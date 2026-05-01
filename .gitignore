@@ -144,3 +144,6 @@ vite.config.ts.timestamp-*
 
 # local
 **/.DS_Store
+
+# reference repos (cloned upstream harnesses for browsing only)
+reference-repos/
