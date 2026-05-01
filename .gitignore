@@ -143,4 +143,4 @@ vite.config.ts.timestamp-*
 .vite/
 
 # local
-.DS_Store
+**/.DS_Store
