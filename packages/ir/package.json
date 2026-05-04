@@ -1,0 +1,12 @@
+{
+  "name": "@crewhaus/ir",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Canonical typed intermediate representation",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  }
+}

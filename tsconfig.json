@@ -1,0 +1,11 @@
+{
+  "files": [],
+  "references": [
+    { "path": "./packages/spec" },
+    { "path": "./packages/ir" },
+    { "path": "./packages/compiler" },
+    { "path": "./packages/target-cli" },
+    { "path": "./packages/runtime-core" },
+    { "path": "./apps/cli" }
+  ]
+}
