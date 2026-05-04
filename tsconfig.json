@@ -1,6 +1,8 @@
 {
   "files": [],
   "references": [
+    { "path": "./packages/errors" },
+    { "path": "./packages/logging" },
     { "path": "./packages/spec" },
     { "path": "./packages/ir" },
     { "path": "./packages/compiler" },

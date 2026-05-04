@@ -1,5 +1,5 @@
-import Anthropic from "@anthropic-ai/sdk";
 import * as readline from "node:readline/promises";
+import Anthropic from "@anthropic-ai/sdk";
 
 /**
  * Slice-scope runtime: a multi-turn streaming chat loop with prompt

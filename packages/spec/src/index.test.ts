@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { parseSpec, Spec, SpecParseError } from "./index";
+import { Spec, SpecParseError, parseSpec } from "./index";
 
 describe("parseSpec", () => {
   test("parses a minimal valid CLI spec", () => {
@@ -30,7 +30,7 @@ agent:
   });
 
   test("rejects spec with missing required fields", () => {
-    expect(() => parseSpec(`name: hello`)).toThrow(SpecParseError);
+    expect(() => parseSpec("name: hello")).toThrow(SpecParseError);
   });
 
   test("rejects spec with unknown top-level fields (strict mode)", () => {

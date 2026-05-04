@@ -4,20 +4,19 @@
   "private": true,
   "type": "module",
   "description": "Modular meta-harness tool: compiles a single high-level harness spec into multiple runtime targets",
-  "workspaces": [
-    "packages/*",
-    "apps/*",
-    "examples/*"
-  ],
+  "workspaces": ["packages/*", "apps/*", "examples/*"],
   "scripts": {
     "typecheck": "tsc -b",
     "build": "tsc -b",
     "clean": "tsc -b --clean && rm -rf packages/*/dist apps/*/dist examples/*/dist",
     "test": "bun --filter '@crewhaus/*' test",
+    "lint": "biome check .",
+    "lint:fix": "biome check --write .",
     "compile:hello": "bun apps/cli/src/index.ts compile examples/hello-cli/crewhaus.yaml -o examples/hello-cli/dist",
     "run:hello": "bun examples/hello-cli/dist/agent.ts"
   },
   "devDependencies": {
+    "@biomejs/biome": "1.9.4",
     "@types/bun": "^1.2.0",
     "@types/node": "^22.0.0",
     "typescript": "^5.7.0"
