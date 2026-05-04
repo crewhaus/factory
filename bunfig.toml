@@ -1,0 +1,5 @@
+# Bun runtime config
+# Workspace-aware install
+[install]
+# Use exact versions in lockfile for reproducibility
+exact = false

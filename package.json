@@ -1,0 +1,28 @@
+{
+  "name": "crewhaus-factory",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Modular meta-harness tool: compiles a single high-level harness spec into multiple runtime targets",
+  "workspaces": [
+    "packages/*",
+    "apps/*",
+    "examples/*"
+  ],
+  "scripts": {
+    "typecheck": "tsc -b",
+    "build": "tsc -b",
+    "clean": "tsc -b --clean && rm -rf packages/*/dist apps/*/dist examples/*/dist",
+    "test": "bun --filter '@crewhaus/*' test",
+    "compile:hello": "bun apps/cli/src/index.ts compile examples/hello-cli/crewhaus.yaml -o examples/hello-cli/dist",
+    "run:hello": "bun examples/hello-cli/dist/agent.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  },
+  "engines": {
+    "bun": ">=1.2.0"
+  }
+}

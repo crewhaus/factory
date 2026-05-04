@@ -1,0 +1,17 @@
+{
+  "name": "@crewhaus/cli",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "crewhaus-factory CLI: compile, run, deploy harness specs",
+  "main": "src/index.ts",
+  "bin": {
+    "crewhaus": "src/index.ts"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@crewhaus/compiler": "workspace:*"
+  }
+}

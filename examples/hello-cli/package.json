@@ -1,0 +1,10 @@
+{
+  "name": "@crewhaus-examples/hello-cli",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Smallest possible spec → CLI agent vertical slice",
+  "dependencies": {
+    "@crewhaus/runtime-core": "workspace:*"
+  }
+}

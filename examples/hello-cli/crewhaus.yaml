@@ -1,0 +1,7 @@
+name: hello
+target: cli
+agent:
+  model: claude-sonnet-4-6
+  instructions: |
+    You are a helpful, concise assistant. Reply in two sentences or fewer
+    unless the user asks for more detail.
