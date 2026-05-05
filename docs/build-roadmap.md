@@ -65,6 +65,8 @@ Each package gets a unit test file (`T1`) covering the happy path, malformed inp
 
 ## Section 2 — Thread tools through the full pipeline
 
+> Status: ✅ complete (PR #7).
+
 **Catalog modules:** `spec-schema` expansion, `ir-model` expansion, `compiler-core` update, `target-cli-bundle` update, `runtime-orchestrator` update (updates to existing packages)
 
 With the tool framework in place, the compiler pipeline needs to carry tool declarations from spec YAML all the way through to the generated agent, and the runtime needs to handle `tool_use` stream events. This section is mostly sequential because each layer depends on the one above it.
@@ -338,6 +340,8 @@ Extend the pipeline to carry tools from spec YAML through to the generated agent
    - Execute them using tool-executor, append tool_result messages, and loop back to the model
 
 Update existing tests. Add an integration test in packages/compiler that compiles a spec with tools: [read] and checks the emitted code. Add a runtime-core test with a mock Anthropic client that returns a tool_use block, verifying the tool is called and the conversation continues.
+
+Update docs/MODULE-CATALOG.md with everything that is complete and create a pull request with all updates.
 ```
 
 ---
@@ -369,6 +373,8 @@ Build three new packages in parallel — they do not depend on each other:
    - Return a markdown checklist
 
 Each package: @crewhaus/tool-fs etc., type: "module", workspace:* deps on tool-catalog and tool-builder. Include T1 unit tests and T3 integration tests. tool-bash timeout test: verify the process is killed after timeout. tool-fs path-traversal test: verify ../../../etc/passwd is rejected.
+
+Update docs/MODULE-CATALOG.md with everything that is complete and create a pull request with all updates.
 ```
 
 ---
@@ -410,6 +416,8 @@ After all five packages are built, integrate them into packages/runtime-core:
 - Use turn-state-machine for the turn loop
 - Check token-budget at the start of each turn
 - Apply snip first (free), then autocompact if still over 85% of limit
+
+Update docs/MODULE-CATALOG.md with everything that is complete and create a pull request with all updates.
 ```
 
 ---
@@ -442,6 +450,8 @@ Add three new subcommands to apps/cli/src/index.ts. These can be developed in pa
 Update the help text at the top of the file to list all four subcommands (compile, run, init, doctor).
 
 Write integration tests using Bun.spawn for each subcommand. The run test should use examples/hello-cli/crewhaus.yaml with a mock input that closes stdin immediately.
+
+Update docs/MODULE-CATALOG.md with everything that is complete and create a pull request with all updates.
 ```
 
 ---
@@ -479,4 +489,6 @@ Add a second target shape — workflow — to the full pipeline:
    - Add compile:hello-workflow and run:hello-workflow scripts to the root package.json
 
 Tests: unit tests for target-workflow verifying the generated code structure. Integration test compiling hello-workflow and confirming it produces a bundle with step-sequencing logic.
+
+Update docs/MODULE-CATALOG.md with everything that is complete and create a pull request with all updates.
 ```

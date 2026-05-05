@@ -22,15 +22,15 @@ Modules in the per-layer tables below are prefixed with status markers:
 
 | Module | Layer | Notes |
 |---|---|---|
-| `spec-schema` | F1 | v0 schema (name, target, agent.model, agent.instructions). PR #2. |
+| `spec-schema` | F1 | v0 schema (name, target, agent.model, agent.instructions); optional `tools: string[]`. PR #2, expanded in PR #7. |
 | `spec-parser` | F1 | YAML → Zod-validated spec. PR #2. |
 | `spec-validator` | F1 | Bundled with parser via Zod (`.strict()`). PR #2. |
-| `ir-model` | F1 | v0 only — mirrors spec shape. PR #2. |
-| `compiler-core` | F2 | Pipeline: parse → lower → emit. PR #2. |
-| `target-cli-bundle` | F2 | Single-file `agent.ts` codegen for CLI target. PR #2. |
+| `ir-model` | F1 | v0 — mirrors spec shape; carries normalized `tools: readonly string[]`. PR #2, expanded in PR #7. |
+| `compiler-core` | F2 | Pipeline: parse → lower → emit; threads `spec.tools ?? []` into `ir.tools`. PR #2, expanded in PR #7. |
+| `target-cli-bundle` | F2 | Single-file `agent.ts` codegen for CLI target; emits grouped tool imports + `defaultCatalog.register()` when `ir.tools` is non-empty. PR #2, expanded in PR #7. |
 | `codegen-templates` | F2 | Inline string templates in target-cli. PR #2. |
 | `spec-cli` | F4 | `compile` subcommand only; init/run/deploy/eval/watch/doctor pending. PR #2. |
-| `runtime-orchestrator` | R1 | Single-turn-cycle slice — streaming chat REPL. PR #2. |
+| `runtime-orchestrator` | R1 | Streaming chat REPL with `tool_use` loop (executor-driven, Zod→JSON-Schema, full-content-block history). PR #2, expanded in PR #7. |
 | `model-adapter` | R2 | Anthropic-only via `@anthropic-ai/sdk`. PR #2. |
 | `error-types` | F-foundations | Typed `CrewhausError` hierarchy + `toJSON`. PR #3. Extended with `"tool"` code in PR #6. |
 | `logging` | F-foundations | `pretty/json` formats, level filtering, `child()` bindings. PR #3. |
@@ -95,10 +95,10 @@ These live in `crewhaus-factory` and produce/operate generated harnesses. They a
 
 | Module | Responsibility | Refs (`reference-repos/`) | Targets | Research focus | Tests |
 |---|---|---|---|---|---|
-| ✅ **`spec-schema`** | Define user-facing harness spec DSL (YAML/TS): agents, tools, channels, workflow, eval, deploy. Versioned, JSON Schema-backed. | `agent-framework/python/.../declarative/`, `adk-python/cli/`, `openclaw.yaml` schema, `crewAI/.../agent` configs, `claude-code/.../settings.ts` | All | DSL design tradeoffs (YAML vs TS); how MAF declarative format vs ADK YAML differ; LangGraph imperative vs declarative split | T1, T9 |
+| ✅ **`spec-schema`** | Define user-facing harness spec DSL (YAML/TS): agents, tools, channels, workflow, eval, deploy. Versioned, JSON Schema-backed. Currently `name` + `target: cli` + `agent` + optional `tools: string[]`. | `agent-framework/python/.../declarative/`, `adk-python/cli/`, `openclaw.yaml` schema, `crewAI/.../agent` configs, `claude-code/.../settings.ts` | All | DSL design tradeoffs (YAML vs TS); how MAF declarative format vs ADK YAML differ; LangGraph imperative vs declarative split | T1, T9 |
 | ✅ **`spec-parser`** | Parse, lint, resolve includes/macros/overlays → AST. | `langgraph/_validate.py`, `haystack` pipeline YAML loader, `crewAI/.../flow_serializer.py` | All | Include/import semantics; cyclic detection; overlay merging | T1, T9 |
 | ✅ **`spec-validator`** | Type-check, resolve refs, verify tool/agent/model existence, profile constraints. | `agent-framework/.../_validation.py`, `langgraph/_validate.py`, `haystack/.../Pipeline.validate` | All | Cross-module ref resolution; profile constraint propagation | T1, T2, T9 |
-| ✅ **`ir-model`** | Canonical typed IR: agents, nodes, edges, events, tools, policies, memory, evals, channels, schedule. Runtime-agnostic. | `AI-Harness-Systems.md` §IR schema; `agent-framework/.../_workflow_builder.py`; LangGraph graph IR; ADK declarative IR | All | Single IR vs multiple? Event encoding (envelope vs typed message); type system depth | T1 |
+| ✅ **`ir-model`** | Canonical typed IR: agents, nodes, edges, events, tools, policies, memory, evals, channels, schedule. Runtime-agnostic. `IrV0` currently carries name, target, agent, and `tools: readonly string[]`. | `AI-Harness-Systems.md` §IR schema; `agent-framework/.../_workflow_builder.py`; LangGraph graph IR; ADK declarative IR | All | Single IR vs multiple? Event encoding (envelope vs typed message); type system depth | T1 |
 | **`ir-passes`** | Optimization passes: dead-tool elimination, profile pruning, edge fusion, prompt-cache prefix sorting, redundancy collapse. | `claude-code/.../services/compact/grouping.ts` (sort pattern); `dspy/.../teleprompt/` pass style | All | Pass ordering; idempotence; pluggable pass registry | T1, T4 |
 | **`spec-registry`** | Persist spec templates, versions, migration metadata, ownership, environment overlays, tenant isolation. | `openclaw/config/`, `claude-code/.../migrations/`, `adk-python/cli/` | All | Storage backend (FS / SQL / object); multi-tenant isolation | T1, T3 |
 | **`migration-engine`** | Versioned schema migrations across IR versions (template upgrade paths). | `claude-code/.../migrations/` (`CURRENT_MIGRATION_VERSION = 11`); LangGraph checkpoint version migrations | All | Forward + backward migration paths; deprecation policy | T1, T4 |
@@ -107,12 +107,12 @@ These live in `crewhaus-factory` and produce/operate generated harnesses. They a
 
 | Module | Responsibility | Refs | Targets | Research focus | Tests |
 |---|---|---|---|---|---|
-| ✅ **`compiler-core`** | Orchestrate frontend (parse → validate → IR) and dispatch to target backends; emit deployment bundle. | LangChain LCEL → LangGraph compile path; MAF `_workflow_builder.py`; ADK declarative-config compilation | All | Pipeline composition; error reporting; partial compilation | T1, T3 |
+| ✅ **`compiler-core`** | Orchestrate frontend (parse → validate → IR) and dispatch to target backends; emit deployment bundle. `lower()` threads `spec.tools ?? []` into `ir.tools`. | LangChain LCEL → LangGraph compile path; MAF `_workflow_builder.py`; ADK declarative-config compilation | All | Pipeline composition; error reporting; partial compilation | T1, T3 |
 | **`target-graph`** | Codegen for stateful graph runtime (LangGraph-shape) — node/edge/checkpoint config, durability mode. | `langgraph/.../pregel/`, `agent-framework/.../_workflows/_workflow.py` | **GRPH**, MGD, CRW | Pregel vs imperative; checkpoint scheme | T1, T4 |
 | **`target-workflow`** | Codegen for event-driven workflow target. | `crewAI/.../flow/`, `llama_index/.../workflow`, `adk-python/.../flows/` | **CRW**, MGD, RES | Async event semantics; pub/sub vs typed channels | T1, T4 |
 | **`target-pipeline`** | Codegen for pipeline DAG. | `haystack/.../core/`, `haystack/components/` | **RAG** | Component decorator; DAG scheduling | T1, T3 |
 | **`target-managed`** | Codegen for managed runtime bundles (Anthropic Managed Agents, OpenAI Codex App Server, AgentCore, Foundry, Agent Engine). | Anthropic Managed Agents docs; OpenAI App Server JSON-RPC; AWS AgentCore; ADK platform | **MGD** | Manifest format diversity; deploy artifact shape | T1, T3 |
-| ✅ **`target-cli-bundle`** | Codegen for CLI coding agent: entry, REPL, tools, hooks, settings.json, MCP config. | `claude-code/main.tsx`, `claude-code/cli/`, `claude-code/entrypoints/` | **CLI** | Bundling (Bun/Node); side-effect imports | T1, T3, T7 |
+| ✅ **`target-cli-bundle`** | Codegen for CLI coding agent: entry, REPL, tools, hooks, settings.json, MCP config. Emits grouped tool imports + `defaultCatalog.register()` calls + `tools: defaultCatalog.list()` for any spec with non-empty `tools`; unknown names fail at compile time via `TargetEmitError`. Hooks/settings/MCP still pending. | `claude-code/main.tsx`, `claude-code/cli/`, `claude-code/entrypoints/` | **CLI** | Bundling (Bun/Node); side-effect imports | T1, T3, T7 |
 | **`target-channel-bot`** | Codegen for channel assistant: gateway, channel adapters, cron, daemon. | `openclaw/gateway/`, `openclaw/daemon/`, `openclaw/channels/` | **CHN** | Service shape; multi-channel orchestration | T1, T3 |
 | **`target-eval-bundle`** | Codegen for eval harness: dataset loader, runner, graders, report writer. | `lm-evaluation-harness/lm_eval/`, `helm/benchmark/`, `ragas/.../evaluate.py` | **EVAL** | Task spec format; reproducibility | T1, T5 |
 | **`target-research-bundle`** | Codegen for autonomous research agent: planner, crawler, citation tracker, report writer. | `gstack-main/.../autoplan/`; CrewAI research flows; ADK research samples | **RES** | Long-horizon resumability; checkpoint-per-stage | T1, T4, T7 |
@@ -163,7 +163,7 @@ These ship as **selectable building blocks** the factory wires into a generated 
 
 | Module | Responsibility | Refs | Targets | Research focus | Tests |
 |---|---|---|---|---|---|
-| ✅ **`runtime-orchestrator`** | The main agent/run loop: turn cycle (model→tool→model), recovery, termination. | `claude-code/query.ts` (1730-line async-gen loop); `langgraph/.../pregel/_loop.py`; `agent-framework/.../_runner.py`; `openai-agents/.../runner.py` | All | Async-gen vs reactive vs callback; state-machine vs free-form | T1, T3, T4 |
+| ✅ **`runtime-orchestrator`** | The main agent/run loop: turn cycle (model→tool→model), recovery, termination. Streaming chat REPL with full `tool_use` loop — Zod→JSON-Schema for advertised tools, `tool-executor` for invocation, full content-block history so `tool_result` ids resolve. Recovery + compaction still pending. | `claude-code/query.ts` (1730-line async-gen loop); `langgraph/.../pregel/_loop.py`; `agent-framework/.../_runner.py`; `openai-agents/.../runner.py` | All | Async-gen vs reactive vs callback; state-machine vs free-form | T1, T3, T4 |
 | **`query-engine`** | SDK/headless wrapper over orchestrator (`submitMessage()` async-gen). | `claude-code/QueryEngine.ts` | All | SDK message normalization | T1, T3 |
 | **`turn-state-machine`** | Transitions: need_model / need_tools / need_compaction / need_recovery / done. | `claude-code/query.ts` `State`/`Continue` pattern | All | Transition diagram; invariant checks | T1, T9 |
 | **`recovery-engine`** | `max_output_tokens` retries, `prompt_too_long` collapse, media-error strip, model-fallback tombstoning. | `claude-code/query.ts` recovery branches; `agent-framework/.../_runner.py` retry | CLI, CHN, CRW, GRPH, MGD, RES | Recovery taxonomy; idempotence under retry | T1, T4 |

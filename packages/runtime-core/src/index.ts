@@ -1,6 +1,9 @@
 import * as readline from "node:readline/promises";
 import Anthropic from "@anthropic-ai/sdk";
 import { RuntimeError } from "@crewhaus/errors";
+import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import { executeTool } from "@crewhaus/tool-executor";
+import { zodToJsonSchema } from "zod-to-json-schema";
 
 /**
  * Slice-scope runtime: a multi-turn streaming chat loop with prompt
@@ -12,9 +15,15 @@ import { RuntimeError } from "@crewhaus/errors";
  * are detected by the `sk-ant-oat` prefix and given the beta + identity
  * headers required to route through subscription billing.
  *
- * Future expansion: tool execution, compaction, permission, hooks,
- * multi-provider model adapters, abort handling, recovery, keychain refresh
- * for OAuth — see docs/MODULE-CATALOG.md PART B Layers R1–R2.
+ * Tool support (Section 2): when `tools` is provided, the loop forwards
+ * the tool definitions (Zod → JSON Schema) to the model and, after each
+ * streaming response, executes any tool_use blocks via @crewhaus/tool-executor
+ * before re-calling the model. The inner loop terminates when the assistant
+ * returns no further tool_use blocks for that user turn.
+ *
+ * Future expansion: compaction, permission, hooks, multi-provider model
+ * adapters, abort handling, recovery, keychain refresh for OAuth — see
+ * docs/MODULE-CATALOG.md PART B Layers R1–R2.
  */
 
 /**
@@ -105,6 +114,8 @@ export type RunChatLoopOptions = {
   isOAuth?: boolean;
   /** Override the input stream (testing). Defaults to process.stdin. */
   input?: NodeJS.ReadableStream;
+  /** Tools the model may invoke. When empty/undefined, tools are not advertised. */
+  tools?: ReadonlyArray<RegisteredTool>;
 };
 
 export async function runChatLoop(opts: RunChatLoopOptions): Promise<void> {
@@ -123,6 +134,19 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<void> {
   const systemBlocks: Anthropic.TextBlockParam[] = isOAuth
     ? [{ type: "text", text: CLAUDE_CODE_SYSTEM_PREFIX }, userInstructions]
     : [userInstructions];
+
+  const tools = opts.tools ?? [];
+  const anthropicTools: Anthropic.Tool[] | undefined =
+    tools.length > 0
+      ? tools.map((t) => ({
+          name: t.name,
+          description: t.description,
+          input_schema: zodToJsonSchema(t.inputSchema, {
+            $refStrategy: "none",
+          }) as Anthropic.Tool.InputSchema,
+        }))
+      : undefined;
+  const toolByName = new Map(tools.map((t) => [t.name, t]));
 
   const rl = readline.createInterface({
     input: opts.input ?? process.stdin,
@@ -158,27 +182,60 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<void> {
 
       messages.push({ role: "user", content: userInput });
 
-      process.stdout.write("agent> ");
-      const stream = client.messages.stream({
-        model: opts.model,
-        max_tokens: maxTokens,
-        system: systemBlocks,
-        messages,
-      });
+      // Inner tool loop: keep calling the model until it stops requesting tools.
+      while (true) {
+        process.stdout.write("agent> ");
+        const stream = client.messages.stream({
+          model: opts.model,
+          max_tokens: maxTokens,
+          system: systemBlocks,
+          messages,
+          ...(anthropicTools ? { tools: anthropicTools } : {}),
+        });
 
-      stream.on("text", (chunk) => {
-        process.stdout.write(chunk);
-      });
+        stream.on("text", (chunk) => {
+          process.stdout.write(chunk);
+        });
 
-      const final = await stream.finalMessage();
-      process.stdout.write("\n");
+        const final = await stream.finalMessage();
+        process.stdout.write("\n");
 
-      const assistantText = final.content
-        .filter((block): block is Anthropic.TextBlock => block.type === "text")
-        .map((block) => block.text)
-        .join("");
+        // Persist the assistant turn with the FULL content-block array; tool_use
+        // blocks must survive into history so subsequent tool_result references
+        // resolve, and Anthropic rejects orphan tool_result ids.
+        messages.push({
+          role: "assistant",
+          content: final.content as Anthropic.MessageParam["content"],
+        });
 
-      messages.push({ role: "assistant", content: assistantText });
+        const toolUses = final.content.filter(
+          (b): b is Anthropic.ToolUseBlock => b.type === "tool_use",
+        );
+        if (toolUses.length === 0) break;
+
+        const toolResults: Anthropic.ToolResultBlockParam[] = [];
+        for (const tu of toolUses) {
+          process.stdout.write(`[tool: ${tu.name}]\n`);
+          const tool = toolByName.get(tu.name);
+          if (!tool) {
+            toolResults.push({
+              type: "tool_result",
+              tool_use_id: tu.id,
+              content: `unknown tool "${tu.name}"`,
+              is_error: true,
+            });
+            continue;
+          }
+          const result = await executeTool(tool, tu.input, { toolUseId: tu.id });
+          toolResults.push({
+            type: "tool_result",
+            tool_use_id: result.toolUseId,
+            content: result.content,
+            is_error: result.isError,
+          });
+        }
+        messages.push({ role: "user", content: toolResults });
+      }
     }
   } finally {
     rl.close();

@@ -15,6 +15,7 @@ export const Spec = z
       model: z.string().min(1),
       instructions: z.string().min(1),
     }),
+    tools: z.array(z.string().min(1)).optional(),
   })
   .strict();
 

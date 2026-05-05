@@ -11,6 +11,7 @@ export type IrV0 = {
     readonly model: string;
     readonly instructions: string;
   };
+  readonly tools: readonly string[];
 };
 
 /**
