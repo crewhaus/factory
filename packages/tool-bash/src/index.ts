@@ -5,8 +5,8 @@ import { z } from "zod";
 /**
  * Built-in Bash tool. Spawns the command through `sh -c` via `Bun.spawn`,
  * captures stdout + stderr, and enforces a default 30s timeout (max 10min)
- * with an AbortController. The returned string is human-readable and
- * encodes both streams plus the exit code.
+ * by SIGKILLing the subprocess when the deadline elapses. The returned
+ * string is human-readable and encodes both streams plus the exit code.
  *
  * Layer R4. Pairs with the `target-cli` codegen contract (`bash` export).
  */
@@ -49,20 +49,25 @@ export const bash: RegisteredTool = buildTool({
   destructive: true,
   execute: async (input) => {
     const timeoutMs = input.timeout ?? DEFAULT_TIMEOUT_MS;
-    const ac = new AbortController();
-    const timer = setTimeout(() => ac.abort(), timeoutMs);
+    const proc = Bun.spawn(["sh", "-c", input.command], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try {
+        proc.kill("SIGKILL");
+      } catch {
+        // Process already exited between the timer firing and the kill call.
+      }
+    }, timeoutMs);
     try {
-      const proc = Bun.spawn(["sh", "-c", input.command], {
-        stdout: "pipe",
-        stderr: "pipe",
-        signal: ac.signal,
-      });
       const [stdout, stderr, exitCode] = await Promise.all([
         new Response(proc.stdout).text(),
         new Response(proc.stderr).text(),
         proc.exited,
       ]);
-      const timedOut = ac.signal.aborted;
       return formatResult({ stdout, stderr, exitCode, timedOut, timeoutMs });
     } finally {
       clearTimeout(timer);
