@@ -8,11 +8,19 @@ import { z } from "zod";
  * by SIGKILLing the subprocess when the deadline elapses. The returned
  * string is human-readable and encodes both streams plus the exit code.
  *
+ * Linux note: when `sh` forks a long-running grandchild (e.g. `sleep 10`),
+ * SIGKILL on the shell does not propagate to the orphan, which keeps the
+ * pipe write-end alive and prevents `text()` from ever EOFing. After the
+ * shell exits we therefore give each stream a fixed drain grace window
+ * before falling back to an empty string — the orphan still exits on its
+ * own, but the tool call returns within `timeoutMs + DRAIN_GRACE_MS`.
+ *
  * Layer R4. Pairs with the `target-cli` codegen contract (`bash` export).
  */
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_TIMEOUT_MS = 600_000;
+const DRAIN_GRACE_MS = 500;
 
 const bashSchema = z.object({
   command: z.string().min(1),
@@ -63,10 +71,14 @@ export const bash: RegisteredTool = buildTool({
       }
     }, timeoutMs);
     try {
-      const [stdout, stderr, exitCode] = await Promise.all([
-        new Response(proc.stdout).text(),
-        new Response(proc.stderr).text(),
-        proc.exited,
+      const stdoutText = new Response(proc.stdout).text();
+      const stderrText = new Response(proc.stderr).text();
+      const exitCode = await proc.exited;
+      const drainFallback = (): Promise<string> =>
+        new Promise((resolve) => setTimeout(() => resolve(""), DRAIN_GRACE_MS));
+      const [stdout, stderr] = await Promise.all([
+        Promise.race([stdoutText, drainFallback()]),
+        Promise.race([stderrText, drainFallback()]),
       ]);
       return formatResult({ stdout, stderr, exitCode, timedOut, timeoutMs });
     } finally {
