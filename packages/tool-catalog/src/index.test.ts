@@ -1,12 +1,7 @@
-import { describe, expect, test, beforeEach } from "bun:test";
-import { z } from "zod";
+import { beforeEach, describe, expect, test } from "bun:test";
 import { CrewhausError } from "@crewhaus/errors";
-import {
-  ToolCatalog,
-  ToolCatalogError,
-  defaultCatalog,
-  type RegisteredTool,
-} from "./index";
+import { z } from "zod";
+import { type RegisteredTool, ToolCatalog, ToolCatalogError, defaultCatalog } from "./index";
 
 function makeTool(name: string): RegisteredTool {
   return {

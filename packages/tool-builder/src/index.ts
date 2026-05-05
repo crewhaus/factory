@@ -1,5 +1,5 @@
+import type { RegisteredTool, ToolDefinition } from "@crewhaus/tool-catalog";
 import type { ZodType } from "zod";
-import type { ToolDefinition, RegisteredTool } from "@crewhaus/tool-catalog";
 
 /**
  * Converts a ToolDefinition into a RegisteredTool by applying fail-closed

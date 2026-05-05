@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { compilePattern, matchesPattern, PatternParseError } from "./index";
 import { CrewhausError } from "@crewhaus/errors";
+import { PatternParseError, compilePattern, matchesPattern } from "./index";
 
 describe("compilePattern — no-arg patterns", () => {
   test("exact name matches itself", () => {

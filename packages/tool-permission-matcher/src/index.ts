@@ -22,7 +22,7 @@ function globToRegex(glob: string): RegExp {
   let i = 0;
 
   while (i < glob.length) {
-    const ch = glob[i]!;
+    const ch = glob.charAt(i);
 
     if (ch === "*" && glob[i + 1] === "*") {
       const prevIsSep = i === 0 || glob[i - 1] === "/";
@@ -98,6 +98,7 @@ export function matchesPattern(
   input: unknown,
 ): boolean {
   if (!compiled._toolRe.test(toolName)) return false;
-  if (compiled._argRe === null) return true;
-  return stringValues(input).some((v) => compiled._argRe!.test(v));
+  const argRe = compiled._argRe;
+  if (argRe === null) return true;
+  return stringValues(input).some((v) => argRe.test(v));
 }

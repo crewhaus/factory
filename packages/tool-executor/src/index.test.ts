@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { z } from "zod";
-import { executeTool, ToolPermissionError } from "./index";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import { z } from "zod";
+import { ToolPermissionError, executeTool } from "./index";
 
 const schema = z.object({ command: z.string() });
 
@@ -80,7 +80,9 @@ describe("executeTool — permission denied", () => {
 describe("executeTool — execute throws", () => {
   test("returns isError:true with error message", async () => {
     const failTool = makeEchoTool({
-      execute: async () => { throw new Error("disk full"); },
+      execute: async () => {
+        throw new Error("disk full");
+      },
     });
     const result = await executeTool(failTool, { command: "write" }, { toolUseId: "8" });
     expect(result.isError).toBe(true);
@@ -89,7 +91,9 @@ describe("executeTool — execute throws", () => {
 
   test("captures non-Error throws as strings", async () => {
     const failTool = makeEchoTool({
-      execute: async () => { throw "string error"; },
+      execute: async () => {
+        throw "string error";
+      },
     });
     const result = await executeTool(failTool, { command: "x" }, { toolUseId: "9" });
     expect(result.isError).toBe(true);

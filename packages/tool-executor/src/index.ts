@@ -1,7 +1,7 @@
 import { CrewhausError } from "@crewhaus/errors";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
-import { validateToolInput } from "@crewhaus/tool-validate";
 import { compilePattern, matchesPattern } from "@crewhaus/tool-permission-matcher";
+import { validateToolInput } from "@crewhaus/tool-validate";
 
 export type ToolResult = {
   readonly toolUseId: string;

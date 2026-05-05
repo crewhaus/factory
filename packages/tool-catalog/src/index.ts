@@ -1,5 +1,5 @@
-import type { ZodType } from "zod";
 import { CrewhausError } from "@crewhaus/errors";
+import type { ZodType } from "zod";
 
 export interface ToolDefinition<TInput = unknown> {
   name: string;

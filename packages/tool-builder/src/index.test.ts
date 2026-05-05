@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import type { ToolDefinition } from "@crewhaus/tool-catalog";
 import { z } from "zod";
 import { buildTool } from "./index";
-import type { ToolDefinition } from "@crewhaus/tool-catalog";
 
 const echoSchema = z.object({ message: z.string() });
 type EchoInput = z.infer<typeof echoSchema>;
@@ -30,14 +30,24 @@ describe("buildTool — fail-closed defaults", () => {
   });
 
   test("explicit true flags are preserved", () => {
-    const tool = buildTool({ ...echoDef, concurrencySafe: true, readOnly: true, destructive: true });
+    const tool = buildTool({
+      ...echoDef,
+      concurrencySafe: true,
+      readOnly: true,
+      destructive: true,
+    });
     expect(tool.concurrencySafe).toBe(true);
     expect(tool.readOnly).toBe(true);
     expect(tool.destructive).toBe(true);
   });
 
   test("explicit false flags are preserved", () => {
-    const tool = buildTool({ ...echoDef, concurrencySafe: false, readOnly: false, destructive: false });
+    const tool = buildTool({
+      ...echoDef,
+      concurrencySafe: false,
+      readOnly: false,
+      destructive: false,
+    });
     expect(tool.concurrencySafe).toBe(false);
     expect(tool.readOnly).toBe(false);
     expect(tool.destructive).toBe(false);
@@ -67,7 +77,9 @@ describe("buildTool — execute delegation", () => {
   test("execute propagates errors from def.execute", async () => {
     const failDef: ToolDefinition<EchoInput> = {
       ...echoDef,
-      execute: async () => { throw new Error("boom"); },
+      execute: async () => {
+        throw new Error("boom");
+      },
     };
     const tool = buildTool(failDef);
     expect(tool.execute({ message: "x" })).rejects.toThrow("boom");

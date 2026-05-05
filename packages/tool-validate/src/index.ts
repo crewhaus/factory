@@ -1,5 +1,5 @@
-import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { CrewhausError } from "@crewhaus/errors";
+import type { RegisteredTool } from "@crewhaus/tool-catalog";
 
 export type ZodIssue = { readonly path: ReadonlyArray<string | number>; readonly message: string };
 

@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { z } from "zod";
-import { validateToolInput, ToolValidationError } from "./index";
 import { CrewhausError } from "@crewhaus/errors";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import { z } from "zod";
+import { ToolValidationError, validateToolInput } from "./index";
 
 const schema = z.object({ command: z.string(), args: z.array(z.string()).optional() });
 
