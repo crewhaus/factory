@@ -1,3 +1,4 @@
+import { escapeJsonString } from "@crewhaus/infra-utils";
 import type { Bundle, IrV0 } from "@crewhaus/ir";
 
 /**
@@ -26,8 +27,8 @@ function renderAgent(ir: IrV0): string {
 import { runChatLoop } from "@crewhaus/runtime-core";
 
 await runChatLoop({
-  model: ${JSON.stringify(ir.agent.model)},
-  instructions: ${JSON.stringify(ir.agent.instructions)},
+  model: ${escapeJsonString(ir.agent.model)},
+  instructions: ${escapeJsonString(ir.agent.instructions)},
 });
 `;
 }

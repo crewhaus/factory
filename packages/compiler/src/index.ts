@@ -1,3 +1,4 @@
+import { assertNever } from "@crewhaus/infra-utils";
 import type { Bundle, IrV0 } from "@crewhaus/ir";
 import { type Spec, parseSpec } from "@crewhaus/spec";
 import { emitCli } from "@crewhaus/target-cli";
@@ -34,6 +35,8 @@ function emit(ir: IrV0): Bundle {
   switch (ir.target) {
     case "cli":
       return emitCli(ir);
+    default:
+      return assertNever(ir.target);
   }
 }
 

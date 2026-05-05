@@ -13,6 +13,7 @@
     "test": "bun test src"
   },
   "dependencies": {
+    "@crewhaus/infra-utils": "workspace:*",
     "@crewhaus/ir": "workspace:*",
     "@crewhaus/spec": "workspace:*",
     "@crewhaus/target-cli": "workspace:*"

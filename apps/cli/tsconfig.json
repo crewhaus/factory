@@ -5,5 +5,9 @@
     "outDir": "dist"
   },
   "include": ["src/**/*"],
-  "references": [{ "path": "../../packages/compiler" }, { "path": "../../packages/logging" }]
+  "references": [
+    { "path": "../../packages/compiler" },
+    { "path": "../../packages/infra-utils" },
+    { "path": "../../packages/logging" }
+  ]
 }
