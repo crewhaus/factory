@@ -30,7 +30,7 @@ Modules in the per-layer tables below are prefixed with status markers:
 | `target-cli-bundle` | F2 | Single-file `agent.ts` codegen for CLI target; emits grouped tool imports + `defaultCatalog.register()` when `ir.tools` is non-empty. PR #2, expanded in PR #7. |
 | `codegen-templates` | F2 | Inline string templates in target-cli. PR #2. |
 | `spec-cli` | F4 | `compile` subcommand only; init/run/deploy/eval/watch/doctor pending. PR #2. |
-| `runtime-orchestrator` | R1 | Streaming chat REPL with state-machine-driven inner loop, `tool_use` execution, and pre-turn compaction (snip → autocompact). PR #2, #7, #8. |
+| `runtime-orchestrator` | R1 | Streaming chat REPL with state-machine-driven inner loop, `tool_use` execution, and pre-turn compaction (snip → autocompact). PR #2, #7, #9. |
 | `model-adapter` | R2 | Anthropic-only via `@anthropic-ai/sdk`. PR #2. |
 | `error-types` | F-foundations | Typed `CrewhausError` hierarchy + `toJSON`. PR #3. Extended with `"tool"` code in PR #6. |
 | `logging` | F-foundations | `pretty/json` formats, level filtering, `child()` bindings. PR #3. |
@@ -40,11 +40,11 @@ Modules in the per-layer tables below are prefixed with status markers:
 | `tool-validate` | R3 | `validateToolInput()` returning typed `ValidationResult`; `ToolValidationError` with Zod issues. PR #6. |
 | `tool-permission-matcher` | R3 | `compilePattern()` + `matchesPattern()`; supports `Bash(git *)`, `Read`, `Write(**/src/**)` glob syntax. PR #6. |
 | `tool-executor` | R3 | `executeTool()`: validate → permission-check → invoke → normalized `ToolResult`. PR #6. |
-| `turn-state-machine` | R1 | Pure state machine: `NeedModel`/`NeedTools`/`NeedCompaction`/`NeedRecovery`/`Done`; exhaustive transition tests over the (state, event) cartesian product. PR #8. |
-| `run-context` | R1 | `RunContext` type (`runId`, `sessionId`, `turnNumber`, `abortSignal`, `logger`) + `createRunContext()` factory; logger child-bound to run/session ids. PR #8. |
-| `token-budget` | R2 | `estimateTokens()` (char/4 heuristic over text, tool_use, tool_result blocks) + `TokenBudget` class with `add()` / `isApproachingLimit()` (default threshold 0.85). PR #8. |
-| `compaction-snip` | R6 | Pure middle-message removal with `[Context compacted: N messages removed]` marker; tool-use/result orphan defense walks boundaries until pairs are intact. PR #8. |
-| `compaction-autocompact` | R6 | Model-summarize-then-replace; returns `[user-marker, assistant-summary]` pair so the next user input appends naturally. PR #8. |
+| `turn-state-machine` | R1 | Pure state machine: `NeedModel`/`NeedTools`/`NeedCompaction`/`NeedRecovery`/`Done`; exhaustive transition tests over the (state, event) cartesian product. PR #9. |
+| `run-context` | R1 | `RunContext` type (`runId`, `sessionId`, `turnNumber`, `abortSignal`, `logger`) + `createRunContext()` factory; logger child-bound to run/session ids. PR #9. |
+| `token-budget` | R2 | `estimateTokens()` (char/4 heuristic over text, tool_use, tool_result blocks) + `TokenBudget` class with `add()` / `isApproachingLimit()` (default threshold 0.85). PR #9. |
+| `compaction-snip` | R6 | Pure middle-message removal with `[Context compacted: N messages removed]` marker; tool-use/result orphan defense walks boundaries until pairs are intact. PR #9. |
+| `compaction-autocompact` | R6 | Model-summarize-then-replace; returns `[user-marker, assistant-summary]` pair so the next user input appends naturally. PR #9. |
 
 **Total**: 23 of ~190 modules.
 

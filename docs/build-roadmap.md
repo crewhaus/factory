@@ -154,7 +154,7 @@ Each tool package gets `T1` unit tests and `T3` integration tests. The `tool-bas
 
 ## Section 4 — Turn state machine + context management
 
-> Status: ✅ complete (PR #8).
+> Status: ✅ complete (PR #9).
 
 **Catalog modules:** `turn-state-machine`, `run-context`, `token-budget`, `compaction-snip`, `compaction-autocompact` (R1, R2, R6)
 
