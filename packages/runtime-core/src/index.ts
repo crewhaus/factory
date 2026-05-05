@@ -1,14 +1,25 @@
 import * as readline from "node:readline/promises";
 import Anthropic from "@anthropic-ai/sdk";
+import { autoCompact } from "@crewhaus/compaction-autocompact";
+import { snip } from "@crewhaus/compaction-snip";
 import { RuntimeError } from "@crewhaus/errors";
+import { type RunContext, createRunContext } from "@crewhaus/run-context";
+import { TokenBudget, estimateTokens } from "@crewhaus/token-budget";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { executeTool } from "@crewhaus/tool-executor";
+import {
+  type ToolUseBlock as TsmToolUseBlock,
+  type TurnState,
+  initialState,
+  transition,
+} from "@crewhaus/turn-state-machine";
 import { zodToJsonSchema } from "zod-to-json-schema";
 
 /**
  * Slice-scope runtime: a multi-turn streaming chat loop with prompt
- * caching for the system prompt. Maps to catalog R1 runtime-orchestrator
- * (single-turn-cycle slice) and R2 model-adapter (Anthropic only).
+ * caching, tool execution, and pre-turn context compaction. Maps to
+ * catalog R1 runtime-orchestrator (state-machine-driven inner loop)
+ * and R2 model-adapter (Anthropic only).
  *
  * Auth resolution: ANTHROPIC_AUTH_TOKEN (Claude Pro/Max OAuth) takes
  * precedence over ANTHROPIC_API_KEY (pay-per-token API key). OAuth tokens
@@ -18,12 +29,20 @@ import { zodToJsonSchema } from "zod-to-json-schema";
  * Tool support (Section 2): when `tools` is provided, the loop forwards
  * the tool definitions (Zod → JSON Schema) to the model and, after each
  * streaming response, executes any tool_use blocks via @crewhaus/tool-executor
- * before re-calling the model. The inner loop terminates when the assistant
- * returns no further tool_use blocks for that user turn.
+ * before re-calling the model. The state machine reaches Done(no_tools)
+ * when the assistant returns no further tool_use blocks for a turn.
  *
- * Future expansion: compaction, permission, hooks, multi-provider model
- * adapters, abort handling, recovery, keychain refresh for OAuth — see
- * docs/MODULE-CATALOG.md PART B Layers R1–R2.
+ * Compaction (Section 4): at the start of each user turn, estimate the
+ * conversation's token count against `contextLimit` (default 200_000).
+ * When usage crosses `compactionThreshold` (default 0.85), apply the
+ * cheap snip first (drop middle messages, insert a marker). If the
+ * trimmed history is still over threshold, fall back to autocompact
+ * (model-summarized replacement).
+ *
+ * Future expansion: reactive compaction (NeedCompaction state from a
+ * 413), recovery taxonomy (NeedRecovery state from max-tokens etc.),
+ * permission, hooks, multi-provider model adapters, keychain refresh
+ * for OAuth — see docs/MODULE-CATALOG.md PART B Layers R1–R2.
  */
 
 /**
@@ -48,6 +67,11 @@ const CLAUDE_CODE_HEADERS = {
 
 /** System-prompt prefix expected for subscription-billed OAuth requests. */
 const CLAUDE_CODE_SYSTEM_PREFIX = "You are Claude Code, Anthropic's official CLI for Claude.";
+
+const DEFAULT_CONTEXT_LIMIT = 200_000;
+const DEFAULT_COMPACTION_THRESHOLD = 0.85;
+const DEFAULT_SNIP_KEEP_HEAD = 4;
+const DEFAULT_SNIP_KEEP_TAIL = 20;
 
 export type ResolvedAuth =
   | { readonly mode: "oauth"; readonly token: string }
@@ -116,6 +140,16 @@ export type RunChatLoopOptions = {
   input?: NodeJS.ReadableStream;
   /** Tools the model may invoke. When empty/undefined, tools are not advertised. */
   tools?: ReadonlyArray<RegisteredTool>;
+  /** Per-run identity, abort signal, and logger. Defaults to a fresh `createRunContext()`. */
+  runContext?: RunContext;
+  /** Context-window limit in tokens. Defaults to 200_000 (Claude opus/sonnet 4.x). */
+  contextLimit?: number;
+  /** Fraction of `contextLimit` at which compaction kicks in. Defaults to 0.85. */
+  compactionThreshold?: number;
+  /** Number of head messages to keep when snipping. Defaults to 4. */
+  snipKeepHead?: number;
+  /** Number of tail messages to keep when snipping. Defaults to 20. */
+  snipKeepTail?: number;
 };
 
 export async function runChatLoop(opts: RunChatLoopOptions): Promise<void> {
@@ -124,7 +158,13 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<void> {
     : createAnthropicClient(resolveAuth());
   const { client, isOAuth } = resolved;
   const maxTokens = opts.maxTokens ?? 4096;
-  const messages: Anthropic.MessageParam[] = [];
+  const runContext = opts.runContext ?? createRunContext();
+  const contextLimit = opts.contextLimit ?? DEFAULT_CONTEXT_LIMIT;
+  const compactionThreshold = opts.compactionThreshold ?? DEFAULT_COMPACTION_THRESHOLD;
+  const snipKeepHead = opts.snipKeepHead ?? DEFAULT_SNIP_KEEP_HEAD;
+  const snipKeepTail = opts.snipKeepTail ?? DEFAULT_SNIP_KEEP_TAIL;
+
+  let messages: Anthropic.MessageParam[] = [];
 
   const userInstructions: Anthropic.TextBlockParam = {
     type: "text",
@@ -168,6 +208,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<void> {
 
   try {
     while (true) {
+      if (runContext.abortSignal.aborted) break;
+
       let userInput: string;
       try {
         const result = await Promise.race([rl.question("\nyou> "), closedSignal]);
@@ -181,63 +223,166 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<void> {
       if (userInput === "exit" || userInput === "quit") break;
 
       messages.push({ role: "user", content: userInput });
+      runContext.turnNumber += 1;
+      runContext.logger.debug("turn start", {
+        turn: runContext.turnNumber,
+        messages: messages.length,
+      });
 
-      // Inner tool loop: keep calling the model until it stops requesting tools.
-      while (true) {
-        process.stdout.write("agent> ");
-        const stream = client.messages.stream({
-          model: opts.model,
-          max_tokens: maxTokens,
-          system: systemBlocks,
-          messages,
-          ...(anthropicTools ? { tools: anthropicTools } : {}),
-        });
+      // Pre-turn budget check: snip first (free), then autocompact if still over.
+      messages = await maybeCompact({
+        messages,
+        client,
+        model: opts.model,
+        contextLimit,
+        compactionThreshold,
+        snipKeepHead,
+        snipKeepTail,
+        logger: runContext.logger,
+      });
 
-        stream.on("text", (chunk) => {
-          process.stdout.write(chunk);
-        });
-
-        const final = await stream.finalMessage();
-        process.stdout.write("\n");
-
-        // Persist the assistant turn with the FULL content-block array; tool_use
-        // blocks must survive into history so subsequent tool_result references
-        // resolve, and Anthropic rejects orphan tool_result ids.
-        messages.push({
-          role: "assistant",
-          content: final.content as Anthropic.MessageParam["content"],
-        });
-
-        const toolUses = final.content.filter(
-          (b): b is Anthropic.ToolUseBlock => b.type === "tool_use",
-        );
-        if (toolUses.length === 0) break;
-
-        const toolResults: Anthropic.ToolResultBlockParam[] = [];
-        for (const tu of toolUses) {
-          process.stdout.write(`[tool: ${tu.name}]\n`);
-          const tool = toolByName.get(tu.name);
-          if (!tool) {
-            toolResults.push({
-              type: "tool_result",
-              tool_use_id: tu.id,
-              content: `unknown tool "${tu.name}"`,
-              is_error: true,
-            });
-            continue;
-          }
-          const result = await executeTool(tool, tu.input, { toolUseId: tu.id });
-          toolResults.push({
-            type: "tool_result",
-            tool_use_id: result.toolUseId,
-            content: result.content,
-            is_error: result.isError,
-          });
+      // State-machine driven inner loop. Each iteration handles one
+      // (state, event) pair. NeedCompaction/NeedRecovery are wired as
+      // no-op continues for v1; they exist in the type for future
+      // reactive paths (413 retry, max-output-tokens recovery).
+      let state: TurnState = initialState;
+      while (state.kind !== "Done") {
+        if (runContext.abortSignal.aborted) {
+          state = transition(state, { kind: "Aborted" });
+          continue;
         }
-        messages.push({ role: "user", content: toolResults });
+
+        switch (state.kind) {
+          case "NeedModel": {
+            process.stdout.write("agent> ");
+            const stream = client.messages.stream({
+              model: opts.model,
+              max_tokens: maxTokens,
+              system: systemBlocks,
+              messages,
+              ...(anthropicTools ? { tools: anthropicTools } : {}),
+            });
+
+            stream.on("text", (chunk) => {
+              process.stdout.write(chunk);
+            });
+
+            const final = await stream.finalMessage();
+            process.stdout.write("\n");
+
+            // Persist the assistant turn with the FULL content-block array;
+            // tool_use blocks must survive into history so subsequent
+            // tool_result references resolve.
+            messages.push({
+              role: "assistant",
+              content: final.content as Anthropic.MessageParam["content"],
+            });
+
+            const toolUses = final.content.filter(
+              (b): b is Anthropic.ToolUseBlock => b.type === "tool_use",
+            );
+            if (toolUses.length === 0) {
+              state = transition(state, { kind: "ModelReturnedText" });
+            } else {
+              const tsmBlocks: TsmToolUseBlock[] = toolUses.map((t) => ({
+                id: t.id,
+                name: t.name,
+                input: t.input,
+              }));
+              state = transition(state, { kind: "ModelReturnedToolUse", toolUses: tsmBlocks });
+            }
+            break;
+          }
+          case "NeedTools": {
+            const toolResults: Anthropic.ToolResultBlockParam[] = [];
+            for (const tu of state.toolUses) {
+              process.stdout.write(`[tool: ${tu.name}]\n`);
+              const tool = toolByName.get(tu.name);
+              if (!tool) {
+                toolResults.push({
+                  type: "tool_result",
+                  tool_use_id: tu.id,
+                  content: `unknown tool "${tu.name}"`,
+                  is_error: true,
+                });
+                continue;
+              }
+              const result = await executeTool(tool, tu.input, { toolUseId: tu.id });
+              toolResults.push({
+                type: "tool_result",
+                tool_use_id: result.toolUseId,
+                content: result.content,
+                is_error: result.isError,
+              });
+            }
+            messages.push({ role: "user", content: toolResults });
+            state = transition(state, { kind: "ToolsExecuted" });
+            break;
+          }
+          case "NeedCompaction":
+            // Reactive compaction is not wired in v1 — pre-turn handles it.
+            state = transition(state, { kind: "CompactionDone" });
+            break;
+          case "NeedRecovery":
+            // Recovery is not wired in v1 — treat as a no-op continue.
+            state = transition(state, { kind: "RecoveryDone" });
+            break;
+        }
       }
+
+      runContext.logger.debug("turn end", {
+        turn: runContext.turnNumber,
+        reason: state.kind === "Done" ? state.reason : "unknown",
+      });
     }
   } finally {
     rl.close();
   }
+}
+
+type CompactArgs = {
+  messages: Anthropic.MessageParam[];
+  client: Anthropic;
+  model: string;
+  contextLimit: number;
+  compactionThreshold: number;
+  snipKeepHead: number;
+  snipKeepTail: number;
+  logger: RunContext["logger"];
+};
+
+/**
+ * Pre-turn compaction ladder: estimate → snip → re-estimate → autocompact.
+ * Returns the (possibly replaced) messages array. Pure with respect to
+ * the input array; callers reassign.
+ */
+async function maybeCompact(args: CompactArgs): Promise<Anthropic.MessageParam[]> {
+  const {
+    messages,
+    client,
+    model,
+    contextLimit,
+    compactionThreshold,
+    snipKeepHead,
+    snipKeepTail,
+    logger,
+  } = args;
+
+  const initialBudget = new TokenBudget(contextLimit);
+  initialBudget.add(estimateTokens(messages), 0);
+  if (!initialBudget.isApproachingLimit(compactionThreshold)) {
+    return messages;
+  }
+
+  const snipped = snip(messages, snipKeepHead, snipKeepTail);
+  logger.info("snip applied", { before: messages.length, after: snipped.length });
+
+  const postSnipBudget = new TokenBudget(contextLimit);
+  postSnipBudget.add(estimateTokens(snipped), 0);
+  if (!postSnipBudget.isApproachingLimit(compactionThreshold)) {
+    return snipped;
+  }
+
+  logger.info("autocompact triggered", { tokensAfterSnip: postSnipBudget.used });
+  return await autoCompact(snipped, client, model);
 }

@@ -154,6 +154,8 @@ Each tool package gets `T1` unit tests and `T3` integration tests. The `tool-bas
 
 ## Section 4 — Turn state machine + context management
 
+> Status: ✅ complete (PR #8).
+
 **Catalog modules:** `turn-state-machine`, `run-context`, `token-budget`, `compaction-snip`, `compaction-autocompact` (R1, R2, R6)
 
 As conversations grow, the runtime needs to manage token budgets and compact history before hitting the 200k context limit. This section formalizes the turn lifecycle into an explicit state machine and adds the two most important compaction strategies. `turn-state-machine` and `run-context` can be built in parallel; compaction modules depend on `token-budget`.
