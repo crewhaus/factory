@@ -103,6 +103,8 @@ export type RunChatLoopOptions = {
   client?: Anthropic;
   /** When supplying a custom client, force OAuth-style system prefix. */
   isOAuth?: boolean;
+  /** Override the input stream (testing). Defaults to process.stdin. */
+  input?: NodeJS.ReadableStream;
 };
 
 export async function runChatLoop(opts: RunChatLoopOptions): Promise<void> {
@@ -123,8 +125,18 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<void> {
     : [userInstructions];
 
   const rl = readline.createInterface({
-    input: process.stdin,
+    input: opts.input ?? process.stdin,
     output: process.stdout,
+  });
+
+  // EOF on stdin (e.g. when input is piped in non-interactively) auto-closes
+  // the readline interface. The next `rl.question` call would then crash with
+  // ERR_USE_AFTER_CLOSE, so race each prompt against the close event and
+  // also catch the post-close throw — close can fire either before we issue
+  // the next prompt or while we're already awaiting one.
+  const STDIN_CLOSED = Symbol("stdin-closed");
+  const closedSignal = new Promise<typeof STDIN_CLOSED>((resolve) => {
+    rl.once("close", () => resolve(STDIN_CLOSED));
   });
 
   const authNote = isOAuth ? " [oauth]" : "";
@@ -132,7 +144,15 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<void> {
 
   try {
     while (true) {
-      const userInput = (await rl.question("\nyou> ")).trim();
+      let userInput: string;
+      try {
+        const result = await Promise.race([rl.question("\nyou> "), closedSignal]);
+        if (result === STDIN_CLOSED) break;
+        userInput = result.trim();
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ERR_USE_AFTER_CLOSE") break;
+        throw err;
+      }
       if (userInput === "") continue;
       if (userInput === "exit" || userInput === "quit") break;
 
