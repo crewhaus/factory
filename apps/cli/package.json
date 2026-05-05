@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@crewhaus/compiler": "workspace:*",
+    "@crewhaus/infra-utils": "workspace:*",
     "@crewhaus/logging": "workspace:*"
   }
 }

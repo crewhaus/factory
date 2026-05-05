@@ -2,6 +2,7 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { SpecParseError, compile } from "@crewhaus/compiler";
+import { ArgParseError, type ParsedArgs, parseArgs } from "@crewhaus/infra-utils";
 import { createLogger } from "@crewhaus/logging";
 
 /**
@@ -18,38 +19,12 @@ import { createLogger } from "@crewhaus/logging";
 
 const logger = createLogger({ bindings: { app: "crewhaus" } });
 
-type ParsedArgs = {
-  subcommand: string;
-  positional: string[];
-  flags: Record<string, string | boolean>;
-};
-
-function parseArgs(argv: string[]): ParsedArgs {
-  const [subcommand = "", ...rest] = argv;
-  const positional: string[] = [];
-  const flags: Record<string, string | boolean> = {};
-
-  for (let i = 0; i < rest.length; i++) {
-    const arg = rest[i];
-    if (arg === undefined) break;
-    if (arg === "-o" || arg === "--out") {
-      const next = rest[i + 1];
-      if (next === undefined) {
-        die(`flag "${arg}" requires a value`);
-      }
-      flags["out"] = next;
-      i += 1;
-    } else if (arg === "-h" || arg === "--help") {
-      flags["help"] = true;
-    } else if (arg.startsWith("-")) {
-      die(`unknown flag: ${arg}`);
-    } else {
-      positional.push(arg);
-    }
-  }
-
-  return { subcommand, positional, flags };
-}
+const FLAG_SCHEMA = {
+  flags: [
+    { name: "out", short: "o", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+} as const;
 
 function usage(): never {
   process.stderr.write(
@@ -111,12 +86,21 @@ function runCompile(args: ParsedArgs): void {
   logger.debug("compile.success", { files: bundle.files.length, out: absOut });
 }
 
-const args = parseArgs(process.argv.slice(2));
-const sub = args.subcommand;
-if (sub === "compile") {
-  runCompile(args);
-} else if (sub === "" || sub === "-h" || sub === "--help") {
+const argv = process.argv.slice(2);
+const [subcommand = "", ...rest] = argv;
+
+let parsed: ParsedArgs;
+try {
+  parsed = parseArgs(rest, FLAG_SCHEMA);
+} catch (err) {
+  if (err instanceof ArgParseError) die(err.message);
+  throw err;
+}
+
+if (subcommand === "compile") {
+  runCompile(parsed);
+} else if (subcommand === "" || subcommand === "-h" || subcommand === "--help") {
   usage();
 } else {
-  die(`unknown subcommand: ${sub}`);
+  die(`unknown subcommand: ${subcommand}`);
 }

@@ -10,6 +10,7 @@
     ".": "./src/index.ts"
   },
   "dependencies": {
+    "@crewhaus/infra-utils": "workspace:*",
     "@crewhaus/ir": "workspace:*"
   }
 }

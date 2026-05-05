@@ -19,6 +19,7 @@
       },
       "dependencies": {
         "@crewhaus/compiler": "workspace:*",
+        "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/logging": "workspace:*",
       },
     },
@@ -33,6 +34,7 @@
       "name": "@crewhaus/compiler",
       "version": "0.0.0",
       "dependencies": {
+        "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
         "@crewhaus/spec": "workspace:*",
         "@crewhaus/target-cli": "workspace:*",
@@ -40,6 +42,10 @@
     },
     "packages/errors": {
       "name": "@crewhaus/errors",
+      "version": "0.0.0",
+    },
+    "packages/infra-utils": {
+      "name": "@crewhaus/infra-utils",
       "version": "0.0.0",
     },
     "packages/ir": {
@@ -71,6 +77,7 @@
       "name": "@crewhaus/target-cli",
       "version": "0.0.0",
       "dependencies": {
+        "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
       },
     },
@@ -103,6 +110,8 @@
     "@crewhaus/compiler": ["@crewhaus/compiler@workspace:packages/compiler"],
 
     "@crewhaus/errors": ["@crewhaus/errors@workspace:packages/errors"],
+
+    "@crewhaus/infra-utils": ["@crewhaus/infra-utils@workspace:packages/infra-utils"],
 
     "@crewhaus/ir": ["@crewhaus/ir@workspace:packages/ir"],
 

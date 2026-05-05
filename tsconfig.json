@@ -3,6 +3,7 @@
   "references": [
     { "path": "./packages/errors" },
     { "path": "./packages/logging" },
+    { "path": "./packages/infra-utils" },
     { "path": "./packages/spec" },
     { "path": "./packages/ir" },
     { "path": "./packages/compiler" },

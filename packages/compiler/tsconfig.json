@@ -5,5 +5,10 @@
     "outDir": "dist"
   },
   "include": ["src/**/*"],
-  "references": [{ "path": "../spec" }, { "path": "../ir" }, { "path": "../target-cli" }]
+  "references": [
+    { "path": "../infra-utils" },
+    { "path": "../spec" },
+    { "path": "../ir" },
+    { "path": "../target-cli" }
+  ]
 }
