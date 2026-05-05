@@ -1,6 +1,6 @@
 # CrewHaus Factory — Build Roadmap
 
-> Status as of 2026-05-05. 13 of ~190 catalog modules implemented.
+> Status as of 2026-05-05. 21 of ~190 catalog modules implemented.
 > See `docs/MODULE-CATALOG.md` for full per-module specs and test layer references.
 
 ---
