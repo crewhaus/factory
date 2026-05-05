@@ -79,6 +79,61 @@ agent:
   });
 });
 
+describe("parseSpec tools field", () => {
+  test("parses a CLI spec with a tools array", () => {
+    const spec = parseSpec(`
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+tools:
+  - read
+  - write
+`);
+    expect(spec.tools).toEqual(["read", "write"]);
+  });
+
+  test("tools field is optional (omitted means undefined)", () => {
+    const spec = parseSpec(`
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+`);
+    expect(spec.tools).toBeUndefined();
+  });
+
+  test("rejects non-string tool entries", () => {
+    expect(() =>
+      parseSpec(`
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+tools:
+  - 123
+`),
+    ).toThrow(SpecParseError);
+  });
+
+  test("rejects empty-string tool names", () => {
+    expect(() =>
+      parseSpec(`
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+tools:
+  - ""
+`),
+    ).toThrow(SpecParseError);
+  });
+});
+
 describe("Spec schema", () => {
   test("schema is exported as a runtime value (Zod)", () => {
     expect(typeof Spec.safeParse).toBe("function");

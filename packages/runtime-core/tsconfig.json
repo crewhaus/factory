@@ -5,5 +5,9 @@
     "outDir": "dist"
   },
   "include": ["src/**/*"],
-  "references": [{ "path": "../errors" }]
+  "references": [
+    { "path": "../errors" },
+    { "path": "../tool-catalog" },
+    { "path": "../tool-executor" }
+  ]
 }

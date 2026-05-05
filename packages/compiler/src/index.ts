@@ -28,6 +28,7 @@ function lower(spec: Spec): IrV0 {
       model: spec.agent.model,
       instructions: spec.agent.instructions,
     },
+    tools: spec.tools ?? [],
   };
 }
 
