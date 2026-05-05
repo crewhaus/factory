@@ -12,6 +12,7 @@
     ".": "./src/index.ts"
   },
   "dependencies": {
-    "@crewhaus/compiler": "workspace:*"
+    "@crewhaus/compiler": "workspace:*",
+    "@crewhaus/logging": "workspace:*"
   }
 }

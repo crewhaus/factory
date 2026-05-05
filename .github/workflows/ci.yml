@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ">=1.2.0"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Test
+        run: bun run test
+
+      - name: Lint
+        run: bun run lint
+
+      - name: Compile hello-cli example
+        run: bun run compile:hello
+
+      - name: Verify generated bundle
+        run: |
+          test -f examples/hello-cli/dist/agent.ts
+          grep -q 'runChatLoop' examples/hello-cli/dist/agent.ts
+          grep -q 'claude-sonnet-4-6' examples/hello-cli/dist/agent.ts
+          grep -q 'DO NOT EDIT' examples/hello-cli/dist/agent.ts

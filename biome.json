@@ -21,6 +21,9 @@
       },
       "suspicious": {
         "noExplicitAny": "warn"
+      },
+      "complexity": {
+        "useLiteralKeys": "off"
       }
     }
   },

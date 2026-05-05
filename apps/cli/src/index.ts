@@ -1,7 +1,8 @@
 #!/usr/bin/env bun
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { compile, SpecParseError } from "@crewhaus/compiler";
+import { SpecParseError, compile } from "@crewhaus/compiler";
+import { createLogger } from "@crewhaus/logging";
 
 /**
  * crewhaus — slice-scope CLI.
@@ -9,7 +10,13 @@ import { compile, SpecParseError } from "@crewhaus/compiler";
  *   compile <spec.yaml> -o <out-dir>    parse → IR → emit bundle to disk
  *
  * Future (per catalog F4 spec-cli): init, deploy, eval, run, watch, doctor.
+ *
+ * User-facing messages (status, errors) go directly to stdout/stderr for clean
+ * UX. The logger is for diagnostic events visible only when CREWHAUS_LOG_LEVEL
+ * is set to debug (or CREWHAUS_LOG=json for machine-readable traces).
  */
+
+const logger = createLogger({ bindings: { app: "crewhaus" } });
 
 type ParsedArgs = {
   subcommand: string;
@@ -74,6 +81,7 @@ function runCompile(args: ParsedArgs): void {
 
   const absSpec = resolve(specPath);
   const absOut = resolve(outDir);
+  logger.debug("compile.start", { spec: absSpec, out: absOut });
 
   let yamlText: string;
   try {
@@ -100,17 +108,15 @@ function runCompile(args: ParsedArgs): void {
     process.stdout.write(`wrote ${fullPath}\n`);
   }
   process.stdout.write(`compiled bundle (${bundle.files.length} file(s)) → ${absOut}\n`);
+  logger.debug("compile.success", { files: bundle.files.length, out: absOut });
 }
 
 const args = parseArgs(process.argv.slice(2));
-switch (args.subcommand) {
-  case "compile":
-    runCompile(args);
-    break;
-  case "":
-  case "-h":
-  case "--help":
-    usage();
-  default:
-    die(`unknown subcommand: ${args.subcommand}`);
+const sub = args.subcommand;
+if (sub === "compile") {
+  runCompile(args);
+} else if (sub === "" || sub === "-h" || sub === "--help") {
+  usage();
+} else {
+  die(`unknown subcommand: ${sub}`);
 }

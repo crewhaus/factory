@@ -5,6 +5,7 @@
     "": {
       "name": "crewhaus-factory",
       "devDependencies": {
+        "@biomejs/biome": "1.9.4",
         "@types/bun": "^1.2.0",
         "@types/node": "^22.0.0",
         "typescript": "^5.7.0",
@@ -18,6 +19,7 @@
       },
       "dependencies": {
         "@crewhaus/compiler": "workspace:*",
+        "@crewhaus/logging": "workspace:*",
       },
     },
     "examples/hello-cli": {
@@ -36,8 +38,16 @@
         "@crewhaus/target-cli": "workspace:*",
       },
     },
+    "packages/errors": {
+      "name": "@crewhaus/errors",
+      "version": "0.0.0",
+    },
     "packages/ir": {
       "name": "@crewhaus/ir",
+      "version": "0.0.0",
+    },
+    "packages/logging": {
+      "name": "@crewhaus/logging",
       "version": "0.0.0",
     },
     "packages/runtime-core": {
@@ -45,12 +55,14 @@
       "version": "0.0.0",
       "dependencies": {
         "@anthropic-ai/sdk": "^0.40.0",
+        "@crewhaus/errors": "workspace:*",
       },
     },
     "packages/spec": {
       "name": "@crewhaus/spec",
       "version": "0.0.0",
       "dependencies": {
+        "@crewhaus/errors": "workspace:*",
         "yaml": "^2.6.0",
         "zod": "^3.23.8",
       },
@@ -66,13 +78,35 @@
   "packages": {
     "@anthropic-ai/sdk": ["@anthropic-ai/sdk@0.40.1", "", { "dependencies": { "@types/node": "^18.11.18", "@types/node-fetch": "^2.6.4", "abort-controller": "^3.0.0", "agentkeepalive": "^4.2.1", "form-data-encoder": "1.7.2", "formdata-node": "^4.3.2", "node-fetch": "^2.6.7" } }, "sha512-DJMWm8lTEM9Lk/MSFL+V+ugF7jKOn0M2Ujvb5fN8r2nY14aHbGPZ1k6sgjL+tpJ3VuOGJNG+4R83jEpOuYPv8w=="],
 
+    "@biomejs/biome": ["@biomejs/biome@1.9.4", "", { "optionalDependencies": { "@biomejs/cli-darwin-arm64": "1.9.4", "@biomejs/cli-darwin-x64": "1.9.4", "@biomejs/cli-linux-arm64": "1.9.4", "@biomejs/cli-linux-arm64-musl": "1.9.4", "@biomejs/cli-linux-x64": "1.9.4", "@biomejs/cli-linux-x64-musl": "1.9.4", "@biomejs/cli-win32-arm64": "1.9.4", "@biomejs/cli-win32-x64": "1.9.4" }, "bin": { "biome": "bin/biome" } }, "sha512-1rkd7G70+o9KkTn5KLmDYXihGoTaIGO9PIIN2ZB7UJxFrWw04CZHPYiMRjYsaDvVV7hP1dYNRLxSANLaBFGpog=="],
+
+    "@biomejs/cli-darwin-arm64": ["@biomejs/cli-darwin-arm64@1.9.4", "", { "os": "darwin", "cpu": "arm64" }, "sha512-bFBsPWrNvkdKrNCYeAp+xo2HecOGPAy9WyNyB/jKnnedgzl4W4Hb9ZMzYNbf8dMCGmUdSavlYHiR01QaYR58cw=="],
+
+    "@biomejs/cli-darwin-x64": ["@biomejs/cli-darwin-x64@1.9.4", "", { "os": "darwin", "cpu": "x64" }, "sha512-ngYBh/+bEedqkSevPVhLP4QfVPCpb+4BBe2p7Xs32dBgs7rh9nY2AIYUL6BgLw1JVXV8GlpKmb/hNiuIxfPfZg=="],
+
+    "@biomejs/cli-linux-arm64": ["@biomejs/cli-linux-arm64@1.9.4", "", { "os": "linux", "cpu": "arm64" }, "sha512-fJIW0+LYujdjUgJJuwesP4EjIBl/N/TcOX3IvIHJQNsAqvV2CHIogsmA94BPG6jZATS4Hi+xv4SkBBQSt1N4/g=="],
+
+    "@biomejs/cli-linux-arm64-musl": ["@biomejs/cli-linux-arm64-musl@1.9.4", "", { "os": "linux", "cpu": "arm64" }, "sha512-v665Ct9WCRjGa8+kTr0CzApU0+XXtRgwmzIf1SeKSGAv+2scAlW6JR5PMFo6FzqqZ64Po79cKODKf3/AAmECqA=="],
+
+    "@biomejs/cli-linux-x64": ["@biomejs/cli-linux-x64@1.9.4", "", { "os": "linux", "cpu": "x64" }, "sha512-lRCJv/Vi3Vlwmbd6K+oQ0KhLHMAysN8lXoCI7XeHlxaajk06u7G+UsFSO01NAs5iYuWKmVZjmiOzJ0OJmGsMwg=="],
+
+    "@biomejs/cli-linux-x64-musl": ["@biomejs/cli-linux-x64-musl@1.9.4", "", { "os": "linux", "cpu": "x64" }, "sha512-gEhi/jSBhZ2m6wjV530Yy8+fNqG8PAinM3oV7CyO+6c3CEh16Eizm21uHVsyVBEB6RIM8JHIl6AGYCv6Q6Q9Tg=="],
+
+    "@biomejs/cli-win32-arm64": ["@biomejs/cli-win32-arm64@1.9.4", "", { "os": "win32", "cpu": "arm64" }, "sha512-tlbhLk+WXZmgwoIKwHIHEBZUwxml7bRJgk0X2sPyNR3S93cdRq6XulAZRQJ17FYGGzWne0fgrXBKpl7l4M87Hg=="],
+
+    "@biomejs/cli-win32-x64": ["@biomejs/cli-win32-x64@1.9.4", "", { "os": "win32", "cpu": "x64" }, "sha512-8Y5wMhVIPaWe6jw2H+KlEm4wP/f7EW3810ZLmDlrEEy5KvBsb9ECEfu/kMWD484ijfQ8+nIi0giMgu9g1UAuuA=="],
+
     "@crewhaus-examples/hello-cli": ["@crewhaus-examples/hello-cli@workspace:examples/hello-cli"],
 
     "@crewhaus/cli": ["@crewhaus/cli@workspace:apps/cli"],
 
     "@crewhaus/compiler": ["@crewhaus/compiler@workspace:packages/compiler"],
 
+    "@crewhaus/errors": ["@crewhaus/errors@workspace:packages/errors"],
+
     "@crewhaus/ir": ["@crewhaus/ir@workspace:packages/ir"],
+
+    "@crewhaus/logging": ["@crewhaus/logging@workspace:packages/logging"],
 
     "@crewhaus/runtime-core": ["@crewhaus/runtime-core@workspace:packages/runtime-core"],
 

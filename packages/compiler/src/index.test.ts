@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { compile, SpecParseError } from "./index";
+import { SpecParseError, compile } from "./index";
 
 const MINIMAL_SPEC = `
 name: hello
@@ -36,7 +36,9 @@ agent:
     a newline.
 `);
     const content = bundle.files[0]?.content ?? "";
-    expect(content).toContain('"line \\"with quotes\\" and \\\\backslashes\\\\ and\\na newline.\\n"');
+    expect(content).toContain(
+      '"line \\"with quotes\\" and \\\\backslashes\\\\ and\\na newline.\\n"',
+    );
   });
 
   test("propagates parse errors as SpecParseError", () => {

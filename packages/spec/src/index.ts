@@ -1,3 +1,4 @@
+import { SpecParseError } from "@crewhaus/errors";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
 
@@ -19,12 +20,7 @@ export const Spec = z
 
 export type Spec = z.infer<typeof Spec>;
 
-export class SpecParseError extends Error {
-  override readonly name = "SpecParseError";
-  constructor(message: string, cause?: unknown) {
-    super(message, cause === undefined ? undefined : { cause });
-  }
-}
+export { SpecParseError };
 
 export function parseSpec(yamlText: string): Spec {
   let raw: unknown;
