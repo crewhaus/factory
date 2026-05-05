@@ -7,7 +7,7 @@
  * its full cause chain via `toJSON()` for the logging layer.
  */
 
-export type ErrorCode = "spec_parse" | "compiler" | "runtime" | "config";
+export type ErrorCode = "spec_parse" | "compiler" | "runtime" | "config" | "tool";
 
 export type SerializedError = {
   name: string;

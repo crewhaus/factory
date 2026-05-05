@@ -32,11 +32,16 @@ Modules in the per-layer tables below are prefixed with status markers:
 | `spec-cli` | F4 | `compile` subcommand only; init/run/deploy/eval/watch/doctor pending. PR #2. |
 | `runtime-orchestrator` | R1 | Single-turn-cycle slice — streaming chat REPL. PR #2. |
 | `model-adapter` | R2 | Anthropic-only via `@anthropic-ai/sdk`. PR #2. |
-| `error-types` | F-foundations | Typed `CrewhausError` hierarchy + `toJSON`. PR #3. |
+| `error-types` | F-foundations | Typed `CrewhausError` hierarchy + `toJSON`. PR #3. Extended with `"tool"` code in PR #6. |
 | `logging` | F-foundations | `pretty/json` formats, level filtering, `child()` bindings. PR #3. |
 | `infra-utils` | F-foundations | `escapeJsonString`, `parseArgs`, `assertNever`. |
+| `tool-catalog` | R3 | `ToolDefinition`/`RegisteredTool` interfaces, `ToolCatalog` registry, `defaultCatalog` singleton. PR #6. |
+| `tool-builder` | R3 | `buildTool()` factory with fail-closed safety defaults. PR #6. |
+| `tool-validate` | R3 | `validateToolInput()` returning typed `ValidationResult`; `ToolValidationError` with Zod issues. PR #6. |
+| `tool-permission-matcher` | R3 | `compilePattern()` + `matchesPattern()`; supports `Bash(git *)`, `Read`, `Write(**/src/**)` glob syntax. PR #6. |
+| `tool-executor` | R3 | `executeTool()`: validate → permission-check → invoke → normalized `ToolResult`. PR #6. |
 
-**Total**: 13 of ~190 modules.
+**Total**: 18 of ~190 modules.
 
 ### In progress (🚧)
 
@@ -187,17 +192,17 @@ These ship as **selectable building blocks** the factory wires into a generated 
 
 | Module | Responsibility | Refs | Targets | Research focus | Tests |
 |---|---|---|---|---|---|
-| **`tool-catalog`** | Registry of tools w/ metadata (concurrency-safe, read-only, destructive, defer, profile). | `claude-code/Tool.ts` + `tools.ts`; `openclaw/.../agents/tool-catalog.ts`; `openai-agents/.../tool.py` | CLI, CHN, CRW, MGD, GRPH, RES, BROW, BATCH | Metadata schema; profile membership | T1 |
-| **`tool-builder`** | Factory `buildTool()` w/ fail-closed defaults. | `claude-code/.../Tool.ts` `buildTool` factory | All | Default safety posture | T1, T9 |
+| ✅ **`tool-catalog`** | Registry of tools w/ metadata (concurrency-safe, read-only, destructive, defer, profile). | `claude-code/Tool.ts` + `tools.ts`; `openclaw/.../agents/tool-catalog.ts`; `openai-agents/.../tool.py` | CLI, CHN, CRW, MGD, GRPH, RES, BROW, BATCH | Metadata schema; profile membership | T1 |
+| ✅ **`tool-builder`** | Factory `buildTool()` w/ fail-closed defaults. | `claude-code/.../Tool.ts` `buildTool` factory | All | Default safety posture | T1, T9 |
 | **`tool-orchestrator`** | Partition tool calls into concurrent/serial batches. | `claude-code/.../services/tools/toolOrchestration.ts` (`partitionToolCalls`); `agent-framework/.../_executor.py` | CLI, CHN, CRW, MGD, GRPH, RES | Concurrency-safety classification | T1, T3, T7 |
-| **`tool-executor`** | Execute single tool: validate → permission → invoke → format result. | `claude-code/.../services/tools/toolExecution.ts`; `openai-agents/.../agent.py` tool exec | CLI, CHN, CRW, MGD, GRPH, RES, BROW | Error normalization; timeout handling | T1, T3 |
+| ✅ **`tool-executor`** | Execute single tool: validate → permission → invoke → format result. | `claude-code/.../services/tools/toolExecution.ts`; `openai-agents/.../agent.py` tool exec | CLI, CHN, CRW, MGD, GRPH, RES, BROW | Error normalization; timeout handling | T1, T3 |
 | **`streaming-tool-executor`** | Execute tools while model still streaming. | `claude-code/.../services/tools/StreamingToolExecutor.ts` | CLI, CHN, RES | Partial-args parsing; sibling abort | T1, T3, T7 |
 | **`tool-result-store`** | Persist large tool outputs to disk; preview to model. | `claude-code/.../utils/toolResultStorage.ts` | CLI, CHN, RES | Preview shape; addressing scheme | T1, T3 |
 | **`tool-loop-detection`** | Detect repeated tool calls; prevent runaway. | `openclaw/.../agents/tool-loop-detection.ts` | CLI, CHN, CRW, GRPH, RES | Hash window; false-positive rate | T1, T9 |
 | **`tool-search`** | Deferred tool loading by keyword (saves tokens). | `claude-code/.../tools/ToolSearchTool/`; `Tool.ts` `shouldDefer` | CLI, CHN, RES | Index strategy; recall quality | T1, T5 |
 | **`tool-display`** | Render tool calls/results in TUI/UI (React/Ink). | `openclaw/.../agents/tool-display.ts`; `claude-code/Tool.ts` `renderToolUseMessage` | CLI, CHN | Render perf; long-output truncation | T1, T3 |
-| **`tool-permission-matcher`** | Pattern matchers for permission rules (`Bash(git *)`). | `claude-code/.../utils/permissions/preparePermissionMatcher` | All | Glob vs regex; pattern composition | T1, T9 |
-| **`tool-validate`** | Pre-permission input validation per tool (Zod/Pydantic). | `claude-code/.../Tool.ts` `validateInput`; `openai-agents/.../tool.py` schema | All | Schema-validation error mapping | T1, T2 |
+| ✅ **`tool-permission-matcher`** | Pattern matchers for permission rules (`Bash(git *)`). | `claude-code/.../utils/permissions/preparePermissionMatcher` | All | Glob vs regex; pattern composition | T1, T9 |
+| ✅ **`tool-validate`** | Pre-permission input validation per tool (Zod/Pydantic). | `claude-code/.../Tool.ts` `validateInput`; `openai-agents/.../tool.py` schema | All | Schema-validation error mapping | T1, T2 |
 
 ### Layer R4 — Built-in Tool Implementations
 

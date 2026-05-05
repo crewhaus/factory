@@ -9,6 +9,11 @@
     { "path": "./packages/compiler" },
     { "path": "./packages/target-cli" },
     { "path": "./packages/runtime-core" },
+    { "path": "./packages/tool-catalog" },
+    { "path": "./packages/tool-builder" },
+    { "path": "./packages/tool-validate" },
+    { "path": "./packages/tool-permission-matcher" },
+    { "path": "./packages/tool-executor" },
     { "path": "./apps/cli" }
   ]
 }
