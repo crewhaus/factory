@@ -14,6 +14,9 @@
     { "path": "./packages/tool-validate" },
     { "path": "./packages/tool-permission-matcher" },
     { "path": "./packages/tool-executor" },
+    { "path": "./packages/tool-fs" },
+    { "path": "./packages/tool-bash" },
+    { "path": "./packages/tool-todo" },
     { "path": "./apps/cli" }
   ]
 }

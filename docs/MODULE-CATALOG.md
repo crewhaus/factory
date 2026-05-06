@@ -40,13 +40,16 @@ Modules in the per-layer tables below are prefixed with status markers:
 | `tool-validate` | R3 | `validateToolInput()` returning typed `ValidationResult`; `ToolValidationError` with Zod issues. PR #6. |
 | `tool-permission-matcher` | R3 | `compilePattern()` + `matchesPattern()`; supports `Bash(git *)`, `Read`, `Write(**/src/**)` glob syntax. PR #6. |
 | `tool-executor` | R3 | `executeTool()`: validate → permission-check → invoke → normalized `ToolResult`. PR #6. |
+| `tool-fs` | R4 | `Read`/`Write`/`Edit`/`Glob`/`Grep` sandboxed to `process.cwd()`; atomic writes via temp + rename; `ToolPermissionError` for traversal. PR #8. |
+| `tool-bash` | R4 | `Bash` via `Bun.spawn` with default 30s timeout (max 10min); captures stdout + stderr; returns formatted exit/timeout report. PR #8. |
+| `tool-todo` | R4 | `TodoWrite` over a per-process module-level list; renders a markdown checklist with status/priority. PR #8. |
 | `turn-state-machine` | R1 | Pure state machine: `NeedModel`/`NeedTools`/`NeedCompaction`/`NeedRecovery`/`Done`; exhaustive transition tests over the (state, event) cartesian product. PR #9. |
 | `run-context` | R1 | `RunContext` type (`runId`, `sessionId`, `turnNumber`, `abortSignal`, `logger`) + `createRunContext()` factory; logger child-bound to run/session ids. PR #9. |
 | `token-budget` | R2 | `estimateTokens()` (char/4 heuristic over text, tool_use, tool_result blocks) + `TokenBudget` class with `add()` / `isApproachingLimit()` (default threshold 0.85). PR #9. |
 | `compaction-snip` | R6 | Pure middle-message removal with `[Context compacted: N messages removed]` marker; tool-use/result orphan defense walks boundaries until pairs are intact. PR #9. |
 | `compaction-autocompact` | R6 | Model-summarize-then-replace; returns `[user-marker, assistant-summary]` pair so the next user input appends naturally. PR #9. |
 
-**Total**: 23 of ~190 modules.
+**Total**: 26 of ~190 modules.
 
 ### In progress (🚧)
 
@@ -213,8 +216,8 @@ These ship as **selectable building blocks** the factory wires into a generated 
 
 | Module | Responsibility | Refs | Targets | Research focus | Tests |
 |---|---|---|---|---|---|
-| **`tool-fs`** | `read`/`write`/`edit`/`apply_patch`/glob/grep over workspace; FS policy enforcement. | `claude-code/.../tools/FileReadTool` etc.; `openclaw/.../agents/bash-tools.*`; `openclaw/.../agents/tool-fs-policy.ts`; `openai-agents/.../sandbox/files.py` | CLI, CHN, CRW, RES, BATCH | Atomic edit; path traversal defense | T1, T3, T8 |
-| **`tool-bash`** | Shell exec, background process mgmt, kill-tree. | `claude-code/.../tools/BashTool`; `openclaw/.../process/exec.ts`,`kill-tree.ts` | CLI, CHN, BATCH, RES | Sandboxing; timeout; output buffering | T1, T3, T8 |
+| ✅ **`tool-fs`** | `read`/`write`/`edit`/`apply_patch`/glob/grep over workspace; FS policy enforcement. Slice ships `Read`/`Write`/`Edit`/`Glob`/`Grep` sandboxed to `process.cwd()`; atomic writes via temp + rename; `ToolPermissionError` on traversal. `apply_patch` and policy hooks pending. PR #8. | `claude-code/.../tools/FileReadTool` etc.; `openclaw/.../agents/bash-tools.*`; `openclaw/.../agents/tool-fs-policy.ts`; `openai-agents/.../sandbox/files.py` | CLI, CHN, CRW, RES, BATCH | Atomic edit; path traversal defense | T1, T3, T8 |
+| ✅ **`tool-bash`** | Shell exec, background process mgmt, kill-tree. Slice ships foreground exec via `Bun.spawn` with default 30s timeout (max 10min). Background process / kill-tree pending. PR #8. | `claude-code/.../tools/BashTool`; `openclaw/.../process/exec.ts`,`kill-tree.ts` | CLI, CHN, BATCH, RES | Sandboxing; timeout; output buffering | T1, T3, T8 |
 | **`tool-process`** | Long-running background processes; monitoring; log capture. | `openclaw/.../agents/bash-tools.process.ts`; `claude-code/.../utils/Shell.ts` | CLI, CHN, BATCH | PID tracking; reap policy | T1, T3, T7 |
 | **`tool-code-execution`** | Sandboxed Python/JS REPL. | `claude-code/.../tools/REPLTool`; OpenAI Code Interpreter; Foundry CI; `adk-python/.../code_executors/` | CLI, MGD, EVAL, RES, BATCH | Container vs micro-VM; warm pool | T1, T3, T7, T8 |
 | **`tool-web-search`** | Brave/Bing/Google/X/Tavily providers. | `openclaw/web-search/`; `claude-code/.../tools/WebSearchTool`; `openai-agents/.../extensions/` | CLI, CHN, CRW, RAG, RES | Provider fallback; result normalization | T1, T2 |
@@ -223,7 +226,7 @@ These ship as **selectable building blocks** the factory wires into a generated 
 | **`tool-mcp`** | Wrapper presenting external MCP tools as native tools. | `claude-code/.../services/mcp/`; `crewAI/.../tools/mcp_native_tool.py`; `openclaw/mcp/` | CLI, CHN, MGD, RES, BROW | Stdio vs SSE; auth handoff | T1, T2, T3 |
 | **`tool-image-generation`** | Image gen (DALL-E/Flux). | `openclaw/.../image-generation/`; `openclaw/.../agents/tool-images.ts` | CHN, CRW, RES | Provider abstraction; safety filters | T1, T2 |
 | **`tool-tts-stt`** | TTS + speech-to-text tools. | `openclaw/tts/`; `openai-agents/.../voice/`; `openclaw/.../realtime-voice/`,`realtime-transcription/` | CHN, VOICE | Codec choice; streaming | T1, T2, T7 |
-| **`tool-todo`** | Todo-list tool for plan tracking. | `claude-code/.../tools/TodoWriteTool` | CLI, CRW, RES | Diff-friendly output | T1 |
+| ✅ **`tool-todo`** | Todo-list tool for plan tracking. Module-level per-process list; `TodoWrite` overwrites the list and renders a markdown checklist with status/priority. PR #8. | `claude-code/.../tools/TodoWriteTool` | CLI, CRW, RES | Diff-friendly output | T1 |
 | **`tool-skill`** | Read SKILL.md → context. | `claude-code/.../tools/SkillTool`; `openclaw/.../agents/skills/serialize.ts` | CLI, CHN, RES | Frontmatter schema; conflict resolution | T1, T3 |
 | **`tool-ask-user`** | Interactive question prompting. | `claude-code/.../tools/AskUserQuestionTool` | CLI, CHN, CRW, VOICE | Multi-select UX; preview rendering | T1, T3 |
 | **`tool-cron`** | Cron-job CRUD tool. | `claude-code/.../tools/ScheduleCronTool`; `openclaw/cron/` | CLI, CHN | Cron-expression parsing | T1, T3 |

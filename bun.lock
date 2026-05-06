@@ -124,6 +124,21 @@
         "@anthropic-ai/sdk": "^0.40.0",
       },
     },
+    "packages/tool-bash": {
+      "name": "@crewhaus/tool-bash",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
+        "@crewhaus/tool-permission-matcher": "workspace:*",
+        "@crewhaus/tool-validate": "workspace:*",
+      },
+    },
     "packages/tool-builder": {
       "name": "@crewhaus/tool-builder",
       "version": "0.0.0",
@@ -152,11 +167,40 @@
         "zod": "^3.23.8",
       },
     },
+    "packages/tool-fs": {
+      "name": "@crewhaus/tool-fs",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
+        "@crewhaus/tool-permission-matcher": "workspace:*",
+        "@crewhaus/tool-validate": "workspace:*",
+      },
+    },
     "packages/tool-permission-matcher": {
       "name": "@crewhaus/tool-permission-matcher",
       "version": "0.0.0",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
+      },
+    },
+    "packages/tool-todo": {
+      "name": "@crewhaus/tool-todo",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
+        "@crewhaus/tool-permission-matcher": "workspace:*",
+        "@crewhaus/tool-validate": "workspace:*",
       },
     },
     "packages/tool-validate": {
@@ -225,13 +269,19 @@
 
     "@crewhaus/token-budget": ["@crewhaus/token-budget@workspace:packages/token-budget"],
 
+    "@crewhaus/tool-bash": ["@crewhaus/tool-bash@workspace:packages/tool-bash"],
+
     "@crewhaus/tool-builder": ["@crewhaus/tool-builder@workspace:packages/tool-builder"],
 
     "@crewhaus/tool-catalog": ["@crewhaus/tool-catalog@workspace:packages/tool-catalog"],
 
     "@crewhaus/tool-executor": ["@crewhaus/tool-executor@workspace:packages/tool-executor"],
 
+    "@crewhaus/tool-fs": ["@crewhaus/tool-fs@workspace:packages/tool-fs"],
+
     "@crewhaus/tool-permission-matcher": ["@crewhaus/tool-permission-matcher@workspace:packages/tool-permission-matcher"],
+
+    "@crewhaus/tool-todo": ["@crewhaus/tool-todo@workspace:packages/tool-todo"],
 
     "@crewhaus/tool-validate": ["@crewhaus/tool-validate@workspace:packages/tool-validate"],
 
