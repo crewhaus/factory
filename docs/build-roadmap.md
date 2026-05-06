@@ -208,6 +208,8 @@ Integrate both compaction strategies into `runtime-core`: check token budget at 
 
 ## Section 5 — CLI subcommand expansion
 
+> Status: ✅ complete (PR #10).
+
 **Catalog modules:** `spec-cli` additions — `init`, `run`, `doctor` subcommands (F4)
 
 The CLI currently only has `compile`. These three new subcommands turn `crewhaus` into the full developer CLI. They can be built in parallel once Sections 1–4 are in place, since they are independent entry points into the already-built pipeline.

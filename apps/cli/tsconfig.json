@@ -8,6 +8,13 @@
   "references": [
     { "path": "../../packages/compiler" },
     { "path": "../../packages/infra-utils" },
-    { "path": "../../packages/logging" }
+    { "path": "../../packages/ir" },
+    { "path": "../../packages/logging" },
+    { "path": "../../packages/runtime-core" },
+    { "path": "../../packages/spec" },
+    { "path": "../../packages/tool-bash" },
+    { "path": "../../packages/tool-catalog" },
+    { "path": "../../packages/tool-fs" },
+    { "path": "../../packages/tool-todo" }
   ]
 }
