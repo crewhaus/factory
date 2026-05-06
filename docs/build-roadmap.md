@@ -899,7 +899,7 @@ End-to-end smoke test before opening the PR (against the live model via ANTHROPI
 4. Abort: start a long-running prompt ("count slowly to 200, one number per line"), press Ctrl-C once. Confirm the current turn aborts cleanly, no orphan child processes (`ps` should show no leftover bash from the smoke run), and the process is still alive accepting input. Press Ctrl-C again — confirm clean exit.
 - Clean up any /tmp/crewhaus-smoke artifacts
 
-Update docs/MODULE-CATALOG.md with everything that is complete and create a pull request with all updates.
+Update docs/MODULE-CATALOG.md and docs/build-roadmap.md with everything that is complete and create a pull request with all updates.
 ```
 
 ---
@@ -951,7 +951,7 @@ End-to-end smoke test before opening the PR (against the live model via ANTHROPI
 4. Streaming: with streaming: true on the run, confirm via timing logs that a Bash tool starts executing before the assistant message_stop event fires.
 - Clean up .crewhaus/tool-results/ artifacts
 
-Update docs/MODULE-CATALOG.md with everything that is complete and create a pull request with all updates.
+Update docs/MODULE-CATALOG.md and docs/build-roadmap.md with everything that is complete and create a pull request with all updates.
 ```
 
 ---
@@ -998,7 +998,7 @@ End-to-end smoke test before opening the PR (against the live model via ANTHROPI
 4. Reconnect: while the agent is running, find the spawned npx child PID and `kill -9` it. Confirm mcp-host detects the disconnect, reconnects with backoff, and a follow-up tool call succeeds.
 5. Verify nothing in the existing examples (hello-cli, hello-workflow) regressed when no mcp_servers are configured.
 
-Update docs/MODULE-CATALOG.md with everything that is complete and create a pull request with all updates.
+Update docs/MODULE-CATALOG.md and docs/build-roadmap.md with everything that is complete and create a pull request with all updates.
 ```
 
 ---
@@ -1051,7 +1051,7 @@ End-to-end smoke test before opening the PR (against the live model via ANTHROPI
 4. Trigger eviction: backdate one session file's mtime to 31 days ago (`touch -t YYYYMMDD0000 ...`) and run `crewhaus run` again — confirm the old session is purged from `list()`.
 5. Clean up `.crewhaus/sessions/` after the smoke run.
 
-Update docs/MODULE-CATALOG.md with everything that is complete and create a pull request with all updates.
+Update docs/MODULE-CATALOG.md and docs/build-roadmap.md with everything that is complete and create a pull request with all updates.
 ```
 
 ---
@@ -1104,7 +1104,7 @@ End-to-end smoke test before opening the PR (against the live model via ANTHROPI
 3. Slash commands: place `.crewhaus/commands/explain.md` with body "Explain $ARGUMENTS in two sentences." Run the agent; type `/explain quicksort`. Confirm the input was expanded before being sent (the model reply should be a quicksort explanation, not a meta-comment about a slash command).
 4. Clean up the temp project.
 
-Update docs/MODULE-CATALOG.md with everything that is complete and create a pull request with all updates.
+Update docs/MODULE-CATALOG.md and docs/build-roadmap.md with everything that is complete and create a pull request with all updates.
 ```
 
 ---
@@ -1166,5 +1166,5 @@ End-to-end smoke test before opening the PR (against the live model via ANTHROPI
 4. POST a payload with a tampered signature and confirm the daemon rejects it with 401 — no model call made.
 5. Kill the daemon (clean shutdown; no orphan processes).
 
-Update docs/MODULE-CATALOG.md with everything that is complete and create a pull request with all updates.
+Update docs/MODULE-CATALOG.md and docs/build-roadmap.md with everything that is complete and create a pull request with all updates.
 ```
