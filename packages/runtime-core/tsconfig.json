@@ -6,8 +6,14 @@
   },
   "include": ["src/**/*"],
   "references": [
+    { "path": "../compaction-autocompact" },
+    { "path": "../compaction-snip" },
     { "path": "../errors" },
+    { "path": "../logging" },
+    { "path": "../run-context" },
+    { "path": "../token-budget" },
     { "path": "../tool-catalog" },
-    { "path": "../tool-executor" }
+    { "path": "../tool-executor" },
+    { "path": "../turn-state-machine" }
   ]
 }

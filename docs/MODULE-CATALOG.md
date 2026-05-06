@@ -30,7 +30,7 @@ Modules in the per-layer tables below are prefixed with status markers:
 | `target-cli-bundle` | F2 | Single-file `agent.ts` codegen for CLI target; emits grouped tool imports + `defaultCatalog.register()` when `ir.tools` is non-empty. PR #2, expanded in PR #7. |
 | `codegen-templates` | F2 | Inline string templates in target-cli. PR #2. |
 | `spec-cli` | F4 | `compile` subcommand only; init/run/deploy/eval/watch/doctor pending. PR #2. |
-| `runtime-orchestrator` | R1 | Streaming chat REPL with `tool_use` loop (executor-driven, Zod→JSON-Schema, full-content-block history). PR #2, expanded in PR #7. |
+| `runtime-orchestrator` | R1 | Streaming chat REPL with state-machine-driven inner loop, `tool_use` execution, and pre-turn compaction (snip → autocompact). PR #2, #7, #9. |
 | `model-adapter` | R2 | Anthropic-only via `@anthropic-ai/sdk`. PR #2. |
 | `error-types` | F-foundations | Typed `CrewhausError` hierarchy + `toJSON`. PR #3. Extended with `"tool"` code in PR #6. |
 | `logging` | F-foundations | `pretty/json` formats, level filtering, `child()` bindings. PR #3. |
@@ -40,8 +40,16 @@ Modules in the per-layer tables below are prefixed with status markers:
 | `tool-validate` | R3 | `validateToolInput()` returning typed `ValidationResult`; `ToolValidationError` with Zod issues. PR #6. |
 | `tool-permission-matcher` | R3 | `compilePattern()` + `matchesPattern()`; supports `Bash(git *)`, `Read`, `Write(**/src/**)` glob syntax. PR #6. |
 | `tool-executor` | R3 | `executeTool()`: validate → permission-check → invoke → normalized `ToolResult`. PR #6. |
+| `tool-fs` | R4 | `Read`/`Write`/`Edit`/`Glob`/`Grep` sandboxed to `process.cwd()`; atomic writes via temp + rename; `ToolPermissionError` for traversal. PR #8. |
+| `tool-bash` | R4 | `Bash` via `Bun.spawn` with default 30s timeout (max 10min); captures stdout + stderr; returns formatted exit/timeout report. PR #8. |
+| `tool-todo` | R4 | `TodoWrite` over a per-process module-level list; renders a markdown checklist with status/priority. PR #8. |
+| `turn-state-machine` | R1 | Pure state machine: `NeedModel`/`NeedTools`/`NeedCompaction`/`NeedRecovery`/`Done`; exhaustive transition tests over the (state, event) cartesian product. PR #9. |
+| `run-context` | R1 | `RunContext` type (`runId`, `sessionId`, `turnNumber`, `abortSignal`, `logger`) + `createRunContext()` factory; logger child-bound to run/session ids. PR #9. |
+| `token-budget` | R2 | `estimateTokens()` (char/4 heuristic over text, tool_use, tool_result blocks) + `TokenBudget` class with `add()` / `isApproachingLimit()` (default threshold 0.85). PR #9. |
+| `compaction-snip` | R6 | Pure middle-message removal with `[Context compacted: N messages removed]` marker; tool-use/result orphan defense walks boundaries until pairs are intact. PR #9. |
+| `compaction-autocompact` | R6 | Model-summarize-then-replace; returns `[user-marker, assistant-summary]` pair so the next user input appends naturally. PR #9. |
 
-**Total**: 18 of ~190 modules.
+**Total**: 26 of ~190 modules.
 
 ### In progress (🚧)
 
@@ -163,15 +171,15 @@ These ship as **selectable building blocks** the factory wires into a generated 
 
 | Module | Responsibility | Refs | Targets | Research focus | Tests |
 |---|---|---|---|---|---|
-| ✅ **`runtime-orchestrator`** | The main agent/run loop: turn cycle (model→tool→model), recovery, termination. Streaming chat REPL with full `tool_use` loop — Zod→JSON-Schema for advertised tools, `tool-executor` for invocation, full content-block history so `tool_result` ids resolve. Recovery + compaction still pending. | `claude-code/query.ts` (1730-line async-gen loop); `langgraph/.../pregel/_loop.py`; `agent-framework/.../_runner.py`; `openai-agents/.../runner.py` | All | Async-gen vs reactive vs callback; state-machine vs free-form | T1, T3, T4 |
+| ✅ **`runtime-orchestrator`** | The main agent/run loop: state-machine-driven inner loop (NeedModel/NeedTools/NeedCompaction/NeedRecovery/Done) with pre-turn compaction (snip → autocompact at 0.85 of context). Reactive 413-recovery + max-tokens recovery still pending. | `claude-code/query.ts` (1730-line async-gen loop); `langgraph/.../pregel/_loop.py`; `agent-framework/.../_runner.py`; `openai-agents/.../runner.py` | All | Async-gen vs reactive vs callback; state-machine vs free-form | T1, T3, T4 |
 | **`query-engine`** | SDK/headless wrapper over orchestrator (`submitMessage()` async-gen). | `claude-code/QueryEngine.ts` | All | SDK message normalization | T1, T3 |
-| **`turn-state-machine`** | Transitions: need_model / need_tools / need_compaction / need_recovery / done. | `claude-code/query.ts` `State`/`Continue` pattern | All | Transition diagram; invariant checks | T1, T9 |
+| ✅ **`turn-state-machine`** | Transitions: need_model / need_tools / need_compaction / need_recovery / done. Pure FSM; exhaustive transition tests. | `claude-code/query.ts` `State`/`Continue` pattern | All | Transition diagram; invariant checks | T1, T9 |
 | **`recovery-engine`** | `max_output_tokens` retries, `prompt_too_long` collapse, media-error strip, model-fallback tombstoning. | `claude-code/query.ts` recovery branches; `agent-framework/.../_runner.py` retry | CLI, CHN, CRW, GRPH, MGD, RES | Recovery taxonomy; idempotence under retry | T1, T4 |
 | **`stream-runtime`** | Generator composition: provider stream → orchestrator → consumer. | `claude-code/.../services/tools/StreamingToolExecutor.ts`; `openai-agents/.../stream_events.py`; `langgraph/.../streaming` | All | Backpressure; multi-consumer fanout | T1, T3, T7 |
 | **`abort-controller`** | Cooperative cancellation (parent vs sibling abort, child controllers per tool). | `claude-code/.../utils/abortController.ts` | All | AbortSignal threading; cleanup ordering | T1, T3 |
 | **`scheduler`** | Concurrency primitives: bounded parallelism, queue, priority lanes (UI vs background vs cron). | `openclaw/.../cron/isolated-agent` lane mgmt | All | Lane isolation; starvation prevention | T1, T7 |
 | **`durability-mode`** | Configurable durability: `exit` / `async` / `sync` checkpoint write. | `langgraph/.../checkpoint` durability modes | GRPH, MGD, CHN, RES | Async write semantics; loss-window analysis | T1, T4, T7 |
-| **`run-context`** | Per-run context object threaded through orchestrator/tools/policy. | `claude-code/.../Tool.ts` `ToolUseContext`; `openai-agents/.../run_context.py` | All | What goes in context; immutability vs mutation | T1, T3 |
+| ✅ **`run-context`** | Per-run context object threaded through orchestrator/tools/policy. `runId`, `sessionId`, `turnNumber`, `abortSignal`, `logger` — logger child-bound by default. Tool-executor threading is a follow-up. | `claude-code/.../Tool.ts` `ToolUseContext`; `openai-agents/.../run_context.py` | All | What goes in context; immutability vs mutation | T1, T3 |
 
 ### Layer R2 — Model Layer
 
@@ -179,7 +187,7 @@ These ship as **selectable building blocks** the factory wires into a generated 
 |---|---|---|---|---|---|
 | ✅ **`model-adapter`** | Protocol over vendor SDKs (Anthropic/OpenAI/Gemini/Bedrock/local). Normalizes messages, tools, structured output. | `openai-agents/.../models/`; `agent-framework/.../openai/`,`anthropic/`,`gemini/`; `dspy/.../clients/`; `crewAI/.../llms/` | All | Common message schema; cross-provider feature gaps | T1, T2 |
 | **`model-router`** | Route by policy: cost/quality/latency, alias resolution, regional routing. | `openclaw/.../agents/anthropic-vertex-stream.ts`; `crewAI/.../llm.py`; `AI-Harness-Systems.md` §model_policy | All | Policy DSL; failover topology | T1, T2, T7 |
-| **`token-budget`** | Track input/output tokens; per-message budgets; auto-continue thresholds. | `claude-code/.../query/tokenBudget.ts` (+500k auto-continue); `claude-code/.../utils/tokenEstimation.ts` | All | Tokenizer parity across providers | T1, T9 |
+| ✅ **`token-budget`** | `estimateTokens()` (char/4 heuristic) + `TokenBudget` class with `add()` and `isApproachingLimit(threshold = 0.85)`. Handles tool_use/tool_result content shapes; image/document blocks ignored. Auto-continue thresholds + diminishing-returns logic deferred. | `claude-code/.../query/tokenBudget.ts` (+500k auto-continue); `claude-code/.../utils/tokenEstimation.ts` | All | Tokenizer parity across providers | T1, T9 |
 | **`prompt-cache-manager`** | Prompt-cache stability: contiguous tool prefixes, cache-friendly system prompts, cache breakpoints. | `claude-code/tools.ts` (built-ins prefix); Anthropic prompt-caching docs | All | Provider cache semantics; breakpoint placement | T1, T4 |
 | **`response-format-coercion`** | Force structured/JSON output; schema validation; retry-on-malformed. | `dspy/.../predict/`; `openai-agents/.../agent_output.py`; `openclaw/.../agents/anthropic-payload-policy.ts` | All | Provider-native vs prompted JSON; coercion ladders | T1, T2, T9 |
 | **`reasoning-controller`** | Thinking modes / extended thinking, effort levels, reasoning visibility. | `claude-code/.../state/AppStateStore.ts` (`thinkingConfig`,`effortValue`); `openclaw/auto-reply/` | CLI, CHN, CRW, GRPH, RES | When to expose chain-of-thought; cost vs quality | T1, T5 |
@@ -208,8 +216,8 @@ These ship as **selectable building blocks** the factory wires into a generated 
 
 | Module | Responsibility | Refs | Targets | Research focus | Tests |
 |---|---|---|---|---|---|
-| **`tool-fs`** | `read`/`write`/`edit`/`apply_patch`/glob/grep over workspace; FS policy enforcement. | `claude-code/.../tools/FileReadTool` etc.; `openclaw/.../agents/bash-tools.*`; `openclaw/.../agents/tool-fs-policy.ts`; `openai-agents/.../sandbox/files.py` | CLI, CHN, CRW, RES, BATCH | Atomic edit; path traversal defense | T1, T3, T8 |
-| **`tool-bash`** | Shell exec, background process mgmt, kill-tree. | `claude-code/.../tools/BashTool`; `openclaw/.../process/exec.ts`,`kill-tree.ts` | CLI, CHN, BATCH, RES | Sandboxing; timeout; output buffering | T1, T3, T8 |
+| ✅ **`tool-fs`** | `read`/`write`/`edit`/`apply_patch`/glob/grep over workspace; FS policy enforcement. Slice ships `Read`/`Write`/`Edit`/`Glob`/`Grep` sandboxed to `process.cwd()`; atomic writes via temp + rename; `ToolPermissionError` on traversal. `apply_patch` and policy hooks pending. PR #8. | `claude-code/.../tools/FileReadTool` etc.; `openclaw/.../agents/bash-tools.*`; `openclaw/.../agents/tool-fs-policy.ts`; `openai-agents/.../sandbox/files.py` | CLI, CHN, CRW, RES, BATCH | Atomic edit; path traversal defense | T1, T3, T8 |
+| ✅ **`tool-bash`** | Shell exec, background process mgmt, kill-tree. Slice ships foreground exec via `Bun.spawn` with default 30s timeout (max 10min). Background process / kill-tree pending. PR #8. | `claude-code/.../tools/BashTool`; `openclaw/.../process/exec.ts`,`kill-tree.ts` | CLI, CHN, BATCH, RES | Sandboxing; timeout; output buffering | T1, T3, T8 |
 | **`tool-process`** | Long-running background processes; monitoring; log capture. | `openclaw/.../agents/bash-tools.process.ts`; `claude-code/.../utils/Shell.ts` | CLI, CHN, BATCH | PID tracking; reap policy | T1, T3, T7 |
 | **`tool-code-execution`** | Sandboxed Python/JS REPL. | `claude-code/.../tools/REPLTool`; OpenAI Code Interpreter; Foundry CI; `adk-python/.../code_executors/` | CLI, MGD, EVAL, RES, BATCH | Container vs micro-VM; warm pool | T1, T3, T7, T8 |
 | **`tool-web-search`** | Brave/Bing/Google/X/Tavily providers. | `openclaw/web-search/`; `claude-code/.../tools/WebSearchTool`; `openai-agents/.../extensions/` | CLI, CHN, CRW, RAG, RES | Provider fallback; result normalization | T1, T2 |
@@ -218,7 +226,7 @@ These ship as **selectable building blocks** the factory wires into a generated 
 | **`tool-mcp`** | Wrapper presenting external MCP tools as native tools. | `claude-code/.../services/mcp/`; `crewAI/.../tools/mcp_native_tool.py`; `openclaw/mcp/` | CLI, CHN, MGD, RES, BROW | Stdio vs SSE; auth handoff | T1, T2, T3 |
 | **`tool-image-generation`** | Image gen (DALL-E/Flux). | `openclaw/.../image-generation/`; `openclaw/.../agents/tool-images.ts` | CHN, CRW, RES | Provider abstraction; safety filters | T1, T2 |
 | **`tool-tts-stt`** | TTS + speech-to-text tools. | `openclaw/tts/`; `openai-agents/.../voice/`; `openclaw/.../realtime-voice/`,`realtime-transcription/` | CHN, VOICE | Codec choice; streaming | T1, T2, T7 |
-| **`tool-todo`** | Todo-list tool for plan tracking. | `claude-code/.../tools/TodoWriteTool` | CLI, CRW, RES | Diff-friendly output | T1 |
+| ✅ **`tool-todo`** | Todo-list tool for plan tracking. Module-level per-process list; `TodoWrite` overwrites the list and renders a markdown checklist with status/priority. PR #8. | `claude-code/.../tools/TodoWriteTool` | CLI, CRW, RES | Diff-friendly output | T1 |
 | **`tool-skill`** | Read SKILL.md → context. | `claude-code/.../tools/SkillTool`; `openclaw/.../agents/skills/serialize.ts` | CLI, CHN, RES | Frontmatter schema; conflict resolution | T1, T3 |
 | **`tool-ask-user`** | Interactive question prompting. | `claude-code/.../tools/AskUserQuestionTool` | CLI, CHN, CRW, VOICE | Multi-select UX; preview rendering | T1, T3 |
 | **`tool-cron`** | Cron-job CRUD tool. | `claude-code/.../tools/ScheduleCronTool`; `openclaw/cron/` | CLI, CHN | Cron-expression parsing | T1, T3 |
@@ -258,10 +266,10 @@ These ship as **selectable building blocks** the factory wires into a generated 
 | Module | Responsibility | Refs | Targets | Research focus | Tests |
 |---|---|---|---|---|---|
 | **`context-engine`** | Pluggable context-management interface (bootstrap/maintain/ingest/assemble/compact). | `openclaw/context-engine/`; `claude-code/context.ts` | CLI, CHN, CRW, GRPH, RES | Interface stability; named impls | T1, T3 |
-| **`compaction-snip`** | Remove old middle messages; keep head+tail. | `claude-code/.../services/compact/snipCompact.ts` | CLI, CHN, RES | Snip thresholds | T1, T9 |
+| ✅ **`compaction-snip`** | Pure middle-message removal with `[Context compacted: N messages removed]` marker. Boundary defense walks `headEnd`/`tailStart` until tool_use/tool_result pairs are intact. | `claude-code/.../services/compact/snipCompact.ts` | CLI, CHN, RES | Snip thresholds | T1, T9 |
 | **`compaction-microcompact`** | Cached per-tool-use-id compaction. | `claude-code/.../services/compact/microCompact.ts`,`apiMicrocompact.ts` | CLI, CHN, RES | Cache key design | T1, T4 |
 | **`compaction-context-collapse`** | Read-time projection over full history. | `claude-code/.../services/contextCollapse/` | CLI, CHN, GRPH, RES | Projection schema | T1, T4 |
-| **`compaction-autocompact`** | Full-conversation summary near token limits. | `claude-code/.../services/compact/autoCompact.ts` | CLI, CHN, CRW, GRPH, MGD, RES | Summary fidelity vs cost | T1, T5 |
+| ✅ **`compaction-autocompact`** | Calls the model to summarize the conversation; returns `[user-marker, assistant-summary]` pair. Circuit breaker, session-memory promotion, cache-safe params deferred. | `claude-code/.../services/compact/autoCompact.ts` | CLI, CHN, CRW, GRPH, MGD, RES | Summary fidelity vs cost | T1, T5 |
 | **`compaction-reactive`** | Emergency compaction on 413 / prompt-too-long. | `claude-code/query.ts` reactive-compact branch | CLI, CHN, CRW, GRPH, MGD, RES | Recovery loop bound | T1, T4 |
 | **`compaction-tool-result-budget`** | Per-message aggregate-tool-result budget; persist overflow. | `claude-code/.../utils/toolResultStorage.ts` | CLI, CHN, RES | Budget allocation strategy | T1, T9 |
 | **`compaction-session-memory`** | Promote insights to session memory at compaction. | `claude-code/.../services/compact/sessionMemoryCompact.ts` | CLI, CHN | Promotion criteria | T1, T5 |

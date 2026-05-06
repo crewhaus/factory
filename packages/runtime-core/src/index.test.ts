@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { PassThrough } from "node:stream";
 import type Anthropic from "@anthropic-ai/sdk";
+import { createLogger } from "@crewhaus/logging";
+import { createRunContext } from "@crewhaus/run-context";
 import { buildTool } from "@crewhaus/tool-builder";
 import { z } from "zod";
 import { resolveAuth, runChatLoop } from "./index";
@@ -236,5 +238,204 @@ describe("runChatLoop tool execution", () => {
     await runChatLoop({ model: "test-model", instructions: "test", client, input });
 
     expect(capturedTools()[0]).toBeUndefined();
+  });
+});
+
+/**
+ * Stub that scripts both `messages.stream` (for normal turns) and
+ * `messages.create` (for autoCompact). Captures every call so tests
+ * can assert ordering between the two surfaces.
+ */
+function makeFullClient(scripts: ReadonlyArray<Anthropic.ContentBlock[]>): {
+  client: Anthropic;
+  streamCount: () => number;
+  createCount: () => number;
+  capturedStreamMessages: () => ReadonlyArray<ReadonlyArray<Anthropic.MessageParam>>;
+} {
+  const captures: Anthropic.MessageParam[][] = [];
+  let streamIdx = 0;
+  let createCount = 0;
+  const client = {
+    messages: {
+      stream: (req: { messages: Anthropic.MessageParam[] }) => {
+        captures.push(req.messages.map((m) => ({ ...m })));
+        const content = scripts[Math.min(streamIdx, scripts.length - 1)] ?? [];
+        streamIdx++;
+        return {
+          on: () => {},
+          finalMessage: async () => ({ content }),
+        };
+      },
+      create: async () => {
+        createCount++;
+        return {
+          content: [{ type: "text", text: "compacted summary", citations: null }],
+        } as Anthropic.Message;
+      },
+    },
+  } as unknown as Anthropic;
+  return {
+    client,
+    streamCount: () => streamIdx,
+    createCount: () => createCount,
+    capturedStreamMessages: () => captures,
+  };
+}
+
+describe("runChatLoop runContext", () => {
+  test("runs without an explicit runContext (default factory fires)", async () => {
+    const input = new PassThrough();
+    input.end();
+    const { client, calls } = makeStubClient();
+    await runChatLoop({ model: "test-model", instructions: "test", client, input });
+    expect(calls()).toBe(0);
+  });
+
+  test("turnNumber increments on each user input", async () => {
+    const ctx = createRunContext();
+    expect(ctx.turnNumber).toBe(0);
+
+    const input = new PassThrough();
+    input.write("hello\n");
+    input.end();
+    const { client } = makeStubClient("ack");
+
+    await runChatLoop({
+      model: "test-model",
+      instructions: "test",
+      client,
+      input,
+      runContext: ctx,
+    });
+
+    expect(ctx.turnNumber).toBe(1);
+  });
+
+  test("logger receives turn-start debug records", async () => {
+    const lines: string[] = [];
+    const logger = createLogger({
+      level: "debug",
+      format: "json",
+      sink: (line) => {
+        lines.push(line);
+      },
+    });
+    const ctx = createRunContext({ logger });
+    const input = new PassThrough();
+    input.write("hi\n");
+    input.end();
+    const { client } = makeStubClient("ack");
+
+    await runChatLoop({
+      model: "test-model",
+      instructions: "test",
+      client,
+      input,
+      runContext: ctx,
+    });
+
+    const turnStarts = lines.filter((l) => l.includes('"msg":"turn start"'));
+    expect(turnStarts.length).toBe(1);
+  });
+});
+
+describe("runChatLoop pre-turn compaction", () => {
+  test("snips long history before calling the model", async () => {
+    // Pre-load the runtime via a long initial user message — bigger
+    // than 0.85 * 200 = 170 tokens at char/4 heuristic, so the budget
+    // trips on turn 1 and snip fires.
+    //
+    // We use a small contextLimit + matching threshold so we don't
+    // need to fabricate ~170k chars of input.
+    const longUser = "a".repeat(800); // ~200 estimated tokens
+    const input = new PassThrough();
+    input.write(`${longUser}\n`);
+    input.end();
+
+    const { client, capturedStreamMessages } = makeFullClient([
+      [{ type: "text", text: "ok", citations: null } as Anthropic.TextBlock],
+    ]);
+
+    await runChatLoop({
+      model: "test-model",
+      instructions: "test",
+      client,
+      input,
+      contextLimit: 200,
+      compactionThreshold: 0.85,
+      snipKeepHead: 0,
+      snipKeepTail: 0,
+    });
+
+    // The model should still have been called, but the messages it saw
+    // include the snip marker (the snipped path runs even though it
+    // collapses to a single marker for keepHead/keepTail = 0/0).
+    const sentToModel = capturedStreamMessages()[0] ?? [];
+    const containsMarker = sentToModel.some(
+      (m) => typeof m.content === "string" && m.content.includes("[Context compacted:"),
+    );
+    expect(containsMarker).toBe(true);
+  });
+
+  test("falls back to autocompact when snip alone does not free enough", async () => {
+    // contextLimit = 100. After snip with keepHead=1/keepTail=1, we
+    // keep both message ends (each big), so usage stays >85% and the
+    // autocompact path triggers.
+    const big = "x".repeat(800); // ~200 tokens estimate
+    const input = new PassThrough();
+    input.write(`${big}\n`);
+    input.end();
+
+    const { client, createCount, capturedStreamMessages } = makeFullClient([
+      [{ type: "text", text: "ok", citations: null } as Anthropic.TextBlock],
+    ]);
+
+    await runChatLoop({
+      model: "test-model",
+      instructions: "test",
+      client,
+      input,
+      contextLimit: 100,
+      compactionThreshold: 0.85,
+      snipKeepHead: 1,
+      snipKeepTail: 1,
+    });
+
+    expect(createCount()).toBe(1);
+    const sentToModel = capturedStreamMessages()[0] ?? [];
+    // After autocompact the history is the [marker, summary] pair.
+    const hasMarker = sentToModel.some(
+      (m) => typeof m.content === "string" && m.content.includes("Previous conversation summary"),
+    );
+    const hasSummary = sentToModel.some(
+      (m) => typeof m.content === "string" && m.content.includes("compacted summary"),
+    );
+    expect(hasMarker).toBe(true);
+    expect(hasSummary).toBe(true);
+  });
+
+  test("skips compaction entirely when budget is below threshold", async () => {
+    const input = new PassThrough();
+    input.write("hello\n"); // ~2 tokens
+    input.end();
+
+    const { client, createCount, capturedStreamMessages } = makeFullClient([
+      [{ type: "text", text: "hi back", citations: null } as Anthropic.TextBlock],
+    ]);
+
+    await runChatLoop({
+      model: "test-model",
+      instructions: "test",
+      client,
+      input,
+      contextLimit: 200_000,
+    });
+
+    expect(createCount()).toBe(0);
+    const sentToModel = capturedStreamMessages()[0] ?? [];
+    const containsMarker = sentToModel.some(
+      (m) => typeof m.content === "string" && m.content.includes("[Context compacted:"),
+    );
+    expect(containsMarker).toBe(false);
   });
 });
