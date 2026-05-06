@@ -373,3 +373,145 @@ permissions:
     });
   });
 });
+
+describe("parseSpec mcp_servers block (Section 9)", () => {
+  test("parses a CLI spec with a stdio MCP server", () => {
+    const spec = parseSpec(`
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+mcp_servers:
+  fs:
+    transport: stdio
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+    env:
+      DEBUG: "1"
+`);
+    if (spec.target !== "cli") expect.unreachable();
+    expect(spec.mcp_servers).toBeDefined();
+    const fs = spec.mcp_servers?.["fs"];
+    expect(fs?.transport).toBe("stdio");
+    if (fs?.transport !== "stdio") expect.unreachable();
+    expect(fs.command).toBe("npx");
+    expect(fs.args).toEqual(["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]);
+    expect(fs.env).toEqual({ DEBUG: "1" });
+  });
+
+  test("parses a CLI spec with an SSE MCP server", () => {
+    const spec = parseSpec(`
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+mcp_servers:
+  remote:
+    transport: sse
+    url: https://example.com/sse
+    headers:
+      Authorization: "Bearer x"
+`);
+    if (spec.target !== "cli") expect.unreachable();
+    const remote = spec.mcp_servers?.["remote"];
+    expect(remote?.transport).toBe("sse");
+    if (remote?.transport !== "sse") expect.unreachable();
+    expect(remote.url).toBe("https://example.com/sse");
+    expect(remote.headers).toEqual({ Authorization: "Bearer x" });
+  });
+
+  test("parses a workflow spec with mcp_servers", () => {
+    const spec = parseSpec(`
+name: w
+target: workflow
+model: m
+mcp_servers:
+  fs:
+    transport: stdio
+    command: foo
+steps:
+  - name: a
+    instructions: ai
+`);
+    if (spec.target !== "workflow") expect.unreachable();
+    expect(spec.mcp_servers?.["fs"]).toBeDefined();
+  });
+
+  test("mcp_servers field is optional", () => {
+    const spec = parseSpec(`
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+`);
+    if (spec.target !== "cli") expect.unreachable();
+    expect(spec.mcp_servers).toBeUndefined();
+  });
+
+  test("rejects an MCP config missing the discriminator", () => {
+    expect(() =>
+      parseSpec(`
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+mcp_servers:
+  fs:
+    command: npx
+`),
+    ).toThrow(SpecParseError);
+  });
+
+  test("rejects an unknown transport value", () => {
+    expect(() =>
+      parseSpec(`
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+mcp_servers:
+  fs:
+    transport: ftp
+    command: x
+`),
+    ).toThrow(SpecParseError);
+  });
+
+  test("rejects an stdio config with stray sse fields (strict mode)", () => {
+    expect(() =>
+      parseSpec(`
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+mcp_servers:
+  fs:
+    transport: stdio
+    command: x
+    url: https://nope
+`),
+    ).toThrow(SpecParseError);
+  });
+
+  test("rejects an SSE config with non-URL url", () => {
+    expect(() =>
+      parseSpec(`
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+mcp_servers:
+  fs:
+    transport: sse
+    url: not-a-url
+`),
+    ).toThrow(SpecParseError);
+  });
+});

@@ -25,6 +25,8 @@
     { "path": "./packages/recovery-engine" },
     { "path": "./packages/permission-engine" },
     { "path": "./packages/abort-controller" },
+    { "path": "./packages/mcp-host" },
+    { "path": "./packages/tool-mcp" },
     { "path": "./apps/cli" }
   ]
 }

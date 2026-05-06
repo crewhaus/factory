@@ -276,9 +276,10 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       ? tools.map((t) => ({
           name: t.name,
           description: t.description,
-          input_schema: zodToJsonSchema(t.inputSchema, {
-            $refStrategy: "none",
-          }) as Anthropic.Tool.InputSchema,
+          input_schema: (t.jsonSchema ??
+            zodToJsonSchema(t.inputSchema, {
+              $refStrategy: "none",
+            })) as Anthropic.Tool.InputSchema,
         }))
       : undefined;
   const toolByName = new Map(tools.map((t) => [t.name, t]));

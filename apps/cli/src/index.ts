@@ -9,6 +9,7 @@ import {
   parseArgs,
 } from "@crewhaus/infra-utils";
 import { createLogger } from "@crewhaus/logging";
+import { McpHost } from "@crewhaus/mcp-host";
 import {
   BUILTIN_DEFAULT_RULES,
   PermissionConfigError,
@@ -19,7 +20,8 @@ import {
 } from "@crewhaus/permission-engine";
 import { resolveAuth, runChatLoop } from "@crewhaus/runtime-core";
 import { parseSpec } from "@crewhaus/spec";
-import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import { type RegisteredTool, ToolCatalog } from "@crewhaus/tool-catalog";
+import { registerMcpServer } from "@crewhaus/tool-mcp";
 
 /**
  * crewhaus — slice-scope CLI.
@@ -277,6 +279,28 @@ async function runRun(args: ParsedArgs): Promise<void> {
     });
   }
 
+  // Section 9 — connect to declared MCP servers and register their remote
+  // tools alongside the built-ins. Mirror of the codegen path in
+  // @crewhaus/target-cli (renderMcpServers); keep them in sync.
+  let mcpHost: McpHost | undefined;
+  if (Object.keys(ir.mcp_servers).length > 0) {
+    const host = new McpHost({ logger });
+    mcpHost = host;
+    for (const [name, cfg] of Object.entries(ir.mcp_servers)) {
+      host.addServer(name, cfg);
+    }
+    const tempCatalog = new ToolCatalog();
+    for (const t of tools) tempCatalog.register(t);
+    await Promise.all(
+      Object.keys(ir.mcp_servers).map((name) =>
+        registerMcpServer(host, name, tempCatalog, {
+          onRegister: ({ fullName }) => process.stdout.write(`[mcp] registered ${fullName}\n`),
+        }),
+      ),
+    );
+    tools = tempCatalog.list().slice();
+  }
+
   const modelOverride = args.flags["model"];
   const model = typeof modelOverride === "string" ? modelOverride : ir.agent.model;
 
@@ -300,13 +324,17 @@ async function runRun(args: ParsedArgs): Promise<void> {
 
   const permissionRules = buildRuleSet(ir.permissions.rules, process.cwd());
 
-  await runChatLoop({
-    model,
-    instructions: ir.agent.instructions,
-    tools,
-    permissionMode,
-    permissionRules,
-  });
+  try {
+    await runChatLoop({
+      model,
+      instructions: ir.agent.instructions,
+      tools,
+      permissionMode,
+      permissionRules,
+    });
+  } finally {
+    if (mcpHost) await mcpHost.disconnectAll();
+  }
 }
 
 type DoctorCheck = { label: string; pass: boolean; reason?: string };

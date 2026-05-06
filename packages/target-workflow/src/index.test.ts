@@ -10,6 +10,7 @@ const TWO_STEP_IR: IrWorkflowV0 = {
     { name: "list", instructions: "list files", model: "claude-sonnet-4-6", tools: ["bash"] },
     { name: "summarize", instructions: "summarize", model: "claude-sonnet-4-6", tools: [] },
   ],
+  mcp_servers: {},
   permissions: { rules: [] },
 };
 

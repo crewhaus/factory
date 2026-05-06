@@ -72,3 +72,23 @@ describe("defaultCatalog", () => {
     expect(defaultCatalog).toBeInstanceOf(ToolCatalog);
   });
 });
+
+describe("RegisteredTool jsonSchema field", () => {
+  test("optional jsonSchema is preserved when set", () => {
+    const catalog = new ToolCatalog();
+    const tool: RegisteredTool = {
+      ...makeTool("Mcp"),
+      jsonSchema: { type: "object", properties: { x: { type: "number" } } },
+    };
+    catalog.register(tool);
+    const got = catalog.get("Mcp");
+    expect(got?.jsonSchema).toEqual({ type: "object", properties: { x: { type: "number" } } });
+  });
+
+  test("absent jsonSchema is undefined", () => {
+    const catalog = new ToolCatalog();
+    const tool = makeTool("Plain");
+    catalog.register(tool);
+    expect(catalog.get("Plain")?.jsonSchema).toBeUndefined();
+  });
+});

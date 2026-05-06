@@ -240,6 +240,48 @@ describe("runChatLoop tool execution", () => {
 
     expect(capturedTools()[0]).toBeUndefined();
   });
+
+  test("forwards tool.jsonSchema verbatim when present (over zodToJsonSchema)", async () => {
+    const customJsonSchema = {
+      type: "object" as const,
+      properties: {
+        message: { type: "string", description: "what to echo" },
+        flag: { type: "boolean", default: false },
+      },
+      required: ["message"],
+      additionalProperties: false,
+    };
+    const mcpStyleTool = buildTool({
+      name: "everything__echo",
+      description: "remote echo",
+      // The validator is permissive (mirrors how tool-mcp builds RegisteredTool).
+      inputSchema: z.unknown(),
+      jsonSchema: customJsonSchema,
+      execute: async () => "ok",
+    });
+
+    const { client, capturedTools } = makeScriptedClient([
+      [{ type: "text", text: "fine", citations: null } as Anthropic.TextBlock],
+    ]);
+
+    const input = new PassThrough();
+    input.write("hi\n");
+    input.end();
+
+    await runChatLoop({
+      model: "test-model",
+      instructions: "test",
+      client,
+      input,
+      tools: [mcpStyleTool],
+    });
+
+    // The tool advertised on the first call must carry the exact JSON Schema
+    // bytes from the MCP-style tool, not the zodToJsonSchema(z.unknown()) shape.
+    expect(capturedTools()[0]?.[0]?.input_schema).toBe(
+      customJsonSchema as unknown as Anthropic.Tool.InputSchema,
+    );
+  });
 });
 
 /**

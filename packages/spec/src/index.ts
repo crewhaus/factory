@@ -31,6 +31,30 @@ const permissionsBlock = z
   .strict()
   .optional();
 
+// MCP servers block (Section 9). Discriminated on `transport` so unknown
+// configs surface as a clear "Invalid literal value" error rather than a
+// confusing union-of-rejections.
+const stdioMcpConfig = z
+  .object({
+    transport: z.literal("stdio"),
+    command: z.string().min(1),
+    args: z.array(z.string()).optional(),
+    env: z.record(z.string()).optional(),
+  })
+  .strict();
+
+const sseMcpConfig = z
+  .object({
+    transport: z.literal("sse"),
+    url: z.string().url(),
+    headers: z.record(z.string()).optional(),
+  })
+  .strict();
+
+const mcpServerConfigSchema = z.discriminatedUnion("transport", [stdioMcpConfig, sseMcpConfig]);
+
+const mcpServersBlock = z.record(z.string().min(1), mcpServerConfigSchema).optional();
+
 const cliSchema = z
   .object({
     name: z.string().min(1),
@@ -40,6 +64,7 @@ const cliSchema = z
       instructions: z.string().min(1),
     }),
     tools: z.array(z.string().min(1)).optional(),
+    mcp_servers: mcpServersBlock,
     permissions: permissionsBlock,
   })
   .strict();
@@ -59,6 +84,7 @@ const workflowSchema = z
     target: z.literal("workflow"),
     model: z.string().min(1),
     steps: z.array(workflowStepSchema).min(1),
+    mcp_servers: mcpServersBlock,
     permissions: permissionsBlock,
   })
   .strict();
@@ -69,6 +95,7 @@ export type Spec = z.infer<typeof Spec>;
 export type SpecCli = z.infer<typeof cliSchema>;
 export type SpecWorkflow = z.infer<typeof workflowSchema>;
 export type SpecWorkflowStep = z.infer<typeof workflowStepSchema>;
+export type SpecMcpServerConfig = z.infer<typeof mcpServerConfigSchema>;
 
 export { SpecParseError };
 

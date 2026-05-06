@@ -10,12 +10,14 @@
     { "path": "../../packages/infra-utils" },
     { "path": "../../packages/ir" },
     { "path": "../../packages/logging" },
+    { "path": "../../packages/mcp-host" },
     { "path": "../../packages/permission-engine" },
     { "path": "../../packages/runtime-core" },
     { "path": "../../packages/spec" },
     { "path": "../../packages/tool-bash" },
     { "path": "../../packages/tool-catalog" },
     { "path": "../../packages/tool-fs" },
+    { "path": "../../packages/tool-mcp" },
     { "path": "../../packages/tool-todo" }
   ]
 }
