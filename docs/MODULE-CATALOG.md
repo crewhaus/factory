@@ -624,6 +624,15 @@ End-to-end tests for the catalog itself (independent of any single module):
 
 ---
 
+# PART I - Module Briefs
+
+One-page build briefs now live in [`docs/module-briefs/README.md`](module-briefs/README.md).
+They follow the dependency order from PART G, expand shorthand entries such as
+`tool-web-*`, `channel-*`, and the named stacks, and include catalog modules that
+PART G implies by layer but does not name directly.
+
+---
+
 ## Critical files for implementation reference
 
 - `docs/AI-Harness-Systems.md` — IR schema, reference architecture, test layers, deployment profiles, OTel dimensions, cross-cutting tradeoffs.
