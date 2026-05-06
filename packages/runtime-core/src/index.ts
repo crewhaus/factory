@@ -18,9 +18,13 @@ import {
   recover,
 } from "@crewhaus/recovery-engine";
 import { type RunContext, createRunContext } from "@crewhaus/run-context";
+import { executeStreaming } from "@crewhaus/streaming-tool-executor";
 import { TokenBudget, estimateTokens } from "@crewhaus/token-budget";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { executeTool } from "@crewhaus/tool-executor";
+import { type LoopDetection, detectLoop } from "@crewhaus/tool-loop-detection";
+import { partitionToolCalls } from "@crewhaus/tool-orchestrator";
+import { storeAndPreview } from "@crewhaus/tool-result-store";
 import {
   type ToolUseBlock as TsmToolUseBlock,
   type TurnState,
@@ -32,9 +36,11 @@ import { zodToJsonSchema } from "zod-to-json-schema";
 /**
  * Slice-scope runtime: a multi-turn streaming chat loop with prompt
  * caching, tool execution, pre-turn context compaction, recovery taxonomy,
- * permission gating, and cooperative cancellation. Maps to catalog R1
- * runtime-orchestrator + R1 recovery-engine + R8 permission-engine + R1
- * abort-controller, plus R2 model-adapter (Anthropic only).
+ * permission gating, cooperative cancellation, and a partitioned/streaming
+ * tool layer. Maps to catalog R1 runtime-orchestrator + R1 recovery-engine
+ * + R8 permission-engine + R1 abort-controller + R3 tool-orchestrator /
+ * tool-loop-detection / tool-result-store / streaming-tool-executor, plus
+ * R2 model-adapter (Anthropic only).
  *
  * Auth resolution: ANTHROPIC_AUTH_TOKEN (Claude Pro/Max OAuth) takes
  * precedence over ANTHROPIC_API_KEY (pay-per-token API key). OAuth tokens
@@ -46,6 +52,19 @@ import { zodToJsonSchema } from "zod-to-json-schema";
  * the permission engine, then executes via @crewhaus/tool-executor before
  * re-calling the model. The state machine reaches Done(no_tools) when the
  * assistant returns no further tool_use blocks for a turn.
+ *
+ * Tool layer enrichment (Section 8): tool execution is partitioned via
+ * `@crewhaus/tool-orchestrator` so concurrency-safe read-only calls run
+ * via `Promise.all` while destructive calls run serially. After each
+ * batch, `@crewhaus/tool-loop-detection` scans the per-run history; on a
+ * hit, a synthetic warning user message is appended (deduped per
+ * signature) so the model can self-correct. Every tool result flows
+ * through `@crewhaus/tool-result-store` — outputs over 10 KB are
+ * persisted to `.crewhaus/tool-results/<runId>/<toolUseId>.txt` and the
+ * model sees a preview pointing at the full file. Behind a
+ * `streaming: true` option, the loop swaps to
+ * `@crewhaus/streaming-tool-executor`, which dispatches tools mid-stream
+ * via the SDK's `contentBlock` event.
  *
  * Compaction: at the start of each user turn, estimate the conversation's
  * token count against `contextLimit` (default 200_000). When usage crosses
@@ -208,6 +227,12 @@ export type RunChatLoopOptions = {
    * a TTY; defaults to false otherwise (singleTurn, piped input, tests).
    */
   installSigintHandler?: boolean;
+  /**
+   * When true, drive the model stream with `@crewhaus/streaming-tool-executor`
+   * so tool execution starts as soon as each `tool_use` block completes
+   * (mid-stream) rather than waiting for the full response. Default: false.
+   */
+  streaming?: boolean;
 };
 
 /**
@@ -272,6 +297,151 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // `useConst` rule (which fires on exactly-one-assignment lets).
   let askApproval: ((toolName: string, input: unknown) => Promise<boolean>) | undefined = undefined;
 
+  // Per-run state for tool-loop detection and warning de-dup. Both span
+  // turns within a single `runChatLoop` invocation so cross-turn loops
+  // (e.g. "keep running date") get caught and warned at most once per
+  // signature.
+  const toolUseHistory: TsmToolUseBlock[] = [];
+  const warnedLoopSignatures = new Set<string>();
+
+  /**
+   * Execute one tool_use block end-to-end: permission gate → executeTool
+   * with the per-tool abort signal → wrap large output through
+   * `tool-result-store`. Returns a fully-formed `ToolResultBlockParam`
+   * suitable for appending to message history.
+   *
+   * Used by both the partitioned (post-stream) path and the streaming
+   * path so the permission/abort/store contract is uniform.
+   */
+  async function executeOneToolUse(
+    tu: TsmToolUseBlock,
+  ): Promise<Anthropic.ToolResultBlockParam> {
+    process.stdout.write(`[tool: ${tu.name}]\n`);
+    const tool = toolByName.get(tu.name);
+    if (!tool) {
+      return {
+        type: "tool_result",
+        tool_use_id: tu.id,
+        content: `unknown tool "${tu.name}"`,
+        is_error: true,
+      };
+    }
+
+    const decision = evaluate(
+      {
+        toolName: tu.name,
+        input: tu.input,
+        readOnly: tool.readOnly,
+        destructive: tool.destructive,
+      },
+      permissionMode,
+      permissionRules,
+    );
+    let approved = decision === "allow";
+    let denialMessage: string | undefined;
+    if (decision === "deny") {
+      denialMessage = "tool denied by permission policy";
+    } else if (decision === "ask") {
+      if (askApproval !== undefined) {
+        approved = await askApproval(tu.name, tu.input);
+        if (!approved) denialMessage = "tool denied by user";
+      } else {
+        denialMessage =
+          "tool denied (single-turn mode: cannot prompt for interactive approval)";
+      }
+    }
+    if (!approved) {
+      return {
+        type: "tool_result",
+        tool_use_id: tu.id,
+        content: denialMessage ?? "tool denied",
+        is_error: true,
+      };
+    }
+
+    const toolAbort = turnAbort.child();
+    const raw = await executeTool(tool, tu.input, {
+      toolUseId: tu.id,
+      signal: toolAbort.signal,
+    });
+    const stored = await storeAndPreview(
+      { toolUseId: raw.toolUseId, content: raw.content, isError: raw.isError },
+      { runId: runContext.runId, toolUseId: tu.id },
+    );
+    if (stored.persisted) {
+      runContext.logger.info("tool result persisted", {
+        toolUseId: tu.id,
+        toolName: tu.name,
+        fullPath: stored.fullPath,
+      });
+    }
+    return {
+      type: "tool_result",
+      tool_use_id: tu.id,
+      content: stored.previewContent,
+      is_error: raw.isError,
+    };
+  }
+
+  /**
+   * Run a list of tool calls honouring the orchestrator's partition:
+   * concurrent-safe batches via `Promise.all`, then serial calls one at
+   * a time. Results are returned in the original `toolUses` order so
+   * they line up with the assistant turn's tool_use blocks.
+   */
+  async function runToolBatch(
+    toolUses: ReadonlyArray<TsmToolUseBlock>,
+  ): Promise<Anthropic.ToolResultBlockParam[]> {
+    const partition = partitionToolCalls(toolUses, (n) => toolByName.get(n));
+    runContext.logger.debug("tool partition", {
+      concurrent: partition.concurrent.map((b) => b.length),
+      serial: partition.serial.length,
+    });
+    const byId = new Map<string, Anthropic.ToolResultBlockParam>();
+    for (const batch of partition.concurrent) {
+      const settled = await Promise.all(batch.map((tu) => executeOneToolUse(tu)));
+      for (const r of settled) byId.set(r.tool_use_id, r);
+    }
+    for (const tu of partition.serial) {
+      const r = await executeOneToolUse(tu);
+      byId.set(r.tool_use_id, r);
+    }
+    return toolUses.map((tu) => {
+      const r = byId.get(tu.id);
+      if (r === undefined) {
+        return {
+          type: "tool_result",
+          tool_use_id: tu.id,
+          content: "internal error: missing tool result",
+          is_error: true,
+        };
+      }
+      return r;
+    });
+  }
+
+  /**
+   * Convert a freshly-detected loop into a synthetic user message that
+   * nudges the model to break the cycle. Returns `null` if no loop is
+   * currently detected, or if this signature has already produced a
+   * warning earlier in the run.
+   */
+  function maybeBuildLoopWarning(): Anthropic.MessageParam | null {
+    const detection: LoopDetection | null = detectLoop(toolUseHistory);
+    if (detection === null) return null;
+    if (warnedLoopSignatures.has(detection.signature)) return null;
+    warnedLoopSignatures.add(detection.signature);
+    runContext.logger.warn("tool loop detected", {
+      signature: detection.signature,
+      toolName: detection.toolName,
+      count: detection.count,
+    });
+    return {
+      role: "user",
+      content: `[runtime] possible loop detected: tool "${detection.toolName}" has been called ${detection.count} times with the same input within the last ${detection.windowSize} calls. Reconsider before repeating; respond with a different approach or final text.`,
+    };
+  }
+
   /**
    * Run one user→assistant turn through the state machine. Mutates
    * `messages` in place (pushes the assistant turn and any tool_results).
@@ -309,6 +479,62 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             stream.on("text", (chunk) => {
               process.stdout.write(chunk);
             });
+
+            if (opts.streaming) {
+              // Streaming path: dispatch tools mid-stream so they start
+              // running as soon as their args are complete-and-valid. We
+              // pass `executeOneToolUse` as the `runTool` so permissions,
+              // per-tool abort, and result-store wrapping all flow
+              // through the same helper as the non-streaming path.
+              const { finalContent, toolResults } = await executeStreaming(stream, {
+                toolByName,
+                abortSignal: turnAbort.signal,
+                runTool: (block) =>
+                  executeOneToolUse({
+                    id: block.id,
+                    name: block.name,
+                    input: block.input,
+                  }),
+                onEvent: (e) => {
+                  runContext.logger.debug("streaming-tool", { ...e });
+                },
+              });
+              process.stdout.write("\n");
+
+              messages.push({
+                role: "assistant",
+                content: finalContent as Anthropic.MessageParam["content"],
+              });
+              terminalContent = [...finalContent];
+
+              const toolUses = finalContent.filter(
+                (b): b is Anthropic.ToolUseBlock => b.type === "tool_use",
+              );
+              if (toolUses.length === 0) {
+                state = transition(state, { kind: "ModelReturnedText" });
+                break;
+              }
+
+              for (const tu of toolUses) {
+                toolUseHistory.push({ id: tu.id, name: tu.name, input: tu.input });
+              }
+              messages.push({ role: "user", content: toolResults });
+              const warning = maybeBuildLoopWarning();
+              if (warning !== null) messages.push(warning);
+
+              // Synthesize the two transitions the state machine expects:
+              // tools have already executed during the stream so we
+              // collapse ModelReturnedToolUse → ToolsExecuted into a
+              // single hop back to NeedModel.
+              const tsmBlocks: TsmToolUseBlock[] = toolUses.map((t) => ({
+                id: t.id,
+                name: t.name,
+                input: t.input,
+              }));
+              state = transition(state, { kind: "ModelReturnedToolUse", toolUses: tsmBlocks });
+              state = transition(state, { kind: "ToolsExecuted" });
+              break;
+            }
 
             const final = await stream.finalMessage();
             process.stdout.write("\n");
@@ -349,6 +575,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 name: t.name,
                 input: t.input,
               }));
+              for (const tu of tsmBlocks) toolUseHistory.push(tu);
               state = transition(state, { kind: "ModelReturnedToolUse", toolUses: tsmBlocks });
             }
           } catch (err) {
@@ -370,70 +597,10 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         }
 
         case "NeedTools": {
-          const toolResults: Anthropic.ToolResultBlockParam[] = [];
-          for (const tu of state.toolUses) {
-            process.stdout.write(`[tool: ${tu.name}]\n`);
-            const tool = toolByName.get(tu.name);
-            if (!tool) {
-              toolResults.push({
-                type: "tool_result",
-                tool_use_id: tu.id,
-                content: `unknown tool "${tu.name}"`,
-                is_error: true,
-              });
-              continue;
-            }
-
-            // Permission gate.
-            const decision = evaluate(
-              {
-                toolName: tu.name,
-                input: tu.input,
-                readOnly: tool.readOnly,
-                destructive: tool.destructive,
-              },
-              permissionMode,
-              permissionRules,
-            );
-
-            let approved = decision === "allow";
-            let denialMessage: string | undefined;
-
-            if (decision === "deny") {
-              denialMessage = "tool denied by permission policy";
-            } else if (decision === "ask") {
-              if (askApproval !== undefined) {
-                approved = await askApproval(tu.name, tu.input);
-                if (!approved) denialMessage = "tool denied by user";
-              } else {
-                denialMessage =
-                  "tool denied (single-turn mode: cannot prompt for interactive approval)";
-              }
-            }
-
-            if (!approved) {
-              toolResults.push({
-                type: "tool_result",
-                tool_use_id: tu.id,
-                content: denialMessage ?? "tool denied",
-                is_error: true,
-              });
-              continue;
-            }
-
-            const toolAbort = turnAbort.child();
-            const result = await executeTool(tool, tu.input, {
-              toolUseId: tu.id,
-              signal: toolAbort.signal,
-            });
-            toolResults.push({
-              type: "tool_result",
-              tool_use_id: result.toolUseId,
-              content: result.content,
-              is_error: result.isError,
-            });
-          }
+          const toolResults = await runToolBatch(state.toolUses);
           messages.push({ role: "user", content: toolResults });
+          const warning = maybeBuildLoopWarning();
+          if (warning !== null) messages.push(warning);
           state = transition(state, { kind: "ToolsExecuted" });
           break;
         }

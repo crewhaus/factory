@@ -330,7 +330,7 @@ Spec/CLI surface: `crewhaus run` accepts `--permission-mode <default|plan|auto|b
 
 ## Section 8 — Tool layer enrichment
 
-> Status: not started.
+> Status: complete (PR #13).
 
 **Catalog modules:** `tool-orchestrator`, `tool-loop-detection`, `tool-result-store`, `streaming-tool-executor` (all R3)
 

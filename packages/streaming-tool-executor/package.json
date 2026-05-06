@@ -1,0 +1,24 @@
+{
+  "name": "@crewhaus/streaming-tool-executor",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Dispatch tool execution mid-stream so tools start before message_stop",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.40.0",
+    "@crewhaus/errors": "workspace:*",
+    "@crewhaus/tool-builder": "workspace:*",
+    "@crewhaus/tool-catalog": "workspace:*",
+    "@crewhaus/tool-executor": "workspace:*",
+    "@crewhaus/turn-state-machine": "workspace:*",
+    "zod": "^3.23.8"
+  }
+}

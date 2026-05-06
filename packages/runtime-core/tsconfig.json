@@ -17,6 +17,10 @@
     { "path": "../token-budget" },
     { "path": "../tool-catalog" },
     { "path": "../tool-executor" },
+    { "path": "../tool-orchestrator" },
+    { "path": "../tool-loop-detection" },
+    { "path": "../tool-result-store" },
+    { "path": "../streaming-tool-executor" },
     { "path": "../turn-state-machine" }
   ]
 }

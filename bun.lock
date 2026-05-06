@@ -127,9 +127,13 @@
         "@crewhaus/permission-engine": "workspace:*",
         "@crewhaus/recovery-engine": "workspace:*",
         "@crewhaus/run-context": "workspace:*",
+        "@crewhaus/streaming-tool-executor": "workspace:*",
         "@crewhaus/token-budget": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
         "@crewhaus/tool-executor": "workspace:*",
+        "@crewhaus/tool-loop-detection": "workspace:*",
+        "@crewhaus/tool-orchestrator": "workspace:*",
+        "@crewhaus/tool-result-store": "workspace:*",
         "@crewhaus/turn-state-machine": "workspace:*",
         "zod-to-json-schema": "^3.23.5",
       },
@@ -145,6 +149,19 @@
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "yaml": "^2.6.0",
+        "zod": "^3.23.8",
+      },
+    },
+    "packages/streaming-tool-executor": {
+      "name": "@crewhaus/streaming-tool-executor",
+      "version": "0.0.0",
+      "dependencies": {
+        "@anthropic-ai/sdk": "^0.40.0",
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-executor": "workspace:*",
+        "@crewhaus/turn-state-machine": "workspace:*",
         "zod": "^3.23.8",
       },
     },
@@ -231,11 +248,35 @@
         "@crewhaus/tool-validate": "workspace:*",
       },
     },
+    "packages/tool-loop-detection": {
+      "name": "@crewhaus/tool-loop-detection",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/turn-state-machine": "workspace:*",
+      },
+    },
+    "packages/tool-orchestrator": {
+      "name": "@crewhaus/tool-orchestrator",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/turn-state-machine": "workspace:*",
+      },
+    },
     "packages/tool-permission-matcher": {
       "name": "@crewhaus/tool-permission-matcher",
       "version": "0.0.0",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
+      },
+    },
+    "packages/tool-result-store": {
+      "name": "@crewhaus/tool-result-store",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-executor": "workspace:*",
       },
     },
     "packages/tool-todo": {
@@ -322,6 +363,8 @@
 
     "@crewhaus/spec": ["@crewhaus/spec@workspace:packages/spec"],
 
+    "@crewhaus/streaming-tool-executor": ["@crewhaus/streaming-tool-executor@workspace:packages/streaming-tool-executor"],
+
     "@crewhaus/target-cli": ["@crewhaus/target-cli@workspace:packages/target-cli"],
 
     "@crewhaus/target-workflow": ["@crewhaus/target-workflow@workspace:packages/target-workflow"],
@@ -338,7 +381,13 @@
 
     "@crewhaus/tool-fs": ["@crewhaus/tool-fs@workspace:packages/tool-fs"],
 
+    "@crewhaus/tool-loop-detection": ["@crewhaus/tool-loop-detection@workspace:packages/tool-loop-detection"],
+
+    "@crewhaus/tool-orchestrator": ["@crewhaus/tool-orchestrator@workspace:packages/tool-orchestrator"],
+
     "@crewhaus/tool-permission-matcher": ["@crewhaus/tool-permission-matcher@workspace:packages/tool-permission-matcher"],
+
+    "@crewhaus/tool-result-store": ["@crewhaus/tool-result-store@workspace:packages/tool-result-store"],
 
     "@crewhaus/tool-todo": ["@crewhaus/tool-todo@workspace:packages/tool-todo"],
 

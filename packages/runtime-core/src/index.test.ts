@@ -679,3 +679,252 @@ describe("runChatLoop singleTurn mode", () => {
     ).rejects.toThrow(/seedMessages.*role.*user/);
   });
 });
+
+// --- Section 8 integration: orchestrator, loop-detect, result-store, streaming ---
+
+describe("runChatLoop — Section 8 orchestrator", () => {
+  test("two read-only tool calls execute concurrently in one turn", async () => {
+    const startedAt: number[] = [];
+    const finishedAt: number[] = [];
+    const slowRead = buildTool({
+      name: "Read",
+      description: "slow",
+      inputSchema: z.object({ id: z.string() }),
+      readOnly: true,
+      concurrencySafe: true,
+      execute: async (input) => {
+        startedAt.push(Date.now());
+        await new Promise((r) => setTimeout(r, 60));
+        finishedAt.push(Date.now());
+        return `read:${input.id}`;
+      },
+    });
+
+    const { client, callCount } = makeScriptedClient([
+      [
+        { type: "tool_use", id: "tu_a", name: "Read", input: { id: "a" } } as Anthropic.ToolUseBlock,
+        { type: "tool_use", id: "tu_b", name: "Read", input: { id: "b" } } as Anthropic.ToolUseBlock,
+      ],
+      [{ type: "text", text: "done", citations: null } as Anthropic.TextBlock],
+    ]);
+
+    const input = new PassThrough();
+    input.write("read both\n");
+    input.end();
+
+    const t0 = Date.now();
+    await runChatLoop({
+      model: "test-model",
+      instructions: "test",
+      client,
+      input,
+      tools: [slowRead],
+    });
+    const elapsed = Date.now() - t0;
+
+    expect(callCount()).toBe(2);
+    // Two 60ms tools running in parallel finish in ~60ms total, not 120ms.
+    expect(elapsed).toBeLessThan(105);
+    // Both starts come before either finish.
+    expect(startedAt.length).toBe(2);
+    expect(finishedAt.length).toBe(2);
+    expect(Math.max(...startedAt)).toBeLessThan(Math.min(...finishedAt));
+  });
+});
+
+describe("runChatLoop — Section 8 loop detection", () => {
+  test("warns when the same tool call repeats >= threshold and stops re-warning", async () => {
+    const dateTool = buildTool({
+      name: "Bash",
+      description: "bash",
+      inputSchema: z.object({ command: z.string() }),
+      destructive: true,
+      execute: async (input) => `ran:${input.command}`,
+    });
+
+    // Three identical Bash calls in a row should trigger a loop warning.
+    // Then a final text turn ends the loop.
+    const sameCall = (id: string): Anthropic.ToolUseBlock =>
+      ({
+        type: "tool_use",
+        id,
+        name: "Bash",
+        input: { command: "date" },
+      } as Anthropic.ToolUseBlock);
+    const { client, capturedMessages } = makeScriptedClient([
+      [sameCall("tu_1")],
+      [sameCall("tu_2")],
+      [sameCall("tu_3")],
+      [{ type: "text", text: "stopping", citations: null } as Anthropic.TextBlock],
+    ]);
+
+    const input = new PassThrough();
+    input.write("loop\n");
+    input.end();
+
+    await runChatLoop({
+      model: "test-model",
+      instructions: "test",
+      client,
+      input,
+      tools: [dateTool],
+    });
+
+    // The 4th call's request body should contain a `[runtime] possible loop`
+    // user message somewhere in `messages`.
+    const fourthCall = capturedMessages()[3] ?? [];
+    const sawWarning = fourthCall.some(
+      (m) =>
+        m.role === "user" &&
+        typeof m.content === "string" &&
+        m.content.includes("[runtime] possible loop detected"),
+    );
+    expect(sawWarning).toBe(true);
+  });
+});
+
+describe("runChatLoop — Section 8 result store", () => {
+  test("large tool output is persisted and replaced with a preview marker", async () => {
+    const { mkdtempSync, rmSync, statSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const tmpRoot = mkdtempSync(join(tmpdir(), "crewhaus-runtime-store-"));
+    const oldCwd = process.cwd();
+    process.chdir(tmpRoot);
+
+    try {
+      // Tool that returns >10KB of multi-line output. Make 250 lines of
+      // 50 chars each (≈12.7KB) so the first-100-lines preview is shorter
+      // than the full payload.
+      const bigPayload = Array.from({ length: 250 }, (_, i) => `line ${i.toString().padEnd(50, " ")}`).join("\n");
+      const bigTool = buildTool({
+        name: "BigRead",
+        description: "produces a large string",
+        inputSchema: z.object({}),
+        readOnly: true,
+        execute: async () => bigPayload,
+      });
+
+      const { client, capturedMessages } = makeScriptedClient([
+        [{ type: "tool_use", id: "tu_big", name: "BigRead", input: {} } as Anthropic.ToolUseBlock],
+        [{ type: "text", text: "done", citations: null } as Anthropic.TextBlock],
+      ]);
+
+      const input = new PassThrough();
+      input.write("go\n");
+      input.end();
+
+      await runChatLoop({
+        model: "test-model",
+        instructions: "test",
+        client,
+        input,
+        tools: [bigTool],
+      });
+
+      // The 2nd call's tool_result content must be a preview, not the full payload.
+      const secondCall = capturedMessages()[1] ?? [];
+      const userMsg = secondCall.find(
+        (m) => m.role === "user" && Array.isArray(m.content),
+      );
+      const content = (userMsg?.content as Anthropic.ToolResultBlockParam[])[0]?.content;
+      const preview = typeof content === "string" ? content : "";
+      expect(preview.length).toBeLessThan(bigPayload.length);
+      expect(preview).toContain("[truncated, full output at ");
+      expect(preview).toContain(".crewhaus/tool-results/");
+
+      // The corresponding file exists with the full payload on disk.
+      const match = preview.match(/full output at (.+?)\]$/);
+      expect(match).not.toBeNull();
+      const fullPath = match?.[1] ?? "";
+      expect(statSync(fullPath).size).toBe(bigPayload.length);
+    } finally {
+      process.chdir(oldCwd);
+      rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("runChatLoop — Section 8 streaming flag", () => {
+  test("streaming: true dispatches tools mid-stream and round-trips results", async () => {
+    const events: { id: string; phase: "started" | "finished" }[] = [];
+    const tool = buildTool({
+      name: "Read",
+      description: "fake",
+      inputSchema: z.object({ id: z.string() }),
+      readOnly: true,
+      concurrencySafe: true,
+      execute: async (input) => {
+        events.push({ id: input.id, phase: "started" });
+        events.push({ id: input.id, phase: "finished" });
+        return `read:${input.id}`;
+      },
+    });
+
+    // Streaming-aware fake client: returns a stream object that fires
+    // contentBlock for each tool_use as the executor subscribes, then
+    // resolves finalMessage with the same blocks.
+    const blocks1 = [
+      { type: "tool_use", id: "tu_1", name: "Read", input: { id: "1" } } as Anthropic.ToolUseBlock,
+      { type: "tool_use", id: "tu_2", name: "Read", input: { id: "2" } } as Anthropic.ToolUseBlock,
+    ];
+    const blocks2 = [{ type: "text", text: "done", citations: null } as Anthropic.TextBlock];
+    let streamIdx = 0;
+    const captures: Anthropic.MessageParam[][] = [];
+    const client = {
+      messages: {
+        stream: (req: { messages: Anthropic.MessageParam[] }) => {
+          captures.push(req.messages.map((m) => ({ ...m })));
+          const content =
+            streamIdx === 0
+              ? (blocks1 as Anthropic.ContentBlock[])
+              : (blocks2 as Anthropic.ContentBlock[]);
+          streamIdx++;
+          const handlers: Record<string, ((arg?: unknown) => void)[]> = {};
+          const stream = {
+            on: (event: string, handler: (arg?: unknown) => void) => {
+              (handlers[event] ??= []).push(handler);
+              if (event === "contentBlock") {
+                // Fire all blocks asynchronously to mimic real stream timing.
+                queueMicrotask(() => {
+                  for (const b of content) handler(b);
+                });
+              }
+            },
+            finalMessage: async () => {
+              await new Promise((r) => setTimeout(r, 5));
+              return { content };
+            },
+          };
+          return stream;
+        },
+      },
+    } as unknown as Anthropic;
+
+    const input = new PassThrough();
+    input.write("go\n");
+    input.end();
+
+    await runChatLoop({
+      model: "test-model",
+      instructions: "test",
+      client,
+      input,
+      tools: [tool],
+      streaming: true,
+    });
+
+    // Both tools ran (executions captured).
+    const startedIds = events.filter((e) => e.phase === "started").map((e) => e.id);
+    expect(startedIds.sort()).toEqual(["1", "2"]);
+
+    // The 2nd model call saw the assistant turn + tool_results in messages.
+    const secondCall = captures[1] ?? [];
+    const userMsg = secondCall.find(
+      (m) => m.role === "user" && Array.isArray(m.content),
+    );
+    expect(userMsg).toBeDefined();
+    const trBlocks = (userMsg?.content as Anthropic.ToolResultBlockParam[]) ?? [];
+    expect(trBlocks.map((b) => b.tool_use_id).sort()).toEqual(["tu_1", "tu_2"]);
+  });
+});
