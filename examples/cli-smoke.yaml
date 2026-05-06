@@ -1,0 +1,9 @@
+name: cli-smoke
+target: cli
+agent:
+  model: claude-haiku-4-5-20251001
+  instructions: |
+    You are a smoke-test agent for crewhaus-factory Section 7. Use tools when
+    the user asks you to. Be brief.
+tools:
+  - bash

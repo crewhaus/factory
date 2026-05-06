@@ -277,4 +277,99 @@ steps:
 `),
     ).toThrow(SpecParseError);
   });
+
+  describe("permissions block", () => {
+    test("accepts a cli spec with permissions: mode + rules", () => {
+      const spec = parseSpec(`
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+permissions:
+  mode: auto
+  rules:
+    - type: alwaysAllow
+      pattern: Read
+    - type: alwaysDeny
+      pattern: Bash(rm**)
+`);
+      expect(spec.target).toBe("cli");
+      if (spec.target !== "cli") return;
+      expect(spec.permissions?.mode).toBe("auto");
+      expect(spec.permissions?.rules).toHaveLength(2);
+    });
+
+    test("accepts a workflow spec with permissions block", () => {
+      const spec = parseSpec(`
+name: w
+target: workflow
+model: m
+steps:
+  - name: a
+    instructions: ai
+permissions:
+  mode: plan
+`);
+      expect(spec.target).toBe("workflow");
+      if (spec.target !== "workflow") return;
+      expect(spec.permissions?.mode).toBe("plan");
+    });
+
+    test("rejects mode: bypass in cli spec with a friendly security message", () => {
+      expect(() =>
+        parseSpec(`
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+permissions:
+  mode: bypass
+`),
+      ).toThrow(SpecParseError);
+      expect(() =>
+        parseSpec(`
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+permissions:
+  mode: bypass
+`),
+      ).toThrow(/bypass mode is only available via the --permission-mode CLI flag/);
+    });
+
+    test("rejects mode: bypass in workflow spec", () => {
+      expect(() =>
+        parseSpec(`
+name: w
+target: workflow
+model: m
+steps:
+  - name: a
+    instructions: ai
+permissions:
+  mode: bypass
+`),
+      ).toThrow(SpecParseError);
+    });
+
+    test("rejects unknown rule type", () => {
+      expect(() =>
+        parseSpec(`
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+permissions:
+  rules:
+    - type: neverAllow
+      pattern: Read
+`),
+      ).toThrow(SpecParseError);
+    });
+  });
 });

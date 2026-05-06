@@ -9,6 +9,14 @@ import {
   parseArgs,
 } from "@crewhaus/infra-utils";
 import { createLogger } from "@crewhaus/logging";
+import {
+  BUILTIN_DEFAULT_RULES,
+  PermissionConfigError,
+  type PermissionMode,
+  type RuleSet,
+  parsePermissionsConfig,
+  tagRules,
+} from "@crewhaus/permission-engine";
 import { resolveAuth, runChatLoop } from "@crewhaus/runtime-core";
 import { parseSpec } from "@crewhaus/spec";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
@@ -40,9 +48,17 @@ const COMPILE_SCHEMA: ParseArgsSchema = {
 const RUN_SCHEMA: ParseArgsSchema = {
   flags: [
     { name: "model", takesValue: true },
+    { name: "permission-mode", takesValue: true },
     { name: "help", short: "h" },
   ],
 };
+
+const VALID_PERMISSION_MODES = ["default", "plan", "auto", "bypass"] as const;
+type CliPermissionMode = (typeof VALID_PERMISSION_MODES)[number];
+
+function isValidPermissionMode(s: string): s is CliPermissionMode {
+  return (VALID_PERMISSION_MODES as readonly string[]).includes(s);
+}
 
 const INIT_SCHEMA: ParseArgsSchema = {
   flags: [{ name: "help", short: "h" }],
@@ -175,9 +191,50 @@ async function loadToolMap(): Promise<Record<string, RegisteredTool>> {
   };
 }
 
+/**
+ * Build the layered permission rule set from the IR (yaml source) and an
+ * optional `.crewhaus/settings.json` (settings source). The flag and hooks
+ * sources are placeholders for future sections (no rules yet, just modes).
+ *
+ * All non-flag config goes through `parsePermissionsConfig` which rejects
+ * `mode: bypass` (defense in depth on top of the spec parser's check).
+ */
+function buildRuleSet(
+  yamlRules: ReadonlyArray<{ type: "alwaysAllow" | "alwaysDeny" | "alwaysAsk"; pattern: string }>,
+  cwd: string,
+): RuleSet {
+  let settings: RuleSet["settings"] = [];
+  const settingsPath = join(cwd, ".crewhaus", "settings.json");
+  if (existsSync(settingsPath)) {
+    let raw: unknown;
+    try {
+      raw = JSON.parse(readFileSync(settingsPath, "utf-8"));
+    } catch (err) {
+      die(`failed to parse ${settingsPath}: ${(err as Error).message}`);
+    }
+    const root = (raw as { permissions?: unknown }).permissions ?? raw;
+    try {
+      const parsed = parsePermissionsConfig(root, "settings");
+      settings = tagRules(parsed.rules, "settings");
+    } catch (err) {
+      if (err instanceof PermissionConfigError) die(err.message);
+      throw err;
+    }
+  }
+  return {
+    flag: [],
+    settings,
+    yaml: tagRules(yamlRules, "yaml"),
+    hooks: [],
+    builtin: BUILTIN_DEFAULT_RULES,
+  };
+}
+
 async function runRun(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
-    process.stdout.write("usage: crewhaus run <spec.yaml> [--model <model>]\n");
+    process.stdout.write(
+      "usage: crewhaus run <spec.yaml> [--model <model>] [--permission-mode <default|plan|auto|bypass>]\n",
+    );
     return;
   }
   const specPath = args.positional[0];
@@ -223,10 +280,32 @@ async function runRun(args: ParsedArgs): Promise<void> {
   const modelOverride = args.flags["model"];
   const model = typeof modelOverride === "string" ? modelOverride : ir.agent.model;
 
+  // Permission mode resolution: CLI flag > spec > "default".
+  // bypass is reachable only via the flag (the spec parser has already
+  // rejected `mode: bypass`).
+  const flagMode = args.flags["permission-mode"];
+  let permissionMode: PermissionMode;
+  if (typeof flagMode === "string") {
+    if (!isValidPermissionMode(flagMode)) {
+      die(
+        `invalid --permission-mode "${flagMode}" — allowed: ${VALID_PERMISSION_MODES.join(", ")}`,
+      );
+    }
+    permissionMode = flagMode;
+  } else if (ir.permissions.mode !== undefined) {
+    permissionMode = ir.permissions.mode;
+  } else {
+    permissionMode = "default";
+  }
+
+  const permissionRules = buildRuleSet(ir.permissions.rules, process.cwd());
+
   await runChatLoop({
     model,
     instructions: ir.agent.instructions,
     tools,
+    permissionMode,
+    permissionRules,
   });
 }
 

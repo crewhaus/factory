@@ -18,6 +18,9 @@
     { "path": "./packages/tool-fs" },
     { "path": "./packages/tool-bash" },
     { "path": "./packages/tool-todo" },
+    { "path": "./packages/recovery-engine" },
+    { "path": "./packages/permission-engine" },
+    { "path": "./packages/abort-controller" },
     { "path": "./apps/cli" }
   ]
 }

@@ -1,11 +1,20 @@
 import { CrewhausError } from "@crewhaus/errors";
 import type { ZodType } from "zod";
 
+/**
+ * Per-call context passed as the second argument to `execute`. Tools that
+ * support cooperative cancellation (e.g. tool-bash forwarding to Bun.spawn)
+ * read `signal` from here; tools that don't care can ignore it entirely.
+ */
+export interface ToolExecuteContext {
+  readonly signal?: AbortSignal;
+}
+
 export interface ToolDefinition<TInput = unknown> {
   name: string;
   description: string;
   inputSchema: ZodType<TInput>;
-  execute: (input: TInput) => Promise<string>;
+  execute: (input: TInput, ctx?: ToolExecuteContext) => Promise<string>;
   concurrencySafe?: boolean;
   readOnly?: boolean;
   destructive?: boolean;
@@ -17,7 +26,7 @@ export interface RegisteredTool {
   name: string;
   description: string;
   inputSchema: ZodType<unknown>;
-  execute: (input: unknown) => Promise<string>;
+  execute: (input: unknown, ctx?: ToolExecuteContext) => Promise<string>;
   concurrencySafe: boolean;
   readOnly: boolean;
   destructive: boolean;

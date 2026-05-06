@@ -1,0 +1,98 @@
+[
+  {
+    "label": "real Anthropic 529 overloaded",
+    "shape": {
+      "name": "APIError",
+      "status": 529,
+      "error": { "type": "overloaded_error", "message": "Overloaded" },
+      "message": "529 Overloaded"
+    },
+    "expectedKind": "retry"
+  },
+  {
+    "label": "real Anthropic 503 service unavailable",
+    "shape": {
+      "name": "APIError",
+      "status": 503,
+      "error": { "type": "api_error", "message": "Service unavailable" },
+      "message": "503 Service Unavailable"
+    },
+    "expectedKind": "retry"
+  },
+  {
+    "label": "real Anthropic 500 internal error",
+    "shape": {
+      "name": "APIError",
+      "status": 500,
+      "error": { "type": "api_error", "message": "Internal server error" },
+      "message": "500 Internal Server Error"
+    },
+    "expectedKind": "retry"
+  },
+  {
+    "label": "real Anthropic prompt too long (400 + invalid_request_error w/ message hint)",
+    "shape": {
+      "name": "BadRequestError",
+      "status": 400,
+      "error": {
+        "type": "invalid_request_error",
+        "message": "Prompt is too long: 220000 tokens > 200000 maximum"
+      },
+      "message": "400 Prompt is too long: 220000 tokens > 200000 maximum"
+    },
+    "expectedKind": "compact"
+  },
+  {
+    "label": "real Anthropic generic 400 invalid_request",
+    "shape": {
+      "name": "BadRequestError",
+      "status": 400,
+      "error": { "type": "invalid_request_error", "message": "messages.0: invalid block" },
+      "message": "400 Bad Request"
+    },
+    "expectedKind": "tombstone"
+  },
+  {
+    "label": "synthetic max_output_tokens (caller fabricates after stop_reason)",
+    "shape": {
+      "name": "Error",
+      "error": { "type": "max_output_tokens", "message": "stop_reason was max_tokens" },
+      "message": "max output tokens reached"
+    },
+    "expectedKind": "continue"
+  },
+  {
+    "label": "user-aborted via APIUserAbortError",
+    "shape": {
+      "name": "APIUserAbortError",
+      "message": "Request was aborted"
+    },
+    "expectedKind": "fail"
+  },
+  {
+    "label": "user-aborted via AbortError",
+    "shape": {
+      "name": "AbortError",
+      "message": "The operation was aborted"
+    },
+    "expectedKind": "fail"
+  },
+  {
+    "label": "unknown TypeError",
+    "shape": {
+      "name": "TypeError",
+      "message": "Cannot read properties of undefined"
+    },
+    "expectedKind": "fail"
+  },
+  {
+    "label": "real Anthropic 401 unauthorized (treated as unknown → fail)",
+    "shape": {
+      "name": "AuthenticationError",
+      "status": 401,
+      "error": { "type": "authentication_error", "message": "invalid x-api-key" },
+      "message": "401 Unauthorized"
+    },
+    "expectedKind": "fail"
+  }
+]

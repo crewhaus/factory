@@ -55,11 +55,14 @@ export const bash: RegisteredTool = buildTool({
     "Run a shell command via `sh -c`. Captures stdout and stderr; default timeout 30s, max 10min.",
   inputSchema: bashSchema,
   destructive: true,
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     const timeoutMs = input.timeout ?? DEFAULT_TIMEOUT_MS;
     const proc = Bun.spawn(["sh", "-c", input.command], {
       stdout: "pipe",
       stderr: "pipe",
+      // When the orchestrator aborts the turn (Ctrl-C, recovery exhaustion),
+      // Bun forwards the signal as SIGTERM to the spawned shell.
+      ...(ctx?.signal !== undefined ? { signal: ctx.signal } : {}),
     });
     let timedOut = false;
     const timer = setTimeout(() => {

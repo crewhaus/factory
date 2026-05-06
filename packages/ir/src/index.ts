@@ -3,6 +3,20 @@
  * In the slice, IR shape mirrors the spec; later passes (ir-passes module)
  * will perform optimization and target-specific lowering.
  */
+export type IrPermissionRule = {
+  readonly type: "alwaysAllow" | "alwaysDeny" | "alwaysAsk";
+  readonly pattern: string;
+};
+
+/**
+ * Permissions config carried through to codegen. The mode here cannot be
+ * "bypass" — that's enforced by the spec parser. Bypass enters via CLI flag.
+ */
+export type IrPermissions = {
+  readonly mode?: "default" | "plan" | "auto";
+  readonly rules: readonly IrPermissionRule[];
+};
+
 export type IrV0 = {
   readonly version: 0;
   readonly name: string;
@@ -12,6 +26,7 @@ export type IrV0 = {
     readonly instructions: string;
   };
   readonly tools: readonly string[];
+  readonly permissions: IrPermissions;
 };
 
 /**
@@ -35,6 +50,7 @@ export type IrWorkflowV0 = {
   readonly name: string;
   readonly target: "workflow";
   readonly steps: readonly IrWorkflowStep[];
+  readonly permissions: IrPermissions;
 };
 
 /** Discriminated union over every supported target IR. */

@@ -13,6 +13,8 @@ export type ExecutionContext = {
   readonly toolUseId: string;
   /** When present, the tool call must match at least one pattern. Absent = allow all. */
   readonly allowedPatterns?: ReadonlyArray<string>;
+  /** Optional cooperative-cancellation signal forwarded to the tool. */
+  readonly signal?: AbortSignal;
 };
 
 export class ToolPermissionError extends CrewhausError {
@@ -49,7 +51,7 @@ export async function executeTool(
   }
 
   try {
-    const content = await tool.execute(validation.value);
+    const content = await tool.execute(validation.value, { signal: context.signal });
     return { toolUseId, content, isError: false };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

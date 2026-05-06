@@ -10,6 +10,7 @@
     { "path": "../../packages/infra-utils" },
     { "path": "../../packages/ir" },
     { "path": "../../packages/logging" },
+    { "path": "../../packages/permission-engine" },
     { "path": "../../packages/runtime-core" },
     { "path": "../../packages/spec" },
     { "path": "../../packages/tool-bash" },
