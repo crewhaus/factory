@@ -52,8 +52,12 @@ Modules in the per-layer tables below are prefixed with status markers:
 | `recovery-engine` | R1 | Pure decision function `recover(error, state) → RecoveryAction` over the Anthropic taxonomy: `prompt_too_long → compact`, `max_output_tokens → continue`, `overloaded/5xx → retry` (exp backoff 1–30 s), `invalid_request → tombstone`, with per-turn budgets. T4 fixture replay over 10 representative SDK error shapes. PR #12. |
 | `permission-engine` | R8 | Modes `default`/`plan`/`auto`/`bypass` over a 5-source `RuleSet` (flag → settings → yaml → hooks → builtin). `evaluate(call, mode, rules) → "allow" \| "deny" \| "ask"`. `parsePermissionsConfig` rejects `mode: bypass` from any non-flag source (T8 security test). PR #12. |
 | `abort-controller` | R1 | Parent/child abort tree with WeakRef cascade so abandoned children don't pin parents; sibling-independent. T3 spawns `sleep 30` and verifies SIGTERM cascade. Wired into runtime-core for SIGINT (first cancels turn, second exits). PR #12. |
+| `tool-orchestrator` | R3 | `partitionToolCalls(calls, lookup) → { concurrent: ToolUse[][], serial: ToolUse[] }` splits calls into concurrent (`concurrencySafe && readOnly && !destructive`) batches and a serial list. T9 property test fuzzes 100 random tool/flag mixes. PR #13. |
+| `tool-loop-detection` | R3 | `detectLoop(history, windowSize=10, threshold=3)` over a sliding window of canonical-JSON `(toolName, input)` signatures; runtime injects a one-shot warning user message per signature. PR #13. |
+| `tool-result-store` | R3 | `storeAndPreview(result, opts)` persists outputs >10 KB to `.crewhaus/tool-results/<runId>/<toolUseId>.txt` (write-exclusive flag for idempotent retry); preview = first 100 lines + `[truncated, full output at <fullPath>]`. Path-traversal guards on `runId`/`toolUseId`. PR #13. |
+| `streaming-tool-executor` | R3 | `executeStreaming(stream, opts)` dispatches `tool_use` blocks during the SDK stream via the `contentBlock` event with a concurrent-safe `canExecute()` gate; sibling-abort on destructive failure. Accepts a `runTool` callback so the runtime can plumb permission + abort + result-store through. T7 load test with 50 partial blocks. PR #13. |
 
-**Total**: 30 of ~190 modules.
+**Total**: 34 of ~190 modules.
 
 ### In progress (🚧)
 
@@ -206,11 +210,11 @@ These ship as **selectable building blocks** the factory wires into a generated 
 |---|---|---|---|---|---|
 | ✅ **`tool-catalog`** | Registry of tools w/ metadata (concurrency-safe, read-only, destructive, defer, profile). | `claude-code/Tool.ts` + `tools.ts`; `openclaw/.../agents/tool-catalog.ts`; `openai-agents/.../tool.py` | CLI, CHN, CRW, MGD, GRPH, RES, BROW, BATCH | Metadata schema; profile membership | T1 |
 | ✅ **`tool-builder`** | Factory `buildTool()` w/ fail-closed defaults. | `claude-code/.../Tool.ts` `buildTool` factory | All | Default safety posture | T1, T9 |
-| **`tool-orchestrator`** | Partition tool calls into concurrent/serial batches. | `claude-code/.../services/tools/toolOrchestration.ts` (`partitionToolCalls`); `agent-framework/.../_executor.py` | CLI, CHN, CRW, MGD, GRPH, RES | Concurrency-safety classification | T1, T3, T7 |
+| ✅ **`tool-orchestrator`** | Partition tool calls into concurrent/serial batches. | `claude-code/.../services/tools/toolOrchestration.ts` (`partitionToolCalls`); `agent-framework/.../_executor.py` | CLI, CHN, CRW, MGD, GRPH, RES | Concurrency-safety classification | T1, T3, T7 |
 | ✅ **`tool-executor`** | Execute single tool: validate → permission → invoke → format result. | `claude-code/.../services/tools/toolExecution.ts`; `openai-agents/.../agent.py` tool exec | CLI, CHN, CRW, MGD, GRPH, RES, BROW | Error normalization; timeout handling | T1, T3 |
-| **`streaming-tool-executor`** | Execute tools while model still streaming. | `claude-code/.../services/tools/StreamingToolExecutor.ts` | CLI, CHN, RES | Partial-args parsing; sibling abort | T1, T3, T7 |
-| **`tool-result-store`** | Persist large tool outputs to disk; preview to model. | `claude-code/.../utils/toolResultStorage.ts` | CLI, CHN, RES | Preview shape; addressing scheme | T1, T3 |
-| **`tool-loop-detection`** | Detect repeated tool calls; prevent runaway. | `openclaw/.../agents/tool-loop-detection.ts` | CLI, CHN, CRW, GRPH, RES | Hash window; false-positive rate | T1, T9 |
+| ✅ **`streaming-tool-executor`** | Execute tools while model still streaming. | `claude-code/.../services/tools/StreamingToolExecutor.ts` | CLI, CHN, RES | Partial-args parsing; sibling abort | T1, T3, T7 |
+| ✅ **`tool-result-store`** | Persist large tool outputs to disk; preview to model. | `claude-code/.../utils/toolResultStorage.ts` | CLI, CHN, RES | Preview shape; addressing scheme | T1, T3 |
+| ✅ **`tool-loop-detection`** | Detect repeated tool calls; prevent runaway. | `openclaw/.../agents/tool-loop-detection.ts` | CLI, CHN, CRW, GRPH, RES | Hash window; false-positive rate | T1, T9 |
 | **`tool-search`** | Deferred tool loading by keyword (saves tokens). | `claude-code/.../tools/ToolSearchTool/`; `Tool.ts` `shouldDefer` | CLI, CHN, RES | Index strategy; recall quality | T1, T5 |
 | **`tool-display`** | Render tool calls/results in TUI/UI (React/Ink). | `openclaw/.../agents/tool-display.ts`; `claude-code/Tool.ts` `renderToolUseMessage` | CLI, CHN | Render perf; long-output truncation | T1, T3 |
 | ✅ **`tool-permission-matcher`** | Pattern matchers for permission rules (`Bash(git *)`). | `claude-code/.../utils/permissions/preparePermissionMatcher` | All | Glob vs regex; pattern composition | T1, T9 |

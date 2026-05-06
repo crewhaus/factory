@@ -7,15 +7,14 @@
 
 ## Current baseline
 
-The compiler pipeline (spec → IR → codegen) ships two target shapes (`cli`, `workflow`) and the runtime carries tools end-to-end with state-machine-driven turns and pre-turn compaction (snip → autocompact). The CLI exposes `compile`, `run`, `init`, and `doctor` subcommands; three built-in tool packages (`tool-fs`, `tool-bash`, `tool-todo`) are registered. Section 7 added recovery (Anthropic taxonomy with budgets), a layered permission engine (modes + 5 rule sources, with `bypass` locked to the CLI flag), and a parent/child abort tree with SIGINT integration.
+The compiler pipeline (spec → IR → codegen) ships two target shapes (`cli`, `workflow`) and the runtime carries tools end-to-end with state-machine-driven turns and pre-turn compaction (snip → autocompact). The CLI exposes `compile`, `run`, `init`, and `doctor` subcommands; three built-in tool packages (`tool-fs`, `tool-bash`, `tool-todo`) are registered. Section 7 added recovery (Anthropic taxonomy with budgets), a layered permission engine (modes + 5 rule sources, with `bypass` locked to the CLI flag), and a parent/child abort tree with SIGINT integration. Section 8 added the partitioned tool layer: concurrent-safe read-only calls run via `Promise.all` while destructive calls run serially, repeated `(toolName, input)` pairs trigger a sliding-window loop warning, large outputs (>10 KB) are persisted to `.crewhaus/tool-results/<runId>/<toolUseId>.txt` with a preview marker the model can re-read, and `streaming: true` dispatches tools mid-stream via the SDK's `contentBlock` event.
 
-What the current stack still cannot do — and Sections 8–12 unlock, in order:
+What the current stack still cannot do — and Sections 9–12 unlock, in order:
 
-1. **Run tools efficiently** — tool calls are serialized, large outputs blow up context, runaway loops are not detected, tools cannot start while the model is still streaming. *(Section 8)*
-2. **Speak MCP** — no way to use the ecosystem of external MCP servers (filesystem, github, sentry, etc.) without writing native tool wrappers. *(Section 9)*
-3. **Remember anything** — no session store, no transcript log, no in-process state container; every `crewhaus run` starts from zero. *(Section 10)*
-4. **Be customized** — no hooks, no skills, no slash commands. The harness has no extension surface for users. *(Section 11)*
-5. **Live in chat** — only CLI and workflow targets exist; no channel/messenger shape. *(Section 12)*
+1. **Speak MCP** — no way to use the ecosystem of external MCP servers (filesystem, github, sentry, etc.) without writing native tool wrappers. *(Section 9)*
+2. **Remember anything** — no session store, no transcript log, no in-process state container; every `crewhaus run` starts from zero. *(Section 10)*
+3. **Be customized** — no hooks, no skills, no slash commands. The harness has no extension surface for users. *(Section 11)*
+4. **Live in chat** — only CLI and workflow targets exist; no channel/messenger shape. *(Section 12)*
 
 ---
 
@@ -330,56 +329,23 @@ Spec/CLI surface: `crewhaus run` accepts `--permission-mode <default|plan|auto|b
 
 ## Section 8 — Tool layer enrichment
 
-> Status: not started.
+> Status: ✅ complete (PR #13).
 
 **Catalog modules:** `tool-orchestrator`, `tool-loop-detection`, `tool-result-store`, `streaming-tool-executor` (all R3)
 
-Today the runtime executes tool calls serially after the stream completes, dumps full output back into context, and has no defense against runaway loops. These four modules close those gaps. They are independent of each other and parallel-safe; each plugs into the existing `tool-executor` or replaces the inline tool loop in `runtime-core`.
+Four independent packages built in parallel, then integrated into `runtime-core`:
 
-### Build order within this section
+- **`tool-orchestrator`** — `partitionToolCalls(calls, lookup)` returns `{ concurrent: ToolUse[][], serial: ToolUse[] }`. A call is concurrent-safe iff `tool.concurrencySafe && tool.readOnly && !tool.destructive`; consecutive safe calls collapse into one batch and the runtime runs them via `Promise.all`. T9 property test fuzzes 100 random tool/flag mixes and asserts no destructive call ever lands in a concurrent batch.
+- **`tool-loop-detection`** — `detectLoop(history, windowSize=10, threshold=3)` over a sliding window of canonical-JSON `(toolName, input)` signatures. Returns `{ signature, toolName, count, … }` when any signature reaches threshold inside the window; canonical encoding sorts object keys recursively so `{a:1,b:2}` and `{b:2,a:1}` collapse to the same signature.
+- **`tool-result-store`** — `storeAndPreview(result, { runId, toolUseId, … })` persists outputs over 10 KB to `.crewhaus/tool-results/<runId>/<toolUseId>.txt` (write-exclusive flag for idempotent retry) and returns a preview = first 100 lines + `[truncated, full output at <fullPath>]`. Path-traversal guards reject any `runId`/`toolUseId` containing `/`, `\`, `..`, or `\0`.
+- **`streaming-tool-executor`** — `executeStreaming(stream, opts)` subscribes to the SDK's `contentBlock` event so each `tool_use` block dispatches as soon as it completes. A `canExecute()` gate runs concurrent-safe tools in parallel and serialises destructive ones; sibling-abort fires on a destructive tool error (overridable via `shouldAbortOnError`). Accepts a `runTool` callback so the runtime can plumb permission gating + per-tool abort + result-store wrapping through the same path as the post-stream batch executor. T7 load test fires 50 synthetic `tool_use` blocks and confirms ordering + completion under 1 s.
 
-```
-tool-orchestrator         ──►  (replace inline tool loop in runtime-core)
-tool-loop-detection             (all four parallel)
-tool-result-store
-streaming-tool-executor
-```
+Runtime integration: `runtime-core.runOneTurn` now calls `partitionToolCalls`, runs concurrent batches via `Promise.all`, and runs serial calls one at a time. Each tool flows through `executeOneToolUse(tu)` which combines permission gating (Section 7) with the per-tool abort tree, `executeTool`, and `storeAndPreview`. After each batch (or after `executeStreaming` returns), `detectLoop()` scans the per-run `toolUseHistory`; on a hit it appends a synthetic user message warning the model and dedups by signature so the warning fires at most once per signature for the lifetime of the run. Behind `streaming: true` on `RunChatLoopOptions`, the loop swaps to `executeStreaming` with the same `executeOneToolUse` callback, collapsing `NeedTools` into the `NeedModel` branch (tools have already executed by the time `finalMessage` resolves).
 
-### What to build
-
-**`packages/tool-orchestrator`**
-- `partitionToolCalls(calls: ToolUse[], catalog: ToolCatalog): { concurrent: ToolUse[][], serial: ToolUse[] }`
-- All `concurrencySafe && readOnly` tools go in concurrent batches (run via `Promise.all`)
-- Anything destructive or with side effects goes serial
-- References: `claude-code/services/tools/toolOrchestration.ts` `partitionToolCalls`, `agent-framework/_executor.py`
-
-**`packages/tool-loop-detection`** *(parallel)*
-- Hash recent (toolName, input) pairs over a sliding window
-- `detectLoop(history: ToolUse[], windowSize = 10, threshold = 3): LoopDetection | null`
-- Returns the loop signature and count when the same call repeats ≥ threshold within window
-- The runtime should inject a tool-result message warning the model and then proceed
-- References: `openclaw/agents/tool-loop-detection.ts`
-
-**`packages/tool-result-store`** *(parallel)*
-- When a tool result exceeds N bytes (default 10KB), persist full output to `.crewhaus/tool-results/<runId>/<toolUseId>.txt` and return a preview + reference to the model
-- `storeAndPreview(result: ToolResult, opts): { previewContent: string, fullPath: string }`
-- Generated agents can later read the full file via the `Read` tool
-- References: `claude-code/utils/toolResultStorage.ts`
-
-**`packages/streaming-tool-executor`** *(parallel)*
-- Parse partial `tool_use` blocks from the streaming response and start execution before `message_stop`
-- Tracks per-tool-use-id partial-args parsing state; fires `executeTool()` as soon as args are complete-and-valid
-- Aborts in-flight tools if the model emits `stop_reason: "end_turn"` while a tool is still running its first invocation alongside another tool that needs to come first (sibling abort)
-- References: `claude-code/services/tools/StreamingToolExecutor.ts`
-
-### Integration into `runtime-core`
-- Replace the inline tool execution in `runChatLoop` with `tool-orchestrator.partitionToolCalls()` then run concurrent batches via `Promise.all`
-- Run `tool-loop-detection.detectLoop()` after each tool batch; on detection, append a system warning and continue
-- Wrap every tool result through `tool-result-store.storeAndPreview()` before appending to message history
-- Behind a `streaming: true` option flag, swap `tool-executor` for `streaming-tool-executor`
+End-to-end smoke against the live model (OAuth via `ANTHROPIC_AUTH_TOKEN`): concurrency log shows the tool partition splitting Read/Bash; loop warning fires at count = 3 of repeated `Bash {command:"date"}`; reading `bun.lock` (22 KB) persists to disk and the agent re-reads the stored path on the next turn; `streaming: true` shows `kind:"tool-started"` debug events firing during the stream, with `durationMs` matching a real `sleep 1` before `turn end`.
 
 ### Tests
-Each package gets `T1` unit tests. `tool-orchestrator` needs a property test (`T9`) verifying no two destructive tools ever land in the same concurrent batch. `streaming-tool-executor` needs a load test (`T7`) with a fake stream emitting 50 partial tool_use blocks.
+`tool-orchestrator`: 9 unit + T9 property tests over 100 random partitions (no destructive call ever in a concurrent batch). `tool-loop-detection`: 18 unit tests including object-order canonicalisation, window slicing, and threshold edge cases. `tool-result-store`: 11 unit tests with temp-dir per case, covering UTF-8 byte-length, idempotent retry, error-result persistence, and path-traversal rejection. `streaming-tool-executor`: 9 unit + T7 load (50 partial blocks under 1 s, results in input order). `runtime-core`: 4 new integration tests for the partitioned, loop-warning, large-result, and streaming paths.
 
 ---
 

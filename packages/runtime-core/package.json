@@ -24,6 +24,10 @@
     "@crewhaus/token-budget": "workspace:*",
     "@crewhaus/tool-catalog": "workspace:*",
     "@crewhaus/tool-executor": "workspace:*",
+    "@crewhaus/tool-loop-detection": "workspace:*",
+    "@crewhaus/tool-orchestrator": "workspace:*",
+    "@crewhaus/tool-result-store": "workspace:*",
+    "@crewhaus/streaming-tool-executor": "workspace:*",
     "@crewhaus/turn-state-machine": "workspace:*",
     "zod-to-json-schema": "^3.23.5"
   },

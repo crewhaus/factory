@@ -1,0 +1,15 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "references": [
+    { "path": "../errors" },
+    { "path": "../tool-builder" },
+    { "path": "../tool-catalog" },
+    { "path": "../tool-executor" },
+    { "path": "../turn-state-machine" }
+  ],
+  "include": ["src/**/*"]
+}
