@@ -126,7 +126,9 @@ describe("executeStreaming — multi-tool concurrency", () => {
     expect(starts.length).toBe(2);
     // Both starts should happen before either finish — i.e. interleaved.
     const firstFinish = events.findIndex((e) => e.kind === "tool-finished");
-    const lastStart = events.map((e, i) => (e.kind === "tool-started" ? i : -1)).reduce((a, c) => Math.max(a, c), -1);
+    const lastStart = events
+      .map((e, i) => (e.kind === "tool-started" ? i : -1))
+      .reduce((a, c) => Math.max(a, c), -1);
     expect(lastStart).toBeLessThan(firstFinish);
   });
 });
@@ -137,11 +139,18 @@ describe("executeStreaming — mixed concurrent + serial", () => {
     const read = makeSlowReadTool(20);
     const bash = makeBashTool();
 
-    const blocks = [tu("tu_1", "Read", { id: "1" }), tu("tu_2", "Bash", { command: "echo" }), tu("tu_3", "Read", { id: "3" })];
+    const blocks = [
+      tu("tu_1", "Read", { id: "1" }),
+      tu("tu_2", "Bash", { command: "echo" }),
+      tu("tu_3", "Read", { id: "3" }),
+    ];
     const events: StreamingToolEvent[] = [];
 
     const promise = executeStreaming(stream, {
-      toolByName: new Map([["Read", read], ["Bash", bash]]),
+      toolByName: new Map([
+        ["Read", read],
+        ["Bash", bash],
+      ]),
       onEvent: (e) => events.push(e),
     });
     for (const b of blocks) stream.emitToolUse(b);
@@ -169,13 +178,13 @@ describe("executeStreaming — sibling abort on destructive failure", () => {
     const bash = makeBashTool({ failOn: "boom" });
 
     const events: StreamingToolEvent[] = [];
-    const blocks = [
-      tu("tu_a", "Bash", { command: "boom" }),
-      tu("tu_b", "Read", { id: "b" }),
-    ];
+    const blocks = [tu("tu_a", "Bash", { command: "boom" }), tu("tu_b", "Read", { id: "b" })];
 
     const promise = executeStreaming(stream, {
-      toolByName: new Map([["Read", read], ["Bash", bash]]),
+      toolByName: new Map([
+        ["Read", read],
+        ["Bash", bash],
+      ]),
       onEvent: (e) => events.push(e),
     });
     for (const b of blocks) stream.emitToolUse(b);
@@ -199,12 +208,12 @@ describe("executeStreaming — sibling abort on destructive failure", () => {
     const bash = makeBashTool({ failOn: "boom" });
     const read = makeReadTool(() => {});
 
-    const blocks = [
-      tu("tu_a", "Bash", { command: "boom" }),
-      tu("tu_b", "Read", { id: "b" }),
-    ];
+    const blocks = [tu("tu_a", "Bash", { command: "boom" }), tu("tu_b", "Read", { id: "b" })];
     const promise = executeStreaming(stream, {
-      toolByName: new Map([["Read", read], ["Bash", bash]]),
+      toolByName: new Map([
+        ["Read", read],
+        ["Bash", bash],
+      ]),
       shouldAbortOnError: () => false,
     });
     for (const b of blocks) stream.emitToolUse(b);
@@ -247,7 +256,11 @@ describe("executeStreaming — late tool_use blocks", () => {
 describe("executeStreaming — text-only stream", () => {
   test("no tool_use blocks → empty toolResults", async () => {
     const stream = new FakeStream();
-    const text: Anthropic.ContentBlock = { type: "text", text: "hi", citations: null } as Anthropic.ContentBlock;
+    const text: Anthropic.ContentBlock = {
+      type: "text",
+      text: "hi",
+      citations: null,
+    } as Anthropic.ContentBlock;
     const promise = executeStreaming(stream, { toolByName: new Map() });
     stream.finish([text]);
     const out = await promise;

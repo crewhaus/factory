@@ -4,8 +4,6 @@
     "rootDir": "src",
     "outDir": "dist"
   },
-  "references": [
-    { "path": "../turn-state-machine" }
-  ],
+  "references": [{ "path": "../turn-state-machine" }],
   "include": ["src/**/*"]
 }

@@ -52,7 +52,11 @@ describe("detectLoop — basic shapes", () => {
   });
 
   test("threshold 3, three identical calls in window → detected", () => {
-    const out = detectLoop([call("Bash", { command: "date" }), call("Bash", { command: "date" }), call("Bash", { command: "date" })]);
+    const out = detectLoop([
+      call("Bash", { command: "date" }),
+      call("Bash", { command: "date" }),
+      call("Bash", { command: "date" }),
+    ]);
     expect(out).not.toBeNull();
     expect(out?.toolName).toBe("Bash");
     expect(out?.count).toBe(3);
@@ -117,7 +121,11 @@ describe("detectLoop — early-exit on first hit", () => {
   test("returns the FIRST signature to hit threshold while scanning the window", () => {
     // Two competing loops in window: A and B. A's third occurrence should
     // arrive first and be reported.
-    const out = detectLoop([call("A"), call("B"), call("A"), call("B"), call("A"), call("B"), call("B")], 10, 3);
+    const out = detectLoop(
+      [call("A"), call("B"), call("A"), call("B"), call("A"), call("B"), call("B")],
+      10,
+      3,
+    );
     expect(out?.toolName).toBe("A");
   });
 });

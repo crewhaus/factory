@@ -17,7 +17,10 @@ function makeTool(overrides: Partial<RegisteredTool> & { name: string }): Regist
   };
 }
 
-function call(name: string, id = `tu_${name}_${Math.random().toString(36).slice(2, 6)}`): ToolUseBlock {
+function call(
+  name: string,
+  id = `tu_${name}_${Math.random().toString(36).slice(2, 6)}`,
+): ToolUseBlock {
   return { id, name, input: {} };
 }
 

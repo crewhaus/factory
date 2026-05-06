@@ -40,12 +40,16 @@ const noop = buildTool({
 describe("streaming-tool-executor — T7 load", () => {
   test("50 partial tool_use blocks complete under 1s and preserve order", async () => {
     const stream = new FakeStream();
-    const blocks: Anthropic.ToolUseBlock[] = Array.from({ length: 50 }, (_, i) => ({
-      type: "tool_use",
-      id: `tu_${i}`,
-      name: "Read",
-      input: { id: i },
-    } as Anthropic.ToolUseBlock));
+    const blocks: Anthropic.ToolUseBlock[] = Array.from(
+      { length: 50 },
+      (_, i) =>
+        ({
+          type: "tool_use",
+          id: `tu_${i}`,
+          name: "Read",
+          input: { id: i },
+        }) as Anthropic.ToolUseBlock,
+    );
 
     const start = Date.now();
     const promise = executeStreaming(stream, {

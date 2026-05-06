@@ -702,8 +702,18 @@ describe("runChatLoop — Section 8 orchestrator", () => {
 
     const { client, callCount } = makeScriptedClient([
       [
-        { type: "tool_use", id: "tu_a", name: "Read", input: { id: "a" } } as Anthropic.ToolUseBlock,
-        { type: "tool_use", id: "tu_b", name: "Read", input: { id: "b" } } as Anthropic.ToolUseBlock,
+        {
+          type: "tool_use",
+          id: "tu_a",
+          name: "Read",
+          input: { id: "a" },
+        } as Anthropic.ToolUseBlock,
+        {
+          type: "tool_use",
+          id: "tu_b",
+          name: "Read",
+          input: { id: "b" },
+        } as Anthropic.ToolUseBlock,
       ],
       [{ type: "text", text: "done", citations: null } as Anthropic.TextBlock],
     ]);
@@ -751,7 +761,7 @@ describe("runChatLoop — Section 8 loop detection", () => {
         id,
         name: "Bash",
         input: { command: "date" },
-      } as Anthropic.ToolUseBlock);
+      }) as Anthropic.ToolUseBlock;
     const { client, capturedMessages } = makeScriptedClient([
       [sameCall("tu_1")],
       [sameCall("tu_2")],
@@ -798,7 +808,10 @@ describe("runChatLoop — Section 8 result store", () => {
       // Tool that returns >10KB of multi-line output. Make 250 lines of
       // 50 chars each (≈12.7KB) so the first-100-lines preview is shorter
       // than the full payload.
-      const bigPayload = Array.from({ length: 250 }, (_, i) => `line ${i.toString().padEnd(50, " ")}`).join("\n");
+      const bigPayload = Array.from(
+        { length: 250 },
+        (_, i) => `line ${i.toString().padEnd(50, " ")}`,
+      ).join("\n");
       const bigTool = buildTool({
         name: "BigRead",
         description: "produces a large string",
@@ -827,9 +840,7 @@ describe("runChatLoop — Section 8 result store", () => {
 
       // The 2nd call's tool_result content must be a preview, not the full payload.
       const secondCall = capturedMessages()[1] ?? [];
-      const userMsg = secondCall.find(
-        (m) => m.role === "user" && Array.isArray(m.content),
-      );
+      const userMsg = secondCall.find((m) => m.role === "user" && Array.isArray(m.content));
       const content = (userMsg?.content as Anthropic.ToolResultBlockParam[])[0]?.content;
       const preview = typeof content === "string" ? content : "";
       expect(preview.length).toBeLessThan(bigPayload.length);
@@ -883,10 +894,8 @@ describe("runChatLoop — Section 8 streaming flag", () => {
               ? (blocks1 as Anthropic.ContentBlock[])
               : (blocks2 as Anthropic.ContentBlock[]);
           streamIdx++;
-          const handlers: Record<string, ((arg?: unknown) => void)[]> = {};
           const stream = {
             on: (event: string, handler: (arg?: unknown) => void) => {
-              (handlers[event] ??= []).push(handler);
               if (event === "contentBlock") {
                 // Fire all blocks asynchronously to mimic real stream timing.
                 queueMicrotask(() => {
@@ -924,9 +933,7 @@ describe("runChatLoop — Section 8 streaming flag", () => {
 
     // The 2nd model call saw the assistant turn + tool_results in messages.
     const secondCall = captures[1] ?? [];
-    const userMsg = secondCall.find(
-      (m) => m.role === "user" && Array.isArray(m.content),
-    );
+    const userMsg = secondCall.find((m) => m.role === "user" && Array.isArray(m.content));
     expect(userMsg).toBeDefined();
     const trBlocks = (userMsg?.content as Anthropic.ToolResultBlockParam[]) ?? [];
     expect(trBlocks.map((b) => b.tool_use_id).sort()).toEqual(["tu_1", "tu_2"]);

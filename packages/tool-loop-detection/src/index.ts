@@ -48,8 +48,7 @@ export function detectLoop(
 ): LoopDetection | null {
   if (history.length === 0 || threshold <= 0) return null;
 
-  const window =
-    history.length > windowSize ? history.slice(history.length - windowSize) : history;
+  const window = history.length > windowSize ? history.slice(history.length - windowSize) : history;
 
   const counts = new Map<string, { count: number; toolName: string }>();
   for (const call of window) {

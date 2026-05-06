@@ -313,9 +313,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
    * Used by both the partitioned (post-stream) path and the streaming
    * path so the permission/abort/store contract is uniform.
    */
-  async function executeOneToolUse(
-    tu: TsmToolUseBlock,
-  ): Promise<Anthropic.ToolResultBlockParam> {
+  async function executeOneToolUse(tu: TsmToolUseBlock): Promise<Anthropic.ToolResultBlockParam> {
     process.stdout.write(`[tool: ${tu.name}]\n`);
     const tool = toolByName.get(tu.name);
     if (!tool) {
@@ -346,8 +344,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         approved = await askApproval(tu.name, tu.input);
         if (!approved) denialMessage = "tool denied by user";
       } else {
-        denialMessage =
-          "tool denied (single-turn mode: cannot prompt for interactive approval)";
+        denialMessage = "tool denied (single-turn mode: cannot prompt for interactive approval)";
       }
     }
     if (!approved) {

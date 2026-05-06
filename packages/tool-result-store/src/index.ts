@@ -119,7 +119,7 @@ export function resolveStoragePath(
   // Sanity: the resolved path must still live under rootDir.
   const root = resolve(rootDir);
   if (!abs.startsWith(`${root}${sep}`)) {
-    throw new RuntimeError(`tool-result-store: resolved path escapes rootDir`);
+    throw new RuntimeError("tool-result-store: resolved path escapes rootDir");
   }
   return abs;
 }

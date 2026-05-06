@@ -54,7 +54,10 @@ export type StreamingExecuteOptions = {
    * tools. Default: abort when the failing tool was destructive
    * (mirrors claude-code's Bash-only abort, but generalised).
    */
-  readonly shouldAbortOnError?: (failedToolName: string, tool: RegisteredTool | undefined) => boolean;
+  readonly shouldAbortOnError?: (
+    failedToolName: string,
+    tool: RegisteredTool | undefined,
+  ) => boolean;
   /**
    * Per-tool execution function used in place of the bare `executeTool`
    * call. The runtime supplies one that adds permission gating, per-tool
@@ -101,7 +104,7 @@ function defaultShouldAbortOnError(
 }
 
 function isConcurrencySafe(tool: RegisteredTool | undefined): boolean {
-  return tool !== undefined && tool.concurrencySafe && tool.readOnly && !tool.destructive;
+  return tool?.concurrencySafe === true && tool.readOnly && !tool.destructive;
 }
 
 /**
@@ -177,21 +180,19 @@ export async function executeStreaming(
     });
     const dispatchPromise: Promise<Anthropic.ToolResultBlockParam> = opts.runTool
       ? opts.runTool(entry.block)
-      : (entry.tool === undefined
-          ? Promise.resolve<Anthropic.ToolResultBlockParam>({
-              type: "tool_result",
-              tool_use_id: entry.block.id,
-              content: `unknown tool "${entry.block.name}"`,
-              is_error: true,
-            })
-          : executeTool(entry.tool, entry.block.input, { toolUseId: entry.block.id }).then(
-              (res) => ({
-                type: "tool_result",
-                tool_use_id: entry.block.id,
-                content: res.content,
-                is_error: res.isError,
-              }),
-            ));
+      : entry.tool === undefined
+        ? Promise.resolve<Anthropic.ToolResultBlockParam>({
+            type: "tool_result",
+            tool_use_id: entry.block.id,
+            content: `unknown tool "${entry.block.name}"`,
+            is_error: true,
+          })
+        : executeTool(entry.tool, entry.block.input, { toolUseId: entry.block.id }).then((res) => ({
+            type: "tool_result",
+            tool_use_id: entry.block.id,
+            content: res.content,
+            is_error: res.isError,
+          }));
     const promise = dispatchPromise
       .then((res) => {
         entry.status = "done";

@@ -131,7 +131,7 @@ describe("storeAndPreview — over threshold", () => {
 
   test("error results (isError: true) also get persisted when large", async () => {
     const rootDir = newTempRoot();
-    const stack = "Error: boom\n" + "    at foo\n".repeat(5000);
+    const stack = `Error: boom\n${"    at foo\n".repeat(5000)}`;
     const out = await storeAndPreview(makeResult(stack, true), {
       runId: "run_f",
       toolUseId: "tu_6",
