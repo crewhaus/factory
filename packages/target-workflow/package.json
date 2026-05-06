@@ -1,9 +1,9 @@
 {
-  "name": "@crewhaus/compiler",
+  "name": "@crewhaus/target-workflow",
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Compiler core: parse → validate → lower → emit",
+  "description": "Codegen backend for workflow target (sequential multi-step agents)",
   "main": "src/index.ts",
   "types": "src/index.ts",
   "exports": {
@@ -13,10 +13,8 @@
     "test": "bun test src"
   },
   "dependencies": {
+    "@crewhaus/errors": "workspace:*",
     "@crewhaus/infra-utils": "workspace:*",
-    "@crewhaus/ir": "workspace:*",
-    "@crewhaus/spec": "workspace:*",
-    "@crewhaus/target-cli": "workspace:*",
-    "@crewhaus/target-workflow": "workspace:*"
+    "@crewhaus/ir": "workspace:*"
   }
 }

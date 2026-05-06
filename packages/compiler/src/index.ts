@@ -1,7 +1,8 @@
 import { assertNever } from "@crewhaus/infra-utils";
-import type { Bundle, IrV0 } from "@crewhaus/ir";
+import type { Bundle, IrNode, IrV0, IrWorkflowV0 } from "@crewhaus/ir";
 import { type Spec, parseSpec } from "@crewhaus/spec";
 import { emitCli } from "@crewhaus/target-cli";
+import { emitWorkflow } from "@crewhaus/target-workflow";
 
 /**
  * Compile a YAML spec text into a deployable bundle.
@@ -10,8 +11,8 @@ import { emitCli } from "@crewhaus/target-cli";
  *   parse → validate → lower → emit
  *
  * Future (per catalog F2 compiler-core): pluggable IR passes (dead-tool
- * elimination, profile pruning, prompt-cache prefix sorting), multi-target
- * dispatch, and a bundle-packager step.
+ * elimination, profile pruning, prompt-cache prefix sorting), and a
+ * bundle-packager step.
  */
 export function compile(yamlText: string): Bundle {
   const spec = parseSpec(yamlText);
@@ -19,27 +20,46 @@ export function compile(yamlText: string): Bundle {
   return emit(ir);
 }
 
-function lower(spec: Spec): IrV0 {
-  return {
-    version: 0,
-    name: spec.name,
-    target: spec.target,
-    agent: {
-      model: spec.agent.model,
-      instructions: spec.agent.instructions,
-    },
-    tools: spec.tools ?? [],
-  };
-}
-
-function emit(ir: IrV0): Bundle {
-  switch (ir.target) {
+function lower(spec: Spec): IrNode {
+  switch (spec.target) {
     case "cli":
-      return emitCli(ir);
+      return {
+        version: 0,
+        name: spec.name,
+        target: "cli",
+        agent: {
+          model: spec.agent.model,
+          instructions: spec.agent.instructions,
+        },
+        tools: spec.tools ?? [],
+      } satisfies IrV0;
+    case "workflow":
+      return {
+        version: 0,
+        name: spec.name,
+        target: "workflow",
+        steps: spec.steps.map((s) => ({
+          name: s.name,
+          instructions: s.instructions,
+          model: s.model ?? spec.model,
+          tools: s.tools ?? [],
+        })),
+      } satisfies IrWorkflowV0;
     default:
-      return assertNever(ir.target);
+      return assertNever(spec);
   }
 }
 
-export type { Bundle, IrV0 } from "@crewhaus/ir";
+function emit(ir: IrNode): Bundle {
+  switch (ir.target) {
+    case "cli":
+      return emitCli(ir);
+    case "workflow":
+      return emitWorkflow(ir);
+    default:
+      return assertNever(ir);
+  }
+}
+
+export type { Bundle, IrV0, IrWorkflowV0, IrNode } from "@crewhaus/ir";
 export { type Spec, parseSpec, SpecParseError } from "@crewhaus/spec";

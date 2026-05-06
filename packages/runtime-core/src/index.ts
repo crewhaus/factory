@@ -150,9 +150,30 @@ export type RunChatLoopOptions = {
   snipKeepHead?: number;
   /** Number of tail messages to keep when snipping. Defaults to 20. */
   snipKeepTail?: number;
+  /**
+   * Pre-loaded conversation history. In `singleTurn` mode this is the
+   * entire input; the last entry must be `role: "user"`.
+   */
+  seedMessages?: ReadonlyArray<Anthropic.MessageParam>;
+  /**
+   * Single-shot mode: run exactly one user→assistant turn (with the tool
+   * inner-loop until Done) using `seedMessages`, then return the terminal
+   * assistant text. Skips the stdin REPL entirely. Used by the workflow
+   * target to run each step as a discrete turn.
+   */
+  singleTurn?: boolean;
 };
 
-export async function runChatLoop(opts: RunChatLoopOptions): Promise<void> {
+/**
+ * Runs the streaming chat loop and returns the terminal assistant text.
+ *
+ * - REPL mode (default): reads stdin in a loop, prints assistant turns to
+ *   stdout, returns `""` when the loop exits.
+ * - Single-turn mode (`singleTurn: true`): runs one turn from the seeded
+ *   message history and returns the concatenated text content of the final
+ *   assistant message. Does not touch stdin.
+ */
+export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   const resolved = opts.client
     ? { client: opts.client, isOAuth: opts.isOAuth ?? false }
     : createAnthropicClient(resolveAuth());
@@ -163,8 +184,6 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<void> {
   const compactionThreshold = opts.compactionThreshold ?? DEFAULT_COMPACTION_THRESHOLD;
   const snipKeepHead = opts.snipKeepHead ?? DEFAULT_SNIP_KEEP_HEAD;
   const snipKeepTail = opts.snipKeepTail ?? DEFAULT_SNIP_KEEP_TAIL;
-
-  let messages: Anthropic.MessageParam[] = [];
 
   const userInstructions: Anthropic.TextBlockParam = {
     type: "text",
@@ -187,6 +206,142 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<void> {
         }))
       : undefined;
   const toolByName = new Map(tools.map((t) => [t.name, t]));
+
+  /**
+   * Run one user→assistant turn through the state machine. Mutates
+   * `messages` in place (pushes the assistant turn and any tool_results).
+   * Returns the final assistant content blocks so callers can extract
+   * text. Closes over client/model/maxTokens/etc.
+   */
+  async function runOneTurn(
+    messages: Anthropic.MessageParam[],
+  ): Promise<{ terminalContent: Anthropic.ContentBlock[] }> {
+    let state: TurnState = initialState;
+    let terminalContent: Anthropic.ContentBlock[] = [];
+
+    while (state.kind !== "Done") {
+      if (runContext.abortSignal.aborted) {
+        state = transition(state, { kind: "Aborted" });
+        continue;
+      }
+
+      switch (state.kind) {
+        case "NeedModel": {
+          process.stdout.write("agent> ");
+          const stream = client.messages.stream({
+            model: opts.model,
+            max_tokens: maxTokens,
+            system: systemBlocks,
+            messages,
+            ...(anthropicTools ? { tools: anthropicTools } : {}),
+          });
+
+          stream.on("text", (chunk) => {
+            process.stdout.write(chunk);
+          });
+
+          const final = await stream.finalMessage();
+          process.stdout.write("\n");
+
+          // Persist the assistant turn with the FULL content-block array;
+          // tool_use blocks must survive into history so subsequent
+          // tool_result references resolve.
+          messages.push({
+            role: "assistant",
+            content: final.content as Anthropic.MessageParam["content"],
+          });
+          terminalContent = final.content;
+
+          const toolUses = final.content.filter(
+            (b): b is Anthropic.ToolUseBlock => b.type === "tool_use",
+          );
+          if (toolUses.length === 0) {
+            state = transition(state, { kind: "ModelReturnedText" });
+          } else {
+            const tsmBlocks: TsmToolUseBlock[] = toolUses.map((t) => ({
+              id: t.id,
+              name: t.name,
+              input: t.input,
+            }));
+            state = transition(state, { kind: "ModelReturnedToolUse", toolUses: tsmBlocks });
+          }
+          break;
+        }
+        case "NeedTools": {
+          const toolResults: Anthropic.ToolResultBlockParam[] = [];
+          for (const tu of state.toolUses) {
+            process.stdout.write(`[tool: ${tu.name}]\n`);
+            const tool = toolByName.get(tu.name);
+            if (!tool) {
+              toolResults.push({
+                type: "tool_result",
+                tool_use_id: tu.id,
+                content: `unknown tool "${tu.name}"`,
+                is_error: true,
+              });
+              continue;
+            }
+            const result = await executeTool(tool, tu.input, { toolUseId: tu.id });
+            toolResults.push({
+              type: "tool_result",
+              tool_use_id: result.toolUseId,
+              content: result.content,
+              is_error: result.isError,
+            });
+          }
+          messages.push({ role: "user", content: toolResults });
+          state = transition(state, { kind: "ToolsExecuted" });
+          break;
+        }
+        case "NeedCompaction":
+          state = transition(state, { kind: "CompactionDone" });
+          break;
+        case "NeedRecovery":
+          state = transition(state, { kind: "RecoveryDone" });
+          break;
+      }
+    }
+
+    return { terminalContent };
+  }
+
+  // Single-shot path used by the workflow target. One turn, returns the
+  // terminal assistant text, never reads stdin.
+  if (opts.singleTurn) {
+    const seed = opts.seedMessages ?? [];
+    const last = seed[seed.length - 1];
+    if (!last || last.role !== "user") {
+      throw new RuntimeError(
+        'runChatLoop({ singleTurn: true }) requires `seedMessages` to end with a `role: "user"` entry',
+      );
+    }
+    let messages: Anthropic.MessageParam[] = [...seed];
+    runContext.turnNumber += 1;
+    runContext.logger.debug("turn start (single)", {
+      turn: runContext.turnNumber,
+      messages: messages.length,
+    });
+
+    messages = await maybeCompact({
+      messages,
+      client,
+      model: opts.model,
+      contextLimit,
+      compactionThreshold,
+      snipKeepHead,
+      snipKeepTail,
+      logger: runContext.logger,
+    });
+
+    const { terminalContent } = await runOneTurn(messages);
+    return terminalContent
+      .filter((b): b is Anthropic.TextBlock => b.type === "text")
+      .map((b) => b.text)
+      .join("");
+  }
+
+  // REPL mode (existing behavior).
+  let messages: Anthropic.MessageParam[] = opts.seedMessages ? [...opts.seedMessages] : [];
 
   const rl = readline.createInterface({
     input: opts.input ?? process.stdin,
@@ -241,103 +396,17 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<void> {
         logger: runContext.logger,
       });
 
-      // State-machine driven inner loop. Each iteration handles one
-      // (state, event) pair. NeedCompaction/NeedRecovery are wired as
-      // no-op continues for v1; they exist in the type for future
-      // reactive paths (413 retry, max-output-tokens recovery).
-      let state: TurnState = initialState;
-      while (state.kind !== "Done") {
-        if (runContext.abortSignal.aborted) {
-          state = transition(state, { kind: "Aborted" });
-          continue;
-        }
-
-        switch (state.kind) {
-          case "NeedModel": {
-            process.stdout.write("agent> ");
-            const stream = client.messages.stream({
-              model: opts.model,
-              max_tokens: maxTokens,
-              system: systemBlocks,
-              messages,
-              ...(anthropicTools ? { tools: anthropicTools } : {}),
-            });
-
-            stream.on("text", (chunk) => {
-              process.stdout.write(chunk);
-            });
-
-            const final = await stream.finalMessage();
-            process.stdout.write("\n");
-
-            // Persist the assistant turn with the FULL content-block array;
-            // tool_use blocks must survive into history so subsequent
-            // tool_result references resolve.
-            messages.push({
-              role: "assistant",
-              content: final.content as Anthropic.MessageParam["content"],
-            });
-
-            const toolUses = final.content.filter(
-              (b): b is Anthropic.ToolUseBlock => b.type === "tool_use",
-            );
-            if (toolUses.length === 0) {
-              state = transition(state, { kind: "ModelReturnedText" });
-            } else {
-              const tsmBlocks: TsmToolUseBlock[] = toolUses.map((t) => ({
-                id: t.id,
-                name: t.name,
-                input: t.input,
-              }));
-              state = transition(state, { kind: "ModelReturnedToolUse", toolUses: tsmBlocks });
-            }
-            break;
-          }
-          case "NeedTools": {
-            const toolResults: Anthropic.ToolResultBlockParam[] = [];
-            for (const tu of state.toolUses) {
-              process.stdout.write(`[tool: ${tu.name}]\n`);
-              const tool = toolByName.get(tu.name);
-              if (!tool) {
-                toolResults.push({
-                  type: "tool_result",
-                  tool_use_id: tu.id,
-                  content: `unknown tool "${tu.name}"`,
-                  is_error: true,
-                });
-                continue;
-              }
-              const result = await executeTool(tool, tu.input, { toolUseId: tu.id });
-              toolResults.push({
-                type: "tool_result",
-                tool_use_id: result.toolUseId,
-                content: result.content,
-                is_error: result.isError,
-              });
-            }
-            messages.push({ role: "user", content: toolResults });
-            state = transition(state, { kind: "ToolsExecuted" });
-            break;
-          }
-          case "NeedCompaction":
-            // Reactive compaction is not wired in v1 — pre-turn handles it.
-            state = transition(state, { kind: "CompactionDone" });
-            break;
-          case "NeedRecovery":
-            // Recovery is not wired in v1 — treat as a no-op continue.
-            state = transition(state, { kind: "RecoveryDone" });
-            break;
-        }
-      }
+      await runOneTurn(messages);
 
       runContext.logger.debug("turn end", {
         turn: runContext.turnNumber,
-        reason: state.kind === "Done" ? state.reason : "unknown",
       });
     }
   } finally {
     rl.close();
   }
+
+  return "";
 }
 
 type CompactArgs = {

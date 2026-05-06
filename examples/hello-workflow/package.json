@@ -1,0 +1,11 @@
+{
+  "name": "@crewhaus-examples/hello-workflow",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Workflow target vertical slice — two-step sequential agent",
+  "dependencies": {
+    "@crewhaus/runtime-core": "workspace:*",
+    "@crewhaus/tool-bash": "workspace:*"
+  }
+}

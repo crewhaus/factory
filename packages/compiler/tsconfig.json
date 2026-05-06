@@ -9,6 +9,7 @@
     { "path": "../infra-utils" },
     { "path": "../spec" },
     { "path": "../ir" },
-    { "path": "../target-cli" }
+    { "path": "../target-cli" },
+    { "path": "../target-workflow" }
   ]
 }

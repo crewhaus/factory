@@ -8,6 +8,7 @@
     { "path": "./packages/ir" },
     { "path": "./packages/compiler" },
     { "path": "./packages/target-cli" },
+    { "path": "./packages/target-workflow" },
     { "path": "./packages/runtime-core" },
     { "path": "./packages/tool-catalog" },
     { "path": "./packages/tool-builder" },

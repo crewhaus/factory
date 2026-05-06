@@ -108,3 +108,82 @@ tools:
     ).toThrow(/unknown tool "bogus"/);
   });
 });
+
+const MINIMAL_WORKFLOW_SPEC = `
+name: hello-workflow
+target: workflow
+model: claude-sonnet-4-6
+steps:
+  - name: list
+    instructions: list files
+    tools:
+      - bash
+  - name: summarize
+    instructions: summarize what you found
+`;
+
+describe("compile workflow target", () => {
+  test("emits a single-file bundle for a workflow spec", () => {
+    const bundle = compile(MINIMAL_WORKFLOW_SPEC);
+    expect(bundle.files).toHaveLength(1);
+    expect(bundle.files[0]?.path).toBe("agent.ts");
+  });
+
+  test("generated workflow bundle imports runChatLoop and contains both step instructions", () => {
+    const content = compile(MINIMAL_WORKFLOW_SPEC).files[0]?.content ?? "";
+    expect(content).toContain('import { runChatLoop } from "@crewhaus/runtime-core";');
+    expect(content).toContain('"list files"');
+    expect(content).toContain('"summarize what you found"');
+    // Both steps share the workflow-level model.
+    expect(content).toContain('"claude-sonnet-4-6"');
+  });
+
+  test("generated workflow bundle threads per-step tools", () => {
+    const content = compile(MINIMAL_WORKFLOW_SPEC).files[0]?.content ?? "";
+    expect(content).toContain('import { bash } from "@crewhaus/tool-bash";');
+    expect(content).toContain("tools: [bash]");
+  });
+
+  test("per-step model override is resolved at lower-time and emitted", () => {
+    const content =
+      compile(`
+name: w
+target: workflow
+model: default-model
+steps:
+  - name: a
+    instructions: ai
+    model: override-model
+  - name: b
+    instructions: bi
+`).files[0]?.content ?? "";
+    expect(content).toContain('"override-model"');
+    expect(content).toContain('"default-model"');
+  });
+
+  test("rejects an unknown tool name in any workflow step", () => {
+    expect(() =>
+      compile(`
+name: w
+target: workflow
+model: m
+steps:
+  - name: a
+    instructions: ai
+    tools:
+      - bogus
+`),
+    ).toThrow(/unknown tool "bogus"/);
+  });
+
+  test("propagates parse errors as SpecParseError for invalid workflow YAML", () => {
+    expect(() =>
+      compile(`
+name: w
+target: workflow
+model: m
+steps: []
+`),
+    ).toThrow(SpecParseError);
+  });
+});
