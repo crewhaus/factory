@@ -37,6 +37,14 @@
         "@crewhaus/runtime-core": "workspace:*",
       },
     },
+    "examples/hello-workflow": {
+      "name": "@crewhaus-examples/hello-workflow",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/runtime-core": "workspace:*",
+        "@crewhaus/tool-bash": "workspace:*",
+      },
+    },
     "packages/compaction-autocompact": {
       "name": "@crewhaus/compaction-autocompact",
       "version": "0.0.0",
@@ -60,6 +68,7 @@
         "@crewhaus/ir": "workspace:*",
         "@crewhaus/spec": "workspace:*",
         "@crewhaus/target-cli": "workspace:*",
+        "@crewhaus/target-workflow": "workspace:*",
       },
     },
     "packages/errors": {
@@ -117,6 +126,15 @@
     },
     "packages/target-cli": {
       "name": "@crewhaus/target-cli",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/infra-utils": "workspace:*",
+        "@crewhaus/ir": "workspace:*",
+      },
+    },
+    "packages/target-workflow": {
+      "name": "@crewhaus/target-workflow",
       "version": "0.0.0",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
@@ -250,6 +268,8 @@
 
     "@crewhaus-examples/hello-cli": ["@crewhaus-examples/hello-cli@workspace:examples/hello-cli"],
 
+    "@crewhaus-examples/hello-workflow": ["@crewhaus-examples/hello-workflow@workspace:examples/hello-workflow"],
+
     "@crewhaus/cli": ["@crewhaus/cli@workspace:apps/cli"],
 
     "@crewhaus/compaction-autocompact": ["@crewhaus/compaction-autocompact@workspace:packages/compaction-autocompact"],
@@ -273,6 +293,8 @@
     "@crewhaus/spec": ["@crewhaus/spec@workspace:packages/spec"],
 
     "@crewhaus/target-cli": ["@crewhaus/target-cli@workspace:packages/target-cli"],
+
+    "@crewhaus/target-workflow": ["@crewhaus/target-workflow@workspace:packages/target-workflow"],
 
     "@crewhaus/token-budget": ["@crewhaus/token-budget@workspace:packages/token-budget"],
 

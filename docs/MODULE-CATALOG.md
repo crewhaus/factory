@@ -22,15 +22,16 @@ Modules in the per-layer tables below are prefixed with status markers:
 
 | Module | Layer | Notes |
 |---|---|---|
-| `spec-schema` | F1 | v0 schema (name, target, agent.model, agent.instructions); optional `tools: string[]`. PR #2, expanded in PR #7. |
+| `spec-schema` | F1 | Discriminated union over `target`: `cli` (agent + optional tools[]) and `workflow` (top-level model + steps[] with optional per-step model/tools). PR #2, expanded in PR #7 and Section 6. |
 | `spec-parser` | F1 | YAML → Zod-validated spec. PR #2. |
 | `spec-validator` | F1 | Bundled with parser via Zod (`.strict()`). PR #2. |
-| `ir-model` | F1 | v0 — mirrors spec shape; carries normalized `tools: readonly string[]`. PR #2, expanded in PR #7. |
-| `compiler-core` | F2 | Pipeline: parse → lower → emit; threads `spec.tools ?? []` into `ir.tools`. PR #2, expanded in PR #7. |
+| `ir-model` | F1 | `IrV0` (cli) carries name, agent, tools; `IrWorkflowV0` carries name and steps[] with each step's `model` resolved at lower-time. Exported as `IrNode` discriminated union. PR #2, expanded in PR #7 and Section 6. |
+| `compiler-core` | F2 | Pipeline: parse → lower → emit; `lower()`/`emit()` dispatch on target (`cli` → target-cli, `workflow` → target-workflow). PR #2, expanded in PR #7 and Section 6. |
 | `target-cli-bundle` | F2 | Single-file `agent.ts` codegen for CLI target; emits grouped tool imports + `defaultCatalog.register()` when `ir.tools` is non-empty. PR #2, expanded in PR #7. |
-| `codegen-templates` | F2 | Inline string templates in target-cli. PR #2. |
+| `target-workflow` | F2 | Single-file `agent.ts` codegen for workflow target; emits sequential `runChatLoop({ singleTurn: true })` calls with per-step instructions, model, tools, and the prior step's terminal text threaded forward as a synthetic user message. Section 6. |
+| `codegen-templates` | F2 | Inline string templates in target-cli and target-workflow. PR #2, Section 6. |
 | `spec-cli` | F4 | `compile`, `init`, `run`, `doctor` subcommands; deploy/eval/watch pending. PR #2, expanded in PR #10. |
-| `runtime-orchestrator` | R1 | Streaming chat REPL with state-machine-driven inner loop, `tool_use` execution, and pre-turn compaction (snip → autocompact). PR #2, #7, #9. |
+| `runtime-orchestrator` | R1 | Streaming chat REPL with state-machine-driven inner loop, `tool_use` execution, and pre-turn compaction (snip → autocompact). Single-shot `singleTurn` + `seedMessages` mode added for workflow target. PR #2, #7, #9, Section 6. |
 | `model-adapter` | R2 | Anthropic-only via `@anthropic-ai/sdk`. PR #2. |
 | `error-types` | F-foundations | Typed `CrewhausError` hierarchy + `toJSON`. PR #3. Extended with `"tool"` code in PR #6. |
 | `logging` | F-foundations | `pretty/json` formats, level filtering, `child()` bindings. PR #3. |
@@ -49,7 +50,7 @@ Modules in the per-layer tables below are prefixed with status markers:
 | `compaction-snip` | R6 | Pure middle-message removal with `[Context compacted: N messages removed]` marker; tool-use/result orphan defense walks boundaries until pairs are intact. PR #9. |
 | `compaction-autocompact` | R6 | Model-summarize-then-replace; returns `[user-marker, assistant-summary]` pair so the next user input appends naturally. PR #9. |
 
-**Total**: 26 of ~190 modules.
+**Total**: 27 of ~190 modules.
 
 ### In progress (🚧)
 
@@ -103,10 +104,10 @@ These live in `crewhaus-factory` and produce/operate generated harnesses. They a
 
 | Module | Responsibility | Refs (`reference-repos/`) | Targets | Research focus | Tests |
 |---|---|---|---|---|---|
-| ✅ **`spec-schema`** | Define user-facing harness spec DSL (YAML/TS): agents, tools, channels, workflow, eval, deploy. Versioned, JSON Schema-backed. Currently `name` + `target: cli` + `agent` + optional `tools: string[]`. | `agent-framework/python/.../declarative/`, `adk-python/cli/`, `openclaw.yaml` schema, `crewAI/.../agent` configs, `claude-code/.../settings.ts` | All | DSL design tradeoffs (YAML vs TS); how MAF declarative format vs ADK YAML differ; LangGraph imperative vs declarative split | T1, T9 |
+| ✅ **`spec-schema`** | Define user-facing harness spec DSL (YAML/TS): agents, tools, channels, workflow, eval, deploy. Versioned, JSON Schema-backed. Currently a `z.discriminatedUnion("target", [cli, workflow])` — CLI carries `agent` + optional `tools[]`; workflow carries top-level `model` + `steps[]` (each with `name`, `instructions`, optional `model` override, optional `tools[]`). | `agent-framework/python/.../declarative/`, `adk-python/cli/`, `openclaw.yaml` schema, `crewAI/.../agent` configs, `claude-code/.../settings.ts` | All | DSL design tradeoffs (YAML vs TS); how MAF declarative format vs ADK YAML differ; LangGraph imperative vs declarative split | T1, T9 |
 | ✅ **`spec-parser`** | Parse, lint, resolve includes/macros/overlays → AST. | `langgraph/_validate.py`, `haystack` pipeline YAML loader, `crewAI/.../flow_serializer.py` | All | Include/import semantics; cyclic detection; overlay merging | T1, T9 |
 | ✅ **`spec-validator`** | Type-check, resolve refs, verify tool/agent/model existence, profile constraints. | `agent-framework/.../_validation.py`, `langgraph/_validate.py`, `haystack/.../Pipeline.validate` | All | Cross-module ref resolution; profile constraint propagation | T1, T2, T9 |
-| ✅ **`ir-model`** | Canonical typed IR: agents, nodes, edges, events, tools, policies, memory, evals, channels, schedule. Runtime-agnostic. `IrV0` currently carries name, target, agent, and `tools: readonly string[]`. | `AI-Harness-Systems.md` §IR schema; `agent-framework/.../_workflow_builder.py`; LangGraph graph IR; ADK declarative IR | All | Single IR vs multiple? Event encoding (envelope vs typed message); type system depth | T1 |
+| ✅ **`ir-model`** | Canonical typed IR: agents, nodes, edges, events, tools, policies, memory, evals, channels, schedule. Runtime-agnostic. `IrV0` (cli) carries name, agent, and tools; `IrWorkflowV0` carries name and `steps[]` where each step has its `model` resolved at lower-time (`step.model ?? workflow.model`). Exported as `IrNode = IrV0 \| IrWorkflowV0`. | `AI-Harness-Systems.md` §IR schema; `agent-framework/.../_workflow_builder.py`; LangGraph graph IR; ADK declarative IR | All | Single IR vs multiple? Event encoding (envelope vs typed message); type system depth | T1 |
 | **`ir-passes`** | Optimization passes: dead-tool elimination, profile pruning, edge fusion, prompt-cache prefix sorting, redundancy collapse. | `claude-code/.../services/compact/grouping.ts` (sort pattern); `dspy/.../teleprompt/` pass style | All | Pass ordering; idempotence; pluggable pass registry | T1, T4 |
 | **`spec-registry`** | Persist spec templates, versions, migration metadata, ownership, environment overlays, tenant isolation. | `openclaw/config/`, `claude-code/.../migrations/`, `adk-python/cli/` | All | Storage backend (FS / SQL / object); multi-tenant isolation | T1, T3 |
 | **`migration-engine`** | Versioned schema migrations across IR versions (template upgrade paths). | `claude-code/.../migrations/` (`CURRENT_MIGRATION_VERSION = 11`); LangGraph checkpoint version migrations | All | Forward + backward migration paths; deprecation policy | T1, T4 |
@@ -115,9 +116,9 @@ These live in `crewhaus-factory` and produce/operate generated harnesses. They a
 
 | Module | Responsibility | Refs | Targets | Research focus | Tests |
 |---|---|---|---|---|---|
-| ✅ **`compiler-core`** | Orchestrate frontend (parse → validate → IR) and dispatch to target backends; emit deployment bundle. `lower()` threads `spec.tools ?? []` into `ir.tools`. | LangChain LCEL → LangGraph compile path; MAF `_workflow_builder.py`; ADK declarative-config compilation | All | Pipeline composition; error reporting; partial compilation | T1, T3 |
+| ✅ **`compiler-core`** | Orchestrate frontend (parse → validate → IR) and dispatch to target backends; emit deployment bundle. `lower()` and `emit()` switch on `target` (`cli` → target-cli, `workflow` → target-workflow); workflow lowering resolves per-step model overrides against the workflow default. | LangChain LCEL → LangGraph compile path; MAF `_workflow_builder.py`; ADK declarative-config compilation | All | Pipeline composition; error reporting; partial compilation | T1, T3 |
 | **`target-graph`** | Codegen for stateful graph runtime (LangGraph-shape) — node/edge/checkpoint config, durability mode. | `langgraph/.../pregel/`, `agent-framework/.../_workflows/_workflow.py` | **GRPH**, MGD, CRW | Pregel vs imperative; checkpoint scheme | T1, T4 |
-| **`target-workflow`** | Codegen for event-driven workflow target. | `crewAI/.../flow/`, `llama_index/.../workflow`, `adk-python/.../flows/` | **CRW**, MGD, RES | Async event semantics; pub/sub vs typed channels | T1, T4 |
+| ✅ **`target-workflow`** | Codegen for sequential workflow target. v0 emits an `agent.ts` that runs each step via `runChatLoop({ singleTurn: true })` with per-step instructions, model (override or workflow default), tools, and the prior step's terminal assistant text threaded forward as a synthetic user message. Async event semantics, pub/sub channels, parallel/conditional steps still pending. | `crewAI/.../flow/`, `llama_index/.../workflow`, `adk-python/.../flows/` | **CRW**, MGD, RES | Async event semantics; pub/sub vs typed channels | T1, T3 |
 | **`target-pipeline`** | Codegen for pipeline DAG. | `haystack/.../core/`, `haystack/components/` | **RAG** | Component decorator; DAG scheduling | T1, T3 |
 | **`target-managed`** | Codegen for managed runtime bundles (Anthropic Managed Agents, OpenAI Codex App Server, AgentCore, Foundry, Agent Engine). | Anthropic Managed Agents docs; OpenAI App Server JSON-RPC; AWS AgentCore; ADK platform | **MGD** | Manifest format diversity; deploy artifact shape | T1, T3 |
 | ✅ **`target-cli-bundle`** | Codegen for CLI coding agent: entry, REPL, tools, hooks, settings.json, MCP config. Emits grouped tool imports + `defaultCatalog.register()` calls + `tools: defaultCatalog.list()` for any spec with non-empty `tools`; unknown names fail at compile time via `TargetEmitError`. Hooks/settings/MCP still pending. | `claude-code/main.tsx`, `claude-code/cli/`, `claude-code/entrypoints/` | **CLI** | Bundling (Bun/Node); side-effect imports | T1, T3, T7 |
@@ -171,7 +172,7 @@ These ship as **selectable building blocks** the factory wires into a generated 
 
 | Module | Responsibility | Refs | Targets | Research focus | Tests |
 |---|---|---|---|---|---|
-| ✅ **`runtime-orchestrator`** | The main agent/run loop: state-machine-driven inner loop (NeedModel/NeedTools/NeedCompaction/NeedRecovery/Done) with pre-turn compaction (snip → autocompact at 0.85 of context). Reactive 413-recovery + max-tokens recovery still pending. | `claude-code/query.ts` (1730-line async-gen loop); `langgraph/.../pregel/_loop.py`; `agent-framework/.../_runner.py`; `openai-agents/.../runner.py` | All | Async-gen vs reactive vs callback; state-machine vs free-form | T1, T3, T4 |
+| ✅ **`runtime-orchestrator`** | The main agent/run loop: state-machine-driven inner loop (NeedModel/NeedTools/NeedCompaction/NeedRecovery/Done) with pre-turn compaction (snip → autocompact at 0.85 of context). `runChatLoop` runs as a stdin REPL by default; `singleTurn: true` + `seedMessages` runs one turn from a pre-built history and returns the terminal assistant text (used by target-workflow). Reactive 413-recovery + max-tokens recovery still pending. | `claude-code/query.ts` (1730-line async-gen loop); `langgraph/.../pregel/_loop.py`; `agent-framework/.../_runner.py`; `openai-agents/.../runner.py` | All | Async-gen vs reactive vs callback; state-machine vs free-form | T1, T3, T4 |
 | **`query-engine`** | SDK/headless wrapper over orchestrator (`submitMessage()` async-gen). | `claude-code/QueryEngine.ts` | All | SDK message normalization | T1, T3 |
 | ✅ **`turn-state-machine`** | Transitions: need_model / need_tools / need_compaction / need_recovery / done. Pure FSM; exhaustive transition tests. | `claude-code/query.ts` `State`/`Continue` pattern | All | Transition diagram; invariant checks | T1, T9 |
 | **`recovery-engine`** | `max_output_tokens` retries, `prompt_too_long` collapse, media-error strip, model-fallback tombstoning. | `claude-code/query.ts` recovery branches; `agent-framework/.../_runner.py` retry | CLI, CHN, CRW, GRPH, MGD, RES | Recovery taxonomy; idempotence under retry | T1, T4 |

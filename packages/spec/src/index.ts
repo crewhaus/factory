@@ -3,11 +3,16 @@ import { parse as parseYaml } from "yaml";
 import { z } from "zod";
 
 /**
- * v0 spec schema — the absolute minimum to compile a runnable CLI agent.
- * Will grow into the full catalog spec (agents, tools, channels, workflow,
- * eval, deploy) — see docs/MODULE-CATALOG.md PART A Layer F1.
+ * v0 spec schema — a discriminated union over `target`.
+ *
+ * - `cli`: a single streaming-chat agent (Section 1–5).
+ * - `workflow`: a sequence of named steps run in order, threading the prior
+ *   step's final assistant text into the next step's user message (Section 6).
+ *
+ * Will grow into the full catalog spec (channels, eval, deploy) — see
+ * docs/MODULE-CATALOG.md PART A Layer F1.
  */
-export const Spec = z
+const cliSchema = z
   .object({
     name: z.string().min(1),
     target: z.literal("cli"),
@@ -19,7 +24,30 @@ export const Spec = z
   })
   .strict();
 
+const workflowStepSchema = z
+  .object({
+    name: z.string().min(1),
+    instructions: z.string().min(1),
+    model: z.string().min(1).optional(),
+    tools: z.array(z.string().min(1)).optional(),
+  })
+  .strict();
+
+const workflowSchema = z
+  .object({
+    name: z.string().min(1),
+    target: z.literal("workflow"),
+    model: z.string().min(1),
+    steps: z.array(workflowStepSchema).min(1),
+  })
+  .strict();
+
+export const Spec = z.discriminatedUnion("target", [cliSchema, workflowSchema]);
+
 export type Spec = z.infer<typeof Spec>;
+export type SpecCli = z.infer<typeof cliSchema>;
+export type SpecWorkflow = z.infer<typeof workflowSchema>;
+export type SpecWorkflowStep = z.infer<typeof workflowStepSchema>;
 
 export { SpecParseError };
 

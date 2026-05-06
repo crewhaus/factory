@@ -439,3 +439,121 @@ describe("runChatLoop pre-turn compaction", () => {
     expect(containsMarker).toBe(false);
   });
 });
+
+describe("runChatLoop singleTurn mode", () => {
+  test("returns the terminal assistant text and does not read stdin", async () => {
+    const { client, callCount } = makeScriptedClient([
+      [{ type: "text", text: "hello from step", citations: null } as Anthropic.TextBlock],
+    ]);
+
+    // PassThrough that we never end and never write to: if singleTurn read
+    // from it the call would hang and time out the test.
+    const input = new PassThrough();
+
+    const result = await runChatLoop({
+      model: "test-model",
+      instructions: "test",
+      client,
+      input,
+      singleTurn: true,
+      seedMessages: [{ role: "user", content: "go" }],
+    });
+
+    expect(result).toBe("hello from step");
+    expect(callCount()).toBe(1);
+    // Stream should not have been touched.
+    expect(input.readableEnded).toBe(false);
+  });
+
+  test("executes tool_use blocks and returns the post-tool assistant text", async () => {
+    const toolCalls: unknown[] = [];
+    const echoTool = buildTool({
+      name: "echo",
+      description: "echoes",
+      inputSchema: z.object({ msg: z.string() }),
+      execute: async (input) => {
+        toolCalls.push(input);
+        return `echoed: ${input.msg}`;
+      },
+    });
+
+    const { client, callCount } = makeScriptedClient([
+      [
+        {
+          type: "tool_use",
+          id: "tu_1",
+          name: "echo",
+          input: { msg: "hi" },
+        } as Anthropic.ToolUseBlock,
+      ],
+      [{ type: "text", text: "after tool", citations: null } as Anthropic.TextBlock],
+    ]);
+
+    const result = await runChatLoop({
+      model: "test-model",
+      instructions: "test",
+      client,
+      singleTurn: true,
+      seedMessages: [{ role: "user", content: "please echo" }],
+      tools: [echoTool],
+    });
+
+    expect(result).toBe("after tool");
+    expect(callCount()).toBe(2);
+    expect(toolCalls).toEqual([{ msg: "hi" }]);
+  });
+
+  test("returns empty string when terminal assistant has no text blocks", async () => {
+    // Edge case: model returns only a tool_use, then on the follow-up returns
+    // nothing text-like (e.g. another tool_use that we treat as text-Done by
+    // simulating with an empty content array on the second turn). The state
+    // machine would not actually allow that in production, so use a single
+    // empty-text turn to model "no text content".
+    const { client } = makeScriptedClient([
+      [{ type: "text", text: "", citations: null } as Anthropic.TextBlock],
+    ]);
+
+    const result = await runChatLoop({
+      model: "test-model",
+      instructions: "test",
+      client,
+      singleTurn: true,
+      seedMessages: [{ role: "user", content: "anything" }],
+    });
+
+    expect(result).toBe("");
+  });
+
+  test("throws RuntimeError when seedMessages is missing or does not end with role:user", async () => {
+    const { client } = makeStubClient();
+
+    await expect(
+      runChatLoop({
+        model: "test-model",
+        instructions: "test",
+        client,
+        singleTurn: true,
+        seedMessages: [],
+      }),
+    ).rejects.toThrow(/seedMessages.*role.*user/);
+
+    await expect(
+      runChatLoop({
+        model: "test-model",
+        instructions: "test",
+        client,
+        singleTurn: true,
+        seedMessages: [{ role: "assistant", content: "wrong end" }],
+      }),
+    ).rejects.toThrow(/seedMessages.*role.*user/);
+
+    await expect(
+      runChatLoop({
+        model: "test-model",
+        instructions: "test",
+        client,
+        singleTurn: true,
+      }),
+    ).rejects.toThrow(/seedMessages.*role.*user/);
+  });
+});

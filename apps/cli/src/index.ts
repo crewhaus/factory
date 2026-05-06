@@ -201,6 +201,12 @@ async function runRun(args: ParsedArgs): Promise<void> {
     throw err;
   }
 
+  if (ir.target !== "cli") {
+    die(
+      `crewhaus run only supports target: cli (got "${ir.target}"). For workflow specs, compile and execute the bundle directly: bun apps/cli/src/index.ts compile <spec> -o <out> && bun <out>/agent.ts`,
+    );
+  }
+
   let tools: RegisteredTool[] = [];
   if (ir.tools.length > 0) {
     const toolMap = await loadToolMap();

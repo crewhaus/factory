@@ -69,6 +69,7 @@ describe("crewhaus init", () => {
     expect(existsSync(written)).toBe(true);
     const spec = parseSpec(readFileSync(written, "utf-8"));
     expect(spec.target).toBe("cli");
+    if (spec.target !== "cli") expect.unreachable();
     expect(spec.agent.model).toBe("claude-opus-4-7");
     expect(spec.agent.instructions.length).toBeGreaterThan(0);
     expect(result.stdout).toMatch(/wrote .*crewhaus\.yaml/);
