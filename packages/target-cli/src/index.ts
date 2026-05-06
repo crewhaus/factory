@@ -38,6 +38,9 @@ export class TargetEmitError extends CrewhausError {
  * Section-3 tool so the convention is documented; the actual packages ship
  * incrementally (currently none — generated agents that reference these
  * names will fail at install time until Section 3 lands).
+ *
+ * Mirror: `loadToolMap()` in apps/cli/src/index.ts maps the same names to
+ * RegisteredTool instances for `crewhaus run`. Keep both maps in sync.
  */
 const BUILTIN_TOOL_MAP: Record<string, { package: string; export: string }> = {
   read: { package: "@crewhaus/tool-fs", export: "read" },

@@ -19,7 +19,7 @@ export function compile(yamlText: string): Bundle {
   return emit(ir);
 }
 
-function lower(spec: Spec): IrV0 {
+export function lower(spec: Spec): IrV0 {
   return {
     version: 0,
     name: spec.name,
