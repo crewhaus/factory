@@ -1,0 +1,18 @@
+{
+  "name": "@crewhaus/compaction-snip",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Pure middle-message removal with tool-use/result orphan defense",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.40.0"
+  }
+}

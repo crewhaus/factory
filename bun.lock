@@ -30,6 +30,21 @@
         "@crewhaus/runtime-core": "workspace:*",
       },
     },
+    "packages/compaction-autocompact": {
+      "name": "@crewhaus/compaction-autocompact",
+      "version": "0.0.0",
+      "dependencies": {
+        "@anthropic-ai/sdk": "^0.40.0",
+        "@crewhaus/errors": "workspace:*",
+      },
+    },
+    "packages/compaction-snip": {
+      "name": "@crewhaus/compaction-snip",
+      "version": "0.0.0",
+      "dependencies": {
+        "@anthropic-ai/sdk": "^0.40.0",
+      },
+    },
     "packages/compiler": {
       "name": "@crewhaus/compiler",
       "version": "0.0.0",
@@ -56,17 +71,30 @@
       "name": "@crewhaus/logging",
       "version": "0.0.0",
     },
+    "packages/run-context": {
+      "name": "@crewhaus/run-context",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/logging": "workspace:*",
+      },
+    },
     "packages/runtime-core": {
       "name": "@crewhaus/runtime-core",
       "version": "0.0.0",
       "dependencies": {
         "@anthropic-ai/sdk": "^0.40.0",
+        "@crewhaus/compaction-autocompact": "workspace:*",
+        "@crewhaus/compaction-snip": "workspace:*",
         "@crewhaus/errors": "workspace:*",
+        "@crewhaus/run-context": "workspace:*",
+        "@crewhaus/token-budget": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
         "@crewhaus/tool-executor": "workspace:*",
+        "@crewhaus/turn-state-machine": "workspace:*",
         "zod-to-json-schema": "^3.23.5",
       },
       "devDependencies": {
+        "@crewhaus/logging": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "zod": "^3.23.8",
       },
@@ -87,6 +115,13 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
+      },
+    },
+    "packages/token-budget": {
+      "name": "@crewhaus/token-budget",
+      "version": "0.0.0",
+      "dependencies": {
+        "@anthropic-ai/sdk": "^0.40.0",
       },
     },
     "packages/tool-bash": {
@@ -177,6 +212,13 @@
         "zod": "^3.23.8",
       },
     },
+    "packages/turn-state-machine": {
+      "name": "@crewhaus/turn-state-machine",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+      },
+    },
   },
   "packages": {
     "@anthropic-ai/sdk": ["@anthropic-ai/sdk@0.40.1", "", { "dependencies": { "@types/node": "^18.11.18", "@types/node-fetch": "^2.6.4", "abort-controller": "^3.0.0", "agentkeepalive": "^4.2.1", "form-data-encoder": "1.7.2", "formdata-node": "^4.3.2", "node-fetch": "^2.6.7" } }, "sha512-DJMWm8lTEM9Lk/MSFL+V+ugF7jKOn0M2Ujvb5fN8r2nY14aHbGPZ1k6sgjL+tpJ3VuOGJNG+4R83jEpOuYPv8w=="],
@@ -203,6 +245,10 @@
 
     "@crewhaus/cli": ["@crewhaus/cli@workspace:apps/cli"],
 
+    "@crewhaus/compaction-autocompact": ["@crewhaus/compaction-autocompact@workspace:packages/compaction-autocompact"],
+
+    "@crewhaus/compaction-snip": ["@crewhaus/compaction-snip@workspace:packages/compaction-snip"],
+
     "@crewhaus/compiler": ["@crewhaus/compiler@workspace:packages/compiler"],
 
     "@crewhaus/errors": ["@crewhaus/errors@workspace:packages/errors"],
@@ -213,11 +259,15 @@
 
     "@crewhaus/logging": ["@crewhaus/logging@workspace:packages/logging"],
 
+    "@crewhaus/run-context": ["@crewhaus/run-context@workspace:packages/run-context"],
+
     "@crewhaus/runtime-core": ["@crewhaus/runtime-core@workspace:packages/runtime-core"],
 
     "@crewhaus/spec": ["@crewhaus/spec@workspace:packages/spec"],
 
     "@crewhaus/target-cli": ["@crewhaus/target-cli@workspace:packages/target-cli"],
+
+    "@crewhaus/token-budget": ["@crewhaus/token-budget@workspace:packages/token-budget"],
 
     "@crewhaus/tool-bash": ["@crewhaus/tool-bash@workspace:packages/tool-bash"],
 
@@ -234,6 +284,8 @@
     "@crewhaus/tool-todo": ["@crewhaus/tool-todo@workspace:packages/tool-todo"],
 
     "@crewhaus/tool-validate": ["@crewhaus/tool-validate@workspace:packages/tool-validate"],
+
+    "@crewhaus/turn-state-machine": ["@crewhaus/turn-state-machine@workspace:packages/turn-state-machine"],
 
     "@types/bun": ["@types/bun@1.3.13", "", { "dependencies": { "bun-types": "1.3.13" } }, "sha512-9fqXWk5YIHGGnUau9TEi+qdlTYDAnOj+xLCmSTwXfAIqXr2x4tytJb43E9uCvt09zJURKXwAtkoH4nLQfzeTXw=="],
 

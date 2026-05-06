@@ -1,6 +1,6 @@
 # CrewHaus Factory — Build Roadmap
 
-> Status as of 2026-05-05. 21 of ~190 catalog modules implemented.
+> Status as of 2026-05-05. 26 of ~190 catalog modules implemented.
 > See `docs/MODULE-CATALOG.md` for full per-module specs and test layer references.
 
 ---
@@ -153,6 +153,8 @@ Each tool package gets `T1` unit tests and `T3` integration tests. The `tool-bas
 ---
 
 ## Section 4 — Turn state machine + context management
+
+> Status: ✅ complete (PR #9).
 
 **Catalog modules:** `turn-state-machine`, `run-context`, `token-budget`, `compaction-snip`, `compaction-autocompact` (R1, R2, R6)
 
