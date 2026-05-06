@@ -30,7 +30,7 @@ Modules in the per-layer tables below are prefixed with status markers:
 | `target-cli-bundle` | F2 | Single-file `agent.ts` codegen for CLI target; emits grouped tool imports + `defaultCatalog.register()` when `ir.tools` is non-empty. PR #2, expanded in PR #7. |
 | `target-workflow` | F2 | Single-file `agent.ts` codegen for workflow target; emits sequential `runChatLoop({ singleTurn: true })` calls with per-step instructions, model, tools, and the prior step's terminal text threaded forward as a synthetic user message. Section 6. |
 | `codegen-templates` | F2 | Inline string templates in target-cli and target-workflow. PR #2, Section 6. |
-| `spec-cli` | F4 | `compile` subcommand only; init/run/deploy/eval/watch/doctor pending. PR #2. |
+| `spec-cli` | F4 | `compile`, `init`, `run`, `doctor` subcommands; deploy/eval/watch pending. PR #2, expanded in PR #10. |
 | `runtime-orchestrator` | R1 | Streaming chat REPL with state-machine-driven inner loop, `tool_use` execution, and pre-turn compaction (snip → autocompact). Single-shot `singleTurn` + `seedMessages` mode added for workflow target. PR #2, #7, #9, Section 6. |
 | `model-adapter` | R2 | Anthropic-only via `@anthropic-ai/sdk`. PR #2. |
 | `error-types` | F-foundations | Typed `CrewhausError` hierarchy + `toJSON`. PR #3. Extended with `"tool"` code in PR #6. |
@@ -149,7 +149,7 @@ These live in `crewhaus-factory` and produce/operate generated harnesses. They a
 | **`studio-server`** | Backend (project mgmt, multi-user collab, preview runs). | LangSmith control plane; OpenAI Agent Builder backend | All (authoring) | Auth, project model, collab session | T1, T3 |
 | **`trace-viewer`** | Visualize traces/runs/replays; trajectory grading UI. | OpenAI Trace UI; LangSmith; `agent-framework/.../devui/`; Haystack tracing UIs | All | Trace data model; flame/swim-lane rendering | T1, T3 |
 | **`graph-visualizer`** | Render IR or live workflow graph (mermaid/d3/xyflow). | LangGraph viz; MAF `_viz.py`; `openai-agents/.../visualization.py` | GRPH, CRW, RAG, MGD | Layout for typed graphs; live updates | T1, T3 |
-| ✅ **`spec-cli`** | Command-line: `crewhaus init / compile / deploy / eval`. | `claude-code/cli/`; `adk-python/cli/`; `openclaw/cli/`; gstack CLI | All | Subcommand discovery; help generation; shell completions | T1, T3 |
+| ✅ **`spec-cli`** | Command-line: `crewhaus compile / init / run / doctor` shipped (PR #2 + PR #10); `deploy / eval / watch` pending. `run` parses spec, lowers in-memory, and dispatches to `runChatLoop` with lazily-resolved tools; `doctor` reports auth, Bun version, and project-spec presence. | `claude-code/cli/`; `adk-python/cli/`; `openclaw/cli/`; gstack CLI | All | Subcommand discovery; help generation; shell completions | T1, T3 |
 | **`wizard`** | First-run profile selection, channel/auth setup. | `openclaw/wizard/`; gstack `setup`; `claude-code/.../screens/` | CLI, CHN | State machine; backtracking; resumability | T1, T3 |
 | **`scaffold-templates`** | Built-in spec templates per target shape. | gstack slash-commands as ref; `openclaw` profiles | All | Template parameterization; conventions | T1 |
 

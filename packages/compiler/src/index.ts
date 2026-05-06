@@ -20,7 +20,7 @@ export function compile(yamlText: string): Bundle {
   return emit(ir);
 }
 
-function lower(spec: Spec): IrNode {
+export function lower(spec: Spec): IrNode {
   switch (spec.target) {
     case "cli":
       return {

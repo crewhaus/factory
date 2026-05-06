@@ -11,9 +11,19 @@
   "exports": {
     ".": "./src/index.ts"
   },
+  "scripts": {
+    "test": "bun test src"
+  },
   "dependencies": {
     "@crewhaus/compiler": "workspace:*",
     "@crewhaus/infra-utils": "workspace:*",
-    "@crewhaus/logging": "workspace:*"
+    "@crewhaus/ir": "workspace:*",
+    "@crewhaus/logging": "workspace:*",
+    "@crewhaus/runtime-core": "workspace:*",
+    "@crewhaus/spec": "workspace:*",
+    "@crewhaus/tool-bash": "workspace:*",
+    "@crewhaus/tool-catalog": "workspace:*",
+    "@crewhaus/tool-fs": "workspace:*",
+    "@crewhaus/tool-todo": "workspace:*"
   }
 }
