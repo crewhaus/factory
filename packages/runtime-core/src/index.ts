@@ -518,7 +518,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               for (const tu of toolUses) {
                 toolUseHistory.push({ id: tu.id, name: tu.name, input: tu.input });
               }
-              messages.push({ role: "user", content: toolResults });
+              messages.push({ role: "user", content: [...toolResults] });
               const warning = maybeBuildLoopWarning();
               if (warning !== null) messages.push(warning);
 

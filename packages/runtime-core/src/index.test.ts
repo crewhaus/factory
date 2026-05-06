@@ -719,6 +719,7 @@ describe("runChatLoop — Section 8 orchestrator", () => {
       client,
       input,
       tools: [slowRead],
+      permissionMode: "bypass",
     });
     const elapsed = Date.now() - t0;
 
@@ -768,6 +769,7 @@ describe("runChatLoop — Section 8 loop detection", () => {
       client,
       input,
       tools: [dateTool],
+      permissionMode: "bypass",
     });
 
     // The 4th call's request body should contain a `[runtime] possible loop`
@@ -820,6 +822,7 @@ describe("runChatLoop — Section 8 result store", () => {
         client,
         input,
         tools: [bigTool],
+        permissionMode: "bypass",
       });
 
       // The 2nd call's tool_result content must be a preview, not the full payload.
@@ -912,6 +915,7 @@ describe("runChatLoop — Section 8 streaming flag", () => {
       input,
       tools: [tool],
       streaming: true,
+      permissionMode: "bypass",
     });
 
     // Both tools ran (executions captured).
