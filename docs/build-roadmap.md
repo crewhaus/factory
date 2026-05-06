@@ -1,22 +1,21 @@
 # CrewHaus Factory — Build Roadmap
 
-> Status as of 2026-05-06. 27 of ~190 catalog modules implemented; Sections 1–6 complete, Sections 7–12 next.
+> Status as of 2026-05-06. 30 of ~190 catalog modules implemented; Sections 1–7 complete, Sections 8–12 next.
 > See `docs/MODULE-CATALOG.md` for full per-module specs and test layer references.
 
 ---
 
 ## Current baseline
 
-The compiler pipeline (spec → IR → codegen) ships two target shapes (`cli`, `workflow`) and the runtime carries tools end-to-end with state-machine-driven turns and pre-turn compaction (snip → autocompact). The CLI exposes `compile`, `run`, `init`, and `doctor` subcommands, and three built-in tool packages (`tool-fs`, `tool-bash`, `tool-todo`) are registered.
+The compiler pipeline (spec → IR → codegen) ships two target shapes (`cli`, `workflow`) and the runtime carries tools end-to-end with state-machine-driven turns and pre-turn compaction (snip → autocompact). The CLI exposes `compile`, `run`, `init`, and `doctor` subcommands; three built-in tool packages (`tool-fs`, `tool-bash`, `tool-todo`) are registered. Section 7 added recovery (Anthropic taxonomy with budgets), a layered permission engine (modes + 5 rule sources, with `bypass` locked to the CLI flag), and a parent/child abort tree with SIGINT integration.
 
-What the current stack still cannot do — and Sections 7–12 unlock, in order:
+What the current stack still cannot do — and Sections 8–12 unlock, in order:
 
-1. **Survive failure** — no error recovery, no cancellation, no real permission engine. The agent will crash on `prompt_too_long`, leak resources on Ctrl-C, and run any tool it's handed. *(Section 7)*
-2. **Run tools efficiently** — tool calls are serialized, large outputs blow up context, runaway loops are not detected, tools cannot start while the model is still streaming. *(Section 8)*
-3. **Speak MCP** — no way to use the ecosystem of external MCP servers (filesystem, github, sentry, etc.) without writing native tool wrappers. *(Section 9)*
-4. **Remember anything** — no session store, no transcript log, no in-process state container; every `crewhaus run` starts from zero. *(Section 10)*
-5. **Be customized** — no hooks, no skills, no slash commands. The harness has no extension surface for users. *(Section 11)*
-6. **Live in chat** — only CLI and workflow targets exist; no channel/messenger shape. *(Section 12)*
+1. **Run tools efficiently** — tool calls are serialized, large outputs blow up context, runaway loops are not detected, tools cannot start while the model is still streaming. *(Section 8)*
+2. **Speak MCP** — no way to use the ecosystem of external MCP servers (filesystem, github, sentry, etc.) without writing native tool wrappers. *(Section 9)*
+3. **Remember anything** — no session store, no transcript log, no in-process state container; every `crewhaus run` starts from zero. *(Section 10)*
+4. **Be customized** — no hooks, no skills, no slash commands. The harness has no extension surface for users. *(Section 11)*
+5. **Live in chat** — only CLI and workflow targets exist; no channel/messenger shape. *(Section 12)*
 
 ---
 
@@ -310,49 +309,22 @@ spec-schema (workflow target + steps[])  ──►  ir-model (IrWorkflowV0)  ─
 
 ## Section 7 — Hardening: recovery, permission engine, abort
 
-> Status: not started.
+> Status: ✅ complete (PR #12).
 
 **Catalog modules:** `recovery-engine` (R1), `permission-engine` (R8), `abort-controller` (R1)
 
-The runtime currently throws on any non-200 model response, has no cancellation story, and only checks tool calls against a single pattern matcher with no notion of modes or rule sources. This section makes the agent robust enough to leave running unattended. All three modules are independent of each other and can be built in parallel; each integrates into `runtime-core` at the end.
+Three independent packages built in parallel, then integrated into `runtime-core`:
 
-### Build order within this section
+- **`recovery-engine`** — pure decision function. Anthropic-error taxonomy: `prompt_too_long → compact`, `max_output_tokens → continue`, `overloaded/5xx → retry` (exponential backoff capped at 30 s + jitter), `invalid_request → tombstone`, with per-turn budgets (5 retries, 1 compact, 3 continues, 1 tombstone) and a fixture-based replay test.
+- **`permission-engine`** — modes (`default`/`plan`/`auto`/`bypass`) over a 5-source `RuleSet` walked in priority order `flag → settings → yaml → hooks → builtin`. Built on `tool-permission-matcher`. **Security**: `mode: bypass` is rejected at parse time from yaml/settings sources — only the `--permission-mode` CLI flag may select it.
+- **`abort-controller`** — parent/child abort tree with WeakRef cascade so abandoned children don't pin parents; sibling-independent; T3 spawns `sleep 30` and verifies SIGTERM cascade.
 
-```
-recovery-engine     ──►  (integrate into runtime-core)
-permission-engine        (parallel)
-abort-controller
-```
+Runtime integration: each model stream call is wrapped in try/catch that delegates to `recover()`; each tool call evaluates through `permission-engine.evaluate()` before exec (REPL mode prompts via stdin on `ask`, single-turn mode treats `ask` as deny); the abort tree is rooted at the `runContext.abortSignal`, with a turn-level child for the model stream and a per-tool grandchild forwarded into `Bun.spawn({ signal })`. A SIGINT handler in REPL mode aborts the active turn on the first press and exits the process on the second within the same turn. The Anthropic SDK now honors `ANTHROPIC_BASE_URL` to support the smoke-test mock at `scripts/smoke-mock-anthropic.ts`.
 
-### What to build
-
-**`packages/recovery-engine`**
-- Classify Anthropic errors into a recovery taxonomy: `prompt_too_long` → trigger reactive compaction; `max_output_tokens` → continue with `Continue?` prompt; `overloaded_error` / `5xx` → exponential backoff retry; `invalid_request_error` → tombstone the offending message and surface to user
-- `recover(error: AnthropicError, state: TurnState): RecoveryAction`
-- `RecoveryAction` union: `{ kind: "compact" } | { kind: "retry", delayMs } | { kind: "continue" } | { kind: "tombstone", messageId } | { kind: "fail", reason }`
-- References: `claude-code/query.ts` recovery branches, `agent-framework/_runner.py` retry
-
-**`packages/permission-engine`** *(parallel)*
-- Modes: `default` (ask on first encounter), `plan` (read-only, no writes), `auto` (allow all read-only, ask for destructive), `bypass` (allow everything — for tests/CI)
-- Rule sources, in priority order: command-line flag → `.crewhaus/settings.json` → `crewhaus.yaml` permissions block → hook decisions → built-in defaults
-- Rule types: `alwaysAllow`, `alwaysDeny`, `alwaysAsk`
-- `evaluate(toolCall, mode, rules): "allow" | "deny" | "ask"`
-- Build on top of the existing `tool-permission-matcher` for the pattern-matching primitive
-- References: `claude-code/utils/permissions/` (14 files); `AI-Harness-Systems.md` §Policy engine
-
-**`packages/abort-controller`** *(parallel)*
-- Wraps `AbortController` with parent/child semantics: parent abort cancels all children; sibling abort does not propagate
-- `createAbortTree(parent?: AbortSignal): { signal, abort, child(): AbortTree }`
-- Hook into `runChatLoop` for Ctrl-C handling — first SIGINT cancels current turn, second exits
-- References: `claude-code/utils/abortController.ts`
-
-### Integration into `runtime-core`
-- Wrap each model call in a try/catch that delegates to `recovery-engine`
-- Run every tool through `permission-engine.evaluate()` before `tool-executor`; in `default` and `auto` modes, prompt the user via stdin for `ask` decisions
-- Thread the abort tree through `runChatLoop`, `tool-executor`, and child tool processes (`Bun.spawn` accepts `signal`)
+Spec/CLI surface: `crewhaus run` accepts `--permission-mode <default|plan|auto|bypass>`; specs may declare a `permissions` block (`mode` + `rules[]`); `.crewhaus/settings.json` is parsed when present. Generated `agent.ts` bundles thread the IR's permissions into `runChatLoop`. Bypass is rejected at every parse boundary (spec, settings, schema enum) — a defense-in-depth lockdown verified by the T8 security test.
 
 ### Tests
-`recovery-engine`: unit tests (`T1`) per error class plus a replay test (`T4`) over a fixture of recorded errors. `permission-engine`: property tests (`T9`) over rule precedence + a security test (`T8`) verifying `bypass` cannot be set from a YAML file (only via flag). `abort-controller`: integration test (`T3`) verifying child-tool processes receive SIGTERM on parent abort.
+`recovery-engine`: 33 unit + replay tests (T1, T4) over a fixture of 10 representative SDK error shapes. `permission-engine`: 22 unit + property + security tests (T1, T9, T8) including a property test over 200 random rule sets and three bypass-lockdown checks. `abort-controller`: 10 cascade + WeakRef + child-process tests (T1, T3) including a real `Bun.spawn(["sleep", "30"], { signal })` SIGTERM-cascade integration test.
 
 ---
 

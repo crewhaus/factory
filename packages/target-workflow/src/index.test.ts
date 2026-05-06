@@ -10,6 +10,7 @@ const TWO_STEP_IR: IrWorkflowV0 = {
     { name: "list", instructions: "list files", model: "claude-sonnet-4-6", tools: ["bash"] },
     { name: "summarize", instructions: "summarize", model: "claude-sonnet-4-6", tools: [] },
   ],
+  permissions: { rules: [] },
 };
 
 describe("emitWorkflow", () => {
@@ -140,5 +141,31 @@ describe("emitWorkflow", () => {
     const c = emitWorkflow(ir).files[0]?.content ?? "";
     expect(c).toContain('model: "model-a"');
     expect(c).toContain('model: "model-b"');
+  });
+
+  test("emits permissionMode and permissionRules when configured", () => {
+    const ir: IrWorkflowV0 = {
+      ...TWO_STEP_IR,
+      permissions: {
+        mode: "auto",
+        rules: [
+          { type: "alwaysAllow", pattern: "Read" },
+          { type: "alwaysDeny", pattern: "Bash(rm**)" },
+        ],
+      },
+    };
+    const c = emitWorkflow(ir).files[0]?.content ?? "";
+    expect(c).toContain('permissionMode: "auto"');
+    expect(c).toContain("permissionRules:");
+    expect(c).toContain('{ type: "alwaysAllow", pattern: "Read", source: "yaml" }');
+    expect(c).toContain('{ type: "alwaysDeny", pattern: "Bash(rm**)", source: "yaml" }');
+    expect(c).toContain('import { BUILTIN_DEFAULT_RULES } from "@crewhaus/permission-engine";');
+  });
+
+  test("omits permissions block when neither mode nor rules are set", () => {
+    const c = emitWorkflow(TWO_STEP_IR).files[0]?.content ?? "";
+    expect(c).not.toContain("permissionMode");
+    expect(c).not.toContain("permissionRules");
+    expect(c).not.toContain("BUILTIN_DEFAULT_RULES");
   });
 });

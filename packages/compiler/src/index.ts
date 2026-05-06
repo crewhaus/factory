@@ -1,5 +1,5 @@
 import { assertNever } from "@crewhaus/infra-utils";
-import type { Bundle, IrNode, IrV0, IrWorkflowV0 } from "@crewhaus/ir";
+import type { Bundle, IrNode, IrPermissions, IrV0, IrWorkflowV0 } from "@crewhaus/ir";
 import { type Spec, parseSpec } from "@crewhaus/spec";
 import { emitCli } from "@crewhaus/target-cli";
 import { emitWorkflow } from "@crewhaus/target-workflow";
@@ -20,6 +20,15 @@ export function compile(yamlText: string): Bundle {
   return emit(ir);
 }
 
+function lowerPermissions(spec: Spec): IrPermissions {
+  const p = spec.permissions;
+  if (p === undefined) return { rules: [] };
+  return {
+    mode: p.mode,
+    rules: (p.rules ?? []).map((r) => ({ type: r.type, pattern: r.pattern })),
+  };
+}
+
 export function lower(spec: Spec): IrNode {
   switch (spec.target) {
     case "cli":
@@ -32,6 +41,7 @@ export function lower(spec: Spec): IrNode {
           instructions: spec.agent.instructions,
         },
         tools: spec.tools ?? [],
+        permissions: lowerPermissions(spec),
       } satisfies IrV0;
     case "workflow":
       return {
@@ -44,6 +54,7 @@ export function lower(spec: Spec): IrNode {
           model: s.model ?? spec.model,
           tools: s.tools ?? [],
         })),
+        permissions: lowerPermissions(spec),
       } satisfies IrWorkflowV0;
     default:
       return assertNever(spec);

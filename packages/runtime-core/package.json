@@ -14,9 +14,12 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.40.0",
+    "@crewhaus/abort-controller": "workspace:*",
     "@crewhaus/compaction-autocompact": "workspace:*",
     "@crewhaus/compaction-snip": "workspace:*",
     "@crewhaus/errors": "workspace:*",
+    "@crewhaus/permission-engine": "workspace:*",
+    "@crewhaus/recovery-engine": "workspace:*",
     "@crewhaus/run-context": "workspace:*",
     "@crewhaus/token-budget": "workspace:*",
     "@crewhaus/tool-catalog": "workspace:*",

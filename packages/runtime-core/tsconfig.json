@@ -6,10 +6,13 @@
   },
   "include": ["src/**/*"],
   "references": [
+    { "path": "../abort-controller" },
     { "path": "../compaction-autocompact" },
     { "path": "../compaction-snip" },
     { "path": "../errors" },
     { "path": "../logging" },
+    { "path": "../permission-engine" },
+    { "path": "../recovery-engine" },
     { "path": "../run-context" },
     { "path": "../token-budget" },
     { "path": "../tool-catalog" },

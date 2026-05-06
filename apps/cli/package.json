@@ -19,6 +19,7 @@
     "@crewhaus/infra-utils": "workspace:*",
     "@crewhaus/ir": "workspace:*",
     "@crewhaus/logging": "workspace:*",
+    "@crewhaus/permission-engine": "workspace:*",
     "@crewhaus/runtime-core": "workspace:*",
     "@crewhaus/spec": "workspace:*",
     "@crewhaus/tool-bash": "workspace:*",

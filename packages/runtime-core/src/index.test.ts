@@ -159,6 +159,7 @@ describe("runChatLoop tool execution", () => {
       client,
       input,
       tools: [echoTool],
+      permissionMode: "bypass",
     });
 
     // The model was called twice for one user input: once that requested the
@@ -496,6 +497,7 @@ describe("runChatLoop singleTurn mode", () => {
       singleTurn: true,
       seedMessages: [{ role: "user", content: "please echo" }],
       tools: [echoTool],
+      permissionMode: "bypass",
     });
 
     expect(result).toBe("after tool");
@@ -522,6 +524,126 @@ describe("runChatLoop singleTurn mode", () => {
     });
 
     expect(result).toBe("");
+  });
+
+  test("permission policy denies a tool in default mode and writes a denial tool_result", async () => {
+    const echoTool = buildTool({
+      name: "echo",
+      description: "echoes",
+      inputSchema: z.object({ msg: z.string() }),
+      execute: async (input) => `echoed: ${input.msg}`,
+    });
+
+    const { client, callCount, capturedMessages } = makeScriptedClient([
+      [
+        {
+          type: "tool_use",
+          id: "tu_d",
+          name: "echo",
+          input: { msg: "hi" },
+        } as Anthropic.ToolUseBlock,
+      ],
+      [{ type: "text", text: "ack denied", citations: null } as Anthropic.TextBlock],
+    ]);
+
+    // single-turn: no rl, so any "ask" decision falls through to deny.
+    // default mode + empty rule set → ask → deny in single-turn mode.
+    await runChatLoop({
+      model: "test-model",
+      instructions: "test",
+      client,
+      singleTurn: true,
+      seedMessages: [{ role: "user", content: "go" }],
+      tools: [echoTool],
+      permissionMode: "default",
+    });
+
+    expect(callCount()).toBe(2);
+    const secondCall = capturedMessages()[1] ?? [];
+    const blocks = (secondCall[secondCall.length - 1]?.content ??
+      []) as Anthropic.ToolResultBlockParam[];
+    expect(blocks[0]?.is_error).toBe(true);
+    expect(String(blocks[0]?.content)).toMatch(/tool denied/);
+  });
+
+  test("permission policy in plan mode denies any non-readOnly tool", async () => {
+    const writeTool = buildTool({
+      name: "write",
+      description: "writes",
+      inputSchema: z.object({ path: z.string() }),
+      destructive: true,
+      execute: async () => "wrote",
+    });
+
+    const { client, capturedMessages } = makeScriptedClient([
+      [
+        {
+          type: "tool_use",
+          id: "tu_w",
+          name: "write",
+          input: { path: "/tmp/x" },
+        } as Anthropic.ToolUseBlock,
+      ],
+      [{ type: "text", text: "ok", citations: null } as Anthropic.TextBlock],
+    ]);
+
+    await runChatLoop({
+      model: "test-model",
+      instructions: "test",
+      client,
+      singleTurn: true,
+      seedMessages: [{ role: "user", content: "go" }],
+      tools: [writeTool],
+      permissionMode: "plan",
+    });
+
+    const secondCall = capturedMessages()[1] ?? [];
+    const blocks = (secondCall[secondCall.length - 1]?.content ??
+      []) as Anthropic.ToolResultBlockParam[];
+    expect(blocks[0]?.is_error).toBe(true);
+    expect(String(blocks[0]?.content)).toMatch(/tool denied/);
+  });
+
+  test("recovery: 5xx from the stream triggers retry, then succeeds on the next attempt", async () => {
+    let attempt = 0;
+    const client = {
+      messages: {
+        stream: () => {
+          attempt++;
+          return {
+            on: () => {},
+            finalMessage: async () => {
+              if (attempt === 1) {
+                throw {
+                  name: "APIError",
+                  status: 503,
+                  error: { type: "api_error", message: "service unavailable" },
+                  message: "503 Service Unavailable",
+                };
+              }
+              return {
+                content: [{ type: "text", text: "ok after retry", citations: null }],
+                stop_reason: "end_turn",
+              };
+            },
+          };
+        },
+      },
+    } as unknown as Anthropic;
+
+    const result = await runChatLoop({
+      model: "test-model",
+      instructions: "test",
+      client,
+      singleTurn: true,
+      seedMessages: [{ role: "user", content: "go" }],
+      // Override the runContext to use a logger that captures lines so we
+      // can assert the recovery.action log fires.
+      permissionMode: "bypass",
+    });
+
+    expect(attempt).toBe(2); // first call failed, second succeeded
+    expect(result).toBe("ok after retry");
   });
 
   test("throws RuntimeError when seedMessages is missing or does not end with role:user", async () => {

@@ -22,6 +22,7 @@
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
         "@crewhaus/logging": "workspace:*",
+        "@crewhaus/permission-engine": "workspace:*",
         "@crewhaus/runtime-core": "workspace:*",
         "@crewhaus/spec": "workspace:*",
         "@crewhaus/tool-bash": "workspace:*",
@@ -44,6 +45,10 @@
         "@crewhaus/runtime-core": "workspace:*",
         "@crewhaus/tool-bash": "workspace:*",
       },
+    },
+    "packages/abort-controller": {
+      "name": "@crewhaus/abort-controller",
+      "version": "0.0.0",
     },
     "packages/compaction-autocompact": {
       "name": "@crewhaus/compaction-autocompact",
@@ -87,6 +92,22 @@
       "name": "@crewhaus/logging",
       "version": "0.0.0",
     },
+    "packages/permission-engine": {
+      "name": "@crewhaus/permission-engine",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-permission-matcher": "workspace:*",
+        "zod": "^3.23.8",
+      },
+    },
+    "packages/recovery-engine": {
+      "name": "@crewhaus/recovery-engine",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+      },
+    },
     "packages/run-context": {
       "name": "@crewhaus/run-context",
       "version": "0.0.0",
@@ -99,9 +120,12 @@
       "version": "0.0.0",
       "dependencies": {
         "@anthropic-ai/sdk": "^0.40.0",
+        "@crewhaus/abort-controller": "workspace:*",
         "@crewhaus/compaction-autocompact": "workspace:*",
         "@crewhaus/compaction-snip": "workspace:*",
         "@crewhaus/errors": "workspace:*",
+        "@crewhaus/permission-engine": "workspace:*",
+        "@crewhaus/recovery-engine": "workspace:*",
         "@crewhaus/run-context": "workspace:*",
         "@crewhaus/token-budget": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
@@ -270,6 +294,8 @@
 
     "@crewhaus-examples/hello-workflow": ["@crewhaus-examples/hello-workflow@workspace:examples/hello-workflow"],
 
+    "@crewhaus/abort-controller": ["@crewhaus/abort-controller@workspace:packages/abort-controller"],
+
     "@crewhaus/cli": ["@crewhaus/cli@workspace:apps/cli"],
 
     "@crewhaus/compaction-autocompact": ["@crewhaus/compaction-autocompact@workspace:packages/compaction-autocompact"],
@@ -285,6 +311,10 @@
     "@crewhaus/ir": ["@crewhaus/ir@workspace:packages/ir"],
 
     "@crewhaus/logging": ["@crewhaus/logging@workspace:packages/logging"],
+
+    "@crewhaus/permission-engine": ["@crewhaus/permission-engine@workspace:packages/permission-engine"],
+
+    "@crewhaus/recovery-engine": ["@crewhaus/recovery-engine@workspace:packages/recovery-engine"],
 
     "@crewhaus/run-context": ["@crewhaus/run-context@workspace:packages/run-context"],
 
