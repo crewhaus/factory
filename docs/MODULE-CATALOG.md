@@ -22,16 +22,16 @@ Modules in the per-layer tables below are prefixed with status markers:
 
 | Module | Layer | Notes |
 |---|---|---|
-| `spec-schema` | F1 | Discriminated union over `target`: `cli` (agent + optional tools[]) and `workflow` (top-level model + steps[] with optional per-step model/tools). PR #2, expanded in PR #7 and Section 6. |
+| `spec-schema` | F1 | Discriminated union over `target`: `cli` (agent + optional tools[]) and `workflow` (top-level model + steps[] with optional per-step model/tools). PR #2, expanded in PR #7 and PR #11. |
 | `spec-parser` | F1 | YAML → Zod-validated spec. PR #2. |
 | `spec-validator` | F1 | Bundled with parser via Zod (`.strict()`). PR #2. |
-| `ir-model` | F1 | `IrV0` (cli) carries name, agent, tools; `IrWorkflowV0` carries name and steps[] with each step's `model` resolved at lower-time. Exported as `IrNode` discriminated union. PR #2, expanded in PR #7 and Section 6. |
-| `compiler-core` | F2 | Pipeline: parse → lower → emit; `lower()`/`emit()` dispatch on target (`cli` → target-cli, `workflow` → target-workflow). PR #2, expanded in PR #7 and Section 6. |
+| `ir-model` | F1 | `IrV0` (cli) carries name, agent, tools; `IrWorkflowV0` carries name and steps[] with each step's `model` resolved at lower-time. Exported as `IrNode` discriminated union. PR #2, expanded in PR #7 and PR #11. |
+| `compiler-core` | F2 | Pipeline: parse → lower → emit; `lower()`/`emit()` dispatch on target (`cli` → target-cli, `workflow` → target-workflow). PR #2, expanded in PR #7 and PR #11. |
 | `target-cli-bundle` | F2 | Single-file `agent.ts` codegen for CLI target; emits grouped tool imports + `defaultCatalog.register()` when `ir.tools` is non-empty. PR #2, expanded in PR #7. |
-| `target-workflow` | F2 | Single-file `agent.ts` codegen for workflow target; emits sequential `runChatLoop({ singleTurn: true })` calls with per-step instructions, model, tools, and the prior step's terminal text threaded forward as a synthetic user message. Section 6. |
-| `codegen-templates` | F2 | Inline string templates in target-cli and target-workflow. PR #2, Section 6. |
+| `target-workflow` | F2 | Single-file `agent.ts` codegen for workflow target; emits sequential `runChatLoop({ singleTurn: true })` calls with per-step instructions, model, tools, and the prior step's terminal text threaded forward as a synthetic user message. PR #11. |
+| `codegen-templates` | F2 | Inline string templates in target-cli and target-workflow. PR #2, expanded in PR #11. |
 | `spec-cli` | F4 | `compile`, `init`, `run`, `doctor` subcommands; deploy/eval/watch pending. PR #2, expanded in PR #10. |
-| `runtime-orchestrator` | R1 | Streaming chat REPL with state-machine-driven inner loop, `tool_use` execution, and pre-turn compaction (snip → autocompact). Single-shot `singleTurn` + `seedMessages` mode added for workflow target. PR #2, #7, #9, Section 6. |
+| `runtime-orchestrator` | R1 | Streaming chat REPL with state-machine-driven inner loop, `tool_use` execution, and pre-turn compaction (snip → autocompact). Single-shot `singleTurn` + `seedMessages` mode added for workflow target. PR #2, #7, #9, #11. |
 | `model-adapter` | R2 | Anthropic-only via `@anthropic-ai/sdk`. PR #2. |
 | `error-types` | F-foundations | Typed `CrewhausError` hierarchy + `toJSON`. PR #3. Extended with `"tool"` code in PR #6. |
 | `logging` | F-foundations | `pretty/json` formats, level filtering, `child()` bindings. PR #3. |

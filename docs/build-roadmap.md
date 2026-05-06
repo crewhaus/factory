@@ -1,17 +1,28 @@
 # CrewHaus Factory — Build Roadmap
 
-> Status as of 2026-05-05. 26 of ~190 catalog modules implemented.
+> Status as of 2026-05-06. 27 of ~190 catalog modules implemented; Sections 1–6 complete, Sections 7–12 next.
 > See `docs/MODULE-CATALOG.md` for full per-module specs and test layer references.
 
 ---
 
 ## Current baseline
 
-The compiler pipeline (spec → IR → codegen) and a minimal streaming chat runtime are complete. Generated agents run a multi-turn REPL with prompt caching but cannot call tools, manage context limits, or be invoked without a prior `compile` step. The sections below unlock each of those capabilities in dependency order.
+The compiler pipeline (spec → IR → codegen) ships two target shapes (`cli`, `workflow`) and the runtime carries tools end-to-end with state-machine-driven turns and pre-turn compaction (snip → autocompact). The CLI exposes `compile`, `run`, `init`, and `doctor` subcommands, and three built-in tool packages (`tool-fs`, `tool-bash`, `tool-todo`) are registered.
+
+What the current stack still cannot do — and Sections 7–12 unlock, in order:
+
+1. **Survive failure** — no error recovery, no cancellation, no real permission engine. The agent will crash on `prompt_too_long`, leak resources on Ctrl-C, and run any tool it's handed. *(Section 7)*
+2. **Run tools efficiently** — tool calls are serialized, large outputs blow up context, runaway loops are not detected, tools cannot start while the model is still streaming. *(Section 8)*
+3. **Speak MCP** — no way to use the ecosystem of external MCP servers (filesystem, github, sentry, etc.) without writing native tool wrappers. *(Section 9)*
+4. **Remember anything** — no session store, no transcript log, no in-process state container; every `crewhaus run` starts from zero. *(Section 10)*
+5. **Be customized** — no hooks, no skills, no slash commands. The harness has no extension surface for users. *(Section 11)*
+6. **Live in chat** — only CLI and workflow targets exist; no channel/messenger shape. *(Section 12)*
 
 ---
 
 ## Section 1 — Tool layer foundation
+
+> Status: ✅ complete (PR #6).
 
 **Catalog modules:** `tool-catalog`, `tool-builder`, `tool-validate`, `tool-executor`, `tool-permission-matcher` (all R3)
 
@@ -111,6 +122,8 @@ Update existing tests for spec, ir, and compiler to cover the new `tools` field.
 ---
 
 ## Section 3 — First built-in tool implementations
+
+> Status: ✅ complete (PR #8).
 
 **Catalog modules:** `tool-fs`, `tool-bash`, `tool-todo` (R4)
 
@@ -250,6 +263,8 @@ Each subcommand gets an integration test (`T3`) via `Bun.spawn` on the CLI binar
 
 ## Section 6 — Second target shape: workflow
 
+> Status: ✅ complete (PR #11).
+
 **Catalog modules:** `target-workflow`, `ir-model` expansion (IrWorkflow), `spec-schema` expansion (workflow shape), `codegen-templates` additions (F2, F1)
 
 With the tool framework, context management, and CLI in place, the pipeline is mature enough to support a second target shape. A `workflow` target compiles a spec with named sequential steps into a generated runtime that runs them in order, passing state between steps. This builds directly on everything from Sections 1–5.
@@ -293,6 +308,304 @@ spec-schema (workflow target + steps[])  ──►  ir-model (IrWorkflowV0)  ─
 
 ---
 
+## Section 7 — Hardening: recovery, permission engine, abort
+
+> Status: not started.
+
+**Catalog modules:** `recovery-engine` (R1), `permission-engine` (R8), `abort-controller` (R1)
+
+The runtime currently throws on any non-200 model response, has no cancellation story, and only checks tool calls against a single pattern matcher with no notion of modes or rule sources. This section makes the agent robust enough to leave running unattended. All three modules are independent of each other and can be built in parallel; each integrates into `runtime-core` at the end.
+
+### Build order within this section
+
+```
+recovery-engine     ──►  (integrate into runtime-core)
+permission-engine        (parallel)
+abort-controller
+```
+
+### What to build
+
+**`packages/recovery-engine`**
+- Classify Anthropic errors into a recovery taxonomy: `prompt_too_long` → trigger reactive compaction; `max_output_tokens` → continue with `Continue?` prompt; `overloaded_error` / `5xx` → exponential backoff retry; `invalid_request_error` → tombstone the offending message and surface to user
+- `recover(error: AnthropicError, state: TurnState): RecoveryAction`
+- `RecoveryAction` union: `{ kind: "compact" } | { kind: "retry", delayMs } | { kind: "continue" } | { kind: "tombstone", messageId } | { kind: "fail", reason }`
+- References: `claude-code/query.ts` recovery branches, `agent-framework/_runner.py` retry
+
+**`packages/permission-engine`** *(parallel)*
+- Modes: `default` (ask on first encounter), `plan` (read-only, no writes), `auto` (allow all read-only, ask for destructive), `bypass` (allow everything — for tests/CI)
+- Rule sources, in priority order: command-line flag → `.crewhaus/settings.json` → `crewhaus.yaml` permissions block → hook decisions → built-in defaults
+- Rule types: `alwaysAllow`, `alwaysDeny`, `alwaysAsk`
+- `evaluate(toolCall, mode, rules): "allow" | "deny" | "ask"`
+- Build on top of the existing `tool-permission-matcher` for the pattern-matching primitive
+- References: `claude-code/utils/permissions/` (14 files); `AI-Harness-Systems.md` §Policy engine
+
+**`packages/abort-controller`** *(parallel)*
+- Wraps `AbortController` with parent/child semantics: parent abort cancels all children; sibling abort does not propagate
+- `createAbortTree(parent?: AbortSignal): { signal, abort, child(): AbortTree }`
+- Hook into `runChatLoop` for Ctrl-C handling — first SIGINT cancels current turn, second exits
+- References: `claude-code/utils/abortController.ts`
+
+### Integration into `runtime-core`
+- Wrap each model call in a try/catch that delegates to `recovery-engine`
+- Run every tool through `permission-engine.evaluate()` before `tool-executor`; in `default` and `auto` modes, prompt the user via stdin for `ask` decisions
+- Thread the abort tree through `runChatLoop`, `tool-executor`, and child tool processes (`Bun.spawn` accepts `signal`)
+
+### Tests
+`recovery-engine`: unit tests (`T1`) per error class plus a replay test (`T4`) over a fixture of recorded errors. `permission-engine`: property tests (`T9`) over rule precedence + a security test (`T8`) verifying `bypass` cannot be set from a YAML file (only via flag). `abort-controller`: integration test (`T3`) verifying child-tool processes receive SIGTERM on parent abort.
+
+---
+
+## Section 8 — Tool layer enrichment
+
+> Status: not started.
+
+**Catalog modules:** `tool-orchestrator`, `tool-loop-detection`, `tool-result-store`, `streaming-tool-executor` (all R3)
+
+Today the runtime executes tool calls serially after the stream completes, dumps full output back into context, and has no defense against runaway loops. These four modules close those gaps. They are independent of each other and parallel-safe; each plugs into the existing `tool-executor` or replaces the inline tool loop in `runtime-core`.
+
+### Build order within this section
+
+```
+tool-orchestrator         ──►  (replace inline tool loop in runtime-core)
+tool-loop-detection             (all four parallel)
+tool-result-store
+streaming-tool-executor
+```
+
+### What to build
+
+**`packages/tool-orchestrator`**
+- `partitionToolCalls(calls: ToolUse[], catalog: ToolCatalog): { concurrent: ToolUse[][], serial: ToolUse[] }`
+- All `concurrencySafe && readOnly` tools go in concurrent batches (run via `Promise.all`)
+- Anything destructive or with side effects goes serial
+- References: `claude-code/services/tools/toolOrchestration.ts` `partitionToolCalls`, `agent-framework/_executor.py`
+
+**`packages/tool-loop-detection`** *(parallel)*
+- Hash recent (toolName, input) pairs over a sliding window
+- `detectLoop(history: ToolUse[], windowSize = 10, threshold = 3): LoopDetection | null`
+- Returns the loop signature and count when the same call repeats ≥ threshold within window
+- The runtime should inject a tool-result message warning the model and then proceed
+- References: `openclaw/agents/tool-loop-detection.ts`
+
+**`packages/tool-result-store`** *(parallel)*
+- When a tool result exceeds N bytes (default 10KB), persist full output to `.crewhaus/tool-results/<runId>/<toolUseId>.txt` and return a preview + reference to the model
+- `storeAndPreview(result: ToolResult, opts): { previewContent: string, fullPath: string }`
+- Generated agents can later read the full file via the `Read` tool
+- References: `claude-code/utils/toolResultStorage.ts`
+
+**`packages/streaming-tool-executor`** *(parallel)*
+- Parse partial `tool_use` blocks from the streaming response and start execution before `message_stop`
+- Tracks per-tool-use-id partial-args parsing state; fires `executeTool()` as soon as args are complete-and-valid
+- Aborts in-flight tools if the model emits `stop_reason: "end_turn"` while a tool is still running its first invocation alongside another tool that needs to come first (sibling abort)
+- References: `claude-code/services/tools/StreamingToolExecutor.ts`
+
+### Integration into `runtime-core`
+- Replace the inline tool execution in `runChatLoop` with `tool-orchestrator.partitionToolCalls()` then run concurrent batches via `Promise.all`
+- Run `tool-loop-detection.detectLoop()` after each tool batch; on detection, append a system warning and continue
+- Wrap every tool result through `tool-result-store.storeAndPreview()` before appending to message history
+- Behind a `streaming: true` option flag, swap `tool-executor` for `streaming-tool-executor`
+
+### Tests
+Each package gets `T1` unit tests. `tool-orchestrator` needs a property test (`T9`) verifying no two destructive tools ever land in the same concurrent batch. `streaming-tool-executor` needs a load test (`T7`) with a fake stream emitting 50 partial tool_use blocks.
+
+---
+
+## Section 9 — MCP host
+
+> Status: not started.
+
+**Catalog modules:** `mcp-host` (R5), `tool-mcp` (R4)
+
+MCP is the lingua franca for agent tooling — once the harness can speak it, every external MCP server (filesystem, github, sentry, slack, …) becomes available without bespoke wrappers. This section is sequential: the protocol client first, then the wrapper that adapts MCP tools into the existing `tool-catalog`.
+
+### Build order within this section
+
+```
+mcp-host  ──►  tool-mcp  ──►  (spec schema: mcp_servers[], runtime-core init wires it up)
+```
+
+### What to build
+
+**`packages/mcp-host`**
+- Manages MCP server connections: stdio (child process) and SSE (HTTP) transports
+- Connection lifecycle: spawn / handshake (`initialize` request) / poll capabilities / disconnect / reconnect with backoff
+- `McpClient` class: `connect()`, `listTools()`, `callTool(name, args)`, `disconnect()`
+- `McpHost` registry: keyed by server name; `addServer(name, config)`, `getClient(name)`
+- Server config schema: `{ command: string, args?: string[], env?: Record<string,string> }` for stdio; `{ url: string, headers?: Record<string,string> }` for SSE
+- References: `claude-code/services/mcp/`, `agent-framework/_mcp.py`, `openai-agents/mcp/`
+
+**`packages/tool-mcp`**
+- Wraps a remote MCP tool as a local `RegisteredTool`
+- `registerMcpServer(host: McpHost, serverName: string, catalog: ToolCatalog): Promise<void>`
+  - Calls `listTools()` on the server, builds a `RegisteredTool` per remote tool, registers each in the catalog with name `<serverName>__<toolName>`
+  - Tool invocation delegates to `host.getClient(serverName).callTool(...)`
+  - All MCP tools default to `concurrencySafe: false, readOnly: false, destructive: false` (caller can override per-server in spec)
+- References: `claude-code/services/mcp/`, `crewAI/tools/mcp_native_tool.py`
+
+### Spec schema + runtime wiring
+- Extend `packages/spec` with optional `mcp_servers?: Record<string, McpServerConfig>` block
+- `compiler-core` passes it through to `IrV0.mcp_servers`
+- `target-cli` emits boot code that, before `runChatLoop()`, instantiates `McpHost`, calls `addServer()` per entry, then `registerMcpServer(host, name, catalog)` per entry — `await Promise.all`
+- Document an example spec: `mcp_servers: { fs: { command: "npx", args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"] } }`
+
+### Tests
+`mcp-host`: contract test (`T2`) against the official MCP everything-server reference; integration test (`T3`) for stdio reconnect after kill; security test (`T8`) verifying tool schemas from a malicious server cannot escape the schema validator. `tool-mcp`: integration test (`T3`) wiring a mock McpHost + catalog and confirming a remote tool call round-trips.
+
+---
+
+## Section 10 — Persistence: state, sessions, event log
+
+> Status: not started.
+
+**Catalog modules:** `state-store` (R7), `session-store` (R7), `event-log` (R7)
+
+The runtime is amnesiac — every `crewhaus run` starts blank, no transcripts are written, and there's no in-process state container for tools/hooks to coordinate through. These three primitives are independent and parallel-safe.
+
+### Build order within this section
+
+```
+state-store    ──►  (each plugs into runtime-core independently)
+session-store        (all three parallel)
+event-log
+```
+
+### What to build
+
+**`packages/state-store`**
+- Tiny zustand-style store: `createStore<T>(initial: T): Store<T>`
+- API: `get()`, `set(partial)`, `subscribe(listener)`, `select(selector)`
+- Referential equality on selectors; listener fires only on actual change
+- ~40 lines of code; no dependencies
+- References: `claude-code/state/store.ts` (40 lines)
+
+**`packages/session-store`** *(parallel)*
+- Persists session metadata to `.crewhaus/sessions/<sessionId>.json`
+- Session shape: `{ id, createdAt, updatedAt, name, target, model, lastTurnIndex }`
+- API: `create(opts)`, `get(id)`, `list()`, `update(id, patch)`, `delete(id)`
+- TTL-based eviction: anything older than 30 days is purged on `list()`
+- References: `claude-code/utils/sessionStorage.ts`, `agent-framework/_sessions.py`
+
+**`packages/event-log`** *(parallel)*
+- Append-only JSONL transcript at `.crewhaus/sessions/<sessionId>.jsonl`
+- Event shape: `{ ts, kind: "user_message" | "assistant_message" | "tool_use" | "tool_result" | "error" | "compaction", payload }`
+- API: `open(sessionId): EventLog`, `append(event)`, `read({ since?, until? }): AsyncIterable<Event>`, `close()`
+- Schema-versioned with `version: 1` field on every line for future migration
+- References: `claude-code/utils/sessionStorage.ts`, `AI-Harness-Systems.md` §append-only event history
+
+### Integration into `runtime-core`
+- On `runChatLoop` start: create or resume session via `session-store`; open `event-log` for append; create a `state-store` bound to this run
+- After every model response and tool result: append to event log
+- On `runChatLoop` exit: update session `lastTurnIndex`, close event log
+- Add `--resume <sessionId>` flag to `crewhaus run` that replays the event log into message history before continuing
+
+### Tests
+`state-store`: property tests (`T9`) over subscribe ordering. `session-store`: integration test (`T3`) creating + listing + evicting. `event-log`: load test (`T7`) appending 10K events and reading them back; replay test (`T4`) confirming `--resume` produces an identical message history.
+
+---
+
+## Section 11 — Hooks, skills, slash commands
+
+> Status: not started.
+
+**Catalog modules:** `hooks-engine` (R9), `skills-registry` (R9), `slash-commands` (R9)
+
+These three modules give users an extension surface — the difference between a fixed harness and a customizable one. `hooks-engine` is the structural primitive both other modules build on; `skills-registry` and `slash-commands` are user-facing features that depend on it.
+
+### Build order within this section
+
+```
+hooks-engine  ──►  skills-registry      (parallel after hooks-engine)
+                   slash-commands
+```
+
+### What to build
+
+**`packages/hooks-engine`**
+- Lifecycle events: `session-start`, `pre-tool`, `post-tool`, `pre-compact`, `post-compact`, `stop`, `pre-model`, `post-model`
+- Hook def: `{ event, matcher?: string, command: string }` — runs an arbitrary shell command via `Bun.spawn`, passing event payload as JSON on stdin and reading a JSON decision from stdout
+- Decision shape: `{ decision: "allow" | "deny" | "block", reason?, mutate?: object }`
+- Loaded from `.crewhaus/settings.json` (project) and `~/.crewhaus/settings.json` (user); user settings stack under project settings
+- API: `loadHooks()`, `runHooks(event, payload): Promise<HookResult[]>`
+- References: `openclaw/hooks/`, `claude-code/hooks/`
+
+**`packages/skills-registry`** *(parallel after hooks)*
+- A "skill" is a directory containing `SKILL.md` with frontmatter (`name`, `description`, `triggers?`, `tools?`)
+- Discovery order: `~/.crewhaus/skills/`, `<project>/.crewhaus/skills/`, plugin-bundled skills
+- Lazy load: list all skills at boot (just frontmatter), inject the *names + descriptions* into the system prompt; load full body only when the model calls the `Skill` tool with that name
+- Adds a built-in `Skill(name)` tool to the default catalog when skills are present
+- References: `openclaw/agents/skills/`, `claude-code/skills/`
+
+**`packages/slash-commands`** *(parallel after hooks)*
+- A slash command is a markdown file in `.crewhaus/commands/<name>.md` with optional frontmatter (`description`, `argument-hint`)
+- When the user input starts with `/<name>`, expand the markdown body (with `$ARGUMENTS` substitution) into the user message and submit
+- API: `loadCommands(): Map<string, SlashCommand>`, `expand(input: string, commands): { handled: boolean, expanded: string }`
+- Hook integration: fires a `pre-slash` hook event before expansion so users can intercept
+- References: `openclaw/commands/`, `claude-code/commands.ts`
+
+### Integration into `runtime-core` and `apps/cli`
+- `runChatLoop` fires hook events at the right moments (`pre-tool` before each tool execution, `post-tool` after, etc.); a `deny` decision short-circuits with the hook's reason as the result
+- `apps/cli/src/index.ts` `run` subcommand checks for slash commands on each user input before sending to the model
+- System prompt builder gets a new section that lists available skills
+
+### Tests
+`hooks-engine`: integration test (`T3`) with a fixture hook that returns `deny` and verifying the tool is blocked; security test (`T8`) verifying hook commands inherit a restricted env. `skills-registry`: unit test (`T1`) for frontmatter parsing; integration test (`T3`) verifying full skill body is only loaded on tool call. `slash-commands`: property test (`T9`) over `$ARGUMENTS` substitution edge cases.
+
+---
+
+## Section 12 — Third target shape: channel bot
+
+> Status: not started.
+
+**Catalog modules:** `target-channel-bot` (F2), Slack adapter (R-channels), `tool-message-channel` (R4); transitively depends on `mcp-host` (Section 9), `session-store` + `event-log` (Section 10), `hooks-engine` (Section 11)
+
+A channel bot lives in a long-running daemon that listens to inbound messages from Slack/Telegram/Discord and runs a session per thread. This is the third major target shape and the first that requires the persistence and extension stack from Sections 10–11. We ship the framework + one channel (Slack); other channels follow the same shape.
+
+### Build order within this section
+
+```
+target-channel-bot                   ──►  channel-adapter-slack
+spec schema (channel target)               tool-message-channel        (parallel after framework)
+ir-model (IrChannelV0)                     examples/hello-channel/
+```
+
+### What to build
+
+**`packages/spec`** — add `channel` target
+- `target: "channel"` with: `agent: { model, instructions, tools? }`, `channels: { slack?: { botToken: string, signingSecret: string, ... } }`, `routing: { sessionKey: "thread" | "user" | "channel" }`
+
+**`packages/ir`** — add `IrChannelV0`
+- Mirrors the channel spec; carries channel configs and routing rules
+
+**`packages/target-channel-bot`**
+- Codegen for a long-running daemon: HTTP server (`Bun.serve`) accepting webhooks per channel; gateway dispatching incoming events to a session router; per-session `runChatLoop()` instances driven by inbound messages instead of stdin
+- Generated bundle is a multi-file artifact (`gateway.ts`, `daemon.ts`, `session-router.ts`, `agent.ts`) — first time the codegen produces more than one file
+- References: `openclaw/gateway/`, `openclaw/daemon/`, `openclaw/channels/`
+
+**`packages/channel-adapter-slack`**
+- Implements: webhook signature verification (`X-Slack-Signature` HMAC), event parsing (`message`, `app_mention`), reply-to-thread API, typing indicator, file uploads
+- Shape: `createSlackAdapter(config): ChannelAdapter` where `ChannelAdapter` has `verify`, `parseInbound`, `sendReply`, `setTyping`
+- References: `openclaw/channels/slack/`
+
+**`packages/tool-message-channel`**
+- Tool: `SendMessage(channel, text)` — lets the agent send messages to other channels/threads/DMs
+- Permission-gated by default; requires explicit allow via `permission-engine` rules
+- References: `openclaw/agents/channel-tools.ts`, `claude-code/tools/SendMessageTool`
+
+### Session routing
+- `session-store` keyed by `slack:<workspaceId>:<channelId>:<threadTs>` (when `routing.sessionKey: "thread"`)
+- Each inbound message resumes the session via `--resume`-equivalent in-process logic, appends the message, and runs one turn
+- Hooks fire as normal (so users can plug in approval flows for channel tools)
+
+**`examples/hello-channel/crewhaus.yaml`**
+- A Slack bot that mentions trigger an agent reply in-thread, with `tool-fs` and `tool-bash` available via permission rules
+- Add `compile:hello-channel` and `run:hello-channel` scripts to the root `package.json`
+
+### Tests
+`target-channel-bot`: unit test (`T1`) on generated bundle structure; integration test (`T3`) compiling `hello-channel` and starting the daemon, posting a fake Slack webhook, and asserting a reply is sent. `channel-adapter-slack`: contract test (`T2`) against a recorded Slack event corpus; security test (`T8`) for signature verification with tampered payloads. `tool-message-channel`: permission test (`T8`) verifying the tool fails closed without explicit allow rule.
+
+---
+
 ## Kickoff prompts
 
 Use these prompts with Claude Code from the project root (`/Users/bots/Developer/crewhaus-factory`). Each prompt is self-contained.
@@ -318,6 +631,11 @@ Each package should follow the existing pattern: type: "module", main: "src/inde
 Write tests for each package. tool-executor needs both unit tests and an integration test that wires catalog + validate + permission + a mock tool.
 
 Do not modify runtime-core yet — that comes in Section 2.
+
+End-to-end smoke test before opening the PR:
+- ANTHROPIC_AUTH_TOKEN is in .env (Bun auto-loads .env; the runtime supports OAuth tokens with the sk-ant-oat prefix)
+- This section adds no user-visible behavior. Run the existing regression: `bun run compile:hello && echo "say hi" | bun run run:hello` and verify the agent replies — confirms nothing in the foundation packages broke the baseline runtime.
+- No persistent artifacts to clean up.
 ```
 
 ---
@@ -344,6 +662,12 @@ Extend the pipeline to carry tools from spec YAML through to the generated agent
    - Execute them using tool-executor, append tool_result messages, and loop back to the model
 
 Update existing tests. Add an integration test in packages/compiler that compiles a spec with tools: [read] and checks the emitted code. Add a runtime-core test with a mock Anthropic client that returns a tool_use block, verifying the tool is called and the conversation continues.
+
+End-to-end smoke test before opening the PR:
+- ANTHROPIC_AUTH_TOKEN is in .env (Bun auto-loads .env; the runtime supports OAuth tokens with the sk-ant-oat prefix)
+- Create a temporary spec with tools: [Read] (use a stub Read tool registered by the test, or skip if Section 3 hasn't landed yet — in that case use a no-op tool registered inline)
+- Compile and run; from stdin send: "what tools do you have? call one." and verify the model emits a tool_use block, the tool runs, the conversation continues, and you get a coherent reply
+- Confirm without tools the existing examples/hello-cli still works (regression)
 
 Update docs/MODULE-CATALOG.md with everything that is complete and create a pull request with all updates.
 ```
@@ -377,6 +701,16 @@ Build three new packages in parallel — they do not depend on each other:
    - Return a markdown checklist
 
 Each package: @crewhaus/tool-fs etc., type: "module", workspace:* deps on tool-catalog and tool-builder. Include T1 unit tests and T3 integration tests. tool-bash timeout test: verify the process is killed after timeout. tool-fs path-traversal test: verify ../../../etc/passwd is rejected.
+
+End-to-end smoke test before opening the PR:
+- ANTHROPIC_AUTH_TOKEN is in .env (Bun auto-loads .env)
+- Create a smoke spec with tools: [Read, Bash, TodoWrite] in a temp dir; compile and run
+- Drive these prompts and verify each tool actually executes against the live model:
+  1. "list the files in . using the Bash tool" — expect a Bash tool_use, real ls output, then a summary
+  2. "read the package.json and tell me the name field" — expect Read tool_use, JSON content, correct extracted name
+  3. "make a 3-item todo list for tonight" — expect TodoWrite tool_use, markdown checklist back
+- Verify the path-traversal defense at runtime: prompt the agent to "Read ../../../etc/passwd" and confirm the tool returns a permission error rather than file content
+- Clean up the temp dir
 
 Update docs/MODULE-CATALOG.md with everything that is complete and create a pull request with all updates.
 ```
@@ -421,6 +755,12 @@ After all five packages are built, integrate them into packages/runtime-core:
 - Check token-budget at the start of each turn
 - Apply snip first (free), then autocompact if still over 85% of limit
 
+End-to-end smoke test before opening the PR:
+- ANTHROPIC_AUTH_TOKEN is in .env (Bun auto-loads .env)
+- Regression: `bun run compile:hello && echo "tell me a haiku" | bun run run:hello` still completes successfully
+- Force compaction in a real run: temporarily lower the token-budget threshold (env var or const override) so the limit triggers within a few turns, then have a 6-turn conversation. Confirm in stderr/logs that snip fires first and autoCompact fires when snip alone is insufficient. Confirm the model still produces coherent replies after compaction.
+- Restore the original threshold before opening the PR
+
 Update docs/MODULE-CATALOG.md with everything that is complete and create a pull request with all updates.
 ```
 
@@ -454,6 +794,14 @@ Add three new subcommands to apps/cli/src/index.ts. These can be developed in pa
 Update the help text at the top of the file to list all four subcommands (compile, run, init, doctor).
 
 Write integration tests using Bun.spawn for each subcommand. The run test should use examples/hello-cli/crewhaus.yaml with a mock input that closes stdin immediately.
+
+End-to-end smoke test before opening the PR:
+- ANTHROPIC_AUTH_TOKEN is in .env (Bun auto-loads .env)
+- In a temp dir: `bun apps/cli/src/index.ts init smoke-bot` → confirm crewhaus.yaml exists and parses cleanly
+- `bun apps/cli/src/index.ts doctor` in the temp dir → confirm exits 0 (token present, bun version OK, yaml present)
+- Unset ANTHROPIC_AUTH_TOKEN inline (`env -u ANTHROPIC_AUTH_TOKEN bun apps/cli/src/index.ts doctor`) → confirm exits 1 with a missing-credential message
+- `echo "say hi in 5 words" | bun apps/cli/src/index.ts run smoke-bot/crewhaus.yaml` → confirm a real reply from the model
+- Clean up the temp dir
 
 Update docs/MODULE-CATALOG.md with everything that is complete and create a pull request with all updates.
 ```
@@ -493,6 +841,330 @@ Add a second target shape — workflow — to the full pipeline:
    - Add compile:hello-workflow and run:hello-workflow scripts to the root package.json
 
 Tests: unit tests for target-workflow verifying the generated code structure. Integration test compiling hello-workflow and confirming it produces a bundle with step-sequencing logic.
+
+End-to-end smoke test before opening the PR:
+- ANTHROPIC_AUTH_TOKEN is in .env (Bun auto-loads .env)
+- `bun run compile:hello-workflow && bun run run:hello-workflow`
+- Verify in the output that step 1 ran first (lists files via Bash), step 2 ran second (summary), and the step-2 prompt clearly received step-1's output as context
+- Re-run the existing CLI example (`bun run run:hello`) to confirm the discriminated-union spec change did not break the cli target
+
+Update docs/MODULE-CATALOG.md with everything that is complete and create a pull request with all updates.
+```
+
+---
+
+### Section 7 — Hardening: recovery, permission, abort
+
+```
+Read docs/build-roadmap.md Section 7. Also read:
+- packages/runtime-core/src/index.ts (where recovery + permission + abort all integrate)
+- packages/tool-permission-matcher/src/index.ts (the existing pattern matcher to build on)
+- packages/tool-executor/src/index.ts (where permission gates apply)
+- docs/MODULE-CATALOG.md Layer R1 entries for recovery-engine and abort-controller, Layer R8 entry for permission-engine
+
+Build three packages in parallel — they have no dependencies on each other:
+
+1. packages/recovery-engine
+   - Classify Anthropic errors into a recovery taxonomy (prompt_too_long → compact, max_output_tokens → continue, overloaded/5xx → exponential backoff, invalid_request → tombstone)
+   - recover(error, state): RecoveryAction where RecoveryAction is a discriminated union: { kind: "compact" } | { kind: "retry", delayMs } | { kind: "continue" } | { kind: "tombstone", messageId } | { kind: "fail", reason }
+   - No I/O — pure decision function
+
+2. packages/permission-engine
+   - Modes: default | plan | auto | bypass
+   - Rule sources, in priority order: command-line flag → .crewhaus/settings.json → crewhaus.yaml permissions block → hook decisions → built-in defaults
+   - Rule types: alwaysAllow | alwaysDeny | alwaysAsk
+   - evaluate(toolCall, mode, rules): "allow" | "deny" | "ask"
+   - Build on top of @crewhaus/tool-permission-matcher for pattern primitives
+   - SECURITY: bypass mode must NOT be settable from a YAML file — only via command-line flag. Add a unit test asserting this.
+
+3. packages/abort-controller
+   - createAbortTree(parent?: AbortSignal): { signal, abort, child(): AbortTree }
+   - Parent abort cascades to all children; siblings are independent
+   - First SIGINT cancels current turn; second exits the process
+
+After all three are built, integrate into packages/runtime-core:
+- Wrap each model call in try/catch that delegates to recovery-engine; honor RecoveryAction (retry, compact, continue, tombstone, fail)
+- Run every tool through permission-engine.evaluate() before tool-executor; in default/auto modes, prompt the user via stdin for "ask" decisions
+- Thread the abort tree through runChatLoop and into Bun.spawn calls in tool-bash via the signal option
+
+Tests:
+- recovery-engine: T1 unit tests per error class; T4 replay test over a fixture of recorded errors
+- permission-engine: T9 property tests over rule precedence; T8 security test on bypass-mode lockdown
+- abort-controller: T3 integration test verifying child-tool processes receive SIGTERM on parent abort
+
+End-to-end smoke test before opening the PR (against the live model via ANTHROPIC_AUTH_TOKEN in .env):
+1. Recovery: temporarily point the runtime at an unreachable Anthropic base URL (env override) for one turn so the model call fails with a network/5xx error; confirm recovery-engine drives a retry with backoff and the run eventually succeeds when you restore the URL. Then revert.
+2. Permission (default mode): run a spec with tools: [Bash], prompt "run rm -rf /tmp/crewhaus-smoke" and confirm the runtime asks for approval on stdin; type "n" and confirm the tool is denied with a clean message in the assistant reply.
+3. Permission (bypass via flag): with --permission-mode bypass on the command line, the same tool call runs without prompting. Verify bypass set in crewhaus.yaml is REJECTED at parse time (security check).
+4. Abort: start a long-running prompt ("count slowly to 200, one number per line"), press Ctrl-C once. Confirm the current turn aborts cleanly, no orphan child processes (`ps` should show no leftover bash from the smoke run), and the process is still alive accepting input. Press Ctrl-C again — confirm clean exit.
+- Clean up any /tmp/crewhaus-smoke artifacts
+
+Update docs/MODULE-CATALOG.md with everything that is complete and create a pull request with all updates.
+```
+
+---
+
+### Section 8 — Tool layer enrichment
+
+```
+Read docs/build-roadmap.md Section 8. Also read:
+- packages/runtime-core/src/index.ts (the inline tool loop to be replaced)
+- packages/tool-executor/src/index.ts (where streaming variant slots in)
+- packages/tool-catalog/src/index.ts (the metadata flags driving partition)
+- docs/MODULE-CATALOG.md Layer R3 entries for tool-orchestrator, tool-loop-detection, tool-result-store, streaming-tool-executor
+
+Build four packages in parallel — they have no dependencies on each other:
+
+1. packages/tool-orchestrator
+   - partitionToolCalls(calls, catalog): { concurrent: ToolUse[][], serial: ToolUse[] }
+   - Tools that are concurrencySafe && readOnly batch together (run via Promise.all)
+   - Anything destructive or with side effects goes serial
+   - Property test (T9): no two destructive tools in same concurrent batch
+
+2. packages/tool-loop-detection
+   - Sliding-window hash of (toolName, input) pairs
+   - detectLoop(history, windowSize=10, threshold=3): LoopDetection | null
+   - When triggered, return the loop signature + count; runtime injects a warning tool-result and continues
+
+3. packages/tool-result-store
+   - Persist outputs > 10KB to .crewhaus/tool-results/<runId>/<toolUseId>.txt
+   - storeAndPreview(result, opts): { previewContent: string, fullPath: string }
+   - Preview = first 100 lines + "[truncated, full output at <fullPath>]"
+
+4. packages/streaming-tool-executor
+   - Parse partial tool_use blocks from the stream and start execution before message_stop
+   - Track per-tool-use-id partial-args parsing state; fire executeTool() when args are complete-and-valid
+   - Sibling abort: if a sibling tool errors and the strategy demands it, abort still-running tools
+
+After all four are built, integrate into packages/runtime-core:
+- Replace inline tool execution with tool-orchestrator.partitionToolCalls() then Promise.all on concurrent batches
+- Run tool-loop-detection.detectLoop() after each batch; on hit, append a system warning and continue
+- Wrap every tool result through tool-result-store.storeAndPreview() before appending to message history
+- Behind a streaming: true flag on RunChatLoopOptions, swap tool-executor for streaming-tool-executor
+
+Tests: T1 unit tests per package; T7 load test for streaming-tool-executor with 50 partial tool_use blocks.
+
+End-to-end smoke test before opening the PR (against the live model via ANTHROPIC_AUTH_TOKEN in .env):
+1. Concurrency: spec with tools: [Read, Bash] (Read is concurrencySafe + readOnly, Bash is not). Prompt "read package.json AND run pwd in parallel" — confirm in logs/timing that Read calls batch concurrently while Bash runs serially.
+2. Loop detection: prompt the agent in a way that nudges it to repeat the same tool call (e.g. "keep running `date` over and over, don't stop"). Confirm tool-loop-detection injects a warning system message and the agent stops looping.
+3. Result store: prompt "Read /usr/share/dict/words" (or another large file). Confirm the message history contains a preview-only tool result, the full output is on disk under .crewhaus/tool-results/<runId>/, and a follow-up prompt "find the longest word in that file" still works (agent reads the stored path).
+4. Streaming: with streaming: true on the run, confirm via timing logs that a Bash tool starts executing before the assistant message_stop event fires.
+- Clean up .crewhaus/tool-results/ artifacts
+
+Update docs/MODULE-CATALOG.md with everything that is complete and create a pull request with all updates.
+```
+
+---
+
+### Section 9 — MCP host
+
+```
+Read docs/build-roadmap.md Section 9. Also read:
+- packages/tool-catalog/src/index.ts (where MCP tools register)
+- packages/tool-builder/src/index.ts (the buildTool factory used to wrap MCP tools)
+- packages/spec/src/index.ts (extend with mcp_servers block)
+- packages/ir/src/index.ts and packages/compiler/src/index.ts and packages/target-cli/src/index.ts (thread mcp_servers through the pipeline)
+- docs/MODULE-CATALOG.md Layer R5 entry for mcp-host and Layer R4 entry for tool-mcp
+
+Build sequentially — tool-mcp depends on mcp-host:
+
+1. packages/mcp-host (build first)
+   - Transports: stdio (Bun.spawn child process with NDJSON over stdin/stdout) and SSE (HTTP + EventSource)
+   - McpClient class: connect() / listTools() / callTool(name, args) / disconnect()
+   - Connection lifecycle: spawn → initialize handshake → capability poll; reconnect with exponential backoff (max 30s)
+   - McpHost registry: addServer(name, config) / getClient(name) / disconnectAll()
+   - Server config: { command, args?, env? } for stdio | { url, headers? } for SSE
+
+2. packages/tool-mcp (build after mcp-host)
+   - registerMcpServer(host, serverName, catalog): Promise<void>
+   - Calls listTools() on the server; for each remote tool, builds a RegisteredTool via @crewhaus/tool-builder and registers as <serverName>__<toolName>
+   - Tool invocation delegates to host.getClient(serverName).callTool(...)
+   - Default flags: concurrencySafe: false, readOnly: false, destructive: false (caller can override per-server)
+
+3. Thread mcp_servers through the pipeline:
+   - packages/spec: add optional mcp_servers?: Record<string, McpServerConfig>
+   - packages/ir: add mcp_servers field on IrV0 (and IrWorkflowV0, IrChannelV0 if in flight)
+   - packages/compiler: pass through unchanged
+   - packages/target-cli: emit boot code that constructs McpHost, calls addServer per entry, then awaits Promise.all(entries.map(e => registerMcpServer(host, e.name, catalog))) before runChatLoop()
+
+Tests:
+- mcp-host: T2 contract test against the official MCP everything-server reference; T3 stdio reconnect after kill; T8 schema-validator escape attempt
+- tool-mcp: T3 wiring a mock McpHost + catalog and round-tripping a remote tool call
+
+End-to-end smoke test before opening the PR (against the live model via ANTHROPIC_AUTH_TOKEN in .env):
+1. Stdio MCP: write a smoke spec with `mcp_servers: { everything: { command: "npx", args: ["-y", "@modelcontextprotocol/server-everything"] } }`. Compile and run.
+2. On boot, confirm the runtime logs that it connected to the server and registered each remote tool under the namespaced name (e.g. `everything__echo`, `everything__add`).
+3. Prompt: "use the everything__echo tool to echo back the string 'hello mcp'". Confirm the tool call round-trips through the MCP server and the model receives 'hello mcp' as the result.
+4. Reconnect: while the agent is running, find the spawned npx child PID and `kill -9` it. Confirm mcp-host detects the disconnect, reconnects with backoff, and a follow-up tool call succeeds.
+5. Verify nothing in the existing examples (hello-cli, hello-workflow) regressed when no mcp_servers are configured.
+
+Update docs/MODULE-CATALOG.md with everything that is complete and create a pull request with all updates.
+```
+
+---
+
+### Section 10 — Persistence: state, sessions, event log
+
+```
+Read docs/build-roadmap.md Section 10. Also read:
+- packages/runtime-core/src/index.ts (where all three integrate)
+- packages/run-context/src/index.ts (RunContext gains sessionId)
+- apps/cli/src/index.ts (run subcommand gains --resume flag)
+- docs/MODULE-CATALOG.md Layer R7 entries for state-store, session-store, event-log
+
+Build three packages in parallel — they have no dependencies on each other:
+
+1. packages/state-store
+   - createStore<T>(initial: T): Store<T> — zustand-style
+   - API: get() / set(partial) / subscribe(listener) / select(selector)
+   - Listener fires only on actual change (referential equality on selector output)
+   - Property test (T9) over subscribe ordering and equality
+
+2. packages/session-store
+   - File-backed persistence at .crewhaus/sessions/<sessionId>.json
+   - Session shape: { id, createdAt, updatedAt, name, target, model, lastTurnIndex }
+   - API: create(opts) / get(id) / list() / update(id, patch) / delete(id)
+   - On list(), evict any session older than 30 days
+
+3. packages/event-log
+   - Append-only JSONL at .crewhaus/sessions/<sessionId>.jsonl
+   - Event shape: { ts, version: 1, kind: "user_message" | "assistant_message" | "tool_use" | "tool_result" | "error" | "compaction", payload }
+   - API: open(sessionId): EventLog / append(event) / read({ since?, until? }): AsyncIterable<Event> / close()
+
+After all three are built, integrate into packages/runtime-core:
+- On runChatLoop start: create or resume session via session-store; open event-log; create state-store bound to this run; thread sessionId through RunContext
+- After every model response and tool result: append to event log
+- On runChatLoop exit: update session lastTurnIndex; close event log
+
+Then in apps/cli/src/index.ts:
+- Add --resume <sessionId> flag to crewhaus run that replays the event log into message history before continuing
+
+Tests:
+- state-store: T9 property tests
+- session-store: T3 integration test for create + list + 30-day eviction
+- event-log: T7 load test with 10K events; T4 replay test confirming --resume produces an identical message history
+
+End-to-end smoke test before opening the PR (against the live model via ANTHROPIC_AUTH_TOKEN in .env):
+1. Run `bun run run:hello`, send: "remember the magic word is `parsnip`", then exit (Ctrl-D).
+2. Confirm `.crewhaus/sessions/<id>.json` exists with the session metadata, and `.crewhaus/sessions/<id>.jsonl` contains user_message + assistant_message events.
+3. Capture the sessionId, then run: `bun apps/cli/src/index.ts run examples/hello-cli/crewhaus.yaml --resume <id>` and ask "what was the magic word?". Confirm the model recalls "parsnip" — proving event-log replay reconstructed the prior conversation.
+4. Trigger eviction: backdate one session file's mtime to 31 days ago (`touch -t YYYYMMDD0000 ...`) and run `crewhaus run` again — confirm the old session is purged from `list()`.
+5. Clean up `.crewhaus/sessions/` after the smoke run.
+
+Update docs/MODULE-CATALOG.md with everything that is complete and create a pull request with all updates.
+```
+
+---
+
+### Section 11 — Hooks, skills, slash commands
+
+```
+Read docs/build-roadmap.md Section 11. Also read:
+- packages/runtime-core/src/index.ts (where hooks fire)
+- packages/tool-catalog/src/index.ts (skills add a Skill tool)
+- apps/cli/src/index.ts (where slash commands intercept)
+- docs/MODULE-CATALOG.md Layer R9 entries for hooks-engine, skills-registry, slash-commands
+
+Build sequentially — skills-registry and slash-commands both depend on hooks-engine:
+
+1. packages/hooks-engine (build first)
+   - Lifecycle events: session-start | pre-tool | post-tool | pre-compact | post-compact | stop | pre-model | post-model
+   - Hook def: { event, matcher?: string (glob), command: string }
+   - Runtime: spawn the command via Bun.spawn, write event payload as JSON on stdin, parse JSON decision from stdout
+   - Decision shape: { decision: "allow" | "deny" | "block", reason?, mutate?: object }
+   - Load from .crewhaus/settings.json (project) and ~/.crewhaus/settings.json (user); user settings stack under project settings
+   - API: loadHooks() / runHooks(event, payload): Promise<HookResult[]>
+   - SECURITY: hook commands inherit a restricted env (drop PATH except known-safe entries; no AWS/GCP creds)
+
+2. packages/skills-registry (parallel with slash-commands after hooks-engine)
+   - A skill = directory with SKILL.md + frontmatter (name, description, triggers?, tools?)
+   - Discovery order: ~/.crewhaus/skills/, <project>/.crewhaus/skills/, plugin-bundled
+   - Lazy load: at boot, list skills (frontmatter only) and inject names + descriptions into the system prompt
+   - Adds a built-in Skill(name) tool to the default catalog when skills are present; full body loads only when this tool is invoked
+
+3. packages/slash-commands (parallel with skills-registry after hooks-engine)
+   - A slash command = .crewhaus/commands/<name>.md with optional frontmatter (description, argument-hint)
+   - When user input starts with /<name>, expand the markdown body (with $ARGUMENTS substitution) into the user message and submit
+   - API: loadCommands(): Map<string, SlashCommand> / expand(input, commands): { handled: boolean, expanded: string }
+   - Fires a pre-slash hook event before expansion
+
+After all three are built, integrate:
+- packages/runtime-core: fire hook events at the right moments; a "deny" decision short-circuits with the hook's reason as the result
+- apps/cli/src/index.ts run subcommand: check for slash commands on each user input before sending to the model
+- system-prompt construction in target-cli + target-workflow: add a section listing available skills
+
+Tests:
+- hooks-engine: T3 fixture hook returning "deny"; T8 verifying restricted env
+- skills-registry: T1 frontmatter parsing; T3 verifying full skill body loads only on Skill tool call
+- slash-commands: T9 property test over $ARGUMENTS substitution edge cases
+
+End-to-end smoke test before opening the PR (against the live model via ANTHROPIC_AUTH_TOKEN in .env):
+1. Hooks: in a temp project, write `.crewhaus/settings.json` with a pre-tool hook for Bash that returns `{"decision":"deny","reason":"smoke test deny"}`. Run the agent and prompt "run `whoami`". Confirm the assistant reply surfaces the deny reason and Bash never executed (no `whoami` output).
+2. Skills: place `.crewhaus/skills/say-pirate/SKILL.md` with frontmatter (name, description: "respond like a pirate") and a body of pirate-speak instructions. Run the agent; confirm the system prompt lists "say-pirate" as available. Prompt "use the say-pirate skill and greet me" — confirm the agent calls Skill("say-pirate") and the reply is in pirate voice.
+3. Slash commands: place `.crewhaus/commands/explain.md` with body "Explain $ARGUMENTS in two sentences." Run the agent; type `/explain quicksort`. Confirm the input was expanded before being sent (the model reply should be a quicksort explanation, not a meta-comment about a slash command).
+4. Clean up the temp project.
+
+Update docs/MODULE-CATALOG.md with everything that is complete and create a pull request with all updates.
+```
+
+---
+
+### Section 12 — Channel bot target shape (Slack)
+
+```
+Read docs/build-roadmap.md Section 12. Also read:
+- packages/target-cli/src/index.ts and packages/target-workflow/src/index.ts (codegen patterns to follow)
+- packages/session-store/src/index.ts and packages/event-log/src/index.ts (Section 10 — required prereqs)
+- packages/hooks-engine/src/index.ts (Section 11 — required prereq)
+- packages/mcp-host/src/index.ts (Section 9 — used by generated daemon)
+- docs/MODULE-CATALOG.md Layer F2 entry for target-channel-bot, R4 entries for tool-message-channel
+
+Build the channel target as follows. The spec/IR additions are sequential prereqs; everything else is parallel.
+
+1. packages/spec — add channel target to the discriminated union:
+   target: "channel" with:
+   - agent: { model, instructions, tools? }
+   - channels: { slack?: { botToken, signingSecret, appToken? } }
+   - routing: { sessionKey: "thread" | "user" | "channel" }
+
+2. packages/ir — add IrChannelV0 mirroring the spec; export IrNode = IrV0 | IrWorkflowV0 | IrChannelV0
+
+3. packages/compiler — detect target: "channel" in lower(); dispatch to target-channel-bot in emit()
+
+4. packages/target-channel-bot (parallel with adapter)
+   - First codegen target that emits multiple files: gateway.ts, daemon.ts, session-router.ts, agent.ts
+   - daemon.ts boots Bun.serve(), wires gateway routes per channel, instantiates McpHost
+   - gateway.ts dispatches inbound webhooks to session-router via the appropriate channel adapter
+   - session-router.ts maps inbound message → sessionId (per routing.sessionKey), resumes via session-store + event-log, runs one runChatLoop turn per inbound message
+   - agent.ts wraps runChatLoop config (similar to target-cli)
+
+5. packages/channel-adapter-slack (parallel with target-channel-bot)
+   - createSlackAdapter(config): ChannelAdapter
+   - ChannelAdapter shape: { verify(req): boolean, parseInbound(req): InboundEvent, sendReply(threadKey, text), setTyping(threadKey) }
+   - HMAC verification of X-Slack-Signature using signingSecret with timestamp tolerance ±5min
+   - Event handling: message, app_mention; ignore bot_id matching self
+
+6. packages/tool-message-channel (parallel with adapter)
+   - Tool: SendMessage(channel, text)
+   - Permission-gated by default — requires explicit allow rule via permission-engine
+   - Delegates to the appropriate channel adapter
+
+7. examples/hello-channel/crewhaus.yaml + scripts
+   - Slack bot: app_mention triggers an agent reply in-thread, with tool-fs and tool-bash available via permission rules
+   - Add compile:hello-channel and run:hello-channel scripts to the root package.json
+
+Tests:
+- target-channel-bot: T1 generated bundle structure; T3 compile hello-channel, start daemon, post a fake Slack webhook, assert reply
+- channel-adapter-slack: T2 contract test against a recorded Slack event corpus; T8 signature verification with tampered payloads
+- tool-message-channel: T8 verifying fail-closed without explicit allow
+
+End-to-end smoke test before opening the PR (against the live model via ANTHROPIC_AUTH_TOKEN in .env):
+- The model side runs against the live Anthropic API. The Slack side is exercised with a synthetic webhook (no real Slack workspace required). Note in .env.example that real-Slack smoke needs SLACK_BOT_TOKEN + SLACK_SIGNING_SECRET, but they are NOT required for this smoke.
+1. Compile hello-channel with placeholder Slack creds and start the daemon: `bun run run:hello-channel &` — capture the PID.
+2. Compute a valid X-Slack-Signature for a fixture app_mention payload using the placeholder signing secret and POST it to the daemon's /slack/events endpoint. Confirm the daemon: parses the event, resolves a session via session-store keyed on thread_ts, runs one turn against the live model, and emits a sendReply call (mock the Slack outbound HTTP with a local listener and assert the body).
+3. POST the SAME signed payload twice and confirm the daemon does not double-process (idempotency on Slack event_id).
+4. POST a payload with a tampered signature and confirm the daemon rejects it with 401 — no model call made.
+5. Kill the daemon (clean shutdown; no orphan processes).
 
 Update docs/MODULE-CATALOG.md with everything that is complete and create a pull request with all updates.
 ```
