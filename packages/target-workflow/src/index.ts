@@ -91,8 +91,11 @@ function renderStep(step: IrWorkflowStep, idx: number, total: number): string {
   const stepNum = idx + 1;
   const toolsField = renderToolsField(step.tools);
 
+  // Anthropic rejects empty user content with a 400, so fall back to a
+  // non-empty placeholder when stdin is empty (autonomous-style agent —
+  // the step's instructions ARE the prompt).
   const userContent = isFirst
-    ? "stdinInput"
+    ? 'stdinInput || "begin"'
     : "`## Output of previous step:\\n${priorOutput}\\n\\n## Your task:\\n(continue based on the previous step's output)`";
 
   const stdinReadLine = isFirst ? "  const stdinInput = await readStdinToEnd();\n" : "";

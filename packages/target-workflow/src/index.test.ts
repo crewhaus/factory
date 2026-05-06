@@ -49,6 +49,13 @@ describe("emitWorkflow", () => {
     expect(c).toContain("Output of previous step");
   });
 
+  test("step 1 falls back to a non-empty placeholder when stdin is empty", () => {
+    // Anthropic rejects empty user content with a 400; the generated code
+    // must fall back to something non-empty.
+    const c = emitWorkflow(TWO_STEP_IR).files[0]?.content ?? "";
+    expect(c).toContain('stdinInput || "begin"');
+  });
+
   test("tools imports are deduped and grouped by package", () => {
     const ir: IrWorkflowV0 = {
       ...TWO_STEP_IR,
