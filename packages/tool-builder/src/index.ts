@@ -15,5 +15,6 @@ export function buildTool<TInput>(def: ToolDefinition<TInput>): RegisteredTool {
     concurrencySafe: def.concurrencySafe ?? false,
     readOnly: def.readOnly ?? false,
     destructive: def.destructive ?? false,
+    ...(def.jsonSchema !== undefined ? { jsonSchema: def.jsonSchema } : {}),
   };
 }

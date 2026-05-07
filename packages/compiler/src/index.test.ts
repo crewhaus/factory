@@ -122,6 +122,71 @@ steps:
     instructions: summarize what you found
 `;
 
+describe("compile with mcp_servers (Section 9)", () => {
+  test("threads a stdio MCP server into the emitted bundle", () => {
+    const content =
+      compile(`
+name: hello
+target: cli
+agent:
+  model: claude-sonnet-4-6
+  instructions: be helpful
+mcp_servers:
+  fs:
+    transport: stdio
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+`).files[0]?.content ?? "";
+
+    expect(content).toContain('import { McpHost } from "@crewhaus/mcp-host";');
+    expect(content).toContain('import { registerMcpServer } from "@crewhaus/tool-mcp";');
+    expect(content).toContain('import { defaultCatalog } from "@crewhaus/tool-catalog";');
+    expect(content).toContain("new McpHost();");
+    expect(content).toContain('mcpHost.addServer("fs",');
+    expect(content).toContain('"transport":"stdio"');
+    expect(content).toContain('"command":"npx"');
+    expect(content).toContain("await Promise.all([");
+    expect(content).toContain('registerMcpServer(mcpHost, "fs", defaultCatalog,');
+    expect(content).toContain("tools: defaultCatalog.list(),");
+    expect(content).toContain("try {");
+    expect(content).toContain("await mcpHost.disconnectAll();");
+  });
+
+  test("threads SSE MCP servers and works alongside built-in tools", () => {
+    const content =
+      compile(`
+name: dual
+target: cli
+agent:
+  model: m
+  instructions: i
+tools:
+  - bash
+mcp_servers:
+  remote:
+    transport: sse
+    url: https://example.com/sse
+`).files[0]?.content ?? "";
+
+    // Single defaultCatalog import even though both built-ins and MCP use it.
+    const matches = content.match(/from "@crewhaus\/tool-catalog"/g) ?? [];
+    expect(matches.length).toBe(1);
+    expect(content).toContain('import { bash } from "@crewhaus/tool-bash";');
+    expect(content).toContain('mcpHost.addServer("remote",');
+    expect(content).toContain('"transport":"sse"');
+    expect(content).toContain('"url":"https://example.com/sse"');
+  });
+
+  test("emits no MCP plumbing when mcp_servers is omitted", () => {
+    const content = compile(MINIMAL_SPEC).files[0]?.content ?? "";
+    expect(content).not.toContain("@crewhaus/mcp-host");
+    expect(content).not.toContain("@crewhaus/tool-mcp");
+    expect(content).not.toContain("McpHost");
+    expect(content).not.toContain("disconnectAll");
+    expect(content).not.toContain("try {");
+  });
+});
+
 describe("compile workflow target", () => {
   test("emits a single-file bundle for a workflow spec", () => {
     const bundle = compile(MINIMAL_WORKFLOW_SPEC);

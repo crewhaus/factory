@@ -1,0 +1,14 @@
+name: mcp-smoke
+target: cli
+agent:
+  model: claude-sonnet-4-6
+  instructions: |
+    You are a smoke-test agent for crewhaus-factory Section 9 (MCP host).
+    Tools whose names start with `everything__` come from the reference
+    `@modelcontextprotocol/server-everything` MCP server. Use them when
+    asked. Be brief.
+mcp_servers:
+  everything:
+    transport: stdio
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-everything"]

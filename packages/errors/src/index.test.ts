@@ -1,5 +1,14 @@
 import { describe, expect, test } from "bun:test";
-import { CompilerError, ConfigError, CrewhausError, RuntimeError, SpecParseError } from "./index";
+import {
+  CompilerError,
+  ConfigError,
+  CrewhausError,
+  McpConnectionError,
+  McpError,
+  McpProtocolError,
+  RuntimeError,
+  SpecParseError,
+} from "./index";
 
 describe("CrewhausError", () => {
   test("extends Error and exposes a code", () => {
@@ -56,6 +65,9 @@ describe("subclasses", () => {
     expect(new CompilerError("x").code).toBe("compiler");
     expect(new RuntimeError("x").code).toBe("runtime");
     expect(new ConfigError("x").code).toBe("config");
+    expect(new McpError("x").code).toBe("mcp");
+    expect(new McpConnectionError("x").code).toBe("mcp");
+    expect(new McpProtocolError("x").code).toBe("mcp");
   });
 
   test("each subclass has a stable name (for instanceof / log filtering)", () => {
@@ -63,6 +75,9 @@ describe("subclasses", () => {
     expect(new CompilerError("x").name).toBe("CompilerError");
     expect(new RuntimeError("x").name).toBe("RuntimeError");
     expect(new ConfigError("x").name).toBe("ConfigError");
+    expect(new McpError("x").name).toBe("McpError");
+    expect(new McpConnectionError("x").name).toBe("McpConnectionError");
+    expect(new McpProtocolError("x").name).toBe("McpProtocolError");
   });
 
   test("subclasses are instanceof their parent", () => {
@@ -70,5 +85,18 @@ describe("subclasses", () => {
     expect(new CompilerError("x")).toBeInstanceOf(CrewhausError);
     expect(new RuntimeError("x")).toBeInstanceOf(CrewhausError);
     expect(new ConfigError("x")).toBeInstanceOf(CrewhausError);
+    expect(new McpError("x")).toBeInstanceOf(CrewhausError);
+    expect(new McpConnectionError("x")).toBeInstanceOf(McpError);
+    expect(new McpProtocolError("x")).toBeInstanceOf(McpError);
+  });
+
+  test("McpConnectionError serializes via toJSON", () => {
+    const err = new McpConnectionError("connection lost", new Error("ECONNREFUSED"));
+    expect(err.toJSON()).toEqual({
+      name: "McpConnectionError",
+      code: "mcp",
+      message: "connection lost",
+      cause: { name: "Error", message: "ECONNREFUSED" },
+    });
   });
 });

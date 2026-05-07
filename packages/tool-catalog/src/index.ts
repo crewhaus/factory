@@ -18,6 +18,15 @@ export interface ToolDefinition<TInput = unknown> {
   concurrencySafe?: boolean;
   readOnly?: boolean;
   destructive?: boolean;
+  /**
+   * Authoritative JSON Schema for the tool's input. When set, runtime-core
+   * forwards this verbatim to the model instead of running
+   * `zodToJsonSchema(inputSchema)`. Used by tools whose canonical schema is
+   * already JSON Schema (e.g. MCP tools), where the Zod round-trip would be
+   * lossy. The `inputSchema` slot is still required for the validator path
+   * (typically `z.unknown()` for MCP).
+   */
+  jsonSchema?: unknown;
 }
 
 /** Normalized form stored in the catalog. All flags are required booleans and
@@ -30,6 +39,9 @@ export interface RegisteredTool {
   concurrencySafe: boolean;
   readOnly: boolean;
   destructive: boolean;
+  /** See ToolDefinition.jsonSchema. Optional; runtime-core falls back to
+   *  zodToJsonSchema(inputSchema) when absent. */
+  jsonSchema?: unknown;
 }
 
 export class ToolCatalogError extends CrewhausError {

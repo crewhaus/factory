@@ -67,6 +67,24 @@ describe("buildTool — identity fields", () => {
   });
 });
 
+describe("buildTool — jsonSchema passthrough", () => {
+  test("jsonSchema is omitted when not set on the definition", () => {
+    const tool = buildTool(echoDef);
+    expect(tool.jsonSchema).toBeUndefined();
+    expect("jsonSchema" in tool).toBe(false);
+  });
+
+  test("jsonSchema is preserved verbatim when present", () => {
+    const raw = {
+      type: "object" as const,
+      properties: { message: { type: "string" as const } },
+      required: ["message"],
+    };
+    const tool = buildTool({ ...echoDef, jsonSchema: raw });
+    expect(tool.jsonSchema).toBe(raw);
+  });
+});
+
 describe("buildTool — execute delegation", () => {
   test("registered execute calls original def.execute", async () => {
     const tool = buildTool(echoDef);

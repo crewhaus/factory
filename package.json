@@ -15,7 +15,9 @@
     "compile:hello": "bun apps/cli/src/index.ts compile examples/hello-cli/crewhaus.yaml -o examples/hello-cli/dist",
     "run:hello": "bun examples/hello-cli/dist/agent.ts",
     "compile:hello-workflow": "bun apps/cli/src/index.ts compile examples/hello-workflow/crewhaus.yaml -o examples/hello-workflow/dist",
-    "run:hello-workflow": "bun examples/hello-workflow/dist/agent.ts"
+    "run:hello-workflow": "bun examples/hello-workflow/dist/agent.ts",
+    "compile:mcp-smoke": "bun apps/cli/src/index.ts compile examples/mcp-smoke/crewhaus.yaml -o examples/mcp-smoke/dist",
+    "run:mcp-smoke": "bun examples/mcp-smoke/dist/agent.ts"
   },
   "devDependencies": {
     "@biomejs/biome": "1.9.4",

@@ -17,6 +17,27 @@ export type IrPermissions = {
   readonly rules: readonly IrPermissionRule[];
 };
 
+/**
+ * MCP server configs carried through to codegen (Section 9). Lower-time
+ * normalisation: optional spec fields become required IR fields with
+ * empty defaults, so target codegen doesn't need `?? []` guards.
+ */
+export type IrMcpStdioConfig = {
+  readonly transport: "stdio";
+  readonly command: string;
+  readonly args: readonly string[];
+  readonly env?: Readonly<Record<string, string>>;
+};
+
+export type IrMcpSseConfig = {
+  readonly transport: "sse";
+  readonly url: string;
+  readonly headers?: Readonly<Record<string, string>>;
+};
+
+export type IrMcpServerConfig = IrMcpStdioConfig | IrMcpSseConfig;
+export type IrMcpServers = Readonly<Record<string, IrMcpServerConfig>>;
+
 export type IrV0 = {
   readonly version: 0;
   readonly name: string;
@@ -26,6 +47,7 @@ export type IrV0 = {
     readonly instructions: string;
   };
   readonly tools: readonly string[];
+  readonly mcp_servers: IrMcpServers;
   readonly permissions: IrPermissions;
 };
 
@@ -50,6 +72,7 @@ export type IrWorkflowV0 = {
   readonly name: string;
   readonly target: "workflow";
   readonly steps: readonly IrWorkflowStep[];
+  readonly mcp_servers: IrMcpServers;
   readonly permissions: IrPermissions;
 };
 

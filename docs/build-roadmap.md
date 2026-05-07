@@ -1,20 +1,19 @@
 # CrewHaus Factory — Build Roadmap
 
-> Status as of 2026-05-06. 30 of ~190 catalog modules implemented; Sections 1–7 complete, Sections 8–12 next.
+> Status as of 2026-05-06. 36 of ~190 catalog modules implemented; Sections 1–9 complete, Sections 10–12 next.
 > See `docs/MODULE-CATALOG.md` for full per-module specs and test layer references.
 
 ---
 
 ## Current baseline
 
-The compiler pipeline (spec → IR → codegen) ships two target shapes (`cli`, `workflow`) and the runtime carries tools end-to-end with state-machine-driven turns and pre-turn compaction (snip → autocompact). The CLI exposes `compile`, `run`, `init`, and `doctor` subcommands; three built-in tool packages (`tool-fs`, `tool-bash`, `tool-todo`) are registered. Section 7 added recovery (Anthropic taxonomy with budgets), a layered permission engine (modes + 5 rule sources, with `bypass` locked to the CLI flag), and a parent/child abort tree with SIGINT integration. Section 8 added the partitioned tool layer: concurrent-safe read-only calls run via `Promise.all` while destructive calls run serially, repeated `(toolName, input)` pairs trigger a sliding-window loop warning, large outputs (>10 KB) are persisted to `.crewhaus/tool-results/<runId>/<toolUseId>.txt` with a preview marker the model can re-read, and `streaming: true` dispatches tools mid-stream via the SDK's `contentBlock` event.
+The compiler pipeline (spec → IR → codegen) ships two target shapes (`cli`, `workflow`) and the runtime carries tools end-to-end with state-machine-driven turns and pre-turn compaction (snip → autocompact). The CLI exposes `compile`, `run`, `init`, and `doctor` subcommands; three built-in tool packages (`tool-fs`, `tool-bash`, `tool-todo`) are registered. Section 7 added recovery (Anthropic taxonomy with budgets), a layered permission engine (modes + 5 rule sources, with `bypass` locked to the CLI flag), and a parent/child abort tree with SIGINT integration. Section 8 added the partitioned tool layer: concurrent-safe read-only calls run via `Promise.all` while destructive calls run serially, repeated `(toolName, input)` pairs trigger a sliding-window loop warning, large outputs (>10 KB) are persisted to `.crewhaus/tool-results/<runId>/<toolUseId>.txt` with a preview marker the model can re-read, and `streaming: true` dispatches tools mid-stream via the SDK's `contentBlock` event. Section 9 added MCP host + tool-mcp + a `mcp_servers` block in the spec, so external MCP servers (filesystem, github, the everything-server reference, …) auto-spawn at boot and their remote tools register on the catalog under `<server>__<tool>`.
 
-What the current stack still cannot do — and Sections 9–12 unlock, in order:
+What the current stack still cannot do — and Sections 10–12 unlock, in order:
 
-1. **Speak MCP** — no way to use the ecosystem of external MCP servers (filesystem, github, sentry, etc.) without writing native tool wrappers. *(Section 9)*
-2. **Remember anything** — no session store, no transcript log, no in-process state container; every `crewhaus run` starts from zero. *(Section 10)*
-3. **Be customized** — no hooks, no skills, no slash commands. The harness has no extension surface for users. *(Section 11)*
-4. **Live in chat** — only CLI and workflow targets exist; no channel/messenger shape. *(Section 12)*
+1. **Remember anything** — no session store, no transcript log, no in-process state container; every `crewhaus run` starts from zero. *(Section 10)*
+2. **Be customized** — no hooks, no skills, no slash commands. The harness has no extension surface for users. *(Section 11)*
+3. **Live in chat** — only CLI and workflow targets exist; no channel/messenger shape. *(Section 12)*
 
 ---
 
@@ -351,44 +350,38 @@ End-to-end smoke against the live model (OAuth via `ANTHROPIC_AUTH_TOKEN`): conc
 
 ## Section 9 — MCP host
 
-> Status: not started.
+> Status: ✅ complete (PR pending).
 
 **Catalog modules:** `mcp-host` (R5), `tool-mcp` (R4)
 
-MCP is the lingua franca for agent tooling — once the harness can speak it, every external MCP server (filesystem, github, sentry, slack, …) becomes available without bespoke wrappers. This section is sequential: the protocol client first, then the wrapper that adapts MCP tools into the existing `tool-catalog`.
+Two new packages plus a `mcp_servers` block threaded through `spec → ir → compiler → target-cli`, so any YAML spec can declare external MCP servers and have them spawned + registered automatically at boot. The entire MCP ecosystem (filesystem, github, sentry, the official `@modelcontextprotocol/server-everything` reference) is now available without per-server code.
 
-### Build order within this section
+### Sequential build order
 
 ```
-mcp-host  ──►  tool-mcp  ──►  (spec schema: mcp_servers[], runtime-core init wires it up)
+errors (mcp code) → tool-catalog/tool-builder (jsonSchema field) → runtime-core (honor jsonSchema)
+                                ↓
+mcp-host (uses errors) → tool-mcp (uses mcp-host + tool-builder + tool-catalog)
+                                ↓
+spec → ir → compiler → target-cli, target-workflow (warning), apps/cli (mirror), examples/mcp-smoke
 ```
 
-### What to build
+### What was built
 
-**`packages/mcp-host`**
-- Manages MCP server connections: stdio (child process) and SSE (HTTP) transports
-- Connection lifecycle: spawn / handshake (`initialize` request) / poll capabilities / disconnect / reconnect with backoff
-- `McpClient` class: `connect()`, `listTools()`, `callTool(name, args)`, `disconnect()`
-- `McpHost` registry: keyed by server name; `addServer(name, config)`, `getClient(name)`
-- Server config schema: `{ command: string, args?: string[], env?: Record<string,string> }` for stdio; `{ url: string, headers?: Record<string,string> }` for SSE
-- References: `claude-code/services/mcp/`, `agent-framework/_mcp.py`, `openai-agents/mcp/`
+- **`mcp-host`** — `McpClient` / `McpHost` shell over `@modelcontextprotocol/sdk` (`Client` + `StdioClientTransport` + `SSEClientTransport`). Hand-rolling the wire format (NDJSON over stdin/stdout) was rejected: the SDK already implements the JSON-RPC 2.0 framing, versioned `initialize` handshake, capability negotiation, and notification semantics. State machine: `idle → connecting → connected → disconnected → connecting → connected` with `closed` as the terminal sink. Reconnect uses exp backoff (1 s → 30 s cap, ±10% jitter, no max attempts). New `callTool` calls during disconnect await a `connectedDeferred` (queue cap 16); in-flight calls reject with `McpConnectionError`. `addServer()` is synchronous (config + uniqueness check); `connect()` runs explicitly inside `registerMcpServer()` so all I/O concentrates in one boot-time `Promise.all`. Both transports are implemented; SSE gets unit-test coverage and stdio gets the smoke runbook + a gated T2 contract test against the everything-server.
+- **`tool-mcp`** — `registerMcpServer(host, serverName, catalog, opts?)` calls `listTools()` and builds one `RegisteredTool` per remote tool via `@crewhaus/tool-builder`, namespaced as `<serverName>__<toolName>`. Per-tool flag overrides (`concurrencySafe`/`readOnly`/`destructive`) win over `defaults`; final fallback is `(false, false, false)`. Remote tool names are validated against `[a-zA-Z0-9_-]+`; descriptions are stripped of C0 control chars.
+- **Schema passthrough** — extends `RegisteredTool` (and `ToolDefinition`) with an optional `jsonSchema?: unknown` field. `runtime-core.runChatLoop` prefers `t.jsonSchema` over `zodToJsonSchema(t.inputSchema)` when present, so MCP tools can carry their server-authoritative JSON Schema verbatim instead of going through a lossy Zod round-trip. MCP tools use `z.unknown()` as the local validator; the MCP server itself validates arguments on the wire, and any `isError: true` result becomes a thrown `McpError` that flows through the existing `executeOneToolUse` error path.
+- **Pipeline threading** — spec adds `mcp_servers?: Record<string, McpServerConfig>` (discriminated on `transport: "stdio" | "sse"`, strict-mode rejection of stray fields). IR mirrors with `IrMcpServers` types on both `IrV0` and `IrWorkflowV0`. `compiler.lower()` normalises `args ?? []` so target-cli emits without `?? []` guards. `target-cli` emits an `McpHost` boot block before `runChatLoop` and wraps the call in `try/finally` with `disconnectAll()` cleanup; `apps/cli` mirrors the same wiring in `runRun` so `crewhaus run` stays parity-equivalent with `compile && bun agent.ts`. `target-workflow` is unchanged in behaviour but emits a one-line warning comment when `mcp_servers` is non-empty so the silent ignore is visible to the user.
+- **Errors** — new `ErrorCode = "mcp"` plus `McpError` / `McpConnectionError` / `McpProtocolError` for clean log filtering and recovery dispatch.
 
-**`packages/tool-mcp`**
-- Wraps a remote MCP tool as a local `RegisteredTool`
-- `registerMcpServer(host: McpHost, serverName: string, catalog: ToolCatalog): Promise<void>`
-  - Calls `listTools()` on the server, builds a `RegisteredTool` per remote tool, registers each in the catalog with name `<serverName>__<toolName>`
-  - Tool invocation delegates to `host.getClient(serverName).callTool(...)`
-  - All MCP tools default to `concurrencySafe: false, readOnly: false, destructive: false` (caller can override per-server in spec)
-- References: `claude-code/services/mcp/`, `crewAI/tools/mcp_native_tool.py`
+### Limitations (v0)
 
-### Spec schema + runtime wiring
-- Extend `packages/spec` with optional `mcp_servers?: Record<string, McpServerConfig>` block
-- `compiler-core` passes it through to `IrV0.mcp_servers`
-- `target-cli` emits boot code that, before `runChatLoop()`, instantiates `McpHost`, calls `addServer()` per entry, then `registerMcpServer(host, name, catalog)` per entry — `await Promise.all`
-- Document an example spec: `mcp_servers: { fs: { command: "npx", args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"] } }`
+- `notifications/tools/list_changed` is ignored — the catalog is built once at boot. A future section can add a `RuntimeCatalog` + watcher.
+- Non-text content blocks (image, audio, resource) reduce to `[image: <mime>]` / `[audio: <mime>]` / `[resource: <uri>]` placeholders for the model.
+- `target-workflow` ignores `mcp_servers` (warning comment in the emitted bundle); follow-up will wire it up the same way as `target-cli`.
 
 ### Tests
-`mcp-host`: contract test (`T2`) against the official MCP everything-server reference; integration test (`T3`) for stdio reconnect after kill; security test (`T8`) verifying tool schemas from a malicious server cannot escape the schema validator. `tool-mcp`: integration test (`T3`) wiring a mock McpHost + catalog and confirming a remote tool call round-trips.
+`mcp-host`: 19 unit + integration + security tests (T1, T3, T8) plus a gated T2 contract test (`CREWHAUS_RUN_MCP_CONTRACT=1`) against `npx @modelcontextprotocol/server-everything` covering connect → listTools → callTool → disconnect on a real subprocess. `tool-mcp`: 9 integration tests (T3) over a mock McpHost confirming namespaced registration, schema-bytes round-trip, default + per-tool flag override semantics, and `isError` → `McpError` conversion. End-to-end smoke against the live model (OAuth via `ANTHROPIC_AUTH_TOKEN`): boot logs registered 13 namespaced tools (`everything__echo`, `everything__add`, etc.); model called `everything__echo` with `{ message: "hello mcp" }` and got `Echo: hello mcp` back; `kill -9` on the npx child triggered `mcp.transport_closed` → `mcp.reconnect_scheduled` (delayMs ≈ 1078) → `mcp.connected`; hello-cli + hello-workflow regressions clean (no MCP plumbing emitted when `mcp_servers` is omitted).
 
 ---
 

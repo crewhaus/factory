@@ -1,0 +1,21 @@
+{
+  "name": "@crewhaus/mcp-host",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "MCP client manager: stdio + SSE transports, exp-backoff reconnect, server registry, built on @modelcontextprotocol/sdk",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@crewhaus/errors": "workspace:*",
+    "@crewhaus/logging": "workspace:*",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^3.23.8"
+  }
+}

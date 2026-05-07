@@ -7,7 +7,7 @@
  * its full cause chain via `toJSON()` for the logging layer.
  */
 
-export type ErrorCode = "spec_parse" | "compiler" | "runtime" | "config" | "tool";
+export type ErrorCode = "spec_parse" | "compiler" | "runtime" | "config" | "tool" | "mcp";
 
 export type SerializedError = {
   name: string;
@@ -68,4 +68,19 @@ export class ConfigError extends CrewhausError {
   constructor(message: string, cause?: unknown) {
     super("config", message, cause);
   }
+}
+
+export class McpError extends CrewhausError {
+  override readonly name: string = "McpError";
+  constructor(message: string, cause?: unknown) {
+    super("mcp", message, cause);
+  }
+}
+
+export class McpConnectionError extends McpError {
+  override readonly name = "McpConnectionError";
+}
+
+export class McpProtocolError extends McpError {
+  override readonly name = "McpProtocolError";
 }
