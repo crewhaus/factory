@@ -92,6 +92,13 @@
       "name": "@crewhaus/errors",
       "version": "0.0.0",
     },
+    "packages/event-log": {
+      "name": "@crewhaus/event-log",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+      },
+    },
     "packages/infra-utils": {
       "name": "@crewhaus/infra-utils",
       "version": "0.0.0",
@@ -146,9 +153,12 @@
         "@crewhaus/compaction-autocompact": "workspace:*",
         "@crewhaus/compaction-snip": "workspace:*",
         "@crewhaus/errors": "workspace:*",
+        "@crewhaus/event-log": "workspace:*",
         "@crewhaus/permission-engine": "workspace:*",
         "@crewhaus/recovery-engine": "workspace:*",
         "@crewhaus/run-context": "workspace:*",
+        "@crewhaus/session-store": "workspace:*",
+        "@crewhaus/state-store": "workspace:*",
         "@crewhaus/streaming-tool-executor": "workspace:*",
         "@crewhaus/token-budget": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
@@ -165,6 +175,13 @@
         "zod": "^3.23.8",
       },
     },
+    "packages/session-store": {
+      "name": "@crewhaus/session-store",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+      },
+    },
     "packages/spec": {
       "name": "@crewhaus/spec",
       "version": "0.0.0",
@@ -173,6 +190,10 @@
         "yaml": "^2.6.0",
         "zod": "^3.23.8",
       },
+    },
+    "packages/state-store": {
+      "name": "@crewhaus/state-store",
+      "version": "0.0.0",
     },
     "packages/streaming-tool-executor": {
       "name": "@crewhaus/streaming-tool-executor",
@@ -382,6 +403,8 @@
 
     "@crewhaus/errors": ["@crewhaus/errors@workspace:packages/errors"],
 
+    "@crewhaus/event-log": ["@crewhaus/event-log@workspace:packages/event-log"],
+
     "@crewhaus/infra-utils": ["@crewhaus/infra-utils@workspace:packages/infra-utils"],
 
     "@crewhaus/ir": ["@crewhaus/ir@workspace:packages/ir"],
@@ -398,7 +421,11 @@
 
     "@crewhaus/runtime-core": ["@crewhaus/runtime-core@workspace:packages/runtime-core"],
 
+    "@crewhaus/session-store": ["@crewhaus/session-store@workspace:packages/session-store"],
+
     "@crewhaus/spec": ["@crewhaus/spec@workspace:packages/spec"],
+
+    "@crewhaus/state-store": ["@crewhaus/state-store@workspace:packages/state-store"],
 
     "@crewhaus/streaming-tool-executor": ["@crewhaus/streaming-tool-executor@workspace:packages/streaming-tool-executor"],
 

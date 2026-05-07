@@ -1,19 +1,18 @@
 # CrewHaus Factory — Build Roadmap
 
-> Status as of 2026-05-06. 36 of ~190 catalog modules implemented; Sections 1–9 complete, Sections 10–12 next.
+> Status as of 2026-05-07. 39 of ~190 catalog modules implemented; Sections 1–10 complete, Sections 11–12 next.
 > See `docs/MODULE-CATALOG.md` for full per-module specs and test layer references.
 
 ---
 
 ## Current baseline
 
-The compiler pipeline (spec → IR → codegen) ships two target shapes (`cli`, `workflow`) and the runtime carries tools end-to-end with state-machine-driven turns and pre-turn compaction (snip → autocompact). The CLI exposes `compile`, `run`, `init`, and `doctor` subcommands; three built-in tool packages (`tool-fs`, `tool-bash`, `tool-todo`) are registered. Section 7 added recovery (Anthropic taxonomy with budgets), a layered permission engine (modes + 5 rule sources, with `bypass` locked to the CLI flag), and a parent/child abort tree with SIGINT integration. Section 8 added the partitioned tool layer: concurrent-safe read-only calls run via `Promise.all` while destructive calls run serially, repeated `(toolName, input)` pairs trigger a sliding-window loop warning, large outputs (>10 KB) are persisted to `.crewhaus/tool-results/<runId>/<toolUseId>.txt` with a preview marker the model can re-read, and `streaming: true` dispatches tools mid-stream via the SDK's `contentBlock` event. Section 9 added MCP host + tool-mcp + a `mcp_servers` block in the spec, so external MCP servers (filesystem, github, the everything-server reference, …) auto-spawn at boot and their remote tools register on the catalog under `<server>__<tool>`.
+The compiler pipeline (spec → IR → codegen) ships two target shapes (`cli`, `workflow`) and the runtime carries tools end-to-end with state-machine-driven turns and pre-turn compaction (snip → autocompact). The CLI exposes `compile`, `run`, `init`, and `doctor` subcommands; three built-in tool packages (`tool-fs`, `tool-bash`, `tool-todo`) are registered. Section 7 added recovery (Anthropic taxonomy with budgets), a layered permission engine (modes + 5 rule sources, with `bypass` locked to the CLI flag), and a parent/child abort tree with SIGINT integration. Section 8 added the partitioned tool layer: concurrent-safe read-only calls run via `Promise.all` while destructive calls run serially, repeated `(toolName, input)` pairs trigger a sliding-window loop warning, large outputs (>10 KB) are persisted to `.crewhaus/tool-results/<runId>/<toolUseId>.txt` with a preview marker the model can re-read, and `streaming: true` dispatches tools mid-stream via the SDK's `contentBlock` event. Section 9 added MCP host + tool-mcp + a `mcp_servers` block in the spec, so external MCP servers (filesystem, github, the everything-server reference, …) auto-spawn at boot and their remote tools register on the catalog under `<server>__<tool>`. Section 10 added persistence: every `crewhaus run` now creates (or `--resume`s) a session under `.crewhaus/sessions/`, transcripts append to a versioned JSONL event log, sessions older than 30 days evict on the next run, and a per-run `state-store` ships as the coordination surface for the hooks/skills work landing in Section 11.
 
-What the current stack still cannot do — and Sections 10–12 unlock, in order:
+What the current stack still cannot do — and Sections 11–12 unlock, in order:
 
-1. **Remember anything** — no session store, no transcript log, no in-process state container; every `crewhaus run` starts from zero. *(Section 10)*
-2. **Be customized** — no hooks, no skills, no slash commands. The harness has no extension surface for users. *(Section 11)*
-3. **Live in chat** — only CLI and workflow targets exist; no channel/messenger shape. *(Section 12)*
+1. **Be customized** — no hooks, no skills, no slash commands. The harness has no extension surface for users. *(Section 11)*
+2. **Live in chat** — only CLI and workflow targets exist; no channel/messenger shape. *(Section 12)*
 
 ---
 
@@ -387,51 +386,41 @@ spec → ir → compiler → target-cli, target-workflow (warning), apps/cli (mi
 
 ## Section 10 — Persistence: state, sessions, event log
 
-> Status: not started.
+> Status: ✅ complete (PR pending).
 
 **Catalog modules:** `state-store` (R7), `session-store` (R7), `event-log` (R7)
 
-The runtime is amnesiac — every `crewhaus run` starts blank, no transcripts are written, and there's no in-process state container for tools/hooks to coordinate through. These three primitives are independent and parallel-safe.
+Three independent R7 packages plus a runtime-core integration that creates (or `--resume`s) a session at the start of every `runChatLoop`, appends every meaningful event to a versioned JSONL transcript, and evicts sessions older than 30 days as a side-effect of the next start. The user-facing payoff is the `--resume <sessionId>` flag on `crewhaus run`: a session that learned `parsnip` in one process can recall it in the next, proving the event-log replay reconstructs the message history exactly.
 
-### Build order within this section
+### What was built
 
-```
-state-store    ──►  (each plugs into runtime-core independently)
-session-store        (all three parallel)
-event-log
-```
+- **`state-store`** — tiny zustand-style container: `createStore<T>(initial)` returns `{ get, set, subscribe, select }`. `set(partial | (s) => partial)` shallow-merges; root listeners fire on every actual change, and `select(selector)` returns a derived view whose listeners fire only when `Object.is(selector(next), selector(prev)) === false` (referential equality on the projected output, like zustand's `subscribeWithSelector`). Listener exceptions are isolated via `console.error` so a misbehaving subscriber can't poison its siblings. The runtime instantiates one `Store<Record<string, unknown>>({})` per `runChatLoop` invocation as the coordination surface for the hooks/skills/tools landing in Section 11; Section 10 ships the plumbing only. Tests: T1 unit + T9 property over 100 random `set` sequences (model state matches store state; selector fires == count of distinct projections).
+- **`session-store`** — file-backed JSON metadata at `.crewhaus/sessions/<id>.json`. Session shape: `{ id, createdAt, updatedAt, name, target, model, lastTurnIndex }`. API is `createSessionStore({rootDir, ttlDays, now})` returning `{ create, get, list, update, delete }`. Ids are `sess_<16 hex>` (8 random bytes); `validateId` enforces the regex on every read path so `../escape`/`etc/passwd`/missing-prefix all throw `RuntimeError` before any filesystem access. Atomic writes go through `<id>.json.tmp` + `rename`. `list()` evicts (`unlink`s the `.json` AND the sibling `.jsonl`) any file whose **mtime** is older than `ttlDays * 86_400_000` ms — mtime, not the in-file `updatedAt`, so `touch -t YYYYMMDD0000 <id>.json` is a sufficient way to test or force expiry from the shell. Tests: T1 CRUD unit + T3 backdate-mtime-then-list-evicts integration over a `mkdtempSync` rootDir.
+- **`event-log`** — append-only JSONL transcript at `.crewhaus/sessions/<sessionId>.jsonl`. `openEventLog(sessionId, {rootDir, now})` returns `{ append, read, close }`. Each event lands as one line: `{ ts, version: 1, kind, payload }` where `kind` is one of `user_message | assistant_message | tool_use | tool_result | error | compaction`. Append uses `appendFileSync(...)` with mode `0o600` (owner-only, mirroring `claude-code/utils/sessionStorage.ts:2579`); synchronous append on POSIX is atomic per line so concurrent runs cannot interleave partial JSON. `read({since, until})` opens `fs.createReadStream` + `node:readline`, parses each line as JSON, and yields events in insertion order; missing files yield zero, malformed lines throw `RuntimeError` carrying the line number. Tests: T1 round-trip across all six kinds + filtering + the malformed-line guard, plus T7 load test that appends 10 000 events and reads them back in <5 s.
 
-### What to build
+### Runtime integration (`runtime-core`)
 
-**`packages/state-store`**
-- Tiny zustand-style store: `createStore<T>(initial: T): Store<T>`
-- API: `get()`, `set(partial)`, `subscribe(listener)`, `select(selector)`
-- Referential equality on selectors; listener fires only on actual change
-- ~40 lines of code; no dependencies
-- References: `claude-code/state/store.ts` (40 lines)
+`runChatLoop` now does the following at the top of every invocation:
 
-**`packages/session-store`** *(parallel)*
-- Persists session metadata to `.crewhaus/sessions/<sessionId>.json`
-- Session shape: `{ id, createdAt, updatedAt, name, target, model, lastTurnIndex }`
-- API: `create(opts)`, `get(id)`, `list()`, `update(id, patch)`, `delete(id)`
-- TTL-based eviction: anything older than 30 days is purged on `list()`
-- References: `claude-code/utils/sessionStorage.ts`, `agent-framework/_sessions.py`
+1. Construct a `SessionStore` rooted at `opts.sessionRootDir` (or `CREWHAUS_SESSION_DIR` env, useful for tests) and call `sessionStore.list()` once for housekeeping — old sessions evict here without any explicit user action.
+2. Resolve the `sessionId`: if `opts.resume` is set, load the existing session and replay its event log via the new exported `replayMessageHistory(eventLog)` helper, which walks the JSONL and pushes one `MessageParam` per `user_message`/`assistant_message` event (tool_use/tool_result/error/compaction events are audit-only). If `opts.resume` is unset, call `sessionStore.create({ id: opts.runContext?.sessionId, name, target, model })` so the run-context's id (already `sess_<16 hex>` by construction — `run-context` was updated to match) becomes the persisted file name.
+3. `openEventLog(sessionId)` for the rest of the run; `runChatLoop`'s `finally` block calls `sessionStore.update(sessionId, { lastTurnIndex: runContext.turnNumber })` and `eventLog.close()` for both the REPL and singleTurn paths.
+4. Instantiate a fresh `state-store` (consumed in Section 11+; held in scope today).
 
-**`packages/event-log`** *(parallel)*
-- Append-only JSONL transcript at `.crewhaus/sessions/<sessionId>.jsonl`
-- Event shape: `{ ts, kind: "user_message" | "assistant_message" | "tool_use" | "tool_result" | "error" | "compaction", payload }`
-- API: `open(sessionId): EventLog`, `append(event)`, `read({ since?, until? }): AsyncIterable<Event>`, `close()`
-- Schema-versioned with `version: 1` field on every line for future migration
-- References: `claude-code/utils/sessionStorage.ts`, `AI-Harness-Systems.md` §append-only event history
+Throughout the loop, every message-mutation site emits a corresponding event — the REPL prompt push, every assistant turn (streaming + non-streaming), every post-tool batch, every loop-warning user message, the recovery branch's compact/continue/tombstone paths, and `executeOneToolUse` (which now logs both `tool_use` at start and `tool_result` at end). `maybeCompact` and `forceCompact` accept an optional `onCompaction` callback so the audit `compaction` event captures the snip-vs-autocompact distinction without duplicating the cost-estimation logic.
 
-### Integration into `runtime-core`
-- On `runChatLoop` start: create or resume session via `session-store`; open `event-log` for append; create a `state-store` bound to this run
-- After every model response and tool result: append to event log
-- On `runChatLoop` exit: update session `lastTurnIndex`, close event log
-- Add `--resume <sessionId>` flag to `crewhaus run` that replays the event log into message history before continuing
+### CLI + bundle
+
+`crewhaus run` now accepts `--resume <sessionId>`; the format is validated against `/^sess_[0-9a-f]{16}$/` before any I/O. `apps/cli` also forwards `sessionName: ir.name` and `sessionTarget: ir.target` so persisted metadata is human-meaningful. The `target-cli` codegen path emits the same two fields into the generated `agent.ts`, keeping bundles parity-equivalent with the in-memory CLI run.
+
+### End-to-end smoke (live model via `ANTHROPIC_AUTH_TOKEN`)
+
+1. `bun run run:hello` with input `remember the magic word is parsnip` — assistant acknowledged. `.crewhaus/sessions/sess_72c5cd39db1f9219.json` showed `name: "hello"`, `target: "cli"`, `model: "claude-sonnet-4-6"`, `lastTurnIndex: 1`. `.jsonl` contained one `user_message` + one `assistant_message` event at `version: 1`.
+2. `bun apps/cli/src/index.ts run examples/hello-cli/crewhaus.yaml --resume sess_72c5cd39db1f9219` with input `what was the magic word?` — the loop logged `messages:3` (proving the [u, a, u] history reached the model unchanged) and the assistant responded "The magic word is `parsnip`."
+3. `touch -t 202604010000 .crewhaus/sessions/<id>.json` then a fresh `crewhaus run` — the housekeeping `list()` purged both the `.json` and the sibling `.jsonl`; only the new session remained on disk.
 
 ### Tests
-`state-store`: property tests (`T9`) over subscribe ordering. `session-store`: integration test (`T3`) creating + listing + evicting. `event-log`: load test (`T7`) appending 10K events and reading them back; replay test (`T4`) confirming `--resume` produces an identical message history.
+`state-store`: 14 unit + property tests (T1 + T9). `session-store`: 15 unit + integration tests (T1 + T3, including the mtime-eviction case). `event-log`: 8 unit + load tests (T1 + T7, with the 10 K-event round-trip in <1 s). `runtime-core`: 5 new tests in the `runChatLoop — Section 10 persistence` block (T3 lastTurnIndex on exit, T4 replay determinism, resume integration, missing-session error, mutual-exclusion guard, event-log capture). Existing 29 runtime-core tests still pass with `process.env.CREWHAUS_SESSION_DIR` routed to a `mkdtempSync` root via `beforeAll`/`afterAll`.
 
 ---
 

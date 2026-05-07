@@ -4,6 +4,7 @@ import { type AbortTree, createAbortTree } from "@crewhaus/abort-controller";
 import { autoCompact } from "@crewhaus/compaction-autocompact";
 import { snip } from "@crewhaus/compaction-snip";
 import { RuntimeError } from "@crewhaus/errors";
+import { type EventKind, type EventLog, openEventLog } from "@crewhaus/event-log";
 import {
   BUILTIN_DEFAULT_RULES,
   type PermissionMode,
@@ -18,6 +19,8 @@ import {
   recover,
 } from "@crewhaus/recovery-engine";
 import { type RunContext, createRunContext } from "@crewhaus/run-context";
+import { type SessionStore, createSessionStore } from "@crewhaus/session-store";
+import { type Store, createStore } from "@crewhaus/state-store";
 import { executeStreaming } from "@crewhaus/streaming-tool-executor";
 import { TokenBudget, estimateTokens } from "@crewhaus/token-budget";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
@@ -84,6 +87,21 @@ import { zodToJsonSchema } from "zod-to-json-schema";
  * Cancellation: the `runContext.abortSignal` becomes the root of an abort
  * tree; each turn gets a child, each tool call gets a grandchild. First
  * SIGINT cancels the current turn; second SIGINT exits the process.
+ *
+ * Persistence (Section 10): every `runChatLoop` invocation either creates
+ * a new session via `@crewhaus/session-store` or resumes an existing one
+ * (`opts.resume`); the session's `.json` metadata file lives at
+ * `.crewhaus/sessions/<id>.json` alongside an append-only `.jsonl`
+ * transcript opened via `@crewhaus/event-log`. Every user input,
+ * assistant turn, tool_use, tool_result, recovery error, and compaction
+ * is appended as one JSON line. On `--resume`, the runtime walks the
+ * `.jsonl` and replays `user_message` + `assistant_message` events into
+ * the message history before the loop starts. A per-run
+ * `@crewhaus/state-store` is also instantiated as a coordination surface
+ * for hooks/skills/tools (consumed by Section 11+). Eviction: any
+ * session whose `.json` mtime is older than 30 days is purged on the
+ * next `sessionStore.list()` (called once at the top of every
+ * `runChatLoop`).
  */
 
 /**
@@ -178,6 +196,31 @@ export function createAnthropicClient(
   };
 }
 
+/**
+ * Walk an `EventLog` and reconstruct the SDK message history. Only
+ * `user_message` and `assistant_message` events contribute — `tool_use`
+ * and `tool_result` events are audit-only because the same data already
+ * lives inside the assistant/user message content arrays. `error` and
+ * `compaction` events are observability-only and skipped.
+ *
+ * Exported so consumers (the `--resume` path in `apps/cli`, the T4
+ * replay test, and any future inspector) can reproduce the same history
+ * the runtime would build.
+ */
+export async function replayMessageHistory(log: EventLog): Promise<Anthropic.MessageParam[]> {
+  const messages: Anthropic.MessageParam[] = [];
+  for await (const ev of log.read()) {
+    if (ev.kind === "user_message") {
+      const p = ev.payload as { content: Anthropic.MessageParam["content"] };
+      messages.push({ role: "user", content: p.content });
+    } else if (ev.kind === "assistant_message") {
+      const p = ev.payload as { content: Anthropic.MessageParam["content"] };
+      messages.push({ role: "assistant", content: p.content });
+    }
+  }
+  return messages;
+}
+
 export type RunChatLoopOptions = {
   model: string;
   instructions: string;
@@ -233,6 +276,32 @@ export type RunChatLoopOptions = {
    * (mid-stream) rather than waiting for the full response. Default: false.
    */
   streaming?: boolean;
+  /**
+   * Override the directory under which session metadata `.json` files and
+   * event-log `.jsonl` files live. Defaults to `.crewhaus/sessions`.
+   */
+  sessionRootDir?: string;
+  /**
+   * Human-readable label for new sessions; persisted to the session JSON.
+   * Typically the spec `name`. Defaults to `(unnamed)`.
+   */
+  sessionName?: string;
+  /**
+   * Target shape this session belongs to (`"cli"`, `"workflow"`, …); persisted
+   * to the session JSON for future filtering. Defaults to `"cli"`.
+   */
+  sessionTarget?: string;
+  /**
+   * Resume an existing session: load its metadata, replay its event log
+   * into the message history (only `user_message` + `assistant_message`
+   * events; tool_use/tool_result are audit-only and already nested inside
+   * those messages), then continue the loop. Mutually exclusive with
+   * `seedMessages` (the resume payload becomes the seed). When the caller
+   * supplies a `runContext`, its `sessionId` must already match
+   * `resume.sessionId`; otherwise the runtime reseats the sessionId in
+   * the run context for this run.
+   */
+  resume?: { readonly sessionId: string };
 };
 
 /**
@@ -250,7 +319,83 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     : createAnthropicClient(resolveAuth());
   const { client, isOAuth } = resolved;
   const maxTokens = opts.maxTokens ?? 4096;
-  const runContext = opts.runContext ?? createRunContext();
+
+  // Mutual exclusion: resume takes priority and replaces any seedMessages.
+  if (opts.resume !== undefined && opts.seedMessages !== undefined) {
+    throw new RuntimeError(
+      "runChatLoop: `resume` and `seedMessages` are mutually exclusive — the resume payload becomes the seed",
+    );
+  }
+  if (opts.singleTurn === true && opts.resume !== undefined) {
+    throw new RuntimeError(
+      "runChatLoop: `resume` is not supported in singleTurn mode (resumption only makes sense for the REPL)",
+    );
+  }
+  if (
+    opts.runContext !== undefined &&
+    opts.resume !== undefined &&
+    opts.runContext.sessionId !== opts.resume.sessionId
+  ) {
+    throw new RuntimeError(
+      "runChatLoop: opts.runContext.sessionId must match opts.resume.sessionId when both are supplied",
+    );
+  }
+
+  // Persistence boot: session create/resume + event log open. Runs first
+  // so the run context's sessionId — possibly carried over from a prior
+  // run — is the one the rest of the loop logs against.
+  const sessionRootDir = opts.sessionRootDir ?? process.env["CREWHAUS_SESSION_DIR"] ?? undefined;
+  const sessionStore: SessionStore = createSessionStore({ rootDir: sessionRootDir });
+  // Housekeeping side-effect: evicts any session whose mtime is older than
+  // the TTL (default 30 days). The returned list is intentionally discarded.
+  await sessionStore.list();
+
+  let sessionId: string;
+  let resumedMessages: Anthropic.MessageParam[] | undefined;
+  if (opts.resume) {
+    const existing = await sessionStore.get(opts.resume.sessionId);
+    if (existing === null) {
+      throw new RuntimeError(
+        `cannot --resume "${opts.resume.sessionId}": session not found in ${sessionRootDir ?? ".crewhaus/sessions"}`,
+      );
+    }
+    sessionId = existing.id;
+    const replayLog = await openEventLog(sessionId, { rootDir: sessionRootDir });
+    resumedMessages = await replayMessageHistory(replayLog);
+    await replayLog.close();
+  } else {
+    // If the caller supplied a runContext, honour its sessionId (already
+    // sess_<16 hex> by construction) so logs and the persisted file agree.
+    // Otherwise, let session-store mint a fresh id.
+    const created = await sessionStore.create({
+      id: opts.runContext?.sessionId,
+      name: opts.sessionName ?? "(unnamed)",
+      target: opts.sessionTarget ?? "cli",
+      model: opts.model,
+    });
+    sessionId = created.id;
+  }
+
+  // Use the supplied runContext as-is when it agrees with the resolved
+  // sessionId; otherwise build a fresh context bound to that sessionId.
+  // Tests that pass their own runContext rely on observing turnNumber on
+  // it after the loop returns, so we never silently swap it out.
+  const runContext: RunContext = opts.runContext ?? createRunContext({ sessionId });
+
+  const eventLog: EventLog = await openEventLog(sessionId, { rootDir: sessionRootDir });
+
+  // Per-run state container — coordination surface for hooks/skills/tools
+  // landing in Section 11+. Section 10 only ships the plumbing; the
+  // underscore prefix marks the intentional non-consumer.
+  const _runState: Store<Record<string, unknown>> = createStore({});
+  void _runState;
+
+  // Tight helper so call sites stay one line. Errors propagate so an I/O
+  // failure on the audit trail surfaces rather than silently dropping.
+  async function logEvent(kind: EventKind, payload: unknown): Promise<void> {
+    await eventLog.append({ kind, payload });
+  }
+
   const contextLimit = opts.contextLimit ?? DEFAULT_CONTEXT_LIMIT;
   const compactionThreshold = opts.compactionThreshold ?? DEFAULT_COMPACTION_THRESHOLD;
   const snipKeepHead = opts.snipKeepHead ?? DEFAULT_SNIP_KEEP_HEAD;
@@ -316,14 +461,25 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
    */
   async function executeOneToolUse(tu: TsmToolUseBlock): Promise<Anthropic.ToolResultBlockParam> {
     process.stdout.write(`[tool: ${tu.name}]\n`);
+    await logEvent("tool_use", { id: tu.id, name: tu.name, input: tu.input });
     const tool = toolByName.get(tu.name);
+    const finish = async (
+      result: Anthropic.ToolResultBlockParam,
+    ): Promise<Anthropic.ToolResultBlockParam> => {
+      await logEvent("tool_result", {
+        toolUseId: tu.id,
+        content: typeof result.content === "string" ? result.content : "[non-string content]",
+        isError: result.is_error === true,
+      });
+      return result;
+    };
     if (!tool) {
-      return {
+      return finish({
         type: "tool_result",
         tool_use_id: tu.id,
         content: `unknown tool "${tu.name}"`,
         is_error: true,
-      };
+      });
     }
 
     const decision = evaluate(
@@ -349,12 +505,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       }
     }
     if (!approved) {
-      return {
+      return finish({
         type: "tool_result",
         tool_use_id: tu.id,
         content: denialMessage ?? "tool denied",
         is_error: true,
-      };
+      });
     }
 
     const toolAbort = turnAbort.child();
@@ -373,12 +529,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         fullPath: stored.fullPath,
       });
     }
-    return {
+    return finish({
       type: "tool_result",
       tool_use_id: tu.id,
       content: stored.previewContent,
       is_error: raw.isError,
-    };
+    });
   }
 
   /**
@@ -503,6 +659,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 role: "assistant",
                 content: finalContent as Anthropic.MessageParam["content"],
               });
+              await logEvent("assistant_message", { content: finalContent });
               terminalContent = [...finalContent];
 
               const toolUses = finalContent.filter(
@@ -517,8 +674,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 toolUseHistory.push({ id: tu.id, name: tu.name, input: tu.input });
               }
               messages.push({ role: "user", content: [...toolResults] });
+              await logEvent("user_message", { content: [...toolResults] });
               const warning = maybeBuildLoopWarning();
-              if (warning !== null) messages.push(warning);
+              if (warning !== null) {
+                messages.push(warning);
+                await logEvent("user_message", { content: warning.content });
+              }
 
               // Synthesize the two transitions the state machine expects:
               // tools have already executed during the stream so we
@@ -544,6 +705,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               role: "assistant",
               content: final.content as Anthropic.MessageParam["content"],
             });
+            await logEvent("assistant_message", { content: final.content });
             terminalContent = final.content;
 
             // Synthetic max_output_tokens recovery: stop_reason "max_tokens"
@@ -583,12 +745,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             }
             lastErrorForRecovery = err;
             const errObj = err as { name?: unknown; message?: unknown };
+            const errorName = typeof errObj.name === "string" ? errObj.name : "Error";
+            const errorMessage = typeof errObj.message === "string" ? errObj.message : String(err);
+            await logEvent("error", { name: errorName, message: errorMessage });
             state = transition(state, {
               kind: "RecoverableError",
-              error: {
-                name: typeof errObj.name === "string" ? errObj.name : "Error",
-                message: typeof errObj.message === "string" ? errObj.message : String(err),
-              },
+              error: { name: errorName, message: errorMessage },
             });
           }
           break;
@@ -597,8 +759,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         case "NeedTools": {
           const toolResults = await runToolBatch(state.toolUses);
           messages.push({ role: "user", content: toolResults });
+          await logEvent("user_message", { content: toolResults });
           const warning = maybeBuildLoopWarning();
-          if (warning !== null) messages.push(warning);
+          if (warning !== null) {
+            messages.push(warning);
+            await logEvent("user_message", { content: warning.content });
+          }
           state = transition(state, { kind: "ToolsExecuted" });
           break;
         }
@@ -619,6 +785,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           });
           switch (action.kind) {
             case "compact": {
+              const before = messages.length;
               const compacted = await forceCompact({
                 messages,
                 client,
@@ -629,6 +796,11 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               });
               messages.length = 0;
               messages.push(...compacted);
+              await logEvent("compaction", {
+                kind: "reactive",
+                before,
+                after: messages.length,
+              });
               state = transition(state, { kind: "RecoveryDone" });
               break;
             }
@@ -636,19 +808,22 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               await new Promise((resolve) => setTimeout(resolve, action.delayMs));
               state = transition(state, { kind: "RecoveryDone" });
               break;
-            case "continue":
-              messages.push({ role: "user", content: "Please continue from where you left off." });
+            case "continue": {
+              const continueMsg = "Please continue from where you left off.";
+              messages.push({ role: "user", content: continueMsg });
+              await logEvent("user_message", { content: continueMsg });
               state = transition(state, { kind: "RecoveryDone" });
               break;
+            }
             case "tombstone": {
               const lastIdx = messages.length - 1;
               if (lastIdx >= 0 && messages[lastIdx]?.role === "assistant") {
                 messages.pop();
               }
-              messages.push({
-                role: "user",
-                content: "[previous assistant turn was rejected as invalid; please retry]",
-              });
+              const tombstoneMsg =
+                "[previous assistant turn was rejected as invalid; please retry]";
+              messages.push({ role: "user", content: tombstoneMsg });
+              await logEvent("user_message", { content: tombstoneMsg });
               state = transition(state, { kind: "RecoveryDone" });
               break;
             }
@@ -673,33 +848,64 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         'runChatLoop({ singleTurn: true }) requires `seedMessages` to end with a `role: "user"` entry',
       );
     }
-    let messages: Anthropic.MessageParam[] = [...seed];
-    runContext.turnNumber += 1;
-    runContext.logger.debug("turn start (single)", {
-      turn: runContext.turnNumber,
-      messages: messages.length,
-    });
+    try {
+      let messages: Anthropic.MessageParam[] = [...seed];
+      // Replay the seed through the event log so the persisted transcript
+      // captures the workflow step's user input.
+      for (const m of seed) {
+        if (m.role === "user") {
+          await logEvent("user_message", { content: m.content });
+        } else if (m.role === "assistant") {
+          await logEvent("assistant_message", { content: m.content });
+        }
+      }
+      runContext.turnNumber += 1;
+      runContext.logger.debug("turn start (single)", {
+        turn: runContext.turnNumber,
+        messages: messages.length,
+      });
 
-    messages = await maybeCompact({
-      messages,
-      client,
-      model: opts.model,
-      contextLimit,
-      compactionThreshold,
-      snipKeepHead,
-      snipKeepTail,
-      logger: runContext.logger,
-    });
+      messages = await maybeCompact(
+        {
+          messages,
+          client,
+          model: opts.model,
+          contextLimit,
+          compactionThreshold,
+          snipKeepHead,
+          snipKeepTail,
+          logger: runContext.logger,
+        },
+        async (info) => {
+          await logEvent("compaction", info);
+        },
+      );
 
-    const { terminalContent } = await runOneTurn(messages);
-    return terminalContent
-      .filter((b): b is Anthropic.TextBlock => b.type === "text")
-      .map((b) => b.text)
-      .join("");
+      const { terminalContent } = await runOneTurn(messages);
+      return terminalContent
+        .filter((b): b is Anthropic.TextBlock => b.type === "text")
+        .map((b) => b.text)
+        .join("");
+    } finally {
+      await sessionStore
+        .update(sessionId, { lastTurnIndex: runContext.turnNumber })
+        .catch((err) => {
+          runContext.logger.warn("session-store: lastTurnIndex update failed", {
+            error: (err as Error).message,
+          });
+        });
+      await eventLog.close();
+    }
   }
 
-  // REPL mode (existing behavior).
-  let messages: Anthropic.MessageParam[] = opts.seedMessages ? [...opts.seedMessages] : [];
+  // REPL mode (existing behavior). When resuming, the prior session's
+  // transcript becomes the seed; otherwise honour any caller-supplied
+  // seedMessages.
+  let messages: Anthropic.MessageParam[] = resumedMessages
+    ? [...resumedMessages]
+    : opts.seedMessages
+      ? [...opts.seedMessages]
+      : [];
 
   const rl = readline.createInterface({
     input: opts.input ?? process.stdin,
@@ -780,6 +986,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       if (userInput === "exit" || userInput === "quit") break;
 
       messages.push({ role: "user", content: userInput });
+      await logEvent("user_message", { content: userInput });
       runContext.turnNumber += 1;
       runContext.logger.debug("turn start", {
         turn: runContext.turnNumber,
@@ -787,16 +994,21 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       });
 
       // Pre-turn budget check: snip first (free), then autocompact if still over.
-      messages = await maybeCompact({
-        messages,
-        client,
-        model: opts.model,
-        contextLimit,
-        compactionThreshold,
-        snipKeepHead,
-        snipKeepTail,
-        logger: runContext.logger,
-      });
+      messages = await maybeCompact(
+        {
+          messages,
+          client,
+          model: opts.model,
+          contextLimit,
+          compactionThreshold,
+          snipKeepHead,
+          snipKeepTail,
+          logger: runContext.logger,
+        },
+        async (info) => {
+          await logEvent("compaction", info);
+        },
+      );
 
       try {
         await runOneTurn(messages);
@@ -818,6 +1030,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       process.removeListener("SIGINT", sigintHandler);
     }
     rl.close();
+    await sessionStore.update(sessionId, { lastTurnIndex: runContext.turnNumber }).catch((err) => {
+      runContext.logger.warn("session-store: lastTurnIndex update failed", {
+        error: (err as Error).message,
+      });
+    });
+    await eventLog.close();
   }
 
   return "";
@@ -828,6 +1046,12 @@ function isAbortError(err: unknown): boolean {
   const name = (err as { name?: unknown }).name;
   return typeof name === "string" && (name === "AbortError" || name === "APIUserAbortError");
 }
+
+type CompactionInfo = {
+  readonly kind: "snip" | "autocompact";
+  readonly before: number;
+  readonly after: number;
+};
 
 type CompactArgs = {
   messages: Anthropic.MessageParam[];
@@ -840,12 +1064,19 @@ type CompactArgs = {
   logger: RunContext["logger"];
 };
 
+type OnCompaction = (info: CompactionInfo) => Promise<void>;
+
 /**
  * Pre-turn compaction ladder: estimate → snip → re-estimate → autocompact.
  * Returns the (possibly replaced) messages array. Pure with respect to
- * the input array; callers reassign.
+ * the input array; callers reassign. The optional `onCompaction` callback
+ * fires once per applied step so the runtime can append a `compaction`
+ * event to the session log without duplicating the cost-estimation logic.
  */
-async function maybeCompact(args: CompactArgs): Promise<Anthropic.MessageParam[]> {
+async function maybeCompact(
+  args: CompactArgs,
+  onCompaction?: OnCompaction,
+): Promise<Anthropic.MessageParam[]> {
   const {
     messages,
     client,
@@ -865,6 +1096,9 @@ async function maybeCompact(args: CompactArgs): Promise<Anthropic.MessageParam[]
 
   const snipped = snip(messages, snipKeepHead, snipKeepTail);
   logger.info("snip applied", { before: messages.length, after: snipped.length });
+  if (onCompaction !== undefined) {
+    await onCompaction({ kind: "snip", before: messages.length, after: snipped.length });
+  }
 
   const postSnipBudget = new TokenBudget(contextLimit);
   postSnipBudget.add(estimateTokens(snipped), 0);
@@ -873,7 +1107,11 @@ async function maybeCompact(args: CompactArgs): Promise<Anthropic.MessageParam[]
   }
 
   logger.info("autocompact triggered", { tokensAfterSnip: postSnipBudget.used });
-  return await autoCompact(snipped, client, model);
+  const after = await autoCompact(snipped, client, model);
+  if (onCompaction !== undefined) {
+    await onCompaction({ kind: "autocompact", before: snipped.length, after: after.length });
+  }
+  return after;
 }
 
 type ForceCompactArgs = {

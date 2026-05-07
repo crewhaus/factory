@@ -51,9 +51,12 @@ const RUN_SCHEMA: ParseArgsSchema = {
   flags: [
     { name: "model", takesValue: true },
     { name: "permission-mode", takesValue: true },
+    { name: "resume", takesValue: true },
     { name: "help", short: "h" },
   ],
 };
+
+const SESSION_ID_REGEX = /^sess_[0-9a-f]{16}$/;
 
 const VALID_PERMISSION_MODES = ["default", "plan", "auto", "bypass"] as const;
 type CliPermissionMode = (typeof VALID_PERMISSION_MODES)[number];
@@ -78,6 +81,7 @@ function usage(): never {
       "subcommands:",
       "  compile <spec.yaml> -o <out-dir>     compile a spec to a runnable bundle",
       "  run <spec.yaml> [--model <model>]    compile in-memory and execute the agent",
+      "                  [--resume <id>]      resume a prior session (event-log replay)",
       "  init [name]                          scaffold a new crewhaus.yaml",
       "  doctor                               check environment health",
       "",
@@ -235,12 +239,21 @@ function buildRuleSet(
 async function runRun(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
-      "usage: crewhaus run <spec.yaml> [--model <model>] [--permission-mode <default|plan|auto|bypass>]\n",
+      "usage: crewhaus run <spec.yaml> [--model <model>] [--permission-mode <default|plan|auto|bypass>] [--resume <sessionId>]\n",
     );
     return;
   }
   const specPath = args.positional[0];
   if (typeof specPath !== "string") die("missing <spec.yaml>");
+
+  const resumeFlag = args.flags["resume"];
+  let resumeId: string | undefined;
+  if (typeof resumeFlag === "string") {
+    if (!SESSION_ID_REGEX.test(resumeFlag)) {
+      die(`invalid --resume sessionId "${resumeFlag}" — expected sess_<16 hex>`);
+    }
+    resumeId = resumeFlag;
+  }
 
   const absSpec = resolve(specPath);
   logger.debug("run.start", { spec: absSpec });
@@ -331,6 +344,9 @@ async function runRun(args: ParsedArgs): Promise<void> {
       tools,
       permissionMode,
       permissionRules,
+      sessionName: ir.name,
+      sessionTarget: ir.target,
+      ...(resumeId !== undefined ? { resume: { sessionId: resumeId } } : {}),
     });
   } finally {
     if (mcpHost) await mcpHost.disconnectAll();

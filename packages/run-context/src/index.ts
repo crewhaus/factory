@@ -7,7 +7,7 @@
  * Reference: claude-code/Tool.ts `ToolUseContext`,
  * openai-agents/run_context.py.
  */
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { type Logger, createLogger } from "@crewhaus/logging";
 
 export type RunContext = {
@@ -20,7 +20,18 @@ export type RunContext = {
 };
 
 export type RunContextOptions = {
+  /**
+   * Override the auto-generated `runId`. Format is unconstrained; the
+   * default factory produces `run_<8 hex>`.
+   */
   runId?: string;
+  /**
+   * Override the auto-generated `sessionId`. Must follow the format
+   * `sess_<16 hex>` so it round-trips through `@crewhaus/session-store`
+   * (whose path-traversal guard rejects anything else). The default
+   * factory produces a value that already conforms; runtime-core
+   * overrides this when creating or resuming a persisted session.
+   */
   sessionId?: string;
   abortSignal?: AbortSignal;
   logger?: Logger;
@@ -31,13 +42,23 @@ function shortId(): string {
 }
 
 /**
+ * Generate a fresh sessionId in the format `sess_<16 hex>`. The 16-hex
+ * suffix matches the regex `@crewhaus/session-store` enforces on every
+ * read path, so a `RunContext`-supplied id can flow straight into
+ * `sessionStore.create({ id })` without a format conversion.
+ */
+function generateSessionId(): string {
+  return `sess_${randomBytes(8).toString("hex")}`;
+}
+
+/**
  * Build a fresh RunContext with sensible defaults: random ids, a
  * never-aborted signal, and a logger that has the run/session ids
  * pre-bound so every log line is tagged automatically.
  */
 export function createRunContext(opts: RunContextOptions = {}): RunContext {
   const runId = opts.runId ?? `run_${shortId()}`;
-  const sessionId = opts.sessionId ?? `sess_${shortId()}`;
+  const sessionId = opts.sessionId ?? generateSessionId();
   const abortSignal = opts.abortSignal ?? new AbortController().signal;
   const baseLogger = opts.logger ?? createLogger();
   const logger = baseLogger.child({ runId, sessionId });

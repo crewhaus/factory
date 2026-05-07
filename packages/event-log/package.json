@@ -1,0 +1,18 @@
+{
+  "name": "@crewhaus/event-log",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Append-only JSONL transcript log per session",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@crewhaus/errors": "workspace:*"
+  }
+}
