@@ -45,11 +45,33 @@ agent:
     expect(() => compile("not: a: valid: spec")).toThrow(SpecParseError);
   });
 
-  test("emits no tool plumbing when spec omits tools", () => {
+  test("emits no built-in tool imports when spec omits tools", () => {
     const content = compile(MINIMAL_SPEC).files[0]?.content ?? "";
-    expect(content).not.toContain("@crewhaus/tool-catalog");
-    expect(content).not.toContain("defaultCatalog.register");
-    expect(content).not.toContain("tools:");
+    // Section 11 always wires hooks/skills/slash-commands and the catalog
+    // (so a runtime-discovered Skill tool can register), but built-in tool
+    // packages are still not imported when the spec doesn't request them.
+    expect(content).not.toContain("@crewhaus/tool-fs");
+    expect(content).not.toContain("@crewhaus/tool-bash");
+    expect(content).not.toContain("@crewhaus/tool-todo");
+    expect(content).not.toContain("defaultCatalog.register(read");
+    expect(content).not.toContain("defaultCatalog.register(write");
+    expect(content).not.toContain("defaultCatalog.register(bash");
+  });
+
+  test("emits Section 11 extension surface (hooks/skills/slash) on every CLI bundle", () => {
+    const content = compile(MINIMAL_SPEC).files[0]?.content ?? "";
+    expect(content).toContain('import { loadHooks } from "@crewhaus/hooks-engine";');
+    expect(content).toContain(
+      'import { discoverSkills, createSkillTool } from "@crewhaus/skills-registry";',
+    );
+    expect(content).toContain('import { loadCommands } from "@crewhaus/slash-commands";');
+    expect(content).toContain("await Promise.all([");
+    expect(content).toContain("loadHooks({ cwd: __cwd })");
+    expect(content).toContain("discoverSkills({ cwd: __cwd })");
+    expect(content).toContain("loadCommands({ cwd: __cwd })");
+    expect(content).toContain("hooks: __hooks,");
+    expect(content).toContain("skills: __skills,");
+    expect(content).toContain("slashCommands: __slashCommands,");
   });
 });
 
@@ -203,10 +225,11 @@ describe("compile workflow target", () => {
     expect(content).toContain('"claude-sonnet-4-6"');
   });
 
-  test("generated workflow bundle threads per-step tools", () => {
+  test("generated workflow bundle threads per-step tools (Section 11 weaves Skill tool in)", () => {
     const content = compile(MINIMAL_WORKFLOW_SPEC).files[0]?.content ?? "";
     expect(content).toContain('import { bash } from "@crewhaus/tool-bash";');
-    expect(content).toContain("tools: [bash]");
+    // Spec-declared tools appear in both branches of the skill conditional.
+    expect(content).toContain("tools: __skillTool ? [bash, __skillTool] : [bash],");
   });
 
   test("per-step model override is resolved at lower-time and emitted", () => {

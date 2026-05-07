@@ -83,7 +83,7 @@ describe("emitWorkflow", () => {
     expect(c).not.toMatch(/import \{ read \} from "@crewhaus\/tool-fs"/);
   });
 
-  test("per-step tools field reflects only that step's tools", () => {
+  test("per-step tools field reflects that step's tools (Section 11 weaves the Skill tool in)", () => {
     const ir: IrWorkflowV0 = {
       ...TWO_STEP_IR,
       steps: [
@@ -92,17 +92,37 @@ describe("emitWorkflow", () => {
       ],
     };
     const c = emitWorkflow(ir).files[0]?.content ?? "";
-    expect(c).toContain("tools: [bash]");
-    expect(c).toContain("tools: [read]");
+    // Step's spec-declared tools appear in both branches of the
+    // skill-tool conditional. The conditional itself is the Section 11
+    // weave: when skills are discovered at runtime, __skillTool is the
+    // synthetic Skill(name) tool produced by createSkillTool.
+    expect(c).toContain("tools: __skillTool ? [bash, __skillTool] : [bash],");
+    expect(c).toContain("tools: __skillTool ? [read, __skillTool] : [read],");
   });
 
-  test("steps without tools omit the tools field entirely", () => {
+  test("steps without tools still emit a Section 11 skill-aware tools field", () => {
     const ir: IrWorkflowV0 = {
       ...TWO_STEP_IR,
       steps: [{ name: "a", instructions: "i", model: "m", tools: [] }],
     };
     const c = emitWorkflow(ir).files[0]?.content ?? "";
-    expect(c).not.toContain("tools:");
+    expect(c).toContain("tools: __skillTool ? [__skillTool] : [],");
+  });
+
+  test("emits Section 11 extension surface (hooks/skills/slash) shared across steps", () => {
+    const c = emitWorkflow(TWO_STEP_IR).files[0]?.content ?? "";
+    expect(c).toContain('import { loadHooks } from "@crewhaus/hooks-engine";');
+    expect(c).toContain(
+      'import { discoverSkills, createSkillTool } from "@crewhaus/skills-registry";',
+    );
+    expect(c).toContain('import { loadCommands } from "@crewhaus/slash-commands";');
+    // Discovery happens once at the top of main() and is shared across steps.
+    expect(c).toContain("loadHooks({ cwd: __cwd })");
+    expect(c).toContain("discoverSkills({ cwd: __cwd })");
+    expect(c).toContain("loadCommands({ cwd: __cwd })");
+    // Each step threads the shared discovery through runChatLoop.
+    const hookFieldMatches = c.match(/hooks: __hooks,/g) ?? [];
+    expect(hookFieldMatches.length).toBe(2);
   });
 
   test("rejects unknown tool names at emit time", () => {

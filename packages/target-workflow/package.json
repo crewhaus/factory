@@ -16,5 +16,10 @@
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/infra-utils": "workspace:*",
     "@crewhaus/ir": "workspace:*"
+  },
+  "peerDependencies": {
+    "@crewhaus/hooks-engine": "workspace:*",
+    "@crewhaus/skills-registry": "workspace:*",
+    "@crewhaus/slash-commands": "workspace:*"
   }
 }

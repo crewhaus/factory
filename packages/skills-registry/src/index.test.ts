@@ -1,0 +1,257 @@
+import { describe, expect, mock, test } from "bun:test";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  SkillParseError,
+  createSkillTool,
+  discoverSkills,
+  formatSkillsForPrompt,
+  loadSkillBody,
+  parseSkillFile,
+} from "./index";
+
+function withTempHomeAndCwd(
+  setup: (paths: { home: string; cwd: string }) => void,
+  body: (paths: { home: string; cwd: string }) => Promise<void> | void,
+): Promise<void> {
+  const home = mkdtempSync(join(tmpdir(), "skills-home-"));
+  const cwd = mkdtempSync(join(tmpdir(), "skills-cwd-"));
+  try {
+    setup({ home, cwd });
+    return Promise.resolve(body({ home, cwd })).finally(() => {
+      rmSync(home, { recursive: true, force: true });
+      rmSync(cwd, { recursive: true, force: true });
+    });
+  } catch (err) {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+    throw err;
+  }
+}
+
+function writeSkill(root: string, name: string, frontmatter: string, body: string): string {
+  const dir = join(root, ".crewhaus", "skills", name);
+  mkdirSync(dir, { recursive: true });
+  const file = join(dir, "SKILL.md");
+  writeFileSync(file, `---\n${frontmatter}\n---\n${body}`);
+  return file;
+}
+
+describe("parseSkillFile", () => {
+  test("extracts frontmatter and body", () => {
+    const content = `---
+name: say-hi
+description: respond with a greeting
+---
+You are friendly. Say hello.`;
+    const { frontmatter, body } = parseSkillFile(content);
+    expect(frontmatter.name).toBe("say-hi");
+    expect(frontmatter.description).toBe("respond with a greeting");
+    expect(body).toBe("You are friendly. Say hello.");
+  });
+
+  test("supports optional triggers and tools fields", () => {
+    const content = `---
+name: x
+description: y
+triggers: [foo, bar]
+tools: [Read, Bash]
+---
+body`;
+    const { frontmatter } = parseSkillFile(content);
+    expect(frontmatter.triggers).toEqual(["foo", "bar"]);
+    expect(frontmatter.tools).toEqual(["Read", "Bash"]);
+  });
+
+  test("rejects missing frontmatter delimiter", () => {
+    expect(() => parseSkillFile("no frontmatter here")).toThrow(SkillParseError);
+  });
+
+  test("rejects unterminated frontmatter", () => {
+    expect(() => parseSkillFile("---\nname: x\ndescription: y\nstill open")).toThrow(
+      SkillParseError,
+    );
+  });
+
+  test("rejects missing name field", () => {
+    expect(() => parseSkillFile("---\ndescription: only desc\n---\nbody")).toThrow(SkillParseError);
+  });
+
+  test("rejects missing description field", () => {
+    expect(() => parseSkillFile("---\nname: only-name\n---\nbody")).toThrow(SkillParseError);
+  });
+
+  test("rejects non-string name", () => {
+    expect(() => parseSkillFile("---\nname: 42\ndescription: x\n---\nbody")).toThrow(
+      SkillParseError,
+    );
+  });
+
+  test("preserves multi-paragraph body verbatim", () => {
+    const body = "Line 1\n\nLine 2\n\n## Heading\n\n- bullet";
+    const content = `---\nname: x\ndescription: y\n---\n${body}`;
+    expect(parseSkillFile(content).body).toBe(body);
+  });
+
+  test("strips UTF-8 BOM if present", () => {
+    const content = "﻿---\nname: x\ndescription: y\n---\nbody";
+    const { frontmatter } = parseSkillFile(content);
+    expect(frontmatter.name).toBe("x");
+  });
+});
+
+describe("discoverSkills", () => {
+  test("returns [] when neither root exists", async () => {
+    await withTempHomeAndCwd(
+      () => {},
+      async ({ home, cwd }) => {
+        expect(await discoverSkills({ cwd, homeDir: home })).toEqual([]);
+      },
+    );
+  });
+
+  test("project skills override user skills by name", async () => {
+    await withTempHomeAndCwd(
+      ({ home, cwd }) => {
+        writeSkill(home, "x", "name: x\ndescription: from-user", "user body");
+        writeSkill(cwd, "x", "name: x\ndescription: from-project", "project body");
+      },
+      async ({ home, cwd }) => {
+        const skills = await discoverSkills({ cwd, homeDir: home });
+        expect(skills.length).toBe(1);
+        expect(skills[0]?.description).toBe("from-project");
+      },
+    );
+  });
+
+  test("ignores directories without SKILL.md", async () => {
+    await withTempHomeAndCwd(
+      ({ cwd }) => {
+        mkdirSync(join(cwd, ".crewhaus", "skills", "no-skill-here"), { recursive: true });
+        writeSkill(cwd, "real", "name: real\ndescription: legit", "body");
+      },
+      async ({ home, cwd }) => {
+        const skills = await discoverSkills({ cwd, homeDir: home });
+        expect(skills.map((s) => s.name)).toEqual(["real"]);
+      },
+    );
+  });
+
+  test("plugin dirs are also walked", async () => {
+    await withTempHomeAndCwd(
+      ({ cwd }) => {
+        const pluginDir = join(cwd, "plugin-bundle");
+        mkdirSync(join(pluginDir, "plug-skill"), { recursive: true });
+        writeFileSync(
+          join(pluginDir, "plug-skill", "SKILL.md"),
+          "---\nname: plug-skill\ndescription: from plugin\n---\nbody",
+        );
+      },
+      async ({ home, cwd }) => {
+        const skills = await discoverSkills({
+          cwd,
+          homeDir: home,
+          pluginDirs: [join(cwd, "plugin-bundle")],
+        });
+        expect(skills.map((s) => s.name)).toEqual(["plug-skill"]);
+      },
+    );
+  });
+
+  test("malformed SKILL.md in a discovered dir surfaces SkillParseError", async () => {
+    await withTempHomeAndCwd(
+      ({ cwd }) => {
+        const dir = join(cwd, ".crewhaus", "skills", "broken");
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(join(dir, "SKILL.md"), "---\nname: broken\n---\nno description");
+      },
+      async ({ home, cwd }) => {
+        await expect(discoverSkills({ cwd, homeDir: home })).rejects.toBeInstanceOf(
+          SkillParseError,
+        );
+      },
+    );
+  });
+});
+
+describe("formatSkillsForPrompt", () => {
+  test("returns empty string for empty list", () => {
+    expect(formatSkillsForPrompt([])).toBe("");
+  });
+
+  test("renders a bullet per skill", () => {
+    const out = formatSkillsForPrompt([
+      { name: "a", description: "one", filePath: "/x" },
+      { name: "b", description: "two", filePath: "/y" },
+    ]);
+    expect(out).toContain("- a: one");
+    expect(out).toContain("- b: two");
+    expect(out).toContain("`Skill`");
+  });
+});
+
+describe("createSkillTool — lazy-load contract (T3)", () => {
+  test("describes available skill names", () => {
+    const tool = createSkillTool([
+      { name: "x", description: "X-desc", filePath: "/tmp/x/SKILL.md" },
+      { name: "y", description: "Y-desc", filePath: "/tmp/y/SKILL.md" },
+    ]);
+    expect(tool.name).toBe("Skill");
+    expect(tool.description).toContain("x, y");
+  });
+
+  test("returns body only on tool execution, not at boot", async () => {
+    await withTempHomeAndCwd(
+      ({ cwd }) => {
+        writeSkill(cwd, "lazy", "name: lazy\ndescription: lazy-desc", "REAL_BODY_CONTENT");
+      },
+      async ({ home, cwd }) => {
+        const skills = await discoverSkills({ cwd, homeDir: home });
+        // Up to this point only the frontmatter has been read; verify by
+        // creating the tool and inspecting its description (which should
+        // not contain the body).
+        const tool = createSkillTool(skills);
+        expect(tool.description).not.toContain("REAL_BODY_CONTENT");
+        // Now invoke the tool — only here should the body land.
+        const result = await tool.execute({ name: "lazy" });
+        expect(result).toContain("REAL_BODY_CONTENT");
+      },
+    );
+  });
+
+  test("unknown skill name returns informative error string", async () => {
+    const tool = createSkillTool([{ name: "real", description: "x", filePath: "/tmp/r/SKILL.md" }]);
+    const result = await tool.execute({ name: "ghost" });
+    expect(result).toContain("unknown skill");
+    expect(result).toContain("ghost");
+  });
+
+  test("loadSkillBody is the single point that touches the body file", async () => {
+    await withTempHomeAndCwd(
+      ({ cwd }) => {
+        writeSkill(cwd, "spy", "name: spy\ndescription: x", "secret-body");
+      },
+      async ({ home, cwd }) => {
+        const skills = await discoverSkills({ cwd, homeDir: home });
+        const ref = skills[0];
+        if (!ref) throw new Error("expected one skill");
+        const body = await loadSkillBody(ref);
+        expect(body).toBe("secret-body");
+        // Sanity: the file on disk still has the body intact.
+        expect(readFileSync(ref.filePath, "utf8")).toContain("secret-body");
+      },
+    );
+  });
+});
+
+describe("Skill tool flag shape", () => {
+  test("readOnly + concurrency-safe + not destructive", () => {
+    const tool = createSkillTool([]);
+    expect(tool.readOnly).toBe(true);
+    expect(tool.concurrencySafe).toBe(true);
+    expect(tool.destructive).toBe(false);
+  });
+});
+
+void mock;

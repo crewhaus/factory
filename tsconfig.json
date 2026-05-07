@@ -27,6 +27,9 @@
     { "path": "./packages/abort-controller" },
     { "path": "./packages/mcp-host" },
     { "path": "./packages/tool-mcp" },
+    { "path": "./packages/hooks-engine" },
+    { "path": "./packages/skills-registry" },
+    { "path": "./packages/slash-commands" },
     { "path": "./apps/cli" }
   ]
 }

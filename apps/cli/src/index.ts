@@ -2,6 +2,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { SpecParseError, compile, lower } from "@crewhaus/compiler";
+import { loadHooks } from "@crewhaus/hooks-engine";
 import {
   ArgParseError,
   type ParseArgsSchema,
@@ -19,6 +20,8 @@ import {
   tagRules,
 } from "@crewhaus/permission-engine";
 import { resolveAuth, runChatLoop } from "@crewhaus/runtime-core";
+import { createSkillTool, discoverSkills } from "@crewhaus/skills-registry";
+import { loadCommands } from "@crewhaus/slash-commands";
 import { parseSpec } from "@crewhaus/spec";
 import { type RegisteredTool, ToolCatalog } from "@crewhaus/tool-catalog";
 import { registerMcpServer } from "@crewhaus/tool-mcp";
@@ -218,13 +221,19 @@ function buildRuleSet(
     } catch (err) {
       die(`failed to parse ${settingsPath}: ${(err as Error).message}`);
     }
-    const root = (raw as { permissions?: unknown }).permissions ?? raw;
-    try {
-      const parsed = parsePermissionsConfig(root, "settings");
-      settings = tagRules(parsed.rules, "settings");
-    } catch (err) {
-      if (err instanceof PermissionConfigError) die(err.message);
-      throw err;
+    // Section 11 introduced top-level keys (`hooks`) into settings.json.
+    // Only parse the `permissions` sub-object — never the bare root —
+    // so hooks/skills/slash-command keys don't trip the strict permission
+    // validator. If the file has no `permissions` block, treat as empty.
+    const root = (raw as { permissions?: unknown }).permissions;
+    if (root !== undefined) {
+      try {
+        const parsed = parsePermissionsConfig(root, "settings");
+        settings = tagRules(parsed.rules, "settings");
+      } catch (err) {
+        if (err instanceof PermissionConfigError) die(err.message);
+        throw err;
+      }
     }
   }
   return {
@@ -337,6 +346,31 @@ async function runRun(args: ParsedArgs): Promise<void> {
 
   const permissionRules = buildRuleSet(ir.permissions.rules, process.cwd());
 
+  // Section 11 — discover hooks, skills, and slash commands from the user's
+  // workspace. Hooks come from `~/.crewhaus/settings.json` + `<cwd>/.crewhaus/settings.json`;
+  // skills from `~/.crewhaus/skills/*/SKILL.md` + project-equivalent; slash
+  // commands from `<cwd>/.crewhaus/commands/*.md`. When skills are present,
+  // a synthetic `Skill(name)` tool is appended to the tool list so the
+  // model can lazily fetch each skill's body.
+  const cwd = process.cwd();
+  const [hooks, skills, slashCommands] = await Promise.all([
+    loadHooks({ cwd }),
+    discoverSkills({ cwd }),
+    loadCommands({ cwd }),
+  ]);
+  if (skills.length > 0) {
+    tools.push(createSkillTool(skills));
+    process.stdout.write(
+      `[skills] ${skills.length} available: ${skills.map((s) => s.name).join(", ")}\n`,
+    );
+  }
+  if (hooks.length > 0) process.stdout.write(`[hooks] ${hooks.length} loaded\n`);
+  if (slashCommands.size > 0) {
+    process.stdout.write(
+      `[slash] ${slashCommands.size} commands: ${[...slashCommands.keys()].join(", ")}\n`,
+    );
+  }
+
   try {
     await runChatLoop({
       model,
@@ -346,6 +380,9 @@ async function runRun(args: ParsedArgs): Promise<void> {
       permissionRules,
       sessionName: ir.name,
       sessionTarget: ir.target,
+      hooks,
+      skills,
+      slashCommands,
       ...(resumeId !== undefined ? { resume: { sessionId: resumeId } } : {}),
     });
   } finally {
