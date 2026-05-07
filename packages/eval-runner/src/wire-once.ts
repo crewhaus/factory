@@ -1,3 +1,5 @@
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 /**
  * Build the agent stack ONCE per eval run, then share across samples.
  *
@@ -13,25 +15,23 @@
  * escape hatch is reserved for a future where this matters.
  */
 import type { SubAgentDefinition } from "@crewhaus/agent-context-isolation";
-import { loadHooks, type HookDef } from "@crewhaus/hooks-engine";
+import { type HookDef, loadHooks } from "@crewhaus/hooks-engine";
 import type { IrV0 } from "@crewhaus/ir";
 import { createLogger } from "@crewhaus/logging";
 import { McpHost } from "@crewhaus/mcp-host";
 import {
   BUILTIN_DEFAULT_RULES,
   PermissionConfigError,
+  type RuleSet,
   parsePermissionsConfig,
   tagRules,
-  type RuleSet,
 } from "@crewhaus/permission-engine";
-import { createSkillTool, discoverSkills, type SkillRef } from "@crewhaus/skills-registry";
-import { loadCommands, type SlashCommand } from "@crewhaus/slash-commands";
+import { type SkillRef, createSkillTool, discoverSkills } from "@crewhaus/skills-registry";
+import { type SlashCommand, loadCommands } from "@crewhaus/slash-commands";
 import { spawnSubAgent } from "@crewhaus/sub-agent-spawner";
 import { type RegisteredTool, ToolCatalog } from "@crewhaus/tool-catalog";
 import { registerMcpServer } from "@crewhaus/tool-mcp";
 import { createTaskTool } from "@crewhaus/tool-task";
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
 import { RunnerError } from "./errors";
 
 type SpawnSubAgentFn = typeof spawnSubAgent;
@@ -53,10 +53,7 @@ export type SharedAgentDeps = {
 
 const logger = createLogger({ bindings: { module: "eval-runner.wire" } });
 
-export async function wireRunOnce(
-  ir: IrV0,
-  opts: { cwd?: string } = {},
-): Promise<SharedAgentDeps> {
+export async function wireRunOnce(ir: IrV0, opts: { cwd?: string } = {}): Promise<SharedAgentDeps> {
   const cwd = opts.cwd ?? process.cwd();
 
   // Tools.
@@ -83,9 +80,7 @@ export async function wireRunOnce(
     const tempCatalog = new ToolCatalog();
     for (const t of tools) tempCatalog.register(t);
     await Promise.all(
-      Object.keys(ir.mcp_servers).map((name) =>
-        registerMcpServer(host, name, tempCatalog),
-      ),
+      Object.keys(ir.mcp_servers).map((name) => registerMcpServer(host, name, tempCatalog)),
     );
     tools = tempCatalog.list().slice();
   }
@@ -171,9 +166,7 @@ async function applyToolConfigs(
   }
   if (used.has("webFetch") && toolConfigs["webFetch"] !== undefined) {
     const { registerWebFetchConfig } = await import("@crewhaus/tool-web");
-    registerWebFetchConfig(
-      toolConfigs["webFetch"] as Parameters<typeof registerWebFetchConfig>[0],
-    );
+    registerWebFetchConfig(toolConfigs["webFetch"] as Parameters<typeof registerWebFetchConfig>[0]);
   }
 }
 
@@ -188,10 +181,7 @@ function buildRuleSet(
     try {
       raw = JSON.parse(readFileSync(settingsPath, "utf-8"));
     } catch (err) {
-      throw new RunnerError(
-        `failed to parse ${settingsPath}: ${(err as Error).message}`,
-        err,
-      );
+      throw new RunnerError(`failed to parse ${settingsPath}: ${(err as Error).message}`, err);
     }
     const root = (raw as { permissions?: unknown }).permissions;
     if (root !== undefined) {

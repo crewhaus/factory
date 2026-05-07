@@ -43,7 +43,10 @@ async function* rowsToSamples(
       const cell = row[i] ?? "";
       // expected_tools is the only array-shaped field — comma-split
       if (key === "expected_tools" && cell !== "") {
-        obj[key] = cell.split(",").map((s) => s.trim()).filter((s) => s.length > 0);
+        obj[key] = cell
+          .split(",")
+          .map((s) => s.trim())
+          .filter((s) => s.length > 0);
       } else if (cell !== "") {
         obj[key] = cell;
       }

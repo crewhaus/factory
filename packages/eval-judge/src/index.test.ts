@@ -2,8 +2,8 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Sample } from "@crewhaus/eval-dataset";
-import { buildJudgePrompt, createJudgeGrader, judge, JudgeError, loadRubric } from "./index";
 import { makeNaiveStubClient } from "./__test__/stub-client";
+import { JudgeError, buildJudgePrompt, createJudgeGrader, judge, loadRubric } from "./index";
 
 const RUBRIC_YAML = `
 criteria:
@@ -69,8 +69,18 @@ describe("buildJudgePrompt (T1)", () => {
 
   test("two calls produce different sentinels", () => {
     const rubric = loadRubric(RUBRIC_YAML);
-    const p1 = buildJudgePrompt({ rubric, input: "a", expectedOutput: undefined, agentOutput: "x" });
-    const p2 = buildJudgePrompt({ rubric, input: "a", expectedOutput: undefined, agentOutput: "x" });
+    const p1 = buildJudgePrompt({
+      rubric,
+      input: "a",
+      expectedOutput: undefined,
+      agentOutput: "x",
+    });
+    const p2 = buildJudgePrompt({
+      rubric,
+      input: "a",
+      expectedOutput: undefined,
+      agentOutput: "x",
+    });
     expect(p1.sentinel).not.toBe(p2.sentinel);
   });
 
@@ -127,7 +137,10 @@ describe("judge with stub client (T1)", () => {
     const client = {
       messages: {
         async create() {
-          return { content: [{ type: "text" as const, text: "I refuse" }], stop_reason: "end_turn" };
+          return {
+            content: [{ type: "text" as const, text: "I refuse" }],
+            stop_reason: "end_turn",
+          };
         },
       },
     };

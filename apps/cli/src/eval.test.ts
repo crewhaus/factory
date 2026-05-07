@@ -62,10 +62,7 @@ describe("crewhaus eval CLI integration (T3)", () => {
         '{"id":"q2","input":"yo","expected_output":"yo"}',
       ].join("\n"),
     );
-    writeFileSync(
-      graders,
-      "graders:\n  - name: math\n    type: contains\n    substring: 'q'\n",
-    );
+    writeFileSync(graders, "graders:\n  - name: math\n    type: contains\n    substring: 'q'\n");
 
     // We can't easily inject a stub into the CLI subprocess without
     // adding a new flag, so we test the orchestration via a grader that

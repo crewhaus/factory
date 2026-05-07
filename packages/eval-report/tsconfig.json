@@ -5,8 +5,5 @@
     "outDir": "dist"
   },
   "include": ["src/**/*"],
-  "references": [
-    { "path": "../errors" },
-    { "path": "../eval-runner" }
-  ]
+  "references": [{ "path": "../errors" }, { "path": "../eval-runner" }]
 }

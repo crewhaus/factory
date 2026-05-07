@@ -58,10 +58,11 @@ export function buildJudgePrompt({
   const rubricText = rubric.criteria
     .map(
       (c) =>
-        `Criterion: ${c.name}\n  Description: ${c.description}\n  Anchors:\n` +
-        Object.entries(c.anchors)
+        `Criterion: ${c.name}\n  Description: ${c.description}\n  Anchors:\n${Object.entries(
+          c.anchors,
+        )
           .map(([k, v]) => `    ${k}: ${v}`)
-          .join("\n"),
+          .join("\n")}`,
     )
     .join("\n\n");
 

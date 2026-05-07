@@ -3,13 +3,13 @@ import { join } from "node:path";
 import type { Sample } from "@crewhaus/eval-dataset";
 import {
   type CompiledGrader,
-  combineCompiledGraders,
-  type Grader,
   type GradeResult,
+  type Grader,
   type RunResult,
   type ToolCall,
+  combineCompiledGraders,
 } from "@crewhaus/eval-grader";
-import { openEventLog, type Event as TranscriptEvent } from "@crewhaus/event-log";
+import { type Event as TranscriptEvent, openEventLog } from "@crewhaus/event-log";
 import { createRunContext } from "@crewhaus/run-context";
 import type { ModelResponseEvent, TraceEvent } from "@crewhaus/trace-event-bus";
 import { RunnerError } from "./errors";
@@ -127,7 +127,8 @@ export async function runSample(args: {
   // Overall = AND of all graders, score = mean.
   const overall: GradeResult = {
     passed: error === undefined && perGrader.every((g) => g.passed),
-    score: perGrader.length === 0 ? 0 : perGrader.reduce((s, g) => s + g.score, 0) / perGrader.length,
+    score:
+      perGrader.length === 0 ? 0 : perGrader.reduce((s, g) => s + g.score, 0) / perGrader.length,
     rationale:
       error !== undefined
         ? `agent invocation error: ${error}`

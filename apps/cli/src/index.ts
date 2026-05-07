@@ -555,7 +555,8 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
   const concurrencyFlag = args.flags["concurrency"];
   const seedFlag = args.flags["seed"];
   const judgeModelFlag = args.flags["judge-model"];
-  const concurrency = typeof concurrencyFlag === "string" ? Number.parseInt(concurrencyFlag, 10) : undefined;
+  const concurrency =
+    typeof concurrencyFlag === "string" ? Number.parseInt(concurrencyFlag, 10) : undefined;
   const seed = typeof seedFlag === "string" ? Number.parseInt(seedFlag, 10) : undefined;
   if (concurrency !== undefined && (Number.isNaN(concurrency) || concurrency < 1)) {
     die(`invalid --concurrency "${concurrencyFlag}" — must be positive integer`);

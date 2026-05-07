@@ -40,7 +40,10 @@ describe("exactMatch (T1)", () => {
   });
 
   test("respects caseInsensitive", async () => {
-    const r = await exactMatch({ caseInsensitive: true })(sample, { ...baseRun, agentOutput: "HELLO" });
+    const r = await exactMatch({ caseInsensitive: true })(sample, {
+      ...baseRun,
+      agentOutput: "HELLO",
+    });
     expect(r.passed).toBe(true);
   });
 
@@ -93,7 +96,7 @@ describe("jsonPath + evalJsonPath (T1)", () => {
     expect(evalJsonPath(obj, "$.user.roles[0]")).toEqual(["admin"]);
     expect(evalJsonPath(obj, "$.user.roles[*]")).toEqual(["admin", "viewer"]);
     expect(evalJsonPath(obj, "$..name")).toEqual(["alice"]);
-    expect(evalJsonPath(obj, "$.user[\"name\"]")).toEqual(["alice"]);
+    expect(evalJsonPath(obj, '$.user["name"]')).toEqual(["alice"]);
   });
 
   test("rejects unsupported expression", () => {

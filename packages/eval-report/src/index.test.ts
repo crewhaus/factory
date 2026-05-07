@@ -1,9 +1,9 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { EvalRunSummary, SampleResult } from "@crewhaus/eval-runner";
-import { diffReports, loadRun, renderReport, ReportError } from "./index";
+import { ReportError, diffReports, loadRun, renderReport } from "./index";
 
 const TMP_ROOTS: string[] = [];
 function newTempRoot(): string {

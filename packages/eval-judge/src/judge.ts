@@ -1,6 +1,6 @@
 import type Anthropic from "@anthropic-ai/sdk";
 import type { Sample } from "@crewhaus/eval-dataset";
-import type { Grader, GradeResult, RunResult } from "@crewhaus/eval-grader";
+import type { GradeResult, Grader, RunResult } from "@crewhaus/eval-grader";
 import { createLogger } from "@crewhaus/logging";
 import { createAnthropicClient, resolveAuth } from "@crewhaus/runtime-core";
 import { z } from "zod";
@@ -86,7 +86,7 @@ export async function judge(opts: JudgeOptions): Promise<JudgeResult> {
   // see runtime-core line 524 for the canonical pattern. Without it, OAuth
   // tokens are rejected by the API as not-Claude-Code traffic.
   const systemBlocks = isOAuth
-    ? "You are Claude Code, Anthropic's official CLI for Claude.\n\n" + system
+    ? `You are Claude Code, Anthropic's official CLI for Claude.\n\n${system}`
     : system;
 
   const response = await client.messages.create({
@@ -141,7 +141,10 @@ export async function judge(opts: JudgeOptions): Promise<JudgeResult> {
  * Wrap a `judge` call in a `Grader`. Maps 1–5 → 0..1 via (n-1)/4 and uses
  * the rubric's `passing_score` as the gate.
  */
-export function createJudgeGrader(rubric: Rubric, opts: { client?: JudgeClient; model?: string } = {}): Grader {
+export function createJudgeGrader(
+  rubric: Rubric,
+  opts: { client?: JudgeClient; model?: string } = {},
+): Grader {
   return async (sample: Sample, run: RunResult): Promise<GradeResult> => {
     const result = await judge({
       rubric,

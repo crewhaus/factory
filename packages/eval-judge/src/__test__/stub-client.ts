@@ -10,7 +10,10 @@ import type { JudgeClient } from "../judge";
  * (and that sentinels surround them).
  */
 export function makeNaiveStubClient(
-  scorer: (userText: string, systemText: string) => {
+  scorer: (
+    userText: string,
+    systemText: string,
+  ) => {
     score: 1 | 2 | 3 | 4 | 5;
     rationale: string;
     criterion_scores: Record<string, number>;

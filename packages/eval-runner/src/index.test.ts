@@ -13,7 +13,7 @@ function narrowToAgent(ir: IrNode): IrV0 {
   return ir;
 }
 import { aggregate, quantile } from "./aggregate";
-import { runEval, type AgentInvoker } from "./index";
+import { type AgentInvoker, runEval } from "./index";
 import { Semaphore } from "./semaphore";
 
 const TMP_ROOTS: string[] = [];
@@ -235,16 +235,10 @@ describe("runEval — T7 200-sample concurrency-8 SLO", () => {
   }, 90_000);
 });
 
-function mockSample(
-  id: string,
-  passed: boolean,
-  score: number,
-  latencyMs: number,
-  turns: number,
-) {
+function mockSample(id: string, passed: boolean, score: number, latencyMs: number, turns: number) {
   return {
     sampleId: id,
-    sessionId: "sess_" + id.padEnd(16, "0"),
+    sessionId: `sess_${id.padEnd(16, "0")}`,
     startedAt: "2026-01-01T00:00:00Z",
     endedAt: "2026-01-01T00:00:01Z",
     latencyMs,

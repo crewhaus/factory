@@ -24,19 +24,22 @@
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import type { Sample } from "@crewhaus/eval-dataset";
-import type { IrV0 } from "@crewhaus/ir";
-import {
-  type CompiledGrader,
-  type Grader,
-} from "@crewhaus/eval-grader";
+import type { CompiledGrader, Grader } from "@crewhaus/eval-grader";
 import { createJudgeGrader, loadRubric } from "@crewhaus/eval-judge";
+import type { IrV0 } from "@crewhaus/ir";
 import { runChatLoop } from "@crewhaus/runtime-core";
 import { aggregate } from "./aggregate";
 import { RunnerError } from "./errors";
 import { runSample } from "./run-sample";
 import { Semaphore } from "./semaphore";
-import type { AgentInvoker, EvalRunSummary, GraderEntry, RunEvalOptions, SampleResult } from "./types";
-import { wireRunOnce, type SharedAgentDeps } from "./wire-once";
+import type {
+  AgentInvoker,
+  EvalRunSummary,
+  GraderEntry,
+  RunEvalOptions,
+  SampleResult,
+} from "./types";
+import { type SharedAgentDeps, wireRunOnce } from "./wire-once";
 
 export type { AgentInvoker, EvalRunSummary, GraderEntry, RunEvalOptions, SampleResult };
 export type { SharedAgentDeps };
@@ -195,7 +198,10 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
 }
 
 async function defaultInvoker(ir: IrV0, opts: RunEvalOptions): Promise<AgentInvoker> {
-  const wired: SharedAgentDeps = await wireRunOnce(ir, opts.cwd !== undefined ? { cwd: opts.cwd } : {});
+  const wired: SharedAgentDeps = await wireRunOnce(
+    ir,
+    opts.cwd !== undefined ? { cwd: opts.cwd } : {},
+  );
   return async (req) => {
     const agentOutput = await runChatLoop({
       model: wired.model,

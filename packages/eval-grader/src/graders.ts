@@ -1,7 +1,7 @@
 import type { z } from "zod";
 import { GraderError } from "./errors";
 import { evalJsonPath } from "./json-path";
-import type { Grader, GradeResult } from "./types";
+import type { GradeResult, Grader } from "./types";
 
 const PASS: GradeResult = { passed: true, score: 1, rationale: "" };
 
@@ -171,7 +171,9 @@ export function toolCallSequence(opts: ToolCallSequenceOptions): Grader {
 
 // -------- composers --------
 
-export function all(graders: ReadonlyArray<{ name?: string; grader: Grader }> | ReadonlyArray<Grader>): Grader {
+export function all(
+  graders: ReadonlyArray<{ name?: string; grader: Grader }> | ReadonlyArray<Grader>,
+): Grader {
   const list = normalizeList(graders);
   return async (sample, run) => {
     const results: GradeResult[] = [];
@@ -188,7 +190,9 @@ export function all(graders: ReadonlyArray<{ name?: string; grader: Grader }> | 
   };
 }
 
-export function any(graders: ReadonlyArray<{ name?: string; grader: Grader }> | ReadonlyArray<Grader>): Grader {
+export function any(
+  graders: ReadonlyArray<{ name?: string; grader: Grader }> | ReadonlyArray<Grader>,
+): Grader {
   const list = normalizeList(graders);
   return async (sample, run) => {
     const results: GradeResult[] = [];
@@ -205,7 +209,11 @@ export function any(graders: ReadonlyArray<{ name?: string; grader: Grader }> | 
   };
 }
 
-export type WeightedEntry = { readonly name?: string; readonly grader: Grader; readonly weight: number };
+export type WeightedEntry = {
+  readonly name?: string;
+  readonly grader: Grader;
+  readonly weight: number;
+};
 
 export function weighted(entries: ReadonlyArray<WeightedEntry>, threshold = 0.5): Grader {
   if (entries.length === 0) {
@@ -218,7 +226,8 @@ export function weighted(entries: ReadonlyArray<WeightedEntry>, threshold = 0.5)
   return async (sample, run) => {
     const results: GradeResult[] = [];
     for (const e of entries) results.push(await e.grader(sample, run));
-    const score = results.reduce((acc, r, i) => acc + r.score * (entries[i]?.weight ?? 0), 0) / totalWeight;
+    const score =
+      results.reduce((acc, r, i) => acc + r.score * (entries[i]?.weight ?? 0), 0) / totalWeight;
     const passed = score >= threshold;
     return {
       passed,
@@ -276,4 +285,4 @@ function deepEqual(a: unknown, b: unknown): boolean {
 }
 
 // Re-export so combine helper users can use the `pass` shape if they want.
-export { type GradeResult } from "./types";
+export type { GradeResult } from "./types";

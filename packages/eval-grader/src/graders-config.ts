@@ -146,7 +146,9 @@ function compile(spec: GraderSpec): CompiledGrader {
         name: spec.name,
         grader: exactMatch({
           ...(spec.trim !== undefined ? { trim: spec.trim } : {}),
-          ...(spec.case_insensitive !== undefined ? { caseInsensitive: spec.case_insensitive } : {}),
+          ...(spec.case_insensitive !== undefined
+            ? { caseInsensitive: spec.case_insensitive }
+            : {}),
         }),
         weight: 1,
       };
@@ -155,7 +157,9 @@ function compile(spec: GraderSpec): CompiledGrader {
         name: spec.name,
         grader: contains({
           substring: spec.substring,
-          ...(spec.case_insensitive !== undefined ? { caseInsensitive: spec.case_insensitive } : {}),
+          ...(spec.case_insensitive !== undefined
+            ? { caseInsensitive: spec.case_insensitive }
+            : {}),
         }),
         weight: 1,
       };

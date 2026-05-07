@@ -90,7 +90,10 @@ async function* parseCsvText(text: string, source: string): AsyncIterable<Sample
       if (key === undefined) continue;
       const cell = row[i] ?? "";
       if (key === "expected_tools" && cell !== "") {
-        obj[key] = cell.split(",").map((s) => s.trim()).filter((s) => s.length > 0);
+        obj[key] = cell
+          .split(",")
+          .map((s) => s.trim())
+          .filter((s) => s.length > 0);
       } else if (cell !== "") {
         obj[key] = cell;
       }

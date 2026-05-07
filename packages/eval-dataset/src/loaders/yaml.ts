@@ -32,10 +32,7 @@ export async function loadYaml(path: string): Promise<LoadedDataset> {
   return { name: dataset.name, samples: yieldSamples(dataset.samples, path) };
 }
 
-async function* yieldSamples(
-  samples: ReadonlyArray<unknown>,
-  path: string,
-): AsyncIterable<Sample> {
+async function* yieldSamples(samples: ReadonlyArray<unknown>, path: string): AsyncIterable<Sample> {
   let i = 0;
   for (const raw of samples) {
     const result = SampleSchema.safeParse(raw);
