@@ -6,7 +6,10 @@ describe("createRunContext defaults", () => {
   test("generates run/session ids with expected prefixes", () => {
     const ctx = createRunContext();
     expect(ctx.runId).toMatch(/^run_[0-9a-f]{8}$/);
-    expect(ctx.sessionId).toMatch(/^sess_[0-9a-f]{8}$/);
+    // session-store path-traversal guard requires sess_<16 hex>; the
+    // default factory matches that format so runtime-core can hand the
+    // id straight to sessionStore.create({ id }).
+    expect(ctx.sessionId).toMatch(/^sess_[0-9a-f]{16}$/);
   });
 
   test("starts turnNumber at 0", () => {

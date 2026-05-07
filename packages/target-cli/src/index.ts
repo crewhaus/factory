@@ -187,7 +187,9 @@ function renderAgent(ir: IrV0): string {
   const mcpBoot = mcp.hasAny ? `${mcp.bootBlock}\n\n` : "";
   const runChatLoopCall = `await runChatLoop({
   model: ${escapeJsonString(ir.agent.model)},
-  instructions: ${escapeJsonString(ir.agent.instructions)},${toolsField}${permField}
+  instructions: ${escapeJsonString(ir.agent.instructions)},
+  sessionName: ${escapeJsonString(ir.name)},
+  sessionTarget: "cli",${toolsField}${permField}
 });`;
   const wrapped = mcp.hasAny
     ? `try {

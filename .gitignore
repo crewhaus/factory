@@ -147,3 +147,6 @@ vite.config.ts.timestamp-*
 
 # reference repos (cloned upstream harnesses for browsing only)
 reference-repos/
+
+# crewhaus runtime artifacts (sessions, transcripts, persisted tool results)
+.crewhaus/

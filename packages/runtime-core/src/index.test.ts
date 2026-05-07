@@ -1,11 +1,26 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import type Anthropic from "@anthropic-ai/sdk";
 import { createLogger } from "@crewhaus/logging";
 import { createRunContext } from "@crewhaus/run-context";
 import { buildTool } from "@crewhaus/tool-builder";
 import { z } from "zod";
-import { resolveAuth, runChatLoop } from "./index";
+import { replayMessageHistory, resolveAuth, runChatLoop } from "./index";
+
+// Route session-store/event-log writes to a per-file tmpdir so tests do
+// not pollute `.crewhaus/sessions/` in the repo. runtime-core honours
+// CREWHAUS_SESSION_DIR when no explicit `sessionRootDir` is supplied.
+const SHARED_SESSION_ROOT = mkdtempSync(join(tmpdir(), "crewhaus-runtime-core-tests-"));
+beforeAll(() => {
+  process.env["CREWHAUS_SESSION_DIR"] = SHARED_SESSION_ROOT;
+});
+afterAll(() => {
+  process.env["CREWHAUS_SESSION_DIR"] = undefined;
+  rmSync(SHARED_SESSION_ROOT, { recursive: true, force: true });
+});
 
 describe("resolveAuth", () => {
   test("returns mode=none when neither var is set", () => {
@@ -979,5 +994,185 @@ describe("runChatLoop — Section 8 streaming flag", () => {
     expect(userMsg).toBeDefined();
     const trBlocks = (userMsg?.content as Anthropic.ToolResultBlockParam[]) ?? [];
     expect(trBlocks.map((b) => b.tool_use_id).sort()).toEqual(["tu_1", "tu_2"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Section 10 — runChatLoop --resume + persistence integration
+// ---------------------------------------------------------------------------
+
+describe("runChatLoop — Section 10 persistence", () => {
+  test("session JSON is persisted with lastTurnIndex on REPL exit", async () => {
+    const ctx = createRunContext();
+    const { client } = makeScriptedClient([
+      [{ type: "text", text: "ack", citations: null } as Anthropic.TextBlock],
+    ]);
+    const input = new PassThrough();
+    input.write("hello\n");
+    input.end();
+
+    await runChatLoop({
+      model: "test-model",
+      instructions: "test",
+      client,
+      input,
+      runContext: ctx,
+      sessionName: "spec-name",
+      sessionTarget: "cli",
+    });
+
+    // Session metadata file exists with the expected shape and the
+    // turnNumber the loop incremented.
+    const file = join(SHARED_SESSION_ROOT, `${ctx.sessionId}.json`);
+    const { readFile } = await import("node:fs/promises");
+    const json = JSON.parse(await readFile(file, "utf8"));
+    expect(json.id).toBe(ctx.sessionId);
+    expect(json.name).toBe("spec-name");
+    expect(json.target).toBe("cli");
+    expect(json.model).toBe("test-model");
+    expect(json.lastTurnIndex).toBe(ctx.turnNumber);
+    expect(json.lastTurnIndex).toBeGreaterThanOrEqual(1);
+  });
+
+  test("T4 replay: replayMessageHistory rebuilds an identical history from the JSONL", async () => {
+    // Hand-craft a 4-message transcript via direct event-log appends so
+    // the replay algorithm is exercised in isolation. tool_use /
+    // tool_result events are interleaved as audit-only and must NOT
+    // contribute to the reconstructed message history.
+    const sessionId = "sess_aaaaaaaaaaaaaaaa";
+    const { openEventLog } = await import("@crewhaus/event-log");
+    const log = await openEventLog(sessionId, { rootDir: SHARED_SESSION_ROOT });
+    await log.append({ kind: "user_message", payload: { content: "ping 1" } });
+    await log.append({
+      kind: "assistant_message",
+      payload: { content: [{ type: "text", text: "pong 1", citations: null }] },
+    });
+    await log.append({ kind: "tool_use", payload: { id: "tu_1", name: "noop", input: {} } });
+    await log.append({
+      kind: "tool_result",
+      payload: { toolUseId: "tu_1", content: "ok", isError: false },
+    });
+    await log.append({ kind: "user_message", payload: { content: "ping 2" } });
+    await log.append({
+      kind: "assistant_message",
+      payload: { content: [{ type: "text", text: "pong 2", citations: null }] },
+    });
+    await log.append({ kind: "error", payload: { name: "Whatever", message: "transient" } });
+    await log.close();
+
+    const reopened = await openEventLog(sessionId, { rootDir: SHARED_SESSION_ROOT });
+    const replayed = await replayMessageHistory(reopened);
+    await reopened.close();
+
+    expect(replayed.length).toBe(4);
+    expect(replayed[0]).toEqual({ role: "user", content: "ping 1" });
+    expect(replayed[1]?.role).toBe("assistant");
+    expect((replayed[1]?.content as Anthropic.ContentBlock[])[0]?.type).toBe("text");
+    expect(replayed[2]).toEqual({ role: "user", content: "ping 2" });
+    expect(replayed[3]?.role).toBe("assistant");
+  });
+
+  test("--resume threads the prior transcript into the next model call", async () => {
+    // Run A: one user→assistant turn, persisted to its session file.
+    const ctxA = createRunContext();
+    const recorded = makeScriptedClient([
+      [{ type: "text", text: "answer-1", citations: null } as Anthropic.TextBlock],
+    ]);
+    const inputA = new PassThrough();
+    inputA.write("first message\n");
+    inputA.end();
+    await runChatLoop({
+      model: "test-model",
+      instructions: "test",
+      client: recorded.client,
+      input: inputA,
+      runContext: ctxA,
+    });
+
+    // Run B: resume the same session, send one more user message. The
+    // model's first call must see [user1, assistant1, user2] — proving
+    // event-log replay reconstructed history and the runtime threaded
+    // it into messages BEFORE pushing the new user input.
+    const sessionId = ctxA.sessionId;
+    const resumed = makeScriptedClient([
+      [{ type: "text", text: "answer-2", citations: null } as Anthropic.TextBlock],
+    ]);
+    const ctxB = createRunContext({ sessionId });
+    const inputB = new PassThrough();
+    inputB.write("second message\n");
+    inputB.end();
+    await runChatLoop({
+      model: "test-model",
+      instructions: "test",
+      client: resumed.client,
+      input: inputB,
+      runContext: ctxB,
+      resume: { sessionId },
+    });
+
+    const firstCall = resumed.capturedMessages()[0] ?? [];
+    expect(firstCall.length).toBe(3);
+    expect(firstCall[0]?.role).toBe("user");
+    expect(firstCall[0]?.content).toBe("first message");
+    expect(firstCall[1]?.role).toBe("assistant");
+    expect(firstCall[2]?.role).toBe("user");
+    expect(firstCall[2]?.content).toBe("second message");
+  });
+
+  test("--resume on a missing session throws RuntimeError", async () => {
+    const { client } = makeScriptedClient([]);
+    const input = new PassThrough();
+    input.end();
+    await expect(
+      runChatLoop({
+        model: "test-model",
+        instructions: "test",
+        client,
+        input,
+        resume: { sessionId: "sess_0000000000000000" },
+      }),
+    ).rejects.toThrow(/cannot --resume/);
+  });
+
+  test("rejects resume + seedMessages combo as mutually exclusive", async () => {
+    const { client } = makeScriptedClient([]);
+    await expect(
+      runChatLoop({
+        model: "test-model",
+        instructions: "test",
+        client,
+        input: new PassThrough(),
+        resume: { sessionId: "sess_0000000000000000" },
+        seedMessages: [{ role: "user", content: "hi" }],
+      }),
+    ).rejects.toThrow(/mutually exclusive/);
+  });
+
+  test("event log captures user_message + assistant_message events", async () => {
+    const ctx = createRunContext();
+    const { client } = makeScriptedClient([
+      [{ type: "text", text: "thanks", citations: null } as Anthropic.TextBlock],
+    ]);
+    const input = new PassThrough();
+    input.write("ping\n");
+    input.end();
+    await runChatLoop({
+      model: "test-model",
+      instructions: "test",
+      client,
+      input,
+      runContext: ctx,
+    });
+
+    const { openEventLog } = await import("@crewhaus/event-log");
+    const log = await openEventLog(ctx.sessionId, { rootDir: SHARED_SESSION_ROOT });
+    const all: Array<{ kind: string; payload: unknown }> = [];
+    for await (const ev of log.read()) all.push({ kind: ev.kind, payload: ev.payload });
+    await log.close();
+
+    const kinds = all.map((e) => e.kind);
+    expect(kinds).toContain("user_message");
+    expect(kinds).toContain("assistant_message");
+    expect(kinds.indexOf("user_message")).toBeLessThan(kinds.indexOf("assistant_message"));
   });
 });
