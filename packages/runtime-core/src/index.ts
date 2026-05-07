@@ -565,7 +565,10 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     ): Promise<Anthropic.ToolResultBlockParam> => {
       await logEvent("tool_result", {
         toolUseId: tu.id,
-        content: typeof result.content === "string" ? result.content : "[non-string content]",
+        content:
+          typeof result.content === "string"
+            ? result.content
+            : summariseNonStringContent(result.content),
         isError: result.is_error === true,
       });
       // Section 11 — fire post-tool after the result is captured. Decision
@@ -675,9 +678,45 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     return finish({
       type: "tool_result",
       tool_use_id: tu.id,
-      content: stored.previewContent,
+      // Section 14 — pass non-string content (image content arrays) through
+      // verbatim so the model sees the image. Anthropic's ToolResultBlockParam
+      // already accepts string | Array<TextBlockParam | ImageBlockParam>.
+      content:
+        typeof stored.previewContent === "string"
+          ? stored.previewContent
+          : (stored.previewContent as ReadonlyArray<
+              Anthropic.TextBlockParam | Anthropic.ImageBlockParam
+            > as Anthropic.ToolResultBlockParam["content"]),
       is_error: raw.isError,
     });
+  }
+
+  /**
+   * Section 14 — short summary used in the audit-log payload when a tool
+   * returns a non-string content array (e.g. ReadImage's image block). The
+   * full content still reaches the model via tool_result.content above; the
+   * audit log just gets a length-aware tag.
+   */
+  function summariseNonStringContent(
+    content: ReadonlyArray<Anthropic.TextBlockParam | Anthropic.ImageBlockParam> | undefined,
+  ): string {
+    if (content === undefined) return "[no content]";
+    let images = 0;
+    let texts = 0;
+    let totalChars = 0;
+    for (const block of content) {
+      if (block.type === "image") {
+        images++;
+        if (block.source.type === "base64") totalChars += block.source.data.length;
+      } else if (block.type === "text") {
+        texts++;
+        totalChars += block.text.length;
+      }
+    }
+    const parts: string[] = [];
+    if (images > 0) parts.push(`${images} image block${images > 1 ? "s" : ""}`);
+    if (texts > 0) parts.push(`${texts} text block${texts > 1 ? "s" : ""}`);
+    return `[${parts.join(", ")}, ${totalChars} chars]`;
   }
 
   /**

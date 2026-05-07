@@ -85,6 +85,15 @@ const subAgentDefinitionSchema = z
 
 const subAgentsBlock = z.record(z.string().min(1), subAgentDefinitionSchema).optional();
 
+/**
+ * Section 14 — per-tool runtime config map. Tool-specific schemas live
+ * inside each tool package; the spec layer treats every value as opaque
+ * `unknown` and forwards it verbatim to the IR. The codegen layer emits
+ * an init call (e.g. `registerFetchConfig({ ... })`) for tools whose
+ * BUILTIN_TOOL_MAP entry declares an `initSymbol`.
+ */
+const toolConfigBlock = z.record(z.string().min(1), z.unknown()).optional();
+
 const cliSchema = z
   .object({
     name: z.string().min(1),
@@ -97,6 +106,7 @@ const cliSchema = z
       })
       .strict(),
     tools: z.array(z.string().min(1)).optional(),
+    tool_config: toolConfigBlock,
     mcp_servers: mcpServersBlock,
     permissions: permissionsBlock,
   })
@@ -108,6 +118,7 @@ const workflowStepSchema = z
     instructions: z.string().min(1),
     model: z.string().min(1).optional(),
     tools: z.array(z.string().min(1)).optional(),
+    tool_config: toolConfigBlock,
   })
   .strict();
 
@@ -154,6 +165,7 @@ const channelAgentSchema = z
     model: z.string().min(1),
     instructions: z.string().min(1),
     tools: z.array(z.string().min(1)).optional(),
+    tool_config: toolConfigBlock,
     sub_agents: subAgentsBlock,
   })
   .strict();

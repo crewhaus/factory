@@ -187,12 +187,22 @@ export async function executeStreaming(
             content: `unknown tool "${entry.block.name}"`,
             is_error: true,
           })
-        : executeTool(entry.tool, entry.block.input, { toolUseId: entry.block.id }).then((res) => ({
-            type: "tool_result",
-            tool_use_id: entry.block.id,
-            content: res.content,
-            is_error: res.isError,
-          }));
+        : executeTool(entry.tool, entry.block.input, { toolUseId: entry.block.id }).then(
+            (res): Anthropic.ToolResultBlockParam => ({
+              type: "tool_result",
+              tool_use_id: entry.block.id,
+              // Section 14 — tool content may be string or an Anthropic
+              // image content array; cast the readonly variant we model in
+              // tool-catalog to the SDK's mutable array type for the API.
+              content:
+                typeof res.content === "string"
+                  ? res.content
+                  : (res.content as ReadonlyArray<
+                      Anthropic.TextBlockParam | Anthropic.ImageBlockParam
+                    > as Anthropic.ToolResultBlockParam["content"]),
+              is_error: res.isError,
+            }),
+          );
     const promise = dispatchPromise
       .then((res) => {
         entry.status = "done";

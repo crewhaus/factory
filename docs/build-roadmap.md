@@ -1,6 +1,6 @@
 # CrewHaus Factory — Build Roadmap
 
-> Status as of 2026-05-07. 50 of ~190 catalog modules implemented; Sections 1–13 complete. Sections 14–17 below cover an expanded tool catalog (web/image/fetch), observability, the eval stack, and multi-provider model adapters.
+> Status as of 2026-05-07. 53 of ~190 catalog modules implemented; Sections 1–14 complete. Sections 15–17 below cover observability, the eval stack, and multi-provider model adapters.
 > See `docs/MODULE-CATALOG.md` for full per-module specs and test layer references.
 
 ---
@@ -16,7 +16,7 @@ What the current stack can now do, end-to-end:
 What is *not* yet covered (and frames the next sections):
 
 - **Delegation.** Section 13 landed sub-agents — every shipped target now has a `Task(description, prompt, subagent_type?)` tool that spawns a child agent in an isolated `RunContext` (own runId/sessionId/event-log/state-store), with parent→child permission scoping (`inherit | scoped | replace`), bypass non-propagation, and SIGINT cascade. Specs declare sub-agents inline under `agent.sub_agents` (CLI + channel targets); the filesystem fallback at `.crewhaus/sub-agents/<name>.md` ships too.
-- **Tool surface.** The catalog covers fs/bash/todo and the channel cross-poster; no web access, no image inputs, no generic HTTP. Section 14 fills the gap with three independent packages built in parallel.
+- **Tool surface.** *(Section 14 closed this gap.)* `tool-web` (`WebFetch` + `WebSearch`), `tool-image` (`ReadImage` returning Anthropic image content blocks), and `tool-fetch` (generic HTTP with fail-closed allow-list and SSRF defense) are landed. Spec layer gained an additive `tool_config` block plumbed through IR + codegen + the runner.
 - **Observability.** The runtime emits structured logs but no trace events. Nothing exports to OpenTelemetry, nothing collects metrics, and the eval stack has no event bus to ingest. Section 15 introduces the trace bus + exporters; Section 16 builds the eval stack on top of it.
 - **Provider lock-in.** `model-adapter` calls Anthropic directly. The spec accepts any model string but the runtime only resolves Claude. Section 17 generalizes the adapter shape and adds OpenAI/Gemini/Bedrock/local support behind a `model-router`.
 
@@ -596,44 +596,41 @@ Spec / IR / target additions are sequential after `tool-task` is stable, since t
 
 ## Section 14 — Tool catalog expansion: web, image, fetch
 
-> Status: 🚧 next up. Three independent tool packages — fully parallel with each other and with Sections 13/15.
+> Status: ✅ landed. Three independent tool packages plus two strictly-additive cross-cutting changes. End-to-end smoke test (`bun run smoke:section-14`) drives 6 probes against the live model and passes.
 
 **Catalog modules:** `tool-web` (R4), `tool-image` (R4), `tool-fetch` (R4)
 
-The current built-in catalog covers local-machine work (fs, bash, todo) plus cross-channel messaging. Real assistants need internet access, image inputs, and generic HTTP. Each of these three packages is independent — none depends on the others, all depend only on the tool framework from Section 1 — so they can be built fully in parallel.
+**Cross-cutting changes (forced by smoke-test scope):**
+- **A. Image content-block return path** — widened `RegisteredTool.execute` return type from `Promise<string>` to `Promise<string \| ToolResultContent>` (text + base64 image blocks). Touches `tool-catalog`, `tool-builder`, `tool-executor`, `runtime-core`, `tool-result-store`. Strictly additive: every existing string-returning tool unchanged.
+- **B. Per-tool spec config** — added an additive `tool_config: Record<string, unknown>` field to spec/IR (cli + workflow + channel agent blocks); `target-cli` / `target-channel-bot` / `apps/cli/src/index.ts:loadToolMap` emit / call per-tool init functions when an `initSymbol` is declared in `BUILTIN_TOOL_MAP`. Today: `webFetch → registerWebFetchConfig`, `fetch → registerFetchConfig`.
 
-### Build order within this section
+**Deferred:**
+- 20-images-per-turn cap on `ReadImage`. Needs `RunContext.turnMetrics` exposed via `ToolExecuteContext`. Plausible Section 14.5 or rolled into Section 15 (observability) since per-turn metrics overlap.
+- Anthropic server-side `web_search` path. Lands when Section 17 introduces `model.features.web_search`. Until then, `WebSearch` requires `CREWHAUS_SEARCH_PROVIDER` + `CREWHAUS_SEARCH_API_KEY` env.
 
-```
-tool-web      (parallel)
-tool-image    (parallel)
-tool-fetch    (parallel)
-```
+### What landed
 
-### What to build
+**`packages/tool-web`** (`@crewhaus/tool-web`):
+- `WebFetch(url, prompt?)`: scheme check (http/https only), optional allow-list via `getWebFetchConfig().allowedDomains` (registered from `tools.WebFetch.allowed_domains`), 30 s timeout, ≤5 manual redirects, 5 MB body cap, cheerio + turndown HTML → markdown. The optional `prompt` is prepended to the body (no recursive model call inside the tool — that fights the runtime loop).
+- `WebSearch(query, allowed_domains?, blocked_domains?)`: provider dispatch via env (Brave or Tavily); normalised `{title, url, snippet}[]` rendered as a numbered list. Clean refusal when env unset.
+- `registerWebFetchConfig(...)` / `getWebFetchConfig()` — module-level config registry.
 
-**`packages/tool-web`**
-- `WebFetch(url, prompt?)`: fetch URL, parse HTML via `cheerio`, convert to markdown via `turndown`, optionally summarize via the model using `prompt`
-- `WebSearch(query, allowed_domains?, blocked_domains?)`: thin wrapper around Anthropic's server-side `web_search` tool when `model.features.web_search` is true; otherwise dispatches to a configurable provider (Brave, Tavily) via env (`CREWHAUS_SEARCH_PROVIDER`, `CREWHAUS_SEARCH_API_KEY`)
-- Defenses: 30s timeout, 5 MB content cap, follow up to 5 redirects, refuse non-http(s) schemes, optional URL allow-list via spec `tools.WebFetch.allowed_domains`
-- References: `claude-code/tools/WebFetchTool`, `claude-code/tools/WebSearchTool`
+**`packages/tool-image`** (`@crewhaus/tool-image`):
+- `ReadImage(path)`: traversal defense mirroring `tool-fs`, magic-byte sniff (PNG/JPEG/GIF/WebP, content-type spoof rejected), 5 MB cap. Returns the new `ToolResultContent` shape — a single image block — which `runtime-core` forwards verbatim into `tool_result.content` so the model actually receives the image.
 
-**`packages/tool-image`**
-- `ReadImage(path)`: reads an image from disk (path must resolve under `process.cwd()`, same defense as `tool-fs`), validates content-type via magic bytes (PNG/JPG/GIF/WebP), returns an Anthropic `image` content block (base64-encoded)
-- Limits: ≤5 MB per image, ≤20 images per turn (rejects further calls in the same turn with a clean error)
-- References: `claude-code/tools/ReadTool` image branch
-
-**`packages/tool-fetch`**
-- `Fetch(url, method?: "GET" | "POST" | "PUT" | "DELETE", body?, headers?)` — generic HTTP for API integrations
-- **Fail-closed allow-list**: empty list = deny all. Spec config: `tools.Fetch.allowed_origins: ["https://api.example.com"]`. Origins matched as exact scheme+host+port.
-- Strips `Cookie` and `Authorization` headers from responses before returning to the model (prevents accidental credential leaks back into the conversation)
-- References: `openclaw/agents/http-tool.ts`
+**`packages/tool-fetch`** (`@crewhaus/tool-fetch`):
+- `Fetch(url, method?, body?, headers?)` — generic HTTP. Fail-closed `tools.Fetch.allowed_origins` allow-list (empty = deny all), origin canonicalisation (scheme + lowercase-host + non-default-port). Layered SSRF default-deny on loopback / link-local / RFC1918 / mDNS / AWS metadata even when allow-listed; DNS lookup catches rebinding. ≤5 redirects re-checked per hop, 5 MB body cap, 30 s timeout. `Cookie` / `Set-Cookie` / `Authorization` headers stripped from responses.
+- `registerFetchConfig(...)` / `getFetchConfig()` — fail-closed module-level registry.
 
 ### Tests
 
-- `tool-web`: T1 unit (mocked `fetch`); T8 redirect-loop, scheme rejection, content-cap, allow-list bypass attempts; T2 contract test for `WebSearch` against fixture provider responses
-- `tool-image`: T1 unit; T8 path-traversal (`../../etc/...`), content-type spoof (file with `.png` extension but PDF magic bytes), oversize rejection
-- `tool-fetch`: T8 empty-allow-list rejects all; SSRF defense (rejects `127.0.0.1`, `169.254.169.254`, RFC1918 ranges by default); credential-stripping verification
+- `tool-web`: T1 (cheerio extraction, turndown link rendering, scheme rejection, allow-list); T8 (redirect loop, redirect smuggling, body cap, allow-list bypass attempts); T2 (Brave + Tavily provider contract via mocked `fetch`).
+- `tool-image`: T1 (each magic-byte path, success shape); T8 (`../../etc/passwd`, absolute paths, content-type spoof, oversize file).
+- `tool-fetch`: T1 (origin canonicalisation, header stripping, method dispatch); T8 (empty allow-list = deny all, scheme/case/port spoofs, SSRF on every literal range, DNS rebinding via mocked lookup, redirect loop, redirect smuggling, credential strip). 31 cases.
+
+### End-to-end smoke (`scripts/section-14-smoke.ts`)
+
+Six probes against the live model: WebFetch example.com → "Example Domain"; Fetch GitHub API → stargazers_count; Fetch unlisted origin → fail-closed deny; ReadImage → image block actually reaches the model and is described; ReadImage `../../etc/passwd` → traversal denial; Fetch `169.254.169.254` → SSRF refusal. All 6 pass.
 
 ---
 

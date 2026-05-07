@@ -58,6 +58,15 @@ export type IrSubAgentDefinition = {
   readonly inheritBypass: boolean;
 };
 
+/**
+ * Section 14 — per-tool runtime config carried verbatim from the spec to
+ * codegen. Keys are tool names (lowercase variable name as used in
+ * `BUILTIN_TOOL_MAP`); values are tool-specific config blobs whose schemas
+ * live inside each tool package. Empty-default at lower-time so codegen
+ * never has to `?? {}`.
+ */
+export type IrToolConfigs = Readonly<Record<string, unknown>>;
+
 export type IrV0 = {
   readonly version: 0;
   readonly name: string;
@@ -67,6 +76,7 @@ export type IrV0 = {
     readonly instructions: string;
   };
   readonly tools: readonly string[];
+  readonly toolConfigs: IrToolConfigs;
   readonly mcp_servers: IrMcpServers;
   readonly permissions: IrPermissions;
   readonly subAgents: readonly IrSubAgentDefinition[];
@@ -81,6 +91,7 @@ export type IrWorkflowStep = {
   readonly instructions: string;
   readonly model: string;
   readonly tools: readonly string[];
+  readonly toolConfigs: IrToolConfigs;
 };
 
 /**
@@ -138,6 +149,7 @@ export type IrChannelV0 = {
     readonly instructions: string;
   };
   readonly tools: readonly string[];
+  readonly toolConfigs: IrToolConfigs;
   readonly channels: IrChannels;
   readonly routing: IrRouting;
   readonly mcp_servers: IrMcpServers;

@@ -1,11 +1,17 @@
 import { CrewhausError } from "@crewhaus/errors";
-import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import type { RegisteredTool, ToolExecuteResult } from "@crewhaus/tool-catalog";
 import { compilePattern, matchesPattern } from "@crewhaus/tool-permission-matcher";
 import { validateToolInput } from "@crewhaus/tool-validate";
 
+/**
+ * Section 14 — `content` widened from `string` to `string | ToolResultContent`
+ * so tools like `ReadImage` can return Anthropic image content blocks. Error
+ * paths still produce a string (validation message, permission refusal,
+ * thrown-error.message) — the union is only meaningful on the success path.
+ */
 export type ToolResult = {
   readonly toolUseId: string;
-  readonly content: string;
+  readonly content: ToolExecuteResult;
   readonly isError: boolean;
 };
 

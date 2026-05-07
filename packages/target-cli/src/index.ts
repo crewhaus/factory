@@ -42,7 +42,20 @@ export class TargetEmitError extends CrewhausError {
  * Mirror: `loadToolMap()` in apps/cli/src/index.ts maps the same names to
  * RegisteredTool instances for `crewhaus run`. Keep both maps in sync.
  */
-const BUILTIN_TOOL_MAP: Record<string, { package: string; export: string }> = {
+/**
+ * Section 14 — `initSymbol` is the name of an exported function in the
+ * tool's package that takes a config blob and registers it for the tool
+ * to read at execute time (e.g. `registerFetchConfig({ allowed_origins })`).
+ * Codegen emits the call before `defaultCatalog.register(...)` when the
+ * IR's `toolConfigs` map has a value for the tool.
+ */
+type BuiltinToolEntry = {
+  readonly package: string;
+  readonly export: string;
+  readonly initSymbol?: string;
+};
+
+const BUILTIN_TOOL_MAP: Record<string, BuiltinToolEntry> = {
   read: { package: "@crewhaus/tool-fs", export: "read" },
   write: { package: "@crewhaus/tool-fs", export: "write" },
   edit: { package: "@crewhaus/tool-fs", export: "edit" },
@@ -50,35 +63,59 @@ const BUILTIN_TOOL_MAP: Record<string, { package: string; export: string }> = {
   grep: { package: "@crewhaus/tool-fs", export: "grep" },
   bash: { package: "@crewhaus/tool-bash", export: "bash" },
   todoWrite: { package: "@crewhaus/tool-todo", export: "todoWrite" },
+  webFetch: {
+    package: "@crewhaus/tool-web",
+    export: "webFetch",
+    initSymbol: "registerWebFetchConfig",
+  },
+  webSearch: { package: "@crewhaus/tool-web", export: "webSearch" },
+  readImage: { package: "@crewhaus/tool-image", export: "readImage" },
+  fetch: {
+    package: "@crewhaus/tool-fetch",
+    export: "fetch",
+    initSymbol: "registerFetchConfig",
+  },
 };
 
-function resolveTools(toolNames: readonly string[]): {
+function resolveTools(
+  toolNames: readonly string[],
+  toolConfigs: Readonly<Record<string, unknown>>,
+): {
   imports: string[];
+  inits: string[];
   registrations: string[];
 } {
-  if (toolNames.length === 0) return { imports: [], registrations: [] };
+  if (toolNames.length === 0) return { imports: [], inits: [], registrations: [] };
 
-  // Group exports by package for one grouped import per package.
-  const byPackage = new Map<string, string[]>();
+  // Group exports + inits by package for one grouped import per package.
+  const byPackage = new Map<string, Set<string>>();
   const registrations: string[] = [];
+  const inits: string[] = [];
   for (const name of toolNames) {
     const entry = BUILTIN_TOOL_MAP[name];
     if (!entry) {
       const known = Object.keys(BUILTIN_TOOL_MAP).sort().join(", ");
       throw new TargetEmitError(`unknown tool "${name}" — known tools: ${known}`);
     }
-    const list = byPackage.get(entry.package) ?? [];
-    list.push(entry.export);
-    byPackage.set(entry.package, list);
+    const set = byPackage.get(entry.package) ?? new Set<string>();
+    set.add(entry.export);
+    byPackage.set(entry.package, set);
+    if (entry.initSymbol !== undefined) {
+      const cfg = toolConfigs[name];
+      if (cfg !== undefined) {
+        set.add(entry.initSymbol);
+        inits.push(`${entry.initSymbol}(${JSON.stringify(cfg)});`);
+      }
+    }
     registrations.push(`defaultCatalog.register(${entry.export});`);
   }
 
   const imports: string[] = [`import { defaultCatalog } from "@crewhaus/tool-catalog";`];
   for (const pkg of [...byPackage.keys()].sort()) {
-    const exports = (byPackage.get(pkg) ?? []).slice().sort();
-    imports.push(`import { ${exports.join(", ")} } from "${pkg}";`);
+    const symbols = [...(byPackage.get(pkg) ?? new Set<string>())].sort();
+    imports.push(`import { ${symbols.join(", ")} } from "${pkg}";`);
   }
-  return { imports, registrations };
+  return { imports, inits, registrations };
 }
 
 function renderPermissionsField(ir: IrV0): string {
@@ -220,7 +257,7 @@ function renderSubAgentDef(d: IrSubAgentDefinition): string {
 }
 
 function renderAgent(ir: IrV0): string {
-  const { imports: builtinImports, registrations } = resolveTools(ir.tools);
+  const { imports: builtinImports, inits, registrations } = resolveTools(ir.tools, ir.toolConfigs);
   const mcp = renderMcpServers(ir);
   const subAgents = renderSubAgents(ir);
   // The catalog import is needed when either built-in tools OR MCP servers
@@ -234,7 +271,11 @@ function renderAgent(ir: IrV0): string {
     : "";
   const importBlock = builtinImports.length > 0 ? `${builtinImports.join("\n")}\n` : "";
   const mcpImportBlock = mcp.imports.length > 0 ? `${mcp.imports.join("\n")}\n` : "";
-  const registerBlock = registrations.length > 0 ? `\n${registrations.join("\n")}\n` : "";
+  // Section 14 — emit per-tool init calls (e.g. registerFetchConfig) before
+  // the catalog registration so tools see their config on first use.
+  const initBlock = inits.length > 0 ? `${inits.join("\n")}\n` : "";
+  const registerBlock =
+    registrations.length > 0 ? `\n${initBlock}${registrations.join("\n")}\n` : "";
   // tools: defaultCatalog.list() always — Section 11 may register a Skill
   // tool at boot when skills are discovered, so we always advertise.
   const toolsField = "\n  tools: defaultCatalog.list(),";

@@ -133,6 +133,7 @@ describe("Glob tool", () => {
     await writeFile(path.join(tmp, "b.ts"), "");
     await writeFile(path.join(tmp, "c.txt"), "");
     const result = await glob.execute({ pattern: "*.ts" });
+    if (typeof result !== "string") throw new Error("expected string result");
     expect(result.split("\n").sort()).toEqual(["a.ts", "b.ts"]);
   });
 

@@ -16,11 +16,39 @@ export interface ToolExecuteContext {
   readonly bridge?: unknown;
 }
 
+/**
+ * Section 14 — non-string tool result content. Mirrors the subset of
+ * Anthropic's `ToolResultBlockParam.content` we use today: text + base64
+ * image blocks. `runtime-core` forwards arrays of these verbatim into the
+ * API's `tool_result.content` field, so the model sees them as image
+ * inputs rather than as base64 text.
+ *
+ * Tools that don't return rich content (the majority — fs, bash, todo,
+ * mcp, channel, task) keep returning `string` and never construct these.
+ */
+export interface ToolResultTextBlock {
+  readonly type: "text";
+  readonly text: string;
+}
+
+export interface ToolResultImageBlock {
+  readonly type: "image";
+  readonly source: {
+    readonly type: "base64";
+    readonly media_type: "image/png" | "image/jpeg" | "image/gif" | "image/webp";
+    readonly data: string;
+  };
+}
+
+export type ToolResultContentBlock = ToolResultTextBlock | ToolResultImageBlock;
+export type ToolResultContent = ReadonlyArray<ToolResultContentBlock>;
+export type ToolExecuteResult = string | ToolResultContent;
+
 export interface ToolDefinition<TInput = unknown> {
   name: string;
   description: string;
   inputSchema: ZodType<TInput>;
-  execute: (input: TInput, ctx?: ToolExecuteContext) => Promise<string>;
+  execute: (input: TInput, ctx?: ToolExecuteContext) => Promise<ToolExecuteResult>;
   concurrencySafe?: boolean;
   readOnly?: boolean;
   destructive?: boolean;
@@ -41,7 +69,7 @@ export interface RegisteredTool {
   name: string;
   description: string;
   inputSchema: ZodType<unknown>;
-  execute: (input: unknown, ctx?: ToolExecuteContext) => Promise<string>;
+  execute: (input: unknown, ctx?: ToolExecuteContext) => Promise<ToolExecuteResult>;
   concurrencySafe: boolean;
   readOnly: boolean;
   destructive: boolean;

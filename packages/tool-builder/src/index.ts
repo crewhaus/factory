@@ -1,4 +1,9 @@
-import type { RegisteredTool, ToolDefinition, ToolExecuteContext } from "@crewhaus/tool-catalog";
+import type {
+  RegisteredTool,
+  ToolDefinition,
+  ToolExecuteContext,
+  ToolExecuteResult,
+} from "@crewhaus/tool-catalog";
 import type { ZodType } from "zod";
 
 /**
@@ -11,7 +16,10 @@ export function buildTool<TInput>(def: ToolDefinition<TInput>): RegisteredTool {
     name: def.name,
     description: def.description,
     inputSchema: def.inputSchema as ZodType<unknown>,
-    execute: def.execute as (input: unknown, ctx?: ToolExecuteContext) => Promise<string>,
+    execute: def.execute as (
+      input: unknown,
+      ctx?: ToolExecuteContext,
+    ) => Promise<ToolExecuteResult>,
     concurrencySafe: def.concurrencySafe ?? false,
     readOnly: def.readOnly ?? false,
     destructive: def.destructive ?? false,

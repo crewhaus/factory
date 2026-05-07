@@ -135,6 +135,17 @@ function lowerSubAgents(
   }));
 }
 
+/**
+ * Section 14 — freeze a spec `tool_config` map into the IR shape. Empty
+ * default (`{}`) so codegen never needs `?? {}` guards.
+ */
+function lowerToolConfigs(
+  raw: Record<string, unknown> | undefined,
+): Readonly<Record<string, unknown>> {
+  if (raw === undefined) return Object.freeze({});
+  return Object.freeze({ ...raw });
+}
+
 export function lower(spec: Spec): IrNode {
   switch (spec.target) {
     case "cli":
@@ -147,6 +158,7 @@ export function lower(spec: Spec): IrNode {
           instructions: spec.agent.instructions,
         },
         tools: spec.tools ?? [],
+        toolConfigs: lowerToolConfigs(spec.tool_config),
         mcp_servers: lowerMcpServers(spec.mcp_servers),
         permissions: lowerPermissions(spec),
         subAgents: lowerSubAgents(spec.agent.sub_agents),
@@ -161,6 +173,7 @@ export function lower(spec: Spec): IrNode {
           instructions: s.instructions,
           model: s.model ?? spec.model,
           tools: s.tools ?? [],
+          toolConfigs: lowerToolConfigs(s.tool_config),
         })),
         mcp_servers: lowerMcpServers(spec.mcp_servers),
         permissions: lowerPermissions(spec),
@@ -175,6 +188,7 @@ export function lower(spec: Spec): IrNode {
           instructions: spec.agent.instructions,
         },
         tools: spec.agent.tools ?? [],
+        toolConfigs: lowerToolConfigs(spec.agent.tool_config),
         channels: lowerChannels(spec.channels),
         routing: { sessionKey: spec.routing.sessionKey },
         mcp_servers: lowerMcpServers(spec.mcp_servers),

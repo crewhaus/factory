@@ -45,7 +45,13 @@ export class TargetEmitError extends CrewhausError {
  * target-workflow maps, plus `sendMessage` (the channel-target's
  * cross-channel addressing tool from Section 12).
  */
-const BUILTIN_TOOL_MAP: Record<string, { package: string; export: string }> = {
+type BuiltinToolEntry = {
+  readonly package: string;
+  readonly export: string;
+  readonly initSymbol?: string;
+};
+
+const BUILTIN_TOOL_MAP: Record<string, BuiltinToolEntry> = {
   read: { package: "@crewhaus/tool-fs", export: "read" },
   write: { package: "@crewhaus/tool-fs", export: "write" },
   edit: { package: "@crewhaus/tool-fs", export: "edit" },
@@ -54,32 +60,56 @@ const BUILTIN_TOOL_MAP: Record<string, { package: string; export: string }> = {
   bash: { package: "@crewhaus/tool-bash", export: "bash" },
   todoWrite: { package: "@crewhaus/tool-todo", export: "todoWrite" },
   sendMessage: { package: "@crewhaus/tool-message-channel", export: "sendMessage" },
+  webFetch: {
+    package: "@crewhaus/tool-web",
+    export: "webFetch",
+    initSymbol: "registerWebFetchConfig",
+  },
+  webSearch: { package: "@crewhaus/tool-web", export: "webSearch" },
+  readImage: { package: "@crewhaus/tool-image", export: "readImage" },
+  fetch: {
+    package: "@crewhaus/tool-fetch",
+    export: "fetch",
+    initSymbol: "registerFetchConfig",
+  },
 };
 
-function resolveTools(toolNames: readonly string[]): {
+function resolveTools(
+  toolNames: readonly string[],
+  toolConfigs: Readonly<Record<string, unknown>>,
+): {
   imports: string[];
+  inits: string[];
   registrations: string[];
 } {
-  if (toolNames.length === 0) return { imports: [], registrations: [] };
-  const byPackage = new Map<string, string[]>();
+  if (toolNames.length === 0) return { imports: [], inits: [], registrations: [] };
+  const byPackage = new Map<string, Set<string>>();
   const registrations: string[] = [];
+  const inits: string[] = [];
   for (const name of toolNames) {
     const entry = BUILTIN_TOOL_MAP[name];
     if (!entry) {
       const known = Object.keys(BUILTIN_TOOL_MAP).sort().join(", ");
       throw new TargetEmitError(`unknown tool "${name}" — known tools: ${known}`);
     }
-    const list = byPackage.get(entry.package) ?? [];
-    list.push(entry.export);
-    byPackage.set(entry.package, list);
+    const set = byPackage.get(entry.package) ?? new Set<string>();
+    set.add(entry.export);
+    byPackage.set(entry.package, set);
+    if (entry.initSymbol !== undefined) {
+      const cfg = toolConfigs[name];
+      if (cfg !== undefined) {
+        set.add(entry.initSymbol);
+        inits.push(`${entry.initSymbol}(${JSON.stringify(cfg)});`);
+      }
+    }
     registrations.push(`defaultCatalog.register(${entry.export});`);
   }
   const imports: string[] = [];
   for (const pkg of [...byPackage.keys()].sort()) {
-    const exports = (byPackage.get(pkg) ?? []).slice().sort();
-    imports.push(`import { ${exports.join(", ")} } from "${pkg}";`);
+    const symbols = [...(byPackage.get(pkg) ?? new Set<string>())].sort();
+    imports.push(`import { ${symbols.join(", ")} } from "${pkg}";`);
   }
-  return { imports, registrations };
+  return { imports, inits, registrations };
 }
 
 /**
@@ -443,7 +473,7 @@ function renderDaemon(ir: IrChannelV0): string {
   if (slack === undefined) {
     throw new TargetEmitError("channel target without slack config not yet supported");
   }
-  const { imports: builtinImports, registrations } = resolveTools(ir.tools);
+  const { imports: builtinImports, inits, registrations } = resolveTools(ir.tools, ir.toolConfigs);
   const mcp = renderMcpServers(ir);
   const subAgents = renderSubAgents(ir);
   const envNames = requiredEnvNames(ir);
@@ -472,9 +502,10 @@ if (__missing.length > 0) {
 registerChannelAdapter("slack", slackAdapter);`;
 
   const builtinImportBlock = builtinImports.length > 0 ? `${builtinImports.join("\n")}\n` : "";
+  const initLines = inits.length > 0 ? `  ${inits.join("\n  ")}\n` : "";
   const registerBlock =
     registrations.length > 0
-      ? `\n  // Built-in tools (from spec.agent.tools)\n  ${registrations.join("\n  ")}\n`
+      ? `\n  // Built-in tools (from spec.agent.tools)\n${initLines}  ${registrations.join("\n  ")}\n`
       : "";
 
   const mcpImportBlock = mcp.imports.length > 0 ? `${mcp.imports.join("\n")}\n` : "";

@@ -1,0 +1,26 @@
+{
+  "name": "@crewhaus/tool-image",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "ReadImage tool — validates magic bytes and returns Anthropic base64 image content blocks",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@crewhaus/errors": "workspace:*",
+    "@crewhaus/tool-builder": "workspace:*",
+    "@crewhaus/tool-catalog": "workspace:*",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@crewhaus/tool-executor": "workspace:*",
+    "@crewhaus/tool-permission-matcher": "workspace:*",
+    "@crewhaus/tool-validate": "workspace:*"
+  }
+}

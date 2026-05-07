@@ -9,6 +9,7 @@ function baseIr(overrides: Partial<IrV0> = {}): IrV0 {
     target: "cli",
     agent: { model: "claude-sonnet-4-6", instructions: "be helpful" },
     tools: [],
+    toolConfigs: {},
     mcp_servers: {},
     permissions: { rules: [] },
     subAgents: [],
