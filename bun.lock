@@ -85,6 +85,19 @@
         "@crewhaus/tool-mcp": "workspace:*",
       },
     },
+    "examples/section-15-smoke": {
+      "name": "@crewhaus-examples/section-15-smoke",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/hooks-engine": "workspace:*",
+        "@crewhaus/permission-engine": "workspace:*",
+        "@crewhaus/runtime-core": "workspace:*",
+        "@crewhaus/skills-registry": "workspace:*",
+        "@crewhaus/slash-commands": "workspace:*",
+        "@crewhaus/tool-bash": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+      },
+    },
     "packages/abort-controller": {
       "name": "@crewhaus/abort-controller",
       "version": "0.0.0",
@@ -100,6 +113,7 @@
         "@crewhaus/run-context": "workspace:*",
         "@crewhaus/state-store": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/trace-event-bus": "workspace:*",
       },
     },
     "packages/channel-adapter-slack": {
@@ -153,6 +167,7 @@
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/logging": "workspace:*",
+        "@crewhaus/trace-event-bus": "workspace:*",
       },
     },
     "packages/infra-utils": {
@@ -173,8 +188,23 @@
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/logging": "workspace:*",
+        "@crewhaus/trace-event-bus": "workspace:*",
         "@modelcontextprotocol/sdk": "^1.29.0",
         "zod": "^3.23.8",
+      },
+    },
+    "packages/metrics-collector": {
+      "name": "@crewhaus/metrics-collector",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/trace-event-bus": "workspace:*",
+      },
+    },
+    "packages/otel-exporter": {
+      "name": "@crewhaus/otel-exporter",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/trace-event-bus": "workspace:*",
       },
     },
     "packages/permission-engine": {
@@ -198,6 +228,7 @@
       "version": "0.0.0",
       "dependencies": {
         "@crewhaus/logging": "workspace:*",
+        "@crewhaus/trace-event-bus": "workspace:*",
       },
     },
     "packages/runtime-core": {
@@ -212,6 +243,8 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/event-log": "workspace:*",
         "@crewhaus/hooks-engine": "workspace:*",
+        "@crewhaus/metrics-collector": "workspace:*",
+        "@crewhaus/otel-exporter": "workspace:*",
         "@crewhaus/permission-engine": "workspace:*",
         "@crewhaus/recovery-engine": "workspace:*",
         "@crewhaus/run-context": "workspace:*",
@@ -220,12 +253,14 @@
         "@crewhaus/slash-commands": "workspace:*",
         "@crewhaus/state-store": "workspace:*",
         "@crewhaus/streaming-tool-executor": "workspace:*",
+        "@crewhaus/structured-event-printer": "workspace:*",
         "@crewhaus/token-budget": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
         "@crewhaus/tool-executor": "workspace:*",
         "@crewhaus/tool-loop-detection": "workspace:*",
         "@crewhaus/tool-orchestrator": "workspace:*",
         "@crewhaus/tool-result-store": "workspace:*",
+        "@crewhaus/trace-event-bus": "workspace:*",
         "@crewhaus/turn-state-machine": "workspace:*",
         "zod-to-json-schema": "^3.23.5",
       },
@@ -284,6 +319,13 @@
         "@crewhaus/tool-executor": "workspace:*",
         "@crewhaus/turn-state-machine": "workspace:*",
         "zod": "^3.23.8",
+      },
+    },
+    "packages/structured-event-printer": {
+      "name": "@crewhaus/structured-event-printer",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/trace-event-bus": "workspace:*",
       },
     },
     "packages/sub-agent-permission-inheritance": {
@@ -577,6 +619,13 @@
         "@types/turndown": "^5.0.5",
       },
     },
+    "packages/trace-event-bus": {
+      "name": "@crewhaus/trace-event-bus",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/logging": "workspace:*",
+      },
+    },
     "packages/turn-state-machine": {
       "name": "@crewhaus/turn-state-machine",
       "version": "0.0.0",
@@ -614,6 +663,8 @@
 
     "@crewhaus-examples/mcp-smoke": ["@crewhaus-examples/mcp-smoke@workspace:examples/mcp-smoke"],
 
+    "@crewhaus-examples/section-15-smoke": ["@crewhaus-examples/section-15-smoke@workspace:examples/section-15-smoke"],
+
     "@crewhaus/abort-controller": ["@crewhaus/abort-controller@workspace:packages/abort-controller"],
 
     "@crewhaus/agent-context-isolation": ["@crewhaus/agent-context-isolation@workspace:packages/agent-context-isolation"],
@@ -642,6 +693,10 @@
 
     "@crewhaus/mcp-host": ["@crewhaus/mcp-host@workspace:packages/mcp-host"],
 
+    "@crewhaus/metrics-collector": ["@crewhaus/metrics-collector@workspace:packages/metrics-collector"],
+
+    "@crewhaus/otel-exporter": ["@crewhaus/otel-exporter@workspace:packages/otel-exporter"],
+
     "@crewhaus/permission-engine": ["@crewhaus/permission-engine@workspace:packages/permission-engine"],
 
     "@crewhaus/recovery-engine": ["@crewhaus/recovery-engine@workspace:packages/recovery-engine"],
@@ -661,6 +716,8 @@
     "@crewhaus/state-store": ["@crewhaus/state-store@workspace:packages/state-store"],
 
     "@crewhaus/streaming-tool-executor": ["@crewhaus/streaming-tool-executor@workspace:packages/streaming-tool-executor"],
+
+    "@crewhaus/structured-event-printer": ["@crewhaus/structured-event-printer@workspace:packages/structured-event-printer"],
 
     "@crewhaus/sub-agent-permission-inheritance": ["@crewhaus/sub-agent-permission-inheritance@workspace:packages/sub-agent-permission-inheritance"],
 
@@ -707,6 +764,8 @@
     "@crewhaus/tool-validate": ["@crewhaus/tool-validate@workspace:packages/tool-validate"],
 
     "@crewhaus/tool-web": ["@crewhaus/tool-web@workspace:packages/tool-web"],
+
+    "@crewhaus/trace-event-bus": ["@crewhaus/trace-event-bus@workspace:packages/trace-event-bus"],
 
     "@crewhaus/turn-state-machine": ["@crewhaus/turn-state-machine@workspace:packages/turn-state-machine"],
 

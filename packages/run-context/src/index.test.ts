@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createLogger } from "@crewhaus/logging";
+import { TraceEventBus } from "@crewhaus/trace-event-bus";
 import { createRunContext } from "./index";
 
 describe("createRunContext defaults", () => {
@@ -68,5 +69,20 @@ describe("createRunContext overrides", () => {
     expect(ctx.abortSignal.aborted).toBe(false);
     ac.abort();
     expect(ctx.abortSignal.aborted).toBe(true);
+  });
+});
+
+describe("createRunContext eventBus", () => {
+  test("default eventBus carries the run/session ids", () => {
+    const ctx = createRunContext();
+    expect(ctx.eventBus).toBeInstanceOf(TraceEventBus);
+    expect(ctx.eventBus.runId).toBe(ctx.runId);
+    expect(ctx.eventBus.sessionId).toBe(ctx.sessionId);
+  });
+
+  test("custom eventBus is wired through verbatim", () => {
+    const bus = new TraceEventBus({ runId: "run_custom", sessionId: "sess_custom" });
+    const ctx = createRunContext({ runId: "run_custom", sessionId: "sess_custom", eventBus: bus });
+    expect(ctx.eventBus).toBe(bus);
   });
 });

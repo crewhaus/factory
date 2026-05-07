@@ -36,6 +36,7 @@ import { executeTool } from "@crewhaus/tool-executor";
 import { type LoopDetection, detectLoop } from "@crewhaus/tool-loop-detection";
 import { partitionToolCalls } from "@crewhaus/tool-orchestrator";
 import { storeAndPreview } from "@crewhaus/tool-result-store";
+import { TraceEventBus } from "@crewhaus/trace-event-bus";
 import {
   type ToolUseBlock as TsmToolUseBlock,
   type TurnState,
@@ -43,6 +44,7 @@ import {
   transition,
 } from "@crewhaus/turn-state-machine";
 import { zodToJsonSchema } from "zod-to-json-schema";
+import { attachDefaultSubscribers } from "./observability";
 
 /**
  * Slice-scope runtime: a multi-turn streaming chat loop with prompt
@@ -429,6 +431,14 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // it after the loop returns, so we never silently swap it out.
   const runContext: RunContext = opts.runContext ?? createRunContext({ sessionId });
 
+  // Section 15 — every observability subscriber (otel, metrics, printer)
+  // hangs off this single bus. The default constructor in `createRunContext`
+  // mints a no-subscriber bus; here we attach the env-gated set so a fresh
+  // run with `OTEL_EXPORTER_OTLP_ENDPOINT` set automatically exports.
+  const bus: TraceEventBus = runContext.eventBus;
+  void TraceEventBus; // keep type import alive for future direct constructions
+  const subscribers = await attachDefaultSubscribers(bus, runContext);
+
   const eventLog: EventLog = await openEventLog(sessionId, { rootDir: sessionRootDir });
 
   // Per-run state container — coordination surface for hooks/skills/tools
@@ -463,7 +473,10 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   ): Promise<{ allowed: boolean; reason?: string; mutate?: Record<string, unknown> }> {
     if (hooks.length === 0) return { allowed: true };
     try {
-      const results = await runHooks(event, payload, hooks, { logger: runContext.logger });
+      const results = await runHooks(event, payload, hooks, {
+        logger: runContext.logger,
+        eventBus: bus,
+      });
       return aggregateDecisions(results);
     } catch (err) {
       runContext.logger.warn("hook firing failed", {
@@ -559,6 +572,16 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   async function executeOneToolUse(tu: TsmToolUseBlock): Promise<Anthropic.ToolResultBlockParam> {
     process.stdout.write(`[tool: ${tu.name}]\n`);
     await logEvent("tool_use", { id: tu.id, name: tu.name, input: tu.input });
+    const inputBytes = Buffer.byteLength(JSON.stringify(tu.input ?? null), "utf8");
+    const toolStartEnvelope = bus.envelope();
+    bus.publish({
+      ...toolStartEnvelope,
+      kind: "tool_call_start",
+      toolUseId: tu.id,
+      toolName: tu.name,
+      inputBytes,
+    });
+    const t0Tool = performance.now();
     const tool = toolByName.get(tu.name);
     const finish = async (
       result: Anthropic.ToolResultBlockParam,
@@ -570,6 +593,21 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             ? result.content
             : summariseNonStringContent(result.content),
         isError: result.is_error === true,
+      });
+      const outputContent = result.content;
+      const outputBytes =
+        typeof outputContent === "string"
+          ? Buffer.byteLength(outputContent, "utf8")
+          : Buffer.byteLength(JSON.stringify(outputContent ?? null), "utf8");
+      bus.publish({
+        ...bus.envelope(),
+        spanId: toolStartEnvelope.spanId,
+        kind: "tool_call_end",
+        toolUseId: tu.id,
+        toolName: tu.name,
+        isError: result.is_error === true,
+        outputBytes,
+        durationMs: performance.now() - t0Tool,
       });
       // Section 11 — fire post-tool after the result is captured. Decision
       // is observational here: a deny on post-tool logs a warning but does
@@ -619,6 +657,13 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       permissionMode,
       permissionRules,
     );
+    bus.publish({
+      ...bus.envelope(),
+      kind: "permission_decision",
+      toolName: tu.name,
+      decision,
+      mode: permissionMode,
+    });
     let approved = decision === "allow";
     let denialMessage: string | undefined;
     if (decision === "deny") {
@@ -824,6 +869,17 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             break;
           }
           try {
+            const modelStartEnv = bus.envelope();
+            bus.publish({
+              ...modelStartEnv,
+              kind: "model_request",
+              model: opts.model,
+              messageCount: messages.length,
+              toolCount: anthropicTools?.length ?? 0,
+              streaming: opts.streaming === true,
+            });
+            const t0Model = performance.now();
+            let streamChunkIndex = 0;
             const stream = client.messages.stream(
               {
                 model: opts.model,
@@ -837,6 +893,15 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
 
             stream.on("text", (chunk) => {
               process.stdout.write(chunk);
+              bus.publish(
+                {
+                  ...bus.envelope(),
+                  kind: "model_stream_token",
+                  chunkIndex: streamChunkIndex++,
+                  deltaChars: chunk.length,
+                },
+                { ephemeral: true },
+              );
             });
 
             if (opts.streaming) {
@@ -845,6 +910,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               // pass `executeOneToolUse` as the `runTool` so permissions,
               // per-tool abort, and result-store wrapping all flow
               // through the same helper as the non-streaming path.
+              void modelStartEnv;
               const { finalContent, toolResults } = await executeStreaming(stream, {
                 toolByName,
                 abortSignal: turnAbort.signal,
@@ -866,6 +932,28 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               });
               await logEvent("assistant_message", { content: finalContent });
               terminalContent = [...finalContent];
+              const streamingFinal = await stream.finalMessage();
+              const sUsage = streamingFinal.usage;
+              bus.publish({
+                ...bus.envelope(),
+                spanId: modelStartEnv.spanId,
+                kind: "model_response",
+                model: opts.model,
+                stopReason: streamingFinal.stop_reason ?? "end_turn",
+                usage: {
+                  input: sUsage?.input_tokens ?? 0,
+                  output: sUsage?.output_tokens ?? 0,
+                  ...(sUsage?.cache_read_input_tokens !== undefined &&
+                  sUsage?.cache_read_input_tokens !== null
+                    ? { cacheRead: sUsage.cache_read_input_tokens }
+                    : {}),
+                  ...(sUsage?.cache_creation_input_tokens !== undefined &&
+                  sUsage?.cache_creation_input_tokens !== null
+                    ? { cacheCreate: sUsage.cache_creation_input_tokens }
+                    : {}),
+                },
+                durationMs: performance.now() - t0Model,
+              });
               await fireHook("post-model", {
                 streaming: true,
                 contentBlocks: finalContent.length,
@@ -906,6 +994,28 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
 
             const final = await stream.finalMessage();
             process.stdout.write("\n");
+
+            const fUsage = final.usage;
+            bus.publish({
+              ...bus.envelope(),
+              spanId: modelStartEnv.spanId,
+              kind: "model_response",
+              model: opts.model,
+              stopReason: final.stop_reason ?? "end_turn",
+              usage: {
+                input: fUsage?.input_tokens ?? 0,
+                output: fUsage?.output_tokens ?? 0,
+                ...(fUsage?.cache_read_input_tokens !== undefined &&
+                fUsage?.cache_read_input_tokens !== null
+                  ? { cacheRead: fUsage.cache_read_input_tokens }
+                  : {}),
+                ...(fUsage?.cache_creation_input_tokens !== undefined &&
+                fUsage?.cache_creation_input_tokens !== null
+                  ? { cacheCreate: fUsage.cache_creation_input_tokens }
+                  : {}),
+              },
+              durationMs: performance.now() - t0Model,
+            });
 
             // Persist the assistant turn with the FULL content-block array;
             // tool_use blocks must survive into history so subsequent
@@ -997,6 +1107,13 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             errorName: state.error.name,
             recoveryDepth: recovery.retryCount + recovery.compactCount + recovery.continueCount,
           });
+          bus.publish({
+            ...bus.envelope(),
+            kind: "error_recovered",
+            action: action.kind,
+            errorName: state.error.name,
+            depth: recovery.retryCount + recovery.compactCount + recovery.continueCount,
+          });
           switch (action.kind) {
             case "compact": {
               const before = messages.length;
@@ -1015,6 +1132,14 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 kind: "reactive",
                 before,
                 after: messages.length,
+              });
+              bus.publish({
+                ...bus.envelope(),
+                kind: "compaction_fired",
+                subKind: "reactive",
+                before,
+                after: messages.length,
+                phase: "reactive",
               });
               await fireHook("post-compact", {
                 kind: "reactive",
@@ -1085,6 +1210,14 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         }
       }
       runContext.turnNumber += 1;
+      bus.setTurnNumber(runContext.turnNumber);
+      const t0SingleTurn = performance.now();
+      bus.publish({
+        ...bus.envelope(),
+        kind: "turn_start",
+        turn: runContext.turnNumber,
+        messageCount: messages.length,
+      });
       runContext.logger.debug("turn start (single)", {
         turn: runContext.turnNumber,
         messages: messages.length,
@@ -1103,6 +1236,14 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         },
         async (info) => {
           await logEvent("compaction", info);
+          bus.publish({
+            ...bus.envelope(),
+            kind: "compaction_fired",
+            subKind: info.kind,
+            before: info.before,
+            after: info.after,
+            phase: "pre-turn",
+          });
           // Fire one pre-compact (info has the before-count from the work
           // that just ran) followed by post-compact. Pre-compact in this
           // path is observational — by the time onCompaction fires the
@@ -1114,6 +1255,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       );
 
       const { terminalContent } = await runOneTurn(messages);
+      bus.publish({
+        ...bus.envelope(),
+        kind: "turn_end",
+        turn: runContext.turnNumber,
+        durationMs: performance.now() - t0SingleTurn,
+      });
       return terminalContent
         .filter((b): b is Anthropic.TextBlock => b.type === "text")
         .map((b) => b.text)
@@ -1124,6 +1271,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         turnCount: runContext.turnNumber,
         reason: "complete",
       });
+      await subscribers.flushAll();
+      await subscribers.shutdownAll();
       await sessionStore
         .update(sessionId, { lastTurnIndex: runContext.turnNumber })
         .catch((err) => {
@@ -1251,6 +1400,14 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       messages.push({ role: "user", content: effectiveInput });
       await logEvent("user_message", { content: effectiveInput });
       runContext.turnNumber += 1;
+      bus.setTurnNumber(runContext.turnNumber);
+      const t0Turn = performance.now();
+      bus.publish({
+        ...bus.envelope(),
+        kind: "turn_start",
+        turn: runContext.turnNumber,
+        messageCount: messages.length,
+      });
       runContext.logger.debug("turn start", {
         turn: runContext.turnNumber,
         messages: messages.length,
@@ -1270,6 +1427,14 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         },
         async (info) => {
           await logEvent("compaction", info);
+          bus.publish({
+            ...bus.envelope(),
+            kind: "compaction_fired",
+            subKind: info.kind,
+            before: info.before,
+            after: info.after,
+            phase: "pre-turn",
+          });
           await fireHook("pre-compact", { ...info, phase: "pre-turn" });
           await fireHook("post-compact", { ...info, phase: "pre-turn" });
         },
@@ -1286,6 +1451,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         }
       }
 
+      bus.publish({
+        ...bus.envelope(),
+        kind: "turn_end",
+        turn: runContext.turnNumber,
+        durationMs: performance.now() - t0Turn,
+      });
       runContext.logger.debug("turn end", {
         turn: runContext.turnNumber,
       });
@@ -1296,6 +1467,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       turnCount: runContext.turnNumber,
       reason: runAbort.signal.aborted ? "abort" : "exit",
     });
+    await subscribers.flushAll();
+    await subscribers.shutdownAll();
     if (shouldInstallSigint) {
       process.removeListener("SIGINT", sigintHandler);
     }

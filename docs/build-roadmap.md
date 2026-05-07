@@ -17,7 +17,7 @@ What is *not* yet covered (and frames the next sections):
 
 - **Delegation.** Section 13 landed sub-agents — every shipped target now has a `Task(description, prompt, subagent_type?)` tool that spawns a child agent in an isolated `RunContext` (own runId/sessionId/event-log/state-store), with parent→child permission scoping (`inherit | scoped | replace`), bypass non-propagation, and SIGINT cascade. Specs declare sub-agents inline under `agent.sub_agents` (CLI + channel targets); the filesystem fallback at `.crewhaus/sub-agents/<name>.md` ships too.
 - **Tool surface.** *(Section 14 closed this gap.)* `tool-web` (`WebFetch` + `WebSearch`), `tool-image` (`ReadImage` returning Anthropic image content blocks), and `tool-fetch` (generic HTTP with fail-closed allow-list and SSRF defense) are landed. Spec layer gained an additive `tool_config` block plumbed through IR + codegen + the runner.
-- **Observability.** The runtime emits structured logs but no trace events. Nothing exports to OpenTelemetry, nothing collects metrics, and the eval stack has no event bus to ingest. Section 15 introduces the trace bus + exporters; Section 16 builds the eval stack on top of it.
+- **Observability.** *(Section 15 closed this gap.)* `TraceEventBus` is wired through `RunContext` and emits 15 lifecycle event kinds; `otel-exporter` (OTLP/HTTP, `gen_ai/*` semantic conventions), `metrics-collector` (Prometheus textfile / buffered stdout JSON / HTTP `/metrics`), and `structured-event-printer` (pretty stderr / JSON Lines stdout) attach automatically based on env vars. The bus's 5000-event ring buffer is the in-process surface Section 16's eval-runner consumes; W3C `traceparent` propagation stitches sub-agent runs and daemon mode under one trace.
 - **Provider lock-in.** `model-adapter` calls Anthropic directly. The spec accepts any model string but the runtime only resolves Claude. Section 17 generalizes the adapter shape and adds OpenAI/Gemini/Bedrock/local support behind a `model-router`.
 
 ---
@@ -636,7 +636,7 @@ Six probes against the live model: WebFetch example.com → "Example Domain"; Fe
 
 ## Section 15 — Observability and tracing
 
-> Status: 🚧 next up. Required prereq for Section 16. Parallelizable with Sections 13 and 14.
+> Status: ✅ landed. Four packages plus the runtime-core integration. End-to-end smoke test (`bun run smoke:section-15`) drives a 3-turn conversation with a Bash tool call against a docker-hosted OpenTelemetry Collector and verifies spans, pretty stderr, and JSON metrics on stdout.
 
 **Catalog modules:** `trace-event-bus` (R-observability), `otel-exporter` (R-observability), `metrics-collector` (R-observability), `structured-event-printer` (R-observability)
 
@@ -681,10 +681,42 @@ trace-event-bus  ──►  otel-exporter
 
 ### Tests
 
-- `trace-event-bus`: T1 unit (subscribe/publish, ring-buffer eviction); T9 property tests on event ordering invariants (turn_start always precedes turn_end with matching turnNumber)
-- `otel-exporter`: T2 contract test against a local OpenTelemetry Collector container (asserts span attribute names match `gen_ai/*` conventions); T7 backpressure test (1000 events/sec without dropping)
-- `metrics-collector`: T1 unit per metric; T3 integration confirming a 3-turn conversation produces correct counter increments
-- `runtime-core`: T3 confirming a single `runChatLoop` turn with one tool call produces exactly the expected event sequence
+- `trace-event-bus`: T1 unit (subscribe/publish, ring-buffer eviction, ephemeral handling, traceparent round-trip); T9 ordering invariants (every `turn_start{n}` paired with `turn_end{n}` before `turn_start{n+1}`; `tool_call_start` always precedes its matching `tool_call_end` by `toolUseId`); T7 backpressure (5000 events with a slow async subscriber, no drops, `flush()` resolves under wall-clock budget). 22 tests pass.
+- `otel-exporter`: T2 contract test asserting span attribute names match the OTel GenAI semantic conventions verbatim (`gen_ai.system`, `gen_ai.request.model`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `gen_ai.response.finish_reason`, `gen_ai.operation.name`); T1 happy-path with an injected `fetch` impl (OTLP/JSON payload shape, `parseHeaders`, `onError` capture). 8 tests pass.
+- `metrics-collector`: T1 unit (counter Prometheus exposition, histogram cumulative buckets, sink-spec parsing); T3 integration driving a fake bus through 3 turns + 1 Bash tool call and asserting `crewhaus_turns_total = 3` plus `crewhaus_tool_calls_total{tool="Bash"} = 1`. 6 tests pass.
+- `structured-event-printer`: T1 (pretty-formatter golden file per kind, JSON Lines round-trip); collapser test (100 token events → rolling line + `(done)` finalizer; non-TTY swallow → single summary). 9 tests pass.
+- `runtime-core`: T3 single-turn run with a mocked Anthropic client capturing the bus's event sequence — asserts the expected ordered subset `turn_start → model_request → model_response → tool_call_start → permission_decision → tool_call_end → model_request → model_response → turn_end` under one shared traceId, and that paired tool start/end events share a spanId. 37 tests pass (existing suite untouched).
+
+### What landed
+
+**`packages/trace-event-bus`** — `TraceEvent` discriminated union covering all 15 kinds with the standard envelope (`runId`, `sessionId`, `turnNumber`, `traceId`, `spanId`, optional `parentSpanId`, ISO timestamp). `TraceEventBus` exposes `subscribe()`, `publish(event, { ephemeral? })`, `recent({ since?, kinds? })` over a 5000-event ring buffer, plus `startSpan`/`currentSpanId`/`currentTraceparent` for span tree management and W3C trace-context propagation. Subscriber failures are isolated and counted; ephemeral events skip the ring buffer (used for `model_stream_token` so 10k+ tokens don't evict structurally important events). The bus also tracks the current `turnNumber` (set by the orchestrator at each turn boundary) and exposes `envelope()` so peripheral publishers (`mcp-host`, `hooks-engine`, `sub-agent-spawner`) don't need to thread `RunContext` themselves.
+
+**`packages/otel-exporter`** — Dependency-free OTLP/JSON exporter. Maps lifecycle events to OpenTelemetry spans using `gen_ai/*` semantic conventions; tool spans use `code.function = <toolName>` plus `crewhaus.tool.*` extension keys; MCP spans use `mcp.server.name` / `mcp.tool.name`. `model_stream_token` events become span events on the open model span (named `gen_ai.completion.chunk`) — never one span per token. POSTs OTLP/JSON to `<endpoint>/v1/traces` on a 5s batch interval; sync flush on shutdown so short-lived runs don't lose data. Honors `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_SERVICE_NAME`.
+
+**`packages/metrics-collector`** — Counter/histogram primitives with Prometheus default buckets `[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10]`. Counters: `crewhaus_turns_total`, `crewhaus_tool_calls_total{tool}`, `crewhaus_tokens_total{direction}`, `crewhaus_errors_total{kind}`. Histograms: `crewhaus_turn_duration_seconds`, `crewhaus_tool_duration_seconds{tool}`, `crewhaus_model_ttft_seconds` (computed as the timestamp delta between `model_request` and the first `model_stream_token` per traceId). Three sinks: `prometheusTextfile(path)` (atomic write on flush), `stdoutJson()` (**buffers in memory and emits one JSON dump on `flush()`** — avoids interleaving with assistant text on stdout), and `httpServer(port)` (pull-based `/metrics`). Selected via `CREWHAUS_METRICS=stdout|textfile|textfile:/path|http:8765`.
+
+**`packages/structured-event-printer`** — Color-coded pretty stderr (`CREWHAUS_TRACE=pretty`) or JSON Lines to stdout (`CREWHAUS_TRACE=json`). Pretty mode collapses `model_stream_token` deltas into a rolling line via `\r` rewrites on a TTY (or one summary line on `model_response` when stderr is piped). One formatter per `TraceEvent` kind; `NO_COLOR` disables ANSI escapes.
+
+**`packages/runtime-core`** — `observability.ts` exports `attachDefaultSubscribers(bus, runContext)` which conditionally attaches the three subscribers based on env. `runChatLoop` constructs (or reuses) a `TraceEventBus` on `RunContext`, calls `setTurnNumber(n)` at every turn boundary, and publishes lifecycle events at every meaningful site: `turn_start/end`, `model_request/response/stream_token`, `tool_call_start/end`, `permission_decision`, `compaction_fired` (both pre-turn and reactive), `error_recovered`. The existing `logger.*` and `logEvent(...)` calls stay intact (additive design — `CREWHAUS_LOG` and `CREWHAUS_TRACE` are independent surfaces).
+
+**`packages/run-context` / `packages/agent-context-isolation`** — `RunContext` gains a required `eventBus: TraceEventBus` field (defaulted in the factory so existing tests keep working). `createIsolatedContext` mints the child's bus with `inheritTraceId: parent.eventBus.traceId, inheritParentSpanId: parent.eventBus.currentSpanId` so OTel stitches parent and sub-agent runs into one trace.
+
+**`packages/mcp-host`, `packages/hooks-engine`, `packages/sub-agent-spawner`** — Each gains an optional `eventBus?: TraceEventBus` and emits its own internal events: `mcp_call_start/end` around `sdk.callTool`, `hook_fired` after each hook subprocess settles, `sub_agent_start/end` on the parent bus around the child run.
+
+### End-to-end smoke (`scripts/section-15-smoke.ts`)
+
+Compiles `examples/section-15-smoke` (Bash + REPL), spins up `otel/opentelemetry-collector-contrib` via docker on `:4318` with a `debug` exporter, drives a 3-turn conversation against the live model with a single Bash tool call, and verifies (a) the collector saw `gen_ai.system` / `gen_ai.request.model` / `gen_ai.usage.input_tokens` attributes plus a `tool.Bash` span all under one traceId, (b) agent stderr contains pretty-printed `[model_request]` / `[tool_call_start]` events, (c) agent stdout ends with a JSON metrics dump containing `crewhaus_turns_total ≥ 3` and `crewhaus_tool_calls_total{tool="Bash"} ≥ 1`. A second baseline run with no observability env vars confirms the opt-in invariant — when `CREWHAUS_TRACE` / `CREWHAUS_METRICS` / `OTEL_EXPORTER_OTLP_ENDPOINT` are unset the agent's output matches pre-Section-15 behaviour exactly.
+
+### Env var matrix
+
+| Variable | Effect |
+|----------|--------|
+| `CREWHAUS_TRACE=pretty\|json` | Attaches `structured-event-printer`. Pretty → stderr with ANSI colors and a rolling token-stream line; JSON → JSON Lines on stdout. |
+| `CREWHAUS_METRICS=stdout\|textfile\|textfile:/path\|http:PORT` | Attaches `metrics-collector`. `stdout` buffers and emits one JSON dump on flush. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT=http://host:4318` | Attaches `otel-exporter` (OTLP/HTTP only). |
+| `OTEL_EXPORTER_OTLP_HEADERS="k1=v1,k2=v2"` | Headers added to every OTLP POST. |
+| `OTEL_SERVICE_NAME=...` | Sets the `service.name` resource attribute (default `crewhaus`). |
+| `TRACEPARENT=00-<32hex>-<16hex>-<2hex>` | W3C inbound trace context — daemon-mode traces stitch under an upstream gateway's traceId. |
 
 ---
 

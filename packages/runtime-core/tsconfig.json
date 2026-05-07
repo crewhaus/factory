@@ -28,6 +28,10 @@
     { "path": "../tool-loop-detection" },
     { "path": "../tool-result-store" },
     { "path": "../streaming-tool-executor" },
-    { "path": "../turn-state-machine" }
+    { "path": "../turn-state-machine" },
+    { "path": "../trace-event-bus" },
+    { "path": "../structured-event-printer" },
+    { "path": "../metrics-collector" },
+    { "path": "../otel-exporter" }
   ]
 }

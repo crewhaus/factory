@@ -4,6 +4,6 @@
     "rootDir": "src",
     "outDir": "dist"
   },
-  "references": [{ "path": "../logging" }],
+  "references": [{ "path": "../logging" }, { "path": "../trace-event-bus" }],
   "include": ["src/**/*"]
 }

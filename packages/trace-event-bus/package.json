@@ -1,0 +1,18 @@
+{
+  "name": "@crewhaus/trace-event-bus",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "In-process trace event bus with ring-buffered history and W3C trace-context propagation",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@crewhaus/logging": "workspace:*"
+  }
+}

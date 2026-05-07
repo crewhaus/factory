@@ -13,6 +13,7 @@
     "test": "bun test src"
   },
   "dependencies": {
-    "@crewhaus/logging": "workspace:*"
+    "@crewhaus/logging": "workspace:*",
+    "@crewhaus/trace-event-bus": "workspace:*"
   }
 }

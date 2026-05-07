@@ -9,6 +9,7 @@
  */
 import { randomBytes, randomUUID } from "node:crypto";
 import { type Logger, createLogger } from "@crewhaus/logging";
+import { TraceEventBus } from "@crewhaus/trace-event-bus";
 
 export type RunContext = {
   readonly runId: string;
@@ -17,6 +18,14 @@ export type RunContext = {
   turnNumber: number;
   readonly abortSignal: AbortSignal;
   readonly logger: Logger;
+  /**
+   * Per-run trace bus. Always non-null — the factory mints a default
+   * subscriber-less bus when none is supplied. Pluggable subscribers
+   * (otel-exporter, metrics-collector, structured-event-printer) are
+   * attached by the orchestrator's `attachDefaultSubscribers` helper based
+   * on env vars.
+   */
+  readonly eventBus: TraceEventBus;
 };
 
 export type RunContextOptions = {
@@ -35,6 +44,12 @@ export type RunContextOptions = {
   sessionId?: string;
   abortSignal?: AbortSignal;
   logger?: Logger;
+  /**
+   * Override the auto-constructed `TraceEventBus`. Sub-agents pass a child
+   * bus they minted via `inheritTraceId` so the parent and child share one
+   * OpenTelemetry trace.
+   */
+  eventBus?: TraceEventBus;
 };
 
 function shortId(): string {
@@ -53,8 +68,9 @@ function generateSessionId(): string {
 
 /**
  * Build a fresh RunContext with sensible defaults: random ids, a
- * never-aborted signal, and a logger that has the run/session ids
- * pre-bound so every log line is tagged automatically.
+ * never-aborted signal, a logger that has the run/session ids
+ * pre-bound so every log line is tagged automatically, and a fresh
+ * `TraceEventBus`.
  */
 export function createRunContext(opts: RunContextOptions = {}): RunContext {
   const runId = opts.runId ?? `run_${shortId()}`;
@@ -62,11 +78,13 @@ export function createRunContext(opts: RunContextOptions = {}): RunContext {
   const abortSignal = opts.abortSignal ?? new AbortController().signal;
   const baseLogger = opts.logger ?? createLogger();
   const logger = baseLogger.child({ runId, sessionId });
+  const eventBus = opts.eventBus ?? new TraceEventBus({ runId, sessionId, logger });
   return {
     runId,
     sessionId,
     turnNumber: 0,
     abortSignal,
     logger,
+    eventBus,
   };
 }

@@ -14,6 +14,7 @@
   },
   "dependencies": {
     "@crewhaus/errors": "workspace:*",
-    "@crewhaus/logging": "workspace:*"
+    "@crewhaus/logging": "workspace:*",
+    "@crewhaus/trace-event-bus": "workspace:*"
   }
 }

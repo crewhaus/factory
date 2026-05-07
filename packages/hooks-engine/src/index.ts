@@ -44,6 +44,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
 import { type Logger, createLogger } from "@crewhaus/logging";
+import type { TraceEventBus } from "@crewhaus/trace-event-bus";
 
 export const HOOK_EVENTS = [
   "session-start",
@@ -93,6 +94,8 @@ export type RunHooksOptions = {
   readonly signal?: AbortSignal;
   /** Override env source (testing). Defaults to `process.env`. */
   readonly parentEnv?: NodeJS.ProcessEnv;
+  /** Optional Section 15 trace bus. Each fired hook emits a `hook_fired` event. */
+  readonly eventBus?: TraceEventBus;
 };
 
 const DEFAULT_TIMEOUT_MS = 5_000;
@@ -214,8 +217,26 @@ export async function runHooks(
   });
   if (filtered.length === 0) return [];
   const logger = opts.logger;
+  const bus = opts.eventBus;
   const env = buildHookEnv(opts.parentEnv ?? process.env);
-  return Promise.all(filtered.map((hook) => runOne(hook, payload, env, logger, opts.signal)));
+  const results = await Promise.all(
+    filtered.map((hook) => runOne(hook, payload, env, logger, opts.signal)),
+  );
+  if (bus) {
+    for (const r of results) {
+      const allowed = r.decision.decision === "allow";
+      bus.publish({
+        ...bus.envelope(),
+        kind: "hook_fired",
+        event,
+        ...(r.hook.matcher ? { matcher: r.hook.matcher } : {}),
+        allowed,
+        durationMs: r.durationMs,
+        ...(r.decision.reason ? { reason: r.decision.reason } : {}),
+      });
+    }
+  }
+  return results;
 }
 
 function extractMatchTarget(payload: unknown, matcherKey: string): string | undefined {
