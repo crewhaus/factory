@@ -72,6 +72,7 @@ describe("storeAndPreview — over threshold", () => {
     expect(statSync(out.fullPath).size).toBe(Buffer.byteLength(padded, "utf8"));
 
     // Preview = first DEFAULT_PREVIEW_LINES lines + truncation marker.
+    if (typeof out.previewContent !== "string") throw new Error("expected string preview");
     const previewLines = out.previewContent.split("\n");
     // last line should be the marker, the line before that may be partial.
     expect(previewLines[previewLines.length - 1]).toContain("[truncated, full output at ");
