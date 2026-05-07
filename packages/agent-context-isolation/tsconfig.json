@@ -11,7 +11,8 @@
     { "path": "../permission-engine" },
     { "path": "../run-context" },
     { "path": "../state-store" },
-    { "path": "../tool-catalog" }
+    { "path": "../tool-catalog" },
+    { "path": "../trace-event-bus" }
   ],
   "include": ["src/**/*"]
 }

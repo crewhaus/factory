@@ -36,6 +36,10 @@
     "@crewhaus/tool-result-store": "workspace:*",
     "@crewhaus/streaming-tool-executor": "workspace:*",
     "@crewhaus/turn-state-machine": "workspace:*",
+    "@crewhaus/trace-event-bus": "workspace:*",
+    "@crewhaus/structured-event-printer": "workspace:*",
+    "@crewhaus/metrics-collector": "workspace:*",
+    "@crewhaus/otel-exporter": "workspace:*",
     "zod-to-json-schema": "^3.23.5"
   },
   "devDependencies": {

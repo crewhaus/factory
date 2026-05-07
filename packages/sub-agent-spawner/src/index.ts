@@ -71,6 +71,21 @@ export async function spawnSubAgent(
     },
   });
 
+  // Section 15: also publish on the parent bus so OTel/metrics see the boundary.
+  // Use the same spanId for start/end so the OTel exporter pairs them.
+  const parentBus = parent.runContext.eventBus;
+  const subAgentEnvelope = parentBus.envelope();
+  parentBus.publish({
+    ...subAgentEnvelope,
+    kind: "sub_agent_start",
+    name: opts.def.name,
+    childRunId: child.runContext.runId,
+    childSessionId: child.sessionId,
+    toolCount: opts.childTools.length,
+    promptBytes: Buffer.byteLength(opts.prompt, "utf8"),
+  });
+
+  const t0SubAgent = performance.now();
   let finalMessage = "";
   let isError = false;
   let errorMessage: string | undefined;
@@ -135,6 +150,19 @@ export async function spawnSubAgent(
       finalMessageLength: finalMessage.length,
       toolCallCount: toolCalls.length,
     },
+  });
+
+  parentBus.publish({
+    ...parentBus.envelope(),
+    spanId: subAgentEnvelope.spanId,
+    kind: "sub_agent_end",
+    name: opts.def.name,
+    childRunId: child.runContext.runId,
+    childSessionId: child.sessionId,
+    isError,
+    toolCallCount: toolCalls.length,
+    finalMessageBytes: Buffer.byteLength(finalMessage, "utf8"),
+    durationMs: performance.now() - t0SubAgent,
   });
 
   await child.close();

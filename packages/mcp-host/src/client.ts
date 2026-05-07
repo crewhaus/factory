@@ -1,5 +1,6 @@
 import { McpConnectionError, McpError, McpProtocolError } from "@crewhaus/errors";
 import type { Logger } from "@crewhaus/logging";
+import type { TraceEventBus } from "@crewhaus/trace-event-bus";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -38,6 +39,8 @@ export type McpClientOptions = {
   /** Override the timer scheduler (tests). */
   readonly setTimer?: (cb: () => void, ms: number) => unknown;
   readonly clearTimer?: (handle: unknown) => void;
+  /** Optional Section 15 trace bus. When supplied, every callTool emits paired mcp_call_start/end events. */
+  readonly eventBus?: TraceEventBus;
 };
 
 /**
@@ -68,6 +71,7 @@ export class McpClient {
   private readonly callTimeoutMs: number;
   private readonly setTimer: (cb: () => void, ms: number) => unknown;
   private readonly clearTimer: (handle: unknown) => void;
+  private readonly eventBus: TraceEventBus | undefined;
 
   private state: McpClientState = { kind: "idle" };
   private sdk: Client | null = null;
@@ -88,6 +92,7 @@ export class McpClient {
     this.callTimeoutMs = opts.callTimeoutMs ?? DEFAULT_CALL_TIMEOUT_MS;
     this.setTimer = opts.setTimer ?? ((cb, ms) => setTimeout(cb, ms));
     this.clearTimer = opts.clearTimer ?? ((h) => clearTimeout(h as ReturnType<typeof setTimeout>));
+    this.eventBus = opts.eventBus;
     // The initial connectedDeferred can sit unresolved indefinitely (until
     // first connect() or disconnect()). Attach a no-op catch so a later
     // disconnect-without-await doesn't surface as an unhandled rejection.
@@ -242,6 +247,17 @@ export class McpClient {
     if (!sdk) throw new McpConnectionError(`mcp client "${this.name}" lost connection`);
 
     const timeoutMs = opts.timeoutMs ?? this.callTimeoutMs;
+    const bus = this.eventBus;
+    const startEnv = bus?.envelope();
+    if (bus && startEnv) {
+      bus.publish({
+        ...startEnv,
+        kind: "mcp_call_start",
+        server: this.name,
+        toolName: name,
+      });
+    }
+    const t0 = performance.now();
     let raw: unknown;
     try {
       raw = await sdk.callTool(
@@ -255,10 +271,35 @@ export class McpClient {
         },
       );
     } catch (err) {
+      if (bus && startEnv) {
+        bus.publish({
+          ...bus.envelope(),
+          spanId: startEnv.spanId,
+          kind: "mcp_call_end",
+          server: this.name,
+          toolName: name,
+          isError: true,
+          durationMs: performance.now() - t0,
+        });
+      }
       throw wrapAsCallError(err, `mcp call "${this.name}.${name}" failed`);
     }
 
-    return reduceCallResult(raw as { content?: ReadonlyArray<unknown>; isError?: boolean });
+    const reduced = reduceCallResult(
+      raw as { content?: ReadonlyArray<unknown>; isError?: boolean },
+    );
+    if (bus && startEnv) {
+      bus.publish({
+        ...bus.envelope(),
+        spanId: startEnv.spanId,
+        kind: "mcp_call_end",
+        server: this.name,
+        toolName: name,
+        isError: reduced.isError === true,
+        durationMs: performance.now() - t0,
+      });
+    }
+    return reduced;
   }
 
   /**

@@ -1,0 +1,16 @@
+name: section-15-smoke
+target: cli
+agent:
+  model: claude-sonnet-4-6
+  instructions: |
+    You are a CrewHaus Section 15 smoke-test agent. Follow the user's
+    instructions verbatim. When asked to run a Bash command, use the Bash
+    tool exactly once with the command they specify. Do not editorialize.
+    Replies should be one short sentence.
+tools:
+  - bash
+permissions:
+  mode: default
+  rules:
+    - type: alwaysAllow
+      pattern: "Bash(ls **)"

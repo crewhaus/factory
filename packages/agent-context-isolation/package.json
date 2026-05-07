@@ -19,6 +19,7 @@
     "@crewhaus/permission-engine": "workspace:*",
     "@crewhaus/run-context": "workspace:*",
     "@crewhaus/state-store": "workspace:*",
-    "@crewhaus/tool-catalog": "workspace:*"
+    "@crewhaus/tool-catalog": "workspace:*",
+    "@crewhaus/trace-event-bus": "workspace:*"
   }
 }

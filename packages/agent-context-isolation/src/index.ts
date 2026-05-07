@@ -21,6 +21,7 @@
  * `sub_agent_end` events on the parent's existing `EventLog`; the child's
  * own transcript lives in a separate `<childSessionId>.jsonl` file.
  */
+import { randomBytes, randomUUID } from "node:crypto";
 import { type AbortTree, createAbortTree } from "@crewhaus/abort-controller";
 import { type EventLog, openEventLog } from "@crewhaus/event-log";
 import type { HookDef } from "@crewhaus/hooks-engine";
@@ -28,6 +29,7 @@ import type { PermissionMode, RuleSet } from "@crewhaus/permission-engine";
 import { type RunContext, createRunContext } from "@crewhaus/run-context";
 import { type Store, createStore } from "@crewhaus/state-store";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import { TraceEventBus } from "@crewhaus/trace-event-bus";
 
 /**
  * A sub-agent definition. The `name` field is set from the spec map's key at
@@ -184,10 +186,26 @@ export async function createIsolatedContext(
 
   // Fresh identity. createRunContext mints randomBytes(8)→sess_<16hex> and
   // a short runId; we let the parent's logger seed the child's logger so
-  // every log line carries the inherited app/session bindings.
+  // every log line carries the inherited app/session bindings. The child's
+  // event bus inherits the parent's traceId and is rooted under the parent
+  // bus's currently-open span, so OpenTelemetry stitches both runs into one
+  // trace. The runId/sessionId on the child's events differ from the parent's
+  // so subscribers can still distinguish per-run aggregates.
+  const childRunId = `run_${randomUUID().slice(0, 8)}`;
+  const childSessionId = `sess_${randomBytes(8).toString("hex")}`;
+  const childBus = new TraceEventBus({
+    runId: childRunId,
+    sessionId: childSessionId,
+    inheritTraceId: parent.runContext.eventBus.traceId,
+    inheritParentSpanId: parent.runContext.eventBus.currentSpanId,
+    logger: parent.runContext.logger,
+  });
   const runContext = createRunContext({
+    runId: childRunId,
+    sessionId: childSessionId,
     abortSignal: abortTree.signal,
     logger: parent.runContext.logger,
+    eventBus: childBus,
   });
 
   const sessionRootDir = opts.sessionRootDir ?? parent.sessionRootDir;
