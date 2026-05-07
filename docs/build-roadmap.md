@@ -426,50 +426,51 @@ Throughout the loop, every message-mutation site emits a corresponding event —
 
 ## Section 11 — Hooks, skills, slash commands
 
-> Status: not started.
+> Status: ✅ complete (PR pending).
 
 **Catalog modules:** `hooks-engine` (R9), `skills-registry` (R9), `slash-commands` (R9)
 
-These three modules give users an extension surface — the difference between a fixed harness and a customizable one. `hooks-engine` is the structural primitive both other modules build on; `skills-registry` and `slash-commands` are user-facing features that depend on it.
+Three new R9 packages plus a runtime-core integration that wires lifecycle hooks at every meaningful moment, advertises lazy-loaded skills in the system prompt with a synthetic `Skill(name)` tool, and intercepts `/<name>` user input for markdown-templated expansion. The user-facing payoff: drop a `.crewhaus/settings.json` with a `pre-tool` hook to gate Bash; drop a `SKILL.md` under `.crewhaus/skills/say-pirate/` and the model will pick it up via Skill tool calls; drop `.crewhaus/commands/explain.md` containing `Explain $ARGUMENTS in two sentences.` and `/explain quicksort` becomes a fully expanded user message before it reaches the model.
 
-### Build order within this section
+### What was built
 
-```
-hooks-engine  ──►  skills-registry      (parallel after hooks-engine)
-                   slash-commands
-```
+- **`hooks-engine`** — `loadHooks({ cwd, homeDir })` reads `~/.crewhaus/settings.json` then `<cwd>/.crewhaus/settings.json` (user first, project last), validates each entry against the `HookEvent` union, and returns a flat `HookDef[]`. `runHooks(event, payload, hooks)` filters by event + glob-match (`hook.matcher` against `payload[matcherKey ?? "name"]` — supports `*`, `**`, `?`), then spawns each surviving hook in parallel via `Bun.spawn(["sh", "-c", cmd])` with a **restricted env** (`PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`, `HOME`, `USER`, `LANG`, `TERM`, `TMPDIR`, `LC_*` only — no `ANTHROPIC_AUTH_TOKEN`, no `AWS_*`, no `GH_TOKEN`, no `OPENAI_API_KEY`, etc.). Each spawn writes JSON payload to stdin, reads JSON decision from stdout, has a 5 s default timeout (SIGKILL on miss), and falls back to a synthetic `deny` on malformed JSON, non-zero exit, or timeout. `aggregateDecisions(results)` short-circuits on the first deny/block; allows shallow-merge their `mutate` objects. v1 only honours `mutate` for `pre-slash` (the `expanded` field). A drain-grace pattern mirroring `tool-bash` keeps the loop responsive when a hook spawns a long-running grandchild that orphans the pipe.
+- **`skills-registry`** — `discoverSkills({ cwd, homeDir, pluginDirs })` walks `~/.crewhaus/skills/*/SKILL.md` then project then plugin dirs, parses frontmatter with `yaml` (already vendored via `@crewhaus/spec`), and returns `SkillRef[]` with `{ name, description, triggers?, tools?, filePath }`. `parseSkillFile(content)` is exposed for testing. `formatSkillsForPrompt(skills)` produces an "Available skills" block for the system prompt that lists names + descriptions only; `loadSkillBody(ref)` reads the full body on demand. `createSkillTool(skills)` builds a `RegisteredTool` with `name: "Skill"`, `inputSchema: z.object({ name: z.string() })`, `readOnly: true`, `concurrencySafe: true` whose `execute` calls `loadSkillBody`. The lazy-load contract: `discoverSkills` reads frontmatter only; the full body is read **only** when the model calls `Skill({ name })`. Frontmatter `tools?` is parsed but not yet enforced at runtime.
+- **`slash-commands`** — `loadCommands({ cwd })` reads `<cwd>/.crewhaus/commands/*.md` with optional frontmatter (`description`, `argument-hint` → `argumentHint`); each file's basename (sans `.md`) becomes the command name. `expand(input, commands)` matches `^\/(\S+)\s*([\s\S]*)$`, looks up the command, and substitutes via `body.split("$ARGUMENTS").join(args)` — non-recursive, no regex, so args containing `$ARGUMENTS`/regex specials/multi-line content pass through untouched. Inputs without a leading `/` or with unknown command names return `{ handled: false, expanded: input }`. Property test runs 200 random body+args pairs against the substitution invariant.
 
-### What to build
+### Runtime integration (`runtime-core`)
 
-**`packages/hooks-engine`**
-- Lifecycle events: `session-start`, `pre-tool`, `post-tool`, `pre-compact`, `post-compact`, `stop`, `pre-model`, `post-model`
-- Hook def: `{ event, matcher?: string, command: string }` — runs an arbitrary shell command via `Bun.spawn`, passing event payload as JSON on stdin and reading a JSON decision from stdout
-- Decision shape: `{ decision: "allow" | "deny" | "block", reason?, mutate?: object }`
-- Loaded from `.crewhaus/settings.json` (project) and `~/.crewhaus/settings.json` (user); user settings stack under project settings
-- API: `loadHooks()`, `runHooks(event, payload): Promise<HookResult[]>`
-- References: `openclaw/hooks/`, `claude-code/hooks/`
+Three new options on `runChatLoop`:
 
-**`packages/skills-registry`** *(parallel after hooks)*
-- A "skill" is a directory containing `SKILL.md` with frontmatter (`name`, `description`, `triggers?`, `tools?`)
-- Discovery order: `~/.crewhaus/skills/`, `<project>/.crewhaus/skills/`, plugin-bundled skills
-- Lazy load: list all skills at boot (just frontmatter), inject the *names + descriptions* into the system prompt; load full body only when the model calls the `Skill` tool with that name
-- Adds a built-in `Skill(name)` tool to the default catalog when skills are present
-- References: `openclaw/agents/skills/`, `claude-code/skills/`
+- `hooks?: ReadonlyArray<HookDef>` — discovered at boot by the caller, threaded through.
+- `skills?: ReadonlyArray<SkillRef>` — used to format an "Available skills:" cache-controlled text block appended to `systemBlocks`. The caller adds `createSkillTool(skills)` to the `tools` array separately, keeping runtime-core agnostic about the synthetic tool's identity.
+- `slashCommands?: ReadonlyMap<string, SlashCommand>` — when a REPL turn begins with a registered `/<name>`, the body is expanded (with $ARGUMENTS substitution) before being pushed to `messages`.
 
-**`packages/slash-commands`** *(parallel after hooks)*
-- A slash command is a markdown file in `.crewhaus/commands/<name>.md` with optional frontmatter (`description`, `argument-hint`)
-- When the user input starts with `/<name>`, expand the markdown body (with `$ARGUMENTS` substitution) into the user message and submit
-- API: `loadCommands(): Map<string, SlashCommand>`, `expand(input: string, commands): { handled: boolean, expanded: string }`
-- Hook integration: fires a `pre-slash` hook event before expansion so users can intercept
-- References: `openclaw/commands/`, `claude-code/commands.ts`
+Hook firing points (logged at debug level via `runContext.logger`, errors from a misbehaving hook fall through as `allowed: true`):
 
-### Integration into `runtime-core` and `apps/cli`
-- `runChatLoop` fires hook events at the right moments (`pre-tool` before each tool execution, `post-tool` after, etc.); a `deny` decision short-circuits with the hook's reason as the result
-- `apps/cli/src/index.ts` `run` subcommand checks for slash commands on each user input before sending to the model
-- System prompt builder gets a new section that lists available skills
+| Event | When | Effect of deny/block |
+|---|---|---|
+| `session-start` | After persistence + run-context boot, before tool/permission setup | log only |
+| `pre-tool` | Top of `executeOneToolUse`, after `logEvent("tool_use")` | short-circuit with `[blocked by hook] <reason>` as the tool result |
+| `post-tool` | Inside the `finish()` callback | log only |
+| `pre-model` | NeedModel case, before `client.messages.stream` | append synthetic assistant `[blocked by hook] <reason>`, transition to `Done` |
+| `post-model` | After `logEvent("assistant_message")` (both streaming and non-streaming paths) | log only |
+| `pre-compact` / `post-compact` | Around `maybeCompact` (pre-turn) and `forceCompact` (reactive recovery) | log only |
+| `pre-slash` | REPL after reading `userInput`, before substitution | deny falls through with original input; `mutate.expanded` overrides |
+| `stop` | First line of `finally` in both REPL and singleTurn paths | log only |
+
+### CLI + codegen
+
+`apps/cli/src/index.ts run` calls `loadHooks` / `discoverSkills` / `loadCommands` once before `runChatLoop` and forwards them. `target-cli` and `target-workflow` codegen always emit the same three loaders + `createSkillTool` weave so compiled bundles have parity with the in-memory `crewhaus run`. The `buildRuleSet` `settings.json` parser was tightened to only consume the `permissions` sub-object (so the new top-level `hooks` key doesn't trip the strict validator).
+
+### End-to-end smoke (live model via `ANTHROPIC_AUTH_TOKEN`, scripts/section-11-smoke.ts)
+
+1. **Hook deny**: project `.crewhaus/settings.json` with a `pre-tool` matcher `Bash` returning `{"decision":"deny","reason":"smoke test deny"}`. Prompted "Run `whoami`". The runtime emitted `[hooks] 1 loaded` and `[tool: Bash]`, then the assistant replied "It looks like the `whoami` command was blocked by a security policy." — `whoami` never executed (no bare username in stdout).
+2. **Skill say-pirate**: `.crewhaus/skills/say-pirate/SKILL.md` with description `respond like a 1700s pirate`. Prompted "Use the say-pirate skill and greet me". The runtime emitted `[skills] 1 available: say-pirate`; the model called `Skill({ name: "say-pirate" })` (logged as `[tool: Skill]`); the reply contained pirate vocabulary (`ye`, `arr`, `matey`).
+3. **Slash `/explain`**: `.crewhaus/commands/explain.md` with body `Explain $ARGUMENTS in two short sentences. Be technical and direct.`. Typed `/explain quicksort`. The runtime emitted `[slash] 1 commands: explain`; the model received the substituted prompt and answered with quicksort vocabulary (`partition`, `pivot`, `divide`) — no meta-comment about a slash command.
 
 ### Tests
-`hooks-engine`: integration test (`T3`) with a fixture hook that returns `deny` and verifying the tool is blocked; security test (`T8`) verifying hook commands inherit a restricted env. `skills-registry`: unit test (`T1`) for frontmatter parsing; integration test (`T3`) verifying full skill body is only loaded on tool call. `slash-commands`: property test (`T9`) over `$ARGUMENTS` substitution edge cases.
+`hooks-engine`: 26 tests over T1 (loadHooks layered loading, malformed entry validation, aggregateDecisions algebra), T3 (fixture deny / allow scripts, glob filter, malformed JSON / non-zero exit / SIGKILL timeout), and T8 (env strips `ANTHROPIC_AUTH_TOKEN`/`AWS_*`/`GH_TOKEN`/`OPENAI_API_KEY` regardless of parent env, both at the unit-test and the spawned-subprocess layer). `skills-registry`: 21 tests covering T1 frontmatter parsing edge cases (BOM, missing fields, unterminated frontmatter), T1 discovery layering (project overrides user by name; plugin dirs included), and T3 lazy-load contract (`discoverSkills` doesn't touch the body; `Skill.execute` does). `slash-commands`: 18 tests including a T9 property test that runs 200 random `body × args` pairs against the algebraic invariant `expanded === body.split("$ARGUMENTS").join(extracted-args)` — args with regex specials, embedded `$ARGUMENTS`, and newlines are all covered. `compiler`: two new tests verify the Section 11 extension surface lands in every compiled CLI bundle and the workflow target's per-step Skill-tool weave.
 
 ---
 

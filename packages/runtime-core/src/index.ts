@@ -5,6 +5,7 @@ import { autoCompact } from "@crewhaus/compaction-autocompact";
 import { snip } from "@crewhaus/compaction-snip";
 import { RuntimeError } from "@crewhaus/errors";
 import { type EventKind, type EventLog, openEventLog } from "@crewhaus/event-log";
+import { type HookDef, type HookEvent, aggregateDecisions, runHooks } from "@crewhaus/hooks-engine";
 import {
   BUILTIN_DEFAULT_RULES,
   type PermissionMode,
@@ -20,6 +21,8 @@ import {
 } from "@crewhaus/recovery-engine";
 import { type RunContext, createRunContext } from "@crewhaus/run-context";
 import { type SessionStore, createSessionStore } from "@crewhaus/session-store";
+import { type SkillRef, formatSkillsForPrompt } from "@crewhaus/skills-registry";
+import { type SlashCommand, expand as expandSlash } from "@crewhaus/slash-commands";
 import { type Store, createStore } from "@crewhaus/state-store";
 import { executeStreaming } from "@crewhaus/streaming-tool-executor";
 import { TokenBudget, estimateTokens } from "@crewhaus/token-budget";
@@ -302,6 +305,27 @@ export type RunChatLoopOptions = {
    * the run context for this run.
    */
   resume?: { readonly sessionId: string };
+  /**
+   * Section 11 — lifecycle hooks discovered from `.crewhaus/settings.json`.
+   * The runtime fires events at key moments (session-start, pre/post tool,
+   * pre/post model, pre/post compact, pre-slash, stop). A `deny` decision
+   * on `pre-tool` short-circuits with the hook's reason as the result; on
+   * `pre-model` it appends `[blocked by hook]` and ends the turn.
+   */
+  hooks?: ReadonlyArray<HookDef>;
+  /**
+   * Section 11 — discovered skills, advertised in the system prompt. The
+   * caller is responsible for adding `createSkillTool(skills)` to the
+   * `tools` array; runtime-core only formats them into the system block.
+   */
+  skills?: ReadonlyArray<SkillRef>;
+  /**
+   * Section 11 — slash-command registry. When the user input starts with
+   * `/<name>` and `<name>` is in this map, the body is expanded with
+   * `$ARGUMENTS` substitution before being sent to the model. Fires
+   * `pre-slash` first; deny falls through to the original input.
+   */
+  slashCommands?: ReadonlyMap<string, SlashCommand>;
 };
 
 /**
@@ -396,6 +420,38 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     await eventLog.append({ kind, payload });
   }
 
+  // Section 11 — fire matching hooks for `event` and aggregate the result.
+  // No-ops when no hooks are configured. The aggregated decision exposes
+  // `allowed` / `reason` / `mutate`; v1 callers honour `mutate` only for
+  // `pre-slash` (the `expanded` field). Errors are caught and surfaced as
+  // a deny so a misbehaving hook implementation does not crash the run.
+  const hooks = opts.hooks ?? [];
+  async function fireHook(
+    event: HookEvent,
+    payload: unknown,
+  ): Promise<{ allowed: boolean; reason?: string; mutate?: Record<string, unknown> }> {
+    if (hooks.length === 0) return { allowed: true };
+    try {
+      const results = await runHooks(event, payload, hooks, { logger: runContext.logger });
+      return aggregateDecisions(results);
+    } catch (err) {
+      runContext.logger.warn("hook firing failed", {
+        event,
+        error: (err as Error).message,
+      });
+      return { allowed: true };
+    }
+  }
+
+  // Section 11 — `session-start` fires once after the persistence + run
+  // context boot is complete. Observational only (no deny/block effect).
+  await fireHook("session-start", {
+    sessionId,
+    model: opts.model,
+    target: opts.sessionTarget ?? "cli",
+    resumed: opts.resume !== undefined,
+  });
+
   const contextLimit = opts.contextLimit ?? DEFAULT_CONTEXT_LIMIT;
   const compactionThreshold = opts.compactionThreshold ?? DEFAULT_COMPACTION_THRESHOLD;
   const snipKeepHead = opts.snipKeepHead ?? DEFAULT_SNIP_KEEP_HEAD;
@@ -411,9 +467,19 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     text: opts.instructions,
     cache_control: { type: "ephemeral" },
   };
+  // Section 11 — append a "Available skills:" block to the system prompt
+  // when skills are configured. The block lists names + descriptions only;
+  // the model reaches each skill's body by calling the `Skill` tool (which
+  // the caller is responsible for adding to the tools array).
+  const skills = opts.skills ?? [];
+  const skillsText = skills.length > 0 ? formatSkillsForPrompt(skills) : "";
+  const skillsBlock: Anthropic.TextBlockParam[] =
+    skillsText.length > 0
+      ? [{ type: "text", text: skillsText, cache_control: { type: "ephemeral" } }]
+      : [];
   const systemBlocks: Anthropic.TextBlockParam[] = isOAuth
-    ? [{ type: "text", text: CLAUDE_CODE_SYSTEM_PREFIX }, userInstructions]
-    : [userInstructions];
+    ? [{ type: "text", text: CLAUDE_CODE_SYSTEM_PREFIX }, userInstructions, ...skillsBlock]
+    : [userInstructions, ...skillsBlock];
 
   const tools = opts.tools ?? [];
   const anthropicTools: Anthropic.Tool[] | undefined =
@@ -471,6 +537,21 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         content: typeof result.content === "string" ? result.content : "[non-string content]",
         isError: result.is_error === true,
       });
+      // Section 11 — fire post-tool after the result is captured. Decision
+      // is observational here: a deny on post-tool logs a warning but does
+      // not rewrite the result (the model has already received it once on
+      // the prior turn in some streaming scenarios).
+      const post = await fireHook("post-tool", {
+        id: tu.id,
+        name: tu.name,
+        isError: result.is_error === true,
+      });
+      if (!post.allowed) {
+        runContext.logger.warn("post-tool hook denied", {
+          tool: tu.name,
+          reason: post.reason,
+        });
+      }
       return result;
     };
     if (!tool) {
@@ -478,6 +559,18 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         type: "tool_result",
         tool_use_id: tu.id,
         content: `unknown tool "${tu.name}"`,
+        is_error: true,
+      });
+    }
+
+    // Section 11 — pre-tool hook: short-circuit with the hook's reason
+    // when any matching hook returns deny/block.
+    const preHook = await fireHook("pre-tool", { id: tu.id, name: tu.name, input: tu.input });
+    if (!preHook.allowed) {
+      return finish({
+        type: "tool_result",
+        tool_use_id: tu.id,
+        content: `[blocked by hook] ${preHook.reason ?? "denied"}`,
         is_error: true,
       });
     }
@@ -618,6 +711,29 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       switch (state.kind) {
         case "NeedModel": {
           process.stdout.write("agent> ");
+          // Section 11 — pre-model hook. Deny short-circuits the turn with
+          // a synthetic "[blocked by hook]" assistant message so the loop
+          // exits cleanly (state transitions through ModelReturnedText →
+          // Done(no_tools)).
+          const preModel = await fireHook("pre-model", {
+            model: opts.model,
+            streaming: opts.streaming === true,
+            messageCount: messages.length,
+          });
+          if (!preModel.allowed) {
+            const blockedText = `[blocked by hook] ${preModel.reason ?? "denied"}`;
+            process.stdout.write(`${blockedText}\n`);
+            const blockedBlock: Anthropic.TextBlock = {
+              type: "text",
+              text: blockedText,
+              citations: null,
+            };
+            messages.push({ role: "assistant", content: [blockedBlock] });
+            await logEvent("assistant_message", { content: [blockedBlock] });
+            terminalContent = [blockedBlock];
+            state = transition(state, { kind: "ModelReturnedText" });
+            break;
+          }
           try {
             const stream = client.messages.stream(
               {
@@ -661,6 +777,10 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               });
               await logEvent("assistant_message", { content: finalContent });
               terminalContent = [...finalContent];
+              await fireHook("post-model", {
+                streaming: true,
+                contentBlocks: finalContent.length,
+              });
 
               const toolUses = finalContent.filter(
                 (b): b is Anthropic.ToolUseBlock => b.type === "tool_use",
@@ -707,6 +827,11 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             });
             await logEvent("assistant_message", { content: final.content });
             terminalContent = final.content;
+            await fireHook("post-model", {
+              streaming: false,
+              stopReason: final.stop_reason,
+              contentBlocks: final.content.length,
+            });
 
             // Synthetic max_output_tokens recovery: stop_reason "max_tokens"
             // means the model was cut off mid-reply. Route through the
@@ -786,6 +911,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           switch (action.kind) {
             case "compact": {
               const before = messages.length;
+              await fireHook("pre-compact", { kind: "reactive", before });
               const compacted = await forceCompact({
                 messages,
                 client,
@@ -797,6 +923,11 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               messages.length = 0;
               messages.push(...compacted);
               await logEvent("compaction", {
+                kind: "reactive",
+                before,
+                after: messages.length,
+              });
+              await fireHook("post-compact", {
                 kind: "reactive",
                 before,
                 after: messages.length,
@@ -878,6 +1009,13 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         },
         async (info) => {
           await logEvent("compaction", info);
+          // Fire one pre-compact (info has the before-count from the work
+          // that just ran) followed by post-compact. Pre-compact in this
+          // path is observational — by the time onCompaction fires the
+          // step has already happened — but the pair lets hooks see both
+          // events for symmetry with the reactive path.
+          await fireHook("pre-compact", { ...info, phase: "pre-turn" });
+          await fireHook("post-compact", { ...info, phase: "pre-turn" });
         },
       );
 
@@ -887,6 +1025,11 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         .map((b) => b.text)
         .join("");
     } finally {
+      await fireHook("stop", {
+        sessionId,
+        turnCount: runContext.turnNumber,
+        reason: "complete",
+      });
       await sessionStore
         .update(sessionId, { lastTurnIndex: runContext.turnNumber })
         .catch((err) => {
@@ -985,8 +1128,34 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       if (userInput === "") continue;
       if (userInput === "exit" || userInput === "quit") break;
 
-      messages.push({ role: "user", content: userInput });
-      await logEvent("user_message", { content: userInput });
+      // Section 11 — slash-command expansion. When the user input matches
+      // a registered slash command, the markdown body (with $ARGUMENTS
+      // substitution) becomes the effective user message. A `pre-slash`
+      // hook fires first; deny falls through with the original input,
+      // mutate.expanded overrides the substituted text.
+      let effectiveInput = userInput;
+      if (opts.slashCommands && opts.slashCommands.size > 0) {
+        const slash = expandSlash(userInput, opts.slashCommands);
+        if (slash.handled) {
+          const decision = await fireHook("pre-slash", {
+            name: slash.command?.name,
+            arguments: slash.arguments,
+            expanded: slash.expanded,
+          });
+          if (decision.allowed) {
+            const override = decision.mutate?.["expanded"];
+            effectiveInput = typeof override === "string" ? override : slash.expanded;
+          } else {
+            runContext.logger.info("pre-slash hook denied", {
+              name: slash.command?.name,
+              reason: decision.reason,
+            });
+          }
+        }
+      }
+
+      messages.push({ role: "user", content: effectiveInput });
+      await logEvent("user_message", { content: effectiveInput });
       runContext.turnNumber += 1;
       runContext.logger.debug("turn start", {
         turn: runContext.turnNumber,
@@ -1007,6 +1176,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         },
         async (info) => {
           await logEvent("compaction", info);
+          await fireHook("pre-compact", { ...info, phase: "pre-turn" });
+          await fireHook("post-compact", { ...info, phase: "pre-turn" });
         },
       );
 
@@ -1026,6 +1197,11 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       });
     }
   } finally {
+    await fireHook("stop", {
+      sessionId,
+      turnCount: runContext.turnNumber,
+      reason: runAbort.signal.aborted ? "abort" : "exit",
+    });
     if (shouldInstallSigint) {
       process.removeListener("SIGINT", sigintHandler);
     }

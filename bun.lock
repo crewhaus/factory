@@ -19,12 +19,15 @@
       },
       "dependencies": {
         "@crewhaus/compiler": "workspace:*",
+        "@crewhaus/hooks-engine": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
         "@crewhaus/logging": "workspace:*",
         "@crewhaus/mcp-host": "workspace:*",
         "@crewhaus/permission-engine": "workspace:*",
         "@crewhaus/runtime-core": "workspace:*",
+        "@crewhaus/skills-registry": "workspace:*",
+        "@crewhaus/slash-commands": "workspace:*",
         "@crewhaus/spec": "workspace:*",
         "@crewhaus/tool-bash": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
@@ -99,6 +102,14 @@
         "@crewhaus/errors": "workspace:*",
       },
     },
+    "packages/hooks-engine": {
+      "name": "@crewhaus/hooks-engine",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/logging": "workspace:*",
+      },
+    },
     "packages/infra-utils": {
       "name": "@crewhaus/infra-utils",
       "version": "0.0.0",
@@ -154,10 +165,13 @@
         "@crewhaus/compaction-snip": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/event-log": "workspace:*",
+        "@crewhaus/hooks-engine": "workspace:*",
         "@crewhaus/permission-engine": "workspace:*",
         "@crewhaus/recovery-engine": "workspace:*",
         "@crewhaus/run-context": "workspace:*",
         "@crewhaus/session-store": "workspace:*",
+        "@crewhaus/skills-registry": "workspace:*",
+        "@crewhaus/slash-commands": "workspace:*",
         "@crewhaus/state-store": "workspace:*",
         "@crewhaus/streaming-tool-executor": "workspace:*",
         "@crewhaus/token-budget": "workspace:*",
@@ -180,6 +194,24 @@
       "version": "0.0.0",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
+      },
+    },
+    "packages/skills-registry": {
+      "name": "@crewhaus/skills-registry",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "yaml": "^2.6.0",
+        "zod": "^3.23.8",
+      },
+    },
+    "packages/slash-commands": {
+      "name": "@crewhaus/slash-commands",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "yaml": "^2.6.0",
       },
     },
     "packages/spec": {
@@ -216,6 +248,11 @@
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
       },
+      "peerDependencies": {
+        "@crewhaus/hooks-engine": "workspace:*",
+        "@crewhaus/skills-registry": "workspace:*",
+        "@crewhaus/slash-commands": "workspace:*",
+      },
     },
     "packages/target-workflow": {
       "name": "@crewhaus/target-workflow",
@@ -224,6 +261,11 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
+      },
+      "peerDependencies": {
+        "@crewhaus/hooks-engine": "workspace:*",
+        "@crewhaus/skills-registry": "workspace:*",
+        "@crewhaus/slash-commands": "workspace:*",
       },
     },
     "packages/token-budget": {
@@ -405,6 +447,8 @@
 
     "@crewhaus/event-log": ["@crewhaus/event-log@workspace:packages/event-log"],
 
+    "@crewhaus/hooks-engine": ["@crewhaus/hooks-engine@workspace:packages/hooks-engine"],
+
     "@crewhaus/infra-utils": ["@crewhaus/infra-utils@workspace:packages/infra-utils"],
 
     "@crewhaus/ir": ["@crewhaus/ir@workspace:packages/ir"],
@@ -422,6 +466,10 @@
     "@crewhaus/runtime-core": ["@crewhaus/runtime-core@workspace:packages/runtime-core"],
 
     "@crewhaus/session-store": ["@crewhaus/session-store@workspace:packages/session-store"],
+
+    "@crewhaus/skills-registry": ["@crewhaus/skills-registry@workspace:packages/skills-registry"],
+
+    "@crewhaus/slash-commands": ["@crewhaus/slash-commands@workspace:packages/slash-commands"],
 
     "@crewhaus/spec": ["@crewhaus/spec@workspace:packages/spec"],
 

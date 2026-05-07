@@ -1,0 +1,19 @@
+{
+  "name": "@crewhaus/hooks-engine",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Lifecycle hooks engine: load .crewhaus/settings.json, spawn hook commands with restricted env, aggregate decisions",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@crewhaus/errors": "workspace:*",
+    "@crewhaus/logging": "workspace:*"
+  }
+}
