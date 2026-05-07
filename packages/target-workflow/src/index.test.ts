@@ -24,6 +24,7 @@ const TWO_STEP_IR: IrWorkflowV0 = {
   ],
   mcp_servers: {},
   permissions: { rules: [] },
+  compaction: {},
 };
 
 describe("emitWorkflow", () => {

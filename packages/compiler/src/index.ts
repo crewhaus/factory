@@ -3,6 +3,7 @@ import type {
   Bundle,
   IrChannelV0,
   IrChannels,
+  IrCompaction,
   IrMcpServerConfig,
   IrMcpServers,
   IrNode,
@@ -146,6 +147,18 @@ function lowerToolConfigs(
   return Object.freeze({ ...raw });
 }
 
+/**
+ * Section 17 — normalise the optional `compaction` block. Always produce
+ * an object so codegen can read `ir.compaction.model` safely. When the
+ * spec omits the block entirely, the IR carries an empty object — runtime
+ * resolves to "use the agent's primary model" in that case.
+ */
+function lowerCompaction(spec: Spec): IrCompaction {
+  const c = spec.compaction;
+  if (c === undefined) return {};
+  return c.model !== undefined ? { model: c.model } : {};
+}
+
 export function lower(spec: Spec): IrNode {
   switch (spec.target) {
     case "cli":
@@ -162,6 +175,7 @@ export function lower(spec: Spec): IrNode {
         mcp_servers: lowerMcpServers(spec.mcp_servers),
         permissions: lowerPermissions(spec),
         subAgents: lowerSubAgents(spec.agent.sub_agents),
+        compaction: lowerCompaction(spec),
       } satisfies IrV0;
     case "workflow":
       return {
@@ -177,6 +191,7 @@ export function lower(spec: Spec): IrNode {
         })),
         mcp_servers: lowerMcpServers(spec.mcp_servers),
         permissions: lowerPermissions(spec),
+        compaction: lowerCompaction(spec),
       } satisfies IrWorkflowV0;
     case "channel":
       return {
@@ -194,6 +209,7 @@ export function lower(spec: Spec): IrNode {
         mcp_servers: lowerMcpServers(spec.mcp_servers),
         permissions: lowerPermissions(spec),
         subAgents: lowerSubAgents(spec.agent.sub_agents),
+        compaction: lowerCompaction(spec),
       } satisfies IrChannelV0;
     default:
       return assertNever(spec);

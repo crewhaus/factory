@@ -8,6 +8,7 @@ const MIN_IR: IrChannelV0 = {
   target: "channel",
   agent: { model: "claude-sonnet-4-6", instructions: "be helpful" },
   tools: [],
+  toolConfigs: {},
   channels: {
     slack: {
       botToken: { kind: "env", name: "SLACK_BOT_TOKEN" },
@@ -18,6 +19,7 @@ const MIN_IR: IrChannelV0 = {
   mcp_servers: {},
   permissions: { rules: [] },
   subAgents: [],
+  compaction: {},
 };
 
 const fileMap = (ir: IrChannelV0): Map<string, string> =>

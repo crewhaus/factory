@@ -64,30 +64,56 @@ describe("resolveAuth", () => {
   });
 });
 
-/** Anthropic client stub that counts `messages.stream` calls. */
-function makeStubClient(reply = "ok"): { client: Anthropic; calls: () => number } {
+/**
+ * Section 17 — synthetic ProviderAdapter that returns a single
+ * text-only stream per call. Counts how many times the runtime invokes
+ * the adapter so EOF / loop-exit assertions stay accurate.
+ */
+function makeStubAdapter(reply = "ok"): {
+  adapter: import("@crewhaus/adapter-anthropic").ProviderAdapter;
+  calls: () => number;
+} {
   let calls = 0;
-  const client = {
-    messages: {
-      stream: () => {
-        calls++;
-        return {
-          on: () => {},
-          finalMessage: async () => ({ content: [{ type: "text", text: reply }] }),
-        };
-      },
+  const adapter: import("@crewhaus/adapter-anthropic").ProviderAdapter = {
+    providerId: "anthropic",
+    features: {
+      caching: "explicit",
+      tool_use: true,
+      vision: true,
+      thinking: true,
+      web_search: true,
     },
-  } as unknown as Anthropic;
-  return { client, calls: () => calls };
+    estimateTokens: () => 0,
+    stream: () => {
+      calls++;
+      return (async function* () {
+        yield { kind: "message_start" } as const;
+        yield {
+          kind: "content_block_start",
+          index: 0,
+          block: { type: "text", text: "" },
+        } as const;
+        yield {
+          kind: "content_block_delta",
+          index: 0,
+          delta: { type: "text_delta", text: reply },
+        } as const;
+        yield { kind: "content_block_stop", index: 0 } as const;
+        yield { kind: "message_delta", stopReason: "end_turn" } as const;
+        yield { kind: "message_stop" } as const;
+      })();
+    },
+  };
+  return { adapter, calls: () => calls };
 }
 
 describe("runChatLoop stdin EOF handling", () => {
   test("exits cleanly when the input stream is already at EOF", async () => {
     const input = new PassThrough();
     input.end();
-    const { client, calls } = makeStubClient();
+    const { adapter, calls } = makeStubAdapter();
 
-    await runChatLoop({ model: "test-model", instructions: "test", client, input });
+    await runChatLoop({ model: "test-model", instructions: "test", _adapter: adapter, input });
 
     expect(calls()).toBe(0);
   });
@@ -96,17 +122,22 @@ describe("runChatLoop stdin EOF handling", () => {
     const input = new PassThrough();
     input.write("hi\n");
     input.end();
-    const { client, calls } = makeStubClient("hello back");
+    const { adapter, calls } = makeStubAdapter("hello back");
 
-    await runChatLoop({ model: "test-model", instructions: "test", client, input });
+    await runChatLoop({ model: "test-model", instructions: "test", _adapter: adapter, input });
 
     expect(calls()).toBe(1);
   });
 });
 
-/** Scripted Anthropic stub that cycles through pre-baked content blocks per call. */
+/**
+ * Scripted ProviderAdapter (Section 17) that cycles through pre-baked
+ * content-block arrays per call, synthesising the canonical StreamEvent
+ * sequence. Captures the messages + tools the runtime sent so tests
+ * can assert tool_result wiring, advertise-then-omit behaviour, etc.
+ */
 function makeScriptedClient(scripts: ReadonlyArray<Anthropic.ContentBlock[]>): {
-  client: Anthropic;
+  adapter: import("@crewhaus/adapter-anthropic").ProviderAdapter;
   callCount: () => number;
   capturedMessages: () => ReadonlyArray<ReadonlyArray<Anthropic.MessageParam>>;
   capturedTools: () => ReadonlyArray<Anthropic.Tool[] | undefined>;
@@ -114,23 +145,71 @@ function makeScriptedClient(scripts: ReadonlyArray<Anthropic.ContentBlock[]>): {
   const captures: Anthropic.MessageParam[][] = [];
   const tools: (Anthropic.Tool[] | undefined)[] = [];
   let i = 0;
-  const client = {
-    messages: {
-      stream: (req: { messages: Anthropic.MessageParam[]; tools?: Anthropic.Tool[] }) => {
-        // Capture a deep-ish copy so later mutations to the same array don't leak.
-        captures.push(req.messages.map((m) => ({ ...m })));
-        tools.push(req.tools);
-        const content = scripts[Math.min(i, scripts.length - 1)] ?? [];
-        i++;
-        return {
-          on: () => {},
-          finalMessage: async () => ({ content }),
-        };
-      },
+  const adapter: import("@crewhaus/adapter-anthropic").ProviderAdapter = {
+    providerId: "anthropic",
+    features: {
+      caching: "explicit",
+      tool_use: true,
+      vision: true,
+      thinking: true,
+      web_search: true,
     },
-  } as unknown as Anthropic;
+    estimateTokens: () => 0,
+    stream: (req) => {
+      captures.push(req.messages.map((m) => ({ ...m })) as Anthropic.MessageParam[]);
+      tools.push(
+        req.tools !== undefined
+          ? req.tools.map((t) => ({
+              name: t.name,
+              description: t.description,
+              input_schema: t.input_schema as Anthropic.Tool.InputSchema,
+            }))
+          : undefined,
+      );
+      const content = scripts[Math.min(i, scripts.length - 1)] ?? [];
+      const hasToolUse = content.some((b) => b.type === "tool_use");
+      i++;
+      return (async function* () {
+        yield { kind: "message_start" } as const;
+        for (let idx = 0; idx < content.length; idx++) {
+          const block = content[idx];
+          if (block === undefined) continue;
+          if (block.type === "text") {
+            yield {
+              kind: "content_block_start",
+              index: idx,
+              block: { type: "text", text: "" },
+            } as const;
+            yield {
+              kind: "content_block_delta",
+              index: idx,
+              delta: { type: "text_delta", text: block.text },
+            } as const;
+            yield { kind: "content_block_stop", index: idx } as const;
+          } else if (block.type === "tool_use") {
+            yield {
+              kind: "content_block_start",
+              index: idx,
+              block: { type: "tool_use", id: block.id, name: block.name, input: {} },
+            } as const;
+            yield {
+              kind: "content_block_delta",
+              index: idx,
+              delta: { type: "input_json_delta", partial_json: JSON.stringify(block.input ?? {}) },
+            } as const;
+            yield { kind: "content_block_stop", index: idx } as const;
+          }
+        }
+        yield {
+          kind: "message_delta",
+          stopReason: hasToolUse ? "tool_use" : "end_turn",
+        } as const;
+        yield { kind: "message_stop" } as const;
+      })();
+    },
+  };
   return {
-    client,
+    adapter,
     callCount: () => i,
     capturedMessages: () => captures,
     capturedTools: () => tools,
@@ -150,7 +229,7 @@ describe("runChatLoop tool execution", () => {
       },
     });
 
-    const { client, callCount, capturedMessages, capturedTools } = makeScriptedClient([
+    const { adapter, callCount, capturedMessages, capturedTools } = makeScriptedClient([
       // 1st model turn: ask for a tool.
       [
         {
@@ -171,7 +250,7 @@ describe("runChatLoop tool execution", () => {
     await runChatLoop({
       model: "test-model",
       instructions: "test",
-      client,
+      _adapter: adapter,
       input,
       tools: [echoTool],
       permissionMode: "bypass",
@@ -210,7 +289,7 @@ describe("runChatLoop tool execution", () => {
       execute: async () => "ok",
     });
 
-    const { client, callCount, capturedMessages } = makeScriptedClient([
+    const { adapter, callCount, capturedMessages } = makeScriptedClient([
       [
         {
           type: "tool_use",
@@ -229,7 +308,7 @@ describe("runChatLoop tool execution", () => {
     await runChatLoop({
       model: "test-model",
       instructions: "test",
-      client,
+      _adapter: adapter,
       input,
       tools: [knownTool],
     });
@@ -243,7 +322,7 @@ describe("runChatLoop tool execution", () => {
   });
 
   test("does not advertise tools when the tools list is empty", async () => {
-    const { client, capturedTools } = makeScriptedClient([
+    const { adapter, capturedTools } = makeScriptedClient([
       [{ type: "text", text: "hi", citations: null } as Anthropic.TextBlock],
     ]);
 
@@ -251,7 +330,7 @@ describe("runChatLoop tool execution", () => {
     input.write("hi\n");
     input.end();
 
-    await runChatLoop({ model: "test-model", instructions: "test", client, input });
+    await runChatLoop({ model: "test-model", instructions: "test", _adapter: adapter, input });
 
     expect(capturedTools()[0]).toBeUndefined();
   });
@@ -275,7 +354,7 @@ describe("runChatLoop tool execution", () => {
       execute: async () => "ok",
     });
 
-    const { client, capturedTools } = makeScriptedClient([
+    const { adapter, capturedTools } = makeScriptedClient([
       [{ type: "text", text: "fine", citations: null } as Anthropic.TextBlock],
     ]);
 
@@ -286,7 +365,7 @@ describe("runChatLoop tool execution", () => {
     await runChatLoop({
       model: "test-model",
       instructions: "test",
-      client,
+      _adapter: adapter,
       input,
       tools: [mcpStyleTool],
     });
@@ -300,42 +379,98 @@ describe("runChatLoop tool execution", () => {
 });
 
 /**
- * Stub that scripts both `messages.stream` (for normal turns) and
- * `messages.create` (for autoCompact). Captures every call so tests
- * can assert ordering between the two surfaces.
+ * Section 17 — combined stream-and-compaction stub. The runtime now
+ * routes both turns and `autoCompact` through `adapter.stream(...)`,
+ * so a single ProviderAdapter handles both surfaces. The `scripts`
+ * array drives normal turns; once exhausted, every subsequent call
+ * (which in practice are autoCompact calls) returns a fixed "compacted
+ * summary" text-only stream — preserving the prior separation of
+ * concerns at the assertion layer.
  */
 function makeFullClient(scripts: ReadonlyArray<Anthropic.ContentBlock[]>): {
-  client: Anthropic;
+  adapter: import("@crewhaus/adapter-anthropic").ProviderAdapter;
   streamCount: () => number;
   createCount: () => number;
   capturedStreamMessages: () => ReadonlyArray<ReadonlyArray<Anthropic.MessageParam>>;
 } {
   const captures: Anthropic.MessageParam[][] = [];
   let streamIdx = 0;
-  let createCount = 0;
-  const client = {
-    messages: {
-      stream: (req: { messages: Anthropic.MessageParam[] }) => {
-        captures.push(req.messages.map((m) => ({ ...m })));
-        const content = scripts[Math.min(streamIdx, scripts.length - 1)] ?? [];
-        streamIdx++;
-        return {
-          on: () => {},
-          finalMessage: async () => ({ content }),
-        };
-      },
-      create: async () => {
-        createCount++;
-        return {
-          content: [{ type: "text", text: "compacted summary", citations: null }],
-        } as Anthropic.Message;
-      },
+  let compactionCount = 0;
+  const adapter: import("@crewhaus/adapter-anthropic").ProviderAdapter = {
+    providerId: "anthropic",
+    features: {
+      caching: "explicit",
+      tool_use: true,
+      vision: true,
+      thinking: true,
+      web_search: true,
     },
-  } as unknown as Anthropic;
+    estimateTokens: () => 0,
+    stream: (req) => {
+      // Detect compaction vs. turn by sniffing the trailing user message
+      // for the SUMMARY_REQUEST sentinel. autoCompact appends a known
+      // "Summarize the prior conversation" prompt; turn calls don't.
+      const lastMsg = req.messages[req.messages.length - 1];
+      const lastContent = typeof lastMsg?.content === "string" ? lastMsg.content : "";
+      const isCompaction = /Summarize the prior conversation/.test(lastContent);
+      // Capture only turn calls so test assertions on
+      // `capturedStreamMessages()[0]` keep their pre-Section-17
+      // semantics (where compaction went through a separate API
+      // surface). Compaction calls are counted in `compactionCount`.
+      if (!isCompaction) {
+        captures.push(req.messages.map((m) => ({ ...m })) as Anthropic.MessageParam[]);
+      }
+      const content = isCompaction
+        ? ([
+            { type: "text", text: "compacted summary", citations: null } as Anthropic.TextBlock,
+          ] as Anthropic.ContentBlock[])
+        : (scripts[Math.min(streamIdx, scripts.length - 1)] ?? []);
+      if (isCompaction) compactionCount++;
+      else streamIdx++;
+      const hasToolUse = content.some((b) => b.type === "tool_use");
+      return (async function* () {
+        yield { kind: "message_start" } as const;
+        for (let idx = 0; idx < content.length; idx++) {
+          const block = content[idx];
+          if (block === undefined) continue;
+          if (block.type === "text") {
+            yield {
+              kind: "content_block_start",
+              index: idx,
+              block: { type: "text", text: "" },
+            } as const;
+            yield {
+              kind: "content_block_delta",
+              index: idx,
+              delta: { type: "text_delta", text: block.text },
+            } as const;
+            yield { kind: "content_block_stop", index: idx } as const;
+          } else if (block.type === "tool_use") {
+            yield {
+              kind: "content_block_start",
+              index: idx,
+              block: { type: "tool_use", id: block.id, name: block.name, input: {} },
+            } as const;
+            yield {
+              kind: "content_block_delta",
+              index: idx,
+              delta: { type: "input_json_delta", partial_json: JSON.stringify(block.input ?? {}) },
+            } as const;
+            yield { kind: "content_block_stop", index: idx } as const;
+          }
+        }
+        yield {
+          kind: "message_delta",
+          stopReason: hasToolUse ? "tool_use" : "end_turn",
+        } as const;
+        yield { kind: "message_stop" } as const;
+      })();
+    },
+  };
   return {
-    client,
+    adapter,
     streamCount: () => streamIdx,
-    createCount: () => createCount,
+    createCount: () => compactionCount,
     capturedStreamMessages: () => captures,
   };
 }
@@ -344,8 +479,8 @@ describe("runChatLoop runContext", () => {
   test("runs without an explicit runContext (default factory fires)", async () => {
     const input = new PassThrough();
     input.end();
-    const { client, calls } = makeStubClient();
-    await runChatLoop({ model: "test-model", instructions: "test", client, input });
+    const { adapter, calls } = makeStubAdapter();
+    await runChatLoop({ model: "test-model", instructions: "test", _adapter: adapter, input });
     expect(calls()).toBe(0);
   });
 
@@ -356,12 +491,12 @@ describe("runChatLoop runContext", () => {
     const input = new PassThrough();
     input.write("hello\n");
     input.end();
-    const { client } = makeStubClient("ack");
+    const { adapter } = makeStubAdapter("ack");
 
     await runChatLoop({
       model: "test-model",
       instructions: "test",
-      client,
+      _adapter: adapter,
       input,
       runContext: ctx,
     });
@@ -382,12 +517,12 @@ describe("runChatLoop runContext", () => {
     const input = new PassThrough();
     input.write("hi\n");
     input.end();
-    const { client } = makeStubClient("ack");
+    const { adapter } = makeStubAdapter("ack");
 
     await runChatLoop({
       model: "test-model",
       instructions: "test",
-      client,
+      _adapter: adapter,
       input,
       runContext: ctx,
     });
@@ -410,14 +545,14 @@ describe("runChatLoop pre-turn compaction", () => {
     input.write(`${longUser}\n`);
     input.end();
 
-    const { client, capturedStreamMessages } = makeFullClient([
+    const { adapter, capturedStreamMessages } = makeFullClient([
       [{ type: "text", text: "ok", citations: null } as Anthropic.TextBlock],
     ]);
 
     await runChatLoop({
       model: "test-model",
       instructions: "test",
-      client,
+      _adapter: adapter,
       input,
       contextLimit: 200,
       compactionThreshold: 0.85,
@@ -444,14 +579,14 @@ describe("runChatLoop pre-turn compaction", () => {
     input.write(`${big}\n`);
     input.end();
 
-    const { client, createCount, capturedStreamMessages } = makeFullClient([
+    const { adapter, createCount, capturedStreamMessages } = makeFullClient([
       [{ type: "text", text: "ok", citations: null } as Anthropic.TextBlock],
     ]);
 
     await runChatLoop({
       model: "test-model",
       instructions: "test",
-      client,
+      _adapter: adapter,
       input,
       contextLimit: 100,
       compactionThreshold: 0.85,
@@ -477,14 +612,14 @@ describe("runChatLoop pre-turn compaction", () => {
     input.write("hello\n"); // ~2 tokens
     input.end();
 
-    const { client, createCount, capturedStreamMessages } = makeFullClient([
+    const { adapter, createCount, capturedStreamMessages } = makeFullClient([
       [{ type: "text", text: "hi back", citations: null } as Anthropic.TextBlock],
     ]);
 
     await runChatLoop({
       model: "test-model",
       instructions: "test",
-      client,
+      _adapter: adapter,
       input,
       contextLimit: 200_000,
     });
@@ -500,7 +635,7 @@ describe("runChatLoop pre-turn compaction", () => {
 
 describe("runChatLoop singleTurn mode", () => {
   test("returns the terminal assistant text and does not read stdin", async () => {
-    const { client, callCount } = makeScriptedClient([
+    const { adapter, callCount } = makeScriptedClient([
       [{ type: "text", text: "hello from step", citations: null } as Anthropic.TextBlock],
     ]);
 
@@ -511,7 +646,7 @@ describe("runChatLoop singleTurn mode", () => {
     const result = await runChatLoop({
       model: "test-model",
       instructions: "test",
-      client,
+      _adapter: adapter,
       input,
       singleTurn: true,
       seedMessages: [{ role: "user", content: "go" }],
@@ -535,7 +670,7 @@ describe("runChatLoop singleTurn mode", () => {
       },
     });
 
-    const { client, callCount } = makeScriptedClient([
+    const { adapter, callCount } = makeScriptedClient([
       [
         {
           type: "tool_use",
@@ -550,7 +685,7 @@ describe("runChatLoop singleTurn mode", () => {
     const result = await runChatLoop({
       model: "test-model",
       instructions: "test",
-      client,
+      _adapter: adapter,
       singleTurn: true,
       seedMessages: [{ role: "user", content: "please echo" }],
       tools: [echoTool],
@@ -568,14 +703,14 @@ describe("runChatLoop singleTurn mode", () => {
     // simulating with an empty content array on the second turn). The state
     // machine would not actually allow that in production, so use a single
     // empty-text turn to model "no text content".
-    const { client } = makeScriptedClient([
+    const { adapter } = makeScriptedClient([
       [{ type: "text", text: "", citations: null } as Anthropic.TextBlock],
     ]);
 
     const result = await runChatLoop({
       model: "test-model",
       instructions: "test",
-      client,
+      _adapter: adapter,
       singleTurn: true,
       seedMessages: [{ role: "user", content: "anything" }],
     });
@@ -591,7 +726,7 @@ describe("runChatLoop singleTurn mode", () => {
       execute: async (input) => `echoed: ${input.msg}`,
     });
 
-    const { client, callCount, capturedMessages } = makeScriptedClient([
+    const { adapter, callCount, capturedMessages } = makeScriptedClient([
       [
         {
           type: "tool_use",
@@ -608,7 +743,7 @@ describe("runChatLoop singleTurn mode", () => {
     await runChatLoop({
       model: "test-model",
       instructions: "test",
-      client,
+      _adapter: adapter,
       singleTurn: true,
       seedMessages: [{ role: "user", content: "go" }],
       tools: [echoTool],
@@ -632,7 +767,7 @@ describe("runChatLoop singleTurn mode", () => {
       execute: async () => "wrote",
     });
 
-    const { client, capturedMessages } = makeScriptedClient([
+    const { adapter, capturedMessages } = makeScriptedClient([
       [
         {
           type: "tool_use",
@@ -647,7 +782,7 @@ describe("runChatLoop singleTurn mode", () => {
     await runChatLoop({
       model: "test-model",
       instructions: "test",
-      client,
+      _adapter: adapter,
       singleTurn: true,
       seedMessages: [{ role: "user", content: "go" }],
       tools: [writeTool],
@@ -663,39 +798,52 @@ describe("runChatLoop singleTurn mode", () => {
 
   test("recovery: 5xx from the stream triggers retry, then succeeds on the next attempt", async () => {
     let attempt = 0;
-    const client = {
-      messages: {
-        stream: () => {
-          attempt++;
-          return {
-            on: () => {},
-            finalMessage: async () => {
-              if (attempt === 1) {
-                throw {
-                  name: "APIError",
-                  status: 503,
-                  error: { type: "api_error", message: "service unavailable" },
-                  message: "503 Service Unavailable",
-                };
-              }
-              return {
-                content: [{ type: "text", text: "ok after retry", citations: null }],
-                stop_reason: "end_turn",
-              };
-            },
-          };
-        },
+    const adapter: import("@crewhaus/adapter-anthropic").ProviderAdapter = {
+      providerId: "anthropic",
+      features: {
+        caching: "explicit",
+        tool_use: true,
+        vision: true,
+        thinking: true,
+        web_search: true,
       },
-    } as unknown as Anthropic;
+      estimateTokens: () => 0,
+      stream: () => {
+        attempt++;
+        const myAttempt = attempt;
+        return (async function* () {
+          if (myAttempt === 1) {
+            throw {
+              name: "APIError",
+              status: 503,
+              error: { type: "api_error", message: "service unavailable" },
+              message: "503 Service Unavailable",
+            };
+          }
+          yield { kind: "message_start" } as const;
+          yield {
+            kind: "content_block_start",
+            index: 0,
+            block: { type: "text", text: "" },
+          } as const;
+          yield {
+            kind: "content_block_delta",
+            index: 0,
+            delta: { type: "text_delta", text: "ok after retry" },
+          } as const;
+          yield { kind: "content_block_stop", index: 0 } as const;
+          yield { kind: "message_delta", stopReason: "end_turn" } as const;
+          yield { kind: "message_stop" } as const;
+        })();
+      },
+    };
 
     const result = await runChatLoop({
       model: "test-model",
       instructions: "test",
-      client,
+      _adapter: adapter,
       singleTurn: true,
       seedMessages: [{ role: "user", content: "go" }],
-      // Override the runContext to use a logger that captures lines so we
-      // can assert the recovery.action log fires.
       permissionMode: "bypass",
     });
 
@@ -704,13 +852,13 @@ describe("runChatLoop singleTurn mode", () => {
   });
 
   test("throws RuntimeError when seedMessages is missing or does not end with role:user", async () => {
-    const { client } = makeStubClient();
+    const { adapter } = makeStubAdapter();
 
     await expect(
       runChatLoop({
         model: "test-model",
         instructions: "test",
-        client,
+        _adapter: adapter,
         singleTurn: true,
         seedMessages: [],
       }),
@@ -720,7 +868,7 @@ describe("runChatLoop singleTurn mode", () => {
       runChatLoop({
         model: "test-model",
         instructions: "test",
-        client,
+        _adapter: adapter,
         singleTurn: true,
         seedMessages: [{ role: "assistant", content: "wrong end" }],
       }),
@@ -730,7 +878,7 @@ describe("runChatLoop singleTurn mode", () => {
       runChatLoop({
         model: "test-model",
         instructions: "test",
-        client,
+        _adapter: adapter,
         singleTurn: true,
       }),
     ).rejects.toThrow(/seedMessages.*role.*user/);
@@ -757,7 +905,7 @@ describe("runChatLoop — Section 8 orchestrator", () => {
       },
     });
 
-    const { client, callCount } = makeScriptedClient([
+    const { adapter, callCount } = makeScriptedClient([
       [
         {
           type: "tool_use",
@@ -783,7 +931,7 @@ describe("runChatLoop — Section 8 orchestrator", () => {
     await runChatLoop({
       model: "test-model",
       instructions: "test",
-      client,
+      _adapter: adapter,
       input,
       tools: [slowRead],
       permissionMode: "bypass",
@@ -819,7 +967,7 @@ describe("runChatLoop — Section 8 loop detection", () => {
         name: "Bash",
         input: { command: "date" },
       }) as Anthropic.ToolUseBlock;
-    const { client, capturedMessages } = makeScriptedClient([
+    const { adapter, capturedMessages } = makeScriptedClient([
       [sameCall("tu_1")],
       [sameCall("tu_2")],
       [sameCall("tu_3")],
@@ -833,7 +981,7 @@ describe("runChatLoop — Section 8 loop detection", () => {
     await runChatLoop({
       model: "test-model",
       instructions: "test",
-      client,
+      _adapter: adapter,
       input,
       tools: [dateTool],
       permissionMode: "bypass",
@@ -877,7 +1025,7 @@ describe("runChatLoop — Section 8 result store", () => {
         execute: async () => bigPayload,
       });
 
-      const { client, capturedMessages } = makeScriptedClient([
+      const { adapter, capturedMessages } = makeScriptedClient([
         [{ type: "tool_use", id: "tu_big", name: "BigRead", input: {} } as Anthropic.ToolUseBlock],
         [{ type: "text", text: "done", citations: null } as Anthropic.TextBlock],
       ]);
@@ -889,7 +1037,7 @@ describe("runChatLoop — Section 8 result store", () => {
       await runChatLoop({
         model: "test-model",
         instructions: "test",
-        client,
+        _adapter: adapter,
         input,
         tools: [bigTool],
         permissionMode: "bypass",
@@ -932,9 +1080,10 @@ describe("runChatLoop — Section 8 streaming flag", () => {
       },
     });
 
-    // Streaming-aware fake client: returns a stream object that fires
-    // contentBlock for each tool_use as the executor subscribes, then
-    // resolves finalMessage with the same blocks.
+    // Section 17 — adapter that yields tool_use blocks via the
+    // canonical StreamEvent shape on the first call, text on the
+    // second. The runtime's streaming-tool-executor consumes these and
+    // dispatches each tool_use as soon as content_block_stop fires.
     const blocks1 = [
       { type: "tool_use", id: "tu_1", name: "Read", input: { id: "1" } } as Anthropic.ToolUseBlock,
       { type: "tool_use", id: "tu_2", name: "Read", input: { id: "2" } } as Anthropic.ToolUseBlock,
@@ -942,33 +1091,66 @@ describe("runChatLoop — Section 8 streaming flag", () => {
     const blocks2 = [{ type: "text", text: "done", citations: null } as Anthropic.TextBlock];
     let streamIdx = 0;
     const captures: Anthropic.MessageParam[][] = [];
-    const client = {
-      messages: {
-        stream: (req: { messages: Anthropic.MessageParam[] }) => {
-          captures.push(req.messages.map((m) => ({ ...m })));
-          const content =
-            streamIdx === 0
-              ? (blocks1 as Anthropic.ContentBlock[])
-              : (blocks2 as Anthropic.ContentBlock[]);
-          streamIdx++;
-          const stream = {
-            on: (event: string, handler: (arg?: unknown) => void) => {
-              if (event === "contentBlock") {
-                // Fire all blocks asynchronously to mimic real stream timing.
-                queueMicrotask(() => {
-                  for (const b of content) handler(b);
-                });
-              }
-            },
-            finalMessage: async () => {
-              await new Promise((r) => setTimeout(r, 5));
-              return { content };
-            },
-          };
-          return stream;
-        },
+    const adapter: import("@crewhaus/adapter-anthropic").ProviderAdapter = {
+      providerId: "anthropic",
+      features: {
+        caching: "explicit",
+        tool_use: true,
+        vision: true,
+        thinking: true,
+        web_search: true,
       },
-    } as unknown as Anthropic;
+      estimateTokens: () => 0,
+      stream: (req) => {
+        captures.push(req.messages.map((m) => ({ ...m })) as Anthropic.MessageParam[]);
+        const content =
+          streamIdx === 0
+            ? (blocks1 as Anthropic.ContentBlock[])
+            : (blocks2 as Anthropic.ContentBlock[]);
+        streamIdx++;
+        const hasToolUse = content.some((b) => b.type === "tool_use");
+        return (async function* () {
+          yield { kind: "message_start" } as const;
+          for (let idx = 0; idx < content.length; idx++) {
+            const block = content[idx];
+            if (block === undefined) continue;
+            if (block.type === "text") {
+              yield {
+                kind: "content_block_start",
+                index: idx,
+                block: { type: "text", text: "" },
+              } as const;
+              yield {
+                kind: "content_block_delta",
+                index: idx,
+                delta: { type: "text_delta", text: block.text },
+              } as const;
+              yield { kind: "content_block_stop", index: idx } as const;
+            } else if (block.type === "tool_use") {
+              yield {
+                kind: "content_block_start",
+                index: idx,
+                block: { type: "tool_use", id: block.id, name: block.name, input: {} },
+              } as const;
+              yield {
+                kind: "content_block_delta",
+                index: idx,
+                delta: {
+                  type: "input_json_delta",
+                  partial_json: JSON.stringify(block.input ?? {}),
+                },
+              } as const;
+              yield { kind: "content_block_stop", index: idx } as const;
+            }
+          }
+          yield {
+            kind: "message_delta",
+            stopReason: hasToolUse ? "tool_use" : "end_turn",
+          } as const;
+          yield { kind: "message_stop" } as const;
+        })();
+      },
+    };
 
     const input = new PassThrough();
     input.write("go\n");
@@ -977,7 +1159,7 @@ describe("runChatLoop — Section 8 streaming flag", () => {
     await runChatLoop({
       model: "test-model",
       instructions: "test",
-      client,
+      _adapter: adapter,
       input,
       tools: [tool],
       streaming: true,
@@ -1004,7 +1186,7 @@ describe("runChatLoop — Section 8 streaming flag", () => {
 describe("runChatLoop — Section 10 persistence", () => {
   test("session JSON is persisted with lastTurnIndex on REPL exit", async () => {
     const ctx = createRunContext();
-    const { client } = makeScriptedClient([
+    const { adapter } = makeScriptedClient([
       [{ type: "text", text: "ack", citations: null } as Anthropic.TextBlock],
     ]);
     const input = new PassThrough();
@@ -1014,7 +1196,7 @@ describe("runChatLoop — Section 10 persistence", () => {
     await runChatLoop({
       model: "test-model",
       instructions: "test",
-      client,
+      _adapter: adapter,
       input,
       runContext: ctx,
       sessionName: "spec-name",
@@ -1084,7 +1266,7 @@ describe("runChatLoop — Section 10 persistence", () => {
     await runChatLoop({
       model: "test-model",
       instructions: "test",
-      client: recorded.client,
+      _adapter: recorded.adapter,
       input: inputA,
       runContext: ctxA,
     });
@@ -1104,7 +1286,7 @@ describe("runChatLoop — Section 10 persistence", () => {
     await runChatLoop({
       model: "test-model",
       instructions: "test",
-      client: resumed.client,
+      _adapter: resumed.adapter,
       input: inputB,
       runContext: ctxB,
       resume: { sessionId },
@@ -1120,14 +1302,14 @@ describe("runChatLoop — Section 10 persistence", () => {
   });
 
   test("--resume on a missing session throws RuntimeError", async () => {
-    const { client } = makeScriptedClient([]);
+    const { adapter } = makeScriptedClient([]);
     const input = new PassThrough();
     input.end();
     await expect(
       runChatLoop({
         model: "test-model",
         instructions: "test",
-        client,
+        _adapter: adapter,
         input,
         resume: { sessionId: "sess_0000000000000000" },
       }),
@@ -1135,12 +1317,12 @@ describe("runChatLoop — Section 10 persistence", () => {
   });
 
   test("rejects resume + seedMessages combo as mutually exclusive in REPL mode", async () => {
-    const { client } = makeScriptedClient([]);
+    const { adapter } = makeScriptedClient([]);
     await expect(
       runChatLoop({
         model: "test-model",
         instructions: "test",
-        client,
+        _adapter: adapter,
         input: new PassThrough(),
         resume: { sessionId: "sess_0000000000000000" },
         seedMessages: [{ role: "user", content: "hi" }],
@@ -1164,7 +1346,7 @@ describe("runChatLoop — Section 10 persistence", () => {
     await runChatLoop({
       model: "test-model",
       instructions: "test",
-      client: recordedA.client,
+      _adapter: recordedA.adapter,
       input: inputA,
       runContext: ctxA,
     });
@@ -1188,7 +1370,7 @@ describe("runChatLoop — Section 10 persistence", () => {
     const reply = await runChatLoop({
       model: "test-model",
       instructions: "test",
-      client: recordedB.client,
+      _adapter: recordedB.adapter,
       runContext: ctxB,
       resume: { sessionId },
       singleTurn: true,
@@ -1219,7 +1401,7 @@ describe("runChatLoop — Section 10 persistence", () => {
 
   test("event log captures user_message + assistant_message events", async () => {
     const ctx = createRunContext();
-    const { client } = makeScriptedClient([
+    const { adapter } = makeScriptedClient([
       [{ type: "text", text: "thanks", citations: null } as Anthropic.TextBlock],
     ]);
     const input = new PassThrough();
@@ -1228,7 +1410,7 @@ describe("runChatLoop — Section 10 persistence", () => {
     await runChatLoop({
       model: "test-model",
       instructions: "test",
-      client,
+      _adapter: adapter,
       input,
       runContext: ctx,
     });

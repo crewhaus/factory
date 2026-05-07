@@ -1,8 +1,12 @@
-import type Anthropic from "@anthropic-ai/sdk";
+import {
+  type ProviderAdapter,
+  collectFinalMessage,
+  extractToolUse,
+} from "@crewhaus/adapter-anthropic";
 import type { Sample } from "@crewhaus/eval-dataset";
 import type { GradeResult, Grader, RunResult } from "@crewhaus/eval-grader";
 import { createLogger } from "@crewhaus/logging";
-import { createAnthropicClient, resolveAuth } from "@crewhaus/runtime-core";
+import { resolveModel } from "@crewhaus/model-router";
 import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { JudgeError } from "./errors";
@@ -13,34 +17,17 @@ export const DEFAULT_JUDGE_MODEL = "claude-sonnet-4-5";
 
 const logger = createLogger({ bindings: { module: "eval-judge" } });
 
-/**
- * Minimal subset of the Anthropic SDK we use, narrowed so a stub client can
- * implement only this surface for tests.
- */
-export type JudgeClient = {
-  messages: {
-    create(params: {
-      model: string;
-      max_tokens: number;
-      system: string;
-      messages: Array<{ role: "user" | "assistant"; content: string }>;
-      tools: Array<{ name: string; description: string; input_schema: unknown }>;
-      tool_choice: { type: "tool"; name: string };
-    }): Promise<{
-      content: Array<
-        | { type: "text"; text: string }
-        | { type: "tool_use"; id: string; name: string; input: unknown }
-      >;
-      stop_reason?: string | null;
-    }>;
-  };
-};
-
 export type JudgeOptions = {
   readonly rubric: Rubric;
   readonly sample: Sample;
   readonly agentOutput: string;
-  readonly client?: JudgeClient;
+  /**
+   * Section 17 — optional pre-built ProviderAdapter. When omitted, the
+   * judge resolves `model` (or `DEFAULT_JUDGE_MODEL`) through the
+   * model-router so any provider — Anthropic, OpenAI, Gemini,
+   * Bedrock — can act as the judge model.
+   */
+  readonly adapter?: ProviderAdapter;
   readonly model?: string;
   readonly maxTokens?: number;
 };
@@ -65,16 +52,10 @@ const submitScoreInputSchema = zodToJsonSchema(SubmitScoreSchema, {
 
 export async function judge(opts: JudgeOptions): Promise<JudgeResult> {
   const model = opts.model ?? DEFAULT_JUDGE_MODEL;
-  let client: JudgeClient;
-  let isOAuth: boolean;
-  if (opts.client) {
-    client = opts.client;
-    isOAuth = false;
-  } else {
-    const resolved = await getDefaultClient();
-    client = resolved.client;
-    isOAuth = resolved.isOAuth;
-  }
+  // Section 17 — resolve via model-router unless caller injected an
+  // adapter. The OAuth Claude-Code prefix logic now lives inside
+  // adapter-anthropic; we no longer need to handle it here.
+  const adapter: ProviderAdapter = opts.adapter ?? (await resolveModel(model)).adapter;
   const { system, user, sentinel } = buildJudgePrompt({
     rubric: opts.rubric,
     input: opts.sample.input,
@@ -82,38 +63,28 @@ export async function judge(opts: JudgeOptions): Promise<JudgeResult> {
     agentOutput: opts.agentOutput,
   });
 
-  // OAuth requires the "You are Claude Code" prefix in the system prompt;
-  // see runtime-core line 524 for the canonical pattern. Without it, OAuth
-  // tokens are rejected by the API as not-Claude-Code traffic.
-  const systemBlocks = isOAuth
-    ? `You are Claude Code, Anthropic's official CLI for Claude.\n\n${system}`
-    : system;
-
-  const response = await client.messages.create({
-    model,
-    max_tokens: opts.maxTokens ?? 1024,
-    system: systemBlocks,
-    messages: [{ role: "user", content: user }],
-    tools: [
-      {
-        name: "submit_score",
-        description:
-          "Submit the overall 1–5 score, a brief rationale, and the per-criterion scores. " +
-          "The judge MUST call this tool — never reply in plain text.",
-        input_schema: submitScoreInputSchema,
-      },
-    ],
-    tool_choice: { type: "tool", name: "submit_score" },
-  });
-
-  const toolUse = response.content.find(
-    (b): b is { type: "tool_use"; id: string; name: string; input: unknown } =>
-      b.type === "tool_use" && b.name === "submit_score",
+  const final = await collectFinalMessage(
+    adapter.stream({
+      model,
+      system: [{ type: "text", text: system }],
+      messages: [{ role: "user", content: user }],
+      tools: [
+        {
+          name: "submit_score",
+          description:
+            "Submit the overall 1–5 score, a brief rationale, and the per-criterion scores. " +
+            "The judge MUST call this tool — never reply in plain text.",
+          input_schema: submitScoreInputSchema,
+        },
+      ],
+      toolChoice: { type: "tool", name: "submit_score" },
+      maxTokens: opts.maxTokens ?? 1024,
+    }),
   );
+
+  const toolUse = extractToolUse(final, "submit_score");
   if (!toolUse) {
-    throw new JudgeError(
-      `judge did not call submit_score (stop_reason=${response.stop_reason ?? "?"})`,
-    );
+    throw new JudgeError(`judge did not call submit_score (stop_reason=${final.stopReason})`);
   }
 
   const parsed = SubmitScoreSchema.safeParse(toolUse.input);
@@ -143,14 +114,14 @@ export async function judge(opts: JudgeOptions): Promise<JudgeResult> {
  */
 export function createJudgeGrader(
   rubric: Rubric,
-  opts: { client?: JudgeClient; model?: string } = {},
+  opts: { adapter?: ProviderAdapter; model?: string } = {},
 ): Grader {
   return async (sample: Sample, run: RunResult): Promise<GradeResult> => {
     const result = await judge({
       rubric,
       sample,
       agentOutput: run.agentOutput,
-      ...(opts.client !== undefined ? { client: opts.client } : {}),
+      ...(opts.adapter !== undefined ? { adapter: opts.adapter } : {}),
       ...(opts.model !== undefined ? { model: opts.model } : {}),
     });
     const passing = rubric.passing_score;
@@ -161,20 +132,3 @@ export function createJudgeGrader(
     };
   };
 }
-
-let cachedDefaultClient: { client: JudgeClient; isOAuth: boolean } | undefined;
-async function getDefaultClient(): Promise<{ client: JudgeClient; isOAuth: boolean }> {
-  if (cachedDefaultClient) return cachedDefaultClient;
-  const auth = resolveAuth(process.env);
-  if (auth.mode === "none") {
-    throw new JudgeError(
-      "no Anthropic credentials — set ANTHROPIC_AUTH_TOKEN (Claude subscription) or ANTHROPIC_API_KEY",
-    );
-  }
-  const { client, isOAuth } = createAnthropicClient(auth);
-  cachedDefaultClient = { client: client as unknown as JudgeClient, isOAuth };
-  return cachedDefaultClient;
-}
-
-// Mark Anthropic import to avoid TS unused warning when the SDK is shimmed
-type _AnthropicAlias = Anthropic;

@@ -1,6 +1,12 @@
 import * as readline from "node:readline/promises";
-import Anthropic from "@anthropic-ai/sdk";
+import type Anthropic from "@anthropic-ai/sdk";
 import { type AbortTree, createAbortTree } from "@crewhaus/abort-controller";
+import {
+  type ProviderAdapter,
+  type ProviderId,
+  collectFinalMessage,
+  consumeStream,
+} from "@crewhaus/adapter-anthropic";
 import type {
   RuntimeBridge,
   SpawnSubAgentFn,
@@ -11,6 +17,7 @@ import { snip } from "@crewhaus/compaction-snip";
 import { RuntimeError } from "@crewhaus/errors";
 import { type EventKind, type EventLog, openEventLog } from "@crewhaus/event-log";
 import { type HookDef, type HookEvent, aggregateDecisions, runHooks } from "@crewhaus/hooks-engine";
+import { resolveModel } from "@crewhaus/model-router";
 import {
   BUILTIN_DEFAULT_RULES,
   type PermissionMode,
@@ -114,97 +121,23 @@ import { attachDefaultSubscribers } from "./observability";
  * `runChatLoop`).
  */
 
-/**
- * Beta headers Anthropic expects when authenticating with a Claude subscription
- * OAuth token (issued by `claude setup-token`). Without these the request
- * routes through the API workspace instead of the user's subscription.
- */
-const OAUTH_BETAS = [
-  "claude-code-20250219",
-  "oauth-2025-04-20",
-  "fine-grained-tool-streaming-2025-05-14",
-  "interleaved-thinking-2025-05-14",
-] as const;
-
-/** Identity headers paired with the OAuth token for subscription-billing routing. */
-const CLAUDE_CODE_HEADERS = {
-  accept: "application/json",
-  "anthropic-dangerous-direct-browser-access": "true",
-  "user-agent": "claude-cli/2.1.2 (external, cli)",
-  "x-app": "cli",
-} as const;
-
-/** System-prompt prefix expected for subscription-billed OAuth requests. */
-const CLAUDE_CODE_SYSTEM_PREFIX = "You are Claude Code, Anthropic's official CLI for Claude.";
-
 const DEFAULT_CONTEXT_LIMIT = 200_000;
 const DEFAULT_COMPACTION_THRESHOLD = 0.85;
 const DEFAULT_SNIP_KEEP_HEAD = 4;
 const DEFAULT_SNIP_KEEP_TAIL = 20;
 
-export type ResolvedAuth =
-  | { readonly mode: "oauth"; readonly token: string }
-  | { readonly mode: "api-key"; readonly token: string }
-  | { readonly mode: "none" };
-
-/**
- * Resolve Anthropic credentials from env. ANTHROPIC_AUTH_TOKEN takes
- * precedence; tokens prefixed with `sk-ant-oat` are treated as OAuth, all
- * others fall through to API-key handling.
- */
-export function resolveAuth(env: NodeJS.ProcessEnv = process.env): ResolvedAuth {
-  const authToken = env["ANTHROPIC_AUTH_TOKEN"];
-  if (authToken) {
-    return authToken.startsWith("sk-ant-oat")
-      ? { mode: "oauth", token: authToken }
-      : { mode: "api-key", token: authToken };
-  }
-  const apiKey = env["ANTHROPIC_API_KEY"];
-  if (apiKey) return { mode: "api-key", token: apiKey };
-  return { mode: "none" };
-}
-
-/**
- * Build an Anthropic SDK client for the resolved auth. Throws RuntimeError
- * with mode="none" so the caller surfaces a clear setup hint.
- *
- * Honors `ANTHROPIC_BASE_URL` from env so smoke/integration tests can point
- * at a local mock-Anthropic server without touching production endpoints.
- */
-export function createAnthropicClient(
-  auth: ResolvedAuth,
-  env: NodeJS.ProcessEnv = process.env,
-): {
-  client: Anthropic;
-  isOAuth: boolean;
-} {
-  if (auth.mode === "none") {
-    throw new RuntimeError(
-      "no Anthropic credentials found: set ANTHROPIC_AUTH_TOKEN (Claude subscription, recommended) or ANTHROPIC_API_KEY (pay-per-token) — see .env.example",
-    );
-  }
-  const baseURL = env["ANTHROPIC_BASE_URL"];
-  const baseURLOption = baseURL !== undefined && baseURL !== "" ? { baseURL } : {};
-  if (auth.mode === "oauth") {
-    return {
-      isOAuth: true,
-      client: new Anthropic({
-        authToken: auth.token,
-        apiKey: null,
-        dangerouslyAllowBrowser: true,
-        defaultHeaders: {
-          "anthropic-beta": OAUTH_BETAS.join(","),
-          ...CLAUDE_CODE_HEADERS,
-        },
-        ...baseURLOption,
-      }),
-    };
-  }
-  return {
-    isOAuth: false,
-    client: new Anthropic({ apiKey: auth.token, authToken: null, ...baseURLOption }),
-  };
-}
+// Section 17 — `resolveAuth` / `createAnthropicClient` / `ResolvedAuth` /
+// `OAUTH_BETAS` / `CLAUDE_CODE_HEADERS` / `CLAUDE_CODE_SYSTEM_PREFIX`
+// moved into `@crewhaus/adapter-anthropic`. Re-exported here so legacy
+// importers (eval-judge fallback, downstream tests) keep compiling.
+export {
+  CLAUDE_CODE_HEADERS,
+  CLAUDE_CODE_SYSTEM_PREFIX,
+  OAUTH_BETAS,
+  createAnthropicClient,
+  resolveAuth,
+} from "@crewhaus/adapter-anthropic";
+export type { ResolvedAuth } from "@crewhaus/adapter-anthropic";
 
 /**
  * Walk an `EventLog` and reconstruct the SDK message history. Only
@@ -235,10 +168,31 @@ export type RunChatLoopOptions = {
   model: string;
   instructions: string;
   maxTokens?: number;
-  /** Override the SDK client (testing, alternate auth flows). */
-  client?: Anthropic;
-  /** When supplying a custom client, force OAuth-style system prefix. */
-  isOAuth?: boolean;
+  /**
+   * Section 17 — optional override for the model used by
+   * `compaction-autocompact`. When undefined, compaction reuses
+   * `opts.model` (and therefore the same adapter). Set to a different
+   * model string (or even a different provider via the prefix
+   * conventions, e.g. `openai/gpt-4o-mini`) to route compaction
+   * elsewhere.
+   */
+  compactionModel?: string;
+  /**
+   * Test injection backdoor: pre-built ProviderAdapter that bypasses
+   * the model-router. When set, `model` is still the user-facing
+   * `agent.model` (used for trace events and as the `req.model` field
+   * passed to the adapter), but no router lookup happens.
+   *
+   * Used by sub-agent-spawner.test.ts and runtime-core.test.ts to
+   * inject scripted adapters; replaces the previous `client` /
+   * `isOAuth` injection contract.
+   */
+  _adapter?: ProviderAdapter;
+  /**
+   * Section 17 — same as `_adapter` but for the compaction model.
+   * When omitted, defaults to `_adapter` (or the routed primary).
+   */
+  _compactionAdapter?: ProviderAdapter;
   /** Override the input stream (testing). Defaults to process.stdin. */
   input?: NodeJS.ReadableStream;
   /** Tools the model may invoke. When empty/undefined, tools are not advertised. */
@@ -360,10 +314,17 @@ export type RunChatLoopOptions = {
  *   assistant message. Does not touch stdin.
  */
 export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
-  const resolved = opts.client
-    ? { client: opts.client, isOAuth: opts.isOAuth ?? false }
-    : createAnthropicClient(resolveAuth());
-  const { client, isOAuth } = resolved;
+  // Section 17 — resolve the primary adapter via the model-router.
+  // The router lazy-loads the matching provider package; an
+  // Anthropic-only spec never pulls AWS / OpenAI / Gemini SDKs.
+  const adapter: ProviderAdapter = opts._adapter ?? (await resolveModel(opts.model)).adapter;
+  const providerId: ProviderId = adapter.providerId;
+  const compactionAdapter: ProviderAdapter =
+    opts._compactionAdapter ??
+    (opts.compactionModel !== undefined
+      ? (await resolveModel(opts.compactionModel)).adapter
+      : adapter);
+  const compactionModel = opts.compactionModel ?? opts.model;
   const maxTokens = opts.maxTokens ?? 4096;
 
   // Mutual exclusion: resume takes priority and replaces any seedMessages
@@ -521,9 +482,10 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     skillsText.length > 0
       ? [{ type: "text", text: skillsText, cache_control: { type: "ephemeral" } }]
       : [];
-  const systemBlocks: Anthropic.TextBlockParam[] = isOAuth
-    ? [{ type: "text", text: CLAUDE_CODE_SYSTEM_PREFIX }, userInstructions, ...skillsBlock]
-    : [userInstructions, ...skillsBlock];
+  // Section 17 — runtime-core no longer prepends the Claude Code OAuth
+  // prefix; `adapter-anthropic` handles that internally so each adapter
+  // owns its provider-specific auth-shape requirements.
+  const systemBlocks: Anthropic.TextBlockParam[] = [userInstructions, ...skillsBlock];
 
   const tools = opts.tools ?? [];
   const anthropicTools: Anthropic.Tool[] | undefined =
@@ -874,56 +836,82 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               ...modelStartEnv,
               kind: "model_request",
               model: opts.model,
+              provider: providerId,
               messageCount: messages.length,
               toolCount: anthropicTools?.length ?? 0,
               streaming: opts.streaming === true,
             });
             const t0Model = performance.now();
             let streamChunkIndex = 0;
-            const stream = client.messages.stream(
-              {
-                model: opts.model,
-                max_tokens: maxTokens,
-                system: systemBlocks,
-                messages,
-                ...(anthropicTools ? { tools: anthropicTools } : {}),
-              },
-              { signal: turnAbort.signal },
-            );
 
-            stream.on("text", (chunk) => {
-              process.stdout.write(chunk);
-              bus.publish(
-                {
-                  ...bus.envelope(),
-                  kind: "model_stream_token",
-                  chunkIndex: streamChunkIndex++,
-                  deltaChars: chunk.length,
-                },
-                { ephemeral: true },
-              );
+            // Section 17 — `adapter.stream(req)` returns
+            // `AsyncIterable<StreamEvent>`; we accumulate via
+            // `consumeStream` (callbacks for stdout streaming + token
+            // telemetry) and pull the final canonical message at the
+            // end. The canonical content blocks are wire-compatible
+            // with `Anthropic.ContentBlock` so existing message-history
+            // bookkeeping continues to work.
+            // Note: `messages` is `Anthropic.MessageParam[]` whose
+            // content union is structurally a superset of canonical
+            // (it includes `document`, deprecated `tool_result`
+            // shapes, etc.). Cast to the canonical surface — the
+            // bookkeeping is wire-compatible for the block kinds we
+            // actually consume (text / image / tool_use / tool_result
+            // / thinking).
+            const reqStream = adapter.stream({
+              model: opts.model,
+              system: systemBlocks.map((b) => ({
+                type: "text" as const,
+                text: b.text,
+                ...(b.cache_control !== undefined ? { cache_control: b.cache_control } : {}),
+              })),
+              messages: messages as Parameters<ProviderAdapter["stream"]>[0]["messages"],
+              tools:
+                anthropicTools !== undefined
+                  ? anthropicTools.map((t) => ({
+                      name: t.name,
+                      description: t.description ?? "",
+                      input_schema: t.input_schema as Record<string, unknown>,
+                    }))
+                  : undefined,
+              maxTokens,
+              signal: turnAbort.signal,
             });
 
             if (opts.streaming) {
-              // Streaming path: dispatch tools mid-stream so they start
-              // running as soon as their args are complete-and-valid. We
-              // pass `executeOneToolUse` as the `runTool` so permissions,
-              // per-tool abort, and result-store wrapping all flow
-              // through the same helper as the non-streaming path.
+              // Streaming path: dispatch tools mid-stream via the
+              // refactored streaming-tool-executor (now consumes
+              // AsyncIterable<StreamEvent> directly).
               void modelStartEnv;
-              const { finalContent, toolResults } = await executeStreaming(stream, {
-                toolByName,
-                abortSignal: turnAbort.signal,
-                runTool: (block) =>
-                  executeOneToolUse({
-                    id: block.id,
-                    name: block.name,
-                    input: block.input,
-                  }),
-                onEvent: (e) => {
-                  runContext.logger.debug("streaming-tool", { ...e });
+              const onTextDelta = (chunk: string): void => {
+                process.stdout.write(chunk);
+                bus.publish(
+                  {
+                    ...bus.envelope(),
+                    kind: "model_stream_token",
+                    chunkIndex: streamChunkIndex++,
+                    deltaChars: chunk.length,
+                  },
+                  { ephemeral: true },
+                );
+              };
+              const { finalContent, toolResults, stopReason, usage } = await executeStreaming(
+                reqStream,
+                {
+                  toolByName,
+                  abortSignal: turnAbort.signal,
+                  onTextDelta,
+                  runTool: (block) =>
+                    executeOneToolUse({
+                      id: block.id,
+                      name: block.name,
+                      input: block.input,
+                    }),
+                  onEvent: (e) => {
+                    runContext.logger.debug("streaming-tool", { ...e });
+                  },
                 },
-              });
+              );
               process.stdout.write("\n");
 
               messages.push({
@@ -931,27 +919,15 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 content: finalContent as Anthropic.MessageParam["content"],
               });
               await logEvent("assistant_message", { content: finalContent });
-              terminalContent = [...finalContent];
-              const streamingFinal = await stream.finalMessage();
-              const sUsage = streamingFinal.usage;
+              terminalContent = [...finalContent] as Anthropic.ContentBlock[];
               bus.publish({
                 ...bus.envelope(),
                 spanId: modelStartEnv.spanId,
                 kind: "model_response",
                 model: opts.model,
-                stopReason: streamingFinal.stop_reason ?? "end_turn",
-                usage: {
-                  input: sUsage?.input_tokens ?? 0,
-                  output: sUsage?.output_tokens ?? 0,
-                  ...(sUsage?.cache_read_input_tokens !== undefined &&
-                  sUsage?.cache_read_input_tokens !== null
-                    ? { cacheRead: sUsage.cache_read_input_tokens }
-                    : {}),
-                  ...(sUsage?.cache_creation_input_tokens !== undefined &&
-                  sUsage?.cache_creation_input_tokens !== null
-                    ? { cacheCreate: sUsage.cache_creation_input_tokens }
-                    : {}),
-                },
+                provider: providerId,
+                stopReason: stopReason ?? "end_turn",
+                usage,
                 durationMs: performance.now() - t0Model,
               });
               await fireHook("post-model", {
@@ -960,7 +936,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               });
 
               const toolUses = finalContent.filter(
-                (b): b is Anthropic.ToolUseBlock => b.type === "tool_use",
+                (b): b is Extract<typeof b, { type: "tool_use" }> => b.type === "tool_use",
               );
               if (toolUses.length === 0) {
                 state = transition(state, { kind: "ModelReturnedText" });
@@ -992,28 +968,32 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               break;
             }
 
-            const final = await stream.finalMessage();
+            // Non-streaming path: drain the AsyncIterable into a final
+            // `ProviderMessage` while emitting text deltas to stdout.
+            const final = await consumeStream(reqStream, {
+              onTextDelta: (chunk) => {
+                process.stdout.write(chunk);
+                bus.publish(
+                  {
+                    ...bus.envelope(),
+                    kind: "model_stream_token",
+                    chunkIndex: streamChunkIndex++,
+                    deltaChars: chunk.length,
+                  },
+                  { ephemeral: true },
+                );
+              },
+            });
             process.stdout.write("\n");
 
-            const fUsage = final.usage;
             bus.publish({
               ...bus.envelope(),
               spanId: modelStartEnv.spanId,
               kind: "model_response",
               model: opts.model,
-              stopReason: final.stop_reason ?? "end_turn",
-              usage: {
-                input: fUsage?.input_tokens ?? 0,
-                output: fUsage?.output_tokens ?? 0,
-                ...(fUsage?.cache_read_input_tokens !== undefined &&
-                fUsage?.cache_read_input_tokens !== null
-                  ? { cacheRead: fUsage.cache_read_input_tokens }
-                  : {}),
-                ...(fUsage?.cache_creation_input_tokens !== undefined &&
-                fUsage?.cache_creation_input_tokens !== null
-                  ? { cacheCreate: fUsage.cache_creation_input_tokens }
-                  : {}),
-              },
+              provider: providerId,
+              stopReason: final.stopReason,
+              usage: final.usage,
               durationMs: performance.now() - t0Model,
             });
 
@@ -1025,17 +1005,17 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               content: final.content as Anthropic.MessageParam["content"],
             });
             await logEvent("assistant_message", { content: final.content });
-            terminalContent = final.content;
+            terminalContent = [...final.content] as Anthropic.ContentBlock[];
             await fireHook("post-model", {
               streaming: false,
-              stopReason: final.stop_reason,
+              stopReason: final.stopReason,
               contentBlocks: final.content.length,
             });
 
             // Synthetic max_output_tokens recovery: stop_reason "max_tokens"
             // means the model was cut off mid-reply. Route through the
             // recovery state machine so we ask it to continue.
-            if (final.stop_reason === "max_tokens") {
+            if (final.stopReason === "max_tokens") {
               lastErrorForRecovery = {
                 name: "MaxTokensError",
                 error: { type: "max_output_tokens" },
@@ -1049,7 +1029,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             }
 
             const toolUses = final.content.filter(
-              (b): b is Anthropic.ToolUseBlock => b.type === "tool_use",
+              (b): b is Extract<typeof b, { type: "tool_use" }> => b.type === "tool_use",
             );
             if (toolUses.length === 0) {
               state = transition(state, { kind: "ModelReturnedText" });
@@ -1120,8 +1100,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               await fireHook("pre-compact", { kind: "reactive", before });
               const compacted = await forceCompact({
                 messages,
-                client,
-                model: opts.model,
+                adapter: compactionAdapter,
+                model: compactionModel,
                 snipKeepHead,
                 snipKeepTail,
                 logger: runContext.logger,
@@ -1226,8 +1206,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       messages = await maybeCompact(
         {
           messages,
-          client,
-          model: opts.model,
+          adapter: compactionAdapter,
+          model: compactionModel,
           contextLimit,
           compactionThreshold,
           snipKeepHead,
@@ -1327,8 +1307,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     }
   };
 
-  const authNote = isOAuth ? " [oauth]" : "";
-  process.stdout.write(`agent ready (model: ${opts.model})${authNote}. type "exit" to quit.\n`);
+  const providerNote = providerId === "anthropic" ? "" : ` [${providerId}]`;
+  process.stdout.write(`agent ready (model: ${opts.model})${providerNote}. type "exit" to quit.\n`);
 
   // SIGINT handler: first press during a turn aborts the turn; second
   // press exits. Counter resets at the start of each new turn. Default-on
@@ -1417,8 +1397,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       messages = await maybeCompact(
         {
           messages,
-          client,
-          model: opts.model,
+          adapter: compactionAdapter,
+          model: compactionModel,
           contextLimit,
           compactionThreshold,
           snipKeepHead,
@@ -1485,7 +1465,11 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
 }
 
 function isAbortError(err: unknown): boolean {
-  if (err instanceof Anthropic.APIUserAbortError) return true;
+  // Section 17 — runtime-core no longer imports the Anthropic SDK at
+  // runtime, so we name-match instead of `instanceof`. The provider
+  // adapters preserve the SDK error names through their normalisation
+  // layers, so this catches both Anthropic and OpenAI/Gemini/Bedrock
+  // abort errors uniformly.
   const name = (err as { name?: unknown }).name;
   return typeof name === "string" && (name === "AbortError" || name === "APIUserAbortError");
 }
@@ -1498,7 +1482,7 @@ type CompactionInfo = {
 
 type CompactArgs = {
   messages: Anthropic.MessageParam[];
-  client: Anthropic;
+  adapter: ProviderAdapter;
   model: string;
   contextLimit: number;
   compactionThreshold: number;
@@ -1522,7 +1506,7 @@ async function maybeCompact(
 ): Promise<Anthropic.MessageParam[]> {
   const {
     messages,
-    client,
+    adapter,
     model,
     contextLimit,
     compactionThreshold,
@@ -1550,7 +1534,7 @@ async function maybeCompact(
   }
 
   logger.info("autocompact triggered", { tokensAfterSnip: postSnipBudget.used });
-  const after = await autoCompact(snipped, client, model);
+  const after = await autoCompact(snipped, adapter, model);
   if (onCompaction !== undefined) {
     await onCompaction({ kind: "autocompact", before: snipped.length, after: after.length });
   }
@@ -1559,7 +1543,7 @@ async function maybeCompact(
 
 type ForceCompactArgs = {
   messages: Anthropic.MessageParam[];
-  client: Anthropic;
+  adapter: ProviderAdapter;
   model: string;
   snipKeepHead: number;
   snipKeepTail: number;
@@ -1573,8 +1557,8 @@ type ForceCompactArgs = {
  * largest blob).
  */
 async function forceCompact(args: ForceCompactArgs): Promise<Anthropic.MessageParam[]> {
-  const { messages, client, model, snipKeepHead, snipKeepTail, logger } = args;
+  const { messages, adapter, model, snipKeepHead, snipKeepTail, logger } = args;
   const snipped = snip(messages, snipKeepHead, snipKeepTail);
   logger.info("reactive snip applied", { before: messages.length, after: snipped.length });
-  return await autoCompact(snipped, client, model);
+  return await autoCompact(snipped, adapter, model);
 }

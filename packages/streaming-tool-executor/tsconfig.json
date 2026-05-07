@@ -5,6 +5,7 @@
     "outDir": "dist"
   },
   "references": [
+    { "path": "../adapter-anthropic" },
     { "path": "../errors" },
     { "path": "../tool-builder" },
     { "path": "../tool-catalog" },

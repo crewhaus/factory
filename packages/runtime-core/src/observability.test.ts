@@ -10,38 +10,67 @@ import type { TraceEvent, TraceEventKind } from "@crewhaus/trace-event-bus";
 import { z } from "zod";
 import { runChatLoop } from "./index";
 
-function makeOneTurnClient(toolUseId: string): Anthropic {
+function makeOneTurnAdapter(
+  toolUseId: string,
+): import("@crewhaus/adapter-anthropic").ProviderAdapter {
   let i = 0;
   return {
-    messages: {
-      stream: () => {
-        const isFirst = i === 0;
-        i += 1;
-        return {
-          on: () => {},
-          finalMessage: async () =>
-            isFirst
-              ? {
-                  content: [
-                    {
-                      type: "tool_use",
-                      id: toolUseId,
-                      name: "noop",
-                      input: { x: 1 },
-                    },
-                  ],
-                  stop_reason: "tool_use",
-                  usage: { input_tokens: 100, output_tokens: 30 },
-                }
-              : {
-                  content: [{ type: "text", text: "done" }],
-                  stop_reason: "end_turn",
-                  usage: { input_tokens: 150, output_tokens: 10 },
-                },
-        };
-      },
+    providerId: "anthropic",
+    features: {
+      caching: "explicit",
+      tool_use: true,
+      vision: true,
+      thinking: true,
+      web_search: true,
     },
-  } as unknown as Anthropic;
+    estimateTokens: () => 0,
+    stream: () => {
+      const isFirst = i === 0;
+      i += 1;
+      return (async function* () {
+        yield {
+          kind: "message_start",
+          usage: { input: isFirst ? 100 : 150, output: 0 },
+        } as const;
+        if (isFirst) {
+          yield {
+            kind: "content_block_start",
+            index: 0,
+            block: { type: "tool_use", id: toolUseId, name: "noop", input: {} },
+          } as const;
+          yield {
+            kind: "content_block_delta",
+            index: 0,
+            delta: { type: "input_json_delta", partial_json: JSON.stringify({ x: 1 }) },
+          } as const;
+          yield { kind: "content_block_stop", index: 0 } as const;
+          yield {
+            kind: "message_delta",
+            stopReason: "tool_use",
+            usage: { input: 100, output: 30 },
+          } as const;
+        } else {
+          yield {
+            kind: "content_block_start",
+            index: 0,
+            block: { type: "text", text: "" },
+          } as const;
+          yield {
+            kind: "content_block_delta",
+            index: 0,
+            delta: { type: "text_delta", text: "done" },
+          } as const;
+          yield { kind: "content_block_stop", index: 0 } as const;
+          yield {
+            kind: "message_delta",
+            stopReason: "end_turn",
+            usage: { input: 150, output: 10 },
+          } as const;
+        }
+        yield { kind: "message_stop" } as const;
+      })();
+    },
+  };
 }
 
 describe("runChatLoop observability", () => {
@@ -61,7 +90,7 @@ describe("runChatLoop observability", () => {
     await runChatLoop({
       model: "test-model",
       instructions: "test",
-      client: makeOneTurnClient("toolu_a"),
+      _adapter: makeOneTurnAdapter("toolu_a"),
       runContext,
       singleTurn: true,
       seedMessages: [{ role: "user", content: "hello" }],

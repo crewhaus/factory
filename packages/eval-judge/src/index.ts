@@ -12,7 +12,7 @@
  * Reference: build-roadmap.md §16 — risk callout `🔴 Prompt-injection in eval-judge`.
  */
 export { judge, createJudgeGrader, DEFAULT_JUDGE_MODEL } from "./judge";
-export type { JudgeOptions, JudgeResult, JudgeClient } from "./judge";
+export type { JudgeOptions, JudgeResult } from "./judge";
 export { loadRubric, type Rubric, type RubricCriterion } from "./rubric";
 export { JudgeError } from "./errors";
 export { buildJudgePrompt, type PromptParts } from "./prompt-template";

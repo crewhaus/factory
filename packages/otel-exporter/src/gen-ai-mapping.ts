@@ -41,6 +41,34 @@ import {
 
 export const GEN_AI_SYSTEM = "anthropic";
 
+/**
+ * Section 17 — map our internal `ProviderId` to the OTel GenAI
+ * `gen_ai.system` value. Defaults to "anthropic" for backwards
+ * compatibility (events emitted before the multi-provider refactor
+ * had no `provider` field).
+ *
+ * OTel canonical values: https://opentelemetry.io/docs/specification/genai/
+ *   - "anthropic" → Anthropic Messages API
+ *   - "openai"    → OpenAI Chat Completions / Responses
+ *   - "gcp.gemini" → Google Gemini
+ *   - "aws.bedrock" → AWS Bedrock
+ */
+export function genAiSystem(provider: string | undefined): string {
+  switch (provider) {
+    case "openai":
+      return "openai";
+    case "gemini":
+      return "gcp.gemini";
+    case "bedrock":
+      return "aws.bedrock";
+    case "anthropic":
+    case undefined:
+      return GEN_AI_SYSTEM;
+    default:
+      return provider;
+  }
+}
+
 export const ATTR = {
   GEN_AI_SYSTEM: "gen_ai.system",
   GEN_AI_OPERATION_NAME: "gen_ai.operation.name",
@@ -162,7 +190,7 @@ export function buildTurnSpan(start: StartedTurn, end: TurnEndEvent): OtelSpan {
 export function buildModelSpan(start: StartedModel, end: ModelResponseEvent): OtelSpan {
   const attrs: Attribute[] = [
     ...envelopeAttrs(end),
-    attrStr(ATTR.GEN_AI_SYSTEM, GEN_AI_SYSTEM),
+    attrStr(ATTR.GEN_AI_SYSTEM, genAiSystem(end.provider ?? start.ev.provider)),
     attrStr(ATTR.GEN_AI_OPERATION_NAME, "chat"),
     attrStr(ATTR.GEN_AI_REQUEST_MODEL, end.model),
     attrInt(ATTR.GEN_AI_USAGE_INPUT_TOKENS, end.usage.input),

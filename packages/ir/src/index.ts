@@ -67,6 +67,17 @@ export type IrSubAgentDefinition = {
  */
 export type IrToolConfigs = Readonly<Record<string, unknown>>;
 
+/**
+ * Section 17 — optional per-target compaction config. `model` overrides
+ * the model used by `compaction-autocompact` for summarisation; when
+ * undefined (or the whole block is undefined) the runtime defaults to
+ * the agent's primary model. Lower-time the spec block is normalised to
+ * an object so codegen never has to `?? {}`.
+ */
+export type IrCompaction = {
+  readonly model?: string;
+};
+
 export type IrV0 = {
   readonly version: 0;
   readonly name: string;
@@ -80,6 +91,7 @@ export type IrV0 = {
   readonly mcp_servers: IrMcpServers;
   readonly permissions: IrPermissions;
   readonly subAgents: readonly IrSubAgentDefinition[];
+  readonly compaction: IrCompaction;
 };
 
 /**
@@ -106,6 +118,7 @@ export type IrWorkflowV0 = {
   readonly steps: readonly IrWorkflowStep[];
   readonly mcp_servers: IrMcpServers;
   readonly permissions: IrPermissions;
+  readonly compaction: IrCompaction;
 };
 
 /**
@@ -155,6 +168,7 @@ export type IrChannelV0 = {
   readonly mcp_servers: IrMcpServers;
   readonly permissions: IrPermissions;
   readonly subAgents: readonly IrSubAgentDefinition[];
+  readonly compaction: IrCompaction;
 };
 
 /** Discriminated union over every supported target IR. */

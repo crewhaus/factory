@@ -4,6 +4,6 @@
     "rootDir": "src",
     "outDir": "dist"
   },
-  "references": [{ "path": "../errors" }],
+  "references": [{ "path": "../adapter-anthropic" }, { "path": "../errors" }],
   "include": ["src/**/*"]
 }

@@ -896,9 +896,32 @@ eval-dataset  ──►  eval-grader     (parallel)  ──►  eval-runner  ─
 
 ## Section 17 — Multi-provider model layer
 
-> Status: 🟡 next. Parallelizable with Section 16 (no shared files).
+> Status: ✅ complete.
 
-**Catalog modules:** `adapter-anthropic` (R2 — refactor of current `model-adapter`), `adapter-openai` (R2), `adapter-gemini` (R2), `adapter-bedrock` (R2), `model-router` (R2)
+**Catalog modules:** `adapter-anthropic` (R2 — refactor of original `model-adapter`), `adapter-openai` (R2), `adapter-gemini` (R2), `adapter-bedrock` (R2), `model-router` (R2)
+
+### What landed
+
+- `packages/adapter-anthropic` extracted from `runtime-core`. Owns the new shared `ProviderAdapter` interface, the canonical `ProviderRequest` / `StreamEvent` / `CanonicalMessage` shapes (Anthropic-isomorphic so the JSONL transcript stays wire-compatible), `resolveAuth` / `createAnthropicClient` (re-exported from `runtime-core` for back-compat), and the `consumeStream` / `collectFinalMessage` / `extractFirstText` / `extractToolUse` helpers that replaced every `messages.create` callsite downstream.
+- `packages/adapter-openai` (Chat Completions + SSE → `StreamEvent` translation; `features.caching = "automatic"`; reused by the `local/<model>@<url>` router path against any OpenAI-compatible local endpoint — Ollama, vLLM, llama.cpp server).
+- `packages/adapter-gemini` via `@google/genai` (`functionCall` ↔ `tool_use`; `systemInstruction`; thinking-mode; `features.caching = "explicit"`).
+- `packages/adapter-bedrock` via `@aws-sdk/client-bedrock-runtime` with per-family marshalling under `src/families/{anthropic,llama,mistral}.ts`. Anthropic-on-Bedrock reuses `adapter-anthropic`'s raw-event translator; Llama/Mistral render their native chat templates and decode their respective stream chunk shapes. `features` is family-specific.
+- `packages/model-router` parses `agent.model` and lazy-loads the matching adapter via `await import(...)`. Anthropic-only specs never trigger imports of `@aws-sdk/*`, `@google/genai`, or `openai`. Cached per `(providerId, baseUrl, family)` key; malformed input throws `ConfigError` with a human-readable hint.
+- `packages/runtime-core` rewritten: dropped the `client?: Anthropic` injection point in favour of `_adapter?: ProviderAdapter`; the model-call path now consumes `AsyncIterable<StreamEvent>` via `consumeStream` (with stdout streaming + token-bus telemetry callbacks). The OAuth Claude-Code system prefix moved into `adapter-anthropic` so `runtime-core` is provider-shape-agnostic. `compactionModel` option threads a separate adapter for compaction (defaults to the agent's primary adapter when omitted).
+- `packages/streaming-tool-executor` rewritten to consume `AsyncIterable<StreamEvent>` directly (replacing the old `AnthropicLikeStream` event-emitter contract). Reconstructs each tool_use block on `content_block_stop` by parsing accumulated `input_json_delta` chunks; queue / dispatch / sibling-abort logic unchanged.
+- `packages/compaction-autocompact` switched signature to `autoCompact(messages, adapter, model)` and uses `collectFinalMessage(adapter.stream(...))` instead of `client.messages.create()`.
+- `packages/eval-judge` dropped its bespoke `JudgeClient` interface; resolves the judge model through `model-router` by default, accepts a `ProviderAdapter` for tests. The OAuth-prefix logic that was duplicated in `judge.ts` now lives inside `adapter-anthropic`.
+- `packages/spec` + `packages/ir` + `packages/compiler` now carry an optional `compaction.model` field on `cli` / `workflow` / `channel` schemas; `lower()` normalises into `IrCompaction`.
+- `packages/errors` extended with `AdapterError` + `ProviderAuthError` (code: `"adapter"`).
+- `packages/trace-event-bus` `ModelRequestEvent` / `ModelResponseEvent` carry an optional `provider: ProviderId`; `packages/otel-exporter`'s `gen-ai-mapping.ts` emits `gen_ai.system` per-provider via `genAiSystem()` (`anthropic` / `openai` / `gcp.gemini` / `aws.bedrock`).
+- `.env.example` documents the optional `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `GEMINI_API_KEY` / `AWS_*` env shapes.
+
+### Verification
+
+- `bun x tsc -b` — clean across the workspace.
+- `bun run lint` — biome clean.
+- `bun run test` — all 62 packages pass; T2 contract sanity covered by per-adapter unit tests over canonical fixtures.
+- `bun apps/cli/src/index.ts run examples/hello-cli/crewhaus.yaml` against the live Anthropic API confirms the refactored stream consumer renders tokens, fires hooks/skills/slash-commands, and threads through the new `consumeStream` accumulator.
 
 `packages/runtime-core` constructs an Anthropic SDK client directly. The spec accepts any model string but the runtime only resolves Claude. To unlock OpenAI, Gemini, AWS Bedrock, and local-Ollama agents, the adapter shape needs to be generalized to a provider-agnostic streaming interface, with a `model-router` dispatching based on `agent.model`.
 
