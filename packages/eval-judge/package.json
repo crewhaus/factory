@@ -1,0 +1,26 @@
+{
+  "name": "@crewhaus/eval-judge",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "LLM-as-judge grader with prompt-injection defense and structured tool-use output",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.40.0",
+    "@crewhaus/errors": "workspace:*",
+    "@crewhaus/eval-dataset": "workspace:*",
+    "@crewhaus/eval-grader": "workspace:*",
+    "@crewhaus/logging": "workspace:*",
+    "@crewhaus/runtime-core": "workspace:*",
+    "yaml": "^2.6.0",
+    "zod": "^3.23.8",
+    "zod-to-json-schema": "^3.23.5"
+  }
+}

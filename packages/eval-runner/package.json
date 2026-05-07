@@ -1,13 +1,11 @@
 {
-  "name": "@crewhaus/cli",
+  "name": "@crewhaus/eval-runner",
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "crewhaus-factory CLI: compile, run, deploy harness specs",
+  "description": "Eval runner — per-sample isolation, concurrency, grading, persistence",
   "main": "src/index.ts",
-  "bin": {
-    "crewhaus": "src/index.ts"
-  },
+  "types": "src/index.ts",
   "exports": {
     ".": "./src/index.ts"
   },
@@ -17,16 +15,17 @@
   "dependencies": {
     "@crewhaus/agent-context-isolation": "workspace:*",
     "@crewhaus/compiler": "workspace:*",
+    "@crewhaus/errors": "workspace:*",
     "@crewhaus/eval-dataset": "workspace:*",
     "@crewhaus/eval-grader": "workspace:*",
-    "@crewhaus/eval-report": "workspace:*",
-    "@crewhaus/eval-runner": "workspace:*",
+    "@crewhaus/eval-judge": "workspace:*",
+    "@crewhaus/event-log": "workspace:*",
     "@crewhaus/hooks-engine": "workspace:*",
-    "@crewhaus/infra-utils": "workspace:*",
     "@crewhaus/ir": "workspace:*",
     "@crewhaus/logging": "workspace:*",
     "@crewhaus/mcp-host": "workspace:*",
     "@crewhaus/permission-engine": "workspace:*",
+    "@crewhaus/run-context": "workspace:*",
     "@crewhaus/runtime-core": "workspace:*",
     "@crewhaus/skills-registry": "workspace:*",
     "@crewhaus/slash-commands": "workspace:*",
@@ -40,6 +39,8 @@
     "@crewhaus/tool-mcp": "workspace:*",
     "@crewhaus/tool-task": "workspace:*",
     "@crewhaus/tool-todo": "workspace:*",
-    "@crewhaus/tool-web": "workspace:*"
+    "@crewhaus/tool-web": "workspace:*",
+    "@crewhaus/trace-event-bus": "workspace:*",
+    "zod": "^3.23.8"
   }
 }

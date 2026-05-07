@@ -1,0 +1,12 @@
+name: yaml-fixture
+samples:
+  - id: q1
+    input: hello
+  - id: q2
+    input: goodbye
+    expected_output: bye
+  - id: q3
+    input: tools
+    expected_tools: [bash, read]
+    metadata:
+      difficulty: easy

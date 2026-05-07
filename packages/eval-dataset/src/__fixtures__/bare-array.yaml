@@ -1,0 +1,5 @@
+- id: a1
+  input: first
+- id: a2
+  input: second
+  expected_output: ok
