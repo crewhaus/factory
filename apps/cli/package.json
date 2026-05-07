@@ -30,9 +30,12 @@
     "@crewhaus/sub-agent-spawner": "workspace:*",
     "@crewhaus/tool-bash": "workspace:*",
     "@crewhaus/tool-catalog": "workspace:*",
+    "@crewhaus/tool-fetch": "workspace:*",
     "@crewhaus/tool-fs": "workspace:*",
+    "@crewhaus/tool-image": "workspace:*",
     "@crewhaus/tool-mcp": "workspace:*",
     "@crewhaus/tool-task": "workspace:*",
-    "@crewhaus/tool-todo": "workspace:*"
+    "@crewhaus/tool-todo": "workspace:*",
+    "@crewhaus/tool-web": "workspace:*"
   }
 }

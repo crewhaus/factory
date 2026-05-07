@@ -28,6 +28,7 @@ describe("IrV0 (cli target)", () => {
       target: "cli",
       agent: { model: "claude-sonnet-4-6", instructions: "be helpful" },
       tools: [],
+      toolConfigs: {},
       mcp_servers: {},
       permissions: { rules: [] },
       subAgents: [],
@@ -61,12 +62,14 @@ describe("IrWorkflowV0 (workflow target)", () => {
       instructions: "list the files",
       model: "claude-sonnet-4-6",
       tools: ["bash"],
+      toolConfigs: {},
     };
     const step2: IrWorkflowStep = {
       name: "summarise",
       instructions: "summarise the listing",
       model: "claude-sonnet-4-6",
       tools: [],
+      toolConfigs: {},
     };
     const ir: IrWorkflowV0 = {
       version: 0,
@@ -91,6 +94,7 @@ describe("IrChannelV0 (channel target)", () => {
       target: "channel",
       agent: { model: "claude-sonnet-4-6", instructions: "be helpful" },
       tools: [],
+      toolConfigs: {},
       channels: { slack: { botToken: literal, signingSecret: envRef } },
       routing: { sessionKey: "thread" },
       mcp_servers: {},
@@ -118,6 +122,7 @@ describe("IrNode discriminated union narrowing", () => {
       target: "cli",
       agent: { model: "m", instructions: "i" },
       tools: [],
+      toolConfigs: {},
       mcp_servers: {},
       permissions: { rules: [] },
       subAgents: [],
@@ -136,6 +141,7 @@ describe("IrNode discriminated union narrowing", () => {
       target: "channel",
       agent: { model: "m", instructions: "i" },
       tools: [],
+      toolConfigs: {},
       channels: {},
       routing: { sessionKey: "thread" },
       mcp_servers: {},

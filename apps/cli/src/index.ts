@@ -187,10 +187,13 @@ agent:
  * `BUILTIN_TOOL_MAP` in packages/target-cli/src/index.ts — keep them in sync.
  */
 async function loadToolMap(): Promise<Record<string, RegisteredTool>> {
-  const [fs, bash, todo] = await Promise.all([
+  const [fs, bash, todo, web, image, fetchPkg] = await Promise.all([
     import("@crewhaus/tool-fs"),
     import("@crewhaus/tool-bash"),
     import("@crewhaus/tool-todo"),
+    import("@crewhaus/tool-web"),
+    import("@crewhaus/tool-image"),
+    import("@crewhaus/tool-fetch"),
   ]);
   return {
     read: fs.read,
@@ -200,7 +203,31 @@ async function loadToolMap(): Promise<Record<string, RegisteredTool>> {
     grep: fs.grep,
     bash: bash.bash,
     todoWrite: todo.todoWrite,
+    webFetch: web.webFetch,
+    webSearch: web.webSearch,
+    readImage: image.readImage,
+    fetch: fetchPkg.fetch,
   };
+}
+
+/**
+ * Section 14 — apply per-tool config from the IR's `toolConfigs` map by
+ * calling each tool's registration function. Mirror of the codegen-emitted
+ * init calls in target-cli/target-channel-bot. Keep in sync.
+ */
+async function applyToolConfigs(
+  toolNames: readonly string[],
+  toolConfigs: Readonly<Record<string, unknown>>,
+): Promise<void> {
+  const used = new Set(toolNames);
+  if (used.has("fetch") && toolConfigs["fetch"] !== undefined) {
+    const { registerFetchConfig } = await import("@crewhaus/tool-fetch");
+    registerFetchConfig(toolConfigs["fetch"] as Parameters<typeof registerFetchConfig>[0]);
+  }
+  if (used.has("webFetch") && toolConfigs["webFetch"] !== undefined) {
+    const { registerWebFetchConfig } = await import("@crewhaus/tool-web");
+    registerWebFetchConfig(toolConfigs["webFetch"] as Parameters<typeof registerWebFetchConfig>[0]);
+  }
 }
 
 /**
@@ -293,6 +320,9 @@ async function runRun(args: ParsedArgs): Promise<void> {
 
   let tools: RegisteredTool[] = [];
   if (ir.tools.length > 0) {
+    // Section 14 — apply per-tool config (e.g. registerFetchConfig) before
+    // loading the tools so first-call execution sees the registered config.
+    await applyToolConfigs(ir.tools, ir.toolConfigs);
     const toolMap = await loadToolMap();
     tools = ir.tools.map((name) => {
       const tool = toolMap[name];

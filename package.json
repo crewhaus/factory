@@ -22,7 +22,8 @@
     "run:hello-channel": "bun examples/hello-channel/dist/daemon.ts",
     "smoke:section-11": "bun scripts/section-11-smoke.ts",
     "smoke:section-12": "bun scripts/section-12-smoke.ts",
-    "smoke:section-13": "bun scripts/section-13-smoke.ts"
+    "smoke:section-13": "bun scripts/section-13-smoke.ts",
+    "smoke:section-14": "bun scripts/section-14-smoke.ts"
   },
   "devDependencies": {
     "@biomejs/biome": "1.9.4",

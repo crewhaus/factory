@@ -7,8 +7,20 @@ const TWO_STEP_IR: IrWorkflowV0 = {
   name: "demo",
   target: "workflow",
   steps: [
-    { name: "list", instructions: "list files", model: "claude-sonnet-4-6", tools: ["bash"] },
-    { name: "summarize", instructions: "summarize", model: "claude-sonnet-4-6", tools: [] },
+    {
+      name: "list",
+      instructions: "list files",
+      model: "claude-sonnet-4-6",
+      tools: ["bash"],
+      toolConfigs: {},
+    },
+    {
+      name: "summarize",
+      instructions: "summarize",
+      model: "claude-sonnet-4-6",
+      tools: [],
+      toolConfigs: {},
+    },
   ],
   mcp_servers: {},
   permissions: { rules: [] },
@@ -67,12 +79,14 @@ describe("emitWorkflow", () => {
           instructions: "i",
           model: "m",
           tools: ["read", "bash"],
+          toolConfigs: {},
         },
         {
           name: "b",
           instructions: "i",
           model: "m",
           tools: ["read", "write"], // read appears twice — dedupe expected
+          toolConfigs: {},
         },
       ],
     };
@@ -87,8 +101,8 @@ describe("emitWorkflow", () => {
     const ir: IrWorkflowV0 = {
       ...TWO_STEP_IR,
       steps: [
-        { name: "a", instructions: "i", model: "m", tools: ["bash"] },
-        { name: "b", instructions: "i", model: "m", tools: ["read"] },
+        { name: "a", instructions: "i", model: "m", tools: ["bash"], toolConfigs: {} },
+        { name: "b", instructions: "i", model: "m", tools: ["read"], toolConfigs: {} },
       ],
     };
     const c = emitWorkflow(ir).files[0]?.content ?? "";
@@ -103,7 +117,7 @@ describe("emitWorkflow", () => {
   test("steps without tools still emit a Section 11 skill-aware tools field", () => {
     const ir: IrWorkflowV0 = {
       ...TWO_STEP_IR,
-      steps: [{ name: "a", instructions: "i", model: "m", tools: [] }],
+      steps: [{ name: "a", instructions: "i", model: "m", tools: [], toolConfigs: {} }],
     };
     const c = emitWorkflow(ir).files[0]?.content ?? "";
     expect(c).toContain("tools: __skillTool ? [__skillTool] : [],");
@@ -128,7 +142,7 @@ describe("emitWorkflow", () => {
   test("rejects unknown tool names at emit time", () => {
     const ir: IrWorkflowV0 = {
       ...TWO_STEP_IR,
-      steps: [{ name: "a", instructions: "i", model: "m", tools: ["bogus"] }],
+      steps: [{ name: "a", instructions: "i", model: "m", tools: ["bogus"], toolConfigs: {} }],
     };
     expect(() => emitWorkflow(ir)).toThrow(TargetEmitError);
     expect(() => emitWorkflow(ir)).toThrow(/unknown tool "bogus"/);
@@ -143,6 +157,7 @@ describe("emitWorkflow", () => {
           instructions: 'has "quotes" and \\backslashes\\',
           model: 'm-"x"',
           tools: [],
+          toolConfigs: {},
         },
       ],
     };
@@ -155,8 +170,8 @@ describe("emitWorkflow", () => {
     const ir: IrWorkflowV0 = {
       ...TWO_STEP_IR,
       steps: [
-        { name: "a", instructions: "i", model: "model-a", tools: [] },
-        { name: "b", instructions: "i", model: "model-b", tools: [] },
+        { name: "a", instructions: "i", model: "model-a", tools: [], toolConfigs: {} },
+        { name: "b", instructions: "i", model: "model-b", tools: [], toolConfigs: {} },
       ],
     };
     const c = emitWorkflow(ir).files[0]?.content ?? "";

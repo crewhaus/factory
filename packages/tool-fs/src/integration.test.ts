@@ -103,6 +103,7 @@ describe("integration: tool-fs through executeTool", () => {
     await writeFile(path.join(tmp, "b.md"), "");
     const result = await executeTool(lookup("Glob"), { pattern: "*.md" }, { toolUseId: "g1" });
     expect(result.isError).toBe(false);
+    if (typeof result.content !== "string") throw new Error("expected string content");
     expect(result.content.split("\n").sort()).toEqual(["a.md", "b.md"]);
   });
 });

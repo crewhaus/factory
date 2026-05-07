@@ -26,6 +26,7 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, join, resolve, sep } from "node:path";
 import { RuntimeError } from "@crewhaus/errors";
+import type { ToolExecuteResult } from "@crewhaus/tool-catalog";
 import type { ToolResult } from "@crewhaus/tool-executor";
 
 export type StoreOptions = {
@@ -37,7 +38,7 @@ export type StoreOptions = {
 };
 
 export type StoredResult = {
-  readonly previewContent: string;
+  readonly previewContent: ToolExecuteResult;
   readonly fullPath: string | null;
   readonly persisted: boolean;
 };
@@ -60,6 +61,14 @@ export async function storeAndPreview(
   const thresholdBytes = opts.thresholdBytes ?? DEFAULT_THRESHOLD_BYTES;
   const previewLines = opts.previewLines ?? DEFAULT_PREVIEW_LINES;
   const rootDir = opts.rootDir ?? DEFAULT_ROOT_DIR;
+
+  // Section 14 — non-string content (image content arrays) bypasses
+  // persistence entirely. The blocks are forwarded as-is to the model so
+  // it can see the image; size capping happens inside the producing tool
+  // (e.g. tool-image enforces a 5 MB per-image limit on disk).
+  if (typeof result.content !== "string") {
+    return { previewContent: result.content, fullPath: null, persisted: false };
+  }
 
   const byteLength = Buffer.byteLength(result.content, "utf8");
   if (byteLength <= thresholdBytes) {
