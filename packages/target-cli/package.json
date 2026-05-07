@@ -18,5 +18,8 @@
     "@crewhaus/hooks-engine": "workspace:*",
     "@crewhaus/skills-registry": "workspace:*",
     "@crewhaus/slash-commands": "workspace:*"
+  },
+  "scripts": {
+    "test": "bun test src"
   }
 }
