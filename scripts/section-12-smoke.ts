@@ -1,4 +1,10 @@
 #!/usr/bin/env bun
+import { createHmac } from "node:crypto";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { Subprocess } from "bun";
+
 /**
  * Section 12 end-to-end smoke test against the live Anthropic API.
  *
@@ -21,11 +27,6 @@
  *
  * Exits 0 on full success; 1 on any failure.
  */
-import type { Subprocess } from "bun";
-import { createHmac } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 
 // Inline copy of `signSlackBody` from @crewhaus/channel-adapter-slack;
 // scripts/ is outside the workspace package graph, so importing the
