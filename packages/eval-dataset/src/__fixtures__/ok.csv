@@ -1,0 +1,5 @@
+id,input,expected_output,expected_tools
+q1,hello,,
+q2,"hello, world","greeting","bash, read"
+q3,"line1
+line2","multi","read"

@@ -3,6 +3,10 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import type { SubAgentDefinition } from "@crewhaus/agent-context-isolation";
 import { SpecParseError, compile, lower } from "@crewhaus/compiler";
+import { loadDataset } from "@crewhaus/eval-dataset";
+import { parseGradersConfig } from "@crewhaus/eval-grader";
+import { diffReports, loadRun, renderReport } from "@crewhaus/eval-report";
+import { runEval as runEvalLib } from "@crewhaus/eval-runner";
 import { loadHooks } from "@crewhaus/hooks-engine";
 import {
   ArgParseError,
@@ -79,6 +83,25 @@ const DOCTOR_SCHEMA: ParseArgsSchema = {
   flags: [{ name: "help", short: "h" }],
 };
 
+const EVAL_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "dataset", takesValue: true },
+    { name: "graders", takesValue: true },
+    { name: "judge-model", takesValue: true },
+    { name: "concurrency", takesValue: true },
+    { name: "seed", takesValue: true },
+    { name: "out", short: "o", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
+const EVAL_REPORT_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "out", short: "o", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
 function usage(): never {
   process.stderr.write(
     [
@@ -88,6 +111,11 @@ function usage(): never {
       "  compile <spec.yaml> -o <out-dir>     compile a spec to a runnable bundle",
       "  run <spec.yaml> [--model <model>]    compile in-memory and execute the agent",
       "                  [--resume <id>]      resume a prior session (event-log replay)",
+      "  eval <spec.yaml> --dataset <data>    run the agent against a dataset and grade",
+      "       --graders <graders.yaml>       (deterministic graders + LLM-as-judge)",
+      "       [--judge-model <model>] [--concurrency N] [--seed N] -o <out-dir>",
+      "  eval-report diff <prev> <new>        compare two eval runs and emit a diff report",
+      "       [-o <out-dir>]",
       "  init [name]                          scaffold a new crewhaus.yaml",
       "  doctor                               check environment health",
       "",
@@ -507,6 +535,127 @@ function runDoctor(args: ParsedArgs): void {
   process.exit(allPass ? 0 : 1);
 }
 
+async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus eval <spec.yaml> --dataset <data> --graders <graders.yaml> " +
+        "[--judge-model <model>] [--concurrency N] [--seed N] -o <out-dir>\n",
+    );
+    return;
+  }
+  const specPath = args.positional[0];
+  if (typeof specPath !== "string") die("missing <spec.yaml>");
+  const datasetPath = args.flags["dataset"];
+  const gradersPath = args.flags["graders"];
+  const outDirArg = args.flags["out"];
+  if (typeof datasetPath !== "string") die("missing --dataset <data>");
+  if (typeof gradersPath !== "string") die("missing --graders <graders.yaml>");
+  if (typeof outDirArg !== "string") die("missing -o <out-dir>");
+
+  const concurrencyFlag = args.flags["concurrency"];
+  const seedFlag = args.flags["seed"];
+  const judgeModelFlag = args.flags["judge-model"];
+  const concurrency = typeof concurrencyFlag === "string" ? Number.parseInt(concurrencyFlag, 10) : undefined;
+  const seed = typeof seedFlag === "string" ? Number.parseInt(seedFlag, 10) : undefined;
+  if (concurrency !== undefined && (Number.isNaN(concurrency) || concurrency < 1)) {
+    die(`invalid --concurrency "${concurrencyFlag}" — must be positive integer`);
+  }
+  if (seed !== undefined && Number.isNaN(seed)) {
+    die(`invalid --seed "${seedFlag}" — must be integer`);
+  }
+
+  const absSpec = resolve(specPath);
+  let yamlText: string;
+  try {
+    yamlText = readFileSync(absSpec, "utf-8");
+  } catch (err) {
+    die(`could not read ${absSpec}: ${(err as Error).message}`);
+  }
+  let ir: ReturnType<typeof lower>;
+  try {
+    ir = lower(parseSpec(yamlText));
+  } catch (err) {
+    if (err instanceof SpecParseError) die(err.message);
+    throw err;
+  }
+  if (ir.target !== "cli") {
+    die(`crewhaus eval only supports target: cli (got "${ir.target}")`);
+  }
+
+  let gradersYaml: string;
+  try {
+    gradersYaml = readFileSync(resolve(gradersPath), "utf-8");
+  } catch (err) {
+    die(`could not read ${gradersPath}: ${(err as Error).message}`);
+  }
+  const { compiled } = parseGradersConfig(gradersYaml);
+  const dataset = await loadDataset(resolve(datasetPath));
+
+  const absOut = resolve(outDirArg);
+  process.stdout.write(`[eval] running ${dataset.name}: ${compiled.length} graders → ${absOut}\n`);
+
+  const summary = await runEvalLib({
+    ir,
+    dataset,
+    compiledGraders: compiled,
+    opts: {
+      outDir: absOut,
+      ...(concurrency !== undefined ? { concurrency } : {}),
+      ...(seed !== undefined ? { seed } : {}),
+      ...(typeof judgeModelFlag === "string" ? { judgeModel: judgeModelFlag } : {}),
+    },
+  });
+
+  // Render report
+  const loaded = await loadRun(absOut);
+  const rendered = renderReport(loaded);
+  writeFileSync(join(absOut, "index.html"), rendered.html);
+
+  process.stdout.write(
+    `[eval] runId=${summary.runId} pass_rate=${(summary.aggregates.passRate * 100).toFixed(1)}% ` +
+      `mean_score=${summary.aggregates.meanScore.toFixed(3)} ` +
+      `errors=${summary.aggregates.errorCount} ` +
+      `tokens=${summary.aggregates.totalTokens.input}/${summary.aggregates.totalTokens.output}\n`,
+  );
+  process.stdout.write(`[eval] report: ${join(absOut, "index.html")}\n`);
+}
+
+async function runEvalReport(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write("usage: crewhaus eval-report diff <prev> <new> [-o <out-dir>]\n");
+    return;
+  }
+  const action = args.positional[0];
+  if (action !== "diff") die(`eval-report: unknown action "${action ?? ""}" — supported: diff`);
+
+  const prev = args.positional[1];
+  const next = args.positional[2];
+  if (typeof prev !== "string" || typeof next !== "string") {
+    die("eval-report diff: missing <prev> <new>");
+  }
+
+  const outArg = args.flags["out"];
+  const prevLoaded = await loadRun(prev);
+  const nextLoaded = await loadRun(next);
+  const result = diffReports(prevLoaded, nextLoaded);
+
+  if (typeof outArg === "string") {
+    const absOut = resolve(outArg);
+    mkdirSync(absOut, { recursive: true });
+    writeFileSync(join(absOut, "index.html"), result.html);
+    writeFileSync(join(absOut, "diff.json"), result.json);
+    process.stdout.write(`[eval-report] diff: ${join(absOut, "index.html")}\n`);
+  } else {
+    process.stdout.write(result.html);
+  }
+  process.stdout.write(
+    `[eval-report] regressions=${result.diff.regressions.length} ` +
+      `recoveries=${result.diff.recoveries.length} ` +
+      `score_shifts=${result.diff.scoreShifts.length} ` +
+      `unchanged=${result.diff.unchanged}\n`,
+  );
+}
+
 const argv = process.argv.slice(2);
 const subcommand = argv[0] ?? "";
 const rest = argv.slice(1);
@@ -520,6 +669,12 @@ switch (subcommand) {
     break;
   case "run":
     await runRun(parseFor(rest, RUN_SCHEMA));
+    break;
+  case "eval":
+    await runEvalSubcommand(parseFor(rest, EVAL_SCHEMA));
+    break;
+  case "eval-report":
+    await runEvalReport(parseFor(rest, EVAL_REPORT_SCHEMA));
     break;
   case "doctor":
     runDoctor(parseFor(rest, DOCTOR_SCHEMA));

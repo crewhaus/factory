@@ -1,0 +1,15 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "include": ["src/**/*"],
+  "references": [
+    { "path": "../errors" },
+    { "path": "../eval-dataset" },
+    { "path": "../eval-grader" },
+    { "path": "../logging" },
+    { "path": "../runtime-core" }
+  ]
+}

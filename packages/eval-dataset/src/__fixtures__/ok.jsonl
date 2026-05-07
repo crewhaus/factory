@@ -1,0 +1,3 @@
+{"id":"q1","input":"hello"}
+{"id":"q2","input":"goodbye","expected_output":"bye"}
+{"id":"q3","input":"add tools","expected_tools":["bash","read"],"metadata":{"difficulty":"easy"}}

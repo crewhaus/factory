@@ -20,6 +20,10 @@
       "dependencies": {
         "@crewhaus/agent-context-isolation": "workspace:*",
         "@crewhaus/compiler": "workspace:*",
+        "@crewhaus/eval-dataset": "workspace:*",
+        "@crewhaus/eval-grader": "workspace:*",
+        "@crewhaus/eval-report": "workspace:*",
+        "@crewhaus/eval-runner": "workspace:*",
         "@crewhaus/hooks-engine": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
@@ -153,6 +157,85 @@
     "packages/errors": {
       "name": "@crewhaus/errors",
       "version": "0.0.0",
+    },
+    "packages/eval-dataset": {
+      "name": "@crewhaus/eval-dataset",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "yaml": "^2.6.0",
+        "zod": "^3.23.8",
+      },
+    },
+    "packages/eval-grader": {
+      "name": "@crewhaus/eval-grader",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/eval-dataset": "workspace:*",
+        "@crewhaus/event-log": "workspace:*",
+        "@crewhaus/trace-event-bus": "workspace:*",
+        "yaml": "^2.6.0",
+        "zod": "^3.23.8",
+      },
+    },
+    "packages/eval-judge": {
+      "name": "@crewhaus/eval-judge",
+      "version": "0.0.0",
+      "dependencies": {
+        "@anthropic-ai/sdk": "^0.40.0",
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/eval-dataset": "workspace:*",
+        "@crewhaus/eval-grader": "workspace:*",
+        "@crewhaus/logging": "workspace:*",
+        "@crewhaus/runtime-core": "workspace:*",
+        "yaml": "^2.6.0",
+        "zod": "^3.23.8",
+        "zod-to-json-schema": "^3.23.5",
+      },
+    },
+    "packages/eval-report": {
+      "name": "@crewhaus/eval-report",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/eval-runner": "workspace:*",
+      },
+    },
+    "packages/eval-runner": {
+      "name": "@crewhaus/eval-runner",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/agent-context-isolation": "workspace:*",
+        "@crewhaus/compiler": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/eval-dataset": "workspace:*",
+        "@crewhaus/eval-grader": "workspace:*",
+        "@crewhaus/eval-judge": "workspace:*",
+        "@crewhaus/event-log": "workspace:*",
+        "@crewhaus/hooks-engine": "workspace:*",
+        "@crewhaus/ir": "workspace:*",
+        "@crewhaus/logging": "workspace:*",
+        "@crewhaus/mcp-host": "workspace:*",
+        "@crewhaus/permission-engine": "workspace:*",
+        "@crewhaus/run-context": "workspace:*",
+        "@crewhaus/runtime-core": "workspace:*",
+        "@crewhaus/skills-registry": "workspace:*",
+        "@crewhaus/slash-commands": "workspace:*",
+        "@crewhaus/spec": "workspace:*",
+        "@crewhaus/sub-agent-spawner": "workspace:*",
+        "@crewhaus/tool-bash": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-fetch": "workspace:*",
+        "@crewhaus/tool-fs": "workspace:*",
+        "@crewhaus/tool-image": "workspace:*",
+        "@crewhaus/tool-mcp": "workspace:*",
+        "@crewhaus/tool-task": "workspace:*",
+        "@crewhaus/tool-todo": "workspace:*",
+        "@crewhaus/tool-web": "workspace:*",
+        "@crewhaus/trace-event-bus": "workspace:*",
+        "zod": "^3.23.8",
+      },
     },
     "packages/event-log": {
       "name": "@crewhaus/event-log",
@@ -680,6 +763,16 @@
     "@crewhaus/compiler": ["@crewhaus/compiler@workspace:packages/compiler"],
 
     "@crewhaus/errors": ["@crewhaus/errors@workspace:packages/errors"],
+
+    "@crewhaus/eval-dataset": ["@crewhaus/eval-dataset@workspace:packages/eval-dataset"],
+
+    "@crewhaus/eval-grader": ["@crewhaus/eval-grader@workspace:packages/eval-grader"],
+
+    "@crewhaus/eval-judge": ["@crewhaus/eval-judge@workspace:packages/eval-judge"],
+
+    "@crewhaus/eval-report": ["@crewhaus/eval-report@workspace:packages/eval-report"],
+
+    "@crewhaus/eval-runner": ["@crewhaus/eval-runner@workspace:packages/eval-runner"],
 
     "@crewhaus/event-log": ["@crewhaus/event-log@workspace:packages/event-log"],
 
