@@ -1,0 +1,24 @@
+{
+  "name": "@crewhaus/agent-context-isolation",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "IsolatedContext factory + RuntimeBridge type for sub-agent spawning (Section 13)",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@crewhaus/abort-controller": "workspace:*",
+    "@crewhaus/event-log": "workspace:*",
+    "@crewhaus/hooks-engine": "workspace:*",
+    "@crewhaus/permission-engine": "workspace:*",
+    "@crewhaus/run-context": "workspace:*",
+    "@crewhaus/state-store": "workspace:*",
+    "@crewhaus/tool-catalog": "workspace:*"
+  }
+}

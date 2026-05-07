@@ -1,0 +1,17 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "references": [
+    { "path": "../abort-controller" },
+    { "path": "../event-log" },
+    { "path": "../hooks-engine" },
+    { "path": "../permission-engine" },
+    { "path": "../run-context" },
+    { "path": "../state-store" },
+    { "path": "../tool-catalog" }
+  ],
+  "include": ["src/**/*"]
+}

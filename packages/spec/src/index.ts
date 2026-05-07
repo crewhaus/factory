@@ -58,14 +58,44 @@ const mcpServerConfigSchema = z.discriminatedUnion("transport", [stdioMcpConfig,
 
 const mcpServersBlock = z.record(z.string().min(1), mcpServerConfigSchema).optional();
 
+// Section 13 — sub-agent definitions. Inline on the agent block (cli +
+// channel today; workflow has no agent block). The map's key is the
+// `subagent_type` users pass to the Task tool. Permissions field mirrors
+// the runtime's resolution shape.
+const subAgentDefinitionSchema = z
+  .object({
+    description: z.string().min(1),
+    instructions: z.string().min(1),
+    tools: z.array(z.string().min(1)).optional(),
+    model: z.string().min(1).optional(),
+    permissions: z
+      .union([
+        z.enum(["inherit", "scoped"]),
+        z
+          .object({
+            allow: z.array(z.string().min(1)),
+            deny: z.array(z.string().min(1)),
+          })
+          .strict(),
+      ])
+      .optional(),
+    inherit_bypass: z.boolean().optional(),
+  })
+  .strict();
+
+const subAgentsBlock = z.record(z.string().min(1), subAgentDefinitionSchema).optional();
+
 const cliSchema = z
   .object({
     name: z.string().min(1),
     target: z.literal("cli"),
-    agent: z.object({
-      model: z.string().min(1),
-      instructions: z.string().min(1),
-    }),
+    agent: z
+      .object({
+        model: z.string().min(1),
+        instructions: z.string().min(1),
+        sub_agents: subAgentsBlock,
+      })
+      .strict(),
     tools: z.array(z.string().min(1)).optional(),
     mcp_servers: mcpServersBlock,
     permissions: permissionsBlock,
@@ -124,6 +154,7 @@ const channelAgentSchema = z
     model: z.string().min(1),
     instructions: z.string().min(1),
     tools: z.array(z.string().min(1)).optional(),
+    sub_agents: subAgentsBlock,
   })
   .strict();
 
@@ -149,6 +180,7 @@ export type SpecChannel = z.infer<typeof channelSchema>;
 export type SpecChannelAgent = z.infer<typeof channelAgentSchema>;
 export type SpecSlackChannel = z.infer<typeof slackChannelSchema>;
 export type SpecMcpServerConfig = z.infer<typeof mcpServerConfigSchema>;
+export type SpecSubAgentDefinition = z.infer<typeof subAgentDefinitionSchema>;
 
 export { SpecParseError };
 

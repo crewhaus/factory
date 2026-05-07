@@ -6,6 +6,7 @@
   },
   "include": ["src/**/*"],
   "references": [
+    { "path": "../../packages/agent-context-isolation" },
     { "path": "../../packages/compiler" },
     { "path": "../../packages/hooks-engine" },
     { "path": "../../packages/infra-utils" },
@@ -17,10 +18,12 @@
     { "path": "../../packages/skills-registry" },
     { "path": "../../packages/slash-commands" },
     { "path": "../../packages/spec" },
+    { "path": "../../packages/sub-agent-spawner" },
     { "path": "../../packages/tool-bash" },
     { "path": "../../packages/tool-catalog" },
     { "path": "../../packages/tool-fs" },
     { "path": "../../packages/tool-mcp" },
+    { "path": "../../packages/tool-task" },
     { "path": "../../packages/tool-todo" }
   ]
 }

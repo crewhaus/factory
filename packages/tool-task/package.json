@@ -1,0 +1,29 @@
+{
+  "name": "@crewhaus/tool-task",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Task(description, prompt, subagent_type?) tool — spawns a sub-agent and returns its final message (Section 13)",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@crewhaus/agent-context-isolation": "workspace:*",
+    "@crewhaus/errors": "workspace:*",
+    "@crewhaus/sub-agent-permission-inheritance": "workspace:*",
+    "@crewhaus/tool-builder": "workspace:*",
+    "@crewhaus/tool-catalog": "workspace:*",
+    "yaml": "^2.6.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@crewhaus/event-log": "workspace:*",
+    "@crewhaus/permission-engine": "workspace:*",
+    "@crewhaus/run-context": "workspace:*"
+  }
+}

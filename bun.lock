@@ -18,6 +18,7 @@
         "crewhaus": "src/index.ts",
       },
       "dependencies": {
+        "@crewhaus/agent-context-isolation": "workspace:*",
         "@crewhaus/compiler": "workspace:*",
         "@crewhaus/hooks-engine": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
@@ -29,10 +30,12 @@
         "@crewhaus/skills-registry": "workspace:*",
         "@crewhaus/slash-commands": "workspace:*",
         "@crewhaus/spec": "workspace:*",
+        "@crewhaus/sub-agent-spawner": "workspace:*",
         "@crewhaus/tool-bash": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
         "@crewhaus/tool-fs": "workspace:*",
         "@crewhaus/tool-mcp": "workspace:*",
+        "@crewhaus/tool-task": "workspace:*",
         "@crewhaus/tool-todo": "workspace:*",
       },
     },
@@ -82,6 +85,19 @@
     "packages/abort-controller": {
       "name": "@crewhaus/abort-controller",
       "version": "0.0.0",
+    },
+    "packages/agent-context-isolation": {
+      "name": "@crewhaus/agent-context-isolation",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/abort-controller": "workspace:*",
+        "@crewhaus/event-log": "workspace:*",
+        "@crewhaus/hooks-engine": "workspace:*",
+        "@crewhaus/permission-engine": "workspace:*",
+        "@crewhaus/run-context": "workspace:*",
+        "@crewhaus/state-store": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+      },
     },
     "packages/channel-adapter-slack": {
       "name": "@crewhaus/channel-adapter-slack",
@@ -187,6 +203,7 @@
       "dependencies": {
         "@anthropic-ai/sdk": "^0.40.0",
         "@crewhaus/abort-controller": "workspace:*",
+        "@crewhaus/agent-context-isolation": "workspace:*",
         "@crewhaus/compaction-autocompact": "workspace:*",
         "@crewhaus/compaction-snip": "workspace:*",
         "@crewhaus/errors": "workspace:*",
@@ -263,6 +280,32 @@
         "@crewhaus/tool-catalog": "workspace:*",
         "@crewhaus/tool-executor": "workspace:*",
         "@crewhaus/turn-state-machine": "workspace:*",
+        "zod": "^3.23.8",
+      },
+    },
+    "packages/sub-agent-permission-inheritance": {
+      "name": "@crewhaus/sub-agent-permission-inheritance",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/agent-context-isolation": "workspace:*",
+        "@crewhaus/permission-engine": "workspace:*",
+        "@crewhaus/tool-permission-matcher": "workspace:*",
+      },
+    },
+    "packages/sub-agent-spawner": {
+      "name": "@crewhaus/sub-agent-spawner",
+      "version": "0.0.0",
+      "dependencies": {
+        "@anthropic-ai/sdk": "^0.40.0",
+        "@crewhaus/agent-context-isolation": "workspace:*",
+        "@crewhaus/event-log": "workspace:*",
+        "@crewhaus/runtime-core": "workspace:*",
+      },
+      "devDependencies": {
+        "@crewhaus/permission-engine": "workspace:*",
+        "@crewhaus/run-context": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
         "zod": "^3.23.8",
       },
     },
@@ -441,6 +484,24 @@
         "@crewhaus/tool-executor": "workspace:*",
       },
     },
+    "packages/tool-task": {
+      "name": "@crewhaus/tool-task",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/agent-context-isolation": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/sub-agent-permission-inheritance": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "yaml": "^2.6.0",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/event-log": "workspace:*",
+        "@crewhaus/permission-engine": "workspace:*",
+        "@crewhaus/run-context": "workspace:*",
+      },
+    },
     "packages/tool-todo": {
       "name": "@crewhaus/tool-todo",
       "version": "0.0.0",
@@ -503,6 +564,8 @@
 
     "@crewhaus/abort-controller": ["@crewhaus/abort-controller@workspace:packages/abort-controller"],
 
+    "@crewhaus/agent-context-isolation": ["@crewhaus/agent-context-isolation@workspace:packages/agent-context-isolation"],
+
     "@crewhaus/channel-adapter-slack": ["@crewhaus/channel-adapter-slack@workspace:packages/channel-adapter-slack"],
 
     "@crewhaus/cli": ["@crewhaus/cli@workspace:apps/cli"],
@@ -547,6 +610,10 @@
 
     "@crewhaus/streaming-tool-executor": ["@crewhaus/streaming-tool-executor@workspace:packages/streaming-tool-executor"],
 
+    "@crewhaus/sub-agent-permission-inheritance": ["@crewhaus/sub-agent-permission-inheritance@workspace:packages/sub-agent-permission-inheritance"],
+
+    "@crewhaus/sub-agent-spawner": ["@crewhaus/sub-agent-spawner@workspace:packages/sub-agent-spawner"],
+
     "@crewhaus/target-channel-bot": ["@crewhaus/target-channel-bot@workspace:packages/target-channel-bot"],
 
     "@crewhaus/target-cli": ["@crewhaus/target-cli@workspace:packages/target-cli"],
@@ -576,6 +643,8 @@
     "@crewhaus/tool-permission-matcher": ["@crewhaus/tool-permission-matcher@workspace:packages/tool-permission-matcher"],
 
     "@crewhaus/tool-result-store": ["@crewhaus/tool-result-store@workspace:packages/tool-result-store"],
+
+    "@crewhaus/tool-task": ["@crewhaus/tool-task@workspace:packages/tool-task"],
 
     "@crewhaus/tool-todo": ["@crewhaus/tool-todo@workspace:packages/tool-todo"],
 

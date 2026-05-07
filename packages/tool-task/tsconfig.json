@@ -1,0 +1,18 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "references": [
+    { "path": "../agent-context-isolation" },
+    { "path": "../errors" },
+    { "path": "../event-log" },
+    { "path": "../permission-engine" },
+    { "path": "../run-context" },
+    { "path": "../sub-agent-permission-inheritance" },
+    { "path": "../tool-builder" },
+    { "path": "../tool-catalog" }
+  ],
+  "include": ["src/**/*"]
+}

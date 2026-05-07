@@ -21,7 +21,8 @@
     "compile:hello-channel": "bun apps/cli/src/index.ts compile examples/hello-channel/crewhaus.yaml -o examples/hello-channel/dist",
     "run:hello-channel": "bun examples/hello-channel/dist/daemon.ts",
     "smoke:section-11": "bun scripts/section-11-smoke.ts",
-    "smoke:section-12": "bun scripts/section-12-smoke.ts"
+    "smoke:section-12": "bun scripts/section-12-smoke.ts",
+    "smoke:section-13": "bun scripts/section-13-smoke.ts"
   },
   "devDependencies": {
     "@biomejs/biome": "1.9.4",

@@ -15,6 +15,7 @@
     "test": "bun test src"
   },
   "dependencies": {
+    "@crewhaus/agent-context-isolation": "workspace:*",
     "@crewhaus/compiler": "workspace:*",
     "@crewhaus/hooks-engine": "workspace:*",
     "@crewhaus/infra-utils": "workspace:*",
@@ -26,10 +27,12 @@
     "@crewhaus/skills-registry": "workspace:*",
     "@crewhaus/slash-commands": "workspace:*",
     "@crewhaus/spec": "workspace:*",
+    "@crewhaus/sub-agent-spawner": "workspace:*",
     "@crewhaus/tool-bash": "workspace:*",
     "@crewhaus/tool-catalog": "workspace:*",
     "@crewhaus/tool-fs": "workspace:*",
     "@crewhaus/tool-mcp": "workspace:*",
+    "@crewhaus/tool-task": "workspace:*",
     "@crewhaus/tool-todo": "workspace:*"
   }
 }

@@ -30,6 +30,7 @@ describe("IrV0 (cli target)", () => {
       tools: [],
       mcp_servers: {},
       permissions: { rules: [] },
+      subAgents: [],
     };
     expect(ir.version).toBe(0);
     expect(ir.target).toBe("cli");
@@ -94,6 +95,7 @@ describe("IrChannelV0 (channel target)", () => {
       routing: { sessionKey: "thread" },
       mcp_servers: {},
       permissions: { rules: [] },
+      subAgents: [],
     };
     expect(ir.target).toBe("channel");
     expect(ir.channels.slack?.botToken.kind).toBe("literal");
@@ -118,6 +120,7 @@ describe("IrNode discriminated union narrowing", () => {
       tools: [],
       mcp_servers: {},
       permissions: { rules: [] },
+      subAgents: [],
     };
     const workflowNode: IrNode = {
       version: 0,
@@ -137,6 +140,7 @@ describe("IrNode discriminated union narrowing", () => {
       routing: { sessionKey: "thread" },
       mcp_servers: {},
       permissions: { rules: [] },
+      subAgents: [],
     };
 
     function describeNode(n: IrNode): string {

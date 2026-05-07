@@ -15,6 +15,12 @@ export type ExecutionContext = {
   readonly allowedPatterns?: ReadonlyArray<string>;
   /** Optional cooperative-cancellation signal forwarded to the tool. */
   readonly signal?: AbortSignal;
+  /**
+   * Section 13 — opaque runtime bridge forwarded into the tool's
+   * `ToolExecuteContext.bridge`. Framework-aware tools (the Task tool) cast
+   * it; ordinary tools ignore it.
+   */
+  readonly bridge?: unknown;
 };
 
 export class ToolPermissionError extends CrewhausError {
@@ -51,7 +57,10 @@ export async function executeTool(
   }
 
   try {
-    const content = await tool.execute(validation.value, { signal: context.signal });
+    const content = await tool.execute(validation.value, {
+      signal: context.signal,
+      ...(context.bridge !== undefined ? { bridge: context.bridge } : {}),
+    });
     return { toolUseId, content, isError: false };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
