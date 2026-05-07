@@ -52,7 +52,7 @@ extra: nope
     expect(() =>
       parseSpec(`
 name: hello
-target: channel
+target: voice
 agent:
   model: m
   instructions: i
@@ -371,6 +371,159 @@ permissions:
 `),
       ).toThrow(SpecParseError);
     });
+  });
+});
+
+describe("parseSpec channel target (Section 12)", () => {
+  test("parses a minimal valid channel spec", () => {
+    const spec = parseSpec(`
+name: hello-channel
+target: channel
+agent:
+  model: claude-sonnet-4-6
+  instructions: be a good bot
+channels:
+  slack:
+    botToken: xoxb-test
+    signingSecret: shh
+routing:
+  sessionKey: thread
+`);
+    expect(spec.target).toBe("channel");
+    if (spec.target !== "channel") expect.unreachable();
+    expect(spec.agent.model).toBe("claude-sonnet-4-6");
+    expect(spec.channels.slack?.botToken).toBe("xoxb-test");
+    expect(spec.routing.sessionKey).toBe("thread");
+    expect(spec.agent.tools).toBeUndefined();
+  });
+
+  test("parses a channel spec with agent.tools and permissions", () => {
+    const spec = parseSpec(`
+name: hello-channel
+target: channel
+agent:
+  model: m
+  instructions: i
+  tools:
+    - read
+    - bash
+channels:
+  slack:
+    botToken: $SLACK_BOT_TOKEN
+    signingSecret: $SLACK_SIGNING_SECRET
+    appToken: $SLACK_APP_TOKEN
+routing:
+  sessionKey: user
+permissions:
+  rules:
+    - type: alwaysAllow
+      pattern: Read
+`);
+    if (spec.target !== "channel") expect.unreachable();
+    expect(spec.agent.tools).toEqual(["read", "bash"]);
+    expect(spec.channels.slack?.appToken).toBe("$SLACK_APP_TOKEN");
+    expect(spec.routing.sessionKey).toBe("user");
+    expect(spec.permissions?.rules).toHaveLength(1);
+  });
+
+  test("rejects a channel spec missing the channels block", () => {
+    expect(() =>
+      parseSpec(`
+name: hello-channel
+target: channel
+agent:
+  model: m
+  instructions: i
+routing:
+  sessionKey: thread
+`),
+    ).toThrow(SpecParseError);
+  });
+
+  test("rejects a channel spec with empty channels block (no slack)", () => {
+    expect(() =>
+      parseSpec(`
+name: hello-channel
+target: channel
+agent:
+  model: m
+  instructions: i
+channels: {}
+routing:
+  sessionKey: thread
+`),
+    ).toThrow(/at least one channel/);
+  });
+
+  test("rejects a channel spec missing routing", () => {
+    expect(() =>
+      parseSpec(`
+name: hello-channel
+target: channel
+agent:
+  model: m
+  instructions: i
+channels:
+  slack:
+    botToken: x
+    signingSecret: y
+`),
+    ).toThrow(SpecParseError);
+  });
+
+  test("rejects an invalid sessionKey", () => {
+    expect(() =>
+      parseSpec(`
+name: hello-channel
+target: channel
+agent:
+  model: m
+  instructions: i
+channels:
+  slack:
+    botToken: x
+    signingSecret: y
+routing:
+  sessionKey: workspace
+`),
+    ).toThrow(SpecParseError);
+  });
+
+  test("rejects an unknown channel adapter (strict)", () => {
+    expect(() =>
+      parseSpec(`
+name: hello-channel
+target: channel
+agent:
+  model: m
+  instructions: i
+channels:
+  telegram:
+    botToken: x
+routing:
+  sessionKey: thread
+`),
+    ).toThrow(SpecParseError);
+  });
+
+  test("rejects mode: bypass in channel spec", () => {
+    expect(() =>
+      parseSpec(`
+name: hello-channel
+target: channel
+agent:
+  model: m
+  instructions: i
+channels:
+  slack:
+    botToken: x
+    signingSecret: y
+routing:
+  sessionKey: thread
+permissions:
+  mode: bypass
+`),
+    ).toThrow(SpecParseError);
   });
 });
 

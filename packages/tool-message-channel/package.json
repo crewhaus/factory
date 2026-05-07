@@ -1,0 +1,28 @@
+{
+  "name": "@crewhaus/tool-message-channel",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Built-in `SendMessage` tool for cross-channel addressing (Section 12). Permission-gated; fail-closed without an explicit allow rule.",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@crewhaus/channel-adapter-slack": "workspace:*",
+    "@crewhaus/errors": "workspace:*",
+    "@crewhaus/tool-builder": "workspace:*",
+    "@crewhaus/tool-catalog": "workspace:*",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@crewhaus/permission-engine": "workspace:*",
+    "@crewhaus/tool-executor": "workspace:*",
+    "@crewhaus/tool-permission-matcher": "workspace:*",
+    "@crewhaus/tool-validate": "workspace:*"
+  }
+}

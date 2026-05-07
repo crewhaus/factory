@@ -1,0 +1,24 @@
+name: hello-channel
+target: channel
+agent:
+  model: claude-sonnet-4-6
+  instructions: |
+    You are a Slack bot. When mentioned in a thread, reply concisely
+    (1-2 sentences) in the same thread. You may use the Read filesystem
+    tool and the Bash shell tool to ground answers in repo state, but
+    Bash invocations are gated and ask for approval each time.
+  tools:
+    - read
+    - bash
+channels:
+  slack:
+    botToken: $SLACK_BOT_TOKEN
+    signingSecret: $SLACK_SIGNING_SECRET
+routing:
+  sessionKey: thread
+permissions:
+  rules:
+    - type: alwaysAllow
+      pattern: Read
+    - type: alwaysAsk
+      pattern: Bash(**)

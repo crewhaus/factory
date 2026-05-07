@@ -1,0 +1,17 @@
+{
+  "token": "Vt9PuruQ8XWLn8eK",
+  "team_id": "T12345WRK",
+  "api_app_id": "A0KRDEXAMPLE",
+  "event": {
+    "type": "message",
+    "subtype": "bot_message",
+    "bot_id": "B0BOT01",
+    "text": "hello",
+    "ts": "1700000002.000300",
+    "channel": "C0CHAN01"
+  },
+  "type": "event_callback",
+  "event_id": "Ev0EVENTTHREE",
+  "event_time": 1700000002,
+  "authorizations": []
+}
