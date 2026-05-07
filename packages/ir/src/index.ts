@@ -76,8 +76,55 @@ export type IrWorkflowV0 = {
   readonly permissions: IrPermissions;
 };
 
+/**
+ * A secret value referenced by a channel config (Section 12). Lower-time
+ * normalisation: spec strings starting with `$VAR_NAME` (where VAR_NAME
+ * matches `[A-Z_][A-Z0-9_]*`) become `{ kind: "env", name }`, anything else
+ * becomes `{ kind: "literal", value }`. Codegen emits literals as quoted
+ * strings and env-refs as `process.env.VAR_NAME`, plus a startup check
+ * that exits non-zero when a referenced env var is unset.
+ */
+export type IrSecretRef =
+  | { readonly kind: "literal"; readonly value: string }
+  | { readonly kind: "env"; readonly name: string };
+
+export type IrSlackConfig = {
+  readonly botToken: IrSecretRef;
+  readonly signingSecret: IrSecretRef;
+  readonly appToken?: IrSecretRef;
+};
+
+export type IrChannels = {
+  readonly slack?: IrSlackConfig;
+};
+
+export type IrRouting = {
+  readonly sessionKey: "thread" | "user" | "channel";
+};
+
+/**
+ * Channel IR — a long-running daemon that listens for inbound webhook events
+ * and runs one agent turn per inbound message. The daemon resumes per-thread
+ * sessions (keyed by `routing.sessionKey`) via session-store + event-log,
+ * appends the new message, and runs one `runChatLoop` turn.
+ */
+export type IrChannelV0 = {
+  readonly version: 0;
+  readonly name: string;
+  readonly target: "channel";
+  readonly agent: {
+    readonly model: string;
+    readonly instructions: string;
+  };
+  readonly tools: readonly string[];
+  readonly channels: IrChannels;
+  readonly routing: IrRouting;
+  readonly mcp_servers: IrMcpServers;
+  readonly permissions: IrPermissions;
+};
+
 /** Discriminated union over every supported target IR. */
-export type IrNode = IrV0 | IrWorkflowV0;
+export type IrNode = IrV0 | IrWorkflowV0 | IrChannelV0;
 
 /**
  * The output of compilation: a set of files to be written to disk by the

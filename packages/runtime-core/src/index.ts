@@ -344,17 +344,20 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   const { client, isOAuth } = resolved;
   const maxTokens = opts.maxTokens ?? 4096;
 
-  // Mutual exclusion: resume takes priority and replaces any seedMessages.
-  if (opts.resume !== undefined && opts.seedMessages !== undefined) {
+  // Mutual exclusion: resume takes priority and replaces any seedMessages
+  // in REPL mode (the resume payload becomes the seed). Section 12 carves
+  // out an exception for singleTurn + resume: the seed is the NEW inbound
+  // message, the resumed history is the prefix.
+  if (opts.resume !== undefined && opts.seedMessages !== undefined && opts.singleTurn !== true) {
     throw new RuntimeError(
-      "runChatLoop: `resume` and `seedMessages` are mutually exclusive — the resume payload becomes the seed",
+      "runChatLoop: `resume` and `seedMessages` are mutually exclusive in REPL mode — the resume payload becomes the seed",
     );
   }
-  if (opts.singleTurn === true && opts.resume !== undefined) {
-    throw new RuntimeError(
-      "runChatLoop: `resume` is not supported in singleTurn mode (resumption only makes sense for the REPL)",
-    );
-  }
+  // Section 12: singleTurn + resume IS supported — used by the channel-bot
+  // session-router for "resume the thread, append the inbound message, run
+  // one turn". The seed must contain only the new turn's input (a single
+  // user message); the replayed event-log history becomes the prefix and
+  // is NOT re-logged.
   if (
     opts.runContext !== undefined &&
     opts.resume !== undefined &&
@@ -969,8 +972,10 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     return { terminalContent };
   }
 
-  // Single-shot path used by the workflow target. One turn, returns the
-  // terminal assistant text, never reads stdin.
+  // Single-shot path used by the workflow target and (Section 12) the
+  // channel-bot session router. Runs one user→assistant turn (with the tool
+  // inner-loop until Done), persists the transcript, returns the terminal
+  // assistant text. Never reads stdin.
   if (opts.singleTurn) {
     const seed = opts.seedMessages ?? [];
     const last = seed[seed.length - 1];
@@ -980,9 +985,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       );
     }
     try {
-      let messages: Anthropic.MessageParam[] = [...seed];
-      // Replay the seed through the event log so the persisted transcript
-      // captures the workflow step's user input.
+      // When resuming, the replayed event-log history becomes the prefix
+      // (already on disk — never re-logged). The seed is the new turn's
+      // input, appended at the end. Without resume (workflow target), the
+      // seed IS the entire turn and is logged through.
+      const replayed = resumedMessages ?? [];
+      let messages: Anthropic.MessageParam[] = [...replayed, ...seed];
       for (const m of seed) {
         if (m.role === "user") {
           await logEvent("user_message", { content: m.content });

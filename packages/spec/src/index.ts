@@ -8,8 +8,11 @@ import { z } from "zod";
  * - `cli`: a single streaming-chat agent (Section 1–5).
  * - `workflow`: a sequence of named steps run in order, threading the prior
  *   step's final assistant text into the next step's user message (Section 6).
+ * - `channel`: a long-running daemon that listens for inbound channel events
+ *   (Slack today, more channels later) and runs one agent turn per inbound
+ *   message, threaded by the routing key. Section 12.
  *
- * Will grow into the full catalog spec (channels, eval, deploy) — see
+ * Will grow into the full catalog spec (eval, deploy) — see
  * docs/MODULE-CATALOG.md PART A Layer F1.
  */
 
@@ -89,12 +92,62 @@ const workflowSchema = z
   })
   .strict();
 
-export const Spec = z.discriminatedUnion("target", [cliSchema, workflowSchema]);
+// Channel target (Section 12). Secret fields (botToken/signingSecret/appToken)
+// are kept as plain strings here; the compiler's `lower()` rewrites strings
+// matching `$VAR_NAME` into env-var references in the IR so the compiled
+// bundle reads `process.env.VAR_NAME` at runtime instead of embedding secrets.
+const slackChannelSchema = z
+  .object({
+    botToken: z.string().min(1),
+    signingSecret: z.string().min(1),
+    appToken: z.string().min(1).optional(),
+  })
+  .strict();
+
+const channelsBlock = z
+  .object({
+    slack: slackChannelSchema.optional(),
+  })
+  .strict()
+  .refine((c) => c.slack !== undefined, {
+    message: "channels block requires at least one channel (slack)",
+  });
+
+const routingBlock = z
+  .object({
+    sessionKey: z.enum(["thread", "user", "channel"]),
+  })
+  .strict();
+
+const channelAgentSchema = z
+  .object({
+    model: z.string().min(1),
+    instructions: z.string().min(1),
+    tools: z.array(z.string().min(1)).optional(),
+  })
+  .strict();
+
+const channelSchema = z
+  .object({
+    name: z.string().min(1),
+    target: z.literal("channel"),
+    agent: channelAgentSchema,
+    channels: channelsBlock,
+    routing: routingBlock,
+    mcp_servers: mcpServersBlock,
+    permissions: permissionsBlock,
+  })
+  .strict();
+
+export const Spec = z.discriminatedUnion("target", [cliSchema, workflowSchema, channelSchema]);
 
 export type Spec = z.infer<typeof Spec>;
 export type SpecCli = z.infer<typeof cliSchema>;
 export type SpecWorkflow = z.infer<typeof workflowSchema>;
 export type SpecWorkflowStep = z.infer<typeof workflowStepSchema>;
+export type SpecChannel = z.infer<typeof channelSchema>;
+export type SpecChannelAgent = z.infer<typeof channelAgentSchema>;
+export type SpecSlackChannel = z.infer<typeof slackChannelSchema>;
 export type SpecMcpServerConfig = z.infer<typeof mcpServerConfigSchema>;
 
 export { SpecParseError };

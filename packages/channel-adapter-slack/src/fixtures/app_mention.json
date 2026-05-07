@@ -1,0 +1,18 @@
+{
+  "token": "Vt9PuruQ8XWLn8eK",
+  "team_id": "T12345WRK",
+  "api_app_id": "A0KRDEXAMPLE",
+  "event": {
+    "type": "app_mention",
+    "user": "U07USER01",
+    "text": "<@U0BOT> what time is it?",
+    "ts": "1700000000.000100",
+    "channel": "C0CHAN01",
+    "event_ts": "1700000000.000100",
+    "thread_ts": "1700000000.000100"
+  },
+  "type": "event_callback",
+  "event_id": "Ev0EVENTONE",
+  "event_time": 1700000000,
+  "authorizations": []
+}

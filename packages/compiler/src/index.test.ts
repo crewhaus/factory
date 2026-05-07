@@ -275,3 +275,93 @@ steps: []
     ).toThrow(SpecParseError);
   });
 });
+
+describe("compile channel target (Section 12)", () => {
+  test("emits a 4-file bundle for a minimal channel spec", () => {
+    const bundle = compile(`
+name: hello-channel
+target: channel
+agent:
+  model: claude-sonnet-4-6
+  instructions: be a good bot
+channels:
+  slack:
+    botToken: $SLACK_BOT_TOKEN
+    signingSecret: $SLACK_SIGNING_SECRET
+routing:
+  sessionKey: thread
+`);
+    const paths = bundle.files.map((f) => f.path).sort();
+    expect(paths).toEqual(["agent.ts", "daemon.ts", "gateway.ts", "session-router.ts"]);
+  });
+
+  test("env-ref secrets lower into process.env reads in daemon.ts", () => {
+    const bundle = compile(`
+name: hello-channel
+target: channel
+agent:
+  model: m
+  instructions: i
+channels:
+  slack:
+    botToken: $SLACK_BOT_TOKEN
+    signingSecret: $SLACK_SIGNING_SECRET
+routing:
+  sessionKey: thread
+`);
+    const daemon = bundle.files.find((f) => f.path === "daemon.ts")?.content ?? "";
+    expect(daemon).toContain('process.env["SLACK_BOT_TOKEN"]');
+    expect(daemon).toContain('process.env["SLACK_SIGNING_SECRET"]');
+    expect(daemon).toContain("missing required env vars");
+  });
+
+  test("literal secrets are embedded verbatim and skip the env-check block", () => {
+    const bundle = compile(`
+name: hello-channel
+target: channel
+agent:
+  model: m
+  instructions: i
+channels:
+  slack:
+    botToken: xoxb-literal-token
+    signingSecret: literal-signing-secret
+routing:
+  sessionKey: user
+`);
+    const daemon = bundle.files.find((f) => f.path === "daemon.ts")?.content ?? "";
+    expect(daemon).toContain('"xoxb-literal-token"');
+    expect(daemon).toContain('"literal-signing-secret"');
+    expect(daemon).not.toContain("missing required env vars");
+  });
+
+  test("agent.tools threaded through agent + tool registration", () => {
+    const bundle = compile(`
+name: hello-channel
+target: channel
+agent:
+  model: m
+  instructions: i
+  tools:
+    - read
+    - sendMessage
+channels:
+  slack:
+    botToken: x
+    signingSecret: y
+routing:
+  sessionKey: thread
+permissions:
+  rules:
+    - type: alwaysAllow
+      pattern: SendMessage
+`);
+    const daemon = bundle.files.find((f) => f.path === "daemon.ts")?.content ?? "";
+    expect(daemon).toContain('import { read } from "@crewhaus/tool-fs";');
+    expect(daemon).toContain('import { sendMessage } from "@crewhaus/tool-message-channel";');
+    expect(daemon).toContain("defaultCatalog.register(read);");
+    expect(daemon).toContain("defaultCatalog.register(sendMessage);");
+    const agent = bundle.files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agent).toContain('pattern: "SendMessage"');
+  });
+});

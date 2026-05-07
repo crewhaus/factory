@@ -1,18 +1,17 @@
 # CrewHaus Factory — Build Roadmap
 
-> Status as of 2026-05-07. 39 of ~190 catalog modules implemented; Sections 1–10 complete, Sections 11–12 next.
+> Status as of 2026-05-07. 46 of ~190 catalog modules implemented; Sections 1–12 complete.
 > See `docs/MODULE-CATALOG.md` for full per-module specs and test layer references.
 
 ---
 
 ## Current baseline
 
-The compiler pipeline (spec → IR → codegen) ships two target shapes (`cli`, `workflow`) and the runtime carries tools end-to-end with state-machine-driven turns and pre-turn compaction (snip → autocompact). The CLI exposes `compile`, `run`, `init`, and `doctor` subcommands; three built-in tool packages (`tool-fs`, `tool-bash`, `tool-todo`) are registered. Section 7 added recovery (Anthropic taxonomy with budgets), a layered permission engine (modes + 5 rule sources, with `bypass` locked to the CLI flag), and a parent/child abort tree with SIGINT integration. Section 8 added the partitioned tool layer: concurrent-safe read-only calls run via `Promise.all` while destructive calls run serially, repeated `(toolName, input)` pairs trigger a sliding-window loop warning, large outputs (>10 KB) are persisted to `.crewhaus/tool-results/<runId>/<toolUseId>.txt` with a preview marker the model can re-read, and `streaming: true` dispatches tools mid-stream via the SDK's `contentBlock` event. Section 9 added MCP host + tool-mcp + a `mcp_servers` block in the spec, so external MCP servers (filesystem, github, the everything-server reference, …) auto-spawn at boot and their remote tools register on the catalog under `<server>__<tool>`. Section 10 added persistence: every `crewhaus run` now creates (or `--resume`s) a session under `.crewhaus/sessions/`, transcripts append to a versioned JSONL event log, sessions older than 30 days evict on the next run, and a per-run `state-store` ships as the coordination surface for the hooks/skills work landing in Section 11.
+The compiler pipeline (spec → IR → codegen) ships three target shapes (`cli`, `workflow`, `channel`) and the runtime carries tools end-to-end with state-machine-driven turns and pre-turn compaction (snip → autocompact). The CLI exposes `compile`, `run`, `init`, and `doctor` subcommands; three built-in tool packages (`tool-fs`, `tool-bash`, `tool-todo`) are registered, plus the opt-in cross-channel `tool-message-channel`. Section 7 added recovery (Anthropic taxonomy with budgets), a layered permission engine (modes + 5 rule sources, with `bypass` locked to the CLI flag), and a parent/child abort tree with SIGINT integration. Section 8 added the partitioned tool layer: concurrent-safe read-only calls run via `Promise.all` while destructive calls run serially, repeated `(toolName, input)` pairs trigger a sliding-window loop warning, large outputs (>10 KB) are persisted to `.crewhaus/tool-results/<runId>/<toolUseId>.txt` with a preview marker the model can re-read, and `streaming: true` dispatches tools mid-stream via the SDK's `contentBlock` event. Section 9 added MCP host + tool-mcp + a `mcp_servers` block in the spec, so external MCP servers (filesystem, github, the everything-server reference, …) auto-spawn at boot and their remote tools register on the catalog under `<server>__<tool>`. Section 10 added persistence: every `crewhaus run` now creates (or `--resume`s) a session under `.crewhaus/sessions/`, transcripts append to a versioned JSONL event log, sessions older than 30 days evict on the next run, and a per-run `state-store` ships as the coordination surface for the hooks/skills work landing in Section 11. Section 11 wired the extension surface — hooks, skills, slash commands — into every `runChatLoop` invocation. Section 12 added the third target shape: a long-running daemon (`Bun.serve` + per-thread session resumption) with a Slack adapter, the first multi-file codegen output, and a permission-gated `SendMessage` tool for cross-channel addressing.
 
-What the current stack still cannot do — and Sections 11–12 unlock, in order:
+What the current stack can now do, end-to-end:
 
-1. **Be customized** — no hooks, no skills, no slash commands. The harness has no extension surface for users. *(Section 11)*
-2. **Live in chat** — only CLI and workflow targets exist; no channel/messenger shape. *(Section 12)*
+- Compile a `target: channel` spec → multi-file daemon bundle → `bun run run:hello-channel` listens on `/slack/events`, verifies signed webhooks (HMAC-SHA256 + ±5 min replay window), dedups by Slack `event_id`, resumes per-thread sessions keyed on `sha256(slack:<workspace>:<channel>:<thread>)`, runs one `runChatLoop` turn per inbound message, and replies in-thread via `chat.postMessage`. Hooks, skills, and slash commands fire on every turn. Tools register opt-in via `agent.tools` (built-ins + future channel-specific), permission rules gate execution, and `SendMessage` requires an explicit `alwaysAllow` rule before the agent can use it.
 
 ---
 
@@ -476,7 +475,7 @@ Hook firing points (logged at debug level via `runContext.logger`, errors from a
 
 ## Section 12 — Third target shape: channel bot
 
-> Status: not started.
+> Status: ✅ complete.
 
 **Catalog modules:** `target-channel-bot` (F2), Slack adapter (R-channels), `tool-message-channel` (R4); transitively depends on `mcp-host` (Section 9), `session-store` + `event-log` (Section 10), `hooks-engine` (Section 11)
 
@@ -523,7 +522,7 @@ ir-model (IrChannelV0)                     examples/hello-channel/
 - Add `compile:hello-channel` and `run:hello-channel` scripts to the root `package.json`
 
 ### Tests
-`target-channel-bot`: unit test (`T1`) on generated bundle structure; integration test (`T3`) compiling `hello-channel` and starting the daemon, posting a fake Slack webhook, and asserting a reply is sent. `channel-adapter-slack`: contract test (`T2`) against a recorded Slack event corpus; security test (`T8`) for signature verification with tampered payloads. `tool-message-channel`: permission test (`T8`) verifying the tool fails closed without explicit allow rule.
+`target-channel-bot`: unit test (`T1`) on generated bundle structure (24 tests covering each emitted file's contract). `channel-adapter-slack`: contract test (`T2`) against fixture Slack events (`app_mention`, `message`, `bot_message`, `url_verification`); security test (`T8`) covering tampered body, tampered signature, wrong secret, expired timestamp, future timestamp, missing headers, malformed timestamp, and length-mismatch (`timingSafeEqual` guard). `tool-message-channel`: permission test (`T8`) verifying fail-closed in default mode without an explicit `alwaysAllow SendMessage` rule, plus source-priority override semantics. `runtime-core`: regression test for the singleTurn + resume mutex relaxation — asserts the model receives prior history + new seed AND the event log gains exactly the new turn (replayed messages are not re-logged). The `T3` integration test (compile + spawn daemon + post webhook + assert reply) lives in `scripts/section-12-smoke.ts` (5 scenarios end-to-end against the live model with synthetic Slack webhooks + a local outbound mock listener).
 
 ---
 

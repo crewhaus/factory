@@ -1134,7 +1134,7 @@ describe("runChatLoop — Section 10 persistence", () => {
     ).rejects.toThrow(/cannot --resume/);
   });
 
-  test("rejects resume + seedMessages combo as mutually exclusive", async () => {
+  test("rejects resume + seedMessages combo as mutually exclusive in REPL mode", async () => {
     const { client } = makeScriptedClient([]);
     await expect(
       runChatLoop({
@@ -1146,6 +1146,75 @@ describe("runChatLoop — Section 10 persistence", () => {
         seedMessages: [{ role: "user", content: "hi" }],
       }),
     ).rejects.toThrow(/mutually exclusive/);
+  });
+
+  // Section 12 — channel-bot session router uses singleTurn + resume to
+  // "resume the thread, append the inbound message, run one turn". Verifies
+  // (a) the model receives prior history + new seed, and (b) the event log
+  // gains exactly the new turn's messages — replayed history is NOT re-logged.
+  test("singleTurn + resume threads prior history without re-logging", async () => {
+    // Run A: one REPL turn, persisted to its session.
+    const ctxA = createRunContext();
+    const recordedA = makeScriptedClient([
+      [{ type: "text", text: "reply-1", citations: null } as Anthropic.TextBlock],
+    ]);
+    const inputA = new PassThrough();
+    inputA.write("first\n");
+    inputA.end();
+    await runChatLoop({
+      model: "test-model",
+      instructions: "test",
+      client: recordedA.client,
+      input: inputA,
+      runContext: ctxA,
+    });
+
+    const { openEventLog } = await import("@crewhaus/event-log");
+    const beforeLog = await openEventLog(ctxA.sessionId, { rootDir: SHARED_SESSION_ROOT });
+    const beforeEvents: Array<{ kind: string }> = [];
+    for await (const ev of beforeLog.read()) beforeEvents.push({ kind: ev.kind });
+    await beforeLog.close();
+    const beforeUser = beforeEvents.filter((e) => e.kind === "user_message").length;
+    const beforeAsst = beforeEvents.filter((e) => e.kind === "assistant_message").length;
+    expect(beforeUser).toBe(1);
+    expect(beforeAsst).toBe(1);
+
+    // Run B: singleTurn + resume + new seed (the channel-bot pattern).
+    const sessionId = ctxA.sessionId;
+    const recordedB = makeScriptedClient([
+      [{ type: "text", text: "reply-2", citations: null } as Anthropic.TextBlock],
+    ]);
+    const ctxB = createRunContext({ sessionId });
+    const reply = await runChatLoop({
+      model: "test-model",
+      instructions: "test",
+      client: recordedB.client,
+      runContext: ctxB,
+      resume: { sessionId },
+      singleTurn: true,
+      seedMessages: [{ role: "user", content: "second" }],
+    });
+    expect(reply).toBe("reply-2");
+
+    // Model received [u1, a1, u2] — replayed prefix + new seed.
+    const firstCall = recordedB.capturedMessages()[0] ?? [];
+    expect(firstCall.length).toBe(3);
+    expect(firstCall[0]?.role).toBe("user");
+    expect(firstCall[0]?.content).toBe("first");
+    expect(firstCall[1]?.role).toBe("assistant");
+    expect(firstCall[2]?.role).toBe("user");
+    expect(firstCall[2]?.content).toBe("second");
+
+    // Event log gained exactly +1 user_message + +1 assistant_message —
+    // replayed messages must not be re-logged.
+    const afterLog = await openEventLog(sessionId, { rootDir: SHARED_SESSION_ROOT });
+    const afterEvents: Array<{ kind: string }> = [];
+    for await (const ev of afterLog.read()) afterEvents.push({ kind: ev.kind });
+    await afterLog.close();
+    const afterUser = afterEvents.filter((e) => e.kind === "user_message").length;
+    const afterAsst = afterEvents.filter((e) => e.kind === "assistant_message").length;
+    expect(afterUser - beforeUser).toBe(1);
+    expect(afterAsst - beforeAsst).toBe(1);
   });
 
   test("event log captures user_message + assistant_message events", async () => {

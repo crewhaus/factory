@@ -1,0 +1,17 @@
+{
+  "token": "Vt9PuruQ8XWLn8eK",
+  "team_id": "T12345WRK",
+  "api_app_id": "A0KRDEXAMPLE",
+  "event": {
+    "type": "message",
+    "user": "U07USER01",
+    "text": "ping",
+    "ts": "1700000001.000200",
+    "channel": "C0CHAN01",
+    "event_ts": "1700000001.000200"
+  },
+  "type": "event_callback",
+  "event_id": "Ev0EVENTTWO",
+  "event_time": 1700000001,
+  "authorizations": []
+}
