@@ -38,6 +38,26 @@ export type IrMcpSseConfig = {
 export type IrMcpServerConfig = IrMcpStdioConfig | IrMcpSseConfig;
 export type IrMcpServers = Readonly<Record<string, IrMcpServerConfig>>;
 
+/**
+ * Section 13 — a sub-agent definition lowered from spec form. The map's key
+ * is hoisted to a `name` field for ergonomics. `tools: readonly string[]`
+ * mirrors `IrV0.tools`; codegen filters the parent catalog to this
+ * allowlist when building the child catalog. `permissions` defaults to
+ * `"inherit"` at lower-time when undefined; `inheritBypass` to false.
+ */
+export type IrSubAgentDefinition = {
+  readonly name: string;
+  readonly description: string;
+  readonly instructions: string;
+  readonly tools: readonly string[];
+  readonly model?: string;
+  readonly permissions:
+    | "inherit"
+    | "scoped"
+    | { readonly allow: readonly string[]; readonly deny: readonly string[] };
+  readonly inheritBypass: boolean;
+};
+
 export type IrV0 = {
   readonly version: 0;
   readonly name: string;
@@ -49,6 +69,7 @@ export type IrV0 = {
   readonly tools: readonly string[];
   readonly mcp_servers: IrMcpServers;
   readonly permissions: IrPermissions;
+  readonly subAgents: readonly IrSubAgentDefinition[];
 };
 
 /**
@@ -121,6 +142,7 @@ export type IrChannelV0 = {
   readonly routing: IrRouting;
   readonly mcp_servers: IrMcpServers;
   readonly permissions: IrPermissions;
+  readonly subAgents: readonly IrSubAgentDefinition[];
 };
 
 /** Discriminated union over every supported target IR. */

@@ -1,6 +1,11 @@
 import * as readline from "node:readline/promises";
 import Anthropic from "@anthropic-ai/sdk";
 import { type AbortTree, createAbortTree } from "@crewhaus/abort-controller";
+import type {
+  RuntimeBridge,
+  SpawnSubAgentFn,
+  SubAgentDefinition,
+} from "@crewhaus/agent-context-isolation";
 import { autoCompact } from "@crewhaus/compaction-autocompact";
 import { snip } from "@crewhaus/compaction-snip";
 import { RuntimeError } from "@crewhaus/errors";
@@ -326,6 +331,21 @@ export type RunChatLoopOptions = {
    * `pre-slash` first; deny falls through to the original input.
    */
   slashCommands?: ReadonlyMap<string, SlashCommand>;
+  /**
+   * Section 13 — inline sub-agent definitions exposed via the `Task` tool.
+   * Threaded into the `RuntimeBridge` and surfaced to framework-aware
+   * tools (only `Task` today). Codegen sets this from the IR; ordinary
+   * runChatLoop callers leave it undefined.
+   */
+  subAgents?: ReadonlyMap<string, SubAgentDefinition>;
+  /**
+   * Section 13 — sub-agent spawner injection. Codegen passes
+   * `spawnSubAgent` from `@crewhaus/sub-agent-spawner`. The runtime stamps
+   * it onto the bridge; the Task tool dispatches via it. Inverted-DI to
+   * avoid a runtime-core → sub-agent-spawner cycle (the spawner consumes
+   * runChatLoop).
+   */
+  spawnSubAgent?: SpawnSubAgentFn;
 };
 
 /**
@@ -416,6 +436,14 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // underscore prefix marks the intentional non-consumer.
   const _runState: Store<Record<string, unknown>> = createStore({});
   void _runState;
+
+  // Section 13 — RuntimeBridge. Built once per run, handed to every
+  // tool execution through the executor's ExecutionContext. Framework-
+  // aware tools (only `Task` today) cast `ctx.bridge` to RuntimeBridge.
+  // Built lazily inside executeOneToolUse so it captures the latest
+  // permission-mode/-rules and tool list — the values themselves are
+  // stable for the run, but the closure keeps the call-site at the
+  // tool-execute boundary tidy.
 
   // Tight helper so call sites stay one line. Errors propagate so an I/O
   // failure on the audit trail surfaces rather than silently dropping.
@@ -610,9 +638,28 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     }
 
     const toolAbort = turnAbort.child();
+    // Build the bridge for this call. Skipped (left undefined) when no
+    // spawnSubAgent injection is provided — non-Task tools don't need it.
+    const bridge: RuntimeBridge | undefined =
+      opts.spawnSubAgent !== undefined
+        ? {
+            runContext,
+            eventLog,
+            permissionMode,
+            permissionRules,
+            tools,
+            model: opts.model,
+            maxTokens,
+            ...(sessionRootDir !== undefined ? { sessionRootDir } : {}),
+            hooks,
+            ...(opts.subAgents !== undefined ? { subAgents: opts.subAgents } : {}),
+            spawnSubAgent: opts.spawnSubAgent,
+          }
+        : undefined;
     const raw = await executeTool(tool, tu.input, {
       toolUseId: tu.id,
       signal: toolAbort.signal,
+      ...(bridge !== undefined ? { bridge } : {}),
     });
     const stored = await storeAndPreview(
       { toolUseId: raw.toolUseId, content: raw.content, isError: raw.isError },

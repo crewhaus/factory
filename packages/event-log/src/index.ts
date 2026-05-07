@@ -38,7 +38,9 @@ export type EventKind =
   | "tool_use"
   | "tool_result"
   | "error"
-  | "compaction";
+  | "compaction"
+  | "sub_agent_start"
+  | "sub_agent_end";
 
 export type Event = {
   readonly ts: number;

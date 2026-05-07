@@ -1,0 +1,28 @@
+{
+  "name": "@crewhaus/sub-agent-spawner",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "spawnSubAgent — wires IsolatedContext + child runChatLoop and re-emits boundary events to the parent (Section 13)",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.40.0",
+    "@crewhaus/agent-context-isolation": "workspace:*",
+    "@crewhaus/event-log": "workspace:*",
+    "@crewhaus/runtime-core": "workspace:*"
+  },
+  "devDependencies": {
+    "@crewhaus/permission-engine": "workspace:*",
+    "@crewhaus/run-context": "workspace:*",
+    "@crewhaus/tool-builder": "workspace:*",
+    "@crewhaus/tool-catalog": "workspace:*",
+    "zod": "^3.23.8"
+  }
+}

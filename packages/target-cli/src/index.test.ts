@@ -11,6 +11,7 @@ function baseIr(overrides: Partial<IrV0> = {}): IrV0 {
     tools: [],
     mcp_servers: {},
     permissions: { rules: [] },
+    subAgents: [],
     ...overrides,
   };
 }
@@ -71,8 +72,7 @@ describe("emitCli — tool wiring (Section 2)", () => {
   });
 
   test("multiple tools from the same package are grouped into one import", () => {
-    const content =
-      emitCli(baseIr({ tools: ["read", "write", "edit"] })).files[0]?.content ?? "";
+    const content = emitCli(baseIr({ tools: ["read", "write", "edit"] })).files[0]?.content ?? "";
     // single import line covering all three exports
     expect(content).toMatch(/import \{ edit, read, write \} from "@crewhaus\/tool-fs"/);
     // three separate register calls
@@ -132,7 +132,9 @@ describe("emitCli — permissions (Section 7)", () => {
           },
         }),
       ).files[0]?.content ?? "";
-    expect(content).toContain('import { BUILTIN_DEFAULT_RULES } from "@crewhaus/permission-engine"');
+    expect(content).toContain(
+      'import { BUILTIN_DEFAULT_RULES } from "@crewhaus/permission-engine"',
+    );
     expect(content).toContain("permissionRules: {");
     expect(content).toContain("yaml: [");
     expect(content).toContain('type: "alwaysAllow"');
@@ -196,6 +198,65 @@ describe("emitCli — extension surface (Section 11)", () => {
     expect(content).toContain(
       "if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));",
     );
+  });
+});
+
+describe("emitCli — sub-agents (Section 13)", () => {
+  test("empty subAgents is a no-op (regression: pre-Section-13 shape preserved)", () => {
+    const content = emitCli(baseIr()).files[0]?.content ?? "";
+    expect(content).not.toContain("@crewhaus/tool-task");
+    expect(content).not.toContain("@crewhaus/sub-agent-spawner");
+    expect(content).not.toContain("__subAgents");
+    expect(content).not.toContain("spawnSubAgent");
+  });
+
+  test("non-empty subAgents emits imports, registry, Task tool registration, and runChatLoop wiring", () => {
+    const content =
+      emitCli(
+        baseIr({
+          subAgents: [
+            {
+              name: "summarizer",
+              description: "summarize text",
+              instructions: "Summarize input in 2 sentences.",
+              tools: [],
+              permissions: "scoped",
+              inheritBypass: false,
+            },
+          ],
+        }),
+      ).files[0]?.content ?? "";
+    expect(content).toContain('import { createTaskTool } from "@crewhaus/tool-task"');
+    expect(content).toContain('import { spawnSubAgent } from "@crewhaus/sub-agent-spawner"');
+    expect(content).toContain('SubAgentDefinition } from "@crewhaus/agent-context-isolation"');
+    expect(content).toContain("__subAgents");
+    expect(content).toContain('"summarizer"');
+    expect(content).toContain('description: "summarize text"');
+    expect(content).toContain('permissions: "scoped"');
+    expect(content).toContain("inherit_bypass: false");
+    expect(content).toContain("createTaskTool({ subAgents: __subAgents })");
+    expect(content).toContain("subAgents: __subAgents");
+    expect(content).toContain("spawnSubAgent,");
+  });
+
+  test("replace-style permissions render as { allow, deny }", () => {
+    const content =
+      emitCli(
+        baseIr({
+          subAgents: [
+            {
+              name: "rep",
+              description: "x",
+              instructions: "y",
+              tools: ["read"],
+              permissions: { allow: ["Read", "Glob"], deny: ["Bash(**)"] },
+              inheritBypass: false,
+            },
+          ],
+        }),
+      ).files[0]?.content ?? "";
+    expect(content).toContain('allow: ["Read","Glob"]');
+    expect(content).toContain('deny: ["Bash(**)"]');
   });
 });
 

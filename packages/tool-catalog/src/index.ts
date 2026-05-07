@@ -5,9 +5,15 @@ import type { ZodType } from "zod";
  * Per-call context passed as the second argument to `execute`. Tools that
  * support cooperative cancellation (e.g. tool-bash forwarding to Bun.spawn)
  * read `signal` from here; tools that don't care can ignore it entirely.
+ *
+ * `bridge` (Section 13) is an opaque payload runtime-core stuffs in once per
+ * run. Framework-aware tools — today only the `Task` tool — cast it back to
+ * the typed `RuntimeBridge` from `@crewhaus/agent-context-isolation`.
+ * Ordinary tools ignore it.
  */
 export interface ToolExecuteContext {
   readonly signal?: AbortSignal;
+  readonly bridge?: unknown;
 }
 
 export interface ToolDefinition<TInput = unknown> {

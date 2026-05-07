@@ -9,6 +9,7 @@ import type {
   IrPermissions,
   IrSecretRef,
   IrSlackConfig,
+  IrSubAgentDefinition,
   IrV0,
   IrWorkflowV0,
 } from "@crewhaus/ir";
@@ -17,6 +18,7 @@ import {
   type SpecChannel,
   type SpecMcpServerConfig,
   type SpecSlackChannel,
+  type SpecSubAgentDefinition,
   parseSpec,
 } from "@crewhaus/spec";
 import { emitChannelBot } from "@crewhaus/target-channel-bot";
@@ -107,6 +109,32 @@ function lowerChannels(channels: SpecChannel["channels"]): IrChannels {
   };
 }
 
+/**
+ * Section 13 — convert a spec sub_agents map to a deterministic IR array.
+ * The map key becomes the `name` field. Defaults applied at lower-time:
+ *   - permissions ?? "inherit"
+ *   - inherit_bypass ?? false
+ *   - tools ?? []  (codegen treats "no tools" as "no allowed tools" when
+ *                   permissions !== "inherit"; tool-task itself encodes
+ *                   the same fallback for runtime resolution.)
+ */
+function lowerSubAgents(
+  map: Record<string, SpecSubAgentDefinition> | undefined,
+): IrSubAgentDefinition[] {
+  if (map === undefined) return [];
+  // Stable order: sort by name so generated bundles diff cleanly.
+  const entries = Object.entries(map).sort(([a], [b]) => a.localeCompare(b));
+  return entries.map(([name, def]) => ({
+    name,
+    description: def.description,
+    instructions: def.instructions,
+    tools: def.tools ?? [],
+    ...(def.model !== undefined ? { model: def.model } : {}),
+    permissions: def.permissions ?? "inherit",
+    inheritBypass: def.inherit_bypass ?? false,
+  }));
+}
+
 export function lower(spec: Spec): IrNode {
   switch (spec.target) {
     case "cli":
@@ -121,6 +149,7 @@ export function lower(spec: Spec): IrNode {
         tools: spec.tools ?? [],
         mcp_servers: lowerMcpServers(spec.mcp_servers),
         permissions: lowerPermissions(spec),
+        subAgents: lowerSubAgents(spec.agent.sub_agents),
       } satisfies IrV0;
     case "workflow":
       return {
@@ -150,6 +179,7 @@ export function lower(spec: Spec): IrNode {
         routing: { sessionKey: spec.routing.sessionKey },
         mcp_servers: lowerMcpServers(spec.mcp_servers),
         permissions: lowerPermissions(spec),
+        subAgents: lowerSubAgents(spec.agent.sub_agents),
       } satisfies IrChannelV0;
     default:
       return assertNever(spec);

@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
+import type { SubAgentDefinition } from "@crewhaus/agent-context-isolation";
 import { SpecParseError, compile, lower } from "@crewhaus/compiler";
 import { loadHooks } from "@crewhaus/hooks-engine";
 import {
@@ -23,8 +24,10 @@ import { resolveAuth, runChatLoop } from "@crewhaus/runtime-core";
 import { createSkillTool, discoverSkills } from "@crewhaus/skills-registry";
 import { loadCommands } from "@crewhaus/slash-commands";
 import { parseSpec } from "@crewhaus/spec";
+import { spawnSubAgent } from "@crewhaus/sub-agent-spawner";
 import { type RegisteredTool, ToolCatalog } from "@crewhaus/tool-catalog";
 import { registerMcpServer } from "@crewhaus/tool-mcp";
+import { createTaskTool } from "@crewhaus/tool-task";
 
 /**
  * crewhaus — slice-scope CLI.
@@ -371,6 +374,31 @@ async function runRun(args: ParsedArgs): Promise<void> {
     );
   }
 
+  // Section 13 — when the IR carries inline sub-agent definitions, build the
+  // registry, register the Task tool, and inject `spawnSubAgent` so the
+  // runtime can populate the bridge for framework-aware tools.
+  let subAgents: ReadonlyMap<string, SubAgentDefinition> | undefined;
+  if (ir.subAgents.length > 0) {
+    subAgents = new Map(
+      ir.subAgents.map((d) => [
+        d.name,
+        {
+          name: d.name,
+          description: d.description,
+          instructions: d.instructions,
+          tools: d.tools,
+          ...(d.model !== undefined ? { model: d.model } : {}),
+          permissions: d.permissions,
+          inherit_bypass: d.inheritBypass,
+        } satisfies SubAgentDefinition,
+      ]),
+    );
+    tools.push(createTaskTool({ subAgents }));
+    process.stdout.write(
+      `[sub-agents] ${subAgents.size} available: ${[...subAgents.keys()].join(", ")}\n`,
+    );
+  }
+
   try {
     await runChatLoop({
       model,
@@ -383,6 +411,7 @@ async function runRun(args: ParsedArgs): Promise<void> {
       hooks,
       skills,
       slashCommands,
+      ...(subAgents !== undefined ? { subAgents, spawnSubAgent } : {}),
       ...(resumeId !== undefined ? { resume: { sessionId: resumeId } } : {}),
     });
   } finally {

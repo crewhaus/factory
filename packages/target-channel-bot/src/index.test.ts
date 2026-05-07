@@ -17,6 +17,7 @@ const MIN_IR: IrChannelV0 = {
   routing: { sessionKey: "thread" },
   mcp_servers: {},
   permissions: { rules: [] },
+  subAgents: [],
 };
 
 const fileMap = (ir: IrChannelV0): Map<string, string> =>
