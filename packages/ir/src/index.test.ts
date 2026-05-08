@@ -1,8 +1,14 @@
 import { describe, expect, test } from "bun:test";
 import type {
   Bundle,
+  IrBatchQueueAdapter,
+  IrBatchV0,
+  IrBrowserBackend,
+  IrBrowserV0,
   IrChannelV0,
   IrCompaction,
+  IrCrewRole,
+  IrCrewV0,
   IrGraphEdge,
   IrGraphNode,
   IrGraphV0,
@@ -15,10 +21,13 @@ import type {
   IrPermissions,
   IrPipelineDocument,
   IrPipelineV0,
+  IrResearchV0,
   IrSecretRef,
   IrSubAgentDefinition,
   IrToolConfigs,
   IrV0,
+  IrVoiceProvider,
+  IrVoiceV0,
   IrWorkflowStep,
   IrWorkflowV0,
 } from "./index";
@@ -224,6 +233,102 @@ describe("IrNode discriminated union narrowing", () => {
       permissions: { rules: [] },
       compaction: {},
     };
+    const crewNode: IrNode = {
+      version: 0,
+      name: "x",
+      target: "crew",
+      entry: "researcher",
+      roles: [
+        {
+          name: "researcher",
+          model: "m",
+          instructions: "research",
+          tools: [],
+          toolConfigs: {},
+          subAgents: [],
+        },
+        {
+          name: "writer",
+          model: "m",
+          instructions: "write",
+          tools: [],
+          toolConfigs: {},
+          subAgents: [],
+        },
+      ],
+      mcp_servers: {},
+      permissions: { rules: [] },
+      compaction: {},
+    };
+    const researchNode: IrNode = {
+      version: 0,
+      name: "x",
+      target: "research",
+      agent: { model: "m", instructions: "i" },
+      goal: "study GRPH risks",
+      branchingFactor: 3,
+      maxDurationMs: 300_000,
+      retrieve: { allowedOrigins: ["https://example.com"], allowedFileRoots: [] },
+      tools: [],
+      toolConfigs: {},
+      mcp_servers: {},
+      permissions: { rules: [] },
+      compaction: {},
+    };
+    const batchNode: IrNode = {
+      version: 0,
+      name: "x",
+      target: "batch",
+      agent: { model: "m", instructions: "i" },
+      queue: {
+        adapter: "in-memory",
+        visibilityTimeoutMs: 30_000,
+        maxRetries: 3,
+        seedJobs: ["job-1"],
+      },
+      concurrency: 4,
+      idempotencyWindowMs: 60_000,
+      tools: [],
+      toolConfigs: {},
+      mcp_servers: {},
+      permissions: { rules: [] },
+      compaction: {},
+    };
+    const voiceNode: IrNode = {
+      version: 0,
+      name: "x",
+      target: "voice",
+      agent: { model: "m", instructions: "i" },
+      voice: {
+        provider: "openai",
+        voiceId: "alloy",
+        vad: "server",
+        bargeInTriggerFrames: 3,
+        bargeInWindowMs: 200,
+      },
+      tools: [],
+      toolConfigs: {},
+      mcp_servers: {},
+      permissions: { rules: [] },
+      compaction: {},
+    };
+    const browserNode: IrNode = {
+      version: 0,
+      name: "x",
+      target: "browser",
+      agent: { model: "m", instructions: "i" },
+      driver: {
+        backend: "chromium",
+        viewport: { width: 1280, height: 800 },
+        startUrl: "https://example.com",
+      },
+      groundingModel: "m",
+      tools: [],
+      toolConfigs: {},
+      mcp_servers: {},
+      permissions: { rules: [] },
+      compaction: {},
+    };
 
     function describeNode(n: IrNode): string {
       switch (n.target) {
@@ -258,6 +363,11 @@ describe("IrNode discriminated union narrowing", () => {
     expect(describeNode(graphNode)).toBe("graph:2");
     expect(describeNode(managedNode)).toBe("managed:2");
     expect(describeNode(pipelineNode)).toBe("pipeline:3");
+    expect(describeNode(crewNode)).toBe("crew:2");
+    expect(describeNode(researchNode)).toBe("research:3");
+    expect(describeNode(batchNode)).toBe("batch:in-memory");
+    expect(describeNode(voiceNode)).toBe("voice:openai");
+    expect(describeNode(browserNode)).toBe("browser:chromium");
   });
 });
 
@@ -530,5 +640,287 @@ describe("IrPipelineV0 (Section 21)", () => {
       defaultK: 5,
     };
     void _bad;
+  });
+});
+
+describe("IrCrewV0 (Section 22)", () => {
+  test("a crew IR carries an entry role + role table; sub-agents inherited per role", () => {
+    const researcher: IrCrewRole = {
+      name: "researcher",
+      model: "claude-sonnet-4-6",
+      instructions: "gather facts",
+      tools: ["WebFetch"],
+      toolConfigs: {},
+      subAgents: [],
+    };
+    const writer: IrCrewRole = {
+      name: "writer",
+      model: "claude-sonnet-4-6",
+      instructions: "synthesise into a post",
+      tools: [],
+      toolConfigs: {},
+      subAgents: [
+        {
+          name: "outline-helper",
+          description: "draft an outline",
+          instructions: "produce a 5-bullet outline",
+          tools: [],
+          permissions: "inherit",
+          inheritBypass: false,
+        },
+      ],
+    };
+    const ir: IrCrewV0 = {
+      version: 0,
+      name: "research-crew",
+      target: "crew",
+      entry: "researcher",
+      roles: [researcher, writer],
+      mcp_servers: {},
+      permissions: { rules: [] },
+      compaction: {},
+    };
+    expect(ir.entry).toBe("researcher");
+    expect(ir.roles.length).toBe(2);
+    expect(ir.roles[1]?.subAgents.length).toBe(1);
+  });
+
+  test("optional routing.match maps source-role → next-role on substring match", () => {
+    const ir: IrCrewV0 = {
+      version: 0,
+      name: "router-crew",
+      target: "crew",
+      entry: "researcher",
+      roles: [],
+      routing: {
+        kind: "match",
+        match: {
+          researcher: [{ contains: "DONE", to: "writer" }],
+        },
+      },
+      mcp_servers: {},
+      permissions: { rules: [] },
+      compaction: {},
+    };
+    expect(ir.routing?.kind).toBe("match");
+    expect(ir.routing?.match?.["researcher"]?.[0]?.to).toBe("writer");
+  });
+
+  test("routing.kind is restricted to match | llm", () => {
+    // @ts-expect-error — random string is not a legal routing kind
+    const _bad: IrCrewV0["routing"] = { kind: "random" };
+    void _bad;
+  });
+});
+
+describe("IrResearchV0 (Section 23 — RES)", () => {
+  test("a research IR carries goal + branchingFactor + retrieve allowlists", () => {
+    const ir: IrResearchV0 = {
+      version: 0,
+      name: "doc-research",
+      target: "research",
+      agent: { model: "claude-sonnet-4-6", instructions: "research deeply" },
+      goal: "what gates the BROW shape",
+      branchingFactor: 4,
+      maxDurationMs: 30 * 60 * 1000,
+      retrieve: {
+        allowedOrigins: ["https://docs.example.com"],
+        allowedFileRoots: ["/tmp/research"],
+        vectorBackend: "in-memory",
+      },
+      tools: [],
+      toolConfigs: {},
+      mcp_servers: {},
+      permissions: { rules: [] },
+      compaction: {},
+    };
+    expect(ir.branchingFactor).toBe(4);
+    expect(ir.retrieve.allowedOrigins).toEqual(["https://docs.example.com"]);
+    expect(ir.retrieve.vectorBackend).toBe("in-memory");
+  });
+
+  test("retrieve.allowedOrigins / allowedFileRoots can both be empty (fail-closed)", () => {
+    const ir: IrResearchV0 = {
+      version: 0,
+      name: "locked-down",
+      target: "research",
+      agent: { model: "m", instructions: "i" },
+      goal: "x",
+      branchingFactor: 1,
+      maxDurationMs: 1000,
+      retrieve: { allowedOrigins: [], allowedFileRoots: [] },
+      tools: [],
+      toolConfigs: {},
+      mcp_servers: {},
+      permissions: { rules: [] },
+      compaction: {},
+    };
+    expect(ir.retrieve.allowedOrigins.length).toBe(0);
+    expect(ir.retrieve.allowedFileRoots.length).toBe(0);
+  });
+});
+
+describe("IrBatchV0 (Section 23 — BATCH)", () => {
+  test("a batch IR carries queue config + concurrency + idempotency window", () => {
+    const ir: IrBatchV0 = {
+      version: 0,
+      name: "queue-worker",
+      target: "batch",
+      agent: { model: "claude-haiku-4-5", instructions: "process the job" },
+      queue: {
+        adapter: "redis-streams",
+        visibilityTimeoutMs: 30_000,
+        visibilityRenewIntervalMs: 10_000,
+        maxRetries: 5,
+      },
+      concurrency: 8,
+      idempotencyWindowMs: 24 * 60 * 60 * 1000,
+      tools: [],
+      toolConfigs: {},
+      mcp_servers: {},
+      permissions: { rules: [] },
+      compaction: {},
+    };
+    expect(ir.queue.adapter).toBe("redis-streams");
+    expect(ir.concurrency).toBe(8);
+    expect(ir.idempotencyWindowMs).toBe(86_400_000);
+  });
+
+  test("queue.adapter is restricted to in-memory | sqs | redis-streams | postgres", () => {
+    const valid: IrBatchQueueAdapter[] = ["in-memory", "sqs", "redis-streams", "postgres"];
+    expect(valid.length).toBe(4);
+    // @ts-expect-error — kafka is not a legal queue adapter in v0
+    const _bad: IrBatchQueueAdapter = "kafka";
+    void _bad;
+  });
+
+  test("seedJobs only populated when adapter === 'in-memory' (test/smoke convenience)", () => {
+    const ir: IrBatchV0 = {
+      version: 0,
+      name: "seeded",
+      target: "batch",
+      agent: { model: "m", instructions: "i" },
+      queue: {
+        adapter: "in-memory",
+        visibilityTimeoutMs: 30_000,
+        maxRetries: 3,
+        seedJobs: ["job-a", "job-b", "job-c"],
+      },
+      concurrency: 2,
+      idempotencyWindowMs: 60_000,
+      tools: [],
+      toolConfigs: {},
+      mcp_servers: {},
+      permissions: { rules: [] },
+      compaction: {},
+    };
+    expect(ir.queue.seedJobs?.length).toBe(3);
+  });
+});
+
+describe("IrVoiceV0 (Section 24 — VOICE)", () => {
+  test("a voice IR carries provider + voiceId + barge-in trigger config", () => {
+    const ir: IrVoiceV0 = {
+      version: 0,
+      name: "phone-bot",
+      target: "voice",
+      agent: { model: "claude-sonnet-4-6", instructions: "greet the caller" },
+      voice: {
+        provider: "openai",
+        voiceId: "alloy",
+        vad: "server",
+        bargeInTriggerFrames: 3,
+        bargeInWindowMs: 200,
+      },
+      tools: [],
+      toolConfigs: {},
+      mcp_servers: {},
+      permissions: { rules: [] },
+      compaction: {},
+    };
+    expect(ir.voice.provider).toBe("openai");
+    expect(ir.voice.bargeInTriggerFrames).toBe(3);
+    expect(ir.voice.vad).toBe("server");
+  });
+
+  test("optional telephony adapter wires Twilio / LiveKit / in-memory smoke", () => {
+    const ir: IrVoiceV0 = {
+      version: 0,
+      name: "twilio-bot",
+      target: "voice",
+      agent: { model: "m", instructions: "i" },
+      voice: {
+        provider: "vapi",
+        voiceId: "default",
+        vad: "server",
+        bargeInTriggerFrames: 2,
+        bargeInWindowMs: 150,
+      },
+      telephony: { provider: "twilio" },
+      tools: [],
+      toolConfigs: {},
+      mcp_servers: {},
+      permissions: { rules: [] },
+      compaction: {},
+    };
+    expect(ir.telephony?.provider).toBe("twilio");
+  });
+
+  test("provider is restricted to openai | vapi", () => {
+    const valid: IrVoiceProvider[] = ["openai", "vapi"];
+    expect(valid.length).toBe(2);
+    // @ts-expect-error — google realtime is not yet in v0
+    const _bad: IrVoiceProvider = "google";
+    void _bad;
+  });
+});
+
+describe("IrBrowserV0 (Section 25 — BROW)", () => {
+  test("a browser IR carries driver backend + viewport + grounding model", () => {
+    const ir: IrBrowserV0 = {
+      version: 0,
+      name: "ops-bot",
+      target: "browser",
+      agent: { model: "claude-sonnet-4-6", instructions: "navigate the dashboard" },
+      driver: {
+        backend: "chromium",
+        viewport: { width: 1280, height: 800 },
+        startUrl: "https://example.com/login",
+      },
+      groundingModel: "claude-sonnet-4-6",
+      tools: [],
+      toolConfigs: {},
+      mcp_servers: {},
+      permissions: { rules: [] },
+      compaction: {},
+    };
+    expect(ir.driver.backend).toBe("chromium");
+    expect(ir.driver.viewport.width).toBe(1280);
+    expect(ir.driver.startUrl).toBe("https://example.com/login");
+  });
+
+  test("driver.backend is restricted to host | chromium | remote", () => {
+    const valid: IrBrowserBackend[] = ["host", "chromium", "remote"];
+    expect(valid.length).toBe(3);
+    // @ts-expect-error — firefox-driver isn't a legal backend in v0
+    const _bad: IrBrowserBackend = "firefox-driver";
+    void _bad;
+  });
+
+  test("startUrl is optional; daemon skips goto() when absent", () => {
+    const ir: IrBrowserV0 = {
+      version: 0,
+      name: "no-start",
+      target: "browser",
+      agent: { model: "m", instructions: "i" },
+      driver: { backend: "chromium", viewport: { width: 800, height: 600 } },
+      groundingModel: "m",
+      tools: [],
+      toolConfigs: {},
+      mcp_servers: {},
+      permissions: { rules: [] },
+      compaction: {},
+    };
+    expect(ir.driver.startUrl).toBeUndefined();
   });
 });
