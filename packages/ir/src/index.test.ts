@@ -206,7 +206,11 @@ describe("IrNode discriminated union narrowing", () => {
       name: "x",
       target: "pipeline",
       agent: { model: "m", instructions: "i" },
-      retrieve: { embedderModel: "openai/text-embedding-3-small", vectorBackend: "in-memory", defaultK: 5 },
+      retrieve: {
+        embedderModel: "openai/text-embedding-3-small",
+        vectorBackend: "in-memory",
+        defaultK: 5,
+      },
       indexing: {
         chunkStrategy: "fixed",
         chunkSize: 512,
