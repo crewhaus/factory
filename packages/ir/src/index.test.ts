@@ -247,6 +247,8 @@ describe("IrNode discriminated union narrowing", () => {
           return `batch:${n.queue.adapter}`;
         case "voice":
           return `voice:${n.voice.provider}`;
+        case "browser":
+          return `browser:${n.driver.backend}`;
       }
     }
 

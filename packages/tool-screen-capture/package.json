@@ -1,0 +1,22 @@
+{
+  "name": "@crewhaus/tool-screen-capture",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Screenshot tool — returns Anthropic image content block for the BROW agent (Section 25 BROW)",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@crewhaus/computer-use-driver": "workspace:*",
+    "@crewhaus/errors": "workspace:*",
+    "@crewhaus/tool-builder": "workspace:*",
+    "@crewhaus/tool-catalog": "workspace:*",
+    "zod": "^3.23.8"
+  }
+}

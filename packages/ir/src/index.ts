@@ -422,6 +422,40 @@ export type IrVoiceV0 = {
   readonly compaction: IrCompaction;
 };
 
+/**
+ * Section 25 — BROW (computer-use / browser driver) IR. The compiled
+ * daemon launches a chromium driver, registers Screenshot + Click /
+ * Type / Key / Scroll + FindElement tools, optionally navigates to
+ * `startUrl`, and runs `runChatLoop` against the user's prompt.
+ */
+export type IrBrowserBackend = "host" | "chromium" | "remote";
+
+export type IrBrowserV0 = {
+  readonly version: 0;
+  readonly name: string;
+  readonly target: "browser";
+  readonly agent: {
+    readonly model: string;
+    readonly instructions: string;
+  };
+  readonly driver: {
+    readonly backend: IrBrowserBackend;
+    readonly viewport: {
+      readonly width: number;
+      readonly height: number;
+    };
+    /** Optional initial URL; daemon calls driver.goto() before runChatLoop. */
+    readonly startUrl?: string;
+  };
+  /** Vision-grounding model. Defaults at lower-time to agent.model. */
+  readonly groundingModel: string;
+  readonly tools: readonly string[];
+  readonly toolConfigs: IrToolConfigs;
+  readonly mcp_servers: IrMcpServers;
+  readonly permissions: IrPermissions;
+  readonly compaction: IrCompaction;
+};
+
 /** Discriminated union over every supported target IR. */
 export type IrNode =
   | IrV0
@@ -433,7 +467,8 @@ export type IrNode =
   | IrCrewV0
   | IrResearchV0
   | IrBatchV0
-  | IrVoiceV0;
+  | IrVoiceV0
+  | IrBrowserV0;
 
 /**
  * The output of compilation: a set of files to be written to disk by the

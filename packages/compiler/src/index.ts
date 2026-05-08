@@ -2,6 +2,7 @@ import { assertNever } from "@crewhaus/infra-utils";
 import type {
   Bundle,
   IrBatchV0,
+  IrBrowserV0,
   IrChannelV0,
   IrChannels,
   IrCompaction,
@@ -32,6 +33,7 @@ import {
   parseSpec,
 } from "@crewhaus/spec";
 import { emitBatchWorker } from "@crewhaus/target-batch-worker";
+import { emitBrowserDriver } from "@crewhaus/target-browser-driver";
 import { emitChannelBot } from "@crewhaus/target-channel-bot";
 import { emitCli } from "@crewhaus/target-cli";
 import { emitCrew } from "@crewhaus/target-crew";
@@ -376,6 +378,24 @@ export function lower(spec: Spec): IrNode {
         permissions: lowerPermissions(spec),
         compaction: lowerCompaction(spec),
       } satisfies IrVoiceV0;
+    case "browser":
+      return {
+        version: 0,
+        name: spec.name,
+        target: "browser",
+        agent: { model: spec.agent.model, instructions: spec.agent.instructions },
+        driver: {
+          backend: spec.driver.backend,
+          viewport: { width: spec.driver.viewport.width, height: spec.driver.viewport.height },
+          ...(spec.driver.startUrl !== undefined ? { startUrl: spec.driver.startUrl } : {}),
+        },
+        groundingModel: spec.groundingModel ?? spec.agent.model,
+        tools: spec.tools ?? [],
+        toolConfigs: lowerToolConfigs(spec.tool_config),
+        mcp_servers: lowerMcpServers(spec.mcp_servers),
+        permissions: lowerPermissions(spec),
+        compaction: lowerCompaction(spec),
+      } satisfies IrBrowserV0;
     default:
       return assertNever(spec);
   }
@@ -414,6 +434,8 @@ function emit(ir: IrNode): Bundle {
       return emitBatchWorker(ir);
     case "voice":
       return emitVoice(ir);
+    case "browser":
+      return emitBrowserDriver(ir);
     default:
       return assertNever(ir);
   }
