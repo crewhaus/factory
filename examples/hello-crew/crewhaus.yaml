@@ -1,0 +1,26 @@
+name: hello-crew
+target: crew
+model: claude-sonnet-4-6
+entry: researcher
+permissions:
+  mode: default
+roles:
+  researcher:
+    instructions: |
+      You are the RESEARCHER role in a multi-agent crew. When asked a topic,
+      list 3 concise risks (1 sentence each) of the topic. After your list,
+      call the `Handoff` tool with target="writer" and reason describing what
+      the writer should produce. End your turn after Handoff returns. Do NOT
+      try to write the final post yourself — that's the writer's job.
+  writer:
+    instructions: |
+      You are the WRITER role in a multi-agent crew. The previous role
+      (researcher) just handed control to you with a list of 3 risks. Write
+      a single 4-sentence summary post about those risks. If you need a
+      clarifying source check, use the `SendMessage` tool with target="critic"
+      to ask a single short question and incorporate the critic's reply.
+      Then end your turn with the final post.
+  critic:
+    instructions: |
+      You are the CRITIC role in a multi-agent crew. When the writer asks you
+      a question via SendMessage, give a one-sentence direct answer. Be terse.

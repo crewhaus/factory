@@ -315,6 +315,55 @@ const pipelineSchema = z
   })
   .strict();
 
+// Crew target (Section 22). Multi-role agent runtime; each role is an
+// `agent`-shaped block (model + instructions + tools); `entry` names the
+// first-active role; optional `routing` block carries either `match`
+// rules or `llm` directive (lower-time placeholder for an LLM-backed
+// router; runtime falls back to "no router" when the target shape lands
+// on the codegen path).
+const crewRoleSchema = z
+  .object({
+    instructions: z.string().min(1),
+    model: z.string().min(1).optional(),
+    tools: z.array(z.string().min(1)).optional(),
+    tool_config: toolConfigBlock,
+    sub_agents: subAgentsBlock,
+  })
+  .strict();
+
+const crewRoutingMatchEntrySchema = z
+  .object({
+    contains: z.string().min(1),
+    to: z.string().min(1),
+  })
+  .strict();
+
+const crewRoutingSchema = z
+  .object({
+    kind: z.enum(["match", "llm"]),
+    match: z.record(z.string().min(1), z.array(crewRoutingMatchEntrySchema).min(1)).optional(),
+  })
+  .strict();
+
+const crewSchema = z
+  .object({
+    name: z.string().min(1),
+    target: z.literal("crew"),
+    /** Crew-wide model fallback used by any role that omits `role.model`. */
+    model: z.string().min(1),
+    entry: z.string().min(1),
+    roles: z.record(z.string().min(1), crewRoleSchema),
+    routing: crewRoutingSchema.optional(),
+    mcp_servers: mcpServersBlock,
+    permissions: permissionsBlock,
+    compaction: compactionBlock,
+  })
+  .strict();
+// `.refine()` on a discriminatedUnion member would change the type from
+// ZodObject to ZodEffects (incompatible with the union); the
+// "entry-in-roles" + "non-empty roles" cross-field checks live in
+// `parseSpec` below as a post-parse pass.
+
 export const Spec = z.discriminatedUnion("target", [
   cliSchema,
   workflowSchema,
@@ -322,6 +371,7 @@ export const Spec = z.discriminatedUnion("target", [
   graphSchema,
   managedSchema,
   pipelineSchema,
+  crewSchema,
 ]);
 
 export type Spec = z.infer<typeof Spec>;
@@ -338,6 +388,9 @@ export type SpecManaged = z.infer<typeof managedSchema>;
 export type SpecManagedTenant = z.infer<typeof managedTenantSchema>;
 export type SpecPipeline = z.infer<typeof pipelineSchema>;
 export type SpecPipelineDocument = z.infer<typeof pipelineDocumentSchema>;
+export type SpecCrew = z.infer<typeof crewSchema>;
+export type SpecCrewRole = z.infer<typeof crewRoleSchema>;
+export type SpecCrewRouting = z.infer<typeof crewRoutingSchema>;
 export type SpecMcpServerConfig = z.infer<typeof mcpServerConfigSchema>;
 export type SpecSubAgentDefinition = z.infer<typeof subAgentDefinitionSchema>;
 export type SpecCompactionBlock = z.infer<typeof compactionBlock>;
@@ -376,5 +429,34 @@ export function parseSpec(yamlText: string): Spec {
       result.error,
     );
   }
-  return result.data;
+  // Section 22 — crew cross-field invariants. Kept here rather than as
+  // `.refine()`s on the schema so the discriminated-union member stays
+  // a plain ZodObject (Zod's discriminatedUnion rejects ZodEffects).
+  const data = result.data;
+  if (data.target === "crew") {
+    const roleNames = Object.keys(data.roles);
+    if (roleNames.length === 0) {
+      throw new SpecParseError("crew target requires at least one role");
+    }
+    if (!roleNames.includes(data.entry)) {
+      throw new SpecParseError(
+        `crew.entry "${data.entry}" must name one of crew.roles (got: ${roleNames.join(", ")})`,
+      );
+    }
+    if (data.routing !== undefined && data.routing.kind === "match" && data.routing.match) {
+      for (const [from, rules] of Object.entries(data.routing.match)) {
+        if (!roleNames.includes(from)) {
+          throw new SpecParseError(`crew.routing.match["${from}"]: source role not in crew.roles`);
+        }
+        for (const rule of rules) {
+          if (!roleNames.includes(rule.to)) {
+            throw new SpecParseError(
+              `crew.routing.match["${from}"].to = "${rule.to}" — target role not in crew.roles`,
+            );
+          }
+        }
+      }
+    }
+  }
+  return data;
 }

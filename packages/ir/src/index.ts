@@ -266,8 +266,58 @@ export type IrPipelineV0 = {
   readonly compaction: IrCompaction;
 };
 
+/**
+ * Section 22 — CRW (multi-agent crew) IR. One role definition per entry;
+ * `entry` names the role that runs first; optional `routing` block carries
+ * either a `match` map (predicate-driven) or `llm` directive (use a model
+ * to pick the next role) — both lower-time placeholders today, with the
+ * built-in default-router behaviour preserved when both are absent.
+ */
+export type IrCrewRole = {
+  readonly name: string;
+  /** Resolved at lower-time (`role.model ?? crew.model`). */
+  readonly model: string;
+  readonly instructions: string;
+  readonly tools: readonly string[];
+  readonly toolConfigs: IrToolConfigs;
+  readonly subAgents: readonly IrSubAgentDefinition[];
+};
+
+export type IrCrewRoutingKind = "match" | "llm";
+
+export type IrCrewRouting = {
+  readonly kind: IrCrewRoutingKind;
+  /**
+   * Per-role match table. Only set when `kind === "match"`. Keys are
+   * source role names; values are simple substring matchers tested
+   * against the source role's terminal output to pick the next role.
+   */
+  readonly match?: Readonly<
+    Record<string, ReadonlyArray<{ readonly contains: string; readonly to: string }>>
+  >;
+};
+
+export type IrCrewV0 = {
+  readonly version: 0;
+  readonly name: string;
+  readonly target: "crew";
+  readonly entry: string;
+  readonly roles: readonly IrCrewRole[];
+  readonly routing?: IrCrewRouting;
+  readonly mcp_servers: IrMcpServers;
+  readonly permissions: IrPermissions;
+  readonly compaction: IrCompaction;
+};
+
 /** Discriminated union over every supported target IR. */
-export type IrNode = IrV0 | IrWorkflowV0 | IrChannelV0 | IrGraphV0 | IrManagedV0 | IrPipelineV0;
+export type IrNode =
+  | IrV0
+  | IrWorkflowV0
+  | IrChannelV0
+  | IrGraphV0
+  | IrManagedV0
+  | IrPipelineV0
+  | IrCrewV0;
 
 /**
  * The output of compilation: a set of files to be written to disk by the

@@ -4,6 +4,8 @@ import type {
   IrChannelV0,
   IrChannels,
   IrCompaction,
+  IrCrewRole,
+  IrCrewV0,
   IrGraphV0,
   IrManagedV0,
   IrMcpServerConfig,
@@ -20,6 +22,7 @@ import type {
 import {
   type Spec,
   type SpecChannel,
+  type SpecCrewRole,
   type SpecMcpServerConfig,
   type SpecSlackChannel,
   type SpecSubAgentDefinition,
@@ -27,6 +30,7 @@ import {
 } from "@crewhaus/spec";
 import { emitChannelBot } from "@crewhaus/target-channel-bot";
 import { emitCli } from "@crewhaus/target-cli";
+import { emitCrew } from "@crewhaus/target-crew";
 import { emitGraph } from "@crewhaus/target-graph";
 import { emitManaged } from "@crewhaus/target-managed";
 import { emitPipeline } from "@crewhaus/target-pipeline";
@@ -277,9 +281,42 @@ export function lower(spec: Spec): IrNode {
         permissions: lowerPermissions(spec),
         compaction: lowerCompaction(spec),
       } satisfies IrPipelineV0;
+    case "crew":
+      return {
+        version: 0,
+        name: spec.name,
+        target: "crew",
+        entry: spec.entry,
+        // Stable order: sort by role name so generated bundles diff cleanly.
+        roles: Object.entries(spec.roles)
+          .sort(([a], [b]) => a.localeCompare(b))
+          .map(([name, role]) => lowerCrewRole(name, role, spec.model)),
+        ...(spec.routing !== undefined
+          ? {
+              routing: {
+                kind: spec.routing.kind,
+                ...(spec.routing.match !== undefined ? { match: spec.routing.match } : {}),
+              },
+            }
+          : {}),
+        mcp_servers: lowerMcpServers(spec.mcp_servers),
+        permissions: lowerPermissions(spec),
+        compaction: lowerCompaction(spec),
+      } satisfies IrCrewV0;
     default:
       return assertNever(spec);
   }
+}
+
+function lowerCrewRole(name: string, role: SpecCrewRole, fallbackModel: string): IrCrewRole {
+  return {
+    name,
+    model: role.model ?? fallbackModel,
+    instructions: role.instructions,
+    tools: role.tools ?? [],
+    toolConfigs: lowerToolConfigs(role.tool_config),
+    subAgents: lowerSubAgents(role.sub_agents),
+  };
 }
 
 function emit(ir: IrNode): Bundle {
@@ -296,6 +333,8 @@ function emit(ir: IrNode): Bundle {
       return emitManaged(ir);
     case "pipeline":
       return emitPipeline(ir);
+    case "crew":
+      return emitCrew(ir);
     default:
       return assertNever(ir);
   }

@@ -8,6 +8,7 @@ import {
   consumeStream,
 } from "@crewhaus/adapter-anthropic";
 import type {
+  CrewMailbox,
   RuntimeBridge,
   SpawnSubAgentFn,
   SubAgentDefinition,
@@ -307,6 +308,15 @@ export type RunChatLoopOptions = {
    * runChatLoop).
    */
   spawnSubAgent?: SpawnSubAgentFn;
+  /**
+   * Section 22 — crew orchestrator injection. The orchestrator
+   * implements `CrewMailbox` and threads itself in here per role-turn so
+   * the in-band Handoff and A2A SendMessage tools can record intent /
+   * make synchronous peer requests through `ctx.bridge.crewMailbox`.
+   * Inverted-DI to avoid a runtime-core → crew-orchestrator cycle (the
+   * orchestrator consumes runChatLoop).
+   */
+  crewMailbox?: CrewMailbox;
   /**
    * Section 18 — set true when the bundle has wired a non-noop sandbox
    * backend. The permission engine refuses to grant `allow` for tools
@@ -693,7 +703,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     // Build the bridge for this call. Skipped (left undefined) when no
     // spawnSubAgent injection is provided — non-Task tools don't need it.
     const bridge: RuntimeBridge | undefined =
-      opts.spawnSubAgent !== undefined
+      opts.spawnSubAgent !== undefined || opts.crewMailbox !== undefined
         ? {
             runContext,
             eventLog,
@@ -705,7 +715,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             ...(sessionRootDir !== undefined ? { sessionRootDir } : {}),
             hooks,
             ...(opts.subAgents !== undefined ? { subAgents: opts.subAgents } : {}),
-            spawnSubAgent: opts.spawnSubAgent,
+            ...(opts.spawnSubAgent !== undefined ? { spawnSubAgent: opts.spawnSubAgent } : {}),
+            ...(opts.crewMailbox !== undefined ? { crewMailbox: opts.crewMailbox } : {}),
           }
         : undefined;
     const raw = await executeTool(tool, tu.input, {

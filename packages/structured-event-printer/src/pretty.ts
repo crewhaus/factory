@@ -57,5 +57,17 @@ function formatBody(ev: TraceEvent): string {
       return `name=${ev.name} childRun=${ev.childRunId} tools=${ev.toolCount} prompt=${ev.promptBytes}B`;
     case "sub_agent_end":
       return `name=${ev.name} childRun=${ev.childRunId} ${ev.isError ? "ERROR " : ""}toolCalls=${ev.toolCallCount} finalMsg=${ev.finalMessageBytes}B duration=${ev.durationMs.toFixed(0)}ms`;
+    case "role_start":
+      return `role=${ev.role} activation=${ev.activation}`;
+    case "role_end":
+      return `role=${ev.role} activation=${ev.activation} finalMsg=${ev.finalMessageBytes}B duration=${ev.durationMs.toFixed(0)}ms`;
+    case "handoff":
+      return `from=${ev.from} to=${ev.to} depth=${ev.depth}${
+        ev.reason ? ` reason=${ev.reason}` : ""
+      }`;
+    case "a2a_message":
+      return `from=${ev.from} to=${ev.to} kind=${ev.messageKind} payload=${ev.payloadBytes}B`;
+    case "crew_done":
+      return `finalRole=${ev.finalRole} activations=${ev.totalActivations} duration=${ev.durationMs.toFixed(0)}ms`;
   }
 }

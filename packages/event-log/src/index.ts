@@ -40,7 +40,14 @@ export type EventKind =
   | "error"
   | "compaction"
   | "sub_agent_start"
-  | "sub_agent_end";
+  | "sub_agent_end"
+  // Section 22 — CRW (multi-agent crew) lifecycle events. Single durable
+  // sessionId across an entire crew run; every role's turn writes here.
+  | "role_start"
+  | "role_end"
+  | "handoff"
+  | "a2a_message"
+  | "crew_done";
 
 export type Event = {
   readonly ts: number;

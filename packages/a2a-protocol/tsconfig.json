@@ -1,0 +1,14 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "references": [
+    { "path": "../agent-context-isolation" },
+    { "path": "../tool-builder" },
+    { "path": "../tool-catalog" },
+    { "path": "../trace-event-bus" }
+  ],
+  "include": ["src/**/*"]
+}

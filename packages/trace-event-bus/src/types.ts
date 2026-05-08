@@ -181,6 +181,53 @@ export type SubAgentEndEvent = TraceEventEnvelope & {
   durationMs: number;
 };
 
+/**
+ * Section 22 — CRW (multi-agent crew) lifecycle events. Every variant
+ * shares the run/session/trace envelope so an entire crew run nests
+ * under one OTel trace and lands in one JSONL session log.
+ */
+export type RoleStartEvent = TraceEventEnvelope & {
+  kind: "role_start";
+  role: string;
+  /** Position in the crew's role-activation sequence (0 = entry role). */
+  activation: number;
+};
+
+export type RoleEndEvent = TraceEventEnvelope & {
+  kind: "role_end";
+  role: string;
+  activation: number;
+  finalMessageBytes: number;
+  durationMs: number;
+};
+
+export type HandoffEvent = TraceEventEnvelope & {
+  kind: "handoff";
+  from: string;
+  to: string;
+  reason: string;
+  /** Increments each time control changes hands; refusal-loop guard trips at the configured depth. */
+  depth: number;
+};
+
+export type A2AMessageEvent = TraceEventEnvelope & {
+  kind: "a2a_message";
+  from: string;
+  to: string;
+  /** Free-form classifier (`question` | `answer` | `notify` | …); orchestrator stamps `question` on tool calls today. */
+  messageKind: string;
+  payloadBytes: number;
+  /** W3C traceparent embedded in the A2A envelope. Should equal the bus's traceId on both ends. */
+  traceparent: string;
+};
+
+export type CrewDoneEvent = TraceEventEnvelope & {
+  kind: "crew_done";
+  finalRole: string;
+  totalActivations: number;
+  durationMs: number;
+};
+
 export type TraceEvent =
   | TurnStartEvent
   | TurnEndEvent
@@ -197,7 +244,12 @@ export type TraceEvent =
   | PermissionDecisionEvent
   | ErrorRecoveredEvent
   | SubAgentStartEvent
-  | SubAgentEndEvent;
+  | SubAgentEndEvent
+  | RoleStartEvent
+  | RoleEndEvent
+  | HandoffEvent
+  | A2AMessageEvent
+  | CrewDoneEvent;
 
 export type TraceEventKind = TraceEvent["kind"];
 

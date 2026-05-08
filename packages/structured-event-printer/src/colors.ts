@@ -23,6 +23,13 @@ const PALETTE: Record<TraceEventKind, string> = {
   error_recovered: "\x1b[31m", // red
   sub_agent_start: "\x1b[36m",
   sub_agent_end: "\x1b[36m",
+  // Section 22 — CRW lifecycle events. Reuse the cyan/blue family so a
+  // crew's role traffic visually parallels sub-agent + model spans.
+  role_start: "\x1b[96m", // bright cyan
+  role_end: "\x1b[96m",
+  handoff: "\x1b[35m", // magenta — peer-coordination hand-off
+  a2a_message: "\x1b[95m", // bright magenta
+  crew_done: "\x1b[32m", // green — terminal success
 };
 
 export function colorize(kind: TraceEventKind, text: string, useColor: boolean): string {
