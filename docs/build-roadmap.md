@@ -1,22 +1,23 @@
 # CrewHaus Factory — Build Roadmap
 
-> Status as of 2026-05-08. 66 of ~190 catalog modules implemented across 61 workspace packages; Sections 1–17 all complete. Sections 18–21 below cover production safety hardening, the GRPH (graph) target shape, the MGD (managed runtime) target shape, and the RAG (pipeline) target shape — picking up the highest-priority 🔴 critical-path items from MODULE-CATALOG PART G.5 now that the multi-provider/eval/observability/sub-agent work has all landed.
+> Status as of 2026-05-08. 86 of ~190 catalog modules implemented across 81 workspace packages; Sections 1–21 all complete. Sections 22–25 below round out the remaining target shapes (CRW multi-agent crew, RES research agent, BATCH queue worker, VOICE realtime audio, BROW computer-use) plus Section 26 lands the Studio authoring + trace-inspection UI on top.
 > See `docs/MODULE-CATALOG.md` for full per-module specs, test layer references, and the per-row `Depends on` columns + 🔴/🟡 risk markers used throughout this roadmap.
 
 ---
 
 ## Critical path & risk overview
 
-Sections 1–17 are landed. The next four sections target the highest-leverage 🔴 critical-path modules in MODULE-CATALOG PART G.5 — each unblocks a target shape (GRPH/MGD/RAG) or substantively hardens production deployments.
+Sections 1–21 are landed. Six target shapes ship today (CLI, workflow, channel, graph, managed, pipeline) on top of a complete tool framework, multi-provider model layer, persistence, observability, eval stack, sub-agents, and a containerised production-safety floor. The remaining roadmap closes out the meta-harness's target-shape promise (CRW + RES + BATCH + VOICE + BROW) and lands the Studio UI that turns the factory into a product surface.
 
-- **Section 18 (production safety floor)** is the precondition for any deployment running untrusted code: `sandbox` (R8), `tool-code-execution` (R4), and `prompt-injection-detector` (R8). These three together replace the current "trust the host" posture with a containerized exec environment + an output classifier the runtime hooks into automatically. Sandbox is the load-bearing piece — code-execution composes on top of it.
-- **Section 19 (GRPH target shape)** lands `checkpoint-store` (R7), `graph-engine` (R11), and `target-graph` (F2). Together they enable durable, time-travelable, HITL-friendly long-horizon agents — the shape claimed by LangGraph and required by every research / managed runtime that needs resumable graph state.
-- **Section 20 (MGD target shape + governance)** lands `gateway-server` (R16), `policy-engine` (R8), `tenancy` (R17), `audit-log` (R17), and `target-managed` (F2). Together they unlock the managed/enterprise runtime — multi-tenant, regional routing, audited, with the gateway protocol the `web-ui` and `deployment-controller` work hangs off.
-- **Section 21 (RAG target shape)** lands `pipeline-engine` (R11), the R12 retrieval primitives (`tool-retrieve`, `chunker`, `embedder`, `vector-store`), and `target-pipeline` (F2). Together they enable Haystack/LlamaIndex-style component DAGs and unlock the entire RAG shape.
+- **Section 22 (CRW target shape — multi-agent crew)** lands the missing coordination primitives that take the existing sub-agent surface from §13 to a full multi-agent crew: `agent-handoff` (R10), `a2a-protocol` (R10), `crew-orchestrator` (R10), `target-crew` (F2). Modest novelty — most of the heavy runtime work (isolation, permission inheritance, abort cascade) shipped in §13. The new pieces are the handoff protocol and the role-based dispatcher.
+- **Section 23 (RES + BATCH target shapes — parallel)** lands two additive shapes that compose existing primitives. RES (`target-research-bundle`, `planner`, `crawler`, `citation-tracker`, `report-writer`) leans heavily on §13 sub-agents + §15 trace bus + §10 persistence to support hours-long autonomous execution with branch exploration and citation tracking. BATCH (`queue-protocol`, `queue-consumer`, `idempotency-keys`, `target-batch-worker`) is a focused queue-consumer pattern — the meta-harness's answer to cron jobs and offline data pipelines.
+- **Section 24 (VOICE target shape)** is a dedicated section because realtime audio is genuinely novel territory: `voice-runtime` (R16), `vad-engine` (R16), `barge-in-controller` (R16), `call-session` (R16), `target-voice` (F2). The provider abstraction is non-trivial — OpenAI Realtime and Vapi differ at the wire-protocol level, and PCM/Opus framing + telephony lifecycle have no parallel anywhere else in the codebase.
+- **Section 25 (BROW target shape)** is dedicated for the same reason: `computer-use-driver` (R18), `tool-screen-capture` (R4), `tool-mouse-keyboard` (R4), `tool-vision-grounding` (R4), `target-browser-driver` (F2). Cross-OS desktop control over a screenshot loop is its own novel surface; the screenshot-frequency-vs-action-latency trade-off is the load-bearing design call.
+- **Section 26 (Studio — authoring + inspection UI)** sits on top of everything that's shipped and turns the factory into a product. Modules: `studio-server` (F4), `studio-ui` (F4), `trace-viewer` (F4), `graph-visualizer` (F4), `wizard` (F4), `scaffold-templates` (F4), `plugin-sdk` (F5). Studio is what closes the loop — spec authoring, live trace inspection, eval-result drilldowns, and a `crewhaus deploy` button.
 
-**Parallelisation:** Sections 18 and 19 are fully independent (no shared files); they can run in parallel. Section 20 depends on Section 18's `policy-engine` for tenancy enforcement. Section 21 is independent of all three and could run any time after Section 17.
+**Parallelisation:** Section 22 (CRW) and Section 23 (RES + BATCH) are fully independent — they touch disjoint catalog modules and can land in parallel. Section 24 (VOICE) and Section 25 (BROW) are independent of each other and of 22/23, but each is a deep enough vertical that a dedicated push is warranted. Section 26 (Studio) is best done last because every prior section lands new event kinds / IR variants that the trace viewer and graph visualiser must render.
 
-Sections 22+ (VOICE, BROW, advanced multi-agent crew) remain deferred — each is an all-or-nothing chain with substantial novelty relative to the references and warrants its own scoping pass once Sections 18–21 are landed. See MODULE-CATALOG PART G.5 for the full risk register.
+Beyond Section 26, what remains is cross-cutting hardening (cost-tracker, prompt-cache-manager, secrets-manager rotation, rate-limiter, circuit-breaker, deployment-controller, canary-controller, migration-runner) plus deeper evaluation tooling (prompt-optimizer, regression-runner, dataset-registry, grader-registry). These are scoped in MODULE-CATALOG but not yet roadmapped — they belong in Sections 27+ after the target-shape catalogue is complete.
 
 ## Section dependency graph
 
@@ -24,40 +25,50 @@ Sections 22+ (VOICE, BROW, advanced multi-agent crew) remain deferred — each i
 F-foundations (✅ §1–4)
         │
         ▼
-Compiler & runtime core (✅ §1–7)
+Compiler & runtime core ──► Tool layer ──► MCP ──► Persistence
+(✅ §1–7)                   (✅ §1, §3, §8)  (✅ §9) (✅ §10)
         │
         ▼
-Tool layer (✅ §1, §3, §8) ──► MCP host (✅ §9)
-        │
-        ▼
-Persistence (✅ §10) ──► Hooks/skills/commands (✅ §11)
-        │
-        ▼
-Channel target shape (✅ §12) ──► Sub-agents + Task tool (✅ §13)
-                                          │
-                                          ▼
-                              Tool surface expansion (✅ §14)
-                                          │
-                                          ▼
-                              Observability (✅ §15)
-                                          │
-                              ┌───────────┴────────────┐
-                              ▼                        ▼
-                       §16 Eval stack (✅)     §17 Multi-provider (✅)
-                              │                        │
-                              └─────────┬──────────────┘
-                                        ▼
-                       ┌────────────────┼────────────────┬─────────────────┐
-                       ▼                ▼                ▼                 ▼
-                §18 Production    §19 GRPH        §20 MGD target    §21 RAG target
-                safety floor      target shape    + governance      shape
-                (sandbox +        (checkpoint-    (gateway-server   (pipeline-engine
-                tool-code-        store +         + policy-engine + + R12 retrieval +
-                execution +       graph-engine +  tenancy +         target-pipeline)
-                prompt-injection- target-graph)   audit-log +
-                detector)                         target-managed)
-                       │                                  ▲
-                       └────► (provides policy-engine for §20)
+Hooks/skills/commands (✅ §11) ──► Channel target (✅ §12) ──► Sub-agents (✅ §13)
+        │                                                              │
+        ▼                                                              ▼
+Tool surface expansion (✅ §14) ──► Observability (✅ §15)
+                                            │
+                              ┌─────────────┼─────────────┐
+                              ▼             ▼             ▼
+                       §16 Eval (✅)  §17 Multi-provider (✅)
+                              │             │
+                              └──────┬──────┘
+                                     ▼
+                ┌───────────┬────────┴───────┬───────────┐
+                ▼           ▼                ▼           ▼
+        §18 Safety    §19 GRPH         §20 MGD     §21 RAG
+        floor (✅)    target (✅)      target (✅) target (✅)
+                │                        ▲
+                └────► (policy-engine ───┘)
+                                                    │
+                       ┌────────────────────────────┴────────────────────┐
+                       ▼                                                 ▼
+                §22 CRW target shape                          §23 RES + BATCH target shapes
+                (agent-handoff, a2a-protocol,                 (parallel; both leverage
+                crew-orchestrator, target-crew)               existing primitives)
+                       │                                                 │
+                       └────────────────────┬────────────────────────────┘
+                                            ▼
+                              §24 VOICE target shape
+                              (voice-runtime, vad-engine,
+                              barge-in-controller, target-voice)
+                                            │
+                                            ▼
+                              §25 BROW target shape
+                              (computer-use-driver, tool-screen-capture,
+                              tool-mouse-keyboard, tool-vision-grounding,
+                              target-browser-driver)
+                                            │
+                                            ▼
+                              §26 Studio (authoring + inspection UI)
+                              (studio-server, studio-ui, trace-viewer,
+                              graph-visualizer, wizard, plugin-sdk)
 ```
 
 ## Section dependency table
@@ -85,31 +96,37 @@ Channel target shape (✅ §12) ──► Sub-agents + Task tool (✅ §13)
 | **§19 GRPH target shape** | ✅ | §1–4, §10 (event-log replay) | GRPH shape, `durable-execution` family, branch/HITL flows, MGD durability |
 | **§20 MGD target shape + governance** | ✅ | §18 (`policy-engine`), §10, §15 | MGD shape, remote channel daemon, multi-tenant deployment, `web-ui` backend |
 | **§21 RAG target shape** | ✅ | §1–4, §15 (trace-event-bus for retrieval spans) | RAG shape, all R12 retrieval/embedding modules, doc-grounded agents |
+| **§22 CRW target shape** | 🟡 next, parallel with §23 | §13 (sub-agents), §15 (trace bus), §11 (hooks) | CRW shape, multi-agent coordination patterns, `agent-framework`/`crewAI` parity |
+| **§23 RES + BATCH target shapes** | 🟡 next, parallel with §22 | §10 (persistence), §13 (sub-agents for RES), §14 (`tool-fetch` for RES crawl) | RES shape (autonomous research), BATCH shape (queue worker), cron-scheduled agents |
+| **§24 VOICE target shape** | 🟡 dedicated; after §22–23 | §1–7 base runtime; §17 model-router for realtime providers | VOICE shape, telephony/realtime audio agents, OpenAI Realtime + Vapi parity |
+| **§25 BROW target shape** | 🟡 dedicated; after §22–23 | §1–7 base runtime; §18 sandbox for screenshot ops | BROW shape, computer-use agents, Operator-style cross-OS desktop control |
+| **§26 Studio** | 🟡 last; after §22–25 | every prior section's IR variants + trace event kinds | Authoring UI, trace-viewer drilldown, graph visualizer, wizard, plugin SDK, eval-result inspection |
 
 ---
 
 ## Current baseline
 
-The compiler pipeline (spec → IR → codegen) ships three target shapes (`cli`, `workflow`, `channel`) and the runtime carries tools end-to-end with state-machine-driven turns and pre-turn compaction (snip → autocompact). The CLI exposes `compile`, `run`, `init`, and `doctor` subcommands; three built-in tool packages (`tool-fs`, `tool-bash`, `tool-todo`) are registered, plus the opt-in cross-channel `tool-message-channel`. Section 7 added recovery (Anthropic taxonomy with budgets), a layered permission engine (modes + 5 rule sources, with `bypass` locked to the CLI flag), and a parent/child abort tree with SIGINT integration. Section 8 added the partitioned tool layer: concurrent-safe read-only calls run via `Promise.all` while destructive calls run serially, repeated `(toolName, input)` pairs trigger a sliding-window loop warning, large outputs (>10 KB) are persisted to `.crewhaus/tool-results/<runId>/<toolUseId>.txt` with a preview marker the model can re-read, and `streaming: true` dispatches tools mid-stream via the SDK's `contentBlock` event. Section 9 added MCP host + tool-mcp + a `mcp_servers` block in the spec, so external MCP servers (filesystem, github, the everything-server reference, …) auto-spawn at boot and their remote tools register on the catalog under `<server>__<tool>`. Section 10 added persistence: every `crewhaus run` now creates (or `--resume`s) a session under `.crewhaus/sessions/`, transcripts append to a versioned JSONL event log, sessions older than 30 days evict on the next run, and a per-run `state-store` ships as the coordination surface for the hooks/skills work landing in Section 11. Section 11 wired the extension surface — hooks, skills, slash commands — into every `runChatLoop` invocation. Section 12 added the third target shape: a long-running daemon (`Bun.serve` + per-thread session resumption) with a Slack adapter, the first multi-file codegen output, and a permission-gated `SendMessage` tool for cross-channel addressing. Section 13 added sub-agents and the `Task` tool: spec declares sub-agent definitions inline under `agent.sub_agents` (CLI + channel) or via `.crewhaus/sub-agents/<name>.md` frontmatter, and the runtime stuffs a typed `RuntimeBridge` into `ToolExecuteContext` so the Task tool can spawn children with isolated context, scoped tools, scoped permissions (with bypass non-propagation), and SIGINT cascade; the parent's event log records `sub_agent_start`/`sub_agent_end` boundary events while each child's transcript lives in its own JSONL.
+Six target shapes ship today: **CLI**, **workflow**, **channel** (Slack), **graph** (LangGraph-style with checkpointing + HITL), **managed** (multi-tenant daemon + JWT-authed gateway + hash-chained audit log), and **pipeline** (Haystack-style component DAG with retrieval primitives). The compiler pipeline (spec → IR → codegen) handles all six via a discriminated-union `IrNode = IrV0 | IrWorkflowV0 | IrChannelV0 | IrGraphV0 | IrManagedV0 | IrPipelineV0`. Sections 1–17 built the foundation: tool framework, persistence, hooks/skills/slash, sub-agents + Task tool, expanded tool catalogue (web/image/fetch), observability (trace bus + OTel + metrics + pretty/JSON printer), eval stack with `crewhaus eval` subcommand, and a multi-provider model layer (Anthropic/OpenAI/Gemini/Bedrock + local via OpenAI-compatible URL). Sections 18–21 added the production safety floor (containerised sandbox, sandboxed code-execution, prompt-injection classifier) and the three remaining "core" target shapes (graph, managed, pipeline).
 
 What the current stack can now do, end-to-end:
 
-- Compile a `target: channel` spec → multi-file daemon bundle → `bun run run:hello-channel` listens on `/slack/events`, verifies signed webhooks (HMAC-SHA256 + ±5 min replay window), dedups by Slack `event_id`, resumes per-thread sessions keyed on `sha256(slack:<workspace>:<channel>:<thread>)`, runs one `runChatLoop` turn per inbound message, and replies in-thread via `chat.postMessage`. Hooks, skills, and slash commands fire on every turn. Tools register opt-in via `agent.tools` (built-ins + future channel-specific), permission rules gate execution, and `SendMessage` requires an explicit `alwaysAllow` rule before the agent can use it.
+- **CLI**: `bun run run:hello` — interactive REPL with all built-in tools, hooks, skills, slash commands, sub-agents, MCP servers, multi-provider models, observability hooks.
+- **Workflow**: `bun run run:hello-workflow` — sequential multi-step agent threading prior step's output forward as a synthetic user message.
+- **Channel (Slack)**: `bun run run:hello-channel` — long-running daemon with HMAC-verified webhooks, per-thread session resumption, idempotent dispatch.
+- **Graph**: `bun run run:hello-graph` — node/edge graph with checkpointing, HITL pause/resume, branch-from-checkpoint time travel, durable exactly-once node execution.
+- **Managed**: `bun run run:hello-managed` — multi-tenant daemon with JWT auth, per-tenant budget enforcement, hash-chained audit log, `crewhaus audit verify <tenant>` integrity check.
+- **Pipeline (RAG)**: `bun run run:hello-rag` — chunk → embed → index pipeline plus a retrieval-grounded agent calling `Retrieve(query, k?, filter?)` against an in-memory vector store.
 
-What is *not* yet covered (and frames Sections 18–21):
+What is *not* yet covered (and frames Sections 22–26):
 
-- **Delegation.** *(Section 13 closed this gap.)* Every shipped target has a `Task(description, prompt, subagent_type?)` tool that spawns a child agent in an isolated `RunContext` (own runId/sessionId/event-log/state-store), with parent→child permission scoping (`inherit | scoped | replace`), bypass non-propagation, and SIGINT cascade. Specs declare sub-agents inline under `agent.sub_agents` (CLI + channel targets); the filesystem fallback at `.crewhaus/sub-agents/<name>.md` ships too.
-- **Tool surface.** *(Section 14 closed this gap.)* `tool-web` (`WebFetch` + `WebSearch`), `tool-image` (`ReadImage` returning Anthropic image content blocks), and `tool-fetch` (generic HTTP with fail-closed allow-list and SSRF defense) are landed. Spec layer gained an additive `tool_config` block plumbed through IR + codegen + the runner.
-- **Observability.** *(Section 15 closed this gap.)* `TraceEventBus` is wired through `RunContext` and emits 15 lifecycle event kinds; `otel-exporter` (OTLP/HTTP, `gen_ai/*` semantic conventions), `metrics-collector` (Prometheus textfile / buffered stdout JSON / HTTP `/metrics`), and `structured-event-printer` (pretty stderr / JSON Lines stdout) attach automatically based on env vars. The bus's 5000-event ring buffer is the in-process surface the Section 16 eval-runner consumes; W3C `traceparent` propagation stitches sub-agent runs and daemon mode under one trace.
-- **Eval stack.** *(Section 16 closed this gap.)* `crewhaus eval` runs a spec against a JSONL/CSV/YAML dataset under configurable concurrency, applies deterministic + LLM-as-judge graders to each sample, and writes an HTML/JSON report with per-sample drill-downs and a diff mode. The judge is structurally hardened against prompt injection in the rubric.
-- **Provider lock-in.** *(Section 17 closed this gap.)* `model-router` parses `agent.model` (`claude-*` / `openai/*` / `gemini/*` / `bedrock/*` / `local/<m>@<url>`) and lazy-loads the matching adapter. Anthropic-only specs never pull `@aws-sdk/*`, `@google/genai`, or `openai` on disk. `compaction-autocompact` resolves a separate adapter when `compaction.model` is set.
+- **Multi-agent crew (CRW shape).** Sub-agents from §13 cover the parent → child delegation case. The CRW shape adds peer-to-peer coordination: explicit handoff (one agent passes control to another with shared context), A2A messaging (agents exchange typed events without parent involvement), role-based dispatch (the orchestrator routes incoming work to the role best fit for it). Modules: `agent-handoff`, `a2a-protocol`, `crew-orchestrator`, `target-crew`. **Section 22 lands this.**
+- **Autonomous research agent (RES shape).** Long-horizon execution patterns — planner that decomposes a research goal, crawler that follows citations, citation tracker that records source provenance, report writer that synthesises findings. Builds on §13 sub-agents (each branch is a sub-agent), §15 trace bus (multi-hour runs need durable observability), §10 persistence (resumability across crashes). Modules: `target-research-bundle`, `planner`, `crawler`, `citation-tracker`, `report-writer`. **Section 23 lands this.**
+- **Batch worker (BATCH shape).** Queue-consumer pattern for cron-scheduled or offline-data agents. No live UI, no per-message session — just a worker that pulls work from a queue, processes it, writes results, and acks. Modules: `queue-protocol`, `queue-consumer`, `idempotency-keys`, `target-batch-worker`. **Section 23 (parallel with RES) lands this.**
+- **Voice / realtime (VOICE shape).** Genuinely novel territory — the realtime audio loop, VAD (voice activity detection), barge-in (user can interrupt), call-session lifecycle (telephony connect/hold/transfer), and provider abstraction over OpenAI Realtime + Vapi at the wire-protocol level. PCM/Opus framing has no parallel anywhere else in the codebase. Modules: `voice-runtime`, `vad-engine`, `barge-in-controller`, `call-session`, `target-voice`. **Section 24 lands this.**
+- **Browser / computer-use (BROW shape).** Cross-OS desktop control over a screenshot loop. The screenshot-frequency-vs-action-latency trade-off is the load-bearing design call. Modules: `computer-use-driver`, `tool-screen-capture`, `tool-mouse-keyboard`, `tool-vision-grounding`, `target-browser-driver`. **Section 25 lands this.**
+- **Studio (authoring + inspection UI).** What turns the meta-harness into a product surface — spec authoring with live validation, trace viewer with drilldowns, graph visualiser for the GRPH shape, eval-result inspection, a wizard for new specs, and a plugin SDK. Sits on top of every shipped target shape and event kind. Modules: `studio-server`, `studio-ui`, `trace-viewer`, `graph-visualizer`, `wizard`, `scaffold-templates`, `plugin-sdk`. **Section 26 lands this.**
 
-What still gates target-shape coverage (Sections 19–21):
-
-- **Untrusted-code safety.** *(Section 18 closed this gap.)* `sandbox` (docker/podman/noop), `tool-code-execution` (`Python`/`JavaScript`/`Shell` over the matching curated images), and `prompt-injection-detector` (3-layer classifier hooked into runtime-core's post-tool path) are landed. The permission engine refuses to run any `requiresSandbox: true` tool unless an explicit `alwaysAllow` rule matches AND a non-noop sandbox is available; tool outputs are classified before the model sees them, with malicious verdicts redacted to a notice and suspicious verdicts kept-but-warned.
-- **Stateful, durable graphs.** No GRPH-style runtime exists — there is no `graph-engine` for node/edge execution, no `checkpoint-store` for resumable state, and no `target-graph` codegen. Long-horizon agents that need durability + branch exploration + HITL pauses cannot be expressed in the current shape catalogue. **Section 19 lands this.**
-- **Managed/multi-tenant deployment.** No `gateway-server` (the app-server protocol underpinning MGD and remote CHN), no `policy-engine` (side-effect classification + audit), no `tenancy` (per-tenant isolation), no `audit-log` (regulated-deployment audit trail), no `target-managed` codegen. Production CHN/MGD deployments cannot be expressed today. **Section 20 lands this.**
-- **Pipeline DAGs / RAG.** No `pipeline-engine` (component-DAG runtime), no R12 retrieval primitives (`tool-retrieve`, `chunker`, `embedder`, `vector-store`), no `target-pipeline` codegen. Doc-grounded agents and Haystack/LlamaIndex-shaped pipelines cannot be expressed. **Section 21 lands this.**
+Beyond Section 26, what remains is cross-cutting hardening (`cost-tracker`, `prompt-cache-manager` rotation, `secrets-manager`, `rate-limiter`, `circuit-breaker`, `deployment-controller`, `canary-controller`, `migration-runner`) plus deeper evaluation tooling (`prompt-optimizer`, `regression-runner`, `target-eval-bundle`, `dataset-registry`, `grader-registry`). These are scoped in MODULE-CATALOG and live in Sections 27+.
 
 ---
 
@@ -1353,6 +1370,259 @@ Drives `examples/hello-rag` (5 seed docs about CrewHaus target shapes) against t
 
 ---
 
+## Section 22 — CRW target shape (multi-agent crew)
+
+> Status: 🟡 next up. Parallelisable with Section 23 (no shared files).
+
+**Catalog modules:** `agent-handoff` (R10), `a2a-protocol` (R10), `crew-orchestrator` (R10), `target-crew` (F2)
+
+Section 13 shipped the parent → child delegation case via the `Task` tool and sub-agents. The CRW target shape adds peer-to-peer coordination patterns: explicit handoff (one role passes control to another with shared context), A2A messaging (agents exchange typed events without parent involvement), and role-based dispatch (the orchestrator routes incoming work to the role best fit for it). The runtime work is modest because the heavy lifting — isolation, permission inheritance, abort cascade, event-log boundary records — already shipped in §13. The new pieces are the handoff/A2A protocols and the role dispatcher.
+
+### Build order within this section
+
+```
+agent-handoff       ──►  crew-orchestrator  ──►  target-crew
+a2a-protocol  (parallel)
+```
+
+Spec/IR additions are sequential after `target-crew` is stable.
+
+### What to build
+
+**`packages/agent-handoff`** — explicit baton-pass between roles
+- `Handoff(targetRole, reason, context?)` tool — current agent yields control to `targetRole` with a structured reason and optional shared context. The receiving agent inherits the parent's session + transcript prefix.
+- Refusal protocol: target may refuse with a typed reason, returning control to the sender.
+- References: `crewAI/.../task_handoff.py`, `agent-framework/.../handoffs.py`, `openai-agents/handoffs.py`.
+
+**`packages/a2a-protocol`** — peer messaging
+- `SendMessage(toRole, payload)` agent-to-agent tool (distinct from §12's channel-bot `SendMessage`); routes through the orchestrator's mailbox.
+- Typed event envelope: `{ from, to, kind, payload, traceparent }` — trace context propagates so the entire crew shows under one OTel trace.
+- References: Google A2A spec, `agent-framework/.../_a2a.py`.
+
+**`packages/crew-orchestrator`** — role-based dispatch
+- `Crew` builder: `addRole(name, def)`, `setEntry(name)`, `setRouting(routerFn)`, `compile()`
+- `compile()` returns `RunnableCrew`: `run(input, opts): AsyncIterable<CrewEvent>` (events: `role_start`, `handoff`, `a2a_message`, `role_end`, `crew_done`)
+- Default router selects role by `match(input)` predicate; custom routers receive `(input, currentState) → roleName`.
+- References: `crewAI/.../crew.py`, `agent-framework/.../_workflows/_workflow.py` (orchestrator pattern).
+
+**`packages/target-crew`** — codegen
+- `target: "crew"` spec carries `roles: { [name]: { model, instructions, tools?, sub_agents? } }`, `entry: string`, `routing?: { kind: "match" | "llm" }`
+- Multi-file output: `daemon.ts` (boots crew + serves on stdin or webhook), `orchestrator.ts` (the compiled `RunnableCrew`), one `agent_<role>.ts` per role.
+
+**`packages/spec` + `packages/ir`** — `target: "crew"` discriminated-union variant; `IrCrewV0` mirrors the spec.
+
+### Tests
+
+- `agent-handoff`: T3 round-trip (sender → target → return); T8 refusal-loop guard (sender refuses → target refuses → control terminates with a clean error rather than infinite ping-pong)
+- `a2a-protocol`: T2 contract test against Google A2A fixture envelopes; T9 property test on `traceparent` propagation
+- `crew-orchestrator`: T1 per builder method; T3 a 3-role crew (researcher → writer → critic) with one handoff and one A2A message; T9 routing-determinism property test
+- `target-crew`: T1 generated-bundle structure; T3 compile + run a 3-role fixture crew end-to-end
+- E2E smoke: `examples/hello-crew/` — researcher pulls facts, writer drafts, critic asks one A2A question of researcher, writer revises. Smoke verifies the OTel trace shows all three roles under one traceId.
+
+---
+
+## Section 23 — RES + BATCH target shapes (parallel)
+
+> Status: 🟡 next up. Two independent target shapes that share no files; one PR per shape, both parallelisable with Section 22.
+
+**Catalog modules (RES):** `target-research-bundle` (F2), `planner` (R-orchestration), `crawler` (R-orchestration), `citation-tracker` (R-orchestration), `report-writer` (R-orchestration)
+
+**Catalog modules (BATCH):** `queue-protocol` (R14), `queue-consumer` (R14), `idempotency-keys` (R7), `target-batch-worker` (F2)
+
+### RES — autonomous research agent
+
+A long-horizon executor that decomposes a research goal, crawls citations across many sources, tracks provenance, and writes a final report. Multi-hour runs are first-class — RES leans on §10 persistence for resumability across crashes, §13 sub-agents for parallel branch exploration, §14 `tool-fetch` + `tool-web` for sourcing, and §15 trace bus for durable observability.
+
+**Build order:**
+```
+planner  ──►  crawler  ──►  citation-tracker  ──►  report-writer  ──►  target-research-bundle
+                            (parallel with crawler)
+```
+
+**What to build:**
+- `packages/planner` — `decompose(goal, context): Plan` where `Plan = { steps: Array<{id, query, dependsOn}>, branchPoints }`. Plans are checkpointed; sub-agent failures backtrack to the prior branch.
+- `packages/crawler` — Anthropic-server-side `web_search` when available, fallback via `tool-fetch` allow-list. URL-deduplication, robots.txt honoring, per-domain rate limiting.
+- `packages/citation-tracker` — every fact the agent cites is persisted with `{ url, snippet, retrievedAt, sha256(content) }` so the report-writer can render footnotes deterministically.
+- `packages/report-writer` — pulls the citation tree + transcript and emits a markdown / JSON-structured report.
+- `packages/target-research-bundle` — `target: "research"` spec carries `goal`, `branchingFactor`, `maxDuration`, optional `vectorBackend` for memory; emits a daemon that runs to `goal-met-or-budget-exhausted`.
+
+**Tests:** T3 end-to-end on a fixture goal ("3 risks of GRPH agents"); T4 replay test confirming a crashed run resumes from the last checkpoint without re-fetching crawled URLs (citation-tracker dedups); T7 24-hour soak on a synthetic infinite-citation graph (must terminate cleanly when budget hits).
+
+### BATCH — queue worker
+
+A focused queue-consumer pattern. No interactive REPL, no live UI, no per-message session — just a worker that pulls work from a queue, runs one `runChatLoop` per item with a fresh sessionId, writes the result, and acks. Idempotency keys make retries safe.
+
+**Build order:** all parallel after `queue-protocol` is stable.
+
+**What to build:**
+- `packages/queue-protocol` — abstract queue interface: `pull(): Job`, `ack(jobId)`, `nack(jobId, reason)`, `extendVisibility(jobId, ms)`. Adapters: SQS, Redis Streams, Postgres advisory-lock, in-memory (testing).
+- `packages/queue-consumer` — long-running `Bun.spawn`-friendly loop that pulls + dispatches + acks; visibility-timeout-aware; graceful shutdown on SIGTERM (drains in-flight jobs).
+- `packages/idempotency-keys` — `IdempotencyKey(jobId, attempt)` deduper; persists per-key result for `idempotency-window` so retries return cached output.
+- `packages/target-batch-worker` — `target: "batch"` spec carries `queue: { adapter, ... }`, `concurrency`, `idempotencyWindow`. Emits a long-running daemon shaped like §12's channel daemon but pulling from a queue instead of webhooks.
+
+**Tests:** T3 end-to-end with the in-memory queue adapter (50 jobs, concurrency 4, all complete); T7 backpressure test (queue grows faster than consumer drains; verify visibility-timeout hand-off works); T9 idempotency property test (same `IdempotencyKey` across N retries → identical result, model called exactly once).
+
+---
+
+## Section 24 — VOICE target shape
+
+> Status: 🟡 dedicated section after §22–23. Substantial novelty.
+
+**Catalog modules:** `voice-runtime` (R16), `vad-engine` (R16), `barge-in-controller` (R16), `call-session` (R16), `target-voice` (F2)
+
+Realtime audio is genuinely novel territory in this codebase. The provider abstraction is non-trivial — OpenAI Realtime and Vapi differ at the wire-protocol level — and PCM/Opus framing + telephony lifecycle have no parallel in the existing target shapes. This section is dedicated because it warrants its own scoping pass.
+
+### Build order within this section
+
+```
+voice-runtime  ──►  vad-engine  ──►  barge-in-controller  ──►  call-session  ──►  target-voice
+                                     (parallel with vad-engine)
+```
+
+### What to build
+
+**`packages/voice-runtime`** — provider abstraction over realtime
+- `RealtimeAdapter` interface: `connect(opts)`, `sendAudio(pcmFrame)`, `sendText(text)`, `onTranscript(cb)`, `onAudio(cb)`, `onToolUse(cb)`, `disconnect()`
+- Adapters: `realtime-openai` (over WebSocket; PCM 16-bit 24kHz), `realtime-vapi` (over their SDK; Opus). Lazy-loaded like §17 model adapters.
+- Provider-agnostic event shapes: `transcript_partial`, `transcript_final`, `audio_chunk`, `tool_use`, `interrupt`, `disconnect`.
+
+**`packages/vad-engine`** — voice activity detection
+- `detect(pcmFrame): "speech" | "silence" | "transitioning"` — WebRTC VAD-style energy + zero-crossing-rate heuristic; no external ML dep.
+- 30 ms framing; aggressiveness configurable (0–3 per WebRTC convention).
+
+**`packages/barge-in-controller`** — user interruption
+- Watches the inbound audio stream via `vad-engine`; when speech is detected during agent playback, fires `interrupt()` on the realtime adapter so the model stops mid-utterance.
+- Configurable hysteresis (don't barge in on a 50 ms cough).
+
+**`packages/call-session`** — telephony lifecycle
+- States: `idle | dialing | connected | on-hold | transferred | terminated`
+- Per-state hooks fire on state transitions (so users can plug in CRM updates, recording starts, etc.)
+- Pluggable adapters for Twilio + LiveKit SIP for the actual telephony connection.
+
+**`packages/target-voice`** — codegen
+- `target: "voice"` spec carries `voice: { provider, voiceId }`, `telephony?: { provider, ... }`, `agent.{model, instructions, tools?}`
+- Multi-file output: `daemon.ts`, `voice-loop.ts`, `agent.ts`. Daemon serves the realtime endpoint (HTTP for browser-WebRTC clients; SIP gateway for telephony).
+
+### Tests
+
+- `voice-runtime`: T2 contract per adapter (synthetic 1-second PCM stream → expected event sequence)
+- `vad-engine`: T2 against the WebRTC VAD reference corpus (≥90% agreement); T9 stability under noise injection
+- `barge-in-controller`: T3 simulated overlap (agent playing audio + user starts speaking at frame 100 → interrupt fires within 200 ms)
+- `call-session`: T9 state-machine property test over all transitions
+- `target-voice`: T1 bundle structure; T3 fixture call (synthetic audio in → text out)
+- E2E smoke: `examples/hello-voice/` — browser client connects to the daemon, says "what's the weather", agent reads the response. Smoke uses a recorded PCM clip (no microphone needed).
+
+---
+
+## Section 25 — BROW target shape (computer-use)
+
+> Status: 🟡 dedicated section after §22–23. Substantial novelty; depends on §18 sandbox for screenshot ops in production.
+
+**Catalog modules:** `computer-use-driver` (R18), `tool-screen-capture` (R4), `tool-mouse-keyboard` (R4), `tool-vision-grounding` (R4), `target-browser-driver` (F2)
+
+Cross-OS desktop / browser control over a screenshot loop. The key design call is the screenshot-frequency-vs-action-latency trade-off — too frequent and the model is overwhelmed, too sparse and the agent loses sync with the UI state. The §18 sandbox composes here as a containerised browser host (Chromium-in-docker) for production deployments where letting the agent drive the host machine is unacceptable.
+
+### Build order within this section
+
+```
+computer-use-driver  ──►  tool-screen-capture       (parallel)  ──►  target-browser-driver
+                          tool-mouse-keyboard
+                          tool-vision-grounding
+```
+
+### What to build
+
+**`packages/computer-use-driver`** — cross-OS abstraction
+- `Driver` interface: `screenshot()`, `click(x, y, button?)`, `type(text)`, `key(combo)`, `scroll(dx, dy)`, `getViewport()`
+- Backends: `host` (uses macOS / Linux / Windows native APIs), `docker-chromium` (driver inside a container; required when sandbox is mandatory), `remote` (stub for future CDP-style remote browsers).
+- References: Anthropic computer-use API, OpenAI Operator patterns.
+
+**`packages/tool-screen-capture`** — `Screenshot()` tool
+- Returns a viewport screenshot as an image content block (composes with §14's `tool-image` content-block pattern).
+- Configurable downscale factor to keep model context budget under control.
+
+**`packages/tool-mouse-keyboard`** — `Click(x, y)`, `Type(text)`, `Key(combo)`, `Scroll(dx, dy)` tools
+- All four wrap the driver methods 1:1.
+- `destructive: true` — needs explicit `alwaysAllow` to run.
+
+**`packages/tool-vision-grounding`** — element-locating helper
+- `FindElement(description)`: takes a natural-language description, screenshots the viewport, asks the model for a bounding box, returns coordinates.
+- The model that performs grounding is configurable; defaults to the agent's primary model.
+- This is the canonical answer to "click the blue Login button" without the user pixel-counting.
+
+**`packages/target-browser-driver`** — codegen
+- `target: "browser"` spec carries `driver: { backend }`, `screenshotIntervalMs`, `viewport: { width, height }`, `agent.{model, instructions, tools?}`
+- Single-file `agent.ts` boots the driver, registers screenshot + mouse-keyboard + vision-grounding tools, runs `runChatLoop`.
+
+### Tests
+
+- `computer-use-driver`: T2 per backend against a fixture-driven test harness (screenshot returns expected hash; click/type are observable through a mock target window)
+- `tool-screen-capture`: T1 unit (downscale correctness, format validation); T8 refuses to capture screens belonging to other users
+- `tool-mouse-keyboard`: T8 destructive-flag enforcement (refuses without explicit `alwaysAllow`)
+- `tool-vision-grounding`: T3 round-trip against a fixture screenshot of a known UI; verify the returned coordinates land within the target element's bounding box
+- `target-browser-driver`: T1 bundle structure; T3 fixture flow (open a known web page, click a known element, assert the next screenshot shows the expected state change)
+- E2E smoke: `examples/hello-browser/` — browser-in-docker visits a static fixture page, agent is told "click the Submit button", smoke verifies the post-submit screenshot.
+
+---
+
+## Section 26 — Studio (authoring + inspection UI)
+
+> Status: 🟡 last in this roadmap; depends on every prior section's IR variants and trace event kinds being stable.
+
+**Catalog modules:** `studio-server` (F4), `studio-ui` (F4), `trace-viewer` (F4), `graph-visualizer` (F4), `wizard` (F4), `scaffold-templates` (F4), `plugin-sdk` (F5)
+
+Studio is what closes the loop and turns the meta-harness into a product surface. It sits on top of every shipped target shape and event kind. The design is web-first — `Bun.serve` for the backend, a single SPA bundle for the frontend, no SSR required.
+
+### Build order within this section
+
+```
+studio-server  ──►  studio-ui  ──►  trace-viewer       (parallel)  ──►  plugin-sdk
+                                    graph-visualizer
+                                    wizard
+                                    scaffold-templates
+```
+
+### What to build
+
+**`packages/studio-server`** — web backend
+- `Bun.serve` daemon exposing: spec CRUD (read/write `crewhaus.yaml` files in a workspace), run inspection (lists `.crewhaus/sessions/`, streams the JSONL transcript + trace events as SSE), eval-result inspection (lists `.crewhaus/evals/`, serves the per-sample HTML reports), `crewhaus run` / `crewhaus eval` invocation via subprocess.
+- Authenticates via the same JWT shape as §20's `gateway-server` so a managed deployment can host studio and the gateway under one auth surface.
+
+**`packages/studio-ui`** — single-page app
+- Vanilla TS + minimal framework (Lit or Solid; no React-shaped tooling). Bundled with `bun build`.
+- Pages: spec list, spec editor (Monaco; YAML lint via `spec-validator`), run viewer (live trace SSE), eval result browser, sub-agent tree visualiser.
+
+**`packages/trace-viewer`** — embeddable trace timeline
+- Renders `TraceEvent[]` (Section 15) as a Gantt-style timeline with per-span drilldown. Span kinds: model, tool, mcp, hook, sub_agent, compaction, permission, recovery.
+- Used by `studio-ui` AND embedded inside `eval-report`'s per-sample drilldown (Section 16).
+
+**`packages/graph-visualizer`** — render `IrGraphV0` and live graph runs
+- D3 force-directed layout for static graph spec rendering; same layout reused for live run visualisation with node-state colour-coding (idle/running/done/hitl/failed).
+- Click any node → drills down to that node's trace events in `trace-viewer`.
+
+**`packages/wizard`** — guided spec creation
+- Asks 5 questions (target shape, model, primary tools, persistence backend, env vars) and emits a `crewhaus.yaml` + matching `.env.example`. Used by `crewhaus init --wizard` AND a "new spec" button in `studio-ui`.
+
+**`packages/scaffold-templates`** — opinionated starting points
+- One template per target shape — `cli-coding-agent`, `slack-bot`, `slack-bot-with-mcp`, `research-agent`, `rag-bot`, `crew-research`, etc.
+- Used by `wizard` and `crewhaus init <template>`.
+
+**`packages/plugin-sdk`** — extension surface for studio + factory
+- `definePlugin({ name, hooks: { onSpecLoad, onTraceEvent, onEvalSampleRendered }, ... })` — plugins can add panes to studio-ui, contribute custom trace-event renderers, and inject post-eval reports.
+- Lazy-loaded from `~/.crewhaus/plugins/<name>/index.ts`.
+
+### Tests
+
+- `studio-server`: T3 end-to-end via curl + SSE consumer (spec CRUD round-trip, run inspection, eval-result fetch)
+- `studio-ui`: Playwright smoke against the bundled SPA — load app, create a spec, run it, watch trace, view eval result
+- `trace-viewer`: T1 snapshot test against fixture event corpora (verifies Gantt layout determinism)
+- `graph-visualizer`: T1 layout-stability test (same graph → same node positions ±1 px)
+- `wizard`: T1 per-question branching; T3 the 5-question flow produces a valid spec for every target shape
+- `plugin-sdk`: T8 sandbox isolation (plugin code can NOT exfil files outside `~/.crewhaus/plugins/<self>/`)
+- E2E smoke: `bun run studio` boots the daemon + opens a browser; the smoke navigates the wizard, creates a CLI spec, runs it, watches the trace timeline render in real time, opens the eval pane after running `crewhaus eval`, and exercises the GRPH visualizer against `examples/hello-graph`.
+
+---
+
 ## Kickoff prompts
 
 Use these prompts with Claude Code from the project root (`/Users/bots/Developer/crewhaus-factory`). Each prompt is self-contained.
@@ -2427,6 +2697,296 @@ End-to-end smoke test before opening the PR:
 - Concurrency: index 100 docs in parallel; confirm vector-store handles concurrent upserts without races (verify by re-querying the count)
 - Confirm the existing target shapes (cli/workflow/channel) all still compile and run after the spec discriminated-union expansion
 - Clean up .crewhaus/vector-store/
+
+Update docs/MODULE-CATALOG.md and docs/build-roadmap.md with everything that is complete and create a pull request with all updates.
+```
+
+---
+
+### Section 22 — CRW target shape (multi-agent crew)
+
+```
+Read docs/build-roadmap.md Section 22. Also read in full:
+- packages/agent-context-isolation/src/index.ts and packages/sub-agent-spawner/src/index.ts (Section 13 — the isolation primitives a Handoff reuses)
+- packages/sub-agent-permission-inheritance/src/index.ts (Section 13 — the permission-scoping pattern Handoff inherits)
+- packages/runtime-core/src/index.ts (where RuntimeBridge lives — Handoff and SendMessage are tools that go through the bridge like Task does)
+- packages/trace-event-bus/src/index.ts (sub_agent_start/sub_agent_end pattern; CRW adds handoff + a2a_message events)
+- packages/event-log/src/index.ts (the JSONL append shape; handoff events ride here too)
+- packages/spec/src/index.ts and packages/ir/src/index.ts (where target: "crew" lands)
+- packages/target-channel-bot/src/index.ts (multi-file codegen pattern target-crew mirrors)
+- docs/MODULE-CATALOG.md entries for agent-handoff, a2a-protocol, crew-orchestrator, target-crew
+
+Build in this order:
+
+1. packages/agent-handoff (sequential prereq)
+   - Handoff(targetRole, reason, context?) tool — current agent yields control to targetRole with structured reason + optional shared context
+   - Receiver inherits the parent's session + transcript prefix (mirror the Section 13 sub-agent isolation pattern but DON'T fork the session — handoff is in-band)
+   - Refusal protocol: target may refuse with a typed reason → control returns to sender; T8 covers the refusal-loop guard (sender refuses → target refuses → terminates cleanly, no infinite ping-pong)
+
+2. packages/a2a-protocol (parallel with agent-handoff after the bridge interface is stable)
+   - SendMessage(toRole, payload) agent-to-agent tool (DISTINCT from Section 12's channel-bot SendMessage; this one routes inside the crew)
+   - Typed event envelope: { from, to, kind, payload, traceparent }
+   - traceparent propagation so the entire crew shows under one OTel trace; T9 property test on this invariant
+   - Reference: Google A2A spec, agent-framework/.../_a2a.py
+
+3. packages/crew-orchestrator (depends on #1 and #2)
+   - Crew builder: addRole(name, def), setEntry(name), setRouting(routerFn), compile()
+   - compile() returns RunnableCrew: run(input, opts) → AsyncIterable<CrewEvent> over role_start | handoff | a2a_message | role_end | crew_done
+   - Default router: match(input) predicate-driven; custom routers receive (input, currentState) → roleName
+
+4. packages/target-crew (depends on #3)
+   - target: "crew" spec carries roles: { [name]: { model, instructions, tools?, sub_agents? } }, entry: string, routing?: { kind: "match" | "llm" }
+   - Multi-file output: daemon.ts (boots crew + serves stdin or webhook), orchestrator.ts (compiled RunnableCrew), one agent_<role>.ts per role
+
+5. Spec/IR additions (sequential after #4)
+   - packages/spec — add "crew" variant to discriminated union
+   - packages/ir — IrCrewV0 with roles, entry, routing
+   - packages/compiler — detect target: "crew", dispatch to target-crew
+
+6. examples/hello-crew/ — researcher → writer → critic; one handoff (researcher → writer) and one A2A message (critic asks researcher one question)
+
+Tests: T3 round-trip handoff; T8 refusal-loop guard; T2 A2A contract against Google A2A fixtures; T9 traceparent propagation property test; T1 per crew-orchestrator builder method; T3 3-role crew end-to-end with one handoff + one A2A message; T9 routing-determinism property test; T1 generated bundle structure.
+
+End-to-end smoke test before opening the PR:
+- ANTHROPIC_AUTH_TOKEN is in .env (Bun auto-loads .env)
+- Compile examples/hello-crew and run it: drive the input "research the top 3 risks of multi-agent crews and write a 200-word post about them with one critique embedded"
+- Verify: researcher role runs first (visible in trace events as role_start{role: "researcher"}); after research completes, a handoff event fires with reason; writer role runs second (role_start{role: "writer"}); critic role asks researcher one A2A question (a2a_message event with from: "critic", to: "researcher"); writer revises; final crew_done event
+- All four event kinds (role_start, handoff, a2a_message, role_end) are visible in the JSONL event log under the same sessionId
+- OTel verification: with OTEL_EXPORTER_OTLP_ENDPOINT set to a docker-hosted collector, confirm all three roles' spans share one traceId
+- Refusal-loop check: temporarily set both researcher and writer to refuse handoffs → confirm the run terminates with a clean "handoff refused (depth=2)" error rather than infinite ping-pong
+- Confirm the existing target shapes (cli/workflow/channel/graph/managed/pipeline) all still compile and run after the spec discriminated-union expansion
+
+Update docs/MODULE-CATALOG.md and docs/build-roadmap.md with everything that is complete and create a pull request with all updates.
+```
+
+---
+
+### Section 23 — RES + BATCH target shapes (parallel)
+
+```
+Read docs/build-roadmap.md Section 23. This is two independent shapes shipped in parallel — make ONE PR per shape, not one combined.
+
+For RES, also read:
+- packages/sub-agent-spawner/src/index.ts (each research branch is a sub-agent)
+- packages/tool-fetch/src/index.ts and packages/tool-web/src/index.ts (Section 14 — the crawler reuses these)
+- packages/event-log/src/index.ts (multi-hour runs need durable replay)
+- packages/checkpoint-store/src/index.ts (Section 19 — RES checkpoints branch points)
+- docs/MODULE-CATALOG.md entries for target-research-bundle, planner, crawler, citation-tracker, report-writer
+
+For BATCH, also read:
+- packages/target-channel-bot/src/index.ts (the daemon-shape codegen target-batch-worker mirrors)
+- packages/state-store/src/index.ts and packages/event-log/src/index.ts (Section 10 — per-job session)
+- docs/MODULE-CATALOG.md entries for queue-protocol, queue-consumer, idempotency-keys, target-batch-worker
+
+RES build order:
+1. packages/planner — decompose(goal, context): Plan; checkpointed at branch points; sub-agent failures backtrack
+2. packages/crawler — Anthropic server-side web_search when available; fallback via tool-fetch allow-list; URL-dedup, robots.txt, per-domain rate limit
+3. In parallel: packages/citation-tracker — every cited fact persisted with { url, snippet, retrievedAt, sha256(content) }
+4. packages/report-writer — pulls citation tree + transcript, emits markdown / JSON-structured report
+5. packages/target-research-bundle — target: "research" spec carries goal, branchingFactor, maxDuration, optional vectorBackend; emits a daemon
+
+BATCH build order: parallel after queue-protocol stabilises
+1. packages/queue-protocol — abstract queue interface: pull(): Job, ack(jobId), nack(jobId, reason), extendVisibility(jobId, ms). Adapters: SQS, Redis Streams, Postgres advisory-lock, in-memory (testing).
+2. packages/queue-consumer — long-running loop; visibility-timeout-aware; SIGTERM drains in-flight jobs
+3. packages/idempotency-keys — IdempotencyKey(jobId, attempt) deduper; per-key cached result for idempotency-window
+4. packages/target-batch-worker — target: "batch" spec carries queue: { adapter, ... }, concurrency, idempotencyWindow
+
+Spec/IR additions:
+- packages/spec — add "research" + "batch" discriminated-union variants
+- packages/ir — IrResearchV0 + IrBatchV0
+- packages/compiler — dispatch on target
+
+Tests:
+- RES: T3 end-to-end on a fixture goal ("3 risks of GRPH agents"); T4 replay test confirming a crashed run resumes from last checkpoint without re-fetching crawled URLs (citation-tracker dedups); T7 24-hour soak on a synthetic infinite-citation graph (must terminate cleanly when budget hits)
+- BATCH: T3 end-to-end with in-memory queue (50 jobs, concurrency 4, all complete); T7 backpressure test (queue grows faster than consumer drains; verify visibility-timeout hand-off); T9 idempotency property test (same key across N retries → identical result, model called exactly once)
+
+End-to-end smoke tests before opening each PR (against the live model via ANTHROPIC_AUTH_TOKEN in .env):
+
+RES smoke (`bun run smoke:section-23-res`):
+1. Compile examples/hello-research and run with goal "what target shapes does this codebase support?"; the planner decomposes into 3 sub-questions
+2. Verify checkpoints land in .crewhaus/research/<runId>/ after each branch
+3. Kill the runner mid-second-branch; restart with `crewhaus run --resume <runId>`; confirm it picks up from the last checkpoint and the previously-fetched URLs are NOT re-fetched (citation-tracker hit)
+4. Final report contains numbered citations with deterministic ordering (re-running produces byte-identical citation block)
+
+BATCH smoke (`bun run smoke:section-23-batch`):
+1. Compile examples/hello-batch and start the worker with the in-memory queue; enqueue 20 fixture jobs
+2. Verify all 20 ack within the SLO (concurrency 4 → ~5x parallel speedup)
+3. Inject a transient failure on job 7 (force a 5xx from the model); confirm the consumer nacks, the idempotency-keys layer caches the partial output, the retry hits cache and acks within ms
+4. Send SIGTERM mid-batch; confirm in-flight jobs complete + ack before exit, queued-but-not-pulled jobs remain on the queue
+5. Confirm the existing target shapes still compile and run after the discriminated-union expansion
+
+Update docs/MODULE-CATALOG.md and docs/build-roadmap.md with everything that is complete and create a pull request per shape (two PRs total).
+```
+
+---
+
+### Section 24 — VOICE target shape
+
+```
+Read docs/build-roadmap.md Section 24. Also read in full:
+- packages/runtime-core/src/index.ts (the existing streaming loop pattern voice-runtime adapts to realtime)
+- packages/model-router/src/index.ts (Section 17 — voice-runtime mirrors the lazy-load + provider-prefix pattern)
+- packages/trace-event-bus/src/index.ts (TraceEvent will gain transcript_partial / audio_chunk / interrupt kinds)
+- packages/target-channel-bot/src/index.ts (long-running daemon shape target-voice mirrors)
+- docs/MODULE-CATALOG.md entries for voice-runtime, vad-engine, barge-in-controller, call-session, target-voice
+- reference-repos/openai-agents-python/src/agents/realtime/ (primary OpenAI Realtime reference)
+- reference-repos/openai-agents-python/src/agents/voice/ (PCM/Opus framing reference)
+
+Build in this order:
+
+1. packages/voice-runtime (sequential prereq)
+   - RealtimeAdapter interface: connect(opts), sendAudio(pcmFrame), sendText(text), onTranscript(cb), onAudio(cb), onToolUse(cb), disconnect()
+   - Adapters: realtime-openai (WebSocket; PCM 16-bit 24kHz), realtime-vapi (their SDK; Opus). Lazy-loaded.
+   - Provider-agnostic event shapes: transcript_partial, transcript_final, audio_chunk, tool_use, interrupt, disconnect
+
+2. In parallel after #1:
+   2a. packages/vad-engine — detect(pcmFrame): "speech" | "silence" | "transitioning"
+       - WebRTC VAD-style energy + zero-crossing-rate heuristic; no external ML dep
+       - 30 ms framing; aggressiveness configurable (0–3 per WebRTC convention)
+   2b. packages/barge-in-controller — watches inbound audio via vad-engine; on speech during agent playback, fires interrupt() on realtime adapter
+       - Hysteresis configurable (don't barge in on a 50 ms cough)
+   2c. packages/call-session — states: idle | dialing | connected | on-hold | transferred | terminated
+       - Per-state hooks fire on transitions
+       - Pluggable adapters for Twilio + LiveKit SIP
+
+3. packages/target-voice (last)
+   - target: "voice" spec carries voice: { provider, voiceId }, telephony?: { provider, ... }, agent.{model, instructions, tools?}
+   - Multi-file output: daemon.ts, voice-loop.ts, agent.ts
+   - Daemon serves realtime endpoint (HTTP for browser-WebRTC clients; SIP gateway for telephony)
+
+Spec/IR additions:
+- packages/spec — add "voice" variant
+- packages/ir — IrVoiceV0
+- packages/compiler — dispatch on target
+
+Tests: T2 contract per realtime adapter (synthetic 1s PCM stream → expected event sequence); T2 vad-engine against WebRTC VAD reference corpus (≥90% agreement); T9 vad-engine stability under noise injection; T3 barge-in simulated overlap (agent playing audio + user starts speaking at frame 100 → interrupt fires within 200ms); T9 call-session state-machine property test; T1 target-voice bundle structure; T3 fixture call (synthetic PCM in → text out).
+
+End-to-end smoke test before opening the PR:
+- ANTHROPIC_AUTH_TOKEN is in .env (Bun auto-loads .env)
+- OPENAI_API_KEY required for the realtime smoke (OpenAI Realtime is the only realtime provider that accepts API keys without a paid telephony account)
+- Compile examples/hello-voice and start the daemon: `bun run run:hello-voice &`
+- Drive these probes:
+  1. Browser smoke: open scripts/section-24-voice-tester.html (a tiny fixture page that connects WebRTC to the daemon, plays a recorded "what's the weather" PCM clip, captures the agent's audio response). Verify the assistant utterance lasts >1s and the trace shows transcript_final with the expected text.
+  2. Barge-in smoke: replay a clip with two utterances ("what's the weather, oh wait, what's the time"). Confirm an interrupt event fires within 200ms of the second utterance starting and the original "what's the weather" reply is cut off.
+  3. Call-session smoke (no real telephony): simulate dialing → connected → terminated transitions via the test harness; confirm hooks fire on every state transition.
+  4. Provider switch: change spec to voice.provider: "vapi" (if VAPI_API_KEY is set; otherwise skip with a note in the report); rerun the browser smoke.
+- Kill the daemon (clean shutdown; no orphan processes); confirm temp PCM files cleaned up
+
+Update docs/MODULE-CATALOG.md and docs/build-roadmap.md with everything that is complete and create a pull request with all updates.
+```
+
+---
+
+### Section 25 — BROW target shape (computer-use)
+
+```
+Read docs/build-roadmap.md Section 25. Also read in full:
+- packages/sandbox/src/index.ts (Section 18 — required prereq for the docker-chromium driver backend)
+- packages/tool-image/src/index.ts (Section 14 — the image content-block pattern tool-screen-capture composes with)
+- packages/tool-fs/src/index.ts (the path-traversal defense pattern to mirror in tool-screen-capture)
+- packages/runtime-core/src/index.ts (where the screenshot-loop driver hooks in via the existing tool framework)
+- packages/permission-engine/src/index.ts (Click/Type/Key/Scroll all need destructive flag enforcement)
+- docs/MODULE-CATALOG.md entries for computer-use-driver, tool-screen-capture, tool-mouse-keyboard, tool-vision-grounding, target-browser-driver
+
+Build in this order:
+
+1. packages/computer-use-driver (sequential prereq)
+   - Driver interface: screenshot(), click(x, y, button?), type(text), key(combo), scroll(dx, dy), getViewport()
+   - Backends: host (macOS/Linux/Windows native APIs), docker-chromium (driver inside a Section-18 sandbox), remote (stub for future CDP-style remote browsers)
+   - Reference: Anthropic computer-use API, OpenAI Operator patterns
+
+2. In parallel after #1:
+   2a. packages/tool-screen-capture — Screenshot() tool returning an Anthropic image content block (composes with Section 14's tool-image content-block pattern)
+       - Configurable downscale factor to keep model context budget under control
+   2b. packages/tool-mouse-keyboard — Click(x, y), Type(text), Key(combo), Scroll(dx, dy) tools wrapping driver methods 1:1
+       - All four destructive: true; refuses without explicit alwaysAllow
+   2c. packages/tool-vision-grounding — FindElement(description) tool
+       - Takes natural-language description, screenshots viewport, asks the model for a bounding box, returns coordinates
+       - Grounding model configurable (defaults to agent's primary model)
+
+3. packages/target-browser-driver (last)
+   - target: "browser" spec carries driver: { backend }, screenshotIntervalMs, viewport: { width, height }, agent.{model, instructions, tools?}
+   - Single-file agent.ts boots driver, registers screenshot + mouse-keyboard + vision-grounding tools, runs runChatLoop
+
+Spec/IR additions:
+- packages/spec — add "browser" variant
+- packages/ir — IrBrowserV0
+- packages/compiler — dispatch on target
+
+Tests: T2 driver per backend against fixture-driven harness (screenshot returns expected hash; click/type observable through mock target window); T1 tool-screen-capture downscale + format validation; T8 refuses to capture screens of other users; T8 mouse-keyboard destructive-flag enforcement (refuses without explicit alwaysAllow); T3 vision-grounding round-trip against fixture screenshot of known UI (returned coords land within target element's bbox); T1 target-browser-driver bundle structure; T3 fixture flow (open known web page, click known element, assert next screenshot shows expected state change).
+
+End-to-end smoke test before opening the PR:
+- ANTHROPIC_AUTH_TOKEN is in .env (Bun auto-loads .env)
+- Confirm `docker version` runs (docker-chromium backend is the smoke target — never use `host` backend for the smoke since it would drive the dev's actual desktop)
+- Compile examples/hello-browser and run with the docker-chromium backend
+- Drive these probes:
+  1. Visit a static fixture page served by `bun run scripts/section-25-fixture-server.ts` (the fixture has a known-id Submit button at known coordinates)
+  2. Prompt: "Click the Submit button" — confirm vision-grounding fires, returns coordinates within the button's bbox, mouse-keyboard click executes, the next screenshot shows the post-submit state
+  3. Permission floor: with the same spec WITHOUT alwaysAllow rules for Click/Type, prompt the same — confirm denial cites destructive-flag + missing rule
+  4. Cross-OS smoke (CI matrix): in addition to docker-chromium, run a host-backend smoke on macOS via a temporary Safari window (gated on `CREWHAUS_BROW_HOST_SMOKE=1` to avoid surprising dev machines)
+- Confirm no orphan chromium processes remain after the docker-chromium smoke
+
+Update docs/MODULE-CATALOG.md and docs/build-roadmap.md with everything that is complete and create a pull request with all updates.
+```
+
+---
+
+### Section 26 — Studio (authoring + inspection UI)
+
+```
+Read docs/build-roadmap.md Section 26. Also read:
+- packages/spec/src/index.ts and packages/compiler/src/index.ts (studio-server reads/writes specs)
+- packages/event-log/src/index.ts and packages/session-store/src/index.ts (studio-server inspects sessions)
+- packages/trace-event-bus/src/index.ts (Section 15 — trace-viewer renders these)
+- packages/eval-runner/src/index.ts and packages/eval-report/src/index.ts (Section 16 — studio embeds the per-sample report)
+- packages/gateway-server/src/index.ts (Section 20 — same JWT auth shape; studio + gateway can co-host)
+- packages/ir/src/index.ts (graph-visualizer renders IrGraphV0)
+- docs/MODULE-CATALOG.md entries for studio-server, studio-ui, trace-viewer, graph-visualizer, wizard, scaffold-templates, plugin-sdk
+
+Build in this order:
+
+1. packages/studio-server (sequential prereq)
+   - Bun.serve daemon exposing: spec CRUD (read/write crewhaus.yaml in workspace), run inspection (lists .crewhaus/sessions/, streams JSONL transcript + trace events as SSE), eval-result inspection (lists .crewhaus/evals/, serves per-sample HTML reports), `crewhaus run` / `crewhaus eval` invocation via subprocess
+   - Authenticates via the same JWT shape as Section 20's gateway-server so a managed deployment can host studio + gateway under one auth surface
+
+2. packages/studio-ui (depends on #1)
+   - Vanilla TS + minimal framework (Lit or Solid; no React-shaped tooling)
+   - Bundled with `bun build`
+   - Pages: spec list, spec editor (Monaco; YAML lint via spec-validator), run viewer (live trace SSE), eval result browser, sub-agent tree visualiser
+
+3. In parallel after #2:
+   3a. packages/trace-viewer — embeddable trace timeline; renders TraceEvent[] as Gantt-style with per-span drilldown
+       Span kinds: model, tool, mcp, hook, sub_agent, compaction, permission, recovery
+       Used by studio-ui AND embedded inside eval-report's per-sample drilldown
+   3b. packages/graph-visualizer — D3 force-directed layout for IrGraphV0; same layout reused for live graph runs with node-state colour-coding
+       Click any node → drills down to that node's trace events in trace-viewer
+   3c. packages/wizard — guided spec creation; 5 questions (target shape, model, primary tools, persistence backend, env vars) → emits crewhaus.yaml + matching .env.example
+       Used by `crewhaus init --wizard` AND a "new spec" button in studio-ui
+   3d. packages/scaffold-templates — opinionated starting points; one template per target shape (cli-coding-agent, slack-bot, slack-bot-with-mcp, research-agent, rag-bot, crew-research, …)
+
+4. packages/plugin-sdk (last)
+   - definePlugin({ name, hooks: { onSpecLoad, onTraceEvent, onEvalSampleRendered }, ... })
+   - Plugins can add panes to studio-ui, contribute custom trace-event renderers, inject post-eval reports
+   - Lazy-loaded from ~/.crewhaus/plugins/<name>/index.ts
+
+Tests:
+- studio-server: T3 end-to-end via curl + SSE consumer (spec CRUD round-trip, run inspection, eval-result fetch)
+- studio-ui: Playwright smoke against bundled SPA — load app, create spec, run it, watch trace, view eval result
+- trace-viewer: T1 snapshot test against fixture event corpora (Gantt layout determinism)
+- graph-visualizer: T1 layout-stability test (same graph → same node positions ±1 px)
+- wizard: T1 per-question branching; T3 the 5-question flow produces a valid spec for every target shape
+- plugin-sdk: T8 sandbox isolation (plugin code can NOT exfil files outside ~/.crewhaus/plugins/<self>/)
+
+End-to-end smoke test before opening the PR:
+- ANTHROPIC_AUTH_TOKEN is in .env (Bun auto-loads .env)
+- `bun run studio` boots studio-server and opens the SPA in the user's default browser
+- Drive these probes via Playwright:
+  1. Wizard: click "new spec", walk through 5 questions selecting target: "cli", model: "claude-sonnet-4-6", tools: [read, bash], persistence: default. Confirm the wizard wrote crewhaus.yaml + .env.example to the workspace. The new spec appears in the spec list.
+  2. Run inspection: click "run" on the new spec; type a prompt; verify the trace timeline renders in real time (live SSE) with at least one model span and one tool span if Bash is invoked.
+  3. Eval inspection: run `crewhaus eval` against a fixture dataset (in a separate terminal); refresh the eval pane in studio; confirm the run appears with pass-rate aggregates and per-sample drilldowns; confirm the trace-viewer is embedded inside each sample's panel.
+  4. Graph visualisation: open examples/hello-graph in the spec editor; click "visualise"; confirm the D3 layout renders 3 nodes + 2 edges with deterministic positioning.
+  5. Plugin: drop scripts/section-26-fixture-plugin/index.ts into ~/.crewhaus/plugins/fixture/; refresh studio; confirm the plugin's "Hello from plugin" pane appears in the sidebar.
+- Stop studio (Ctrl-C); no orphan processes
 
 Update docs/MODULE-CATALOG.md and docs/build-roadmap.md with everything that is complete and create a pull request with all updates.
 ```
