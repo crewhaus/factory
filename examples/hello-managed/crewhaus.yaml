@@ -1,0 +1,15 @@
+name: hello-managed
+target: managed
+agent:
+  model: claude-sonnet-4-6
+  instructions: |
+    You are a managed-daemon agent. Reply tersely (one short sentence).
+tenants:
+  - id: tenant-a
+    budget:
+      maxInputTokens: 100000
+      maxOutputTokens: 20000
+  - id: tenant-b
+    budget:
+      maxInputTokens: 100000
+      maxOutputTokens: 20000

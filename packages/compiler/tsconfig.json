@@ -11,6 +11,7 @@
     { "path": "../ir" },
     { "path": "../target-cli" },
     { "path": "../target-graph" },
+    { "path": "../target-managed" },
     { "path": "../target-workflow" }
   ]
 }

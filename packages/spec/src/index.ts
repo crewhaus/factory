@@ -241,11 +241,46 @@ const graphSchema = z
   })
   .strict();
 
+// Managed daemon target (Section 20). Multi-tenant gateway with
+// per-tenant budgets + policy overrides; emitted bundle is daemon.ts +
+// agent.ts. Authentication is HS256 JWT — the signing secret enters
+// via env at boot, not via the spec.
+const managedTenantSchema = z
+  .object({
+    id: z.string().min(1),
+    budget: z
+      .object({
+        maxInputTokens: z.number().int().positive(),
+        maxOutputTokens: z.number().int().positive(),
+      })
+      .strict(),
+  })
+  .strict();
+
+const managedAgentSchema = z
+  .object({
+    model: z.string().min(1),
+    instructions: z.string().min(1),
+  })
+  .strict();
+
+const managedSchema = z
+  .object({
+    name: z.string().min(1),
+    target: z.literal("managed"),
+    agent: managedAgentSchema,
+    tenants: z.array(managedTenantSchema).min(1),
+    permissions: permissionsBlock,
+    compaction: compactionBlock,
+  })
+  .strict();
+
 export const Spec = z.discriminatedUnion("target", [
   cliSchema,
   workflowSchema,
   channelSchema,
   graphSchema,
+  managedSchema,
 ]);
 
 export type Spec = z.infer<typeof Spec>;
@@ -258,6 +293,8 @@ export type SpecSlackChannel = z.infer<typeof slackChannelSchema>;
 export type SpecGraph = z.infer<typeof graphSchema>;
 export type SpecGraphNode = z.infer<typeof graphNodeSchema>;
 export type SpecGraphEdge = z.infer<typeof graphEdgeSchema>;
+export type SpecManaged = z.infer<typeof managedSchema>;
+export type SpecManagedTenant = z.infer<typeof managedTenantSchema>;
 export type SpecMcpServerConfig = z.infer<typeof mcpServerConfigSchema>;
 export type SpecSubAgentDefinition = z.infer<typeof subAgentDefinitionSchema>;
 export type SpecCompactionBlock = z.infer<typeof compactionBlock>;

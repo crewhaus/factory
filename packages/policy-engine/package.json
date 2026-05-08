@@ -1,0 +1,19 @@
+{
+  "name": "@crewhaus/policy-engine",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Side-effect classification + audit-and-allow policy decisions for the managed-daemon target",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@crewhaus/audit-log": "workspace:*",
+    "@crewhaus/errors": "workspace:*"
+  }
+}

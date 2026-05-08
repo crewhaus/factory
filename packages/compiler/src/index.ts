@@ -5,6 +5,7 @@ import type {
   IrChannels,
   IrCompaction,
   IrGraphV0,
+  IrManagedV0,
   IrMcpServerConfig,
   IrMcpServers,
   IrNode,
@@ -26,6 +27,7 @@ import {
 import { emitChannelBot } from "@crewhaus/target-channel-bot";
 import { emitCli } from "@crewhaus/target-cli";
 import { emitGraph } from "@crewhaus/target-graph";
+import { emitManaged } from "@crewhaus/target-managed";
 import { emitWorkflow } from "@crewhaus/target-workflow";
 
 /**
@@ -233,6 +235,22 @@ export function lower(spec: Spec): IrNode {
         permissions: lowerPermissions(spec),
         compaction: lowerCompaction(spec),
       } satisfies IrGraphV0;
+    case "managed":
+      return {
+        version: 0,
+        name: spec.name,
+        target: "managed",
+        agent: { model: spec.agent.model, instructions: spec.agent.instructions },
+        tenants: spec.tenants.map((t) => ({
+          id: t.id,
+          budget: {
+            maxInputTokens: t.budget.maxInputTokens,
+            maxOutputTokens: t.budget.maxOutputTokens,
+          },
+        })),
+        permissions: lowerPermissions(spec),
+        compaction: lowerCompaction(spec),
+      } satisfies IrManagedV0;
     default:
       return assertNever(spec);
   }
@@ -248,6 +266,8 @@ function emit(ir: IrNode): Bundle {
       return emitChannelBot(ir);
     case "graph":
       return emitGraph(ir);
+    case "managed":
+      return emitManaged(ir);
     default:
       return assertNever(ir);
   }

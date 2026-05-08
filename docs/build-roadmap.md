@@ -83,7 +83,7 @@ Channel target shape (✅ §12) ──► Sub-agents + Task tool (✅ §13)
 | **§17 Multi-provider models** | ✅ | §1 (`model-adapter` interface) | All non-Anthropic providers, cross-provider compaction, EVAL/MGD multi-provider sweeps |
 | **§18 Production safety floor** | ✅ | §1, §3, §7 (permission-engine), §8 | §20 (`policy-engine` consumer), MGD/EVAL hardening, untrusted-code workflows |
 | **§19 GRPH target shape** | ✅ | §1–4, §10 (event-log replay) | GRPH shape, `durable-execution` family, branch/HITL flows, MGD durability |
-| **§20 MGD target shape + governance** | 🟡 after §18 (uses `policy-engine`) | §18 (`policy-engine`), §10, §15 | MGD shape, remote channel daemon, multi-tenant deployment, `web-ui` backend |
+| **§20 MGD target shape + governance** | ✅ | §18 (`policy-engine`), §10, §15 | MGD shape, remote channel daemon, multi-tenant deployment, `web-ui` backend |
 | **§21 RAG target shape** | 🟡 independent | §1–4, §15 (trace-event-bus for retrieval spans) | RAG shape, all R12 retrieval/embedding modules, doc-grounded agents |
 
 ---
@@ -1186,7 +1186,7 @@ Crash recovery (re-run `--resume <grun>` after a kill mid-execute) is supported 
 
 ## Section 20 — MGD target shape + governance
 
-> Status: 🟡 sequential after Section 18 (uses `policy-engine` from §18) + Section 15 (uses trace-bus for audit).
+> Status: ✅ landed. PR feat/section-20-mgd-target.
 
 **Catalog modules:** `gateway-server` (R16), `policy-engine` (R8 — extension of Section 18 work), `tenancy` (R17), `audit-log` (R17), `target-managed` (F2), `gateway-protocol` (R16)
 
@@ -1242,6 +1242,26 @@ policy-engine       ──►  tenancy        (parallel)  ──►  target-mana
 - `tenancy`: T8 cross-tenant read attempts rejected at every storage layer (sessions, evals, tool-results)
 - `audit-log`: T4 hash-chain verification under deliberate tamper; T7 100k-line append + verify cycle
 - `target-managed`: T1 bundle shape; T3 compile + boot a managed daemon, drive one run via the gateway, verify audit-log entries
+
+### What landed
+
+- **`packages/gateway-protocol`** — JSON-RPC v1 envelope (`protocol: "crewhaus.v1"`) with Zod schemas for every method + standard error codes (`unauthorized | forbidden | not_found | bad_request | budget_exceeded | internal_error`). `decodeRequest(raw)` validates envelope + method + params in one pass. Methods: `runs.create`, `runs.continue`, `runs.cancel`, `runs.subscribe`, `sessions.list`, `sessions.fork`, `audit.tail`.
+- **`packages/tenancy`** — `Tenant` carries `{ id, sessionRoot, evalRoot, toolResultRoot, auditRoot, policyOverrides, budget }`. `validateTenantId` accepts only `[a-zA-Z0-9][a-zA-Z0-9_\-]{0,63}`. `withTenant(tenant, fn)` uses Node's AsyncLocalStorage so storage adapters can call `requireTenant()` from anywhere within the call tree. `assertSamePath(absPath, expectedRoot)` is the storage-layer floor — even if a bug bypasses upstream checks, cross-tenant reads throw.
+- **`packages/audit-log`** — daily-rotated `<auditRoot>/YYYY-MM-DD.jsonl` files with mode `0o600` and a hash-chain index in `_chain-tail.json`. Each record carries `{ ts, version: 1, kind, payload, prevHash, hash }` with `hash = SHA-256(prevHash || canonical-body)`. `verify(rootDir)` walks every line and reports the first broken link (file + line + reason: `prevHash mismatch | hash mismatch | malformed JSON`). Kinds: `policy_decision`, `model_call`, `tool_classification`, `gateway_request`, `session_fork`, `tenancy_context`.
+- **`packages/policy-engine`** — `evaluatePolicy(call, { mode?, rules?, tenantPolicy? })` returns `{ decision: "allow" | "audit-and-allow" | "deny", reason?, matchedRule? }`. Modes (`permissive | audit | strict`) demote/upgrade rule actions. Tenant rules win over global rules; default rules cover `none → allow`, `filesystem|network|messaging|external → audit-and-allow`. `auditPolicyDecision(log, call, result)` writes the structured row when the decision is `audit-and-allow` or `deny`. Composes with `permission-engine` — the gateway runs permission first, then policy.
+- **`packages/gateway-server`** — `createGatewayServer({ jwtSecret, tenantsRoot?, handler, tenantOverrides?, now? })` returns `{ listen(port), handle(req), recordUsage(tenantId, delta), usage(tenantId), getAuditLog(tenant) }`. Listens via `Bun.serve` on `127.0.0.1:<port>`. Auth: HS256 JWT (verifier inline using `node:crypto`'s `createHmac` + `timingSafeEqual`); claims must include `tenant_id` and pass `validateTenantId`. `iat` not-future + `exp` not-past enforced. Every authenticated request runs inside `withTenant(tenant, ...)` and writes a `gateway_request` audit row. Budget enforcement: `recordUsage` is in-memory; `429 budget_exceeded` returned when `usage.input >= budget.maxInputTokens` or `usage.output >= budget.maxOutputTokens`. Error mapping: `unauthorized → 401`, `forbidden → 403`, `not_found → 404`, `bad_request → 400`, `budget_exceeded → 429`, `internal_error → 500`.
+- **`packages/target-managed`** — `emitManaged(ir)` codegen. Multi-file output: `agent.ts` exporting `runOneTurn({ tenantId, sessionId, input })` over `runChatLoop({ singleTurn: true })`, plus `daemon.ts` that boots `createGatewayServer` from `process.env.PORT` (default 3000) and `process.env.CREWHAUS_GATEWAY_JWT_SECRET` (refused if shorter than 16 chars). Per-tenant overrides emit budget-only customisations (`maxInputTokens`, `maxOutputTokens`); other fields use `buildTenant` defaults. Graceful shutdown on SIGTERM/SIGINT.
+- **Spec/IR/compiler** — `target: "managed"` schema with `agent: { model, instructions }` and `tenants: [{ id, budget: { maxInputTokens, maxOutputTokens } }]`. `IrManagedV0` mirrors the shape; compiler dispatches `case "managed"` to `emitManaged`.
+
+### End-to-end smoke (`scripts/section-20-smoke.ts`)
+
+1. Compile `examples/hello-managed`, generate a fresh 32-byte HS256 secret, pick a free port, boot the daemon with `CREWHAUS_GATEWAY_JWT_SECRET` + `CREWHAUS_TENANTS_ROOT` + `PORT` env.
+2. tenant-a `runs.create` → 200, run dispatched into runChatLoop, response carries `tenantId: "tenant-a"`.
+3. tenant-b `runs.create` → 200; `<tenantsRoot>/tenant-a/audit/*.jsonl` and `<tenantsRoot>/tenant-b/audit/*.jsonl` are distinct files (proves tenancy isolation at the storage layer).
+4. tenant-a's audit chain verifies cleanly (3 records: `gateway_request` + `policy_decision` + `model_call`); tampering one byte of line 2's payload makes the inline `verifyChain` report `line=2, hash mismatch`.
+5. Expired JWT (`exp` 60 s in the past) → 401, audit chain length unchanged.
+6. Send a 420k-character prompt to exhaust tenant-a's 100k input-token budget; the next request returns 429 `budget_exceeded`.
+7. SIGTERM the daemon; cleanup the temp tenants root.
 
 ---
 

@@ -172,6 +172,33 @@ export type IrChannelV0 = {
 };
 
 /**
+ * Section 20 — Managed daemon IR. Carries the agent block, the
+ * tenant table, and any per-tenant policy / budget overrides. The
+ * `target-managed` codegen consumes this to emit `daemon.ts` +
+ * `agent.ts` files.
+ */
+export type IrManagedTenant = {
+  readonly id: string;
+  readonly budget: {
+    readonly maxInputTokens: number;
+    readonly maxOutputTokens: number;
+  };
+};
+
+export type IrManagedV0 = {
+  readonly version: 0;
+  readonly name: string;
+  readonly target: "managed";
+  readonly agent: {
+    readonly model: string;
+    readonly instructions: string;
+  };
+  readonly tenants: readonly IrManagedTenant[];
+  readonly permissions: IrPermissions;
+  readonly compaction: IrCompaction;
+};
+
+/**
  * Section 19 — Graph IR. A `target: "graph"` spec lowers into a fixed
  * set of LLM-backed nodes plus the edges that connect them.
  */
@@ -206,7 +233,7 @@ export type IrGraphV0 = {
 };
 
 /** Discriminated union over every supported target IR. */
-export type IrNode = IrV0 | IrWorkflowV0 | IrChannelV0 | IrGraphV0;
+export type IrNode = IrV0 | IrWorkflowV0 | IrChannelV0 | IrGraphV0 | IrManagedV0;
 
 /**
  * The output of compilation: a set of files to be written to disk by the
