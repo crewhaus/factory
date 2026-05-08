@@ -204,9 +204,10 @@ export function createTaskTool(opts: CreateTaskToolOptions = {}): RegisteredTool
     destructive: false,
     execute: async (input, ctx) => {
       const bridge = ctx?.bridge as RuntimeBridge | undefined;
-      if (bridge === undefined) {
+      if (bridge === undefined || bridge.spawnSubAgent === undefined) {
         return "[Task error] runtime bridge is not available — Task can only be invoked from runChatLoop with sub-agent support enabled.";
       }
+      const spawnSubAgent = bridge.spawnSubAgent;
       let def: SubAgentDefinition;
       try {
         def = resolveSubAgentDefinition(input.subagent_type, opts);
@@ -231,7 +232,7 @@ export function createTaskTool(opts: CreateTaskToolOptions = {}): RegisteredTool
         ...(bridge.sessionRootDir !== undefined ? { sessionRootDir: bridge.sessionRootDir } : {}),
       };
 
-      const result = await bridge.spawnSubAgent(parentHandle, {
+      const result = await spawnSubAgent(parentHandle, {
         def,
         prompt: input.prompt,
         permissionMode: childPerms.mode,

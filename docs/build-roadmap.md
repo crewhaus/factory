@@ -1372,7 +1372,7 @@ Drives `examples/hello-rag` (5 seed docs about CrewHaus target shapes) against t
 
 ## Section 22 — CRW target shape (multi-agent crew)
 
-> Status: 🟡 next up. Parallelisable with Section 23 (no shared files).
+> Status: ✅ complete (2026-05-08). Shipped: `agent-handoff`, `a2a-protocol`, `crew-orchestrator`, `target-crew`; `target: "crew"` variant on `spec`/`ir`/`compiler`; `examples/hello-crew/`; `scripts/section-22-smoke.ts`. Smoke (live model): researcher → writer handoff, writer → critic A2A question, crew_done with substantive output, refusal-loop guard trips at depth 2, traceparent shared across all roles.
 
 **Catalog modules:** `agent-handoff` (R10), `a2a-protocol` (R10), `crew-orchestrator` (R10), `target-crew` (F2)
 

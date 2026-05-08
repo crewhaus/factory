@@ -9,8 +9,11 @@
  */
 
 export type {
+  A2AMessageEvent,
   CompactionFiredEvent,
+  CrewDoneEvent,
   ErrorRecoveredEvent,
+  HandoffEvent,
   HookFiredEvent,
   McpCallEndEvent,
   McpCallStartEvent,
@@ -21,12 +24,15 @@ export type {
   PermissionDecisionEvent,
   PublishOptions,
   RecentQuery,
+  RoleEndEvent,
+  RoleStartEvent,
   Span,
   SubAgentEndEvent,
   SubAgentStartEvent,
   Subscriber,
   ToolCallEndEvent,
   ToolCallStartEvent,
+  ToolStreamChunkEvent,
   TraceEvent,
   TraceEventEnvelope,
   TraceEventKind,

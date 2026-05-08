@@ -125,14 +125,57 @@ export type SpawnSubAgentOptions = {
 };
 
 /**
+ * Section 22 — Crew mailbox. Implemented by `crew-orchestrator`; consumed
+ * by the `Handoff` tool (`@crewhaus/agent-handoff`) and the in-crew
+ * `SendMessage` tool (`@crewhaus/a2a-protocol`). Type-only here so the
+ * orchestrator can sit downstream of the bridge surface without cycling
+ * back through `agent-context-isolation`.
+ *
+ * Design notes:
+ *   - `requestHandoff` enqueues a baton-pass for the orchestrator to pick
+ *     up after the current role's turn ends; the role's tool simply
+ *     records intent and lets the model emit a clean end_turn.
+ *   - `sendA2A` is a synchronous "RPC to peer" — the orchestrator runs the
+ *     target role inline with the payload as input and returns the reply
+ *     as the tool result. Depth-limited to prevent infinite recursion.
+ *   - `currentRole` lets tools annotate trace events without the
+ *     orchestrator having to re-stamp their inputs.
+ *   - `currentTraceparent` lets the A2A envelope advertise the W3C trace
+ *     context so OTel stitches the entire crew under one trace id.
+ */
+export interface CrewMailbox {
+  /** Roles registered on the crew at compile time. Used by tools for input validation + descriptions. */
+  readonly knownRoles: ReadonlyArray<string>;
+  /** Role currently running. Set by the orchestrator before each role's runChatLoop turn. */
+  currentRole(): string;
+  /** W3C `traceparent` for the crew's current span — embedded in every A2A envelope. */
+  currentTraceparent(): string;
+  /** Queue a handoff. The orchestrator picks it up after the current turn ends. */
+  requestHandoff(target: string, reason: string, context?: unknown): void;
+  /**
+   * Synchronous peer messaging — runs `toRole` inline with `payload` as
+   * input and returns the role's terminal assistant text. Throws on
+   * unknown role; returns an error string when the per-call recursion
+   * limit is hit.
+   */
+  sendA2A(toRole: string, payload: string): Promise<string>;
+}
+
+/**
  * Opaque bag the runtime hands to framework-aware tools through
  * `ToolExecuteContext.bridge`. The `Task` tool casts the unknown bridge to
  * this shape. Every field is read-only; the bridge is built once per run.
+ *
+ * `spawnSubAgent` is optional because Section 22's CRW orchestrator
+ * builds bridges that have no Task-tool wiring (crew uses Handoff +
+ * SendMessage instead). Tools that depend on `spawnSubAgent` MUST
+ * check for undefined before calling it.
  */
 export type RuntimeBridge = ParentRunHandle & {
   readonly hooks: ReadonlyArray<HookDef>;
   readonly subAgents?: ReadonlyMap<string, SubAgentDefinition>;
-  readonly spawnSubAgent: SpawnSubAgentFn;
+  readonly spawnSubAgent?: SpawnSubAgentFn;
+  readonly crewMailbox?: CrewMailbox;
 };
 
 /**

@@ -1,0 +1,20 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "references": [
+    { "path": "../a2a-protocol" },
+    { "path": "../agent-context-isolation" },
+    { "path": "../agent-handoff" },
+    { "path": "../errors" },
+    { "path": "../event-log" },
+    { "path": "../permission-engine" },
+    { "path": "../run-context" },
+    { "path": "../runtime-core" },
+    { "path": "../tool-catalog" },
+    { "path": "../trace-event-bus" }
+  ],
+  "include": ["src/**/*"]
+}

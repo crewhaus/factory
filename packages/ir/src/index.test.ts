@@ -239,6 +239,8 @@ describe("IrNode discriminated union narrowing", () => {
           return `managed:${n.tenants.length}`;
         case "pipeline":
           return `pipeline:${n.indexing.documents.length}`;
+        case "crew":
+          return `crew:${n.roles.length}`;
       }
     }
 
