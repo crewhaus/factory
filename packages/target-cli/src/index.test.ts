@@ -13,6 +13,7 @@ function baseIr(overrides: Partial<IrV0> = {}): IrV0 {
     mcp_servers: {},
     permissions: { rules: [] },
     subAgents: [],
+    compaction: {},
     ...overrides,
   };
 }

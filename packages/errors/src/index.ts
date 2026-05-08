@@ -7,7 +7,14 @@
  * its full cause chain via `toJSON()` for the logging layer.
  */
 
-export type ErrorCode = "spec_parse" | "compiler" | "runtime" | "config" | "tool" | "mcp";
+export type ErrorCode =
+  | "spec_parse"
+  | "compiler"
+  | "runtime"
+  | "config"
+  | "tool"
+  | "mcp"
+  | "adapter";
 
 export type SerializedError = {
   name: string;
@@ -83,4 +90,27 @@ export class McpConnectionError extends McpError {
 
 export class McpProtocolError extends McpError {
   override readonly name = "McpProtocolError";
+}
+
+/**
+ * Section 17 — base for all model-provider adapter failures (auth, request
+ * marshalling, stream parsing, network). Carries `providerId` so callers can
+ * branch on which adapter raised; `cause` keeps the underlying SDK error
+ * accessible via `toJSON()` for the trace/log layer.
+ */
+export class AdapterError extends CrewhausError {
+  override readonly name: string = "AdapterError";
+  readonly providerId: string;
+  constructor(providerId: string, message: string, cause?: unknown) {
+    super("adapter", message, cause);
+    this.providerId = providerId;
+  }
+}
+
+/**
+ * Section 17 — missing or invalid credentials for a model provider. Surfaces
+ * with a setup hint pointing at the relevant env var.
+ */
+export class ProviderAuthError extends AdapterError {
+  override readonly name = "ProviderAuthError";
 }

@@ -94,6 +94,19 @@ const subAgentsBlock = z.record(z.string().min(1), subAgentDefinitionSchema).opt
  */
 const toolConfigBlock = z.record(z.string().min(1), z.unknown()).optional();
 
+/**
+ * Section 17 — optional override for the model used by
+ * `compaction-autocompact` when summarising long conversations. Defaults
+ * to the agent's primary model when omitted, but you can target a
+ * cheaper/faster model (or a different provider) for compaction.
+ */
+const compactionBlock = z
+  .object({
+    model: z.string().min(1).optional(),
+  })
+  .strict()
+  .optional();
+
 const cliSchema = z
   .object({
     name: z.string().min(1),
@@ -109,6 +122,7 @@ const cliSchema = z
     tool_config: toolConfigBlock,
     mcp_servers: mcpServersBlock,
     permissions: permissionsBlock,
+    compaction: compactionBlock,
   })
   .strict();
 
@@ -130,6 +144,7 @@ const workflowSchema = z
     steps: z.array(workflowStepSchema).min(1),
     mcp_servers: mcpServersBlock,
     permissions: permissionsBlock,
+    compaction: compactionBlock,
   })
   .strict();
 
@@ -179,6 +194,7 @@ const channelSchema = z
     routing: routingBlock,
     mcp_servers: mcpServersBlock,
     permissions: permissionsBlock,
+    compaction: compactionBlock,
   })
   .strict();
 
@@ -193,6 +209,7 @@ export type SpecChannelAgent = z.infer<typeof channelAgentSchema>;
 export type SpecSlackChannel = z.infer<typeof slackChannelSchema>;
 export type SpecMcpServerConfig = z.infer<typeof mcpServerConfigSchema>;
 export type SpecSubAgentDefinition = z.infer<typeof subAgentDefinitionSchema>;
+export type SpecCompactionBlock = z.infer<typeof compactionBlock>;
 
 export { SpecParseError };
 

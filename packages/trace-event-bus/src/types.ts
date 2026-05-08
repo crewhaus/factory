@@ -31,9 +31,18 @@ export type TurnEndEvent = TraceEventEnvelope & {
   durationMs: number;
 };
 
+/**
+ * Section 17 — `provider` identifies which adapter handled the request
+ * so the OTel exporter can populate `gen_ai.system` correctly. Optional
+ * for backwards-compat with code paths that haven't been threaded
+ * through the router yet; defaults to "anthropic" when absent.
+ */
+export type ProviderId = "anthropic" | "openai" | "gemini" | "bedrock";
+
 export type ModelRequestEvent = TraceEventEnvelope & {
   kind: "model_request";
   model: string;
+  provider?: ProviderId;
   messageCount: number;
   toolCount: number;
   streaming: boolean;
@@ -49,6 +58,7 @@ export type ModelUsage = {
 export type ModelResponseEvent = TraceEventEnvelope & {
   kind: "model_response";
   model: string;
+  provider?: ProviderId;
   stopReason: string;
   usage: ModelUsage;
   durationMs: number;

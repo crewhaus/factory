@@ -1,0 +1,24 @@
+{
+  "name": "@crewhaus/model-router",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Resolve agent.model strings to a lazy-loaded ProviderAdapter (Section 17)",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@crewhaus/adapter-anthropic": "workspace:*",
+    "@crewhaus/errors": "workspace:*"
+  },
+  "optionalDependencies": {
+    "@crewhaus/adapter-bedrock": "workspace:*",
+    "@crewhaus/adapter-gemini": "workspace:*",
+    "@crewhaus/adapter-openai": "workspace:*"
+  }
+}

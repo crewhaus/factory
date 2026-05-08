@@ -26,7 +26,7 @@
  * Section 15 will plumb real token usage through; today we stamp a zero
  * placeholder so the result type is stable.
  */
-import type Anthropic from "@anthropic-ai/sdk";
+import type { ProviderAdapter } from "@crewhaus/adapter-anthropic";
 import {
   type CreateIsolatedContextOptions,
   type IsolatedContext,
@@ -105,9 +105,7 @@ export async function spawnSubAgent(
       installSigintHandler: false,
       maxTokens: parent.maxTokens,
       ...(sessionRootDir !== undefined ? { sessionRootDir } : {}),
-      ...(opts._client !== undefined
-        ? { client: opts._client as Anthropic, isOAuth: opts._isOAuth }
-        : {}),
+      ...(opts._client !== undefined ? { _adapter: opts._client as ProviderAdapter } : {}),
     });
   } catch (err) {
     isError = true;

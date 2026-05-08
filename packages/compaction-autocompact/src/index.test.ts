@@ -1,44 +1,82 @@
 import { describe, expect, test } from "bun:test";
 import type Anthropic from "@anthropic-ai/sdk";
+import type { ProviderAdapter, StreamEvent } from "@crewhaus/adapter-anthropic";
 import { RuntimeError } from "@crewhaus/errors";
 import { autoCompact } from "./index";
 
-type CreateArgs = {
-  model: string;
-  max_tokens: number;
-  messages: Anthropic.MessageParam[];
-};
+/**
+ * Synthesise an `AsyncIterable<StreamEvent>` from a single text block
+ * (mirrors what `client.messages.create` used to deliver as
+ * `response.content`).
+ */
+function streamWithText(...texts: string[]): AsyncIterable<StreamEvent> {
+  return (async function* () {
+    yield { kind: "message_start" };
+    let idx = 0;
+    for (const text of texts) {
+      const i = idx++;
+      yield {
+        kind: "content_block_start",
+        index: i,
+        block: { type: "text", text: "" },
+      };
+      yield {
+        kind: "content_block_delta",
+        index: i,
+        delta: { type: "text_delta", text },
+      };
+      yield { kind: "content_block_stop", index: i };
+    }
+    yield { kind: "message_delta", stopReason: "end_turn" };
+    yield { kind: "message_stop" };
+  })();
+}
 
-function makeStubClient(response: Pick<Anthropic.Message, "content">): {
-  client: Anthropic;
-  lastArgs: () => CreateArgs | undefined;
+function streamWithEmptyContent(): AsyncIterable<StreamEvent> {
+  return (async function* () {
+    yield { kind: "message_start" };
+    yield { kind: "message_delta", stopReason: "end_turn" };
+    yield { kind: "message_stop" };
+  })();
+}
+
+type CapturedReq = Parameters<ProviderAdapter["stream"]>[0];
+
+function makeStubAdapter(stream: () => AsyncIterable<StreamEvent>): {
+  adapter: ProviderAdapter;
+  lastReq: () => CapturedReq | undefined;
   callCount: () => number;
 } {
   let count = 0;
-  let lastArgs: CreateArgs | undefined;
-  const client = {
-    messages: {
-      create: async (args: CreateArgs) => {
-        count++;
-        lastArgs = args;
-        return response as Anthropic.Message;
-      },
+  let lastReq: CapturedReq | undefined;
+  const adapter: ProviderAdapter = {
+    providerId: "anthropic",
+    features: {
+      caching: "explicit",
+      tool_use: true,
+      vision: true,
+      thinking: true,
+      web_search: true,
     },
-  } as unknown as Anthropic;
-  return { client, lastArgs: () => lastArgs, callCount: () => count };
+    stream(req) {
+      count++;
+      lastReq = req;
+      return stream();
+    },
+    estimateTokens: () => 0,
+  };
+  return { adapter, lastReq: () => lastReq, callCount: () => count };
 }
 
 describe("autoCompact", () => {
   test("returns [user-marker, assistant-summary] tuple", async () => {
-    const { client } = makeStubClient({
-      content: [{ type: "text", text: "summary stub", citations: null }],
-    });
+    const { adapter } = makeStubAdapter(() => streamWithText("summary stub"));
     const messages: Anthropic.MessageParam[] = [
       { role: "user", content: "hello" },
       { role: "assistant", content: "hi" },
     ];
 
-    const result = await autoCompact(messages, client, "claude-opus-4-7");
+    const result = await autoCompact(messages, adapter, "claude-opus-4-7");
 
     expect(result.length).toBe(2);
     expect(result[0]?.role).toBe("user");
@@ -47,56 +85,45 @@ describe("autoCompact", () => {
     expect(result[1]).toEqual({ role: "assistant", content: "summary stub" });
   });
 
-  test("forwards the model id to the client", async () => {
-    const { client, lastArgs } = makeStubClient({
-      content: [{ type: "text", text: "x", citations: null }],
-    });
-    await autoCompact([], client, "claude-opus-4-7");
-    expect(lastArgs()?.model).toBe("claude-opus-4-7");
+  test("forwards the model id to the adapter", async () => {
+    const { adapter, lastReq } = makeStubAdapter(() => streamWithText("x"));
+    await autoCompact([], adapter, "claude-opus-4-7");
+    expect(lastReq()?.model).toBe("claude-opus-4-7");
   });
 
   test("appends the summarization request after the original messages", async () => {
-    const { client, lastArgs } = makeStubClient({
-      content: [{ type: "text", text: "x", citations: null }],
-    });
+    const { adapter, lastReq } = makeStubAdapter(() => streamWithText("x"));
     const messages: Anthropic.MessageParam[] = [
       { role: "user", content: "first" },
       { role: "assistant", content: "second" },
     ];
-    await autoCompact(messages, client, "m");
-    const args = lastArgs();
-    expect(args).toBeDefined();
-    if (!args) throw new Error("unreachable");
-    expect(args.messages.length).toBe(3);
-    expect(args.messages[0]).toEqual({ role: "user", content: "first" });
-    expect(args.messages[1]).toEqual({ role: "assistant", content: "second" });
-    expect(args.messages[2]?.role).toBe("user");
-    expect(args.messages[2]?.content as string).toContain("Summarize");
+    await autoCompact(messages, adapter, "m");
+    const req = lastReq();
+    expect(req).toBeDefined();
+    if (!req) throw new Error("unreachable");
+    expect(req.messages.length).toBe(3);
+    expect(req.messages[0]).toEqual({ role: "user", content: "first" });
+    expect(req.messages[1]).toEqual({ role: "assistant", content: "second" });
+    expect(req.messages[2]?.role).toBe("user");
+    expect(req.messages[2]?.content as string).toContain("Summarize");
   });
 
   test("does not mutate the input messages", async () => {
-    const { client } = makeStubClient({
-      content: [{ type: "text", text: "x", citations: null }],
-    });
+    const { adapter } = makeStubAdapter(() => streamWithText("x"));
     const messages: Anthropic.MessageParam[] = [{ role: "user", content: "a" }];
     const before = messages.length;
-    await autoCompact(messages, client, "m");
+    await autoCompact(messages, adapter, "m");
     expect(messages.length).toBe(before);
   });
 
   test("throws RuntimeError when the response has no text block", async () => {
-    const { client } = makeStubClient({ content: [] });
-    await expect(autoCompact([], client, "m")).rejects.toBeInstanceOf(RuntimeError);
+    const { adapter } = makeStubAdapter(() => streamWithEmptyContent());
+    await expect(autoCompact([], adapter, "m")).rejects.toBeInstanceOf(RuntimeError);
   });
 
   test("uses the first text block when multiple are present", async () => {
-    const { client } = makeStubClient({
-      content: [
-        { type: "text", text: "first text", citations: null },
-        { type: "text", text: "second text", citations: null },
-      ],
-    });
-    const result = await autoCompact([], client, "m");
+    const { adapter } = makeStubAdapter(() => streamWithText("first text", "second text"));
+    const result = await autoCompact([], adapter, "m");
     expect(result[1]).toEqual({ role: "assistant", content: "first text" });
   });
 });

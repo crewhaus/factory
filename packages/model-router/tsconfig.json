@@ -1,0 +1,15 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "references": [
+    { "path": "../adapter-anthropic" },
+    { "path": "../adapter-bedrock" },
+    { "path": "../adapter-gemini" },
+    { "path": "../adapter-openai" },
+    { "path": "../errors" }
+  ],
+  "include": ["src/**/*"]
+}

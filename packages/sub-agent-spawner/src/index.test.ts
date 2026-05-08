@@ -38,21 +38,70 @@ async function makeParent(rootDir: string): Promise<{
   return { parent, parentLog: eventLog, abort: () => ac.abort() };
 }
 
-/** Scripted Anthropic stub mirroring the runtime-core test helper. */
-function makeScriptedClient(scripts: ReadonlyArray<Anthropic.ContentBlock[]>): Anthropic {
+/**
+ * Section 17 — scripted ProviderAdapter that synthesises canonical
+ * StreamEvents from pre-baked Anthropic content blocks.
+ */
+function makeScriptedClient(
+  scripts: ReadonlyArray<Anthropic.ContentBlock[]>,
+): import("@crewhaus/adapter-anthropic").ProviderAdapter {
   let i = 0;
   return {
-    messages: {
-      stream: () => {
-        const content = scripts[Math.min(i, scripts.length - 1)] ?? [];
-        i++;
-        return {
-          on: () => {},
-          finalMessage: async () => ({ content, stop_reason: "end_turn" }),
-        };
-      },
+    providerId: "anthropic",
+    features: {
+      caching: "explicit",
+      tool_use: true,
+      vision: true,
+      thinking: true,
+      web_search: true,
     },
-  } as unknown as Anthropic;
+    estimateTokens: () => 0,
+    stream: () => {
+      const content = scripts[Math.min(i, scripts.length - 1)] ?? [];
+      i++;
+      const hasToolUse = content.some((b) => b.type === "tool_use");
+      return (async function* () {
+        yield { kind: "message_start" } as const;
+        for (let idx = 0; idx < content.length; idx++) {
+          const block = content[idx];
+          if (block === undefined) continue;
+          if (block.type === "text") {
+            yield {
+              kind: "content_block_start",
+              index: idx,
+              block: { type: "text", text: "" },
+            } as const;
+            yield {
+              kind: "content_block_delta",
+              index: idx,
+              delta: { type: "text_delta", text: block.text },
+            } as const;
+            yield { kind: "content_block_stop", index: idx } as const;
+          } else if (block.type === "tool_use") {
+            yield {
+              kind: "content_block_start",
+              index: idx,
+              block: { type: "tool_use", id: block.id, name: block.name, input: {} },
+            } as const;
+            yield {
+              kind: "content_block_delta",
+              index: idx,
+              delta: {
+                type: "input_json_delta",
+                partial_json: JSON.stringify(block.input ?? {}),
+              },
+            } as const;
+            yield { kind: "content_block_stop", index: idx } as const;
+          }
+        }
+        yield {
+          kind: "message_delta",
+          stopReason: hasToolUse ? "tool_use" : "end_turn",
+        } as const;
+        yield { kind: "message_stop" } as const;
+      })();
+    },
+  };
 }
 
 const DEF_NO_TOOLS: SubAgentDefinition = {

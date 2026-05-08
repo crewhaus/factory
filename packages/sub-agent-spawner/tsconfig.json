@@ -5,6 +5,7 @@
     "outDir": "dist"
   },
   "references": [
+    { "path": "../adapter-anthropic" },
     { "path": "../agent-context-isolation" },
     { "path": "../event-log" },
     { "path": "../permission-engine" },

@@ -6,10 +6,11 @@
   },
   "include": ["src/**/*"],
   "references": [
+    { "path": "../adapter-anthropic" },
     { "path": "../errors" },
     { "path": "../eval-dataset" },
     { "path": "../eval-grader" },
     { "path": "../logging" },
-    { "path": "../runtime-core" }
+    { "path": "../model-router" }
   ]
 }
