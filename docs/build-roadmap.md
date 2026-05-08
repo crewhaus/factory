@@ -1,25 +1,24 @@
 # CrewHaus Factory — Build Roadmap
 
-> Status as of 2026-05-08. **All 31 roadmap sections complete.** 138+ of ~190 catalog modules implemented across 127 workspace packages; 12 target shapes ship; production hardening floor + deployment surface + evaluation depth + backend adapter completions + Studio v1 are all merged. The v1.0 product surface plus all production-ops, eval-depth, adapter, and Studio polish are in.
+> Status as of 2026-05-08. **All 31 roadmap sections complete — v1.0 product surface fully landed.** 143 of ~190 catalog modules across 127 workspace packages; 1857 tests across ~140 test files, all green; `tsc -b` clean; `biome check` clean. **12 target shapes ship today** (cli/workflow/channel/graph/managed/pipeline/crew/research/batch/voice/browser/eval). Sections 32–35 below scope the v1.1 phase: distribution + packaging (Docker/Helm/single-binary), channel adapter breadth (Telegram/Discord/WhatsApp/iMessage), federation across CrewHaus deployments, and IDE-class developer-experience tooling.
 > See `docs/MODULE-CATALOG.md` for full per-module specs, test layer references, and the per-row `Depends on` columns + 🔴/🟡 risk markers used throughout this roadmap.
 
 ---
 
 ## Critical path & risk overview
 
-Sections 1–26 are landed. **All 11 target shapes ship today** (CLI, workflow, channel, graph, managed, pipeline, crew, research, batch, voice, browser) on top of a complete tool framework, multi-provider model layer, persistence, observability, eval stack, sub-agents, production safety floor, and Studio authoring + trace-inspection UI. The v1.0 product surface is complete — every shape claimed at project inception is reachable from a single spec.
+Sections 1–31 are landed. **The v1.0 product surface is complete**: 12 target shapes ship (CLI / workflow / channel / graph / managed / pipeline / crew / research / batch / voice / browser / eval), every backend slot has a real implementation (queue / vector / embedder / telephony / realtime / browser-driver), production-grade hardening is in (cost / rate-limit / circuit-break / cache rotation / secrets rotation), continuous deployment with canary + eval-gate works, and Studio v1 ships with Lit + Monaco + live SSE replay + content-sandboxed plugins.
 
-The remaining roadmap is about **hardening what shipped** rather than adding new product surface. Five themes remain, each scoped as its own section:
+The remaining roadmap is no longer about **what** the factory can build — every shape and adapter ships — but about **distribution, breadth, and ecosystem**. Four themes for v1.1, each scoped as its own section:
 
-- **Section 27 (Production hardening)** lands the cross-cutting controls that make a deployment safe to put in front of paying users: `cost-tracker` (per-run/per-tenant cost accumulation), `rate-limiter` (token-bucket per tenant/provider/tool), `circuit-breaker` (half-open state on unhealthy providers, composing with `model-router` failover), `prompt-cache-manager` (rotation across long-running CHN/MGD/RES daemons), and `secrets-manager` (OAuth/API-key/AWS rotation without daemon restart).
-- **Section 28 (Deployment + canary + migration)** turns the factory into a continuous-deployment surface: `deployment-controller` (version pinning, staging→prod promotion), `canary-controller` (percent-of-traffic rollout gated by `eval-runner` regression checks — the deploy-as-eval-gate pattern called out in PART F #10), `migration-runner` (versioned IR migrations across spec versions), `spec-registry` (multi-version spec storage with tenant overlays), `ir-passes` (optimization passes — dead-tool elimination, prompt-cache prefix sorting), and `migration-engine` (forward + backward IR migration paths).
-- **Section 29 (Evaluation depth + EVAL target shape)** closes the quality loop: `prompt-optimizer` (DSPy-style automated prompt tuning using §16 eval stack as the fitness function), `regression-runner` (diff-based pass/fail flip detection on every CI run), `target-eval-bundle` (first-class EVAL target shape — today eval is `crewhaus eval` only), `dataset-registry` (split-aware dataset versioning), `grader-registry` (pluggable graders beyond the §16 built-in set).
-- **Section 30 (Backend adapter completions)** fills out the v0-stub adapters: SQS / Redis Streams / Postgres queue adapters (today only `in-memory`), Lance / Qdrant / Pinecone / Weaviate vector backends (today only `in-memory`), OpenAI / Voyage / Cohere embedder backends (today the production paths are wired but lightly exercised), Twilio / LiveKit SIP telephony adapters (today only the in-memory smoke adapter), Vapi realtime adapter (today only OpenAI Realtime ships), browser `host` + `remote` backends (today only `chromium` ships).
-- **Section 31 (Studio v1 — Lit + Monaco + run replay + plugin sandbox completion)** turns the §26 Studio v0 into a production UI: Lit framework adoption (replaces the vanilla TS bundle), Monaco editor for spec YAML editing with live `spec-validator` lint, full SSE-driven live trace drilldown wired to `runChatLoop`, run-replay mode using §10 event-log to reconstruct any prior run, multi-spec dashboard with aggregate cost/latency, and full plugin-sandbox content isolation (Web Workers / Realm shim — today the §26 sandbox guard only checks file:// path escapes).
+- **Section 32 (Distribution & packaging)** gets the system off the dev workspace and into real deployments: per-target-shape slim Docker images (`docker-images`), a Helm chart for Kubernetes rollouts (`helm-chart`), a single-binary CLI build via `bun build --compile` (`single-binary-cli`) so `homebrew`/`apt`/`scoop`/`winget` can distribute it, and a `crewhaus-cloud` recipe (managed-as-a-service shape combining target-managed + the §32 helm-chart). This is the sequential prereq for every cloud rollout and CI integration that's been deferred.
+- **Section 33 (Channel adapter breadth)** broadens CHN beyond Slack: `channel-adapter-telegram`, `channel-adapter-discord`, `channel-adapter-whatsapp` (Business API), `channel-adapter-imessage` (mac-host-only). Each is independent and parallelisable; each follows the §12 Slack adapter pattern (HMAC verification, idempotent dispatch, per-thread session resumption) so the framework cost is low.
+- **Section 34 (Federation — multi-deployment A2A)** turns one CrewHaus deployment into a participant in a network: `federation-protocol` (mTLS-secured A2A across deployments), `federation-discovery` (DNS SRV / `.well-known/crewhaus.json` lookup), `federation-router` (route a Task or SendMessage to a remote crew as if local). Crew-of-crews — one org's research agent can call another org's domain expert; multi-tenant agent marketplaces become tractable.
+- **Section 35 (Developer-experience tooling)** ships IDE-class authoring: `vscode-extension` (spec authoring + inline trace inspection + run-from-editor), `jetbrains-plugin` (parity for IntelliJ/WebStorm/PyCharm users), `crewhaus-playground` (browser-based REPL — try a spec without installing anything; runs against a hosted CrewHaus deployment).
 
-**Parallelisation:** Sections 27 and 30 are independent — production controls and adapter completions touch disjoint code. Section 28 depends on §27's `rate-limiter` for canary traffic shaping. Section 29 is independent of all four others. Section 31 is best done last because every prior section's new IR/event kinds want to render in Studio.
+**Parallelisation:** Sections 32 and 33 are fully independent (distribution + new channel adapters touch disjoint code). Section 34 depends on §32's `docker-images` for cross-deployment communication via real network endpoints. Section 35 is independent of all three but composes with §32's `single-binary-cli` for editor-extension installation footprint.
 
-Beyond Section 31, the remaining ~70 catalog modules are second-tier polish: more channel adapters (Telegram, Discord, WhatsApp, iMessage), more graders, more deployment frontends, more language sandbox images. These can land opportunistically against shipped infrastructure and don't warrant dedicated roadmap sections.
+Beyond Section 35, the remaining ~50 catalog modules are second-tier polish: more language sandbox images (Go, Rust, Java, Ruby), more graders + datasets, more telemetry exporters (Datadog / Honeycomb / Splunk), spec template marketplace, mobile-target shapes (iOS/Android bundles for native app embedding). These can land opportunistically against shipped infrastructure and don't warrant dedicated roadmap sections.
 
 ## Section dependency graph
 
@@ -137,12 +136,16 @@ Tool surface expansion (✅ §14) ──► Observability (✅ §15)
 | **§29 Evaluation depth + EVAL target shape** | ✅ | §16 (eval stack), §17 (multi-provider model-router for judge swaps) | EVAL target shape, prompt-optimizer regression CI, dataset/grader plugin ecosystem |
 | **§30 Backend adapter completions** | ✅ | §17 base adapter shapes; §21 vector-store interface; §23 queue-protocol interface; §24 telephony slot; §25 driver interface | Production CHN/MGD/RES/VOICE/BROW deployments without v0 stub limits |
 | **§31 Studio v1** | ✅ | every prior section's IR / trace / event / metric kinds | Production authoring UI, run replay, multi-spec dashboards, third-party plugin marketplace |
+| **§32 Distribution & packaging** | 🟡 next, parallel with §33 | §20 (`gateway-server` for hosted `crewhaus-cloud`), §31 (Studio runs inside a container) | §34 (federation needs cross-deployment networking), homebrew/apt/scoop/winget distribution, k8s rollouts |
+| **§33 Channel adapter breadth** | 🟡 next, parallel with §32 | §12 (channel-adapter-base interface) | Multi-channel CHN deployments, customer-facing bots outside Slack |
+| **§34 Federation (multi-deployment A2A)** | 🟡 sequential after §32 (uses `docker-images`) | §32 (`docker-images`), §22 (`a2a-protocol` interface), §20 (mTLS auth pattern) | Crew-of-crews, multi-org agent ecosystems, MGD federation, agent marketplaces |
+| **§35 Developer experience tooling** | 🟡 independent | §32 (`single-binary-cli` for extension installs), §31 (Studio as VS Code webview embed) | Editor adoption, spec-as-code workflows, onboarding funnel, docs-site interactivity |
 
 ---
 
 ## Current baseline
 
-**All 11 target shapes ship today.** The compiler pipeline (spec → IR → codegen) handles every shape via a discriminated-union `IrNode = IrV0 | IrWorkflowV0 | IrChannelV0 | IrGraphV0 | IrManagedV0 | IrPipelineV0 | IrCrewV0 | IrResearchV0 | IrBatchV0 | IrVoiceV0 | IrBrowserV0`. Sections 1–17 built the foundation (tool framework, persistence, hooks/skills/slash, sub-agents + Task tool, expanded tool catalogue, observability, eval stack, multi-provider model layer); Sections 18–21 added the production safety floor and the GRPH/MGD/RAG target shapes; Sections 22–26 added the CRW/RES/BATCH/VOICE/BROW target shapes plus the Studio authoring + trace-inspection UI.
+**All 12 target shapes ship today.** The compiler pipeline (spec → IR → codegen) handles every shape via a discriminated-union `IrNode = IrV0 | IrWorkflowV0 | IrChannelV0 | IrGraphV0 | IrManagedV0 | IrPipelineV0 | IrCrewV0 | IrResearchV0 | IrBatchV0 | IrVoiceV0 | IrBrowserV0 | IrEvalV0`. Sections 1–17 built the foundation; Sections 18–21 added the production safety floor and the GRPH/MGD/RAG target shapes; Sections 22–26 added the CRW/RES/BATCH/VOICE/BROW shapes plus Studio v0; Sections 27–31 hardened production (cost / rate-limit / circuit-break / cache rotation / secrets), shipped continuous deployment with canary + eval-gate, deepened the eval stack with prompt-optimizer + regression-runner + the EVAL target shape (the 12th), filled out every backend adapter slot (queue / vector / telephony / realtime / browser-driver), and lifted Studio to v1 with Lit + Monaco + live SSE replay + content-sandboxed plugins.
 
 What the current stack can now do, end-to-end:
 
@@ -157,15 +160,15 @@ What the current stack can now do, end-to-end:
 - **Batch (queue worker)**: `bun run run:hello-batch` — pulls jobs from in-memory queue (SQS/Redis/Postgres adapters in §30), runs one `runChatLoop({singleTurn:true})` per job, idempotency-keys cache per attempt, SIGTERM drains in-flight, max-retries → DLQ.
 - **Voice (realtime)**: `bun run run:hello-voice -- --smoke <pcm>` — OpenAI Realtime adapter (PCM 16-bit @ 24kHz), VAD over 30 ms frames, barge-in fires `interrupt()` after 4 consecutive speech frames in 200 ms, call-session lifecycle state machine.
 - **Browser (computer-use)**: `bun run run:hello-browser` — chromium-in-Playwright driver, Screenshot/Click/Type/Key/Scroll/FindElement tools, vision-grounding via Claude vision, destructive tools require explicit `alwaysAllow` in default permission mode.
-- **Studio**: `bun run studio` — Bun.serve daemon at `:3000` with spec CRUD, live trace SSE, run inspection, eval-result browser, graph visualiser for IrGraphV0, wizard, plugin SDK.
+- **Studio (v1)**: `bun run studio` — Bun.serve daemon with full Lit + Monaco SPA, live SSE wired to real `runChatLoop` subprocesses, run-replay from §10 event-log, multi-spec dashboard with cost/pass-rate/latency aggregates, content-sandboxed plugin host (Web Workers / Realm shim), `/api/cost-summary` endpoint aggregating §27 cost-tracker output.
+- **Eval (12th target shape)**: `crewhaus eval-bundle` compiles a `target: "eval"` spec to a single `agent.ts` that boots dataset-registry + eval-runner. EVAL is now a deployable artefact, not just a CLI invocation.
 
-What is *not* yet covered (and frames Sections 27–31):
+What is *not* yet covered (and frames Sections 32–35):
 
-- **Cost / rate / circuit / cache / secrets controls.** No `cost-tracker` (today the trace bus carries token counts but no $ aggregation), no `rate-limiter` (today the gateway-server enforces budget but not throughput), no `circuit-breaker` (today provider failures retry per `recovery-engine` but never skip an unhealthy provider), no `prompt-cache-manager` rotation (today the cache lives per-`runChatLoop` only), no `secrets-manager` (today OAuth/API-key/AWS creds are read once at boot). **Section 27 lands these.**
-- **Continuous deployment surface.** No `deployment-controller` (today specs are run from disk, no version pinning), no `canary-controller` (today rollouts are all-or-nothing), no `migration-runner` (today IR version migrations are manual), no `spec-registry` (today specs are single-tenant files), no `ir-passes` (today the IR is emitted verbatim — no dead-tool elimination, no prompt-cache prefix sorting). **Section 28 lands these.**
-- **Evaluation depth.** Today `crewhaus eval` works but is invocation-only — no `prompt-optimizer` (DSPy-style automated tuning), no `regression-runner` (diff-based pass/fail flip detection), no `target-eval-bundle` (first-class EVAL target shape), no `dataset-registry` / `grader-registry` (split-aware versioning + plugin ecosystem). **Section 29 lands these.**
-- **Backend adapter completions.** Multiple v0 stubs are in production paths but only have one backend each: queue (in-memory only — SQS/Redis/Postgres throw "not implemented in v0"), vector-store (in-memory only — Lance/Qdrant/Pinecone/Weaviate stubbed), embedder (production paths exist for OpenAI/Voyage/Cohere but lightly exercised), telephony (in-memory smoke only — Twilio/LiveKit SIP stubbed), realtime (OpenAI Realtime ships, Vapi stub), browser driver (chromium ships, host + remote stubs). **Section 30 lands these completions.**
-- **Studio v1.** Today's Studio v0 ships vanilla TS HTML/JS (no Lit, no Monaco), canned SSE events (`runChatLoop` not yet wired through the SSE), file-system-only spec storage, sandbox-path-only plugin guard (no content sandbox). **Section 31 lands the production UI.**
+- **Distribution & packaging.** Today the system runs out of the dev workspace via `bun run …`. There's no Docker image, no Helm chart, no single-binary build, no `homebrew` / `apt` / `scoop` / `winget` distribution, no `crewhaus-cloud` recipe combining target-managed + deployment-controller + helm-chart. Every cloud rollout, CI integration, and end-user adoption is gated on this. **Section 32 lands the full distribution surface.**
+- **Channel breadth.** Today CHN ships only Slack. No Telegram (`channel-adapter-telegram`), Discord (`channel-adapter-discord`), WhatsApp Business (`channel-adapter-whatsapp`), or iMessage (`channel-adapter-imessage`). Each is a self-contained adapter following the §12 Slack pattern (HMAC verification, idempotent dispatch, per-thread session resumption); the framework cost per new channel is low. **Section 33 lands these.**
+- **Federation.** A CrewHaus deployment is currently isolated — it cannot call agents in another CrewHaus deployment. No `federation-protocol` (mTLS A2A across deployments), no `federation-discovery` (DNS SRV / `.well-known/crewhaus.json`), no `federation-router` (route a Task / SendMessage to a remote crew transparently). Crew-of-crews patterns and multi-org agent ecosystems are out of reach today. **Section 34 lands these.**
+- **IDE-class developer experience.** Spec authoring today is "edit YAML in your editor of choice + `bun apps/cli/src/index.ts compile`". No `vscode-extension` (spec authoring + inline trace + run-from-editor), no `jetbrains-plugin`, no `crewhaus-playground` (browser REPL — try a spec without installing). **Section 35 lands these.**
 
 ---
 
@@ -1954,6 +1957,200 @@ studio-server (SSE wiring)  ──►  studio-ui (Lit + Monaco rewrite)  ──�
 
 ---
 
+## Section 32 — Distribution & packaging
+
+> Status: 🟡 next up. Parallelisable with Section 33. Required prereq for Section 34's cross-deployment networking.
+
+**Catalog modules:** `docker-images` (F3), `helm-chart` (F3), `single-binary-cli` (F3), `crewhaus-cloud` (F3 — composite recipe)
+
+The system runs end-to-end inside the dev workspace. To get into real deployments, Section 32 ships per-target-shape Docker images, a Kubernetes Helm chart, a single-binary CLI build, and a managed-cloud recipe.
+
+### Build order within this section
+
+`docker-images` is the sequential prereq — every other artefact composes on top of it. `single-binary-cli` is independent; can run in parallel. `helm-chart` consumes `docker-images`. `crewhaus-cloud` consumes `helm-chart` + `target-managed`.
+
+```
+docker-images       ──►  helm-chart  ──►  crewhaus-cloud
+single-binary-cli   (parallel)
+```
+
+### What to build
+
+**`packages/docker-images`** — per-target-shape slim images
+- Twelve `Dockerfile`s under `docker/<target>/Dockerfile` (one per shape), each based on `oven/bun:1.2-alpine` with the target's required system deps baked in (e.g. `target/voice` adds `libopus`; `target/browser` adds `chromium`).
+- Multi-stage builds: deps stage → build stage → runtime stage with non-root user + read-only root + `HEALTHCHECK`.
+- `crewhaus build-image <target> --tag <tag>` subcommand wraps `docker buildx build` so users don't need to remember the right Dockerfile path.
+- Image digests pinned in `docker/digests.json` so reproducible builds work without a registry.
+
+**`packages/helm-chart`** — Kubernetes deployment recipe
+- `helm/crewhaus/` chart with templates per target shape; each shape lowers to a `Deployment` + `Service` (and `Ingress` for daemon shapes).
+- Values schema: `target`, `image.tag`, `replicas`, `secrets.<provider>` (wires §27 secrets-manager to k8s `Secret` resources), `gateway.tls.{cert,key}` (wires §20 gateway-server JWT issuance).
+- `helm install crewhaus crewhaus/crewhaus --set target=channel --set channels.slack.signingSecret=$SLACK_SIGNING_SECRET …` is the documented happy path.
+- Includes a `ServiceMonitor` template (Prometheus operator) and an `OpenTelemetryCollector` sidecar so §15 observability flows out of the box.
+
+**`packages/single-binary-cli`** — `bun build --compile` wrapper
+- One command (`bun run build:binary`) produces `dist/crewhaus-{linux,macos,windows}-{x64,arm64}` self-contained binaries (~80 MB each, no Bun/Node prereq on target host).
+- Cross-compile matrix runs in CI on every release tag; binaries uploaded as GitHub release assets.
+- Homebrew formula (`Formula/crewhaus.rb`), apt repo (`packages/single-binary-cli/debian/`), Scoop manifest (`packages/single-binary-cli/scoop.json`), Winget manifest — all auto-generated from the release artefacts.
+
+**`packages/crewhaus-cloud`** — managed-as-a-service recipe
+- Composite: `target: "managed"` + `helm-chart` rendered into a Kustomize overlay + Terraform module (`crewhaus-cloud/terraform/`) provisioning the underlying GKE/EKS/AKS cluster.
+- Default tier: 1× gateway-server, 3× target-managed replicas, 1× studio replica, Postgres for spec-registry, Redis Streams for queue-protocol.
+- `crewhaus cloud deploy --provider aws --region us-east-1` runs the full stack-up; `crewhaus cloud teardown` reverses it.
+- Audit-log persists to S3 (per §20 hash-chained format).
+
+### Tests
+
+- `docker-images`: T2 contract test per target image (boots, exposes the right ports, healthcheck passes); T8 base-image-vuln scan (`trivy image` against each); T7 cold-start time per shape (≤5s for daemon shapes, ≤10s for browser/voice)
+- `helm-chart`: T3 against `kind` cluster — `helm install` round-trip per target shape; T4 upgrade replay (v1 → v2 chart with rolling restart); T8 RBAC minimal-permissions check
+- `single-binary-cli`: T2 cross-platform smoke (`crewhaus run examples/hello-cli/crewhaus.yaml` works on macos-arm64 + linux-x64 + windows-x64); T9 binary-determinism property (same source → same SHA256)
+- `crewhaus-cloud`: T3 end-to-end against a kind cluster + LocalStack (S3 + ECR); T8 audit-log integrity after 24h soak
+
+---
+
+## Section 33 — Channel adapter breadth
+
+> Status: 🟡 next up. Four independent adapter packages; one PR per channel. Parallelisable with Section 32.
+
+**Catalog modules:** `channel-adapter-telegram` (R13), `channel-adapter-discord` (R13), `channel-adapter-whatsapp` (R13), `channel-adapter-imessage` (R13)
+
+Today CHN ships only Slack (§12). Each new channel implements the existing `ChannelAdapter` interface (`verify`, `parseInbound`, `sendReply`, `setTyping`, `idempotencyKey`); the framework cost per channel is low because §12 already handled the hard parts (HMAC verification, idempotent dispatch, per-thread session resumption).
+
+### Build order within this section
+
+```
+channel-adapter-telegram      (parallel)
+channel-adapter-discord       (parallel)
+channel-adapter-whatsapp      (parallel)
+channel-adapter-imessage      (parallel; mac-host only)
+```
+
+Each is its own PR. None depends on another.
+
+### What to build (per channel)
+
+**`packages/channel-adapter-telegram`**
+- HMAC verification via Telegram's `secret_token` header on webhooks.
+- `parseInbound` handles `message`, `edited_message`, `callback_query` (button presses), and group chat events.
+- `sendReply` POSTs `sendMessage` to `https://api.telegram.org/bot<token>/`; `setTyping` posts `sendChatAction`.
+- Group-chat session keying: `<chatId>:<topicId>` when topics are enabled.
+
+**`packages/channel-adapter-discord`**
+- Ed25519 signature verification per Discord's interactions standard.
+- `parseInbound` handles slash commands (interaction type 2), button clicks (type 3), and modal submits (type 5).
+- `sendReply` calls Discord's interaction-response API; `setTyping` posts to `/channels/<id>/typing`.
+- Thread session keying via Discord's native `thread_id`.
+
+**`packages/channel-adapter-whatsapp`**
+- WhatsApp Business Cloud API. Webhook signature verification via the `X-Hub-Signature-256` HMAC.
+- `parseInbound` handles text + media + interactive button replies + list selections.
+- `sendReply` POSTs to `/messages` with the `text`/`template` payload.
+- Per-user session keying (no thread concept in WhatsApp).
+- T8: webhook retry idempotency (WhatsApp redelivers aggressively).
+
+**`packages/channel-adapter-imessage`**
+- macOS-only — uses AppleScript via `osascript` to drive Messages.app (Apple does not offer a public iMessage Business API for general agents).
+- `parseInbound` polls Messages.app's SQLite store at `~/Library/Messages/chat.db` for new messages since the last cursor.
+- `sendReply` runs an AppleScript that sends to the resolved chat handle.
+- Gated by `CREWHAUS_IMESSAGE_HOST_ENABLED=1` because it requires Full Disk Access permission and only works when the daemon runs on a logged-in Mac.
+- T8: idempotency cursor stays put across daemon restarts (no message double-processing).
+
+### Tests
+
+- T2 contract test per adapter against fixture inbound payloads (10 fixtures per channel covering text, media, buttons, edge cases)
+- T8 per adapter: signature tampering, expired timestamp (where applicable), replay attacks, missing headers
+- T3 end-to-end smoke per channel: spin up daemon, POST a signed fixture webhook, assert outbound reply matches expected body
+- iMessage adapter additionally has a T8 path-traversal check on the chat.db read (refuses absolute paths outside `~/Library/Messages/`)
+
+---
+
+## Section 34 — Federation (multi-deployment A2A)
+
+> Status: 🟡 sequential after Section 32 (uses `docker-images` for cross-deployment networking). Parallelisable with Section 35.
+
+**Catalog modules:** `federation-protocol` (R-infra), `federation-discovery` (R-infra), `federation-router` (R-infra)
+
+A CrewHaus deployment is currently isolated. Section 34 lets one deployment call agents in another CrewHaus deployment as if they were local sub-agents — Crew-of-crews. Use cases: domain-expert agents hosted by one org called from another org's research agent, multi-tenant marketplaces where each tenant exposes their crew as a federated participant, MGD federation where regional deployments hand off to a hub deployment for cross-cutting workflows.
+
+### Build order within this section
+
+```
+federation-protocol  ──►  federation-discovery  ──►  federation-router
+```
+
+### What to build
+
+**`packages/federation-protocol`** — mTLS A2A wire format
+- Extends §22's `a2a-protocol` envelope with `federation` fields: `{ from: { deployment, role }, to: { deployment, role }, mtls: { client_cert_subject } }`.
+- Transport: HTTPS POST with mutual TLS. Each deployment has a CA-issued certificate identifying its `deployment_id`; peers verify via cert pinning + transparency log.
+- Protocol versioning: `crewhaus.federation.v1` envelope; rejected without exact match.
+- T8: tampered cert → connection refused; expired cert → 403 with clear error.
+
+**`packages/federation-discovery`** — peer lookup
+- Two methods: DNS SRV record lookup (`_crewhaus._tcp.<deployment>.<domain>`) and `.well-known/crewhaus.json` HTTPS fetch.
+- Returns `{ endpoint, version, supportedShapes, publicKeyFingerprint }`.
+- Caches results with TTL = SRV TTL or 60s for `.well-known`.
+- `crewhaus federation discover <deployment>` CLI subcommand for ops.
+
+**`packages/federation-router`** — transparent remote calls
+- New IR field `subAgents[].federation: { deployment, role }` for cross-deployment sub-agents.
+- When `Task` invokes a federated sub-agent, the runtime routes via `federation-router` instead of `sub-agent-spawner`: opens an mTLS channel, POSTs the federation envelope, awaits the streamed response.
+- Errors map to standard `recovery-engine` taxonomy (network → retry; auth → tombstone).
+- Trace-bus events: `federation_call_start`, `federation_call_end`, `federation_call_error`. OTel `traceparent` propagates so the entire federated call shows under one trace.
+
+### Tests
+
+- T2 contract test on the federation envelope round-trip
+- T8 cert-pinning verification (tampered cert, expired cert, missing cert, wrong CA)
+- T3 two-deployment smoke: deployment A calls a federated sub-agent on deployment B; both deployments are docker-compose'd locally; verify the trace shows one parent span + one remote child span stitched via traceparent
+- T7 100 concurrent federated calls; verify no connection-pool exhaustion + no cert reverification storm
+- T9 property test on discovery TTL behaviour
+
+---
+
+## Section 35 — Developer experience tooling
+
+> Status: 🟡 independent. Three packages; one PR per package.
+
+**Catalog modules:** `vscode-extension` (F4), `jetbrains-plugin` (F4), `crewhaus-playground` (F4)
+
+Spec authoring today happens in plain text. Section 35 ships IDE-class authoring inside VS Code and the JetBrains family, plus a browser-based playground for try-before-installing.
+
+### Build order within this section
+
+All three packages are independent and parallelisable. Each is its own PR.
+
+### What to build
+
+**`packages/vscode-extension`** — the IDE most developers using this codebase live in
+- Spec YAML schema → IntelliSense autocomplete (consumes `@crewhaus/spec`'s Zod schema converted to JSON Schema).
+- Inline lint via `spec-validator` on save with red-squiggle on errors.
+- `crewhaus: Run Spec` command runs the spec via embedded Studio webview; trace timeline renders in a side panel.
+- Sub-agent definition resolver: hovering `subagent_type: "code-reviewer"` shows the resolved frontmatter from `.crewhaus/sub-agents/code-reviewer.md`.
+- Published to the VS Code Marketplace under `crewhaus.crewhaus-vscode`.
+- Bundled with a slim §32 `single-binary-cli` so users don't need a separate install.
+
+**`packages/jetbrains-plugin`** — IntelliJ / WebStorm / PyCharm parity
+- Same schema-driven autocomplete + lint as the VS Code extension.
+- Run/debug configurations: "Run Spec", "Run Eval", "Run Canary".
+- Integrates with JetBrains' Database tools for spec-registry inspection (the Postgres adapter from §28).
+- Published to JetBrains Marketplace.
+
+**`packages/crewhaus-playground`** — browser-based REPL
+- Single-page app at `play.crewhaus.io` (or wherever the project hosts it).
+- Edits a spec in-browser via Monaco; runs against a hosted CrewHaus deployment over the §20 gateway-server.
+- Templates from §26 `scaffold-templates` available as one-click examples.
+- Anonymous sessions get a small free quota; signing in via OAuth (GitHub / Google) lifts the quota and persists specs to the user's account.
+- Backed by §32 `crewhaus-cloud` deployment for the host.
+
+### Tests
+
+- `vscode-extension`: Playwright-against-VS-Code-Web smoke (spec autocomplete fires, lint flags an intentional typo, run command renders the trace timeline); manifest validation in CI
+- `jetbrains-plugin`: IntelliJ test framework smoke (load a fixture project, autocomplete on every IR variant)
+- `crewhaus-playground`: T3 end-to-end (sign in → load template → edit → run → view trace); T8 cross-tenant isolation in the multi-user mode
+
+---
+
 ## Kickoff prompts
 
 Use these prompts with Claude Code from the project root (`/Users/bots/Developer/crewhaus-factory`). Each prompt is self-contained.
@@ -3617,4 +3814,228 @@ End-to-end smoke test before opening the PR:
 - Stop studio (Ctrl-C); no orphan processes; no leftover Web Worker threads
 
 Update docs/MODULE-CATALOG.md and docs/build-roadmap.md with everything that is complete and create a pull request with all updates.
+```
+
+---
+
+### Section 32 — Distribution & packaging
+
+```
+Read docs/build-roadmap.md Section 32. Also read in full:
+- packages/target-managed/src/index.ts and packages/gateway-server/src/index.ts (Section 20 — `crewhaus-cloud` composes these)
+- packages/studio-server/src/index.ts (Section 31 — runs inside a container, needs the right Dockerfile)
+- packages/runtime-core/src/index.ts (the cold-start path the docker-images optimise around)
+- apps/cli/src/index.ts (the CLI surface that compiles to a single binary)
+- docs/MODULE-CATALOG.md entries for docker-images, helm-chart, single-binary-cli, crewhaus-cloud
+
+Build in this order (docker-images sequential prereq; single-binary-cli parallel; helm-chart depends on docker-images; crewhaus-cloud last):
+
+1. packages/docker-images (sequential prereq)
+   - 12 Dockerfiles under docker/<target>/Dockerfile, one per shape, base oven/bun:1.2-alpine
+   - Multi-stage builds: deps → build → runtime stage with non-root + read-only root + HEALTHCHECK
+   - Per-target system deps baked in (target/voice → libopus; target/browser → chromium)
+   - `crewhaus build-image <target> --tag <tag>` subcommand wraps `docker buildx build`
+   - Image digests pinned in docker/digests.json for reproducible builds without registry
+
+2. packages/single-binary-cli (parallel after #1)
+   - `bun run build:binary` produces dist/crewhaus-{linux,macos,windows}-{x64,arm64} self-contained binaries
+   - Cross-compile matrix in CI on every release tag; binaries uploaded as GitHub release assets
+   - Auto-generated Homebrew formula (Formula/crewhaus.rb), apt repo (debian/), Scoop manifest, Winget manifest
+
+3. packages/helm-chart (depends on #1)
+   - helm/crewhaus/ chart with templates per target shape (Deployment + Service + Ingress for daemons)
+   - Values schema: target, image.tag, replicas, secrets.<provider>, gateway.tls.{cert,key}
+   - ServiceMonitor + OpenTelemetryCollector sidecar baked in so §15 observability flows out of the box
+
+4. packages/crewhaus-cloud (depends on #3)
+   - Composite: target: "managed" + helm-chart Kustomize overlay + Terraform module (crewhaus-cloud/terraform/) for GKE/EKS/AKS provisioning
+   - Default tier: 1× gateway-server, 3× target-managed replicas, 1× studio replica, Postgres for spec-registry, Redis Streams for queue-protocol
+   - `crewhaus cloud deploy --provider aws --region us-east-1` runs the full stack-up; `crewhaus cloud teardown` reverses
+   - Audit-log persists to S3 (per §20 hash-chained format)
+
+Tests: T2 contract test per target image (boots, exposes the right ports, healthcheck passes); T8 base-image-vuln scan (trivy image); T7 cold-start time per shape (≤5s daemon; ≤10s browser/voice); T3 helm-chart against `kind` cluster — install round-trip per target shape; T4 chart upgrade replay (v1 → v2 with rolling restart); T8 RBAC minimal-permissions check; T2 single-binary-cli cross-platform smoke (`crewhaus run examples/hello-cli/crewhaus.yaml` works on macos-arm64 + linux-x64 + windows-x64); T9 binary-determinism (same source → same SHA256); T3 crewhaus-cloud end-to-end against `kind` cluster + LocalStack (S3 + ECR); T8 audit-log integrity after 24h soak.
+
+End-to-end smoke test before opening the PR:
+- ANTHROPIC_AUTH_TOKEN is in .env (Bun auto-loads .env)
+- Confirm `docker version` runs; Helm CLI installed; `kind` available
+- Probe 1 (docker-images): `crewhaus build-image cli --tag smoke`; `docker run --rm -e ANTHROPIC_AUTH_TOKEN -v "$PWD/examples/hello-cli":/spec crewhaus/cli:smoke compile /spec/crewhaus.yaml` produces a bundle; healthcheck passes within 5s for the daemon shapes
+- Probe 2 (single-binary-cli): `bun run build:binary --target macos-arm64`; copy the output to a fresh dir; run `./crewhaus run examples/hello-cli/crewhaus.yaml` — verify the agent runs without a Bun/Node prereq
+- Probe 3 (helm-chart): `kind create cluster --name crewhaus-smoke`; `helm install hello-channel ./helm/crewhaus --set target=channel --set channels.slack.signingSecret=fake-secret --set image.tag=smoke`; `kubectl rollout status deploy/hello-channel` succeeds; `helm uninstall hello-channel` reverses cleanly
+- Probe 4 (crewhaus-cloud against LocalStack): `LOCALSTACK_ENDPOINT=… crewhaus cloud deploy --provider aws-localstack --region us-east-1`; verify all three replicas come up; `crewhaus cloud teardown` removes everything
+- Probe 5 (homebrew formula): `brew install --formula ./Formula/crewhaus.rb`; `crewhaus --version` prints the right version; `brew uninstall crewhaus` reverses
+- Confirm the existing 12 target shapes still ship after the cross-cutting wiring
+
+Update docs/MODULE-CATALOG.md and docs/build-roadmap.md with everything that is complete and create a pull request with all updates.
+```
+
+---
+
+### Section 33 — Channel adapter breadth
+
+```
+Read docs/build-roadmap.md Section 33. Four independent adapter packages; ONE PR per channel.
+
+For ALL channels read:
+- packages/channel-adapter-slack/src/index.ts (the Section 12 reference adapter; every new adapter mirrors its structure)
+- packages/target-channel-bot/src/index.ts (the daemon shape; new adapters slot into the existing channel registry)
+- docs/MODULE-CATALOG.md entries for channel-adapter-telegram, channel-adapter-discord, channel-adapter-whatsapp, channel-adapter-imessage
+
+Per channel:
+
+1. packages/channel-adapter-telegram
+   - HMAC verification via Telegram's secret_token webhook header
+   - parseInbound handles message, edited_message, callback_query (button presses), group chat events
+   - sendReply POSTs sendMessage to https://api.telegram.org/bot<token>/; setTyping posts sendChatAction
+   - Group-chat session keying: <chatId>:<topicId> when topics enabled
+
+2. packages/channel-adapter-discord
+   - Ed25519 signature verification per Discord's interactions standard
+   - parseInbound handles slash commands (interaction type 2), button clicks (type 3), modal submits (type 5)
+   - sendReply calls Discord's interaction-response API; setTyping POSTs to /channels/<id>/typing
+   - Thread session keying via Discord's native thread_id
+
+3. packages/channel-adapter-whatsapp
+   - WhatsApp Business Cloud API; X-Hub-Signature-256 HMAC verification
+   - parseInbound handles text + media + interactive button replies + list selections
+   - sendReply POSTs to /messages with text/template payload
+   - Per-user session keying (no thread concept)
+   - T8: webhook retry idempotency (WhatsApp redelivers aggressively)
+
+4. packages/channel-adapter-imessage (mac-host only)
+   - osascript drives Messages.app (no public iMessage Business API)
+   - parseInbound polls ~/Library/Messages/chat.db SQLite for new messages since last cursor
+   - sendReply runs an AppleScript send to resolved chat handle
+   - Gated on CREWHAUS_IMESSAGE_HOST_ENABLED=1 (requires Full Disk Access permission)
+   - T8: idempotency cursor stays put across daemon restarts; T8: path-traversal check on chat.db read
+
+Tests per adapter: T2 contract (10 fixture inbound payloads per channel covering text, media, buttons, edge cases); T8 (signature tampering, expired timestamp, replay attacks, missing headers); T3 end-to-end smoke (spin up daemon, POST signed fixture webhook, assert outbound reply matches expected body).
+
+End-to-end smoke test before opening EACH PR (per channel; one Slack-shaped probe matrix):
+- ANTHROPIC_AUTH_TOKEN is in .env (Bun auto-loads .env)
+- Compile examples/hello-<channel> with the new adapter wired into the spec; start the daemon
+- POST a signed fixture webhook (text inbound) → verify the daemon parses it, runs one runChatLoop turn, and emits a sendReply with the expected body
+- POST a signed fixture webhook (button/interactive inbound where applicable) → verify the structured payload threads through the agent's tool registration
+- POST a tampered-signature webhook → verify rejection with correct status code (401 Slack, 403 Discord, 401 WhatsApp)
+- POST the SAME signed payload twice → verify idempotency (second processing skipped)
+- For iMessage: gate on CREWHAUS_IMESSAGE_HOST_ENABLED=1; never run on CI; set up a fixture chat.db locally, advance the cursor, verify only new messages flow through
+
+Update docs/MODULE-CATALOG.md and docs/build-roadmap.md with everything that is complete after EACH PR (one update per channel).
+```
+
+---
+
+### Section 34 — Federation (multi-deployment A2A)
+
+```
+Read docs/build-roadmap.md Section 34. Also read in full:
+- packages/a2a-protocol/src/index.ts (Section 22 — the in-crew A2A envelope this extends)
+- packages/gateway-server/src/index.ts (Section 20 — the mTLS auth pattern federation mirrors)
+- packages/sub-agent-spawner/src/index.ts (Section 13 — the local-Task path that federation routes around)
+- packages/trace-event-bus/src/index.ts (Section 15 — traceparent propagation across federated calls)
+- packages/recovery-engine/src/index.ts (Section 7 — federation errors map to existing recovery taxonomy)
+- packages/docker-images/src/index.ts (Section 32 — federation requires real network endpoints; tested via docker-compose)
+- docs/MODULE-CATALOG.md entries for federation-protocol, federation-discovery, federation-router
+
+Build in this order:
+
+1. packages/federation-protocol (sequential prereq)
+   - Extends §22 a2a-protocol envelope with federation fields: { from: { deployment, role }, to: { deployment, role }, mtls: { client_cert_subject } }
+   - Transport: HTTPS POST with mutual TLS; CA-issued certs identify deployment_id; cert pinning + transparency log
+   - Protocol versioning: crewhaus.federation.v1 envelope; rejected without exact match
+   - T8: tampered cert → connection refused; expired cert → 403 with clear error
+
+2. packages/federation-discovery (depends on #1)
+   - Two methods: DNS SRV (_crewhaus._tcp.<deployment>.<domain>) + .well-known/crewhaus.json HTTPS fetch
+   - Returns { endpoint, version, supportedShapes, publicKeyFingerprint }
+   - Caches with TTL = SRV TTL or 60s for .well-known
+   - `crewhaus federation discover <deployment>` CLI subcommand
+
+3. packages/federation-router (depends on #2)
+   - New IR field subAgents[].federation: { deployment, role } for cross-deployment sub-agents
+   - When Task invokes a federated sub-agent, runtime routes via federation-router instead of sub-agent-spawner
+   - Opens mTLS channel, POSTs federation envelope, awaits streamed response
+   - Errors map to recovery-engine taxonomy (network → retry; auth → tombstone)
+   - Trace events: federation_call_start, federation_call_end, federation_call_error
+   - traceparent propagates so the entire federated call shows under one trace
+
+Spec/IR additions: subAgents[].federation: { deployment, role } added to spec + IR; compiler validates federation refs at compile-time (deployment ID must match a configured peer in spec.federation.peers).
+
+Tests: T2 federation envelope round-trip; T8 cert-pinning (tampered, expired, missing, wrong CA); T3 two-deployment smoke (deployment A calls federated sub-agent on deployment B; both docker-compose'd locally; trace shows parent + remote child stitched via traceparent); T7 100 concurrent federated calls (no connection-pool exhaustion + no cert reverification storm); T9 discovery TTL property test.
+
+End-to-end smoke test before opening the PR:
+- ANTHROPIC_AUTH_TOKEN is in .env (Bun auto-loads .env)
+- docker-compose.yml under examples/hello-federation/ spins up TWO CrewHaus deployments — deployment-a and deployment-b — each with its own self-signed CA cert
+- deployment-a hosts a generalist agent; deployment-b hosts a code-reviewer specialist
+- Probe 1: deployment-a's spec defines `subAgents.code_reviewer: { federation: { deployment: "deployment-b", role: "code-reviewer" } }`; prompt deployment-a "review the diff in /tmp/fixture.patch"; verify deployment-a calls deployment-b via federation-router, deployment-b runs the review, deployment-a renders the result, and the OTel trace stitches both deployments under one traceId
+- Probe 2 (cert tampering): swap deployment-b's cert for an unrelated cert; rerun the prompt; verify federation-router rejects with cert-pinning-mismatch error and the agent surfaces a clean fail
+- Probe 3 (discovery): take down deployment-b; rerun the prompt; verify federation-router returns peer-unreachable error within the configured timeout
+- Probe 4 (concurrency): pump 50 concurrent federated calls; verify all succeed; check connection-pool stats stay bounded
+- Tear down docker-compose; cleanup CA cert files
+
+Update docs/MODULE-CATALOG.md and docs/build-roadmap.md with everything that is complete and create a pull request with all updates.
+```
+
+---
+
+### Section 35 — Developer experience tooling
+
+```
+Read docs/build-roadmap.md Section 35. Three independent packages; ONE PR per package.
+
+For ALL three read:
+- packages/spec/src/index.ts (Zod schema → JSON Schema for editor autocomplete)
+- packages/studio-ui/src/index.ts (Section 31 — the Lit components reused inside the VS Code webview + JetBrains tool window + playground)
+- packages/studio-server/src/index.ts (Section 31 — the playground's hosted backend)
+- packages/single-binary-cli/src/index.ts (Section 32 — bundled with editor extensions for installation footprint)
+- docs/MODULE-CATALOG.md entries for vscode-extension, jetbrains-plugin, crewhaus-playground
+
+PR 1: packages/vscode-extension (the IDE most developers using this codebase live in)
+- Spec YAML schema → IntelliSense autocomplete (consumes @crewhaus/spec's Zod schema converted to JSON Schema)
+- Inline lint via spec-validator on save with red-squiggle on errors
+- `crewhaus: Run Spec` command runs the spec via embedded Studio webview; trace timeline renders in side panel
+- Sub-agent definition resolver: hovering subagent_type: "code-reviewer" shows the resolved frontmatter from .crewhaus/sub-agents/code-reviewer.md
+- Bundled with §32 single-binary-cli so users don't need a separate install
+- Published to VS Code Marketplace under crewhaus.crewhaus-vscode
+
+PR 2: packages/jetbrains-plugin (IntelliJ / WebStorm / PyCharm parity)
+- Same schema-driven autocomplete + lint as the VS Code extension
+- Run/debug configurations: "Run Spec", "Run Eval", "Run Canary"
+- Integrates with JetBrains' Database tools for spec-registry inspection (the Postgres adapter from §28)
+- Published to JetBrains Marketplace
+
+PR 3: packages/crewhaus-playground (browser-based REPL)
+- Single-page app at play.crewhaus.io
+- Edits a spec in-browser via Monaco; runs against a hosted CrewHaus deployment over §20 gateway-server
+- Templates from §26 scaffold-templates available as one-click examples
+- Anonymous sessions get a small free quota; OAuth (GitHub / Google) lifts the quota and persists specs
+- Backed by §32 crewhaus-cloud deployment for the host
+
+Tests:
+- vscode-extension: Playwright-against-VS-Code-Web smoke (spec autocomplete fires, lint flags an intentional typo, run command renders the trace timeline); manifest validation in CI
+- jetbrains-plugin: IntelliJ test framework smoke (load fixture project, autocomplete on every IR variant)
+- crewhaus-playground: T3 end-to-end (sign in → load template → edit → run → view trace); T8 cross-tenant isolation in multi-user mode
+
+End-to-end smoke test before opening EACH PR:
+
+VS Code extension (PR 1):
+- Build the .vsix (`bun run build:vsce`); install into local VS Code
+- Open examples/hello-cli/crewhaus.yaml; verify autocomplete fires on `target:` suggesting all 12 shapes
+- Introduce typo `target: cli-x`; verify red squiggle + hover error message
+- Hover `subagent_type: "code-reviewer"` (in a fixture spec that defines it); verify the popup shows the frontmatter
+- Run `crewhaus: Run Spec` from the command palette; verify the embedded Studio webview opens + the trace timeline renders live
+- Uninstall extension cleanly; no leftover settings
+
+JetBrains plugin (PR 2):
+- Build the plugin .zip; install via "Install from Disk" in IntelliJ
+- Same autocomplete + lint + run probes as VS Code, against the same fixture project
+- Open the spec-registry tool window; connect to a fixture Postgres adapter; verify spec listings render
+
+Playground (PR 3):
+- Boot crewhaus-cloud locally per §32 instructions
+- Open http://localhost:3000/playground; load the cli-coding-agent template
+- Edit the prompt; run; verify the trace renders live in the side panel
+- Sign in via OAuth dev mode (GitHub mock); verify the spec persists across browser refresh
+- Open in incognito; verify anonymous-quota is enforced (trip the quota; confirm friendly error)
+
+Update docs/MODULE-CATALOG.md and docs/build-roadmap.md with everything that is complete after EACH PR (one update per package).
 ```
