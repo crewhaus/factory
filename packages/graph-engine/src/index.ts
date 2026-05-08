@@ -1,0 +1,618 @@
+/**
+ * Catalog R11 `graph-engine` — stateful graph runtime.
+ *
+ * The engine is a builder + interpreter:
+ *
+ *   const graph = createGraph<State>()
+ *     .addNode("plan",      async (ctx, s) => ({ ...s, plan: "..." }))
+ *     .addNode("execute",   async (ctx, s) => {
+ *       if (!ctx.approval) await ctx.requestApproval("execute the plan?");
+ *       return { ...s, result: "..." };
+ *     })
+ *     .addNode("summarise", async (ctx, s) => ({ ...s, summary: "..." }))
+ *     .addEdge("plan", "execute")
+ *     .addEdge("execute", "summarise")
+ *     .setEntry("plan")
+ *     .compile();
+ *
+ *   for await (const ev of graph.run({ topic: "..." })) {
+ *     // node_start | node_end | edge_taken | branch | checkpoint | hitl_pause
+ *   }
+ *
+ *   // resume from a HITL pause:
+ *   for await (const ev of graph.resume(checkpointId, "approve")) { ... }
+ *
+ * Each node receives a `NodeContext` carrying the parent `RunContext`,
+ * a `requestApproval` helper, and the previous-node state. The engine
+ * persists a checkpoint after every successful node so a crash mid-run
+ * can be recovered by `branch-history` / `durable-execution`.
+ *
+ * Layer R11. Pairs with `checkpoint-store` (R7) and the `target-graph`
+ * codegen.
+ */
+
+import {
+  type Checkpoint,
+  type CheckpointId,
+  type CheckpointStore,
+  type GraphRunId,
+  newGraphRunId,
+} from "@crewhaus/checkpoint-store";
+import { CrewhausError } from "@crewhaus/errors";
+import type { RunContext } from "@crewhaus/run-context";
+
+export type NodeName = string;
+
+/**
+ * Per-node execution context. Independent of the broader RunContext so
+ * graph-engine stays single-purpose (nodes that need to publish trace
+ * events still reach for `runContext.eventBus` directly).
+ */
+export interface NodeContext {
+  readonly runContext: RunContext;
+  readonly graphRunId: GraphRunId;
+  readonly nodeName: NodeName;
+  /**
+   * When the engine is replaying after a `resume(checkpointId, decision)`,
+   * `approval` is the decision string returned to the node that paused.
+   * On a fresh run it's undefined.
+   */
+  readonly approval?: string;
+  /**
+   * Pause graph execution and persist a checkpoint. The engine yields a
+   * `hitl_pause` event then closes the iterable; the operator calls
+   * `graph.resume(checkpointId, decision)` to resume.
+   *
+   * Returns a value only on resume — on the first run this throws a
+   * `HitlPauseSignal` that the engine catches.
+   */
+  requestApproval(prompt: string): Promise<string>;
+}
+
+export type NodeFn<S> = (ctx: NodeContext, prev: S) => Promise<S>;
+
+export type EdgeCondition<S> = (state: S, ctx: NodeContext) => boolean | Promise<boolean>;
+
+type EdgeSpec<S> = {
+  readonly from: NodeName;
+  readonly to: NodeName;
+  readonly condition?: EdgeCondition<S>;
+};
+
+export class HitlPauseSignal extends Error {
+  override readonly name = "HitlPauseSignal";
+  constructor(public readonly prompt: string) {
+    super(`hitl pause: ${prompt}`);
+  }
+}
+
+export class GraphBuildError extends CrewhausError {
+  override readonly name = "GraphBuildError";
+  constructor(message: string, cause?: unknown) {
+    super("config", message, cause);
+  }
+}
+
+export class GraphRunError extends CrewhausError {
+  override readonly name = "GraphRunError";
+  constructor(message: string, cause?: unknown) {
+    super("config", message, cause);
+  }
+}
+
+export type NodeStartEvent = {
+  readonly kind: "node_start";
+  readonly graphRunId: GraphRunId;
+  readonly nodeName: NodeName;
+  readonly turn: number;
+};
+
+export type NodeEndEvent<S> = {
+  readonly kind: "node_end";
+  readonly graphRunId: GraphRunId;
+  readonly nodeName: NodeName;
+  readonly turn: number;
+  readonly state: S;
+  readonly durationMs: number;
+};
+
+export type EdgeTakenEvent = {
+  readonly kind: "edge_taken";
+  readonly graphRunId: GraphRunId;
+  readonly from: NodeName;
+  readonly to: NodeName;
+};
+
+export type CheckpointEvent = {
+  readonly kind: "checkpoint";
+  readonly graphRunId: GraphRunId;
+  readonly nodeName: NodeName;
+  readonly checkpointId: CheckpointId;
+};
+
+export type BranchEvent = {
+  readonly kind: "branch";
+  readonly fromGraphRunId: GraphRunId;
+  readonly fromCheckpointId: CheckpointId;
+  readonly newGraphRunId: GraphRunId;
+};
+
+export type HitlPauseEvent = {
+  readonly kind: "hitl_pause";
+  readonly graphRunId: GraphRunId;
+  readonly nodeName: NodeName;
+  readonly prompt: string;
+  readonly checkpointId: CheckpointId;
+};
+
+export type GraphRunDoneEvent<S> = {
+  readonly kind: "run_done";
+  readonly graphRunId: GraphRunId;
+  readonly state: S;
+};
+
+export type NodeEvent<S> =
+  | NodeStartEvent
+  | NodeEndEvent<S>
+  | EdgeTakenEvent
+  | CheckpointEvent
+  | BranchEvent
+  | HitlPauseEvent
+  | GraphRunDoneEvent<S>;
+
+export type RunOptions = {
+  /**
+   * When set, reuse this graph run id (e.g. for `branch-history`
+   * resuming a branched run); otherwise a fresh `grun_<16hex>` is
+   * minted.
+   */
+  readonly graphRunId?: GraphRunId;
+  /**
+   * When set, the engine starts by loading the named checkpoint and
+   * begins execution from `nextNode` (typically used by `resume()`).
+   */
+  readonly resumeFrom?: { readonly checkpointId: CheckpointId; readonly nextNode: NodeName };
+  /**
+   * Decisions to feed back into HITL `requestApproval()` calls during
+   * replay. Keyed by node name.
+   */
+  readonly approvals?: Readonly<Record<NodeName, string>>;
+  /**
+   * Caller-supplied `RunContext`. Defaults to a fresh `createRunContext()`
+   * when omitted (graph-engine imports the helper lazily to avoid pulling
+   * `@crewhaus/logging` into bundles that supply their own context).
+   */
+  readonly runContext?: RunContext;
+};
+
+export interface RunnableGraph<Input, State> {
+  readonly nodes: ReadonlyArray<NodeName>;
+  readonly entry: NodeName;
+  /** Drive the graph from `input`. Yields events node-by-node. */
+  run(input: Input, opts?: RunOptions): AsyncIterable<NodeEvent<State>>;
+  /**
+   * Resume a previously-paused run. Loads the checkpoint, threads the
+   * decision through `NodeContext.approval`, and resumes execution from
+   * the node following the paused one.
+   */
+  resume(
+    graphRunId: GraphRunId,
+    checkpointId: CheckpointId,
+    decision: string,
+    opts?: Omit<RunOptions, "resumeFrom">,
+  ): AsyncIterable<NodeEvent<State>>;
+}
+
+export interface GraphBuilder<Input, State> {
+  addNode(name: NodeName, fn: NodeFn<State>): GraphBuilder<Input, State>;
+  addEdge(
+    from: NodeName,
+    to: NodeName,
+    condition?: EdgeCondition<State>,
+  ): GraphBuilder<Input, State>;
+  /**
+   * Add a parallel barrier: every node in `names` executes concurrently,
+   * the engine waits for all to complete, and the next edge is taken
+   * from the LAST of `names` (the synthetic merge sink).
+   */
+  addParallel(names: ReadonlyArray<NodeName>): GraphBuilder<Input, State>;
+  setEntry(name: NodeName): GraphBuilder<Input, State>;
+  /**
+   * Convert the input shape into the initial state. Default: cast
+   * `input as unknown as State`. Override when the input and state
+   * types differ.
+   */
+  setInputAdapter(fn: (input: Input) => State): GraphBuilder<Input, State>;
+  compile(): RunnableGraph<Input, State>;
+}
+
+export type CreateGraphOptions = {
+  readonly checkpointStore?: CheckpointStore;
+};
+
+export function createGraph<Input = unknown, State = Input>(
+  opts: CreateGraphOptions = {},
+): GraphBuilder<Input, State> {
+  const nodes = new Map<NodeName, NodeFn<State>>();
+  const edges: EdgeSpec<State>[] = [];
+  const parallelGroups: ReadonlyArray<NodeName>[] = [];
+  let entry: NodeName | undefined;
+  let inputAdapter: (input: Input) => State = (input) => input as unknown as State;
+
+  const builder: GraphBuilder<Input, State> = {
+    addNode(name, fn) {
+      if (nodes.has(name)) {
+        throw new GraphBuildError(`duplicate node "${name}"`);
+      }
+      if (name.length === 0) throw new GraphBuildError("node name must be non-empty");
+      nodes.set(name, fn);
+      return builder;
+    },
+    addEdge(from, to, condition) {
+      edges.push({ from, to, ...(condition !== undefined ? { condition } : {}) });
+      return builder;
+    },
+    addParallel(names) {
+      if (names.length < 2) {
+        throw new GraphBuildError("addParallel requires at least 2 nodes");
+      }
+      parallelGroups.push(names);
+      return builder;
+    },
+    setEntry(name) {
+      entry = name;
+      return builder;
+    },
+    setInputAdapter(fn) {
+      inputAdapter = fn;
+      return builder;
+    },
+    compile(): RunnableGraph<Input, State> {
+      if (entry === undefined) {
+        throw new GraphBuildError("setEntry must be called before compile");
+      }
+      if (!nodes.has(entry)) {
+        throw new GraphBuildError(`entry node "${entry}" is not registered`);
+      }
+      // Validate every edge endpoint references a known node.
+      for (const e of edges) {
+        if (!nodes.has(e.from)) {
+          throw new GraphBuildError(`edge references unknown node "${e.from}" (from)`);
+        }
+        if (!nodes.has(e.to)) {
+          throw new GraphBuildError(`edge references unknown node "${e.to}" (to)`);
+        }
+      }
+      for (const group of parallelGroups) {
+        for (const n of group) {
+          if (!nodes.has(n)) {
+            throw new GraphBuildError(`parallel group references unknown node "${n}"`);
+          }
+        }
+      }
+      return new CompiledGraph<Input, State>({
+        nodes,
+        edges,
+        parallelGroups,
+        entry,
+        inputAdapter,
+        checkpointStore: opts.checkpointStore,
+      });
+    },
+  };
+
+  return builder;
+}
+
+type CompiledOptions<Input, State> = {
+  readonly nodes: Map<NodeName, NodeFn<State>>;
+  readonly edges: ReadonlyArray<EdgeSpec<State>>;
+  readonly parallelGroups: ReadonlyArray<ReadonlyArray<NodeName>>;
+  readonly entry: NodeName;
+  readonly inputAdapter: (input: Input) => State;
+  readonly checkpointStore?: CheckpointStore;
+};
+
+class CompiledGraph<Input, State> implements RunnableGraph<Input, State> {
+  readonly nodes: ReadonlyArray<NodeName>;
+  readonly entry: NodeName;
+  private readonly o: CompiledOptions<Input, State>;
+
+  constructor(opts: CompiledOptions<Input, State>) {
+    this.o = opts;
+    this.nodes = [...opts.nodes.keys()];
+    this.entry = opts.entry;
+  }
+
+  run(input: Input, opts: RunOptions = {}): AsyncIterable<NodeEvent<State>> {
+    const initial = this.o.inputAdapter(input);
+    return this.execute({
+      graphRunId: opts.graphRunId ?? newGraphRunId(),
+      state: initial,
+      startNode: opts.resumeFrom?.nextNode ?? this.o.entry,
+      approvals: opts.approvals ?? {},
+      runContext: opts.runContext,
+      resumedFromCheckpointId: opts.resumeFrom?.checkpointId,
+    });
+  }
+
+  resume(
+    graphRunId: GraphRunId,
+    checkpointId: CheckpointId,
+    decision: string,
+    opts: Omit<RunOptions, "resumeFrom"> = {},
+  ): AsyncIterable<NodeEvent<State>> {
+    const store = this.o.checkpointStore;
+    if (store === undefined) {
+      throw new GraphRunError("resume() requires a checkpointStore at compile time");
+    }
+    const self = this;
+    return (async function* (): AsyncIterable<NodeEvent<State>> {
+      const checkpoint = await store.load(graphRunId, checkpointId);
+      if (checkpoint === undefined) {
+        throw new GraphRunError(`checkpoint ${checkpointId} not found in run ${graphRunId}`);
+      }
+      // The state stored is the state AT THE PAUSE — the paused node never
+      // committed its own output. Replay starts at that node with the
+      // decision threaded in via the `approvals` map.
+      const approvals = { ...(opts.approvals ?? {}), [checkpoint.nodeName]: decision };
+      yield* self.execute({
+        graphRunId,
+        state: checkpoint.state as State,
+        startNode: checkpoint.nodeName,
+        approvals,
+        runContext: opts.runContext,
+        resumedFromCheckpointId: checkpointId,
+      });
+    })();
+  }
+
+  private async *execute(args: {
+    graphRunId: GraphRunId;
+    state: State;
+    startNode: NodeName;
+    approvals: Readonly<Record<NodeName, string>>;
+    runContext?: RunContext;
+    resumedFromCheckpointId?: CheckpointId;
+  }): AsyncIterable<NodeEvent<State>> {
+    const { graphRunId, approvals } = args;
+    let state = args.state;
+    let cursor: NodeName | undefined = args.startNode;
+    let parentCheckpointId = args.resumedFromCheckpointId;
+    let turn = 0;
+    const runContext = args.runContext ?? (await this.lazyRunContext());
+
+    while (cursor !== undefined) {
+      const nodeName = cursor;
+      const fn = this.o.nodes.get(nodeName);
+      if (fn === undefined) {
+        throw new GraphRunError(`node "${nodeName}" is not registered`);
+      }
+      // Detect parallel groups: if `nodeName` is the first member of a group,
+      // run the whole group in parallel; the cursor advances to the LAST
+      // member's outgoing edge.
+      const parallelGroup = this.o.parallelGroups.find((g) => g[0] === nodeName);
+      if (parallelGroup !== undefined) {
+        turn += 1;
+        yield {
+          kind: "node_start",
+          graphRunId,
+          nodeName: `[parallel: ${parallelGroup.join(",")}]`,
+          turn,
+        };
+        const t0 = performance.now();
+        const groupCtxs = parallelGroup.map((n) =>
+          this.makeNodeContext({
+            runContext,
+            graphRunId,
+            nodeName: n,
+            approval: approvals[n],
+          }),
+        );
+        const groupFns = parallelGroup.map((n) => {
+          const f = this.o.nodes.get(n);
+          if (f === undefined) {
+            throw new GraphRunError(`parallel group references missing node "${n}"`);
+          }
+          return f;
+        });
+        const results = await Promise.all(
+          groupFns.map((f, i) => {
+            const ctx = groupCtxs[i];
+            if (ctx === undefined) {
+              throw new GraphRunError("internal: missing parallel context");
+            }
+            return f(ctx, state);
+          }),
+        );
+        // Merge: last writer wins. Callers wanting structured merge should
+        // wrap their results in a non-conflicting shape and reduce them.
+        // Mutate `acc` in place to avoid quadratic spread cost on large groups.
+        const acc: Record<string, unknown> = { ...(state as unknown as object) };
+        for (const r of results) {
+          Object.assign(acc, r as object);
+        }
+        state = acc as unknown as State;
+        yield {
+          kind: "node_end",
+          graphRunId,
+          nodeName: `[parallel: ${parallelGroup.join(",")}]`,
+          turn,
+          state,
+          durationMs: performance.now() - t0,
+        };
+        // Advance cursor from the LAST node in the group.
+        cursor = await this.resolveNext(parallelGroup[parallelGroup.length - 1] as string, state, {
+          runContext,
+          graphRunId,
+          nodeName: parallelGroup[parallelGroup.length - 1] as string,
+        });
+        continue;
+      }
+
+      turn += 1;
+      yield { kind: "node_start", graphRunId, nodeName, turn };
+      const ctx = this.makeNodeContext({
+        runContext,
+        graphRunId,
+        nodeName,
+        approval: approvals[nodeName],
+      });
+      const t0 = performance.now();
+      let next: State;
+      try {
+        next = await fn(ctx, state);
+      } catch (err) {
+        if (err instanceof HitlPauseSignal) {
+          if (this.o.checkpointStore !== undefined) {
+            const cp = await this.o.checkpointStore.save({
+              graphRunId,
+              nodeName,
+              state,
+              ...(parentCheckpointId !== undefined ? { parentCheckpointId } : {}),
+            });
+            yield {
+              kind: "hitl_pause",
+              graphRunId,
+              nodeName,
+              prompt: err.prompt,
+              checkpointId: cp.id,
+            };
+          } else {
+            // No checkpoint store wired; surface a synthetic id so the
+            // event shape is uniform and let the operator persist out-of-band.
+            yield {
+              kind: "hitl_pause",
+              graphRunId,
+              nodeName,
+              prompt: err.prompt,
+              checkpointId: "ckpt_unpersisted_0000",
+            };
+          }
+          return;
+        }
+        throw err;
+      }
+      state = next;
+      yield {
+        kind: "node_end",
+        graphRunId,
+        nodeName,
+        turn,
+        state,
+        durationMs: performance.now() - t0,
+      };
+      if (this.o.checkpointStore !== undefined) {
+        const cp = await this.o.checkpointStore.save({
+          graphRunId,
+          nodeName,
+          state,
+          ...(parentCheckpointId !== undefined ? { parentCheckpointId } : {}),
+        });
+        parentCheckpointId = cp.id;
+        yield { kind: "checkpoint", graphRunId, nodeName, checkpointId: cp.id };
+      }
+      cursor = await this.resolveNext(nodeName, state, { runContext, graphRunId, nodeName });
+    }
+    yield { kind: "run_done", graphRunId, state };
+  }
+
+  /**
+   * Pick the first matching outgoing edge. Edges with no condition match
+   * unconditionally; edges with a condition are evaluated in declaration
+   * order. Returns undefined when there's no outgoing edge (terminal).
+   */
+  private async resolveNext(
+    from: NodeName,
+    state: State,
+    ctxParts: { runContext: RunContext; graphRunId: GraphRunId; nodeName: NodeName },
+  ): Promise<NodeName | undefined> {
+    for (const edge of this.o.edges) {
+      if (edge.from !== from) continue;
+      if (edge.condition === undefined) return edge.to;
+      const ctx = this.makeNodeContext({
+        runContext: ctxParts.runContext,
+        graphRunId: ctxParts.graphRunId,
+        nodeName: ctxParts.nodeName,
+      });
+      if (await edge.condition(state, ctx)) return edge.to;
+    }
+    return undefined;
+  }
+
+  private makeNodeContext(parts: {
+    runContext: RunContext;
+    graphRunId: GraphRunId;
+    nodeName: NodeName;
+    approval?: string;
+  }): NodeContext {
+    return {
+      runContext: parts.runContext,
+      graphRunId: parts.graphRunId,
+      nodeName: parts.nodeName,
+      ...(parts.approval !== undefined ? { approval: parts.approval } : {}),
+      requestApproval: async (prompt: string): Promise<string> => {
+        if (parts.approval !== undefined) return parts.approval;
+        throw new HitlPauseSignal(prompt);
+      },
+    };
+  }
+
+  private async lazyRunContext(): Promise<RunContext> {
+    const { createRunContext } = await import("@crewhaus/run-context");
+    return createRunContext();
+  }
+}
+
+/**
+ * Helper for `branch-history`/durable-execution: walk a node-event
+ * stream and collect the terminal state. Throws if the iterable ends
+ * before a `run_done` event.
+ */
+export async function collectTerminalState<S>(
+  stream: AsyncIterable<NodeEvent<S>>,
+): Promise<{ state: S; events: ReadonlyArray<NodeEvent<S>> }> {
+  const events: NodeEvent<S>[] = [];
+  let state: S | undefined;
+  let done = false;
+  for await (const ev of stream) {
+    events.push(ev);
+    if (ev.kind === "run_done") {
+      state = ev.state;
+      done = true;
+    }
+  }
+  if (!done) {
+    throw new GraphRunError("graph stream ended before run_done (likely a hitl_pause)");
+  }
+  return { state: state as S, events };
+}
+
+/**
+ * Walk the stream and collect the LAST checkpoint id.  Used when an
+ * external caller wants a resumable handle to the latest state without
+ * re-implementing the iterator pattern.
+ */
+export async function collectLastCheckpoint<S>(stream: AsyncIterable<NodeEvent<S>>): Promise<{
+  events: ReadonlyArray<NodeEvent<S>>;
+  lastCheckpointId?: CheckpointId;
+  pausedAt?: { nodeName: NodeName; checkpointId: CheckpointId; prompt: string };
+}> {
+  const events: NodeEvent<S>[] = [];
+  let lastCheckpointId: CheckpointId | undefined;
+  let pausedAt: { nodeName: NodeName; checkpointId: CheckpointId; prompt: string } | undefined;
+  for await (const ev of stream) {
+    events.push(ev);
+    if (ev.kind === "checkpoint") lastCheckpointId = ev.checkpointId;
+    if (ev.kind === "hitl_pause") {
+      pausedAt = { nodeName: ev.nodeName, checkpointId: ev.checkpointId, prompt: ev.prompt };
+    }
+  }
+  return {
+    events,
+    ...(lastCheckpointId !== undefined ? { lastCheckpointId } : {}),
+    ...(pausedAt !== undefined ? { pausedAt } : {}),
+  };
+}
+
+export type { Checkpoint, CheckpointId, GraphRunId };

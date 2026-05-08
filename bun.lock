@@ -71,6 +71,16 @@
         "@crewhaus/runtime-core": "workspace:*",
       },
     },
+    "examples/hello-graph": {
+      "name": "@crewhaus-examples/hello-graph",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/checkpoint-store": "workspace:*",
+        "@crewhaus/graph-engine": "workspace:*",
+        "@crewhaus/run-context": "workspace:*",
+        "@crewhaus/runtime-core": "workspace:*",
+      },
+    },
     "examples/hello-workflow": {
       "name": "@crewhaus-examples/hello-workflow",
       "version": "0.0.0",
@@ -173,8 +183,23 @@
         "@crewhaus/trace-event-bus": "workspace:*",
       },
     },
+    "packages/branch-history": {
+      "name": "@crewhaus/branch-history",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/checkpoint-store": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
+      },
+    },
     "packages/channel-adapter-slack": {
       "name": "@crewhaus/channel-adapter-slack",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+      },
+    },
+    "packages/checkpoint-store": {
+      "name": "@crewhaus/checkpoint-store",
       "version": "0.0.0",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
@@ -205,7 +230,16 @@
         "@crewhaus/spec": "workspace:*",
         "@crewhaus/target-channel-bot": "workspace:*",
         "@crewhaus/target-cli": "workspace:*",
+        "@crewhaus/target-graph": "workspace:*",
         "@crewhaus/target-workflow": "workspace:*",
+      },
+    },
+    "packages/durable-execution": {
+      "name": "@crewhaus/durable-execution",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/checkpoint-store": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
       },
     },
     "packages/errors": {
@@ -296,6 +330,16 @@
       "version": "0.0.0",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
+      },
+    },
+    "packages/graph-engine": {
+      "name": "@crewhaus/graph-engine",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/checkpoint-store": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/run-context": "workspace:*",
+        "@crewhaus/trace-event-bus": "workspace:*",
       },
     },
     "packages/hooks-engine": {
@@ -558,6 +602,15 @@
         "@crewhaus/hooks-engine": "workspace:*",
         "@crewhaus/skills-registry": "workspace:*",
         "@crewhaus/slash-commands": "workspace:*",
+      },
+    },
+    "packages/target-graph": {
+      "name": "@crewhaus/target-graph",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/infra-utils": "workspace:*",
+        "@crewhaus/ir": "workspace:*",
       },
     },
     "packages/target-workflow": {
@@ -911,6 +964,8 @@
 
     "@crewhaus-examples/hello-cli": ["@crewhaus-examples/hello-cli@workspace:examples/hello-cli"],
 
+    "@crewhaus-examples/hello-graph": ["@crewhaus-examples/hello-graph@workspace:examples/hello-graph"],
+
     "@crewhaus-examples/hello-workflow": ["@crewhaus-examples/hello-workflow@workspace:examples/hello-workflow"],
 
     "@crewhaus-examples/mcp-smoke": ["@crewhaus-examples/mcp-smoke@workspace:examples/mcp-smoke"],
@@ -931,7 +986,11 @@
 
     "@crewhaus/agent-context-isolation": ["@crewhaus/agent-context-isolation@workspace:packages/agent-context-isolation"],
 
+    "@crewhaus/branch-history": ["@crewhaus/branch-history@workspace:packages/branch-history"],
+
     "@crewhaus/channel-adapter-slack": ["@crewhaus/channel-adapter-slack@workspace:packages/channel-adapter-slack"],
+
+    "@crewhaus/checkpoint-store": ["@crewhaus/checkpoint-store@workspace:packages/checkpoint-store"],
 
     "@crewhaus/cli": ["@crewhaus/cli@workspace:apps/cli"],
 
@@ -940,6 +999,8 @@
     "@crewhaus/compaction-snip": ["@crewhaus/compaction-snip@workspace:packages/compaction-snip"],
 
     "@crewhaus/compiler": ["@crewhaus/compiler@workspace:packages/compiler"],
+
+    "@crewhaus/durable-execution": ["@crewhaus/durable-execution@workspace:packages/durable-execution"],
 
     "@crewhaus/errors": ["@crewhaus/errors@workspace:packages/errors"],
 
@@ -954,6 +1015,8 @@
     "@crewhaus/eval-runner": ["@crewhaus/eval-runner@workspace:packages/eval-runner"],
 
     "@crewhaus/event-log": ["@crewhaus/event-log@workspace:packages/event-log"],
+
+    "@crewhaus/graph-engine": ["@crewhaus/graph-engine@workspace:packages/graph-engine"],
 
     "@crewhaus/hooks-engine": ["@crewhaus/hooks-engine@workspace:packages/hooks-engine"],
 
@@ -1004,6 +1067,8 @@
     "@crewhaus/target-channel-bot": ["@crewhaus/target-channel-bot@workspace:packages/target-channel-bot"],
 
     "@crewhaus/target-cli": ["@crewhaus/target-cli@workspace:packages/target-cli"],
+
+    "@crewhaus/target-graph": ["@crewhaus/target-graph@workspace:packages/target-graph"],
 
     "@crewhaus/target-workflow": ["@crewhaus/target-workflow@workspace:packages/target-workflow"],
 

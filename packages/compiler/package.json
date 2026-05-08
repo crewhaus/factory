@@ -18,6 +18,7 @@
     "@crewhaus/spec": "workspace:*",
     "@crewhaus/target-channel-bot": "workspace:*",
     "@crewhaus/target-cli": "workspace:*",
+    "@crewhaus/target-graph": "workspace:*",
     "@crewhaus/target-workflow": "workspace:*"
   }
 }

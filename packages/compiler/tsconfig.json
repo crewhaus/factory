@@ -10,6 +10,7 @@
     { "path": "../spec" },
     { "path": "../ir" },
     { "path": "../target-cli" },
+    { "path": "../target-graph" },
     { "path": "../target-workflow" }
   ]
 }

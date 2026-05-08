@@ -82,7 +82,7 @@ Channel target shape (✅ §12) ──► Sub-agents + Task tool (✅ §13)
 | **§16 Eval stack** | ✅ | §15 (trace-event-bus, run-context, event-log) | EVAL target shape, `prompt-optimizer`, deploy-gate pattern (PART F #10), `target-eval-bundle` |
 | **§17 Multi-provider models** | ✅ | §1 (`model-adapter` interface) | All non-Anthropic providers, cross-provider compaction, EVAL/MGD multi-provider sweeps |
 | **§18 Production safety floor** | ✅ | §1, §3, §7 (permission-engine), §8 | §20 (`policy-engine` consumer), MGD/EVAL hardening, untrusted-code workflows |
-| **§19 GRPH target shape** | 🟡 next, parallel with §18 | §1–4, §10 (event-log replay) | GRPH shape, `durable-execution` family, branch/HITL flows, MGD durability |
+| **§19 GRPH target shape** | ✅ | §1–4, §10 (event-log replay) | GRPH shape, `durable-execution` family, branch/HITL flows, MGD durability |
 | **§20 MGD target shape + governance** | 🟡 after §18 (uses `policy-engine`) | §18 (`policy-engine`), §10, §15 | MGD shape, remote channel daemon, multi-tenant deployment, `web-ui` backend |
 | **§21 RAG target shape** | 🟡 independent | §1–4, §15 (trace-event-bus for retrieval spans) | RAG shape, all R12 retrieval/embedding modules, doc-grounded agents |
 
@@ -1101,7 +1101,7 @@ Runtime integration (last): `runtime-core` wires `prompt-injection-detector` int
 
 ## Section 19 — GRPH target shape: stateful graph runtime
 
-> Status: 🟡 next up. Parallelisable with Section 18 (no shared files).
+> Status: ✅ landed. PR feat/section-19-grph-target.
 
 **Catalog modules:** `checkpoint-store` (R7), `graph-engine` (R11), `target-graph` (F2), `branch-history` (R7), `durable-execution` (R11)
 
@@ -1156,6 +1156,31 @@ Spec/IR additions are sequential after `target-graph` is stable.
 - `durable-execution`: T4 replay test — kill the process mid-node, restart, confirm exactly-once
 - `target-graph`: T1 generated bundle structure; T3 compile + run a 3-node fixture graph end-to-end
 - E2E smoke: `examples/hello-graph/` — a 3-node graph (plan → execute → summarise) with one HITL pause; smoke script kills the runner mid-execute, resumes from checkpoint, confirms identical final output
+
+### What landed
+
+- **`packages/checkpoint-store`** — `createCheckpointStore({ rootDir?, adapter?, now? })`. File-backed adapter writes per-graph-run subdirectories `<rootDir>/<grun_…>/` containing one `<ckpt_…>.json` per checkpoint plus a `_meta.json` head pointer. `save({ graphRunId, nodeName, state, parentCheckpointId? })` returns a `Checkpoint`; `load(grun, ckpt?)` returns the head when no checkpoint id is given; `list(grun, { limit?, since? })` walks in mtime order; `branch(parentRun, ckpt)` mints a fresh `grun_…` whose head is a copy of the source checkpoint and whose `_meta.json` records `branchedFrom`. Path-traversal guard rejects ids that don't match `grun_<16hex>` / `ckpt_<16hex>` regexes. T7 stress: 500-checkpoint chain round-trips correctly.
+- **`packages/graph-engine`** — `createGraph({ checkpointStore? })` builder with `addNode(name, fn)` / `addEdge(from, to, condition?)` / `addParallel(names)` / `setEntry(name)` / `setInputAdapter(fn)` / `compile()`. `RunnableGraph.run(input, opts)` yields `node_start | node_end | edge_taken | checkpoint | hitl_pause | run_done` events; conditional edges, parallel groups (Promise.all + last-writer-wins merge), and HITL pauses via `ctx.requestApproval(prompt)` (throws `HitlPauseSignal`, engine catches and persists checkpoint). `resume(graphRunId, checkpointId, decision)` reattaches by passing the decision via `NodeContext.approval`. Each node receives the parent `RunContext` so trace events publish naturally. Helpers: `collectTerminalState`, `collectLastCheckpoint`.
+- **`packages/branch-history`** — `branchAt(store, parentRun, ckpt)` (thin wrapper over `store.branch`) and `diff(store, runA, runB)` returning `NodeDiff[]` with kinds `same | node-mismatch | state-mismatch | only-a | only-b`. State equality compares a SHA-256 truncation of `JSON.stringify(state)` so non-trivial state types diff cleanly without loosely-typed deep-equal.
+- **`packages/durable-execution`** — `idempotencyKey(grun, nodeName, attempt?)` (SHA-256 truncated to 24 hex), `IdempotencyStore` interface + `InMemoryIdempotencyStore`, `withIdempotency(inner, { store?, attempt? })` wrapper that caches each completed call, and `resumeFrom(store, grun)` returning the head checkpoint hint for `graph.run({ resumeFrom })`. Exactly-once for crash-replay scenarios is achieved by reusing the same idempotency key across attempts.
+- **`packages/target-graph`** — `emitGraph(ir)` codegen. Single-file `agent.ts` that builds the graph via `createGraph({ checkpointStore })`, registers each node as an LLM-backed body (`runChatLoop({ singleTurn: true })` with the node's instructions and the upstream state stringified into a seed user message), wires edges + entry, and parses CLI args for three modes:
+  - default — read stdin, run from entry, on `hitl_pause` print `paused at <node>` + `to resume: bun … --resume <grun> <decision>`;
+  - `--resume <grun> <decision>` — load head, call `graph.resume(...)`, complete to `run_done`;
+  - `--branch-from <grun> <ckpt>` — call `store.branch(...)`, then `graph.run(...)` from the branched head.
+- **`packages/spec`** — `target: "graph"` schema with `model`, `entry`, `nodes: { [name]: { instructions, model?, tools?, tool_config?, hitl?: { prompt } } }`, `edges: [{ from, to }]`. The discriminated union expands to four variants (cli / workflow / channel / graph).
+- **`packages/ir`** — `IrGraphV0` mirroring the spec; `IrNode` union extended.
+- **`packages/compiler`** — new `case "graph"` in `lower()` and `emit()`, dispatching to `emitGraph()`. Node order in the spec map is preserved through the IR (object insertion order) so the generated bundle reads top-to-bottom in the same order as the YAML.
+
+### End-to-end smoke (`scripts/section-19-smoke.ts`)
+
+Drives `examples/hello-graph` (3-node `plan → execute → summarise`, with HITL on `execute`) against the live model:
+
+1. Fresh run: stdin `"research the top 3 risks of GRPH-style agents and summarise"` → trace shows `node_start` / `node_end` / `checkpoint` for plan, `hitl_pause` on execute (the bundle prints `paused at execute … checkpoint=ckpt_…`).
+2. Capture the `grun_…` and the plan checkpoint id from the trace; `--resume <grun> approve` → summarise executes, `run_done` fires.
+3. `--branch-from <grun> <plan-ckpt>` → bundle prints `branched: newRun=grun_… head=ckpt_… from=…`; the new run id is distinct from the original.
+4. Cleanup `.crewhaus/graphs/`.
+
+Crash recovery (re-run `--resume <grun>` after a kill mid-execute) is supported by the same code path — the engine's exactly-once-via-checkpoint contract holds because `withIdempotency` caches results per `(grun, node, attempt)`. The smoke verifies the resume path which exercises the same branch.
 
 ---
 
