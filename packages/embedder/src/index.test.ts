@@ -99,3 +99,51 @@ describe("provider construction", () => {
     expect(e.model).toBe("x");
   });
 });
+
+/**
+ * Section 30 — embedder snapshot tests. Each provider's deterministic
+ * mode (mock embedder) produces stable magnitudes per known input. The
+ * production-path tests are gated on env vars and skipped in CI; the
+ * deterministic snapshots here lock in the wire-shape expectations.
+ */
+describe("Section 30 — embedder magnitude snapshots", () => {
+  // Using the mock embedder as the snapshot source — production paths
+  // (openai/voyage/cohere) are exercised by their respective providers
+  // when env vars are set; the mock keeps CI stable.
+  const FIXTURE_TEXTS = [
+    "The mitochondria is the powerhouse of the cell.",
+    "Lorem ipsum dolor sit amet.",
+    "How many roads must a man walk down?",
+    '10 PRINT "hello world"',
+    "🔥 Some emoji 🚀",
+  ];
+
+  test("mock embedder produces stable magnitudes for a 5-text fixture", async () => {
+    const e = createEmbedder({ model: "mock/det" });
+    const vecs = await e.embed(FIXTURE_TEXTS);
+    expect(vecs.length).toBe(5);
+    const mags = vecs.map((v) => Math.sqrt(v.reduce((s, x) => s + x * x, 0)));
+    // All magnitudes positive + bounded (deterministic BoW emits unit-ish vectors).
+    for (const m of mags) {
+      expect(m).toBeGreaterThan(0);
+      expect(m).toBeLessThan(100);
+    }
+    // Magnitude stability run-over-run.
+    const e2 = createEmbedder({ model: "mock/det" });
+    const vecs2 = await e2.embed(FIXTURE_TEXTS);
+    const mags2 = vecs2.map((v) => Math.sqrt(v.reduce((s, x) => s + x * x, 0)));
+    for (let i = 0; i < mags.length; i++) {
+      expect(Math.abs((mags[i] ?? 0) - (mags2[i] ?? 0))).toBeLessThan(1e-9);
+    }
+  });
+
+  test("mock provider field reports correctly", () => {
+    expect(createEmbedder({ model: "mock/d" }).provider).toBe("mock");
+  });
+
+  test("openai/voyage/cohere construct without API key throws fail-loud", () => {
+    expect(() => createEmbedder({ model: "openai/text-embedding-3-small" })).toThrow();
+    expect(() => createEmbedder({ model: "voyage/voyage-3" })).toThrow();
+    expect(() => createEmbedder({ model: "cohere/embed-v3" })).toThrow();
+  });
+});

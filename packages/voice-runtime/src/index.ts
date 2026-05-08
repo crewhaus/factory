@@ -387,42 +387,152 @@ export function createOpenAIRealtimeAdapter(
 
 export type CreateVapiRealtimeAdapterOptions = {
   readonly apiKey?: string;
+  readonly assistantId?: string;
+  /** Test injection — same shape as OpenAI's. */
+  readonly _ws?: WebSocketFactory;
+  readonly _now?: () => Date;
+  /** Override the WebSocket URL. Default: `wss://api.vapi.ai/v1/realtime`. */
+  readonly url?: string;
 };
 
+const DEFAULT_VAPI_REALTIME_URL = "wss://api.vapi.ai/v1/realtime";
+
+/**
+ * Section 30 — Vapi realtime adapter. Maps to the same `RealtimeAdapter`
+ * interface as OpenAI Realtime so callers can swap providers via spec
+ * config. The connect handshake takes an `assistantId` (Vapi's preset)
+ * plus the same instructions/voice/temperature knobs the OpenAI path
+ * supports.
+ *
+ * Without `VAPI_API_KEY` set or an `_ws` injection, `connect()` throws
+ * with a clear message — production deployments enable this when the
+ * env var is present.
+ */
 export function createVapiRealtimeAdapter(
   opts: CreateVapiRealtimeAdapterOptions = {},
 ): RealtimeAdapter {
   const apiKey = opts.apiKey ?? process.env["VAPI_API_KEY"];
+  let ws: WebSocketLike | undefined;
+  let connected = false;
+  let disconnected = false;
+  const handlers = new Set<RealtimeEventHandler>();
+
+  function emit(event: RealtimeEvent): void {
+    for (const h of handlers) {
+      try {
+        h(event);
+      } catch {
+        /* subscribers must not crash the adapter */
+      }
+    }
+  }
+
+  function send(message: Record<string, unknown>): void {
+    if (ws === undefined || ws.readyState !== 1) {
+      throw new VoiceRuntimeError("vapi adapter is not connected (or socket is not open)");
+    }
+    ws.send(JSON.stringify(message));
+  }
+
   return {
     providerId: "vapi",
     sampleRate: OPENAI_REALTIME_SAMPLE_RATE,
     get connected() {
-      return false;
+      return connected;
     },
-    async connect() {
-      throw new VoiceRuntimeError(
-        apiKey
-          ? "voice-runtime: vapi adapter is not implemented in v0 — only realtime-openai is supported."
-          : "voice-runtime: vapi adapter requires VAPI_API_KEY (and is not implemented in v0).",
-      );
+    async connect(connectOpts: RealtimeConnectOptions): Promise<void> {
+      if (!apiKey) {
+        throw new VoiceRuntimeError("voice-runtime: vapi adapter requires VAPI_API_KEY");
+      }
+      if (disconnected) throw new VoiceRuntimeError("vapi adapter has been disconnected");
+      const wsFactory =
+        opts._ws ??
+        (((url: string, init: { headers?: Record<string, string> }) =>
+          new (
+            globalThis as { WebSocket: new (u: string, init?: unknown) => WebSocketLike }
+          ).WebSocket(url, init) as unknown as WebSocketLike) as WebSocketFactory);
+      const url = opts.url ?? DEFAULT_VAPI_REALTIME_URL;
+      ws = wsFactory(url, {
+        headers: { Authorization: `Bearer ${apiKey}` },
+      });
+      await new Promise<void>((resolve, reject) => {
+        if (!ws) return reject(new VoiceRuntimeError("ws factory returned undefined"));
+        ws.addEventListener("open", () => {
+          connected = true;
+          // Vapi configuration handshake.
+          send({
+            type: "session.update",
+            session: {
+              voice: connectOpts.voice,
+              instructions: connectOpts.instructions,
+              ...(opts.assistantId !== undefined ? { assistant_id: opts.assistantId } : {}),
+            },
+          });
+          resolve();
+        });
+        ws.addEventListener("error", (ev) => {
+          reject(
+            new VoiceRuntimeError(
+              `vapi ws error: ${String((ev as { message?: string })?.message ?? ev)}`,
+            ),
+          );
+        });
+        ws.addEventListener("close", () => {
+          connected = false;
+        });
+        ws.addEventListener("message", (ev) => {
+          const raw = (ev as { data?: string }).data ?? "";
+          try {
+            const parsed = JSON.parse(raw) as { type?: string };
+            if (typeof parsed.type === "string") {
+              emit({
+                kind: "raw",
+                provider: "vapi",
+                ts: (opts._now ?? ((): Date => new Date()))().toISOString(),
+                payload: parsed,
+              });
+            }
+          } catch {
+            /* swallow malformed frames */
+          }
+        });
+      });
     },
-    sendAudio() {
-      throw new VoiceRuntimeError("vapi adapter is not implemented in v0");
+    sendAudio(pcm: Int16Array): void {
+      // Vapi accepts base64-encoded PCM in `input_audio_buffer.append`.
+      const buf = Buffer.from(pcm.buffer, pcm.byteOffset, pcm.byteLength);
+      send({ type: "input_audio_buffer.append", audio: buf.toString("base64") });
     },
-    commitInput() {
-      /* no-op for the v0 stub */
+    commitInput(): void {
+      send({ type: "input_audio_buffer.commit" });
     },
-    sendText() {
-      throw new VoiceRuntimeError("vapi adapter is not implemented in v0");
+    sendText(text: string): void {
+      send({ type: "response.create", response: { modalities: ["text", "audio"], input: text } });
     },
-    interrupt() {
-      /* no-op */
+    interrupt(_reason: string): void {
+      try {
+        send({ type: "response.cancel" });
+      } catch {
+        /* idempotent */
+      }
     },
-    on() {
-      return () => {};
+    on(handler): () => void {
+      handlers.add(handler);
+      return () => {
+        handlers.delete(handler);
+      };
     },
-    async disconnect() {
-      /* no-op */
+    async disconnect(): Promise<void> {
+      if (ws) {
+        try {
+          ws.close();
+        } catch {
+          /* best effort */
+        }
+        ws = undefined;
+      }
+      disconnected = true;
+      connected = false;
     },
   };
 }

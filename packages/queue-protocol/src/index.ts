@@ -31,6 +31,23 @@
  */
 import { CrewhausError } from "@crewhaus/errors";
 
+// Section 30 — additional adapter family members
+export {
+  createSqsAdapter,
+  type SqsAdapterOptions,
+  type SqsClientLike,
+} from "./adapters/sqs";
+export {
+  createRedisStreamsAdapter,
+  type RedisStreamsAdapterOptions,
+  type RedisClientLike,
+} from "./adapters/redis-streams";
+export {
+  createPostgresAdapter,
+  type PostgresAdapterOptions,
+  type PostgresClientLike,
+} from "./adapters/postgres";
+
 export class QueueProtocolError extends CrewhausError {
   override readonly name = "QueueProtocolError";
   constructor(message: string, cause?: unknown) {

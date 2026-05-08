@@ -182,14 +182,48 @@ export function createVectorStore(opts: VectorStoreOptions): VectorStore {
   switch (opts.backend) {
     case "in-memory":
       return new InMemoryVectorStore();
-    case "lance":
+    case "lance": {
+      const lance = require("./backends/lance") as typeof import("./backends/lance");
+      return lance.createLanceVectorStore({
+        path: opts.url ?? ".crewhaus/vectors/lance",
+        ...(opts.collection !== undefined ? { collection: opts.collection } : {}),
+      });
+    }
     case "qdrant":
     case "pinecone":
-    case "weaviate":
-      return new NotImplementedVectorStore(opts.backend);
+    case "weaviate": {
+      if (!opts.url) {
+        throw new VectorStoreError(`${opts.backend} backend requires url`);
+      }
+      if (!opts.collection) {
+        throw new VectorStoreError(`${opts.backend} backend requires collection`);
+      }
+      const httpOpts = {
+        url: opts.url,
+        ...(opts.apiKey !== undefined ? { apiKey: opts.apiKey } : {}),
+        collection: opts.collection,
+      };
+      const { createQdrantVectorStore, createPineconeVectorStore, createWeaviateVectorStore } =
+        require("./backends/http") as typeof import("./backends/http");
+      if (opts.backend === "qdrant") return createQdrantVectorStore(httpOpts);
+      if (opts.backend === "pinecone") return createPineconeVectorStore(httpOpts);
+      return createWeaviateVectorStore(httpOpts);
+    }
     default: {
       const exhaustive: never = opts.backend;
       throw new VectorStoreError(`unknown backend "${exhaustive}"`);
     }
   }
 }
+
+// Section 30 — direct backend exports for callers that need custom auth.
+export {
+  createLanceVectorStore,
+  type LanceBackendOptions,
+} from "./backends/lance";
+export {
+  createPineconeVectorStore,
+  createQdrantVectorStore,
+  createWeaviateVectorStore,
+  type HttpVectorBackendOptions,
+} from "./backends/http";

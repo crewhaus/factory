@@ -95,15 +95,10 @@ describe("concurrent upserts (T9)", () => {
   });
 });
 
-describe("not-implemented backends", () => {
-  test("lance throws a clear v0 message", async () => {
-    const store = createVectorStore({ backend: "lance" });
-    await expect(store.upsert("a", [1])).rejects.toThrow(/not implemented in v0/);
-  });
-  test("qdrant / pinecone / weaviate all throw", async () => {
+describe("Section 30 — non-default backends require config", () => {
+  test("qdrant / pinecone / weaviate require url + collection", () => {
     for (const backend of ["qdrant", "pinecone", "weaviate"] as const) {
-      const store = createVectorStore({ backend });
-      await expect(store.upsert("a", [1])).rejects.toBeInstanceOf(VectorStoreError);
+      expect(() => createVectorStore({ backend })).toThrow(VectorStoreError);
     }
   });
 });

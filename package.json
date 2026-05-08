@@ -56,7 +56,8 @@
     "smoke:section-27": "bun examples/section-27-smoke/smoke.ts",
     "smoke:section-28": "bun examples/section-28-smoke/smoke.ts",
     "smoke:section-29": "bun examples/section-29-smoke/smoke.ts",
-    "compile:hello-eval": "bun apps/cli/src/index.ts compile examples/hello-eval/crewhaus.yaml -o examples/hello-eval/dist"
+    "compile:hello-eval": "bun apps/cli/src/index.ts compile examples/hello-eval/crewhaus.yaml -o examples/hello-eval/dist",
+    "smoke:section-30": "bun examples/section-30-smoke/smoke.ts"
   },
   "devDependencies": {
     "@biomejs/biome": "1.9.4",
