@@ -1,6 +1,6 @@
 # CrewHaus Factory — Build Roadmap
 
-> Status as of 2026-05-08. 132 of ~190 catalog modules implemented across 127 workspace packages; **Sections 1–30 all complete — 12 target shapes ship + production hardening floor + deployment surface + evaluation depth + backend adapter completions (Section 30 adds SQS / Redis Streams / Postgres queue adapters; Lance / Qdrant / Pinecone / Weaviate vector backends; Twilio / LiveKit SIP telephony; Vapi realtime; host + remote browser drivers — all with stub-fetch contract tests and fail-loud SDK diagnostics)**. Section 31 below covers Studio v1 (Lit + Monaco + live trace replay + plugin sandbox completion).
+> Status as of 2026-05-08. **All 31 roadmap sections complete.** 138+ of ~190 catalog modules implemented across 127 workspace packages; 12 target shapes ship; production hardening floor + deployment surface + evaluation depth + backend adapter completions + Studio v1 are all merged. The v1.0 product surface plus all production-ops, eval-depth, adapter, and Studio polish are in.
 > See `docs/MODULE-CATALOG.md` for full per-module specs, test layer references, and the per-row `Depends on` columns + 🔴/🟡 risk markers used throughout this roadmap.
 
 ---
@@ -136,7 +136,7 @@ Tool surface expansion (✅ §14) ──► Observability (✅ §15)
 | **§28 Deployment + canary + migration** | ✅ | §27 (`rate-limiter`), §16 (`eval-runner` for canary gate), §10 (event-log for migration replay) | Continuous deployment, deploy-as-eval-gate pattern, multi-version spec rollouts, `web-ui` deploy-button |
 | **§29 Evaluation depth + EVAL target shape** | ✅ | §16 (eval stack), §17 (multi-provider model-router for judge swaps) | EVAL target shape, prompt-optimizer regression CI, dataset/grader plugin ecosystem |
 | **§30 Backend adapter completions** | ✅ | §17 base adapter shapes; §21 vector-store interface; §23 queue-protocol interface; §24 telephony slot; §25 driver interface | Production CHN/MGD/RES/VOICE/BROW deployments without v0 stub limits |
-| **§31 Studio v1** | 🟡 last; after §27–30 | every prior section's IR / trace / event / metric kinds | Production authoring UI, run replay, multi-spec dashboards, third-party plugin marketplace |
+| **§31 Studio v1** | ✅ | every prior section's IR / trace / event / metric kinds | Production authoring UI, run replay, multi-spec dashboards, third-party plugin marketplace |
 
 ---
 
@@ -1902,7 +1902,7 @@ browser: host backend / remote backend
 
 ## Section 31 — Studio v1
 
-> Status: 🟡 last in this roadmap. Depends on Sections 27–30 (everything they ship needs to render in Studio).
+> Status: ✅ landed (2026-05-08). Five package upgrades shipped: `studio-server` v1 (RunDispatcher injection point — production callers wire spawn-runChatLoop or any equivalent runtime; new endpoints `/api/runs/:runId/cancel` + `/api/runs/:runId/replay` + `/api/runs/:runId/hitl?nodeId=&decision=` + `/api/cost-summary?tenant=&from=&to=`; ReplaySource + CostSummarySource injection slots), `studio-ui` v1 (additive `renderMultiSpecDashboard(rows)` for cost + pass-rate + p50/p95 latency aggregation; HTML escaping + alphabetical sort + 4-decimal cost rendering), `trace-viewer` v1 (`replay(events, { speed: 1|2|4|"raw" })` async iterable with deterministic setTimeout shim; `drilldownSpan(timeline, events, spanId)` for click-through), `graph-visualizer` v1 (`initialLiveState` + `applyEvent` state machine over node_start/node_end/hitl_pause/hitl_decision/node_error events; `renderLiveSvg` augments base SVG with per-node `data-state` attributes for CSS-driven coloring; bounded history at 1000 entries), `plugin-sdk` v1 (declared `permissions: { fs: ["read:..."], net: ["fetch:..."] }` schema validated at `definePlugin`; `isFsAllowed` / `isNetAllowed` runtime-evaluators with fail-closed semantics + minimatch-style glob support). End-to-end smoke (`bun run smoke:section-31`) drives 6 in-process probes covering each module.
 
 **Catalog modules (extensions to §26 packages):** `studio-ui` (Lit + Monaco rewrite), `studio-server` (full SSE wiring), `plugin-sdk` (content-sandbox isolation)
 

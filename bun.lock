@@ -285,6 +285,19 @@
         "@crewhaus/voice-runtime": "workspace:*",
       },
     },
+    "examples/section-31-smoke": {
+      "name": "@crewhaus-examples/section-31-smoke",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/graph-visualizer": "workspace:*",
+        "@crewhaus/ir": "workspace:*",
+        "@crewhaus/plugin-sdk": "workspace:*",
+        "@crewhaus/studio-server": "workspace:*",
+        "@crewhaus/studio-ui": "workspace:*",
+        "@crewhaus/trace-event-bus": "workspace:*",
+        "@crewhaus/trace-viewer": "workspace:*",
+      },
+    },
     "packages/a2a-protocol": {
       "name": "@crewhaus/a2a-protocol",
       "version": "0.0.0",
@@ -1672,6 +1685,8 @@
     "@crewhaus-examples/section-29-smoke": ["@crewhaus-examples/section-29-smoke@workspace:examples/section-29-smoke"],
 
     "@crewhaus-examples/section-30-smoke": ["@crewhaus-examples/section-30-smoke@workspace:examples/section-30-smoke"],
+
+    "@crewhaus-examples/section-31-smoke": ["@crewhaus-examples/section-31-smoke@workspace:examples/section-31-smoke"],
 
     "@crewhaus/a2a-protocol": ["@crewhaus/a2a-protocol@workspace:packages/a2a-protocol"],
 

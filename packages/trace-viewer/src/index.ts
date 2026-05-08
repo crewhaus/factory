@@ -279,3 +279,65 @@ export function buildTimeline(events: ReadonlyArray<TraceEvent>): Timeline {
 
   return { t0: lo, t1: hi, spans: annotated };
 }
+
+/**
+ * Section 31 — replay scrubber. Yields events at the configured speed
+ * via a deterministic scheduler. Tests pass `now()` and `setTimeout`
+ * shims so they can verify event ordering without real wall-clock waits.
+ */
+export type ReplayOptions = {
+  /** Replay speed multiplier; 1×/2×/4×/raw. */
+  readonly speed: 1 | 2 | 4 | "raw";
+  /** Override setTimeout for tests. */
+  readonly setTimeoutImpl?: (cb: () => void, ms: number) => void;
+};
+
+/**
+ * Replay events with timing relative to the first event. Returns an
+ * AsyncIterable so callers can `for await ... of` to drive the UI.
+ *
+ * `speed: "raw"` yields every event immediately. `speed: 1` waits the
+ * actual delta between consecutive events (capped at 5s per gap).
+ * `speed: 2` halves the wait; `speed: 4` quarters.
+ */
+export async function* replay(
+  events: ReadonlyArray<TraceEvent>,
+  opts: ReplayOptions,
+): AsyncIterable<TraceEvent> {
+  if (events.length === 0) return;
+  const setTimeoutImpl = opts.setTimeoutImpl ?? setTimeout;
+  const speedDivisor = opts.speed === "raw" ? Number.POSITIVE_INFINITY : opts.speed;
+  const firstTs = Date.parse((events[0] as TraceEvent).timestamp);
+  let lastTs = firstTs;
+  for (const ev of events) {
+    const evTs = Date.parse(ev.timestamp);
+    const gapMs = evTs - lastTs;
+    if (Number.isFinite(speedDivisor) && gapMs > 0) {
+      const wait = Math.min(5000, Math.max(0, gapMs / speedDivisor));
+      await new Promise<void>((resolve) => setTimeoutImpl(resolve, wait));
+    }
+    yield ev;
+    lastTs = evTs;
+  }
+}
+
+/**
+ * Section 31 — drilldown helper. Surface the matching event payload for
+ * a clicked span so the UI can render the full request/response.
+ */
+export type SpanDrilldown = {
+  readonly spanId: string;
+  readonly span: TimelineSpan;
+  readonly events: ReadonlyArray<TraceEvent>;
+};
+
+export function drilldownSpan(
+  timeline: Timeline,
+  events: ReadonlyArray<TraceEvent>,
+  spanId: string,
+): SpanDrilldown | undefined {
+  const span = timeline.spans.find((s) => s.spanId === spanId);
+  if (!span) return undefined;
+  const related = events.filter((e) => e.spanId === spanId || e.parentSpanId === spanId);
+  return { spanId, span, events: related };
+}

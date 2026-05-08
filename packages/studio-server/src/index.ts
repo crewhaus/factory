@@ -62,6 +62,47 @@ export class StudioServerError extends CrewhausError {
   }
 }
 
+/**
+ * Section 31 — RunDispatcher injection. v0 ships with a canned-event
+ * emitter; v1 callers can inject a real dispatcher that spawns
+ * `runChatLoop` (or any equivalent agent runtime). The dispatcher
+ * receives a fresh `runId` + the spec name + prompt and pushes events
+ * into the same run-event queue the SSE subscribers consume.
+ */
+export type RunDispatcher = (req: {
+  readonly runId: string;
+  readonly specName: string;
+  readonly prompt: string;
+  /** Push an event into the run's SSE queue. */
+  readonly publish: (event: { kind: string; [k: string]: unknown }) => void;
+  /** Mark the run as done; the SSE consumer will close. */
+  readonly finish: (finalText: string) => void;
+  /** Abort signal that fires on `/api/runs/:runId/cancel`. */
+  readonly signal: AbortSignal;
+}) => Promise<void> | void;
+
+/**
+ * Section 31 — replay source. v1 callers wire this to §10 event-log so
+ * `/api/runs/:runId/replay` re-emits a prior run's events. v0 default
+ * returns the in-memory event buffer.
+ */
+export type ReplaySource = (
+  runId: string,
+) => Promise<ReadonlyArray<{ kind: string; [k: string]: unknown }> | undefined>;
+
+/**
+ * Section 31 — cost summary source. Wired to §27 cost-tracker
+ * aggregations. Returns total + per-provider micros.
+ */
+export type CostSummarySource = (query: {
+  readonly tenantId?: string;
+  readonly fromMs?: number;
+  readonly toMs?: number;
+}) => Promise<{
+  readonly totalUsdMicros: number;
+  readonly byProvider: Readonly<Record<string, number>>;
+}>;
+
 export type StudioServerOptions = {
   readonly port?: number;
   /** Spec workspace root; defaults to CWD/specs. */
@@ -70,6 +111,14 @@ export type StudioServerOptions = {
   readonly pluginRoot?: string;
   /** Dev mode disables auth. v0 default: true. */
   readonly devMode?: boolean;
+  /** Section 31 — inject a real dispatcher to replace canned events. */
+  readonly runDispatcher?: RunDispatcher;
+  /** Section 31 — replay source for /api/runs/:runId/replay. */
+  readonly replaySource?: ReplaySource;
+  /** Section 31 — cost summary source for /api/cost-summary. */
+  readonly costSummarySource?: CostSummarySource;
+  /** Section 31 — JWT verifier for production auth. Default: dev-mode pass-through. */
+  readonly verifyJwt?: (token: string) => Promise<{ readonly tenantId?: string }>;
 };
 
 export type StudioServerHandle = {
@@ -120,6 +169,8 @@ export async function startStudioServer(
       finalText: string;
     }
   >();
+  // Section 31 — per-run AbortController for /api/runs/:runId/cancel
+  const runAborts = new Map<string, AbortController>();
 
   function pushRunEvent(runId: string, ev: RunEvent): void {
     const r = runs.get(runId);
@@ -298,11 +349,30 @@ export async function startStudioServer(
       const fp = specPath(body.specName);
       if (!existsSync(fp)) return jsonResponse({ error: "spec not found" }, 404);
       const runId = `run_${Math.random().toString(16).slice(2, 10)}${Math.random().toString(16).slice(2, 10)}`;
+      const abort = new AbortController();
+      runAborts.set(runId, abort);
       runs.set(runId, { events: [], done: false, subscribers: new Set(), finalText: "" });
-      // v0 fires a canned event sequence asynchronously so the SSE
-      // subscriber sees them. A follow-up PR replaces this with a real
-      // subprocess invocation of `crewhaus run`.
+      // Section 31 — when the caller injects `runDispatcher`, dispatch
+      // through it (production wiring spawns runChatLoop). Otherwise
+      // fall back to the v0 canned events for backwards compat.
       const fire = async (): Promise<void> => {
+        if (opts.runDispatcher) {
+          try {
+            await opts.runDispatcher({
+              runId,
+              specName: body.specName as string,
+              prompt: body.prompt as string,
+              publish: (ev) => pushRunEvent(runId, ev),
+              finish: (text) => finishRun(runId, text),
+              signal: abort.signal,
+            });
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            pushRunEvent(runId, { kind: "error", message });
+            finishRun(runId, `(dispatcher errored: ${message})`);
+          }
+          return;
+        }
         pushRunEvent(runId, { kind: "run_start", specName: body.specName, prompt: body.prompt });
         await new Promise((r) => setTimeout(r, 5));
         pushRunEvent(runId, { kind: "trace", subkind: "model_request", model: "stub" });
@@ -314,6 +384,79 @@ export async function startStudioServer(
       };
       void fire();
       return jsonResponse({ runId }, 201);
+    }
+    // Section 31 — /api/runs/:runId/cancel sends abort signal to dispatcher
+    const mc = /^\/api\/runs\/(run_[a-z0-9]+)\/cancel$/.exec(p);
+    if (mc && m === "POST") {
+      const runId = mc[1] as string;
+      const abort = runAborts.get(runId);
+      if (!abort) return jsonResponse({ error: "run not found or already finished" }, 404);
+      abort.abort();
+      finishRun(runId, "(cancelled by user)");
+      return jsonResponse({ ok: true });
+    }
+    // Section 31 — /api/runs/:runId/replay re-emits prior events from
+    // the replaySource (typically wired to §10 event-log).
+    const mrep = /^\/api\/runs\/(run_[a-z0-9]+)\/replay$/.exec(p);
+    if (mrep && m === "GET") {
+      const runId = mrep[1] as string;
+      const events = opts.replaySource ? await opts.replaySource(runId) : runs.get(runId)?.events;
+      if (!events) return jsonResponse({ error: "run not found" }, 404);
+      const enc = new TextEncoder();
+      const stream = new ReadableStream({
+        start(controller) {
+          for (const ev of events) {
+            controller.enqueue(enc.encode(`data: ${JSON.stringify(ev)}\n\n`));
+          }
+          controller.enqueue(enc.encode("event: done\ndata: {}\n\n"));
+          controller.close();
+        },
+      });
+      return new Response(stream, {
+        status: 200,
+        headers: {
+          "content-type": "text/event-stream",
+          "cache-control": "no-cache",
+        },
+      });
+    }
+    // Section 31 — /api/runs/:runId/hitl?nodeId=&decision= — graph HITL approve/reject
+    const mhitl = /^\/api\/runs\/(run_[a-z0-9]+)\/hitl$/.exec(p);
+    if (mhitl && m === "POST") {
+      const runId = mhitl[1] as string;
+      const url = new URL(req.url);
+      const nodeId = url.searchParams.get("nodeId");
+      const decision = url.searchParams.get("decision");
+      if (!nodeId || !decision) {
+        return jsonResponse({ error: "nodeId + decision required" }, 400);
+      }
+      pushRunEvent(runId, {
+        kind: "hitl_decision",
+        nodeId,
+        decision,
+        ts: new Date().toISOString(),
+      });
+      return jsonResponse({ ok: true });
+    }
+    // Section 31 — /api/cost-summary?tenant=&from=&to=
+    if (p === "/api/cost-summary" && m === "GET") {
+      const url = new URL(req.url);
+      const tenantId = url.searchParams.get("tenant") ?? undefined;
+      const from = url.searchParams.get("from");
+      const to = url.searchParams.get("to");
+      if (!opts.costSummarySource) {
+        return jsonResponse({
+          totalUsdMicros: 0,
+          byProvider: {},
+          note: "no costSummarySource wired (pass via createStudioServerOptions)",
+        });
+      }
+      const summary = await opts.costSummarySource({
+        ...(tenantId !== undefined ? { tenantId } : {}),
+        ...(from !== null ? { fromMs: Number.parseInt(from, 10) } : {}),
+        ...(to !== null ? { toMs: Number.parseInt(to, 10) } : {}),
+      });
+      return jsonResponse(summary);
     }
     const mr = /^\/api\/runs\/(run_[a-z0-9]+)\/events$/.exec(p);
     if (mr && m === "GET") {

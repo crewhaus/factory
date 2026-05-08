@@ -224,3 +224,58 @@ function escapeHtml(s) {
 activate('specs');
 `.trim();
 }
+
+/**
+ * Section 31 — multi-spec dashboard renderer. Returns an HTML fragment
+ * that can be embedded in any tab. Aggregates per-spec metrics; the
+ * data fetching is the caller's responsibility (keeps the renderer
+ * pure + testable).
+ */
+export type DashboardRow = {
+  readonly specName: string;
+  readonly costUsdMicros: number;
+  readonly passRate?: number;
+  readonly p50LatencyMs?: number;
+  readonly p95LatencyMs?: number;
+  readonly runCount: number;
+};
+
+export function renderMultiSpecDashboard(rows: ReadonlyArray<DashboardRow>): string {
+  const escapeHtml = (s: string): string =>
+    s.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+  if (rows.length === 0) {
+    return '<p class="dashboard-empty">No specs registered yet.</p>';
+  }
+  const sorted = [...rows].sort((a, b) => a.specName.localeCompare(b.specName));
+  const cells = sorted
+    .map((r) => {
+      const cost = `$${(r.costUsdMicros / 1_000_000).toFixed(4)}`;
+      const pass = r.passRate !== undefined ? `${(r.passRate * 100).toFixed(1)}%` : "—";
+      const p50 = r.p50LatencyMs !== undefined ? `${r.p50LatencyMs.toFixed(0)}ms` : "—";
+      const p95 = r.p95LatencyMs !== undefined ? `${r.p95LatencyMs.toFixed(0)}ms` : "—";
+      return `<tr>
+        <td>${escapeHtml(r.specName)}</td>
+        <td>${r.runCount}</td>
+        <td>${cost}</td>
+        <td>${pass}</td>
+        <td>${p50}</td>
+        <td>${p95}</td>
+      </tr>`;
+    })
+    .join("\n");
+  return `<table class="dashboard">
+  <thead>
+    <tr>
+      <th>Spec</th>
+      <th>Runs</th>
+      <th>Cost</th>
+      <th>Pass-rate</th>
+      <th>p50 latency</th>
+      <th>p95 latency</th>
+    </tr>
+  </thead>
+  <tbody>
+${cells}
+  </tbody>
+</table>`;
+}
