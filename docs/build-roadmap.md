@@ -1,23 +1,25 @@
 # CrewHaus Factory — Build Roadmap
 
-> Status as of 2026-05-08. 86 of ~190 catalog modules implemented across 81 workspace packages; Sections 1–21 all complete. Sections 22–25 below round out the remaining target shapes (CRW multi-agent crew, RES research agent, BATCH queue worker, VOICE realtime audio, BROW computer-use) plus Section 26 lands the Studio authoring + trace-inspection UI on top.
+> Status as of 2026-05-08. 116 of ~190 catalog modules implemented across 111 workspace packages; **Sections 1–26 all complete — all 11 target shapes ship**. Sections 27–31 below cover production hardening (cost / rate limits / cache / secrets), deployment surface (canary + migration), evaluation depth (prompt-optimizer + regression-runner + EVAL target shape), backend adapter completions (queue / vector / telephony / browser host backend), and Studio v1 (Lit + Monaco + live trace replay + plugin sandbox completion).
 > See `docs/MODULE-CATALOG.md` for full per-module specs, test layer references, and the per-row `Depends on` columns + 🔴/🟡 risk markers used throughout this roadmap.
 
 ---
 
 ## Critical path & risk overview
 
-Sections 1–21 are landed. Six target shapes ship today (CLI, workflow, channel, graph, managed, pipeline) on top of a complete tool framework, multi-provider model layer, persistence, observability, eval stack, sub-agents, and a containerised production-safety floor. The remaining roadmap closes out the meta-harness's target-shape promise (CRW + RES + BATCH + VOICE + BROW) and lands the Studio UI that turns the factory into a product surface.
+Sections 1–26 are landed. **All 11 target shapes ship today** (CLI, workflow, channel, graph, managed, pipeline, crew, research, batch, voice, browser) on top of a complete tool framework, multi-provider model layer, persistence, observability, eval stack, sub-agents, production safety floor, and Studio authoring + trace-inspection UI. The v1.0 product surface is complete — every shape claimed at project inception is reachable from a single spec.
 
-- **Section 22 (CRW target shape — multi-agent crew)** lands the missing coordination primitives that take the existing sub-agent surface from §13 to a full multi-agent crew: `agent-handoff` (R10), `a2a-protocol` (R10), `crew-orchestrator` (R10), `target-crew` (F2). Modest novelty — most of the heavy runtime work (isolation, permission inheritance, abort cascade) shipped in §13. The new pieces are the handoff protocol and the role-based dispatcher.
-- **Section 23 (RES + BATCH target shapes — parallel)** lands two additive shapes that compose existing primitives. RES (`target-research-bundle`, `planner`, `crawler`, `citation-tracker`, `report-writer`) leans heavily on §13 sub-agents + §15 trace bus + §10 persistence to support hours-long autonomous execution with branch exploration and citation tracking. BATCH (`queue-protocol`, `queue-consumer`, `idempotency-keys`, `target-batch-worker`) is a focused queue-consumer pattern — the meta-harness's answer to cron jobs and offline data pipelines.
-- **Section 24 (VOICE target shape)** is a dedicated section because realtime audio is genuinely novel territory: `voice-runtime` (R16), `vad-engine` (R16), `barge-in-controller` (R16), `call-session` (R16), `target-voice` (F2). The provider abstraction is non-trivial — OpenAI Realtime and Vapi differ at the wire-protocol level, and PCM/Opus framing + telephony lifecycle have no parallel anywhere else in the codebase.
-- **Section 25 (BROW target shape)** is dedicated for the same reason: `computer-use-driver` (R18), `tool-screen-capture` (R4), `tool-mouse-keyboard` (R4), `tool-vision-grounding` (R4), `target-browser-driver` (F2). Cross-OS desktop control over a screenshot loop is its own novel surface; the screenshot-frequency-vs-action-latency trade-off is the load-bearing design call.
-- **Section 26 (Studio — authoring + inspection UI)** sits on top of everything that's shipped and turns the factory into a product. Modules: `studio-server` (F4), `studio-ui` (F4), `trace-viewer` (F4), `graph-visualizer` (F4), `wizard` (F4), `scaffold-templates` (F4), `plugin-sdk` (F5). Studio is what closes the loop — spec authoring, live trace inspection, eval-result drilldowns, and a `crewhaus deploy` button.
+The remaining roadmap is about **hardening what shipped** rather than adding new product surface. Five themes remain, each scoped as its own section:
 
-**Parallelisation:** Section 22 (CRW) and Section 23 (RES + BATCH) are fully independent — they touch disjoint catalog modules and can land in parallel. Section 24 (VOICE) and Section 25 (BROW) are independent of each other and of 22/23, but each is a deep enough vertical that a dedicated push is warranted. Section 26 (Studio) is best done last because every prior section lands new event kinds / IR variants that the trace viewer and graph visualiser must render.
+- **Section 27 (Production hardening)** lands the cross-cutting controls that make a deployment safe to put in front of paying users: `cost-tracker` (per-run/per-tenant cost accumulation), `rate-limiter` (token-bucket per tenant/provider/tool), `circuit-breaker` (half-open state on unhealthy providers, composing with `model-router` failover), `prompt-cache-manager` (rotation across long-running CHN/MGD/RES daemons), and `secrets-manager` (OAuth/API-key/AWS rotation without daemon restart).
+- **Section 28 (Deployment + canary + migration)** turns the factory into a continuous-deployment surface: `deployment-controller` (version pinning, staging→prod promotion), `canary-controller` (percent-of-traffic rollout gated by `eval-runner` regression checks — the deploy-as-eval-gate pattern called out in PART F #10), `migration-runner` (versioned IR migrations across spec versions), `spec-registry` (multi-version spec storage with tenant overlays), `ir-passes` (optimization passes — dead-tool elimination, prompt-cache prefix sorting), and `migration-engine` (forward + backward IR migration paths).
+- **Section 29 (Evaluation depth + EVAL target shape)** closes the quality loop: `prompt-optimizer` (DSPy-style automated prompt tuning using §16 eval stack as the fitness function), `regression-runner` (diff-based pass/fail flip detection on every CI run), `target-eval-bundle` (first-class EVAL target shape — today eval is `crewhaus eval` only), `dataset-registry` (split-aware dataset versioning), `grader-registry` (pluggable graders beyond the §16 built-in set).
+- **Section 30 (Backend adapter completions)** fills out the v0-stub adapters: SQS / Redis Streams / Postgres queue adapters (today only `in-memory`), Lance / Qdrant / Pinecone / Weaviate vector backends (today only `in-memory`), OpenAI / Voyage / Cohere embedder backends (today the production paths are wired but lightly exercised), Twilio / LiveKit SIP telephony adapters (today only the in-memory smoke adapter), Vapi realtime adapter (today only OpenAI Realtime ships), browser `host` + `remote` backends (today only `chromium` ships).
+- **Section 31 (Studio v1 — Lit + Monaco + run replay + plugin sandbox completion)** turns the §26 Studio v0 into a production UI: Lit framework adoption (replaces the vanilla TS bundle), Monaco editor for spec YAML editing with live `spec-validator` lint, full SSE-driven live trace drilldown wired to `runChatLoop`, run-replay mode using §10 event-log to reconstruct any prior run, multi-spec dashboard with aggregate cost/latency, and full plugin-sandbox content isolation (Web Workers / Realm shim — today the §26 sandbox guard only checks file:// path escapes).
 
-Beyond Section 26, what remains is cross-cutting hardening (cost-tracker, prompt-cache-manager, secrets-manager rotation, rate-limiter, circuit-breaker, deployment-controller, canary-controller, migration-runner) plus deeper evaluation tooling (prompt-optimizer, regression-runner, dataset-registry, grader-registry). These are scoped in MODULE-CATALOG but not yet roadmapped — they belong in Sections 27+ after the target-shape catalogue is complete.
+**Parallelisation:** Sections 27 and 30 are independent — production controls and adapter completions touch disjoint code. Section 28 depends on §27's `rate-limiter` for canary traffic shaping. Section 29 is independent of all four others. Section 31 is best done last because every prior section's new IR/event kinds want to render in Studio.
+
+Beyond Section 31, the remaining ~70 catalog modules are second-tier polish: more channel adapters (Telegram, Discord, WhatsApp, iMessage), more graders, more deployment frontends, more language sandbox images. These can land opportunistically against shipped infrastructure and don't warrant dedicated roadmap sections.
 
 ## Section dependency graph
 
@@ -66,9 +68,38 @@ Tool surface expansion (✅ §14) ──► Observability (✅ §15)
                               target-browser-driver)
                                             │
                                             ▼
-                              §26 Studio (authoring + inspection UI)
+                              §26 Studio (✅ authoring + inspection UI)
                               (studio-server, studio-ui, trace-viewer,
                               graph-visualizer, wizard, plugin-sdk)
+                                            │
+                       ┌────────────────────┼────────────────────┐
+                       ▼                    ▼                    ▼
+                §27 Production         §28 Deploy +        §29 Eval depth
+                hardening              canary +            + EVAL target
+                (cost-tracker,         migration           (prompt-optimizer,
+                rate-limiter,          (deployment-        regression-runner,
+                circuit-breaker,       controller,         target-eval-bundle,
+                prompt-cache-          canary-controller,  dataset-registry,
+                manager,               migration-runner,   grader-registry)
+                secrets-manager)       spec-registry,
+                       │               ir-passes,                │
+                       │               migration-engine)         │
+                       │                    ▲                    │
+                       └────► (rate-limiter)┘                    │
+                                            │                    │
+                                            ▼                    ▼
+                              §30 Backend adapter completions
+                              (queue: SQS/Redis/Postgres;
+                              vector: Lance/Qdrant/Pinecone/Weaviate;
+                              embedder: OpenAI/Voyage/Cohere prod paths;
+                              telephony: Twilio/LiveKit;
+                              realtime: Vapi;
+                              browser: host + remote backends)
+                                            │
+                                            ▼
+                              §31 Studio v1
+                              (Lit + Monaco + live SSE replay
+                              + plugin-sandbox content isolation)
 ```
 
 ## Section dependency table
@@ -96,17 +127,22 @@ Tool surface expansion (✅ §14) ──► Observability (✅ §15)
 | **§19 GRPH target shape** | ✅ | §1–4, §10 (event-log replay) | GRPH shape, `durable-execution` family, branch/HITL flows, MGD durability |
 | **§20 MGD target shape + governance** | ✅ | §18 (`policy-engine`), §10, §15 | MGD shape, remote channel daemon, multi-tenant deployment, `web-ui` backend |
 | **§21 RAG target shape** | ✅ | §1–4, §15 (trace-event-bus for retrieval spans) | RAG shape, all R12 retrieval/embedding modules, doc-grounded agents |
-| **§22 CRW target shape** | 🟡 next, parallel with §23 | §13 (sub-agents), §15 (trace bus), §11 (hooks) | CRW shape, multi-agent coordination patterns, `agent-framework`/`crewAI` parity |
-| **§23 RES + BATCH target shapes** | 🟡 next, parallel with §22 | §10 (persistence), §13 (sub-agents for RES), §14 (`tool-fetch` for RES crawl) | RES shape (autonomous research), BATCH shape (queue worker), cron-scheduled agents |
-| **§24 VOICE target shape** | 🟡 dedicated; after §22–23 | §1–7 base runtime; §17 model-router for realtime providers | VOICE shape, telephony/realtime audio agents, OpenAI Realtime + Vapi parity |
-| **§25 BROW target shape** | 🟡 dedicated; after §22–23 | §1–7 base runtime; §18 sandbox for screenshot ops | BROW shape, computer-use agents, Operator-style cross-OS desktop control |
-| **§26 Studio** | 🟡 last; after §22–25 | every prior section's IR variants + trace event kinds | Authoring UI, trace-viewer drilldown, graph visualizer, wizard, plugin SDK, eval-result inspection |
+| **§22 CRW target shape** | ✅ | §13 (sub-agents), §15 (trace bus), §11 (hooks) | CRW shape, multi-agent coordination patterns, `agent-framework`/`crewAI` parity |
+| **§23 RES + BATCH target shapes** | ✅ | §10 (persistence), §13 (sub-agents for RES), §14 (`tool-fetch` for RES crawl) | RES shape (autonomous research), BATCH shape (queue worker), cron-scheduled agents |
+| **§24 VOICE target shape** | ✅ | §1–7 base runtime; §17 model-router for realtime providers | VOICE shape, telephony/realtime audio agents, OpenAI Realtime + Vapi parity |
+| **§25 BROW target shape** | ✅ | §1–7 base runtime; §18 sandbox for screenshot ops | BROW shape, computer-use agents, Operator-style cross-OS desktop control |
+| **§26 Studio** | ✅ | every prior section's IR variants + trace event kinds | Authoring UI, trace-viewer drilldown, graph visualizer, wizard, plugin SDK, eval-result inspection |
+| **§27 Production hardening** | 🟡 next, parallel with §29 / §30 | §17 (`model-router`), §15 (trace bus for cost telemetry), §20 (gateway-server for per-tenant rate-limit) | §28 (`canary-controller` uses rate-limiter for traffic shaping), production-grade CHN/MGD/RES daemons, multi-tenant rate-limit + cost-budget enforcement |
+| **§28 Deployment + canary + migration** | 🟡 sequential after §27 (uses `rate-limiter`) | §27 (`rate-limiter`), §16 (`eval-runner` for canary gate), §10 (event-log for migration replay) | Continuous deployment, deploy-as-eval-gate pattern, multi-version spec rollouts, `web-ui` deploy-button |
+| **§29 Evaluation depth + EVAL target shape** | 🟡 independent | §16 (eval stack), §17 (multi-provider model-router for judge swaps) | EVAL target shape, prompt-optimizer regression CI, dataset/grader plugin ecosystem |
+| **§30 Backend adapter completions** | 🟡 independent | §17 base adapter shapes; §21 vector-store interface; §23 queue-protocol interface; §24 telephony slot; §25 driver interface | Production CHN/MGD/RES/VOICE/BROW deployments without v0 stub limits |
+| **§31 Studio v1** | 🟡 last; after §27–30 | every prior section's IR / trace / event / metric kinds | Production authoring UI, run replay, multi-spec dashboards, third-party plugin marketplace |
 
 ---
 
 ## Current baseline
 
-Six target shapes ship today: **CLI**, **workflow**, **channel** (Slack), **graph** (LangGraph-style with checkpointing + HITL), **managed** (multi-tenant daemon + JWT-authed gateway + hash-chained audit log), and **pipeline** (Haystack-style component DAG with retrieval primitives). The compiler pipeline (spec → IR → codegen) handles all six via a discriminated-union `IrNode = IrV0 | IrWorkflowV0 | IrChannelV0 | IrGraphV0 | IrManagedV0 | IrPipelineV0`. Sections 1–17 built the foundation: tool framework, persistence, hooks/skills/slash, sub-agents + Task tool, expanded tool catalogue (web/image/fetch), observability (trace bus + OTel + metrics + pretty/JSON printer), eval stack with `crewhaus eval` subcommand, and a multi-provider model layer (Anthropic/OpenAI/Gemini/Bedrock + local via OpenAI-compatible URL). Sections 18–21 added the production safety floor (containerised sandbox, sandboxed code-execution, prompt-injection classifier) and the three remaining "core" target shapes (graph, managed, pipeline).
+**All 11 target shapes ship today.** The compiler pipeline (spec → IR → codegen) handles every shape via a discriminated-union `IrNode = IrV0 | IrWorkflowV0 | IrChannelV0 | IrGraphV0 | IrManagedV0 | IrPipelineV0 | IrCrewV0 | IrResearchV0 | IrBatchV0 | IrVoiceV0 | IrBrowserV0`. Sections 1–17 built the foundation (tool framework, persistence, hooks/skills/slash, sub-agents + Task tool, expanded tool catalogue, observability, eval stack, multi-provider model layer); Sections 18–21 added the production safety floor and the GRPH/MGD/RAG target shapes; Sections 22–26 added the CRW/RES/BATCH/VOICE/BROW target shapes plus the Studio authoring + trace-inspection UI.
 
 What the current stack can now do, end-to-end:
 
@@ -116,17 +152,20 @@ What the current stack can now do, end-to-end:
 - **Graph**: `bun run run:hello-graph` — node/edge graph with checkpointing, HITL pause/resume, branch-from-checkpoint time travel, durable exactly-once node execution.
 - **Managed**: `bun run run:hello-managed` — multi-tenant daemon with JWT auth, per-tenant budget enforcement, hash-chained audit log, `crewhaus audit verify <tenant>` integrity check.
 - **Pipeline (RAG)**: `bun run run:hello-rag` — chunk → embed → index pipeline plus a retrieval-grounded agent calling `Retrieve(query, k?, filter?)` against an in-memory vector store.
+- **Crew (multi-agent)**: `bun run run:hello-crew` — researcher → writer → critic with `Handoff`, `SendMessage` (A2A) tools auto-injected per role; refusal-loop guard, A2A-recursion cap, total-activations cap; one OTel trace stitches every role.
+- **Research (RES)**: `bun run run:hello-research` — planner decomposes a goal into sub-questions, crawler with allow-listed origins follows citations, citation-tracker dedups by sha256(content), report-writer emits a numbered-citation block deterministic across re-runs. Resume via `--resume <runId>`.
+- **Batch (queue worker)**: `bun run run:hello-batch` — pulls jobs from in-memory queue (SQS/Redis/Postgres adapters in §30), runs one `runChatLoop({singleTurn:true})` per job, idempotency-keys cache per attempt, SIGTERM drains in-flight, max-retries → DLQ.
+- **Voice (realtime)**: `bun run run:hello-voice -- --smoke <pcm>` — OpenAI Realtime adapter (PCM 16-bit @ 24kHz), VAD over 30 ms frames, barge-in fires `interrupt()` after 4 consecutive speech frames in 200 ms, call-session lifecycle state machine.
+- **Browser (computer-use)**: `bun run run:hello-browser` — chromium-in-Playwright driver, Screenshot/Click/Type/Key/Scroll/FindElement tools, vision-grounding via Claude vision, destructive tools require explicit `alwaysAllow` in default permission mode.
+- **Studio**: `bun run studio` — Bun.serve daemon at `:3000` with spec CRUD, live trace SSE, run inspection, eval-result browser, graph visualiser for IrGraphV0, wizard, plugin SDK.
 
-What is *not* yet covered (and frames Sections 22–26):
+What is *not* yet covered (and frames Sections 27–31):
 
-- **Multi-agent crew (CRW shape).** Sub-agents from §13 cover the parent → child delegation case. The CRW shape adds peer-to-peer coordination: explicit handoff (one agent passes control to another with shared context), A2A messaging (agents exchange typed events without parent involvement), role-based dispatch (the orchestrator routes incoming work to the role best fit for it). Modules: `agent-handoff`, `a2a-protocol`, `crew-orchestrator`, `target-crew`. **Section 22 lands this.**
-- **Autonomous research agent (RES shape).** Long-horizon execution patterns — planner that decomposes a research goal, crawler that follows citations, citation tracker that records source provenance, report writer that synthesises findings. Builds on §13 sub-agents (each branch is a sub-agent), §15 trace bus (multi-hour runs need durable observability), §10 persistence (resumability across crashes). Modules: `target-research-bundle`, `planner`, `crawler`, `citation-tracker`, `report-writer`. **Section 23 lands this.**
-- **Batch worker (BATCH shape).** Queue-consumer pattern for cron-scheduled or offline-data agents. No live UI, no per-message session — just a worker that pulls work from a queue, processes it, writes results, and acks. Modules: `queue-protocol`, `queue-consumer`, `idempotency-keys`, `target-batch-worker`. **Section 23 (parallel with RES) lands this.**
-- **Voice / realtime (VOICE shape).** Genuinely novel territory — the realtime audio loop, VAD (voice activity detection), barge-in (user can interrupt), call-session lifecycle (telephony connect/hold/transfer), and provider abstraction over OpenAI Realtime + Vapi at the wire-protocol level. PCM/Opus framing has no parallel anywhere else in the codebase. Modules: `voice-runtime`, `vad-engine`, `barge-in-controller`, `call-session`, `target-voice`. **Section 24 lands this.**
-- **Browser / computer-use (BROW shape).** Cross-OS desktop control over a screenshot loop. The screenshot-frequency-vs-action-latency trade-off is the load-bearing design call. Modules: `computer-use-driver`, `tool-screen-capture`, `tool-mouse-keyboard`, `tool-vision-grounding`, `target-browser-driver`. **Section 25 lands this.**
-- **Studio (authoring + inspection UI).** What turns the meta-harness into a product surface — spec authoring with live validation, trace viewer with drilldowns, graph visualiser for the GRPH shape, eval-result inspection, a wizard for new specs, and a plugin SDK. Sits on top of every shipped target shape and event kind. Modules: `studio-server`, `studio-ui`, `trace-viewer`, `graph-visualizer`, `wizard`, `scaffold-templates`, `plugin-sdk`. **Section 26 lands this.**
-
-Beyond Section 26, what remains is cross-cutting hardening (`cost-tracker`, `prompt-cache-manager` rotation, `secrets-manager`, `rate-limiter`, `circuit-breaker`, `deployment-controller`, `canary-controller`, `migration-runner`) plus deeper evaluation tooling (`prompt-optimizer`, `regression-runner`, `target-eval-bundle`, `dataset-registry`, `grader-registry`). These are scoped in MODULE-CATALOG and live in Sections 27+.
+- **Cost / rate / circuit / cache / secrets controls.** No `cost-tracker` (today the trace bus carries token counts but no $ aggregation), no `rate-limiter` (today the gateway-server enforces budget but not throughput), no `circuit-breaker` (today provider failures retry per `recovery-engine` but never skip an unhealthy provider), no `prompt-cache-manager` rotation (today the cache lives per-`runChatLoop` only), no `secrets-manager` (today OAuth/API-key/AWS creds are read once at boot). **Section 27 lands these.**
+- **Continuous deployment surface.** No `deployment-controller` (today specs are run from disk, no version pinning), no `canary-controller` (today rollouts are all-or-nothing), no `migration-runner` (today IR version migrations are manual), no `spec-registry` (today specs are single-tenant files), no `ir-passes` (today the IR is emitted verbatim — no dead-tool elimination, no prompt-cache prefix sorting). **Section 28 lands these.**
+- **Evaluation depth.** Today `crewhaus eval` works but is invocation-only — no `prompt-optimizer` (DSPy-style automated tuning), no `regression-runner` (diff-based pass/fail flip detection), no `target-eval-bundle` (first-class EVAL target shape), no `dataset-registry` / `grader-registry` (split-aware versioning + plugin ecosystem). **Section 29 lands these.**
+- **Backend adapter completions.** Multiple v0 stubs are in production paths but only have one backend each: queue (in-memory only — SQS/Redis/Postgres throw "not implemented in v0"), vector-store (in-memory only — Lance/Qdrant/Pinecone/Weaviate stubbed), embedder (production paths exist for OpenAI/Voyage/Cohere but lightly exercised), telephony (in-memory smoke only — Twilio/LiveKit SIP stubbed), realtime (OpenAI Realtime ships, Vapi stub), browser driver (chromium ships, host + remote stubs). **Section 30 lands these completions.**
+- **Studio v1.** Today's Studio v0 ships vanilla TS HTML/JS (no Lit, no Monaco), canned SSE events (`runChatLoop` not yet wired through the SSE), file-system-only spec storage, sandbox-path-only plugin guard (no content sandbox). **Section 31 lands the production UI.**
 
 ---
 
@@ -1623,6 +1662,298 @@ studio-server  ──►  studio-ui  ──►  trace-viewer       (parallel)  �
 
 ---
 
+## Section 27 — Production hardening
+
+> Status: 🟡 next up. Parallelisable with Section 29 and Section 30. Required prereq for Section 28's canary traffic shaping.
+
+**Catalog modules:** `cost-tracker` (R15), `rate-limiter` (R-infra), `circuit-breaker` (R-infra), `prompt-cache-manager` (R6), `secrets-manager` (R-infra)
+
+The current stack runs every shape end-to-end, but the cross-cutting controls a paying-customer deployment needs are absent. There's no $ aggregation per run/tenant, no throughput cap, no provider-failover circuit-breaker (today retry-only), no cache rotation across long runs, no secret rotation without daemon restart. Section 27 lands all five modules and wires them into the existing runtime/gateway/audit-log paths.
+
+### Build order within this section
+
+`cost-tracker` and `secrets-manager` are independent and can be built first in parallel. `rate-limiter` lands next (it composes with `secrets-manager`'s tenant identity). `circuit-breaker` builds on `rate-limiter`'s token-bucket primitive. `prompt-cache-manager` is independent — runs on the existing `model-router` adapter feature flags.
+
+```
+cost-tracker        (parallel)  ──►  rate-limiter  ──►  circuit-breaker
+secrets-manager     (parallel)
+prompt-cache-manager (parallel)
+```
+
+### What to build
+
+**`packages/cost-tracker`** — per-run / per-tenant $ aggregation
+- Subscribes to the §15 trace bus on `model_response` events (which carry `inputTokens`/`outputTokens`/`provider`/`modelId`).
+- Loads a per-provider pricing table (`packages/cost-tracker/pricing.json` — `{ provider, modelId, inputPer1M, outputPer1M, cachedReadPer1M? }`); pricing is versioned so historical runs reprice deterministically.
+- Emits new TraceEvent kind `cost_accrual` with `{ runId, tenantId?, provider, modelId, inputTokens, outputTokens, cachedReadTokens, costUsdMicros }` so downstream consumers (eval-report cost columns, audit-log per-run total, gateway-server budget enforcer) read the same data.
+- `getRunCost(runId): { totalUsdMicros, byProvider }` for after-the-fact queries.
+
+**`packages/rate-limiter`** — token-bucket + leaky-bucket gating
+- Three keyed dimensions: per-tenant, per-provider, per-tool. Each can have a token-bucket (burst-tolerant) or leaky-bucket (smoothing) rate.
+- `acquire(keys, cost): Promise<void>` blocks until tokens are available or rejects after `maxWaitMs`.
+- Composes with §20 `gateway-server`: every JWT-authed request acquires the tenant's bucket before dispatching.
+- Composes with §17 `model-router`: every adapter call acquires the provider's bucket.
+- Per-tool buckets configured in spec under `tools.<Name>.rateLimit: { kind, capacity, refillPerSec }`.
+
+**`packages/circuit-breaker`** — half-open provider state
+- `wrap(adapter, opts): WrappedAdapter` returns a thin proxy. After `failureThreshold` consecutive failures within `windowMs`, the breaker trips: subsequent calls reject immediately for `cooldownMs`, then a single probe call goes through (half-open). Probe success closes the breaker; failure re-opens.
+- Composes with §17 `model-router` so a tripped Anthropic breaker auto-fails-over to OpenAI when `agent.fallbackModels` is configured.
+- Emits `circuit_state_changed` TraceEvents (`closed | open | half_open`).
+
+**`packages/prompt-cache-manager`** — explicit cache rotation
+- Today, prompt-cache markers (Anthropic `cache_control`, Gemini cached content) are emitted once per `runChatLoop` system prompt. Long-running CHN/MGD/RES daemons rotate every 30 days at most (Anthropic limit), but the existing setup never actively rotates.
+- `manage(messages, opts): Messages` injects fresh cache markers when the prior marker is older than `rotateAfterMs` (default: 7 days for safety). Old markers are downgraded to `ephemeral`.
+- Skipped when `adapter.features.caching === "automatic"` (OpenAI server-managed) or `=== false`.
+- Wired into `runtime-core`'s pre-stream hook so the rotation lives outside individual adapters.
+
+**`packages/secrets-manager`** — rotation + audit
+- `Secrets` interface: `get(name): Promise<string>`, `rotate(name): Promise<void>`, `onRotation(handler)`. Backends: env-var (default; rotation is a no-op + warning), file (reads `.crewhaus/secrets/<name>`), vault (HashiCorp Vault HTTP API).
+- Long-running daemons (CHN gateway, MGD gateway, RES daemon) subscribe to `onRotation` so they refresh in-flight credentials without restart.
+- Every `get` and `rotate` is audit-logged via §20 `audit-log` when a tenant is in scope.
+- `secrets-manager doctor` subcommand on the CLI walks the configured backend + reports missing or rotation-due secrets.
+
+### Tests
+
+- `cost-tracker`: T1 per pricing-table format + accumulation math; T9 property test (associative aggregation across a random sample of 10k events); T3 confirms a 3-turn run emits exactly 3 `cost_accrual` events and `getRunCost(runId)` returns the sum
+- `rate-limiter`: T1 per algorithm (token-bucket vs leaky-bucket) edge cases; T7 1000-acquirer load test (concurrency-fair + no starvation); T8 fail-closed when keys are missing (deny rather than allow)
+- `circuit-breaker`: T1 state-machine per `closed → open → half_open → closed` transition; T3 against a flaky stub adapter (10 failures → trip; cooldown elapsed → probe → success → close); T9 property test on consecutive-failure window invariants
+- `prompt-cache-manager`: T1 rotation trigger logic; T3 against an adapter with `caching: "explicit"` confirming rotation injects a fresh marker after `rotateAfterMs`; T9 ensures `caching: "automatic"`/`false` skip cleanly
+- `secrets-manager`: T1 per backend (env-var, file, vault); T8 cross-tenant secret isolation (vault audit only includes the requesting tenant's reads); T3 daemon receives `onRotation` callback within 5s of `rotate()` call
+
+---
+
+## Section 28 — Deployment + canary + migration
+
+> Status: 🟡 sequential after Section 27 (uses `rate-limiter` for canary traffic shaping). Required prereq: §16 eval stack (canary gate consumer).
+
+**Catalog modules:** `deployment-controller` (F3), `canary-controller` (F3), `migration-runner` (F3), `spec-registry` (F1), `ir-passes` (F1), `migration-engine` (F1)
+
+Today, specs run from disk by absolute path. There's no version pinning, no staging→prod promotion, no percent-of-traffic rollout, no automated regression gate, no cross-version migration. Section 28 turns the factory into a continuous-deployment surface.
+
+### Build order within this section
+
+`spec-registry` is the sequential prereq — it owns the multi-version storage that everything else hangs off. After it lands, `ir-passes` + `migration-engine` are parallel (both consume the registry). Then `migration-runner` (consumes migration-engine), then `deployment-controller` (consumes spec-registry), then `canary-controller` (consumes deployment-controller + §27 rate-limiter).
+
+```
+spec-registry  ──►  ir-passes              (parallel)  ──►  migration-runner  ──►  deployment-controller  ──►  canary-controller
+                    migration-engine
+```
+
+### What to build
+
+**`packages/spec-registry`** — versioned spec storage
+- File-backed by default (`.crewhaus/specs/<name>/<version>.yaml` + `<name>/manifest.json`); pluggable adapter for SQLite + Postgres + S3.
+- Operations: `put(name, version, yaml)`, `get(name, version)`, `list(name)`, `pin(name, environment, version)` (e.g. `pin("hello-cli", "prod", "v3")`), `aliasFor(name, environment) → version`.
+- Tenant overlays: per-tenant pin tables override the global pin without copying the spec.
+
+**`packages/ir-passes`** — optimization passes
+- Pass interface: `(ir: IrNode) → IrNode` (idempotent, deterministic, ordered).
+- Built-in passes: `dead-tool-elimination` (drop tools never referenced by sub-agents/permissions), `prompt-cache-prefix-sort` (reorder system-block segments so the cache prefix is maximised), `redundant-mcp-server-collapse` (dedup mcp_servers entries by `(transport, command, args)`), `permission-rule-canonicalize` (sort + dedup rules by source priority).
+- `applyPasses(ir, opts)` runs the configured pipeline; default order is the safe order (dead-tool first, prefix-sort last).
+
+**`packages/migration-engine`** — IR version migrations
+- `migrate(spec, fromVersion, toVersion): Spec` walks a registered migration chain.
+- Migrations registered as `{ from, to, up, down }`; both directions required so rollbacks work.
+- Versioned: today every IR is `version: 0`; the first real migration is `0 → 1` (no-op skeleton).
+- Composable with `ir-passes` — migrations run before passes.
+
+**`packages/migration-runner`** — batch migrate stored specs
+- `migrate-all <fromVersion> <toVersion>` walks every spec in `spec-registry`, applies the migration chain, writes new versions, leaves old versions intact for rollback.
+- Dry-run mode shows the diff per spec before writing.
+- Refuses to run if any spec fails validation post-migration.
+
+**`packages/deployment-controller`** — version pinning + promotion
+- `promote(name, fromEnv, toEnv)` copies the pinned version of the source environment to the destination.
+- `rollback(name, env, version)` re-pins to a previous version.
+- Records every action to §20 `audit-log` (tenant-scoped when applicable).
+- `crewhaus deploy promote <name> staging prod` CLI subcommand.
+
+**`packages/canary-controller`** — percent-of-traffic rollout
+- `canary(name, fromVersion, toVersion, opts: { trafficPercent, evalSpec, gateOnRegression })` shifts a configurable percentage of incoming requests to the new version.
+- Routes via §27 `rate-limiter` keyed on `(tenantId, requestId-hash mod 100 < trafficPercent)`.
+- After `evalIntervalMs`, runs `evalSpec` against both versions in parallel and gates promotion on `regression-runner` (Section 29) — if pass-rate drops below `regressionThreshold`, the canary auto-rolls-back.
+- Without an eval gate (manual mode), the controller waits for explicit `crewhaus deploy promote`.
+
+### Tests
+
+- `spec-registry`: T1 per backend (file, SQLite, Postgres); T9 property test on `pin/aliasFor` invariants under concurrent writers; T8 cross-tenant pin isolation
+- `ir-passes`: T1 per built-in pass; T9 idempotence property test (`apply(apply(x)) === apply(x)`); T4 replay against fixture IRs confirms no semantic drift
+- `migration-engine`: T1 per registered migration's `up + down` round-trip; T4 replay over a fixture corpus of legacy specs
+- `migration-runner`: T3 dry-run + write cycle on a 100-spec fixture registry; T9 idempotence (re-running yields zero changes)
+- `deployment-controller`: T3 promote + rollback round-trip with audit-log assertions
+- `canary-controller`: T3 simulated-traffic test (1000 requests across canary at 10%/50%/100%) with auto-rollback on injected regression; T7 24-hour stability (no traffic-bucket drift)
+
+---
+
+## Section 29 — Evaluation depth + EVAL target shape
+
+> Status: 🟡 independent. Can land any time after Section 27. Strongly composes with Section 28's canary gate.
+
+**Catalog modules:** `prompt-optimizer` (F-eval), `regression-runner` (F-eval), `target-eval-bundle` (F2), `dataset-registry` (R15), `grader-registry` (R15)
+
+Section 16 shipped the eval stack. Section 29 adds depth: automated prompt tuning (DSPy-style), regression detection on every CI run, a first-class EVAL target shape so eval is a deployable artefact rather than a CLI invocation, and pluggable dataset/grader registries.
+
+### Build order within this section
+
+`dataset-registry` and `grader-registry` are independent and parallel. `regression-runner` consumes both. `prompt-optimizer` consumes `regression-runner`. `target-eval-bundle` is parallel — depends on all four.
+
+```
+dataset-registry      (parallel)  ──►  regression-runner  ──►  prompt-optimizer
+grader-registry                                                target-eval-bundle    (parallel)
+```
+
+### What to build
+
+**`packages/dataset-registry`** — split-aware dataset versioning
+- Wraps §16 `eval-dataset` loaders with metadata: `{ name, version, splits: { train, dev, test }, sampleHashes, createdAt }`.
+- File-backed by default (`.crewhaus/datasets/<name>/<version>.json`); pluggable for HuggingFace Hub.
+- `get(name, version, split): AsyncIterable<Sample>` — same shape `eval-runner` consumes.
+- Enforces split boundaries: `prompt-optimizer` can only train on `train`, evaluate on `dev`, never touch `test` until after a release tag.
+
+**`packages/grader-registry`** — pluggable graders
+- `register(name, gradedFn)` adds a custom grader to the global registry.
+- Built-in §16 graders auto-register at boot.
+- `lookupGrader(name): GraderFn` — used by `eval-runner` and CI integrations.
+- Plugin discovery: walks `~/.crewhaus/graders/*/index.ts` and registers via `definePlugin` (composable with §26 `plugin-sdk`).
+
+**`packages/regression-runner`** — diff-based pass/fail flip detection
+- `regress(prevRunId, newRunId, opts): RegressReport` consumes two `eval-runner` outputs from `.crewhaus/evals/<runId>/`.
+- Aggregates: pass-rate delta, p50/p95 latency delta, sample-level pass→fail flip count, fail→pass recovery count, score-shifts > ε.
+- Threshold gate: `gate(prevRunId, newRunId, { regressionThreshold, latencyThreshold }): "pass" | "fail"` — the function `canary-controller` calls.
+- Exits non-zero on regression so CI can block.
+
+**`packages/prompt-optimizer`** — DSPy-style automated prompt tuning
+- `optimize(spec, dataset, opts): OptimizedSpec` runs a search over candidate prompt mutations (rewording, few-shot example insertion, chain-of-thought scaffolding) using `eval-runner` as the fitness function.
+- Strategy: bootstrap from `dataset.train`, evaluate on `dataset.dev`, never touch `dataset.test`.
+- Mutation space configurable; default mutations: rephrase-instruction, add-few-shot, swap-example, add-COT-prefix.
+- Persists every candidate's run + grade trajectory under `.crewhaus/prompt-optimizer/<runId>/` so the search is auditable and resumable.
+- Returns the best-scoring prompt above a configurable improvement threshold.
+
+**`packages/target-eval-bundle`** — first-class EVAL target shape
+- `target: "eval"` spec carries `agent.{model, instructions, tools?}`, `dataset: { name, version, split }`, `graders: [{ name, opts? }]`, `concurrency`, `seed?`.
+- Single-file `agent.ts` boots `dataset-registry` + `grader-registry` + `eval-runner`, runs against the configured dataset, writes results to `.crewhaus/evals/<runId>/`.
+- The 11th target shape — turns "run an eval" into "deploy an eval" (managed-runtime hosted, scheduled via cron, gated by §28 canary).
+
+### Tests
+
+- `dataset-registry`: T1 per backend; T8 split-leak prevention (refuses to expose `test` split to `prompt-optimizer` without an explicit `--allow-test-split` override); T9 hash-stability (same dataset content → same `sampleHashes`)
+- `grader-registry`: T1 register/lookup round-trip; T8 plugin-discovery sandbox isolation
+- `regression-runner`: T1 fixture corpus (10 prev/new pairs covering all delta scenarios); T9 threshold-monotonicity property test
+- `prompt-optimizer`: T3 against a fixture spec + 20-sample dataset (must improve pass-rate by ≥10% on the dev split); T9 search-determinism with `--seed`
+- `target-eval-bundle`: T1 generated bundle structure; T3 compile + run an EVAL target end-to-end with a 5-sample dataset and 2 graders
+
+---
+
+## Section 30 — Backend adapter completions
+
+> Status: 🟡 independent. Can land any time. Best worked as one PR per backend family.
+
+**Catalog modules (extensions to existing packages):** queue adapters (`packages/queue-protocol`), vector backends (`packages/vector-store`), embedder backends (`packages/embedder`), telephony adapters (`packages/call-session`), realtime adapters (`packages/voice-runtime`), browser backends (`packages/computer-use-driver`)
+
+Multiple v0 stubs ship with one production backend each. Production deployments need the full set. Section 30 fills out the v0-stub adapters.
+
+### Build order within this section
+
+Six independent adapter families. Each is its own PR; no shared code across families.
+
+```
+queue: SQS / Redis Streams / Postgres        (parallel)
+vector-store: Lance / Qdrant / Pinecone / Weaviate
+embedder: OpenAI prod path / Voyage / Cohere
+telephony: Twilio / LiveKit SIP
+realtime: Vapi
+browser: host backend / remote backend
+```
+
+### What to build (per family)
+
+**Queue adapters** (extend `@crewhaus/queue-protocol`)
+- `createSqsAdapter({ queueUrl, region, credentials })`, `createRedisStreamsAdapter({ connection, streamKey, consumerGroup })`, `createPostgresAdapter({ pool, tableName })`.
+- Each implements `pull/ack/nack/extendVisibility/stats` with the backend's native semantics (SQS visibility timeout, Redis XPENDING, Postgres advisory locks).
+- T2 contract test corpus shared with `in-memory` adapter ensures all four backends behave identically on the same fixture sequence.
+
+**Vector backends** (extend `@crewhaus/vector-store`)
+- `createLanceVectorStore({ path })` (file-backed), `createQdrantVectorStore({ url, collection })`, `createPineconeVectorStore({ apiKey, indexName })`, `createWeaviateVectorStore({ url, className })`.
+- T2 contract corpus: 100-sample upsert + query + delete cycle, asserts top-k recall ≥ 95% for the L2-distance test set across all four backends.
+
+**Embedder backends** (harden existing `@crewhaus/embedder` paths)
+- The OpenAI/Voyage/Cohere code paths exist but are lightly tested. Section 30 adds 5-text fixture contract tests per backend with snapshot assertions on the canonical embedding magnitude (production sanity check that the API is wired correctly).
+
+**Telephony adapters** (extend `@crewhaus/call-session`)
+- `createTwilioTelephonyAdapter({ accountSid, authToken, fromNumber })`, `createLiveKitSipAdapter({ url, apiKey, apiSecret })`.
+- Contract test against recorded fixture call flows (incoming call, hold, transfer, hangup).
+
+**Realtime adapter — Vapi** (extend `@crewhaus/voice-runtime`)
+- `createVapiRealtimeAdapter({ apiKey, assistantId })` over Vapi's SDK; maps to the same `RealtimeAdapter` interface as OpenAI Realtime.
+- Contract test: synthetic 1s PCM in → expected event sequence.
+
+**Browser backends — host + remote** (extend `@crewhaus/computer-use-driver`)
+- `host` backend: macOS / Linux / Windows native APIs via the existing `mcp__computer-use__*` tools (gated by `CREWHAUS_BROW_HOST_ENABLED=1` because it can drive the dev's actual desktop).
+- `remote` backend: CDP-style remote browser over WebSocket (e.g. browserless.io, BrowserBase).
+- Contract test: each backend honours the `Driver` interface (screenshot/click/type/key/scroll/getViewport).
+
+### Tests
+
+- T2 contract test per backend (shared corpus across the family).
+- T7 load test per family (queue: 1000 jobs; vector: 1M vectors; telephony: 100 concurrent calls).
+- T8 per backend: SQS IAM minimal-permission verification; Pinecone API-key isolation; Twilio webhook-signature verification; remote-browser CDP message validation.
+
+---
+
+## Section 31 — Studio v1
+
+> Status: 🟡 last in this roadmap. Depends on Sections 27–30 (everything they ship needs to render in Studio).
+
+**Catalog modules (extensions to §26 packages):** `studio-ui` (Lit + Monaco rewrite), `studio-server` (full SSE wiring), `plugin-sdk` (content-sandbox isolation)
+
+Section 26 shipped Studio v0: vanilla TS HTML/JS bundle, canned SSE events, sandbox-path-only plugin guard. Section 31 productionises every layer.
+
+### Build order within this section
+
+```
+studio-server (SSE wiring)  ──►  studio-ui (Lit + Monaco rewrite)  ──►  plugin-sdk (content-sandbox)
+                                  trace-viewer (run replay)               (parallel after studio-ui)
+                                  graph-visualizer (live updates)
+```
+
+### What to build
+
+**`packages/studio-server`** v1 — full SSE wiring
+- The `/api/runs` POST → SSE handler currently emits canned events. v1 spawns the actual `runChatLoop` via subprocess with stdout/stderr piped through, parses the §15 trace bus output as SSE messages, and forwards every event kind (15+ today) to the client.
+- New endpoints: `/api/runs/:runId/replay` (SSE-replays a prior run from §10 event-log), `/api/runs/:runId/cancel` (sends SIGINT to the subprocess), `/api/cost-summary?tenant=&from=&to=` (aggregates §27 cost-tracker output).
+- Auth: every endpoint requires the §20 gateway-server JWT in production mode. Dev mode (`CREWHAUS_STUDIO_DEV=1`) skips auth.
+
+**`packages/studio-ui`** v1 — Lit + Monaco
+- Replace the vanilla TS bundle with Lit components. Each pane is a custom element so the layout is composable.
+- Monaco editor for spec YAML editing. Live `spec-validator` lint via debounced WebSocket (500ms). Schema-driven autocomplete for every IR variant.
+- Multi-spec dashboard: aggregate cost (§27), pass-rate (§16), latency p50/p95 across all specs in the registry.
+- Tab strip: Specs / Wizard / Runs / Evals / Graph / Plugins / Cost.
+
+**`packages/trace-viewer`** v1 — run replay
+- Existing Gantt timeline gains a "replay" mode that scrubs through events at configurable speed (1×/2×/4×/raw).
+- Spans become clickable: click a `model_request` span → drilldown shows the full request payload + model response. Click a `tool_call_*` span → shows tool input + output (with redacted-by-classifier markers).
+- Embeds inside `studio-ui` runs panel and §16 `eval-report`'s per-sample drilldown (already wired in §26).
+
+**`packages/graph-visualizer`** v1 — live updates
+- Existing static D3 layout gains a live mode. Subscribes to the SSE `node_start`/`node_end`/`hitl_pause` events and animates node colours in real time.
+- HITL pauses surface a "approve / reject" button overlay — clicking POSTs to `/api/runs/:runId/hitl?nodeId=&decision=`.
+- Branch-from-checkpoint UI: click any past checkpoint → "fork from here" → opens a new run pre-pinned to that checkpoint.
+
+**`packages/plugin-sdk`** v1 — content-sandbox isolation
+- Plugin code currently runs in the studio-server's main process — only the sandbox-path guard from §26 protects against file:// escapes.
+- v1 isolates plugins in Web Workers (UI plugins) or VM2-style realm shims (server plugins). Plugin code cannot access `node:fs`, `node:child_process`, `node:net` outside the plugin's sandbox root.
+- Plugin manifest schema: `{ name, version, permissions: { fs: ["read:~/.crewhaus/plugins/<self>/**"], net: ["fetch:https://api.example.com/**"] } }` — declared up-front; runtime enforces the allow-list.
+
+### Tests
+
+- `studio-server` SSE: T3 spawns a real `runChatLoop` against a fixture spec, asserts the SSE stream emits ≥ N events of expected kinds; T7 100-concurrent SSE consumers (no event drops); T8 expired-JWT rejection
+- `studio-ui` Lit components: T1 per-component rendering snapshot; Playwright T3 for the multi-spec dashboard
+- `trace-viewer` replay: T1 scrub-mode determinism (same events → same render); T3 click-through on a fixture trace produces the expected drilldown
+- `graph-visualizer` live: T3 simulates a 5-node graph with HITL pause; verifies node colours animate in the right order
+- `plugin-sdk` content-sandbox: T8 plugin attempts to read `/etc/passwd` → blocked; plugin attempts to fetch a non-allow-listed URL → blocked; plugin can't escape its declared `permissions.fs` root
+
+---
+
 ## Kickoff prompts
 
 Use these prompts with Claude Code from the project root (`/Users/bots/Developer/crewhaus-factory`). Each prompt is self-contained.
@@ -2993,6 +3324,297 @@ End-to-end smoke test before opening the PR:
   4. Graph visualisation: open examples/hello-graph in the spec editor; click "visualise"; confirm the D3 layout renders 3 nodes + 2 edges with deterministic positioning.
   5. Plugin: drop scripts/section-26-fixture-plugin/index.ts into ~/.crewhaus/plugins/fixture/; refresh studio; confirm the plugin's "Hello from plugin" pane appears in the sidebar.
 - Stop studio (Ctrl-C); no orphan processes
+
+Update docs/MODULE-CATALOG.md and docs/build-roadmap.md with everything that is complete and create a pull request with all updates.
+```
+
+---
+
+### Section 27 — Production hardening
+
+```
+Read docs/build-roadmap.md Section 27. Also read in full:
+- packages/runtime-core/src/index.ts (where cost-tracker subscribes; where prompt-cache-manager hooks pre-stream; where rate-limiter wraps adapter calls)
+- packages/trace-event-bus/src/index.ts (Section 15 — ModelResponseEvent carries the inputTokens/outputTokens cost-tracker reads)
+- packages/model-router/src/index.ts and packages/adapter-anthropic/src/index.ts (Section 17 — circuit-breaker wraps adapters; prompt-cache-manager respects features.caching)
+- packages/gateway-server/src/index.ts (Section 20 — rate-limiter composes with the per-tenant gate)
+- packages/audit-log/src/index.ts (Section 20 — secrets-manager rotation events ride here)
+- packages/recovery-engine/src/index.ts (Section 7 — circuit-breaker is upstream of recovery-engine; never retry into a tripped breaker)
+- docs/MODULE-CATALOG.md entries for cost-tracker, rate-limiter, circuit-breaker, prompt-cache-manager, secrets-manager
+
+Build in this order (cost-tracker + secrets-manager + prompt-cache-manager parallel; rate-limiter sequential; circuit-breaker last):
+
+1. packages/cost-tracker (parallel)
+   - Subscribes to trace bus on model_response (carries inputTokens/outputTokens/provider/modelId)
+   - pricing.json — versioned per-provider pricing table; historical runs reprice deterministically
+   - Emits cost_accrual TraceEvents { runId, tenantId?, provider, modelId, inputTokens, outputTokens, cachedReadTokens, costUsdMicros }
+   - getRunCost(runId) for after-the-fact queries
+
+2. packages/secrets-manager (parallel)
+   - Secrets interface: get(name), rotate(name), onRotation(handler)
+   - Backends: env-var (rotation = warning), file (.crewhaus/secrets/<name>), vault (HashiCorp Vault HTTP)
+   - Long-running daemons subscribe to onRotation for in-flight credential refresh
+   - Every get/rotate audit-logged via Section 20 audit-log when tenant scoped
+
+3. packages/prompt-cache-manager (parallel)
+   - manage(messages, opts) injects fresh cache markers when prior > rotateAfterMs (default 7 days)
+   - Skipped when adapter.features.caching === "automatic" or === false
+   - Wired into runtime-core's pre-stream hook
+
+4. packages/rate-limiter (depends on 1 + 2)
+   - Three keyed dimensions: per-tenant, per-provider, per-tool
+   - Token-bucket (burst-tolerant) + leaky-bucket (smoothing) algorithms
+   - acquire(keys, cost) blocks until tokens available or rejects after maxWaitMs
+   - Composes with §20 gateway-server (tenant bucket pre-dispatch) + §17 model-router (provider bucket pre-call)
+
+5. packages/circuit-breaker (depends on 4)
+   - wrap(adapter, opts): WrappedAdapter — failureThreshold consecutive failures within windowMs trips breaker
+   - States: closed → open → half_open → closed (probe call after cooldownMs)
+   - Composes with §17 model-router for fallbackModels failover
+   - Emits circuit_state_changed TraceEvents
+
+Tests: T1 per pricing-table format + accumulation math; T9 associative-aggregation property test; T1 per rate-limiter algorithm edge case; T7 1000-acquirer load test; T8 fail-closed when keys missing; T1 circuit-breaker state-machine per transition; T3 against flaky stub (10 fails → trip; cooldown elapsed → probe → success → close); T1 prompt-cache rotation trigger logic; T1 secrets-manager per-backend; T8 cross-tenant secret isolation.
+
+End-to-end smoke test before opening the PR:
+- ANTHROPIC_AUTH_TOKEN is in .env (Bun auto-loads .env)
+- Probe 1 (cost): run hello-cli with a 3-turn conversation; verify .crewhaus/sessions/<id>.jsonl has cost_accrual events; `crewhaus cost-summary <runId>` returns nonzero usdMicros matching pricing.json × tokens
+- Probe 2 (rate-limiter): set tenant bucket to 1 req/sec; POST 10 runs to gateway-server; verify ≥9 are queued and the elapsed time ≥ 9s; verify burst-mode handles the same flood with capacity=10 instantly
+- Probe 3 (circuit-breaker): point adapter at an unreachable URL for 11 consecutive failures; verify the 12th call rejects immediately with breaker_open error; wait cooldownMs; restore URL; verify the next call succeeds and breaker closes
+- Probe 4 (prompt-cache rotation): backdate a session's cache marker by 8 days; run a turn; verify the next stream-request includes a fresh cache_control marker AND the old marker is downgraded
+- Probe 5 (secrets rotation): start hello-channel; rotate SLACK_BOT_TOKEN via `crewhaus secrets rotate SLACK_BOT_TOKEN`; verify the next inbound webhook is processed with the new token AND audit-log records the rotation under the daemon's tenant
+- Confirm existing 11 target shapes still ship after the cross-cutting wiring
+
+Update docs/MODULE-CATALOG.md and docs/build-roadmap.md with everything that is complete and create a pull request with all updates.
+```
+
+---
+
+### Section 28 — Deployment + canary + migration
+
+```
+Read docs/build-roadmap.md Section 28. Also read in full:
+- packages/spec/src/index.ts and packages/ir/src/index.ts (where spec-registry stores; what ir-passes operate on)
+- packages/compiler/src/index.ts (where ir-passes plug into the lower→emit flow)
+- packages/eval-runner/src/index.ts (canary-controller's regression gate)
+- packages/rate-limiter/src/index.ts (Section 27 prereq — canary traffic shaping)
+- packages/audit-log/src/index.ts (deployment-controller logs every action)
+- packages/gateway-server/src/index.ts (canary routes via gateway tenant identification)
+- docs/MODULE-CATALOG.md entries for spec-registry, ir-passes, migration-engine, migration-runner, deployment-controller, canary-controller
+
+Build in this order:
+
+1. packages/spec-registry (sequential prereq)
+   - File-backed (.crewhaus/specs/<name>/<version>.yaml + manifest.json); pluggable for SQLite/Postgres/S3
+   - Operations: put/get/list/pin(name, environment, version)/aliasFor(name, environment)
+   - Tenant overlays (per-tenant pin tables override global)
+
+2. packages/ir-passes (parallel after #1)
+   - Pass interface: (ir: IrNode) → IrNode (idempotent, deterministic, ordered)
+   - Built-ins: dead-tool-elimination, prompt-cache-prefix-sort, redundant-mcp-server-collapse, permission-rule-canonicalize
+   - applyPasses(ir, opts) runs configured pipeline
+
+3. packages/migration-engine (parallel)
+   - migrate(spec, fromVersion, toVersion) walks registered chain
+   - Migrations registered as { from, to, up, down } — both directions for rollback
+   - First migration: 0 → 1 no-op skeleton
+
+4. packages/migration-runner (depends on 3)
+   - migrate-all <fromVersion> <toVersion> walks every spec in registry
+   - Dry-run mode shows diff; refuses if any spec fails post-migration validation
+
+5. packages/deployment-controller (depends on 1)
+   - promote(name, fromEnv, toEnv) copies pinned version
+   - rollback(name, env, version) re-pins to previous
+   - audit-log every action (tenant-scoped when applicable)
+   - `crewhaus deploy promote <name> staging prod` subcommand
+
+6. packages/canary-controller (depends on 5 + Section 27 rate-limiter + Section 16 eval-runner)
+   - canary(name, fromVersion, toVersion, opts: { trafficPercent, evalSpec, gateOnRegression })
+   - Routes via rate-limiter keyed on (tenantId, requestId-hash mod 100 < trafficPercent)
+   - After evalIntervalMs, runs evalSpec against both versions in parallel; gates promotion on regression-runner (Section 29 — but the gate hook can ship pre-§29 with a stub implementation)
+   - Auto-rollback on regression below threshold
+
+Tests: T1 per spec-registry backend; T9 pin/aliasFor invariants under concurrent writers; T8 cross-tenant pin isolation; T1 per built-in ir-pass; T9 idempotence (apply(apply(x)) === apply(x)); T4 replay against fixture IRs; T1 per migration up+down round-trip; T3 dry-run + write cycle on 100-spec registry; T9 idempotence; T3 promote + rollback with audit-log assertions; T3 simulated-traffic test (1000 requests at 10%/50%/100%) with auto-rollback on injected regression; T7 24h stability.
+
+End-to-end smoke test before opening the PR:
+- ANTHROPIC_AUTH_TOKEN is in .env (Bun auto-loads .env)
+- Probe 1 (registry): `crewhaus spec put hello-cli v1` from examples/hello-cli; `crewhaus spec list hello-cli` shows v1; `crewhaus spec pin hello-cli prod v1` succeeds; `crewhaus spec alias hello-cli prod` returns v1
+- Probe 2 (passes): apply ir-passes to a fixture IR with a dead tool; verify the dead tool is removed; apply twice — same output (idempotence)
+- Probe 3 (migration): write a 0→1 migration for a fixture spec; run `crewhaus migrate-all 0 1 --dry-run`; verify diff; run without --dry-run; verify v1 written, v0 retained; `crewhaus migrate-all 1 0 --dry-run` shows the inverse diff
+- Probe 4 (deployment): `crewhaus deploy promote hello-cli staging prod`; verify the prod pin shifts; verify audit-log records the action with both versions; `crewhaus deploy rollback hello-cli prod v1` reverses it
+- Probe 5 (canary): start a managed daemon with hello-cli pinned to v1; `crewhaus deploy canary hello-cli v1 v2 --traffic-percent 50 --eval-spec eval-fixtures/regression.yaml`; pump 100 requests; verify ~50 hit v1 and ~50 hit v2; introduce a regression in v2 (worse instructions); confirm canary auto-rolls-back AND audit-log records the rollback reason as "regression: pass-rate dropped from 0.95 to 0.62"
+- Confirm existing 11 target shapes + Section 27 hardening still work end-to-end
+
+Update docs/MODULE-CATALOG.md and docs/build-roadmap.md with everything that is complete and create a pull request with all updates.
+```
+
+---
+
+### Section 29 — Evaluation depth + EVAL target shape
+
+```
+Read docs/build-roadmap.md Section 29. Also read in full:
+- packages/eval-dataset/src/index.ts and packages/eval-grader/src/index.ts (Section 16 — what dataset-registry / grader-registry wrap)
+- packages/eval-runner/src/index.ts (used by regression-runner; the fitness function for prompt-optimizer)
+- packages/eval-report/src/index.ts (consumes regression-runner output for its diff mode)
+- packages/plugin-sdk/src/index.ts (Section 26 — grader-registry uses the same plugin discovery pattern)
+- packages/spec/src/index.ts and packages/ir/src/index.ts (target: "eval" lands here)
+- docs/MODULE-CATALOG.md entries for prompt-optimizer, regression-runner, target-eval-bundle, dataset-registry, grader-registry
+
+Build in this order:
+
+1. packages/dataset-registry (parallel with grader-registry)
+   - Wraps Section 16 eval-dataset loaders with metadata { name, version, splits: { train, dev, test }, sampleHashes, createdAt }
+   - File-backed (.crewhaus/datasets/<name>/<version>.json); pluggable for HuggingFace Hub
+   - get(name, version, split) → AsyncIterable<Sample>
+   - Enforces split boundaries (prompt-optimizer cannot touch test split without --allow-test-split)
+
+2. packages/grader-registry (parallel)
+   - register(name, gradedFn) adds custom graders; built-in §16 graders auto-register at boot
+   - lookupGrader(name) for eval-runner + CI integrations
+   - Plugin discovery walks ~/.crewhaus/graders/*/index.ts via §26 plugin-sdk
+
+3. packages/regression-runner (depends on 1 + 2)
+   - regress(prevRunId, newRunId, opts) → RegressReport with pass-rate delta, latency delta, sample-level flips
+   - gate(prevRunId, newRunId, { regressionThreshold, latencyThreshold }) → "pass" | "fail" — what canary-controller calls
+   - Exits non-zero on regression for CI
+
+4. packages/prompt-optimizer (depends on 3)
+   - optimize(spec, dataset, opts) → OptimizedSpec
+   - Search over candidate mutations (rephrase-instruction, add-few-shot, swap-example, add-COT-prefix)
+   - Bootstrap from dataset.train, evaluate on dataset.dev, never touch dataset.test
+   - Persists every candidate's run + grade trajectory under .crewhaus/prompt-optimizer/<runId>/
+   - Returns best-scoring prompt above improvement threshold
+
+5. packages/target-eval-bundle (parallel with #4)
+   - target: "eval" spec carries agent.{model, instructions, tools?}, dataset: { name, version, split }, graders: [...], concurrency, seed?
+   - Single-file agent.ts boots dataset-registry + grader-registry + eval-runner
+   - The 11th target shape (today eval is `crewhaus eval` only)
+
+Spec/IR additions: add "eval" variant to discriminated union; IrEvalV0 mirrors the spec.
+
+Tests: T1 per dataset-registry backend; T8 split-leak prevention; T9 hash-stability; T1 grader-registry register/lookup; T8 plugin sandbox isolation; T1 regression-runner fixture corpus; T9 threshold-monotonicity property test; T3 prompt-optimizer against fixture spec + 20-sample dataset (must improve pass-rate by ≥10% on dev split); T9 search-determinism with --seed; T1 target-eval-bundle structure; T3 compile + run EVAL target end-to-end with 5-sample dataset and 2 graders.
+
+End-to-end smoke test before opening the PR:
+- ANTHROPIC_AUTH_TOKEN is in .env (Bun auto-loads .env)
+- Probe 1 (registry): `crewhaus dataset put smoke-eval v1 --train smoke.train.jsonl --dev smoke.dev.jsonl --test smoke.test.jsonl`; verify splits stored separately; `crewhaus dataset list smoke-eval` shows v1
+- Probe 2 (split leak): try `prompt-optimizer optimize hello-cli smoke-eval --split test`; confirm refusal with "test split locked; pass --allow-test-split to override"
+- Probe 3 (regression): run `crewhaus eval hello-cli --dataset smoke-eval@v1 --split dev` twice with different prompts; `crewhaus regress <prevRunId> <newRunId> --threshold 0.9` returns pass; introduce a regression in the second prompt; rerun; gate returns fail with non-zero exit
+- Probe 4 (prompt-optimizer): start with intentionally-bad instructions (e.g. "answer in pirate speak" on a math dataset); run optimizer for 10 iterations against smoke-eval@v1.dev; verify pass-rate improves ≥10%; confirm best candidate is persisted
+- Probe 5 (EVAL target): compile examples/hello-eval and run; verify it produces an HTML+JSON report matching the `crewhaus eval` shape end-to-end
+- Confirm existing 11 shapes still ship; the EVAL target makes 12
+
+Update docs/MODULE-CATALOG.md and docs/build-roadmap.md with everything that is complete and create a pull request with all updates.
+```
+
+---
+
+### Section 30 — Backend adapter completions
+
+```
+Read docs/build-roadmap.md Section 30. Six independent adapter families; ONE PR per family.
+
+For queue: read packages/queue-protocol/src/index.ts (the abstract interface) — implement createSqsAdapter / createRedisStreamsAdapter / createPostgresAdapter mirroring the in-memory contract.
+
+For vector: read packages/vector-store/src/index.ts — implement createLanceVectorStore (file-backed) / createQdrantVectorStore / createPineconeVectorStore / createWeaviateVectorStore.
+
+For embedder: read packages/embedder/src/index.ts — the OpenAI/Voyage/Cohere code paths exist; this PR adds production contract tests with snapshot assertions on canonical embedding magnitudes.
+
+For telephony: read packages/call-session/src/index.ts — implement createTwilioTelephonyAdapter / createLiveKitSipAdapter against the existing TelephonyAdapter slot.
+
+For realtime: read packages/voice-runtime/src/index.ts — implement createVapiRealtimeAdapter against the existing RealtimeAdapter interface (stubs already in place).
+
+For browser: read packages/computer-use-driver/src/index.ts — implement the host backend (macOS/Linux/Windows native APIs via mcp__computer-use__*; gated on CREWHAUS_BROW_HOST_ENABLED=1) and the remote backend (CDP-style WebSocket).
+
+Each PR follows the same shape:
+- Implement the adapter against the shared interface
+- T2 contract test using the same fixture corpus the in-memory / chromium / etc. backend already passes — the new backend MUST behave identically
+- T7 load test specific to the family (queue: 1000 jobs; vector: 1M vectors; telephony: 100 concurrent calls; etc.)
+- T8 backend-specific security check (SQS IAM minimal permissions, Pinecone API-key isolation, Twilio webhook signature, remote-browser CDP message validation)
+
+End-to-end smoke test before opening each PR (against the live backend; gated on the relevant env var):
+
+Queue PRs (one per backend; smoke gated on AWS_ACCESS_KEY_ID or REDIS_URL or DATABASE_URL):
+- Set CREWHAUS_QUEUE_ADAPTER=sqs (or redis-streams / postgres); compile examples/hello-batch with the matching adapter; pump 50 jobs; verify all ack within SLO; verify visibility-timeout hand-off works under nack
+
+Vector PRs (smoke gated on QDRANT_URL / PINECONE_API_KEY / WEAVIATE_URL):
+- Compile examples/hello-rag with retrieve.vectorBackend = qdrant (or pinecone / weaviate / lance); index 100 docs; query top-5 against a known-similar corpus; assert recall ≥ 95%
+
+Embedder PRs (smoke gated on OPENAI_API_KEY / VOYAGE_API_KEY / COHERE_API_KEY):
+- Embed a 5-text fixture corpus; assert the embedding magnitudes match snapshot within ε
+
+Telephony PRs (smoke gated on TWILIO_ACCOUNT_SID + TWILIO_AUTH_TOKEN, or LIVEKIT_URL + LIVEKIT_API_KEY):
+- Place a call to a test number; trigger hold + transfer + hangup; verify per-state hooks fire; clean up the call session
+
+Realtime — Vapi PR (gated on VAPI_API_KEY):
+- Synthetic 1s PCM input through the Vapi adapter; assert event sequence matches the OpenAI Realtime contract corpus
+
+Browser PRs:
+- Host backend (gated on CREWHAUS_BROW_HOST_ENABLED=1; never run on CI): visit a fixture page on the dev's actual desktop; click a known element; verify state change
+- Remote backend (gated on REMOTE_BROWSER_URL): connect to a browserless.io / BrowserBase instance; same fixture flow
+
+Each PR confirms the existing chromium / in-memory backend still passes its contract corpus after the new adapter lands.
+
+Update docs/MODULE-CATALOG.md and docs/build-roadmap.md with everything that is complete after EACH PR (one update per family).
+```
+
+---
+
+### Section 31 — Studio v1
+
+```
+Read docs/build-roadmap.md Section 31. Also read in full:
+- packages/studio-server/src/index.ts (Section 26 v0 — the canned-SSE handler that this PR rewires to spawn runChatLoop subprocesses)
+- packages/studio-ui/src/index.ts (the vanilla TS bundle this PR replaces with Lit)
+- packages/trace-viewer/src/index.ts (the Gantt layout this PR adds replay + clickable drilldown to)
+- packages/graph-visualizer/src/index.ts (the static layout this PR adds live SSE updates + HITL approve UI to)
+- packages/plugin-sdk/src/index.ts (the v0 path-only sandbox this PR upgrades to content isolation)
+- packages/event-log/src/index.ts (Section 10 — replay mode reads this)
+- packages/cost-tracker/src/index.ts (Section 27 — the multi-spec dashboard aggregates this)
+- docs/MODULE-CATALOG.md entries for studio-server, studio-ui, trace-viewer, graph-visualizer, plugin-sdk
+
+Build in this order:
+
+1. packages/studio-server v1 (sequential prereq — every later piece consumes its events)
+   - Rewire /api/runs POST → SSE: spawn actual runChatLoop subprocess (stdout/stderr piped); parse trace bus output as SSE; forward every event kind to the client
+   - New endpoints: /api/runs/:runId/replay (SSE-replays prior run from §10 event-log), /api/runs/:runId/cancel (SIGINT), /api/cost-summary?tenant=&from=&to= (aggregates §27 cost-tracker)
+   - Auth: every endpoint requires §20 gateway-server JWT in production; CREWHAUS_STUDIO_DEV=1 skips auth in dev
+
+2. packages/studio-ui v1 (depends on #1)
+   - Lit components — each pane is a custom element so layout is composable
+   - Monaco editor for spec YAML; live spec-validator lint via debounced WebSocket (500ms); schema-driven autocomplete for every IR variant
+   - Multi-spec dashboard: aggregate cost (§27), pass-rate (§16), latency p50/p95
+   - Tab strip: Specs / Wizard / Runs / Evals / Graph / Plugins / Cost
+
+3. packages/trace-viewer v1 (parallel after #2)
+   - Replay mode scrubs through events at 1×/2×/4×/raw
+   - Clickable spans: model_request → drilldown shows full request/response payload; tool_call_* → shows input/output with redacted-by-classifier markers
+   - Embeds inside studio-ui runs panel + §16 eval-report's per-sample drilldown
+
+4. packages/graph-visualizer v1 (parallel)
+   - Live mode subscribes to SSE node_start/node_end/hitl_pause; animates node colours in real time
+   - HITL pauses surface "approve / reject" overlay → POST /api/runs/:runId/hitl?nodeId=&decision=
+   - Branch-from-checkpoint UI: click past checkpoint → "fork from here" → opens new run pre-pinned
+
+5. packages/plugin-sdk v1 (parallel)
+   - Web Workers (UI plugins) or VM2-style realm shims (server plugins)
+   - Plugin code cannot access node:fs/child_process/net outside sandbox root
+   - Manifest schema: { name, version, permissions: { fs: ["read:..."], net: ["fetch:..."] } } — declared up-front; runtime enforces
+
+Tests: T3 SSE end-to-end (real runChatLoop, ≥N events of expected kinds); T7 100-concurrent SSE consumers (no event drops); T8 expired-JWT rejection; T1 per-component Lit rendering snapshot; Playwright T3 multi-spec dashboard; T1 trace-viewer scrub-mode determinism; T3 click-through drilldown; T3 graph-visualizer live mode (5-node graph with HITL pause; node colours animate in order); T8 plugin-sdk content-sandbox (blocks /etc/passwd read, blocks non-allow-listed fetch, blocks fs escape).
+
+End-to-end smoke test before opening the PR:
+- ANTHROPIC_AUTH_TOKEN is in .env (Bun auto-loads .env)
+- Bun build the studio-ui Lit bundle; `bun run studio` boots the daemon
+- Drive these probes via Playwright:
+  1. Create a CLI spec via Monaco; verify live lint flags an intentional typo (e.g. `target: cli-x`); fix; spec saves
+  2. Run the spec; verify the trace timeline animates in real time as events arrive (live SSE, not canned)
+  3. Click a model_request span; verify drilldown shows the full request payload + model response
+  4. Open examples/hello-graph in the graph visualiser; click "run live"; verify node colours animate as the graph executes; pause at HITL; click approve; verify run resumes
+  5. Replay a prior runId via /api/runs/<id>/replay; verify identical event sequence (deterministic from event-log)
+  6. Open the multi-spec cost dashboard; verify aggregate totals match `crewhaus cost-summary`
+  7. Drop a malicious plugin (tries to read /etc/passwd via node:fs); verify it loads but the read returns a sandbox-violation error
+- Stop studio (Ctrl-C); no orphan processes; no leftover Web Worker threads
 
 Update docs/MODULE-CATALOG.md and docs/build-roadmap.md with everything that is complete and create a pull request with all updates.
 ```
