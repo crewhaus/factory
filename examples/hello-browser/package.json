@@ -1,0 +1,17 @@
+{
+  "name": "@crewhaus-examples/hello-browser",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Section 25 BROW target — Playwright-driven chromium computer-use agent",
+  "dependencies": {
+    "@crewhaus/computer-use-driver": "workspace:*",
+    "@crewhaus/permission-engine": "workspace:*",
+    "@crewhaus/run-context": "workspace:*",
+    "@crewhaus/runtime-core": "workspace:*",
+    "@crewhaus/tool-catalog": "workspace:*",
+    "@crewhaus/tool-mouse-keyboard": "workspace:*",
+    "@crewhaus/tool-screen-capture": "workspace:*",
+    "@crewhaus/tool-vision-grounding": "workspace:*"
+  }
+}

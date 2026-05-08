@@ -2879,7 +2879,9 @@ Update docs/MODULE-CATALOG.md and docs/build-roadmap.md with everything that is 
 
 ---
 
-### Section 25 — BROW target shape (computer-use)
+### Section 25 — BROW target shape (computer-use) ✅ complete (2026-05-08)
+
+> Shipped: `computer-use-driver` (Driver interface + Playwright-backed chromium backend; host + remote backends are stubs that throw at connect()), `tool-screen-capture` (Screenshot tool returning Anthropic image content block), `tool-mouse-keyboard` (Click / Type / Key / Scroll — all destructive: true), `tool-vision-grounding` (FindElement(description) — vision-model bbox lookup with fenced-JSON parsing + retry), `target-browser-driver` (single-file agent.ts codegen). Spec/IR/compiler grew the `target: "browser"` discriminated-union variant. Live-model smoke: fixture HTTP server with a known Submit button → agent uses Screenshot + FindElement + Click → fixture page shows `BROW_SMOKE_OK` post-click. Permission-floor probe (same spec without alwaysAllow rules) verified — daemon completes the run but Click is denied; fixture page stays PENDING. Cross-OS host-backend smoke gated on `CREWHAUS_BROW_HOST_SMOKE=1` and explicitly deferred per kickoff.
 
 ```
 Read docs/build-roadmap.md Section 25. Also read in full:

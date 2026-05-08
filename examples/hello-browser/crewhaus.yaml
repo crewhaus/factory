@@ -1,0 +1,37 @@
+name: hello-browser
+target: browser
+agent:
+  model: claude-sonnet-4-6
+  instructions: |
+    You drive a chromium browser. Use the available tools to complete the
+    user's task:
+      - Screenshot() — capture the current viewport.
+      - FindElement(description) — get a bounding box + center coords for
+        a UI element by natural-language description.
+      - Click(x, y), Type(text), Key(combo), Scroll(dx, dy) — drive the
+        page (DESTRUCTIVE; require alwaysAllow).
+    Be deliberate: take ONE screenshot, find the target element, click
+    its center coordinates, take ONE more screenshot to verify, then
+    end your turn with a 1-sentence summary of what you did.
+driver:
+  backend: chromium
+  viewport:
+    width: 1024
+    height: 720
+  startUrl: http://127.0.0.1:7325/
+groundingModel: claude-sonnet-4-6
+permissions:
+  mode: default
+  rules:
+    - type: alwaysAllow
+      pattern: Screenshot
+    - type: alwaysAllow
+      pattern: FindElement
+    - type: alwaysAllow
+      pattern: Click
+    - type: alwaysAllow
+      pattern: Type
+    - type: alwaysAllow
+      pattern: Key
+    - type: alwaysAllow
+      pattern: Scroll

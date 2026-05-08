@@ -10,6 +10,7 @@
     { "path": "../spec" },
     { "path": "../ir" },
     { "path": "../target-batch-worker" },
+    { "path": "../target-browser-driver" },
     { "path": "../target-channel-bot" },
     { "path": "../target-cli" },
     { "path": "../target-crew" },

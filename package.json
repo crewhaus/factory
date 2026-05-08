@@ -48,12 +48,15 @@
     "run:hello-batch": "bun examples/hello-batch/dist/agent.ts",
     "smoke:section-23-batch": "bun scripts/section-23-batch-smoke.ts",
     "compile:hello-voice": "bun apps/cli/src/index.ts compile examples/hello-voice/crewhaus.yaml -o examples/hello-voice/dist",
-    "smoke:section-24": "bun scripts/section-24-smoke.ts"
+    "smoke:section-24": "bun scripts/section-24-smoke.ts",
+    "compile:hello-browser": "bun apps/cli/src/index.ts compile examples/hello-browser/crewhaus.yaml -o examples/hello-browser/dist",
+    "smoke:section-25": "bun scripts/section-25-smoke.ts"
   },
   "devDependencies": {
     "@biomejs/biome": "1.9.4",
     "@types/bun": "^1.2.0",
     "@types/node": "^22.0.0",
+    "playwright": "1.59.1",
     "typescript": "^5.7.0"
   },
   "engines": {

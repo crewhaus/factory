@@ -470,6 +470,42 @@ const voiceSchema = z
   })
   .strict();
 
+// Browser target (Section 25 BROW). Computer-use / browser-driver agent.
+const browserDriverSchema = z
+  .object({
+    backend: z.enum(["host", "chromium", "remote"]).default("chromium"),
+    viewport: z
+      .object({
+        width: z.number().int().positive().default(1280),
+        height: z.number().int().positive().default(720),
+      })
+      .strict()
+      .default({ width: 1280, height: 720 }),
+    startUrl: z.string().url().optional(),
+  })
+  .strict();
+
+const browserSchema = z
+  .object({
+    name: z.string().min(1),
+    target: z.literal("browser"),
+    agent: z
+      .object({
+        model: z.string().min(1),
+        instructions: z.string().min(1),
+      })
+      .strict(),
+    driver: browserDriverSchema.default({}),
+    /** Vision-grounding model. Defaults to the agent's primary model. */
+    groundingModel: z.string().min(1).optional(),
+    tools: z.array(z.string().min(1)).optional(),
+    tool_config: toolConfigBlock,
+    mcp_servers: mcpServersBlock,
+    permissions: permissionsBlock,
+    compaction: compactionBlock,
+  })
+  .strict();
+
 export const Spec = z.discriminatedUnion("target", [
   cliSchema,
   workflowSchema,
@@ -481,6 +517,7 @@ export const Spec = z.discriminatedUnion("target", [
   researchSchema,
   batchSchema,
   voiceSchema,
+  browserSchema,
 ]);
 
 export type Spec = z.infer<typeof Spec>;
@@ -507,6 +544,8 @@ export type SpecBatchQueue = z.infer<typeof batchQueueSchema>;
 export type SpecVoice = z.infer<typeof voiceSchema>;
 export type SpecVoiceBlock = z.infer<typeof voiceBlockSchema>;
 export type SpecVoiceTelephony = z.infer<typeof voiceTelephonySchema>;
+export type SpecBrowser = z.infer<typeof browserSchema>;
+export type SpecBrowserDriver = z.infer<typeof browserDriverSchema>;
 export type SpecMcpServerConfig = z.infer<typeof mcpServerConfigSchema>;
 export type SpecSubAgentDefinition = z.infer<typeof subAgentDefinitionSchema>;
 export type SpecCompactionBlock = z.infer<typeof compactionBlock>;
