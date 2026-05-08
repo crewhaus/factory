@@ -1,0 +1,15 @@
+{
+  "name": "@crewhaus/scaffold-templates",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Built-in spec templates per target shape (Section 26 Studio)",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  }
+}

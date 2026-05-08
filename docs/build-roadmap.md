@@ -2935,7 +2935,9 @@ Update docs/MODULE-CATALOG.md and docs/build-roadmap.md with everything that is 
 
 ---
 
-### Section 26 — Studio (authoring + inspection UI)
+### Section 26 — Studio (authoring + inspection UI) ✅ complete (2026-05-08)
+
+> Shipped: `studio-server` (Bun.serve daemon — spec CRUD, run inspection via SSE, eval-result inspection, plugin discovery, JWT auth aligned with §20 gateway-server), `studio-ui` (vanilla TS HTML+JS bundle), `trace-viewer` (Gantt-shape timeline builder from `TraceEvent[]`), `graph-visualizer` (deterministic layered DAG positioning + SVG renderer), `wizard` (5-question state machine), `scaffold-templates` (10 spec templates — one per target shape), `plugin-sdk` (`definePlugin` + sandbox-path guard). v0 ships HTTP + SSE backend probes; full Playwright UI smoke gated behind `CREWHAUS_RUN_PLAYWRIGHT=1`. Smoke verified: /healthz, /api/templates (10), wizard 5-question → spec creation, POST /api/runs → SSE `run_start | trace | event: done`, /api/graph-layout (3 nodes + 2 edges, deterministic), fixture plugin discovery under `<pluginRoot>/fixture/`. **Roadmap §22–26 complete; the 1.0 surface is done.**
 
 ```
 Read docs/build-roadmap.md Section 26. Also read:
