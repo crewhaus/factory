@@ -1505,7 +1505,7 @@ A focused queue-consumer pattern. No interactive REPL, no live UI, no per-messag
 
 ## Section 24 — VOICE target shape
 
-> Status: 🟡 dedicated section after §22–23. Substantial novelty.
+> Status: ✅ complete (2026-05-08, PR #31). Shipped: `voice-runtime` (`RealtimeAdapter` + OpenAI Realtime WebSocket adapter + Vapi stub), `vad-engine` (energy + ZCR heuristic, 30 ms framing, aggressiveness 0–3), `barge-in-controller` (hysteresis-gated `interrupt()` fire), `call-session` (`idle | dialing | connected | on-hold | transferred | terminated` state machine + in-memory telephony adapter), `target-voice` (multi-file codegen: `agent.ts` + `voice-loop.ts` + `daemon.ts`). Spec/IR/compiler grew the `target: "voice"` discriminated-union variant. Live-model smoke (`bun run smoke:section-24`) against OpenAI Realtime: synthesized "what is the capital of France?" via OpenAI TTS at 24 kHz mono, piped through the daemon's `--smoke <pcm>` path, captured `session_created` + `transcript_final` containing "paris" + 7 `audio_chunk` events. Real telephony adapters (Twilio / LiveKit SIP / Vonage) and the WebRTC bridge for browser-driven voice land in follow-ups; the kickoff explicitly defers them. VAPI smoke skipped per kickoff (`VAPI_API_KEY` unset).
 
 **Catalog modules:** `voice-runtime` (R16), `vad-engine` (R16), `barge-in-controller` (R16), `call-session` (R16), `target-voice` (F2)
 
@@ -1555,7 +1555,7 @@ voice-runtime  ──►  vad-engine  ──►  barge-in-controller  ──► 
 
 ## Section 25 — BROW target shape (computer-use)
 
-> Status: 🟡 dedicated section after §22–23. Substantial novelty; depends on §18 sandbox for screenshot ops in production.
+> Status: ✅ complete (2026-05-08, PR #32). Shipped: `computer-use-driver` (`Driver` interface + Playwright-backed chromium backend; `host` and `remote` backends are stubs that throw at `connect()` — the kickoff explicitly forbids the host backend in smokes), `tool-screen-capture` (Screenshot tool returning Anthropic image content block), `tool-mouse-keyboard` (Click / Type / Key / Scroll — all `destructive: true`), `tool-vision-grounding` (FindElement(description) — vision-model bbox lookup with fenced-JSON parse + retry), `target-browser-driver` (single-file `agent.ts` codegen). Spec/IR/compiler grew the `target: "browser"` discriminated-union variant. Live-model smoke (`bun run smoke:section-25`): fixture HTTP server with a known Submit button → agent uses Screenshot + FindElement + Click → fixture page shows `BROW_SMOKE_OK` post-click. Permission-floor probe (same spec without `alwaysAllow` rules) verified — the daemon completes the run but Click is denied; fixture page stays `PENDING`. Cross-OS host-backend smoke gated on `CREWHAUS_BROW_HOST_SMOKE=1` and explicitly deferred per kickoff; Docker-wrapped chromium (instead of Playwright's bundled chromium) lands in a follow-up.
 
 **Catalog modules:** `computer-use-driver` (R18), `tool-screen-capture` (R4), `tool-mouse-keyboard` (R4), `tool-vision-grounding` (R4), `target-browser-driver` (F2)
 
@@ -1606,7 +1606,7 @@ computer-use-driver  ──►  tool-screen-capture       (parallel)  ──► 
 
 ## Section 26 — Studio (authoring + inspection UI)
 
-> Status: 🟡 last in this roadmap; depends on every prior section's IR variants and trace event kinds being stable.
+> Status: ✅ complete (2026-05-08, PR #33). Shipped: `studio-server` (Bun.serve daemon — spec CRUD, run inspection via SSE, eval-result inspection, plugin discovery, JWT auth aligned with §20 `gateway-server`), `studio-ui` (vanilla TS HTML + JS bundle — Specs / Wizard / Plugins tabs), `trace-viewer` (Gantt-shape timeline builder from `TraceEvent[]`), `graph-visualizer` (deterministic layered DAG positioning + SVG renderer), `wizard` (5-question state machine with `nextQuestion` / `answerWizard` / `compileWizard`), `scaffold-templates` (10 spec templates — one per shipped target shape), `plugin-sdk` (`definePlugin` + `assertPluginPathsStaySandboxed`). v0 ships HTTP + SSE backend probes; full Playwright UI smoke gated behind `CREWHAUS_RUN_PLAYWRIGHT=1`. Live smoke (`bun run smoke:section-26`) verified: `/healthz`, `/api/templates` (10), wizard 5-question → spec creation, `POST /api/runs` → SSE `run_start | trace | event: done`, `/api/graph-layout` (3 nodes + 2 edges, deterministic), fixture plugin discovery under `<pluginRoot>/fixture/`. Lit + Monaco rich UI, real `runChatLoop` dispatch from `/api/runs` (currently canned SSE), and the gateway-server JWT wiring all land in §31 (Studio v1).
 
 **Catalog modules:** `studio-server` (F4), `studio-ui` (F4), `trace-viewer` (F4), `graph-visualizer` (F4), `wizard` (F4), `scaffold-templates` (F4), `plugin-sdk` (F5)
 
