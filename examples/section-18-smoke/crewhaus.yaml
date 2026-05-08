@@ -1,0 +1,21 @@
+name: section-18-smoke
+target: cli
+agent:
+  model: claude-sonnet-4-6
+  instructions: |
+    You are a CrewHaus Section 18 smoke-test agent. The user will tell you
+    exactly which tool to call and with what argument. Call the tool once
+    and report what you observed in one short sentence. Do not editorialize.
+tools:
+  - python
+  - shell
+  - read
+permissions:
+  mode: default
+  rules:
+    - type: alwaysAllow
+      pattern: Python
+    - type: alwaysAllow
+      pattern: Shell
+    - type: alwaysAllow
+      pattern: Read

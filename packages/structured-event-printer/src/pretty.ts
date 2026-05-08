@@ -35,6 +35,8 @@ function formatBody(ev: TraceEvent): string {
       return `tool=${ev.toolName} id=${ev.toolUseId} input=${ev.inputBytes}B`;
     case "tool_call_end":
       return `tool=${ev.toolName} id=${ev.toolUseId} ${ev.isError ? "ERROR " : ""}output=${ev.outputBytes}B duration=${ev.durationMs.toFixed(0)}ms`;
+    case "tool_stream_chunk":
+      return `tool=${ev.toolName} id=${ev.toolUseId} ${ev.stream}=${ev.bytes}B`;
     case "mcp_call_start":
       return `server=${ev.server} tool=${ev.toolName}`;
     case "mcp_call_end":
@@ -47,8 +49,8 @@ function formatBody(ev: TraceEvent): string {
       return `kind=${ev.subKind} phase=${ev.phase} before=${ev.before} after=${ev.after}`;
     case "permission_decision":
       return `tool=${ev.toolName} decision=${ev.decision} mode=${ev.mode}${
-        ev.reason ? ` reason=${ev.reason}` : ""
-      }`;
+        ev.outcome ? ` outcome=${ev.outcome}` : ""
+      }${ev.reason ? ` reason=${ev.reason}` : ""}`;
     case "error_recovered":
       return `action=${ev.action} error=${ev.errorName} depth=${ev.depth}`;
     case "sub_agent_start":

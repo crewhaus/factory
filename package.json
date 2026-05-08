@@ -26,7 +26,9 @@
     "smoke:section-14": "bun scripts/section-14-smoke.ts",
     "compile:section-15-smoke": "bun apps/cli/src/index.ts compile examples/section-15-smoke/crewhaus.yaml -o examples/section-15-smoke/dist",
     "run:section-15-smoke": "bun examples/section-15-smoke/dist/agent.ts",
-    "smoke:section-15": "bun scripts/section-15-smoke.ts"
+    "smoke:section-15": "bun scripts/section-15-smoke.ts",
+    "compile:section-18-smoke": "bun apps/cli/src/index.ts compile examples/section-18-smoke/crewhaus.yaml -o examples/section-18-smoke/dist",
+    "smoke:section-18": "bun scripts/section-18-smoke.ts"
   },
   "devDependencies": {
     "@biomejs/biome": "1.9.4",

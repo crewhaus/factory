@@ -52,6 +52,26 @@ describe("buildTool — fail-closed defaults", () => {
     expect(tool.readOnly).toBe(false);
     expect(tool.destructive).toBe(false);
   });
+
+  test("requiresSandbox defaults to false (fail-closed)", () => {
+    const tool = buildTool(echoDef);
+    expect(tool.requiresSandbox).toBe(false);
+  });
+
+  test("requiresSandbox=true is preserved", () => {
+    const tool = buildTool({ ...echoDef, requiresSandbox: true });
+    expect(tool.requiresSandbox).toBe(true);
+  });
+
+  test("classifyOutput defaults to true", () => {
+    const tool = buildTool(echoDef);
+    expect(tool.classifyOutput).toBe(true);
+  });
+
+  test("classifyOutput=false is preserved", () => {
+    const tool = buildTool({ ...echoDef, classifyOutput: false });
+    expect(tool.classifyOutput).toBe(false);
+  });
 });
 
 describe("buildTool — identity fields", () => {

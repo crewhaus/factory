@@ -13,6 +13,8 @@ function makeTool(overrides: Partial<RegisteredTool> & { name: string }): Regist
     concurrencySafe: false,
     readOnly: false,
     destructive: false,
+    requiresSandbox: false,
+    classifyOutput: true,
     ...overrides,
   };
 }

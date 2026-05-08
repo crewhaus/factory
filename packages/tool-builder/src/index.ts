@@ -23,6 +23,11 @@ export function buildTool<TInput>(def: ToolDefinition<TInput>): RegisteredTool {
     concurrencySafe: def.concurrencySafe ?? false,
     readOnly: def.readOnly ?? false,
     destructive: def.destructive ?? false,
+    // Section 18: fail-closed for the sandbox flag and default-on for
+    // classification. Tools that legitimately bypass classification must
+    // opt out explicitly.
+    requiresSandbox: def.requiresSandbox ?? false,
+    classifyOutput: def.classifyOutput ?? true,
     ...(def.jsonSchema !== undefined ? { jsonSchema: def.jsonSchema } : {}),
   };
 }

@@ -102,6 +102,20 @@
         "@crewhaus/tool-catalog": "workspace:*",
       },
     },
+    "examples/section-18-smoke": {
+      "name": "@crewhaus-examples/section-18-smoke",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/hooks-engine": "workspace:*",
+        "@crewhaus/permission-engine": "workspace:*",
+        "@crewhaus/runtime-core": "workspace:*",
+        "@crewhaus/skills-registry": "workspace:*",
+        "@crewhaus/slash-commands": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-code-execution": "workspace:*",
+        "@crewhaus/tool-fs": "workspace:*",
+      },
+    },
     "packages/abort-controller": {
       "name": "@crewhaus/abort-controller",
       "version": "0.0.0",
@@ -352,6 +366,13 @@
         "zod": "^3.23.8",
       },
     },
+    "packages/prompt-injection-detector": {
+      "name": "@crewhaus/prompt-injection-detector",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+      },
+    },
     "packages/recovery-engine": {
       "name": "@crewhaus/recovery-engine",
       "version": "0.0.0",
@@ -384,6 +405,7 @@
         "@crewhaus/model-router": "workspace:*",
         "@crewhaus/otel-exporter": "workspace:*",
         "@crewhaus/permission-engine": "workspace:*",
+        "@crewhaus/prompt-injection-detector": "workspace:*",
         "@crewhaus/recovery-engine": "workspace:*",
         "@crewhaus/run-context": "workspace:*",
         "@crewhaus/session-store": "workspace:*",
@@ -406,6 +428,13 @@
         "@crewhaus/logging": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "zod": "^3.23.8",
+      },
+    },
+    "packages/sandbox": {
+      "name": "@crewhaus/sandbox",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
       },
     },
     "packages/session-store": {
@@ -580,6 +609,17 @@
       "version": "0.0.0",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
+        "zod": "^3.23.8",
+      },
+    },
+    "packages/tool-code-execution": {
+      "name": "@crewhaus/tool-code-execution",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/sandbox": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
         "zod": "^3.23.8",
       },
     },
@@ -877,6 +917,8 @@
 
     "@crewhaus-examples/section-15-smoke": ["@crewhaus-examples/section-15-smoke@workspace:examples/section-15-smoke"],
 
+    "@crewhaus-examples/section-18-smoke": ["@crewhaus-examples/section-18-smoke@workspace:examples/section-18-smoke"],
+
     "@crewhaus/abort-controller": ["@crewhaus/abort-controller@workspace:packages/abort-controller"],
 
     "@crewhaus/adapter-anthropic": ["@crewhaus/adapter-anthropic@workspace:packages/adapter-anthropic"],
@@ -931,11 +973,15 @@
 
     "@crewhaus/permission-engine": ["@crewhaus/permission-engine@workspace:packages/permission-engine"],
 
+    "@crewhaus/prompt-injection-detector": ["@crewhaus/prompt-injection-detector@workspace:packages/prompt-injection-detector"],
+
     "@crewhaus/recovery-engine": ["@crewhaus/recovery-engine@workspace:packages/recovery-engine"],
 
     "@crewhaus/run-context": ["@crewhaus/run-context@workspace:packages/run-context"],
 
     "@crewhaus/runtime-core": ["@crewhaus/runtime-core@workspace:packages/runtime-core"],
+
+    "@crewhaus/sandbox": ["@crewhaus/sandbox@workspace:packages/sandbox"],
 
     "@crewhaus/session-store": ["@crewhaus/session-store@workspace:packages/session-store"],
 
@@ -968,6 +1014,8 @@
     "@crewhaus/tool-builder": ["@crewhaus/tool-builder@workspace:packages/tool-builder"],
 
     "@crewhaus/tool-catalog": ["@crewhaus/tool-catalog@workspace:packages/tool-catalog"],
+
+    "@crewhaus/tool-code-execution": ["@crewhaus/tool-code-execution@workspace:packages/tool-code-execution"],
 
     "@crewhaus/tool-executor": ["@crewhaus/tool-executor@workspace:packages/tool-executor"],
 

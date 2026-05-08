@@ -27,6 +27,12 @@ export type ExecutionContext = {
    * it; ordinary tools ignore it.
    */
   readonly bridge?: unknown;
+  /**
+   * Section 18 — runtime-core supplies this so streaming tools
+   * (`tool-code-execution`) can forward stdout/stderr chunks to the trace
+   * bus as `tool_stream_chunk` events.
+   */
+  readonly onStreamChunk?: (stream: "stdout" | "stderr", chunk: string) => void;
 };
 
 export class ToolPermissionError extends CrewhausError {
@@ -66,6 +72,7 @@ export async function executeTool(
     const content = await tool.execute(validation.value, {
       signal: context.signal,
       ...(context.bridge !== undefined ? { bridge: context.bridge } : {}),
+      ...(context.onStreamChunk !== undefined ? { onStreamChunk: context.onStreamChunk } : {}),
     });
     return { toolUseId, content, isError: false };
   } catch (err) {

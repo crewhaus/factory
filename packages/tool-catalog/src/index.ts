@@ -10,10 +10,16 @@ import type { ZodType } from "zod";
  * run. Framework-aware tools — today only the `Task` tool — cast it back to
  * the typed `RuntimeBridge` from `@crewhaus/agent-context-isolation`.
  * Ordinary tools ignore it.
+ *
+ * Section 18 — `onStreamChunk` is invoked by streaming tools (e.g.
+ * tool-code-execution piping container stdout/stderr) so runtime-core can
+ * publish `tool_stream_chunk` trace events. The callback is fire-and-forget
+ * — tools must not block on it. Optional; tools that don't stream skip it.
  */
 export interface ToolExecuteContext {
   readonly signal?: AbortSignal;
   readonly bridge?: unknown;
+  readonly onStreamChunk?: (stream: "stdout" | "stderr", chunk: string) => void;
 }
 
 /**
@@ -53,6 +59,23 @@ export interface ToolDefinition<TInput = unknown> {
   readOnly?: boolean;
   destructive?: boolean;
   /**
+   * Section 18 — declares that the tool MUST run inside a sandbox. The
+   * permission engine refuses to grant `allow` in default mode unless an
+   * `alwaysAllow` rule matches AND a real sandbox backend is available
+   * (see `permission-engine.evaluate`). Tool implementations are
+   * responsible for actually using the sandbox; the flag is the policy
+   * declaration that the floor enforces.
+   */
+  requiresSandbox?: boolean;
+  /**
+   * Section 18 — when explicitly false, the post-tool prompt-injection
+   * classifier in runtime-core is skipped for this tool. Default is true
+   * (run the classifier on every output). Set to false ONLY for tools whose
+   * output is structurally guaranteed not to be attacker-controlled (e.g.
+   * the in-process `Task` sub-agent tool wrapper).
+   */
+  classifyOutput?: boolean;
+  /**
    * Authoritative JSON Schema for the tool's input. When set, runtime-core
    * forwards this verbatim to the model instead of running
    * `zodToJsonSchema(inputSchema)`. Used by tools whose canonical schema is
@@ -73,6 +96,10 @@ export interface RegisteredTool {
   concurrencySafe: boolean;
   readOnly: boolean;
   destructive: boolean;
+  /** Section 18 — fails closed (false) when omitted by `buildTool`. */
+  requiresSandbox: boolean;
+  /** Section 18 — defaults to true so post-tool classification runs. */
+  classifyOutput: boolean;
   /** See ToolDefinition.jsonSchema. Optional; runtime-core falls back to
    *  zodToJsonSchema(inputSchema) when absent. */
   jsonSchema?: unknown;

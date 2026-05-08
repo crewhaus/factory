@@ -75,6 +75,21 @@ const BUILTIN_TOOL_MAP: Record<string, BuiltinToolEntry> = {
     export: "fetch",
     initSymbol: "registerFetchConfig",
   },
+  python: {
+    package: "@crewhaus/tool-code-execution",
+    export: "python",
+    initSymbol: "registerCodeExecutionConfig",
+  },
+  javascript: {
+    package: "@crewhaus/tool-code-execution",
+    export: "javascript",
+    initSymbol: "registerCodeExecutionConfig",
+  },
+  shell: {
+    package: "@crewhaus/tool-code-execution",
+    export: "shell",
+    initSymbol: "registerCodeExecutionConfig",
+  },
 };
 
 function resolveTools(
@@ -91,6 +106,11 @@ function resolveTools(
   const byPackage = new Map<string, Set<string>>();
   const registrations: string[] = [];
   const inits: string[] = [];
+  // Section 18 — when several tools share an `initSymbol` (e.g.
+  // python/javascript/shell all calling `registerCodeExecutionConfig`),
+  // emit the init exactly once. We honor a `tool_config.codeExecution`
+  // (or the first per-tool config we encounter) for the shared symbol.
+  const initEmitted = new Set<string>();
   for (const name of toolNames) {
     const entry = BUILTIN_TOOL_MAP[name];
     if (!entry) {
@@ -101,10 +121,15 @@ function resolveTools(
     set.add(entry.export);
     byPackage.set(entry.package, set);
     if (entry.initSymbol !== undefined) {
-      const cfg = toolConfigs[name];
-      if (cfg !== undefined) {
+      const cfg =
+        toolConfigs[name] ?? toolConfigs["codeExecution"] ?? toolConfigs["code_execution"];
+      if (cfg !== undefined && !initEmitted.has(entry.initSymbol)) {
         set.add(entry.initSymbol);
         inits.push(`${entry.initSymbol}(${JSON.stringify(cfg)});`);
+        initEmitted.add(entry.initSymbol);
+      } else if (cfg !== undefined) {
+        // ensure the symbol is imported even when init was emitted earlier
+        set.add(entry.initSymbol);
       }
     }
     registrations.push(`defaultCatalog.register(${entry.export});`);
@@ -307,11 +332,20 @@ if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));`;
   const subAgentsBoot = subAgents.registryBlock
     ? `${subAgents.registryBlock}\n${subAgents.registerBlock}\n\n`
     : "";
+  // Section 18 — only flip `sandboxAvailable` on at runtime when the
+  // operator has wired a real backend. Default (unset) treats docker as
+  // available; `CREWHAUS_SANDBOX=noop` always denies the floor.
+  const hasSandboxTools = ir.tools.some(
+    (t) => t === "python" || t === "javascript" || t === "shell",
+  );
+  const sandboxField = hasSandboxTools
+    ? '\n  sandboxAvailable: ((process.env.CREWHAUS_SANDBOX ?? "docker").toLowerCase() !== "noop"),'
+    : "";
   const runChatLoopCall = `await runChatLoop({
   model: ${escapeJsonString(ir.agent.model)},
   instructions: ${escapeJsonString(ir.agent.instructions)},
   sessionName: ${escapeJsonString(ir.name)},
-  sessionTarget: "cli",${toolsField}${permField}
+  sessionTarget: "cli",${toolsField}${permField}${sandboxField}
   hooks: __hooks,
   skills: __skills,
   slashCommands: __slashCommands,${subAgents.subAgentsField}${subAgents.spawnField}
