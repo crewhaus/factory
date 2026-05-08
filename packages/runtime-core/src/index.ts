@@ -23,8 +23,13 @@ import {
   type PermissionMode,
   type RuleSet,
   emptyRuleSet,
-  evaluate,
+  evaluateWithReason,
 } from "@crewhaus/permission-engine";
+import {
+  buildRedactionNotice,
+  classifyText,
+  llmClassifierEnabled,
+} from "@crewhaus/prompt-injection-detector";
 import {
   type RecoveryState,
   advanceState,
@@ -302,6 +307,23 @@ export type RunChatLoopOptions = {
    * runChatLoop).
    */
   spawnSubAgent?: SpawnSubAgentFn;
+  /**
+   * Section 18 — set true when the bundle has wired a non-noop sandbox
+   * backend. The permission engine refuses to grant `allow` for tools
+   * with `requiresSandbox: true` unless this is set. Codegen flips this
+   * automatically when the spec lists any `requiresSandbox` tool.
+   */
+  sandboxAvailable?: boolean;
+  /**
+   * Section 18 — when set, suspicious or malicious tool outputs are
+   * classified by an LLM after the regex/structural layers. The runtime
+   * supplies the function; the prompt-injection-detector calls it as
+   * a best-effort tier-3. When omitted (the common case), the classifier
+   * stays at tiers 1-2.
+   */
+  promptInjectionLlmClassifier?: (
+    text: string,
+  ) => Promise<{ verdict: "clean" | "suspicious" | "malicious"; rationale?: string } | undefined>;
 };
 
 /**
@@ -625,27 +647,31 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       });
     }
 
-    const decision = evaluate(
+    const decisionDetails = evaluateWithReason(
       {
         toolName: tu.name,
         input: tu.input,
         readOnly: tool.readOnly,
         destructive: tool.destructive,
+        requiresSandbox: tool.requiresSandbox,
       },
       permissionMode,
       permissionRules,
+      { sandboxAvailable: opts.sandboxAvailable === true },
     );
+    const decision = decisionDetails.decision;
     bus.publish({
       ...bus.envelope(),
       kind: "permission_decision",
       toolName: tu.name,
       decision,
       mode: permissionMode,
+      ...(decisionDetails.reason !== undefined ? { reason: decisionDetails.reason } : {}),
     });
     let approved = decision === "allow";
     let denialMessage: string | undefined;
     if (decision === "deny") {
-      denialMessage = "tool denied by permission policy";
+      denialMessage = decisionDetails.reason ?? "tool denied by permission policy";
     } else if (decision === "ask") {
       if (askApproval !== undefined) {
         approved = await askApproval(tu.name, tu.input);
@@ -686,6 +712,23 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       toolUseId: tu.id,
       signal: toolAbort.signal,
       ...(bridge !== undefined ? { bridge } : {}),
+      // Section 18 — runtime-core wires this so streaming tools
+      // (`tool-code-execution`) can publish `tool_stream_chunk` events as
+      // they pipe stdout/stderr from the sandbox container.
+      onStreamChunk: (stream, chunk) => {
+        bus.publish(
+          {
+            ...bus.envelope(),
+            spanId: toolStartEnvelope.spanId,
+            kind: "tool_stream_chunk",
+            toolUseId: tu.id,
+            toolName: tu.name,
+            stream,
+            bytes: Buffer.byteLength(chunk, "utf8"),
+          },
+          { ephemeral: true },
+        );
+      },
     });
     const stored = await storeAndPreview(
       { toolUseId: raw.toolUseId, content: raw.content, isError: raw.isError },
@@ -698,6 +741,18 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         fullPath: stored.fullPath,
       });
     }
+    // Section 18 — post-tool prompt-injection classifier. Runs after the
+    // tool result has been stored but before the model sees it. On a
+    // malicious verdict the previewContent is replaced with a redaction
+    // notice; on suspicious it's kept but the trace event records a
+    // warning. Tools opt out by setting `classifyOutput: false` (only the
+    // in-process Task wrapper does today).
+    const finalPreview = await applyInjectionClassification(
+      tool,
+      tu,
+      stored.previewContent,
+      raw.isError,
+    );
     return finish({
       type: "tool_result",
       tool_use_id: tu.id,
@@ -705,13 +760,85 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       // verbatim so the model sees the image. Anthropic's ToolResultBlockParam
       // already accepts string | Array<TextBlockParam | ImageBlockParam>.
       content:
-        typeof stored.previewContent === "string"
-          ? stored.previewContent
-          : (stored.previewContent as ReadonlyArray<
+        typeof finalPreview === "string"
+          ? finalPreview
+          : (finalPreview as ReadonlyArray<
               Anthropic.TextBlockParam | Anthropic.ImageBlockParam
             > as Anthropic.ToolResultBlockParam["content"]),
       is_error: raw.isError,
     });
+  }
+
+  /**
+   * Section 18 — classify the previewContent we are about to hand to the
+   * model. Returns the (possibly rewritten) content. Publishes
+   * `permission_decision { outcome }` for any non-clean classification so
+   * the audit trail records exactly what was redacted/warned.
+   */
+  let injectionWarningEmitted = false;
+  async function applyInjectionClassification(
+    tool: RegisteredTool,
+    tu: TsmToolUseBlock,
+    previewContent: string | ReadonlyArray<Anthropic.TextBlockParam | Anthropic.ImageBlockParam>,
+    isError: boolean,
+  ): Promise<string | ReadonlyArray<Anthropic.TextBlockParam | Anthropic.ImageBlockParam>> {
+    if (tool.classifyOutput === false) return previewContent;
+    if (isError) return previewContent;
+    // Concatenate text-only content for classification. Image blocks are
+    // never injection vectors at the byte level we examine here.
+    const textForClassification =
+      typeof previewContent === "string"
+        ? previewContent
+        : previewContent.map((b) => (b.type === "text" ? b.text : "")).join("\n");
+    if (textForClassification.length === 0) return previewContent;
+
+    const llmEnabled =
+      opts.promptInjectionLlmClassifier !== undefined && llmClassifierEnabled(process.env);
+    const verdict = await classifyText(
+      textForClassification,
+      llmEnabled ? { llmClassifier: opts.promptInjectionLlmClassifier } : {},
+    );
+    if (verdict.classification === "clean") return previewContent;
+
+    const ruleIds = [...new Set(verdict.hits.map((h) => h.rule))];
+    if (verdict.classification === "malicious") {
+      const notice = buildRedactionNotice(verdict.hits);
+      bus.publish({
+        ...bus.envelope(),
+        kind: "permission_decision",
+        toolName: tu.name,
+        decision: "allow",
+        mode: permissionMode,
+        outcome: "redacted",
+        rules: ruleIds,
+        reason: `prompt injection in tool output (${ruleIds.slice(0, 3).join(", ")})`,
+      });
+      runContext.logger.warn("tool output redacted (prompt injection detected)", {
+        toolUseId: tu.id,
+        toolName: tu.name,
+        rules: ruleIds,
+      });
+      return notice;
+    }
+    // suspicious — keep content but emit a once-per-session warning.
+    bus.publish({
+      ...bus.envelope(),
+      kind: "permission_decision",
+      toolName: tu.name,
+      decision: "allow",
+      mode: permissionMode,
+      outcome: "warned",
+      rules: ruleIds,
+      reason: `suspicious tool output (${ruleIds.slice(0, 3).join(", ")})`,
+    });
+    if (!injectionWarningEmitted) {
+      injectionWarningEmitted = true;
+      runContext.logger.warn(
+        "suspicious tool output — kept but flagged (further suspicious outputs in this session will not be re-warned)",
+        { toolUseId: tu.id, toolName: tu.name, rules: ruleIds },
+      );
+    }
+    return previewContent;
   }
 
   /**

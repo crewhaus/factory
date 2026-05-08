@@ -14,6 +14,8 @@ function makeEchoTool(overrides?: Partial<RegisteredTool>): RegisteredTool {
     concurrencySafe: false,
     readOnly: false,
     destructive: false,
+    requiresSandbox: false,
+    classifyOutput: true,
     ...overrides,
   };
 }

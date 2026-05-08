@@ -227,5 +227,7 @@ export function createSkillTool(skills: ReadonlyArray<SkillRef>): RegisteredTool
     concurrencySafe: true,
     readOnly: true,
     destructive: false,
+    requiresSandbox: false,
+    classifyOutput: true,
   };
 }

@@ -24,6 +24,7 @@
     "@crewhaus/hooks-engine": "workspace:*",
     "@crewhaus/model-router": "workspace:*",
     "@crewhaus/permission-engine": "workspace:*",
+    "@crewhaus/prompt-injection-detector": "workspace:*",
     "@crewhaus/recovery-engine": "workspace:*",
     "@crewhaus/run-context": "workspace:*",
     "@crewhaus/session-store": "workspace:*",

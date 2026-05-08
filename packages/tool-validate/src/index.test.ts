@@ -14,6 +14,8 @@ const tool: RegisteredTool = {
   concurrencySafe: false,
   readOnly: false,
   destructive: false,
+  requiresSandbox: false,
+  classifyOutput: true,
 };
 
 describe("validateToolInput — success", () => {

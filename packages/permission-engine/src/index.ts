@@ -53,9 +53,36 @@ export type ToolCallContext = {
   readonly input: unknown;
   readonly readOnly: boolean;
   readonly destructive: boolean;
+  /**
+   * Section 18 — when true, the tool is gated behind the production
+   * safety floor. `evaluate()` refuses to grant `allow` in default mode
+   * unless an `alwaysAllow` rule matches AND a non-noop sandbox backend
+   * is configured (`sandboxAvailable: true`).
+   */
+  readonly requiresSandbox?: boolean;
 };
 
 export type Decision = "allow" | "deny" | "ask";
+
+/**
+ * Section 18 — extra signals the runtime threads through. `sandboxAvailable`
+ * is true when a non-noop sandbox backend is wired; without it, any
+ * `requiresSandbox: true` tool is denied even if a rule would have allowed
+ * it. This keeps the noop backend strictly test-scope.
+ */
+export type EvaluateOptions = {
+  readonly sandboxAvailable?: boolean;
+};
+
+/**
+ * Decision details. `evaluate()` returns just the Decision (back-compat);
+ * `evaluateWithReason()` exposes the structured form so runtime-core can
+ * publish `permission_decision { reason }` events.
+ */
+export type DecisionDetails = {
+  readonly decision: Decision;
+  readonly reason?: string;
+};
 
 export class PermissionConfigError extends CrewhausError {
   override readonly name = "PermissionConfigError";
@@ -118,32 +145,76 @@ function compile(rule: PermissionRule): CompiledPattern {
 /**
  * Decide allow/deny/ask for one tool call. Pure.
  */
-export function evaluate(call: ToolCallContext, mode: PermissionMode, rules: RuleSet): Decision {
-  if (mode === "bypass") return "allow";
-  if (mode === "plan") return call.readOnly ? "allow" : "deny";
+export function evaluate(
+  call: ToolCallContext,
+  mode: PermissionMode,
+  rules: RuleSet,
+  opts: EvaluateOptions = {},
+): Decision {
+  return evaluateWithReason(call, mode, rules, opts).decision;
+}
 
+/**
+ * Section 18 — full structured form. Returns `decision` plus an optional
+ * `reason` (always populated on a `requiresSandbox` denial). Pure.
+ */
+export function evaluateWithReason(
+  call: ToolCallContext,
+  mode: PermissionMode,
+  rules: RuleSet,
+  opts: EvaluateOptions = {},
+): DecisionDetails {
+  if (mode === "bypass") return { decision: "allow" };
+  if (mode === "plan") return { decision: call.readOnly ? "allow" : "deny" };
+
+  // Section 18 production safety floor: a tool that declared
+  // `requiresSandbox` cannot be allowed unless (a) a rule explicitly
+  // matched AND (b) a non-noop sandbox is available. We compute the
+  // base decision first so ruleHit is already known.
+  let baseDecision: Decision | undefined;
   for (const sourceKey of SOURCE_PRIORITY) {
     for (const rule of rules[sourceKey]) {
       try {
         const compiled = compile(rule);
         if (matchesPattern(compiled, call.toolName, call.input)) {
-          return ruleTypeToDecision(rule.type);
+          baseDecision = ruleTypeToDecision(rule.type);
+          break;
         }
       } catch {
         // A malformed rule pattern is silently skipped — implicit by
         // catching the exception and continuing the inner-loop iteration.
       }
     }
+    if (baseDecision !== undefined) break;
   }
 
-  // No rule matched: mode-specific fallback.
-  if (mode === "auto") {
-    if (call.readOnly) return "allow";
-    if (call.destructive) return "ask";
-    return "allow";
+  if (baseDecision === undefined) {
+    // No rule matched: mode-specific fallback.
+    if (mode === "auto") {
+      if (call.readOnly) baseDecision = "allow";
+      else if (call.destructive) baseDecision = "ask";
+      else baseDecision = "allow";
+    } else {
+      // mode === "default"
+      baseDecision = "ask";
+    }
   }
-  // mode === "default"
-  return "ask";
+
+  if (call.requiresSandbox === true) {
+    if (opts.sandboxAvailable !== true) {
+      return {
+        decision: "deny",
+        reason: `tool "${call.toolName}" requires a sandbox but none is configured (CREWHAUS_SANDBOX must be set to docker or podman)`,
+      };
+    }
+    if (baseDecision !== "allow") {
+      return {
+        decision: "deny",
+        reason: `tool "${call.toolName}" requires an explicit alwaysAllow rule (sandbox-floor — default mode does not auto-grant requiresSandbox tools)`,
+      };
+    }
+  }
+  return { decision: baseDecision };
 }
 
 // ---------------------------------------------------------------------------

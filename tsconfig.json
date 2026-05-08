@@ -51,6 +51,9 @@
     { "path": "./packages/eval-judge" },
     { "path": "./packages/eval-runner" },
     { "path": "./packages/eval-report" },
+    { "path": "./packages/sandbox" },
+    { "path": "./packages/prompt-injection-detector" },
+    { "path": "./packages/tool-code-execution" },
     { "path": "./apps/cli" }
   ]
 }

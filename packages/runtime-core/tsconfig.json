@@ -17,6 +17,7 @@
     { "path": "../logging" },
     { "path": "../model-router" },
     { "path": "../permission-engine" },
+    { "path": "../prompt-injection-detector" },
     { "path": "../recovery-engine" },
     { "path": "../run-context" },
     { "path": "../session-store" },

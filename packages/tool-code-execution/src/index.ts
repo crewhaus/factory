@@ -1,0 +1,229 @@
+import {
+  type Sandbox,
+  type SandboxBackend,
+  type SandboxMount,
+  createSandbox,
+} from "@crewhaus/sandbox";
+import { buildTool } from "@crewhaus/tool-builder";
+import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import { z } from "zod";
+
+/**
+ * Catalog R4 `tool-code-execution` — three sandboxed REPL tools:
+ *
+ *   Python — `python:3.13-slim`, runs `python3 -c <code>`
+ *   JavaScript — `node:22-alpine`, runs `node -e <code>`
+ *   Shell — `alpine:3.19`, runs `sh -c <code>`
+ *
+ * Each tool delegates execution to `@crewhaus/sandbox`, which enforces
+ * the production safety floor (network=none, read-only root, tmpfs /tmp,
+ * 60s timeout, image allowlist, mount whitelist). Without a sandbox
+ * registered, the tool returns an error message at first call — the
+ * permission engine should refuse them earlier (`requiresSandbox: true`).
+ *
+ * Output is streamed line-by-line via `ctx.onStreamChunk` so runtime-core
+ * can publish `tool_stream_chunk` trace events.
+ *
+ * Layer R4. Pairs with `sandbox` (R8) and `permission-engine` (R8).
+ */
+
+export type CodeExecutionConfig = {
+  readonly sandbox?: Sandbox;
+  readonly backend?: SandboxBackend;
+  readonly allowedImages?: ReadonlyArray<string>;
+  readonly mountWhitelist?: ReadonlyArray<string>;
+  readonly defaultTimeoutMs?: number;
+  /** Optional warm pool size per language. Reserved for v1; v0 ignores. */
+  readonly warmPoolSize?: number;
+  /** Per-language image override. Defaults to the curated images. */
+  readonly images?: {
+    readonly python?: string;
+    readonly javascript?: string;
+    readonly shell?: string;
+  };
+  /**
+   * Files the agent is allowed to expose to the container, mapped
+   * { hostAbsolutePath: containerPath }. Each entry must pass the
+   * sandbox's mount whitelist; otherwise the tool refuses the call.
+   */
+  readonly mounts?: Readonly<Record<string, string>>;
+};
+
+export type CodeExecutionConfigInput = {
+  readonly sandbox?: Sandbox;
+  readonly backend?: SandboxBackend;
+  readonly allowed_images?: ReadonlyArray<string>;
+  readonly allowedImages?: ReadonlyArray<string>;
+  readonly mount_whitelist?: ReadonlyArray<string>;
+  readonly mountWhitelist?: ReadonlyArray<string>;
+  readonly default_timeout_ms?: number;
+  readonly defaultTimeoutMs?: number;
+  readonly warm_pool_size?: number;
+  readonly warmPoolSize?: number;
+  readonly images?: {
+    readonly python?: string;
+    readonly javascript?: string;
+    readonly shell?: string;
+  };
+  readonly mounts?: Readonly<Record<string, string>>;
+};
+
+const DEFAULT_IMAGES = {
+  python: "python:3.13-slim",
+  javascript: "node:22-alpine",
+  shell: "alpine:3.19",
+} as const;
+
+let activeConfig: CodeExecutionConfig = {};
+let activeSandbox: Sandbox | undefined;
+
+export function registerCodeExecutionConfig(input: CodeExecutionConfigInput): void {
+  activeConfig = {
+    sandbox: input.sandbox,
+    backend: input.backend,
+    allowedImages: input.allowedImages ?? input.allowed_images,
+    mountWhitelist: input.mountWhitelist ?? input.mount_whitelist,
+    defaultTimeoutMs: input.defaultTimeoutMs ?? input.default_timeout_ms,
+    warmPoolSize: input.warmPoolSize ?? input.warm_pool_size,
+    images: input.images,
+    mounts: input.mounts,
+  };
+  // Reset cached lazy sandbox so the next call constructs from the new
+  // config. If the caller supplied an explicit sandbox, use it directly.
+  activeSandbox = input.sandbox;
+}
+
+export function getCodeExecutionConfig(): CodeExecutionConfig {
+  return activeConfig;
+}
+
+/** Test-only — clears all cached state. */
+export function _resetCodeExecutionConfig(): void {
+  activeConfig = {};
+  activeSandbox = undefined;
+}
+
+function getOrCreateSandbox(): Sandbox {
+  if (activeSandbox !== undefined) return activeSandbox;
+  activeSandbox = createSandbox({
+    ...(activeConfig.backend !== undefined ? { backend: activeConfig.backend } : {}),
+    ...(activeConfig.allowedImages !== undefined
+      ? { allowedImages: activeConfig.allowedImages }
+      : {}),
+    ...(activeConfig.mountWhitelist !== undefined
+      ? { mountWhitelist: activeConfig.mountWhitelist }
+      : {}),
+    ...(activeConfig.defaultTimeoutMs !== undefined
+      ? { defaultTimeoutMs: activeConfig.defaultTimeoutMs }
+      : {}),
+  });
+  return activeSandbox;
+}
+
+function configuredImage(lang: keyof typeof DEFAULT_IMAGES): string {
+  const overrides = activeConfig.images;
+  return overrides?.[lang] ?? DEFAULT_IMAGES[lang];
+}
+
+function buildMounts(): ReadonlyArray<SandboxMount> {
+  const m = activeConfig.mounts;
+  if (m === undefined) return [];
+  return Object.entries(m).map(([src, dst]) => ({ src, dst, readonly: true }));
+}
+
+function formatResult(opts: {
+  stdout: string;
+  stderr: string;
+  exitCode: number;
+  timedOut: boolean;
+  durationMs: number;
+}): string {
+  const parts: string[] = [];
+  if (opts.stdout.length > 0) parts.push(opts.stdout.replace(/\n+$/, ""));
+  if (opts.stderr.length > 0) {
+    parts.push("[stderr]");
+    parts.push(opts.stderr.replace(/\n+$/, ""));
+  }
+  const head = opts.timedOut
+    ? `[exit] ${opts.exitCode} (timed out after ${Math.round(opts.durationMs)}ms)`
+    : `[exit] ${opts.exitCode} (${Math.round(opts.durationMs)}ms)`;
+  parts.push(head);
+  return parts.join("\n");
+}
+
+const codeSchema = z.object({
+  code: z.string().min(1),
+  timeout: z.number().int().positive().max(600_000).optional(),
+});
+
+type CodeInput = z.infer<typeof codeSchema>;
+
+async function runInSandbox(
+  language: "python" | "javascript" | "shell",
+  argv: ReadonlyArray<string>,
+  input: CodeInput,
+  ctx: { signal?: AbortSignal; onStreamChunk?: (s: "stdout" | "stderr", c: string) => void } = {},
+): Promise<string> {
+  const sandbox = getOrCreateSandbox();
+  if (sandbox.backend === "noop") {
+    // Allowed for tests, but emit a clear marker so misuse is obvious.
+    // Production permission floor refuses requiresSandbox tools when the
+    // sandbox is noop, so reaching here in production indicates a leak.
+  }
+  const image = configuredImage(language);
+  const mounts = buildMounts();
+  const result = await sandbox.exec({
+    image,
+    argv: [...argv, input.code],
+    ...(input.timeout !== undefined ? { timeoutMs: input.timeout } : {}),
+    ...(ctx.signal !== undefined ? { signal: ctx.signal } : {}),
+    ...(mounts.length > 0 ? { mounts } : {}),
+    onStdoutChunk: ctx.onStreamChunk ? (chunk) => ctx.onStreamChunk?.("stdout", chunk) : undefined,
+    onStderrChunk: ctx.onStreamChunk ? (chunk) => ctx.onStreamChunk?.("stderr", chunk) : undefined,
+  });
+  return formatResult(result);
+}
+
+export const python: RegisteredTool = buildTool({
+  name: "Python",
+  description:
+    "Execute Python 3 code in a sandboxed container (network=none, read-only root, /tmp scratch). Equivalent to `python3 -c <code>`.",
+  inputSchema: codeSchema,
+  destructive: true,
+  requiresSandbox: true,
+  execute: async (input, ctx) =>
+    runInSandbox("python", ["python3", "-c"], input as CodeInput, {
+      ...(ctx?.signal !== undefined ? { signal: ctx.signal } : {}),
+      ...(ctx?.onStreamChunk !== undefined ? { onStreamChunk: ctx.onStreamChunk } : {}),
+    }),
+});
+
+export const javascript: RegisteredTool = buildTool({
+  name: "JavaScript",
+  description:
+    "Execute JavaScript code in a sandboxed container (network=none, read-only root, /tmp scratch). Equivalent to `node -e <code>`.",
+  inputSchema: codeSchema,
+  destructive: true,
+  requiresSandbox: true,
+  execute: async (input, ctx) =>
+    runInSandbox("javascript", ["node", "-e"], input as CodeInput, {
+      ...(ctx?.signal !== undefined ? { signal: ctx.signal } : {}),
+      ...(ctx?.onStreamChunk !== undefined ? { onStreamChunk: ctx.onStreamChunk } : {}),
+    }),
+});
+
+export const shell: RegisteredTool = buildTool({
+  name: "Shell",
+  description:
+    "Execute a POSIX shell command in a sandboxed container (network=none, read-only root, /tmp scratch). Equivalent to `sh -c <code>`.",
+  inputSchema: codeSchema,
+  destructive: true,
+  requiresSandbox: true,
+  execute: async (input, ctx) =>
+    runInSandbox("shell", ["sh", "-c"], input as CodeInput, {
+      ...(ctx?.signal !== undefined ? { signal: ctx.signal } : {}),
+      ...(ctx?.onStreamChunk !== undefined ? { onStreamChunk: ctx.onStreamChunk } : {}),
+    }),
+});
+
+export const allCodeExecutionTools: ReadonlyArray<RegisteredTool> = [python, javascript, shell];

@@ -7,6 +7,7 @@ import {
   type ToolCallContext,
   emptyRuleSet,
   evaluate,
+  evaluateWithReason,
   parsePermissionsConfig,
   tagRules,
 } from "./index";
@@ -271,5 +272,71 @@ describe("tagRules", () => {
     );
     expect(out[0]?.source).toBe("yaml");
     expect(out[1]?.source).toBe("yaml");
+  });
+});
+
+describe("Section 18 — requiresSandbox floor", () => {
+  const pythonCall: ToolCallContext = {
+    toolName: "Python",
+    input: { code: "print('hi')" },
+    readOnly: false,
+    destructive: true,
+    requiresSandbox: true,
+  };
+
+  test("denies in default mode when no rule + no sandbox", () => {
+    const r = evaluateWithReason(pythonCall, "default", emptyRuleSet);
+    expect(r.decision).toBe("deny");
+    expect(r.reason).toContain("requires a sandbox");
+  });
+
+  test("denies even with rule when sandbox not available", () => {
+    const rules: RuleSet = { ...emptyRuleSet, yaml: [rule("alwaysAllow", "Python")] };
+    const r = evaluateWithReason(pythonCall, "default", rules, { sandboxAvailable: false });
+    expect(r.decision).toBe("deny");
+    expect(r.reason).toContain("requires a sandbox");
+  });
+
+  test("denies in default mode with sandbox but no allow rule", () => {
+    const r = evaluateWithReason(pythonCall, "default", emptyRuleSet, {
+      sandboxAvailable: true,
+    });
+    expect(r.decision).toBe("deny");
+    expect(r.reason).toContain("alwaysAllow rule");
+  });
+
+  test("allows when sandbox available AND alwaysAllow matches", () => {
+    const rules: RuleSet = { ...emptyRuleSet, yaml: [rule("alwaysAllow", "Python")] };
+    const r = evaluateWithReason(pythonCall, "default", rules, { sandboxAvailable: true });
+    expect(r.decision).toBe("allow");
+  });
+
+  test("denies when sandbox available but alwaysAsk matches (ask is not allow)", () => {
+    const rules: RuleSet = { ...emptyRuleSet, yaml: [rule("alwaysAsk", "Python")] };
+    const r = evaluateWithReason(pythonCall, "default", rules, { sandboxAvailable: true });
+    expect(r.decision).toBe("deny");
+  });
+
+  test("auto mode still applies floor — denies without alwaysAllow even when destructive auto-asks would say ask", () => {
+    const r = evaluateWithReason(pythonCall, "auto", emptyRuleSet, { sandboxAvailable: true });
+    expect(r.decision).toBe("deny");
+  });
+
+  test("plan mode unaffected by sandbox floor — still denies non-readOnly", () => {
+    const r = evaluateWithReason(pythonCall, "plan", emptyRuleSet, { sandboxAvailable: true });
+    expect(r.decision).toBe("deny");
+  });
+
+  test("bypass mode unaffected — bypass is a deliberate operator override", () => {
+    const r = evaluateWithReason(pythonCall, "bypass", emptyRuleSet);
+    expect(r.decision).toBe("allow");
+  });
+
+  test("non-sandbox tools unaffected by sandboxAvailable=false", () => {
+    const r = evaluateWithReason(readCall, "default", emptyRuleSet, {
+      sandboxAvailable: false,
+    });
+    // readCall doesn't set requiresSandbox; floor doesn't apply.
+    expect(r.decision).toBe("ask");
   });
 });

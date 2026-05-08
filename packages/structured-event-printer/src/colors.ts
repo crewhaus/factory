@@ -4,24 +4,25 @@
  */
 import type { TraceEventKind } from "@crewhaus/trace-event-bus";
 
-const RESET = "[0m";
+const RESET = "\x1b[0m";
 
 const PALETTE: Record<TraceEventKind, string> = {
-  turn_start: "[36m", // cyan
-  turn_end: "[36m",
-  model_request: "[34m", // blue
-  model_response: "[34m",
-  model_stream_token: "[2m", // dim
-  tool_call_start: "[33m", // yellow
-  tool_call_end: "[33m",
-  mcp_call_start: "[35m", // magenta
-  mcp_call_end: "[35m",
-  hook_fired: "[35m",
-  compaction_fired: "[32m", // green
-  permission_decision: "[33m",
-  error_recovered: "[31m", // red
-  sub_agent_start: "[36m",
-  sub_agent_end: "[36m",
+  turn_start: "\x1b[36m", // cyan
+  turn_end: "\x1b[36m",
+  model_request: "\x1b[34m", // blue
+  model_response: "\x1b[34m",
+  model_stream_token: "\x1b[2m", // dim
+  tool_call_start: "\x1b[33m", // yellow
+  tool_call_end: "\x1b[33m",
+  tool_stream_chunk: "\x1b[2m", // Section 18 — dim, high-volume streaming chunks
+  mcp_call_start: "\x1b[35m", // magenta
+  mcp_call_end: "\x1b[35m",
+  hook_fired: "\x1b[35m",
+  compaction_fired: "\x1b[32m", // green
+  permission_decision: "\x1b[33m",
+  error_recovered: "\x1b[31m", // red
+  sub_agent_start: "\x1b[36m",
+  sub_agent_end: "\x1b[36m",
 };
 
 export function colorize(kind: TraceEventKind, text: string, useColor: boolean): string {

@@ -86,6 +86,24 @@ export type ToolCallEndEvent = TraceEventEnvelope & {
   durationMs: number;
 };
 
+/**
+ * Section 18 — fired by streaming tools (notably `tool-code-execution`)
+ * for each stdout/stderr chunk emerging from the sandboxed process. The
+ * full output is still captured in `tool_call_end` (`outputBytes`) — these
+ * chunk events let observability subscribers visualise progress mid-call.
+ *
+ * Published `ephemeral: true` so a noisy stream (e.g. a 10s shell
+ * command) does not evict structurally important events from the ring
+ * buffer.
+ */
+export type ToolStreamChunkEvent = TraceEventEnvelope & {
+  kind: "tool_stream_chunk";
+  toolUseId: string;
+  toolName: string;
+  stream: "stdout" | "stderr";
+  bytes: number;
+};
+
 export type McpCallStartEvent = TraceEventEnvelope & {
   kind: "mcp_call_start";
   server: string;
@@ -123,6 +141,17 @@ export type PermissionDecisionEvent = TraceEventEnvelope & {
   decision: "allow" | "deny" | "ask";
   mode: string;
   reason?: string;
+  /**
+   * Section 18 — set when runtime-core's post-tool prompt-injection
+   * classifier alters the tool result before it reaches the model.
+   *   "redacted" — the tool output was replaced with a redaction notice
+   *   "warned"   — the output was kept but a one-shot system warning was
+   *                appended for the model
+   * Absent on ordinary permission decisions.
+   */
+  outcome?: "redacted" | "warned";
+  /** Section 18 — names of detector rules that fired, when outcome is set. */
+  rules?: ReadonlyArray<string>;
 };
 
 export type ErrorRecoveredEvent = TraceEventEnvelope & {
@@ -160,6 +189,7 @@ export type TraceEvent =
   | ModelStreamTokenEvent
   | ToolCallStartEvent
   | ToolCallEndEvent
+  | ToolStreamChunkEvent
   | McpCallStartEvent
   | McpCallEndEvent
   | HookFiredEvent

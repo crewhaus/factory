@@ -12,6 +12,8 @@ function makeTool(name: string): RegisteredTool {
     concurrencySafe: false,
     readOnly: false,
     destructive: false,
+    requiresSandbox: false,
+    classifyOutput: true,
   };
 }
 
