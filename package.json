@@ -50,10 +50,14 @@
     "compile:hello-voice": "bun apps/cli/src/index.ts compile examples/hello-voice/crewhaus.yaml -o examples/hello-voice/dist",
     "smoke:section-24": "bun scripts/section-24-smoke.ts",
     "compile:hello-browser": "bun apps/cli/src/index.ts compile examples/hello-browser/crewhaus.yaml -o examples/hello-browser/dist",
-    "smoke:section-25": "bun scripts/section-25-smoke.ts"
+    "smoke:section-25": "bun scripts/section-25-smoke.ts",
+    "studio": "bun scripts/studio-launcher.ts",
+    "smoke:section-26": "bun scripts/section-26-smoke.ts"
   },
   "devDependencies": {
     "@biomejs/biome": "1.9.4",
+    "@crewhaus/studio-server": "workspace:*",
+    "@crewhaus/studio-ui": "workspace:*",
     "@types/bun": "^1.2.0",
     "@types/node": "^22.0.0",
     "playwright": "1.59.1",

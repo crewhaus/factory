@@ -6,6 +6,8 @@
       "name": "crewhaus-factory",
       "devDependencies": {
         "@biomejs/biome": "1.9.4",
+        "@crewhaus/studio-server": "workspace:*",
+        "@crewhaus/studio-ui": "workspace:*",
         "@types/bun": "^1.2.0",
         "@types/node": "^22.0.0",
         "playwright": "1.59.1",
@@ -567,6 +569,13 @@
         "@crewhaus/trace-event-bus": "workspace:*",
       },
     },
+    "packages/graph-visualizer": {
+      "name": "@crewhaus/graph-visualizer",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/ir": "workspace:*",
+      },
+    },
     "packages/hooks-engine": {
       "name": "@crewhaus/hooks-engine",
       "version": "0.0.0",
@@ -656,6 +665,13 @@
         "@crewhaus/adapter-anthropic": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/model-router": "workspace:*",
+      },
+    },
+    "packages/plugin-sdk": {
+      "name": "@crewhaus/plugin-sdk",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
       },
     },
     "packages/policy-engine": {
@@ -761,6 +777,10 @@
         "@crewhaus/errors": "workspace:*",
       },
     },
+    "packages/scaffold-templates": {
+      "name": "@crewhaus/scaffold-templates",
+      "version": "0.0.0",
+    },
     "packages/session-store": {
       "name": "@crewhaus/session-store",
       "version": "0.0.0",
@@ -819,6 +839,24 @@
       "dependencies": {
         "@crewhaus/trace-event-bus": "workspace:*",
       },
+    },
+    "packages/studio-server": {
+      "name": "@crewhaus/studio-server",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/graph-visualizer": "workspace:*",
+        "@crewhaus/ir": "workspace:*",
+        "@crewhaus/plugin-sdk": "workspace:*",
+        "@crewhaus/scaffold-templates": "workspace:*",
+        "@crewhaus/spec": "workspace:*",
+        "@crewhaus/trace-viewer": "workspace:*",
+        "@crewhaus/wizard": "workspace:*",
+      },
+    },
+    "packages/studio-ui": {
+      "name": "@crewhaus/studio-ui",
+      "version": "0.0.0",
     },
     "packages/sub-agent-permission-inheritance": {
       "name": "@crewhaus/sub-agent-permission-inheritance",
@@ -1256,6 +1294,13 @@
         "@crewhaus/logging": "workspace:*",
       },
     },
+    "packages/trace-viewer": {
+      "name": "@crewhaus/trace-viewer",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/trace-event-bus": "workspace:*",
+      },
+    },
     "packages/turn-state-machine": {
       "name": "@crewhaus/turn-state-machine",
       "version": "0.0.0",
@@ -1279,6 +1324,14 @@
       "version": "0.0.0",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
+      },
+    },
+    "packages/wizard": {
+      "name": "@crewhaus/wizard",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/scaffold-templates": "workspace:*",
       },
     },
   },
@@ -1473,6 +1526,8 @@
 
     "@crewhaus/graph-engine": ["@crewhaus/graph-engine@workspace:packages/graph-engine"],
 
+    "@crewhaus/graph-visualizer": ["@crewhaus/graph-visualizer@workspace:packages/graph-visualizer"],
+
     "@crewhaus/hooks-engine": ["@crewhaus/hooks-engine@workspace:packages/hooks-engine"],
 
     "@crewhaus/idempotency-keys": ["@crewhaus/idempotency-keys@workspace:packages/idempotency-keys"],
@@ -1497,6 +1552,8 @@
 
     "@crewhaus/planner": ["@crewhaus/planner@workspace:packages/planner"],
 
+    "@crewhaus/plugin-sdk": ["@crewhaus/plugin-sdk@workspace:packages/plugin-sdk"],
+
     "@crewhaus/policy-engine": ["@crewhaus/policy-engine@workspace:packages/policy-engine"],
 
     "@crewhaus/prompt-injection-detector": ["@crewhaus/prompt-injection-detector@workspace:packages/prompt-injection-detector"],
@@ -1515,6 +1572,8 @@
 
     "@crewhaus/sandbox": ["@crewhaus/sandbox@workspace:packages/sandbox"],
 
+    "@crewhaus/scaffold-templates": ["@crewhaus/scaffold-templates@workspace:packages/scaffold-templates"],
+
     "@crewhaus/session-store": ["@crewhaus/session-store@workspace:packages/session-store"],
 
     "@crewhaus/skills-registry": ["@crewhaus/skills-registry@workspace:packages/skills-registry"],
@@ -1528,6 +1587,10 @@
     "@crewhaus/streaming-tool-executor": ["@crewhaus/streaming-tool-executor@workspace:packages/streaming-tool-executor"],
 
     "@crewhaus/structured-event-printer": ["@crewhaus/structured-event-printer@workspace:packages/structured-event-printer"],
+
+    "@crewhaus/studio-server": ["@crewhaus/studio-server@workspace:packages/studio-server"],
+
+    "@crewhaus/studio-ui": ["@crewhaus/studio-ui@workspace:packages/studio-ui"],
 
     "@crewhaus/sub-agent-permission-inheritance": ["@crewhaus/sub-agent-permission-inheritance@workspace:packages/sub-agent-permission-inheritance"],
 
@@ -1605,6 +1668,8 @@
 
     "@crewhaus/trace-event-bus": ["@crewhaus/trace-event-bus@workspace:packages/trace-event-bus"],
 
+    "@crewhaus/trace-viewer": ["@crewhaus/trace-viewer@workspace:packages/trace-viewer"],
+
     "@crewhaus/turn-state-machine": ["@crewhaus/turn-state-machine@workspace:packages/turn-state-machine"],
 
     "@crewhaus/vad-engine": ["@crewhaus/vad-engine@workspace:packages/vad-engine"],
@@ -1612,6 +1677,8 @@
     "@crewhaus/vector-store": ["@crewhaus/vector-store@workspace:packages/vector-store"],
 
     "@crewhaus/voice-runtime": ["@crewhaus/voice-runtime@workspace:packages/voice-runtime"],
+
+    "@crewhaus/wizard": ["@crewhaus/wizard@workspace:packages/wizard"],
 
     "@google/genai": ["@google/genai@1.52.0", "", { "dependencies": { "google-auth-library": "^10.3.0", "p-retry": "^4.6.2", "protobufjs": "^7.5.4", "ws": "^8.18.0" }, "peerDependencies": { "@modelcontextprotocol/sdk": "^1.25.2" }, "optionalPeers": ["@modelcontextprotocol/sdk"] }, "sha512-gwSvbpiN/17O9TbsqSsE/OzZcpv5Fo4RQjdngGgogtuB9RsyJ8ZHhX5KjHj1bp5N9snN2eK8LDGXSaWW2hof8Q=="],
 
