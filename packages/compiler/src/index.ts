@@ -54,9 +54,24 @@ import { emitWorkflow } from "@crewhaus/target-workflow";
  * elimination, profile pruning, prompt-cache prefix sorting), and a
  * bundle-packager step.
  */
-export function compile(yamlText: string): Bundle {
+export type CompileOptions = {
+  /**
+   * Section 28 — when true, run the §28 ir-passes pipeline between
+   * `lower()` and `emit()`. Default: false (preserves backwards compat).
+   * Codegen consumers can opt in once they've validated the passes
+   * don't drift outputs.
+   */
+  readonly applyIrPasses?: boolean;
+};
+
+export function compile(yamlText: string, opts: CompileOptions = {}): Bundle {
   const spec = parseSpec(yamlText);
-  const ir = lower(spec);
+  let ir = lower(spec);
+  if (opts.applyIrPasses === true) {
+    // Lazy import to avoid pulling ir-passes into bundles that don't ask.
+    const { applyPasses } = require("@crewhaus/ir-passes") as typeof import("@crewhaus/ir-passes");
+    ir = applyPasses(ir);
+  }
   return emit(ir);
 }
 

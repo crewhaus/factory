@@ -1,0 +1,18 @@
+{
+  "name": "@crewhaus/ir-passes",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Idempotent IR optimization passes (dead-tool-elimination, prompt-cache-prefix-sort, redundant-mcp-server-collapse, permission-rule-canonicalize)",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@crewhaus/ir": "workspace:*"
+  }
+}

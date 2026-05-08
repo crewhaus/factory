@@ -1,0 +1,17 @@
+{
+  "name": "@crewhaus-examples/section-28-smoke",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Section 28 deployment + canary smoke",
+  "dependencies": {
+    "@crewhaus/audit-log": "workspace:*",
+    "@crewhaus/canary-controller": "workspace:*",
+    "@crewhaus/deployment-controller": "workspace:*",
+    "@crewhaus/ir": "workspace:*",
+    "@crewhaus/ir-passes": "workspace:*",
+    "@crewhaus/migration-engine": "workspace:*",
+    "@crewhaus/migration-runner": "workspace:*",
+    "@crewhaus/spec-registry": "workspace:*"
+  }
+}

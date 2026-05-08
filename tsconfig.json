@@ -76,6 +76,12 @@
     { "path": "./packages/prompt-cache-manager" },
     { "path": "./packages/rate-limiter" },
     { "path": "./packages/circuit-breaker" },
+    { "path": "./packages/spec-registry" },
+    { "path": "./packages/ir-passes" },
+    { "path": "./packages/migration-engine" },
+    { "path": "./packages/migration-runner" },
+    { "path": "./packages/deployment-controller" },
+    { "path": "./packages/canary-controller" },
     { "path": "./apps/cli" }
   ]
 }

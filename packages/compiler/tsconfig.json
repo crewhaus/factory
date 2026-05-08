@@ -9,6 +9,7 @@
     { "path": "../infra-utils" },
     { "path": "../spec" },
     { "path": "../ir" },
+    { "path": "../ir-passes" },
     { "path": "../target-batch-worker" },
     { "path": "../target-browser-driver" },
     { "path": "../target-channel-bot" },
