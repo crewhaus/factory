@@ -3,11 +3,18 @@ import type {
   Bundle,
   IrChannelV0,
   IrCompaction,
+  IrGraphEdge,
+  IrGraphNode,
+  IrGraphV0,
+  IrManagedTenant,
+  IrManagedV0,
   IrMcpServerConfig,
   IrMcpServers,
   IrNode,
   IrPermissionRule,
   IrPermissions,
+  IrPipelineDocument,
+  IrPipelineV0,
   IrSecretRef,
   IrSubAgentDefinition,
   IrToolConfigs,
@@ -157,6 +164,66 @@ describe("IrNode discriminated union narrowing", () => {
       subAgents: [],
       compaction: {},
     };
+    const graphNode: IrNode = {
+      version: 0,
+      name: "x",
+      target: "graph",
+      entry: "plan",
+      nodes: [
+        {
+          name: "plan",
+          instructions: "plan the work",
+          model: "m",
+          tools: [],
+          toolConfigs: {},
+        },
+        {
+          name: "act",
+          instructions: "act on the plan",
+          model: "m",
+          tools: [],
+          toolConfigs: {},
+        },
+      ],
+      edges: [{ from: "plan", to: "act" }],
+      permissions: { rules: [] },
+      compaction: {},
+    };
+    const managedNode: IrNode = {
+      version: 0,
+      name: "x",
+      target: "managed",
+      agent: { model: "m", instructions: "i" },
+      tenants: [
+        { id: "t1", budget: { maxInputTokens: 1000, maxOutputTokens: 1000 } },
+        { id: "t2", budget: { maxInputTokens: 2000, maxOutputTokens: 2000 } },
+      ],
+      permissions: { rules: [] },
+      compaction: {},
+    };
+    const pipelineNode: IrNode = {
+      version: 0,
+      name: "x",
+      target: "pipeline",
+      agent: { model: "m", instructions: "i" },
+      retrieve: {
+        embedderModel: "openai/text-embedding-3-small",
+        vectorBackend: "in-memory",
+        defaultK: 5,
+      },
+      indexing: {
+        chunkStrategy: "fixed",
+        chunkSize: 512,
+        chunkOverlap: 50,
+        documents: [
+          { id: "d1", text: "hello" },
+          { id: "d2", text: "world" },
+          { id: "d3", text: "of pipelines" },
+        ],
+      },
+      permissions: { rules: [] },
+      compaction: {},
+    };
 
     function describeNode(n: IrNode): string {
       switch (n.target) {
@@ -178,6 +245,9 @@ describe("IrNode discriminated union narrowing", () => {
     expect(describeNode(cliNode)).toBe("cli:m");
     expect(describeNode(workflowNode)).toBe("workflow:0");
     expect(describeNode(channelNode)).toBe("channel:thread");
+    expect(describeNode(graphNode)).toBe("graph:2");
+    expect(describeNode(managedNode)).toBe("managed:2");
+    expect(describeNode(pipelineNode)).toBe("pipeline:3");
   });
 });
 
@@ -306,5 +376,149 @@ describe("IrCompaction (Section 17)", () => {
   test("compaction.model overrides the autocompact summarisation model", () => {
     const c: IrCompaction = { model: "openai/gpt-4o-mini" };
     expect(c.model).toBe("openai/gpt-4o-mini");
+  });
+});
+
+describe("IrGraphV0 (Section 19)", () => {
+  test("a 3-node graph with an entry + edges has every required field", () => {
+    const plan: IrGraphNode = {
+      name: "plan",
+      instructions: "plan the steps",
+      model: "claude-sonnet-4-6",
+      tools: [],
+      toolConfigs: {},
+    };
+    const act: IrGraphNode = {
+      name: "act",
+      instructions: "carry out the plan",
+      model: "claude-sonnet-4-6",
+      tools: ["bash"],
+      toolConfigs: {},
+    };
+    const summarise: IrGraphNode = {
+      name: "summarise",
+      instructions: "summarise the result",
+      model: "claude-sonnet-4-6",
+      tools: [],
+      toolConfigs: {},
+    };
+    const planAct: IrGraphEdge = { from: "plan", to: "act" };
+    const actSum: IrGraphEdge = { from: "act", to: "summarise" };
+    const ir: IrGraphV0 = {
+      version: 0,
+      name: "three-step",
+      target: "graph",
+      entry: "plan",
+      nodes: [plan, act, summarise],
+      edges: [planAct, actSum],
+      permissions: { rules: [] },
+      compaction: {},
+    };
+    expect(ir.entry).toBe("plan");
+    expect(ir.nodes.length).toBe(3);
+    expect(ir.edges.length).toBe(2);
+    expect(ir.nodes[0]?.hitlPrompt).toBeUndefined();
+  });
+
+  test("a node with hitlPrompt opts the run into HITL pause/resume", () => {
+    const node: IrGraphNode = {
+      name: "approve",
+      instructions: "ask the user before continuing",
+      model: "m",
+      tools: [],
+      toolConfigs: {},
+      hitlPrompt: "ok to proceed?",
+    };
+    expect(node.hitlPrompt).toBe("ok to proceed?");
+  });
+});
+
+describe("IrManagedV0 (Section 20)", () => {
+  test("a managed daemon IR carries a tenant table and per-tenant budgets", () => {
+    const t1: IrManagedTenant = {
+      id: "tenant-a",
+      budget: { maxInputTokens: 100_000, maxOutputTokens: 50_000 },
+    };
+    const t2: IrManagedTenant = {
+      id: "tenant-b",
+      budget: { maxInputTokens: 200_000, maxOutputTokens: 100_000 },
+    };
+    const ir: IrManagedV0 = {
+      version: 0,
+      name: "saas-bot",
+      target: "managed",
+      agent: { model: "claude-sonnet-4-6", instructions: "be helpful" },
+      tenants: [t1, t2],
+      permissions: { rules: [] },
+      compaction: {},
+    };
+    expect(ir.tenants.length).toBe(2);
+    expect(ir.tenants[0]?.id).toBe("tenant-a");
+    expect(ir.tenants[1]?.budget.maxInputTokens).toBe(200_000);
+  });
+
+  test("an empty tenant table is structurally valid (lower-time fail-loud lives in the spec parser)", () => {
+    const ir: IrManagedV0 = {
+      version: 0,
+      name: "empty",
+      target: "managed",
+      agent: { model: "m", instructions: "i" },
+      tenants: [],
+      permissions: { rules: [] },
+      compaction: {},
+    };
+    expect(ir.tenants.length).toBe(0);
+  });
+});
+
+describe("IrPipelineV0 (Section 21)", () => {
+  test("a pipeline IR carries retrieve config + indexing pipeline + agent block", () => {
+    const docs: IrPipelineDocument[] = [
+      { id: "doc-1", text: "hello world" },
+      { id: "doc-2", text: "rag stack", metadata: { source: "readme" } },
+    ];
+    const ir: IrPipelineV0 = {
+      version: 0,
+      name: "doc-bot",
+      target: "pipeline",
+      agent: { model: "claude-sonnet-4-6", instructions: "answer using Retrieve" },
+      retrieve: {
+        embedderModel: "openai/text-embedding-3-small",
+        vectorBackend: "in-memory",
+        defaultK: 5,
+      },
+      indexing: {
+        chunkStrategy: "markdown",
+        chunkSize: 1024,
+        chunkOverlap: 100,
+        documents: docs,
+      },
+      permissions: { rules: [] },
+      compaction: {},
+    };
+    expect(ir.retrieve.vectorBackend).toBe("in-memory");
+    expect(ir.indexing.documents.length).toBe(2);
+    expect(ir.indexing.documents[1]?.metadata?.["source"]).toBe("readme");
+  });
+
+  test("chunkStrategy is restricted to fixed | semantic | markdown", () => {
+    const _bad: IrPipelineV0["indexing"] = {
+      // @ts-expect-error — random string is not a legal chunkStrategy
+      chunkStrategy: "random",
+      chunkSize: 0,
+      chunkOverlap: 0,
+      documents: [],
+    };
+    void _bad;
+  });
+
+  test("vectorBackend is restricted to in-memory in v0", () => {
+    const _bad: IrPipelineV0["retrieve"] = {
+      embedderModel: "x",
+      // @ts-expect-error — qdrant/pinecone/lance are roadmap, not yet in v0
+      vectorBackend: "qdrant",
+      defaultK: 5,
+    };
+    void _bad;
   });
 });
