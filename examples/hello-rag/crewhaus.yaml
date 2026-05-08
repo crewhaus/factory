@@ -1,0 +1,55 @@
+name: hello-rag
+target: pipeline
+agent:
+  model: claude-sonnet-4-6
+  instructions: |
+    You are a RAG-grounded assistant. For every question, call the
+    `Retrieve` tool first to fetch relevant context from the vector
+    store, then answer in 2–3 sentences citing the retrieved chunks
+    by `[N]` reference number. If the retrieved chunks don't cover the
+    question, say "I can only answer questions about the indexed docs"
+    — do NOT improvise from outside the retrieval results.
+retrieve:
+  embedderModel: mock/det
+  vectorBackend: in-memory
+  defaultK: 4
+permissions:
+  mode: default
+  rules:
+    - type: alwaysAllow
+      pattern: Retrieve
+indexing:
+  chunkStrategy: fixed
+  chunkSize: 400
+  chunkOverlap: 0
+  documents:
+    - id: target-shapes
+      text: |
+        CrewHaus Factory supports multiple target harness shapes:
+        cli (single-agent REPL), workflow (sequential steps),
+        channel (long-running daemon for Slack and other channels),
+        graph (stateful node/edge runtime with HITL pauses),
+        managed (multi-tenant gateway with audit logs and budgets),
+        and pipeline (component-DAG runtime for RAG / retrieval).
+        Additional shapes planned: eval, res, voice, brow, batch.
+    - id: section-18
+      text: |
+        Section 18 lands the production safety floor: sandbox (docker
+        backend with image allowlist, network=none default, read-only
+        root, /tmp tmpfs), tool-code-execution (Python, JavaScript,
+        Shell tools that require a sandbox), and prompt-injection
+        detector (regex + structural + optional LLM tier hooked into
+        runtime-core's post-tool path).
+    - id: section-19
+      text: |
+        Section 19 lands the GRPH target shape: checkpoint-store
+        (file-backed JSONL), graph-engine (builder + interpreter with
+        HITL pauses), branch-history (branchAt + diff), durable-
+        execution (idempotency keys), and target-graph codegen.
+    - id: section-20
+      text: |
+        Section 20 lands the MGD target shape and governance:
+        gateway-protocol (JSON-RPC v1), tenancy (per-tenant storage
+        rebase via AsyncLocalStorage), audit-log (hash-chained JSONL),
+        policy-engine (sideEffect classification), gateway-server
+        (Bun.serve with HS256 JWT), and target-managed codegen.

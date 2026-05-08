@@ -1,0 +1,15 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "references": [
+    { "path": "../embedder" },
+    { "path": "../errors" },
+    { "path": "../tool-builder" },
+    { "path": "../tool-catalog" },
+    { "path": "../vector-store" }
+  ],
+  "include": ["src/**/*"]
+}

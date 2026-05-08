@@ -34,7 +34,10 @@
     "smoke:section-19": "bun scripts/section-19-smoke.ts",
     "compile:hello-managed": "bun apps/cli/src/index.ts compile examples/hello-managed/crewhaus.yaml -o examples/hello-managed/dist",
     "run:hello-managed": "bun examples/hello-managed/dist/daemon.ts",
-    "smoke:section-20": "bun scripts/section-20-smoke.ts"
+    "smoke:section-20": "bun scripts/section-20-smoke.ts",
+    "compile:hello-rag": "bun apps/cli/src/index.ts compile examples/hello-rag/crewhaus.yaml -o examples/hello-rag/dist",
+    "run:hello-rag": "bun examples/hello-rag/dist/agent.ts",
+    "smoke:section-21": "bun scripts/section-21-smoke.ts"
   },
   "devDependencies": {
     "@biomejs/biome": "1.9.4",

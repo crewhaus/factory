@@ -84,7 +84,7 @@ Channel target shape (✅ §12) ──► Sub-agents + Task tool (✅ §13)
 | **§18 Production safety floor** | ✅ | §1, §3, §7 (permission-engine), §8 | §20 (`policy-engine` consumer), MGD/EVAL hardening, untrusted-code workflows |
 | **§19 GRPH target shape** | ✅ | §1–4, §10 (event-log replay) | GRPH shape, `durable-execution` family, branch/HITL flows, MGD durability |
 | **§20 MGD target shape + governance** | ✅ | §18 (`policy-engine`), §10, §15 | MGD shape, remote channel daemon, multi-tenant deployment, `web-ui` backend |
-| **§21 RAG target shape** | 🟡 independent | §1–4, §15 (trace-event-bus for retrieval spans) | RAG shape, all R12 retrieval/embedding modules, doc-grounded agents |
+| **§21 RAG target shape** | ✅ | §1–4, §15 (trace-event-bus for retrieval spans) | RAG shape, all R12 retrieval/embedding modules, doc-grounded agents |
 
 ---
 
@@ -1267,7 +1267,7 @@ policy-engine       ──►  tenancy        (parallel)  ──►  target-mana
 
 ## Section 21 — RAG target shape: pipeline DAG + retrieval
 
-> Status: 🟡 independent. Can land any time after Section 17.
+> Status: ✅ landed. PR feat/section-21-rag-target.
 
 **Catalog modules:** `pipeline-engine` (R11), `tool-retrieve` (R12), `chunker` (R12), `embedder` (R12), `vector-store` (R12), `target-pipeline` (F2)
 
@@ -1325,6 +1325,31 @@ pipeline-engine  ──►  chunker               (parallel)  ──►  tool-re
 - `tool-retrieve`: T3 round-trip with an in-memory store seeded with 100 documents; T8 filter injection attempts
 - `target-pipeline`: T1 bundle shape; T3 compile + run a 3-component RAG pipeline (chunk → embed → store, then retrieve → answer) end-to-end against the live model
 - E2E smoke: `examples/hello-rag/` — index the project's README, ask "what target shapes are supported?", confirm the answer cites the README
+
+### What landed
+
+- **`packages/chunker`** — three strategies. `fixed` slides a fixed-character window with optional overlap. `semantic` uses `Intl.Segmenter` to find sentence boundaries and packs N sentences per chunk. `markdown` splits at `^#+ ` header boundaries, sub-chunking long sections via `fixed`. Every chunk carries `{ id: <docId>:<index>:<startOffset>, docId, index, startOffset, endOffset, text, metadata? }`. Reconstruction property: `chunk(doc).map(c => c.text).join("")` returns the source bytes for `fixed` with `overlap=0`.
+- **`packages/embedder`** — `createEmbedder({ model })` with a prefix grammar mirroring `model-router`: `openai/<model>` (uses `OPENAI_API_KEY`), `voyage/<model>`, `cohere/<model>`, `local/<model>@<base-url>` (OpenAI-compatible local servers like Ollama / vLLM), `mock/<id>` (deterministic 256-dim hashed BoW). Cloud and local providers share an `OpenAILikeEmbedder` that batches up to 100 texts per `/v1/embeddings` call.
+- **`packages/vector-store`** — `createVectorStore({ backend })`. The `in-memory` backend is the default: flat L2 distance over an in-process Map, with metadata-equality filter. Filter keys + values are screened against an injection regex (`;`, quotes, ``=1``, `or 1=1`, comment markers); SQL-injection-shaped probes throw `VectorStoreError`. `lance` / `qdrant` / `pinecone` / `weaviate` constructors return a stub that throws a clear "not implemented in v0" error so production deployments fail closed instead of silently dropping into an in-memory store.
+- **`packages/pipeline-engine`** — `createPipeline({ ... })` builder with `addComponent(name, fn)` / `connect(from, to, mapping?)` / `setInput(component, key)` / `setOutput(component)` / `compile()`. Components are pure async functions `(inputs) → outputs`; the engine computes a Kahn-style topological schedule, runs sibling components concurrently via `Promise.all`, and forwards each layer's outputs into the downstream inputs (via the optional `EdgeMapping[]`). Streaming via `onEvent: (e: ComponentEvent) => void` emits `component_start | component_end` per component. Cycles throw `PipelineBuildError` at compile time.
+- **`packages/tool-retrieve`** — `Retrieve(query, k?, filter?)` agent tool built via `buildTool` with `readOnly: true, concurrencySafe: true`. `registerRetrieveConfig({ embedder?, embedderModel?, vectorStore?, vectorBackend?, defaultK? })` is the boot-time wiring; the tool throws `RetrieveConfigError` if invoked before registration. Output format: `[N] id=<chunkId> doc=<docId> score=<f4>\n<text-preview>` (preview capped at 280 chars). The vector-store filter guard is the floor — calls with injection-shaped filters throw before the embed even runs.
+- **`packages/target-pipeline`** — `emitPipeline(ir)` codegen. Single-file `agent.ts` that boots the embedder + vector store, registers `Retrieve` on the catalog, runs an indexing pipeline (`chunk → embed → store`) over the spec's seed documents, then drops into the standard `runChatLoop` REPL with the spec's permissions wired in.
+- **Spec/IR/compiler** — `target: "pipeline"` schema with `agent: { model, instructions }`, `retrieve: { embedderModel, vectorBackend, defaultK }`, `indexing: { chunkStrategy, chunkSize, chunkOverlap, documents: [{ id, text, metadata? }] }`. `IrPipelineV0` mirrors the shape; compiler dispatches `case "pipeline"` to `emitPipeline`.
+
+### End-to-end smoke (`scripts/section-21-smoke.ts`)
+
+Drives `examples/hello-rag` (5 seed docs about CrewHaus target shapes) against the live model with the mock embedder so the smoke runs without `OPENAI_API_KEY`:
+
+1. Indexing pipeline emits `component_start` / `component_end` for `chunk` / `embed` / `store`; bundle prints `[pipeline] indexed N chunks` (≥1).
+2. User question "What target shapes are supported by this codebase?" triggers a `Retrieve` tool call (visible as `tool_call_start { toolName: "Retrieve" }` in the trace).
+3. The agent's reply references at least one of the seeded doc ids (`target-shapes`, `section-18`, `section-19`, `section-20`).
+4. Second turn `"Use Retrieve with filter='1=1; DROP TABLE'..."` either trips the vector-store filter guard or the model refuses upfront — both paths are accepted as proof that injection probes don't reach the index.
+
+### Completed deviations
+
+- **Lance / qdrant / pinecone / weaviate vector backends** — v0 ships only the `in-memory` backend; the other constructors return a stub that throws `not implemented in v0`. A follow-up PR will land Lance via a TS binding once one matures; HTTP backends (qdrant / pinecone / weaviate) wait until production demand surfaces.
+- **OpenAI / Voyage / Cohere embedders** — wired but not exercised by the smoke (the smoke uses the deterministic `mock/det` backend so it passes without API keys). Production specs simply change `retrieve.embedderModel` in the YAML.
+- **Pipeline daemon-mode** — the kickoff prompt mentioned "daemon-mode codegen serving pipelines as HTTP endpoints"; v0 emits a single CLI-mode bundle. The HTTP serving path can land alongside `target-managed`'s gateway in a follow-up.
 
 ---
 

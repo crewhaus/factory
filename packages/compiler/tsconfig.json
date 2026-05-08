@@ -12,6 +12,7 @@
     { "path": "../target-cli" },
     { "path": "../target-graph" },
     { "path": "../target-managed" },
+    { "path": "../target-pipeline" },
     { "path": "../target-workflow" }
   ]
 }

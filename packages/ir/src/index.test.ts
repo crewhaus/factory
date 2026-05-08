@@ -170,6 +170,8 @@ describe("IrNode discriminated union narrowing", () => {
           return `graph:${n.nodes.length}`;
         case "managed":
           return `managed:${n.tenants.length}`;
+        case "pipeline":
+          return `pipeline:${n.indexing.documents.length}`;
       }
     }
 

@@ -93,6 +93,23 @@
         "@crewhaus/tenancy": "workspace:*",
       },
     },
+    "examples/hello-rag": {
+      "name": "@crewhaus-examples/hello-rag",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/chunker": "workspace:*",
+        "@crewhaus/embedder": "workspace:*",
+        "@crewhaus/hooks-engine": "workspace:*",
+        "@crewhaus/permission-engine": "workspace:*",
+        "@crewhaus/pipeline-engine": "workspace:*",
+        "@crewhaus/runtime-core": "workspace:*",
+        "@crewhaus/skills-registry": "workspace:*",
+        "@crewhaus/slash-commands": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-retrieve": "workspace:*",
+        "@crewhaus/vector-store": "workspace:*",
+      },
+    },
     "examples/hello-workflow": {
       "name": "@crewhaus-examples/hello-workflow",
       "version": "0.0.0",
@@ -224,6 +241,13 @@
         "@crewhaus/errors": "workspace:*",
       },
     },
+    "packages/chunker": {
+      "name": "@crewhaus/chunker",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+      },
+    },
     "packages/compaction-autocompact": {
       "name": "@crewhaus/compaction-autocompact",
       "version": "0.0.0",
@@ -251,6 +275,7 @@
         "@crewhaus/target-cli": "workspace:*",
         "@crewhaus/target-graph": "workspace:*",
         "@crewhaus/target-managed": "workspace:*",
+        "@crewhaus/target-pipeline": "workspace:*",
         "@crewhaus/target-workflow": "workspace:*",
       },
     },
@@ -259,6 +284,13 @@
       "version": "0.0.0",
       "dependencies": {
         "@crewhaus/checkpoint-store": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
+      },
+    },
+    "packages/embedder": {
+      "name": "@crewhaus/embedder",
+      "version": "0.0.0",
+      "dependencies": {
         "@crewhaus/errors": "workspace:*",
       },
     },
@@ -446,6 +478,13 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tool-permission-matcher": "workspace:*",
         "zod": "^3.23.8",
+      },
+    },
+    "packages/pipeline-engine": {
+      "name": "@crewhaus/pipeline-engine",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
       },
     },
     "packages/policy-engine": {
@@ -668,6 +707,15 @@
         "@crewhaus/ir": "workspace:*",
       },
     },
+    "packages/target-pipeline": {
+      "name": "@crewhaus/target-pipeline",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/infra-utils": "workspace:*",
+        "@crewhaus/ir": "workspace:*",
+      },
+    },
     "packages/target-workflow": {
       "name": "@crewhaus/target-workflow",
       "version": "0.0.0",
@@ -855,6 +903,18 @@
         "@crewhaus/tool-executor": "workspace:*",
       },
     },
+    "packages/tool-retrieve": {
+      "name": "@crewhaus/tool-retrieve",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/embedder": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/vector-store": "workspace:*",
+        "zod": "^3.23.8",
+      },
+    },
     "packages/tool-task": {
       "name": "@crewhaus/tool-task",
       "version": "0.0.0",
@@ -923,6 +983,13 @@
     },
     "packages/turn-state-machine": {
       "name": "@crewhaus/turn-state-machine",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+      },
+    },
+    "packages/vector-store": {
+      "name": "@crewhaus/vector-store",
       "version": "0.0.0",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
@@ -1030,6 +1097,8 @@
 
     "@crewhaus-examples/hello-managed": ["@crewhaus-examples/hello-managed@workspace:examples/hello-managed"],
 
+    "@crewhaus-examples/hello-rag": ["@crewhaus-examples/hello-rag@workspace:examples/hello-rag"],
+
     "@crewhaus-examples/hello-workflow": ["@crewhaus-examples/hello-workflow@workspace:examples/hello-workflow"],
 
     "@crewhaus-examples/mcp-smoke": ["@crewhaus-examples/mcp-smoke@workspace:examples/mcp-smoke"],
@@ -1058,6 +1127,8 @@
 
     "@crewhaus/checkpoint-store": ["@crewhaus/checkpoint-store@workspace:packages/checkpoint-store"],
 
+    "@crewhaus/chunker": ["@crewhaus/chunker@workspace:packages/chunker"],
+
     "@crewhaus/cli": ["@crewhaus/cli@workspace:apps/cli"],
 
     "@crewhaus/compaction-autocompact": ["@crewhaus/compaction-autocompact@workspace:packages/compaction-autocompact"],
@@ -1067,6 +1138,8 @@
     "@crewhaus/compiler": ["@crewhaus/compiler@workspace:packages/compiler"],
 
     "@crewhaus/durable-execution": ["@crewhaus/durable-execution@workspace:packages/durable-execution"],
+
+    "@crewhaus/embedder": ["@crewhaus/embedder@workspace:packages/embedder"],
 
     "@crewhaus/errors": ["@crewhaus/errors@workspace:packages/errors"],
 
@@ -1106,6 +1179,8 @@
 
     "@crewhaus/permission-engine": ["@crewhaus/permission-engine@workspace:packages/permission-engine"],
 
+    "@crewhaus/pipeline-engine": ["@crewhaus/pipeline-engine@workspace:packages/pipeline-engine"],
+
     "@crewhaus/policy-engine": ["@crewhaus/policy-engine@workspace:packages/policy-engine"],
 
     "@crewhaus/prompt-injection-detector": ["@crewhaus/prompt-injection-detector@workspace:packages/prompt-injection-detector"],
@@ -1144,6 +1219,8 @@
 
     "@crewhaus/target-managed": ["@crewhaus/target-managed@workspace:packages/target-managed"],
 
+    "@crewhaus/target-pipeline": ["@crewhaus/target-pipeline@workspace:packages/target-pipeline"],
+
     "@crewhaus/target-workflow": ["@crewhaus/target-workflow@workspace:packages/target-workflow"],
 
     "@crewhaus/tenancy": ["@crewhaus/tenancy@workspace:packages/tenancy"],
@@ -1178,6 +1255,8 @@
 
     "@crewhaus/tool-result-store": ["@crewhaus/tool-result-store@workspace:packages/tool-result-store"],
 
+    "@crewhaus/tool-retrieve": ["@crewhaus/tool-retrieve@workspace:packages/tool-retrieve"],
+
     "@crewhaus/tool-task": ["@crewhaus/tool-task@workspace:packages/tool-task"],
 
     "@crewhaus/tool-todo": ["@crewhaus/tool-todo@workspace:packages/tool-todo"],
@@ -1189,6 +1268,8 @@
     "@crewhaus/trace-event-bus": ["@crewhaus/trace-event-bus@workspace:packages/trace-event-bus"],
 
     "@crewhaus/turn-state-machine": ["@crewhaus/turn-state-machine@workspace:packages/turn-state-machine"],
+
+    "@crewhaus/vector-store": ["@crewhaus/vector-store@workspace:packages/vector-store"],
 
     "@google/genai": ["@google/genai@1.52.0", "", { "dependencies": { "google-auth-library": "^10.3.0", "p-retry": "^4.6.2", "protobufjs": "^7.5.4", "ws": "^8.18.0" }, "peerDependencies": { "@modelcontextprotocol/sdk": "^1.25.2" }, "optionalPeers": ["@modelcontextprotocol/sdk"] }, "sha512-gwSvbpiN/17O9TbsqSsE/OzZcpv5Fo4RQjdngGgogtuB9RsyJ8ZHhX5KjHj1bp5N9snN2eK8LDGXSaWW2hof8Q=="],
 

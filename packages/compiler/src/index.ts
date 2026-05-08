@@ -10,6 +10,7 @@ import type {
   IrMcpServers,
   IrNode,
   IrPermissions,
+  IrPipelineV0,
   IrSecretRef,
   IrSlackConfig,
   IrSubAgentDefinition,
@@ -28,6 +29,7 @@ import { emitChannelBot } from "@crewhaus/target-channel-bot";
 import { emitCli } from "@crewhaus/target-cli";
 import { emitGraph } from "@crewhaus/target-graph";
 import { emitManaged } from "@crewhaus/target-managed";
+import { emitPipeline } from "@crewhaus/target-pipeline";
 import { emitWorkflow } from "@crewhaus/target-workflow";
 
 /**
@@ -251,6 +253,30 @@ export function lower(spec: Spec): IrNode {
         permissions: lowerPermissions(spec),
         compaction: lowerCompaction(spec),
       } satisfies IrManagedV0;
+    case "pipeline":
+      return {
+        version: 0,
+        name: spec.name,
+        target: "pipeline",
+        agent: { model: spec.agent.model, instructions: spec.agent.instructions },
+        retrieve: {
+          embedderModel: spec.retrieve.embedderModel,
+          vectorBackend: spec.retrieve.vectorBackend,
+          defaultK: spec.retrieve.defaultK,
+        },
+        indexing: {
+          chunkStrategy: spec.indexing.chunkStrategy,
+          chunkSize: spec.indexing.chunkSize,
+          chunkOverlap: spec.indexing.chunkOverlap,
+          documents: spec.indexing.documents.map((d) => ({
+            id: d.id,
+            text: d.text,
+            ...(d.metadata !== undefined ? { metadata: d.metadata } : {}),
+          })),
+        },
+        permissions: lowerPermissions(spec),
+        compaction: lowerCompaction(spec),
+      } satisfies IrPipelineV0;
     default:
       return assertNever(spec);
   }
@@ -268,6 +294,8 @@ function emit(ir: IrNode): Bundle {
       return emitGraph(ir);
     case "managed":
       return emitManaged(ir);
+    case "pipeline":
+      return emitPipeline(ir);
     default:
       return assertNever(ir);
   }
