@@ -118,6 +118,15 @@
         "@crewhaus/permission-engine": "workspace:*",
       },
     },
+    "examples/hello-eval": {
+      "name": "@crewhaus-examples/hello-eval",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/dataset-registry": "workspace:*",
+        "@crewhaus/eval-grader": "workspace:*",
+        "@crewhaus/eval-runner": "workspace:*",
+      },
+    },
     "examples/hello-graph": {
       "name": "@crewhaus-examples/hello-graph",
       "version": "0.0.0",
@@ -251,6 +260,18 @@
         "@crewhaus/migration-engine": "workspace:*",
         "@crewhaus/migration-runner": "workspace:*",
         "@crewhaus/spec-registry": "workspace:*",
+      },
+    },
+    "examples/section-29-smoke": {
+      "name": "@crewhaus-examples/section-29-smoke",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/dataset-registry": "workspace:*",
+        "@crewhaus/eval-dataset": "workspace:*",
+        "@crewhaus/eval-runner": "workspace:*",
+        "@crewhaus/grader-registry": "workspace:*",
+        "@crewhaus/prompt-optimizer": "workspace:*",
+        "@crewhaus/regression-runner": "workspace:*",
       },
     },
     "packages/a2a-protocol": {
@@ -437,6 +458,7 @@
         "@crewhaus/target-channel-bot": "workspace:*",
         "@crewhaus/target-cli": "workspace:*",
         "@crewhaus/target-crew": "workspace:*",
+        "@crewhaus/target-eval-bundle": "workspace:*",
         "@crewhaus/target-graph": "workspace:*",
         "@crewhaus/target-managed": "workspace:*",
         "@crewhaus/target-pipeline": "workspace:*",
@@ -497,6 +519,14 @@
         "@crewhaus/adapter-anthropic": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "zod": "^3.23.8",
+      },
+    },
+    "packages/dataset-registry": {
+      "name": "@crewhaus/dataset-registry",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/eval-dataset": "workspace:*",
       },
     },
     "packages/deployment-controller": {
@@ -629,6 +659,14 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/gateway-protocol": "workspace:*",
         "@crewhaus/tenancy": "workspace:*",
+      },
+    },
+    "packages/grader-registry": {
+      "name": "@crewhaus/grader-registry",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/eval-grader": "workspace:*",
       },
     },
     "packages/graph-engine": {
@@ -792,6 +830,17 @@
         "@crewhaus/errors": "workspace:*",
       },
     },
+    "packages/prompt-optimizer": {
+      "name": "@crewhaus/prompt-optimizer",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/dataset-registry": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/eval-dataset": "workspace:*",
+        "@crewhaus/eval-grader": "workspace:*",
+        "@crewhaus/eval-runner": "workspace:*",
+      },
+    },
     "packages/queue-consumer": {
       "name": "@crewhaus/queue-consumer",
       "version": "0.0.0",
@@ -820,6 +869,14 @@
       "version": "0.0.0",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
+      },
+    },
+    "packages/regression-runner": {
+      "name": "@crewhaus/regression-runner",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/eval-runner": "workspace:*",
       },
     },
     "packages/report-writer": {
@@ -1076,6 +1133,14 @@
       "version": "0.0.0",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
+        "@crewhaus/infra-utils": "workspace:*",
+        "@crewhaus/ir": "workspace:*",
+      },
+    },
+    "packages/target-eval-bundle": {
+      "name": "@crewhaus/target-eval-bundle",
+      "version": "0.0.0",
+      "dependencies": {
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
       },
@@ -1569,6 +1634,8 @@
 
     "@crewhaus-examples/hello-crew": ["@crewhaus-examples/hello-crew@workspace:examples/hello-crew"],
 
+    "@crewhaus-examples/hello-eval": ["@crewhaus-examples/hello-eval@workspace:examples/hello-eval"],
+
     "@crewhaus-examples/hello-graph": ["@crewhaus-examples/hello-graph@workspace:examples/hello-graph"],
 
     "@crewhaus-examples/hello-managed": ["@crewhaus-examples/hello-managed@workspace:examples/hello-managed"],
@@ -1590,6 +1657,8 @@
     "@crewhaus-examples/section-27-smoke": ["@crewhaus-examples/section-27-smoke@workspace:examples/section-27-smoke"],
 
     "@crewhaus-examples/section-28-smoke": ["@crewhaus-examples/section-28-smoke@workspace:examples/section-28-smoke"],
+
+    "@crewhaus-examples/section-29-smoke": ["@crewhaus-examples/section-29-smoke@workspace:examples/section-29-smoke"],
 
     "@crewhaus/a2a-protocol": ["@crewhaus/a2a-protocol@workspace:packages/a2a-protocol"],
 
@@ -1643,6 +1712,8 @@
 
     "@crewhaus/crew-orchestrator": ["@crewhaus/crew-orchestrator@workspace:packages/crew-orchestrator"],
 
+    "@crewhaus/dataset-registry": ["@crewhaus/dataset-registry@workspace:packages/dataset-registry"],
+
     "@crewhaus/deployment-controller": ["@crewhaus/deployment-controller@workspace:packages/deployment-controller"],
 
     "@crewhaus/durable-execution": ["@crewhaus/durable-execution@workspace:packages/durable-execution"],
@@ -1666,6 +1737,8 @@
     "@crewhaus/gateway-protocol": ["@crewhaus/gateway-protocol@workspace:packages/gateway-protocol"],
 
     "@crewhaus/gateway-server": ["@crewhaus/gateway-server@workspace:packages/gateway-server"],
+
+    "@crewhaus/grader-registry": ["@crewhaus/grader-registry@workspace:packages/grader-registry"],
 
     "@crewhaus/graph-engine": ["@crewhaus/graph-engine@workspace:packages/graph-engine"],
 
@@ -1709,6 +1782,8 @@
 
     "@crewhaus/prompt-injection-detector": ["@crewhaus/prompt-injection-detector@workspace:packages/prompt-injection-detector"],
 
+    "@crewhaus/prompt-optimizer": ["@crewhaus/prompt-optimizer@workspace:packages/prompt-optimizer"],
+
     "@crewhaus/queue-consumer": ["@crewhaus/queue-consumer@workspace:packages/queue-consumer"],
 
     "@crewhaus/queue-protocol": ["@crewhaus/queue-protocol@workspace:packages/queue-protocol"],
@@ -1716,6 +1791,8 @@
     "@crewhaus/rate-limiter": ["@crewhaus/rate-limiter@workspace:packages/rate-limiter"],
 
     "@crewhaus/recovery-engine": ["@crewhaus/recovery-engine@workspace:packages/recovery-engine"],
+
+    "@crewhaus/regression-runner": ["@crewhaus/regression-runner@workspace:packages/regression-runner"],
 
     "@crewhaus/report-writer": ["@crewhaus/report-writer@workspace:packages/report-writer"],
 
@@ -1762,6 +1839,8 @@
     "@crewhaus/target-cli": ["@crewhaus/target-cli@workspace:packages/target-cli"],
 
     "@crewhaus/target-crew": ["@crewhaus/target-crew@workspace:packages/target-crew"],
+
+    "@crewhaus/target-eval-bundle": ["@crewhaus/target-eval-bundle@workspace:packages/target-eval-bundle"],
 
     "@crewhaus/target-graph": ["@crewhaus/target-graph@workspace:packages/target-graph"],
 

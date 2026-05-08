@@ -82,6 +82,11 @@
     { "path": "./packages/migration-runner" },
     { "path": "./packages/deployment-controller" },
     { "path": "./packages/canary-controller" },
+    { "path": "./packages/dataset-registry" },
+    { "path": "./packages/grader-registry" },
+    { "path": "./packages/regression-runner" },
+    { "path": "./packages/prompt-optimizer" },
+    { "path": "./packages/target-eval-bundle" },
     { "path": "./apps/cli" }
   ]
 }

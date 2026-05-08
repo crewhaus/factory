@@ -354,6 +354,8 @@ describe("IrNode discriminated union narrowing", () => {
           return `voice:${n.voice.provider}`;
         case "browser":
           return `browser:${n.driver.backend}`;
+        case "eval":
+          return `eval:${n.dataset.name}@${n.dataset.version}`;
       }
     }
 

@@ -1,6 +1,6 @@
 # CrewHaus Factory — Build Roadmap
 
-> Status as of 2026-05-08. 127 of ~190 catalog modules implemented across 122 workspace packages; **Sections 1–28 all complete — all 11 target shapes ship + production hardening floor (cost-tracker + rate-limiter + circuit-breaker + prompt-cache-manager + secrets-manager) + deployment surface (spec-registry + ir-passes + migration-engine/runner + deployment-controller + canary-controller)**. Sections 29–31 below cover evaluation depth (prompt-optimizer + regression-runner + EVAL target shape), backend adapter completions (queue / vector / telephony / browser host backend), and Studio v1 (Lit + Monaco + live trace replay + plugin sandbox completion).
+> Status as of 2026-05-08. 132 of ~190 catalog modules implemented across 127 workspace packages; **Sections 1–29 all complete — 12 target shapes ship (added EVAL) + production hardening floor + deployment surface + evaluation depth (dataset-registry + grader-registry + regression-runner + prompt-optimizer + target-eval-bundle)**. Sections 30–31 below cover backend adapter completions (queue / vector / telephony / browser host backend) and Studio v1 (Lit + Monaco + live trace replay + plugin sandbox completion).
 > See `docs/MODULE-CATALOG.md` for full per-module specs, test layer references, and the per-row `Depends on` columns + 🔴/🟡 risk markers used throughout this roadmap.
 
 ---
@@ -74,7 +74,7 @@ Tool surface expansion (✅ §14) ──► Observability (✅ §15)
                                             │
                        ┌────────────────────┼────────────────────┐
                        ▼                    ▼                    ▼
-                §27 Production (✅)    §28 Deploy + (✅)   §29 Eval depth
+                §27 Production (✅)    §28 Deploy + (✅)   §29 Eval depth (✅)
                 hardening              canary +            + EVAL target
                 (cost-tracker,         migration           (prompt-optimizer,
                 rate-limiter,          (deployment-        regression-runner,
@@ -134,7 +134,7 @@ Tool surface expansion (✅ §14) ──► Observability (✅ §15)
 | **§26 Studio** | ✅ | every prior section's IR variants + trace event kinds | Authoring UI, trace-viewer drilldown, graph visualizer, wizard, plugin SDK, eval-result inspection |
 | **§27 Production hardening** | ✅ | §17 (`model-router`), §15 (trace bus for cost telemetry), §20 (gateway-server for per-tenant rate-limit) | §28 (`canary-controller` uses rate-limiter for traffic shaping), production-grade CHN/MGD/RES daemons, multi-tenant rate-limit + cost-budget enforcement |
 | **§28 Deployment + canary + migration** | ✅ | §27 (`rate-limiter`), §16 (`eval-runner` for canary gate), §10 (event-log for migration replay) | Continuous deployment, deploy-as-eval-gate pattern, multi-version spec rollouts, `web-ui` deploy-button |
-| **§29 Evaluation depth + EVAL target shape** | 🟡 independent | §16 (eval stack), §17 (multi-provider model-router for judge swaps) | EVAL target shape, prompt-optimizer regression CI, dataset/grader plugin ecosystem |
+| **§29 Evaluation depth + EVAL target shape** | ✅ | §16 (eval stack), §17 (multi-provider model-router for judge swaps) | EVAL target shape, prompt-optimizer regression CI, dataset/grader plugin ecosystem |
 | **§30 Backend adapter completions** | 🟡 independent | §17 base adapter shapes; §21 vector-store interface; §23 queue-protocol interface; §24 telephony slot; §25 driver interface | Production CHN/MGD/RES/VOICE/BROW deployments without v0 stub limits |
 | **§31 Studio v1** | 🟡 last; after §27–30 | every prior section's IR / trace / event / metric kinds | Production authoring UI, run replay, multi-spec dashboards, third-party plugin marketplace |
 
@@ -1787,7 +1787,7 @@ spec-registry  ──►  ir-passes              (parallel)  ──►  migratio
 
 ## Section 29 — Evaluation depth + EVAL target shape
 
-> Status: 🟡 independent. Can land any time after Section 27. Strongly composes with Section 28's canary gate.
+> Status: ✅ landed (2026-05-08). Five packages shipped: `dataset-registry` (split-aware dataset versioning at `.crewhaus/datasets/<name>/<version>.json` with sample hash stability and a `test`-split leak guard requiring explicit `allowTestSplit`), `grader-registry` (named graders + plugin discovery walking `<root>/<plugin>/index.ts`), `regression-runner` (`regress` + `gate` over two `eval-runner` outputs — `canary-controller` will swap `PASSING_GATE` → `regression-runner.gate`), `prompt-optimizer` (DSPy-style seeded search over rule-based mutations with caller-supplied fitness; persists trajectory + best to `.crewhaus/prompt-optimizer/<runId>/`), `target-eval-bundle` (the 12th target shape; spec/ir/compiler all grew `target: "eval"` discriminated-union variants). `examples/hello-eval/` ships as the canonical example. End-to-end smoke (`bun run smoke:section-29`) drives 5 in-process probes covering each module. Full test suite ~1810 green; lint clean.
 
 **Catalog modules:** `prompt-optimizer` (F-eval), `regression-runner` (F-eval), `target-eval-bundle` (F2), `dataset-registry` (R15), `grader-registry` (R15)
 

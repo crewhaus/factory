@@ -20,6 +20,7 @@
     "@crewhaus/target-batch-worker": "workspace:*",
     "@crewhaus/target-browser-driver": "workspace:*",
     "@crewhaus/target-channel-bot": "workspace:*",
+    "@crewhaus/target-eval-bundle": "workspace:*",
     "@crewhaus/target-cli": "workspace:*",
     "@crewhaus/target-crew": "workspace:*",
     "@crewhaus/target-graph": "workspace:*",
