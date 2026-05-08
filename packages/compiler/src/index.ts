@@ -19,6 +19,7 @@ import type {
   IrSlackConfig,
   IrSubAgentDefinition,
   IrV0,
+  IrVoiceV0,
   IrWorkflowV0,
 } from "@crewhaus/ir";
 import {
@@ -38,6 +39,7 @@ import { emitGraph } from "@crewhaus/target-graph";
 import { emitManaged } from "@crewhaus/target-managed";
 import { emitPipeline } from "@crewhaus/target-pipeline";
 import { emitResearchBundle } from "@crewhaus/target-research-bundle";
+import { emitVoice } from "@crewhaus/target-voice";
 import { emitWorkflow } from "@crewhaus/target-workflow";
 
 /**
@@ -352,6 +354,28 @@ export function lower(spec: Spec): IrNode {
         permissions: lowerPermissions(spec),
         compaction: lowerCompaction(spec),
       } satisfies IrBatchV0;
+    case "voice":
+      return {
+        version: 0,
+        name: spec.name,
+        target: "voice",
+        agent: { model: spec.agent.model, instructions: spec.agent.instructions },
+        voice: {
+          provider: spec.voice.provider,
+          voiceId: spec.voice.voiceId,
+          vad: spec.voice.vad,
+          bargeInTriggerFrames: spec.voice.bargeInTriggerFrames,
+          bargeInWindowMs: spec.voice.bargeInWindowMs,
+        },
+        ...(spec.telephony !== undefined
+          ? { telephony: { provider: spec.telephony.provider } }
+          : {}),
+        tools: spec.tools ?? [],
+        toolConfigs: lowerToolConfigs(spec.tool_config),
+        mcp_servers: lowerMcpServers(spec.mcp_servers),
+        permissions: lowerPermissions(spec),
+        compaction: lowerCompaction(spec),
+      } satisfies IrVoiceV0;
     default:
       return assertNever(spec);
   }
@@ -388,6 +412,8 @@ function emit(ir: IrNode): Bundle {
       return emitResearchBundle(ir);
     case "batch":
       return emitBatchWorker(ir);
+    case "voice":
+      return emitVoice(ir);
     default:
       return assertNever(ir);
   }

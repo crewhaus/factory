@@ -1,0 +1,20 @@
+{
+  "name": "@crewhaus/target-voice",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Codegen for the VOICE target — emits a realtime daemon (Section 24 VOICE)",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@crewhaus/errors": "workspace:*",
+    "@crewhaus/infra-utils": "workspace:*",
+    "@crewhaus/ir": "workspace:*"
+  }
+}

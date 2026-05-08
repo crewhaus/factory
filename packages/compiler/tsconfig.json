@@ -17,6 +17,7 @@
     { "path": "../target-managed" },
     { "path": "../target-pipeline" },
     { "path": "../target-research-bundle" },
+    { "path": "../target-voice" },
     { "path": "../target-workflow" }
   ]
 }

@@ -433,6 +433,43 @@ const batchSchema = z
   })
   .strict();
 
+// Voice target (Section 24 VOICE). Realtime audio agent.
+const voiceBlockSchema = z
+  .object({
+    provider: z.enum(["openai", "vapi"]),
+    voiceId: z.string().min(1).default("alloy"),
+    vad: z.enum(["server", "none"]).default("server"),
+    bargeInTriggerFrames: z.number().int().min(1).max(20).default(4),
+    bargeInWindowMs: z.number().int().min(60).max(2000).default(200),
+  })
+  .strict();
+
+const voiceTelephonySchema = z
+  .object({
+    provider: z.enum(["twilio", "livekit-sip", "in-memory"]),
+  })
+  .strict();
+
+const voiceSchema = z
+  .object({
+    name: z.string().min(1),
+    target: z.literal("voice"),
+    agent: z
+      .object({
+        model: z.string().min(1),
+        instructions: z.string().min(1),
+      })
+      .strict(),
+    voice: voiceBlockSchema,
+    telephony: voiceTelephonySchema.optional(),
+    tools: z.array(z.string().min(1)).optional(),
+    tool_config: toolConfigBlock,
+    mcp_servers: mcpServersBlock,
+    permissions: permissionsBlock,
+    compaction: compactionBlock,
+  })
+  .strict();
+
 export const Spec = z.discriminatedUnion("target", [
   cliSchema,
   workflowSchema,
@@ -443,6 +480,7 @@ export const Spec = z.discriminatedUnion("target", [
   crewSchema,
   researchSchema,
   batchSchema,
+  voiceSchema,
 ]);
 
 export type Spec = z.infer<typeof Spec>;
@@ -466,6 +504,9 @@ export type SpecResearch = z.infer<typeof researchSchema>;
 export type SpecResearchRetrieve = z.infer<typeof researchRetrieveSchema>;
 export type SpecBatch = z.infer<typeof batchSchema>;
 export type SpecBatchQueue = z.infer<typeof batchQueueSchema>;
+export type SpecVoice = z.infer<typeof voiceSchema>;
+export type SpecVoiceBlock = z.infer<typeof voiceBlockSchema>;
+export type SpecVoiceTelephony = z.infer<typeof voiceTelephonySchema>;
 export type SpecMcpServerConfig = z.infer<typeof mcpServerConfigSchema>;
 export type SpecSubAgentDefinition = z.infer<typeof subAgentDefinitionSchema>;
 export type SpecCompactionBlock = z.infer<typeof compactionBlock>;

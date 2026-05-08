@@ -383,6 +383,45 @@ export type IrBatchV0 = {
   readonly compaction: IrCompaction;
 };
 
+/**
+ * Section 24 — VOICE (realtime audio agent) IR. The compiled daemon
+ * opens a realtime adapter (OpenAI Realtime by default), hosts a
+ * call-session state machine, and runs a barge-in controller over
+ * inbound audio frames.
+ */
+export type IrVoiceProvider = "openai" | "vapi";
+export type IrVoiceTelephony = "twilio" | "livekit-sip" | "in-memory";
+
+export type IrVoiceV0 = {
+  readonly version: 0;
+  readonly name: string;
+  readonly target: "voice";
+  readonly agent: {
+    readonly model: string;
+    readonly instructions: string;
+  };
+  readonly voice: {
+    readonly provider: IrVoiceProvider;
+    /** Provider-specific voice id (OpenAI: alloy, echo, …). */
+    readonly voiceId: string;
+    /** Server VAD vs caller-driven. v0 defaults to "server". */
+    readonly vad: "server" | "none";
+    /** Barge-in trigger frame count (consecutive speech frames). */
+    readonly bargeInTriggerFrames: number;
+    /** Barge-in window ms — sliding window for the trigger count. */
+    readonly bargeInWindowMs: number;
+  };
+  /** Optional telephony adapter wiring (Twilio, LiveKit, in-memory for the smoke). */
+  readonly telephony?: {
+    readonly provider: IrVoiceTelephony;
+  };
+  readonly tools: readonly string[];
+  readonly toolConfigs: IrToolConfigs;
+  readonly mcp_servers: IrMcpServers;
+  readonly permissions: IrPermissions;
+  readonly compaction: IrCompaction;
+};
+
 /** Discriminated union over every supported target IR. */
 export type IrNode =
   | IrV0
@@ -393,7 +432,8 @@ export type IrNode =
   | IrPipelineV0
   | IrCrewV0
   | IrResearchV0
-  | IrBatchV0;
+  | IrBatchV0
+  | IrVoiceV0;
 
 /**
  * The output of compilation: a set of files to be written to disk by the

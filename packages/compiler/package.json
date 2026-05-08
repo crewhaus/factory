@@ -24,6 +24,7 @@
     "@crewhaus/target-managed": "workspace:*",
     "@crewhaus/target-pipeline": "workspace:*",
     "@crewhaus/target-research-bundle": "workspace:*",
+    "@crewhaus/target-voice": "workspace:*",
     "@crewhaus/target-workflow": "workspace:*"
   }
 }
