@@ -9,6 +9,7 @@ import type {
   IrCompaction,
   IrCrewRole,
   IrCrewV0,
+  IrEvalV0,
   IrGraphEdge,
   IrGraphNode,
   IrGraphV0,
@@ -329,6 +330,15 @@ describe("IrNode discriminated union narrowing", () => {
       permissions: { rules: [] },
       compaction: {},
     };
+    const evalNode: IrNode = {
+      version: 0,
+      name: "x",
+      target: "eval",
+      agent: { model: "m", instructions: "i", tools: [] },
+      dataset: { name: "smoke", version: "v1", split: "dev" },
+      graders: [{ name: "exact_match" }, { name: "judge", opts: { rubric: "concise" } }],
+      concurrency: 4,
+    };
 
     function describeNode(n: IrNode): string {
       switch (n.target) {
@@ -370,6 +380,7 @@ describe("IrNode discriminated union narrowing", () => {
     expect(describeNode(batchNode)).toBe("batch:in-memory");
     expect(describeNode(voiceNode)).toBe("voice:openai");
     expect(describeNode(browserNode)).toBe("browser:chromium");
+    expect(describeNode(evalNode)).toBe("eval:smoke@v1");
   });
 });
 
@@ -924,5 +935,48 @@ describe("IrBrowserV0 (Section 25 — BROW)", () => {
       compaction: {},
     };
     expect(ir.driver.startUrl).toBeUndefined();
+  });
+});
+
+describe("IrEvalV0 (Section 29 — EVAL target)", () => {
+  test("an eval IR carries dataset reference + graders + concurrency", () => {
+    const ir: IrEvalV0 = {
+      version: 0,
+      name: "smoke-eval",
+      target: "eval",
+      agent: {
+        model: "claude-sonnet-4-6",
+        instructions: "answer concisely",
+        tools: ["read"],
+      },
+      dataset: { name: "qa-bench", version: "v1", split: "dev" },
+      graders: [{ name: "exact_match" }, { name: "judge", opts: { rubric: "concise + correct" } }],
+      concurrency: 4,
+      seed: 42,
+    };
+    expect(ir.dataset.split).toBe("dev");
+    expect(ir.graders.length).toBe(2);
+    expect(ir.graders[1]?.opts?.["rubric"]).toBe("concise + correct");
+    expect(ir.concurrency).toBe(4);
+    expect(ir.seed).toBe(42);
+  });
+
+  test("dataset.split is restricted to train | dev | test", () => {
+    // @ts-expect-error — random string is not a legal split
+    const _bad: IrEvalV0["dataset"] = { name: "x", version: "v1", split: "validation" };
+    void _bad;
+  });
+
+  test("seed is optional; runner falls back to provider-default temperature", () => {
+    const ir: IrEvalV0 = {
+      version: 0,
+      name: "no-seed",
+      target: "eval",
+      agent: { model: "m", instructions: "i", tools: [] },
+      dataset: { name: "x", version: "v1", split: "dev" },
+      graders: [],
+      concurrency: 1,
+    };
+    expect(ir.seed).toBeUndefined();
   });
 });
