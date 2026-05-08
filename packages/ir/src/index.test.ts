@@ -2,12 +2,15 @@ import { describe, expect, test } from "bun:test";
 import type {
   Bundle,
   IrChannelV0,
+  IrCompaction,
   IrMcpServerConfig,
   IrMcpServers,
   IrNode,
   IrPermissionRule,
   IrPermissions,
   IrSecretRef,
+  IrSubAgentDefinition,
+  IrToolConfigs,
   IrV0,
   IrWorkflowStep,
   IrWorkflowV0,
@@ -200,5 +203,102 @@ describe("Bundle shape", () => {
     };
     expect(bundle.files.length).toBe(2);
     expect(bundle.files[0]?.path).toBe("agent.ts");
+  });
+});
+
+describe("IrSubAgentDefinition (Section 13)", () => {
+  test("a sub-agent with `inherit` permissions has no allow/deny lists", () => {
+    const def: IrSubAgentDefinition = {
+      name: "summariser",
+      description: "summarise its input in two sentences",
+      instructions: "be concise",
+      tools: [],
+      permissions: "inherit",
+      inheritBypass: false,
+    };
+    expect(def.permissions).toBe("inherit");
+    expect(def.inheritBypass).toBe(false);
+  });
+
+  test("a sub-agent with `scoped` permissions limits to listed tools", () => {
+    const def: IrSubAgentDefinition = {
+      name: "code-reviewer",
+      description: "review diffs",
+      instructions: "look for bugs",
+      tools: ["read", "grep"],
+      permissions: "scoped",
+      inheritBypass: false,
+    };
+    expect(def.permissions).toBe("scoped");
+    expect(def.tools).toEqual(["read", "grep"]);
+  });
+
+  test("a sub-agent with explicit allow/deny lists narrows further", () => {
+    const def: IrSubAgentDefinition = {
+      name: "auditor",
+      description: "audits a folder",
+      instructions: "report findings",
+      tools: ["read", "grep"],
+      permissions: { allow: ["Read", "Grep(**/src/**)"], deny: ["Bash"] },
+      inheritBypass: false,
+    };
+    if (typeof def.permissions === "string") expect.unreachable();
+    expect(def.permissions.allow).toEqual(["Read", "Grep(**/src/**)"]);
+    expect(def.permissions.deny).toEqual(["Bash"]);
+  });
+
+  test("inheritBypass: true is allowed for explicit opt-in propagation", () => {
+    const def: IrSubAgentDefinition = {
+      name: "trusted",
+      description: "trusted helper",
+      instructions: "do its job",
+      tools: [],
+      permissions: "inherit",
+      inheritBypass: true,
+    };
+    expect(def.inheritBypass).toBe(true);
+  });
+
+  test("optional model override is allowed", () => {
+    const def: IrSubAgentDefinition = {
+      name: "haiku-helper",
+      description: "fast helper",
+      instructions: "be quick",
+      tools: [],
+      model: "claude-haiku-4-5",
+      permissions: "inherit",
+      inheritBypass: false,
+    };
+    expect(def.model).toBe("claude-haiku-4-5");
+  });
+});
+
+describe("IrToolConfigs (Section 14)", () => {
+  test("opaque per-tool config blob is keyed by tool name", () => {
+    const configs: IrToolConfigs = {
+      WebFetch: { allowed_domains: ["example.com"], timeoutMs: 30_000 },
+      Fetch: { allowed_origins: ["https://api.github.com"] },
+    };
+    expect((configs["WebFetch"] as { allowed_domains: string[] }).allowed_domains).toEqual([
+      "example.com",
+    ]);
+    expect(Object.keys(configs).length).toBe(2);
+  });
+
+  test("empty toolConfigs is valid (lower-time default)", () => {
+    const configs: IrToolConfigs = {};
+    expect(Object.keys(configs).length).toBe(0);
+  });
+});
+
+describe("IrCompaction (Section 17)", () => {
+  test("an empty compaction block is valid (defaults to agent model)", () => {
+    const c: IrCompaction = {};
+    expect(c.model).toBeUndefined();
+  });
+
+  test("compaction.model overrides the autocompact summarisation model", () => {
+    const c: IrCompaction = { model: "openai/gpt-4o-mini" };
+    expect(c.model).toBe("openai/gpt-4o-mini");
   });
 });

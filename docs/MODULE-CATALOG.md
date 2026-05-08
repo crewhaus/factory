@@ -12,7 +12,7 @@ The goal of this plan is to lock in the catalog before any implementation, so in
 
 ## Implementation status
 
-> Status as of 2026-05-07. 57 of ~190 catalog modules implemented across 52 workspace packages; full suite is green across every package and the Section 15 end-to-end smoke test (docker OTel collector + 3-turn live model run with one Bash tool call) passes; `tsc -b` clean. Sections 1–15 of `docs/build-roadmap.md` are landed; Sections 16–17 (eval stack, multi-provider models) are scoped but not started.
+> Status as of 2026-05-08. 66 of ~190 catalog modules implemented across 61 workspace packages (+ `apps/cli`); full suite is 1048 tests across 62 test files plus 1 skipped contract test gated on env var, all green; `tsc -b` clean. Sections 1–17 of `docs/build-roadmap.md` are landed: tool framework, all three target shapes (cli/workflow/channel), persistence, hooks/skills/slash, sub-agents + Task tool, expanded tool catalog (web/image/fetch), observability (trace bus + OTel + metrics + pretty/JSON printer), eval stack with `crewhaus eval` subcommand, and multi-provider model layer (Anthropic/OpenAI/Gemini/Bedrock + local via OpenAI-compatible URL). Sections 18–21 (production safety floor, GRPH target shape, MGD target shape + governance, RAG target shape) are scoped but not started.
 
 Modules in the per-layer tables below are prefixed with status markers:
 
@@ -85,8 +85,13 @@ Modules in the per-layer tables below are prefixed with status markers:
 | `otel-exporter` | R15 | Dependency-free OTLP/JSON exporter. Pairs lifecycle events into spans using `gen_ai/*` semantic conventions; `gen_ai.system` is provider-driven (Section 17 — `"anthropic"` / `"openai"` / `"gcp.gemini"` / `"aws.bedrock"`) via `genAiSystem(providerId)`. Other attributes: `gen_ai.request.model`, `gen_ai.usage.input_tokens`/`output_tokens`, `gen_ai.response.finish_reason`, `gen_ai.operation.name="chat"`. Tool spans use `code.function = <toolName>` plus `crewhaus.tool.*` extension keys; MCP spans use `mcp.server.name`/`mcp.tool.name`; `model_stream_token` events ride as span events on the model span (never per-token spans). 5s batch flush + sync flush on shutdown. Honors `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS` (`k1=v1,k2=v2`), `OTEL_SERVICE_NAME` (default `crewhaus`). Section 15, extended in Section 17. |
 | `metrics-collector` | R15 | Counters (`crewhaus_turns_total`, `crewhaus_tool_calls_total{tool}`, `crewhaus_tokens_total{direction}`, `crewhaus_errors_total{kind}`) + histograms (`crewhaus_turn_duration_seconds`, `crewhaus_tool_duration_seconds{tool}`, `crewhaus_model_ttft_seconds` computed from first-token-after-`model_request` per traceId) using Prometheus default buckets. Three sinks: `prometheusTextfile(path)` (atomic write on flush), `stdoutJson()` (**buffers + emits one JSON dump on flush** to avoid interleaving with assistant text on stdout), and `httpServer(port)` (pull-based `/metrics` exposition). Selected via `CREWHAUS_METRICS=stdout\|textfile\|textfile:/path\|http:PORT`. Section 15. |
 | `structured-event-printer` | R15 | Pretty (`CREWHAUS_TRACE=pretty`) — color-coded events on stderr with one-line-per-kind formatters; `model_stream_token` deltas collapse into a rolling line via `\r` rewrites on a TTY (or one summary line on `model_response` when stderr is piped). JSON Lines (`CREWHAUS_TRACE=json`) — one JSON object per event on stdout. `NO_COLOR` disables ANSI escapes. Section 15. |
+| `eval-dataset` | R15 | Loaders for JSONL, CSV, YAML, and HTTP-fetched datasets. Schema: `{ name, samples: Array<{ id, input, expected_output?, expected_tools?, metadata? }> }`. Lazy iterator API so 100k-sample datasets stream rather than load fully. T1 unit per loader format. Section 16. |
+| `eval-grader` | R15 | Deterministic graders: `exact_match`, `contains`, `regex`, `json_path`, `schema` (Zod), `tool_call_sequence` (matches the trace event sequence against an expected pattern). Composers: `all([...])`, `any([...])`, `weighted([...])`. Each grader: `(sample, runResult) → { passed, score, rationale }`. T1 per built-in grader; T9 over `weighted` + `all`/`any` composition. Section 16. |
+| `eval-judge` | R15 | LLM-as-judge with configurable judge model (resolved through `model-router`; default same as agent). Structured output via Zod; returns `{ score: 1..5, rationale }`. Rubric format: YAML with named criteria, each carrying a description and a 1–5 anchor per level. Prompt-injection defense: judge prompt explicitly templates the sample's expected output as untrusted data. T8 13-payload prompt-injection corpus locks in the structural defense. Section 16. |
+| `eval-runner` | R15 | For each sample (concurrency configurable, default 4): create fresh `sessionId`, instantiate `runChatLoop` with the sample input as the seed user message, subscribe to the trace bus to capture events, await completion, apply each configured grader, record per-sample result. Persists raw run artifacts to `.crewhaus/evals/<runId>/<sampleId>/{transcript.jsonl, events.jsonl, grades.json}`. Honors `--seed` where the provider supports temperature reproducibility. T7 200-sample concurrency-8 SLO completes <60s. Section 16. |
+| `eval-report` | R15 | Renders results as HTML (sortable per-sample table, drill-down panel with transcript + trace timeline + grader rationales) and JSON. Aggregates: pass rate, mean score, p50/p95 turn count + latency, total token cost (per-provider pricing table). Diff mode: `eval-report diff <prev-runId> <new-runId>` highlights samples that flipped pass/fail between runs. Wired into `crewhaus eval` and `crewhaus eval-report diff` subcommands. Section 16. |
 
-**Total**: 62 of ~190 modules.
+**Total**: 66 of ~190 modules.
 
 ### In progress (🚧)
 
@@ -114,25 +119,24 @@ Implemented (✅) and in-progress (🚧) modules have already absorbed their ris
 
 ## Critical path snapshot
 
-Top unbuilt modules ranked by how many downstream modules / target shapes they block. Each one is the gate for a stack of dependents — landing them earliest reduces compounding risk in later phases. PART G.5 expands this view into the full risk register; this section is the at-a-glance summary.
+Top unbuilt modules ranked by how many downstream modules / target shapes they block. Each one is the gate for a stack of dependents — landing them earliest reduces compounding risk in later phases. PART G.5 expands this view into the full risk register; this section is the at-a-glance summary. Build-roadmap Sections 18–21 group these into landable units.
 
-| # | Module | Layer | Why critical | Direct downstream blocked |
-|---|---|---|---|---|
-| 1 | 🔴 `eval-service` | R15 | Production deploy gate; the "eval as first-class" anti-pattern (PART F #10) hinges on this. | `eval-runner`, `eval-report`, `prompt-optimizer`, `target-eval-bundle`, Section 16 |
-| 2 | 🔴 `graph-engine` | R11 | First stateful-graph runtime; the GRPH target shape is undefined without it. | `target-graph`, `durable-execution` consumers, `branch-history` HITL flow, MGD |
-| 3 | 🔴 `pipeline-engine` | R11 | Required for the RAG target shape; component DAG validation lives here. | `target-pipeline`, all R12 modules' end-to-end composition |
-| 4 | 🔴 `voice-runtime` | R16 | Realtime audio loop is novel territory; provider abstraction non-trivial. | `target-voice`, `vad-engine`, `barge-in-controller`, `call-session`, VOICE shape |
-| 5 | 🔴 `gateway-server` | R16 | App-server protocol underpins MGD and remote CHN. | `gateway-protocol`, `web-ui`, `deployment-controller` for managed runtimes, MGD |
-| 6 | 🔴 `policy-engine` | R8 | Side-effect classification + audit; required for MGD/regulated tenants. | `tenancy`, `audit-log` consumers, `hitl-engine` integration, `sandbox` compose |
-| 7 | 🔴 `tool-code-execution` | R4 | Sandboxed Python/JS REPL; security model + warm-pool design open. | EVAL CI flows, RES auto-execution, MGD sandbox fan-out |
-| 8 | 🔴 `prompt-injection-detector` | R8 | Cross-cutting safety check on tool outputs; needs taxonomy + measurement. | `guardrails` depth, MGD audit, RES untrusted-source ingest |
-| 9 | 🔴 `checkpoint-store` | R7 | Resumable graph state; encoding scheme blocks GRPH and `durable-execution`. | `branch-history`, `target-graph`, `durable-execution`, MGD durability |
-| 10 | 🔴 `computer-use-driver` | R18 | Cross-OS mouse/keyboard/screenshot; gates the BROW shape entirely. | `tool-screen-capture`, `tool-mouse-keyboard`, `tool-vision-grounding`, BROW shape |
-| 11 | 🔴 `sandbox` | R8 | Containerized exec environment; required for production EVAL/MGD running untrusted code. | `tool-code-execution`, `channel-signal`, MGD/EVAL hardening |
+| # | Module | Layer | Section | Why critical | Direct downstream blocked |
+|---|---|---|---|---|---|
+| 1 | 🔴 `sandbox` | R8 | §18 | Containerised exec environment; required for any production deployment running untrusted code. | `tool-code-execution`, MGD/EVAL hardening, untrusted-sample EVAL CI |
+| 2 | 🔴 `tool-code-execution` | R4 | §18 | Sandboxed Python/JS/Shell REPL; gates EVAL CI auto-grading and RES auto-execution. | EVAL CI flows, RES auto-execution, MGD sandbox fan-out |
+| 3 | 🔴 `prompt-injection-detector` | R8 | §18 | Cross-cutting safety classifier on tool outputs; only thing standing between web/document tools and a compromised agent. | `guardrails` depth, MGD audit, RES untrusted-source ingest |
+| 4 | 🔴 `graph-engine` | R11 | §19 | First stateful-graph runtime; the GRPH target shape is undefined without it. | `target-graph`, `durable-execution`, `branch-history` HITL flow, MGD durability |
+| 5 | 🔴 `checkpoint-store` | R7 | §19 | Resumable graph state; encoding scheme blocks GRPH and `durable-execution`. | `branch-history`, `target-graph`, `durable-execution`, MGD durability |
+| 6 | 🔴 `gateway-server` | R16 | §20 | App-server protocol underpins MGD and remote CHN. | `gateway-protocol`, `web-ui`, `deployment-controller` for managed runtimes, MGD |
+| 7 | 🔴 `policy-engine` | R8 | §20 | Side-effect classification + audit; required for MGD/regulated tenants. | `tenancy`, `audit-log` consumers, `hitl-engine` integration |
+| 8 | 🔴 `pipeline-engine` | R11 | §21 | Required for the RAG target shape; component DAG validation lives here. | `target-pipeline`, all R12 modules' end-to-end composition |
+| 9 | 🔴 `voice-runtime` | R16 | (§22 future) | Realtime audio loop is novel territory; provider abstraction non-trivial. | `target-voice`, `vad-engine`, `barge-in-controller`, `call-session`, VOICE shape |
+| 10 | 🔴 `computer-use-driver` | R18 | (§23 future) | Cross-OS mouse/keyboard/screenshot; gates the BROW shape entirely. | `tool-screen-capture`, `tool-mouse-keyboard`, `tool-vision-grounding`, BROW shape |
 
-(Section 17 closed: `model-router` and `adapter-{anthropic,openai,gemini,bedrock}` all landed; multi-provider runs, MGD regional routing, and EVAL multi-provider sweeps are unblocked.)
+(Sections 16–17 closed: `eval-{dataset,grader,judge,runner,report}`, `model-router`, and `adapter-{anthropic,openai,gemini,bedrock}` all landed; the EVAL target shape, multi-provider runs, MGD regional routing, and EVAL multi-provider sweeps are unblocked.)
 
-Cross-cutting hardening note: until `sandbox` lands, `tool-code-execution` and `tool-bash` operate at process trust level. Any production EVAL or MGD deployment running untrusted samples must flag this in `deploy-checklist` work.
+Cross-cutting hardening note: until `sandbox` (§18) lands, `tool-code-execution` (§18) and the existing `tool-bash` operate at host process trust level. Any production EVAL or MGD deployment running untrusted samples must flag this in `deploy-checklist` work.
 
 ---
 
