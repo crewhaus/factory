@@ -249,3 +249,184 @@ describe("studio-server (T3 — endpoint contract)", () => {
     }
   });
 });
+
+describe("studio-server v1 — Section 31 endpoints", () => {
+  test("runDispatcher injection routes through caller's runtime", async () => {
+    const root = newRoot();
+    const dispatched: Array<{ specName: string; prompt: string }> = [];
+    const server = await startStudioServer({
+      port: 0,
+      workspaceDir: join(root, "specs"),
+      runDispatcher: async ({ specName, prompt, publish, finish }) => {
+        dispatched.push({ specName, prompt });
+        publish({ kind: "custom_event", who: "test" });
+        finish("dispatched-final-text");
+      },
+    });
+    try {
+      const yaml = "name: test\ntarget: cli\nagent:\n  model: m\n  instructions: i\n";
+      await fetch(`http://localhost:${server.port}/api/specs`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: "test", yaml }),
+      });
+      const runRes = await fetch(`http://localhost:${server.port}/api/runs`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ specName: "test", prompt: "hi" }),
+      });
+      const { runId } = (await runRes.json()) as { runId: string };
+      await new Promise((r) => setTimeout(r, 50));
+      expect(dispatched.length).toBe(1);
+      expect(dispatched[0]?.prompt).toBe("hi");
+      const events = await fetch(`http://localhost:${server.port}/api/runs/${runId}/events`);
+      const text = await events.text();
+      expect(text).toContain("custom_event");
+      expect(text).toContain("dispatched-final-text");
+    } finally {
+      await server.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("/api/runs/:runId/cancel signals the dispatcher's abort", async () => {
+    const root = newRoot();
+    let signalSeen: AbortSignal | undefined;
+    const server = await startStudioServer({
+      port: 0,
+      workspaceDir: join(root, "specs"),
+      runDispatcher: async ({ signal, finish }) => {
+        signalSeen = signal;
+        await new Promise((r) => setTimeout(r, 100));
+        finish("done");
+      },
+    });
+    try {
+      const yaml = "name: test\ntarget: cli\nagent:\n  model: m\n  instructions: i\n";
+      await fetch(`http://localhost:${server.port}/api/specs`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: "test", yaml }),
+      });
+      const runRes = await fetch(`http://localhost:${server.port}/api/runs`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ specName: "test", prompt: "hi" }),
+      });
+      const { runId } = (await runRes.json()) as { runId: string };
+      await new Promise((r) => setTimeout(r, 10));
+      const cancelRes = await fetch(`http://localhost:${server.port}/api/runs/${runId}/cancel`, {
+        method: "POST",
+      });
+      expect(cancelRes.status).toBe(200);
+      expect(signalSeen?.aborted).toBe(true);
+    } finally {
+      await server.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("/api/cost-summary returns the source's payload", async () => {
+    const root = newRoot();
+    const server = await startStudioServer({
+      port: 0,
+      workspaceDir: join(root, "specs"),
+      costSummarySource: async () => ({
+        totalUsdMicros: 12_345,
+        byProvider: { anthropic: 12_345 },
+      }),
+    });
+    try {
+      const res = await fetch(
+        `http://localhost:${server.port}/api/cost-summary?tenant=t1&from=0&to=999`,
+      );
+      const body = (await res.json()) as { totalUsdMicros: number };
+      expect(body.totalUsdMicros).toBe(12_345);
+    } finally {
+      await server.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("/api/cost-summary without source returns zeros + note", async () => {
+    const root = newRoot();
+    const server = await startStudioServer({
+      port: 0,
+      workspaceDir: join(root, "specs"),
+    });
+    try {
+      const res = await fetch(`http://localhost:${server.port}/api/cost-summary`);
+      const body = (await res.json()) as {
+        totalUsdMicros: number;
+        note?: string;
+      };
+      expect(body.totalUsdMicros).toBe(0);
+      expect(body.note).toContain("no costSummarySource");
+    } finally {
+      await server.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("/api/runs/:runId/replay uses replaySource when provided", async () => {
+    const root = newRoot();
+    const server = await startStudioServer({
+      port: 0,
+      workspaceDir: join(root, "specs"),
+      replaySource: async (runId) => {
+        if (runId === "run_abc1234567") {
+          return [
+            { kind: "run_start", specName: "x", prompt: "y" },
+            { kind: "trace", subkind: "model_request" },
+          ];
+        }
+        return undefined;
+      },
+    });
+    try {
+      const res = await fetch(`http://localhost:${server.port}/api/runs/run_abc1234567/replay`);
+      expect(res.status).toBe(200);
+      const text = await res.text();
+      expect(text).toContain("run_start");
+      expect(text).toContain("event: done");
+    } finally {
+      await server.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("/api/runs/:runId/hitl pushes a hitl_decision event", async () => {
+    const root = newRoot();
+    const server = await startStudioServer({
+      port: 0,
+      workspaceDir: join(root, "specs"),
+    });
+    try {
+      const yaml = "name: test\ntarget: cli\nagent:\n  model: m\n  instructions: i\n";
+      await fetch(`http://localhost:${server.port}/api/specs`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: "test", yaml }),
+      });
+      const runRes = await fetch(`http://localhost:${server.port}/api/runs`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ specName: "test", prompt: "hi" }),
+      });
+      const { runId } = (await runRes.json()) as { runId: string };
+      await new Promise((r) => setTimeout(r, 50));
+      const hitlRes = await fetch(
+        `http://localhost:${server.port}/api/runs/${runId}/hitl?nodeId=n1&decision=approve`,
+        { method: "POST" },
+      );
+      expect(hitlRes.status).toBe(200);
+      const events = await fetch(`http://localhost:${server.port}/api/runs/${runId}/events`);
+      const text = await events.text();
+      expect(text).toContain("hitl_decision");
+      expect(text).toContain("approve");
+    } finally {
+      await server.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});

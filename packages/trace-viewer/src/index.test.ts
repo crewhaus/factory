@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { TraceEvent, TraceEventEnvelope } from "@crewhaus/trace-event-bus";
-import { buildTimeline } from "./index.js";
+import { buildTimeline, drilldownSpan, replay } from "./index.js";
 
 function envelope(
   spanId: string,
@@ -175,5 +175,134 @@ describe("buildTimeline (T1 snapshot)", () => {
     const tl = buildTimeline(events);
     expect(tl.t0).toBe(Date.parse("2026-05-08T00:00:00.000Z"));
     expect(tl.t1).toBe(Date.parse("2026-05-08T00:00:02.000Z"));
+  });
+});
+
+describe("trace-viewer v1 — Section 31 replay + drilldown", () => {
+  test("replay yields events in order with deterministic timing", async () => {
+    const events: TraceEvent[] = [
+      {
+        ...envelope("a", undefined, "2026-05-08T00:00:00.000Z"),
+        kind: "model_request",
+        model: "m",
+        messageCount: 1,
+        toolCount: 0,
+        streaming: false,
+      },
+      {
+        ...envelope("a", undefined, "2026-05-08T00:00:01.000Z"),
+        kind: "model_response",
+        model: "m",
+        stopReason: "end_turn",
+        usage: { input: 10, output: 10 },
+        durationMs: 1000,
+      },
+    ];
+    const setTimeoutCalls: number[] = [];
+    const stubSetTimeout = (cb: () => void, ms: number): void => {
+      setTimeoutCalls.push(ms);
+      cb();
+    };
+    const out: TraceEvent[] = [];
+    for await (const ev of replay(events, { speed: 1, setTimeoutImpl: stubSetTimeout })) {
+      out.push(ev);
+    }
+    expect(out.length).toBe(2);
+    // Second event scheduled with 1000ms gap.
+    expect(setTimeoutCalls).toContain(1000);
+  });
+
+  test("replay raw mode yields immediately (no setTimeout calls)", async () => {
+    const events: TraceEvent[] = [
+      {
+        ...envelope("a", undefined, "2026-05-08T00:00:00.000Z"),
+        kind: "model_request",
+        model: "m",
+        messageCount: 1,
+        toolCount: 0,
+        streaming: false,
+      },
+      {
+        ...envelope("a", undefined, "2026-05-08T01:00:00.000Z"),
+        kind: "model_response",
+        model: "m",
+        stopReason: "end_turn",
+        usage: { input: 10, output: 10 },
+        durationMs: 1000,
+      },
+    ];
+    let calls = 0;
+    const stubSetTimeout = (cb: () => void): void => {
+      calls++;
+      cb();
+    };
+    const out: TraceEvent[] = [];
+    for await (const ev of replay(events, { speed: "raw", setTimeoutImpl: stubSetTimeout })) {
+      out.push(ev);
+    }
+    expect(calls).toBe(0);
+    expect(out.length).toBe(2);
+  });
+
+  test("replay 4× quarters the wait", async () => {
+    const events: TraceEvent[] = [
+      {
+        ...envelope("a", undefined, "2026-05-08T00:00:00.000Z"),
+        kind: "model_request",
+        model: "m",
+        messageCount: 1,
+        toolCount: 0,
+        streaming: false,
+      },
+      {
+        ...envelope("a", undefined, "2026-05-08T00:00:00.400Z"),
+        kind: "model_response",
+        model: "m",
+        stopReason: "end_turn",
+        usage: { input: 10, output: 10 },
+        durationMs: 400,
+      },
+    ];
+    const calls: number[] = [];
+    const stubSetTimeout = (cb: () => void, ms: number): void => {
+      calls.push(ms);
+      cb();
+    };
+    const out: TraceEvent[] = [];
+    for await (const ev of replay(events, { speed: 4, setTimeoutImpl: stubSetTimeout }))
+      out.push(ev);
+    // 400ms gap / 4 = 100ms wait
+    expect(calls).toContain(100);
+  });
+
+  test("drilldownSpan returns the span + related events", () => {
+    const events: TraceEvent[] = [
+      {
+        ...envelope("a", undefined, "2026-05-08T00:00:00.000Z"),
+        kind: "model_request",
+        model: "m",
+        messageCount: 1,
+        toolCount: 0,
+        streaming: false,
+      },
+      {
+        ...envelope("a", undefined, "2026-05-08T00:00:01.000Z"),
+        kind: "model_response",
+        model: "m",
+        stopReason: "end_turn",
+        usage: { input: 10, output: 10 },
+        durationMs: 1000,
+      },
+    ];
+    const tl = buildTimeline(events);
+    const drilldown = drilldownSpan(tl, events, "a");
+    expect(drilldown).toBeDefined();
+    expect(drilldown?.events.length).toBe(2);
+  });
+
+  test("drilldownSpan returns undefined for unknown spanId", () => {
+    const events: TraceEvent[] = [];
+    const tl = buildTimeline(events);
+    expect(drilldownSpan(tl, events, "missing")).toBeUndefined();
   });
 });

@@ -150,7 +150,9 @@ export function renderSvg(layout: Layout): string {
     );
   }
   for (const n of layout.nodes) {
-    lines.push(`  <g transform="translate(${n.x},${n.y})">`);
+    lines.push(
+      `  <g class="node" data-name="${escapeText(n.id)}" transform="translate(${n.x},${n.y})">`,
+    );
     lines.push(`    <circle r="28" fill="#e0eaff" stroke="#5b80c8" stroke-width="2" />`);
     lines.push(
       `    <text x="0" y="4" text-anchor="middle" font-family="sans-serif" font-size="11">${escapeText(n.id)}</text>`,
@@ -163,4 +165,107 @@ export function renderSvg(layout: Layout): string {
 
 function escapeText(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+/**
+ * Section 31 — live mode. Tracks per-node state (idle / running / done /
+ * paused-hitl / errored) so the UI can color nodes in real time as
+ * graph events stream in over SSE.
+ */
+export type NodeState = "idle" | "running" | "done" | "paused-hitl" | "errored";
+
+export type LiveGraphState = {
+  readonly states: Readonly<Record<string, NodeState>>;
+  readonly reasons: Readonly<Record<string, string>>;
+  readonly history: ReadonlyArray<{
+    readonly node: string;
+    readonly state: NodeState;
+    readonly ts: string;
+  }>;
+};
+
+export type LiveGraphEvent =
+  | { readonly kind: "node_start"; readonly node: string; readonly ts: string }
+  | { readonly kind: "node_end"; readonly node: string; readonly ts: string }
+  | {
+      readonly kind: "hitl_pause";
+      readonly node: string;
+      readonly prompt: string;
+      readonly ts: string;
+    }
+  | {
+      readonly kind: "hitl_decision";
+      readonly node: string;
+      readonly decision: "approve" | "reject";
+      readonly ts: string;
+    }
+  | {
+      readonly kind: "node_error";
+      readonly node: string;
+      readonly message: string;
+      readonly ts: string;
+    };
+
+const HISTORY_CAP = 1000;
+
+export function initialLiveState(layout: Layout): LiveGraphState {
+  const states: Record<string, NodeState> = {};
+  for (const node of layout.nodes) {
+    states[node.id] = "idle";
+  }
+  return Object.freeze({
+    states: Object.freeze(states),
+    reasons: Object.freeze({}),
+    history: Object.freeze([]),
+  });
+}
+
+export function applyEvent(state: LiveGraphState, event: LiveGraphEvent): LiveGraphState {
+  const states: Record<string, NodeState> = { ...state.states };
+  const reasons: Record<string, string> = { ...state.reasons };
+  const history = [...state.history];
+  let next: NodeState | undefined;
+  switch (event.kind) {
+    case "node_start":
+      next = "running";
+      break;
+    case "node_end":
+      next = "done";
+      break;
+    case "hitl_pause":
+      next = "paused-hitl";
+      reasons[event.node] = event.prompt;
+      break;
+    case "hitl_decision":
+      next = event.decision === "approve" ? "running" : "errored";
+      reasons[event.node] = `decision: ${event.decision}`;
+      break;
+    case "node_error":
+      next = "errored";
+      reasons[event.node] = event.message;
+      break;
+  }
+  if (next !== undefined) {
+    states[event.node] = next;
+    history.push({ node: event.node, state: next, ts: event.ts });
+    if (history.length > HISTORY_CAP) history.splice(0, history.length - HISTORY_CAP);
+  }
+  return Object.freeze({
+    states: Object.freeze(states),
+    reasons: Object.freeze(reasons),
+    history: Object.freeze(history),
+  });
+}
+
+/**
+ * Render the layout SVG with per-node `data-state` attributes so the
+ * studio-ui can target each node with CSS for live coloring.
+ */
+export function renderLiveSvg(layout: Layout, state: LiveGraphState): string {
+  const base = renderSvg(layout);
+  // Inject data-state attributes on each `<g class="node" data-name="…" …>`.
+  return base.replace(/<g class="node" data-name="([^"]+)"([^>]*)>/g, (_full, name, rest) => {
+    const s = state.states[name] ?? "idle";
+    return `<g class="node" data-name="${name}" data-state="${s}"${rest}>`;
+  });
 }

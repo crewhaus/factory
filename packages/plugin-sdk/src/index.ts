@@ -52,6 +52,28 @@ export type StudioPluginHooks = {
   onEvalSampleRendered?(sample: { id: string; passed: boolean; [k: string]: unknown }): void;
 };
 
+/**
+ * Section 31 — declared permissions schema. Plugins state up-front
+ * exactly which filesystem paths they need to read (relative to their
+ * sandbox root) and which network origins they can fetch. Runtime
+ * enforces the allow-list — any I/O outside the declared scope is
+ * blocked by the sandbox.
+ *
+ * Format:
+ *   fs: ["read:~/.crewhaus/plugins/<self>/data/**", "read:./fixtures/**"]
+ *   net: ["fetch:https://api.example.com/**", "fetch:https://*.example.com/**"]
+ *
+ * Patterns are minimatch-style globs against either filesystem paths
+ * (relative to the plugin's sandbox root) or URL prefixes. The runtime
+ * evaluator (`isFsAllowed` / `isNetAllowed`) is pure-string and
+ * deterministic so callers can audit exactly what each plugin can do
+ * before instantiating its sandbox.
+ */
+export type PluginPermissions = {
+  readonly fs?: ReadonlyArray<string>;
+  readonly net?: ReadonlyArray<string>;
+};
+
 export type StudioPluginDefinition = {
   readonly name: string;
   /** Semver-shaped version string. Studio renders this in the plugins panel. */
@@ -62,6 +84,11 @@ export type StudioPluginDefinition = {
    * Optional one-line description shown in the plugins panel.
    */
   readonly description?: string;
+  /**
+   * Section 31 — declared permissions allow-list. Optional; absent
+   * means "no fs / no net access" (fail-closed).
+   */
+  readonly permissions?: PluginPermissions;
 };
 
 /**
@@ -75,7 +102,6 @@ export function definePlugin(def: StudioPluginDefinition): StudioPluginDefinitio
   if (typeof def.version !== "string" || def.version.length === 0) {
     throw new PluginSdkError("definePlugin: `version` is required");
   }
-  // Pane id uniqueness within the plugin
   const ids = new Set<string>();
   for (const p of def.panes ?? []) {
     if (ids.has(p.id)) {
@@ -83,6 +109,8 @@ export function definePlugin(def: StudioPluginDefinition): StudioPluginDefinitio
     }
     ids.add(p.id);
   }
+  // Section 31 — validate the declared permissions schema.
+  validatePermissions(def.permissions);
   return Object.freeze({ ...def });
 }
 
@@ -111,6 +139,80 @@ export function assertPluginPathsStaySandboxed(
           `plugin "${plugin.name}" pane "${pane.id}" references file:// path outside its sandbox root: ${path}`,
         );
       }
+    }
+  }
+}
+
+/**
+ * Section 31 — content-sandbox runtime checks. The two helpers below
+ * accept a plugin's declared permissions and return whether a given
+ * fs path / network URL is permitted. The runtime caller wires this
+ * into the actual sandbox boundary (Web Worker postMessage gate for UI
+ * plugins, VM2-style realm for server plugins) so attempts to read
+ * `/etc/passwd` or fetch `https://exfil.example.com/...` are blocked
+ * at the sandbox edge.
+ *
+ * Pattern matching:
+ *  - `read:<path-glob>` — matches absolute or sandbox-relative paths.
+ *    Globs use `**` for recursive and `*` for single-segment.
+ *  - `fetch:<url-glob>` — matches request URLs by prefix + glob.
+ *
+ * Empty / undefined permissions = fail-closed (deny all).
+ */
+export function isFsAllowed(perms: PluginPermissions | undefined, path: string): boolean {
+  if (!perms?.fs) return false;
+  const patterns = perms.fs
+    .filter((p) => p.startsWith("read:"))
+    .map((p) => p.slice("read:".length));
+  return patterns.some((pat) => globMatch(pat, path));
+}
+
+export function isNetAllowed(perms: PluginPermissions | undefined, url: string): boolean {
+  if (!perms?.net) return false;
+  const patterns = perms.net
+    .filter((p) => p.startsWith("fetch:"))
+    .map((p) => p.slice("fetch:".length));
+  return patterns.some((pat) => globMatch(pat, url));
+}
+
+/**
+ * Tiny minimatch shim — supports `**` (recursive), `*` (segment), and
+ * literal-character matching. Sufficient for the plugin-permission
+ * use case; for a more sophisticated patterning need we'd swap in
+ * minimatch proper.
+ */
+function globMatch(pattern: string, value: string): boolean {
+  // Convert glob to a regex anchored at start + end.
+  const escaped = pattern
+    .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+    // ** must come BEFORE * — otherwise "*" replaces inside "**" first.
+    .replace(/\*\*/g, "__GLOB_DOUBLE_STAR__")
+    .replace(/\*/g, "[^/]*")
+    .replace(/__GLOB_DOUBLE_STAR__/g, ".*");
+  const re = new RegExp(`^${escaped}$`);
+  return re.test(value);
+}
+
+/**
+ * Section 31 — assert a plugin's declared permissions match the
+ * actually-needed scope. Used at plugin-load time so a plugin that
+ * declares overly broad permissions fails to load.
+ *
+ * v0 just runs structural validation (fs entries start with `read:`,
+ * net entries start with `fetch:`); a follow-up adds policy-engine
+ * integration so admins can refuse plugins whose declared net allow-
+ * list includes broad wildcards.
+ */
+export function validatePermissions(perms: PluginPermissions | undefined): void {
+  if (!perms) return;
+  for (const f of perms.fs ?? []) {
+    if (!f.startsWith("read:")) {
+      throw new PluginSdkError(`fs permission "${f}" must start with "read:"`);
+    }
+  }
+  for (const n of perms.net ?? []) {
+    if (!n.startsWith("fetch:")) {
+      throw new PluginSdkError(`net permission "${n}" must start with "fetch:"`);
     }
   }
 }

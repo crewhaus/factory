@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { IrGraphV0 } from "@crewhaus/ir";
-import { layoutGraph, renderSvg } from "./index.js";
+import { applyEvent, initialLiveState, layoutGraph, renderLiveSvg, renderSvg } from "./index.js";
 
 const baseIr: IrGraphV0 = {
   version: 0,
@@ -103,5 +103,84 @@ describe("renderSvg", () => {
     };
     const svg = renderSvg(layoutGraph(ir));
     expect(svg).toContain("a&lt;b&amp;c");
+  });
+});
+
+describe("graph-visualizer v1 — Section 31 live mode", () => {
+  test("initialLiveState marks every node as idle", () => {
+    const layout = layoutGraph(baseIr);
+    const state = initialLiveState(layout);
+    for (const n of layout.nodes) {
+      expect(state.states[n.id]).toBe("idle");
+    }
+  });
+
+  test("applyEvent transitions: idle → running → done", () => {
+    const layout = layoutGraph(baseIr);
+    let state = initialLiveState(layout);
+    state = applyEvent(state, { kind: "node_start", node: "plan", ts: "2026-05-08T00:00:00Z" });
+    expect(state.states["plan"]).toBe("running");
+    state = applyEvent(state, { kind: "node_end", node: "plan", ts: "2026-05-08T00:00:01Z" });
+    expect(state.states["plan"]).toBe("done");
+  });
+
+  test("hitl_pause + approve resumes running", () => {
+    const layout = layoutGraph(baseIr);
+    let state = initialLiveState(layout);
+    state = applyEvent(state, {
+      kind: "hitl_pause",
+      node: "execute",
+      prompt: "Approve to continue?",
+      ts: "2026-05-08T00:00:01Z",
+    });
+    expect(state.states["execute"]).toBe("paused-hitl");
+    expect(state.reasons["execute"]).toBe("Approve to continue?");
+    state = applyEvent(state, {
+      kind: "hitl_decision",
+      node: "execute",
+      decision: "approve",
+      ts: "2026-05-08T00:00:02Z",
+    });
+    expect(state.states["execute"]).toBe("running");
+  });
+
+  test("hitl reject → errored", () => {
+    const layout = layoutGraph(baseIr);
+    let state = initialLiveState(layout);
+    state = applyEvent(state, {
+      kind: "hitl_pause",
+      node: "execute",
+      prompt: "p",
+      ts: "t1",
+    });
+    state = applyEvent(state, {
+      kind: "hitl_decision",
+      node: "execute",
+      decision: "reject",
+      ts: "t2",
+    });
+    expect(state.states["execute"]).toBe("errored");
+  });
+
+  test("history is bounded at 1000 entries", () => {
+    const layout = layoutGraph(baseIr);
+    let state = initialLiveState(layout);
+    for (let i = 0; i < 1500; i++) {
+      state = applyEvent(state, {
+        kind: "node_start",
+        node: "plan",
+        ts: `2026-05-08T00:00:${(i % 60).toString().padStart(2, "0")}Z`,
+      });
+    }
+    expect(state.history.length).toBe(1000);
+  });
+
+  test("renderLiveSvg adds data-state attributes per node", () => {
+    const layout = layoutGraph(baseIr);
+    let state = initialLiveState(layout);
+    state = applyEvent(state, { kind: "node_start", node: "plan", ts: "t" });
+    const svg = renderLiveSvg(layout, state);
+    expect(svg).toContain('data-state="running"');
+    expect(svg).toContain('data-state="idle"');
   });
 });
