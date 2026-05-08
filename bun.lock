@@ -34,6 +34,7 @@
         "@crewhaus/mcp-host": "workspace:*",
         "@crewhaus/permission-engine": "workspace:*",
         "@crewhaus/runtime-core": "workspace:*",
+        "@crewhaus/secrets-manager": "workspace:*",
         "@crewhaus/skills-registry": "workspace:*",
         "@crewhaus/slash-commands": "workspace:*",
         "@crewhaus/spec": "workspace:*",
@@ -218,6 +219,20 @@
         "@crewhaus/tool-fs": "workspace:*",
       },
     },
+    "examples/section-27-smoke": {
+      "name": "@crewhaus-examples/section-27-smoke",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/adapter-anthropic": "workspace:*",
+        "@crewhaus/audit-log": "workspace:*",
+        "@crewhaus/circuit-breaker": "workspace:*",
+        "@crewhaus/cost-tracker": "workspace:*",
+        "@crewhaus/prompt-cache-manager": "workspace:*",
+        "@crewhaus/rate-limiter": "workspace:*",
+        "@crewhaus/secrets-manager": "workspace:*",
+        "@crewhaus/trace-event-bus": "workspace:*",
+      },
+    },
     "packages/a2a-protocol": {
       "name": "@crewhaus/a2a-protocol",
       "version": "0.0.0",
@@ -347,6 +362,15 @@
         "@crewhaus/errors": "workspace:*",
       },
     },
+    "packages/circuit-breaker": {
+      "name": "@crewhaus/circuit-breaker",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/adapter-anthropic": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/trace-event-bus": "workspace:*",
+      },
+    },
     "packages/citation-tracker": {
       "name": "@crewhaus/citation-tracker",
       "version": "0.0.0",
@@ -402,6 +426,14 @@
       "optionalPeers": [
         "playwright",
       ],
+    },
+    "packages/cost-tracker": {
+      "name": "@crewhaus/cost-tracker",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/logging": "workspace:*",
+        "@crewhaus/trace-event-bus": "workspace:*",
+      },
     },
     "packages/crawler": {
       "name": "@crewhaus/crawler",
@@ -682,6 +714,13 @@
         "@crewhaus/errors": "workspace:*",
       },
     },
+    "packages/prompt-cache-manager": {
+      "name": "@crewhaus/prompt-cache-manager",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/adapter-anthropic": "workspace:*",
+      },
+    },
     "packages/prompt-injection-detector": {
       "name": "@crewhaus/prompt-injection-detector",
       "version": "0.0.0",
@@ -700,6 +739,13 @@
     },
     "packages/queue-protocol": {
       "name": "@crewhaus/queue-protocol",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+      },
+    },
+    "packages/rate-limiter": {
+      "name": "@crewhaus/rate-limiter",
       "version": "0.0.0",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
@@ -736,8 +782,10 @@
         "@crewhaus/abort-controller": "workspace:*",
         "@crewhaus/adapter-anthropic": "workspace:*",
         "@crewhaus/agent-context-isolation": "workspace:*",
+        "@crewhaus/circuit-breaker": "workspace:*",
         "@crewhaus/compaction-autocompact": "workspace:*",
         "@crewhaus/compaction-snip": "workspace:*",
+        "@crewhaus/cost-tracker": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/event-log": "workspace:*",
         "@crewhaus/hooks-engine": "workspace:*",
@@ -745,7 +793,9 @@
         "@crewhaus/model-router": "workspace:*",
         "@crewhaus/otel-exporter": "workspace:*",
         "@crewhaus/permission-engine": "workspace:*",
+        "@crewhaus/prompt-cache-manager": "workspace:*",
         "@crewhaus/prompt-injection-detector": "workspace:*",
+        "@crewhaus/rate-limiter": "workspace:*",
         "@crewhaus/recovery-engine": "workspace:*",
         "@crewhaus/run-context": "workspace:*",
         "@crewhaus/session-store": "workspace:*",
@@ -780,6 +830,15 @@
     "packages/scaffold-templates": {
       "name": "@crewhaus/scaffold-templates",
       "version": "0.0.0",
+    },
+    "packages/secrets-manager": {
+      "name": "@crewhaus/secrets-manager",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/audit-log": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/logging": "workspace:*",
+      },
     },
     "packages/session-store": {
       "name": "@crewhaus/session-store",
@@ -1456,6 +1515,8 @@
 
     "@crewhaus-examples/section-18-smoke": ["@crewhaus-examples/section-18-smoke@workspace:examples/section-18-smoke"],
 
+    "@crewhaus-examples/section-27-smoke": ["@crewhaus-examples/section-27-smoke@workspace:examples/section-27-smoke"],
+
     "@crewhaus/a2a-protocol": ["@crewhaus/a2a-protocol@workspace:packages/a2a-protocol"],
 
     "@crewhaus/abort-controller": ["@crewhaus/abort-controller@workspace:packages/abort-controller"],
@@ -1486,6 +1547,8 @@
 
     "@crewhaus/chunker": ["@crewhaus/chunker@workspace:packages/chunker"],
 
+    "@crewhaus/circuit-breaker": ["@crewhaus/circuit-breaker@workspace:packages/circuit-breaker"],
+
     "@crewhaus/citation-tracker": ["@crewhaus/citation-tracker@workspace:packages/citation-tracker"],
 
     "@crewhaus/cli": ["@crewhaus/cli@workspace:apps/cli"],
@@ -1497,6 +1560,8 @@
     "@crewhaus/compiler": ["@crewhaus/compiler@workspace:packages/compiler"],
 
     "@crewhaus/computer-use-driver": ["@crewhaus/computer-use-driver@workspace:packages/computer-use-driver"],
+
+    "@crewhaus/cost-tracker": ["@crewhaus/cost-tracker@workspace:packages/cost-tracker"],
 
     "@crewhaus/crawler": ["@crewhaus/crawler@workspace:packages/crawler"],
 
@@ -1556,11 +1621,15 @@
 
     "@crewhaus/policy-engine": ["@crewhaus/policy-engine@workspace:packages/policy-engine"],
 
+    "@crewhaus/prompt-cache-manager": ["@crewhaus/prompt-cache-manager@workspace:packages/prompt-cache-manager"],
+
     "@crewhaus/prompt-injection-detector": ["@crewhaus/prompt-injection-detector@workspace:packages/prompt-injection-detector"],
 
     "@crewhaus/queue-consumer": ["@crewhaus/queue-consumer@workspace:packages/queue-consumer"],
 
     "@crewhaus/queue-protocol": ["@crewhaus/queue-protocol@workspace:packages/queue-protocol"],
+
+    "@crewhaus/rate-limiter": ["@crewhaus/rate-limiter@workspace:packages/rate-limiter"],
 
     "@crewhaus/recovery-engine": ["@crewhaus/recovery-engine@workspace:packages/recovery-engine"],
 
@@ -1573,6 +1642,8 @@
     "@crewhaus/sandbox": ["@crewhaus/sandbox@workspace:packages/sandbox"],
 
     "@crewhaus/scaffold-templates": ["@crewhaus/scaffold-templates@workspace:packages/scaffold-templates"],
+
+    "@crewhaus/secrets-manager": ["@crewhaus/secrets-manager@workspace:packages/secrets-manager"],
 
     "@crewhaus/session-store": ["@crewhaus/session-store@workspace:packages/session-store"],
 

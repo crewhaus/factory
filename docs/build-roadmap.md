@@ -1,6 +1,6 @@
 # CrewHaus Factory — Build Roadmap
 
-> Status as of 2026-05-08. 116 of ~190 catalog modules implemented across 111 workspace packages; **Sections 1–26 all complete — all 11 target shapes ship**. Sections 27–31 below cover production hardening (cost / rate limits / cache / secrets), deployment surface (canary + migration), evaluation depth (prompt-optimizer + regression-runner + EVAL target shape), backend adapter completions (queue / vector / telephony / browser host backend), and Studio v1 (Lit + Monaco + live trace replay + plugin sandbox completion).
+> Status as of 2026-05-08. 121 of ~190 catalog modules implemented across 116 workspace packages; **Sections 1–27 all complete — all 11 target shapes ship + production hardening floor (cost-tracker + rate-limiter + circuit-breaker + prompt-cache-manager + secrets-manager) wired into runtime-core/gateway/audit-log**. Sections 28–31 below cover deployment surface (canary + migration), evaluation depth (prompt-optimizer + regression-runner + EVAL target shape), backend adapter completions (queue / vector / telephony / browser host backend), and Studio v1 (Lit + Monaco + live trace replay + plugin sandbox completion).
 > See `docs/MODULE-CATALOG.md` for full per-module specs, test layer references, and the per-row `Depends on` columns + 🔴/🟡 risk markers used throughout this roadmap.
 
 ---
@@ -74,7 +74,7 @@ Tool surface expansion (✅ §14) ──► Observability (✅ §15)
                                             │
                        ┌────────────────────┼────────────────────┐
                        ▼                    ▼                    ▼
-                §27 Production         §28 Deploy +        §29 Eval depth
+                §27 Production (✅)    §28 Deploy +        §29 Eval depth
                 hardening              canary +            + EVAL target
                 (cost-tracker,         migration           (prompt-optimizer,
                 rate-limiter,          (deployment-        regression-runner,
@@ -132,7 +132,7 @@ Tool surface expansion (✅ §14) ──► Observability (✅ §15)
 | **§24 VOICE target shape** | ✅ | §1–7 base runtime; §17 model-router for realtime providers | VOICE shape, telephony/realtime audio agents, OpenAI Realtime + Vapi parity |
 | **§25 BROW target shape** | ✅ | §1–7 base runtime; §18 sandbox for screenshot ops | BROW shape, computer-use agents, Operator-style cross-OS desktop control |
 | **§26 Studio** | ✅ | every prior section's IR variants + trace event kinds | Authoring UI, trace-viewer drilldown, graph visualizer, wizard, plugin SDK, eval-result inspection |
-| **§27 Production hardening** | 🟡 next, parallel with §29 / §30 | §17 (`model-router`), §15 (trace bus for cost telemetry), §20 (gateway-server for per-tenant rate-limit) | §28 (`canary-controller` uses rate-limiter for traffic shaping), production-grade CHN/MGD/RES daemons, multi-tenant rate-limit + cost-budget enforcement |
+| **§27 Production hardening** | ✅ | §17 (`model-router`), §15 (trace bus for cost telemetry), §20 (gateway-server for per-tenant rate-limit) | §28 (`canary-controller` uses rate-limiter for traffic shaping), production-grade CHN/MGD/RES daemons, multi-tenant rate-limit + cost-budget enforcement |
 | **§28 Deployment + canary + migration** | 🟡 sequential after §27 (uses `rate-limiter`) | §27 (`rate-limiter`), §16 (`eval-runner` for canary gate), §10 (event-log for migration replay) | Continuous deployment, deploy-as-eval-gate pattern, multi-version spec rollouts, `web-ui` deploy-button |
 | **§29 Evaluation depth + EVAL target shape** | 🟡 independent | §16 (eval stack), §17 (multi-provider model-router for judge swaps) | EVAL target shape, prompt-optimizer regression CI, dataset/grader plugin ecosystem |
 | **§30 Backend adapter completions** | 🟡 independent | §17 base adapter shapes; §21 vector-store interface; §23 queue-protocol interface; §24 telephony slot; §25 driver interface | Production CHN/MGD/RES/VOICE/BROW deployments without v0 stub limits |
@@ -1664,7 +1664,7 @@ studio-server  ──►  studio-ui  ──►  trace-viewer       (parallel)  �
 
 ## Section 27 — Production hardening
 
-> Status: 🟡 next up. Parallelisable with Section 29 and Section 30. Required prereq for Section 28's canary traffic shaping.
+> Status: ✅ landed (2026-05-08). Five packages shipped: `cost-tracker` (versioned per-provider pricing → `cost_accrual` TraceEvents → `getRunCost(runId)` aggregation), `secrets-manager` (env-var/file/vault backends with `onRotation` callback fan-out and audit-log integration), `prompt-cache-manager` (Anthropic `cache_control` rotation past the 30-day TTL, no-op for automatic/no-cache providers), `rate-limiter` (token-bucket + leaky-bucket multi-dimensional gating with fail-closed unknown-key handling and partial-failure refunds), `circuit-breaker` (closed → open → half_open → closed state machine wrapping the `ProviderAdapter` interface with `circuit_state_changed` TraceEvents). Integrated into `runtime-core` (cost-tracker subscriber via `CREWHAUS_COST_TRACKING=1`; circuit-breaker wraps the resolved adapter when `RunChatLoopOptions.circuitBreaker` is set; prompt-cache-manager runs once before the first stream against an explicit-caching provider; rate-limiter acquires `RunChatLoopOptions.rateLimitKeys` before each model call). Two new audit-kinds (`secrets_access` / `secrets_rotation`) and two new TraceEvent kinds (`cost_accrual` / `circuit_state_changed`) extend §15's bus and §20's audit-log. CLI surfaces: `crewhaus cost-summary --session <id>`, `crewhaus secrets doctor`, `crewhaus secrets rotate <name>`. End-to-end smoke (`bun run smoke:section-27`) drives 5 in-process probes covering each module + its integration; full test suite ~1670 green; lint clean.
 
 **Catalog modules:** `cost-tracker` (R15), `rate-limiter` (R-infra), `circuit-breaker` (R-infra), `prompt-cache-manager` (R6), `secrets-manager` (R-infra)
 

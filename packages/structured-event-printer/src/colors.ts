@@ -30,6 +30,9 @@ const PALETTE: Record<TraceEventKind, string> = {
   handoff: "\x1b[35m", // magenta — peer-coordination hand-off
   a2a_message: "\x1b[95m", // bright magenta
   crew_done: "\x1b[32m", // green — terminal success
+  // Section 27 — production hardening events
+  cost_accrual: "\x1b[2m", // dim — high-volume per-response accruals
+  circuit_state_changed: "\x1b[31m", // red — degradation warnings stand out
 };
 
 export function colorize(kind: TraceEventKind, text: string, useColor: boolean): string {

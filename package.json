@@ -52,7 +52,8 @@
     "compile:hello-browser": "bun apps/cli/src/index.ts compile examples/hello-browser/crewhaus.yaml -o examples/hello-browser/dist",
     "smoke:section-25": "bun scripts/section-25-smoke.ts",
     "studio": "bun scripts/studio-launcher.ts",
-    "smoke:section-26": "bun scripts/section-26-smoke.ts"
+    "smoke:section-26": "bun scripts/section-26-smoke.ts",
+    "smoke:section-27": "bun examples/section-27-smoke/smoke.ts"
   },
   "devDependencies": {
     "@biomejs/biome": "1.9.4",

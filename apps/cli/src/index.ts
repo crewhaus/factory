@@ -102,6 +102,24 @@ const EVAL_REPORT_SCHEMA: ParseArgsSchema = {
   ],
 };
 
+const COST_SUMMARY_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "session", takesValue: true },
+    { name: "tenant", takesValue: true },
+    { name: "format", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
+const SECRETS_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "backend", takesValue: true },
+    { name: "root-dir", takesValue: true },
+    { name: "value", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
 function usage(): never {
   process.stderr.write(
     [
@@ -118,6 +136,9 @@ function usage(): never {
       "       [-o <out-dir>]",
       "  init [name]                          scaffold a new crewhaus.yaml",
       "  doctor                               check environment health",
+      "  cost-summary --session <id>          summarize cost_accrual events for a session",
+      "  secrets doctor                       list known secrets via the configured backend",
+      "  secrets rotate <name> [--value V]    rotate a named secret (file or vault backend)",
       "",
     ].join("\n"),
   );
@@ -657,6 +678,119 @@ async function runEvalReport(args: ParsedArgs): Promise<void> {
   );
 }
 
+/**
+ * Section 27 — `crewhaus cost-summary [--session <id>] [--tenant <id>]
+ * [--format json|text]`. Reads `cost_accrual` events out of an `event-log`
+ * (or aggregates the per-day audit-log records) and prints a USD summary.
+ *
+ * v0 ships with the per-session readout — pass `--session <id>` to read
+ * the JSONL transcript at `.crewhaus/sessions/<id>.jsonl` and aggregate
+ * the cost_accrual events embedded in there. Tenant aggregation lands in
+ * §31's studio-server cost dashboard.
+ */
+async function runCostSummary(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write("usage: crewhaus cost-summary --session <id> [--format json|text]\n");
+    return;
+  }
+  const session = args.flags["session"];
+  const format = args.flags["format"] ?? "text";
+  if (typeof session !== "string") die("missing --session <id>");
+
+  const sessionFile = join(process.cwd(), ".crewhaus", "sessions", `${session}.jsonl`);
+  if (!existsSync(sessionFile)) {
+    die(`session log not found at ${sessionFile}`);
+  }
+  const lines = readFileSync(sessionFile, "utf-8")
+    .split("\n")
+    .filter((l) => l !== "");
+  let totalMicros = 0;
+  const byProvider: Record<string, number> = {};
+  let count = 0;
+  for (const raw of lines) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      continue;
+    }
+    if (
+      parsed &&
+      typeof parsed === "object" &&
+      "kind" in parsed &&
+      (parsed as { kind?: string }).kind === "cost_accrual"
+    ) {
+      const e = parsed as unknown as {
+        provider: string;
+        costUsdMicros: number;
+      };
+      totalMicros += e.costUsdMicros;
+      byProvider[e.provider] = (byProvider[e.provider] ?? 0) + e.costUsdMicros;
+      count++;
+    }
+  }
+  const totalDollars = totalMicros / 1_000_000;
+  if (format === "json") {
+    process.stdout.write(
+      `${JSON.stringify({ session, count, totalUsdMicros: totalMicros, byProvider })}\n`,
+    );
+  } else {
+    process.stdout.write(`session: ${session}\n`);
+    process.stdout.write(`accrual events: ${count}\n`);
+    process.stdout.write(`total: $${totalDollars.toFixed(4)}\n`);
+    for (const [p, m] of Object.entries(byProvider)) {
+      process.stdout.write(`  ${p}: $${(m / 1_000_000).toFixed(4)}\n`);
+    }
+  }
+}
+
+/**
+ * Section 27 — `crewhaus secrets <action> <name> [opts]`. Two actions:
+ *   doctor                 list configured secrets and report missing
+ *   rotate <name>          rotate the named secret (file or vault backends)
+ */
+async function runSecrets(args: ParsedArgs, action: string): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage:\n" +
+        "  crewhaus secrets doctor [--backend env-var|file|vault] [--root-dir <dir>]\n" +
+        "  crewhaus secrets rotate <name> [--value <new-value>] [--backend ...]\n",
+    );
+    return;
+  }
+  const backendIdFlag = args.flags["backend"];
+  const backendId = typeof backendIdFlag === "string" ? backendIdFlag : "env-var";
+  const rootDirFlag = args.flags["root-dir"];
+  const rootDir =
+    typeof rootDirFlag === "string" ? rootDirFlag : join(process.cwd(), ".crewhaus", "secrets");
+  const { createSecrets, createEnvVarBackend, createFileBackend } = await import(
+    "@crewhaus/secrets-manager"
+  );
+  const backend = backendId === "file" ? createFileBackend({ rootDir }) : createEnvVarBackend();
+  const secrets = createSecrets({ backend });
+
+  if (action === "doctor") {
+    const known = (await backend.list?.()) ?? [];
+    process.stdout.write(`backend: ${backend.id}\n`);
+    process.stdout.write(`known: ${known.length} secret(s)\n`);
+    for (const n of known) process.stdout.write(`  - ${n}\n`);
+    return;
+  }
+
+  if (action === "rotate") {
+    const name = args.positional[0];
+    if (typeof name !== "string") die("missing <name>");
+    const value = args.flags["value"];
+    const newValue = await secrets.rotate(name, {
+      ...(typeof value === "string" ? { newValue: value } : {}),
+    });
+    process.stdout.write(`rotated ${name} (${newValue.length} chars) via ${backend.id} backend\n`);
+    return;
+  }
+
+  die(`unknown secrets action "${action}" (expected: doctor | rotate)`);
+}
+
 const argv = process.argv.slice(2);
 const subcommand = argv[0] ?? "";
 const rest = argv.slice(1);
@@ -680,6 +814,17 @@ switch (subcommand) {
   case "doctor":
     runDoctor(parseFor(rest, DOCTOR_SCHEMA));
     break;
+  case "cost-summary":
+    await runCostSummary(parseFor(rest, COST_SUMMARY_SCHEMA));
+    break;
+  case "secrets": {
+    const action = rest[0] ?? "";
+    if (action !== "doctor" && action !== "rotate") {
+      die(`secrets action must be "doctor" or "rotate" (got "${action}")`);
+    }
+    await runSecrets(parseFor(rest.slice(1), SECRETS_SCHEMA), action);
+    break;
+  }
   case "":
   case "-h":
   case "--help":

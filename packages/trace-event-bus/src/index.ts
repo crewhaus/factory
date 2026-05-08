@@ -10,7 +10,9 @@
 
 export type {
   A2AMessageEvent,
+  CircuitStateChangedEvent,
   CompactionFiredEvent,
+  CostAccrualEvent,
   CrewDoneEvent,
   ErrorRecoveredEvent,
   HandoffEvent,
@@ -22,6 +24,7 @@ export type {
   ModelStreamTokenEvent,
   ModelUsage,
   PermissionDecisionEvent,
+  ProviderId,
   PublishOptions,
   RecentQuery,
   RoleEndEvent,

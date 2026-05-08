@@ -35,6 +35,10 @@
     { "path": "../trace-event-bus" },
     { "path": "../structured-event-printer" },
     { "path": "../metrics-collector" },
-    { "path": "../otel-exporter" }
+    { "path": "../otel-exporter" },
+    { "path": "../cost-tracker" },
+    { "path": "../circuit-breaker" },
+    { "path": "../prompt-cache-manager" },
+    { "path": "../rate-limiter" }
   ]
 }

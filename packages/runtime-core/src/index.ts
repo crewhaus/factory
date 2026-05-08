@@ -13,6 +13,7 @@ import type {
   SpawnSubAgentFn,
   SubAgentDefinition,
 } from "@crewhaus/agent-context-isolation";
+import { type WrappedAdapter, wrap as wrapWithCircuitBreaker } from "@crewhaus/circuit-breaker";
 import { autoCompact } from "@crewhaus/compaction-autocompact";
 import { snip } from "@crewhaus/compaction-snip";
 import { RuntimeError } from "@crewhaus/errors";
@@ -26,11 +27,13 @@ import {
   emptyRuleSet,
   evaluateWithReason,
 } from "@crewhaus/permission-engine";
+import { manage as manageCacheMarkers } from "@crewhaus/prompt-cache-manager";
 import {
   buildRedactionNotice,
   classifyText,
   llmClassifierEnabled,
 } from "@crewhaus/prompt-injection-detector";
+import type { RateLimiter } from "@crewhaus/rate-limiter";
 import {
   type RecoveryState,
   advanceState,
@@ -334,6 +337,37 @@ export type RunChatLoopOptions = {
   promptInjectionLlmClassifier?: (
     text: string,
   ) => Promise<{ verdict: "clean" | "suspicious" | "malicious"; rationale?: string } | undefined>;
+  /**
+   * Section 27 — wrap the resolved primary `ProviderAdapter` in a circuit
+   * breaker before any `stream()` call. When the breaker trips, subsequent
+   * model calls reject immediately rather than hammering a degraded
+   * upstream. Set via codegen when the spec lists `circuit_breaker:` opts.
+   */
+  circuitBreaker?: {
+    readonly failureThreshold?: number;
+    readonly windowMs?: number;
+    readonly cooldownMs?: number;
+  };
+  /**
+   * Section 27 — pre-call rate gating. The runtime calls
+   * `rateLimiter.acquire(rateLimitKeys, 1)` before each model invocation.
+   * Codegen sets `rateLimitKeys` to `[provider, tenant?]` from the
+   * spec's tools/permissions/tenancy block. Without `rateLimiter` set,
+   * gating is skipped (no allow-list error).
+   */
+  rateLimiter?: RateLimiter;
+  /** Keys to acquire per model call. Default: `[]`. */
+  rateLimitKeys?: ReadonlyArray<{
+    readonly dimension: "tenant" | "provider" | "tool";
+    readonly id: string;
+  }>;
+  /**
+   * Section 27 — when set, the system block array goes through
+   * `prompt-cache-manager.manage()` once at run start; if a fresh marker is
+   * injected the new `lastRotatedAt` is exposed via the returned bus event.
+   * Pass `0` (or omit) to force a refresh on the first turn.
+   */
+  promptCacheLastRotatedAt?: number;
 };
 
 /**
@@ -357,7 +391,22 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   const primaryResolution = opts._adapter
     ? { adapter: opts._adapter, modelId: opts.model, providerId: opts._adapter.providerId }
     : await resolveModel(opts.model);
-  const adapter: ProviderAdapter = primaryResolution.adapter;
+  // Section 27 — wrap the primary adapter in a circuit breaker when
+  // `circuitBreaker` opts are set (or by default in production codegen).
+  // The breaker is hung off the run-context's bus so state-change events
+  // surface for audit-log + structured-event-printer + OTel.
+  const baseAdapter: ProviderAdapter = primaryResolution.adapter;
+  let breakerWrap: WrappedAdapter | undefined;
+  const adapter: ProviderAdapter = (() => {
+    if (opts.circuitBreaker === undefined) return baseAdapter;
+    breakerWrap = wrapWithCircuitBreaker(baseAdapter, {
+      ...opts.circuitBreaker,
+      adapterName: baseAdapter.providerId,
+      bus: opts.runContext?.eventBus,
+    });
+    return breakerWrap;
+  })();
+  void breakerWrap; // exposed via runtime stats once gateway/eval consumers land
   const providerId: ProviderId = primaryResolution.providerId;
   const wireModelId: string = primaryResolution.modelId;
   let compactionAdapter: ProviderAdapter;
@@ -533,7 +582,35 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // Section 17 — runtime-core no longer prepends the Claude Code OAuth
   // prefix; `adapter-anthropic` handles that internally so each adapter
   // owns its provider-specific auth-shape requirements.
-  const systemBlocks: Anthropic.TextBlockParam[] = [userInstructions, ...skillsBlock];
+  let systemBlocks: Anthropic.TextBlockParam[] = [userInstructions, ...skillsBlock];
+
+  // Section 27 — rotate cache markers on the system block array if the
+  // last refresh is older than the rotation interval. Skips automatically
+  // when the adapter doesn't support explicit caching (OpenAI / Bedrock
+  // Llama / Mistral). This keeps long-running CHN/MGD/RES daemons under
+  // Anthropic's 30-day TTL.
+  if (adapter.features.caching === "explicit") {
+    const cacheManaged = manageCacheMarkers(
+      systemBlocks.map((b) => ({
+        type: "text" as const,
+        text: b.text,
+        ...(b.cache_control !== undefined ? { cache_control: b.cache_control } : {}),
+      })),
+      {
+        features: adapter.features,
+        ...(opts.promptCacheLastRotatedAt !== undefined
+          ? { lastRotatedAt: opts.promptCacheLastRotatedAt }
+          : {}),
+      },
+    );
+    if (cacheManaged.rotated) {
+      systemBlocks = cacheManaged.blocks.map((b) => ({
+        type: "text",
+        text: b.text,
+        ...(b.cache_control !== undefined ? { cache_control: b.cache_control } : {}),
+      })) as Anthropic.TextBlockParam[];
+    }
+  }
 
   const tools = opts.tools ?? [];
   const anthropicTools: Anthropic.Tool[] | undefined =
@@ -985,6 +1062,13 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             break;
           }
           try {
+            // Section 27 — rate-limit the model call before opening the
+            // stream. The keys are caller-configured (typically
+            // `[provider, tenant?]`); a missing bucket fails closed and
+            // surfaces the RateLimitError up to recovery-engine.
+            if (opts.rateLimiter && opts.rateLimitKeys && opts.rateLimitKeys.length > 0) {
+              await opts.rateLimiter.acquire(opts.rateLimitKeys, 1);
+            }
             const modelStartEnv = bus.envelope();
             bus.publish({
               ...modelStartEnv,

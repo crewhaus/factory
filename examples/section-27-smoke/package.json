@@ -1,0 +1,17 @@
+{
+  "name": "@crewhaus-examples/section-27-smoke",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Section 27 production-hardening end-to-end smoke",
+  "dependencies": {
+    "@crewhaus/adapter-anthropic": "workspace:*",
+    "@crewhaus/audit-log": "workspace:*",
+    "@crewhaus/circuit-breaker": "workspace:*",
+    "@crewhaus/cost-tracker": "workspace:*",
+    "@crewhaus/prompt-cache-manager": "workspace:*",
+    "@crewhaus/rate-limiter": "workspace:*",
+    "@crewhaus/secrets-manager": "workspace:*",
+    "@crewhaus/trace-event-bus": "workspace:*"
+  }
+}

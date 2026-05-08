@@ -19,6 +19,7 @@
     { "path": "../../packages/mcp-host" },
     { "path": "../../packages/permission-engine" },
     { "path": "../../packages/runtime-core" },
+    { "path": "../../packages/secrets-manager" },
     { "path": "../../packages/skills-registry" },
     { "path": "../../packages/slash-commands" },
     { "path": "../../packages/spec" },

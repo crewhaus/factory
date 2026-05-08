@@ -15,6 +15,7 @@
  */
 
 export type {
+  CanonicalCacheControl,
   CanonicalContentBlock,
   CanonicalContentBlockParam,
   CanonicalContentDelta,

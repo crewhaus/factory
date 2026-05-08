@@ -46,7 +46,12 @@ export type AuditKind =
   | "tool_classification"
   | "gateway_request"
   | "session_fork"
-  | "tenancy_context";
+  | "tenancy_context"
+  // Section 27 — secrets-manager rotation + access events
+  | "secrets_rotation"
+  | "secrets_access"
+  // Section 28 — deployment-controller actions
+  | "deployment_action";
 
 export type AuditRecord = {
   readonly ts: number;
