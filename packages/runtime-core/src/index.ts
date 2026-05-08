@@ -317,14 +317,30 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // Section 17 — resolve the primary adapter via the model-router.
   // The router lazy-loads the matching provider package; an
   // Anthropic-only spec never pulls AWS / OpenAI / Gemini SDKs.
-  const adapter: ProviderAdapter = opts._adapter ?? (await resolveModel(opts.model)).adapter;
-  const providerId: ProviderId = adapter.providerId;
-  const compactionAdapter: ProviderAdapter =
-    opts._compactionAdapter ??
-    (opts.compactionModel !== undefined
-      ? (await resolveModel(opts.compactionModel)).adapter
-      : adapter);
-  const compactionModel = opts.compactionModel ?? opts.model;
+  // Section 17 — resolve the primary adapter via the model-router and
+  // capture the *stripped* modelId (the form the provider expects, e.g.
+  // `openai/gpt-4o-mini` → `gpt-4o-mini`). When the caller injects an
+  // `_adapter`, default to `opts.model` for the wire model id — tests
+  // typically pass synthetic ids the stub adapter ignores.
+  const primaryResolution = opts._adapter
+    ? { adapter: opts._adapter, modelId: opts.model, providerId: opts._adapter.providerId }
+    : await resolveModel(opts.model);
+  const adapter: ProviderAdapter = primaryResolution.adapter;
+  const providerId: ProviderId = primaryResolution.providerId;
+  const wireModelId: string = primaryResolution.modelId;
+  let compactionAdapter: ProviderAdapter;
+  let compactionWireModelId: string;
+  if (opts._compactionAdapter !== undefined) {
+    compactionAdapter = opts._compactionAdapter;
+    compactionWireModelId = opts.compactionModel ?? wireModelId;
+  } else if (opts.compactionModel !== undefined) {
+    const c = await resolveModel(opts.compactionModel);
+    compactionAdapter = c.adapter;
+    compactionWireModelId = c.modelId;
+  } else {
+    compactionAdapter = adapter;
+    compactionWireModelId = wireModelId;
+  }
   const maxTokens = opts.maxTokens ?? 4096;
 
   // Mutual exclusion: resume takes priority and replaces any seedMessages
@@ -859,7 +875,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             // actually consume (text / image / tool_use / tool_result
             // / thinking).
             const reqStream = adapter.stream({
-              model: opts.model,
+              model: wireModelId,
               system: systemBlocks.map((b) => ({
                 type: "text" as const,
                 text: b.text,
@@ -1101,7 +1117,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               const compacted = await forceCompact({
                 messages,
                 adapter: compactionAdapter,
-                model: compactionModel,
+                model: compactionWireModelId,
                 snipKeepHead,
                 snipKeepTail,
                 logger: runContext.logger,
@@ -1207,7 +1223,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         {
           messages,
           adapter: compactionAdapter,
-          model: compactionModel,
+          model: compactionWireModelId,
           contextLimit,
           compactionThreshold,
           snipKeepHead,
@@ -1398,7 +1414,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         {
           messages,
           adapter: compactionAdapter,
-          model: compactionModel,
+          model: compactionWireModelId,
           contextLimit,
           compactionThreshold,
           snipKeepHead,
