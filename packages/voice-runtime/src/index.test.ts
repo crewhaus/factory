@@ -230,10 +230,50 @@ describe("createRealtimeAdapter dispatch", () => {
   });
 });
 
-describe("createVapiRealtimeAdapter", () => {
-  test("connect throws a clean diagnostic in v0", async () => {
-    const adapter = createVapiRealtimeAdapter({ apiKey: "vapi_test" });
-    await expect(adapter.connect({ model: "m" })).rejects.toThrow(/not implemented in v0/);
+describe("createVapiRealtimeAdapter (Section 30)", () => {
+  test("missing VAPI_API_KEY throws on connect", async () => {
+    const oldKey = process.env["VAPI_API_KEY"];
+    process.env["VAPI_API_KEY"] = undefined;
+    const adapter = createVapiRealtimeAdapter({});
+    await expect(adapter.connect({ model: "m" })).rejects.toThrow(/VAPI_API_KEY/);
+    if (oldKey !== undefined) process.env["VAPI_API_KEY"] = oldKey;
+  });
+
+  test("connect handshake sends session.update and reaches connected=true", async () => {
+    const sentMessages: string[] = [];
+    const stubFactory: WebSocketFactory = (_url, _init) => {
+      const listeners = new Map<string, (ev: unknown) => void>();
+      const ws: WebSocketLike = {
+        readyState: 1,
+        send(data: string | ArrayBuffer): void {
+          if (typeof data === "string") sentMessages.push(data);
+        },
+        close(): void {},
+        addEventListener(type, handler): void {
+          listeners.set(type, handler);
+        },
+      };
+      // Simulate open after one tick.
+      queueMicrotask(() => listeners.get("open")?.({}));
+      return ws;
+    };
+    const adapter = createVapiRealtimeAdapter({
+      apiKey: "vapi_test",
+      assistantId: "asst_123",
+      _ws: stubFactory,
+    });
+    await adapter.connect({ model: "m", instructions: "be brief", voice: "alloy" });
+    expect(adapter.connected).toBe(true);
+    const sessionUpdate = sentMessages.find((m) => m.includes("session.update"));
+    expect(sessionUpdate).toBeDefined();
+    expect(sessionUpdate).toContain("assistant_id");
+    expect(sessionUpdate).toContain("asst_123");
+  });
+
+  test("interrupt is idempotent when not connected", () => {
+    const adapter = createVapiRealtimeAdapter({ apiKey: "k" });
+    adapter.interrupt("user spoke");
+    adapter.interrupt("user spoke again");
   });
 });
 

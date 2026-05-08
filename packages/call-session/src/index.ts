@@ -23,9 +23,19 @@ import { CrewhausError } from "@crewhaus/errors";
 export class CallSessionError extends CrewhausError {
   override readonly name = "CallSessionError";
   constructor(message: string, cause?: unknown) {
-    super("runtime", message, cause);
+    super("config", message, cause);
   }
 }
+
+// Section 30 — additional telephony adapters
+export {
+  createTwilioTelephonyAdapter,
+  type TwilioAdapterOptions,
+} from "./adapters/twilio";
+export {
+  createLiveKitSipAdapter,
+  type LiveKitSipAdapterOptions,
+} from "./adapters/livekit-sip";
 
 export type CallState = "idle" | "dialing" | "connected" | "on-hold" | "transferred" | "terminated";
 

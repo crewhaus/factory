@@ -274,6 +274,17 @@
         "@crewhaus/regression-runner": "workspace:*",
       },
     },
+    "examples/section-30-smoke": {
+      "name": "@crewhaus-examples/section-30-smoke",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/call-session": "workspace:*",
+        "@crewhaus/computer-use-driver": "workspace:*",
+        "@crewhaus/queue-protocol": "workspace:*",
+        "@crewhaus/vector-store": "workspace:*",
+        "@crewhaus/voice-runtime": "workspace:*",
+      },
+    },
     "packages/a2a-protocol": {
       "name": "@crewhaus/a2a-protocol",
       "version": "0.0.0",
@@ -1659,6 +1670,8 @@
     "@crewhaus-examples/section-28-smoke": ["@crewhaus-examples/section-28-smoke@workspace:examples/section-28-smoke"],
 
     "@crewhaus-examples/section-29-smoke": ["@crewhaus-examples/section-29-smoke@workspace:examples/section-29-smoke"],
+
+    "@crewhaus-examples/section-30-smoke": ["@crewhaus-examples/section-30-smoke@workspace:examples/section-30-smoke"],
 
     "@crewhaus/a2a-protocol": ["@crewhaus/a2a-protocol@workspace:packages/a2a-protocol"],
 

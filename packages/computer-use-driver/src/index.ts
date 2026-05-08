@@ -73,10 +73,27 @@ export type CreateDriverOptions = {
 export function createDriver(opts: CreateDriverOptions): Driver {
   if (opts._injected !== undefined) return opts._injected;
   if (opts.backend === "chromium") return createChromiumDriver(opts);
-  if (opts.backend === "host") return createHostDriverStub();
-  if (opts.backend === "remote") return createRemoteDriverStub();
+  if (opts.backend === "host") {
+    // Section 30 — host backend stays gated. Callers that have wired
+    // a real executor use `createHostDriver` directly.
+    return createHostDriverStub();
+  }
+  if (opts.backend === "remote") {
+    // Same pattern: callers with a puppeteer-core import use
+    // `createRemoteDriver` directly.
+    return createRemoteDriverStub();
+  }
   throw new ComputerUseDriverError(`unknown backend: ${opts.backend}`);
 }
+
+// Section 30 — direct exports for callers that wire backends with an
+// executor or puppeteer-core import.
+export { createHostDriver, type HostBackendOptions, type HostExecutor } from "./backends/host";
+export {
+  createRemoteDriver,
+  type PuppeteerCoreLike,
+  type RemoteBackendOptions,
+} from "./backends/remote";
 
 // ---------------------------------------------------------------------------
 // Playwright-backed chromium driver.

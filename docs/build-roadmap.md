@@ -1,6 +1,6 @@
 # CrewHaus Factory — Build Roadmap
 
-> Status as of 2026-05-08. 132 of ~190 catalog modules implemented across 127 workspace packages; **Sections 1–29 all complete — 12 target shapes ship (added EVAL) + production hardening floor + deployment surface + evaluation depth (dataset-registry + grader-registry + regression-runner + prompt-optimizer + target-eval-bundle)**. Sections 30–31 below cover backend adapter completions (queue / vector / telephony / browser host backend) and Studio v1 (Lit + Monaco + live trace replay + plugin sandbox completion).
+> Status as of 2026-05-08. 132 of ~190 catalog modules implemented across 127 workspace packages; **Sections 1–30 all complete — 12 target shapes ship + production hardening floor + deployment surface + evaluation depth + backend adapter completions (Section 30 adds SQS / Redis Streams / Postgres queue adapters; Lance / Qdrant / Pinecone / Weaviate vector backends; Twilio / LiveKit SIP telephony; Vapi realtime; host + remote browser drivers — all with stub-fetch contract tests and fail-loud SDK diagnostics)**. Section 31 below covers Studio v1 (Lit + Monaco + live trace replay + plugin sandbox completion).
 > See `docs/MODULE-CATALOG.md` for full per-module specs, test layer references, and the per-row `Depends on` columns + 🔴/🟡 risk markers used throughout this roadmap.
 
 ---
@@ -135,7 +135,7 @@ Tool surface expansion (✅ §14) ──► Observability (✅ §15)
 | **§27 Production hardening** | ✅ | §17 (`model-router`), §15 (trace bus for cost telemetry), §20 (gateway-server for per-tenant rate-limit) | §28 (`canary-controller` uses rate-limiter for traffic shaping), production-grade CHN/MGD/RES daemons, multi-tenant rate-limit + cost-budget enforcement |
 | **§28 Deployment + canary + migration** | ✅ | §27 (`rate-limiter`), §16 (`eval-runner` for canary gate), §10 (event-log for migration replay) | Continuous deployment, deploy-as-eval-gate pattern, multi-version spec rollouts, `web-ui` deploy-button |
 | **§29 Evaluation depth + EVAL target shape** | ✅ | §16 (eval stack), §17 (multi-provider model-router for judge swaps) | EVAL target shape, prompt-optimizer regression CI, dataset/grader plugin ecosystem |
-| **§30 Backend adapter completions** | 🟡 independent | §17 base adapter shapes; §21 vector-store interface; §23 queue-protocol interface; §24 telephony slot; §25 driver interface | Production CHN/MGD/RES/VOICE/BROW deployments without v0 stub limits |
+| **§30 Backend adapter completions** | ✅ | §17 base adapter shapes; §21 vector-store interface; §23 queue-protocol interface; §24 telephony slot; §25 driver interface | Production CHN/MGD/RES/VOICE/BROW deployments without v0 stub limits |
 | **§31 Studio v1** | 🟡 last; after §27–30 | every prior section's IR / trace / event / metric kinds | Production authoring UI, run replay, multi-spec dashboards, third-party plugin marketplace |
 
 ---
@@ -1846,7 +1846,7 @@ grader-registry                                                target-eval-bundl
 
 ## Section 30 — Backend adapter completions
 
-> Status: 🟡 independent. Can land any time. Best worked as one PR per backend family.
+> Status: ✅ landed (2026-05-08). Six adapter families shipped — all gated on env vars / SDKs in production but with fully-typed abstractions, fetch-stubbed contract tests, and fail-loud diagnostics when SDKs are missing. Queue: `createSqsAdapter` (REST + receipt-handle map), `createRedisStreamsAdapter` (XREADGROUP / XACK / XADD), `createPostgresAdapter` (SELECT FOR UPDATE SKIP LOCKED with advisory locks). Vector: `createLanceVectorStore` (file-backed NDJSON with deterministic L2 ranking — fully exercised), `createQdrantVectorStore` / `createPineconeVectorStore` / `createWeaviateVectorStore` (HTTP REST/GraphQL with stub-fetch contract tests). Embedder: snapshot tests over a 5-text fixture against the mock embedder; production path constructors throw fail-loud when API keys are missing. Telephony: `createTwilioTelephonyAdapter` (REST POST to Calls.json with HTTP Basic auth), `createLiveKitSipAdapter` (LiveKit twirp/livekit.SIP RPC). Realtime: `createVapiRealtimeAdapter` (WebSocket handshake → session.update with assistant_id; mirrors OpenAI Realtime's adapter shape). Browser: `createHostDriver` (gated on `CREWHAUS_BROW_HOST_ENABLED=1` with caller-supplied `HostExecutor`), `createRemoteDriver` (CDP-style WebSocket via puppeteer-core; injectable for tests). Existing `createDriver({ backend: "host" \| "remote" })` factory still returns the stub for backwards compat; production callers use the new direct factories. End-to-end smoke (`bun run smoke:section-30`) drives 6 probes covering every family.
 
 **Catalog modules (extensions to existing packages):** queue adapters (`packages/queue-protocol`), vector backends (`packages/vector-store`), embedder backends (`packages/embedder`), telephony adapters (`packages/call-session`), realtime adapters (`packages/voice-runtime`), browser backends (`packages/computer-use-driver`)
 
