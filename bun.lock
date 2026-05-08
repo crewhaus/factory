@@ -120,6 +120,20 @@
         "@crewhaus/vector-store": "workspace:*",
       },
     },
+    "examples/hello-research": {
+      "name": "@crewhaus-examples/hello-research",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/citation-tracker": "workspace:*",
+        "@crewhaus/crawler": "workspace:*",
+        "@crewhaus/permission-engine": "workspace:*",
+        "@crewhaus/planner": "workspace:*",
+        "@crewhaus/report-writer": "workspace:*",
+        "@crewhaus/run-context": "workspace:*",
+        "@crewhaus/runtime-core": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+      },
+    },
     "examples/hello-workflow": {
       "name": "@crewhaus-examples/hello-workflow",
       "version": "0.0.0",
@@ -279,6 +293,13 @@
         "@crewhaus/errors": "workspace:*",
       },
     },
+    "packages/citation-tracker": {
+      "name": "@crewhaus/citation-tracker",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+      },
+    },
     "packages/compaction-autocompact": {
       "name": "@crewhaus/compaction-autocompact",
       "version": "0.0.0",
@@ -308,7 +329,19 @@
         "@crewhaus/target-graph": "workspace:*",
         "@crewhaus/target-managed": "workspace:*",
         "@crewhaus/target-pipeline": "workspace:*",
+        "@crewhaus/target-research-bundle": "workspace:*",
         "@crewhaus/target-workflow": "workspace:*",
+      },
+    },
+    "packages/crawler": {
+      "name": "@crewhaus/crawler",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/citation-tracker": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "zod": "^3.23.8",
       },
     },
     "packages/crew-orchestrator": {
@@ -541,6 +574,15 @@
         "@crewhaus/errors": "workspace:*",
       },
     },
+    "packages/planner": {
+      "name": "@crewhaus/planner",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/adapter-anthropic": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/model-router": "workspace:*",
+      },
+    },
     "packages/policy-engine": {
       "name": "@crewhaus/policy-engine",
       "version": "0.0.0",
@@ -560,6 +602,14 @@
       "name": "@crewhaus/recovery-engine",
       "version": "0.0.0",
       "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+      },
+    },
+    "packages/report-writer": {
+      "name": "@crewhaus/report-writer",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/citation-tracker": "workspace:*",
         "@crewhaus/errors": "workspace:*",
       },
     },
@@ -772,6 +822,15 @@
     },
     "packages/target-pipeline": {
       "name": "@crewhaus/target-pipeline",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/infra-utils": "workspace:*",
+        "@crewhaus/ir": "workspace:*",
+      },
+    },
+    "packages/target-research-bundle": {
+      "name": "@crewhaus/target-research-bundle",
       "version": "0.0.0",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
@@ -1164,6 +1223,8 @@
 
     "@crewhaus-examples/hello-rag": ["@crewhaus-examples/hello-rag@workspace:examples/hello-rag"],
 
+    "@crewhaus-examples/hello-research": ["@crewhaus-examples/hello-research@workspace:examples/hello-research"],
+
     "@crewhaus-examples/hello-workflow": ["@crewhaus-examples/hello-workflow@workspace:examples/hello-workflow"],
 
     "@crewhaus-examples/mcp-smoke": ["@crewhaus-examples/mcp-smoke@workspace:examples/mcp-smoke"],
@@ -1198,6 +1259,8 @@
 
     "@crewhaus/chunker": ["@crewhaus/chunker@workspace:packages/chunker"],
 
+    "@crewhaus/citation-tracker": ["@crewhaus/citation-tracker@workspace:packages/citation-tracker"],
+
     "@crewhaus/cli": ["@crewhaus/cli@workspace:apps/cli"],
 
     "@crewhaus/compaction-autocompact": ["@crewhaus/compaction-autocompact@workspace:packages/compaction-autocompact"],
@@ -1205,6 +1268,8 @@
     "@crewhaus/compaction-snip": ["@crewhaus/compaction-snip@workspace:packages/compaction-snip"],
 
     "@crewhaus/compiler": ["@crewhaus/compiler@workspace:packages/compiler"],
+
+    "@crewhaus/crawler": ["@crewhaus/crawler@workspace:packages/crawler"],
 
     "@crewhaus/crew-orchestrator": ["@crewhaus/crew-orchestrator@workspace:packages/crew-orchestrator"],
 
@@ -1252,11 +1317,15 @@
 
     "@crewhaus/pipeline-engine": ["@crewhaus/pipeline-engine@workspace:packages/pipeline-engine"],
 
+    "@crewhaus/planner": ["@crewhaus/planner@workspace:packages/planner"],
+
     "@crewhaus/policy-engine": ["@crewhaus/policy-engine@workspace:packages/policy-engine"],
 
     "@crewhaus/prompt-injection-detector": ["@crewhaus/prompt-injection-detector@workspace:packages/prompt-injection-detector"],
 
     "@crewhaus/recovery-engine": ["@crewhaus/recovery-engine@workspace:packages/recovery-engine"],
+
+    "@crewhaus/report-writer": ["@crewhaus/report-writer@workspace:packages/report-writer"],
 
     "@crewhaus/run-context": ["@crewhaus/run-context@workspace:packages/run-context"],
 
@@ -1293,6 +1362,8 @@
     "@crewhaus/target-managed": ["@crewhaus/target-managed@workspace:packages/target-managed"],
 
     "@crewhaus/target-pipeline": ["@crewhaus/target-pipeline@workspace:packages/target-pipeline"],
+
+    "@crewhaus/target-research-bundle": ["@crewhaus/target-research-bundle@workspace:packages/target-research-bundle"],
 
     "@crewhaus/target-workflow": ["@crewhaus/target-workflow@workspace:packages/target-workflow"],
 

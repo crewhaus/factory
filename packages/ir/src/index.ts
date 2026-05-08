@@ -309,6 +309,43 @@ export type IrCrewV0 = {
   readonly compaction: IrCompaction;
 };
 
+/**
+ * Section 23 — RES (autonomous research) IR. The compiled daemon
+ * decomposes `goal` into `branchingFactor` sub-questions, runs each
+ * branch as a single-turn agent loop, and writes a numbered-citation
+ * report. The agent in each branch has the standard tool catalog plus
+ * the auto-injected `Source(uri)` and `CiteFact(uri, snippet, ...)`
+ * tools from `@crewhaus/crawler` + `@crewhaus/citation-tracker`.
+ */
+export type IrResearchV0 = {
+  readonly version: 0;
+  readonly name: string;
+  readonly target: "research";
+  readonly agent: {
+    readonly model: string;
+    readonly instructions: string;
+  };
+  /** Default research goal. The daemon's `--goal "..."` flag overrides. */
+  readonly goal: string;
+  /** How many sub-questions the planner decomposes into per run. */
+  readonly branchingFactor: number;
+  /** Soft per-run wall-clock cap. The daemon emits `[budget exceeded]` and writes a partial report. */
+  readonly maxDurationMs: number;
+  readonly retrieve: {
+    /** http(s) origins the crawler may fetch. Empty array denies all https. */
+    readonly allowedOrigins: readonly string[];
+    /** Absolute file:// roots the crawler may read from. Empty denies all file://. */
+    readonly allowedFileRoots: readonly string[];
+    /** Optional vector backend hint for future RAG-augmented research. */
+    readonly vectorBackend?: "in-memory";
+  };
+  readonly tools: readonly string[];
+  readonly toolConfigs: IrToolConfigs;
+  readonly mcp_servers: IrMcpServers;
+  readonly permissions: IrPermissions;
+  readonly compaction: IrCompaction;
+};
+
 /** Discriminated union over every supported target IR. */
 export type IrNode =
   | IrV0
@@ -317,7 +354,8 @@ export type IrNode =
   | IrGraphV0
   | IrManagedV0
   | IrPipelineV0
-  | IrCrewV0;
+  | IrCrewV0
+  | IrResearchV0;
 
 /**
  * The output of compilation: a set of files to be written to disk by the

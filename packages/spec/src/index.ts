@@ -364,6 +364,40 @@ const crewSchema = z
 // "entry-in-roles" + "non-empty roles" cross-field checks live in
 // `parseSpec` below as a post-parse pass.
 
+// Research target (Section 23 RES). The compiled daemon decomposes
+// `goal` into `branchingFactor` sub-questions, runs one agent loop per
+// branch, and writes a numbered-citation report under
+// `.crewhaus/research/<runId>/`.
+const researchRetrieveSchema = z
+  .object({
+    allowedOrigins: z.array(z.string().min(1)).default([]),
+    allowedFileRoots: z.array(z.string().min(1)).default([]),
+    vectorBackend: z.enum(["in-memory"]).optional(),
+  })
+  .strict();
+
+const researchSchema = z
+  .object({
+    name: z.string().min(1),
+    target: z.literal("research"),
+    agent: z
+      .object({
+        model: z.string().min(1),
+        instructions: z.string().min(1),
+      })
+      .strict(),
+    goal: z.string().min(1),
+    branchingFactor: z.number().int().min(1).max(8).default(3),
+    maxDurationMs: z.number().int().positive().default(300_000),
+    retrieve: researchRetrieveSchema.default({}),
+    tools: z.array(z.string().min(1)).optional(),
+    tool_config: toolConfigBlock,
+    mcp_servers: mcpServersBlock,
+    permissions: permissionsBlock,
+    compaction: compactionBlock,
+  })
+  .strict();
+
 export const Spec = z.discriminatedUnion("target", [
   cliSchema,
   workflowSchema,
@@ -372,6 +406,7 @@ export const Spec = z.discriminatedUnion("target", [
   managedSchema,
   pipelineSchema,
   crewSchema,
+  researchSchema,
 ]);
 
 export type Spec = z.infer<typeof Spec>;
@@ -391,6 +426,8 @@ export type SpecPipelineDocument = z.infer<typeof pipelineDocumentSchema>;
 export type SpecCrew = z.infer<typeof crewSchema>;
 export type SpecCrewRole = z.infer<typeof crewRoleSchema>;
 export type SpecCrewRouting = z.infer<typeof crewRoutingSchema>;
+export type SpecResearch = z.infer<typeof researchSchema>;
+export type SpecResearchRetrieve = z.infer<typeof researchRetrieveSchema>;
 export type SpecMcpServerConfig = z.infer<typeof mcpServerConfigSchema>;
 export type SpecSubAgentDefinition = z.infer<typeof subAgentDefinitionSchema>;
 export type SpecCompactionBlock = z.infer<typeof compactionBlock>;

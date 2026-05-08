@@ -15,6 +15,7 @@
     { "path": "../target-graph" },
     { "path": "../target-managed" },
     { "path": "../target-pipeline" },
+    { "path": "../target-research-bundle" },
     { "path": "../target-workflow" }
   ]
 }

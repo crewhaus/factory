@@ -22,6 +22,7 @@
     "@crewhaus/target-graph": "workspace:*",
     "@crewhaus/target-managed": "workspace:*",
     "@crewhaus/target-pipeline": "workspace:*",
+    "@crewhaus/target-research-bundle": "workspace:*",
     "@crewhaus/target-workflow": "workspace:*"
   }
 }

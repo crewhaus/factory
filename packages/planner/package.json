@@ -1,0 +1,20 @@
+{
+  "name": "@crewhaus/planner",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "LLM-backed goal decomposer for the RES target — checkpointed Plan with sub-questions (Section 23 RES)",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@crewhaus/adapter-anthropic": "workspace:*",
+    "@crewhaus/errors": "workspace:*",
+    "@crewhaus/model-router": "workspace:*"
+  }
+}
