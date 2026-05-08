@@ -1,0 +1,18 @@
+{
+  "name": "@crewhaus/queue-protocol",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Abstract queue interface + in-memory adapter for the BATCH target shape (Section 23 BATCH)",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@crewhaus/errors": "workspace:*"
+  }
+}

@@ -398,6 +398,41 @@ const researchSchema = z
   })
   .strict();
 
+// Batch target (Section 23 BATCH). Queue-worker daemon: pulls jobs
+// from `queue`, runs the agent on each input, dedups via idempotency
+// keys. v0 ships an in-memory adapter for tests + smoke; SQS / Redis
+// Streams / Postgres adapters land in follow-up PRs.
+const batchQueueSchema = z
+  .object({
+    adapter: z.enum(["in-memory", "sqs", "redis-streams", "postgres"]),
+    visibilityTimeoutMs: z.number().int().positive().default(30_000),
+    visibilityRenewIntervalMs: z.number().int().positive().optional(),
+    maxRetries: z.number().int().min(1).max(10).default(3),
+    seedJobs: z.array(z.string().min(1)).optional(),
+  })
+  .strict();
+
+const batchSchema = z
+  .object({
+    name: z.string().min(1),
+    target: z.literal("batch"),
+    agent: z
+      .object({
+        model: z.string().min(1),
+        instructions: z.string().min(1),
+      })
+      .strict(),
+    queue: batchQueueSchema,
+    concurrency: z.number().int().min(1).max(64).default(4),
+    idempotencyWindowMs: z.number().int().positive().default(60_000),
+    tools: z.array(z.string().min(1)).optional(),
+    tool_config: toolConfigBlock,
+    mcp_servers: mcpServersBlock,
+    permissions: permissionsBlock,
+    compaction: compactionBlock,
+  })
+  .strict();
+
 export const Spec = z.discriminatedUnion("target", [
   cliSchema,
   workflowSchema,
@@ -407,6 +442,7 @@ export const Spec = z.discriminatedUnion("target", [
   pipelineSchema,
   crewSchema,
   researchSchema,
+  batchSchema,
 ]);
 
 export type Spec = z.infer<typeof Spec>;
@@ -428,6 +464,8 @@ export type SpecCrewRole = z.infer<typeof crewRoleSchema>;
 export type SpecCrewRouting = z.infer<typeof crewRoutingSchema>;
 export type SpecResearch = z.infer<typeof researchSchema>;
 export type SpecResearchRetrieve = z.infer<typeof researchRetrieveSchema>;
+export type SpecBatch = z.infer<typeof batchSchema>;
+export type SpecBatchQueue = z.infer<typeof batchQueueSchema>;
 export type SpecMcpServerConfig = z.infer<typeof mcpServerConfigSchema>;
 export type SpecSubAgentDefinition = z.infer<typeof subAgentDefinitionSchema>;
 export type SpecCompactionBlock = z.infer<typeof compactionBlock>;

@@ -1,6 +1,7 @@
 import { assertNever } from "@crewhaus/infra-utils";
 import type {
   Bundle,
+  IrBatchV0,
   IrChannelV0,
   IrChannels,
   IrCompaction,
@@ -29,6 +30,7 @@ import {
   type SpecSubAgentDefinition,
   parseSpec,
 } from "@crewhaus/spec";
+import { emitBatchWorker } from "@crewhaus/target-batch-worker";
 import { emitChannelBot } from "@crewhaus/target-channel-bot";
 import { emitCli } from "@crewhaus/target-cli";
 import { emitCrew } from "@crewhaus/target-crew";
@@ -327,6 +329,29 @@ export function lower(spec: Spec): IrNode {
         permissions: lowerPermissions(spec),
         compaction: lowerCompaction(spec),
       } satisfies IrResearchV0;
+    case "batch":
+      return {
+        version: 0,
+        name: spec.name,
+        target: "batch",
+        agent: { model: spec.agent.model, instructions: spec.agent.instructions },
+        queue: {
+          adapter: spec.queue.adapter,
+          visibilityTimeoutMs: spec.queue.visibilityTimeoutMs,
+          ...(spec.queue.visibilityRenewIntervalMs !== undefined
+            ? { visibilityRenewIntervalMs: spec.queue.visibilityRenewIntervalMs }
+            : {}),
+          maxRetries: spec.queue.maxRetries,
+          ...(spec.queue.seedJobs !== undefined ? { seedJobs: [...spec.queue.seedJobs] } : {}),
+        },
+        concurrency: spec.concurrency,
+        idempotencyWindowMs: spec.idempotencyWindowMs,
+        tools: spec.tools ?? [],
+        toolConfigs: lowerToolConfigs(spec.tool_config),
+        mcp_servers: lowerMcpServers(spec.mcp_servers),
+        permissions: lowerPermissions(spec),
+        compaction: lowerCompaction(spec),
+      } satisfies IrBatchV0;
     default:
       return assertNever(spec);
   }
@@ -361,6 +386,8 @@ function emit(ir: IrNode): Bundle {
       return emitCrew(ir);
     case "research":
       return emitResearchBundle(ir);
+    case "batch":
+      return emitBatchWorker(ir);
     default:
       return assertNever(ir);
   }

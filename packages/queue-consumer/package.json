@@ -1,0 +1,20 @@
+{
+  "name": "@crewhaus/queue-consumer",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Long-running consumer loop for the BATCH target — visibility-timeout-aware, SIGTERM-drains (Section 23 BATCH)",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@crewhaus/errors": "workspace:*",
+    "@crewhaus/idempotency-keys": "workspace:*",
+    "@crewhaus/queue-protocol": "workspace:*"
+  }
+}
