@@ -21,7 +21,10 @@ describe("rate-limiter — T1 token-bucket", () => {
     const rl = createRateLimiter({ buckets });
     const t0 = Date.now();
     await rl.acquire([{ dimension: "tenant", id: "t1" }], 5);
-    expect(Date.now() - t0).toBeLessThan(50);
+    // 250 ms threshold: "immediate" relative to the bucket's 1-token-per-second
+    // refill rate, while tolerating CI scheduler jitter (we saw 51 ms flakes
+    // against a 50 ms cap on shared GitHub runners).
+    expect(Date.now() - t0).toBeLessThan(250);
     const inspect = rl.inspect({ dimension: "tenant", id: "t1" });
     expect(inspect?.available).toBeCloseTo(5, 1);
   });
