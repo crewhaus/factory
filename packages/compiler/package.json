@@ -20,6 +20,7 @@
     "@crewhaus/target-cli": "workspace:*",
     "@crewhaus/target-graph": "workspace:*",
     "@crewhaus/target-managed": "workspace:*",
+    "@crewhaus/target-pipeline": "workspace:*",
     "@crewhaus/target-workflow": "workspace:*"
   }
 }

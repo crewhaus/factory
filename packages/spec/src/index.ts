@@ -275,12 +275,53 @@ const managedSchema = z
   })
   .strict();
 
+// Pipeline / RAG target (Section 21). Carries the embedder + vector-store
+// config, an indexing pipeline, and a chat agent that uses Retrieve.
+const pipelineDocumentSchema = z
+  .object({
+    id: z.string().min(1),
+    text: z.string().min(1),
+    metadata: z.record(z.string(), z.unknown()).optional(),
+  })
+  .strict();
+
+const pipelineSchema = z
+  .object({
+    name: z.string().min(1),
+    target: z.literal("pipeline"),
+    agent: z
+      .object({
+        model: z.string().min(1),
+        instructions: z.string().min(1),
+      })
+      .strict(),
+    retrieve: z
+      .object({
+        embedderModel: z.string().min(1),
+        vectorBackend: z.enum(["in-memory"]).default("in-memory"),
+        defaultK: z.number().int().positive().max(50).default(5),
+      })
+      .strict(),
+    indexing: z
+      .object({
+        chunkStrategy: z.enum(["fixed", "semantic", "markdown"]).default("fixed"),
+        chunkSize: z.number().int().positive().default(400),
+        chunkOverlap: z.number().int().nonnegative().default(0),
+        documents: z.array(pipelineDocumentSchema).min(1),
+      })
+      .strict(),
+    permissions: permissionsBlock,
+    compaction: compactionBlock,
+  })
+  .strict();
+
 export const Spec = z.discriminatedUnion("target", [
   cliSchema,
   workflowSchema,
   channelSchema,
   graphSchema,
   managedSchema,
+  pipelineSchema,
 ]);
 
 export type Spec = z.infer<typeof Spec>;
@@ -295,6 +336,8 @@ export type SpecGraphNode = z.infer<typeof graphNodeSchema>;
 export type SpecGraphEdge = z.infer<typeof graphEdgeSchema>;
 export type SpecManaged = z.infer<typeof managedSchema>;
 export type SpecManagedTenant = z.infer<typeof managedTenantSchema>;
+export type SpecPipeline = z.infer<typeof pipelineSchema>;
+export type SpecPipelineDocument = z.infer<typeof pipelineDocumentSchema>;
 export type SpecMcpServerConfig = z.infer<typeof mcpServerConfigSchema>;
 export type SpecSubAgentDefinition = z.infer<typeof subAgentDefinitionSchema>;
 export type SpecCompactionBlock = z.infer<typeof compactionBlock>;

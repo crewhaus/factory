@@ -1,0 +1,20 @@
+{
+  "name": "@crewhaus-examples/hello-rag",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Section 21 RAG target — pipeline bundle with mock embedder + in-memory vector store",
+  "dependencies": {
+    "@crewhaus/chunker": "workspace:*",
+    "@crewhaus/embedder": "workspace:*",
+    "@crewhaus/hooks-engine": "workspace:*",
+    "@crewhaus/permission-engine": "workspace:*",
+    "@crewhaus/pipeline-engine": "workspace:*",
+    "@crewhaus/runtime-core": "workspace:*",
+    "@crewhaus/skills-registry": "workspace:*",
+    "@crewhaus/slash-commands": "workspace:*",
+    "@crewhaus/tool-catalog": "workspace:*",
+    "@crewhaus/tool-retrieve": "workspace:*",
+    "@crewhaus/vector-store": "workspace:*"
+  }
+}

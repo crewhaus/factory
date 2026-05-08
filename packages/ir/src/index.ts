@@ -232,8 +232,42 @@ export type IrGraphV0 = {
   readonly compaction: IrCompaction;
 };
 
+/**
+ * Section 21 — Pipeline / RAG IR. Carries the embedder + vector-store
+ * config + an indexing pipeline (chunker → embed → store) + the agent
+ * block that uses the Retrieve tool.
+ */
+export type IrPipelineDocument = {
+  readonly id: string;
+  readonly text: string;
+  readonly metadata?: Readonly<Record<string, unknown>>;
+};
+
+export type IrPipelineV0 = {
+  readonly version: 0;
+  readonly name: string;
+  readonly target: "pipeline";
+  readonly agent: {
+    readonly model: string;
+    readonly instructions: string;
+  };
+  readonly retrieve: {
+    readonly embedderModel: string;
+    readonly vectorBackend: "in-memory";
+    readonly defaultK: number;
+  };
+  readonly indexing: {
+    readonly chunkStrategy: "fixed" | "semantic" | "markdown";
+    readonly chunkSize: number;
+    readonly chunkOverlap: number;
+    readonly documents: readonly IrPipelineDocument[];
+  };
+  readonly permissions: IrPermissions;
+  readonly compaction: IrCompaction;
+};
+
 /** Discriminated union over every supported target IR. */
-export type IrNode = IrV0 | IrWorkflowV0 | IrChannelV0 | IrGraphV0 | IrManagedV0;
+export type IrNode = IrV0 | IrWorkflowV0 | IrChannelV0 | IrGraphV0 | IrManagedV0 | IrPipelineV0;
 
 /**
  * The output of compilation: a set of files to be written to disk by the
