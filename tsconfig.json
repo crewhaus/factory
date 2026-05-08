@@ -59,6 +59,12 @@
     { "path": "./packages/branch-history" },
     { "path": "./packages/durable-execution" },
     { "path": "./packages/target-graph" },
+    { "path": "./packages/gateway-protocol" },
+    { "path": "./packages/tenancy" },
+    { "path": "./packages/audit-log" },
+    { "path": "./packages/policy-engine" },
+    { "path": "./packages/gateway-server" },
+    { "path": "./packages/target-managed" },
     { "path": "./apps/cli" }
   ]
 }

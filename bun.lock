@@ -81,6 +81,18 @@
         "@crewhaus/runtime-core": "workspace:*",
       },
     },
+    "examples/hello-managed": {
+      "name": "@crewhaus-examples/hello-managed",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/audit-log": "workspace:*",
+        "@crewhaus/gateway-protocol": "workspace:*",
+        "@crewhaus/gateway-server": "workspace:*",
+        "@crewhaus/policy-engine": "workspace:*",
+        "@crewhaus/runtime-core": "workspace:*",
+        "@crewhaus/tenancy": "workspace:*",
+      },
+    },
     "examples/hello-workflow": {
       "name": "@crewhaus-examples/hello-workflow",
       "version": "0.0.0",
@@ -183,6 +195,13 @@
         "@crewhaus/trace-event-bus": "workspace:*",
       },
     },
+    "packages/audit-log": {
+      "name": "@crewhaus/audit-log",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+      },
+    },
     "packages/branch-history": {
       "name": "@crewhaus/branch-history",
       "version": "0.0.0",
@@ -231,6 +250,7 @@
         "@crewhaus/target-channel-bot": "workspace:*",
         "@crewhaus/target-cli": "workspace:*",
         "@crewhaus/target-graph": "workspace:*",
+        "@crewhaus/target-managed": "workspace:*",
         "@crewhaus/target-workflow": "workspace:*",
       },
     },
@@ -332,6 +352,24 @@
         "@crewhaus/errors": "workspace:*",
       },
     },
+    "packages/gateway-protocol": {
+      "name": "@crewhaus/gateway-protocol",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "zod": "^3.23.8",
+      },
+    },
+    "packages/gateway-server": {
+      "name": "@crewhaus/gateway-server",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/audit-log": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/gateway-protocol": "workspace:*",
+        "@crewhaus/tenancy": "workspace:*",
+      },
+    },
     "packages/graph-engine": {
       "name": "@crewhaus/graph-engine",
       "version": "0.0.0",
@@ -408,6 +446,14 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tool-permission-matcher": "workspace:*",
         "zod": "^3.23.8",
+      },
+    },
+    "packages/policy-engine": {
+      "name": "@crewhaus/policy-engine",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/audit-log": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
       },
     },
     "packages/prompt-injection-detector": {
@@ -613,6 +659,15 @@
         "@crewhaus/ir": "workspace:*",
       },
     },
+    "packages/target-managed": {
+      "name": "@crewhaus/target-managed",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/infra-utils": "workspace:*",
+        "@crewhaus/ir": "workspace:*",
+      },
+    },
     "packages/target-workflow": {
       "name": "@crewhaus/target-workflow",
       "version": "0.0.0",
@@ -625,6 +680,13 @@
         "@crewhaus/hooks-engine": "workspace:*",
         "@crewhaus/skills-registry": "workspace:*",
         "@crewhaus/slash-commands": "workspace:*",
+      },
+    },
+    "packages/tenancy": {
+      "name": "@crewhaus/tenancy",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
       },
     },
     "packages/token-budget": {
@@ -966,6 +1028,8 @@
 
     "@crewhaus-examples/hello-graph": ["@crewhaus-examples/hello-graph@workspace:examples/hello-graph"],
 
+    "@crewhaus-examples/hello-managed": ["@crewhaus-examples/hello-managed@workspace:examples/hello-managed"],
+
     "@crewhaus-examples/hello-workflow": ["@crewhaus-examples/hello-workflow@workspace:examples/hello-workflow"],
 
     "@crewhaus-examples/mcp-smoke": ["@crewhaus-examples/mcp-smoke@workspace:examples/mcp-smoke"],
@@ -985,6 +1049,8 @@
     "@crewhaus/adapter-openai": ["@crewhaus/adapter-openai@workspace:packages/adapter-openai"],
 
     "@crewhaus/agent-context-isolation": ["@crewhaus/agent-context-isolation@workspace:packages/agent-context-isolation"],
+
+    "@crewhaus/audit-log": ["@crewhaus/audit-log@workspace:packages/audit-log"],
 
     "@crewhaus/branch-history": ["@crewhaus/branch-history@workspace:packages/branch-history"],
 
@@ -1016,6 +1082,10 @@
 
     "@crewhaus/event-log": ["@crewhaus/event-log@workspace:packages/event-log"],
 
+    "@crewhaus/gateway-protocol": ["@crewhaus/gateway-protocol@workspace:packages/gateway-protocol"],
+
+    "@crewhaus/gateway-server": ["@crewhaus/gateway-server@workspace:packages/gateway-server"],
+
     "@crewhaus/graph-engine": ["@crewhaus/graph-engine@workspace:packages/graph-engine"],
 
     "@crewhaus/hooks-engine": ["@crewhaus/hooks-engine@workspace:packages/hooks-engine"],
@@ -1035,6 +1105,8 @@
     "@crewhaus/otel-exporter": ["@crewhaus/otel-exporter@workspace:packages/otel-exporter"],
 
     "@crewhaus/permission-engine": ["@crewhaus/permission-engine@workspace:packages/permission-engine"],
+
+    "@crewhaus/policy-engine": ["@crewhaus/policy-engine@workspace:packages/policy-engine"],
 
     "@crewhaus/prompt-injection-detector": ["@crewhaus/prompt-injection-detector@workspace:packages/prompt-injection-detector"],
 
@@ -1070,7 +1142,11 @@
 
     "@crewhaus/target-graph": ["@crewhaus/target-graph@workspace:packages/target-graph"],
 
+    "@crewhaus/target-managed": ["@crewhaus/target-managed@workspace:packages/target-managed"],
+
     "@crewhaus/target-workflow": ["@crewhaus/target-workflow@workspace:packages/target-workflow"],
+
+    "@crewhaus/tenancy": ["@crewhaus/tenancy@workspace:packages/tenancy"],
 
     "@crewhaus/token-budget": ["@crewhaus/token-budget@workspace:packages/token-budget"],
 

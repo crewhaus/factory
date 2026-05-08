@@ -1,0 +1,323 @@
+/**
+ * Catalog R16 `gateway-server` — Bun.serve daemon speaking
+ * `@crewhaus/gateway-protocol` over JSON-over-HTTP.
+ *
+ * Auth: HS256 JWT bearer tokens. Token claims must include
+ * `tenant_id`, an `iat` not in the future, and an `exp` in the future.
+ * The signing secret is verified against `opts.jwtSecret`. Tokens are
+ * NEVER minted by the daemon — they're issued by an external IDP and
+ * the daemon only verifies. (For the smoke test we mint with the same
+ * helper for convenience; production has a separate IDP.)
+ *
+ * Per-tenant scoping: every authenticated request runs inside
+ * `withTenant(tenant, ...)` so storage adapters rebase under the
+ * tenant root and cross-tenant reads throw at the storage layer
+ * (defense in depth — `policy-engine` would refuse before that, but
+ * the storage guard is the floor).
+ *
+ * Budget enforcement: each tenant has `budget.maxInputTokens` /
+ * `maxOutputTokens`. The daemon tracks cumulative usage in memory
+ * (file-backed in production) and refuses with `429
+ * budget_exceeded` once the limit is reached. Run handlers report
+ * usage via `recordUsage(tenantId, { input, output })`.
+ *
+ * Layer R16. Pairs with `gateway-protocol`, `tenancy`, `audit-log`.
+ */
+
+import { createHmac, timingSafeEqual } from "node:crypto";
+import { type AppendInput, type AuditLog, openAuditLog } from "@crewhaus/audit-log";
+import { CrewhausError } from "@crewhaus/errors";
+import {
+  ErrorCode,
+  GatewayProtocolError,
+  type MethodT,
+  PROTOCOL_VERSION,
+  decodeRequest,
+  encodeError,
+  encodeSuccess,
+} from "@crewhaus/gateway-protocol";
+import { type Tenant, buildTenant, validateTenantId, withTenant } from "@crewhaus/tenancy";
+
+export class GatewayServerError extends CrewhausError {
+  override readonly name = "GatewayServerError";
+  constructor(message: string, cause?: unknown) {
+    super("config", message, cause);
+  }
+}
+
+export type JwtClaims = {
+  readonly tenant_id: string;
+  readonly iat?: number;
+  readonly exp?: number;
+  readonly sub?: string;
+};
+
+// ---------------------------------------------------------------------------
+// HS256 JWT — minimal verifier and signer (no external deps).
+// ---------------------------------------------------------------------------
+
+function b64urlEncode(input: Uint8Array | string): string {
+  const buf = typeof input === "string" ? Buffer.from(input, "utf8") : Buffer.from(input);
+  return buf.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function b64urlDecode(input: string): Buffer {
+  const padded = input.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((input.length + 3) % 4);
+  return Buffer.from(padded, "base64");
+}
+
+export function signJwt(claims: JwtClaims, secret: string): string {
+  const header = b64urlEncode(JSON.stringify({ alg: "HS256", typ: "JWT" }));
+  const body = b64urlEncode(JSON.stringify(claims));
+  const data = `${header}.${body}`;
+  const sig = createHmac("sha256", secret).update(data).digest();
+  return `${data}.${b64urlEncode(sig)}`;
+}
+
+export function verifyJwt(token: string, secret: string, now: () => number = Date.now): JwtClaims {
+  const parts = token.split(".");
+  if (parts.length !== 3) {
+    throw new GatewayServerError("malformed JWT — expected 3 segments");
+  }
+  const [headerB64, bodyB64, sigB64] = parts as [string, string, string];
+  const data = `${headerB64}.${bodyB64}`;
+  const expected = createHmac("sha256", secret).update(data).digest();
+  let actual: Buffer;
+  try {
+    actual = b64urlDecode(sigB64);
+  } catch (err) {
+    throw new GatewayServerError("malformed JWT signature segment", err);
+  }
+  if (
+    expected.length !== actual.length ||
+    !timingSafeEqual(new Uint8Array(expected), new Uint8Array(actual))
+  ) {
+    throw new GatewayServerError("JWT signature mismatch");
+  }
+  let claims: JwtClaims;
+  try {
+    claims = JSON.parse(b64urlDecode(bodyB64).toString("utf8")) as JwtClaims;
+  } catch (err) {
+    throw new GatewayServerError("malformed JWT body", err);
+  }
+  if (typeof claims.tenant_id !== "string") {
+    throw new GatewayServerError("JWT missing tenant_id claim");
+  }
+  validateTenantId(claims.tenant_id);
+  const nowMs = now();
+  if (claims.exp !== undefined && claims.exp * 1000 < nowMs) {
+    throw new GatewayServerError("JWT expired");
+  }
+  if (claims.iat !== undefined && claims.iat * 1000 > nowMs + 60_000) {
+    throw new GatewayServerError("JWT iat in the future");
+  }
+  return claims;
+}
+
+// ---------------------------------------------------------------------------
+// Server contract.
+// ---------------------------------------------------------------------------
+
+export type RunHandler = (args: {
+  readonly method: MethodT;
+  readonly params: unknown;
+  readonly tenant: Tenant;
+}) => Promise<unknown>;
+
+export type CreateGatewayServerOptions = {
+  readonly jwtSecret: string;
+  readonly tenantsRoot?: string;
+  readonly handler: RunHandler;
+  /**
+   * Optional: pre-built tenants override the default `buildTenant`
+   * (used by tests + the smoke to inject in-memory budgets without
+   * reading them from disk).
+   */
+  readonly tenantOverrides?: Readonly<Record<string, Tenant>>;
+  readonly now?: () => number;
+};
+
+export type UsageDelta = {
+  readonly input: number;
+  readonly output: number;
+};
+
+export interface GatewayServer {
+  /**
+   * Start listening on `port`. Returns the bound port (useful when
+   * caller passed 0 to ask the kernel for a free port).
+   */
+  listen(port: number, host?: string): Promise<{ port: number; close: () => Promise<void> }>;
+  /**
+   * Single-request entrypoint — used by tests to drive the daemon
+   * without HTTP overhead. Verifies `bearer` exactly the same way the
+   * HTTP layer does.
+   */
+  handle(request: { readonly bearer?: string; readonly body: unknown }): Promise<unknown>;
+  /** Record token usage against a tenant's running total. */
+  recordUsage(tenantId: string, delta: UsageDelta): void;
+  /** Read current usage (mostly for tests). */
+  usage(tenantId: string): { input: number; output: number };
+  /** Get or build the audit log for a tenant. Memoised. */
+  getAuditLog(tenant: Tenant): Promise<AuditLog>;
+}
+
+export function createGatewayServer(opts: CreateGatewayServerOptions): GatewayServer {
+  const usageByTenant = new Map<string, { input: number; output: number }>();
+  const auditLogByTenant = new Map<string, AuditLog>();
+  const now = opts.now ?? Date.now;
+
+  function tenantFor(claims: JwtClaims): Tenant {
+    const override = opts.tenantOverrides?.[claims.tenant_id];
+    if (override !== undefined) return override;
+    return buildTenant(claims.tenant_id, {
+      ...(opts.tenantsRoot !== undefined ? { tenantsRoot: opts.tenantsRoot } : {}),
+    });
+  }
+
+  async function getAuditLog(tenant: Tenant): Promise<AuditLog> {
+    const cached = auditLogByTenant.get(tenant.id);
+    if (cached !== undefined) return cached;
+    const log = await openAuditLog({ rootDir: tenant.auditRoot });
+    auditLogByTenant.set(tenant.id, log);
+    return log;
+  }
+
+  function bumpUsage(tenantId: string, delta: UsageDelta): void {
+    const cur = usageByTenant.get(tenantId) ?? { input: 0, output: 0 };
+    usageByTenant.set(tenantId, {
+      input: cur.input + delta.input,
+      output: cur.output + delta.output,
+    });
+  }
+
+  function checkBudget(tenant: Tenant): void {
+    const used = usageByTenant.get(tenant.id) ?? { input: 0, output: 0 };
+    if (used.input >= tenant.budget.maxInputTokens) {
+      throw new GatewayServerError(
+        `budget exceeded: input tokens ${used.input}/${tenant.budget.maxInputTokens}`,
+      );
+    }
+    if (used.output >= tenant.budget.maxOutputTokens) {
+      throw new GatewayServerError(
+        `budget exceeded: output tokens ${used.output}/${tenant.budget.maxOutputTokens}`,
+      );
+    }
+  }
+
+  async function handleEnvelope(envelope: unknown, bearer: string | undefined): Promise<unknown> {
+    let id = "?";
+    try {
+      if (typeof bearer !== "string" || bearer === "") {
+        return encodeError("?", ErrorCode.Unauthorized, "missing bearer token");
+      }
+      const claims = verifyJwt(bearer, opts.jwtSecret, now);
+      const tenant = tenantFor(claims);
+      const decoded = decodeRequest(envelope);
+      id = decoded.id;
+      checkBudget(tenant);
+      // Audit every authenticated gateway request.
+      const log = await getAuditLog(tenant);
+      const requestPayload: AppendInput["payload"] = {
+        method: decoded.method,
+        tenantId: tenant.id,
+        sub: claims.sub,
+      };
+      await log.append({ kind: "gateway_request", payload: requestPayload });
+      const result = await withTenant(tenant, () =>
+        opts.handler({ method: decoded.method, params: decoded.params, tenant }),
+      );
+      return encodeSuccess(id, result);
+    } catch (err) {
+      if (err instanceof GatewayProtocolError) {
+        return encodeError(id, ErrorCode.BadRequest, err.message);
+      }
+      if (err instanceof GatewayServerError) {
+        if (err.message.startsWith("budget exceeded")) {
+          return encodeError(id, ErrorCode.BudgetExceeded, err.message);
+        }
+        // JWT failures and tenant-id failures both map to 401.
+        if (
+          err.message.startsWith("JWT ") ||
+          err.message.startsWith("malformed JWT") ||
+          err.message.startsWith("invalid tenantId")
+        ) {
+          return encodeError(id, ErrorCode.Unauthorized, err.message);
+        }
+        return encodeError(id, ErrorCode.BadRequest, err.message);
+      }
+      // Tenancy validateTenantId throws TenancyError; map to 401.
+      if (err instanceof Error && err.name === "TenancyError") {
+        return encodeError(id, ErrorCode.Unauthorized, err.message);
+      }
+      const msg = err instanceof Error ? err.message : String(err);
+      return encodeError(id, ErrorCode.InternalError, msg);
+    }
+  }
+
+  return {
+    async listen(port, host = "127.0.0.1"): Promise<{ port: number; close: () => Promise<void> }> {
+      const server = Bun.serve({
+        port,
+        hostname: host,
+        fetch: async (req): Promise<Response> => {
+          const auth = req.headers.get("authorization") ?? "";
+          const bearer = auth.startsWith("Bearer ") ? auth.slice(7) : undefined;
+          let body: unknown;
+          try {
+            body = await req.json();
+          } catch {
+            return Response.json(
+              encodeError("?", ErrorCode.BadRequest, "request body must be JSON"),
+              { status: 400 },
+            );
+          }
+          const out = await handleEnvelope(body, bearer);
+          // Map error codes back to HTTP status for ergonomics.
+          const status =
+            out !== null && typeof out === "object" && "error" in out
+              ? statusFor((out as { error: { code: string } }).error.code ?? "")
+              : 200;
+          return Response.json(out, { status });
+        },
+      });
+      return {
+        port: server.port ?? port,
+        async close(): Promise<void> {
+          server.stop();
+        },
+      };
+    },
+    handle(req): Promise<unknown> {
+      return handleEnvelope(req.body, req.bearer);
+    },
+    recordUsage(tenantId, delta): void {
+      bumpUsage(tenantId, delta);
+    },
+    usage(tenantId): { input: number; output: number } {
+      return usageByTenant.get(tenantId) ?? { input: 0, output: 0 };
+    },
+    getAuditLog,
+  };
+}
+
+function statusFor(code: string): number {
+  switch (code) {
+    case ErrorCode.Unauthorized:
+      return 401;
+    case ErrorCode.Forbidden:
+      return 403;
+    case ErrorCode.NotFound:
+      return 404;
+    case ErrorCode.BadRequest:
+      return 400;
+    case ErrorCode.BudgetExceeded:
+      return 429;
+    case ErrorCode.InternalError:
+      return 500;
+    default:
+      return 200;
+  }
+}
+
+export { PROTOCOL_VERSION };

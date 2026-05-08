@@ -1,0 +1,15 @@
+{
+  "name": "@crewhaus-examples/hello-managed",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Section 20 MGD target — managed-daemon bundle with two tenants",
+  "dependencies": {
+    "@crewhaus/audit-log": "workspace:*",
+    "@crewhaus/gateway-protocol": "workspace:*",
+    "@crewhaus/gateway-server": "workspace:*",
+    "@crewhaus/policy-engine": "workspace:*",
+    "@crewhaus/runtime-core": "workspace:*",
+    "@crewhaus/tenancy": "workspace:*"
+  }
+}

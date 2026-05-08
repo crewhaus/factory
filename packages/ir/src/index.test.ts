@@ -168,6 +168,8 @@ describe("IrNode discriminated union narrowing", () => {
           return `channel:${n.routing.sessionKey}`;
         case "graph":
           return `graph:${n.nodes.length}`;
+        case "managed":
+          return `managed:${n.tenants.length}`;
       }
     }
 
