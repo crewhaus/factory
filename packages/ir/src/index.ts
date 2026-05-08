@@ -171,8 +171,42 @@ export type IrChannelV0 = {
   readonly compaction: IrCompaction;
 };
 
+/**
+ * Section 19 — Graph IR. A `target: "graph"` spec lowers into a fixed
+ * set of LLM-backed nodes plus the edges that connect them.
+ */
+export type IrGraphNode = {
+  readonly name: string;
+  readonly instructions: string;
+  /** Resolved at lower-time (node.model ?? graph.model). */
+  readonly model: string;
+  readonly tools: readonly string[];
+  readonly toolConfigs: IrToolConfigs;
+  /**
+   * When set, the node calls `ctx.requestApproval(prompt)` after the
+   * LLM turn and pauses the graph until `resume(checkpointId, decision)`.
+   */
+  readonly hitlPrompt?: string;
+};
+
+export type IrGraphEdge = {
+  readonly from: string;
+  readonly to: string;
+};
+
+export type IrGraphV0 = {
+  readonly version: 0;
+  readonly name: string;
+  readonly target: "graph";
+  readonly entry: string;
+  readonly nodes: readonly IrGraphNode[];
+  readonly edges: readonly IrGraphEdge[];
+  readonly permissions: IrPermissions;
+  readonly compaction: IrCompaction;
+};
+
 /** Discriminated union over every supported target IR. */
-export type IrNode = IrV0 | IrWorkflowV0 | IrChannelV0;
+export type IrNode = IrV0 | IrWorkflowV0 | IrChannelV0 | IrGraphV0;
 
 /**
  * The output of compilation: a set of files to be written to disk by the

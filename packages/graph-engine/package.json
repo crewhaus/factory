@@ -1,0 +1,21 @@
+{
+  "name": "@crewhaus/graph-engine",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Stateful graph runtime: nodes, edges, parallel branches, HITL pauses, checkpoint-store integration",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@crewhaus/checkpoint-store": "workspace:*",
+    "@crewhaus/errors": "workspace:*",
+    "@crewhaus/run-context": "workspace:*",
+    "@crewhaus/trace-event-bus": "workspace:*"
+  }
+}

@@ -198,7 +198,55 @@ const channelSchema = z
   })
   .strict();
 
-export const Spec = z.discriminatedUnion("target", [cliSchema, workflowSchema, channelSchema]);
+// Graph target (Section 19) — stateful DAG runtime. Nodes are LLM-backed
+// invocations; edges link nodes; HITL pauses interrupt the run on
+// `requestApproval()`. Each node may have its own model + tools.
+const graphNodeSchema = z
+  .object({
+    instructions: z.string().min(1),
+    model: z.string().min(1).optional(),
+    tools: z.array(z.string().min(1)).optional(),
+    tool_config: toolConfigBlock,
+    /**
+     * When true, the node calls `ctx.requestApproval(prompt)` before
+     * returning. The engine pauses, persists a checkpoint, and waits for
+     * `resume(checkpointId, decision)` from the operator/CLI.
+     */
+    hitl: z
+      .object({
+        prompt: z.string().min(1),
+      })
+      .strict()
+      .optional(),
+  })
+  .strict();
+
+const graphEdgeSchema = z
+  .object({
+    from: z.string().min(1),
+    to: z.string().min(1),
+  })
+  .strict();
+
+const graphSchema = z
+  .object({
+    name: z.string().min(1),
+    target: z.literal("graph"),
+    model: z.string().min(1),
+    entry: z.string().min(1),
+    nodes: z.record(z.string().min(1), graphNodeSchema),
+    edges: z.array(graphEdgeSchema).default([]),
+    permissions: permissionsBlock,
+    compaction: compactionBlock,
+  })
+  .strict();
+
+export const Spec = z.discriminatedUnion("target", [
+  cliSchema,
+  workflowSchema,
+  channelSchema,
+  graphSchema,
+]);
 
 export type Spec = z.infer<typeof Spec>;
 export type SpecCli = z.infer<typeof cliSchema>;
@@ -207,6 +255,9 @@ export type SpecWorkflowStep = z.infer<typeof workflowStepSchema>;
 export type SpecChannel = z.infer<typeof channelSchema>;
 export type SpecChannelAgent = z.infer<typeof channelAgentSchema>;
 export type SpecSlackChannel = z.infer<typeof slackChannelSchema>;
+export type SpecGraph = z.infer<typeof graphSchema>;
+export type SpecGraphNode = z.infer<typeof graphNodeSchema>;
+export type SpecGraphEdge = z.infer<typeof graphEdgeSchema>;
 export type SpecMcpServerConfig = z.infer<typeof mcpServerConfigSchema>;
 export type SpecSubAgentDefinition = z.infer<typeof subAgentDefinitionSchema>;
 export type SpecCompactionBlock = z.infer<typeof compactionBlock>;

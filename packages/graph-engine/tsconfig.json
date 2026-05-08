@@ -1,0 +1,14 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "references": [
+    { "path": "../checkpoint-store" },
+    { "path": "../errors" },
+    { "path": "../run-context" },
+    { "path": "../trace-event-bus" }
+  ],
+  "include": ["src/**/*"]
+}

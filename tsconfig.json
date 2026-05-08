@@ -54,6 +54,11 @@
     { "path": "./packages/sandbox" },
     { "path": "./packages/prompt-injection-detector" },
     { "path": "./packages/tool-code-execution" },
+    { "path": "./packages/checkpoint-store" },
+    { "path": "./packages/graph-engine" },
+    { "path": "./packages/branch-history" },
+    { "path": "./packages/durable-execution" },
+    { "path": "./packages/target-graph" },
     { "path": "./apps/cli" }
   ]
 }

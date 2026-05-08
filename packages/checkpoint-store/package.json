@@ -1,0 +1,18 @@
+{
+  "name": "@crewhaus/checkpoint-store",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "File-backed checkpoint store for graph-engine — save/load/list/branch over per-graph-run JSON files",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@crewhaus/errors": "workspace:*"
+  }
+}

@@ -1,0 +1,28 @@
+name: hello-graph
+target: graph
+model: claude-sonnet-4-6
+entry: plan
+nodes:
+  plan:
+    instructions: |
+      You are the PLAN node of a 3-node graph (plan → execute → summarise).
+      Read the user's input from the Upstream state and produce a 3-bullet
+      plan for how to address it. Return only the plan, no preamble.
+  execute:
+    instructions: |
+      You are the EXECUTE node. Read the plan from the Upstream state's
+      `plan` field and execute it: produce concrete findings, talking
+      points, or evidence in 4–6 sentences. Stay grounded in the plan;
+      do not free-associate.
+    hitl:
+      prompt: "Approve the plan and continue to execute?"
+  summarise:
+    instructions: |
+      You are the SUMMARISE node. Read the plan and execute results
+      from the Upstream state and produce a 2-sentence executive
+      summary. Do not include lists or bullets — prose only.
+edges:
+  - from: plan
+    to: execute
+  - from: execute
+    to: summarise

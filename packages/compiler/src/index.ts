@@ -4,6 +4,7 @@ import type {
   IrChannelV0,
   IrChannels,
   IrCompaction,
+  IrGraphV0,
   IrMcpServerConfig,
   IrMcpServers,
   IrNode,
@@ -24,6 +25,7 @@ import {
 } from "@crewhaus/spec";
 import { emitChannelBot } from "@crewhaus/target-channel-bot";
 import { emitCli } from "@crewhaus/target-cli";
+import { emitGraph } from "@crewhaus/target-graph";
 import { emitWorkflow } from "@crewhaus/target-workflow";
 
 /**
@@ -211,6 +213,26 @@ export function lower(spec: Spec): IrNode {
         subAgents: lowerSubAgents(spec.agent.sub_agents),
         compaction: lowerCompaction(spec),
       } satisfies IrChannelV0;
+    case "graph":
+      return {
+        version: 0,
+        name: spec.name,
+        target: "graph",
+        entry: spec.entry,
+        // Preserve YAML insertion order — nodes appear in the bundle in
+        // the same order the spec author wrote them.
+        nodes: Object.entries(spec.nodes).map(([name, node]) => ({
+          name,
+          instructions: node.instructions,
+          model: node.model ?? spec.model,
+          tools: node.tools ?? [],
+          toolConfigs: lowerToolConfigs(node.tool_config),
+          ...(node.hitl !== undefined ? { hitlPrompt: node.hitl.prompt } : {}),
+        })),
+        edges: spec.edges.map((e) => ({ from: e.from, to: e.to })),
+        permissions: lowerPermissions(spec),
+        compaction: lowerCompaction(spec),
+      } satisfies IrGraphV0;
     default:
       return assertNever(spec);
   }
@@ -224,6 +246,8 @@ function emit(ir: IrNode): Bundle {
       return emitWorkflow(ir);
     case "channel":
       return emitChannelBot(ir);
+    case "graph":
+      return emitGraph(ir);
     default:
       return assertNever(ir);
   }

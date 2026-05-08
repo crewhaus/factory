@@ -166,6 +166,8 @@ describe("IrNode discriminated union narrowing", () => {
           return `workflow:${n.steps.length}`;
         case "channel":
           return `channel:${n.routing.sessionKey}`;
+        case "graph":
+          return `graph:${n.nodes.length}`;
       }
     }
 
