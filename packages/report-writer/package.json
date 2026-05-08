@@ -1,0 +1,19 @@
+{
+  "name": "@crewhaus/report-writer",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Markdown + JSON report assembly from citations + branch answers (Section 23 RES)",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@crewhaus/citation-tracker": "workspace:*",
+    "@crewhaus/errors": "workspace:*"
+  }
+}

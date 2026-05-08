@@ -13,6 +13,7 @@ import type {
   IrNode,
   IrPermissions,
   IrPipelineV0,
+  IrResearchV0,
   IrSecretRef,
   IrSlackConfig,
   IrSubAgentDefinition,
@@ -34,6 +35,7 @@ import { emitCrew } from "@crewhaus/target-crew";
 import { emitGraph } from "@crewhaus/target-graph";
 import { emitManaged } from "@crewhaus/target-managed";
 import { emitPipeline } from "@crewhaus/target-pipeline";
+import { emitResearchBundle } from "@crewhaus/target-research-bundle";
 import { emitWorkflow } from "@crewhaus/target-workflow";
 
 /**
@@ -303,6 +305,28 @@ export function lower(spec: Spec): IrNode {
         permissions: lowerPermissions(spec),
         compaction: lowerCompaction(spec),
       } satisfies IrCrewV0;
+    case "research":
+      return {
+        version: 0,
+        name: spec.name,
+        target: "research",
+        agent: { model: spec.agent.model, instructions: spec.agent.instructions },
+        goal: spec.goal,
+        branchingFactor: spec.branchingFactor,
+        maxDurationMs: spec.maxDurationMs,
+        retrieve: {
+          allowedOrigins: [...spec.retrieve.allowedOrigins],
+          allowedFileRoots: [...spec.retrieve.allowedFileRoots],
+          ...(spec.retrieve.vectorBackend !== undefined
+            ? { vectorBackend: spec.retrieve.vectorBackend }
+            : {}),
+        },
+        tools: spec.tools ?? [],
+        toolConfigs: lowerToolConfigs(spec.tool_config),
+        mcp_servers: lowerMcpServers(spec.mcp_servers),
+        permissions: lowerPermissions(spec),
+        compaction: lowerCompaction(spec),
+      } satisfies IrResearchV0;
     default:
       return assertNever(spec);
   }
@@ -335,6 +359,8 @@ function emit(ir: IrNode): Bundle {
       return emitPipeline(ir);
     case "crew":
       return emitCrew(ir);
+    case "research":
+      return emitResearchBundle(ir);
     default:
       return assertNever(ir);
   }

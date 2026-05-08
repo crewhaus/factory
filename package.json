@@ -40,7 +40,10 @@
     "smoke:section-21": "bun scripts/section-21-smoke.ts",
     "compile:hello-crew": "bun apps/cli/src/index.ts compile examples/hello-crew/crewhaus.yaml -o examples/hello-crew/dist",
     "run:hello-crew": "bun examples/hello-crew/dist/daemon.ts",
-    "smoke:section-22": "bun scripts/section-22-smoke.ts"
+    "smoke:section-22": "bun scripts/section-22-smoke.ts",
+    "compile:hello-research": "bun apps/cli/src/index.ts compile examples/hello-research/crewhaus.yaml -o examples/hello-research/dist",
+    "run:hello-research": "bun examples/hello-research/dist/agent.ts",
+    "smoke:section-23-res": "bun scripts/section-23-res-smoke.ts"
   },
   "devDependencies": {
     "@biomejs/biome": "1.9.4",

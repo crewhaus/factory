@@ -1,0 +1,31 @@
+name: hello-research
+target: research
+agent:
+  model: claude-haiku-4-5-20251001
+  instructions: |
+    You are an autonomous research agent. You research one sub-question
+    at a time using a small set of local source documents.
+
+    Workflow for EVERY sub-question (do NOT skip any step):
+      1. Load each available file:// source via `Source(uri)`. The
+         daemon prepends the URI list to the user message — use those
+         URIs verbatim. Subsequent calls with the same uri are cached.
+      2. Pick AT MOST 2 short verbatim snippets across all loaded
+         sources that are most relevant. (More than 2 is wasteful;
+         brevity matters more than coverage.)
+      3. Call `CiteFact(uri, snippet, supportingClaim?)` once per
+         snippet — at most 2 calls. Snippet text must be VERBATIM from
+         the loaded body. Keep snippets ≤ 25 words each.
+      4. End your turn with a SINGLE 2–3 sentence answer that uses the
+         cited facts. Don't restate the snippets — paraphrase them.
+goal: |
+  What target shapes does the CrewHaus Factory codebase support?
+  List them, group them by status (shipped vs. planned), and describe
+  each shape's runtime spine in one sentence.
+branchingFactor: 3
+maxDurationMs: 240000
+retrieve:
+  allowedFileRoots:
+    - examples/hello-research/sources
+permissions:
+  mode: default
