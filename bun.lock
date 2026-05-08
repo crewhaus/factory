@@ -147,6 +147,15 @@
         "@crewhaus/tool-catalog": "workspace:*",
       },
     },
+    "examples/hello-voice": {
+      "name": "@crewhaus-examples/hello-voice",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/barge-in-controller": "workspace:*",
+        "@crewhaus/vad-engine": "workspace:*",
+        "@crewhaus/voice-runtime": "workspace:*",
+      },
+    },
     "examples/hello-workflow": {
       "name": "@crewhaus-examples/hello-workflow",
       "version": "0.0.0",
@@ -277,11 +286,26 @@
         "@crewhaus/errors": "workspace:*",
       },
     },
+    "packages/barge-in-controller": {
+      "name": "@crewhaus/barge-in-controller",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/vad-engine": "workspace:*",
+        "@crewhaus/voice-runtime": "workspace:*",
+      },
+    },
     "packages/branch-history": {
       "name": "@crewhaus/branch-history",
       "version": "0.0.0",
       "dependencies": {
         "@crewhaus/checkpoint-store": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
+      },
+    },
+    "packages/call-session": {
+      "name": "@crewhaus/call-session",
+      "version": "0.0.0",
+      "dependencies": {
         "@crewhaus/errors": "workspace:*",
       },
     },
@@ -344,6 +368,7 @@
         "@crewhaus/target-managed": "workspace:*",
         "@crewhaus/target-pipeline": "workspace:*",
         "@crewhaus/target-research-bundle": "workspace:*",
+        "@crewhaus/target-voice": "workspace:*",
         "@crewhaus/target-workflow": "workspace:*",
       },
     },
@@ -884,6 +909,15 @@
         "@crewhaus/ir": "workspace:*",
       },
     },
+    "packages/target-voice": {
+      "name": "@crewhaus/target-voice",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/infra-utils": "workspace:*",
+        "@crewhaus/ir": "workspace:*",
+      },
+    },
     "packages/target-workflow": {
       "name": "@crewhaus/target-workflow",
       "version": "0.0.0",
@@ -1156,8 +1190,19 @@
         "@crewhaus/errors": "workspace:*",
       },
     },
+    "packages/vad-engine": {
+      "name": "@crewhaus/vad-engine",
+      "version": "0.0.0",
+    },
     "packages/vector-store": {
       "name": "@crewhaus/vector-store",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+      },
+    },
+    "packages/voice-runtime": {
+      "name": "@crewhaus/voice-runtime",
       "version": "0.0.0",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
@@ -1273,6 +1318,8 @@
 
     "@crewhaus-examples/hello-research": ["@crewhaus-examples/hello-research@workspace:examples/hello-research"],
 
+    "@crewhaus-examples/hello-voice": ["@crewhaus-examples/hello-voice@workspace:examples/hello-voice"],
+
     "@crewhaus-examples/hello-workflow": ["@crewhaus-examples/hello-workflow@workspace:examples/hello-workflow"],
 
     "@crewhaus-examples/mcp-smoke": ["@crewhaus-examples/mcp-smoke@workspace:examples/mcp-smoke"],
@@ -1299,7 +1346,11 @@
 
     "@crewhaus/audit-log": ["@crewhaus/audit-log@workspace:packages/audit-log"],
 
+    "@crewhaus/barge-in-controller": ["@crewhaus/barge-in-controller@workspace:packages/barge-in-controller"],
+
     "@crewhaus/branch-history": ["@crewhaus/branch-history@workspace:packages/branch-history"],
+
+    "@crewhaus/call-session": ["@crewhaus/call-session@workspace:packages/call-session"],
 
     "@crewhaus/channel-adapter-slack": ["@crewhaus/channel-adapter-slack@workspace:packages/channel-adapter-slack"],
 
@@ -1421,6 +1472,8 @@
 
     "@crewhaus/target-research-bundle": ["@crewhaus/target-research-bundle@workspace:packages/target-research-bundle"],
 
+    "@crewhaus/target-voice": ["@crewhaus/target-voice@workspace:packages/target-voice"],
+
     "@crewhaus/target-workflow": ["@crewhaus/target-workflow@workspace:packages/target-workflow"],
 
     "@crewhaus/tenancy": ["@crewhaus/tenancy@workspace:packages/tenancy"],
@@ -1469,7 +1522,11 @@
 
     "@crewhaus/turn-state-machine": ["@crewhaus/turn-state-machine@workspace:packages/turn-state-machine"],
 
+    "@crewhaus/vad-engine": ["@crewhaus/vad-engine@workspace:packages/vad-engine"],
+
     "@crewhaus/vector-store": ["@crewhaus/vector-store@workspace:packages/vector-store"],
+
+    "@crewhaus/voice-runtime": ["@crewhaus/voice-runtime@workspace:packages/voice-runtime"],
 
     "@google/genai": ["@google/genai@1.52.0", "", { "dependencies": { "google-auth-library": "^10.3.0", "p-retry": "^4.6.2", "protobufjs": "^7.5.4", "ws": "^8.18.0" }, "peerDependencies": { "@modelcontextprotocol/sdk": "^1.25.2" }, "optionalPeers": ["@modelcontextprotocol/sdk"] }, "sha512-gwSvbpiN/17O9TbsqSsE/OzZcpv5Fo4RQjdngGgogtuB9RsyJ8ZHhX5KjHj1bp5N9snN2eK8LDGXSaWW2hof8Q=="],
 

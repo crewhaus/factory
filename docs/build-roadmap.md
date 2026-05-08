@@ -2820,7 +2820,9 @@ Update docs/MODULE-CATALOG.md and docs/build-roadmap.md with everything that is 
 
 ---
 
-### Section 24 — VOICE target shape
+### Section 24 — VOICE target shape ✅ complete (2026-05-08)
+
+> Shipped: `voice-runtime` (RealtimeAdapter + OpenAI Realtime WebSocket adapter + Vapi stub), `vad-engine` (energy + ZCR heuristic), `barge-in-controller` (hysteresis-gated interrupt fire), `call-session` (idle | dialing | connected | on-hold | transferred | terminated state machine + in-memory adapter), `target-voice` (multi-file codegen: agent.ts + voice-loop.ts + daemon.ts). Spec/IR/compiler grew the `target: "voice"` discriminated-union variant. Live-model smoke (against OpenAI Realtime via OPENAI_API_KEY): synthesized "what is the capital of France?" via OpenAI TTS at 24kHz mono, piped through the daemon's `--smoke <pcm>` path, captured `session_created` + `transcript_final` with content containing "paris" + 7 `audio_chunk` events. Call-session state machine drill via the package's unit tests (idle → dialing → connected → terminated). VAPI smoke skipped per kickoff (VAPI_API_KEY unset).
 
 ```
 Read docs/build-roadmap.md Section 24. Also read in full:
