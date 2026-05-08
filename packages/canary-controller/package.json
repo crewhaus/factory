@@ -1,0 +1,21 @@
+{
+  "name": "@crewhaus/canary-controller",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Percent-of-traffic rollout with eval-gated promotion. Hash-routes requests across two pinned versions and auto-rolls-back on regression.",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@crewhaus/audit-log": "workspace:*",
+    "@crewhaus/deployment-controller": "workspace:*",
+    "@crewhaus/errors": "workspace:*",
+    "@crewhaus/spec-registry": "workspace:*"
+  }
+}

@@ -22,7 +22,10 @@
       },
       "dependencies": {
         "@crewhaus/agent-context-isolation": "workspace:*",
+        "@crewhaus/audit-log": "workspace:*",
+        "@crewhaus/canary-controller": "workspace:*",
         "@crewhaus/compiler": "workspace:*",
+        "@crewhaus/deployment-controller": "workspace:*",
         "@crewhaus/eval-dataset": "workspace:*",
         "@crewhaus/eval-grader": "workspace:*",
         "@crewhaus/eval-report": "workspace:*",
@@ -32,12 +35,15 @@
         "@crewhaus/ir": "workspace:*",
         "@crewhaus/logging": "workspace:*",
         "@crewhaus/mcp-host": "workspace:*",
+        "@crewhaus/migration-engine": "workspace:*",
+        "@crewhaus/migration-runner": "workspace:*",
         "@crewhaus/permission-engine": "workspace:*",
         "@crewhaus/runtime-core": "workspace:*",
         "@crewhaus/secrets-manager": "workspace:*",
         "@crewhaus/skills-registry": "workspace:*",
         "@crewhaus/slash-commands": "workspace:*",
         "@crewhaus/spec": "workspace:*",
+        "@crewhaus/spec-registry": "workspace:*",
         "@crewhaus/sub-agent-spawner": "workspace:*",
         "@crewhaus/tool-bash": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
@@ -233,6 +239,20 @@
         "@crewhaus/trace-event-bus": "workspace:*",
       },
     },
+    "examples/section-28-smoke": {
+      "name": "@crewhaus-examples/section-28-smoke",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/audit-log": "workspace:*",
+        "@crewhaus/canary-controller": "workspace:*",
+        "@crewhaus/deployment-controller": "workspace:*",
+        "@crewhaus/ir": "workspace:*",
+        "@crewhaus/ir-passes": "workspace:*",
+        "@crewhaus/migration-engine": "workspace:*",
+        "@crewhaus/migration-runner": "workspace:*",
+        "@crewhaus/spec-registry": "workspace:*",
+      },
+    },
     "packages/a2a-protocol": {
       "name": "@crewhaus/a2a-protocol",
       "version": "0.0.0",
@@ -341,6 +361,16 @@
         "@crewhaus/errors": "workspace:*",
       },
     },
+    "packages/canary-controller": {
+      "name": "@crewhaus/canary-controller",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/audit-log": "workspace:*",
+        "@crewhaus/deployment-controller": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/spec-registry": "workspace:*",
+      },
+    },
     "packages/channel-adapter-slack": {
       "name": "@crewhaus/channel-adapter-slack",
       "version": "0.0.0",
@@ -400,6 +430,7 @@
       "dependencies": {
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
+        "@crewhaus/ir-passes": "workspace:*",
         "@crewhaus/spec": "workspace:*",
         "@crewhaus/target-batch-worker": "workspace:*",
         "@crewhaus/target-browser-driver": "workspace:*",
@@ -466,6 +497,15 @@
         "@crewhaus/adapter-anthropic": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "zod": "^3.23.8",
+      },
+    },
+    "packages/deployment-controller": {
+      "name": "@crewhaus/deployment-controller",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/audit-log": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/spec-registry": "workspace:*",
       },
     },
     "packages/durable-execution": {
@@ -632,6 +672,13 @@
       "name": "@crewhaus/ir",
       "version": "0.0.0",
     },
+    "packages/ir-passes": {
+      "name": "@crewhaus/ir-passes",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/ir": "workspace:*",
+      },
+    },
     "packages/logging": {
       "name": "@crewhaus/logging",
       "version": "0.0.0",
@@ -652,6 +699,23 @@
       "version": "0.0.0",
       "dependencies": {
         "@crewhaus/trace-event-bus": "workspace:*",
+      },
+    },
+    "packages/migration-engine": {
+      "name": "@crewhaus/migration-engine",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+      },
+    },
+    "packages/migration-runner": {
+      "name": "@crewhaus/migration-runner",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/migration-engine": "workspace:*",
+        "@crewhaus/spec-registry": "workspace:*",
+        "yaml": "^2.6.0",
       },
     },
     "packages/model-router": {
@@ -872,6 +936,14 @@
         "@crewhaus/errors": "workspace:*",
         "yaml": "^2.6.0",
         "zod": "^3.23.8",
+      },
+    },
+    "packages/spec-registry": {
+      "name": "@crewhaus/spec-registry",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/spec": "workspace:*",
       },
     },
     "packages/state-store": {
@@ -1517,6 +1589,8 @@
 
     "@crewhaus-examples/section-27-smoke": ["@crewhaus-examples/section-27-smoke@workspace:examples/section-27-smoke"],
 
+    "@crewhaus-examples/section-28-smoke": ["@crewhaus-examples/section-28-smoke@workspace:examples/section-28-smoke"],
+
     "@crewhaus/a2a-protocol": ["@crewhaus/a2a-protocol@workspace:packages/a2a-protocol"],
 
     "@crewhaus/abort-controller": ["@crewhaus/abort-controller@workspace:packages/abort-controller"],
@@ -1540,6 +1614,8 @@
     "@crewhaus/branch-history": ["@crewhaus/branch-history@workspace:packages/branch-history"],
 
     "@crewhaus/call-session": ["@crewhaus/call-session@workspace:packages/call-session"],
+
+    "@crewhaus/canary-controller": ["@crewhaus/canary-controller@workspace:packages/canary-controller"],
 
     "@crewhaus/channel-adapter-slack": ["@crewhaus/channel-adapter-slack@workspace:packages/channel-adapter-slack"],
 
@@ -1566,6 +1642,8 @@
     "@crewhaus/crawler": ["@crewhaus/crawler@workspace:packages/crawler"],
 
     "@crewhaus/crew-orchestrator": ["@crewhaus/crew-orchestrator@workspace:packages/crew-orchestrator"],
+
+    "@crewhaus/deployment-controller": ["@crewhaus/deployment-controller@workspace:packages/deployment-controller"],
 
     "@crewhaus/durable-execution": ["@crewhaus/durable-execution@workspace:packages/durable-execution"],
 
@@ -1601,11 +1679,17 @@
 
     "@crewhaus/ir": ["@crewhaus/ir@workspace:packages/ir"],
 
+    "@crewhaus/ir-passes": ["@crewhaus/ir-passes@workspace:packages/ir-passes"],
+
     "@crewhaus/logging": ["@crewhaus/logging@workspace:packages/logging"],
 
     "@crewhaus/mcp-host": ["@crewhaus/mcp-host@workspace:packages/mcp-host"],
 
     "@crewhaus/metrics-collector": ["@crewhaus/metrics-collector@workspace:packages/metrics-collector"],
+
+    "@crewhaus/migration-engine": ["@crewhaus/migration-engine@workspace:packages/migration-engine"],
+
+    "@crewhaus/migration-runner": ["@crewhaus/migration-runner@workspace:packages/migration-runner"],
 
     "@crewhaus/model-router": ["@crewhaus/model-router@workspace:packages/model-router"],
 
@@ -1652,6 +1736,8 @@
     "@crewhaus/slash-commands": ["@crewhaus/slash-commands@workspace:packages/slash-commands"],
 
     "@crewhaus/spec": ["@crewhaus/spec@workspace:packages/spec"],
+
+    "@crewhaus/spec-registry": ["@crewhaus/spec-registry@workspace:packages/spec-registry"],
 
     "@crewhaus/state-store": ["@crewhaus/state-store@workspace:packages/state-store"],
 

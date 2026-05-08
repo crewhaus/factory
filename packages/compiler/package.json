@@ -15,6 +15,7 @@
   "dependencies": {
     "@crewhaus/infra-utils": "workspace:*",
     "@crewhaus/ir": "workspace:*",
+    "@crewhaus/ir-passes": "workspace:*",
     "@crewhaus/spec": "workspace:*",
     "@crewhaus/target-batch-worker": "workspace:*",
     "@crewhaus/target-browser-driver": "workspace:*",

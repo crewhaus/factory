@@ -1,0 +1,14 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "references": [
+    { "path": "../audit-log" },
+    { "path": "../deployment-controller" },
+    { "path": "../errors" },
+    { "path": "../spec-registry" }
+  ],
+  "include": ["src/**/*"]
+}

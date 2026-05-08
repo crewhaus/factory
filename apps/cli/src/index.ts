@@ -120,6 +120,33 @@ const SECRETS_SCHEMA: ParseArgsSchema = {
   ],
 };
 
+const SPEC_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "root-dir", takesValue: true },
+    { name: "tenant", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
+const DEPLOY_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "root-dir", takesValue: true },
+    { name: "tenant", takesValue: true },
+    { name: "actor", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
+const MIGRATE_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "root-dir", takesValue: true },
+    { name: "from", takesValue: true },
+    { name: "to", takesValue: true },
+    { name: "dry-run" },
+    { name: "help", short: "h" },
+  ],
+};
+
 function usage(): never {
   process.stderr.write(
     [
@@ -139,6 +166,9 @@ function usage(): never {
       "  cost-summary --session <id>          summarize cost_accrual events for a session",
       "  secrets doctor                       list known secrets via the configured backend",
       "  secrets rotate <name> [--value V]    rotate a named secret (file or vault backend)",
+      "  spec put|list|get|pin|alias ...      versioned spec storage (Section 28 spec-registry)",
+      "  deploy promote|rollback ...          re-pin a spec for an environment (Section 28)",
+      "  migrate-all --from N --to N          batch-migrate every spec in the registry",
       "",
     ].join("\n"),
   );
@@ -791,6 +821,199 @@ async function runSecrets(args: ParsedArgs, action: string): Promise<void> {
   die(`unknown secrets action "${action}" (expected: doctor | rotate)`);
 }
 
+/**
+ * Section 28 — `crewhaus spec <action> ...` subcommands wrap the
+ * spec-registry. Actions: put / get / list / pin / alias.
+ */
+async function runSpec(args: ParsedArgs, action: string): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage:\n" +
+        "  crewhaus spec put <name> <version> <spec.yaml> [--root-dir <dir>]\n" +
+        "  crewhaus spec list <name>                                   list versions\n" +
+        "  crewhaus spec get <name> <version>                          print yaml\n" +
+        "  crewhaus spec pin <name> <env> <version> [--tenant <id>]   pin env → version\n" +
+        "  crewhaus spec alias <name> <env> [--tenant <id>]            resolve env → version\n",
+    );
+    return;
+  }
+  const rootDirFlag = args.flags["root-dir"];
+  const rootDir =
+    typeof rootDirFlag === "string" ? rootDirFlag : join(process.cwd(), ".crewhaus", "specs");
+  const { createFileBackedRegistry } = await import("@crewhaus/spec-registry");
+  const reg = createFileBackedRegistry({ rootDir });
+  const tenantFlag = args.flags["tenant"];
+  const tenantId = typeof tenantFlag === "string" ? tenantFlag : undefined;
+
+  if (action === "put") {
+    const name = args.positional[0];
+    const version = args.positional[1];
+    const filePath = args.positional[2];
+    if (typeof name !== "string") die("missing <name>");
+    if (typeof version !== "string") die("missing <version>");
+    if (typeof filePath !== "string") die("missing <spec.yaml>");
+    const yaml = readFileSync(resolve(filePath), "utf-8");
+    await reg.put(name, version, yaml);
+    process.stdout.write(`stored ${name}@${version} (${yaml.length} bytes)\n`);
+    return;
+  }
+  if (action === "list") {
+    const name = args.positional[0];
+    if (typeof name !== "string") die("missing <name>");
+    const versions = await reg.list(name);
+    for (const v of versions) process.stdout.write(`${v}\n`);
+    return;
+  }
+  if (action === "get") {
+    const name = args.positional[0];
+    const version = args.positional[1];
+    if (typeof name !== "string") die("missing <name>");
+    if (typeof version !== "string") die("missing <version>");
+    process.stdout.write(await reg.get(name, version));
+    return;
+  }
+  if (action === "pin") {
+    const name = args.positional[0];
+    const env = args.positional[1];
+    const version = args.positional[2];
+    if (typeof name !== "string") die("missing <name>");
+    if (typeof env !== "string") die("missing <env>");
+    if (typeof version !== "string") die("missing <version>");
+    if (tenantId !== undefined) {
+      await reg.pinForTenant(tenantId, name, env, version);
+      process.stdout.write(`pinned tenant=${tenantId} ${name} ${env} → ${version}\n`);
+    } else {
+      await reg.pin(name, env, version);
+      process.stdout.write(`pinned ${name} ${env} → ${version}\n`);
+    }
+    return;
+  }
+  if (action === "alias") {
+    const name = args.positional[0];
+    const env = args.positional[1];
+    if (typeof name !== "string") die("missing <name>");
+    if (typeof env !== "string") die("missing <env>");
+    const v =
+      tenantId !== undefined
+        ? await reg.aliasForTenant(tenantId, name, env)
+        : await reg.aliasFor(name, env);
+    if (!v) die(`no pin for ${name} ${env}`);
+    process.stdout.write(`${v}\n`);
+    return;
+  }
+  die(`unknown spec action "${action}" (expected: put | list | get | pin | alias)`);
+}
+
+/**
+ * Section 28 — `crewhaus deploy <action> ...` subcommands wrap the
+ * deployment-controller. Actions: promote / rollback.
+ */
+async function runDeploy(args: ParsedArgs, action: string): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage:\n" +
+        "  crewhaus deploy promote <name> <fromEnv> <toEnv>  copy env pin\n" +
+        "  crewhaus deploy rollback <name> <env> <version>   re-pin env to version\n",
+    );
+    return;
+  }
+  const rootDirFlag = args.flags["root-dir"];
+  const rootDir =
+    typeof rootDirFlag === "string" ? rootDirFlag : join(process.cwd(), ".crewhaus", "specs");
+  const auditDir = join(process.cwd(), ".crewhaus", "audit");
+  const { createFileBackedRegistry } = await import("@crewhaus/spec-registry");
+  const { openAuditLog } = await import("@crewhaus/audit-log");
+  const { createDeploymentController } = await import("@crewhaus/deployment-controller");
+  const reg = createFileBackedRegistry({ rootDir });
+  const audit = await openAuditLog({ rootDir: auditDir });
+  const tenantFlag = args.flags["tenant"];
+  const actorFlag = args.flags["actor"];
+  const tenantId = typeof tenantFlag === "string" ? tenantFlag : undefined;
+  const actor = typeof actorFlag === "string" ? actorFlag : undefined;
+  const ctrl = createDeploymentController({
+    registry: reg,
+    auditLog: audit,
+    ...(tenantId !== undefined ? { tenantId } : {}),
+    ...(actor !== undefined ? { actor } : {}),
+  });
+
+  if (action === "promote") {
+    const name = args.positional[0];
+    const fromEnv = args.positional[1];
+    const toEnv = args.positional[2];
+    if (typeof name !== "string") die("missing <name>");
+    if (typeof fromEnv !== "string") die("missing <fromEnv>");
+    if (typeof toEnv !== "string") die("missing <toEnv>");
+    const rec = await ctrl.promote(name, fromEnv, toEnv);
+    process.stdout.write(
+      `promoted ${name} ${fromEnv} → ${toEnv} (now pinned to ${rec.toVersion})\n`,
+    );
+    return;
+  }
+  if (action === "rollback") {
+    const name = args.positional[0];
+    const env = args.positional[1];
+    const version = args.positional[2];
+    if (typeof name !== "string") die("missing <name>");
+    if (typeof env !== "string") die("missing <env>");
+    if (typeof version !== "string") die("missing <version>");
+    const rec = await ctrl.rollback(name, env, version);
+    process.stdout.write(
+      `rolled back ${name} ${env} → ${version} (was ${rec.fromVersion ?? "unset"})\n`,
+    );
+    return;
+  }
+  die(`unknown deploy action "${action}" (expected: promote | rollback)`);
+}
+
+/**
+ * Section 28 — `crewhaus migrate-all --from <ver> --to <ver> [--dry-run]`.
+ * Walks every spec in the registry and applies the migration chain.
+ */
+async function runMigrateAll(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus migrate-all --from <ver> --to <ver> [--dry-run] [--root-dir <dir>]\n",
+    );
+    return;
+  }
+  const fromFlag = args.flags["from"];
+  const toFlag = args.flags["to"];
+  if (typeof fromFlag !== "string") die("missing --from <ver>");
+  if (typeof toFlag !== "string") die("missing --to <ver>");
+  const fromVersion = Number.parseInt(fromFlag, 10);
+  const toVersion = Number.parseInt(toFlag, 10);
+  if (Number.isNaN(fromVersion) || Number.isNaN(toVersion)) {
+    die("--from / --to must be integers");
+  }
+  const rootDirFlag = args.flags["root-dir"];
+  const rootDir =
+    typeof rootDirFlag === "string" ? rootDirFlag : join(process.cwd(), ".crewhaus", "specs");
+  const dryRun = args.flags["dry-run"] === true;
+  const { createFileBackedRegistry } = await import("@crewhaus/spec-registry");
+  const { createDefaultEngine } = await import("@crewhaus/migration-engine");
+  const { migrateAll } = await import("@crewhaus/migration-runner");
+  const result = await migrateAll({
+    registry: createFileBackedRegistry({ rootDir }),
+    engine: createDefaultEngine(),
+    fromVersion,
+    toVersion,
+    dryRun,
+  });
+  for (const item of result.plan) {
+    const arrow = item.newVersion ? ` → ${item.newVersion}` : "";
+    const err = item.error ? `   ERROR: ${item.error}` : "";
+    process.stdout.write(
+      `${item.action.padEnd(15)} ${item.name}@${item.latestVersion}${arrow}${err}\n`,
+    );
+  }
+  const dryNote = dryRun ? " (dry-run)" : "";
+  process.stdout.write(
+    `[migrate-all] migrated=${result.migrated} skipped=${result.skipped} failed=${result.failed}${dryNote}\n`,
+  );
+  if (result.failed > 0) process.exit(1);
+}
+
 const argv = process.argv.slice(2);
 const subcommand = argv[0] ?? "";
 const rest = argv.slice(1);
@@ -825,6 +1048,25 @@ switch (subcommand) {
     await runSecrets(parseFor(rest.slice(1), SECRETS_SCHEMA), action);
     break;
   }
+  case "spec": {
+    const action = rest[0] ?? "";
+    if (!["put", "list", "get", "pin", "alias"].includes(action)) {
+      die(`spec action must be one of: put, list, get, pin, alias (got "${action}")`);
+    }
+    await runSpec(parseFor(rest.slice(1), SPEC_SCHEMA), action);
+    break;
+  }
+  case "deploy": {
+    const action = rest[0] ?? "";
+    if (action !== "promote" && action !== "rollback") {
+      die(`deploy action must be "promote" or "rollback" (got "${action}")`);
+    }
+    await runDeploy(parseFor(rest.slice(1), DEPLOY_SCHEMA), action);
+    break;
+  }
+  case "migrate-all":
+    await runMigrateAll(parseFor(rest, MIGRATE_SCHEMA));
+    break;
   case "":
   case "-h":
   case "--help":
