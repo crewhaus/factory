@@ -1,0 +1,18 @@
+{
+  "name": "@crewhaus/prompt-cache-manager",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Rotates Anthropic-style cache_control markers on the system prompt so long-running daemons stay under the 30-day TTL",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@crewhaus/adapter-anthropic": "workspace:*"
+  }
+}

@@ -228,6 +228,39 @@ export type CrewDoneEvent = TraceEventEnvelope & {
   durationMs: number;
 };
 
+/**
+ * Section 27 — `cost-tracker` emits this once per `model_response` it
+ * observes. `costUsdMicros` is the dollar total in microdollars (1e-6 USD)
+ * derived from the per-provider pricing table; downstream consumers
+ * (`audit-log`, `gateway-server` budgeter, `studio-server` cost dashboard)
+ * read this field for historical reproducibility.
+ */
+export type CostAccrualEvent = TraceEventEnvelope & {
+  kind: "cost_accrual";
+  provider: ProviderId;
+  modelId: string;
+  inputTokens: number;
+  outputTokens: number;
+  cachedReadTokens: number;
+  costUsdMicros: number;
+  tenantId?: string;
+};
+
+/**
+ * Section 27 — `circuit-breaker` emits this on every state transition.
+ * Subscribers (audit-log, OTel exporter, structured-event-printer) can
+ * surface degraded providers without subscribing to the breaker directly.
+ */
+export type CircuitStateChangedEvent = TraceEventEnvelope & {
+  kind: "circuit_state_changed";
+  /** Adapter identifier (e.g. "anthropic", "openai", or a router-key like "anthropic/claude-opus-4-7"). */
+  adapter: string;
+  fromState: "closed" | "open" | "half_open";
+  toState: "closed" | "open" | "half_open";
+  /** Why the breaker tripped or recovered (optional human-readable reason). */
+  reason?: string;
+};
+
 export type TraceEvent =
   | TurnStartEvent
   | TurnEndEvent
@@ -249,7 +282,9 @@ export type TraceEvent =
   | RoleEndEvent
   | HandoffEvent
   | A2AMessageEvent
-  | CrewDoneEvent;
+  | CrewDoneEvent
+  | CostAccrualEvent
+  | CircuitStateChangedEvent;
 
 export type TraceEventKind = TraceEvent["kind"];
 

@@ -1,3 +1,4 @@
+import { type CostTracker, createCostTracker } from "@crewhaus/cost-tracker";
 import {
   type AttachedMetrics,
   attachIfEnvSet as attachMetricsIfEnvSet,
@@ -14,8 +15,9 @@ import {
  *   CREWHAUS_TRACE=pretty|json    → structured-event-printer
  *   CREWHAUS_METRICS=stdout|...   → metrics-collector (buffered stdout JSON / textfile / http)
  *   OTEL_EXPORTER_OTLP_ENDPOINT   → otel-exporter (OTLP/HTTP, gen_ai/* attributes)
+ *   CREWHAUS_COST_TRACKING=1      → cost-tracker (Section 27 — emits cost_accrual events)
  *
- * All three are opt-in. With no env vars set this function returns a no-op
+ * All four are opt-in. With no env vars set this function returns a no-op
  * `flushAll` so observability adds zero output and zero overhead.
  */
 import type { RunContext } from "@crewhaus/run-context";
@@ -29,6 +31,7 @@ export type AttachedSubscribers = {
   printer: AttachedPrinter | undefined;
   metrics: AttachedMetrics | undefined;
   otel: AttachedOtelExporter | undefined;
+  costTracker: CostTracker | undefined;
   flushAll(): Promise<void>;
   shutdownAll(): Promise<void>;
 };
@@ -41,6 +44,14 @@ export async function attachDefaultSubscribers(
   const printer = attachPrinterIfEnvSet(bus, env);
   const metrics = await attachMetricsIfEnvSet(bus, env);
   const otel = attachOtelIfEnvSet(bus, env);
+  const costTracker =
+    env["CREWHAUS_COST_TRACKING"] === "1" || env["CREWHAUS_COST_TRACKING"] === "true"
+      ? createCostTracker(bus, {
+          ...(env["CREWHAUS_TENANT_ID"] !== undefined
+            ? { tenantId: env["CREWHAUS_TENANT_ID"] }
+            : {}),
+        })
+      : undefined;
   const flushAll = async (): Promise<void> => {
     printer?.finalize();
     const tasks: Promise<void>[] = [];
@@ -58,8 +69,9 @@ export async function attachDefaultSubscribers(
     if (otel) {
       await otel.shutdown().catch((err) => logFlushError(runContext, "otel", err));
     }
+    costTracker?.unsubscribe();
   };
-  return { printer, metrics, otel, flushAll, shutdownAll };
+  return { printer, metrics, otel, costTracker, flushAll, shutdownAll };
 }
 
 function logFlushError(runContext: RunContext, name: string, err: unknown): void {

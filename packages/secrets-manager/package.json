@@ -1,0 +1,20 @@
+{
+  "name": "@crewhaus/secrets-manager",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Pluggable secrets backend with rotation + audit-log integration: env-var, file, vault",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@crewhaus/audit-log": "workspace:*",
+    "@crewhaus/errors": "workspace:*",
+    "@crewhaus/logging": "workspace:*"
+  }
+}

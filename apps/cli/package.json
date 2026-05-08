@@ -28,6 +28,7 @@
     "@crewhaus/mcp-host": "workspace:*",
     "@crewhaus/permission-engine": "workspace:*",
     "@crewhaus/runtime-core": "workspace:*",
+    "@crewhaus/secrets-manager": "workspace:*",
     "@crewhaus/skills-registry": "workspace:*",
     "@crewhaus/slash-commands": "workspace:*",
     "@crewhaus/spec": "workspace:*",

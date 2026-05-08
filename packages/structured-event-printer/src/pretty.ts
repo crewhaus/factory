@@ -69,5 +69,13 @@ function formatBody(ev: TraceEvent): string {
       return `from=${ev.from} to=${ev.to} kind=${ev.messageKind} payload=${ev.payloadBytes}B`;
     case "crew_done":
       return `finalRole=${ev.finalRole} activations=${ev.totalActivations} duration=${ev.durationMs.toFixed(0)}ms`;
+    case "cost_accrual": {
+      const t = ev.tenantId !== undefined ? ` tenant=${ev.tenantId}` : "";
+      return `provider=${ev.provider} model=${ev.modelId}${t} in=${ev.inputTokens} out=${ev.outputTokens} cached=${ev.cachedReadTokens} micros=${ev.costUsdMicros}`;
+    }
+    case "circuit_state_changed":
+      return `adapter=${ev.adapter} ${ev.fromState}→${ev.toState}${
+        ev.reason ? ` reason=${ev.reason}` : ""
+      }`;
   }
 }

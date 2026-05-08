@@ -71,6 +71,11 @@
     { "path": "./packages/pipeline-engine" },
     { "path": "./packages/tool-retrieve" },
     { "path": "./packages/target-pipeline" },
+    { "path": "./packages/cost-tracker" },
+    { "path": "./packages/secrets-manager" },
+    { "path": "./packages/prompt-cache-manager" },
+    { "path": "./packages/rate-limiter" },
+    { "path": "./packages/circuit-breaker" },
     { "path": "./apps/cli" }
   ]
 }
