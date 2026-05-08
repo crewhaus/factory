@@ -8,6 +8,7 @@ import type {
   IrCompaction,
   IrCrewRole,
   IrCrewV0,
+  IrEvalV0,
   IrGraphV0,
   IrManagedV0,
   IrMcpServerConfig,
@@ -37,6 +38,7 @@ import { emitBrowserDriver } from "@crewhaus/target-browser-driver";
 import { emitChannelBot } from "@crewhaus/target-channel-bot";
 import { emitCli } from "@crewhaus/target-cli";
 import { emitCrew } from "@crewhaus/target-crew";
+import { emitEval } from "@crewhaus/target-eval-bundle";
 import { emitGraph } from "@crewhaus/target-graph";
 import { emitManaged } from "@crewhaus/target-managed";
 import { emitPipeline } from "@crewhaus/target-pipeline";
@@ -75,12 +77,18 @@ export function compile(yamlText: string, opts: CompileOptions = {}): Bundle {
   return emit(ir);
 }
 
-function lowerPermissions(spec: Spec): IrPermissions {
+type SpecWithPermissions = Exclude<Spec, { target: "eval" }>;
+function lowerPermissions(spec: SpecWithPermissions): IrPermissions {
   const p = spec.permissions;
   if (p === undefined) return { rules: [] };
   return {
     mode: p.mode,
-    rules: (p.rules ?? []).map((r) => ({ type: r.type, pattern: r.pattern })),
+    rules: (p.rules ?? []).map(
+      (r: { type: IrPermissions["rules"][number]["type"]; pattern: string }) => ({
+        type: r.type,
+        pattern: r.pattern,
+      }),
+    ),
   };
 }
 
@@ -186,7 +194,7 @@ function lowerToolConfigs(
  * spec omits the block entirely, the IR carries an empty object — runtime
  * resolves to "use the agent's primary model" in that case.
  */
-function lowerCompaction(spec: Spec): IrCompaction {
+function lowerCompaction(spec: SpecWithPermissions): IrCompaction {
   const c = spec.compaction;
   if (c === undefined) return {};
   return c.model !== undefined ? { model: c.model } : {};
@@ -411,6 +419,28 @@ export function lower(spec: Spec): IrNode {
         permissions: lowerPermissions(spec),
         compaction: lowerCompaction(spec),
       } satisfies IrBrowserV0;
+    case "eval":
+      return {
+        version: 0,
+        name: spec.name,
+        target: "eval",
+        agent: {
+          model: spec.agent.model,
+          instructions: spec.agent.instructions,
+          tools: spec.agent.tools ?? [],
+        },
+        dataset: {
+          name: spec.dataset.name,
+          version: spec.dataset.version,
+          split: spec.dataset.split,
+        },
+        graders: spec.graders.map((g) => ({
+          name: g.name,
+          ...(g.opts !== undefined ? { opts: g.opts } : {}),
+        })),
+        concurrency: spec.concurrency,
+        ...(spec.seed !== undefined ? { seed: spec.seed } : {}),
+      } satisfies IrEvalV0;
     default:
       return assertNever(spec);
   }
@@ -451,6 +481,8 @@ function emit(ir: IrNode): Bundle {
       return emitVoice(ir);
     case "browser":
       return emitBrowserDriver(ir);
+    case "eval":
+      return emitEval(ir);
     default:
       return assertNever(ir);
   }

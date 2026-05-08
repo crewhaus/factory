@@ -1,0 +1,12 @@
+{
+  "name": "@crewhaus-examples/hello-eval",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "First-class EVAL target shape (Section 29)",
+  "dependencies": {
+    "@crewhaus/dataset-registry": "workspace:*",
+    "@crewhaus/eval-grader": "workspace:*",
+    "@crewhaus/eval-runner": "workspace:*"
+  }
+}

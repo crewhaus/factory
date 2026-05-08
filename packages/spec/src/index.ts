@@ -506,6 +506,47 @@ const browserSchema = z
   })
   .strict();
 
+/**
+ * Section 29 — `target: "eval"` — the EVAL target shape. A spec carries an
+ * agent definition, a dataset reference (resolved via §29 dataset-registry),
+ * a list of grader names (resolved via §29 grader-registry), concurrency
+ * and seed knobs. The compiled bundle boots dataset-registry +
+ * grader-registry + eval-runner and writes results to
+ * `.crewhaus/evals/<runId>/`.
+ */
+const evalSchema = z
+  .object({
+    name: z.string().min(1),
+    target: z.literal("eval"),
+    agent: z
+      .object({
+        model: z.string().min(1),
+        instructions: z.string().min(1),
+        tools: z.array(z.string().min(1)).optional(),
+      })
+      .strict(),
+    dataset: z
+      .object({
+        name: z.string().min(1),
+        version: z.string().min(1),
+        split: z.enum(["train", "dev", "test"]).default("dev"),
+      })
+      .strict(),
+    graders: z
+      .array(
+        z
+          .object({
+            name: z.string().min(1),
+            opts: z.record(z.unknown()).optional(),
+          })
+          .strict(),
+      )
+      .min(1),
+    concurrency: z.number().int().min(1).default(4),
+    seed: z.number().int().optional(),
+  })
+  .strict();
+
 export const Spec = z.discriminatedUnion("target", [
   cliSchema,
   workflowSchema,
@@ -518,6 +559,7 @@ export const Spec = z.discriminatedUnion("target", [
   batchSchema,
   voiceSchema,
   browserSchema,
+  evalSchema,
 ]);
 
 export type Spec = z.infer<typeof Spec>;
@@ -546,6 +588,7 @@ export type SpecVoiceBlock = z.infer<typeof voiceBlockSchema>;
 export type SpecVoiceTelephony = z.infer<typeof voiceTelephonySchema>;
 export type SpecBrowser = z.infer<typeof browserSchema>;
 export type SpecBrowserDriver = z.infer<typeof browserDriverSchema>;
+export type SpecEval = z.infer<typeof evalSchema>;
 export type SpecMcpServerConfig = z.infer<typeof mcpServerConfigSchema>;
 export type SpecSubAgentDefinition = z.infer<typeof subAgentDefinitionSchema>;
 export type SpecCompactionBlock = z.infer<typeof compactionBlock>;

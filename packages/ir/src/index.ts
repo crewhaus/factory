@@ -457,6 +457,33 @@ export type IrBrowserV0 = {
 };
 
 /** Discriminated union over every supported target IR. */
+/**
+ * Section 29 — IR for the EVAL target shape. Lowered from the spec's
+ * dataset/graders/concurrency/seed; codegen writes a single-file
+ * `agent.ts` that boots dataset-registry + grader-registry + eval-runner.
+ */
+export type IrEvalV0 = {
+  readonly version: 0;
+  readonly name: string;
+  readonly target: "eval";
+  readonly agent: {
+    readonly model: string;
+    readonly instructions: string;
+    readonly tools: readonly string[];
+  };
+  readonly dataset: {
+    readonly name: string;
+    readonly version: string;
+    readonly split: "train" | "dev" | "test";
+  };
+  readonly graders: readonly {
+    readonly name: string;
+    readonly opts?: Readonly<Record<string, unknown>>;
+  }[];
+  readonly concurrency: number;
+  readonly seed?: number;
+};
+
 export type IrNode =
   | IrV0
   | IrWorkflowV0
@@ -468,7 +495,8 @@ export type IrNode =
   | IrResearchV0
   | IrBatchV0
   | IrVoiceV0
-  | IrBrowserV0;
+  | IrBrowserV0
+  | IrEvalV0;
 
 /**
  * The output of compilation: a set of files to be written to disk by the

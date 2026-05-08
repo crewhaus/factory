@@ -1,0 +1,98 @@
+/**
+ * Section 29 — `target-eval-bundle` tests:
+ *  - T1 generated bundle structure
+ *  - T3 compile + run EVAL target end-to-end (via spec → ir → emit)
+ */
+import { describe, expect, test } from "bun:test";
+import type { IrEvalV0 } from "@crewhaus/ir";
+import { emitEval } from "./index";
+
+function makeIr(overrides: Partial<IrEvalV0> = {}): IrEvalV0 {
+  return {
+    version: 0,
+    name: "smoke-eval",
+    target: "eval",
+    agent: {
+      model: "claude-opus-4-7",
+      instructions: "answer briefly",
+      tools: [],
+    },
+    dataset: { name: "smoke-eval", version: "v1", split: "dev" },
+    graders: [{ name: "exact_match" }],
+    concurrency: 4,
+    ...overrides,
+  };
+}
+
+describe("target-eval-bundle — T1 emitted bundle structure", () => {
+  test("emitEval returns a single-file bundle named agent.ts", () => {
+    const ir = makeIr();
+    const bundle = emitEval(ir);
+    expect(bundle.files.length).toBe(1);
+    expect(bundle.files[0]?.path).toBe("agent.ts");
+  });
+
+  test("agent.ts imports dataset-registry, eval-grader, eval-runner", () => {
+    const bundle = emitEval(makeIr());
+    const code = bundle.files[0]?.content ?? "";
+    expect(code).toContain("@crewhaus/dataset-registry");
+    expect(code).toContain("@crewhaus/eval-grader");
+    expect(code).toContain("@crewhaus/eval-runner");
+  });
+
+  test("agent.ts contains the spec model + instructions verbatim", () => {
+    const ir = makeIr({
+      agent: {
+        model: "claude-opus-4-7",
+        instructions: "answer in 5 words",
+        tools: [],
+      },
+    });
+    const code = emitEval(ir).files[0]?.content ?? "";
+    expect(code).toContain("claude-opus-4-7");
+    expect(code).toContain("answer in 5 words");
+  });
+
+  test("agent.ts emits seed line when seed is set", () => {
+    const ir = makeIr({ seed: 42 });
+    const code = emitEval(ir).files[0]?.content ?? "";
+    expect(code).toContain("seed: 42");
+  });
+
+  test("agent.ts skips seed line when seed is undefined", () => {
+    const ir = makeIr();
+    const code = emitEval(ir).files[0]?.content ?? "";
+    expect(code).not.toContain("seed: ");
+  });
+
+  test("agent.ts contains the dataset name + split", () => {
+    const ir = makeIr({
+      dataset: { name: "math-bench", version: "v3", split: "dev" },
+    });
+    const code = emitEval(ir).files[0]?.content ?? "";
+    expect(code).toContain('"name":"math-bench"');
+    expect(code).toContain('"split":"dev"');
+  });
+
+  test("agent.ts contains every grader name", () => {
+    const ir = makeIr({
+      graders: [{ name: "exact_match" }, { name: "regex", opts: { pattern: "\\d+" } }],
+    });
+    const code = emitEval(ir).files[0]?.content ?? "";
+    expect(code).toContain("exact_match");
+    expect(code).toContain("regex");
+  });
+
+  test("escapes special characters in instructions", () => {
+    const ir = makeIr({
+      agent: {
+        model: "claude-opus-4-7",
+        instructions: 'with "quotes" and\nnewline',
+        tools: [],
+      },
+    });
+    const code = emitEval(ir).files[0]?.content ?? "";
+    expect(code).toContain('with \\"quotes\\"');
+    expect(code).toContain("\\nnewline");
+  });
+});
