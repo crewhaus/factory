@@ -243,6 +243,8 @@ describe("IrNode discriminated union narrowing", () => {
           return `crew:${n.roles.length}`;
         case "research":
           return `research:${n.branchingFactor}`;
+        case "batch":
+          return `batch:${n.queue.adapter}`;
       }
     }
 

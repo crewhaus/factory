@@ -346,6 +346,43 @@ export type IrResearchV0 = {
   readonly compaction: IrCompaction;
 };
 
+/**
+ * Section 23 BATCH — queue-worker IR. The compiled daemon pulls jobs
+ * from the configured queue, runs the user's handler with `concurrency`
+ * bounded parallelism, wraps each invocation in an idempotency-key
+ * cache, and acks/nacks based on outcome. The handler runs the agent
+ * (single-turn `runChatLoop`) with the job's input as the user message.
+ */
+export type IrBatchQueueAdapter = "in-memory" | "sqs" | "redis-streams" | "postgres";
+
+export type IrBatchV0 = {
+  readonly version: 0;
+  readonly name: string;
+  readonly target: "batch";
+  readonly agent: {
+    readonly model: string;
+    readonly instructions: string;
+  };
+  readonly queue: {
+    readonly adapter: IrBatchQueueAdapter;
+    /** Per-domain rate-limit ms; >= 0. */
+    readonly visibilityTimeoutMs: number;
+    /** Stop renew sidecar past this; ack/nack by then. */
+    readonly visibilityRenewIntervalMs?: number;
+    /** Cap on attempts before DLQ. Default 3. */
+    readonly maxRetries: number;
+    /** When `adapter === "in-memory"`, optional seed jobs (mostly tests + smoke). */
+    readonly seedJobs?: readonly string[];
+  };
+  readonly concurrency: number;
+  readonly idempotencyWindowMs: number;
+  readonly tools: readonly string[];
+  readonly toolConfigs: IrToolConfigs;
+  readonly mcp_servers: IrMcpServers;
+  readonly permissions: IrPermissions;
+  readonly compaction: IrCompaction;
+};
+
 /** Discriminated union over every supported target IR. */
 export type IrNode =
   | IrV0
@@ -355,7 +392,8 @@ export type IrNode =
   | IrManagedV0
   | IrPipelineV0
   | IrCrewV0
-  | IrResearchV0;
+  | IrResearchV0
+  | IrBatchV0;
 
 /**
  * The output of compilation: a set of files to be written to disk by the

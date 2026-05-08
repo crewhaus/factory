@@ -1423,7 +1423,7 @@ Spec/IR additions are sequential after `target-crew` is stable.
 
 ## Section 23 — RES + BATCH target shapes (parallel)
 
-> Status: 🟡 RES complete (2026-05-08), BATCH next up. RES shipped: `planner`, `crawler`, `citation-tracker`, `report-writer`, `target-research-bundle`; `target: "research"` variant on `spec`/`ir`/`compiler`; `examples/hello-research/`; `scripts/section-23-res-smoke.ts`. Live-model smoke verified: planner decomposes the goal into 3 sub-questions, branches run with auto-injected `Source(uri)` + `CiteFact(uri, snippet)` tools, kill-and-resume picks up at the last completed branch with NO URIs re-fetched (citation-tracker dedup), final report carries numbered citations [1], [2], … in deterministic order. BATCH (queue-protocol + queue-consumer + idempotency-keys + target-batch-worker) ships in a separate PR.
+> Status: ✅ complete (2026-05-08). Two PRs: (a) RES — `planner`, `crawler`, `citation-tracker`, `report-writer`, `target-research-bundle`; (b) BATCH — `queue-protocol`, `queue-consumer`, `idempotency-keys`, `target-batch-worker`. Spec/IR/compiler grew `target: "research"` and `target: "batch"` discriminated-union variants. Live-model smokes: RES verified planner decomposition + checkpoint resume + URL-dedup + deterministic citation ordering; BATCH verified 8-job in-memory queue drains with concurrency 4, idempotency-keys cache hits on retry, SIGTERM emits drain_start → drain_end → worker_stop and exits 0.
 
 **Catalog modules (RES):** `target-research-bundle` (F2), `planner` (R-orchestration), `crawler` (R-orchestration), `citation-tracker` (R-orchestration), `report-writer` (R-orchestration)
 

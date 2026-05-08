@@ -46,6 +46,19 @@
         "@crewhaus/tool-web": "workspace:*",
       },
     },
+    "examples/hello-batch": {
+      "name": "@crewhaus-examples/hello-batch",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/idempotency-keys": "workspace:*",
+        "@crewhaus/permission-engine": "workspace:*",
+        "@crewhaus/queue-consumer": "workspace:*",
+        "@crewhaus/queue-protocol": "workspace:*",
+        "@crewhaus/run-context": "workspace:*",
+        "@crewhaus/runtime-core": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+      },
+    },
     "examples/hello-channel": {
       "name": "@crewhaus-examples/hello-channel",
       "version": "0.0.0",
@@ -323,6 +336,7 @@
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
         "@crewhaus/spec": "workspace:*",
+        "@crewhaus/target-batch-worker": "workspace:*",
         "@crewhaus/target-channel-bot": "workspace:*",
         "@crewhaus/target-cli": "workspace:*",
         "@crewhaus/target-crew": "workspace:*",
@@ -508,6 +522,13 @@
         "@crewhaus/trace-event-bus": "workspace:*",
       },
     },
+    "packages/idempotency-keys": {
+      "name": "@crewhaus/idempotency-keys",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+      },
+    },
     "packages/infra-utils": {
       "name": "@crewhaus/infra-utils",
       "version": "0.0.0",
@@ -593,6 +614,22 @@
     },
     "packages/prompt-injection-detector": {
       "name": "@crewhaus/prompt-injection-detector",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+      },
+    },
+    "packages/queue-consumer": {
+      "name": "@crewhaus/queue-consumer",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/idempotency-keys": "workspace:*",
+        "@crewhaus/queue-protocol": "workspace:*",
+      },
+    },
+    "packages/queue-protocol": {
+      "name": "@crewhaus/queue-protocol",
       "version": "0.0.0",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
@@ -754,6 +791,15 @@
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
         "zod": "^3.23.8",
+      },
+    },
+    "packages/target-batch-worker": {
+      "name": "@crewhaus/target-batch-worker",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/infra-utils": "workspace:*",
+        "@crewhaus/ir": "workspace:*",
       },
     },
     "packages/target-channel-bot": {
@@ -1211,6 +1257,8 @@
 
     "@biomejs/cli-win32-x64": ["@biomejs/cli-win32-x64@1.9.4", "", { "os": "win32", "cpu": "x64" }, "sha512-8Y5wMhVIPaWe6jw2H+KlEm4wP/f7EW3810ZLmDlrEEy5KvBsb9ECEfu/kMWD484ijfQ8+nIi0giMgu9g1UAuuA=="],
 
+    "@crewhaus-examples/hello-batch": ["@crewhaus-examples/hello-batch@workspace:examples/hello-batch"],
+
     "@crewhaus-examples/hello-channel": ["@crewhaus-examples/hello-channel@workspace:examples/hello-channel"],
 
     "@crewhaus-examples/hello-cli": ["@crewhaus-examples/hello-cli@workspace:examples/hello-cli"],
@@ -1299,6 +1347,8 @@
 
     "@crewhaus/hooks-engine": ["@crewhaus/hooks-engine@workspace:packages/hooks-engine"],
 
+    "@crewhaus/idempotency-keys": ["@crewhaus/idempotency-keys@workspace:packages/idempotency-keys"],
+
     "@crewhaus/infra-utils": ["@crewhaus/infra-utils@workspace:packages/infra-utils"],
 
     "@crewhaus/ir": ["@crewhaus/ir@workspace:packages/ir"],
@@ -1322,6 +1372,10 @@
     "@crewhaus/policy-engine": ["@crewhaus/policy-engine@workspace:packages/policy-engine"],
 
     "@crewhaus/prompt-injection-detector": ["@crewhaus/prompt-injection-detector@workspace:packages/prompt-injection-detector"],
+
+    "@crewhaus/queue-consumer": ["@crewhaus/queue-consumer@workspace:packages/queue-consumer"],
+
+    "@crewhaus/queue-protocol": ["@crewhaus/queue-protocol@workspace:packages/queue-protocol"],
 
     "@crewhaus/recovery-engine": ["@crewhaus/recovery-engine@workspace:packages/recovery-engine"],
 
@@ -1350,6 +1404,8 @@
     "@crewhaus/sub-agent-permission-inheritance": ["@crewhaus/sub-agent-permission-inheritance@workspace:packages/sub-agent-permission-inheritance"],
 
     "@crewhaus/sub-agent-spawner": ["@crewhaus/sub-agent-spawner@workspace:packages/sub-agent-spawner"],
+
+    "@crewhaus/target-batch-worker": ["@crewhaus/target-batch-worker@workspace:packages/target-batch-worker"],
 
     "@crewhaus/target-channel-bot": ["@crewhaus/target-channel-bot@workspace:packages/target-channel-bot"],
 

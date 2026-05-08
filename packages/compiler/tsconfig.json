@@ -9,6 +9,7 @@
     { "path": "../infra-utils" },
     { "path": "../spec" },
     { "path": "../ir" },
+    { "path": "../target-batch-worker" },
     { "path": "../target-channel-bot" },
     { "path": "../target-cli" },
     { "path": "../target-crew" },

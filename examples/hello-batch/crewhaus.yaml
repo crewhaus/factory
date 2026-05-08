@@ -1,0 +1,25 @@
+name: hello-batch
+target: batch
+agent:
+  model: claude-haiku-4-5-20251001
+  instructions: |
+    You are a batch worker. Each job's input is a short text prompt.
+    Respond with a single concise sentence (≤ 20 words). Do NOT call
+    any tools. End your turn after the one-sentence reply.
+queue:
+  adapter: in-memory
+  visibilityTimeoutMs: 30000
+  maxRetries: 3
+  seedJobs:
+    - "Say hello in one sentence."
+    - "Name three primary colors in one sentence."
+    - "Describe water in one sentence."
+    - "Define recursion in one sentence."
+    - "What is the capital of France? Answer in one sentence."
+    - "Define entropy in one sentence."
+    - "Describe a circle in one sentence."
+    - "Name two oceans in one sentence."
+concurrency: 4
+idempotencyWindowMs: 60000
+permissions:
+  mode: default
