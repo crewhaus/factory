@@ -1,0 +1,12 @@
+{
+  "update_id": 100005,
+  "callback_query": {
+    "id": "cq-001",
+    "from": { "id": 4242, "is_bot": false, "username": "alice" },
+    "data": "approve:123",
+    "message": {
+      "message_id": 50,
+      "chat": { "id": 4242, "type": "private" }
+    }
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "name": "@crewhaus-examples/section-33-telegram-smoke",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Section 33 telegram channel adapter smoke",
+  "dependencies": {
+    "@crewhaus/channel-adapter-telegram": "workspace:*",
+    "@crewhaus/compiler": "workspace:*"
+  }
+}

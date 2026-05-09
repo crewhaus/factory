@@ -232,11 +232,76 @@ describe("emitChannelBot — gateway.ts", () => {
 });
 
 describe("emitChannelBot — error cases", () => {
-  test("throws TargetEmitError when the channels block has no slack config", () => {
-    const irNoSlack: IrChannelV0 = {
+  test("throws TargetEmitError when the channels block has no channels at all", () => {
+    const irNoChannels: IrChannelV0 = {
       ...MIN_IR,
       channels: {},
     };
-    expect(() => emitChannelBot(irNoSlack)).toThrow(TargetEmitError);
+    expect(() => emitChannelBot(irNoChannels)).toThrow(TargetEmitError);
+  });
+});
+
+describe("emitChannelBot — Telegram channel (Section 33)", () => {
+  const TELEGRAM_IR: IrChannelV0 = {
+    ...MIN_IR,
+    channels: {
+      telegram: {
+        botToken: { kind: "env", name: "TELEGRAM_BOT_TOKEN" },
+        secretToken: { kind: "env", name: "TELEGRAM_SECRET_TOKEN" },
+      },
+    },
+  };
+
+  test('daemon.ts imports createTelegramAdapter and registers under "telegram"', () => {
+    const c = fileMap(TELEGRAM_IR).get("daemon.ts") ?? "";
+    expect(c).toContain(
+      'import { createTelegramAdapter } from "@crewhaus/channel-adapter-telegram";',
+    );
+    expect(c).toContain('registerChannelAdapter("telegram", telegramAdapter);');
+    expect(c).toContain('["telegram", telegramAdapter]');
+  });
+
+  test("daemon.ts wires Telegram secret env vars into the startup env-check", () => {
+    const c = fileMap(TELEGRAM_IR).get("daemon.ts") ?? "";
+    expect(c).toContain('"TELEGRAM_BOT_TOKEN"');
+    expect(c).toContain('"TELEGRAM_SECRET_TOKEN"');
+    expect(c).toContain("missing required env vars");
+  });
+
+  test("daemon.ts can register both slack and telegram side-by-side", () => {
+    const both: IrChannelV0 = {
+      ...MIN_IR,
+      channels: {
+        slack: {
+          botToken: { kind: "env", name: "SLACK_BOT_TOKEN" },
+          signingSecret: { kind: "env", name: "SLACK_SIGNING_SECRET" },
+        },
+        telegram: {
+          botToken: { kind: "env", name: "TELEGRAM_BOT_TOKEN" },
+          secretToken: { kind: "env", name: "TELEGRAM_SECRET_TOKEN" },
+        },
+      },
+    };
+    const c = fileMap(both).get("daemon.ts") ?? "";
+    expect(c).toContain("createSlackAdapter");
+    expect(c).toContain("createTelegramAdapter");
+    expect(c).toContain('["slack", slackAdapter]');
+    expect(c).toContain('["telegram", telegramAdapter]');
+  });
+
+  test("literal Telegram secrets embed verbatim and skip env-check", () => {
+    const irLit: IrChannelV0 = {
+      ...MIN_IR,
+      channels: {
+        telegram: {
+          botToken: { kind: "literal", value: "literal-bot-token" },
+          secretToken: { kind: "literal", value: "literal-secret" },
+        },
+      },
+    };
+    const c = fileMap(irLit).get("daemon.ts") ?? "";
+    expect(c).toContain('"literal-bot-token"');
+    expect(c).toContain('"literal-secret"');
+    expect(c).not.toContain("__requiredEnv");
   });
 });
