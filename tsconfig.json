@@ -52,6 +52,7 @@
     { "path": "./packages/structured-event-printer" },
     { "path": "./packages/eval-dataset" },
     { "path": "./packages/eval-grader" },
+    { "path": "./packages/grader-nlg-metrics" },
     { "path": "./packages/eval-judge" },
     { "path": "./packages/eval-runner" },
     { "path": "./packages/eval-report" },

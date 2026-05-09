@@ -478,6 +478,15 @@
         "@crewhaus/trace-event-bus": "workspace:*",
       },
     },
+    "examples/section-38-grader-nlg-metrics-smoke": {
+      "name": "@crewhaus-examples/section-38-grader-nlg-metrics-smoke",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/eval-grader": "workspace:*",
+        "@crewhaus/grader-nlg-metrics": "workspace:*",
+        "@crewhaus/grader-registry": "workspace:*",
+      },
+    },
     "packages/a2a-protocol": {
       "name": "@crewhaus/a2a-protocol",
       "version": "0.0.0",
@@ -975,6 +984,14 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/gateway-protocol": "workspace:*",
         "@crewhaus/tenancy": "workspace:*",
+      },
+    },
+    "packages/grader-nlg-metrics": {
+      "name": "@crewhaus/grader-nlg-metrics",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/eval-grader": "workspace:*",
       },
     },
     "packages/grader-registry": {
@@ -2127,6 +2144,8 @@
 
     "@crewhaus-examples/section-37-exporter-splunk-smoke": ["@crewhaus-examples/section-37-exporter-splunk-smoke@workspace:examples/section-37-exporter-splunk-smoke"],
 
+    "@crewhaus-examples/section-38-grader-nlg-metrics-smoke": ["@crewhaus-examples/section-38-grader-nlg-metrics-smoke@workspace:examples/section-38-grader-nlg-metrics-smoke"],
+
     "@crewhaus/a2a-protocol": ["@crewhaus/a2a-protocol@workspace:packages/a2a-protocol"],
 
     "@crewhaus/abort-controller": ["@crewhaus/abort-controller@workspace:packages/abort-controller"],
@@ -2232,6 +2251,8 @@
     "@crewhaus/gateway-protocol": ["@crewhaus/gateway-protocol@workspace:packages/gateway-protocol"],
 
     "@crewhaus/gateway-server": ["@crewhaus/gateway-server@workspace:packages/gateway-server"],
+
+    "@crewhaus/grader-nlg-metrics": ["@crewhaus/grader-nlg-metrics@workspace:packages/grader-nlg-metrics"],
 
     "@crewhaus/grader-registry": ["@crewhaus/grader-registry@workspace:packages/grader-registry"],
 
