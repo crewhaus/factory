@@ -2248,7 +2248,7 @@ sandbox-image-registry  ──►  sandbox-image-{go,rust,java,ruby,r,dotnet,php
 
 ## Section 37 — Vendor telemetry exporters
 
-> Status: 🟡 independent. Can land any time.
+> Status: 🚧 in progress. `exporter-datadog` ✅ landed; 3 vendor adapters parallel-pending (honeycomb, splunk, newrelic). Independent of §36/38–40.
 
 **Catalog modules:** `exporter-datadog` (R15), `exporter-honeycomb` (R15), `exporter-splunk` (R15), `exporter-newrelic` (R15)
 
