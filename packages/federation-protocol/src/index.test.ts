@@ -11,7 +11,7 @@ import {
   fingerprintCert,
   validateCredentials,
 } from "./index";
-import { type FixtureCertSet, makeFixtureCertSet } from "./test-helpers";
+import { type FixtureCertSet, makeFixtureCertSet, makeFixtureCertSetOther } from "./test-helpers";
 
 const goodEnvelope: FederationEnvelope = {
   version: FEDERATION_VERSION,
@@ -29,8 +29,8 @@ let certs: FixtureCertSet;
 let otherCerts: FixtureCertSet;
 
 beforeAll(() => {
-  certs = makeFixtureCertSet("deployment-test");
-  otherCerts = makeFixtureCertSet("deployment-other");
+  certs = makeFixtureCertSet();
+  otherCerts = makeFixtureCertSetOther();
 });
 
 afterAll(() => {

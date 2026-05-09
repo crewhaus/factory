@@ -1,51 +1,64 @@
 /**
- * Test helpers for federation-protocol — generate a fresh self-signed
- * Ed25519 certificate + matching key pair for use in tests. Returns
- * PEM-encoded strings that the production code accepts as
- * caCertPem/clientCertPem/clientKeyPem.
+ * Test helpers for federation-protocol — read pre-generated fixture
+ * certs from disk so tests don't shell to openssl on every run.
  *
- * We use Bun.spawn over openssl rather than @peculiar/x509 because
- * openssl is universally available on macOS/Linux CI runners.
+ * The fixture certs are self-signed RSA 2048, valid for 10 years, with
+ * CN=fed-fixture (and CN=fed-other for the "wrong key" pair). Generated
+ * once via:
+ *
+ *   openssl req -x509 -newkey rsa:2048 -nodes \
+ *     -keyout fixtures-key.pem -out fixtures-cert.pem \
+ *     -days 3650 -subj "/CN=fed-fixture" -sha256
+ *
+ * Test-only secrets — no production deployment uses these.
+ *
+ * Earlier iterations shelled to openssl on every test run; that timed
+ * out on CI runners with slow entropy and racy `openssl x509 ...
+ * -fingerprint -sha256` invocations. Static fixtures are deterministic
+ * + fast (~1 ms read).
  */
-import { execSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
+
+import { fingerprintCert } from "./index";
 
 export type FixtureCertSet = {
   readonly caCertPem: string;
   readonly clientCertPem: string;
   readonly clientKeyPem: string;
   readonly pinnedFingerprint: string;
+  /** No-op — kept for backwards compat with the old openssl-based helper. */
   readonly cleanup: () => void;
 };
 
+const FIXTURES_DIR = import.meta.dir;
+
 /**
- * Generate a self-signed CA + a leaf cert for `commonName`. Used by
- * federation-protocol tests for cert-pinning + envelope validation.
+ * Returns the canonical fixture cert pair (CN=fed-fixture). The
+ * `_commonName` arg is accepted for backwards compat with the
+ * generate-on-the-fly helper this replaced; it has no effect.
  */
-export function makeFixtureCertSet(commonName = "deployment-test"): FixtureCertSet {
-  const dir = mkdtempSync(join(tmpdir(), "fed-fixture-"));
-  // Self-signed CA + cert. RSA so older openssl builds work too.
-  execSync(
-    `openssl req -x509 -newkey rsa:2048 -nodes -keyout "${dir}/key.pem" -out "${dir}/cert.pem" ` +
-      `-days 30 -subj "/CN=${commonName}" -sha256 2>/dev/null`,
-    { stdio: "ignore" },
-  );
-  const certPem = readFileSync(join(dir, "cert.pem"), "utf8");
-  const keyPem = readFileSync(join(dir, "key.pem"), "utf8");
-  // Self-signed: the cert IS the CA root.
-  const caPem = certPem;
-  // Compute fingerprint via openssl.
-  const fpRaw = execSync(`openssl x509 -in "${dir}/cert.pem" -noout -fingerprint -sha256`, {
-    encoding: "utf8",
-  });
-  const pinnedFingerprint = (fpRaw.split("=")[1] ?? "").trim().replaceAll(":", "").toLowerCase();
+export function makeFixtureCertSet(_commonName = "fed-fixture"): FixtureCertSet {
+  return readFixtures("fixtures-cert.pem", "fixtures-key.pem");
+}
+
+/**
+ * Returns a second, unrelated cert pair (CN=fed-other) — used by the
+ * "wrong public key" / "tampered cert" tests to assert pinning rejects
+ * keys that don't match the configured fingerprint.
+ */
+export function makeFixtureCertSetOther(): FixtureCertSet {
+  return readFixtures("fixtures-other-cert.pem", "fixtures-other-key.pem");
+}
+
+function readFixtures(certFile: string, keyFile: string): FixtureCertSet {
+  const certPem = readFileSync(join(FIXTURES_DIR, certFile), "utf8");
+  const keyPem = readFileSync(join(FIXTURES_DIR, keyFile), "utf8");
   return {
-    caCertPem: caPem,
+    caCertPem: certPem,
     clientCertPem: certPem,
     clientKeyPem: keyPem,
-    pinnedFingerprint,
-    cleanup: () => rmSync(dir, { recursive: true, force: true }),
+    pinnedFingerprint: fingerprintCert(certPem),
+    cleanup: () => undefined,
   };
 }

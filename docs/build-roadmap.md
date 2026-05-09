@@ -1,6 +1,6 @@
 # CrewHaus Factory — Build Roadmap
 
-> Status as of 2026-05-08. **All 31 roadmap sections complete — v1.0 product surface fully landed.** 143 of ~190 catalog modules across 127 workspace packages; 1857 tests across ~140 test files, all green; `tsc -b` clean; `biome check` clean. **12 target shapes ship today** (cli/workflow/channel/graph/managed/pipeline/crew/research/batch/voice/browser/eval). Sections 32–35 below scope the v1.1 phase: distribution + packaging (Docker/Helm/single-binary), channel adapter breadth (Telegram/Discord/WhatsApp/iMessage), federation across CrewHaus deployments, and IDE-class developer-experience tooling.
+> Status as of 2026-05-08. **All 35 roadmap sections complete — v1.0 + v1.1 product surface fully landed.** 157 of ~190 catalog modules across 141 workspace packages; 2172 tests across ~154 test files, all green; `tsc -b` clean; `biome check` clean. **12 target shapes ship today** (cli/workflow/channel/graph/managed/pipeline/crew/research/batch/voice/browser/eval). v1.1 added per-target Docker images + Helm chart + single-binary CLI + crewhaus-cloud Terraform recipe (§32), 4 new channel adapters bringing CHN to 5 channels (Telegram + Discord + WhatsApp + iMessage on top of Slack — §33), cross-deployment federation with mTLS A2A + DNS SRV/.well-known discovery + transparent routing (§34), and IDE-class developer tooling (VS Code extension + JetBrains plugin scaffold + browser-based playground REPL — §35).
 > See `docs/MODULE-CATALOG.md` for full per-module specs, test layer references, and the per-row `Depends on` columns + 🔴/🟡 risk markers used throughout this roadmap.
 
 ---
@@ -139,7 +139,7 @@ Tool surface expansion (✅ §14) ──► Observability (✅ §15)
 | **§32 Distribution & packaging** | ✅ | §20 (`gateway-server` for hosted `crewhaus-cloud`), §31 (Studio runs inside a container) | §34 (federation needs cross-deployment networking), homebrew/apt/scoop/winget distribution, k8s rollouts |
 | **§33 Channel adapter breadth** | ✅ | §12 (channel-adapter-base interface) | Multi-channel CHN deployments, customer-facing bots outside Slack |
 | **§34 Federation (multi-deployment A2A)** | ✅ | §32 (`docker-images`), §22 (`a2a-protocol` interface), §20 (mTLS auth pattern) | Crew-of-crews, multi-org agent ecosystems, MGD federation, agent marketplaces |
-| **§35 Developer experience tooling** | 🚧 2/3 (vscode-extension + jetbrains-plugin landed; crewhaus-playground in flight) | §32 (`single-binary-cli` for extension installs), §31 (Studio as VS Code webview embed) | Editor adoption, spec-as-code workflows, onboarding funnel, docs-site interactivity |
+| **§35 Developer experience tooling** | ✅ | §32 (`single-binary-cli` for extension installs), §31 (Studio as VS Code webview embed) | Editor adoption, spec-as-code workflows, onboarding funnel, docs-site interactivity |
 
 ---
 
@@ -2110,7 +2110,7 @@ federation-protocol  ──►  federation-discovery  ──►  federation-rout
 
 ## Section 35 — Developer experience tooling
 
-> Status: 🟡 independent. Three packages; one PR per package.
+> Status: ✅ complete. Three packages landed across PRs #48, #49, #50: `vscode-extension` (spec autocomplete + lint + Run Spec command + sub-agent hover-card), `jetbrains-plugin` (IntelliJ/WebStorm/PyCharm parity scaffold + plugin.xml + Gradle build), `crewhaus-playground` (browser-based REPL with Monaco editor + tier-based quota + cross-tenant isolation + scaffold-template picker).
 
 **Catalog modules:** `vscode-extension` (F4), `jetbrains-plugin` (F4), `crewhaus-playground` (F4)
 

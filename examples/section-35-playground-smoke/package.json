@@ -1,0 +1,10 @@
+{
+  "name": "@crewhaus-examples/section-35-playground-smoke",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Section 35 crewhaus-playground smoke",
+  "dependencies": {
+    "@crewhaus/crewhaus-playground": "workspace:*"
+  }
+}
