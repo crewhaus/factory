@@ -1,0 +1,14 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "references": [
+    { "path": "../embedder" },
+    { "path": "../errors" },
+    { "path": "../eval-grader" },
+    { "path": "../grader-nlg-metrics" }
+  ],
+  "include": ["src/**/*"]
+}
