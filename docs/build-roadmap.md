@@ -1,6 +1,6 @@
 # CrewHaus Factory — Build Roadmap
 
-> Status as of 2026-05-08. **All 35 roadmap sections complete — v1.0 + v1.1 product surface fully landed.** 157 of ~190 catalog modules across 141 workspace packages; 2172 tests across ~154 test files, all green; `tsc -b` clean; `biome check` clean. **12 target shapes ship today** (cli/workflow/channel/graph/managed/pipeline/crew/research/batch/voice/browser/eval). v1.1 added per-target Docker images + Helm chart + single-binary CLI + crewhaus-cloud Terraform recipe (§32), 4 new channel adapters bringing CHN to 5 channels (Telegram + Discord + WhatsApp + iMessage on top of Slack — §33), cross-deployment federation with mTLS A2A + DNS SRV/.well-known discovery + transparent routing (§34), and IDE-class developer tooling (VS Code extension + JetBrains plugin scaffold + browser-based playground REPL — §35).
+> Status as of 2026-05-09. **All 35 roadmap sections complete — v1.0 + v1.1 product surface fully landed.** 157 of ~190 catalog modules across 142 workspace packages; **2,173 tests across ~154 test files, all green**; `tsc -b` clean; `biome check` clean. **12 target shapes ship today** (cli/workflow/channel/graph/managed/pipeline/crew/research/batch/voice/browser/eval). v1.1 added per-target Docker images + Helm chart + single-binary CLI + crewhaus-cloud Terraform recipe (§32), 4 new channel adapters bringing CHN to 5 channels (Telegram + Discord + WhatsApp + iMessage on top of Slack — §33), cross-deployment federation with mTLS A2A + DNS SRV/.well-known discovery + transparent routing (§34), and IDE-class developer tooling (VS Code extension + JetBrains plugin scaffold + browser-based playground REPL — §35). Sections 36–40 (v1.2) below scope the next phase: polyglot sandbox images, vendor telemetry exporters, production-grade graders, compliance hardening, and a spec template marketplace.
 > See `docs/MODULE-CATALOG.md` for full per-module specs, test layer references, and the per-row `Depends on` columns + 🔴/🟡 risk markers used throughout this roadmap.
 
 ---
@@ -96,9 +96,30 @@ Tool surface expansion (✅ §14) ──► Observability (✅ §15)
                               browser: host + remote backends)
                                             │
                                             ▼
-                              §31 Studio v1
+                              §31 Studio v1 (✅)
                               (Lit + Monaco + live SSE replay
                               + plugin-sandbox content isolation)
+                                            │
+                       ┌────────────────────┼────────────────────┐
+                       ▼                    ▼                    ▼
+                §32 Distribution (✅) §33 Channel breadth (✅) §35 IDE tooling (✅)
+                (docker-images,       (telegram, discord,        (vscode-extension,
+                 helm-chart,           whatsapp, imessage)        jetbrains-plugin,
+                 single-binary-cli,         │                     crewhaus-playground)
+                 crewhaus-cloud)            │
+                       │                    │
+                       └────► §34 Federation (✅) ──► (cross-deployment A2A,
+                                            │         mTLS, DNS SRV / well-known)
+                                            ▼
+                       ┌──────────────┬─────┴────┬──────────────┬─────────────┐
+                       ▼              ▼          ▼              ▼             ▼
+                §36 Polyglot     §37 Vendor   §38 Prod       §39 Compliance §40 Template
+                sandbox          telemetry    graders        hardening      marketplace
+                images           exporters    (NLG metrics,  (encryption,   + example CI
+                (Go/Rust/        (Datadog,     embed-sim,    retention,
+                 Java/Ruby/       Honeycomb,   safety,        right-to-
+                 R/.NET/PHP)      Splunk,      multimodal)    export/delete,
+                                  New Relic)                  PII redaction)
 ```
 
 ## Section dependency table
@@ -140,6 +161,11 @@ Tool surface expansion (✅ §14) ──► Observability (✅ §15)
 | **§33 Channel adapter breadth** | ✅ | §12 (channel-adapter-base interface) | Multi-channel CHN deployments, customer-facing bots outside Slack |
 | **§34 Federation (multi-deployment A2A)** | ✅ | §32 (`docker-images`), §22 (`a2a-protocol` interface), §20 (mTLS auth pattern) | Crew-of-crews, multi-org agent ecosystems, MGD federation, agent marketplaces |
 | **§35 Developer experience tooling** | ✅ | §32 (`single-binary-cli` for extension installs), §31 (Studio as VS Code webview embed) | Editor adoption, spec-as-code workflows, onboarding funnel, docs-site interactivity |
+| **§36 Polyglot sandbox images** | 🟡 next | §18 (`sandbox` + `tool-code-execution` allowlist) | Multi-language tool-code-execution; Go/Rust/Java/Ruby/R/.NET/PHP coverage |
+| **§37 Vendor telemetry exporters** | 🟡 independent | §15 (`otel-exporter`, `metrics-collector`) | Datadog/Honeycomb/Splunk/New Relic drop-in adapters; production observability without sidecar wrangling |
+| **§38 Production graders** | 🟡 independent | §16 (`eval-grader`), §29 (`grader-registry`) | ROUGE/BLEU/embedding-similarity/safety-classifier/multimodal graders; serious eval depth |
+| **§39 Compliance & audit hardening** | 🟡 independent | §20 (`audit-log`, `policy-engine`, `tenancy`) | SOC 2 / GDPR / HIPAA posture; encryption-at-rest; right-to-export/delete; PII redaction |
+| **§40 Spec template marketplace + example CI** | 🟡 last in v1.2 | §26 (`scaffold-templates`); §32 (`single-binary-cli` for marketplace fetch) | Community-contributed templates; CI-gated example corpus; template discovery in Studio |
 
 ---
 
@@ -163,12 +189,22 @@ What the current stack can now do, end-to-end:
 - **Studio (v1)**: `bun run studio` — Bun.serve daemon with full Lit + Monaco SPA, live SSE wired to real `runChatLoop` subprocesses, run-replay from §10 event-log, multi-spec dashboard with cost/pass-rate/latency aggregates, content-sandboxed plugin host (Web Workers / Realm shim), `/api/cost-summary` endpoint aggregating §27 cost-tracker output.
 - **Eval (12th target shape)**: `crewhaus eval-bundle` compiles a `target: "eval"` spec to a single `agent.ts` that boots dataset-registry + eval-runner. EVAL is now a deployable artefact, not just a CLI invocation.
 
-What is *not* yet covered (and frames Sections 32–35):
+What v1.0 + v1.1 already deliver:
 
-- **Distribution & packaging.** Today the system runs out of the dev workspace via `bun run …`. There's no Docker image, no Helm chart, no single-binary build, no `homebrew` / `apt` / `scoop` / `winget` distribution, no `crewhaus-cloud` recipe combining target-managed + deployment-controller + helm-chart. Every cloud rollout, CI integration, and end-user adoption is gated on this. **Section 32 lands the full distribution surface.**
-- **Channel breadth.** Today CHN ships only Slack. No Telegram (`channel-adapter-telegram`), Discord (`channel-adapter-discord`), WhatsApp Business (`channel-adapter-whatsapp`), or iMessage (`channel-adapter-imessage`). Each is a self-contained adapter following the §12 Slack pattern (HMAC verification, idempotent dispatch, per-thread session resumption); the framework cost per new channel is low. **Section 33 lands these.**
-- **Federation.** A CrewHaus deployment is currently isolated — it cannot call agents in another CrewHaus deployment. No `federation-protocol` (mTLS A2A across deployments), no `federation-discovery` (DNS SRV / `.well-known/crewhaus.json`), no `federation-router` (route a Task / SendMessage to a remote crew transparently). Crew-of-crews patterns and multi-org agent ecosystems are out of reach today. **Section 34 lands these.**
-- **IDE-class developer experience.** Spec authoring today is "edit YAML in your editor of choice + `bun apps/cli/src/index.ts compile`". No `vscode-extension` (spec authoring + inline trace + run-from-editor), no `jetbrains-plugin`, no `crewhaus-playground` (browser REPL — try a spec without installing). **Section 35 lands these.**
+- **Distribution & packaging** (§32). Per-target slim Docker images, Helm chart, `bun build --compile` single-binary CLI, Homebrew/Debian/Scoop/Winget manifest renderers, `crewhaus cloud deploy` Terraform + Kustomize recipe.
+- **Channel breadth** (§33). 5 channels ship — Slack (§12) + Telegram + Discord + WhatsApp Business + iMessage (mac-host only). All five register side-by-side; the gateway dispatches by `/<adapter>/events` path prefix.
+- **Federation** (§34). mTLS A2A between deployments, DNS SRV / `.well-known/crewhaus.json` discovery with TTL caching, transparent remote sub-agent routing (`subAgents[].federation: { deployment, role }`). Crew-of-crews patterns work today.
+- **IDE-class developer experience** (§35). VS Code extension (`crewhaus.crewhaus-vscode`), JetBrains plugin scaffold, browser-based `crewhaus-playground` REPL with Monaco + tier-based quota.
+
+What is *not* yet covered (and frames Sections 36–40 — the **v1.2 polish phase**):
+
+- **Polyglot sandbox images** (§36). Today `tool-code-execution` ships only Python 3.13-slim, Node 22-alpine, and Alpine 3.19. Production agents handle polyglot teams — Go, Rust, Java, Ruby, R, .NET, PHP all need first-class sandbox images with a §18 sandbox-image-allowlist registry, healthcheck contracts, and T2 contract tests per language. The cost per language is small (Dockerfile + `crewhaus-sandbox-images` registry entry); the surface impact is significant for teams writing multi-language tools.
+- **Vendor telemetry exporters** (§37). Today the §15 `otel-exporter` speaks OTLP/HTTP and the §15 `metrics-collector` speaks Prometheus textfile + stdout JSON + HTTP `/metrics`. Production deployments running on Datadog / Honeycomb / Splunk / New Relic can route through an OTLP collector sidecar today, but a direct vendor adapter (with the right attribute mappings, sampling rules, and credential plumbing) is the difference between "works after some YAML wrangling" and "drop in `provider: datadog` and forget". 4 packages: `exporter-datadog`, `exporter-honeycomb`, `exporter-splunk`, `exporter-newrelic`; each ~150-200 LOC of OTLP wrapping + vendor-specific resource attributes.
+- **Production graders** (§38). Today §16 `eval-grader` ships exact_match / contains / regex / json_path / schema / tool_call_sequence built-ins plus the §29 grader-registry for plugins. Real eval work needs more: ROUGE/BLEU NLG metrics, embedding-similarity (cosine over a dense model), faithfulness/groundedness against a reference document, toxicity/safety classifiers (OpenAI moderation, Perspective API), multimodal graders (image similarity, OCR-then-grade for screenshots). 3-4 packages: `grader-nlg-metrics`, `grader-semantic-similarity`, `grader-safety-classifiers`, `grader-multimodal`. Each plugs into §29 `grader-registry` so the runtime is unchanged.
+- **Compliance & audit hardening** (§39). Today §20 `audit-log` ships a hash-chained append-only JSONL with tamper-evident integrity and §20 `policy-engine` provides per-decision hooks. Enterprise compliance posture needs more: encryption-at-rest for audit logs, configurable data-retention policies (GDPR right-to-delete), per-tenant export endpoints (right-to-export / data-portability), SOC 2 / ISO 27001 / HIPAA readiness checks (the actual control-evidence collection — which audit-events satisfy which control), redaction policies for PII in tool outputs and trace events. 3 packages: `audit-encryption`, `data-retention-engine`, `compliance-controls`.
+- **Spec template marketplace + example CI** (§40). Today §26 `scaffold-templates` ships 10 hardcoded templates (one per shipped target shape). A template marketplace would let community contributors publish their own templates and let users discover them via Studio: `template-registry` (fetches a manifest from a remote URL with TTL caching; supports Git/GitHub-Releases/HuggingFace-Datasets backends); plus a CI hardening pass that asserts every example in `examples/` compiles + runs end-to-end (today the compile commands are documented but not gated in CI — drift risk).
+
+Beyond Section 40, the remaining ~30 catalog modules are deferred to v1.3+: mobile target shapes (`target-ios-bundle`, `target-android-bundle` — a substantial new compilation path for native app embedding), one-click cloud deploy buttons (Render / Fly.io / Railway / Heroku), and the long tail of additional MCP servers, additional sub-agent templates, and additional sandbox/embedder/vector backends as the ecosystem matures.
 
 ---
 
@@ -2151,6 +2187,254 @@ All three packages are independent and parallelisable. Each is its own PR.
 
 ---
 
+## Section 36 — Polyglot sandbox images
+
+> Status: 🟡 next up. Independent of §37–40; can land in any order.
+
+**Catalog modules:** `sandbox-image-go`, `sandbox-image-rust`, `sandbox-image-java`, `sandbox-image-ruby`, `sandbox-image-r`, `sandbox-image-dotnet`, `sandbox-image-php` (all R8); plus `sandbox-image-registry` (R8) for runtime allow-list management
+
+§18's `tool-code-execution` ships only Python / JavaScript / Shell today. Production agents written for polyglot teams need first-class sandbox images for Go, Rust, Java, Ruby, R, .NET, and PHP — the same `requiresSandbox: true` permission floor, the same `tool_stream_chunk` event-bus surface, the same warm-pool latency budget. The runtime contract stays identical; this section just adds curated images plus a registry pattern that lets teams add more without forking the sandbox package.
+
+### Build order within this section
+
+`sandbox-image-registry` is the sequential prereq — it provides the lookup mechanism that the per-language packages register against. After it lands, the seven language images are fully parallel; each is its own PR.
+
+```
+sandbox-image-registry  ──►  sandbox-image-{go,rust,java,ruby,r,dotnet,php}   (parallel, 7 PRs)
+```
+
+### What to build
+
+**`packages/sandbox-image-registry`** — runtime allow-list management
+- Replaces the current hardcoded `CREWHAUS_SANDBOX_ALLOWED_IMAGES` env var with a registry pattern: `registerSandboxImage({ id, image, healthcheck, defaultEntrypoint })` plus a global `lookupSandboxImage(id)`.
+- Built-in registrations for the §18 trio (python, node, alpine) auto-register at boot for backwards compat.
+- Healthcheck shape: `{ command: string[], expectedExitCode, timeoutMs }` — sandbox boot waits for healthcheck pass before allowing the first `exec()`.
+- `crewhaus sandbox doctor` CLI subcommand walks the registry + reports image-pull / healthcheck status.
+
+**`packages/sandbox-image-go`** — Go 1.23 base
+- Multi-stage Dockerfile: builder layer with `golang:1.23-alpine` + project deps; runtime layer with the compiled binary stripped to ~15 MB.
+- Default entrypoint: `go run -` for stdin-fed snippets; advanced callers can `exec ./<binary>` after a build step.
+- T2 contract: `fmt.Println("hello")` snippet round-trips; T8 escape-attempt suite reuses §18 corpus.
+
+**`packages/sandbox-image-rust`** — Rust stable
+- Builder: `rust:1-alpine` + cargo cache; runtime: `alpine:3.19` with the compiled artefact. Rust-specific care: `RUSTFLAGS="-C strip=symbols"` to keep image size in check.
+- Default entrypoint: cargo-script style for one-file snippets; advanced callers package as a normal crate.
+
+**`packages/sandbox-image-java`** — JDK 21 + Maven
+- `eclipse-temurin:21-alpine` base; entrypoint runs `java <File>.java` (Java 11+ supports running .java files directly). T7 cold-start ≤2s for the runtime image (after warm-pool).
+
+**`packages/sandbox-image-ruby`** — Ruby 3.3
+- `ruby:3.3-alpine` base. Defaults to `ruby -e <code>` for snippets. Includes `bundler` for advanced callers.
+
+**`packages/sandbox-image-r`** — R 4.x
+- `rocker/r-base` base trimmed to ~150 MB. Entrypoint: `Rscript -e <code>`. Common stats packages (`tidyverse`, `data.table`) baked in for analyst-style agents.
+
+**`packages/sandbox-image-dotnet`** — .NET 8
+- `mcr.microsoft.com/dotnet/runtime:8.0-alpine` base. Entrypoint: `dotnet script` (requires globally-installed `dotnet-script`). T7 cold-start budget is more generous (≤4s) given .NET runtime warmup.
+
+**`packages/sandbox-image-php`** — PHP 8.3
+- `php:8.3-alpine` base. Default entrypoint: `php -r <code>` for snippets, `php <file>` for files. Composer included.
+
+### Tests
+
+- `sandbox-image-registry`: T1 register/lookup; T8 reject duplicate registrations and untrusted image refs
+- Per-image: T2 contract test (snippet runs end-to-end with stdin/stdout round-trip), T8 escape-attempt suite (mount traversal, --privileged via env, image-tag injection — same fixtures §18 already uses), T7 warm-pool cold-start budget per image
+
+### End-to-end smoke
+
+`bun run smoke:section-36` boots `sandbox-image-registry`, registers all seven images, runs a "hello world" snippet through each, asserts exit-code 0 and stdout contains the expected token. Live-image probe (gated on `CREWHAUS_SECTION36_LIVE_DOCKER=1`) pulls each image from a real registry and runs the same probes against the actual sandbox.
+
+---
+
+## Section 37 — Vendor telemetry exporters
+
+> Status: 🟡 independent. Can land any time.
+
+**Catalog modules:** `exporter-datadog` (R15), `exporter-honeycomb` (R15), `exporter-splunk` (R15), `exporter-newrelic` (R15)
+
+§15 ships an OTLP/HTTP `otel-exporter` and a Prometheus-textfile / stdout-JSON / HTTP-`/metrics` `metrics-collector`. Production deployments running on a vendor stack can route through an OTLP collector sidecar today, but a direct vendor adapter (with the right resource attributes, sampling rules, and credential plumbing) eliminates the sidecar wrangling and unlocks vendor-specific affordances (Datadog's `dd.service`/`dd.env`/`dd.version` tags; Honeycomb's `service.name` + dataset routing; Splunk's `index` + `source` tags; New Relic's `entity.guid` + license-key auth).
+
+### Build order within this section
+
+All four packages are fully independent and parallelisable. Each is its own PR.
+
+### What to build
+
+**`packages/exporter-datadog`** — Datadog APM + Logs + Metrics
+- Wraps the OTLP exporter with Datadog-specific resource attributes (`dd.service`, `dd.env`, `dd.version` mapped from §17 `model-router` provider id + agent name + spec version).
+- Routes via Datadog's OTLP intake (`https://trace.agent.datadoghq.com/api/v0.2/traces`) when `DD_API_KEY` is set; falls back to the OTLP collector sidecar otherwise.
+- Honors `DD_TRACE_ENABLED`, `DD_LOG_LEVEL`, `DD_TAGS` env vars.
+- T2 fixture-trace snapshot of the Datadog-flavoured payload.
+
+**`packages/exporter-honeycomb`** — Honeycomb tracing
+- OTLP/HTTP exporter pointed at `https://api.honeycomb.io/v1/traces` with `x-honeycomb-team` header.
+- Honeycomb's "dataset" maps to OTel `service.name`; the adapter exposes a `dataset` option that defaults to the spec name.
+
+**`packages/exporter-splunk`** — Splunk Observability Cloud
+- OTLP/HTTP exporter pointed at `https://ingest.<realm>.signalfx.com/v2/trace/otlp` with `X-SF-TOKEN` header.
+- Honors `SPLUNK_REALM` + `SPLUNK_ACCESS_TOKEN` env vars.
+
+**`packages/exporter-newrelic`** — New Relic
+- OTLP/HTTP exporter pointed at `https://otlp.nr-data.net` with `api-key` header (license key).
+- Honors `NEW_RELIC_LICENSE_KEY` env var.
+
+### Tests
+
+- T1 per adapter: header injection + endpoint routing
+- T2 fixture trace round-trip per adapter (assert the attribute mapping is correct against a known-good vendor payload)
+- T8 credential-leak guard per adapter (verify the license key never appears in logs / span attributes / error messages)
+
+### End-to-end smoke
+
+`bun run smoke:section-37` synthesizes 5 model_response events through each adapter and asserts the configured endpoint received the right payload via stub-fetch. Live probes per vendor gated on the respective env var (`DD_API_KEY` etc.).
+
+---
+
+## Section 38 — Production graders
+
+> Status: 🟡 independent. Can land any time.
+
+**Catalog modules:** `grader-nlg-metrics` (R15), `grader-semantic-similarity` (R15), `grader-safety-classifiers` (R15), `grader-multimodal` (R15)
+
+§16 `eval-grader` ships exact_match / contains / regex / json_path / schema / tool_call_sequence built-ins plus `eval-judge` for LLM-as-judge with rubrics. §29 `grader-registry` lets community graders plug in. Section 38 ships the four production-grade grader families that serious eval work needs.
+
+### Build order within this section
+
+All four packages are independent; each is its own PR.
+
+### What to build
+
+**`packages/grader-nlg-metrics`** — ROUGE / BLEU / METEOR
+- Pure-TS implementation of ROUGE-1, ROUGE-2, ROUGE-L; BLEU-1 through BLEU-4; METEOR.
+- `register("rouge_l", { reference: <expected>, threshold: 0.8 })` style options.
+- T1 corpus: 100-pair fixture against published reference scores; T9 score-monotonicity property.
+
+**`packages/grader-semantic-similarity`** — embedding-cosine
+- Computes cosine similarity between agent output and `expected_output` using a caller-supplied §21 embedder (`mock` for tests; OpenAI/Voyage/Cohere in prod).
+- Configurable threshold + fallback to ROUGE-L when the embedder is unavailable.
+- T3 against fixture text pairs + the mock embedder; T9 property test (embed(x) ≈ embed(x) so similarity≈1.0).
+
+**`packages/grader-safety-classifiers`** — toxicity / bias / PII
+- Three sub-graders: `toxicity` (OpenAI moderation API or local fastText classifier), `bias` (caller-supplied classifier), `pii_leak` (regex + classifier).
+- Fail-loud when API keys are missing in production mode; mock-classifier path for tests.
+- T8 corpus: 50 known-toxic + 50 known-clean utterances; assert FN rate < 5% and FP rate < 10%.
+
+**`packages/grader-multimodal`** — image / audio
+- `image_similarity` (perceptual hash + DSSIM); `image_ocr_then_grade` (OCR via Tesseract → applies a text grader); `audio_transcript_match` (speech-to-text → text grader).
+- T1 fixture screenshots + audio clips with known transcripts.
+
+### Tests
+
+- T1 per sub-grader fixture corpus
+- T9 monotonicity / determinism property tests
+- T8 PII-leak corpus regression test
+
+### End-to-end smoke
+
+`bun run smoke:section-38` runs each new grader against a 5-sample fixture dataset and asserts pass-rate matches snapshot.
+
+---
+
+## Section 39 — Compliance & audit hardening
+
+> Status: 🟡 independent. Best worked alongside §38 because `grader-safety-classifiers` PII-leak detection feeds the §39 redaction layer.
+
+**Catalog modules:** `audit-encryption` (R17), `data-retention-engine` (R17), `compliance-controls` (R17), `pii-redactor` (R17)
+
+§20 ships hash-chained tamper-evident audit-log + per-tenant policy-engine. Enterprise compliance needs three more layers: encryption-at-rest for audit logs, configurable data-retention policies (GDPR right-to-delete), and SOC 2 / ISO 27001 / HIPAA control-evidence collection.
+
+### Build order within this section
+
+```
+pii-redactor              (parallel — feeds the others)
+audit-encryption          (parallel)
+data-retention-engine     (parallel)
+compliance-controls  ──►  (depends on the three above for evidence collection)
+```
+
+### What to build
+
+**`packages/pii-redactor`** — outbound + audit redaction
+- Composable detectors: regex patterns (SSN / credit-card / phone / email / IBAN), classifier-driven (delegates to §38 `grader-safety-classifiers.pii_leak`), policy-driven (per-tenant allow-list of fields).
+- Two modes: `replace` (substitute with `[REDACTED:<kind>]` markers) or `hash` (deterministic salted hash so analysts can correlate without seeing the value).
+- Wired into runtime-core's post-tool path so tool outputs go through redaction before reaching the model and the trace bus; wired into `audit-log.append` so audit records don't carry PII.
+
+**`packages/audit-encryption`** — AES-256 encryption-at-rest
+- Wraps the existing `audit-log` write path with envelope encryption: each line's `payload` field is encrypted with a tenant-scoped data-encryption-key, which is itself encrypted by a KEK from §27 `secrets-manager`.
+- Read-side decryption transparent to existing `verify` + `read` flows.
+- Per-tenant key rotation supported via §27 `onRotation`.
+- T8 ensures a tampered ciphertext fails `verify`.
+
+**`packages/data-retention-engine`** — GDPR / right-to-delete
+- `retain(tenant, kind, durationDays)` policies; cron-style sweeper that deletes audit records past their retention window.
+- `export(tenant, format)` produces a tenant-scoped data dump (JSON or NDJSON) — right-to-export.
+- `purge(tenant, kind?, before?)` — right-to-delete; honors compliance-controls' "do not purge during audit window" override.
+- T8 cross-tenant isolation: tenant A's purge never touches tenant B's records.
+
+**`packages/compliance-controls`** — control-evidence collection
+- Schema for SOC 2 / ISO 27001 / HIPAA controls: `{ frameworkId, controlId, evidenceQueries: AuditEventFilter[] }`.
+- Periodic evidence collection: walks the audit-log per control, collects matching records, writes a signed evidence bundle to `.crewhaus/compliance/<framework>/<controlId>/<period>.json`.
+- Built-in framework definitions for SOC 2 Type II's CC6.x (logical access) and CC7.x (system operations); ISO 27001 A.12.4 (logging); HIPAA §164.312(b) (audit controls).
+- `crewhaus compliance evidence --framework soc2 --period 2026-Q2` CLI subcommand.
+
+### Tests
+
+- `pii-redactor`: T1 per detector; T8 redaction-completeness corpus (100 PII samples × 5 detectors)
+- `audit-encryption`: T1 envelope encryption + KEK rotation; T8 tampered-ciphertext detection
+- `data-retention-engine`: T3 sweeper round-trip; T8 cross-tenant purge isolation; T9 idempotence (re-running yields zero changes)
+- `compliance-controls`: T1 per built-in framework; T3 evidence-bundle generation against a fixture audit-log
+
+### End-to-end smoke
+
+`bun run smoke:section-39` writes a fake audit corpus, runs encryption + retention sweep + a SOC 2 evidence collection, and asserts the resulting bundle covers every required control.
+
+---
+
+## Section 40 — Spec template marketplace + example CI
+
+> Status: 🟡 last in v1.2 phase.
+
+**Catalog modules:** `template-registry` (F4), `template-marketplace-client` (F4); plus a `.github/workflows/example-corpus.yml` CI job (no new package)
+
+§26 `scaffold-templates` ships 10 hardcoded templates. A marketplace lets community contributors publish templates and lets users discover them via Studio. Pairs with a CI hardening pass that asserts every example in `examples/` compiles and runs end-to-end (today the compile commands are documented but not gated in CI — drift risk).
+
+### Build order within this section
+
+```
+template-registry  ──►  template-marketplace-client  ──►  studio-ui integration (existing)
+example-corpus CI  (parallel)
+```
+
+### What to build
+
+**`packages/template-registry`** — backend-agnostic template fetcher
+- `RegistrySource` interface: `list()`, `fetch(name)`, `metadata(name)`. Backends: `git` (GitHub Releases), `huggingface` (Datasets), `npm` (a package whose entry-point exports a template manifest), `local` (file-backed default for tests).
+- Caches results with TTL (default 60 minutes); cache invalidation via `crewhaus templates refresh`.
+- Manifest schema: `{ name, version, description, author, target, yaml, exampleEnv?, screenshots? }`. Manifests signed with a sigstore-style signature so users can verify provenance.
+- T8 supply-chain check: refuses templates whose signature doesn't verify against a configured trust root.
+
+**`packages/template-marketplace-client`** — Studio integration
+- New Studio tab "Marketplace" listing community templates; click-to-install pulls the manifest, validates, and saves into the user's spec workspace.
+- Search + filter by `target`, `author`, freshness.
+- One-click "publish" submits a PR to the canonical registry repo (or pushes a Gist for ad-hoc sharing).
+
+**`.github/workflows/example-corpus.yml`** — CI gate
+- Matrix-style job that for every `examples/<name>/crewhaus.yaml`, runs `bun apps/cli/src/index.ts compile examples/<name>/crewhaus.yaml -o /tmp/<name>` with a 60s timeout and asserts exit code 0 + the bundle imports cleanly.
+- Daemon-shape examples (channel, managed, voice) use `--dry-run` mode that exits after boot success.
+- Catches drift the moment a new example fails to compile.
+
+### Tests
+
+- `template-registry`: T1 per backend; T8 signature verification; T9 cache-TTL invariants
+- `template-marketplace-client`: T1 install round-trip; T3 against a fixture registry
+- `example-corpus.yml`: tested by being part of CI itself (any drift = red build)
+
+### End-to-end smoke
+
+`bun run smoke:section-40` writes a fixture template manifest to a local registry, runs `crewhaus templates install <name>`, asserts the spec lands in the workspace, then compiles + runs it end-to-end.
+
+---
+
 ## Kickoff prompts
 
 Use these prompts with Claude Code from the project root (`/Users/bots/Developer/crewhaus-factory`). Each prompt is self-contained.
@@ -4036,6 +4320,208 @@ Playground (PR 3):
 - Edit the prompt; run; verify the trace renders live in the side panel
 - Sign in via OAuth dev mode (GitHub mock); verify the spec persists across browser refresh
 - Open in incognito; verify anonymous-quota is enforced (trip the quota; confirm friendly error)
+
+Update docs/MODULE-CATALOG.md and docs/build-roadmap.md with everything that is complete after EACH PR (one update per package).
+```
+
+---
+
+### Section 36 — Polyglot sandbox images
+
+```
+Read docs/build-roadmap.md Section 36 and docs/MODULE-CATALOG.md scoped-for-v1.2 entries for sandbox-image-registry + per-language images.
+
+Also read in full:
+- packages/sandbox/src/index.ts — current Docker / Podman / noop backend; CREWHAUS_SANDBOX_ALLOWED_IMAGES handling
+- packages/tool-code-execution/src/index.ts — how Python / JavaScript / Shell tools resolve their images today
+- packages/sandbox/src/index.test.ts — T8 escape-attempt corpus this section reuses
+
+Build in this order:
+
+1. packages/sandbox-image-registry (sequential prereq)
+   - registerSandboxImage({ id, image, healthcheck, defaultEntrypoint }) + lookupSandboxImage(id)
+   - Backwards-compat: auto-register python/node/alpine at boot
+   - `crewhaus sandbox doctor` CLI subcommand
+
+2. Then in parallel: packages/sandbox-image-{go, rust, java, ruby, r, dotnet, php}
+   - Multi-stage Dockerfile per language
+   - Default entrypoint for snippet-mode + advanced file-mode
+   - Healthcheck contract per the registry shape
+
+Each language image gets:
+- T2 contract test: hello-world snippet round-trips through tool-code-execution
+- T8 escape-attempt suite (reuse §18 fixtures)
+- T7 warm-pool cold-start budget (≤2s for compiled langs; ≤4s for .NET; ≤500ms for shell-shape interpreters)
+
+End-to-end smoke before opening the PR:
+- ANTHROPIC_AUTH_TOKEN is in .env (Bun auto-loads .env)
+- `bun run smoke:section-36` boots sandbox-image-registry, registers all seven images, runs a hello-world snippet through each, asserts exit code 0 + expected stdout token
+- Live-image probe (gated on CREWHAUS_SECTION36_LIVE_DOCKER=1) pulls each image from a real registry and runs the same probes against the actual sandbox
+
+Update docs/MODULE-CATALOG.md and docs/build-roadmap.md with everything that is complete after EACH PR (one update per language).
+```
+
+---
+
+### Section 37 — Vendor telemetry exporters
+
+```
+Read docs/build-roadmap.md Section 37. Also read in full:
+- packages/otel-exporter/src/index.ts — current OTLP/HTTP exporter; gen_ai/* attribute mapping
+- packages/metrics-collector/src/index.ts — current Prometheus textfile / stdout JSON / HTTP /metrics sinks
+- packages/runtime-core/src/observability.ts — how exporters attach via attachDefaultSubscribers
+
+Build all four packages in parallel — they have no dependencies on each other:
+
+1. packages/exporter-datadog
+   - Wraps OTLP with dd.service / dd.env / dd.version resource attributes
+   - Routes via Datadog OTLP intake when DD_API_KEY is set; falls back to sidecar otherwise
+   - Honors DD_TRACE_ENABLED, DD_LOG_LEVEL, DD_TAGS
+
+2. packages/exporter-honeycomb
+   - OTLP/HTTP to api.honeycomb.io with x-honeycomb-team
+   - Honeycomb dataset = OTel service.name; configurable
+
+3. packages/exporter-splunk
+   - OTLP/HTTP to ingest.<realm>.signalfx.com with X-SF-TOKEN
+   - SPLUNK_REALM + SPLUNK_ACCESS_TOKEN env vars
+
+4. packages/exporter-newrelic
+   - OTLP/HTTP to otlp.nr-data.net with api-key header
+   - NEW_RELIC_LICENSE_KEY env var
+
+Each gets:
+- T1 header injection + endpoint routing
+- T2 fixture trace round-trip (assert attribute mapping against vendor-flavoured payload)
+- T8 credential-leak guard (license key never appears in logs or errors)
+
+End-to-end smoke before opening the PR:
+- ANTHROPIC_AUTH_TOKEN is in .env (Bun auto-loads .env)
+- `bun run smoke:section-37` synthesizes 5 model_response events through each adapter and asserts the configured endpoint received the right payload via stub-fetch
+- Live probes per vendor gated on the respective env var (DD_API_KEY / HONEYCOMB_API_KEY / SPLUNK_ACCESS_TOKEN / NEW_RELIC_LICENSE_KEY)
+
+Update docs/MODULE-CATALOG.md and docs/build-roadmap.md with everything that is complete after EACH PR (one update per vendor).
+```
+
+---
+
+### Section 38 — Production graders
+
+```
+Read docs/build-roadmap.md Section 38. Also read in full:
+- packages/eval-grader/src/index.ts — Grader interface + built-ins (exact_match, regex, json_path, schema, tool_call_sequence)
+- packages/eval-judge/src/index.ts — LLM-as-judge with structured rubrics
+- packages/grader-registry/src/index.ts — pluggable named-grader registry (§29)
+- packages/embedder/src/index.ts — embedder providers for grader-semantic-similarity
+
+Build all four packages in parallel — each plugs into grader-registry independently:
+
+1. packages/grader-nlg-metrics
+   - Pure-TS ROUGE-1, ROUGE-2, ROUGE-L; BLEU-1..4; METEOR
+   - register("rouge_l", { reference: <expected>, threshold: 0.8 })
+   - T1 100-pair fixture against published reference scores; T9 score-monotonicity property
+
+2. packages/grader-semantic-similarity
+   - Cosine over caller-supplied embedder (§21); mock embedder for tests
+   - Configurable threshold + ROUGE-L fallback when embedder unavailable
+
+3. packages/grader-safety-classifiers
+   - Three sub-graders: toxicity (OpenAI moderation OR local fastText), bias (caller-supplied), pii_leak (regex + classifier)
+   - Fail-loud when API keys missing in production mode; mock-classifier for tests
+   - T8 corpus: 50 known-toxic + 50 known-clean; FN < 5%, FP < 10%
+
+4. packages/grader-multimodal
+   - image_similarity (perceptual hash + DSSIM)
+   - image_ocr_then_grade (Tesseract → text grader)
+   - audio_transcript_match (speech-to-text → text grader)
+   - T1 fixture screenshots + audio clips with known transcripts
+
+End-to-end smoke before opening the PR:
+- ANTHROPIC_AUTH_TOKEN is in .env (Bun auto-loads .env)
+- `bun run smoke:section-38` runs each new grader against a 5-sample fixture dataset; asserts pass-rate matches snapshot
+- Live grader probes gated on the relevant API keys (OPENAI_API_KEY for moderation; PERSPECTIVE_API_KEY for bias)
+
+Update docs/MODULE-CATALOG.md and docs/build-roadmap.md with everything that is complete after EACH PR (one update per family).
+```
+
+---
+
+### Section 39 — Compliance & audit hardening
+
+```
+Read docs/build-roadmap.md Section 39. Also read in full:
+- packages/audit-log/src/index.ts — hash-chained tamper-evident JSONL
+- packages/policy-engine/src/index.ts — per-decision audit hooks
+- packages/tenancy/src/index.ts — tenant scoping
+- packages/secrets-manager/src/index.ts — KEK source for audit encryption (§27)
+- packages/grader-safety-classifiers/src/index.ts (§38) — pii_leak detector pii-redactor delegates to
+
+Build in this order (pii-redactor + audit-encryption + data-retention-engine parallel; compliance-controls last):
+
+1. packages/pii-redactor (parallel)
+   - Composable detectors: regex (SSN/CC/phone/email/IBAN), classifier-driven (delegates to §38), policy-driven (per-tenant allow-list)
+   - Two modes: replace ([REDACTED:<kind>]) or hash (deterministic salted)
+   - Wired into runtime-core post-tool path + audit-log.append
+
+2. packages/audit-encryption (parallel)
+   - Envelope encryption: per-line payload with tenant-scoped DEK; KEK from §27 secrets-manager
+   - Read-side decryption transparent to existing verify + read flows
+   - Per-tenant key rotation via §27 onRotation
+   - T8 tampered ciphertext fails verify
+
+3. packages/data-retention-engine (parallel)
+   - retain(tenant, kind, durationDays) policies; cron-style sweeper
+   - export(tenant, format) for right-to-export
+   - purge(tenant, kind?, before?) for right-to-delete; honors compliance-controls "do not purge during audit window" override
+   - T8 cross-tenant isolation
+
+4. packages/compliance-controls (depends on above)
+   - Schema: { frameworkId, controlId, evidenceQueries: AuditEventFilter[] }
+   - Periodic sweeper writes signed evidence bundles to .crewhaus/compliance/<framework>/<controlId>/<period>.json
+   - Built-in defs for SOC 2 CC6.x + CC7.x; ISO 27001 A.12.4; HIPAA §164.312(b)
+   - `crewhaus compliance evidence --framework soc2 --period 2026-Q2` CLI
+
+End-to-end smoke before opening the PR:
+- ANTHROPIC_AUTH_TOKEN is in .env (Bun auto-loads .env)
+- `bun run smoke:section-39` writes a fake audit corpus, runs encryption + retention sweep + a SOC 2 evidence collection, asserts the resulting bundle covers every required control
+- Cross-tenant isolation probe: tenant A purge does not touch tenant B records
+
+Update docs/MODULE-CATALOG.md and docs/build-roadmap.md with everything that is complete after EACH PR (one update per package).
+```
+
+---
+
+### Section 40 — Spec template marketplace + example CI
+
+```
+Read docs/build-roadmap.md Section 40. Also read in full:
+- packages/scaffold-templates/src/index.ts — current 10 hardcoded templates (one per shipped target shape)
+- packages/studio-server/src/index.ts — /api/templates endpoint
+- packages/studio-ui/src/index.ts — Specs / Wizard / Plugins tabs (Marketplace tab lands here)
+- .github/workflows/ci.yml — current CI surface
+- examples/*/crewhaus.yaml — every example to gate in the new CI matrix
+
+Build in this order:
+
+1. packages/template-registry (sequential prereq)
+   - RegistrySource interface: list(), fetch(name), metadata(name)
+   - Backends: git (GitHub Releases), huggingface (Datasets), npm, local (file-backed default)
+   - TTL caching (default 60min); `crewhaus templates refresh`
+   - Manifest schema with sigstore-style signature verification
+   - T8 supply-chain check refuses unverified signatures
+
+2. packages/template-marketplace-client (depends on registry)
+   - Studio "Marketplace" tab: list community templates, click-to-install, search/filter
+   - One-click "publish" submits a PR to canonical registry repo OR pushes a Gist
+
+3. .github/workflows/example-corpus.yml (parallel)
+   - Matrix: for every examples/<name>/crewhaus.yaml, run `bun apps/cli/src/index.ts compile examples/<name>/crewhaus.yaml -o /tmp/<name>` with 60s timeout, assert exit 0 + bundle imports cleanly
+   - Daemon-shape examples use --dry-run mode that exits after boot success
+
+End-to-end smoke before opening the PR:
+- ANTHROPIC_AUTH_TOKEN is in .env (Bun auto-loads .env)
+- `bun run smoke:section-40` writes a fixture template manifest to a local registry, runs `crewhaus templates install <name>`, asserts the spec lands in the workspace, then compiles + runs it end-to-end
+- Verify the example-corpus.yml workflow turns red when any example is intentionally broken (in a scratch branch)
 
 Update docs/MODULE-CATALOG.md and docs/build-roadmap.md with everything that is complete after EACH PR (one update per package).
 ```
