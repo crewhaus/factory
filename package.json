@@ -89,6 +89,7 @@
     "smoke:section-37-splunk": "bun examples/section-37-exporter-splunk-smoke/smoke.ts",
     "smoke:section-37-newrelic": "bun examples/section-37-exporter-newrelic-smoke/smoke.ts",
     "smoke:section-38-nlg": "bun examples/section-38-grader-nlg-metrics-smoke/smoke.ts",
+    "smoke:section-38-semantic": "bun examples/section-38-grader-semantic-similarity-smoke/smoke.ts",
     "smoke:section-37": "bun examples/section-37-exporter-datadog-smoke/smoke.ts && bun examples/section-37-exporter-honeycomb-smoke/smoke.ts && bun examples/section-37-exporter-splunk-smoke/smoke.ts && bun examples/section-37-exporter-newrelic-smoke/smoke.ts",
     "smoke:section-36": "bun examples/section-36-sandbox-image-registry-smoke/smoke.ts && bun examples/section-36-sandbox-image-go-smoke/smoke.ts && bun examples/section-36-sandbox-image-rust-smoke/smoke.ts && bun examples/section-36-sandbox-image-java-smoke/smoke.ts && bun examples/section-36-sandbox-image-ruby-smoke/smoke.ts && bun examples/section-36-sandbox-image-r-smoke/smoke.ts && bun examples/section-36-sandbox-image-dotnet-smoke/smoke.ts && bun examples/section-36-sandbox-image-php-smoke/smoke.ts"
   },

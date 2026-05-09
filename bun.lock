@@ -487,6 +487,16 @@
         "@crewhaus/grader-registry": "workspace:*",
       },
     },
+    "examples/section-38-grader-semantic-similarity-smoke": {
+      "name": "@crewhaus-examples/section-38-grader-semantic-similarity-smoke",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/embedder": "workspace:*",
+        "@crewhaus/eval-grader": "workspace:*",
+        "@crewhaus/grader-registry": "workspace:*",
+        "@crewhaus/grader-semantic-similarity": "workspace:*",
+      },
+    },
     "packages/a2a-protocol": {
       "name": "@crewhaus/a2a-protocol",
       "version": "0.0.0",
@@ -1000,6 +1010,16 @@
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/eval-grader": "workspace:*",
+      },
+    },
+    "packages/grader-semantic-similarity": {
+      "name": "@crewhaus/grader-semantic-similarity",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/embedder": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/eval-grader": "workspace:*",
+        "@crewhaus/grader-nlg-metrics": "workspace:*",
       },
     },
     "packages/graph-engine": {
@@ -2146,6 +2166,8 @@
 
     "@crewhaus-examples/section-38-grader-nlg-metrics-smoke": ["@crewhaus-examples/section-38-grader-nlg-metrics-smoke@workspace:examples/section-38-grader-nlg-metrics-smoke"],
 
+    "@crewhaus-examples/section-38-grader-semantic-similarity-smoke": ["@crewhaus-examples/section-38-grader-semantic-similarity-smoke@workspace:examples/section-38-grader-semantic-similarity-smoke"],
+
     "@crewhaus/a2a-protocol": ["@crewhaus/a2a-protocol@workspace:packages/a2a-protocol"],
 
     "@crewhaus/abort-controller": ["@crewhaus/abort-controller@workspace:packages/abort-controller"],
@@ -2255,6 +2277,8 @@
     "@crewhaus/grader-nlg-metrics": ["@crewhaus/grader-nlg-metrics@workspace:packages/grader-nlg-metrics"],
 
     "@crewhaus/grader-registry": ["@crewhaus/grader-registry@workspace:packages/grader-registry"],
+
+    "@crewhaus/grader-semantic-similarity": ["@crewhaus/grader-semantic-similarity@workspace:packages/grader-semantic-similarity"],
 
     "@crewhaus/graph-engine": ["@crewhaus/graph-engine@workspace:packages/graph-engine"],
 
