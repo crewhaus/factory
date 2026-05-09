@@ -1,0 +1,19 @@
+{
+  "name": "@crewhaus/grader-safety-classifiers",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Safety-classifier graders: toxicity, bias, pii_leak. Pluggable via @crewhaus/grader-registry (Section 38)",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@crewhaus/errors": "workspace:*",
+    "@crewhaus/eval-grader": "workspace:*"
+  }
+}

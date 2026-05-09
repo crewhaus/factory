@@ -487,6 +487,15 @@
         "@crewhaus/grader-registry": "workspace:*",
       },
     },
+    "examples/section-38-grader-safety-classifiers-smoke": {
+      "name": "@crewhaus-examples/section-38-grader-safety-classifiers-smoke",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/eval-grader": "workspace:*",
+        "@crewhaus/grader-registry": "workspace:*",
+        "@crewhaus/grader-safety-classifiers": "workspace:*",
+      },
+    },
     "examples/section-38-grader-semantic-similarity-smoke": {
       "name": "@crewhaus-examples/section-38-grader-semantic-similarity-smoke",
       "version": "0.0.0",
@@ -1006,6 +1015,14 @@
     },
     "packages/grader-registry": {
       "name": "@crewhaus/grader-registry",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/eval-grader": "workspace:*",
+      },
+    },
+    "packages/grader-safety-classifiers": {
+      "name": "@crewhaus/grader-safety-classifiers",
       "version": "0.0.0",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
@@ -2166,6 +2183,8 @@
 
     "@crewhaus-examples/section-38-grader-nlg-metrics-smoke": ["@crewhaus-examples/section-38-grader-nlg-metrics-smoke@workspace:examples/section-38-grader-nlg-metrics-smoke"],
 
+    "@crewhaus-examples/section-38-grader-safety-classifiers-smoke": ["@crewhaus-examples/section-38-grader-safety-classifiers-smoke@workspace:examples/section-38-grader-safety-classifiers-smoke"],
+
     "@crewhaus-examples/section-38-grader-semantic-similarity-smoke": ["@crewhaus-examples/section-38-grader-semantic-similarity-smoke@workspace:examples/section-38-grader-semantic-similarity-smoke"],
 
     "@crewhaus/a2a-protocol": ["@crewhaus/a2a-protocol@workspace:packages/a2a-protocol"],
@@ -2277,6 +2296,8 @@
     "@crewhaus/grader-nlg-metrics": ["@crewhaus/grader-nlg-metrics@workspace:packages/grader-nlg-metrics"],
 
     "@crewhaus/grader-registry": ["@crewhaus/grader-registry@workspace:packages/grader-registry"],
+
+    "@crewhaus/grader-safety-classifiers": ["@crewhaus/grader-safety-classifiers@workspace:packages/grader-safety-classifiers"],
 
     "@crewhaus/grader-semantic-similarity": ["@crewhaus/grader-semantic-similarity@workspace:packages/grader-semantic-similarity"],
 
