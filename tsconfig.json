@@ -52,6 +52,7 @@
     { "path": "./packages/eval-runner" },
     { "path": "./packages/eval-report" },
     { "path": "./packages/sandbox" },
+    { "path": "./packages/sandbox-image-registry" },
     { "path": "./packages/prompt-injection-detector" },
     { "path": "./packages/tool-code-execution" },
     { "path": "./packages/checkpoint-store" },

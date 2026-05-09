@@ -111,6 +111,14 @@ const COST_SUMMARY_SCHEMA: ParseArgsSchema = {
   ],
 };
 
+const SANDBOX_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "probe", takesValue: false },
+    { name: "format", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
 const SECRETS_SCHEMA: ParseArgsSchema = {
   flags: [
     { name: "backend", takesValue: true },
@@ -205,6 +213,8 @@ function usage(): never {
       "       --region <r>",
       "  federation discover <deployment>     resolve a federated peer's endpoint + cert fingerprint (Section 34)",
       "       [--srv-domain <d>] [--format json|yaml]",
+      "  sandbox doctor [--probe]             list registered sandbox images + healthcheck status (Section 36)",
+      "       [--format json|table]",
       "",
     ].join("\n"),
   );
@@ -1204,6 +1214,69 @@ async function runFederation(rest: ReadonlyArray<string>): Promise<void> {
   }
 }
 
+/**
+ * Section 36 — `crewhaus sandbox <action>`. Single action today: `doctor`.
+ *   doctor              list registered sandbox images + healthcheck status
+ *
+ * `--probe` runs each registered image's healthcheck argv via the configured
+ * sandbox backend (docker / podman / noop). Without `--probe` the command
+ * just snapshots the in-process registry — useful for verifying that the
+ * polyglot images are wired up after a fresh `crewhaus install`.
+ */
+async function runSandbox(args: ParsedArgs, action: string): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage:\n" + "  crewhaus sandbox doctor [--probe] [--format json|table]\n",
+    );
+    return;
+  }
+  if (action !== "doctor") die(`unknown sandbox action "${action}" (expected: doctor)`);
+
+  const formatFlag = args.flags["format"];
+  const format = typeof formatFlag === "string" ? formatFlag : "table";
+  if (format !== "json" && format !== "table") {
+    die(`--format must be "json" or "table" (got "${format}")`);
+  }
+  const wantProbe = args.flags["probe"] === true;
+
+  const reg = await import("@crewhaus/sandbox-image-registry");
+  // Touch the registry so the §18 trio bootstraps.
+  reg.listSandboxImages();
+
+  let statuses = reg.snapshotImageStatuses();
+  if (wantProbe) {
+    const sandboxMod = await import("@crewhaus/sandbox");
+    const sandbox = sandboxMod.createSandbox({
+      allowedImages: reg.listAllowedImageRefs(),
+    });
+    statuses = await reg.runHealthchecks(async (entry) => {
+      const result = await sandbox.exec({
+        image: entry.image,
+        argv: [...entry.healthcheck.command],
+        timeoutMs: entry.healthcheck.timeoutMs ?? 5_000,
+      });
+      return { exitCode: result.exitCode, stderr: result.stderr };
+    });
+    await sandbox.close();
+  }
+
+  if (format === "json") {
+    process.stdout.write(`${JSON.stringify(statuses, null, 2)}\n`);
+    return;
+  }
+  process.stdout.write("registered sandbox images:\n");
+  const summaries = reg.listSandboxImages();
+  const byId = new Map(statuses.map((s) => [s.id, s]));
+  for (const e of summaries) {
+    const s = byId.get(e.id);
+    const mark = s?.healthy ? "✓" : wantProbe ? "✗" : "•";
+    const tail = s?.healthy
+      ? `last healthy ${s.lastHealthyAt}`
+      : (s?.lastError ?? (wantProbe ? "no probe result" : "not yet probed"));
+    process.stdout.write(`  ${mark} ${e.id.padEnd(10)} ${e.image.padEnd(28)} ${tail}\n`);
+  }
+}
+
 const argv = process.argv.slice(2);
 const subcommand = argv[0] ?? "";
 const rest = argv.slice(1);
@@ -1274,6 +1347,14 @@ switch (subcommand) {
       die(`federation action must be "discover" (got "${action}")`);
     }
     await runFederation(rest.slice(1));
+    break;
+  }
+  case "sandbox": {
+    const action = rest[0] ?? "";
+    if (action !== "doctor") {
+      die(`sandbox action must be "doctor" (got "${action}")`);
+    }
+    await runSandbox(parseFor(rest.slice(1), SANDBOX_SCHEMA), action);
     break;
   }
   case "":
