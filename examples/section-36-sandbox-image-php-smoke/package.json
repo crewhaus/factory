@@ -1,0 +1,12 @@
+{
+  "name": "@crewhaus-examples/section-36-sandbox-image-php-smoke",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Section 36 sandbox-image-php smoke",
+  "dependencies": {
+    "@crewhaus/sandbox": "workspace:*",
+    "@crewhaus/sandbox-image-php": "workspace:*",
+    "@crewhaus/sandbox-image-registry": "workspace:*"
+  }
+}

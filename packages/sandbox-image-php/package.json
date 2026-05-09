@@ -1,0 +1,20 @@
+{
+  "name": "@crewhaus/sandbox-image-php",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "PHP 8.3 polyglot sandbox image: registry registration + Dockerfile + T2/T7/T8 contract tests (Section 36)",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@crewhaus/errors": "workspace:*",
+    "@crewhaus/sandbox": "workspace:*",
+    "@crewhaus/sandbox-image-registry": "workspace:*"
+  }
+}
