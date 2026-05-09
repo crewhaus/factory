@@ -1,0 +1,9 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src/scripts",
+    "outDir": "dist"
+  },
+  "references": [{ "path": "../errors" }, { "path": "../vscode-extension" }],
+  "include": ["src/scripts/**/*"]
+}

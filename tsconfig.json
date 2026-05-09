@@ -99,6 +99,7 @@
     { "path": "./packages/federation-discovery" },
     { "path": "./packages/federation-router" },
     { "path": "./packages/vscode-extension" },
+    { "path": "./packages/jetbrains-plugin" },
     { "path": "./apps/cli" }
   ]
 }
