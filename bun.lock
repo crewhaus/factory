@@ -392,6 +392,15 @@
         "@crewhaus/sandbox-image-registry": "workspace:*",
       },
     },
+    "examples/section-36-sandbox-image-rust-smoke": {
+      "name": "@crewhaus-examples/section-36-sandbox-image-rust-smoke",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/sandbox": "workspace:*",
+        "@crewhaus/sandbox-image-registry": "workspace:*",
+        "@crewhaus/sandbox-image-rust": "workspace:*",
+      },
+    },
     "packages/a2a-protocol": {
       "name": "@crewhaus/a2a-protocol",
       "version": "0.0.0",
@@ -1175,6 +1184,15 @@
         "@crewhaus/sandbox": "workspace:*",
       },
     },
+    "packages/sandbox-image-rust": {
+      "name": "@crewhaus/sandbox-image-rust",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/sandbox": "workspace:*",
+        "@crewhaus/sandbox-image-registry": "workspace:*",
+      },
+    },
     "packages/scaffold-templates": {
       "name": "@crewhaus/scaffold-templates",
       "version": "0.0.0",
@@ -1931,6 +1949,8 @@
 
     "@crewhaus-examples/section-36-sandbox-image-registry-smoke": ["@crewhaus-examples/section-36-sandbox-image-registry-smoke@workspace:examples/section-36-sandbox-image-registry-smoke"],
 
+    "@crewhaus-examples/section-36-sandbox-image-rust-smoke": ["@crewhaus-examples/section-36-sandbox-image-rust-smoke@workspace:examples/section-36-sandbox-image-rust-smoke"],
+
     "@crewhaus/a2a-protocol": ["@crewhaus/a2a-protocol@workspace:packages/a2a-protocol"],
 
     "@crewhaus/abort-controller": ["@crewhaus/abort-controller@workspace:packages/abort-controller"],
@@ -2100,6 +2120,8 @@
     "@crewhaus/sandbox-image-go": ["@crewhaus/sandbox-image-go@workspace:packages/sandbox-image-go"],
 
     "@crewhaus/sandbox-image-registry": ["@crewhaus/sandbox-image-registry@workspace:packages/sandbox-image-registry"],
+
+    "@crewhaus/sandbox-image-rust": ["@crewhaus/sandbox-image-rust@workspace:packages/sandbox-image-rust"],
 
     "@crewhaus/scaffold-templates": ["@crewhaus/scaffold-templates@workspace:packages/scaffold-templates"],
 
