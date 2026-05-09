@@ -16,6 +16,8 @@
  *      a working CrewHaus deployment fixture. Skipped on plain CI.
  */
 import { execSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 
 import { type Discovery, createDiscovery } from "@crewhaus/federation-discovery";
 import {
@@ -97,18 +99,17 @@ log("probe B: discovery cache");
 
 // ── Probe C: router happy path ─────────────────────────────────────────────
 log("probe C: router happy path");
-let certs: { caCertPem: string; clientCertPem: string; clientKeyPem: string };
-{
-  // Generate a self-signed cert on the fly for the router's mTLS creds.
-  const dir = execSync("mktemp -d", { encoding: "utf8" }).trim();
-  execSync(
-    `openssl req -x509 -newkey rsa:2048 -nodes -keyout "${dir}/k.pem" -out "${dir}/c.pem" -days 30 -subj "/CN=deployment-test" -sha256 2>/dev/null`,
-    { stdio: "ignore" },
-  );
-  const certPem = execSync(`cat "${dir}/c.pem"`, { encoding: "utf8" });
-  const keyPem = execSync(`cat "${dir}/k.pem"`, { encoding: "utf8" });
-  certs = { caCertPem: certPem, clientCertPem: certPem, clientKeyPem: keyPem };
-}
+// Use the static fixture cert from packages/federation-protocol — the
+// earlier on-the-fly openssl req approach timed out CI runners with slow
+// entropy. The fixture is test-only (no production deployment uses it).
+const FIXTURE_DIR = join(import.meta.dir, "..", "..", "packages", "federation-protocol", "src");
+const certPemFixture = readFileSync(join(FIXTURE_DIR, "fixtures-cert.pem"), "utf8");
+const keyPemFixture = readFileSync(join(FIXTURE_DIR, "fixtures-key.pem"), "utf8");
+const certs = {
+  caCertPem: certPemFixture,
+  clientCertPem: certPemFixture,
+  clientKeyPem: keyPemFixture,
+};
 const fingerprint = fingerprintCert(certs.clientCertPem);
 
 const events: RouterTraceEvent[] = [];
