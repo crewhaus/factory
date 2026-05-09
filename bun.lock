@@ -25,7 +25,9 @@
         "@crewhaus/audit-log": "workspace:*",
         "@crewhaus/canary-controller": "workspace:*",
         "@crewhaus/compiler": "workspace:*",
+        "@crewhaus/crewhaus-cloud": "workspace:*",
         "@crewhaus/deployment-controller": "workspace:*",
+        "@crewhaus/docker-images": "workspace:*",
         "@crewhaus/eval-dataset": "workspace:*",
         "@crewhaus/eval-grader": "workspace:*",
         "@crewhaus/eval-report": "workspace:*",
@@ -298,6 +300,16 @@
         "@crewhaus/trace-viewer": "workspace:*",
       },
     },
+    "examples/section-32-smoke": {
+      "name": "@crewhaus-examples/section-32-smoke",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/crewhaus-cloud": "workspace:*",
+        "@crewhaus/docker-images": "workspace:*",
+        "@crewhaus/helm-chart": "workspace:*",
+        "@crewhaus/single-binary-cli": "workspace:*",
+      },
+    },
     "packages/a2a-protocol": {
       "name": "@crewhaus/a2a-protocol",
       "version": "0.0.0",
@@ -545,6 +557,15 @@
         "zod": "^3.23.8",
       },
     },
+    "packages/crewhaus-cloud": {
+      "name": "@crewhaus/crewhaus-cloud",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/docker-images": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/helm-chart": "workspace:*",
+      },
+    },
     "packages/dataset-registry": {
       "name": "@crewhaus/dataset-registry",
       "version": "0.0.0",
@@ -560,6 +581,13 @@
         "@crewhaus/audit-log": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/spec-registry": "workspace:*",
+      },
+    },
+    "packages/docker-images": {
+      "name": "@crewhaus/docker-images",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
       },
     },
     "packages/durable-execution": {
@@ -708,6 +736,14 @@
       "version": "0.0.0",
       "dependencies": {
         "@crewhaus/ir": "workspace:*",
+      },
+    },
+    "packages/helm-chart": {
+      "name": "@crewhaus/helm-chart",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/docker-images": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
       },
     },
     "packages/hooks-engine": {
@@ -987,6 +1023,13 @@
     },
     "packages/session-store": {
       "name": "@crewhaus/session-store",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+      },
+    },
+    "packages/single-binary-cli": {
+      "name": "@crewhaus/single-binary-cli",
       "version": "0.0.0",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
@@ -1688,6 +1731,8 @@
 
     "@crewhaus-examples/section-31-smoke": ["@crewhaus-examples/section-31-smoke@workspace:examples/section-31-smoke"],
 
+    "@crewhaus-examples/section-32-smoke": ["@crewhaus-examples/section-32-smoke@workspace:examples/section-32-smoke"],
+
     "@crewhaus/a2a-protocol": ["@crewhaus/a2a-protocol@workspace:packages/a2a-protocol"],
 
     "@crewhaus/abort-controller": ["@crewhaus/abort-controller@workspace:packages/abort-controller"],
@@ -1740,9 +1785,13 @@
 
     "@crewhaus/crew-orchestrator": ["@crewhaus/crew-orchestrator@workspace:packages/crew-orchestrator"],
 
+    "@crewhaus/crewhaus-cloud": ["@crewhaus/crewhaus-cloud@workspace:packages/crewhaus-cloud"],
+
     "@crewhaus/dataset-registry": ["@crewhaus/dataset-registry@workspace:packages/dataset-registry"],
 
     "@crewhaus/deployment-controller": ["@crewhaus/deployment-controller@workspace:packages/deployment-controller"],
+
+    "@crewhaus/docker-images": ["@crewhaus/docker-images@workspace:packages/docker-images"],
 
     "@crewhaus/durable-execution": ["@crewhaus/durable-execution@workspace:packages/durable-execution"],
 
@@ -1771,6 +1820,8 @@
     "@crewhaus/graph-engine": ["@crewhaus/graph-engine@workspace:packages/graph-engine"],
 
     "@crewhaus/graph-visualizer": ["@crewhaus/graph-visualizer@workspace:packages/graph-visualizer"],
+
+    "@crewhaus/helm-chart": ["@crewhaus/helm-chart@workspace:packages/helm-chart"],
 
     "@crewhaus/hooks-engine": ["@crewhaus/hooks-engine@workspace:packages/hooks-engine"],
 
@@ -1835,6 +1886,8 @@
     "@crewhaus/secrets-manager": ["@crewhaus/secrets-manager@workspace:packages/secrets-manager"],
 
     "@crewhaus/session-store": ["@crewhaus/session-store@workspace:packages/session-store"],
+
+    "@crewhaus/single-binary-cli": ["@crewhaus/single-binary-cli@workspace:packages/single-binary-cli"],
 
     "@crewhaus/skills-registry": ["@crewhaus/skills-registry@workspace:packages/skills-registry"],
 

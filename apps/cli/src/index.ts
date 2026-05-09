@@ -147,6 +147,26 @@ const MIGRATE_SCHEMA: ParseArgsSchema = {
   ],
 };
 
+const BUILD_IMAGE_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "tag", takesValue: true },
+    { name: "platform", takesValue: true },
+    { name: "push" },
+    { name: "help", short: "h" },
+  ],
+};
+
+const CLOUD_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "provider", takesValue: true },
+    { name: "region", takesValue: true },
+    { name: "tier", takesValue: true },
+    { name: "image-tag", takesValue: true },
+    { name: "working-dir", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
 function usage(): never {
   process.stderr.write(
     [
@@ -169,6 +189,12 @@ function usage(): never {
       "  spec put|list|get|pin|alias ...      versioned spec storage (Section 28 spec-registry)",
       "  deploy promote|rollback ...          re-pin a spec for an environment (Section 28)",
       "  migrate-all --from N --to N          batch-migrate every spec in the registry",
+      "  build-image <target> --tag <tag>     build the docker image for a target shape (Section 32)",
+      "       [--platform <p>] [--push]",
+      "  cloud deploy --provider <p>          deploy a managed CrewHaus cluster (Section 32)",
+      "       --region <r> [--tier <t>] [--image-tag <tag>]",
+      "  cloud teardown --provider <p>        tear down a managed cluster",
+      "       --region <r>",
       "",
     ].join("\n"),
   );
@@ -1014,6 +1040,108 @@ async function runMigrateAll(args: ParsedArgs): Promise<void> {
   if (result.failed > 0) process.exit(1);
 }
 
+/**
+ * Section 32 — `crewhaus build-image <target> --tag <tag> [--platform <p>] [--push]`.
+ * Wraps `docker buildx build` for the per-target Dockerfiles in
+ * @crewhaus/docker-images.
+ */
+async function runBuildImage(rest: ReadonlyArray<string>): Promise<void> {
+  const positional: string[] = [];
+  const flags = new Map<string, string | boolean>();
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i];
+    if (a === undefined) continue;
+    if (a === "--help" || a === "-h") {
+      process.stdout.write(
+        "usage: crewhaus build-image <target> --tag <tag> [--platform <p>] [--push]\n",
+      );
+      return;
+    }
+    if (a === "--push") {
+      flags.set("push", true);
+      continue;
+    }
+    if (a === "--tag" || a === "--platform") {
+      const v = rest[i + 1];
+      if (typeof v !== "string") die(`${a} requires a value`);
+      flags.set(a.slice(2), v);
+      i++;
+      continue;
+    }
+    positional.push(a);
+  }
+  const target = positional[0];
+  if (typeof target !== "string") die("missing <target> (one of cli, workflow, channel, ...)");
+  const tag = flags.get("tag");
+  if (typeof tag !== "string") die("missing --tag <tag>");
+  const platform = flags.get("platform");
+  const push = flags.get("push") === true;
+
+  const { buildImage, isTargetShape } = await import("@crewhaus/docker-images");
+  if (!isTargetShape(target)) {
+    die(`unknown target shape: ${target}`);
+  }
+  try {
+    const result = await buildImage({
+      target,
+      tag,
+      platform: typeof platform === "string" ? platform : undefined,
+      push,
+    });
+    process.stdout.write(`built crewhaus/${result.target}:${result.tag}\n`);
+  } catch (err) {
+    die(`build-image: ${(err as Error).message}`);
+  }
+}
+
+/**
+ * Section 32 — `crewhaus cloud deploy|teardown --provider <p> --region <r>`.
+ * Composite recipe: terraform-up + helm-chart + kustomize overlay.
+ */
+async function runCloud(args: ParsedArgs, action: string): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      `usage: crewhaus cloud ${action} --provider <aws|gcp|azure|aws-localstack> --region <r> [--tier <dev|default|production>] [--image-tag <tag>]\n`,
+    );
+    return;
+  }
+  const provider = args.flags["provider"];
+  const region = args.flags["region"];
+  if (typeof provider !== "string") die("missing --provider");
+  if (typeof region !== "string") die("missing --region");
+  const tierFlag = args.flags["tier"];
+  const imageTagFlag = args.flags["image-tag"];
+  const workingDirFlag = args.flags["working-dir"];
+
+  const cloudMod = await import("@crewhaus/crewhaus-cloud");
+  if (!cloudMod.isCloudProvider(provider)) {
+    die(`unknown provider: ${provider} (allowed: ${cloudMod.listProviders().join(", ")})`);
+  }
+  const config = {
+    ...cloudMod.defaultCloudConfig(provider, region),
+    ...(typeof tierFlag === "string" ? { tier: tierFlag as "dev" | "default" | "production" } : {}),
+    ...(typeof imageTagFlag === "string" ? { imageTag: imageTagFlag } : {}),
+  };
+
+  if (action === "deploy") {
+    const result = await cloudMod.deployCloud({
+      config,
+      workingDir: typeof workingDirFlag === "string" ? workingDirFlag : undefined,
+    });
+    process.stdout.write(`${cloudMod.summariseDeploy(result)}\n`);
+    return;
+  }
+  if (action === "teardown") {
+    await cloudMod.teardownCloud({
+      config,
+      workingDir: typeof workingDirFlag === "string" ? workingDirFlag : undefined,
+    });
+    process.stdout.write(`teardown complete for ${config.clusterName}\n`);
+    return;
+  }
+  die(`unknown cloud action "${action}" (expected: deploy | teardown)`);
+}
+
 const argv = process.argv.slice(2);
 const subcommand = argv[0] ?? "";
 const rest = argv.slice(1);
@@ -1067,6 +1195,17 @@ switch (subcommand) {
   case "migrate-all":
     await runMigrateAll(parseFor(rest, MIGRATE_SCHEMA));
     break;
+  case "build-image":
+    await runBuildImage(rest);
+    break;
+  case "cloud": {
+    const action = rest[0] ?? "";
+    if (action !== "deploy" && action !== "teardown") {
+      die(`cloud action must be "deploy" or "teardown" (got "${action}")`);
+    }
+    await runCloud(parseFor(rest.slice(1), CLOUD_SCHEMA), action);
+    break;
+  }
   case "":
   case "-h":
   case "--help":

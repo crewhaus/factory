@@ -47,6 +47,8 @@
     "@crewhaus/tool-mcp": "workspace:*",
     "@crewhaus/tool-task": "workspace:*",
     "@crewhaus/tool-todo": "workspace:*",
-    "@crewhaus/tool-web": "workspace:*"
+    "@crewhaus/tool-web": "workspace:*",
+    "@crewhaus/docker-images": "workspace:*",
+    "@crewhaus/crewhaus-cloud": "workspace:*"
   }
 }

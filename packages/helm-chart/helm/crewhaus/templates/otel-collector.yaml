@@ -1,0 +1,32 @@
+{{- if .Values.otel.enabled -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "crewhaus.fullname" . }}-otel
+  labels:
+    {{- include "crewhaus.labels" . | nindent 4 }}
+data:
+  collector.yaml: |
+    receivers:
+      otlp:
+        protocols:
+          http:
+            endpoint: 0.0.0.0:4318
+    processors:
+      batch:
+        timeout: 5s
+        send_batch_size: 1000
+    exporters:
+      logging:
+        loglevel: info
+    service:
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [batch]
+          exporters: [logging]
+        metrics:
+          receivers: [otlp]
+          processors: [batch]
+          exporters: [logging]
+{{- end }}

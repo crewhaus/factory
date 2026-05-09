@@ -1,0 +1,91 @@
+## Default values for the crewhaus chart.
+
+# One of: cli, workflow, channel, graph, managed, pipeline, crew, research,
+# batch, voice, browser, eval. Determines which Deployment template renders
+# and which Dockerfile-bundled image is used.
+target: channel
+
+image:
+  repository: crewhaus/${target}
+  tag: latest
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+replicas: 1
+
+# Spec ConfigMap source. The chart mounts this ConfigMap at /spec/crewhaus.yaml
+# inside every pod. Paths inside spec must use $VAR_NAME refs (Section 12) —
+# the chart wires them into env vars from `secrets` below.
+spec:
+  configMap: crewhaus-spec
+  fileName: crewhaus.yaml
+
+# Secret references. Each maps a CrewHaus env var to a Kubernetes Secret name +
+# key. Wires §27 secrets-manager to k8s Secret resources.
+secrets:
+  anthropic:
+    secretName: crewhaus-creds
+    key: ANTHROPIC_AUTH_TOKEN
+  slack:
+    signing:
+      secretName: crewhaus-creds
+      key: SLACK_SIGNING_SECRET
+    bot:
+      secretName: crewhaus-creds
+      key: SLACK_BOT_TOKEN
+
+# Service & Ingress (only rendered for daemon shapes: channel, managed, crew,
+# voice, browser).
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 3000
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: crewhaus.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+# §20 gateway-server JWT issuance.
+gateway:
+  tls:
+    cert: ""
+    key: ""
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 1000m
+    memory: 1Gi
+
+# §15 OTel collector sidecar — emits trace events to a configured backend.
+otel:
+  enabled: true
+  endpoint: ""
+  headers: ""
+
+# Prometheus operator ServiceMonitor for §15 metrics-collector httpServer mode.
+serviceMonitor:
+  enabled: true
+  interval: 30s
+  labels: {}
+
+# Pod security context (mirrors the Dockerfile USER + read-only root).
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  fsGroup: 10001
+
+securityContext:
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: [ALL]

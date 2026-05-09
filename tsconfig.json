@@ -87,6 +87,10 @@
     { "path": "./packages/regression-runner" },
     { "path": "./packages/prompt-optimizer" },
     { "path": "./packages/target-eval-bundle" },
+    { "path": "./packages/docker-images" },
+    { "path": "./packages/single-binary-cli" },
+    { "path": "./packages/helm-chart" },
+    { "path": "./packages/crewhaus-cloud" },
     { "path": "./apps/cli" }
   ]
 }
