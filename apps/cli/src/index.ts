@@ -119,6 +119,18 @@ const SANDBOX_SCHEMA: ParseArgsSchema = {
   ],
 };
 
+const COMPLIANCE_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "framework", takesValue: true },
+    { name: "control", takesValue: true },
+    { name: "period", takesValue: true },
+    { name: "audit-dir", takesValue: true },
+    { name: "out-dir", takesValue: true },
+    { name: "signing-key-env", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
 const SECRETS_SCHEMA: ParseArgsSchema = {
   flags: [
     { name: "backend", takesValue: true },
@@ -215,6 +227,9 @@ function usage(): never {
       "       [--srv-domain <d>] [--format json|yaml]",
       "  sandbox doctor [--probe]             list registered sandbox images + healthcheck status (Section 36)",
       "       [--format json|table]",
+      "  compliance evidence                  collect SOC 2 / ISO 27001 / HIPAA evidence (Section 39)",
+      "       --framework <id> [--control <id>] --period <p> [--audit-dir <d>]",
+      "       [--out-dir <d>] [--signing-key-env <ENV>]",
       "",
     ].join("\n"),
   );
@@ -1215,6 +1230,90 @@ async function runFederation(rest: ReadonlyArray<string>): Promise<void> {
 }
 
 /**
+ * Section 39 — `crewhaus compliance evidence` collects SOC 2 / ISO 27001 /
+ * HIPAA evidence bundles by walking an audit-log root and writing signed
+ * bundles to `.crewhaus/compliance/<framework>/<controlId>/<period>.json`.
+ *
+ * Usage:
+ *   crewhaus compliance evidence --framework soc2 --period 2026-Q2 \
+ *     [--control CC6.1] [--audit-dir <d>] [--out-dir <d>] \
+ *     [--signing-key-env CREWHAUS_COMPLIANCE_SIGNING_KEY]
+ */
+async function runCompliance(args: ParsedArgs, action: string): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage:\n" +
+        "  crewhaus compliance evidence --framework <id> [--control <id>] --period <p>\n" +
+        "    [--audit-dir <d>] [--out-dir <d>] [--signing-key-env <ENV>]\n",
+    );
+    return;
+  }
+  if (action !== "evidence") {
+    die(`unknown compliance action "${action}" (expected: evidence)`);
+  }
+  const frameworkFlag = args.flags["framework"];
+  const periodFlag = args.flags["period"];
+  if (typeof frameworkFlag !== "string") die("--framework <id> is required");
+  if (typeof periodFlag !== "string") die("--period <p> is required");
+
+  const auditDirFlag = args.flags["audit-dir"];
+  const outDirFlag = args.flags["out-dir"];
+  const auditDir =
+    typeof auditDirFlag === "string" ? auditDirFlag : join(process.cwd(), ".crewhaus", "audit");
+  const outDir =
+    typeof outDirFlag === "string" ? outDirFlag : join(process.cwd(), ".crewhaus", "compliance");
+
+  const signingKeyEnv = args.flags["signing-key-env"];
+  const signingKey =
+    typeof signingKeyEnv === "string" ? (process.env[signingKeyEnv] ?? undefined) : undefined;
+  if (typeof signingKeyEnv === "string" && signingKey === undefined) {
+    die(`signing key env var "${signingKeyEnv}" is not set`);
+  }
+
+  const { createComplianceCollector } = await import("@crewhaus/compliance-controls");
+  const auditLog = await import("@crewhaus/audit-log");
+  const auditSource = {
+    async *read(): AsyncIterable<
+      Awaited<ReturnType<typeof auditLog.openAuditLog>>["read"] extends () => AsyncIterable<infer T>
+        ? T
+        : never
+    > {
+      // Use the verify shape to walk every record without re-running hash chain
+      // logic — auditLog.openAuditLog().read() is the supported public API.
+      const log = await auditLog.openAuditLog({ rootDir: auditDir });
+      for await (const r of log.read()) {
+        yield r;
+      }
+    },
+  };
+
+  const collector = createComplianceCollector({ auditSource, outputDir: outDir });
+  const controlFlag = args.flags["control"];
+
+  type EvidenceBundle = Awaited<ReturnType<typeof collector.collect>>;
+  let bundles: EvidenceBundle[] | ReadonlyArray<EvidenceBundle>;
+  if (typeof controlFlag === "string") {
+    const single = await collector.collect(frameworkFlag, controlFlag, {
+      period: periodFlag,
+      ...(signingKey !== undefined ? { signingKey } : {}),
+    });
+    bundles = [single];
+  } else {
+    bundles = await collector.collectAll(frameworkFlag, {
+      period: periodFlag,
+      ...(signingKey !== undefined ? { signingKey } : {}),
+    });
+  }
+
+  for (const b of bundles) {
+    const path = collector.writeBundle(b);
+    process.stdout.write(
+      `${b.frameworkId}/${b.controlId} ${periodFlag}: ${b.recordCount} records → ${path}\n`,
+    );
+  }
+}
+
+/**
  * Section 36 — `crewhaus sandbox <action>`. Single action today: `doctor`.
  *   doctor              list registered sandbox images + healthcheck status
  *
@@ -1355,6 +1454,14 @@ switch (subcommand) {
       die(`sandbox action must be "doctor" (got "${action}")`);
     }
     await runSandbox(parseFor(rest.slice(1), SANDBOX_SCHEMA), action);
+    break;
+  }
+  case "compliance": {
+    const action = rest[0] ?? "";
+    if (action !== "evidence") {
+      die(`compliance action must be "evidence" (got "${action}")`);
+    }
+    await runCompliance(parseFor(rest.slice(1), COMPLIANCE_SCHEMA), action);
     break;
   }
   case "":

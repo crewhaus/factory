@@ -52,6 +52,7 @@
     "@crewhaus/crewhaus-cloud": "workspace:*",
     "@crewhaus/federation-discovery": "workspace:*",
     "@crewhaus/sandbox": "workspace:*",
-    "@crewhaus/sandbox-image-registry": "workspace:*"
+    "@crewhaus/sandbox-image-registry": "workspace:*",
+    "@crewhaus/compliance-controls": "workspace:*"
   }
 }

@@ -1,0 +1,15 @@
+{
+  "name": "@crewhaus-examples/section-39-compliance-controls-smoke",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Section 39 compliance-controls smoke",
+  "dependencies": {
+    "@crewhaus/audit-encryption": "workspace:*",
+    "@crewhaus/audit-log": "workspace:*",
+    "@crewhaus/compliance-controls": "workspace:*",
+    "@crewhaus/data-retention-engine": "workspace:*",
+    "@crewhaus/pii-redactor": "workspace:*",
+    "@crewhaus/secrets-manager": "workspace:*"
+  }
+}

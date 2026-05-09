@@ -2337,7 +2337,7 @@ All four packages are independent; each is its own PR.
 
 ## Section 39 — Compliance & audit hardening
 
-> Status: 🚧 in progress. pii-redactor ✅ + audit-encryption ✅ + data-retention-engine ✅ landed; 1 package pending (compliance-controls — depends on the above three). Best worked alongside §38 because `grader-safety-classifiers` PII-leak detection feeds the §39 redaction layer.
+> Status: ✅ COMPLETE. All 4 compliance packages shipped: pii-redactor, audit-encryption, data-retention-engine, compliance-controls. `crewhaus compliance evidence` CLI wired into the spec-cli surface. Pairs with §38 grader-safety-classifiers for the PII-leak detection layer.
 
 **Catalog modules:** `audit-encryption` (R17), `data-retention-engine` (R17), `compliance-controls` (R17), `pii-redactor` (R17)
 

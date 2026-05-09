@@ -25,6 +25,7 @@
         "@crewhaus/audit-log": "workspace:*",
         "@crewhaus/canary-controller": "workspace:*",
         "@crewhaus/compiler": "workspace:*",
+        "@crewhaus/compliance-controls": "workspace:*",
         "@crewhaus/crewhaus-cloud": "workspace:*",
         "@crewhaus/deployment-controller": "workspace:*",
         "@crewhaus/docker-images": "workspace:*",
@@ -524,6 +525,18 @@
         "@crewhaus/secrets-manager": "workspace:*",
       },
     },
+    "examples/section-39-compliance-controls-smoke": {
+      "name": "@crewhaus-examples/section-39-compliance-controls-smoke",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/audit-encryption": "workspace:*",
+        "@crewhaus/audit-log": "workspace:*",
+        "@crewhaus/compliance-controls": "workspace:*",
+        "@crewhaus/data-retention-engine": "workspace:*",
+        "@crewhaus/pii-redactor": "workspace:*",
+        "@crewhaus/secrets-manager": "workspace:*",
+      },
+    },
     "examples/section-39-data-retention-engine-smoke": {
       "name": "@crewhaus-examples/section-39-data-retention-engine-smoke",
       "version": "0.0.0",
@@ -767,6 +780,14 @@
         "@crewhaus/target-research-bundle": "workspace:*",
         "@crewhaus/target-voice": "workspace:*",
         "@crewhaus/target-workflow": "workspace:*",
+      },
+    },
+    "packages/compliance-controls": {
+      "name": "@crewhaus/compliance-controls",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/audit-log": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
       },
     },
     "packages/computer-use-driver": {
@@ -2256,6 +2277,8 @@
 
     "@crewhaus-examples/section-39-audit-encryption-smoke": ["@crewhaus-examples/section-39-audit-encryption-smoke@workspace:examples/section-39-audit-encryption-smoke"],
 
+    "@crewhaus-examples/section-39-compliance-controls-smoke": ["@crewhaus-examples/section-39-compliance-controls-smoke@workspace:examples/section-39-compliance-controls-smoke"],
+
     "@crewhaus-examples/section-39-data-retention-engine-smoke": ["@crewhaus-examples/section-39-data-retention-engine-smoke@workspace:examples/section-39-data-retention-engine-smoke"],
 
     "@crewhaus-examples/section-39-pii-redactor-smoke": ["@crewhaus-examples/section-39-pii-redactor-smoke@workspace:examples/section-39-pii-redactor-smoke"],
@@ -2313,6 +2336,8 @@
     "@crewhaus/compaction-snip": ["@crewhaus/compaction-snip@workspace:packages/compaction-snip"],
 
     "@crewhaus/compiler": ["@crewhaus/compiler@workspace:packages/compiler"],
+
+    "@crewhaus/compliance-controls": ["@crewhaus/compliance-controls@workspace:packages/compliance-controls"],
 
     "@crewhaus/computer-use-driver": ["@crewhaus/computer-use-driver@workspace:packages/computer-use-driver"],
 
