@@ -1,0 +1,20 @@
+{
+  "name": "@crewhaus/exporter-datadog",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Datadog OTLP exporter — wraps @crewhaus/otel-exporter with dd.service/dd.env/dd.version resource attrs + DD_API_KEY auth (Section 37)",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@crewhaus/errors": "workspace:*",
+    "@crewhaus/otel-exporter": "workspace:*",
+    "@crewhaus/trace-event-bus": "workspace:*"
+  }
+}

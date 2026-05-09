@@ -446,6 +446,14 @@
         "@crewhaus/sandbox-image-rust": "workspace:*",
       },
     },
+    "examples/section-37-exporter-datadog-smoke": {
+      "name": "@crewhaus-examples/section-37-exporter-datadog-smoke",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/exporter-datadog": "workspace:*",
+        "@crewhaus/trace-event-bus": "workspace:*",
+      },
+    },
     "packages/a2a-protocol": {
       "name": "@crewhaus/a2a-protocol",
       "version": "0.0.0",
@@ -866,6 +874,15 @@
       "version": "0.0.0",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
+      },
+    },
+    "packages/exporter-datadog": {
+      "name": "@crewhaus/exporter-datadog",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/otel-exporter": "workspace:*",
+        "@crewhaus/trace-event-bus": "workspace:*",
       },
     },
     "packages/federation-discovery": {
@@ -2051,6 +2068,8 @@
 
     "@crewhaus-examples/section-36-sandbox-image-rust-smoke": ["@crewhaus-examples/section-36-sandbox-image-rust-smoke@workspace:examples/section-36-sandbox-image-rust-smoke"],
 
+    "@crewhaus-examples/section-37-exporter-datadog-smoke": ["@crewhaus-examples/section-37-exporter-datadog-smoke@workspace:examples/section-37-exporter-datadog-smoke"],
+
     "@crewhaus/a2a-protocol": ["@crewhaus/a2a-protocol@workspace:packages/a2a-protocol"],
 
     "@crewhaus/abort-controller": ["@crewhaus/abort-controller@workspace:packages/abort-controller"],
@@ -2138,6 +2157,8 @@
     "@crewhaus/eval-runner": ["@crewhaus/eval-runner@workspace:packages/eval-runner"],
 
     "@crewhaus/event-log": ["@crewhaus/event-log@workspace:packages/event-log"],
+
+    "@crewhaus/exporter-datadog": ["@crewhaus/exporter-datadog@workspace:packages/exporter-datadog"],
 
     "@crewhaus/federation-discovery": ["@crewhaus/federation-discovery@workspace:packages/federation-discovery"],
 

@@ -44,6 +44,7 @@
     { "path": "./packages/tool-task" },
     { "path": "./packages/trace-event-bus" },
     { "path": "./packages/otel-exporter" },
+    { "path": "./packages/exporter-datadog" },
     { "path": "./packages/metrics-collector" },
     { "path": "./packages/structured-event-printer" },
     { "path": "./packages/eval-dataset" },
