@@ -2189,7 +2189,7 @@ All three packages are independent and parallelisable. Each is its own PR.
 
 ## Section 36 — Polyglot sandbox images
 
-> Status: 🚧 in progress. registry ✅ + go ✅ + rust ✅ + java ✅ + ruby ✅ + r ✅ landed; 2 language images parallel-pending (dotnet, php). Independent of §37–40; can land in any order.
+> Status: 🚧 in progress. registry ✅ + go ✅ + rust ✅ + java ✅ + ruby ✅ + r ✅ + dotnet ✅ landed; 1 language image parallel-pending (php). Independent of §37–40; can land in any order.
 
 **Catalog modules:** `sandbox-image-go`, `sandbox-image-rust`, `sandbox-image-java`, `sandbox-image-ruby`, `sandbox-image-r`, `sandbox-image-dotnet`, `sandbox-image-php` (all R8); plus `sandbox-image-registry` (R8) for runtime allow-list management
 
