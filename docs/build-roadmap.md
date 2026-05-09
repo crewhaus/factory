@@ -136,7 +136,7 @@ Tool surface expansion (✅ §14) ──► Observability (✅ §15)
 | **§29 Evaluation depth + EVAL target shape** | ✅ | §16 (eval stack), §17 (multi-provider model-router for judge swaps) | EVAL target shape, prompt-optimizer regression CI, dataset/grader plugin ecosystem |
 | **§30 Backend adapter completions** | ✅ | §17 base adapter shapes; §21 vector-store interface; §23 queue-protocol interface; §24 telephony slot; §25 driver interface | Production CHN/MGD/RES/VOICE/BROW deployments without v0 stub limits |
 | **§31 Studio v1** | ✅ | every prior section's IR / trace / event / metric kinds | Production authoring UI, run replay, multi-spec dashboards, third-party plugin marketplace |
-| **§32 Distribution & packaging** | 🟡 next, parallel with §33 | §20 (`gateway-server` for hosted `crewhaus-cloud`), §31 (Studio runs inside a container) | §34 (federation needs cross-deployment networking), homebrew/apt/scoop/winget distribution, k8s rollouts |
+| **§32 Distribution & packaging** | ✅ | §20 (`gateway-server` for hosted `crewhaus-cloud`), §31 (Studio runs inside a container) | §34 (federation needs cross-deployment networking), homebrew/apt/scoop/winget distribution, k8s rollouts |
 | **§33 Channel adapter breadth** | 🟡 next, parallel with §32 | §12 (channel-adapter-base interface) | Multi-channel CHN deployments, customer-facing bots outside Slack |
 | **§34 Federation (multi-deployment A2A)** | 🟡 sequential after §32 (uses `docker-images`) | §32 (`docker-images`), §22 (`a2a-protocol` interface), §20 (mTLS auth pattern) | Crew-of-crews, multi-org agent ecosystems, MGD federation, agent marketplaces |
 | **§35 Developer experience tooling** | 🟡 independent | §32 (`single-binary-cli` for extension installs), §31 (Studio as VS Code webview embed) | Editor adoption, spec-as-code workflows, onboarding funnel, docs-site interactivity |
@@ -1959,7 +1959,7 @@ studio-server (SSE wiring)  ──►  studio-ui (Lit + Monaco rewrite)  ──�
 
 ## Section 32 — Distribution & packaging
 
-> Status: 🟡 next up. Parallelisable with Section 33. Required prereq for Section 34's cross-deployment networking.
+> Status: ✅ complete. Four packages landed: `docker-images` (12 multi-stage Dockerfiles + `crewhaus build-image` CLI), `single-binary-cli` (`bun build --compile` matrix + Homebrew/Debian/Scoop/Winget manifest renderers), `helm-chart` (Helm chart under `helm/crewhaus/` + in-process `renderChart()` for tests), `crewhaus-cloud` (composite Terraform + Kustomize recipe + `crewhaus cloud deploy`/`teardown`). Tests use injected fakes for the `docker buildx`, `bun --compile`, `terraform`, and `kubectl` runners; live infra probes gate on `CREWHAUS_SECTION32_LIVE_DOCKER`/`TF_BIN`.
 
 **Catalog modules:** `docker-images` (F3), `helm-chart` (F3), `single-binary-cli` (F3), `crewhaus-cloud` (F3 — composite recipe)
 

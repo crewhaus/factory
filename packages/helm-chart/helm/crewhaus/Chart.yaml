@@ -1,0 +1,16 @@
+apiVersion: v2
+name: crewhaus
+description: CrewHaus Factory — modular meta-harness for compiling agent specs into deployable runtimes
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+home: https://github.com/crewhaus/crewhaus-factory
+sources:
+  - https://github.com/crewhaus/crewhaus-factory
+maintainers:
+  - name: CrewHaus
+    email: maintainers@crewhaus.io
+keywords:
+  - llm
+  - agents
+  - meta-harness

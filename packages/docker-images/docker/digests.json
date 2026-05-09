@@ -1,0 +1,4 @@
+{
+  "_comment": "Pinned image digests for reproducible builds. `crewhaus build-image --tag <tag>` writes here. Format: `{ \"<target>\": { \"<tag>\": { \"sha256\": \"<digest>\", \"builtAt\": \"<iso>\" } } }`.",
+  "_format_version": 1
+}
