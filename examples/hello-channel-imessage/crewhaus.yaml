@@ -1,0 +1,18 @@
+name: hello-channel-imessage
+target: channel
+agent:
+  model: claude-sonnet-4-6
+  instructions: |
+    You are a personal iMessage assistant running on the user's Mac.
+    Reply concisely (1-2 sentences). You may use the Read filesystem
+    tool to ground answers in repo state.
+  tools:
+    - read
+channels:
+  imessage: {}
+routing:
+  sessionKey: user
+permissions:
+  rules:
+    - type: alwaysAllow
+      pattern: Read

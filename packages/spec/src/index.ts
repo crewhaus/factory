@@ -183,12 +183,20 @@ const whatsappChannelSchema = z
   })
   .strict();
 
+const imessageChannelSchema = z
+  .object({
+    chatDbPath: z.string().min(1).optional(),
+    cursorPath: z.string().min(1).optional(),
+  })
+  .strict();
+
 const channelsBlock = z
   .object({
     slack: slackChannelSchema.optional(),
     telegram: telegramChannelSchema.optional(),
     discord: discordChannelSchema.optional(),
     whatsapp: whatsappChannelSchema.optional(),
+    imessage: imessageChannelSchema.optional(),
   })
   .strict()
   .refine(
@@ -196,10 +204,11 @@ const channelsBlock = z
       c.slack !== undefined ||
       c.telegram !== undefined ||
       c.discord !== undefined ||
-      c.whatsapp !== undefined,
+      c.whatsapp !== undefined ||
+      c.imessage !== undefined,
     {
       message:
-        "channels block requires at least one channel (slack | telegram | discord | whatsapp)",
+        "channels block requires at least one channel (slack | telegram | discord | whatsapp | imessage)",
     },
   );
 
@@ -606,6 +615,7 @@ export type SpecSlackChannel = z.infer<typeof slackChannelSchema>;
 export type SpecTelegramChannel = z.infer<typeof telegramChannelSchema>;
 export type SpecDiscordChannel = z.infer<typeof discordChannelSchema>;
 export type SpecWhatsAppChannel = z.infer<typeof whatsappChannelSchema>;
+export type SpecIMessageChannel = z.infer<typeof imessageChannelSchema>;
 export type SpecGraph = z.infer<typeof graphSchema>;
 export type SpecGraphNode = z.infer<typeof graphNodeSchema>;
 export type SpecGraphEdge = z.infer<typeof graphEdgeSchema>;

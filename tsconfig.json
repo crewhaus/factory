@@ -94,6 +94,7 @@
     { "path": "./packages/channel-adapter-telegram" },
     { "path": "./packages/channel-adapter-discord" },
     { "path": "./packages/channel-adapter-whatsapp" },
+    { "path": "./packages/channel-adapter-imessage" },
     { "path": "./apps/cli" }
   ]
 }

@@ -19,6 +19,7 @@
   },
   "peerDependencies": {
     "@crewhaus/channel-adapter-discord": "workspace:*",
+    "@crewhaus/channel-adapter-imessage": "workspace:*",
     "@crewhaus/channel-adapter-slack": "workspace:*",
     "@crewhaus/channel-adapter-telegram": "workspace:*",
     "@crewhaus/channel-adapter-whatsapp": "workspace:*",
