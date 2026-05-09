@@ -43,6 +43,7 @@
     { "path": "../../packages/crewhaus-cloud" },
     { "path": "../../packages/federation-discovery" },
     { "path": "../../packages/sandbox" },
-    { "path": "../../packages/sandbox-image-registry" }
+    { "path": "../../packages/sandbox-image-registry" },
+    { "path": "../../packages/compliance-controls" }
   ]
 }

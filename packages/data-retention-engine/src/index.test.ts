@@ -113,7 +113,7 @@ describe("purge (T1 + T8 cross-tenant isolation)", () => {
     const eng = createDataRetentionEngine({ recordStore: store, now: () => now });
     await eng.purge("tenant-a");
     // tenant-a records gone; tenant-b records intact.
-    expect(store.ids().sort()).toEqual(["b-1", "b-2"]);
+    expect([...store.ids()].sort()).toEqual(["b-1", "b-2"]);
   });
 
   test("missing tenantId throws", async () => {
