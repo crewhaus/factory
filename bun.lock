@@ -552,6 +552,14 @@
         "@crewhaus/pii-redactor": "workspace:*",
       },
     },
+    "examples/section-40-template-marketplace-client-smoke": {
+      "name": "@crewhaus-examples/section-40-template-marketplace-client-smoke",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/template-marketplace-client": "workspace:*",
+        "@crewhaus/template-registry": "workspace:*",
+      },
+    },
     "examples/section-40-template-registry-smoke": {
       "name": "@crewhaus-examples/section-40-template-registry-smoke",
       "version": "0.0.0",
@@ -1765,6 +1773,14 @@
         "@crewhaus/slash-commands": "workspace:*",
       },
     },
+    "packages/template-marketplace-client": {
+      "name": "@crewhaus/template-marketplace-client",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/template-registry": "workspace:*",
+      },
+    },
     "packages/template-registry": {
       "name": "@crewhaus/template-registry",
       "version": "0.0.0",
@@ -2297,6 +2313,8 @@
 
     "@crewhaus-examples/section-39-pii-redactor-smoke": ["@crewhaus-examples/section-39-pii-redactor-smoke@workspace:examples/section-39-pii-redactor-smoke"],
 
+    "@crewhaus-examples/section-40-template-marketplace-client-smoke": ["@crewhaus-examples/section-40-template-marketplace-client-smoke@workspace:examples/section-40-template-marketplace-client-smoke"],
+
     "@crewhaus-examples/section-40-template-registry-smoke": ["@crewhaus-examples/section-40-template-registry-smoke@workspace:examples/section-40-template-registry-smoke"],
 
     "@crewhaus/a2a-protocol": ["@crewhaus/a2a-protocol@workspace:packages/a2a-protocol"],
@@ -2558,6 +2576,8 @@
     "@crewhaus/target-voice": ["@crewhaus/target-voice@workspace:packages/target-voice"],
 
     "@crewhaus/target-workflow": ["@crewhaus/target-workflow@workspace:packages/target-workflow"],
+
+    "@crewhaus/template-marketplace-client": ["@crewhaus/template-marketplace-client@workspace:packages/template-marketplace-client"],
 
     "@crewhaus/template-registry": ["@crewhaus/template-registry@workspace:packages/template-registry"],
 

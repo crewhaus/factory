@@ -1,0 +1,11 @@
+{
+  "name": "@crewhaus-examples/section-40-template-marketplace-client-smoke",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Section 40 template-marketplace-client smoke",
+  "dependencies": {
+    "@crewhaus/template-marketplace-client": "workspace:*",
+    "@crewhaus/template-registry": "workspace:*"
+  }
+}
