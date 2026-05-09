@@ -83,7 +83,8 @@
     "smoke:section-36-ruby": "bun examples/section-36-sandbox-image-ruby-smoke/smoke.ts",
     "smoke:section-36-r": "bun examples/section-36-sandbox-image-r-smoke/smoke.ts",
     "smoke:section-36-dotnet": "bun examples/section-36-sandbox-image-dotnet-smoke/smoke.ts",
-    "smoke:section-36": "bun examples/section-36-sandbox-image-registry-smoke/smoke.ts && bun examples/section-36-sandbox-image-go-smoke/smoke.ts && bun examples/section-36-sandbox-image-rust-smoke/smoke.ts && bun examples/section-36-sandbox-image-java-smoke/smoke.ts && bun examples/section-36-sandbox-image-ruby-smoke/smoke.ts && bun examples/section-36-sandbox-image-r-smoke/smoke.ts && bun examples/section-36-sandbox-image-dotnet-smoke/smoke.ts"
+    "smoke:section-36-php": "bun examples/section-36-sandbox-image-php-smoke/smoke.ts",
+    "smoke:section-36": "bun examples/section-36-sandbox-image-registry-smoke/smoke.ts && bun examples/section-36-sandbox-image-go-smoke/smoke.ts && bun examples/section-36-sandbox-image-rust-smoke/smoke.ts && bun examples/section-36-sandbox-image-java-smoke/smoke.ts && bun examples/section-36-sandbox-image-ruby-smoke/smoke.ts && bun examples/section-36-sandbox-image-r-smoke/smoke.ts && bun examples/section-36-sandbox-image-dotnet-smoke/smoke.ts && bun examples/section-36-sandbox-image-php-smoke/smoke.ts"
   },
   "devDependencies": {
     "@biomejs/biome": "1.9.4",

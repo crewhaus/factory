@@ -58,6 +58,7 @@
     { "path": "./packages/sandbox-image-ruby" },
     { "path": "./packages/sandbox-image-r" },
     { "path": "./packages/sandbox-image-dotnet" },
+    { "path": "./packages/sandbox-image-php" },
     { "path": "./packages/sandbox-image-rust" },
     { "path": "./packages/prompt-injection-detector" },
     { "path": "./packages/tool-code-execution" },
