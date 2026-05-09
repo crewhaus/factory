@@ -524,6 +524,13 @@
         "@crewhaus/secrets-manager": "workspace:*",
       },
     },
+    "examples/section-39-data-retention-engine-smoke": {
+      "name": "@crewhaus-examples/section-39-data-retention-engine-smoke",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/data-retention-engine": "workspace:*",
+      },
+    },
     "examples/section-39-pii-redactor-smoke": {
       "name": "@crewhaus-examples/section-39-pii-redactor-smoke",
       "version": "0.0.0",
@@ -832,6 +839,13 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/scaffold-templates": "workspace:*",
         "@crewhaus/spec": "workspace:*",
+      },
+    },
+    "packages/data-retention-engine": {
+      "name": "@crewhaus/data-retention-engine",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
       },
     },
     "packages/dataset-registry": {
@@ -2242,6 +2256,8 @@
 
     "@crewhaus-examples/section-39-audit-encryption-smoke": ["@crewhaus-examples/section-39-audit-encryption-smoke@workspace:examples/section-39-audit-encryption-smoke"],
 
+    "@crewhaus-examples/section-39-data-retention-engine-smoke": ["@crewhaus-examples/section-39-data-retention-engine-smoke@workspace:examples/section-39-data-retention-engine-smoke"],
+
     "@crewhaus-examples/section-39-pii-redactor-smoke": ["@crewhaus-examples/section-39-pii-redactor-smoke@workspace:examples/section-39-pii-redactor-smoke"],
 
     "@crewhaus/a2a-protocol": ["@crewhaus/a2a-protocol@workspace:packages/a2a-protocol"],
@@ -2309,6 +2325,8 @@
     "@crewhaus/crewhaus-cloud": ["@crewhaus/crewhaus-cloud@workspace:packages/crewhaus-cloud"],
 
     "@crewhaus/crewhaus-playground": ["@crewhaus/crewhaus-playground@workspace:packages/crewhaus-playground"],
+
+    "@crewhaus/data-retention-engine": ["@crewhaus/data-retention-engine@workspace:packages/data-retention-engine"],
 
     "@crewhaus/dataset-registry": ["@crewhaus/dataset-registry@workspace:packages/dataset-registry"],
 
