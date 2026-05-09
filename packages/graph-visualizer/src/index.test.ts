@@ -165,7 +165,12 @@ describe("graph-visualizer v1 — Section 31 live mode", () => {
   test("history is bounded at 1000 entries", () => {
     const layout = layoutGraph(baseIr);
     let state = initialLiveState(layout);
-    for (let i = 0; i < 1500; i++) {
+    // 1100 iterations is enough to prove the cap (1000 + 100 over) without
+    // hitting CI runner timeouts. applyEvent does an O(n) [...history]
+    // copy + splice, so 1500 × 1000-entry copies tipped over the Bun
+    // 5 s test timeout on GitHub Actions even when local Bun ran in
+    // ~200 ms.
+    for (let i = 0; i < 1100; i++) {
       state = applyEvent(state, {
         kind: "node_start",
         node: "plan",
