@@ -21,6 +21,7 @@
     "@crewhaus/channel-adapter-discord": "workspace:*",
     "@crewhaus/channel-adapter-slack": "workspace:*",
     "@crewhaus/channel-adapter-telegram": "workspace:*",
+    "@crewhaus/channel-adapter-whatsapp": "workspace:*",
     "@crewhaus/hooks-engine": "workspace:*",
     "@crewhaus/mcp-host": "workspace:*",
     "@crewhaus/runtime-core": "workspace:*",

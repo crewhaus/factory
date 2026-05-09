@@ -326,6 +326,14 @@
         "@crewhaus/compiler": "workspace:*",
       },
     },
+    "examples/section-33-whatsapp-smoke": {
+      "name": "@crewhaus-examples/section-33-whatsapp-smoke",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/channel-adapter-whatsapp": "workspace:*",
+        "@crewhaus/compiler": "workspace:*",
+      },
+    },
     "packages/a2a-protocol": {
       "name": "@crewhaus/a2a-protocol",
       "version": "0.0.0",
@@ -460,6 +468,13 @@
     },
     "packages/channel-adapter-telegram": {
       "name": "@crewhaus/channel-adapter-telegram",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+      },
+    },
+    "packages/channel-adapter-whatsapp": {
+      "name": "@crewhaus/channel-adapter-whatsapp",
       "version": "0.0.0",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
@@ -1200,6 +1215,7 @@
         "@crewhaus/channel-adapter-discord": "workspace:*",
         "@crewhaus/channel-adapter-slack": "workspace:*",
         "@crewhaus/channel-adapter-telegram": "workspace:*",
+        "@crewhaus/channel-adapter-whatsapp": "workspace:*",
         "@crewhaus/event-log": "workspace:*",
         "@crewhaus/hooks-engine": "workspace:*",
         "@crewhaus/mcp-host": "workspace:*",
@@ -1769,6 +1785,8 @@
 
     "@crewhaus-examples/section-33-telegram-smoke": ["@crewhaus-examples/section-33-telegram-smoke@workspace:examples/section-33-telegram-smoke"],
 
+    "@crewhaus-examples/section-33-whatsapp-smoke": ["@crewhaus-examples/section-33-whatsapp-smoke@workspace:examples/section-33-whatsapp-smoke"],
+
     "@crewhaus/a2a-protocol": ["@crewhaus/a2a-protocol@workspace:packages/a2a-protocol"],
 
     "@crewhaus/abort-controller": ["@crewhaus/abort-controller@workspace:packages/abort-controller"],
@@ -1800,6 +1818,8 @@
     "@crewhaus/channel-adapter-slack": ["@crewhaus/channel-adapter-slack@workspace:packages/channel-adapter-slack"],
 
     "@crewhaus/channel-adapter-telegram": ["@crewhaus/channel-adapter-telegram@workspace:packages/channel-adapter-telegram"],
+
+    "@crewhaus/channel-adapter-whatsapp": ["@crewhaus/channel-adapter-whatsapp@workspace:packages/channel-adapter-whatsapp"],
 
     "@crewhaus/checkpoint-store": ["@crewhaus/checkpoint-store@workspace:packages/checkpoint-store"],
 

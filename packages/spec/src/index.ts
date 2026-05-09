@@ -175,16 +175,33 @@ const discordChannelSchema = z
   })
   .strict();
 
+const whatsappChannelSchema = z
+  .object({
+    phoneNumberId: z.string().min(1),
+    accessToken: z.string().min(1),
+    appSecret: z.string().min(1),
+  })
+  .strict();
+
 const channelsBlock = z
   .object({
     slack: slackChannelSchema.optional(),
     telegram: telegramChannelSchema.optional(),
     discord: discordChannelSchema.optional(),
+    whatsapp: whatsappChannelSchema.optional(),
   })
   .strict()
-  .refine((c) => c.slack !== undefined || c.telegram !== undefined || c.discord !== undefined, {
-    message: "channels block requires at least one channel (slack | telegram | discord)",
-  });
+  .refine(
+    (c) =>
+      c.slack !== undefined ||
+      c.telegram !== undefined ||
+      c.discord !== undefined ||
+      c.whatsapp !== undefined,
+    {
+      message:
+        "channels block requires at least one channel (slack | telegram | discord | whatsapp)",
+    },
+  );
 
 const routingBlock = z
   .object({
@@ -588,6 +605,7 @@ export type SpecChannelAgent = z.infer<typeof channelAgentSchema>;
 export type SpecSlackChannel = z.infer<typeof slackChannelSchema>;
 export type SpecTelegramChannel = z.infer<typeof telegramChannelSchema>;
 export type SpecDiscordChannel = z.infer<typeof discordChannelSchema>;
+export type SpecWhatsAppChannel = z.infer<typeof whatsappChannelSchema>;
 export type SpecGraph = z.infer<typeof graphSchema>;
 export type SpecGraphNode = z.infer<typeof graphNodeSchema>;
 export type SpecGraphEdge = z.infer<typeof graphEdgeSchema>;

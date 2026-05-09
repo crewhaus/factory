@@ -24,6 +24,7 @@ import type {
   IrTelegramConfig,
   IrV0,
   IrVoiceV0,
+  IrWhatsAppConfig,
   IrWorkflowV0,
 } from "@crewhaus/ir";
 import {
@@ -35,6 +36,7 @@ import {
   type SpecSlackChannel,
   type SpecSubAgentDefinition,
   type SpecTelegramChannel,
+  type SpecWhatsAppChannel,
   parseSpec,
 } from "@crewhaus/spec";
 import { emitBatchWorker } from "@crewhaus/target-batch-worker";
@@ -164,11 +166,20 @@ function lowerDiscord(discord: SpecDiscordChannel): IrDiscordConfig {
   };
 }
 
+function lowerWhatsApp(whatsapp: SpecWhatsAppChannel): IrWhatsAppConfig {
+  return {
+    phoneNumberId: lowerSecret(whatsapp.phoneNumberId),
+    accessToken: lowerSecret(whatsapp.accessToken),
+    appSecret: lowerSecret(whatsapp.appSecret),
+  };
+}
+
 function lowerChannels(channels: SpecChannel["channels"]): IrChannels {
   return {
     ...(channels.slack !== undefined ? { slack: lowerSlack(channels.slack) } : {}),
     ...(channels.telegram !== undefined ? { telegram: lowerTelegram(channels.telegram) } : {}),
     ...(channels.discord !== undefined ? { discord: lowerDiscord(channels.discord) } : {}),
+    ...(channels.whatsapp !== undefined ? { whatsapp: lowerWhatsApp(channels.whatsapp) } : {}),
   };
 }
 

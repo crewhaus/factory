@@ -20,7 +20,8 @@ export function emitChannelBot(ir: IrChannelV0): Bundle {
   if (
     ir.channels.slack === undefined &&
     ir.channels.telegram === undefined &&
-    ir.channels.discord === undefined
+    ir.channels.discord === undefined &&
+    ir.channels.whatsapp === undefined
   ) {
     throw new TargetEmitError(
       "channel target requires at least one configured channel — none found",
@@ -146,6 +147,12 @@ function requiredEnvNames(ir: IrChannelV0): string[] {
     if (discord.applicationId.kind === "env") names.push(discord.applicationId.name);
     if (discord.botToken.kind === "env") names.push(discord.botToken.name);
     if (discord.publicKeyHex.kind === "env") names.push(discord.publicKeyHex.name);
+  }
+  const whatsapp = ir.channels.whatsapp;
+  if (whatsapp !== undefined) {
+    if (whatsapp.phoneNumberId.kind === "env") names.push(whatsapp.phoneNumberId.name);
+    if (whatsapp.accessToken.kind === "env") names.push(whatsapp.accessToken.name);
+    if (whatsapp.appSecret.kind === "env") names.push(whatsapp.appSecret.name);
   }
   return names;
 }
@@ -486,7 +493,13 @@ function renderDaemon(ir: IrChannelV0): string {
   const slack = ir.channels.slack;
   const telegram = ir.channels.telegram;
   const discord = ir.channels.discord;
-  if (slack === undefined && telegram === undefined && discord === undefined) {
+  const whatsapp = ir.channels.whatsapp;
+  if (
+    slack === undefined &&
+    telegram === undefined &&
+    discord === undefined &&
+    whatsapp === undefined
+  ) {
     throw new TargetEmitError("channel target requires at least one channel configured");
   }
   const { imports: builtinImports, inits, registrations } = resolveTools(ir.tools, ir.toolConfigs);
@@ -553,6 +566,22 @@ registerChannelAdapter("telegram", telegramAdapter);`);
 });
 registerChannelAdapter("discord", discordAdapter);`);
     adapterMapEntries.push(`["discord", discordAdapter]`);
+  }
+
+  if (whatsapp !== undefined) {
+    const waPhoneId = renderSecretExpr(whatsapp.phoneNumberId);
+    const waAccessToken = renderSecretExpr(whatsapp.accessToken);
+    const waAppSecret = renderSecretExpr(whatsapp.appSecret);
+    adapterImports.push(
+      `import { createWhatsAppAdapter } from "@crewhaus/channel-adapter-whatsapp";`,
+    );
+    adapterConstructs.push(`const whatsappAdapter = createWhatsAppAdapter({
+  phoneNumberId: ${waPhoneId} ?? "",
+  accessToken: ${waAccessToken} ?? "",
+  appSecret: ${waAppSecret} ?? "",
+});
+registerChannelAdapter("whatsapp", whatsappAdapter);`);
+    adapterMapEntries.push(`["whatsapp", whatsappAdapter]`);
   }
 
   const adapterConstructBlock = adapterConstructs.join("\n\n");

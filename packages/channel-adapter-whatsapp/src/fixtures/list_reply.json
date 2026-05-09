@@ -1,0 +1,30 @@
+{
+  "object": "whatsapp_business_account",
+  "entry": [
+    {
+      "id": "100100100100",
+      "changes": [
+        {
+          "field": "messages",
+          "value": {
+            "messaging_product": "whatsapp",
+            "metadata": { "phone_number_id": "999000999000" },
+            "contacts": [{ "wa_id": "15554443333" }],
+            "messages": [
+              {
+                "id": "wamid.list-001",
+                "from": "15554443333",
+                "timestamp": "1700000300",
+                "type": "interactive",
+                "interactive": {
+                  "type": "list_reply",
+                  "list_reply": { "id": "tier-pro", "title": "Pro", "description": "$49/mo" }
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}
