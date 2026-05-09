@@ -81,8 +81,7 @@ export const DEFAULT_PII_DETECTORS: ReadonlyArray<PiiDetector> = [
   // (with optional space/dash separators) OR a US-style 3-3-4 group.
   {
     kind: "phone",
-    regex:
-      /(?:\+\d{1,3}[-\s](?:\d[-\s]?){6,13}|\(?\b\d{3}\)?[-\s.]?\d{3}[-\s.]?\d{4}\b)/g,
+    regex: /(?:\+\d{1,3}[-\s](?:\d[-\s]?){6,13}|\(?\b\d{3}\)?[-\s.]?\d{3}[-\s.]?\d{4}\b)/g,
   },
   {
     kind: "email",
