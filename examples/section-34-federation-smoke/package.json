@@ -1,0 +1,12 @@
+{
+  "name": "@crewhaus-examples/section-34-federation-smoke",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Section 34 federation smoke",
+  "dependencies": {
+    "@crewhaus/federation-discovery": "workspace:*",
+    "@crewhaus/federation-protocol": "workspace:*",
+    "@crewhaus/federation-router": "workspace:*"
+  }
+}

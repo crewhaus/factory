@@ -138,7 +138,7 @@ Tool surface expansion (✅ §14) ──► Observability (✅ §15)
 | **§31 Studio v1** | ✅ | every prior section's IR / trace / event / metric kinds | Production authoring UI, run replay, multi-spec dashboards, third-party plugin marketplace |
 | **§32 Distribution & packaging** | ✅ | §20 (`gateway-server` for hosted `crewhaus-cloud`), §31 (Studio runs inside a container) | §34 (federation needs cross-deployment networking), homebrew/apt/scoop/winget distribution, k8s rollouts |
 | **§33 Channel adapter breadth** | ✅ | §12 (channel-adapter-base interface) | Multi-channel CHN deployments, customer-facing bots outside Slack |
-| **§34 Federation (multi-deployment A2A)** | 🟡 sequential after §32 (uses `docker-images`) | §32 (`docker-images`), §22 (`a2a-protocol` interface), §20 (mTLS auth pattern) | Crew-of-crews, multi-org agent ecosystems, MGD federation, agent marketplaces |
+| **§34 Federation (multi-deployment A2A)** | ✅ | §32 (`docker-images`), §22 (`a2a-protocol` interface), §20 (mTLS auth pattern) | Crew-of-crews, multi-org agent ecosystems, MGD federation, agent marketplaces |
 | **§35 Developer experience tooling** | 🟡 independent | §32 (`single-binary-cli` for extension installs), §31 (Studio as VS Code webview embed) | Editor adoption, spec-as-code workflows, onboarding funnel, docs-site interactivity |
 
 ---
@@ -2066,7 +2066,7 @@ Each is its own PR. None depends on another.
 
 ## Section 34 — Federation (multi-deployment A2A)
 
-> Status: 🟡 sequential after Section 32 (uses `docker-images` for cross-deployment networking). Parallelisable with Section 35.
+> Status: ✅ complete. Three packages landed: `federation-protocol` (mTLS A2A wire envelope + Node-built-in `crypto.verify` cert pinning), `federation-discovery` (DNS SRV + `.well-known/crewhaus.json` with TTL caching), `federation-router` (transparent remote sub-agent calls + recovery-engine error mapping). `crewhaus federation discover <deployment>` CLI subcommand wired into apps/cli. In-process two-deployment smoke runs without docker-compose.
 
 **Catalog modules:** `federation-protocol` (R-infra), `federation-discovery` (R-infra), `federation-router` (R-infra)
 

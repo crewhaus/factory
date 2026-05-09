@@ -95,6 +95,9 @@
     { "path": "./packages/channel-adapter-discord" },
     { "path": "./packages/channel-adapter-whatsapp" },
     { "path": "./packages/channel-adapter-imessage" },
+    { "path": "./packages/federation-protocol" },
+    { "path": "./packages/federation-discovery" },
+    { "path": "./packages/federation-router" },
     { "path": "./apps/cli" }
   ]
 }

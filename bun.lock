@@ -32,6 +32,7 @@
         "@crewhaus/eval-grader": "workspace:*",
         "@crewhaus/eval-report": "workspace:*",
         "@crewhaus/eval-runner": "workspace:*",
+        "@crewhaus/federation-discovery": "workspace:*",
         "@crewhaus/hooks-engine": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
@@ -340,6 +341,15 @@
       "dependencies": {
         "@crewhaus/channel-adapter-whatsapp": "workspace:*",
         "@crewhaus/compiler": "workspace:*",
+      },
+    },
+    "examples/section-34-federation-smoke": {
+      "name": "@crewhaus-examples/section-34-federation-smoke",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/federation-discovery": "workspace:*",
+        "@crewhaus/federation-protocol": "workspace:*",
+        "@crewhaus/federation-router": "workspace:*",
       },
     },
     "packages/a2a-protocol": {
@@ -753,6 +763,29 @@
       "version": "0.0.0",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
+      },
+    },
+    "packages/federation-discovery": {
+      "name": "@crewhaus/federation-discovery",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+      },
+    },
+    "packages/federation-protocol": {
+      "name": "@crewhaus/federation-protocol",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+      },
+    },
+    "packages/federation-router": {
+      "name": "@crewhaus/federation-router",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/federation-discovery": "workspace:*",
+        "@crewhaus/federation-protocol": "workspace:*",
       },
     },
     "packages/gateway-protocol": {
@@ -1805,6 +1838,8 @@
 
     "@crewhaus-examples/section-33-whatsapp-smoke": ["@crewhaus-examples/section-33-whatsapp-smoke@workspace:examples/section-33-whatsapp-smoke"],
 
+    "@crewhaus-examples/section-34-federation-smoke": ["@crewhaus-examples/section-34-federation-smoke@workspace:examples/section-34-federation-smoke"],
+
     "@crewhaus/a2a-protocol": ["@crewhaus/a2a-protocol@workspace:packages/a2a-protocol"],
 
     "@crewhaus/abort-controller": ["@crewhaus/abort-controller@workspace:packages/abort-controller"],
@@ -1890,6 +1925,12 @@
     "@crewhaus/eval-runner": ["@crewhaus/eval-runner@workspace:packages/eval-runner"],
 
     "@crewhaus/event-log": ["@crewhaus/event-log@workspace:packages/event-log"],
+
+    "@crewhaus/federation-discovery": ["@crewhaus/federation-discovery@workspace:packages/federation-discovery"],
+
+    "@crewhaus/federation-protocol": ["@crewhaus/federation-protocol@workspace:packages/federation-protocol"],
+
+    "@crewhaus/federation-router": ["@crewhaus/federation-router@workspace:packages/federation-router"],
 
     "@crewhaus/gateway-protocol": ["@crewhaus/gateway-protocol@workspace:packages/gateway-protocol"],
 
