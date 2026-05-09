@@ -352,6 +352,13 @@
         "@crewhaus/federation-router": "workspace:*",
       },
     },
+    "examples/section-35-vscode-smoke": {
+      "name": "@crewhaus-examples/section-35-vscode-smoke",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/vscode-extension": "workspace:*",
+      },
+    },
     "packages/a2a-protocol": {
       "name": "@crewhaus/a2a-protocol",
       "version": "0.0.0",
@@ -1686,6 +1693,13 @@
         "@crewhaus/errors": "workspace:*",
       },
     },
+    "packages/vscode-extension": {
+      "name": "@crewhaus/vscode-extension",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/spec": "workspace:*",
+      },
+    },
     "packages/wizard": {
       "name": "@crewhaus/wizard",
       "version": "0.0.0",
@@ -1839,6 +1853,8 @@
     "@crewhaus-examples/section-33-whatsapp-smoke": ["@crewhaus-examples/section-33-whatsapp-smoke@workspace:examples/section-33-whatsapp-smoke"],
 
     "@crewhaus-examples/section-34-federation-smoke": ["@crewhaus-examples/section-34-federation-smoke@workspace:examples/section-34-federation-smoke"],
+
+    "@crewhaus-examples/section-35-vscode-smoke": ["@crewhaus-examples/section-35-vscode-smoke@workspace:examples/section-35-vscode-smoke"],
 
     "@crewhaus/a2a-protocol": ["@crewhaus/a2a-protocol@workspace:packages/a2a-protocol"],
 
@@ -2115,6 +2131,8 @@
     "@crewhaus/vector-store": ["@crewhaus/vector-store@workspace:packages/vector-store"],
 
     "@crewhaus/voice-runtime": ["@crewhaus/voice-runtime@workspace:packages/voice-runtime"],
+
+    "@crewhaus/vscode-extension": ["@crewhaus/vscode-extension@workspace:packages/vscode-extension"],
 
     "@crewhaus/wizard": ["@crewhaus/wizard@workspace:packages/wizard"],
 

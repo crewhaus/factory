@@ -69,7 +69,9 @@
     "smoke:section-33-whatsapp": "bun examples/section-33-whatsapp-smoke/smoke.ts",
     "compile:hello-channel-imessage": "bun apps/cli/src/index.ts compile examples/hello-channel-imessage/crewhaus.yaml -o examples/hello-channel-imessage/dist",
     "smoke:section-33-imessage": "bun examples/section-33-imessage-smoke/smoke.ts",
-    "smoke:section-34": "bun examples/section-34-federation-smoke/smoke.ts"
+    "smoke:section-34": "bun examples/section-34-federation-smoke/smoke.ts",
+    "smoke:section-35-vscode": "bun examples/section-35-vscode-smoke/smoke.ts",
+    "play:vscode": "echo 'vsce package — production build runs in CI from packages/vscode-extension'"
   },
   "devDependencies": {
     "@biomejs/biome": "1.9.4",
