@@ -1,0 +1,10 @@
+{
+  "name": "@crewhaus-examples/section-40-template-registry-smoke",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Section 40 template-registry smoke",
+  "dependencies": {
+    "@crewhaus/template-registry": "workspace:*"
+  }
+}

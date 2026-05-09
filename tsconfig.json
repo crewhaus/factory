@@ -60,6 +60,7 @@
     { "path": "./packages/audit-encryption" },
     { "path": "./packages/data-retention-engine" },
     { "path": "./packages/compliance-controls" },
+    { "path": "./packages/template-registry" },
     { "path": "./packages/eval-judge" },
     { "path": "./packages/eval-runner" },
     { "path": "./packages/eval-report" },
