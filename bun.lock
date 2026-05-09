@@ -352,6 +352,13 @@
         "@crewhaus/federation-router": "workspace:*",
       },
     },
+    "examples/section-35-jetbrains-smoke": {
+      "name": "@crewhaus-examples/section-35-jetbrains-smoke",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/jetbrains-plugin": "workspace:*",
+      },
+    },
     "examples/section-35-vscode-smoke": {
       "name": "@crewhaus-examples/section-35-vscode-smoke",
       "version": "0.0.0",
@@ -875,6 +882,14 @@
       "version": "0.0.0",
       "dependencies": {
         "@crewhaus/ir": "workspace:*",
+      },
+    },
+    "packages/jetbrains-plugin": {
+      "name": "@crewhaus/jetbrains-plugin",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/vscode-extension": "workspace:*",
       },
     },
     "packages/logging": {
@@ -1854,6 +1869,8 @@
 
     "@crewhaus-examples/section-34-federation-smoke": ["@crewhaus-examples/section-34-federation-smoke@workspace:examples/section-34-federation-smoke"],
 
+    "@crewhaus-examples/section-35-jetbrains-smoke": ["@crewhaus-examples/section-35-jetbrains-smoke@workspace:examples/section-35-jetbrains-smoke"],
+
     "@crewhaus-examples/section-35-vscode-smoke": ["@crewhaus-examples/section-35-vscode-smoke@workspace:examples/section-35-vscode-smoke"],
 
     "@crewhaus/a2a-protocol": ["@crewhaus/a2a-protocol@workspace:packages/a2a-protocol"],
@@ -1969,6 +1986,8 @@
     "@crewhaus/ir": ["@crewhaus/ir@workspace:packages/ir"],
 
     "@crewhaus/ir-passes": ["@crewhaus/ir-passes@workspace:packages/ir-passes"],
+
+    "@crewhaus/jetbrains-plugin": ["@crewhaus/jetbrains-plugin@workspace:packages/jetbrains-plugin"],
 
     "@crewhaus/logging": ["@crewhaus/logging@workspace:packages/logging"],
 

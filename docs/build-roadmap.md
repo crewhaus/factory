@@ -139,7 +139,7 @@ Tool surface expansion (✅ §14) ──► Observability (✅ §15)
 | **§32 Distribution & packaging** | ✅ | §20 (`gateway-server` for hosted `crewhaus-cloud`), §31 (Studio runs inside a container) | §34 (federation needs cross-deployment networking), homebrew/apt/scoop/winget distribution, k8s rollouts |
 | **§33 Channel adapter breadth** | ✅ | §12 (channel-adapter-base interface) | Multi-channel CHN deployments, customer-facing bots outside Slack |
 | **§34 Federation (multi-deployment A2A)** | ✅ | §32 (`docker-images`), §22 (`a2a-protocol` interface), §20 (mTLS auth pattern) | Crew-of-crews, multi-org agent ecosystems, MGD federation, agent marketplaces |
-| **§35 Developer experience tooling** | 🚧 1/3 (vscode-extension landed; jetbrains-plugin + crewhaus-playground in flight) | §32 (`single-binary-cli` for extension installs), §31 (Studio as VS Code webview embed) | Editor adoption, spec-as-code workflows, onboarding funnel, docs-site interactivity |
+| **§35 Developer experience tooling** | 🚧 2/3 (vscode-extension + jetbrains-plugin landed; crewhaus-playground in flight) | §32 (`single-binary-cli` for extension installs), §31 (Studio as VS Code webview embed) | Editor adoption, spec-as-code workflows, onboarding funnel, docs-site interactivity |
 
 ---
 

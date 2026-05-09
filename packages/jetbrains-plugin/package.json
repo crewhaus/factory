@@ -1,0 +1,20 @@
+{
+  "name": "@crewhaus/jetbrains-plugin",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "IntelliJ / WebStorm / PyCharm parity for the CrewHaus VS Code extension: spec autocomplete + lint + Run Spec / Run Eval / Run Canary configurations + spec-registry tool window (Section 35).",
+  "main": "src/scripts/build.ts",
+  "types": "src/scripts/build.ts",
+  "exports": {
+    ".": "./src/scripts/build.ts"
+  },
+  "scripts": {
+    "test": "bun test src",
+    "build:plugin": "bun src/scripts/build.ts"
+  },
+  "dependencies": {
+    "@crewhaus/errors": "workspace:*",
+    "@crewhaus/vscode-extension": "workspace:*"
+  }
+}
