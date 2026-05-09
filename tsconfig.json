@@ -47,6 +47,7 @@
     { "path": "./packages/exporter-datadog" },
     { "path": "./packages/exporter-honeycomb" },
     { "path": "./packages/exporter-splunk" },
+    { "path": "./packages/exporter-newrelic" },
     { "path": "./packages/metrics-collector" },
     { "path": "./packages/structured-event-printer" },
     { "path": "./packages/eval-dataset" },
