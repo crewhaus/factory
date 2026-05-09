@@ -478,6 +478,16 @@
         "@crewhaus/trace-event-bus": "workspace:*",
       },
     },
+    "examples/section-38-grader-multimodal-smoke": {
+      "name": "@crewhaus-examples/section-38-grader-multimodal-smoke",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/eval-grader": "workspace:*",
+        "@crewhaus/grader-multimodal": "workspace:*",
+        "@crewhaus/grader-nlg-metrics": "workspace:*",
+        "@crewhaus/grader-registry": "workspace:*",
+      },
+    },
     "examples/section-38-grader-nlg-metrics-smoke": {
       "name": "@crewhaus-examples/section-38-grader-nlg-metrics-smoke",
       "version": "0.0.0",
@@ -1003,6 +1013,14 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/gateway-protocol": "workspace:*",
         "@crewhaus/tenancy": "workspace:*",
+      },
+    },
+    "packages/grader-multimodal": {
+      "name": "@crewhaus/grader-multimodal",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/eval-grader": "workspace:*",
       },
     },
     "packages/grader-nlg-metrics": {
@@ -2181,6 +2199,8 @@
 
     "@crewhaus-examples/section-37-exporter-splunk-smoke": ["@crewhaus-examples/section-37-exporter-splunk-smoke@workspace:examples/section-37-exporter-splunk-smoke"],
 
+    "@crewhaus-examples/section-38-grader-multimodal-smoke": ["@crewhaus-examples/section-38-grader-multimodal-smoke@workspace:examples/section-38-grader-multimodal-smoke"],
+
     "@crewhaus-examples/section-38-grader-nlg-metrics-smoke": ["@crewhaus-examples/section-38-grader-nlg-metrics-smoke@workspace:examples/section-38-grader-nlg-metrics-smoke"],
 
     "@crewhaus-examples/section-38-grader-safety-classifiers-smoke": ["@crewhaus-examples/section-38-grader-safety-classifiers-smoke@workspace:examples/section-38-grader-safety-classifiers-smoke"],
@@ -2292,6 +2312,8 @@
     "@crewhaus/gateway-protocol": ["@crewhaus/gateway-protocol@workspace:packages/gateway-protocol"],
 
     "@crewhaus/gateway-server": ["@crewhaus/gateway-server@workspace:packages/gateway-server"],
+
+    "@crewhaus/grader-multimodal": ["@crewhaus/grader-multimodal@workspace:packages/grader-multimodal"],
 
     "@crewhaus/grader-nlg-metrics": ["@crewhaus/grader-nlg-metrics@workspace:packages/grader-nlg-metrics"],
 

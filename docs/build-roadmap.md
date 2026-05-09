@@ -2292,7 +2292,7 @@ All four packages are fully independent and parallelisable. Each is its own PR.
 
 ## Section 38 — Production graders
 
-> Status: 🚧 in progress. nlg-metrics ✅ + semantic-similarity ✅ + safety-classifiers ✅ landed; 1 grader family parallel-pending (multimodal). Independent of §36/37/39/40.
+> Status: ✅ COMPLETE. All 4 grader families shipped: nlg-metrics, semantic-similarity, safety-classifiers, multimodal. Independent of §36/37/39/40.
 
 **Catalog modules:** `grader-nlg-metrics` (R15), `grader-semantic-similarity` (R15), `grader-safety-classifiers` (R15), `grader-multimodal` (R15)
 
