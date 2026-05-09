@@ -1,0 +1,11 @@
+{
+  "name": "@crewhaus-examples/section-39-pii-redactor-smoke",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Section 39 pii-redactor smoke",
+  "dependencies": {
+    "@crewhaus/grader-safety-classifiers": "workspace:*",
+    "@crewhaus/pii-redactor": "workspace:*"
+  }
+}

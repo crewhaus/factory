@@ -516,6 +516,14 @@
         "@crewhaus/grader-semantic-similarity": "workspace:*",
       },
     },
+    "examples/section-39-pii-redactor-smoke": {
+      "name": "@crewhaus-examples/section-39-pii-redactor-smoke",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/grader-safety-classifiers": "workspace:*",
+        "@crewhaus/pii-redactor": "workspace:*",
+      },
+    },
     "packages/a2a-protocol": {
       "name": "@crewhaus/a2a-protocol",
       "version": "0.0.0",
@@ -1187,6 +1195,14 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tool-permission-matcher": "workspace:*",
         "zod": "^3.23.8",
+      },
+    },
+    "packages/pii-redactor": {
+      "name": "@crewhaus/pii-redactor",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/grader-safety-classifiers": "workspace:*",
       },
     },
     "packages/pipeline-engine": {
@@ -2207,6 +2223,8 @@
 
     "@crewhaus-examples/section-38-grader-semantic-similarity-smoke": ["@crewhaus-examples/section-38-grader-semantic-similarity-smoke@workspace:examples/section-38-grader-semantic-similarity-smoke"],
 
+    "@crewhaus-examples/section-39-pii-redactor-smoke": ["@crewhaus-examples/section-39-pii-redactor-smoke@workspace:examples/section-39-pii-redactor-smoke"],
+
     "@crewhaus/a2a-protocol": ["@crewhaus/a2a-protocol@workspace:packages/a2a-protocol"],
 
     "@crewhaus/abort-controller": ["@crewhaus/abort-controller@workspace:packages/abort-controller"],
@@ -2356,6 +2374,8 @@
     "@crewhaus/otel-exporter": ["@crewhaus/otel-exporter@workspace:packages/otel-exporter"],
 
     "@crewhaus/permission-engine": ["@crewhaus/permission-engine@workspace:packages/permission-engine"],
+
+    "@crewhaus/pii-redactor": ["@crewhaus/pii-redactor@workspace:packages/pii-redactor"],
 
     "@crewhaus/pipeline-engine": ["@crewhaus/pipeline-engine@workspace:packages/pipeline-engine"],
 
