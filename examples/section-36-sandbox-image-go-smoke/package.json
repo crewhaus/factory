@@ -1,0 +1,12 @@
+{
+  "name": "@crewhaus-examples/section-36-sandbox-image-go-smoke",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Section 36 sandbox-image-go smoke",
+  "dependencies": {
+    "@crewhaus/sandbox": "workspace:*",
+    "@crewhaus/sandbox-image-go": "workspace:*",
+    "@crewhaus/sandbox-image-registry": "workspace:*"
+  }
+}
