@@ -170,6 +170,11 @@ Tool surface expansion (✅ §14) ──► Observability (✅ §15)
 | **§38 Production graders** | ✅ | §16 (`eval-grader`), §29 (`grader-registry`) | ROUGE/BLEU/METEOR + embedding-cosine + toxicity/bias/PII + multimodal (image-similarity / OCR / STT) graders; all plug into §29 grader-registry unchanged |
 | **§39 Compliance & audit hardening** | ✅ | §20 (`audit-log`, `policy-engine`, `tenancy`), §27 (`secrets-manager`) | PII redactor + AES-256-GCM envelope-encrypted audit logs + GDPR retention sweeper (right-to-export/delete) + SOC 2/ISO 27001/HIPAA evidence collection; `crewhaus compliance evidence` CLI subcommand |
 | **§40 Spec template marketplace + example CI** | ✅ | §26 (`scaffold-templates`); §32 (`single-binary-cli` for marketplace fetch) | Backend-agnostic registry with sigstore-style Ed25519 verification; Studio Marketplace integration (search + install + draft-publish); `.github/workflows/example-corpus.yml` matrix gate over every `examples/*/crewhaus.yaml` |
+| **§41 Plugin SDK + Loader** | 🟡 next | §31 (`plugin-sdk` v1 + plugin-sandbox); §40 (`verifyManifest` Ed25519 pattern); §29 (`grader-registry` discovery walker shape) | `plugin-loader` (server-side activation with sandbox + capability gating + signature verification); generalised plugin contract surface unblocks §42 module marketplace + every third-party tool/channel/model/grader/target-emitter |
+| **§42 Module marketplace** | 🟡 depends on §41 | §41 (`plugin-sdk` v2 contracts); §40 (`template-registry` transport reused) | `plugin-registry` + `module-marketplace-client` Studio integration; new `crewhaus plugins {list,search,install,uninstall}` CLI subcommands; community-published plugin distribution |
+| **§43 Mobile target shapes** | 🟡 deferred indefinitely | §1–4 base compiler pipeline; §32 docker-images for the host-side build wrapping | When ready: `target-ios-bundle` (SwiftPM + Hermes) + `target-android-bundle` (AAR + NDK bridge) for native app embedding |
+| **§44 One-click cloud-deploy adapters** | 🟡 independent | §32 (`crewhaus-cloud`, `docker-images`); §27 (`secrets-manager` for env-var plumbing) | `cloud-adapter-{render,flyio,railway,heroku}` — solo-dev / OSS-demo onboarding funnel; each adapter a thin wrapper around platform deploy API |
+| **§45 Long-tail breadth** | 🟢 opportunistic | varies | Sub-agent templates, MCP servers, embedder/vector-store backends, additional channel adapters — lands per-addition without dedicated section |
 
 ---
 
@@ -205,23 +210,183 @@ What v1.0 + v1.1 + v1.2 already deliver:
 - **Compliance & audit hardening** (§39). `pii-redactor` (regex + classifier + policy allow-list; replace + hash modes; wired into runtime-core post-tool path + audit-log.append), `audit-encryption` (AES-256-GCM envelope encryption with per-tenant DEK + KEK from §27 secrets-manager + auto-rotation), `data-retention-engine` (GDPR retain/export/purge + cron-style sweeper + audit-window override + cross-tenant isolation), `compliance-controls` (SOC 2 CC6.x/CC7.x + ISO 27001 A.12.4 + HIPAA §164.312(b) evidence collection with HMAC-signed bundles). New `crewhaus compliance evidence --framework <id> --period <p>` CLI subcommand.
 - **Spec template marketplace + example CI** (§40). `template-registry` (LocalRegistrySource / HttpRegistrySource covering git/huggingface/npm + cachedRegistry TTL wrapper + verifyingRegistry sigstore-style Ed25519 verification refusing unsigned/untrusted/tampered manifests). `template-marketplace-client` (search + install + draft-publish, Studio's headless API). New `.github/workflows/example-corpus.yml` matrix gate compiles every `examples/*/crewhaus.yaml` on every PR — turns red when any example drifts.
 
-## v1.3 — candidate next sections
+## v1.3 phase — what comes next
 
-Beyond Section 40 the catalog still has roughly 10 modules deferred. None are critical-path for any shipped target shape — all twelve target shapes already build, deploy, and run in production today. v1.3 is about ecosystem reach, not capability. Strongest candidates, in rough priority order:
+Sections 41–44 below scope the v1.3 phase. **None are critical-path for any shipped target shape** — all twelve target shapes already build, deploy, and run in production today. v1.3 is about ecosystem reach (third-party plugin distribution) and platform breadth (more cloud + mobile deploy targets), not capability. The catalog still has roughly 10 unbuilt modules; the four sections below + §45 long-tail commentary cover all of them.
 
-- **§41 Plugin SDK + loader.** The catalog has `plugin-sdk` (R-extension — public typed surface for third-party tools/channels/models/graders/target backends) and `plugin-loader` (R-extension — runtime activation, sandboxed import, capability gating) listed as 🔴 high-risk. §31 Studio v1 already ships content-isolated plugin sandboxing for studio-ui plugins; §40 template marketplace already ships sigstore-style signature verification. §41 generalises the surface beyond Studio: a stable `@crewhaus/plugin-sdk` package any third-party can publish against, with semver-tracked contracts for `RegisteredTool` / `ChannelAdapter` / `ProviderAdapter` / `Grader` / `TargetEmitter`. `plugin-loader` consumes the SDK, validates signature against a configured trust root (reuse §40's pattern), and registers the loaded plugin against the right registry (§3 tool-catalog / §12 channel registry / §17 model-router / §29 grader-registry / §32 target-emitter map). Target: 2 packages + a plugin-author guide. Unblocks the entire third-party ecosystem.
+**Parallelisation map.** §41 is the sequential prereq for §42 (module-marketplace consumes plugin-sdk contracts). §43 (mobile target shapes) and §44 (cloud-deploy adapters) are independent of §41/§42 and of each other; they can land in any order. §45 is opportunistic add-as-you-go.
 
-- **§42 Module marketplace.** Once §41 lands, extend the §40 marketplace pattern from templates to plugins: a `module-marketplace-client` that lets users browse + install community-published plugins (tools/skills/channels/graders/target backends) directly from Studio. Mostly the same shape as §40 template-marketplace-client; the registry layer (§40 template-registry) is reusable as-is. Target: 1 package.
+**Deferred indefinitely.** §43 mobile target shapes have been proposed since v1.0 but the iOS/Android Bun runtime story has shifted multiple times. The section below sketches the shape but **no kickoff prompt is committed** — pull the trigger when (a) the iOS Bun-on-Hermes pattern stabilises (today it's experimental), (b) the Android NDK bridge has a working reference, and (c) at least one production partner has signed up to consume it. The same applies to WebAssembly-target shapes for client-side agent execution — interesting in principle, but no concrete reference implementation in `reference-repos/` to anchor a design against.
 
-- **§43 Mobile target shapes.** `target-ios-bundle` (Swift Package Manager bundle wrapping the Bun-on-iOS Hermes embedding pattern) and `target-android-bundle` (AAR bundle wrapping the Bun-on-Android NDK bridge). Substantial new compilation paths — emit native project scaffolding in addition to the JS bundle. Target: 2 packages + reference apps. Unblocks native app embedding for partners shipping consumer mobile clients.
+---
 
-- **§44 One-click cloud deploy adapters.** Today §32 `crewhaus-cloud` ships Terraform + Kustomize for AWS / GCP / Azure. v1.3 adds first-class deploy adapters for the dev-friendly platforms: Render, Fly.io, Railway, Heroku, Vercel (functions-shape compile target). Each adapter is a thin wrapper around the platform's deploy API + a target-specific Dockerfile / runtime. Target: 4-5 packages, each ~200 LOC.
+## Section 41 — Plugin SDK + Loader
 
-- **§45 Long-tail breadth.** Additional sub-agent templates (the agents/ directory keeps growing as patterns crystallise), additional MCP servers (the mcp-servers/ directory), additional embedder backends (Cohere / Mistral Embed / Voyage v3), additional vector-store backends (Lance v0.10+, Postgres+pgvector). Each is small (typically <200 LOC) and lands opportunistically without a dedicated roadmap section.
+> Status: 🟡 next up after v1.2. Sequential prereq for §42.
 
-**Parallelisation:** §41 is the sequential prereq for §42 (module-marketplace consumes plugin-sdk contracts). §43 / §44 / §45 are independent of §41-42 and of each other; they can land in any order.
+**Catalog modules:** `plugin-sdk` v2 (F5 — extending the existing Studio-scoped v1 from §26/§31), `plugin-loader` (F5 — new)
 
-**What's deferred indefinitely:** Mobile target shapes have been proposed since v1.0 but the iOS/Android Bun runtime story has shifted multiple times — keep §43 in the candidate list but don't commit a kickoff prompt until the runtime story stabilises. The same applies to WebAssembly-target shapes for client-side agent execution — interesting in principle, but no concrete reference implementation in `reference-repos/` to anchor a design against.
+§31 Studio v1 already ships a `plugin-sdk` for **studio-ui plugins only** — `definePlugin({name, version, hooks, panes, permissions})` with content-isolation via Web Workers / Realm shim, plus `permissions: { fs: ["read:<glob>"], net: ["fetch:<url-glob>"] }` schema. §29 `grader-registry` ships `discoverPluginGraders()` for grader plugins specifically. But there is no general-purpose plugin contract surface: a third-party publishing a custom `RegisteredTool` (R3), `ChannelAdapter` (R13), `ProviderAdapter` (R2), `Grader` (R15), or `TargetEmitter` (F2) has nothing to depend on with semver guarantees. §41 generalises the Studio plugin contract to cover every plugin shape across the codebase, and adds a runtime-side `plugin-loader` that activates plugins with sandbox + capability gating + signature verification.
+
+### Build order within this section
+
+`plugin-sdk` v2 is the sequential prereq — `plugin-loader` consumes the contract types it exports. Two PRs.
+
+```
+plugin-sdk (v2 — extend)  ──►  plugin-loader (new)
+```
+
+### What to build
+
+**`packages/plugin-sdk` (extend the existing v1)** — generalize the Studio-only contract to cover every plugin shape:
+- Existing: `StudioPlugin` (`hooks`, `panes`, `permissions`) — keep verbatim for backwards compat with the §26/§31 callers.
+- New: `ToolPlugin = { kind: "tool", name, version, manifest, register(catalog: ToolCatalog) }`, `ChannelPlugin = { kind: "channel", ... register(registry: ChannelAdapterRegistry) }`, `ModelPlugin = { kind: "model", ... register(router: ModelRouter) }`, `GraderPlugin = { kind: "grader", ... register(registry: GraderRegistry) }`, `TargetEmitterPlugin = { kind: "target-emitter", ... register(map: TargetEmitterMap) }`. Discriminated union over `kind`.
+- New: `PluginManifest` Zod schema — every plugin (any kind) declares `{ name, version, kind, description, author, sdkVersion, permissions?, signature?, publicKey? }`. Manifest re-uses the §40 `template-registry` Ed25519 signature shape so production callers can plug into `verifyingRegistry` without re-implementing crypto.
+- New: `definePlugin<T extends PluginKind>(def: PluginDef<T>): PluginDef<T>` — generic `definePlugin` for any kind; freezes + validates + returns the def. Existing `definePlugin` for studio-ui plugins becomes a thin wrapper specialising `T = "studio-ui"`.
+- T1 manifest schema validation per kind; T2 each kind's `register()` round-trip against a stub registry; T9 every plugin kind validates the same `permissions` shape (no kind-specific divergence).
+
+**`packages/plugin-loader` (new)** — runtime activation surface:
+- `loadPlugin(manifest, opts) → ActivatedPlugin` — fetches the plugin module via the §40 `RegistrySource` (typically wrapped in `verifyingRegistry({trustRoot})` for production), validates the manifest signature, instantiates the right sandbox per kind (Web Worker for `studio-ui`, process-isolated `Bun.spawn(..., { ipc })` for server-side `tool` / `channel` / `model` / `grader` / `target-emitter`), wires the capability evaluator (`isFsAllowed` / `isNetAllowed` from §31 plugin-sdk) into the sandbox boundary, then calls `def.register(...)` with the correct registry instance.
+- `unloadPlugin(activated) → Promise<void>` — graceful teardown: drains in-flight calls, closes the IPC channel, removes the plugin's registry entries.
+- `loadAllPlugins({pluginRoot, registries}) → ReadonlyArray<ActivatedPlugin>` — discovery walker that combines §29 `discoverPluginGraders()` shape (one directory per plugin under `<pluginRoot>/<name>/manifest.json`) with the multi-kind dispatch.
+- Built-in trust roots: `crewhaus-foundation` (the canonical Crewhaus signing key) plus user-configured `~/.crewhaus/trust.json`. Manifests signed by an unknown key fail-loud at load.
+- T1 per-kind activation against stub sandboxes; T8 capability-violation refusal (plugin tries to read outside `permissions.fs`); T8 signature-from-untrusted-key refusal; T8 pinned-version drift refusal (manifest declares `sdkVersion=1.0.0` but loader is 2.0.0 → refuse with clear reason); T3 unloadPlugin drains in-flight calls before tearing the sandbox down.
+
+### Tests
+
+- `plugin-sdk` v2: T1 per-kind manifest validation + signature shape; T2 each kind's `register()` round-trip; T9 permissions schema invariant across kinds
+- `plugin-loader`: T1 sandbox-per-kind dispatch; T8 capability-violation, untrusted-signature, pinned-version drift refusals; T3 unloadPlugin in-flight-call drain; T7 100-plugin load benchmark stays under 5s warm
+
+### End-to-end smoke
+
+`bun run smoke:section-41` builds three fixture plugins (one `tool`, one `grader`, one `channel`), signs each with a fresh keypair, points the loader at a `LocalRegistrySource` over the fixture directory with the test keypair in the trust root, calls `loadAllPlugins`, and asserts: (a) all three register against the right registries (tool-catalog has the new tool, grader-registry has the new grader, channel-adapter-registry has the new channel), (b) capability violations fail-loud, (c) `unloadPlugin` removes registry entries cleanly. Plus a T8 probe: tamper one manifest's yaml, re-sign-NOT, and assert the loader refuses it.
+
+---
+
+## Section 42 — Module marketplace
+
+> Status: 🟡 depends on §41 (`plugin-sdk` contracts).
+
+**Catalog modules:** `plugin-registry` (F5 — new; reuses §40 `template-registry` pattern), `module-marketplace-client` (F5 — new; mirrors §40 `template-marketplace-client`)
+
+§40 ships a community **template** marketplace; §42 extends the same pattern to **plugins**. Once §41 defines stable plugin contracts, the marketplace gives users a Studio tab (and a `crewhaus plugins install <name>` CLI subcommand) for browsing + installing community-published plugins. The transport, caching, and signature verification layers reuse §40 `template-registry` as-is — the only thing that differs is the manifest schema (§41 `PluginManifest` instead of `TemplateManifest`).
+
+### Build order within this section
+
+`plugin-registry` is the sequential prereq for `module-marketplace-client`. Two PRs.
+
+```
+plugin-registry (new wrapper around §40 template-registry)  ──►  module-marketplace-client (new)
+```
+
+### What to build
+
+**`packages/plugin-registry` (new)** — thin wrapper around `@crewhaus/template-registry`:
+- Re-exports `LocalRegistrySource` / `HttpRegistrySource` / `cachedRegistry` / `verifyingRegistry` parameterised over `PluginManifest` (§41) instead of `TemplateManifest`. Most of the implementation is `Pick<>` + a different Zod schema; no fresh crypto, no fresh cache layer.
+- `discoverInstalledPlugins(rootDir)` — walks `<rootDir>/.crewhaus/plugins/<name>/manifest.json`, parses + validates each. Mirrors §29 `discoverPluginGraders` shape.
+- T1 manifest schema validation; T8 supply-chain check delegates to §40 `verifyManifest` (test: tampered plugin yaml fails verify); T9 cache TTL invariants inherited from §40.
+
+**`packages/module-marketplace-client` (new)** — Studio Marketplace Plugins-tab integration:
+- `PluginMarketplaceClient({registry, workspaceDir})` — mirrors §40 `MarketplaceClient` shape: `list()` / `search({query, kind, author, limit})` / `install(name, opts?)` / `uninstall(name)`.
+- `install(name)` writes the plugin module into `<workspaceDir>/.crewhaus/plugins/<name>/` (manifest.json + the bundled JS) and refuses path-traversal in name / subdir / filename (T8). Then triggers `loadPlugin` via §41 `plugin-loader` if the loader is configured.
+- `PluginMarketplacePublisher.draftPublish(...)` — same shape as §40 `MarketplacePublisher` but writes plugin manifests instead of template manifests.
+- New `crewhaus plugins {list,search,install,uninstall}` CLI subcommands wired into apps/cli alongside the existing `crewhaus templates` subcommands.
+- T1 search by query/kind/author + ranking; T1 install/uninstall round-trip; T8 path-traversal refusals; T1 publish-draft shape; T3 install-then-load via §41 plugin-loader.
+
+### Tests
+
+- `plugin-registry`: T1 schema validation; T8 supply-chain refusal; T9 TTL invariants
+- `module-marketplace-client`: T1 search/install/uninstall; T8 path-traversal; T3 install→load round-trip via §41 plugin-loader
+
+### End-to-end smoke
+
+`bun run smoke:section-42` writes a fixture plugin manifest to a `LocalRegistrySource`-backed plugin registry, runs `crewhaus plugins install fixture-tool` (CLI), asserts the plugin lands in `<workspaceDir>/.crewhaus/plugins/fixture-tool/`, verifies §41 `plugin-loader` activates it cleanly, calls the new tool through `runChatLoop` against a stub model, and asserts the registry receives a tool-call event. Then `crewhaus plugins uninstall fixture-tool` removes the plugin and asserts the tool-catalog drops the registration.
+
+---
+
+## Section 43 — Mobile target shapes (deferred)
+
+> Status: 🟡 deferred indefinitely. **No kickoff prompt yet** — pull the trigger when the iOS/Android Bun runtime story stabilises and at least one production partner is committed.
+
+**Catalog modules (when shipped):** `target-ios-bundle` (F2), `target-android-bundle` (F2)
+
+Today the compiler emits TS bundles that run under Bun on a server or developer host. Mobile partners shipping consumer apps want to embed a CrewHaus agent **inside** the native app (chat features, on-device assistants, smart input fields) without round-tripping through a hosted gateway. Two new compilation paths:
+
+- **`target-ios-bundle`** — emits a Swift Package Manager package with a `.podspec`/`Package.swift` + a JS bundle wrapped in a Hermes/JavaScriptCore embedding. Partners drop `pod 'CrewHausAgent'` into their Podfile, instantiate `CrewHausAgent(specURL: ...)`, and call `await agent.run(prompt)` from Swift. The compilation step adds an `ios/` subdirectory next to `dist/` containing the SwiftPM project scaffolding.
+- **`target-android-bundle`** — emits an AAR (Android Archive) with the JS bundle wrapped in the Bun-on-Android NDK bridge (or a JavaScriptEngine fallback for older Android versions). Partners add `implementation 'io.crewhaus:crewhaus-agent:1.0.0'` to their Gradle file and call `agent.run(prompt)` from Kotlin/Java.
+
+### Why deferred
+
+1. **Bun-on-iOS** is experimental. The current Hermes-embedding pattern works for static bundles but doesn't yet support every Node API the runtime depends on (`node:crypto`, `node:fs`); we'd ship with a runtime polyfill story that's likely to break under iOS 19. Wait until the upstream story is stable.
+2. **Bun-on-Android NDK bridge** has an open RFC but no shipped reference implementation. JavaScriptEngine (Android 12+) works but excludes a substantial userbase.
+3. **No production partner is committed.** Without a real consumer of these target shapes, the iteration loop will stall — we'd ship a v0 that nobody validates against real native app constraints.
+4. **Substantial new test surface.** Each target needs (T3) integration tests that actually compile the emitted Xcode/Gradle project — gating on `xcodebuild` / `gradle` being installed on the test host. CI cost is non-trivial; we should design the live-build gate (analogous to `CREWHAUS_SECTION36_LIVE_DOCKER`) in the kickoff prompt before committing.
+
+### When to revisit
+
+When all four conditions hold:
+1. Bun publishes a stable iOS embedding API (or we accept JavaScriptCore as the fallback).
+2. Android NDK bridge ships in Bun mainline (or we accept Android JavaScriptEngine 12+ as the floor).
+3. At least one external partner signs an LOI to consume the bundle.
+4. We have a CI runner with `xcodebuild` (macOS-arm64 GitHub Actions runner) and `gradle` (Linux Java runner) provisioned.
+
+Until then, leave §43 documented but unscoped.
+
+---
+
+## Section 44 — One-click cloud-deploy adapters
+
+> Status: 🟡 independent. Can land any time; each adapter parallelisable.
+
+**Catalog modules:** `cloud-adapter-render`, `cloud-adapter-flyio`, `cloud-adapter-railway`, `cloud-adapter-heroku` (all F3 — new). `cloud-adapter-vercel` is scoped separately (depends on a `target-vercel-functions` shape that's not yet in the catalog; defer to §45 or a follow-up section).
+
+Today §32 `crewhaus-cloud` ships Terraform + Kustomize recipes for AWS / GCP / Azure (production-grade, multi-tenant, opinionated). v1.3 adds first-class deploy adapters for the **dev-friendly** platforms — Render, Fly.io, Railway, Heroku — where the value prop is "five minutes from `crewhaus init` to a public URL hosting a working agent". Each adapter is a thin wrapper around the platform's deploy API + a target-specific Dockerfile / runtime config; together they unlock the solo-dev / OSS-demo / weekend-hack onboarding funnel.
+
+### Build order within this section
+
+All four adapters are fully independent and parallelisable. Each is its own PR. Order does not matter.
+
+### What to build
+
+**`packages/cloud-adapter-render`** — Render.com deployment:
+- `deployToRender({apiKey, serviceName, region?, env?, plan?})` — POSTs to `https://api.render.com/v1/services` with `RENDER_API_KEY` Bearer auth. Detects an existing service by `serviceName` and PATCHes instead of POSTing duplicates.
+- Generates a `render.yaml` blueprint alongside the `Dockerfile` from §32 `docker-images` (per-target shape — `target-managed` for daemons, `target-cli` for CLI runners). Render's blueprint format pins the right Bun version, registers env vars from `secrets-manager`, and configures the health check.
+- T1 argv-shape via stub fetch; T2 service-resource shape against the live Render API (gated on `CREWHAUS_SECTION44_LIVE_RENDER=1` + `RENDER_API_KEY`); T8 credential-leak guard (`scrubApiKey`).
+
+**`packages/cloud-adapter-flyio`** — Fly.io deployment:
+- `deployToFlyio({apiToken, appName, region?, machineSize?, env?})` — uses the Fly Machines API + `fly.toml` generation. Honors `FLY_API_TOKEN`. Generates a `fly.toml` with the right `[build]`, `[env]`, `[[services]]`, and `[[services.health_checks]]` blocks for the target shape.
+- The CLI subcommand path is `crewhaus deploy --provider=flyio`. Reuses §32 `crewhaus-cloud`'s deploy abstraction.
+- T1/T2/T8 mirror the Render adapter pattern.
+
+**`packages/cloud-adapter-railway`** — Railway deployment:
+- `deployToRailway({projectId, apiToken, env?, region?})` — POSTs to Railway's GraphQL `https://backboard.railway.com/graphql/v2`. Honors `RAILWAY_API_TOKEN`.
+- Generates `railway.json` config + reuses §32 Docker image. Railway's per-project env-var sync requires re-PATCHing on every deploy, so the adapter handles that.
+- T1/T2/T8 mirror.
+
+**`packages/cloud-adapter-heroku`** — Heroku deployment:
+- `deployToHeroku({apiKey, appName, region?, dynoSize?, env?})` — POSTs to `https://api.heroku.com/apps/<appName>/builds` after pushing the §32 Docker image to Heroku Container Registry. Honors `HEROKU_API_KEY`.
+- Generates `heroku.yml` for the new container-runtime path (Heroku Postgres + Redis addons recognised when the spec declares §27 `secrets-manager: { backend: heroku-config-vars }`).
+- T1/T2/T8 mirror.
+
+### Tests
+
+- Per adapter: T1 argv shape + endpoint routing via stub fetch; T2 platform-specific resource payload assertions (each platform's API has different naming — fly.toml vs render.yaml vs railway.json vs heroku.yml); T8 credential-leak guard (license/api key never appears in logs/errors); T3 against the live API gated on the per-platform env var
+
+### End-to-end smoke
+
+`bun run smoke:section-44-<provider>` per adapter — synthesises 1 deploy call against a stub-fetch backend, asserts the request URL + headers + body shape match the platform's API contract. Live probes (gated on the respective env vars) actually deploy a smoke `hello-cli` example and assert the deploy returns a 2xx + the resulting URL responds to a health-check. The aggregated `bun run smoke:section-44` chains all four.
+
+---
+
+## Section 45 — Long-tail breadth (no dedicated section)
+
+> Status: 🟢 opportunistic. Lands as needed; no roadmap commitment.
+
+**Catalog modules (open-ended):** additional sub-agent templates, additional MCP servers, additional embedder backends (Cohere v3, Mistral Embed, Voyage v3+), additional vector-store backends (Lance v0.10+, Postgres+pgvector), additional channel adapters (Microsoft Teams, Mattermost, Matrix), additional grader families (custom domain-specific scorers).
+
+These are all **small, isolated additions** (typically <200 LOC each) that don't require their own roadmap section. Each piggy-backs on shipped infrastructure: `embedder` already supports the OpenAI-compatible adapter shape so a Cohere v3 backend is a tiny config change; `vector-store` has a generic HTTP-shape interface so Postgres+pgvector is mostly a SQL adapter; channel adapters reuse `channel-adapter-base`. Treat §45 as a backlog tag, not a milestone.
+
+When demand crystallises around any single addition (e.g. "we need Microsoft Teams as a 6th channel"), open a single PR adding the package; reference §45 in the PR title. If a cluster of related additions emerges (e.g. "we need 3 new vector stores at once"), promote to its own §46+ roadmap section.
 
 ---
 
@@ -4541,4 +4706,147 @@ End-to-end smoke before opening the PR:
 - Verify the example-corpus.yml workflow turns red when any example is intentionally broken (in a scratch branch)
 
 Update docs/MODULE-CATALOG.md and docs/build-roadmap.md with everything that is complete after EACH PR (one update per package).
+```
+
+---
+
+### Section 41 — Plugin SDK + Loader
+
+```
+Read docs/build-roadmap.md Section 41 and docs/MODULE-CATALOG.md scoped-for-v1.3 entries for plugin-sdk + plugin-loader.
+
+Also read in full:
+- packages/plugin-sdk/src/index.ts — current Studio-scoped v1 (definePlugin for studio-ui, permissions schema with isFsAllowed/isNetAllowed)
+- packages/grader-registry/src/index.ts — discoverPluginGraders walker shape; T8 plugin discovery test
+- packages/template-registry/src/index.ts — §40 verifyManifest + signManifest + verifyingRegistry pattern (we reuse the Ed25519 + canonical JSON shape)
+- packages/tool-catalog/src/index.ts + packages/channel-adapter-base/src/index.ts (or the slack adapter) + packages/model-router/src/index.ts — registries plugin-loader will register against
+
+Build in this order:
+
+1. packages/plugin-sdk (extend; sequential prereq for plugin-loader)
+   - Keep StudioPlugin verbatim for backwards compat with §26/§31 callers
+   - Add ToolPlugin / ChannelPlugin / ModelPlugin / GraderPlugin / TargetEmitterPlugin discriminated union over `kind`
+   - Generic `definePlugin<T extends PluginKind>(def): PluginDef<T>` — existing studio-ui definePlugin becomes a thin specialisation
+   - PluginManifest Zod schema { name, version, kind, description, author, sdkVersion, permissions?, signature?, publicKey? }
+   - Reuse §40 template-registry's signature shape so production callers pipe through the same verifyManifest helper
+
+2. packages/plugin-loader (new; depends on plugin-sdk)
+   - loadPlugin(manifest, opts) → ActivatedPlugin: fetch via §40 RegistrySource (typically wrapped in verifyingRegistry), validate signature, instantiate per-kind sandbox (Web Worker for studio-ui; Bun.spawn IPC for server-side kinds), wire isFsAllowed/isNetAllowed capability gate, call def.register(...) against the right registry
+   - unloadPlugin(activated) → drains in-flight calls + closes IPC + removes registry entries
+   - loadAllPlugins({pluginRoot, registries}) → walks <root>/<plugin>/manifest.json; mirrors §29 discoverPluginGraders shape
+   - Built-in trust roots: crewhaus-foundation key + ~/.crewhaus/trust.json
+   - Refusals: untrusted signature (T8), capability violation (T8), pinned-version drift (T8)
+
+Each PR's tests:
+- T1 manifest validation per kind; T2 per-kind register() round-trip against stub registries; T9 permissions schema invariant across kinds
+- T1 sandbox-per-kind dispatch; T8 capability-violation refusal; T8 untrusted-signature refusal; T8 pinned-version drift refusal; T3 unloadPlugin in-flight drain; T7 100-plugin warm load <5s
+
+End-to-end smoke before opening the PR:
+- ANTHROPIC_AUTH_TOKEN is in .env (Bun auto-loads .env)
+- `bun run smoke:section-41` builds three fixture plugins (one tool, one grader, one channel), signs each with a fresh keypair, points the loader at a LocalRegistrySource over the fixture directory with the test keypair in the trust root, calls loadAllPlugins, asserts: (a) all three register against the right registries, (b) capability violations fail-loud, (c) unloadPlugin removes registry entries cleanly. Plus a T8 probe: tamper one manifest's yaml and assert the loader refuses it.
+
+Update docs/MODULE-CATALOG.md and docs/build-roadmap.md after EACH PR (one update per package).
+```
+
+---
+
+### Section 42 — Module marketplace
+
+```
+Read docs/build-roadmap.md Section 42 and docs/MODULE-CATALOG.md scoped-for-v1.3 entries for plugin-registry + module-marketplace-client.
+
+Also read in full:
+- packages/template-registry/src/index.ts — §40 RegistrySource interface + LocalRegistrySource + verifyingRegistry; we wrap these for plugins
+- packages/template-marketplace-client/src/index.ts — §40 MarketplaceClient + MarketplacePublisher pattern; we mirror this for plugins
+- packages/plugin-sdk/src/index.ts — §41 PluginManifest schema (the only difference vs TemplateManifest)
+- packages/plugin-loader/src/index.ts — §41 loadPlugin/unloadPlugin entrypoints we trigger after install
+- apps/cli/src/index.ts — current `crewhaus templates {list,search,install}` subcommand pattern; we mirror as `crewhaus plugins {list,search,install,uninstall}`
+
+Build in this order:
+
+1. packages/plugin-registry (sequential prereq)
+   - Re-exports LocalRegistrySource / HttpRegistrySource / cachedRegistry / verifyingRegistry parameterised over PluginManifest instead of TemplateManifest
+   - discoverInstalledPlugins(rootDir) walks <rootDir>/.crewhaus/plugins/<name>/manifest.json
+   - T1 schema validation; T8 supply-chain check delegates to §40 verifyManifest; T9 cache TTL invariants inherit from §40
+
+2. packages/module-marketplace-client (depends on plugin-registry)
+   - PluginMarketplaceClient({registry, workspaceDir}) mirrors §40 MarketplaceClient: list/search/install/uninstall
+   - install(name) writes to <workspaceDir>/.crewhaus/plugins/<name>/ + triggers §41 plugin-loader if configured
+   - PluginMarketplacePublisher.draftPublish(...) for the publish flow
+   - Wire `crewhaus plugins {list,search,install,uninstall}` CLI subcommands into apps/cli (mirror the existing `crewhaus templates` pattern)
+   - T8 path-traversal refusals on name / subdir / filename
+
+Tests per PR: T1 search/install/uninstall + ranking; T8 path-traversal; T3 install→load round-trip via §41 plugin-loader; T1 publish-draft shape
+
+End-to-end smoke before opening the PR:
+- ANTHROPIC_AUTH_TOKEN is in .env (Bun auto-loads .env)
+- `bun run smoke:section-42` writes a fixture plugin manifest to a LocalRegistrySource-backed plugin registry, runs `crewhaus plugins install fixture-tool` (CLI), asserts the plugin lands in <workspaceDir>/.crewhaus/plugins/fixture-tool/, verifies §41 plugin-loader activates it cleanly, calls the new tool through runChatLoop against a stub model, and asserts the registry receives a tool-call event. Then `crewhaus plugins uninstall fixture-tool` removes the plugin and asserts the tool-catalog drops the registration.
+
+Update docs/MODULE-CATALOG.md and docs/build-roadmap.md after EACH PR (one update per package).
+```
+
+---
+
+### Section 43 — Mobile target shapes (deferred)
+
+> No kickoff prompt yet. Pull the trigger when:
+> 1. Bun publishes a stable iOS embedding API (or we accept JavaScriptCore as the fallback floor)
+> 2. Android NDK bridge ships in Bun mainline (or we accept JavaScriptEngine 12+ as the floor)
+> 3. At least one external partner signs an LOI to consume the bundle
+> 4. We have a CI runner with `xcodebuild` (macOS-arm64 GitHub Actions runner) and `gradle` (Linux Java runner) provisioned, OR we explicitly accept that mobile-bundle CI runs on developer laptops only via a `CREWHAUS_SECTION43_LIVE_MOBILE=1` gate
+>
+> When these hold, draft the kickoff prompt with the same shape as §41/§42/§44, including:
+> - emit-side: target-ios-bundle + target-android-bundle codegen pipelines (alongside the JS bundle, write a SwiftPM Package.swift / Android AAR build.gradle scaffolding)
+> - test-side: T1 emitted-project structure assertions; T3 `xcodebuild -resolvePackageDependencies` + `gradle assembleRelease` against the emitted project
+> - smoke-side: gated live build under CREWHAUS_SECTION43_LIVE_MOBILE=1 + the platform SDKs being installed
+
+---
+
+### Section 44 — One-click cloud-deploy adapters
+
+```
+Read docs/build-roadmap.md Section 44 and docs/MODULE-CATALOG.md scoped-for-v1.3 entries for cloud-adapter-{render,flyio,railway,heroku}.
+
+Also read in full:
+- packages/crewhaus-cloud/src/index.ts — §32 deploy abstraction (`deployCloud` / `teardownCloud` + the Terraform/Kustomize render path); we add a sibling adapter dispatch
+- packages/docker-images/src/index.ts — §32 per-target Dockerfile generation; cloud adapters reuse the emitted images
+- packages/secrets-manager/src/index.ts — §27 backend interface; some platforms (Heroku, Render) accept env-var bulk-set; the adapter wires this through
+- packages/exporter-datadog/src/index.ts — §37 credential-leak guard pattern (scrubApiKey); we mirror this for each cloud platform's API key
+
+Build all four packages in parallel — fully independent:
+
+1. packages/cloud-adapter-render
+   - deployToRender({apiKey, serviceName, region?, env?, plan?}) — POST/PATCH to https://api.render.com/v1/services
+   - Generate render.yaml blueprint alongside the §32 Dockerfile
+   - Detect existing service by serviceName; PATCH if found, POST if not
+   - Honors RENDER_API_KEY env var
+
+2. packages/cloud-adapter-flyio
+   - deployToFlyio({apiToken, appName, region?, machineSize?, env?}) — Fly Machines API + fly.toml generation
+   - Honors FLY_API_TOKEN
+   - [build] / [env] / [[services]] / [[services.health_checks]] blocks per target shape
+
+3. packages/cloud-adapter-railway
+   - deployToRailway({projectId, apiToken, env?, region?}) — POSTs to https://backboard.railway.com/graphql/v2 (GraphQL)
+   - Honors RAILWAY_API_TOKEN
+   - Per-deploy env-var sync via PATCH
+
+4. packages/cloud-adapter-heroku
+   - deployToHeroku({apiKey, appName, region?, dynoSize?, env?}) — push image to Container Registry then POST /apps/<n>/builds
+   - Honors HEROKU_API_KEY
+   - Generate heroku.yml; recognise §27 secrets-manager backend=heroku-config-vars for native env-var sync
+
+Each adapter:
+- T1 argv shape + endpoint routing via stub fetch
+- T2 platform-specific resource payload assertions (each platform's API has different naming — fly.toml vs render.yaml vs railway.json vs heroku.yml)
+- T8 credential-leak guard — license/api key never appears in logs/errors (mirror §37 scrubApiKey)
+- T3 against the live API gated on the per-platform env var (CREWHAUS_SECTION44_LIVE_RENDER=1 + RENDER_API_KEY etc.)
+
+End-to-end smoke before opening the PR:
+- ANTHROPIC_AUTH_TOKEN is in .env (Bun auto-loads .env)
+- `bun run smoke:section-44-<provider>` per adapter: synthesises one deploy call against a stub-fetch backend, asserts the request URL + headers + body shape match the platform's API contract
+- Live probes (gated on the respective env vars) actually deploy a smoke `hello-cli` example and assert the deploy returns a 2xx + the resulting URL responds to a health-check
+- Aggregated `bun run smoke:section-44` chains all four
+
+Update docs/MODULE-CATALOG.md and docs/build-roadmap.md after EACH PR (one update per platform).
 ```
