@@ -375,6 +375,15 @@
         "@crewhaus/vscode-extension": "workspace:*",
       },
     },
+    "examples/section-36-sandbox-image-go-smoke": {
+      "name": "@crewhaus-examples/section-36-sandbox-image-go-smoke",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/sandbox": "workspace:*",
+        "@crewhaus/sandbox-image-go": "workspace:*",
+        "@crewhaus/sandbox-image-registry": "workspace:*",
+      },
+    },
     "examples/section-36-sandbox-image-registry-smoke": {
       "name": "@crewhaus-examples/section-36-sandbox-image-registry-smoke",
       "version": "0.0.0",
@@ -1149,6 +1158,15 @@
         "@crewhaus/errors": "workspace:*",
       },
     },
+    "packages/sandbox-image-go": {
+      "name": "@crewhaus/sandbox-image-go",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/sandbox": "workspace:*",
+        "@crewhaus/sandbox-image-registry": "workspace:*",
+      },
+    },
     "packages/sandbox-image-registry": {
       "name": "@crewhaus/sandbox-image-registry",
       "version": "0.0.0",
@@ -1909,6 +1927,8 @@
 
     "@crewhaus-examples/section-35-vscode-smoke": ["@crewhaus-examples/section-35-vscode-smoke@workspace:examples/section-35-vscode-smoke"],
 
+    "@crewhaus-examples/section-36-sandbox-image-go-smoke": ["@crewhaus-examples/section-36-sandbox-image-go-smoke@workspace:examples/section-36-sandbox-image-go-smoke"],
+
     "@crewhaus-examples/section-36-sandbox-image-registry-smoke": ["@crewhaus-examples/section-36-sandbox-image-registry-smoke@workspace:examples/section-36-sandbox-image-registry-smoke"],
 
     "@crewhaus/a2a-protocol": ["@crewhaus/a2a-protocol@workspace:packages/a2a-protocol"],
@@ -2076,6 +2096,8 @@
     "@crewhaus/runtime-core": ["@crewhaus/runtime-core@workspace:packages/runtime-core"],
 
     "@crewhaus/sandbox": ["@crewhaus/sandbox@workspace:packages/sandbox"],
+
+    "@crewhaus/sandbox-image-go": ["@crewhaus/sandbox-image-go@workspace:packages/sandbox-image-go"],
 
     "@crewhaus/sandbox-image-registry": ["@crewhaus/sandbox-image-registry@workspace:packages/sandbox-image-registry"],
 

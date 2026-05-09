@@ -77,7 +77,8 @@
     "smoke:section-35-playground": "bun examples/section-35-playground-smoke/smoke.ts",
     "play:playground": "bun packages/crewhaus-playground/src/cli.ts",
     "smoke:section-36-registry": "bun examples/section-36-sandbox-image-registry-smoke/smoke.ts",
-    "smoke:section-36": "bun examples/section-36-sandbox-image-registry-smoke/smoke.ts"
+    "smoke:section-36-go": "bun examples/section-36-sandbox-image-go-smoke/smoke.ts",
+    "smoke:section-36": "bun examples/section-36-sandbox-image-registry-smoke/smoke.ts && bun examples/section-36-sandbox-image-go-smoke/smoke.ts"
   },
   "devDependencies": {
     "@biomejs/biome": "1.9.4",

@@ -1,0 +1,13 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "references": [
+    { "path": "../errors" },
+    { "path": "../sandbox" },
+    { "path": "../sandbox-image-registry" }
+  ],
+  "include": ["src/**/*"]
+}
