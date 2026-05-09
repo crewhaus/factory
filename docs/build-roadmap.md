@@ -2392,7 +2392,7 @@ compliance-controls  ──►  (depends on the three above for evidence collect
 
 ## Section 40 — Spec template marketplace + example CI
 
-> Status: 🚧 in progress. `template-registry` ✅ landed (sequential prereq); `template-marketplace-client` + `example-corpus.yml` pending.
+> Status: 🚧 in progress. `template-registry` ✅ + `template-marketplace-client` ✅ landed; `example-corpus.yml` pending.
 
 **Catalog modules:** `template-registry` (F4), `template-marketplace-client` (F4); plus a `.github/workflows/example-corpus.yml` CI job (no new package)
 
