@@ -318,6 +318,14 @@
         "@crewhaus/compiler": "workspace:*",
       },
     },
+    "examples/section-33-imessage-smoke": {
+      "name": "@crewhaus-examples/section-33-imessage-smoke",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/channel-adapter-imessage": "workspace:*",
+        "@crewhaus/compiler": "workspace:*",
+      },
+    },
     "examples/section-33-telegram-smoke": {
       "name": "@crewhaus-examples/section-33-telegram-smoke",
       "version": "0.0.0",
@@ -454,6 +462,13 @@
     },
     "packages/channel-adapter-discord": {
       "name": "@crewhaus/channel-adapter-discord",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+      },
+    },
+    "packages/channel-adapter-imessage": {
+      "name": "@crewhaus/channel-adapter-imessage",
       "version": "0.0.0",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
@@ -1213,6 +1228,7 @@
       },
       "peerDependencies": {
         "@crewhaus/channel-adapter-discord": "workspace:*",
+        "@crewhaus/channel-adapter-imessage": "workspace:*",
         "@crewhaus/channel-adapter-slack": "workspace:*",
         "@crewhaus/channel-adapter-telegram": "workspace:*",
         "@crewhaus/channel-adapter-whatsapp": "workspace:*",
@@ -1783,6 +1799,8 @@
 
     "@crewhaus-examples/section-33-discord-smoke": ["@crewhaus-examples/section-33-discord-smoke@workspace:examples/section-33-discord-smoke"],
 
+    "@crewhaus-examples/section-33-imessage-smoke": ["@crewhaus-examples/section-33-imessage-smoke@workspace:examples/section-33-imessage-smoke"],
+
     "@crewhaus-examples/section-33-telegram-smoke": ["@crewhaus-examples/section-33-telegram-smoke@workspace:examples/section-33-telegram-smoke"],
 
     "@crewhaus-examples/section-33-whatsapp-smoke": ["@crewhaus-examples/section-33-whatsapp-smoke@workspace:examples/section-33-whatsapp-smoke"],
@@ -1814,6 +1832,8 @@
     "@crewhaus/canary-controller": ["@crewhaus/canary-controller@workspace:packages/canary-controller"],
 
     "@crewhaus/channel-adapter-discord": ["@crewhaus/channel-adapter-discord@workspace:packages/channel-adapter-discord"],
+
+    "@crewhaus/channel-adapter-imessage": ["@crewhaus/channel-adapter-imessage@workspace:packages/channel-adapter-imessage"],
 
     "@crewhaus/channel-adapter-slack": ["@crewhaus/channel-adapter-slack@workspace:packages/channel-adapter-slack"],
 

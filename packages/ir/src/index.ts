@@ -173,11 +173,24 @@ export type IrWhatsAppConfig = {
   readonly appSecret: IrSecretRef;
 };
 
+/**
+ * Section 33 — iMessage channel config (macOS host-bound). `chatDbPath`
+ * defaults to `~/Library/Messages/chat.db`; `cursorPath` defaults to
+ * `.crewhaus/imessage-cursor.json`. Both can be overridden in spec for
+ * tests. The adapter requires `CREWHAUS_IMESSAGE_HOST_ENABLED=1` at
+ * boot, so no IR-level secret is needed.
+ */
+export type IrIMessageConfig = {
+  readonly chatDbPath?: IrSecretRef;
+  readonly cursorPath?: IrSecretRef;
+};
+
 export type IrChannels = {
   readonly slack?: IrSlackConfig;
   readonly telegram?: IrTelegramConfig;
   readonly discord?: IrDiscordConfig;
   readonly whatsapp?: IrWhatsAppConfig;
+  readonly imessage?: IrIMessageConfig;
 };
 
 export type IrRouting = {

@@ -11,6 +11,7 @@ import type {
   IrDiscordConfig,
   IrEvalV0,
   IrGraphV0,
+  IrIMessageConfig,
   IrManagedV0,
   IrMcpServerConfig,
   IrMcpServers,
@@ -32,6 +33,7 @@ import {
   type SpecChannel,
   type SpecCrewRole,
   type SpecDiscordChannel,
+  type SpecIMessageChannel,
   type SpecMcpServerConfig,
   type SpecSlackChannel,
   type SpecSubAgentDefinition,
@@ -174,12 +176,20 @@ function lowerWhatsApp(whatsapp: SpecWhatsAppChannel): IrWhatsAppConfig {
   };
 }
 
+function lowerIMessage(imessage: SpecIMessageChannel): IrIMessageConfig {
+  return {
+    ...(imessage.chatDbPath !== undefined ? { chatDbPath: lowerSecret(imessage.chatDbPath) } : {}),
+    ...(imessage.cursorPath !== undefined ? { cursorPath: lowerSecret(imessage.cursorPath) } : {}),
+  };
+}
+
 function lowerChannels(channels: SpecChannel["channels"]): IrChannels {
   return {
     ...(channels.slack !== undefined ? { slack: lowerSlack(channels.slack) } : {}),
     ...(channels.telegram !== undefined ? { telegram: lowerTelegram(channels.telegram) } : {}),
     ...(channels.discord !== undefined ? { discord: lowerDiscord(channels.discord) } : {}),
     ...(channels.whatsapp !== undefined ? { whatsapp: lowerWhatsApp(channels.whatsapp) } : {}),
+    ...(channels.imessage !== undefined ? { imessage: lowerIMessage(channels.imessage) } : {}),
   };
 }
 

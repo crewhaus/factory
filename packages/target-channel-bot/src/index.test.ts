@@ -423,3 +423,45 @@ describe("emitChannelBot — WhatsApp channel (Section 33)", () => {
     expect(c).toContain('["whatsapp", whatsappAdapter]');
   });
 });
+
+describe("emitChannelBot — iMessage channel (Section 33)", () => {
+  const IMESSAGE_IR: IrChannelV0 = {
+    ...MIN_IR,
+    channels: {
+      imessage: {},
+    },
+  };
+
+  test('daemon.ts imports createIMessageAdapter and registers under "imessage"', () => {
+    const c = fileMap(IMESSAGE_IR).get("daemon.ts") ?? "";
+    expect(c).toContain(
+      'import { createIMessageAdapter } from "@crewhaus/channel-adapter-imessage";',
+    );
+    expect(c).toContain('registerChannelAdapter("imessage", imessageAdapter);');
+    expect(c).toContain('["imessage", imessageAdapter]');
+  });
+
+  test("daemon.ts emits imessage adapter with no fields when none configured", () => {
+    const c = fileMap(IMESSAGE_IR).get("daemon.ts") ?? "";
+    expect(c).toContain("createIMessageAdapter({");
+    // No env-check entries because none of the optional fields are set.
+    expect(c).not.toContain("missing required env vars");
+  });
+
+  test("daemon.ts emits chatDbPath / cursorPath when configured via env", () => {
+    const irWithPaths: IrChannelV0 = {
+      ...MIN_IR,
+      channels: {
+        imessage: {
+          chatDbPath: { kind: "env", name: "MY_CHAT_DB" },
+          cursorPath: { kind: "env", name: "MY_CURSOR" },
+        },
+      },
+    };
+    const c = fileMap(irWithPaths).get("daemon.ts") ?? "";
+    expect(c).toContain('chatDbPath: process.env["MY_CHAT_DB"]');
+    expect(c).toContain('cursorPath: process.env["MY_CURSOR"]');
+    expect(c).toContain('"MY_CHAT_DB"');
+    expect(c).toContain('"MY_CURSOR"');
+  });
+});

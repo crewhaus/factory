@@ -21,7 +21,8 @@ export function emitChannelBot(ir: IrChannelV0): Bundle {
     ir.channels.slack === undefined &&
     ir.channels.telegram === undefined &&
     ir.channels.discord === undefined &&
-    ir.channels.whatsapp === undefined
+    ir.channels.whatsapp === undefined &&
+    ir.channels.imessage === undefined
   ) {
     throw new TargetEmitError(
       "channel target requires at least one configured channel — none found",
@@ -153,6 +154,11 @@ function requiredEnvNames(ir: IrChannelV0): string[] {
     if (whatsapp.phoneNumberId.kind === "env") names.push(whatsapp.phoneNumberId.name);
     if (whatsapp.accessToken.kind === "env") names.push(whatsapp.accessToken.name);
     if (whatsapp.appSecret.kind === "env") names.push(whatsapp.appSecret.name);
+  }
+  const imessage = ir.channels.imessage;
+  if (imessage !== undefined) {
+    if (imessage.chatDbPath?.kind === "env") names.push(imessage.chatDbPath.name);
+    if (imessage.cursorPath?.kind === "env") names.push(imessage.cursorPath.name);
   }
   return names;
 }
@@ -494,11 +500,13 @@ function renderDaemon(ir: IrChannelV0): string {
   const telegram = ir.channels.telegram;
   const discord = ir.channels.discord;
   const whatsapp = ir.channels.whatsapp;
+  const imessage = ir.channels.imessage;
   if (
     slack === undefined &&
     telegram === undefined &&
     discord === undefined &&
-    whatsapp === undefined
+    whatsapp === undefined &&
+    imessage === undefined
   ) {
     throw new TargetEmitError("channel target requires at least one channel configured");
   }
@@ -582,6 +590,22 @@ registerChannelAdapter("discord", discordAdapter);`);
 });
 registerChannelAdapter("whatsapp", whatsappAdapter);`);
     adapterMapEntries.push(`["whatsapp", whatsappAdapter]`);
+  }
+
+  if (imessage !== undefined) {
+    const chatDbPath =
+      imessage.chatDbPath !== undefined ? renderSecretExpr(imessage.chatDbPath) : "undefined";
+    const cursorPath =
+      imessage.cursorPath !== undefined ? renderSecretExpr(imessage.cursorPath) : "undefined";
+    adapterImports.push(
+      `import { createIMessageAdapter } from "@crewhaus/channel-adapter-imessage";`,
+    );
+    adapterConstructs.push(`const imessageAdapter = createIMessageAdapter({${
+      imessage.chatDbPath !== undefined ? `\n  chatDbPath: ${chatDbPath},` : ""
+    }${imessage.cursorPath !== undefined ? `\n  cursorPath: ${cursorPath},` : ""}
+});
+registerChannelAdapter("imessage", imessageAdapter);`);
+    adapterMapEntries.push(`["imessage", imessageAdapter]`);
   }
 
   const adapterConstructBlock = adapterConstructs.join("\n\n");
