@@ -2337,7 +2337,7 @@ All four packages are independent; each is its own PR.
 
 ## Section 39 — Compliance & audit hardening
 
-> Status: 🚧 in progress. `pii-redactor` ✅ landed; 3 packages parallel-pending (audit-encryption, data-retention-engine, compliance-controls). Best worked alongside §38 because `grader-safety-classifiers` PII-leak detection feeds the §39 redaction layer.
+> Status: 🚧 in progress. pii-redactor ✅ + audit-encryption ✅ landed; 2 packages parallel-pending (data-retention-engine, compliance-controls). Best worked alongside §38 because `grader-safety-classifiers` PII-leak detection feeds the §39 redaction layer.
 
 **Catalog modules:** `audit-encryption` (R17), `data-retention-engine` (R17), `compliance-controls` (R17), `pii-redactor` (R17)
 
