@@ -1,0 +1,10 @@
+{
+  "update_id": 100006,
+  "message": {
+    "message_id": 21,
+    "from": { "id": 4242, "is_bot": false, "username": "alice" },
+    "chat": { "id": -100456, "type": "supergroup" },
+    "text": "@crewhaus_bot summarize this thread",
+    "entities": [{ "type": "mention", "offset": 0, "length": 14 }]
+  }
+}

@@ -17,8 +17,7 @@ import type { Bundle, IrChannelV0, IrSecretRef, IrSubAgentDefinition } from "@cr
  * with an empty secret.
  */
 export function emitChannelBot(ir: IrChannelV0): Bundle {
-  const slack = ir.channels.slack;
-  if (slack === undefined) {
+  if (ir.channels.slack === undefined && ir.channels.telegram === undefined) {
     throw new TargetEmitError(
       "channel target requires at least one configured channel — none found",
     );
@@ -132,6 +131,11 @@ function requiredEnvNames(ir: IrChannelV0): string[] {
     if (slack.botToken.kind === "env") names.push(slack.botToken.name);
     if (slack.signingSecret.kind === "env") names.push(slack.signingSecret.name);
     // appToken is optional — we don't enforce it at startup.
+  }
+  const telegram = ir.channels.telegram;
+  if (telegram !== undefined) {
+    if (telegram.botToken.kind === "env") names.push(telegram.botToken.name);
+    if (telegram.secretToken.kind === "env") names.push(telegram.secretToken.name);
   }
   return names;
 }
@@ -470,8 +474,9 @@ export function createGateway(config: GatewayConfig): Gateway {
 
 function renderDaemon(ir: IrChannelV0): string {
   const slack = ir.channels.slack;
-  if (slack === undefined) {
-    throw new TargetEmitError("channel target without slack config not yet supported");
+  const telegram = ir.channels.telegram;
+  if (slack === undefined && telegram === undefined) {
+    throw new TargetEmitError("channel target requires at least one channel configured");
   }
   const { imports: builtinImports, inits, registrations } = resolveTools(ir.tools, ir.toolConfigs);
   const mcp = renderMcpServers(ir);
@@ -489,17 +494,42 @@ if (__missing.length > 0) {
 `
       : "";
 
-  const slackBotToken = renderSecretExpr(slack.botToken);
-  const slackSigningSecret = renderSecretExpr(slack.signingSecret);
-  const slackAppToken = slack.appToken !== undefined ? renderSecretExpr(slack.appToken) : undefined;
+  const adapterImports: string[] = [];
+  const adapterConstructs: string[] = [];
+  const adapterMapEntries: string[] = [];
 
-  const slackAdapterConstruct = `const slackAdapter = createSlackAdapter({
+  if (slack !== undefined) {
+    const slackBotToken = renderSecretExpr(slack.botToken);
+    const slackSigningSecret = renderSecretExpr(slack.signingSecret);
+    const slackAppToken =
+      slack.appToken !== undefined ? renderSecretExpr(slack.appToken) : undefined;
+    adapterImports.push(`import { createSlackAdapter } from "@crewhaus/channel-adapter-slack";`);
+    adapterConstructs.push(`const slackAdapter = createSlackAdapter({
   botToken: ${slackBotToken} ?? "",
   signingSecret: ${slackSigningSecret} ?? "",${
     slackAppToken !== undefined ? `\n  appToken: ${slackAppToken},` : ""
   }
 });
-registerChannelAdapter("slack", slackAdapter);`;
+registerChannelAdapter("slack", slackAdapter);`);
+    adapterMapEntries.push(`["slack", slackAdapter]`);
+  }
+
+  if (telegram !== undefined) {
+    const tgBotToken = renderSecretExpr(telegram.botToken);
+    const tgSecretToken = renderSecretExpr(telegram.secretToken);
+    adapterImports.push(
+      `import { createTelegramAdapter } from "@crewhaus/channel-adapter-telegram";`,
+    );
+    adapterConstructs.push(`const telegramAdapter = createTelegramAdapter({
+  botToken: ${tgBotToken} ?? "",
+  secretToken: ${tgSecretToken} ?? "",
+});
+registerChannelAdapter("telegram", telegramAdapter);`);
+    adapterMapEntries.push(`["telegram", telegramAdapter]`);
+  }
+
+  const adapterConstructBlock = adapterConstructs.join("\n\n");
+  const adapterMapLiteral = `new Map([${adapterMapEntries.join(", ")}])`;
 
   const builtinImportBlock = builtinImports.length > 0 ? `${builtinImports.join("\n")}\n` : "";
   const initLines = inits.length > 0 ? `  ${inits.join("\n  ")}\n` : "";
@@ -530,14 +560,14 @@ import { loadHooks } from "@crewhaus/hooks-engine";
 import { discoverSkills, createSkillTool } from "@crewhaus/skills-registry";
 import { loadCommands } from "@crewhaus/slash-commands";
 import { defaultCatalog } from "@crewhaus/tool-catalog";
-import { createSlackAdapter } from "@crewhaus/channel-adapter-slack";
+${adapterImports.join("\n")}
 import { registerChannelAdapter } from "@crewhaus/tool-message-channel";
 ${builtinImportBlock}${mcpImportBlock}${subAgentImportBlock}import { createAgent } from "./agent.js";
 import { createSessionRouter } from "./session-router.js";
 import { createGateway } from "./gateway.js";
 
 ${startupEnvCheck}
-${slackAdapterConstruct}
+${adapterConstructBlock}
 
 async function main(): Promise<void> {
   const __cwd = process.cwd();
@@ -556,7 +586,7 @@ ${registerBlock}${mcpBoot}${subAgentBoot}
   });
   const sessionRouter = createSessionRouter({ agent });
   const gateway = createGateway({
-    adapters: new Map([["slack", slackAdapter]]),
+    adapters: ${adapterMapLiteral},
     sessionRouter,
   });
 

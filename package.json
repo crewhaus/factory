@@ -60,7 +60,9 @@
     "smoke:section-30": "bun examples/section-30-smoke/smoke.ts",
     "smoke:section-31": "bun examples/section-31-smoke/smoke.ts",
     "smoke:section-32": "bun examples/section-32-smoke/smoke.ts",
-    "build:binary": "bun packages/single-binary-cli/src/cli.ts"
+    "build:binary": "bun packages/single-binary-cli/src/cli.ts",
+    "compile:hello-channel-telegram": "bun apps/cli/src/index.ts compile examples/hello-channel-telegram/crewhaus.yaml -o examples/hello-channel-telegram/dist",
+    "smoke:section-33-telegram": "bun examples/section-33-telegram-smoke/smoke.ts"
   },
   "devDependencies": {
     "@biomejs/biome": "1.9.4",

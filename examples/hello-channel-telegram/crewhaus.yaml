@@ -1,0 +1,20 @@
+name: hello-channel-telegram
+target: channel
+agent:
+  model: claude-sonnet-4-6
+  instructions: |
+    You are a Telegram bot. When mentioned in a chat or DM'd, reply
+    concisely (1-2 sentences). You may use the Read filesystem tool to
+    ground answers in repo state.
+  tools:
+    - read
+channels:
+  telegram:
+    botToken: $TELEGRAM_BOT_TOKEN
+    secretToken: $TELEGRAM_SECRET_TOKEN
+routing:
+  sessionKey: thread
+permissions:
+  rules:
+    - type: alwaysAllow
+      pattern: Read

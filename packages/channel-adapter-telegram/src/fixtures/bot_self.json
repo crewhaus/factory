@@ -1,0 +1,9 @@
+{
+  "update_id": 100009,
+  "message": {
+    "message_id": 90,
+    "from": { "id": 9999, "is_bot": true, "username": "crewhaus_bot" },
+    "chat": { "id": -100789, "type": "supergroup" },
+    "text": "I am the bot"
+  }
+}

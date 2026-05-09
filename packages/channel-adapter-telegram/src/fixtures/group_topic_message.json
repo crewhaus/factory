@@ -1,0 +1,10 @@
+{
+  "update_id": 100003,
+  "message": {
+    "message_id": 99,
+    "from": { "id": 4242, "is_bot": false, "username": "alice" },
+    "chat": { "id": -100123, "type": "supergroup" },
+    "message_thread_id": 17,
+    "text": "topic-scoped reply"
+  }
+}

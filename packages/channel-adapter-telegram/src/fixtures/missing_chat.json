@@ -1,0 +1,8 @@
+{
+  "update_id": 100010,
+  "message": {
+    "message_id": 200,
+    "from": { "id": 4242, "is_bot": false, "username": "alice" },
+    "text": "no chat field"
+  }
+}

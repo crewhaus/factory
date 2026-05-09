@@ -160,13 +160,21 @@ const slackChannelSchema = z
   })
   .strict();
 
+const telegramChannelSchema = z
+  .object({
+    botToken: z.string().min(1),
+    secretToken: z.string().min(1),
+  })
+  .strict();
+
 const channelsBlock = z
   .object({
     slack: slackChannelSchema.optional(),
+    telegram: telegramChannelSchema.optional(),
   })
   .strict()
-  .refine((c) => c.slack !== undefined, {
-    message: "channels block requires at least one channel (slack)",
+  .refine((c) => c.slack !== undefined || c.telegram !== undefined, {
+    message: "channels block requires at least one channel (slack | telegram)",
   });
 
 const routingBlock = z
@@ -569,6 +577,7 @@ export type SpecWorkflowStep = z.infer<typeof workflowStepSchema>;
 export type SpecChannel = z.infer<typeof channelSchema>;
 export type SpecChannelAgent = z.infer<typeof channelAgentSchema>;
 export type SpecSlackChannel = z.infer<typeof slackChannelSchema>;
+export type SpecTelegramChannel = z.infer<typeof telegramChannelSchema>;
 export type SpecGraph = z.infer<typeof graphSchema>;
 export type SpecGraphNode = z.infer<typeof graphNodeSchema>;
 export type SpecGraphEdge = z.infer<typeof graphEdgeSchema>;

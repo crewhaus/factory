@@ -139,8 +139,19 @@ export type IrSlackConfig = {
   readonly appToken?: IrSecretRef;
 };
 
+/**
+ * Section 33 — Telegram channel config. `secretToken` is the value passed
+ * to `setWebhook(secret_token=...)` and verified on every inbound POST
+ * via the `X-Telegram-Bot-Api-Secret-Token` header.
+ */
+export type IrTelegramConfig = {
+  readonly botToken: IrSecretRef;
+  readonly secretToken: IrSecretRef;
+};
+
 export type IrChannels = {
   readonly slack?: IrSlackConfig;
+  readonly telegram?: IrTelegramConfig;
 };
 
 export type IrRouting = {

@@ -1,0 +1,9 @@
+{
+  "update_id": 100008,
+  "message": {
+    "message_id": 33,
+    "from": { "id": 4242, "is_bot": false, "username": "alice" },
+    "chat": { "id": 4242, "type": "private" },
+    "caption": "look at this graph"
+  }
+}

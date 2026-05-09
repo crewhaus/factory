@@ -14,7 +14,8 @@ export type ErrorCode =
   | "config"
   | "tool"
   | "mcp"
-  | "adapter";
+  | "adapter"
+  | "channel";
 
 export type SerializedError = {
   name: string;

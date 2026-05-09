@@ -19,6 +19,7 @@
   },
   "peerDependencies": {
     "@crewhaus/channel-adapter-slack": "workspace:*",
+    "@crewhaus/channel-adapter-telegram": "workspace:*",
     "@crewhaus/hooks-engine": "workspace:*",
     "@crewhaus/mcp-host": "workspace:*",
     "@crewhaus/runtime-core": "workspace:*",

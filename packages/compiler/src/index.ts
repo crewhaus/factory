@@ -20,6 +20,7 @@ import type {
   IrSecretRef,
   IrSlackConfig,
   IrSubAgentDefinition,
+  IrTelegramConfig,
   IrV0,
   IrVoiceV0,
   IrWorkflowV0,
@@ -31,6 +32,7 @@ import {
   type SpecMcpServerConfig,
   type SpecSlackChannel,
   type SpecSubAgentDefinition,
+  type SpecTelegramChannel,
   parseSpec,
 } from "@crewhaus/spec";
 import { emitBatchWorker } from "@crewhaus/target-batch-worker";
@@ -145,9 +147,17 @@ function lowerSlack(slack: SpecSlackChannel): IrSlackConfig {
   };
 }
 
+function lowerTelegram(telegram: SpecTelegramChannel): IrTelegramConfig {
+  return {
+    botToken: lowerSecret(telegram.botToken),
+    secretToken: lowerSecret(telegram.secretToken),
+  };
+}
+
 function lowerChannels(channels: SpecChannel["channels"]): IrChannels {
   return {
     ...(channels.slack !== undefined ? { slack: lowerSlack(channels.slack) } : {}),
+    ...(channels.telegram !== undefined ? { telegram: lowerTelegram(channels.telegram) } : {}),
   };
 }
 
