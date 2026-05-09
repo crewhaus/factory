@@ -55,6 +55,7 @@
     { "path": "./packages/grader-nlg-metrics" },
     { "path": "./packages/grader-semantic-similarity" },
     { "path": "./packages/grader-safety-classifiers" },
+    { "path": "./packages/grader-multimodal" },
     { "path": "./packages/eval-judge" },
     { "path": "./packages/eval-runner" },
     { "path": "./packages/eval-report" },
