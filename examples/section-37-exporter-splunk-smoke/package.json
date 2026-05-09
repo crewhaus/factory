@@ -1,0 +1,11 @@
+{
+  "name": "@crewhaus-examples/section-37-exporter-splunk-smoke",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Section 37 exporter-splunk smoke",
+  "dependencies": {
+    "@crewhaus/exporter-splunk": "workspace:*",
+    "@crewhaus/trace-event-bus": "workspace:*"
+  }
+}

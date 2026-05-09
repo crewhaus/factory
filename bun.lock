@@ -462,6 +462,14 @@
         "@crewhaus/trace-event-bus": "workspace:*",
       },
     },
+    "examples/section-37-exporter-splunk-smoke": {
+      "name": "@crewhaus-examples/section-37-exporter-splunk-smoke",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/exporter-splunk": "workspace:*",
+        "@crewhaus/trace-event-bus": "workspace:*",
+      },
+    },
     "packages/a2a-protocol": {
       "name": "@crewhaus/a2a-protocol",
       "version": "0.0.0",
@@ -895,6 +903,15 @@
     },
     "packages/exporter-honeycomb": {
       "name": "@crewhaus/exporter-honeycomb",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/otel-exporter": "workspace:*",
+        "@crewhaus/trace-event-bus": "workspace:*",
+      },
+    },
+    "packages/exporter-splunk": {
+      "name": "@crewhaus/exporter-splunk",
       "version": "0.0.0",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
@@ -2089,6 +2106,8 @@
 
     "@crewhaus-examples/section-37-exporter-honeycomb-smoke": ["@crewhaus-examples/section-37-exporter-honeycomb-smoke@workspace:examples/section-37-exporter-honeycomb-smoke"],
 
+    "@crewhaus-examples/section-37-exporter-splunk-smoke": ["@crewhaus-examples/section-37-exporter-splunk-smoke@workspace:examples/section-37-exporter-splunk-smoke"],
+
     "@crewhaus/a2a-protocol": ["@crewhaus/a2a-protocol@workspace:packages/a2a-protocol"],
 
     "@crewhaus/abort-controller": ["@crewhaus/abort-controller@workspace:packages/abort-controller"],
@@ -2180,6 +2199,8 @@
     "@crewhaus/exporter-datadog": ["@crewhaus/exporter-datadog@workspace:packages/exporter-datadog"],
 
     "@crewhaus/exporter-honeycomb": ["@crewhaus/exporter-honeycomb@workspace:packages/exporter-honeycomb"],
+
+    "@crewhaus/exporter-splunk": ["@crewhaus/exporter-splunk@workspace:packages/exporter-splunk"],
 
     "@crewhaus/federation-discovery": ["@crewhaus/federation-discovery@workspace:packages/federation-discovery"],
 
