@@ -1,0 +1,11 @@
+{
+  "name": "@crewhaus-examples/section-39-audit-encryption-smoke",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Section 39 audit-encryption smoke",
+  "dependencies": {
+    "@crewhaus/audit-encryption": "workspace:*",
+    "@crewhaus/secrets-manager": "workspace:*"
+  }
+}

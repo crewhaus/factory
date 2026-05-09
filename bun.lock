@@ -516,6 +516,14 @@
         "@crewhaus/grader-semantic-similarity": "workspace:*",
       },
     },
+    "examples/section-39-audit-encryption-smoke": {
+      "name": "@crewhaus-examples/section-39-audit-encryption-smoke",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/audit-encryption": "workspace:*",
+        "@crewhaus/secrets-manager": "workspace:*",
+      },
+    },
     "examples/section-39-pii-redactor-smoke": {
       "name": "@crewhaus-examples/section-39-pii-redactor-smoke",
       "version": "0.0.0",
@@ -600,6 +608,15 @@
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
         "zod": "^3.23.8",
+      },
+    },
+    "packages/audit-encryption": {
+      "name": "@crewhaus/audit-encryption",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/audit-log": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/secrets-manager": "workspace:*",
       },
     },
     "packages/audit-log": {
@@ -2223,6 +2240,8 @@
 
     "@crewhaus-examples/section-38-grader-semantic-similarity-smoke": ["@crewhaus-examples/section-38-grader-semantic-similarity-smoke@workspace:examples/section-38-grader-semantic-similarity-smoke"],
 
+    "@crewhaus-examples/section-39-audit-encryption-smoke": ["@crewhaus-examples/section-39-audit-encryption-smoke@workspace:examples/section-39-audit-encryption-smoke"],
+
     "@crewhaus-examples/section-39-pii-redactor-smoke": ["@crewhaus-examples/section-39-pii-redactor-smoke@workspace:examples/section-39-pii-redactor-smoke"],
 
     "@crewhaus/a2a-protocol": ["@crewhaus/a2a-protocol@workspace:packages/a2a-protocol"],
@@ -2240,6 +2259,8 @@
     "@crewhaus/agent-context-isolation": ["@crewhaus/agent-context-isolation@workspace:packages/agent-context-isolation"],
 
     "@crewhaus/agent-handoff": ["@crewhaus/agent-handoff@workspace:packages/agent-handoff"],
+
+    "@crewhaus/audit-encryption": ["@crewhaus/audit-encryption@workspace:packages/audit-encryption"],
 
     "@crewhaus/audit-log": ["@crewhaus/audit-log@workspace:packages/audit-log"],
 

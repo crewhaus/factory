@@ -57,6 +57,7 @@
     { "path": "./packages/grader-safety-classifiers" },
     { "path": "./packages/grader-multimodal" },
     { "path": "./packages/pii-redactor" },
+    { "path": "./packages/audit-encryption" },
     { "path": "./packages/eval-judge" },
     { "path": "./packages/eval-runner" },
     { "path": "./packages/eval-report" },
