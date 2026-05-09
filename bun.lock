@@ -401,6 +401,15 @@
         "@crewhaus/sandbox-image-registry": "workspace:*",
       },
     },
+    "examples/section-36-sandbox-image-ruby-smoke": {
+      "name": "@crewhaus-examples/section-36-sandbox-image-ruby-smoke",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/sandbox": "workspace:*",
+        "@crewhaus/sandbox-image-registry": "workspace:*",
+        "@crewhaus/sandbox-image-ruby": "workspace:*",
+      },
+    },
     "examples/section-36-sandbox-image-rust-smoke": {
       "name": "@crewhaus-examples/section-36-sandbox-image-rust-smoke",
       "version": "0.0.0",
@@ -1202,6 +1211,15 @@
         "@crewhaus/sandbox": "workspace:*",
       },
     },
+    "packages/sandbox-image-ruby": {
+      "name": "@crewhaus/sandbox-image-ruby",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/sandbox": "workspace:*",
+        "@crewhaus/sandbox-image-registry": "workspace:*",
+      },
+    },
     "packages/sandbox-image-rust": {
       "name": "@crewhaus/sandbox-image-rust",
       "version": "0.0.0",
@@ -1969,6 +1987,8 @@
 
     "@crewhaus-examples/section-36-sandbox-image-registry-smoke": ["@crewhaus-examples/section-36-sandbox-image-registry-smoke@workspace:examples/section-36-sandbox-image-registry-smoke"],
 
+    "@crewhaus-examples/section-36-sandbox-image-ruby-smoke": ["@crewhaus-examples/section-36-sandbox-image-ruby-smoke@workspace:examples/section-36-sandbox-image-ruby-smoke"],
+
     "@crewhaus-examples/section-36-sandbox-image-rust-smoke": ["@crewhaus-examples/section-36-sandbox-image-rust-smoke@workspace:examples/section-36-sandbox-image-rust-smoke"],
 
     "@crewhaus/a2a-protocol": ["@crewhaus/a2a-protocol@workspace:packages/a2a-protocol"],
@@ -2142,6 +2162,8 @@
     "@crewhaus/sandbox-image-java": ["@crewhaus/sandbox-image-java@workspace:packages/sandbox-image-java"],
 
     "@crewhaus/sandbox-image-registry": ["@crewhaus/sandbox-image-registry@workspace:packages/sandbox-image-registry"],
+
+    "@crewhaus/sandbox-image-ruby": ["@crewhaus/sandbox-image-ruby@workspace:packages/sandbox-image-ruby"],
 
     "@crewhaus/sandbox-image-rust": ["@crewhaus/sandbox-image-rust@workspace:packages/sandbox-image-rust"],
 
