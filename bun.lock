@@ -393,6 +393,15 @@
         "@crewhaus/sandbox-image-registry": "workspace:*",
       },
     },
+    "examples/section-36-sandbox-image-r-smoke": {
+      "name": "@crewhaus-examples/section-36-sandbox-image-r-smoke",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/sandbox": "workspace:*",
+        "@crewhaus/sandbox-image-r": "workspace:*",
+        "@crewhaus/sandbox-image-registry": "workspace:*",
+      },
+    },
     "examples/section-36-sandbox-image-registry-smoke": {
       "name": "@crewhaus-examples/section-36-sandbox-image-registry-smoke",
       "version": "0.0.0",
@@ -1203,6 +1212,15 @@
         "@crewhaus/sandbox-image-registry": "workspace:*",
       },
     },
+    "packages/sandbox-image-r": {
+      "name": "@crewhaus/sandbox-image-r",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/sandbox": "workspace:*",
+        "@crewhaus/sandbox-image-registry": "workspace:*",
+      },
+    },
     "packages/sandbox-image-registry": {
       "name": "@crewhaus/sandbox-image-registry",
       "version": "0.0.0",
@@ -1985,6 +2003,8 @@
 
     "@crewhaus-examples/section-36-sandbox-image-java-smoke": ["@crewhaus-examples/section-36-sandbox-image-java-smoke@workspace:examples/section-36-sandbox-image-java-smoke"],
 
+    "@crewhaus-examples/section-36-sandbox-image-r-smoke": ["@crewhaus-examples/section-36-sandbox-image-r-smoke@workspace:examples/section-36-sandbox-image-r-smoke"],
+
     "@crewhaus-examples/section-36-sandbox-image-registry-smoke": ["@crewhaus-examples/section-36-sandbox-image-registry-smoke@workspace:examples/section-36-sandbox-image-registry-smoke"],
 
     "@crewhaus-examples/section-36-sandbox-image-ruby-smoke": ["@crewhaus-examples/section-36-sandbox-image-ruby-smoke@workspace:examples/section-36-sandbox-image-ruby-smoke"],
@@ -2160,6 +2180,8 @@
     "@crewhaus/sandbox-image-go": ["@crewhaus/sandbox-image-go@workspace:packages/sandbox-image-go"],
 
     "@crewhaus/sandbox-image-java": ["@crewhaus/sandbox-image-java@workspace:packages/sandbox-image-java"],
+
+    "@crewhaus/sandbox-image-r": ["@crewhaus/sandbox-image-r@workspace:packages/sandbox-image-r"],
 
     "@crewhaus/sandbox-image-registry": ["@crewhaus/sandbox-image-registry@workspace:packages/sandbox-image-registry"],
 

@@ -56,6 +56,7 @@
     { "path": "./packages/sandbox-image-go" },
     { "path": "./packages/sandbox-image-java" },
     { "path": "./packages/sandbox-image-ruby" },
+    { "path": "./packages/sandbox-image-r" },
     { "path": "./packages/sandbox-image-rust" },
     { "path": "./packages/prompt-injection-detector" },
     { "path": "./packages/tool-code-execution" },
