@@ -1,0 +1,12 @@
+{
+  "id": "100000000000000005",
+  "application_id": "200000000000000001",
+  "type": 2,
+  "token": "tok-dm",
+  "channel_id": "300000000000000077",
+  "user": { "id": "500000000000000007", "username": "bob" },
+  "data": {
+    "name": "help",
+    "options": []
+  }
+}

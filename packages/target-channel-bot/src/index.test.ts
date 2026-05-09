@@ -305,3 +305,60 @@ describe("emitChannelBot — Telegram channel (Section 33)", () => {
     expect(c).not.toContain("__requiredEnv");
   });
 });
+
+describe("emitChannelBot — Discord channel (Section 33)", () => {
+  const DISCORD_IR: IrChannelV0 = {
+    ...MIN_IR,
+    channels: {
+      discord: {
+        applicationId: { kind: "env", name: "DISCORD_APPLICATION_ID" },
+        botToken: { kind: "env", name: "DISCORD_BOT_TOKEN" },
+        publicKeyHex: { kind: "env", name: "DISCORD_PUBLIC_KEY" },
+      },
+    },
+  };
+
+  test('daemon.ts imports createDiscordAdapter and registers under "discord"', () => {
+    const c = fileMap(DISCORD_IR).get("daemon.ts") ?? "";
+    expect(c).toContain(
+      'import { createDiscordAdapter } from "@crewhaus/channel-adapter-discord";',
+    );
+    expect(c).toContain('registerChannelAdapter("discord", discordAdapter);');
+    expect(c).toContain('["discord", discordAdapter]');
+  });
+
+  test("daemon.ts wires Discord secrets into startup env-check", () => {
+    const c = fileMap(DISCORD_IR).get("daemon.ts") ?? "";
+    expect(c).toContain('"DISCORD_APPLICATION_ID"');
+    expect(c).toContain('"DISCORD_BOT_TOKEN"');
+    expect(c).toContain('"DISCORD_PUBLIC_KEY"');
+  });
+
+  test("daemon.ts can register slack + telegram + discord side-by-side", () => {
+    const all: IrChannelV0 = {
+      ...MIN_IR,
+      channels: {
+        slack: {
+          botToken: { kind: "env", name: "SLACK_BOT_TOKEN" },
+          signingSecret: { kind: "env", name: "SLACK_SIGNING_SECRET" },
+        },
+        telegram: {
+          botToken: { kind: "env", name: "TELEGRAM_BOT_TOKEN" },
+          secretToken: { kind: "env", name: "TELEGRAM_SECRET_TOKEN" },
+        },
+        discord: {
+          applicationId: { kind: "env", name: "DISCORD_APPLICATION_ID" },
+          botToken: { kind: "env", name: "DISCORD_BOT_TOKEN" },
+          publicKeyHex: { kind: "env", name: "DISCORD_PUBLIC_KEY" },
+        },
+      },
+    };
+    const c = fileMap(all).get("daemon.ts") ?? "";
+    expect(c).toContain("createSlackAdapter");
+    expect(c).toContain("createTelegramAdapter");
+    expect(c).toContain("createDiscordAdapter");
+    expect(c).toContain('["slack", slackAdapter]');
+    expect(c).toContain('["telegram", telegramAdapter]');
+    expect(c).toContain('["discord", discordAdapter]');
+  });
+});

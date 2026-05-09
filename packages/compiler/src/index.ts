@@ -8,6 +8,7 @@ import type {
   IrCompaction,
   IrCrewRole,
   IrCrewV0,
+  IrDiscordConfig,
   IrEvalV0,
   IrGraphV0,
   IrManagedV0,
@@ -29,6 +30,7 @@ import {
   type Spec,
   type SpecChannel,
   type SpecCrewRole,
+  type SpecDiscordChannel,
   type SpecMcpServerConfig,
   type SpecSlackChannel,
   type SpecSubAgentDefinition,
@@ -154,10 +156,19 @@ function lowerTelegram(telegram: SpecTelegramChannel): IrTelegramConfig {
   };
 }
 
+function lowerDiscord(discord: SpecDiscordChannel): IrDiscordConfig {
+  return {
+    applicationId: lowerSecret(discord.applicationId),
+    botToken: lowerSecret(discord.botToken),
+    publicKeyHex: lowerSecret(discord.publicKeyHex),
+  };
+}
+
 function lowerChannels(channels: SpecChannel["channels"]): IrChannels {
   return {
     ...(channels.slack !== undefined ? { slack: lowerSlack(channels.slack) } : {}),
     ...(channels.telegram !== undefined ? { telegram: lowerTelegram(channels.telegram) } : {}),
+    ...(channels.discord !== undefined ? { discord: lowerDiscord(channels.discord) } : {}),
   };
 }
 

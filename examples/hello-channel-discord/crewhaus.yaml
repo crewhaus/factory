@@ -1,0 +1,21 @@
+name: hello-channel-discord
+target: channel
+agent:
+  model: claude-sonnet-4-6
+  instructions: |
+    You are a Discord bot. When a slash command, button click, or modal
+    submit fires, reply concisely (1-2 sentences). You may use the Read
+    filesystem tool to ground answers in repo state.
+  tools:
+    - read
+channels:
+  discord:
+    applicationId: $DISCORD_APPLICATION_ID
+    botToken: $DISCORD_BOT_TOKEN
+    publicKeyHex: $DISCORD_PUBLIC_KEY
+routing:
+  sessionKey: thread
+permissions:
+  rules:
+    - type: alwaysAllow
+      pattern: Read

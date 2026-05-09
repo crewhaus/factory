@@ -18,6 +18,7 @@
     "@crewhaus/ir": "workspace:*"
   },
   "peerDependencies": {
+    "@crewhaus/channel-adapter-discord": "workspace:*",
     "@crewhaus/channel-adapter-slack": "workspace:*",
     "@crewhaus/channel-adapter-telegram": "workspace:*",
     "@crewhaus/hooks-engine": "workspace:*",
