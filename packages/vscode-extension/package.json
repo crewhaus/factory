@@ -1,0 +1,82 @@
+{
+  "name": "@crewhaus/vscode-extension",
+  "displayName": "CrewHaus",
+  "description": "Spec authoring + inline trace inspection + run-from-editor for the CrewHaus meta-harness compiler (Section 35).",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "publisher": "crewhaus",
+  "license": "MIT",
+  "homepage": "https://github.com/crewhaus/crewhaus-factory",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/crewhaus/crewhaus-factory.git"
+  },
+  "categories": ["Programming Languages", "Linters", "Other"],
+  "keywords": ["llm", "agent", "crewhaus"],
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "main": "src/extension.ts",
+  "types": "src/extension.ts",
+  "exports": {
+    ".": "./src/extension.ts",
+    "./schema": "./src/spec-schema.ts",
+    "./run-spec": "./src/run-spec.ts"
+  },
+  "scripts": {
+    "test": "bun test src",
+    "build:vsce": "echo 'vsce package — production build runs in CI from this manifest'"
+  },
+  "activationEvents": [
+    "onLanguage:yaml",
+    "onLanguage:crewhaus-spec",
+    "onCommand:crewhaus.runSpec",
+    "onCommand:crewhaus.openTrace"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "crewhaus-spec",
+        "aliases": ["CrewHaus Spec", "crewhaus.yaml"],
+        "extensions": [".crewhaus.yaml"],
+        "filenamePatterns": ["crewhaus.yaml"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "yamlValidation": [
+      {
+        "fileMatch": ["crewhaus.yaml", "*.crewhaus.yaml"],
+        "url": "./schemas/spec.json"
+      }
+    ],
+    "commands": [
+      {
+        "command": "crewhaus.runSpec",
+        "title": "CrewHaus: Run Spec"
+      },
+      {
+        "command": "crewhaus.openTrace",
+        "title": "CrewHaus: Open Trace Viewer"
+      }
+    ],
+    "configuration": {
+      "title": "CrewHaus",
+      "properties": {
+        "crewhaus.cliPath": {
+          "type": "string",
+          "default": "crewhaus",
+          "description": "Path to the crewhaus CLI binary. Defaults to PATH lookup; the Section-32 single-binary install ships next to the extension when bundled."
+        },
+        "crewhaus.studioUrl": {
+          "type": "string",
+          "default": "http://localhost:4242",
+          "description": "URL of the Studio v1 server (Section 31) the Run Spec webview connects to for live SSE."
+        }
+      }
+    }
+  },
+  "dependencies": {
+    "@crewhaus/spec": "workspace:*"
+  }
+}

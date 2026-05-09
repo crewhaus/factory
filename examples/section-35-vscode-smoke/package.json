@@ -1,0 +1,10 @@
+{
+  "name": "@crewhaus-examples/section-35-vscode-smoke",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Section 35 VS Code extension smoke",
+  "dependencies": {
+    "@crewhaus/vscode-extension": "workspace:*"
+  }
+}
