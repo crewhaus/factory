@@ -149,9 +149,21 @@ export type IrTelegramConfig = {
   readonly secretToken: IrSecretRef;
 };
 
+/**
+ * Section 33 — Discord channel config. `publicKeyHex` is the bot
+ * application's public key (hex, 64 chars) used for Ed25519 verification
+ * of inbound interaction webhooks.
+ */
+export type IrDiscordConfig = {
+  readonly applicationId: IrSecretRef;
+  readonly botToken: IrSecretRef;
+  readonly publicKeyHex: IrSecretRef;
+};
+
 export type IrChannels = {
   readonly slack?: IrSlackConfig;
   readonly telegram?: IrTelegramConfig;
+  readonly discord?: IrDiscordConfig;
 };
 
 export type IrRouting = {

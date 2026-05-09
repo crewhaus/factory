@@ -1,0 +1,13 @@
+{
+  "id": "100000000000000002",
+  "application_id": "200000000000000001",
+  "type": 2,
+  "token": "tok-basic",
+  "channel_id": "300000000000000001",
+  "guild_id": "400000000000000001",
+  "member": { "user": { "id": "500000000000000001", "username": "alice" } },
+  "data": {
+    "name": "ping",
+    "options": []
+  }
+}

@@ -92,6 +92,7 @@
     { "path": "./packages/helm-chart" },
     { "path": "./packages/crewhaus-cloud" },
     { "path": "./packages/channel-adapter-telegram" },
+    { "path": "./packages/channel-adapter-discord" },
     { "path": "./apps/cli" }
   ]
 }

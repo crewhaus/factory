@@ -310,6 +310,14 @@
         "@crewhaus/single-binary-cli": "workspace:*",
       },
     },
+    "examples/section-33-discord-smoke": {
+      "name": "@crewhaus-examples/section-33-discord-smoke",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/channel-adapter-discord": "workspace:*",
+        "@crewhaus/compiler": "workspace:*",
+      },
+    },
     "examples/section-33-telegram-smoke": {
       "name": "@crewhaus-examples/section-33-telegram-smoke",
       "version": "0.0.0",
@@ -434,6 +442,13 @@
         "@crewhaus/deployment-controller": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/spec-registry": "workspace:*",
+      },
+    },
+    "packages/channel-adapter-discord": {
+      "name": "@crewhaus/channel-adapter-discord",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
       },
     },
     "packages/channel-adapter-slack": {
@@ -1182,6 +1197,7 @@
         "@crewhaus/ir": "workspace:*",
       },
       "peerDependencies": {
+        "@crewhaus/channel-adapter-discord": "workspace:*",
         "@crewhaus/channel-adapter-slack": "workspace:*",
         "@crewhaus/channel-adapter-telegram": "workspace:*",
         "@crewhaus/event-log": "workspace:*",
@@ -1749,6 +1765,8 @@
 
     "@crewhaus-examples/section-32-smoke": ["@crewhaus-examples/section-32-smoke@workspace:examples/section-32-smoke"],
 
+    "@crewhaus-examples/section-33-discord-smoke": ["@crewhaus-examples/section-33-discord-smoke@workspace:examples/section-33-discord-smoke"],
+
     "@crewhaus-examples/section-33-telegram-smoke": ["@crewhaus-examples/section-33-telegram-smoke@workspace:examples/section-33-telegram-smoke"],
 
     "@crewhaus/a2a-protocol": ["@crewhaus/a2a-protocol@workspace:packages/a2a-protocol"],
@@ -1776,6 +1794,8 @@
     "@crewhaus/call-session": ["@crewhaus/call-session@workspace:packages/call-session"],
 
     "@crewhaus/canary-controller": ["@crewhaus/canary-controller@workspace:packages/canary-controller"],
+
+    "@crewhaus/channel-adapter-discord": ["@crewhaus/channel-adapter-discord@workspace:packages/channel-adapter-discord"],
 
     "@crewhaus/channel-adapter-slack": ["@crewhaus/channel-adapter-slack@workspace:packages/channel-adapter-slack"],
 

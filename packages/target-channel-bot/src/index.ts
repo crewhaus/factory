@@ -17,7 +17,11 @@ import type { Bundle, IrChannelV0, IrSecretRef, IrSubAgentDefinition } from "@cr
  * with an empty secret.
  */
 export function emitChannelBot(ir: IrChannelV0): Bundle {
-  if (ir.channels.slack === undefined && ir.channels.telegram === undefined) {
+  if (
+    ir.channels.slack === undefined &&
+    ir.channels.telegram === undefined &&
+    ir.channels.discord === undefined
+  ) {
     throw new TargetEmitError(
       "channel target requires at least one configured channel — none found",
     );
@@ -136,6 +140,12 @@ function requiredEnvNames(ir: IrChannelV0): string[] {
   if (telegram !== undefined) {
     if (telegram.botToken.kind === "env") names.push(telegram.botToken.name);
     if (telegram.secretToken.kind === "env") names.push(telegram.secretToken.name);
+  }
+  const discord = ir.channels.discord;
+  if (discord !== undefined) {
+    if (discord.applicationId.kind === "env") names.push(discord.applicationId.name);
+    if (discord.botToken.kind === "env") names.push(discord.botToken.name);
+    if (discord.publicKeyHex.kind === "env") names.push(discord.publicKeyHex.name);
   }
   return names;
 }
@@ -475,7 +485,8 @@ export function createGateway(config: GatewayConfig): Gateway {
 function renderDaemon(ir: IrChannelV0): string {
   const slack = ir.channels.slack;
   const telegram = ir.channels.telegram;
-  if (slack === undefined && telegram === undefined) {
+  const discord = ir.channels.discord;
+  if (slack === undefined && telegram === undefined && discord === undefined) {
     throw new TargetEmitError("channel target requires at least one channel configured");
   }
   const { imports: builtinImports, inits, registrations } = resolveTools(ir.tools, ir.toolConfigs);
@@ -526,6 +537,22 @@ registerChannelAdapter("slack", slackAdapter);`);
 });
 registerChannelAdapter("telegram", telegramAdapter);`);
     adapterMapEntries.push(`["telegram", telegramAdapter]`);
+  }
+
+  if (discord !== undefined) {
+    const dcAppId = renderSecretExpr(discord.applicationId);
+    const dcBotToken = renderSecretExpr(discord.botToken);
+    const dcPubKey = renderSecretExpr(discord.publicKeyHex);
+    adapterImports.push(
+      `import { createDiscordAdapter } from "@crewhaus/channel-adapter-discord";`,
+    );
+    adapterConstructs.push(`const discordAdapter = createDiscordAdapter({
+  applicationId: ${dcAppId} ?? "",
+  botToken: ${dcBotToken} ?? "",
+  publicKeyHex: ${dcPubKey} ?? "",
+});
+registerChannelAdapter("discord", discordAdapter);`);
+    adapterMapEntries.push(`["discord", discordAdapter]`);
   }
 
   const adapterConstructBlock = adapterConstructs.join("\n\n");

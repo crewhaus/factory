@@ -137,7 +137,7 @@ Tool surface expansion (✅ §14) ──► Observability (✅ §15)
 | **§30 Backend adapter completions** | ✅ | §17 base adapter shapes; §21 vector-store interface; §23 queue-protocol interface; §24 telephony slot; §25 driver interface | Production CHN/MGD/RES/VOICE/BROW deployments without v0 stub limits |
 | **§31 Studio v1** | ✅ | every prior section's IR / trace / event / metric kinds | Production authoring UI, run replay, multi-spec dashboards, third-party plugin marketplace |
 | **§32 Distribution & packaging** | ✅ | §20 (`gateway-server` for hosted `crewhaus-cloud`), §31 (Studio runs inside a container) | §34 (federation needs cross-deployment networking), homebrew/apt/scoop/winget distribution, k8s rollouts |
-| **§33 Channel adapter breadth** | 🚧 1/4 (telegram landed; discord/whatsapp/imessage in flight) | §12 (channel-adapter-base interface) | Multi-channel CHN deployments, customer-facing bots outside Slack |
+| **§33 Channel adapter breadth** | 🚧 2/4 (telegram + discord landed; whatsapp/imessage in flight) | §12 (channel-adapter-base interface) | Multi-channel CHN deployments, customer-facing bots outside Slack |
 | **§34 Federation (multi-deployment A2A)** | 🟡 sequential after §32 (uses `docker-images`) | §32 (`docker-images`), §22 (`a2a-protocol` interface), §20 (mTLS auth pattern) | Crew-of-crews, multi-org agent ecosystems, MGD federation, agent marketplaces |
 | **§35 Developer experience tooling** | 🟡 independent | §32 (`single-binary-cli` for extension installs), §31 (Studio as VS Code webview embed) | Editor adoption, spec-as-code workflows, onboarding funnel, docs-site interactivity |
 
