@@ -160,10 +160,24 @@ export type IrDiscordConfig = {
   readonly publicKeyHex: IrSecretRef;
 };
 
+/**
+ * Section 33 — WhatsApp Business Cloud API channel config.
+ * `phoneNumberId` is the Meta-issued phone-number id (numeric,
+ * stringified) the bot sends messages from. `accessToken` is the
+ * system-user token authorising sends. `appSecret` is the Meta app
+ * secret used to verify the `X-Hub-Signature-256` HMAC.
+ */
+export type IrWhatsAppConfig = {
+  readonly phoneNumberId: IrSecretRef;
+  readonly accessToken: IrSecretRef;
+  readonly appSecret: IrSecretRef;
+};
+
 export type IrChannels = {
   readonly slack?: IrSlackConfig;
   readonly telegram?: IrTelegramConfig;
   readonly discord?: IrDiscordConfig;
+  readonly whatsapp?: IrWhatsAppConfig;
 };
 
 export type IrRouting = {

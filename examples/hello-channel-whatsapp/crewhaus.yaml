@@ -1,0 +1,21 @@
+name: hello-channel-whatsapp
+target: channel
+agent:
+  model: claude-sonnet-4-6
+  instructions: |
+    You are a WhatsApp Business bot. When a customer messages, reply
+    concisely (1-3 sentences). You may use the Read filesystem tool to
+    ground answers in repo state.
+  tools:
+    - read
+channels:
+  whatsapp:
+    phoneNumberId: $WHATSAPP_PHONE_NUMBER_ID
+    accessToken: $WHATSAPP_ACCESS_TOKEN
+    appSecret: $WHATSAPP_APP_SECRET
+routing:
+  sessionKey: user
+permissions:
+  rules:
+    - type: alwaysAllow
+      pattern: Read

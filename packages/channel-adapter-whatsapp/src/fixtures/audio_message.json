@@ -1,0 +1,26 @@
+{
+  "object": "whatsapp_business_account",
+  "entry": [
+    {
+      "id": "100100100100",
+      "changes": [
+        {
+          "field": "messages",
+          "value": {
+            "messaging_product": "whatsapp",
+            "metadata": { "phone_number_id": "999000999000" },
+            "contacts": [{ "wa_id": "15554443333" }],
+            "messages": [
+              {
+                "id": "wamid.audio-001",
+                "from": "15554443333",
+                "timestamp": "1700000600",
+                "type": "audio"
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

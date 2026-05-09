@@ -1,0 +1,25 @@
+{
+  "object": "whatsapp_business_account",
+  "entry": [
+    {
+      "id": "100100100100",
+      "changes": [
+        {
+          "field": "messages",
+          "value": {
+            "messaging_product": "whatsapp",
+            "messages": [
+              {
+                "id": "wamid.missing-meta",
+                "from": "15554443333",
+                "timestamp": "1700000800",
+                "type": "text",
+                "text": { "body": "no metadata" }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}
