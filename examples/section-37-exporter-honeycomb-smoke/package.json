@@ -1,0 +1,11 @@
+{
+  "name": "@crewhaus-examples/section-37-exporter-honeycomb-smoke",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Section 37 exporter-honeycomb smoke",
+  "dependencies": {
+    "@crewhaus/exporter-honeycomb": "workspace:*",
+    "@crewhaus/trace-event-bus": "workspace:*"
+  }
+}
