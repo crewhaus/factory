@@ -552,6 +552,10 @@
         "@crewhaus/pii-redactor": "workspace:*",
       },
     },
+    "examples/section-40-example-corpus-smoke": {
+      "name": "@crewhaus-examples/section-40-example-corpus-smoke",
+      "version": "0.0.0",
+    },
     "examples/section-40-template-marketplace-client-smoke": {
       "name": "@crewhaus-examples/section-40-template-marketplace-client-smoke",
       "version": "0.0.0",
@@ -2312,6 +2316,8 @@
     "@crewhaus-examples/section-39-data-retention-engine-smoke": ["@crewhaus-examples/section-39-data-retention-engine-smoke@workspace:examples/section-39-data-retention-engine-smoke"],
 
     "@crewhaus-examples/section-39-pii-redactor-smoke": ["@crewhaus-examples/section-39-pii-redactor-smoke@workspace:examples/section-39-pii-redactor-smoke"],
+
+    "@crewhaus-examples/section-40-example-corpus-smoke": ["@crewhaus-examples/section-40-example-corpus-smoke@workspace:examples/section-40-example-corpus-smoke"],
 
     "@crewhaus-examples/section-40-template-marketplace-client-smoke": ["@crewhaus-examples/section-40-template-marketplace-client-smoke@workspace:examples/section-40-template-marketplace-client-smoke"],
 

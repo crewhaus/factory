@@ -1,0 +1,7 @@
+{
+  "name": "@crewhaus-examples/section-40-example-corpus-smoke",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Section 40 example-corpus smoke — local mirror of the CI matrix gate"
+}
