@@ -359,6 +359,13 @@
         "@crewhaus/jetbrains-plugin": "workspace:*",
       },
     },
+    "examples/section-35-playground-smoke": {
+      "name": "@crewhaus-examples/section-35-playground-smoke",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/crewhaus-playground": "workspace:*",
+      },
+    },
     "examples/section-35-vscode-smoke": {
       "name": "@crewhaus-examples/section-35-vscode-smoke",
       "version": "0.0.0",
@@ -648,6 +655,15 @@
         "@crewhaus/docker-images": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/helm-chart": "workspace:*",
+      },
+    },
+    "packages/crewhaus-playground": {
+      "name": "@crewhaus/crewhaus-playground",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/scaffold-templates": "workspace:*",
+        "@crewhaus/spec": "workspace:*",
       },
     },
     "packages/dataset-registry": {
@@ -1871,6 +1887,8 @@
 
     "@crewhaus-examples/section-35-jetbrains-smoke": ["@crewhaus-examples/section-35-jetbrains-smoke@workspace:examples/section-35-jetbrains-smoke"],
 
+    "@crewhaus-examples/section-35-playground-smoke": ["@crewhaus-examples/section-35-playground-smoke@workspace:examples/section-35-playground-smoke"],
+
     "@crewhaus-examples/section-35-vscode-smoke": ["@crewhaus-examples/section-35-vscode-smoke@workspace:examples/section-35-vscode-smoke"],
 
     "@crewhaus/a2a-protocol": ["@crewhaus/a2a-protocol@workspace:packages/a2a-protocol"],
@@ -1934,6 +1952,8 @@
     "@crewhaus/crew-orchestrator": ["@crewhaus/crew-orchestrator@workspace:packages/crew-orchestrator"],
 
     "@crewhaus/crewhaus-cloud": ["@crewhaus/crewhaus-cloud@workspace:packages/crewhaus-cloud"],
+
+    "@crewhaus/crewhaus-playground": ["@crewhaus/crewhaus-playground@workspace:packages/crewhaus-playground"],
 
     "@crewhaus/dataset-registry": ["@crewhaus/dataset-registry@workspace:packages/dataset-registry"],
 

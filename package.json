@@ -73,7 +73,9 @@
     "smoke:section-35-vscode": "bun examples/section-35-vscode-smoke/smoke.ts",
     "play:vscode": "echo 'vsce package — production build runs in CI from packages/vscode-extension'",
     "smoke:section-35-jetbrains": "bun examples/section-35-jetbrains-smoke/smoke.ts",
-    "play:jetbrains": "echo 'gradle buildPlugin — production build runs in CI with JBR_BIN set'"
+    "play:jetbrains": "echo 'gradle buildPlugin — production build runs in CI with JBR_BIN set'",
+    "smoke:section-35-playground": "bun examples/section-35-playground-smoke/smoke.ts",
+    "play:playground": "bun packages/crewhaus-playground/src/cli.ts"
   },
   "devDependencies": {
     "@biomejs/biome": "1.9.4",
