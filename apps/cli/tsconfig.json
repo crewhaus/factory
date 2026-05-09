@@ -41,6 +41,8 @@
     { "path": "../../packages/tool-web" },
     { "path": "../../packages/docker-images" },
     { "path": "../../packages/crewhaus-cloud" },
-    { "path": "../../packages/federation-discovery" }
+    { "path": "../../packages/federation-discovery" },
+    { "path": "../../packages/sandbox" },
+    { "path": "../../packages/sandbox-image-registry" }
   ]
 }

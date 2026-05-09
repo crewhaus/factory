@@ -42,6 +42,8 @@
         "@crewhaus/migration-runner": "workspace:*",
         "@crewhaus/permission-engine": "workspace:*",
         "@crewhaus/runtime-core": "workspace:*",
+        "@crewhaus/sandbox": "workspace:*",
+        "@crewhaus/sandbox-image-registry": "workspace:*",
         "@crewhaus/secrets-manager": "workspace:*",
         "@crewhaus/skills-registry": "workspace:*",
         "@crewhaus/slash-commands": "workspace:*",
@@ -371,6 +373,14 @@
       "version": "0.0.0",
       "dependencies": {
         "@crewhaus/vscode-extension": "workspace:*",
+      },
+    },
+    "examples/section-36-sandbox-image-registry-smoke": {
+      "name": "@crewhaus-examples/section-36-sandbox-image-registry-smoke",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/sandbox": "workspace:*",
+        "@crewhaus/sandbox-image-registry": "workspace:*",
       },
     },
     "packages/a2a-protocol": {
@@ -1139,6 +1149,14 @@
         "@crewhaus/errors": "workspace:*",
       },
     },
+    "packages/sandbox-image-registry": {
+      "name": "@crewhaus/sandbox-image-registry",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/sandbox": "workspace:*",
+      },
+    },
     "packages/scaffold-templates": {
       "name": "@crewhaus/scaffold-templates",
       "version": "0.0.0",
@@ -1891,6 +1909,8 @@
 
     "@crewhaus-examples/section-35-vscode-smoke": ["@crewhaus-examples/section-35-vscode-smoke@workspace:examples/section-35-vscode-smoke"],
 
+    "@crewhaus-examples/section-36-sandbox-image-registry-smoke": ["@crewhaus-examples/section-36-sandbox-image-registry-smoke@workspace:examples/section-36-sandbox-image-registry-smoke"],
+
     "@crewhaus/a2a-protocol": ["@crewhaus/a2a-protocol@workspace:packages/a2a-protocol"],
 
     "@crewhaus/abort-controller": ["@crewhaus/abort-controller@workspace:packages/abort-controller"],
@@ -2056,6 +2076,8 @@
     "@crewhaus/runtime-core": ["@crewhaus/runtime-core@workspace:packages/runtime-core"],
 
     "@crewhaus/sandbox": ["@crewhaus/sandbox@workspace:packages/sandbox"],
+
+    "@crewhaus/sandbox-image-registry": ["@crewhaus/sandbox-image-registry@workspace:packages/sandbox-image-registry"],
 
     "@crewhaus/scaffold-templates": ["@crewhaus/scaffold-templates@workspace:packages/scaffold-templates"],
 
