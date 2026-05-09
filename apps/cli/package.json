@@ -49,6 +49,7 @@
     "@crewhaus/tool-todo": "workspace:*",
     "@crewhaus/tool-web": "workspace:*",
     "@crewhaus/docker-images": "workspace:*",
-    "@crewhaus/crewhaus-cloud": "workspace:*"
+    "@crewhaus/crewhaus-cloud": "workspace:*",
+    "@crewhaus/federation-discovery": "workspace:*"
   }
 }

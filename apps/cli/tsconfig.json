@@ -40,6 +40,7 @@
     { "path": "../../packages/tool-todo" },
     { "path": "../../packages/tool-web" },
     { "path": "../../packages/docker-images" },
-    { "path": "../../packages/crewhaus-cloud" }
+    { "path": "../../packages/crewhaus-cloud" },
+    { "path": "../../packages/federation-discovery" }
   ]
 }

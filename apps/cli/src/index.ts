@@ -167,6 +167,14 @@ const CLOUD_SCHEMA: ParseArgsSchema = {
   ],
 };
 
+const FEDERATION_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "srv-domain", takesValue: true },
+    { name: "format", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
 function usage(): never {
   process.stderr.write(
     [
@@ -195,6 +203,8 @@ function usage(): never {
       "       --region <r> [--tier <t>] [--image-tag <tag>]",
       "  cloud teardown --provider <p>        tear down a managed cluster",
       "       --region <r>",
+      "  federation discover <deployment>     resolve a federated peer's endpoint + cert fingerprint (Section 34)",
+      "       [--srv-domain <d>] [--format json|yaml]",
       "",
     ].join("\n"),
   );
@@ -1142,6 +1152,58 @@ async function runCloud(args: ParsedArgs, action: string): Promise<void> {
   die(`unknown cloud action "${action}" (expected: deploy | teardown)`);
 }
 
+/**
+ * Section 34 — `crewhaus federation discover <deployment> [--srv-domain <d>] [--format json|yaml]`.
+ * Resolves a peer's endpoint + supportedShapes + publicKeyFingerprint via
+ * .well-known/crewhaus.json, optionally seeded by a DNS SRV lookup.
+ */
+async function runFederation(rest: ReadonlyArray<string>): Promise<void> {
+  const positional: string[] = [];
+  const flags = new Map<string, string>();
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i];
+    if (a === undefined) continue;
+    if (a === "--help" || a === "-h") {
+      process.stdout.write(
+        "usage: crewhaus federation discover <deployment> [--srv-domain <d>] [--format json|yaml]\n",
+      );
+      return;
+    }
+    if (a === "--srv-domain" || a === "--format") {
+      const v = rest[i + 1];
+      if (typeof v !== "string") die(`${a} requires a value`);
+      flags.set(a.slice(2), v);
+      i++;
+      continue;
+    }
+    positional.push(a);
+  }
+  const deployment = positional[0];
+  if (typeof deployment !== "string") die("missing <deployment>");
+  const { discoverDeployment } = await import("@crewhaus/federation-discovery");
+  try {
+    const config: { srvDomain?: string } = {};
+    const srv = flags.get("srv-domain");
+    if (typeof srv === "string") config.srvDomain = srv;
+    const record = await discoverDeployment(deployment, config);
+    const format = flags.get("format") ?? "json";
+    if (format === "yaml") {
+      const yaml = [
+        `endpoint: ${record.endpoint}`,
+        `version: ${record.version}`,
+        "supportedShapes:",
+        ...record.supportedShapes.map((s) => `  - ${s}`),
+        `publicKeyFingerprint: ${record.publicKeyFingerprint}`,
+      ].join("\n");
+      process.stdout.write(`${yaml}\n`);
+    } else {
+      process.stdout.write(`${JSON.stringify(record, null, 2)}\n`);
+    }
+  } catch (err) {
+    die(`federation discover: ${(err as Error).message}`);
+  }
+}
+
 const argv = process.argv.slice(2);
 const subcommand = argv[0] ?? "";
 const rest = argv.slice(1);
@@ -1204,6 +1266,14 @@ switch (subcommand) {
       die(`cloud action must be "deploy" or "teardown" (got "${action}")`);
     }
     await runCloud(parseFor(rest.slice(1), CLOUD_SCHEMA), action);
+    break;
+  }
+  case "federation": {
+    const action = rest[0] ?? "";
+    if (action !== "discover") {
+      die(`federation action must be "discover" (got "${action}")`);
+    }
+    await runFederation(rest.slice(1));
     break;
   }
   case "":

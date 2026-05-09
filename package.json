@@ -68,7 +68,8 @@
     "compile:hello-channel-whatsapp": "bun apps/cli/src/index.ts compile examples/hello-channel-whatsapp/crewhaus.yaml -o examples/hello-channel-whatsapp/dist",
     "smoke:section-33-whatsapp": "bun examples/section-33-whatsapp-smoke/smoke.ts",
     "compile:hello-channel-imessage": "bun apps/cli/src/index.ts compile examples/hello-channel-imessage/crewhaus.yaml -o examples/hello-channel-imessage/dist",
-    "smoke:section-33-imessage": "bun examples/section-33-imessage-smoke/smoke.ts"
+    "smoke:section-33-imessage": "bun examples/section-33-imessage-smoke/smoke.ts",
+    "smoke:section-34": "bun examples/section-34-federation-smoke/smoke.ts"
   },
   "devDependencies": {
     "@biomejs/biome": "1.9.4",
