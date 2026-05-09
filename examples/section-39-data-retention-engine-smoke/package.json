@@ -1,0 +1,10 @@
+{
+  "name": "@crewhaus-examples/section-39-data-retention-engine-smoke",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Section 39 data-retention-engine smoke",
+  "dependencies": {
+    "@crewhaus/data-retention-engine": "workspace:*"
+  }
+}
