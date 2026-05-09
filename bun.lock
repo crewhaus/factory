@@ -552,6 +552,13 @@
         "@crewhaus/pii-redactor": "workspace:*",
       },
     },
+    "examples/section-40-template-registry-smoke": {
+      "name": "@crewhaus-examples/section-40-template-registry-smoke",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/template-registry": "workspace:*",
+      },
+    },
     "packages/a2a-protocol": {
       "name": "@crewhaus/a2a-protocol",
       "version": "0.0.0",
@@ -1758,6 +1765,13 @@
         "@crewhaus/slash-commands": "workspace:*",
       },
     },
+    "packages/template-registry": {
+      "name": "@crewhaus/template-registry",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+      },
+    },
     "packages/tenancy": {
       "name": "@crewhaus/tenancy",
       "version": "0.0.0",
@@ -2283,6 +2297,8 @@
 
     "@crewhaus-examples/section-39-pii-redactor-smoke": ["@crewhaus-examples/section-39-pii-redactor-smoke@workspace:examples/section-39-pii-redactor-smoke"],
 
+    "@crewhaus-examples/section-40-template-registry-smoke": ["@crewhaus-examples/section-40-template-registry-smoke@workspace:examples/section-40-template-registry-smoke"],
+
     "@crewhaus/a2a-protocol": ["@crewhaus/a2a-protocol@workspace:packages/a2a-protocol"],
 
     "@crewhaus/abort-controller": ["@crewhaus/abort-controller@workspace:packages/abort-controller"],
@@ -2542,6 +2558,8 @@
     "@crewhaus/target-voice": ["@crewhaus/target-voice@workspace:packages/target-voice"],
 
     "@crewhaus/target-workflow": ["@crewhaus/target-workflow@workspace:packages/target-workflow"],
+
+    "@crewhaus/template-registry": ["@crewhaus/template-registry@workspace:packages/template-registry"],
 
     "@crewhaus/tenancy": ["@crewhaus/tenancy@workspace:packages/tenancy"],
 
