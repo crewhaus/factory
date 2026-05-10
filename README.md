@@ -4,7 +4,11 @@ A modular **meta-harness tool**: compile a single high-level harness spec into m
 
 Status: scaffolding + thin vertical slice. The first end-to-end target is **CLI** — a minimal `spec.yaml` → IR → generated TypeScript agent that runs under Bun.
 
-See [`docs/MODULE-CATALOG.md`](docs/MODULE-CATALOG.md) for the complete module list (~190 modules, 25 layers, 11 target shapes).
+## Documentation
+
+- **New here?** Start with [`docs/GETTING-STARTED.md`](docs/GETTING-STARTED.md) — guided tour from first principles to a runnable agent.
+- **Looking for a recipe?** See [`docs/recipes/INDEX.md`](docs/recipes/INDEX.md) — 40 task-oriented walkthroughs, one per major feature.
+- **Need the canonical module reference?** See [`docs/MODULE-CATALOG.md`](docs/MODULE-CATALOG.md) — ~190 modules, 25 layers, 12 target shapes.
 
 ## Repository layout
 
