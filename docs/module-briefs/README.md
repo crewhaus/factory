@@ -1,6 +1,6 @@
 # Module Briefs
 
-These briefs continue `docs/MODULE-CATALOG.md` by turning the catalog rows into one-page build briefs. The order follows PART G first; shorthand entries such as `tool-web-*`, `channel-*`, and named stacks are expanded to concrete modules. Catalog rows that are not named directly in PART G are included in the phase implied by their layer.
+These briefs continue [`docs/MODULE-CATALOG.md`](../MODULE-CATALOG.md) by turning the catalog rows into one-page build briefs. The order follows the historical build-phase sequencing (Foundations → IR & Compiler → Model & Tool primitives → Runtime core → …); shorthand entries such as `tool-web-*`, `channel-*`, and named stacks are expanded to concrete modules. Catalog rows that are not named directly in the build phases are included in the phase implied by their layer.
 
 Each brief is intentionally compact: purpose, boundary, inputs/outputs, first slice, and validation plan. The catalog remains the source of truth for the complete matrix.
 
