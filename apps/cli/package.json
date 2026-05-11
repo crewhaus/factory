@@ -15,8 +15,13 @@
     "test": "bun test src"
   },
   "dependencies": {
+    "@crewhaus/adapter-anthropic": "workspace:*",
     "@crewhaus/agent-context-isolation": "workspace:*",
     "@crewhaus/audit-log": "workspace:*",
+    "@crewhaus/eval-optimizer-orchestrator": "workspace:*",
+    "@crewhaus/prompt-optimizer": "workspace:*",
+    "@crewhaus/prompt-optimizer-claude": "workspace:*",
+    "@crewhaus/spec-patch": "workspace:*",
     "@crewhaus/canary-controller": "workspace:*",
     "@crewhaus/compiler": "workspace:*",
     "@crewhaus/deployment-controller": "workspace:*",

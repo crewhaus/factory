@@ -11,6 +11,22 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { type Logger, createLogger } from "@crewhaus/logging";
 import { TraceEventBus } from "@crewhaus/trace-event-bus";
 
+/**
+ * Where content currently flowing through the runtime originated. Mirrors
+ * `TrustOrigin` in `@crewhaus/boundary-classifier`. Kept as a string-literal
+ * union here (instead of an import) so `run-context` does not depend on the
+ * classifier — it carries the metadata; the classifier owns the policy.
+ */
+export type TrustOrigin =
+  | "user"
+  | "mcp"
+  | "subagent"
+  | "channel"
+  | "federation"
+  | "skill"
+  | "compaction"
+  | "tool";
+
 export type RunContext = {
   readonly runId: string;
   readonly sessionId: string;
@@ -26,6 +42,17 @@ export type RunContext = {
    * on env vars.
    */
   readonly eventBus: TraceEventBus;
+  /**
+   * Pillar 3 — origin chain. The runtime appends an origin every time it
+   * crosses a trust boundary (sub-agent enters with `["subagent"]`; a
+   * federation peer call enters with `["federation"]`; an MCP tool inside
+   * a sub-agent looks like `["subagent", "mcp"]` when the boundary checks
+   * fire). Audit logs and trace events read this so a redacted payload
+   * carries the *full provenance* of the trust transition that produced
+   * the redaction. Optional + readonly for backward-compat — existing
+   * `createRunContext` callers don't need to pass it.
+   */
+  readonly originStack?: ReadonlyArray<TrustOrigin>;
 };
 
 export type RunContextOptions = {
@@ -50,6 +77,8 @@ export type RunContextOptions = {
    * OpenTelemetry trace.
    */
   eventBus?: TraceEventBus;
+  /** Initial origin chain. Defaults to undefined (top-level/user context). */
+  originStack?: ReadonlyArray<TrustOrigin>;
 };
 
 function shortId(): string {
@@ -79,12 +108,30 @@ export function createRunContext(opts: RunContextOptions = {}): RunContext {
   const baseLogger = opts.logger ?? createLogger();
   const logger = baseLogger.child({ runId, sessionId });
   const eventBus = opts.eventBus ?? new TraceEventBus({ runId, sessionId, logger });
-  return {
+  const ctx: RunContext = {
     runId,
     sessionId,
     turnNumber: 0,
     abortSignal,
     logger,
     eventBus,
+    ...(opts.originStack !== undefined ? { originStack: opts.originStack } : {}),
   };
+  return ctx;
+}
+
+/**
+ * Return a shallow-cloned `RunContext` with `origin` appended to
+ * `originStack`. Used by boundary sites (sub-agent spawner, MCP host,
+ * channel adapters, federation router, skills registry, compaction
+ * packages) to record the trust-domain crossing in the audit trail.
+ *
+ * Does NOT mutate the input — every caller works with a fresh context
+ * that the inner runtime sees with its own provenance chain.
+ */
+export function pushOrigin(ctx: RunContext, origin: TrustOrigin): RunContext {
+  const next: ReadonlyArray<TrustOrigin> = ctx.originStack
+    ? [...ctx.originStack, origin]
+    : [origin];
+  return { ...ctx, originStack: next };
 }

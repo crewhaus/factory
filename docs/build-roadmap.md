@@ -5,6 +5,90 @@
 
 ---
 
+## How the meta-harness compiler works
+
+> **Read this first.** Every section below adds bricks to one of three architectural pillars; reading them as a flat 45-section list misses the load-bearing structure. The compiler is the protagonist; the rest of the roadmap is its branches.
+
+Crewhaus compiles a single high-level YAML spec into one of twelve target shapes. The pipeline is `parseSpec → lower → applyPasses → emit`, dispatched polymorphically over the IR's `target` discriminator. The full architecture walkthrough lives in [`COMPILER-ARCHITECTURE.md`](COMPILER-ARCHITECTURE.md); this section is the index that ties every roadmap section back to the compiler stage and IR variant it serves.
+
+```mermaid
+flowchart LR
+    YAML[crewhaus.yaml] --> P[parseSpec §1]
+    P --> S[Spec discriminated union]
+    S --> L[lower §1-§5,§6,§12,§19-§25,§29]
+    L --> IR[IrNode discriminated union §1,§19-§25,§29]
+    IR --> AP[applyPasses §28]
+    AP --> IR2[IrNode optimised]
+    IR2 --> E[emit §1-§5,§6,§12,§19-§25,§29]
+    E --> B[Bundle: file array]
+    B --> RT[runtime-core §1-§17,§27,§30 powers every emitted bundle]
+```
+
+### Section ↔ IR variant ↔ catalog layer ↔ compiler stage
+
+Use this index to navigate from a section number straight to its role in the architecture. The "Compiler stage" column tells you whether the section affects the parsing layer, the IR or its lowering, the optimisation passes, the emit step, or the runtime that emitted bundles import. Sections covering cross-cutting concerns (deployment, telemetry, distribution, plugins) carry `Compiler stage: runtime` because they shape the runtime that every emitted bundle depends on rather than a specific IR variant.
+
+| § | IR variant(s) | Catalog layer | Compiler stage | One-liner |
+|---|---|---|---|---|
+| §1 | `IrV0` | F1, R3 | parse → lower → emit (compiler-core seed) | Tool-layer foundation; first cli IR slice |
+| §2 | `IrV0` | R3, R4 | runtime | Tools threaded through pipeline |
+| §3 | `IrV0` | R4 | runtime | First built-in tool implementations |
+| §4 | `IrV0` | R6 | runtime | Turn state machine + context management |
+| §5 | `IrV0` | F4 | parse → emit (CLI plumbing) | CLI subcommand expansion |
+| §6 | `IrWorkflowV0` | F2, R11 | lower → emit | Workflow target shape |
+| §7 | `IrV0` | R8 | runtime | Recovery / permission engine / abort hardening |
+| §8 | `IrV0` | R3 | runtime | Tool layer enrichment |
+| §9 | `IrV0`, `IrChannelV0`, `IrManagedV0` | R5 | lower (mcp_servers) → runtime | MCP host |
+| §10 | every variant | R7 | runtime | Persistence — sessions, event log, checkpoints |
+| §11 | `IrV0`, `IrChannelV0` | R9 | runtime | Hooks / skills / slash commands |
+| §12 | `IrChannelV0` | F2, R13 | lower → emit | Channel bot target shape |
+| §13 | `IrV0`, `IrCrewV0` | R10 | runtime (sub-agent boundary — see §18 fabric) | Sub-agents + Task tool |
+| §14 | `IrV0` | R4 | runtime | Tool catalog expansion (web/image/fetch) |
+| §15 | every variant | R15 | runtime | Observability + tracing (OpenTelemetry baseline) |
+| §16 | `IrEvalV0` | R15 | runtime + lower (eval target → §29) | Eval stack — measurement layer (active loop in §46) |
+| §17 | every variant | R2 | runtime | Multi-provider models |
+| §18 | every variant | R8 | runtime (boundary fabric — wired across §9, §13, §29, channel adapters, federation, skills, compaction) | Production safety floor → fabric model |
+| §19 | `IrGraphV0` | F2, R11 | lower → emit | Graph target shape |
+| §20 | `IrManagedV0` | F2, R8, R17 | lower → emit | Managed multi-tenant target shape |
+| §21 | `IrPipelineV0` | F2, R12 | lower → emit | RAG pipeline target shape |
+| §22 | `IrCrewV0` | F2, R10 | lower → emit | Multi-agent crew target shape |
+| §23 | `IrResearchV0`, `IrBatchV0` | F2, R19, R20 | lower → emit | Research + batch target shapes |
+| §24 | `IrVoiceV0` | F2, R16 | lower → emit | Voice / realtime target shape |
+| §25 | `IrBrowserV0` | F2, R18 | lower → emit | Browser / computer-use target shape |
+| §26 | every variant | F4 | runtime (Studio reads IR + traces) | Studio v0 — authoring + inspection UI |
+| §27 | every variant | R17 | runtime | Production hardening — cost, rate-limit, circuit-break, secrets |
+| §28 | every variant | F2, F3 | applyPasses, deploy | IR-passes + deployment + canary + migration |
+| §29 | `IrEvalV0` | F2, R15 | lower → emit (eval bundle), runtime | Eval depth + EVAL target shape |
+| §30 | every variant | R12, R13, R14, R16 | runtime | Backend adapter completions (queue/vector/telephony/realtime/browser) |
+| §31 | every variant | F4 | runtime | Studio v1 |
+| §32 | every variant | F3 | runtime (distribution) | Per-target Docker images + Helm + single-binary CLI |
+| §33 | `IrChannelV0` | R13 | runtime (boundary classification at inbound — §18 fabric) | Channel adapter breadth (Telegram/Discord/WhatsApp/iMessage) |
+| §34 | `IrCrewV0`, `IrManagedV0` | R10, R17 | runtime (boundary classification on peer payloads — §18 fabric) | Federation (multi-deployment A2A) |
+| §35 | every variant | F4 | runtime (developer experience) | VS Code + JetBrains + Studio Playground |
+| §36 | `IrV0`, `IrPipelineV0` | R8 | runtime | Polyglot sandbox images |
+| §37 | every variant | R15 | runtime | Vendor telemetry exporters |
+| §38 | `IrEvalV0` | R15 | runtime | Production graders |
+| §39 | every variant | R8, R17 | runtime | Compliance & audit hardening |
+| §40 | every variant | F4 | runtime | Spec template marketplace + example CI |
+| §41 | every variant | F5 | runtime | Plugin SDK + loader |
+| §42 | every variant | F5 | runtime | Module marketplace |
+| §43 | future `IrIosV0`, `IrAndroidV0` | F2 | lower → emit | Mobile target shapes (deferred) |
+| §44 | `IrManagedV0` | F3 | runtime | One-click cloud-deploy adapters |
+| §45 | varies | varies | varies | Long-tail breadth (no dedicated section) |
+| §46 | every variant | F2, R15 | runtime + spec-patch (post-eval mutation) | Active IR-patch optimizer (Pillar 2 — see [recipe 42](recipes/42-active-optimization.md)) |
+
+The "compiler-core pipeline" phase covers **§1–§5, §6, §12, §19–§25, §29** — every section that adds an IR variant or its lowering/emit code. Everything else is either runtime infrastructure, target periphery, or cross-cutting policy. This phase grouping is what the [critique](https://github.com/crewhaus/crewhaus-factory/issues) called for; it is an index over the existing flat numbering rather than a renumbering.
+
+### The three pillars in one paragraph each
+
+- **Pillar 1 — compiler as protagonist**: the table above is the rubric. Every IR variant has a section, every target emitter has a section, every IR-pass goes in §28. New target shapes start at the IR.
+- **Pillar 2 — eval is active**: §16 + §29 ship the *measurement* layer; **§46** ships the active *mutation* layer (`crewhaus optimize` writes spec patches that mutate the YAML, not just HTML reports). The DSPy MIPRO citation in [`AI-Harness-Systems.md`](AI-Harness-Systems.md) is the empirical justification.
+- **Pillar 3 — security is a fabric**: §18 ships the perimeter primitive (`prompt-injection-detector`); the fabric wiring spans §9 (MCP), §13 (sub-agent boundary), §29 (compaction), §33 (channel adapters), §34 (federation), and §11 (skills). The single chokepoint is `boundary-classifier`; every cross-trust-domain transition flows through it with `TrustOrigin` metadata.
+
+Contributor invariants for all three pillars live in [`/CLAUDE.md`](../CLAUDE.md).
+
+---
+
 ## Critical path & risk overview
 
 **Sections 1–40 are all landed.** v1.0 (§1–31) + v1.1 (§32–35) + v1.2 (§36–40) are complete. 12 target shapes ship (CLI / workflow / channel / graph / managed / pipeline / crew / research / batch / voice / browser / eval); every backend slot has a real implementation (queue / vector / embedder / telephony / realtime / browser-driver); production-grade hardening is in (cost / rate-limit / circuit-break / cache rotation / secrets rotation); continuous deployment with canary + eval-gate works; Studio v1 ships with Lit + Monaco + live SSE replay + content-sandboxed plugins; the system is packaged for real-world distribution (per-target slim Docker images + Helm chart + single-binary CLI + `crewhaus-cloud` Terraform/Kustomize recipe); CHN supports 5 channels (Slack + Telegram + Discord + WhatsApp + iMessage); deployments can federate over mTLS A2A with DNS-SRV/`.well-known` discovery; IDE-class authoring tooling ships across VS Code + JetBrains + a browser playground; and v1.2 closed out the breadth/ecosystem layer with 7 polyglot sandbox images, 4 vendor telemetry exporters, 4 production grader families, 4 compliance hardening packages (with `crewhaus compliance evidence` CLI), and a sigstore-style template marketplace + matrix CI gate.
@@ -222,6 +306,8 @@ Sections 41–44 below scope the v1.3 phase. **None are critical-path for any sh
 
 ## Section 41 — Plugin SDK + Loader
 
+*IR variant: every variant · Catalog layer: F5 · Compiler stage: runtime*
+
 > Status: 🟡 next up after v1.2. Sequential prereq for §42.
 
 **Catalog modules:** `plugin-sdk` v2 (F5 — extending the existing Studio-scoped v1 from §26/§31), `plugin-loader` (F5 — new)
@@ -265,6 +351,8 @@ plugin-sdk (v2 — extend)  ──►  plugin-loader (new)
 
 ## Section 42 — Module marketplace
 
+*IR variant: every variant · Catalog layer: F5 · Compiler stage: runtime*
+
 > Status: 🟡 depends on §41 (`plugin-sdk` contracts).
 
 **Catalog modules:** `plugin-registry` (F5 — new; reuses §40 `template-registry` pattern), `module-marketplace-client` (F5 — new; mirrors §40 `template-marketplace-client`)
@@ -306,6 +394,8 @@ plugin-registry (new wrapper around §40 template-registry)  ──►  module-m
 
 ## Section 43 — Mobile target shapes (deferred)
 
+*IR variant: future `IrIosV0` / `IrAndroidV0` · Catalog layer: F2 · Compiler stage: lower → emit*
+
 > Status: 🟡 deferred indefinitely. **No kickoff prompt yet** — pull the trigger when the iOS/Android Bun runtime story stabilises and at least one production partner is committed.
 
 **Catalog modules (when shipped):** `target-ios-bundle` (F2), `target-android-bundle` (F2)
@@ -335,6 +425,8 @@ Until then, leave §43 documented but unscoped.
 ---
 
 ## Section 44 — One-click cloud-deploy adapters
+
+*IR variant: `IrManagedV0` · Catalog layer: F3 · Compiler stage: runtime*
 
 > Status: 🟡 independent. Can land any time; each adapter parallelisable.
 
@@ -380,6 +472,8 @@ All four adapters are fully independent and parallelisable. Each is its own PR. 
 
 ## Section 45 — Long-tail breadth (no dedicated section)
 
+*IR variant: varies · Catalog layer: varies · Compiler stage: varies*
+
 > Status: 🟢 opportunistic. Lands as needed; no roadmap commitment.
 
 **Catalog modules (open-ended):** additional sub-agent templates, additional MCP servers, additional embedder backends (Cohere v3, Mistral Embed, Voyage v3+), additional vector-store backends (Lance v0.10+, Postgres+pgvector), additional channel adapters (Microsoft Teams, Mattermost, Matrix), additional grader families (custom domain-specific scorers).
@@ -390,7 +484,61 @@ When demand crystallises around any single addition (e.g. "we need Microsoft Tea
 
 ---
 
+## Section 46 — Active IR-patch optimizer (Pillar 2 — eval is active)
+
+*IR variant: every variant · Catalog layer: F2 + R15 · Compiler stage: runtime + spec-patch (post-eval mutation) — **Pillar 2 active-optimisation layer***
+
+> Status: ✅ landed under the 2026-Q2 philosophy realignment. Closes the gap between the §16/§29 *measurement* stack and the +13% MIPRO citation in [`AI-Harness-Systems.md`](AI-Harness-Systems.md).
+
+**Catalog modules:** `spec-patch` (F2, brief 278), `eval-optimizer-orchestrator` (F-eval, brief 279), `prompt-optimizer-claude` (F-eval, brief 280); extends `prompt-optimizer` (F-eval, brief 114) with a `MutationProvider` seam.
+
+§16 shipped the eval stack; §29 added depth and exposed `prompt-optimizer` as a search function. Neither closed the loop — the optimiser's output never became a spec patch the user could review or commit. §46 ships the orchestration layer that:
+
+1. Refactors `prompt-optimizer` to delegate mutation generation to a `MutationProvider` interface. The original 4 rule-based mutations become `RuleBasedMutationProvider` (the deterministic default).
+2. Adds `ClaudeMutationProvider` (in `@crewhaus/prompt-optimizer-claude`) — a model-driven rewriter that asks Claude for `{ rewrite, rationale }` JSON given the current prompt + a sample of dev-set failures.
+3. Adds `@crewhaus/spec-patch` — a `SpecPatch` type + `applySpecPatch(yaml, patch)` that uses the `yaml` library's CST so comments and key order survive the round-trip. Crucially, patches operate on the SPEC, not the IR — the compiler's `lower()` does destructive normalisation, so IR-level patches can't round-trip to YAML.
+4. Adds `@crewhaus/eval-optimizer-orchestrator` — wires `eval-runner` (fitness) + `prompt-optimizer` (search) + `spec-patch` (mutation) into a single `optimizeSpec()` function.
+5. Adds `crewhaus optimize <spec> --dataset … --graders … [--mutator rule-based|claude] [--write-back]` CLI subcommand. Default emits `patch.json` + report; `--write-back` rewrites the source YAML with a header comment.
+6. Adds `OPTIMIZABLE_PATHS` whitelist — security-critical fields (`permissions.mode`, `model_router` rules, MCP configs) are explicitly excluded; the optimiser cannot rewrite the production safety floor.
+
+### Build order
+
+```
+spec-patch  ──►  eval-optimizer-orchestrator  ──►  crewhaus optimize CLI
+                            ▲                              │
+                            │                              ▼
+prompt-optimizer (refactored) ──► prompt-optimizer-claude (opt-in mutator)
+```
+
+### Tests
+
+- `spec-patch/__tests__/round-trip.test.ts` — apply patch, parse, verify shape
+- `spec-patch/__tests__/yaml-comment-preservation.test.ts` — comments survive CST round-trip
+- `spec-patch/__tests__/validate-patch.test.ts` — cross-target patches, non-existent paths, malformed shapes
+- `eval-optimizer-orchestrator/__tests__/end-to-end.test.ts` — synthetic fitness fn, verifies score delta + patch shape + persistence
+- `prompt-optimizer-claude/__tests__/mutation.test.ts` — mocked Anthropic adapter; happy path + 3 fallback scenarios
+- `prompt-optimizer/__tests__/mutation-provider-interface.test.ts` — rule-based + claude providers both satisfy the interface
+
+### Verification
+
+```bash
+crewhaus optimize examples/hello-optimize/crewhaus.yaml \
+  --dataset examples/hello-optimize/dataset.jsonl \
+  --graders examples/hello-optimize/graders.yaml \
+  --iterations 5 --seed 42 --write-back
+```
+
+See [recipe 42](recipes/42-active-optimization.md) for the narrative walkthrough.
+
+### Risk markers
+
+🟡 `prompt-optimizer-claude` depends on Claude's JSON compliance. Without explicit JSON mode (currently unavailable in Anthropic's API), the meta-prompt's "output exactly one JSON object" instruction is best-effort. Zod fallback + `try { JSON.parse }` are the safety nets; fallback to current-best on any failure keeps the search loop alive.
+
+---
+
 ## Section 1 — Tool layer foundation
+
+*IR variant: `IrV0` · Catalog layer: F1 + R3 · Compiler stage: parse → lower → emit (compiler-core seed)*
 
 > Status: ✅ complete (PR #6).
 
@@ -446,6 +594,8 @@ Each package gets a unit test file (`T1`) covering the happy path, malformed inp
 
 ## Section 2 — Thread tools through the full pipeline
 
+*IR variant: `IrV0` · Catalog layer: R3 + R4 · Compiler stage: runtime (compiler-core pipeline)*
+
 > Status: ✅ complete (PR #7).
 
 **Catalog modules:** `spec-schema` expansion, `ir-model` expansion, `compiler-core` update, `target-cli-bundle` update, `runtime-orchestrator` update (updates to existing packages)
@@ -493,6 +643,8 @@ Update existing tests for spec, ir, and compiler to cover the new `tools` field.
 
 ## Section 3 — First built-in tool implementations
 
+*IR variant: `IrV0` · Catalog layer: R4 · Compiler stage: runtime (compiler-core pipeline)*
+
 > Status: ✅ complete (PR #8).
 
 **Catalog modules:** `tool-fs`, `tool-bash`, `tool-todo` (R4)
@@ -536,6 +688,8 @@ Each tool package gets `T1` unit tests and `T3` integration tests. The `tool-bas
 ---
 
 ## Section 4 — Turn state machine + context management
+
+*IR variant: `IrV0` · Catalog layer: R6 · Compiler stage: runtime (compiler-core pipeline)*
 
 > Status: ✅ complete (PR #9).
 
@@ -591,6 +745,8 @@ Integrate both compaction strategies into `runtime-core`: check token budget at 
 
 ## Section 5 — CLI subcommand expansion
 
+*IR variant: `IrV0` · Catalog layer: F4 · Compiler stage: parse → emit (compiler-core pipeline)*
+
 > Status: ✅ complete (PR #10).
 
 **Catalog modules:** `spec-cli` additions — `init`, `run`, `doctor` subcommands (F4)
@@ -632,6 +788,8 @@ Each subcommand gets an integration test (`T3`) via `Bun.spawn` on the CLI binar
 ---
 
 ## Section 6 — Second target shape: workflow
+
+*IR variant: `IrWorkflowV0` · Catalog layer: F2 + R11 · Compiler stage: lower → emit (compiler-core pipeline)*
 
 > Status: ✅ complete (PR #11).
 
@@ -680,6 +838,8 @@ spec-schema (workflow target + steps[])  ──►  ir-model (IrWorkflowV0)  ─
 
 ## Section 7 — Hardening: recovery, permission engine, abort
 
+*IR variant: `IrV0` · Catalog layer: R8 · Compiler stage: runtime (compiler-core pipeline)*
+
 > Status: ✅ complete (PR #12).
 
 **Catalog modules:** `recovery-engine` (R1), `permission-engine` (R8), `abort-controller` (R1)
@@ -700,6 +860,8 @@ Spec/CLI surface: `crewhaus run` accepts `--permission-mode <default|plan|auto|b
 ---
 
 ## Section 8 — Tool layer enrichment
+
+*IR variant: `IrV0` · Catalog layer: R3 · Compiler stage: runtime (compiler-core pipeline)*
 
 > Status: ✅ complete (PR #13).
 
@@ -722,6 +884,8 @@ End-to-end smoke against the live model (OAuth via `ANTHROPIC_AUTH_TOKEN`): conc
 ---
 
 ## Section 9 — MCP host
+
+*IR variant: `IrV0` / `IrChannelV0` / `IrManagedV0` · Catalog layer: R5 · Compiler stage: lower (`mcp_servers`) → runtime — **Pillar 3 boundary site** (MCP responses pass through `boundary-classifier`)*
 
 > Status: ✅ complete (PR pending).
 
@@ -759,6 +923,8 @@ spec → ir → compiler → target-cli, target-workflow (warning), apps/cli (mi
 ---
 
 ## Section 10 — Persistence: state, sessions, event log
+
+*IR variant: every variant · Catalog layer: R7 · Compiler stage: runtime (compiler-core pipeline)*
 
 > Status: ✅ complete (PR pending).
 
@@ -799,6 +965,8 @@ Throughout the loop, every message-mutation site emits a corresponding event —
 ---
 
 ## Section 11 — Hooks, skills, slash commands
+
+*IR variant: `IrV0` / `IrChannelV0` · Catalog layer: R9 · Compiler stage: runtime — **Pillar 3 boundary site** (skill bodies pass through `boundary-classifier` on first load)*
 
 > Status: ✅ complete (PR pending).
 
@@ -849,6 +1017,8 @@ Hook firing points (logged at debug level via `runContext.logger`, errors from a
 ---
 
 ## Section 12 — Third target shape: channel bot
+
+*IR variant: `IrChannelV0` · Catalog layer: F2 + R13 · Compiler stage: lower → emit*
 
 > Status: ✅ complete.
 
@@ -902,6 +1072,8 @@ ir-model (IrChannelV0)                     examples/hello-channel/
 ---
 
 ## Section 13 — Sub-agents and the Task tool
+
+*IR variant: `IrV0` / `IrCrewV0` · Catalog layer: R10 · Compiler stage: runtime — **Pillar 3 boundary site** (sub-agent `finalMessage` passes through `boundary-classifier` before reaching parent context)*
 
 > Status: ✅ landed (PR forthcoming). 4 new packages: `agent-context-isolation`, `sub-agent-spawner`, `sub-agent-permission-inheritance`, `tool-task`. Spec/IR/codegen wiring for inline `sub_agents` (CLI + channel). 731 tests green; 38 new tests over T1, T3, T7, T8, T9.
 
@@ -964,6 +1136,8 @@ Spec / IR / target additions are sequential after `tool-task` is stable, since t
 
 ## Section 14 — Tool catalog expansion: web, image, fetch
 
+*IR variant: `IrV0` · Catalog layer: R4 · Compiler stage: runtime*
+
 > Status: ✅ landed. Three independent tool packages plus two strictly-additive cross-cutting changes. End-to-end smoke test (`bun run smoke:section-14`) drives 6 probes against the live model and passes.
 
 **Catalog modules:** `tool-web` (R4), `tool-image` (R4), `tool-fetch` (R4)
@@ -1003,6 +1177,8 @@ Six probes against the live model: WebFetch example.com → "Example Domain"; Fe
 ---
 
 ## Section 15 — Observability and tracing
+
+*IR variant: every variant · Catalog layer: R15 · Compiler stage: runtime (OpenTelemetry baseline — see [AI-Harness-Systems.md §implementation-blueprint](AI-Harness-Systems.md) for the prescribed span set)*
 
 > Status: ✅ landed. Four packages plus the runtime-core integration. End-to-end smoke test (`bun run smoke:section-15`) drives a 3-turn conversation with a Bash tool call against a docker-hosted OpenTelemetry Collector and verifies spans, pretty stderr, and JSON metrics on stdout.
 
@@ -1089,6 +1265,8 @@ Compiles `examples/section-15-smoke` (Bash + REPL), spins up `otel/opentelemetry
 ---
 
 ## Section 16 — Eval stack
+
+*IR variant: `IrEvalV0` · Catalog layer: R15 · Compiler stage: runtime — **Pillar 2 measurement layer** (the active optimisation loop lives in §46; see [recipe 42](recipes/42-active-optimization.md))*
 
 > Status: ✅ done (2026-05-07). All 5 packages + `crewhaus eval` and `crewhaus eval-report diff` subcommands shipped. 90 unit tests + 5 CLI integration tests pass; T7 200-sample concurrency-8 SLO completes <60s; T8 13-payload prompt-injection corpus locks in the structural defense. Live smoke test against `ANTHROPIC_AUTH_TOKEN` exercised the agent invocation, grader path, judge OAuth wiring, HTML report, and diff mode end-to-end.
 
@@ -1184,6 +1362,8 @@ eval-dataset  ──►  eval-grader     (parallel)  ──►  eval-runner  ─
 ---
 
 ## Section 17 — Multi-provider model layer
+
+*IR variant: every variant · Catalog layer: R2 · Compiler stage: runtime*
 
 > Status: ✅ complete.
 
@@ -1300,11 +1480,15 @@ adapter-anthropic (refactor)  ──►  adapter-openai      (parallel)  ──�
 
 ## Section 18 — Production safety floor
 
+*IR variant: every variant · Catalog layer: R8 · Compiler stage: runtime — **Pillar 3 fabric primitive** (`boundary-classifier` is the chokepoint; wiring spans §9 MCP, §11 skills, §13 sub-agents, §29 compaction, §33 channel adapters, §34 federation; see [recipe 41](recipes/41-security-fabric.md))*
+
 > Status: ✅ landed. PR feat/section-18-safety-floor.
 
 **Catalog modules:** `sandbox` (R8), `tool-code-execution` (R4), `prompt-injection-detector` (R8)
 
 The runtime currently runs every tool call at the host's process trust level. `tool-bash` shells out via `Bun.spawn`, `tool-fs` writes inside `process.cwd()` — both rely on the host being trusted. Real production deployments (multi-tenant MGD, EVAL with untrusted samples, RES with web-fetched documents) need three things this section ships: a containerised exec environment, a sandboxed code-execution tool that composes on top of it, and a prompt-injection classifier the runtime fires automatically over tool outputs.
+
+> **Pillar 3 — the perimeter is not enough.** As originally shipped, §18 wired `prompt-injection-detector` only into the post-tool path inside `runtime-core` ([packages/runtime-core/src/index.ts:867](../packages/runtime-core/src/index.ts) — `applyInjectionClassification`). That stopped direct tool-result injections but missed every *lateral* injection vector: an MCP server returning malicious ND-JSON, a sub-agent's `finalMessage` carrying a crafted jailbreak, a Telegram inbound message that bypasses the perimeter because it isn't a tool result, a federation peer payload that mTLS authenticated but the content was malicious, a skill body planted on disk, a compaction summary that absorbed earlier attacker text. The fabric model (added under Workstream C of the 2026-Q2 philosophy realignment) keeps §18's primitive (`prompt-injection-detector`) but routes every cross-trust-domain transition through a single chokepoint, [packages/boundary-classifier](../packages/boundary-classifier), with `TrustOrigin` metadata and a content-hash LRU cache. The complete boundary inventory and the wiring sites are in [recipe 41](recipes/41-security-fabric.md) and [/CLAUDE.md §Pillar-3](../CLAUDE.md).
 
 ### Build order within this section
 
@@ -1377,6 +1561,8 @@ Runtime integration (last): `runtime-core` wires `prompt-injection-detector` int
 ---
 
 ## Section 19 — GRPH target shape: stateful graph runtime
+
+*IR variant: `IrGraphV0` · Catalog layer: F2 + R11 · Compiler stage: lower → emit*
 
 > Status: ✅ landed. PR feat/section-19-grph-target.
 
@@ -1463,6 +1649,8 @@ Crash recovery (re-run `--resume <grun>` after a kill mid-execute) is supported 
 
 ## Section 20 — MGD target shape + governance
 
+*IR variant: `IrManagedV0` · Catalog layer: F2 + R8 + R17 · Compiler stage: lower → emit*
+
 > Status: ✅ landed. PR feat/section-20-mgd-target.
 
 **Catalog modules:** `gateway-server` (R16), `policy-engine` (R8 — extension of Section 18 work), `tenancy` (R17), `audit-log` (R17), `target-managed` (F2), `gateway-protocol` (R16)
@@ -1543,6 +1731,8 @@ policy-engine       ──►  tenancy        (parallel)  ──►  target-mana
 ---
 
 ## Section 21 — RAG target shape: pipeline DAG + retrieval
+
+*IR variant: `IrPipelineV0` · Catalog layer: F2 + R12 · Compiler stage: lower → emit*
 
 > Status: ✅ landed. PR feat/section-21-rag-target.
 
@@ -1632,6 +1822,8 @@ Drives `examples/hello-rag` (5 seed docs about CrewHaus target shapes) against t
 
 ## Section 22 — CRW target shape (multi-agent crew)
 
+*IR variant: `IrCrewV0` · Catalog layer: F2 + R10 · Compiler stage: lower → emit*
+
 > Status: ✅ complete (2026-05-08). Shipped: `agent-handoff`, `a2a-protocol`, `crew-orchestrator`, `target-crew`; `target: "crew"` variant on `spec`/`ir`/`compiler`; `examples/hello-crew/`; `scripts/section-22-smoke.ts`. Smoke (live model): researcher → writer handoff, writer → critic A2A question, crew_done with substantive output, refusal-loop guard trips at depth 2, traceparent shared across all roles.
 
 **Catalog modules:** `agent-handoff` (R10), `a2a-protocol` (R10), `crew-orchestrator` (R10), `target-crew` (F2)
@@ -1683,6 +1875,8 @@ Spec/IR additions are sequential after `target-crew` is stable.
 
 ## Section 23 — RES + BATCH target shapes (parallel)
 
+*IR variant: `IrResearchV0` / `IrBatchV0` · Catalog layer: F2 + R19 + R20 · Compiler stage: lower → emit*
+
 > Status: ✅ complete (2026-05-08). Two PRs: (a) RES — `planner`, `crawler`, `citation-tracker`, `report-writer`, `target-research-bundle`; (b) BATCH — `queue-protocol`, `queue-consumer`, `idempotency-keys`, `target-batch-worker`. Spec/IR/compiler grew `target: "research"` and `target: "batch"` discriminated-union variants. Live-model smokes: RES verified planner decomposition + checkpoint resume + URL-dedup + deterministic citation ordering; BATCH verified 8-job in-memory queue drains with concurrency 4, idempotency-keys cache hits on retry, SIGTERM emits drain_start → drain_end → worker_stop and exits 0.
 
 **Catalog modules (RES):** `target-research-bundle` (F2), `planner` (R-orchestration), `crawler` (R-orchestration), `citation-tracker` (R-orchestration), `report-writer` (R-orchestration)
@@ -1725,6 +1919,8 @@ A focused queue-consumer pattern. No interactive REPL, no live UI, no per-messag
 ---
 
 ## Section 24 — VOICE target shape
+
+*IR variant: `IrVoiceV0` · Catalog layer: F2 + R16 · Compiler stage: lower → emit*
 
 > Status: ✅ complete (2026-05-08, PR #31). Shipped: `voice-runtime` (`RealtimeAdapter` + OpenAI Realtime WebSocket adapter + Vapi stub), `vad-engine` (energy + ZCR heuristic, 30 ms framing, aggressiveness 0–3), `barge-in-controller` (hysteresis-gated `interrupt()` fire), `call-session` (`idle | dialing | connected | on-hold | transferred | terminated` state machine + in-memory telephony adapter), `target-voice` (multi-file codegen: `agent.ts` + `voice-loop.ts` + `daemon.ts`). Spec/IR/compiler grew the `target: "voice"` discriminated-union variant. Live-model smoke (`bun run smoke:section-24`) against OpenAI Realtime: synthesized "what is the capital of France?" via OpenAI TTS at 24 kHz mono, piped through the daemon's `--smoke <pcm>` path, captured `session_created` + `transcript_final` containing "paris" + 7 `audio_chunk` events. Real telephony adapters (Twilio / LiveKit SIP / Vonage) and the WebRTC bridge for browser-driven voice land in follow-ups; the kickoff explicitly defers them. VAPI smoke skipped per kickoff (`VAPI_API_KEY` unset).
 
@@ -1776,6 +1972,8 @@ voice-runtime  ──►  vad-engine  ──►  barge-in-controller  ──► 
 
 ## Section 25 — BROW target shape (computer-use)
 
+*IR variant: `IrBrowserV0` · Catalog layer: F2 + R18 · Compiler stage: lower → emit*
+
 > Status: ✅ complete (2026-05-08, PR #32). Shipped: `computer-use-driver` (`Driver` interface + Playwright-backed chromium backend; `host` and `remote` backends are stubs that throw at `connect()` — the kickoff explicitly forbids the host backend in smokes), `tool-screen-capture` (Screenshot tool returning Anthropic image content block), `tool-mouse-keyboard` (Click / Type / Key / Scroll — all `destructive: true`), `tool-vision-grounding` (FindElement(description) — vision-model bbox lookup with fenced-JSON parse + retry), `target-browser-driver` (single-file `agent.ts` codegen). Spec/IR/compiler grew the `target: "browser"` discriminated-union variant. Live-model smoke (`bun run smoke:section-25`): fixture HTTP server with a known Submit button → agent uses Screenshot + FindElement + Click → fixture page shows `BROW_SMOKE_OK` post-click. Permission-floor probe (same spec without `alwaysAllow` rules) verified — the daemon completes the run but Click is denied; fixture page stays `PENDING`. Cross-OS host-backend smoke gated on `CREWHAUS_BROW_HOST_SMOKE=1` and explicitly deferred per kickoff; Docker-wrapped chromium (instead of Playwright's bundled chromium) lands in a follow-up.
 
 **Catalog modules:** `computer-use-driver` (R18), `tool-screen-capture` (R4), `tool-mouse-keyboard` (R4), `tool-vision-grounding` (R4), `target-browser-driver` (F2)
@@ -1826,6 +2024,8 @@ computer-use-driver  ──►  tool-screen-capture       (parallel)  ──► 
 ---
 
 ## Section 26 — Studio (authoring + inspection UI)
+
+*IR variant: every variant · Catalog layer: F4 · Compiler stage: runtime (Studio reads IR + traces)*
 
 > Status: ✅ complete (2026-05-08, PR #33). Shipped: `studio-server` (Bun.serve daemon — spec CRUD, run inspection via SSE, eval-result inspection, plugin discovery, JWT auth aligned with §20 `gateway-server`), `studio-ui` (vanilla TS HTML + JS bundle — Specs / Wizard / Plugins tabs), `trace-viewer` (Gantt-shape timeline builder from `TraceEvent[]`), `graph-visualizer` (deterministic layered DAG positioning + SVG renderer), `wizard` (5-question state machine with `nextQuestion` / `answerWizard` / `compileWizard`), `scaffold-templates` (10 spec templates — one per shipped target shape), `plugin-sdk` (`definePlugin` + `assertPluginPathsStaySandboxed`). v0 ships HTTP + SSE backend probes; full Playwright UI smoke gated behind `CREWHAUS_RUN_PLAYWRIGHT=1`. Live smoke (`bun run smoke:section-26`) verified: `/healthz`, `/api/templates` (10), wizard 5-question → spec creation, `POST /api/runs` → SSE `run_start | trace | event: done`, `/api/graph-layout` (3 nodes + 2 edges, deterministic), fixture plugin discovery under `<pluginRoot>/fixture/`. Lit + Monaco rich UI, real `runChatLoop` dispatch from `/api/runs` (currently canned SSE), and the gateway-server JWT wiring all land in §31 (Studio v1).
 
@@ -1884,6 +2084,8 @@ studio-server  ──►  studio-ui  ──►  trace-viewer       (parallel)  �
 ---
 
 ## Section 27 — Production hardening
+
+*IR variant: every variant · Catalog layer: R17 · Compiler stage: runtime*
 
 > Status: ✅ landed (2026-05-08). Five packages shipped: `cost-tracker` (versioned per-provider pricing → `cost_accrual` TraceEvents → `getRunCost(runId)` aggregation), `secrets-manager` (env-var/file/vault backends with `onRotation` callback fan-out and audit-log integration), `prompt-cache-manager` (Anthropic `cache_control` rotation past the 30-day TTL, no-op for automatic/no-cache providers), `rate-limiter` (token-bucket + leaky-bucket multi-dimensional gating with fail-closed unknown-key handling and partial-failure refunds), `circuit-breaker` (closed → open → half_open → closed state machine wrapping the `ProviderAdapter` interface with `circuit_state_changed` TraceEvents). Integrated into `runtime-core` (cost-tracker subscriber via `CREWHAUS_COST_TRACKING=1`; circuit-breaker wraps the resolved adapter when `RunChatLoopOptions.circuitBreaker` is set; prompt-cache-manager runs once before the first stream against an explicit-caching provider; rate-limiter acquires `RunChatLoopOptions.rateLimitKeys` before each model call). Two new audit-kinds (`secrets_access` / `secrets_rotation`) and two new TraceEvent kinds (`cost_accrual` / `circuit_state_changed`) extend §15's bus and §20's audit-log. CLI surfaces: `crewhaus cost-summary --session <id>`, `crewhaus secrets doctor`, `crewhaus secrets rotate <name>`. End-to-end smoke (`bun run smoke:section-27`) drives 5 in-process probes covering each module + its integration; full test suite ~1670 green; lint clean.
 
@@ -1944,6 +2146,8 @@ prompt-cache-manager (parallel)
 ---
 
 ## Section 28 — Deployment + canary + migration
+
+*IR variant: every variant · Catalog layer: F2 + F3 · Compiler stage: applyPasses + deploy (`ir-passes` lives here; eval-driven SPEC patches live in §46 — see [Pillar 1 vs Pillar 2 in CLAUDE.md](../CLAUDE.md))*
 
 > Status: ✅ landed (2026-05-08). Six packages shipped: `spec-registry` (versioned multi-version spec storage with env pinning and per-tenant overlays at `_tenants/<id>/<name>.json`), `ir-passes` (idempotent IR optimization pipeline with deadToolElimination / redundantMcpServerCollapse / permissionRuleCanonicalize / promptCachePrefixSort built-ins, wired into `compile(yaml, { applyIrPasses: true })`), `migration-engine` (single-step `{from, to, up, down}` chain registry with multi-version walk), `migration-runner` (batch `migrateAll` over a registry with dry-run + idempotent re-runs + post-migration validation), `deployment-controller` (`promote(name, fromEnv, toEnv)` and `rollback(name, env, version)` with §20 audit-log integration under `deployment_action` kind), `canary-controller` (stable `sha256(tenantId|requestId)` mod 100 hash routing for percent-of-traffic rollout, with `evaluate(config, { gate })` doing eval-gated promotion or auto-rollback + audit-log of regression reason). The §29 `regression-runner` will replace the v0 `PASSING_GATE` stub. CLI surfaces: `crewhaus spec put|list|get|pin|alias`, `crewhaus deploy promote|rollback`, `crewhaus migrate-all --from <ver> --to <ver> [--dry-run]`. Audit-log gains a `deployment_action` kind. End-to-end smoke (`bun run smoke:section-28`) drives 5 in-process probes covering each module + its integration; full test suite ~1750 green; lint clean.
 
@@ -2008,11 +2212,15 @@ spec-registry  ──►  ir-passes              (parallel)  ──►  migratio
 
 ## Section 29 — Evaluation depth + EVAL target shape
 
+*IR variant: `IrEvalV0` · Catalog layer: F2 + R15 · Compiler stage: lower → emit + runtime — **Pillar 2 measurement layer** (the active optimisation loop / `crewhaus optimize` lives in §46; this section ships the orphaned `prompt-optimizer` and the EVAL target bundle that §46 builds on)*
+
 > Status: ✅ landed (2026-05-08). Five packages shipped: `dataset-registry` (split-aware dataset versioning at `.crewhaus/datasets/<name>/<version>.json` with sample hash stability and a `test`-split leak guard requiring explicit `allowTestSplit`), `grader-registry` (named graders + plugin discovery walking `<root>/<plugin>/index.ts`), `regression-runner` (`regress` + `gate` over two `eval-runner` outputs — `canary-controller` will swap `PASSING_GATE` → `regression-runner.gate`), `prompt-optimizer` (DSPy-style seeded search over rule-based mutations with caller-supplied fitness; persists trajectory + best to `.crewhaus/prompt-optimizer/<runId>/`), `target-eval-bundle` (the 12th target shape; spec/ir/compiler all grew `target: "eval"` discriminated-union variants). `examples/hello-eval/` ships as the canonical example. End-to-end smoke (`bun run smoke:section-29`) drives 5 in-process probes covering each module. Full test suite ~1810 green; lint clean.
 
 **Catalog modules:** `prompt-optimizer` (F-eval), `regression-runner` (F-eval), `target-eval-bundle` (F2), `dataset-registry` (R15), `grader-registry` (R15)
 
 Section 16 shipped the eval stack. Section 29 adds depth: automated prompt tuning (DSPy-style), regression detection on every CI run, a first-class EVAL target shape so eval is a deployable artefact rather than a CLI invocation, and pluggable dataset/grader registries.
+
+> **Pillar 2 — measurement vs. mutation.** §29 ships the *measurement* layer (the orphaned `prompt-optimizer` package, regression-runner, dataset-registry, grader-registry, target-eval-bundle). It does not yet close the loop. The active *mutation* layer — the orchestration that runs eval → mutate → re-eval → write back a YAML patch — lives in **§46 — Active IR-patch optimizer**, added under Workstream B of the 2026-Q2 philosophy realignment. §46 introduces the `MutationProvider` interface (rule-based + Claude-driven providers), the `spec-patch` package (YAML CST round-trip that preserves comments and key order), the `eval-optimizer-orchestrator` package (wires fitness fn + search + patch generation), and the `crewhaus optimize` CLI subcommand. The original §29 `prompt-optimizer` exports a pure `optimize()` function; §46 wires it into a user-facing workflow. See [recipe 42](recipes/42-active-optimization.md) and [/CLAUDE.md §Pillar-2](../CLAUDE.md).
 
 ### Build order within this section
 
@@ -2066,6 +2274,8 @@ grader-registry                                                target-eval-bundl
 ---
 
 ## Section 30 — Backend adapter completions
+
+*IR variant: every variant · Catalog layer: R12 + R13 + R14 + R16 · Compiler stage: runtime*
 
 > Status: ✅ landed (2026-05-08). Six adapter families shipped — all gated on env vars / SDKs in production but with fully-typed abstractions, fetch-stubbed contract tests, and fail-loud diagnostics when SDKs are missing. Queue: `createSqsAdapter` (REST + receipt-handle map), `createRedisStreamsAdapter` (XREADGROUP / XACK / XADD), `createPostgresAdapter` (SELECT FOR UPDATE SKIP LOCKED with advisory locks). Vector: `createLanceVectorStore` (file-backed NDJSON with deterministic L2 ranking — fully exercised), `createQdrantVectorStore` / `createPineconeVectorStore` / `createWeaviateVectorStore` (HTTP REST/GraphQL with stub-fetch contract tests). Embedder: snapshot tests over a 5-text fixture against the mock embedder; production path constructors throw fail-loud when API keys are missing. Telephony: `createTwilioTelephonyAdapter` (REST POST to Calls.json with HTTP Basic auth), `createLiveKitSipAdapter` (LiveKit twirp/livekit.SIP RPC). Realtime: `createVapiRealtimeAdapter` (WebSocket handshake → session.update with assistant_id; mirrors OpenAI Realtime's adapter shape). Browser: `createHostDriver` (gated on `CREWHAUS_BROW_HOST_ENABLED=1` with caller-supplied `HostExecutor`), `createRemoteDriver` (CDP-style WebSocket via puppeteer-core; injectable for tests). Existing `createDriver({ backend: "host" \| "remote" })` factory still returns the stub for backwards compat; production callers use the new direct factories. End-to-end smoke (`bun run smoke:section-30`) drives 6 probes covering every family.
 
@@ -2123,6 +2333,8 @@ browser: host backend / remote backend
 
 ## Section 31 — Studio v1
 
+*IR variant: every variant · Catalog layer: F4 · Compiler stage: runtime*
+
 > Status: ✅ landed (2026-05-08). Five package upgrades shipped: `studio-server` v1 (RunDispatcher injection point — production callers wire spawn-runChatLoop or any equivalent runtime; new endpoints `/api/runs/:runId/cancel` + `/api/runs/:runId/replay` + `/api/runs/:runId/hitl?nodeId=&decision=` + `/api/cost-summary?tenant=&from=&to=`; ReplaySource + CostSummarySource injection slots), `studio-ui` v1 (additive `renderMultiSpecDashboard(rows)` for cost + pass-rate + p50/p95 latency aggregation; HTML escaping + alphabetical sort + 4-decimal cost rendering), `trace-viewer` v1 (`replay(events, { speed: 1|2|4|"raw" })` async iterable with deterministic setTimeout shim; `drilldownSpan(timeline, events, spanId)` for click-through), `graph-visualizer` v1 (`initialLiveState` + `applyEvent` state machine over node_start/node_end/hitl_pause/hitl_decision/node_error events; `renderLiveSvg` augments base SVG with per-node `data-state` attributes for CSS-driven coloring; bounded history at 1000 entries), `plugin-sdk` v1 (declared `permissions: { fs: ["read:..."], net: ["fetch:..."] }` schema validated at `definePlugin`; `isFsAllowed` / `isNetAllowed` runtime-evaluators with fail-closed semantics + minimatch-style glob support). End-to-end smoke (`bun run smoke:section-31`) drives 6 in-process probes covering each module.
 
 **Catalog modules (extensions to §26 packages):** `studio-ui` (Lit + Monaco rewrite), `studio-server` (full SSE wiring), `plugin-sdk` (content-sandbox isolation)
@@ -2177,6 +2389,8 @@ studio-server (SSE wiring)  ──►  studio-ui (Lit + Monaco rewrite)  ──�
 
 ## Section 32 — Distribution & packaging
 
+*IR variant: every variant · Catalog layer: F3 · Compiler stage: runtime (distribution)*
+
 > Status: ✅ complete. Four packages landed: `docker-images` (12 multi-stage Dockerfiles + `crewhaus build-image` CLI), `single-binary-cli` (`bun build --compile` matrix + Homebrew/Debian/Scoop/Winget manifest renderers), `helm-chart` (Helm chart under `helm/crewhaus/` + in-process `renderChart()` for tests), `crewhaus-cloud` (composite Terraform + Kustomize recipe + `crewhaus cloud deploy`/`teardown`). Tests use injected fakes for the `docker buildx`, `bun --compile`, `terraform`, and `kubectl` runners; live infra probes gate on `CREWHAUS_SECTION32_LIVE_DOCKER`/`TF_BIN`.
 
 **Catalog modules:** `docker-images` (F3), `helm-chart` (F3), `single-binary-cli` (F3), `crewhaus-cloud` (F3 — composite recipe)
@@ -2227,6 +2441,8 @@ single-binary-cli   (parallel)
 ---
 
 ## Section 33 — Channel adapter breadth
+
+*IR variant: `IrChannelV0` · Catalog layer: R13 · Compiler stage: runtime — **Pillar 3 boundary site** (inbound channel text passes through `boundary-classifier` with `origin: "channel"` before becoming a `user_message`)*
 
 > Status: ✅ complete. Four adapter packages landed across PRs #43, #44, #45, #46: `channel-adapter-telegram`, `channel-adapter-discord`, `channel-adapter-whatsapp`, `channel-adapter-imessage`. spec/IR/compiler/target-channel-bot all extended with multi-channel scaffolding so all five channels (Slack + the four new) can be registered side-by-side and the gateway dispatches by `/<adapter>/events` path prefix.
 
@@ -2284,6 +2500,8 @@ Each is its own PR. None depends on another.
 
 ## Section 34 — Federation (multi-deployment A2A)
 
+*IR variant: `IrCrewV0` / `IrManagedV0` · Catalog layer: R10 + R17 · Compiler stage: runtime — **Pillar 3 boundary site** (peer payloads pass through `boundary-classifier` with `origin: "federation"`; mTLS authenticates the peer, classification authenticates the content)*
+
 > Status: ✅ complete. Three packages landed: `federation-protocol` (mTLS A2A wire envelope + Node-built-in `crypto.verify` cert pinning), `federation-discovery` (DNS SRV + `.well-known/crewhaus.json` with TTL caching), `federation-router` (transparent remote sub-agent calls + recovery-engine error mapping). `crewhaus federation discover <deployment>` CLI subcommand wired into apps/cli. In-process two-deployment smoke runs without docker-compose.
 
 **Catalog modules:** `federation-protocol` (R-infra), `federation-discovery` (R-infra), `federation-router` (R-infra)
@@ -2328,6 +2546,8 @@ federation-protocol  ──►  federation-discovery  ──►  federation-rout
 
 ## Section 35 — Developer experience tooling
 
+*IR variant: every variant · Catalog layer: F4 · Compiler stage: runtime (developer experience)*
+
 > Status: ✅ complete. Three packages landed across PRs #48, #49, #50: `vscode-extension` (spec autocomplete + lint + Run Spec command + sub-agent hover-card), `jetbrains-plugin` (IntelliJ/WebStorm/PyCharm parity scaffold + plugin.xml + Gradle build), `crewhaus-playground` (browser-based REPL with Monaco editor + tier-based quota + cross-tenant isolation + scaffold-template picker).
 
 **Catalog modules:** `vscode-extension` (F4), `jetbrains-plugin` (F4), `crewhaus-playground` (F4)
@@ -2370,6 +2590,8 @@ All three packages are independent and parallelisable. Each is its own PR.
 ---
 
 ## Section 36 — Polyglot sandbox images
+
+*IR variant: `IrV0` / `IrPipelineV0` · Catalog layer: R8 · Compiler stage: runtime*
 
 > Status: ✅ COMPLETE. All 8 packages shipped: `sandbox-image-registry` + `sandbox-image-{go,rust,java,ruby,r,dotnet,php}`. Independent of §37–40.
 
@@ -2430,6 +2652,8 @@ sandbox-image-registry  ──►  sandbox-image-{go,rust,java,ruby,r,dotnet,php
 
 ## Section 37 — Vendor telemetry exporters
 
+*IR variant: every variant · Catalog layer: R15 · Compiler stage: runtime*
+
 > Status: ✅ COMPLETE. All 4 vendor adapters shipped: datadog, honeycomb, splunk, newrelic. Independent of §36/38–40.
 
 **Catalog modules:** `exporter-datadog` (R15), `exporter-honeycomb` (R15), `exporter-splunk` (R15), `exporter-newrelic` (R15)
@@ -2473,6 +2697,8 @@ All four packages are fully independent and parallelisable. Each is its own PR.
 ---
 
 ## Section 38 — Production graders
+
+*IR variant: `IrEvalV0` · Catalog layer: R15 · Compiler stage: runtime*
 
 > Status: ✅ COMPLETE. All 4 grader families shipped: nlg-metrics, semantic-similarity, safety-classifiers, multimodal. Independent of §36/37/39/40.
 
@@ -2518,6 +2744,8 @@ All four packages are independent; each is its own PR.
 ---
 
 ## Section 39 — Compliance & audit hardening
+
+*IR variant: every variant · Catalog layer: R8 + R17 · Compiler stage: runtime*
 
 > Status: ✅ COMPLETE. All 4 compliance packages shipped: pii-redactor, audit-encryption, data-retention-engine, compliance-controls. `crewhaus compliance evidence` CLI wired into the spec-cli surface. Pairs with §38 grader-safety-classifiers for the PII-leak detection layer.
 
@@ -2573,6 +2801,8 @@ compliance-controls  ──►  (depends on the three above for evidence collect
 ---
 
 ## Section 40 — Spec template marketplace + example CI
+
+*IR variant: every variant · Catalog layer: F4 · Compiler stage: runtime*
 
 > Status: ✅ COMPLETE. All 3 surfaces shipped: `template-registry` + `template-marketplace-client` + `.github/workflows/example-corpus.yml` matrix CI gate.
 

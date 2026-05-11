@@ -37,6 +37,7 @@ import {
   type ToolCallRecord,
   createIsolatedContext,
 } from "@crewhaus/agent-context-isolation";
+import { classifyBoundary } from "@crewhaus/boundary-classifier";
 import { type EventLog, openEventLog } from "@crewhaus/event-log";
 import { runChatLoop } from "@crewhaus/runtime-core";
 
@@ -164,6 +165,23 @@ export async function spawnSubAgent(
   });
 
   await child.close();
+
+  // Pillar 3 boundary site — re-classify the child's final message
+  // before handing it back to the parent's context. The child ran
+  // runChatLoop with its OWN classification on each tool result, but
+  // those classifiers only saw the truncated previews of tool outputs.
+  // A polymorphic jailbreak that the child's model absorbed and surfaced
+  // in its summary would otherwise reach the parent's context window
+  // intact — see [recipe 41](../../docs/recipes/41-security-fabric.md).
+  // We replace `finalMessage` with the redaction notice on a malicious
+  // verdict; suspicious is kept (the warn-action emits a trace event
+  // through the classifier; nothing else to do here).
+  if (!isError && finalMessage.length > 0) {
+    const boundary = await classifyBoundary(finalMessage, { origin: "subagent" });
+    if (boundary.action === "redact" && boundary.redacted !== undefined) {
+      finalMessage = boundary.redacted;
+    }
+  }
 
   return {
     finalMessage,

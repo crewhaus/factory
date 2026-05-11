@@ -1,0 +1,21 @@
+# hello-optimize — a CLI agent whose system prompt is deliberately short
+# so the active optimizer has room to improve. Pair this with a small
+# dataset and run:
+#
+#   crewhaus optimize examples/hello-optimize/crewhaus.yaml \
+#     --dataset examples/hello-optimize/dataset.jsonl \
+#     --graders examples/hello-optimize/graders.yaml \
+#     --iterations 5 \
+#     --seed 42
+#
+# Add --write-back to apply the winning candidate to this file directly.
+# Add --mutator claude to use Claude-driven rewrites instead of the
+# deterministic rule-based provider.
+
+target: cli
+name: hello-optimize
+agent:
+  model: claude-sonnet-4-5
+  # Deliberately terse — the optimizer should expand this.
+  instructions: Answer the user's question.
+tools: []

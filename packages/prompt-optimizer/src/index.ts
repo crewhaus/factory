@@ -50,6 +50,41 @@ export type Candidate = {
 
 export type FitnessFn = (prompt: string) => Promise<number>;
 
+/**
+ * Pillar 2 — the seam that lets `prompt-optimizer-claude` (or any
+ * future model-driven mutator) plug into the same search loop the
+ * rule-based provider uses. The v0 of this package shipped only
+ * rule-based mutations; the L91 comment above flagged model-driven
+ * rewriting as the next step. This interface IS that step: a provider
+ * just needs to produce a mutated prompt + optional metadata.
+ */
+export interface MutationProvider {
+  /** Stable name for logging + persisted trajectory metadata. */
+  readonly name: string;
+  /**
+   * Generate the next candidate from the current best. The state is
+   * a snapshot — providers should not retain it across calls.
+   */
+  next(state: OptimizerState): Promise<ProviderMutation>;
+}
+
+export type OptimizerState = {
+  readonly iteration: number;
+  readonly best: Candidate;
+  readonly trajectory: ReadonlyArray<Candidate>;
+  readonly trainSet: ReadonlyArray<Sample>;
+  readonly devSet: ReadonlyArray<Sample>;
+};
+
+export type ProviderMutation = {
+  /** The proposed new prompt. */
+  readonly prompt: string;
+  /** Structured record of what changed; persisted for audit. */
+  readonly mutations: ReadonlyArray<Mutation>;
+  /** Optional human-readable rationale (the Claude provider sets this). */
+  readonly rationale?: string;
+};
+
 export type OptimizeOptions = {
   /** Pass `train` and `dev` from §29 dataset-registry. */
   readonly trainSet: ReadonlyArray<Sample>;
@@ -66,10 +101,18 @@ export type OptimizeOptions = {
   /** Optional persistence root (default: `.crewhaus/prompt-optimizer/<runId>`). */
   readonly outDir?: string;
   /**
-   * Mutation set. Default: `["rephrase-instruction", "add-few-shot",
-   * "swap-example", "add-COT-prefix"]`. Pass a subset to constrain.
+   * Mutation set for the default rule-based provider. Default:
+   * `["rephrase-instruction", "add-few-shot", "swap-example",
+   * "add-COT-prefix"]`. Pass a subset to constrain. Ignored when a
+   * `mutator` is supplied.
    */
   readonly mutations?: ReadonlyArray<Mutation["kind"]>;
+  /**
+   * Pluggable mutator. Default: a `RuleBasedMutationProvider` seeded
+   * with `seed`. The `crewhaus optimize --mutator claude` CLI swaps
+   * in `prompt-optimizer-claude`'s `ClaudeMutationProvider`.
+   */
+  readonly mutator?: MutationProvider;
 };
 
 export type OptimizeResult = {
@@ -121,9 +164,58 @@ export function applyMutation(prompt: string, m: Mutation): string {
 }
 
 /**
- * Run an iterative search; each iteration draws a deterministic mutation
- * (modulo the seeded RNG), measures fitness on the dev set via the
- * caller-supplied `fitness` function, and keeps the best.
+ * The deterministic rule-based provider — the v0 default that ships
+ * in this package. Picks a mutation kind via a seeded xorshift RNG,
+ * applies it to the current-best prompt, returns the result. The
+ * existing 4 mutation kinds (`rephrase-instruction`, `add-few-shot`,
+ * `swap-example`, `add-COT-prefix`) live here verbatim — the
+ * refactor extracted them from `optimize()` so a future provider
+ * (Pillar 2: `prompt-optimizer-claude`) can plug in without breaking
+ * the deterministic test harness.
+ */
+export class RuleBasedMutationProvider implements MutationProvider {
+  readonly name = "rule-based";
+  private readonly rng: () => number;
+  private readonly mutationKinds: ReadonlyArray<Mutation["kind"]>;
+  constructor(opts: { seed?: number; mutations?: ReadonlyArray<Mutation["kind"]> } = {}) {
+    this.rng = makeXorshift(opts.seed ?? 0xcafe);
+    this.mutationKinds = opts.mutations ?? DEFAULT_MUTATIONS;
+  }
+  async next(state: OptimizerState): Promise<ProviderMutation> {
+    const kind =
+      this.mutationKinds[Math.floor(this.rng() * this.mutationKinds.length)] ??
+      "rephrase-instruction";
+    // Safe: optimize() validated trainSet.length > 0 above.
+    const firstTrain = state.trainSet[0] as (typeof state.trainSet)[number];
+    let mutation: Mutation;
+    if (kind === "add-few-shot") {
+      mutation = {
+        kind,
+        sample: state.trainSet[Math.floor(this.rng() * state.trainSet.length)] ?? firstTrain,
+      };
+    } else if (kind === "swap-example") {
+      mutation = {
+        kind,
+        oldSample: state.trainSet[Math.floor(this.rng() * state.trainSet.length)] ?? firstTrain,
+        newSample: state.trainSet[Math.floor(this.rng() * state.trainSet.length)] ?? firstTrain,
+      };
+    } else if (kind === "rephrase-instruction") {
+      mutation = { kind };
+    } else {
+      mutation = { kind: "add-COT-prefix" };
+    }
+    return {
+      prompt: applyMutation(state.best.prompt, mutation),
+      mutations: [mutation],
+    };
+  }
+}
+
+/**
+ * Run an iterative search; each iteration delegates to the configured
+ * `MutationProvider` (default: `RuleBasedMutationProvider` seeded with
+ * `opts.seed`), measures fitness on the dev set via the caller-supplied
+ * `fitness` function, and keeps the best.
  */
 export async function optimize(basePrompt: string, opts: OptimizeOptions): Promise<OptimizeResult> {
   if (opts.trainSet.length === 0) {
@@ -133,11 +225,14 @@ export async function optimize(basePrompt: string, opts: OptimizeOptions): Promi
     throw new PromptOptimizerError("optimize: devSet must contain at least one sample");
   }
   const iterations = opts.iterations ?? 10;
-  const seed = opts.seed ?? 0xcafe;
-  const mutationKinds = opts.mutations ?? DEFAULT_MUTATIONS;
   const runId = opts.runId ?? `opt_${Date.now().toString(16)}`;
 
-  const rng = makeXorshift(seed);
+  const mutator: MutationProvider =
+    opts.mutator ??
+    new RuleBasedMutationProvider({
+      ...(opts.seed !== undefined ? { seed: opts.seed } : {}),
+      ...(opts.mutations !== undefined ? { mutations: opts.mutations } : {}),
+    });
 
   const baseScore = await opts.fitness(basePrompt);
   const baseCandidate: Candidate = {
@@ -148,34 +243,21 @@ export async function optimize(basePrompt: string, opts: OptimizeOptions): Promi
   };
   const trajectory: Candidate[] = [baseCandidate];
   let best: Candidate = baseCandidate;
-  // Safe: caller validated trainSet.length > 0 above.
-  const firstTrain = opts.trainSet[0] as (typeof opts.trainSet)[number];
 
   for (let i = 1; i <= iterations; i++) {
-    const kind = mutationKinds[Math.floor(rng() * mutationKinds.length)] ?? "rephrase-instruction";
-    let mutation: Mutation;
-    if (kind === "add-few-shot") {
-      mutation = {
-        kind,
-        sample: opts.trainSet[Math.floor(rng() * opts.trainSet.length)] ?? firstTrain,
-      };
-    } else if (kind === "swap-example") {
-      mutation = {
-        kind,
-        oldSample: opts.trainSet[Math.floor(rng() * opts.trainSet.length)] ?? firstTrain,
-        newSample: opts.trainSet[Math.floor(rng() * opts.trainSet.length)] ?? firstTrain,
-      };
-    } else if (kind === "rephrase-instruction") {
-      mutation = { kind };
-    } else {
-      mutation = { kind: "add-COT-prefix" };
-    }
-    const next = applyMutation(best.prompt, mutation);
-    const score = await opts.fitness(next);
+    const state: OptimizerState = {
+      iteration: i,
+      best,
+      trajectory,
+      trainSet: opts.trainSet,
+      devSet: opts.devSet,
+    };
+    const proposal = await mutator.next(state);
+    const score = await opts.fitness(proposal.prompt);
     const candidate: Candidate = {
       id: `candidate-${i}`,
-      prompt: next,
-      mutations: [...best.mutations, mutation],
+      prompt: proposal.prompt,
+      mutations: [...best.mutations, ...proposal.mutations],
       score,
     };
     trajectory.push(candidate);

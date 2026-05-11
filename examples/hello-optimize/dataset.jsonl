@@ -1,0 +1,10 @@
+{"id":"q1","input":"What is the capital of France?","expected_output":"Paris"}
+{"id":"q2","input":"What is the capital of Germany?","expected_output":"Berlin"}
+{"id":"q3","input":"What is the capital of Italy?","expected_output":"Rome"}
+{"id":"q4","input":"What is the capital of Spain?","expected_output":"Madrid"}
+{"id":"q5","input":"What is the capital of Japan?","expected_output":"Tokyo"}
+{"id":"q6","input":"What is the capital of Brazil?","expected_output":"Brasília"}
+{"id":"q7","input":"What is the capital of Canada?","expected_output":"Ottawa"}
+{"id":"q8","input":"What is the capital of Australia?","expected_output":"Canberra"}
+{"id":"q9","input":"What is the capital of Egypt?","expected_output":"Cairo"}
+{"id":"q10","input":"What is the capital of India?","expected_output":"New Delhi"}
