@@ -587,10 +587,13 @@ The full recipe index lives at [`recipes/INDEX.md`](recipes/INDEX.md).
 ### The full module catalog
 
 When a recipe says "uses module X," the canonical reference is
-[`docs/MODULE-CATALOG.md`](MODULE-CATALOG.md). It documents every
-package in `packages/` — inputs, outputs, design choices, test
-coverage, the section it shipped in. Treat it as a glossary, not
-required reading.
+[`docs/MODULE-CATALOG.md`](MODULE-CATALOG.md). It's organised as
+role-based reading paths ("if you are adding a new target shape, go
+to …") rather than a flat glossary, so you can land on the ~5
+modules that matter for your task without reading the rest. Per-module
+build briefs live in [`docs/module-briefs/`](module-briefs/README.md);
+implementation status and the v1.3 backlog live in
+[`docs/MODULE-CATALOG-STATUS.md`](MODULE-CATALOG-STATUS.md).
 
 ---
 
