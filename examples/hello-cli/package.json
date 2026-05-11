@@ -5,6 +5,10 @@
   "type": "module",
   "description": "Smallest possible spec → CLI agent vertical slice",
   "dependencies": {
-    "@crewhaus/runtime-core": "workspace:*"
+    "@crewhaus/hooks-engine": "workspace:*",
+    "@crewhaus/runtime-core": "workspace:*",
+    "@crewhaus/skills-registry": "workspace:*",
+    "@crewhaus/slash-commands": "workspace:*",
+    "@crewhaus/tool-catalog": "workspace:*"
   }
 }
