@@ -111,7 +111,11 @@
       "name": "@crewhaus-examples/hello-cli",
       "version": "0.0.0",
       "dependencies": {
+        "@crewhaus/hooks-engine": "workspace:*",
         "@crewhaus/runtime-core": "workspace:*",
+        "@crewhaus/skills-registry": "workspace:*",
+        "@crewhaus/slash-commands": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
       },
     },
     "examples/hello-crew": {
@@ -199,7 +203,10 @@
       "name": "@crewhaus-examples/hello-workflow",
       "version": "0.0.0",
       "dependencies": {
+        "@crewhaus/hooks-engine": "workspace:*",
         "@crewhaus/runtime-core": "workspace:*",
+        "@crewhaus/skills-registry": "workspace:*",
+        "@crewhaus/slash-commands": "workspace:*",
         "@crewhaus/tool-bash": "workspace:*",
       },
     },
@@ -207,8 +214,11 @@
       "name": "@crewhaus-examples/mcp-smoke",
       "version": "0.0.0",
       "dependencies": {
+        "@crewhaus/hooks-engine": "workspace:*",
         "@crewhaus/mcp-host": "workspace:*",
         "@crewhaus/runtime-core": "workspace:*",
+        "@crewhaus/skills-registry": "workspace:*",
+        "@crewhaus/slash-commands": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
         "@crewhaus/tool-mcp": "workspace:*",
       },

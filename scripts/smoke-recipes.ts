@@ -39,6 +39,16 @@ const LIVE = process.env["RECIPE_SMOKE_LIVE"] === "1";
 const SAFE_PREFIXES = ["compile:"];
 const LIVE_PREFIXES = ["run:", "smoke:"];
 
+// Scripts that require non-Anthropic credentials beyond `RECIPE_SMOKE_LIVE`.
+// The smoke runner skips them (instead of failing loudly) when the listed
+// env vars are absent — e.g. `run:hello-channel` boots a Slack daemon and
+// fails immediately without `SLACK_BOT_TOKEN`/`SLACK_SIGNING_SECRET`. Adding
+// an entry here is purely cosmetic: the underlying script still fails-loud
+// when invoked directly, which is the right behavior outside CI.
+const REQUIRES_ENV: Record<string, readonly string[]> = {
+  "run:hello-channel": ["SLACK_BOT_TOKEN", "SLACK_SIGNING_SECRET"],
+};
+
 type Frontmatter = { bunScripts?: string[] };
 
 type Result = {
@@ -153,6 +163,20 @@ function main(): void {
         process.stdout.write(`  · ${script}  (gated on RECIPE_SMOKE_LIVE=1; skipping)\n`);
         results.push({ recipe: rel, script, status: "skipped", reason: "live mode disabled" });
         continue;
+      }
+      const required = REQUIRES_ENV[script];
+      if (required !== undefined) {
+        const missing = required.filter((v) => !process.env[v]);
+        if (missing.length > 0) {
+          process.stdout.write(`  · ${script}  (requires ${missing.join(", ")}; skipping)\n`);
+          results.push({
+            recipe: rel,
+            script,
+            status: "skipped",
+            reason: `missing env: ${missing.join(", ")}`,
+          });
+          continue;
+        }
       }
       results.push(runScript(rel, script));
     }
