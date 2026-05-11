@@ -12,6 +12,8 @@
     "test": "bun --filter '@crewhaus/*' test",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
+    "recipes:test": "bun scripts/test-recipes.ts",
+    "recipes:smoke": "bun scripts/smoke-recipes.ts",
     "compile:hello": "bun apps/cli/src/index.ts compile examples/hello-cli/crewhaus.yaml -o examples/hello-cli/dist",
     "run:hello": "bun examples/hello-cli/dist/agent.ts",
     "compile:hello-workflow": "bun apps/cli/src/index.ts compile examples/hello-workflow/crewhaus.yaml -o examples/hello-workflow/dist",

@@ -1,0 +1,51 @@
+name: Recipes
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/recipes/**"
+      - "docs/GETTING-STARTED.md"
+      - "scripts/test-recipes.ts"
+      - "scripts/smoke-recipes.ts"
+      - "examples/**/crewhaus.yaml"
+      - "packages/spec/**"
+      - ".github/workflows/recipes.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "docs/recipes/**"
+      - "docs/GETTING-STARTED.md"
+      - "scripts/test-recipes.ts"
+      - "scripts/smoke-recipes.ts"
+      - "examples/**/crewhaus.yaml"
+      - "packages/spec/**"
+      - ".github/workflows/recipes.yml"
+
+jobs:
+  static:
+    name: Static recipe validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ">=1.2.0"
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Run static recipe tests
+        run: bun run recipes:test
+
+  smoke:
+    name: Recipe compile smoke (no model calls)
+    runs-on: ubuntu-latest
+    needs: static
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ">=1.2.0"
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Run compile-only smoke for recipes with bun_scripts
+        run: bun run recipes:smoke
