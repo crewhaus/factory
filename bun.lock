@@ -21,6 +21,7 @@
         "crewhaus": "src/index.ts",
       },
       "dependencies": {
+        "@crewhaus/adapter-anthropic": "workspace:*",
         "@crewhaus/agent-context-isolation": "workspace:*",
         "@crewhaus/audit-log": "workspace:*",
         "@crewhaus/canary-controller": "workspace:*",
@@ -31,6 +32,7 @@
         "@crewhaus/docker-images": "workspace:*",
         "@crewhaus/eval-dataset": "workspace:*",
         "@crewhaus/eval-grader": "workspace:*",
+        "@crewhaus/eval-optimizer-orchestrator": "workspace:*",
         "@crewhaus/eval-report": "workspace:*",
         "@crewhaus/eval-runner": "workspace:*",
         "@crewhaus/federation-discovery": "workspace:*",
@@ -42,6 +44,8 @@
         "@crewhaus/migration-engine": "workspace:*",
         "@crewhaus/migration-runner": "workspace:*",
         "@crewhaus/permission-engine": "workspace:*",
+        "@crewhaus/prompt-optimizer": "workspace:*",
+        "@crewhaus/prompt-optimizer-claude": "workspace:*",
         "@crewhaus/runtime-core": "workspace:*",
         "@crewhaus/sandbox": "workspace:*",
         "@crewhaus/sandbox-image-registry": "workspace:*",
@@ -49,6 +53,7 @@
         "@crewhaus/skills-registry": "workspace:*",
         "@crewhaus/slash-commands": "workspace:*",
         "@crewhaus/spec": "workspace:*",
+        "@crewhaus/spec-patch": "workspace:*",
         "@crewhaus/spec-registry": "workspace:*",
         "@crewhaus/sub-agent-spawner": "workspace:*",
         "@crewhaus/tool-bash": "workspace:*",
@@ -683,6 +688,14 @@
         "@crewhaus/voice-runtime": "workspace:*",
       },
     },
+    "packages/boundary-classifier": {
+      "name": "@crewhaus/boundary-classifier",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/prompt-injection-detector": "workspace:*",
+      },
+    },
     "packages/branch-history": {
       "name": "@crewhaus/branch-history",
       "version": "0.0.0",
@@ -779,6 +792,7 @@
       "dependencies": {
         "@anthropic-ai/sdk": "^0.40.0",
         "@crewhaus/adapter-anthropic": "workspace:*",
+        "@crewhaus/boundary-classifier": "workspace:*",
         "@crewhaus/errors": "workspace:*",
       },
     },
@@ -975,6 +989,19 @@
         "yaml": "^2.6.0",
         "zod": "^3.23.8",
         "zod-to-json-schema": "^3.23.5",
+      },
+    },
+    "packages/eval-optimizer-orchestrator": {
+      "name": "@crewhaus/eval-optimizer-orchestrator",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/prompt-optimizer": "workspace:*",
+        "@crewhaus/spec": "workspace:*",
+        "@crewhaus/spec-patch": "workspace:*",
+      },
+      "devDependencies": {
+        "@crewhaus/eval-dataset": "workspace:*",
       },
     },
     "packages/eval-report": {
@@ -1342,6 +1369,20 @@
         "@crewhaus/eval-runner": "workspace:*",
       },
     },
+    "packages/prompt-optimizer-claude": {
+      "name": "@crewhaus/prompt-optimizer-claude",
+      "version": "0.0.0",
+      "dependencies": {
+        "@anthropic-ai/sdk": "^0.40.0",
+        "@crewhaus/adapter-anthropic": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/prompt-optimizer": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/eval-dataset": "workspace:*",
+      },
+    },
     "packages/queue-consumer": {
       "name": "@crewhaus/queue-consumer",
       "version": "0.0.0",
@@ -1551,6 +1592,7 @@
       "name": "@crewhaus/skills-registry",
       "version": "0.0.0",
       "dependencies": {
+        "@crewhaus/boundary-classifier": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
         "yaml": "^2.6.0",
@@ -1570,6 +1612,16 @@
       "version": "0.0.0",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
+        "yaml": "^2.6.0",
+        "zod": "^3.23.8",
+      },
+    },
+    "packages/spec-patch": {
+      "name": "@crewhaus/spec-patch",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/spec": "workspace:*",
         "yaml": "^2.6.0",
         "zod": "^3.23.8",
       },
@@ -1641,6 +1693,7 @@
         "@anthropic-ai/sdk": "^0.40.0",
         "@crewhaus/adapter-anthropic": "workspace:*",
         "@crewhaus/agent-context-isolation": "workspace:*",
+        "@crewhaus/boundary-classifier": "workspace:*",
         "@crewhaus/event-log": "workspace:*",
         "@crewhaus/runtime-core": "workspace:*",
       },
@@ -1926,6 +1979,7 @@
       "name": "@crewhaus/tool-mcp",
       "version": "0.0.0",
       "dependencies": {
+        "@crewhaus/boundary-classifier": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/mcp-host": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
@@ -2355,6 +2409,8 @@
 
     "@crewhaus/barge-in-controller": ["@crewhaus/barge-in-controller@workspace:packages/barge-in-controller"],
 
+    "@crewhaus/boundary-classifier": ["@crewhaus/boundary-classifier@workspace:packages/boundary-classifier"],
+
     "@crewhaus/branch-history": ["@crewhaus/branch-history@workspace:packages/branch-history"],
 
     "@crewhaus/call-session": ["@crewhaus/call-session@workspace:packages/call-session"],
@@ -2420,6 +2476,8 @@
     "@crewhaus/eval-grader": ["@crewhaus/eval-grader@workspace:packages/eval-grader"],
 
     "@crewhaus/eval-judge": ["@crewhaus/eval-judge@workspace:packages/eval-judge"],
+
+    "@crewhaus/eval-optimizer-orchestrator": ["@crewhaus/eval-optimizer-orchestrator@workspace:packages/eval-optimizer-orchestrator"],
 
     "@crewhaus/eval-report": ["@crewhaus/eval-report@workspace:packages/eval-report"],
 
@@ -2505,6 +2563,8 @@
 
     "@crewhaus/prompt-optimizer": ["@crewhaus/prompt-optimizer@workspace:packages/prompt-optimizer"],
 
+    "@crewhaus/prompt-optimizer-claude": ["@crewhaus/prompt-optimizer-claude@workspace:packages/prompt-optimizer-claude"],
+
     "@crewhaus/queue-consumer": ["@crewhaus/queue-consumer@workspace:packages/queue-consumer"],
 
     "@crewhaus/queue-protocol": ["@crewhaus/queue-protocol@workspace:packages/queue-protocol"],
@@ -2552,6 +2612,8 @@
     "@crewhaus/slash-commands": ["@crewhaus/slash-commands@workspace:packages/slash-commands"],
 
     "@crewhaus/spec": ["@crewhaus/spec@workspace:packages/spec"],
+
+    "@crewhaus/spec-patch": ["@crewhaus/spec-patch@workspace:packages/spec-patch"],
 
     "@crewhaus/spec-registry": ["@crewhaus/spec-registry@workspace:packages/spec-registry"],
 

@@ -25,6 +25,7 @@
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
+import { classifyBoundary } from "@crewhaus/boundary-classifier";
 import { CrewhausError } from "@crewhaus/errors";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { parse as parseYaml } from "yaml";
@@ -180,10 +181,23 @@ function readSkillsUnder(root: string): SkillRef[] {
 /**
  * Read the full body of a skill from disk. Called only when the model
  * invokes `Skill({ name })` — the lazy-load contract.
+ *
+ * Pillar 3 boundary site — a plugin-installed or attacker-planted
+ * SKILL.md on disk is externally-controlled content. Classify the body
+ * via `boundary-classifier` with `origin: "skill"` before handing it to
+ * the model. The classifier's content-hash LRU cache means re-invoking
+ * a healthy skill doesn't burn classification budget on repeated calls.
+ * On a malicious verdict we return the redaction notice; the existing
+ * §18 post-tool classifier in runtime-core remains a redundant safety
+ * net (it'll detect any text that slipped through the cache eviction).
  */
 export async function loadSkillBody(ref: SkillRef): Promise<string> {
   const raw = readFileSync(ref.filePath, "utf8");
   const { body } = parseSkillFile(raw);
+  const boundary = await classifyBoundary(body, { origin: "skill" });
+  if (boundary.action === "redact" && boundary.redacted !== undefined) {
+    return boundary.redacted;
+  }
   return body;
 }
 

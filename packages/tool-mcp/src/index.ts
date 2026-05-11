@@ -1,3 +1,4 @@
+import { classifyBoundary } from "@crewhaus/boundary-classifier";
 import { McpError } from "@crewhaus/errors";
 import type { McpHost, McpToolDefinition } from "@crewhaus/mcp-host";
 import { buildTool } from "@crewhaus/tool-builder";
@@ -83,6 +84,17 @@ export function buildMcpRegisteredTool(
       });
       if (result.isError) {
         throw new McpError(result.content || `mcp tool "${fullName}" returned an error result`);
+      }
+      // Pillar 3 boundary site — classify the FULL MCP response (not just
+      // the truncated preview the §18 post-tool classifier sees later).
+      // A polymorphic jailbreak hidden mid-payload would otherwise bypass
+      // the runtime-core classifier when storeAndPreview truncates the
+      // bytes that contained it. The boundary-classifier's content-hash
+      // cache means a repeated MCP call to a healthy server doesn't burn
+      // re-classification budget.
+      const boundary = await classifyBoundary(result.content, { origin: "mcp" });
+      if (boundary.action === "redact" && boundary.redacted !== undefined) {
+        return boundary.redacted;
       }
       return result.content;
     },

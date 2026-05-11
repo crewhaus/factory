@@ -4,10 +4,6 @@
     "rootDir": "src",
     "outDir": "dist"
   },
-  "references": [
-    { "path": "../adapter-anthropic" },
-    { "path": "../boundary-classifier" },
-    { "path": "../errors" }
-  ],
+  "references": [{ "path": "../errors" }, { "path": "../spec" }],
   "include": ["src/**/*"]
 }

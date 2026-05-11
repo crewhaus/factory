@@ -4,6 +4,10 @@
     "rootDir": "src",
     "outDir": "dist"
   },
-  "references": [{ "path": "../errors" }, { "path": "../tool-catalog" }],
+  "references": [
+    { "path": "../boundary-classifier" },
+    { "path": "../errors" },
+    { "path": "../tool-catalog" }
+  ],
   "include": ["src/**/*"]
 }

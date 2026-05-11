@@ -23,6 +23,7 @@ import {
   collectFinalMessage,
   extractFirstText,
 } from "@crewhaus/adapter-anthropic";
+import { classifyBoundary } from "@crewhaus/boundary-classifier";
 import { RuntimeError } from "@crewhaus/errors";
 
 const SUMMARY_REQUEST =
@@ -65,8 +66,20 @@ export async function autoCompact(
     throw new RuntimeError("autoCompact: model response contained no text block");
   }
 
+  // Pillar 3 boundary site — if the pre-compaction history contained
+  // attacker text from any earlier boundary (an MCP response, a
+  // sub-agent return, an inbound channel message), the summarising
+  // model may have absorbed it. Classify the summary at the compaction
+  // boundary before it replaces the active history. On malicious, fall
+  // back to the redaction notice so the model's next turn sees the
+  // injection has been neutralised — losing the summary is preferable
+  // to letting it carry the payload forward.
+  const boundary = await classifyBoundary(summary, { origin: "compaction" });
+  const safeSummary =
+    boundary.action === "redact" && boundary.redacted !== undefined ? boundary.redacted : summary;
+
   return [
     { role: "user", content: SUMMARY_MARKER },
-    { role: "assistant", content: summary },
+    { role: "assistant", content: safeSummary },
   ];
 }

@@ -5,6 +5,7 @@ import type { SubAgentDefinition } from "@crewhaus/agent-context-isolation";
 import { SpecParseError, compile, lower } from "@crewhaus/compiler";
 import { loadDataset } from "@crewhaus/eval-dataset";
 import { parseGradersConfig } from "@crewhaus/eval-grader";
+import { optimizeSpec } from "@crewhaus/eval-optimizer-orchestrator";
 import { diffReports, loadRun, renderReport } from "@crewhaus/eval-report";
 import { runEval as runEvalLib } from "@crewhaus/eval-runner";
 import { loadHooks } from "@crewhaus/hooks-engine";
@@ -80,7 +81,24 @@ const INIT_SCHEMA: ParseArgsSchema = {
 };
 
 const DOCTOR_SCHEMA: ParseArgsSchema = {
-  flags: [{ name: "help", short: "h" }],
+  flags: [
+    { name: "philosophy-alignment", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
+const OPTIMIZE_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "dataset", takesValue: true },
+    { name: "graders", takesValue: true },
+    { name: "mutator", takesValue: true },
+    { name: "iterations", takesValue: true },
+    { name: "seed", takesValue: true },
+    { name: "improvement-threshold", takesValue: true },
+    { name: "write-back", takesValue: false },
+    { name: "out", short: "o", takesValue: true },
+    { name: "help", short: "h" },
+  ],
 };
 
 const EVAL_SCHEMA: ParseArgsSchema = {
@@ -604,7 +622,14 @@ function checkBunVersion(version: string): { pass: boolean; reason?: string } {
 
 function runDoctor(args: ParsedArgs): void {
   if (args.flags["help"]) {
-    process.stdout.write("usage: crewhaus doctor\n");
+    process.stdout.write(
+      "usage: crewhaus doctor [--philosophy-alignment]\n" +
+        "  --philosophy-alignment   audit the codebase + examples against the three architectural pillars\n",
+    );
+    return;
+  }
+  if (args.flags["philosophy-alignment"]) {
+    runDoctorPhilosophyAlignment();
     return;
   }
 
@@ -645,6 +670,300 @@ function runDoctor(args: ParsedArgs): void {
   const allPass = checks.every((c) => c.pass);
   process.stdout.write(allPass ? "\nall checks passed.\n" : "\nsome checks failed.\n");
   process.exit(allPass ? 0 : 1);
+}
+
+/**
+ * Workstream D — `crewhaus doctor --philosophy-alignment`. Audits the
+ * repo against the three architectural pillars (compiler-as-protagonist,
+ * eval-is-active, security-is-fabric). Exits 0 on green, 1 on any
+ * finding. Designed to be runnable in CI as a soft gate.
+ */
+function runDoctorPhilosophyAlignment(): void {
+  const findings: DoctorCheck[] = [];
+
+  // Pillar 1 — compiler-as-protagonist. The IR-discriminated-union is
+  // the contract; the architecture doc must exist and reference the IR
+  // file by path.
+  const archDocPath = join(process.cwd(), "docs", "COMPILER-ARCHITECTURE.md");
+  if (existsSync(archDocPath)) {
+    const content = readFileSync(archDocPath, "utf8");
+    const referencesIrVariants =
+      content.includes("IrV0") && content.includes("IrPipelineV0") && content.includes("IrGraphV0");
+    findings.push({
+      label: "Pillar 1 — docs/COMPILER-ARCHITECTURE.md references IR variants",
+      pass: referencesIrVariants,
+      reason: referencesIrVariants
+        ? undefined
+        : "doc exists but does not enumerate the IR-discriminated-union variants",
+    });
+  } else {
+    findings.push({
+      label: "Pillar 1 — docs/COMPILER-ARCHITECTURE.md exists",
+      pass: false,
+      reason: "not found",
+    });
+  }
+
+  // Pillar 2 — eval is active. The eval-optimizer-orchestrator must
+  // be in the workspace and the optimize CLI subcommand must exist.
+  const orchestratorPkg = join(
+    process.cwd(),
+    "packages",
+    "eval-optimizer-orchestrator",
+    "package.json",
+  );
+  findings.push({
+    label: "Pillar 2 — eval-optimizer-orchestrator package present",
+    pass: existsSync(orchestratorPkg),
+    reason: existsSync(orchestratorPkg)
+      ? undefined
+      : "Workstream B did not land — install or rebuild",
+  });
+
+  const specPatchPkg = join(process.cwd(), "packages", "spec-patch", "package.json");
+  findings.push({
+    label: "Pillar 2 — spec-patch package present",
+    pass: existsSync(specPatchPkg),
+    reason: existsSync(specPatchPkg) ? undefined : "Workstream B did not land",
+  });
+
+  // Pillar 3 — security is a fabric. The boundary-classifier package
+  // must exist and be referenced by the canonical boundary sites
+  // (tool-mcp, sub-agent-spawner, skills-registry, compaction-autocompact).
+  const boundaryPkg = join(process.cwd(), "packages", "boundary-classifier", "package.json");
+  findings.push({
+    label: "Pillar 3 — boundary-classifier package present",
+    pass: existsSync(boundaryPkg),
+    reason: existsSync(boundaryPkg) ? undefined : "Workstream C did not land",
+  });
+
+  const boundarySites: ReadonlyArray<{ name: string; path: string }> = [
+    { name: "tool-mcp", path: "packages/tool-mcp/src/index.ts" },
+    { name: "sub-agent-spawner", path: "packages/sub-agent-spawner/src/index.ts" },
+    { name: "skills-registry", path: "packages/skills-registry/src/index.ts" },
+    { name: "compaction-autocompact", path: "packages/compaction-autocompact/src/index.ts" },
+  ];
+  for (const site of boundarySites) {
+    const filePath = join(process.cwd(), site.path);
+    if (!existsSync(filePath)) {
+      findings.push({
+        label: `Pillar 3 — ${site.name} source present`,
+        pass: false,
+        reason: `${site.path} not found`,
+      });
+      continue;
+    }
+    const body = readFileSync(filePath, "utf8");
+    const classifies = body.includes("classifyBoundary") || body.includes("boundary-classifier");
+    findings.push({
+      label: `Pillar 3 — ${site.name} calls classifyBoundary`,
+      pass: classifies,
+      reason: classifies
+        ? undefined
+        : `no reference to classifyBoundary in ${site.path} — security regression`,
+    });
+  }
+
+  // CLAUDE.md exists at project root.
+  const claudemd = join(process.cwd(), "CLAUDE.md");
+  findings.push({
+    label: "Contributor doc — CLAUDE.md at project root",
+    pass: existsSync(claudemd),
+    reason: existsSync(claudemd) ? undefined : "missing — contributors will drift",
+  });
+
+  for (const f of findings) {
+    if (f.pass) {
+      process.stdout.write(`✓ ${f.label}\n`);
+    } else {
+      process.stdout.write(`✗ ${f.label}: ${f.reason ?? "failed"}\n`);
+    }
+  }
+  const allPass = findings.every((f) => f.pass);
+  process.stdout.write(
+    allPass
+      ? "\nphilosophy alignment: green. All three pillars intact.\n"
+      : `\nphilosophy alignment: ${findings.filter((f) => !f.pass).length} finding(s). See [/CLAUDE.md](CLAUDE.md) for invariants.\n`,
+  );
+  process.exit(allPass ? 0 : 1);
+}
+
+/**
+ * Workstream B — `crewhaus optimize <spec> --dataset <data> --graders
+ * <graders.yaml> [--mutator rule-based|claude] [--iterations N]
+ * [--write-back] [-o <out-dir>]`. Closes the active-optimisation loop.
+ *
+ * Loads the spec + dataset + graders, builds a fitness function that
+ * re-runs `eval-runner` for every candidate prompt, delegates to
+ * `optimizeSpec`, and prints the resulting score delta + patch path.
+ */
+async function runOptimize(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus optimize <spec.yaml> --dataset <data> --graders <graders.yaml> " +
+        "[--mutator rule-based|claude] [--iterations N] [--seed N] " +
+        "[--improvement-threshold F] [--write-back] [-o <out-dir>]\n",
+    );
+    return;
+  }
+  const specPath = args.positional[0];
+  if (typeof specPath !== "string") die("missing <spec.yaml>");
+  const datasetPath = args.flags["dataset"];
+  const gradersPath = args.flags["graders"];
+  if (typeof datasetPath !== "string") die("missing --dataset <data>");
+  if (typeof gradersPath !== "string") die("missing --graders <graders.yaml>");
+
+  const iterationsFlag = args.flags["iterations"];
+  const seedFlag = args.flags["seed"];
+  const thresholdFlag = args.flags["improvement-threshold"];
+  const iterations = typeof iterationsFlag === "string" ? Number.parseInt(iterationsFlag, 10) : 10;
+  const seed = typeof seedFlag === "string" ? Number.parseInt(seedFlag, 10) : 0xcafe;
+  const improvementThreshold =
+    typeof thresholdFlag === "string" ? Number.parseFloat(thresholdFlag) : 0.01;
+  if (Number.isNaN(iterations) || iterations < 1) {
+    die(`invalid --iterations "${iterationsFlag}" — must be positive integer`);
+  }
+
+  const writeBack = args.flags["write-back"] === true;
+  const outDirArg = args.flags["out"];
+  const absSpec = resolve(specPath);
+  const runId = `opt_${Date.now().toString(16)}`;
+  const outDir =
+    typeof outDirArg === "string"
+      ? resolve(outDirArg)
+      : resolve(join(".crewhaus", "optimize", runId));
+
+  let gradersYaml: string;
+  try {
+    gradersYaml = readFileSync(resolve(gradersPath), "utf-8");
+  } catch (err) {
+    die(`could not read ${gradersPath}: ${(err as Error).message}`);
+  }
+  const { compiled } = parseGradersConfig(gradersYaml);
+  const dataset = await loadDataset(resolve(datasetPath));
+
+  // Materialize the dataset once — we'll re-iterate per fitness call.
+  const samples: Array<{ id: string; input: string; expected_output?: string }> = [];
+  for await (const s of dataset.samples) {
+    samples.push({
+      id: s.id,
+      input: s.input,
+      ...(s.expected_output !== undefined ? { expected_output: s.expected_output } : {}),
+    });
+  }
+  if (samples.length === 0) die(`dataset "${dataset.name}" yielded zero samples`);
+
+  // Train/dev split: 70/30 deterministic split by sample id ordering.
+  const splitIdx = Math.max(1, Math.floor(samples.length * 0.7));
+  const trainSet = samples.slice(0, splitIdx);
+  const devSet = samples.slice(splitIdx);
+  if (devSet.length === 0) {
+    die(`dataset has ${samples.length} samples — need at least 2 (70/30 split needs a dev split)`);
+  }
+
+  // Fitness fn: patch the spec with the candidate prompt, lower to IR,
+  // run eval-runner, return passRate. Each call is one full eval pass.
+  const fitness = async (prompt: string): Promise<number> => {
+    const yamlText = readFileSync(absSpec, "utf-8");
+    // Re-parse to capture spec.target without depending on the
+    // orchestrator's extractCurrentPrompt internals.
+    const parsedTarget = parseSpec(yamlText).target;
+    // Build a patch and apply it in-memory (no disk write — fitness is
+    // pure with respect to the source file).
+    const { applySpecPatch } = await import("@crewhaus/spec-patch");
+    const { yaml: patchedYaml } = applySpecPatch(yamlText, {
+      target: parsedTarget as never,
+      path: ["agent", "instructions"],
+      op: "replace",
+      value: prompt,
+    });
+    let ir: ReturnType<typeof lower>;
+    try {
+      ir = lower(parseSpec(patchedYaml));
+    } catch (err) {
+      if (err instanceof SpecParseError) {
+        process.stderr.write("[optimize] candidate compiled invalid spec, skipping\n");
+        return 0;
+      }
+      throw err;
+    }
+    if (ir.target !== "cli") {
+      die(`crewhaus optimize v0 only supports target: cli (got "${ir.target}")`);
+    }
+    const summary = await runEvalLib({
+      ir,
+      dataset: { name: dataset.name, samples: makeAsyncIterable(devSet) },
+      compiledGraders: compiled,
+      opts: {
+        outDir: join(outDir, "evals", `${prompt.length}_${ir.agent.instructions.length}`),
+        concurrency: 4,
+        seed,
+      },
+    });
+    return summary.aggregates.passRate;
+  };
+
+  const mutator = args.flags["mutator"];
+  let mutatorImpl: import("@crewhaus/prompt-optimizer").MutationProvider | undefined;
+  if (mutator === "claude") {
+    const { createClaudeMutationProvider } = await import("@crewhaus/prompt-optimizer-claude");
+    const { createAnthropicAdapter } = await import("@crewhaus/adapter-anthropic");
+    const ir = lower(parseSpec(readFileSync(absSpec, "utf-8")));
+    const judgeModel = ir.target === "cli" ? ir.agent.model : "claude-sonnet-4-5";
+    mutatorImpl = createClaudeMutationProvider({
+      adapter: await createAnthropicAdapter(),
+      model: judgeModel,
+    });
+  } else if (mutator !== undefined && mutator !== "rule-based") {
+    die(`unknown --mutator "${mutator}" — supported: rule-based, claude`);
+  }
+
+  process.stdout.write(
+    `[optimize] runId=${runId} spec=${specPath} dataset=${dataset.name} ` +
+      `(${trainSet.length} train / ${devSet.length} dev) iterations=${iterations} ` +
+      `mutator=${mutator ?? "rule-based"}\n`,
+  );
+
+  const result = await optimizeSpec({
+    specPath: absSpec,
+    fitness,
+    trainSet,
+    devSet,
+    iterations,
+    seed,
+    improvementThreshold,
+    outDir,
+    writeBack,
+    runId,
+    ...(mutatorImpl !== undefined ? { mutator: mutatorImpl } : {}),
+  });
+
+  process.stdout.write(
+    `[optimize] score: ${result.scoreBefore.toFixed(3)} → ${result.scoreAfter.toFixed(3)} ` +
+      `(Δ ${result.improvement >= 0 ? "+" : ""}${result.improvement.toFixed(3)})\n`,
+  );
+  process.stdout.write(`[optimize] patch: ${join(result.outDir, "patch.json")}\n`);
+  if (result.applied) {
+    if (result.writtenTo) {
+      process.stdout.write(`[optimize] wrote patched YAML to ${result.writtenTo}\n`);
+    } else {
+      process.stdout.write(
+        `[optimize] patch ready (improvement ≥ ${improvementThreshold}). Re-run with --write-back to apply.\n`,
+      );
+    }
+  } else {
+    process.stdout.write(
+      `[optimize] no improvement above threshold ${improvementThreshold}; source untouched.\n`,
+    );
+  }
+}
+
+function makeAsyncIterable<T>(items: ReadonlyArray<T>): AsyncIterable<T> {
+  return {
+    async *[Symbol.asyncIterator]() {
+      for (const item of items) yield item;
+    },
+  };
 }
 
 async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
@@ -1395,6 +1714,9 @@ switch (subcommand) {
     break;
   case "eval-report":
     await runEvalReport(parseFor(rest, EVAL_REPORT_SCHEMA));
+    break;
+  case "optimize":
+    await runOptimize(parseFor(rest, OPTIMIZE_SCHEMA));
     break;
   case "doctor":
     runDoctor(parseFor(rest, DOCTOR_SCHEMA));

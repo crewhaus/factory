@@ -1,0 +1,9 @@
+# Single grader: case-insensitive containment of the expected output.
+# The terse default instructions tend to produce wordy answers; the
+# optimizer's rule-based provider biases toward "Be concise" rewrites
+# which improves grader pass-rate.
+graders:
+  - name: contains-expected
+    kind: contains
+    case_sensitive: false
+    field: expected_output

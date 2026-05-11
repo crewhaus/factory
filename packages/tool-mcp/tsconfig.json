@@ -5,6 +5,7 @@
     "outDir": "dist"
   },
   "references": [
+    { "path": "../boundary-classifier" },
     { "path": "../errors" },
     { "path": "../mcp-host" },
     { "path": "../tool-builder" },

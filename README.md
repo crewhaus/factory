@@ -42,11 +42,21 @@ ANTHROPIC_API_KEY=sk-... bun run run:hello
 
 The compiled agent is a self-contained TypeScript file that imports `@crewhaus/runtime-core` and runs a streaming chat loop with the configured model and instructions.
 
-## Design choices
+## Three architectural pillars
 
-- **TypeScript + Bun** primary runtime. Python is reserved for slots where the ecosystem genuinely outclasses TS — DSPy-style prompt optimization, and the eval/dataset stack (Ragas, HELM, lm-evaluation-harness).
-- **Spec → IR → target codegen** pipeline (per [`docs/AI-Harness-Systems.md`](docs/AI-Harness-Systems.md) §reference architecture). The IR is runtime-agnostic; backends are swappable.
-- **Generated bundles are runtime-thin**: they import `@crewhaus/runtime-core` rather than embedding everything. The eventual `bundle-packager` module can inline for distribution.
+Every change in this repo respects three invariants. They exist because the founding thesis in [`docs/AI-Harness-Systems.md`](docs/AI-Harness-Systems.md) only holds if all three stay true together. Contributors should read [`CLAUDE.md`](CLAUDE.md) for the rules each pillar produces.
+
+1. **The compiler is the protagonist.** Crewhaus is a meta-harness compiler, not "yet another agent loop." Specs flow through `parseSpec → lower → applyPasses → emit`; the IR is a discriminated union (`IrNode = IrV0 | IrWorkflowV0 | IrChannelV0 | IrGraphV0 | ...`) and each target shape consumes its own typed IR variant. New target shapes start at the IR, not at codegen. Walked through with file paths in [`docs/COMPILER-ARCHITECTURE.md`](docs/COMPILER-ARCHITECTURE.md).
+
+2. **Eval is active, not passive.** The empirical signal that the harness layer can deliver measurable accuracy gains is DSPy's MIPRO result (+13% on five of seven multi-stage programs). Crewhaus's eval stack closes the loop: eval failures produce *spec patches* via `crewhaus optimize`, not just HTML reports. The orchestration layer wires `eval-runner` (fitness) + `prompt-optimizer` (search via a `MutationProvider` interface, with both rule-based and Claude-driven providers shipping) + `spec-patch` (YAML CST round-trip with comment preservation) + optional write-back. See [`docs/recipes/42-active-optimization.md`](docs/recipes/42-active-optimization.md).
+
+3. **Security is a fabric, not a perimeter.** `prompt-injection-detector` fires at every cross-trust boundary, not just the front door. The `boundary-classifier` package centralises classification with `TrustOrigin` metadata — `"user" | "mcp" | "subagent" | "channel" | "federation" | "skill" | "compaction" | "tool"` — and a content-hash LRU cache. Authentication (mTLS, JWT) verifies *who*; classification verifies *what*. See [`docs/recipes/41-security-fabric.md`](docs/recipes/41-security-fabric.md).
+
+## Operating choices
+
+- **TypeScript + Bun** primary runtime. Python interop is reserved for slots where the ecosystem genuinely outclasses TS (today: nothing — the Claude-backed `MutationProvider` superseded the originally-deferred DSPy bridge for prompt optimisation; Ragas/HELM/lm-evaluation-harness datasets are consumed via shipped JSONL exports rather than a runtime bridge).
+- **Spec → IR → target codegen** pipeline. The IR is runtime-agnostic; backends are swappable. Twelve targets ship today (CLI, workflow, channel bot, stateful graph, managed multi-tenant, RAG pipeline, multi-agent crew, autonomous research, batch worker, voice/realtime, browser/computer-use, eval bundle).
+- **Generated bundles are runtime-thin**: they import `@crewhaus/runtime-core` rather than embedding everything. The `bundle-packager` module can inline for distribution.
 - **Streaming + prompt caching** in the runtime by default — these are core, not optional.
 
 ## Roadmap from this scaffold

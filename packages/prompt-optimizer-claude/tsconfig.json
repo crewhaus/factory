@@ -6,8 +6,9 @@
   },
   "references": [
     { "path": "../adapter-anthropic" },
-    { "path": "../boundary-classifier" },
-    { "path": "../errors" }
+    { "path": "../errors" },
+    { "path": "../eval-dataset" },
+    { "path": "../prompt-optimizer" }
   ],
   "include": ["src/**/*"]
 }

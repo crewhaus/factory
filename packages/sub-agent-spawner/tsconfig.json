@@ -7,6 +7,7 @@
   "references": [
     { "path": "../adapter-anthropic" },
     { "path": "../agent-context-isolation" },
+    { "path": "../boundary-classifier" },
     { "path": "../event-log" },
     { "path": "../permission-engine" },
     { "path": "../run-context" },

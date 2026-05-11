@@ -13,6 +13,7 @@
     "test": "bun test src"
   },
   "dependencies": {
+    "@crewhaus/boundary-classifier": "workspace:*",
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/mcp-host": "workspace:*",
     "@crewhaus/tool-builder": "workspace:*",

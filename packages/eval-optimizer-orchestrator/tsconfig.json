@@ -5,9 +5,11 @@
     "outDir": "dist"
   },
   "references": [
-    { "path": "../adapter-anthropic" },
-    { "path": "../boundary-classifier" },
-    { "path": "../errors" }
+    { "path": "../errors" },
+    { "path": "../eval-dataset" },
+    { "path": "../prompt-optimizer" },
+    { "path": "../spec" },
+    { "path": "../spec-patch" }
   ],
   "include": ["src/**/*"]
 }

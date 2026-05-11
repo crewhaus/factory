@@ -1,12 +1,30 @@
 # prompt-optimizer
 
-Status: planned
+Status: shipped (rule-based search v0). The model-driven mutation provider lives in [`prompt-optimizer-claude`](280-prompt-optimizer-claude.md) (brief 280); the orchestration that closes the active-optimisation loop lives in [`eval-optimizer-orchestrator`](279-eval-optimizer-orchestrator.md) (brief 279). User-facing entry: [`crewhaus optimize`](../../apps/cli/src/index.ts) ([recipe 42](../recipes/42-active-optimization.md)).
 Dependency phase: 9 - Telemetry & eval
 Catalog layer: R15 - Telemetry, Tracing, Eval
 Origin in ordering: named in Part G
-Workspace home: not created yet; likely packages/prompt-optimizer unless folded into a target bundle
+Workspace home: `packages/prompt-optimizer/`
 Targets: EVAL, CLI (advanced)
 Test layers: T1, T5
+
+## MutationProvider seam (added under Pillar 2 remediation)
+
+The original v0 of this package shipped 4 rule-based mutations hard-coded into the `optimize()` loop. The realignment refactored these into a `MutationProvider` interface so the search loop is decoupled from the mutation source:
+
+```ts
+export interface MutationProvider {
+  readonly name: string;
+  next(state: OptimizerState): Promise<ProviderMutation>;
+}
+```
+
+Two providers ship today:
+
+- `RuleBasedMutationProvider` (this package; default) — deterministic, seeded, ships the original 4 mutations.
+- `ClaudeMutationProvider` (`@crewhaus/prompt-optimizer-claude`; opt-in via `--mutator claude`) — model-driven rewriting that closes the L91 comment's gap.
+
+Future providers (a DSPy-bridge variant, an OPRO implementation, a domain-specific mutator) plug in via the same interface without touching the search loop.
 
 ## Purpose
 

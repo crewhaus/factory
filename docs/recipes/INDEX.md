@@ -99,6 +99,15 @@ Topics that don't fit cleanly above but matter once you start building real syst
 | 39 | [Channel: WhatsApp](39-channel-whatsapp.md)                     | §33       |
 | 40 | [Channel: iMessage](40-channel-imessage.md)                     | §33       |
 
+## Part G — The three architectural pillars (philosophy alignment)
+
+Recipes that map directly onto the invariants codified in [`/CLAUDE.md`](../../CLAUDE.md).
+
+| #  | Recipe                                                          | Pillar             | Status   |
+| -- | --------------------------------------------------------------- | ------------------ | -------- |
+| 41 | [Security fabric](41-security-fabric.md)                        | Pillar 3 — fabric  | complete |
+| 42 | [Active optimization](42-active-optimization.md)                | Pillar 2 — active  | complete |
+
 ---
 
 ## Suggested reading orders
