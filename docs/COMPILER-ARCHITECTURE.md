@@ -149,6 +149,58 @@ Then append your pass to `DEFAULT_PIPELINE` at [packages/ir-passes/src/index.ts:
 
 Passes must be **idempotent**: applying a pass twice must produce the same result as applying it once. Tests should include a fixed-point assertion (`pass(pass(ir)) === pass(ir)`).
 
+## The lossy lower, and how `crewhaus optimize` writes back
+
+`lower()` is intentionally lossy. The IR is sorted, frozen, deduped, env-var-rewritten — codegen wants those properties, but the path from the IR back to the user's hand-authored YAML is therefore one-way. That asymmetry is what Pillar 2 has to bridge: when an eval failure produces a mutation that should land in the source spec, the optimizer cannot patch the IR (no round-trip) and cannot regenerate the YAML from the IR (would erase the user's comments and key order). The only honest option is to patch the YAML itself.
+
+The mechanism is simpler than it sounds, because spec patches are addressed by **field paths** (`["agent", "instructions"]`), and those paths exist identically in the source YAML and in any structural representation of it. The `yaml` package's [`parseDocument`](https://eemeli.org/yaml/#documents) parses to a **concrete syntax tree (CST)** — the Document AST — whose API operates on the live tree:
+
+```ts
+// packages/spec-patch/src/index.ts
+import { parseDocument } from "yaml";
+
+const doc = parseDocument(yamlText);   // CST: keeps comments, key order, indentation
+doc.setIn(["agent", "instructions"], newPrompt);
+const newYaml = doc.toString();        // renders back; only the touched bytes change
+```
+
+That's it. No source map. No node-id table. No reverse mapping from IR back to YAML. Patches are addressed by spec path; the CST is addressed by spec path; the parser maintains the original surface form of every node it does not touch. A `--write-back` run leaves your comments where you put them, your indentation as you typed it, and your unrelated keys in the order you wrote them.
+
+### Why this is enough — and where the boundary lives
+
+The reason this works without an elaborate mapping table is that **`OPTIMIZABLE_PATHS` deliberately whitelists only fields whose lowering is field-preserving** ([packages/spec-patch/src/index.ts:186](../packages/spec-patch/src/index.ts)). The whitelist for the CLI target, for example:
+
+```ts
+cli: [
+  ["agent", "instructions"],     // string — survives lowering 1:1
+  ["compaction", "threshold"],   // number — survives lowering 1:1
+]
+```
+
+`agent.instructions` is a string in the spec, a string in the IR, and a string in the generated bundle. The patch path matches the spec path matches the CST path. Patching is safe.
+
+What is **deliberately excluded** from `OPTIMIZABLE_PATHS` for every target:
+
+- `permissions.rules` — deduped + reordered during `lowerPermissions`. The lowered order is not the source order, so a patch that targeted "rule 3" in the IR would land on the wrong line in the CST. The fix is not a smarter mapping; it is "don't autotune this field." Permission rules are security policy; they require human review anyway.
+- `permissions.mode` — security policy.
+- `mcp_servers.*` — host/transport config, security-sensitive.
+- `subAgents` (raw spec map) — lowered to an array sorted by name; the index path is not stable.
+- Anything secret-bearing — `lowerSecret` rewrites `$VAR` → `{kind:"env", name:"VAR"}`; the source string and the IR value have different shapes by design.
+
+The whitelist is the answer to "what happens if the optimizer tries to patch a rule that was deduped during lowering?" — it does not. `validatePatch` ([packages/spec-patch/src/index.ts:157](../packages/spec-patch/src/index.ts)) refuses any path that isn't in `OPTIMIZABLE_PATHS` for the spec's target. Adding a path to the whitelist is the explicit signal that "this field's lower is field-preserving and it is safe to autotune"; if you ever extend the optimisation surface, you owe a test that round-trips a comment-bearing YAML through `applySpecPatch` for the new path.
+
+### The contract, end to end
+
+| Stage | What it does | Why it cannot do the write-back |
+|---|---|---|
+| `parseSpec` | YAML → typed `Spec` (Zod-validated) | Discards comments / indentation; not invertible. |
+| `lower` | `Spec` → `IrNode` (sorted, frozen, deduped, env-rewritten) | Order-canonical; intentionally lossy. |
+| `applyPasses` | `IrNode` → optimised `IrNode` | Operates on a derivative of a derivative. |
+| `emit` | `IrNode` → `Bundle` (TypeScript source) | Pure codegen target. |
+| `applySpecPatch` | `(yamlText, SpecPatch)` → `{yaml, spec}` via the `yaml` CST | The only stage that touches the user's source bytes; preserves comments + key order. |
+
+When the eval optimizer produces a `SpecPatch` and the user runs `crewhaus optimize --write-back`, the pipeline that fires is: existing source YAML → `applySpecPatch` → mutated source YAML on disk. Re-running the compiler on the mutated source then runs the full lossy pipeline again — but the user's source remains the source of truth. See [recipes/42-active-optimization.md §What `--write-back` actually does](recipes/42-active-optimization.md) for a worked before/after.
+
 ## What lives where, summarised
 
 | Concern | Lives in |

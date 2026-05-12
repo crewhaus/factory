@@ -15,13 +15,14 @@
 4. [The 12 target shapes](#the-12-target-shapes)
 5. [Anatomy of a spec](#anatomy-of-a-spec)
 6. [How data moves through the system](#how-data-moves-through-the-system)
-7. [The CLI, end to end](#the-cli-end-to-end)
-8. [The runtime directory](#the-runtime-directory)
-9. [Tools, permissions, and skills](#tools-permissions-and-skills)
-10. [Observability and cost](#observability-and-cost)
-11. [Studio: the visual front door](#studio-the-visual-front-door)
-12. [Going further](#going-further)
-13. [Troubleshooting](#troubleshooting)
+7. [Debugging the compiler](#debugging-the-compiler)
+8. [The CLI, end to end](#the-cli-end-to-end)
+9. [The runtime directory](#the-runtime-directory)
+10. [Tools, permissions, and skills](#tools-permissions-and-skills)
+11. [Observability and cost](#observability-and-cost)
+12. [Studio: the visual front door](#studio-the-visual-front-door)
+13. [Going further](#going-further)
+14. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -150,7 +151,14 @@ you reach for the more specialized ones.
 
 ## Anatomy of a spec
 
-The smallest possible spec is five lines:
+The smallest possible spec is five lines. Read it for the shape; we
+add a `permissions:` block before introducing tools (next snippet)
+because **every spec that ever calls a tool should make a permission
+decision explicit** — a defaulted-away permission rule is the
+single most common source of "my agent did something I didn't expect"
+in production. The chat-only smallest example skips it (there are no
+tool calls to gate), but treat that as the exception, not the
+template.
 
 ```yaml
 # examples/hello-cli/crewhaus.yaml
@@ -162,6 +170,47 @@ agent:
     You are a helpful, concise assistant. Reply in two sentences or fewer
     unless the user asks for more detail.
 ```
+
+Once the agent has any tools, the next thing the spec should declare
+is its permission posture. The minimal addition is a `permissions:`
+block with `mode:` set explicitly — even leaving `rules: []` empty
+tells the runtime "I have thought about this and I want the default
+ask-on-destructive behaviour." That single declaration is what stops
+a new contributor from copy-pasting a spec and accidentally inheriting
+a permission posture they didn't choose:
+
+```yaml
+name: hello-with-tools
+target: cli
+agent:
+  model: claude-sonnet-4-6
+  instructions: You read files and answer questions about them.
+tools:
+  - read          # safe — gated by permissions.rules below
+permissions:
+  mode: default   # default | plan | auto | bypass (bypass: CLI-flag only)
+  rules:
+    - { type: alwaysAllow, pattern: Read }
+```
+
+The four modes are explained in
+[Tools, permissions, and skills](#tools-permissions-and-skills); the
+short version is `default` allows read-only, asks for destructive,
+which is the right shape for an interactive CLI. The lift from the
+five-line spec is one block — typing it out is the point. It is the
+moment in your learning where you internalise that **every tool call
+crosses a permission boundary**, and that boundary is named in
+the spec rather than hidden in framework defaults.
+
+For internet-exposed targets (`channel`, `managed`) the lift is one
+more idea on top: inbound text from Slack / Telegram / Discord /
+WhatsApp / iMessage / federation peers is *untrusted content* even
+after the adapter has cryptographically verified the sender, and the
+recipes for those targets show where to wire the `classifyBoundary`
+fabric call. See
+[Recipe 03 — Slack Bot, Step 6](recipes/03-slack-bot.md#step-6--classify-untrusted-inbound-text-security-primer)
+and [Recipe 41 — Security Fabric](recipes/41-security-fabric.md) once
+you reach that target shape.
 
 Adding tools, permissions, and an MCP server brings you to a
 production-shaped CLI:
@@ -348,6 +397,148 @@ Studio reads the same JSONL to render its trace timeline.
 
 ---
 
+## Debugging the compiler
+
+The diagram above is honest about *what* happens; this section is
+about *where to look* when the agent does something you didn't expect.
+A 50-line YAML lowers into multi-hundred-line generated TypeScript
+running against a runtime built from ~190 modules — that's a lot of
+distance between your intent and the running program. The system
+ships two compiler-equivalents-of-debugging-symbols that keep the
+distance crossable:
+
+1. **`crewhaus compile --emit-ir`** — print the intermediate
+   representation as JSON, *before* code generation runs. This is the
+   middleman of the whole pipeline. It shows you exactly what the
+   compiler decided your spec means after `lower()` normalised it
+   (sub-agent maps flattened to arrays, role names alphabetized,
+   secrets rewritten as env-var references, permission rules deduped
+   and reordered).
+2. **`.crewhaus/sessions/<id>.jsonl`** — the append-only trace of
+   every runtime decision. Each line is a single event: which model
+   call, which tool call, which permission decision, which compaction,
+   which error. This is the post-execution counterpart to `--emit-ir`:
+   the IR tells you what the compiler emitted; the JSONL tells you
+   what that emission actually *did*.
+
+### Inspecting the IR before codegen
+
+```bash
+# Print the IR as JSON to stdout
+bun apps/cli/src/index.ts compile examples/hello-cli/crewhaus.yaml --emit-ir
+
+# Or write it to disk for diffing across spec edits
+bun apps/cli/src/index.ts compile examples/hello-cli/crewhaus.yaml \
+    --emit-ir -o /tmp/hello-ir
+diff <(jq -S . /tmp/hello-ir-before/ir.json) \
+     <(jq -S . /tmp/hello-ir/ir.json)
+```
+
+The output is a typed JSON value matching one of the twelve `IrNode`
+variants listed under [The mental model](#the-mental-model). The
+`target` field tells you which variant you're looking at; everything
+else is what that target's emitter will receive verbatim. **If a
+field is missing from the IR, the target can't reference it** —
+that's the discriminated-union invariant the compiler enforces.
+
+This is the fastest way to answer questions like:
+
+- "Did my `$SLACK_BOT_TOKEN` reference lower to an env-var read, or
+  did the compiler bake a literal into the bundle?" → Look for
+  `"botToken": { "kind": "env", "name": "SLACK_BOT_TOKEN" }` in the
+  IR. If `kind` is `"literal"`, your `$` prefix is malformed (env
+  refs match `^\$[A-Z_][A-Z0-9_]*$` only).
+- "I have three `alwaysAllow` rules for `Read` — did dedup keep them
+  all?" → The IR's `permissions.rules` shows the canonical, deduped
+  set. If a rule you wrote is missing, an earlier rule subsumed it.
+- "Why doesn't my new MCP tool show up in the bundle?" → If the IR
+  doesn't list it under `mcp_servers`, the spec didn't parse it (most
+  often: a YAML indentation mistake silently put the block at the
+  wrong nesting level).
+
+### Reading the JSONL session trace
+
+When a tool call goes wrong at runtime, the JSONL is where the
+evidence lives. Walk through a concrete scenario:
+
+> You build a CLI agent that lists files with `glob`, picks one, and
+> tries to `write` to it. You forgot to grant `Write` in
+> `permissions.rules`. The agent crashes mid-turn with `tool refused:
+> permission denied`. Where is the *exact* moment the runtime made
+> that decision?
+
+```bash
+# 1. Find the session id — the run prints it on the first line.
+ls -t .crewhaus/sessions/ | head -2
+
+# 2. Look at the last few events of the failing turn.
+tail -n 20 .crewhaus/sessions/sess_<id>.jsonl | jq -c .
+
+# 3. Filter to the permission engine's verdicts only.
+jq -c 'select(.kind == "permission_decision")' \
+   .crewhaus/sessions/sess_<id>.jsonl
+```
+
+You'll see entries shaped like:
+
+```json
+{
+  "kind": "permission_decision",
+  "tool": "Write",
+  "input": { "path": "/tmp/notes.md" },
+  "outcome": "denied",
+  "matched_rule": null,
+  "reason": "no matching alwaysAllow rule; default mode denies destructive Write",
+  "session_id": "sess_…",
+  "turn_index": 4,
+  "ts": "2026-05-12T17:42:11.013Z"
+}
+```
+
+The `matched_rule: null` field is the smoking gun — no rule in your
+spec was specific enough to authorise the call, so the default policy
+ran. Adding `{ type: alwaysAllow, pattern: Write(**/tmp/**) }` to
+`permissions.rules` and recompiling lets the call through; running
+the same query after the fix shows `outcome: "allowed"` and the
+matching `matched_rule` populated.
+
+The same workflow applies to any other failure class:
+
+| Symptom in the REPL                          | Filter on the JSONL                                                                  |
+| -------------------------------------------- | ------------------------------------------------------------------------------------ |
+| Tool ran but produced garbage                | `select(.kind == "tool_result" and .tool == "<name>")`                               |
+| Agent went silent / stuck                    | `select(.kind == "error")` — the taxonomy field tells you whether it's recoverable.  |
+| Reply contradicts an earlier turn            | `select(.kind == "compaction")` — was the offending message snipped or summarised?   |
+| Cost looks wrong                             | `select(.kind == "cost_accrual") \| {turn_index, input_tokens, output_tokens, usd}`  |
+| Tool output was redacted unexpectedly        | `select(.kind == "permission_decision" and .outcome == "redacted")` — security fabric. |
+
+### Mapping a runtime error back to a spec line
+
+The JSONL records `session_id`, `turn_index`, and the model-facing
+`tool` name. The model-facing tool name (`Write`, `Bash`,
+`filesystem__read_file`) maps to the rule pattern in your spec; the
+permission rule that *should* have matched (or the one that
+unexpectedly blocked) is the line you want to edit. Two patterns
+worth knowing:
+
+- **Empty `matched_rule` plus `outcome: "denied"`** — your spec is
+  silent on this tool. Add an `alwaysAllow` rule with the narrowest
+  pattern that covers the call. The `input` field tells you the
+  argument so you can tighten beyond the bare tool name (e.g.
+  `Write(/tmp/**)` instead of `Write`).
+- **Populated `matched_rule` plus `outcome: "denied"`** — your spec
+  has an `alwaysDeny` or `alwaysAsk` rule winning over an
+  `alwaysAllow`. Recall the tier order: **deny > ask > allow**. The
+  IR view (`--emit-ir`) shows the rules in evaluation order; the
+  first matching `deny`/`ask` wins regardless of what comes after.
+
+If `--emit-ir` and the JSONL don't make a failure self-explanatory,
+the gap is a documentation bug — file it, because the
+intent-to-code mapping is supposed to be navigable from this
+section without diving into the runtime source.
+
+---
+
 ## The CLI, end to end
 
 The `crewhaus` CLI lives at
@@ -358,6 +549,7 @@ underlying invocation is always `bun apps/cli/src/index.ts <subcommand>`.
 | Subcommand                                   | Purpose                                                                                 |
 | -------------------------------------------- | --------------------------------------------------------------------------------------- |
 | `compile <spec> -o <out-dir>`                | Parse → IR → emit bundle to `<out-dir>`.                                                |
+| `compile <spec> --emit-ir [-o <out-dir>]`    | Print the lowered IR as JSON (or write `<out-dir>/ir.json`); skip codegen. See [Debugging the compiler](#debugging-the-compiler). |
 | `run <spec> [--model …] [--resume <id>]`     | Compile in-memory and execute (CLI shape only).                                         |
 | `init [name]`                                | Scaffold a fresh `crewhaus.yaml`.                                                       |
 | `doctor`                                     | Check Bun version, credentials, working spec, Docker availability for sandboxed tools.  |
