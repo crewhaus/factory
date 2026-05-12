@@ -38,6 +38,7 @@ import { createTaskTool } from "@crewhaus/tool-task";
  * crewhaus — slice-scope CLI.
  * Subcommands:
  *   compile <spec.yaml> -o <out-dir>     parse → IR → emit bundle to disk
+ *   compile <spec.yaml> --emit-ir        parse → IR → print IR JSON (no codegen)
  *   run <spec.yaml> [--model <model>]    compile in-memory and execute the agent
  *   init [name]                          scaffold a new crewhaus.yaml
  *   doctor                               check environment health
@@ -54,6 +55,7 @@ const logger = createLogger({ bindings: { app: "crewhaus" } });
 const COMPILE_SCHEMA: ParseArgsSchema = {
   flags: [
     { name: "out", short: "o", takesValue: true },
+    { name: "emit-ir", takesValue: false },
     { name: "help", short: "h" },
   ],
 };
@@ -220,6 +222,7 @@ function usage(): never {
       "",
       "subcommands:",
       "  compile <spec.yaml> -o <out-dir>     compile a spec to a runnable bundle",
+      "  compile <spec.yaml> --emit-ir        print the lowered IR as JSON (debug)",
       "  run <spec.yaml> [--model <model>]    compile in-memory and execute the agent",
       "                  [--resume <id>]      resume a prior session (event-log replay)",
       "  eval <spec.yaml> --dataset <data>    run the agent against a dataset and grade",
@@ -270,17 +273,21 @@ function parseFor(rest: ReadonlyArray<string>, schema: ParseArgsSchema): ParsedA
 
 function runCompile(args: ParsedArgs): void {
   if (args.flags["help"]) {
-    process.stdout.write("usage: crewhaus compile <spec.yaml> -o <out-dir>\n");
+    process.stdout.write(
+      "usage: crewhaus compile <spec.yaml> [-o <out-dir>] [--emit-ir]\n" +
+        "  --emit-ir  Skip code emission; print the lowered IR as JSON to\n" +
+        "             stdout (or to <out-dir>/ir.json when -o is set).\n",
+    );
     return;
   }
   const specPath = args.positional[0];
   const outDir = args.flags["out"];
+  const emitIr = args.flags["emit-ir"] === true;
   if (typeof specPath !== "string") die("missing <spec.yaml>");
-  if (typeof outDir !== "string") die("missing -o <out-dir>");
+  if (!emitIr && typeof outDir !== "string") die("missing -o <out-dir>");
 
   const absSpec = resolve(specPath);
-  const absOut = resolve(outDir);
-  logger.debug("compile.start", { spec: absSpec, out: absOut });
+  logger.debug("compile.start", { spec: absSpec, out: outDir, emitIr });
 
   let yamlText: string;
   try {
@@ -288,6 +295,30 @@ function runCompile(args: ParsedArgs): void {
   } catch (err) {
     die(`could not read ${absSpec}: ${(err as Error).message}`);
   }
+
+  if (emitIr) {
+    let ir: ReturnType<typeof lower>;
+    try {
+      ir = lower(parseSpec(yamlText));
+    } catch (err) {
+      if (err instanceof SpecParseError) die(err.message);
+      throw err;
+    }
+    const json = `${JSON.stringify(ir, null, 2)}\n`;
+    if (typeof outDir === "string") {
+      const absOut = resolve(outDir);
+      mkdirSync(absOut, { recursive: true });
+      const irPath = join(absOut, "ir.json");
+      writeFileSync(irPath, json);
+      process.stdout.write(`wrote ${irPath}\n`);
+    } else {
+      process.stdout.write(json);
+    }
+    logger.debug("compile.emit-ir.success", { out: outDir ?? "stdout" });
+    return;
+  }
+
+  const absOut = resolve(outDir as string);
 
   let bundle: ReturnType<typeof compile>;
   try {

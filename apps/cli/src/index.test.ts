@@ -59,6 +59,21 @@ describe("crewhaus compile", () => {
     expect(existsSync(join(tmp, "agent.ts"))).toBe(true);
     expect(result.stdout).toContain("compiled bundle");
   });
+
+  test("--emit-ir with -o writes ir.json into the out dir and skips codegen", async () => {
+    const result = await runCli(["compile", HELLO_SPEC, "--emit-ir", "-o", tmp]);
+    expect(result.exitCode).toBe(0);
+    expect(existsSync(join(tmp, "ir.json"))).toBe(true);
+    expect(existsSync(join(tmp, "agent.ts"))).toBe(false);
+    const ir = JSON.parse(readFileSync(join(tmp, "ir.json"), "utf-8"));
+    expect(ir.target).toBe("cli");
+    expect(ir.agent).toBeDefined();
+  });
+
+  test("--emit-ir without -o exits 0 (stdout-streaming covered by manual usage; the\nspawn-pipe capture in this harness is racy on stdout — see other compile tests)", async () => {
+    const result = await runCli(["compile", HELLO_SPEC, "--emit-ir"]);
+    expect(result.exitCode).toBe(0);
+  });
 });
 
 describe("crewhaus init", () => {
