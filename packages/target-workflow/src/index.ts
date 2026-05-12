@@ -183,6 +183,8 @@ import { loadCommands } from "@crewhaus/slash-commands";
 ${mcpWarning}import { runChatLoop } from "@crewhaus/runtime-core";
 ${permImport}${extensionImports}${importBlock}
 async function readStdinToEnd(): Promise<string> {
+  // No piped input — don't block waiting on an interactive TTY.
+  if (process.stdin.isTTY) return "";
   const chunks: Buffer[] = [];
   for await (const chunk of process.stdin) {
     chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
