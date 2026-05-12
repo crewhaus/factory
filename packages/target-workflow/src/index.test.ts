@@ -71,6 +71,14 @@ describe("emitWorkflow", () => {
     expect(c).toContain('stdinInput || "begin"');
   });
 
+  test("readStdinToEnd short-circuits when stdin is a TTY (no piped input)", () => {
+    // Without this check the for-await loop blocks forever on an
+    // interactive terminal — the symptom users hit when they run
+    // `bun run run:hello-workflow` without piping anything in.
+    const c = emitWorkflow(TWO_STEP_IR).files[0]?.content ?? "";
+    expect(c).toContain("process.stdin.isTTY");
+  });
+
   test("tools imports are deduped and grouped by package", () => {
     const ir: IrWorkflowV0 = {
       ...TWO_STEP_IR,
