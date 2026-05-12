@@ -137,14 +137,17 @@ describe("AnthropicAdapter", () => {
     // Match the real SDK's APIConnectionError shape: no .status, no .error.
     (sdkLikeError as { name: string }).name = "APIConnectionError";
 
+    // Iterator that rejects on first .next() — models a mid-stream SSE
+    // error where the SDK's iterator throws after the stream is opened.
+    // Avoids `async function*` (which biome flags as useYield when there
+    // are no yields, even though throw-only generators are valid).
     const client = {
       messages: {
-        stream: ((_params: Anthropic.MessageStreamParams) =>
-          (async function* () {
-            throw sdkLikeError;
-            // biome-ignore lint/correctness/useYield: unreachable yield satisfies the generator contract
-            yield {} as Anthropic.RawMessageStreamEvent;
-          })()) as unknown as Anthropic["messages"]["stream"],
+        stream: ((_params: Anthropic.MessageStreamParams) => ({
+          [Symbol.asyncIterator]() {
+            return { next: () => Promise.reject(sdkLikeError) };
+          },
+        })) as unknown as Anthropic["messages"]["stream"],
       },
     } as unknown as Anthropic;
 
@@ -165,14 +168,17 @@ describe("AnthropicAdapter", () => {
     const sdkLikeError = new Error("Connection error.");
     (sdkLikeError as { name: string }).name = "APIConnectionError";
 
+    // Iterator that rejects on first .next() — models a mid-stream SSE
+    // error where the SDK's iterator throws after the stream is opened.
+    // Avoids `async function*` (which biome flags as useYield when there
+    // are no yields, even though throw-only generators are valid).
     const client = {
       messages: {
-        stream: ((_params: Anthropic.MessageStreamParams) =>
-          (async function* () {
-            throw sdkLikeError;
-            // biome-ignore lint/correctness/useYield: unreachable yield satisfies the generator contract
-            yield {} as Anthropic.RawMessageStreamEvent;
-          })()) as unknown as Anthropic["messages"]["stream"],
+        stream: ((_params: Anthropic.MessageStreamParams) => ({
+          [Symbol.asyncIterator]() {
+            return { next: () => Promise.reject(sdkLikeError) };
+          },
+        })) as unknown as Anthropic["messages"]["stream"],
       },
     } as unknown as Anthropic;
 
