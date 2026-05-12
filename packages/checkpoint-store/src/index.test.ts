@@ -185,20 +185,28 @@ describe("drop", () => {
 });
 
 describe("stress (T7-lite)", () => {
-  test("saving 500 checkpoints round-trips correctly", async () => {
-    const grun = newGraphRunId();
-    let parent: string | undefined;
-    for (let i = 0; i < 500; i += 1) {
-      const cp = await store.save({
-        graphRunId: grun,
-        nodeName: `n${i}`,
-        state: { i },
-        ...(parent !== undefined ? { parentCheckpointId: parent } : {}),
-      });
-      parent = cp.id;
-    }
-    const list = await store.list(grun);
-    expect(list.length).toBe(500);
-    expect(list[499]?.state).toEqual({ i: 499 });
-  });
+  // 500 sequential async fs writes is tight against bun:test's 5 s default
+  // on shared CI runners — observed 5.3 s with 5 s budget. The 15 s budget
+  // gives ~3× headroom without sacrificing the stress shape (still 500
+  // round-trips against real disk).
+  test(
+    "saving 500 checkpoints round-trips correctly",
+    async () => {
+      const grun = newGraphRunId();
+      let parent: string | undefined;
+      for (let i = 0; i < 500; i += 1) {
+        const cp = await store.save({
+          graphRunId: grun,
+          nodeName: `n${i}`,
+          state: { i },
+          ...(parent !== undefined ? { parentCheckpointId: parent } : {}),
+        });
+        parent = cp.id;
+      }
+      const list = await store.list(grun);
+      expect(list.length).toBe(500);
+      expect(list[499]?.state).toEqual({ i: 499 });
+    },
+    15_000,
+  );
 });
