@@ -209,6 +209,7 @@
       "version": "0.0.0",
       "dependencies": {
         "@crewhaus/hooks-engine": "workspace:*",
+        "@crewhaus/permission-engine": "workspace:*",
         "@crewhaus/runtime-core": "workspace:*",
         "@crewhaus/skills-registry": "workspace:*",
         "@crewhaus/slash-commands": "workspace:*",

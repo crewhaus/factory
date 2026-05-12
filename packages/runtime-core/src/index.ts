@@ -764,7 +764,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         approved = await askApproval(tu.name, tu.input);
         if (!approved) denialMessage = "tool denied by user";
       } else {
-        denialMessage = "tool denied (single-turn mode: cannot prompt for interactive approval)";
+        denialMessage =
+          `tool denied: \`${tu.name}\` defaulted to "ask" and single-turn mode has no interactive surface to prompt on. ` +
+          `Add an explicit rule to permissions.rules in your spec, e.g. \`{ type: alwaysAllow, pattern: ${tu.name} }\`, or run in REPL mode where "ask" can prompt.`;
       }
     }
     if (!approved) {
