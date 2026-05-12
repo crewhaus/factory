@@ -275,14 +275,16 @@ you can wire the same check yourself with a `pre-model` hook today:
   "hooks": {
     "pre-model": [
       {
-        "command": "bun run scripts/classify-inbound.ts"
+        "command": "bun scripts/classify-inbound.ts"
       }
     ]
   }
 }
 ```
 
-The hook reads the inbound text from `$CREWHAUS_USER_MESSAGE`, calls
+The hook script (`bun <file>` executes it directly — this is your
+own script, not a `package.json` entry) reads the inbound text from
+`$CREWHAUS_USER_MESSAGE`, calls
 `classifyBoundary(text, { origin: "channel" })`, and emits a
 `{"decision":"deny","reason":...}` JSON object on stdout when the
 classifier blocks. The hook engine short-circuits before the model
