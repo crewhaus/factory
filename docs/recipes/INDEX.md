@@ -1,11 +1,10 @@
 # Recipes
 
 > Task-oriented walkthroughs for every major feature of crewhaus-factory.
-> The first five recipes are **complete**; the remaining 35 are stubs
-> with accurate pointers to code, examples, and module catalog entries
-> that future authors can build on.
->
-> Complete recipes: 01, 02, 03, 12, 17.
+> All 42 recipes are **complete** as of 2026-05-11. Every recipe is
+> statically validated by `bun run recipes:test` and every recipe with
+> a `compile:*` script in its frontmatter is also compile-smoke
+> validated by `bun run recipes:smoke`.
 
 If you're new here, start with [`docs/GETTING-STARTED.md`](../GETTING-STARTED.md)
 first. Each recipe assumes you've read it.
@@ -28,14 +27,14 @@ runnable from a 5–30 line spec and a one-line `bun run …`.
 | 01 | [CLI Coding Agent](01-cli-coding-agent.md)               | `cli`       | [`examples/hello-cli`](../../examples/hello-cli)                  | complete |
 | 02 | [Sequential Workflow](02-sequential-workflow.md)         | `workflow`  | [`examples/hello-workflow`](../../examples/hello-workflow)        | complete |
 | 03 | [Slack Bot](03-slack-bot.md)                             | `channel`   | [`examples/hello-channel`](../../examples/hello-channel)          | complete |
-| 04 | [Multi-Agent Crew](04-multi-agent-crew.md)               | `crew`      | [`examples/hello-crew`](../../examples/hello-crew)                | stub     |
-| 05 | [Stateful Graph](05-stateful-graph.md)                   | `graph`     | [`examples/hello-graph`](../../examples/hello-graph)              | stub     |
-| 06 | [RAG Pipeline](06-rag-pipeline.md)                       | `pipeline`  | [`examples/hello-rag`](../../examples/hello-rag)                  | stub     |
-| 07 | [Autonomous Research](07-autonomous-research.md)         | `research`  | [`examples/hello-research`](../../examples/hello-research)        | stub     |
-| 08 | [Batch Worker](08-batch-worker.md)                       | `batch`     | [`examples/hello-batch`](../../examples/hello-batch)              | stub     |
-| 09 | [Voice Agent](09-voice-agent.md)                         | `voice`     | [`examples/hello-voice`](../../examples/hello-voice)              | stub     |
-| 10 | [Browser Agent](10-browser-agent.md)                     | `browser`   | [`examples/hello-browser`](../../examples/hello-browser)          | stub     |
-| 11 | [Managed Multitenant](11-managed-multitenant.md)         | `managed`   | [`examples/hello-managed`](../../examples/hello-managed)          | stub     |
+| 04 | [Multi-Agent Crew](04-multi-agent-crew.md)               | `crew`      | [`examples/hello-crew`](../../examples/hello-crew)                | complete |
+| 05 | [Stateful Graph](05-stateful-graph.md)                   | `graph`     | [`examples/hello-graph`](../../examples/hello-graph)              | complete |
+| 06 | [RAG Pipeline](06-rag-pipeline.md)                       | `pipeline`  | [`examples/hello-rag`](../../examples/hello-rag)                  | complete |
+| 07 | [Autonomous Research](07-autonomous-research.md)         | `research`  | [`examples/hello-research`](../../examples/hello-research)        | complete |
+| 08 | [Batch Worker](08-batch-worker.md)                       | `batch`     | [`examples/hello-batch`](../../examples/hello-batch)              | complete |
+| 09 | [Voice Agent](09-voice-agent.md)                         | `voice`     | [`examples/hello-voice`](../../examples/hello-voice)              | complete |
+| 10 | [Browser Agent](10-browser-agent.md)                     | `browser`   | [`examples/hello-browser`](../../examples/hello-browser)          | complete |
+| 11 | [Managed Multitenant](11-managed-multitenant.md)         | `managed`   | [`examples/hello-managed`](../../examples/hello-managed)          | complete |
 | 12 | [Eval Harness](12-eval-harness.md)                       | `eval`      | [`examples/hello-eval`](../../examples/hello-eval)                | complete |
 
 ## Part B — Core capabilities
@@ -44,10 +43,10 @@ Cross-cutting features that compose into every shape.
 
 | #  | Recipe                                                       | Catalog       | Status   |
 | -- | ------------------------------------------------------------ | ------------- | -------- |
-| 13 | [MCP Servers](13-mcp-servers.md)                             | §9            | stub     |
-| 14 | [Hooks](14-hooks.md)                                         | §11           | stub     |
-| 15 | [Skills](15-skills.md)                                       | §11           | stub     |
-| 16 | [Slash Commands](16-slash-commands.md)                       | §11           | stub     |
+| 13 | [MCP Servers](13-mcp-servers.md)                             | §9            | complete |
+| 14 | [Hooks](14-hooks.md)                                         | §11           | complete |
+| 15 | [Skills](15-skills.md)                                       | §11           | complete |
+| 16 | [Slash Commands](16-slash-commands.md)                       | §11           | complete |
 | 17 | [Observability](17-observability.md)                         | §15, §27, §37 | complete |
 
 ## Part C — Production hardening
@@ -123,15 +122,15 @@ Recipes that map directly onto the invariants codified in [`/CLAUDE.md`](../../C
 
 | Total recipes | Status                  |
 | ------------- | ----------------------- |
-| 40            | Total                   |
-| 5             | Walkthrough complete (01, 02, 03, 12, 17) |
-| 35            | Stub                    |
+| 42            | Total (01-40 + pillar recipes 41, 42) |
+| 42            | Walkthrough complete    |
+| 0             | Stub                    |
 
-Contributions welcome. Each stub already lists the example, codegen
-package, runtime modules, and catalog section relevant to its topic —
-the body should walk a new reader from "I have an empty workspace" to
-"I have a working spec, runnable, with the feature in question
-exercised." Aim for ~200–400 lines of prose per recipe.
+Each recipe walks from "I have an empty workspace" to "I have a
+working spec, runnable, with the feature in question exercised." Most
+land between 250 and 450 lines of prose, with embedded YAML
+snippets and `bun run …` commands that the static validator
+re-compiles on every PR.
 
 ## Testing recipes
 
