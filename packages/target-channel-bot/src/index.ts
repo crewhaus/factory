@@ -477,13 +477,20 @@ export function createGateway(config: GatewayConfig): Gateway {
       // event
       const seen = remember(parsed.event.idempotencyKey);
       if (seen) return new Response("duplicate", { status: 200 });
-      // Fire-and-await: respond after handling so Slack records success.
-      try {
-        await config.sessionRouter.handle(parsed.event, adapter);
-      } catch (err) {
-        process.stderr.write(\`[gateway] handler error: \${(err as Error).message}\\n\`);
-        return new Response("handler error", { status: 500 });
-      }
+      // Slack expects an ACK within 3 s (and Telegram/Discord/WhatsApp have
+      // similar tight inbound windows). Drive the model turn asynchronously
+      // so the model's inner-loop latency — and any transient API error —
+      // can't bubble into the webhook response. The channel adapter's own
+      // outbound (chat.postMessage, sendMessage, etc.) delivers the reply
+      // when the turn finishes. Errors are surfaced via stderr; the
+      // operator's observability stack catches them there.
+      queueMicrotask(() => {
+        config.sessionRouter.handle(parsed.event, adapter).catch((err) => {
+          process.stderr.write(
+            \`[gateway] handler error (\${parsed.event.idempotencyKey}): \${(err as Error).message}\\n\`,
+          );
+        });
+      });
       return new Response("ok", { status: 200 });
     },
   };

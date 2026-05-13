@@ -229,6 +229,23 @@ describe("emitChannelBot — gateway.ts", () => {
     // /events$ tail to confirm the routing pattern is in place.
     expect(c).toContain("/events$/");
   });
+
+  test("ACKs 200 immediately and dispatches the model turn asynchronously", () => {
+    // Slack/Telegram/Discord/WhatsApp all expect a fast ACK on inbound
+    // webhooks (Slack's documented bound is 3 s). Driving the model turn
+    // synchronously would block the response and surface transient API
+    // errors as 500s, prompting platform-side retries and duplicate work.
+    // Confirm the generated handler dispatches the model call out-of-band
+    // and never returns 500 from the inline handler path.
+    const c = fileMap(MIN_IR).get("gateway.ts") ?? "";
+    expect(c).toContain("queueMicrotask(");
+    expect(c).toContain("config.sessionRouter.handle(parsed.event, adapter).catch");
+    // The 500-on-handler-error branch from the prior synchronous-await
+    // implementation should be gone. Any remaining `status: 500` in this
+    // file would indicate a regression.
+    expect(c).not.toContain("status: 500");
+    expect(c).not.toContain('"handler error"');
+  });
 });
 
 describe("emitChannelBot — error cases", () => {
