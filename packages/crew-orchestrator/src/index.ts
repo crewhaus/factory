@@ -384,6 +384,20 @@ async function* driveCrew(
       a2aDepth += 1;
       const savedRole = currentRoleName;
       currentRoleName = toRole;
+      // Bracket the peer's inline `runChatLoop` with a2a_turn_start /
+      // a2a_turn_end markers in the shared session log. A later role's
+      // `replayMessageHistory` uses these to skip the peer's nested
+      // user/assistant messages — otherwise the parent role's `tool_use`
+      // (SendMessage) ends up separated from its `tool_result` by the
+      // peer's seed + reply, and Claude API rejects the unpaired
+      // `tool_use` on the next resume. These markers are internal to
+      // replay; they bypass `recordEvent` (which only surfaces
+      // user-visible CrewEvent kinds to the trace bus) and append
+      // directly to the JSONL — mirroring sub-agent-spawner's pattern.
+      await eventLog.append({
+        kind: "a2a_turn_start",
+        payload: { from: savedRole, to: toRole },
+      });
       try {
         const reply = await runChatLoop({
           model: peerDef.model,
@@ -419,6 +433,12 @@ async function* driveCrew(
         firstTurn = false;
         return reply;
       } finally {
+        // Close the bracket BEFORE restoring orchestrator state — the
+        // marker must land in the log even if `runChatLoop` threw.
+        await eventLog.append({
+          kind: "a2a_turn_end",
+          payload: { from: savedRole, to: toRole },
+        });
         currentRoleName = savedRole;
         a2aDepth -= 1;
       }

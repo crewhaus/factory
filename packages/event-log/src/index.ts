@@ -47,6 +47,16 @@ export type EventKind =
   | "role_end"
   | "handoff"
   | "a2a_message"
+  // a2a_turn_start / a2a_turn_end bracket the nested inline `runChatLoop`
+  // an A2A peer call drives. Because every role in a crew shares one
+  // session JSONL, the peer's `user_message` + `assistant_message`
+  // events land in the parent's log; on a later role's `resume`,
+  // `replayMessageHistory` uses these markers to skip the peer's nested
+  // transcript and keep the parent's `tool_use → tool_result` pair
+  // immediately adjacent (Claude API requires it). Symmetric to
+  // `sub_agent_start/end` for Section-13 sub-agents.
+  | "a2a_turn_start"
+  | "a2a_turn_end"
   | "crew_done";
 
 export type Event = {
