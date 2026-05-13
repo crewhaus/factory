@@ -410,3 +410,53 @@ describe("Crew end-to-end (programmable adapter)", () => {
     }
   });
 });
+
+describe("refusal-loop guard — refusalDepth boundary (T8 supplement)", () => {
+  // The T8 ping-pong test above asserts the default `refusalDepth=2`
+  // guard. This boundary check covers `refusalDepth=1`, which trips on
+  // the second consecutive handoff. Together they pin the guard
+  // mathematically — `consecutiveHandoffs > refusalDepth` — without
+  // depending on a live model. (The Section-22 smoke previously tried
+  // to verify the same invariant via a live haiku-4.5 crew, but modern
+  // models recognise the bounce trap and refuse to call Handoff at all,
+  // so the guard never fires there.)
+  test("refusalDepth=1 trips on the second consecutive handoff", async () => {
+    const root = newTempRoot();
+    try {
+      const adapter = makeProgrammableAdapter(({ seed, previousToolResults }) => {
+        if (previousToolResults.length > 0) {
+          return [{ type: "text", text: "[handoff issued]" }];
+        }
+        const target = seed.includes("[Handoff from a]") ? "a" : "b";
+        return [
+          {
+            type: "tool_use",
+            id: `t_ho_${target}`,
+            name: "Handoff",
+            input: { target, reason: "ping-pong" },
+          },
+        ];
+      });
+
+      const crew = Crew()
+        .setName("tight-refusal")
+        .addRole("a", { model: "stub", instructions: "a." })
+        .addRole("b", { model: "stub", instructions: "b." })
+        .setEntry("a")
+        .compile();
+
+      await expect(
+        collect(
+          crew.run("go", {
+            sessionRootDir: root,
+            _adapter: adapter,
+            maxActivations: 32,
+            refusalDepth: 1,
+          }),
+        ),
+      ).rejects.toBeInstanceOf(HandoffRefusedError);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
