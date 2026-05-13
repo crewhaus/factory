@@ -410,3 +410,260 @@ describe("Crew end-to-end (programmable adapter)", () => {
     }
   });
 });
+
+describe("A2A → Handoff transcript hygiene", () => {
+  // Regression test for the bug where role A's SendMessage tool_use + the
+  // peer's nested transcript + the SendMessage tool_result interleave in
+  // the shared session JSONL, and a later role's resumed history replays
+  // them in literal order — leaving the parent's tool_use unpaired
+  // (Claude API rejects with "tool_use ids were found without
+  // tool_result blocks immediately after"). The a2a_turn_start /
+  // a2a_turn_end markers let replayMessageHistory skip the peer's nested
+  // events so the parent's tool_use / tool_result stay adjacent.
+  test("the role after a SendMessage→Handoff sees adjacent tool_use+tool_result, no peer turn", async () => {
+    const root = newTempRoot();
+    try {
+      // Capture the messages array each role sees when its adapter is
+      // called for the FIRST time on that turn (i.e. the seed, before
+      // any tool_result has come back). The third role's first messages
+      // is what would reproduce the bug if the markers didn't work.
+      const firstMessagesByRole = new Map<string, Anthropic.MessageParam[]>();
+      const callsByRole = new Map<string, number>();
+
+      const adapter: ProviderAdapter = {
+        providerId: "anthropic",
+        features: {
+          caching: "explicit",
+          tool_use: true,
+          vision: true,
+          thinking: true,
+          web_search: true,
+        },
+        estimateTokens: () => 0,
+        stream: ({ messages }) => {
+          // Figure out which role we're on by inspecting the LAST user
+          // message text. Each role's seed user content is identifiable.
+          const last = messages[messages.length - 1];
+          let lastText = "";
+          if (last?.content && typeof last.content === "string") {
+            lastText = last.content;
+          } else if (last?.content && Array.isArray(last.content)) {
+            for (const block of last.content) {
+              if ("text" in block && typeof block.text === "string") lastText = block.text;
+            }
+          }
+          // First call for role A: seed is "begin". Emit SendMessage(b).
+          // Second call for role A: tool_result back. Emit Handoff(c).
+          // Third call for role A: Handoff tool_result back. End turn.
+          // Role B: peer turn, returns short reply.
+          // Role C: should see no peer turn in its messages.
+          let role: string;
+          if (lastText.includes("[A2A from a → b]")) {
+            role = "b";
+          } else if (lastText.includes("[Handoff from a]")) {
+            role = "c";
+          } else {
+            role = "a";
+          }
+          const callIdx = (callsByRole.get(role) ?? 0) + 1;
+          callsByRole.set(role, callIdx);
+          if (callIdx === 1) {
+            firstMessagesByRole.set(
+              role,
+              messages.map((m) => ({ ...m })) as Anthropic.MessageParam[],
+            );
+          }
+
+          // Decide the response.
+          let blocks: Anthropic.ContentBlock[];
+          if (role === "b") {
+            // Peer responds with text.
+            blocks = [{ type: "text", text: "peer reply: data is from Wikipedia" }];
+          } else if (role === "c") {
+            // Receiver of Handoff — just end turn.
+            blocks = [{ type: "text", text: "c done" }];
+          } else if (role === "a" && callIdx === 1) {
+            blocks = [
+              {
+                type: "tool_use",
+                id: "tu_send",
+                name: "SendMessage",
+                input: { target: "b", payload: "where is the data from?" },
+              },
+            ];
+          } else if (role === "a" && callIdx === 2) {
+            blocks = [
+              {
+                type: "tool_use",
+                id: "tu_ho",
+                name: "Handoff",
+                input: { target: "c", reason: "you take it from here" },
+              },
+            ];
+          } else {
+            blocks = [{ type: "text", text: "a end" }];
+          }
+
+          const hasToolUse = blocks.some((b) => b.type === "tool_use");
+          return (async function* () {
+            yield { kind: "message_start" } as StreamEvent;
+            for (let idx = 0; idx < blocks.length; idx++) {
+              const block = blocks[idx];
+              if (!block) continue;
+              if (block.type === "text") {
+                yield {
+                  kind: "content_block_start",
+                  index: idx,
+                  block: { type: "text", text: "" },
+                } as StreamEvent;
+                yield {
+                  kind: "content_block_delta",
+                  index: idx,
+                  delta: { type: "text_delta", text: block.text },
+                } as StreamEvent;
+                yield { kind: "content_block_stop", index: idx } as StreamEvent;
+              } else if (block.type === "tool_use") {
+                yield {
+                  kind: "content_block_start",
+                  index: idx,
+                  block: { type: "tool_use", id: block.id, name: block.name, input: {} },
+                } as StreamEvent;
+                yield {
+                  kind: "content_block_delta",
+                  index: idx,
+                  delta: {
+                    type: "input_json_delta",
+                    partial_json: JSON.stringify(block.input ?? {}),
+                  },
+                } as StreamEvent;
+                yield { kind: "content_block_stop", index: idx } as StreamEvent;
+              }
+            }
+            yield {
+              kind: "message_delta",
+              stopReason: hasToolUse ? "tool_use" : "end_turn",
+            } as StreamEvent;
+            yield { kind: "message_stop" } as StreamEvent;
+          })();
+        },
+      };
+
+      const crew = Crew()
+        .setName("a2a-then-handoff")
+        .addRole("a", { model: "stub", instructions: "a." })
+        .addRole("b", { model: "stub", instructions: "b." })
+        .addRole("c", { model: "stub", instructions: "c." })
+        .setEntry("a")
+        .compile();
+
+      const events = await collect(
+        crew.run("begin", { sessionRootDir: root, _adapter: adapter, maxActivations: 8 }),
+      );
+
+      // Sanity: run completed via crew_done with c as the final role.
+      const done = events[events.length - 1];
+      expect(done?.kind).toBe("crew_done");
+
+      // The interesting assertion: role C's first-call messages must
+      // contain role A's `tool_use` (SendMessage) IMMEDIATELY followed
+      // by a `tool_result` user message — i.e. the peer's nested
+      // user/assistant pair must NOT appear in C's replayed history.
+      const cFirst = firstMessagesByRole.get("c");
+      expect(cFirst).toBeDefined();
+      if (cFirst === undefined) throw new Error("c first messages missing");
+
+      // Walk the message list; for every assistant message containing a
+      // tool_use, the next message must be a user with a matching
+      // tool_result block. This is the exact pairing Anthropic requires.
+      for (let i = 0; i < cFirst.length; i++) {
+        const m = cFirst[i];
+        if (m?.role !== "assistant") continue;
+        if (!Array.isArray(m.content)) continue;
+        for (const block of m.content) {
+          if ("type" in block && block.type === "tool_use") {
+            const next = cFirst[i + 1];
+            expect(next?.role).toBe("user");
+            const nextContent = next?.content;
+            if (!Array.isArray(nextContent)) {
+              throw new Error(
+                `expected array content after tool_use ${block.id}; got: ${JSON.stringify(next)}`,
+              );
+            }
+            const result = nextContent.find(
+              (b) =>
+                "type" in b &&
+                b.type === "tool_result" &&
+                (b as { tool_use_id?: string }).tool_use_id === block.id,
+            );
+            expect(result).toBeDefined();
+          }
+        }
+      }
+
+      // Defense in depth: C's history must NOT contain the peer's
+      // [A2A from a → b] seed user message.
+      const peerSeedSeen = cFirst.some((m) => {
+        if (typeof m.content === "string") return m.content.includes("[A2A from a → b]");
+        if (Array.isArray(m.content)) {
+          return m.content.some(
+            (b) => "text" in b && typeof b.text === "string" && b.text.includes("[A2A from a → b]"),
+          );
+        }
+        return false;
+      });
+      expect(peerSeedSeen).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("refusal-loop guard — refusalDepth boundary (T8 supplement)", () => {
+  // The T8 ping-pong test above asserts the default `refusalDepth=2`
+  // guard. This boundary check covers `refusalDepth=1`, which trips on
+  // the second consecutive handoff. Together they pin the guard
+  // mathematically — `consecutiveHandoffs > refusalDepth` — without
+  // depending on a live model. (The Section-22 smoke previously tried
+  // to verify the same invariant via a live haiku-4.5 crew, but modern
+  // models recognise the bounce trap and refuse to call Handoff at all,
+  // so the guard never fires there.)
+  test("refusalDepth=1 trips on the second consecutive handoff", async () => {
+    const root = newTempRoot();
+    try {
+      const adapter = makeProgrammableAdapter(({ seed, previousToolResults }) => {
+        if (previousToolResults.length > 0) {
+          return [{ type: "text", text: "[handoff issued]" }];
+        }
+        const target = seed.includes("[Handoff from a]") ? "a" : "b";
+        return [
+          {
+            type: "tool_use",
+            id: `t_ho_${target}`,
+            name: "Handoff",
+            input: { target, reason: "ping-pong" },
+          },
+        ];
+      });
+
+      const crew = Crew()
+        .setName("tight-refusal")
+        .addRole("a", { model: "stub", instructions: "a." })
+        .addRole("b", { model: "stub", instructions: "b." })
+        .setEntry("a")
+        .compile();
+
+      await expect(
+        collect(
+          crew.run("go", {
+            sessionRootDir: root,
+            _adapter: adapter,
+            maxActivations: 32,
+            refusalDepth: 1,
+          }),
+        ),
+      ).rejects.toBeInstanceOf(HandoffRefusedError);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});

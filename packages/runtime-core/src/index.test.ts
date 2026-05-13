@@ -1216,6 +1216,118 @@ describe("runChatLoop — Section 10 persistence", () => {
     expect(json.lastTurnIndex).toBeGreaterThanOrEqual(1);
   });
 
+  test("replayMessageHistory skips events bracketed by a2a_turn / sub_agent markers", async () => {
+    // The parent role's tool_use (e.g. SendMessage) followed by the
+    // peer's nested transcript would otherwise produce an unpaired
+    // tool_use in the replayed history — Claude API rejects with
+    // `tool_use ids were found without tool_result blocks immediately
+    // after`. The marker pair lets replay skip the peer's events while
+    // keeping the parent's tool_use / tool_result adjacent.
+    const sessionId = "sess_bbbbbbbbbbbbbbbb";
+    const { openEventLog } = await import("@crewhaus/event-log");
+    const log = await openEventLog(sessionId, { rootDir: SHARED_SESSION_ROOT });
+    // Parent emits a tool_use SendMessage in an assistant message.
+    await log.append({ kind: "user_message", payload: { content: "begin" } });
+    await log.append({
+      kind: "assistant_message",
+      payload: {
+        content: [
+          {
+            type: "tool_use",
+            id: "tu_send",
+            name: "SendMessage",
+            input: { target: "critic", payload: "q?" },
+          },
+        ],
+      },
+    });
+    // A2A peer turn starts → these user/assistant events must be skipped.
+    await log.append({ kind: "a2a_turn_start", payload: { from: "writer", to: "critic" } });
+    await log.append({
+      kind: "user_message",
+      payload: { content: "[A2A from writer → critic]\n\nq?" },
+    });
+    await log.append({
+      kind: "assistant_message",
+      payload: { content: [{ type: "text", text: "critic answer", citations: null }] },
+    });
+    await log.append({ kind: "a2a_turn_end", payload: { from: "writer", to: "critic" } });
+    // Parent receives the SendMessage tool_result.
+    await log.append({
+      kind: "user_message",
+      payload: {
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "tu_send",
+            content: "critic answer",
+            is_error: false,
+          },
+        ],
+      },
+    });
+    await log.append({
+      kind: "assistant_message",
+      payload: { content: [{ type: "text", text: "final from writer", citations: null }] },
+    });
+    await log.close();
+
+    const reopened = await openEventLog(sessionId, { rootDir: SHARED_SESSION_ROOT });
+    const replayed = await replayMessageHistory(reopened);
+    await reopened.close();
+
+    // 4 messages: user "begin", assistant (tool_use), user (tool_result), assistant (final).
+    // Peer's user/assistant in the middle are skipped.
+    expect(replayed.length).toBe(4);
+    expect(replayed[0]).toEqual({ role: "user", content: "begin" });
+    expect(replayed[1]?.role).toBe("assistant");
+    const block1 = (replayed[1]?.content as Anthropic.ContentBlock[])[0] as { type: string };
+    expect(block1?.type).toBe("tool_use");
+    expect(replayed[2]?.role).toBe("user");
+    const block2 = (replayed[2]?.content as Anthropic.ToolResultBlockParam[])[0];
+    expect(block2?.type).toBe("tool_result");
+    expect(block2?.tool_use_id).toBe("tu_send");
+    expect(replayed[3]?.role).toBe("assistant");
+  });
+
+  test("replayMessageHistory tolerates nested a2a brackets (peer of a peer)", async () => {
+    // If a peer's inline runChatLoop itself drives another A2A call,
+    // the markers nest. Depth-counting keeps any nesting level skipped
+    // until the outermost a2a_turn_end is seen.
+    const sessionId = "sess_cccccccccccccccc";
+    const { openEventLog } = await import("@crewhaus/event-log");
+    const log = await openEventLog(sessionId, { rootDir: SHARED_SESSION_ROOT });
+    await log.append({ kind: "user_message", payload: { content: "outer" } });
+    await log.append({ kind: "a2a_turn_start", payload: { from: "a", to: "b" } });
+    await log.append({ kind: "user_message", payload: { content: "level-1" } });
+    await log.append({ kind: "a2a_turn_start", payload: { from: "b", to: "c" } });
+    await log.append({ kind: "user_message", payload: { content: "level-2" } });
+    await log.append({
+      kind: "assistant_message",
+      payload: { content: [{ type: "text", text: "level-2 reply", citations: null }] },
+    });
+    await log.append({ kind: "a2a_turn_end", payload: { from: "b", to: "c" } });
+    await log.append({
+      kind: "assistant_message",
+      payload: { content: [{ type: "text", text: "level-1 reply", citations: null }] },
+    });
+    await log.append({ kind: "a2a_turn_end", payload: { from: "a", to: "b" } });
+    await log.append({
+      kind: "assistant_message",
+      payload: { content: [{ type: "text", text: "outer reply", citations: null }] },
+    });
+    await log.close();
+
+    const reopened = await openEventLog(sessionId, { rootDir: SHARED_SESSION_ROOT });
+    const replayed = await replayMessageHistory(reopened);
+    await reopened.close();
+
+    // Only the outer user message and outer assistant reply survive.
+    expect(replayed.length).toBe(2);
+    expect(replayed[0]).toEqual({ role: "user", content: "outer" });
+    expect(replayed[1]?.role).toBe("assistant");
+  });
+
   test("T4 replay: replayMessageHistory rebuilds an identical history from the JSONL", async () => {
     // Hand-craft a 4-message transcript via direct event-log appends so
     // the replay algorithm is exercised in isolation. tool_use /

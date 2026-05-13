@@ -20,7 +20,7 @@
  */
 import { spawn, spawnSync } from "node:child_process";
 import { writeFileSync } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 
 const CWD = process.cwd();
@@ -194,40 +194,18 @@ const main = async (): Promise<void> => {
   }
   log(`OK: crew_done with ${finalOut.length}-char finalOutput`);
 
-  // (6) Refusal-loop guard. Compile a variant where every role refuses
-  // any handoff by re-handing-off back. We rewrite the spec inline.
-  log("running refusal-loop variant");
-  const refusalDir = join(EXAMPLE, "dist-refusal");
-  const refusalSpec = `name: hello-crew-refusal
-target: crew
-model: claude-haiku-4-5-20251001
-entry: a
-permissions:
-  mode: default
-roles:
-  a:
-    instructions: |
-      You are role A. On EVERY turn, IMMEDIATELY call the Handoff tool with
-      target="b" and reason="bouncing — refusing this work". Never produce
-      narrative text on your own. End your turn after Handoff returns.
-  b:
-    instructions: |
-      You are role B. On EVERY turn, IMMEDIATELY call the Handoff tool with
-      target="a" and reason="bouncing — refusing this work". Never produce
-      narrative text on your own. End your turn after Handoff returns.
-`;
-  const refusalSpecPath = join(EXAMPLE, "dist", "refusal.yaml");
-  await writeFile(refusalSpecPath, refusalSpec);
-  await compileExample(refusalSpecPath, refusalDir);
-  const refusalDaemon = join(refusalDir, "daemon.ts");
-  const refusal = await runDaemon(refusalDaemon, "go", 120_000);
-  // The daemon should exit with non-zero AND stderr should mention "handoff refused".
-  const refusalStream = `${refusal.stdout}\n${refusal.stderr}`;
-  if (!refusalStream.toLowerCase().includes("handoff refused")) {
-    dump("refusal", refusal);
-    fail('refusal-loop variant did not report "handoff refused"');
-  }
-  log("OK: refusal-loop guard tripped cleanly");
+  // (6) Refusal-loop guard. This scenario previously drove a live
+  // haiku-4.5 crew where every role was instructed to immediately call
+  // Handoff back to the other role, expecting refusalDepth to trip with
+  // "handoff refused". Modern models (haiku-4.5 and above) recognise
+  // the bounce trap and refuse to call Handoff at all, so the guard
+  // never fired and the smoke failed for the wrong reason.
+  //
+  // The same invariant is now verified deterministically by the
+  // "refusal-loop guard (T8)" + "refusalDepth=1 trips ..." unit tests
+  // in packages/crew-orchestrator/src/index.test.ts, which inject a
+  // programmable adapter that always emits a Handoff tool_use. No live
+  // model is involved there, so the guard fires reliably.
 
   // (7) traceId invariant: every event in the happy stream that carries
   // a traceparent should share the same traceId. The orchestrator emits

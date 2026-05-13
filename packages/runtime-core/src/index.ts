@@ -161,7 +161,25 @@ export type { ResolvedAuth } from "@crewhaus/adapter-anthropic";
  */
 export async function replayMessageHistory(log: EventLog): Promise<Anthropic.MessageParam[]> {
   const messages: Anthropic.MessageParam[] = [];
+  // Crew sessions and sub-agent spawners share one append-only log.
+  // Events emitted between a2a_turn_start / a2a_turn_end (Section 22)
+  // or sub_agent_start / sub_agent_end (Section 13) are nested
+  // transcripts that should NOT bleed into the outer role's history —
+  // their `user_message` and `assistant_message` events would otherwise
+  // sit between the parent's tool_use and its tool_result, breaking
+  // Claude API's adjacency requirement. Track nesting depth and only
+  // surface user/assistant events at depth 0.
+  let depth = 0;
   for await (const ev of log.read()) {
+    if (ev.kind === "a2a_turn_start" || ev.kind === "sub_agent_start") {
+      depth += 1;
+      continue;
+    }
+    if (ev.kind === "a2a_turn_end" || ev.kind === "sub_agent_end") {
+      depth = Math.max(0, depth - 1);
+      continue;
+    }
+    if (depth > 0) continue;
     if (ev.kind === "user_message") {
       const p = ev.payload as { content: Anthropic.MessageParam["content"] };
       messages.push({ role: "user", content: p.content });
