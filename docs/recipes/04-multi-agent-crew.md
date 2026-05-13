@@ -78,13 +78,16 @@ Compile and run:
 
 ```bash
 bun run compile:hello-crew
-bun run run:hello-crew
+echo "Topic: rolling out vector-search to production" | bun run run:hello-crew
 ```
 
-You'll see the researcher list risks, hand off to the writer, the
-writer post-question the critic via SendMessage, and the final summary
-print. Three model calls minimum, sometimes four if the writer pings
-the critic.
+The crew daemon reads one prompt per line from stdin; if you run it
+without piping anything it exits with `[crew] no input on stdin` and
+status 2 (designed: no input → no turn). On a piped run you'll see the
+researcher list risks, hand off to the writer, the writer
+post-question the critic via SendMessage, and the final summary print.
+Three model calls minimum, sometimes four if the writer pings the
+critic.
 
 ## The two auto-injected tools
 

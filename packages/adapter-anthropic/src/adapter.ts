@@ -96,6 +96,15 @@ export function createAnthropicAdapter(env: NodeJS.ProcessEnv = process.env): An
  * `message`, `name`). `recovery-engine` was written against Anthropic's
  * shape; keeping those fields untouched means non-Anthropic adapters
  * normalise into the same shape and we don't need a new taxonomy.
+ *
+ * Special case: mid-stream SSE errors come through the SDK as
+ * `APIError.generate(undefined, ...)` which yields an `APIConnectionError`
+ * with `.error = undefined`, `.status = undefined`, and `.message` set to
+ * the raw JSON envelope (`{ "type":"error", "error":{ "type":"overloaded_error", ... } }`).
+ * Without recovering the structured fields, `classify()` returns "unknown"
+ * and a transient overload becomes a fatal `recovery failed:` — exactly
+ * the symptom the recipe walkthrough hit on a busy Anthropic server.
+ * Parse the JSON envelope and hoist its `.error` so classification works.
  */
 function normaliseAnthropicError(err: unknown): unknown {
   // Aborts pass through verbatim — the runtime distinguishes them by
@@ -115,5 +124,43 @@ function normaliseAnthropicError(err: unknown): unknown {
   if (typeof e.name === "string") {
     (wrapped as unknown as { name?: string }).name = e.name;
   }
+
+  // Recover structured fields from a JSON-envelope error message when the
+  // SDK didn't surface them (mid-stream SSE error path).
+  if (e.status === undefined && e.error === undefined) {
+    const parsed = tryParseSseErrorEnvelope(message);
+    if (parsed !== undefined) {
+      (wrapped as unknown as { error?: unknown }).error = parsed;
+    }
+  }
   return wrapped;
+}
+
+/**
+ * Try to extract Anthropic's error-envelope shape from a string. Handles
+ * both the bare JSON form (`{"type":"error","error":{...}}`) and the
+ * older SDK form prefixed with `SSE Error: `. Returns the inner `.error`
+ * object (`{ type, message, ... }`) when the envelope matches, otherwise
+ * undefined.
+ */
+function tryParseSseErrorEnvelope(message: string): { type: string; message?: string } | undefined {
+  const trimmed = message.replace(/^SSE Error:\s*/, "").trim();
+  if (!trimmed.startsWith("{")) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null) return undefined;
+  const envelope = parsed as { type?: unknown; error?: unknown };
+  if (envelope.type !== "error" || typeof envelope.error !== "object" || envelope.error === null) {
+    return undefined;
+  }
+  const inner = envelope.error as { type?: unknown; message?: unknown };
+  if (typeof inner.type !== "string") return undefined;
+  return {
+    type: inner.type,
+    ...(typeof inner.message === "string" ? { message: inner.message } : {}),
+  };
 }

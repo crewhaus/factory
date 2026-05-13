@@ -121,4 +121,75 @@ describe("AnthropicAdapter", () => {
     // 16 chars / 4 = 4 tokens
     expect(tokens).toBe(4);
   });
+
+  test("mid-stream SSE errors expose `.error.type` for recovery-engine classify()", async () => {
+    // The SDK's streaming.mjs calls `APIError.generate(undefined, ...)`
+    // for mid-stream errors, which yields an APIConnectionError with
+    // .error = undefined, .status = undefined, and .message set to the
+    // raw JSON envelope. Without recovery, classify() returns "unknown"
+    // and a transient overload becomes a fatal `recovery failed:`.
+    const envelope = JSON.stringify({
+      type: "error",
+      error: { details: null, type: "overloaded_error", message: "Overloaded" },
+      request_id: "req_x",
+    });
+    const sdkLikeError = new Error(envelope);
+    // Match the real SDK's APIConnectionError shape: no .status, no .error.
+    (sdkLikeError as { name: string }).name = "APIConnectionError";
+
+    // Iterator that rejects on first .next() — models a mid-stream SSE
+    // error where the SDK's iterator throws after the stream is opened.
+    // Avoids `async function*` (which biome flags as useYield when there
+    // are no yields, even though throw-only generators are valid).
+    const client = {
+      messages: {
+        stream: ((_params: Anthropic.MessageStreamParams) => ({
+          [Symbol.asyncIterator]() {
+            return { next: () => Promise.reject(sdkLikeError) };
+          },
+        })) as unknown as Anthropic["messages"]["stream"],
+      },
+    } as unknown as Anthropic;
+
+    const a = new AnthropicAdapter({ client, isOAuth: false });
+    let caught: unknown;
+    try {
+      for await (const _ev of a.stream(REQ)) void _ev;
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeDefined();
+    const wrapped = caught as { error?: { type?: string; message?: string } };
+    expect(wrapped.error?.type).toBe("overloaded_error");
+    expect(wrapped.error?.message).toBe("Overloaded");
+  });
+
+  test("non-envelope error messages are left untouched", async () => {
+    const sdkLikeError = new Error("Connection error.");
+    (sdkLikeError as { name: string }).name = "APIConnectionError";
+
+    // Iterator that rejects on first .next() — models a mid-stream SSE
+    // error where the SDK's iterator throws after the stream is opened.
+    // Avoids `async function*` (which biome flags as useYield when there
+    // are no yields, even though throw-only generators are valid).
+    const client = {
+      messages: {
+        stream: ((_params: Anthropic.MessageStreamParams) => ({
+          [Symbol.asyncIterator]() {
+            return { next: () => Promise.reject(sdkLikeError) };
+          },
+        })) as unknown as Anthropic["messages"]["stream"],
+      },
+    } as unknown as Anthropic;
+
+    const a = new AnthropicAdapter({ client, isOAuth: false });
+    let caught: unknown;
+    try {
+      for await (const _ev of a.stream(REQ)) void _ev;
+    } catch (err) {
+      caught = err;
+    }
+    const wrapped = caught as { error?: unknown };
+    expect(wrapped.error).toBeUndefined();
+  });
 });

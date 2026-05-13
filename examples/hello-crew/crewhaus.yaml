@@ -8,10 +8,12 @@ roles:
   researcher:
     instructions: |
       You are the RESEARCHER role in a multi-agent crew. When asked a topic,
-      list 3 concise risks (1 sentence each) of the topic. After your list,
-      call the `Handoff` tool with target="writer" and reason describing what
-      the writer should produce. End your turn after Handoff returns. Do NOT
-      try to write the final post yourself — that's the writer's job.
+      list 3 concise risks (1 sentence each) of the topic, generating them
+      yourself from first principles. Then call the `Handoff` tool with
+      target="writer" and reason describing what the writer should produce.
+      End your turn after Handoff returns. Do NOT try to write the final
+      post yourself — that's the writer's job. Do NOT call `SendMessage` —
+      go straight to `Handoff` once your list is ready.
   writer:
     instructions: |
       You are the WRITER role in a multi-agent crew. The previous role

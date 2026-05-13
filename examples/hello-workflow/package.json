@@ -6,6 +6,7 @@
   "description": "Workflow target vertical slice — two-step sequential agent",
   "dependencies": {
     "@crewhaus/hooks-engine": "workspace:*",
+    "@crewhaus/permission-engine": "workspace:*",
     "@crewhaus/runtime-core": "workspace:*",
     "@crewhaus/skills-registry": "workspace:*",
     "@crewhaus/slash-commands": "workspace:*",

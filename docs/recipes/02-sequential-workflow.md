@@ -41,6 +41,9 @@ is two steps: list files, then summarize. The whole file:
 name: hello-workflow
 target: workflow
 model: claude-sonnet-4-6
+permissions:
+  rules:
+    - { type: alwaysAllow, pattern: Bash }
 steps:
   - name: list-files
     instructions: |
@@ -62,8 +65,15 @@ Note the differences from a CLI spec:
   Workflows don't have a single agent — they have a sequence of steps.
 - `steps:` replaces `agent.instructions`. Each step has its own
   `instructions`, and optionally its own `model` and `tools`.
-- No `permissions:` block in this example, but you can add one — it
-  applies uniformly across every step.
+- The `permissions:` block is **required for any destructive tool** —
+  including `bash`. Workflow steps execute in single-turn mode, which
+  has no interactive surface for the permission engine to prompt on, so
+  any tool whose default verdict would be `ask` is converted to `deny`.
+  An explicit `alwaysAllow` rule is the smallest config that lets step 1
+  actually run `ls -la`. The block applies uniformly across every step.
+  Without it, you'll see `tool denied (single-turn mode: cannot prompt
+  for interactive approval)` in the session JSONL and the model will
+  produce a confused message claiming the environment is restricted.
 
 Compile and run:
 

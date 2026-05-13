@@ -1,6 +1,14 @@
 name: hello-workflow
 target: workflow
 model: claude-sonnet-4-6
+# Workflow steps run in single-turn mode, where the permission engine has
+# no interactive surface to prompt on — any tool whose default verdict is
+# `ask` is converted to `deny`. The Bash tool is `destructive: true` and
+# falls through to `ask` by default, so it must be allowed explicitly
+# here for step 1 to actually run `ls -la`.
+permissions:
+  rules:
+    - { type: alwaysAllow, pattern: Bash }
 steps:
   - name: list-files
     instructions: |

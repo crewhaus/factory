@@ -80,12 +80,16 @@ Run it:
 
 ```bash
 bun run compile:hello-graph
-bun run run:hello-graph
+echo "Should we adopt a 4-day work week?" | bun run run:hello-graph
 ```
 
-You'll see the plan node print, the execute node print, then the run
-**pauses** with the approval prompt. Type a decision, press enter,
-and the execute + summarise nodes complete.
+The graph reads its input from stdin (the `input` field of the
+upstream state seeds the `plan` node). Run it without piping anything
+and the model receives an empty string — it'll still complete every
+node, but the output is generic. You'll see the plan node print, the
+execute node print, then the run **pauses** with the approval prompt.
+Type a decision, press enter, and the execute + summarise nodes
+complete.
 
 ## State threading
 

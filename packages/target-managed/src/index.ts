@@ -79,14 +79,25 @@ import { auditPolicyDecision, evaluatePolicy } from "@crewhaus/policy-engine";
 import { buildTenant, type Tenant } from "@crewhaus/tenancy";
 import { runOneTurn } from "./agent.ts";
 
+import { randomBytes } from "node:crypto";
 const TENANTS_ROOT = process.env.CREWHAUS_TENANTS_ROOT ?? "/tmp/crewhaus-tenants";
 const PORT = Number(process.env.PORT ?? 3000);
-const JWT_SECRET = process.env.CREWHAUS_GATEWAY_JWT_SECRET;
-if (!JWT_SECRET || JWT_SECRET.length < 16) {
+const ENV_JWT_SECRET = process.env.CREWHAUS_GATEWAY_JWT_SECRET;
+if (ENV_JWT_SECRET !== undefined && ENV_JWT_SECRET.length < 16) {
   console.error(
-    "[managed] CREWHAUS_GATEWAY_JWT_SECRET must be set (min 16 chars). Refusing to start.",
+    "[managed] CREWHAUS_GATEWAY_JWT_SECRET is set but too short (min 16 chars). Refusing to start.",
   );
   process.exit(1);
+}
+const JWT_SECRET: string = ENV_JWT_SECRET ?? randomBytes(24).toString("hex");
+if (ENV_JWT_SECRET === undefined) {
+  // Dev-mode autogeneration. The doc-side contract is that the operator
+  // copies this line and re-exports it for subsequent runs (otherwise
+  // every restart invalidates previously-minted tokens). In production,
+  // set CREWHAUS_GATEWAY_JWT_SECRET explicitly.
+  console.error(
+    \`[managed] no CREWHAUS_GATEWAY_JWT_SECRET in env — generated a one-shot dev secret. Export it to re-use:\\n  export CREWHAUS_GATEWAY_JWT_SECRET=\${JWT_SECRET}\`,
+  );
 }
 
 const TENANT_OVERRIDES: Record<string, Partial<Tenant>> = {
