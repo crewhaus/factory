@@ -43,6 +43,20 @@ const BUILTIN_TOOL_MAP: Record<string, { package: string; export: string }> = {
   grep: { package: "@crewhaus/tool-fs", export: "grep" },
   bash: { package: "@crewhaus/tool-bash", export: "bash" },
   todoWrite: { package: "@crewhaus/tool-todo", export: "todoWrite" },
+  // §47 read-only EVM tools (slice 0).
+  evmCall: { package: "@crewhaus/tool-evm", export: "evmCall" },
+  evmGetLogs: { package: "@crewhaus/tool-evm", export: "evmGetLogs" },
+  evmGetTransaction: { package: "@crewhaus/tool-evm", export: "evmGetTransaction" },
+  evmGetTransactionReceipt: {
+    package: "@crewhaus/tool-evm",
+    export: "evmGetTransactionReceipt",
+  },
+  evmGetBalance: { package: "@crewhaus/tool-evm", export: "evmGetBalance" },
+  evmBlockNumber: { package: "@crewhaus/tool-evm", export: "evmBlockNumber" },
+  // §47 destructive EVM tools (slice 1) — gated by permission-engine
+  // (destructive: true) and wallet-engine (two-gate model).
+  evmSendTransaction: { package: "@crewhaus/tool-evm-tx", export: "evmSendTransaction" },
+  evmSimulate: { package: "@crewhaus/tool-evm-tx", export: "evmSimulate" },
 };
 
 /**

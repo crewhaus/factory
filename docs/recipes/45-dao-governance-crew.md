@@ -47,32 +47,32 @@ roles:
       Read the proposal id from the user. Hand off to the four analysts:
       treasury_impact, legal_review, technical_risk, governance_history.
       When all four reply, hand off to recommendation.
-    tools: [EvmCall]
+    tools: [evmCall]
   treasury_impact:
     instructions: |
       Use governor__proposals and EvmCall on referenced treasury contracts
       to compute the dollar impact of executing this proposal. Return a
       structured summary {impact_usd, confidence}.
-    tools: [EvmCall, EvmGetLogs]
+    tools: [evmCall, evmGetLogs]
   legal_review:
     instructions: |
       Read the proposal's IPFS-hosted description (assume the description
       hash is in the proposal envelope). Flag any terms that imply
       regulated activity (securities issuance, KYC obligations, MSB
       activity). Return a structured summary {risk_level, citations}.
-    tools: [EvmCall]
+    tools: [evmCall]
   technical_risk:
     instructions: |
       Read the proposal's calldata bytes. Identify the target contract(s)
       and methods. Compute the bytecode hash for each target. Flag any
       upgradeable proxies. Return a structured summary {targets, risks}.
-    tools: [EvmCall]
+    tools: [evmCall]
   governance_history:
     instructions: |
       Use EvmGetLogs to fetch the last 10 ProposalCreated + ProposalExecuted
       events. Summarise the success rate, quorum trends, and the proposer's
       track record. Return a structured summary {pattern, anomalies}.
-    tools: [EvmGetLogs]
+    tools: [evmGetLogs]
   recommendation:
     instructions: |
       Read the four analyst replies. Produce a single voting recommendation

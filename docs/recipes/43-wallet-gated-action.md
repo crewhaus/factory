@@ -52,15 +52,17 @@ steps:
       Run EvmSimulate against the USDC transfer call. Surface the
       gasUsed, return data, and any revert reason. Do NOT send the
       transaction.
-    tools: [EvmSimulate]
+    tools: [evmSimulate]
   - name: review-and-send
     instructions: |
       Summarise the simulation result for the user in 1-2 sentences.
       Then call EvmSendTransaction with the same args. The approval
       prompt will fire; quote the simulation summary in the prompt so
       the user can decide informed.
-    tools: [EvmSendTransaction]
+    tools: [evmSendTransaction]
 ```
+
+Tool names in the `tools:` list use the lowercase registration name (`evmSimulate`, `evmSendTransaction`); permission-engine rules pattern-match against the runtime tool name (`EvmSimulate`, `EvmSendTransaction`) — the case difference is the existing convention shared with `read`/`Read`, `bash`/`Bash`, etc.
 
 ## How the layers compose
 
