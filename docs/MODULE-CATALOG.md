@@ -420,8 +420,8 @@ These ship as **selectable building blocks** the factory wires into a generated 
 | ✅ `tool-vision-grounding` | `FindElement(description)` → vision-model bbox lookup. | BROW, CLI | T1, T5, T6 | `tool-builder`, `tool-screen-capture`, `model-adapter` |
 | 🟡 `tool-dom-inspector` | DOM/AX-tree-based element queries (when in browser). | BROW | T1, T2, T3 | `tool-builder`, `browser-extension-bridge` |
 | ✅ `tool-evm` | Read-only EVM tools (EvmCall, EvmGetLogs, EvmGetTransaction, EvmGetTransactionReceipt, EvmGetBalance, EvmBlockNumber). §47 slice 0. | CLI, WF, CHN, GRPH, CRW, RES, BATCH | T1, T3 | `tool-builder`, `chain-adapter-base`, `chain-adapter-evm` |
-| 🟡 `tool-evm-tx` | Destructive EVM transaction tools — sign+broadcast, simulation, status check. §47 slice 1. | CLI, WF, CHN, GRPH, CRW, BATCH, ONCHAIN | T1, T3, T8 | `tool-builder`, `wallet-engine`, `chain-adapter-evm` |
-| 🟡 `tool-contract-gateway` | ABI → typed-tool generator (compile-time). §47 slice 1. | CLI, WF, CHN, GRPH, CRW | T1, T9 | `tool-builder`, `chain-adapter-base` |
+| ✅ `tool-evm-tx` | Destructive EVM transaction tools — sign+broadcast, simulation, status check. §47 slice 1. | CLI, WF, CHN, GRPH, CRW, BATCH, ONCHAIN | T1, T3, T8 | `tool-builder`, `wallet-engine`, `chain-adapter-evm` |
+| ✅ `tool-contract-gateway` | ABI → typed-tool generator (compile-time). §47 slice 1. | CLI, WF, CHN, GRPH, CRW | T1, T9 | `tool-builder`, `chain-adapter-base` |
 
 #### R5 — MCP & Protocol Hosts
 
@@ -484,6 +484,8 @@ These ship as **selectable building blocks** the factory wires into a generated 
 | ✅ `pii-redactor` | Detect/redact PII in inputs, outputs, logs. Regex + classifier + policy allow-list. | CHN, MGD, VOICE | T1, T5, T8 | `model-adapter` |
 | ✅ `prompt-injection-detector` | 3-layer classifier (regex + structural + optional LLM). Wired into post-tool path. | All | T1, T8 | `tool-result-store`, `model-adapter` |
 | ✅ `boundary-classifier` | Pillar 3 chokepoint — wraps `prompt-injection-detector` with TrustOrigin + content-hash cache. | All | T1, T8 | `prompt-injection-detector` |
+| ✅ `wallet-engine` | Custody + sign-request flow: simulate → static policy → approval → custody-sign → broadcast → boundary-classify receipt. §47 slice 1. | CLI, WF, CHN, GRPH, CRW, BATCH, ONCHAIN | T1, T8 | `boundary-classifier`, `chain-adapter-base` |
+| ✅ `permission-tokengated` | Token-gated entitlement resolver — reads on-chain ownership, emits `alwaysAllow`/`alwaysDeny` rules. §47 slice 1. | All | T1, T8 | `chain-adapter-base`, `permission-engine` |
 | ✅ `sandbox-image-{python,javascript,shell,go,rust,java,ruby,r,dotnet,php}` | Polyglot sandbox image registry. | All sandbox-using | T1, T2, T7, T8 | `sandbox` |
 | ✅ `audit-encryption` | Envelope encryption (AES-256-GCM) for audit-log payloads; per-tenant DEK. | MGD | T1, T2, T8 | `secrets-manager` |
 | ✅ `data-retention-engine` | GDPR-shaped retention; purge / export / sweep with cross-tenant guard. | MGD | T1, T8, T9 | `audit-log`, `secrets-manager` |

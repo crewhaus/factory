@@ -1,0 +1,13 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "include": ["src/**/*"],
+  "references": [
+    { "path": "../errors" },
+    { "path": "../boundary-classifier" },
+    { "path": "../chain-adapter-base" }
+  ]
+}

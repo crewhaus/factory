@@ -8,11 +8,13 @@ import { describe, expect, test } from "bun:test";
 import type { IrNode, IrV0 } from "@crewhaus/ir";
 import {
   DEFAULT_PIPELINE,
+  IrPassError,
   applyPasses,
   deadToolElimination,
   permissionRuleCanonicalize,
   promptCachePrefixSort,
   redundantMcpServerCollapse,
+  transactionPolicyEnforcement,
 } from "./index";
 
 function makeCli(overrides: Partial<IrV0> = {}): IrV0 {
@@ -232,7 +234,147 @@ describe("ir-passes — applyPasses + idempotence (T9)", () => {
     expect(calls).toEqual(["a", "b"]);
   });
 
-  test("DEFAULT_PIPELINE has 4 passes", () => {
-    expect(DEFAULT_PIPELINE.length).toBe(4);
+  test("DEFAULT_PIPELINE has 5 passes (deadTool, mcpCollapse, permCanon, txPolicy, cachePrefix)", () => {
+    expect(DEFAULT_PIPELINE.length).toBe(5);
+  });
+});
+
+describe("ir-passes — transactionPolicyEnforcement (T1, T8)", () => {
+  const baseChain = {
+    id: "base-mainnet",
+    kind: "evm" as const,
+    rpcUrls: [{ kind: "literal" as const, value: "https://rpc.test" }],
+    rpcPolicy: "single" as const,
+    finality: { kind: "finalized" as const },
+    reorgTolerant: true,
+  };
+  const treasuryWallet = {
+    id: "treasury",
+    chainId: "base-mainnet",
+    custody: "user-controlled" as const,
+    signingPolicy: "explicit-user-approval" as const,
+  };
+  const usdcContract = {
+    id: "usdc",
+    chainId: "base-mainnet",
+    address: "0xusdc",
+    abiRef: "abi://erc20",
+  };
+
+  test("empty subsystem is a no-op (existing specs untouched)", () => {
+    const ir = makeCli();
+    expect(transactionPolicyEnforcement(ir)).toBe(ir);
+  });
+
+  test("valid subsystem passes through unchanged", () => {
+    const ir = makeCli({
+      chains: [baseChain],
+      wallets: [treasuryWallet],
+      contracts: [usdcContract],
+      transactionPolicy: {
+        defaultWriteApproval: "required",
+        allowedContracts: ["usdc"],
+        simulationRequired: true,
+      },
+    });
+    expect(transactionPolicyEnforcement(ir)).toBe(ir);
+  });
+
+  test("rejects wallets[].chainId not declared in chains[]", () => {
+    const ir = makeCli({
+      chains: [baseChain],
+      wallets: [{ ...treasuryWallet, chainId: "polygon-mainnet" }],
+    });
+    expect(() => transactionPolicyEnforcement(ir)).toThrow(IrPassError);
+  });
+
+  test("rejects contracts[].chainId not declared in chains[]", () => {
+    const ir = makeCli({
+      chains: [baseChain],
+      contracts: [{ ...usdcContract, chainId: "polygon-mainnet" }],
+    });
+    expect(() => transactionPolicyEnforcement(ir)).toThrow(/not declared in chains\[\]/);
+  });
+
+  test("rejects allowedContracts entry not in contracts[].id", () => {
+    const ir = makeCli({
+      chains: [baseChain],
+      contracts: [usdcContract],
+      transactionPolicy: {
+        defaultWriteApproval: "required",
+        allowedContracts: ["unknown-token"],
+        simulationRequired: true,
+      },
+    });
+    expect(() => transactionPolicyEnforcement(ir)).toThrow(/unknown-token/);
+  });
+
+  test("rejects approval=none with non-automated wallet", () => {
+    const ir = makeCli({
+      chains: [baseChain],
+      wallets: [treasuryWallet],
+      contracts: [usdcContract],
+      transactionPolicy: {
+        defaultWriteApproval: "none",
+        allowedContracts: ["usdc"],
+        simulationRequired: false,
+      },
+    });
+    expect(() => transactionPolicyEnforcement(ir)).toThrow(/automated/);
+  });
+
+  test("accepts approval=none when every wallet is automated", () => {
+    const ir = makeCli({
+      chains: [baseChain],
+      wallets: [
+        {
+          ...treasuryWallet,
+          custody: "kms",
+          signingPolicy: "automated",
+          keyRef: { kind: "env", name: "KMS_KEY" },
+        },
+      ],
+      contracts: [usdcContract],
+      transactionPolicy: {
+        defaultWriteApproval: "none",
+        allowedContracts: ["usdc"],
+        simulationRequired: false,
+      },
+    });
+    expect(transactionPolicyEnforcement(ir)).toBe(ir);
+  });
+
+  test("rejects kms wallet without keyRef", () => {
+    const ir = makeCli({
+      chains: [baseChain],
+      wallets: [{ ...treasuryWallet, custody: "kms" }],
+    });
+    expect(() => transactionPolicyEnforcement(ir)).toThrow(/keyRef/);
+  });
+
+  test("rejects duplicate chains[].id", () => {
+    const ir = makeCli({ chains: [baseChain, baseChain] });
+    expect(() => transactionPolicyEnforcement(ir)).toThrow(/duplicate chains/);
+  });
+
+  test("rejects duplicate wallets[].id", () => {
+    const ir = makeCli({
+      chains: [baseChain],
+      wallets: [treasuryWallet, treasuryWallet],
+    });
+    expect(() => transactionPolicyEnforcement(ir)).toThrow(/duplicate wallets/);
+  });
+
+  test("non-blockchain shapes (managed, voice, browser, eval) pass through unchanged", () => {
+    const ir: IrNode = {
+      version: 0,
+      name: "test-mgd",
+      target: "managed",
+      agent: { model: "claude-opus-4-7", instructions: "hi" },
+      tenants: [{ id: "t1", budget: { maxInputTokens: 1, maxOutputTokens: 1 } }],
+      permissions: { rules: [] },
+      compaction: {},
+    };
+    expect(transactionPolicyEnforcement(ir)).toBe(ir);
   });
 });

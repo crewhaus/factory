@@ -1244,6 +1244,7 @@
       "name": "@crewhaus/ir-passes",
       "version": "0.0.0",
       "dependencies": {
+        "@crewhaus/errors": "workspace:*",
         "@crewhaus/ir": "workspace:*",
       },
     },
@@ -1321,6 +1322,15 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tool-permission-matcher": "workspace:*",
         "zod": "^3.23.8",
+      },
+    },
+    "packages/permission-tokengated": {
+      "name": "@crewhaus/permission-tokengated",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/chain-adapter-base": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/permission-engine": "workspace:*",
       },
     },
     "packages/pii-redactor": {
@@ -1929,6 +1939,16 @@
         "zod": "^3.23.8",
       },
     },
+    "packages/tool-contract-gateway": {
+      "name": "@crewhaus/tool-contract-gateway",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "zod": "^3.23.8",
+      },
+    },
     "packages/tool-evm": {
       "name": "@crewhaus/tool-evm",
       "version": "0.0.0",
@@ -1938,6 +1958,18 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
+        "zod": "^3.23.8",
+      },
+    },
+    "packages/tool-evm-tx": {
+      "name": "@crewhaus/tool-evm-tx",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/chain-adapter-base": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/wallet-engine": "workspace:*",
         "zod": "^3.23.8",
       },
     },
@@ -2209,6 +2241,15 @@
       "version": "0.0.0",
       "dependencies": {
         "@crewhaus/spec": "workspace:*",
+      },
+    },
+    "packages/wallet-engine": {
+      "name": "@crewhaus/wallet-engine",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/boundary-classifier": "workspace:*",
+        "@crewhaus/chain-adapter-base": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
       },
     },
     "packages/wizard": {
@@ -2581,6 +2622,8 @@
 
     "@crewhaus/permission-engine": ["@crewhaus/permission-engine@workspace:packages/permission-engine"],
 
+    "@crewhaus/permission-tokengated": ["@crewhaus/permission-tokengated@workspace:packages/permission-tokengated"],
+
     "@crewhaus/pii-redactor": ["@crewhaus/pii-redactor@workspace:packages/pii-redactor"],
 
     "@crewhaus/pipeline-engine": ["@crewhaus/pipeline-engine@workspace:packages/pipeline-engine"],
@@ -2705,7 +2748,11 @@
 
     "@crewhaus/tool-code-execution": ["@crewhaus/tool-code-execution@workspace:packages/tool-code-execution"],
 
+    "@crewhaus/tool-contract-gateway": ["@crewhaus/tool-contract-gateway@workspace:packages/tool-contract-gateway"],
+
     "@crewhaus/tool-evm": ["@crewhaus/tool-evm@workspace:packages/tool-evm"],
+
+    "@crewhaus/tool-evm-tx": ["@crewhaus/tool-evm-tx@workspace:packages/tool-evm-tx"],
 
     "@crewhaus/tool-executor": ["@crewhaus/tool-executor@workspace:packages/tool-executor"],
 
@@ -2756,6 +2803,8 @@
     "@crewhaus/voice-runtime": ["@crewhaus/voice-runtime@workspace:packages/voice-runtime"],
 
     "@crewhaus/vscode-extension": ["@crewhaus/vscode-extension@workspace:packages/vscode-extension"],
+
+    "@crewhaus/wallet-engine": ["@crewhaus/wallet-engine@workspace:packages/wallet-engine"],
 
     "@crewhaus/wizard": ["@crewhaus/wizard@workspace:packages/wizard"],
 
