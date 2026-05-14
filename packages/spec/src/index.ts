@@ -686,6 +686,109 @@ const evalSchema = z
   })
   .strict();
 
+/**
+ * Section 47 — `onchain` target. Long-running event-driven daemon.
+ * Triggers fire on contract events / block scans / address watches;
+ * each trigger runs one agent turn with the decoded payload as the
+ * user message. Wallets + transaction_policy let the agent respond
+ * with signed transactions (escrow release, treasury rebalance, etc).
+ */
+const onchainTriggerSchema = z.discriminatedUnion("kind", [
+  z
+    .object({
+      kind: z.literal("event"),
+      chainId: z.string().min(1),
+      contract: z.string().min(1),
+      event: z.string().min(1),
+      filter: z.record(z.string(), z.unknown()).optional(),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("block"),
+      chainId: z.string().min(1),
+      scanIntervalMs: z.number().int().min(1000).max(3_600_000),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("address"),
+      chainId: z.string().min(1),
+      address: z.string().min(1),
+      direction: z.enum(["in", "out", "both"]).default("both"),
+    })
+    .strict(),
+]);
+
+const onchainSchema = z
+  .object({
+    name: z.string().min(1),
+    target: z.literal("onchain"),
+    agent: z
+      .object({
+        model: z.string().min(1),
+        instructions: z.string().min(1),
+      })
+      .strict(),
+    chains: z.array(chainBindingSchema).min(1),
+    wallets: z.array(walletBindingSchema).default([]),
+    contracts: z.array(contractBindingSchema).default([]),
+    transaction_policy: transactionPolicySchema.default({
+      defaultWriteApproval: "required",
+      allowedContracts: [],
+      simulationRequired: true,
+    }),
+    triggers: z.array(onchainTriggerSchema).min(1),
+    idempotencyWindowMs: z.number().int().positive().default(60_000),
+    tools: z.array(z.string().min(1)).optional(),
+    tool_config: toolConfigBlock,
+    mcp_servers: mcpServersBlock,
+    permissions: permissionsBlock,
+    compaction: compactionBlock,
+  })
+  .strict();
+
+/**
+ * Section 47 — `onchain-game` target. Perceive-act-perceive loop
+ * against a game contract: read state via `stateReader`, ask the model
+ * for a move, broadcast it as a transaction, await confirmation,
+ * re-read state. Single chain, single wallet.
+ */
+const onchainGameSchema = z
+  .object({
+    name: z.string().min(1),
+    target: z.literal("onchain-game"),
+    agent: z
+      .object({
+        model: z.string().min(1),
+        instructions: z.string().min(1),
+      })
+      .strict(),
+    chain: chainBindingSchema,
+    wallet: walletBindingSchema,
+    game: z
+      .object({
+        contract: contractBindingSchema,
+        stateReader: z.string().min(1),
+        actionsContract: z.string().min(1).optional(),
+        turnSemantics: z.enum(["turn-based", "real-time", "async"]).default("turn-based"),
+        moveTimeoutMs: z.number().int().positive().optional(),
+        objective: z.string().min(1).optional(),
+      })
+      .strict(),
+    transaction_policy: transactionPolicySchema.default({
+      defaultWriteApproval: "required",
+      allowedContracts: [],
+      simulationRequired: true,
+    }),
+    tools: z.array(z.string().min(1)).optional(),
+    tool_config: toolConfigBlock,
+    mcp_servers: mcpServersBlock,
+    permissions: permissionsBlock,
+    compaction: compactionBlock,
+  })
+  .strict();
+
 export const Spec = z.discriminatedUnion("target", [
   cliSchema,
   workflowSchema,
@@ -699,6 +802,8 @@ export const Spec = z.discriminatedUnion("target", [
   voiceSchema,
   browserSchema,
   evalSchema,
+  onchainSchema,
+  onchainGameSchema,
 ]);
 
 export type Spec = z.infer<typeof Spec>;
@@ -726,6 +831,9 @@ export type SpecResearch = z.infer<typeof researchSchema>;
 export type SpecResearchRetrieve = z.infer<typeof researchRetrieveSchema>;
 export type SpecBatch = z.infer<typeof batchSchema>;
 export type SpecBatchQueue = z.infer<typeof batchQueueSchema>;
+export type SpecOnchain = z.infer<typeof onchainSchema>;
+export type SpecOnchainGame = z.infer<typeof onchainGameSchema>;
+export type SpecChainTrigger = z.infer<typeof onchainTriggerSchema>;
 export type SpecVoice = z.infer<typeof voiceSchema>;
 export type SpecVoiceBlock = z.infer<typeof voiceBlockSchema>;
 export type SpecVoiceTelephony = z.infer<typeof voiceTelephonySchema>;

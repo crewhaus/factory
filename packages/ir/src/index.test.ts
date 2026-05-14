@@ -366,6 +366,10 @@ describe("IrNode discriminated union narrowing", () => {
           return `browser:${n.driver.backend}`;
         case "eval":
           return `eval:${n.dataset.name}@${n.dataset.version}`;
+        case "onchain":
+          return `onchain:${n.triggers.length}`;
+        case "onchain-game":
+          return `onchain-game:${n.game.turnSemantics}`;
       }
     }
 

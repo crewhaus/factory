@@ -97,6 +97,8 @@
     { "path": "./packages/policy-engine" },
     { "path": "./packages/gateway-server" },
     { "path": "./packages/target-managed" },
+    { "path": "./packages/target-onchain" },
+    { "path": "./packages/target-onchain-game" },
     { "path": "./packages/chunker" },
     { "path": "./packages/embedder" },
     { "path": "./packages/vector-store" },

@@ -18,6 +18,8 @@
     { "path": "../target-crew" },
     { "path": "../target-graph" },
     { "path": "../target-managed" },
+    { "path": "../target-onchain" },
+    { "path": "../target-onchain-game" },
     { "path": "../target-pipeline" },
     { "path": "../target-research-bundle" },
     { "path": "../target-voice" },

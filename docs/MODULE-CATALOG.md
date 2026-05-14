@@ -295,6 +295,8 @@ These live in `crewhaus-factory` and **produce or operate** generated harnesses.
 | ✅ `target-voice` | Codegen for `voice` target — RealtimeAdapter + VAD + barge-in + call-session. | VOICE | T1, T2, T7 | `compiler-core`, `voice-runtime`, `vad-engine`, `barge-in-controller`, `call-session` |
 | ✅ `target-browser-driver` | Codegen for `browser` target — Chromium driver + screenshot/click/type/vision tools. | BROW | T1, T3 | `compiler-core`, `computer-use-driver`, `tool-screen-capture`, `tool-vision-grounding` |
 | ✅ `target-eval-bundle` | Codegen for `eval` target — dataset loader, runner, graders, report. | EVAL | T1, T5 | `compiler-core`, `eval-runner`, `dataset-registry`, `grader-registry` |
+| ✅ `target-onchain` | Codegen for `onchain` target — event-driven daemon with trigger subscription + idempotency dedup + chain-payload classification. §47 slice 2. | ONCHAIN | T1, T3 | `compiler-core`, `chain-adapter-evm`, `boundary-classifier`, `wallet-engine` |
+| ✅ `target-onchain-game` | Codegen for `onchain-game` target — perceive-act loop against a game contract (read state → propose move → broadcast → confirm → re-read). §47 slice 2. | ONCHAIN-GAME | T1, T3 | `compiler-core`, `chain-adapter-evm`, `boundary-classifier`, `wallet-engine` |
 | 🟡 `bundle-packager` | Package compiled artifacts (Docker/OCI/npm/pypi/manifest). | All | T1, T3 | `compiler-core`, target-* |
 | ✅ `codegen-templates` | Templates per target (Bun + Ink CLI, FastAPI service, …). | All | T1 | — |
 

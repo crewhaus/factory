@@ -5,6 +5,8 @@ import type {
   IrBrowserV0,
   IrChainBinding,
   IrChainFinality,
+  IrChainGameV0,
+  IrChainV0,
   IrChannelV0,
   IrChannels,
   IrCompaction,
@@ -54,6 +56,8 @@ import { emitCrew } from "@crewhaus/target-crew";
 import { emitEval } from "@crewhaus/target-eval-bundle";
 import { emitGraph } from "@crewhaus/target-graph";
 import { emitManaged } from "@crewhaus/target-managed";
+import { emitOnchain } from "@crewhaus/target-onchain";
+import { emitOnchainGame } from "@crewhaus/target-onchain-game";
 import { emitPipeline } from "@crewhaus/target-pipeline";
 import { emitResearchBundle } from "@crewhaus/target-research-bundle";
 import { emitVoice } from "@crewhaus/target-voice";
@@ -601,6 +605,102 @@ export function lower(spec: Spec): IrNode {
         concurrency: spec.concurrency,
         ...(spec.seed !== undefined ? { seed: spec.seed } : {}),
       } satisfies IrEvalV0;
+    case "onchain": {
+      const lowered = lowerChainSubsystem(spec);
+      if (lowered.chains === undefined || lowered.chains.length === 0) {
+        throw new Error("onchain target requires chains[] to be non-empty");
+      }
+      return {
+        version: 0,
+        name: spec.name,
+        target: "onchain",
+        agent: { model: spec.agent.model, instructions: spec.agent.instructions },
+        chains: lowered.chains,
+        wallets: lowered.wallets ?? [],
+        contracts: lowered.contracts ?? [],
+        transactionPolicy: lowered.transactionPolicy ?? {
+          defaultWriteApproval: "required",
+          allowedContracts: [],
+          simulationRequired: true,
+        },
+        triggers: spec.triggers.map((t) => {
+          if (t.kind === "event") {
+            return {
+              kind: "event",
+              chainId: t.chainId,
+              contract: t.contract,
+              event: t.event,
+              ...(t.filter !== undefined ? { filter: t.filter } : {}),
+            };
+          }
+          if (t.kind === "block") {
+            return {
+              kind: "block",
+              chainId: t.chainId,
+              scanIntervalMs: t.scanIntervalMs,
+            };
+          }
+          return {
+            kind: "address",
+            chainId: t.chainId,
+            address: t.address,
+            direction: t.direction,
+          };
+        }),
+        idempotencyWindowMs: spec.idempotencyWindowMs,
+        tools: spec.tools ?? [],
+        toolConfigs: lowerToolConfigs(spec.tool_config),
+        mcp_servers: lowerMcpServers(spec.mcp_servers),
+        permissions: lowerPermissions(spec),
+        compaction: lowerCompaction(spec),
+      } satisfies IrChainV0;
+    }
+    case "onchain-game": {
+      // onchain-game inlines a single chain/wallet/contract, so we lower
+      // each one through the shared helpers and then assemble.
+      const lowered = lowerChainSubsystem({
+        chains: [spec.chain],
+        wallets: [spec.wallet],
+        contracts: [spec.game.contract],
+        transaction_policy: spec.transaction_policy,
+      });
+      const chain = lowered.chains?.[0];
+      const wallet = lowered.wallets?.[0];
+      const contract = lowered.contracts?.[0];
+      if (chain === undefined || wallet === undefined || contract === undefined) {
+        throw new Error("onchain-game lowering failed to produce chain/wallet/contract");
+      }
+      return {
+        version: 0,
+        name: spec.name,
+        target: "onchain-game",
+        agent: { model: spec.agent.model, instructions: spec.agent.instructions },
+        chain,
+        wallet,
+        game: {
+          contract,
+          stateReader: spec.game.stateReader,
+          turnSemantics: spec.game.turnSemantics,
+          ...(spec.game.actionsContract !== undefined
+            ? { actionsContract: spec.game.actionsContract }
+            : {}),
+          ...(spec.game.moveTimeoutMs !== undefined
+            ? { moveTimeoutMs: spec.game.moveTimeoutMs }
+            : {}),
+          ...(spec.game.objective !== undefined ? { objective: spec.game.objective } : {}),
+        },
+        transactionPolicy: lowered.transactionPolicy ?? {
+          defaultWriteApproval: "required",
+          allowedContracts: [],
+          simulationRequired: true,
+        },
+        tools: spec.tools ?? [],
+        toolConfigs: lowerToolConfigs(spec.tool_config),
+        mcp_servers: lowerMcpServers(spec.mcp_servers),
+        permissions: lowerPermissions(spec),
+        compaction: lowerCompaction(spec),
+      } satisfies IrChainGameV0;
+    }
     default:
       return assertNever(spec);
   }
@@ -643,6 +743,10 @@ function emit(ir: IrNode): Bundle {
       return emitBrowserDriver(ir);
     case "eval":
       return emitEval(ir);
+    case "onchain":
+      return emitOnchain(ir);
+    case "onchain-game":
+      return emitOnchainGame(ir);
     default:
       return assertNever(ir);
   }

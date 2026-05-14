@@ -837,6 +837,8 @@
         "@crewhaus/target-eval-bundle": "workspace:*",
         "@crewhaus/target-graph": "workspace:*",
         "@crewhaus/target-managed": "workspace:*",
+        "@crewhaus/target-onchain": "workspace:*",
+        "@crewhaus/target-onchain-game": "workspace:*",
         "@crewhaus/target-pipeline": "workspace:*",
         "@crewhaus/target-research-bundle": "workspace:*",
         "@crewhaus/target-voice": "workspace:*",
@@ -1827,6 +1829,24 @@
         "@crewhaus/ir": "workspace:*",
       },
     },
+    "packages/target-onchain": {
+      "name": "@crewhaus/target-onchain",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/infra-utils": "workspace:*",
+        "@crewhaus/ir": "workspace:*",
+      },
+    },
+    "packages/target-onchain-game": {
+      "name": "@crewhaus/target-onchain-game",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/infra-utils": "workspace:*",
+        "@crewhaus/ir": "workspace:*",
+      },
+    },
     "packages/target-pipeline": {
       "name": "@crewhaus/target-pipeline",
       "version": "0.0.0",
@@ -2723,6 +2743,10 @@
     "@crewhaus/target-graph": ["@crewhaus/target-graph@workspace:packages/target-graph"],
 
     "@crewhaus/target-managed": ["@crewhaus/target-managed@workspace:packages/target-managed"],
+
+    "@crewhaus/target-onchain": ["@crewhaus/target-onchain@workspace:packages/target-onchain"],
+
+    "@crewhaus/target-onchain-game": ["@crewhaus/target-onchain-game@workspace:packages/target-onchain-game"],
 
     "@crewhaus/target-pipeline": ["@crewhaus/target-pipeline@workspace:packages/target-pipeline"],
 
