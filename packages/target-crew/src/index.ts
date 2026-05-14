@@ -269,7 +269,12 @@ async function main(): Promise<void> {
     process.exit(1);
   }
   if (lastFinalOutput.length > 0) {
-    process.stderr.write(\`[crew] final: \${lastFinalOutput.slice(0, 200)}\\n\`);
+    const PREVIEW_LIMIT = 200;
+    const preview =
+      lastFinalOutput.length > PREVIEW_LIMIT
+        ? \`\${lastFinalOutput.slice(0, PREVIEW_LIMIT)}… [preview truncated; full output (\${lastFinalOutput.length} chars) is on stdout in the crew_done event]\`
+        : lastFinalOutput;
+    process.stderr.write(\`[crew] final: \${preview}\\n\`);
   }
 }
 
