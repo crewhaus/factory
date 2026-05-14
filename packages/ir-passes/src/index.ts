@@ -24,16 +24,28 @@
  *   deadToolElimination → redundantMcpServerCollapse →
  *   permissionRuleCanonicalize → promptCachePrefixSort
  */
+import { CrewhausError } from "@crewhaus/errors";
 import type {
+  IrChainBinding,
   IrChannelV0,
+  IrContractBinding,
   IrManagedV0,
   IrMcpServerConfig,
   IrMcpServers,
   IrNode,
   IrPermissionRule,
   IrPermissions,
+  IrTransactionPolicy,
   IrV0,
+  IrWalletBinding,
 } from "@crewhaus/ir";
+
+export class IrPassError extends CrewhausError {
+  override readonly name = "IrPassError";
+  constructor(message: string, cause?: unknown) {
+    super("compiler", message, cause);
+  }
+}
 
 export type IrPass = (ir: IrNode) => IrNode;
 
@@ -195,9 +207,140 @@ export function promptCachePrefixSort(ir: IrNode): IrNode {
   return ir;
 }
 
+/**
+ * Pass 5 — §47 transaction-policy enforcement. Validates the
+ * cross-cutting blockchain blocks at compile time so the runtime
+ * can rely on referential integrity:
+ *
+ *   - every `wallets[].chainId` references a declared `chains[].id`
+ *   - every `contracts[].chainId` references a declared `chains[].id`
+ *   - every `transaction_policy.allowed_contracts` entry references
+ *     a declared `contracts[].id`
+ *   - `transaction_policy.defaultWriteApproval = "none"` is only
+ *     permitted when every wallet is `automated` custody
+ *   - declared wallets without a key reference are user-controlled
+ *     (kms / hsm / local custody require `keyRef`)
+ *
+ * Mismatches throw `IrPassError` so compilation halts before any
+ * bundle is emitted. The wallet-engine also re-checks these at
+ * runtime (defense in depth); this pass catches mistakes at the
+ * earliest possible point.
+ */
+type CarriesChainSubsystem = {
+  readonly chains?: ReadonlyArray<IrChainBinding>;
+  readonly wallets?: ReadonlyArray<IrWalletBinding>;
+  readonly contracts?: ReadonlyArray<IrContractBinding>;
+  readonly transactionPolicy?: IrTransactionPolicy;
+};
+
+function carriesChainSubsystem(ir: IrNode): ir is IrNode & CarriesChainSubsystem {
+  const t = ir.target;
+  return (
+    t === "cli" ||
+    t === "workflow" ||
+    t === "channel" ||
+    t === "graph" ||
+    t === "crew" ||
+    t === "research" ||
+    t === "batch"
+  );
+}
+
+export function transactionPolicyEnforcement(ir: IrNode): IrNode {
+  if (!carriesChainSubsystem(ir)) return ir;
+  const chains = ir.chains;
+  const wallets = ir.wallets;
+  const contracts = ir.contracts;
+  const policy = ir.transactionPolicy;
+
+  // Empty subsystem is a no-op (existing specs untouched).
+  if (
+    (chains === undefined || chains.length === 0) &&
+    (wallets === undefined || wallets.length === 0) &&
+    (contracts === undefined || contracts.length === 0) &&
+    policy === undefined
+  ) {
+    return ir;
+  }
+
+  const chainIds = new Set<string>((chains ?? []).map((c) => c.id));
+  const contractIds = new Set<string>((contracts ?? []).map((c) => c.id));
+
+  // chains[] uniqueness
+  if (chains !== undefined) {
+    const seen = new Set<string>();
+    for (const c of chains) {
+      if (seen.has(c.id)) {
+        throw new IrPassError(`duplicate chains[].id "${c.id}"`);
+      }
+      seen.add(c.id);
+    }
+  }
+
+  // wallets[*].chainId ⊆ chains[].id; keyRef required for non-user-controlled
+  if (wallets !== undefined) {
+    const seen = new Set<string>();
+    for (const w of wallets) {
+      if (seen.has(w.id)) {
+        throw new IrPassError(`duplicate wallets[].id "${w.id}"`);
+      }
+      seen.add(w.id);
+      if (!chainIds.has(w.chainId)) {
+        throw new IrPassError(
+          `wallets[].id "${w.id}" references chainId "${w.chainId}" which is not declared in chains[]`,
+        );
+      }
+      if (w.custody !== "user-controlled" && w.keyRef === undefined) {
+        throw new IrPassError(
+          `wallets[].id "${w.id}" has custody="${w.custody}" but no keyRef; kms/hsm/local custody requires keyRef`,
+        );
+      }
+    }
+  }
+
+  // contracts[*].chainId ⊆ chains[].id
+  if (contracts !== undefined) {
+    const seen = new Set<string>();
+    for (const c of contracts) {
+      if (seen.has(c.id)) {
+        throw new IrPassError(`duplicate contracts[].id "${c.id}"`);
+      }
+      seen.add(c.id);
+      if (!chainIds.has(c.chainId)) {
+        throw new IrPassError(
+          `contracts[].id "${c.id}" references chainId "${c.chainId}" which is not declared in chains[]`,
+        );
+      }
+    }
+  }
+
+  // transaction_policy.allowed_contracts ⊆ contracts[].id
+  if (policy !== undefined) {
+    for (const cid of policy.allowedContracts) {
+      if (!contractIds.has(cid)) {
+        throw new IrPassError(
+          `transaction_policy.allowedContracts entry "${cid}" is not a declared contracts[].id`,
+        );
+      }
+    }
+    if (policy.defaultWriteApproval === "none") {
+      const allAutomated = (wallets ?? []).every((w) => w.signingPolicy === "automated");
+      if (!allAutomated) {
+        throw new IrPassError(
+          'transaction_policy.defaultWriteApproval="none" requires every wallet to have signingPolicy="automated"',
+        );
+      }
+    }
+  }
+
+  // No structural rewrite — the pass validates and passes through.
+  return ir;
+}
+
 export const DEFAULT_PIPELINE: ReadonlyArray<IrPass> = Object.freeze([
   deadToolElimination,
   redundantMcpServerCollapse,
   permissionRuleCanonicalize,
+  transactionPolicyEnforcement,
   promptCachePrefixSort,
 ]);

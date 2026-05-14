@@ -13,6 +13,7 @@
     "test": "bun test src"
   },
   "dependencies": {
+    "@crewhaus/errors": "workspace:*",
     "@crewhaus/ir": "workspace:*"
   }
 }

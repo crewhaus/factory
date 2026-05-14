@@ -1,0 +1,21 @@
+{
+  "name": "@crewhaus/tool-contract-gateway",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "ABI → typed-tool generator. Reads contracts[] from the IR; emits read tools (function stateMutability view/pure) and write tools (destructive: true, gated through wallet-engine). §47 slice 1.",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@crewhaus/errors": "workspace:*",
+    "@crewhaus/tool-builder": "workspace:*",
+    "@crewhaus/tool-catalog": "workspace:*",
+    "zod": "^3.23.8"
+  }
+}

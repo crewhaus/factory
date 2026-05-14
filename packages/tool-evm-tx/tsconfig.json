@@ -1,0 +1,15 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "include": ["src/**/*"],
+  "references": [
+    { "path": "../errors" },
+    { "path": "../tool-builder" },
+    { "path": "../tool-catalog" },
+    { "path": "../chain-adapter-base" },
+    { "path": "../wallet-engine" }
+  ]
+}
