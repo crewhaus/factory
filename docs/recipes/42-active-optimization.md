@@ -115,7 +115,7 @@ The full `OPTIMIZABLE_PATHS` whitelist (in [`packages/spec-patch/src/index.ts`](
 
 ## What `--write-back` actually does
 
-The biggest reason developers refuse to run `--write-back` against a committed spec is fear: "is the optimizer going to strip my comments? reorder my keys? clobber the `# DO NOT CHANGE THIS PROMPT` warning my teammate left?" The answer is no, but the mechanism is worth showing concretely so you trust the answer.
+The biggest reason developers refuse to run `--write-back` against a committed spec is fear: "is the optimizer going to strip my comments? reorder my keys? clobber the `# DO NOT CHANGE THIS PROMPT` warning my teammate left?" The answer is no, but the mechanism is worth showing concretely so you trust the answer. (For a side-by-side walkthrough that includes the failing-eval trace events alongside the YAML before/after, see [GETTING-STARTED.md § Scenario 2 — an eval failed and the optimizer wants to patch your prompt](../GETTING-STARTED.md#scenario-2--an-eval-failed-and-the-optimizer-wants-to-patch-your-prompt).)
 
 `applySpecPatch` ([packages/spec-patch/src/index.ts:90](../../packages/spec-patch/src/index.ts)) parses the YAML to a **concrete syntax tree** via the [`yaml`](https://eemeli.org/yaml/) package's `parseDocument`, mutates the targeted node by spec-path, and renders the tree back with `Document.toString()`. The CST tracks every byte of whitespace, every comment (leading, trailing, mid-line), and every key order. Bytes the patch doesn't touch render verbatim.
 
