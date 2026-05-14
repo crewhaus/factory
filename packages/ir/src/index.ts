@@ -658,6 +658,117 @@ export type IrEvalV0 = {
   readonly seed?: number;
 };
 
+/**
+ * Section 47 — `onchain` daemon trigger. The compiled daemon listens
+ * for one of three trigger kinds and runs one agent turn per inbound
+ * event:
+ *   - `event`: subscribe to a contract event (topic[0] = keccak of the
+ *     event signature). The daemon decodes the event using the
+ *     declared contract ABI and threads the decoded payload into the
+ *     agent's user message.
+ *   - `block`: scan new blocks at `scanIntervalMs` cadence, running
+ *     the agent against block-level summaries. Used by treasury
+ *     monitors and reorg detectors.
+ *   - `address`: watch transfers/calls to or from a watched address.
+ *     `direction` ("in" | "out" | "both") filters which side of the
+ *     transfer fires the trigger.
+ */
+export type IrChainTrigger =
+  | {
+      readonly kind: "event";
+      readonly chainId: string;
+      readonly contract: string;
+      readonly event: string;
+      readonly filter?: Readonly<Record<string, unknown>>;
+    }
+  | {
+      readonly kind: "block";
+      readonly chainId: string;
+      readonly scanIntervalMs: number;
+    }
+  | {
+      readonly kind: "address";
+      readonly chainId: string;
+      readonly address: string;
+      readonly direction: "in" | "out" | "both";
+    };
+
+/**
+ * Section 47 — IR for the `onchain` target shape. The compiled daemon
+ * subscribes to the configured triggers, dedupes events by `(txHash,
+ * logIndex)` within `idempotencyWindowMs`, and runs one
+ * `runChatLoop({singleTurn: true})` per inbound trigger with the
+ * decoded payload as the user message. The agent has access to the
+ * standard tool catalog (including §47 `tool-evm` + `tool-evm-tx`) so
+ * it can respond with transactions, alerts, or notifications.
+ */
+export type IrChainV0 = {
+  readonly version: 0;
+  readonly name: string;
+  readonly target: "onchain";
+  readonly agent: {
+    readonly model: string;
+    readonly instructions: string;
+  };
+  readonly chains: readonly IrChainBinding[];
+  readonly wallets: readonly IrWalletBinding[];
+  readonly contracts: readonly IrContractBinding[];
+  readonly transactionPolicy: IrTransactionPolicy;
+  readonly triggers: readonly IrChainTrigger[];
+  /** Dedup window for `(txHash, logIndex)` (or block height for block triggers). */
+  readonly idempotencyWindowMs: number;
+  readonly tools: readonly string[];
+  readonly toolConfigs: IrToolConfigs;
+  readonly mcp_servers: IrMcpServers;
+  readonly permissions: IrPermissions;
+  readonly compaction: IrCompaction;
+};
+
+/**
+ * Section 47 — IR for the `onchain-game` target. Models a perceive-act
+ * loop against a game contract: the daemon reads game state via the
+ * configured `stateReader` view function, runs the agent to propose a
+ * move, broadcasts the move as a transaction, waits for confirmation,
+ * and re-reads the new state. Closest analogues are `voice` (realtime
+ * perceive-act loop with barge-in) and `browser` (perceive-act loop
+ * with vision grounding). The chain-specific concerns are turn
+ * semantics (sync/realtime/async) and move-confirmation finality.
+ */
+export type IrChainGameTurnSemantics = "turn-based" | "real-time" | "async";
+
+export type IrChainGameV0 = {
+  readonly version: 0;
+  readonly name: string;
+  readonly target: "onchain-game";
+  readonly agent: {
+    readonly model: string;
+    readonly instructions: string;
+  };
+  /** Games are bound to one chain at a time; multi-chain games are rare. */
+  readonly chain: IrChainBinding;
+  /** Single player wallet. */
+  readonly wallet: IrWalletBinding;
+  readonly game: {
+    /** Game contract binding. */
+    readonly contract: IrContractBinding;
+    /** ABI method name for reading the full game state (a view fn). */
+    readonly stateReader: string;
+    /** Optional separate actions contract; defaults to game.contract. */
+    readonly actionsContract?: string;
+    readonly turnSemantics: IrChainGameTurnSemantics;
+    /** Hard cap on a move's wall-clock spend for real-time games. */
+    readonly moveTimeoutMs?: number;
+    /** Natural-language win condition the model uses to evaluate state. */
+    readonly objective?: string;
+  };
+  readonly transactionPolicy: IrTransactionPolicy;
+  readonly tools: readonly string[];
+  readonly toolConfigs: IrToolConfigs;
+  readonly mcp_servers: IrMcpServers;
+  readonly permissions: IrPermissions;
+  readonly compaction: IrCompaction;
+};
+
 export type IrNode =
   | IrV0
   | IrWorkflowV0
@@ -670,7 +781,9 @@ export type IrNode =
   | IrBatchV0
   | IrVoiceV0
   | IrBrowserV0
-  | IrEvalV0;
+  | IrEvalV0
+  | IrChainV0
+  | IrChainGameV0;
 
 /**
  * The output of compilation: a set of files to be written to disk by the

@@ -128,6 +128,8 @@ export function extractCurrentPrompt(spec: Spec): string {
     case "voice":
     case "browser":
     case "eval":
+    case "onchain":
+    case "onchain-game":
       return spec.agent.instructions;
     case "workflow":
     case "graph":

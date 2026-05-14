@@ -25,6 +25,8 @@
     "@crewhaus/target-crew": "workspace:*",
     "@crewhaus/target-graph": "workspace:*",
     "@crewhaus/target-managed": "workspace:*",
+    "@crewhaus/target-onchain": "workspace:*",
+    "@crewhaus/target-onchain-game": "workspace:*",
     "@crewhaus/target-pipeline": "workspace:*",
     "@crewhaus/target-research-bundle": "workspace:*",
     "@crewhaus/target-voice": "workspace:*",

@@ -237,6 +237,21 @@ export const OPTIMIZABLE_PATHS: Readonly<
   voice: Object.freeze([Object.freeze(["agent", "instructions"])]),
   browser: Object.freeze([Object.freeze(["agent", "instructions"])]),
   eval: Object.freeze([Object.freeze(["agent", "instructions"])]),
+  // §47 onchain daemon: full cross-cutting blocks are optimizable.
+  onchain: Object.freeze([
+    Object.freeze(["agent", "instructions"]),
+    Object.freeze(["chains"]),
+    Object.freeze(["triggers"]),
+    Object.freeze(["transaction_policy"]),
+    Object.freeze(["idempotencyWindowMs"]),
+  ]),
+  // §47 onchain-game: instructions, game.objective, and the policy are
+  // the productive knobs; move-timeout-ms is the realtime quality knob.
+  "onchain-game": Object.freeze([
+    Object.freeze(["agent", "instructions"]),
+    Object.freeze(["game"]),
+    Object.freeze(["transaction_policy"]),
+  ]),
 });
 
 function isOptimizable(target: Spec["target"], path: ReadonlyArray<string>): boolean {

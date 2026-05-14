@@ -107,6 +107,18 @@ Recipes that map directly onto the invariants codified in [`/CLAUDE.md`](../../C
 | 41 | [Security fabric](41-security-fabric.md)                        | Pillar 3 — fabric  | complete |
 | 42 | [Active optimization](42-active-optimization.md)                | Pillar 2 — active  | complete |
 
+## Part H — Section 47 blockchain shapes
+
+Recipes covering the §47 blockchain integration. Most blockchain "shapes" from the §47 proposal are compositions of existing IR variants with the cross-cutting `chains` / `wallets` / `contracts` / `transaction_policy` blocks — only the event daemon and game-playing shape needed new IR variants (recipe 47).
+
+| #  | Recipe                                                          | §47 shapes covered           | Status   |
+| -- | --------------------------------------------------------------- | ---------------------------- | -------- |
+| 43 | [Wallet-gated action](43-wallet-gated-action.md)                | Shapes 1, 11                 | complete |
+| 44 | [Chain as tool gateway](44-chain-as-tool-gateway.md)            | Shapes 2, 3, 5, 7            | complete |
+| 45 | [DAO governance crew](45-dao-governance-crew.md)                | Shape 6                      | complete |
+| 46 | [Tokenized access](46-tokenized-access.md)                      | Shapes 9, 12 (credential)    | complete |
+| 47 | [Onchain daemon & game](47-onchain-daemon-and-game.md)          | Shapes 8, 10 + on-chain games | complete |
+
 ---
 
 ## Suggested reading orders
@@ -117,13 +129,14 @@ Recipes that map directly onto the invariants codified in [`/CLAUDE.md`](../../C
 - **Shipping a SaaS.** 11 → 19 → 20 → 22 → 23 → 24 → 36.
 - **Multi-agent system.** 04 → 28 → 05 → 27.
 - **RAG / research.** 06 → 07 → 12.
+- **Blockchain integration.** 43 → 44 → 46 → 45 → 47.
 
 ## Status
 
 | Total recipes | Status                  |
 | ------------- | ----------------------- |
-| 42            | Total (01-40 + pillar recipes 41, 42) |
-| 42            | Walkthrough complete    |
+| 47            | Total (01-40 + pillar recipes 41, 42 + §47 recipes 43-47) |
+| 47            | Walkthrough complete    |
 | 0             | Stub                    |
 
 Each recipe walks from "I have an empty workspace" to "I have a
