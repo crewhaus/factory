@@ -92,6 +92,11 @@ export type IrV0 = {
   readonly permissions: IrPermissions;
   readonly subAgents: readonly IrSubAgentDefinition[];
   readonly compaction: IrCompaction;
+  /** §47 cross-cutting blockchain subsystem (slice 0). All optional. */
+  readonly chains?: readonly IrChainBinding[];
+  readonly wallets?: readonly IrWalletBinding[];
+  readonly contracts?: readonly IrContractBinding[];
+  readonly transactionPolicy?: IrTransactionPolicy;
 };
 
 /**
@@ -118,6 +123,11 @@ export type IrWorkflowV0 = {
   readonly steps: readonly IrWorkflowStep[];
   readonly mcp_servers: IrMcpServers;
   readonly permissions: IrPermissions;
+  /** §47 cross-cutting blockchain subsystem (slice 0). All optional. */
+  readonly chains?: readonly IrChainBinding[];
+  readonly wallets?: readonly IrWalletBinding[];
+  readonly contracts?: readonly IrContractBinding[];
+  readonly transactionPolicy?: IrTransactionPolicy;
   readonly compaction: IrCompaction;
 };
 
@@ -132,6 +142,95 @@ export type IrWorkflowV0 = {
 export type IrSecretRef =
   | { readonly kind: "literal"; readonly value: string }
   | { readonly kind: "env"; readonly name: string };
+
+/**
+ * Section 47 — Blockchain primitives (cross-cutting subsystem).
+ *
+ * These types are shared across shapes that interact with chain state.
+ * Any shape may declare optional `chains` / `wallets` / `contracts` /
+ * `transactionPolicy` blocks; the §47 `onchain` and `onchain-game`
+ * target variants additionally require `triggers` and a `game` block
+ * respectively (those types land with slice 2).
+ *
+ * Finality policy is encoded explicitly because reorg tolerance and
+ * confirmation counts are quality knobs (Pillar 2: optimizable) and
+ * security boundaries (Pillar 3: a wrong finality choice lets an
+ * attacker present a reorged log as real). See [docs/recipes/47-onchain-daemon-and-game.md](docs/recipes/47-onchain-daemon-and-game.md).
+ */
+export type IrChainFinality =
+  | { readonly kind: "confirmations"; readonly count: number }
+  | { readonly kind: "finalized" }
+  | { readonly kind: "safe" };
+
+/**
+ * Resolved chain config. `kind: "evm"` is the only supported family in
+ * slice 0/1/2 — Solana, Cosmos, and Bitcoin are deferred. `rpcUrls` is
+ * an array of `IrSecretRef` so URLs that carry API keys (Alchemy,
+ * Infura) can be loaded from env at runtime. `rpcPolicy` controls how
+ * multiple URLs are used: `single` picks the first, `fallback` retries
+ * the next on error, `quorum` requires N/M agreement on critical reads.
+ */
+export type IrChainBinding = {
+  readonly id: string;
+  readonly kind: "evm";
+  readonly rpcUrls: readonly IrSecretRef[];
+  readonly rpcPolicy: "single" | "quorum" | "fallback";
+  readonly finality: IrChainFinality;
+  readonly reorgTolerant: boolean;
+};
+
+/**
+ * Wallet binding — how the runtime signs transactions for `chainId`.
+ * `custody` declares where the key lives; `signingPolicy` declares how
+ * each sign request is gated. The default for any `destructive: true`
+ * tool that uses this wallet is `explicit-user-approval`; `policy-gated`
+ * defers to the §47 `transaction_policy` block; `automated` is only
+ * permitted when the wallet is also marked `kms` or `hsm` custody.
+ * `keyRef` is required for `kms` / `hsm` / `local` custody; for
+ * `user-controlled` (WalletConnect, MetaMask, etc.) the signing happens
+ * externally and `keyRef` is omitted.
+ */
+export type IrWalletBinding = {
+  readonly id: string;
+  readonly chainId: string;
+  readonly custody: "user-controlled" | "kms" | "hsm" | "local";
+  readonly signingPolicy: "explicit-user-approval" | "policy-gated" | "automated";
+  readonly keyRef?: IrSecretRef;
+};
+
+/**
+ * Smart-contract binding. `abiRef` is a string the
+ * `tool-contract-gateway` (slice 1) resolves into a typed-tool set;
+ * supported schemes are `abi://erc20`, `abi://erc721`, `abi://erc1155`,
+ * and `file://path/to/abi.json`. Reads against this contract become
+ * `readOnly: true` tools; writes become `destructive: true` and gate
+ * approval automatically via `permission-engine`.
+ */
+export type IrContractBinding = {
+  readonly id: string;
+  readonly chainId: string;
+  readonly address: string;
+  readonly abiRef: string;
+};
+
+/**
+ * Transaction policy — the safety floor for any tool that signs and
+ * broadcasts a transaction. `defaultWriteApproval: "required"` is the
+ * default; setting it to `"none"` is only valid when every wallet is
+ * `automated` custody, which the §47 IR pass enforces. `maxValueUsd`
+ * is an upper bound on native-token transfers (in USD, evaluated at
+ * sign-time via the configured price oracle); transactions exceeding
+ * the cap are rejected pre-broadcast. `allowedContracts` is a list of
+ * `IrContractBinding.id` values — destructive calls to any other
+ * contract are rejected. `simulationRequired: true` forces every
+ * destructive call through a fork-simulator before approval.
+ */
+export type IrTransactionPolicy = {
+  readonly defaultWriteApproval: "required" | "policy" | "none";
+  readonly maxValueUsd?: number;
+  readonly allowedContracts: readonly string[];
+  readonly simulationRequired: boolean;
+};
 
 export type IrSlackConfig = {
   readonly botToken: IrSecretRef;
@@ -219,6 +318,11 @@ export type IrChannelV0 = {
   readonly permissions: IrPermissions;
   readonly subAgents: readonly IrSubAgentDefinition[];
   readonly compaction: IrCompaction;
+  /** §47 cross-cutting blockchain subsystem (slice 0). All optional. */
+  readonly chains?: readonly IrChainBinding[];
+  readonly wallets?: readonly IrWalletBinding[];
+  readonly contracts?: readonly IrContractBinding[];
+  readonly transactionPolicy?: IrTransactionPolicy;
 };
 
 /**
@@ -280,6 +384,11 @@ export type IrGraphV0 = {
   readonly edges: readonly IrGraphEdge[];
   readonly permissions: IrPermissions;
   readonly compaction: IrCompaction;
+  /** §47 cross-cutting blockchain subsystem (slice 0). All optional. */
+  readonly chains?: readonly IrChainBinding[];
+  readonly wallets?: readonly IrWalletBinding[];
+  readonly contracts?: readonly IrContractBinding[];
+  readonly transactionPolicy?: IrTransactionPolicy;
 };
 
 /**
@@ -357,6 +466,11 @@ export type IrCrewV0 = {
   readonly mcp_servers: IrMcpServers;
   readonly permissions: IrPermissions;
   readonly compaction: IrCompaction;
+  /** §47 cross-cutting blockchain subsystem (slice 0). All optional. */
+  readonly chains?: readonly IrChainBinding[];
+  readonly wallets?: readonly IrWalletBinding[];
+  readonly contracts?: readonly IrContractBinding[];
+  readonly transactionPolicy?: IrTransactionPolicy;
 };
 
 /**
@@ -394,6 +508,11 @@ export type IrResearchV0 = {
   readonly mcp_servers: IrMcpServers;
   readonly permissions: IrPermissions;
   readonly compaction: IrCompaction;
+  /** §47 cross-cutting blockchain subsystem (slice 0). All optional. */
+  readonly chains?: readonly IrChainBinding[];
+  readonly wallets?: readonly IrWalletBinding[];
+  readonly contracts?: readonly IrContractBinding[];
+  readonly transactionPolicy?: IrTransactionPolicy;
 };
 
 /**
@@ -431,6 +550,11 @@ export type IrBatchV0 = {
   readonly mcp_servers: IrMcpServers;
   readonly permissions: IrPermissions;
   readonly compaction: IrCompaction;
+  /** §47 cross-cutting blockchain subsystem (slice 0). All optional. */
+  readonly chains?: readonly IrChainBinding[];
+  readonly wallets?: readonly IrWalletBinding[];
+  readonly contracts?: readonly IrContractBinding[];
+  readonly transactionPolicy?: IrTransactionPolicy;
 };
 
 /**

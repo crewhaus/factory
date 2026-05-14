@@ -722,6 +722,23 @@
         "@crewhaus/spec-registry": "workspace:*",
       },
     },
+    "packages/chain-adapter-base": {
+      "name": "@crewhaus/chain-adapter-base",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/boundary-classifier": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
+      },
+    },
+    "packages/chain-adapter-evm": {
+      "name": "@crewhaus/chain-adapter-evm",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/boundary-classifier": "workspace:*",
+        "@crewhaus/chain-adapter-base": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
+      },
+    },
     "packages/channel-adapter-discord": {
       "name": "@crewhaus/channel-adapter-discord",
       "version": "0.0.0",
@@ -1912,6 +1929,18 @@
         "zod": "^3.23.8",
       },
     },
+    "packages/tool-evm": {
+      "name": "@crewhaus/tool-evm",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/chain-adapter-base": "workspace:*",
+        "@crewhaus/chain-adapter-evm": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "zod": "^3.23.8",
+      },
+    },
     "packages/tool-executor": {
       "name": "@crewhaus/tool-executor",
       "version": "0.0.0",
@@ -2418,6 +2447,10 @@
 
     "@crewhaus/canary-controller": ["@crewhaus/canary-controller@workspace:packages/canary-controller"],
 
+    "@crewhaus/chain-adapter-base": ["@crewhaus/chain-adapter-base@workspace:packages/chain-adapter-base"],
+
+    "@crewhaus/chain-adapter-evm": ["@crewhaus/chain-adapter-evm@workspace:packages/chain-adapter-evm"],
+
     "@crewhaus/channel-adapter-discord": ["@crewhaus/channel-adapter-discord@workspace:packages/channel-adapter-discord"],
 
     "@crewhaus/channel-adapter-imessage": ["@crewhaus/channel-adapter-imessage@workspace:packages/channel-adapter-imessage"],
@@ -2671,6 +2704,8 @@
     "@crewhaus/tool-catalog": ["@crewhaus/tool-catalog@workspace:packages/tool-catalog"],
 
     "@crewhaus/tool-code-execution": ["@crewhaus/tool-code-execution@workspace:packages/tool-code-execution"],
+
+    "@crewhaus/tool-evm": ["@crewhaus/tool-evm@workspace:packages/tool-evm"],
 
     "@crewhaus/tool-executor": ["@crewhaus/tool-executor@workspace:packages/tool-executor"],
 

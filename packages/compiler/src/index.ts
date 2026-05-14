@@ -3,9 +3,12 @@ import type {
   Bundle,
   IrBatchV0,
   IrBrowserV0,
+  IrChainBinding,
+  IrChainFinality,
   IrChannelV0,
   IrChannels,
   IrCompaction,
+  IrContractBinding,
   IrCrewRole,
   IrCrewV0,
   IrDiscordConfig,
@@ -23,8 +26,10 @@ import type {
   IrSlackConfig,
   IrSubAgentDefinition,
   IrTelegramConfig,
+  IrTransactionPolicy,
   IrV0,
   IrVoiceV0,
+  IrWalletBinding,
   IrWhatsAppConfig,
   IrWorkflowV0,
 } from "@crewhaus/ir";
@@ -242,6 +247,112 @@ function lowerCompaction(spec: SpecWithPermissions): IrCompaction {
   return c.model !== undefined ? { model: c.model } : {};
 }
 
+/**
+ * Section 47 — normalise the cross-cutting blockchain subsystem blocks
+ * (chains / wallets / contracts / transaction_policy). Each block is
+ * optional; the helper returns a partial that's spread into the IR
+ * variant, so unused blocks remain absent (Pillar 1: emitters check
+ * presence and skip chain init when none are declared).
+ *
+ * `rpcUrls` and `keyRef` strings are routed through `lowerSecret` so
+ * `$ALCHEMY_URL` / `$KMS_KEY_ID` become env-var references at runtime
+ * — the bundle never embeds RPC credentials or signing keys.
+ *
+ * Validation that's not expressible in Zod (cross-block references —
+ * `wallets[*].chainId` must reference declared `chains[*].id`,
+ * `transaction_policy.allowed_contracts` must reference declared
+ * `contracts[*].id`) is enforced by the §47 IR pass in `ir-passes`
+ * (slice 1). At the compiler layer we just pass values through.
+ */
+type SpecChainSubsystem = {
+  readonly chains?: ReadonlyArray<{
+    readonly id: string;
+    readonly kind: "evm";
+    readonly rpcUrls: readonly string[];
+    readonly rpcPolicy: "single" | "quorum" | "fallback";
+    readonly finality:
+      | { readonly kind: "confirmations"; readonly count: number }
+      | { readonly kind: "finalized" }
+      | { readonly kind: "safe" };
+    readonly reorgTolerant: boolean;
+  }>;
+  readonly wallets?: ReadonlyArray<{
+    readonly id: string;
+    readonly chainId: string;
+    readonly custody: "user-controlled" | "kms" | "hsm" | "local";
+    readonly signingPolicy: "explicit-user-approval" | "policy-gated" | "automated";
+    readonly keyRef?: string;
+  }>;
+  readonly contracts?: ReadonlyArray<{
+    readonly id: string;
+    readonly chainId: string;
+    readonly address: string;
+    readonly abiRef: string;
+  }>;
+  readonly transaction_policy?: {
+    readonly defaultWriteApproval: "required" | "policy" | "none";
+    readonly maxValueUsd?: number;
+    readonly allowedContracts: readonly string[];
+    readonly simulationRequired: boolean;
+  };
+};
+
+type IrChainSubsystem = {
+  chains?: readonly IrChainBinding[];
+  wallets?: readonly IrWalletBinding[];
+  contracts?: readonly IrContractBinding[];
+  transactionPolicy?: IrTransactionPolicy;
+};
+
+function lowerChainFinality(
+  f: NonNullable<SpecChainSubsystem["chains"]>[number]["finality"],
+): IrChainFinality {
+  if (f.kind === "confirmations") return { kind: "confirmations", count: f.count };
+  if (f.kind === "finalized") return { kind: "finalized" };
+  return { kind: "safe" };
+}
+
+function lowerChainSubsystem(spec: SpecChainSubsystem): IrChainSubsystem {
+  const out: IrChainSubsystem = {};
+  if (spec.chains !== undefined) {
+    out.chains = spec.chains.map((c) => ({
+      id: c.id,
+      kind: c.kind,
+      rpcUrls: c.rpcUrls.map(lowerSecret),
+      rpcPolicy: c.rpcPolicy,
+      finality: lowerChainFinality(c.finality),
+      reorgTolerant: c.reorgTolerant,
+    }));
+  }
+  if (spec.wallets !== undefined) {
+    out.wallets = spec.wallets.map((w) => ({
+      id: w.id,
+      chainId: w.chainId,
+      custody: w.custody,
+      signingPolicy: w.signingPolicy,
+      ...(w.keyRef !== undefined ? { keyRef: lowerSecret(w.keyRef) } : {}),
+    }));
+  }
+  if (spec.contracts !== undefined) {
+    out.contracts = spec.contracts.map((ct) => ({
+      id: ct.id,
+      chainId: ct.chainId,
+      address: ct.address,
+      abiRef: ct.abiRef,
+    }));
+  }
+  if (spec.transaction_policy !== undefined) {
+    const tp = spec.transaction_policy;
+    out.transactionPolicy = {
+      defaultWriteApproval: tp.defaultWriteApproval,
+      ...(tp.maxValueUsd !== undefined ? { maxValueUsd: tp.maxValueUsd } : {}),
+      allowedContracts: [...tp.allowedContracts],
+      simulationRequired: tp.simulationRequired,
+    };
+  }
+  return out;
+}
+
 export function lower(spec: Spec): IrNode {
   switch (spec.target) {
     case "cli":
@@ -259,6 +370,7 @@ export function lower(spec: Spec): IrNode {
         permissions: lowerPermissions(spec),
         subAgents: lowerSubAgents(spec.agent.sub_agents),
         compaction: lowerCompaction(spec),
+        ...lowerChainSubsystem(spec),
       } satisfies IrV0;
     case "workflow":
       return {
@@ -275,6 +387,7 @@ export function lower(spec: Spec): IrNode {
         mcp_servers: lowerMcpServers(spec.mcp_servers),
         permissions: lowerPermissions(spec),
         compaction: lowerCompaction(spec),
+        ...lowerChainSubsystem(spec),
       } satisfies IrWorkflowV0;
     case "channel":
       return {
@@ -293,6 +406,7 @@ export function lower(spec: Spec): IrNode {
         permissions: lowerPermissions(spec),
         subAgents: lowerSubAgents(spec.agent.sub_agents),
         compaction: lowerCompaction(spec),
+        ...lowerChainSubsystem(spec),
       } satisfies IrChannelV0;
     case "graph":
       return {
@@ -313,6 +427,7 @@ export function lower(spec: Spec): IrNode {
         edges: spec.edges.map((e) => ({ from: e.from, to: e.to })),
         permissions: lowerPermissions(spec),
         compaction: lowerCompaction(spec),
+        ...lowerChainSubsystem(spec),
       } satisfies IrGraphV0;
     case "managed":
       return {
@@ -375,6 +490,7 @@ export function lower(spec: Spec): IrNode {
         mcp_servers: lowerMcpServers(spec.mcp_servers),
         permissions: lowerPermissions(spec),
         compaction: lowerCompaction(spec),
+        ...lowerChainSubsystem(spec),
       } satisfies IrCrewV0;
     case "research":
       return {
@@ -397,6 +513,7 @@ export function lower(spec: Spec): IrNode {
         mcp_servers: lowerMcpServers(spec.mcp_servers),
         permissions: lowerPermissions(spec),
         compaction: lowerCompaction(spec),
+        ...lowerChainSubsystem(spec),
       } satisfies IrResearchV0;
     case "batch":
       return {
@@ -420,6 +537,7 @@ export function lower(spec: Spec): IrNode {
         mcp_servers: lowerMcpServers(spec.mcp_servers),
         permissions: lowerPermissions(spec),
         compaction: lowerCompaction(spec),
+        ...lowerChainSubsystem(spec),
       } satisfies IrBatchV0;
     case "voice":
       return {
