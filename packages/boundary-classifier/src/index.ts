@@ -68,7 +68,8 @@ export type TrustOrigin =
   | "federation"
   | "skill"
   | "compaction"
-  | "tool";
+  | "tool"
+  | "chain";
 
 export type BoundarySeverity = "block" | "warn" | "pass";
 
@@ -93,6 +94,12 @@ const ORIGIN_DEFAULT_POLICY: Record<TrustOrigin, BoundarySeverity> = {
   skill: "block",
   compaction: "block",
   tool: "block",
+  // Chain content: RPC responses, decoded event logs, peer-signed claims.
+  // Authenticated transport (mTLS, JWT) verifies *who* served it; classification
+  // verifies *what* it contains. An attacker who controls a node, an indexer,
+  // or an event-emitting contract can plant malicious strings in event payloads
+  // that get decoded and injected into the model's context. Block by default.
+  chain: "block",
 };
 
 export type ClassifyBoundaryOptions = {

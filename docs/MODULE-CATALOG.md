@@ -419,6 +419,9 @@ These ship as **selectable building blocks** the factory wires into a generated 
 | ✅ `tool-mouse-keyboard` | Click / Type / Key / Scroll — all `destructive: true`. | BROW | T1, T3 | `tool-builder`, `computer-use-driver` |
 | ✅ `tool-vision-grounding` | `FindElement(description)` → vision-model bbox lookup. | BROW, CLI | T1, T5, T6 | `tool-builder`, `tool-screen-capture`, `model-adapter` |
 | 🟡 `tool-dom-inspector` | DOM/AX-tree-based element queries (when in browser). | BROW | T1, T2, T3 | `tool-builder`, `browser-extension-bridge` |
+| ✅ `tool-evm` | Read-only EVM tools (EvmCall, EvmGetLogs, EvmGetTransaction, EvmGetTransactionReceipt, EvmGetBalance, EvmBlockNumber). §47 slice 0. | CLI, WF, CHN, GRPH, CRW, RES, BATCH | T1, T3 | `tool-builder`, `chain-adapter-base`, `chain-adapter-evm` |
+| 🟡 `tool-evm-tx` | Destructive EVM transaction tools — sign+broadcast, simulation, status check. §47 slice 1. | CLI, WF, CHN, GRPH, CRW, BATCH, ONCHAIN | T1, T3, T8 | `tool-builder`, `wallet-engine`, `chain-adapter-evm` |
+| 🟡 `tool-contract-gateway` | ABI → typed-tool generator (compile-time). §47 slice 1. | CLI, WF, CHN, GRPH, CRW | T1, T9 | `tool-builder`, `chain-adapter-base` |
 
 #### R5 — MCP & Protocol Hosts
 
@@ -430,6 +433,9 @@ These ship as **selectable building blocks** the factory wires into a generated 
 | 🟡 `acp-protocol` | Agent Control Plane protocol (session policy, approvals, spawning). | CHN, MGD | T1, T2 | `permission-engine`, `hooks-engine`, `gateway-server` |
 | 🟡 `ag-ui-protocol` | Agent-UI protocol streaming UI events. | CLI, CHN, MGD | T1, T2, T3 | `trace-event-bus`, `gateway-server` |
 | 🟡 `webhook-host` | Inbound webhook receiver. | CHN, BATCH, MGD | T1, T2, T8 | `secrets-manager`, `gateway-server`, `idempotency-keys` |
+| ✅ `chain-adapter-base` | Abstract `ChainAdapter` contract + read-method allowlist + `classifyChainPayload` wrap-on-read. §47 slice 0. | All shapes that declare `chains[]` | T1, T8 | `errors`, `boundary-classifier` |
+| ✅ `chain-adapter-evm` | EVM JSON-RPC adapter — single/quorum/fallback dispatch, JSON-RPC error decoding, §41 classifier integration. §47 slice 0. | All shapes that declare `chains[]` with `kind: "evm"` | T1, T3, T8 | `chain-adapter-base`, `boundary-classifier` |
+| 🟡 `chain-adapter-solana` / `chain-adapter-cosmos` / `chain-adapter-bitcoin` | Non-EVM adapters. §47 deferred. | All | T1, T3, T8 | `chain-adapter-base` |
 
 #### R6 — Context & Memory
 

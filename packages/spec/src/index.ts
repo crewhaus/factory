@@ -107,6 +107,74 @@ const compactionBlock = z
   .strict()
   .optional();
 
+/**
+ * Section 47 — blockchain subsystem blocks (cross-cutting). Any shape may
+ * declare any subset of `chains` / `wallets` / `contracts` /
+ * `transaction_policy`. Authoring rules:
+ *   - `chains[]`: at least one when other blocks are present.
+ *   - `wallets[]`: every entry references a declared `chains[].id`.
+ *   - `contracts[]`: every entry references a declared `chains[].id`.
+ *   - `transaction_policy`: enforced by §47 IR pass at compile time;
+ *     entries in `allowed_contracts` must reference declared `contracts[].id`.
+ * Per-field semantics mirror the IR variants in `@crewhaus/ir`.
+ */
+const chainFinalitySchema = z.discriminatedUnion("kind", [
+  z
+    .object({
+      kind: z.literal("confirmations"),
+      count: z.number().int().min(0).max(256),
+    })
+    .strict(),
+  z.object({ kind: z.literal("finalized") }).strict(),
+  z.object({ kind: z.literal("safe") }).strict(),
+]);
+
+const chainBindingSchema = z
+  .object({
+    id: z.string().min(1),
+    kind: z.literal("evm"),
+    rpcUrls: z.array(z.string().min(1)).min(1),
+    rpcPolicy: z.enum(["single", "quorum", "fallback"]).default("single"),
+    finality: chainFinalitySchema,
+    reorgTolerant: z.boolean().default(true),
+  })
+  .strict();
+
+const walletBindingSchema = z
+  .object({
+    id: z.string().min(1),
+    chainId: z.string().min(1),
+    custody: z.enum(["user-controlled", "kms", "hsm", "local"]),
+    signingPolicy: z
+      .enum(["explicit-user-approval", "policy-gated", "automated"])
+      .default("explicit-user-approval"),
+    keyRef: z.string().min(1).optional(),
+  })
+  .strict();
+
+const contractBindingSchema = z
+  .object({
+    id: z.string().min(1),
+    chainId: z.string().min(1),
+    address: z.string().min(1),
+    abiRef: z.string().min(1),
+  })
+  .strict();
+
+const transactionPolicySchema = z
+  .object({
+    defaultWriteApproval: z.enum(["required", "policy", "none"]).default("required"),
+    maxValueUsd: z.number().positive().optional(),
+    allowedContracts: z.array(z.string().min(1)).default([]),
+    simulationRequired: z.boolean().default(true),
+  })
+  .strict();
+
+const chainsBlock = z.array(chainBindingSchema).optional();
+const walletsBlock = z.array(walletBindingSchema).optional();
+const contractsBlock = z.array(contractBindingSchema).optional();
+const transactionPolicyBlock = transactionPolicySchema.optional();
+
 const cliSchema = z
   .object({
     name: z.string().min(1),
@@ -123,6 +191,10 @@ const cliSchema = z
     mcp_servers: mcpServersBlock,
     permissions: permissionsBlock,
     compaction: compactionBlock,
+    chains: chainsBlock,
+    wallets: walletsBlock,
+    contracts: contractsBlock,
+    transaction_policy: transactionPolicyBlock,
   })
   .strict();
 
@@ -145,6 +217,10 @@ const workflowSchema = z
     mcp_servers: mcpServersBlock,
     permissions: permissionsBlock,
     compaction: compactionBlock,
+    chains: chainsBlock,
+    wallets: walletsBlock,
+    contracts: contractsBlock,
+    transaction_policy: transactionPolicyBlock,
   })
   .strict();
 
@@ -238,6 +314,10 @@ const channelSchema = z
     mcp_servers: mcpServersBlock,
     permissions: permissionsBlock,
     compaction: compactionBlock,
+    chains: chainsBlock,
+    wallets: walletsBlock,
+    contracts: contractsBlock,
+    transaction_policy: transactionPolicyBlock,
   })
   .strict();
 
@@ -281,6 +361,10 @@ const graphSchema = z
     edges: z.array(graphEdgeSchema).default([]),
     permissions: permissionsBlock,
     compaction: compactionBlock,
+    chains: chainsBlock,
+    wallets: walletsBlock,
+    contracts: contractsBlock,
+    transaction_policy: transactionPolicyBlock,
   })
   .strict();
 
@@ -400,6 +484,10 @@ const crewSchema = z
     mcp_servers: mcpServersBlock,
     permissions: permissionsBlock,
     compaction: compactionBlock,
+    chains: chainsBlock,
+    wallets: walletsBlock,
+    contracts: contractsBlock,
+    transaction_policy: transactionPolicyBlock,
   })
   .strict();
 // `.refine()` on a discriminatedUnion member would change the type from
@@ -438,6 +526,10 @@ const researchSchema = z
     mcp_servers: mcpServersBlock,
     permissions: permissionsBlock,
     compaction: compactionBlock,
+    chains: chainsBlock,
+    wallets: walletsBlock,
+    contracts: contractsBlock,
+    transaction_policy: transactionPolicyBlock,
   })
   .strict();
 
@@ -473,6 +565,10 @@ const batchSchema = z
     mcp_servers: mcpServersBlock,
     permissions: permissionsBlock,
     compaction: compactionBlock,
+    chains: chainsBlock,
+    wallets: walletsBlock,
+    contracts: contractsBlock,
+    transaction_policy: transactionPolicyBlock,
   })
   .strict();
 

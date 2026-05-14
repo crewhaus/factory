@@ -24,6 +24,7 @@ describe("classifyBoundary — defaults per origin", () => {
       "skill",
       "compaction",
       "tool",
+      "chain",
     ];
     for (const origin of origins) {
       const res = await classifyBoundary(CLEAN, { origin, bypassCache: true });
@@ -43,6 +44,7 @@ describe("classifyBoundary — defaults per origin", () => {
       "skill",
       "compaction",
       "tool",
+      "chain",
     ];
     for (const origin of blocking) {
       const res = await classifyBoundary(MALICIOUS, { origin, bypassCache: true });

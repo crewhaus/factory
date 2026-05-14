@@ -189,10 +189,28 @@ export const OPTIMIZABLE_PATHS: Readonly<
   cli: Object.freeze([
     Object.freeze(["agent", "instructions"]),
     Object.freeze(["compaction", "threshold"]),
+    // §47 blockchain subsystem (slice 0). Whole-block replacement so the
+    // optimizer can tune `chains[*].finality.count`, `chains[*].rpcPolicy`,
+    // `transaction_policy.maxValueUsd`, and `transaction_policy.simulationRequired`
+    // by patching their parent block.
+    Object.freeze(["chains"]),
+    Object.freeze(["transaction_policy"]),
   ]),
-  workflow: Object.freeze([Object.freeze(["steps"])]) /* whole-step replacement allowed */,
-  channel: Object.freeze([Object.freeze(["agent", "instructions"])]),
-  graph: Object.freeze([Object.freeze(["nodes"])]),
+  workflow: Object.freeze([
+    Object.freeze(["steps"]),
+    Object.freeze(["chains"]),
+    Object.freeze(["transaction_policy"]),
+  ]) /* whole-step replacement allowed */,
+  channel: Object.freeze([
+    Object.freeze(["agent", "instructions"]),
+    Object.freeze(["chains"]),
+    Object.freeze(["transaction_policy"]),
+  ]),
+  graph: Object.freeze([
+    Object.freeze(["nodes"]),
+    Object.freeze(["chains"]),
+    Object.freeze(["transaction_policy"]),
+  ]),
   managed: Object.freeze([Object.freeze(["agent", "instructions"])]),
   pipeline: Object.freeze([
     Object.freeze(["agent", "instructions"]),
@@ -200,12 +218,22 @@ export const OPTIMIZABLE_PATHS: Readonly<
     Object.freeze(["indexing", "chunkOverlap"]),
     Object.freeze(["retrieve", "defaultK"]),
   ]),
-  crew: Object.freeze([Object.freeze(["roles"])]) /* whole-role replacement */,
+  crew: Object.freeze([
+    Object.freeze(["roles"]),
+    Object.freeze(["chains"]),
+    Object.freeze(["transaction_policy"]),
+  ]) /* whole-role replacement */,
   research: Object.freeze([
     Object.freeze(["agent", "instructions"]),
     Object.freeze(["retrieve", "maxDepth"]),
+    Object.freeze(["chains"]),
+    Object.freeze(["transaction_policy"]),
   ]),
-  batch: Object.freeze([Object.freeze(["agent", "instructions"])]),
+  batch: Object.freeze([
+    Object.freeze(["agent", "instructions"]),
+    Object.freeze(["chains"]),
+    Object.freeze(["transaction_policy"]),
+  ]),
   voice: Object.freeze([Object.freeze(["agent", "instructions"])]),
   browser: Object.freeze([Object.freeze(["agent", "instructions"])]),
   eval: Object.freeze([Object.freeze(["agent", "instructions"])]),
