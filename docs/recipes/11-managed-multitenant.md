@@ -29,6 +29,50 @@ chat input) or [`batch`](08-batch-worker.md) (for queue input).
 Multi-tenant adds gateway overhead and operational discipline that's
 not worth it for a single user.
 
+<details>
+<summary><strong>Architectural context</strong> — managed harnesses as a category, and the cost-per-successful-run frame</summary>
+
+The `managed` target is crewhaus's open-source mapping for the
+**managed harness platform** category that AWS AgentCore, Anthropic
+Managed Agents, Azure Foundry, and Gemini Agent Engine all occupy
+([docs/AI-Harness-Systems.md](../AI-Harness-Systems.md)). The
+unifying lesson across those platforms is that the "managed" surface
+is not just a deployment convenience — it's a **billing surface**.
+Anthropic prices sessions in `running` state at $0.08/hour; OpenAI
+charges tokens plus tool/container fees; Azure adds tool-specific
+charges (Code Interpreter, Bing grounding); AWS bills AgentCore
+runtime/gateway/memory separately. The architectural conclusion: when
+sessions are long-lived and externally-triggered, **cost per
+successful run** is the metric to instrument, not just token cost
+per call.
+
+That insight shapes three managed-target invariants:
+
+- **Per-tenant budgets are first-class spec fields**, not external
+  policy. The runtime stops the session when the budget exhausts;
+  there is no graceful failure mode where one tenant's session
+  silently bills another tenant.
+- **Hash-chained audit logs** mirror the SOC 2 evidence collection
+  pattern that every managed platform exposes (AgentCore observability,
+  Foundry's Azure Monitor integration, Anthropic's persistent event
+  history). The chain makes log tampering detectable, which is the
+  property compliance auditors care about — not log volume.
+- **Storage rebased per tenant** prevents the failure mode managed
+  platforms work hardest to avoid: cross-tenant data leakage through
+  a shared cache, a shared embedding store, or a shared session
+  history. The same shape AWS uses for multi-tenant AgentCore
+  deployments.
+
+Pillar 3 implications ([CLAUDE.md](../../CLAUDE.md)): every JSON-RPC
+inbound request carries authenticated tenant identity *and* unclassified
+user text. Authentication says *who* sent the request; the
+boundary-classifier still classifies the body as `TrustOrigin: "channel"`
+before it reaches the model. Skipping the classifier for "authenticated"
+tenants is the single most common managed-harness security regression
+in the wild.
+
+</details>
+
 ## Prerequisites
 
 - [Recipe 01 — CLI Coding Agent](01-cli-coding-agent.md) for the

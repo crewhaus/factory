@@ -31,6 +31,40 @@ If your jobs need to coordinate (peer queries, shared state), use
 your goal is one long-horizon research task, use
 [research](07-autonomous-research.md).
 
+<details>
+<summary><strong>Architectural context</strong> — batch as the "background mode" pattern, with at-least-once semantics</summary>
+
+`batch` is the harness's mapping for the **background-mode** pattern
+OpenAI added to the Responses API for long-running tasks
+([docs/AI-Harness-Systems.md](../AI-Harness-Systems.md)) and the
+queue-worker pattern that every cloud-managed harness exposes (AWS
+SQS-backed agents, Foundry Agent Service queues, Anthropic's session
+runtime). The unifying invariant: **the calling system doesn't block
+on the model; the worker pulls, runs, and acks**. Three architectural
+lessons land here:
+
+- **Visibility-extended consumption** — long model calls would
+  otherwise time out the queue's visibility window and the job would
+  be redelivered mid-flight. The runtime extends visibility on a heartbeat,
+  the same shape SQS and AgentCore use.
+- **Idempotency keys, not exactly-once** — at-least-once delivery is
+  the only honest cross-queue guarantee. A duplicate hits the
+  idempotency cache and returns the previous result; without that
+  cache, a worker crash + redelivery produces two model calls and two
+  bills. (This is the same architectural fix the Anthropic prompt cache
+  enables for retried HTTP calls — different layer, same principle.)
+- **Graceful drains** — Kubernetes `SIGTERM` and AWS autoscaler
+  scale-in events fire before pods die. The runtime stops pulling new
+  jobs immediately but lets in-flight jobs finish, mirroring the
+  pattern Foundry and AgentCore use for managed worker fleets.
+
+`batch` lowers to `runChatLoop({ singleTurn: true })` per job — the
+same single-turn primitive as workflow steps — so the per-job
+semantics are identical to a workflow step. The difference is purely
+in the *driver*: a queue instead of a static step list.
+
+</details>
+
 ## Prerequisites
 
 - [Recipe 01 — CLI Coding Agent](01-cli-coding-agent.md) for the

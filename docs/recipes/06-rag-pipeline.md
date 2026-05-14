@@ -26,6 +26,36 @@ You'd reach for `target: pipeline` when:
 If you want fully autonomous, multi-step research over a goal (not a
 fixed corpus), use [`research`](07-autonomous-research.md) instead.
 
+<details>
+<summary><strong>Architectural context</strong> — pipeline-first beats agent-first when the bottleneck is retrieval</summary>
+
+Haystack and LlamaIndex are the field's strongest signals that **when
+retrieval quality is the engineering challenge, you want a
+pipeline-first harness, not an agent-first one** ([docs/AI-Harness-Systems.md](../AI-Harness-Systems.md)).
+Haystack's core design is "components connected by pipelines" —
+routers, retrievers, generators, tools as swappable units — and
+LlamaIndex is structured around data-centric workflows for the same
+reason. The `pipeline` target lowers to `IrPipelineV0`, an explicit
+DAG of `chunk → embed → store → retrieve → answer` steps, each
+swappable: change the embedder from `mock/det` to `openai/text-embedding-3-small`
+and only one IR node changes; change the vector store from `in-memory`
+to `pgvector` and only one IR node changes. The agent's instructions
+are unchanged.
+
+This separation matters because "RAG quality" is rarely a model
+problem and almost always a retrieval problem: chunk size, overlap,
+ranker, top-k, citation faithfulness. The Pillar 2 optimizer's
+`OPTIMIZABLE_PATHS` ([packages/spec-patch](../../packages/spec-patch))
+includes `chunkOverlap` and `defaultK` for exactly this reason — when
+eval grades RAG output, the optimizer should reach for retrieval
+parameters before it touches prompts. Ragas is the field's most
+mature RAG eval surface; pair this recipe with
+[Recipe 12 — Eval Harness](12-eval-harness.md) and
+[Recipe 34 — Building Custom Graders](34-building-custom-graders.md)
+to wire Ragas-style faithfulness and answer-relevancy graders.
+
+</details>
+
 ## Prerequisites
 
 - [Recipe 01 — CLI Coding Agent](01-cli-coding-agent.md) for the

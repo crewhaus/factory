@@ -27,6 +27,49 @@ If the work has a stable API behind it, prefer a CLI agent with HTTP
 tools. If you need full desktop automation (not just browser), see
 the `host` backend caveats below.
 
+<details>
+<summary><strong>Architectural context</strong> — browser tools are the largest trust-surface expansion in any target shape</summary>
+
+The harness-design literature ([docs/AI-Harness-Systems.md](../AI-Harness-Systems.md))
+flags **browser tools, code execution, MCP servers, and external
+search** as the categories that "materially increase attack and
+compliance surface" — Microsoft recommends isolation and explicit
+approvals; OpenAI distinguishes hosted from local MCP and emphasizes
+guardrails; Azure documents that Bing grounding sends data outside the
+usual compliance boundary. Of those four, **browser** is the one
+where a single action — a single `Click` on the wrong button — can
+exfiltrate credentials, post to social media as the logged-in user,
+or initiate an irreversible purchase.
+
+The Pillar 3 implications are direct ([CLAUDE.md](../../CLAUDE.md)):
+
+- The `browser` target's tool surface (`Click`, `Type`, `Key`,
+  `Scroll`) is uniformly destructive. The default verdict `ask`
+  converts to `deny` outside an interactive REPL, which is the
+  correct default — but means production browser agents need explicit
+  `alwaysAllow` rules with **tight pattern scopes**. `Type("*")` is
+  almost never the right rule; `Type` rules should bound the form
+  fields the agent is allowed to touch.
+- Every page the browser loads is **externally-controlled content**.
+  Page text reaches the model through the same path as MCP responses
+  — the `boundary-classifier` treats it as `TrustOrigin: "tool"` (the
+  tool result origin), so prompt-injection content inside the page
+  body is detected before it reaches the model call. Disabling that
+  classifier for speed is a Pillar 3 regression, full stop.
+- The Anthropic Computer Use research shipped a similar `Screenshot
+  → FindElement → Click` pattern and surfaced the same lesson: vision
+  grounding is more robust than DOM selectors *and* harder for an
+  attacker to manipulate via injected DOM, because the model is
+  scoring the rendered pixels.
+
+If you find yourself loosening permissions because the agent "needs
+to click around freely," reframe the task as a workflow with explicit
+named steps and a permission rule per step. Open-ended browsing is
+the production-incident shape; bounded automation is the production
+shape.
+
+</details>
+
 ## Prerequisites
 
 - [Recipe 01 — CLI Coding Agent](01-cli-coding-agent.md) for the

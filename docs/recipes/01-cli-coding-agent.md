@@ -24,6 +24,24 @@ By the end of this recipe you'll have a working agent that:
 Time: ~30 minutes if you follow along. ~5 minutes if you just run the
 example and skip the explanations.
 
+<details>
+<summary><strong>Architectural context</strong> — why <code>cli</code> is the right shape to learn on</summary>
+
+Anthropic's own guidance for harness design ([docs/AI-Harness-Systems.md](../AI-Harness-Systems.md))
+is explicit: "teams usually do best with **simple, composable
+workflows** before escalating to elaborate agent architectures." The
+`cli` shape is the smallest viable harness — one agent, one chat loop,
+one process — that still exercises every primitive (model adapter,
+tool gateway, policy engine, session store, telemetry). It maps
+directly onto the OpenAI Agents SDK pattern (agent + tools + sessions +
+tracing) which is the field's de-facto baseline for a single tool-using
+agent. Every other shape in this manual lowers to the same
+`runChatLoop` from [packages/runtime-core](../../packages/runtime-core);
+mastering it once means the other 11 target shapes are *spec
+variations*, not new runtimes to learn.
+
+</details>
+
 ## Prerequisites
 
 - [Bun](https://bun.sh) 1.2 or later.

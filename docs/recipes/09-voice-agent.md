@@ -27,6 +27,38 @@ for other channels). If you want voice but offline (no realtime
 latency requirements), build a [batch worker](08-batch-worker.md) that
 transcribes file uploads.
 
+<details>
+<summary><strong>Architectural context</strong> — realtime is a different harness, not "CLI with audio"</summary>
+
+OpenAI's Realtime API and the Codex App Server's bidirectional
+JSON-RPC pattern ([docs/AI-Harness-Systems.md](../AI-Harness-Systems.md))
+are the strongest signals that **realtime is a categorically
+different harness shape**, not a thin wrapper over the chat loop.
+Three properties don't compose backward into the polling REST model:
+
+- **Audio framing** — 24 kHz PCM in *and* out, with VAD-driven turn
+  boundaries instead of HTTP request/response framing.
+- **Barge-in** — the user can interrupt the model mid-utterance,
+  which means TTS must be cancellable per-frame, not per-message. The
+  hysteresis-gated barge-in in this recipe (4 frames in a 200 ms
+  window) is the same shape OpenAI's Realtime VAD events use.
+- **Sub-second response-start latency** — the model must begin
+  streaming tokens *and* TTS must begin pronouncing them well before
+  the full response is known. This is incompatible with a `POST /run`
+  + poll loop; it requires the persistent bidirectional channel that
+  OpenAI's Realtime API and the App Server JSON-RPC pattern provide.
+
+`voice` lowers to `IrVoiceV0`, which the emitter wires into a
+provider-specific realtime adapter (`openai-realtime`, `vapi`). The
+permissions layer still applies — tool calls inside a voice session
+hit the same policy engine — but the surface is event-driven rather
+than turn-driven. If you can tolerate 2-3 seconds of latency on
+response start, you almost certainly want a channel adapter with TTS
+on top, not the realtime target; the realtime path is cost- and
+operations-heavier and only justified when latency is the product.
+
+</details>
+
 ## Prerequisites
 
 - An OpenAI API key (Realtime API) for the default provider, or a
