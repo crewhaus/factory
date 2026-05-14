@@ -270,6 +270,7 @@ For span-tree inspection in a UI, set up OTel + a local
 
 ## What to read next
 
+- **Correlate a runtime trace event back to the spec line that caused it.** [GETTING-STARTED.md § Tracing a request across YAML, IR, and trace](../GETTING-STARTED.md#tracing-a-request-across-yaml-ir-and-trace) — two worked walkthroughs (permission denial; eval-driven prompt mutation) showing YAML, IR, and trace events side by side.
 - **Persist sessions across restarts.** [Recipe 31 — Session Resume and Replay](31-session-resume-and-replay.md).
 - **Audit trail with hash chaining.** [Recipe 22 — Compliance and Audit](22-compliance-and-audit.md).
 - **Multi-tenant observability per tenant.** [Recipe 11 — Managed Multitenant](11-managed-multitenant.md).

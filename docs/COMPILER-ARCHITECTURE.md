@@ -201,6 +201,18 @@ The whitelist is the answer to "what happens if the optimizer tries to patch a r
 
 When the eval optimizer produces a `SpecPatch` and the user runs `crewhaus optimize --write-back`, the pipeline that fires is: existing source YAML → `applySpecPatch` → mutated source YAML on disk. Re-running the compiler on the mutated source then runs the full lossy pipeline again — but the user's source remains the source of truth. See [recipes/42-active-optimization.md §What `--write-back` actually does](recipes/42-active-optimization.md) for a worked before/after.
 
+### What this means for debugging
+
+The lossy lower has predictable consequences when you inspect the IR with `crewhaus compile --emit-ir`. None of them are bugs; they are the canonical form the IR commits to. Knowing the shape in advance saves a lot of "where did my rule go?" debugging:
+
+- **A rule you wrote isn't there.** If your spec had two `alwaysAllow Read` rules and `--emit-ir` shows one, `lowerPermissions` deduped them. The remaining rule is the canonical representative; matching behaviour is unchanged. The same applies to `mcp_servers` — `redundantMcpServerCollapse` ([packages/ir-passes/src/index.ts:113](../packages/ir-passes/src/index.ts)) merges entries whose transport+command+args are identical.
+- **Rule order doesn't match your source.** Permission rules emerge ordered by `(type, pattern)` after `lowerPermissions`, not in the order you typed. Search the IR by tool name (the pattern field), not by line position. The tier order — **deny > ask > allow** — is what the engine evaluates, not the array order.
+- **Your `"sk-…"` literal is gone.** `lowerSecret` rewrites every `$VAR_NAME` reference into `{kind:"env", name:"VAR_NAME"}` and every non-prefixed string into `{kind:"literal", value:"…"}`. If you see `kind:"literal"` where you expected an env-ref, your `$` prefix was malformed (env refs match `^\$[A-Z_][A-Z0-9_]*$` only — lowercase or numbers-first are silently treated as literals).
+- **A sub-agent map became an array.** Spec-level `subAgents: { researcher: …, fact_checker: … }` becomes `subAgents: [{name: "fact_checker", …}, {name: "researcher", …}]` in the IR — alphabetised by name. The index position is not a stable id.
+- **Optimisable fields keep their source order.** `agent.instructions`, `compaction.threshold`, the `OPTIMIZABLE_PATHS` set above — these are 1:1 between spec and IR by design, because they're the surface the optimizer is allowed to patch. If a field is in `OPTIMIZABLE_PATHS`, its IR position is its spec position.
+
+The corollary: when a runtime trace event names a tool (`toolName: "Write"`) or a rule pattern, the bridge back to your YAML is the **field name**, not the line number. [docs/GETTING-STARTED.md § Tracing a request across YAML, IR, and trace](GETTING-STARTED.md#tracing-a-request-across-yaml-ir-and-trace) walks two concrete scenarios end-to-end.
+
 ## What lives where, summarised
 
 | Concern | Lives in |

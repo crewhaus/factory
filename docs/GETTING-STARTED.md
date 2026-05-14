@@ -128,6 +128,32 @@ and read it — it's about fifty lines, no surprises.
 example under `examples/hello-*/` and a recipe under
 [`docs/recipes/`](recipes/) that walks you through using it for real.
 
+### Pick your target — a short funnel
+
+Twelve shapes is a lot to absorb at once. In practice almost everyone
+starts from one of four entry points; the recipe for that entry point
+is the right next read. Pick one and skip the rest until you need it:
+
+| You want to build…                                              | Start here                                                                                | Then come back for                                                |
+| --------------------------------------------------------------- | ----------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
+| **A local chat agent / coding companion** (laptop, dev, CI)     | [Recipe 01 — CLI Coding Agent](recipes/01-cli-coding-agent.md)                            | tools, permissions, MCP — section 10 below                        |
+| **A bot that lives in a chat product** (Slack / Telegram / …)   | [Recipe 03 — Slack Bot](recipes/03-slack-bot.md) (Telegram/Discord/WhatsApp/iMessage at 37–40) | inbound classification — section 5 above + Recipe 41              |
+| **A deterministic multi-step pipeline** (extract → transform → write) | [Recipe 02 — Sequential Workflow](recipes/02-sequential-workflow.md)                      | hooks + observability — Recipes 14 + 17                           |
+| **A RAG / document-Q&A agent**                                  | [Recipe 06 — RAG Pipeline](recipes/06-rag-pipeline.md)                                    | eval-driven prompt tuning — Recipe 42                             |
+
+**Pick `cli` first if you're unsure.** Every other shape adds something
+on top of the chat loop, so `cli` is the right shape for learning the
+runtime before reaching for the specialized ones — and the polymorphism
+later is one YAML line, not a rewrite. Recipe 01 is the canonical first
+read regardless of where you land; the chat-loop primitives every other
+shape composes on top of are explained there.
+
+### Full survey
+
+The remaining eight shapes round out the runtime. Skim once for
+breadth; return to the row that matches your problem when you need
+it.
+
 | `target:`     | What it is                                               | Smallest example                                                          | Recipe                                                                                       |
 | ------------- | -------------------------------------------------------- | ------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
 | **`cli`**     | Streaming chat REPL. Tools, MCP, hooks, slash commands.  | [`examples/hello-cli`](../examples/hello-cli/crewhaus.yaml)               | [recipes/01-cli-coding-agent.md](recipes/01-cli-coding-agent.md)                             |
@@ -142,10 +168,6 @@ example under `examples/hello-*/` and a recipe under
 | **`browser`** | Computer-use agent (chromium + click/type/screenshot).   | [`examples/hello-browser`](../examples/hello-browser/crewhaus.yaml)       | [recipes/10-browser-agent.md](recipes/10-browser-agent.md)                                   |
 | **`managed`** | Multi-tenant gateway daemon with per-tenant budgets and audit. | [`examples/hello-managed`](../examples/hello-managed/crewhaus.yaml) | [recipes/11-managed-multitenant.md](recipes/11-managed-multitenant.md)                       |
 | **`eval`**    | Benchmark harness — dataset + graders + report.          | [`examples/hello-eval`](../examples/hello-eval/crewhaus.yaml)             | [recipes/12-eval-harness.md](recipes/12-eval-harness.md)                                     |
-
-**Pick `cli` first.** Every other shape adds something on top of the
-chat loop — `cli` is the right shape for learning the system before
-you reach for the more specialized ones.
 
 ---
 
@@ -211,6 +233,41 @@ fabric call. See
 [Recipe 03 — Slack Bot, Step 6](recipes/03-slack-bot.md#step-6--classify-untrusted-inbound-text-security-primer)
 and [Recipe 41 — Security Fabric](recipes/41-security-fabric.md) once
 you reach that target shape.
+
+### Trust boundaries at a glance
+
+The whole security posture of the system is one sentence: **every
+piece of content entering the model's context has a `TrustOrigin`,
+and crossing a trust boundary means calling `classifyBoundary` first.**
+Authentication (mTLS, Slack signatures, JWTs) verifies *who* sent
+something; classification verifies *what* the content contains. They
+are different problems and require different primitives.
+
+The seven boundary sites the runtime classifies today, with the
+package that wires each one and the severity policy a malicious
+verdict triggers by default:
+
+| Site                                 | `TrustOrigin`  | Severity default | Wired in                                                                                              |
+| ------------------------------------ | -------------- | ---------------- | ----------------------------------------------------------------------------------------------------- |
+| MCP tool responses                   | `"mcp"`        | `block`          | [packages/tool-mcp](../packages/tool-mcp)                                                             |
+| Sub-agent `finalMessage`             | `"subagent"`   | `block`          | [packages/sub-agent-spawner](../packages/sub-agent-spawner)                                           |
+| Inbound channel text                 | `"channel"`    | `block`          | `packages/channel-adapter-*` (Slack / Telegram / Discord / WhatsApp / iMessage)                       |
+| Federation peer payloads             | `"federation"` | `block`          | [packages/federation-router](../packages/federation-router)                                           |
+| Skill bodies loaded from disk        | `"skill"`      | `block`          | [packages/skills-registry](../packages/skills-registry)                                               |
+| Compaction summaries                 | `"compaction"` | `block`          | [packages/compaction-autocompact](../packages/compaction-autocompact)                                 |
+| Tool results (the §18 baseline path) | `"tool"`       | `block`          | [packages/runtime-core](../packages/runtime-core) — `applyInjectionClassification`                    |
+| Direct CLI input                     | `"user"`       | `pass`           | (the developer typing) — the developer *is* the user in a CLI context                                 |
+
+A `cli` spec only goes near `"user"` (and `"tool"` once it has any
+destructive tools). A `channel` spec adds `"channel"` and any
+`"mcp"` it uses. A `managed` spec adds `"federation"` if it peers.
+You don't have to engage with every row of the table on day one;
+the table is here so when a runtime trace says `boundary: mcp,
+action: redact` you know immediately which package made the call.
+
+[Recipe 41 — Security Fabric](recipes/41-security-fabric.md) walks
+two threat scenarios (malicious MCP, poisoned sub-agent) end-to-end
+and is the contributor checklist for adding a new boundary site.
 
 Adding tools, permissions, and an MCP server brings you to a
 production-shaped CLI:
@@ -404,7 +461,7 @@ about *where to look* when the agent does something you didn't expect.
 A 50-line YAML lowers into multi-hundred-line generated TypeScript
 running against a runtime built from ~190 modules — that's a lot of
 distance between your intent and the running program. The system
-ships two compiler-equivalents-of-debugging-symbols that keep the
+ships three compiler-equivalents-of-debugging-symbols that keep the
 distance crossable:
 
 1. **`crewhaus compile --emit-ir`** — print the intermediate
@@ -414,12 +471,31 @@ distance crossable:
    (sub-agent maps flattened to arrays, role names alphabetized,
    secrets rewritten as env-var references, permission rules deduped
    and reordered).
-2. **`.crewhaus/sessions/<id>.jsonl`** — the append-only trace of
-   every runtime decision. Each line is a single event: which model
-   call, which tool call, which permission decision, which compaction,
-   which error. This is the post-execution counterpart to `--emit-ir`:
-   the IR tells you what the compiler emitted; the JSONL tells you
-   what that emission actually *did*.
+2. **`.crewhaus/sessions/<id>.jsonl`** — the durable append-only
+   conversation transcript. Each line is one structural event:
+   `user_message`, `assistant_message`, `tool_use`, `tool_result`,
+   `compaction`, `error`, `sub_agent_*`, `role_*`, `handoff`,
+   `a2a_message`, `crew_done`. This is what `crewhaus run --resume`
+   replays and what Studio renders as a session timeline. It is *not*
+   the full runtime stream — finer-grained signals (per-tool start /
+   end, permission decisions, model requests, cost accrual) live in
+   the in-process bus and only land here if they're in that
+   structural set.
+3. **`CREWHAUS_TRACE=json` / `pretty`** — the in-process
+   `TraceEventBus` exported live as JSON Lines on stdout (or
+   colour-coded events on stderr). This is the post-execution
+   counterpart to `--emit-ir`: the IR tells you what the compiler
+   emitted; the trace stream tells you what that emission actually
+   *did*, at the granularity of every model request, every tool call,
+   every permission decision, every hook firing, every compaction
+   trigger, every cost accrual. The same stream feeds the
+   `otel-exporter` and the vendor adapters listed in
+   [Observability and cost](#observability-and-cost).
+
+When you're chasing a "why did the runtime decide X?" question, the
+trace stream is the source. When you're reconstructing what the agent
+*said* and *did*, the JSONL is the source. The IR is the source for
+"what does the compiler think my spec means."
 
 ### Inspecting the IR before codegen
 
@@ -456,86 +532,331 @@ This is the fastest way to answer questions like:
   often: a YAML indentation mistake silently put the block at the
   wrong nesting level).
 
-### Reading the JSONL session trace
+### Reading the JSONL transcript
 
-When a tool call goes wrong at runtime, the JSONL is where the
-evidence lives. Walk through a concrete scenario:
-
-> You build a CLI agent that lists files with `glob`, picks one, and
-> tries to `write` to it. You forgot to grant `Write` in
-> `permissions.rules`. The agent crashes mid-turn with `tool refused:
-> permission denied`. Where is the *exact* moment the runtime made
-> that decision?
+The JSONL is the durable record of the conversation. Each line wraps
+its payload in a small envelope — `{ ts, version: 1, kind, payload }`
+— so subscribers can fan out on `kind` and migrate on `version`
+without re-parsing. The `kind` values are deliberately structural;
+the full list is in [packages/event-log/src/index.ts](../packages/event-log/src/index.ts).
 
 ```bash
-# 1. Find the session id — the run prints it on the first line.
+# 1. Find the session id — the run prints it on the first line of stderr.
 ls -t .crewhaus/sessions/ | head -2
 
 # 2. Look at the last few events of the failing turn.
 tail -n 20 .crewhaus/sessions/sess_<id>.jsonl | jq -c .
 
-# 3. Filter to the permission engine's verdicts only.
-jq -c 'select(.kind == "permission_decision")' \
+# 3. See every tool the assistant invoked, regardless of outcome.
+jq -c 'select(.kind == "tool_use") | {tool: .payload.name, args: .payload.input}' \
    .crewhaus/sessions/sess_<id>.jsonl
 ```
 
-You'll see entries shaped like:
+| Question the JSONL can answer            | Filter                                                                          |
+| ---------------------------------------- | ------------------------------------------------------------------------------- |
+| What did the user actually type?         | `select(.kind == "user_message")`                                               |
+| Which tools did the assistant call?      | `select(.kind == "tool_use") \| .payload.name`                                  |
+| Did a tool error or succeed?             | `select(.kind == "tool_result") \| {is_error: .payload.is_error, content: .payload.content}` |
+| Was anything compacted out of context?   | `select(.kind == "compaction") \| .payload.subKind`                             |
+| Did the run hit an unrecoverable error?  | `select(.kind == "error")` — the `payload.recoverable` field tells you whether it tombstoned the turn. |
+| Did a sub-agent run?                     | `select(.kind == "sub_agent_start" or .kind == "sub_agent_end")`                |
+
+### Reading the live trace stream
+
+The events the JSONL doesn't capture — `permission_decision`,
+`model_request` / `model_response`, `tool_call_start` /
+`tool_call_end`, `hook_fired`, `compaction_fired`, `cost_accrual`,
+`error_recovered`, the boundary classifier outcomes — flow through
+the in-process `TraceEventBus`. Set `CREWHAUS_TRACE=json` and the
+stream lands as one JSON object per line on stdout; redirect it to
+disk if you want the same kind of after-the-fact `jq` filtering you'd
+do on the JSONL.
+
+```bash
+# Capture the full trace stream for the run.
+CREWHAUS_TRACE=json bun run run:hello 2> hello.stderr > hello.trace.jsonl
+
+# Find permission decisions the engine made during the run.
+jq -c 'select(.kind == "permission_decision")' hello.trace.jsonl
+```
+
+A `permission_decision` event has the shape defined in
+[packages/trace-event-bus/src/types.ts:138](../packages/trace-event-bus/src/types.ts) —
+an envelope (`runId`, `sessionId`, `turnNumber`, `traceId`, `spanId`,
+`timestamp`) plus the event-specific fields:
 
 ```json
 {
+  "runId": "run_8a7d6f5e4c3b2a19",
+  "sessionId": "sess_3f9c2b1a8e7d6c5b",
+  "turnNumber": 2,
+  "traceId": "4c1b6d8e9f0a2b3c4d5e6f7a8b9c0d1e",
+  "spanId": "a1b2c3d4e5f60718",
+  "parentSpanId": "f0e1d2c3b4a59687",
+  "timestamp": "2026-05-13T17:42:11.013Z",
   "kind": "permission_decision",
-  "tool": "Write",
-  "input": { "path": "/tmp/notes.md" },
-  "outcome": "denied",
-  "matched_rule": null,
-  "reason": "no matching alwaysAllow rule; default mode denies destructive Write",
-  "session_id": "sess_…",
-  "turn_index": 4,
-  "ts": "2026-05-12T17:42:11.013Z"
+  "toolName": "Write",
+  "decision": "ask",
+  "mode": "default"
 }
 ```
 
-The `matched_rule: null` field is the smoking gun — no rule in your
-spec was specific enough to authorise the call, so the default policy
-ran. Adding `{ type: alwaysAllow, pattern: Write(**/tmp/**) }` to
-`permissions.rules` and recompiling lets the call through; running
-the same query after the fix shows `outcome: "allowed"` and the
-matching `matched_rule` populated.
+`decision: "ask"` with **no `reason` field** is the moment the runtime
+had no rule it could match and fell through to default-mode behaviour.
+The engine only populates `reason` when it can name a specific cause
+(sandbox-floor denial, prompt-injection redaction, etc.); plain
+no-rule-matched cases stay quiet on purpose so absence-of-reason is
+itself a signal. In an interactive REPL the runtime then calls
+`askApproval` and the user decides; in a non-interactive run (CI,
+`bun run` piped) the call is refused with `tool denied (single-turn
+mode: cannot prompt for interactive approval)`. The fix is to add
+an `alwaysAllow` rule that covers the tool (or set
+`permissions.mode: auto` for allow-by-default behaviour).
 
-The same workflow applies to any other failure class:
+The same trace stream is what
+[Recipe 17 — Observability](recipes/17-observability.md) walks
+through in detail; the same events feed `OTEL_EXPORTER_OTLP_ENDPOINT`
+and the vendor exporters.
 
-| Symptom in the REPL                          | Filter on the JSONL                                                                  |
-| -------------------------------------------- | ------------------------------------------------------------------------------------ |
-| Tool ran but produced garbage                | `select(.kind == "tool_result" and .tool == "<name>")`                               |
-| Agent went silent / stuck                    | `select(.kind == "error")` — the taxonomy field tells you whether it's recoverable.  |
-| Reply contradicts an earlier turn            | `select(.kind == "compaction")` — was the offending message snipped or summarised?   |
-| Cost looks wrong                             | `select(.kind == "cost_accrual") \| {turn_index, input_tokens, output_tokens, usd}`  |
-| Tool output was redacted unexpectedly        | `select(.kind == "permission_decision" and .outcome == "redacted")` — security fabric. |
+| Symptom in the REPL                          | Where to look                                                                                                    |
+| -------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| Tool ran but produced garbage                | JSONL — `select(.kind == "tool_result" and .payload.is_error == false) \| .payload.content`                      |
+| Tool refused or was redacted unexpectedly    | Trace — `select(.kind == "permission_decision")` (look at `decision` and `outcome`)                              |
+| Agent went silent / stuck                    | JSONL — `select(.kind == "error")` — the `payload.recoverable` field tells you whether it'll be retried.         |
+| Reply contradicts an earlier turn            | JSONL — `select(.kind == "compaction")` — was the offending message snipped or summarised?                       |
+| Cost looks wrong                             | Trace — `select(.kind == "cost_accrual") \| {turnNumber, usage, totalUsd}` (requires `CREWHAUS_COST_TRACKING=1`) |
+| Hook fired but didn't seem to take effect    | Trace — `select(.kind == "hook_fired") \| {event, matcher, allowed, reason}`                                     |
+
+### Tracing a request across YAML, IR, and trace
+
+The three surfaces above are most useful when you read them as one
+sequence. This subsection walks two concrete scenarios end-to-end —
+a permission denial and an eval-driven prompt mutation — with every
+panel quoted from real compiler / runtime output. Read the panels
+top to bottom; the **What this proves** note at the end of each
+scenario explains what the breadcrumbs tell you.
+
+#### Scenario 1 — your agent's `write` got refused
+
+You write a small note-keeping CLI agent. It can `read` files
+(safe — covered by an `alwaysAllow` rule) and `write` files (not
+covered). The first time the model tries to save a note, the runtime
+intercepts the call. Where does the trail of evidence start?
+
+**Panel 1 — the spec you wrote** (`note-keeper.yaml`):
+
+```yaml
+name: note-keeper
+target: cli
+agent:
+  model: claude-sonnet-4-6
+  instructions: |
+    You help the user keep notes. When asked to save something, write it
+    to a file in the current working directory.
+tools:
+  - read
+  - write
+permissions:
+  mode: default
+  rules:
+    - { type: alwaysAllow, pattern: Read }
+```
+
+**Panel 2 — the IR after `lower()`**, captured by
+`bun apps/cli/src/index.ts compile note-keeper.yaml --emit-ir`:
+
+```json
+{
+  "version": 0,
+  "name": "note-keeper",
+  "target": "cli",
+  "agent": {
+    "model": "claude-sonnet-4-6",
+    "instructions": "You help the user keep notes. When asked to save something, write it\nto a file in the current working directory.\n"
+  },
+  "tools": [
+    "read",
+    "write"
+  ],
+  "toolConfigs": {},
+  "mcp_servers": {},
+  "permissions": {
+    "mode": "default",
+    "rules": [
+      { "type": "alwaysAllow", "pattern": "Read" }
+    ]
+  },
+  "subAgents": [],
+  "compaction": {}
+}
+```
+
+**Panel 3 — the trace event** from `CREWHAUS_TRACE=json` when the
+model invokes `Write({"path": "todo.txt", "content": "buy milk"})`:
+
+```json
+{
+  "runId": "run_8a7d6f5e4c3b2a19",
+  "sessionId": "sess_3f9c2b1a8e7d6c5b",
+  "turnNumber": 2,
+  "traceId": "4c1b6d8e9f0a2b3c4d5e6f7a8b9c0d1e",
+  "spanId": "a1b2c3d4e5f60718",
+  "timestamp": "2026-05-13T17:42:11.013Z",
+  "kind": "permission_decision",
+  "toolName": "Write",
+  "decision": "ask",
+  "mode": "default"
+}
+```
+
+**What this proves.** Three views, one story:
+
+- The YAML's `permissions.rules` has one entry. It covers `Read`.
+- The IR's `permissions.rules` has the same one entry — `lower()`
+  faithfully preserved it (nothing to dedupe, nothing to sort, the
+  rule was a 1:1 copy). If there were no rule for `Write`, the IR
+  shows none.
+- The trace shows the engine at `turnNumber: 2` reaching for a rule
+  and finding none, so it fell through to default-mode behaviour
+  (`decision: "ask"`).
+
+The fix is wherever the chain starts — your YAML. Add
+`{ type: alwaysAllow, pattern: Write(**/*.txt) }` to
+`permissions.rules`, recompile, and the trace at the same turn now
+shows `decision: "allow"` plus a `reason` populated by the matched
+rule. No source map needed: the IR field names (`permissions.rules`,
+`tools`, `agent.instructions`) are the bridge — they're stable
+between the spec you wrote and the trace events the runtime emits.
+
+#### Scenario 2 — an eval failed and the optimizer wants to patch your prompt
+
+You run `crewhaus eval` against a labelled dataset. The grader fails
+on too many examples. You run `crewhaus optimize --write-back` and
+the system rewrites `agent.instructions` in place. Did it eat your
+comments? Where did the patch land? What did it touch?
+
+**Panel 1 — the spec before the run** (excerpt from
+[`docs/recipes/42-active-optimization.md`](recipes/42-active-optimization.md)):
+
+```yaml
+# crewhaus.yaml — coding agent for our team
+# Owner: @max. Reviewed 2026-04-30.
+name: my-coding-agent
+target: cli
+
+agent:
+  model: claude-sonnet-4-6
+  # DO NOT CHANGE THIS PROMPT WITHOUT TEAM REVIEW (incident 2026-03-04)
+  instructions: |
+    You help with TypeScript. Read files before editing.
+permissions:
+  mode: default
+  rules:
+    - { type: alwaysAllow, pattern: Read }
+    - { type: alwaysAsk,   pattern: Bash(**) }
+```
+
+**Panel 2 — the failing eval trace**, filtered from the same stream:
+
+```json
+{"kind":"tool_call_end","toolName":"grade","isError":false,"outputBytes":312,"durationMs":480,"...":"..."}
+{"kind":"tool_call_end","toolName":"grade","isError":false,"outputBytes":298,"durationMs":462,"...":"..."}
+{"kind":"cost_accrual","model":"claude-sonnet-4-6","usage":{"input":4210,"output":1180},"...":"..."}
+```
+
+The eval harness's grader emits a per-sample score that lands in the
+`tool_call_end` payload; the orchestrator aggregates these into the
+run's pass rate (`0.450` in this run). The `cost_accrual` events give
+the spend per turn — useful for spotting when an optimizer iteration
+is paying more than it's worth.
+
+**Panel 3 — the spec after `crewhaus optimize --write-back`**:
+
+```yaml
+# crewhaus optimize: runId opt_a8f3b21c
+# - mutator: rule-based
+# - iterations: 5
+# - score: 0.450 → 0.780 (Δ 0.330)
+# - generated: 2026-05-12T17:42:00Z
+
+# crewhaus.yaml — coding agent for our team
+# Owner: @max. Reviewed 2026-04-30.
+name: my-coding-agent
+target: cli
+
+agent:
+  model: claude-sonnet-4-6
+  # DO NOT CHANGE THIS PROMPT WITHOUT TEAM REVIEW (incident 2026-03-04)
+  instructions: |
+    Think step by step before answering.
+
+    You help with TypeScript. Read files before editing.
+permissions:
+  mode: default
+  rules:
+    - { type: alwaysAllow, pattern: Read }
+    - { type: alwaysAsk,   pattern: Bash(**) }
+```
+
+**What this proves.** Look at what survives:
+
+- Your `# DO NOT CHANGE THIS PROMPT WITHOUT TEAM REVIEW` comment is
+  byte-identical. So is `# Owner: @max…`, the blank line above
+  `agent:`, and the whole `permissions` block. The CST round-trip
+  preserves every byte of source not in the patch path.
+- The patch path was `["agent", "instructions"]`. That path is
+  listed in `OPTIMIZABLE_PATHS["cli"]`
+  ([packages/spec-patch/src/index.ts:189](../packages/spec-patch/src/index.ts))
+  precisely because `agent.instructions` is a string in the spec, a
+  string in the IR, and a string in the generated bundle — the lower
+  is 1:1, so the patch path equals the spec path equals the CST
+  path.
+- The run-header comment prepended at the top is the audit trail:
+  `git diff` makes the rewrite obvious to a reviewer, and the runId
+  ties back to the eval orchestrator's artefacts in
+  `.crewhaus/optimize/<runId>/`.
+- If the optimizer had attempted a path *not* in
+  `OPTIMIZABLE_PATHS` (say `permissions.rules.0.pattern`), the
+  orchestrator would have raised `SpecPatchError: path … is not
+  listed in OPTIMIZABLE_PATHS for target "cli"` — see
+  [Recipe 42 § What happens if the optimizer targets a structurally volatile field](recipes/42-active-optimization.md)
+  for the worked refusal.
+
+The next eval run on the patched YAML shows the new score in its own
+`tool_call_end` events, closing the loop: bad score in the trace →
+patch on a whitelisted path → updated YAML on disk (comments
+intact) → new score in the next trace. The lossy `lower()` doesn't
+get in the way because `OPTIMIZABLE_PATHS` is exactly the set of
+paths where it isn't lossy.
 
 ### Mapping a runtime error back to a spec line
 
-The JSONL records `session_id`, `turn_index`, and the model-facing
-`tool` name. The model-facing tool name (`Write`, `Bash`,
-`filesystem__read_file`) maps to the rule pattern in your spec; the
-permission rule that *should* have matched (or the one that
-unexpectedly blocked) is the line you want to edit. Two patterns
-worth knowing:
+When a trace event tells you "decision: ask, no matching rule," the
+model-facing tool name (`Write`, `Bash`, `filesystem__read_file`)
+maps directly to the rule pattern in your spec. The IR field name
+(`permissions.rules`) is the same as the spec key — there is no
+mapping table to consult, because the IR and the spec share names
+for every field whose lower is 1:1. Two patterns worth knowing:
 
-- **Empty `matched_rule` plus `outcome: "denied"`** — your spec is
-  silent on this tool. Add an `alwaysAllow` rule with the narrowest
-  pattern that covers the call. The `input` field tells you the
-  argument so you can tighten beyond the bare tool name (e.g.
-  `Write(/tmp/**)` instead of `Write`).
-- **Populated `matched_rule` plus `outcome: "denied"`** — your spec
-  has an `alwaysDeny` or `alwaysAsk` rule winning over an
-  `alwaysAllow`. Recall the tier order: **deny > ask > allow**. The
-  IR view (`--emit-ir`) shows the rules in evaluation order; the
-  first matching `deny`/`ask` wins regardless of what comes after.
+- **`decision: "ask"` with no `reason` mentioning a rule** — your
+  spec is silent on this tool. Add an `alwaysAllow` rule with the
+  narrowest pattern that covers the call (the trace's prior
+  `tool_call_start` event has the `inputBytes`; the JSONL's
+  preceding `tool_use` event has the argument so you can tighten
+  beyond the bare tool name — `Write(**/notes/**)` instead of
+  `Write`).
+- **`decision: "deny"` with a `reason`** — your spec or the
+  builtin safety floor has an `alwaysDeny` / `alwaysAsk` rule
+  winning over an `alwaysAllow`. Recall the tier order: **deny >
+  ask > allow**, and the layer order: **flag > settings > yaml >
+  hooks > builtin**. The IR's `permissions.rules` shows the
+  evaluation order; `--emit-ir` is faster than reading the engine
+  source.
 
-If `--emit-ir` and the JSONL don't make a failure self-explanatory,
-the gap is a documentation bug — file it, because the
-intent-to-code mapping is supposed to be navigable from this
-section without diving into the runtime source.
+If `--emit-ir`, the JSONL, and the trace stream together don't make
+a failure self-explanatory, the gap is a documentation bug — file
+it, because the intent-to-code mapping is supposed to be navigable
+from this section without diving into the runtime source.
 
 ---
 
