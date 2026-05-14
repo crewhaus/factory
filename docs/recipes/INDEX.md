@@ -1,7 +1,7 @@
 # Recipes
 
 > Task-oriented walkthroughs for every major feature of crewhaus-factory.
-> All 42 recipes are **complete** as of 2026-05-11. Every recipe is
+> All 47 recipes are **complete** as of 2026-05-14. Every recipe is
 > statically validated by `bun run recipes:test` and every recipe with
 > a `compile:*` script in its frontmatter is also compile-smoke
 > validated by `bun run recipes:smoke`.
@@ -14,6 +14,85 @@ Every recipe is statically validated by `bun run recipes:test`
 that opt into a `test:` frontmatter block also get compile-smoke
 coverage via `bun run recipes:smoke`. See [Testing recipes](#testing-recipes)
 below.
+
+---
+
+## Pick a recipe — diagnostic decision tree
+
+The 47 recipes cover a lot of ground. Most readers don't need to scan
+the table of contents; they need to find the shape that matches the
+problem they brought. Walk this tree from the top:
+
+1. **Are you just trying the system for the first time?** → start at
+   [Recipe 01 — CLI Coding Agent](01-cli-coding-agent.md). Every other
+   recipe assumes you've worked through it.
+2. **Does the task need human-in-the-loop approval between steps, or
+   the ability to resume after a crash?** → [Recipe 05 — Stateful
+   Graph](05-stateful-graph.md). HITL pauses and durable checkpoints
+   are graph-shaped, not workflow-shaped.
+3. **Is the task highly parallelizable — multiple subtasks that each
+   benefit from a dedicated specialist role?** → [Recipe 04 — Multi-Agent
+   Crew](04-multi-agent-crew.md). (Google's scaling study found
+   centralized multi-agent topologies help parallelizable reasoning,
+   while *hurting* sequential reasoning by 39–70% — see the
+   architectural-context callouts in recipes 02 and 04.)
+4. **Is each step a clearly-bounded "extract → transform → format"
+   stage with a single handoff?** → [Recipe 02 — Sequential
+   Workflow](02-sequential-workflow.md). Determinism over flexibility.
+5. **Is retrieval quality the main engineering problem (ranking,
+   chunking, citation faithfulness)?** → [Recipe 06 — RAG
+   Pipeline](06-rag-pipeline.md). Pipeline-first beats agent-first when
+   the bottleneck is documents, not reasoning.
+6. **Are you shipping to a chat channel (Slack, Discord, Telegram,
+   WhatsApp, iMessage)?** → [Recipe 03 — Slack Bot](03-slack-bot.md)
+   first, then the matching adapter in Part F.
+7. **Do you have a labelled dataset and want to optimize program
+   quality rather than hand-tune prompts?** → [Recipe 12 — Eval
+   Harness](12-eval-harness.md) to set up the dataset, then
+   [Recipe 42 — Active Optimization](42-active-optimization.md) for
+   DSPy-style spec mutation (the empirical result that motivates the
+   project: +13% accuracy on 5/7 multi-stage programs).
+8. **Are you running long-horizon autonomous work (research, batch
+   jobs)?** → [Recipe 07 — Autonomous Research](07-autonomous-research.md)
+   or [Recipe 08 — Batch Worker](08-batch-worker.md). Both lean on
+   compaction, durable sessions, and background execution.
+9. **Voice or browser surface?** → [Recipe 09 — Voice
+   Agent](09-voice-agent.md) / [Recipe 10 — Browser
+   Agent](10-browser-agent.md). Note the elevated trust surface for
+   browser tools — read the security primer below first.
+10. **Multi-tenant SaaS?** → [Recipe 11 — Managed
+    Multitenant](11-managed-multitenant.md), then Part C for hardening.
+11. **Touching wallets, contracts, or chain events?** → Part H,
+    starting with [Recipe 43 — Wallet-gated
+    action](43-wallet-gated-action.md).
+
+The flowchart is a teaching scaffold, not a cage. Once you understand
+each pure topology, hybrid systems compose naturally — graph nodes can
+embed crews, crews can call workflows, channels can wrap any of them.
+
+## Security primer — read this before you ship anything
+
+Three recipes form the **Pillar 3** "security as fabric" foundation
+([CLAUDE.md](../../CLAUDE.md)). Read them *before* the first time you
+deploy an agent that touches a host or a network:
+
+- [Recipe 14 — Hooks](14-hooks.md) — `PreToolUse` / `PostToolUse`
+  policy hooks; the mechanical guardrail under every other layer.
+- [Recipe 29 — Permissions Deep Dive](29-permissions-deep-dive.md) —
+  the rule-kinds-in-tier-order grammar; why `alwaysDeny` structurally
+  beats `alwaysAllow`; concrete `Bash(rm -rf:*)` examples.
+- [Recipe 41 — Security Fabric](41-security-fabric.md) — boundary
+  classification at every site that ingests external content (MCP,
+  sub-agents, channels, federation, skills, compaction, tool results).
+
+The default permission verdict is `ask`, which is safe in a CLI REPL
+but **converts to `deny` in non-interactive shapes** (workflow, graph,
+channel, batch, managed). If you build a Slack bot in recipe 03
+without reading recipe 29, a random user in that Slack channel can ask
+the bot to run shell commands on your server — the same kind of
+mistake the recipe ordering used to invite. Run `crewhaus doctor
+--philosophy-alignment` before any PR that touches a boundary site;
+it will fail the build if Pillar 3 has drifted.
 
 ---
 
@@ -121,7 +200,12 @@ Recipes covering the §47 blockchain integration. Most blockchain "shapes" from 
 
 ---
 
-## Suggested reading orders
+## Quick paths (for readers who already know the shape they want)
+
+If the diagnostic tree above already pointed you somewhere, you can
+skip this section. These are the back-of-the-book index entries — once
+you've internalized the topologies, they're the fastest way to wire up
+a known scenario:
 
 - **Newcomer.** 01 → 17 → 13 → 14 → 29.
 - **Putting an agent in Slack.** 01 → 03 → 14 → 17.
@@ -130,6 +214,7 @@ Recipes covering the §47 blockchain integration. Most blockchain "shapes" from 
 - **Multi-agent system.** 04 → 28 → 05 → 27.
 - **RAG / research.** 06 → 07 → 12.
 - **Blockchain integration.** 43 → 44 → 46 → 45 → 47.
+- **Active optimization (DSPy-inspired).** 12 → 34 → 42.
 
 ## Status
 

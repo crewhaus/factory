@@ -29,6 +29,40 @@ If your corpus is fixed (and pre-known), use [`pipeline`](06-rag-pipeline.md)
 instead. If you have many independent prompts to run, use
 [`batch`](08-batch-worker.md).
 
+<details>
+<summary><strong>Architectural context</strong> — long-running autonomous sessions, compaction, and citation discipline</summary>
+
+The `research` target is the harness's answer to the **long-running
+autonomous session** pattern that Anthropic's Managed Agents,
+OpenAI's background-mode runs, and AWS AgentCore all converge on
+([docs/AI-Harness-Systems.md](../AI-Harness-Systems.md)): a session
+with persistent event history, durable checkpoints, compaction for
+long histories, and structured artifact output. Three primitives map
+to specific architectural lessons:
+
+- **Wall-clock + branching-factor caps** are the harness equivalent
+  of Anthropic's session-runtime billing surface ($0.08/session-hour
+  in `running` state in their public pricing): autonomy without a cost
+  ceiling is an outage waiting to happen, so the runtime enforces both
+  a time budget and a fan-out cap.
+- **Sub-question-level checkpoints** mirror MAF's checkpoint/time-travel
+  pattern. A crash at minute 7 resumes the unfinished sub-question
+  from its last completed step, not the whole research goal — the same
+  reason LangGraph exposes `sync` durability.
+- **Verbatim snippet citations** are the per-output analogue of the
+  Pillar 3 "compaction summaries are classified content" rule
+  ([CLAUDE.md](../../CLAUDE.md)). The runtime never asks the model to
+  paraphrase a source it just fetched; it stores the snippet verbatim
+  and lets the report reference it by `[N]`. This makes both audit
+  and grading tractable: every claim has a substring you can grep for
+  in the fetched corpus.
+
+If you want fully unbounded autonomy with no caps, you've left the
+harness's safety envelope — that's not a research target, that's an
+unsupervised production incident.
+
+</details>
+
 ## Prerequisites
 
 - [Recipe 06 — RAG Pipeline](06-rag-pipeline.md) for the retrieval

@@ -28,6 +28,33 @@ If you want **state across nodes plus human-in-the-loop pauses**, use
 [`graph`](05-stateful-graph.md). If you want **fully isolated child
 agents** that can't see the parent's context, use [`Task` sub-agents](28-sub-agents-and-task.md).
 
+<details>
+<summary><strong>Architectural context</strong> — when multi-agent helps, when it hurts</summary>
+
+Google's agent-scaling study (cited in
+[docs/AI-Harness-Systems.md](../AI-Harness-Systems.md)) is the
+strongest empirical signal on when to reach for `crew`: **centralized
+multi-agent topologies help on highly parallelizable reasoning** —
+finance-style decomposition into independent subtasks is the canonical
+fit — and **decentralized topologies help on dynamic browsing /
+navigation**. The same study found multi-agent variants *hurt*
+sequential reasoning by 39–70%, which is why a "researcher → writer →
+critic" pipeline with a fixed step order belongs in
+[workflow](02-sequential-workflow.md), not crew. Reach for crew when
+the roles need to *negotiate* — clarifying questions, peer messaging,
+emergent routing — not when they just need to take turns.
+
+The `Handoff` + `SendMessage` tool pair is structurally similar to
+AutoGen's GroupChat and CrewAI's Crew + delegation, but every baton
+pass lowers through the same `runChatLoop` as the `cli` target, so
+tracing, permissions, and session events compose the same way. Anthropic
+guidance to start with composable workflows before escalating
+applies here: if you can't articulate *which* role needs *which* peer
+to clarify *what*, you're likely better served by a single-agent baseline
+with stronger tool descriptions.
+
+</details>
+
 ## Prerequisites
 
 - [Recipe 01 — CLI Coding Agent](01-cli-coding-agent.md) for the

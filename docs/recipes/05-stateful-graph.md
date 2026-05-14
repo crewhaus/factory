@@ -28,6 +28,41 @@ If you don't need durable state, conditional edges, or HITL, use
 [crew](04-multi-agent-crew.md) (lighter-weight) or
 [workflow](02-sequential-workflow.md) (deterministic).
 
+<details>
+<summary><strong>Architectural context</strong> — graph durability, checkpoint policy, and HITL</summary>
+
+LangGraph and Microsoft Agent Framework are the two canonical
+stateful-graph runtimes ([docs/AI-Harness-Systems.md](../AI-Harness-Systems.md)).
+LangGraph exposes durable execution with three explicit durability
+modes — `exit`, `async`, `sync` — and MAF centers graph workflows with
+**checkpointing, streaming, time travel, and OpenTelemetry**. Every
+design decision in this recipe maps to one of those primitives:
+
+- **`checkpoint_policy: sync`** (the default for HITL-bearing graphs)
+  writes the state snapshot *before* the runtime asks for a human
+  decision. Switching it to `async` saves a handful of milliseconds
+  per node but breaks the ability to safely pause for approval — the
+  approver could decide while the snapshot is mid-flight, and a crash
+  in that window loses the decision context. That's exactly the
+  tradeoff LangGraph's durability docs flag as the reason
+  `sync` exists.
+- **`hitl:` on a node** is the harness-level analogue of LangGraph's
+  `interrupt()` and MAF's checkpoint-pause primitive: the run
+  serializes state, exits the process cleanly, and waits for an
+  out-of-band resume signal. The runtime never holds a blocking
+  process during a human review.
+- **Conditional edges** map to LangGraph's `add_conditional_edges`. The
+  IR variant `IrGraphV0` carries each edge's optional `when` predicate
+  so the codegen target can lower to either an in-process router or a
+  distributed orchestrator without changing the spec.
+
+If you find yourself wanting graph features but not HITL, you can keep
+`checkpoint_policy: async` and save the latency — but make the
+decision deliberately, with the durability mode that fits the job, not
+by default.
+
+</details>
+
 ## Prerequisites
 
 - [Recipe 04 — Multi-Agent Crew](04-multi-agent-crew.md) for the

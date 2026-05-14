@@ -26,6 +26,30 @@ If those properties don't fit, prefer [`graph`](05-stateful-graph.md)
 (branches + HITL) or [`crew`](04-multi-agent-crew.md) (roles + peer
 messaging).
 
+<details>
+<summary><strong>Architectural context</strong> — why a sequential workflow is single-turn-threaded, not multi-agent</summary>
+
+The empirical case for keeping each step single-turn comes from
+Google's controlled agent-scaling study (cited in
+[docs/AI-Harness-Systems.md](../AI-Harness-Systems.md)): **multi-agent
+variants degrade sequential reasoning tasks by 39–70%** compared to a
+single-agent baseline. The same study found centralized multi-agent
+patterns *help* on parallelizable tasks — which is exactly the use
+case for [crew](04-multi-agent-crew.md), not workflow. Task structure
+should determine topology, and "extract → transform → format" is
+sequential by construction.
+
+`workflow` lowers to `runChatLoop({ singleTurn: true, seedMessages })`
+for each step, which deliberately removes the agentic surface (no peer
+messaging, no handoffs, no mid-step branching). This is the same
+design instinct as LlamaIndex's event-driven workflows and CrewAI
+Flows: structured, deterministic, easier to test than a free-form
+agent loop. If you find yourself wanting one step to ask another a
+clarifying question, you've outgrown workflow — that's the signal to
+move to crew, not to relax workflow's single-turn invariant.
+
+</details>
+
 ## Prerequisites
 
 - [Recipe 01 — CLI Coding Agent](01-cli-coding-agent.md) so you know the

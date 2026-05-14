@@ -25,6 +25,31 @@ By the end of this recipe you'll have:
 - An understanding of HMAC verification, session keying, and the
   optional `SendMessage` tool for proactive bot-initiated posts.
 
+<details>
+<summary><strong>Architectural context</strong> — channel adapters as a trust boundary and a long-running session surface</summary>
+
+The `channel` target is two things at once: a long-running daemon
+pattern (similar to OpenAI's background-mode and AWS AgentCore's
+long-running session model — see
+[docs/AI-Harness-Systems.md](../AI-Harness-Systems.md)) and a **trust
+boundary** under Pillar 3 ([CLAUDE.md](../../CLAUDE.md)). Inbound
+Slack messages — even from authenticated users in your own workspace
+— are externally-controlled content. Every text body that reaches the
+model is classified by
+[packages/boundary-classifier](../../packages/boundary-classifier)
+with `TrustOrigin: "channel"`; an attacker who DMs your bot a prompt
+injection is treated the same as a malicious MCP response. The
+mTLS/HMAC verification this recipe walks through tells you *who*
+sent the message; it does not say anything about *what* the content
+contains. Classification happens after authentication, not instead of
+it. Before you wire any destructive tool into a channel-target spec,
+read [Recipe 29 — Permissions Deep Dive](29-permissions-deep-dive.md):
+the default verdict `ask` converts to `deny` in channel mode (no
+interactive surface to prompt on), so every dangerous tool needs an
+explicit allow rule with a tight pattern.
+
+</details>
+
 ## Prerequisites
 
 - A Slack workspace where you can install a custom app.

@@ -22,6 +22,44 @@ is the foundation that canary gating and prompt optimization sit on,
 and it's the first thing to set up if you're putting an agent in front
 of users.
 
+<details>
+<summary><strong>Architectural context</strong> — why eval is a first-class subsystem, not a dashboard</summary>
+
+The eval stack is Pillar 2 of the crewhaus thesis
+([CLAUDE.md](../../CLAUDE.md)): **eval is active, not passive** —
+failures should produce *spec patches*, not just HTML reports. The
+empirical case for that pillar comes from DSPy's MIPRO result, cited
+prominently in [docs/AI-Harness-Systems.md](../AI-Harness-Systems.md):
+**+13% accuracy on five of seven multi-stage LM programs**. That's
+one of the few primary-source results attributing measurable gains to
+the harness/programming layer itself, rather than to model choice or
+prompt-engineering folklore.
+
+The landscape also signals that eval should be layered, not monolithic:
+
+- **HELM** is the strongest neutral cross-model benchmark surface.
+- **`lm-evaluation-harness`** remains the most reusable open
+  benchmark runner.
+- **Ragas** specializes in retrieval-centric grading (faithfulness,
+  answer-relevancy) — pair with [Recipe 06](06-rag-pipeline.md).
+- **DSPy `Evaluate` + MIPRO** is the optimizer story.
+- **OpenAI Evals, Foundry evaluators, ADK golden datasets, Haystack
+  evaluation, LlamaIndex evaluation, CrewAI testing** all ship
+  framework-native eval surfaces.
+
+The `target: eval` shape exposes the layered stack as composable
+spec fields: deterministic graders, NLG metrics, and LLM-as-judge can
+all run on the same dataset, write to the same report, and feed the
+same canary gate ([Recipe 21](21-deployment-and-canary.md)) — which is
+what makes the loop close back to spec mutation in
+[Recipe 42 — Active Optimization](42-active-optimization.md). If
+you've only built the report, you've built the passive half of the
+stack; the active half is what the thesis is actually arguing for.
+
+</details>
+
+
+
 By the end of this recipe you'll have:
 
 - A small JSONL dataset with a train/dev/test split.
