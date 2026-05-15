@@ -1,7 +1,7 @@
 # Recipes
 
 > Task-oriented walkthroughs for every major feature of crewhaus-factory.
-> All 47 recipes are **complete** as of 2026-05-14. Every recipe is
+> All 48 recipes are **complete** as of 2026-05-15. Every recipe is
 > statically validated by `bun run recipes:test` and every recipe with
 > a `compile:*` script in its frontmatter is also compile-smoke
 > validated by `bun run recipes:smoke`.
@@ -19,10 +19,15 @@ below.
 
 ## Pick a recipe — diagnostic decision tree
 
-The 47 recipes cover a lot of ground. Most readers don't need to scan
+The 48 recipes cover a lot of ground. Most readers don't need to scan
 the table of contents; they need to find the shape that matches the
 problem they brought. Walk this tree from the top:
 
+0. **Not sure what you want yet?** → [Recipe 48 — Harness
+   Designer](48-harness-designer.md) interviews you about intent and
+   writes the spec for you. Use this when you can describe the *goal*
+   but not the *shape*. Everything below is for when you'd rather
+   pick the shape yourself.
 1. **Are you just trying the system for the first time?** → start at
    [Recipe 01 — CLI Coding Agent](01-cli-coding-agent.md). Every other
    recipe assumes you've worked through it.
@@ -198,6 +203,14 @@ Recipes covering the §47 blockchain integration. Most blockchain "shapes" from 
 | 46 | [Tokenized access](46-tokenized-access.md)                      | Shapes 9, 12 (credential)    | complete |
 | 47 | [Onchain daemon & game](47-onchain-daemon-and-game.md)          | Shapes 8, 10 + on-chain games | complete |
 
+## Part I — Meta-tooling
+
+Reflexive recipes — CrewHaus designing itself. The system general enough that a YAML spec can produce the harness that writes the YAML.
+
+| #  | Recipe                                                          | Pattern            | Status   |
+| -- | --------------------------------------------------------------- | ------------------ | -------- |
+| 48 | [Harness Designer](48-harness-designer.md)                      | meta-cli           | complete |
+
 ---
 
 ## Quick paths (for readers who already know the shape they want)
@@ -215,13 +228,14 @@ a known scenario:
 - **RAG / research.** 06 → 07 → 12.
 - **Blockchain integration.** 43 → 44 → 46 → 45 → 47.
 - **Active optimization (DSPy-inspired).** 12 → 34 → 42.
+- **Designing a new harness from intent.** 48 → (the recipe for the shape it picks) → 12 → 42.
 
 ## Status
 
 | Total recipes | Status                  |
 | ------------- | ----------------------- |
-| 47            | Total (01-40 + pillar recipes 41, 42 + §47 recipes 43-47) |
-| 47            | Walkthrough complete    |
+| 48            | Total (01-40 + pillars 41, 42 + §47 recipes 43-47 + meta 48) |
+| 48            | Walkthrough complete    |
 | 0             | Stub                    |
 
 Each recipe walks from "I have an empty workspace" to "I have a

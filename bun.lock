@@ -152,6 +152,17 @@
         "@crewhaus/runtime-core": "workspace:*",
       },
     },
+    "examples/hello-harness-designer": {
+      "name": "@crewhaus-examples/hello-harness-designer",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/hooks-engine": "workspace:*",
+        "@crewhaus/runtime-core": "workspace:*",
+        "@crewhaus/skills-registry": "workspace:*",
+        "@crewhaus/slash-commands": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+      },
+    },
     "examples/hello-managed": {
       "name": "@crewhaus-examples/hello-managed",
       "version": "0.0.0",
@@ -2387,6 +2398,8 @@
     "@crewhaus-examples/hello-eval": ["@crewhaus-examples/hello-eval@workspace:examples/hello-eval"],
 
     "@crewhaus-examples/hello-graph": ["@crewhaus-examples/hello-graph@workspace:examples/hello-graph"],
+
+    "@crewhaus-examples/hello-harness-designer": ["@crewhaus-examples/hello-harness-designer@workspace:examples/hello-harness-designer"],
 
     "@crewhaus-examples/hello-managed": ["@crewhaus-examples/hello-managed@workspace:examples/hello-managed"],
 
