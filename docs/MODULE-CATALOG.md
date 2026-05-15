@@ -1,6 +1,6 @@
 # Module Catalog
 
-> A navigation map for the ~190 modules that compose `crewhaus-factory`. This document is structured so **you don't read it cover-to-cover**. You pick a reading path that matches what you're trying to do, and the path tells you which 5–15 modules to focus on, which pillar to internalise, and which recipes and briefs to follow.
+> A navigation map for the ~190 modules that compose `factory`. This document is structured so **you don't read it cover-to-cover**. You pick a reading path that matches what you're trying to do, and the path tells you which 5–15 modules to focus on, which pillar to internalise, and which recipes and briefs to follow.
 
 ## How to use this document
 
@@ -264,7 +264,7 @@ Test layer codes (defined in [AI-Harness-Systems.md](AI-Harness-Systems.md)):
 
 ### Factory-level modules (the meta-harness itself)
 
-These live in `crewhaus-factory` and **produce or operate** generated harnesses. They are not embedded in the generated artifact.
+These live in `factory` and **produce or operate** generated harnesses. They are not embedded in the generated artifact.
 
 #### F1 — Spec & IR
 

@@ -109,8 +109,8 @@ const sha = {
 };
 const inputs = {
   version: "1.0.0",
-  homepage: "https://github.com/crewhaus/crewhaus-factory",
-  downloadBaseUrl: "https://github.com/crewhaus/crewhaus-factory/releases/download/v1.0.0",
+  homepage: "https://github.com/crewhaus/factory",
+  downloadBaseUrl: "https://github.com/crewhaus/factory/releases/download/v1.0.0",
   sha256: sha,
 };
 const formula = renderHomebrewFormula(inputs);

@@ -3,7 +3,9 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { createSlackAdapter, signSlackBody, verifySlackSignature } from "./index";
 
-const FIXTURES = join(import.meta.dir, "fixtures");
+// `tsc -b` also compiles this file into `dist/`; resolve fixtures from the
+// source tree so both the src and dist test copies find them.
+const FIXTURES = join(import.meta.dir.replace(/([/\\])dist$/, "$1src"), "fixtures");
 const APP_MENTION = readFileSync(join(FIXTURES, "app_mention.json"), "utf8");
 const MESSAGE = readFileSync(join(FIXTURES, "message.json"), "utf8");
 const BOT_MESSAGE = readFileSync(join(FIXTURES, "bot_message.json"), "utf8");

@@ -12,8 +12,11 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+// `tsc -b` also compiles this file into `dist/`; resolve the CLI entrypoint
+// from the source tree so the dist test copy can still spawn it.
+const SRC_DIR = import.meta.dir.replace(/([/\\])dist$/, "$1src");
 const REPO_ROOT = join(import.meta.dir, "../../..");
-const CLI_PATH = join(import.meta.dir, "index.ts");
+const CLI_PATH = join(SRC_DIR, "index.ts");
 const HELLO_SPEC = join(REPO_ROOT, "examples/hello-cli/crewhaus.yaml");
 
 const TMP_ROOTS: string[] = [];

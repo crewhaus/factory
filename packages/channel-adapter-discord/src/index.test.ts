@@ -14,7 +14,9 @@ import {
   verifyDiscordSignature,
 } from "./index";
 
-const FIXTURES_DIR = join(import.meta.dir, "fixtures");
+// `tsc -b` also compiles this file into `dist/`; resolve fixtures from the
+// source tree so both the src and dist test copies find them.
+const FIXTURES_DIR = join(import.meta.dir.replace(/([/\\])dist$/, "$1src"), "fixtures");
 const fixture = (name: string) => readFileSync(join(FIXTURES_DIR, `${name}.json`), "utf8");
 
 let publicKeyHex: string;

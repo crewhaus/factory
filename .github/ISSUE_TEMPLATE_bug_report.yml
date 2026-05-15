@@ -1,0 +1,101 @@
+name: Bug report
+description: Report something that doesn't work the way it should.
+title: "[bug]: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug report.
+
+        Before submitting, please search [existing issues](https://github.com/crewhaus/factory/issues) and [Discussions Q&A](https://github.com/crewhaus/factory/discussions/categories/q-a) — your question may have been answered already.
+
+        For questions (rather than bugs), please use [Discussions](https://github.com/crewhaus/factory/discussions) instead.
+
+  - type: input
+    id: version
+    attributes:
+      label: CrewHaus CLI version
+      description: Output of `crewhaus --version`
+      placeholder: "0.1.0"
+    validations:
+      required: true
+
+  - type: input
+    id: bun-version
+    attributes:
+      label: Bun version
+      description: Output of `bun --version`
+      placeholder: "1.2.0"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: "macOS 14.5 / Ubuntu 22.04 / Windows 11 + WSL2 / etc."
+    validations:
+      required: true
+
+  - type: textarea
+    id: spec
+    attributes:
+      label: Minimal spec.yaml that reproduces
+      description: |
+        Reduce your spec to the smallest version that still triggers the bug. Paste it here as a code block.
+      render: yaml
+      placeholder: |
+        name: minimal-repro
+        model:
+          provider: anthropic
+          name: claude-sonnet-4-6
+        instructions: |
+          ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: Command(s) you ran
+      description: Exact commands, in order.
+      render: bash
+      placeholder: |
+        crewhaus compile
+        crewhaus run
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected to happen
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: What actually happened
+      description: Include the full error output / stack trace.
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: Anything else that might be relevant — recent changes, environment quirks, related issues.
+
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Checklist
+      options:
+        - label: I have searched existing issues and Discussions.
+          required: true
+        - label: I have reduced the spec.yaml to a minimal reproducing case.
+          required: true
+        - label: I have included full command(s) and error output.
+          required: true

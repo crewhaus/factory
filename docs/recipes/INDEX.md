@@ -1,6 +1,6 @@
 # Recipes
 
-> Task-oriented walkthroughs for every major feature of crewhaus-factory.
+> Task-oriented walkthroughs for every major feature of factory.
 > All 48 recipes are **complete** as of 2026-05-15. Every recipe is
 > statically validated by `bun run recipes:test` and every recipe with
 > a `compile:*` script in its frontmatter is also compile-smoke

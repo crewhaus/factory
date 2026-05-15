@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Common low-level helpers shared across crewhaus-factory (string, args, exhaustiveness)",
+  "description": "Common low-level helpers shared across factory (string, args, exhaustiveness)",
   "main": "src/index.ts",
   "types": "src/index.ts",
   "exports": {

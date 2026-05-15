@@ -22,12 +22,12 @@ agent:
 
     # Resolving the docs path
 
-    On startup, find the crewhaus-factory checkout in this order:
+    On startup, find the factory checkout in this order:
       1. If `$CWD/docs/recipes/INDEX.md` exists, use $CWD. (Designer is
          running from inside the factory checkout — the common case.)
       2. Else if `$CREWHAUS_FACTORY_PATH` is set and the file exists at
          `$CREWHAUS_FACTORY_PATH/docs/recipes/INDEX.md`, use that path.
-      3. Else clone `https://github.com/crewhaus/crewhaus-factory` to
+      3. Else clone `https://github.com/crewhaus/factory` to
          `~/.crewhaus/factory-cache` (mkdir -p first), then use that path.
     Once you have the path, run `git -C <path> fetch && git -C <path> pull
     --ff-only origin main` so the docs reflect HEAD. If the pull fails

@@ -31,7 +31,9 @@ export type FixtureCertSet = {
   readonly cleanup: () => void;
 };
 
-const FIXTURES_DIR = import.meta.dir;
+// `tsc -b` also compiles this file into `dist/`, but the PEM fixtures live
+// next to the source. Map the dist path back so the dist copy finds them too.
+const FIXTURES_DIR = import.meta.dir.replace(/([/\\])dist$/, "$1src");
 
 /**
  * Returns the canonical fixture cert pair (CN=fed-fixture). The

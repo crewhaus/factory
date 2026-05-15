@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question or discussion
+    url: https://github.com/crewhaus/factory/discussions
+    about: Please use Discussions for "how do I..." questions, ideas, and showcase posts.
+  - name: Security vulnerability
+    url: https://github.com/crewhaus/factory/security/advisories/new
+    about: Report security vulnerabilities privately. Do not file a public issue. You can also email security@crewhaus.ai.
+  - name: Code of Conduct concern
+    url: mailto:conduct@crewhaus.ai
+    about: Report Code of Conduct concerns privately to conduct@crewhaus.ai.

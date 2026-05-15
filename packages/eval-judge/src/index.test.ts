@@ -247,10 +247,10 @@ describe("prompt-injection corpus (T8)", () => {
     truth_score: number;
   };
 
-  const corpus: Row[] = readFileSync(
-    join(import.meta.dir, "__fixtures__/injection-corpus.jsonl"),
-    "utf-8",
-  )
+  // `tsc -b` also compiles this file into `dist/`; resolve fixtures from the
+  // source tree so both the src and dist test copies find the corpus.
+  const SRC_DIR = import.meta.dir.replace(/([/\\])dist$/, "$1src");
+  const corpus: Row[] = readFileSync(join(SRC_DIR, "__fixtures__/injection-corpus.jsonl"), "utf-8")
     .split("\n")
     .filter((l) => l.trim() !== "")
     .map((l) => JSON.parse(l) as Row);

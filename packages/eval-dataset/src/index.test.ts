@@ -2,7 +2,11 @@ import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
 import { DatasetLoadError, loadDataset, parseCsv } from "./index";
 
-const FIX = join(import.meta.dir, "__fixtures__");
+// `tsc -b` compiles this file into `dist/`, so `bun test` (with no path filter)
+// picks up both `src/index.test.ts` and `dist/index.test.js`. The compiled copy
+// resolves `import.meta.dir` to `dist/`, but `__fixtures__/` only exists under
+// `src/`. Map back to the source tree so both copies find the fixtures.
+const FIX = join(import.meta.dir.replace(/([/\\])dist$/, "$1src"), "__fixtures__");
 
 async function collect<T>(iter: AsyncIterable<T>): Promise<T[]> {
   const out: T[] = [];

@@ -2,7 +2,9 @@ import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
 import { type HookDef, runHooks } from "./index";
 
-const FIXTURES = join(import.meta.dir, "fixtures");
+// `tsc -b` also compiles this file into `dist/`; resolve fixtures from the
+// source tree so both the src and dist test copies find them.
+const FIXTURES = join(import.meta.dir.replace(/([/\\])dist$/, "$1src"), "fixtures");
 
 describe("runHooks (T3 integration)", () => {
   test("fixture deny script returns deny decision", async () => {

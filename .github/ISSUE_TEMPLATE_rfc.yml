@@ -1,0 +1,55 @@
+name: RFC (Request for Comments)
+description: Propose a substantial change requiring deliberation before code.
+title: "[rfc]: "
+labels: ["rfc", "needs-discussion"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        RFCs are required for: new target shapes, new trust boundaries, eval-loop changes, schema changes affecting existing specs, cross-package architectural shifts, and governance changes. See [`CONTRIBUTING.md`](https://github.com/crewhaus/factory/blob/main/CONTRIBUTING.md#3-the-three-architectural-pillars).
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What problem are we solving? Why now?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: The shape of the change. Include design sketches, code examples, IR variants, API shapes.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What else did you consider, and why is this the right call?
+    validations:
+      required: true
+
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: Compatibility impact
+      description: Breaking? What's the migration story? Which versions are affected?
+    validations:
+      required: true
+
+  - type: textarea
+    id: security
+    attributes:
+      label: Security impact
+      description: Any new trust boundaries? Any privilege changes? Implications for the boundary classifier?
+    validations:
+      required: true
+
+  - type: textarea
+    id: open-questions
+    attributes:
+      label: Open questions
+      description: What needs resolving before this can ship?

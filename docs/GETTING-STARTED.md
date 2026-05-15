@@ -1,4 +1,4 @@
-# Getting Started with crewhaus-factory
+# Getting Started with factory
 
 > A guided tour for new users. Starts at first principles, drills down to
 > data flow, and ends with a runnable agent on your machine.
@@ -28,7 +28,7 @@
 
 ## What this is, in one minute
 
-**crewhaus-factory is a meta-harness compiler.** You write one short YAML
+**factory is a meta-harness compiler.** You write one short YAML
 file describing the agent you want — what model, what tools, what shape
 of runtime. The compiler emits a self-contained TypeScript program that
 you run with [Bun](https://bun.sh).
@@ -43,7 +43,7 @@ and audit trails. Different output shapes.
 
 > **Why this exists.** Today, every agent framework picks one shape and
 > bakes it in. CrewAI is crews. LangGraph is graphs. Claude Code is a
-> CLI. None of them let you switch shape without rewriting. crewhaus-factory
+> CLI. None of them let you switch shape without rewriting. factory
 > separates the *spec* (your intent) from the *target* (how it runs), so
 > you can move a working agent into a new shape — Slack today, voice
 > tomorrow, batch worker the week after — by changing one line of YAML.

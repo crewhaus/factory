@@ -1,5 +1,5 @@
 /**
- * Common low-level helpers shared across crewhaus-factory.
+ * Common low-level helpers shared across factory.
  * Catalog F-foundations (`infra-utils`) — keep this package small. Only add
  * helpers when there is a real consumer. Things that grow into their own
  * concept (config loading, retries, ids) graduate to their own package.

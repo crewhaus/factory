@@ -1,5 +1,5 @@
 /**
- * Typed error hierarchy for crewhaus-factory.
+ * Typed error hierarchy for factory.
  * Catalog F-foundations (`error-types`) — every later layer imports this
  * for structured error reporting instead of throwing raw `Error`s.
  *

@@ -4,9 +4,9 @@ description: CrewHaus Factory — modular meta-harness for compiling agent specs
 type: application
 version: 0.1.0
 appVersion: "1.0.0"
-home: https://github.com/crewhaus/crewhaus-factory
+home: https://github.com/crewhaus/factory
 sources:
-  - https://github.com/crewhaus/crewhaus-factory
+  - https://github.com/crewhaus/factory
 maintainers:
   - name: CrewHaus
     email: maintainers@crewhaus.io

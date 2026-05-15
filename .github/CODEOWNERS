@@ -1,0 +1,58 @@
+# CODEOWNERS for crewhaus/factory
+#
+# This file declares which maintainers review which parts of the codebase.
+# At launch the project lead owns everything; the file exists so the structure
+# is in place when maintainers join.
+#
+# Syntax: github.com/path-pattern <space> @username [@username ...]
+# See: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Default owner — applies to anything not matched by a more specific rule below
+*                               @studiomax
+
+# Architecture & design decisions
+/decisions/                     @studiomax
+/CLAUDE.md                      @studiomax
+/GOVERNANCE.md                  @studiomax
+/TRADEMARK.md                   @studiomax
+/CODE_OF_CONDUCT.md             @studiomax
+
+# Compiler core
+/packages/spec/                 @studiomax
+/packages/ir/                   @studiomax
+/packages/ir-passes/            @studiomax
+/packages/compiler/             @studiomax
+/packages/runtime-core/         @studiomax
+
+# Target emitters (specific maintainers per target as they emerge)
+/packages/target-cli/           @studiomax
+/packages/target-channel-*/     @studiomax
+/packages/target-graph/         @studiomax
+/packages/target-pipeline/      @studiomax
+/packages/target-crew/          @studiomax
+/packages/target-research/      @studiomax
+/packages/target-batch/         @studiomax
+/packages/target-voice/         @studiomax
+/packages/target-browser/       @studiomax
+/packages/target-managed/       @studiomax
+/packages/target-eval/          @studiomax
+/packages/target-workflow/      @studiomax
+
+# Eval & optimization
+/packages/eval-runner/                       @studiomax
+/packages/prompt-optimizer/                  @studiomax
+/packages/prompt-optimizer-claude/           @studiomax
+/packages/spec-patch/                        @studiomax
+/packages/eval-optimizer-orchestrator/       @studiomax
+
+# Security fabric (highest scrutiny)
+/packages/boundary-classifier/  @studiomax
+/packages/prompt-injection-detector/         @studiomax
+
+# Documentation
+/docs/                          @studiomax
+
+# CI / tooling
+/.github/                       @studiomax
+/biome.json                     @studiomax
+/tsconfig*.json                 @studiomax
