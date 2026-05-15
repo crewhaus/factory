@@ -1,0 +1,13 @@
+# GitHub Sponsors and other funding platforms.
+# Apply for GitHub Sponsors for your account / the crewhaus org early in launch
+# (approval takes time). Uncomment the lines once approved.
+
+# github: [crewhaus]
+# open_collective: crewhaus
+# patreon: # username
+
+# Recommendation: do not list a buy-me-a-coffee, Ko-fi, or similar.
+# Donations should not be confused with the paid Cloud product or
+# StudioMax implementation packages — keep the revenue lines clean.
+
+custom: ["https://cloud.crewhaus.ai", "https://studiomax.io/work/crewhaus"]

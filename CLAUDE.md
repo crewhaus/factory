@@ -1,6 +1,6 @@
-# CLAUDE.md — Contributor compass for crewhaus-factory
+# CLAUDE.md — Contributor compass for factory
 
-This file is the source of truth for *how* to develop crewhaus-factory. The *what* lives in:
+This file is the source of truth for *how* to develop factory. The *what* lives in:
 
 - [docs/AI-Harness-Systems.md](docs/AI-Harness-Systems.md) — the founding architectural thesis (north star; do not modify lightly)
 - [docs/COMPILER-ARCHITECTURE.md](docs/COMPILER-ARCHITECTURE.md) — the meta-harness compiler walked through with file paths

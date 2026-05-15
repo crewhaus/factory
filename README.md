@@ -1,72 +1,155 @@
 # CrewHaus Factory
 
-A modular **meta-harness tool**: compile a single high-level harness spec into multiple runtime targets (CLI agent, channel bot, multi-agent crew, RAG pipeline, eval harness, managed runtime, stateful graph, autonomous research, voice/realtime, computer-use, batch worker).
+*The open-source meta-harness compiler for AI agents.*
 
-Status: scaffolding + thin vertical slice. The first end-to-end target is **CLI** — a minimal `spec.yaml` → IR → generated TypeScript agent that runs under Bun.
+Compile a single `spec.yaml` into a CLI agent, channel bot, RAG pipeline, multi-agent crew, eval harness, voice/realtime agent, browser/computer-use agent, and more. Active eval optimization. Trust-aware by default. Apache-2.0.
 
-## Documentation
-
-- **New here?** Start with [`docs/GETTING-STARTED.md`](docs/GETTING-STARTED.md) — guided tour from first principles to a runnable agent.
-- **Looking for a recipe?** See [`docs/recipes/INDEX.md`](docs/recipes/INDEX.md) — 40 task-oriented walkthroughs, one per major feature.
-- **Need the canonical module reference?** See [`docs/MODULE-CATALOG.md`](docs/MODULE-CATALOG.md) — ~190 modules, 25 layers, 12 target shapes.
-
-## Repository layout
-
-```
-packages/
-  spec/           F1 — user-facing spec schema (Zod) + YAML parser
-  ir/             F1 — canonical typed intermediate representation
-  compiler/       F2 — compiler-core (parse → validate → lower → emit)
-  target-cli/     F2 — codegen backend for CLI target
-  runtime-core/   R1 — minimal runtime imported by generated bundles
-apps/
-  cli/            the `crewhaus` CLI ("compile", "run", ...)
-examples/
-  hello-cli/      smallest possible spec + generated agent
-docs/
-  MODULE-CATALOG.md         complete module catalog (~190 modules)
-  AI-Harness-Systems.md     ecosystem analysis grounding the catalog
-  architecture studies/     reference architectures (Claude Code, OpenClaw)
-reference-repos/  (gitignored) cloned upstream harnesses for browsing
+```bash
+bun add -d @crewhaus/cli
+crewhaus init my-agent
+cd my-agent
+crewhaus compile && crewhaus run
 ```
 
-## Quickstart (vertical slice)
+## Why CrewHaus?
+
+Most teams build a different harness for every shape of agent — a CLI here, a Slack bot there, a RAG pipeline somewhere else, an eval rig on the side. The behaviour is identical; the wiring is wildly different.
+
+CrewHaus is the layer above. You write the agent once, as a `spec.yaml`. The compiler emits whichever runtime shape you need.
+
+## What you can compile to
+
+Twelve target shapes ship today:
+
+| Target | What it produces |
+|---|---|
+| `cli` | A self-contained TypeScript CLI agent |
+| `channel-slack` / `channel-discord` / `channel-telegram` / `channel-whatsapp` | Channel bots |
+| `graph` | A stateful graph runtime |
+| `pipeline` | A RAG pipeline |
+| `crew` | A multi-agent crew |
+| `research` | An autonomous research agent |
+| `batch` | A batch worker |
+| `voice` | A voice/realtime agent |
+| `browser` | A browser/computer-use agent |
+| `managed` | A managed multi-tenant runtime |
+| `eval` | An eval bundle for grading other targets |
+| `workflow` | A workflow orchestration runtime |
+
+Adding a new target shape starts at the IR, not at codegen. See [`docs/COMPILER-ARCHITECTURE.md`](docs/COMPILER-ARCHITECTURE.md).
+
+## The three pillars
+
+1. **The compiler is the protagonist.** Specs flow through `parseSpec → lower → applyPasses → emit`. The IR is a discriminated union of target-shape variants; each emitter consumes its own typed variant.
+
+2. **Eval is active, not passive.** Eval failures produce *spec patches*. `crewhaus optimize` searches the mutation space (rule-based or Claude-driven) and writes back through a YAML CST that preserves comments and key order. The loop closes.
+
+3. **Security is a fabric, not a perimeter.** Every untrusted ingress — MCP responses, sub-agent returns, channel inbound messages, federation payloads, skill bodies, compaction summaries — goes through the boundary classifier with `TrustOrigin` metadata before it hits a model call. Authentication verifies who; classification verifies what.
+
+Full architecture: [`docs/AI-Harness-Systems.md`](docs/AI-Harness-Systems.md), [`docs/COMPILER-ARCHITECTURE.md`](docs/COMPILER-ARCHITECTURE.md), [`CLAUDE.md`](CLAUDE.md).
+
+## Quickstart
 
 Requires [Bun](https://bun.sh) ≥ 1.2.
 
 ```bash
-bun install
-bun run compile:hello   # compiles examples/hello-cli/crewhaus.yaml → dist/agent.ts
-ANTHROPIC_API_KEY=sk-... bun run run:hello
+# Install the CLI
+bun add -d @crewhaus/cli
+
+# Create a new agent project
+crewhaus init my-agent
+cd my-agent
+
+# Edit spec.yaml — see docs/recipes/01-first-spec.md
+
+# Compile to the CLI target (the default)
+crewhaus compile
+
+# Run it
+ANTHROPIC_API_KEY=sk-... crewhaus run
+
+# Or compile to a different shape
+crewhaus compile --target channel-slack
+crewhaus compile --target rag-pipeline
+crewhaus compile --target eval-bundle
 ```
 
-The compiled agent is a self-contained TypeScript file that imports `@crewhaus/runtime-core` and runs a streaming chat loop with the configured model and instructions.
+## Example: compile a spec to two different shapes
 
-## Three architectural pillars
+```yaml
+# spec.yaml
+name: github-issue-triage
+model:
+  provider: anthropic
+  name: claude-sonnet-4-6
+instructions: |
+  You triage GitHub issues by reading them and assigning labels.
+tools:
+  - github:list_labels
+  - github:add_labels
+```
 
-Every change in this repo respects three invariants. They exist because the founding thesis in [`docs/AI-Harness-Systems.md`](docs/AI-Harness-Systems.md) only holds if all three stay true together. Contributors should read [`CLAUDE.md`](CLAUDE.md) for the rules each pillar produces.
+```bash
+# Get a CLI you can run locally
+crewhaus compile --target cli
 
-1. **The compiler is the protagonist.** Crewhaus is a meta-harness compiler, not "yet another agent loop." Specs flow through `parseSpec → lower → applyPasses → emit`; the IR is a discriminated union (`IrNode = IrV0 | IrWorkflowV0 | IrChannelV0 | IrGraphV0 | ...`) and each target shape consumes its own typed IR variant. New target shapes start at the IR, not at codegen. Walked through with file paths in [`docs/COMPILER-ARCHITECTURE.md`](docs/COMPILER-ARCHITECTURE.md).
+# Get a Slack bot that responds to a slash command
+crewhaus compile --target channel-slack
 
-2. **Eval is active, not passive.** The empirical signal that the harness layer can deliver measurable accuracy gains is DSPy's MIPRO result (+13% on five of seven multi-stage programs). Crewhaus's eval stack closes the loop: eval failures produce *spec patches* via `crewhaus optimize`, not just HTML reports. The orchestration layer wires `eval-runner` (fitness) + `prompt-optimizer` (search via a `MutationProvider` interface, with both rule-based and Claude-driven providers shipping) + `spec-patch` (YAML CST round-trip with comment preservation) + optional write-back. See [`docs/recipes/42-active-optimization.md`](docs/recipes/42-active-optimization.md).
+# Get an eval bundle to test it
+crewhaus compile --target eval --eval-set evals/triage.jsonl
+```
 
-3. **Security is a fabric, not a perimeter.** `prompt-injection-detector` fires at every cross-trust boundary, not just the front door. The `boundary-classifier` package centralises classification with `TrustOrigin` metadata — `"user" | "mcp" | "subagent" | "channel" | "federation" | "skill" | "compaction" | "tool"` — and a content-hash LRU cache. Authentication (mTLS, JWT) verifies *who*; classification verifies *what*. See [`docs/recipes/41-security-fabric.md`](docs/recipes/41-security-fabric.md).
+Same spec. Different shapes. Different deployment paths.
 
-## Operating choices
+## Documentation
 
-- **TypeScript + Bun** primary runtime. Python interop is reserved for slots where the ecosystem genuinely outclasses TS (today: nothing — the Claude-backed `MutationProvider` superseded the originally-deferred DSPy bridge for prompt optimisation; Ragas/HELM/lm-evaluation-harness datasets are consumed via shipped JSONL exports rather than a runtime bridge).
-- **Spec → IR → target codegen** pipeline. The IR is runtime-agnostic; backends are swappable. Twelve targets ship today (CLI, workflow, channel bot, stateful graph, managed multi-tenant, RAG pipeline, multi-agent crew, autonomous research, batch worker, voice/realtime, browser/computer-use, eval bundle).
-- **Generated bundles are runtime-thin**: they import `@crewhaus/runtime-core` rather than embedding everything. The `bundle-packager` module can inline for distribution.
-- **Streaming + prompt caching** in the runtime by default — these are core, not optional.
+- **New here?** Start with [Getting Started](docs/GETTING-STARTED.md) — a guided tour from first principles to a runnable agent.
+- **Looking for a recipe?** See [Recipes Index](docs/recipes/INDEX.md) — 40+ task-oriented walkthroughs.
+- **Need the module reference?** See [Module Catalog](docs/MODULE-CATALOG.md) — full module catalog across the target-shape variants.
+- **Contributing?** See [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
-## Roadmap from this scaffold
+## Crewhaus Forge
 
-The vertical slice covers the smallest sliver of these catalog modules:
-- `spec-schema`, `spec-parser`, `spec-validator` (F1)
-- `ir-model` (F1, v0 only)
-- `compiler-core`, `target-cli-bundle`, `codegen-templates` (F2)
-- `runtime-orchestrator` (R1, single-turn slice only)
-- `model-adapter` (R2, Anthropic only)
-- `spec-cli` (F4)
+Community registry for shared harnesses, skills, tools, and recipes. **Coming Summer 2026.** [See what's coming →](https://forge.crewhaus.ai)
 
-Next, in dependency order from PART G of the catalog: foundations (`infra-utils`, `error-types`, `logging`, `config-loader`, `state-store`, `feature-flags`), then real model layer + tool layer, then permission + compaction, then the harder targets.
+## Want hands-on help?
+
+[StudioMax](https://studiomax.io/work/crewhaus) — the studio that built CrewHaus — offers fixed-scope implementation packages: install, configure, build your first harnesses, train your team.
+
+## A hosted version?
+
+We may build a hosted CrewHaus eventually — managed runtime, private registry, observability. We're listening for signal first. [Tell us what you'd want →](https://cloud.crewhaus.ai). No promises.
+
+## Contributing
+
+Contributions are welcome. CrewHaus is async-first and BDFL-lite — see [`GOVERNANCE.md`](GOVERNANCE.md) for how decisions are made and [`CONTRIBUTING.md`](CONTRIBUTING.md) for how to contribute.
+
+Quick links:
+
+- [Good first issues](https://github.com/crewhaus/factory/labels/good%20first%20issue)
+- [Help wanted](https://github.com/crewhaus/factory/labels/help%20wanted)
+- [Open RFCs](https://github.com/crewhaus/factory/labels/rfc)
+- [`docs/contributing/your-first-target.md`](docs/contributing/your-first-target.md) — adding a new target shape end-to-end
+
+## Support
+
+Async, best-effort, community-driven. See [`SUPPORT.md`](SUPPORT.md) for the channels and what to expect.
+
+- Free users → [GitHub Discussions](https://github.com/crewhaus/factory/discussions) and [Issues](https://github.com/crewhaus/factory/issues)
+- Paid Cloud users → support tied to your plan
+- Custom implementation → [StudioMax implementation packages](https://studiomax.io/work/crewhaus)
+
+## Security
+
+Vulnerability reports go to a private channel, not GitHub Issues. See [`SECURITY.md`](SECURITY.md).
+
+## License
+
+[Apache License 2.0](LICENSE). The Apache-2.0 license covers the code. **CrewHaus**, **Crewhaus Factory**, **Crewhaus Cloud**, **Crewhaus Forge**, and the logo are trademarks; see [`TRADEMARK.md`](TRADEMARK.md) for use-of-marks policy.
+
+Documentation is licensed under [Creative Commons Attribution 4.0](docs/LICENSE).
+
+---
+
+*Built by [StudioMax](https://studiomax.io).*

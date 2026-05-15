@@ -1,5 +1,5 @@
 /**
- * Structured logging for crewhaus-factory.
+ * Structured logging for factory.
  * Catalog F-foundations (`logging`) — every later layer routes diagnostic
  * output through this contract instead of raw stderr writes.
  *

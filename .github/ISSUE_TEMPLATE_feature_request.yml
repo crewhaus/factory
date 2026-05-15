@@ -1,0 +1,48 @@
+name: Feature request
+description: Suggest a feature or improvement.
+title: "[feat]: "
+labels: ["enhancement", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the suggestion. Some feature ideas require an RFC before any code is written — see [`CONTRIBUTING.md`](https://github.com/crewhaus/factory/blob/main/CONTRIBUTING.md) for when an RFC is needed. If your idea is large or architectural, please open an RFC instead.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: Describe the underlying problem, not the solution you have in mind.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would you like CrewHaus to do?
+      description: Sketch what the feature would look like. Include CLI command shapes, spec.yaml fields, or API surface if relevant.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What workarounds have you tried? Why isn't this already possible?
+
+  - type: textarea
+    id: pillar-impact
+    attributes:
+      label: Pillar alignment
+      description: |
+        How does this feature relate to the three pillars?
+
+        - **Compiler-first:** Does this need a new IR variant or pass?
+        - **Active eval:** Does this involve eval or optimization?
+        - **Security fabric:** Does this introduce a new trust boundary?
+
+  - type: input
+    id: target-shape
+    attributes:
+      label: Which target shape(s) does this affect?
+      placeholder: "cli, channel-slack, all targets, n/a"

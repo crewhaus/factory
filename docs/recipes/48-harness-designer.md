@@ -21,7 +21,7 @@ designing itself.
 
 By the end of this recipe you'll have a working agent that:
 
-- Pulls the latest crewhaus-factory docs on every run.
+- Pulls the latest factory docs on every run.
 - Asks ONE open-ended question, then up to four intent-anchored
   clarifying questions.
 - Never asks "which target shape?", "which tools?", or "what
@@ -80,7 +80,7 @@ multi-stage programs ([docs/AI-Harness-Systems.md](../AI-Harness-Systems.md))
 - An Anthropic credential (`ANTHROPIC_AUTH_TOKEN` from `claude
   setup-token` if you have Pro/Max, otherwise `ANTHROPIC_API_KEY`).
 - This repo cloned and `bun install` run once. **Or** set
-  `CREWHAUS_FACTORY_PATH=/path/to/crewhaus-factory` to point at a
+  `CREWHAUS_FACTORY_PATH=/path/to/factory` to point at a
   checkout living elsewhere. **Or** let the designer clone the repo
   to `~/.crewhaus/factory-cache` on first run — it handles that
   itself.
@@ -360,7 +360,7 @@ runtime. It tries three paths in order, all in the instructions:
    compiled designer somewhere else and want to point at a known
    checkout.
 3. **Clone-to-cache fallback.** Otherwise, `git clone
-   https://github.com/crewhaus/crewhaus-factory ~/.crewhaus/factory-cache`
+   https://github.com/crewhaus/factory ~/.crewhaus/factory-cache`
    on first run, `git pull --ff-only` on subsequent runs.
 
 In all three cases the designer runs `git pull --ff-only` before

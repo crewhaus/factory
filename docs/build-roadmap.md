@@ -77,7 +77,7 @@ Use this index to navigate from a section number straight to its role in the arc
 | §45 | varies | varies | varies | Long-tail breadth (no dedicated section) |
 | §46 | every variant | F2, R15 | runtime + spec-patch (post-eval mutation) | Active IR-patch optimizer (Pillar 2 — see [recipe 42](recipes/42-active-optimization.md)) |
 
-The "compiler-core pipeline" phase covers **§1–§5, §6, §12, §19–§25, §29** — every section that adds an IR variant or its lowering/emit code. Everything else is either runtime infrastructure, target periphery, or cross-cutting policy. This phase grouping is what the [critique](https://github.com/crewhaus/crewhaus-factory/issues) called for; it is an index over the existing flat numbering rather than a renumbering.
+The "compiler-core pipeline" phase covers **§1–§5, §6, §12, §19–§25, §29** — every section that adds an IR variant or its lowering/emit code. Everything else is either runtime infrastructure, target periphery, or cross-cutting policy. This phase grouping is what the [critique](https://github.com/crewhaus/factory/issues) called for; it is an index over the existing flat numbering rather than a renumbering.
 
 ### The three pillars in one paragraph each
 
@@ -2849,7 +2849,7 @@ example-corpus CI  (parallel)
 
 ## Kickoff prompts
 
-Use these prompts with Claude Code from the project root (`/Users/bots/Developer/crewhaus-factory`). Each prompt is self-contained.
+Use these prompts with Claude Code from the project root (`/Users/bots/Developer/CrewHaus/factory`). Each prompt is self-contained.
 
 ---
 

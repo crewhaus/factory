@@ -1,5 +1,5 @@
 /**
- * @crewhaus/mcp-host — MCP client manager for crewhaus-factory.
+ * @crewhaus/mcp-host — MCP client manager for factory.
  *
  * Catalog R5 (`mcp-host`). Wraps `@modelcontextprotocol/sdk` with:
  *   - stdio + SSE transports (constructed from `McpServerConfig`).
