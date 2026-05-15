@@ -1,0 +1,14 @@
+{
+  "name": "@crewhaus-examples/hello-harness-designer",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Meta-recipe: a CrewHaus harness that designs other CrewHaus harnesses",
+  "dependencies": {
+    "@crewhaus/hooks-engine": "workspace:*",
+    "@crewhaus/runtime-core": "workspace:*",
+    "@crewhaus/skills-registry": "workspace:*",
+    "@crewhaus/slash-commands": "workspace:*",
+    "@crewhaus/tool-catalog": "workspace:*"
+  }
+}
