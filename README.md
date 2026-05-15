@@ -1,4 +1,4 @@
-# crewhaus-factory
+# CrewHaus Factory
 
 A modular **meta-harness tool**: compile a single high-level harness spec into multiple runtime targets (CLI agent, channel bot, multi-agent crew, RAG pipeline, eval harness, managed runtime, stateful graph, autonomous research, voice/realtime, computer-use, batch worker).
 
