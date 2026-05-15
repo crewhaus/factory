@@ -215,7 +215,10 @@ describe("T4 — fixture replay", () => {
     shape: unknown;
     expectedKind: RecoveryAction["kind"];
   };
-  const fixturesPath = join(import.meta.dir, "__fixtures__", "errors.json");
+  // `tsc -b` also compiles this file into `dist/`; resolve fixtures from the
+  // source tree so both the src and dist test copies find errors.json.
+  const SRC_DIR = import.meta.dir.replace(/([/\\])dist$/, "$1src");
+  const fixturesPath = join(SRC_DIR, "__fixtures__", "errors.json");
   const fixtures = JSON.parse(readFileSync(fixturesPath, "utf-8")) as Fixture[];
 
   for (const f of fixtures) {

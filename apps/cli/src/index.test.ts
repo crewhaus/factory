@@ -4,7 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseSpec } from "@crewhaus/spec";
 
-const CLI_PATH = join(import.meta.dir, "index.ts");
+// `tsc -b` also compiles this file into `dist/`; resolve the CLI entrypoint
+// from the source tree so the dist test copy can still spawn it.
+const SRC_DIR = import.meta.dir.replace(/([/\\])dist$/, "$1src");
+const CLI_PATH = join(SRC_DIR, "index.ts");
 const REPO_ROOT = join(import.meta.dir, "../../..");
 const HELLO_SPEC = join(REPO_ROOT, "examples/hello-cli/crewhaus.yaml");
 

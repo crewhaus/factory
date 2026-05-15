@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 /**
  * @crewhaus/jetbrains-plugin/scripts/build — Section 35
@@ -24,7 +24,18 @@ export class JetbrainsPluginError extends CrewhausError {
   }
 }
 
-const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
+// Walk up from this file to the nearest package.json. Source layout is
+// `src/scripts/build.ts` (2 levels deep); `tsc -b` flattens to `dist/build.js`
+// (1 level deep). A marker-based walk handles both without hard-coding depth.
+function findPackageRoot(start: string): string {
+  let cur = start;
+  while (cur !== dirname(cur)) {
+    if (existsSync(join(cur, "package.json"))) return cur;
+    cur = dirname(cur);
+  }
+  throw new JetbrainsPluginError(`package.json not found above ${start}`);
+}
+const PACKAGE_ROOT = findPackageRoot(dirname(fileURLToPath(import.meta.url)));
 const PLUGIN_XML_PATH = join(PACKAGE_ROOT, "src", "main", "resources", "META-INF", "plugin.xml");
 const BUILD_GRADLE_PATH = join(PACKAGE_ROOT, "build.gradle.kts");
 
