@@ -104,7 +104,7 @@ Same spec. Different shapes. Different deployment paths.
 
 ## Documentation
 
-- **New here?** Start with [Getting Started](https://github.com/crewhaus/demos/blob/main/GETTING-STARTED.md) — a guided tour from first principles to a runnable agent.
+- **New here?** Start with [Getting Started](https://github.com/crewhaus/docs/blob/main/GETTING-STARTED.md) — a guided tour from first principles to a runnable agent.
 - **Looking for a recipe?** See [Recipes Index](https://github.com/crewhaus/demos/blob/main/recipes/INDEX.md) — 40+ task-oriented walkthroughs.
 - **Need the module reference?** See [Module Catalog](https://github.com/crewhaus/docs/blob/main/MODULE-CATALOG.md) — full module catalog across the target-shape variants.
 - **Contributing?** See [`CONTRIBUTING.md`](CONTRIBUTING.md).
