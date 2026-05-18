@@ -6,11 +6,8 @@
       "name": "crewhaus-factory",
       "devDependencies": {
         "@biomejs/biome": "1.9.4",
-        "@crewhaus/studio-server": "workspace:*",
-        "@crewhaus/studio-ui": "workspace:*",
         "@types/bun": "^1.2.0",
         "@types/node": "^22.0.0",
-        "playwright": "1.59.1",
         "typescript": "^5.7.0",
       },
     },
@@ -67,537 +64,6 @@
         "@crewhaus/tool-web": "workspace:*",
       },
     },
-    "examples/hello-batch": {
-      "name": "@crewhaus-examples/hello-batch",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/idempotency-keys": "workspace:*",
-        "@crewhaus/permission-engine": "workspace:*",
-        "@crewhaus/queue-consumer": "workspace:*",
-        "@crewhaus/queue-protocol": "workspace:*",
-        "@crewhaus/run-context": "workspace:*",
-        "@crewhaus/runtime-core": "workspace:*",
-        "@crewhaus/tool-catalog": "workspace:*",
-      },
-    },
-    "examples/hello-browser": {
-      "name": "@crewhaus-examples/hello-browser",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/computer-use-driver": "workspace:*",
-        "@crewhaus/permission-engine": "workspace:*",
-        "@crewhaus/run-context": "workspace:*",
-        "@crewhaus/runtime-core": "workspace:*",
-        "@crewhaus/tool-catalog": "workspace:*",
-        "@crewhaus/tool-mouse-keyboard": "workspace:*",
-        "@crewhaus/tool-screen-capture": "workspace:*",
-        "@crewhaus/tool-vision-grounding": "workspace:*",
-      },
-    },
-    "examples/hello-channel": {
-      "name": "@crewhaus-examples/hello-channel",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/channel-adapter-slack": "workspace:*",
-        "@crewhaus/hooks-engine": "workspace:*",
-        "@crewhaus/permission-engine": "workspace:*",
-        "@crewhaus/run-context": "workspace:*",
-        "@crewhaus/runtime-core": "workspace:*",
-        "@crewhaus/session-store": "workspace:*",
-        "@crewhaus/skills-registry": "workspace:*",
-        "@crewhaus/slash-commands": "workspace:*",
-        "@crewhaus/tool-bash": "workspace:*",
-        "@crewhaus/tool-catalog": "workspace:*",
-        "@crewhaus/tool-fs": "workspace:*",
-        "@crewhaus/tool-message-channel": "workspace:*",
-      },
-    },
-    "examples/hello-cli": {
-      "name": "@crewhaus-examples/hello-cli",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/hooks-engine": "workspace:*",
-        "@crewhaus/runtime-core": "workspace:*",
-        "@crewhaus/skills-registry": "workspace:*",
-        "@crewhaus/slash-commands": "workspace:*",
-        "@crewhaus/tool-catalog": "workspace:*",
-      },
-    },
-    "examples/hello-crew": {
-      "name": "@crewhaus-examples/hello-crew",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/a2a-protocol": "workspace:*",
-        "@crewhaus/agent-handoff": "workspace:*",
-        "@crewhaus/crew-orchestrator": "workspace:*",
-        "@crewhaus/permission-engine": "workspace:*",
-      },
-    },
-    "examples/hello-eval": {
-      "name": "@crewhaus-examples/hello-eval",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/dataset-registry": "workspace:*",
-        "@crewhaus/eval-grader": "workspace:*",
-        "@crewhaus/eval-runner": "workspace:*",
-      },
-    },
-    "examples/hello-graph": {
-      "name": "@crewhaus-examples/hello-graph",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/checkpoint-store": "workspace:*",
-        "@crewhaus/graph-engine": "workspace:*",
-        "@crewhaus/run-context": "workspace:*",
-        "@crewhaus/runtime-core": "workspace:*",
-      },
-    },
-    "examples/hello-harness-designer": {
-      "name": "@crewhaus-examples/hello-harness-designer",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/hooks-engine": "workspace:*",
-        "@crewhaus/runtime-core": "workspace:*",
-        "@crewhaus/skills-registry": "workspace:*",
-        "@crewhaus/slash-commands": "workspace:*",
-        "@crewhaus/tool-catalog": "workspace:*",
-      },
-    },
-    "examples/hello-managed": {
-      "name": "@crewhaus-examples/hello-managed",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/audit-log": "workspace:*",
-        "@crewhaus/gateway-protocol": "workspace:*",
-        "@crewhaus/gateway-server": "workspace:*",
-        "@crewhaus/policy-engine": "workspace:*",
-        "@crewhaus/runtime-core": "workspace:*",
-        "@crewhaus/tenancy": "workspace:*",
-      },
-    },
-    "examples/hello-rag": {
-      "name": "@crewhaus-examples/hello-rag",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/chunker": "workspace:*",
-        "@crewhaus/embedder": "workspace:*",
-        "@crewhaus/hooks-engine": "workspace:*",
-        "@crewhaus/permission-engine": "workspace:*",
-        "@crewhaus/pipeline-engine": "workspace:*",
-        "@crewhaus/runtime-core": "workspace:*",
-        "@crewhaus/skills-registry": "workspace:*",
-        "@crewhaus/slash-commands": "workspace:*",
-        "@crewhaus/tool-catalog": "workspace:*",
-        "@crewhaus/tool-retrieve": "workspace:*",
-        "@crewhaus/vector-store": "workspace:*",
-      },
-    },
-    "examples/hello-research": {
-      "name": "@crewhaus-examples/hello-research",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/citation-tracker": "workspace:*",
-        "@crewhaus/crawler": "workspace:*",
-        "@crewhaus/permission-engine": "workspace:*",
-        "@crewhaus/planner": "workspace:*",
-        "@crewhaus/report-writer": "workspace:*",
-        "@crewhaus/run-context": "workspace:*",
-        "@crewhaus/runtime-core": "workspace:*",
-        "@crewhaus/tool-catalog": "workspace:*",
-      },
-    },
-    "examples/hello-voice": {
-      "name": "@crewhaus-examples/hello-voice",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/barge-in-controller": "workspace:*",
-        "@crewhaus/vad-engine": "workspace:*",
-        "@crewhaus/voice-runtime": "workspace:*",
-      },
-    },
-    "examples/hello-workflow": {
-      "name": "@crewhaus-examples/hello-workflow",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/hooks-engine": "workspace:*",
-        "@crewhaus/permission-engine": "workspace:*",
-        "@crewhaus/runtime-core": "workspace:*",
-        "@crewhaus/skills-registry": "workspace:*",
-        "@crewhaus/slash-commands": "workspace:*",
-        "@crewhaus/tool-bash": "workspace:*",
-      },
-    },
-    "examples/mcp-smoke": {
-      "name": "@crewhaus-examples/mcp-smoke",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/hooks-engine": "workspace:*",
-        "@crewhaus/mcp-host": "workspace:*",
-        "@crewhaus/runtime-core": "workspace:*",
-        "@crewhaus/skills-registry": "workspace:*",
-        "@crewhaus/slash-commands": "workspace:*",
-        "@crewhaus/tool-catalog": "workspace:*",
-        "@crewhaus/tool-mcp": "workspace:*",
-      },
-    },
-    "examples/section-15-smoke": {
-      "name": "@crewhaus-examples/section-15-smoke",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/hooks-engine": "workspace:*",
-        "@crewhaus/permission-engine": "workspace:*",
-        "@crewhaus/runtime-core": "workspace:*",
-        "@crewhaus/skills-registry": "workspace:*",
-        "@crewhaus/slash-commands": "workspace:*",
-        "@crewhaus/tool-bash": "workspace:*",
-        "@crewhaus/tool-catalog": "workspace:*",
-      },
-    },
-    "examples/section-18-smoke": {
-      "name": "@crewhaus-examples/section-18-smoke",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/hooks-engine": "workspace:*",
-        "@crewhaus/permission-engine": "workspace:*",
-        "@crewhaus/runtime-core": "workspace:*",
-        "@crewhaus/skills-registry": "workspace:*",
-        "@crewhaus/slash-commands": "workspace:*",
-        "@crewhaus/tool-catalog": "workspace:*",
-        "@crewhaus/tool-code-execution": "workspace:*",
-        "@crewhaus/tool-fs": "workspace:*",
-      },
-    },
-    "examples/section-27-smoke": {
-      "name": "@crewhaus-examples/section-27-smoke",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/adapter-anthropic": "workspace:*",
-        "@crewhaus/audit-log": "workspace:*",
-        "@crewhaus/circuit-breaker": "workspace:*",
-        "@crewhaus/cost-tracker": "workspace:*",
-        "@crewhaus/prompt-cache-manager": "workspace:*",
-        "@crewhaus/rate-limiter": "workspace:*",
-        "@crewhaus/secrets-manager": "workspace:*",
-        "@crewhaus/trace-event-bus": "workspace:*",
-      },
-    },
-    "examples/section-28-smoke": {
-      "name": "@crewhaus-examples/section-28-smoke",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/audit-log": "workspace:*",
-        "@crewhaus/canary-controller": "workspace:*",
-        "@crewhaus/deployment-controller": "workspace:*",
-        "@crewhaus/ir": "workspace:*",
-        "@crewhaus/ir-passes": "workspace:*",
-        "@crewhaus/migration-engine": "workspace:*",
-        "@crewhaus/migration-runner": "workspace:*",
-        "@crewhaus/spec-registry": "workspace:*",
-      },
-    },
-    "examples/section-29-smoke": {
-      "name": "@crewhaus-examples/section-29-smoke",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/dataset-registry": "workspace:*",
-        "@crewhaus/eval-dataset": "workspace:*",
-        "@crewhaus/eval-runner": "workspace:*",
-        "@crewhaus/grader-registry": "workspace:*",
-        "@crewhaus/prompt-optimizer": "workspace:*",
-        "@crewhaus/regression-runner": "workspace:*",
-      },
-    },
-    "examples/section-30-smoke": {
-      "name": "@crewhaus-examples/section-30-smoke",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/call-session": "workspace:*",
-        "@crewhaus/computer-use-driver": "workspace:*",
-        "@crewhaus/queue-protocol": "workspace:*",
-        "@crewhaus/vector-store": "workspace:*",
-        "@crewhaus/voice-runtime": "workspace:*",
-      },
-    },
-    "examples/section-31-smoke": {
-      "name": "@crewhaus-examples/section-31-smoke",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/graph-visualizer": "workspace:*",
-        "@crewhaus/ir": "workspace:*",
-        "@crewhaus/plugin-sdk": "workspace:*",
-        "@crewhaus/studio-server": "workspace:*",
-        "@crewhaus/studio-ui": "workspace:*",
-        "@crewhaus/trace-event-bus": "workspace:*",
-        "@crewhaus/trace-viewer": "workspace:*",
-      },
-    },
-    "examples/section-32-smoke": {
-      "name": "@crewhaus-examples/section-32-smoke",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/crewhaus-cloud": "workspace:*",
-        "@crewhaus/docker-images": "workspace:*",
-        "@crewhaus/helm-chart": "workspace:*",
-        "@crewhaus/single-binary-cli": "workspace:*",
-      },
-    },
-    "examples/section-33-discord-smoke": {
-      "name": "@crewhaus-examples/section-33-discord-smoke",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/channel-adapter-discord": "workspace:*",
-        "@crewhaus/compiler": "workspace:*",
-      },
-    },
-    "examples/section-33-imessage-smoke": {
-      "name": "@crewhaus-examples/section-33-imessage-smoke",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/channel-adapter-imessage": "workspace:*",
-        "@crewhaus/compiler": "workspace:*",
-      },
-    },
-    "examples/section-33-telegram-smoke": {
-      "name": "@crewhaus-examples/section-33-telegram-smoke",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/channel-adapter-telegram": "workspace:*",
-        "@crewhaus/compiler": "workspace:*",
-      },
-    },
-    "examples/section-33-whatsapp-smoke": {
-      "name": "@crewhaus-examples/section-33-whatsapp-smoke",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/channel-adapter-whatsapp": "workspace:*",
-        "@crewhaus/compiler": "workspace:*",
-      },
-    },
-    "examples/section-34-federation-smoke": {
-      "name": "@crewhaus-examples/section-34-federation-smoke",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/federation-discovery": "workspace:*",
-        "@crewhaus/federation-protocol": "workspace:*",
-        "@crewhaus/federation-router": "workspace:*",
-      },
-    },
-    "examples/section-35-jetbrains-smoke": {
-      "name": "@crewhaus-examples/section-35-jetbrains-smoke",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/jetbrains-plugin": "workspace:*",
-      },
-    },
-    "examples/section-35-playground-smoke": {
-      "name": "@crewhaus-examples/section-35-playground-smoke",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/crewhaus-playground": "workspace:*",
-      },
-    },
-    "examples/section-35-vscode-smoke": {
-      "name": "@crewhaus-examples/section-35-vscode-smoke",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/vscode-extension": "workspace:*",
-      },
-    },
-    "examples/section-36-sandbox-image-dotnet-smoke": {
-      "name": "@crewhaus-examples/section-36-sandbox-image-dotnet-smoke",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/sandbox": "workspace:*",
-        "@crewhaus/sandbox-image-dotnet": "workspace:*",
-        "@crewhaus/sandbox-image-registry": "workspace:*",
-      },
-    },
-    "examples/section-36-sandbox-image-go-smoke": {
-      "name": "@crewhaus-examples/section-36-sandbox-image-go-smoke",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/sandbox": "workspace:*",
-        "@crewhaus/sandbox-image-go": "workspace:*",
-        "@crewhaus/sandbox-image-registry": "workspace:*",
-      },
-    },
-    "examples/section-36-sandbox-image-java-smoke": {
-      "name": "@crewhaus-examples/section-36-sandbox-image-java-smoke",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/sandbox": "workspace:*",
-        "@crewhaus/sandbox-image-java": "workspace:*",
-        "@crewhaus/sandbox-image-registry": "workspace:*",
-      },
-    },
-    "examples/section-36-sandbox-image-php-smoke": {
-      "name": "@crewhaus-examples/section-36-sandbox-image-php-smoke",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/sandbox": "workspace:*",
-        "@crewhaus/sandbox-image-php": "workspace:*",
-        "@crewhaus/sandbox-image-registry": "workspace:*",
-      },
-    },
-    "examples/section-36-sandbox-image-r-smoke": {
-      "name": "@crewhaus-examples/section-36-sandbox-image-r-smoke",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/sandbox": "workspace:*",
-        "@crewhaus/sandbox-image-r": "workspace:*",
-        "@crewhaus/sandbox-image-registry": "workspace:*",
-      },
-    },
-    "examples/section-36-sandbox-image-registry-smoke": {
-      "name": "@crewhaus-examples/section-36-sandbox-image-registry-smoke",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/sandbox": "workspace:*",
-        "@crewhaus/sandbox-image-registry": "workspace:*",
-      },
-    },
-    "examples/section-36-sandbox-image-ruby-smoke": {
-      "name": "@crewhaus-examples/section-36-sandbox-image-ruby-smoke",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/sandbox": "workspace:*",
-        "@crewhaus/sandbox-image-registry": "workspace:*",
-        "@crewhaus/sandbox-image-ruby": "workspace:*",
-      },
-    },
-    "examples/section-36-sandbox-image-rust-smoke": {
-      "name": "@crewhaus-examples/section-36-sandbox-image-rust-smoke",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/sandbox": "workspace:*",
-        "@crewhaus/sandbox-image-registry": "workspace:*",
-        "@crewhaus/sandbox-image-rust": "workspace:*",
-      },
-    },
-    "examples/section-37-exporter-datadog-smoke": {
-      "name": "@crewhaus-examples/section-37-exporter-datadog-smoke",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/exporter-datadog": "workspace:*",
-        "@crewhaus/trace-event-bus": "workspace:*",
-      },
-    },
-    "examples/section-37-exporter-honeycomb-smoke": {
-      "name": "@crewhaus-examples/section-37-exporter-honeycomb-smoke",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/exporter-honeycomb": "workspace:*",
-        "@crewhaus/trace-event-bus": "workspace:*",
-      },
-    },
-    "examples/section-37-exporter-newrelic-smoke": {
-      "name": "@crewhaus-examples/section-37-exporter-newrelic-smoke",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/exporter-newrelic": "workspace:*",
-        "@crewhaus/trace-event-bus": "workspace:*",
-      },
-    },
-    "examples/section-37-exporter-splunk-smoke": {
-      "name": "@crewhaus-examples/section-37-exporter-splunk-smoke",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/exporter-splunk": "workspace:*",
-        "@crewhaus/trace-event-bus": "workspace:*",
-      },
-    },
-    "examples/section-38-grader-multimodal-smoke": {
-      "name": "@crewhaus-examples/section-38-grader-multimodal-smoke",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/eval-grader": "workspace:*",
-        "@crewhaus/grader-multimodal": "workspace:*",
-        "@crewhaus/grader-nlg-metrics": "workspace:*",
-        "@crewhaus/grader-registry": "workspace:*",
-      },
-    },
-    "examples/section-38-grader-nlg-metrics-smoke": {
-      "name": "@crewhaus-examples/section-38-grader-nlg-metrics-smoke",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/eval-grader": "workspace:*",
-        "@crewhaus/grader-nlg-metrics": "workspace:*",
-        "@crewhaus/grader-registry": "workspace:*",
-      },
-    },
-    "examples/section-38-grader-safety-classifiers-smoke": {
-      "name": "@crewhaus-examples/section-38-grader-safety-classifiers-smoke",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/eval-grader": "workspace:*",
-        "@crewhaus/grader-registry": "workspace:*",
-        "@crewhaus/grader-safety-classifiers": "workspace:*",
-      },
-    },
-    "examples/section-38-grader-semantic-similarity-smoke": {
-      "name": "@crewhaus-examples/section-38-grader-semantic-similarity-smoke",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/embedder": "workspace:*",
-        "@crewhaus/eval-grader": "workspace:*",
-        "@crewhaus/grader-registry": "workspace:*",
-        "@crewhaus/grader-semantic-similarity": "workspace:*",
-      },
-    },
-    "examples/section-39-audit-encryption-smoke": {
-      "name": "@crewhaus-examples/section-39-audit-encryption-smoke",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/audit-encryption": "workspace:*",
-        "@crewhaus/secrets-manager": "workspace:*",
-      },
-    },
-    "examples/section-39-compliance-controls-smoke": {
-      "name": "@crewhaus-examples/section-39-compliance-controls-smoke",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/audit-encryption": "workspace:*",
-        "@crewhaus/audit-log": "workspace:*",
-        "@crewhaus/compliance-controls": "workspace:*",
-        "@crewhaus/data-retention-engine": "workspace:*",
-        "@crewhaus/pii-redactor": "workspace:*",
-        "@crewhaus/secrets-manager": "workspace:*",
-      },
-    },
-    "examples/section-39-data-retention-engine-smoke": {
-      "name": "@crewhaus-examples/section-39-data-retention-engine-smoke",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/data-retention-engine": "workspace:*",
-      },
-    },
-    "examples/section-39-pii-redactor-smoke": {
-      "name": "@crewhaus-examples/section-39-pii-redactor-smoke",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/grader-safety-classifiers": "workspace:*",
-        "@crewhaus/pii-redactor": "workspace:*",
-      },
-    },
-    "examples/section-40-example-corpus-smoke": {
-      "name": "@crewhaus-examples/section-40-example-corpus-smoke",
-      "version": "0.0.0",
-    },
-    "examples/section-40-template-marketplace-client-smoke": {
-      "name": "@crewhaus-examples/section-40-template-marketplace-client-smoke",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/template-marketplace-client": "workspace:*",
-        "@crewhaus/template-registry": "workspace:*",
-      },
-    },
-    "examples/section-40-template-registry-smoke": {
-      "name": "@crewhaus-examples/section-40-template-registry-smoke",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/template-registry": "workspace:*",
-      },
-    },
     "packages/a2a-protocol": {
       "name": "@crewhaus/a2a-protocol",
       "version": "0.0.0",
@@ -617,7 +83,7 @@
       "name": "@crewhaus/adapter-anthropic",
       "version": "0.0.0",
       "dependencies": {
-        "@anthropic-ai/sdk": "^0.40.0",
+        "@anthropic-ai/sdk": "^0.96.0",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/token-budget": "workspace:*",
       },
@@ -819,7 +285,7 @@
       "name": "@crewhaus/compaction-autocompact",
       "version": "0.0.0",
       "dependencies": {
-        "@anthropic-ai/sdk": "^0.40.0",
+        "@anthropic-ai/sdk": "^0.96.0",
         "@crewhaus/adapter-anthropic": "workspace:*",
         "@crewhaus/boundary-classifier": "workspace:*",
         "@crewhaus/errors": "workspace:*",
@@ -829,7 +295,7 @@
       "name": "@crewhaus/compaction-snip",
       "version": "0.0.0",
       "dependencies": {
-        "@anthropic-ai/sdk": "^0.40.0",
+        "@anthropic-ai/sdk": "^0.96.0",
       },
     },
     "packages/compiler": {
@@ -912,7 +378,7 @@
         "@crewhaus/trace-event-bus": "workspace:*",
       },
       "devDependencies": {
-        "@anthropic-ai/sdk": "^0.40.0",
+        "@anthropic-ai/sdk": "^0.96.0",
         "@crewhaus/adapter-anthropic": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "zod": "^3.23.8",
@@ -925,15 +391,6 @@
         "@crewhaus/docker-images": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/helm-chart": "workspace:*",
-      },
-    },
-    "packages/crewhaus-playground": {
-      "name": "@crewhaus/crewhaus-playground",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/errors": "workspace:*",
-        "@crewhaus/scaffold-templates": "workspace:*",
-        "@crewhaus/spec": "workspace:*",
       },
     },
     "packages/data-retention-engine": {
@@ -1214,13 +671,6 @@
         "@crewhaus/trace-event-bus": "workspace:*",
       },
     },
-    "packages/graph-visualizer": {
-      "name": "@crewhaus/graph-visualizer",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/ir": "workspace:*",
-      },
-    },
     "packages/helm-chart": {
       "name": "@crewhaus/helm-chart",
       "version": "0.0.0",
@@ -1259,14 +709,6 @@
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/ir": "workspace:*",
-      },
-    },
-    "packages/jetbrains-plugin": {
-      "name": "@crewhaus/jetbrains-plugin",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/errors": "workspace:*",
-        "@crewhaus/vscode-extension": "workspace:*",
       },
     },
     "packages/logging": {
@@ -1370,13 +812,6 @@
         "@crewhaus/model-router": "workspace:*",
       },
     },
-    "packages/plugin-sdk": {
-      "name": "@crewhaus/plugin-sdk",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/errors": "workspace:*",
-      },
-    },
     "packages/policy-engine": {
       "name": "@crewhaus/policy-engine",
       "version": "0.0.0",
@@ -1414,7 +849,7 @@
       "name": "@crewhaus/prompt-optimizer-claude",
       "version": "0.0.0",
       "dependencies": {
-        "@anthropic-ai/sdk": "^0.40.0",
+        "@anthropic-ai/sdk": "^0.96.0",
         "@crewhaus/adapter-anthropic": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/prompt-optimizer": "workspace:*",
@@ -1482,7 +917,7 @@
       "name": "@crewhaus/runtime-core",
       "version": "0.0.0",
       "dependencies": {
-        "@anthropic-ai/sdk": "^0.40.0",
+        "@anthropic-ai/sdk": "^0.96.0",
         "@crewhaus/abort-controller": "workspace:*",
         "@crewhaus/adapter-anthropic": "workspace:*",
         "@crewhaus/agent-context-isolation": "workspace:*",
@@ -1602,10 +1037,6 @@
         "@crewhaus/sandbox-image-registry": "workspace:*",
       },
     },
-    "packages/scaffold-templates": {
-      "name": "@crewhaus/scaffold-templates",
-      "version": "0.0.0",
-    },
     "packages/secrets-manager": {
       "name": "@crewhaus/secrets-manager",
       "version": "0.0.0",
@@ -1683,7 +1114,7 @@
       "name": "@crewhaus/streaming-tool-executor",
       "version": "0.0.0",
       "dependencies": {
-        "@anthropic-ai/sdk": "^0.40.0",
+        "@anthropic-ai/sdk": "^0.96.0",
         "@crewhaus/adapter-anthropic": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
@@ -1700,24 +1131,6 @@
         "@crewhaus/trace-event-bus": "workspace:*",
       },
     },
-    "packages/studio-server": {
-      "name": "@crewhaus/studio-server",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/errors": "workspace:*",
-        "@crewhaus/graph-visualizer": "workspace:*",
-        "@crewhaus/ir": "workspace:*",
-        "@crewhaus/plugin-sdk": "workspace:*",
-        "@crewhaus/scaffold-templates": "workspace:*",
-        "@crewhaus/spec": "workspace:*",
-        "@crewhaus/trace-viewer": "workspace:*",
-        "@crewhaus/wizard": "workspace:*",
-      },
-    },
-    "packages/studio-ui": {
-      "name": "@crewhaus/studio-ui",
-      "version": "0.0.0",
-    },
     "packages/sub-agent-permission-inheritance": {
       "name": "@crewhaus/sub-agent-permission-inheritance",
       "version": "0.0.0",
@@ -1731,7 +1144,7 @@
       "name": "@crewhaus/sub-agent-spawner",
       "version": "0.0.0",
       "dependencies": {
-        "@anthropic-ai/sdk": "^0.40.0",
+        "@anthropic-ai/sdk": "^0.96.0",
         "@crewhaus/adapter-anthropic": "workspace:*",
         "@crewhaus/agent-context-isolation": "workspace:*",
         "@crewhaus/boundary-classifier": "workspace:*",
@@ -1925,7 +1338,7 @@
       "name": "@crewhaus/token-budget",
       "version": "0.0.0",
       "dependencies": {
-        "@anthropic-ai/sdk": "^0.40.0",
+        "@anthropic-ai/sdk": "^0.96.0",
       },
     },
     "packages/tool-bash": {
@@ -2235,13 +1648,6 @@
         "@crewhaus/logging": "workspace:*",
       },
     },
-    "packages/trace-viewer": {
-      "name": "@crewhaus/trace-viewer",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/trace-event-bus": "workspace:*",
-      },
-    },
     "packages/turn-state-machine": {
       "name": "@crewhaus/turn-state-machine",
       "version": "0.0.0",
@@ -2267,13 +1673,6 @@
         "@crewhaus/errors": "workspace:*",
       },
     },
-    "packages/vscode-extension": {
-      "name": "@crewhaus/vscode-extension",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/spec": "workspace:*",
-      },
-    },
     "packages/wallet-engine": {
       "name": "@crewhaus/wallet-engine",
       "version": "0.0.0",
@@ -2283,17 +1682,9 @@
         "@crewhaus/errors": "workspace:*",
       },
     },
-    "packages/wizard": {
-      "name": "@crewhaus/wizard",
-      "version": "0.0.0",
-      "dependencies": {
-        "@crewhaus/errors": "workspace:*",
-        "@crewhaus/scaffold-templates": "workspace:*",
-      },
-    },
   },
   "packages": {
-    "@anthropic-ai/sdk": ["@anthropic-ai/sdk@0.40.1", "", { "dependencies": { "@types/node": "^18.11.18", "@types/node-fetch": "^2.6.4", "abort-controller": "^3.0.0", "agentkeepalive": "^4.2.1", "form-data-encoder": "1.7.2", "formdata-node": "^4.3.2", "node-fetch": "^2.6.7" } }, "sha512-DJMWm8lTEM9Lk/MSFL+V+ugF7jKOn0M2Ujvb5fN8r2nY14aHbGPZ1k6sgjL+tpJ3VuOGJNG+4R83jEpOuYPv8w=="],
+    "@anthropic-ai/sdk": ["@anthropic-ai/sdk@0.96.0", "", { "dependencies": { "json-schema-to-ts": "^3.1.1", "standardwebhooks": "^1.0.0" }, "peerDependencies": { "zod": "^3.25.0 || ^4.0.0" }, "optionalPeers": ["zod"], "bin": { "anthropic-ai-sdk": "bin/cli" } }, "sha512-KlCsODtTyb17bLUVCSDC2HtSvAbJf60sEiPEax9dInF+aDF92vS4TZJ5XD7YCQXNb1/5icYaw8Y7wMjPlIV9Zg=="],
 
     "@aws-crypto/crc32": ["@aws-crypto/crc32@5.2.0", "", { "dependencies": { "@aws-crypto/util": "^5.2.0", "@aws-sdk/types": "^3.222.0", "tslib": "^2.6.2" } }, "sha512-nLbCWqQNgUiwwtFsen1AdzAtvuLRsQS8rYgMuxCrdKf9kOssamGLuPwyTY9wyYblNr9+1XM8v6zoDTPPSIeANg=="],
 
@@ -2367,6 +1758,8 @@
 
     "@aws/lambda-invoke-store": ["@aws/lambda-invoke-store@0.2.4", "", {}, "sha512-iY8yvjE0y651BixKNPgmv1WrQc+GZ142sb0z4gYnChDDY2YqI4P/jsSopBWrKfAt7LOJAkOXt7rC/hms+WclQQ=="],
 
+    "@babel/runtime": ["@babel/runtime@7.29.2", "", {}, "sha512-JiDShH45zKHWyGe4ZNVRrCjBz8Nh9TMmZG1kh4QTK8hCBTWBi8Da+i7s1fJw7/lYpM4ccepSNfqzZ/QvABBi5g=="],
+
     "@biomejs/biome": ["@biomejs/biome@1.9.4", "", { "optionalDependencies": { "@biomejs/cli-darwin-arm64": "1.9.4", "@biomejs/cli-darwin-x64": "1.9.4", "@biomejs/cli-linux-arm64": "1.9.4", "@biomejs/cli-linux-arm64-musl": "1.9.4", "@biomejs/cli-linux-x64": "1.9.4", "@biomejs/cli-linux-x64-musl": "1.9.4", "@biomejs/cli-win32-arm64": "1.9.4", "@biomejs/cli-win32-x64": "1.9.4" }, "bin": { "biome": "bin/biome" } }, "sha512-1rkd7G70+o9KkTn5KLmDYXihGoTaIGO9PIIN2ZB7UJxFrWw04CZHPYiMRjYsaDvVV7hP1dYNRLxSANLaBFGpog=="],
 
     "@biomejs/cli-darwin-arm64": ["@biomejs/cli-darwin-arm64@1.9.4", "", { "os": "darwin", "cpu": "arm64" }, "sha512-bFBsPWrNvkdKrNCYeAp+xo2HecOGPAy9WyNyB/jKnnedgzl4W4Hb9ZMzYNbf8dMCGmUdSavlYHiR01QaYR58cw=="],
@@ -2384,112 +1777,6 @@
     "@biomejs/cli-win32-arm64": ["@biomejs/cli-win32-arm64@1.9.4", "", { "os": "win32", "cpu": "arm64" }, "sha512-tlbhLk+WXZmgwoIKwHIHEBZUwxml7bRJgk0X2sPyNR3S93cdRq6XulAZRQJ17FYGGzWne0fgrXBKpl7l4M87Hg=="],
 
     "@biomejs/cli-win32-x64": ["@biomejs/cli-win32-x64@1.9.4", "", { "os": "win32", "cpu": "x64" }, "sha512-8Y5wMhVIPaWe6jw2H+KlEm4wP/f7EW3810ZLmDlrEEy5KvBsb9ECEfu/kMWD484ijfQ8+nIi0giMgu9g1UAuuA=="],
-
-    "@crewhaus-examples/hello-batch": ["@crewhaus-examples/hello-batch@workspace:examples/hello-batch"],
-
-    "@crewhaus-examples/hello-browser": ["@crewhaus-examples/hello-browser@workspace:examples/hello-browser"],
-
-    "@crewhaus-examples/hello-channel": ["@crewhaus-examples/hello-channel@workspace:examples/hello-channel"],
-
-    "@crewhaus-examples/hello-cli": ["@crewhaus-examples/hello-cli@workspace:examples/hello-cli"],
-
-    "@crewhaus-examples/hello-crew": ["@crewhaus-examples/hello-crew@workspace:examples/hello-crew"],
-
-    "@crewhaus-examples/hello-eval": ["@crewhaus-examples/hello-eval@workspace:examples/hello-eval"],
-
-    "@crewhaus-examples/hello-graph": ["@crewhaus-examples/hello-graph@workspace:examples/hello-graph"],
-
-    "@crewhaus-examples/hello-harness-designer": ["@crewhaus-examples/hello-harness-designer@workspace:examples/hello-harness-designer"],
-
-    "@crewhaus-examples/hello-managed": ["@crewhaus-examples/hello-managed@workspace:examples/hello-managed"],
-
-    "@crewhaus-examples/hello-rag": ["@crewhaus-examples/hello-rag@workspace:examples/hello-rag"],
-
-    "@crewhaus-examples/hello-research": ["@crewhaus-examples/hello-research@workspace:examples/hello-research"],
-
-    "@crewhaus-examples/hello-voice": ["@crewhaus-examples/hello-voice@workspace:examples/hello-voice"],
-
-    "@crewhaus-examples/hello-workflow": ["@crewhaus-examples/hello-workflow@workspace:examples/hello-workflow"],
-
-    "@crewhaus-examples/mcp-smoke": ["@crewhaus-examples/mcp-smoke@workspace:examples/mcp-smoke"],
-
-    "@crewhaus-examples/section-15-smoke": ["@crewhaus-examples/section-15-smoke@workspace:examples/section-15-smoke"],
-
-    "@crewhaus-examples/section-18-smoke": ["@crewhaus-examples/section-18-smoke@workspace:examples/section-18-smoke"],
-
-    "@crewhaus-examples/section-27-smoke": ["@crewhaus-examples/section-27-smoke@workspace:examples/section-27-smoke"],
-
-    "@crewhaus-examples/section-28-smoke": ["@crewhaus-examples/section-28-smoke@workspace:examples/section-28-smoke"],
-
-    "@crewhaus-examples/section-29-smoke": ["@crewhaus-examples/section-29-smoke@workspace:examples/section-29-smoke"],
-
-    "@crewhaus-examples/section-30-smoke": ["@crewhaus-examples/section-30-smoke@workspace:examples/section-30-smoke"],
-
-    "@crewhaus-examples/section-31-smoke": ["@crewhaus-examples/section-31-smoke@workspace:examples/section-31-smoke"],
-
-    "@crewhaus-examples/section-32-smoke": ["@crewhaus-examples/section-32-smoke@workspace:examples/section-32-smoke"],
-
-    "@crewhaus-examples/section-33-discord-smoke": ["@crewhaus-examples/section-33-discord-smoke@workspace:examples/section-33-discord-smoke"],
-
-    "@crewhaus-examples/section-33-imessage-smoke": ["@crewhaus-examples/section-33-imessage-smoke@workspace:examples/section-33-imessage-smoke"],
-
-    "@crewhaus-examples/section-33-telegram-smoke": ["@crewhaus-examples/section-33-telegram-smoke@workspace:examples/section-33-telegram-smoke"],
-
-    "@crewhaus-examples/section-33-whatsapp-smoke": ["@crewhaus-examples/section-33-whatsapp-smoke@workspace:examples/section-33-whatsapp-smoke"],
-
-    "@crewhaus-examples/section-34-federation-smoke": ["@crewhaus-examples/section-34-federation-smoke@workspace:examples/section-34-federation-smoke"],
-
-    "@crewhaus-examples/section-35-jetbrains-smoke": ["@crewhaus-examples/section-35-jetbrains-smoke@workspace:examples/section-35-jetbrains-smoke"],
-
-    "@crewhaus-examples/section-35-playground-smoke": ["@crewhaus-examples/section-35-playground-smoke@workspace:examples/section-35-playground-smoke"],
-
-    "@crewhaus-examples/section-35-vscode-smoke": ["@crewhaus-examples/section-35-vscode-smoke@workspace:examples/section-35-vscode-smoke"],
-
-    "@crewhaus-examples/section-36-sandbox-image-dotnet-smoke": ["@crewhaus-examples/section-36-sandbox-image-dotnet-smoke@workspace:examples/section-36-sandbox-image-dotnet-smoke"],
-
-    "@crewhaus-examples/section-36-sandbox-image-go-smoke": ["@crewhaus-examples/section-36-sandbox-image-go-smoke@workspace:examples/section-36-sandbox-image-go-smoke"],
-
-    "@crewhaus-examples/section-36-sandbox-image-java-smoke": ["@crewhaus-examples/section-36-sandbox-image-java-smoke@workspace:examples/section-36-sandbox-image-java-smoke"],
-
-    "@crewhaus-examples/section-36-sandbox-image-php-smoke": ["@crewhaus-examples/section-36-sandbox-image-php-smoke@workspace:examples/section-36-sandbox-image-php-smoke"],
-
-    "@crewhaus-examples/section-36-sandbox-image-r-smoke": ["@crewhaus-examples/section-36-sandbox-image-r-smoke@workspace:examples/section-36-sandbox-image-r-smoke"],
-
-    "@crewhaus-examples/section-36-sandbox-image-registry-smoke": ["@crewhaus-examples/section-36-sandbox-image-registry-smoke@workspace:examples/section-36-sandbox-image-registry-smoke"],
-
-    "@crewhaus-examples/section-36-sandbox-image-ruby-smoke": ["@crewhaus-examples/section-36-sandbox-image-ruby-smoke@workspace:examples/section-36-sandbox-image-ruby-smoke"],
-
-    "@crewhaus-examples/section-36-sandbox-image-rust-smoke": ["@crewhaus-examples/section-36-sandbox-image-rust-smoke@workspace:examples/section-36-sandbox-image-rust-smoke"],
-
-    "@crewhaus-examples/section-37-exporter-datadog-smoke": ["@crewhaus-examples/section-37-exporter-datadog-smoke@workspace:examples/section-37-exporter-datadog-smoke"],
-
-    "@crewhaus-examples/section-37-exporter-honeycomb-smoke": ["@crewhaus-examples/section-37-exporter-honeycomb-smoke@workspace:examples/section-37-exporter-honeycomb-smoke"],
-
-    "@crewhaus-examples/section-37-exporter-newrelic-smoke": ["@crewhaus-examples/section-37-exporter-newrelic-smoke@workspace:examples/section-37-exporter-newrelic-smoke"],
-
-    "@crewhaus-examples/section-37-exporter-splunk-smoke": ["@crewhaus-examples/section-37-exporter-splunk-smoke@workspace:examples/section-37-exporter-splunk-smoke"],
-
-    "@crewhaus-examples/section-38-grader-multimodal-smoke": ["@crewhaus-examples/section-38-grader-multimodal-smoke@workspace:examples/section-38-grader-multimodal-smoke"],
-
-    "@crewhaus-examples/section-38-grader-nlg-metrics-smoke": ["@crewhaus-examples/section-38-grader-nlg-metrics-smoke@workspace:examples/section-38-grader-nlg-metrics-smoke"],
-
-    "@crewhaus-examples/section-38-grader-safety-classifiers-smoke": ["@crewhaus-examples/section-38-grader-safety-classifiers-smoke@workspace:examples/section-38-grader-safety-classifiers-smoke"],
-
-    "@crewhaus-examples/section-38-grader-semantic-similarity-smoke": ["@crewhaus-examples/section-38-grader-semantic-similarity-smoke@workspace:examples/section-38-grader-semantic-similarity-smoke"],
-
-    "@crewhaus-examples/section-39-audit-encryption-smoke": ["@crewhaus-examples/section-39-audit-encryption-smoke@workspace:examples/section-39-audit-encryption-smoke"],
-
-    "@crewhaus-examples/section-39-compliance-controls-smoke": ["@crewhaus-examples/section-39-compliance-controls-smoke@workspace:examples/section-39-compliance-controls-smoke"],
-
-    "@crewhaus-examples/section-39-data-retention-engine-smoke": ["@crewhaus-examples/section-39-data-retention-engine-smoke@workspace:examples/section-39-data-retention-engine-smoke"],
-
-    "@crewhaus-examples/section-39-pii-redactor-smoke": ["@crewhaus-examples/section-39-pii-redactor-smoke@workspace:examples/section-39-pii-redactor-smoke"],
-
-    "@crewhaus-examples/section-40-example-corpus-smoke": ["@crewhaus-examples/section-40-example-corpus-smoke@workspace:examples/section-40-example-corpus-smoke"],
-
-    "@crewhaus-examples/section-40-template-marketplace-client-smoke": ["@crewhaus-examples/section-40-template-marketplace-client-smoke@workspace:examples/section-40-template-marketplace-client-smoke"],
-
-    "@crewhaus-examples/section-40-template-registry-smoke": ["@crewhaus-examples/section-40-template-registry-smoke@workspace:examples/section-40-template-registry-smoke"],
 
     "@crewhaus/a2a-protocol": ["@crewhaus/a2a-protocol@workspace:packages/a2a-protocol"],
 
@@ -2563,8 +1850,6 @@
 
     "@crewhaus/crewhaus-cloud": ["@crewhaus/crewhaus-cloud@workspace:packages/crewhaus-cloud"],
 
-    "@crewhaus/crewhaus-playground": ["@crewhaus/crewhaus-playground@workspace:packages/crewhaus-playground"],
-
     "@crewhaus/data-retention-engine": ["@crewhaus/data-retention-engine@workspace:packages/data-retention-engine"],
 
     "@crewhaus/dataset-registry": ["@crewhaus/dataset-registry@workspace:packages/dataset-registry"],
@@ -2623,8 +1908,6 @@
 
     "@crewhaus/graph-engine": ["@crewhaus/graph-engine@workspace:packages/graph-engine"],
 
-    "@crewhaus/graph-visualizer": ["@crewhaus/graph-visualizer@workspace:packages/graph-visualizer"],
-
     "@crewhaus/helm-chart": ["@crewhaus/helm-chart@workspace:packages/helm-chart"],
 
     "@crewhaus/hooks-engine": ["@crewhaus/hooks-engine@workspace:packages/hooks-engine"],
@@ -2636,8 +1919,6 @@
     "@crewhaus/ir": ["@crewhaus/ir@workspace:packages/ir"],
 
     "@crewhaus/ir-passes": ["@crewhaus/ir-passes@workspace:packages/ir-passes"],
-
-    "@crewhaus/jetbrains-plugin": ["@crewhaus/jetbrains-plugin@workspace:packages/jetbrains-plugin"],
 
     "@crewhaus/logging": ["@crewhaus/logging@workspace:packages/logging"],
 
@@ -2662,8 +1943,6 @@
     "@crewhaus/pipeline-engine": ["@crewhaus/pipeline-engine@workspace:packages/pipeline-engine"],
 
     "@crewhaus/planner": ["@crewhaus/planner@workspace:packages/planner"],
-
-    "@crewhaus/plugin-sdk": ["@crewhaus/plugin-sdk@workspace:packages/plugin-sdk"],
 
     "@crewhaus/policy-engine": ["@crewhaus/policy-engine@workspace:packages/policy-engine"],
 
@@ -2709,8 +1988,6 @@
 
     "@crewhaus/sandbox-image-rust": ["@crewhaus/sandbox-image-rust@workspace:packages/sandbox-image-rust"],
 
-    "@crewhaus/scaffold-templates": ["@crewhaus/scaffold-templates@workspace:packages/scaffold-templates"],
-
     "@crewhaus/secrets-manager": ["@crewhaus/secrets-manager@workspace:packages/secrets-manager"],
 
     "@crewhaus/session-store": ["@crewhaus/session-store@workspace:packages/session-store"],
@@ -2732,10 +2009,6 @@
     "@crewhaus/streaming-tool-executor": ["@crewhaus/streaming-tool-executor@workspace:packages/streaming-tool-executor"],
 
     "@crewhaus/structured-event-printer": ["@crewhaus/structured-event-printer@workspace:packages/structured-event-printer"],
-
-    "@crewhaus/studio-server": ["@crewhaus/studio-server@workspace:packages/studio-server"],
-
-    "@crewhaus/studio-ui": ["@crewhaus/studio-ui@workspace:packages/studio-ui"],
 
     "@crewhaus/sub-agent-permission-inheritance": ["@crewhaus/sub-agent-permission-inheritance@workspace:packages/sub-agent-permission-inheritance"],
 
@@ -2829,8 +2102,6 @@
 
     "@crewhaus/trace-event-bus": ["@crewhaus/trace-event-bus@workspace:packages/trace-event-bus"],
 
-    "@crewhaus/trace-viewer": ["@crewhaus/trace-viewer@workspace:packages/trace-viewer"],
-
     "@crewhaus/turn-state-machine": ["@crewhaus/turn-state-machine@workspace:packages/turn-state-machine"],
 
     "@crewhaus/vad-engine": ["@crewhaus/vad-engine@workspace:packages/vad-engine"],
@@ -2839,11 +2110,7 @@
 
     "@crewhaus/voice-runtime": ["@crewhaus/voice-runtime@workspace:packages/voice-runtime"],
 
-    "@crewhaus/vscode-extension": ["@crewhaus/vscode-extension@workspace:packages/vscode-extension"],
-
     "@crewhaus/wallet-engine": ["@crewhaus/wallet-engine@workspace:packages/wallet-engine"],
-
-    "@crewhaus/wizard": ["@crewhaus/wizard@workspace:packages/wizard"],
 
     "@google/genai": ["@google/genai@1.52.0", "", { "dependencies": { "google-auth-library": "^10.3.0", "p-retry": "^4.6.2", "protobufjs": "^7.5.4", "ws": "^8.18.0" }, "peerDependencies": { "@modelcontextprotocol/sdk": "^1.25.2" }, "optionalPeers": ["@modelcontextprotocol/sdk"] }, "sha512-gwSvbpiN/17O9TbsqSsE/OzZcpv5Fo4RQjdngGgogtuB9RsyJ8ZHhX5KjHj1bp5N9snN2eK8LDGXSaWW2hof8Q=="],
 
@@ -2962,6 +2229,8 @@
     "@smithy/util-utf8": ["@smithy/util-utf8@4.2.2", "", { "dependencies": { "@smithy/util-buffer-from": "^4.2.2", "tslib": "^2.6.2" } }, "sha512-75MeYpjdWRe8M5E3AW0O4Cx3UadweS+cwdXjwYGBW5h/gxxnbeZ877sLPX/ZJA9GVTlL/qG0dXP29JWFCD1Ayw=="],
 
     "@smithy/uuid": ["@smithy/uuid@1.1.2", "", { "dependencies": { "tslib": "^2.6.2" } }, "sha512-O/IEdcCUKkubz60tFbGA7ceITTAJsty+lBjNoorP4Z6XRqaFb/OjQjZODophEcuq68nKm6/0r+6/lLQ+XVpk8g=="],
+
+    "@stablelib/base64": ["@stablelib/base64@1.0.1", "", {}, "sha512-1bnPQqSxSuc3Ii6MhBysoWCg58j97aUjuCSZrGSmDxNqtytIi0k8utUenAwTZN4V5mXXYGsVUI9zeBqy+jBOSQ=="],
 
     "@types/bun": ["@types/bun@1.3.13", "", { "dependencies": { "bun-types": "1.3.13" } }, "sha512-9fqXWk5YIHGGnUau9TEi+qdlTYDAnOj+xLCmSTwXfAIqXr2x4tytJb43E9uCvt09zJURKXwAtkoH4nLQfzeTXw=="],
 
@@ -3083,6 +2352,8 @@
 
     "fast-deep-equal": ["fast-deep-equal@3.1.3", "", {}, "sha512-f3qQ9oQy9j2AhBe/H9VC91wLmKBCCU/gDOnKNAYG5hswO7BLKj09Hc5HYNz9cGI++xlpDCIgDaitVs03ATR84Q=="],
 
+    "fast-sha256": ["fast-sha256@1.3.0", "", {}, "sha512-n11RGP/lrWEFI/bWdygLxhI+pVeo1ZYIVwvvPkW7azl/rOy+F3HYRZ2K5zeE9mmkhQppyv9sQFx0JM9UabnpPQ=="],
+
     "fast-uri": ["fast-uri@3.1.2", "", {}, "sha512-rVjf7ArG3LTk+FS6Yw81V1DLuZl1bRbNrev6Tmd/9RaroeeRRJhAt7jg/6YFxbvAQXUCavSoZhPPj6oOx+5KjQ=="],
 
     "fast-xml-builder": ["fast-xml-builder@1.1.9", "", { "dependencies": { "path-expression-matcher": "^1.1.3" } }, "sha512-jcyKVSEX13iseJqg7n/KWw+xnu/7fdrZ333Fac54KjHDIELVCfDDJXYIm6DTJ0Su4gSzrhqiK0DzY/wZbF40mw=="],
@@ -3154,6 +2425,8 @@
     "jose": ["jose@6.2.3", "", {}, "sha512-YYVDInQKFJfR/xa3ojUTl8c2KoTwiL1R5Wg9YCydwH0x0B9grbzlg5HC7mMjCtUJjbQ/YnGEZIhI5tCgfTb4Hw=="],
 
     "json-bigint": ["json-bigint@1.0.0", "", { "dependencies": { "bignumber.js": "^9.0.0" } }, "sha512-SiPv/8VpZuWbvLSMtTDU8hEfrZWg/mH/nV/b4o0CYbSxu1UIQPLdwKOCIyLQX+VIPO5vrLX3i8qtqFyhdPSUSQ=="],
+
+    "json-schema-to-ts": ["json-schema-to-ts@3.1.1", "", { "dependencies": { "@babel/runtime": "^7.18.3", "ts-algebra": "^2.0.0" } }, "sha512-+DWg8jCJG2TEnpy7kOm/7/AxaYoaRbjVB4LFZLySZlWn8exGs3A4OLJR966cVvU26N7X9TWxl+Jsw7dzAqKT6g=="],
 
     "json-schema-traverse": ["json-schema-traverse@1.0.0", "", {}, "sha512-NM8/P9n3XjXhIZn1lLhkFaACTOURQXjWhV4BA/RnOv8xvgqtqpAX9IO4mRQxSx1Rlo4tqzeqb0sOlruaOy3dug=="],
 
@@ -3255,6 +2528,8 @@
 
     "side-channel-weakmap": ["side-channel-weakmap@1.0.2", "", { "dependencies": { "call-bound": "^1.0.2", "es-errors": "^1.3.0", "get-intrinsic": "^1.2.5", "object-inspect": "^1.13.3", "side-channel-map": "^1.0.1" } }, "sha512-WPS/HvHQTYnHisLo9McqBHOJk2FkHO/tlpvldyrnem4aeQp4hai3gythswg6p01oSoTl58rcpiFAjF2br2Ak2A=="],
 
+    "standardwebhooks": ["standardwebhooks@1.0.0", "", { "dependencies": { "@stablelib/base64": "^1.0.0", "fast-sha256": "^1.3.0" } }, "sha512-BbHGOQK9olHPMvQNHWul6MYlrRTAOKn03rOe4A8O3CLWhNf4YHBqq2HJKKC+sfqpxiBY52pNeesD6jIiLDz8jg=="],
+
     "statuses": ["statuses@2.0.2", "", {}, "sha512-DvEy55V3DB7uknRo+4iOGT5fP1slR8wQohVdknigZPMpMstaKJQWhwiYBACJE3Ul2pTnATihhBYnRhZQHGBiRw=="],
 
     "strnum": ["strnum@2.3.0", "", {}, "sha512-ums3KNd42PGyx5xaoVTO1mjU1bH3NpY4vsrVlnv9PNGqQj8wd7rJ6nEypLrJ7z5vxK5RP0yMLo6J/Gsm62DI5Q=="],
@@ -3262,6 +2537,8 @@
     "toidentifier": ["toidentifier@1.0.1", "", {}, "sha512-o5sSPKEkg/DIQNmH43V0/uerLrpzVedkUh8tGNvaeXpfpuwjKenlSox/2O/BTlZUtEe+JG7s5YhEz608PlAHRA=="],
 
     "tr46": ["tr46@0.0.3", "", {}, "sha512-N3WMsuqV66lT30CrXNbEjx4GEwlow3v6rr4mCcv6prnfwhS01rkgyFdjPNBYd9br7LpXV1+Emh01fHnq2Gdgrw=="],
+
+    "ts-algebra": ["ts-algebra@2.0.0", "", {}, "sha512-FPAhNPFMrkwz76P7cdjdmiShwMynZYN6SgOujD1urY4oNm80Ou9oMdmbR45LotcKOXoy7wSmHkRFE6Mxbrhefw=="],
 
     "tslib": ["tslib@2.8.1", "", {}, "sha512-oJFu94HQb+KVduSUQL7wnpmqnfmLsOA/nAh6b6EH0wCEoK0/mPeXU6c3wKDV83MkOuHPRHtSXKKU99IBazS/2w=="],
 
@@ -3301,8 +2578,6 @@
 
     "zod-to-json-schema": ["zod-to-json-schema@3.25.2", "", { "peerDependencies": { "zod": "^3.25.28 || ^4" } }, "sha512-O/PgfnpT1xKSDeQYSCfRI5Gy3hPf91mKVDuYLUHZJMiDFptvP41MSnWofm8dnCm0256ZNfZIM7DSzuSMAFnjHA=="],
 
-    "@anthropic-ai/sdk/@types/node": ["@types/node@18.19.130", "", { "dependencies": { "undici-types": "~5.26.4" } }, "sha512-GRaXQx6jGfL8sKfaIDD6OupbIHBr9jv7Jnaml9tB7l4v068PAOXqfcujMMo5PhbIs6ggR1XODELqahT2R8v0fg=="],
-
     "@aws-crypto/sha256-browser/@smithy/util-utf8": ["@smithy/util-utf8@2.3.0", "", { "dependencies": { "@smithy/util-buffer-from": "^2.2.0", "tslib": "^2.6.2" } }, "sha512-R8Rdn8Hy72KKcebgLiv8jQcQkXoLMOGGv5uI1/k0l+snqkOzQ1R0ChUBCxWMlBsFMekWjq0wRudIweFs7sKT5A=="],
 
     "@aws-crypto/util/@smithy/util-utf8": ["@smithy/util-utf8@2.3.0", "", { "dependencies": { "@smithy/util-buffer-from": "^2.2.0", "tslib": "^2.6.2" } }, "sha512-R8Rdn8Hy72KKcebgLiv8jQcQkXoLMOGGv5uI1/k0l+snqkOzQ1R0ChUBCxWMlBsFMekWjq0wRudIweFs7sKT5A=="],
@@ -3324,8 +2599,6 @@
     "parse5/entities": ["entities@6.0.1", "", {}, "sha512-aN97NXWF6AWBTahfVOIrB/NShkzi5H7F9r1s9mD3cDj4Ko5f2qhhVoYMibXF7GlLveb/D2ioWay8lxI97Ven3g=="],
 
     "whatwg-encoding/iconv-lite": ["iconv-lite@0.6.3", "", { "dependencies": { "safer-buffer": ">= 2.1.2 < 3.0.0" } }, "sha512-4fCk79wshMdzMp2rH06qWrJE4iolqLhCUH+OiuIgU++RB0+94NlDL81atO7GX55uUKueo0txHNtvEyI6D7WdMw=="],
-
-    "@anthropic-ai/sdk/@types/node/undici-types": ["undici-types@5.26.5", "", {}, "sha512-JlCMO+ehdEIKqlFxk6IfVoAUVmgz7cU7zD/h9XZ0qzeosSHmUJVOzSQvvYSYWXkFXC+IfLKSIffhv0sVZup6pA=="],
 
     "@aws-crypto/sha256-browser/@smithy/util-utf8/@smithy/util-buffer-from": ["@smithy/util-buffer-from@2.2.0", "", { "dependencies": { "@smithy/is-array-buffer": "^2.2.0", "tslib": "^2.6.2" } }, "sha512-IJdWBbTcMQ6DA0gdNhh/BwrLkDR+ADW5Kr1aZmd4k3DIF6ezMV4R2NIAmT08wQJ3yUK82thHWmC/TnK/wpMMIA=="],
 

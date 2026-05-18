@@ -132,9 +132,6 @@
     { "path": "./packages/federation-protocol" },
     { "path": "./packages/federation-discovery" },
     { "path": "./packages/federation-router" },
-    { "path": "./packages/vscode-extension" },
-    { "path": "./packages/jetbrains-plugin" },
-    { "path": "./packages/crewhaus-playground" },
     { "path": "./apps/cli" }
   ]
 }

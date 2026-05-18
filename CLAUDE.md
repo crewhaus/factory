@@ -2,16 +2,16 @@
 
 This file is the source of truth for *how* to develop factory. The *what* lives in:
 
-- [docs/AI-Harness-Systems.md](docs/AI-Harness-Systems.md) — the founding architectural thesis (north star; do not modify lightly)
-- [docs/COMPILER-ARCHITECTURE.md](docs/COMPILER-ARCHITECTURE.md) — the meta-harness compiler walked through with file paths
-- [docs/build-roadmap.md](docs/build-roadmap.md) — what's been built and what comes next
-- [docs/MODULE-CATALOG.md](docs/MODULE-CATALOG.md) — ~190 modules across 25 catalog layers
+- [AI-Harness-Systems.md](https://github.com/crewhaus/docs/blob/main/AI-Harness-Systems.md) — the founding architectural thesis (north star; do not modify lightly)
+- [COMPILER-ARCHITECTURE.md](https://github.com/crewhaus/docs/blob/main/COMPILER-ARCHITECTURE.md) — the meta-harness compiler walked through with file paths
+- [build-roadmap.md](https://github.com/crewhaus/docs/blob/main/build-roadmap.md) — what's been built and what comes next
+- [MODULE-CATALOG.md](https://github.com/crewhaus/docs/blob/main/MODULE-CATALOG.md) — ~190 modules across 25 catalog layers
 
 Read those for *what*. Read this for *how*.
 
 ## The three architectural pillars
 
-Every change in this repo must respect three invariants. They exist because in 2026-Q2 a critique surfaced that the implementation had drifted from the founding thesis on each axis; the remediation is documented in the corresponding sections of [docs/build-roadmap.md](docs/build-roadmap.md) and the invariants are codified here so future contributors stay anchored.
+Every change in this repo must respect three invariants. They exist because in 2026-Q2 a critique surfaced that the implementation had drifted from the founding thesis on each axis; the remediation is documented in the corresponding sections of [build-roadmap.md](https://github.com/crewhaus/docs/blob/main/build-roadmap.md) and the invariants are codified here so future contributors stay anchored.
 
 ### Pillar 1 — The compiler is the protagonist
 
@@ -27,7 +27,7 @@ Crewhaus is a **meta-harness compiler**, not "yet another agent loop." Specs flo
 
 ### Pillar 2 — Eval is active, not passive
 
-The empirical signal that the harness layer can deliver measurable accuracy gains is DSPy's MIPRO result (+13% on five of seven multi-stage programs, cited in [docs/AI-Harness-Systems.md](docs/AI-Harness-Systems.md)). Crewhaus's eval stack must close the loop: eval failures must produce *spec patches*, not just HTML reports.
+The empirical signal that the harness layer can deliver measurable accuracy gains is DSPy's MIPRO result (+13% on five of seven multi-stage programs, cited in [AI-Harness-Systems.md](https://github.com/crewhaus/docs/blob/main/AI-Harness-Systems.md)). Crewhaus's eval stack must close the loop: eval failures must produce *spec patches*, not just HTML reports.
 
 The active-optimization layer:
 
@@ -73,16 +73,16 @@ Every site that pulls externally-controlled content into the model's context mus
 ## Cross-cutting expectations
 
 - **TypeScript + Bun** is the primary runtime. Python interop is reserved for slots where the ecosystem genuinely outclasses TS (today: nothing — the Claude-backed `MutationProvider` superseded the originally-deferred DSPy bridge).
-- **No new package without a module brief** in [docs/module-briefs](docs/module-briefs). Briefs document responsibilities, depended-on / unblocks, and the catalog layer.
+- **No new package without a module brief** in [module-briefs](https://github.com/crewhaus/docs/tree/main/module-briefs). Briefs document responsibilities, depended-on / unblocks, and the catalog layer.
 - **Every package owns its tests** under `__tests__/` next to `src/`. Aim for `bun test` to stay ≥ the current pre-PR count.
 - **`bun run tsc -b` and `biome check` clean** before every PR. The `.github/workflows/example-corpus.yml` matrix also has to be green.
 - **Run `crewhaus doctor --philosophy-alignment`** before sending a PR that touches the IR, the eval stack, or any boundary site. It audits the three pillars against the current tree and exits 1 on drift.
 
 ## Where to start reading
 
-- **New target shape?** → `packages/ir/`, `packages/compiler/`, `packages/target-cli/` (smallest target), [docs/COMPILER-ARCHITECTURE.md](docs/COMPILER-ARCHITECTURE.md).
-- **New eval grader?** → `packages/eval-grader/`, `packages/grader-registry/`, [docs/recipes/34-building-custom-graders.md](docs/recipes/34-building-custom-graders.md).
-- **New tool?** → `packages/tool-builder/`, `packages/tool-catalog/`, [docs/module-briefs/047-tool-builder.md](docs/module-briefs/047-tool-builder.md).
-- **New channel?** → `packages/channel-adapter-base/`, an existing adapter like `channel-adapter-slack`, [docs/recipes/37-channel-telegram.md](docs/recipes/37-channel-telegram.md).
-- **New trust boundary?** → `packages/boundary-classifier/`, [docs/recipes/41-security-fabric.md](docs/recipes/41-security-fabric.md).
-- **Eval-driven optimization?** → `packages/eval-optimizer-orchestrator/`, [docs/recipes/42-active-optimization.md](docs/recipes/42-active-optimization.md).
+- **New target shape?** → `packages/ir/`, `packages/compiler/`, `packages/target-cli/` (smallest target), [COMPILER-ARCHITECTURE.md](https://github.com/crewhaus/docs/blob/main/COMPILER-ARCHITECTURE.md).
+- **New eval grader?** → `packages/eval-grader/`, `packages/grader-registry/`, [recipes/34-building-custom-graders.md](https://github.com/crewhaus/demos/blob/main/recipes/34-building-custom-graders.md).
+- **New tool?** → `packages/tool-builder/`, `packages/tool-catalog/`, [module-briefs/047-tool-builder.md](https://github.com/crewhaus/docs/blob/main/module-briefs/047-tool-builder.md).
+- **New channel?** → `packages/channel-adapter-base/`, an existing adapter like `channel-adapter-slack`, [recipes/37-channel-telegram.md](https://github.com/crewhaus/demos/blob/main/recipes/37-channel-telegram.md).
+- **New trust boundary?** → `packages/boundary-classifier/`, [recipes/41-security-fabric.md](https://github.com/crewhaus/demos/blob/main/recipes/41-security-fabric.md).
+- **Eval-driven optimization?** → `packages/eval-optimizer-orchestrator/`, [recipes/42-active-optimization.md](https://github.com/crewhaus/demos/blob/main/recipes/42-active-optimization.md).

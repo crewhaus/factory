@@ -18,5 +18,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Security fabric via `packages/boundary-classifier` with `TrustOrigin` metadata and a content-hash LRU cache, wired into MCP, sub-agent, channel, federation, skill, compaction, and tool boundaries.
 - `crewhaus doctor --philosophy-alignment` audit for the three architectural pillars.
 - CLI app (`apps/cli`), VS Code extension (`packages/vscode-extension`), Helm chart (`packages/helm-chart`), and single-binary CLI build.
-- Example specs and recipes under `examples/` and `docs/recipes/`.
-- Module catalog and build roadmap documentation under `docs/`.
+- Example specs and recipes in the [demos repo](https://github.com/crewhaus/demos) under `examples/` and `recipes/`.
+- Module catalog and build roadmap in the standalone [docs repo](https://github.com/crewhaus/docs).

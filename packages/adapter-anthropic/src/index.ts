@@ -51,6 +51,37 @@ export {
   createAnthropicClient,
 } from "./client.js";
 
+/**
+ * Re-exports of `@anthropic-ai/sdk` so workspace consumers can import
+ * the Anthropic class, error types, and message types from a single
+ * canonical instance. Without this, packages with their own direct dep
+ * on `@anthropic-ai/sdk` install a second copy of the SDK, and runtime
+ * `instanceof` checks against error classes fall through (because each
+ * copy defines its own classes). Always import from this package, not
+ * from `@anthropic-ai/sdk` directly.
+ */
+export { default as Anthropic } from "@anthropic-ai/sdk";
+export {
+  AnthropicError,
+  APIError,
+  APIConnectionError,
+  APIConnectionTimeoutError,
+  APIUserAbortError,
+  AuthenticationError,
+  BadRequestError,
+  ConflictError,
+  InternalServerError,
+  NotFoundError,
+  PermissionDeniedError,
+  RateLimitError,
+  UnprocessableEntityError,
+} from "@anthropic-ai/sdk";
+export type {
+  Message,
+  MessageParam,
+  ToolUseBlock,
+} from "@anthropic-ai/sdk/resources/messages";
+
 export {
   collectFinalMessage,
   consumeStream,

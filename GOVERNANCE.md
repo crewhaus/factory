@@ -22,7 +22,7 @@ The project lead:
 - Owns the trademarks and brand assets
 - Speaks for the project officially
 
-The project lead is appointed by the owner of CrewHaus IP (currently Max Meier, operating as StudioMax; see ADR-008). Succession is by appointment of the prior project lead with documented reasoning, or by the IP owner in their absence. Because the IP owner is a natural person rather than a corporate entity, succession planning is a real risk that needs explicit attention — see `docs/governance/succession.md` (to be added by Day 180).
+The project lead is appointed by the owner of CrewHaus IP (currently Max Meier, operating as StudioMax; see ADR-008). Succession is by appointment of the prior project lead with documented reasoning, or by the IP owner in their absence. Because the IP owner is a natural person rather than a corporate entity, succession planning is a real risk that needs explicit attention — see `governance/succession.md` in the [docs repo](https://github.com/crewhaus/docs) (to be added by Day 180).
 
 ### Core maintainers
 
@@ -125,7 +125,7 @@ Until any of these triggers, this document is the governance model.
 
 If the project lead becomes unavailable permanently, the entity that owns CrewHaus IP appoints a successor. If both the project lead and the IP-owning entity are unavailable, the core maintainers convene and elect a successor from among trusted contributors, by simple majority.
 
-The succession plan is documented separately at [`docs/governance/succession.md`](docs/governance/succession.md) (to be added by Day 180).
+The succession plan is documented separately at [`governance/succession.md`](https://github.com/crewhaus/docs/blob/main/governance/succession.md) in the docs repo (to be added by Day 180).
 
 ---
 

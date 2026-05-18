@@ -16,10 +16,21 @@ function newTempRoot(): string {
  * given the role's seed messages. The adapter reads the LATEST user message
  * each call, which is what the role-by-role orchestrator dispatches.
  */
+/**
+ * Test-local content block. SDK 0.96 tightened `TextBlock` (now requires
+ * `citations`) and `ToolUseBlock` (now requires `caller`). These synthetic
+ * test blocks never carry either, so we use a relaxed variant rather than
+ * spelling the extra fields everywhere.
+ */
+type TestBlock =
+  | { type: "text"; text: string }
+  | { type: "tool_use"; id: string; name: string; input: unknown }
+  | Exclude<Anthropic.ContentBlock, { type: "text" } | { type: "tool_use" }>;
+
 type Policy = (args: {
   seed: string;
   previousToolResults: ReadonlyArray<string>;
-}) => Anthropic.ContentBlock[];
+}) => TestBlock[];
 
 function makeProgrammableAdapter(policy: Policy): ProviderAdapter {
   return {
@@ -475,7 +486,7 @@ describe("A2A → Handoff transcript hygiene", () => {
           }
 
           // Decide the response.
-          let blocks: Anthropic.ContentBlock[];
+          let blocks: TestBlock[];
           if (role === "b") {
             // Peer responds with text.
             blocks = [{ type: "text", text: "peer reply: data is from Wikipedia" }];

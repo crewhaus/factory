@@ -25,7 +25,7 @@
     "@crewhaus/trace-event-bus": "workspace:*"
   },
   "devDependencies": {
-    "@anthropic-ai/sdk": "^0.40.0",
+    "@anthropic-ai/sdk": "^0.96.0",
     "@crewhaus/adapter-anthropic": "workspace:*",
     "@crewhaus/tool-builder": "workspace:*",
     "zod": "^3.23.8"

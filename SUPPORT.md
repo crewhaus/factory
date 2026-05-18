@@ -108,7 +108,7 @@ If you've waited a week without a response, it's reasonable to politely bump you
 
 The best way to get a fast, useful response:
 
-- **Search first.** GitHub Discussions, the docs, and the recipes index ([`docs/recipes/INDEX.md`](docs/recipes/INDEX.md)) cover most questions.
+- **Search first.** GitHub Discussions, the docs, and the recipes index ([`the demos recipes index`](the demos recipes index)) cover most questions.
 - **Include a reproduction.** A minimal `spec.yaml` + command + error output beats a vague description every time.
 - **State the version.** `crewhaus --version` and the Bun version.
 - **Don't cross-post.** Pick one channel.

@@ -203,8 +203,8 @@ At launch there is one core maintainer (project lead). The ladder exists so the 
 
 ## Documentation
 
-- New features need a recipe in `docs/recipes/`.
-- New modules need a brief in `docs/module-briefs/`.
+- New features need a recipe in the [demos repo's `recipes/`](https://github.com/crewhaus/demos/tree/main/recipes).
+- New modules need a brief in the [docs repo's `module-briefs/`](https://github.com/crewhaus/docs/tree/main/module-briefs).
 - Public API changes need a changelog entry (auto-generated from conventional commits).
 - Docs use Creative Commons Attribution 4.0 (separate from the code license).
 

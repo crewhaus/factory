@@ -36,7 +36,7 @@ Twelve target shapes ship today:
 | `eval` | An eval bundle for grading other targets |
 | `workflow` | A workflow orchestration runtime |
 
-Adding a new target shape starts at the IR, not at codegen. See [`docs/COMPILER-ARCHITECTURE.md`](docs/COMPILER-ARCHITECTURE.md).
+Adding a new target shape starts at the IR, not at codegen. See [`COMPILER-ARCHITECTURE.md`](https://github.com/crewhaus/docs/blob/main/COMPILER-ARCHITECTURE.md).
 
 ## The three pillars
 
@@ -46,7 +46,7 @@ Adding a new target shape starts at the IR, not at codegen. See [`docs/COMPILER-
 
 3. **Security is a fabric, not a perimeter.** Every untrusted ingress — MCP responses, sub-agent returns, channel inbound messages, federation payloads, skill bodies, compaction summaries — goes through the boundary classifier with `TrustOrigin` metadata before it hits a model call. Authentication verifies who; classification verifies what.
 
-Full architecture: [`docs/AI-Harness-Systems.md`](docs/AI-Harness-Systems.md), [`docs/COMPILER-ARCHITECTURE.md`](docs/COMPILER-ARCHITECTURE.md), [`CLAUDE.md`](CLAUDE.md).
+Full architecture: [`AI-Harness-Systems.md`](https://github.com/crewhaus/docs/blob/main/AI-Harness-Systems.md), [`COMPILER-ARCHITECTURE.md`](https://github.com/crewhaus/docs/blob/main/COMPILER-ARCHITECTURE.md), [`CLAUDE.md`](CLAUDE.md).
 
 ## Quickstart
 
@@ -60,7 +60,7 @@ bun add -d @crewhaus/cli
 crewhaus init my-agent
 cd my-agent
 
-# Edit spec.yaml — see docs/recipes/01-first-spec.md
+# Edit spec.yaml — see https://github.com/crewhaus/demos/blob/main/recipes/01-first-spec.md
 
 # Compile to the CLI target (the default)
 crewhaus compile
@@ -104,10 +104,18 @@ Same spec. Different shapes. Different deployment paths.
 
 ## Documentation
 
-- **New here?** Start with [Getting Started](docs/GETTING-STARTED.md) — a guided tour from first principles to a runnable agent.
-- **Looking for a recipe?** See [Recipes Index](docs/recipes/INDEX.md) — 40+ task-oriented walkthroughs.
-- **Need the module reference?** See [Module Catalog](docs/MODULE-CATALOG.md) — full module catalog across the target-shape variants.
+- **New here?** Start with [Getting Started](https://github.com/crewhaus/demos/blob/main/GETTING-STARTED.md) — a guided tour from first principles to a runnable agent.
+- **Looking for a recipe?** See [Recipes Index](https://github.com/crewhaus/demos/blob/main/recipes/INDEX.md) — 40+ task-oriented walkthroughs.
+- **Need the module reference?** See [Module Catalog](https://github.com/crewhaus/docs/blob/main/MODULE-CATALOG.md) — full module catalog across the target-shape variants.
 - **Contributing?** See [`CONTRIBUTING.md`](CONTRIBUTING.md).
+
+## Tooling around the compiler
+
+The compiler, runtime, eval stack, and security fabric live in this repo. Tooling that sits *around* the compiler — Studio, IDE extensions, the browser playground, and the section-* example specs — lives in the sibling [crewhaus/demos](https://github.com/crewhaus/demos) repo and consumes factory via tsconfig path aliases.
+
+- **Studio** ([demos/packages/studio-server](https://github.com/crewhaus/demos/tree/main/packages/studio-server) + [studio-ui](https://github.com/crewhaus/demos/tree/main/packages/studio-ui), with [wizard](https://github.com/crewhaus/demos/tree/main/packages/wizard), [scaffold-templates](https://github.com/crewhaus/demos/tree/main/packages/scaffold-templates), [trace-viewer](https://github.com/crewhaus/demos/tree/main/packages/trace-viewer), [graph-visualizer](https://github.com/crewhaus/demos/tree/main/packages/graph-visualizer), [plugin-sdk](https://github.com/crewhaus/demos/tree/main/packages/plugin-sdk)) — Bun.serve daemon for spec authoring, run inspection, and plugin discovery.
+- **IDE extensions** — [VS Code](https://github.com/crewhaus/demos/tree/main/packages/vscode-extension), [JetBrains](https://github.com/crewhaus/demos/tree/main/packages/jetbrains-plugin), [browser playground](https://github.com/crewhaus/demos/tree/main/packages/crewhaus-playground).
+- **Section example specs** — [demos/examples](https://github.com/crewhaus/demos/tree/main/examples/) holds the per-section reference specs (`section-15-smoke`, `section-33-discord-smoke`, etc.) used to drive integration runs.
 
 ## Crewhaus Forge
 
@@ -130,7 +138,7 @@ Quick links:
 - [Good first issues](https://github.com/crewhaus/factory/labels/good%20first%20issue)
 - [Help wanted](https://github.com/crewhaus/factory/labels/help%20wanted)
 - [Open RFCs](https://github.com/crewhaus/factory/labels/rfc)
-- [`docs/contributing/your-first-target.md`](docs/contributing/your-first-target.md) — adding a new target shape end-to-end
+- [`contributing/your-first-target.md`](https://github.com/crewhaus/docs/blob/main/contributing/your-first-target.md) — adding a new target shape end-to-end
 
 ## Support
 
@@ -148,7 +156,7 @@ Vulnerability reports go to a private channel, not GitHub Issues. See [`SECURITY
 
 [Apache License 2.0](LICENSE). The Apache-2.0 license covers the code. **CrewHaus**, **Crewhaus Factory**, **Crewhaus Cloud**, **Crewhaus Forge**, and the logo are trademarks; see [`TRADEMARK.md`](TRADEMARK.md) for use-of-marks policy.
 
-Documentation is licensed under [Creative Commons Attribution 4.0](docs/LICENSE).
+Documentation is licensed under [Creative Commons Attribution 4.0](https://github.com/crewhaus/docs/blob/main/LICENSE).
 
 ---
 

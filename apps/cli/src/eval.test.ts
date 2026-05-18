@@ -17,7 +17,7 @@ import { join } from "node:path";
 const SRC_DIR = import.meta.dir.replace(/([/\\])dist$/, "$1src");
 const REPO_ROOT = join(import.meta.dir, "../../..");
 const CLI_PATH = join(SRC_DIR, "index.ts");
-const HELLO_SPEC = join(REPO_ROOT, "examples/hello-cli/crewhaus.yaml");
+const HELLO_SPEC = join(REPO_ROOT, "apps/cli/test-fixtures/minimal-cli/crewhaus.yaml");
 
 const TMP_ROOTS: string[] = [];
 function newTempRoot(): string {

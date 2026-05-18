@@ -155,7 +155,7 @@ export type IrSecretRef =
  * Finality policy is encoded explicitly because reorg tolerance and
  * confirmation counts are quality knobs (Pillar 2: optimizable) and
  * security boundaries (Pillar 3: a wrong finality choice lets an
- * attacker present a reorged log as real). See [docs/recipes/47-onchain-daemon-and-game.md](docs/recipes/47-onchain-daemon-and-game.md).
+ * attacker present a reorged log as real). See [recipes/47-onchain-daemon-and-game.md](https://github.com/crewhaus/demos/blob/main/recipes/47-onchain-daemon-and-game.md).
  */
 export type IrChainFinality =
   | { readonly kind: "confirmations"; readonly count: number }

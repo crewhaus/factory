@@ -13,6 +13,6 @@
     "test": "bun test src"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.40.0"
+    "@anthropic-ai/sdk": "^0.96.0"
   }
 }

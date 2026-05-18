@@ -59,15 +59,15 @@ For day-to-day visibility on what's in flight, see the [GitHub Project](https://
 - Production-readiness statement for each target shape
 - Security audit completed
 
-## Themes we are not pursuing
+## Themes we are not presently pursuing
 
-To save time on questions: these are not on the roadmap, and probably never will be.
+To save time on questions: these are not on the roadmap, and may or may not ever be depending on the direction of the project TBD by user demand and community contributions.
 
 - **Visual / no-code spec editor.** CrewHaus is a developer tool. Specs are YAML files in your editor.
+- **Drag-and-drop workflow builder.** That's a different product category (n8n, Make, Zapier). CrewHaus targets developers.
 - **Python implementation.** The repo's CLAUDE.md explains: TS+Bun is the primary runtime. The Claude-backed `MutationProvider` superseded the originally-deferred DSPy bridge.
 - **Built-in model hosting.** We integrate with model providers; we don't host models.
 - **Generic LLM playground.** CrewHaus is a compiler, not a chat app.
-- **Drag-and-drop workflow builder.** That's a different product category (n8n, Make, Zapier). CrewHaus targets developers.
 
 ## How to propose roadmap changes
 

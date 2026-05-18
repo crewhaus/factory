@@ -955,12 +955,13 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
    * full content still reaches the model via tool_result.content above; the
    * audit log just gets a length-aware tag.
    */
-  function summariseNonStringContent(
-    content: ReadonlyArray<Anthropic.TextBlockParam | Anthropic.ImageBlockParam> | undefined,
-  ): string {
-    if (content === undefined) return "[no content]";
+  function summariseNonStringContent(content: Anthropic.ToolResultBlockParam["content"]): string {
+    if (content === undefined || typeof content === "string") {
+      return content === undefined ? "[no content]" : `[${content.length} chars]`;
+    }
     let images = 0;
     let texts = 0;
+    let other = 0;
     let totalChars = 0;
     for (const block of content) {
       if (block.type === "image") {
@@ -969,11 +970,14 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       } else if (block.type === "text") {
         texts++;
         totalChars += block.text.length;
+      } else {
+        other++;
       }
     }
     const parts: string[] = [];
     if (images > 0) parts.push(`${images} image block${images > 1 ? "s" : ""}`);
     if (texts > 0) parts.push(`${texts} text block${texts > 1 ? "s" : ""}`);
+    if (other > 0) parts.push(`${other} other block${other > 1 ? "s" : ""}`);
     return `[${parts.join(", ")}, ${totalChars} chars]`;
   }
 

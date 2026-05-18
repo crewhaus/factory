@@ -94,7 +94,7 @@ describe("rawEventToCanonical", () => {
           cache_creation_input_tokens: 3,
         },
       },
-    } as Anthropic.RawMessageStreamEvent);
+    } as unknown as Anthropic.RawMessageStreamEvent);
     expect(ev).toEqual({
       kind: "message_start",
       usage: { input: 12, output: 0, cacheRead: 5, cacheCreate: 3 },
@@ -109,7 +109,7 @@ describe("rawEventToCanonical", () => {
         type: "text",
         text: "",
       } as Anthropic.RawContentBlockStartEvent["content_block"],
-    } as Anthropic.RawMessageStreamEvent);
+    } as unknown as Anthropic.RawMessageStreamEvent);
     expect(ev).toEqual({
       kind: "content_block_start",
       index: 0,
@@ -127,7 +127,7 @@ describe("rawEventToCanonical", () => {
         name: "Read",
         input: {},
       } as Anthropic.RawContentBlockStartEvent["content_block"],
-    } as Anthropic.RawMessageStreamEvent);
+    } as unknown as Anthropic.RawMessageStreamEvent);
     expect(ev).toEqual({
       kind: "content_block_start",
       index: 1,
@@ -140,7 +140,7 @@ describe("rawEventToCanonical", () => {
       type: "content_block_delta",
       index: 0,
       delta: { type: "text_delta", text: "hello" },
-    } as Anthropic.RawMessageStreamEvent);
+    } as unknown as Anthropic.RawMessageStreamEvent);
     expect(ev).toEqual({
       kind: "content_block_delta",
       index: 0,
@@ -153,7 +153,7 @@ describe("rawEventToCanonical", () => {
       type: "content_block_delta",
       index: 1,
       delta: { type: "input_json_delta", partial_json: '{"x":' },
-    } as Anthropic.RawMessageStreamEvent);
+    } as unknown as Anthropic.RawMessageStreamEvent);
     expect(ev).toEqual({
       kind: "content_block_delta",
       index: 1,

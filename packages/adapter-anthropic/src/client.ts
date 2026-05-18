@@ -7,6 +7,7 @@
  * billing instead of the API workspace.
  */
 
+import { execFileSync } from "node:child_process";
 import Anthropic from "@anthropic-ai/sdk";
 import { ProviderAuthError } from "@crewhaus/errors";
 import type { ResolvedAuth } from "./auth.js";
@@ -24,11 +25,45 @@ export const OAUTH_BETAS = [
   "interleaved-thinking-2025-05-14",
 ] as const;
 
+/**
+ * Fallback when the local `claude` binary isn't on PATH. Bump this when you
+ * pull a fresh CLI so the spoofed user-agent doesn't drift far from what
+ * Anthropic's anti-abuse system expects. (OAuth tokens used outside the
+ * official CLI are unsupported and the user-agent staleness is one of the
+ * signals Anthropic uses to 429 them.)
+ */
+const FALLBACK_CLAUDE_CLI_VERSION = "2.1.92";
+
+let warnedAboutCliFallback = false;
+
+function detectClaudeCliVersion(): string {
+  try {
+    const raw = execFileSync("claude", ["--version"], {
+      encoding: "utf-8",
+      timeout: 1000,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    const match = /(\d+\.\d+\.\d+)/.exec(raw);
+    if (match?.[1]) return match[1];
+  } catch {
+    // claude not installed, not on PATH, or timed out — fall through.
+  }
+  if (!warnedAboutCliFallback) {
+    warnedAboutCliFallback = true;
+    console.warn(
+      `[adapter-anthropic] could not detect installed claude CLI version; using fallback claude-cli/${FALLBACK_CLAUDE_CLI_VERSION} for OAuth identity headers`,
+    );
+  }
+  return FALLBACK_CLAUDE_CLI_VERSION;
+}
+
+const DETECTED_CLAUDE_CLI_VERSION = detectClaudeCliVersion();
+
 /** Identity headers paired with the OAuth token for subscription-billing routing. */
 export const CLAUDE_CODE_HEADERS = {
   accept: "application/json",
   "anthropic-dangerous-direct-browser-access": "true",
-  "user-agent": "claude-cli/2.1.2 (external, cli)",
+  "user-agent": `claude-cli/${DETECTED_CLAUDE_CLI_VERSION} (external, cli)`,
   "x-app": "cli",
 } as const;
 

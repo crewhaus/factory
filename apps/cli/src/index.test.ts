@@ -9,7 +9,7 @@ import { parseSpec } from "@crewhaus/spec";
 const SRC_DIR = import.meta.dir.replace(/([/\\])dist$/, "$1src");
 const CLI_PATH = join(SRC_DIR, "index.ts");
 const REPO_ROOT = join(import.meta.dir, "../../..");
-const HELLO_SPEC = join(REPO_ROOT, "examples/hello-cli/crewhaus.yaml");
+const HELLO_SPEC = join(REPO_ROOT, "apps/cli/test-fixtures/minimal-cli/crewhaus.yaml");
 
 type RunResult = {
   exitCode: number;
