@@ -638,7 +638,7 @@ async function runRun(args: ParsedArgs): Promise<void> {
   }
 }
 
-type DoctorCheck = { label: string; pass: boolean; reason?: string };
+type DoctorCheck = { label: string; pass: boolean; reason?: string; warn?: boolean };
 
 function checkBunVersion(version: string): { pass: boolean; reason?: string } {
   const parts = version.split(".");
@@ -713,15 +713,17 @@ function runDoctorPhilosophyAlignment(): void {
   const findings: DoctorCheck[] = [];
 
   // Pillar 1 — compiler-as-protagonist. The IR-discriminated-union is
-  // the contract; the architecture doc must exist and reference the IR
-  // file by path.
-  const archDocPath = join(process.cwd(), "docs", "COMPILER-ARCHITECTURE.md");
+  // the contract; the architecture doc must reference the IR variants.
+  // Canonical docs live off-repo at github.com/crewhaus/docs; we look
+  // for a sibling checkout (../docs/) in the developer workspace and
+  // warn-skip when absent rather than failing the audit.
+  const archDocPath = resolve(process.cwd(), "..", "docs", "COMPILER-ARCHITECTURE.md");
   if (existsSync(archDocPath)) {
     const content = readFileSync(archDocPath, "utf8");
     const referencesIrVariants =
       content.includes("IrV0") && content.includes("IrPipelineV0") && content.includes("IrGraphV0");
     findings.push({
-      label: "Pillar 1 — docs/COMPILER-ARCHITECTURE.md references IR variants",
+      label: "Pillar 1 — ../docs/COMPILER-ARCHITECTURE.md references IR variants",
       pass: referencesIrVariants,
       reason: referencesIrVariants
         ? undefined
@@ -729,9 +731,11 @@ function runDoctorPhilosophyAlignment(): void {
     });
   } else {
     findings.push({
-      label: "Pillar 1 — docs/COMPILER-ARCHITECTURE.md exists",
-      pass: false,
-      reason: "not found",
+      label: "Pillar 1 — COMPILER-ARCHITECTURE.md (sibling checkout)",
+      pass: true,
+      warn: true,
+      reason:
+        "sibling ../docs not cloned; canonical docs at github.com/crewhaus/docs — clone alongside factory/ to enable this check",
     });
   }
 
@@ -804,7 +808,9 @@ function runDoctorPhilosophyAlignment(): void {
   });
 
   for (const f of findings) {
-    if (f.pass) {
+    if (f.warn && f.pass) {
+      process.stdout.write(`~ ${f.label}: ${f.reason ?? "skipped"}\n`);
+    } else if (f.pass) {
       process.stdout.write(`✓ ${f.label}\n`);
     } else {
       process.stdout.write(`✗ ${f.label}: ${f.reason ?? "failed"}\n`);
