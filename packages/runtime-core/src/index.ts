@@ -60,6 +60,11 @@ import {
   transition,
 } from "@crewhaus/turn-state-machine";
 import { zodToJsonSchema } from "zod-to-json-schema";
+import {
+  type StreamRenderer,
+  createCliMarkdownRenderer,
+  isCliMarkdownEnabled,
+} from "./cli-markdown";
 import { attachDefaultSubscribers } from "./observability";
 
 /**
@@ -514,6 +519,24 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   const bus: TraceEventBus = runContext.eventBus;
   void TraceEventBus; // keep type import alive for future direct constructions
   const subscribers = await attachDefaultSubscribers(bus, runContext);
+
+  // M2.1 — CLI markdown renderer (env-gated). When CREWHAUS_CLI_MARKDOWN=1,
+  // text-delta chunks flow through a streaming markdown → ANSI transform so
+  // the user sees rendered bold/italic/headers/lists/code-fences instead of
+  // raw asterisks. The renderer is line-buffered; chunks accumulate until a
+  // `\n` arrives, then the rendered line writes to stdout. `end()` is
+  // called after the per-turn `\n` to flush any tail content.
+  const mdRenderer: StreamRenderer | undefined = isCliMarkdownEnabled()
+    ? createCliMarkdownRenderer()
+    : undefined;
+  const writeText = (chunk: string): void => {
+    if (mdRenderer) mdRenderer.push(chunk);
+    else process.stdout.write(chunk);
+  };
+  const endTurn = (): void => {
+    if (mdRenderer) mdRenderer.end();
+    process.stdout.write("\n");
+  };
 
   const eventLog: EventLog = await openEventLog(sessionId, { rootDir: sessionRootDir });
 
@@ -1146,7 +1169,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               // AsyncIterable<StreamEvent> directly).
               void modelStartEnv;
               const onTextDelta = (chunk: string): void => {
-                process.stdout.write(chunk);
+                writeText(chunk);
                 bus.publish(
                   {
                     ...bus.envelope(),
@@ -1174,7 +1197,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                   },
                 },
               );
-              process.stdout.write("\n");
+              endTurn();
 
               messages.push({
                 role: "assistant",
@@ -1234,7 +1257,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             // `ProviderMessage` while emitting text deltas to stdout.
             const final = await consumeStream(reqStream, {
               onTextDelta: (chunk) => {
-                process.stdout.write(chunk);
+                writeText(chunk);
                 bus.publish(
                   {
                     ...bus.envelope(),
@@ -1246,7 +1269,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 );
               },
             });
-            process.stdout.write("\n");
+            endTurn();
 
             bus.publish({
               ...bus.envelope(),
