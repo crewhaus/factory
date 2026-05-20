@@ -379,13 +379,15 @@ agent:
  * `BUILTIN_TOOL_MAP` in packages/target-cli/src/index.ts — keep them in sync.
  */
 async function loadToolMap(): Promise<Record<string, RegisteredTool>> {
-  const [fs, bash, todo, web, image, fetchPkg] = await Promise.all([
+  const [fs, bash, todo, web, image, fetchPkg, imageGen, docIngest] = await Promise.all([
     import("@crewhaus/tool-fs"),
     import("@crewhaus/tool-bash"),
     import("@crewhaus/tool-todo"),
     import("@crewhaus/tool-web"),
     import("@crewhaus/tool-image"),
     import("@crewhaus/tool-fetch"),
+    import("@crewhaus/tool-image-generation"),
+    import("@crewhaus/tool-document-ingest"),
   ]);
   return {
     read: fs.read,
@@ -399,6 +401,8 @@ async function loadToolMap(): Promise<Record<string, RegisteredTool>> {
     webSearch: web.webSearch,
     readImage: image.readImage,
     fetch: fetchPkg.fetch,
+    imageGenerate: imageGen.imageGenerate,
+    ingestDocument: docIngest.ingestDocument,
   };
 }
 

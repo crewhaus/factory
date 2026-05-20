@@ -90,6 +90,18 @@ const BUILTIN_TOOL_MAP: Record<string, BuiltinToolEntry> = {
     export: "shell",
     initSymbol: "registerCodeExecutionConfig",
   },
+  // M4.1 — image generation (DALL-E / Replicate / mock for offline).
+  imageGenerate: {
+    package: "@crewhaus/tool-image-generation",
+    export: "imageGenerate",
+    initSymbol: "registerImageGenerationConfig",
+  },
+  // M4.3 — document ingest (txt/md/csv/json out of the box; PDF/docx
+  // via operator-registered parsers).
+  ingestDocument: {
+    package: "@crewhaus/tool-document-ingest",
+    export: "ingestDocument",
+  },
 };
 
 function resolveTools(

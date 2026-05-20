@@ -56,9 +56,11 @@
         "@crewhaus/sub-agent-spawner": "workspace:*",
         "@crewhaus/tool-bash": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-document-ingest": "workspace:*",
         "@crewhaus/tool-fetch": "workspace:*",
         "@crewhaus/tool-fs": "workspace:*",
         "@crewhaus/tool-image": "workspace:*",
+        "@crewhaus/tool-image-generation": "workspace:*",
         "@crewhaus/tool-mcp": "workspace:*",
         "@crewhaus/tool-task": "workspace:*",
         "@crewhaus/tool-todo": "workspace:*",
@@ -725,6 +727,13 @@
         "@crewhaus/trace-event-bus": "workspace:*",
         "@modelcontextprotocol/sdk": "^1.29.0",
         "zod": "^3.23.8",
+      },
+    },
+    "packages/memory-store": {
+      "name": "@crewhaus/memory-store",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
       },
     },
     "packages/metrics-collector": {
@@ -1395,6 +1404,16 @@
         "zod": "^3.23.8",
       },
     },
+    "packages/tool-document-ingest": {
+      "name": "@crewhaus/tool-document-ingest",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "zod": "^3.23.8",
+      },
+    },
     "packages/tool-evm": {
       "name": "@crewhaus/tool-evm",
       "version": "0.0.0",
@@ -1476,6 +1495,16 @@
         "@crewhaus/tool-validate": "workspace:*",
       },
     },
+    "packages/tool-image-generation": {
+      "name": "@crewhaus/tool-image-generation",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "zod": "^3.23.8",
+      },
+    },
     "packages/tool-loop-detection": {
       "name": "@crewhaus/tool-loop-detection",
       "version": "0.0.0",
@@ -1490,6 +1519,16 @@
         "@crewhaus/boundary-classifier": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/mcp-host": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "zod": "^3.23.8",
+      },
+    },
+    "packages/tool-memory": {
+      "name": "@crewhaus/tool-memory",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/memory-store": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
         "zod": "^3.23.8",
@@ -1926,6 +1965,8 @@
 
     "@crewhaus/mcp-host": ["@crewhaus/mcp-host@workspace:packages/mcp-host"],
 
+    "@crewhaus/memory-store": ["@crewhaus/memory-store@workspace:packages/memory-store"],
+
     "@crewhaus/metrics-collector": ["@crewhaus/metrics-collector@workspace:packages/metrics-collector"],
 
     "@crewhaus/migration-engine": ["@crewhaus/migration-engine@workspace:packages/migration-engine"],
@@ -2062,6 +2103,8 @@
 
     "@crewhaus/tool-contract-gateway": ["@crewhaus/tool-contract-gateway@workspace:packages/tool-contract-gateway"],
 
+    "@crewhaus/tool-document-ingest": ["@crewhaus/tool-document-ingest@workspace:packages/tool-document-ingest"],
+
     "@crewhaus/tool-evm": ["@crewhaus/tool-evm@workspace:packages/tool-evm"],
 
     "@crewhaus/tool-evm-tx": ["@crewhaus/tool-evm-tx@workspace:packages/tool-evm-tx"],
@@ -2074,9 +2117,13 @@
 
     "@crewhaus/tool-image": ["@crewhaus/tool-image@workspace:packages/tool-image"],
 
+    "@crewhaus/tool-image-generation": ["@crewhaus/tool-image-generation@workspace:packages/tool-image-generation"],
+
     "@crewhaus/tool-loop-detection": ["@crewhaus/tool-loop-detection@workspace:packages/tool-loop-detection"],
 
     "@crewhaus/tool-mcp": ["@crewhaus/tool-mcp@workspace:packages/tool-mcp"],
+
+    "@crewhaus/tool-memory": ["@crewhaus/tool-memory@workspace:packages/tool-memory"],
 
     "@crewhaus/tool-message-channel": ["@crewhaus/tool-message-channel@workspace:packages/tool-message-channel"],
 

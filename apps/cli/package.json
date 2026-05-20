@@ -50,6 +50,8 @@
     "@crewhaus/tool-fetch": "workspace:*",
     "@crewhaus/tool-fs": "workspace:*",
     "@crewhaus/tool-image": "workspace:*",
+    "@crewhaus/tool-image-generation": "workspace:*",
+    "@crewhaus/tool-document-ingest": "workspace:*",
     "@crewhaus/tool-mcp": "workspace:*",
     "@crewhaus/tool-task": "workspace:*",
     "@crewhaus/tool-todo": "workspace:*",
