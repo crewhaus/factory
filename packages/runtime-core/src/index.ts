@@ -66,6 +66,7 @@ import {
   isCliMarkdownEnabled,
 } from "./cli-markdown";
 import { attachDefaultSubscribers } from "./observability";
+import { loadProjectMemory } from "./project-memory";
 
 /**
  * Slice-scope runtime: a multi-turn streaming chat loop with prompt
@@ -620,10 +621,37 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     skillsText.length > 0
       ? [{ type: "text", text: skillsText, cache_control: { type: "ephemeral" } }]
       : [];
+  // M3.1 — auto-load project memory files (CLAUDE.md / CODE-COMPANION.md /
+  // AGENT.md) from cwd at session start. Mirrors Claude Code's CLAUDE.md
+  // auto-load convention. Pillar 3 compliance: each file's content is
+  // classified via boundary-classifier with origin "user" inside
+  // loadProjectMemory() (the user's repo is developer-trusted).
+  const projectMemory = await loadProjectMemory();
+  const projectMemoryBlock: Anthropic.TextBlockParam[] =
+    projectMemory.prompt.length > 0
+      ? [
+          {
+            type: "text",
+            text: projectMemory.prompt,
+            cache_control: { type: "ephemeral" },
+          },
+        ]
+      : [];
+  if (projectMemory.files.length > 0) {
+    process.stdout.write(
+      `[memory] loaded ${projectMemory.files.length} project memory file(s): ${projectMemory.files
+        .map((f) => f.filename)
+        .join(", ")}\n`,
+    );
+  }
   // Section 17 — runtime-core no longer prepends the Claude Code OAuth
   // prefix; `adapter-anthropic` handles that internally so each adapter
   // owns its provider-specific auth-shape requirements.
-  let systemBlocks: Anthropic.TextBlockParam[] = [userInstructions, ...skillsBlock];
+  let systemBlocks: Anthropic.TextBlockParam[] = [
+    userInstructions,
+    ...projectMemoryBlock,
+    ...skillsBlock,
+  ];
 
   // Section 27 — rotate cache markers on the system block array if the
   // last refresh is older than the rotation interval. Skips automatically
@@ -1594,6 +1622,23 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
 
   const providerNote = providerId === "anthropic" ? "" : ` [${providerId}]`;
   process.stdout.write(`agent ready (model: ${opts.model})${providerNote}. type "exit" to quit.\n`);
+
+  // M3.2 — plan-mode UX indicator. When `permissions.mode: plan` is
+  // active, the LLM-policy permission engine is the gate; show the
+  // user it's on so they know destructive tools will be pushed back on.
+  if (permissionMode === "plan") {
+    process.stdout.write(
+      "\x1b[1m\x1b[33m[plan mode]\x1b[0m destructive tools (Write, Edit, Bash) gate through LLM policy; type a request to plan, then approve before execution.\n",
+    );
+  } else if (permissionMode === "auto") {
+    process.stdout.write(
+      "\x1b[1m\x1b[35m[auto mode]\x1b[0m all rules apply, no prompts — the agent acts under your declared permissions.\n",
+    );
+  } else if (permissionMode === "bypass") {
+    process.stdout.write(
+      "\x1b[1m\x1b[31m[BYPASS mode]\x1b[0m all permission rules are disabled. Use only on isolated machines.\n",
+    );
+  }
 
   // SIGINT handler: first press during a turn aborts the turn; second
   // press exits. Counter resets at the start of each new turn. Default-on

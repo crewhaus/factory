@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import { rename, unlink } from "node:fs/promises";
 import * as path from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
+import { renderEditDiff } from "./diff";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { z } from "zod";
@@ -111,7 +112,17 @@ export const edit: RegisteredTool = buildTool({
       await unlink(tmp).catch(() => {});
       throw err;
     }
-    return `edited ${input.path}`;
+    // M3.3 — return a unified-diff style hunk so the CLI (and the model
+    // on subsequent turns) can see exactly what changed. The header
+    // line "edited <path>" stays first for backward compatibility with
+    // tests + tool-result parsers; the diff body follows.
+    const diff = renderEditDiff({
+      path: input.path,
+      original,
+      oldString: input.oldString,
+      newString: input.newString,
+    });
+    return diff.length > 0 ? `edited ${input.path}\n${diff}` : `edited ${input.path}`;
   },
 });
 
