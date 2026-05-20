@@ -39,6 +39,7 @@
     "@crewhaus/permission-engine": "workspace:*",
     "@crewhaus/runtime-core": "workspace:*",
     "@crewhaus/secrets-manager": "workspace:*",
+    "@crewhaus/session-store": "workspace:*",
     "@crewhaus/spec-registry": "workspace:*",
     "@crewhaus/skills-registry": "workspace:*",
     "@crewhaus/slash-commands": "workspace:*",

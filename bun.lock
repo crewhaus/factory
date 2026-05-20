@@ -47,6 +47,7 @@
         "@crewhaus/sandbox": "workspace:*",
         "@crewhaus/sandbox-image-registry": "workspace:*",
         "@crewhaus/secrets-manager": "workspace:*",
+        "@crewhaus/session-store": "workspace:*",
         "@crewhaus/skills-registry": "workspace:*",
         "@crewhaus/slash-commands": "workspace:*",
         "@crewhaus/spec": "workspace:*",
