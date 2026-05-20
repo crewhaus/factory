@@ -75,6 +75,17 @@ export interface ChannelAdapter {
   parseInbound(req: RawRequest): ParsedInbound;
   sendReply(args: { event: InboundEvent; text: string }): Promise<void>;
   setTyping(args: { event: InboundEvent }): Promise<void>;
+  /**
+   * Phase 3 §3.2 — add an emoji reaction to an inbound message as a
+   * lightweight status acknowledgement. Conventionally:
+   *   - "eyes" (👀) on pre-tool / start
+   *   - "white_check_mark" (✅) on post-tool / success
+   *   - "warning" (⚠️) on need-approval / error
+   * Optional — adapters that don't support reactions (or haven't
+   * implemented yet) can leave this undefined and the runtime will
+   * skip the hook silently.
+   */
+  react?(args: { event: InboundEvent; emoji: string }): Promise<void>;
 }
 
 export type SlackAdapterConfig = {
@@ -200,6 +211,39 @@ export function createSlackAdapter(
       // Slack has no public typing-indicator API for bots. No-op for v0;
       // future versions may use the `assistant.threads.setStatus` API
       // (Slack AI Assistant beta) for an approximation.
+    },
+
+    // Phase 3 §3.2 — emoji reactions via reactions.add.
+    // Slack expects emoji names without colons ("eyes", not ":eyes:").
+    async react(args: { event: InboundEvent; emoji: string }): Promise<void> {
+      const emoji = args.emoji.replace(/^:|:$/g, "");
+      const url = `${apiBaseUrl}/reactions.add`;
+      const res = await doFetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json; charset=utf-8",
+          Authorization: `Bearer ${config.botToken}`,
+        },
+        body: JSON.stringify({
+          channel: args.event.channelId,
+          timestamp: args.event.ts,
+          name: emoji,
+        }),
+      });
+      if (!res.ok) {
+        // Reactions are best-effort — log via thrown error but the
+        // session-router catches and continues so a flaky API doesn't
+        // abort message processing.
+        throw new SlackAdapterError(`reactions.add failed: ${res.status} ${res.statusText}`);
+      }
+      const ct = res.headers.get("content-type") ?? "";
+      if (ct.includes("application/json")) {
+        const body = (await res.json()) as { ok?: boolean; error?: string };
+        // "already_reacted" is a benign no-op; don't surface as error.
+        if (body.ok === false && body.error !== "already_reacted") {
+          throw new SlackAdapterError(`reactions.add error: ${body.error ?? "unknown"}`);
+        }
+      }
     },
   };
 }

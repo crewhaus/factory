@@ -284,3 +284,82 @@ describe("createSlackAdapter — sendReply", () => {
     ).rejects.toThrow(/channel_not_found/);
   });
 });
+
+describe("react (Phase 3 §3.2)", () => {
+  const sampleEvent = {
+    idempotencyKey: "E1",
+    workspaceId: "T1",
+    channelId: "C1",
+    userId: "U1",
+    ts: "1234.5678",
+    text: "hello",
+    subtype: "message" as const,
+  };
+
+  test("posts to reactions.add with channel + timestamp + emoji name", async () => {
+    let capturedUrl = "";
+    let capturedBody = "";
+    const fakeFetch: typeof fetch = async (url, init) => {
+      capturedUrl = String(url);
+      capturedBody = String(init?.body ?? "");
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+    const adapter = createSlackAdapter(
+      { botToken: "xoxb-test", signingSecret: SECRET },
+      { fetch: fakeFetch },
+    );
+    expect(adapter.react).toBeDefined();
+    await adapter.react!({ event: sampleEvent, emoji: "eyes" });
+    expect(capturedUrl).toBe("https://slack.com/api/reactions.add");
+    const body = JSON.parse(capturedBody) as { channel: string; timestamp: string; name: string };
+    expect(body.channel).toBe("C1");
+    expect(body.timestamp).toBe("1234.5678");
+    expect(body.name).toBe("eyes");
+  });
+
+  test("strips leading/trailing colons from emoji name", async () => {
+    let capturedBody = "";
+    const fakeFetch: typeof fetch = async (_url, init) => {
+      capturedBody = String(init?.body ?? "");
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    };
+    const adapter = createSlackAdapter(
+      { botToken: "xoxb", signingSecret: SECRET },
+      { fetch: fakeFetch },
+    );
+    await adapter.react!({ event: sampleEvent, emoji: ":white_check_mark:" });
+    const body = JSON.parse(capturedBody) as { name: string };
+    expect(body.name).toBe("white_check_mark");
+  });
+
+  test("treats already_reacted as benign no-op", async () => {
+    const fakeFetch: typeof fetch = async () =>
+      new Response(JSON.stringify({ ok: false, error: "already_reacted" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    const adapter = createSlackAdapter(
+      { botToken: "xoxb", signingSecret: SECRET },
+      { fetch: fakeFetch },
+    );
+    await expect(adapter.react!({ event: sampleEvent, emoji: "eyes" })).resolves.toBeUndefined();
+  });
+
+  test("throws on non-already_reacted error", async () => {
+    const fakeFetch: typeof fetch = async () =>
+      new Response(JSON.stringify({ ok: false, error: "invalid_auth" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    const adapter = createSlackAdapter(
+      { botToken: "xoxb", signingSecret: SECRET },
+      { fetch: fakeFetch },
+    );
+    await expect(adapter.react!({ event: sampleEvent, emoji: "eyes" })).rejects.toThrow(
+      /invalid_auth/,
+    );
+  });
+});

@@ -736,6 +736,88 @@ cli:
   });
 });
 
+describe("parseSpec — gateway (Phase 3 §3.4)", () => {
+  test("accepts a gateway block with port + ui", () => {
+    const spec = parseSpec(`
+name: hello
+target: channel
+agent:
+  model: claude-sonnet-4-6
+  instructions: be helpful
+channels:
+  slack:
+    botToken: $SLACK_BOT_TOKEN
+    signingSecret: $SLACK_SIGNING_SECRET
+routing:
+  sessionKey: thread
+gateway:
+  port: 19001
+  ui: true
+`);
+    if (spec.target !== "channel") throw new Error("unexpected target");
+    expect(spec.gateway?.port).toBe(19001);
+    expect(spec.gateway?.ui).toBe(true);
+  });
+
+  test("ui defaults to false when omitted", () => {
+    const spec = parseSpec(`
+name: hello
+target: channel
+agent:
+  model: claude-sonnet-4-6
+  instructions: be helpful
+channels:
+  slack:
+    botToken: $SLACK_BOT_TOKEN
+    signingSecret: $SLACK_SIGNING_SECRET
+routing:
+  sessionKey: thread
+gateway:
+  port: 8080
+`);
+    if (spec.target !== "channel") throw new Error("unexpected target");
+    expect(spec.gateway?.ui).toBe(false);
+  });
+
+  test("rejects invalid port (out of range)", () => {
+    expect(() =>
+      parseSpec(`
+name: hello
+target: channel
+agent:
+  model: claude-sonnet-4-6
+  instructions: be helpful
+channels:
+  slack:
+    botToken: $SLACK_BOT_TOKEN
+    signingSecret: $SLACK_SIGNING_SECRET
+routing:
+  sessionKey: thread
+gateway:
+  port: 99999
+`),
+    ).toThrow(SpecParseError);
+  });
+
+  test("gateway is optional", () => {
+    const spec = parseSpec(`
+name: hello
+target: channel
+agent:
+  model: claude-sonnet-4-6
+  instructions: be helpful
+channels:
+  slack:
+    botToken: $SLACK_BOT_TOKEN
+    signingSecret: $SLACK_SIGNING_SECRET
+routing:
+  sessionKey: thread
+`);
+    if (spec.target !== "channel") throw new Error("unexpected target");
+    expect(spec.gateway).toBeUndefined();
+  });
+});
+
 describe("parseSpec — heartbeat (Phase 3 §3.1)", () => {
   test("accepts a heartbeat block with duration and instructions", () => {
     const spec = parseSpec(`

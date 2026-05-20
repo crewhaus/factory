@@ -325,6 +325,14 @@ export type IrHeartbeat = {
   readonly instructions: string;
 };
 
+/**
+ * Phase 3 §3.4 — channel daemon control-UI gateway config.
+ */
+export type IrChannelGateway = {
+  readonly port: number;
+  readonly ui: boolean;
+};
+
 export type IrChannelV0 = {
   readonly version: 0;
   readonly name: string;
@@ -342,6 +350,7 @@ export type IrChannelV0 = {
   readonly subAgents: readonly IrSubAgentDefinition[];
   readonly compaction: IrCompaction;
   readonly heartbeat?: IrHeartbeat;
+  readonly gateway?: IrChannelGateway;
   /** §47 cross-cutting blockchain subsystem (slice 0). All optional. */
   readonly chains?: readonly IrChainBinding[];
   readonly wallets?: readonly IrWalletBinding[];

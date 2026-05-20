@@ -459,6 +459,15 @@ export function lower(spec: Spec): IrNode {
               },
             }
           : {}),
+        // Phase 3 §3.4 — gateway control-UI config.
+        ...(spec.gateway !== undefined
+          ? {
+              gateway: {
+                port: spec.gateway.port,
+                ui: spec.gateway.ui,
+              },
+            }
+          : {}),
         ...lowerChainSubsystem(spec),
       } satisfies IrChannelV0;
     case "graph":

@@ -221,6 +221,21 @@ const heartbeatBlock = z
   .strict()
   .optional();
 
+/**
+ * Phase 3 §3.4 — channel daemon control-UI gateway. When set, the
+ * compiled daemon spawns a second HTTP listener on `port` that serves
+ * a status endpoint (and, when `ui: true`, a minimal dashboard).
+ * Mirrors OpenClaw's Gateway control plane in concept; ours starts
+ * minimal and is intended to host packaged Studio UI in a follow-up.
+ */
+const channelGatewayBlock = z
+  .object({
+    port: z.number().int().min(1).max(65535),
+    ui: z.boolean().default(false),
+  })
+  .strict()
+  .optional();
+
 const cliSchema = z
   .object({
     name: z.string().min(1),
@@ -362,6 +377,7 @@ const channelSchema = z
     permissions: permissionsBlock,
     compaction: compactionBlock,
     heartbeat: heartbeatBlock,
+    gateway: channelGatewayBlock,
     chains: chainsBlock,
     wallets: walletsBlock,
     contracts: contractsBlock,
