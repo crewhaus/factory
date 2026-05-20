@@ -482,3 +482,138 @@ describe("emitChannelBot — iMessage channel (Section 33)", () => {
     expect(c).toContain('"MY_CURSOR"');
   });
 });
+
+describe("emitChannelBot — emoji reactions (Phase 3 §3.2)", () => {
+  test("session-router emits tryReact eyes/white_check_mark/warning", () => {
+    const c = fileMap(MIN_IR).get("session-router.ts") ?? "";
+    expect(c).toContain("tryReact");
+    expect(c).toContain('"eyes"');
+    expect(c).toContain('"white_check_mark"');
+    expect(c).toContain('"warning"');
+    // Should guard on adapter.react presence before calling.
+    expect(c).toContain("if (!adapter.react)");
+  });
+
+  test("react failures are best-effort (try/catch)", () => {
+    const c = fileMap(MIN_IR).get("session-router.ts") ?? "";
+    // The tryReact helper catches errors and swallows them so the
+    // model turn proceeds even if Slack's reactions.add 5xxs.
+    expect(c).toMatch(/try\s*\{[^}]*await adapter\.react/);
+  });
+
+  test("warning emoji fires when the runTurn throws", () => {
+    const c = fileMap(MIN_IR).get("session-router.ts") ?? "";
+    // The outer try/catch around runTurn re-throws after warning react
+    // so the gateway can return a 5xx; this is the right contract.
+    expect(c).toContain("throw err");
+  });
+});
+
+describe("emitChannelBot — gateway control-UI (Phase 3 §3.4)", () => {
+  test("omits gateway server when ir.gateway is undefined", () => {
+    const c = fileMap(MIN_IR).get("daemon.ts") ?? "";
+    expect(c).not.toContain("__gatewayServer");
+    expect(c).not.toContain("/status");
+  });
+
+  test("emits Bun.serve on configured port when gateway is set", () => {
+    const ir: IrChannelV0 = {
+      ...MIN_IR,
+      gateway: { port: 19001, ui: true },
+    };
+    const c = fileMap(ir).get("daemon.ts") ?? "";
+    expect(c).toContain("19001");
+    expect(c).toContain("__gatewayServer = Bun.serve");
+    expect(c).toContain('"/status"');
+    expect(c).toContain("[gateway] listening on");
+  });
+
+  test("gateway.ui:false suppresses HTML dashboard route", () => {
+    const ir: IrChannelV0 = {
+      ...MIN_IR,
+      gateway: { port: 18080, ui: false },
+    };
+    const c = fileMap(ir).get("daemon.ts") ?? "";
+    // The ui-flag is a runtime boolean (rendered as literal),
+    // and the HTML branch checks it before serving.
+    expect(c).toContain("__gatewayUiEnabled = false");
+    expect(c).toContain("18080");
+  });
+
+  test("status endpoint reports declared channels", () => {
+    const ir: IrChannelV0 = {
+      ...MIN_IR,
+      channels: {
+        slack: MIN_IR.channels.slack,
+        telegram: {
+          botToken: { kind: "env", name: "TG_BOT_TOKEN" },
+          secretToken: { kind: "env", name: "TG_SECRET_TOKEN" },
+        },
+      },
+      gateway: { port: 19001, ui: false },
+    };
+    const c = fileMap(ir).get("daemon.ts") ?? "";
+    expect(c).toContain('"slack"');
+    expect(c).toContain('"telegram"');
+  });
+
+  test("gateway is cleanly stopped on shutdown", () => {
+    const ir: IrChannelV0 = {
+      ...MIN_IR,
+      gateway: { port: 19001, ui: false },
+    };
+    const c = fileMap(ir).get("daemon.ts") ?? "";
+    expect(c).toContain("__gatewayServer.stop(true)");
+  });
+});
+
+describe("emitChannelBot — heartbeat (Phase 3 §3.1)", () => {
+  test("omits heartbeat boot when ir.heartbeat is undefined", () => {
+    const c = fileMap(MIN_IR).get("daemon.ts") ?? "";
+    expect(c).not.toContain("setInterval");
+    expect(c).not.toContain("[heartbeat]");
+    expect(c).not.toContain("__heartbeatTimer");
+  });
+
+  test("emits a setInterval loop and shutdown clearInterval when heartbeat is set", () => {
+    const irWithHeartbeat: IrChannelV0 = {
+      ...MIN_IR,
+      heartbeat: {
+        everyMs: 7_200_000, // 2h
+        instructions: "Wake and decide what's useful.",
+      },
+    };
+    const c = fileMap(irWithHeartbeat).get("daemon.ts") ?? "";
+    expect(c).toContain("setInterval(");
+    expect(c).toContain("7200000"); // 2h in ms
+    expect(c).toContain('"Wake and decide what\'s useful."');
+    expect(c).toContain("[heartbeat] tick");
+    expect(c).toContain("clearInterval(__heartbeatTimer)");
+    expect(c).toContain("import { randomBytes as __hbRandomBytes }");
+    // The heartbeat fires the agent via the same runTurn surface as
+    // inbound messages, so each tick gets a fresh session id.
+    expect(c).toContain("agent.runTurn({");
+    expect(c).toContain("isNew: true");
+  });
+
+  test("heartbeat coexists with sub-agents and MCP servers", () => {
+    const ir: IrChannelV0 = {
+      ...MIN_IR,
+      subAgents: [
+        {
+          name: "planner",
+          description: "plans things",
+          instructions: "Plan, do not execute.",
+          tools: ["read"],
+          permissions: { allow: ["Read"], deny: [] },
+          inheritBypass: false,
+        },
+      ],
+      heartbeat: { everyMs: 60_000, instructions: "tick" },
+    };
+    const c = fileMap(ir).get("daemon.ts") ?? "";
+    expect(c).toContain("setInterval(");
+    expect(c).toContain("60000");
+    expect(c).toContain("Sub-agents (Section 13)");
+  });
+});

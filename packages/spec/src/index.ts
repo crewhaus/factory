@@ -175,6 +175,74 @@ const walletsBlock = z.array(walletBindingSchema).optional();
 const contractsBlock = z.array(contractBindingSchema).optional();
 const transactionPolicyBlock = transactionPolicySchema.optional();
 
+/**
+ * Phase 3 §3.3 — CLI banner with optional tagline rotation. When set,
+ * the compiled cli-target bundle prints this banner on cold start
+ * (suppressed under `--resume` / `--continue` so resumed sessions
+ * don't re-banner). Static mode picks the first tagline; random mode
+ * picks one uniformly per startup.
+ */
+const cliBannerBlock = z
+  .object({
+    taglineMode: z.enum(["static", "random"]).default("static"),
+    taglines: z.array(z.string().min(1)).min(1),
+  })
+  .strict()
+  .optional();
+
+const cliOptionsBlock = z
+  .object({
+    banner: cliBannerBlock,
+    /**
+     * Phase 2 M2.2 — TUI polish gate. "basic" is the current readline-
+     * driven REPL; "rich" is reserved for future Ink-based output
+     * (status line, multi-line input, ESC interrupt). Today both modes
+     * compile identically; the field is forward-compatible.
+     */
+    tui: z.enum(["basic", "rich"]).default("basic"),
+  })
+  .strict()
+  .optional();
+
+/**
+ * Phase 3 §3.1 — heartbeat scheduled wake for channel daemons. When
+ * present, target-channel-bot emits a setInterval loop that
+ * synthesises a heartbeat turn at the configured interval. The
+ * `every` field accepts a duration string (e.g. "2h", "30m", "60s").
+ * `instructions` is what the runtime sends as the synthetic user
+ * message at each tick; pair with HEARTBEAT.md in cwd for richer
+ * playbook reads.
+ */
+const HEARTBEAT_DURATION_REGEX = /^\d+(?:ms|s|m|h)$/;
+
+const heartbeatBlock = z
+  .object({
+    every: z
+      .string()
+      .regex(
+        HEARTBEAT_DURATION_REGEX,
+        'heartbeat.every must be a duration like "2h", "30m", "60s", or "500ms"',
+      ),
+    instructions: z.string().min(1),
+  })
+  .strict()
+  .optional();
+
+/**
+ * Phase 3 §3.4 — channel daemon control-UI gateway. When set, the
+ * compiled daemon spawns a second HTTP listener on `port` that serves
+ * a status endpoint (and, when `ui: true`, a minimal dashboard).
+ * Mirrors OpenClaw's Gateway control plane in concept; ours starts
+ * minimal and is intended to host packaged Studio UI in a follow-up.
+ */
+const channelGatewayBlock = z
+  .object({
+    port: z.number().int().min(1).max(65535),
+    ui: z.boolean().default(false),
+  })
+  .strict()
+  .optional();
+
 const cliSchema = z
   .object({
     name: z.string().min(1),
@@ -191,6 +259,7 @@ const cliSchema = z
     mcp_servers: mcpServersBlock,
     permissions: permissionsBlock,
     compaction: compactionBlock,
+    cli: cliOptionsBlock,
     chains: chainsBlock,
     wallets: walletsBlock,
     contracts: contractsBlock,
@@ -314,6 +383,8 @@ const channelSchema = z
     mcp_servers: mcpServersBlock,
     permissions: permissionsBlock,
     compaction: compactionBlock,
+    heartbeat: heartbeatBlock,
+    gateway: channelGatewayBlock,
     chains: chainsBlock,
     wallets: walletsBlock,
     contracts: contractsBlock,

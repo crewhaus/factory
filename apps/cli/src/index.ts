@@ -26,6 +26,7 @@ import {
   tagRules,
 } from "@crewhaus/permission-engine";
 import { resolveAuth, runChatLoop } from "@crewhaus/runtime-core";
+import { createSessionStore } from "@crewhaus/session-store";
 import { createSkillTool, discoverSkills } from "@crewhaus/skills-registry";
 import { loadCommands } from "@crewhaus/slash-commands";
 import { parseSpec } from "@crewhaus/spec";
@@ -65,6 +66,7 @@ const RUN_SCHEMA: ParseArgsSchema = {
     { name: "model", takesValue: true },
     { name: "permission-mode", takesValue: true },
     { name: "resume", takesValue: true },
+    { name: "continue", takesValue: false },
     { name: "help", short: "h" },
   ],
 };
@@ -224,7 +226,8 @@ function usage(): never {
       "  compile <spec.yaml> -o <out-dir>     compile a spec to a runnable bundle",
       "  compile <spec.yaml> --emit-ir        print the lowered IR as JSON (debug)",
       "  run <spec.yaml> [--model <model>]    compile in-memory and execute the agent",
-      "                  [--resume <id>]      resume a prior session (event-log replay)",
+      "                  [--resume <id>]      resume a specific session (event-log replay)",
+      "                  [--continue]         resume the most-recent session for this spec",
       "  eval <spec.yaml> --dataset <data>    run the agent against a dataset and grade",
       "       --graders <graders.yaml>       (deterministic graders + LLM-as-judge)",
       "       [--judge-model <model>] [--concurrency N] [--seed N] -o <out-dir>",
@@ -376,13 +379,15 @@ agent:
  * `BUILTIN_TOOL_MAP` in packages/target-cli/src/index.ts — keep them in sync.
  */
 async function loadToolMap(): Promise<Record<string, RegisteredTool>> {
-  const [fs, bash, todo, web, image, fetchPkg] = await Promise.all([
+  const [fs, bash, todo, web, image, fetchPkg, imageGen, docIngest] = await Promise.all([
     import("@crewhaus/tool-fs"),
     import("@crewhaus/tool-bash"),
     import("@crewhaus/tool-todo"),
     import("@crewhaus/tool-web"),
     import("@crewhaus/tool-image"),
     import("@crewhaus/tool-fetch"),
+    import("@crewhaus/tool-image-generation"),
+    import("@crewhaus/tool-document-ingest"),
   ]);
   return {
     read: fs.read,
@@ -396,6 +401,8 @@ async function loadToolMap(): Promise<Record<string, RegisteredTool>> {
     webSearch: web.webSearch,
     readImage: image.readImage,
     fetch: fetchPkg.fetch,
+    imageGenerate: imageGen.imageGenerate,
+    ingestDocument: docIngest.ingestDocument,
   };
 }
 
@@ -467,7 +474,7 @@ function buildRuleSet(
 async function runRun(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
-      "usage: crewhaus run <spec.yaml> [--model <model>] [--permission-mode <default|plan|auto|bypass>] [--resume <sessionId>]\n",
+      "usage: crewhaus run <spec.yaml> [--model <model>] [--permission-mode <default|plan|auto|bypass>] [--resume <sessionId> | --continue]\n",
     );
     return;
   }
@@ -475,6 +482,10 @@ async function runRun(args: ParsedArgs): Promise<void> {
   if (typeof specPath !== "string") die("missing <spec.yaml>");
 
   const resumeFlag = args.flags["resume"];
+  const continueFlag = args.flags["continue"] === true;
+  if (typeof resumeFlag === "string" && continueFlag) {
+    die("--resume and --continue are mutually exclusive");
+  }
   let resumeId: string | undefined;
   if (typeof resumeFlag === "string") {
     if (!SESSION_ID_REGEX.test(resumeFlag)) {
@@ -504,6 +515,25 @@ async function runRun(args: ParsedArgs): Promise<void> {
   if (ir.target !== "cli") {
     die(
       `crewhaus run only supports target: cli (got "${ir.target}"). For workflow specs, compile and execute the bundle directly: bun apps/cli/src/index.ts compile <spec> -o <out> && bun <out>/agent.ts`,
+    );
+  }
+
+  // --continue resolves to the most-recently-updated session for this
+  // spec's name, scoped to the current working directory's session
+  // store. session-store's list() returns sessions sorted by updatedAt
+  // descending, with a TTL-based eviction sweep as a side effect.
+  if (continueFlag) {
+    const store = createSessionStore();
+    const sessions = await store.list();
+    const match = sessions.find((s: { name: string }) => s.name === ir.name);
+    if (match === undefined) {
+      die(
+        `no prior session for spec "${ir.name}" in ${process.cwd()}/.crewhaus/sessions/. Start one with: crewhaus run ${specPath}`,
+      );
+    }
+    resumeId = match.id;
+    process.stdout.write(
+      `[continue] resuming session ${match.id} (last updated ${match.updatedAt})\n`,
     );
   }
 

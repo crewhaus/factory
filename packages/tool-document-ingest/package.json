@@ -1,0 +1,21 @@
+{
+  "name": "@crewhaus/tool-document-ingest",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "M4.3 — IngestDocument tool. Reads .txt/.md/.csv/.json/.yaml inline; PDF/docx/xlsx via pluggable parsers (deferred to operator-provided handlers).",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@crewhaus/errors": "workspace:*",
+    "@crewhaus/tool-builder": "workspace:*",
+    "@crewhaus/tool-catalog": "workspace:*",
+    "zod": "^3.23.8"
+  }
+}

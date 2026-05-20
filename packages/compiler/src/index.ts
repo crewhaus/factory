@@ -95,6 +95,32 @@ export function compile(yamlText: string, opts: CompileOptions = {}): Bundle {
 }
 
 type SpecWithPermissions = Exclude<Spec, { target: "eval" }>;
+/**
+ * Phase 3 §3.1 — parse a heartbeat duration string ("2h", "30m",
+ * "60s", "500ms") to milliseconds. Caller is expected to have already
+ * regex-validated the format at the spec layer; this is the
+ * deterministic numeric step.
+ */
+function parseDurationToMs(duration: string): number {
+  const m = /^(\d+)(ms|s|m|h)$/.exec(duration);
+  if (!m) {
+    throw new Error(`invalid duration "${duration}" (caught past spec validation)`);
+  }
+  const n = Number.parseInt(m[1] ?? "0", 10);
+  switch (m[2]) {
+    case "ms":
+      return n;
+    case "s":
+      return n * 1000;
+    case "m":
+      return n * 60 * 1000;
+    case "h":
+      return n * 60 * 60 * 1000;
+    default:
+      throw new Error(`unreachable duration unit "${m[2]}"`);
+  }
+}
+
 function lowerPermissions(spec: SpecWithPermissions): IrPermissions {
   const p = spec.permissions;
   if (p === undefined) return { rules: [] };
@@ -374,6 +400,24 @@ export function lower(spec: Spec): IrNode {
         permissions: lowerPermissions(spec),
         subAgents: lowerSubAgents(spec.agent.sub_agents),
         compaction: lowerCompaction(spec),
+        // Phase 3 §3.3 — CLI banner config. Plus Phase 2 M2.2 TUI mode
+        // gate. Only included when the spec author opted in (cli block
+        // and its fields are optional).
+        ...(spec.cli !== undefined
+          ? {
+              cli: {
+                ...(spec.cli.banner !== undefined
+                  ? {
+                      banner: {
+                        taglineMode: spec.cli.banner.taglineMode,
+                        taglines: [...spec.cli.banner.taglines],
+                      },
+                    }
+                  : {}),
+                ...(spec.cli.tui !== "basic" ? { tui: spec.cli.tui } : {}),
+              },
+            }
+          : {}),
         ...lowerChainSubsystem(spec),
       } satisfies IrV0;
     case "workflow":
@@ -410,6 +454,26 @@ export function lower(spec: Spec): IrNode {
         permissions: lowerPermissions(spec),
         subAgents: lowerSubAgents(spec.agent.sub_agents),
         compaction: lowerCompaction(spec),
+        // Phase 3 §3.1 — heartbeat. Duration string ("2h", "30m") is
+        // parsed once at lower time so codegen emits a literal numeric
+        // setInterval arg in ms.
+        ...(spec.heartbeat !== undefined
+          ? {
+              heartbeat: {
+                everyMs: parseDurationToMs(spec.heartbeat.every),
+                instructions: spec.heartbeat.instructions,
+              },
+            }
+          : {}),
+        // Phase 3 §3.4 — gateway control-UI config.
+        ...(spec.gateway !== undefined
+          ? {
+              gateway: {
+                port: spec.gateway.port,
+                ui: spec.gateway.ui,
+              },
+            }
+          : {}),
         ...lowerChainSubsystem(spec),
       } satisfies IrChannelV0;
     case "graph":

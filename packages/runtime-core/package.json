@@ -17,6 +17,7 @@
     "@crewhaus/abort-controller": "workspace:*",
     "@crewhaus/adapter-anthropic": "workspace:*",
     "@crewhaus/agent-context-isolation": "workspace:*",
+    "@crewhaus/boundary-classifier": "workspace:*",
     "@crewhaus/circuit-breaker": "workspace:*",
     "@crewhaus/compaction-autocompact": "workspace:*",
     "@crewhaus/compaction-snip": "workspace:*",
