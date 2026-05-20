@@ -400,15 +400,21 @@ export function lower(spec: Spec): IrNode {
         permissions: lowerPermissions(spec),
         subAgents: lowerSubAgents(spec.agent.sub_agents),
         compaction: lowerCompaction(spec),
-        // Phase 3 §3.3 — CLI banner config. Only included when the
-        // spec author opted in (the field is optional).
-        ...(spec.cli?.banner !== undefined
+        // Phase 3 §3.3 — CLI banner config. Plus Phase 2 M2.2 TUI mode
+        // gate. Only included when the spec author opted in (cli block
+        // and its fields are optional).
+        ...(spec.cli !== undefined
           ? {
               cli: {
-                banner: {
-                  taglineMode: spec.cli.banner.taglineMode,
-                  taglines: [...spec.cli.banner.taglines],
-                },
+                ...(spec.cli.banner !== undefined
+                  ? {
+                      banner: {
+                        taglineMode: spec.cli.banner.taglineMode,
+                        taglines: [...spec.cli.banner.taglines],
+                      },
+                    }
+                  : {}),
+                ...(spec.cli.tui !== "basic" ? { tui: spec.cli.tui } : {}),
               },
             }
           : {}),

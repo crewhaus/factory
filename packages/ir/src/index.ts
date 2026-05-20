@@ -88,6 +88,8 @@ export type IrCliBanner = {
 
 export type IrCliOptions = {
   readonly banner?: IrCliBanner;
+  /** Phase 2 M2.2 — TUI mode gate. */
+  readonly tui?: "basic" | "rich";
 };
 
 export type IrV0 = {

@@ -193,6 +193,13 @@ const cliBannerBlock = z
 const cliOptionsBlock = z
   .object({
     banner: cliBannerBlock,
+    /**
+     * Phase 2 M2.2 — TUI polish gate. "basic" is the current readline-
+     * driven REPL; "rich" is reserved for future Ink-based output
+     * (status line, multi-line input, ESC interrupt). Today both modes
+     * compile identically; the field is forward-compatible.
+     */
+    tui: z.enum(["basic", "rich"]).default("basic"),
   })
   .strict()
   .optional();
