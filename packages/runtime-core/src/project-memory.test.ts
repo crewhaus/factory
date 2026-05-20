@@ -49,9 +49,9 @@ describe("loadProjectMemory", () => {
     const dir = setUpWorkdir({ "CLAUDE.md": "# Project X\nDoes the thing." });
     const result = await loadProjectMemory({ cwd: dir });
     expect(result.files.length).toBe(1);
-    expect(result.files[0]!.filename).toBe("CLAUDE.md");
-    expect(result.files[0]!.content).toContain("# Project X");
-    expect(result.files[0]!.truncated).toBe(false);
+    expect(result.files[0]?.filename).toBe("CLAUDE.md");
+    expect(result.files[0]?.content).toContain("# Project X");
+    expect(result.files[0]?.truncated).toBe(false);
     expect(result.prompt).toContain('<project_memory file="CLAUDE.md">');
     expect(result.prompt).toContain("</project_memory>");
   });
@@ -77,8 +77,8 @@ describe("loadProjectMemory", () => {
     const dir = setUpWorkdir({ "CLAUDE.md": "x".repeat(200) });
     const result = await loadProjectMemory({ cwd: dir, capBytes: 50 });
     expect(result.files.length).toBe(1);
-    expect(result.files[0]!.truncated).toBe(true);
-    expect(result.files[0]!.content).toContain("[...truncated to 50 bytes");
+    expect(result.files[0]?.truncated).toBe(true);
+    expect(result.files[0]?.content).toContain("[...truncated to 50 bytes");
   });
 
   test("stops loading once total cap exhausted", async () => {
@@ -107,7 +107,7 @@ describe("loadProjectMemory", () => {
     const dir = setUpWorkdir({ "PROJECT.md": "custom content" });
     const result = await loadProjectMemory({ cwd: dir, filenames: ["PROJECT.md"] });
     expect(result.files.length).toBe(1);
-    expect(result.files[0]!.filename).toBe("PROJECT.md");
+    expect(result.files[0]?.filename).toBe("PROJECT.md");
   });
 
   test("returns valid result when cwd doesn't exist (no throw)", async () => {

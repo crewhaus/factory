@@ -1,8 +1,4 @@
-import {
-  type CostTracker,
-  createCostTracker,
-  formatUsdMicros,
-} from "@crewhaus/cost-tracker";
+import { type CostTracker, createCostTracker, formatUsdMicros } from "@crewhaus/cost-tracker";
 import {
   type AttachedMetrics,
   attachIfEnvSet as attachMetricsIfEnvSet,
@@ -56,8 +52,7 @@ export type AttachedSubscribers = {
  */
 export function formatCostInlineLine(ev: CostAccrualEvent): string {
   const cost = formatUsdMicros(ev.costUsdMicros);
-  const fmtTokens = (n: number): string =>
-    n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${n}`;
+  const fmtTokens = (n: number): string => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${n}`);
   return `[💸 ${cost} · ${fmtTokens(ev.inputTokens)} in / ${fmtTokens(ev.outputTokens)} out · model=${ev.modelId}]`;
 }
 

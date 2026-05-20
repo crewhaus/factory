@@ -117,6 +117,6 @@ function countLines(s: string): number {
 function envInt(name: string, fallback: number): number {
   const v = process.env[name];
   if (v === undefined) return fallback;
-  const n = parseInt(v, 10);
+  const n = Number.parseInt(v, 10);
   return Number.isFinite(n) && n > 0 ? n : fallback;
 }

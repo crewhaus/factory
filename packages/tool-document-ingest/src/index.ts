@@ -49,25 +49,10 @@ export class DocumentIngestError extends CrewhausError {
   }
 }
 
-const TEXT_EXTENSIONS = new Set([
-  ".txt",
-  ".md",
-  ".mdx",
-  ".log",
-  ".out",
-  ".rst",
-]);
+const TEXT_EXTENSIONS = new Set([".txt", ".md", ".mdx", ".log", ".out", ".rst"]);
 const TABULAR_EXTENSIONS = new Set([".csv", ".tsv"]);
 const STRUCTURED_EXTENSIONS = new Set([".json", ".yaml", ".yml"]);
-const STUB_EXTENSIONS = new Set([
-  ".pdf",
-  ".docx",
-  ".doc",
-  ".xlsx",
-  ".xls",
-  ".pptx",
-  ".epub",
-]);
+const STUB_EXTENSIONS = new Set([".pdf", ".docx", ".doc", ".xlsx", ".xls", ".pptx", ".epub"]);
 
 const customParsers = new Map<string, DocumentParser>();
 
@@ -131,9 +116,9 @@ export const ingestDocument: RegisteredTool = buildTool({
     const maxBytes = input.maxBytes ?? DEFAULT_MAX_BYTES;
 
     // Operator-registered parser takes priority over built-in handling.
-    if (customParsers.has(ext)) {
-      const parser = customParsers.get(ext)!;
-      const result = await parser(abs);
+    const customParser = customParsers.get(ext);
+    if (customParser !== undefined) {
+      const result = await customParser(abs);
       return renderResult({
         path: abs,
         content: result.content,
@@ -148,7 +133,12 @@ export const ingestDocument: RegisteredTool = buildTool({
       );
     }
 
-    if (TEXT_EXTENSIONS.has(ext) || TABULAR_EXTENSIONS.has(ext) || STRUCTURED_EXTENSIONS.has(ext) || ext === "") {
+    if (
+      TEXT_EXTENSIONS.has(ext) ||
+      TABULAR_EXTENSIONS.has(ext) ||
+      STRUCTURED_EXTENSIONS.has(ext) ||
+      ext === ""
+    ) {
       const raw = readFileSync(abs, "utf-8");
       const metadata: Record<string, unknown> = {
         ext: ext || "(none)",

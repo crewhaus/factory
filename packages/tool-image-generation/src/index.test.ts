@@ -4,17 +4,13 @@
  * an injected fetch.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import {
-  ImageGenerationError,
-  imageGenerate,
-  registerImageGenerationConfig,
-} from "./index";
+import { ImageGenerationError, imageGenerate, registerImageGenerationConfig } from "./index";
 
 let savedEnv: NodeJS.ProcessEnv;
 
 beforeEach(() => {
   savedEnv = { ...process.env };
-  delete process.env["OPENAI_API_KEY"];
+  process.env["OPENAI_API_KEY"] = undefined;
   registerImageGenerationConfig({});
 });
 
@@ -64,10 +60,10 @@ describe("imageGenerate — openai provider", () => {
     const mockFetch: typeof globalThis.fetch = async (input, init) => {
       capturedUrl = String(input);
       capturedBody = String(init?.body ?? "");
-      return new Response(
-        JSON.stringify({ data: [{ url: "https://example.com/img.png" }] }),
-        { status: 200, headers: { "content-type": "application/json" } },
-      );
+      return new Response(JSON.stringify({ data: [{ url: "https://example.com/img.png" }] }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
     };
     registerImageGenerationConfig({ provider: "openai", fetch: mockFetch });
 
@@ -85,10 +81,9 @@ describe("imageGenerate — openai provider", () => {
     let capturedBody = "";
     const mockFetch: typeof globalThis.fetch = async (_input, init) => {
       capturedBody = String(init?.body ?? "");
-      return new Response(
-        JSON.stringify({ data: [{ url: "https://example.com/x.png" }] }),
-        { status: 200 },
-      );
+      return new Response(JSON.stringify({ data: [{ url: "https://example.com/x.png" }] }), {
+        status: 200,
+      });
     };
     registerImageGenerationConfig({ provider: "openai", fetch: mockFetch });
     await imageGenerate.execute({ prompt: "x", size: "1792x1024", style: "natural" });

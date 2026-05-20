@@ -106,7 +106,7 @@ function parseDurationToMs(duration: string): number {
   if (!m) {
     throw new Error(`invalid duration "${duration}" (caught past spec validation)`);
   }
-  const n = parseInt(m[1] ?? "0", 10);
+  const n = Number.parseInt(m[1] ?? "0", 10);
   switch (m[2]) {
     case "ms":
       return n;

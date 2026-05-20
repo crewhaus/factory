@@ -41,7 +41,10 @@ export type ImageGenerationConfig = {
 };
 
 const inputSchema = z.object({
-  prompt: z.string().min(1).describe("What to generate. Be specific; vague prompts produce vague images."),
+  prompt: z
+    .string()
+    .min(1)
+    .describe("What to generate. Be specific; vague prompts produce vague images."),
   size: z
     .enum(["256x256", "512x512", "1024x1024", "1792x1024", "1024x1792"])
     .optional()
@@ -50,7 +53,9 @@ const inputSchema = z.object({
   responseFormat: z
     .enum(["url", "b64_json"])
     .optional()
-    .describe("How to return the image. Default 'url'; b64_json is useful for offline / no-CDN deployments."),
+    .describe(
+      "How to return the image. Default 'url'; b64_json is useful for offline / no-CDN deployments.",
+    ),
 });
 
 export class ImageGenerationError extends CrewhausError {

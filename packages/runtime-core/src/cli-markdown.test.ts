@@ -20,6 +20,7 @@ function capture(): { write: (s: string) => void; out: () => string } {
 // Strip ANSI escape sequences so we can assert on plain content
 // while still letting other tests verify the escape codes are present.
 function strip(s: string): string {
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: ANSI escape detection is intentional — the renderer's output IS the control sequences we want to strip.
   return s.replace(/\x1b\[[0-9;]*m/g, "");
 }
 

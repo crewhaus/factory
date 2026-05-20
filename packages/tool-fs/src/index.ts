@@ -2,10 +2,10 @@ import { randomBytes } from "node:crypto";
 import { rename, unlink } from "node:fs/promises";
 import * as path from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
-import { renderEditDiff } from "./diff";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { z } from "zod";
+import { renderEditDiff } from "./diff";
 
 /**
  * Built-in filesystem tools, sandboxed to the process's current working

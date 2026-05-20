@@ -81,11 +81,7 @@ export async function loadProjectMemory(
       const st = await stat(fullPath);
       if (!st.isFile()) continue;
       matched.push({ filename, fullPath, size: st.size });
-    } catch {
-      // Best-effort: a file that vanishes between exists() and stat()
-      // (race) or is otherwise unreadable should not abort the load.
-      continue;
-    }
+    } catch {}
   }
 
   if (matched.length === 0) {
@@ -120,10 +116,7 @@ export async function loadProjectMemory(
   }
 
   const sections = files
-    .map(
-      (f) =>
-        `<project_memory file="${f.filename}">\n${f.content}\n</project_memory>`,
-    )
+    .map((f) => `<project_memory file="${f.filename}">\n${f.content}\n</project_memory>`)
     .join("\n\n");
 
   return {

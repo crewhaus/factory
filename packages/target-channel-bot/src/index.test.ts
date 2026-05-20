@@ -589,7 +589,7 @@ describe("emitChannelBot — heartbeat (Phase 3 §3.1)", () => {
     expect(c).toContain('"Wake and decide what\'s useful."');
     expect(c).toContain("[heartbeat] tick");
     expect(c).toContain("clearInterval(__heartbeatTimer)");
-    expect(c).toContain('import { randomBytes as __hbRandomBytes }');
+    expect(c).toContain("import { randomBytes as __hbRandomBytes }");
     // The heartbeat fires the agent via the same runTurn surface as
     // inbound messages, so each tick gets a fresh session id.
     expect(c).toContain("agent.runTurn({");

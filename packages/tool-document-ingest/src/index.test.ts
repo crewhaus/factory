@@ -47,7 +47,7 @@ describe("ingestDocument — basics", () => {
   test("ingests a plain .txt file with the document envelope", async () => {
     const path = writeFile("note.txt", "hello\nworld\n");
     const result = await ingestDocument.execute({ path });
-    expect(result).toContain('<document path=');
+    expect(result).toContain("<document path=");
     expect(result).toContain("hello");
     expect(result).toContain("</document>");
     expect(result).toContain("metadata:");
@@ -120,9 +120,9 @@ describe("ingestDocument — operator-registered parsers", () => {
   });
 
   test("registerDocumentParser rejects extensions without leading dot", () => {
-    expect(() =>
-      registerDocumentParser("pdf", async () => ({ content: "" })),
-    ).toThrow(DocumentIngestError);
+    expect(() => registerDocumentParser("pdf", async () => ({ content: "" }))).toThrow(
+      DocumentIngestError,
+    );
   });
 
   test("ext matching is case-insensitive", async () => {

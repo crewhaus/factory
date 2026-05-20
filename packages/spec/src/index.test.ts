@@ -841,10 +841,8 @@ heartbeat:
     expect(spec.heartbeat?.instructions).toBe("wake and decide");
   });
 
-  test.each(["2h", "30m", "60s", "500ms"])(
-    "accepts duration string %s",
-    (every: string) => {
-      const spec = parseSpec(`
+  test.each(["2h", "30m", "60s", "500ms"])("accepts duration string %s", (every: string) => {
+    const spec = parseSpec(`
 name: hello
 target: channel
 agent:
@@ -860,10 +858,9 @@ heartbeat:
   every: ${every}
   instructions: tick
 `);
-      if (spec.target !== "channel") throw new Error("unexpected target");
-      expect(spec.heartbeat?.every).toBe(every);
-    },
-  );
+    if (spec.target !== "channel") throw new Error("unexpected target");
+    expect(spec.heartbeat?.every).toBe(every);
+  });
 
   test("rejects invalid duration format", () => {
     expect(() =>

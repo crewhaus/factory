@@ -312,7 +312,7 @@ describe("react (Phase 3 §3.2)", () => {
       { fetch: fakeFetch },
     );
     expect(adapter.react).toBeDefined();
-    await adapter.react!({ event: sampleEvent, emoji: "eyes" });
+    await adapter.react?.({ event: sampleEvent, emoji: "eyes" });
     expect(capturedUrl).toBe("https://slack.com/api/reactions.add");
     const body = JSON.parse(capturedBody) as { channel: string; timestamp: string; name: string };
     expect(body.channel).toBe("C1");
@@ -330,7 +330,7 @@ describe("react (Phase 3 §3.2)", () => {
       { botToken: "xoxb", signingSecret: SECRET },
       { fetch: fakeFetch },
     );
-    await adapter.react!({ event: sampleEvent, emoji: ":white_check_mark:" });
+    await adapter.react?.({ event: sampleEvent, emoji: ":white_check_mark:" });
     const body = JSON.parse(capturedBody) as { name: string };
     expect(body.name).toBe("white_check_mark");
   });
@@ -345,7 +345,7 @@ describe("react (Phase 3 §3.2)", () => {
       { botToken: "xoxb", signingSecret: SECRET },
       { fetch: fakeFetch },
     );
-    await expect(adapter.react!({ event: sampleEvent, emoji: "eyes" })).resolves.toBeUndefined();
+    await expect(adapter.react?.({ event: sampleEvent, emoji: "eyes" })).resolves.toBeUndefined();
   });
 
   test("throws on non-already_reacted error", async () => {
@@ -358,7 +358,7 @@ describe("react (Phase 3 §3.2)", () => {
       { botToken: "xoxb", signingSecret: SECRET },
       { fetch: fakeFetch },
     );
-    await expect(adapter.react!({ event: sampleEvent, emoji: "eyes" })).rejects.toThrow(
+    await expect(adapter.react?.({ event: sampleEvent, emoji: "eyes" })).rejects.toThrow(
       /invalid_auth/,
     );
   });

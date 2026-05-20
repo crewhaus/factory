@@ -532,7 +532,9 @@ async function runRun(args: ParsedArgs): Promise<void> {
       );
     }
     resumeId = match.id;
-    process.stdout.write(`[continue] resuming session ${match.id} (last updated ${match.updatedAt})\n`);
+    process.stdout.write(
+      `[continue] resuming session ${match.id} (last updated ${match.updatedAt})\n`,
+    );
   }
 
   let tools: RegisteredTool[] = [];

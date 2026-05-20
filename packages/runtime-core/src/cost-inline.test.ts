@@ -33,9 +33,7 @@ describe("formatCostInlineLine", () => {
   });
 
   test("formats token counts above 1k with one decimal place", () => {
-    const line = formatCostInlineLine(
-      makeEvent({ inputTokens: 12_345, outputTokens: 678 }),
-    );
+    const line = formatCostInlineLine(makeEvent({ inputTokens: 12_345, outputTokens: 678 }));
     expect(line).toContain("12.3k in");
     expect(line).toContain("678 out"); // below 1k stays raw
   });

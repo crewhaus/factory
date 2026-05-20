@@ -50,8 +50,8 @@ describe("remember + recall", () => {
     await store.remember("the user prefers TypeScript over JavaScript");
     const results = await store.recall("TypeScript");
     expect(results.length).toBe(1);
-    expect(results[0]!.entry.text).toBe("the user prefers TypeScript over JavaScript");
-    expect(results[0]!.score).toBeGreaterThan(0);
+    expect(results[0]?.entry.text).toBe("the user prefers TypeScript over JavaScript");
+    expect(results[0]?.score).toBeGreaterThan(0);
   });
 
   test("remember assigns ids with the mem_ prefix", async () => {
@@ -72,7 +72,7 @@ describe("remember + recall", () => {
     expect(results.length).toBe(2);
     // Both TypeScript-mentioning entries should outrank the Python one,
     // which is excluded entirely (zero score).
-    expect(results[0]!.score).toBeGreaterThanOrEqual(results[1]!.score);
+    expect(results[0]?.score).toBeGreaterThanOrEqual(results[1]?.score);
     expect(results.find((r) => r.entry.text.includes("Python"))).toBeUndefined();
   });
 
@@ -81,7 +81,7 @@ describe("remember + recall", () => {
     await store.remember("personal note", ["family", "anniversary"]);
     const results = await store.recall("anniversary");
     expect(results.length).toBe(1);
-    expect(results[0]!.entry.tags).toEqual(["family", "anniversary"]);
+    expect(results[0]?.entry.tags).toEqual(["family", "anniversary"]);
   });
 
   test("recall returns empty array when nothing matches", async () => {

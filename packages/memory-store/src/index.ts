@@ -138,10 +138,7 @@ export function createMemoryStore(opts: MemoryStoreOptions): MemoryStore {
       return entry;
     },
 
-    async recall(
-      query: string,
-      k: number = DEFAULT_K,
-    ): Promise<readonly MemoryRecallResult[]> {
+    async recall(query: string, k: number = DEFAULT_K): Promise<readonly MemoryRecallResult[]> {
       if (typeof query !== "string" || query.length === 0) {
         throw new MemoryStoreError("recall(): query must be a non-empty string");
       }
