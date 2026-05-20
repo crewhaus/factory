@@ -289,3 +289,63 @@ describe("emitCli — combined", () => {
     expect(runChatLoopIdx).toBeGreaterThan(extensionBootIdx);
   });
 });
+
+describe("emitCli — CLI banner (Phase 3 §3.3)", () => {
+  test("omits banner code when ir.cli.banner is undefined", () => {
+    const content = emitCli(baseIr()).files[0]?.content ?? "";
+    expect(content).not.toContain("CREWHAUS_RESUMED");
+    expect(content).not.toContain("__tagline");
+  });
+
+  test("emits a static-mode banner that prints the first tagline", () => {
+    const ir = baseIr({
+      cli: {
+        banner: {
+          taglineMode: "static",
+          taglines: ["🦞 EXFOLIATE! EXFOLIATE!", "🦞 second tagline"],
+        },
+      },
+    });
+    const content = emitCli(ir).files[0]?.content ?? "";
+    expect(content).toContain("🦞 EXFOLIATE! EXFOLIATE!");
+    expect(content).toContain("__taglines[0]");
+    expect(content).not.toContain("Math.random()");
+    // Resumed-session suppression
+    expect(content).toContain("CREWHAUS_RESUMED");
+  });
+
+  test("emits a random-mode banner that picks via Math.random()", () => {
+    const ir = baseIr({
+      cli: {
+        banner: {
+          taglineMode: "random",
+          taglines: ["one", "two", "three"],
+        },
+      },
+    });
+    const content = emitCli(ir).files[0]?.content ?? "";
+    expect(content).toContain("Math.floor(Math.random()");
+    expect(content).toContain('"one"');
+    expect(content).toContain('"two"');
+    expect(content).toContain('"three"');
+  });
+
+  test("name is escaped against backtick/template injection inside the banner", () => {
+    const ir = baseIr({
+      name: "evil`${process.exit(1)}",
+      cli: {
+        banner: { taglineMode: "static", taglines: ["t"] },
+      },
+    });
+    const content = emitCli(ir).files[0]?.content ?? "";
+    // The banner emits inside a backtick template literal. Backticks and ${
+    // in the name must be escaped so they can't break out of the template
+    // and run arbitrary code at startup.
+    expect(content).toContain("evil\\`\\${process.exit(1)}");
+    // The escaped form should appear specifically in the banner body
+    // (after the "process.stdout.write" call introducing the banner).
+    const writeIdx = content.indexOf("process.stdout.write(`\\n");
+    const escapedIdx = content.indexOf("evil\\`\\${process.exit(1)}");
+    expect(escapedIdx).toBeGreaterThan(writeIdx);
+  });
+});

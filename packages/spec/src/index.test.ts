@@ -668,3 +668,157 @@ mcp_servers:
     ).toThrow(SpecParseError);
   });
 });
+
+describe("parseSpec — CLI banner (Phase 3 §3.3)", () => {
+  test("accepts a banner block with taglineMode and taglines", () => {
+    const spec = parseSpec(`
+name: hello
+target: cli
+agent:
+  model: claude-sonnet-4-6
+  instructions: be helpful
+cli:
+  banner:
+    taglineMode: random
+    taglines:
+      - "🦞 first"
+      - "🦞 second"
+`);
+    if (spec.target !== "cli") throw new Error("unexpected target");
+    expect(spec.cli?.banner?.taglineMode).toBe("random");
+    expect(spec.cli?.banner?.taglines).toEqual(["🦞 first", "🦞 second"]);
+  });
+
+  test("defaults taglineMode to 'static' when omitted", () => {
+    const spec = parseSpec(`
+name: hello
+target: cli
+agent:
+  model: claude-sonnet-4-6
+  instructions: be helpful
+cli:
+  banner:
+    taglines: ["only one"]
+`);
+    if (spec.target !== "cli") throw new Error("unexpected target");
+    expect(spec.cli?.banner?.taglineMode).toBe("static");
+  });
+
+  test("rejects empty taglines array", () => {
+    expect(() =>
+      parseSpec(`
+name: hello
+target: cli
+agent:
+  model: claude-sonnet-4-6
+  instructions: be helpful
+cli:
+  banner:
+    taglines: []
+`),
+    ).toThrow(SpecParseError);
+  });
+
+  test("rejects invalid taglineMode", () => {
+    expect(() =>
+      parseSpec(`
+name: hello
+target: cli
+agent:
+  model: claude-sonnet-4-6
+  instructions: be helpful
+cli:
+  banner:
+    taglineMode: invalid
+    taglines: ["t"]
+`),
+    ).toThrow(SpecParseError);
+  });
+});
+
+describe("parseSpec — heartbeat (Phase 3 §3.1)", () => {
+  test("accepts a heartbeat block with duration and instructions", () => {
+    const spec = parseSpec(`
+name: hello
+target: channel
+agent:
+  model: claude-sonnet-4-6
+  instructions: be helpful
+channels:
+  slack:
+    botToken: $SLACK_BOT_TOKEN
+    signingSecret: $SLACK_SIGNING_SECRET
+routing:
+  sessionKey: thread
+heartbeat:
+  every: 2h
+  instructions: wake and decide
+`);
+    if (spec.target !== "channel") throw new Error("unexpected target");
+    expect(spec.heartbeat?.every).toBe("2h");
+    expect(spec.heartbeat?.instructions).toBe("wake and decide");
+  });
+
+  test.each(["2h", "30m", "60s", "500ms"])(
+    "accepts duration string %s",
+    (every: string) => {
+      const spec = parseSpec(`
+name: hello
+target: channel
+agent:
+  model: claude-sonnet-4-6
+  instructions: be helpful
+channels:
+  slack:
+    botToken: $SLACK_BOT_TOKEN
+    signingSecret: $SLACK_SIGNING_SECRET
+routing:
+  sessionKey: thread
+heartbeat:
+  every: ${every}
+  instructions: tick
+`);
+      if (spec.target !== "channel") throw new Error("unexpected target");
+      expect(spec.heartbeat?.every).toBe(every);
+    },
+  );
+
+  test("rejects invalid duration format", () => {
+    expect(() =>
+      parseSpec(`
+name: hello
+target: channel
+agent:
+  model: claude-sonnet-4-6
+  instructions: be helpful
+channels:
+  slack:
+    botToken: $SLACK_BOT_TOKEN
+    signingSecret: $SLACK_SIGNING_SECRET
+routing:
+  sessionKey: thread
+heartbeat:
+  every: "2 hours"
+  instructions: tick
+`),
+    ).toThrow(SpecParseError);
+  });
+
+  test("heartbeat is optional", () => {
+    const spec = parseSpec(`
+name: hello
+target: channel
+agent:
+  model: claude-sonnet-4-6
+  instructions: be helpful
+channels:
+  slack:
+    botToken: $SLACK_BOT_TOKEN
+    signingSecret: $SLACK_SIGNING_SECRET
+routing:
+  sessionKey: thread
+`);
+    if (spec.target !== "channel") throw new Error("unexpected target");
+    expect(spec.heartbeat).toBeUndefined();
+  });
+});

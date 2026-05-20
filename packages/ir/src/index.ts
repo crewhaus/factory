@@ -78,6 +78,18 @@ export type IrCompaction = {
   readonly model?: string;
 };
 
+/**
+ * Phase 3 §3.3 — CLI banner config carried into IR for codegen.
+ */
+export type IrCliBanner = {
+  readonly taglineMode: "static" | "random";
+  readonly taglines: readonly string[];
+};
+
+export type IrCliOptions = {
+  readonly banner?: IrCliBanner;
+};
+
 export type IrV0 = {
   readonly version: 0;
   readonly name: string;
@@ -92,6 +104,7 @@ export type IrV0 = {
   readonly permissions: IrPermissions;
   readonly subAgents: readonly IrSubAgentDefinition[];
   readonly compaction: IrCompaction;
+  readonly cli?: IrCliOptions;
   /** §47 cross-cutting blockchain subsystem (slice 0). All optional. */
   readonly chains?: readonly IrChainBinding[];
   readonly wallets?: readonly IrWalletBinding[];
@@ -302,6 +315,16 @@ export type IrRouting = {
  * sessions (keyed by `routing.sessionKey`) via session-store + event-log,
  * appends the new message, and runs one `runChatLoop` turn.
  */
+/**
+ * Phase 3 §3.1 — heartbeat config carried into IR. `everyMs` is
+ * normalized from the duration-string in the spec to milliseconds at
+ * lower time so codegen can emit a literal numeric setInterval arg.
+ */
+export type IrHeartbeat = {
+  readonly everyMs: number;
+  readonly instructions: string;
+};
+
 export type IrChannelV0 = {
   readonly version: 0;
   readonly name: string;
@@ -318,6 +341,7 @@ export type IrChannelV0 = {
   readonly permissions: IrPermissions;
   readonly subAgents: readonly IrSubAgentDefinition[];
   readonly compaction: IrCompaction;
+  readonly heartbeat?: IrHeartbeat;
   /** §47 cross-cutting blockchain subsystem (slice 0). All optional. */
   readonly chains?: readonly IrChainBinding[];
   readonly wallets?: readonly IrWalletBinding[];

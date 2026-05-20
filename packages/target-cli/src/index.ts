@@ -332,6 +332,23 @@ if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));`;
   const subAgentsBoot = subAgents.registryBlock
     ? `${subAgents.registryBlock}\n${subAgents.registerBlock}\n\n`
     : "";
+
+  // Phase 3 §3.3 — CLI banner with optional tagline rotation. Emitted
+  // ahead of runChatLoop so users see the brand on cold start. Suppressed
+  // when CREWHAUS_RESUMED=1 (set by --continue/--resume) so resumed
+  // sessions don't re-banner.
+  const bannerBoot = ir.cli?.banner
+    ? `if (process.env.CREWHAUS_RESUMED !== "1") {
+  const __taglines = ${JSON.stringify(ir.cli.banner.taglines)};
+  const __tagline = ${
+    ir.cli.banner.taglineMode === "random"
+      ? "__taglines[Math.floor(Math.random() * __taglines.length)]"
+      : "__taglines[0]"
+  };
+  process.stdout.write(\`\\n\\x1b[1m${escapeBannerName(ir.name)}\\x1b[0m — \${__tagline}\\n\\n\`);
+}
+`
+    : "";
   // Section 18 — only flip `sandboxAvailable` on at runtime when the
   // operator has wired a real backend. Default (unset) treats docker as
   // available; `CREWHAUS_SANDBOX=noop` always denies the floor.
@@ -369,6 +386,17 @@ ${permImport}${importBlock}${catalogImport}${mcpImportBlock}${subAgentImportBloc
 ${registerBlock}
 ${extensionBoot}
 
-${subAgentsBoot}${mcpBoot}${wrapped}
+${bannerBoot}${subAgentsBoot}${mcpBoot}${wrapped}
 `;
+}
+
+/**
+ * Escape a string for safe embedding inside a backtick template literal
+ * in the generated bundle. Banner names come from spec.name (user-
+ * controlled but already validated to be a non-empty string) — we still
+ * sanitize to be defensive about backticks and template-literal
+ * interpolation tokens.
+ */
+function escapeBannerName(name: string): string {
+  return name.replace(/\\/g, "\\\\").replace(/`/g, "\\`").replace(/\$\{/g, "\\${");
 }

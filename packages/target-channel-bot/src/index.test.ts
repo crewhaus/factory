@@ -482,3 +482,54 @@ describe("emitChannelBot — iMessage channel (Section 33)", () => {
     expect(c).toContain('"MY_CURSOR"');
   });
 });
+
+describe("emitChannelBot — heartbeat (Phase 3 §3.1)", () => {
+  test("omits heartbeat boot when ir.heartbeat is undefined", () => {
+    const c = fileMap(MIN_IR).get("daemon.ts") ?? "";
+    expect(c).not.toContain("setInterval");
+    expect(c).not.toContain("[heartbeat]");
+    expect(c).not.toContain("__heartbeatTimer");
+  });
+
+  test("emits a setInterval loop and shutdown clearInterval when heartbeat is set", () => {
+    const irWithHeartbeat: IrChannelV0 = {
+      ...MIN_IR,
+      heartbeat: {
+        everyMs: 7_200_000, // 2h
+        instructions: "Wake and decide what's useful.",
+      },
+    };
+    const c = fileMap(irWithHeartbeat).get("daemon.ts") ?? "";
+    expect(c).toContain("setInterval(");
+    expect(c).toContain("7200000"); // 2h in ms
+    expect(c).toContain('"Wake and decide what\'s useful."');
+    expect(c).toContain("[heartbeat] tick");
+    expect(c).toContain("clearInterval(__heartbeatTimer)");
+    expect(c).toContain('import { randomBytes as __hbRandomBytes }');
+    // The heartbeat fires the agent via the same runTurn surface as
+    // inbound messages, so each tick gets a fresh session id.
+    expect(c).toContain("agent.runTurn({");
+    expect(c).toContain("isNew: true");
+  });
+
+  test("heartbeat coexists with sub-agents and MCP servers", () => {
+    const ir: IrChannelV0 = {
+      ...MIN_IR,
+      subAgents: [
+        {
+          name: "planner",
+          description: "plans things",
+          instructions: "Plan, do not execute.",
+          tools: ["read"],
+          permissions: { allow: ["Read"], deny: [] },
+          inheritBypass: false,
+        },
+      ],
+      heartbeat: { everyMs: 60_000, instructions: "tick" },
+    };
+    const c = fileMap(ir).get("daemon.ts") ?? "";
+    expect(c).toContain("setInterval(");
+    expect(c).toContain("60000");
+    expect(c).toContain("Sub-agents (Section 13)");
+  });
+});
