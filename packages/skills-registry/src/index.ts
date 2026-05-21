@@ -34,11 +34,46 @@ import { z } from "zod";
 const SKILL_FILE = "SKILL.md";
 const SKILLS_RELATIVE = ".crewhaus/skills";
 
+/**
+ * SKILL.md frontmatter. The required pair (`name`, `description`) matches
+ * Anthropic's baseline. The optional fields extend toward the conventions
+ * used in Anthropic's vertical packs (academic-research-skills,
+ * claude-for-legal, financial-services) so packs from those repos can
+ * drop into a CrewHaus skills directory without translation.
+ *
+ *  - `triggers` (CrewHaus original): keyword matchers the runtime can use
+ *    to decide whether to surface the skill in the system prompt's
+ *    "Available skills:" block.
+ *  - `tools` (CrewHaus original): tool-name allow-list — when a skill is
+ *    "active", runtime-core can narrow the tool catalog to this subset.
+ *    v1 parses the field but does NOT enforce; that's a runtime follow-up.
+ *  - `argument-hint` (Anthropic vertical packs, e.g. claude-for-legal): a
+ *    slash-command-style argument summary, e.g. `"[subject] [--review |
+ *    --drill]"`. Surfaced verbatim in the skill listing so the model
+ *    knows the call shape without reading the body.
+ *  - `metadata` (Anthropic academic-research-skills): version, status,
+ *    task-type, and cross-skill linkage. Optional; the registry stores
+ *    them on `SkillRef` for downstream consumers (Studio's skill
+ *    explorer, eval datasets, plugin-marketplace listings).
+ *
+ * Schema-extensions follow-up: Anthropic vertical packs also ship
+ * `agents/<name>.md` subdirectories and `references/*.schema.json`
+ * envelopes. Those are filesystem conventions; this package detects them
+ * via filesystem checks at discovery time, not via the frontmatter
+ * schema. See docs/SKILLS-FORMAT.md.
+ */
 export type SkillFrontmatter = {
   readonly name: string;
   readonly description: string;
   readonly triggers?: ReadonlyArray<string>;
   readonly tools?: ReadonlyArray<string>;
+  readonly argumentHint?: string;
+  readonly metadata?: {
+    readonly version?: string;
+    readonly status?: "draft" | "active" | "deprecated";
+    readonly taskType?: "open-ended" | "closed" | "hybrid";
+    readonly relatedSkills?: ReadonlyArray<string>;
+  };
 };
 
 export type SkillRef = SkillFrontmatter & {
@@ -92,6 +127,22 @@ export function parseSkillFile(content: string): { frontmatter: SkillFrontmatter
     description: z.string().min(1),
     triggers: z.array(z.string()).optional(),
     tools: z.array(z.string()).optional(),
+    // Anthropic vertical-pack extensions. Both YAML key conventions are
+    // accepted (`argument-hint` per Anthropic's slash-command convention,
+    // and `argumentHint` per CrewHaus's camelCase preference) so packs
+    // copied from Anthropic skill repos parse without translation.
+    "argument-hint": z.string().optional(),
+    argumentHint: z.string().optional(),
+    metadata: z
+      .object({
+        version: z.string().optional(),
+        status: z.enum(["draft", "active", "deprecated"]).optional(),
+        task_type: z.enum(["open-ended", "closed", "hybrid"]).optional(),
+        taskType: z.enum(["open-ended", "closed", "hybrid"]).optional(),
+        related_skills: z.array(z.string()).optional(),
+        relatedSkills: z.array(z.string()).optional(),
+      })
+      .optional(),
   });
   const result = fmSchema.safeParse(parsed);
   if (!result.success) {
@@ -100,7 +151,34 @@ export function parseSkillFile(content: string): { frontmatter: SkillFrontmatter
     const message = issue ? issue.message : "validation failed";
     throw new SkillParseError(`SKILL.md frontmatter ${path}: ${message}`);
   }
-  return { frontmatter: result.data, body };
+  const raw = result.data;
+  // Normalize the dual key conventions (Anthropic kebab + CrewHaus camel)
+  // into the canonical CrewHaus shape.
+  const frontmatter: SkillFrontmatter = {
+    name: raw.name,
+    description: raw.description,
+    ...(raw.triggers !== undefined ? { triggers: raw.triggers } : {}),
+    ...(raw.tools !== undefined ? { tools: raw.tools } : {}),
+    ...(raw["argument-hint"] !== undefined || raw.argumentHint !== undefined
+      ? { argumentHint: raw.argumentHint ?? raw["argument-hint"] }
+      : {}),
+    ...(raw.metadata !== undefined
+      ? {
+          metadata: {
+            ...(raw.metadata.version !== undefined ? { version: raw.metadata.version } : {}),
+            ...(raw.metadata.status !== undefined ? { status: raw.metadata.status } : {}),
+            ...(raw.metadata.taskType !== undefined || raw.metadata.task_type !== undefined
+              ? { taskType: raw.metadata.taskType ?? raw.metadata.task_type }
+              : {}),
+            ...(raw.metadata.relatedSkills !== undefined ||
+            raw.metadata.related_skills !== undefined
+              ? { relatedSkills: raw.metadata.relatedSkills ?? raw.metadata.related_skills }
+              : {}),
+          },
+        }
+      : {}),
+  };
+  return { frontmatter, body };
 }
 
 function findFrontmatterEnd(content: string): number {
@@ -243,5 +321,12 @@ export function createSkillTool(skills: ReadonlyArray<SkillRef>): RegisteredTool
     destructive: false,
     requiresSandbox: false,
     classifyOutput: true,
+    // Pillar 3: Skill bodies stay in-process; the Skill tool itself never
+    // transmits to an external sink, so internal scope is correct. (The
+    // skills-registry's boundary site for the skill body's content is
+    // the `"skill"` origin in boundary-classifier; that's the source
+    // side, separate from this sink-side declaration.)
+    scope: "internal",
+    requireJustification: false,
   };
 }

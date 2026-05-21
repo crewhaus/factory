@@ -64,6 +64,72 @@ body`;
     expect(frontmatter.tools).toEqual(["Read", "Bash"]);
   });
 
+  test("parses Anthropic-style argument-hint (kebab key)", () => {
+    const content = `---
+name: x
+description: y
+argument-hint: "[subject] [--review | --drill]"
+---
+body`;
+    const { frontmatter } = parseSkillFile(content);
+    expect(frontmatter.argumentHint).toBe("[subject] [--review | --drill]");
+  });
+
+  test("parses CrewHaus-style argumentHint (camel key)", () => {
+    const content = `---
+name: x
+description: y
+argumentHint: "<topic>"
+---
+body`;
+    const { frontmatter } = parseSkillFile(content);
+    expect(frontmatter.argumentHint).toBe("<topic>");
+  });
+
+  test("parses Anthropic-style metadata with snake_case keys", () => {
+    const content = `---
+name: x
+description: y
+metadata:
+  version: "3.7.3"
+  status: active
+  task_type: open-ended
+  related_skills: [foo, bar]
+---
+body`;
+    const { frontmatter } = parseSkillFile(content);
+    expect(frontmatter.metadata?.version).toBe("3.7.3");
+    expect(frontmatter.metadata?.status).toBe("active");
+    expect(frontmatter.metadata?.taskType).toBe("open-ended");
+    expect(frontmatter.metadata?.relatedSkills).toEqual(["foo", "bar"]);
+  });
+
+  test("parses CrewHaus-style metadata with camelCase keys", () => {
+    const content = `---
+name: x
+description: y
+metadata:
+  version: "1.0.0"
+  taskType: closed
+  relatedSkills: [other]
+---
+body`;
+    const { frontmatter } = parseSkillFile(content);
+    expect(frontmatter.metadata?.taskType).toBe("closed");
+    expect(frontmatter.metadata?.relatedSkills).toEqual(["other"]);
+  });
+
+  test("rejects invalid metadata.status enum", () => {
+    const content = `---
+name: x
+description: y
+metadata:
+  status: invalid-status
+---
+body`;
+    expect(() => parseSkillFile(content)).toThrow(SkillParseError);
+  });
+
   test("rejects missing frontmatter delimiter", () => {
     expect(() => parseSkillFile("no frontmatter here")).toThrow(SkillParseError);
   });

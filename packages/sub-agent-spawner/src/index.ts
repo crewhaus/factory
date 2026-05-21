@@ -39,6 +39,7 @@ import {
 } from "@crewhaus/agent-context-isolation";
 import { classifyBoundary } from "@crewhaus/boundary-classifier";
 import { type EventLog, openEventLog } from "@crewhaus/event-log";
+import { tagContent } from "@crewhaus/run-context";
 import { runChatLoop } from "@crewhaus/runtime-core";
 
 /**
@@ -180,6 +181,13 @@ export async function spawnSubAgent(
     const boundary = await classifyBoundary(finalMessage, { origin: "subagent" });
     if (boundary.action === "redact" && boundary.redacted !== undefined) {
       finalMessage = boundary.redacted;
+    } else {
+      // Pillar 3 sink-side fabric — content the parent will see needs to
+      // be retrievable by the egress classifier on subsequent external-
+      // tool calls. tagContent stores the content under origin "subagent"
+      // so a later fetch/web/mcp call that smuggles this text triggers a
+      // warn/block depending on the sink scope.
+      tagContent(parent.runContext, finalMessage, "subagent");
     }
   }
 

@@ -211,6 +211,9 @@ export const webFetch: RegisteredTool = buildTool({
   inputSchema: webFetchSchema,
   readOnly: true,
   concurrencySafe: true,
+  // Pillar 3 sink-side: URL parameters can encode exfiltrated data ("Safe URL"
+  // pattern from OpenAI's 2026-05 prompt-injection paper).
+  scope: "external",
   execute: async (input, ctx) => {
     let url: URL;
     try {
@@ -397,6 +400,8 @@ export const webSearch: RegisteredTool = buildTool({
   inputSchema: webSearchSchema,
   readOnly: true,
   concurrencySafe: true,
+  // Pillar 3 sink-side: search-query parameter is an exfiltration vector.
+  scope: "external",
   execute: async (input, ctx) => {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(new Error("search timeout")), DEFAULT_TIMEOUT_MS);

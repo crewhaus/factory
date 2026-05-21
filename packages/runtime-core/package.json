@@ -22,6 +22,7 @@
     "@crewhaus/compaction-autocompact": "workspace:*",
     "@crewhaus/compaction-snip": "workspace:*",
     "@crewhaus/cost-tracker": "workspace:*",
+    "@crewhaus/egress-classifier": "workspace:*",
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/event-log": "workspace:*",
     "@crewhaus/hooks-engine": "workspace:*",

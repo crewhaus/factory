@@ -1,0 +1,21 @@
+{
+  "name": "@crewhaus/grader-12-metric-rubric",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Pillar-2 canonical eval rubric — 12 named graders with industry-validated thresholds derived from Towards Data Science's 100+ enterprise deployments framework (2026-05)",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@crewhaus/errors": "workspace:*",
+    "@crewhaus/eval-dataset": "workspace:*",
+    "@crewhaus/eval-grader": "workspace:*",
+    "@crewhaus/grader-registry": "workspace:*"
+  }
+}

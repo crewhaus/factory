@@ -24,6 +24,7 @@
     "@crewhaus/spec-patch": "workspace:*",
     "@crewhaus/canary-controller": "workspace:*",
     "@crewhaus/compiler": "workspace:*",
+    "@crewhaus/context-bundle": "workspace:*",
     "@crewhaus/deployment-controller": "workspace:*",
     "@crewhaus/eval-dataset": "workspace:*",
     "@crewhaus/eval-grader": "workspace:*",

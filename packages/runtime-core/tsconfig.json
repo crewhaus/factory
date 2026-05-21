@@ -11,6 +11,7 @@
     { "path": "../agent-context-isolation" },
     { "path": "../compaction-autocompact" },
     { "path": "../compaction-snip" },
+    { "path": "../egress-classifier" },
     { "path": "../errors" },
     { "path": "../event-log" },
     { "path": "../hooks-engine" },

@@ -189,6 +189,17 @@ export const OPTIMIZABLE_PATHS: Readonly<
   cli: Object.freeze([
     Object.freeze(["agent", "instructions"]),
     Object.freeze(["compaction", "threshold"]),
+    // Pillar 2 active context curation — eval-optimizer can flip the
+    // semantic-dedupe + relevance-reorder pass on/off and tune its
+    // similarity threshold, which dominates input-token cost on long runs.
+    Object.freeze(["compaction", "curate"]),
+    Object.freeze(["compaction", "dedupeThreshold"]),
+    Object.freeze(["compaction", "relevanceTopK"]),
+    // Pillar 3 sink-side fabric — egress policy + intent-gate thresholds
+    // are tunable so the eval-optimizer can find the sweet spot between
+    // false-positive denials and false-negative exfil bypasses.
+    Object.freeze(["security", "egressPolicy"]),
+    Object.freeze(["security", "justification"]),
     // §47 blockchain subsystem (slice 0). Whole-block replacement so the
     // optimizer can tune `chains[*].finality.count`, `chains[*].rpcPolicy`,
     // `transaction_policy.maxValueUsd`, and `transaction_policy.simulationRequired`

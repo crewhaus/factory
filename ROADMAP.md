@@ -23,8 +23,18 @@ For day-to-day visibility on what's in flight, see the [GitHub Project](https://
 
 ## v0.2.x (Days 30-60)
 
+**Reference-corpus integrations (this slice):**
+
+- **Pillar 3 egress fabric** — symmetric sink-side companion to `boundary-classifier`. New `packages/egress-classifier`. Tool descriptors gain `scope: "internal" | "external"`; `RunContext.dataLineage` tracks per-origin content provenance; `runtime-core` scans every external-scope tool input against lineage before invocation. New audit kind `egress_decision`. New trace outcomes `egress-passed | egress-warned | egress-blocked`. Recipe: [demos/recipes/51-egress-fabric.md](https://github.com/crewhaus/demos/blob/main/recipes/51-egress-fabric.md). Source: OpenAI 2026-05 prompt-injection paper, SACR 2026 runtime-security paper.
+- **Pillar 3 intent gate (justification)** — `permission-engine` adds `evaluateJustification` + `ruleBasedJustificationJudge` + the `JustificationJudge` interface for LLM-backed production judges. Tool descriptors gain `requireJustification: true`. New audit kind `permission_justification_evaluated`. Recipe: [demos/recipes/53-justification-gates.md](https://github.com/crewhaus/demos/blob/main/recipes/53-justification-gates.md). Source: SACR's three-layer model (Cyata's "guardian agent", Apono's intent-based authorization).
+- **Pillar 2 canonical 12-metric rubric** — new `packages/grader-12-metric-rubric` with all 12 named graders + industry-validated thresholds. Cross-sample roll-up via `summarize12MetricRubric` (p50/p95/p99, category roll-ups, threshold-breach flags). `costPerUsefulOutput` aggregator. Recipe: [demos/recipes/12-eval-harness.md](https://github.com/crewhaus/demos/blob/main/recipes/12-eval-harness.md). Source: TDS 2026-05 12-metric framework.
+- **Pillar 2 active context curation** — new `packages/compaction-curator`. Semantic-dedupe + relevance-reorder + top-K trim. `OPTIMIZABLE_PATHS` exposes `compaction.curate`, `compaction.dedupeThreshold`, `compaction.relevanceTopK`. Recipe: [demos/recipes/52-context-curation.md](https://github.com/crewhaus/demos/blob/main/recipes/52-context-curation.md). Source: Routray 2026-03 context-cost article.
+- **AST-aware code intelligence** — new `packages/tool-codegraph` with four tools (`CodeGraphSearch`, `CodeGraphCallers`, `CodeGraphCallees`, `CodeGraphImpact`) wrapping `@colbymchenry/codegraph` as an optional peer. Recipe: [demos/recipes/54-codegraph-tool.md](https://github.com/crewhaus/demos/blob/main/recipes/54-codegraph-tool.md).
+
+**Other v0.2.x items:**
+
 - More example artifacts: GitHub-issue-triage harness, doc-summarization skill, RAG pipeline, multi-agent customer-support crew, eval bundle
-- Improved `crewhaus doctor --philosophy-alignment` checks
+- Improved `crewhaus doctor --philosophy-alignment` checks (now covers egress + justification fabric drift)
 - Polished error messages from the compiler (especially around invalid IR transitions)
 - Tightened recipes index with task-oriented walkthroughs
 

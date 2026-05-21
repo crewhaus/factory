@@ -84,6 +84,9 @@ export const imageGenerate: RegisteredTool = buildTool({
   inputSchema,
   destructive: false,
   readOnly: false, // not idempotent — each call mints a new image
+  // Pillar 3 sink-side: the prompt is sent to a remote provider; lineage
+  // exfiltration via prompt smuggling is real.
+  scope: "external",
   execute: async (input) => {
     const cfg = registeredConfig ?? {};
     const provider = cfg.provider ?? defaultProvider(process.env);

@@ -24,6 +24,7 @@
         "@crewhaus/canary-controller": "workspace:*",
         "@crewhaus/compiler": "workspace:*",
         "@crewhaus/compliance-controls": "workspace:*",
+        "@crewhaus/context-bundle": "workspace:*",
         "@crewhaus/crewhaus-cloud": "workspace:*",
         "@crewhaus/deployment-controller": "workspace:*",
         "@crewhaus/docker-images": "workspace:*",
@@ -294,6 +295,13 @@
         "@crewhaus/errors": "workspace:*",
       },
     },
+    "packages/compaction-curator": {
+      "name": "@crewhaus/compaction-curator",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+      },
+    },
     "packages/compaction-snip": {
       "name": "@crewhaus/compaction-snip",
       "version": "0.0.0",
@@ -345,6 +353,10 @@
       "optionalPeers": [
         "playwright",
       ],
+    },
+    "packages/context-bundle": {
+      "name": "@crewhaus/context-bundle",
+      "version": "0.0.0",
     },
     "packages/cost-tracker": {
       "name": "@crewhaus/cost-tracker",
@@ -433,6 +445,14 @@
       "dependencies": {
         "@crewhaus/checkpoint-store": "workspace:*",
         "@crewhaus/errors": "workspace:*",
+      },
+    },
+    "packages/egress-classifier": {
+      "name": "@crewhaus/egress-classifier",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/run-context": "workspace:*",
       },
     },
     "packages/embedder": {
@@ -620,6 +640,16 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/gateway-protocol": "workspace:*",
         "@crewhaus/tenancy": "workspace:*",
+      },
+    },
+    "packages/grader-12-metric-rubric": {
+      "name": "@crewhaus/grader-12-metric-rubric",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/eval-dataset": "workspace:*",
+        "@crewhaus/eval-grader": "workspace:*",
+        "@crewhaus/grader-registry": "workspace:*",
       },
     },
     "packages/grader-multimodal": {
@@ -936,6 +966,7 @@
         "@crewhaus/compaction-autocompact": "workspace:*",
         "@crewhaus/compaction-snip": "workspace:*",
         "@crewhaus/cost-tracker": "workspace:*",
+        "@crewhaus/egress-classifier": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/event-log": "workspace:*",
         "@crewhaus/hooks-engine": "workspace:*",
@@ -1160,11 +1191,11 @@
         "@crewhaus/agent-context-isolation": "workspace:*",
         "@crewhaus/boundary-classifier": "workspace:*",
         "@crewhaus/event-log": "workspace:*",
+        "@crewhaus/run-context": "workspace:*",
         "@crewhaus/runtime-core": "workspace:*",
       },
       "devDependencies": {
         "@crewhaus/permission-engine": "workspace:*",
-        "@crewhaus/run-context": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
         "zod": "^3.23.8",
@@ -1393,6 +1424,22 @@
         "@crewhaus/tool-catalog": "workspace:*",
         "zod": "^3.23.8",
       },
+    },
+    "packages/tool-codegraph": {
+      "name": "@crewhaus/tool-codegraph",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "peerDependencies": {
+        "@colbymchenry/codegraph": "*",
+      },
+      "optionalPeers": [
+        "@colbymchenry/codegraph",
+      ],
     },
     "packages/tool-contract-gateway": {
       "name": "@crewhaus/tool-contract-gateway",
@@ -1875,6 +1922,8 @@
 
     "@crewhaus/compaction-autocompact": ["@crewhaus/compaction-autocompact@workspace:packages/compaction-autocompact"],
 
+    "@crewhaus/compaction-curator": ["@crewhaus/compaction-curator@workspace:packages/compaction-curator"],
+
     "@crewhaus/compaction-snip": ["@crewhaus/compaction-snip@workspace:packages/compaction-snip"],
 
     "@crewhaus/compiler": ["@crewhaus/compiler@workspace:packages/compiler"],
@@ -1882,6 +1931,8 @@
     "@crewhaus/compliance-controls": ["@crewhaus/compliance-controls@workspace:packages/compliance-controls"],
 
     "@crewhaus/computer-use-driver": ["@crewhaus/computer-use-driver@workspace:packages/computer-use-driver"],
+
+    "@crewhaus/context-bundle": ["@crewhaus/context-bundle@workspace:packages/context-bundle"],
 
     "@crewhaus/cost-tracker": ["@crewhaus/cost-tracker@workspace:packages/cost-tracker"],
 
@@ -1900,6 +1951,8 @@
     "@crewhaus/docker-images": ["@crewhaus/docker-images@workspace:packages/docker-images"],
 
     "@crewhaus/durable-execution": ["@crewhaus/durable-execution@workspace:packages/durable-execution"],
+
+    "@crewhaus/egress-classifier": ["@crewhaus/egress-classifier@workspace:packages/egress-classifier"],
 
     "@crewhaus/embedder": ["@crewhaus/embedder@workspace:packages/embedder"],
 
@@ -1936,6 +1989,8 @@
     "@crewhaus/gateway-protocol": ["@crewhaus/gateway-protocol@workspace:packages/gateway-protocol"],
 
     "@crewhaus/gateway-server": ["@crewhaus/gateway-server@workspace:packages/gateway-server"],
+
+    "@crewhaus/grader-12-metric-rubric": ["@crewhaus/grader-12-metric-rubric@workspace:packages/grader-12-metric-rubric"],
 
     "@crewhaus/grader-multimodal": ["@crewhaus/grader-multimodal@workspace:packages/grader-multimodal"],
 
@@ -2100,6 +2155,8 @@
     "@crewhaus/tool-catalog": ["@crewhaus/tool-catalog@workspace:packages/tool-catalog"],
 
     "@crewhaus/tool-code-execution": ["@crewhaus/tool-code-execution@workspace:packages/tool-code-execution"],
+
+    "@crewhaus/tool-codegraph": ["@crewhaus/tool-codegraph@workspace:packages/tool-codegraph"],
 
     "@crewhaus/tool-contract-gateway": ["@crewhaus/tool-contract-gateway@workspace:packages/tool-contract-gateway"],
 

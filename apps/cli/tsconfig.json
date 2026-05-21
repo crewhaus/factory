@@ -15,6 +15,7 @@
     { "path": "../../packages/audit-log" },
     { "path": "../../packages/canary-controller" },
     { "path": "../../packages/compiler" },
+    { "path": "../../packages/context-bundle" },
     { "path": "../../packages/deployment-controller" },
     { "path": "../../packages/eval-dataset" },
     { "path": "../../packages/eval-grader" },

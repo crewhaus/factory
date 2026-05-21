@@ -51,7 +51,20 @@ export type AuditKind =
   | "secrets_rotation"
   | "secrets_access"
   // Section 28 — deployment-controller actions
-  | "deployment_action";
+  | "deployment_action"
+  // Pillar 3 sink-side fabric — egress-classifier emits one event per
+  // external-tool invocation. Payload shape (informally; opaque JSON):
+  //   { sinkId, sinkScope, verdict, originsFound, matchCount, originStack }
+  // The raw outbound payload is NEVER stored verbatim — only the lineage
+  // summary. The egress-classifier's `summarizeEgress(result)` produces
+  // the human-readable form that lands in the `payload_summary` field.
+  | "egress_decision"
+  // Pillar 3 intent gate — permission-engine emits one event per
+  // justification-evaluated tool call. Payload shape (opaque JSON):
+  //   { toolName, justification, verdict: "allow"|"deny", reason, judgeModel }
+  // Stored verbatim because the justification IS the audit artifact;
+  // redacting it would defeat the purpose.
+  | "permission_justification_evaluated";
 
 export type AuditRecord = {
   readonly ts: number;

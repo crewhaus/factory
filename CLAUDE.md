@@ -48,11 +48,11 @@ The active-optimization layer:
 
 Section 18's "safety floor" is necessary but not sufficient. Untrusted content can enter the system at any boundary — MCP responses, sub-agent returns, channel inbound messages, federation peer payloads, skill bodies loaded from disk, compaction summaries that absorbed earlier attacker text — and an attacker who controls one of those boundaries can lateral-move across the system if the boundary doesn't re-verify.
 
-The fabric: **[packages/boundary-classifier](packages/boundary-classifier)** is the single chokepoint. It wraps `prompt-injection-detector` with `TrustOrigin` metadata (`"user" | "mcp" | "subagent" | "channel" | "federation" | "skill" | "compaction" | "tool"`), a content-hash LRU cache, and a configurable severity policy (default: block on malicious, warn on suspicious). `RunContext.originStack` carries the origin chain so trace events record it.
+The fabric has **two symmetric halves**: a source side (classify content coming in) and a sink side (classify content going out). The OpenAI 2026-05 prompt-injection paper and SACR's 2026 runtime-security report converge on the same insight: source classification is necessary but not sufficient; an attacker who controls a source AND an accessible sink can lateral-move across the agent's permissions even when every individual permission check passes. The egress fabric (recommendation A, v0.2.x) is the symmetric companion that closes that loop.
 
-Every site that pulls externally-controlled content into the model's context must classify before injecting. The complete inventory:
+**Source-side chokepoint** — [packages/boundary-classifier](packages/boundary-classifier). It wraps `prompt-injection-detector` with `TrustOrigin` metadata (`"user" | "mcp" | "subagent" | "channel" | "federation" | "skill" | "compaction" | "tool" | "chain"`), a content-hash LRU cache, and a configurable severity policy (default: block on malicious, warn on suspicious). `RunContext.originStack` carries the origin chain so trace events record it. After a non-blocked verdict, the boundary site also calls `tagContent(ctx, content, origin)` which populates `RunContext.dataLineage` for the sink-side check.
 
-| Site | Origin | Where |
+| Source site | Origin | Where |
 |---|---|---|
 | MCP tool responses | `"mcp"` | [packages/tool-mcp](packages/tool-mcp) |
 | Sub-agent `finalMessage` | `"subagent"` | [packages/sub-agent-spawner](packages/sub-agent-spawner) |
@@ -62,13 +62,28 @@ Every site that pulls externally-controlled content into the model's context mus
 | Compaction summaries | `"compaction"` | `packages/compaction-*` |
 | Tool results | `"tool"` | [packages/runtime-core](packages/runtime-core) |
 
+**Sink-side chokepoint** — [packages/egress-classifier](packages/egress-classifier). On every external-scope tool call (`tool.scope === "external"`), `runtime-core` calls `classifyEgress(payload, ctx, { sinkId, sinkScope })`. The classifier scans `RunContext.dataLineage` for substring matches and folds the per-origin policy across all hits. The default policy is *permissive on `"user"` content, warn on configured sinks, block on dynamic sinks*. Three audit outcomes land in the trace bus and audit-log: `"egress-passed" | "egress-warned" | "egress-blocked"`.
+
+| External sink | Tool | `scope` |
+|---|---|---|
+| HTTP fetch | [packages/tool-fetch](packages/tool-fetch) | `"external"` |
+| Web search / fetch | [packages/tool-web](packages/tool-web) | `"external"` |
+| MCP tool call | [packages/tool-mcp](packages/tool-mcp) | `"external"` |
+| Channel send | [packages/tool-message-channel](packages/tool-message-channel) | `"external"` |
+| EVM tx broadcast | [packages/tool-evm-tx](packages/tool-evm-tx) | `"external"` |
+| Image generation upload | [packages/tool-image-generation](packages/tool-image-generation) | `"external"` |
+
+**Intent gate** — orthogonal third layer. Tools that set `requireJustification: true` (default: `SendMessage`, `EvmSendTransaction`, `ImageGenerate`) demand the model supply a `justification` string with each call. `permission-engine`'s `evaluateJustification` checks it against the spec's `instructions` (the goal an attacker cannot influence) via a configurable judge — rule-based by default, LLM-backed in production. Audit kind: `permission_justification_evaluated`. SACR's three-layer model (deterministic governance → behavioral analysis → non-deterministic governance) lands its third layer here; recipe [demos/recipes/53-justification-gates.md](https://github.com/crewhaus/demos/blob/main/recipes/53-justification-gates.md) walks through it.
+
 **Contributor rules:**
 
-1. **Any new module that ingests external content registers a `TrustOrigin`** in `packages/boundary-classifier/src/origins.ts` and calls `classifyBoundary` before the content reaches a model call or a tool result.
-2. **Authentication ≠ classification.** mTLS, JWT, and signed cookies verify *who* sent something; they say nothing about *what* the content contains. Classify after authenticating.
-3. **The content-hash cache must not be bypassed for performance**; if you find yourself reaching past the classifier, you've made a security regression, not an optimization.
-4. **`tool-task` keeps `classifyOutput: false`** because the sub-agent's return is already classified at the spawner boundary. Don't add a second pass at the tool layer — double-classification produces double warnings and burns the cache.
-5. **Severity defaults**: malicious → replace with redaction notice; suspicious → keep + log + emit `permission_decision` trace event. Override only via explicit `opts.severity`.
+1. **Any new module that ingests external content registers a `TrustOrigin`** in `packages/boundary-classifier/src/origins.ts`, calls `classifyBoundary` before the content reaches a model call or a tool result, AND calls `tagContent(ctx, content, origin)` after a non-blocked verdict so the sink-side classifier sees it.
+2. **Any new tool that crosses a process or network boundary sets `scope: "external"`** in its `ToolDefinition`. Tools default to `"internal"` at normalization, so forgetting this is silently insecure — the §41 `crewhaus doctor` philosophy-alignment check catches it.
+3. **Destructive or visible-side-effect tools should set `requireJustification: true`** — `SendMessage`, `EvmSendTransaction`, `ImageGenerate`, and federation outbound tools all do.
+4. **Authentication ≠ classification.** mTLS, JWT, and signed cookies verify *who* sent something; they say nothing about *what* the content contains. Classify after authenticating.
+5. **The content-hash cache must not be bypassed for performance**; if you find yourself reaching past the classifier, you've made a security regression, not an optimization.
+6. **`tool-task` keeps `classifyOutput: false`** because the sub-agent's return is already classified at the spawner boundary. Don't add a second pass at the tool layer — double-classification produces double warnings and burns the cache.
+7. **Severity defaults**: malicious → replace with redaction notice; suspicious → keep + log + emit `permission_decision` trace event. Override only via explicit `opts.severity` for the source side, `opts.override` for the sink side.
 
 ## Cross-cutting expectations
 
@@ -82,7 +97,12 @@ Every site that pulls externally-controlled content into the model's context mus
 
 - **New target shape?** → `packages/ir/`, `packages/compiler/`, `packages/target-cli/` (smallest target), [COMPILER-ARCHITECTURE.md](https://github.com/crewhaus/docs/blob/main/COMPILER-ARCHITECTURE.md).
 - **New eval grader?** → `packages/eval-grader/`, `packages/grader-registry/`, [recipes/34-building-custom-graders.md](https://github.com/crewhaus/demos/blob/main/recipes/34-building-custom-graders.md).
-- **New tool?** → `packages/tool-builder/`, `packages/tool-catalog/`, [module-briefs/047-tool-builder.md](https://github.com/crewhaus/docs/blob/main/module-briefs/047-tool-builder.md).
+- **Canonical eval rubric?** → `packages/grader-12-metric-rubric/` ships the 12-metric framework from TDS's 100+-deployment paper with industry-validated thresholds; install it with one call: `register12MetricRubric(graderRegistry)`. See [recipes/12-eval-harness.md](https://github.com/crewhaus/demos/blob/main/recipes/12-eval-harness.md).
+- **New tool?** → `packages/tool-builder/`, `packages/tool-catalog/` — remember to set `scope: "external"` if the tool crosses a network/process boundary, `requireJustification: true` if it has destructive or visible side effects. [module-briefs/047-tool-builder.md](https://github.com/crewhaus/docs/blob/main/module-briefs/047-tool-builder.md).
 - **New channel?** → `packages/channel-adapter-base/`, an existing adapter like `channel-adapter-slack`, [recipes/37-channel-telegram.md](https://github.com/crewhaus/demos/blob/main/recipes/37-channel-telegram.md).
-- **New trust boundary?** → `packages/boundary-classifier/`, [recipes/41-security-fabric.md](https://github.com/crewhaus/demos/blob/main/recipes/41-security-fabric.md).
+- **New trust source boundary?** → `packages/boundary-classifier/`, call `tagContent` after a non-blocked verdict so the sink side sees it, [recipes/41-security-fabric.md](https://github.com/crewhaus/demos/blob/main/recipes/41-security-fabric.md).
+- **New external sink / egress check?** → `packages/egress-classifier/`, mark the tool `scope: "external"`, [recipes/51-egress-fabric.md](https://github.com/crewhaus/demos/blob/main/recipes/51-egress-fabric.md).
+- **Justification-gated tool?** → `packages/permission-engine/`, set `requireJustification: true` on the tool descriptor, supply an LLM-backed `justificationJudge` to `runChatLoop` for production, [recipes/53-justification-gates.md](https://github.com/crewhaus/demos/blob/main/recipes/53-justification-gates.md).
+- **Active context curation (pre-compaction)?** → `packages/compaction-curator/`, opt in via `spec.compaction.curate: true`, [recipes/52-context-curation.md](https://github.com/crewhaus/demos/blob/main/recipes/52-context-curation.md).
+- **AST-aware code intelligence?** → `packages/tool-codegraph/`, install the optional peer `@colbymchenry/codegraph`, [recipes/54-codegraph-tool.md](https://github.com/crewhaus/demos/blob/main/recipes/54-codegraph-tool.md).
 - **Eval-driven optimization?** → `packages/eval-optimizer-orchestrator/`, [recipes/42-active-optimization.md](https://github.com/crewhaus/demos/blob/main/recipes/42-active-optimization.md).

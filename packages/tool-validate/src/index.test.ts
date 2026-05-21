@@ -16,6 +16,8 @@ const tool: RegisteredTool = {
   destructive: false,
   requiresSandbox: false,
   classifyOutput: true,
+  scope: "internal",
+  requireJustification: false,
 };
 
 describe("validateToolInput — success", () => {

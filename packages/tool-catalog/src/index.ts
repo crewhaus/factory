@@ -50,6 +50,24 @@ export type ToolResultContentBlock = ToolResultTextBlock | ToolResultImageBlock;
 export type ToolResultContent = ReadonlyArray<ToolResultContentBlock>;
 export type ToolExecuteResult = string | ToolResultContent;
 
+/**
+ * Pillar 3 sink-side fabric — where a tool's effect lands.
+ *
+ * - `"internal"`: the tool reads/writes process-local state only
+ *   (filesystem, sandboxed code execution, memory, todo, code-graph
+ *   index). Egress classifier skips internal tools.
+ * - `"external"`: the tool transmits data to a sink the runtime cannot
+ *   re-classify after the fact — a URL fetched, a channel message sent,
+ *   a federation outbound payload, an MCP tool invocation, an EVM tx
+ *   broadcast, an image upload. Every such call routes through
+ *   `egress-classifier` first.
+ *
+ * Default at normalization is `"internal"` (fails closed). Tools that
+ * cross a process or network boundary MUST set `"external"` explicitly
+ * in their `ToolDefinition`.
+ */
+export type ToolScope = "internal" | "external";
+
 export interface ToolDefinition<TInput = unknown> {
   name: string;
   description: string;
@@ -76,6 +94,27 @@ export interface ToolDefinition<TInput = unknown> {
    */
   classifyOutput?: boolean;
   /**
+   * Pillar 3 sink-side — see `ToolScope`. Default `"internal"` at
+   * normalization. Set `"external"` for any tool whose effect leaves the
+   * process boundary unmonitored.
+   */
+  scope?: ToolScope;
+  /**
+   * Pillar 3 intent gate — when true, runtime-core demands the model
+   * supply a `justification` string in the tool's input alongside the
+   * declared schema, and `permission-engine` evaluates the justification
+   * against the session's stated goal via an LLM-as-judge. Failures emit
+   * `permission_justification_evaluated` audit events and deny the call.
+   *
+   * Default at normalization is `false`. Recommended `true` for any tool
+   * with destructive or external side effects (evm-tx, message-channel,
+   * federation outbound). Independent of `scope` — a tool can be
+   * `internal` and still require justification (e.g. a destructive fs
+   * delete), and a tool can be `external` without requiring justification
+   * (e.g. a read-only public-data fetch).
+   */
+  requireJustification?: boolean;
+  /**
    * Authoritative JSON Schema for the tool's input. When set, runtime-core
    * forwards this verbatim to the model instead of running
    * `zodToJsonSchema(inputSchema)`. Used by tools whose canonical schema is
@@ -100,6 +139,17 @@ export interface RegisteredTool {
   requiresSandbox: boolean;
   /** Section 18 — defaults to true so post-tool classification runs. */
   classifyOutput: boolean;
+  /**
+   * Pillar 3 sink-side — fails closed (`"internal"`) when omitted. Tools
+   * that cross a process or network boundary MUST set `"external"`
+   * explicitly in their `ToolDefinition`.
+   */
+  scope: ToolScope;
+  /**
+   * Pillar 3 intent gate — fails closed (false) when omitted. See
+   * `ToolDefinition.requireJustification`.
+   */
+  requireJustification: boolean;
   /** See ToolDefinition.jsonSchema. Optional; runtime-core falls back to
    *  zodToJsonSchema(inputSchema) when absent. */
   jsonSchema?: unknown;
