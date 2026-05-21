@@ -76,6 +76,19 @@ export type IrToolConfigs = Readonly<Record<string, unknown>>;
  */
 export type IrCompaction = {
   readonly model?: string;
+  /** Pillar 2 — when true, target emitters wire `compaction-curator`
+   *  as a pre-pass before the autocompact threshold check. The spec
+   *  layer accepts this verbatim (validated in `packages/spec`); the
+   *  IR holds it as an opt-in flag with no default so emitters can
+   *  distinguish "user said false" from "user didn't say". */
+  readonly curate?: boolean;
+  /** Cosine threshold for the curator's dedupe pass. Curator's own
+   *  default (0.92, `DEFAULT_DEDUPE_THRESHOLD` in
+   *  `@crewhaus/compaction-curator`) applies when undefined. */
+  readonly dedupeThreshold?: number;
+  /** Top-K cap for the curator's relevance reorder. Undefined means
+   *  reorder without trimming. */
+  readonly relevanceTopK?: number;
 };
 
 /**

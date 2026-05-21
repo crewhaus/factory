@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { SpecParseError, compile } from "./index";
+import { parseSpec } from "@crewhaus/spec";
+import { SpecParseError, compile, lower } from "./index";
 
 const MINIMAL_SPEC = `
 name: hello
@@ -363,5 +364,76 @@ permissions:
     expect(daemon).toContain("defaultCatalog.register(sendMessage);");
     const agent = bundle.files.find((f) => f.path === "agent.ts")?.content ?? "";
     expect(agent).toContain('pattern: "SendMessage"');
+  });
+});
+
+describe("lower — compaction block (Pillar 2 curator wiring)", () => {
+  test("preserves curator fields verbatim on the IR", () => {
+    const spec = parseSpec(`
+name: hello
+target: cli
+agent:
+  model: claude-sonnet-4-6
+  instructions: be helpful
+compaction:
+  model: claude-haiku-4
+  curate: true
+  dedupeThreshold: 0.85
+  relevanceTopK: 7
+`);
+    const ir = lower(spec);
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect(ir.compaction).toEqual({
+      model: "claude-haiku-4",
+      curate: true,
+      dedupeThreshold: 0.85,
+      relevanceTopK: 7,
+    });
+  });
+
+  test("omits undefined curator fields from the IR (no false defaults)", () => {
+    const spec = parseSpec(`
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+compaction:
+  curate: true
+`);
+    const ir = lower(spec);
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect(ir.compaction).toEqual({ curate: true });
+    expect("dedupeThreshold" in ir.compaction).toBe(false);
+    expect("relevanceTopK" in ir.compaction).toBe(false);
+    expect("model" in ir.compaction).toBe(false);
+  });
+
+  test("empty compaction object lowers to empty IR compaction", () => {
+    const spec = parseSpec(`
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+`);
+    const ir = lower(spec);
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect(ir.compaction).toEqual({});
+  });
+
+  test("compile() succeeds end-to-end with curator config (no emitter rejection)", () => {
+    const bundle = compile(`
+name: hello
+target: cli
+agent:
+  model: claude-sonnet-4-6
+  instructions: be helpful
+compaction:
+  curate: true
+  dedupeThreshold: 0.9
+  relevanceTopK: 10
+`);
+    expect(bundle.files).toHaveLength(1);
   });
 });
