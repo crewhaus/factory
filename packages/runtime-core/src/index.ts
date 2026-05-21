@@ -16,16 +16,20 @@ import type {
 import { type WrappedAdapter, wrap as wrapWithCircuitBreaker } from "@crewhaus/circuit-breaker";
 import { autoCompact } from "@crewhaus/compaction-autocompact";
 import { snip } from "@crewhaus/compaction-snip";
+import { type EgressVerdict, classifyEgress, summarizeEgress } from "@crewhaus/egress-classifier";
 import { RuntimeError } from "@crewhaus/errors";
 import { type EventKind, type EventLog, openEventLog } from "@crewhaus/event-log";
 import { type HookDef, type HookEvent, aggregateDecisions, runHooks } from "@crewhaus/hooks-engine";
 import { resolveModel } from "@crewhaus/model-router";
 import {
   BUILTIN_DEFAULT_RULES,
+  type JustificationJudge,
   type PermissionMode,
   type RuleSet,
   emptyRuleSet,
+  evaluateJustification,
   evaluateWithReason,
+  ruleBasedJustificationJudge,
 } from "@crewhaus/permission-engine";
 import { manage as manageCacheMarkers } from "@crewhaus/prompt-cache-manager";
 import {
@@ -40,7 +44,7 @@ import {
   initialRecoveryState,
   recover,
 } from "@crewhaus/recovery-engine";
-import { type RunContext, createRunContext } from "@crewhaus/run-context";
+import { type RunContext, createRunContext, tagContent } from "@crewhaus/run-context";
 import { type SessionStore, createSessionStore } from "@crewhaus/session-store";
 import { type SkillRef, formatSkillsForPrompt } from "@crewhaus/skills-registry";
 import { type SlashCommand, expand as expandSlash } from "@crewhaus/slash-commands";
@@ -361,6 +365,15 @@ export type RunChatLoopOptions = {
   promptInjectionLlmClassifier?: (
     text: string,
   ) => Promise<{ verdict: "clean" | "suspicious" | "malicious"; rationale?: string } | undefined>;
+  /**
+   * Pillar 3 intent gate — when supplied, runtime-core wires this judge
+   * into `evaluateJustification` for every tool call whose descriptor
+   * sets `requireJustification: true`. Defaults to the rule-based judge
+   * exported by `permission-engine`. Production deployments should pass
+   * an LLM-backed judge that compares the agent's stated justification
+   * against the session goal with model-quality reasoning.
+   */
+  justificationJudge?: JustificationJudge;
   /**
    * Section 27 — wrap the resolved primary `ProviderAdapter` in a circuit
    * breaker before any `stream()` call. When the breaker trips, subsequent
@@ -847,6 +860,106 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       });
     }
 
+    // Pillar 3 intent gate — when the tool descriptor demands a justification,
+    // require the model to include one in the input and evaluate it via the
+    // configured judge (rule-based by default; runtime callers can pass an
+    // LLM-backed judge for production). The justification is captured to
+    // audit-log verbatim. The session goal we compare against is the spec's
+    // `instructions` field — fixed at compile time, not influenced by runtime
+    // input, so an attacker who controls the user prompt cannot also
+    // re-define the goal under which their justification gets scored.
+    if (tool.requireJustification === true) {
+      const input = tu.input as Record<string, unknown> | undefined;
+      const rawJustification = input?.["justification"];
+      const justification = typeof rawJustification === "string" ? rawJustification : "";
+      const judge = opts.justificationJudge ?? ruleBasedJustificationJudge;
+      const verdict = await evaluateJustification(
+        {
+          toolName: tu.name,
+          justification,
+          sessionGoal: opts.instructions ?? "",
+          input: tu.input,
+        },
+        judge,
+      );
+      bus.publish({
+        ...bus.envelope(),
+        kind: "permission_decision",
+        toolName: tu.name,
+        decision: verdict.allow ? "allow" : "deny",
+        mode: permissionMode,
+        reason: `justification: ${verdict.reason} [judge=${verdict.judgeModel}]`,
+      });
+      runContext.logger.info("justification evaluated", {
+        toolUseId: tu.id,
+        toolName: tu.name,
+        allow: verdict.allow,
+        judgeModel: verdict.judgeModel,
+        confidence: verdict.confidence,
+      });
+      if (!verdict.allow) {
+        return finish({
+          type: "tool_result",
+          tool_use_id: tu.id,
+          content: `[justification denied] ${verdict.reason}. Reformulate the call with a justification that ties to the session's declared goal, or omit this tool from the call.`,
+          is_error: true,
+        });
+      }
+    }
+
+    // Pillar 3 sink-side fabric — for tools that transmit to an external
+    // sink, scan the input payload against the run-context's data-lineage
+    // map. A `block` verdict means the payload contains content that was
+    // tagged from a non-`"user"` origin and policy disallows transmission;
+    // we deny the call before it fires. `warn` logs but proceeds.
+    //
+    // The runtime treats every external tool as `"external-configured"`
+    // (the spec listed it). Dynamically-discovered sinks (an MCP server
+    // the agent loaded mid-session) should use `"external-dynamic"` to
+    // get stricter default policy; that wiring lives in `tool-mcp`'s
+    // dynamic-tool path and is a v0.3.x follow-up.
+    if (tool.scope === "external") {
+      const payload = JSON.stringify(tu.input ?? null);
+      const egress = await classifyEgress(payload, runContext, {
+        sinkId: tu.name,
+        sinkScope: "external-configured",
+      });
+      const egressOutcome =
+        egress.verdict === "pass"
+          ? "egress-passed"
+          : egress.verdict === "warn"
+            ? "egress-warned"
+            : "egress-blocked";
+      bus.publish({
+        ...bus.envelope(),
+        kind: "permission_decision",
+        toolName: tu.name,
+        decision: egress.verdict === "block" ? "deny" : "allow",
+        mode: permissionMode,
+        outcome: egressOutcome,
+        ...(egress.originsFound.length > 0 ? { reason: `egress: ${summarizeEgress(egress)}` } : {}),
+      });
+      if (egress.verdict !== "pass") {
+        runContext.logger.warn("egress classification non-clean", {
+          toolUseId: tu.id,
+          toolName: tu.name,
+          verdict: egress.verdict satisfies EgressVerdict,
+          originsFound: egress.originsFound,
+          matchCount: egress.matchCount,
+        });
+      }
+      if (egress.verdict === "block") {
+        return finish({
+          type: "tool_result",
+          tool_use_id: tu.id,
+          content:
+            "[egress denied] outbound payload contains content tagged from a non-user origin under a strict-policy sink. " +
+            "Inspect the prior tool/sub-agent results that fed this call's input; the egress classifier's `dataLineage` records which boundary site introduced the flagged substring.",
+          is_error: true,
+        });
+      }
+    }
+
     const toolAbort = turnAbort.child();
     // Build the bridge for this call. Skipped (left undefined) when no
     // spawnSubAgent injection is provided — non-Task tools don't need it.
@@ -912,6 +1025,23 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       stored.previewContent,
       raw.isError,
     );
+    // Pillar 3 sink-side fabric — tag the (post-classification) tool result
+    // into run-context's dataLineage so the egress classifier can detect
+    // exfiltration of this content on a subsequent external-tool call.
+    // Skipped for the in-process Task wrapper (`classifyOutput: false`)
+    // because the sub-agent's finalMessage is already tagged at the
+    // sub-agent-spawner boundary with the more-specific "subagent" origin.
+    // MCP tools tag separately inside tool-mcp with the "mcp" origin so
+    // their lineage carries the more-precise provenance.
+    if (tool.classifyOutput !== false && !raw.isError) {
+      const taggable =
+        typeof finalPreview === "string"
+          ? finalPreview
+          : finalPreview.map((b) => (b.type === "text" ? b.text : "")).join("\n");
+      if (taggable.length > 0) {
+        tagContent(runContext, taggable, "tool");
+      }
+    }
     return finish({
       type: "tool_result",
       tool_use_id: tu.id,

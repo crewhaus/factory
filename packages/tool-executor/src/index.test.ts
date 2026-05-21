@@ -16,6 +16,8 @@ function makeEchoTool(overrides?: Partial<RegisteredTool>): RegisteredTool {
     destructive: false,
     requiresSandbox: false,
     classifyOutput: true,
+    scope: "internal",
+    requireJustification: false,
     ...overrides,
   };
 }

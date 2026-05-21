@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { createLogger } from "@crewhaus/logging";
 import { TraceEventBus } from "@crewhaus/trace-event-bus";
-import { createRunContext } from "./index";
+import { DATA_LINEAGE_CAP, createRunContext, pushOrigin, tagContent } from "./index";
 
 describe("createRunContext defaults", () => {
   test("generates run/session ids with expected prefixes", () => {
@@ -84,5 +84,74 @@ describe("createRunContext eventBus", () => {
     const bus = new TraceEventBus({ runId: "run_custom", sessionId: "sess_custom" });
     const ctx = createRunContext({ runId: "run_custom", sessionId: "sess_custom", eventBus: bus });
     expect(ctx.eventBus).toBe(bus);
+  });
+});
+
+describe("pushOrigin", () => {
+  test("appends to undefined originStack", () => {
+    const ctx = createRunContext();
+    const next = pushOrigin(ctx, "subagent");
+    expect(next.originStack).toEqual(["subagent"]);
+    expect(ctx.originStack).toBeUndefined();
+  });
+
+  test("appends to existing originStack without mutating input", () => {
+    const ctx = createRunContext({ originStack: ["subagent"] });
+    const next = pushOrigin(ctx, "mcp");
+    expect(next.originStack).toEqual(["subagent", "mcp"]);
+    expect(ctx.originStack).toEqual(["subagent"]);
+  });
+});
+
+describe("tagContent (Pillar 3 data-lineage)", () => {
+  test("lazy-creates dataLineage on first tag", () => {
+    const ctx = createRunContext();
+    expect(ctx.dataLineage).toBeUndefined();
+    tagContent(ctx, "subagent-returned payload of meaningful length", "subagent");
+    expect(ctx.dataLineage).toBeInstanceOf(Map);
+    expect(ctx.dataLineage?.size).toBe(1);
+  });
+
+  test("records origin per tagged string", () => {
+    const ctx = createRunContext();
+    tagContent(ctx, "first tagged string from a subagent return", "subagent");
+    tagContent(ctx, "second tagged string from an MCP tool result", "mcp");
+    expect(ctx.dataLineage?.get("first tagged string from a subagent return")).toBe("subagent");
+    expect(ctx.dataLineage?.get("second tagged string from an MCP tool result")).toBe("mcp");
+  });
+
+  test("ignores content shorter than 16 chars (egress-floor parity)", () => {
+    const ctx = createRunContext();
+    tagContent(ctx, "tiny", "subagent");
+    expect(ctx.dataLineage).toBeUndefined();
+  });
+
+  test("re-tagging refreshes recency (most-recent insertion order)", () => {
+    const ctx = createRunContext();
+    tagContent(ctx, "first string of taggable length here", "subagent");
+    tagContent(ctx, "second string of taggable length here", "mcp");
+    tagContent(ctx, "first string of taggable length here", "subagent"); // refresh
+    const keys = [...(ctx.dataLineage?.keys() ?? [])];
+    // After refresh, "first..." should be the most-recent (last in iteration).
+    expect(keys[keys.length - 1]).toBe("first string of taggable length here");
+  });
+
+  test("evicts oldest beyond DATA_LINEAGE_CAP", () => {
+    const ctx = createRunContext();
+    for (let i = 0; i < DATA_LINEAGE_CAP + 5; i++) {
+      tagContent(ctx, `tagged string number ${i.toString().padStart(4, "0")} payload`, "subagent");
+    }
+    expect(ctx.dataLineage?.size).toBe(DATA_LINEAGE_CAP);
+    // The first 5 should have been evicted.
+    expect(ctx.dataLineage?.has("tagged string number 0000 payload")).toBe(false);
+    expect(ctx.dataLineage?.has("tagged string number 0004 payload")).toBe(false);
+    expect(ctx.dataLineage?.has("tagged string number 0005 payload")).toBe(true);
+  });
+
+  test("ignores non-string input gracefully", () => {
+    const ctx = createRunContext();
+    // biome-ignore lint/suspicious/noExplicitAny: testing runtime guard
+    tagContent(ctx, 123 as any, "subagent");
+    expect(ctx.dataLineage).toBeUndefined();
   });
 });

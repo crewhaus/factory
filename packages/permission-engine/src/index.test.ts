@@ -1,14 +1,17 @@
 import { describe, expect, test } from "bun:test";
 import {
   BUILTIN_DEFAULT_RULES,
+  type JustificationJudge,
   PermissionConfigError,
   type PermissionRule,
   type RuleSet,
   type ToolCallContext,
   emptyRuleSet,
   evaluate,
+  evaluateJustification,
   evaluateWithReason,
   parsePermissionsConfig,
+  ruleBasedJustificationJudge,
   tagRules,
 } from "./index";
 
@@ -338,5 +341,90 @@ describe("Section 18 — requiresSandbox floor", () => {
     });
     // readCall doesn't set requiresSandbox; floor doesn't apply.
     expect(r.decision).toBe("ask");
+  });
+});
+
+describe("Pillar 3 — ruleBasedJustificationJudge", () => {
+  test("denies brief justifications", async () => {
+    const v = await evaluateJustification({
+      toolName: "SendMessage",
+      justification: "ok",
+      sessionGoal: "summarize the user's emails",
+      input: {},
+    });
+    expect(v.allow).toBe(false);
+    expect(v.reason).toMatch(/too brief/);
+    expect(v.judgeModel).toBe("rule-based");
+  });
+
+  test("allows when no session goal is supplied (audit-only path)", async () => {
+    const v = await evaluateJustification({
+      toolName: "SendMessage",
+      justification: "user wants a confirmation message sent to slack #team",
+      sessionGoal: "",
+      input: {},
+    });
+    expect(v.allow).toBe(true);
+    expect(v.confidence).toBe(0);
+  });
+
+  test("denies when justification shares no salient tokens with goal", async () => {
+    const v = await evaluateJustification({
+      toolName: "EvmSendTransaction",
+      justification: "broadcasting a transaction to mint the new NFT collection",
+      sessionGoal: "summarize the customer's recent email correspondence",
+      input: {},
+    });
+    expect(v.allow).toBe(false);
+    expect(v.reason).toMatch(/no salient tokens/);
+  });
+
+  test("allows when justification overlaps the goal", async () => {
+    const v = await evaluateJustification({
+      toolName: "SendMessage",
+      justification: "post the email summary to the #customer-success channel",
+      sessionGoal: "summarize the customer's recent email correspondence",
+      input: {},
+    });
+    expect(v.allow).toBe(true);
+    expect(v.confidence ?? 0).toBeGreaterThan(0);
+  });
+
+  test("custom judge overrides the default", async () => {
+    const custom: JustificationJudge = () => ({
+      allow: false,
+      reason: "denied by test judge",
+      judgeModel: "test-judge",
+    });
+    const v = await evaluateJustification(
+      {
+        toolName: "SendMessage",
+        justification: "long enough justification text here",
+        sessionGoal: "long enough justification text here",
+        input: {},
+      },
+      custom,
+    );
+    expect(v.allow).toBe(false);
+    expect(v.judgeModel).toBe("test-judge");
+  });
+
+  test("async judge is awaited", async () => {
+    const asyncJudge: JustificationJudge = async () => ({
+      allow: true,
+      reason: "async ok",
+      judgeModel: "async-test",
+    });
+    const v = await evaluateJustification(
+      {
+        toolName: "X",
+        justification: "long enough justification text here",
+        sessionGoal: "long enough justification text here",
+        input: {},
+      },
+      asyncJudge,
+    );
+    expect(v.allow).toBe(true);
+    expect(v.judgeModel).toBe("async-test");
   });
 });

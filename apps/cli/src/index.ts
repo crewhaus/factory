@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import type { SubAgentDefinition } from "@crewhaus/agent-context-isolation";
 import { SpecParseError, compile, lower } from "@crewhaus/compiler";
+import { buildContextBundle, discoverRoots } from "@crewhaus/context-bundle";
 import { loadDataset } from "@crewhaus/eval-dataset";
 import { parseGradersConfig } from "@crewhaus/eval-grader";
 import { optimizeSpec } from "@crewhaus/eval-optimizer-orchestrator";
@@ -87,6 +88,17 @@ const INIT_SCHEMA: ParseArgsSchema = {
 const DOCTOR_SCHEMA: ParseArgsSchema = {
   flags: [
     { name: "philosophy-alignment", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
+const CONTEXT_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "bundle", takesValue: false },
+    { name: "out", short: "o", takesValue: true },
+    { name: "factory-root", takesValue: true },
+    { name: "docs-root", takesValue: true },
+    { name: "demos-root", takesValue: true },
     { name: "help", short: "h" },
   ],
 };
@@ -235,6 +247,8 @@ function usage(): never {
       "       [-o <out-dir>]",
       "  init [name]                          scaffold a new crewhaus.yaml",
       "  doctor                               check environment health",
+      "  context --bundle [-o <file>]         emit a single-markdown orientation manifest",
+      "       [--factory-root <p>] [--docs-root <p>] [--demos-root <p>]",
       "  cost-summary --session <id>          summarize cost_accrual events for a session",
       "  secrets doctor                       list known secrets via the configured backend",
       "  secrets rotate <name> [--value V]    rotate a named secret (file or vault backend)",
@@ -679,6 +693,63 @@ function checkBunVersion(version: string): { pass: boolean; reason?: string } {
   }
   const ok = major > 1 || (major === 1 && minor >= 2);
   return ok ? { pass: true } : { pass: false, reason: `bun ${version} is below minimum 1.2.0` };
+}
+
+function runContext(args: ParsedArgs): void {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus context --bundle [-o <file>]\n" +
+        "  Emits a single-markdown manifest of the spec schema, recipe index,\n" +
+        "  module catalog headings, and getting-started guide. Designed for\n" +
+        "  piping into an agent's system prompt or for caching as the answer\n" +
+        '  to "give me CrewHaus context."\n' +
+        "\n" +
+        "  --factory-root <p>   override factory checkout (default: $CREWHAUS_FACTORY_ROOT\n" +
+        "                       or sibling-walk from cwd)\n" +
+        "  --docs-root <p>      override docs checkout\n" +
+        "  --demos-root <p>     override demos checkout\n",
+    );
+    return;
+  }
+  if (args.flags["bundle"] !== true) {
+    die("missing --bundle (the only mode currently supported)");
+  }
+
+  const factoryOverride = args.flags["factory-root"];
+  const docsOverride = args.flags["docs-root"];
+  const demosOverride = args.flags["demos-root"];
+  const env = {
+    ...process.env,
+    ...(typeof factoryOverride === "string" ? { CREWHAUS_FACTORY_ROOT: factoryOverride } : {}),
+    ...(typeof docsOverride === "string" ? { CREWHAUS_DOCS_ROOT: docsOverride } : {}),
+    ...(typeof demosOverride === "string" ? { CREWHAUS_DEMOS_ROOT: demosOverride } : {}),
+  };
+
+  let roots: ReturnType<typeof discoverRoots>;
+  try {
+    roots = discoverRoots({ env });
+  } catch (err) {
+    die((err as Error).message);
+  }
+
+  const bundle = buildContextBundle({
+    factoryRoot: roots.factoryRoot,
+    docsRoot: roots.docsRoot,
+    demosRoot: roots.demosRoot,
+  });
+
+  const outFile = args.flags["out"];
+  if (typeof outFile === "string") {
+    const abs = resolve(outFile);
+    const dir = dirname(abs);
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    writeFileSync(abs, bundle.markdown);
+    process.stderr.write(
+      `wrote bundle: ${abs} (${bundle.markdown.length} chars, ${bundle.sources.length} sources)\n`,
+    );
+    return;
+  }
+  process.stdout.write(bundle.markdown);
 }
 
 function runDoctor(args: ParsedArgs): void {
@@ -1787,6 +1858,9 @@ switch (subcommand) {
     break;
   case "doctor":
     runDoctor(parseFor(rest, DOCTOR_SCHEMA));
+    break;
+  case "context":
+    runContext(parseFor(rest, CONTEXT_SCHEMA));
     break;
   case "cost-summary":
     await runCostSummary(parseFor(rest, COST_SUMMARY_SCHEMA));

@@ -72,6 +72,26 @@ describe("buildTool — fail-closed defaults", () => {
     const tool = buildTool({ ...echoDef, classifyOutput: false });
     expect(tool.classifyOutput).toBe(false);
   });
+
+  test("scope defaults to 'internal' (Pillar 3 sink-side, fail-closed)", () => {
+    const tool = buildTool(echoDef);
+    expect(tool.scope).toBe("internal");
+  });
+
+  test("scope='external' is preserved", () => {
+    const tool = buildTool({ ...echoDef, scope: "external" });
+    expect(tool.scope).toBe("external");
+  });
+
+  test("requireJustification defaults to false (Pillar 3 intent gate, fail-closed)", () => {
+    const tool = buildTool(echoDef);
+    expect(tool.requireJustification).toBe(false);
+  });
+
+  test("requireJustification=true is preserved", () => {
+    const tool = buildTool({ ...echoDef, requireJustification: true });
+    expect(tool.requireJustification).toBe(true);
+  });
 });
 
 describe("buildTool — identity fields", () => {

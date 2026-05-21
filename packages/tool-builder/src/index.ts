@@ -28,6 +28,15 @@ export function buildTool<TInput>(def: ToolDefinition<TInput>): RegisteredTool {
     // opt out explicitly.
     requiresSandbox: def.requiresSandbox ?? false,
     classifyOutput: def.classifyOutput ?? true,
+    // Pillar 3 sink-side fabric: fail-closed at "internal" so tools that
+    // actually cross a network/process boundary must opt in to "external"
+    // explicitly. egress-classifier reads this flag to decide whether to
+    // route the call's payload through its substring scan.
+    scope: def.scope ?? "internal",
+    // Pillar 3 intent gate: fail-closed at false. Destructive or external
+    // tools should opt in explicitly (see tool-fetch, tool-evm-tx,
+    // tool-message-channel, federation-router).
+    requireJustification: def.requireJustification ?? false,
     ...(def.jsonSchema !== undefined ? { jsonSchema: def.jsonSchema } : {}),
   };
 }

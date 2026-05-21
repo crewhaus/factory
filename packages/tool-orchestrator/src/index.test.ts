@@ -15,6 +15,8 @@ function makeTool(overrides: Partial<RegisteredTool> & { name: string }): Regist
     destructive: false,
     requiresSandbox: false,
     classifyOutput: true,
+    scope: "internal",
+    requireJustification: false,
     ...overrides,
   };
 }

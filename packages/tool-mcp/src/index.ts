@@ -76,6 +76,13 @@ export function buildMcpRegisteredTool(
     concurrencySafe: flags.concurrencySafe,
     readOnly: flags.readOnly,
     destructive: flags.destructive,
+    // Pillar 3 sink-side: every MCP call is an external sink. The MCP
+    // protocol gives us no visibility into what the remote server actually
+    // does with its arguments — egress-classifier defaults to "external"
+    // scope and treats dynamically-registered servers as
+    // "external-dynamic" (strict policy) while spec-configured servers are
+    // "external-configured".
+    scope: "external",
     execute: async (input, ctx) => {
       const client = host.getClient(serverName);
       const args = (input ?? {}) as Record<string, unknown>;

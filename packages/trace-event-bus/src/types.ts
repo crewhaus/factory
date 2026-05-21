@@ -144,12 +144,19 @@ export type PermissionDecisionEvent = TraceEventEnvelope & {
   /**
    * Section 18 — set when runtime-core's post-tool prompt-injection
    * classifier alters the tool result before it reaches the model.
-   *   "redacted" — the tool output was replaced with a redaction notice
-   *   "warned"   — the output was kept but a one-shot system warning was
-   *                appended for the model
+   *   "redacted"      — the tool output was replaced with a redaction notice
+   *   "warned"        — the output was kept but a one-shot system warning was
+   *                     appended for the model
+   * Pillar 3 sink-side egress fabric — set when the egress classifier
+   * decides on an external-scope tool call.
+   *   "egress-passed" — payload contained no tagged cross-origin content
+   *   "egress-warned" — tagged content found; the configured-sink policy
+   *                     allows transmission but logs the lineage
+   *   "egress-blocked" — tagged content found; the dynamic-sink policy
+   *                     blocks transmission; the tool call was denied
    * Absent on ordinary permission decisions.
    */
-  outcome?: "redacted" | "warned";
+  outcome?: "redacted" | "warned" | "egress-passed" | "egress-warned" | "egress-blocked";
   /** Section 18 — names of detector rules that fired, when outcome is set. */
   rules?: ReadonlyArray<string>;
 };

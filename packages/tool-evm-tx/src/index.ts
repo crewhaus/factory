@@ -122,6 +122,12 @@ export const evmSendTransaction: RegisteredTool = buildTool({
   inputSchema: sendTxSchema,
   destructive: true,
   classifyOutput: true,
+  // Pillar 3 sink-side: broadcasting a tx writes data permanently to a
+  // public ledger — the most-external sink we have.
+  scope: "external",
+  // Pillar 3 intent gate: tx broadcast is destructive AND irreversible AND
+  // costs money. Mandatory justification gate.
+  requireJustification: true,
   execute: async (input) => {
     const wallet = requireWallet(input.walletId, "EvmSendTransaction");
     const policy = requirePolicy("EvmSendTransaction");

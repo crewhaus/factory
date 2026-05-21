@@ -329,6 +329,10 @@ export const fetch: RegisteredTool = buildTool({
   description:
     "HTTP(S) request to an explicitly allow-listed origin. Returns status, headers (Cookie/Authorization stripped), and body (≤5 MB). Methods: GET/POST/PUT/DELETE. Refuses loopback, link-local, RFC1918, and mDNS targets even when allow-listed.",
   inputSchema: fetchSchema,
+  // Pillar 3 sink-side: HTTP egress is the canonical external sink. Body
+  // and URL parameters can both carry exfiltrated lineage; egress-classifier
+  // scans both before the request fires.
+  scope: "external",
   execute: async (input, ctx) => {
     let url: URL;
     try {

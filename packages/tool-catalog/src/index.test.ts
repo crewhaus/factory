@@ -14,6 +14,8 @@ function makeTool(name: string): RegisteredTool {
     destructive: false,
     requiresSandbox: false,
     classifyOutput: true,
+    scope: "internal",
+    requireJustification: false,
   };
 }
 

@@ -85,6 +85,12 @@ export const sendMessage: RegisteredTool = buildTool({
     'Send a message to a channel/thread/DM identified by a routing key (e.g. "slack:T123:C456:1700000000.000"). Permission-gated.',
   inputSchema: sendMessageSchema,
   destructive: true,
+  // Pillar 3 sink-side: channel send is the textbook lateral-comm sink.
+  // egress-classifier scans the `text` payload for cross-origin lineage.
+  scope: "external",
+  // Pillar 3 intent gate: sending a message is irreversible-ish and visible
+  // to humans on the other end, so demand justification.
+  requireJustification: true,
   execute: async (input) => {
     const { adapterId, event } = parseRoutingKey(input.channel);
     const adapter = getChannelAdapter(adapterId);

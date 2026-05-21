@@ -54,6 +54,21 @@ export type RunContext = {
    * `createRunContext` callers don't need to pass it.
    */
   readonly originStack?: ReadonlyArray<TrustOrigin>;
+  /**
+   * Pillar 3 sink-side fabric — content-to-origin map populated by every
+   * boundary site (sub-agent spawner, MCP host, channel adapters, federation
+   * router, skills registry, compaction packages, tool result classifier)
+   * via `tagContent(ctx, content, origin)` after the source-side
+   * `classifyBoundary` call. `egress-classifier` reads this map at every
+   * external-tool call to detect cross-origin exfiltration.
+   *
+   * Mutable Map (not readonly) because tagging accumulates throughout a
+   * run; callers should never replace the reference, only mutate via the
+   * `tagContent` helper which enforces the size cap. Optional for
+   * backward-compat: pre-fabric runtimes don't pre-allocate it, and
+   * `tagContent` lazy-creates on first use.
+   */
+  dataLineage?: Map<string, TrustOrigin>;
 };
 
 export type RunContextOptions = {
@@ -135,4 +150,50 @@ export function pushOrigin(ctx: RunContext, origin: TrustOrigin): RunContext {
     ? [...ctx.originStack, origin]
     : [origin];
   return { ...ctx, originStack: next };
+}
+
+/**
+ * Soft cap on `dataLineage` size. Beyond this, oldest entries (insertion
+ * order) are evicted. Set deliberately conservative because the map is
+ * scanned on every external-tool call (egress-classifier's substring
+ * pass is O(n*m) per call); a runaway lineage degrades fast-path latency.
+ *
+ * A typical run touches 5–30 boundary crossings. 256 covers the 99th
+ * percentile case (sub-agent fan-out, long MCP-tool transcripts) without
+ * letting an adversarial input balloon the lineage.
+ */
+export const DATA_LINEAGE_CAP = 256;
+
+/**
+ * Tag `content` as having entered the run from `origin`. Called by every
+ * Pillar-3 boundary site immediately after `classifyBoundary` returns a
+ * non-blocked verdict, so the content that reaches the model's context
+ * carries its provenance into the lineage map.
+ *
+ * Lazy-creates `ctx.dataLineage` if absent. Enforces the size cap by
+ * evicting in insertion order (oldest first) — Map's iteration order is
+ * insertion order, so `keys().next().value` is the oldest.
+ *
+ * Does nothing for empty strings (egress-classifier ignores them anyway)
+ * and for content shorter than the egress floor (any tag we'd create
+ * would never produce a match). The 16-char floor is duplicated here
+ * deliberately: callers reading `dataLineage` directly shouldn't have to
+ * filter again.
+ */
+export function tagContent(ctx: RunContext, content: string, origin: TrustOrigin): void {
+  if (typeof content !== "string") return;
+  if (content.length < 16) return;
+  if (ctx.dataLineage === undefined) {
+    // biome-ignore lint/suspicious/noExplicitAny: legitimate mutation of readonly-ish optional
+    (ctx as any).dataLineage = new Map<string, TrustOrigin>();
+  }
+  const map = ctx.dataLineage as Map<string, TrustOrigin>;
+  // Refresh recency by deleting then re-inserting.
+  if (map.has(content)) map.delete(content);
+  map.set(content, origin);
+  while (map.size > DATA_LINEAGE_CAP) {
+    const oldest = map.keys().next().value;
+    if (oldest === undefined) break;
+    map.delete(oldest);
+  }
 }

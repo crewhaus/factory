@@ -18,11 +18,11 @@
     "@crewhaus/agent-context-isolation": "workspace:*",
     "@crewhaus/boundary-classifier": "workspace:*",
     "@crewhaus/event-log": "workspace:*",
+    "@crewhaus/run-context": "workspace:*",
     "@crewhaus/runtime-core": "workspace:*"
   },
   "devDependencies": {
     "@crewhaus/permission-engine": "workspace:*",
-    "@crewhaus/run-context": "workspace:*",
     "@crewhaus/tool-builder": "workspace:*",
     "@crewhaus/tool-catalog": "workspace:*",
     "zod": "^3.23.8"

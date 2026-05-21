@@ -34,7 +34,7 @@ export class GraderRegistry {
   private readonly graders = new Map<string, Grader>();
 
   register(name: string, grader: Grader): void {
-    if (!/^[A-Za-z][A-Za-z0-9_-]*$/.test(name)) {
+    if (!/^[A-Za-z][A-Za-z0-9_.-]*$/.test(name)) {
       throw new GraderRegistryError(`invalid grader name "${name}"`);
     }
     if (this.graders.has(name)) {
@@ -45,7 +45,7 @@ export class GraderRegistry {
 
   /** Replace an existing entry (tests + plugin reload). */
   upsert(name: string, grader: Grader): void {
-    if (!/^[A-Za-z][A-Za-z0-9_-]*$/.test(name)) {
+    if (!/^[A-Za-z][A-Za-z0-9_.-]*$/.test(name)) {
       throw new GraderRegistryError(`invalid grader name "${name}"`);
     }
     this.graders.set(name, grader);

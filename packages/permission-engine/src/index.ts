@@ -217,6 +217,168 @@ export function evaluateWithReason(
   return { decision: baseDecision };
 }
 
+/**
+ * Pillar 3 intent gate — verdict from a justification judge.
+ */
+export type JustificationVerdict = {
+  /** True if the justification is consistent with the session's stated goal. */
+  readonly allow: boolean;
+  /** Short human-readable rationale. Always present; lands in audit-log. */
+  readonly reason: string;
+  /** Confidence in [0, 1] when the judge supplies it; undefined for binary judges. */
+  readonly confidence?: number;
+  /** Judge model identifier — `"rule-based"` for the default, otherwise the
+   *  LLM model name supplied by the runtime. */
+  readonly judgeModel: string;
+};
+
+/**
+ * Pillar 3 intent gate — interface a judge function implements. Sync OR
+ * async; runtime-core awaits the return. Implementations:
+ *   - `ruleBasedJustificationJudge` (default; deterministic for tests)
+ *   - LLM-backed judge supplied by runtime-core when the spec opts in
+ *
+ * The session-goal string is the agent's declared task (typically the user
+ * message that started the run, or a planner-emitted summary). The judge
+ * compares the justification to the goal; deciding factors are
+ * implementation-specific.
+ */
+export type JustificationJudge = (input: {
+  readonly toolName: string;
+  readonly justification: string;
+  readonly sessionGoal: string;
+  readonly input: unknown;
+}) => Promise<JustificationVerdict> | JustificationVerdict;
+
+/**
+ * Default rule-based judge. Deterministic, no LLM call, suitable for tests
+ * and for low-stakes deployments where rough intent checking is enough.
+ *
+ * Heuristics (intentionally simple — production should override with an
+ * LLM-backed judge):
+ *   - Justification length < 16 chars → deny ("too brief to be meaningful")
+ *   - Goal not provided → allow with low confidence (no signal to check
+ *     against; the audit trail still captures the justification verbatim)
+ *   - Otherwise: token overlap. The justification's lowercase token set
+ *     must share ≥ 1 non-stopword token with the session goal's set.
+ *     Tightens too easily under polysemy; an LLM judge replaces this
+ *     entirely when wired.
+ */
+const STOPWORDS = new Set([
+  "the",
+  "a",
+  "an",
+  "and",
+  "or",
+  "but",
+  "to",
+  "of",
+  "in",
+  "for",
+  "on",
+  "at",
+  "by",
+  "with",
+  "is",
+  "are",
+  "was",
+  "were",
+  "be",
+  "been",
+  "i",
+  "you",
+  "we",
+  "they",
+  "this",
+  "that",
+  "these",
+  "those",
+  "it",
+  "its",
+  "my",
+  "your",
+  "our",
+  "their",
+  "do",
+  "does",
+  "did",
+  "have",
+  "has",
+  "had",
+  "would",
+  "should",
+  "could",
+  "may",
+  "might",
+  "can",
+  "will",
+  "shall",
+  "must",
+]);
+
+function tokenize(s: string): Set<string> {
+  return new Set(
+    s
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]+/g, " ")
+      .split(/\s+/)
+      .filter((t) => t.length > 2 && !STOPWORDS.has(t)),
+  );
+}
+
+export const ruleBasedJustificationJudge: JustificationJudge = (input) => {
+  if (input.justification.length < 16) {
+    return {
+      allow: false,
+      reason: `justification too brief (${input.justification.length} chars); supply at least 16 characters of explanation`,
+      confidence: 1.0,
+      judgeModel: "rule-based",
+    };
+  }
+  if (input.sessionGoal.length === 0) {
+    return {
+      allow: true,
+      reason: "no session goal supplied to compare against; justification captured verbatim",
+      confidence: 0.0,
+      judgeModel: "rule-based",
+    };
+  }
+  const justTokens = tokenize(input.justification);
+  const goalTokens = tokenize(input.sessionGoal);
+  let overlap = 0;
+  for (const t of justTokens) if (goalTokens.has(t)) overlap += 1;
+  if (overlap === 0) {
+    return {
+      allow: false,
+      reason: `justification shares no salient tokens with session goal (justification: ${justTokens.size} tokens, goal: ${goalTokens.size} tokens, overlap: 0)`,
+      confidence: 0.7,
+      judgeModel: "rule-based",
+    };
+  }
+  return {
+    allow: true,
+    reason: `${overlap} token(s) overlap between justification and session goal`,
+    confidence: Math.min(1, overlap / 3),
+    judgeModel: "rule-based",
+  };
+};
+
+/**
+ * Evaluate a justification under the supplied judge. Convenience wrapper
+ * so runtime-core does not have to handle the sync-or-async ambiguity.
+ */
+export async function evaluateJustification(
+  input: {
+    readonly toolName: string;
+    readonly justification: string;
+    readonly sessionGoal: string;
+    readonly input: unknown;
+  },
+  judge: JustificationJudge = ruleBasedJustificationJudge,
+): Promise<JustificationVerdict> {
+  return await Promise.resolve(judge(input));
+}
+
 // ---------------------------------------------------------------------------
 // Config parsing — security-critical. Bypass is excluded from the parser.
 // ---------------------------------------------------------------------------
