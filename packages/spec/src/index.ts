@@ -103,6 +103,21 @@ const toolConfigBlock = z.record(z.string().min(1), z.unknown()).optional();
 const compactionBlock = z
   .object({
     model: z.string().min(1).optional(),
+    /** Pillar 2 — opt in to the pre-compaction curator pass. Defaults
+     *  to `false` when omitted; the IR carries the user's choice
+     *  verbatim so target emitters can wire `@crewhaus/compaction-curator`
+     *  on the runtime path. See docs/MODULE-CATALOG.md R6 + recipe 52. */
+    curate: z.boolean().optional(),
+    /** Cosine-similarity threshold above which two items are considered
+     *  duplicates by the curator. Defaults to 0.92 in the curator
+     *  itself; spec-level override targets per-corpus tuning. Must be
+     *  in (0, 1] — values outside that range can't be cosine outputs. */
+    dedupeThreshold: z.number().gt(0).lte(1).optional(),
+    /** Max items the curator keeps after the relevance reorder. When
+     *  omitted, the curator only reorders (no top-K trim). Spec-level
+     *  override is the natural knob for RAG pipelines that want a hard
+     *  cap on retrieved chunks per turn. */
+    relevanceTopK: z.number().int().positive().optional(),
   })
   .strict()
   .optional();

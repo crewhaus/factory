@@ -274,7 +274,18 @@ function lowerToolConfigs(
 function lowerCompaction(spec: SpecWithPermissions): IrCompaction {
   const c = spec.compaction;
   if (c === undefined) return {};
-  return c.model !== undefined ? { model: c.model } : {};
+  // Propagate each defined field verbatim. Defaults belong at the
+  // consumer site (curator's `DEFAULT_DEDUPE_THRESHOLD`, autocompact's
+  // primary-model fallback) so the IR carries the user's intent
+  // without lying about defaults.
+  const out: {
+    -readonly [K in keyof IrCompaction]: IrCompaction[K];
+  } = {};
+  if (c.model !== undefined) out.model = c.model;
+  if (c.curate !== undefined) out.curate = c.curate;
+  if (c.dedupeThreshold !== undefined) out.dedupeThreshold = c.dedupeThreshold;
+  if (c.relevanceTopK !== undefined) out.relevanceTopK = c.relevanceTopK;
+  return out;
 }
 
 /**

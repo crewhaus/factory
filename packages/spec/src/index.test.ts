@@ -901,3 +901,111 @@ routing:
     expect(spec.heartbeat).toBeUndefined();
   });
 });
+
+describe("parseSpec — compaction block (Section 17 + Pillar 2 curator)", () => {
+  test("accepts the curator opt-in + tuning knobs", () => {
+    const spec = parseSpec(`
+name: hello
+target: cli
+agent:
+  model: claude-sonnet-4-6
+  instructions: be helpful
+compaction:
+  model: claude-haiku-4
+  curate: true
+  dedupeThreshold: 0.88
+  relevanceTopK: 5
+`);
+    if (spec.target !== "cli") throw new Error("unexpected target");
+    expect(spec.compaction).toEqual({
+      model: "claude-haiku-4",
+      curate: true,
+      dedupeThreshold: 0.88,
+      relevanceTopK: 5,
+    });
+  });
+
+  test("each curator field is independently optional", () => {
+    const spec = parseSpec(`
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+compaction:
+  curate: true
+`);
+    if (spec.target !== "cli") throw new Error("unexpected target");
+    expect(spec.compaction).toEqual({ curate: true });
+  });
+
+  test("rejects dedupeThreshold > 1 (cosine outputs cap at 1)", () => {
+    expect(() =>
+      parseSpec(`
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+compaction:
+  dedupeThreshold: 1.5
+`),
+    ).toThrow(SpecParseError);
+  });
+
+  test("rejects dedupeThreshold <= 0", () => {
+    expect(() =>
+      parseSpec(`
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+compaction:
+  dedupeThreshold: 0
+`),
+    ).toThrow(SpecParseError);
+  });
+
+  test("rejects non-integer relevanceTopK", () => {
+    expect(() =>
+      parseSpec(`
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+compaction:
+  relevanceTopK: 3.5
+`),
+    ).toThrow(SpecParseError);
+  });
+
+  test("rejects relevanceTopK <= 0", () => {
+    expect(() =>
+      parseSpec(`
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+compaction:
+  relevanceTopK: 0
+`),
+    ).toThrow(SpecParseError);
+  });
+
+  test("rejects unknown keys inside the compaction block (strict)", () => {
+    expect(() =>
+      parseSpec(`
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+compaction:
+  enableMagic: true
+`),
+    ).toThrow(SpecParseError);
+  });
+});

@@ -102,6 +102,11 @@ const BUILTIN_TOOL_MAP: Record<string, BuiltinToolEntry> = {
     package: "@crewhaus/tool-document-ingest",
     export: "ingestDocument",
   },
+  // Pillar 2 — AST-aware code intelligence (recipe 54).
+  codegraphSearch: { package: "@crewhaus/tool-codegraph", export: "codegraphSearch" },
+  codegraphCallers: { package: "@crewhaus/tool-codegraph", export: "codegraphCallers" },
+  codegraphCallees: { package: "@crewhaus/tool-codegraph", export: "codegraphCallees" },
+  codegraphImpact: { package: "@crewhaus/tool-codegraph", export: "codegraphImpact" },
 };
 
 function resolveTools(
