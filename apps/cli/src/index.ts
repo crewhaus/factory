@@ -393,7 +393,7 @@ agent:
  * `BUILTIN_TOOL_MAP` in packages/target-cli/src/index.ts — keep them in sync.
  */
 async function loadToolMap(): Promise<Record<string, RegisteredTool>> {
-  const [fs, bash, todo, web, image, fetchPkg, imageGen, docIngest] = await Promise.all([
+  const [fs, bash, todo, web, image, fetchPkg, imageGen, docIngest, codegraph] = await Promise.all([
     import("@crewhaus/tool-fs"),
     import("@crewhaus/tool-bash"),
     import("@crewhaus/tool-todo"),
@@ -402,6 +402,7 @@ async function loadToolMap(): Promise<Record<string, RegisteredTool>> {
     import("@crewhaus/tool-fetch"),
     import("@crewhaus/tool-image-generation"),
     import("@crewhaus/tool-document-ingest"),
+    import("@crewhaus/tool-codegraph"),
   ]);
   return {
     read: fs.read,
@@ -417,6 +418,11 @@ async function loadToolMap(): Promise<Record<string, RegisteredTool>> {
     fetch: fetchPkg.fetch,
     imageGenerate: imageGen.imageGenerate,
     ingestDocument: docIngest.ingestDocument,
+    // Pillar 2 — AST-aware code intelligence (recipe 54).
+    codegraphSearch: codegraph.codegraphSearch,
+    codegraphCallers: codegraph.codegraphCallers,
+    codegraphCallees: codegraph.codegraphCallees,
+    codegraphImpact: codegraph.codegraphImpact,
   };
 }
 

@@ -73,6 +73,11 @@ const BUILTIN_TOOL_MAP: Record<string, BuiltinToolEntry> = {
   // (destructive: true) and wallet-engine (two-gate model).
   evmSendTransaction: { package: "@crewhaus/tool-evm-tx", export: "evmSendTransaction" },
   evmSimulate: { package: "@crewhaus/tool-evm-tx", export: "evmSimulate" },
+  // Pillar 2 — AST-aware code intelligence (recipe 54).
+  codegraphSearch: { package: "@crewhaus/tool-codegraph", export: "codegraphSearch" },
+  codegraphCallers: { package: "@crewhaus/tool-codegraph", export: "codegraphCallers" },
+  codegraphCallees: { package: "@crewhaus/tool-codegraph", export: "codegraphCallees" },
+  codegraphImpact: { package: "@crewhaus/tool-codegraph", export: "codegraphImpact" },
 };
 
 export function emitCrew(ir: IrCrewV0): Bundle {

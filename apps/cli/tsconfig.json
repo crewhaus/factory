@@ -38,6 +38,7 @@
     { "path": "../../packages/sub-agent-spawner" },
     { "path": "../../packages/tool-bash" },
     { "path": "../../packages/tool-catalog" },
+    { "path": "../../packages/tool-codegraph" },
     { "path": "../../packages/tool-fetch" },
     { "path": "../../packages/tool-fs" },
     { "path": "../../packages/tool-image" },
