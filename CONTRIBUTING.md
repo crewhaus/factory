@@ -16,7 +16,7 @@ This document covers:
 
 Use the [Bug report template](.github/ISSUE_TEMPLATE/bug_report.yml). A good bug report includes:
 
-- The version of `@crewhaus/cli` (run `crewhaus --version`)
+- The commit SHA of factory you're on (run `git rev-parse HEAD`). Once `@crewhaus/cli` is on npm, the version of `@crewhaus/cli` (run `crewhaus --version`) — see [`PACKAGES.md`](PACKAGES.md) for publish status.
 - Your `spec.yaml` (or a minimal reduction of it)
 - What you ran (`crewhaus compile`, `crewhaus run`, etc.)
 - What you expected to happen
