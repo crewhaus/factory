@@ -2,7 +2,7 @@
 
 *The open-source meta-harness compiler for AI agents.*
 
-Compile a single `spec.yaml` into a CLI agent, channel bot, RAG pipeline, multi-agent crew, eval harness, voice/realtime agent, browser/computer-use agent, and more. Active eval optimization. Trust-aware by default. Apache-2.0.
+Compile a single spec (a `crewhaus.yaml`) into a CLI agent, channel bot, RAG pipeline, multi-agent crew, eval harness, voice/realtime agent, browser/computer-use agent, and more. Active eval optimization. Trust-aware by default. Apache-2.0.
 
 ```bash
 # Until @crewhaus/cli is on npm (tracking in PACKAGES.md), use it from a clone.
@@ -10,14 +10,14 @@ git clone https://github.com/crewhaus/factory && cd factory && bun install && cd
 alias crewhaus="bun $(pwd)/factory/apps/cli/src/index.ts"
 crewhaus init my-agent
 cd my-agent
-crewhaus compile && crewhaus run
+crewhaus compile crewhaus.yaml -o build && crewhaus run crewhaus.yaml
 ```
 
 ## Why CrewHaus?
 
 Most teams build a different harness for every shape of agent — a CLI here, a Slack bot there, a RAG pipeline somewhere else, an eval rig on the side. The behaviour is identical; the wiring is wildly different.
 
-CrewHaus is the layer above. You write the agent once, as a `spec.yaml`. The compiler emits whichever runtime shape you need.
+CrewHaus is the layer above. You write the agent once, as a spec (`crewhaus.yaml`). The compiler emits whichever runtime shape you need.
 
 ## What you can compile to
 
@@ -59,51 +59,64 @@ Requires [Bun](https://bun.sh) ≥ 1.2.
 git clone https://github.com/crewhaus/factory && cd factory && bun install && cd ..
 alias crewhaus="bun $(pwd)/factory/apps/cli/src/index.ts"
 
-# Create a new agent project
+# Create a new agent project — writes a minimal `crewhaus.yaml`
 crewhaus init my-agent
 cd my-agent
-
-# Edit spec.yaml — see https://github.com/crewhaus/demos/blob/main/recipes/01-first-spec.md
-
-# Compile to the CLI target (the default)
-crewhaus compile
-
-# Run it (set a credential in .env first — see .env.example for the full list of supported providers)
-crewhaus run
-
-# Or compile to a different shape
-crewhaus compile --target channel-slack
-crewhaus compile --target rag-pipeline
-crewhaus compile --target eval-bundle
 ```
 
-## Example: compile a spec to two different shapes
+`crewhaus init` writes a runnable starter spec:
 
 ```yaml
-# spec.yaml
+# crewhaus.yaml
+name: my-agent
+target: cli
+agent:
+  model: claude-opus-4-7
+  instructions: |
+    You are a helpful assistant. Replace these instructions with your
+    agent's actual behavior, persona, and constraints.
+```
+
+Edit the `instructions` block to describe what your agent should do, then:
+
+```bash
+# Set a provider credential (the default model is Anthropic;
+# other providers are listed in factory/.env.example)
+export ANTHROPIC_API_KEY=sk-ant-...
+
+# Compile crewhaus.yaml to a runnable bundle in ./build
+crewhaus compile crewhaus.yaml -o build
+
+# Run the agent
+crewhaus run crewhaus.yaml
+```
+
+To compile to a different shape, change `target:` in `crewhaus.yaml` to one of the values from the table above (`channel`, `pipeline`, `eval`, …) and re-run `crewhaus compile`.
+
+## Example: one agent, multiple shapes
+
+```yaml
+# cli.yaml
 name: github-issue-triage
-model:
-  provider: anthropic
-  name: claude-sonnet-4-6
-instructions: |
-  You triage GitHub issues by reading them and assigning labels.
+target: cli
+agent:
+  model: claude-sonnet-4-6
+  instructions: |
+    You triage GitHub issues by reading them and assigning labels.
 tools:
   - github:list_labels
   - github:add_labels
 ```
 
 ```bash
-# Get a CLI you can run locally
-crewhaus compile --target cli
-
-# Get a Slack bot that responds to a slash command
-crewhaus compile --target channel-slack
-
-# Get an eval bundle to test it
-crewhaus compile --target eval --eval-set evals/triage.jsonl
+# Same agent block, three shapes — each spec swaps `target:` and adds its
+# own config (channels + routing for Slack, dataset + graders for eval).
+crewhaus compile cli.yaml    -o build/cli      # local CLI
+crewhaus compile slack.yaml  -o build/slack    # Slack bot
+crewhaus compile triage.yaml -o build/eval     # eval bundle
 ```
 
-Same spec. Different shapes. Different deployment paths.
+Same agent. Different shapes. Different deployment paths.
 
 ## Documentation
 
