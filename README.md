@@ -5,7 +5,9 @@
 Compile a single `spec.yaml` into a CLI agent, channel bot, RAG pipeline, multi-agent crew, eval harness, voice/realtime agent, browser/computer-use agent, and more. Active eval optimization. Trust-aware by default. Apache-2.0.
 
 ```bash
-bun add -d @crewhaus/cli
+# Until @crewhaus/cli is on npm (tracking in PACKAGES.md), use it from a clone.
+git clone https://github.com/crewhaus/factory && cd factory && bun install && cd ..
+alias crewhaus="bun $(pwd)/factory/apps/cli/src/index.ts"
 crewhaus init my-agent
 cd my-agent
 crewhaus compile && crewhaus run
@@ -53,8 +55,9 @@ Full architecture: [`AI-Harness-Systems.md`](https://github.com/crewhaus/docs/bl
 Requires [Bun](https://bun.sh) ≥ 1.2.
 
 ```bash
-# Install the CLI
-bun add -d @crewhaus/cli
+# Until @crewhaus/cli is on npm (tracking in PACKAGES.md), use it from a clone.
+git clone https://github.com/crewhaus/factory && cd factory && bun install && cd ..
+alias crewhaus="bun $(pwd)/factory/apps/cli/src/index.ts"
 
 # Create a new agent project
 crewhaus init my-agent
