@@ -906,12 +906,16 @@ function runDoctorPhilosophyAlignment(): void {
     });
   }
 
-  // CLAUDE.md exists at project root.
+  // Contributor compass exists at project root. AGENTS.md is the canonical
+  // vendor-neutral convention (agents.md); CLAUDE.md is accepted as a fallback
+  // for repos still on the Claude Code-specific naming.
+  const agentsmd = join(process.cwd(), "AGENTS.md");
   const claudemd = join(process.cwd(), "CLAUDE.md");
+  const hasContributorCompass = existsSync(agentsmd) || existsSync(claudemd);
   findings.push({
-    label: "Contributor doc — CLAUDE.md at project root",
-    pass: existsSync(claudemd),
-    reason: existsSync(claudemd) ? undefined : "missing — contributors will drift",
+    label: "Contributor doc — AGENTS.md (or CLAUDE.md) at project root",
+    pass: hasContributorCompass,
+    reason: hasContributorCompass ? undefined : "missing — contributors will drift",
   });
 
   for (const f of findings) {
@@ -927,7 +931,7 @@ function runDoctorPhilosophyAlignment(): void {
   process.stdout.write(
     allPass
       ? "\nphilosophy alignment: green. All three pillars intact.\n"
-      : `\nphilosophy alignment: ${findings.filter((f) => !f.pass).length} finding(s). See [/CLAUDE.md](CLAUDE.md) for invariants.\n`,
+      : `\nphilosophy alignment: ${findings.filter((f) => !f.pass).length} finding(s). See [/AGENTS.md](AGENTS.md) for invariants.\n`,
   );
   process.exit(allPass ? 0 : 1);
 }

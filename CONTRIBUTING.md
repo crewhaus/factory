@@ -91,7 +91,7 @@ We use [Conventional Commits](https://www.conventionalcommits.org/) for commit m
 
 ## 3. The three architectural pillars
 
-Every change in this repo must respect three invariants. These come from [`CLAUDE.md`](CLAUDE.md) — read that first for the full versions.
+Every change in this repo must respect three invariants. These come from [`AGENTS.md`](AGENTS.md) — read that first for the full versions.
 
 ### Pillar 1: The compiler is the protagonist
 

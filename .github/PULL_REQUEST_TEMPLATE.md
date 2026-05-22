@@ -37,7 +37,7 @@ Closes #
 
 ## Pillar alignment check
 
-<!-- For non-trivial changes, confirm the change respects the three pillars from CLAUDE.md. -->
+<!-- For non-trivial changes, confirm the change respects the three pillars from AGENTS.md. -->
 
 - [ ] **Pillar 1 (Compiler-first):** If this adds a target shape or compiler-level feature, it goes through the IR (`Ir<Target>V0` variant), not just codegen.
 - [ ] **Pillar 2 (Active eval):** If this adds an optimizable spec parameter, it's listed in `OPTIMIZABLE_PATHS`. Patches mutate the spec, never the IR.
