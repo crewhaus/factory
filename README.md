@@ -46,7 +46,7 @@ Adding a new target shape starts at the IR, not at codegen. See [`COMPILER-ARCHI
 
 3. **Security is a fabric, not a perimeter.** Every untrusted ingress — MCP responses, sub-agent returns, channel inbound messages, federation payloads, skill bodies, compaction summaries — goes through the boundary classifier with `TrustOrigin` metadata before it hits a model call. Authentication verifies who; classification verifies what.
 
-Full architecture: [`AI-Harness-Systems.md`](https://github.com/crewhaus/docs/blob/main/AI-Harness-Systems.md), [`COMPILER-ARCHITECTURE.md`](https://github.com/crewhaus/docs/blob/main/COMPILER-ARCHITECTURE.md), [`CLAUDE.md`](CLAUDE.md).
+Full architecture: [`AI-Harness-Systems.md`](https://github.com/crewhaus/docs/blob/main/AI-Harness-Systems.md), [`COMPILER-ARCHITECTURE.md`](https://github.com/crewhaus/docs/blob/main/COMPILER-ARCHITECTURE.md), [`AGENTS.md`](AGENTS.md).
 
 ## Quickstart
 
@@ -65,8 +65,8 @@ cd my-agent
 # Compile to the CLI target (the default)
 crewhaus compile
 
-# Run it
-ANTHROPIC_API_KEY=sk-... crewhaus run
+# Run it (set a credential in .env first — see .env.example for the full list of supported providers)
+crewhaus run
 
 # Or compile to a different shape
 crewhaus compile --target channel-slack

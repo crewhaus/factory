@@ -3,16 +3,18 @@
  *
  * At session-start, the runtime looks for canonical "project memory"
  * files in the current working directory and prepends their contents
- * to the system prompt. Mirrors Claude Code's CLAUDE.md auto-load
- * convention.
+ * to the system prompt. Follows the vendor-neutral agents.md convention
+ * (https://agents.md) and is compatible with Claude Code's CLAUDE.md
+ * auto-load behaviour.
  *
- * Files searched (in priority order, first match wins for each name):
+ * Files searched (in priority order, all matches are loaded):
+ *   - AGENTS.md         (vendor-neutral convention — agents.md)
  *   - CLAUDE.md         (Claude Code convention)
  *   - CODE-COMPANION.md (hello-code demo convention)
- *   - AGENT.md          (provider-neutral convention)
+ *   - AGENT.md          (legacy singular form; retained for compatibility)
  *
  * Each file's contents are wrapped in:
- *   <project_memory file="CLAUDE.md">
+ *   <project_memory file="AGENTS.md">
  *   ...contents...
  *   </project_memory>
  *
@@ -34,7 +36,12 @@ import { readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { classifyBoundary } from "@crewhaus/boundary-classifier";
 
-export const CANONICAL_MEMORY_FILES = ["CLAUDE.md", "CODE-COMPANION.md", "AGENT.md"] as const;
+export const CANONICAL_MEMORY_FILES = [
+  "AGENTS.md",
+  "CLAUDE.md",
+  "CODE-COMPANION.md",
+  "AGENT.md",
+] as const;
 
 export const DEFAULT_PROJECT_MEMORY_CAP_BYTES = 64 * 1024;
 

@@ -1,6 +1,6 @@
 /**
  * Tests for the project-memory auto-loader. Covers:
- * - File discovery in cwd (CLAUDE.md, CODE-COMPANION.md, AGENT.md)
+ * - File discovery in cwd (AGENTS.md, CLAUDE.md, CODE-COMPANION.md, AGENT.md)
  * - Multi-file concatenation with envelope tags
  * - Cap-byte truncation with notice
  * - Graceful no-match (empty result; non-erroring)
@@ -45,6 +45,17 @@ describe("loadProjectMemory", () => {
     expect(result.totalBytes).toBe(0);
   });
 
+  test("loads AGENTS.md when present", async () => {
+    const dir = setUpWorkdir({ "AGENTS.md": "# Project Neutral\nHandles the thing." });
+    const result = await loadProjectMemory({ cwd: dir });
+    expect(result.files.length).toBe(1);
+    expect(result.files[0]?.filename).toBe("AGENTS.md");
+    expect(result.files[0]?.content).toContain("# Project Neutral");
+    expect(result.files[0]?.truncated).toBe(false);
+    expect(result.prompt).toContain('<project_memory file="AGENTS.md">');
+    expect(result.prompt).toContain("</project_memory>");
+  });
+
   test("loads CLAUDE.md when present", async () => {
     const dir = setUpWorkdir({ "CLAUDE.md": "# Project X\nDoes the thing." });
     const result = await loadProjectMemory({ cwd: dir });
@@ -58,16 +69,19 @@ describe("loadProjectMemory", () => {
 
   test("loads multiple memory files in canonical priority order", async () => {
     const dir = setUpWorkdir({
+      "AGENTS.md": "# agents content",
       "CLAUDE.md": "# claude content",
       "CODE-COMPANION.md": "# code companion content",
       "AGENT.md": "# agent content",
     });
     const result = await loadProjectMemory({ cwd: dir });
     expect(result.files.map((f) => f.filename)).toEqual([
+      "AGENTS.md",
       "CLAUDE.md",
       "CODE-COMPANION.md",
       "AGENT.md",
     ]);
+    expect(result.prompt).toContain('<project_memory file="AGENTS.md">');
     expect(result.prompt).toContain('<project_memory file="CLAUDE.md">');
     expect(result.prompt).toContain('<project_memory file="CODE-COMPANION.md">');
     expect(result.prompt).toContain('<project_memory file="AGENT.md">');
@@ -117,7 +131,12 @@ describe("loadProjectMemory", () => {
   });
 
   test("CANONICAL_MEMORY_FILES exports the right list", () => {
-    expect(CANONICAL_MEMORY_FILES).toEqual(["CLAUDE.md", "CODE-COMPANION.md", "AGENT.md"]);
+    expect(CANONICAL_MEMORY_FILES).toEqual([
+      "AGENTS.md",
+      "CLAUDE.md",
+      "CODE-COMPANION.md",
+      "AGENT.md",
+    ]);
   });
 
   test("DEFAULT_PROJECT_MEMORY_CAP_BYTES is 64 KB", () => {

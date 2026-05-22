@@ -75,7 +75,7 @@ To save time on questions: these are not on the roadmap, and may or may not ever
 
 - **Visual / no-code spec editor.** CrewHaus is a developer tool. Specs are YAML files in your editor.
 - **Drag-and-drop workflow builder.** That's a different product category (n8n, Make, Zapier). CrewHaus targets developers.
-- **Python implementation.** The repo's CLAUDE.md explains: TS+Bun is the primary runtime. The Claude-backed `MutationProvider` superseded the originally-deferred DSPy bridge.
+- **Python implementation.** The repo's AGENTS.md explains: TS+Bun is the primary runtime. The Claude-backed `MutationProvider` superseded the originally-deferred DSPy bridge.
 - **Built-in model hosting.** We integrate with model providers; we don't host models.
 - **Generic LLM playground.** CrewHaus is a compiler, not a chat app.
 

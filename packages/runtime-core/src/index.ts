@@ -634,10 +634,11 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     skillsText.length > 0
       ? [{ type: "text", text: skillsText, cache_control: { type: "ephemeral" } }]
       : [];
-  // M3.1 — auto-load project memory files (CLAUDE.md / CODE-COMPANION.md /
-  // AGENT.md) from cwd at session start. Mirrors Claude Code's CLAUDE.md
-  // auto-load convention. Pillar 3 compliance: each file's content is
-  // classified via boundary-classifier with origin "user" inside
+  // M3.1 — auto-load project memory files (AGENTS.md / CLAUDE.md /
+  // CODE-COMPANION.md / AGENT.md) from cwd at session start. Follows the
+  // vendor-neutral agents.md convention; compatible with Claude Code's
+  // CLAUDE.md auto-load behaviour. Pillar 3 compliance: each file's content
+  // is classified via boundary-classifier with origin "user" inside
   // loadProjectMemory() (the user's repo is developer-trusted).
   const projectMemory = await loadProjectMemory();
   const projectMemoryBlock: Anthropic.TextBlockParam[] =

@@ -12,6 +12,7 @@
 
 # Architecture & design decisions
 /decisions/                     @studiomax
+/AGENTS.md                      @studiomax
 /CLAUDE.md                      @studiomax
 /GOVERNANCE.md                  @studiomax
 /TRADEMARK.md                   @studiomax
