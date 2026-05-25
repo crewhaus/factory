@@ -11,8 +11,9 @@
  *      them (the smoke's permission-floor probe relies on this — same
  *      spec without `alwaysAllow` rules → denial cites destructive
  *      flag).
- *   4. Reads a single user prompt from stdin (or the `--prompt` arg
- *      for non-interactive smokes) and runs `runChatLoop`.
+ *   4. Reads a single user prompt from `--prompt <text>` or stdin and
+ *      runs `runChatLoop` in single-turn mode. The interpreter path
+ *      (`crewhaus run`) mirrors this same wiring — keep them in sync.
  *   5. On exit, calls driver.disconnect() so chromium doesn't leak.
  */
 import { CrewhausError } from "@crewhaus/errors";

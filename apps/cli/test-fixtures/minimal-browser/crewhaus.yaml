@@ -1,0 +1,7 @@
+name: hello-browser
+target: browser
+agent:
+  model: claude-sonnet-4-6
+  instructions: |
+    You are a helpful browser-driving assistant. Open the page, find what
+    the user asked for, and report a concise answer.

@@ -120,9 +120,16 @@ agent:
 ```
 
 ```bash
+# Compile to runnable bundles
 crewhaus compile cli.yaml     -o build/cli      # local CLI agent
 crewhaus compile browser.yaml -o build/browser  # browser/computer-use agent
+
+# Or run directly — no compile step needed
+crewhaus run cli.yaml                                   # interactive terminal
+crewhaus run browser.yaml --prompt "research X"         # one-shot browser session
 ```
+
+The browser target launches a headless Chromium via [Playwright](https://playwright.dev) — run `bunx playwright install chromium` once if you don't already have it. The compiled bundle and `crewhaus run` use the same runtime; pick whichever fits your deployment.
 
 Same agent. Different runtimes. Only `target:` changed.
 

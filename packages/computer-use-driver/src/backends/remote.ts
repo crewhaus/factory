@@ -72,13 +72,10 @@ export function createRemoteDriver(opts: RemoteBackendOptions): Driver {
     async goto(url: string): Promise<void> {
       await ensure().goto(url);
     },
-    async screenshot(): Promise<{ pngBase64: string; viewport: Viewport }> {
+    async screenshot(): Promise<Uint8Array> {
       const buffer = await ensure().screenshot({ encoding: "base64" });
       const pngBase64 = typeof buffer === "string" ? buffer : buffer.toString("base64");
-      return {
-        pngBase64,
-        viewport: opts.viewport ?? { width: 1280, height: 800 },
-      };
+      return Buffer.from(pngBase64, "base64");
     },
     async click(x: number, y: number, button = "left"): Promise<void> {
       await ensure().mouse.click(x, y, { button });
@@ -89,18 +86,31 @@ export function createRemoteDriver(opts: RemoteBackendOptions): Driver {
     async key(combo: string): Promise<void> {
       await ensure().keyboard.press(combo);
     },
-    async scroll(x: number, y: number, _deltaX: number, deltaY: number): Promise<void> {
-      // Puppeteer doesn't expose mouse.wheel by default; eval to dispatch.
-      await ensure().evaluate(() => {
-        window.scrollBy(0, 0);
-      });
-      // Capture coordinates inside a scoped function so the bundler keeps them.
-      void x;
-      void y;
-      void deltaY;
+    async scroll(dx: number, dy: number): Promise<void> {
+      // Puppeteer doesn't expose mouse.wheel directly; dispatch from the
+      // page context where `window` is defined. The eval-with-args shape
+      // isn't on the local PuppeteerCoreLike type; cast to puppeteer's
+      // actual surface to call it.
+      const pageWithArgs = ensure() as unknown as {
+        evaluate(
+          fn: (d: { dx: number; dy: number }) => void,
+          arg: { dx: number; dy: number },
+        ): Promise<void>;
+      };
+      await pageWithArgs.evaluate(
+        (d: { dx: number; dy: number }) => {
+          (globalThis as unknown as { scrollBy: (dx: number, dy: number) => void }).scrollBy(
+            d.dx,
+            d.dy,
+          );
+        },
+        { dx, dy },
+      );
     },
     async getViewport(): Promise<Viewport> {
-      return opts.viewport ?? { width: 1280, height: 800 };
+      const v = opts.viewport;
+      if (v !== undefined) return v;
+      return { width: 1280, height: 800, devicePixelRatio: 1 };
     },
     async disconnect(): Promise<void> {
       try {

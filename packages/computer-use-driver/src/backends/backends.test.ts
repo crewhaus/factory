@@ -15,7 +15,7 @@ describe("host driver — Section 30", () => {
 
   test("connect + click + screenshot delegates to executor", async () => {
     const calls: string[] = [];
-    const viewport: Viewport = { width: 1920, height: 1080 };
+    const viewport: Viewport = { width: 1920, height: 1080, devicePixelRatio: 1 };
     const executor: HostExecutor = {
       async click(x, y, button) {
         calls.push(`click ${x},${y} ${button}`);
@@ -31,15 +31,40 @@ describe("host driver — Section 30", () => {
       },
       async screenshot() {
         calls.push("screenshot");
-        return { pngBase64: "base64-data", viewport };
+        // "iVBORw0KGgo=" decodes to the PNG magic bytes (0x89 0x50 0x4E 0x47 ...).
+        return { pngBase64: "iVBORw0KGgo=", viewport };
       },
     };
     const driver = createHostDriver({ enabled: true, executor });
     await driver.connect();
     await driver.click(100, 200, "left");
     const shot = await driver.screenshot();
-    expect(shot.viewport).toEqual(viewport);
+    expect(shot).toBeInstanceOf(Uint8Array);
+    expect(shot[0]).toBe(0x89);
+    expect(shot[1]).toBe(0x50);
     expect(calls).toEqual(["click 100,200 left", "screenshot"]);
+  });
+
+  test("scroll delegates to executor with zero anchor", async () => {
+    const calls: string[] = [];
+    const executor: HostExecutor = {
+      async click() {},
+      async type() {},
+      async key() {},
+      async scroll(x, y, dx, dy) {
+        calls.push(`scroll ${x},${y} ${dx},${dy}`);
+      },
+      async screenshot() {
+        return {
+          pngBase64: "",
+          viewport: { width: 0, height: 0, devicePixelRatio: 1 },
+        };
+      },
+    };
+    const driver = createHostDriver({ enabled: true, executor });
+    await driver.connect();
+    await driver.scroll(10, 20);
+    expect(calls).toEqual(["scroll 0,0 10,20"]);
   });
 
   test("operations before connect throw", async () => {
@@ -49,7 +74,10 @@ describe("host driver — Section 30", () => {
       async key() {},
       async scroll() {},
       async screenshot() {
-        return { pngBase64: "", viewport: { width: 0, height: 0 } };
+        return {
+          pngBase64: "",
+          viewport: { width: 0, height: 0, devicePixelRatio: 1 },
+        };
       },
     } as HostExecutor;
     const driver = createHostDriver({ enabled: true, executor });
@@ -61,7 +89,10 @@ describe("host driver — Section 30", () => {
       enabled: true,
       executor: {
         async screenshot() {
-          return { pngBase64: "", viewport: { width: 0, height: 0 } };
+          return {
+            pngBase64: "",
+            viewport: { width: 0, height: 0, devicePixelRatio: 1 },
+          };
         },
       } as HostExecutor,
     });
