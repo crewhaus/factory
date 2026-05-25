@@ -10,6 +10,8 @@ const SRC_DIR = import.meta.dir.replace(/([/\\])dist$/, "$1src");
 const CLI_PATH = join(SRC_DIR, "index.ts");
 const REPO_ROOT = join(import.meta.dir, "../../..");
 const HELLO_SPEC = join(REPO_ROOT, "apps/cli/test-fixtures/minimal-cli/crewhaus.yaml");
+const BROWSER_SPEC = join(REPO_ROOT, "apps/cli/test-fixtures/minimal-browser/crewhaus.yaml");
+const VOICE_SPEC = join(REPO_ROOT, "apps/cli/test-fixtures/minimal-voice/crewhaus.yaml");
 
 type RunResult = {
   exitCode: number;
@@ -136,6 +138,43 @@ describe("crewhaus run", () => {
     });
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("could not read");
+  });
+
+  test("browser target rejects --resume with a clear error (single-turn)", async () => {
+    const result = await runCli(
+      ["run", BROWSER_SPEC, "--resume", "sess_0123456789abcdef", "--prompt", "ignored"],
+      { env: { ANTHROPIC_API_KEY: "test-no-call" } },
+    );
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("--resume");
+    expect(result.stderr).toContain("browser");
+  });
+
+  test("browser target rejects --continue with a clear error (single-turn)", async () => {
+    const result = await runCli(["run", BROWSER_SPEC, "--continue", "--prompt", "ignored"], {
+      env: { ANTHROPIC_API_KEY: "test-no-call" },
+    });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("--continue");
+    expect(result.stderr).toContain("browser");
+  });
+
+  test("browser target errors with 'no prompt' when neither --prompt nor stdin supplies one", async () => {
+    const result = await runCli(["run", BROWSER_SPEC], {
+      env: { ANTHROPIC_API_KEY: "test-no-call" },
+      closeStdinImmediately: true,
+    });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("no prompt");
+  });
+
+  test("unsupported target names cli + browser in the dispatch error", async () => {
+    const result = await runCli(["run", VOICE_SPEC], {
+      env: { ANTHROPIC_API_KEY: "test-no-call" },
+    });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("cli or browser");
+    expect(result.stderr).toContain('got "voice"');
   });
 });
 

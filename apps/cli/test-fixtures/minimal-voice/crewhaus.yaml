@@ -1,0 +1,8 @@
+name: hello-voice
+target: voice
+agent:
+  model: claude-sonnet-4-6
+  instructions: |
+    You are a helpful voice assistant.
+voice:
+  provider: openai

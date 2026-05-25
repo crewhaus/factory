@@ -68,6 +68,7 @@ const RUN_SCHEMA: ParseArgsSchema = {
     { name: "permission-mode", takesValue: true },
     { name: "resume", takesValue: true },
     { name: "continue", takesValue: false },
+    { name: "prompt", takesValue: true },
     { name: "help", short: "h" },
   ],
 };
@@ -238,8 +239,9 @@ function usage(): never {
       "  compile <spec.yaml> -o <out-dir>     compile a spec to a runnable bundle",
       "  compile <spec.yaml> --emit-ir        print the lowered IR as JSON (debug)",
       "  run <spec.yaml> [--model <model>]    compile in-memory and execute the agent",
-      "                  [--resume <id>]      resume a specific session (event-log replay)",
-      "                  [--continue]         resume the most-recent session for this spec",
+      "                  [--resume <id>]      resume a specific session (cli targets only)",
+      "                  [--continue]         resume the most-recent session (cli targets only)",
+      "                  [--prompt <text>]    initial user prompt (browser targets; defaults to stdin)",
       "  eval <spec.yaml> --dataset <data>    run the agent against a dataset and grade",
       "       --graders <graders.yaml>       (deterministic graders + LLM-as-judge)",
       "       [--judge-model <model>] [--concurrency N] [--seed N] -o <out-dir>",
@@ -494,25 +496,12 @@ function buildRuleSet(
 async function runRun(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
-      "usage: crewhaus run <spec.yaml> [--model <model>] [--permission-mode <default|plan|auto|bypass>] [--resume <sessionId> | --continue]\n",
+      "usage: crewhaus run <spec.yaml> [--model <model>] [--permission-mode <default|plan|auto|bypass>] [--resume <sessionId> | --continue] [--prompt <text>]\n",
     );
     return;
   }
   const specPath = args.positional[0];
   if (typeof specPath !== "string") die("missing <spec.yaml>");
-
-  const resumeFlag = args.flags["resume"];
-  const continueFlag = args.flags["continue"] === true;
-  if (typeof resumeFlag === "string" && continueFlag) {
-    die("--resume and --continue are mutually exclusive");
-  }
-  let resumeId: string | undefined;
-  if (typeof resumeFlag === "string") {
-    if (!SESSION_ID_REGEX.test(resumeFlag)) {
-      die(`invalid --resume sessionId "${resumeFlag}" — expected sess_<16 hex>`);
-    }
-    resumeId = resumeFlag;
-  }
 
   const absSpec = resolve(specPath);
   logger.debug("run.start", { spec: absSpec });
@@ -532,10 +521,34 @@ async function runRun(args: ParsedArgs): Promise<void> {
     throw err;
   }
 
-  if (ir.target !== "cli") {
-    die(
-      `crewhaus run only supports target: cli (got "${ir.target}"). For workflow specs, compile and execute the bundle directly: bun apps/cli/src/index.ts compile <spec> -o <out> && bun <out>/agent.ts`,
-    );
+  if (ir.target === "cli") return runRunCli(args, ir, specPath);
+  if (ir.target === "browser") return runRunBrowser(args, ir);
+  die(
+    `crewhaus run supports target: cli or browser (got "${ir.target}"). Other target shapes are compile-only — see PACKAGES.md.`,
+  );
+}
+
+/**
+ * cli-target run path. Multi-turn interactive REPL, session-store backed,
+ * loads hooks/skills/slash-commands/sub-agents from the user's workspace,
+ * and wires every spec-declared MCP server.
+ */
+async function runRunCli(
+  args: ParsedArgs,
+  ir: Extract<ReturnType<typeof lower>, { target: "cli" }>,
+  specPath: string,
+): Promise<void> {
+  const resumeFlag = args.flags["resume"];
+  const continueFlag = args.flags["continue"] === true;
+  if (typeof resumeFlag === "string" && continueFlag) {
+    die("--resume and --continue are mutually exclusive");
+  }
+  let resumeId: string | undefined;
+  if (typeof resumeFlag === "string") {
+    if (!SESSION_ID_REGEX.test(resumeFlag)) {
+      die(`invalid --resume sessionId "${resumeFlag}" — expected sess_<16 hex>`);
+    }
+    resumeId = resumeFlag;
   }
 
   // --continue resolves to the most-recently-updated session for this
@@ -686,6 +699,143 @@ async function runRun(args: ParsedArgs): Promise<void> {
   } finally {
     if (mcpHost) await mcpHost.disconnectAll();
   }
+}
+
+/**
+ * browser-target run path. Single-turn: read one prompt (from --prompt or
+ * stdin), drive a chromium session via @crewhaus/computer-use-driver,
+ * disconnect cleanly. Mirrors the codegen template in
+ * packages/target-browser-driver/src/index.ts — keep them in sync.
+ *
+ * V0 deliberately omits MCP, hooks, skills, slash commands, and sub-agents:
+ * runChatLoop runs with `singleTurn: true`, so multi-turn-only features
+ * aren't load-bearing here. The cli path keeps them.
+ *
+ * The browser bundle emitter (line 96 of target-browser-driver) currently
+ * drops ir.tools / ir.toolConfigs / ir.mcp_servers — that's a known gap
+ * tracked separately. This run path honors ir.tools so spec-declared
+ * built-ins reach the agent.
+ */
+async function runRunBrowser(
+  args: ParsedArgs,
+  ir: Extract<ReturnType<typeof lower>, { target: "browser" }>,
+): Promise<void> {
+  if (args.flags["resume"] !== undefined || args.flags["continue"] === true) {
+    die("--resume and --continue are not supported for target: browser (single-turn)");
+  }
+
+  const promptFlag = args.flags["prompt"];
+  let prompt: string;
+  if (typeof promptFlag === "string" && promptFlag.length > 0) {
+    prompt = promptFlag;
+  } else if (process.stdin.isTTY) {
+    die("no prompt — pass --prompt <text> or pipe input on stdin");
+  } else {
+    prompt = (await readAllStdin()).trim();
+    if (prompt.length === 0) {
+      die("no prompt — pass --prompt <text> or pipe non-empty input on stdin");
+    }
+  }
+
+  let tools: RegisteredTool[] = [];
+  if (ir.tools.length > 0) {
+    await applyToolConfigs(ir.tools, ir.toolConfigs);
+    const toolMap = await loadToolMap();
+    tools = ir.tools.map((name) => {
+      const tool = toolMap[name];
+      if (!tool) {
+        const known = Object.keys(toolMap).sort().join(", ");
+        die(`unknown tool "${name}" — known tools: ${known}`);
+      }
+      return tool;
+    });
+  }
+
+  const modelOverride = args.flags["model"];
+  const model = typeof modelOverride === "string" ? modelOverride : ir.agent.model;
+
+  const flagMode = args.flags["permission-mode"];
+  let permissionMode: PermissionMode;
+  if (typeof flagMode === "string") {
+    if (!isValidPermissionMode(flagMode)) {
+      die(
+        `invalid --permission-mode "${flagMode}" — allowed: ${VALID_PERMISSION_MODES.join(", ")}`,
+      );
+    }
+    permissionMode = flagMode;
+  } else if (ir.permissions.mode !== undefined) {
+    permissionMode = ir.permissions.mode;
+  } else {
+    permissionMode = "default";
+  }
+
+  const permissionRules = buildRuleSet(ir.permissions.rules, process.cwd());
+
+  // Lazy-import the browser-runtime packages so cli/init/doctor invocations
+  // don't pay the playwright + computer-use-driver load cost.
+  const [{ createDriver }, screenCapture, mouseKeyboard, visionGrounding] = await Promise.all([
+    import("@crewhaus/computer-use-driver"),
+    import("@crewhaus/tool-screen-capture"),
+    import("@crewhaus/tool-mouse-keyboard"),
+    import("@crewhaus/tool-vision-grounding"),
+  ]);
+
+  const driver = createDriver({
+    backend: ir.driver.backend,
+    viewport: ir.driver.viewport,
+  });
+
+  emitEvent({ kind: "browser_start", backend: ir.driver.backend });
+  await driver.connect();
+  try {
+    if (ir.driver.startUrl !== undefined) {
+      await driver.goto(ir.driver.startUrl);
+      emitEvent({ kind: "navigated", url: ir.driver.startUrl });
+    }
+
+    const screenshotTool = screenCapture.createScreenshotTool({ driver });
+    const mk = mouseKeyboard.createAllMouseKeyboardTools({ driver });
+    const findElement = visionGrounding.createFindElementTool({
+      driver,
+      model: ir.groundingModel,
+    });
+    const allTools: RegisteredTool[] = [
+      screenshotTool,
+      mk.click,
+      mk.type,
+      mk.key,
+      mk.scroll,
+      findElement,
+      ...tools,
+    ];
+
+    const finalText = await runChatLoop({
+      model,
+      instructions: ir.agent.instructions,
+      tools: allTools,
+      permissionMode,
+      permissionRules,
+      sessionName: ir.name,
+      sessionTarget: "browser",
+      singleTurn: true,
+      seedMessages: [{ role: "user", content: prompt }],
+      installSigintHandler: false,
+      maxTokens: 4096,
+    });
+    emitEvent({ kind: "browser_done", finalText });
+  } finally {
+    await driver.disconnect();
+  }
+}
+
+async function readAllStdin(): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of process.stdin) chunks.push(chunk as Buffer);
+  return Buffer.concat(chunks).toString("utf-8");
+}
+
+function emitEvent(event: Record<string, unknown>): void {
+  process.stdout.write(`${JSON.stringify(event)}\n`);
 }
 
 type DoctorCheck = { label: string; pass: boolean; reason?: string; warn?: boolean };

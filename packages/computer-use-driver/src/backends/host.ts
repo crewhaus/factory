@@ -60,9 +60,10 @@ export function createHostDriver(opts: HostBackendOptions): Driver {
         "host backend cannot navigate URLs directly — open a browser via OS shell first",
       );
     },
-    async screenshot(): Promise<{ pngBase64: string; viewport: Viewport }> {
+    async screenshot(): Promise<Uint8Array> {
       if (!connected) throw new ComputerUseDriverError("host driver not connected");
-      return await opts.executor.screenshot();
+      const { pngBase64 } = await opts.executor.screenshot();
+      return Buffer.from(pngBase64, "base64");
     },
     async click(x: number, y: number, button = "left"): Promise<void> {
       if (!connected) throw new ComputerUseDriverError("host driver not connected");
@@ -76,9 +77,11 @@ export function createHostDriver(opts: HostBackendOptions): Driver {
       if (!connected) throw new ComputerUseDriverError("host driver not connected");
       await opts.executor.key(combo);
     },
-    async scroll(x: number, y: number, deltaX: number, deltaY: number): Promise<void> {
+    async scroll(dx: number, dy: number): Promise<void> {
       if (!connected) throw new ComputerUseDriverError("host driver not connected");
-      await opts.executor.scroll(x, y, deltaX, deltaY);
+      // Driver.scroll has no cursor coords; pass (0, 0) for the executor's
+      // anchor and let the host shim scroll at the focused window's origin.
+      await opts.executor.scroll(0, 0, dx, dy);
     },
     async getViewport(): Promise<Viewport> {
       if (!connected) throw new ComputerUseDriverError("host driver not connected");

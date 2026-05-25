@@ -110,7 +110,10 @@ function createChromiumDriver(opts: CreateDriverOptions): Driver {
   }> {
     try {
       // Lazy import so non-browser users don't need Playwright in their tree.
-      const mod = await import("playwright");
+      // The import is dynamic via a string indirection so `tsc` doesn't fail
+      // when playwright (an optional peer dep) isn't installed in CI.
+      const playwrightModule = "playwright";
+      const mod = await import(playwrightModule);
       return mod as unknown as { chromium: { launch: (...args: unknown[]) => unknown } };
     } catch (err) {
       throw new ComputerUseDriverError(
