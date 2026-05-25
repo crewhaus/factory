@@ -95,22 +95,69 @@ To compile to a different shape, change `target:` in `crewhaus.yaml` to one of t
 
 ## Example: one agent, multiple shapes
 
+The three specs below share an identical `agent:` (and `mcp_servers:`) block — only the `target:` and the shape-specific config below it change.
+
 ```yaml
-# cli.yaml
+# cli.yaml — local CLI agent
 name: github-issue-triage
 target: cli
 agent:
   model: claude-sonnet-4-6
   instructions: |
     You triage GitHub issues by reading them and assigning labels.
-tools:
-  - github:list_labels
-  - github:add_labels
+mcp_servers:
+  github:
+    transport: stdio
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-github"]
+    env:
+      GITHUB_PERSONAL_ACCESS_TOKEN: $GITHUB_TOKEN
 ```
 
+```yaml
+# slack.yaml — same agent, dispatched as a Slack bot
+name: github-issue-triage
+target: channel
+agent:
+  model: claude-sonnet-4-6
+  instructions: |
+    You triage GitHub issues by reading them and assigning labels.
+mcp_servers:
+  github:
+    transport: stdio
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-github"]
+    env:
+      GITHUB_PERSONAL_ACCESS_TOKEN: $GITHUB_TOKEN
+channels:
+  slack:
+    botToken: $SLACK_BOT_TOKEN
+    signingSecret: $SLACK_SIGNING_SECRET
+routing:
+  sessionKey: thread
+```
+
+```yaml
+# triage.yaml — same agent, graded against a labeled dataset
+name: github-issue-triage
+target: eval
+agent:
+  model: claude-sonnet-4-6
+  instructions: |
+    You triage GitHub issues by reading them and assigning labels.
+dataset:
+  name: triage-cases
+  version: v1
+  split: dev
+graders:
+  - name: exact_match
+concurrency: 4
+```
+
+> **Note on tools.** The `tools:` block (omitted above) lists *built-in* tools only — `read`, `webFetch`, `bash`, etc. Tools served by an MCP server are auto-discovered when you configure the server under `mcp_servers:`; you don't need to list them. Run `crewhaus compile --help` for the full built-in catalog.
+
 ```bash
-# Same agent block, three shapes — each spec swaps `target:` and adds its
-# own config (channels + routing for Slack, dataset + graders for eval).
+# Same agent block, three shapes.
 crewhaus compile cli.yaml    -o build/cli      # local CLI
 crewhaus compile slack.yaml  -o build/slack    # Slack bot
 crewhaus compile triage.yaml -o build/eval     # eval bundle
