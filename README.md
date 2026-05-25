@@ -93,77 +93,40 @@ crewhaus run crewhaus.yaml
 
 To compile to a different shape, change `target:` in `crewhaus.yaml` to one of the values from the table above (`channel`, `pipeline`, `eval`, …) and re-run `crewhaus compile`.
 
-## Example: one agent, multiple shapes
+## Example: one spec, multiple shapes
 
-The three specs below share an identical `agent:` (and `mcp_servers:`) block — only the `target:` and the shape-specific config below it change.
+The two specs below share an identical `agent:` block — only `target:` changes. The same agent compiles to either a local CLI or a browser/computer-use agent, with no other config.
 
 ```yaml
-# cli.yaml — local CLI agent
-name: github-issue-triage
+# cli.yaml — runs in a terminal
+name: research-assistant
 target: cli
 agent:
   model: claude-sonnet-4-6
   instructions: |
-    You triage GitHub issues by reading them and assigning labels.
-mcp_servers:
-  github:
-    transport: stdio
-    command: npx
-    args: ["-y", "@modelcontextprotocol/server-github"]
-    env:
-      GITHUB_PERSONAL_ACCESS_TOKEN: $GITHUB_TOKEN
+    You help users research a topic. Given a question, find
+    relevant sources and produce a short, cited summary.
 ```
 
 ```yaml
-# slack.yaml — same agent, dispatched as a Slack bot
-name: github-issue-triage
-target: channel
+# browser.yaml — same agent, driven against a real browser
+name: research-assistant
+target: browser
 agent:
   model: claude-sonnet-4-6
   instructions: |
-    You triage GitHub issues by reading them and assigning labels.
-mcp_servers:
-  github:
-    transport: stdio
-    command: npx
-    args: ["-y", "@modelcontextprotocol/server-github"]
-    env:
-      GITHUB_PERSONAL_ACCESS_TOKEN: $GITHUB_TOKEN
-channels:
-  slack:
-    botToken: $SLACK_BOT_TOKEN
-    signingSecret: $SLACK_SIGNING_SECRET
-routing:
-  sessionKey: thread
+    You help users research a topic. Given a question, find
+    relevant sources and produce a short, cited summary.
 ```
-
-```yaml
-# triage.yaml — same agent, graded against a labeled dataset
-name: github-issue-triage
-target: eval
-agent:
-  model: claude-sonnet-4-6
-  instructions: |
-    You triage GitHub issues by reading them and assigning labels.
-dataset:
-  name: triage-cases
-  version: v1
-  split: dev
-graders:
-  - name: exact_match
-concurrency: 4
-```
-
-> **Note on tools.** The `tools:` block (omitted above) lists *built-in* tools only — `read`, `webFetch`, `bash`, etc. Tools served by an MCP server are auto-discovered when you configure the server under `mcp_servers:`; you don't need to list them. Run `crewhaus compile --help` for the full built-in catalog.
 
 ```bash
-# Same agent block, three shapes.
-crewhaus compile cli.yaml    -o build/cli      # local CLI
-crewhaus compile slack.yaml  -o build/slack    # Slack bot
-crewhaus compile triage.yaml -o build/eval     # eval bundle
+crewhaus compile cli.yaml     -o build/cli      # local CLI agent
+crewhaus compile browser.yaml -o build/browser  # browser/computer-use agent
 ```
 
-Same agent. Different shapes. Different deployment paths.
+Same agent. Different runtimes. Only `target:` changed.
+
+Richer target shapes carry their own config block — `channels:` + `routing:` for a Slack bot, `dataset:` + `graders:` for an eval, `retrieve:` + `indexing:` for a RAG pipeline, `queue:` for a batch worker, `voice:` for a realtime agent — but the `agent:` block stays the same across all of them.
 
 ## Documentation
 
