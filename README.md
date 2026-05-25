@@ -147,10 +147,6 @@ The compiler, runtime, eval stack, and security fabric live in this repo. Toolin
 
 Community registry for shared harnesses, skills, tools, and recipes. **Coming Summer 2026.** [See what's coming →](https://forge.crewhaus.ai)
 
-## Want hands-on help?
-
-[StudioMax](https://studiomax.io/work/crewhaus) — the studio that built CrewHaus — offers fixed-scope implementation packages: install, configure, build your first harnesses, train your team.
-
 ## A hosted version?
 
 We may build a hosted CrewHaus eventually — managed runtime, private registry, observability. We're listening for signal first. [Tell us what you'd want →](https://cloud.crewhaus.ai). No promises.
