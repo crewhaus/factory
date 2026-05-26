@@ -1,0 +1,19 @@
+{
+  "name": "@crewhaus/cloud-adapter-railway",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "One-click deploy adapter for Railway — generates a railway.json + Dockerfile and wraps the Railway GraphQL API for daemon target shapes (Section 44)",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@crewhaus/docker-images": "workspace:*",
+    "@crewhaus/errors": "workspace:*"
+  }
+}
