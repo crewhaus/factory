@@ -299,6 +299,22 @@
         "@crewhaus/errors": "workspace:*",
       },
     },
+    "packages/cloud-adapter-heroku": {
+      "name": "@crewhaus/cloud-adapter-heroku",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/docker-images": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
+      },
+    },
+    "packages/cloud-adapter-railway": {
+      "name": "@crewhaus/cloud-adapter-railway",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/docker-images": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
+      },
+    },
     "packages/cloud-adapter-render": {
       "name": "@crewhaus/cloud-adapter-render",
       "version": "0.0.0",
@@ -1963,6 +1979,10 @@
     "@crewhaus/cli": ["@crewhaus/cli@workspace:apps/cli"],
 
     "@crewhaus/cloud-adapter-flyio": ["@crewhaus/cloud-adapter-flyio@workspace:packages/cloud-adapter-flyio"],
+
+    "@crewhaus/cloud-adapter-heroku": ["@crewhaus/cloud-adapter-heroku@workspace:packages/cloud-adapter-heroku"],
+
+    "@crewhaus/cloud-adapter-railway": ["@crewhaus/cloud-adapter-railway@workspace:packages/cloud-adapter-railway"],
 
     "@crewhaus/cloud-adapter-render": ["@crewhaus/cloud-adapter-render@workspace:packages/cloud-adapter-render"],
 

@@ -120,6 +120,8 @@
     { "path": "./packages/circuit-breaker" },
     { "path": "./packages/cloud-adapter-render" },
     { "path": "./packages/cloud-adapter-flyio" },
+    { "path": "./packages/cloud-adapter-railway" },
+    { "path": "./packages/cloud-adapter-heroku" },
     { "path": "./packages/spec-registry" },
     { "path": "./packages/ir-passes" },
     { "path": "./packages/migration-engine" },
