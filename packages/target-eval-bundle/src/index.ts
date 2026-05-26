@@ -22,7 +22,7 @@ export function emitEval(ir: IrEvalV0): Bundle {
 // Source spec: ${escapeJsonString(ir.name)} (target: eval, ir version: 0)
 import { resolve } from "node:path";
 import { createFileBackedRegistry } from "@crewhaus/dataset-registry";
-import { combineCompiledGraders, parseGradersConfig } from "@crewhaus/eval-grader";
+import { parseGradersConfig } from "@crewhaus/eval-grader";
 import { runEval } from "@crewhaus/eval-runner";
 
 const SPEC_NAME = ${escapeJsonString(ir.name)};
@@ -30,28 +30,44 @@ const MODEL = ${escapeJsonString(ir.agent.model)};
 const INSTRUCTIONS = ${escapeJsonString(ir.agent.instructions)};
 const DATASET = ${JSON.stringify(ir.dataset)};
 const GRADER_CONFIGS = ${JSON.stringify(ir.graders)};
+const AGENT_TOOLS = ${JSON.stringify(ir.agent.tools)};
 const CONCURRENCY = ${ir.concurrency};
 ${toolsLine}
 async function main(): Promise<void> {
   const registry = createFileBackedRegistry({
     rootDir: process.env["CREWHAUS_DATASETS_DIR"] ?? resolve(process.cwd(), ".crewhaus", "datasets"),
   });
-  const samples: Array<unknown> = [];
-  for await (const s of registry.get(DATASET.name, DATASET.version, DATASET.split)) {
-    samples.push(s);
-  }
   // Build a mini graders.yaml so we can reuse parseGradersConfig directly.
+  // The IR's graders[i].name is the type discriminator — emit both name
+  // (label) and type (discriminator), with opts inlined as sibling keys.
   const gradersYaml = "graders:\\n" +
     GRADER_CONFIGS.map((g: { name: string; opts?: Record<string, unknown> }) => {
-      const optsStr = g.opts ? \`\\n    opts: \${JSON.stringify(g.opts)}\` : "";
-      return \`  - name: \${g.name}\${optsStr}\`;
+      const optsLines = g.opts
+        ? Object.entries(g.opts).map(([k, v]) => \`    \${k}: \${JSON.stringify(v)}\`)
+        : [];
+      return [\`  - name: \${g.name}\`, \`    type: \${g.name}\`, ...optsLines].join("\\n");
     }).join("\\n");
   const { compiled } = parseGradersConfig(gradersYaml);
+  const ir = {
+    version: 0 as const,
+    name: SPEC_NAME,
+    target: "cli" as const,
+    agent: { model: MODEL, instructions: INSTRUCTIONS },
+    tools: AGENT_TOOLS,
+    toolConfigs: {},
+    mcp_servers: {},
+    permissions: { rules: [] },
+    subAgents: [],
+    compaction: {},
+  };
   const result = await runEval({
-    spec: { name: SPEC_NAME, model: MODEL, instructions: INSTRUCTIONS },
-    samples: { samples: samples as never } as never,
-    grader: combineCompiledGraders(compiled),
-    options: {
+    ir,
+    dataset: {
+      name: DATASET.name,
+      samples: registry.get(DATASET.name, DATASET.version, DATASET.split),
+    },
+    compiledGraders: compiled,
+    opts: {
       concurrency: CONCURRENCY,
 ${seedLine}    },
   });
