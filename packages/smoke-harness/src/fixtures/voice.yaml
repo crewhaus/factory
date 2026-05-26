@@ -1,0 +1,8 @@
+name: smoke-voice
+target: voice
+agent:
+  model: claude-sonnet-4-6
+  instructions: |
+    Smoke fixture for the voice shape. Be brief.
+voice:
+  provider: openai

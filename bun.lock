@@ -1127,6 +1127,15 @@
         "yaml": "^2.6.0",
       },
     },
+    "packages/smoke-harness": {
+      "name": "@crewhaus/smoke-harness",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/compiler": "workspace:*",
+        "@crewhaus/ir": "workspace:*",
+        "@crewhaus/spec": "workspace:*",
+      },
+    },
     "packages/spec": {
       "name": "@crewhaus/spec",
       "version": "0.0.0",
@@ -2112,6 +2121,8 @@
     "@crewhaus/skills-registry": ["@crewhaus/skills-registry@workspace:packages/skills-registry"],
 
     "@crewhaus/slash-commands": ["@crewhaus/slash-commands@workspace:packages/slash-commands"],
+
+    "@crewhaus/smoke-harness": ["@crewhaus/smoke-harness@workspace:packages/smoke-harness"],
 
     "@crewhaus/spec": ["@crewhaus/spec@workspace:packages/spec"],
 

@@ -1,0 +1,32 @@
+name: smoke-onchain-game
+target: onchain-game
+agent:
+  model: claude-sonnet-4-6
+  instructions: |
+    Smoke fixture for the onchain-game shape. Make optimal moves.
+chain:
+  id: base-sepolia
+  kind: evm
+  rpcUrls:
+    - $SMOKE_BASE_SEPOLIA_RPC
+  rpcPolicy: single
+  finality:
+    kind: confirmations
+    count: 1
+  reorgTolerant: true
+wallet:
+  id: player
+  chainId: base-sepolia
+  custody: local
+  signingPolicy: automated
+  keyRef: $SMOKE_PLAYER_KEY
+game:
+  contract:
+    id: tictactoe
+    chainId: base-sepolia
+    address: "0xgame0000000000000000000000000000000smoke"
+    abiRef: abi://tictactoe
+  stateReader: "9af14a16"
+  turnSemantics: turn-based
+  objective: |
+    Win or draw, never lose.

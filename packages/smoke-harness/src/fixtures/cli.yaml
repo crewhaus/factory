@@ -1,0 +1,6 @@
+name: smoke-cli
+target: cli
+agent:
+  model: claude-sonnet-4-6
+  instructions: |
+    You are a smoke fixture for the CLI shape. Reply concisely.

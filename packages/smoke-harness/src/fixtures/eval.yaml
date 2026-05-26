@@ -1,0 +1,13 @@
+name: smoke-eval
+target: eval
+agent:
+  model: claude-sonnet-4-6
+  instructions: |
+    Smoke fixture for the eval shape. Answer briefly.
+dataset:
+  name: smoke-eval
+  version: v1
+  split: dev
+graders:
+  - name: exact_match
+concurrency: 2

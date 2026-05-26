@@ -103,6 +103,7 @@ CrewHaus is a meta-harness compiler, not "yet another agent loop." Specs flow th
 - Targets receive their typed IR variant, never the raw spec. Reaching into `spec.foo` from an emitter breaks the polymorphism.
 - IR-level optimizations live in `packages/ir-passes/` as `(IrNode) → IrNode` functions.
 - The `assertNever(ir)` exhaustive check is non-negotiable.
+- Add the shape to the smoke matrix: drop a fixture at `packages/smoke-harness/src/fixtures/<shape>.yaml` and an entry in `packages/smoke-harness/src/assertions.ts`. Coverage tests fail if either is missing — this is how CI catches emitter drift.
 
 ### Pillar 2: Eval is active, not passive
 

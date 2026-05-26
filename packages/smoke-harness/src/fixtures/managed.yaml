@@ -1,0 +1,11 @@
+name: smoke-managed
+target: managed
+agent:
+  model: claude-sonnet-4-6
+  instructions: |
+    Smoke fixture for the managed-daemon shape.
+tenants:
+  - id: tenant-smoke
+    budget:
+      maxInputTokens: 100000
+      maxOutputTokens: 20000

@@ -1,0 +1,15 @@
+name: smoke-research
+target: research
+agent:
+  model: claude-sonnet-4-6
+  instructions: |
+    Smoke fixture for the research shape. Be concise.
+goal: |
+  Summarise the impact of X in one paragraph.
+branchingFactor: 2
+maxDurationMs: 60000
+retrieve:
+  allowedOrigins:
+    - https://docs.anthropic.com
+  allowedFileRoots:
+    - /tmp
