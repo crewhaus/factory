@@ -118,6 +118,7 @@
     { "path": "./packages/prompt-cache-manager" },
     { "path": "./packages/rate-limiter" },
     { "path": "./packages/circuit-breaker" },
+    { "path": "./packages/cloud-adapter-render" },
     { "path": "./packages/spec-registry" },
     { "path": "./packages/ir-passes" },
     { "path": "./packages/migration-engine" },

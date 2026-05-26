@@ -291,6 +291,14 @@
         "@crewhaus/errors": "workspace:*",
       },
     },
+    "packages/cloud-adapter-render": {
+      "name": "@crewhaus/cloud-adapter-render",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/docker-images": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
+      },
+    },
     "packages/compaction-autocompact": {
       "name": "@crewhaus/compaction-autocompact",
       "version": "0.0.0",
@@ -1945,6 +1953,8 @@
     "@crewhaus/citation-tracker": ["@crewhaus/citation-tracker@workspace:packages/citation-tracker"],
 
     "@crewhaus/cli": ["@crewhaus/cli@workspace:apps/cli"],
+
+    "@crewhaus/cloud-adapter-render": ["@crewhaus/cloud-adapter-render@workspace:packages/cloud-adapter-render"],
 
     "@crewhaus/compaction-autocompact": ["@crewhaus/compaction-autocompact@workspace:packages/compaction-autocompact"],
 
