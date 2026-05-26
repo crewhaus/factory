@@ -64,7 +64,7 @@ crewhaus compile && crewhaus run
 ## Intentionally NOT published
 
 - `factory` (the root workspace itself) — `"private": true` permanently. It's a workspace orchestrator, not a consumable package.
-- Everything under `demos/packages/` — Studio UI/server, IDE extensions, the browser playground, trace-viewer, graph-visualizer, wizard, scaffold-templates, plugin-sdk. Studio and friends live in [crewhaus/demos](https://github.com/crewhaus/demos) and consume factory via tsconfig path aliases.
+- Everything under `utilities/` — Studio UI/server, IDE extensions, the browser playground, trace-viewer, graph-visualizer, wizard, scaffold-templates, plugin-sdk. Studio and friends live in [crewhaus/utilities](https://github.com/crewhaus/utilities) and consume factory via tsconfig path aliases.
 - Everything under `demos/examples/` — `@crewhaus-examples/*` smoke tests per catalog section. Internal CI artifacts.
 - The sibling apps in the repo (`website/`, `cloud/`, `transition-site/`, `operations/`) — none are npm-shipped.
 
