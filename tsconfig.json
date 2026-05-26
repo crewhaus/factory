@@ -125,6 +125,7 @@
     { "path": "./packages/plugin-sdk" },
     { "path": "./packages/plugin-loader" },
     { "path": "./packages/plugin-registry" },
+    { "path": "./packages/module-marketplace-client" },
     { "path": "./packages/spec-registry" },
     { "path": "./packages/ir-passes" },
     { "path": "./packages/migration-engine" },

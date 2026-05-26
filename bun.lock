@@ -841,6 +841,15 @@
         "@crewhaus/adapter-openai": "workspace:*",
       },
     },
+    "packages/module-marketplace-client": {
+      "name": "@crewhaus/module-marketplace-client",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/plugin-registry": "workspace:*",
+        "@crewhaus/plugin-sdk": "workspace:*",
+      },
+    },
     "packages/otel-exporter": {
       "name": "@crewhaus/otel-exporter",
       "version": "0.0.0",
@@ -2120,6 +2129,8 @@
     "@crewhaus/migration-runner": ["@crewhaus/migration-runner@workspace:packages/migration-runner"],
 
     "@crewhaus/model-router": ["@crewhaus/model-router@workspace:packages/model-router"],
+
+    "@crewhaus/module-marketplace-client": ["@crewhaus/module-marketplace-client@workspace:packages/module-marketplace-client"],
 
     "@crewhaus/otel-exporter": ["@crewhaus/otel-exporter@workspace:packages/otel-exporter"],
 
