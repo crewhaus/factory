@@ -173,7 +173,7 @@ export async function spawnSubAgent(
   // those classifiers only saw the truncated previews of tool outputs.
   // A polymorphic jailbreak that the child's model absorbed and surfaced
   // in its summary would otherwise reach the parent's context window
-  // intact — see [recipe 41](https://github.com/crewhaus/demos/blob/main/recipes/41-security-fabric.md).
+  // intact — see [recipe 41](https://github.com/crewhaus/demos/blob/main/walkthroughs/41-security-fabric.md).
   // We replace `finalMessage` with the redaction notice on a malicious
   // verdict; suspicious is kept (the warn-action emits a trace event
   // through the classifier; nothing else to do here).
