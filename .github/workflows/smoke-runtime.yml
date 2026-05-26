@@ -1,9 +1,13 @@
 name: Smoke (runtime)
 
-# Opt-in runtime smoke for the browser target. Issues a real Anthropic
-# API call against a locally-served fixture page; asserts the agent
-# called Navigate + Screenshot and grounded its answer in the page.
-# This catches the "compiled + booted but didn't actually use the tools"
+# Opt-in runtime smoke for the runnable target shapes (cli + browser).
+# Issues real Anthropic API calls and asserts each agent actually used
+# the tools it was given:
+#   - browser: agent calls Navigate + Screenshot and grounds its answer
+#     in a locally-served fixture page (randomised magic phrase).
+#   - cli: agent calls the `read` tool on a randomised file and grounds
+#     its answer in the file content.
+# Catches the "compiled + booted but didn't actually use the tools"
 # failure mode — see PR #108 for the canonical example.
 #
 # Gated on the ANTHROPIC_API_KEY repository secret existing. Forks /
@@ -34,10 +38,10 @@ jobs:
       - name: Install Playwright chromium
         run: bunx playwright install --with-deps chromium
 
-      - name: Runtime smoke (browser)
+      - name: Runtime smoke (cli + browser)
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          # Make the runtime test fail (not skip) if the secret somehow
+          # Make the runtime tests fail (not skip) if the secret somehow
           # isn't set when this job runs.
           CREWHAUS_RUNTIME_SMOKE_REQUIRED: "1"
         run: bun run test:smoke:runtime
