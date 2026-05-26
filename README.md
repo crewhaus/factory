@@ -104,8 +104,10 @@ target: cli
 agent:
   model: claude-sonnet-4-6
   instructions: |
-    You help users research a topic. Given a question, find
-    relevant sources and produce a short, cited summary.
+    You help users research a topic. Given a question, produce a
+    short, cited summary. If you have browser tools, start by calling
+    Navigate to load https://duckduckgo.com/html/, then use Screenshot
+    to read what came back before answering.
 ```
 
 ```yaml
@@ -115,8 +117,10 @@ target: browser
 agent:
   model: claude-sonnet-4-6
   instructions: |
-    You help users research a topic. Given a question, find
-    relevant sources and produce a short, cited summary.
+    You help users research a topic. Given a question, produce a
+    short, cited summary. If you have browser tools, start by calling
+    Navigate to load https://duckduckgo.com/html/, then use Screenshot
+    to read what came back before answering.
 ```
 
 ```bash

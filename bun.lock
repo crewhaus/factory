@@ -66,6 +66,7 @@
         "@crewhaus/tool-image-generation": "workspace:*",
         "@crewhaus/tool-mcp": "workspace:*",
         "@crewhaus/tool-mouse-keyboard": "workspace:*",
+        "@crewhaus/tool-navigate": "workspace:*",
         "@crewhaus/tool-screen-capture": "workspace:*",
         "@crewhaus/tool-task": "workspace:*",
         "@crewhaus/tool-todo": "workspace:*",
@@ -1614,6 +1615,17 @@
         "zod": "^3.23.8",
       },
     },
+    "packages/tool-navigate": {
+      "name": "@crewhaus/tool-navigate",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/computer-use-driver": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "zod": "^3.23.8",
+      },
+    },
     "packages/tool-orchestrator": {
       "name": "@crewhaus/tool-orchestrator",
       "version": "0.0.0",
@@ -2190,6 +2202,8 @@
     "@crewhaus/tool-message-channel": ["@crewhaus/tool-message-channel@workspace:packages/tool-message-channel"],
 
     "@crewhaus/tool-mouse-keyboard": ["@crewhaus/tool-mouse-keyboard@workspace:packages/tool-mouse-keyboard"],
+
+    "@crewhaus/tool-navigate": ["@crewhaus/tool-navigate@workspace:packages/tool-navigate"],
 
     "@crewhaus/tool-orchestrator": ["@crewhaus/tool-orchestrator@workspace:packages/tool-orchestrator"],
 
