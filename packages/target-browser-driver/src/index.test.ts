@@ -167,12 +167,8 @@ describe("emitBrowserDriver — tool wiring (parity with runRunBrowser)", () => 
       toolConfigs: { fetch: { allowed_origins: ["https://example.com"] } },
     };
     const code = emitBrowserDriver(ir).files[0]?.content ?? "";
-    expect(code).toMatch(
-      /import \{ fetch, registerFetchConfig \} from "@crewhaus\/tool-fetch";/,
-    );
-    expect(code).toContain(
-      'registerFetchConfig({"allowed_origins":["https://example.com"]});',
-    );
+    expect(code).toMatch(/import \{ fetch, registerFetchConfig \} from "@crewhaus\/tool-fetch";/);
+    expect(code).toContain('registerFetchConfig({"allowed_origins":["https://example.com"]});');
     expect(code).toContain("defaultCatalog.register(fetch);");
     // init must come before the register call (so the tool sees its config
     // on first execute)
