@@ -142,7 +142,7 @@ Richer target shapes carry their own config block — `channels:` + `routing:` f
 ## Documentation
 
 - **New here?** Start with [Getting Started](https://github.com/crewhaus/docs/blob/main/GETTING-STARTED.md) — a guided tour from first principles to a runnable agent.
-- **Looking for a recipe?** See [Recipes Index](https://github.com/crewhaus/demos/blob/main/recipes/INDEX.md) — 40+ task-oriented walkthroughs.
+- **Looking for a recipe?** See [Recipes Index](https://github.com/crewhaus/demos/blob/main/walkthroughs/INDEX.md) — 40+ task-oriented walkthroughs.
 - **Need the module reference?** See [Module Catalog](https://github.com/crewhaus/docs/blob/main/MODULE-CATALOG.md) — full module catalog across the target-shape variants.
 - **Contributing?** See [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
@@ -152,7 +152,7 @@ The compiler, runtime, eval stack, and security fabric live in this repo. Toolin
 
 - **Studio** ([studio-server](https://github.com/crewhaus/utilities/tree/main/studio-server) + [studio-ui](https://github.com/crewhaus/utilities/tree/main/studio-ui), with [wizard](https://github.com/crewhaus/utilities/tree/main/wizard), [scaffold-templates](https://github.com/crewhaus/utilities/tree/main/scaffold-templates), [trace-viewer](https://github.com/crewhaus/utilities/tree/main/trace-viewer), [graph-visualizer](https://github.com/crewhaus/utilities/tree/main/graph-visualizer), [plugin-sdk](https://github.com/crewhaus/utilities/tree/main/plugin-sdk)) — Bun.serve daemon for spec authoring, run inspection, and plugin discovery.
 - **IDE extensions** — [VS Code](https://github.com/crewhaus/utilities/tree/main/vscode-extension), [JetBrains](https://github.com/crewhaus/utilities/tree/main/jetbrains-plugin), [browser playground](https://github.com/crewhaus/utilities/tree/main/crewhaus-playground).
-- **Section example specs** — [demos/examples](https://github.com/crewhaus/demos/tree/main/examples/) holds the per-section reference specs (`section-15-smoke`, `section-33-discord-smoke`, etc.) used to drive integration runs.
+- **Section example specs** — [demos/smoke](https://github.com/crewhaus/demos/tree/main/smoke/) holds the per-section reference specs (`section-15-smoke`, `section-33-discord-smoke`, etc.) used to drive integration runs.
 
 ## Crewhaus Forge
 
