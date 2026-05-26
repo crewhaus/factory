@@ -709,12 +709,10 @@ async function runRunCli(
  *
  * V0 deliberately omits MCP, hooks, skills, slash commands, and sub-agents:
  * runChatLoop runs with `singleTurn: true`, so multi-turn-only features
- * aren't load-bearing here. The cli path keeps them.
- *
- * The browser bundle emitter (line 96 of target-browser-driver) currently
- * drops ir.tools / ir.toolConfigs / ir.mcp_servers — that's a known gap
- * tracked separately. This run path honors ir.tools so spec-declared
- * built-ins reach the agent.
+ * aren't load-bearing here. The cli path keeps them. The browser bundle
+ * emitter (`@crewhaus/target-browser-driver`) honors ir.tools +
+ * ir.toolConfigs and similarly skips mcp_servers / compaction — extend
+ * both in lockstep if that ever changes.
  */
 async function runRunBrowser(
   args: ParsedArgs,
