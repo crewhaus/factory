@@ -291,6 +291,14 @@
         "@crewhaus/errors": "workspace:*",
       },
     },
+    "packages/cloud-adapter-flyio": {
+      "name": "@crewhaus/cloud-adapter-flyio",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/docker-images": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
+      },
+    },
     "packages/cloud-adapter-render": {
       "name": "@crewhaus/cloud-adapter-render",
       "version": "0.0.0",
@@ -1953,6 +1961,8 @@
     "@crewhaus/citation-tracker": ["@crewhaus/citation-tracker@workspace:packages/citation-tracker"],
 
     "@crewhaus/cli": ["@crewhaus/cli@workspace:apps/cli"],
+
+    "@crewhaus/cloud-adapter-flyio": ["@crewhaus/cloud-adapter-flyio@workspace:packages/cloud-adapter-flyio"],
 
     "@crewhaus/cloud-adapter-render": ["@crewhaus/cloud-adapter-render@workspace:packages/cloud-adapter-render"],
 
