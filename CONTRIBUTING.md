@@ -104,7 +104,8 @@ CrewHaus is a meta-harness compiler, not "yet another agent loop." Specs flow th
 - IR-level optimizations live in `packages/ir-passes/` as `(IrNode) → IrNode` functions.
 - The `assertNever(ir)` exhaustive check is non-negotiable.
 - Add the shape to the smoke matrix: drop a fixture at `packages/smoke-harness/src/fixtures/<shape>.yaml` and an entry in `packages/smoke-harness/src/assertions.ts`. Coverage tests fail if either is missing — this is how CI catches emitter drift.
-- The runtime smoke track (`bun run test:smoke:runtime`) drives a real Anthropic API call against the compiled `target: browser` bundle and asserts the agent actually used the tools. It's gated on `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` and runs only via the `Smoke (runtime)` workflow (manual dispatch + daily cron) so per-PR CI stays key-free.
+- The runtime smoke track (`bun run test:smoke:runtime`) drives real Anthropic API calls against the compiled bundles (`cli`, `browser`, `batch`) and asserts each agent actually used its tools. Gated on `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY`; runs via the `Smoke (runtime)` workflow (manual dispatch + daily cron) so per-PR CI stays key-free.
+- Service-backed shapes (`channel`, `onchain`, `voice`) are scaffolded but skip until their specific tokens + infra are wired. See [`packages/smoke-harness/RUNTIME-ACTIVATION.md`](packages/smoke-harness/RUNTIME-ACTIVATION.md) for what each shape needs and the activation checklist.
 
 ### Pillar 2: Eval is active, not passive
 

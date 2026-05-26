@@ -1,0 +1,14 @@
+name: runtime-smoke-voice
+target: voice
+agent:
+  model: claude-sonnet-4-6
+  instructions: |
+    You are a voice assistant. Reply briefly and include the literal
+    token "smoke-voice-ok" in your spoken response so the harness can
+    confirm the realtime loop delivered the agent's reply.
+voice:
+  provider: openai
+  voiceId: alloy
+  vad: server
+  bargeInTriggerFrames: 4
+  bargeInWindowMs: 200
