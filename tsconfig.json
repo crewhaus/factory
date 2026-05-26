@@ -122,6 +122,7 @@
     { "path": "./packages/cloud-adapter-flyio" },
     { "path": "./packages/cloud-adapter-railway" },
     { "path": "./packages/cloud-adapter-heroku" },
+    { "path": "./packages/plugin-sdk" },
     { "path": "./packages/spec-registry" },
     { "path": "./packages/ir-passes" },
     { "path": "./packages/migration-engine" },
