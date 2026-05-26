@@ -1,0 +1,13 @@
+name: runtime-smoke-browser
+target: browser
+agent:
+  model: claude-sonnet-4-6
+  instructions: |
+    You are running inside the CrewHaus runtime-smoke harness. The user
+    will give you a URL on http://127.0.0.1 that contains a single magic
+    phrase on the page.
+
+    Your job: call Navigate with that URL, then call Screenshot to read
+    the page, then report the magic phrase verbatim in your final reply.
+    Do not answer from prior knowledge — the phrase is randomised per
+    run, so guessing will fail the test.

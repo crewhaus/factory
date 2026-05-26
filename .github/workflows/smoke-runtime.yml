@@ -1,0 +1,43 @@
+name: Smoke (runtime)
+
+# Opt-in runtime smoke for the browser target. Issues a real Anthropic
+# API call against a locally-served fixture page; asserts the agent
+# called Navigate + Screenshot and grounded its answer in the page.
+# This catches the "compiled + booted but didn't actually use the tools"
+# failure mode — see PR #108 for the canonical example.
+#
+# Gated on the ANTHROPIC_API_KEY repository secret existing. Forks /
+# external PRs don't get the secret, so this job is automatically a
+# no-op for them.
+on:
+  # Trigger only when explicitly requested; keeps API spend predictable.
+  workflow_dispatch:
+  schedule:
+    # Daily catch on main so regressions get caught within 24h even if
+    # no PR runs the manual dispatch.
+    - cron: "17 9 * * *"
+
+jobs:
+  smoke-runtime:
+    runs-on: ubuntu-latest
+    if: ${{ github.repository == 'crewhaus/factory' }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ">=1.2.0"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Install Playwright chromium
+        run: bunx playwright install --with-deps chromium
+
+      - name: Runtime smoke (browser)
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Make the runtime test fail (not skip) if the secret somehow
+          # isn't set when this job runs.
+          CREWHAUS_RUNTIME_SMOKE_REQUIRED: "1"
+        run: bun run test:smoke:runtime

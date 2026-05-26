@@ -10,7 +10,8 @@
     "build": "tsc -b",
     "clean": "tsc -b --clean && rm -rf packages/*/dist apps/*/dist",
     "test": "bun --filter '@crewhaus/*' test",
-    "test:smoke": "bun test packages/smoke-harness",
+    "test:smoke": "bun test packages/smoke-harness/src/index.test.ts",
+    "test:smoke:runtime": "bun test packages/smoke-harness/src/runtime.test.ts",
     "lint": "biome check .",
     "lint:fix": "biome check --write ."
   },
