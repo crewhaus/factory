@@ -27,7 +27,7 @@
  *
  * Catalog layer: R6 (extension of §17 compaction primitives, symmetric to
  * `compaction-autocompact` and `compaction-snip`). Recipe:
- * demos/recipes/52-context-curation.md.
+ * demos/walkthroughs/52-context-curation.md.
  */
 import { CrewhausError } from "@crewhaus/errors";
 

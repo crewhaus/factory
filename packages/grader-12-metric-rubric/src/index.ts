@@ -27,8 +27,8 @@
  * not graders — they're aggregators that fold a `ReadonlyArray<GradeResult>`
  * into a category-roll-up summary. See `summarize12MetricRubric` below.
  *
- * Catalog layer: R-eval. Recipes: demos/recipes/12-eval-harness.md and
- * demos/recipes/34-building-custom-graders.md.
+ * Catalog layer: R-eval. Recipes: demos/walkthroughs/12-eval-harness.md and
+ * demos/walkthroughs/34-building-custom-graders.md.
  */
 import type { Sample } from "@crewhaus/eval-dataset";
 import type { GradeResult, Grader, RunResult } from "@crewhaus/eval-grader";
@@ -200,7 +200,7 @@ function missingField(field: string, metric: string): GradeResult {
   return {
     passed: false,
     score: 0,
-    rationale: `${metric} requires Sample.${field}; supply it in your dataset to get a real verdict (see demos/recipes/12-eval-harness.md)`,
+    rationale: `${metric} requires Sample.${field}; supply it in your dataset to get a real verdict (see demos/walkthroughs/12-eval-harness.md)`,
   };
 }
 

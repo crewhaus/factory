@@ -25,7 +25,7 @@
  *      network egress. The egress-classifier short-circuits on internal
  *      tools so this is performance-preserving by design.
  *
- * Catalog layer: R3 (tools). Recipe: demos/recipes/54-codegraph-tool.md.
+ * Catalog layer: R3 (tools). Recipe: demos/walkthroughs/54-codegraph-tool.md.
  */
 import { CrewhausError } from "@crewhaus/errors";
 import { buildTool } from "@crewhaus/tool-builder";

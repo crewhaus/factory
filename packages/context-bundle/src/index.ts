@@ -140,7 +140,7 @@ function listRecipes(demosRoot: string, sources: ContextBundleSource[]): string 
     const text = readFileSync(path, "utf-8");
     sources.push({ path, bytes: Buffer.byteLength(text, "utf-8") });
     const title = firstHeading(text) ?? basename(file, ".md");
-    rows.push(`- [${file}](demos/recipes/${file}) — ${title}`);
+    rows.push(`- [${file}](demos/walkthroughs/${file}) — ${title}`);
   }
   return rows.join("\n");
 }

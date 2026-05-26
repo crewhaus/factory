@@ -43,7 +43,7 @@
  * a perf optimisation.
  *
  * Catalog layer: R8 (extension of §18 safety primitives, symmetric to
- * `boundary-classifier`). Recipe: demos/recipes/51-egress-fabric.md.
+ * `boundary-classifier`). Recipe: demos/walkthroughs/51-egress-fabric.md.
  */
 import { createHash } from "node:crypto";
 import { CrewhausError } from "@crewhaus/errors";
