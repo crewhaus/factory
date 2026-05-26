@@ -25,9 +25,9 @@ import { createFileBackedRegistry } from "@crewhaus/dataset-registry";
 import { combineCompiledGraders, parseGradersConfig } from "@crewhaus/eval-grader";
 import { runEval } from "@crewhaus/eval-runner";
 
-const SPEC_NAME = "${escapeJsonString(ir.name)}";
-const MODEL = "${escapeJsonString(ir.agent.model)}";
-const INSTRUCTIONS = "${escapeJsonString(ir.agent.instructions)}";
+const SPEC_NAME = ${escapeJsonString(ir.name)};
+const MODEL = ${escapeJsonString(ir.agent.model)};
+const INSTRUCTIONS = ${escapeJsonString(ir.agent.instructions)};
 const DATASET = ${JSON.stringify(ir.dataset)};
 const GRADER_CONFIGS = ${JSON.stringify(ir.graders)};
 const CONCURRENCY = ${ir.concurrency};
