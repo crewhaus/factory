@@ -119,6 +119,7 @@
     { "path": "./packages/rate-limiter" },
     { "path": "./packages/circuit-breaker" },
     { "path": "./packages/cloud-adapter-render" },
+    { "path": "./packages/cloud-adapter-flyio" },
     { "path": "./packages/spec-registry" },
     { "path": "./packages/ir-passes" },
     { "path": "./packages/migration-engine" },
