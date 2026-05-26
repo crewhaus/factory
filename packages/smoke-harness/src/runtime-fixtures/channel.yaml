@@ -1,0 +1,17 @@
+name: runtime-smoke-channel
+target: channel
+agent:
+  model: claude-sonnet-4-6
+  instructions: |
+    You are a Slack bot. When you receive a message, reply with a short
+    acknowledgement that includes the literal token "smoke-channel-ok"
+    so the harness can confirm the agent loop fired end-to-end.
+channels:
+  slack:
+    botToken: $SMOKE_SLACK_BOT_TOKEN
+    signingSecret: $SMOKE_SLACK_SIGNING_SECRET
+routing:
+  sessionKey: thread
+gateway:
+  port: 18790
+  ui: false

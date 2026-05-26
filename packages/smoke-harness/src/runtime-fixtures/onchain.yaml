@@ -1,0 +1,30 @@
+name: runtime-smoke-onchain
+target: onchain
+agent:
+  model: claude-sonnet-4-6
+  instructions: |
+    You are an onchain reactor. When a Transfer event fires, reply with
+    a short acknowledgement including the literal token
+    "smoke-onchain-ok" so the harness can confirm the trigger loop
+    delivered the decoded event to the agent.
+chains:
+  - id: smoke-chain
+    kind: evm
+    rpcUrls:
+      - $SMOKE_ONCHAIN_RPC
+    rpcPolicy: single
+    finality:
+      kind: confirmations
+      count: 1
+    reorgTolerant: true
+contracts:
+  - id: smoke-token
+    chainId: smoke-chain
+    address: "0x0000000000000000000000000000000000000001"
+    abiRef: abi://erc20
+triggers:
+  - kind: event
+    chainId: smoke-chain
+    contract: smoke-token
+    event: Transfer
+idempotencyWindowMs: 60000

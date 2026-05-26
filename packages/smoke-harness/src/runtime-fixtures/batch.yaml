@@ -1,0 +1,17 @@
+name: runtime-smoke-batch
+target: batch
+agent:
+  model: claude-haiku-4-5-20251001
+  instructions: |
+    You are a batch worker. The user message is one job input. Reply
+    with a single short sentence that includes the literal token
+    "smoke-batch-ok" so the harness can confirm you processed the job.
+queue:
+  adapter: in-memory
+  visibilityTimeoutMs: 30000
+  maxRetries: 1
+  seedJobs:
+    - "first smoke job"
+    - "second smoke job"
+concurrency: 1
+idempotencyWindowMs: 60000
