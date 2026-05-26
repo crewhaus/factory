@@ -1,0 +1,6 @@
+name: smoke-browser
+target: browser
+agent:
+  model: claude-sonnet-4-6
+  instructions: |
+    Smoke fixture: Navigate then Screenshot before answering.

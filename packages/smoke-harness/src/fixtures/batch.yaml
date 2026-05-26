@@ -1,0 +1,15 @@
+name: smoke-batch
+target: batch
+agent:
+  model: claude-sonnet-4-6
+  instructions: |
+    Smoke fixture for the batch shape. Process each job briefly.
+queue:
+  adapter: in-memory
+  visibilityTimeoutMs: 30000
+  maxRetries: 3
+  seedJobs:
+    - smoke job 1
+    - smoke job 2
+concurrency: 2
+idempotencyWindowMs: 60000

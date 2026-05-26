@@ -1,0 +1,16 @@
+name: smoke-graph
+target: graph
+model: claude-sonnet-4-6
+entry: plan
+nodes:
+  plan:
+    instructions: Plan the work.
+  execute:
+    instructions: Execute the plan.
+  summarise:
+    instructions: Summarise the result.
+edges:
+  - from: plan
+    to: execute
+  - from: execute
+    to: summarise

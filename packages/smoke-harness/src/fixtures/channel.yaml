@@ -1,0 +1,12 @@
+name: smoke-channel
+target: channel
+agent:
+  model: claude-sonnet-4-6
+  instructions: |
+    Smoke fixture for the channel shape. Reply briefly.
+channels:
+  slack:
+    botToken: $SMOKE_SLACK_BOT_TOKEN
+    signingSecret: $SMOKE_SLACK_SIGNING_SECRET
+routing:
+  sessionKey: thread

@@ -1,0 +1,8 @@
+name: smoke-workflow
+target: workflow
+model: claude-sonnet-4-6
+steps:
+  - name: list
+    instructions: List the inputs.
+  - name: summarise
+    instructions: Summarise the listed inputs in two sentences.

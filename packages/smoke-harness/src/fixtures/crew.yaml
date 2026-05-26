@@ -1,0 +1,11 @@
+name: smoke-crew
+target: crew
+model: claude-sonnet-4-6
+entry: researcher
+roles:
+  researcher:
+    instructions: |
+      You are the researcher. Find the relevant facts.
+  writer:
+    instructions: |
+      You are the writer. Write a one-paragraph summary.
