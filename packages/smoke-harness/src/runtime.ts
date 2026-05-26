@@ -1,5 +1,6 @@
 /**
- * Runtime smoke for the browser target — Phase 3 of the smoke plan.
+ * Runtime smoke for the runnable target shapes (cli, browser) — Phase 3
+ * of the smoke plan.
  *
  * Compile-time smoke (`./index.ts`) catches "did the emitter wire the
  * right imports?" but cannot catch "did the agent actually use the
@@ -9,24 +10,23 @@
  * without ever navigating. Compile-time was green; the user experience
  * was broken.
  *
- * This harness drives the canonical bug-shape end-to-end:
- *   1. Spin up a local Bun.serve on 127.0.0.1 with a randomised magic
- *      phrase embedded in the HTML.
- *   2. Spawn `crewhaus run` on a browser fixture with --prompt that
- *      tells the model to navigate to that URL and report the phrase.
- *   3. After the subprocess exits, read the .jsonl event log out of
- *      `CREWHAUS_SESSION_DIR` and assert:
- *        - a `tool_use` event with name="Navigate" appeared
- *        - a `tool_use` event with name="Screenshot" appeared
- *        - the final `browser_done` event's `finalText` contains the
- *          magic phrase (proving the model grounded its answer in the
- *          page, not in training data).
+ * Common shape (both `runBrowserRuntimeSmoke` and `runCliRuntimeSmoke`):
+ *   - Generate a randomised "magic phrase" that the agent can only
+ *     learn by using a tool — a local Bun.serve page for browser, a
+ *     temp file for cli — so guessing from training data fails.
+ *   - Spawn `crewhaus run` as a subprocess with
+ *     `CREWHAUS_SESSION_DIR=<tmp>` so the runtime's `.jsonl` event log
+ *     lands somewhere we can read post-exit.
+ *   - After exit, parse the event log and assert: (a) the expected
+ *     `tool_use` events fired in the right order, and (b) the final
+ *     assistant turn contains the magic phrase.
  *
- * The whole track is gated on `ANTHROPIC_API_KEY` being set. CI runs
- * it via a separate opt-in job that exports the secret; the main
- * matrix stays key-free.
+ * Both tracks are gated on `ANTHROPIC_AUTH_TOKEN` (OAuth) or
+ * `ANTHROPIC_API_KEY`. The main CI matrix runs key-free (tests skip
+ * cleanly); the opt-in `Smoke (runtime)` workflow exports the secret
+ * and flips skip → fail via `CREWHAUS_RUNTIME_SMOKE_REQUIRED=1`.
  */
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -155,6 +155,142 @@ function toolUseNames(events: ReadonlyArray<{ kind: string; payload: unknown }>)
       const p = e.payload as { name?: unknown };
       return typeof p?.name === "string" ? p.name : "<unknown>";
     });
+}
+
+/**
+ * Pull the text content out of every `assistant_message` event in spec
+ * order. The runtime serialises the model's output as a discriminated
+ * union of content blocks; we collapse the text-typed blocks per turn
+ * and return one string per assistant turn.
+ */
+function assistantTexts(events: ReadonlyArray<{ kind: string; payload: unknown }>): string[] {
+  const out: string[] = [];
+  for (const e of events) {
+    if (e.kind !== "assistant_message") continue;
+    const p = e.payload as { content?: unknown };
+    const content = p?.content;
+    if (typeof content === "string") {
+      out.push(content);
+      continue;
+    }
+    if (!Array.isArray(content)) continue;
+    const parts: string[] = [];
+    for (const block of content) {
+      const b = block as { type?: string; text?: unknown };
+      if (b?.type === "text" && typeof b.text === "string") parts.push(b.text);
+    }
+    if (parts.length > 0) out.push(parts.join(""));
+  }
+  return out;
+}
+
+/**
+ * cli runtime smoke. Drives `crewhaus run` with target: cli (multi-turn
+ * REPL) by piping a single prompt over stdin and then closing stdin —
+ * the REPL processes the one turn and exits cleanly on EOF (see the
+ * `STDIN_CLOSED` race in runtime-core/index.ts:1730). The fixture
+ * spec declares the `read` tool, and the harness writes a randomised
+ * magic-phrase file to a tmp dir so the only way for the agent to
+ * answer correctly is to actually call `read`.
+ */
+export async function runCliRuntimeSmoke(
+  opts: {
+    timeoutMs?: number;
+  } = {},
+): Promise<RuntimeSmokeResult> {
+  if (!runtimeSmokeIsEnabled()) {
+    return {
+      shape: "cli",
+      status: "skipped",
+      failures: [],
+      skipReason: "neither ANTHROPIC_AUTH_TOKEN nor a real ANTHROPIC_API_KEY is set",
+    };
+  }
+
+  const sessionDir = mkdtempSync(join(tmpdir(), "crewhaus-runtime-cli-"));
+  const workDir = mkdtempSync(join(tmpdir(), "crewhaus-runtime-cli-work-"));
+  const phrase = `crewhaus-magic-cli-${crypto.randomUUID().slice(0, 8)}`;
+  const secretFile = join(workDir, "secret.txt");
+  writeFileSync(secretFile, `The magic phrase is: ${phrase}\n`);
+
+  try {
+    const prompt = `Use the read tool to read ${secretFile}, then reply with the magic phrase verbatim and stop.`;
+    const fixture = join(RUNTIME_FIXTURES_DIR, "cli.yaml");
+    const env: Record<string, string> = {
+      PATH: process.env["PATH"] ?? "",
+      CREWHAUS_SESSION_DIR: sessionDir,
+    };
+    const oauth = process.env["ANTHROPIC_AUTH_TOKEN"];
+    const apiKey = process.env["ANTHROPIC_API_KEY"];
+    if (oauth !== undefined && oauth !== "") env["ANTHROPIC_AUTH_TOKEN"] = oauth;
+    if (apiKey !== undefined && apiKey !== "") env["ANTHROPIC_API_KEY"] = apiKey;
+
+    const proc = Bun.spawn([process.execPath, CLI_PATH, "run", fixture], {
+      cwd: REPO_ROOT,
+      env,
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    // Write the single prompt then close stdin. The REPL's `you>` loop
+    // races each rl.question against a closed-stdin signal, so EOF makes
+    // it break cleanly after the one turn has finished.
+    if (proc.stdin) {
+      proc.stdin.write(`${prompt}\n`);
+      proc.stdin.end();
+    }
+
+    const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    const timer = setTimeout(() => proc.kill("SIGKILL"), timeoutMs);
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    clearTimeout(timer);
+
+    const failures: string[] = [];
+    if (exitCode !== 0) {
+      failures.push(`crewhaus run exited non-zero (${exitCode})`);
+    }
+
+    const events = readSessionEventLog(sessionDir);
+    if (events.length === 0) {
+      failures.push(`no event-log .jsonl written to ${sessionDir}`);
+    }
+
+    const toolNames = toolUseNames(events);
+    if (!toolNames.includes("read")) {
+      failures.push(`expected a tool_use event with name="read", got [${toolNames.join(", ")}]`);
+    }
+
+    // Confirm the agent's final reply grounds in the file content. The
+    // last assistant_message in the log is the model's terminal reply
+    // to the user; any earlier ones happen before the read tool result
+    // is fed back in.
+    const turns = assistantTexts(events);
+    const finalText = turns.at(-1) ?? "";
+    if (!finalText.includes(phrase)) {
+      failures.push(
+        `final assistant turn does not contain the magic phrase ${JSON.stringify(phrase)} — ` +
+          `the agent did not ground its answer in the file content. Last turn was: ${JSON.stringify(finalText.slice(0, 240))}`,
+      );
+    }
+
+    return {
+      shape: "cli",
+      status: failures.length === 0 ? "ok" : "failed",
+      failures,
+      stdout,
+      stderr,
+      events,
+      finalText,
+    };
+  } finally {
+    rmSync(sessionDir, { recursive: true, force: true });
+    rmSync(workDir, { recursive: true, force: true });
+  }
 }
 
 export async function runBrowserRuntimeSmoke(
