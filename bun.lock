@@ -890,6 +890,14 @@
         "@crewhaus/model-router": "workspace:*",
       },
     },
+    "packages/plugin-sdk": {
+      "name": "@crewhaus/plugin-sdk",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+      },
+    },
     "packages/policy-engine": {
       "name": "@crewhaus/policy-engine",
       "version": "0.0.0",
@@ -2107,6 +2115,8 @@
     "@crewhaus/pipeline-engine": ["@crewhaus/pipeline-engine@workspace:packages/pipeline-engine"],
 
     "@crewhaus/planner": ["@crewhaus/planner@workspace:packages/planner"],
+
+    "@crewhaus/plugin-sdk": ["@crewhaus/plugin-sdk@workspace:packages/plugin-sdk"],
 
     "@crewhaus/policy-engine": ["@crewhaus/policy-engine@workspace:packages/policy-engine"],
 
