@@ -898,6 +898,15 @@
         "@crewhaus/plugin-sdk": "workspace:*",
       },
     },
+    "packages/plugin-registry": {
+      "name": "@crewhaus/plugin-registry",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/plugin-sdk": "workspace:*",
+        "@crewhaus/secrets-manager": "workspace:*",
+      },
+    },
     "packages/plugin-sdk": {
       "name": "@crewhaus/plugin-sdk",
       "version": "0.0.0",
@@ -2125,6 +2134,8 @@
     "@crewhaus/planner": ["@crewhaus/planner@workspace:packages/planner"],
 
     "@crewhaus/plugin-loader": ["@crewhaus/plugin-loader@workspace:packages/plugin-loader"],
+
+    "@crewhaus/plugin-registry": ["@crewhaus/plugin-registry@workspace:packages/plugin-registry"],
 
     "@crewhaus/plugin-sdk": ["@crewhaus/plugin-sdk@workspace:packages/plugin-sdk"],
 
