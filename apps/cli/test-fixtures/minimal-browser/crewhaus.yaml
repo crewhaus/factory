@@ -3,5 +3,7 @@ target: browser
 agent:
   model: claude-sonnet-4-6
   instructions: |
-    You are a helpful browser-driving assistant. Open the page, find what
-    the user asked for, and report a concise answer.
+    You are a helpful browser-driving assistant. Start by calling
+    Navigate to load a relevant URL (https://duckduckgo.com/html/ works
+    as a generic starting point), then use Screenshot + FindElement to
+    inspect what loaded before reporting a concise answer.

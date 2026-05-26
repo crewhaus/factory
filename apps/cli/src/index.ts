@@ -771,12 +771,14 @@ async function runRunBrowser(
 
   // Lazy-import the browser-runtime packages so cli/init/doctor invocations
   // don't pay the playwright + computer-use-driver load cost.
-  const [{ createDriver }, screenCapture, mouseKeyboard, visionGrounding] = await Promise.all([
-    import("@crewhaus/computer-use-driver"),
-    import("@crewhaus/tool-screen-capture"),
-    import("@crewhaus/tool-mouse-keyboard"),
-    import("@crewhaus/tool-vision-grounding"),
-  ]);
+  const [{ createDriver }, navigate, screenCapture, mouseKeyboard, visionGrounding] =
+    await Promise.all([
+      import("@crewhaus/computer-use-driver"),
+      import("@crewhaus/tool-navigate"),
+      import("@crewhaus/tool-screen-capture"),
+      import("@crewhaus/tool-mouse-keyboard"),
+      import("@crewhaus/tool-vision-grounding"),
+    ]);
 
   const driver = createDriver({
     backend: ir.driver.backend,
@@ -791,6 +793,7 @@ async function runRunBrowser(
       emitEvent({ kind: "navigated", url: ir.driver.startUrl });
     }
 
+    const navigateTool = navigate.createNavigateTool({ driver });
     const screenshotTool = screenCapture.createScreenshotTool({ driver });
     const mk = mouseKeyboard.createAllMouseKeyboardTools({ driver });
     const findElement = visionGrounding.createFindElementTool({
@@ -798,6 +801,7 @@ async function runRunBrowser(
       model: ir.groundingModel,
     });
     const allTools: RegisteredTool[] = [
+      navigateTool,
       screenshotTool,
       mk.click,
       mk.type,

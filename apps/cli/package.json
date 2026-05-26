@@ -57,6 +57,7 @@
     "@crewhaus/tool-document-ingest": "workspace:*",
     "@crewhaus/tool-mcp": "workspace:*",
     "@crewhaus/tool-mouse-keyboard": "workspace:*",
+    "@crewhaus/tool-navigate": "workspace:*",
     "@crewhaus/tool-screen-capture": "workspace:*",
     "@crewhaus/tool-task": "workspace:*",
     "@crewhaus/tool-todo": "workspace:*",

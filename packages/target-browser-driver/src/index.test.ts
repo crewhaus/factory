@@ -23,15 +23,31 @@ describe("emitBrowserDriver", () => {
     expect(bundle.files[0]?.path).toBe("agent.ts");
   });
 
-  test("agent.ts wires driver + screenshot + mouse-keyboard + vision-grounding", () => {
+  test("agent.ts wires driver + navigate + screenshot + mouse-keyboard + vision-grounding", () => {
     const code = emitBrowserDriver(baseIr).files[0]?.content ?? "";
     expect(code).toContain("@crewhaus/computer-use-driver");
+    expect(code).toContain("@crewhaus/tool-navigate");
     expect(code).toContain("@crewhaus/tool-screen-capture");
     expect(code).toContain("@crewhaus/tool-mouse-keyboard");
     expect(code).toContain("@crewhaus/tool-vision-grounding");
+    expect(code).toContain("createNavigateTool");
     expect(code).toContain("createScreenshotTool");
     expect(code).toContain("createAllMouseKeyboardTools");
     expect(code).toContain("createFindElementTool");
+  });
+
+  test("Navigate is listed first in the runtime tools array (bootstrap before others)", () => {
+    const code = emitBrowserDriver(baseIr).files[0]?.content ?? "";
+    // The emitted line declares the tools array. Navigate must appear before
+    // Screenshot / Click / Type / Key / Scroll / FindElement so the agent has
+    // an obvious entry point when no startUrl is set.
+    const toolsLine = code.split("\n").find((l) => l.includes("const tools = ["));
+    expect(toolsLine).toBeDefined();
+    expect(toolsLine).toContain("navigateTool");
+    const navIdx = toolsLine?.indexOf("navigateTool") ?? -1;
+    const screenshotIdx = toolsLine?.indexOf("screenshotTool") ?? -1;
+    expect(navIdx).toBeGreaterThanOrEqual(0);
+    expect(screenshotIdx).toBeGreaterThan(navIdx);
   });
 
   test("startUrl, when set, triggers driver.goto() before runChatLoop", () => {

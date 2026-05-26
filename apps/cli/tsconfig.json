@@ -45,6 +45,7 @@
     { "path": "../../packages/tool-image" },
     { "path": "../../packages/tool-mcp" },
     { "path": "../../packages/tool-mouse-keyboard" },
+    { "path": "../../packages/tool-navigate" },
     { "path": "../../packages/tool-screen-capture" },
     { "path": "../../packages/tool-task" },
     { "path": "../../packages/tool-todo" },
