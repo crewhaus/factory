@@ -33,6 +33,11 @@ const PALETTE: Record<TraceEventKind, string> = {
   // Section 27 — production hardening events
   cost_accrual: "\x1b[2m", // dim — high-volume per-response accruals
   circuit_state_changed: "\x1b[31m", // red — degradation warnings stand out
+  // Track F (§57) — AgentFlow-style runtime feedback channels
+  test_verdict: "\x1b[32m", // green by default; pretty printer flips to red for fail
+  program_output: "\x1b[2m", // dim — high-volume
+  coverage_report: "\x1b[34m", // blue
+  sanitizer_report: "\x1b[31m", // red — almost always a finding
 };
 
 export function colorize(kind: TraceEventKind, text: string, useColor: boolean): string {

@@ -254,6 +254,73 @@ export type CostAccrualEvent = TraceEventEnvelope & {
 };
 
 /**
+ * Track F (Section 57) — runtime feedback channel: test verdict.
+ * Source: AgentFlow (arxiv 2604.20801, §3.2). Emitted by an `eval`
+ * target or any test-running tool to report a structured pass/fail.
+ * Separate event kind from `tool_call_end` so the optimizer can
+ * filter cheaply and so OTel exporters can route verdicts to a
+ * different sink (often a verdict-focused dashboard, not a generic
+ * tool-call trace).
+ */
+export type TestVerdictEvent = TraceEventEnvelope & {
+  kind: "test_verdict";
+  testId: string;
+  verdict: "pass" | "fail" | "skip" | "error";
+  /** Optional human-readable reason for the verdict. */
+  reason?: string;
+  durationMs: number;
+};
+
+/**
+ * Track F (Section 57) — runtime feedback channel: program stdout/stderr.
+ * Source: AgentFlow (arxiv 2604.20801, §3.2). Emitted by sandboxed
+ * program runs (`tool-code-execution`, `tool-bash`). Per-chunk
+ * emission is `tool_stream_chunk`; this event is the per-process
+ * summary that lands at exit.
+ */
+export type ProgramOutputEvent = TraceEventEnvelope & {
+  kind: "program_output";
+  programId: string;
+  exitCode: number;
+  stdoutBytes: number;
+  stderrBytes: number;
+  durationMs: number;
+};
+
+/**
+ * Track F (Section 57) — runtime feedback channel: coverage report.
+ * Source: AgentFlow (arxiv 2604.20801, §3.2). Line/branch coverage
+ * obtained from LLVM source-based instrumentation or v8 coverage.
+ * Reveals whether the agent's input reached the code region the
+ * eval cares about — essential signal for sparse-reward eval loops.
+ */
+export type CoverageReportEvent = TraceEventEnvelope & {
+  kind: "coverage_report";
+  programId: string;
+  linesCovered: number;
+  linesTotal: number;
+  branchesCovered: number;
+  branchesTotal: number;
+};
+
+/**
+ * Track F (Section 57) — runtime feedback channel: sanitizer report.
+ * Source: AgentFlow (arxiv 2604.20801, §3.2). AddressSanitizer /
+ * UndefinedBehaviorSanitizer reports — detects memory-safety
+ * violations and UB even when the program does not visibly crash.
+ * Mostly relevant for security-research deployments (the AgentFlow
+ * paper discovered 10 Chrome zero-days using exactly this channel).
+ */
+export type SanitizerReportEvent = TraceEventEnvelope & {
+  kind: "sanitizer_report";
+  programId: string;
+  sanitizer: "asan" | "ubsan" | "msan" | "tsan" | "lsan" | "other";
+  isError: boolean;
+  /** Short summary line (e.g. "heap-buffer-overflow at parser.c:42"). */
+  summary: string;
+};
+
+/**
  * Section 27 — `circuit-breaker` emits this on every state transition.
  * Subscribers (audit-log, OTel exporter, structured-event-printer) can
  * surface degraded providers without subscribing to the breaker directly.
@@ -291,7 +358,11 @@ export type TraceEvent =
   | A2AMessageEvent
   | CrewDoneEvent
   | CostAccrualEvent
-  | CircuitStateChangedEvent;
+  | CircuitStateChangedEvent
+  | TestVerdictEvent
+  | ProgramOutputEvent
+  | CoverageReportEvent
+  | SanitizerReportEvent;
 
 export type TraceEventKind = TraceEvent["kind"];
 

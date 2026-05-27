@@ -123,6 +123,28 @@ const compactionBlock = z
   .optional();
 
 /**
+ * Section 55 (Track A) — named failure taxonomy. Cross-cutting block
+ * available on every target shape. Each entry names a failure class and
+ * tells the recovery engine which `RecoveryAction` to take when the
+ * pattern matches an error's `message`. Optional `hint` is surfaced to
+ * the model as a one-shot system message on `continue`/`retry` recovery.
+ *
+ * Source: Natural-Language Agent Harnesses (arxiv 2603.25723, Tsinghua,
+ * March 2026) names failure_taxonomy as one of the six components a
+ * portable harness must expose. Cited paper: NLAH (arxiv 2603.25723).
+ */
+const failureTaxonomyEntrySchema = z
+  .object({
+    class: z.string().min(1),
+    pattern: z.string().min(1),
+    recovery: z.enum(["retry", "compact", "continue", "tombstone", "fail"]),
+    hint: z.string().min(1).optional(),
+  })
+  .strict();
+
+const failureTaxonomyBlock = z.array(failureTaxonomyEntrySchema).optional();
+
+/**
  * Section 47 — blockchain subsystem blocks (cross-cutting). Any shape may
  * declare any subset of `chains` / `wallets` / `contracts` /
  * `transaction_policy`. Authoring rules:
@@ -274,6 +296,7 @@ const cliSchema = z
     mcp_servers: mcpServersBlock,
     permissions: permissionsBlock,
     compaction: compactionBlock,
+    failure_taxonomy: failureTaxonomyBlock,
     cli: cliOptionsBlock,
     chains: chainsBlock,
     wallets: walletsBlock,
@@ -301,6 +324,7 @@ const workflowSchema = z
     mcp_servers: mcpServersBlock,
     permissions: permissionsBlock,
     compaction: compactionBlock,
+    failure_taxonomy: failureTaxonomyBlock,
     chains: chainsBlock,
     wallets: walletsBlock,
     contracts: contractsBlock,
@@ -398,6 +422,7 @@ const channelSchema = z
     mcp_servers: mcpServersBlock,
     permissions: permissionsBlock,
     compaction: compactionBlock,
+    failure_taxonomy: failureTaxonomyBlock,
     heartbeat: heartbeatBlock,
     gateway: channelGatewayBlock,
     chains: chainsBlock,
@@ -447,6 +472,7 @@ const graphSchema = z
     edges: z.array(graphEdgeSchema).default([]),
     permissions: permissionsBlock,
     compaction: compactionBlock,
+    failure_taxonomy: failureTaxonomyBlock,
     chains: chainsBlock,
     wallets: walletsBlock,
     contracts: contractsBlock,
@@ -485,6 +511,7 @@ const managedSchema = z
     tenants: z.array(managedTenantSchema).min(1),
     permissions: permissionsBlock,
     compaction: compactionBlock,
+    failure_taxonomy: failureTaxonomyBlock,
   })
   .strict();
 
@@ -525,6 +552,7 @@ const pipelineSchema = z
       .strict(),
     permissions: permissionsBlock,
     compaction: compactionBlock,
+    failure_taxonomy: failureTaxonomyBlock,
   })
   .strict();
 
@@ -570,6 +598,7 @@ const crewSchema = z
     mcp_servers: mcpServersBlock,
     permissions: permissionsBlock,
     compaction: compactionBlock,
+    failure_taxonomy: failureTaxonomyBlock,
     chains: chainsBlock,
     wallets: walletsBlock,
     contracts: contractsBlock,
@@ -612,6 +641,7 @@ const researchSchema = z
     mcp_servers: mcpServersBlock,
     permissions: permissionsBlock,
     compaction: compactionBlock,
+    failure_taxonomy: failureTaxonomyBlock,
     chains: chainsBlock,
     wallets: walletsBlock,
     contracts: contractsBlock,
@@ -651,6 +681,7 @@ const batchSchema = z
     mcp_servers: mcpServersBlock,
     permissions: permissionsBlock,
     compaction: compactionBlock,
+    failure_taxonomy: failureTaxonomyBlock,
     chains: chainsBlock,
     wallets: walletsBlock,
     contracts: contractsBlock,
@@ -692,6 +723,7 @@ const voiceSchema = z
     mcp_servers: mcpServersBlock,
     permissions: permissionsBlock,
     compaction: compactionBlock,
+    failure_taxonomy: failureTaxonomyBlock,
   })
   .strict();
 
@@ -728,6 +760,7 @@ const browserSchema = z
     mcp_servers: mcpServersBlock,
     permissions: permissionsBlock,
     compaction: compactionBlock,
+    failure_taxonomy: failureTaxonomyBlock,
   })
   .strict();
 
@@ -769,6 +802,7 @@ const evalSchema = z
       .min(1),
     concurrency: z.number().int().min(1).default(4),
     seed: z.number().int().optional(),
+    failure_taxonomy: failureTaxonomyBlock,
   })
   .strict();
 
@@ -831,6 +865,7 @@ const onchainSchema = z
     mcp_servers: mcpServersBlock,
     permissions: permissionsBlock,
     compaction: compactionBlock,
+    failure_taxonomy: failureTaxonomyBlock,
   })
   .strict();
 
@@ -872,6 +907,7 @@ const onchainGameSchema = z
     mcp_servers: mcpServersBlock,
     permissions: permissionsBlock,
     compaction: compactionBlock,
+    failure_taxonomy: failureTaxonomyBlock,
   })
   .strict();
 
@@ -929,6 +965,8 @@ export type SpecEval = z.infer<typeof evalSchema>;
 export type SpecMcpServerConfig = z.infer<typeof mcpServerConfigSchema>;
 export type SpecSubAgentDefinition = z.infer<typeof subAgentDefinitionSchema>;
 export type SpecCompactionBlock = z.infer<typeof compactionBlock>;
+export type SpecFailureTaxonomyEntry = z.infer<typeof failureTaxonomyEntrySchema>;
+export type SpecFailureTaxonomy = z.infer<typeof failureTaxonomyBlock>;
 
 export { SpecParseError };
 

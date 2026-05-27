@@ -77,5 +77,15 @@ function formatBody(ev: TraceEvent): string {
       return `adapter=${ev.adapter} ${ev.fromState}→${ev.toState}${
         ev.reason ? ` reason=${ev.reason}` : ""
       }`;
+    case "test_verdict":
+      return `test=${ev.testId} verdict=${ev.verdict} duration=${ev.durationMs.toFixed(0)}ms${
+        ev.reason ? ` reason=${ev.reason}` : ""
+      }`;
+    case "program_output":
+      return `program=${ev.programId} exit=${ev.exitCode} stdout=${ev.stdoutBytes}B stderr=${ev.stderrBytes}B duration=${ev.durationMs.toFixed(0)}ms`;
+    case "coverage_report":
+      return `program=${ev.programId} lines=${ev.linesCovered}/${ev.linesTotal} branches=${ev.branchesCovered}/${ev.branchesTotal}`;
+    case "sanitizer_report":
+      return `program=${ev.programId} sanitizer=${ev.sanitizer} ${ev.isError ? "ERROR " : ""}${ev.summary}`;
   }
 }

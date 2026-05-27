@@ -234,8 +234,8 @@ describe("ir-passes — applyPasses + idempotence (T9)", () => {
     expect(calls).toEqual(["a", "b"]);
   });
 
-  test("DEFAULT_PIPELINE has 5 passes (deadTool, mcpCollapse, permCanon, txPolicy, cachePrefix)", () => {
-    expect(DEFAULT_PIPELINE.length).toBe(5);
+  test("DEFAULT_PIPELINE has 6 passes (+ wellFormednessCheck from Track F §57)", () => {
+    expect(DEFAULT_PIPELINE.length).toBe(6);
   });
 });
 

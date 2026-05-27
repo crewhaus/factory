@@ -29,6 +29,8 @@ import type {
   IrChainBinding,
   IrChannelV0,
   IrContractBinding,
+  IrCrewV0,
+  IrGraphV0,
   IrManagedV0,
   IrMcpServerConfig,
   IrMcpServers,
@@ -337,10 +339,103 @@ export function transactionPolicyEnforcement(ir: IrNode): IrNode {
   return ir;
 }
 
+/**
+ * Track F (Section 57) — well-formedness check for typed multi-agent
+ * graphs. Source: AgentFlow (arxiv 2604.20801). Before any candidate
+ * harness is sent for expensive LLM evaluation, this pass:
+ *
+ *   1. Verifies every graph edge connects declared nodes.
+ *   2. Verifies the graph is connected (every node reachable from entry).
+ *   3. Verifies every edge's `schema` either is `untyped` or resolves
+ *      to a declared `messageSchemas` entry.
+ *   4. For crews: verifies routing.match targets all reference declared
+ *      roles (a subset of what `parseSpec` does; we re-check here so
+ *      `applyPasses(ir)` is safe to call standalone).
+ *
+ * Failing this check is fast and cheap, which means the search budget
+ * for upstream optimizers (Tracks D, E) goes to well-formed harnesses
+ * only. Cited paper: AgentFlow (arxiv 2604.20801).
+ */
+export function wellFormednessCheck(ir: IrNode): IrNode {
+  if (ir.target === "graph") {
+    const g = ir as IrGraphV0;
+    const nodeNames = new Set(g.nodes.map((n) => n.name));
+    if (!nodeNames.has(g.entry)) {
+      throw new IrPassError(
+        `graph entry "${g.entry}" is not a declared node (nodes: ${[...nodeNames].join(", ")})`,
+      );
+    }
+    const schemaNames = new Set((g.messageSchemas ?? []).map((s) => s.name));
+    for (const e of g.edges) {
+      if (!nodeNames.has(e.from)) {
+        throw new IrPassError(`graph edge from "${e.from}" references an undeclared node`);
+      }
+      if (!nodeNames.has(e.to)) {
+        throw new IrPassError(`graph edge to "${e.to}" references an undeclared node`);
+      }
+      if (e.schema !== undefined && e.schema.kind === "named") {
+        if (!schemaNames.has(e.schema.name)) {
+          throw new IrPassError(
+            `graph edge ${e.from}→${e.to} references undeclared message schema "${e.schema.name}"`,
+          );
+        }
+      }
+    }
+    // Reachability from entry.
+    const reachable = new Set<string>([g.entry]);
+    let added = true;
+    while (added) {
+      added = false;
+      for (const e of g.edges) {
+        if (reachable.has(e.from) && !reachable.has(e.to)) {
+          reachable.add(e.to);
+          added = true;
+        }
+      }
+    }
+    for (const n of g.nodes) {
+      if (!reachable.has(n.name)) {
+        throw new IrPassError(`graph node "${n.name}" is unreachable from entry "${g.entry}"`);
+      }
+    }
+  } else if (ir.target === "crew") {
+    const c = ir as IrCrewV0;
+    const roleNames = new Set(c.roles.map((r) => r.name));
+    if (!roleNames.has(c.entry)) {
+      throw new IrPassError(
+        `crew entry "${c.entry}" is not a declared role (roles: ${[...roleNames].join(", ")})`,
+      );
+    }
+    const schemaNames = new Set((c.messageSchemas ?? []).map((s) => s.name));
+    if (c.routing?.kind === "match" && c.routing.match !== undefined) {
+      for (const [from, rules] of Object.entries(c.routing.match)) {
+        if (!roleNames.has(from)) {
+          throw new IrPassError(`crew routing.match["${from}"]: source role not declared`);
+        }
+        for (const rule of rules) {
+          if (!roleNames.has(rule.to)) {
+            throw new IrPassError(
+              `crew routing.match["${from}"].to "${rule.to}": target role not declared`,
+            );
+          }
+        }
+      }
+    }
+    // Schema declarations exist (they're optional but if present they must
+    // be uniquely named). This catches the easy authoring bug of declaring
+    // two schemas with the same name.
+    if (schemaNames.size !== (c.messageSchemas ?? []).length) {
+      throw new IrPassError("crew messageSchemas contains duplicate names");
+    }
+  }
+  return ir;
+}
+
 export const DEFAULT_PIPELINE: ReadonlyArray<IrPass> = Object.freeze([
   deadToolElimination,
   redundantMcpServerCollapse,
   permissionRuleCanonicalize,
   transactionPolicyEnforcement,
+  wellFormednessCheck,
   promptCachePrefixSort,
 ]);

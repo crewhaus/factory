@@ -396,6 +396,14 @@
       "name": "@crewhaus/context-bundle",
       "version": "0.0.0",
     },
+    "packages/contract-compiler": {
+      "name": "@crewhaus/contract-compiler",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/specialization-registry": "workspace:*",
+      },
+    },
     "packages/cost-tracker": {
       "name": "@crewhaus/cost-tracker",
       "version": "0.0.0",
@@ -804,6 +812,14 @@
         "@crewhaus/errors": "workspace:*",
       },
     },
+    "packages/meta-harness-optimizer": {
+      "name": "@crewhaus/meta-harness-optimizer",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/prompt-optimizer": "workspace:*",
+      },
+    },
     "packages/metrics-collector": {
       "name": "@crewhaus/metrics-collector",
       "version": "0.0.0",
@@ -1014,6 +1030,13 @@
       "version": "0.0.0",
       "dependencies": {
         "@crewhaus/citation-tracker": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
+      },
+    },
+    "packages/rules-engine": {
+      "name": "@crewhaus/rules-engine",
+      "version": "0.0.0",
+      "dependencies": {
         "@crewhaus/errors": "workspace:*",
       },
     },
@@ -1229,6 +1252,13 @@
         "@crewhaus/spec": "workspace:*",
       },
     },
+    "packages/specialization-registry": {
+      "name": "@crewhaus/specialization-registry",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+      },
+    },
     "packages/state-store": {
       "name": "@crewhaus/state-store",
       "version": "0.0.0",
@@ -1325,6 +1355,14 @@
         "@crewhaus/tool-catalog": "workspace:*",
         "@crewhaus/tool-mcp": "workspace:*",
         "@crewhaus/tool-message-channel": "workspace:*",
+      },
+    },
+    "packages/target-claude-plugin": {
+      "name": "@crewhaus/target-claude-plugin",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/ir": "workspace:*",
       },
     },
     "packages/target-cli": {
@@ -1606,6 +1644,14 @@
         "@crewhaus/tool-executor": "workspace:*",
         "@crewhaus/tool-permission-matcher": "workspace:*",
         "@crewhaus/tool-validate": "workspace:*",
+      },
+    },
+    "packages/tool-harness-synthesizer": {
+      "name": "@crewhaus/tool-harness-synthesizer",
+      "version": "0.0.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/prompt-optimizer": "workspace:*",
       },
     },
     "packages/tool-image": {
@@ -2034,6 +2080,8 @@
 
     "@crewhaus/context-bundle": ["@crewhaus/context-bundle@workspace:packages/context-bundle"],
 
+    "@crewhaus/contract-compiler": ["@crewhaus/contract-compiler@workspace:packages/contract-compiler"],
+
     "@crewhaus/cost-tracker": ["@crewhaus/cost-tracker@workspace:packages/cost-tracker"],
 
     "@crewhaus/crawler": ["@crewhaus/crawler@workspace:packages/crawler"],
@@ -2122,6 +2170,8 @@
 
     "@crewhaus/memory-store": ["@crewhaus/memory-store@workspace:packages/memory-store"],
 
+    "@crewhaus/meta-harness-optimizer": ["@crewhaus/meta-harness-optimizer@workspace:packages/meta-harness-optimizer"],
+
     "@crewhaus/metrics-collector": ["@crewhaus/metrics-collector@workspace:packages/metrics-collector"],
 
     "@crewhaus/migration-engine": ["@crewhaus/migration-engine@workspace:packages/migration-engine"],
@@ -2172,6 +2222,8 @@
 
     "@crewhaus/report-writer": ["@crewhaus/report-writer@workspace:packages/report-writer"],
 
+    "@crewhaus/rules-engine": ["@crewhaus/rules-engine@workspace:packages/rules-engine"],
+
     "@crewhaus/run-context": ["@crewhaus/run-context@workspace:packages/run-context"],
 
     "@crewhaus/runtime-core": ["@crewhaus/runtime-core@workspace:packages/runtime-core"],
@@ -2212,6 +2264,8 @@
 
     "@crewhaus/spec-registry": ["@crewhaus/spec-registry@workspace:packages/spec-registry"],
 
+    "@crewhaus/specialization-registry": ["@crewhaus/specialization-registry@workspace:packages/specialization-registry"],
+
     "@crewhaus/state-store": ["@crewhaus/state-store@workspace:packages/state-store"],
 
     "@crewhaus/streaming-tool-executor": ["@crewhaus/streaming-tool-executor@workspace:packages/streaming-tool-executor"],
@@ -2227,6 +2281,8 @@
     "@crewhaus/target-browser-driver": ["@crewhaus/target-browser-driver@workspace:packages/target-browser-driver"],
 
     "@crewhaus/target-channel-bot": ["@crewhaus/target-channel-bot@workspace:packages/target-channel-bot"],
+
+    "@crewhaus/target-claude-plugin": ["@crewhaus/target-claude-plugin@workspace:packages/target-claude-plugin"],
 
     "@crewhaus/target-cli": ["@crewhaus/target-cli@workspace:packages/target-cli"],
 
@@ -2281,6 +2337,8 @@
     "@crewhaus/tool-fetch": ["@crewhaus/tool-fetch@workspace:packages/tool-fetch"],
 
     "@crewhaus/tool-fs": ["@crewhaus/tool-fs@workspace:packages/tool-fs"],
+
+    "@crewhaus/tool-harness-synthesizer": ["@crewhaus/tool-harness-synthesizer@workspace:packages/tool-harness-synthesizer"],
 
     "@crewhaus/tool-image": ["@crewhaus/tool-image@workspace:packages/tool-image"],
 
