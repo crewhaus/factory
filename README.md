@@ -158,10 +158,6 @@ The compiler, runtime, eval stack, and security fabric live in this repo. Toolin
 
 Community registry for shared harnesses, skills, tools, and recipes. **Coming Summer 2026.** [See what's coming →](https://forge.crewhaus.ai)
 
-## A hosted version?
-
-We may build a hosted CrewHaus eventually — managed runtime, private registry, observability. We're listening for signal first. [Tell us what you'd want →](https://cloud.crewhaus.ai). No promises.
-
 ## Contributing
 
 Contributions are welcome. CrewHaus is async-first and BDFL-lite — see [`GOVERNANCE.md`](GOVERNANCE.md) for how decisions are made and [`CONTRIBUTING.md`](CONTRIBUTING.md) for how to contribute.
