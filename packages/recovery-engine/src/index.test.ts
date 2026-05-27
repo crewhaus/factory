@@ -3,11 +3,13 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   BUDGETS,
+  type NamedFailureClass,
   type RecoveryAction,
   advanceState,
   backoffMs,
   classify,
   initialRecoveryState,
+  matchNamedFailure,
   recover,
 } from "./index";
 
@@ -227,4 +229,61 @@ describe("T4 — fixture replay", () => {
       expect(action.kind).toBe(f.expectedKind);
     });
   }
+});
+
+// Section 55 (Track A) — named failure taxonomy. The recovery engine
+// consults user-declared classes before falling back to the built-in
+// taxonomy. Source: NLAH (arxiv 2603.25723).
+describe("Track A — named failure taxonomy", () => {
+  const taxonomy: NamedFailureClass[] = [
+    { class: "missing_artifact", pattern: "ENOENT", recovery: "tombstone" },
+    { class: "verifier_failure", pattern: "verification failed", recovery: "continue" },
+    { class: "rate_limit_429", pattern: "/^429\\b/", recovery: "retry" },
+  ];
+
+  test("substring pattern matches a named class", () => {
+    const matched = matchNamedFailure({ message: "ENOENT: no such file or directory" }, taxonomy);
+    expect(matched?.class).toBe("missing_artifact");
+  });
+
+  test("regex pattern matches a named class", () => {
+    const matched = matchNamedFailure({ message: "429 too many requests" }, taxonomy);
+    expect(matched?.class).toBe("rate_limit_429");
+  });
+
+  test("case-insensitive substring match", () => {
+    const matched = matchNamedFailure({ message: "Verification Failed: bad output" }, taxonomy);
+    expect(matched?.class).toBe("verifier_failure");
+  });
+
+  test("returns undefined when no entry matches", () => {
+    expect(matchNamedFailure({ message: "completely unrelated" }, taxonomy)).toBeUndefined();
+  });
+
+  test("recover() uses named-class recovery when matched", () => {
+    const action = recover({ message: "ENOENT bad path" }, initialRecoveryState, taxonomy);
+    expect(action.kind).toBe("tombstone");
+  });
+
+  test("recover() falls through to built-in classify when no named match", () => {
+    const action = recover({ status: 503, message: "overloaded" }, initialRecoveryState, taxonomy);
+    expect(action.kind).toBe("retry");
+  });
+
+  test("named-class recovery respects per-turn budgets", () => {
+    const exhausted = { ...initialRecoveryState, tombstoneCount: BUDGETS.MAX_TOMBSTONES };
+    const action = recover({ message: "ENOENT bad path" }, exhausted, taxonomy);
+    expect(action.kind).toBe("fail");
+    if (action.kind === "fail") {
+      expect(action.reason).toContain("missing_artifact");
+    }
+  });
+
+  test("malformed regex pattern is skipped without throwing", () => {
+    const badTaxonomy: NamedFailureClass[] = [
+      { class: "bad", pattern: "/[unclosed/", recovery: "fail" },
+    ];
+    expect(() => matchNamedFailure({ message: "anything" }, badTaxonomy)).not.toThrow();
+    expect(matchNamedFailure({ message: "anything" }, badTaxonomy)).toBeUndefined();
+  });
 });

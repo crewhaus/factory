@@ -15,6 +15,7 @@ import type {
   IrCrewV0,
   IrDiscordConfig,
   IrEvalV0,
+  IrFailureTaxonomyEntry,
   IrGraphV0,
   IrIMessageConfig,
   IrManagedV0,
@@ -289,6 +290,41 @@ function lowerCompaction(spec: SpecWithPermissions): IrCompaction {
 }
 
 /**
+ * Section 55 (Track A) — lower the optional `failure_taxonomy` block.
+ * The lower is 1:1 (no normalisation, no dedup, no reordering) so
+ * `failureTaxonomy` is added to `OPTIMIZABLE_PATHS` directly.
+ *
+ * Returns `{ failureTaxonomy: [...] }` when present, `{}` when omitted —
+ * spread into the IR so the field stays absent in the latter case
+ * (emitters can `if ("failureTaxonomy" in ir)` to gate their codegen).
+ */
+type SpecWithFailureTaxonomy = {
+  readonly failure_taxonomy?: ReadonlyArray<{
+    readonly class: string;
+    readonly pattern: string;
+    readonly recovery: "retry" | "compact" | "continue" | "tombstone" | "fail";
+    readonly hint?: string;
+  }>;
+};
+
+function lowerFailureTaxonomy(spec: SpecWithFailureTaxonomy): {
+  failureTaxonomy?: ReadonlyArray<IrFailureTaxonomyEntry>;
+} {
+  const t = spec.failure_taxonomy;
+  if (t === undefined || t.length === 0) return {};
+  // Preserve insertion order; recovery engine evaluates entries top-to-bottom
+  // and uses the first match. Reordering would change semantics, so the
+  // lower is intentionally pass-through.
+  return {
+    failureTaxonomy: t.map((e) =>
+      e.hint !== undefined
+        ? { class: e.class, pattern: e.pattern, recovery: e.recovery, hint: e.hint }
+        : { class: e.class, pattern: e.pattern, recovery: e.recovery },
+    ),
+  };
+}
+
+/**
  * Section 47 — normalise the cross-cutting blockchain subsystem blocks
  * (chains / wallets / contracts / transaction_policy). Each block is
  * optional; the helper returns a partial that's spread into the IR
@@ -411,6 +447,7 @@ export function lower(spec: Spec): IrNode {
         permissions: lowerPermissions(spec),
         subAgents: lowerSubAgents(spec.agent.sub_agents),
         compaction: lowerCompaction(spec),
+        ...lowerFailureTaxonomy(spec),
         // Phase 3 §3.3 — CLI banner config. Plus Phase 2 M2.2 TUI mode
         // gate. Only included when the spec author opted in (cli block
         // and its fields are optional).
@@ -446,6 +483,7 @@ export function lower(spec: Spec): IrNode {
         mcp_servers: lowerMcpServers(spec.mcp_servers),
         permissions: lowerPermissions(spec),
         compaction: lowerCompaction(spec),
+        ...lowerFailureTaxonomy(spec),
         ...lowerChainSubsystem(spec),
       } satisfies IrWorkflowV0;
     case "channel":
@@ -465,6 +503,7 @@ export function lower(spec: Spec): IrNode {
         permissions: lowerPermissions(spec),
         subAgents: lowerSubAgents(spec.agent.sub_agents),
         compaction: lowerCompaction(spec),
+        ...lowerFailureTaxonomy(spec),
         // Phase 3 §3.1 — heartbeat. Duration string ("2h", "30m") is
         // parsed once at lower time so codegen emits a literal numeric
         // setInterval arg in ms.
@@ -506,6 +545,7 @@ export function lower(spec: Spec): IrNode {
         edges: spec.edges.map((e) => ({ from: e.from, to: e.to })),
         permissions: lowerPermissions(spec),
         compaction: lowerCompaction(spec),
+        ...lowerFailureTaxonomy(spec),
         ...lowerChainSubsystem(spec),
       } satisfies IrGraphV0;
     case "managed":
@@ -523,6 +563,7 @@ export function lower(spec: Spec): IrNode {
         })),
         permissions: lowerPermissions(spec),
         compaction: lowerCompaction(spec),
+        ...lowerFailureTaxonomy(spec),
       } satisfies IrManagedV0;
     case "pipeline":
       return {
@@ -547,6 +588,7 @@ export function lower(spec: Spec): IrNode {
         },
         permissions: lowerPermissions(spec),
         compaction: lowerCompaction(spec),
+        ...lowerFailureTaxonomy(spec),
       } satisfies IrPipelineV0;
     case "crew":
       return {
@@ -569,6 +611,7 @@ export function lower(spec: Spec): IrNode {
         mcp_servers: lowerMcpServers(spec.mcp_servers),
         permissions: lowerPermissions(spec),
         compaction: lowerCompaction(spec),
+        ...lowerFailureTaxonomy(spec),
         ...lowerChainSubsystem(spec),
       } satisfies IrCrewV0;
     case "research":
@@ -592,6 +635,7 @@ export function lower(spec: Spec): IrNode {
         mcp_servers: lowerMcpServers(spec.mcp_servers),
         permissions: lowerPermissions(spec),
         compaction: lowerCompaction(spec),
+        ...lowerFailureTaxonomy(spec),
         ...lowerChainSubsystem(spec),
       } satisfies IrResearchV0;
     case "batch":
@@ -616,6 +660,7 @@ export function lower(spec: Spec): IrNode {
         mcp_servers: lowerMcpServers(spec.mcp_servers),
         permissions: lowerPermissions(spec),
         compaction: lowerCompaction(spec),
+        ...lowerFailureTaxonomy(spec),
         ...lowerChainSubsystem(spec),
       } satisfies IrBatchV0;
     case "voice":
@@ -639,6 +684,7 @@ export function lower(spec: Spec): IrNode {
         mcp_servers: lowerMcpServers(spec.mcp_servers),
         permissions: lowerPermissions(spec),
         compaction: lowerCompaction(spec),
+        ...lowerFailureTaxonomy(spec),
       } satisfies IrVoiceV0;
     case "browser":
       return {
@@ -657,6 +703,7 @@ export function lower(spec: Spec): IrNode {
         mcp_servers: lowerMcpServers(spec.mcp_servers),
         permissions: lowerPermissions(spec),
         compaction: lowerCompaction(spec),
+        ...lowerFailureTaxonomy(spec),
       } satisfies IrBrowserV0;
     case "eval":
       return {
@@ -679,6 +726,7 @@ export function lower(spec: Spec): IrNode {
         })),
         concurrency: spec.concurrency,
         ...(spec.seed !== undefined ? { seed: spec.seed } : {}),
+        ...lowerFailureTaxonomy(spec),
       } satisfies IrEvalV0;
     case "onchain": {
       const lowered = lowerChainSubsystem(spec);
@@ -728,6 +776,7 @@ export function lower(spec: Spec): IrNode {
         mcp_servers: lowerMcpServers(spec.mcp_servers),
         permissions: lowerPermissions(spec),
         compaction: lowerCompaction(spec),
+        ...lowerFailureTaxonomy(spec),
       } satisfies IrChainV0;
     }
     case "onchain-game": {
@@ -774,6 +823,7 @@ export function lower(spec: Spec): IrNode {
         mcp_servers: lowerMcpServers(spec.mcp_servers),
         permissions: lowerPermissions(spec),
         compaction: lowerCompaction(spec),
+        ...lowerFailureTaxonomy(spec),
       } satisfies IrChainGameV0;
     }
     default:

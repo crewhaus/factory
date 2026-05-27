@@ -92,6 +92,60 @@ export type IrCompaction = {
 };
 
 /**
+ * Section 55 (Track A) — named failure taxonomy. Cross-cutting; carried
+ * through to runtime-core so `recovery-engine` can consult the user's
+ * named classes before falling back to its built-in taxonomy.
+ *
+ * `pattern` is a substring (case-insensitive) of the error.message OR a
+ * `/regex/` literal — the recovery engine compiles each form once at
+ * spec-load time. `recovery` names which `RecoveryAction` to take.
+ * `hint`, when present, is what `runtime-core` appends as a synthetic
+ * system message on `retry`/`continue` recoveries so the model gets
+ * named-class self-correction guidance.
+ *
+ * Source: Natural-Language Agent Harnesses (arxiv 2603.25723).
+ */
+export type IrFailureTaxonomyEntry = {
+  readonly class: string;
+  readonly pattern: string;
+  readonly recovery: "retry" | "compact" | "continue" | "tombstone" | "fail";
+  readonly hint?: string;
+};
+
+export type IrFailureTaxonomy = readonly IrFailureTaxonomyEntry[];
+
+/**
+ * Track F (Section 57) — typed message schemas (Σ) for multi-agent
+ * communication. Source: AgentFlow (arxiv 2604.20801). A typed graph
+ * DSL with well-formedness checking makes searching the full multi-
+ * agent design space tractable: structurally broken candidates are
+ * eliminated cheaply, so the search budget goes to well-formed
+ * harnesses only.
+ *
+ * An IrMessageSchema is a named JSON-Schema shape describing what a
+ * given edge in the crew/graph carries. The well-formedness pass in
+ * `@crewhaus/ir-passes` checks that every edge in the graph references
+ * either a declared schema or `untyped` (the legacy default).
+ */
+export type IrMessageSchema = {
+  readonly name: string;
+  /** JSON Schema describing the message payload. v0 keeps it as `unknown`
+   *  rather than typed-importing zod-to-json-schema — the wellformedness
+   *  pass only checks that the schema is an object; full validation
+   *  happens at runtime in `@crewhaus/runtime-core`. */
+  readonly schema: Readonly<Record<string, unknown>>;
+};
+
+/**
+ * Per-edge schema reference. `untyped` means "any payload" (the v0
+ * default that preserves backwards compatibility). Named references
+ * must match one of the variant's `messageSchemas` entries.
+ */
+export type IrSchemaRef =
+  | { readonly kind: "untyped" }
+  | { readonly kind: "named"; readonly name: string };
+
+/**
  * Phase 3 §3.3 — CLI banner config carried into IR for codegen.
  */
 export type IrCliBanner = {
@@ -120,6 +174,8 @@ export type IrV0 = {
   readonly subAgents: readonly IrSubAgentDefinition[];
   readonly compaction: IrCompaction;
   readonly cli?: IrCliOptions;
+  /** Section 55 (Track A) — named failure taxonomy. Optional. */
+  readonly failureTaxonomy?: IrFailureTaxonomy;
   /** §47 cross-cutting blockchain subsystem (slice 0). All optional. */
   readonly chains?: readonly IrChainBinding[];
   readonly wallets?: readonly IrWalletBinding[];
@@ -157,6 +213,8 @@ export type IrWorkflowV0 = {
   readonly contracts?: readonly IrContractBinding[];
   readonly transactionPolicy?: IrTransactionPolicy;
   readonly compaction: IrCompaction;
+  /** Section 55 (Track A) — named failure taxonomy. Optional. */
+  readonly failureTaxonomy?: IrFailureTaxonomy;
 };
 
 /**
@@ -366,6 +424,8 @@ export type IrChannelV0 = {
   readonly compaction: IrCompaction;
   readonly heartbeat?: IrHeartbeat;
   readonly gateway?: IrChannelGateway;
+  /** Section 55 (Track A) — named failure taxonomy. Optional. */
+  readonly failureTaxonomy?: IrFailureTaxonomy;
   /** §47 cross-cutting blockchain subsystem (slice 0). All optional. */
   readonly chains?: readonly IrChainBinding[];
   readonly wallets?: readonly IrWalletBinding[];
@@ -398,6 +458,8 @@ export type IrManagedV0 = {
   readonly tenants: readonly IrManagedTenant[];
   readonly permissions: IrPermissions;
   readonly compaction: IrCompaction;
+  /** Section 55 (Track A) — named failure taxonomy. Optional. */
+  readonly failureTaxonomy?: IrFailureTaxonomy;
 };
 
 /**
@@ -421,6 +483,10 @@ export type IrGraphNode = {
 export type IrGraphEdge = {
   readonly from: string;
   readonly to: string;
+  /** Track F (Section 57) — typed message schema carried by this edge.
+   *  Defaults to `{ kind: "untyped" }` (any payload) when absent. The
+   *  ir-passes wellformedness check verifies named refs resolve. */
+  readonly schema?: IrSchemaRef;
 };
 
 export type IrGraphV0 = {
@@ -430,8 +496,13 @@ export type IrGraphV0 = {
   readonly entry: string;
   readonly nodes: readonly IrGraphNode[];
   readonly edges: readonly IrGraphEdge[];
+  /** Track F (Section 57) — named message schemas referenced by edges.
+   *  Absent means no typed edges (all `untyped` by default). */
+  readonly messageSchemas?: readonly IrMessageSchema[];
   readonly permissions: IrPermissions;
   readonly compaction: IrCompaction;
+  /** Section 55 (Track A) — named failure taxonomy. Optional. */
+  readonly failureTaxonomy?: IrFailureTaxonomy;
   /** §47 cross-cutting blockchain subsystem (slice 0). All optional. */
   readonly chains?: readonly IrChainBinding[];
   readonly wallets?: readonly IrWalletBinding[];
@@ -471,6 +542,8 @@ export type IrPipelineV0 = {
   };
   readonly permissions: IrPermissions;
   readonly compaction: IrCompaction;
+  /** Section 55 (Track A) — named failure taxonomy. Optional. */
+  readonly failureTaxonomy?: IrFailureTaxonomy;
 };
 
 /**
@@ -511,9 +584,14 @@ export type IrCrewV0 = {
   readonly entry: string;
   readonly roles: readonly IrCrewRole[];
   readonly routing?: IrCrewRouting;
+  /** Track F (Section 57) — named message schemas referenced by handoffs.
+   *  Absent means no typed handoffs (all `untyped` by default). */
+  readonly messageSchemas?: readonly IrMessageSchema[];
   readonly mcp_servers: IrMcpServers;
   readonly permissions: IrPermissions;
   readonly compaction: IrCompaction;
+  /** Section 55 (Track A) — named failure taxonomy. Optional. */
+  readonly failureTaxonomy?: IrFailureTaxonomy;
   /** §47 cross-cutting blockchain subsystem (slice 0). All optional. */
   readonly chains?: readonly IrChainBinding[];
   readonly wallets?: readonly IrWalletBinding[];
@@ -556,6 +634,8 @@ export type IrResearchV0 = {
   readonly mcp_servers: IrMcpServers;
   readonly permissions: IrPermissions;
   readonly compaction: IrCompaction;
+  /** Section 55 (Track A) — named failure taxonomy. Optional. */
+  readonly failureTaxonomy?: IrFailureTaxonomy;
   /** §47 cross-cutting blockchain subsystem (slice 0). All optional. */
   readonly chains?: readonly IrChainBinding[];
   readonly wallets?: readonly IrWalletBinding[];
@@ -598,6 +678,8 @@ export type IrBatchV0 = {
   readonly mcp_servers: IrMcpServers;
   readonly permissions: IrPermissions;
   readonly compaction: IrCompaction;
+  /** Section 55 (Track A) — named failure taxonomy. Optional. */
+  readonly failureTaxonomy?: IrFailureTaxonomy;
   /** §47 cross-cutting blockchain subsystem (slice 0). All optional. */
   readonly chains?: readonly IrChainBinding[];
   readonly wallets?: readonly IrWalletBinding[];
@@ -642,6 +724,8 @@ export type IrVoiceV0 = {
   readonly mcp_servers: IrMcpServers;
   readonly permissions: IrPermissions;
   readonly compaction: IrCompaction;
+  /** Section 55 (Track A) — named failure taxonomy. Optional. */
+  readonly failureTaxonomy?: IrFailureTaxonomy;
 };
 
 /**
@@ -676,6 +760,8 @@ export type IrBrowserV0 = {
   readonly mcp_servers: IrMcpServers;
   readonly permissions: IrPermissions;
   readonly compaction: IrCompaction;
+  /** Section 55 (Track A) — named failure taxonomy. Optional. */
+  readonly failureTaxonomy?: IrFailureTaxonomy;
 };
 
 /** Discriminated union over every supported target IR. */
@@ -704,6 +790,8 @@ export type IrEvalV0 = {
   }[];
   readonly concurrency: number;
   readonly seed?: number;
+  /** Section 55 (Track A) — named failure taxonomy. Optional. */
+  readonly failureTaxonomy?: IrFailureTaxonomy;
 };
 
 /**
@@ -770,6 +858,8 @@ export type IrChainV0 = {
   readonly mcp_servers: IrMcpServers;
   readonly permissions: IrPermissions;
   readonly compaction: IrCompaction;
+  /** Section 55 (Track A) — named failure taxonomy. Optional. */
+  readonly failureTaxonomy?: IrFailureTaxonomy;
 };
 
 /**
@@ -815,6 +905,8 @@ export type IrChainGameV0 = {
   readonly mcp_servers: IrMcpServers;
   readonly permissions: IrPermissions;
   readonly compaction: IrCompaction;
+  /** Section 55 (Track A) — named failure taxonomy. Optional. */
+  readonly failureTaxonomy?: IrFailureTaxonomy;
 };
 
 export type IrNode =

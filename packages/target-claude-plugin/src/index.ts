@@ -1,0 +1,348 @@
+/**
+ * Track H (§59) — `target-claude-plugin`. Emits an Anthropic-compatible
+ * Claude Code plugin directory from any CrewHaus IR variant.
+ *
+ * Source: claude-plugins-official (Anthropic's reference repo at
+ * github.com/anthropics/claude-code-plugins). Anthropic's reference
+ * plugin format is intentionally minimal:
+ *
+ *   plugin-name/
+ *   ├── .claude-plugin/
+ *   │   └── plugin.json       # required: name, description, author
+ *   ├── .mcp.json             # optional, MCP server config
+ *   ├── skills/<name>/SKILL.md
+ *   ├── agents/<name>.md      # optional sub-agent definitions
+ *   ├── commands/<name>.md    # optional legacy slash entries
+ *   └── README.md             # documentation
+ *
+ * The emitter is shape-aware:
+ *
+ *   - `cli` / `channel` / `managed` / `pipeline` / `research` / `batch` /
+ *     `voice` / `browser` / `eval` / `onchain` / `onchain-game` →
+ *     produce a single SKILL.md derived from agent.instructions, plus
+ *     sub-agent .md files for each declared sub-agent.
+ *   - `workflow` → one SKILL.md per step.
+ *   - `graph` → one SKILL.md per node, plus a top-level SKILL.md naming
+ *     the entry node.
+ *   - `crew` → one agent .md per role; the entry role becomes the
+ *     primary SKILL.md.
+ *
+ * This is a strict-emission package: no I/O, returns a `Bundle` of
+ * files for the caller (the CLI) to write to disk. Pure functions.
+ *
+ * See Track H of the §55–§59 batch in factory/CHANGELOG.md.
+ */
+import { CrewhausError } from "@crewhaus/errors";
+import type {
+  IrChannelV0,
+  IrCrewV0,
+  IrEvalV0,
+  IrGraphV0,
+  IrManagedV0,
+  IrNode,
+  IrPipelineV0,
+  IrResearchV0,
+  IrV0,
+  IrWorkflowV0,
+} from "@crewhaus/ir";
+
+export class TargetClaudePluginError extends CrewhausError {
+  override readonly name = "TargetClaudePluginError";
+  constructor(message: string, cause?: unknown) {
+    super("compiler", message, cause);
+  }
+}
+
+export type PluginFile = {
+  readonly path: string;
+  readonly content: string;
+};
+
+export type PluginBundle = {
+  readonly files: ReadonlyArray<PluginFile>;
+};
+
+export type EmitClaudePluginOptions = {
+  /** Plugin author (required by Anthropic's minimal schema). */
+  readonly author: {
+    readonly name: string;
+    readonly email?: string;
+  };
+  /**
+   * Optional human-readable description; defaults to the IR's name + target.
+   * Anthropic recommends 1-2 sentences describing trigger conditions.
+   */
+  readonly description?: string;
+};
+
+/**
+ * Main entry. Returns a `PluginBundle` of files; the caller writes
+ * them to disk under the chosen plugin directory.
+ */
+export function emitClaudePlugin(ir: IrNode, opts: EmitClaudePluginOptions): PluginBundle {
+  const description = opts.description ?? defaultDescription(ir);
+  const pluginJson = renderPluginJson(ir.name, description, opts.author);
+  const files: PluginFile[] = [
+    { path: ".claude-plugin/plugin.json", content: pluginJson },
+    { path: "README.md", content: renderReadme(ir, description) },
+  ];
+
+  // MCP servers — only emitted for variants that carry them in IR.
+  const mcp = renderMcpJson(ir);
+  if (mcp !== undefined) {
+    files.push({ path: ".mcp.json", content: mcp });
+  }
+
+  // Per-variant skill + agent emission.
+  switch (ir.target) {
+    case "cli":
+      files.push(...emitCliShape(ir as IrV0));
+      break;
+    case "workflow":
+      files.push(...emitWorkflowShape(ir as IrWorkflowV0));
+      break;
+    case "channel":
+      files.push(...emitChannelShape(ir as IrChannelV0));
+      break;
+    case "graph":
+      files.push(...emitGraphShape(ir as IrGraphV0));
+      break;
+    case "crew":
+      files.push(...emitCrewShape(ir as IrCrewV0));
+      break;
+    case "managed":
+      files.push(...emitGenericAgentShape(ir as IrManagedV0, ir.target));
+      break;
+    case "pipeline":
+      files.push(...emitGenericAgentShape(ir as IrPipelineV0, ir.target));
+      break;
+    case "research":
+      files.push(...emitGenericAgentShape(ir as IrResearchV0, ir.target));
+      break;
+    case "eval":
+      files.push(...emitEvalShape(ir as IrEvalV0));
+      break;
+    case "batch":
+    case "voice":
+    case "browser":
+    case "onchain":
+    case "onchain-game":
+      files.push(...emitGenericAgentShape(ir, ir.target));
+      break;
+    default:
+      throw new TargetClaudePluginError(
+        `unsupported IR target for claude-plugin emission: ${(ir as { target: string }).target}`,
+      );
+  }
+  return { files };
+}
+
+function defaultDescription(ir: IrNode): string {
+  return `${ir.name} — CrewHaus ${ir.target} agent compiled to Claude Code plugin format.`;
+}
+
+function renderPluginJson(
+  name: string,
+  description: string,
+  author: EmitClaudePluginOptions["author"],
+): string {
+  const obj = {
+    name,
+    description,
+    author: {
+      name: author.name,
+      ...(author.email !== undefined ? { email: author.email } : {}),
+    },
+  };
+  return `${JSON.stringify(obj, null, 2)}\n`;
+}
+
+function renderReadme(ir: IrNode, description: string): string {
+  return [
+    `# ${ir.name}`,
+    "",
+    description,
+    "",
+    "## Origin",
+    "",
+    `Generated by CrewHaus \`target-claude-plugin\` from a \`target: ${ir.target}\` spec.`,
+    "Format reference: [claude-plugins-official](https://github.com/anthropics/claude-code-plugins).",
+    "",
+    "## Install",
+    "",
+    "Drop this directory under `~/.claude/plugins/` or your project's `.claude/plugins/`.",
+    "",
+  ].join("\n");
+}
+
+function renderMcpJson(ir: IrNode): string | undefined {
+  // Only emit when the IR variant has mcp_servers and it's non-empty.
+  const v = ir as { mcp_servers?: Record<string, unknown> };
+  if (v.mcp_servers === undefined) return undefined;
+  const keys = Object.keys(v.mcp_servers);
+  if (keys.length === 0) return undefined;
+  return `${JSON.stringify(v.mcp_servers, null, 2)}\n`;
+}
+
+/**
+ * Render a SKILL.md frontmatter block. Anthropic's minimal schema:
+ * `name` + `description` required. Optional `argument-hint` makes
+ * the skill user-invokable as a slash command.
+ */
+function renderSkill(opts: {
+  readonly name: string;
+  readonly description: string;
+  readonly body: string;
+  readonly argumentHint?: string;
+}): string {
+  const frontmatter: string[] = ["---", `name: ${opts.name}`, `description: ${opts.description}`];
+  if (opts.argumentHint !== undefined) {
+    frontmatter.push(`argument-hint: ${opts.argumentHint}`);
+  }
+  frontmatter.push("---");
+  return `${frontmatter.join("\n")}\n\n${opts.body}\n`;
+}
+
+function emitCliShape(ir: IrV0): PluginFile[] {
+  const files: PluginFile[] = [
+    {
+      path: `skills/${ir.name}/SKILL.md`,
+      content: renderSkill({
+        name: ir.name,
+        description: firstSentence(ir.agent.instructions) || defaultDescription(ir),
+        body: ir.agent.instructions,
+      }),
+    },
+  ];
+  for (const sa of ir.subAgents ?? []) {
+    files.push({
+      path: `agents/${sa.name}.md`,
+      content: renderAgent(sa.name, sa.description, sa.instructions),
+    });
+  }
+  return files;
+}
+
+function emitWorkflowShape(ir: IrWorkflowV0): PluginFile[] {
+  const files: PluginFile[] = [];
+  for (const step of ir.steps) {
+    files.push({
+      path: `skills/${ir.name}-${step.name}/SKILL.md`,
+      content: renderSkill({
+        name: `${ir.name}-${step.name}`,
+        description: `Step ${step.name} of workflow ${ir.name}`,
+        body: step.instructions,
+      }),
+    });
+  }
+  return files;
+}
+
+function emitChannelShape(ir: IrChannelV0): PluginFile[] {
+  const files = emitCliShape({
+    ...(ir as unknown as IrV0),
+    target: "cli",
+  } as IrV0);
+  // Channel daemons aren't natively claude-plugin-shaped; we emit the
+  // skill content but flag the channel context in the README.
+  files.push({
+    path: "CLAUDE_PLUGIN_NOTES.md",
+    content: [
+      "# Channel daemon notes",
+      "",
+      "This plugin was emitted from a `target: channel` spec. The channel " +
+        "daemon (Slack/Telegram/Discord/etc.) lifecycle is NOT part of the " +
+        "Claude Code plugin runtime — re-deploy the channel separately and " +
+        "use this plugin's skills inside Claude Code for design-time work.",
+      "",
+    ].join("\n"),
+  });
+  return files;
+}
+
+function emitGraphShape(ir: IrGraphV0): PluginFile[] {
+  const files: PluginFile[] = [
+    {
+      path: `skills/${ir.name}/SKILL.md`,
+      content: renderSkill({
+        name: ir.name,
+        description: `Stateful graph; entry node = "${ir.entry}".`,
+        body: `Graph nodes: ${ir.nodes.map((n) => n.name).join(", ")}\nEdges: ${ir.edges
+          .map((e) => `${e.from}→${e.to}`)
+          .join(", ")}`,
+      }),
+    },
+  ];
+  for (const node of ir.nodes) {
+    files.push({
+      path: `skills/${ir.name}-${node.name}/SKILL.md`,
+      content: renderSkill({
+        name: `${ir.name}-${node.name}`,
+        description: `Graph node "${node.name}" (entry=${node.name === ir.entry})`,
+        body: node.instructions,
+      }),
+    });
+  }
+  return files;
+}
+
+function emitCrewShape(ir: IrCrewV0): PluginFile[] {
+  const files: PluginFile[] = [];
+  for (const role of ir.roles) {
+    if (role.name === ir.entry) {
+      files.push({
+        path: `skills/${ir.name}/SKILL.md`,
+        content: renderSkill({
+          name: ir.name,
+          description: `Entry role "${role.name}" of crew ${ir.name}`,
+          body: role.instructions,
+        }),
+      });
+    }
+    files.push({
+      path: `agents/${role.name}.md`,
+      content: renderAgent(role.name, `Role: ${role.name}`, role.instructions),
+    });
+  }
+  return files;
+}
+
+function emitEvalShape(ir: IrEvalV0): PluginFile[] {
+  return [
+    {
+      path: `skills/${ir.name}/SKILL.md`,
+      content: renderSkill({
+        name: ir.name,
+        description: `Eval harness over dataset ${ir.dataset.name} (${ir.dataset.split})`,
+        body: ir.agent.instructions,
+      }),
+    },
+  ];
+}
+
+function emitGenericAgentShape(
+  ir: { name: string; target: string; agent: { instructions: string } },
+  target: string,
+): PluginFile[] {
+  return [
+    {
+      path: `skills/${ir.name}/SKILL.md`,
+      content: renderSkill({
+        name: ir.name,
+        description: `${target} agent — see body for instructions.`,
+        body: ir.agent.instructions,
+      }),
+    },
+  ];
+}
+
+function renderAgent(name: string, description: string, instructions: string): string {
+  return ["---", `name: ${name}`, `description: ${description}`, "---", "", instructions, ""].join(
+    "\n",
+  );
+}
+
+function firstSentence(text: string): string {
+  const m = text.match(/^[^.\n]+[.!?]/);
+  return m !== null ? m[0] : (text.split("\n")[0] ?? "");
+}

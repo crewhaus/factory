@@ -188,6 +188,7 @@ export const OPTIMIZABLE_PATHS: Readonly<
 > = Object.freeze({
   cli: Object.freeze([
     Object.freeze(["agent", "instructions"]),
+    Object.freeze(["failure_taxonomy"]),
     Object.freeze(["compaction", "threshold"]),
     // Pillar 2 active context curation — eval-optimizer can flip the
     // semantic-dedupe + relevance-reorder pass on/off and tune its
@@ -209,48 +210,68 @@ export const OPTIMIZABLE_PATHS: Readonly<
   ]),
   workflow: Object.freeze([
     Object.freeze(["steps"]),
+    Object.freeze(["failure_taxonomy"]),
     Object.freeze(["chains"]),
     Object.freeze(["transaction_policy"]),
   ]) /* whole-step replacement allowed */,
   channel: Object.freeze([
     Object.freeze(["agent", "instructions"]),
+    Object.freeze(["failure_taxonomy"]),
     Object.freeze(["chains"]),
     Object.freeze(["transaction_policy"]),
   ]),
   graph: Object.freeze([
     Object.freeze(["nodes"]),
+    Object.freeze(["failure_taxonomy"]),
     Object.freeze(["chains"]),
     Object.freeze(["transaction_policy"]),
   ]),
-  managed: Object.freeze([Object.freeze(["agent", "instructions"])]),
+  managed: Object.freeze([
+    Object.freeze(["agent", "instructions"]),
+    Object.freeze(["failure_taxonomy"]),
+  ]),
   pipeline: Object.freeze([
     Object.freeze(["agent", "instructions"]),
+    Object.freeze(["failure_taxonomy"]),
     Object.freeze(["indexing", "chunkSize"]),
     Object.freeze(["indexing", "chunkOverlap"]),
     Object.freeze(["retrieve", "defaultK"]),
   ]),
   crew: Object.freeze([
     Object.freeze(["roles"]),
+    Object.freeze(["failure_taxonomy"]),
     Object.freeze(["chains"]),
     Object.freeze(["transaction_policy"]),
   ]) /* whole-role replacement */,
   research: Object.freeze([
     Object.freeze(["agent", "instructions"]),
+    Object.freeze(["failure_taxonomy"]),
     Object.freeze(["retrieve", "maxDepth"]),
     Object.freeze(["chains"]),
     Object.freeze(["transaction_policy"]),
   ]),
   batch: Object.freeze([
     Object.freeze(["agent", "instructions"]),
+    Object.freeze(["failure_taxonomy"]),
     Object.freeze(["chains"]),
     Object.freeze(["transaction_policy"]),
   ]),
-  voice: Object.freeze([Object.freeze(["agent", "instructions"])]),
-  browser: Object.freeze([Object.freeze(["agent", "instructions"])]),
-  eval: Object.freeze([Object.freeze(["agent", "instructions"])]),
+  voice: Object.freeze([
+    Object.freeze(["agent", "instructions"]),
+    Object.freeze(["failure_taxonomy"]),
+  ]),
+  browser: Object.freeze([
+    Object.freeze(["agent", "instructions"]),
+    Object.freeze(["failure_taxonomy"]),
+  ]),
+  eval: Object.freeze([
+    Object.freeze(["agent", "instructions"]),
+    Object.freeze(["failure_taxonomy"]),
+  ]),
   // §47 onchain daemon: full cross-cutting blocks are optimizable.
   onchain: Object.freeze([
     Object.freeze(["agent", "instructions"]),
+    Object.freeze(["failure_taxonomy"]),
     Object.freeze(["chains"]),
     Object.freeze(["triggers"]),
     Object.freeze(["transaction_policy"]),
@@ -260,6 +281,7 @@ export const OPTIMIZABLE_PATHS: Readonly<
   // the productive knobs; move-timeout-ms is the realtime quality knob.
   "onchain-game": Object.freeze([
     Object.freeze(["agent", "instructions"]),
+    Object.freeze(["failure_taxonomy"]),
     Object.freeze(["game"]),
     Object.freeze(["transaction_policy"]),
   ]),

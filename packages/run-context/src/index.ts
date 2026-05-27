@@ -69,7 +69,51 @@ export type RunContext = {
    * `tagContent` lazy-creates on first use.
    */
   dataLineage?: Map<string, TrustOrigin>;
+  /**
+   * Cross-cutting (Track 10) — per-agent identity for tool calls,
+   * permission decisions, and audit log entries. Source:
+   * "Runtime Security for AI Agents: An Identity Governance
+   * Perspective" (industry blog, May 2026).
+   *
+   * Without identity, CrewHaus tracks `tool → permission` but cannot
+   * attribute a call to the specific skill, sub-agent, or role that
+   * made it. The audit log and permission engine both consult this
+   * field when present — undefined means "top-level user context"
+   * (preserves prior behaviour for runtimes that haven't been
+   * threaded through identity yet).
+   *
+   * Mutable so a sub-agent spawner can shadow the field for the
+   * child run without rebuilding the whole context.
+   */
+  agentIdentity?: AgentIdentity;
 };
+
+/**
+ * Per-agent identity for permission scope + audit trail. All fields
+ * are optional so partial identity (just `skillId`, or just
+ * `subAgentId`) is representable. The audit log uses
+ * `formatAgentIdentity(id)` to render a stable string key for
+ * grouping events.
+ */
+export type AgentIdentity = {
+  readonly skillId?: string;
+  readonly subAgentId?: string;
+  readonly roleId?: string;
+};
+
+/**
+ * Render an `AgentIdentity` to a stable string key. Format:
+ * `skill=<id>;subagent=<id>;role=<id>` — fields with undefined
+ * values are omitted; an empty identity renders as `<top-level>`.
+ */
+export function formatAgentIdentity(id: AgentIdentity | undefined): string {
+  if (id === undefined) return "<top-level>";
+  const parts: string[] = [];
+  if (id.skillId !== undefined) parts.push(`skill=${id.skillId}`);
+  if (id.subAgentId !== undefined) parts.push(`subagent=${id.subAgentId}`);
+  if (id.roleId !== undefined) parts.push(`role=${id.roleId}`);
+  return parts.length === 0 ? "<top-level>" : parts.join(";");
+}
 
 export type RunContextOptions = {
   /**

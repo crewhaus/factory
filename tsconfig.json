@@ -148,6 +148,12 @@
     { "path": "./packages/federation-protocol" },
     { "path": "./packages/federation-discovery" },
     { "path": "./packages/federation-router" },
+    { "path": "./packages/tool-harness-synthesizer" },
+    { "path": "./packages/meta-harness-optimizer" },
+    { "path": "./packages/specialization-registry" },
+    { "path": "./packages/contract-compiler" },
+    { "path": "./packages/target-claude-plugin" },
+    { "path": "./packages/rules-engine" },
     { "path": "./apps/cli" }
   ]
 }

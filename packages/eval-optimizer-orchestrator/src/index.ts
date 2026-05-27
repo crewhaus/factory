@@ -265,3 +265,15 @@ export async function optimizeSpec(opts: OptimizeSpecOptions): Promise<OptimizeS
 // Re-export the spec-patch types so callers don't need a second import.
 export type { SpecPatch } from "@crewhaus/spec-patch";
 export { applySpecPatch, validatePatch } from "@crewhaus/spec-patch";
+
+// Track B — four-way failure arbiter (Section 55, from Meta-Engineering
+// Harnesses arxiv 2605.25665). See ./failure-arbiter.ts for the
+// rule-based classifier.
+export type {
+  AggregateVerdict,
+  ArbiterAction,
+  ArbiterVerdict,
+  FailingSample,
+  FailureClass,
+} from "./failure-arbiter";
+export { aggregate, arbitrate } from "./failure-arbiter";

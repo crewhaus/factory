@@ -126,10 +126,72 @@ export function classify(error: unknown): RecoveryErrorClass {
 }
 
 /**
+ * Section 55 (Track A) — a single entry from a spec's `failure_taxonomy`,
+ * carried verbatim from the IR. The recovery engine consults the taxonomy
+ * BEFORE falling back to its built-in classify+recover logic so user-
+ * named classes take precedence. Cited paper: NLAH (arxiv 2603.25723).
+ */
+export type NamedFailureClass = {
+  readonly class: string;
+  readonly pattern: string;
+  readonly recovery: "retry" | "compact" | "continue" | "tombstone" | "fail";
+  readonly hint?: string;
+};
+
+/**
+ * Match an unknown error against a taxonomy entry's `pattern`. The pattern
+ * is either a `/regex/flags` literal or a case-insensitive substring of
+ * the error.message. Returns the first matching entry, or undefined.
+ */
+export function matchNamedFailure(
+  error: unknown,
+  taxonomy: ReadonlyArray<NamedFailureClass>,
+): NamedFailureClass | undefined {
+  const message =
+    typeof (error as { message?: unknown })?.message === "string"
+      ? (error as { message: string }).message
+      : "";
+  if (message.length === 0) return undefined;
+  for (const entry of taxonomy) {
+    const p = entry.pattern;
+    if (p.length > 2 && p.startsWith("/") && p.lastIndexOf("/") > 0) {
+      const lastSlash = p.lastIndexOf("/");
+      const body = p.slice(1, lastSlash);
+      const flags = p.slice(lastSlash + 1);
+      let re: RegExp;
+      try {
+        re = new RegExp(body, flags);
+      } catch {
+        continue;
+      }
+      if (re.test(message)) return entry;
+    } else {
+      if (message.toLowerCase().includes(p.toLowerCase())) return entry;
+    }
+  }
+  return undefined;
+}
+
+/**
  * Decide what to do about `error` given the per-turn recovery state. Pure.
  * Each call returns a single action; the caller advances state.
+ *
+ * When `taxonomy` is provided, named classes take precedence over the
+ * built-in classify+recover taxonomy. A named match returns its declared
+ * `recovery` action directly (subject to the same per-turn budgets as
+ * built-in classes). Unmatched errors fall through to the built-in flow.
  */
-export function recover(error: unknown, state: RecoveryState): RecoveryAction {
+export function recover(
+  error: unknown,
+  state: RecoveryState,
+  taxonomy?: ReadonlyArray<NamedFailureClass>,
+): RecoveryAction {
+  if (taxonomy !== undefined && taxonomy.length > 0) {
+    const named = matchNamedFailure(error, taxonomy);
+    if (named !== undefined) {
+      return recoverNamed(named, state);
+    }
+  }
   const klass = classify(error);
   const message = (error as { message?: unknown })?.message;
   const reasonStr = typeof message === "string" && message.length > 0 ? message : klass;
@@ -168,6 +230,44 @@ export function recover(error: unknown, state: RecoveryState): RecoveryAction {
 
     case "unknown":
       return { kind: "fail", reason: reasonStr };
+  }
+}
+
+/**
+ * Convert a matched named-failure entry into the corresponding
+ * RecoveryAction, respecting the same per-turn budgets as built-in
+ * classes. Budget exhaustion always returns `fail` so the user can't
+ * declare an infinite retry loop via taxonomy.
+ */
+function recoverNamed(named: NamedFailureClass, state: RecoveryState): RecoveryAction {
+  const reason = `failure_taxonomy: ${named.class}`;
+  switch (named.recovery) {
+    case "retry":
+      if (state.retryCount >= MAX_RETRIES) {
+        return { kind: "fail", reason: `retry budget exhausted: ${reason}` };
+      }
+      return {
+        kind: "retry",
+        delayMs: backoffMs(state.retryCount),
+        attempt: state.retryCount + 1,
+      };
+    case "compact":
+      if (state.compactCount >= MAX_COMPACTS) {
+        return { kind: "fail", reason: `compact budget exhausted: ${reason}` };
+      }
+      return { kind: "compact" };
+    case "continue":
+      if (state.continueCount >= MAX_CONTINUES) {
+        return { kind: "fail", reason: `continue budget exhausted: ${reason}` };
+      }
+      return { kind: "continue" };
+    case "tombstone":
+      if (state.tombstoneCount >= MAX_TOMBSTONES) {
+        return { kind: "fail", reason: `tombstone budget exhausted: ${reason}` };
+      }
+      return { kind: "tombstone" };
+    case "fail":
+      return { kind: "fail", reason };
   }
 }
 
