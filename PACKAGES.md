@@ -31,7 +31,7 @@ alias crewhaus="bun $(pwd)/factory/apps/cli/src/index.ts"
 crewhaus init my-agent
 ```
 
-`docs/GETTING-STARTED.md` walks the full development workflow.
+[`GETTING-STARTED.md`](https://github.com/crewhaus/docs/blob/main/GETTING-STARTED.md) in the sibling [crewhaus/docs](https://github.com/crewhaus/docs) repo walks the full development workflow.
 
 ## Using the CLI after launch
 
