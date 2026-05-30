@@ -1,0 +1,20 @@
+{
+  "name": "@crewhaus/target-cf-worker-cli",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Codegen backend for CLI target emitted as a Cloudflare Worker. Sibling of target-cli; reads the same IrV0 variant, emits a Worker bundle.",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@crewhaus/errors": "workspace:*",
+    "@crewhaus/infra-utils": "workspace:*",
+    "@crewhaus/ir": "workspace:*"
+  }
+}

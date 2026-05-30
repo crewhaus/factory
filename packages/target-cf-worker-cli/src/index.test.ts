@@ -1,0 +1,90 @@
+import { describe, expect, test } from "bun:test";
+import type { IrV0 } from "@crewhaus/ir";
+import { TargetEmitError, emitCfWorkerCli } from "./index";
+
+const baseIr: IrV0 = {
+  version: 0,
+  name: "hello-cli",
+  target: "cli",
+  agent: {
+    model: "claude-haiku-4-5-20251001",
+    instructions: "You are a helpful assistant.",
+  },
+  tools: [],
+  toolConfigs: Object.freeze({}),
+  mcp_servers: Object.freeze({}),
+  permissions: { rules: [] },
+  subAgents: [],
+  compaction: {},
+};
+
+describe("emitCfWorkerCli", () => {
+  test("emits worker.js, wrangler.toml, and package.json", () => {
+    const bundle = emitCfWorkerCli(baseIr);
+    const paths = bundle.files.map((f) => f.path).sort();
+    expect(paths).toEqual(["package.json", "worker.js", "wrangler.toml"]);
+  });
+
+  test("worker.js inlines model and instructions", () => {
+    const bundle = emitCfWorkerCli(baseIr);
+    const worker = bundle.files.find((f) => f.path === "worker.js");
+    expect(worker?.content).toContain("claude-haiku-4-5-20251001");
+    expect(worker?.content).toContain("You are a helpful assistant.");
+    expect(worker?.content).toContain("api.anthropic.com");
+  });
+
+  test("wrangler.toml uses sanitized spec name", () => {
+    const ir: IrV0 = { ...baseIr, name: "Hello World!" };
+    const bundle = emitCfWorkerCli(ir);
+    const wrangler = bundle.files.find((f) => f.path === "wrangler.toml");
+    expect(wrangler?.content).toContain('name = "hello-world-"');
+  });
+
+  test("worker.js escapes special characters in instructions", () => {
+    const ir: IrV0 = {
+      ...baseIr,
+      agent: {
+        ...baseIr.agent,
+        instructions: 'Respond with "quoted" text\nand newlines.',
+      },
+    };
+    const bundle = emitCfWorkerCli(ir);
+    const worker = bundle.files.find((f) => f.path === "worker.js");
+    expect(worker?.content).toContain('\\"quoted\\"');
+    expect(worker?.content).toContain("\\n");
+  });
+
+  test("rejects non-cli IR variants", () => {
+    const wrong = { ...baseIr, target: "workflow" } as unknown as IrV0;
+    expect(() => emitCfWorkerCli(wrong)).toThrow(TargetEmitError);
+  });
+
+  test("rejects CLI IR with tools until M2", () => {
+    const ir: IrV0 = { ...baseIr, tools: ["read", "write"] };
+    expect(() => emitCfWorkerCli(ir)).toThrow(TargetEmitError);
+  });
+
+  // Regression: the emitter previously wrapped JSON.stringify output in an
+  // extra pair of quotes (`name: ""hello-cli""`), which Cloudflare rejected
+  // at upload with "Unexpected identifier 'hello' at worker.js:5:10". The
+  // substring assertions above missed it, so parse the whole module instead.
+  const parseJs = (code: string) => new Bun.Transpiler({ loader: "js" }).transformSync(code);
+
+  test("worker.js is syntactically valid JavaScript", () => {
+    const worker = emitCfWorkerCli(baseIr).files.find((f) => f.path === "worker.js");
+    expect(() => parseJs(worker?.content ?? "")).not.toThrow();
+  });
+
+  test("worker.js stays valid with hyphenated name and tricky instructions", () => {
+    const ir: IrV0 = {
+      ...baseIr,
+      name: "hello-cli",
+      agent: {
+        ...baseIr.agent,
+        instructions: 'Quotes "here", a newline\nhere, a ${dollar} and a ` backtick.',
+      },
+    };
+    const worker = emitCfWorkerCli(ir).files.find((f) => f.path === "worker.js");
+    expect(() => parseJs(worker?.content ?? "")).not.toThrow();
+  });
+});

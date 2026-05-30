@@ -154,6 +154,10 @@
     { "path": "./packages/contract-compiler" },
     { "path": "./packages/target-claude-plugin" },
     { "path": "./packages/rules-engine" },
+    { "path": "./packages/target-cf-worker-cli" },
+    { "path": "./packages/target-cf-worker-graph" },
+    { "path": "./packages/target-cf-worker-workflow" },
+    { "path": "./packages/compiler-worker" },
     { "path": "./apps/cli" }
   ]
 }

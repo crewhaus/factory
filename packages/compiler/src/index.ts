@@ -36,6 +36,7 @@ import type {
   IrWhatsAppConfig,
   IrWorkflowV0,
 } from "@crewhaus/ir";
+import { applyPasses as applyIrPassesFn } from "@crewhaus/ir-passes";
 import {
   type Spec,
   type SpecChannel,
@@ -88,9 +89,10 @@ export function compile(yamlText: string, opts: CompileOptions = {}): Bundle {
   const spec = parseSpec(yamlText);
   let ir = lower(spec);
   if (opts.applyIrPasses === true) {
-    // Lazy import to avoid pulling ir-passes into bundles that don't ask.
-    const { applyPasses } = require("@crewhaus/ir-passes") as typeof import("@crewhaus/ir-passes");
-    ir = applyPasses(ir);
+    // Static import so the compiler bundles cleanly into a Cloudflare
+    // Worker. ir-passes is a workspace dep regardless; the prior `require`
+    // call broke Worker bundling (no `require` in CF Workers runtime).
+    ir = applyIrPassesFn(ir);
   }
   return emit(ir);
 }
