@@ -14,7 +14,7 @@ For day-to-day visibility on what's in flight, see the [GitHub Project](https://
 
 - Compiler core: `parseSpec → lower → applyPasses → emit`
 - IR as a discriminated union of target-shape variants (CLI, channel bot, stateful graph, managed multi-tenant, RAG pipeline, multi-agent crew, autonomous research, batch worker, voice/realtime, browser/computer-use, eval bundle, workflow, on-chain, on-chain game)
-- Fourteen target emitters: CLI, channel-{slack,discord,telegram,whatsapp,imessage}, graph, managed, pipeline, crew, research, batch, voice, browser, eval, workflow, onchain, onchain-game
+- Target emitters, one per shape: CLI, channel-{slack,discord,telegram,whatsapp,imessage}, graph, managed, pipeline, crew, research, batch, voice, browser, eval, workflow, onchain, onchain-game
 - `crewhaus-runtime-core` — runtime-thin imports for generated bundles
 - `crewhaus init`, `crewhaus compile`, `crewhaus run`, `crewhaus optimize`, `crewhaus validate`, `crewhaus doctor`
 - Eval-driven optimization: rule-based and Claude-driven `MutationProvider`s; spec-patch with YAML CST round-trip
