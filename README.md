@@ -26,7 +26,7 @@ CrewHaus is the layer above. You write the agent once, as a spec (`crewhaus.yaml
 
 ## What you can compile to
 
-Fourteen target shapes ship today:
+These target shapes ship today:
 
 | Target | What it produces |
 |---|---|
