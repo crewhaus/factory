@@ -1,7 +1,6 @@
 {
   "name": "@crewhaus/dataset-registry",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.1",
   "type": "module",
   "description": "Split-aware dataset versioning: train/dev/test with hash-stable sample identifiers and split-leak prevention",
   "main": "src/index.ts",
@@ -15,5 +14,29 @@
   "dependencies": {
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/eval-dataset": "workspace:*"
-  }
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@studiomax.io",
+    "url": "https://studiomax.io"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/dataset-registry"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/dataset-registry#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ]
 }

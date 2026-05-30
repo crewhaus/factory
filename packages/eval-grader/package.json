@@ -1,7 +1,6 @@
 {
   "name": "@crewhaus/eval-grader",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.1",
   "type": "module",
   "description": "Deterministic graders + composers for the eval stack",
   "main": "src/index.ts",
@@ -19,5 +18,29 @@
     "@crewhaus/trace-event-bus": "workspace:*",
     "yaml": "^2.6.0",
     "zod": "^3.23.8"
-  }
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@studiomax.io",
+    "url": "https://studiomax.io"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/eval-grader"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/eval-grader#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ]
 }

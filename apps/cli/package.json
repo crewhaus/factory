@@ -1,7 +1,6 @@
 {
   "name": "@crewhaus/cli",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.1",
   "type": "module",
   "description": "factory CLI: compile, run, deploy harness specs",
   "main": "src/index.ts",
@@ -69,5 +68,29 @@
     "@crewhaus/sandbox": "workspace:*",
     "@crewhaus/sandbox-image-registry": "workspace:*",
     "@crewhaus/compliance-controls": "workspace:*"
-  }
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@studiomax.io",
+    "url": "https://studiomax.io"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "apps/cli"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/apps/cli#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ]
 }

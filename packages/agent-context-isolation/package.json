@@ -1,7 +1,6 @@
 {
   "name": "@crewhaus/agent-context-isolation",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.1",
   "type": "module",
   "description": "IsolatedContext factory + RuntimeBridge type for sub-agent spawning (Section 13)",
   "main": "src/index.ts",
@@ -21,5 +20,29 @@
     "@crewhaus/state-store": "workspace:*",
     "@crewhaus/tool-catalog": "workspace:*",
     "@crewhaus/trace-event-bus": "workspace:*"
-  }
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@studiomax.io",
+    "url": "https://studiomax.io"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/agent-context-isolation"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/agent-context-isolation#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ]
 }

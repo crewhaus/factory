@@ -1,7 +1,6 @@
 {
   "name": "@crewhaus/secrets-manager",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.1",
   "type": "module",
   "description": "Pluggable secrets backend with rotation + audit-log integration: env-var, file, vault",
   "main": "src/index.ts",
@@ -16,5 +15,29 @@
     "@crewhaus/audit-log": "workspace:*",
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/logging": "workspace:*"
-  }
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@studiomax.io",
+    "url": "https://studiomax.io"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/secrets-manager"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/secrets-manager#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ]
 }

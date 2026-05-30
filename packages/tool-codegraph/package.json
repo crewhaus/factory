@@ -1,7 +1,6 @@
 {
   "name": "@crewhaus/tool-codegraph",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.1",
   "type": "module",
   "description": "AST-aware code intelligence tool — wraps the codegraph npm SDK so agents can ask for callers/callees/impact-radius instead of greping",
   "main": "src/index.ts",
@@ -22,6 +21,32 @@
     "@colbymchenry/codegraph": "*"
   },
   "peerDependenciesMeta": {
-    "@colbymchenry/codegraph": { "optional": true }
-  }
+    "@colbymchenry/codegraph": {
+      "optional": true
+    }
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@studiomax.io",
+    "url": "https://studiomax.io"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/tool-codegraph"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/tool-codegraph#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ]
 }

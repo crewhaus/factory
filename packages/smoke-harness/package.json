@@ -1,7 +1,6 @@
 {
   "name": "@crewhaus/smoke-harness",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.1",
   "type": "module",
   "description": "Compile-time smoke matrix: drives one minimal spec per target shape through compile() and asserts the emitted bundle has the imports/registrations/event-kinds the shape is supposed to wire.",
   "main": "src/index.ts",
@@ -16,5 +15,29 @@
     "@crewhaus/compiler": "workspace:*",
     "@crewhaus/ir": "workspace:*",
     "@crewhaus/spec": "workspace:*"
-  }
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@studiomax.io",
+    "url": "https://studiomax.io"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/smoke-harness"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/smoke-harness#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ]
 }

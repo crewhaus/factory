@@ -1,7 +1,6 @@
 {
   "name": "@crewhaus/permission-tokengated",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.1",
   "type": "module",
   "description": "Token-gated permission resolver. Reads on-chain ownership (ERC-20 balance, ERC-721 ownerOf) and emits alwaysAllow / alwaysDeny PermissionRule records. §47 slice 1; supports Shape 9 (Tokenized Access) and Shape 12 (DID/credential).",
   "main": "src/index.ts",
@@ -16,5 +15,29 @@
     "@crewhaus/chain-adapter-base": "workspace:*",
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/permission-engine": "workspace:*"
-  }
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@studiomax.io",
+    "url": "https://studiomax.io"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/permission-tokengated"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/permission-tokengated#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ]
 }

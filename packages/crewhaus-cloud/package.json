@@ -1,7 +1,6 @@
 {
   "name": "@crewhaus/crewhaus-cloud",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.1",
   "type": "module",
   "description": "Managed-as-a-service composite recipe: target-managed + helm-chart Kustomize overlay + Terraform module for GKE/EKS/AKS provisioning (Section 32)",
   "main": "src/index.ts",
@@ -16,5 +15,29 @@
     "@crewhaus/docker-images": "workspace:*",
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/helm-chart": "workspace:*"
-  }
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@studiomax.io",
+    "url": "https://studiomax.io"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/crewhaus-cloud"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/crewhaus-cloud#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ]
 }

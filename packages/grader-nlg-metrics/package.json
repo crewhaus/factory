@@ -1,7 +1,6 @@
 {
   "name": "@crewhaus/grader-nlg-metrics",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.1",
   "type": "module",
   "description": "NLG-metric graders: ROUGE-1/2/L, BLEU-1..4, METEOR. Pure-TS; pluggable into @crewhaus/grader-registry (Section 38)",
   "main": "src/index.ts",
@@ -15,5 +14,29 @@
   "dependencies": {
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/eval-grader": "workspace:*"
-  }
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@studiomax.io",
+    "url": "https://studiomax.io"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/grader-nlg-metrics"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/grader-nlg-metrics#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ]
 }

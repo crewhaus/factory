@@ -1,7 +1,6 @@
 {
   "name": "@crewhaus/graph-engine",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.1",
   "type": "module",
   "description": "Stateful graph runtime: nodes, edges, parallel branches, HITL pauses, checkpoint-store integration",
   "main": "src/index.ts",
@@ -17,5 +16,29 @@
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/run-context": "workspace:*",
     "@crewhaus/trace-event-bus": "workspace:*"
-  }
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@studiomax.io",
+    "url": "https://studiomax.io"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/graph-engine"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/graph-engine#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ]
 }

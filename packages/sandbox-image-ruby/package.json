@@ -1,7 +1,6 @@
 {
   "name": "@crewhaus/sandbox-image-ruby",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.1",
   "type": "module",
   "description": "Ruby 3.3 polyglot sandbox image: registry registration + Dockerfile + T2/T7/T8 contract tests (Section 36)",
   "main": "src/index.ts",
@@ -16,5 +15,29 @@
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/sandbox": "workspace:*",
     "@crewhaus/sandbox-image-registry": "workspace:*"
-  }
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@studiomax.io",
+    "url": "https://studiomax.io"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/sandbox-image-ruby"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/sandbox-image-ruby#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ]
 }

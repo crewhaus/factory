@@ -1,7 +1,6 @@
 {
   "name": "@crewhaus/spec-patch",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.1",
   "type": "module",
   "description": "Pillar-2 patch infrastructure — apply a SpecPatch to a YAML source preserving comments and key order via the yaml CST. Drives the active eval optimizer's spec-level mutation loop.",
   "main": "src/index.ts",
@@ -17,5 +16,29 @@
     "@crewhaus/spec": "workspace:*",
     "yaml": "^2.6.0",
     "zod": "^3.23.8"
-  }
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@studiomax.io",
+    "url": "https://studiomax.io"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/spec-patch"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/spec-patch#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ]
 }
