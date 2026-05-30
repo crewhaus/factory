@@ -13,12 +13,12 @@ For day-to-day visibility on what's in flight, see the [GitHub Project](https://
 ## What's in v0.1.0 (current)
 
 - Compiler core: `parseSpec → lower → applyPasses → emit`
-- IR as a discriminated union of target-shape variants (CLI, channel bot, stateful graph, managed multi-tenant, RAG pipeline, multi-agent crew, autonomous research, batch worker, voice/realtime, browser/computer-use, eval bundle, workflow)
-- Twelve target emitters: CLI, channel-{slack,discord,telegram,whatsapp}, graph, managed, pipeline, crew, research, batch, voice, browser, eval, workflow
+- IR as a discriminated union of target-shape variants (CLI, channel bot, stateful graph, managed multi-tenant, RAG pipeline, multi-agent crew, autonomous research, batch worker, voice/realtime, browser/computer-use, eval bundle, workflow, on-chain, on-chain game)
+- Fourteen target emitters: CLI, channel-{slack,discord,telegram,whatsapp,imessage}, graph, managed, pipeline, crew, research, batch, voice, browser, eval, workflow, onchain, onchain-game
 - `crewhaus-runtime-core` — runtime-thin imports for generated bundles
 - `crewhaus init`, `crewhaus compile`, `crewhaus run`, `crewhaus optimize`, `crewhaus validate`, `crewhaus doctor`
 - Eval-driven optimization: rule-based and Claude-driven `MutationProvider`s; spec-patch with YAML CST round-trip
-- Boundary classifier with `TrustOrigin` metadata across the seven boundary sites (MCP, sub-agent, channel, federation, skill, compaction, tool)
+- Boundary classifier with `TrustOrigin` metadata across the eight boundary sites (MCP, sub-agent, channel, federation, skill, compaction, tool, chain)
 - Hello-world examples for: CLI, workflow, channel-{discord,telegram,whatsapp}, federation, graph, sandbox-image (multiple language variants)
 
 ## v0.2.x (Days 30-60)
@@ -85,4 +85,4 @@ Open an RFC issue. See [`CONTRIBUTING.md`](CONTRIBUTING.md). We expect to revise
 
 ---
 
-*Last updated: [DATE]. Subject to change.*
+*Last updated: 2026-05-30. Subject to change.*

@@ -17,13 +17,13 @@ Every change in this repo must respect three invariants. They exist because in 2
 
 ### Pillar 1 — The compiler is the protagonist
 
-Crewhaus is a **meta-harness compiler**, not "yet another agent loop." Specs flow through `parseSpec → lower → applyPasses → emit` ([packages/compiler/src/index.ts](packages/compiler/src/index.ts)). The IR is a discriminated union — `IrNode = IrV0 | IrWorkflowV0 | IrChannelV0 | IrGraphV0 | IrManagedV0 | IrPipelineV0 | IrCrewV0 | IrResearchV0 | IrBatchV0 | IrVoiceV0 | IrBrowserV0 | IrEvalV0` ([packages/ir/src/index.ts:537](packages/ir/src/index.ts:537)) — and each target shape consumes its own IR variant.
+Crewhaus is a **meta-harness compiler**, not "yet another agent loop." Specs flow through `parseSpec → lower → applyPasses → emit` ([packages/compiler/src/index.ts](packages/compiler/src/index.ts)). The IR is a discriminated union — `IrNode = IrV0 | IrWorkflowV0 | IrChannelV0 | IrGraphV0 | IrManagedV0 | IrPipelineV0 | IrCrewV0 | IrResearchV0 | IrBatchV0 | IrVoiceV0 | IrBrowserV0 | IrEvalV0 | IrChainV0 | IrChainGameV0` ([packages/ir/src/index.ts:912](packages/ir/src/index.ts:912)) — and each target shape consumes its own IR variant.
 
 **Contributor rules:**
 
-1. **New target shapes start at the IR**, not at codegen. Add an `Ir<Target>V0` type to the discriminated union, add a `lower` case, add an `emit<Target>(ir: Ir<Target>V0)` function, register it in `emit()`. The `assertNever(ir)` exhaustive check at [packages/compiler/src/index.ts:529](packages/compiler/src/index.ts:529) keeps you honest.
+1. **New target shapes start at the IR**, not at codegen. Add an `Ir<Target>V0` type to the discriminated union, add a `lower` case, add an `emit<Target>(ir: Ir<Target>V0)` function, register it in `emit()`. The `assertNever(ir)` exhaustive check at [packages/compiler/src/index.ts:878](packages/compiler/src/index.ts:878) keeps you honest.
 2. **Targets receive their typed IR variant**, never the raw spec. If you reach into `spec.foo` from a target emitter, you've broken the polymorphism — push the field into the IR variant instead.
-3. **IR-level optimizations live in `packages/ir-passes/`** as `(IrNode) → IrNode` functions with a type-guard for the variants they touch. See `redundantMcpServerCollapse` at [packages/ir-passes/src/index.ts:113](packages/ir-passes/src/index.ts:113) for the template.
+3. **IR-level optimizations live in `packages/ir-passes/`** as `(IrNode) → IrNode` functions with a type-guard for the variants they touch. See `redundantMcpServerCollapse` at [packages/ir-passes/src/index.ts:127](packages/ir-passes/src/index.ts:127) for the template.
 4. **Eval-driven mutations do NOT go in `ir-passes`.** They patch the spec, not the IR — see Pillar 2.
 5. **The roadmap, briefs, and recipes for a new feature must cite its IR variant.** If you find yourself documenting something without an IR variant, you're probably adding a runtime feature without first deciding where it lives in the compiler.
 
@@ -43,7 +43,7 @@ The active-optimization layer:
 
 1. **Spec parameters that should be optimizable** must be listed in `OPTIMIZABLE_PATHS` ([packages/spec-patch/src/index.ts](packages/spec-patch/src/index.ts)). If you add a new spec field that affects eval quality (chunkOverlap, defaultK, temperature, instructions), add the path or the optimizer can't reach it.
 2. **Patches mutate the spec, never the IR.** The compiler's `lower()` does destructive normalization (sort, freeze, env-var rewriting); IR-level patches can't round-trip back to YAML.
-3. **The rule-based provider stays the default in tests** so test fixtures are deterministic. The model-driven Claude provider is opt-in via `--mutator claude` and is cost-gated via `--budget-usd`.
+3. **The rule-based provider stays the default in tests** so test fixtures are deterministic. The model-driven Claude provider is opt-in via `--mutator claude`. A `--budget-usd` cost-gate backed by `cost-tracker` is a planned follow-up; today the only safety rail is the orchestrator's `iterations` cap.
 4. **Eval reports without a patch are passive grading** — that's fine for canary gates and dashboards, but the system's promise is *active* optimization. Do not let the optimization loop fall out of date with the rest of the eval stack.
 
 ### Pillar 3 — Security is a fabric, not a perimeter
@@ -63,6 +63,7 @@ The fabric has **two symmetric halves**: a source side (classify content coming 
 | Skill bodies | `"skill"` | [packages/skills-registry](packages/skills-registry) |
 | Compaction summaries | `"compaction"` | `packages/compaction-*` |
 | Tool results | `"tool"` | [packages/runtime-core](packages/runtime-core) |
+| On-chain payloads / receipts | `"chain"` | [packages/target-onchain](packages/target-onchain), [packages/target-onchain-game](packages/target-onchain-game), [packages/wallet-engine](packages/wallet-engine) |
 
 **Sink-side chokepoint** — [packages/egress-classifier](packages/egress-classifier). On every external-scope tool call (`tool.scope === "external"`), `runtime-core` calls `classifyEgress(payload, ctx, { sinkId, sinkScope })`. The classifier scans `RunContext.dataLineage` for substring matches and folds the per-origin policy across all hits. The default policy is *permissive on `"user"` content, warn on configured sinks, block on dynamic sinks*. Three audit outcomes land in the trace bus and audit-log: `"egress-passed" | "egress-warned" | "egress-blocked"`.
 
@@ -79,7 +80,7 @@ The fabric has **two symmetric halves**: a source side (classify content coming 
 
 **Contributor rules:**
 
-1. **Any new module that ingests external content registers a `TrustOrigin`** in `packages/boundary-classifier/src/origins.ts`, calls `classifyBoundary` before the content reaches a model call or a tool result, AND calls `tagContent(ctx, content, origin)` after a non-blocked verdict so the sink-side classifier sees it.
+1. **Any new module that ingests external content registers a `TrustOrigin`** in [packages/boundary-classifier/src/index.ts:63](packages/boundary-classifier/src/index.ts:63), calls `classifyBoundary` before the content reaches a model call or a tool result, AND calls `tagContent(ctx, content, origin)` after a non-blocked verdict so the sink-side classifier sees it.
 2. **Any new tool that crosses a process or network boundary sets `scope: "external"`** in its `ToolDefinition`. Tools default to `"internal"` at normalization, so forgetting this is silently insecure — the §41 `crewhaus doctor` philosophy-alignment check catches it.
 3. **Destructive or visible-side-effect tools should set `requireJustification: true`** — `SendMessage`, `EvmSendTransaction`, `ImageGenerate`, and federation outbound tools all do.
 4. **Authentication ≠ classification.** mTLS, JWT, and signed cookies verify *who* sent something; they say nothing about *what* the content contains. Classify after authenticating.
