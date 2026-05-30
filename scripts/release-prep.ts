@@ -12,7 +12,7 @@
  *   bun scripts/release-prep.ts --access public       # override publishConfig.access
  */
 
-import { readdirSync, readFileSync, statSync, writeFileSync, existsSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 
 type Json = Record<string, unknown>;
@@ -45,7 +45,8 @@ const REPO_BY_BASENAME: Record<string, { owner: string; repo: string }> = {
 };
 
 const repoBase = (() => {
-  const base = ROOT.split("/").pop()!;
+  const parts = ROOT.split("/");
+  const base = parts[parts.length - 1] ?? "";
   return REPO_BY_BASENAME[base];
 })();
 
@@ -62,7 +63,7 @@ function readJson(path: string): Json {
 }
 
 function writeJson(path: string, data: Json) {
-  writeFileSync(path, JSON.stringify(data, null, 2) + "\n");
+  writeFileSync(path, `${JSON.stringify(data, null, 2)}\n`);
 }
 
 /** Get glob-expanded list of package dirs from workspace root. */
@@ -122,9 +123,9 @@ function applyRelease(pkg: Json, pkgDir: string, isRoot: boolean): boolean {
   // version
   set("version", TARGET_VERSION);
 
-  // private: remove
+  // private: remove (set to undefined so it doesn't serialize)
   if (pkg.private !== undefined) {
-    delete pkg.private;
+    pkg.private = undefined;
     changed = true;
   }
 
@@ -143,7 +144,10 @@ function applyRelease(pkg: Json, pkgDir: string, isRoot: boolean): boolean {
   });
 
   // homepage / bugs
-  set("homepage", relDir ? `${HOMEPAGE_BASE}/tree/main/${relDir}#readme` : `${HOMEPAGE_BASE}#readme`);
+  set(
+    "homepage",
+    relDir ? `${HOMEPAGE_BASE}/tree/main/${relDir}#readme` : `${HOMEPAGE_BASE}#readme`,
+  );
   set("bugs", { url: `${HOMEPAGE_BASE}/issues` });
 
   // publishConfig

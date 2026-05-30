@@ -40,10 +40,5 @@
   "publishConfig": {
     "access": "restricted"
   },
-  "files": [
-    "src",
-    "README.md",
-    "LICENSE",
-    "NOTICE"
-  ]
+  "files": ["src", "README.md", "LICENSE", "NOTICE"]
 }

@@ -19,9 +19,9 @@
  *   bun scripts/publish-workspace.ts --filter @crewhaus/errors
  */
 
-import { readdirSync, readFileSync, existsSync, statSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 
 type PkgInfo = {
   name: string;
@@ -113,7 +113,8 @@ function topoSort(pkgs: PkgInfo[]): PkgInfo[] {
   for (const [n, d] of inDeg) if (d === 0) ready.push(n);
   ready.sort();
   while (ready.length) {
-    const n = ready.shift()!;
+    const n = ready.shift();
+    if (n === undefined) break;
     const p = byName.get(n);
     if (!p) continue;
     out.push(p);
@@ -131,7 +132,10 @@ function topoSort(pkgs: PkgInfo[]): PkgInfo[] {
   if (out.length !== pkgs.length) {
     throw new Error(
       `Topo sort incomplete (cycle?). Sorted ${out.length}/${pkgs.length}. ` +
-        `Unsorted: ${pkgs.filter((p) => !out.includes(p)).map((p) => p.name).join(", ")}`,
+        `Unsorted: ${pkgs
+          .filter((p) => !out.includes(p))
+          .map((p) => p.name)
+          .join(", ")}`,
     );
   }
   return out;
@@ -151,7 +155,7 @@ type PublishResult = "ok" | "already" | "failed";
 function publish(p: PkgInfo): PublishResult {
   console.log(`\n→ publishing ${p.name}@${p.version}`);
   if (DRY) {
-    console.log(`  (dry-run, skipping)`);
+    console.log("  (dry-run, skipping)");
     return "ok";
   }
   // Capture output so we can recognize "already published" as success.
@@ -160,7 +164,7 @@ function publish(p: PkgInfo): PublishResult {
   process.stdout.write(out);
   if (r.status === 0) return "ok";
   if (/cannot publish over the previously published versions/i.test(out)) {
-    console.log(`  (already published — treating as success)`);
+    console.log("  (already published — treating as success)");
     return "already";
   }
   return "failed";
