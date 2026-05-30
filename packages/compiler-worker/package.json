@@ -1,0 +1,28 @@
+{
+  "name": "@crewhaus/compiler-worker",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Stateless Cloudflare Worker exposing the CrewHaus compiler over HTTP for the studio PWA",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src",
+    "dev": "wrangler dev --local",
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "@crewhaus/compiler": "workspace:*",
+    "@crewhaus/ir": "workspace:*",
+    "@crewhaus/spec": "workspace:*",
+    "@crewhaus/target-cf-worker-cli": "workspace:*",
+    "@crewhaus/target-cf-worker-graph": "workspace:*",
+    "@crewhaus/target-cf-worker-workflow": "workspace:*"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20251001.0"
+  }
+}

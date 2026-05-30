@@ -1,0 +1,13 @@
+name = "crewhaus-compiler"
+main = "src/index.ts"
+compatibility_date = "2026-05-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Required vars. The PWA origin is comma-separated for multi-env support.
+# Production deploys override these via wrangler.production.toml or CI secrets.
+[vars]
+ALLOWED_ORIGINS = "https://crewhaus-studio.pages.dev,http://localhost:4322"
+
+# Optional: max body bytes to accept (defensive vs giant specs from misbehaving clients).
+# 256 KB is comfortably above the largest spec in demos/starters.
+MAX_BODY_BYTES = "262144"
