@@ -21,12 +21,12 @@ CrewHaus is the layer above. You write the agent once, as a spec (`crewhaus.yaml
 
 ## What you can compile to
 
-Twelve target shapes ship today:
+Fourteen target shapes ship today:
 
 | Target | What it produces |
 |---|---|
 | `cli` | A self-contained TypeScript CLI agent |
-| `channel-slack` / `channel-discord` / `channel-telegram` / `channel-whatsapp` | Channel bots |
+| `channel` (slack / discord / telegram / whatsapp / imessage) | Channel bots |
 | `graph` | A stateful graph runtime |
 | `pipeline` | A RAG pipeline |
 | `crew` | A multi-agent crew |
@@ -37,6 +37,8 @@ Twelve target shapes ship today:
 | `managed` | A managed multi-tenant runtime |
 | `eval` | An eval bundle for grading other targets |
 | `workflow` | A workflow orchestration runtime |
+| `onchain` | An on-chain (EVM) agent runtime |
+| `onchain-game` | An on-chain game runtime |
 
 Adding a new target shape starts at the IR, not at codegen. See [`COMPILER-ARCHITECTURE.md`](https://github.com/crewhaus/docs/blob/main/COMPILER-ARCHITECTURE.md).
 

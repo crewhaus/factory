@@ -2,13 +2,15 @@
  * Track E (§56) — `meta-harness-optimizer`.
  *
  * **BREAKING — opt-in only.** Default optimizer mutator stays `rule`;
- * this mutator is invoked explicitly via `crewhaus optimize --mutator
- * meta-harness`. When used, the optimizer's output is a rewritten
- * bundle (`agent.ts`) that no longer round-trips through `parseSpec`.
- * That sidesteps the spec-as-source-of-truth invariant in exchange
- * for full expressiveness over the runtime program. A run header
- * comment is prepended to the bundle so reviewers see the divergence
- * immediately.
+ * this mutator is consumed programmatically by passing a
+ * `MetaHarnessMutationProvider` to `optimizeSpec({ mutator: ... })`.
+ * (CLI `--mutator meta-harness` wiring is a follow-up; the CLI today
+ * exposes `rule-based` and `claude` only.) When used, the optimizer's
+ * output is a rewritten bundle (`agent.ts`) that no longer round-trips
+ * through `parseSpec`. That sidesteps the spec-as-source-of-truth
+ * invariant in exchange for full expressiveness over the runtime
+ * program. A run header comment is prepended to the bundle so reviewers
+ * see the divergence immediately.
  *
  * Source: Meta-Harness (Lee et al., Stanford/KRAFTON/MIT,
  * arxiv 2603.28052, March 2026). The paper's key empirical finding:

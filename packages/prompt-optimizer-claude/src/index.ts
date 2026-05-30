@@ -22,9 +22,10 @@
  *      the search — see the rule-based provider as the deterministic
  *      fallback path).
  *
- * Cost: each call is one Claude request (~1-3K tokens). The
- * `crewhaus optimize --mutator claude --budget-usd N` flag caps total
- * spend via the §27 `cost-tracker` running spend total.
+ * Cost: each call is one Claude request (~1-3K tokens). A cost-gate
+ * (`--budget-usd`) backed by the §27 `cost-tracker` running spend
+ * total is a planned follow-up; today the only safety rail is the
+ * orchestrator's `iterations` cap.
  *
  * Catalog layer: F-eval (active optimisation). Brief: 280.
  */

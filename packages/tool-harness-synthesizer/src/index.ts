@@ -303,10 +303,13 @@ export async function synthesizeVerifier(opts: SynthesizeOptions): Promise<Synth
  * runs one iteration of the inner tree search and emits a
  * prompt-edit that references the synthesized verifier.
  *
- * Typical wiring (CLI): `crewhaus optimize --mutator verifier-synthesis`
- * → orchestrator constructs this provider with the spec's skill samples
- * → orchestrator runs the standard search loop, but each "mutation"
- * is a freshly-synthesized verifier persisted to .crewhaus/verifiers/.
+ * Typical wiring (programmatic): construct this provider with the
+ * spec's skill samples and a `refiner` function, then pass it to
+ * `optimizeSpec({ mutator: new VerifierMutationProvider(...) })`. The
+ * orchestrator runs the standard search loop, but each "mutation" is
+ * a freshly-synthesized verifier persisted to .crewhaus/verifiers/.
+ * (CLI `--mutator verifier-synthesis` wiring is a follow-up; the CLI
+ * today exposes `rule-based` and `claude` only.)
  */
 export class VerifierMutationProvider implements MutationProvider {
   readonly name = "verifier-synthesis";

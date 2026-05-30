@@ -124,7 +124,7 @@ Every untrusted ingress is classified before content reaches a model call.
 
 **Rules:**
 
-- Any new module that ingests external content registers a `TrustOrigin` in `packages/boundary-classifier/src/origins.ts`.
+- Any new module that ingests external content registers a `TrustOrigin` in [`packages/boundary-classifier/src/index.ts`](packages/boundary-classifier/src/index.ts).
 - Authentication ≠ classification. Classify after authenticating.
 - The content-hash cache is not bypassed for performance.
 - Severity defaults: malicious → replace with redaction notice; suspicious → keep + log + emit `permission_decision` trace event.
@@ -206,7 +206,7 @@ At launch there is one core maintainer (project lead). The ladder exists so the 
 
 ## Documentation
 
-- New features need a recipe in the [demos repo.s `walkthroughs/`](https://github.com/crewhaus/demos/tree/main/walkthroughs).
+- New features need a recipe in the [demos repo's `walkthroughs/`](https://github.com/crewhaus/demos/tree/main/walkthroughs).
 - New modules need a brief in the [docs repo's `module-briefs/`](https://github.com/crewhaus/docs/tree/main/module-briefs).
 - Public API changes need a changelog entry (auto-generated from conventional commits).
 - Docs use Creative Commons Attribution 4.0 (separate from the code license).
