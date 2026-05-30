@@ -1,7 +1,6 @@
 {
   "name": "@crewhaus/target-research-bundle",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.1",
   "type": "module",
   "description": "Codegen for the RES target — emits a resumable daemon that drives planner → branches → report (Section 23 RES)",
   "main": "src/index.ts",
@@ -16,5 +15,24 @@
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/infra-utils": "workspace:*",
     "@crewhaus/ir": "workspace:*"
-  }
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@studiomax.io",
+    "url": "https://studiomax.io"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/target-research-bundle"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/target-research-bundle#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  },
+  "files": ["src", "README.md", "LICENSE", "NOTICE"]
 }

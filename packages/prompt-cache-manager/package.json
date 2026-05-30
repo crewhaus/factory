@@ -1,7 +1,6 @@
 {
   "name": "@crewhaus/prompt-cache-manager",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.1",
   "type": "module",
   "description": "Rotates Anthropic-style cache_control markers on the system prompt so long-running daemons stay under the 30-day TTL",
   "main": "src/index.ts",
@@ -14,5 +13,24 @@
   },
   "dependencies": {
     "@crewhaus/adapter-anthropic": "workspace:*"
-  }
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@studiomax.io",
+    "url": "https://studiomax.io"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/prompt-cache-manager"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/prompt-cache-manager#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  },
+  "files": ["src", "README.md", "LICENSE", "NOTICE"]
 }

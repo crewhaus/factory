@@ -1,7 +1,6 @@
 {
   "name": "@crewhaus/deployment-controller",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.1",
   "type": "module",
   "description": "Version pinning + promotion: promote(name, fromEnv, toEnv) / rollback. Records every action to audit-log.",
   "main": "src/index.ts",
@@ -16,5 +15,24 @@
     "@crewhaus/audit-log": "workspace:*",
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/spec-registry": "workspace:*"
-  }
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@studiomax.io",
+    "url": "https://studiomax.io"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/deployment-controller"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/deployment-controller#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  },
+  "files": ["src", "README.md", "LICENSE", "NOTICE"]
 }

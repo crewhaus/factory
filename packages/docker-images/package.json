@@ -1,7 +1,6 @@
 {
   "name": "@crewhaus/docker-images",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.1",
   "type": "module",
   "description": "Per-target-shape Docker images (multi-stage, non-root, healthchecked) + crewhaus build-image CLI wrapper (Section 32)",
   "main": "src/index.ts",
@@ -14,5 +13,24 @@
   },
   "dependencies": {
     "@crewhaus/errors": "workspace:*"
-  }
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@studiomax.io",
+    "url": "https://studiomax.io"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/docker-images"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/docker-images#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  },
+  "files": ["src", "README.md", "LICENSE", "NOTICE"]
 }

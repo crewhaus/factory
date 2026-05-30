@@ -1,7 +1,6 @@
 {
   "name": "@crewhaus/exporter-datadog",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.1",
   "type": "module",
   "description": "Datadog OTLP exporter — wraps @crewhaus/otel-exporter with dd.service/dd.env/dd.version resource attrs + DD_API_KEY auth (Section 37)",
   "main": "src/index.ts",
@@ -16,5 +15,24 @@
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/otel-exporter": "workspace:*",
     "@crewhaus/trace-event-bus": "workspace:*"
-  }
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@studiomax.io",
+    "url": "https://studiomax.io"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/exporter-datadog"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/exporter-datadog#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  },
+  "files": ["src", "README.md", "LICENSE", "NOTICE"]
 }

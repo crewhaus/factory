@@ -1,7 +1,6 @@
 {
   "name": "@crewhaus/target-browser-driver",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.1",
   "type": "module",
   "description": "Codegen for the BROW target — emits a single agent.ts that boots a chromium driver + vision-grounding tools (Section 25 BROW)",
   "main": "src/index.ts",
@@ -16,5 +15,24 @@
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/infra-utils": "workspace:*",
     "@crewhaus/ir": "workspace:*"
-  }
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@studiomax.io",
+    "url": "https://studiomax.io"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/target-browser-driver"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/target-browser-driver#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  },
+  "files": ["src", "README.md", "LICENSE", "NOTICE"]
 }

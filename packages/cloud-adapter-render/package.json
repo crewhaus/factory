@@ -1,7 +1,6 @@
 {
   "name": "@crewhaus/cloud-adapter-render",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.1",
   "type": "module",
   "description": "One-click deploy adapter for Render — generates a render.yaml blueprint + a Render-tuned Dockerfile and wraps the Render Deploy API for daemon target shapes (Section 44)",
   "main": "src/index.ts",
@@ -15,5 +14,24 @@
   "dependencies": {
     "@crewhaus/docker-images": "workspace:*",
     "@crewhaus/errors": "workspace:*"
-  }
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@studiomax.io",
+    "url": "https://studiomax.io"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/cloud-adapter-render"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/cloud-adapter-render#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  },
+  "files": ["src", "README.md", "LICENSE", "NOTICE"]
 }

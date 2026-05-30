@@ -1,7 +1,6 @@
 {
   "name": "@crewhaus/slash-commands",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.1",
   "type": "module",
   "description": "Markdown-templated slash commands with $ARGUMENTS substitution",
   "main": "src/index.ts",
@@ -15,5 +14,24 @@
   "dependencies": {
     "@crewhaus/errors": "workspace:*",
     "yaml": "^2.6.0"
-  }
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@studiomax.io",
+    "url": "https://studiomax.io"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/slash-commands"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/slash-commands#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  },
+  "files": ["src", "README.md", "LICENSE", "NOTICE"]
 }

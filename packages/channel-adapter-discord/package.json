@@ -1,7 +1,6 @@
 {
   "name": "@crewhaus/channel-adapter-discord",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.1",
   "type": "module",
   "description": "Discord channel adapter: Ed25519 signature verification + slash-command/button/modal interaction parsing + interaction-response API (Section 33)",
   "main": "src/index.ts",
@@ -14,5 +13,24 @@
   },
   "dependencies": {
     "@crewhaus/errors": "workspace:*"
-  }
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@studiomax.io",
+    "url": "https://studiomax.io"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/channel-adapter-discord"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/channel-adapter-discord#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  },
+  "files": ["src", "README.md", "LICENSE", "NOTICE"]
 }

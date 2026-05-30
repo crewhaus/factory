@@ -1,7 +1,6 @@
 {
   "name": "@crewhaus/tool-message-channel",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.1",
   "type": "module",
   "description": "Built-in `SendMessage` tool for cross-channel addressing (Section 12). Permission-gated; fail-closed without an explicit allow rule.",
   "main": "src/index.ts",
@@ -24,5 +23,24 @@
     "@crewhaus/tool-executor": "workspace:*",
     "@crewhaus/tool-permission-matcher": "workspace:*",
     "@crewhaus/tool-validate": "workspace:*"
-  }
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@studiomax.io",
+    "url": "https://studiomax.io"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/tool-message-channel"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/tool-message-channel#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  },
+  "files": ["src", "README.md", "LICENSE", "NOTICE"]
 }

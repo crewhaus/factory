@@ -1,7 +1,6 @@
 {
   "name": "@crewhaus/a2a-protocol",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.1",
   "type": "module",
   "description": "In-crew agent-to-agent SendMessage tool with traceparent envelopes (Section 22)",
   "main": "src/index.ts",
@@ -18,5 +17,24 @@
     "@crewhaus/tool-catalog": "workspace:*",
     "@crewhaus/trace-event-bus": "workspace:*",
     "zod": "^3.23.8"
-  }
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@studiomax.io",
+    "url": "https://studiomax.io"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/a2a-protocol"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/a2a-protocol#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  },
+  "files": ["src", "README.md", "LICENSE", "NOTICE"]
 }

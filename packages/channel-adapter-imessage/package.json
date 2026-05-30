@@ -1,7 +1,6 @@
 {
   "name": "@crewhaus/channel-adapter-imessage",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.1",
   "type": "module",
   "description": "macOS-only iMessage channel adapter: ~/Library/Messages/chat.db polling + osascript send + cursor-based idempotency (Section 33)",
   "main": "src/index.ts",
@@ -14,5 +13,24 @@
   },
   "dependencies": {
     "@crewhaus/errors": "workspace:*"
-  }
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@studiomax.io",
+    "url": "https://studiomax.io"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/channel-adapter-imessage"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/channel-adapter-imessage#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  },
+  "files": ["src", "README.md", "LICENSE", "NOTICE"]
 }

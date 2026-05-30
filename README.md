@@ -5,13 +5,18 @@
 Compile a single spec (a `crewhaus.yaml`) into a CLI agent, channel bot, RAG pipeline, multi-agent crew, eval harness, voice/realtime agent, browser/computer-use agent, and more. Active eval optimization. Trust-aware by default. Apache-2.0.
 
 ```bash
-# Until @crewhaus/cli is on npm (tracking in PACKAGES.md), use it from a clone.
-git clone https://github.com/crewhaus/factory && cd factory && bun install && cd ..
-alias crewhaus="bun $(pwd)/factory/apps/cli/src/index.ts"
-crewhaus init my-agent
+bun add -d @crewhaus/cli
+bun x crewhaus init my-agent
 cd my-agent
-crewhaus compile crewhaus.yaml -o build && crewhaus run crewhaus.yaml
+bun x crewhaus compile crewhaus.yaml -o build && bun x crewhaus run crewhaus.yaml
 ```
+
+> **0.1.1 status (2026-05-30).** The `@crewhaus` npm scope is currently published
+> with `publishConfig.access: "restricted"` for private testing. Anyone granted scope
+> access can `bun add -d @crewhaus/cli` as shown above. The scope flips to public
+> per [PACKAGES.md](PACKAGES.md)'s launch checklist; once that happens this README
+> needs no change — the install command is the same. (Pin `^0.1.1` or newer; v0.1.0
+> shipped with broken workspace:* deps and is tombstoned.)
 
 ## Why CrewHaus?
 
@@ -57,14 +62,14 @@ Full architecture: [`AI-Harness-Systems.md`](https://github.com/crewhaus/docs/bl
 Requires [Bun](https://bun.sh) ≥ 1.2.
 
 ```bash
-# Until @crewhaus/cli is on npm (tracking in PACKAGES.md), use it from a clone.
-git clone https://github.com/crewhaus/factory && cd factory && bun install && cd ..
-alias crewhaus="bun $(pwd)/factory/apps/cli/src/index.ts"
+bun add -d @crewhaus/cli
 
 # Create a new agent project — writes a minimal `crewhaus.yaml`
-crewhaus init my-agent
+bun x crewhaus init my-agent
 cd my-agent
 ```
+
+If you'd rather develop against the workspace directly (contributing to factory itself), see [CONTRIBUTING.md](CONTRIBUTING.md) for the clone-and-link workflow.
 
 `crewhaus init` writes a runnable starter spec:
 

@@ -1,7 +1,6 @@
 {
   "name": "@crewhaus/mcp-host",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.1",
   "type": "module",
   "description": "MCP client manager: stdio + SSE transports, exp-backoff reconnect, server registry, built on @modelcontextprotocol/sdk",
   "main": "src/index.ts",
@@ -18,5 +17,24 @@
     "@crewhaus/trace-event-bus": "workspace:*",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "zod": "^3.23.8"
-  }
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@studiomax.io",
+    "url": "https://studiomax.io"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/mcp-host"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/mcp-host#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  },
+  "files": ["src", "README.md", "LICENSE", "NOTICE"]
 }

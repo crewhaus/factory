@@ -1,7 +1,6 @@
 {
   "name": "@crewhaus/branch-history",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.1",
   "type": "module",
   "description": "Branch + diff helpers over checkpoint-store — time-travel utilities for the GRPH target",
   "main": "src/index.ts",
@@ -15,5 +14,24 @@
   "dependencies": {
     "@crewhaus/checkpoint-store": "workspace:*",
     "@crewhaus/errors": "workspace:*"
-  }
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@studiomax.io",
+    "url": "https://studiomax.io"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/branch-history"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/branch-history#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  },
+  "files": ["src", "README.md", "LICENSE", "NOTICE"]
 }

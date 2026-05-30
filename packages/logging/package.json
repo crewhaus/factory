@@ -1,7 +1,6 @@
 {
   "name": "@crewhaus/logging",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.1",
   "type": "module",
   "description": "Structured logger shared across factory layers",
   "main": "src/index.ts",
@@ -11,5 +10,24 @@
   },
   "scripts": {
     "test": "bun test src"
-  }
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@studiomax.io",
+    "url": "https://studiomax.io"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/logging"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/logging#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  },
+  "files": ["src", "README.md", "LICENSE", "NOTICE"]
 }

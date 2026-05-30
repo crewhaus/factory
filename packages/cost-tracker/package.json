@@ -1,7 +1,6 @@
 {
   "name": "@crewhaus/cost-tracker",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.1",
   "type": "module",
   "description": "Per-run / per-tenant USD aggregation: subscribes to model_response events, emits cost_accrual TraceEvents",
   "main": "src/index.ts",
@@ -16,5 +15,24 @@
   "dependencies": {
     "@crewhaus/trace-event-bus": "workspace:*",
     "@crewhaus/logging": "workspace:*"
-  }
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@studiomax.io",
+    "url": "https://studiomax.io"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/cost-tracker"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/cost-tracker#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  },
+  "files": ["src", "README.md", "LICENSE", "NOTICE"]
 }

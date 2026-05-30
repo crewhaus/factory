@@ -1,7 +1,6 @@
 {
   "name": "@crewhaus/compiler",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.1",
   "type": "module",
   "description": "Compiler core: parse → validate → lower → emit",
   "main": "src/index.ts",
@@ -31,5 +30,24 @@
     "@crewhaus/target-research-bundle": "workspace:*",
     "@crewhaus/target-voice": "workspace:*",
     "@crewhaus/target-workflow": "workspace:*"
-  }
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@studiomax.io",
+    "url": "https://studiomax.io"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/compiler"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/compiler#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  },
+  "files": ["src", "README.md", "LICENSE", "NOTICE"]
 }

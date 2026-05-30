@@ -1,7 +1,6 @@
 {
   "name": "@crewhaus/streaming-tool-executor",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.1",
   "type": "module",
   "description": "Dispatch tool execution mid-stream so tools start before message_stop",
   "main": "src/index.ts",
@@ -21,5 +20,24 @@
     "@crewhaus/tool-executor": "workspace:*",
     "@crewhaus/turn-state-machine": "workspace:*",
     "zod": "^3.23.8"
-  }
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@studiomax.io",
+    "url": "https://studiomax.io"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/streaming-tool-executor"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/streaming-tool-executor#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  },
+  "files": ["src", "README.md", "LICENSE", "NOTICE"]
 }

@@ -1,7 +1,6 @@
 {
   "name": "@crewhaus/helm-chart",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.1",
   "type": "module",
   "description": "Kubernetes Helm chart (templates + values schema + ServiceMonitor + OTel collector sidecar) plus an in-process renderChart() for tests (Section 32)",
   "main": "src/index.ts",
@@ -15,5 +14,24 @@
   "dependencies": {
     "@crewhaus/docker-images": "workspace:*",
     "@crewhaus/errors": "workspace:*"
-  }
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@studiomax.io",
+    "url": "https://studiomax.io"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/helm-chart"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/helm-chart#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  },
+  "files": ["src", "README.md", "LICENSE", "NOTICE"]
 }

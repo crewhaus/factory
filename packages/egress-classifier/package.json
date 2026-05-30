@@ -1,7 +1,6 @@
 {
   "name": "@crewhaus/egress-classifier",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.1",
   "type": "module",
   "description": "Pillar-3 sink-side chokepoint — classify content leaving via external sinks (fetch / web / mcp / channel / federation / evm-tx) against the data-lineage carried in run-context",
   "main": "src/index.ts",
@@ -15,5 +14,24 @@
   "dependencies": {
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/run-context": "workspace:*"
-  }
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@studiomax.io",
+    "url": "https://studiomax.io"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/egress-classifier"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/egress-classifier#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  },
+  "files": ["src", "README.md", "LICENSE", "NOTICE"]
 }

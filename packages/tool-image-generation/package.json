@@ -1,7 +1,6 @@
 {
   "name": "@crewhaus/tool-image-generation",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.1",
   "type": "module",
   "description": "M4.1 — image-generation tool (DALL-E 3, Replicate, future Flux/SD). Calls remote API; no host writes; non-destructive.",
   "main": "src/index.ts",
@@ -17,5 +16,24 @@
     "@crewhaus/tool-builder": "workspace:*",
     "@crewhaus/tool-catalog": "workspace:*",
     "zod": "^3.23.8"
-  }
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@studiomax.io",
+    "url": "https://studiomax.io"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/tool-image-generation"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/tool-image-generation#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  },
+  "files": ["src", "README.md", "LICENSE", "NOTICE"]
 }

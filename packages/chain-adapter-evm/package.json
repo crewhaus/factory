@@ -1,7 +1,6 @@
 {
   "name": "@crewhaus/chain-adapter-evm",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.1",
   "type": "module",
   "description": "EVM chain adapter: JSON-RPC over fetch with single/quorum/fallback dispatch, finality enforcement, and §41 boundary classification of every response (Section 47, Slice 0).",
   "main": "src/index.ts",
@@ -16,5 +15,24 @@
     "@crewhaus/boundary-classifier": "workspace:*",
     "@crewhaus/chain-adapter-base": "workspace:*",
     "@crewhaus/errors": "workspace:*"
-  }
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@studiomax.io",
+    "url": "https://studiomax.io"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/chain-adapter-evm"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/chain-adapter-evm#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  },
+  "files": ["src", "README.md", "LICENSE", "NOTICE"]
 }
