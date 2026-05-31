@@ -1,0 +1,40 @@
+{
+  "name": "@crewhaus/justification-judge-claude",
+  "version": "0.1.1",
+  "type": "module",
+  "description": "Pillar-3 model-backed JustificationJudge — asks Claude whether a tool call's justification is genuinely consistent with the compile-time session goal. Ships the production judge the intent gate's footnote promised; fails closed on model error.",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.96.0",
+    "@crewhaus/adapter-anthropic": "workspace:*",
+    "@crewhaus/errors": "workspace:*",
+    "@crewhaus/permission-engine": "workspace:*",
+    "zod": "^3.23.8"
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@studiomax.io",
+    "url": "https://studiomax.io"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/justification-judge-claude"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/justification-judge-claude#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  },
+  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+}

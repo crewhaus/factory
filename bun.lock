@@ -38,6 +38,7 @@
         "@crewhaus/hooks-engine": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
+        "@crewhaus/justification-judge-claude": "workspace:*",
         "@crewhaus/logging": "workspace:*",
         "@crewhaus/mcp-host": "workspace:*",
         "@crewhaus/migration-engine": "workspace:*",
@@ -74,6 +75,9 @@
         "@crewhaus/tool-vision-grounding": "workspace:*",
         "@crewhaus/tool-web": "workspace:*",
         "@crewhaus/trace-event-bus": "workspace:*",
+      },
+      "devDependencies": {
+        "zod": "^3.23.8",
       },
     },
     "packages/a2a-protocol": {
@@ -807,6 +811,17 @@
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/ir": "workspace:*",
+      },
+    },
+    "packages/justification-judge-claude": {
+      "name": "@crewhaus/justification-judge-claude",
+      "version": "0.1.1",
+      "dependencies": {
+        "@anthropic-ai/sdk": "^0.96.0",
+        "@crewhaus/adapter-anthropic": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/permission-engine": "workspace:*",
+        "zod": "^3.23.8",
       },
     },
     "packages/logging": {
@@ -2191,6 +2206,8 @@
     "@crewhaus/ir": ["@crewhaus/ir@workspace:packages/ir"],
 
     "@crewhaus/ir-passes": ["@crewhaus/ir-passes@workspace:packages/ir-passes"],
+
+    "@crewhaus/justification-judge-claude": ["@crewhaus/justification-judge-claude@workspace:packages/justification-judge-claude"],
 
     "@crewhaus/logging": ["@crewhaus/logging@workspace:packages/logging"],
 

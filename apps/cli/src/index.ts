@@ -20,6 +20,7 @@ import { createLogger } from "@crewhaus/logging";
 import { McpHost } from "@crewhaus/mcp-host";
 import {
   BUILTIN_DEFAULT_RULES,
+  type JustificationJudge,
   PermissionConfigError,
   type PermissionMode,
   type RuleSet,
@@ -36,6 +37,16 @@ import { type RegisteredTool, ToolCatalog } from "@crewhaus/tool-catalog";
 import { registerMcpServer } from "@crewhaus/tool-mcp";
 import { createTaskTool } from "@crewhaus/tool-task";
 import { type CostAccrualEvent, TraceEventBus } from "@crewhaus/trace-event-bus";
+// FR-004 — Pillar 3 intent-gate judge + durable audit-sink resolution, in a
+// side-effect-free module so it is unit-testable (this entry file runs an
+// argv switch on import).
+import {
+  InvalidJudgeChoiceError,
+  type JudgeChoice,
+  createJustificationJudge,
+  openJustificationAuditSink,
+  resolveJudgeChoice,
+} from "./justification-gate";
 // FR-002 — Pillar 3 sink-side scope gate, shared by `compile --strict` and
 // `doctor --philosophy-alignment`. Kept in a side-effect-free module so it is
 // unit-testable (this entry file runs an argv switch on import).
@@ -78,6 +89,14 @@ const RUN_SCHEMA: ParseArgsSchema = {
     { name: "resume", takesValue: true },
     { name: "continue", takesValue: false },
     { name: "prompt", takesValue: true },
+    // FR-004 — select the Pillar 3 intent-gate judge for this run.
+    // rule-based (default) | claude. Overrides the spec's
+    // security.justification.judge when supplied.
+    { name: "justification-judge", takesValue: true },
+    // FR-004 — disable the durable `permission_justification_evaluated`
+    // audit-log record (on by default for `run`). The ephemeral trace-bus
+    // event is unaffected; this only skips opening `.crewhaus/audit`.
+    { name: "no-justification-audit", takesValue: false },
     { name: "help", short: "h" },
   ],
 };
@@ -254,6 +273,7 @@ function usage(): never {
       "                  [--resume <id>]      resume a specific session (cli targets only)",
       "                  [--continue]         resume the most-recent session (cli targets only)",
       "                  [--prompt <text>]    initial user prompt (browser targets; defaults to stdin)",
+      "                  [--justification-judge rule-based|claude]  Pillar 3 intent-gate judge (FR-004)",
       "  eval <spec.yaml> --dataset <data>    run the agent against a dataset and grade",
       "       --graders <graders.yaml>       (deterministic graders + LLM-as-judge)",
       "       [--judge-model <model>] [--concurrency N] [--seed N] -o <out-dir>",
@@ -569,10 +589,37 @@ function buildRuleSet(
   };
 }
 
+/**
+ * FR-004 — resolve the Pillar 3 intent-gate judge for a `run`. Precedence:
+ * `--justification-judge` flag > spec `security.justification.judge` >
+ * `"rule-based"`. Returns `undefined` for the rule-based path so the
+ * caller omits `justificationJudge` from `runChatLoop` and runtime-core
+ * falls back to `ruleBasedJustificationJudge` (the documented default for
+ * tests/offline runs). For `"claude"` it lazily imports the adapter +
+ * `@crewhaus/justification-judge-claude` (matching the run path's existing
+ * lazy-import style) so the model-backed judge code only loads when
+ * actually selected. An unknown value `die()`s.
+ */
+async function resolveJustificationJudge(
+  args: ParsedArgs,
+  securityJustification: { judge?: JudgeChoice; model?: string } | undefined,
+): Promise<JustificationJudge | undefined> {
+  const flag = args.flags["justification-judge"];
+  const flagValue = typeof flag === "string" ? flag : undefined;
+  let choice: JudgeChoice;
+  try {
+    choice = resolveJudgeChoice(flagValue, securityJustification);
+  } catch (err) {
+    if (err instanceof InvalidJudgeChoiceError) die(err.message);
+    throw err;
+  }
+  return createJustificationJudge(choice, securityJustification?.model);
+}
+
 async function runRun(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
-      "usage: crewhaus run <spec.yaml> [--model <model>] [--permission-mode <default|plan|auto|bypass>] [--resume <sessionId> | --continue] [--prompt <text>]\n",
+      "usage: crewhaus run <spec.yaml> [--model <model>] [--permission-mode <default|plan|auto|bypass>] [--resume <sessionId> | --continue] [--prompt <text>] [--justification-judge rule-based|claude]\n",
     );
     return;
   }
@@ -707,6 +754,18 @@ async function runRunCli(
 
   const permissionRules = buildRuleSet(ir.permissions.rules, process.cwd());
 
+  // FR-004 — resolve the Pillar 3 intent-gate judge (flag > spec > rule-based).
+  // undefined leaves runtime-core on `ruleBasedJustificationJudge`.
+  const justificationJudge = await resolveJustificationJudge(args, ir.security?.justification);
+  // FR-004 — open the durable audit sink the intent gate appends a
+  // `permission_justification_evaluated` record to. On by default for `run`
+  // (rooted at .crewhaus/audit); `--no-justification-audit` skips it. undefined
+  // leaves runtime-core writing only the ephemeral trace-bus event.
+  const justificationAuditSink = await openJustificationAuditSink({
+    cwd: process.cwd(),
+    enabled: args.flags["no-justification-audit"] !== true,
+  });
+
   // Section 11 — discover hooks, skills, and slash commands from the user's
   // workspace. Hooks come from `~/.crewhaus/settings.json` + `<cwd>/.crewhaus/settings.json`;
   // skills from `~/.crewhaus/skills/*/SKILL.md` + project-equivalent; slash
@@ -771,6 +830,8 @@ async function runRunCli(
       slashCommands,
       ...(subAgents !== undefined ? { subAgents, spawnSubAgent } : {}),
       ...(resumeId !== undefined ? { resume: { sessionId: resumeId } } : {}),
+      ...(justificationJudge !== undefined ? { justificationJudge } : {}),
+      ...(justificationAuditSink !== undefined ? { justificationAuditSink } : {}),
     });
   } finally {
     if (mcpHost) await mcpHost.disconnectAll();
@@ -845,6 +906,18 @@ async function runRunBrowser(
 
   const permissionRules = buildRuleSet(ir.permissions.rules, process.cwd());
 
+  // FR-004 — honour --justification-judge on the browser one-shot path too.
+  // The browser spec shape carries no `security` block, so this is
+  // flag-only (flag > rule-based); both run paths thread the same judge
+  // into the same gate inside runChatLoop.
+  const justificationJudge = await resolveJustificationJudge(args, undefined);
+  // FR-004 — same durable audit sink as the cli path, so a justification-gated
+  // browser tool also writes the `permission_justification_evaluated` record.
+  const justificationAuditSink = await openJustificationAuditSink({
+    cwd: process.cwd(),
+    enabled: args.flags["no-justification-audit"] !== true,
+  });
+
   // Lazy-import the browser-runtime packages so cli/init/doctor invocations
   // don't pay the playwright + computer-use-driver load cost.
   const [{ createDriver }, navigate, screenCapture, mouseKeyboard, visionGrounding] =
@@ -897,6 +970,8 @@ async function runRunBrowser(
       sessionTarget: "browser",
       singleTurn: true,
       seedMessages: [{ role: "user", content: prompt }],
+      ...(justificationJudge !== undefined ? { justificationJudge } : {}),
+      ...(justificationAuditSink !== undefined ? { justificationAuditSink } : {}),
       installSigintHandler: false,
       maxTokens: 4096,
     });

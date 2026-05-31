@@ -11,6 +11,7 @@
     { "path": "../../packages/eval-optimizer-orchestrator" },
     { "path": "../../packages/prompt-optimizer" },
     { "path": "../../packages/prompt-optimizer-claude" },
+    { "path": "../../packages/justification-judge-claude" },
     { "path": "../../packages/spec-patch" },
     { "path": "../../packages/audit-log" },
     { "path": "../../packages/canary-controller" },
