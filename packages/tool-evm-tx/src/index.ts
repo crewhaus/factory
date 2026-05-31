@@ -125,6 +125,8 @@ export const evmSendTransaction: RegisteredTool = buildTool({
   // Pillar 3 sink-side: broadcasting a tx writes data permanently to a
   // public ledger — the most-external sink we have.
   scope: "external",
+  // FR-002 — declare the io-capability fact (RPC broadcast over the network).
+  ioCapability: "network",
   // Pillar 3 intent gate: tx broadcast is destructive AND irreversible AND
   // costs money. Mandatory justification gate.
   requireJustification: true,

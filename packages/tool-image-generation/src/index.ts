@@ -87,6 +87,8 @@ export const imageGenerate: RegisteredTool = buildTool({
   // Pillar 3 sink-side: the prompt is sent to a remote provider; lineage
   // exfiltration via prompt smuggling is real.
   scope: "external",
+  // FR-002 — declare the io-capability fact (remote image-gen API call).
+  ioCapability: "network",
   execute: async (input) => {
     const cfg = registeredConfig ?? {};
     const provider = cfg.provider ?? defaultProvider(process.env);

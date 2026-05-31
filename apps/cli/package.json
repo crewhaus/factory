@@ -47,6 +47,7 @@
     "@crewhaus/spec": "workspace:*",
     "@crewhaus/sub-agent-spawner": "workspace:*",
     "@crewhaus/tool-bash": "workspace:*",
+    "@crewhaus/tool-builder": "workspace:*",
     "@crewhaus/tool-catalog": "workspace:*",
     "@crewhaus/tool-codegraph": "workspace:*",
     "@crewhaus/tool-fetch": "workspace:*",

@@ -88,6 +88,8 @@ export const sendMessage: RegisteredTool = buildTool({
   // Pillar 3 sink-side: channel send is the textbook lateral-comm sink.
   // egress-classifier scans the `text` payload for cross-origin lineage.
   scope: "external",
+  // FR-002 — declare the io-capability fact (outbound channel network call).
+  ioCapability: "network",
   // Pillar 3 intent gate: sending a message is irreversible-ish and visible
   // to humans on the other end, so demand justification.
   requireJustification: true,

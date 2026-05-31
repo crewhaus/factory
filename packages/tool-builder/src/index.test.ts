@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { ToolDefinition } from "@crewhaus/tool-catalog";
 import { z } from "zod";
-import { buildTool } from "./index";
+import { OUTWARD_TOOL_NAMES, buildTool, isOutwardName } from "./index";
 
 const echoSchema = z.object({ message: z.string() });
 type EchoInput = z.infer<typeof echoSchema>;
@@ -91,6 +91,93 @@ describe("buildTool — fail-closed defaults", () => {
   test("requireJustification=true is preserved", () => {
     const tool = buildTool({ ...echoDef, requireJustification: true });
     expect(tool.requireJustification).toBe(true);
+  });
+
+  // FR-002 — io-capability passthrough. Like jsonSchema, the field is omitted
+  // entirely when the definition does not set it (additive; no behavior change
+  // for the ~all tools that don't declare it).
+  test("ioCapability is omitted when not set on the definition", () => {
+    const tool = buildTool(echoDef);
+    expect(tool.ioCapability).toBeUndefined();
+    expect("ioCapability" in tool).toBe(false);
+  });
+
+  test("ioCapability:'network' is passed through verbatim", () => {
+    const tool = buildTool({ ...echoDef, name: "CustomSocket", ioCapability: "network" });
+    expect(tool.ioCapability).toBe("network");
+  });
+
+  test("ioCapability:'process' is passed through verbatim", () => {
+    const tool = buildTool({ ...echoDef, name: "RunDaemon", ioCapability: "process" });
+    expect(tool.ioCapability).toBe("process");
+  });
+
+  test("ioCapability does NOT itself flip the scope default (scope stays its own decision)", () => {
+    // ioCapability is the *fact*; scope is the *policy*. buildTool does not
+    // infer scope from ioCapability — the compile-time audit is what couples
+    // them. A custom io-capable tool that forgets scope still defaults to
+    // "internal" here (fail-closed), which is exactly what --strict then flags.
+    const tool = buildTool({ ...echoDef, name: "CustomSocket", ioCapability: "network" });
+    expect(tool.scope).toBe("internal");
+  });
+});
+
+describe("buildTool — FR-002 outward-name scope inference (defense-in-depth)", () => {
+  test("an outward-name tool with no explicit scope infers 'external' (Fetch)", () => {
+    const tool = buildTool({ ...echoDef, name: "Fetch" });
+    expect(tool.scope).toBe("external");
+  });
+
+  test.each(["WebFetch", "WebSearch", "SendMessage", "EvmSendTransaction", "ImageGenerate"])(
+    "outward built-in %s infers 'external' when scope is unspecified",
+    (name) => {
+      const tool = buildTool({ ...echoDef, name });
+      expect(tool.scope).toBe("external");
+    },
+  );
+
+  test("a namespaced MCP tool (mcp__server__tool) infers 'external' via the prefix rule", () => {
+    const tool = buildTool({ ...echoDef, name: "mcp__slack__send" });
+    expect(tool.scope).toBe("external");
+  });
+
+  test("a pure-compute name (Echo) still defaults to 'internal'", () => {
+    const tool = buildTool({ ...echoDef, name: "Echo" });
+    expect(tool.scope).toBe("internal");
+  });
+
+  test("an explicit scope:'internal' on an outward NAME is preserved (def.scope wins)", () => {
+    // The override path the FR's red gate covers: an author can still force a
+    // known-outward tool back to internal, and the audit (compile --strict /
+    // doctor) is what flags that as the footgun.
+    const tool = buildTool({ ...echoDef, name: "Fetch", scope: "internal" });
+    expect(tool.scope).toBe("internal");
+  });
+
+  test("an explicit scope:'external' on a non-outward name is preserved", () => {
+    const tool = buildTool({ ...echoDef, name: "CustomSocket", scope: "external" });
+    expect(tool.scope).toBe("external");
+  });
+});
+
+describe("isOutwardName / OUTWARD_TOOL_NAMES", () => {
+  test("returns true for every name in the outward set", () => {
+    for (const name of OUTWARD_TOOL_NAMES) {
+      expect(isOutwardName(name)).toBe(true);
+    }
+  });
+
+  test("returns true for any mcp__-prefixed name", () => {
+    expect(isOutwardName("mcp__github__create_issue")).toBe(true);
+    expect(isOutwardName("mcp__")).toBe(true);
+  });
+
+  test("returns false for internal/compute tool names", () => {
+    expect(isOutwardName("Echo")).toBe(false);
+    expect(isOutwardName("read")).toBe(false);
+    expect(isOutwardName("bash")).toBe(false);
+    // a name that merely contains 'mcp' but isn't prefixed is not outward
+    expect(isOutwardName("dumpcp")).toBe(false);
   });
 });
 
