@@ -43,7 +43,7 @@
  * a perf optimisation.
  *
  * Catalog layer: R8 (extension of §18 safety primitives, symmetric to
- * `boundary-classifier`). Recipe: demos/walkthroughs/51-egress-fabric.md.
+ * `boundary-classifier`). Recipe: demos/walkthroughs/55-egress-fabric.md.
  */
 import { createHash } from "node:crypto";
 import { CrewhausError } from "@crewhaus/errors";
@@ -121,6 +121,85 @@ const ORIGIN_DEFAULT_POLICY: SeverityMatrix = {
  */
 export const MIN_MATCH_LENGTH = 16;
 
+/**
+ * FR-006 — the matching step factored behind a strategy interface. The
+ * matcher decides *which* tagged lineage entries the outbound payload
+ * "contains"; it never decides pass/warn/block. The verdict fold (origin
+ * policy + `block > warn > pass` precedence) stays in `classifyEgress`, so
+ * the three audit outcomes and their precedence are structurally
+ * matcher-independent.
+ *
+ * The default `SubstringEgressMatcher` is behavior-preserving: it is the
+ * verbatim substring scan that lived inline before the seam existed,
+ * including the `MIN_MATCH_LENGTH` floor. An optional embedding-backed
+ * matcher ships separately as `@crewhaus/egress-matcher-semantic`; the
+ * default egress path never imports it (no new hard dependency).
+ *
+ * NOTE: the FR sketch wrote `match(payload, lineage, opts)` with
+ * `DataLineage` / `EgressOpts` types. Those names do not exist in the
+ * codebase (lineage is `Map<string, TrustOrigin>` on `RunContext`; there
+ * is no `DataLineage` type). This implementation uses a single
+ * `EgressMatchInput` bag — idiomatic with this codebase's option-bag style
+ * — and keeps the matcher returning only raw hits, which strictly
+ * strengthens the matcher-independence guarantee.
+ */
+export type EgressMatchInput = {
+  /** The serialized outbound payload to inspect. */
+  readonly payload: string;
+  /** The run-context data-lineage map: tagged content → its trust origin. */
+  readonly lineage: ReadonlyMap<string, TrustOrigin>;
+  /** Floor below which a tagged entry is too short to count as a match. */
+  readonly minMatchLength: number;
+};
+
+/**
+ * Raw lineage hits — origins whose tagged content the matcher considers
+ * present in the payload, plus a count of distinct matched tagged strings.
+ * Deliberately verdict-free: `classifyEgress` folds policy over
+ * `originsFound`, the matcher does not.
+ */
+export type EgressMatchResult = {
+  readonly originsFound: ReadonlyArray<TrustOrigin>;
+  readonly matchCount: number;
+};
+
+/**
+ * A pluggable egress-matching strategy. `name` namespaces audit/trace
+ * records and the verdict cache key (so a semantic-matcher verdict never
+ * serves a substring-matcher hit from cache). `match` may be sync or
+ * async; `classifyEgress` awaits it either way.
+ */
+export interface EgressMatcher {
+  readonly name: string;
+  match(input: EgressMatchInput): EgressMatchResult | Promise<EgressMatchResult>;
+}
+
+/**
+ * The default, behavior-preserving matcher: the exact substring scan that
+ * was inline in `classifyEgress` before FR-006. A tagged entry counts when
+ * it is at least `minMatchLength` chars and appears verbatim in the
+ * payload. `originsFound` is deduped; `matchCount` counts distinct matched
+ * tagged strings.
+ */
+export class SubstringEgressMatcher implements EgressMatcher {
+  readonly name = "substring";
+  match(input: EgressMatchInput): EgressMatchResult {
+    const seen = new Set<TrustOrigin>();
+    let matchCount = 0;
+    for (const [tagged, origin] of input.lineage.entries()) {
+      if (tagged.length < input.minMatchLength) continue;
+      if (input.payload.includes(tagged)) {
+        seen.add(origin);
+        matchCount += 1;
+      }
+    }
+    return { originsFound: [...seen], matchCount };
+  }
+}
+
+/** Shared default-matcher singleton — the built-in egress detection. */
+export const substringMatcher: EgressMatcher = new SubstringEgressMatcher();
+
 export type EgressPolicyOverride = Partial<Record<TrustOrigin, EgressVerdict>>;
 
 export type ClassifyEgressOptions = {
@@ -150,6 +229,15 @@ export type ClassifyEgressOptions = {
    * supply this.
    */
   readonly minMatchLength?: number;
+  /**
+   * FR-006 — pluggable matching strategy. Defaults to `substringMatcher`
+   * (behavior-preserving). Supply an alternate matcher (e.g. the optional
+   * `@crewhaus/egress-matcher-semantic`) to swap *how* lineage matches are
+   * detected; the per-origin/per-sink policy and the three audit outcomes
+   * are unaffected. The cache key namespaces by `matcher.name`, so
+   * switching matchers mid-run never cross-serves a stale verdict.
+   */
+  readonly matcher?: EgressMatcher;
 };
 
 /**
@@ -198,8 +286,15 @@ type CachedVerdict = {
 
 const cache = new LruCache<CachedVerdict>(DEFAULT_CACHE_CAP);
 
-function cacheKey(payload: string, sinkScope: SinkScope, sinkId: string): string {
+function cacheKey(
+  payload: string,
+  sinkScope: SinkScope,
+  sinkId: string,
+  matcherName: string,
+): string {
   const h = createHash("sha256")
+    .update(matcherName)
+    .update("|")
     .update(sinkScope)
     .update("|")
     .update(sinkId)
@@ -265,7 +360,13 @@ export async function classifyEgress(
     };
   }
 
-  const key = cacheKey(payload, opts.sinkScope, opts.sinkId);
+  const floor = opts.minMatchLength ?? MIN_MATCH_LENGTH;
+  const matcher = opts.matcher ?? substringMatcher;
+
+  // Namespace the cache by matcher name so a verdict produced by one
+  // matcher (e.g. semantic) is never served to a call using another
+  // (e.g. substring) over the same (sinkScope, sinkId, payload).
+  const key = cacheKey(payload, opts.sinkScope, opts.sinkId, matcher.name);
   if (opts.bypassCache !== true) {
     const hit = cache.get(key);
     if (hit !== undefined) {
@@ -283,19 +384,13 @@ export async function classifyEgress(
     }
   }
 
-  const floor = opts.minMatchLength ?? MIN_MATCH_LENGTH;
-  const seen = new Set<TrustOrigin>();
-  let matchCount = 0;
-
-  for (const [tagged, origin] of lineage.entries()) {
-    if (tagged.length < floor) continue;
-    if (payload.includes(tagged)) {
-      seen.add(origin);
-      matchCount += 1;
-    }
-  }
-
-  const originsFound: ReadonlyArray<TrustOrigin> = [...seen];
+  // The matcher decides *which* lineage entries the payload contains; the
+  // policy fold below is matcher-independent. `match` may be sync or async.
+  const { originsFound, matchCount } = await matcher.match({
+    payload,
+    lineage,
+    minMatchLength: floor,
+  });
   const cached: CachedVerdict = { verdict: "pass", originsFound, matchCount };
   if (opts.bypassCache !== true) {
     cache.set(key, cached);

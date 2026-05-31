@@ -1084,3 +1084,79 @@ agent:
     expect(spec.security).toBeUndefined();
   });
 });
+
+// FR-006 — Pillar 3 sink-side fabric (egress matcher selector).
+describe("parseSpec security.egressMatcher", () => {
+  test("parses a cli spec with security.egressMatcher: semantic", () => {
+    const spec = parseSpec(`
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+security:
+  egressMatcher: semantic
+`);
+    if (spec.target !== "cli") expect.unreachable();
+    expect(spec.security?.egressMatcher).toBe("semantic");
+  });
+
+  test("parses security.egressMatcher: substring (the explicit default)", () => {
+    const spec = parseSpec(`
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+security:
+  egressMatcher: substring
+`);
+    if (spec.target !== "cli") expect.unreachable();
+    expect(spec.security?.egressMatcher).toBe("substring");
+  });
+
+  test("rejects an unknown egressMatcher enum value (strict)", () => {
+    expect(() =>
+      parseSpec(`
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+security:
+  egressMatcher: telepathic
+`),
+    ).toThrow(SpecParseError);
+  });
+
+  test("egressMatcher coexists with justification in the same security block", () => {
+    const spec = parseSpec(`
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+security:
+  justification:
+    judge: claude
+  egressMatcher: semantic
+`);
+    if (spec.target !== "cli") expect.unreachable();
+    expect(spec.security?.justification?.judge).toBe("claude");
+    expect(spec.security?.egressMatcher).toBe("semantic");
+  });
+
+  test("egressMatcher is optional — a security block without it still parses", () => {
+    const spec = parseSpec(`
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+security:
+  justification: {}
+`);
+    if (spec.target !== "cli") expect.unreachable();
+    expect(spec.security?.egressMatcher).toBeUndefined();
+  });
+});

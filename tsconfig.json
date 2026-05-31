@@ -89,6 +89,7 @@
     { "path": "./packages/prompt-injection-detector" },
     { "path": "./packages/boundary-classifier" },
     { "path": "./packages/egress-classifier" },
+    { "path": "./packages/egress-matcher-semantic" },
     { "path": "./packages/compaction-curator" },
     { "path": "./packages/spec-patch" },
     { "path": "./packages/prompt-optimizer-claude" },

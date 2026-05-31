@@ -37,6 +37,17 @@ import { type RegisteredTool, ToolCatalog } from "@crewhaus/tool-catalog";
 import { registerMcpServer } from "@crewhaus/tool-mcp";
 import { createTaskTool } from "@crewhaus/tool-task";
 import { type CostAccrualEvent, TraceEventBus } from "@crewhaus/trace-event-bus";
+// FR-006 — Pillar 3 sink-side egress-matcher selection (the substring/semantic
+// selector lowered to ir.security.egressMatcher). Side-effect-free + lazily
+// imports the optional semantic package only when "semantic" is selected, so
+// the default path pulls in no embedding dependency.
+import {
+  DEFAULT_EGRESS_EMBEDDER_MODEL,
+  type EgressMatcherChoice,
+  InvalidEgressMatcherChoiceError,
+  createEgressMatcher,
+  resolveEgressMatcherChoice,
+} from "./egress-matcher";
 // FR-004 — Pillar 3 intent-gate judge + durable audit-sink resolution, in a
 // side-effect-free module so it is unit-testable (this entry file runs an
 // argv switch on import).
@@ -97,6 +108,14 @@ const RUN_SCHEMA: ParseArgsSchema = {
     // audit-log record (on by default for `run`). The ephemeral trace-bus
     // event is unaffected; this only skips opening `.crewhaus/audit`.
     { name: "no-justification-audit", takesValue: false },
+    // FR-006 — select the Pillar 3 sink-side egress matcher for this run.
+    // substring (default) | semantic. Overrides the spec's
+    // security.egressMatcher when supplied.
+    { name: "egress-matcher", takesValue: true },
+    // FR-006 — embedder model for the "semantic" egress matcher (the
+    // @crewhaus/embedder prefix grammar, e.g. openai/text-embedding-3-small,
+    // mock/deterministic). Flag > CREWHAUS_EGRESS_EMBEDDER env > default.
+    { name: "egress-embedder", takesValue: true },
     { name: "help", short: "h" },
   ],
 };
@@ -274,6 +293,8 @@ function usage(): never {
       "                  [--continue]         resume the most-recent session (cli targets only)",
       "                  [--prompt <text>]    initial user prompt (browser targets; defaults to stdin)",
       "                  [--justification-judge rule-based|claude]  Pillar 3 intent-gate judge (FR-004)",
+      "                  [--egress-matcher substring|semantic]  Pillar 3 sink-side matcher (FR-006)",
+      "                  [--egress-embedder <model>]  embedder for --egress-matcher semantic",
       "  eval <spec.yaml> --dataset <data>    run the agent against a dataset and grade",
       "       --graders <graders.yaml>       (deterministic graders + LLM-as-judge)",
       "       [--judge-model <model>] [--concurrency N] [--seed N] -o <out-dir>",
@@ -326,6 +347,36 @@ function parseFor(rest: ReadonlyArray<string>, schema: ParseArgsSchema): ParsedA
   }
 }
 
+/**
+ * FR-006 — emit a `compile` warning when the spec selects the semantic egress
+ * matcher (`security.egressMatcher: semantic`). The selector lowers to
+ * `ir.security.egressMatcher` and the `crewhaus run` path constructs the
+ * matcher from it, but the `target-cli` emitter does not yet construct it in
+ * the generated bundle (the same shape as `security.justification.judge`).
+ * Without this warning a bundle-only user could set `semantic` and silently
+ * get the substring default in the emitted artifact — the "flag parsed but
+ * not threaded" trap. Lowering is pure and cheap; parse failures are surfaced
+ * by the emit branches, so they are swallowed here.
+ */
+function warnDeferredEgressMatcher(yamlText: string): void {
+  let ir: ReturnType<typeof lower>;
+  try {
+    ir = lower(parseSpec(yamlText));
+  } catch {
+    return;
+  }
+  if (ir.target !== "cli") return;
+  if (ir.security?.egressMatcher === "semantic") {
+    process.stderr.write(
+      'crewhaus: [warn] security.egressMatcher: "semantic" is honoured by `crewhaus run` ' +
+        "(it constructs @crewhaus/egress-matcher-semantic with an injected embedder), but the " +
+        "generated cli bundle does not yet construct it — the emitted artifact runs the substring " +
+        "matcher. Emitting the semantic selection into a standalone bundle is the remaining FR-006 " +
+        "follow-up. Run the spec with `crewhaus run` to use the semantic matcher today.\n",
+    );
+  }
+}
+
 async function runCompile(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
@@ -363,6 +414,14 @@ async function runCompile(args: ParsedArgs): Promise<void> {
   } catch (err) {
     die(`could not read ${absSpec}: ${(err as Error).message}`);
   }
+
+  // FR-006 — make the deferred bundle-side egress-matcher path LOUD. The
+  // selector lowers to `ir.security.egressMatcher` and the `run` path honours
+  // it, but the generated cli bundle does not yet construct the semantic
+  // matcher (same as the justification judge). Warn so a bundle-only user is
+  // not misled into thinking the emitted artifact carries `semantic`. Parse
+  // failures are reported by the emit branches below; skip the warning here.
+  warnDeferredEgressMatcher(yamlText);
 
   // FR-002 — strict scope gate. Lower the spec (pure), resolve every
   // referenced built-in tool name to its RegisteredTool, and audit scopes
@@ -616,10 +675,43 @@ async function resolveJustificationJudge(
   return createJustificationJudge(choice, securityJustification?.model);
 }
 
+/**
+ * FR-006 — resolve the Pillar 3 sink-side egress matcher for a `run`.
+ * Precedence: `--egress-matcher` flag > spec `security.egressMatcher` (lowered
+ * to `ir.security.egressMatcher`) > `"substring"`. Returns `undefined` for the
+ * substring path so the caller omits `egressMatcher` from `runChatLoop` and
+ * runtime-core stays on the built-in `substringMatcher` (the default egress
+ * path then pulls in no embedding dependency). For `"semantic"` it lazily
+ * imports `@crewhaus/embedder` + `@crewhaus/egress-matcher-semantic` and
+ * constructs a `SemanticEgressMatcher`; the embedder model comes from
+ * `--egress-embedder` > `CREWHAUS_EGRESS_EMBEDDER` env >
+ * `DEFAULT_EGRESS_EMBEDDER_MODEL`. An unknown matcher value `die()`s.
+ */
+async function resolveEgressMatcher(
+  args: ParsedArgs,
+  irEgressMatcher: EgressMatcherChoice | undefined,
+): Promise<import("@crewhaus/egress-classifier").EgressMatcher | undefined> {
+  const flag = args.flags["egress-matcher"];
+  const flagValue = typeof flag === "string" ? flag : undefined;
+  let choice: EgressMatcherChoice;
+  try {
+    choice = resolveEgressMatcherChoice(flagValue, irEgressMatcher);
+  } catch (err) {
+    if (err instanceof InvalidEgressMatcherChoiceError) die(err.message);
+    throw err;
+  }
+  const embedderFlag = args.flags["egress-embedder"];
+  const embedderModel =
+    (typeof embedderFlag === "string" ? embedderFlag : undefined) ??
+    process.env["CREWHAUS_EGRESS_EMBEDDER"] ??
+    DEFAULT_EGRESS_EMBEDDER_MODEL;
+  return createEgressMatcher(choice, { embedderModel });
+}
+
 async function runRun(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
-      "usage: crewhaus run <spec.yaml> [--model <model>] [--permission-mode <default|plan|auto|bypass>] [--resume <sessionId> | --continue] [--prompt <text>] [--justification-judge rule-based|claude]\n",
+      "usage: crewhaus run <spec.yaml> [--model <model>] [--permission-mode <default|plan|auto|bypass>] [--resume <sessionId> | --continue] [--prompt <text>] [--justification-judge rule-based|claude] [--egress-matcher substring|semantic] [--egress-embedder <model>]\n",
     );
     return;
   }
@@ -766,6 +858,14 @@ async function runRunCli(
     enabled: args.flags["no-justification-audit"] !== true,
   });
 
+  // FR-006 — resolve the Pillar 3 sink-side egress matcher (flag > spec >
+  // substring). undefined leaves runtime-core on the built-in
+  // `substringMatcher`; `"semantic"` constructs the optional
+  // `@crewhaus/egress-matcher-semantic` with an injected embedder. The
+  // placement (IR-wired, every external sink) and the warn/block policy are
+  // unchanged — only *how* lineage matches are detected.
+  const egressMatcher = await resolveEgressMatcher(args, ir.security?.egressMatcher);
+
   // Section 11 — discover hooks, skills, and slash commands from the user's
   // workspace. Hooks come from `~/.crewhaus/settings.json` + `<cwd>/.crewhaus/settings.json`;
   // skills from `~/.crewhaus/skills/*/SKILL.md` + project-equivalent; slash
@@ -832,6 +932,7 @@ async function runRunCli(
       ...(resumeId !== undefined ? { resume: { sessionId: resumeId } } : {}),
       ...(justificationJudge !== undefined ? { justificationJudge } : {}),
       ...(justificationAuditSink !== undefined ? { justificationAuditSink } : {}),
+      ...(egressMatcher !== undefined ? { egressMatcher } : {}),
     });
   } finally {
     if (mcpHost) await mcpHost.disconnectAll();
@@ -911,6 +1012,11 @@ async function runRunBrowser(
   // flag-only (flag > rule-based); both run paths thread the same judge
   // into the same gate inside runChatLoop.
   const justificationJudge = await resolveJustificationJudge(args, undefined);
+  // FR-006 — honour --egress-matcher on the browser one-shot path too. The
+  // browser spec shape carries no `security` block, so this is flag-only
+  // (flag > substring); both run paths thread the same matcher into the same
+  // egress check inside runChatLoop.
+  const egressMatcher = await resolveEgressMatcher(args, undefined);
   // FR-004 — same durable audit sink as the cli path, so a justification-gated
   // browser tool also writes the `permission_justification_evaluated` record.
   const justificationAuditSink = await openJustificationAuditSink({
@@ -972,6 +1078,7 @@ async function runRunBrowser(
       seedMessages: [{ role: "user", content: prompt }],
       ...(justificationJudge !== undefined ? { justificationJudge } : {}),
       ...(justificationAuditSink !== undefined ? { justificationAuditSink } : {}),
+      ...(egressMatcher !== undefined ? { egressMatcher } : {}),
       installSigintHandler: false,
       maxTokens: 4096,
     });

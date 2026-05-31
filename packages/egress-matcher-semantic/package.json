@@ -1,0 +1,39 @@
+{
+  "name": "@crewhaus/egress-matcher-semantic",
+  "version": "0.1.1",
+  "type": "module",
+  "description": "Optional embedding-backed EgressMatcher — scores outbound payloads against tagged data-lineage by cosine similarity, so semantic (paraphrased / re-encoded) leakage is caught where the substring default would miss it. The default egress path never imports this; it is opt-in per spec/runtime.",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@crewhaus/egress-classifier": "workspace:*",
+    "@crewhaus/embedder": "workspace:*",
+    "@crewhaus/errors": "workspace:*",
+    "@crewhaus/run-context": "workspace:*"
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@studiomax.io",
+    "url": "https://studiomax.io"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/egress-matcher-semantic"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/egress-matcher-semantic#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  },
+  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+}

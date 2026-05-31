@@ -1,0 +1,14 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "references": [
+    { "path": "../egress-classifier" },
+    { "path": "../embedder" },
+    { "path": "../errors" },
+    { "path": "../run-context" }
+  ],
+  "include": ["src/**/*"]
+}
