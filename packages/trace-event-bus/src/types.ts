@@ -251,6 +251,19 @@ export type CostAccrualEvent = TraceEventEnvelope & {
   cachedReadTokens: number;
   costUsdMicros: number;
   tenantId?: string;
+  /**
+   * FR-003 — when true, this event is an *aggregate* run total rather than a
+   * single model call: the `eval-optimizer-orchestrator` publishes one such
+   * terminal accrual at the end of a budget-gated `crewhaus optimize` run so
+   * the spend summary (total $ + token totals) lands on the trace bus, not
+   * only on the result/report.json. Its token/cost fields are the sums over
+   * the run's per-call accruals. Subscribers that aggregate per-call spend
+   * (`cost-tracker`) ignore externally-published `cost_accrual` events
+   * entirely — they only sum the ones they emit from `model_response` — so a
+   * terminal total never double-counts. Absent (falsy) on ordinary per-call
+   * accruals, including every `cost-tracker`-emitted one.
+   */
+  summary?: boolean;
 };
 
 /**

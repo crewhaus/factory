@@ -35,6 +35,7 @@ import { spawnSubAgent } from "@crewhaus/sub-agent-spawner";
 import { type RegisteredTool, ToolCatalog } from "@crewhaus/tool-catalog";
 import { registerMcpServer } from "@crewhaus/tool-mcp";
 import { createTaskTool } from "@crewhaus/tool-task";
+import { type CostAccrualEvent, TraceEventBus } from "@crewhaus/trace-event-bus";
 // FR-002 — Pillar 3 sink-side scope gate, shared by `compile --strict` and
 // `doctor --philosophy-alignment`. Kept in a side-effect-free module so it is
 // unit-testable (this entry file runs an argv switch on import).
@@ -120,6 +121,8 @@ const OPTIMIZE_SCHEMA: ParseArgsSchema = {
     { name: "iterations", takesValue: true },
     { name: "seed", takesValue: true },
     { name: "improvement-threshold", takesValue: true },
+    // FR-003 — dollar ceiling for model-driven runs (composes with --iterations).
+    { name: "budget-usd", takesValue: true },
     { name: "write-back", takesValue: false },
     { name: "out", short: "o", takesValue: true },
     { name: "help", short: "h" },
@@ -258,6 +261,7 @@ function usage(): never {
       "       [-o <out-dir>]",
       "  optimize <spec.yaml> --dataset <data> --graders <graders.yaml>",
       "       [--mutator rule-based|claude] [--iterations N] [--seed N]",
+      "       [--budget-usd N]                     stop a model-driven run before it exceeds $N (FR-003)",
       "       [--write-back] [-o <out-dir>]        active eval-driven optimization (Pillar 2)",
       "  init [name]                          scaffold a new crewhaus.yaml",
       "  doctor                               check environment health",
@@ -1186,18 +1190,27 @@ async function runDoctorPhilosophyAlignment(): Promise<void> {
 /**
  * Workstream B — `crewhaus optimize <spec> --dataset <data> --graders
  * <graders.yaml> [--mutator rule-based|claude] [--iterations N]
- * [--write-back] [-o <out-dir>]`. Closes the active-optimisation loop.
+ * [--budget-usd N] [--write-back] [-o <out-dir>]`. Closes the
+ * active-optimisation loop.
  *
  * Loads the spec + dataset + graders, builds a fitness function that
  * re-runs `eval-runner` for every candidate prompt, delegates to
- * `optimizeSpec`, and prints the resulting score delta + patch path.
+ * `optimizeSpec`, and prints the resulting score delta + spend summary +
+ * patch path. FR-003: `--budget-usd N` bounds a model-driven run by a
+ * dollar ceiling (the orchestrator stops before a mutation call that
+ * would exceed it); it composes with `--iterations` (first bound wins)
+ * and is inert on rule-based runs (which make no model calls → $0). A
+ * `TraceEventBus` is threaded into `optimizeSpec` so each call's
+ * `cost_accrual` and the terminal aggregate spend summary land on the
+ * standard observability bus on this real path (CREWHAUS_TRACE_COST=1
+ * echoes them to stderr); the run-total $ also prints to stdout.
  */
 async function runOptimize(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
       "usage: crewhaus optimize <spec.yaml> --dataset <data> --graders <graders.yaml> " +
         "[--mutator rule-based|claude] [--iterations N] [--seed N] " +
-        "[--improvement-threshold F] [--write-back] [-o <out-dir>]\n",
+        "[--improvement-threshold F] [--budget-usd N] [--write-back] [-o <out-dir>]\n",
     );
     return;
   }
@@ -1217,6 +1230,18 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
     typeof thresholdFlag === "string" ? Number.parseFloat(thresholdFlag) : 0.01;
   if (Number.isNaN(iterations) || iterations < 1) {
     die(`invalid --iterations "${iterationsFlag}" — must be positive integer`);
+  }
+
+  // FR-003 — optional dollar budget for model-driven runs. Omit → today's
+  // behaviour (iterations cap only). On a rule-based run the gate is inert
+  // (no model calls → $0), so passing it is harmless.
+  const budgetFlag = args.flags["budget-usd"];
+  let budgetUsd: number | undefined;
+  if (typeof budgetFlag === "string") {
+    budgetUsd = Number.parseFloat(budgetFlag);
+    if (Number.isNaN(budgetUsd) || budgetUsd <= 0) {
+      die(`invalid --budget-usd "${budgetFlag}" — must be a positive number`);
+    }
   }
 
   const writeBack = args.flags["write-back"] === true;
@@ -1319,6 +1344,25 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
       `mutator=${mutator ?? "rule-based"}\n`,
   );
 
+  // FR-003 — thread a real trace bus into the optimize run so the per-call
+  // `cost_accrual` events AND the terminal aggregate summary land on the
+  // standard observability bus on the actual `crewhaus optimize` path — not
+  // only when a unit test injects a bus. The spend total still prints to
+  // stdout below (unchanged default UX); set CREWHAUS_TRACE_COST=1 to also
+  // echo each bus cost event to stderr for live observability.
+  const traceBus = new TraceEventBus({ runId, sessionId: runId });
+  if (process.env["CREWHAUS_TRACE_COST"] === "1") {
+    traceBus.subscribe((e) => {
+      if (e.kind !== "cost_accrual") return;
+      const ev = e as CostAccrualEvent;
+      const label = ev.summary === true ? "cost-total" : "cost-call";
+      process.stderr.write(
+        `[optimize] ${label} provider=${ev.provider} model=${ev.modelId} ` +
+          `in=${ev.inputTokens} out=${ev.outputTokens} micros=${ev.costUsdMicros}\n`,
+      );
+    });
+  }
+
   const result = await optimizeSpec({
     specPath: absSpec,
     fitness,
@@ -1330,12 +1374,23 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
     outDir,
     writeBack,
     runId,
+    traceBus,
     ...(mutatorImpl !== undefined ? { mutator: mutatorImpl } : {}),
+    ...(budgetUsd !== undefined ? { budgetUsd } : {}),
   });
 
   process.stdout.write(
     `[optimize] score: ${result.scoreBefore.toFixed(3)} → ${result.scoreAfter.toFixed(3)} ` +
       `(Δ ${result.improvement >= 0 ? "+" : ""}${result.improvement.toFixed(3)})\n`,
+  );
+  // FR-003 — spend summary: total $ + model-call count, and whether the
+  // dollar budget (not the iterations cap) ended the run.
+  const spendStop =
+    result.stoppedReason === "budget-reached"
+      ? ` (stopped: budget reached, $${budgetUsd?.toFixed(2)} cap)\n`
+      : "\n";
+  process.stdout.write(
+    `[optimize] spend: ${result.spend.totalUsd} over ${result.spend.perIteration.length} model call(s)${spendStop}`,
   );
   process.stdout.write(`[optimize] patch: ${join(result.outDir, "patch.json")}\n`);
   if (result.applied) {

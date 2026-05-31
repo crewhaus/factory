@@ -22,10 +22,14 @@
  *      the search — see the rule-based provider as the deterministic
  *      fallback path).
  *
- * Cost: each call is one Claude request (~1-3K tokens). A cost-gate
- * (`--budget-usd`) backed by the §27 `cost-tracker` running spend
- * total is a planned follow-up; today the only safety rail is the
- * orchestrator's `iterations` cap.
+ * Cost: each call is one Claude request (~1-3K tokens). Each `next()`
+ * now surfaces the call's actual token `usage` on the returned
+ * `ProviderMutation`, and the provider exposes its `modelId` +
+ * `maxOutputTokens` getters, so the FR-003 `--budget-usd` cost-gate in
+ * `eval-optimizer-orchestrator` can price every call against the §27
+ * `cost-tracker` table and stop before a mutation call would exceed
+ * the budget. The gate composes with the orchestrator's `iterations`
+ * cap (whichever bound is hit first ends the run).
  *
  * Catalog layer: F-eval (active optimisation). Brief: 280.
  */
@@ -105,10 +109,59 @@ export class ClaudeMutationProvider implements MutationProvider {
     this.systemBlock = opts.systemOverride ?? META_PROMPT_SYSTEM;
   }
 
+  /**
+   * The model id this provider calls, exposed read-only so the FR-003
+   * cost-gate can price each call via `resolvePricing(DEFAULT_PRICING,
+   * "anthropic", modelId)`. The `MutationProvider` interface only
+   * guarantees `name` + `next()`; the orchestrator feature-detects this
+   * getter and falls back to a zero-cost meter for providers that don't
+   * expose it.
+   */
+  get modelId(): string {
+    return this.model;
+  }
+
+  /**
+   * The output-token ceiling for each call, exposed read-only so the
+   * cost-gate can compute a worst-case pre-call estimate (the gate must
+   * decide BEFORE a call whether it would exceed the budget).
+   */
+  get maxOutputTokens(): number {
+    return this.maxTokens;
+  }
+
+  /**
+   * FR-003 — exact serialized INPUT character count this provider would
+   * transmit for `state`, so the cost-gate prices the *real* meta-prompt
+   * rather than just `best.prompt.length + a fixed overhead`. The naive
+   * estimate (prompt length only) under-counts the system block AND the
+   * rendered dev-set failure block (each failure's input + expected_output)
+   * that `next()` actually sends; with a large dev window + small maxTokens
+   * that deficit could let a gate-passing call exceed the budget after the
+   * fact. Returning the full system+user char count here makes the
+   * `chars/4` token estimate cover everything the model is billed for, so
+   * the orchestrator's estimate-before guarantee holds unconditionally
+   * (input is now bounded from above, output is already the ceiling).
+   *
+   * The orchestrator feature-detects this method (it is not part of the
+   * `MutationProvider` interface); providers that omit it fall back to the
+   * `best.prompt.length + metaOverheadChars` heuristic.
+   */
+  estimateInputChars(state: OptimizerState): number {
+    const failures = this.selectFailures(state);
+    const userMessage = this.buildUserMessage(state.best.prompt, failures);
+    return this.systemBlock.length + userMessage.length;
+  }
+
   async next(state: OptimizerState): Promise<ProviderMutation> {
     const failures = this.selectFailures(state);
     const userMessage = this.buildUserMessage(state.best.prompt, failures);
 
+    // The call's actual token usage, captured so the FR-003 cost-gate
+    // can fold it into a running spend total. Stays undefined until the
+    // model call round-trips; a failed/unusable response still records
+    // whatever was consumed (the model DID run) so spend is accounted.
+    let callUsage: ProviderMutation["usage"];
     let rawText: string | undefined;
     try {
       const final = await collectFinalMessage(
@@ -119,22 +172,28 @@ export class ClaudeMutationProvider implements MutationProvider {
           maxTokens: this.maxTokens,
         }),
       );
+      callUsage = {
+        input: final.usage.input,
+        output: final.usage.output,
+        ...(final.usage.cacheRead !== undefined ? { cacheRead: final.usage.cacheRead } : {}),
+      };
       rawText = extractFirstText(final);
     } catch (err) {
       // Mutator unavailability is not fatal — fall back to current best.
       // The orchestrator's outer loop will record a degenerate iteration
-      // (score unchanged) and the search continues.
+      // (score unchanged) and the search continues. No usage is available
+      // on a stream error (the call did not complete), so spend is zero.
       return this.fallback(state, `model error: ${(err as Error).message}`);
     }
     if (rawText === undefined) {
-      return this.fallback(state, "model returned no text block");
+      return this.fallback(state, "model returned no text block", callUsage);
     }
 
     // Extract JSON: tolerate ```json fences and leading prose. We
     // search for the first balanced `{...}` substring.
     const jsonMatch = rawText.match(/\{[\s\S]*\}/);
     if (jsonMatch === null) {
-      return this.fallback(state, "model response did not contain a JSON object");
+      return this.fallback(state, "model response did not contain a JSON object", callUsage);
     }
     let parsed: { rewrite: string; rationale: string };
     try {
@@ -144,6 +203,7 @@ export class ClaudeMutationProvider implements MutationProvider {
       return this.fallback(
         state,
         `model response failed schema validation: ${(err as Error).message}`,
+        callUsage,
       );
     }
 
@@ -157,6 +217,7 @@ export class ClaudeMutationProvider implements MutationProvider {
       prompt: parsed.rewrite,
       mutations: [mutation],
       rationale: parsed.rationale,
+      ...(callUsage !== undefined ? { usage: callUsage } : {}),
     };
   }
 
@@ -198,13 +259,22 @@ export class ClaudeMutationProvider implements MutationProvider {
   /**
    * Fallback when the model can't produce a usable rewrite. Returns
    * the current best verbatim so the search loop records a no-op
-   * iteration. The orchestrator logs the fallback reason.
+   * iteration. The orchestrator logs the fallback reason. When the
+   * model DID round-trip (returned text/JSON that turned out unusable),
+   * the `usage` actually consumed is forwarded so the cost-gate still
+   * accounts for the spend; a stream error (no completed call) passes
+   * no usage and is therefore charged zero.
    */
-  private fallback(state: OptimizerState, reason: string): ProviderMutation {
+  private fallback(
+    state: OptimizerState,
+    reason: string,
+    usage?: ProviderMutation["usage"],
+  ): ProviderMutation {
     return {
       prompt: state.best.prompt,
       mutations: [],
       rationale: `claude-fallback: ${reason}`,
+      ...(usage !== undefined ? { usage } : {}),
     };
   }
 }

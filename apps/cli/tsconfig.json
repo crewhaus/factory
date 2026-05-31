@@ -37,6 +37,7 @@
     { "path": "../../packages/slash-commands" },
     { "path": "../../packages/spec" },
     { "path": "../../packages/sub-agent-spawner" },
+    { "path": "../../packages/trace-event-bus" },
     { "path": "../../packages/tool-bash" },
     { "path": "../../packages/tool-builder" },
     { "path": "../../packages/tool-catalog" },

@@ -20,7 +20,10 @@ const SAMPLE_DEV: ReadonlyArray<Sample> = [
  * Matches the canonical event protocol consumed by
  * `consumeStream`/`collectFinalMessage`.
  */
-function mockAdapter(content: string): ProviderAdapter {
+function mockAdapter(
+  content: string,
+  usage: { input: number; output: number; cacheRead?: number } = { input: 0, output: 0 },
+): ProviderAdapter {
   return {
     id: "mock",
     features: {
@@ -31,7 +34,16 @@ function mockAdapter(content: string): ProviderAdapter {
     // biome-ignore lint/suspicious/noExplicitAny: minimal mock
     stream(_params: any): AsyncIterable<any> {
       return (async function* () {
-        yield { kind: "message_start", usage: { input: 0, output: 0 } };
+        // message_start carries input (+ cache) counts; message_delta
+        // carries the running output count — matches the real protocol.
+        yield {
+          kind: "message_start",
+          usage: {
+            input: usage.input,
+            output: 0,
+            ...(usage.cacheRead !== undefined ? { cacheRead: usage.cacheRead } : {}),
+          },
+        };
         yield {
           kind: "content_block_start",
           index: 0,
@@ -43,7 +55,11 @@ function mockAdapter(content: string): ProviderAdapter {
           delta: { type: "text_delta", text: content },
         };
         yield { kind: "content_block_stop", index: 0 };
-        yield { kind: "message_delta", stopReason: "end_turn" };
+        yield {
+          kind: "message_delta",
+          stopReason: "end_turn",
+          usage: { input: usage.input, output: usage.output },
+        };
         yield { kind: "message_stop" };
       })();
     },
@@ -147,5 +163,107 @@ describe("ClaudeMutationProvider", () => {
       model: "claude-sonnet-4-5",
     });
     expect(provider.name).toBe("claude");
+  });
+
+  // FR-003 — the provider surfaces per-call usage + exposes pricing getters.
+  test("returns per-call usage from the response on the success path", async () => {
+    const adapter = mockAdapter(`{"rewrite": "Be concise.", "rationale": "Removes ambiguity."}`, {
+      input: 1234,
+      output: 567,
+      cacheRead: 89,
+    });
+    const provider = new ClaudeMutationProvider({ adapter, model: "claude-sonnet-4-5" });
+    const result = await provider.next(baseState);
+    expect(result.prompt).toBe("Be concise.");
+    expect(result.usage).toEqual({ input: 1234, output: 567, cacheRead: 89 });
+  });
+
+  test("forwards consumed usage even when the response is unusable (JSON miss)", async () => {
+    const adapter = mockAdapter("not actually json", { input: 100, output: 20 });
+    const provider = new ClaudeMutationProvider({ adapter, model: "claude-sonnet-4-5" });
+    const result = await provider.next(baseState);
+    // Fell back to current best, but the spend the model DID incur is reported.
+    expect(result.prompt).toBe(baseState.best.prompt);
+    expect(result.rationale).toContain("claude-fallback");
+    expect(result.usage).toEqual({ input: 100, output: 20 });
+  });
+
+  test("omits usage when the model call never completes (stream error)", async () => {
+    const adapter = {
+      id: "mock",
+      features: { caching: "none", thinking: false, multimodal: { input: false, output: false } },
+      // biome-ignore lint/suspicious/noExplicitAny: minimal mock
+      stream(_params: any): AsyncIterable<any> {
+        return (async function* () {
+          throw new Error("model unavailable");
+          // biome-ignore lint/correctness/noUnreachable: keep typed as async generator
+          yield;
+        })();
+      },
+    } as unknown as ProviderAdapter;
+    const provider = new ClaudeMutationProvider({ adapter, model: "claude-sonnet-4-5" });
+    const result = await provider.next(baseState);
+    expect(result.prompt).toBe(baseState.best.prompt);
+    expect(result.usage).toBeUndefined();
+  });
+
+  test("exposes modelId + maxOutputTokens getters for the cost-gate", () => {
+    const provider = new ClaudeMutationProvider({
+      adapter: mockAdapter(""),
+      model: "claude-opus-4-7",
+      maxTokens: 4096,
+    });
+    expect(provider.modelId).toBe("claude-opus-4-7");
+    expect(provider.maxOutputTokens).toBe(4096);
+  });
+
+  test("maxOutputTokens getter defaults to 2048", () => {
+    const provider = new ClaudeMutationProvider({
+      adapter: mockAdapter(""),
+      model: "claude-sonnet-4-5",
+    });
+    expect(provider.maxOutputTokens).toBe(2048);
+  });
+
+  // FR-003 (input-estimate gap) — estimateInputChars must count the FULL
+  // serialized input (system block + rendered dev-set failure block), not
+  // just the candidate prompt, so the orchestrator's cost-gate cannot
+  // under-count input for a wide dev window.
+  test("estimateInputChars counts the system block + rendered failure block", () => {
+    const provider = new ClaudeMutationProvider({
+      adapter: mockAdapter(""),
+      model: "claude-sonnet-4-5",
+    });
+    const est = provider.estimateInputChars(baseState);
+    // Strictly greater than the prompt length alone — the deficit the naive
+    // `best.prompt.length` estimate would have missed.
+    expect(est).toBeGreaterThan(baseState.best.prompt.length);
+    // The estimate covers the rendered failure block: it exceeds the prompt
+    // length PLUS the combined dev-set input + expected_output text that
+    // next() serializes — exactly the content the naive `best.prompt.length`
+    // heuristic ignored.
+    const devTextChars = SAMPLE_DEV.reduce(
+      (acc, s) => acc + s.input.length + (s.expected_output?.length ?? 0),
+      0,
+    );
+    expect(est).toBeGreaterThan(baseState.best.prompt.length + devTextChars);
+  });
+
+  test("estimateInputChars grows with the dev-set failure window", () => {
+    const wideDev: ReadonlyArray<Sample> = [
+      ...SAMPLE_DEV,
+      { id: "d3", input: "x".repeat(5_000), expected_output: "y".repeat(5_000) },
+      { id: "d4", input: "z".repeat(5_000), expected_output: "w".repeat(5_000) },
+    ];
+    const provider = new ClaudeMutationProvider({
+      adapter: mockAdapter(""),
+      model: "claude-sonnet-4-5",
+      maxFailuresInPrompt: 4,
+    });
+    const narrow = provider.estimateInputChars(baseState);
+    const wide = provider.estimateInputChars({ ...baseState, devSet: wideDev });
+    // A larger window serializes more failure text → a larger input estimate,
+    // exactly the case the original prompt-only heuristic under-counted.
+    expect(wide).toBeGreaterThan(narrow + 18_000);
   });
 });

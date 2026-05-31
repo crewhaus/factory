@@ -32,13 +32,15 @@
  * Catalog layer: F-eval. Brief: 279.
  */
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
 import type { Sample } from "@crewhaus/eval-dataset";
 import {
   type Candidate,
   type FitnessFn,
   type MutationProvider,
+  type OptimizerState,
+  type ProviderMutation,
   optimize,
 } from "@crewhaus/prompt-optimizer";
 import { type Spec, parseSpec } from "@crewhaus/spec";
@@ -48,6 +50,13 @@ import {
   formatWriteBackHeader,
   validatePatch,
 } from "@crewhaus/spec-patch";
+import type { CostAccrualEvent, ProviderId, TraceEventBus } from "@crewhaus/trace-event-bus";
+import {
+  BudgetMeter,
+  type SpendSummary,
+  type StoppedReason,
+  actualCallMicros,
+} from "./budget-gate";
 
 export class OptimizeSpecError extends CrewhausError {
   override readonly name = "OptimizeSpecError";
@@ -88,6 +97,27 @@ export type OptimizeSpecOptions = {
   readonly runId?: string;
   /** RNG seed forwarded to the default rule-based mutator. */
   readonly seed?: number;
+  /**
+   * FR-003 — dollar ceiling for a model-driven run. When set, the
+   * orchestrator threads a `cost-tracker`-priced running total through
+   * the search and stops BEFORE issuing a mutation call that would push
+   * tracked spend over this budget, returning the best-so-far with
+   * `stoppedReason: "budget-reached"`. Composes with `iterations`
+   * (whichever bound is hit first ends the run). Omit → today's
+   * behaviour (iterations cap only). Rule-based runs make no model
+   * calls and report `$0` regardless of this flag.
+   */
+  readonly budgetUsd?: number;
+  /**
+   * FR-003 — optional trace bus to publish spend onto the standard
+   * observability bus. When provided, one `cost_accrual` event is published
+   * per recorded model call, PLUS one terminal aggregate `cost_accrual`
+   * (`summary: true`) carrying the run total at the end of the run. The
+   * shipped `crewhaus optimize` CLI path constructs a bus and passes it
+   * here, so spend reaches the bus on the real user-facing path, not only
+   * in unit tests.
+   */
+  readonly traceBus?: TraceEventBus;
 };
 
 export type OptimizeSpecResult = {
@@ -107,6 +137,18 @@ export type OptimizeSpecResult = {
   readonly outDir: string;
   /** Full trajectory of every iteration's candidate. */
   readonly trajectory: ReadonlyArray<Candidate>;
+  /**
+   * FR-003 — the run's spend summary. Always present: for a rule-based
+   * run (or any run with no model usage) it is total `$0.0000` with
+   * `stopped: "iterations-cap"`.
+   */
+  readonly spend: SpendSummary;
+  /**
+   * FR-003 — which bound ended the run, mirrored from `spend.stopped`
+   * for ergonomics. `"budget-reached"` only when `--budget-usd` was set
+   * AND the gate tripped before the iterations cap.
+   */
+  readonly stoppedReason: StoppedReason;
 };
 
 /**
@@ -167,6 +209,31 @@ export async function optimizeSpec(opts: OptimizeSpecOptions): Promise<OptimizeS
   const outDir = opts.outDir ?? join(".crewhaus", "optimize", runId);
   mkdirSync(outDir, { recursive: true });
 
+  // FR-003 — cost budget gate. Build a meter priced against the mutator's
+  // model (feature-detected; the rule-based provider exposes no model so
+  // the meter never accumulates and never trips). The gate wraps the
+  // supplied mutator: it checks the budget BEFORE each call and records
+  // the call's actual usage AFTER. Once tripped, every subsequent call is
+  // a cheap no-op (best unchanged) so `optimize()` completes normally with
+  // the full trajectory + best-so-far — we never throw out of the loop,
+  // which would discard the trajectory.
+  const budgetMicros =
+    opts.budgetUsd !== undefined ? Math.round(opts.budgetUsd * 1_000_000) : undefined;
+  const modelInfo = resolveMutatorModel(opts.mutator);
+  const meter = new BudgetMeter(
+    budgetMicros,
+    modelInfo.provider,
+    modelInfo.modelId,
+    modelInfo.maxOutputTokens,
+  );
+  let stoppedEarly = false;
+  const gatedMutator: MutationProvider | undefined =
+    opts.mutator !== undefined
+      ? wrapWithBudgetGate(opts.mutator, meter, opts.traceBus, modelInfo, runId, () => {
+          stoppedEarly = true;
+        })
+      : undefined;
+
   const result = await optimize(basePrompt, {
     trainSet: opts.trainSet,
     devSet: opts.devSet,
@@ -176,10 +243,40 @@ export async function optimizeSpec(opts: OptimizeSpecOptions): Promise<OptimizeS
       ? { improvementThreshold: opts.improvementThreshold }
       : {}),
     ...(opts.seed !== undefined ? { seed: opts.seed } : {}),
-    ...(opts.mutator !== undefined ? { mutator: opts.mutator } : {}),
+    ...(gatedMutator !== undefined ? { mutator: gatedMutator } : {}),
     runId,
     outDir,
   });
+
+  const stoppedReason: StoppedReason = stoppedEarly ? "budget-reached" : "iterations-cap";
+  const spend = meter.summary(stoppedReason);
+
+  // FR-003 — publish the AGGREGATE spend summary onto the trace bus (in
+  // addition to the per-call `cost_accrual` events). This is the "...plus
+  // the total" the budgetUsd doc + walkthrough promise: without it the
+  // total lived only on the result/report.json, never on the bus. We reuse
+  // the `cost_accrual` kind (additive — no new event kind) with the
+  // `summary: true` discriminator so subscribers can tell the run total
+  // apart from a single call; `cost-tracker` ignores externally-published
+  // accruals, so this never double-counts. Published even when zero calls
+  // were recorded so the bus always carries a terminal total for the run.
+  if (opts.traceBus !== undefined) {
+    const totalInput = spend.perIteration.reduce((a, s) => a + s.inputTokens, 0);
+    const totalOutput = spend.perIteration.reduce((a, s) => a + s.outputTokens, 0);
+    const totalAccrual: CostAccrualEvent = {
+      ...opts.traceBus.envelope(),
+      runId,
+      kind: "cost_accrual",
+      provider: modelInfo.provider,
+      modelId: modelInfo.modelId,
+      inputTokens: totalInput,
+      outputTokens: totalOutput,
+      cachedReadTokens: 0,
+      costUsdMicros: spend.totalUsdMicros,
+      summary: true,
+    };
+    opts.traceBus.publish(totalAccrual);
+  }
 
   const improvementThreshold = opts.improvementThreshold ?? 0.01;
   const applied = result.improvement >= improvementThreshold;
@@ -212,6 +309,10 @@ export async function optimizeSpec(opts: OptimizeSpecOptions): Promise<OptimizeS
         improvement: result.improvement,
         improvementThreshold,
         applied,
+        // FR-003 — spend accounting + stop reason persisted for audit.
+        ...(opts.budgetUsd !== undefined ? { budgetUsd: opts.budgetUsd } : {}),
+        stoppedReason,
+        spend,
         timestamp: new Date().toISOString(),
       },
       null,
@@ -259,7 +360,135 @@ export async function optimizeSpec(opts: OptimizeSpecOptions): Promise<OptimizeS
     ...(writtenTo !== undefined ? { writtenTo } : {}),
     outDir,
     trajectory: result.trajectory,
+    spend,
+    stoppedReason,
   };
+}
+
+/**
+ * FR-003 — feature-detect the mutator's pricing inputs. The
+ * `MutationProvider` interface only guarantees `name` + `next()`; a
+ * model-backed provider (`ClaudeMutationProvider`) additionally exposes
+ * read-only `modelId` + `maxOutputTokens` getters. When present we price
+ * calls against `("anthropic", modelId)`; otherwise (rule-based, or any
+ * provider that doesn't expose the getters) we return a placeholder model
+ * id that prices to $0, so the meter never accumulates and the gate never
+ * trips — the run is bounded by the iterations cap alone.
+ */
+function resolveMutatorModel(mutator: MutationProvider | undefined): {
+  provider: ProviderId;
+  modelId: string;
+  maxOutputTokens: number;
+} {
+  if (
+    mutator !== undefined &&
+    "modelId" in mutator &&
+    typeof (mutator as { modelId: unknown }).modelId === "string"
+  ) {
+    const modelId = (mutator as { modelId: string }).modelId;
+    const maxOutputTokens =
+      "maxOutputTokens" in mutator &&
+      typeof (mutator as { maxOutputTokens: unknown }).maxOutputTokens === "number"
+        ? (mutator as { maxOutputTokens: number }).maxOutputTokens
+        : 2048;
+    return { provider: "anthropic", modelId, maxOutputTokens };
+  }
+  // No model exposed → an unpriceable placeholder id (resolvePricing miss
+  // ⇒ $0). 2048 is the conventional default ceiling; unused when $0.
+  return { provider: "anthropic", modelId: "__rule-based__", maxOutputTokens: 2048 };
+}
+
+/**
+ * FR-003 — feature-detect a provider's exact serialized-input length for
+ * the upcoming call. A model-backed provider (`ClaudeMutationProvider`)
+ * exposes `estimateInputChars(state)` returning the system-block + rendered
+ * failure-block char count it will transmit, so the cost-gate prices the
+ * real meta-prompt instead of just `best.prompt.length`. Returns undefined
+ * for providers without the hook (the caller falls back to prompt length).
+ */
+function estimateInputChars(mutator: MutationProvider, state: OptimizerState): number | undefined {
+  if (
+    "estimateInputChars" in mutator &&
+    typeof (mutator as { estimateInputChars: unknown }).estimateInputChars === "function"
+  ) {
+    const n = (mutator as { estimateInputChars: (s: OptimizerState) => number }).estimateInputChars(
+      state,
+    );
+    return typeof n === "number" && Number.isFinite(n) ? n : undefined;
+  }
+  return undefined;
+}
+
+/**
+ * FR-003 — wrap a `MutationProvider` so the orchestrator can gate on cost.
+ * Before each delegated call we ask the meter whether the upcoming call
+ * would exceed the budget; if so we DO NOT delegate (the model call is
+ * never issued) and instead return a no-op mutation (best unchanged),
+ * flagging `onStop()` so the orchestrator records `budget-reached`. Once
+ * tripped the wrapper stays in no-op mode for the remaining iterations so
+ * the search converges cheaply on the best-so-far without throwing — which
+ * keeps `optimize()` untouched and preserves the full trajectory. After a
+ * delegated call we record its actual usage and (optionally) publish a
+ * `cost_accrual` event onto the trace bus.
+ */
+function wrapWithBudgetGate(
+  base: MutationProvider,
+  meter: BudgetMeter,
+  traceBus: TraceEventBus | undefined,
+  modelInfo: { provider: ProviderId; modelId: string },
+  runId: string,
+  onStop: () => void,
+): MutationProvider {
+  let tripped = false;
+  return {
+    name: base.name,
+    async next(state: OptimizerState): Promise<ProviderMutation> {
+      // FR-003 — price the FULL serialized input the provider will send
+      // (system block + rendered dev-set failure block), not just the
+      // candidate prompt, when the provider exposes the exact-length hook.
+      // This closes the input under-count that could otherwise let a
+      // gate-passing call exceed budget after the fact for large dev
+      // windows. Providers without the hook fall back to prompt length;
+      // the meter adds its own `metaOverheadChars` margin in both cases.
+      const inputChars = estimateInputChars(base, state) ?? state.best.prompt.length;
+      if (tripped || meter.wouldExceed(inputChars)) {
+        if (!tripped) {
+          tripped = true;
+          onStop();
+        }
+        // No-op: return the current best unchanged. The model call is
+        // never issued, so no spend is incurred for this iteration.
+        return { prompt: state.best.prompt, mutations: [] };
+      }
+      const mutation = await base.next(state);
+      if (mutation.usage !== undefined) {
+        meter.record(state.iteration, mutation.usage);
+        if (traceBus !== undefined) {
+          const accrual: CostAccrualEvent = {
+            ...traceBus.envelope(),
+            runId,
+            kind: "cost_accrual",
+            provider: modelInfo.provider,
+            modelId: modelInfo.modelId,
+            inputTokens: mutation.usage.input,
+            outputTokens: mutation.usage.output,
+            cachedReadTokens: mutation.usage.cacheRead ?? 0,
+            costUsdMicros: actualCallMicrosFor(mutation.usage, modelInfo),
+          };
+          traceBus.publish(accrual);
+        }
+      }
+      return mutation;
+    },
+  };
+}
+
+/** Price one call's usage for the trace-bus event (mirrors the meter's math). */
+function actualCallMicrosFor(
+  usage: { input: number; output: number; cacheRead?: number },
+  modelInfo: { provider: ProviderId; modelId: string },
+): number {
+  return actualCallMicros(usage, modelInfo.provider, modelInfo.modelId);
 }
 
 // Re-export the spec-patch types so callers don't need a second import.
@@ -277,3 +506,10 @@ export type {
   FailureClass,
 } from "./failure-arbiter";
 export { aggregate, arbitrate } from "./failure-arbiter";
+
+// FR-003 — cost budget gate (`--budget-usd`). See ./budget-gate.ts for the
+// estimate-before/record-after meter built on cost-tracker's pure pricing
+// exports. The budget loop itself lives in `optimizeSpec` (above) because
+// it owns the cost-tracker dependency and the iteration accounting.
+export type { CallUsage, IterationSpend, SpendSummary, StoppedReason } from "./budget-gate";
+export { BudgetMeter, actualCallMicros, estimateCallMicros } from "./budget-gate";
