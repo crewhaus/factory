@@ -159,6 +159,21 @@ export type PermissionDecisionEvent = TraceEventEnvelope & {
   outcome?: "redacted" | "warned" | "egress-passed" | "egress-warned" | "egress-blocked";
   /** Section 18 — names of detector rules that fired, when outcome is set. */
   rules?: ReadonlyArray<string>;
+  /**
+   * Pillar 3 (FR-004) intent gate — the judge identity that produced this
+   * decision, promoted to a first-class field so the judge model is
+   * recorded on the canonical audit/trace surface rather than only being
+   * embedded in `reason`. `"rule-based"` for the default judge, otherwise
+   * the model id supplied by the configured `JustificationJudge` (e.g.
+   * `"claude-haiku-4-5"`, or `"<model> (error)"` when a model-backed judge
+   * failed closed). Absent on permission decisions that didn't run the
+   * justification gate.
+   */
+  judgeModel?: string;
+  /** Pillar 3 (FR-004) intent gate — the judge's confidence in [0,1] when
+   *  it supplied one. Absent on non-justification decisions and on binary
+   *  judges that omit confidence. */
+  justificationConfidence?: number;
 };
 
 export type ErrorRecoveredEvent = TraceEventEnvelope & {

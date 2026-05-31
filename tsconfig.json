@@ -92,6 +92,7 @@
     { "path": "./packages/compaction-curator" },
     { "path": "./packages/spec-patch" },
     { "path": "./packages/prompt-optimizer-claude" },
+    { "path": "./packages/justification-judge-claude" },
     { "path": "./packages/eval-optimizer-orchestrator" },
     { "path": "./packages/tool-code-execution" },
     { "path": "./packages/checkpoint-store" },

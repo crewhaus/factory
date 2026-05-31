@@ -437,3 +437,72 @@ compaction:
     expect(bundle.files).toHaveLength(1);
   });
 });
+
+// FR-004 — Pillar 3 security block lowered into ir.security.
+describe("lower — security block (Pillar 3 intent-gate judge)", () => {
+  test("populates ir.security.justification verbatim (judge + model)", () => {
+    const spec = parseSpec(`
+name: hello
+target: cli
+agent:
+  model: claude-sonnet-4-6
+  instructions: be helpful
+security:
+  justification:
+    judge: claude
+    model: claude-haiku-4-5
+`);
+    const ir = lower(spec);
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect(ir.security).toEqual({
+      justification: { judge: "claude", model: "claude-haiku-4-5" },
+    });
+  });
+
+  test("omits the judge model when the spec omits it (no false default)", () => {
+    const spec = parseSpec(`
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+security:
+  justification:
+    judge: claude
+`);
+    const ir = lower(spec);
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect(ir.security).toEqual({ justification: { judge: "claude" } });
+    expect("model" in (ir.security?.justification ?? {})).toBe(false);
+  });
+
+  test("absent security block leaves ir.security undefined (spread-out)", () => {
+    const spec = parseSpec(`
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+`);
+    const ir = lower(spec);
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect(ir.security).toBeUndefined();
+    expect("security" in ir).toBe(false);
+  });
+
+  test("security block present but justification omitted leaves ir.security undefined", () => {
+    // A `security: {}` block carries no justification choice, so the run
+    // path falls back to rule-based; the IR field stays absent.
+    const spec = parseSpec(`
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+security: {}
+`);
+    const ir = lower(spec);
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect(ir.security).toBeUndefined();
+  });
+});

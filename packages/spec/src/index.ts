@@ -123,6 +123,39 @@ const compactionBlock = z
   .optional();
 
 /**
+ * Pillar 3 (FR-004) — per-target security fabric block. Today it carries
+ * the intent-gate's judge selection; the optimizable path
+ * `["security", "justification"]` is already registered in
+ * `spec-patch`'s `OPTIMIZABLE_PATHS`, so this block MUST be named
+ * `security` with a `justification` sub-field to honour it.
+ *
+ * `justification.judge` selects which `JustificationJudge` the cli run
+ * path wires: `"rule-based"` (the deterministic default for tests/offline
+ * runs) or `"claude"` (the model-backed `@crewhaus/justification-judge-claude`,
+ * the documented production recommendation). `model` is the judge model
+ * id for the claude judge; the consumer defaults it to a haiku-class
+ * model when omitted.
+ *
+ * NOTE: `egressPolicy` is reserved — `OPTIMIZABLE_PATHS` also lists
+ * `["security", "egressPolicy"]`, owned by the egress-fabric FRs
+ * (FR-002/006). Do NOT add `egressPolicy` here; that would clobber their
+ * sub-field. FR-004 adds `justification`; the egress-matcher selector
+ * lands alongside it later as an independent optional sub-field.
+ */
+const securityBlock = z
+  .object({
+    justification: z
+      .object({
+        judge: z.enum(["rule-based", "claude"]).default("rule-based"),
+        model: z.string().min(1).optional(),
+      })
+      .strict()
+      .optional(),
+  })
+  .strict()
+  .optional();
+
+/**
  * Section 55 (Track A) — named failure taxonomy. Cross-cutting block
  * available on every target shape. Each entry names a failure class and
  * tells the recovery engine which `RecoveryAction` to take when the
@@ -296,6 +329,7 @@ const cliSchema = z
     mcp_servers: mcpServersBlock,
     permissions: permissionsBlock,
     compaction: compactionBlock,
+    security: securityBlock,
     failure_taxonomy: failureTaxonomyBlock,
     cli: cliOptionsBlock,
     chains: chainsBlock,
@@ -965,6 +999,7 @@ export type SpecEval = z.infer<typeof evalSchema>;
 export type SpecMcpServerConfig = z.infer<typeof mcpServerConfigSchema>;
 export type SpecSubAgentDefinition = z.infer<typeof subAgentDefinitionSchema>;
 export type SpecCompactionBlock = z.infer<typeof compactionBlock>;
+export type SpecSecurityBlock = z.infer<typeof securityBlock>;
 export type SpecFailureTaxonomyEntry = z.infer<typeof failureTaxonomyEntrySchema>;
 export type SpecFailureTaxonomy = z.infer<typeof failureTaxonomyBlock>;
 

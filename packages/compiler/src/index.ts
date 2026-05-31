@@ -26,6 +26,7 @@ import type {
   IrPipelineV0,
   IrResearchV0,
   IrSecretRef,
+  IrSecurity,
   IrSlackConfig,
   IrSubAgentDefinition,
   IrTelegramConfig,
@@ -327,6 +328,42 @@ function lowerFailureTaxonomy(spec: SpecWithFailureTaxonomy): {
 }
 
 /**
+ * Pillar 3 (FR-004) — lower the optional `security` block. Mirrors
+ * `lowerCompaction`'s "propagate only defined fields" discipline:
+ * defaults belong at the consumer (the cli run path defaults the judge
+ * model to a haiku-class id), so the IR carries the user's intent
+ * without lying about defaults.
+ *
+ * Returns `{ security: {...} }` only when the spec declares a
+ * `justification` sub-block, `{}` otherwise — spread into the IR so the
+ * `security` field stays absent when omitted (Pillar 1: emitters/the run
+ * path check presence). `egressPolicy` is intentionally not handled here
+ * (reserved for FR-002/006).
+ */
+type SpecWithSecurity = {
+  readonly security?: {
+    readonly justification?: {
+      readonly judge: "rule-based" | "claude";
+      readonly model?: string;
+    };
+  };
+};
+
+function lowerSecurity(spec: SpecWithSecurity): { security?: IrSecurity } {
+  const s = spec.security;
+  if (s === undefined) return {};
+  const justification =
+    s.justification !== undefined
+      ? {
+          judge: s.justification.judge,
+          ...(s.justification.model !== undefined ? { model: s.justification.model } : {}),
+        }
+      : undefined;
+  if (justification === undefined) return {};
+  return { security: { justification } };
+}
+
+/**
  * Section 47 — normalise the cross-cutting blockchain subsystem blocks
  * (chains / wallets / contracts / transaction_policy). Each block is
  * optional; the helper returns a partial that's spread into the IR
@@ -450,6 +487,7 @@ export function lower(spec: Spec): IrNode {
         subAgents: lowerSubAgents(spec.agent.sub_agents),
         compaction: lowerCompaction(spec),
         ...lowerFailureTaxonomy(spec),
+        ...lowerSecurity(spec),
         // Phase 3 §3.3 — CLI banner config. Plus Phase 2 M2.2 TUI mode
         // gate. Only included when the spec author opted in (cli block
         // and its fields are optional).

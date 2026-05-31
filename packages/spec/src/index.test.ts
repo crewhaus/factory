@@ -1009,3 +1009,78 @@ compaction:
     ).toThrow(SpecParseError);
   });
 });
+
+// FR-004 — Pillar 3 security block (intent-gate judge selection).
+describe("parseSpec security.justification", () => {
+  test("parses a cli spec with security.justification.judge=claude + model", () => {
+    const spec = parseSpec(`
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+security:
+  justification:
+    judge: claude
+    model: claude-haiku-4-5
+`);
+    if (spec.target !== "cli") expect.unreachable();
+    expect(spec.security?.justification?.judge).toBe("claude");
+    expect(spec.security?.justification?.model).toBe("claude-haiku-4-5");
+  });
+
+  test("judge defaults to rule-based when the justification block omits it", () => {
+    const spec = parseSpec(`
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+security:
+  justification: {}
+`);
+    if (spec.target !== "cli") expect.unreachable();
+    expect(spec.security?.justification?.judge).toBe("rule-based");
+  });
+
+  test("rejects an unknown judge enum value", () => {
+    expect(() =>
+      parseSpec(`
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+security:
+  justification:
+    judge: gpt-omniscient
+`),
+    ).toThrow(SpecParseError);
+  });
+
+  test("rejects unknown keys inside the security block (strict)", () => {
+    expect(() =>
+      parseSpec(`
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+security:
+  enableTelepathy: true
+`),
+    ).toThrow(SpecParseError);
+  });
+
+  test("security block is optional — a spec without it still parses", () => {
+    const spec = parseSpec(`
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+`);
+    if (spec.target !== "cli") expect.unreachable();
+    expect(spec.security).toBeUndefined();
+  });
+});

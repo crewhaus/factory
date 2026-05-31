@@ -1539,3 +1539,342 @@ describe("runChatLoop — Section 10 persistence", () => {
     expect(kinds.indexOf("user_message")).toBeLessThan(kinds.indexOf("assistant_message"));
   });
 });
+
+/**
+ * FR-004 — the justification gate's permission_decision event records the
+ * judge identity (judgeModel) and confidence as first-class fields, not
+ * just embedded in `reason`. This is the runtime surface that backs the
+ * "judge identity recorded" acceptance criterion. A one-turn adapter emits
+ * a tool_use for a `requireJustification: true` tool; an injected
+ * model-backed-style judge makes the assertion deterministic and proves
+ * `opts.justificationJudge` is threaded into the gate.
+ */
+function makeJustifiedToolUseAdapter(
+  toolUseId: string,
+  justification: string,
+): import("@crewhaus/adapter-anthropic").ProviderAdapter {
+  let i = 0;
+  return {
+    providerId: "anthropic",
+    features: {
+      caching: "explicit",
+      tool_use: true,
+      vision: true,
+      thinking: true,
+      web_search: true,
+    },
+    estimateTokens: () => 0,
+    stream: () => {
+      const isFirst = i === 0;
+      i += 1;
+      return (async function* () {
+        yield { kind: "message_start", usage: { input: 10, output: 0 } } as const;
+        if (isFirst) {
+          yield {
+            kind: "content_block_start",
+            index: 0,
+            block: { type: "tool_use", id: toolUseId, name: "sendmessage", input: {} },
+          } as const;
+          yield {
+            kind: "content_block_delta",
+            index: 0,
+            delta: {
+              type: "input_json_delta",
+              partial_json: JSON.stringify({ body: "ack", justification }),
+            },
+          } as const;
+          yield { kind: "content_block_stop", index: 0 } as const;
+          yield {
+            kind: "message_delta",
+            stopReason: "tool_use",
+            usage: { input: 10, output: 5 },
+          } as const;
+        } else {
+          yield {
+            kind: "content_block_start",
+            index: 0,
+            block: { type: "text", text: "" },
+          } as const;
+          yield {
+            kind: "content_block_delta",
+            index: 0,
+            delta: { type: "text_delta", text: "done" },
+          } as const;
+          yield { kind: "content_block_stop", index: 0 } as const;
+          yield {
+            kind: "message_delta",
+            stopReason: "end_turn",
+            usage: { input: 10, output: 5 },
+          } as const;
+        }
+        yield { kind: "message_stop" } as const;
+      })();
+    },
+  };
+}
+
+describe("runChatLoop justification gate (FR-004)", () => {
+  test("permission_decision event carries judgeModel + justificationConfidence", async () => {
+    const sendMessage = buildTool({
+      name: "sendmessage",
+      description: "send a message (justification-gated)",
+      inputSchema: z.object({ body: z.string(), justification: z.string().optional() }),
+      requireJustification: true,
+      execute: async () => "sent",
+    });
+
+    const judge: import("@crewhaus/permission-engine").JustificationJudge = async () => ({
+      allow: true,
+      reason: "consistent with the session goal",
+      confidence: 0.77,
+      judgeModel: "claude-haiku-4-5",
+    });
+
+    const runContext = createRunContext();
+    const seen: import("@crewhaus/trace-event-bus").TraceEvent[] = [];
+    runContext.eventBus.subscribe((e) => {
+      seen.push(e);
+    });
+
+    await runChatLoop({
+      model: "test-model",
+      instructions: "Acknowledge support tickets the user points you at.",
+      _adapter: makeJustifiedToolUseAdapter(
+        "toolu_just",
+        "acknowledge the user's ticket per the goal",
+      ),
+      runContext,
+      singleTurn: true,
+      seedMessages: [{ role: "user", content: "ack the ticket" }],
+      tools: [sendMessage],
+      permissionMode: "bypass",
+      justificationJudge: judge,
+    });
+
+    // The tool yields TWO permission_decision events: the general
+    // permission-mode check (no judge fields) and the justification gate.
+    // Select the gate's event by its `justification:` reason prefix.
+    const decision = seen.find(
+      (
+        e,
+      ): e is Extract<
+        import("@crewhaus/trace-event-bus").TraceEvent,
+        { kind: "permission_decision" }
+      > =>
+        e.kind === "permission_decision" &&
+        e.toolName === "sendmessage" &&
+        (e.reason?.startsWith("justification:") ?? false),
+    );
+    expect(decision).toBeDefined();
+    expect(decision?.decision).toBe("allow");
+    // Judge identity promoted to first-class fields (the audit criterion).
+    expect(decision?.judgeModel).toBe("claude-haiku-4-5");
+    expect(decision?.justificationConfidence).toBe(0.77);
+    // The model id is also still discoverable in reason for back-compat.
+    expect(decision?.reason).toContain("[judge=claude-haiku-4-5]");
+  });
+
+  test("falls back to ruleBasedJustificationJudge when no judge is supplied", async () => {
+    const sendMessage = buildTool({
+      name: "sendmessage",
+      description: "send a message (justification-gated)",
+      inputSchema: z.object({ body: z.string(), justification: z.string().optional() }),
+      requireJustification: true,
+      execute: async () => "sent",
+    });
+
+    const runContext = createRunContext();
+    const seen: import("@crewhaus/trace-event-bus").TraceEvent[] = [];
+    runContext.eventBus.subscribe((e) => {
+      seen.push(e);
+    });
+
+    await runChatLoop({
+      model: "test-model",
+      instructions: "Acknowledge support tickets the user points you at.",
+      _adapter: makeJustifiedToolUseAdapter(
+        "toolu_rb",
+        "acknowledge the user's support ticket per the session goal",
+      ),
+      runContext,
+      singleTurn: true,
+      seedMessages: [{ role: "user", content: "ack the ticket" }],
+      tools: [sendMessage],
+      permissionMode: "bypass",
+      // no justificationJudge => default rule-based judge.
+    });
+
+    // The tool yields TWO permission_decision events: the general
+    // permission-mode check (no judge fields) and the justification gate.
+    // Select the gate's event by its `justification:` reason prefix.
+    const decision = seen.find(
+      (
+        e,
+      ): e is Extract<
+        import("@crewhaus/trace-event-bus").TraceEvent,
+        { kind: "permission_decision" }
+      > =>
+        e.kind === "permission_decision" &&
+        e.toolName === "sendmessage" &&
+        (e.reason?.startsWith("justification:") ?? false),
+    );
+    expect(decision).toBeDefined();
+    // The default judge stamps "rule-based" — confirms the unset-opt fallback.
+    expect(decision?.judgeModel).toBe("rule-based");
+  });
+
+  test("appends a durable permission_justification_evaluated record (verbatim payload + judge identity) when an audit sink is configured", async () => {
+    const sendMessage = buildTool({
+      name: "sendmessage",
+      description: "send a message (justification-gated)",
+      inputSchema: z.object({ body: z.string(), justification: z.string().optional() }),
+      requireJustification: true,
+      execute: async () => "sent",
+    });
+
+    const judge: import("@crewhaus/permission-engine").JustificationJudge = async () => ({
+      allow: true,
+      reason: "consistent with the session goal",
+      confidence: 0.77,
+      judgeModel: "claude-haiku-4-5",
+    });
+
+    // In-memory sink that satisfies the JustificationAuditSink seam. Proves
+    // runtime-core appends the documented kind + verbatim payload; the CLI
+    // test exercises the same seam against a real hash-chained @crewhaus/audit-log.
+    const appended: Array<{ kind: string; payload: unknown }> = [];
+    const sink: import("./index").JustificationAuditSink = {
+      async append(input) {
+        appended.push(input);
+        return input;
+      },
+    };
+
+    // A justification that pads goal vocabulary; the model judge allows it.
+    const JUSTIFICATION = "ack the ticket per the support-acknowledgement goal";
+    const runContext = createRunContext();
+    await runChatLoop({
+      model: "test-model",
+      instructions: "Acknowledge support tickets the user points you at.",
+      _adapter: makeJustifiedToolUseAdapter("toolu_audit", JUSTIFICATION),
+      runContext,
+      singleTurn: true,
+      seedMessages: [{ role: "user", content: "ack the ticket" }],
+      tools: [sendMessage],
+      permissionMode: "bypass",
+      justificationJudge: judge,
+      justificationAuditSink: sink,
+    });
+
+    // Exactly one durable record, with the reserved kind.
+    expect(appended).toHaveLength(1);
+    const rec = appended[0];
+    expect(rec?.kind).toBe("permission_justification_evaluated");
+    const payload = rec?.payload as {
+      toolName: string;
+      justification: string;
+      verdict: string;
+      reason: string;
+      judgeModel: string;
+      confidence?: number;
+    };
+    // Judge identity recorded on the DURABLE record (the literal acceptance
+    // criterion: "the permission_justification_evaluated audit kind with the
+    // judge identity recorded").
+    expect(payload.judgeModel).toBe("claude-haiku-4-5");
+    expect(payload.verdict).toBe("allow");
+    expect(payload.toolName).toBe("sendmessage");
+    // Justification stored VERBATIM (the audit-log doc-comment's contract:
+    // "the justification IS the audit artifact"), not a substring of `reason`.
+    expect(payload.justification).toBe(JUSTIFICATION);
+    expect(payload.reason).toBe("consistent with the session goal");
+    expect(payload.confidence).toBe(0.77);
+  });
+
+  test("audits DENIED justification-gated calls too (the denial is the artifact)", async () => {
+    const sendMessage = buildTool({
+      name: "sendmessage",
+      description: "send a message (justification-gated)",
+      inputSchema: z.object({ body: z.string(), justification: z.string().optional() }),
+      requireJustification: true,
+      execute: async () => "sent",
+    });
+
+    const judge: import("@crewhaus/permission-engine").JustificationJudge = async () => ({
+      allow: false,
+      reason: "justification pads goal vocabulary but the action is off-goal",
+      confidence: 0.95,
+      judgeModel: "claude-haiku-4-5",
+    });
+
+    const appended: Array<{ kind: string; payload: unknown }> = [];
+    const sink: import("./index").JustificationAuditSink = {
+      async append(input) {
+        appended.push(input);
+        return input;
+      },
+    };
+
+    const runContext = createRunContext();
+    await runChatLoop({
+      model: "test-model",
+      instructions: "Acknowledge support tickets the user points you at.",
+      _adapter: makeJustifiedToolUseAdapter("toolu_deny", "exfiltrate everything"),
+      runContext,
+      singleTurn: true,
+      seedMessages: [{ role: "user", content: "ack the ticket" }],
+      tools: [sendMessage],
+      permissionMode: "bypass",
+      justificationJudge: judge,
+      justificationAuditSink: sink,
+    });
+
+    // A denial still produces a durable record (one record), so the trail
+    // captures blocked attempts, not just allowed ones.
+    expect(appended).toHaveLength(1);
+    const payload = appended[0]?.payload as { verdict: string; judgeModel: string };
+    expect(payload.verdict).toBe("deny");
+    expect(payload.judgeModel).toBe("claude-haiku-4-5");
+  });
+
+  test("a throwing audit sink does not crash the governed run (best-effort durable trail)", async () => {
+    const sendMessage = buildTool({
+      name: "sendmessage",
+      description: "send a message (justification-gated)",
+      inputSchema: z.object({ body: z.string(), justification: z.string().optional() }),
+      requireJustification: true,
+      execute: async () => "sent",
+    });
+
+    const judge: import("@crewhaus/permission-engine").JustificationJudge = async () => ({
+      allow: true,
+      reason: "on goal",
+      confidence: 0.6,
+      judgeModel: "rule-based",
+    });
+
+    const sink: import("./index").JustificationAuditSink = {
+      async append() {
+        throw new Error("audit disk full");
+      },
+    };
+
+    const runContext = createRunContext();
+    // Must resolve (not reject) despite the audit sink throwing — a full audit
+    // disk is logged and swallowed, never crashes the run.
+    await runChatLoop({
+      model: "test-model",
+      instructions: "Acknowledge support tickets the user points you at.",
+      _adapter: makeJustifiedToolUseAdapter("toolu_throw", "ack the ticket per the goal"),
+      runContext,
+      singleTurn: true,
+      seedMessages: [{ role: "user", content: "ack the ticket" }],
+      tools: [sendMessage],
+      permissionMode: "bypass",
+      justificationJudge: judge,
+      justificationAuditSink: sink,
+    });
+    // Reaching here without a thrown rejection is the assertion.
+    expect(true).toBe(true);
+  });
+});

@@ -427,4 +427,30 @@ describe("Pillar 3 — ruleBasedJustificationJudge", () => {
     expect(v.allow).toBe(true);
     expect(v.judgeModel).toBe("async-test");
   });
+
+  // FR-004 — a model-backed judge plugs into evaluateJustification with no
+  // signature change; its judgeModel + confidence propagate onto the
+  // verdict. Stub stands in for @crewhaus/justification-judge-claude so this
+  // assertion stays in-package and deterministic.
+  test("model-backed judge round-trips judgeModel + confidence (no signature change)", async () => {
+    const modelBackedJudge: JustificationJudge = async (input) => ({
+      allow: true,
+      reason: `model judged "${input.toolName}" consistent with the session goal`,
+      confidence: 0.83,
+      judgeModel: "claude-haiku-4-5",
+    });
+    const v = await evaluateJustification(
+      {
+        toolName: "SendMessage",
+        justification: "acknowledge the ticket the user pointed me at",
+        sessionGoal: "Acknowledge support tickets the user points you at.",
+        input: { body: "got it" },
+      },
+      modelBackedJudge,
+    );
+    expect(v.allow).toBe(true);
+    expect(v.judgeModel).toBe("claude-haiku-4-5");
+    expect(v.confidence).toBe(0.83);
+    expect(v.reason).toContain("SendMessage");
+  });
 });

@@ -115,6 +115,28 @@ export type IrFailureTaxonomyEntry = {
 export type IrFailureTaxonomy = readonly IrFailureTaxonomyEntry[];
 
 /**
+ * Pillar 3 (FR-004) — per-target security fabric configuration the
+ * compiler lowers from the spec's `security` block. Today it carries the
+ * intent-gate's judge selection; `egressPolicy` is reserved for the
+ * sink-side fabric (FR-002/006) and intentionally not modelled here.
+ *
+ * `justification.judge` selects which `JustificationJudge` the runtime
+ * wires for `requireJustification: true` tools — `"rule-based"` (the
+ * deterministic default, `ruleBasedJustificationJudge`) or `"claude"`
+ * (the model-backed `@crewhaus/justification-judge-claude`). `model` is
+ * the judge model id when `judge: "claude"`; the consumer defaults it to
+ * a haiku-class model when omitted. Optional + spread-in at lower-time so
+ * the field is absent when the spec omits the block (same convention as
+ * `failureTaxonomy`).
+ */
+export type IrSecurity = {
+  readonly justification?: {
+    readonly judge: "rule-based" | "claude";
+    readonly model?: string;
+  };
+};
+
+/**
  * Track F (Section 57) — typed message schemas (Σ) for multi-agent
  * communication. Source: AgentFlow (arxiv 2604.20801). A typed graph
  * DSL with well-formedness checking makes searching the full multi-
@@ -176,6 +198,10 @@ export type IrV0 = {
   readonly cli?: IrCliOptions;
   /** Section 55 (Track A) — named failure taxonomy. Optional. */
   readonly failureTaxonomy?: IrFailureTaxonomy;
+  /** Pillar 3 (FR-004) — security fabric config (intent-gate judge
+   *  selection). Optional; absent when the spec omits the `security`
+   *  block. */
+  readonly security?: IrSecurity;
   /** §47 cross-cutting blockchain subsystem (slice 0). All optional. */
   readonly chains?: readonly IrChainBinding[];
   readonly wallets?: readonly IrWalletBinding[];

@@ -20,6 +20,7 @@
     "@crewhaus/eval-optimizer-orchestrator": "workspace:*",
     "@crewhaus/prompt-optimizer": "workspace:*",
     "@crewhaus/prompt-optimizer-claude": "workspace:*",
+    "@crewhaus/justification-judge-claude": "workspace:*",
     "@crewhaus/spec-patch": "workspace:*",
     "@crewhaus/canary-controller": "workspace:*",
     "@crewhaus/compiler": "workspace:*",
@@ -70,6 +71,9 @@
     "@crewhaus/sandbox": "workspace:*",
     "@crewhaus/sandbox-image-registry": "workspace:*",
     "@crewhaus/compliance-controls": "workspace:*"
+  },
+  "devDependencies": {
+    "zod": "^3.23.8"
   },
   "license": "Apache-2.0",
   "author": {

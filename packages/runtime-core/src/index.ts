@@ -201,6 +201,30 @@ export async function replayMessageHistory(log: EventLog): Promise<Anthropic.Mes
   return messages;
 }
 
+/**
+ * Pillar 3 (FR-004) intent gate — the durable audit sink the justification
+ * gate appends to. Structurally a subset of `@crewhaus/audit-log`'s
+ * `AuditLog` (its `append({ kind, payload })`), declared here as a minimal
+ * interface so runtime-core does NOT take a dependency on (or a cycle with)
+ * `@crewhaus/audit-log`. The CLI/codegen passes a real `openAuditLog(...)`
+ * instance; tests pass an in-memory or tmp-dir-backed one. When omitted (the
+ * default for every existing caller), the gate writes nothing durable and the
+ * trace-bus `permission_decision` event remains the only surface — i.e. zero
+ * behaviour change unless a caller opts in.
+ *
+ * The `kind` the gate appends is exactly `"permission_justification_evaluated"`,
+ * the AuditKind `@crewhaus/audit-log` reserves for this signal; the payload is
+ * the documented verbatim shape `{ toolName, justification, verdict, reason,
+ * judgeModel, confidence? }` (the justification IS the audit artifact — stored
+ * verbatim, never redacted).
+ */
+export type JustificationAuditSink = {
+  append(input: {
+    readonly kind: "permission_justification_evaluated";
+    readonly payload: unknown;
+  }): Promise<unknown>;
+};
+
 export type RunChatLoopOptions = {
   model: string;
   instructions: string;
@@ -374,6 +398,19 @@ export type RunChatLoopOptions = {
    * against the session goal with model-quality reasoning.
    */
   justificationJudge?: JustificationJudge;
+  /**
+   * Pillar 3 (FR-004) intent gate — durable audit sink. When supplied,
+   * every justification-evaluated tool call appends a
+   * `permission_justification_evaluated` record (verbatim payload) to this
+   * hash-chained sink IN ADDITION to publishing the `permission_decision`
+   * trace event. This is the durable, tamper-evident audit artifact the
+   * `permission_justification_evaluated` AuditKind was created for; the
+   * trace-bus event is ephemeral. Omitting it leaves the trace bus as the
+   * only surface (no behaviour change for existing callers). The CLI `run`
+   * path wires a real `@crewhaus/audit-log` instance rooted at
+   * `.crewhaus/audit`.
+   */
+  justificationAuditSink?: JustificationAuditSink;
   /**
    * Section 27 — wrap the resolved primary `ProviderAdapter` in a circuit
    * breaker before any `stream()` call. When the breaker trips, subsequent
@@ -890,6 +927,15 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         decision: verdict.allow ? "allow" : "deny",
         mode: permissionMode,
         reason: `justification: ${verdict.reason} [judge=${verdict.judgeModel}]`,
+        // FR-004 — promote the judge identity (and confidence) to
+        // first-class fields on the canonical permission_decision event so
+        // the `permission_justification_evaluated` audit story records WHO
+        // judged, not just an embedded substring of `reason`. Absent on
+        // ordinary (non-justification) permission decisions.
+        judgeModel: verdict.judgeModel,
+        ...(verdict.confidence !== undefined
+          ? { justificationConfidence: verdict.confidence }
+          : {}),
       });
       runContext.logger.info("justification evaluated", {
         toolUseId: tu.id,
@@ -898,6 +944,37 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         judgeModel: verdict.judgeModel,
         confidence: verdict.confidence,
       });
+      // FR-004 — emit the durable `permission_justification_evaluated` audit
+      // record. The trace event above is ephemeral; THIS is the hash-chained,
+      // tamper-evident artifact the AuditKind was created for. We append one
+      // record per justification-evaluated call (allow OR deny — the audit
+      // trail must capture denials too), storing the justification VERBATIM
+      // alongside the verdict and the judge identity, exactly the payload
+      // shape `@crewhaus/audit-log` documents for this kind. Best-effort but
+      // surfaced: an I/O failure on the audit trail is logged and swallowed so
+      // a full audit disk does not crash a governed run, mirroring how the
+      // egress fabric treats its own audit surface. Absent sink → no-op.
+      if (opts.justificationAuditSink !== undefined) {
+        try {
+          await opts.justificationAuditSink.append({
+            kind: "permission_justification_evaluated",
+            payload: {
+              toolName: tu.name,
+              justification,
+              verdict: verdict.allow ? "allow" : "deny",
+              reason: verdict.reason,
+              judgeModel: verdict.judgeModel,
+              ...(verdict.confidence !== undefined ? { confidence: verdict.confidence } : {}),
+            },
+          });
+        } catch (err) {
+          runContext.logger.warn("justification audit append failed", {
+            toolUseId: tu.id,
+            toolName: tu.name,
+            error: (err as Error).message,
+          });
+        }
+      }
       if (!verdict.allow) {
         return finish({
           type: "tool_result",

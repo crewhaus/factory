@@ -59,11 +59,19 @@ export type AuditKind =
   // summary. The egress-classifier's `summarizeEgress(result)` produces
   // the human-readable form that lands in the `payload_summary` field.
   | "egress_decision"
-  // Pillar 3 intent gate — permission-engine emits one event per
-  // justification-evaluated tool call. Payload shape (opaque JSON):
-  //   { toolName, justification, verdict: "allow"|"deny", reason, judgeModel }
+  // Pillar 3 intent gate — `runtime-core`'s justification gate appends one
+  // record per justification-evaluated tool call (allow OR deny) when a
+  // durable sink is wired via `runChatLoop({ justificationAuditSink })`. The
+  // CLI `run`/browser paths open a real audit-log rooted at `.crewhaus/audit`
+  // and pass it (disable with `--no-justification-audit`); the ephemeral
+  // `permission_decision` trace-bus event mirrors the same verdict + judge
+  // identity for live observability. Payload shape (opaque JSON):
+  //   { toolName, justification, verdict: "allow"|"deny", reason, judgeModel,
+  //     confidence? }
   // Stored verbatim because the justification IS the audit artifact;
-  // redacting it would defeat the purpose.
+  // redacting it would defeat the purpose. (`runtime-core` declares a minimal
+  // structural `JustificationAuditSink` rather than importing this package, to
+  // avoid a dependency cycle; this `AuditLog` satisfies that seam.)
   | "permission_justification_evaluated";
 
 export type AuditRecord = {

@@ -255,6 +255,49 @@ describe("crewhaus run", () => {
     expect(result.stderr).toContain("cli or browser");
     expect(result.stderr).toContain('got "voice"');
   });
+
+  // FR-004 — --justification-judge selects the Pillar 3 intent-gate judge.
+  // This subprocess test proves the flag resolves and the agent starts; the
+  // FULL handoff (CLI-resolved judge actually governing a gate decision and
+  // the judge identity landing in the durable permission_justification_evaluated
+  // audit record) is proven deterministically in justification-gate.test.ts —
+  // a subprocess cannot drive a real model turn without a live call.
+  test("--justification-judge claude starts the agent cleanly (judge wired)", async () => {
+    const result = await runCli(["run", HELLO_SPEC, "--justification-judge", "claude"], {
+      env: { ANTHROPIC_API_KEY: "test-no-call" },
+      closeStdinImmediately: true,
+    });
+    // The claude judge is constructed (lazy import of
+    // @crewhaus/justification-judge-claude + the anthropic adapter) but never
+    // called — stdin closes before any turn. A clean exit proves the wiring
+    // resolves without error.
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("model: claude-sonnet-4-6");
+  });
+
+  test("--justification-judge rule-based starts the agent cleanly (explicit default)", async () => {
+    const result = await runCli(["run", HELLO_SPEC, "--justification-judge", "rule-based"], {
+      env: { ANTHROPIC_API_KEY: "test-no-call" },
+      closeStdinImmediately: true,
+    });
+    expect(result.exitCode).toBe(0);
+  });
+
+  test("an invalid --justification-judge value exits non-zero with the allowed list", async () => {
+    const result = await runCli(["run", HELLO_SPEC, "--justification-judge", "gpt-omniscient"], {
+      env: { ANTHROPIC_API_KEY: "test-no-call" },
+      closeStdinImmediately: true,
+    });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("invalid --justification-judge");
+    expect(result.stderr).toContain("rule-based, claude");
+  });
+
+  test("run --help lists the --justification-judge flag", async () => {
+    const result = await runCli(["run", "--help"]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("--justification-judge");
+  });
 });
 
 describe("crewhaus doctor", () => {
