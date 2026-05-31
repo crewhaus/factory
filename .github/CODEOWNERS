@@ -8,52 +8,52 @@
 # See: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
 
 # Default owner — applies to anything not matched by a more specific rule below
-*                               @studiomax
+*                               @studiomaxio
 
 # Architecture & design decisions
-/decisions/                     @studiomax
-/AGENTS.md                      @studiomax
-/CLAUDE.md                      @studiomax
-/GOVERNANCE.md                  @studiomax
-/TRADEMARK.md                   @studiomax
-/CODE_OF_CONDUCT.md             @studiomax
+/decisions/                     @studiomaxio
+/AGENTS.md                      @studiomaxio
+/CLAUDE.md                      @studiomaxio
+/GOVERNANCE.md                  @studiomaxio
+/TRADEMARK.md                   @studiomaxio
+/CODE_OF_CONDUCT.md             @studiomaxio
 
 # Compiler core
-/packages/spec/                 @studiomax
-/packages/ir/                   @studiomax
-/packages/ir-passes/            @studiomax
-/packages/compiler/             @studiomax
-/packages/runtime-core/         @studiomax
+/packages/spec/                 @studiomaxio
+/packages/ir/                   @studiomaxio
+/packages/ir-passes/            @studiomaxio
+/packages/compiler/             @studiomaxio
+/packages/runtime-core/         @studiomaxio
 
 # Target emitters (specific maintainers per target as they emerge)
-/packages/target-cli/           @studiomax
-/packages/target-channel-*/     @studiomax
-/packages/target-graph/         @studiomax
-/packages/target-pipeline/      @studiomax
-/packages/target-crew/          @studiomax
-/packages/target-research/      @studiomax
-/packages/target-batch/         @studiomax
-/packages/target-voice/         @studiomax
-/packages/target-browser/       @studiomax
-/packages/target-managed/       @studiomax
-/packages/target-eval/          @studiomax
-/packages/target-workflow/      @studiomax
+/packages/target-cli/           @studiomaxio
+/packages/target-channel-*/     @studiomaxio
+/packages/target-graph/         @studiomaxio
+/packages/target-pipeline/      @studiomaxio
+/packages/target-crew/          @studiomaxio
+/packages/target-research/      @studiomaxio
+/packages/target-batch/         @studiomaxio
+/packages/target-voice/         @studiomaxio
+/packages/target-browser/       @studiomaxio
+/packages/target-managed/       @studiomaxio
+/packages/target-eval/          @studiomaxio
+/packages/target-workflow/      @studiomaxio
 
 # Eval & optimization
-/packages/eval-runner/                       @studiomax
-/packages/prompt-optimizer/                  @studiomax
-/packages/prompt-optimizer-claude/           @studiomax
-/packages/spec-patch/                        @studiomax
-/packages/eval-optimizer-orchestrator/       @studiomax
+/packages/eval-runner/                       @studiomaxio
+/packages/prompt-optimizer/                  @studiomaxio
+/packages/prompt-optimizer-claude/           @studiomaxio
+/packages/spec-patch/                        @studiomaxio
+/packages/eval-optimizer-orchestrator/       @studiomaxio
 
 # Security fabric (highest scrutiny)
-/packages/boundary-classifier/  @studiomax
-/packages/prompt-injection-detector/         @studiomax
+/packages/boundary-classifier/  @studiomaxio
+/packages/prompt-injection-detector/         @studiomaxio
 
 # Documentation
-/docs/                          @studiomax
+/docs/                          @studiomaxio
 
 # CI / tooling
-/.github/                       @studiomax
-/biome.json                     @studiomax
-/tsconfig*.json                 @studiomax
+/.github/                       @studiomaxio
+/biome.json                     @studiomaxio
+/tsconfig*.json                 @studiomaxio
