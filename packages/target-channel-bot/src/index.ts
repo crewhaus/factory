@@ -298,6 +298,7 @@ function renderAgent(ir: IrChannelV0): string {
 // Source spec: ${ir.name} (target: channel, ir version: ${ir.version}, file: agent.ts)
 import { runChatLoop } from "@crewhaus/runtime-core";
 import { createRunContext } from "@crewhaus/run-context";
+import { classifyInbound } from "@crewhaus/channel-adapter-base";
 ${permImport}${subAgentTypeImport}import type { HookDef } from "@crewhaus/hooks-engine";
 import type { SkillRef } from "@crewhaus/skills-registry";
 import type { SlashCommand } from "@crewhaus/slash-commands";
@@ -325,6 +326,13 @@ export function createAgent(config: AgentConfig): Agent {
   return {
     async runTurn(args: RunTurnArgs): Promise<string> {
       const runContext = createRunContext({ sessionId: args.sessionId });
+      // Pillar 3 channel boundary — classify the inbound message at
+      // TrustOrigin "channel" BEFORE it seeds a model turn. The gateway
+      // already verified the webhook signature (who); this verifies what
+      // the text contains. Malicious inbound is replaced by a redaction
+      // notice; pass/warn content is tagged into runContext.dataLineage so
+      // the egress fabric sees the channel origin on later external calls.
+      const __inbound = await classifyInbound(args.message, runContext, { origin: "channel" });
       return await runChatLoop({
         model: ${escapeJsonString(ir.agent.model)},
         instructions: ${escapeJsonString(ir.agent.instructions)},
@@ -333,7 +341,7 @@ export function createAgent(config: AgentConfig): Agent {
         ...(config.sessionRootDir !== undefined ? { sessionRootDir: config.sessionRootDir } : {}),
         runContext,
         singleTurn: true,
-        seedMessages: [{ role: "user", content: args.message }],
+        seedMessages: [{ role: "user", content: __inbound }],
         ...(args.isNew ? {} : { resume: { sessionId: args.sessionId } }),
         tools: config.tools,
         hooks: config.hooks,

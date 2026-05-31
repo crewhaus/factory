@@ -21,6 +21,7 @@
  *     `{ kind: "tombstone", messageId }` — the federated subagent call
  *     produces a clear failure message in the agent transcript.
  */
+import { classifyBoundary } from "@crewhaus/boundary-classifier";
 import { CrewhausError } from "@crewhaus/errors";
 import { type Discovery, createDiscovery } from "@crewhaus/federation-discovery";
 import {
@@ -30,6 +31,7 @@ import {
   type MtlsCredentials,
   federationCall,
 } from "@crewhaus/federation-protocol";
+import { type RunContext, tagContent } from "@crewhaus/run-context";
 
 export class FederationRouterError extends CrewhausError {
   override readonly name = "FederationRouterError";
@@ -57,6 +59,16 @@ export type FederationRouterConfig = {
    * real bus's `currentTraceparent()` in production).
    */
   readonly currentTraceparent?: () => string;
+  /**
+   * Pillar 3 boundary site — the per-run `RunContext` for the caller.
+   * When supplied, a non-blocked peer `reply` is tagged into
+   * `runContext.dataLineage` under origin `"federation"` so the sink-side
+   * egress classifier sees federation-origin content on a later
+   * external-scope tool call. Optional for backward-compat: the security-
+   * critical half (redacting a malicious peer reply) runs regardless —
+   * `tagContent` is only reachable when a runtime threads a context here.
+   */
+  readonly runContext?: RunContext;
 };
 
 export type RouterTraceEvent =
@@ -151,13 +163,30 @@ export function createFederationRouter(config: FederationRouterConfig): Federati
             `peer ${args.to.deployment} response missing string 'reply' field`,
           );
         }
+        // Pillar 3 boundary site — the peer `reply` is untrusted external
+        // content entering local context. mTLS / cert-pin / version checks
+        // above authenticated *who* the peer is; they say nothing about
+        // *what* the reply contains. A malicious deployment can return a
+        // prompt injection inside an authenticated channel — classify it at
+        // origin "federation" (strict block default) before it reaches the
+        // caller's model. On a non-blocked verdict, tag the reply into the
+        // caller's data-lineage (when a RunContext was supplied) so the
+        // sink-side egress classifier sees the federation origin on a later
+        // external-tool call. See recipe 41 (security fabric) / 27 (federation).
+        let reply = parsed.reply;
+        const fb = await classifyBoundary(reply, { origin: "federation" });
+        if (fb.action === "redact" && fb.redacted !== undefined) {
+          reply = fb.redacted;
+        } else if (config.runContext) {
+          tagContent(config.runContext, reply, "federation");
+        }
         trace({
           kind: "federation_call_end",
           to: args.to,
           status: result.status,
           durationMs: Date.now() - start,
         });
-        return { reply: parsed.reply };
+        return { reply };
       } catch (err) {
         trace({
           kind: "federation_call_error",

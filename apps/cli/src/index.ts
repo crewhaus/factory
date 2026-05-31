@@ -1174,7 +1174,8 @@ async function runDoctorPhilosophyAlignment(): Promise<void> {
 
   // Pillar 3 — security is a fabric. The boundary-classifier package
   // must exist and be referenced by the canonical boundary sites
-  // (tool-mcp, sub-agent-spawner, skills-registry, compaction-autocompact).
+  // (tool-mcp, sub-agent-spawner, skills-registry, compaction-autocompact,
+  // federation-router, channel-adapter-base).
   const boundaryPkg = join(process.cwd(), "packages", "boundary-classifier", "package.json");
   findings.push({
     label: "Pillar 3 — boundary-classifier package present",
@@ -1187,6 +1188,8 @@ async function runDoctorPhilosophyAlignment(): Promise<void> {
     { name: "sub-agent-spawner", path: "packages/sub-agent-spawner/src/index.ts" },
     { name: "skills-registry", path: "packages/skills-registry/src/index.ts" },
     { name: "compaction-autocompact", path: "packages/compaction-autocompact/src/index.ts" },
+    { name: "federation-router", path: "packages/federation-router/src/index.ts" },
+    { name: "channel-adapter-base", path: "packages/channel-adapter-base/src/index.ts" },
   ];
   for (const site of boundarySites) {
     const filePath = join(process.cwd(), site.path);

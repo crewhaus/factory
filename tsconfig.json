@@ -142,6 +142,7 @@
     { "path": "./packages/single-binary-cli" },
     { "path": "./packages/helm-chart" },
     { "path": "./packages/crewhaus-cloud" },
+    { "path": "./packages/channel-adapter-base" },
     { "path": "./packages/channel-adapter-telegram" },
     { "path": "./packages/channel-adapter-discord" },
     { "path": "./packages/channel-adapter-whatsapp" },
