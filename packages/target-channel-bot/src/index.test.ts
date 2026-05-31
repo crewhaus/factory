@@ -182,9 +182,28 @@ describe("emitChannelBot — agent.ts", () => {
     const c = fileMap(MIN_IR).get("agent.ts") ?? "";
     expect(c).toContain("singleTurn: true");
     expect(c).toContain("resume: { sessionId: args.sessionId }");
-    expect(c).toContain('seedMessages: [{ role: "user", content: args.message }]');
+    // The seed now carries the boundary-classified inbound (__inbound), not
+    // the raw args.message — see the Pillar-3 channel-boundary test below.
+    expect(c).toContain('seedMessages: [{ role: "user", content: __inbound }]');
+    expect(c).not.toContain('seedMessages: [{ role: "user", content: args.message }]');
     expect(c).toContain('sessionTarget: "channel"');
     expect(c).toContain('sessionName: "demo"');
+  });
+
+  test("classifies inbound channel text at the boundary before seeding the model (Pillar 3, FR-005)", () => {
+    const c = fileMap(MIN_IR).get("agent.ts") ?? "";
+    // Imports the channel boundary chokepoint.
+    expect(c).toContain('import { classifyInbound } from "@crewhaus/channel-adapter-base";');
+    // Calls it on the inbound message with the per-run runContext + channel origin.
+    expect(c).toContain('classifyInbound(args.message, runContext, { origin: "channel" })');
+    // The classify runs BEFORE the runChatLoop call (the redacted/tagged text
+    // is what reaches the model), and its result feeds the seed.
+    const classifyIdx = c.indexOf("classifyInbound(args.message");
+    const loopIdx = c.indexOf("runChatLoop({");
+    expect(classifyIdx).toBeGreaterThan(-1);
+    expect(loopIdx).toBeGreaterThan(-1);
+    expect(classifyIdx).toBeLessThan(loopIdx);
+    expect(c).toContain("const __inbound = await classifyInbound(");
   });
 
   test("threads model + instructions + permissions from the IR", () => {

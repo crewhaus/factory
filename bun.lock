@@ -232,6 +232,15 @@
         "@crewhaus/errors": "workspace:*",
       },
     },
+    "packages/channel-adapter-base": {
+      "name": "@crewhaus/channel-adapter-base",
+      "version": "0.1.1",
+      "dependencies": {
+        "@crewhaus/boundary-classifier": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/run-context": "workspace:*",
+      },
+    },
     "packages/channel-adapter-discord": {
       "name": "@crewhaus/channel-adapter-discord",
       "version": "0.1.1",
@@ -688,9 +697,11 @@
       "name": "@crewhaus/federation-router",
       "version": "0.1.1",
       "dependencies": {
+        "@crewhaus/boundary-classifier": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/federation-discovery": "workspace:*",
         "@crewhaus/federation-protocol": "workspace:*",
+        "@crewhaus/run-context": "workspace:*",
       },
     },
     "packages/gateway-protocol": {
@@ -1400,6 +1411,7 @@
         "@crewhaus/ir": "workspace:*",
       },
       "peerDependencies": {
+        "@crewhaus/channel-adapter-base": "workspace:*",
         "@crewhaus/channel-adapter-discord": "workspace:*",
         "@crewhaus/channel-adapter-imessage": "workspace:*",
         "@crewhaus/channel-adapter-slack": "workspace:*",
@@ -2078,6 +2090,8 @@
     "@crewhaus/chain-adapter-base": ["@crewhaus/chain-adapter-base@workspace:packages/chain-adapter-base"],
 
     "@crewhaus/chain-adapter-evm": ["@crewhaus/chain-adapter-evm@workspace:packages/chain-adapter-evm"],
+
+    "@crewhaus/channel-adapter-base": ["@crewhaus/channel-adapter-base@workspace:packages/channel-adapter-base"],
 
     "@crewhaus/channel-adapter-discord": ["@crewhaus/channel-adapter-discord@workspace:packages/channel-adapter-discord"],
 

@@ -1,8 +1,8 @@
 {
-  "name": "@crewhaus/federation-router",
+  "name": "@crewhaus/channel-adapter-base",
   "version": "0.1.1",
   "type": "module",
-  "description": "Routes Task/SendMessage invocations transparently across federated CrewHaus deployments via federation-protocol + federation-discovery (Section 34)",
+  "description": "Channel boundary base: classifies inbound channel text at TrustOrigin \"channel\" before it reaches a model call (Pillar 3 chokepoint, Section 33)",
   "main": "src/index.ts",
   "types": "src/index.ts",
   "exports": {
@@ -14,8 +14,6 @@
   "dependencies": {
     "@crewhaus/boundary-classifier": "workspace:*",
     "@crewhaus/errors": "workspace:*",
-    "@crewhaus/federation-discovery": "workspace:*",
-    "@crewhaus/federation-protocol": "workspace:*",
     "@crewhaus/run-context": "workspace:*"
   },
   "license": "Apache-2.0",
@@ -27,9 +25,9 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/crewhaus/factory.git",
-    "directory": "packages/federation-router"
+    "directory": "packages/channel-adapter-base"
   },
-  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/federation-router#readme",
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/channel-adapter-base#readme",
   "bugs": {
     "url": "https://github.com/crewhaus/factory/issues"
   },
