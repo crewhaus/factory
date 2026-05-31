@@ -35,6 +35,10 @@ import { spawnSubAgent } from "@crewhaus/sub-agent-spawner";
 import { type RegisteredTool, ToolCatalog } from "@crewhaus/tool-catalog";
 import { registerMcpServer } from "@crewhaus/tool-mcp";
 import { createTaskTool } from "@crewhaus/tool-task";
+// FR-002 — Pillar 3 sink-side scope gate, shared by `compile --strict` and
+// `doctor --philosophy-alignment`. Kept in a side-effect-free module so it is
+// unit-testable (this entry file runs an argv switch on import).
+import { auditSpecToolNames, auditToolScopes, collectToolNames } from "./scope-audit";
 
 /**
  * crewhaus — slice-scope CLI.
@@ -58,6 +62,10 @@ const COMPILE_SCHEMA: ParseArgsSchema = {
   flags: [
     { name: "out", short: "o", takesValue: true },
     { name: "emit-ir", takesValue: false },
+    // FR-002 — fail the build when an outward-reaching tool is left at a
+    // non-"external" scope. Opt-in for now; slated to become the default in
+    // a later minor (see whitepaper §6).
+    { name: "strict", takesValue: false },
     { name: "help", short: "h" },
   ],
 };
@@ -237,6 +245,7 @@ function usage(): never {
       "",
       "subcommands:",
       "  compile <spec.yaml> -o <out-dir>     compile a spec to a runnable bundle",
+      "                  [--strict]           fail if an outward tool is left non-external (FR-002)",
       "  compile <spec.yaml> --emit-ir        print the lowered IR as JSON (debug)",
       "  run <spec.yaml> [--model <model>]    compile in-memory and execute the agent",
       "                  [--resume <id>]      resume a specific session (cli targets only)",
@@ -293,29 +302,52 @@ function parseFor(rest: ReadonlyArray<string>, schema: ParseArgsSchema): ParsedA
   }
 }
 
-function runCompile(args: ParsedArgs): void {
+async function runCompile(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
-      "usage: crewhaus compile <spec.yaml> [-o <out-dir>] [--emit-ir]\n" +
+      "usage: crewhaus compile <spec.yaml> [-o <out-dir>] [--emit-ir] [--strict]\n" +
         "  --emit-ir  Skip code emission; print the lowered IR as JSON to\n" +
-        "             stdout (or to <out-dir>/ir.json when -o is set).\n",
+        "             stdout (or to <out-dir>/ir.json when -o is set).\n" +
+        "  --strict   FR-002 — fail the build (exit 1) if any I/O-capable tool\n" +
+        '             the spec uses is left at a non-"external" scope. Flags:\n' +
+        "             (a) a resolvable built-in whose declared io-capability or\n" +
+        "                 outward name disagrees with its scope;\n" +
+        "             (b) an outward-by-name sink — any mcp__* tool or known\n" +
+        "                 outward built-in — that cannot be resolved to a\n" +
+        '                 scope:"external" tool offline (its egress scope is\n' +
+        "                 unverifiable at compile time, so --strict refuses it).\n" +
+        "             A non-outward custom tool whose name carries no signal is\n" +
+        "             left to the live `doctor --philosophy-alignment` audit /\n" +
+        "             runtime egress fabric. Opt-in today; slated to become the\n" +
+        "             default in a later minor.\n",
     );
     return;
   }
   const specPath = args.positional[0];
   const outDir = args.flags["out"];
   const emitIr = args.flags["emit-ir"] === true;
+  const strict = args.flags["strict"] === true;
   if (typeof specPath !== "string") die("missing <spec.yaml>");
   if (!emitIr && typeof outDir !== "string") die("missing -o <out-dir>");
 
   const absSpec = resolve(specPath);
-  logger.debug("compile.start", { spec: absSpec, out: outDir, emitIr });
+  logger.debug("compile.start", { spec: absSpec, out: outDir, emitIr, strict });
 
   let yamlText: string;
   try {
     yamlText = readFileSync(absSpec, "utf-8");
   } catch (err) {
     die(`could not read ${absSpec}: ${(err as Error).message}`);
+  }
+
+  // FR-002 — strict scope gate. Lower the spec (pure), resolve every
+  // referenced built-in tool name to its RegisteredTool, and audit scopes
+  // BEFORE any emission. Runs for both --emit-ir and bundle modes so the
+  // gate can't be sidestepped by mode choice. `lower()` only carries tool
+  // NAMES, not scope, so resolution via loadToolMap() is what surfaces the
+  // real RegisteredTool.scope.
+  if (strict) {
+    await runStrictScopeGate(yamlText);
   }
 
   if (emitIr) {
@@ -361,6 +393,43 @@ function runCompile(args: ParsedArgs): void {
   }
   process.stdout.write(`compiled bundle (${bundle.files.length} file(s)) → ${absOut}\n`);
   logger.debug("compile.success", { files: bundle.files.length, out: absOut });
+}
+
+/**
+ * FR-002 — the `compile --strict` enforcement body. Lowers the spec, resolves
+ * the tool names it references to their RegisteredTools, and runs the shared
+ * `auditToolScopes`. On any finding, writes a `[strict]` diagnostic per
+ * tool to stderr and exits 1 BEFORE emitting. Shares the exact audit with
+ * `crewhaus doctor --philosophy-alignment`.
+ */
+async function runStrictScopeGate(yamlText: string): Promise<void> {
+  let ir: ReturnType<typeof lower>;
+  try {
+    ir = lower(parseSpec(yamlText));
+  } catch (err) {
+    if (err instanceof SpecParseError) die(err.message);
+    throw err;
+  }
+  const toolNames = collectToolNames(ir);
+  if (toolNames.length === 0) return;
+
+  const toolMap = await loadToolMap();
+  // Shared, name-independent audit (see scope-audit.ts):
+  //   - resolvable built-ins are checked by capability/outward-name vs scope;
+  //   - an outward-by-name sink we CANNOT resolve to a scope:"external" tool
+  //     offline (a custom outward name, or any `mcp__*` dynamic sink) is a
+  //     finding, because --strict refuses to emit a bundle that reaches a
+  //     sink whose external scope it cannot verify at compile time.
+  const findings = auditSpecToolNames(toolNames, (name) => toolMap[name]);
+  if (findings.length > 0) {
+    for (const f of findings) {
+      process.stderr.write(`crewhaus: [strict] tool "${f.toolName}" ${f.reason}\n`);
+    }
+    process.stderr.write(
+      `crewhaus: [strict] ${findings.length} scope finding(s) — refusing to emit. Set scope: "external" on each tool above, or drop --strict.\n`,
+    );
+    process.exit(1);
+  }
 }
 
 function runInit(args: ParsedArgs): void {
@@ -913,7 +982,7 @@ function runContext(args: ParsedArgs): void {
   process.stdout.write(bundle.markdown);
 }
 
-function runDoctor(args: ParsedArgs): void {
+async function runDoctor(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
       "usage: crewhaus doctor [--philosophy-alignment]\n" +
@@ -922,7 +991,7 @@ function runDoctor(args: ParsedArgs): void {
     return;
   }
   if (args.flags["philosophy-alignment"]) {
-    runDoctorPhilosophyAlignment();
+    await runDoctorPhilosophyAlignment();
     return;
   }
 
@@ -971,7 +1040,7 @@ function runDoctor(args: ParsedArgs): void {
  * eval-is-active, security-is-fabric). Exits 0 on green, 1 on any
  * finding. Designed to be runnable in CI as a soft gate.
  */
-function runDoctorPhilosophyAlignment(): void {
+async function runDoctorPhilosophyAlignment(): Promise<void> {
   const findings: DoctorCheck[] = [];
 
   // Pillar 1 — compiler-as-protagonist. The IR-discriminated-union is
@@ -1059,6 +1128,29 @@ function runDoctorPhilosophyAlignment(): void {
         ? undefined
         : `no reference to classifyBoundary in ${site.path} — security regression`,
     });
+  }
+
+  // FR-002 — Pillar 3 sink-side. Audit the full built-in tool map: every
+  // outward-reaching built-in must carry scope: "external" so the egress
+  // classifier fires on it. Uses the SAME `auditToolScopes` helper as
+  // `compile --strict` (acceptance: the two paths share one implementation).
+  // Importing the tool packages is heavier than the rest of doctor, so it's
+  // confined to this --philosophy-alignment branch.
+  const toolMap = await loadToolMap();
+  const scopeFindings = auditToolScopes(Object.values(toolMap));
+  if (scopeFindings.length === 0) {
+    findings.push({
+      label: 'Pillar 3 — all built-in outward tools scope:"external"',
+      pass: true,
+    });
+  } else {
+    for (const f of scopeFindings) {
+      findings.push({
+        label: `Pillar 3 — tool "${f.toolName}" outward but scope!="external"`,
+        pass: false,
+        reason: f.reason,
+      });
+    }
   }
 
   // Contributor compass exists at project root. AGENTS.md is the canonical
@@ -2004,7 +2096,7 @@ const rest = argv.slice(1);
 
 switch (subcommand) {
   case "compile":
-    runCompile(parseFor(rest, COMPILE_SCHEMA));
+    await runCompile(parseFor(rest, COMPILE_SCHEMA));
     break;
   case "init":
     runInit(parseFor(rest, INIT_SCHEMA));
@@ -2022,7 +2114,7 @@ switch (subcommand) {
     await runOptimize(parseFor(rest, OPTIMIZE_SCHEMA));
     break;
   case "doctor":
-    runDoctor(parseFor(rest, DOCTOR_SCHEMA));
+    await runDoctor(parseFor(rest, DOCTOR_SCHEMA));
     break;
   case "context":
     runContext(parseFor(rest, CONTEXT_SCHEMA));

@@ -333,6 +333,9 @@ export const fetch: RegisteredTool = buildTool({
   // and URL parameters can both carry exfiltrated lineage; egress-classifier
   // scans both before the request fires.
   scope: "external",
+  // FR-002 — declare the io-capability fact so the compile-time audit binds
+  // scope:"external" to this tool by capability, not only by its name.
+  ioCapability: "network",
   execute: async (input, ctx) => {
     let url: URL;
     try {

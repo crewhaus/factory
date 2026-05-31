@@ -79,6 +79,85 @@ describe("crewhaus compile", () => {
     const result = await runCli(["compile", HELLO_SPEC, "--emit-ir"]);
     expect(result.exitCode).toBe(0);
   });
+
+  // FR-002 — compile-time external-sink scope gate.
+  test("--help mentions the --strict scope gate", async () => {
+    const result = await runCli(["compile", "--help"]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("--strict");
+    expect(result.stdout).toContain('non-"external"');
+  });
+
+  test("--strict on a clean (toolless) spec still emits and exits 0", async () => {
+    const result = await runCli(["compile", HELLO_SPEC, "--strict", "-o", tmp]);
+    expect(result.exitCode).toBe(0);
+    expect(existsSync(join(tmp, "agent.ts"))).toBe(true);
+    expect(result.stderr).not.toContain("[strict]");
+  });
+
+  test("--strict passes when an outward tool (fetch) is correctly external", async () => {
+    // Exercises the full resolve path: collectToolNames → loadToolMap →
+    // auditSpecToolNames → auditToolScopes. `Fetch` ships scope:"external"
+    // (and ioCapability:"network"), so the audit is clean and the bundle emits.
+    const specPath = join(tmp, "crewhaus.yaml");
+    writeFileSync(
+      specPath,
+      "name: with-fetch\ntarget: cli\nagent:\n  model: claude-sonnet-4-6\n  instructions: |\n    Use fetch when needed.\ntools:\n  - fetch\n",
+    );
+    const outDir = join(tmp, "out");
+    const result = await runCli(["compile", specPath, "--strict", "-o", outDir]);
+    expect(result.exitCode).toBe(0);
+    expect(existsSync(join(outDir, "agent.ts"))).toBe(true);
+    expect(result.stderr).not.toContain("[strict]");
+  });
+
+  // FR-002 RED PATH (the case the adversarial review proved exited 0). A spec
+  // referencing an `mcp__*` sink the offline tool map cannot resolve to a
+  // scope:"external" tool must FAIL --strict, naming the tool, and must NOT
+  // emit. This is the criterion's "diagnostic naming any I/O-capable tool left
+  // at an unspecified scope" — enforced at the spec level, not only re-checking
+  // the already-correct built-ins.
+  const MCP_SINK_SPEC =
+    "name: evil\ntarget: cli\nagent:\n  model: claude-sonnet-4-6\n  instructions: |\n    do a thing\ntools:\n  - mcp__evil__exfiltrate\n";
+
+  test("--strict FAILS (exit 1) on an unresolved mcp__ exfiltration sink and names it", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    writeFileSync(specPath, MCP_SINK_SPEC);
+    const outDir = join(tmp, "out");
+    const result = await runCli(["compile", specPath, "--strict", "-o", outDir]);
+    expect(result.exitCode).toBe(1);
+    // The `[strict]` marker proves the STRICT GATE produced the failure (and
+    // ran before any emit) — the generic emitter "unknown tool" error carries
+    // no such marker. This is the exact spec the adversarial review proved
+    // exited 0 under the old name-only audit.
+    expect(result.stderr).toContain("[strict]");
+    expect(result.stderr).toContain("mcp__evil__exfiltrate");
+    expect(result.stderr).toContain("unverifiable offline");
+    // refused to emit
+    expect(existsSync(join(outDir, "agent.ts"))).toBe(false);
+  });
+
+  test("--strict gates --emit-ir too — isolates the gate (lowering alone would succeed)", async () => {
+    // On --emit-ir there is NO target emitter in the path, so the spec lowers
+    // cleanly and the ONLY thing that can produce exit 1 is the strict gate.
+    // If --strict were a no-op the IR would print and exit 0. This is the
+    // cleanest proof the gate is load-bearing, not the emitter's own
+    // unknown-tool rejection.
+    const specPath = join(tmp, "crewhaus.yaml");
+    writeFileSync(specPath, MCP_SINK_SPEC);
+    const outDir = join(tmp, "out");
+    const result = await runCli(["compile", specPath, "--strict", "--emit-ir", "-o", outDir]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("[strict]");
+    expect(result.stderr).toContain("mcp__evil__exfiltrate");
+    expect(existsSync(join(outDir, "ir.json"))).toBe(false);
+  });
+
+  test("--strict also gates the --emit-ir path (clean spec exits 0)", async () => {
+    const result = await runCli(["compile", HELLO_SPEC, "--strict", "--emit-ir", "-o", tmp]);
+    expect(result.exitCode).toBe(0);
+    expect(existsSync(join(tmp, "ir.json"))).toBe(true);
+  });
 });
 
 describe("crewhaus init", () => {
@@ -207,6 +286,21 @@ describe("crewhaus doctor", () => {
     });
     expect(result.exitCode).toBe(1);
     expect(result.stdout).toContain("✗ crewhaus.yaml in cwd");
+  });
+
+  // FR-002 — the philosophy-alignment audit now includes a Pillar 3 sink-side
+  // pass over the built-in tool map, sharing auditToolScopes with
+  // `compile --strict`. Run from REPO_ROOT so the package-presence checks and
+  // loadToolMap() see the real workspace. All built-in outward tools ship
+  // scope:"external", so the new check is green and the overall audit exits 0.
+  test("--philosophy-alignment audits built-in tool scopes and reports them green", async () => {
+    const result = await runCli(["doctor", "--philosophy-alignment"], {
+      cwd: REPO_ROOT,
+      env: { ANTHROPIC_API_KEY: "test" },
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('Pillar 3 — all built-in outward tools scope:"external"');
+    expect(result.stdout).toContain("philosophy alignment: green");
   });
 });
 

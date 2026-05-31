@@ -68,6 +68,35 @@ export type ToolExecuteResult = string | ToolResultContent;
  */
 export type ToolScope = "internal" | "external";
 
+/**
+ * FR-002 — Pillar 3 sink-side io-capability signal.
+ *
+ * `scope` declares the *policy* (does the egress classifier run); this
+ * declares the *fact* (does the tool actually cross a boundary). The two are
+ * separable on purpose: the compile-time gate uses the fact to require the
+ * policy. A tool that opens a socket or spawns a process is io-capable
+ * regardless of what `scope` it was given, so the `crewhaus compile --strict`
+ * / `crewhaus doctor --philosophy-alignment` audit can flag an io-capable
+ * tool left at a non-`"external"` scope *by name-independent capability*,
+ * closing the custom-`buildTool`-tool residual the FR's mechanism 2 targets
+ * ("custom buildTool tools that open sockets, spawn processes, touch the
+ * network").
+ *
+ * - `"network"`: the tool issues outbound network requests (HTTP, websocket,
+ *   raw socket, RPC, an SDK that does so under the hood).
+ * - `"process"`: the tool spawns a child process / shell whose effects the
+ *   runtime cannot re-classify after the fact.
+ *
+ * Author-supplied custom tools that touch the network or spawn processes
+ * SHOULD declare this; the six built-in outward tools also declare it so the
+ * audit no longer depends solely on their hardcoded names. Omitted ⇒ no
+ * declared io-capability (the prior behavior — the audit then falls back to
+ * the name heuristic only). This is additive and fail-open *for omission*
+ * but fail-closed *for declaration*: declaring io-capability and forgetting
+ * `scope: "external"` is exactly what `--strict` refuses.
+ */
+export type ToolIoCapability = "network" | "process";
+
 export interface ToolDefinition<TInput = unknown> {
   name: string;
   description: string;
@@ -100,11 +129,23 @@ export interface ToolDefinition<TInput = unknown> {
    */
   scope?: ToolScope;
   /**
+   * Pillar 3 sink-side — see `ToolIoCapability`. Declares that this tool
+   * actually crosses a network or process boundary, independent of `scope`.
+   * Custom tools that open sockets / spawn processes SHOULD set this so the
+   * `compile --strict` / `doctor --philosophy-alignment` audit can require
+   * `scope: "external"` on them by capability rather than by name. Omitted ⇒
+   * no declared io-capability (prior behavior).
+   */
+  ioCapability?: ToolIoCapability;
+  /**
    * Pillar 3 intent gate — when true, runtime-core demands the model
    * supply a `justification` string in the tool's input alongside the
    * declared schema, and `permission-engine` evaluates the justification
-   * against the session's stated goal via an LLM-as-judge. Failures emit
-   * `permission_justification_evaluated` audit events and deny the call.
+   * against the session's stated goal via an LLM-as-judge. Every evaluation
+   * (allow OR deny) publishes a `permission_decision` trace event and, when a
+   * durable `justificationAuditSink` is wired into `runChatLoop`, appends a
+   * `permission_justification_evaluated` record to `@crewhaus/audit-log`; a
+   * deny additionally blocks the call.
    *
    * Default at normalization is `false`. Recommended `true` for any tool
    * with destructive or external side effects (evm-tx, message-channel,
@@ -145,6 +186,12 @@ export interface RegisteredTool {
    * explicitly in their `ToolDefinition`.
    */
   scope: ToolScope;
+  /**
+   * Pillar 3 sink-side io-capability fact. Optional: absent ⇒ the tool did
+   * not declare crossing a boundary (the audit then relies on the outward-
+   * name heuristic only). See `ToolDefinition.ioCapability`.
+   */
+  ioCapability?: ToolIoCapability;
   /**
    * Pillar 3 intent gate — fails closed (false) when omitted. See
    * `ToolDefinition.requireJustification`.

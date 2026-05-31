@@ -83,6 +83,9 @@ export function buildMcpRegisteredTool(
     // "external-dynamic" (strict policy) while spec-configured servers are
     // "external-configured".
     scope: "external",
+    // FR-002 — declare the io-capability fact: every MCP call leaves the
+    // process for a remote server over the network.
+    ioCapability: "network",
     execute: async (input, ctx) => {
       const client = host.getClient(serverName);
       const args = (input ?? {}) as Record<string, unknown>;
