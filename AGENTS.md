@@ -43,7 +43,7 @@ The active-optimization layer:
 
 1. **Spec parameters that should be optimizable** must be listed in `OPTIMIZABLE_PATHS` ([packages/spec-patch/src/index.ts](packages/spec-patch/src/index.ts)). If you add a new spec field that affects eval quality (chunkOverlap, defaultK, temperature, instructions), add the path or the optimizer can't reach it.
 2. **Patches mutate the spec, never the IR.** The compiler's `lower()` does destructive normalization (sort, freeze, env-var rewriting); IR-level patches can't round-trip back to YAML.
-3. **The rule-based provider stays the default in tests** so test fixtures are deterministic. The model-driven Claude provider is opt-in via `--mutator claude`. A `--budget-usd` cost-gate backed by `cost-tracker` is a planned follow-up; today the only safety rail is the orchestrator's `iterations` cap.
+3. **The rule-based provider stays the default in tests** so test fixtures are deterministic. The model-driven Claude provider is opt-in via `--mutator claude`. The `--budget-usd` cost-gate backed by `cost-tracker` now ships: the orchestrator threads a `cost-tracker`-priced running total through the search, estimates each call's worst-case cost before issuing it, and stops before a mutation call that would exceed the budget — composing with the `iterations` cap (whichever bound is hit first ends the run). Rule-based runs make no model calls and report `$0`.
 4. **Eval reports without a patch are passive grading** — that's fine for canary gates and dashboards, but the system's promise is *active* optimization. Do not let the optimization loop fall out of date with the rest of the eval stack.
 
 ### Pillar 3 — Security is a fabric, not a perimeter

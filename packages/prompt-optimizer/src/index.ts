@@ -83,6 +83,20 @@ export type ProviderMutation = {
   readonly mutations: ReadonlyArray<Mutation>;
   /** Optional human-readable rationale (the Claude provider sets this). */
   readonly rationale?: string;
+  /**
+   * Per-call model token usage for THIS mutation, surfaced so a
+   * cost-gating orchestrator (FR-003 `--budget-usd`) can fold the
+   * call's actual spend into a running total. A model-backed provider
+   * (e.g. `prompt-optimizer-claude`) sets this from the response's
+   * token counts; the rule-based provider leaves it undefined (it
+   * issues no model call → zero cost). This field is purely additive
+   * and never affects the search itself.
+   */
+  readonly usage?: {
+    readonly input: number;
+    readonly output: number;
+    readonly cacheRead?: number;
+  };
 };
 
 export type OptimizeOptions = {

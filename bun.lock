@@ -73,6 +73,7 @@
         "@crewhaus/tool-todo": "workspace:*",
         "@crewhaus/tool-vision-grounding": "workspace:*",
         "@crewhaus/tool-web": "workspace:*",
+        "@crewhaus/trace-event-bus": "workspace:*",
       },
     },
     "packages/a2a-protocol": {
@@ -568,10 +569,12 @@
       "name": "@crewhaus/eval-optimizer-orchestrator",
       "version": "0.0.0",
       "dependencies": {
+        "@crewhaus/cost-tracker": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/prompt-optimizer": "workspace:*",
         "@crewhaus/spec": "workspace:*",
         "@crewhaus/spec-patch": "workspace:*",
+        "@crewhaus/trace-event-bus": "workspace:*",
       },
       "devDependencies": {
         "@crewhaus/eval-dataset": "workspace:*",

@@ -47,6 +47,7 @@
     "@crewhaus/slash-commands": "workspace:*",
     "@crewhaus/spec": "workspace:*",
     "@crewhaus/sub-agent-spawner": "workspace:*",
+    "@crewhaus/trace-event-bus": "workspace:*",
     "@crewhaus/tool-bash": "workspace:*",
     "@crewhaus/tool-builder": "workspace:*",
     "@crewhaus/tool-catalog": "workspace:*",

@@ -304,6 +304,141 @@ describe("crewhaus doctor", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// FR-003 — `crewhaus optimize --budget-usd` (cost budget gate).
+// Closes the affected-package coverage the FR implies: the flag's
+// negative-validation branch, the flag's forwarding into optimizeSpec, and
+// the spend summary on the resulting report. The validation tests need no
+// credentials (they short-circuit via die() before any model call); the
+// full-run test is creds-gated like the eval CLI test (the fitness function
+// runs the real agent) and asserts on the persisted report.json rather than
+// stdout, which is the robust artifact surface.
+// ---------------------------------------------------------------------------
+describe("crewhaus optimize --budget-usd", () => {
+  // A throwaway dataset + graders so the run reaches the budget gate. The
+  // grader is response-independent (`contains: q`) so the pipeline runs
+  // regardless of the agent's actual answer.
+  function writeOptimizeFixtures(): { dataset: string; graders: string } {
+    const dataset = join(tmp, "dataset.jsonl");
+    const graders = join(tmp, "graders.yaml");
+    writeFileSync(
+      dataset,
+      [
+        '{"id":"q1","input":"hi","expected_output":"hi"}',
+        '{"id":"q2","input":"yo","expected_output":"yo"}',
+        '{"id":"q3","input":"hey","expected_output":"hey"}',
+      ].join("\n"),
+    );
+    writeFileSync(graders, "graders:\n  - name: g\n    type: contains\n    substring: 'q'\n");
+    return { dataset, graders };
+  }
+
+  test("rejects --budget-usd 0 (non-positive) via die()", async () => {
+    const { dataset, graders } = writeOptimizeFixtures();
+    const result = await runCli(
+      ["optimize", HELLO_SPEC, "--dataset", dataset, "--graders", graders, "--budget-usd", "0"],
+      { env: { ANTHROPIC_API_KEY: "test-no-call" } },
+    );
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("invalid --budget-usd");
+    expect(result.stderr).toContain("positive number");
+  });
+
+  test("rejects a negative --budget-usd via die()", async () => {
+    const { dataset, graders } = writeOptimizeFixtures();
+    const result = await runCli(
+      ["optimize", HELLO_SPEC, "--dataset", dataset, "--graders", graders, "--budget-usd", "-1.5"],
+      { env: { ANTHROPIC_API_KEY: "test-no-call" } },
+    );
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("invalid --budget-usd");
+  });
+
+  test("rejects a non-numeric --budget-usd (NaN) via die()", async () => {
+    const { dataset, graders } = writeOptimizeFixtures();
+    const result = await runCli(
+      ["optimize", HELLO_SPEC, "--dataset", dataset, "--graders", graders, "--budget-usd", "lots"],
+      { env: { ANTHROPIC_API_KEY: "test-no-call" } },
+    );
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("invalid --budget-usd");
+  });
+
+  test("a VALID --budget-usd clears validation (fails later on a missing graders file, not on the budget)", async () => {
+    // Proves the positive branch: a well-formed budget is accepted and the
+    // run proceeds PAST the budget gate — the only failure is the absent
+    // graders file, whose error message is distinct from the budget error.
+    const dataset = join(tmp, "dataset.jsonl");
+    writeFileSync(dataset, '{"id":"q1","input":"hi","expected_output":"hi"}');
+    const missingGraders = join(tmp, "does-not-exist-graders.yaml");
+    const result = await runCli(
+      [
+        "optimize",
+        HELLO_SPEC,
+        "--dataset",
+        dataset,
+        "--graders",
+        missingGraders,
+        "--budget-usd",
+        "2.50",
+      ],
+      { env: { ANTHROPIC_API_KEY: "test-no-call" } },
+    );
+    expect(result.exitCode).toBe(1);
+    // Did NOT die on the budget — the budget was valid.
+    expect(result.stderr).not.toContain("invalid --budget-usd");
+    // Died on the next step instead: reading the (missing) graders file.
+    expect(result.stderr).toContain("could not read");
+  });
+
+  test("optimize --help lists the --budget-usd flag", async () => {
+    const result = await runCli(["optimize", "--help"]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("--budget-usd");
+  });
+
+  test("a rule-based optimize run reports $0 spend + iterations-cap stop in report.json, with the budget forwarded", async () => {
+    // Creds-gated: the fitness function runs the real agent (eval-runner),
+    // so without an Anthropic token the SDK call would block. Skip in that
+    // case — the validation tests above still cover the flag deterministically.
+    if (!process.env["ANTHROPIC_AUTH_TOKEN"] && !process.env["ANTHROPIC_API_KEY"]) {
+      return;
+    }
+    const { dataset, graders } = writeOptimizeFixtures();
+    const out = join(tmp, "opt-out");
+    const result = await runCli(
+      [
+        "optimize",
+        HELLO_SPEC,
+        "--dataset",
+        dataset,
+        "--graders",
+        graders,
+        // rule-based mutator (default) → no model calls in the search → $0.
+        "--iterations",
+        "2",
+        "--seed",
+        "7",
+        "--budget-usd",
+        "1.50",
+        "-o",
+        out,
+      ],
+      { env: { ANTHROPIC_API_KEY: process.env["ANTHROPIC_API_KEY"] ?? "" } },
+    );
+    expect(result.exitCode).toBe(0);
+    // Assert on the persisted report (robust artifact, not stdout).
+    const report = JSON.parse(readFileSync(join(out, "report.json"), "utf-8"));
+    // The flag was forwarded into optimizeSpec (persisted to the report).
+    expect(report.budgetUsd).toBe(1.5);
+    // Rule-based run → $0 spend, bounded by the iterations cap (not the budget).
+    expect(report.stoppedReason).toBe("iterations-cap");
+    expect(report.spend.totalUsd).toBe("$0.0000");
+    expect(report.spend.totalUsdMicros).toBe(0);
+    expect(report.spend.stopped).toBe("iterations-cap");
+  }, 120_000);
+});
+
 describe("crewhaus help and unknown subcommand", () => {
   test("--help prints usage listing all four subcommands", async () => {
     const result = await runCli(["--help"]);

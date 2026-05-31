@@ -5,11 +5,13 @@
     "outDir": "dist"
   },
   "references": [
+    { "path": "../cost-tracker" },
     { "path": "../errors" },
     { "path": "../eval-dataset" },
     { "path": "../prompt-optimizer" },
     { "path": "../spec" },
-    { "path": "../spec-patch" }
+    { "path": "../spec-patch" },
+    { "path": "../trace-event-bus" }
   ],
   "include": ["src/**/*"]
 }

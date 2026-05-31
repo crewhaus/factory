@@ -9,7 +9,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Sample } from "@crewhaus/eval-dataset";
-import { PromptOptimizerError, applyMutation, optimize } from "./index";
+import { PromptOptimizerError, RuleBasedMutationProvider, applyMutation, optimize } from "./index";
 
 let tmpRoot = "";
 
@@ -124,6 +124,34 @@ describe("prompt-optimizer — T3 fitness-driven search", () => {
         fitness: async () => 1,
       }),
     ).rejects.toBeInstanceOf(PromptOptimizerError);
+  });
+});
+
+describe("prompt-optimizer — FR-003 ProviderMutation.usage is optional", () => {
+  test("RuleBasedMutationProvider.next() leaves usage undefined (no model call)", async () => {
+    const provider = new RuleBasedMutationProvider({ seed: 0x42 });
+    const result = await provider.next({
+      iteration: 1,
+      best: { id: "candidate-0", prompt: "answer", mutations: [], score: 0.5 },
+      trajectory: [],
+      trainSet: [sample("a", "q", "a")],
+      devSet: [sample("b", "r", "b")],
+    });
+    // The seam widening is purely additive — rule-based reports no usage.
+    expect(result.usage).toBeUndefined();
+  });
+
+  test("optimize() still completes with the rule-based (usage-free) provider", async () => {
+    const fitness = async (prompt: string): Promise<number> => prompt.length / 100;
+    const samples = [sample("a", "q", "a")];
+    const result = await optimize("answer", {
+      trainSet: samples,
+      devSet: samples,
+      fitness,
+      iterations: 3,
+      seed: 0x42,
+    });
+    expect(result.trajectory.length).toBe(4); // base + 3
   });
 });
 

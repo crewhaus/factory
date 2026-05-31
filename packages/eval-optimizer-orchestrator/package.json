@@ -13,10 +13,12 @@
     "test": "bun test src"
   },
   "dependencies": {
+    "@crewhaus/cost-tracker": "workspace:*",
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/prompt-optimizer": "workspace:*",
     "@crewhaus/spec": "workspace:*",
-    "@crewhaus/spec-patch": "workspace:*"
+    "@crewhaus/spec-patch": "workspace:*",
+    "@crewhaus/trace-event-bus": "workspace:*"
   },
   "devDependencies": {
     "@crewhaus/eval-dataset": "workspace:*"
