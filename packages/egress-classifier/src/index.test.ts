@@ -1,10 +1,15 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { type TrustOrigin, createRunContext, tagContent } from "@crewhaus/run-context";
 import {
+  type EgressMatchInput,
+  type EgressMatchResult,
+  type EgressMatcher,
   MIN_MATCH_LENGTH,
+  SubstringEgressMatcher,
   _cacheSize,
   _clearEgressCache,
   classifyEgress,
+  substringMatcher,
   summarizeEgress,
 } from "./index";
 
@@ -193,5 +198,187 @@ describe("summarizeEgress", () => {
     expect(summary).toContain("3");
     expect(summary).toContain("mcp,subagent");
     expect(summary).toContain("dynamic-mcp:foo");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// FR-006 — the EgressMatcher seam.
+// ---------------------------------------------------------------------------
+
+describe("SubstringEgressMatcher (FR-006)", () => {
+  test('name is "substring" for audit + cache namespacing', () => {
+    expect(substringMatcher.name).toBe("substring");
+    expect(new SubstringEgressMatcher().name).toBe("substring");
+  });
+
+  test("matches identically to the legacy inline scan", () => {
+    // The default matcher is the verbatim pre-FR-006 loop: tagged entries
+    // >= floor that the payload contains, deduped origins, distinct count.
+    const lineage = new Map<string, TrustOrigin>([
+      ["mcp-sourced bearer token segment", "mcp"],
+      ["subagent-flagged content from worker", "subagent"],
+      ["short", "tool"], // under floor — must be ignored
+      ["user-typed sentence here visible", "user"], // not present in payload
+    ]);
+    const payload =
+      "POST mcp-sourced bearer token segment + subagent-flagged content from worker (short)";
+    const result = new SubstringEgressMatcher().match({
+      payload,
+      lineage,
+      minMatchLength: MIN_MATCH_LENGTH,
+    });
+    expect([...result.originsFound].sort()).toEqual(["mcp", "subagent"]);
+    expect(result.matchCount).toBe(2); // the two over-floor hits; "short" skipped
+  });
+
+  test("respects the minMatchLength floor passed in the input", () => {
+    // Use the concrete class so `.match` is the synchronous overload.
+    const m = new SubstringEgressMatcher();
+    const lineage = new Map<string, TrustOrigin>([["shortish", "subagent"]]);
+    // Under default floor → no hit.
+    expect(
+      m.match({
+        payload: "carries shortish inside",
+        lineage,
+        minMatchLength: MIN_MATCH_LENGTH,
+      }).matchCount,
+    ).toBe(0);
+    // With a low floor → hit.
+    expect(
+      m.match({
+        payload: "carries shortish inside",
+        lineage,
+        minMatchLength: 4,
+      }).matchCount,
+    ).toBe(1);
+  });
+});
+
+describe("classifyEgress with an injected matcher (FR-006)", () => {
+  test("uses the injected matcher's hits and folds policy over them", async () => {
+    const ctx = createRunContext();
+    // Populate lineage with content the SUBSTRING matcher would NOT find in
+    // the payload, proving the verdict came from the injected matcher.
+    ctx.dataLineage = new Map<string, TrustOrigin>([
+      ["paraphrased-and-reencoded original text", "subagent"],
+    ]);
+    const fakeMatcher: EgressMatcher = {
+      name: "fake-fixed",
+      match: (_input: EgressMatchInput): EgressMatchResult => ({
+        originsFound: ["subagent"],
+        matchCount: 1,
+      }),
+    };
+    const result = await classifyEgress("totally unrelated outbound bytes", ctx, {
+      sinkId: "fetch",
+      sinkScope: "external-configured", // subagent on configured → warn
+      matcher: fakeMatcher,
+    });
+    // The substring matcher would have returned pass (no verbatim overlap);
+    // the injected matcher's hit drives the warn verdict. This proves the
+    // policy fold is matcher-independent (acceptance #3).
+    expect(result.verdict).toBe("warn");
+    expect(result.originsFound).toEqual(["subagent"]);
+    expect(result.matchCount).toBe(1);
+  });
+
+  test("custom-matcher hits still respect per-origin/per-sink policy", async () => {
+    const ctx = createRunContext();
+    ctx.dataLineage = new Map<string, TrustOrigin>([["anything", "subagent"]]);
+    const subagentHit: EgressMatcher = {
+      name: "subagent-hit",
+      match: () => ({ originsFound: ["subagent"], matchCount: 1 }),
+    };
+    // Same matcher, same hit — warn on configured, block on dynamic. The
+    // outcome difference comes purely from sinkScope policy, not the matcher.
+    const configured = await classifyEgress("payload", ctx, {
+      sinkId: "fetch",
+      sinkScope: "external-configured",
+      matcher: subagentHit,
+      bypassCache: true,
+    });
+    const dynamic = await classifyEgress("payload", ctx, {
+      sinkId: "dyn",
+      sinkScope: "external-dynamic",
+      matcher: subagentHit,
+      bypassCache: true,
+    });
+    expect(configured.verdict).toBe("warn");
+    expect(dynamic.verdict).toBe("block");
+  });
+
+  test("an injected matcher may be async", async () => {
+    const ctx = createRunContext();
+    ctx.dataLineage = new Map<string, TrustOrigin>([["anything", "mcp"]]);
+    const asyncMatcher: EgressMatcher = {
+      name: "async-hit",
+      match: async () => {
+        await Promise.resolve();
+        return { originsFound: ["mcp"], matchCount: 2 };
+      },
+    };
+    const result = await classifyEgress("payload", ctx, {
+      sinkId: "fetch",
+      sinkScope: "external-dynamic", // mcp on dynamic → block
+      matcher: asyncMatcher,
+    });
+    expect(result.verdict).toBe("block");
+    expect(result.matchCount).toBe(2);
+  });
+
+  test("cache key namespaces by matcher name (no cross-serve)", async () => {
+    const ctx = createRunContext();
+    ctx.dataLineage = new Map<string, TrustOrigin>([["anything", "subagent"]]);
+    _clearEgressCache();
+    // Matcher A finds a hit → warn, and caches under name "A".
+    const matcherA: EgressMatcher = {
+      name: "matcher-A",
+      match: () => ({ originsFound: ["subagent"], matchCount: 1 }),
+    };
+    // Matcher B finds nothing → pass, under name "B". Same payload/sink.
+    const matcherB: EgressMatcher = {
+      name: "matcher-B",
+      match: () => ({ originsFound: [], matchCount: 0 }),
+    };
+    const a = await classifyEgress("same payload", ctx, {
+      sinkId: "fetch",
+      sinkScope: "external-configured",
+      matcher: matcherA,
+    });
+    const b = await classifyEgress("same payload", ctx, {
+      sinkId: "fetch",
+      sinkScope: "external-configured",
+      matcher: matcherB,
+    });
+    expect(a.verdict).toBe("warn");
+    expect(a.fromCache).toBe(false);
+    // If the cache did NOT namespace by matcher name, B would have served
+    // A's cached warn-hit. It must compute its own (pass) verdict instead.
+    expect(b.verdict).toBe("pass");
+    expect(b.fromCache).toBe(false);
+    expect(_cacheSize()).toBe(2); // two distinct keys, not one
+  });
+
+  test("re-running the same matcher does serve from cache", async () => {
+    const ctx = createRunContext();
+    ctx.dataLineage = new Map<string, TrustOrigin>([["anything", "subagent"]]);
+    _clearEgressCache();
+    const m: EgressMatcher = {
+      name: "stable",
+      match: () => ({ originsFound: ["subagent"], matchCount: 1 }),
+    };
+    const first = await classifyEgress("p", ctx, {
+      sinkId: "fetch",
+      sinkScope: "external-configured",
+      matcher: m,
+    });
+    const second = await classifyEgress("p", ctx, {
+      sinkId: "fetch",
+      sinkScope: "external-configured",
+      matcher: m,
+    });
+    expect(first.fromCache).toBe(false);
+    expect(second.fromCache).toBe(true);
+    expect(second.verdict).toBe("warn");
   });
 });

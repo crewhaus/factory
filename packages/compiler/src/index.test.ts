@@ -506,3 +506,98 @@ security: {}
     expect(ir.security).toBeUndefined();
   });
 });
+
+// FR-006 — Pillar 3 sink-side egress-matcher selector lowered into
+// ir.security.egressMatcher. This is the seam that closes the "flag parsed
+// but not threaded" gap: the run path reads ir.security.egressMatcher and
+// constructs the matcher, so a verbatim lowering assertion is the proof the
+// selector actually reaches generated/run code rather than being dropped.
+describe("lower — security.egressMatcher (Pillar 3 sink-side matcher, FR-006)", () => {
+  test("lowers egressMatcher: semantic verbatim into ir.security", () => {
+    const spec = parseSpec(`
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+security:
+  egressMatcher: semantic
+`);
+    const ir = lower(spec);
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect(ir.security).toEqual({ egressMatcher: "semantic" });
+  });
+
+  test("lowers egressMatcher: substring verbatim (the explicit default)", () => {
+    const spec = parseSpec(`
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+security:
+  egressMatcher: substring
+`);
+    const ir = lower(spec);
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect(ir.security).toEqual({ egressMatcher: "substring" });
+  });
+
+  test("a lone egressMatcher (no justification) still produces ir.security — the block is NOT dropped", () => {
+    // Regression guard for the old lowerSecurity early-return that bailed
+    // whenever justification was absent, which would have silently dropped a
+    // standalone egressMatcher selector.
+    const spec = parseSpec(`
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+security:
+  egressMatcher: semantic
+`);
+    const ir = lower(spec);
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect(ir.security).toBeDefined();
+    expect(ir.security?.egressMatcher).toBe("semantic");
+    expect("justification" in (ir.security ?? {})).toBe(false);
+  });
+
+  test("egressMatcher coexists with justification — both lower into the same block", () => {
+    const spec = parseSpec(`
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+security:
+  justification:
+    judge: claude
+    model: claude-haiku-4-5
+  egressMatcher: semantic
+`);
+    const ir = lower(spec);
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect(ir.security).toEqual({
+      justification: { judge: "claude", model: "claude-haiku-4-5" },
+      egressMatcher: "semantic",
+    });
+  });
+
+  test("absent egressMatcher leaves the field off ir.security (justification still lowers alone)", () => {
+    const spec = parseSpec(`
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+security:
+  justification:
+    judge: rule-based
+`);
+    const ir = lower(spec);
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect(ir.security).toEqual({ justification: { judge: "rule-based" } });
+    expect("egressMatcher" in (ir.security ?? {})).toBe(false);
+  });
+});

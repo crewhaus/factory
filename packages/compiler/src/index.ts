@@ -346,12 +346,16 @@ type SpecWithSecurity = {
       readonly judge: "rule-based" | "claude";
       readonly model?: string;
     };
+    readonly egressMatcher?: "substring" | "semantic";
   };
 };
 
 function lowerSecurity(spec: SpecWithSecurity): { security?: IrSecurity } {
   const s = spec.security;
   if (s === undefined) return {};
+  // FR-004 `justification` and FR-006 `egressMatcher` are independent
+  // optional sub-fields of the same `security` block: carry whichever is
+  // present. The block is dropped from the IR only when both are absent.
   const justification =
     s.justification !== undefined
       ? {
@@ -359,8 +363,14 @@ function lowerSecurity(spec: SpecWithSecurity): { security?: IrSecurity } {
           ...(s.justification.model !== undefined ? { model: s.justification.model } : {}),
         }
       : undefined;
-  if (justification === undefined) return {};
-  return { security: { justification } };
+  const egressMatcher = s.egressMatcher;
+  if (justification === undefined && egressMatcher === undefined) return {};
+  return {
+    security: {
+      ...(justification !== undefined ? { justification } : {}),
+      ...(egressMatcher !== undefined ? { egressMatcher } : {}),
+    },
+  };
 }
 
 /**

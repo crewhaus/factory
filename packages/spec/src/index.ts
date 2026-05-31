@@ -139,8 +139,9 @@ const compactionBlock = z
  * NOTE: `egressPolicy` is reserved — `OPTIMIZABLE_PATHS` also lists
  * `["security", "egressPolicy"]`, owned by the egress-fabric FRs
  * (FR-002/006). Do NOT add `egressPolicy` here; that would clobber their
- * sub-field. FR-004 adds `justification`; the egress-matcher selector
- * lands alongside it later as an independent optional sub-field.
+ * sub-field. FR-004 added `justification`; FR-006 added `egressMatcher`
+ * (the substring/semantic selector) alongside it — both are independent
+ * optional sub-fields of this same block.
  */
 const securityBlock = z
   .object({
@@ -151,6 +152,34 @@ const securityBlock = z
       })
       .strict()
       .optional(),
+    /**
+     * Pillar 3 sink-side fabric (FR-006) — select the egress-matching
+     * strategy. `"substring"` (the default when omitted) is the
+     * behavior-preserving `SubstringEgressMatcher` with `MIN_MATCH_LENGTH`.
+     * `"semantic"` selects the optional embedding-backed
+     * `@crewhaus/egress-matcher-semantic`, which scores outbound payloads
+     * against tagged data-lineage by cosine similarity. Switching the
+     * matcher changes *how* lineage matches are detected; the per-origin/
+     * per-sink policy and the three audit outcomes are unaffected.
+     *
+     * This field is lowered to `IrSecurity.egressMatcher` (FR-006) and
+     * honoured by the `crewhaus run` path, which resolves the selector and
+     * threads the matcher into `runChatLoop({ egressMatcher })` — exactly
+     * how `security.justification.judge` selects the intent-gate judge on
+     * the same path. `"semantic"` constructs the optional
+     * `@crewhaus/egress-matcher-semantic` (with an injected embedder; see
+     * `--egress-embedder`). The runtime SEAM
+     * (`RunChatLoopOptions.egressMatcher`) underlies both.
+     *
+     * NOTE: the *generated cli bundle* does not yet construct the matcher
+     * from this field (the `target-cli` emitter, like the justification
+     * judge, leaves it to the run path); emitting the selection into a
+     * standalone bundle is the remaining FR-006 follow-up. `crewhaus
+     * compile` warns when `egressMatcher: semantic` is set so a
+     * bundle-only user is not misled into thinking the emitted artifact
+     * carries it.
+     */
+    egressMatcher: z.enum(["substring", "semantic"]).optional(),
   })
   .strict()
   .optional();

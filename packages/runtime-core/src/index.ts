@@ -16,7 +16,12 @@ import type {
 import { type WrappedAdapter, wrap as wrapWithCircuitBreaker } from "@crewhaus/circuit-breaker";
 import { autoCompact } from "@crewhaus/compaction-autocompact";
 import { snip } from "@crewhaus/compaction-snip";
-import { type EgressVerdict, classifyEgress, summarizeEgress } from "@crewhaus/egress-classifier";
+import {
+  type EgressMatcher,
+  type EgressVerdict,
+  classifyEgress,
+  summarizeEgress,
+} from "@crewhaus/egress-classifier";
 import { RuntimeError } from "@crewhaus/errors";
 import { type EventKind, type EventLog, openEventLog } from "@crewhaus/event-log";
 import { type HookDef, type HookEvent, aggregateDecisions, runHooks } from "@crewhaus/hooks-engine";
@@ -411,6 +416,19 @@ export type RunChatLoopOptions = {
    * `.crewhaus/audit`.
    */
   justificationAuditSink?: JustificationAuditSink;
+  /**
+   * Pillar 3 sink-side fabric (FR-006) — pluggable egress-matching
+   * strategy. When supplied, every external-scope tool call routes its
+   * payload through this matcher inside `classifyEgress` instead of the
+   * built-in `SubstringEgressMatcher`. The matcher only decides *which*
+   * tagged data-lineage entries the payload contains; the per-origin/
+   * per-sink policy and the three audit outcomes (`egress-passed |
+   * egress-warned | egress-blocked`) are unchanged. Omitting it preserves
+   * the substring default (zero behaviour change for existing callers).
+   * Production deployments that opt into semantic detection pass an
+   * instance of `@crewhaus/egress-matcher-semantic`.
+   */
+  egressMatcher?: EgressMatcher;
   /**
    * Section 27 — wrap the resolved primary `ProviderAdapter` in a circuit
    * breaker before any `stream()` call. When the breaker trips, subsequent
@@ -1001,6 +1019,11 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       const egress = await classifyEgress(payload, runContext, {
         sinkId: tu.name,
         sinkScope: "external-configured",
+        // FR-006: forward the caller-selected matcher when present. Absent
+        // (every existing caller) → classifyEgress defaults to the
+        // substring matcher, so the scope gate / sinkScope / policy fold
+        // below are byte-for-byte unchanged.
+        ...(opts.egressMatcher !== undefined ? { matcher: opts.egressMatcher } : {}),
       });
       const egressOutcome =
         egress.verdict === "pass"
