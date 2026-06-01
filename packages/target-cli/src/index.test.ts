@@ -33,7 +33,15 @@ describe("emitCli — bundle shape", () => {
 
   test("the IR name is embedded in the source-spec comment", () => {
     const content = emitCli(baseIr({ name: "my-bot" })).files[0]?.content ?? "";
-    expect(content).toContain("Source spec: my-bot");
+    expect(content).toContain('Source spec: "my-bot"');
+  });
+
+  test("a newline in the spec name cannot break out of the source-spec comment (#147)", () => {
+    const evil = "evil\nglobalThis.__PWNED__ = 1";
+    const content = emitCli(baseIr({ name: evil })).files[0]?.content ?? "";
+    const header = content.split("\n").find((l) => l.includes("Source spec:")) ?? "";
+    expect(header).toContain("\\n"); // the newline is escaped inside the comment
+    expect(content).not.toContain("\nglobalThis.__PWNED__ = 1"); // never emitted as live code
   });
 
   test("the model and instructions are escaped + embedded in the runChatLoop call", () => {
