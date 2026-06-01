@@ -144,7 +144,76 @@ The browser target launches a headless Chromium via [Playwright](https://playwri
 
 Same agent. Different runtimes. Only `target:` changed.
 
-Richer target shapes carry their own config block — `channels:` + `routing:` for a Slack bot, `dataset:` + `graders:` for an eval, `retrieve:` + `indexing:` for a RAG pipeline, `queue:` for a batch worker, `voice:` for a realtime agent — but the `agent:` block stays the same across all of them.
+## Example: tools and richer shapes
+
+The example above needs no tools. Most real agents do — and tools come from two places. **Built-in tools** go in a `tools:` list (`read`, `write`, `edit`, `bash`, `grep`, `webFetch`, `webSearch`, …). **MCP server tools** are auto-discovered: declare the server under `mcp_servers:` and every tool it exposes is registered for you — you never list them by hand.
+
+```yaml
+# triage.yaml — a CLI agent backed by a GitHub MCP server
+name: github-issue-triage
+target: cli
+agent:
+  model: claude-sonnet-4-6
+  instructions: |
+    You triage GitHub issues by reading them and assigning labels.
+mcp_servers:
+  github:
+    transport: stdio
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-github"]
+    env:
+      GITHUB_PERSONAL_ACCESS_TOKEN: $GITHUB_TOKEN
+```
+
+Richer shapes keep that same `agent:` (and `mcp_servers:`) block and layer their own config on top — only `target:` and the shape-specific block change. The same triage agent becomes a Slack bot, or an eval graded against a labeled dataset:
+
+```yaml
+# slack.yaml — same agent, dispatched as a Slack bot
+name: github-issue-triage
+target: channel
+agent:
+  model: claude-sonnet-4-6
+  instructions: |
+    You triage GitHub issues by reading them and assigning labels.
+mcp_servers:
+  github:
+    transport: stdio
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-github"]
+    env:
+      GITHUB_PERSONAL_ACCESS_TOKEN: $GITHUB_TOKEN
+channels:
+  slack:
+    botToken: $SLACK_BOT_TOKEN
+    signingSecret: $SLACK_SIGNING_SECRET
+routing:
+  sessionKey: thread
+```
+
+```yaml
+# eval.yaml — same agent, graded against a labeled dataset
+name: github-issue-triage
+target: eval
+agent:
+  model: claude-sonnet-4-6
+  instructions: |
+    You triage GitHub issues by reading them and assigning labels.
+dataset:
+  name: triage-cases
+  version: v1
+  split: dev
+graders:
+  - name: exact_match
+concurrency: 4
+```
+
+```bash
+crewhaus compile triage.yaml -o build/cli     # CLI agent with GitHub MCP tools
+crewhaus compile slack.yaml  -o build/slack   # Slack bot
+crewhaus compile eval.yaml   -o build/eval    # eval bundle
+```
+
+Other shapes follow the same rule — `retrieve:` + `indexing:` for a RAG pipeline, `queue:` for a batch worker, `voice:` for a realtime agent — but the `agent:` block stays identical across all of them.
 
 ## Documentation
 
