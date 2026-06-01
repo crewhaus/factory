@@ -30,6 +30,7 @@
     "@crewhaus/egress-classifier": "workspace:*",
     "@crewhaus/egress-matcher-semantic": "workspace:*",
     "@crewhaus/embedder": "workspace:*",
+    "@crewhaus/errors": "workspace:*",
     "@crewhaus/eval-dataset": "workspace:*",
     "@crewhaus/eval-grader": "workspace:*",
     "@crewhaus/eval-report": "workspace:*",

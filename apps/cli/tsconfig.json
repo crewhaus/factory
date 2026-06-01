@@ -22,6 +22,7 @@
     { "path": "../../packages/egress-classifier" },
     { "path": "../../packages/egress-matcher-semantic" },
     { "path": "../../packages/embedder" },
+    { "path": "../../packages/errors" },
     { "path": "../../packages/eval-dataset" },
     { "path": "../../packages/eval-grader" },
     { "path": "../../packages/eval-report" },

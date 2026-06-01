@@ -4,6 +4,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import type { SubAgentDefinition } from "@crewhaus/agent-context-isolation";
 import { SpecParseError, compile, lower } from "@crewhaus/compiler";
 import { buildContextBundle, discoverRoots } from "@crewhaus/context-bundle";
+import { CrewhausError } from "@crewhaus/errors";
 import { loadDataset } from "@crewhaus/eval-dataset";
 import { parseGradersConfig } from "@crewhaus/eval-grader";
 import { optimizeSpec } from "@crewhaus/eval-optimizer-orchestrator";
@@ -452,7 +453,15 @@ async function runCompile(args: ParsedArgs): Promise<void> {
   try {
     bundle = compile(yamlText);
   } catch (err) {
-    if (err instanceof SpecParseError) {
+    // compile() runs parse → lower → emit. parseSpec throws SpecParseError;
+    // each target emitter throws its own TargetEmitError (e.g. an unresolvable
+    // tool name once the default-on scope gate has been bypassed with
+    // --allow-unmarked-sinks). Both — like every structured failure in this
+    // pipeline — extend CrewhausError, so route the whole family through die()
+    // for a clean one-line error + exit 1 instead of letting the emitter crash
+    // escape as an uncaught stack trace. A non-CrewhausError (a genuine bug)
+    // still propagates with its full stack for debugging.
+    if (err instanceof CrewhausError) {
       die(err.message);
     }
     throw err;
