@@ -75,7 +75,7 @@ function renderNodeBody(node: IrGraphNode): string {
     node.hitlPrompt !== undefined
       ? `
       const __decision = await ctx.requestApproval(${escapeJsonString(node.hitlPrompt)});
-      __next.${node.name}_decision = __decision;`
+      __next[${nameJs} + "_decision"] = __decision;`
       : "";
   return `
     async (ctx, prev) => {
@@ -91,7 +91,7 @@ function renderNodeBody(node: IrGraphNode): string {
         singleTurn: true,
         runContext: ctx.runContext,
       });
-      const __next = { ...prev, ${node.name}: __reply };${hitlBlock}
+      const __next = { ...prev, [${nameJs}]: __reply };${hitlBlock}
       return __next;
     }`;
 }
