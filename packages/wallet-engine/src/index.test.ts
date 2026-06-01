@@ -110,6 +110,67 @@ describe("createWalletEngine — policy enforcement", () => {
     ).rejects.toThrow(/uniswap-router/);
   });
 
+  test("rejects when tx.to does not match the bound contract address (#151)", async () => {
+    const we = createWalletEngine({
+      resolveAdapter: () => fakeAdapter(() => "0x"),
+      approve: async () => "allow",
+    });
+    we.registerCustody(createLocalSignerStub());
+    const policy: TransactionPolicy = { ...POLICY, contractAddresses: { usdc: "0xusdc" } };
+    const tx: UnsignedTx = { ...TX_OK, to: "0xattacker" };
+    await expect(we.requestSignAndBroadcast({ tx, policy, wallet: WALLET })).rejects.toThrow(
+      /does not match the address/,
+    );
+  });
+
+  test("rejects when tx value exceeds maxValueWei (#152)", async () => {
+    const we = createWalletEngine({
+      resolveAdapter: () => fakeAdapter(() => "0x"),
+      approve: async () => "allow",
+    });
+    we.registerCustody(createLocalSignerStub());
+    const policy: TransactionPolicy = { ...POLICY, maxValueWei: "0x10" };
+    const tx: UnsignedTx = { ...TX_OK, value: "0x20" };
+    await expect(we.requestSignAndBroadcast({ tx, policy, wallet: WALLET })).rejects.toThrow(
+      /exceeds transaction_policy\.maxValueWei/,
+    );
+  });
+
+  test("fails closed when maxValueUsd is set without a price oracle (#152)", async () => {
+    const we = createWalletEngine({
+      resolveAdapter: () => fakeAdapter(() => "0x"),
+      approve: async () => "allow",
+    });
+    we.registerCustody(createLocalSignerStub());
+    const policy: TransactionPolicy = { ...POLICY, maxValueUsd: 100 };
+    await expect(we.requestSignAndBroadcast({ tx: TX_OK, policy, wallet: WALLET })).rejects.toThrow(
+      /price oracle/,
+    );
+  });
+
+  test("allows a case-insensitive address match with value under maxValueWei (#151, #152)", async () => {
+    const we = createWalletEngine({
+      resolveAdapter: () =>
+        fakeAdapter((method) => {
+          if (method === "eth_call") return "0x";
+          if (method === "eth_estimateGas") return "0x5208";
+          if (method === "eth_getTransactionReceipt")
+            return { blockNumber: "0x100", status: "0x1" };
+          return null;
+        }),
+      approve: async () => "allow",
+    });
+    we.registerCustody(createLocalSignerStub());
+    const policy: TransactionPolicy = {
+      ...POLICY,
+      contractAddresses: { usdc: "0xUSDC" }, // checksum/case differs from TX_OK.to "0xusdc"
+      maxValueWei: "0x100",
+    };
+    const tx: UnsignedTx = { ...TX_OK, value: "0x10" };
+    const receipt = await we.requestSignAndBroadcast({ tx, policy, wallet: WALLET });
+    expect(receipt.status).toBe("0x1");
+  });
+
   test("rejects approval='none' with non-automated wallet", async () => {
     const we = createWalletEngine({
       resolveAdapter: () => fakeAdapter(() => "0x"),
