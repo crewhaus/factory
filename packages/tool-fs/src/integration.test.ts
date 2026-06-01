@@ -5,7 +5,7 @@
  * isError:true and a permission-flavored message.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
@@ -105,5 +105,81 @@ describe("integration: tool-fs through executeTool", () => {
     expect(result.isError).toBe(false);
     if (typeof result.content !== "string") throw new Error("expected string content");
     expect(result.content.split("\n").sort()).toEqual(["a.md", "b.md"]);
+  });
+});
+
+// Regression — issue #149 (CWE-59). The lexical check blocks `../` escapes,
+// but an in-root symlink whose target is outside the workspace also escapes.
+// These plant such symlinks and assert every path-taking tool rejects them.
+describe("integration: tool-fs symlink containment (#149)", () => {
+  test("Read through an in-root symlink to an out-of-root file is rejected", async () => {
+    const outside = mkdtempSync(path.join(tmpdir(), "tool-fs-outside-"));
+    try {
+      await writeFile(path.join(outside, "secret.txt"), "TOPSECRET");
+      symlinkSync(path.join(outside, "secret.txt"), path.join(tmp, "link.txt"));
+      const r = await executeTool(lookup("Read"), { path: "link.txt" }, { toolUseId: "sl1" });
+      expect(r.isError).toBe(true);
+      expect(r.content).toMatch(/escapes the workspace root|rejected path/);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test("Write through an in-root symlinked directory to outside is rejected", async () => {
+    const outside = mkdtempSync(path.join(tmpdir(), "tool-fs-outside-"));
+    try {
+      symlinkSync(outside, path.join(tmp, "escape"));
+      const w = await executeTool(
+        lookup("Write"),
+        { path: "escape/evil.txt", content: "x" },
+        { toolUseId: "sl2" },
+      );
+      expect(w.isError).toBe(true);
+      expect(w.content).toMatch(/escapes the workspace root|rejected path/);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test("Edit through an in-root symlink to an out-of-root file is rejected", async () => {
+    const outside = mkdtempSync(path.join(tmpdir(), "tool-fs-outside-"));
+    try {
+      await writeFile(path.join(outside, "target.txt"), "aaa");
+      symlinkSync(path.join(outside, "target.txt"), path.join(tmp, "elink.txt"));
+      const r = await executeTool(
+        lookup("Edit"),
+        { path: "elink.txt", oldString: "aaa", newString: "bbb" },
+        { toolUseId: "sl3" },
+      );
+      expect(r.isError).toBe(true);
+      expect(r.content).toMatch(/escapes the workspace root|rejected path/);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test("Grep with a base path that escapes via symlink is rejected", async () => {
+    const outside = mkdtempSync(path.join(tmpdir(), "tool-fs-outside-"));
+    try {
+      await writeFile(path.join(outside, "f.txt"), "needle");
+      symlinkSync(outside, path.join(tmp, "glink"));
+      const r = await executeTool(
+        lookup("Grep"),
+        { pattern: "needle", path: "glink" },
+        { toolUseId: "sl4" },
+      );
+      expect(r.isError).toBe(true);
+      expect(r.content).toMatch(/escapes the workspace root|rejected path/);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test("an in-root symlink to an in-root file still works (no over-blocking)", async () => {
+    await writeFile(path.join(tmp, "real.txt"), "hello");
+    symlinkSync(path.join(tmp, "real.txt"), path.join(tmp, "good-link.txt"));
+    const r = await executeTool(lookup("Read"), { path: "good-link.txt" }, { toolUseId: "sl5" });
+    expect(r.isError).toBe(false);
+    expect(r.content).toBe("hello");
   });
 });

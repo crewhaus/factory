@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import { existsSync, realpathSync } from "node:fs";
 import { rename, unlink } from "node:fs/promises";
 import * as path from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
@@ -10,7 +11,8 @@ import { renderEditDiff } from "./diff";
 /**
  * Built-in filesystem tools, sandboxed to the process's current working
  * directory. Every path argument is resolved relative to `process.cwd()` and
- * rejected if it escapes outside via `..` or absolute prefixes.
+ * rejected if it escapes outside via `..`, absolute prefixes, or symlinks
+ * whose real target lies outside the root.
  *
  * Layer R4 (built-in tools). Pairs with the `target-cli` codegen contract,
  * which imports each lowercase variable (`read`, `write`, ...) by name.
@@ -34,7 +36,32 @@ export class ToolPermissionError extends CrewhausError {
 function resolveSafe(toolName: string, rel: string, root: string = process.cwd()): string {
   const rootResolved = path.resolve(root);
   const abs = path.resolve(rootResolved, rel);
+  // 1) Lexical containment — fast path; rejects `..` and absolute escapes.
+  //    The trailing `path.sep` avoids the `/root` vs `/root-sibling` pitfall.
   if (abs !== rootResolved && !abs.startsWith(`${rootResolved}${path.sep}`)) {
+    throw new ToolPermissionError(toolName, rel);
+  }
+  // 2) Symlink-aware containment (CWE-59). The lexical check above is fooled
+  //    by an in-root symlink that points outside the workspace, so re-check
+  //    the REAL path. The leaf may not exist yet (Write/Edit create it), so
+  //    resolve the deepest existing ancestor and re-append the missing tail.
+  //    Fails closed if realpath errors for any reason other than the walk.
+  try {
+    const rootReal = realpathSync(rootResolved);
+    let probe = abs;
+    const tail: string[] = [];
+    while (!existsSync(probe)) {
+      tail.unshift(path.basename(probe));
+      const parent = path.dirname(probe);
+      if (parent === probe) break; // reached the filesystem root
+      probe = parent;
+    }
+    const real = tail.length > 0 ? path.join(realpathSync(probe), ...tail) : realpathSync(probe);
+    if (real !== rootReal && !real.startsWith(`${rootReal}${path.sep}`)) {
+      throw new ToolPermissionError(toolName, rel);
+    }
+  } catch (err) {
+    if (err instanceof ToolPermissionError) throw err;
     throw new ToolPermissionError(toolName, rel);
   }
   return abs;
