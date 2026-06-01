@@ -13,7 +13,8 @@
   },
   "dependencies": {
     "@crewhaus/errors": "workspace:*",
-    "@crewhaus/prompt-optimizer": "workspace:*"
+    "@crewhaus/prompt-optimizer": "workspace:*",
+    "@crewhaus/sandbox": "workspace:*"
   },
   "license": "Apache-2.0",
   "author": {

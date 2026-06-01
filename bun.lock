@@ -1746,6 +1746,7 @@
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/prompt-optimizer": "workspace:*",
+        "@crewhaus/sandbox": "workspace:*",
       },
     },
     "packages/tool-image": {
