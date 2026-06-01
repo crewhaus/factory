@@ -135,14 +135,17 @@ export type IrSecurity = {
     readonly model?: string;
   };
   /**
-   * Pillar 3 sink-side fabric (FR-006) — the egress-matching strategy the
-   * run path selects. `"substring"` is the behavior-preserving
-   * `SubstringEgressMatcher` (`MIN_MATCH_LENGTH`); `"semantic"` selects the
-   * optional embedding-backed `@crewhaus/egress-matcher-semantic`. Lowered
-   * from `spec.security.egressMatcher`. Absent when the spec omits it, in
-   * which case the runtime stays on the substring default. Only changes
-   * *how* lineage matches are detected — the per-origin/per-sink policy and
-   * the three audit outcomes (`egress-passed | egress-warned |
+   * Pillar 3 sink-side fabric (FR-006) — the egress-matching strategy.
+   * `"substring"` is the behavior-preserving `SubstringEgressMatcher`
+   * (`MIN_MATCH_LENGTH`); `"semantic"` selects the optional embedding-backed
+   * `@crewhaus/egress-matcher-semantic`. Lowered from
+   * `spec.security.egressMatcher`. Absent when the spec omits it, in which
+   * case the runtime stays on the substring default. Honoured on BOTH paths:
+   * the `crewhaus run` interpreter resolves it into
+   * `runChatLoop({ egressMatcher })`, and `@crewhaus/target-cli` emits the
+   * same matcher construction into the standalone compiled bundle. Only
+   * changes *how* lineage matches are detected — the per-origin/per-sink
+   * policy and the three audit outcomes (`egress-passed | egress-warned |
    * egress-blocked`) are matcher-independent and live in `classifyEgress`,
    * not here.
    */
