@@ -495,6 +495,17 @@ export function resolveSessionRootDir(optsRoot: string | undefined): string | un
   return process.env["CREWHAUS_SESSION_DIR"] ?? undefined;
 }
 
+/**
+ * Tenant-scoped root for the tool-result spill store, mirroring
+ * resolveSessionRootDir (#150). Inside a tenant scope the tenant's rebased
+ * `toolResultRoot` is used so one tenant's persisted tool outputs never share
+ * a directory with another's; otherwise `undefined` lets tool-result-store
+ * apply its own non-tenant default.
+ */
+export function resolveToolResultRoot(): string | undefined {
+  return currentTenantContext()?.tenant.toolResultRoot;
+}
+
 export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // Section 17 — resolve the primary adapter via the model-router.
   // The router lazy-loads the matching provider package; an
@@ -1127,9 +1138,14 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         );
       },
     });
+    const toolResultRoot = resolveToolResultRoot();
     const stored = await storeAndPreview(
       { toolUseId: raw.toolUseId, content: raw.content, isError: raw.isError },
-      { runId: runContext.runId, toolUseId: tu.id },
+      {
+        runId: runContext.runId,
+        toolUseId: tu.id,
+        ...(toolResultRoot !== undefined ? { rootDir: toolResultRoot } : {}),
+      },
     );
     if (stored.persisted) {
       runContext.logger.info("tool result persisted", {

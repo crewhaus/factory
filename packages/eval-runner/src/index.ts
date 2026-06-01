@@ -28,6 +28,7 @@ import type { CompiledGrader, Grader } from "@crewhaus/eval-grader";
 import { createJudgeGrader, loadRubric } from "@crewhaus/eval-judge";
 import type { IrV0 } from "@crewhaus/ir";
 import { runChatLoop } from "@crewhaus/runtime-core";
+import { currentTenantContext } from "@crewhaus/tenancy";
 import { aggregate } from "./aggregate";
 import { RunnerError } from "./errors";
 import { runSample } from "./run-sample";
@@ -60,6 +61,20 @@ export type RunEvalArgs = {
 };
 
 /**
+ * Resolve the eval output directory. When an eval runs inside a tenant scope
+ * (e.g. a cloud/managed eval), the tenant's rebased `evalRoot` is used so one
+ * tenant's eval artifacts never share a directory with another's; the global
+ * default is only used outside any tenant scope (#150). An explicit
+ * `optsOutDir` always wins for trusted callers.
+ */
+export function resolveEvalOutDir(runId: string, optsOutDir?: string): string {
+  if (optsOutDir !== undefined) return optsOutDir;
+  const tenant = currentTenantContext()?.tenant;
+  if (tenant !== undefined) return join(tenant.evalRoot, runId);
+  return join(".crewhaus", "evals", runId);
+}
+
+/**
  * Execute an evaluation. Returns a summary; per-sample artifacts and
  * the summary itself are also persisted under `outDir`.
  */
@@ -68,7 +83,7 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
   const opts = args.opts ?? {};
 
   const runId = opts.runId ?? generateRunId();
-  const outDir = opts.outDir ?? join(".crewhaus", "evals", runId);
+  const outDir = resolveEvalOutDir(runId, opts.outDir);
   mkdirSync(outDir, { recursive: true });
 
   // Resolve graders. Replace any `llm_judge` placeholder with a real judge

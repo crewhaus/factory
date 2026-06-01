@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { buildTenant, withTenant } from "@crewhaus/tenancy";
-import { resolveSessionRootDir } from "./index";
+import { resolveSessionRootDir, resolveToolResultRoot } from "./index";
 
 // Regression — issue #142 (CWE-1230). The managed daemon wraps every gateway
 // request in `withTenant(...)`; runtime-core must resolve its session/event-log
@@ -58,5 +58,23 @@ describe("resolveSessionRootDir — tenant isolation (#142)", () => {
     const a = buildTenant("tenant-a", { tenantsRoot: "/tmp/ch-tenant-test" });
     const root = withTenant(a, () => resolveSessionRootDir("/tmp/explicit")) as string;
     expect(root).toBe("/tmp/explicit");
+  });
+});
+
+// Regression — issue #150 (CWE-1230). The tool-result spill store must be
+// rebased per tenant too, not just the session store.
+describe("resolveToolResultRoot — tenant isolation (#150)", () => {
+  test("each tenant resolves to its own toolResultRoot, disjoint", () => {
+    const a = buildTenant("tenant-a", { tenantsRoot: "/tmp/ch-tenant-test" });
+    const b = buildTenant("tenant-b", { tenantsRoot: "/tmp/ch-tenant-test" });
+    const rootA = withTenant(a, () => resolveToolResultRoot()) as string;
+    const rootB = withTenant(b, () => resolveToolResultRoot()) as string;
+    expect(rootA).toBe(a.toolResultRoot);
+    expect(rootB).toBe(b.toolResultRoot);
+    expect(rootA).not.toBe(rootB);
+  });
+
+  test("outside a tenant scope, returns undefined (tool-result-store default applies)", () => {
+    expect(resolveToolResultRoot()).toBeUndefined();
   });
 });

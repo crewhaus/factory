@@ -30,6 +30,7 @@
     "@crewhaus/slash-commands": "workspace:*",
     "@crewhaus/spec": "workspace:*",
     "@crewhaus/sub-agent-spawner": "workspace:*",
+    "@crewhaus/tenancy": "workspace:*",
     "@crewhaus/tool-bash": "workspace:*",
     "@crewhaus/tool-catalog": "workspace:*",
     "@crewhaus/tool-fetch": "workspace:*",
