@@ -19,6 +19,7 @@ import { snip } from "@crewhaus/compaction-snip";
 import {
   type EgressMatcher,
   type EgressVerdict,
+  type SinkScope,
   classifyEgress,
   summarizeEgress,
 } from "@crewhaus/egress-classifier";
@@ -431,6 +432,14 @@ export type RunChatLoopOptions = {
    */
   egressMatcher?: EgressMatcher;
   /**
+   * Pillar 3 sink-side — classify a tool sink as `"external-configured"` (a
+   * spec-declared sink → warn on non-user content) or `"external-dynamic"` (a
+   * runtime-joined sink → block on non-user content). Defaults to treating
+   * `mcp__*` sinks as dynamic and everything else as configured (#144); wire
+   * this to mark federation-joined or other runtime-discovered sinks dynamic.
+   */
+  resolveSinkScope?: (toolName: string) => SinkScope;
+  /**
    * Section 27 — wrap the resolved primary `ProviderAdapter` in a circuit
    * breaker before any `stream()` call. When the breaker trips, subsequent
    * model calls reject immediately rather than hammering a degraded
@@ -504,6 +513,18 @@ export function resolveSessionRootDir(optsRoot: string | undefined): string | un
  */
 export function resolveToolResultRoot(): string | undefined {
   return currentTenantContext()?.tenant.toolResultRoot;
+}
+
+/**
+ * Default egress sink-scope. Runtime-joined MCP sinks (`mcp__*`) are the
+ * canonical dynamically-discovered external sink, so classify them as
+ * `"external-dynamic"` — this makes the egress block tier reachable for
+ * non-user-origin payloads (#144). Spec-declared built-in sinks stay
+ * `"external-configured"` (warn). Override via `runChatLoop({ resolveSinkScope })`
+ * to mark federation-joined or other runtime sinks dynamic too.
+ */
+export function defaultSinkScope(toolName: string): SinkScope {
+  return toolName.startsWith("mcp__") ? "external-dynamic" : "external-configured";
 }
 
 export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
@@ -1044,16 +1065,17 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     // tagged from a non-`"user"` origin and policy disallows transmission;
     // we deny the call before it fires. `warn` logs but proceeds.
     //
-    // The runtime treats every external tool as `"external-configured"`
-    // (the spec listed it). Dynamically-discovered sinks (an MCP server
-    // the agent loaded mid-session) should use `"external-dynamic"` to
-    // get stricter default policy; that wiring lives in `tool-mcp`'s
-    // dynamic-tool path and is a v0.3.x follow-up.
+    // Resolve the sink-scope so the egress block tier is actually reachable
+    // (#144): runtime-joined MCP sinks default to `"external-dynamic"` (block
+    // non-user-origin content), while spec-declared sinks stay
+    // `"external-configured"` (warn). Callers can override via
+    // `opts.resolveSinkScope` to mark federation-joined or other dynamic sinks.
     if (tool.scope === "external") {
       const payload = JSON.stringify(tu.input ?? null);
+      const sinkScope = (opts.resolveSinkScope ?? defaultSinkScope)(tu.name);
       const egress = await classifyEgress(payload, runContext, {
         sinkId: tu.name,
-        sinkScope: "external-configured",
+        sinkScope,
         // FR-006: forward the caller-selected matcher when present. Absent
         // (every existing caller) → classifyEgress defaults to the
         // substring matcher, so the scope gate / sinkScope / policy fold

