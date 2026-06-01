@@ -217,7 +217,18 @@ export async function discoverSkills(opts: DiscoverSkillsOptions = {}): Promise<
       byName.set(ref.name, ref);
     }
   }
-  return [...byName.values()];
+  // Pillar 3 boundary site — `formatSkillsForPrompt` and the `Skill` tool
+  // surface each skill's `name` + `description` verbatim in the system prompt,
+  // so classify the frontmatter at discovery (origin "skill") and drop any
+  // skill whose metadata is malicious before it can reach the prompt (#154).
+  // The body is separately classified in `loadSkillBody`.
+  const safe: SkillRef[] = [];
+  for (const ref of byName.values()) {
+    const verdict = await classifyBoundary(`${ref.name}: ${ref.description}`, { origin: "skill" });
+    if (verdict.action === "redact") continue;
+    safe.push(ref);
+  }
+  return safe;
 }
 
 function readSkillsUnder(root: string): SkillRef[] {
