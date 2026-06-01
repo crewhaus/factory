@@ -85,10 +85,19 @@ const COMPILE_SCHEMA: ParseArgsSchema = {
   flags: [
     { name: "out", short: "o", takesValue: true },
     { name: "emit-ir", takesValue: false },
-    // FR-002 — fail the build when an outward-reaching tool is left at a
-    // non-"external" scope. Opt-in for now; slated to become the default in
-    // a later minor (see whitepaper §6).
+    // FR-002 — the strict scope gate (fail the build when an outward-reaching
+    // tool is left at a non-"external" scope) now runs by DEFAULT on every
+    // compile. `--strict` is retained as an accepted no-op so existing
+    // invocations and CI scripts keep working; the gate fires with or without
+    // it (see whitepaper §6).
     { name: "strict", takesValue: false },
+    // FR-002 — explicit opt-out for users who knowingly bypass the gate (e.g.
+    // an outward sink whose external scope is verified out of band). Either
+    // spelling disables the gate; both are accepted so neither reach is a
+    // surprise. Without one of these flags an unmarked outward/io-capable tool
+    // FAILS the compile.
+    { name: "allow-unmarked-sinks", takesValue: false },
+    { name: "no-strict-scope", takesValue: false },
     { name: "help", short: "h" },
   ],
 };
@@ -286,7 +295,8 @@ function usage(): never {
       "",
       "subcommands:",
       "  compile <spec.yaml> -o <out-dir>     compile a spec to a runnable bundle",
-      "                  [--strict]           fail if an outward tool is left non-external (FR-002)",
+      "                                       (fails if an outward tool is left non-external — FR-002)",
+      "                  [--allow-unmarked-sinks]  opt out of the external-sink scope gate",
       "  compile <spec.yaml> --emit-ir        print the lowered IR as JSON (debug)",
       "  run <spec.yaml> [--model <model>]    compile in-memory and execute the agent",
       "                  [--resume <id>]      resume a specific session (cli targets only)",
@@ -347,66 +357,47 @@ function parseFor(rest: ReadonlyArray<string>, schema: ParseArgsSchema): ParsedA
   }
 }
 
-/**
- * FR-006 — emit a `compile` warning when the spec selects the semantic egress
- * matcher (`security.egressMatcher: semantic`). The selector lowers to
- * `ir.security.egressMatcher` and the `crewhaus run` path constructs the
- * matcher from it, but the `target-cli` emitter does not yet construct it in
- * the generated bundle (the same shape as `security.justification.judge`).
- * Without this warning a bundle-only user could set `semantic` and silently
- * get the substring default in the emitted artifact — the "flag parsed but
- * not threaded" trap. Lowering is pure and cheap; parse failures are surfaced
- * by the emit branches, so they are swallowed here.
- */
-function warnDeferredEgressMatcher(yamlText: string): void {
-  let ir: ReturnType<typeof lower>;
-  try {
-    ir = lower(parseSpec(yamlText));
-  } catch {
-    return;
-  }
-  if (ir.target !== "cli") return;
-  if (ir.security?.egressMatcher === "semantic") {
-    process.stderr.write(
-      'crewhaus: [warn] security.egressMatcher: "semantic" is honoured by `crewhaus run` ' +
-        "(it constructs @crewhaus/egress-matcher-semantic with an injected embedder), but the " +
-        "generated cli bundle does not yet construct it — the emitted artifact runs the substring " +
-        "matcher. Emitting the semantic selection into a standalone bundle is the remaining FR-006 " +
-        "follow-up. Run the spec with `crewhaus run` to use the semantic matcher today.\n",
-    );
-  }
-}
-
 async function runCompile(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
-      "usage: crewhaus compile <spec.yaml> [-o <out-dir>] [--emit-ir] [--strict]\n" +
+      "usage: crewhaus compile <spec.yaml> [-o <out-dir>] [--emit-ir]\n" +
+        "                        [--allow-unmarked-sinks]\n" +
         "  --emit-ir  Skip code emission; print the lowered IR as JSON to\n" +
         "             stdout (or to <out-dir>/ir.json when -o is set).\n" +
-        "  --strict   FR-002 — fail the build (exit 1) if any I/O-capable tool\n" +
-        '             the spec uses is left at a non-"external" scope. Flags:\n' +
-        "             (a) a resolvable built-in whose declared io-capability or\n" +
-        "                 outward name disagrees with its scope;\n" +
-        "             (b) an outward-by-name sink — any mcp__* tool or known\n" +
-        "                 outward built-in — that cannot be resolved to a\n" +
-        '                 scope:"external" tool offline (its egress scope is\n' +
-        "                 unverifiable at compile time, so --strict refuses it).\n" +
-        "             A non-outward custom tool whose name carries no signal is\n" +
-        "             left to the live `doctor --philosophy-alignment` audit /\n" +
-        "             runtime egress fabric. Opt-in today; slated to become the\n" +
-        "             default in a later minor.\n",
+        "\n" +
+        "  FR-002 — the strict scope gate runs by DEFAULT: the build fails\n" +
+        "  (exit 1) if any I/O-capable tool the spec uses is left at a\n" +
+        '  non-"external" scope. It flags:\n' +
+        "    (a) a resolvable built-in whose declared io-capability or\n" +
+        "        outward name disagrees with its scope;\n" +
+        "    (b) an outward-by-name sink — any mcp__* tool or known outward\n" +
+        '        built-in — that cannot be resolved to a scope:"external"\n' +
+        "        tool offline (its egress scope is unverifiable at compile\n" +
+        "        time, so the gate refuses it).\n" +
+        "  A non-outward custom tool whose name carries no signal is left to\n" +
+        "  the live `doctor --philosophy-alignment` audit / runtime egress\n" +
+        "  fabric.\n" +
+        "\n" +
+        "  --allow-unmarked-sinks   Opt out of the gate for this compile (alias:\n" +
+        "             --no-strict-scope). Use only when you knowingly bypass it.\n" +
+        "  --strict   Accepted no-op — the gate is already on by default.\n",
     );
     return;
   }
   const specPath = args.positional[0];
   const outDir = args.flags["out"];
   const emitIr = args.flags["emit-ir"] === true;
-  const strict = args.flags["strict"] === true;
+  // FR-002 — the strict scope gate is DEFAULT-ON. It runs unless the user
+  // explicitly opts out with --allow-unmarked-sinks (or its alias
+  // --no-strict-scope). `--strict` is now a no-op kept for back-compat.
+  const allowUnmarkedSinks =
+    args.flags["allow-unmarked-sinks"] === true || args.flags["no-strict-scope"] === true;
+  const strict = !allowUnmarkedSinks;
   if (typeof specPath !== "string") die("missing <spec.yaml>");
   if (!emitIr && typeof outDir !== "string") die("missing -o <out-dir>");
 
   const absSpec = resolve(specPath);
-  logger.debug("compile.start", { spec: absSpec, out: outDir, emitIr, strict });
+  logger.debug("compile.start", { spec: absSpec, out: outDir, emitIr, strict, allowUnmarkedSinks });
 
   let yamlText: string;
   try {
@@ -415,20 +406,20 @@ async function runCompile(args: ParsedArgs): Promise<void> {
     die(`could not read ${absSpec}: ${(err as Error).message}`);
   }
 
-  // FR-006 — make the deferred bundle-side egress-matcher path LOUD. The
-  // selector lowers to `ir.security.egressMatcher` and the `run` path honours
-  // it, but the generated cli bundle does not yet construct the semantic
-  // matcher (same as the justification judge). Warn so a bundle-only user is
-  // not misled into thinking the emitted artifact carries `semantic`. Parse
-  // failures are reported by the emit branches below; skip the warning here.
-  warnDeferredEgressMatcher(yamlText);
+  // FR-006 — `security.egressMatcher: semantic` is now emitted into the
+  // standalone cli bundle by `@crewhaus/target-cli` (it constructs
+  // `@crewhaus/egress-matcher-semantic` with an injected embedder and threads
+  // it into the bundle's `runChatLoop({ egressMatcher })`), so a compiled
+  // artifact honours the selection WITHOUT the `run` path. No compile-time
+  // warning is needed anymore — emission replaced the warn-only shim.
 
-  // FR-002 — strict scope gate. Lower the spec (pure), resolve every
-  // referenced built-in tool name to its RegisteredTool, and audit scopes
-  // BEFORE any emission. Runs for both --emit-ir and bundle modes so the
-  // gate can't be sidestepped by mode choice. `lower()` only carries tool
-  // NAMES, not scope, so resolution via loadToolMap() is what surfaces the
-  // real RegisteredTool.scope.
+  // FR-002 — strict scope gate, now DEFAULT-ON. Lower the spec (pure), resolve
+  // every referenced built-in tool name to its RegisteredTool, and audit scopes
+  // BEFORE any emission. Runs for both --emit-ir and bundle modes so the gate
+  // can't be sidestepped by mode choice. `lower()` only carries tool NAMES, not
+  // scope, so resolution via loadToolMap() is what surfaces the real
+  // RegisteredTool.scope. Skipped only when the user opts out explicitly with
+  // --allow-unmarked-sinks (strict === false).
   if (strict) {
     await runStrictScopeGate(yamlText);
   }
@@ -509,7 +500,7 @@ async function runStrictScopeGate(yamlText: string): Promise<void> {
       process.stderr.write(`crewhaus: [strict] tool "${f.toolName}" ${f.reason}\n`);
     }
     process.stderr.write(
-      `crewhaus: [strict] ${findings.length} scope finding(s) — refusing to emit. Set scope: "external" on each tool above, or drop --strict.\n`,
+      `crewhaus: [strict] ${findings.length} scope finding(s) — refusing to emit. Set scope: "external" on each tool above, or pass --allow-unmarked-sinks to bypass the gate.\n`,
     );
     process.exit(1);
   }

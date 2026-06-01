@@ -80,56 +80,32 @@ describe("crewhaus compile", () => {
     expect(result.exitCode).toBe(0);
   });
 
-  // FR-002 — compile-time external-sink scope gate.
-  test("--help mentions the --strict scope gate", async () => {
-    const result = await runCli(["compile", "--help"]);
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout).toContain("--strict");
-    expect(result.stdout).toContain('non-"external"');
-  });
-
-  test("--strict on a clean (toolless) spec still emits and exits 0", async () => {
-    const result = await runCli(["compile", HELLO_SPEC, "--strict", "-o", tmp]);
-    expect(result.exitCode).toBe(0);
-    expect(existsSync(join(tmp, "agent.ts"))).toBe(true);
-    expect(result.stderr).not.toContain("[strict]");
-  });
-
-  test("--strict passes when an outward tool (fetch) is correctly external", async () => {
-    // Exercises the full resolve path: collectToolNames → loadToolMap →
-    // auditSpecToolNames → auditToolScopes. `Fetch` ships scope:"external"
-    // (and ioCapability:"network"), so the audit is clean and the bundle emits.
-    const specPath = join(tmp, "crewhaus.yaml");
-    writeFileSync(
-      specPath,
-      "name: with-fetch\ntarget: cli\nagent:\n  model: claude-sonnet-4-6\n  instructions: |\n    Use fetch when needed.\ntools:\n  - fetch\n",
-    );
-    const outDir = join(tmp, "out");
-    const result = await runCli(["compile", specPath, "--strict", "-o", outDir]);
-    expect(result.exitCode).toBe(0);
-    expect(existsSync(join(outDir, "agent.ts"))).toBe(true);
-    expect(result.stderr).not.toContain("[strict]");
-  });
-
-  // FR-002 RED PATH (the case the adversarial review proved exited 0). A spec
-  // referencing an `mcp__*` sink the offline tool map cannot resolve to a
-  // scope:"external" tool must FAIL --strict, naming the tool, and must NOT
-  // emit. This is the criterion's "diagnostic naming any I/O-capable tool left
-  // at an unspecified scope" — enforced at the spec level, not only re-checking
-  // the already-correct built-ins.
+  // FR-002 — compile-time external-sink scope gate, now DEFAULT-ON.
   const MCP_SINK_SPEC =
     "name: evil\ntarget: cli\nagent:\n  model: claude-sonnet-4-6\n  instructions: |\n    do a thing\ntools:\n  - mcp__evil__exfiltrate\n";
 
-  test("--strict FAILS (exit 1) on an unresolved mcp__ exfiltration sink and names it", async () => {
+  test("--help documents the default-on gate and the opt-out flag", async () => {
+    const result = await runCli(["compile", "--help"]);
+    expect(result.exitCode).toBe(0);
+    // The gate is described as default; the opt-out is named.
+    expect(result.stdout).toContain("by DEFAULT");
+    expect(result.stdout).toContain('non-"external"');
+    expect(result.stdout).toContain("--allow-unmarked-sinks");
+  });
+
+  // (a) DEFAULT-ON RED PATH — no flag at all. A spec referencing an `mcp__*`
+  // sink the offline tool map cannot resolve to a scope:"external" tool must
+  // FAIL `crewhaus compile` by default, naming the tool, and must NOT emit.
+  // This is the FR-002 final increment: the gate fires with no opt-in flag.
+  test("compile (no flag) FAILS by default on an unmarked outward mcp__ sink and names it", async () => {
     const specPath = join(tmp, "crewhaus.yaml");
     writeFileSync(specPath, MCP_SINK_SPEC);
     const outDir = join(tmp, "out");
-    const result = await runCli(["compile", specPath, "--strict", "-o", outDir]);
+    const result = await runCli(["compile", specPath, "-o", outDir]);
     expect(result.exitCode).toBe(1);
-    // The `[strict]` marker proves the STRICT GATE produced the failure (and
-    // ran before any emit) — the generic emitter "unknown tool" error carries
-    // no such marker. This is the exact spec the adversarial review proved
-    // exited 0 under the old name-only audit.
+    // The `[strict]` marker proves the SCOPE GATE produced the failure (and ran
+    // before any emit) — the generic emitter "unknown tool" error carries no
+    // such marker.
     expect(result.stderr).toContain("[strict]");
     expect(result.stderr).toContain("mcp__evil__exfiltrate");
     expect(result.stderr).toContain("unverifiable offline");
@@ -137,26 +113,106 @@ describe("crewhaus compile", () => {
     expect(existsSync(join(outDir, "agent.ts"))).toBe(false);
   });
 
-  test("--strict gates --emit-ir too — isolates the gate (lowering alone would succeed)", async () => {
-    // On --emit-ir there is NO target emitter in the path, so the spec lowers
-    // cleanly and the ONLY thing that can produce exit 1 is the strict gate.
-    // If --strict were a no-op the IR would print and exit 0. This is the
-    // cleanest proof the gate is load-bearing, not the emitter's own
-    // unknown-tool rejection.
+  // (a') Isolation: on --emit-ir there is NO target emitter in the path, so the
+  // spec lowers cleanly and the ONLY thing that can produce exit 1 is the scope
+  // gate. If the gate were off the IR would print and exit 0 — so this proves
+  // the default-on gate is load-bearing, not the emitter's unknown-tool reject.
+  test("compile --emit-ir (no flag) FAILS by default on the unmarked sink (gate is load-bearing)", async () => {
     const specPath = join(tmp, "crewhaus.yaml");
     writeFileSync(specPath, MCP_SINK_SPEC);
     const outDir = join(tmp, "out");
-    const result = await runCli(["compile", specPath, "--strict", "--emit-ir", "-o", outDir]);
+    const result = await runCli(["compile", specPath, "--emit-ir", "-o", outDir]);
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("[strict]");
     expect(result.stderr).toContain("mcp__evil__exfiltrate");
     expect(existsSync(join(outDir, "ir.json"))).toBe(false);
   });
 
-  test("--strict also gates the --emit-ir path (clean spec exits 0)", async () => {
-    const result = await runCli(["compile", HELLO_SPEC, "--strict", "--emit-ir", "-o", tmp]);
+  // (b) OPT-OUT — the same unmarked sink passes the compile when the user
+  // explicitly bypasses the gate. We assert against the --emit-ir path because
+  // it isolates the GATE: the scope gate runs identically for emit-ir and
+  // bundle modes, and --emit-ir lowers an unresolved mcp__ tool cleanly (the
+  // bundle EMITTER independently rejects any unknown tool name, which is a
+  // separate concern from the scope gate this flag governs). So a gate-bypassed
+  // --emit-ir exits 0 and writes ir.json with no `[strict]` finding; if the
+  // opt-out did NOT bypass, this same spec exits 1 (see the no-flag test above).
+  test("--allow-unmarked-sinks bypasses the gate: the unmarked sink now passes", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    writeFileSync(specPath, MCP_SINK_SPEC);
+    const outDir = join(tmp, "out");
+    const result = await runCli([
+      "compile",
+      specPath,
+      "--allow-unmarked-sinks",
+      "--emit-ir",
+      "-o",
+      outDir,
+    ]);
     expect(result.exitCode).toBe(0);
-    expect(existsSync(join(tmp, "ir.json"))).toBe(true);
+    expect(result.stderr).not.toContain("[strict]");
+    expect(existsSync(join(outDir, "ir.json"))).toBe(true);
+  });
+
+  test("--no-strict-scope is an accepted alias that also bypasses the gate", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    writeFileSync(specPath, MCP_SINK_SPEC);
+    const outDir = join(tmp, "out");
+    const result = await runCli([
+      "compile",
+      specPath,
+      "--no-strict-scope",
+      "--emit-ir",
+      "-o",
+      outDir,
+    ]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).not.toContain("[strict]");
+    expect(existsSync(join(outDir, "ir.json"))).toBe(true);
+  });
+
+  // (c) CLEAN spec still compiles by default (no flag, no opt-out).
+  test("compile (no flag) on a clean (toolless) spec still emits and exits 0", async () => {
+    const result = await runCli(["compile", HELLO_SPEC, "-o", tmp]);
+    expect(result.exitCode).toBe(0);
+    expect(existsSync(join(tmp, "agent.ts"))).toBe(true);
+    expect(result.stderr).not.toContain("[strict]");
+  });
+
+  test("compile (no flag) passes when an outward tool (fetch) is correctly external", async () => {
+    // Exercises the full resolve path: collectToolNames → loadToolMap →
+    // auditSpecToolNames → auditToolScopes. `Fetch` ships scope:"external"
+    // (and ioCapability:"network"), so the audit is clean and the bundle emits
+    // — by default, with no flag.
+    const specPath = join(tmp, "crewhaus.yaml");
+    writeFileSync(
+      specPath,
+      "name: with-fetch\ntarget: cli\nagent:\n  model: claude-sonnet-4-6\n  instructions: |\n    Use fetch when needed.\ntools:\n  - fetch\n",
+    );
+    const outDir = join(tmp, "out");
+    const result = await runCli(["compile", specPath, "-o", outDir]);
+    expect(result.exitCode).toBe(0);
+    expect(existsSync(join(outDir, "agent.ts"))).toBe(true);
+    expect(result.stderr).not.toContain("[strict]");
+  });
+
+  // Back-compat: `--strict` is still accepted (now a no-op since the gate is
+  // default-on) so existing invocations and CI scripts keep working unchanged.
+  test("--strict remains accepted (no-op) and the unmarked sink still fails", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    writeFileSync(specPath, MCP_SINK_SPEC);
+    const outDir = join(tmp, "out");
+    const result = await runCli(["compile", specPath, "--strict", "-o", outDir]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("[strict]");
+    expect(result.stderr).toContain("mcp__evil__exfiltrate");
+    expect(existsSync(join(outDir, "agent.ts"))).toBe(false);
+  });
+
+  test("--strict on a clean (toolless) spec still emits and exits 0", async () => {
+    const result = await runCli(["compile", HELLO_SPEC, "--strict", "-o", tmp]);
+    expect(result.exitCode).toBe(0);
+    expect(existsSync(join(tmp, "agent.ts"))).toBe(true);
+    expect(result.stderr).not.toContain("[strict]");
   });
 });
 

@@ -349,3 +349,81 @@ describe("emitCli — CLI banner (Phase 3 §3.3)", () => {
     expect(escapedIdx).toBeGreaterThan(writeIdx);
   });
 });
+
+describe("emitCli — egress matcher (Pillar 3 sink-side, FR-006)", () => {
+  test("no security block → no egress-matcher wiring (substring default, zero embedding deps)", () => {
+    const content = emitCli(baseIr()).files[0]?.content ?? "";
+    // The default artifact must not pull in the semantic package or the
+    // embedder — the optional-dependency posture (acceptance #4) holds.
+    expect(content).not.toContain("@crewhaus/egress-matcher-semantic");
+    expect(content).not.toContain("@crewhaus/embedder");
+    expect(content).not.toContain("egressMatcher:");
+    expect(content).not.toContain("createSemanticEgressMatcher");
+    expect(content).not.toContain("__egressMatcher");
+  });
+
+  test('egressMatcher: "substring" emits nothing (explicit default is still the bare bundle)', () => {
+    const content =
+      emitCli(baseIr({ security: { egressMatcher: "substring" } })).files[0]?.content ?? "";
+    expect(content).not.toContain("@crewhaus/egress-matcher-semantic");
+    expect(content).not.toContain("@crewhaus/embedder");
+    expect(content).not.toContain("egressMatcher:");
+    expect(content).not.toContain("__egressMatcher");
+  });
+
+  test("security with only justification (no egressMatcher) emits no egress wiring", () => {
+    // Presence of the security block alone must not trigger emission — only
+    // egressMatcher: "semantic" does.
+    const content =
+      emitCli(baseIr({ security: { justification: { judge: "claude" } } })).files[0]?.content ?? "";
+    expect(content).not.toContain("@crewhaus/egress-matcher-semantic");
+    expect(content).not.toContain("egressMatcher:");
+  });
+
+  test('egressMatcher: "semantic" emits imports, embedder+matcher construction, and the runChatLoop field', () => {
+    const content =
+      emitCli(baseIr({ security: { egressMatcher: "semantic" } })).files[0]?.content ?? "";
+    // Imports for the optional embedding-backed matcher + the embedder.
+    expect(content).toContain('import { createEmbedder } from "@crewhaus/embedder"');
+    expect(content).toContain(
+      'import { createSemanticEgressMatcher } from "@crewhaus/egress-matcher-semantic"',
+    );
+    // Embedder model resolved at bundle runtime: env override > documented
+    // default — the standalone analogue of the run path's resolution.
+    expect(content).toContain("process.env.CREWHAUS_EGRESS_EMBEDDER");
+    expect(content).toContain('"openai/text-embedding-3-small"');
+    // The matcher is constructed with the injected embedder…
+    expect(content).toContain("createSemanticEgressMatcher({ embedder: __egressEmbedder })");
+    // …and threaded into runChatLoop, mirroring the run path.
+    expect(content).toContain("egressMatcher: __egressMatcher");
+  });
+
+  test("semantic: the matcher is constructed BEFORE runChatLoop (so the field references a bound symbol)", () => {
+    const content =
+      emitCli(baseIr({ security: { egressMatcher: "semantic" } })).files[0]?.content ?? "";
+    const constructIdx = content.indexOf("const __egressMatcher =");
+    const runChatLoopIdx = content.indexOf("await runChatLoop({");
+    expect(constructIdx).toBeGreaterThanOrEqual(0);
+    expect(runChatLoopIdx).toBeGreaterThan(constructIdx);
+  });
+
+  test("semantic + MCP: egress construction sits ahead of the mcp try/finally wrapper", () => {
+    // When MCP is present the runChatLoop call is wrapped in try/finally and
+    // re-indented; the egress matcher construction must still precede it.
+    const content =
+      emitCli(
+        baseIr({
+          security: { egressMatcher: "semantic" },
+          mcp_servers: {
+            things: { transport: "stdio", command: "node", args: ["server.js"] },
+          },
+        }),
+      ).files[0]?.content ?? "";
+    const constructIdx = content.indexOf("const __egressMatcher =");
+    const tryIdx = content.indexOf("try {");
+    expect(constructIdx).toBeGreaterThanOrEqual(0);
+    expect(tryIdx).toBeGreaterThan(constructIdx);
+    // And the field is still threaded into the (wrapped) runChatLoop options.
+    expect(content).toContain("egressMatcher: __egressMatcher");
+  });
+});

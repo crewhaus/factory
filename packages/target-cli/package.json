@@ -14,9 +14,19 @@
     "@crewhaus/ir": "workspace:*"
   },
   "peerDependencies": {
+    "@crewhaus/egress-matcher-semantic": "workspace:*",
+    "@crewhaus/embedder": "workspace:*",
     "@crewhaus/hooks-engine": "workspace:*",
     "@crewhaus/skills-registry": "workspace:*",
     "@crewhaus/slash-commands": "workspace:*"
+  },
+  "peerDependenciesMeta": {
+    "@crewhaus/egress-matcher-semantic": {
+      "optional": true
+    },
+    "@crewhaus/embedder": {
+      "optional": true
+    }
   },
   "scripts": {
     "test": "bun test src"

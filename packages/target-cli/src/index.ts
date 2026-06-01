@@ -279,6 +279,58 @@ function renderSubAgents(ir: IrV0): {
   };
 }
 
+/**
+ * FR-006 (Pillar 3, sink-side) — emit the egress-matcher selection lowered
+ * to `ir.security.egressMatcher` into the standalone bundle, so a compiled
+ * cli artifact honours `security.egressMatcher: semantic` WITHOUT the
+ * `crewhaus run` path. This mirrors `apps/cli`'s `resolveEgressMatcher` /
+ * `createEgressMatcher`:
+ *
+ *   - `"substring"` (or absent) returns empty pieces — the bundle pulls in
+ *     NO embedding dependency and runtime-core stays on the built-in
+ *     `substringMatcher` default (the run path returns `undefined` here and
+ *     omits `egressMatcher`; the emitted shape stays byte-identical to the
+ *     pre-FR-006 bundle). The optional-dependency posture (acceptance #4) is
+ *     preserved: the default artifact never imports the semantic package.
+ *   - `"semantic"` emits the construction of a `SemanticEgressMatcher` with
+ *     an injected `@crewhaus/embedder` `Embedder`, threaded into
+ *     `runChatLoop({ egressMatcher })`. The embedder model is resolved at
+ *     bundle runtime from `CREWHAUS_EGRESS_EMBEDDER` (the same env var the
+ *     run path reads) falling back to the documented default — the standalone
+ *     analogue of `--egress-embedder` > `CREWHAUS_EGRESS_EMBEDDER` > default.
+ *
+ * Only *how* lineage matches are detected changes; the IR-wired placement
+ * (every external sink) and the per-origin/per-sink policy + the three audit
+ * outcomes (`egress-passed | egress-warned | egress-blocked`) live in
+ * `classifyEgress` and are matcher-independent.
+ */
+const DEFAULT_EGRESS_EMBEDDER_MODEL = "openai/text-embedding-3-small";
+
+function renderEgressMatcher(ir: IrV0): {
+  imports: string[];
+  bootBlock: string;
+  field: string;
+} {
+  if (ir.security?.egressMatcher !== "semantic") {
+    return { imports: [], bootBlock: "", field: "" };
+  }
+  const imports = [
+    `import { createEmbedder } from "@crewhaus/embedder";`,
+    `import { createSemanticEgressMatcher } from "@crewhaus/egress-matcher-semantic";`,
+  ];
+  // Resolve the embedder model at bundle runtime, mirroring the run path's
+  // `CREWHAUS_EGRESS_EMBEDDER` env > DEFAULT_EGRESS_EMBEDDER_MODEL precedence.
+  // The `--egress-embedder` flag has no standalone-bundle analogue; the env
+  // var is the deployment knob for a compiled artifact.
+  const bootBlock = [
+    "const __egressEmbedder = createEmbedder({",
+    `  model: process.env.CREWHAUS_EGRESS_EMBEDDER ?? ${escapeJsonString(DEFAULT_EGRESS_EMBEDDER_MODEL)},`,
+    "});",
+    "const __egressMatcher = createSemanticEgressMatcher({ embedder: __egressEmbedder });",
+  ].join("\n");
+  return { imports, bootBlock, field: "\n  egressMatcher: __egressMatcher," };
+}
+
 /** Render one IrSubAgentDefinition as a TypeScript object literal. */
 function renderSubAgentDef(d: IrSubAgentDefinition): string {
   const lines: string[] = [];
@@ -302,6 +354,11 @@ function renderAgent(ir: IrV0): string {
   const { imports: builtinImports, inits, registrations } = resolveTools(ir.tools, ir.toolConfigs);
   const mcp = renderMcpServers(ir);
   const subAgents = renderSubAgents(ir);
+  // FR-006 — Pillar 3 sink-side egress matcher. Empty pieces for the
+  // substring default (the bundle stays free of any embedding dependency);
+  // for "semantic" it constructs `@crewhaus/egress-matcher-semantic` with an
+  // injected embedder, mirroring the `crewhaus run` path.
+  const egress = renderEgressMatcher(ir);
   // The catalog import is needed when either built-in tools OR MCP servers
   // are in play. resolveTools() already prepends it for the built-in case;
   // we add it explicitly when MCP is the only consumer.
@@ -349,6 +406,10 @@ if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));`;
   const subAgentsBoot = subAgents.registryBlock
     ? `${subAgents.registryBlock}\n${subAgents.registerBlock}\n\n`
     : "";
+  // FR-006 — construct the semantic matcher (when selected) before the
+  // runChatLoop call so it can be threaded into the options. Empty for the
+  // substring default.
+  const egressBoot = egress.bootBlock ? `${egress.bootBlock}\n\n` : "";
 
   // Phase 3 §3.3 — CLI banner with optional tagline rotation. Emitted
   // ahead of runChatLoop so users see the brand on cold start. Suppressed
@@ -382,7 +443,7 @@ if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));`;
   sessionTarget: "cli",${toolsField}${permField}${sandboxField}
   hooks: __hooks,
   skills: __skills,
-  slashCommands: __slashCommands,${subAgents.subAgentsField}${subAgents.spawnField}
+  slashCommands: __slashCommands,${subAgents.subAgentsField}${subAgents.spawnField}${egress.field}
 });`;
   const wrapped = mcp.hasAny
     ? `try {
@@ -394,16 +455,17 @@ if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));`;
 
   const subAgentImportBlock =
     subAgents.imports.length > 0 ? `${subAgents.imports.join("\n")}\n` : "";
+  const egressImportBlock = egress.imports.length > 0 ? `${egress.imports.join("\n")}\n` : "";
 
   return `#!/usr/bin/env bun
 // Generated by crewhaus. DO NOT EDIT.
 // Source spec: ${ir.name} (target: cli, ir version: ${ir.version})
 import { runChatLoop } from "@crewhaus/runtime-core";
-${permImport}${importBlock}${catalogImport}${mcpImportBlock}${subAgentImportBlock}${extensionImport}
+${permImport}${importBlock}${catalogImport}${mcpImportBlock}${subAgentImportBlock}${egressImportBlock}${extensionImport}
 ${registerBlock}
 ${extensionBoot}
 
-${bannerBoot}${subAgentsBoot}${mcpBoot}${wrapped}
+${bannerBoot}${subAgentsBoot}${egressBoot}${mcpBoot}${wrapped}
 `;
 }
 

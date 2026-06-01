@@ -171,13 +171,12 @@ const securityBlock = z
      * `--egress-embedder`). The runtime SEAM
      * (`RunChatLoopOptions.egressMatcher`) underlies both.
      *
-     * NOTE: the *generated cli bundle* does not yet construct the matcher
-     * from this field (the `target-cli` emitter, like the justification
-     * judge, leaves it to the run path); emitting the selection into a
-     * standalone bundle is the remaining FR-006 follow-up. `crewhaus
-     * compile` warns when `egressMatcher: semantic` is set so a
-     * bundle-only user is not misled into thinking the emitted artifact
-     * carries it.
+     * The *generated cli bundle* also honours this field: `@crewhaus/target-cli`
+     * emits the matcher construction (the semantic one with an injected
+     * `@crewhaus/embedder` embedder) into the bundle's
+     * `runChatLoop({ egressMatcher })`, so a compiled standalone artifact uses
+     * `semantic` WITHOUT the `crewhaus run` path. The substring default emits
+     * nothing, keeping the bundle free of any embedding dependency.
      */
     egressMatcher: z.enum(["substring", "semantic"]).optional(),
   })
