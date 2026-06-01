@@ -8,6 +8,11 @@ describe("Bash tool metadata", () => {
     expect(bash.readOnly).toBe(false);
     expect(bash.concurrencySafe).toBe(false);
   });
+
+  test("crosses a process boundary → external scope + process io-capability (#146)", () => {
+    expect(bash.scope).toBe("external");
+    expect(bash.ioCapability).toBe("process");
+  });
 });
 
 describe("Bash tool execution", () => {
