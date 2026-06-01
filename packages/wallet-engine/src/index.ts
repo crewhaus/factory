@@ -66,7 +66,20 @@ export type WalletConfig = {
 export type TransactionPolicy = {
   readonly defaultWriteApproval: "required" | "policy" | "none";
   readonly maxValueUsd?: number;
+  /**
+   * Native-token value ceiling in wei (decimal or 0x-hex). Oracle-free and
+   * enforced pre-broadcast (#152).
+   */
+  readonly maxValueWei?: string;
   readonly allowedContracts: readonly string[];
+  /**
+   * Resolved `contractId` → address map. When present, `tx.to` is bound to the
+   * address registered for `tx.contractId`, so a whitelisted id cannot be used
+   * to send to an arbitrary address (#151). The runtime should populate this
+   * from the spec's `contracts[]`; the stronger long-term fix is to drop `to`
+   * from the tool input entirely and resolve it from `contractId` here.
+   */
+  readonly contractAddresses?: Readonly<Record<string, string>>;
   readonly simulationRequired: boolean;
 };
 
@@ -91,6 +104,21 @@ export type UnsignedTx = {
   /** Optional gas limit (hex). Adapter estimates if omitted. */
   readonly gasLimit?: string;
 };
+
+/**
+ * Parse a wei amount expressed as a decimal or 0x-hex string. Throws a
+ * WalletEngineError (fail-closed) on a malformed value.
+ */
+function parseWei(walletId: string, label: string, v: string): bigint {
+  try {
+    return BigInt(v.trim());
+  } catch {
+    throw new WalletEngineError(
+      walletId,
+      `invalid ${label} "${v}" (expected wei as a decimal or 0x-hex string)`,
+    );
+  }
+}
 
 /**
  * Simulation result. Conservatively typed — real adapters surface
@@ -255,6 +283,46 @@ export function createWalletEngine(opts: WalletEngineOptions): WalletEngine {
           `contract id "${tx.contractId}" not in transaction_policy.allowedContracts ${JSON.stringify(policy.allowedContracts)}`,
         );
       }
+    }
+
+    // #151 — bind `to` to the claimed contractId. `allowedContracts` alone is a
+    // symbolic gate; without this an attacker can claim a whitelisted id and
+    // still send to an arbitrary address. When the resolved address map is
+    // present, `tx.to` MUST equal the address registered for `tx.contractId`.
+    if (tx.contractId !== undefined && policy.contractAddresses !== undefined) {
+      const expected = policy.contractAddresses[tx.contractId];
+      if (expected === undefined) {
+        throw new WalletEngineError(
+          tx.walletId,
+          `contract id "${tx.contractId}" has no resolved address in transaction_policy.contractAddresses`,
+        );
+      }
+      if (tx.to.toLowerCase() !== expected.toLowerCase()) {
+        throw new WalletEngineError(
+          tx.walletId,
+          `tx.to "${tx.to}" does not match the address ${expected} bound to contract id "${tx.contractId}"`,
+        );
+      }
+    }
+
+    // #152 — value caps. maxValueWei is an oracle-free native ceiling enforced
+    // here. maxValueUsd cannot be enforced without a price oracle (none is
+    // wired in this build), so fail closed rather than give false assurance.
+    if (policy.maxValueWei !== undefined) {
+      const cap = parseWei(tx.walletId, "transaction_policy.maxValueWei", policy.maxValueWei);
+      const val = parseWei(tx.walletId, "tx.value", tx.value ?? "0x0");
+      if (val > cap) {
+        throw new WalletEngineError(
+          tx.walletId,
+          `tx value ${val} wei exceeds transaction_policy.maxValueWei (${cap} wei)`,
+        );
+      }
+    }
+    if (policy.maxValueUsd !== undefined) {
+      throw new WalletEngineError(
+        tx.walletId,
+        `transaction_policy.maxValueUsd (${policy.maxValueUsd}) cannot be enforced: USD value caps require a price oracle, which is not wired in this build. Use transaction_policy.maxValueWei for a native-token ceiling.`,
+      );
     }
     // `none` (defaultWriteApproval) is only valid under `automated` custody —
     // documented invariant. The runtime layers that allow this combo perform
