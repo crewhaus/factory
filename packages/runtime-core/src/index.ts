@@ -55,6 +55,7 @@ import { type SkillRef, formatSkillsForPrompt } from "@crewhaus/skills-registry"
 import { type SlashCommand, expand as expandSlash } from "@crewhaus/slash-commands";
 import { type Store, createStore } from "@crewhaus/state-store";
 import { executeStreaming } from "@crewhaus/streaming-tool-executor";
+import { currentTenantContext } from "@crewhaus/tenancy";
 import { TokenBudget, estimateTokens } from "@crewhaus/token-budget";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { executeTool } from "@crewhaus/tool-executor";
@@ -471,6 +472,29 @@ export type RunChatLoopOptions = {
  *   message history and returns the concatenated text content of the final
  *   assistant message. Does not touch stdin.
  */
+/**
+ * Resolve the root directory for session + event-log persistence (and the
+ * sub-agent storage it threads onward).
+ *
+ * Tenant isolation is MANDATORY at the storage layer, not cooperative: the
+ * managed daemon wraps every gateway request in `withTenant(...)`, so when a
+ * tenant context is active we use that tenant's path-rebased `sessionRoot`
+ * and never fall back to the process-global default — one tenant's prompts
+ * and transcripts can no longer land in another tenant's directory (#142).
+ *
+ * Precedence: an explicit per-call `optsRoot` (set only by trusted callers
+ * such as a target emitter or a test) wins; then the active tenant's
+ * `sessionRoot`; then `CREWHAUS_SESSION_DIR`; otherwise `undefined` (which
+ * lets `session-store` apply its own non-tenant default). The env var and the
+ * global default are only consulted OUTSIDE any tenant scope.
+ */
+export function resolveSessionRootDir(optsRoot: string | undefined): string | undefined {
+  if (optsRoot !== undefined) return optsRoot;
+  const tenant = currentTenantContext()?.tenant;
+  if (tenant !== undefined) return tenant.sessionRoot;
+  return process.env["CREWHAUS_SESSION_DIR"] ?? undefined;
+}
+
 export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // Section 17 — resolve the primary adapter via the model-router.
   // The router lazy-loads the matching provider package; an
@@ -543,7 +567,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // Persistence boot: session create/resume + event log open. Runs first
   // so the run context's sessionId — possibly carried over from a prior
   // run — is the one the rest of the loop logs against.
-  const sessionRootDir = opts.sessionRootDir ?? process.env["CREWHAUS_SESSION_DIR"] ?? undefined;
+  const sessionRootDir = resolveSessionRootDir(opts.sessionRootDir);
   const sessionStore: SessionStore = createSessionStore({ rootDir: sessionRootDir });
   // Housekeeping side-effect: evicts any session whose mtime is older than
   // the TTL (default 30 days). The returned list is intentionally discarded.

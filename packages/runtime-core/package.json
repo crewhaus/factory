@@ -36,6 +36,7 @@
     "@crewhaus/skills-registry": "workspace:*",
     "@crewhaus/slash-commands": "workspace:*",
     "@crewhaus/state-store": "workspace:*",
+    "@crewhaus/tenancy": "workspace:*",
     "@crewhaus/token-budget": "workspace:*",
     "@crewhaus/tool-catalog": "workspace:*",
     "@crewhaus/tool-executor": "workspace:*",
