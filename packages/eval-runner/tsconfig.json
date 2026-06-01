@@ -24,6 +24,7 @@
     { "path": "../slash-commands" },
     { "path": "../spec" },
     { "path": "../sub-agent-spawner" },
+    { "path": "../tenancy" },
     { "path": "../tool-bash" },
     { "path": "../tool-catalog" },
     { "path": "../tool-fetch" },
