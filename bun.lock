@@ -32,6 +32,7 @@
         "@crewhaus/egress-classifier": "workspace:*",
         "@crewhaus/egress-matcher-semantic": "workspace:*",
         "@crewhaus/embedder": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
         "@crewhaus/eval-dataset": "workspace:*",
         "@crewhaus/eval-grader": "workspace:*",
         "@crewhaus/eval-optimizer-orchestrator": "workspace:*",
@@ -1461,10 +1462,16 @@
         "@crewhaus/ir": "workspace:*",
       },
       "peerDependencies": {
+        "@crewhaus/egress-matcher-semantic": "workspace:*",
+        "@crewhaus/embedder": "workspace:*",
         "@crewhaus/hooks-engine": "workspace:*",
         "@crewhaus/skills-registry": "workspace:*",
         "@crewhaus/slash-commands": "workspace:*",
       },
+      "optionalPeers": [
+        "@crewhaus/egress-matcher-semantic",
+        "@crewhaus/embedder",
+      ],
     },
     "packages/target-crew": {
       "name": "@crewhaus/target-crew",

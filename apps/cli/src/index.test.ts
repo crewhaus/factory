@@ -170,6 +170,49 @@ describe("crewhaus compile", () => {
     expect(existsSync(join(outDir, "ir.json"))).toBe(true);
   });
 
+  // (b') OPT-OUT, BUNDLE MODE — emitter errors must exit cleanly, not crash.
+  // Once --allow-unmarked-sinks bypasses the scope gate, the same unresolvable
+  // mcp__ sink reaches the bundle EMITTER (which the --emit-ir opt-out test
+  // above never does), and the emitter throws TargetEmitError because it can't
+  // map the name to a built-in. That emitter failure must be routed through
+  // die() exactly like the SpecParseError path — a one-line message + exit 1,
+  // never an uncaught stack trace. (Pre-existing bug, independent of the gate.)
+  test("--allow-unmarked-sinks: an unresolvable mcp__ sink fails cleanly (die, not crash) in bundle mode", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    writeFileSync(specPath, MCP_SINK_SPEC);
+    const outDir = join(tmp, "out");
+    const result = await runCli(["compile", specPath, "--allow-unmarked-sinks", "-o", outDir]);
+    expect(result.exitCode).toBe(1);
+    // Clean die() output: prefixed "crewhaus: " and names the offending tool.
+    expect(result.stderr).toContain('crewhaus: unknown tool "mcp__evil__exfiltrate"');
+    // The gate was bypassed — it is NOT the source of this failure…
+    expect(result.stderr).not.toContain("[strict]");
+    // …and the emitter error did NOT escape as an uncaught crash: neither the
+    // error class name nor any "at file:line:col" stack frame leaks to stderr.
+    expect(result.stderr).not.toContain("TargetEmitError");
+    expect(result.stderr).not.toMatch(/\bat .+:\d+:\d+/);
+    // Nothing was emitted.
+    expect(existsSync(join(outDir, "agent.ts"))).toBe(false);
+  });
+
+  // The report's literal repro: a plain non-outward unknown tool name (one the
+  // gate never flags, so it reaches the emitter with or without the opt-out)
+  // compiled under --allow-unmarked-sinks also fails cleanly via die().
+  test("--allow-unmarked-sinks: a plain unknown tool name also fails cleanly (die, not crash)", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    writeFileSync(
+      specPath,
+      "name: typo\ntarget: cli\nagent:\n  model: claude-sonnet-4-6\n  instructions: |\n    do a thing\ntools:\n  - not-a-real-tool\n",
+    );
+    const outDir = join(tmp, "out");
+    const result = await runCli(["compile", specPath, "--allow-unmarked-sinks", "-o", outDir]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('crewhaus: unknown tool "not-a-real-tool"');
+    expect(result.stderr).not.toContain("TargetEmitError");
+    expect(result.stderr).not.toMatch(/\bat .+:\d+:\d+/);
+    expect(existsSync(join(outDir, "agent.ts"))).toBe(false);
+  });
+
   // (c) CLEAN spec still compiles by default (no flag, no opt-out).
   test("compile (no flag) on a clean (toolless) spec still emits and exits 0", async () => {
     const result = await runCli(["compile", HELLO_SPEC, "-o", tmp]);
