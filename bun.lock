@@ -1140,6 +1140,7 @@
         "@crewhaus/state-store": "workspace:*",
         "@crewhaus/streaming-tool-executor": "workspace:*",
         "@crewhaus/structured-event-printer": "workspace:*",
+        "@crewhaus/tenancy": "workspace:*",
         "@crewhaus/token-budget": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
         "@crewhaus/tool-executor": "workspace:*",

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
   WebFetchPermissionError,
   _resetWebFetchConfig,
+  _setDnsLookup,
   _setRawFetch,
   htmlToMarkdown,
   registerWebFetchConfig,
@@ -27,6 +28,9 @@ const ORIGINAL_ENV: Record<string, string | undefined> = {};
 beforeEach(() => {
   _resetWebFetchConfig();
   _setRawFetch(undefined);
+  // Keep the SSRF DNS backstop offline + deterministic: every host resolves
+  // to a public IP by default. Individual tests override to exercise rebinding.
+  _setDnsLookup(async () => ({ address: "93.184.216.34", family: 4 }));
   for (const key of ["CREWHAUS_SEARCH_PROVIDER", "CREWHAUS_SEARCH_API_KEY"]) {
     ORIGINAL_ENV[key] = process.env[key];
     delete process.env[key];
@@ -36,6 +40,7 @@ beforeEach(() => {
 afterEach(() => {
   _resetWebFetchConfig();
   _setRawFetch(undefined);
+  _setDnsLookup(undefined);
   for (const [key, value] of Object.entries(ORIGINAL_ENV)) {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
@@ -162,6 +167,88 @@ describe("T8 — WebFetch scheme + allow-list", () => {
       async () => new Response("ok", { status: 200, headers: { "content-type": "text/plain" } }),
     );
     await expect(webFetch.execute({ url: "https://EXAMPLE.com/" })).resolves.toBeDefined();
+  });
+});
+
+describe("WebFetch — SSRF guard (#141)", () => {
+  test("rejects the cloud-metadata IP even with an empty allow-list", async () => {
+    _setRawFetch(async () => {
+      throw new Error("must not fetch");
+    });
+    await expect(
+      webFetch.execute({
+        url: "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+      }),
+    ).rejects.toBeInstanceOf(WebFetchPermissionError);
+  });
+
+  test("rejects loopback localhost", async () => {
+    _setRawFetch(async () => {
+      throw new Error("must not fetch");
+    });
+    await expect(webFetch.execute({ url: "http://localhost:6379/" })).rejects.toBeInstanceOf(
+      WebFetchPermissionError,
+    );
+  });
+
+  test("rejects an RFC1918 IP literal", async () => {
+    _setRawFetch(async () => {
+      throw new Error("must not fetch");
+    });
+    await expect(webFetch.execute({ url: "http://10.0.0.5/" })).rejects.toBeInstanceOf(
+      WebFetchPermissionError,
+    );
+  });
+
+  test("rejects the IPv6 loopback [::1]", async () => {
+    _setRawFetch(async () => {
+      throw new Error("must not fetch");
+    });
+    await expect(webFetch.execute({ url: "http://[::1]:8080/" })).rejects.toBeInstanceOf(
+      WebFetchPermissionError,
+    );
+  });
+
+  test("rejects DNS rebinding: a public host that resolves to 127.0.0.1", async () => {
+    _setDnsLookup(async () => ({ address: "127.0.0.1", family: 4 }));
+    _setRawFetch(async () => {
+      throw new Error("must not fetch");
+    });
+    await expect(
+      webFetch.execute({ url: "https://totally-legit.example/" }),
+    ).rejects.toBeInstanceOf(WebFetchPermissionError);
+  });
+
+  test("guard fires even when the internal host is explicitly allow-listed", async () => {
+    registerWebFetchConfig({ allowed_domains: ["169.254.169.254"] });
+    _setRawFetch(async () => {
+      throw new Error("must not fetch");
+    });
+    await expect(webFetch.execute({ url: "http://169.254.169.254/" })).rejects.toBeInstanceOf(
+      WebFetchPermissionError,
+    );
+  });
+
+  test("blocks a redirect that lands on an internal host (per-hop)", async () => {
+    let hops = 0;
+    _setRawFetch(async () => {
+      hops++;
+      return new Response(null, {
+        status: 302,
+        headers: { location: "http://169.254.169.254/" },
+      });
+    });
+    await expect(webFetch.execute({ url: "https://example.com/" })).rejects.toBeInstanceOf(
+      WebFetchPermissionError,
+    );
+    expect(hops).toBe(1);
+  });
+
+  test("still allows a normal public host (guard is not over-broad)", async () => {
+    _setRawFetch(
+      async () => new Response("ok", { status: 200, headers: { "content-type": "text/plain" } }),
+    );
+    await expect(webFetch.execute({ url: "https://example.com/" })).resolves.toBeDefined();
   });
 });
 

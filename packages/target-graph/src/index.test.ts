@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { escapeJsonString } from "@crewhaus/infra-utils";
 import type { IrGraphV0 } from "@crewhaus/ir";
 import { TargetEmitError, emitGraph } from "./index";
 
@@ -115,5 +116,49 @@ describe("emitGraph", () => {
     const content = bundle.files[0]?.content ?? "";
     expect(content).toContain("--resume");
     expect(content).toContain("--branch-from");
+  });
+
+  // Regression — issue #140 (CWE-94). A graph node name must never be
+  // interpolated into emitted code as a bare identifier: a name containing
+  // `};` previously broke out of the `__next` object literal and injected a
+  // top-level statement into agent.ts (RCE on the build/run host).
+  test("malicious node name is emitted as a computed string key, not bare code", () => {
+    const name = 'pwn: __reply }; globalThis.__PWNED__ = "RCE"; const __z = { x';
+    const ir: IrGraphV0 = {
+      ...baseIr,
+      entry: name,
+      nodes: [
+        { name, instructions: "x", model: "claude-sonnet-4-6", tools: [], toolConfigs: {} },
+      ] as IrGraphV0["nodes"],
+      edges: [],
+    };
+    const content = emitGraph(ir).files[0]?.content ?? "";
+    // The name is a computed key built from the escaped string literal …
+    expect(content).toContain(`{ ...prev, [${escapeJsonString(name)}]: __reply }`);
+    // … never a bare identifier, and the payload never appears as live code.
+    expect(content).not.toContain("{ ...prev, pwn:");
+    expect(content).not.toContain('__reply }; globalThis.__PWNED__ = "RCE"; const __z');
+  });
+
+  test("malicious hitl node name does not break the _decision assignment", () => {
+    const name = "x = 1; globalThis.__HITL_PWNED__ = 1; let _q";
+    const ir: IrGraphV0 = {
+      ...baseIr,
+      entry: name,
+      nodes: [
+        {
+          name,
+          instructions: "x",
+          model: "claude-sonnet-4-6",
+          tools: [],
+          toolConfigs: {},
+          hitlPrompt: "ok?",
+        },
+      ] as IrGraphV0["nodes"],
+      edges: [],
+    };
+    const content = emitGraph(ir).files[0]?.content ?? "";
+    expect(content).toContain(`__next[${escapeJsonString(name)} + "_decision"]`);
+    expect(content).not.toContain("__next.x = 1; globalThis.__HITL_PWNED__");
   });
 });
