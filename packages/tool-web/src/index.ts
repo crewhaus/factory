@@ -1,3 +1,4 @@
+import { lookup as dnsLookup } from "node:dns/promises";
 import { CrewhausError } from "@crewhaus/errors";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
@@ -12,6 +13,9 @@ import { z } from "zod";
  *   - Validates http/https scheme.
  *   - Optional allow-list via `getWebFetchConfig().allowedDomains`. When
  *     non-empty, host must equal an entry or be a subdomain of one.
+ *   - SSRF guard (independent of the allow-list, re-checked on every
+ *     redirect hop): rejects loopback, link-local / 169.254.0.0/16,
+ *     RFC1918, CGNAT, *.local / *.localhost, and DNS-rebinding targets.
  *   - Manual redirect handling, max 5; allow-list re-checked at every hop.
  *   - 30 s default timeout (`AbortController`, honours `ctx.signal`).
  *   - 5 MB response body cap.
@@ -89,6 +93,85 @@ function isHostAllowed(host: string): boolean {
   );
 }
 
+// ─── SSRF guard ─────────────────────────────────────────────────────────
+// Defence-in-depth, INDEPENDENT of the allow-list. WebFetch is reachable
+// with model-/prompt-influenced URLs; without this guard an empty allow-list
+// (the documented default) lets an attacker pivot to cloud-metadata
+// (169.254.169.254), loopback, or RFC1918 services. Mirrors tool-fetch's
+// `assertNotSsrf`, including the DNS-resolution backstop for rebinding.
+
+/**
+ * DNS resolver injection point used by tests. Production callers leave it at
+ * `dnsLookup` from `node:dns/promises`; tests stub it to assert the rebinding
+ * path or to keep the suite offline.
+ */
+export type DnsLookupFn = (
+  host: string,
+) => Promise<{ readonly address: string; readonly family: number }>;
+let dnsLookupFn: DnsLookupFn = (host) => dnsLookup(host, { verbatim: false });
+export function _setDnsLookup(fn: DnsLookupFn | undefined): void {
+  dnsLookupFn = fn ?? ((host) => dnsLookup(host, { verbatim: false }));
+}
+
+function isPrivateIp(addr: string): boolean {
+  let ip = addr.replace(/^\[/, "").replace(/\]$/, "").toLowerCase();
+  // IPv4-mapped IPv6 (::ffff:127.0.0.1) — unwrap and re-check the IPv4 tail.
+  const mapped = ip.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+  if (mapped?.[1] !== undefined) ip = mapped[1];
+
+  if (ip === "::1" || ip === "::") return true; // IPv6 loopback / unspecified
+  if (ip.startsWith("fe80:")) return true; // IPv6 link-local
+  if (ip.startsWith("fc") || ip.startsWith("fd")) return true; // IPv6 unique-local
+
+  const parts = ip.split(".").map((p) => Number.parseInt(p, 10));
+  if (parts.length !== 4 || parts.some((n) => Number.isNaN(n) || n < 0 || n > 255)) {
+    return false;
+  }
+  const [a, b] = parts as [number, number, number, number];
+  if (a === 127) return true; // 127.0.0.0/8 loopback
+  if (a === 10) return true; // 10.0.0.0/8 RFC1918
+  if (a === 169 && b === 254) return true; // 169.254.0.0/16 link-local + cloud metadata
+  if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12 RFC1918
+  if (a === 192 && b === 168) return true; // 192.168.0.0/16 RFC1918
+  if (a === 100 && b >= 64 && b <= 127) return true; // 100.64.0.0/10 CGNAT
+  if (a === 0) return true; // 0.0.0.0/8
+  return false;
+}
+
+/**
+ * Reject any host that is — or resolves to — a private/loopback/link-local
+ * address. Applied at the initial URL and at every redirect hop, regardless
+ * of the allow-list. Fails closed if the name cannot be resolved.
+ */
+async function assertNotSsrf(hostname: string): Promise<void> {
+  const lower = hostname.toLowerCase();
+  if (lower === "localhost" || lower.endsWith(".localhost")) {
+    throw new WebFetchPermissionError(`WebFetch denied: host "${hostname}" resolves to loopback`);
+  }
+  if (lower.endsWith(".local")) {
+    throw new WebFetchPermissionError(`WebFetch denied: mDNS host "${hostname}" is not allowed`);
+  }
+  if (isPrivateIp(lower)) {
+    throw new WebFetchPermissionError(
+      `WebFetch denied: host "${hostname}" is a private/loopback IP`,
+    );
+  }
+  // Resolve so a public-looking name pointing at an internal IP (DNS
+  // rebinding) is still caught.
+  let resolved: { readonly address: string; readonly family: number };
+  try {
+    resolved = await dnsLookupFn(lower);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new WebFetchPermissionError(`WebFetch denied: cannot resolve "${hostname}": ${msg}`);
+  }
+  if (isPrivateIp(resolved.address)) {
+    throw new WebFetchPermissionError(
+      `WebFetch denied: host "${hostname}" resolves to private IP ${resolved.address}`,
+    );
+  }
+}
+
 // ─── WebFetch ─────────────────────────────────────────────────────────
 
 const webFetchSchema = z.object({
@@ -148,6 +231,8 @@ async function performWebFetch(initialUrl: URL, signal: AbortSignal): Promise<Re
         `WebFetch denied: scheme "${currentUrl.protocol}" — only http/https allowed`,
       );
     }
+    // SSRF guard — independent of the allow-list, enforced on every hop.
+    await assertNotSsrf(currentUrl.hostname);
     if (!isHostAllowed(currentUrl.hostname)) {
       throw new WebFetchPermissionError(
         `WebFetch denied: host "${currentUrl.hostname}" is not in allowed_domains`,
