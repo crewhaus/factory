@@ -92,6 +92,25 @@ function stringValues(input: unknown): string[] {
   return Object.values(input as Record<string, unknown>).flatMap(stringValues);
 }
 
+/**
+ * The operative argument field(s) per built-in tool — the input the permission
+ * arg-glob is meant to constrain. Matching ONLY these stops a decoy field (e.g.
+ * Write's `content`, or an attacker-injected key) from satisfying an allow rule
+ * (#145). Names cover both the tool-fs fields and the Claude-Code-style aliases.
+ */
+const OPERATIVE_ARG_FIELDS: Readonly<Record<string, readonly string[]>> = {
+  Bash: ["command"],
+  Read: ["file_path", "path"],
+  Write: ["file_path", "path"],
+  Edit: ["file_path", "path"],
+  Glob: ["pattern"],
+  Grep: ["pattern", "path"],
+  Fetch: ["url"],
+  WebFetch: ["url"],
+  WebSearch: ["query"],
+  Navigate: ["url"],
+};
+
 export function matchesPattern(
   compiled: CompiledPattern,
   toolName: string,
@@ -100,5 +119,24 @@ export function matchesPattern(
   if (!compiled._toolRe.test(toolName)) return false;
   const argRe = compiled._argRe;
   if (argRe === null) return true;
-  return stringValues(input).some((v) => argRe.test(v));
+
+  // Match the arg-glob against the tool's OPERATIVE field(s) only, so a decoy
+  // field cannot authorize a malicious operative one (#145). The previous
+  // `.some` over every string in the input was the bypass.
+  const fields = OPERATIVE_ARG_FIELDS[toolName];
+  if (fields !== undefined && input !== null && typeof input === "object") {
+    const record = input as Record<string, unknown>;
+    const vals: string[] = [];
+    for (const f of fields) {
+      const v = record[f];
+      if (typeof v === "string") vals.push(v);
+    }
+    if (vals.length > 0) return vals.some((v) => argRe.test(v));
+    // operative field absent → fall through to the conservative check
+  }
+
+  // Unknown tool (or operative field absent): require EVERY string to match, so
+  // a decoy field cannot authorize the call. No strings at all → deny.
+  const all = stringValues(input);
+  return all.length > 0 && all.every((v) => argRe.test(v));
 }

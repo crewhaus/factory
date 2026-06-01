@@ -66,6 +66,35 @@ describe("compilePattern — arg patterns", () => {
     const p = compilePattern("Bash(git *)");
     expect(matchesPattern(p, "Read", { command: "git status" })).toBe(false);
   });
+
+  // Regression — issue #145 (CWE-863). A decoy field must not satisfy an allow
+  // rule meant for the tool's operative argument.
+  test("a decoy field cannot authorize a malicious Bash command (#145)", () => {
+    const p = compilePattern("Bash(git *)");
+    // `command` is operative; `description` is a decoy that matches the glob.
+    expect(matchesPattern(p, "Bash", { command: "rm -rf /", description: "git push" })).toBe(false);
+  });
+
+  test("Write content cannot satisfy a path glob (#145)", () => {
+    const p = compilePattern("Write(**/src/**)");
+    // `file_path` is operative; `content` is a decoy mentioning src/.
+    expect(
+      matchesPattern(p, "Write", { file_path: "/etc/passwd", content: "edit src/app.ts" }),
+    ).toBe(false);
+  });
+
+  test("a legit operative field still authorizes despite non-matching extras (#145)", () => {
+    const p = compilePattern("Write(**/src/**)");
+    expect(matchesPattern(p, "Write", { file_path: "src/app.ts", content: "anything here" })).toBe(
+      true,
+    );
+  });
+
+  test("unknown tool requires every string to match (conservative fallback)", () => {
+    const p = compilePattern("CustomTool(safe*)");
+    expect(matchesPattern(p, "CustomTool", { op: "danger", note: "safe" })).toBe(false);
+    expect(matchesPattern(p, "CustomTool", { op: "safe-op", note: "safe-note" })).toBe(true);
+  });
 });
 
 describe("compilePattern — error cases", () => {
