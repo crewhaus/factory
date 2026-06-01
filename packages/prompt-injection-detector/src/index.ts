@@ -70,6 +70,44 @@ const SEVERITY_WEIGHT: Record<PromptInjectionSeverity, number> = {
 const SCORE_SUSPICIOUS = 0.4;
 const SCORE_MALICIOUS = 0.8;
 
+// Upper bound on the text the regex/structural layers scan, so a pathological
+// (e.g. multi-MB whitespace) input cannot wedge the classifier (#153). Larger
+// inputs are analyzed head + tail.
+const MAX_CLASSIFY_LEN = 64 * 1024;
+
+// Zero-width / format / bidi / tag characters used to split trigger words
+// ("ig<U+200B>nore"). Stripped from the match view; their *presence* is still
+// caught on the raw text by the unicode-tag-spoof / rtl-override rules.
+const INVISIBLE_RE = /[­᠎​-‏‪-‮⁠-⁤⁦-⁯﻿\u{E0000}-\u{E007F}]/gu;
+
+// Common confusable homoglyphs → ASCII, applied only to the match view so an
+// attacker cannot dodge the keyword rules with Cyrillic/Greek look-alikes
+// (e.g. Cyrillic "іgnоre"). Intentionally small to limit false positives.
+const HOMOGLYPHS: Record<string, string> = {
+  а: "a",
+  е: "e",
+  о: "o",
+  р: "p",
+  с: "c",
+  у: "y",
+  х: "x",
+  і: "i",
+  ѕ: "s",
+  ј: "j",
+  Α: "A",
+  Β: "B",
+  Ε: "E",
+  Ο: "O",
+  Ρ: "P",
+  Τ: "T",
+  Χ: "X",
+  ο: "o",
+  ρ: "p",
+  α: "a",
+  ε: "e",
+  ι: "i",
+};
+
 /**
  * Hand-curated corpus. Rule ids are stable so callers (auditors, tests,
  * the redaction notice) can rely on them.
@@ -254,12 +292,12 @@ export const REGEX_RULES: ReadonlyArray<PromptInjectionRule> = [
   },
   {
     id: "smuggled-system-block",
-    pattern: /^\s*system:\s*\n[\s\S]{0,400}\n\s*human:/im,
+    pattern: /^[ \t]*system:[ \t]*\n[\s\S]{0,400}\n[ \t]*human:/im,
     severity: "high",
   },
   {
     id: "fake-user-injection",
-    pattern: /^\s*(?:User|Human|USER):\s*[^\n]{1,200}\n\s*(?:Assistant|System|SYSTEM):/m,
+    pattern: /^[ \t]*(?:User|Human|USER):[ \t]*[^\n]{1,200}\n[ \t]*(?:Assistant|System|SYSTEM):/m,
     severity: "high",
   },
   {
@@ -351,7 +389,7 @@ export const REGEX_RULES: ReadonlyArray<PromptInjectionRule> = [
   },
   {
     id: "markdown-instruction-block",
-    pattern: /^[\s\S]{1,400}^>+\s*(?:You are|Ignore|Disregard|Forget|From now on)/im,
+    pattern: /^[\s\S]{1,400}?^>+[ \t]*(?:You are|Ignore|Disregard|Forget|From now on)/im,
     severity: "low",
   },
   {
@@ -406,7 +444,7 @@ function structuralHits(text: string): PromptInjectionHit[] {
   // Role-marker injection beyond the ones the regex layer already matches.
   // A cheap structural variant: "role:\nrole:" cluster on adjacent lines.
   const roleClusterRe =
-    /(?:^|\n)\s*(?:system|assistant|user|human)\s*:[^\n]*\n\s*(?:system|assistant|user|human)\s*:/i;
+    /(?:^|\n)[ \t]*(?:system|assistant|user|human)[ \t]*:[^\n]*\n[ \t]*(?:system|assistant|user|human)[ \t]*:/i;
   const role = roleClusterRe.exec(text);
   if (role) {
     hits.push({
@@ -423,7 +461,7 @@ function structuralHits(text: string): PromptInjectionHit[] {
   const tailStart = Math.max(0, text.length - 350);
   const tail = text.slice(tailStart);
   const tailImperative =
-    /(?:^|\n)\s*(?:now |then |finally )?(?:please\s+)?(?:run|execute|fetch|delete|remove|email|upload|send|forward|leak|exfil(?:trate)?|shutdown|kill|chmod|chown|sudo)\b[^\n]{0,200}$/i;
+    /(?:^|\n)[ \t]*(?:now |then |finally )?(?:please[ \t]+)?(?:run|execute|fetch|delete|remove|email|upload|send|forward|leak|exfil(?:trate)?|shutdown|kill|chmod|chown|sudo)\b[^\n]{0,200}$/i;
   const t = tailImperative.exec(tail);
   if (t) {
     hits.push({
@@ -504,6 +542,85 @@ function classify(score: number, threshold: { suspicious: number; malicious: num
   return "clean" as const;
 }
 
+function foldHomoglyphs(s: string): string {
+  let out = "";
+  for (const ch of s) out += HOMOGLYPHS[ch] ?? ch;
+  return out;
+}
+
+/**
+ * Canonical "match view" of the text. NFKC-folds full-width / compatibility
+ * forms, strips zero-width/format/bidi/tag characters, maps confusable
+ * homoglyphs to ASCII, and collapses whitespace runs to single spaces so the
+ * literal-space anchors in the keyword rules match "ignore\n\nprevious" and
+ * "ｉｇｎｏｒｅ　ｐｒｅｖｉｏｕｓ" alike (#143).
+ */
+function normalizeForMatch(text: string): string {
+  const stripped = text.normalize("NFKC").replace(INVISIBLE_RE, "");
+  return foldHomoglyphs(stripped).replace(/\s+/g, " ");
+}
+
+function isMostlyPrintable(s: string): boolean {
+  if (s.length === 0) return false;
+  let printable = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c === 9 || c === 10 || c === 13 || (c >= 32 && c < 127)) printable++;
+  }
+  return printable / s.length > 0.85;
+}
+
+function tryDecodeBase64(blob: string): string | undefined {
+  if (blob.length < 16 || blob.length % 4 === 1) return undefined;
+  try {
+    const decoded = Buffer.from(blob, "base64").toString("utf8");
+    return isMostlyPrintable(decoded) ? decoded : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function tryDecodeHex(blob: string): string | undefined {
+  if (blob.length < 16 || blob.length % 2 !== 0) return undefined;
+  try {
+    const decoded = Buffer.from(blob, "hex").toString("utf8");
+    return isMostlyPrintable(decoded) ? decoded : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function tryDecodePercent(text: string): string | undefined {
+  try {
+    const decoded = decodeURIComponent(text);
+    return decoded !== text ? decoded : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Recursively decode base64 / hex / percent-encoded blobs so an injection
+ * hidden in an encoded payload is rescanned in cleartext, regardless of
+ * neighbouring keywords (#143). Match counts and depth are bounded so this
+ * cannot itself become a DoS vector.
+ */
+function decodedVariants(text: string, depth = 2): string[] {
+  if (depth <= 0 || text.length === 0) return [];
+  const out: string[] = [];
+  const push = (s: string | undefined): void => {
+    if (s !== undefined && s.length > 0) out.push(s, ...decodedVariants(s, depth - 1));
+  };
+  for (const m of [...text.matchAll(/[A-Za-z0-9+/]{16,}={0,2}/g)].slice(0, 8)) {
+    push(tryDecodeBase64(m[0]));
+  }
+  for (const m of [...text.matchAll(/(?:[0-9A-Fa-f]{2}){8,}/g)].slice(0, 8)) {
+    push(tryDecodeHex(m[0]));
+  }
+  if (/%[0-9A-Fa-f]{2}/.test(text)) push(tryDecodePercent(text));
+  return out.slice(0, 16);
+}
+
 /**
  * Classify a tool output. Pure with respect to the input string when
  * the LLM classifier is not supplied.
@@ -519,13 +636,34 @@ export async function classifyText(
   if (text === "") {
     return { classification: "clean", score: 0, hits: [] };
   }
-  const hits: PromptInjectionHit[] = [...regexHits(text), ...structuralHits(text)];
+  // Bound the work the regex/structural layers do so a pathological input
+  // can't wedge the classifier (#153). Keep head + tail so leading and
+  // trailing injections both stay in view.
+  const analyzed =
+    text.length > MAX_CLASSIFY_LEN
+      ? `${text.slice(0, MAX_CLASSIFY_LEN / 2)}\n${text.slice(-MAX_CLASSIFY_LEN / 2)}`
+      : text;
+  // De-obfuscate into match views so the keyword rules can't be dodged with
+  // full-width characters, zero-width splits, homoglyphs, whitespace tricks,
+  // or base64/percent/hex encoding (#143). Structural rules run on the raw
+  // (bounded) text; regex rules run on every variant, deduped by rule id.
+  const variants = [analyzed, normalizeForMatch(analyzed), ...decodedVariants(analyzed)];
+  const regHits: PromptInjectionHit[] = [];
+  const seenRules = new Set<string>();
+  for (const variant of variants) {
+    for (const h of regexHits(variant)) {
+      if (seenRules.has(h.rule)) continue;
+      seenRules.add(h.rule);
+      regHits.push(h);
+    }
+  }
+  const hits: PromptInjectionHit[] = [...regHits, ...structuralHits(analyzed)];
   let score = aggregateScore(hits);
   let classification = classify(score, threshold);
 
   if (opts.llmClassifier !== undefined) {
     try {
-      const verdict = await opts.llmClassifier(text);
+      const verdict = await opts.llmClassifier(analyzed);
       if (verdict !== undefined) {
         if (verdict.verdict === "malicious") {
           classification = "malicious";
