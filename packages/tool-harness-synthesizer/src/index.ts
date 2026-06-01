@@ -25,12 +25,15 @@
  * variant that proposes verifier-aware prompt edits.
  *
  * v0 ships:
- *   - `synthesizeVerifier(spec)` — pure tree search over candidate
- *     verifier code strings (the LLM call is supplied by the caller
- *     so this package stays pure)
+ *   - `synthesizeVerifier(spec)` — tree search over candidate verifier
+ *     code strings (the LLM call is supplied by the caller so this
+ *     package stays pure with respect to the model)
  *   - `thompsonPick(nodes)` — Thompson sampling over tree nodes
  *   - `VerifierMutationProvider` — adapter to plug verifier search
  *     into the existing optimizer
+ *   - `runVerifier(code, samples)` — scores a candidate by running it
+ *     inside a locked-down `@crewhaus/sandbox` container; the candidate
+ *     code never executes on this host (see its SECURITY note).
  *
  * Cited paper: AutoHarness (arxiv 2603.03329, Lou et al., 2026-03).
  */
@@ -40,6 +43,8 @@ import type {
   OptimizerState,
   ProviderMutation,
 } from "@crewhaus/prompt-optimizer";
+import { type Sandbox, createSandbox } from "@crewhaus/sandbox";
+import { runVerifierInSandbox } from "./sandboxed-eval";
 
 export class HarnessSynthesizerError extends CrewhausError {
   override readonly name = "HarnessSynthesizerError";
@@ -54,6 +59,11 @@ export class HarnessSynthesizerError extends CrewhausError {
  * (false) this sample. Both classes are required for non-degenerate
  * search — a verifier that returns `true` for everything passes the
  * `expected: true` set perfectly.
+ *
+ * NOTE: `input`/`output` cross an isolation boundary (see `runVerifier`)
+ * and are marshaled as JSON, so they must be JSON-serializable. The
+ * verifier observes structured copies, not live host references — an
+ * intentional consequence of running it out-of-process.
  */
 export type VerifierSample = {
   readonly input: unknown;
@@ -66,8 +76,15 @@ export type VerifierSample = {
  * achieved on the last evaluation. `code` is a function body string
  * with the signature `(input: unknown, output: unknown) => boolean`.
  * It's stored as a string so the search can mutate it and feed it
- * back to the LLM. Execution happens via `runVerifier` which
- * compiles + invokes safely in a sandboxed Function call.
+ * back to the LLM.
+ *
+ * SECURITY: `code` is attacker-influenceable (caller seed candidates +
+ * refiner output, which a future model-backed refiner derives from
+ * skill/tool I/O that can carry injected content). It is NEVER compiled
+ * or invoked on this host. Execution happens via `runVerifier`, which
+ * evaluates the candidate inside a locked-down `@crewhaus/sandbox`
+ * container with no ambient authority — see the SECURITY note on
+ * `runVerifier`.
  */
 export type VerifierCandidate = {
   readonly id: string;
@@ -85,50 +102,81 @@ export type VerifierCandidate = {
  * returns a new code string. In production, this is a model call; for
  * testing it's a deterministic rule-based mutation. Either way, the
  * signature is the same.
+ *
+ * SECURITY: the string this returns is executed (in isolation — see
+ * `runVerifier`), so a model-backed refiner is effectively running
+ * model output as code. The container is the trust boundary, NOT the
+ * model — never relax `runVerifier`'s isolation on the assumption that
+ * refiner output is trustworthy.
  */
 export type RefinerFn = (
   current: VerifierCandidate,
   failures: ReadonlyArray<VerifierSample>,
 ) => Promise<string>;
 
+/** Isolation options shared by `runVerifier` and the inner search. */
+export type RunVerifierOptions = {
+  /**
+   * Isolation backend. Defaults to `createSandbox()` (honors the
+   * `CREWHAUS_SANDBOX` env; `docker` by default). The non-isolating
+   * `noop` backend is REFUSED — see the SECURITY note on `runVerifier`.
+   */
+  readonly sandbox?: Sandbox;
+  /** Per-evaluation wall-clock budget (ms). Default: 10_000. */
+  readonly timeoutMs?: number;
+  /** Container image. Default: `node:22-alpine` (on the sandbox allowlist). */
+  readonly image?: string;
+};
+
 /**
  * The Critic: runs `code` against a sample set and returns the per-
- * sample verdict and the heuristic value. Pure; deterministic given
- * the same code + samples.
+ * sample verdict and the heuristic value. Deterministic given the same
+ * code + samples (modulo the verifier's own determinism).
+ *
+ * SECURITY (FR-007): `code` is untrusted and is NOT run in this process.
+ * `runVerifier` ships `{ code, samples }` to a locked-down
+ * `@crewhaus/sandbox` container (`--network none`, `--read-only`, no
+ * host env, cpu/mem caps, wall-clock kill, `no-new-privileges`) and
+ * scores the returned verdicts here on the host — the container never
+ * receives `expected`. Inside the jail the candidate is compiled with
+ * the runtime's dynamic-function constructor and invoked over the
+ * samples; an exfiltration/RCE attempt (e.g. a refiner emitting a
+ * network call) is contained by the jail. FAIL CLOSED: when no real
+ * isolation backend is available (the `noop` backend, or none),
+ * `runVerifier` throws rather than executing untrusted code unsandboxed,
+ * mirroring the `requiresSandbox` floor enforced elsewhere in the repo.
+ *
+ * Behavior contract: per-sample runtime errors are caught (verdict
+ * `false`, `errors++`), matching the prior in-process semantics. Code
+ * that fails to compile, times out, or otherwise crashes the harness
+ * throws a `HarnessSynthesizerError`.
  */
-export function runVerifier(
+export async function runVerifier(
   code: string,
   samples: ReadonlyArray<VerifierSample>,
-): {
+  opts: RunVerifierOptions = {},
+): Promise<{
   readonly verdicts: ReadonlyArray<boolean>;
   readonly heuristic: number;
   readonly errors: number;
-} {
-  let fn: (input: unknown, output: unknown) => boolean;
+}> {
+  const ownsSandbox = opts.sandbox === undefined;
+  const sandbox = opts.sandbox ?? createSandbox();
   try {
-    // Code must be the body of a function with parameters (input, output).
-    // We wrap defensively so callers can pass either a body or a complete
-    // expression returning a function.
-    fn = new Function("input", "output", `${code}`) as (input: unknown, output: unknown) => boolean;
-  } catch (err) {
-    throw new HarnessSynthesizerError(`verifier code did not compile: ${(err as Error).message}`);
-  }
-  const verdicts: boolean[] = [];
-  let correct = 0;
-  let errors = 0;
-  for (const s of samples) {
-    let v: boolean;
-    try {
-      v = Boolean(fn(s.input, s.output));
-    } catch {
-      v = false;
-      errors++;
+    // FR-007 — fail closed: never run untrusted verifier code without
+    // a real isolation boundary.
+    if (sandbox.backend === "noop") {
+      throw new HarnessSynthesizerError(
+        "refusing to evaluate verifier code in a noop sandbox (no isolation); set CREWHAUS_SANDBOX=docker|podman",
+      );
     }
-    verdicts.push(v);
-    if (v === s.expected) correct++;
+    return await runVerifierInSandbox(sandbox, code, samples, {
+      ...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
+      ...(opts.image !== undefined ? { image: opts.image } : {}),
+    });
+  } finally {
+    if (ownsSandbox) await sandbox.close();
   }
-  const heuristic = samples.length === 0 ? 0 : correct / samples.length;
-  return { verdicts, heuristic, errors };
 }
 
 /**
@@ -210,6 +258,14 @@ export type SynthesizeOptions = {
   readonly target?: number;
   /** RNG for Thompson sampling. Default: Math.random. */
   readonly rng?: () => number;
+  /**
+   * Isolation backend reused across every evaluation in the inner search.
+   * Defaults to one `createSandbox()` per call (closed when the search
+   * ends). See `runVerifier` for the isolation/fail-closed contract.
+   */
+  readonly sandbox?: Sandbox;
+  /** Per-evaluation wall-clock budget (ms) forwarded to `runVerifier`. */
+  readonly timeoutMs?: number;
 };
 
 export type SynthesizeResult = {
@@ -223,6 +279,9 @@ export type SynthesizeResult = {
  * Run the tree search. Returns the best candidate found, the
  * iteration count, and whether the target heuristic was reached.
  * Pure with respect to randomness: pass `rng` for determinism.
+ *
+ * One isolation backend is created (or reused, if `opts.sandbox` is
+ * supplied) for the whole search and closed on exit — see `runVerifier`.
  */
 export async function synthesizeVerifier(opts: SynthesizeOptions): Promise<SynthesizeResult> {
   if (opts.seedCandidates.length === 0) {
@@ -235,66 +294,79 @@ export async function synthesizeVerifier(opts: SynthesizeOptions): Promise<Synth
   const rng = opts.rng ?? Math.random;
   const maxIter = opts.maxIterations ?? 16;
 
-  // Initialize the candidate pool from seeds.
-  const pool: VerifierCandidate[] = [];
-  for (let i = 0; i < opts.seedCandidates.length; i++) {
-    const code = opts.seedCandidates[i] as string;
-    const { heuristic } = runVerifier(code, opts.samples);
-    pool.push({
-      id: `seed_${i}`,
-      code,
-      score: heuristic,
-      heuristic,
-      // Beta starts uniform; update with observed correct/incorrect counts.
-      alpha: 1 + Math.round(heuristic * opts.samples.length),
-      beta: 1 + Math.round((1 - heuristic) * opts.samples.length),
-    });
-  }
-  const trajectory: VerifierCandidate[] = [...pool];
+  // One isolation backend reused across the whole inner search; close it
+  // on exit only if we created it (the caller owns an injected one).
+  const ownsSandbox = opts.sandbox === undefined;
+  const sandbox = opts.sandbox ?? createSandbox();
+  const runOpts: RunVerifierOptions = {
+    sandbox,
+    ...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
+  };
 
-  // Early exit if a seed already satisfies the target.
-  let best = pool.reduce((a, b) => (a.heuristic >= b.heuristic ? a : b));
-  if (best.heuristic >= target) {
-    return { best, iterations: 0, converged: true, trajectory };
-  }
+  try {
+    // Initialize the candidate pool from seeds.
+    const pool: VerifierCandidate[] = [];
+    for (let i = 0; i < opts.seedCandidates.length; i++) {
+      const code = opts.seedCandidates[i] as string;
+      const { heuristic } = await runVerifier(code, opts.samples, runOpts);
+      pool.push({
+        id: `seed_${i}`,
+        code,
+        score: heuristic,
+        heuristic,
+        // Beta starts uniform; update with observed correct/incorrect counts.
+        alpha: 1 + Math.round(heuristic * opts.samples.length),
+        beta: 1 + Math.round((1 - heuristic) * opts.samples.length),
+      });
+    }
+    const trajectory: VerifierCandidate[] = [...pool];
 
-  for (let iter = 0; iter < maxIter; iter++) {
-    const pickIdx = thompsonPick(pool, rng);
-    const parent = pool[pickIdx] as VerifierCandidate;
-    // Compute concrete failures for the refiner.
-    const { verdicts } = runVerifier(parent.code, opts.samples);
-    const failures: VerifierSample[] = [];
-    for (let i = 0; i < opts.samples.length; i++) {
-      const s = opts.samples[i] as VerifierSample;
-      const v = verdicts[i] as boolean;
-      if (v !== s.expected) failures.push(s);
-    }
-    let newCode: string;
-    try {
-      newCode = await opts.refiner(parent, failures);
-    } catch (err) {
-      throw new HarnessSynthesizerError(
-        `refiner threw on iteration ${iter}: ${(err as Error).message}`,
-        err,
-      );
-    }
-    const { heuristic } = runVerifier(newCode, opts.samples);
-    const child: VerifierCandidate = {
-      id: `cand_${iter}`,
-      code: newCode,
-      score: heuristic,
-      heuristic,
-      alpha: 1 + Math.round(heuristic * opts.samples.length),
-      beta: 1 + Math.round((1 - heuristic) * opts.samples.length),
-    };
-    pool.push(child);
-    trajectory.push(child);
-    if (heuristic > best.heuristic) best = child;
+    // Early exit if a seed already satisfies the target.
+    let best = pool.reduce((a, b) => (a.heuristic >= b.heuristic ? a : b));
     if (best.heuristic >= target) {
-      return { best, iterations: iter + 1, converged: true, trajectory };
+      return { best, iterations: 0, converged: true, trajectory };
     }
+
+    for (let iter = 0; iter < maxIter; iter++) {
+      const pickIdx = thompsonPick(pool, rng);
+      const parent = pool[pickIdx] as VerifierCandidate;
+      // Compute concrete failures for the refiner.
+      const { verdicts } = await runVerifier(parent.code, opts.samples, runOpts);
+      const failures: VerifierSample[] = [];
+      for (let i = 0; i < opts.samples.length; i++) {
+        const s = opts.samples[i] as VerifierSample;
+        const v = verdicts[i] as boolean;
+        if (v !== s.expected) failures.push(s);
+      }
+      let newCode: string;
+      try {
+        newCode = await opts.refiner(parent, failures);
+      } catch (err) {
+        throw new HarnessSynthesizerError(
+          `refiner threw on iteration ${iter}: ${(err as Error).message}`,
+          err,
+        );
+      }
+      const { heuristic } = await runVerifier(newCode, opts.samples, runOpts);
+      const child: VerifierCandidate = {
+        id: `cand_${iter}`,
+        code: newCode,
+        score: heuristic,
+        heuristic,
+        alpha: 1 + Math.round(heuristic * opts.samples.length),
+        beta: 1 + Math.round((1 - heuristic) * opts.samples.length),
+      };
+      pool.push(child);
+      trajectory.push(child);
+      if (heuristic > best.heuristic) best = child;
+      if (best.heuristic >= target) {
+        return { best, iterations: iter + 1, converged: true, trajectory };
+      }
+    }
+    return { best, iterations: maxIter, converged: false, trajectory };
+  } finally {
+    if (ownsSandbox) await sandbox.close();
   }
-  return { best, iterations: maxIter, converged: false, trajectory };
 }
 
 /**
@@ -310,6 +382,11 @@ export async function synthesizeVerifier(opts: SynthesizeOptions): Promise<Synth
  * a freshly-synthesized verifier persisted to .crewhaus/verifiers/.
  * (CLI `--mutator verifier-synthesis` wiring is a follow-up; the CLI
  * today exposes `rule-based` and `claude` only.)
+ *
+ * SECURITY: the inner search executes refiner-produced code. Pass a
+ * `sandbox` (or rely on the default) — `synthesizeVerifier`/`runVerifier`
+ * isolate every evaluation and fail closed without a real backend. A
+ * model-backed `refiner` is only safe to wire because of that jail.
  */
 export class VerifierMutationProvider implements MutationProvider {
   readonly name = "verifier-synthesis";
@@ -320,6 +397,7 @@ export class VerifierMutationProvider implements MutationProvider {
     private readonly refiner: RefinerFn,
     private readonly seedCandidates: ReadonlyArray<string>,
     private readonly maxInnerIterations: number = 4,
+    private readonly sandbox?: Sandbox,
   ) {}
 
   async next(state: OptimizerState): Promise<ProviderMutation> {
@@ -329,6 +407,7 @@ export class VerifierMutationProvider implements MutationProvider {
       samples: this.samples,
       refiner: this.refiner,
       maxIterations: this.maxInnerIterations,
+      ...(this.sandbox !== undefined ? { sandbox: this.sandbox } : {}),
     });
     const annotation = `\n\n[verifier ${result.best.id}, h=${result.best.heuristic.toFixed(3)}]`;
     return {
