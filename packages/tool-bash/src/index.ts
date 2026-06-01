@@ -55,6 +55,12 @@ export const bash: RegisteredTool = buildTool({
     "Run a shell command via `sh -c`. Captures stdout and stderr; default timeout 30s, max 10min.",
   inputSchema: bashSchema,
   destructive: true,
+  // Pillar 3 sink-side: Bash spawns a host process and its command string is an
+  // exfiltration channel (curl, nc, `base64 | sh`, …). Mark it external +
+  // process so runtime-core runs classifyEgress on the command payload and the
+  // substring matcher can flag tagged secrets on the command line (#146).
+  scope: "external",
+  ioCapability: "process",
   execute: async (input, ctx) => {
     const timeoutMs = input.timeout ?? DEFAULT_TIMEOUT_MS;
     const proc = Bun.spawn(["sh", "-c", input.command], {
