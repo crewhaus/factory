@@ -15,6 +15,7 @@
     "@crewhaus/boundary-classifier": "workspace:*",
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/mcp-host": "workspace:*",
+    "@crewhaus/run-context": "workspace:*",
     "@crewhaus/tool-builder": "workspace:*",
     "@crewhaus/tool-catalog": "workspace:*",
     "zod": "^3.23.8"

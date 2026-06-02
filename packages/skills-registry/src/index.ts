@@ -27,6 +27,7 @@ import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import { classifyBoundary } from "@crewhaus/boundary-classifier";
 import { CrewhausError } from "@crewhaus/errors";
+import { type RunContext, tagContent } from "@crewhaus/run-context";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
@@ -279,13 +280,26 @@ function readSkillsUnder(root: string): SkillRef[] {
  * On a malicious verdict we return the redaction notice; the existing
  * §18 post-tool classifier in runtime-core remains a redundant safety
  * net (it'll detect any text that slipped through the cache eviction).
+ *
+ * Pillar 3 sink-side fabric (invariant #1) — a module that classifies
+ * external content MUST also `tagContent` so the egress check sees its
+ * provenance. After a non-redacted verdict the body is tagged under origin
+ * `"skill"` when a `RunContext` is reachable, so the egress classifier can
+ * attribute a later exfiltration to the skill boundary specifically. `ctx`
+ * is optional: callers that can't reach the run context (e.g. a bare
+ * `loadSkillBody(ref)` in a test) still get classification, just no tag.
  */
-export async function loadSkillBody(ref: SkillRef): Promise<string> {
+export async function loadSkillBody(ref: SkillRef, ctx?: RunContext): Promise<string> {
   const raw = readFileSync(ref.filePath, "utf8");
   const { body } = parseSkillFile(raw);
   const boundary = await classifyBoundary(body, { origin: "skill" });
   if (boundary.action === "redact" && boundary.redacted !== undefined) {
+    // Malicious — the raw body never reaches the model, so there is nothing
+    // for the egress fabric to track; do NOT tag lineage.
     return boundary.redacted;
+  }
+  if (ctx !== undefined) {
+    tagContent(ctx, body, "skill");
   }
   return body;
 }
@@ -319,13 +333,20 @@ export function createSkillTool(skills: ReadonlyArray<SkillRef>): RegisteredTool
     name: "Skill",
     description,
     inputSchema: skillToolSchema,
-    execute: async (input) => {
+    execute: async (input, ctx) => {
       const parsed = skillToolSchema.parse(input);
       const ref = byName.get(parsed.name);
       if (!ref) {
         return `unknown skill "${parsed.name}". Available: ${known || "(none)"}.`;
       }
-      return await loadSkillBody(ref);
+      // Thread the RunContext off the opaque runtime bridge (Section 13)
+      // so loadSkillBody can tag the body's provenance into dataLineage.
+      // The bridge is `unknown` to tool-catalog and only populated when the
+      // runtime wires sub-agent / crew support; we read just `runContext`
+      // structurally to avoid depending on agent-context-isolation. When
+      // absent the body is still classified, just not tagged.
+      const bridge = ctx?.bridge as { runContext?: RunContext } | undefined;
+      return await loadSkillBody(ref, bridge?.runContext);
     },
     concurrencySafe: true,
     readOnly: true,

@@ -1268,6 +1268,7 @@
       "dependencies": {
         "@crewhaus/boundary-classifier": "workspace:*",
         "@crewhaus/errors": "workspace:*",
+        "@crewhaus/run-context": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
         "yaml": "^2.6.0",
         "zod": "^3.23.8",
@@ -1793,6 +1794,7 @@
         "@crewhaus/boundary-classifier": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/mcp-host": "workspace:*",
+        "@crewhaus/run-context": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
         "zod": "^3.23.8",
