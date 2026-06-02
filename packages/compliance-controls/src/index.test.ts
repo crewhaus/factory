@@ -23,6 +23,7 @@ function makeRecord(
   return {
     ts: partial.ts ?? Date.now(),
     version: 1,
+    seq: partial.seq ?? 0,
     kind: partial.kind,
     payload: partial.payload,
     prevHash: partial.prevHash ?? "GENESIS",
