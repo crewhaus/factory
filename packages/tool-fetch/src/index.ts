@@ -144,8 +144,16 @@ export function _setDnsLookup(fn: DnsLookupFn | undefined): void {
  * private/loopback/link-local/mDNS range. This blocks SSRF on top of the
  * origin allow-list (defence in depth: even if `localhost` is in the
  * allow-list, we still reject it here).
+ *
+ * Returns the validated IP address so the caller can *pin* the connection to
+ * that exact host. Resolving here and connecting somewhere else (the default
+ * `fetch`, which re-resolves at connect time) is a DNS-rebinding TOCTOU: a
+ * hostile resolver can answer with a public IP for this check and a private
+ * one (127.0.0.1, 169.254.169.254, …) milliseconds later for the socket.
+ * `performFetch` dials the returned address directly. For IP-literal hosts the
+ * pinned value is the (normalised) literal itself.
  */
-export async function assertNotSsrf(hostname: string): Promise<void> {
+export async function assertNotSsrf(hostname: string): Promise<string> {
   const lower = hostname.toLowerCase();
 
   if (lower === "localhost" || lower.endsWith(".localhost")) {
@@ -158,8 +166,17 @@ export async function assertNotSsrf(hostname: string): Promise<void> {
     throw new FetchPermissionError(`SSRF: host "${hostname}" is a private/loopback IP`);
   }
 
+  // An IP literal is its own pinned target — no DNS lookup, nothing to rebind.
+  // Strip any IPv6 brackets so the pinned value matches a resolver's output.
+  const unbracketed = lower.replace(/^\[/, "").replace(/\]$/, "");
+  const literal = normalizeIpv4(unbracketed) ?? (unbracketed.includes(":") ? unbracketed : null);
+  if (literal !== null) {
+    return literal;
+  }
+
   // Resolve the hostname so a public-looking name that points to 127.0.0.1
-  // (DNS rebinding) is still caught.
+  // (DNS rebinding) is still caught — and return the resolved address so the
+  // caller connects to *this* IP rather than re-resolving at connect time.
   let resolved: { readonly address: string; readonly family: number };
   try {
     resolved = await dnsLookupFn(lower);
@@ -172,20 +189,99 @@ export async function assertNotSsrf(hostname: string): Promise<void> {
       `SSRF: host "${hostname}" resolves to private IP ${resolved.address}`,
     );
   }
+  return resolved.address;
+}
+
+/**
+ * Normalise an IPv4 literal to canonical dotted-decimal. Browsers and many
+ * HTTP stacks accept octal (`0177.0.0.1`), hex (`0x7f.0.0.1` / `0x7f000001`),
+ * and 32-bit integer (`2130706433`) forms — all of which resolve to the same
+ * address as `127.0.0.1`. We canonicalise here so `isPrivateIp` classifies
+ * them, closing an SSRF allow-list bypass. Returns the dotted-decimal form, or
+ * `null` if `raw` is not a recognisable IPv4 literal.
+ */
+function normalizeIpv4(raw: string): string | null {
+  const trimmed = raw.trim();
+  if (trimmed === "") return null;
+
+  const parseComponent = (s: string): number | null => {
+    if (s === "") return null;
+    let value: number;
+    if (/^0[xX][0-9a-fA-F]+$/.test(s)) {
+      value = Number.parseInt(s.slice(2), 16);
+    } else if (/^0[0-7]+$/.test(s)) {
+      value = Number.parseInt(s, 8);
+    } else if (/^[0-9]+$/.test(s)) {
+      value = Number.parseInt(s, 10);
+    } else {
+      return null;
+    }
+    return Number.isNaN(value) ? null : value;
+  };
+
+  const segments = trimmed.split(".");
+  if (segments.length > 4) return null;
+
+  const components: number[] = [];
+  for (const seg of segments) {
+    const value = parseComponent(seg);
+    if (value === null || value < 0) return null;
+    components.push(value);
+  }
+
+  // RFC-3986-style packing: the final component absorbs the remaining bytes
+  // (e.g. `127.1` ⇒ 127.0.0.1, `2130706433` ⇒ 127.0.0.1, `0x7f.0.0.1`).
+  const n = components.length;
+  const octets = [0, 0, 0, 0];
+  for (let i = 0; i < n - 1; i++) {
+    const c = components[i] as number;
+    if (c > 255) return null;
+    octets[i] = c;
+  }
+  const last = components[n - 1] as number;
+  const maxLast = 2 ** (8 * (4 - (n - 1)));
+  if (last >= maxLast) return null;
+  let rest = last;
+  for (let i = 3; i >= n - 1; i--) {
+    octets[i] = rest & 0xff;
+    rest = Math.floor(rest / 256);
+  }
+  return octets.join(".");
 }
 
 function isPrivateIp(addr: string): boolean {
   // Strip IPv6 brackets if present.
   const ip = addr.replace(/^\[/, "").replace(/\]$/, "");
+  const lowerIp = ip.toLowerCase();
 
-  // IPv6 loopback / link-local / unique-local
-  if (ip === "::1") return true;
-  if (ip.toLowerCase().startsWith("fe80:")) return true;
-  if (ip.toLowerCase().startsWith("fc") || ip.toLowerCase().startsWith("fd")) return true;
+  // IPv6 unspecified / loopback / link-local / unique-local
+  if (lowerIp === "::" || lowerIp === "::1") return true;
+  if (lowerIp.startsWith("fe80:")) return true;
+  if (lowerIp.startsWith("fc") || lowerIp.startsWith("fd")) return true;
 
-  // IPv4 dotted-quad parsing
-  const parts = ip.split(".").map((p) => Number.parseInt(p, 10));
-  if (parts.length !== 4 || parts.some((n) => Number.isNaN(n) || n < 0 || n > 255)) {
+  // IPv4-mapped IPv6 (e.g. ::ffff:127.0.0.1 / ::ffff:7f00:1) — classify by the
+  // embedded IPv4 address so a mapped literal can't smuggle past the checks.
+  const mapped = lowerIp.match(/^::ffff:(.+)$/);
+  if (mapped) {
+    const tail = mapped[1] as string;
+    if (tail.includes(".")) {
+      return isPrivateIp(tail);
+    }
+    // Hex form ::ffff:7f00:0001 → 127.0.0.1
+    const hexGroups = tail.split(":");
+    if (hexGroups.length === 2 && hexGroups.every((g) => /^[0-9a-f]{1,4}$/.test(g))) {
+      const hi = Number.parseInt(hexGroups[0] as string, 16);
+      const lo = Number.parseInt(hexGroups[1] as string, 16);
+      return isPrivateIp([(hi >> 8) & 0xff, hi & 0xff, (lo >> 8) & 0xff, lo & 0xff].join("."));
+    }
+    return false;
+  }
+
+  // IPv4 — normalise octal/hex/integer literals to dotted-decimal first.
+  const normalized = normalizeIpv4(ip);
+  if (normalized === null) return false;
+  const parts = normalized.split(".").map((p) => Number.parseInt(p, 10));
+  if (parts.length !== 4 || parts.some((nn) => Number.isNaN(nn) || nn < 0 || nn > 255)) {
     return false;
   }
   const [a, b] = parts as [number, number, number, number];
@@ -195,6 +291,9 @@ function isPrivateIp(addr: string): boolean {
   if (a === 169 && b === 254) return true; // 169.254.0.0/16 link-local + AWS metadata
   if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12 RFC1918
   if (a === 192 && b === 168) return true; // 192.168.0.0/16 RFC1918
+  if (a === 100 && b >= 64 && b <= 127) return true; // 100.64.0.0/10 CGNAT (RFC6598)
+  if (a === 192 && b === 0 && parts[2] === 0) return true; // 192.0.0.0/24 IETF protocol (RFC6890)
+  if (a === 198 && (b === 18 || b === 19)) return true; // 198.18.0.0/15 benchmarking (RFC2544)
   if (a === 0) return true; // 0.0.0.0/8
   return false;
 }
@@ -266,13 +365,59 @@ function formatResponse(res: Response, body: string): string {
 
 /**
  * Fetcher injection point used by tests so they can supply a mocked
- * `fetch` without touching the network. Production callers leave it at
- * `globalThis.fetch`.
+ * `fetch` without touching the network. Production callers leave it at the
+ * IP-pinning default below.
+ *
+ * `pinnedIp` is the address `assertNotSsrf` validated for `req`'s host. The
+ * production fetcher connects to *that* address (preserving the original Host
+ * header and TLS SNI) so the socket can't be rebound to a private IP between
+ * the SSRF check and `connect()`. Test stubs may ignore the argument.
  */
-export type RawFetch = (req: Request) => Promise<Response>;
-let rawFetch: RawFetch = (req) => globalThis.fetch(req);
+export type RawFetch = (req: Request, pinnedIp: string) => Promise<Response>;
+
+/**
+ * Dial `pinnedIp` directly while keeping the request's original host for the
+ * `Host` header and TLS SNI, so certificate validation and virtual-host
+ * routing still work against the real hostname.
+ */
+function pinnedFetch(req: Request, pinnedIp: string): Promise<Response> {
+  const original = new URL(req.url);
+  const host = original.hostname;
+  const hostUnbracketed = host.replace(/^\[/, "").replace(/\]$/, "");
+
+  // Already an IP literal (or no resolution happened) ⇒ nothing to rewrite.
+  if (hostUnbracketed === pinnedIp || pinnedIp === "") {
+    return globalThis.fetch(req);
+  }
+
+  // Rebuild the URL pointing at the pinned IP. Bracket IPv6 literals.
+  const hostForUrl = pinnedIp.includes(":") ? `[${pinnedIp}]` : pinnedIp;
+  const pinnedUrl = new URL(original.toString());
+  pinnedUrl.hostname = hostForUrl;
+
+  const headers = new Headers(req.headers);
+  // Preserve virtual-host routing against the real name.
+  headers.set("host", original.port === "" ? host : `${host}:${original.port}`);
+
+  const init: RequestInit & { tls?: { serverName: string } } = {
+    method: req.method,
+    headers,
+    redirect: "manual",
+    signal: req.signal,
+    // SNI must still be the real hostname so TLS cert validation passes.
+    tls: { serverName: host },
+  };
+  if (req.method !== "GET" && req.method !== "HEAD") {
+    init.body = req.body;
+    // Streaming a request body in Bun/undici requires duplex: "half".
+    (init as { duplex?: string }).duplex = "half";
+  }
+  return globalThis.fetch(pinnedUrl.toString(), init);
+}
+
+let rawFetch: RawFetch = pinnedFetch;
 export function _setRawFetch(fn: RawFetch | undefined): void {
-  rawFetch = fn ?? ((req) => globalThis.fetch(req));
+  rawFetch = fn ?? pinnedFetch;
 }
 
 async function performFetch(
@@ -290,7 +435,10 @@ async function performFetch(
       );
     }
     checkOriginAllowed(currentUrl);
-    await assertNotSsrf(currentUrl.hostname);
+    // Re-validate every hop and pin the connection to the exact IP we just
+    // vetted, so a rebinding resolver can't swap in a private address between
+    // this check and the socket connect (CWE-367 TOCTOU).
+    const pinnedIp = await assertNotSsrf(currentUrl.hostname);
 
     const init: RequestInit = {
       method,
@@ -299,7 +447,7 @@ async function performFetch(
       ...(body !== undefined ? { body } : {}),
       headers: headers ?? {},
     };
-    const res = await rawFetch(new Request(currentUrl.toString(), init));
+    const res = await rawFetch(new Request(currentUrl.toString(), init), pinnedIp);
 
     if (res.status >= 300 && res.status < 400 && res.headers.has("location")) {
       const loc = res.headers.get("location") ?? "";
