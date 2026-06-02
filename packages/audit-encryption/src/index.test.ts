@@ -1,11 +1,16 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
 import { createCipheriv, createHash, randomBytes } from "node:crypto";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createEnvVarBackend, createSecrets } from "@crewhaus/secrets-manager";
 import {
   AuditEncryptionError,
   type EncryptedRecord,
   InMemoryDekStore,
   createAuditEncryption,
+  createFileDekStore,
+  staticKekProvider,
 } from "./index";
 
 function setKek(name: string, value: string): void {
@@ -309,5 +314,203 @@ describe("#164 — DEK versioning + rotation re-keys (CWE-323)", () => {
     const record = await enc.encryptPayload({ x: 1 }, "tenant-a");
     const orphaned = { ...record, kekRef: "kek:KEK_TEST:unknown-9999" };
     await expect(enc.decryptPayload(orphaned)).rejects.toThrow(/no KEK material retained/);
+  });
+});
+
+describe("#163/#164 follow-up — persistent FileDekStore across restart", () => {
+  const tmpDirs: string[] = [];
+  function freshDir(): string {
+    const d = mkdtempSync(join(tmpdir(), "audit-enc-dek-"));
+    tmpDirs.push(d);
+    return d;
+  }
+  afterAll(() => {
+    for (const d of tmpDirs) rmSync(d, { recursive: true, force: true });
+  });
+
+  const V1 = "kek-v1-secret-12345678";
+  const V2 = "kek-v2-secret-87654321";
+  const V1_REF = "kek:KEK_TEST:v1";
+  const V2_REF = "kek:KEK_TEST:v2";
+
+  test("FileDekStore is a drop-in DekStore: encrypt + decrypt round-trip", async () => {
+    const dir = freshDir();
+    setKek("KEK_TEST", V1);
+    const secrets = createSecrets({ backend: createEnvVarBackend() });
+    const store = createFileDekStore(dir, staticKekProvider({ kekRef: V1_REF, kekValue: V1 }));
+    const enc = await createAuditEncryption({ secrets, kekName: "KEK_TEST", dekStore: store });
+    const rec = await enc.encryptPayload({ event: "x" }, "tenant-a");
+    expect(await enc.decryptPayload(rec)).toEqual({ event: "x" });
+    // The tenant's DEK file exists on disk after the first write.
+    expect(existsSync(join(dir, "dek-tenant-a.json"))).toBe(true);
+  });
+
+  test("persisted DEK file is wrapped (no raw key bytes, no KEK value) and 0o600", async () => {
+    const dir = freshDir();
+    setKek("KEK_TEST", V1);
+    const secrets = createSecrets({ backend: createEnvVarBackend() });
+    const store = createFileDekStore(dir, staticKekProvider({ kekRef: V1_REF, kekValue: V1 }));
+    const enc = await createAuditEncryption({ secrets, kekName: "KEK_TEST", dekStore: store });
+    await enc.encryptPayload({ event: "x" }, "tenant-a");
+
+    const file = join(dir, "dek-tenant-a.json");
+    // File is owner-read/write only (0o600). Mask to the permission bits.
+    expect(statSync(file).mode & 0o777).toBe(0o600);
+
+    const raw = readFileSync(file, "utf8");
+    const parsed = JSON.parse(raw);
+    // Persists ONLY the wrapped DEK + binding metadata — never the KEK value.
+    expect(parsed).toMatchObject({
+      version: 1,
+      uses: 1,
+      kekRef: V1_REF,
+      kekSalt: expect.stringMatching(/^[a-f0-9]{32}$/),
+      wrappedDek: expect.stringMatching(/^[a-f0-9]+$/),
+      wrappedDekIv: expect.stringMatching(/^[a-f0-9]{24}$/),
+      wrappedDekTag: expect.stringMatching(/^[a-f0-9]{32}$/),
+    });
+    expect(parsed).not.toHaveProperty("dek");
+    // The operator KEK value must not appear anywhere in the file.
+    expect(raw).not.toContain(V1);
+  });
+
+  test("FRESH engine on the same file store decrypts a pre-rotation record after restart", async () => {
+    const dir = freshDir();
+
+    // --- Process 1: boot under v1, encrypt, then rotate to v2. ---
+    setKek("KEK_TEST", V1);
+    const secrets1 = createSecrets({ backend: createEnvVarBackend() });
+    const store1 = createFileDekStore(dir, staticKekProvider({ kekRef: V1_REF, kekValue: V1 }));
+    const enc1 = await createAuditEncryption({
+      secrets: secrets1,
+      kekName: "KEK_TEST",
+      dekStore: store1,
+    });
+
+    const before = await enc1.encryptPayload({ era: "v1" }, "tenant-a");
+    expect(before.kekRef).toBe(V1_REF);
+    expect(before.dekRef).toBe("dek:tenant-a:v1");
+
+    await enc1.rotateKek(V2, V2_REF);
+    expect(enc1.kekRef).toBe(V2_REF);
+
+    // --- Simulate a restart: brand-new engine + store, same dir. The
+    // operator re-provides the current (post-rotation) KEK as the boot
+    // value and re-supplies the prior KEK as retained material. Nothing
+    // from process 1's in-memory state carries over. ---
+    setKek("KEK_TEST", V2); // backend now returns the rotated value
+    const secrets2 = createSecrets({ backend: createEnvVarBackend() });
+    const store2 = createFileDekStore(
+      dir,
+      staticKekProvider({ kekRef: V2_REF, kekValue: V2 }, [{ kekRef: V1_REF, kekValue: V1 }]),
+    );
+    const enc2 = await createAuditEncryption({
+      secrets: secrets2,
+      kekName: "KEK_TEST",
+      kekRef: V2_REF, // boot value is the v2 material; pin its true ref
+      retainedKeks: [{ kekRef: V1_REF, kekValue: V1 }],
+      dekStore: store2,
+    });
+
+    // The pre-rotation record (sealed under v1) still decrypts.
+    expect(await enc2.decryptPayload(before)).toEqual({ era: "v1" });
+
+    // The DEK use-count + version survived the restart: the rotation in
+    // process 1 re-minted tenant-a to v2, and the fresh engine sees that
+    // (it does NOT reset to a fresh v1 DEK).
+    const after = await enc2.encryptPayload({ era: "v2" }, "tenant-a");
+    expect(after.kekRef).toBe(V2_REF);
+    expect(after.dekRef).toBe("dek:tenant-a:v2");
+    expect(await enc2.decryptPayload(after)).toEqual({ era: "v2" });
+  }, 20_000);
+
+  test("use-count survives restart (DEK does not roll prematurely)", async () => {
+    const dir = freshDir();
+    setKek("KEK_TEST", V1);
+
+    // Process 1: two writes against a maxRecordsPerDek of 3 (uses -> 2).
+    const secrets1 = createSecrets({ backend: createEnvVarBackend() });
+    const store1 = createFileDekStore(dir, staticKekProvider({ kekRef: V1_REF, kekValue: V1 }));
+    const enc1 = await createAuditEncryption({
+      secrets: secrets1,
+      kekName: "KEK_TEST",
+      dekStore: store1,
+      maxRecordsPerDek: 3,
+    });
+    const r1 = await enc1.encryptPayload({ n: 1 }, "tenant-a");
+    const r2 = await enc1.encryptPayload({ n: 2 }, "tenant-a");
+    expect(r1.dekRef).toBe("dek:tenant-a:v1");
+    expect(r2.dekRef).toBe("dek:tenant-a:v1");
+
+    // Restart: fresh engine + store on the same dir, same KEK. The use
+    // counter is read from disk (=2), so the 3rd write stays on v1 and the
+    // 4th rolls to v2 — proving the counter was not reset to 0.
+    const secrets2 = createSecrets({ backend: createEnvVarBackend() });
+    const store2 = createFileDekStore(dir, staticKekProvider({ kekRef: V1_REF, kekValue: V1 }));
+    const enc2 = await createAuditEncryption({
+      secrets: secrets2,
+      kekName: "KEK_TEST",
+      dekStore: store2,
+      maxRecordsPerDek: 3,
+    });
+    const r3 = await enc2.encryptPayload({ n: 3 }, "tenant-a");
+    const r4 = await enc2.encryptPayload({ n: 4 }, "tenant-a");
+    expect(r3.dekRef).toBe("dek:tenant-a:v1"); // 3rd use still fits v1
+    expect(r4.dekRef).toBe("dek:tenant-a:v2"); // 4th rolls — counter persisted
+
+    // All four records still decrypt under the persisted DEKs.
+    expect(await enc2.decryptPayload(r1)).toEqual({ n: 1 });
+    expect(await enc2.decryptPayload(r3)).toEqual({ n: 3 });
+    expect(await enc2.decryptPayload(r4)).toEqual({ n: 4 });
+  });
+
+  test("reading a DEK file without its KEK material throws a clear error", async () => {
+    const dir = freshDir();
+    setKek("KEK_TEST", V1);
+    const secrets = createSecrets({ backend: createEnvVarBackend() });
+    // Persist a DEK wrapped under v1...
+    const writeStore = createFileDekStore(dir, staticKekProvider({ kekRef: V1_REF, kekValue: V1 }));
+    const enc = await createAuditEncryption({
+      secrets,
+      kekName: "KEK_TEST",
+      dekStore: writeStore,
+    });
+    await enc.encryptPayload({ x: 1 }, "tenant-a");
+
+    // ...then try to read it with a provider that lacks v1 entirely.
+    const blindStore = createFileDekStore(dir, staticKekProvider({ kekRef: V2_REF, kekValue: V2 }));
+    await expect(blindStore.getEntry?.("tenant-a")).rejects.toThrow(/no KEK material for kekRef/);
+  });
+
+  test("createFileDekStore rejects an empty rootDir", () => {
+    expect(() =>
+      createFileDekStore("", staticKekProvider({ kekRef: V1_REF, kekValue: V1 })),
+    ).toThrow(/rootDir is required/);
+  });
+
+  test("FileDekStore.tenants lists persisted tenants for rotation", async () => {
+    const dir = freshDir();
+    setKek("KEK_TEST", V1);
+    const secrets = createSecrets({ backend: createEnvVarBackend() });
+    const store = createFileDekStore(dir, staticKekProvider({ kekRef: V1_REF, kekValue: V1 }));
+    const enc = await createAuditEncryption({ secrets, kekName: "KEK_TEST", dekStore: store });
+    await enc.encryptPayload({ x: 1 }, "tenant-a");
+    await enc.encryptPayload({ x: 1 }, "tenant-b");
+    const tenants = await store.tenants?.();
+    expect([...(tenants ?? [])].sort()).toEqual(["tenant-a", "tenant-b"]);
+  });
+});
+
+describe("staticKekProvider", () => {
+  test("resolves current + retained, current wins on ref collision", () => {
+    const p = staticKekProvider({ kekRef: "kek:a:v2", kekValue: "current-value" }, [
+      { kekRef: "kek:a:v1", kekValue: "old-value" },
+      // A stale retained entry under the current ref must not shadow it.
+      { kekRef: "kek:a:v2", kekValue: "stale-value" },
+    ]);
+    expect(p.current()).toEqual({ kekRef: "kek:a:v2", kekValue: "current-value" });
+    expect(p.resolve("kek:a:v1")).toBe("old-value");
+    expect(p.resolve("kek:a:v2")).toBe("current-value");
+    expect(p.resolve("kek:a:unknown")).toBeUndefined();
   });
 });
