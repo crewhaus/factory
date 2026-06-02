@@ -1,9 +1,36 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { createHmac } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type Tenant, buildTenant } from "@crewhaus/tenancy";
 import { createGatewayServer, signJwt, verifyJwt } from "./index";
+
+/**
+ * Forge a token with an arbitrary header + claims (signed with `secret`) so
+ * we can exercise rejection paths `signJwt` would never produce — e.g. an
+ * `alg: none` header or a body with no `exp`.
+ */
+function forgeToken(
+  header: Record<string, unknown>,
+  claims: Record<string, unknown>,
+  secret: string,
+): string {
+  const b64url = (s: string): string =>
+    Buffer.from(s, "utf8")
+      .toString("base64")
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_")
+      .replace(/=+$/, "");
+  const data = `${b64url(JSON.stringify(header))}.${b64url(JSON.stringify(claims))}`;
+  const sig = createHmac("sha256", secret)
+    .update(data)
+    .digest("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+  return `${data}.${sig}`;
+}
 
 let tmp: string;
 
@@ -60,6 +87,46 @@ describe("JWT round-trip", () => {
   test("rejects invalid tenant_id (path traversal)", () => {
     const token = signJwt({ tenant_id: "../etc" }, SECRET);
     expect(() => verifyJwt(token, SECRET)).toThrow(/invalid tenantId/);
+  });
+
+  test("valid short-lived HS256 token verifies", () => {
+    const iat = Math.floor(Date.now() / 1000);
+    const token = signJwt({ tenant_id: "tenant-a", iat, exp: iat + 300 }, SECRET);
+    const claims = verifyJwt(token, SECRET);
+    expect(claims.tenant_id).toBe("tenant-a");
+    expect(claims.exp).toBe(iat + 300);
+  });
+
+  test("rejects token with no exp claim (CWE-613)", () => {
+    // Forge directly — `signJwt` always injects an exp.
+    const token = forgeToken({ alg: "HS256", typ: "JWT" }, { tenant_id: "tenant-a" }, SECRET);
+    expect(() => verifyJwt(token, SECRET)).toThrow(/missing exp/);
+  });
+
+  test("rejects token whose header alg is not HS256", () => {
+    const iat = Math.floor(Date.now() / 1000);
+    const token = forgeToken(
+      { alg: "none", typ: "JWT" },
+      { tenant_id: "tenant-a", iat, exp: iat + 300 },
+      SECRET,
+    );
+    expect(() => verifyJwt(token, SECRET)).toThrow(/unsupported alg/);
+  });
+
+  test("rejects token whose header typ is not JWT", () => {
+    const iat = Math.floor(Date.now() / 1000);
+    const token = forgeToken(
+      { alg: "HS256", typ: "JWE" },
+      { tenant_id: "tenant-a", iat, exp: iat + 300 },
+      SECRET,
+    );
+    expect(() => verifyJwt(token, SECRET)).toThrow(/unsupported typ/);
+  });
+
+  test("rejects a token whose lifetime exceeds the 24h ceiling", () => {
+    const iat = Math.floor(Date.now() / 1000);
+    const token = signJwt({ tenant_id: "tenant-a", iat, exp: iat + 25 * 60 * 60 }, SECRET);
+    expect(() => verifyJwt(token, SECRET)).toThrow(/lifetime exceeds maximum/);
   });
 });
 

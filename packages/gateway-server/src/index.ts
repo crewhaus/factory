@@ -56,6 +56,20 @@ export type JwtClaims = {
 // HS256 JWT — minimal verifier and signer (no external deps).
 // ---------------------------------------------------------------------------
 
+/** Only HS256 is accepted — guards against `alg` confusion (e.g. `none`). */
+const JWT_ALG = "HS256";
+/** Only compact JWS bearer tokens are accepted. */
+const JWT_TYP = "JWT";
+/** Reject tokens whose lifetime (`exp - iat`) exceeds this when `iat` is present. */
+const MAX_JWT_LIFETIME_SECONDS = 24 * 60 * 60;
+/** Allowed clock skew when checking `iat` is not in the future. */
+const IAT_SKEW_MS = 60_000;
+
+type JwtHeader = {
+  readonly alg?: string;
+  readonly typ?: string;
+};
+
 function b64urlEncode(input: Uint8Array | string): string {
   const buf = typeof input === "string" ? Buffer.from(input, "utf8") : Buffer.from(input);
   return buf.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
@@ -67,8 +81,13 @@ function b64urlDecode(input: string): Buffer {
 }
 
 export function signJwt(claims: JwtClaims, secret: string): string {
-  const header = b64urlEncode(JSON.stringify({ alg: "HS256", typ: "JWT" }));
-  const body = b64urlEncode(JSON.stringify(claims));
+  // Convenience minter (tests + smoke only). Default `iat`/`exp` so emitted
+  // tokens satisfy the verifier's mandatory-`exp` + bounded-lifetime contract;
+  // production tokens come from an external IDP.
+  const iat = claims.iat ?? Math.floor(Date.now() / 1000);
+  const exp = claims.exp ?? iat + 60 * 60;
+  const header = b64urlEncode(JSON.stringify({ alg: JWT_ALG, typ: JWT_TYP }));
+  const body = b64urlEncode(JSON.stringify({ ...claims, iat, exp }));
   const data = `${header}.${body}`;
   const sig = createHmac("sha256", secret).update(data).digest();
   return `${data}.${b64urlEncode(sig)}`;
@@ -80,6 +99,20 @@ export function verifyJwt(token: string, secret: string, now: () => number = Dat
     throw new GatewayServerError("malformed JWT — expected 3 segments");
   }
   const [headerB64, bodyB64, sigB64] = parts as [string, string, string];
+  // Validate the header (alg/typ) BEFORE spending an HMAC — rejects
+  // `alg: none` / algorithm-confusion tokens up front.
+  let header: JwtHeader;
+  try {
+    header = JSON.parse(b64urlDecode(headerB64).toString("utf8")) as JwtHeader;
+  } catch (err) {
+    throw new GatewayServerError("malformed JWT header", err);
+  }
+  if (header.alg !== JWT_ALG) {
+    throw new GatewayServerError(`JWT unsupported alg — expected ${JWT_ALG}`);
+  }
+  if (header.typ !== JWT_TYP) {
+    throw new GatewayServerError(`JWT unsupported typ — expected ${JWT_TYP}`);
+  }
   const data = `${headerB64}.${bodyB64}`;
   const expected = createHmac("sha256", secret).update(data).digest();
   let actual: Buffer;
@@ -105,11 +138,26 @@ export function verifyJwt(token: string, secret: string, now: () => number = Dat
   }
   validateTenantId(claims.tenant_id);
   const nowMs = now();
-  if (claims.exp !== undefined && claims.exp * 1000 < nowMs) {
+  // `exp` is mandatory — an absent (or non-numeric) `exp` must not mean
+  // "never expires" (CWE-613).
+  if (typeof claims.exp !== "number" || !Number.isFinite(claims.exp)) {
+    throw new GatewayServerError("JWT missing exp claim");
+  }
+  if (claims.exp * 1000 <= nowMs) {
     throw new GatewayServerError("JWT expired");
   }
-  if (claims.iat !== undefined && claims.iat * 1000 > nowMs + 60_000) {
-    throw new GatewayServerError("JWT iat in the future");
+  if (claims.iat !== undefined) {
+    if (typeof claims.iat !== "number" || !Number.isFinite(claims.iat)) {
+      throw new GatewayServerError("JWT malformed iat claim");
+    }
+    if (claims.iat * 1000 > nowMs + IAT_SKEW_MS) {
+      throw new GatewayServerError("JWT iat in the future");
+    }
+    // Bound the maximum lifetime — a token cannot outlive its `iat` by more
+    // than the configured ceiling.
+    if (claims.exp - claims.iat > MAX_JWT_LIFETIME_SECONDS) {
+      throw new GatewayServerError("JWT lifetime exceeds maximum");
+    }
   }
   return claims;
 }
