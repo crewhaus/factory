@@ -23,6 +23,7 @@
  */
 import type { ProviderAdapter } from "@crewhaus/adapter-anthropic";
 import type { CrewMailbox } from "@crewhaus/agent-context-isolation";
+import { classifyBoundary } from "@crewhaus/boundary-classifier";
 import { CrewhausError } from "@crewhaus/errors";
 import { type EventLog, openEventLog } from "@crewhaus/event-log";
 import {
@@ -31,7 +32,7 @@ import {
   type RuleSet,
   emptyRuleSet,
 } from "@crewhaus/permission-engine";
-import { type RunContext, createRunContext } from "@crewhaus/run-context";
+import { type RunContext, createRunContext, tagContent } from "@crewhaus/run-context";
 import { runChatLoop } from "@crewhaus/runtime-core";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import type {
@@ -398,6 +399,10 @@ async function* driveCrew(
         kind: "a2a_turn_start",
         payload: { from: savedRole, to: toRole },
       });
+      // Pillar 3 cross-agent boundary site — classify the sender-supplied
+      // payload before it becomes the peer's seed, redacting on a malicious
+      // verdict and tagging an allowed one (mirrors the handoff path).
+      const safePayload = await classifyCrossAgentText(runContext, payload);
       try {
         const reply = await runChatLoop({
           model: peerDef.model,
@@ -412,7 +417,7 @@ async function* driveCrew(
           seedMessages: [
             {
               role: "user",
-              content: `[A2A from ${savedRole} → ${toRole}]\n\n${payload}`,
+              content: `[A2A from ${savedRole} → ${toRole}]\n\n${safePayload}`,
             },
           ],
           tools: composeRoleTools({
@@ -547,7 +552,7 @@ async function* driveCrew(
           });
           lastAccessedFrom = ho.from;
           currentRoleName = ho.to;
-          messages = buildHandoffSeed(ho);
+          messages = await buildHandoffSeed(runContext, ho);
           continue;
         }
 
@@ -653,22 +658,48 @@ type HandoffEventInternal = {
   context?: unknown;
 };
 
-function buildHandoffSeed(
+/**
+ * Pillar 3 cross-agent boundary site. In-crew handoffs and A2A sends carry
+ * sender-supplied strings (reason / context / payload) straight into the
+ * receiving role's seed — a compromised crew member could otherwise inject
+ * instructions into a peer, the lateral vector sub-agent-spawner already
+ * closes on `finalMessage`. Classify with the cross-agent `"subagent"`
+ * origin (reused so this stays in-package), redact on a malicious verdict
+ * before the text becomes the receiver's seed, and tag a non-blocked
+ * verdict so the receiver's egress checks see the provenance.
+ */
+async function classifyCrossAgentText(ctx: RunContext, text: string): Promise<string> {
+  const boundary = await classifyBoundary(text, { origin: "subagent" });
+  if (boundary.action === "redact" && boundary.redacted !== undefined) {
+    return boundary.redacted;
+  }
+  tagContent(ctx, text, "subagent");
+  return text;
+}
+
+function serialiseContext(context: unknown): string {
+  if (typeof context === "string") return context;
+  try {
+    return JSON.stringify(context, null, 2);
+  } catch {
+    return String(context);
+  }
+}
+
+/**
+ * Build the receiving role's seed for a handoff. The sender-supplied
+ * `reason` and `context` are classified at the `"subagent"` boundary (see
+ * `classifyCrossAgentText`) before they land in the seed.
+ */
+async function buildHandoffSeed(
+  ctx: RunContext,
   ho: HandoffEventInternal,
-): ReadonlyArray<{ role: "user" | "assistant"; content: string }> {
-  const parts: string[] = [`[Handoff from ${ho.from}]\n\nReason: ${ho.reason}`];
+): Promise<ReadonlyArray<{ role: "user" | "assistant"; content: string }>> {
+  const safeReason = await classifyCrossAgentText(ctx, ho.reason);
+  const parts: string[] = [`[Handoff from ${ho.from}]\n\nReason: ${safeReason}`];
   if (ho.context !== undefined) {
-    let serialised: string;
-    if (typeof ho.context === "string") {
-      serialised = ho.context;
-    } else {
-      try {
-        serialised = JSON.stringify(ho.context, null, 2);
-      } catch {
-        serialised = String(ho.context);
-      }
-    }
-    parts.push(`Context:\n${serialised}`);
+    const safeContext = await classifyCrossAgentText(ctx, serialiseContext(ho.context));
+    parts.push(`Context:\n${safeContext}`);
   }
   parts.push(
     "You now own the conversation. Continue the work end-to-end, calling tools as needed, and respond directly to the user when you are done.",

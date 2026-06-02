@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import type { ToolDefinition } from "@crewhaus/tool-catalog";
+import type { RegisteredTool, ToolDefinition, ToolIoCapability } from "@crewhaus/tool-catalog";
 import { z } from "zod";
-import { OUTWARD_TOOL_NAMES, buildTool, isOutwardName } from "./index";
+import { OUTWARD_TOOL_NAMES, auditToolScopes, buildTool, isOutwardName } from "./index";
 
 const echoSchema = z.object({ message: z.string() });
 type EchoInput = z.infer<typeof echoSchema>;
@@ -209,6 +209,72 @@ describe("buildTool — jsonSchema passthrough", () => {
     };
     const tool = buildTool({ ...echoDef, jsonSchema: raw });
     expect(tool.jsonSchema).toBe(raw);
+  });
+});
+
+describe("auditToolScopes — FR-002 pure scope gate", () => {
+  // auditToolScopes reads `.name`, `.scope`, and `.ioCapability` only; minimal
+  // doubles let us express the exact triples under audit — including the
+  // dangerous "outward name / io-capable but forced internal" cases that the
+  // fail-closed buildTool default plus an explicit scope override can produce.
+  function mkTool(
+    name: string,
+    scope: "internal" | "external",
+    ioCapability?: ToolIoCapability,
+  ): RegisteredTool {
+    return { name, scope, ...(ioCapability ? { ioCapability } : {}) } as unknown as RegisteredTool;
+  }
+
+  test("flags a network tool left scope:'internal' (capability path, novel name)", () => {
+    const findings = auditToolScopes([mkTool("SomeCustomSocketTool", "internal", "network")]);
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.toolName).toBe("SomeCustomSocketTool");
+    expect(findings[0]?.reason).toContain('ioCapability "network"');
+    expect(findings[0]?.reason).toContain('scope is "internal"');
+  });
+
+  test("flags a process tool left scope:'internal' (capability path)", () => {
+    const findings = auditToolScopes([mkTool("RunDaemon", "internal", "process")]);
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.reason).toContain('ioCapability "process"');
+  });
+
+  test("flags an outward-named tool forced internal (name backstop)", () => {
+    const findings = auditToolScopes([mkTool("Fetch", "internal")]);
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.toolName).toBe("Fetch");
+    expect(findings[0]?.reason).toContain('expected "external"');
+  });
+
+  test("flags a namespaced MCP tool forced internal (mcp__ prefix)", () => {
+    expect(auditToolScopes([mkTool("mcp__slack__send", "internal")])).toHaveLength(1);
+  });
+
+  test("passes a correctly-annotated set (external io-capable + external outward + internal compute)", () => {
+    const clean = auditToolScopes([
+      mkTool("SomeCustomSocketTool", "external", "network"),
+      mkTool("Fetch", "external"),
+      mkTool("read", "internal"),
+    ]);
+    expect(clean).toHaveLength(0);
+  });
+
+  test("reports every mis-scoped tool, leaving correct ones unflagged", () => {
+    const findings = auditToolScopes([
+      mkTool("Fetch", "internal"), // flagged (outward name)
+      mkTool("WebSearch", "external"), // ok
+      mkTool("SendMessage", "internal"), // flagged (outward name)
+      mkTool("read", "internal"), // ok (internal compute)
+    ]);
+    expect(findings.map((f) => f.toolName).sort()).toEqual(["Fetch", "SendMessage"]);
+  });
+
+  test("an empty tool set produces no findings", () => {
+    expect(auditToolScopes([])).toHaveLength(0);
+  });
+
+  test("a tool with NEITHER capability nor outward name is not flagged (documented residual)", () => {
+    expect(auditToolScopes([mkTool("opaque", "internal")])).toHaveLength(0);
   });
 });
 

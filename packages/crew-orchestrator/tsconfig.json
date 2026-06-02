@@ -8,6 +8,7 @@
     { "path": "../a2a-protocol" },
     { "path": "../agent-context-isolation" },
     { "path": "../agent-handoff" },
+    { "path": "../boundary-classifier" },
     { "path": "../errors" },
     { "path": "../event-log" },
     { "path": "../permission-engine" },

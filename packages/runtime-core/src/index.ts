@@ -1194,8 +1194,11 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     // Skipped for the in-process Task wrapper (`classifyOutput: false`)
     // because the sub-agent's finalMessage is already tagged at the
     // sub-agent-spawner boundary with the more-specific "subagent" origin.
-    // MCP tools tag separately inside tool-mcp with the "mcp" origin so
-    // their lineage carries the more-precise provenance.
+    // MCP tools additionally tag their FULL response under the more-precise
+    // "mcp" origin inside tool-mcp when the runtime threads a RunContext via
+    // the bridge; this coarse "tool" tag of the (possibly truncated) preview
+    // still fires for them as a backstop so the content has lineage even
+    // when no bridge is wired.
     if (tool.classifyOutput !== false && !raw.isError) {
       const taggable =
         typeof finalPreview === "string"

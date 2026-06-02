@@ -15,6 +15,7 @@
     "@crewhaus/a2a-protocol": "workspace:*",
     "@crewhaus/agent-context-isolation": "workspace:*",
     "@crewhaus/agent-handoff": "workspace:*",
+    "@crewhaus/boundary-classifier": "workspace:*",
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/event-log": "workspace:*",
     "@crewhaus/permission-engine": "workspace:*",

@@ -39,6 +39,55 @@ export function isOutwardName(name: string): boolean {
 }
 
 /**
+ * FR-002 — a single per-tool scope finding produced by `auditToolScopes`.
+ * `toolName` is the offending tool's `name`; `reason` is a human-readable
+ * explanation suitable for a `[strict]` diagnostic or a `doctor` line.
+ */
+export type ScopeFinding = { toolName: string; reason: string };
+
+/**
+ * FR-002 — Pillar 3 sink-side build-time gate, as a PURE, side-effect-free
+ * function over already-resolved `RegisteredTool`s. This is the single shared
+ * audit the contributor docs reference (`crewhaus compile --strict` and
+ * `crewhaus doctor --philosophy-alignment`); keeping it here in tool-builder —
+ * next to `isOutwardName` and `buildTool`, the two facts it keys on — means
+ * every consumer audits identically rather than re-deriving the rule.
+ *
+ * A finding fires when a tool is I/O-capable yet its resolved `scope` is not
+ * `"external"`. A tool counts as I/O-capable when EITHER:
+ *
+ *   (a) it declares `ioCapability` ("network" | "process") on its definition —
+ *       the capability-driven path that catches an *arbitrary-named* custom
+ *       `buildTool` tool that opens a socket or spawns a process; or
+ *   (b) its name is definitionally outward-reaching (per `isOutwardName`:
+ *       Fetch/WebFetch/WebSearch/SendMessage/EvmSendTransaction/ImageGenerate
+ *       or any `mcp__*`) — the name backstop for a future built-in that forgets
+ *       BOTH annotations.
+ *
+ * The irreducible residual a static check cannot reach is a tool that declares
+ * NEITHER its capability NOR an outward name; that is the documented limit of
+ * an annotation-based gate short of full dataflow analysis.
+ */
+export function auditToolScopes(tools: ReadonlyArray<RegisteredTool>): ScopeFinding[] {
+  const findings: ScopeFinding[] = [];
+  for (const tool of tools) {
+    if (tool.scope === "external") continue;
+    if (tool.ioCapability !== undefined) {
+      findings.push({
+        toolName: tool.name,
+        reason: `declares ioCapability "${tool.ioCapability}" (crosses a ${tool.ioCapability} boundary) but scope is "${tool.scope}" (expected "external")`,
+      });
+    } else if (isOutwardName(tool.name)) {
+      findings.push({
+        toolName: tool.name,
+        reason: `is outward-reaching by definition but scope is "${tool.scope}" (expected "external")`,
+      });
+    }
+  }
+  return findings;
+}
+
+/**
  * Converts a ToolDefinition into a RegisteredTool by applying fail-closed
  * safety defaults. Any flag not explicitly set in the definition defaults to
  * false (the least-privileged stance).
