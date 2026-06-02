@@ -28,7 +28,7 @@ import { basename, join } from "node:path";
 import { classifyBoundary } from "@crewhaus/boundary-classifier";
 import { CrewhausError } from "@crewhaus/errors";
 import { type RunContext, tagContent } from "@crewhaus/run-context";
-import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
 
@@ -317,6 +317,20 @@ export function formatSkillsForPrompt(skills: ReadonlyArray<SkillRef>): string {
 const skillToolSchema = z.object({ name: z.string().min(1) });
 
 /**
+ * Resolve the run's `RunContext` for provenance tagging. Prefers the
+ * `ctx.runContext` field the runtime threads on EVERY tool execute (#160
+ * follow-up); falls back to the opaque runtime bridge's `runContext`
+ * (Section 13) for back-compat. The bridge is `unknown` to tool-catalog, so
+ * its `runContext` is read structurally to avoid depending on
+ * agent-context-isolation. Returns undefined when neither is present.
+ */
+function resolveRunContext(ctx: ToolExecuteContext | undefined): RunContext | undefined {
+  if (ctx?.runContext !== undefined) return ctx.runContext;
+  const bridge = ctx?.bridge as { runContext?: RunContext } | undefined;
+  return bridge?.runContext;
+}
+
+/**
  * Build the synthetic `Skill` tool that hands the model each skill body
  * on demand. The tool is read-only / concurrency-safe / non-destructive,
  * and exposes the available skill names in its description so the model
@@ -339,14 +353,14 @@ export function createSkillTool(skills: ReadonlyArray<SkillRef>): RegisteredTool
       if (!ref) {
         return `unknown skill "${parsed.name}". Available: ${known || "(none)"}.`;
       }
-      // Thread the RunContext off the opaque runtime bridge (Section 13)
-      // so loadSkillBody can tag the body's provenance into dataLineage.
-      // The bridge is `unknown` to tool-catalog and only populated when the
-      // runtime wires sub-agent / crew support; we read just `runContext`
+      // Thread the RunContext so loadSkillBody can tag the body's provenance
+      // into dataLineage. Prefer `ctx.runContext`, which the runtime now
+      // threads on EVERY tool execute (#160 follow-up); fall back to the
+      // opaque runtime bridge's `runContext` (Section 13) for back-compat —
+      // the bridge is `unknown` to tool-catalog, so we read `runContext`
       // structurally to avoid depending on agent-context-isolation. When
-      // absent the body is still classified, just not tagged.
-      const bridge = ctx?.bridge as { runContext?: RunContext } | undefined;
-      return await loadSkillBody(ref, bridge?.runContext);
+      // neither is present the body is still classified, just not tagged.
+      return await loadSkillBody(ref, resolveRunContext(ctx));
     },
     concurrencySafe: true,
     readOnly: true,

@@ -301,3 +301,69 @@ describe("Pillar 3 boundary fabric — tagContent provenance (#160)", () => {
     expect(ctx.dataLineage).toBeUndefined();
   });
 });
+
+describe("Pillar 3 boundary fabric — precise tag fires on every run (#160-followup)", () => {
+  test('a clean MCP response is tagged "mcp" via ctx.runContext on a plain run (no bridge)', async () => {
+    clearBoundaryCache();
+    // A plain top-level run wires NO bridge (no sub-agent / crew support);
+    // the runtime now threads the RunContext directly on `ctx.runContext`,
+    // so the precise "mcp" origin tag must still fire here.
+    const content = "the quarterly revenue figure is forty-two million dollars (plain run)";
+    const { host } = makeFakeHost({
+      serverName: "data",
+      tools: [{ name: "report", inputSchema: {} }],
+      callImpl: async () => ({ content, isError: false }),
+    });
+    const catalog = new ToolCatalog();
+    await registerMcpServer(host, "data", catalog);
+    const tool = catalog.get("data__report");
+    if (!tool) throw new Error("report not registered");
+
+    const ctx: RunContext = createRunContext();
+    const result = await tool.execute({}, { runContext: ctx });
+
+    expect(result).toBe(content);
+    expect(ctx.dataLineage?.get(content)).toBe("mcp");
+  });
+
+  test("ctx.runContext takes precedence over ctx.bridge.runContext", async () => {
+    clearBoundaryCache();
+    const content = "a multi-word mcp body long enough to clear the lineage floor";
+    const { host } = makeFakeHost({
+      serverName: "data",
+      tools: [{ name: "report", inputSchema: {} }],
+      callImpl: async () => ({ content, isError: false }),
+    });
+    const catalog = new ToolCatalog();
+    await registerMcpServer(host, "data", catalog);
+    const tool = catalog.get("data__report");
+    if (!tool) throw new Error("report not registered");
+
+    const direct: RunContext = createRunContext();
+    const viaBridge: RunContext = createRunContext();
+    // Both surfaces present: the direct field wins, so only `direct` is tagged.
+    await tool.execute({}, { runContext: direct, bridge: { runContext: viaBridge } });
+
+    expect(direct.dataLineage?.get(content)).toBe("mcp");
+    expect(viaBridge.dataLineage).toBeUndefined();
+  });
+
+  test("back-compat: ctx.bridge.runContext still tags when no ctx.runContext is supplied", async () => {
+    clearBoundaryCache();
+    const content = "a bridge-only mcp response body with enough characters to tag";
+    const { host } = makeFakeHost({
+      serverName: "data",
+      tools: [{ name: "report", inputSchema: {} }],
+      callImpl: async () => ({ content, isError: false }),
+    });
+    const catalog = new ToolCatalog();
+    await registerMcpServer(host, "data", catalog);
+    const tool = catalog.get("data__report");
+    if (!tool) throw new Error("report not registered");
+
+    const ctx: RunContext = createRunContext();
+    await tool.execute({}, { bridge: { runContext: ctx } });
+
+    expect(ctx.dataLineage?.get(content)).toBe("mcp");
+  });
+});

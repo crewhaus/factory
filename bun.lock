@@ -1633,6 +1633,7 @@
       "version": "0.1.1",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
+        "@crewhaus/run-context": "workspace:*",
         "zod": "^3.23.8",
       },
     },
