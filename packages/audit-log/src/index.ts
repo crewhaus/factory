@@ -31,12 +31,29 @@
  * IMPORTANT — on-host files are NOT tamper-proof against a same-uid
  * attacker. The 0o600 mode only blocks *other* users; the gateway's own
  * uid (or anything that compromises it) can rewrite both the JSONL and
- * `_chain-tail.json` in lockstep, defeating the anchor check above. True
- * non-repudiation requires an anchor the audit-writer cannot rewrite —
- * an off-host / WORM bucket, a separate-privilege service, or periodic
- * publication to an external transparency log. A *missing* anchor is
- * therefore reported by `verify` as a known limitation (`anchorChecked:
- * false`), never silently treated as a pass.
+ * `_chain-tail.json` in lockstep, defeating the on-host anchor check
+ * above. True non-repudiation requires an anchor the audit-writer cannot
+ * rewrite — an off-host / WORM bucket, a separate-privilege service, or
+ * periodic publication to an external transparency log. A *missing*
+ * on-host anchor is therefore reported by `verify` as a known limitation
+ * (`anchorChecked: false`), never silently treated as a pass.
+ *
+ * Off-host anchor hook (`AnchorStore`). To close the same-uid lockstep
+ * gap, `openAuditLog` and `verify` accept an OPTIONAL pluggable
+ * `AnchorStore` — `{ putAnchor(logId, {seq, hash}), getAnchor(logId) }`.
+ * On each `append`, the new tail `{ seq, hash }` is *best-effort* mirrored
+ * to the store (a put failure never blocks the durable local write). On
+ * `verify`, the external anchor is consulted IN ADDITION to
+ * `_chain-tail.json`: if it witnesses a `seq` the surviving chain no
+ * longer reaches — or a tip hash that disagrees at the anchored seq —
+ * verify FAILS, catching a tail truncation that ALSO rewrote the on-host
+ * `_chain-tail.json` in lockstep (the attacker cannot reach back into the
+ * external store). An anchor that merely lags behind newer appends (the
+ * benign best-effort case) is NOT treated as a failure. This package
+ * ships only an in-memory `InMemoryAnchorStore` reference implementation
+ * for tests/dev; PRODUCTION DEPLOYMENTS SHOULD SUPPLY A WORM-BACKED STORE
+ * (object-lock bucket, append-only/separate-privilege service, or
+ * transparency log) so the audit writer's own uid cannot rewrite it.
  *
  * Files are created with mode 0o600 (owner-only) so the audit trail
  * cannot be read by other users on the host. Append uses
@@ -121,10 +138,71 @@ export class AuditLogError extends CrewhausError {
   }
 }
 
+/**
+ * Off-host anchor commitment for a single log: the latest `{ seq, hash }`
+ * the writer has published externally. Deliberately minimal so a
+ * deployment can back it with a WORM bucket, an append-only/separate-
+ * privilege service, or a transparency log.
+ */
+export type AnchorRecord = { readonly seq: number; readonly hash: string };
+
+/**
+ * Pluggable hook for mirroring the hash-chain tail to an anchor the audit
+ * writer's own uid CANNOT rewrite. `append` calls `putAnchor` best-effort
+ * after the local write; `verify` calls `getAnchor` to cross-check the
+ * surviving chain (see file header). `logId` namespaces multiple logs in
+ * one store — `openAuditLog` defaults it to the absolute `rootDir`.
+ *
+ * Implementations should make `putAnchor` monotonic (never regress to a
+ * lower `seq`) when the backing store permits; a stale/lagging anchor is
+ * benign for `verify`, but a regressed one weakens truncation detection.
+ * PRODUCTION SHOULD SUPPLY A WORM-BACKED IMPLEMENTATION — the bundled
+ * {@link InMemoryAnchorStore} is for tests/dev only and offers no
+ * tamper-resistance on its own.
+ */
+export interface AnchorStore {
+  putAnchor(logId: string, anchor: AnchorRecord): Promise<void>;
+  getAnchor(logId: string): Promise<AnchorRecord | undefined>;
+}
+
+/**
+ * Reference {@link AnchorStore} that keeps the latest anchor per `logId`
+ * in process memory, monotonic on `seq`. Useful for tests and for wiring
+ * the `verify` cross-check in a single process; it provides NO durability
+ * or tamper-resistance and MUST NOT be relied on for non-repudiation in
+ * production — back the seam with a WORM store instead.
+ */
+export class InMemoryAnchorStore implements AnchorStore {
+  private readonly anchors = new Map<string, AnchorRecord>();
+
+  async putAnchor(logId: string, anchor: AnchorRecord): Promise<void> {
+    const existing = this.anchors.get(logId);
+    // Monotonic: never let a later put regress the committed tip backwards.
+    if (existing !== undefined && anchor.seq < existing.seq) return;
+    this.anchors.set(logId, { seq: anchor.seq, hash: anchor.hash });
+  }
+
+  async getAnchor(logId: string): Promise<AnchorRecord | undefined> {
+    return this.anchors.get(logId);
+  }
+}
+
 export type OpenAuditLogOptions = {
   readonly rootDir: string;
   readonly now?: () => number;
   readonly day?: () => string;
+  /**
+   * Optional off-host anchor store. When supplied, every `append`
+   * best-effort mirrors the new tail `{ seq, hash }` to it (a put failure
+   * is swallowed so the durable local write is never blocked). Pass the
+   * same store + `logId` to {@link verify} to cross-check the chain.
+   */
+  readonly anchorStore?: AnchorStore;
+  /**
+   * Key under which this log's anchor is stored in `anchorStore`. Defaults
+   * to the absolute `rootDir`, letting one store hold many logs.
+   */
+  readonly logId?: string;
 };
 
 export interface AuditLog {
@@ -171,6 +249,8 @@ export async function openAuditLog(opts: OpenAuditLogOptions): Promise<AuditLog>
   mkdirSync(opts.rootDir, { recursive: true, mode: 0o700 });
   const now = opts.now ?? ((): number => Date.now());
   const day = opts.day ?? todayStr;
+  const anchorStore = opts.anchorStore;
+  const logId = opts.logId ?? opts.rootDir;
 
   return {
     async append(input: AppendInput): Promise<AuditRecord> {
@@ -192,6 +272,18 @@ export async function openAuditLog(opts: OpenAuditLogOptions): Promise<AuditLog>
       const file = join(opts.rootDir, `${day()}.jsonl`);
       appendFileSync(file, `${JSON.stringify(record)}\n`, { mode: 0o600 });
       writeChainTail(opts.rootDir, day(), hash, seq);
+      // Best-effort: mirror the new tail to the off-host anchor. A failure
+      // here (network/WORM hiccup) must NOT fail the durable local append —
+      // the chain remains internally verifiable, and a lagging external
+      // anchor is benign for `verify` (it only ever flags an anchor that is
+      // AHEAD of a truncated chain, never one that trails).
+      if (anchorStore !== undefined) {
+        try {
+          await anchorStore.putAnchor(logId, { seq, hash });
+        } catch {
+          // Swallowed by design — see comment above.
+        }
+      }
       return record;
     },
     read(readOpts: { day?: string } = {}): AsyncIterable<AuditRecord> {
@@ -230,15 +322,24 @@ export type VerifyResult =
       readonly recordsChecked: number;
       /**
        * Whether the surviving chain was matched against the independent
-       * `_chain-tail.json` anchor. `false` means the anchor was absent, so
-       * tail-truncation could NOT be ruled out — `ok: true` here attests
-       * only that the survivors are internally consistent and gapless from
-       * 0, not that nothing was dropped off the end. Callers that need
-       * non-repudiation must treat `ok && !anchorChecked` as a limitation,
-       * not a clean bill of health. (And see the file header: even a present
-       * on-host anchor is rewritable by a same-uid attacker.)
+       * on-host `_chain-tail.json` anchor. `false` means the anchor was
+       * absent, so tail-truncation could NOT be ruled out — `ok: true` here
+       * attests only that the survivors are internally consistent and
+       * gapless from 0, not that nothing was dropped off the end. Callers
+       * that need non-repudiation must treat `ok && !anchorChecked` as a
+       * limitation, not a clean bill of health. (And see the file header:
+       * even a present on-host anchor is rewritable by a same-uid attacker.)
        */
       readonly anchorChecked: boolean;
+      /**
+       * Whether an off-host {@link AnchorStore} was supplied AND held an
+       * anchor that was cross-checked against the surviving chain. `false`
+       * means no store was passed, or it had no anchor yet — so a same-uid
+       * lockstep rewrite of the on-host anchor could NOT be ruled out. Only
+       * `ok && externalAnchorChecked` attests that an anchor the writer
+       * cannot rewrite agreed with the chain tip.
+       */
+      readonly externalAnchorChecked: boolean;
     }
   | {
       readonly ok: false;
@@ -249,21 +350,63 @@ export type VerifyResult =
     };
 
 /**
+ * Optional cross-check inputs for {@link verify}. Supply the same
+ * `anchorStore` (and matching `logId`) used when the log was opened to
+ * have `verify` consult the off-host anchor in addition to the on-host
+ * `_chain-tail.json`. Both are optional and back-compatible — calling
+ * `verify(rootDir)` keeps the original on-host-only behaviour.
+ */
+export type VerifyOptions = {
+  readonly anchorStore?: AnchorStore;
+  readonly logId?: string;
+};
+
+/**
  * Walk every `<rootDir>/*.jsonl` chain, verifying each record's
  * `hash` against `SHA-256(prevHash || canonical-body)`, that `prevHash`
  * matches the previous record's `hash`, and that `seq` is gapless from
  * 0. After the walk, the surviving chain's last `{ hash, seq }` is
- * matched against the independent `_chain-tail.json` anchor so a dropped
- * suffix (tail truncation / newest-day deletion) is caught.
+ * matched against the independent on-host `_chain-tail.json` anchor so a
+ * dropped suffix (tail truncation / newest-day deletion) is caught.
+ *
+ * If a `{ anchorStore }` is supplied (see {@link VerifyOptions}), the
+ * off-host anchor is consulted IN ADDITION to `_chain-tail.json`: when it
+ * witnesses a `seq` the surviving chain no longer reaches — or a tip hash
+ * that disagrees at the anchored seq — verify FAILS. This catches a tail
+ * truncation that ALSO rewrote the on-host anchor in lockstep, since a
+ * same-uid attacker cannot reach into the external (ideally WORM) store.
+ * An external anchor that merely lags BEHIND newer appends (the benign
+ * best-effort case) is not a failure.
  *
  * Returns the first broken link (file + line number + reason), or
  * `{ ok: true }` if the chain is intact. On success, `anchorChecked`
- * reports whether the tail anchor was present and matched; `false` means
- * the anchor was missing and tail-truncation could not be ruled out (a
- * limitation, not a pass — see the file header on same-uid tamper).
+ * reports whether the on-host tail anchor was present and matched, and
+ * `externalAnchorChecked` whether an off-host anchor was supplied and
+ * cross-checked; `false` on either means that gap could not be ruled out
+ * (a limitation, not a pass — see the file header on same-uid tamper).
  */
-export async function verify(rootDir: string): Promise<VerifyResult> {
-  if (!existsSync(rootDir)) return { ok: true, recordsChecked: 0, anchorChecked: false };
+export async function verify(rootDir: string, options: VerifyOptions = {}): Promise<VerifyResult> {
+  if (!existsSync(rootDir)) {
+    // No local chain at all. Even so, an external anchor may witness records
+    // that a wholesale deletion (rootDir rm'd) destroyed — cross-check it
+    // against the empty (GENESIS-tipped, seq -1) chain before passing.
+    const empty = await crossCheckExternalAnchor(rootDir, options, GENESIS_HASH, -1);
+    if (empty !== undefined && !empty.ok) {
+      return {
+        ok: false,
+        recordsChecked: 0,
+        file: empty.file,
+        line: empty.line,
+        reason: empty.reason,
+      };
+    }
+    return {
+      ok: true,
+      recordsChecked: 0,
+      anchorChecked: false,
+      externalAnchorChecked: empty?.externalAnchorChecked ?? false,
+    };
+  }
   const files = readdirSync(rootDir)
     .filter((f) => f.endsWith(".jsonl"))
     .sort();
@@ -338,19 +481,35 @@ export async function verify(rootDir: string): Promise<VerifyResult> {
     }
   }
 
-  // Anchor check: compare the surviving chain's last { hash, seq } against
-  // the independent _chain-tail.json. A truncation that drops trailing
-  // records leaves the survivors internally consistent, so this anchor —
-  // not the walk above — is what catches it. A missing anchor is reported
-  // (anchorChecked: false), never silently treated as a clean pass. NOTE:
-  // an on-host anchor is rewritable by a same-uid attacker (see header);
-  // this defends only against truncation by a party that does NOT also
-  // rewrite the anchor in lockstep.
+  const lastSeq = expectedSeq - 1;
+
+  // Off-host anchor check FIRST: the external store is the only commitment a
+  // same-uid attacker cannot rewrite, so it is what catches a truncation that
+  // also rewrote `_chain-tail.json` in lockstep. (See file header.)
+  const external = await crossCheckExternalAnchor(rootDir, options, prevHash, lastSeq);
+  if (external !== undefined && !external.ok) {
+    return {
+      ok: false,
+      recordsChecked,
+      file: external.file,
+      line: external.line,
+      reason: external.reason,
+    };
+  }
+  const externalAnchorChecked = external?.externalAnchorChecked ?? false;
+
+  // On-host anchor check: compare the surviving chain's last { hash, seq }
+  // against the independent _chain-tail.json. A truncation that drops trailing
+  // records leaves the survivors internally consistent, so this anchor — not
+  // the walk above — is what catches it. A missing anchor is reported
+  // (anchorChecked: false), never silently treated as a clean pass. NOTE: an
+  // on-host anchor is rewritable by a same-uid attacker (see header); it
+  // defends only against truncation by a party that does NOT also rewrite the
+  // anchor in lockstep — which is exactly what the external anchor above adds.
   const tail = readChainTail(rootDir);
   if (tail === undefined) {
-    return { ok: true, recordsChecked, anchorChecked: false };
+    return { ok: true, recordsChecked, anchorChecked: false, externalAnchorChecked };
   }
-  const lastSeq = expectedSeq - 1;
   if (tail.hash !== prevHash) {
     return {
       ok: false,
@@ -374,5 +533,74 @@ export async function verify(rootDir: string): Promise<VerifyResult> {
         `but surviving chain ends at seq ${lastSeq} (records were dropped from the tail)`,
     };
   }
-  return { ok: true, recordsChecked, anchorChecked: true };
+  return { ok: true, recordsChecked, anchorChecked: true, externalAnchorChecked };
+}
+
+/**
+ * Cross-check the surviving chain tip (`tipHash` at `lastSeq`; an empty
+ * chain is `GENESIS_HASH` at `-1`) against an off-host {@link AnchorStore}.
+ *
+ * Threat model — the store witnesses the highest tail the writer published.
+ *  - external `seq > lastSeq`  → the chain no longer reaches a record the
+ *    anchor saw ⇒ tail truncation (even if `_chain-tail.json` was rewritten
+ *    in lockstep, which the attacker cannot do to the external store) → FAIL.
+ *  - external `seq === lastSeq` but `hash !== tipHash` → the tip was rewritten
+ *    in place at the anchored height → FAIL.
+ *  - external `seq < lastSeq` → the anchor merely lags behind newer appends
+ *    (benign best-effort `putAnchor` lag) → pass.
+ *
+ * Returns `undefined` when no store was supplied; otherwise a partial result
+ * carrying `externalAnchorChecked` (true once an anchor was actually read and
+ * compared) plus, on mismatch, the failure fields. A `getAnchor` that throws
+ * is treated as "anchor unavailable" (not consulted), not as tamper.
+ */
+type ExternalAnchorCheck =
+  | { readonly ok: true; readonly externalAnchorChecked: boolean }
+  | {
+      readonly ok: false;
+      readonly file: string;
+      readonly line: number;
+      readonly reason: string;
+      readonly externalAnchorChecked: boolean;
+    };
+
+async function crossCheckExternalAnchor(
+  rootDir: string,
+  options: VerifyOptions,
+  tipHash: string,
+  lastSeq: number,
+): Promise<ExternalAnchorCheck | undefined> {
+  const store = options.anchorStore;
+  if (store === undefined) return undefined;
+  const logId = options.logId ?? rootDir;
+  let anchor: AnchorRecord | undefined;
+  try {
+    anchor = await store.getAnchor(logId);
+  } catch {
+    // Anchor backend unavailable: cannot rule the truncation gap in OR out,
+    // so report "not checked" rather than fabricating a pass or a failure.
+    return { ok: true, externalAnchorChecked: false };
+  }
+  if (anchor === undefined) return { ok: true, externalAnchorChecked: false };
+
+  if (anchor.seq > lastSeq) {
+    return {
+      ok: false,
+      file: "<external-anchor>",
+      line: 0,
+      reason: `external anchor mismatch — store witnesses seq ${anchor.seq} (hash "${anchor.hash}") but surviving chain ends at seq ${lastSeq} (records were dropped from the tail and the on-host anchor rewritten in lockstep)`,
+      externalAnchorChecked: true,
+    };
+  }
+  if (anchor.seq === lastSeq && anchor.hash !== tipHash) {
+    return {
+      ok: false,
+      file: "<external-anchor>",
+      line: 0,
+      reason: `external anchor mismatch — store records hash "${anchor.hash}" at seq ${anchor.seq} but surviving chain tip is "${tipHash}" (the tail record was rewritten in place)`,
+      externalAnchorChecked: true,
+    };
+  }
+  // anchor.seq < lastSeq → benign lag; or matched tip → consistent.
+  return { ok: true, externalAnchorChecked: true };
 }
