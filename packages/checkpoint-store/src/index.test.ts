@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { RuntimeError } from "@crewhaus/errors";
+import { TenancyError, buildTenant, withTenant } from "@crewhaus/tenancy";
 import {
   type CheckpointStore,
   CheckpointStoreError,
@@ -205,4 +206,49 @@ describe("stress (T7-lite)", () => {
     expect(list.length).toBe(500);
     expect(list[499]?.state).toEqual({ i: 499 });
   }, 15_000);
+});
+
+describe("cross-tenant fencing (CWE-1230)", () => {
+  test("inside tenantA, a store rooted under tenantB fails closed", async () => {
+    const tenantsRoot = mkdtempSync(join(tmpdir(), "checkpoint-tenants-"));
+    try {
+      const tenantA = buildTenant("tenant-a", { tenantsRoot });
+      const tenantB = buildTenant("tenant-b", { tenantsRoot });
+      // Store rooted under tenantB while tenantA is active — every resolved
+      // graph-run directory escapes tenantA's sessionRoot, so it fails closed.
+      const fenced = createCheckpointStore({ rootDir: tenantB.sessionRoot });
+      await withTenant(tenantA, async () => {
+        const grun = newGraphRunId();
+        await expect(fenced.save({ graphRunId: grun, nodeName: "a", state: 1 })).rejects.toThrow(
+          TenancyError,
+        );
+        await expect(fenced.load(grun)).rejects.toThrow(/cross-tenant access denied/);
+      });
+    } finally {
+      rmSync(tenantsRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("inside tenantA, a store rooted under tenantA round-trips", async () => {
+    const tenantsRoot = mkdtempSync(join(tmpdir(), "checkpoint-tenants-"));
+    try {
+      const tenantA = buildTenant("tenant-a", { tenantsRoot });
+      const ok = createCheckpointStore({ rootDir: tenantA.sessionRoot });
+      await withTenant(tenantA, async () => {
+        const grun = newGraphRunId();
+        const cp = await ok.save({ graphRunId: grun, nodeName: "a", state: { x: 1 } });
+        const loaded = await ok.load(grun, cp.id);
+        expect(loaded?.id).toBe(cp.id);
+      });
+    } finally {
+      rmSync(tenantsRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("no active tenant — behaviour is unchanged (no fencing)", async () => {
+    const grun = newGraphRunId();
+    const cp = await store.save({ graphRunId: grun, nodeName: "a", state: { x: 1 } });
+    const loaded = await store.load(grun, cp.id);
+    expect(loaded?.id).toBe(cp.id);
+  });
 });

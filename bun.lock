@@ -286,6 +286,7 @@
       "version": "0.1.1",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tenancy": "workspace:*",
       },
     },
     "packages/chunker": {
@@ -657,6 +658,7 @@
       "version": "0.1.1",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tenancy": "workspace:*",
       },
     },
     "packages/exporter-datadog": {
@@ -1250,6 +1252,7 @@
       "version": "0.1.1",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tenancy": "workspace:*",
       },
     },
     "packages/single-binary-cli": {
@@ -1865,6 +1868,7 @@
       "version": "0.1.1",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tenancy": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
         "@crewhaus/tool-executor": "workspace:*",
       },

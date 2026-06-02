@@ -24,8 +24,9 @@
  */
 import { randomBytes } from "node:crypto";
 import { mkdir, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { RuntimeError } from "@crewhaus/errors";
+import { assertSamePath, currentTenantContext, requireTenant } from "@crewhaus/tenancy";
 
 export const DEFAULT_ROOT_DIR = ".crewhaus/sessions";
 export const DEFAULT_TTL_DAYS = 30;
@@ -70,12 +71,22 @@ export function createSessionStore(opts: SessionStoreOptions = {}): SessionStore
   const ttlDays = opts.ttlDays ?? DEFAULT_TTL_DAYS;
   const now = opts.now ?? (() => new Date());
 
+  // When a tenant context is active, fail closed on any resolved path that
+  // escapes the tenant's sessionRoot (CWE-1230). Outside a tenant scope (the
+  // common CLI case) this is a no-op so non-tenant behaviour is unchanged.
+  function fence(absPath: string): string {
+    if (currentTenantContext() !== undefined) {
+      assertSamePath(absPath, requireTenant().sessionRoot);
+    }
+    return absPath;
+  }
+
   function pathFor(id: string): string {
-    return join(rootDir, `${id}.json`);
+    return fence(resolve(rootDir, `${id}.json`));
   }
 
   function logPathFor(id: string): string {
-    return join(rootDir, `${id}.jsonl`);
+    return fence(resolve(rootDir, `${id}.jsonl`));
   }
 
   function validateId(id: string): void {

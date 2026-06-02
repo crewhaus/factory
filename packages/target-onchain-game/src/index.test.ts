@@ -79,6 +79,31 @@ describe("emitOnchainGame — happy path", () => {
     expect(c).toContain('"allowedContracts":["tictactoe"]');
     expect(c).toContain('"simulationRequired":true');
   });
+
+  // #151 activation — the single game contract is resolved into the policy's
+  // contractId -> address map so the wallet-engine binds tx.to.
+  test("populates transaction_policy.contractAddresses from the game contract", () => {
+    const bundle = emitOnchainGame(baseIr());
+    const c = bundle.files[0]?.content ?? "";
+    expect(c).toContain('"contractAddresses":{"tictactoe":"0xgame"}');
+  });
+
+  // #159 (CWE-798) — a kms:// / hsm:// key handle is a permitted literal.
+  test("renders a kms:// keyRef handle verbatim", () => {
+    const bundle = emitOnchainGame(
+      baseIr({
+        wallet: {
+          id: "player",
+          chainId: "base-sepolia",
+          custody: "kms",
+          signingPolicy: "automated",
+          keyRef: { kind: "literal", value: "kms://aws/player-key" },
+        },
+      }),
+    );
+    const c = bundle.files[0]?.content ?? "";
+    expect(c).toContain('"kms://aws/player-key"');
+  });
 });
 
 describe("emitOnchainGame — validation", () => {
@@ -119,5 +144,26 @@ describe("emitOnchainGame — validation", () => {
         game: { ...ir.game, turnSemantics: "real-time" },
       }),
     ).toThrow(/moveTimeoutMs/);
+  });
+
+  // #159 (CWE-798) — a literal (raw hex private key) wallet keyRef must not be
+  // baked into the emitted artifact.
+  test("rejects a literal (hex private key) wallet keyRef", () => {
+    expect(() =>
+      emitOnchainGame(
+        baseIr({
+          wallet: {
+            id: "player",
+            chainId: "base-sepolia",
+            custody: "local",
+            signingPolicy: "automated",
+            keyRef: {
+              kind: "literal",
+              value: "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d",
+            },
+          },
+        }),
+      ),
+    ).toThrow(TargetEmitError);
   });
 });

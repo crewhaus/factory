@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type AuditLog, GENESIS_HASH, openAuditLog, verify } from "./index";
@@ -54,14 +54,19 @@ describe("append + read", () => {
 });
 
 describe("verify (T4)", () => {
-  test("clean chain reports ok=true", async () => {
+  test("clean chain reports ok=true and matches the tail anchor", async () => {
     const log = await makeLog();
     for (let i = 0; i < 10; i += 1) {
       await log.append({ kind: "policy_decision", payload: { i } });
     }
     const r = await verify(tmp);
     expect(r.ok).toBe(true);
-    if (r.ok) expect(r.recordsChecked).toBe(10);
+    if (r.ok) {
+      expect(r.recordsChecked).toBe(10);
+      // The _chain-tail.json anchor exists and matches the surviving tail,
+      // so the truncation guard actually ran (not the missing-anchor path).
+      expect(r.anchorChecked).toBe(true);
+    }
   });
 
   test("empty rootDir reports ok=true with 0 records", async () => {
@@ -128,6 +133,124 @@ describe("verify (T4)", () => {
     if (!r.ok) {
       expect(r.line).toBe(2);
       expect(r.reason).toMatch(/malformed JSON/);
+    }
+  });
+});
+
+describe("tail-truncation detection (CWE-345)", () => {
+  const readLines = (file: string): string[] =>
+    readFileSync(file, "utf8")
+      .split("\n")
+      .filter((l) => l !== "");
+
+  test("every record carries a 0-based, gapless seq", async () => {
+    const log = await makeLog();
+    for (let i = 0; i < 5; i += 1) {
+      await log.append({ kind: "model_call", payload: i });
+    }
+    const seqs: number[] = [];
+    for await (const r of log.read()) seqs.push(r.seq);
+    expect(seqs).toEqual([0, 1, 2, 3, 4]);
+  });
+
+  test("the persisted chain-tail anchor records the last seq", async () => {
+    const log = await makeLog();
+    await log.append({ kind: "model_call", payload: "a" });
+    await log.append({ kind: "model_call", payload: "b" });
+    await log.append({ kind: "model_call", payload: "c" });
+    const anchor = JSON.parse(readFileSync(join(tmp, "_chain-tail.json"), "utf8"));
+    expect(anchor.seq).toBe(2);
+    expect(anchor.day).toBe(FIXED_DAY);
+    expect(anchor.hash).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  test("truncating the last record is detected via the tail anchor", async () => {
+    const log = await makeLog();
+    await log.append({ kind: "secrets_access", payload: "sensitive-1" });
+    await log.append({ kind: "secrets_access", payload: "sensitive-2" });
+    await log.append({ kind: "secrets_access", payload: "sensitive-3" });
+
+    // Attacker deletes the trailing record to erase their activity, but
+    // leaves _chain-tail.json untouched. The survivors still chain cleanly
+    // and their seq run (0,1) is gapless — only the independent anchor,
+    // which still commits to the dropped record, reveals the truncation.
+    const file = join(tmp, `${FIXED_DAY}.jsonl`);
+    const lines = readLines(file);
+    writeFileSync(file, `${lines.slice(0, -1).join("\n")}\n`);
+
+    const r = await verify(tmp);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.reason).toMatch(/chain-tail anchor mismatch/);
+      expect(r.recordsChecked).toBe(2);
+    }
+  });
+
+  test("deleting the entire newest-day file is detected", async () => {
+    const log = await makeLog();
+    await log.append({ kind: "gateway_request", payload: 1 });
+    await log.append({ kind: "gateway_request", payload: 2 });
+
+    // rm the only day file but keep the anchor: the surviving chain is now
+    // empty (ends at GENESIS) yet the anchor still points at a real hash.
+    unlinkSync(join(tmp, `${FIXED_DAY}.jsonl`));
+
+    const r = await verify(tmp);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toMatch(/chain-tail anchor mismatch/);
+  });
+
+  test("deleting a record from the middle is detected as a seq gap", async () => {
+    const log = await makeLog();
+    await log.append({ kind: "model_call", payload: 0 });
+    await log.append({ kind: "model_call", payload: 1 });
+    await log.append({ kind: "model_call", payload: 2 });
+
+    // Remove the middle line. prevHash linkage would also break, but the
+    // gapless-seq assertion fires first on the now-missing seq 1.
+    const file = join(tmp, `${FIXED_DAY}.jsonl`);
+    const lines = readLines(file);
+    writeFileSync(file, `${[lines[0], lines[2]].join("\n")}\n`);
+
+    const r = await verify(tmp);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toMatch(/seq gap|prevHash mismatch/);
+  });
+
+  test("a missing anchor is reported as a limitation, not a clean pass", async () => {
+    const log = await makeLog();
+    await log.append({ kind: "model_call", payload: 1 });
+    await log.append({ kind: "model_call", payload: 2 });
+
+    // Without the independent anchor, tail-truncation cannot be ruled out:
+    // the surviving chain is internally consistent, so verify still reports
+    // ok, but flags anchorChecked=false so callers know it is not proof of
+    // completeness.
+    unlinkSync(join(tmp, "_chain-tail.json"));
+
+    const r = await verify(tmp);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.recordsChecked).toBe(2);
+      expect(r.anchorChecked).toBe(false);
+    }
+  });
+
+  test("a legit append after verify still chains and verifies", async () => {
+    const log = await makeLog();
+    await log.append({ kind: "model_call", payload: 1 });
+    const first = await verify(tmp);
+    expect(first.ok).toBe(true);
+
+    // Guard against over-blocking: continuing to append must keep seq
+    // monotone and the anchor in sync, so a fresh verify still passes.
+    await log.append({ kind: "model_call", payload: 2 });
+    await log.append({ kind: "model_call", payload: 3 });
+    const second = await verify(tmp);
+    expect(second.ok).toBe(true);
+    if (second.ok) {
+      expect(second.recordsChecked).toBe(3);
+      expect(second.anchorChecked).toBe(true);
     }
   });
 });

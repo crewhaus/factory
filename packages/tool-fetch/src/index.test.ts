@@ -4,6 +4,7 @@ import {
   _resetFetchConfig,
   _setDnsLookup,
   _setRawFetch,
+  assertNotSsrf,
   canonicalizeOrigin,
   fetch,
   registerFetchConfig,
@@ -362,5 +363,189 @@ describe("T8 — credential strip on response", () => {
     expect(result).not.toContain("sid=secret-session");
     expect(result).not.toContain("Bearer my-token");
     expect(result).toContain("ok");
+  });
+});
+
+describe("#155 — DNS-rebinding TOCTOU: connection is pinned to the validated IP", () => {
+  test("rebinding resolver (public for the check, private at connect) is blocked", async () => {
+    // The classic rebinding race: the SSRF check sees a public IP, then the
+    // socket would re-resolve to 127.0.0.1. We pin to the IP we vetted, so the
+    // attacker-controlled second answer is never connected to. Here the
+    // resolver returns private on the *check* call to assert it is rejected
+    // before any fetch — but the deeper guarantee is the pinned-IP dial below.
+    registerFetchConfig({ allowed_origins: ["https://rebind.example.com"] });
+    let lookups = 0;
+    _setDnsLookup(async () => {
+      lookups++;
+      // First answer public; any later answer private. With pinning, only the
+      // first answer is ever used and it is what we connect to.
+      return lookups === 1
+        ? { address: "93.184.216.34", family: 4 }
+        : { address: "127.0.0.1", family: 4 };
+    });
+    let connectedHostname: string | undefined;
+    _setRawFetch(async (req, pinnedIp) => {
+      // The tool must hand us the IP it validated and dial *that*, never a
+      // hostname the runtime could re-resolve at connect time.
+      connectedHostname = pinnedIp;
+      return jsonResponse(200, { ok: true });
+    });
+    const result = await fetch.execute({ url: "https://rebind.example.com/" });
+    if (typeof result !== "string") throw new Error("expected string result");
+    expect(connectedHostname).toBe("93.184.216.34");
+    expect(lookups).toBe(1);
+  });
+
+  test("a public-looking host that resolves private is rejected, fetch never fires", async () => {
+    registerFetchConfig({ allowed_origins: ["https://rebind.example.com"] });
+    _setDnsLookup(async () => ({ address: "169.254.169.254", family: 4 }));
+    _setRawFetch(async () => {
+      throw new Error("must not call — pinned IP is private");
+    });
+    await expect(fetch.execute({ url: "https://rebind.example.com/" })).rejects.toBeInstanceOf(
+      FetchPermissionError,
+    );
+  });
+
+  test("each redirect hop is re-validated and re-pinned to its own IP", async () => {
+    registerFetchConfig({
+      allowed_origins: ["https://a.example.com", "https://b.example.com"],
+    });
+    _setDnsLookup(async (host) => {
+      if (host === "a.example.com") return { address: "93.184.216.34", family: 4 };
+      if (host === "b.example.com") return { address: "127.0.0.1", family: 4 };
+      return { address: "93.184.216.34", family: 4 };
+    });
+    const pins: string[] = [];
+    _setRawFetch(async (req, pinnedIp) => {
+      pins.push(pinnedIp);
+      const url = new URL(req.url);
+      // performFetch keeps the original host on the Request and conveys the
+      // vetted IP out-of-band via `pinnedIp`; the first hop (a) redirects to b,
+      // which would rebind to loopback.
+      if (url.hostname === "a.example.com") {
+        return new Response(null, {
+          status: 302,
+          headers: { location: "https://b.example.com/" },
+        });
+      }
+      throw new Error("must not connect to b — it resolves to loopback");
+    });
+    await expect(fetch.execute({ url: "https://a.example.com/" })).rejects.toBeInstanceOf(
+      FetchPermissionError,
+    );
+    // a was pinned + connected; b was rejected by assertNotSsrf before any dial.
+    expect(pins).toEqual(["93.184.216.34"]);
+  });
+
+  test("legit public host still succeeds and is dialled at its resolved IP", async () => {
+    registerFetchConfig({ allowed_origins: ["https://api.example.com"] });
+    _setDnsLookup(async () => ({ address: "93.184.216.34", family: 4 }));
+    let pinnedIp: string | undefined;
+    let hostHeaderPreserved = false;
+    _setRawFetch(async (req, ip) => {
+      pinnedIp = ip;
+      // The request URL we build still carries the real host so the caller can
+      // set Host/SNI from it.
+      hostHeaderPreserved = new URL(req.url).hostname === "api.example.com";
+      return jsonResponse(200, { ok: true });
+    });
+    const result = await fetch.execute({ url: "https://api.example.com/v1/items" });
+    if (typeof result !== "string") throw new Error("expected string result");
+    expect(pinnedIp).toBe("93.184.216.34");
+    expect(hostHeaderPreserved).toBe(true);
+    expect(result).toContain("HTTP 200");
+  });
+
+  test("an IP-literal host is its own pin and needs no DNS lookup", async () => {
+    registerFetchConfig({ allowed_origins: ["https://93.184.216.34"] });
+    let lookups = 0;
+    _setDnsLookup(async () => {
+      lookups++;
+      return { address: "93.184.216.34", family: 4 };
+    });
+    let pinnedIp: string | undefined;
+    _setRawFetch(async (_req, ip) => {
+      pinnedIp = ip;
+      return jsonResponse(200, { ok: true });
+    });
+    await fetch.execute({ url: "https://93.184.216.34/" });
+    expect(pinnedIp).toBe("93.184.216.34");
+    expect(lookups).toBe(0);
+  });
+});
+
+describe("#155 — broadened isPrivateIp ranges (via assertNotSsrf)", () => {
+  // assertNotSsrf classifies the literal directly, so we can assert each new
+  // range is blocked without routing through DNS.
+  const blocked = [
+    ["100.64.0.0/10 CGNAT", "100.64.1.1"],
+    ["100.64.0.0/10 upper edge", "100.127.255.254"],
+    ["192.0.0.0/24 IETF protocol", "192.0.0.8"],
+    ["198.18.0.0/15 benchmarking", "198.18.0.1"],
+    ["198.18.0.0/15 upper half", "198.19.255.254"],
+    ["IPv4-mapped IPv6 loopback", "::ffff:127.0.0.1"],
+    ["IPv4-mapped IPv6 metadata", "::ffff:169.254.169.254"],
+    ["IPv4-mapped IPv6 hex form", "::ffff:7f00:0001"],
+    ["unspecified ::", "::"],
+  ] as const;
+
+  for (const [label, ip] of blocked) {
+    test(`${label} (${ip}) is rejected`, async () => {
+      await expect(assertNotSsrf(ip)).rejects.toBeInstanceOf(FetchPermissionError);
+    });
+  }
+
+  const allowedPublic = [
+    ["100.63.x is public (just below CGNAT)", "100.63.255.255"],
+    ["100.128.x is public (just above CGNAT)", "100.128.0.0"],
+    ["192.0.1.x is public (just above 192.0.0.0/24)", "192.0.1.1"],
+    ["198.17.x is public (just below benchmarking)", "198.17.255.255"],
+    ["198.20.x is public (just above benchmarking)", "198.20.0.0"],
+  ] as const;
+
+  for (const [label, ip] of allowedPublic) {
+    test(`${label} (${ip}) is allowed and pins to itself`, async () => {
+      await expect(assertNotSsrf(ip)).resolves.toBe(ip);
+    });
+  }
+
+  test("public IPv4-mapped IPv6 is not over-blocked", async () => {
+    await expect(assertNotSsrf("::ffff:93.184.216.34")).resolves.toBeDefined();
+  });
+});
+
+describe("#155 — non-decimal IPv4 literals are normalised before classification", () => {
+  // The WHATWG URL parser canonicalises these on its own, but assertNotSsrf /
+  // isPrivateIp must not depend on that — they receive raw hostnames from
+  // canonicalizeOrigin and direct callers too.
+  const loopbackForms = [
+    ["octal", "0177.0.0.1"],
+    ["hex dotted", "0x7f.0.0.1"],
+    ["hex packed", "0x7f000001"],
+    ["32-bit integer", "2130706433"],
+    ["short form 127.1", "127.1"],
+  ] as const;
+
+  for (const [label, literal] of loopbackForms) {
+    test(`${label} (${literal}) is recognised as 127.0.0.1 and rejected`, async () => {
+      await expect(assertNotSsrf(literal)).rejects.toBeInstanceOf(FetchPermissionError);
+    });
+  }
+
+  test("integer form of AWS metadata (2852039166) is rejected", async () => {
+    // 169.254.169.254 = 0xA9FEA9FE = 2852039166
+    await expect(assertNotSsrf("2852039166")).rejects.toBeInstanceOf(FetchPermissionError);
+  });
+
+  test("hex form of a public IP normalises and is allowed", async () => {
+    // 0x5DB8D822 = 93.184.216.34 (public)
+    await expect(assertNotSsrf("0x5DB8D822")).resolves.toBe("93.184.216.34");
+  });
+
+  test("out-of-range integer is not treated as an IP (falls through to DNS)", async () => {
+    // 2 ** 32 is too large to be a valid packed IPv4; it must not be classified
+    // as private, and with the default public DNS stub it resolves fine.
+    await expect(assertNotSsrf("4294967296")).resolves.toBe("93.184.216.34");
   });
 });

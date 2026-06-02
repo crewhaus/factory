@@ -133,6 +133,87 @@ describe("emitOnchain — happy path", () => {
     expect(c).toContain('"allowedContracts":["treasury"]');
     expect(c).toContain('"maxValueUsd":5000');
   });
+
+  // #151 activation — the policy must carry a resolved contractId -> address
+  // map so the wallet-engine can bind tx.to to the declared contract.
+  test("populates transaction_policy.contractAddresses from declared contracts[]", () => {
+    const bundle = emitOnchain(
+      baseIr({
+        contracts: [
+          { id: "treasury", chainId: "base-mainnet", address: "0xTREASURY", abiRef: "abi://safe" },
+          { id: "vault", chainId: "base-mainnet", address: "0xVAULT", abiRef: "abi://erc20" },
+        ],
+      }),
+    );
+    const c = bundle.files[0]?.content ?? "";
+    expect(c).toContain('"contractAddresses":{"treasury":"0xTREASURY","vault":"0xVAULT"}');
+  });
+
+  test("omits contractAddresses when no contracts are declared", () => {
+    const bundle = emitOnchain(baseIr({ contracts: [] }));
+    const c = bundle.files[0]?.content ?? "";
+    expect(c).not.toContain("contractAddresses");
+  });
+
+  // #159 (CWE-798) — a wallet keyRef that is an env ref or a kms:// / hsm://
+  // handle is fine; a bare literal (esp. a raw hex private key) must not be
+  // baked into the emitted artifact.
+  test("renders a wallet env-ref keyRef as a process.env lookup", () => {
+    const bundle = emitOnchain(
+      baseIr({
+        wallets: [
+          {
+            id: "treasurer",
+            chainId: "base-mainnet",
+            custody: "kms",
+            signingPolicy: "policy-gated",
+            keyRef: { kind: "env", name: "TREASURER_KEY" },
+          },
+        ],
+      }),
+    );
+    const c = bundle.files[0]?.content ?? "";
+    expect(c).toContain('process.env["TREASURER_KEY"]');
+  });
+
+  test("renders a kms:// keyRef handle verbatim", () => {
+    const bundle = emitOnchain(
+      baseIr({
+        wallets: [
+          {
+            id: "treasurer",
+            chainId: "base-mainnet",
+            custody: "kms",
+            signingPolicy: "policy-gated",
+            keyRef: { kind: "literal", value: "kms://aws/treasurer-key" },
+          },
+        ],
+      }),
+    );
+    const c = bundle.files[0]?.content ?? "";
+    expect(c).toContain('"kms://aws/treasurer-key"');
+  });
+
+  test("rejects a literal (hex private key) wallet keyRef", () => {
+    expect(() =>
+      emitOnchain(
+        baseIr({
+          wallets: [
+            {
+              id: "treasurer",
+              chainId: "base-mainnet",
+              custody: "local",
+              signingPolicy: "automated",
+              keyRef: {
+                kind: "literal",
+                value: "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d",
+              },
+            },
+          ],
+        }),
+      ),
+    ).toThrow(TargetEmitError);
+  });
 });
 
 describe("emitOnchain — validation", () => {

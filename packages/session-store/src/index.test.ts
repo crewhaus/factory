@@ -2,6 +2,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { TenancyError, buildTenant, withTenant } from "@crewhaus/tenancy";
 import { createSessionStore } from "./index";
 
 const TMP_ROOTS: string[] = [];
@@ -199,5 +200,42 @@ describe("session-store — list and TTL eviction", () => {
     utimesSync(join(rootDir, `${a.id}.json`), old, old);
     const listed = await store.list();
     expect(listed).toEqual([]);
+  });
+});
+
+describe("session-store — cross-tenant fencing (CWE-1230)", () => {
+  test("inside tenantA, a store rooted under tenantB fails closed", async () => {
+    const tenantsRoot = newTempRoot();
+    const tenantA = buildTenant("tenant-a", { tenantsRoot });
+    const tenantB = buildTenant("tenant-b", { tenantsRoot });
+    // Store rooted under tenantB while the active context is tenantA — every
+    // resolved file path escapes tenantA's sessionRoot, so reads/writes throw.
+    const store = createSessionStore({ rootDir: tenantB.sessionRoot });
+    await withTenant(tenantA, async () => {
+      await expect(
+        store.create({ id: "sess_aaaaaaaaaaaaaaaa", name: "x", target: "cli", model: "m" }),
+      ).rejects.toThrow(TenancyError);
+      await expect(store.get("sess_aaaaaaaaaaaaaaaa")).rejects.toThrow(
+        /cross-tenant access denied/,
+      );
+    });
+  });
+
+  test("inside tenantA, a store rooted under tenantA succeeds", async () => {
+    const tenantsRoot = newTempRoot();
+    const tenantA = buildTenant("tenant-a", { tenantsRoot });
+    const store = createSessionStore({ rootDir: tenantA.sessionRoot });
+    await withTenant(tenantA, async () => {
+      const created = await store.create({ name: "ok", target: "cli", model: "m" });
+      const got = await store.get(created.id);
+      expect(got?.id).toBe(created.id);
+    });
+  });
+
+  test("no active tenant — behaviour is unchanged (no fencing)", async () => {
+    const rootDir = newTempRoot();
+    const store = createSessionStore({ rootDir });
+    const created = await store.create({ name: "ok", target: "cli", model: "m" });
+    expect(await store.get(created.id)).toEqual(created);
   });
 });

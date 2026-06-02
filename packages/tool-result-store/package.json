@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@crewhaus/errors": "workspace:*",
+    "@crewhaus/tenancy": "workspace:*",
     "@crewhaus/tool-catalog": "workspace:*",
     "@crewhaus/tool-executor": "workspace:*"
   },
