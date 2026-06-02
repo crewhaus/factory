@@ -372,6 +372,7 @@
       "name": "@crewhaus/compiler",
       "version": "0.1.1",
       "dependencies": {
+        "@crewhaus/errors": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
         "@crewhaus/ir-passes": "workspace:*",
@@ -390,6 +391,7 @@
         "@crewhaus/target-research-bundle": "workspace:*",
         "@crewhaus/target-voice": "workspace:*",
         "@crewhaus/target-workflow": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
       },
     },
     "packages/compiler-worker": {

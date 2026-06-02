@@ -677,3 +677,70 @@ triggers:
     ).toThrow(/raw private key/);
   });
 });
+
+describe("compile({ strict: true }) — FR-002 sink-side scope gate", () => {
+  // An outward-by-name tool referenced in a spec (here a dynamic MCP sink the
+  // compiler cannot resolve to a scope:"external" tool offline). This lowers
+  // fine (the spec schema accepts any non-empty tool string) but is an
+  // unverifiable external sink — the gate must refuse it BEFORE emit.
+  const SPEC_WITH_MCP_SINK = `
+name: leaky
+target: cli
+agent:
+  model: m
+  instructions: i
+tools:
+  - mcp__evil__exfiltrate
+`;
+
+  // Clean spec: only internal-compute built-ins. No outward names.
+  const SPEC_INTERNAL_TOOLS = `
+name: clean
+target: cli
+agent:
+  model: m
+  instructions: i
+tools:
+  - read
+  - bash
+`;
+
+  test("fails on an outward-named sink referenced by the spec", () => {
+    expect(() => compile(SPEC_WITH_MCP_SINK, { strict: true })).toThrow(/\[strict\]/);
+    expect(() => compile(SPEC_WITH_MCP_SINK, { strict: true })).toThrow(/mcp__evil__exfiltrate/);
+  });
+
+  test('the strict failure names the expected remedy (scope: "external")', () => {
+    expect(() => compile(SPEC_WITH_MCP_SINK, { strict: true })).toThrow(/scope: "external"/);
+  });
+
+  test("passes a spec whose tools are all internal-compute built-ins", () => {
+    const bundle = compile(SPEC_INTERNAL_TOOLS, { strict: true });
+    expect(bundle.files).toHaveLength(1);
+    expect(bundle.files[0]?.path).toBe("agent.ts");
+  });
+
+  test("nested tool sites (workflow steps) are audited too", () => {
+    const spec = `
+name: leaky-flow
+target: workflow
+model: m
+steps:
+  - name: reach-out
+    instructions: send it
+    tools:
+      - mcp__slack__send
+`;
+    expect(() => compile(spec, { strict: true })).toThrow(/mcp__slack__send/);
+  });
+
+  test("DEFAULT (no strict) does NOT run the gate — backwards compatible", () => {
+    // Without { strict: true } the outward-named spec is not gated by scope
+    // (it would instead fall through to the emitter's own resolution); the
+    // gate is strictly opt-in so existing compile() callers are unchanged.
+    // A clean spec compiles identically with and without the flag.
+    const withFlag = compile(SPEC_INTERNAL_TOOLS, { strict: true }).files[0]?.content;
+    const without = compile(SPEC_INTERNAL_TOOLS).files[0]?.content;
+    expect(without).toBe(withFlag);
+  });
+});

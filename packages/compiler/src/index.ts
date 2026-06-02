@@ -1,3 +1,4 @@
+import { CompilerError } from "@crewhaus/errors";
 import { assertNever } from "@crewhaus/infra-utils";
 import type {
   Bundle,
@@ -65,6 +66,7 @@ import { emitPipeline } from "@crewhaus/target-pipeline";
 import { emitResearchBundle } from "@crewhaus/target-research-bundle";
 import { emitVoice } from "@crewhaus/target-voice";
 import { emitWorkflow } from "@crewhaus/target-workflow";
+import { type ScopeFinding, isOutwardName } from "@crewhaus/tool-builder";
 
 /**
  * Compile a YAML spec text into a deployable bundle.
@@ -84,11 +86,34 @@ export type CompileOptions = {
    * don't drift outputs.
    */
   readonly applyIrPasses?: boolean;
+  /**
+   * FR-002 — Pillar 3 sink-side build-time gate. When true, audit every tool
+   * NAME the lowered IR references and FAIL the compile (throw `CompilerError`)
+   * if any is an outward-reaching sink the compiler cannot verify carries
+   * `scope: "external"` offline. Default: false (preserves backwards compat).
+   *
+   * This is the library-level equivalent of `crewhaus compile --strict`: it
+   * makes the gate available to EVERY `compile()` consumer (e.g. the
+   * `compiler-worker` Cloudflare Worker that compiles arbitrary user YAML),
+   * not just the CLI wrapper. Because the compiler must bundle cleanly into a
+   * Worker, it cannot import the heavy built-in tool packages to read live
+   * `RegisteredTool.scope`; the IR carries tool NAMES only. So the offline
+   * gate keys on `isOutwardName` (shared with `@crewhaus/tool-builder`'s
+   * `auditToolScopes`): a `mcp__*` or definitionally-outward built-in name is
+   * an external sink whose external scope is unverifiable offline → drift.
+   * The CLI's `--strict` additionally resolves names against the local tool
+   * map (`auditToolScopes` over real `RegisteredTool`s); both share the same
+   * outward-name rule so they cannot diverge.
+   */
+  readonly strict?: boolean;
 };
 
 export function compile(yamlText: string, opts: CompileOptions = {}): Bundle {
   const spec = parseSpec(yamlText);
   let ir = lower(spec);
+  if (opts.strict === true) {
+    assertToolScopesStrict(ir);
+  }
   if (opts.applyIrPasses === true) {
     // Static import so the compiler bundles cleanly into a Cloudflare
     // Worker. ir-passes is a workspace dep regardless; the prior `require`
@@ -96,6 +121,60 @@ export function compile(yamlText: string, opts: CompileOptions = {}): Bundle {
     ir = applyIrPassesFn(ir);
   }
   return emit(ir);
+}
+
+/**
+ * FR-002 — collect every tool NAME referenced anywhere in a lowered IR,
+ * variant-agnostically. The IR is a JSON-serializable discriminated union;
+ * some variants carry tools at the top level (`IrV0.tools`), others nest them
+ * under steps / nodes / roles / sub-agents. Rather than couple to each
+ * variant's shape, walk the object and gather every string under a `tools`
+ * key. Deterministic and dedup'd.
+ */
+function collectToolNames(ir: unknown): string[] {
+  const names = new Set<string>();
+  const visit = (node: unknown): void => {
+    if (Array.isArray(node)) {
+      for (const item of node) visit(item);
+      return;
+    }
+    if (node !== null && typeof node === "object") {
+      for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+        if (key === "tools" && Array.isArray(value)) {
+          for (const v of value) if (typeof v === "string") names.add(v);
+        }
+        visit(value);
+      }
+    }
+  };
+  visit(ir);
+  return [...names];
+}
+
+/**
+ * FR-002 — the offline `strict` scope audit over a lowered IR's tool names.
+ * Throws `CompilerError` (extends `CrewhausError`, so a CLI catch routes it
+ * through `die()`) listing every outward-by-name sink that cannot be verified
+ * `scope: "external"` offline. A spec referencing `mcp__evil__exfiltrate` (or
+ * any outward built-in name) no longer slips through a non-CLI `compile()`.
+ */
+function assertToolScopesStrict(ir: IrNode): void {
+  const findings: ScopeFinding[] = [];
+  for (const name of collectToolNames(ir)) {
+    if (isOutwardName(name)) {
+      findings.push({
+        toolName: name,
+        reason:
+          'is an outward-reaching sink by name but its scope cannot be verified "external" at compile time (dynamic/MCP sinks must be vetted, not assumed)',
+      });
+    }
+  }
+  if (findings.length > 0) {
+    const detail = findings.map((f) => `tool "${f.toolName}" ${f.reason}`).join("; ");
+    throw new CompilerError(
+      `[strict] ${findings.length} scope finding(s) — refusing to emit: ${detail}. Set scope: "external" on each tool, or compile without { strict: true } to bypass the gate.`,
+    );
+  }
 }
 
 type SpecWithPermissions = Exclude<Spec, { target: "eval" }>;

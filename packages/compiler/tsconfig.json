@@ -6,10 +6,12 @@
   },
   "include": ["src/**/*"],
   "references": [
+    { "path": "../errors" },
     { "path": "../infra-utils" },
     { "path": "../spec" },
     { "path": "../ir" },
     { "path": "../ir-passes" },
+    { "path": "../tool-builder" },
     { "path": "../target-batch-worker" },
     { "path": "../target-browser-driver" },
     { "path": "../target-channel-bot" },
