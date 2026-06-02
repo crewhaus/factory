@@ -18,15 +18,19 @@ describe("rate-limiter — T1 token-bucket", () => {
     const buckets = new Map<string, BucketConfig>([
       ["tenant:t1", { kind: "token-bucket", capacity: 10, refillPerSec: 1 }],
     ]);
-    const rl = createRateLimiter({ buckets });
+    // Inject a frozen clock so the bucket's refill is computed against virtual
+    // time. With the real clock, the few ms between acquire and inspect refill
+    // a fraction of a token (1/sec), nudging `available` to ~5.05 — enough to
+    // trip the old toBeCloseTo(5, 1) 0.05 tolerance on loaded CI runners.
+    // Frozen time makes the post-acquire balance exactly 5, deterministically.
+    const nowMs = 1_000_000;
+    const rl = createRateLimiter({ buckets, now: (): number => nowMs });
     const t0 = Date.now();
     await rl.acquire([{ dimension: "tenant", id: "t1" }], 5);
-    // 250 ms threshold: "immediate" relative to the bucket's 1-token-per-second
-    // refill rate, while tolerating CI scheduler jitter (we saw 51 ms flakes
-    // against a 50 ms cap on shared GitHub runners).
+    // "immediate": acquiring below capacity must not block (real wall-clock).
     expect(Date.now() - t0).toBeLessThan(250);
     const inspect = rl.inspect({ dimension: "tenant", id: "t1" });
-    expect(inspect?.available).toBeCloseTo(5, 1);
+    expect(inspect?.available).toBe(5);
   });
 
   test("burst tolerance: capacity available immediately at start", async () => {
