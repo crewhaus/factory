@@ -1,4 +1,11 @@
-import { type Bundle, SpecParseError, compile, lower, parseSpec } from "@crewhaus/compiler";
+import {
+  type Bundle,
+  SpecParseError,
+  assertToolScopesStrict,
+  compile,
+  lower,
+  parseSpec,
+} from "@crewhaus/compiler";
 import { emitCfWorkerCli } from "@crewhaus/target-cf-worker-cli";
 import { emitCfWorkerGraph } from "@crewhaus/target-cf-worker-graph";
 import { emitCfWorkerWorkflow } from "@crewhaus/target-cf-worker-workflow";
@@ -13,6 +20,10 @@ import { handleProviderProxy } from "./proxy";
  *   POST /compile  { yaml: string, applyIrPasses?: boolean }
  *      → 200 { bundle: Bundle }
  *      → 400 { error: { code: "PARSE" | "COMPILE", message, path? } }
+ *      The compile path is scope-gated server-side (FR-002, Pillar 3): a spec
+ *      reaching an outward sink (a `mcp__*` tool, or a built-in like Fetch /
+ *      WebFetch / SendMessage) whose `scope: "external"` cannot be verified
+ *      offline is refused with code "COMPILE" — mirroring `compile --strict`.
  *
  *   POST /validate { yaml: string }
  *      → 200 { ok: true }
@@ -105,6 +116,12 @@ async function handleCompile(request: Request, env: Env, cors: HeadersInit): Pro
     if (emitAs === "cf-worker") {
       const spec = parseSpec(body.yaml);
       const ir = lower(spec);
+      // FR-002 — Pillar 3 sink-side gate. This branch drives lower()+emit
+      // directly (bypassing compile()), so apply the SAME offline scope audit
+      // compile({ strict: true }) runs over the lowered IR: an outward-reaching
+      // sink (a `mcp__*` tool, or a built-in like Fetch/WebFetch/SendMessage)
+      // whose scope:"external" cannot be verified offline is rejected here too.
+      assertToolScopesStrict(ir);
       const allowedOrigins = Array.isArray(body.allowedOrigins)
         ? body.allowedOrigins.filter((o): o is string => typeof o === "string")
         : undefined;
@@ -135,7 +152,12 @@ async function handleCompile(request: Request, env: Env, cors: HeadersInit): Pro
           );
       }
     } else {
-      bundle = compile(body.yaml, { applyIrPasses });
+      // FR-002 — Pillar 3 sink-side gate. The Worker compiles arbitrary
+      // user-submitted YAML server-side, so it mirrors `compile --strict` /
+      // the CLI: { strict: true } refuses to emit a bundle that reaches an
+      // outward sink (mcp__*, Fetch/WebFetch/SendMessage, …) whose external
+      // scope is unverifiable offline. CompilerError surfaces as 400 COMPILE.
+      bundle = compile(body.yaml, { applyIrPasses, strict: true });
     }
     return jsonResponse({ bundle }, 200, cors);
   } catch (err) {

@@ -1119,29 +1119,42 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     }
 
     const toolAbort = turnAbort.child();
-    // Build the bridge for this call. Skipped (left undefined) when no
-    // spawnSubAgent injection is provided — non-Task tools don't need it.
-    const bridge: RuntimeBridge | undefined =
-      opts.spawnSubAgent !== undefined || opts.crewMailbox !== undefined
-        ? {
-            runContext,
-            eventLog,
-            permissionMode,
-            permissionRules,
-            tools,
-            model: opts.model,
-            maxTokens,
-            ...(sessionRootDir !== undefined ? { sessionRootDir } : {}),
-            hooks,
-            ...(opts.subAgents !== undefined ? { subAgents: opts.subAgents } : {}),
-            ...(opts.spawnSubAgent !== undefined ? { spawnSubAgent: opts.spawnSubAgent } : {}),
-            ...(opts.crewMailbox !== undefined ? { crewMailbox: opts.crewMailbox } : {}),
-          }
-        : undefined;
+    // Build the bridge for this call. Built on EVERY run (#160 follow-up):
+    // it carries `runContext`, which Pillar-3 boundary-site tools (tool-mcp,
+    // skills-registry) read to tag their external content's provenance under
+    // the precise "mcp"/"skill" origin. Previously the bridge was skipped
+    // unless `spawnSubAgent`/`crewMailbox` was injected, so a plain top-level
+    // run gave those tools no RunContext and their content fell back to the
+    // coarse "tool" origin. The Task-tool-only fields (`spawnSubAgent`,
+    // `crewMailbox`, `subAgents`) stay conditional — they're omitted when not
+    // wired, and the Task tool already checks for undefined before using them.
+    const bridge: RuntimeBridge = {
+      runContext,
+      eventLog,
+      permissionMode,
+      permissionRules,
+      tools,
+      model: opts.model,
+      maxTokens,
+      ...(sessionRootDir !== undefined ? { sessionRootDir } : {}),
+      hooks,
+      ...(opts.subAgents !== undefined ? { subAgents: opts.subAgents } : {}),
+      ...(opts.spawnSubAgent !== undefined ? { spawnSubAgent: opts.spawnSubAgent } : {}),
+      ...(opts.crewMailbox !== undefined ? { crewMailbox: opts.crewMailbox } : {}),
+    };
     const raw = await executeTool(tool, tu.input, {
       toolUseId: tu.id,
       signal: toolAbort.signal,
-      ...(bridge !== undefined ? { bridge } : {}),
+      // #160 follow-up — the bridge (built on every run, above) carries
+      // `runContext`, which boundary-site tools (tool-mcp, skills-registry)
+      // read to tag their external content under the precise "mcp"/"skill"
+      // origin. `tool-executor` forwards `bridge` verbatim; those tools read
+      // `ctx.runContext` first and fall back to `ctx.bridge.runContext`, so
+      // the bridge is what activates the precise tag today. (Threading
+      // `runContext` as a first-class field on this call would also require
+      // adding it to `tool-executor`'s `ExecutionContext`, which is owned
+      // elsewhere; the bridge path needs no such change.)
+      bridge,
       // Section 18 — runtime-core wires this so streaming tools
       // (`tool-code-execution`) can publish `tool_stream_chunk` events as
       // they pipe stdout/stderr from the sandbox container.
@@ -1195,10 +1208,11 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     // because the sub-agent's finalMessage is already tagged at the
     // sub-agent-spawner boundary with the more-specific "subagent" origin.
     // MCP tools additionally tag their FULL response under the more-precise
-    // "mcp" origin inside tool-mcp when the runtime threads a RunContext via
-    // the bridge; this coarse "tool" tag of the (possibly truncated) preview
-    // still fires for them as a backstop so the content has lineage even
-    // when no bridge is wired.
+    // "mcp" origin inside tool-mcp; since #160 follow-up the runtime threads
+    // a RunContext (via `bridge`/`ctx.runContext`) on EVERY run, so that
+    // precise tag now fires unconditionally. This coarse "tool" tag of the
+    // (possibly truncated) preview still fires for them as a redundant
+    // backstop so the content has lineage even if the precise tag is missed.
     if (tool.classifyOutput !== false && !raw.isError) {
       const taggable =
         typeof finalPreview === "string"

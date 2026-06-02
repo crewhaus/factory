@@ -3,7 +3,7 @@ import { McpError } from "@crewhaus/errors";
 import type { McpHost, McpToolDefinition } from "@crewhaus/mcp-host";
 import { type RunContext, tagContent } from "@crewhaus/run-context";
 import { buildTool } from "@crewhaus/tool-builder";
-import type { RegisteredTool, ToolCatalog } from "@crewhaus/tool-catalog";
+import type { RegisteredTool, ToolCatalog, ToolExecuteContext } from "@crewhaus/tool-catalog";
 import { z } from "zod";
 
 /**
@@ -115,11 +115,13 @@ export function buildMcpRegisteredTool(
       // provenance. Record the full MCP response under origin "mcp" so the
       // egress classifier attributes any later exfiltration to the precise
       // boundary site (rather than the coarse runtime-core "tool" origin).
-      // RunContext is reached via the opaque `ctx.bridge` the runtime stuffs
-      // in (the same payload tool-task reads); when no bridge is wired (no
-      // sub-agent / crew support) this best-effort tag is skipped and the
-      // runtime-core post-tool path still tags the preview under "tool".
-      const runContext = bridgeRunContext(ctx);
+      // The RunContext is read from `ctx.runContext` first (#160 follow-up:
+      // the runtime now threads it directly on every run) and falls back to
+      // the opaque `ctx.bridge.runContext` for back-compat with callers that
+      // only wire the bridge. When neither is present this best-effort tag is
+      // skipped and the runtime-core post-tool path still tags the preview
+      // under the coarse "tool" origin.
+      const runContext = resolveRunContext(ctx);
       if (runContext !== undefined) {
         tagContent(runContext, result.content, "mcp");
       }
@@ -161,15 +163,17 @@ export async function registerMcpServer(
 }
 
 /**
- * Pull the `RunContext` off the opaque runtime bridge, if present. The
- * bridge (Section 13) is `ToolExecuteContext.bridge` — `unknown` to
- * tool-catalog and only populated by runtime-core when sub-agent / crew
- * support is wired. We read just the `runContext` field structurally
- * (rather than importing the full `RuntimeBridge` from
- * `agent-context-isolation`, which would invert the dependency arrow) so
- * the boundary tag is best-effort and degrades cleanly when absent.
+ * Resolve the run's `RunContext` for provenance tagging. Prefers the
+ * `ctx.runContext` field the runtime now threads on EVERY tool execute
+ * (#160 follow-up). Falls back to the opaque runtime bridge's `runContext`
+ * (Section 13) — `ToolExecuteContext.bridge` is `unknown` to tool-catalog,
+ * so we read its `runContext` field structurally (rather than importing the
+ * full `RuntimeBridge` from `agent-context-isolation`, which would invert the
+ * dependency arrow). Returns undefined when neither is present, so the
+ * boundary tag is best-effort and degrades cleanly.
  */
-function bridgeRunContext(ctx: { readonly bridge?: unknown } | undefined): RunContext | undefined {
+function resolveRunContext(ctx: ToolExecuteContext | undefined): RunContext | undefined {
+  if (ctx?.runContext !== undefined) return ctx.runContext;
   const bridge = ctx?.bridge as { runContext?: RunContext } | undefined;
   return bridge?.runContext;
 }

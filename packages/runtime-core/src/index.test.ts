@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import type Anthropic from "@anthropic-ai/sdk";
 import { createLogger } from "@crewhaus/logging";
-import { createRunContext } from "@crewhaus/run-context";
+import { type RunContext, createRunContext } from "@crewhaus/run-context";
 import { buildTool } from "@crewhaus/tool-builder";
 import { z } from "zod";
 import { replayMessageHistory, resolveAuth, runChatLoop } from "./index";
@@ -279,6 +279,51 @@ describe("runChatLoop tool execution", () => {
     expect(resultBlocks[0]?.tool_use_id).toBe("tu_1");
     expect(resultBlocks[0]?.is_error).toBe(false);
     expect(resultBlocks[0]?.content).toBe("echoed: hi");
+  });
+
+  test("a plain run (no sub-agent / crew) still threads the run's RunContext to tools (#160-followup)", async () => {
+    // #160 follow-up — the bridge carrying `runContext` used to be built only
+    // when `spawnSubAgent`/`crewMailbox` was injected, so boundary-site tools
+    // (tool-mcp, skills-registry) got no RunContext on a plain run and tagged
+    // their content under the coarse "tool" origin instead of "mcp"/"skill".
+    // Now the bridge is built on every run; assert a tool can reach the run's
+    // RunContext (the surface those tools use to call `tagContent`).
+    let bridgeRunContext: RunContext | undefined;
+    const probe = buildTool({
+      name: "probe",
+      description: "captures its run context",
+      inputSchema: z.object({}),
+      execute: async (_input, ctx) => {
+        const bridge = ctx?.bridge as { runContext?: RunContext } | undefined;
+        bridgeRunContext = bridge?.runContext;
+        return "ok";
+      },
+    });
+
+    const { adapter } = makeScriptedClient([
+      [{ type: "tool_use", id: "tu_p", name: "probe", input: {} } as Anthropic.ToolUseBlock],
+      [{ type: "text", text: "done", citations: null } as Anthropic.TextBlock],
+    ]);
+
+    const ctx = createRunContext();
+    const input = new PassThrough();
+    input.write("probe please\n");
+    input.end();
+
+    await runChatLoop({
+      model: "test-model",
+      instructions: "test",
+      _adapter: adapter,
+      input,
+      tools: [probe],
+      permissionMode: "bypass",
+      runContext: ctx,
+      // NOTE: deliberately NO spawnSubAgent / crewMailbox — a plain top-level run.
+    });
+
+    // The tool saw a bridge, and its runContext is the very run context we
+    // passed in — so tool-mcp/skills-registry can tag provenance on every run.
+    expect(bridgeRunContext).toBe(ctx);
   });
 
   test("returns an is_error tool_result when the model names an unknown tool", async () => {

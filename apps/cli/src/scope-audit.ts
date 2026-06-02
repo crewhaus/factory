@@ -1,59 +1,17 @@
-import { isOutwardName } from "@crewhaus/tool-builder";
+import { type ScopeFinding, auditToolScopes, isOutwardName } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 
 /**
- * FR-002 — Pillar 3 sink-side build-time gate (pure, side-effect-free so it
- * is directly unit-testable; the entry file `index.ts` runs a top-level
- * argv switch and cannot be imported without executing the CLI).
- *
- * A single shared audit used by BOTH `crewhaus compile --strict` and
- * `crewhaus doctor --philosophy-alignment` so the two enforcement paths can
- * never drift (acceptance criterion: "the --strict gate and doctor
- * --philosophy-alignment share one implementation").
- *
- * A finding fires when a tool is I/O-capable yet its resolved `scope` is not
- * "external". A tool counts as I/O-capable when EITHER:
- *
- *   (a) it declares `ioCapability` ("network" | "process") on its
- *       `ToolDefinition` — the capability-driven path that catches an
- *       *arbitrary-named* custom `buildTool` tool that opens a socket or
- *       spawns a process (the FR mechanism-2 residual: "custom buildTool
- *       tools that open sockets, spawn processes, touch the network"); or
- *   (b) its name is definitionally outward-reaching
- *       (Fetch/WebFetch/WebSearch/SendMessage/EvmSendTransaction/ImageGenerate
- *       or any `mcp__*`, per `isOutwardName`) — the name backstop that still
- *       fires for a future built-in that forgets BOTH annotations.
- *
- * Because the gate keys on the declared capability and not only on a
- * hardcoded name set, a custom `SomeCustomSocketTool` with
- * `ioCapability: "network"` but no `scope: "external"` is now flagged — the
- * gate is no longer a no-op for user-authored tools that declare what they
- * do. (It cannot read the mind of a tool that declares NEITHER its
- * capability nor an outward name; that irreducible residual — a tool that
- * lies by omission about touching the network — is documented in the
- * walkthrough and is the limit of a static, annotation-based check short of
- * full dataflow analysis, which the FR puts out of scope.)
+ * FR-002 — Pillar 3 sink-side build-time gate. The canonical per-tool
+ * `auditToolScopes` (and its `ScopeFinding` type) now live in
+ * `@crewhaus/tool-builder`, next to `isOutwardName` and `buildTool` — the two
+ * facts the gate keys on — so every consumer (this CLI's `compile --strict`
+ * and `doctor --philosophy-alignment`, plus the `compile()` library and the
+ * compiler-worker) audits identically rather than re-deriving the rule. They
+ * are re-exported here so the CLI's existing import sites and tests are
+ * unchanged.
  */
-export type ScopeFinding = { toolName: string; reason: string };
-
-export function auditToolScopes(tools: ReadonlyArray<RegisteredTool>): ScopeFinding[] {
-  const findings: ScopeFinding[] = [];
-  for (const tool of tools) {
-    if (tool.scope === "external") continue;
-    if (tool.ioCapability !== undefined) {
-      findings.push({
-        toolName: tool.name,
-        reason: `declares ioCapability "${tool.ioCapability}" (crosses a ${tool.ioCapability} boundary) but scope is "${tool.scope}" (expected "external")`,
-      });
-    } else if (isOutwardName(tool.name)) {
-      findings.push({
-        toolName: tool.name,
-        reason: `is outward-reaching by definition but scope is "${tool.scope}" (expected "external")`,
-      });
-    }
-  }
-  return findings;
-}
+export { type ScopeFinding, auditToolScopes };
 
 /**
  * FR-002 — the `compile --strict` audit over the *spec-level* tool names a

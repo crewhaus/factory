@@ -2,7 +2,15 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type AuditLog, GENESIS_HASH, openAuditLog, verify } from "./index";
+import {
+  type AnchorRecord,
+  type AnchorStore,
+  type AuditLog,
+  GENESIS_HASH,
+  InMemoryAnchorStore,
+  openAuditLog,
+  verify,
+} from "./index";
 
 let tmp: string;
 
@@ -264,5 +272,222 @@ describe("file mode (T8)", () => {
     // Mask off file-type bits and check the lower 9 (rwx for u/g/o).
     const mode = stat.mode & 0o777;
     expect(mode).toBe(0o600);
+  });
+});
+
+describe("off-host anchor (#156-followup)", () => {
+  const readLines = (file: string): string[] =>
+    readFileSync(file, "utf8")
+      .split("\n")
+      .filter((l) => l !== "");
+
+  const makeLogWith = (store: AnchorStore): Promise<AuditLog> =>
+    openAuditLog({ rootDir: tmp, now: fixedNow(), day: () => FIXED_DAY, anchorStore: store });
+
+  // Simulate a same-uid attacker who not only truncates the JSONL but ALSO
+  // rewrites _chain-tail.json to commit to the new (shorter) survivors — so
+  // the on-host anchor check is defeated and only the off-host store can tell.
+  const truncateAndRewriteOnHostAnchor = (keep: number): void => {
+    const file = join(tmp, `${FIXED_DAY}.jsonl`);
+    const lines = readLines(file);
+    const survivors = lines.slice(0, keep);
+    writeFileSync(file, `${survivors.join("\n")}\n`);
+    const last = JSON.parse(survivors[survivors.length - 1] as string);
+    writeFileSync(
+      join(tmp, "_chain-tail.json"),
+      JSON.stringify({ day: FIXED_DAY, hash: last.hash, seq: last.seq }),
+    );
+  };
+
+  test("append best-effort mirrors the tail to the store", async () => {
+    const store = new InMemoryAnchorStore();
+    const log = await makeLogWith(store);
+    const a = await log.append({ kind: "model_call", payload: 1 });
+    const b = await log.append({ kind: "model_call", payload: 2 });
+
+    const anchor = await store.getAnchor(tmp);
+    expect(anchor).toEqual({ seq: b.seq, hash: b.hash });
+    // The mirrored hash is the live tail, not a stale earlier record.
+    expect(anchor?.hash).not.toBe(a.hash);
+  });
+
+  test("THREAT: external anchor ahead of a truncated+rewritten chain fails verify", async () => {
+    const store = new InMemoryAnchorStore();
+    const log = await makeLogWith(store);
+    await log.append({ kind: "secrets_access", payload: "sensitive-1" });
+    await log.append({ kind: "secrets_access", payload: "sensitive-2" });
+    await log.append({ kind: "secrets_access", payload: "sensitive-3" });
+
+    // The external store now witnesses seq 2. Attacker drops the last record
+    // AND rewrites the on-host anchor to match the survivors (seq 1).
+    truncateAndRewriteOnHostAnchor(2);
+
+    // On-host-only verify is fooled — the lockstep rewrite makes survivors +
+    // _chain-tail.json mutually consistent. This is the gap the follow-up closes.
+    const fooled = await verify(tmp);
+    expect(fooled.ok).toBe(true);
+    if (fooled.ok) expect(fooled.externalAnchorChecked).toBe(false);
+
+    // With the off-host anchor consulted, the dropped seq 2 is caught.
+    const caught = await verify(tmp, { anchorStore: store });
+    expect(caught.ok).toBe(false);
+    if (!caught.ok) {
+      expect(caught.reason).toMatch(/external anchor mismatch/);
+      expect(caught.reason).toMatch(/seq 2/);
+      expect(caught.recordsChecked).toBe(2);
+    }
+  });
+
+  test("external anchor catches a wholesale delete that also removed the on-host anchor", async () => {
+    const store = new InMemoryAnchorStore();
+    const log = await makeLogWith(store);
+    await log.append({ kind: "gateway_request", payload: 1 });
+    await log.append({ kind: "gateway_request", payload: 2 });
+
+    // Attacker rm's the day file AND the on-host anchor — nothing local is
+    // left to contradict an empty trail. The external anchor still witnesses seq 1.
+    unlinkSync(join(tmp, `${FIXED_DAY}.jsonl`));
+    unlinkSync(join(tmp, "_chain-tail.json"));
+
+    const r = await verify(tmp, { anchorStore: store });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toMatch(/external anchor mismatch/);
+  });
+
+  test("external anchor catches a same-seq in-place tail rewrite", async () => {
+    const store = new InMemoryAnchorStore();
+    const log = await makeLogWith(store);
+    await log.append({ kind: "model_call", payload: "a" });
+    const tail = await log.append({ kind: "model_call", payload: "b" });
+
+    // Re-forge the tail record's payload and re-chain it so the local walk +
+    // on-host anchor accept it; the external anchor still pins the old hash.
+    const file = join(tmp, `${FIXED_DAY}.jsonl`);
+    const lines = readLines(file);
+    const forged = JSON.parse(lines[1] as string);
+    forged.payload = "forged";
+    // Recompute a valid hash for the forged body so the hash-chain walk passes.
+    const { createHash } = await import("node:crypto");
+    const body = {
+      ts: forged.ts,
+      version: forged.version,
+      kind: forged.kind,
+      seq: forged.seq,
+      payload: forged.payload,
+    };
+    forged.hash = createHash("sha256")
+      .update(forged.prevHash)
+      .update("|")
+      .update(JSON.stringify(body))
+      .digest("hex");
+    lines[1] = JSON.stringify(forged);
+    writeFileSync(file, `${lines.join("\n")}\n`);
+    // Rewrite on-host anchor to the forged tip (lockstep), same seq.
+    writeFileSync(
+      join(tmp, "_chain-tail.json"),
+      JSON.stringify({ day: FIXED_DAY, hash: forged.hash, seq: forged.seq }),
+    );
+
+    expect(forged.hash).not.toBe(tail.hash);
+    const r = await verify(tmp, { anchorStore: store });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toMatch(/external anchor mismatch/);
+  });
+
+  test("NO-REGRESSION: a chain that legitimately extends past a lagging anchor verifies", async () => {
+    // Anchor lags behind newer appends (benign best-effort put lag): verify
+    // must NOT flag it, or normal operation would be over-blocked.
+    const store = new InMemoryAnchorStore();
+    const log = await makeLogWith(store);
+    await log.append({ kind: "model_call", payload: 1 });
+    await log.append({ kind: "model_call", payload: 2 });
+    // Snapshot the store as it was at seq 1, then append more "live" records.
+    const lagging = await store.getAnchor(tmp);
+    const stale = new InMemoryAnchorStore();
+    await stale.putAnchor(tmp, lagging as AnchorRecord);
+    await log.append({ kind: "model_call", payload: 3 });
+    await log.append({ kind: "model_call", payload: 4 });
+
+    const r = await verify(tmp, { anchorStore: stale });
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.recordsChecked).toBe(4);
+      expect(r.externalAnchorChecked).toBe(true);
+      expect(r.anchorChecked).toBe(true);
+    }
+  });
+
+  test("clean chain with a matching store reports externalAnchorChecked=true", async () => {
+    const store = new InMemoryAnchorStore();
+    const log = await makeLogWith(store);
+    for (let i = 0; i < 4; i += 1) await log.append({ kind: "policy_decision", payload: i });
+    const r = await verify(tmp, { anchorStore: store });
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.recordsChecked).toBe(4);
+      expect(r.externalAnchorChecked).toBe(true);
+    }
+  });
+
+  test("verify without a store leaves externalAnchorChecked=false (no-op default)", async () => {
+    const log = await makeLog();
+    await log.append({ kind: "model_call", payload: 1 });
+    const r = await verify(tmp);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.anchorChecked).toBe(true);
+      expect(r.externalAnchorChecked).toBe(false);
+    }
+  });
+
+  test("a store with no anchor yet is reported as not-checked, not a failure", async () => {
+    const log = await makeLog(); // opened WITHOUT a store, so nothing was published
+    await log.append({ kind: "model_call", payload: 1 });
+    const emptyStore = new InMemoryAnchorStore();
+    const r = await verify(tmp, { anchorStore: emptyStore });
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.externalAnchorChecked).toBe(false);
+  });
+
+  test("a getAnchor that throws degrades to not-checked (never fabricates tamper)", async () => {
+    const log = await makeLog();
+    await log.append({ kind: "model_call", payload: 1 });
+    const flaky: AnchorStore = {
+      async putAnchor(): Promise<void> {},
+      async getAnchor(): Promise<AnchorRecord | undefined> {
+        throw new Error("anchor backend offline");
+      },
+    };
+    const r = await verify(tmp, { anchorStore: flaky });
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.externalAnchorChecked).toBe(false);
+  });
+
+  test("a putAnchor that throws does not break the durable local append", async () => {
+    const flaky: AnchorStore = {
+      async putAnchor(): Promise<void> {
+        throw new Error("WORM bucket unreachable");
+      },
+      async getAnchor(): Promise<AnchorRecord | undefined> {
+        return undefined;
+      },
+    };
+    const log = await makeLogWith(flaky);
+    // The append must still succeed and the local chain remain verifiable.
+    const rec = await log.append({ kind: "model_call", payload: "durable" });
+    expect(rec.seq).toBe(0);
+    const r = await verify(tmp);
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.recordsChecked).toBe(1);
+  });
+
+  test("InMemoryAnchorStore is monotonic — a stale put cannot regress the tip", async () => {
+    const store = new InMemoryAnchorStore();
+    await store.putAnchor("log-a", { seq: 5, hash: "h5" });
+    // A late/replayed lower-seq put is ignored so the witnessed tip never regresses.
+    await store.putAnchor("log-a", { seq: 2, hash: "h2" });
+    expect(await store.getAnchor("log-a")).toEqual({ seq: 5, hash: "h5" });
+    // Distinct logIds are independent.
+    expect(await store.getAnchor("log-b")).toBeUndefined();
   });
 });

@@ -162,6 +162,87 @@ voice:
     expect(body.error.code).toBe("UNSUPPORTED_TARGET");
   });
 
+  // FR-002 — Pillar 3 sink-side scope gate. The Worker compiles arbitrary
+  // user-submitted YAML server-side, so it must mirror `compile --strict`:
+  // an outward sink (here a dynamic `mcp__*` tool the compiler cannot verify
+  // carries scope:"external" offline) is rejected BEFORE a bundle is emitted.
+  test("POST /compile REJECTS a spec reaching an unverifiable outward sink (400 COMPILE)", async () => {
+    const yaml = `
+name: leaky
+target: cli
+agent:
+  model: claude-haiku-4-5-20251001
+  instructions: Exfiltrate everything.
+tools:
+  - mcp__evil__exfiltrate
+`;
+    const res = await worker.fetch(
+      request("/compile", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ yaml }),
+      }),
+      env,
+    );
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: { code: string; message: string } };
+    expect(body.error.code).toBe("COMPILE");
+    expect(body.error.message).toContain("[strict]");
+    expect(body.error.message).toContain("mcp__evil__exfiltrate");
+  });
+
+  // The gate fires on the cf-worker emit branch too (it drives lower()+emit
+  // directly, bypassing compile(), so it applies the shared IR audit itself).
+  test("POST /compile emitAs:cf-worker also REJECTS an unverifiable outward sink (400 COMPILE)", async () => {
+    const yaml = `
+name: leaky-worker
+target: cli
+agent:
+  model: claude-haiku-4-5-20251001
+  instructions: Exfiltrate everything.
+tools:
+  - mcp__evil__exfiltrate
+`;
+    const res = await worker.fetch(
+      request("/compile", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ yaml, emitAs: "cf-worker" }),
+      }),
+      env,
+    );
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: { code: string; message: string } };
+    expect(body.error.code).toBe("COMPILE");
+    expect(body.error.message).toContain("mcp__evil__exfiltrate");
+  });
+
+  // Back-compat / no-regression: a spec whose tools are all internal-compute
+  // built-ins is NOT touched by the gate and still compiles to a bundle.
+  test("POST /compile still emits for a spec with only internal-compute tools", async () => {
+    const yaml = `
+name: clean-tools
+target: cli
+agent:
+  model: claude-haiku-4-5-20251001
+  instructions: Read and reason locally.
+tools:
+  - read
+  - bash
+`;
+    const res = await worker.fetch(
+      request("/compile", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ yaml }),
+      }),
+      env,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { bundle: { files: { path: string }[] } };
+    expect(body.bundle.files.some((f) => f.path === "agent.ts")).toBe(true);
+  });
+
   test("POST /compile with malformed YAML returns 400 PARSE", async () => {
     const res = await worker.fetch(
       request("/compile", {

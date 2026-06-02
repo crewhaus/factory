@@ -7,6 +7,15 @@ import {
   randomBytes,
   scryptSync,
 } from "node:crypto";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  writeFileSync,
+} from "node:fs";
+import { join } from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
 import type { Secrets } from "@crewhaus/secrets-manager";
 
@@ -89,11 +98,33 @@ export type AuditEncryptionOptions = {
   /** Name of the KEK in §27 secrets-manager. */
   readonly kekName: string;
   /**
+   * Stable identifier for the *boot* KEK value. Defaults to
+   * `kek:<kekName>:v1`. This is the `kekRef` stamped on records sealed
+   * before the first in-process rotation, and the key under which the
+   * boot KEK is held in the retain-for-decrypt registry. After one or
+   * more rotations, a restarted process boots with the *latest* KEK
+   * value; pass that rotation's ref here so historical refs stay stable
+   * and the boot value is not mistaken for the original `:v1` material.
+   */
+  readonly kekRef?: string;
+  /**
    * Optional persistent DEK store. If omitted, DEKs live in-memory
    * (process-local). Production should plug a tenant-scoped key store
-   * here (HSM, KMS, vault path).
+   * here (HSM, KMS, vault path) — see {@link createFileDekStore} for a
+   * file-backed implementation that survives restart.
    */
   readonly dekStore?: DekStore;
+  /**
+   * Prior KEK material to re-seed at boot, keyed by the `kekRef` it was
+   * minted under. The in-process KEK registry that {@link rotateKek}
+   * populates does not survive a restart, so a freshly-constructed engine
+   * can only unwrap records sealed under the *boot* KEK. Operators that
+   * have rotated must re-provide each superseded KEK here so historical
+   * records (which embed their original `kekRef`) keep decrypting after a
+   * restart (CWE-323). Values are never persisted by this package; the
+   * operator re-supplies them from the secret backend's history.
+   */
+  readonly retainedKeks?: ReadonlyArray<{ readonly kekRef: string; readonly kekValue: string }>;
   /**
    * Roll a tenant's DEK to a fresh version once it has wrapped this many
    * records. Bounds the blast radius of any single DEK. Defaults to
@@ -157,6 +188,189 @@ export class InMemoryDekStore implements DekStore {
   async tenants(): Promise<ReadonlyArray<string>> {
     return [...this.map.keys()];
   }
+}
+
+/**
+ * Source of KEK material for {@link createFileDekStore}. The store wraps
+ * each DEK before it touches disk and unwraps on read, so it needs the
+ * *current* KEK to seal new writes and any *superseded* KEK (keyed by the
+ * `kekRef` recorded alongside the wrapped DEK) to open older files after
+ * a rotation. Operators construct this at boot from the same KEK(s) they
+ * re-provide to the engine — the store never persists the KEK value
+ * itself, only the wrapped DEK plus its `kekRef`.
+ */
+export interface KekProvider {
+  /** KEK used to wrap DEKs on write. */
+  current(): { readonly kekRef: string; readonly kekValue: string };
+  /** Resolve the KEK value a stored DEK was wrapped under, by `kekRef`. */
+  resolve(kekRef: string): string | undefined;
+}
+
+/**
+ * Build a {@link KekProvider} from a current KEK plus zero or more
+ * superseded KEKs (keyed by their original `kekRef`). After a rotation,
+ * the operator re-supplies the prior KEK(s) here so the file store can
+ * unwrap DEK files sealed under them.
+ */
+export function staticKekProvider(
+  current: { readonly kekRef: string; readonly kekValue: string },
+  retained: ReadonlyArray<{ readonly kekRef: string; readonly kekValue: string }> = [],
+): KekProvider {
+  const byRef = new Map<string, string>();
+  for (const { kekRef, kekValue } of retained) byRef.set(kekRef, kekValue);
+  // The current KEK takes precedence over any same-ref retained entry.
+  byRef.set(current.kekRef, current.kekValue);
+  return {
+    current: () => ({ kekRef: current.kekRef, kekValue: current.kekValue }),
+    resolve: (kekRef) => byRef.get(kekRef),
+  };
+}
+
+/** On-disk shape of a persisted DEK file. Never contains the raw DEK. */
+type PersistedDek = {
+  readonly version: number;
+  readonly uses: number;
+  /** KEK ref the DEK is wrapped under — selects the unwrap key on read. */
+  readonly kekRef: string;
+  /** Per-file scrypt salt (hex) for the wrapping-key derivation. */
+  readonly kekSalt: string;
+  /** Wrapped (encrypted) DEK + GCM IV/tag, all hex. */
+  readonly wrappedDek: string;
+  readonly wrappedDekIv: string;
+  readonly wrappedDekTag: string;
+};
+
+export type FileDekStoreOptions = {
+  /**
+   * Test seam: deterministic IV/salt generator for the wrapping step.
+   * Defaults to {@link randomBytes}.
+   */
+  readonly randomBytesImpl?: (n: number) => Buffer;
+};
+
+/**
+ * File-backed {@link DekStore} that persists DEKs so they (and their
+ * version + use-count) survive a restart. Each tenant's DEK lives in
+ * `<rootDir>/dek-<tenant>.json` written at mode `0o600`.
+ *
+ * SECURITY: the raw DEK is **never** written to disk. It is wrapped with
+ * the {@link KekProvider}'s current KEK (scrypt-derived AES-256-GCM key,
+ * the same scheme the engine uses for records) and only the *wrapped*
+ * bytes — together with the `kekRef` and salt needed to re-derive the
+ * unwrapping key — are persisted. The KEK *value* is supplied by the
+ * operator at boot and is never persisted (CWE-312/CWE-256): an attacker
+ * with read access to `rootDir` gets only ciphertext.
+ *
+ * After a rotation the operator must keep providing the prior KEK(s) via
+ * {@link staticKekProvider}'s `retained` list until every tenant's file
+ * has been rewritten under the new KEK (which happens on the next write
+ * for that tenant, including the re-mint that `rotateKek` performs).
+ */
+export function createFileDekStore(
+  rootDir: string,
+  kek: KekProvider,
+  opts: FileDekStoreOptions = {},
+): DekStore {
+  if (typeof rootDir !== "string" || rootDir.length === 0) {
+    throw new AuditEncryptionError("createFileDekStore: rootDir is required");
+  }
+  const rng = opts.randomBytesImpl ?? randomBytes;
+  mkdirSync(rootDir, { recursive: true, mode: 0o700 });
+
+  const FILE_PREFIX = "dek-";
+  const FILE_SUFFIX = ".json";
+
+  function pathFor(tenantId: string): string {
+    if (!/^[A-Za-z0-9_.-]+$/.test(tenantId)) {
+      throw new AuditEncryptionError(
+        `createFileDekStore: invalid tenantId "${tenantId}" (must match [A-Za-z0-9_.-]+)`,
+      );
+    }
+    return join(rootDir, `${FILE_PREFIX}${tenantId}${FILE_SUFFIX}`);
+  }
+
+  /** Wrap a raw DEK under the current KEK for persistence. */
+  function wrap(dek: Buffer): Omit<PersistedDek, "version" | "uses"> {
+    const { kekRef, kekValue } = kek.current();
+    const salt = rng(SALT_BYTES);
+    const kekKey = deriveKekKey(kekValue, salt);
+    const iv = rng(IV_BYTES);
+    const { ciphertext, tag } = encryptBytes(dek, kekKey, iv);
+    return {
+      kekRef,
+      kekSalt: salt.toString("hex"),
+      wrappedDek: ciphertext.toString("hex"),
+      wrappedDekIv: iv.toString("hex"),
+      wrappedDekTag: tag.toString("hex"),
+    };
+  }
+
+  /** Unwrap a persisted DEK using the KEK its `kekRef` selects. */
+  function unwrap(p: PersistedDek): Buffer {
+    const kekValue = kek.resolve(p.kekRef);
+    if (kekValue === undefined) {
+      throw new AuditEncryptionError(
+        `createFileDekStore: no KEK material for kekRef ${p.kekRef}; cannot unwrap persisted DEK (re-provide the prior KEK via staticKekProvider's retained list)`,
+      );
+    }
+    const kekKey = deriveKekKey(kekValue, Buffer.from(p.kekSalt, "hex"));
+    return decryptBytes(
+      Buffer.from(p.wrappedDek, "hex"),
+      kekKey,
+      Buffer.from(p.wrappedDekIv, "hex"),
+      Buffer.from(p.wrappedDekTag, "hex"),
+    );
+  }
+
+  function readPersisted(tenantId: string): PersistedDek | undefined {
+    const p = pathFor(tenantId);
+    if (!existsSync(p)) return undefined;
+    const raw = readFileSync(p, "utf8");
+    let parsed: PersistedDek;
+    try {
+      parsed = JSON.parse(raw) as PersistedDek;
+    } catch (err) {
+      throw new AuditEncryptionError(`createFileDekStore: corrupt DEK file at ${p}`, err);
+    }
+    return parsed;
+  }
+
+  /** Atomic write at 0o600: write `.tmp`, then rename into place. */
+  function writePersisted(tenantId: string, value: PersistedDek): void {
+    const p = pathFor(tenantId);
+    const tmp = `${p}.tmp`;
+    writeFileSync(tmp, JSON.stringify(value), { encoding: "utf8", mode: 0o600 });
+    renameSync(tmp, p);
+  }
+
+  return {
+    async get(tenantId: string): Promise<Buffer | undefined> {
+      const p = readPersisted(tenantId);
+      return p === undefined ? undefined : unwrap(p);
+    },
+    async set(tenantId: string, dek: Buffer): Promise<void> {
+      const prev = readPersisted(tenantId);
+      writePersisted(tenantId, { ...wrap(dek), version: prev?.version ?? 1, uses: 0 });
+    },
+    async getEntry(tenantId: string): Promise<DekEntry | undefined> {
+      const p = readPersisted(tenantId);
+      if (p === undefined) return undefined;
+      return { dek: unwrap(p), version: p.version, uses: p.uses };
+    },
+    async setEntry(tenantId: string, entry: DekEntry): Promise<void> {
+      writePersisted(tenantId, {
+        ...wrap(entry.dek),
+        version: entry.version,
+        uses: entry.uses,
+      });
+    },
+    async tenants(): Promise<ReadonlyArray<string>> {
+      if (!existsSync(rootDir)) return [];
+      return readdirSync(rootDir)
+        .filter((f) => f.startsWith(FILE_PREFIX) && f.endsWith(FILE_SUFFIX))
+        .map((f) => f.slice(FILE_PREFIX.length, f.length - FILE_SUFFIX.length));
+    },
+  };
 }
 
 const KEY_BYTES = 32; // AES-256
@@ -236,13 +450,25 @@ export async function createAuditEncryption(
       ? opts.maxRecordsPerDek
       : DEFAULT_MAX_RECORDS_PER_DEK;
   const initialKekValue = await opts.secrets.get(opts.kekName);
-  let currentKekRef = `kek:${opts.kekName}:v1`;
+  let currentKekRef =
+    typeof opts.kekRef === "string" && opts.kekRef.length > 0
+      ? opts.kekRef
+      : `kek:${opts.kekName}:v1`;
   let currentKekValue = initialKekValue;
   // Retain every KEK value we have ever held, keyed by its ref, so
   // `decryptPayload` can re-derive the wrapping key for records sealed
   // under a now-superseded KEK (CWE-323). Production deployments that
-  // restart should rehydrate this from the secret backend's history.
+  // restart rehydrate the superseded entries from `retainedKeks` (the
+  // secret backend's history), since the registry is otherwise
+  // process-local and lost across restarts.
   const kekValuesByRef = new Map<string, string>([[currentKekRef, currentKekValue]]);
+  for (const { kekRef, kekValue } of opts.retainedKeks ?? []) {
+    // The boot KEK already occupies `currentKekRef`; don't let a stale
+    // retained entry shadow it.
+    if (!kekValuesByRef.has(kekRef)) {
+      kekValuesByRef.set(kekRef, kekValue);
+    }
+  }
 
   // Auto-subscribe to rotation events.
   const unsubscribeRotation = opts.secrets.onRotation((event) => {

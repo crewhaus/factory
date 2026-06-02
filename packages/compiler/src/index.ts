@@ -157,8 +157,13 @@ function collectToolNames(ir: unknown): string[] {
  * through `die()`) listing every outward-by-name sink that cannot be verified
  * `scope: "external"` offline. A spec referencing `mcp__evil__exfiltrate` (or
  * any outward built-in name) no longer slips through a non-CLI `compile()`.
+ *
+ * Exported so a consumer that drives `lower()` + an emitter directly — rather
+ * than going through `compile({ strict: true })` — can apply the SAME offline
+ * gate over its already-lowered IR (e.g. the compiler-worker's `cf-worker`
+ * emit branch), instead of re-deriving the rule and risking drift.
  */
-function assertToolScopesStrict(ir: IrNode): void {
+export function assertToolScopesStrict(ir: IrNode): void {
   const findings: ScopeFinding[] = [];
   for (const name of collectToolNames(ir)) {
     if (isOutwardName(name)) {

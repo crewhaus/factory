@@ -438,4 +438,79 @@ describe("Pillar 3 boundary fabric — tagContent provenance (#160)", () => {
   });
 });
 
+describe("Pillar 3 boundary fabric — precise tag fires on every run (#160-followup)", () => {
+  test('the Skill tool tags "skill" via ctx.runContext on a plain run (no bridge)', async () => {
+    clearBoundaryCache();
+    await withTempHomeAndCwd(
+      ({ cwd }) => {
+        writeSkill(
+          cwd,
+          "via-field",
+          "name: via-field\ndescription: x",
+          "A long enough skill body to clear the lineage floor (plain run).",
+        );
+      },
+      async ({ home, cwd }) => {
+        const skills = await discoverSkills({ cwd, homeDir: home });
+        const tool = createSkillTool(skills);
+        // A plain top-level run wires NO bridge; the runtime now threads the
+        // RunContext directly on `ctx.runContext`, so the precise "skill"
+        // origin tag must still fire here.
+        const ctx: RunContext = createRunContext();
+        const result = await tool.execute({ name: "via-field" }, { runContext: ctx });
+        expect(result).toBe("A long enough skill body to clear the lineage floor (plain run).");
+        expect(ctx.dataLineage?.get(result as string)).toBe("skill");
+      },
+    );
+  });
+
+  test("ctx.runContext takes precedence over ctx.bridge.runContext", async () => {
+    clearBoundaryCache();
+    await withTempHomeAndCwd(
+      ({ cwd }) => {
+        writeSkill(
+          cwd,
+          "prec",
+          "name: prec\ndescription: x",
+          "A skill body long enough to clear the lineage floor for precedence.",
+        );
+      },
+      async ({ home, cwd }) => {
+        const skills = await discoverSkills({ cwd, homeDir: home });
+        const tool = createSkillTool(skills);
+        const direct: RunContext = createRunContext();
+        const viaBridge: RunContext = createRunContext();
+        // Both surfaces present: the direct field wins, so only `direct` is tagged.
+        const result = await tool.execute(
+          { name: "prec" },
+          { runContext: direct, bridge: { runContext: viaBridge } },
+        );
+        expect(direct.dataLineage?.get(result as string)).toBe("skill");
+        expect(viaBridge.dataLineage).toBeUndefined();
+      },
+    );
+  });
+
+  test("back-compat: ctx.bridge.runContext still tags when no ctx.runContext is supplied", async () => {
+    clearBoundaryCache();
+    await withTempHomeAndCwd(
+      ({ cwd }) => {
+        writeSkill(
+          cwd,
+          "bridge-only",
+          "name: bridge-only\ndescription: x",
+          "A bridge-only skill body with enough characters to tag.",
+        );
+      },
+      async ({ home, cwd }) => {
+        const skills = await discoverSkills({ cwd, homeDir: home });
+        const tool = createSkillTool(skills);
+        const ctx: RunContext = createRunContext();
+        const result = await tool.execute({ name: "bridge-only" }, { bridge: { runContext: ctx } });
+        expect(ctx.dataLineage?.get(result as string)).toBe("skill");
+      },
+    );
+  });
+});
+
 void mock;

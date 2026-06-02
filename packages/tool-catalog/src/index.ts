@@ -1,4 +1,5 @@
 import { CrewhausError } from "@crewhaus/errors";
+import type { RunContext } from "@crewhaus/run-context";
 import type { ZodType } from "zod";
 
 /**
@@ -11,6 +12,16 @@ import type { ZodType } from "zod";
  * the typed `RuntimeBridge` from `@crewhaus/agent-context-isolation`.
  * Ordinary tools ignore it.
  *
+ * Pillar 3 sink-side fabric (#160 follow-up) — `runContext` is the run's
+ * `RunContext`, supplied so boundary-site tools (tool-mcp, skills-registry)
+ * can `tagContent` their external content's provenance into `dataLineage`
+ * on EVERY run. It carries the same `RunContext` instance the runtime would
+ * otherwise expose only via `bridge.runContext` (which is built lazily). It
+ * is optional and additive: tools that don't tag provenance ignore it, and
+ * tagging tools read it first but fall back to `bridge.runContext` for
+ * back-compat. The runtime always makes the run context reachable through at
+ * least one of the two; tagging tools must tolerate both being absent.
+ *
  * Section 18 — `onStreamChunk` is invoked by streaming tools (e.g.
  * tool-code-execution piping container stdout/stderr) so runtime-core can
  * publish `tool_stream_chunk` trace events. The callback is fire-and-forget
@@ -19,6 +30,7 @@ import type { ZodType } from "zod";
 export interface ToolExecuteContext {
   readonly signal?: AbortSignal;
   readonly bridge?: unknown;
+  readonly runContext?: RunContext;
   readonly onStreamChunk?: (stream: "stdout" | "stderr", chunk: string) => void;
 }
 
