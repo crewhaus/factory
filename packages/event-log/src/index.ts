@@ -25,9 +25,10 @@
  * `AI-Harness-Systems.md` §append-only event history.
  */
 import { appendFileSync, createReadStream, existsSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { RuntimeError } from "@crewhaus/errors";
+import { assertSamePath, currentTenantContext, requireTenant } from "@crewhaus/tenancy";
 
 export const DEFAULT_ROOT_DIR = ".crewhaus/sessions";
 const ID_REGEX = /^sess_[0-9a-f]{16}$/;
@@ -98,11 +99,22 @@ export async function openEventLog(
   validateId(sessionId);
   const rootDir = opts.rootDir ?? DEFAULT_ROOT_DIR;
   const now = opts.now ?? (() => Date.now());
-  const fullPath = join(rootDir, `${sessionId}.jsonl`);
+  const fullPath = resolve(rootDir, `${sessionId}.jsonl`);
   mkdirSync(rootDir, { recursive: true });
+
+  // When a tenant context is active, fail closed on a resolved path that
+  // escapes the tenant's sessionRoot (CWE-1230). Outside a tenant scope (the
+  // common CLI case) this is a no-op so non-tenant behaviour is unchanged.
+  function fence(): void {
+    if (currentTenantContext() !== undefined) {
+      assertSamePath(fullPath, requireTenant().sessionRoot);
+    }
+  }
+  fence();
 
   return {
     async append(event: AppendEvent): Promise<void> {
+      fence();
       const wire: Event = {
         ts: now(),
         version: 1,
@@ -114,6 +126,7 @@ export async function openEventLog(
     },
 
     read(readOpts: { since?: number; until?: number } = {}): AsyncIterable<Event> {
+      fence();
       return readEvents(fullPath, readOpts);
     },
 

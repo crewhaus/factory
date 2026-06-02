@@ -38,8 +38,9 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { CrewhausError, RuntimeError } from "@crewhaus/errors";
+import { assertSamePath, currentTenantContext, requireTenant } from "@crewhaus/tenancy";
 
 export const DEFAULT_ROOT_DIR = ".crewhaus/graphs";
 
@@ -160,7 +161,16 @@ class FileSystemAdapter implements CheckpointStoreAdapter {
 
   private dir(graphRunId: GraphRunId): string {
     validateGraphRunId(graphRunId);
-    return join(this.rootDir, graphRunId);
+    const dir = join(this.rootDir, graphRunId);
+    // When a tenant context is active, fail closed on a resolved path that
+    // escapes the tenant's sessionRoot (CWE-1230). Every checkpoint/meta path
+    // is built under this directory, so fencing here covers every read/write.
+    // Outside a tenant scope (the common CLI case) this is a no-op so
+    // non-tenant behaviour is unchanged.
+    if (currentTenantContext() !== undefined) {
+      assertSamePath(resolve(dir), requireTenant().sessionRoot);
+    }
+    return dir;
   }
 
   private metaPath(graphRunId: GraphRunId): string {

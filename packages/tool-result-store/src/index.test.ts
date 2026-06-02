@@ -2,6 +2,7 @@ import { afterAll, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { TenancyError, buildTenant, withTenant } from "@crewhaus/tenancy";
 import type { ToolResult } from "@crewhaus/tool-executor";
 import {
   DEFAULT_PREVIEW_LINES,
@@ -179,5 +180,50 @@ describe("storeAndPreview — path traversal guard", () => {
   test("resolveStoragePath returns a path under rootDir", () => {
     const path = resolveStoragePath("run_x", "tu_y", "/tmp/cr-test");
     expect(path).toContain("/tmp/cr-test/run_x/tu_y.txt");
+  });
+});
+
+describe("storeAndPreview — cross-tenant fencing (CWE-1230)", () => {
+  const big = "x".repeat(DEFAULT_THRESHOLD_BYTES + 10);
+
+  test("inside tenantA, a store rooted under tenantB fails closed", async () => {
+    const tenantsRoot = newTempRoot();
+    const tenantA = buildTenant("tenant-a", { tenantsRoot });
+    const tenantB = buildTenant("tenant-b", { tenantsRoot });
+    // Persisting under tenantB's toolResultRoot while tenantA is active
+    // resolves a path outside tenantA's root, so it fails closed.
+    await withTenant(tenantA, async () => {
+      await expect(
+        storeAndPreview(makeResult(big), {
+          runId: "run_x",
+          toolUseId: "tu_x",
+          rootDir: tenantB.toolResultRoot,
+        }),
+      ).rejects.toThrow(TenancyError);
+    });
+  });
+
+  test("inside tenantA, a store rooted under tenantA persists", async () => {
+    const tenantsRoot = newTempRoot();
+    const tenantA = buildTenant("tenant-a", { tenantsRoot });
+    await withTenant(tenantA, async () => {
+      const out = await storeAndPreview(makeResult(big), {
+        runId: "run_x",
+        toolUseId: "tu_x",
+        rootDir: tenantA.toolResultRoot,
+      });
+      expect(out.persisted).toBe(true);
+      expect(out.fullPath).toContain(tenantA.toolResultRoot);
+    });
+  });
+
+  test("no active tenant — behaviour is unchanged (no fencing)", async () => {
+    const rootDir = newTempRoot();
+    const out = await storeAndPreview(makeResult(big), {
+      runId: "run_x",
+      toolUseId: "tu_x",
+      rootDir,
+    });
+    expect(out.persisted).toBe(true);
   });
 });

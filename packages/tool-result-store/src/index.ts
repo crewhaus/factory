@@ -26,8 +26,18 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, join, resolve, sep } from "node:path";
 import { RuntimeError } from "@crewhaus/errors";
+import { assertSamePath, currentTenantContext, requireTenant } from "@crewhaus/tenancy";
 import type { ToolExecuteResult } from "@crewhaus/tool-catalog";
 import type { ToolResult } from "@crewhaus/tool-executor";
+
+// When a tenant context is active, fail closed on a resolved storage path that
+// escapes the tenant's toolResultRoot (CWE-1230). Outside a tenant scope (the
+// common CLI case) this is a no-op so non-tenant behaviour is unchanged.
+function fence(absPath: string): void {
+  if (currentTenantContext() !== undefined) {
+    assertSamePath(absPath, requireTenant().toolResultRoot);
+  }
+}
 
 export type StoreOptions = {
   readonly runId: string;
@@ -79,6 +89,7 @@ export async function storeAndPreview(
   rejectUnsafeSegment("toolUseId", opts.toolUseId);
 
   const fullPath = join(rootDir, opts.runId, `${opts.toolUseId}.txt`);
+  fence(resolve(fullPath));
   await mkdir(dirname(fullPath), { recursive: true });
   try {
     await writeFile(fullPath, result.content, { flag: "wx" });
@@ -130,5 +141,6 @@ export function resolveStoragePath(
   if (!abs.startsWith(`${root}${sep}`)) {
     throw new RuntimeError("tool-result-store: resolved path escapes rootDir");
   }
+  fence(abs);
   return abs;
 }

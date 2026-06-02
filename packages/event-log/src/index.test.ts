@@ -2,6 +2,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { TenancyError, buildTenant, withTenant } from "@crewhaus/tenancy";
 import { type Event, openEventLog } from "./index";
 
 const TMP_ROOTS: string[] = [];
@@ -169,4 +170,36 @@ describe("event-log — T7 load", () => {
     // Read should be substantially faster than the append loop.
     expect(readMs).toBeLessThan(5_000);
   }, 30_000);
+});
+
+describe("event-log — cross-tenant fencing (CWE-1230)", () => {
+  test("inside tenantA, a log rooted under tenantB fails closed", async () => {
+    const tenantsRoot = newTempRoot();
+    const tenantA = buildTenant("tenant-a", { tenantsRoot });
+    const tenantB = buildTenant("tenant-b", { tenantsRoot });
+    // Opening a log rooted under tenantB while tenantA is active resolves a
+    // path outside tenantA's sessionRoot, so it fails closed.
+    await expect(
+      withTenant(tenantA, () => openEventLog(TEST_ID, { rootDir: tenantB.sessionRoot })),
+    ).rejects.toThrow(TenancyError);
+  });
+
+  test("inside tenantA, a log rooted under tenantA round-trips", async () => {
+    const tenantsRoot = newTempRoot();
+    const tenantA = buildTenant("tenant-a", { tenantsRoot });
+    await withTenant(tenantA, async () => {
+      const log = await openEventLog(TEST_ID, { rootDir: tenantA.sessionRoot });
+      await log.append({ kind: "user_message", payload: { ok: true } });
+      const all = await collect(log.read());
+      expect(all.length).toBe(1);
+    });
+  });
+
+  test("no active tenant — behaviour is unchanged (no fencing)", async () => {
+    const rootDir = newTempRoot();
+    const log = await openEventLog(TEST_ID, { rootDir });
+    await log.append({ kind: "user_message", payload: { ok: true } });
+    const all = await collect(log.read());
+    expect(all.length).toBe(1);
+  });
 });

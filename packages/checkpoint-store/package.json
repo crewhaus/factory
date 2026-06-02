@@ -12,7 +12,8 @@
     "test": "bun test src"
   },
   "dependencies": {
-    "@crewhaus/errors": "workspace:*"
+    "@crewhaus/errors": "workspace:*",
+    "@crewhaus/tenancy": "workspace:*"
   },
   "license": "Apache-2.0",
   "author": {

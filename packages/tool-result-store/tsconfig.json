@@ -6,6 +6,7 @@
   },
   "references": [
     { "path": "../errors" },
+    { "path": "../tenancy" },
     { "path": "../tool-catalog" },
     { "path": "../tool-executor" }
   ],
