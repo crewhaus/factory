@@ -2,7 +2,6 @@
 
 This file is the source of truth for *how* to develop factory. The *what* lives in:
 
-- [AI-Harness-Systems.md](https://github.com/crewhaus/docs/blob/main/AI-Harness-Systems.md) — the founding architectural thesis (north star; do not modify lightly)
 - [COMPILER-ARCHITECTURE.md](https://github.com/crewhaus/docs/blob/main/COMPILER-ARCHITECTURE.md) — the meta-harness compiler walked through with file paths
 - [build-roadmap.md](https://github.com/crewhaus/operations/blob/main/build-roadmap.md) — what's been built and what comes next
 - [MODULE-CATALOG.md](https://github.com/crewhaus/docs/blob/main/MODULE-CATALOG.md) — ~190 modules across 25 catalog layers

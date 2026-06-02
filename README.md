@@ -249,9 +249,7 @@ Quick links:
 
 Async, best-effort, community-driven. See [`SUPPORT.md`](SUPPORT.md) for the channels and what to expect.
 
-- Free users → [GitHub Discussions](https://github.com/crewhaus/factory/discussions) and [Issues](https://github.com/crewhaus/factory/issues)
-- Paid Cloud users → support tied to your plan
-- Custom implementation → [StudioMax implementation packages](https://studiomax.io/work/crewhaus)
+- [GitHub Discussions](https://github.com/crewhaus/factory/discussions) and [Issues](https://github.com/crewhaus/factory/issues)
 
 ## Security
 

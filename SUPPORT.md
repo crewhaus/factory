@@ -29,11 +29,11 @@ Search before posting. Most "how do I" questions have been asked before.
 
 ### Security
 
-**security@crewhaus.ai**. Do not file security issues publicly. See [`SECURITY.md`](SECURITY.md).
+Do not file security issues publicly. See [`SECURITY.md`](SECURITY.md).
 
 ### Conduct
 
-**conduct@crewhaus.ai**. See [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md).
+See [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md).
 
 ## Where NOT to ask
 
@@ -84,7 +84,7 @@ For now we're focused on the open source and bounded consulting; we're collectin
 
 ### StudioMax implementation packages
 
-[Work with StudioMax →](https://studiomax.io/work/crewhaus)
+[Work with StudioMax →](https://studiomax.io/)
 
 For teams that want hands-on help getting CrewHaus running, StudioMax (the studio behind CrewHaus) sells fixed-scope implementation packages:
 
@@ -93,7 +93,7 @@ For teams that want hands-on help getting CrewHaus running, StudioMax (the studi
 - **Custom Harness Pack** — build reusable harnesses for a specific business function
 - **Private Registry Setup** — deploy private artifact workflow with team controls
 
-These are fixed-fee, scoped engagements. Not hourly. Get a quote at hello@studiomax.io.
+These are fixed-fee, scoped engagements. Not hourly. Get a quote - max@studiomax.io.
 
 ## What "best effort" means in practice
 
