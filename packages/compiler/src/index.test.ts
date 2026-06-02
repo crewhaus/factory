@@ -601,3 +601,79 @@ security:
     expect("egressMatcher" in (ir.security ?? {})).toBe(false);
   });
 });
+
+describe("lower — wallet keyRef policy (Section 47, #159 CWE-798)", () => {
+  const ONCHAIN_SPEC = (keyRef: string) => `
+name: treasury-daemon
+target: onchain
+agent:
+  model: m
+  instructions: i
+chains:
+  - id: base-mainnet
+    kind: evm
+    rpcUrls:
+      - $BASE_RPC
+    rpcPolicy: single
+    finality:
+      kind: confirmations
+      count: 12
+    reorgTolerant: true
+wallets:
+  - id: treasurer
+    chainId: base-mainnet
+    custody: local
+    signingPolicy: automated
+    keyRef: "${keyRef}"
+contracts:
+  - id: treasury
+    chainId: base-mainnet
+    address: "0xTREASURY"
+    abiRef: abi://safe
+triggers:
+  - kind: block
+    chainId: base-mainnet
+    scanIntervalMs: 30000
+`;
+
+  test("lowers a $ENV_REF wallet keyRef into an env reference", () => {
+    const ir = lower(parseSpec(ONCHAIN_SPEC("$TREASURER_KEY")));
+    if (ir.target !== "onchain") throw new Error("unexpected target");
+    expect(ir.wallets[0]?.keyRef).toEqual({ kind: "env", name: "TREASURER_KEY" });
+  });
+
+  test("lowers a kms:// wallet keyRef handle as a literal", () => {
+    const ir = lower(parseSpec(ONCHAIN_SPEC("kms://aws/treasurer-key")));
+    if (ir.target !== "onchain") throw new Error("unexpected target");
+    expect(ir.wallets[0]?.keyRef).toEqual({ kind: "literal", value: "kms://aws/treasurer-key" });
+  });
+
+  test("rejects a raw hex private key wallet keyRef", () => {
+    expect(() =>
+      lower(
+        parseSpec(
+          ONCHAIN_SPEC("0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"),
+        ),
+      ),
+    ).toThrow(/raw private key/);
+  });
+
+  test("rejects an arbitrary literal wallet keyRef that is not an env ref or handle", () => {
+    expect(() => lower(parseSpec(ONCHAIN_SPEC("my-secret-passphrase")))).toThrow(
+      /not a permitted signing-key reference/,
+    );
+  });
+
+  test("compile() embeds an env-ref keyRef and binds contractAddresses (#151)", () => {
+    const bundle = compile(ONCHAIN_SPEC("$TREASURER_KEY"));
+    const agent = bundle.files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agent).toContain('process.env["TREASURER_KEY"]');
+    expect(agent).toContain('"contractAddresses":{"treasury":"0xTREASURY"}');
+  });
+
+  test("compile() fails closed on a raw hex private key keyRef", () => {
+    expect(() =>
+      compile(ONCHAIN_SPEC("0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d")),
+    ).toThrow(/raw private key/);
+  });
+});

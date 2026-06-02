@@ -184,6 +184,35 @@ function lowerSecret(raw: string): IrSecretRef {
   return { kind: "literal", value: raw };
 }
 
+/**
+ * Section 47 (#159, CWE-798) — lower a wallet `keyRef` with a stricter
+ * policy than `lowerSecret`. A signing key MUST be an indirection — an
+ * `$ENV_REF` (resolved from `process.env` in the compiled bundle) or a
+ * `kms://` / `hsm://` handle that names a key the custody backend holds.
+ * A literal value (especially a raw hex private key) would be baked
+ * verbatim into the DO-NOT-EDIT `agent.ts` artifact, so we fail
+ * compilation rather than emit a secret into a checked-in file.
+ */
+const KEY_HANDLE_RE = /^(kms|hsm):\/\/.+/;
+const RAW_HEX_PRIVATE_KEY_RE = /^0x?[0-9a-fA-F]{64}$/;
+function lowerWalletKeyRef(walletId: string, raw: string): IrSecretRef {
+  const m = raw.match(ENV_REF_RE);
+  if (m && typeof m[1] === "string") {
+    return { kind: "env", name: m[1] };
+  }
+  if (RAW_HEX_PRIVATE_KEY_RE.test(raw)) {
+    throw new Error(
+      `wallet "${walletId}" keyRef looks like a raw private key — never embed signing keys in a spec. Use an environment reference (e.g. keyRef: $WALLET_KEY) or a kms:// / hsm:// handle.`,
+    );
+  }
+  if (KEY_HANDLE_RE.test(raw)) {
+    return { kind: "literal", value: raw };
+  }
+  throw new Error(
+    `wallet "${walletId}" keyRef "${raw}" is not a permitted signing-key reference. Use an environment reference (e.g. keyRef: $WALLET_KEY) or a kms:// / hsm:// handle.`,
+  );
+}
+
 function lowerSlack(slack: SpecSlackChannel): IrSlackConfig {
   return {
     botToken: lowerSecret(slack.botToken),
@@ -456,7 +485,7 @@ function lowerChainSubsystem(spec: SpecChainSubsystem): IrChainSubsystem {
       chainId: w.chainId,
       custody: w.custody,
       signingPolicy: w.signingPolicy,
-      ...(w.keyRef !== undefined ? { keyRef: lowerSecret(w.keyRef) } : {}),
+      ...(w.keyRef !== undefined ? { keyRef: lowerWalletKeyRef(w.id, w.keyRef) } : {}),
     }));
   }
   if (spec.contracts !== undefined) {

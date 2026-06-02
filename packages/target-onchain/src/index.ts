@@ -50,6 +50,24 @@ function renderSecretRef(ref: IrSecretRef): string {
   )}); })()`;
 }
 
+/**
+ * #159 (CWE-798) — a wallet signing key must never be a bare literal in
+ * the emitted DO-NOT-EDIT artifact. The compiler's `lowerWalletKeyRef`
+ * already rejects literal keyRefs at lower time; this is the
+ * defense-in-depth guard at the emit boundary (e.g. for a hand-built IR
+ * that bypassed the lowerer). Env refs pass; only `kms://` / `hsm://`
+ * key handles are permitted as literals.
+ */
+const KEY_HANDLE_RE = /^(kms|hsm):\/\/.+/;
+function renderWalletKeyRef(walletId: string, ref: IrSecretRef): string {
+  if (ref.kind === "literal" && !KEY_HANDLE_RE.test(ref.value)) {
+    throw new TargetEmitError(
+      `wallet "${walletId}" keyRef is a literal signing key; refusing to embed it in the generated bundle. Use an environment reference or a kms:// / hsm:// handle.`,
+    );
+  }
+  return renderSecretRef(ref);
+}
+
 function renderChain(chain: IrChainV0["chains"][number]): string {
   const rpcs = chain.rpcUrls.map(renderSecretRef).join(", ");
   const finality =
@@ -68,7 +86,8 @@ function renderChain(chain: IrChainV0["chains"][number]): string {
 }
 
 function renderWallet(w: IrChainV0["wallets"][number]): string {
-  const keyRefStr = w.keyRef !== undefined ? `,\n    keyRef: ${renderSecretRef(w.keyRef)}` : "";
+  const keyRefStr =
+    w.keyRef !== undefined ? `,\n    keyRef: ${renderWalletKeyRef(w.id, w.keyRef)}` : "";
   return [
     "  {",
     `    id: ${JSON.stringify(w.id)},`,
@@ -120,11 +139,20 @@ export function emitOnchain(ir: IrChainV0): Bundle {
   }
 
   const policy = ir.transactionPolicy;
+  // #151 — resolve the declared contracts[] (id -> address) into the policy so
+  // the wallet-engine can bind `tx.to` to the address registered for a claimed
+  // contractId. Without this map a whitelisted id can still be pointed at an
+  // arbitrary address.
+  const contractAddresses: Record<string, string> = {};
+  for (const c of ir.contracts) {
+    contractAddresses[c.id] = c.address;
+  }
   const policyLiteral = JSON.stringify({
     defaultWriteApproval: policy.defaultWriteApproval,
     allowedContracts: policy.allowedContracts,
     simulationRequired: policy.simulationRequired,
     ...(policy.maxValueUsd !== undefined ? { maxValueUsd: policy.maxValueUsd } : {}),
+    ...(ir.contracts.length > 0 ? { contractAddresses } : {}),
   });
 
   const chains = ir.chains.map(renderChain).join(",\n");
