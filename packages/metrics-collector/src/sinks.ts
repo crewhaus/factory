@@ -49,9 +49,22 @@ export function prometheusTextfile(registry: Registry, path: string): Sink {
   };
 }
 
-export type HttpSink = Sink & { readonly port: number };
+export type HttpSink = Sink & { readonly port: number; readonly host: string };
 
-export async function httpServer(registry: Registry, port: number): Promise<HttpSink> {
+/**
+ * Loopback by default. The `/metrics` endpoint is **unauthenticated** — anyone
+ * who can reach the socket can scrape it — so we bind `127.0.0.1` unless the
+ * caller explicitly opts in to a wider interface. Exposing it externally
+ * (`0.0.0.0`) is supported but should sit behind the platform's private
+ * network / scrape proxy, never on a publicly routable interface.
+ */
+export const DEFAULT_HTTP_HOST = "127.0.0.1";
+
+export async function httpServer(
+  registry: Registry,
+  port: number,
+  host: string = DEFAULT_HTTP_HOST,
+): Promise<HttpSink> {
   const http = await import("node:http");
   let server: Server | undefined;
   await new Promise<void>((resolve, reject) => {
@@ -71,14 +84,19 @@ export async function httpServer(registry: Registry, port: number): Promise<Http
       res.end();
     });
     server.once("error", reject);
-    server.listen(port, () => {
+    // Bind to `host` (loopback unless an explicit interface was requested) so
+    // the unauthenticated endpoint is not reachable off-box by default.
+    server.listen(port, host, () => {
       resolve();
     });
   });
   if (!server) throw new Error("metrics http server failed to start");
-  const boundPort = ((server.address() as { port: number } | null)?.port ?? port) as number;
+  const addr = server.address() as { port: number; address: string } | null;
+  const boundPort = (addr?.port ?? port) as number;
+  const boundHost = addr?.address ?? host;
   return {
     port: boundPort,
+    host: boundHost,
     async flush() {
       // HTTP sink has no flush — it's pull-based.
     },
