@@ -1,11 +1,13 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
   BUILTIN_DEFAULT_RULES,
   type JustificationJudge,
   PermissionConfigError,
   type PermissionRule,
+  RULE_BASED_JUDGE_MODEL,
   type RuleSet,
   type ToolCallContext,
+  __resetRuleBasedJudgeWarningForTests,
   emptyRuleSet,
   evaluate,
   evaluateJustification,
@@ -452,5 +454,107 @@ describe("Pillar 3 — ruleBasedJustificationJudge", () => {
     expect(v.judgeModel).toBe("claude-haiku-4-5");
     expect(v.confidence).toBe(0.83);
     expect(v.reason).toContain("SendMessage");
+  });
+});
+
+// #161 (CWE-807) — the rule-based judge is satisfiable by attacker-influenced
+// justification text, so in a real (non-test) run evaluateJustification must
+// surface a prominent one-time warning that it offers no protection and that
+// production needs an LLM-backed judge. A model-backed judge must NOT trip it.
+describe("Pillar 3 — rule-based judge weakness warning (#161)", () => {
+  const originalWarn = console.warn;
+  const originalNodeEnv = process.env.NODE_ENV;
+  let warnings: string[] = [];
+
+  beforeEach(() => {
+    warnings = [];
+    console.warn = (...args: unknown[]) => {
+      warnings.push(args.map(String).join(" "));
+    };
+    // The guard latches per process; reset it so each test asserts for the
+    // right reason regardless of order.
+    __resetRuleBasedJudgeWarningForTests();
+  });
+
+  afterEach(() => {
+    console.warn = originalWarn;
+    process.env.NODE_ENV = originalNodeEnv;
+    __resetRuleBasedJudgeWarningForTests();
+  });
+
+  test("warns for the rule-based judge path in a non-test run", async () => {
+    process.env.NODE_ENV = "production";
+    await evaluateJustification({
+      toolName: "EvmSendTransaction",
+      justification: "broadcasting a transaction to mint the new NFT collection",
+      sessionGoal: "summarize the customer's recent email correspondence",
+      input: {},
+    });
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("[permission-engine]");
+    expect(warnings[0]).toContain("SECURITY");
+    expect(warnings[0]).toContain("EvmSendTransaction");
+    expect(warnings[0]).toContain("security.justification.judge: claude");
+    // Warning is decoupled from the verdict — it fires on allow paths too.
+  });
+
+  test("warns on an allow verdict too (not just denials)", async () => {
+    process.env.NODE_ENV = "production";
+    const v = await evaluateJustification({
+      toolName: "SendMessage",
+      justification: "post the email summary to the #customer-success channel",
+      sessionGoal: "summarize the customer's recent email correspondence",
+      input: {},
+    });
+    expect(v.allow).toBe(true);
+    expect(v.judgeModel).toBe(RULE_BASED_JUDGE_MODEL);
+    expect(warnings).toHaveLength(1);
+  });
+
+  test("fires at most once per process even across many tool calls", async () => {
+    process.env.NODE_ENV = "production";
+    for (let i = 0; i < 5; i++) {
+      await evaluateJustification({
+        toolName: `Tool${i}`,
+        justification: "broadcasting a transaction to mint the new NFT collection",
+        sessionGoal: "summarize the customer's recent email correspondence",
+        input: {},
+      });
+    }
+    expect(warnings).toHaveLength(1);
+    // First-seen tool name is the one captured in the one-time warning.
+    expect(warnings[0]).toContain("Tool0");
+  });
+
+  test("does NOT warn for an injected model-backed judge", async () => {
+    process.env.NODE_ENV = "production";
+    const modelBackedJudge: JustificationJudge = async (input) => ({
+      allow: true,
+      reason: `model judged "${input.toolName}" consistent with the session goal`,
+      confidence: 0.91,
+      judgeModel: "claude-haiku-4-5",
+    });
+    const v = await evaluateJustification(
+      {
+        toolName: "EvmSendTransaction",
+        justification: "broadcasting a transaction to mint the new NFT collection",
+        sessionGoal: "summarize the customer's recent email correspondence",
+        input: {},
+      },
+      modelBackedJudge,
+    );
+    expect(v.judgeModel).toBe("claude-haiku-4-5");
+    expect(warnings).toHaveLength(0);
+  });
+
+  test("stays silent under NODE_ENV=test even on the rule-based path", async () => {
+    process.env.NODE_ENV = "test";
+    await evaluateJustification({
+      toolName: "EvmSendTransaction",
+      justification: "broadcasting a transaction to mint the new NFT collection",
+      sessionGoal: "summarize the customer's recent email correspondence",
+      input: {},
+    });
+    expect(warnings).toHaveLength(0);
   });
 });

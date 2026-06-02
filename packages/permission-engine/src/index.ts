@@ -364,8 +364,60 @@ export const ruleBasedJustificationJudge: JustificationJudge = (input) => {
 };
 
 /**
+ * Model id reported by `ruleBasedJustificationJudge`. The verdict that the
+ * default judge emits is tagged with this so the evaluation site can tell a
+ * rule-based verdict apart from an LLM-backed one after the fact.
+ */
+export const RULE_BASED_JUDGE_MODEL = "rule-based";
+
+/**
+ * One-time guard so the rule-based-judge weakness warning fires at most once
+ * per process. Module-level (mirrors `adapter-anthropic`'s
+ * `warnedAboutCliFallback`) so repeated tool calls in a long run don't spam.
+ */
+let warnedAboutRuleBasedJudge = false;
+
+/**
+ * Test-only: reset the one-time warning guard. The warning latches for the
+ * lifetime of the process, which is correct in production but makes
+ * order-independent assertions in the test suite impossible. Not part of the
+ * supported runtime surface — callers other than tests should never need it.
+ */
+export function __resetRuleBasedJudgeWarningForTests(): void {
+  warnedAboutRuleBasedJudge = false;
+}
+
+/**
+ * CWE-807 (#161) — the rule-based judge scores a justification by token
+ * overlap against the spec instructions. That text is attacker-influenceable:
+ * the SAME (possibly prompt-injected) model that picked the tool also writes
+ * the justification, so it can trivially echo a salient goal token and pass.
+ * In the default crewhaus run config this judge therefore provides no real
+ * protection. We can't safely re-wire the default judge from here (that's a
+ * cross-package decision), so instead we make the weakness LOUD: a prominent
+ * one-time runtime warning at the evaluation site whenever a rule-based
+ * verdict gates a real (non-test) run. An LLM-backed judge reports a different
+ * `judgeModel` and does not trip this.
+ */
+function warnRuleBasedJudgeOnce(toolName: string): void {
+  if (warnedAboutRuleBasedJudge) return;
+  // `bun test`/`NODE_ENV=test` exercises the rule-based judge constantly; only
+  // surface the warning for real runs so test output stays clean.
+  if (process.env.NODE_ENV === "test") return;
+  warnedAboutRuleBasedJudge = true;
+  console.warn(
+    `[permission-engine] SECURITY: the rule-based justification judge is gating a justification-required tool (first seen: \`${toolName}\`). It only checks token overlap between the justification and the spec instructions, so the SAME (potentially prompt-injected) model that chose the tool can also write a passing justification — this offers NO protection against an injected justification. Production MUST set \`security.justification.judge: claude\` in the spec (or pass an LLM-backed \`justificationJudge\` to the runtime). This warning fires once per process.`,
+  );
+}
+
+/**
  * Evaluate a justification under the supplied judge. Convenience wrapper
  * so runtime-core does not have to handle the sync-or-async ambiguity.
+ *
+ * Side effect (#161): when the resolved verdict came from the rule-based judge
+ * and this is a real (non-test) run, emit a prominent one-time warning that the
+ * rule-based judge is no defence against a justification written by the same
+ * model. See `warnRuleBasedJudgeOnce`.
  */
 export async function evaluateJustification(
   input: {
@@ -376,7 +428,11 @@ export async function evaluateJustification(
   },
   judge: JustificationJudge = ruleBasedJustificationJudge,
 ): Promise<JustificationVerdict> {
-  return await Promise.resolve(judge(input));
+  const verdict = await Promise.resolve(judge(input));
+  if (verdict.judgeModel === RULE_BASED_JUDGE_MODEL) {
+    warnRuleBasedJudgeOnce(input.toolName);
+  }
+  return verdict;
 }
 
 // ---------------------------------------------------------------------------
