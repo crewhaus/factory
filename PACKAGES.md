@@ -93,7 +93,7 @@ All ten publish at the same cut version as the factory packages.
 - The deployable app at [crewhaus/studio-pwa](https://github.com/crewhaus/studio-pwa) — it's an Astro PWA you deploy on Cloudflare Pages, not an npm package.
 - The demos workspace at [crewhaus/demos](https://github.com/crewhaus/demos) and the smoke packages under `demos/smoke/*` — `@crewhaus-examples/*` smoke tests per catalog section. Internal CI artifacts; the example code is freely copyable under Apache-2.0.
 - The doc site at [crewhaus/docs](https://github.com/crewhaus/docs) — prose, not code.
-- The sibling apps in the meta-repo (`website/`, `cloud/`, `transition-site/`, `operations/`) — none are npm-shipped.
+- The sibling apps and tooling in the development meta-repo — none are npm-shipped.
 
 ## Publishing checklist (per release cut)
 
@@ -112,12 +112,7 @@ When the launch decision lands:
 1. Run `scripts/release-prep.ts --access public` on both `factory/` and `utilities/`. The script rewrites `publishConfig.access` across all package.jsons.
 2. Cut a new changeset describing the visibility flip (typically a `0.2.0` minor or whatever the next planned cut is). Publish.
 3. Run `npm access public @crewhaus/<pkg>` for any packages that need to flip retroactively on already-published versions. (npm's policy: `restricted` versions stay restricted; new versions inherit `publishConfig.access`. The CLI command above flips the *package*, not just future versions.)
-4. Revert the "private testing" note in [README.md](README.md) and remove the `<!-- Pre-launch note: … -->` banners from launch-day drafts:
-   - `../operations/LAUNCH-PLAN.md`
-   - `../operations/content/LAUNCH-POST.md`
-   - `../operations/content/lucky-machines-crossover.md`
-   - `../website/project/uploads/HOMEPAGE-COPY.md`
-   - `../website/project/uploads/LAUNCH-PLAN.md`
+4. Revert the "private testing" note in [README.md](README.md) and remove the `<!-- Pre-launch note: … -->` banners from the launch-day draft docs (the specific files are tracked in the private launch runbook).
 5. Cut a release tag, push to GitHub, publish to npm in the same change window so docs and packages don't drift.
 
 A fully generated list of packages (with versions, descriptions, and access status) is a one-liner over `packages/*/package.json` whenever we want one — that's a follow-up rather than something to hand-curate here.

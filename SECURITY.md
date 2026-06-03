@@ -38,7 +38,7 @@ This policy covers:
 
 - `@crewhaus/cli`, `@crewhaus/core`, `@crewhaus/runtime-core` and all other published `@crewhaus/*` npm packages
 - The compiler and target emitters in this repository
-- The `crewhaus.ai`, `docs.crewhaus.ai`, `forge.crewhaus.ai`, and `cloud.crewhaus.ai` web properties
+- The `crewhaus.ai` website, plus `docs.crewhaus.ai`, `forge.crewhaus.ai`, and `cloud.crewhaus.ai` once those properties are live
 
 This policy does NOT cover:
 
@@ -49,7 +49,7 @@ This policy does NOT cover:
 ## What we consider a vulnerability
 
 - Code execution via crafted spec.yaml or artifact input
-- Authentication / authorization bypass in Crewhaus Cloud
+- Authentication / authorization bypass in a hosted Crewhaus service, once one is offered
 - Bypass of the boundary classifier (prompt injection sneaking past `TrustOrigin` classification)
 - Information disclosure (secrets, customer data, eval results)
 - Denial of service that goes beyond "the model is slow"
@@ -102,4 +102,4 @@ We do not currently offer a paid bug bounty. We may offer one in the future for 
 
 ---
 
-*Last updated: [DATE OF MERGE]*
+*Last updated: 2026-06-03*

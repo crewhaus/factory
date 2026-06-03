@@ -1,0 +1,34 @@
+name: No private-repo links
+
+# Public repos must never link into the private launch-plan/operations repo.
+# This is a cheap grep-guard that complements link checking: a link-checker
+# that excludes github.com/crewhaus/* (to avoid 404s on still-private siblings)
+# cannot catch a link INTO a repo that must stay private. This can.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    name: No links into private crewhaus repos
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fail on links to private crewhaus repos
+        run: |
+          if grep -rnI -E 'github\.com/crewhaus/(operations|launch-plan)' \
+               --include='*.md' --include='*.mdx' \
+               --include='*.yml' --include='*.yaml' --include='*.json' \
+               --include='*.ts' --include='*.tsx' --include='*.js' --include='*.jsx' \
+               --exclude-dir=node_modules --exclude-dir=.git . ; then
+            echo "::error::Found a link into a private crewhaus repo (operations/launch-plan). Repoint it to the public docs repo before merge."
+            exit 1
+          fi
+          echo "OK -- no links into private crewhaus repos."

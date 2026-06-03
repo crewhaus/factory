@@ -70,31 +70,6 @@ These restrictions are not unfriendly; they're how a 10-15 hrs/week project stay
 - Implementation assistance for your specific use case
 - Phone or video support
 
-## Paid support routes
-
-If you need more than what free users get, two options:
-
-### Crewhaus Cloud (not yet built)
-
-[Tell us if you'd want a hosted version →](https://cloud.crewhaus.ai)
-
-A hosted CrewHaus product is something we may build in the future — depending on whether enough teams would actually use it. If it ever ships, paying customers would get response-time commitments tied to their plan and higher-priority support.
-
-For now we're focused on the open source and bounded consulting; we're collecting interest signals at the link above but making no promise.
-
-### StudioMax implementation packages
-
-[Work with StudioMax →](https://studiomax.io/)
-
-For teams that want hands-on help getting CrewHaus running, StudioMax (the studio behind CrewHaus) sells fixed-scope implementation packages:
-
-- **CrewHaus Starter Implementation** — install, configure, deliver the first 3 artifacts
-- **Agent Factory Audit** — review your existing AI workflows and recommend CrewHaus structure
-- **Custom Harness Pack** — build reusable harnesses for a specific business function
-- **Private Registry Setup** — deploy private artifact workflow with team controls
-
-These are fixed-fee, scoped engagements. Not hourly. Get a quote at max@studiomax.io.
-
 ## What "best effort" means in practice
 
 The project lead spends roughly 10-15 hours per week on CrewHaus. Of that, support typically gets:
