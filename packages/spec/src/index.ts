@@ -2,6 +2,22 @@ import { SpecParseError } from "@crewhaus/errors";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
 
+// SECURITY (codegen-injection backstop, #147/#148): spec/role/node/step names
+// flow verbatim into generated source across ~14 emitters — `//` and `/* */`
+// comments, template literals, JSON `package.json` manifests, YAML frontmatter,
+// and on-disk file paths (`skills/<name>/SKILL.md`). A raw newline, `*/`, quote,
+// backtick or `/` lets a crafted name break out of those contexts (RCE on
+// build/run, dependency injection, path traversal). The emitters escape per-site
+// as defense-in-depth, but this is the systemic floor: restrict names to a
+// single-line safe charset so the breakout characters can never enter the IR.
+const safeName = z
+  .string()
+  .min(1)
+  .regex(
+    /^[\w .:-]+$/,
+    "name may contain only letters, digits, spaces, and '_ . - :' (no newlines, quotes, slashes, or comment/template delimiters)",
+  );
+
 /**
  * v0 spec schema — a discriminated union over `target`.
  *
@@ -83,7 +99,7 @@ const subAgentDefinitionSchema = z
   })
   .strict();
 
-const subAgentsBlock = z.record(z.string().min(1), subAgentDefinitionSchema).optional();
+const subAgentsBlock = z.record(safeName, subAgentDefinitionSchema).optional();
 
 /**
  * Section 14 — per-tool runtime config map. Tool-specific schemas live
@@ -343,7 +359,7 @@ const channelGatewayBlock = z
 
 const cliSchema = z
   .object({
-    name: z.string().min(1),
+    name: safeName,
     target: z.literal("cli"),
     agent: z
       .object({
@@ -369,7 +385,7 @@ const cliSchema = z
 
 const workflowStepSchema = z
   .object({
-    name: z.string().min(1),
+    name: safeName,
     instructions: z.string().min(1),
     model: z.string().min(1).optional(),
     tools: z.array(z.string().min(1)).optional(),
@@ -379,7 +395,7 @@ const workflowStepSchema = z
 
 const workflowSchema = z
   .object({
-    name: z.string().min(1),
+    name: safeName,
     target: z.literal("workflow"),
     model: z.string().min(1),
     steps: z.array(workflowStepSchema).min(1),
@@ -476,7 +492,7 @@ const channelAgentSchema = z
 
 const channelSchema = z
   .object({
-    name: z.string().min(1),
+    name: safeName,
     target: z.literal("channel"),
     agent: channelAgentSchema,
     channels: channelsBlock,
@@ -526,11 +542,11 @@ const graphEdgeSchema = z
 
 const graphSchema = z
   .object({
-    name: z.string().min(1),
+    name: safeName,
     target: z.literal("graph"),
     model: z.string().min(1),
     entry: z.string().min(1),
-    nodes: z.record(z.string().min(1), graphNodeSchema),
+    nodes: z.record(safeName, graphNodeSchema),
     edges: z.array(graphEdgeSchema).default([]),
     permissions: permissionsBlock,
     compaction: compactionBlock,
@@ -567,7 +583,7 @@ const managedAgentSchema = z
 
 const managedSchema = z
   .object({
-    name: z.string().min(1),
+    name: safeName,
     target: z.literal("managed"),
     agent: managedAgentSchema,
     tenants: z.array(managedTenantSchema).min(1),
@@ -589,7 +605,7 @@ const pipelineDocumentSchema = z
 
 const pipelineSchema = z
   .object({
-    name: z.string().min(1),
+    name: safeName,
     target: z.literal("pipeline"),
     agent: z
       .object({
@@ -650,12 +666,12 @@ const crewRoutingSchema = z
 
 const crewSchema = z
   .object({
-    name: z.string().min(1),
+    name: safeName,
     target: z.literal("crew"),
     /** Crew-wide model fallback used by any role that omits `role.model`. */
     model: z.string().min(1),
     entry: z.string().min(1),
-    roles: z.record(z.string().min(1), crewRoleSchema),
+    roles: z.record(safeName, crewRoleSchema),
     routing: crewRoutingSchema.optional(),
     mcp_servers: mcpServersBlock,
     permissions: permissionsBlock,
@@ -686,7 +702,7 @@ const researchRetrieveSchema = z
 
 const researchSchema = z
   .object({
-    name: z.string().min(1),
+    name: safeName,
     target: z.literal("research"),
     agent: z
       .object({
@@ -727,7 +743,7 @@ const batchQueueSchema = z
 
 const batchSchema = z
   .object({
-    name: z.string().min(1),
+    name: safeName,
     target: z.literal("batch"),
     agent: z
       .object({
@@ -770,7 +786,7 @@ const voiceTelephonySchema = z
 
 const voiceSchema = z
   .object({
-    name: z.string().min(1),
+    name: safeName,
     target: z.literal("voice"),
     agent: z
       .object({
@@ -806,7 +822,7 @@ const browserDriverSchema = z
 
 const browserSchema = z
   .object({
-    name: z.string().min(1),
+    name: safeName,
     target: z.literal("browser"),
     agent: z
       .object({
@@ -836,7 +852,7 @@ const browserSchema = z
  */
 const evalSchema = z
   .object({
-    name: z.string().min(1),
+    name: safeName,
     target: z.literal("eval"),
     agent: z
       .object({
@@ -847,7 +863,7 @@ const evalSchema = z
       .strict(),
     dataset: z
       .object({
-        name: z.string().min(1),
+        name: safeName,
         version: z.string().min(1),
         split: z.enum(["train", "dev", "test"]).default("dev"),
       })
@@ -856,7 +872,7 @@ const evalSchema = z
       .array(
         z
           .object({
-            name: z.string().min(1),
+            name: safeName,
             opts: z.record(z.unknown()).optional(),
           })
           .strict(),
@@ -904,7 +920,7 @@ const onchainTriggerSchema = z.discriminatedUnion("kind", [
 
 const onchainSchema = z
   .object({
-    name: z.string().min(1),
+    name: safeName,
     target: z.literal("onchain"),
     agent: z
       .object({
@@ -939,7 +955,7 @@ const onchainSchema = z
  */
 const onchainGameSchema = z
   .object({
-    name: z.string().min(1),
+    name: safeName,
     target: z.literal("onchain-game"),
     agent: z
       .object({
