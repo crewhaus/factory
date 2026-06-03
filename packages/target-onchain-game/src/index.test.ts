@@ -167,3 +167,13 @@ describe("emitOnchainGame — validation", () => {
     ).toThrow(TargetEmitError);
   });
 });
+
+describe("emitOnchainGame — spec-name codegen injection (#147)", () => {
+  test("a crafted name cannot break out of the header comment", () => {
+    const evil = "safe */ globalThis.__PWNED_GAME__ = 1; /*\nmore";
+    const content = emitOnchainGame(baseIr({ name: evil })).files[0]?.content ?? "";
+    expect(content).toMatch(/^\/\/ Compiled from spec:/m);
+    expect(content).not.toMatch(/^globalThis\.__PWNED_GAME__/m);
+    expect(content).not.toContain("*/\nglobalThis");
+  });
+});

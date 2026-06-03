@@ -117,3 +117,20 @@ describe("emitCfWorkerWorkflow", () => {
     expect(() => parseJs(worker?.content ?? "")).not.toThrow();
   });
 });
+
+describe("emitCfWorkerWorkflow — package.json name injection (#148)", () => {
+  test("package.json sanitizes the spec name and resists JSON injection", () => {
+    const ir: IrWorkflowV0 = {
+      ...baseIr,
+      name: '", "dependencies": { "evil-typosquat": "1.0.0" }, "x": "',
+    };
+    const pkg = emitCfWorkerWorkflow(ir).files.find((f) => f.path === "package.json");
+    expect(pkg).toBeDefined();
+    const parsed = JSON.parse(pkg?.content ?? "") as {
+      name: string;
+      dependencies?: Record<string, string>;
+    };
+    expect(parsed.name).not.toContain('"'); // sanitized to [a-z0-9-]
+    expect(parsed.dependencies).toBeUndefined(); // injection did not break out
+  });
+});

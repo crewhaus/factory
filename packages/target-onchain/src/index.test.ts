@@ -235,3 +235,18 @@ describe("emitOnchain — validation", () => {
     ).toThrow(/not declared in chains/);
   });
 });
+
+describe("emitOnchain — spec-name codegen injection (#147)", () => {
+  test("a crafted name cannot break out of the header comment", () => {
+    // Block-comment escape: a `*/` (plus a newline) in the name would, with a
+    // raw `/* … */` header, terminate the comment and inject top-level code.
+    const evil = "safe */ globalThis.__PWNED_ONCHAIN__ = 1; /*\nmore";
+    const content = emitOnchain(baseIr({ name: evil })).files[0]?.content ?? "";
+    // Header is now a `//` line comment using the JSON-escaped name.
+    expect(content).toMatch(/^\/\/ Compiled from spec:/m);
+    // The payload only ever appears inside the escaped SPEC_NAME string and the
+    // comment — never as a top-level statement at column 0.
+    expect(content).not.toMatch(/^globalThis\.__PWNED_ONCHAIN__/m);
+    expect(content).not.toContain("*/\nglobalThis");
+  });
+});
