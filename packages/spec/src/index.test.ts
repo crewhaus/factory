@@ -24,11 +24,11 @@ agent:
     const cli = (name: string) =>
       `\ntarget: cli\nagent:\n  model: m\n  instructions: be helpful\nname: ${name}\n`;
     test.each([
-      ['a newline (block/line-comment escape)', '"line one\\nglobalThis.x=1"'],
-      ['a block-comment terminator */', '"safe */ code /* x"'],
-      ['a slash (path traversal in plugin emitters)', '"../../etc/evil"'],
-      ['a double-quote (JSON manifest break-out)', '"a\\", \\"dependencies\\": {}"'],
-      ['a backtick (template-literal escape)', '"a`+code+`b"'],
+      ["a newline (block/line-comment escape)", '"line one\\nglobalThis.x=1"'],
+      ["a block-comment terminator */", '"safe */ code /* x"'],
+      ["a slash (path traversal in plugin emitters)", '"../../etc/evil"'],
+      ["a double-quote (JSON manifest break-out)", '"a\\", \\"dependencies\\": {}"'],
+      ["a backtick (template-literal escape)", '"a`+code+`b"'],
     ])("rejects a name containing %s", (_label, name) => {
       expect(() => parseSpec(cli(name))).toThrow(SpecParseError);
     });
