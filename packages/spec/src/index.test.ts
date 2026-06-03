@@ -17,6 +17,28 @@ agent:
     expect(spec.agent.instructions).toBe("be helpful");
   });
 
+  // Codegen-injection backstop (#147/#148): names flow verbatim into generated
+  // comments, file paths, JSON manifests and frontmatter — reject the breakout
+  // characters at parse time so no emitter can be tricked downstream.
+  describe("name safe-charset backstop", () => {
+    const cli = (name: string) =>
+      `\ntarget: cli\nagent:\n  model: m\n  instructions: be helpful\nname: ${name}\n`;
+    test.each([
+      ["a newline (block/line-comment escape)", '"line one\\nglobalThis.x=1"'],
+      ["a block-comment terminator */", '"safe */ code /* x"'],
+      ["a slash (path traversal in plugin emitters)", '"../../etc/evil"'],
+      ["a double-quote (JSON manifest break-out)", '"a\\", \\"dependencies\\": {}"'],
+      ["a backtick (template-literal escape)", '"a`+code+`b"'],
+    ])("rejects a name containing %s", (_label, name) => {
+      expect(() => parseSpec(cli(name))).toThrow(SpecParseError);
+    });
+
+    test("accepts ordinary names (letters, digits, space, . _ - :)", () => {
+      const spec = parseSpec(cli('"My Agent v1.2 - prod:eu"'));
+      expect(spec.name).toBe("My Agent v1.2 - prod:eu");
+    });
+  });
+
   test("preserves multi-line block-scalar instructions", () => {
     const spec = parseSpec(`
 name: hello

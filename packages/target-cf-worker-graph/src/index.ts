@@ -385,8 +385,12 @@ enabled = true
 }
 
 function renderPackageJson(ir: IrGraphV0): string {
+  // Sanitize like the wrangler name. A raw ir.name breaks out of the JSON
+  // string (this manifest is reachable from the hosted compiler-worker HTTP
+  // endpoint), allowing dependency/script injection into package.json (#148).
+  const safeName = ir.name.replace(/[^a-z0-9-]/gi, "-").toLowerCase();
   return `{
-  "name": "${ir.name}",
+  "name": "${safeName}",
   "version": "0.0.0",
   "private": true,
   "type": "module",
