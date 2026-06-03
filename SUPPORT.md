@@ -93,7 +93,7 @@ For teams that want hands-on help getting CrewHaus running, StudioMax (the studi
 - **Custom Harness Pack** — build reusable harnesses for a specific business function
 - **Private Registry Setup** — deploy private artifact workflow with team controls
 
-These are fixed-fee, scoped engagements. Not hourly. Get a quote - max@studiomax.io.
+These are fixed-fee, scoped engagements. Not hourly. Get a quote at max@studiomax.io.
 
 ## What "best effort" means in practice
 

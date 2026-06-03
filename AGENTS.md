@@ -3,7 +3,7 @@
 This file is the source of truth for *how* to develop factory. The *what* lives in:
 
 - [COMPILER-ARCHITECTURE.md](https://github.com/crewhaus/docs/blob/main/COMPILER-ARCHITECTURE.md) — the meta-harness compiler walked through with file paths
-- [build-roadmap.md](https://github.com/crewhaus/operations/blob/main/build-roadmap.md) — what's been built and what comes next
+- [build-roadmap.md](https://github.com/crewhaus/docs/blob/main/build-roadmap.md) — what's been built and what comes next
 - [MODULE-CATALOG.md](https://github.com/crewhaus/docs/blob/main/MODULE-CATALOG.md) — ~190 modules across 25 catalog layers
 
 Read those for *what*. Read this for *how*.
@@ -12,7 +12,7 @@ This file follows the [agents.md](https://agents.md) vendor-neutral convention s
 
 ## The three architectural pillars
 
-Every change in this repo must respect three invariants. They exist because in 2026-Q2 a critique surfaced that the implementation had drifted from the founding thesis on each axis; the remediation is documented in the corresponding sections of [build-roadmap.md](https://github.com/crewhaus/operations/blob/main/build-roadmap.md) and the invariants are codified here so future contributors stay anchored.
+Every change in this repo must respect three invariants. They exist because in 2026-Q2 a critique surfaced that the implementation had drifted from the founding thesis on each axis; the remediation is documented in the corresponding sections of [build-roadmap.md](https://github.com/crewhaus/docs/blob/main/build-roadmap.md) and the invariants are codified here so future contributors stay anchored.
 
 ### Pillar 1 — The compiler is the protagonist
 

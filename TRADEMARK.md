@@ -118,7 +118,7 @@ For uses not covered by this policy, email **trademark@crewhaus.ai** describing 
 
 ## Why we have this policy
 
-We're an open source project that runs a paid hosted product. The open source code is yours; the brand identifies us. Trademark protection is what lets us run the hosted product without competitors copying the brand identity and confusing customers. It also protects users of the open source from being misled by lookalike products.
+We're an open source project that plans to run a paid hosted product. The open source code is yours; the brand identifies us. Trademark protection is what would let us run that hosted product without competitors copying the brand identity and confusing customers. It also protects users of the open source from being misled by lookalike products.
 
 We try to err on the side of permissiveness. Most reasonable uses are fine. The policy exists to prevent specific harms: brand confusion, false endorsement, and competing hosted services using our name.
 
