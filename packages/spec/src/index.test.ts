@@ -1182,3 +1182,75 @@ security:
     expect(spec.security?.egressMatcher).toBeUndefined();
   });
 });
+
+describe("parseSpec pipeline target — vector backend (Section 21)", () => {
+  const PIPELINE = (retrieve: string) => `
+name: doc-bot
+target: pipeline
+agent:
+  model: claude-sonnet-4-6
+  instructions: answer using Retrieve
+retrieve:
+${retrieve}
+indexing:
+  chunkStrategy: fixed
+  chunkSize: 200
+  chunkOverlap: 0
+  documents:
+    - id: doc-1
+      text: the quick brown fox
+`;
+
+  test("defaults vectorBackend to in-memory when omitted", () => {
+    const spec = parseSpec(PIPELINE("  embedderModel: mock/det"));
+    if (spec.target !== "pipeline") expect.unreachable();
+    expect(spec.retrieve.vectorBackend).toBe("in-memory");
+  });
+
+  test("accepts the file backend (lance) with no extra config", () => {
+    const spec = parseSpec(PIPELINE("  embedderModel: mock/det\n  vectorBackend: lance"));
+    if (spec.target !== "pipeline") expect.unreachable();
+    expect(spec.retrieve.vectorBackend).toBe("lance");
+  });
+
+  test("accepts an http backend with url + collection + apiKey", () => {
+    const spec = parseSpec(
+      PIPELINE(
+        [
+          "  embedderModel: mock/det",
+          "  vectorBackend: qdrant",
+          "  url: https://qdrant.example",
+          "  collection: docs",
+          "  apiKey: $QDRANT_API_KEY",
+        ].join("\n"),
+      ),
+    );
+    if (spec.target !== "pipeline") expect.unreachable();
+    expect(spec.retrieve.vectorBackend).toBe("qdrant");
+    expect(spec.retrieve.url).toBe("https://qdrant.example");
+    expect(spec.retrieve.collection).toBe("docs");
+    expect(spec.retrieve.apiKey).toBe("$QDRANT_API_KEY");
+  });
+
+  test("rejects an unknown backend id", () => {
+    expect(() => parseSpec(PIPELINE("  embedderModel: mock/det\n  vectorBackend: faiss"))).toThrow(
+      SpecParseError,
+    );
+  });
+
+  test("rejects an http backend missing url", () => {
+    expect(() =>
+      parseSpec(PIPELINE("  embedderModel: mock/det\n  vectorBackend: qdrant\n  collection: docs")),
+    ).toThrow(/requires retrieve\.url/);
+  });
+
+  test("rejects an http backend missing collection", () => {
+    expect(() =>
+      parseSpec(
+        PIPELINE(
+          "  embedderModel: mock/det\n  vectorBackend: pinecone\n  url: https://pinecone.example",
+        ),
+      ),
+    ).toThrow(/requires retrieve\.collection/);
+  });
+});

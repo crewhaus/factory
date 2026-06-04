@@ -27,6 +27,7 @@ import type {
   IrSubAgentDefinition,
   IrToolConfigs,
   IrV0,
+  IrVectorBackend,
   IrVoiceProvider,
   IrVoiceV0,
   IrWorkflowStep,
@@ -649,14 +650,40 @@ describe("IrPipelineV0 (Section 21)", () => {
     void _bad;
   });
 
-  test("vectorBackend is restricted to in-memory in v0", () => {
+  test("vectorBackend accepts every implemented backend id", () => {
+    const backends: IrVectorBackend[] = ["in-memory", "lance", "qdrant", "pinecone", "weaviate"];
+    for (const vectorBackend of backends) {
+      const retrieve: IrPipelineV0["retrieve"] = {
+        embedderModel: "x",
+        vectorBackend,
+        defaultK: 5,
+      };
+      expect(retrieve.vectorBackend).toBe(vectorBackend);
+    }
+  });
+
+  test("vectorBackend still rejects an unknown backend id", () => {
     const _bad: IrPipelineV0["retrieve"] = {
       embedderModel: "x",
-      // @ts-expect-error — qdrant/pinecone/lance are roadmap, not yet in v0
-      vectorBackend: "qdrant",
+      // @ts-expect-error — faiss is not an implemented vector backend
+      vectorBackend: "faiss",
       defaultK: 5,
     };
     void _bad;
+  });
+
+  test("retrieve carries optional url/collection/apiKey for remote backends", () => {
+    const retrieve: IrPipelineV0["retrieve"] = {
+      embedderModel: "x",
+      vectorBackend: "qdrant",
+      defaultK: 5,
+      url: "https://qdrant.example",
+      collection: "docs",
+      apiKey: { kind: "env", name: "QDRANT_API_KEY" },
+    };
+    expect(retrieve.url).toBe("https://qdrant.example");
+    expect(retrieve.collection).toBe("docs");
+    expect(retrieve.apiKey).toEqual({ kind: "env", name: "QDRANT_API_KEY" });
   });
 });
 

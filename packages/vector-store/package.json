@@ -2,7 +2,7 @@
   "name": "@crewhaus/vector-store",
   "version": "0.1.1",
   "type": "module",
-  "description": "Vector index — in-memory flat L2 default, HTTP backends (qdrant/pinecone/weaviate) deferred",
+  "description": "Vector index — in-memory flat L2 default, file-backed lance + HTTP backends (qdrant/pinecone/weaviate)",
   "main": "src/index.ts",
   "types": "src/index.ts",
   "exports": {

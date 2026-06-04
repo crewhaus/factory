@@ -1,6 +1,6 @@
 import { CrewhausError } from "@crewhaus/errors";
 import { escapeJsonString } from "@crewhaus/infra-utils";
-import type { Bundle, IrPipelineV0 } from "@crewhaus/ir";
+import type { Bundle, IrPipelineV0, IrSecretRef } from "@crewhaus/ir";
 
 /**
  * Emit a RAG/pipeline bundle.
@@ -34,6 +34,33 @@ export class TargetEmitError extends CrewhausError {
   constructor(message: string, cause?: unknown) {
     super("compiler", message, cause);
   }
+}
+
+/**
+ * Render a vector-store API key as a JS expression. Env-refs become
+ * `process.env["NAME"]` (resolved in the bundle at runtime, so the secret
+ * never lands in the checked-in source); literals become an escaped string.
+ */
+function renderSecretExpr(ref: IrSecretRef): string {
+  if (ref.kind === "env") return `process.env[${escapeJsonString(ref.name)}]`;
+  return escapeJsonString(ref.value);
+}
+
+/**
+ * Build the `createVectorStore({ ... })` call. Only the fields the IR
+ * carries are emitted, so an `in-memory` pipeline stays byte-identical to
+ * `createVectorStore({ backend: "in-memory" })`; remote/file backends add
+ * their url/apiKey/collection. (The HTTP backends are guaranteed url +
+ * collection by the spec parser, so this never emits an unrunnable call.)
+ */
+function renderVectorStoreCall(retrieve: IrPipelineV0["retrieve"]): string {
+  const opts: string[] = [`backend: ${escapeJsonString(retrieve.vectorBackend)}`];
+  if (retrieve.url !== undefined) opts.push(`url: ${escapeJsonString(retrieve.url)}`);
+  if (retrieve.apiKey !== undefined) opts.push(`apiKey: ${renderSecretExpr(retrieve.apiKey)}`);
+  if (retrieve.collection !== undefined) {
+    opts.push(`collection: ${escapeJsonString(retrieve.collection)}`);
+  }
+  return `createVectorStore({ ${opts.join(", ")} })`;
 }
 
 function renderAgent(ir: IrPipelineV0): string {
@@ -89,7 +116,7 @@ import { discoverSkills, createSkillTool } from "@crewhaus/skills-registry";
 import { loadCommands } from "@crewhaus/slash-commands";
 
 const __embedder = createEmbedder({ model: ${escapeJsonString(ir.retrieve.embedderModel)} });
-const __vectorStore = createVectorStore({ backend: ${escapeJsonString(ir.retrieve.vectorBackend)} });
+const __vectorStore = ${renderVectorStoreCall(ir.retrieve)};
 registerRetrieveConfig({ embedder: __embedder, vectorStore: __vectorStore, defaultK: ${ir.retrieve.defaultK} });
 defaultCatalog.register(retrieve);
 
