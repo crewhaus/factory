@@ -8,12 +8,12 @@
  *
  * Backends:
  *   "in-memory" — flat L2 distance over an in-process Map (default).
- *   "lance"     — file-backed Lance index. NOT yet implemented; throws
- *                 a clear NotImplementedError so callers know to wire
- *                 a real adapter.
- *   "qdrant" / "pinecone" / "weaviate" — deferred to a follow-up. The
- *                 default factory throws to keep production deployments
- *                 from accidentally falling through.
+ *   "lance"     — file-backed index. Stores vectors as NDJSON by
+ *                 default and lights up the real Lance SDK when
+ *                 `@lancedb/lancedb` is present.
+ *   "qdrant" / "pinecone" / "weaviate" — fetch-backed HTTP clients.
+ *                 Require `url` + `collection` (plus optional `apiKey`);
+ *                 the factory throws only when those are missing.
  *
  * Filter shape: a flat `Record<string, unknown>` of metadata predicates.
  * The in-memory backend supports exact-equality only. Strings that

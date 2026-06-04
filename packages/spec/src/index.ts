@@ -593,6 +593,17 @@ const managedSchema = z
   })
   .strict();
 
+// Vector-store backend ids accepted in specs. Mirrors `VectorBackendId`
+// from @crewhaus/vector-store (and `IrVectorBackend`) — the canonical set
+// of implemented backends — kept inline so the spec stays dependency-light.
+// Keep in sync when a backend is added or removed.
+const VECTOR_BACKENDS = ["in-memory", "lance", "qdrant", "pinecone", "weaviate"] as const;
+
+// The HTTP backends construct only with a `url` + `collection` (the
+// vector-store factory throws otherwise); parseSpec requires both so a
+// spec that selects one without them fails at compile, not at runtime.
+const HTTP_VECTOR_BACKENDS = new Set(["qdrant", "pinecone", "weaviate"]);
+
 // Pipeline / RAG target (Section 21). Carries the embedder + vector-store
 // config, an indexing pipeline, and a chat agent that uses Retrieve.
 const pipelineDocumentSchema = z
@@ -616,8 +627,16 @@ const pipelineSchema = z
     retrieve: z
       .object({
         embedderModel: z.string().min(1),
-        vectorBackend: z.enum(["in-memory"]).default("in-memory"),
+        vectorBackend: z.enum(VECTOR_BACKENDS).default("in-memory"),
         defaultK: z.number().int().positive().max(50).default(5),
+        // Remote (qdrant/pinecone/weaviate) + file (lance) backend config.
+        // `url` is the service base URL (or, for lance, the on-disk index
+        // path); `apiKey` accepts a `$ENV_REF` so the secret resolves from
+        // `process.env` in the bundle rather than being baked into it. The
+        // HTTP backends require `url` + `collection` (enforced in parseSpec).
+        url: z.string().min(1).optional(),
+        collection: z.string().min(1).optional(),
+        apiKey: z.string().min(1).optional(),
       })
       .strict(),
     indexing: z
@@ -696,7 +715,7 @@ const researchRetrieveSchema = z
   .object({
     allowedOrigins: z.array(z.string().min(1)).default([]),
     allowedFileRoots: z.array(z.string().min(1)).default([]),
-    vectorBackend: z.enum(["in-memory"]).optional(),
+    vectorBackend: z.enum(VECTOR_BACKENDS).optional(),
   })
   .strict();
 
@@ -1108,6 +1127,24 @@ export function parseSpec(yamlText: string): Spec {
           }
         }
       }
+    }
+  }
+  // Section 21 — pipeline HTTP-backend invariants. qdrant/pinecone/weaviate
+  // throw at construction without a url + collection, so selecting one
+  // without both would emit an unrunnable bundle. Reject at parse time with
+  // a message naming the missing field (kept here, not as a `.refine()`, so
+  // the discriminated-union member stays a plain ZodObject).
+  if (data.target === "pipeline" && HTTP_VECTOR_BACKENDS.has(data.retrieve.vectorBackend)) {
+    const { vectorBackend, url, collection } = data.retrieve;
+    if (!url) {
+      throw new SpecParseError(
+        `pipeline retrieve.vectorBackend "${vectorBackend}" requires retrieve.url (the remote service base URL)`,
+      );
+    }
+    if (!collection) {
+      throw new SpecParseError(
+        `pipeline retrieve.vectorBackend "${vectorBackend}" requires retrieve.collection`,
+      );
     }
   }
   return data;

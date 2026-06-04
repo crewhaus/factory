@@ -563,6 +563,16 @@ export type IrPipelineDocument = {
   readonly metadata?: Readonly<Record<string, unknown>>;
 };
 
+/**
+ * Vector-store backend selector. Mirrors `VectorBackendId` from
+ * `@crewhaus/vector-store` — the canonical source of truth for which
+ * backends exist — but kept inline here (exactly as `IrBatchQueueAdapter`
+ * mirrors the `queue-protocol` adapter ids) so the runtime-agnostic IR
+ * keeps its zero runtime-package dependencies. Keep the two in sync when a
+ * backend is added or removed.
+ */
+export type IrVectorBackend = "in-memory" | "lance" | "qdrant" | "pinecone" | "weaviate";
+
 export type IrPipelineV0 = {
   readonly version: 0;
   readonly name: string;
@@ -573,8 +583,21 @@ export type IrPipelineV0 = {
   };
   readonly retrieve: {
     readonly embedderModel: string;
-    readonly vectorBackend: "in-memory";
+    readonly vectorBackend: IrVectorBackend;
     readonly defaultK: number;
+    /**
+     * Remote (qdrant/pinecone/weaviate) and file (lance) backends — the
+     * service base URL or, for lance, the on-disk index path. Omitted for
+     * `in-memory`. Required for the HTTP backends (enforced at spec parse).
+     */
+    readonly url?: string;
+    /** Remote/file backends — collection / table name. */
+    readonly collection?: string;
+    /**
+     * Remote backends — API key, lowered to an env-ref (`$VAR` →
+     * `process.env`) or a literal so real secrets stay out of the bundle.
+     */
+    readonly apiKey?: IrSecretRef;
   };
   readonly indexing: {
     readonly chunkStrategy: "fixed" | "semantic" | "markdown";
@@ -669,7 +692,7 @@ export type IrResearchV0 = {
     /** Absolute file:// roots the crawler may read from. Empty denies all file://. */
     readonly allowedFileRoots: readonly string[];
     /** Optional vector backend hint for future RAG-augmented research. */
-    readonly vectorBackend?: "in-memory";
+    readonly vectorBackend?: IrVectorBackend;
   };
   readonly tools: readonly string[];
   readonly toolConfigs: IrToolConfigs;

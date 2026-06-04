@@ -18,7 +18,7 @@ import { type Embedder, createEmbedder } from "@crewhaus/embedder";
 import { CrewhausError } from "@crewhaus/errors";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
-import { type VectorStore, createVectorStore } from "@crewhaus/vector-store";
+import { type VectorBackendId, type VectorStore, createVectorStore } from "@crewhaus/vector-store";
 import { z } from "zod";
 
 export class RetrieveConfigError extends CrewhausError {
@@ -39,7 +39,19 @@ export type RetrieveConfigInput = {
   readonly embedderModel?: string;
   readonly embedderApiKey?: string;
   readonly vectorStore?: VectorStore;
-  readonly vectorBackend?: "in-memory";
+  readonly vectorBackend?: VectorBackendId;
+  /**
+   * Connection config for the chosen `vectorBackend`, consulted only when no
+   * `vectorStore` instance is supplied. Mirrors the pipeline spec's
+   * `retrieve.{url,collection,apiKey}`. The HTTP backends
+   * (qdrant/pinecone/weaviate) require `url` + `collection`; lance reads
+   * `url` as its on-disk index path. `apiKey` here is the vector store's,
+   * distinct from `embedderApiKey`. (At runtime the caller passes the
+   * resolved secret — there is no bundle to keep it out of.)
+   */
+  readonly url?: string;
+  readonly collection?: string;
+  readonly apiKey?: string;
   readonly defaultK?: number;
   readonly default_k?: number;
 };
@@ -56,7 +68,12 @@ export function registerRetrieveConfig(input: RetrieveConfigInput): void {
   }
   let vectorStore = input.vectorStore;
   if (vectorStore === undefined) {
-    vectorStore = createVectorStore({ backend: input.vectorBackend ?? "in-memory" });
+    vectorStore = createVectorStore({
+      backend: input.vectorBackend ?? "in-memory",
+      ...(input.url !== undefined ? { url: input.url } : {}),
+      ...(input.apiKey !== undefined ? { apiKey: input.apiKey } : {}),
+      ...(input.collection !== undefined ? { collection: input.collection } : {}),
+    });
   }
   if (embedder === undefined) {
     throw new RetrieveConfigError(

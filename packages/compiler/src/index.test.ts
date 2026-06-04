@@ -438,6 +438,102 @@ compaction:
   });
 });
 
+// Section 21 — pipeline vector-store backend selection. The IR/spec union
+// was widened from the `in-memory`-only literal to every implemented
+// backend (in-memory | lance | qdrant | pinecone | weaviate); lower() passes
+// the id through and the emitter wires it into createVectorStore. HTTP
+// backends also carry url/collection/apiKey so the bundle is runnable.
+describe("lower/compile — pipeline vector backend (Section 21)", () => {
+  const PIPELINE_SPEC = (retrieve: string) => `
+name: doc-bot
+target: pipeline
+agent:
+  model: claude-sonnet-4-6
+  instructions: answer using Retrieve
+retrieve:
+${retrieve}
+indexing:
+  chunkStrategy: fixed
+  chunkSize: 200
+  chunkOverlap: 0
+  documents:
+    - id: doc-1
+      text: the quick brown fox
+`;
+
+  test("a lance spec lowers with vectorBackend: lance", () => {
+    const ir = lower(parseSpec(PIPELINE_SPEC("  embedderModel: mock/det\n  vectorBackend: lance")));
+    if (ir.target !== "pipeline") throw new Error("unexpected target");
+    expect(ir.retrieve.vectorBackend).toBe("lance");
+  });
+
+  test('a lance spec compiles to createVectorStore({ backend: "lance" })', () => {
+    const bundle = compile(PIPELINE_SPEC("  embedderModel: mock/det\n  vectorBackend: lance"));
+    const agent = bundle.files[0]?.content ?? "";
+    expect(agent).toContain('createVectorStore({ backend: "lance" })');
+  });
+
+  test("an omitted vectorBackend still defaults to in-memory (unchanged call)", () => {
+    const bundle = compile(PIPELINE_SPEC("  embedderModel: mock/det"));
+    const agent = bundle.files[0]?.content ?? "";
+    expect(agent).toContain('createVectorStore({ backend: "in-memory" })');
+  });
+
+  test("an http backend surfaces url + collection + env-ref apiKey into the call", () => {
+    const bundle = compile(
+      PIPELINE_SPEC(
+        [
+          "  embedderModel: mock/det",
+          "  vectorBackend: qdrant",
+          "  url: https://qdrant.example",
+          "  collection: docs",
+          "  apiKey: $QDRANT_API_KEY",
+        ].join("\n"),
+      ),
+    );
+    const agent = bundle.files[0]?.content ?? "";
+    expect(agent).toContain(
+      'createVectorStore({ backend: "qdrant", url: "https://qdrant.example", apiKey: process.env["QDRANT_API_KEY"], collection: "docs" })',
+    );
+  });
+
+  test("a literal apiKey lowers to a literal (env-ref is opt-in via $VAR)", () => {
+    const ir = lower(
+      parseSpec(
+        PIPELINE_SPEC(
+          [
+            "  embedderModel: mock/det",
+            "  vectorBackend: pinecone",
+            "  url: https://pinecone.example",
+            "  collection: docs",
+            "  apiKey: pc-literal-key",
+          ].join("\n"),
+        ),
+      ),
+    );
+    if (ir.target !== "pipeline") throw new Error("unexpected target");
+    expect(ir.retrieve.apiKey).toEqual({ kind: "literal", value: "pc-literal-key" });
+  });
+
+  test("an http backend without url is rejected at parse time", () => {
+    expect(() =>
+      compile(
+        PIPELINE_SPEC("  embedderModel: mock/det\n  vectorBackend: qdrant\n  collection: docs"),
+      ),
+    ).toThrow(/requires retrieve\.url/);
+  });
+
+  test("an http backend without collection is rejected at parse time", () => {
+    expect(() =>
+      compile(
+        PIPELINE_SPEC(
+          "  embedderModel: mock/det\n  vectorBackend: weaviate\n  url: https://weaviate.example",
+        ),
+      ),
+    ).toThrow(/requires retrieve\.collection/);
+  });
+});
+
 // FR-004 — Pillar 3 security block lowered into ir.security.
 describe("lower — security block (Pillar 3 intent-gate judge)", () => {
   test("populates ir.security.justification verbatim (judge + model)", () => {

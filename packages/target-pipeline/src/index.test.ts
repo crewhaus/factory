@@ -71,4 +71,53 @@ describe("emitPipeline", () => {
     const ir: IrPipelineV0 = { ...baseIr, indexing: { ...baseIr.indexing, documents: [] } };
     expect(() => emitPipeline(ir)).toThrow(TargetEmitError);
   });
+
+  test("emits the IR-declared backend id (lance) verbatim", () => {
+    const ir: IrPipelineV0 = {
+      ...baseIr,
+      retrieve: { ...baseIr.retrieve, vectorBackend: "lance" },
+    };
+    const content = emitPipeline(ir).files[0]?.content ?? "";
+    expect(content).toContain('createVectorStore({ backend: "lance" })');
+  });
+
+  test("surfaces url + collection + env-ref apiKey for an http backend", () => {
+    const ir: IrPipelineV0 = {
+      ...baseIr,
+      retrieve: {
+        ...baseIr.retrieve,
+        vectorBackend: "qdrant",
+        url: "https://qdrant.example",
+        collection: "docs",
+        apiKey: { kind: "env", name: "QDRANT_API_KEY" },
+      },
+    };
+    const content = emitPipeline(ir).files[0]?.content ?? "";
+    expect(content).toContain(
+      'createVectorStore({ backend: "qdrant", url: "https://qdrant.example", apiKey: process.env["QDRANT_API_KEY"], collection: "docs" })',
+    );
+  });
+
+  test("a literal apiKey is emitted as a string literal (no env indirection)", () => {
+    const ir: IrPipelineV0 = {
+      ...baseIr,
+      retrieve: {
+        ...baseIr.retrieve,
+        vectorBackend: "pinecone",
+        url: "https://pinecone.example",
+        collection: "docs",
+        apiKey: { kind: "literal", value: "pc-literal-key" },
+      },
+    };
+    const content = emitPipeline(ir).files[0]?.content ?? "";
+    expect(content).toContain(
+      'createVectorStore({ backend: "pinecone", url: "https://pinecone.example", apiKey: "pc-literal-key", collection: "docs" })',
+    );
+  });
+
+  test("an in-memory backend emits only the backend key (no stray config)", () => {
+    const content = emitPipeline(baseIr).files[0]?.content ?? "";
+    expect(content).toContain('createVectorStore({ backend: "in-memory" })');
+    expect(content).not.toContain("apiKey:");
+  });
 });

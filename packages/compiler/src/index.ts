@@ -738,6 +738,15 @@ export function lower(spec: Spec): IrNode {
           embedderModel: spec.retrieve.embedderModel,
           vectorBackend: spec.retrieve.vectorBackend,
           defaultK: spec.retrieve.defaultK,
+          ...(spec.retrieve.url !== undefined ? { url: spec.retrieve.url } : {}),
+          ...(spec.retrieve.collection !== undefined
+            ? { collection: spec.retrieve.collection }
+            : {}),
+          // apiKey flows through the same `$VAR` → env-ref lowering as other
+          // secrets so a real key never lands in the compiled bundle.
+          ...(spec.retrieve.apiKey !== undefined
+            ? { apiKey: lowerSecret(spec.retrieve.apiKey) }
+            : {}),
         },
         indexing: {
           chunkStrategy: spec.indexing.chunkStrategy,

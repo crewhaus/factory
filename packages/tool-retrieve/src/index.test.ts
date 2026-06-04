@@ -1,9 +1,13 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createEmbedder } from "@crewhaus/embedder";
 import { createVectorStore } from "@crewhaus/vector-store";
 import {
   RetrieveConfigError,
   _resetRetrieveConfig,
+  getRetrieveConfig,
   registerRetrieveConfig,
   retrieve,
 } from "./index";
@@ -100,5 +104,48 @@ describe("registerRetrieveConfig variants", () => {
       vectorBackend: "in-memory",
     });
     // No throw — config built lazily.
+  });
+
+  test("constructs a lance store from vectorBackend + url (on-disk index path)", () => {
+    // Pass an explicit temp path so the test never writes the default
+    // `.crewhaus/vectors/lance` dir into the working tree.
+    const dir = mkdtempSync(join(tmpdir(), "crewhaus-retrieve-lance-"));
+    try {
+      registerRetrieveConfig({ embedderModel: "mock/det", vectorBackend: "lance", url: dir });
+      expect(getRetrieveConfig()?.vectorStore.backend).toBe("lance");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("constructs an http (qdrant) store from vectorBackend + url + collection + apiKey", () => {
+    registerRetrieveConfig({
+      embedderModel: "mock/det",
+      vectorBackend: "qdrant",
+      url: "https://qdrant.example",
+      collection: "docs",
+      apiKey: "test-key",
+    });
+    expect(getRetrieveConfig()?.vectorStore.backend).toBe("qdrant");
+  });
+
+  test("an http backend missing url throws (config reaches the factory guard)", () => {
+    expect(() =>
+      registerRetrieveConfig({
+        embedderModel: "mock/det",
+        vectorBackend: "qdrant",
+        collection: "docs",
+      }),
+    ).toThrow(/requires url/);
+  });
+
+  test("an http backend missing collection throws", () => {
+    expect(() =>
+      registerRetrieveConfig({
+        embedderModel: "mock/det",
+        vectorBackend: "weaviate",
+        url: "https://weaviate.example",
+      }),
+    ).toThrow(/requires collection/);
   });
 });
