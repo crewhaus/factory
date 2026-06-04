@@ -20,9 +20,9 @@ bun x crewhaus compile crewhaus.yaml -o build && bun x crewhaus run crewhaus.yam
 
 ## Why CrewHaus?
 
-Most teams build a different harness for every shape of agent — a CLI here, a Slack bot there, a RAG pipeline somewhere else, an eval rig on the side. The behaviour is identical; the wiring is wildly different.
+Write the agent once, as a spec (`crewhaus.yaml`). Compile it to the shape each situation calls for — a CLI to run locally, a Slack bot for the team, an eval bundle to grade it — each emitted as code idiomatic to that runtime, not a generic wrapper.
 
-CrewHaus is the layer above. You write the agent once, as a spec (`crewhaus.yaml`). The compiler emits whichever runtime shape you need.
+When the spec changes, every shape recompiles. Run the eval loop and `crewhaus optimize` rewrites the spec from its failures, so the fix lands in all of them. CrewHaus is the layer above the runtimes.
 
 ## What you can compile to
 
@@ -53,7 +53,7 @@ Adding a new target shape starts at the IR, not at codegen. See [`COMPILER-ARCHI
 
 2. **Eval is active, not passive.** Eval failures produce *spec patches*. `crewhaus optimize` searches the mutation space (rule-based or Claude-driven) and writes back through a YAML CST that preserves comments and key order. The loop closes.
 
-3. **Security is a fabric, not a perimeter.** Every untrusted ingress — MCP responses, sub-agent returns, channel inbound messages, federation payloads, skill bodies, compaction summaries — goes through the boundary classifier with `TrustOrigin` metadata before it hits a model call. Authentication verifies who; classification verifies what.
+3. **Security is a fabric, not a perimeter.** Untrusted content — MCP responses, sub-agent returns, channel inbound messages, federation payloads, skill bodies, compaction summaries — is classified by a single boundary classifier, tagged with `TrustOrigin`, before it reaches a model call. Authentication verifies who; classification verifies what.
 
 Full architecture: [`AI-Harness-Systems.md`](https://github.com/crewhaus/docs/blob/main/AI-Harness-Systems.md), [`COMPILER-ARCHITECTURE.md`](https://github.com/crewhaus/docs/blob/main/COMPILER-ARCHITECTURE.md), [`AGENTS.md`](AGENTS.md).
 
