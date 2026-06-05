@@ -1,5 +1,14 @@
 import { describe, expect, test } from "bun:test";
-import type { IrCrewV0, IrGraphV0, IrV0, IrWorkflowV0 } from "@crewhaus/ir";
+import type {
+  IrChannelV0,
+  IrCrewV0,
+  IrEvalV0,
+  IrGraphV0,
+  IrManagedV0,
+  IrNode,
+  IrV0,
+  IrWorkflowV0,
+} from "@crewhaus/ir";
 import { TargetClaudePluginError, emitClaudePlugin } from "./index";
 
 const baseCli: IrV0 = {
@@ -174,6 +183,137 @@ describe("SKILL.md frontmatter", () => {
     const skill = b.files.find((f) => f.path === "skills/hello-plugin/SKILL.md");
     expect(skill?.content).toMatch(/^---\nname: hello-plugin\ndescription: /);
     expect(skill?.content).toContain("Be helpful.");
+  });
+});
+
+describe("emitClaudePlugin — channel shape", () => {
+  const baseChannel: IrChannelV0 = {
+    version: 0,
+    name: "slackbot",
+    target: "channel",
+    agent: { model: "claude-sonnet-4-6", instructions: "Greet users warmly. Then help them." },
+    tools: [],
+    toolConfigs: {},
+    channels: {
+      slack: {
+        botToken: { kind: "literal", value: "xoxb-fake" },
+        signingSecret: { kind: "env", name: "SLACK_SIGNING_SECRET" },
+      },
+    },
+    routing: { sessionKey: "thread" },
+    mcp_servers: {},
+    permissions: { rules: [] },
+    subAgents: [],
+    compaction: {},
+  };
+
+  test("emits the CLI-shaped SKILL.md from agent.instructions", () => {
+    const b = emitClaudePlugin(baseChannel, { author: { name: "x" } });
+    const skill = b.files.find((f) => f.path === "skills/slackbot/SKILL.md");
+    expect(skill).toBeDefined();
+    // description is the first sentence of the instructions.
+    expect(skill?.content).toContain("Greet users warmly.");
+    expect(skill?.content).toContain("Then help them.");
+  });
+
+  test("appends a CLAUDE_PLUGIN_NOTES.md flagging the channel daemon context", () => {
+    const b = emitClaudePlugin(baseChannel, { author: { name: "x" } });
+    const notes = b.files.find((f) => f.path === "CLAUDE_PLUGIN_NOTES.md");
+    expect(notes).toBeDefined();
+    expect(notes?.content).toContain("# Channel daemon notes");
+    expect(notes?.content).toContain("target: channel");
+    expect(notes?.content).toContain("lifecycle is NOT part of the");
+  });
+
+  test("forwards channel sub-agents into agents/<name>.md", () => {
+    const withSub: IrChannelV0 = {
+      ...baseChannel,
+      subAgents: [
+        {
+          name: "triage",
+          description: "Triage incoming messages",
+          instructions: "Sort by urgency",
+          tools: [],
+          permissions: "inherit",
+          inheritBypass: false,
+        },
+      ],
+    };
+    const b = emitClaudePlugin(withSub, { author: { name: "x" } });
+    const agent = b.files.find((f) => f.path === "agents/triage.md");
+    expect(agent).toBeDefined();
+    expect(agent?.content).toContain("name: triage");
+    expect(agent?.content).toContain("Sort by urgency");
+  });
+});
+
+describe("emitClaudePlugin — eval shape", () => {
+  const baseEval: IrEvalV0 = {
+    version: 0,
+    name: "qa-eval",
+    target: "eval",
+    agent: { model: "claude-sonnet-4-6", instructions: "Answer concisely.", tools: [] },
+    dataset: { name: "qa-bench", version: "v1", split: "dev" },
+    graders: [{ name: "exact_match" }],
+    concurrency: 4,
+  };
+
+  test("emits a single SKILL.md naming the dataset + split in its description", () => {
+    const b = emitClaudePlugin(baseEval, { author: { name: "x" } });
+    const skill = b.files.find((f) => f.path === "skills/qa-eval/SKILL.md");
+    expect(skill).toBeDefined();
+    expect(skill?.content).toContain("Eval harness over dataset qa-bench (dev)");
+    expect(skill?.content).toContain("Answer concisely.");
+    // eval shape emits exactly one skill (no per-grader files).
+    const skillPaths = b.files.map((f) => f.path).filter((p) => p.startsWith("skills/"));
+    expect(skillPaths).toEqual(["skills/qa-eval/SKILL.md"]);
+  });
+});
+
+describe("emitClaudePlugin — generic agent shapes", () => {
+  const managed: IrManagedV0 = {
+    version: 0,
+    name: "saas-bot",
+    target: "managed",
+    agent: { model: "claude-sonnet-4-6", instructions: "Serve every tenant." },
+    tenants: [],
+    permissions: { rules: [] },
+    compaction: {},
+  };
+
+  test("managed emits one SKILL.md with a `<target> agent` description", () => {
+    const b = emitClaudePlugin(managed, { author: { name: "x" } });
+    const skill = b.files.find((f) => f.path === "skills/saas-bot/SKILL.md");
+    expect(skill).toBeDefined();
+    expect(skill?.content).toContain("managed agent — see body for instructions.");
+    expect(skill?.content).toContain("Serve every tenant.");
+  });
+
+  // pipeline / research route through the same generic helper but with a
+  // dedicated switch arm; batch / voice / browser / onchain / onchain-game
+  // share a single arm. Exercise every arm so each `case` is covered.
+  test.each([
+    "pipeline",
+    "research",
+    "batch",
+    "voice",
+    "browser",
+    "onchain",
+    "onchain-game",
+  ] as const)("%s target emits a generic SKILL.md", (target) => {
+    const ir = {
+      version: 0,
+      name: `${target}-agent`,
+      target,
+      agent: { model: "m", instructions: `Run the ${target}.` },
+      permissions: { rules: [] },
+      compaction: {},
+    } as unknown as IrNode;
+    const b = emitClaudePlugin(ir, { author: { name: "x" } });
+    const skill = b.files.find((f) => f.path === `skills/${target}-agent/SKILL.md`);
+    expect(skill).toBeDefined();
+    expect(skill?.content).toContain(`${target} agent — see body for instructions.`);
+    expect(skill?.content).toContain(`Run the ${target}.`);
   });
 });
 

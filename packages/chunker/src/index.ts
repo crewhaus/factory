@@ -90,8 +90,15 @@ function chunkFixed(doc: Document, opts: ChunkOptions): Chunk[] {
 function chunkSemantic(doc: Document, opts: ChunkOptions): Chunk[] {
   if (opts.size <= 0) throw new ChunkerError("size must be positive");
   const overlap = opts.overlap ?? 0;
-  // Intl.Segmenter is widely available in modern Node + Bun.
-  const segmenter = new Intl.Segmenter(opts.locale ?? "en", { granularity: "sentence" });
+  // Intl.Segmenter is widely available in modern Node + Bun. An invalid
+  // `locale` makes the constructor throw a raw `RangeError`; wrap it so callers
+  // see the package's typed `ChunkerError` contract (with the original as cause).
+  let segmenter: Intl.Segmenter;
+  try {
+    segmenter = new Intl.Segmenter(opts.locale ?? "en", { granularity: "sentence" });
+  } catch (cause) {
+    throw new ChunkerError(`invalid locale ${JSON.stringify(opts.locale)}`, cause);
+  }
   type Sentence = { readonly text: string; readonly start: number; readonly end: number };
   const sentences: Sentence[] = [];
   for (const seg of segmenter.segment(doc.text)) {

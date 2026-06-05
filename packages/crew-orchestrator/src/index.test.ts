@@ -4,7 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type Anthropic from "@anthropic-ai/sdk";
 import type { ProviderAdapter, StreamEvent } from "@crewhaus/adapter-anthropic";
+import type { CrewMailbox, RuntimeBridge } from "@crewhaus/agent-context-isolation";
+import { BUILTIN_DEFAULT_RULES, type RuleSet, emptyRuleSet } from "@crewhaus/permission-engine";
+import { buildTool } from "@crewhaus/tool-builder";
+import type { ToolExecuteContext } from "@crewhaus/tool-catalog";
 import { isValidSpanId, isValidTraceId, parseTraceparent } from "@crewhaus/trace-event-bus";
+import { z } from "zod";
 import { Crew, type CrewEvent, HandoffRefusedError } from "./index.js";
 
 function newTempRoot(): string {
@@ -810,6 +815,148 @@ describe("cross-agent seed boundary classification (#165, CWE-94)", () => {
       if (peerSeed === undefined) throw new Error("peer never received an A2A seed");
       expect(peerSeed).not.toContain("Ignore all previous instructions");
       expect(peerSeed).toContain("[tool output redacted: prompt injection detected:");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("mailbox surface exposed to in-crew tools", () => {
+  // The orchestrator's `CrewMailbox.currentTraceparent()` exists so a
+  // role's own tool can stamp the live W3C trace context onto an outgoing
+  // envelope (the A2A SendMessage tool relies on the orchestrator stamping
+  // it, but a custom crew tool may read it directly). The orchestrator
+  // never calls this closure itself — it reads the bus directly — so this
+  // test drives a custom role tool that pulls the traceparent off the
+  // mailbox via `ctx.bridge.crewMailbox`, exercising that closure and
+  // pinning the contract that the value is a valid, parseable traceparent.
+  test("a role tool can read mailbox.currentTraceparent()/currentRole() and gets live values", async () => {
+    const root = newTempRoot();
+    let stamped: string | undefined;
+    let roleSeen: string | undefined;
+    let knownRolesSeen: ReadonlyArray<string> | undefined;
+    try {
+      const stampTrace = buildTool({
+        name: "StampTrace",
+        description: "Stamp the current crew trace context.",
+        inputSchema: z.object({}).strict(),
+        readOnly: true,
+        execute: async (_input: unknown, ctx?: ToolExecuteContext) => {
+          const bridge = ctx?.bridge as RuntimeBridge | undefined;
+          const mailbox = bridge?.crewMailbox as CrewMailbox | undefined;
+          if (mailbox === undefined) return "[no mailbox]";
+          // A custom crew tool stamping provenance reads the whole mailbox
+          // read-surface: the active role, the live trace context, and the
+          // role roster.
+          stamped = mailbox.currentTraceparent();
+          roleSeen = mailbox.currentRole();
+          knownRolesSeen = mailbox.knownRoles;
+          return `role=${roleSeen} traceparent=${stamped}`;
+        },
+      });
+
+      // The custom tool isn't auto-allowed (only Handoff + SendMessage are),
+      // so grant it explicitly under the same builtin floor the orchestrator
+      // would otherwise apply by default.
+      const permissionRules: RuleSet = {
+        ...emptyRuleSet,
+        builtin: BUILTIN_DEFAULT_RULES,
+        flag: [{ type: "alwaysAllow", pattern: "StampTrace", source: "flag" }],
+      };
+
+      const adapter = makeProgrammableAdapter(({ previousToolResults }) => {
+        // Once the tool result is back, end the turn; otherwise call the tool.
+        if (previousToolResults.length > 0) return [{ type: "text", text: "stamped" }];
+        return [{ type: "tool_use", id: "tu_stamp", name: "StampTrace", input: {} }];
+      });
+
+      const crew = Crew()
+        .setName("stamp-crew")
+        .addRole("solo", { model: "stub", instructions: "Solo.", tools: [stampTrace] })
+        .setEntry("solo")
+        .compile();
+
+      const events = await collect(
+        crew.run("go", {
+          sessionRootDir: root,
+          _adapter: adapter,
+          permissionRules,
+          maxActivations: 4,
+        }),
+      );
+
+      expect(events[events.length - 1]?.kind).toBe("crew_done");
+      // The closure ran and yielded a valid, bus-consistent traceparent.
+      expect(stamped).toBeDefined();
+      const parsed = parseTraceparent(stamped ?? "");
+      expect(parsed).not.toBeNull();
+      expect(parsed && isValidTraceId(parsed.traceId)).toBe(true);
+      expect(parsed && isValidSpanId(parsed.parentSpanId)).toBe(true);
+      // currentRole() reports the role whose turn invoked the tool.
+      expect(roleSeen).toBe("solo");
+      // knownRoles is the crew's role roster.
+      expect(knownRolesSeen).toEqual(["solo"]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("handoff context serialisation", () => {
+  // `serialiseContext` JSON-encodes a non-string handoff `context` before it
+  // is boundary-classified and folded into the receiver's seed. This test
+  // pins the object path (JSON.stringify, 2-space pretty-print) by driving a
+  // real researcher→writer handoff and asserting the seed the receiver
+  // actually sees. (The String()-fallback catch arm fires only if
+  // JSON.stringify throws — e.g. a cyclic object — but such a value cannot
+  // reach `requestHandoff` through a real Handoff tool call: the SDK/tool
+  // layer JSON-serialises the tool input first and rejects the cycle there,
+  // so the catch is defensive-only and not exercised end-to-end.)
+
+  // Capture the receiver's seed for a researcher→writer handoff whose
+  // Handoff tool input is `handoffInput`.
+  async function runHandoffCaptureSeed(
+    root: string,
+    handoffInput: Record<string, unknown>,
+  ): Promise<string> {
+    let receiverSeed: string | undefined;
+    const adapter = makeProgrammableAdapter(({ seed, previousToolResults }) => {
+      if (seed.includes("[Handoff from researcher]")) {
+        receiverSeed = seed;
+        return [{ type: "text", text: "received" }];
+      }
+      if (previousToolResults.length > 0) return [{ type: "text", text: "[handoff queued]" }];
+      return [{ type: "tool_use", id: "tool_1", name: "Handoff", input: handoffInput }];
+    });
+
+    const crew = Crew()
+      .setName("ctx-serialise")
+      .addRole("researcher", { model: "stub", instructions: "Research." })
+      .addRole("writer", { model: "stub", instructions: "Write." })
+      .setEntry("researcher")
+      .compile();
+
+    await collect(
+      crew.run("brief", { sessionRootDir: root, _adapter: adapter, maxActivations: 4 }),
+    );
+    if (receiverSeed === undefined) throw new Error("writer never received a handoff seed");
+    return receiverSeed;
+  }
+
+  test("object context is JSON-serialised into the receiver's seed", async () => {
+    const root = newTempRoot();
+    try {
+      const seed = await runHandoffCaptureSeed(root, {
+        target: "writer",
+        reason: "structured payload attached",
+        context: { ticket: 4821, city: "Berlin", tags: ["urgent", "shipping"] },
+      });
+      // The object is pretty-printed (2-space JSON) and survives verbatim —
+      // it carries no injection so the classifier passes it through.
+      expect(seed).toContain('"ticket": 4821');
+      expect(seed).toContain('"city": "Berlin"');
+      expect(seed).toContain('"urgent"');
+      expect(seed).not.toContain("[tool output redacted:");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

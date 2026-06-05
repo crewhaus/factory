@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   DataRetentionError,
   InMemoryRecordStore,
+  type RecordStore,
   type RetentionRecord,
   _msPerDayForTest,
   createDataRetentionEngine,
@@ -276,5 +277,172 @@ describe("sweep (cron-style)", () => {
     const result = await eng.sweep();
     expect(result.deletedCount).toBe(0);
     expect(result.recordsKept).toBe(2);
+  });
+});
+
+describe("InMemoryRecordStore", () => {
+  test("size() reports the current record count and tracks deletes", async () => {
+    const store = new InMemoryRecordStore([
+      record("a-1", "tenant-a", "audit", 5),
+      record("a-2", "tenant-a", "audit", 5),
+    ]);
+    expect(store.size()).toBe(2);
+    await store.delete("a-1");
+    expect(store.size()).toBe(1);
+    await store.delete("nope"); // no-op
+    expect(store.size()).toBe(1);
+  });
+
+  test("delete() returns false when the id is absent", async () => {
+    const store = new InMemoryRecordStore([record("a-1", "tenant-a", "audit", 5)]);
+    expect(await store.delete("ghost")).toBe(false);
+    expect(await store.delete("a-1")).toBe(true);
+  });
+});
+
+describe("default clock", () => {
+  // Exercises the fallback `now` (Date.now) path when no `now` is injected.
+  test("addAuditWindow uses Date.now() when no clock is supplied", () => {
+    const eng = createDataRetentionEngine({ recordStore: new InMemoryRecordStore() });
+    // A window far in the future must be accepted under the real clock...
+    eng.addAuditWindow({
+      frameworkId: "soc2",
+      controlId: "CC6.1",
+      expiresAt: Date.now() + 365 * DAY_MS,
+    });
+    expect(eng.listAuditWindows()).toHaveLength(1);
+    // ...and an already-past window must be rejected under the real clock.
+    expect(() =>
+      eng.addAuditWindow({
+        frameworkId: "soc2",
+        controlId: "CC6.2",
+        expiresAt: Date.now() - 1000,
+      }),
+    ).toThrow(DataRetentionError);
+  });
+
+  test("defaultRetentionDays falls back to 90 when unset", async () => {
+    const now = 1_700_000_000_000;
+    const store = new InMemoryRecordStore([
+      record("fresh", "tenant-a", "audit", 80, {}, now), // < 90d → kept
+      record("stale", "tenant-a", "audit", 100, {}, now), // > 90d → purged
+    ]);
+    const eng = createDataRetentionEngine({ recordStore: store, now: () => now });
+    const result = await eng.purge("tenant-a");
+    expect(result.deleted).toBe(1);
+    expect(store.ids()).toEqual(["fresh"]);
+  });
+});
+
+describe("defensive cross-tenant guards (misbehaving store)", () => {
+  // A custom store that ignores the tenant filter and leaks foreign records.
+  // The engine's per-record `record.tenantId !== tenantId` guard must still
+  // refuse to act on them (T8 belt-and-suspenders).
+  class LeakyStore implements RecordStore {
+    constructor(private readonly recs: ReadonlyArray<RetentionRecord>) {}
+    async *listAll(): AsyncIterable<RetentionRecord> {
+      for (const r of this.recs) yield r;
+    }
+    // Deliberately ignores `_tenantId` and yields EVERYTHING.
+    async *listByTenant(_tenantId: string): AsyncIterable<RetentionRecord> {
+      for (const r of this.recs) yield r;
+    }
+    async delete(): Promise<boolean> {
+      return true;
+    }
+  }
+
+  test("purge skips foreign-tenant records a leaky store yields", async () => {
+    const now = 1_700_000_000_000;
+    const deleted: string[] = [];
+    const recs = [
+      record("a-old", "tenant-a", "audit", 200, {}, now),
+      record("b-old", "tenant-b", "audit", 200, {}, now),
+    ];
+    // Inline store so `delete` can record which ids the engine acts on.
+    const store: RecordStore = {
+      async *listAll() {
+        for (const r of recs) yield r;
+      },
+      async *listByTenant() {
+        for (const r of recs) yield r; // leaks every tenant
+      },
+      async delete(id: string): Promise<boolean> {
+        deleted.push(id);
+        return true;
+      },
+    };
+    const eng = createDataRetentionEngine({
+      recordStore: store,
+      now: () => now,
+      defaultRetentionDays: 30,
+    });
+    const result = await eng.purge("tenant-a");
+    expect(result.deleted).toBe(1);
+    expect(deleted).toEqual(["a-old"]); // tenant-b never touched
+  });
+
+  test("export omits foreign-tenant records a leaky store yields", async () => {
+    const store = new LeakyStore([
+      record("a-1", "tenant-a", "audit", 5),
+      record("b-1", "tenant-b", "audit", 5),
+    ]);
+    const eng = createDataRetentionEngine({ recordStore: store });
+    const out = await eng.export("tenant-a", { format: "json" });
+    const parsed = JSON.parse(out) as RetentionRecord[];
+    expect(parsed).toHaveLength(1);
+    expect(parsed[0]?.id).toBe("a-1");
+    expect(out.includes("b-1")).toBe(false);
+  });
+});
+
+describe("delete-returns-false branches", () => {
+  // When the store reports `delete` -> false (record already gone), neither
+  // purge nor sweep should count it as deleted.
+  class NoopDeleteStore implements RecordStore {
+    constructor(private readonly recs: ReadonlyArray<RetentionRecord>) {}
+    async *listAll(): AsyncIterable<RetentionRecord> {
+      for (const r of this.recs) yield r;
+    }
+    async *listByTenant(tenantId: string): AsyncIterable<RetentionRecord> {
+      for (const r of this.recs) if (r.tenantId === tenantId) yield r;
+    }
+    async delete(): Promise<boolean> {
+      return false; // pretend the record vanished between list and delete
+    }
+  }
+
+  test("purge does not count a delete that returns false", async () => {
+    const now = 1_700_000_000_000;
+    const store = new NoopDeleteStore([record("a-old", "tenant-a", "audit", 200, {}, now)]);
+    const eng = createDataRetentionEngine({
+      recordStore: store,
+      now: () => now,
+      defaultRetentionDays: 30,
+    });
+    const result = await eng.purge("tenant-a");
+    expect(result.deleted).toBe(0);
+  });
+
+  test("sweep counts a delete that returns false as kept", async () => {
+    const now = 1_700_000_000_000;
+    const store = new NoopDeleteStore([record("a-old", "tenant-a", "audit", 200, {}, now)]);
+    const eng = createDataRetentionEngine({
+      recordStore: store,
+      now: () => now,
+      defaultRetentionDays: 30,
+    });
+    const result = await eng.sweep();
+    expect(result.deletedCount).toBe(0);
+    expect(result.recordsKept).toBe(1);
+  });
+});
+
+describe("createDataRetentionEngine guard", () => {
+  test("throws when recordStore is missing", () => {
+    // Force the undefined-recordStore branch through the public factory.
+    expect(() =>
+      createDataRetentionEngine({ recordStore: undefined as unknown as RecordStore }),
+    ).toThrow(DataRetentionError);
   });
 });

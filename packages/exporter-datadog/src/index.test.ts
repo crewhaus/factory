@@ -1,9 +1,10 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { type TraceEvent, TraceEventBus } from "@crewhaus/trace-event-bus";
 import {
   DD_DEFAULT_ENDPOINT,
   _parseDdTagsForTest,
   _scrubApiKeyForTest,
+  _wrapFetchWithDdAttrsForTest,
   attachDatadogExporter,
   attachDatadogIfEnvSet,
 } from "./index";
@@ -277,5 +278,197 @@ describe("parseDdTags", () => {
   test("returns empty array for undefined / empty string", () => {
     expect(_parseDdTagsForTest(undefined)).toEqual([]);
     expect(_parseDdTagsForTest("")).toEqual([]);
+  });
+
+  test("value may contain non-key chars (e.g. '?', '=', '@', '+')", () => {
+    // The value half permits any non-comma/non-whitespace char.
+    expect(_parseDdTagsForTest("k:v?x")).toEqual(["k:v?x"]);
+    expect(_parseDdTagsForTest("k:a=b@c+d")).toEqual(["k:a=b@c+d"]);
+    // Value may itself contain colons.
+    expect(_parseDdTagsForTest("k:a:b:c")).toEqual(["k:a:b:c"]);
+  });
+
+  test("ReDoS regression: pathological colon run validates in linear time", () => {
+    // Before the fix, a long colon run followed by an *internal* whitespace
+    // char (here a tab) drove the combined `…[A-Za-z0-9_./:-]*:[^,\s]+$` regex
+    // into O(n^2) backtracking: the key class overlaps the separator `:`, so the
+    // engine retries every colon position when the value class ultimately fails.
+    // `trim()` only strips edge whitespace and commas are split out, so an
+    // internal tab is genuinely reachable through parseDdTags. At n=60000 the old
+    // regex took multiple seconds; the split-on-first-colon validator is
+    // sub-millisecond. The tag is (correctly) rejected either way.
+    const pathological = `a${":".repeat(60000)}\tx`;
+    const start = performance.now();
+    const out = _parseDdTagsForTest(pathological);
+    const elapsedMs = performance.now() - start;
+    expect(out).toEqual([]);
+    expect(elapsedMs).toBeLessThan(250);
+  });
+});
+
+describe("attachDatadogExporter — default onError stderr path", () => {
+  test("writes a scrubbed message to stderr when no onError is supplied", async () => {
+    const bus = new TraceEventBus({ runId: "run_l", sessionId: "sess_c" });
+    const apiKey = "dd-secret-key-fedcba654321";
+    const writes: string[] = [];
+    const spy = spyOn(process.stderr, "write").mockImplementation(((chunk: unknown) => {
+      writes.push(String(chunk));
+      return true;
+    }) as typeof process.stderr.write);
+    try {
+      // Upstream 500 whose body mentions the key — otel-exporter throws an Error
+      // containing the body text, which our onError must scrub before stderr.
+      const failingFetch: typeof fetch = (async () =>
+        new Response(`boom referencing ${apiKey}`, { status: 500 })) as unknown as typeof fetch;
+      const exp = attachDatadogExporter(bus, {
+        apiKey,
+        fetchImpl: failingFetch,
+        flushIntervalMs: 0,
+        // no onError -> exercise the default stderr branch
+      });
+      publishTurnPair(bus);
+      await exp.flush();
+      await exp.shutdown();
+    } finally {
+      spy.mockRestore();
+    }
+    const joined = writes.join("");
+    expect(joined).toContain("[exporter-datadog] export failed:");
+    expect(joined).toContain("[REDACTED:DD_API_KEY]");
+    expect(joined).not.toContain(apiKey);
+  });
+
+  test("default onError forwards an unscrubbed message unchanged to stderr", async () => {
+    // When the error message does not contain the key, no redaction marker is
+    // added — still routed to the default stderr branch.
+    const bus = new TraceEventBus({ runId: "run_m", sessionId: "sess_d" });
+    const writes: string[] = [];
+    const spy = spyOn(process.stderr, "write").mockImplementation(((chunk: unknown) => {
+      writes.push(String(chunk));
+      return true;
+    }) as typeof process.stderr.write);
+    try {
+      const failingFetch: typeof fetch = (async () => {
+        throw new Error("network unreachable");
+      }) as unknown as typeof fetch;
+      const exp = attachDatadogExporter(bus, {
+        apiKey: "dd-test-1234567890",
+        fetchImpl: failingFetch,
+        flushIntervalMs: 0,
+      });
+      publishTurnPair(bus);
+      await exp.flush();
+      await exp.shutdown();
+    } finally {
+      spy.mockRestore();
+    }
+    const joined = writes.join("");
+    expect(joined).toContain("[exporter-datadog] export failed: network unreachable");
+    expect(joined).not.toContain("[REDACTED");
+  });
+});
+
+describe("wrapFetchWithDdAttrs — body handling branches", () => {
+  const attrs = {
+    ddService: "svc",
+    ddEnv: "prod",
+    ddVersion: "9.9.9",
+    tags: ["team:platform"] as ReadonlyArray<string>,
+  };
+
+  function recordingFetch(): { fetch: typeof fetch; last: { input: unknown; init?: RequestInit } } {
+    const state: { input: unknown; init?: RequestInit } = { input: undefined };
+    const impl = (async (input: unknown, init?: RequestInit) => {
+      state.input = input;
+      state.init = init;
+      return new Response("", { status: 200 });
+    }) as unknown as typeof fetch;
+    return { fetch: impl, last: state };
+  }
+
+  test("injects dd.* attrs into a valid OTLP body (incl. existing attrs)", async () => {
+    const { fetch, last } = recordingFetch();
+    const wrapped = _wrapFetchWithDdAttrsForTest(fetch, attrs);
+    const body = JSON.stringify({
+      resourceSpans: [
+        { resource: { attributes: [{ key: "service.name", value: { stringValue: "x" } }] } },
+      ],
+    });
+    await wrapped("http://collector/v1/traces", { method: "POST", body });
+    const sent = JSON.parse(String(last.init?.body));
+    const keys = sent.resourceSpans[0].resource.attributes.map((a: { key: string }) => a.key);
+    expect(keys).toContain("service.name");
+    expect(keys).toContain("dd.service");
+    expect(keys).toContain("dd.tag.team");
+  });
+
+  test("seeds attrs when resourceSpans entry has no existing resource.attributes", async () => {
+    const { fetch, last } = recordingFetch();
+    const wrapped = _wrapFetchWithDdAttrsForTest(fetch, attrs);
+    // resource.attributes absent -> exercises the `: []` side of the ternary.
+    const body = JSON.stringify({ resourceSpans: [{}] });
+    await wrapped("http://collector/v1/traces", { method: "POST", body });
+    const sent = JSON.parse(String(last.init?.body));
+    const byKey = Object.fromEntries(
+      sent.resourceSpans[0].resource.attributes.map(
+        (a: { key: string; value: { stringValue?: string } }) => [a.key, a.value.stringValue],
+      ),
+    );
+    expect(byKey["dd.service"]).toBe("svc");
+    expect(byKey["dd.env"]).toBe("prod");
+    expect(byKey["dd.version"]).toBe("9.9.9");
+    expect(byKey["dd.tag.team"]).toBe("platform");
+  });
+
+  test("falls through unchanged when JSON body has no resourceSpans array", async () => {
+    const { fetch, last } = recordingFetch();
+    const wrapped = _wrapFetchWithDdAttrsForTest(fetch, attrs);
+    const body = JSON.stringify({ hello: "world" });
+    await wrapped("http://x/v1/traces", { method: "POST", body });
+    // Body forwarded verbatim (no decoration).
+    expect(last.init?.body).toBe(body);
+  });
+
+  test("falls through unchanged when the string body is not valid JSON", async () => {
+    // Exercises the catch{} fall-through (JSON.parse throws).
+    const { fetch, last } = recordingFetch();
+    const wrapped = _wrapFetchWithDdAttrsForTest(fetch, attrs);
+    const body = "{not json";
+    await wrapped("http://x/v1/traces", { method: "POST", body });
+    expect(last.init?.body).toBe(body);
+  });
+
+  test("passes through requests with a non-string body untouched", async () => {
+    const { fetch, last } = recordingFetch();
+    const wrapped = _wrapFetchWithDdAttrsForTest(fetch, attrs);
+    const blob = new Uint8Array([1, 2, 3]);
+    await wrapped("http://x/v1/traces", { method: "POST", body: blob });
+    expect(last.init?.body).toBe(blob);
+  });
+
+  test("passes through requests with no init", async () => {
+    const { fetch, last } = recordingFetch();
+    const wrapped = _wrapFetchWithDdAttrsForTest(fetch, attrs);
+    await wrapped("http://x/v1/traces");
+    expect(last.init).toBeUndefined();
+  });
+
+  test("tag entry with no colon maps to dd.tag.<key> with empty value", async () => {
+    // parseDdTags would reject a colon-less tag, but the fetch decorator itself
+    // splits defensively: a bare key yields dd.tag.<key> with "" value.
+    const { fetch, last } = recordingFetch();
+    const wrapped = _wrapFetchWithDdAttrsForTest(fetch, {
+      ...attrs,
+      tags: ["soloflag"],
+    });
+    const body = JSON.stringify({ resourceSpans: [{}] });
+    await wrapped("http://x/v1/traces", { method: "POST", body });
+    const sent = JSON.parse(String(last.init?.body));
+    const byKey = Object.fromEntries(
+      sent.resourceSpans[0].resource.attributes.map(
+        (a: { key: string; value: { stringValue?: string } }) => [a.key, a.value.stringValue],
+      ),
+    );
+    expect(byKey["dd.tag.soloflag"]).toBe("");
   });
 });

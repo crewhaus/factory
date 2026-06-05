@@ -178,6 +178,52 @@ describe("HttpRegistrySource (T1)", () => {
     });
     await expect(src.list()).rejects.toThrow(/missing templates\[\]/);
   });
+
+  test("fetch returns the full manifest from the per-name URL", async () => {
+    const seenUrls: string[] = [];
+    const fetchImpl = (async (url: string) => {
+      seenUrls.push(url);
+      return new Response(JSON.stringify({ ...baseManifest, name: "remote-c" }), { status: 200 });
+    }) as unknown as typeof fetch;
+    const src = new HttpRegistrySource({
+      id: "npm",
+      listUrl: "https://npm.test/list",
+      fetchUrl: (n) => `https://npm.test/pkg/${n}`,
+      fetchImpl,
+    });
+    const m = await src.fetch("remote-c");
+    expect(m.name).toBe("remote-c");
+    expect(m.yaml).toBe(baseManifest.yaml);
+    expect(seenUrls).toEqual(["https://npm.test/pkg/remote-c"]);
+  });
+
+  test("fetch throws on non-2xx with id, name, status and body tail", async () => {
+    const fetchImpl = (async () =>
+      new Response("nope", { status: 503 })) as unknown as typeof fetch;
+    const src = new HttpRegistrySource({
+      id: "git",
+      listUrl: "https://example.test/list",
+      fetchUrl: (n) => `https://example.test/fetch/${n}`,
+      fetchImpl,
+    });
+    await expect(src.fetch("ghost")).rejects.toThrow(/git fetch "ghost" 503: nope/);
+  });
+
+  test("metadata strips yaml from the fetched manifest", async () => {
+    const fetchImpl = (async () =>
+      new Response(JSON.stringify({ ...baseManifest, name: "remote-d" }), {
+        status: 200,
+      })) as unknown as typeof fetch;
+    const src = new HttpRegistrySource({
+      id: "git",
+      listUrl: "https://example.test/list",
+      fetchUrl: (n) => `https://example.test/fetch/${n}`,
+      fetchImpl,
+    });
+    const meta = await src.metadata("remote-d");
+    expect(meta.name).toBe("remote-d");
+    expect("yaml" in meta).toBe(false);
+  });
 });
 
 describe("cachedRegistry — TTL caching (T9)", () => {
@@ -232,6 +278,83 @@ describe("cachedRegistry — TTL caching (T9)", () => {
 
   test("default TTL is 60 minutes", () => {
     expect(_defaultTtlMsForTest).toBe(60 * 60 * 1000);
+  });
+
+  test("fetch caches per-name within TTL, re-fetches after expiry and refresh", async () => {
+    let fetchCalls = 0;
+    const upstream: RegistrySource = {
+      id: "u",
+      async list() {
+        return [];
+      },
+      async fetch(name) {
+        fetchCalls += 1;
+        return { ...baseManifest, name };
+      },
+      async metadata() {
+        throw new Error("not used");
+      },
+    };
+    let now = 1_000;
+    const cached = cachedRegistry({ source: upstream, now: () => now, ttlMs: 1_000 });
+    await cached.fetch("a");
+    await cached.fetch("a"); // cache hit
+    expect(fetchCalls).toBe(1);
+    await cached.fetch("b"); // different key → miss
+    expect(fetchCalls).toBe(2);
+    now += 1_500; // past TTL for "a"
+    await cached.fetch("a");
+    expect(fetchCalls).toBe(3);
+    cached.refresh();
+    await cached.fetch("a");
+    expect(fetchCalls).toBe(4);
+  });
+
+  test("metadata caches per-name within TTL, re-fetches after expiry and refresh", async () => {
+    let metaCalls = 0;
+    const upstream: RegistrySource = {
+      id: "u",
+      async list() {
+        return [];
+      },
+      async fetch() {
+        throw new Error("not used");
+      },
+      async metadata(name) {
+        metaCalls += 1;
+        const { yaml: _y, ...meta } = { ...baseManifest, name };
+        return meta;
+      },
+    };
+    let now = 5_000;
+    const cached = cachedRegistry({ source: upstream, now: () => now, ttlMs: 2_000 });
+    const first = await cached.metadata("a");
+    expect(first.name).toBe("a");
+    await cached.metadata("a"); // cache hit
+    expect(metaCalls).toBe(1);
+    now += 2_500; // past TTL
+    await cached.metadata("a");
+    expect(metaCalls).toBe(2);
+    cached.refresh();
+    await cached.metadata("a");
+    expect(metaCalls).toBe(3);
+  });
+
+  test("cached id annotates the wrapped source id", () => {
+    const upstream: RegistrySource = {
+      id: "git",
+      async list() {
+        return [];
+      },
+      async fetch() {
+        throw new Error("not used");
+      },
+      async metadata() {
+        throw new Error("not used");
+      },
+    };
+    const cached = cachedRegistry({ source: upstream });
+    expect(cached.id).toBe("git+cache");
   });
 });
 
@@ -295,5 +418,38 @@ describe("verifyingRegistry — T8 supply-chain check", () => {
       trustRoot: { publicKeys: [b.publicKey] }, // trust a different key only
     });
     await expect(verifying.fetch("hello-cli-template")).rejects.toThrow(/not in trust root/);
+  });
+
+  test("id annotates the wrapped source", async () => {
+    const local = new LocalRegistrySource({ rootDir: tmp });
+    const verifying = verifyingRegistry({ source: local, trustRoot: { publicKeys: [] } });
+    expect(verifying.id).toBe("local+verifying");
+  });
+
+  test("list passes metadata through unverified (verification is fetch-only)", async () => {
+    const { privateKey, publicKey } = generateSigningKeypair();
+    const sig = signManifest({ ...baseManifest, publicKey }, privateKey);
+    const local = new LocalRegistrySource({ rootDir: tmp });
+    local.put({ ...baseManifest, name: "signed-one", publicKey, signature: sig });
+    local.put({ ...baseManifest, name: "unsigned-two" }); // no signature
+    const verifying = verifyingRegistry({
+      source: local,
+      trustRoot: { publicKeys: [publicKey] },
+    });
+    // list does NOT verify — it returns metadata for every manifest as-is.
+    const list = await verifying.list();
+    expect(list.map((m) => m.name)).toEqual(["signed-one", "unsigned-two"]);
+  });
+
+  test("metadata passes through without signature verification", async () => {
+    const local = new LocalRegistrySource({ rootDir: tmp });
+    local.put({ ...baseManifest, name: "meta-only" }); // unsigned
+    const verifying = verifyingRegistry({
+      source: local,
+      trustRoot: { publicKeys: [] },
+    });
+    const meta = await verifying.metadata("meta-only");
+    expect(meta.name).toBe("meta-only");
+    expect("yaml" in meta).toBe(false);
   });
 });

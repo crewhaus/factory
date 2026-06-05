@@ -349,7 +349,12 @@ export function createGatewayServer(opts: CreateGatewayServerOptions): GatewaySe
   };
 }
 
-function statusFor(code: string): number {
+/**
+ * Map a wire `ErrorCode` to its HTTP status. Exported so reference clients
+ * and embedders can render the same status the daemon's HTTP layer does.
+ * Exhaustive over {@link ErrorCode}; unknown codes fall back to `200`.
+ */
+export function statusFor(code: string): number {
   switch (code) {
     case ErrorCode.Unauthorized:
       return 401;

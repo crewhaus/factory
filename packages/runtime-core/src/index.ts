@@ -872,7 +872,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         content:
           typeof result.content === "string"
             ? result.content
-            : summariseNonStringContent(result.content),
+            : summariseNonStringContent(
+                result.content as Exclude<
+                  Anthropic.ToolResultBlockParam["content"],
+                  string | undefined
+                >,
+              ),
         isError: result.is_error === true,
       });
       const outputContent = result.content;
@@ -1316,10 +1321,13 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
    * full content still reaches the model via tool_result.content above; the
    * audit log just gets a length-aware tag.
    */
-  function summariseNonStringContent(content: Anthropic.ToolResultBlockParam["content"]): string {
-    if (content === undefined || typeof content === "string") {
-      return content === undefined ? "[no content]" : `[${content.length} chars]`;
-    }
+  // Takes the non-string member of ToolResultBlockParam["content"] — the
+  // sole caller (`finish`) only invokes this on the non-string branch of a
+  // `typeof result.content === "string"` ternary, so the string/undefined
+  // case is statically excluded here and no dead guard is needed.
+  function summariseNonStringContent(
+    content: Exclude<Anthropic.ToolResultBlockParam["content"], string | undefined>,
+  ): string {
     let images = 0;
     let texts = 0;
     let other = 0;
@@ -1356,27 +1364,27 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       concurrent: partition.concurrent.map((b) => b.length),
       serial: partition.serial.length,
     });
-    const byId = new Map<string, Anthropic.ToolResultBlockParam>();
+    // Map each tool_use's identity to its slot in the original order so
+    // results can be placed back in order regardless of the
+    // concurrent/serial execution shape. `partitionToolCalls` is total —
+    // every input block lands in exactly one partition bucket — and
+    // `executeOneToolUse` always resolves to a result, so every slot is
+    // filled; there is no missing-result case to defend against.
+    const indexByBlock = new Map<TsmToolUseBlock, number>();
+    toolUses.forEach((tu, idx) => indexByBlock.set(tu, idx));
+    const results = new Array<Anthropic.ToolResultBlockParam>(toolUses.length);
     for (const batch of partition.concurrent) {
       const settled = await Promise.all(batch.map((tu) => executeOneToolUse(tu)));
-      for (const r of settled) byId.set(r.tool_use_id, r);
+      batch.forEach((tu, i) => {
+        // biome-ignore lint/style/noNonNullAssertion: every block came from toolUses, so its index is registered.
+        results[indexByBlock.get(tu)!] = settled[i] as Anthropic.ToolResultBlockParam;
+      });
     }
     for (const tu of partition.serial) {
-      const r = await executeOneToolUse(tu);
-      byId.set(r.tool_use_id, r);
+      // biome-ignore lint/style/noNonNullAssertion: every block came from toolUses, so its index is registered.
+      results[indexByBlock.get(tu)!] = await executeOneToolUse(tu);
     }
-    return toolUses.map((tu) => {
-      const r = byId.get(tu.id);
-      if (r === undefined) {
-        return {
-          type: "tool_result",
-          tool_use_id: tu.id,
-          content: "internal error: missing tool result",
-          is_error: true,
-        };
-      }
-      return r;
-    });
+    return results;
   }
 
   /**
@@ -1696,11 +1704,14 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           break;
         }
 
-        case "NeedCompaction":
-          // Reserved: pre-turn compaction is run outside the state machine;
-          // the recovery branch handles in-turn reactive compaction inline.
-          state = transition(state, { kind: "CompactionDone" });
-          break;
+        // NOTE: there is no `case "NeedCompaction"` here, and it is
+        // unreachable by construction: the turn-state-machine only enters
+        // `NeedCompaction` on a `BudgetExceeded` event, and this loop never
+        // emits one — pre-turn compaction runs outside the state machine (see
+        // `maybeCompact`) and in-turn reactive compaction is handled inline by
+        // the `compact` recovery action below. If a future change starts
+        // emitting `BudgetExceeded` from `runOneTurn`, restore a
+        // `NeedCompaction` → `CompactionDone` arm (and cover it) here.
 
         case "NeedRecovery": {
           const action = recover(lastErrorForRecovery, recovery);
@@ -1764,10 +1775,13 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               break;
             }
             case "tombstone": {
-              const lastIdx = messages.length - 1;
-              if (lastIdx >= 0 && messages[lastIdx]?.role === "assistant") {
-                messages.pop();
-              }
+              // A tombstone fires on an `invalid_request` from the model call.
+              // The model stream is atomic with respect to history: it either
+              // fully succeeds (pushing exactly one assistant message, after
+              // which the turn transitions to Done/NeedTools — never into
+              // recovery) or it throws before pushing anything. So when we
+              // reach here the tail is never a dangling assistant turn, and
+              // there is nothing to pop — we just append the retry nudge.
               const tombstoneMsg =
                 "[previous assistant turn was rejected as invalid; please retry]";
               messages.push({ role: "user", content: tombstoneMsg });

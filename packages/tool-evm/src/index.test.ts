@@ -124,3 +124,94 @@ describe("EvmGetTransactionReceipt", () => {
     expect(JSON.parse(out as string).status).toBe("0x1");
   });
 });
+
+describe("EvmGetTransaction", () => {
+  test("dispatches eth_getTransactionByHash with the hash", async () => {
+    const calls: Call[] = [];
+    setEvmAdapterResolver(() =>
+      fakeAdapter((c) => {
+        calls.push(c);
+        return { from: "0xfrom", to: "0xto", value: "0x0" };
+      }),
+    );
+    const out = await EVM_TOOL_MAP.evmGetTransaction.execute({
+      chainId: "base-mainnet",
+      txHash: "0xdeadbeef",
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.method).toBe("eth_getTransactionByHash");
+    expect(calls[0]?.params).toEqual(["0xdeadbeef"]);
+    expect(JSON.parse(out as string).from).toBe("0xfrom");
+  });
+});
+
+describe("EvmGetBalance", () => {
+  test("dispatches eth_getBalance with address + latest by default and returns the hex string", async () => {
+    const calls: Call[] = [];
+    setEvmAdapterResolver(() =>
+      fakeAdapter((c) => {
+        calls.push(c);
+        return "0xde0b6b3a7640000";
+      }),
+    );
+    const out = await EVM_TOOL_MAP.evmGetBalance.execute({
+      chainId: "base-mainnet",
+      address: "0xwallet",
+    });
+    expect(calls[0]?.method).toBe("eth_getBalance");
+    expect(calls[0]?.params).toEqual(["0xwallet", "latest"]);
+    // String result is returned verbatim, not JSON-stringified.
+    expect(out).toBe("0xde0b6b3a7640000");
+  });
+
+  test("honors explicit blockTag and JSON-stringifies a non-string result", async () => {
+    let receivedTag: unknown;
+    setEvmAdapterResolver(() =>
+      fakeAdapter((c) => {
+        receivedTag = c.params[1];
+        return { weird: "object" };
+      }),
+    );
+    const out = await EVM_TOOL_MAP.evmGetBalance.execute({
+      chainId: "base-mainnet",
+      address: "0xwallet",
+      blockTag: "finalized",
+    });
+    expect(receivedTag).toBe("finalized");
+    expect(JSON.parse(out as string).weird).toBe("object");
+  });
+});
+
+describe("EvmBlockNumber", () => {
+  test("dispatches eth_blockNumber with no params and returns the hex string", async () => {
+    const calls: Call[] = [];
+    setEvmAdapterResolver(() =>
+      fakeAdapter((c) => {
+        calls.push(c);
+        return "0x1234";
+      }),
+    );
+    const out = await EVM_TOOL_MAP.evmBlockNumber.execute({ chainId: "base-mainnet" });
+    expect(calls[0]?.method).toBe("eth_blockNumber");
+    expect(calls[0]?.params).toEqual([]);
+    expect(out).toBe("0x1234");
+  });
+
+  test("JSON-stringifies a non-string block-number result (defensive)", async () => {
+    setEvmAdapterResolver(() => fakeAdapter(() => ({ block: 4660 })));
+    const out = await EVM_TOOL_MAP.evmBlockNumber.execute({ chainId: "base-mainnet" });
+    expect(JSON.parse(out as string).block).toBe(4660);
+  });
+});
+
+describe("requireAdapter — unbound resolver branch", () => {
+  test("throws a boot-time error when no resolver has been bound", async () => {
+    // Force the module-level resolver back to undefined to exercise the
+    // `resolver === undefined` branch (distinct from a bound resolver that
+    // returns undefined for an unknown chainId).
+    setEvmAdapterResolver(undefined as unknown as (chainId: string) => undefined);
+    await expect(EVM_TOOL_MAP.evmBlockNumber.execute({ chainId: "base-mainnet" })).rejects.toThrow(
+      /no EvmAdapterResolver bound/,
+    );
+  });
+});

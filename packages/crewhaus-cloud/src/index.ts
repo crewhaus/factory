@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -476,8 +477,10 @@ export async function teardownCloud(opts: DeployCloudOptions): Promise<void> {
 
 function randomPassword(): string {
   // 24 hex chars — only used as a placeholder so the Terraform variable is set;
-  // production users override via -var-file.
-  return Array.from({ length: 24 }, () => Math.floor(Math.random() * 16).toString(16)).join("");
+  // production users override via -var-file. Sourced from a CSPRNG so that, if
+  // an operator does not override it, the provisioned DB admin credential is not
+  // derived from a predictable Math.random() stream (CWE-338).
+  return randomBytes(12).toString("hex");
 }
 
 /** Used by the CLI subcommand to enumerate provider choices. */

@@ -2,7 +2,9 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { CrewhausError } from "@crewhaus/errors";
 import {
+  MetaHarnessError,
   MetaHarnessMutationProvider,
   ensureExperienceStore,
   formatBreakingChangeHeader,
@@ -93,6 +95,34 @@ describe("formatBreakingChangeHeader", () => {
     expect(h).toContain("opt_abc");
     expect(h).toContain("claude-code-sdk");
     expect(h).toContain("0.812");
+  });
+});
+
+describe("MetaHarnessError", () => {
+  // Exported structured-error type for callers that wrap meta-harness failures
+  // (e.g. a proposer that cannot write the experience store). Nothing in the
+  // pure adapter throws it today, so assert its public contract directly: the
+  // typed `code`, stable `name`, message, cause chaining, and toJSON() output.
+  test("carries the 'compiler' code, stable name, and message", () => {
+    const err = new MetaHarnessError("experience store is unwritable");
+    expect(err).toBeInstanceOf(Error);
+    expect(err).toBeInstanceOf(CrewhausError);
+    expect(err).toBeInstanceOf(MetaHarnessError);
+    expect(err.name).toBe("MetaHarnessError");
+    expect(err.code).toBe("compiler");
+    expect(err.message).toBe("experience store is unwritable");
+  });
+
+  test("preserves the cause and serializes the chain via toJSON()", () => {
+    const cause = new Error("ENOSPC: no space left on device");
+    const err = new MetaHarnessError("failed to persist candidate", cause);
+    expect(err.cause).toBe(cause);
+    expect(err.toJSON()).toEqual({
+      name: "MetaHarnessError",
+      code: "compiler",
+      message: "failed to persist candidate",
+      cause: { name: "Error", message: "ENOSPC: no space left on device" },
+    });
   });
 });
 

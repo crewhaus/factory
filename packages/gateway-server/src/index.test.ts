@@ -3,8 +3,16 @@ import { createHmac } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { ErrorCode } from "@crewhaus/gateway-protocol";
 import { type Tenant, buildTenant } from "@crewhaus/tenancy";
-import { createGatewayServer, signJwt, verifyJwt } from "./index";
+import {
+  GatewayServerError,
+  PROTOCOL_VERSION,
+  createGatewayServer,
+  signJwt,
+  statusFor,
+  verifyJwt,
+} from "./index";
 
 /**
  * Forge a token with an arbitrary header + claims (signed with `secret`) so
@@ -284,5 +292,419 @@ describe("audit log", () => {
     const rows: unknown[] = [];
     for await (const r of log.read()) rows.push(r);
     expect(rows.length).toBe(1);
+  });
+
+  test("the audit row carries method, tenantId and the token's sub claim", async () => {
+    const { server, tenantA } = makeServer();
+    const token = signJwt({ tenant_id: "tenant-a", sub: "user-42" }, SECRET);
+    await server.handle({
+      bearer: token,
+      body: {
+        protocol: "crewhaus.v1",
+        id: "1",
+        method: "runs.create",
+        params: { spec: "s", input: "" },
+      },
+    });
+    const log = await server.getAuditLog(tenantA);
+    const rows: Array<{ payload: { method: string; tenantId: string; sub?: string } }> = [];
+    for await (const r of log.read())
+      rows.push(r as { payload: { method: string; tenantId: string; sub?: string } });
+    expect(rows[0]?.payload).toEqual({
+      method: "runs.create",
+      tenantId: "tenant-a",
+      sub: "user-42",
+    });
+  });
+
+  test("getAuditLog memoises — the same log instance is returned per tenant", async () => {
+    const { server, tenantA } = makeServer();
+    const first = await server.getAuditLog(tenantA);
+    const second = await server.getAuditLog(tenantA);
+    expect(second).toBe(first);
+  });
+});
+
+describe("verifyJwt — iat edge cases (forged tokens)", () => {
+  test("rejects a token whose iat is in the future", () => {
+    const future = Math.floor((Date.now() + 10 * 60_000) / 1000);
+    const token = forgeToken(
+      { alg: "HS256", typ: "JWT" },
+      { tenant_id: "tenant-a", iat: future, exp: future + 60 },
+      SECRET,
+    );
+    expect(() => verifyJwt(token, SECRET)).toThrow(/iat in the future/);
+  });
+
+  test("rejects a token whose iat is non-numeric", () => {
+    const iat = Math.floor(Date.now() / 1000);
+    const token = forgeToken(
+      { alg: "HS256", typ: "JWT" },
+      { tenant_id: "tenant-a", iat: "soon", exp: iat + 300 },
+      SECRET,
+    );
+    expect(() => verifyJwt(token, SECRET)).toThrow(/malformed iat/);
+  });
+
+  test("rejects a body with a missing tenant_id claim", () => {
+    const iat = Math.floor(Date.now() / 1000);
+    const token = forgeToken({ alg: "HS256", typ: "JWT" }, { iat, exp: iat + 300 }, SECRET);
+    expect(() => verifyJwt(token, SECRET)).toThrow(/missing tenant_id/);
+  });
+
+  test("rejects a token whose body is not valid JSON", () => {
+    // Header is valid; body decodes to non-JSON bytes; signature matches that body.
+    const b64url = (s: string): string =>
+      Buffer.from(s, "utf8")
+        .toString("base64")
+        .replace(/\+/g, "-")
+        .replace(/\//g, "_")
+        .replace(/=+$/, "");
+    const headerB64 = b64url(JSON.stringify({ alg: "HS256", typ: "JWT" }));
+    const bodyB64 = b64url("this-is-not-json{");
+    const data = `${headerB64}.${bodyB64}`;
+    const sig = createHmac("sha256", SECRET)
+      .update(data)
+      .digest("base64")
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_")
+      .replace(/=+$/, "");
+    expect(() => verifyJwt(`${data}.${sig}`, SECRET)).toThrow(/malformed JWT body/);
+  });
+
+  test("rejects a token whose header is not valid JSON", () => {
+    const b64url = (s: string): string =>
+      Buffer.from(s, "utf8")
+        .toString("base64")
+        .replace(/\+/g, "-")
+        .replace(/\//g, "_")
+        .replace(/=+$/, "");
+    const headerB64 = b64url("not-json{");
+    const iat = Math.floor(Date.now() / 1000);
+    const bodyB64 = b64url(JSON.stringify({ tenant_id: "tenant-a", iat, exp: iat + 300 }));
+    const data = `${headerB64}.${bodyB64}`;
+    const sig = createHmac("sha256", SECRET)
+      .update(data)
+      .digest("base64")
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_")
+      .replace(/=+$/, "");
+    expect(() => verifyJwt(`${data}.${sig}`, SECRET)).toThrow(/malformed JWT header/);
+  });
+});
+
+describe("createGatewayServer — injected clock + default tenant building", () => {
+  test("honours an injected now() for expiry checks", async () => {
+    // Token expires at T+300s. Pin the clock past expiry; the request must 401.
+    const iat = 1_000_000;
+    const token = signJwt({ tenant_id: "tenant-a", iat, exp: iat + 300 }, SECRET);
+    const tenantA = buildTenant("tenant-a", { tenantsRoot: tmp });
+    const server = createGatewayServer({
+      jwtSecret: SECRET,
+      tenantsRoot: tmp,
+      handler: async () => ({ ok: true }),
+      tenantOverrides: { "tenant-a": tenantA },
+      now: () => (iat + 10_000) * 1000,
+    });
+    const res = await server.handle({
+      bearer: token,
+      body: {
+        protocol: "crewhaus.v1",
+        id: "1",
+        method: "runs.create",
+        params: { spec: "s", input: "" },
+      },
+    });
+    expect(res).toMatchObject({
+      error: { code: "unauthorized", message: expect.stringMatching(/expired/) },
+    });
+  });
+
+  test("builds a tenant from tenantsRoot when no override is supplied", async () => {
+    // No tenantOverrides → tenantFor() falls through to buildTenant(tenantsRoot).
+    let seenRoot: string | undefined;
+    const server = createGatewayServer({
+      jwtSecret: SECRET,
+      tenantsRoot: tmp,
+      handler: async ({ tenant }) => {
+        seenRoot = tenant.auditRoot;
+        return { ok: true };
+      },
+    });
+    const token = signJwt({ tenant_id: "tenant-a" }, SECRET);
+    const res = await server.handle({
+      bearer: token,
+      body: {
+        protocol: "crewhaus.v1",
+        id: "1",
+        method: "runs.create",
+        params: { spec: "s", input: "" },
+      },
+    });
+    expect(res).toMatchObject({ protocol: "crewhaus.v1", id: "1" });
+    expect(seenRoot?.startsWith(tmp)).toBe(true);
+  });
+
+  test("builds a tenant with the package default root when tenantsRoot is omitted", async () => {
+    // Neither override nor tenantsRoot → buildTenant() uses its own default root.
+    // We never write to disk here: budget is exhausted first so the handler/audit
+    // never runs, keeping the test free of real filesystem side effects.
+    const server = createGatewayServer({
+      jwtSecret: SECRET,
+      handler: async () => ({ ok: true }),
+    });
+    server.recordUsage("tenant-a", { input: 10_000_000, output: 0 });
+    const token = signJwt({ tenant_id: "tenant-a" }, SECRET);
+    const res = await server.handle({
+      bearer: token,
+      body: {
+        protocol: "crewhaus.v1",
+        id: "1",
+        method: "runs.create",
+        params: { spec: "s", input: "" },
+      },
+    });
+    expect(res).toMatchObject({ error: { code: "budget_exceeded" } });
+  });
+});
+
+describe("budget enforcement — output dimension + internal errors", () => {
+  test("exhausted output budget → 429 budget_exceeded", async () => {
+    const tenantA = buildTenant("tenant-a", { tenantsRoot: tmp });
+    const tinyA: Tenant = { ...tenantA, budget: { maxInputTokens: 1000, maxOutputTokens: 100 } };
+    const server = createGatewayServer({
+      jwtSecret: SECRET,
+      tenantsRoot: tmp,
+      handler: async () => ({ ok: true }),
+      tenantOverrides: { "tenant-a": tinyA },
+    });
+    server.recordUsage("tenant-a", { input: 0, output: 100 });
+    const token = signJwt({ tenant_id: "tenant-a" }, SECRET);
+    const res = await server.handle({
+      bearer: token,
+      body: {
+        protocol: "crewhaus.v1",
+        id: "1",
+        method: "runs.create",
+        params: { spec: "s", input: "" },
+      },
+    });
+    expect(res).toMatchObject({
+      error: { code: "budget_exceeded", message: expect.stringMatching(/output tokens/) },
+    });
+  });
+
+  test("a handler that rejects surfaces as 500 internal_error", async () => {
+    const { server } = makeServer(async () => {
+      throw new Error("handler boom");
+    });
+    const token = signJwt({ tenant_id: "tenant-a" }, SECRET);
+    const res = await server.handle({
+      bearer: token,
+      body: {
+        protocol: "crewhaus.v1",
+        id: "1",
+        method: "runs.create",
+        params: { spec: "s", input: "" },
+      },
+    });
+    expect(res).toMatchObject({
+      error: { code: "internal_error", message: "handler boom" },
+    });
+  });
+
+  test("a handler that throws a non-Error value is stringified into internal_error", async () => {
+    // Reject with a raw (non-Error) string to exercise the server's
+    // `String(err)` branch. A plain rejected promise (rather than an `async`
+    // body that `throw`s a string literal) keeps the rejection reason exactly
+    // "raw string failure" without tripping useAwait / noThrowLiteral.
+    const { server } = makeServer(() => Promise.reject("raw string failure"));
+    const token = signJwt({ tenant_id: "tenant-a" }, SECRET);
+    const res = await server.handle({
+      bearer: token,
+      body: {
+        protocol: "crewhaus.v1",
+        id: "1",
+        method: "runs.create",
+        params: { spec: "s", input: "" },
+      },
+    });
+    expect(res).toMatchObject({
+      error: { code: "internal_error", message: "raw string failure" },
+    });
+  });
+
+  test("a GatewayServerError that is neither budget nor auth maps to 400 bad_request", async () => {
+    const { server } = makeServer(async () => {
+      throw new GatewayServerError("some other config problem");
+    });
+    const token = signJwt({ tenant_id: "tenant-a" }, SECRET);
+    const res = await server.handle({
+      bearer: token,
+      body: {
+        protocol: "crewhaus.v1",
+        id: "1",
+        method: "runs.create",
+        params: { spec: "s", input: "" },
+      },
+    });
+    expect(res).toMatchObject({
+      error: { code: "bad_request", message: "some other config problem" },
+    });
+  });
+});
+
+describe("statusFor — exhaustive wire code → HTTP status map", () => {
+  test("maps every standard ErrorCode and falls back to 200", () => {
+    expect(statusFor(ErrorCode.Unauthorized)).toBe(401);
+    expect(statusFor(ErrorCode.Forbidden)).toBe(403);
+    expect(statusFor(ErrorCode.NotFound)).toBe(404);
+    expect(statusFor(ErrorCode.BadRequest)).toBe(400);
+    expect(statusFor(ErrorCode.BudgetExceeded)).toBe(429);
+    expect(statusFor(ErrorCode.InternalError)).toBe(500);
+    // Unknown / empty codes fall through to the 200 default.
+    expect(statusFor("totally_unknown_code")).toBe(200);
+    expect(statusFor("")).toBe(200);
+  });
+});
+
+describe("listen — real Bun.serve HTTP surface (loopback)", () => {
+  /** Start the daemon on an ephemeral loopback port and return a teardown. */
+  async function withHttp(
+    server: ReturnType<typeof createGatewayServer>,
+    fn: (base: string) => Promise<void>,
+  ): Promise<void> {
+    const { port, close } = await server.listen(0);
+    expect(typeof port).toBe("number");
+    expect(port).toBeGreaterThan(0);
+    try {
+      await fn(`http://127.0.0.1:${port}`);
+    } finally {
+      await close();
+    }
+  }
+
+  test("authenticated POST returns 200 with the success envelope", async () => {
+    const { server } = makeServer(async ({ tenant }) => ({
+      runId: "run_h",
+      sessionId: "sess_h",
+      tenantId: tenant.id,
+    }));
+    const token = signJwt({ tenant_id: "tenant-a" }, SECRET);
+    await withHttp(server, async (base) => {
+      const res = await fetch(base, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+        body: JSON.stringify({
+          protocol: PROTOCOL_VERSION,
+          id: "1",
+          method: "runs.create",
+          params: { spec: "s", input: "hi" },
+        }),
+      });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({
+        protocol: PROTOCOL_VERSION,
+        id: "1",
+        result: { runId: "run_h", sessionId: "sess_h", tenantId: "tenant-a" },
+      });
+    });
+  });
+
+  test("missing Authorization header returns 401", async () => {
+    const { server } = makeServer();
+    await withHttp(server, async (base) => {
+      const res = await fetch(base, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          protocol: PROTOCOL_VERSION,
+          id: "1",
+          method: "runs.create",
+          params: { spec: "s", input: "" },
+        }),
+      });
+      expect(res.status).toBe(401);
+      expect(await res.json()).toMatchObject({ error: { code: "unauthorized" } });
+    });
+  });
+
+  test("a non-Bearer Authorization scheme is treated as no token (401)", async () => {
+    const { server } = makeServer();
+    await withHttp(server, async (base) => {
+      const res = await fetch(base, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Basic abc123" },
+        body: JSON.stringify({
+          protocol: PROTOCOL_VERSION,
+          id: "1",
+          method: "runs.create",
+          params: { spec: "s", input: "" },
+        }),
+      });
+      expect(res.status).toBe(401);
+    });
+  });
+
+  test("a non-JSON body returns 400 before auth is even consulted", async () => {
+    const { server } = makeServer();
+    await withHttp(server, async (base) => {
+      const res = await fetch(base, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer whatever" },
+        body: "}{ not json",
+      });
+      expect(res.status).toBe(400);
+      expect(await res.json()).toMatchObject({
+        error: { code: "bad_request", message: expect.stringMatching(/must be JSON/) },
+      });
+    });
+  });
+
+  test("an over-budget request returns HTTP 429", async () => {
+    const tenantA = buildTenant("tenant-a", { tenantsRoot: tmp });
+    const tinyA: Tenant = { ...tenantA, budget: { maxInputTokens: 50, maxOutputTokens: 50 } };
+    const server = createGatewayServer({
+      jwtSecret: SECRET,
+      tenantsRoot: tmp,
+      handler: async () => ({ ok: true }),
+      tenantOverrides: { "tenant-a": tinyA },
+    });
+    server.recordUsage("tenant-a", { input: 50, output: 0 });
+    const token = signJwt({ tenant_id: "tenant-a" }, SECRET);
+    await withHttp(server, async (base) => {
+      const res = await fetch(base, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+        body: JSON.stringify({
+          protocol: PROTOCOL_VERSION,
+          id: "1",
+          method: "runs.create",
+          params: { spec: "s", input: "" },
+        }),
+      });
+      expect(res.status).toBe(429);
+    });
+  });
+
+  test("binds on an explicit host argument", async () => {
+    const { server } = makeServer();
+    const { port, close } = await server.listen(0, "127.0.0.1");
+    try {
+      const token = signJwt({ tenant_id: "tenant-a" }, SECRET);
+      const res = await fetch(`http://127.0.0.1:${port}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+        body: JSON.stringify({
+          protocol: PROTOCOL_VERSION,
+          id: "1",
+          method: "runs.create",
+          params: { spec: "s", input: "" },
+        }),
+      });
+      expect(res.status).toBe(200);
+    } finally {
+      await close();
+    }
   });
 });

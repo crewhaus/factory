@@ -59,6 +59,10 @@ export function contains(opts: ContainsOptions): Grader {
 export function regex(pattern: RegExp | string, flags?: string): Grader {
   const re = typeof pattern === "string" ? new RegExp(pattern, flags) : pattern;
   return async (_sample, run) => {
+    // `test` mutates `lastIndex` on global/sticky regexes, which would make a
+    // reused grader instance flip-flop pass/fail across samples. Reset to keep
+    // each invocation independent and deterministic.
+    re.lastIndex = 0;
     if (re.test(run.agentOutput)) return pass(`output matches /${re.source}/${re.flags}`);
     return fail(`output does not match /${re.source}/${re.flags}`);
   };

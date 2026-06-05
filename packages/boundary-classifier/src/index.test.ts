@@ -1,7 +1,8 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, mock, test } from "bun:test";
 import {
   type TrustOrigin,
   boundaryCacheSize,
+  buildRedactionNotice,
   classifyBoundary,
   classifyBoundaryRaw,
   clearBoundaryCache,
@@ -170,5 +171,135 @@ describe("suspicious tier", () => {
       // the detector may legitimately call it clean.
       expect(res.action).toBe("pass");
     }
+  });
+
+  test("suspicious verdict under warn severity → warn action (non-clean is flagged)", async () => {
+    // Drive the makeResult warn-branch deterministically by forcing the
+    // verdict with an LLM classifier that lifts clean → suspicious. Clean
+    // input means the regex/structural layers contribute nothing, so the
+    // verdict is exactly the LLM's "suspicious".
+    const llmClassifier = mock(async () => ({ verdict: "suspicious" as const }));
+    const res = await classifyBoundary(CLEAN, {
+      origin: "channel",
+      severity: "warn",
+      llmClassifier,
+      bypassCache: true,
+    });
+    expect(llmClassifier).toHaveBeenCalledTimes(1);
+    expect(res.verdict.classification).toBe("suspicious");
+    expect(res.action).toBe("warn");
+    expect(res.original).toBe(CLEAN);
+    expect(res.redacted).toBeUndefined();
+  });
+});
+
+describe("severity: warn — clean content passes", () => {
+  test("clean verdict under warn severity → pass action, verbatim", async () => {
+    // Exercises the warn-branch's clean short-circuit in makeResult.
+    const res = await classifyBoundary(CLEAN, {
+      origin: "mcp",
+      severity: "warn",
+      bypassCache: true,
+    });
+    expect(res.verdict.classification).toBe("clean");
+    expect(res.action).toBe("pass");
+    expect(res.original).toBe(CLEAN);
+    expect(res.redacted).toBeUndefined();
+  });
+});
+
+describe("LLM classifier (layer 3) forwarding", () => {
+  test("a malicious LLM verdict forces redaction even on otherwise-clean text", async () => {
+    // The callback is deterministic (no real model). It must receive the
+    // text and its verdict must drive the boundary policy.
+    const llmClassifier = mock(async (text: string) => {
+      expect(typeof text).toBe("string");
+      return { verdict: "malicious" as const, rationale: "test-forced" };
+    });
+    const res = await classifyBoundary(CLEAN, {
+      origin: "mcp",
+      llmClassifier,
+      bypassCache: true,
+    });
+    expect(llmClassifier).toHaveBeenCalledTimes(1);
+    expect(res.verdict.classification).toBe("malicious");
+    expect(res.action).toBe("redact");
+    expect(res.redacted).toBeDefined();
+    expect(res.redacted).toContain("[tool output redacted");
+    // The notice should name the llm rule that fired.
+    expect(res.redacted).toContain("llm-malicious");
+  });
+
+  test("no llmClassifier passed → callback never invoked (option omitted)", async () => {
+    const llmClassifier = mock(async () => ({ verdict: "malicious" as const }));
+    // Note: intentionally NOT forwarding llmClassifier here.
+    const res = await classifyBoundary(CLEAN, { origin: "mcp", bypassCache: true });
+    expect(llmClassifier).toHaveBeenCalledTimes(0);
+    expect(res.verdict.classification).toBe("clean");
+    expect(res.action).toBe("pass");
+  });
+
+  test("classifyBoundaryRaw forwards the llmClassifier through to the verdict", async () => {
+    const llmClassifier = mock(async () => ({ verdict: "malicious" as const }));
+    const res = await classifyBoundaryRaw(CLEAN, {
+      origin: "subagent",
+      llmClassifier,
+      bypassCache: true,
+    });
+    expect(llmClassifier).toHaveBeenCalledTimes(1);
+    expect(res.verdict.classification).toBe("malicious");
+    expect(res.origin).toBe("subagent");
+    expect(res.fromCache).toBe(false);
+  });
+});
+
+describe("LRU recency — recently-read entries survive eviction", () => {
+  test("get() promotes an old key so it is not evicted when the cap overflows", async () => {
+    // Seed one entry, then read it back repeatedly while filling the cache
+    // past its cap so a naive FIFO would evict it. The LRU promotion on
+    // get() must keep it resident.
+    const survivor = "lru-survivor-entry";
+    const seed = await classifyBoundary(survivor, { origin: "mcp" });
+    expect(seed.fromCache).toBe(false);
+
+    for (let i = 0; i < 1100; i++) {
+      // Touch the survivor every few inserts to keep it most-recent.
+      if (i % 50 === 0) {
+        const touch = await classifyBoundary(survivor, { origin: "mcp" });
+        expect(touch.fromCache).toBe(true);
+      }
+      await classifyBoundary(`filler-${i}`, { origin: "mcp" });
+    }
+
+    expect(boundaryCacheSize()).toBeLessThanOrEqual(1024);
+    const recheck = await classifyBoundary(survivor, { origin: "mcp" });
+    expect(recheck.fromCache).toBe(true);
+  });
+});
+
+describe("redaction notice export", () => {
+  test("buildRedactionNotice is re-exported and produces the branded notice", () => {
+    const notice = buildRedactionNotice([
+      { rule: "ignore-previous", span: [0, 5], severity: "high", layer: "regex" },
+    ]);
+    expect(notice).toContain("[tool output redacted");
+    expect(notice).toContain("ignore-previous");
+  });
+});
+
+describe("cache + policy independence", () => {
+  test("a cached verdict still re-applies the per-call severity policy", async () => {
+    // First call caches the malicious verdict under block (default → redact).
+    const first = await classifyBoundary(MALICIOUS, { origin: "mcp" });
+    expect(first.fromCache).toBe(false);
+    expect(first.action).toBe("redact");
+
+    // Second call hits the cache but overrides severity to "pass": the
+    // verdict is reused, the action is recomputed from the new policy.
+    const second = await classifyBoundary(MALICIOUS, { origin: "mcp", severity: "pass" });
+    expect(second.fromCache).toBe(true);
+    expect(second.verdict.classification).toBe("malicious");
+    expect(second.action).toBe("pass");
+    expect(second.original).toBe(MALICIOUS);
   });
 });

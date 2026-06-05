@@ -287,6 +287,22 @@ describe("sendReply / setTyping (T3)", () => {
     expect(calls.length).toBe(1);
     expect(calls[0]?.url).toBe("https://test.discord.local/channels/300000000000000001/typing");
   });
+
+  test("setTyping swallows network rejection (best-effort)", async () => {
+    // A failed typing indicator must never reject and break the reply flow.
+    const f = (async () => {
+      throw new Error("network down");
+    }) as unknown as typeof fetch;
+    const a = adapter({ fetch: f });
+    await expect(a.setTyping({ event })).resolves.toBeUndefined();
+  });
+
+  test("setTyping ignores non-2xx responses (best-effort)", async () => {
+    const f = (async () =>
+      new Response("nope", { status: 500, statusText: "Internal" })) as unknown as typeof fetch;
+    const a = adapter({ fetch: f });
+    await expect(a.setTyping({ event })).resolves.toBeUndefined();
+  });
 });
 
 describe("createDiscordAdapter.verify()", () => {

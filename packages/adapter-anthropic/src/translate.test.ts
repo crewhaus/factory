@@ -1,8 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import type Anthropic from "@anthropic-ai/sdk";
 import { CLAUDE_CODE_SYSTEM_PREFIX } from "./client.js";
-import { rawEventToCanonical, toAnthropicParams } from "./translate.js";
-import type { ProviderRequest } from "./types.js";
+import {
+  rawEventToCanonical,
+  toAnthropicMessages,
+  toAnthropicParams,
+  toAnthropicSystem,
+} from "./translate.js";
+import type { CanonicalMessage, CanonicalTextBlockParam, ProviderRequest } from "./types.js";
 
 const baseReq: ProviderRequest = {
   model: "claude-sonnet-4-6",
@@ -72,6 +77,23 @@ describe("toAnthropicParams", () => {
   test("omits tools key entirely when empty", () => {
     const params = toAnthropicParams({ ...baseReq, tools: [] }, false);
     expect(params.tools).toBeUndefined();
+  });
+
+  test("omits tools key when tools is undefined", () => {
+    const params = toAnthropicParams(baseReq, false);
+    expect(params.tools).toBeUndefined();
+    expect(params.tool_choice).toBeUndefined();
+    expect(params.thinking).toBeUndefined();
+  });
+
+  test("tool_choice auto translates", () => {
+    const params = toAnthropicParams({ ...baseReq, toolChoice: { type: "auto" } }, false);
+    expect(params.tool_choice).toEqual({ type: "auto" });
+  });
+
+  test("tool_choice any translates", () => {
+    const params = toAnthropicParams({ ...baseReq, toolChoice: { type: "any" } }, false);
+    expect(params.tool_choice).toEqual({ type: "any" });
   });
 });
 
@@ -177,5 +199,166 @@ describe("rawEventToCanonical", () => {
   test("message_stop yields canonical message_stop", () => {
     const ev = rawEventToCanonical({ type: "message_stop" } as Anthropic.RawMessageStreamEvent);
     expect(ev).toEqual({ kind: "message_stop" });
+  });
+
+  test("message_start with null cache fields omits cacheRead/cacheCreate", () => {
+    const ev = rawEventToCanonical({
+      type: "message_start",
+      message: {
+        id: "msg_2",
+        type: "message",
+        role: "assistant",
+        model: "claude-sonnet-4-6",
+        content: [],
+        stop_reason: null,
+        stop_sequence: null,
+        usage: {
+          input_tokens: 7,
+          output_tokens: 0,
+          cache_read_input_tokens: null,
+          cache_creation_input_tokens: null,
+        },
+      },
+    } as unknown as Anthropic.RawMessageStreamEvent);
+    expect(ev).toEqual({ kind: "message_start", usage: { input: 7, output: 0 } });
+  });
+
+  test("content_block_start thinking → canonical thinking block (with signature)", () => {
+    const ev = rawEventToCanonical({
+      type: "content_block_start",
+      index: 0,
+      content_block: {
+        type: "thinking",
+        thinking: "let me reason",
+        signature: "sig-abc",
+      } as Anthropic.RawContentBlockStartEvent["content_block"],
+    } as unknown as Anthropic.RawMessageStreamEvent);
+    expect(ev).toEqual({
+      kind: "content_block_start",
+      index: 0,
+      block: { type: "thinking", thinking: "let me reason", signature: "sig-abc" },
+    });
+  });
+
+  test("content_block_start thinking without signature omits the field", () => {
+    const ev = rawEventToCanonical({
+      type: "content_block_start",
+      index: 0,
+      content_block: {
+        type: "thinking",
+        thinking: "partial",
+        signature: "",
+      } as Anthropic.RawContentBlockStartEvent["content_block"],
+    } as unknown as Anthropic.RawMessageStreamEvent);
+    expect(ev).toEqual({
+      kind: "content_block_start",
+      index: 0,
+      block: { type: "thinking", thinking: "partial" },
+    });
+  });
+
+  test("content_block_start with unmapped block type → null (dropped)", () => {
+    const ev = rawEventToCanonical({
+      type: "content_block_start",
+      index: 2,
+      content_block: {
+        type: "server_tool_use",
+        id: "srv_1",
+        name: "web_search",
+        input: {},
+      } as unknown as Anthropic.RawContentBlockStartEvent["content_block"],
+    } as unknown as Anthropic.RawMessageStreamEvent);
+    expect(ev).toBeNull();
+  });
+
+  test("thinking_delta passes thinking text through", () => {
+    const ev = rawEventToCanonical({
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "thinking_delta", thinking: "more thought" },
+    } as unknown as Anthropic.RawMessageStreamEvent);
+    expect(ev).toEqual({
+      kind: "content_block_delta",
+      index: 0,
+      delta: { type: "thinking_delta", thinking: "more thought" },
+    });
+  });
+
+  test("signature_delta passes signature through", () => {
+    const ev = rawEventToCanonical({
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "signature_delta", signature: "final-sig" },
+    } as unknown as Anthropic.RawMessageStreamEvent);
+    expect(ev).toEqual({
+      kind: "content_block_delta",
+      index: 0,
+      delta: { type: "signature_delta", signature: "final-sig" },
+    });
+  });
+
+  test("unmapped content_block_delta type → null (dropped)", () => {
+    const ev = rawEventToCanonical({
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "citations_delta", citation: {} },
+    } as unknown as Anthropic.RawMessageStreamEvent);
+    expect(ev).toBeNull();
+  });
+
+  test("message_delta without stop_reason or usage yields bare kind", () => {
+    const ev = rawEventToCanonical({
+      type: "message_delta",
+      delta: { stop_reason: null, stop_sequence: null },
+    } as unknown as Anthropic.RawMessageStreamEvent);
+    expect(ev).toEqual({ kind: "message_delta" });
+  });
+
+  test("message_delta usage with missing output_tokens defaults output to 0", () => {
+    const ev = rawEventToCanonical({
+      type: "message_delta",
+      delta: { stop_reason: null, stop_sequence: null },
+      usage: {},
+    } as unknown as Anthropic.RawMessageStreamEvent);
+    expect(ev).toEqual({ kind: "message_delta", usage: { input: 0, output: 0 } });
+  });
+
+  test("unknown top-level event type → null (dropped)", () => {
+    const ev = rawEventToCanonical({
+      type: "ping",
+    } as unknown as Anthropic.RawMessageStreamEvent);
+    expect(ev).toBeNull();
+  });
+});
+
+describe("toAnthropicMessages", () => {
+  test("passes the canonical message array through unchanged", () => {
+    const messages: CanonicalMessage[] = [
+      { role: "user", content: "hi" },
+      { role: "assistant", content: [{ type: "text", text: "hello" }] },
+    ];
+    const out = toAnthropicMessages(messages);
+    expect(out).toEqual(messages as unknown as Anthropic.MessageParam[]);
+  });
+});
+
+describe("toAnthropicSystem", () => {
+  test("maps text blocks, dropping undefined cache_control", () => {
+    const system: CanonicalTextBlockParam[] = [{ type: "text", text: "rules" }];
+    expect(toAnthropicSystem(system)).toEqual([{ type: "text", text: "rules" }]);
+  });
+
+  test("preserves cache_control when present", () => {
+    const system: CanonicalTextBlockParam[] = [
+      { type: "text", text: "big context", cache_control: { type: "ephemeral" } },
+    ];
+    expect(toAnthropicSystem(system)).toEqual([
+      { type: "text", text: "big context", cache_control: { type: "ephemeral" } },
+    ]);
+  });
+
+  test("preserves an explicit null cache_control", () => {
+    const system: CanonicalTextBlockParam[] = [{ type: "text", text: "ctx", cache_control: null }];
+    expect(toAnthropicSystem(system)).toEqual([{ type: "text", text: "ctx", cache_control: null }]);
   });
 });

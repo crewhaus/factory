@@ -1,11 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import {
+  AdapterError,
   CompilerError,
   ConfigError,
   CrewhausError,
   McpConnectionError,
   McpError,
   McpProtocolError,
+  ProviderAuthError,
   RuntimeError,
   SpecParseError,
 } from "./index";
@@ -97,6 +99,54 @@ describe("subclasses", () => {
       code: "mcp",
       message: "connection lost",
       cause: { name: "Error", message: "ECONNREFUSED" },
+    });
+  });
+});
+
+describe("AdapterError", () => {
+  test("tags itself with the adapter code and captures providerId", () => {
+    const err = new AdapterError("openai", "request failed");
+    expect(err).toBeInstanceOf(CrewhausError);
+    expect(err.code).toBe("adapter");
+    expect(err.providerId).toBe("openai");
+    expect(err.message).toBe("request failed");
+    expect(err.name).toBe("AdapterError");
+  });
+
+  test("preserves the underlying SDK error via cause", () => {
+    const sdkErr = new Error("429 rate limited");
+    const err = new AdapterError("anthropic", "upstream error", sdkErr);
+    expect(err.cause).toBe(sdkErr);
+  });
+
+  test("toJSON serializes the cause chain (providerId is not part of the wire shape)", () => {
+    const err = new AdapterError("anthropic", "stream parse failed", new Error("EOF"));
+    expect(err.toJSON()).toEqual({
+      name: "AdapterError",
+      code: "adapter",
+      message: "stream parse failed",
+      cause: { name: "Error", message: "EOF" },
+    });
+  });
+});
+
+describe("ProviderAuthError", () => {
+  test("is an AdapterError with the adapter code and a stable name", () => {
+    const err = new ProviderAuthError("openai", "missing OPENAI_API_KEY");
+    expect(err).toBeInstanceOf(AdapterError);
+    expect(err).toBeInstanceOf(CrewhausError);
+    expect(err.code).toBe("adapter");
+    expect(err.providerId).toBe("openai");
+    expect(err.name).toBe("ProviderAuthError");
+  });
+
+  test("toJSON reports the ProviderAuthError name", () => {
+    const err = new ProviderAuthError("anthropic", "invalid credentials");
+    expect(err.toJSON()).toEqual({
+      name: "ProviderAuthError",
+      code: "adapter",
+      message: "invalid credentials",
+      cause: undefined,
     });
   });
 });

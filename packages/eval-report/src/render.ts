@@ -110,7 +110,7 @@ function aggregateCards(s: EvalRunSummary): string {
 function sampleRow(s: SampleResult, perSample?: LoadedRun["perSample"][string]): string {
   const status = s.error ? "fail" : s.grades.overall.passed ? "pass" : "fail";
   const scoreBar = `<span class="score-bar"><span style="width:${(s.grades.overall.score * 100).toFixed(0)}%"></span></span>`;
-  const drillId = `drill-${s.sampleId}`;
+  const drillId = `drill-${escapeHtml(s.sampleId)}`;
   return `
 <tr>
   <td>${escapeHtml(s.sampleId)}</td>

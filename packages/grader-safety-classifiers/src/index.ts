@@ -177,7 +177,11 @@ export function detectPii(
   const hits: PiiHit[] = [];
   for (const det of detectors) {
     // Reset lastIndex so a single regex instance can be reused across calls.
-    const re = new RegExp(det.regex.source, det.regex.flags);
+    // Force the global flag: `String.prototype.matchAll` throws a TypeError on
+    // a non-global RegExp, and caller-supplied detectors may omit `g`. Detecting
+    // every match is the intended semantics regardless of the source flag.
+    const flags = det.regex.flags.includes("g") ? det.regex.flags : `${det.regex.flags}g`;
+    const re = new RegExp(det.regex.source, flags);
     for (const m of text.matchAll(re)) {
       hits.push({ kind: det.kind, value: m[0] });
     }
@@ -237,8 +241,11 @@ const TOXIC_KEYWORDS: ReadonlyArray<string> = [
 ];
 
 export class MockToxicityClassifier implements Classifier {
-  readonly id = "mock-toxicity";
+  readonly id: string;
   readonly mock = true;
+  constructor(opts: { id?: string } = {}) {
+    this.id = opts.id ?? "mock-toxicity";
+  }
   async classify(text: string): Promise<ClassifierResult> {
     const lower = text.toLowerCase();
     const hits = TOXIC_KEYWORDS.filter((k) => lower.includes(k));
@@ -258,8 +265,11 @@ const BIASED_PHRASES: ReadonlyArray<string> = [
 ];
 
 export class MockBiasClassifier implements Classifier {
-  readonly id = "mock-bias";
+  readonly id: string;
   readonly mock = true;
+  constructor(opts: { id?: string } = {}) {
+    this.id = opts.id ?? "mock-bias";
+  }
   async classify(text: string): Promise<ClassifierResult> {
     const lower = text.toLowerCase();
     const hits = BIASED_PHRASES.filter((p) => lower.includes(p));
@@ -271,8 +281,11 @@ export class MockBiasClassifier implements Classifier {
 }
 
 export class MockPiiClassifier implements Classifier {
-  readonly id = "mock-pii";
+  readonly id: string;
   readonly mock = true;
+  constructor(opts: { id?: string } = {}) {
+    this.id = opts.id ?? "mock-pii";
+  }
   async classify(text: string): Promise<ClassifierResult> {
     const hits = detectPii(text);
     return {

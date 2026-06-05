@@ -1,7 +1,14 @@
 import { describe, expect, test } from "bun:test";
 import { createLogger } from "@crewhaus/logging";
 import { TraceEventBus } from "@crewhaus/trace-event-bus";
-import { DATA_LINEAGE_CAP, createRunContext, pushOrigin, tagContent } from "./index";
+import {
+  type AgentIdentity,
+  DATA_LINEAGE_CAP,
+  createRunContext,
+  formatAgentIdentity,
+  pushOrigin,
+  tagContent,
+} from "./index";
 
 describe("createRunContext defaults", () => {
   test("generates run/session ids with expected prefixes", () => {
@@ -153,5 +160,36 @@ describe("tagContent (Pillar 3 data-lineage)", () => {
     // biome-ignore lint/suspicious/noExplicitAny: testing runtime guard
     tagContent(ctx, 123 as any, "subagent");
     expect(ctx.dataLineage).toBeUndefined();
+  });
+});
+
+describe("formatAgentIdentity", () => {
+  test("undefined identity renders as <top-level>", () => {
+    expect(formatAgentIdentity(undefined)).toBe("<top-level>");
+  });
+
+  test("empty identity object renders as <top-level>", () => {
+    expect(formatAgentIdentity({})).toBe("<top-level>");
+  });
+
+  test("renders a single skillId field", () => {
+    expect(formatAgentIdentity({ skillId: "code-review" })).toBe("skill=code-review");
+  });
+
+  test("renders a single subAgentId field", () => {
+    expect(formatAgentIdentity({ subAgentId: "sub-7" })).toBe("subagent=sub-7");
+  });
+
+  test("renders a single roleId field", () => {
+    expect(formatAgentIdentity({ roleId: "reviewer" })).toBe("role=reviewer");
+  });
+
+  test("joins all present fields in skill;subagent;role order", () => {
+    const id: AgentIdentity = { skillId: "s1", subAgentId: "a1", roleId: "r1" };
+    expect(formatAgentIdentity(id)).toBe("skill=s1;subagent=a1;role=r1");
+  });
+
+  test("omits undefined fields while keeping order for the rest", () => {
+    expect(formatAgentIdentity({ skillId: "s1", roleId: "r1" })).toBe("skill=s1;role=r1");
   });
 });

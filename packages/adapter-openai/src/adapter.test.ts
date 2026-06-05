@@ -1,0 +1,385 @@
+import { describe, expect, test } from "bun:test";
+import type { ProviderRequest, StreamEvent } from "@crewhaus/adapter-anthropic";
+import { AdapterError, ProviderAuthError } from "@crewhaus/errors";
+import type OpenAI from "openai";
+import { OpenAIAdapter, createOpenAIAdapter } from "./adapter.js";
+
+type ChatChunk = OpenAI.Chat.Completions.ChatCompletionChunk;
+
+const REQ: ProviderRequest = {
+  model: "gpt-4o-mini",
+  system: [{ type: "text", text: "be terse" }],
+  messages: [{ role: "user", content: "hi" }],
+  maxTokens: 64,
+};
+
+function mkChunk(
+  delta: Partial<ChatChunk["choices"][number]["delta"]>,
+  finish?: string,
+  usage?: ChatChunk["usage"],
+): ChatChunk {
+  return {
+    id: "c",
+    object: "chat.completion.chunk",
+    created: 0,
+    model: "gpt-4o-mini",
+    choices: [
+      {
+        index: 0,
+        delta: delta as ChatChunk["choices"][number]["delta"],
+        finish_reason: (finish ?? null) as ChatChunk["choices"][number]["finish_reason"],
+        logprobs: null,
+      },
+    ],
+    ...(usage !== undefined ? { usage } : {}),
+  } as ChatChunk;
+}
+
+/**
+ * Build a fake OpenAI client whose `chat.completions.create(params, opts)`
+ * captures the call and returns a value produced by `behaviour`. The real
+ * SDK's streaming `create()` returns a Promise that resolves to an
+ * AsyncIterable; the adapter only awaits then `for await`s it, so the
+ * test surface is just that.
+ */
+function fakeClient(behaviour: {
+  create: (
+    params: OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming,
+    opts: { signal?: AbortSignal },
+  ) => unknown;
+  captured?: {
+    params?: OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming;
+    opts?: { signal?: AbortSignal };
+  };
+}): OpenAI {
+  return {
+    chat: {
+      completions: {
+        create: ((
+          params: OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming,
+          opts: { signal?: AbortSignal },
+        ) => {
+          if (behaviour.captured !== undefined) {
+            behaviour.captured.params = params;
+            behaviour.captured.opts = opts;
+          }
+          return behaviour.create(params, opts);
+        }) as unknown as OpenAI["chat"]["completions"]["create"],
+      },
+    },
+  } as unknown as OpenAI;
+}
+
+async function* gen(chunks: ChatChunk[]): AsyncIterable<ChatChunk> {
+  for (const c of chunks) yield c;
+}
+
+async function drain(stream: AsyncIterable<StreamEvent>): Promise<StreamEvent[]> {
+  const out: StreamEvent[] = [];
+  for await (const e of stream) out.push(e);
+  return out;
+}
+
+describe("OpenAIAdapter", () => {
+  test("providerId + features", () => {
+    const client = fakeClient({ create: () => Promise.resolve(gen([])) });
+    const a = new OpenAIAdapter({ client });
+    expect(a.providerId).toBe("openai");
+    expect(a.features).toEqual({
+      caching: "automatic",
+      tool_use: true,
+      vision: true,
+      thinking: false,
+      web_search: false,
+    });
+  });
+
+  test("stream() translates params and yields canonical StreamEvents", async () => {
+    const captured: {
+      params?: OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming;
+      opts?: { signal?: AbortSignal };
+    } = {};
+    const client = fakeClient({
+      captured,
+      create: () =>
+        Promise.resolve(
+          gen([
+            mkChunk({ role: "assistant", content: "" }),
+            mkChunk({ content: "ok" }),
+            mkChunk({}, "stop", { prompt_tokens: 5, completion_tokens: 1, total_tokens: 6 }),
+          ]),
+        ),
+    });
+    const a = new OpenAIAdapter({ client });
+    const events = await drain(a.stream(REQ));
+    expect(events.map((e) => e.kind)).toEqual([
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop",
+    ]);
+    expect(captured.params?.model).toBe("gpt-4o-mini");
+    expect(captured.params?.stream).toBe(true);
+    // No signal on the request → no signal key forwarded to the SDK.
+    expect(captured.opts).toEqual({});
+  });
+
+  test("stream() forwards req.signal to the SDK when present", async () => {
+    const captured: {
+      params?: OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming;
+      opts?: { signal?: AbortSignal };
+    } = {};
+    const ctrl = new AbortController();
+    const client = fakeClient({
+      captured,
+      create: () =>
+        Promise.resolve(
+          gen([mkChunk({}, "stop", { prompt_tokens: 1, completion_tokens: 0, total_tokens: 1 })]),
+        ),
+    });
+    const a = new OpenAIAdapter({ client });
+    await drain(a.stream({ ...REQ, signal: ctrl.signal }));
+    expect(captured.opts?.signal).toBe(ctrl.signal);
+  });
+
+  test("stream() wraps a synchronous error from create() as AdapterError", async () => {
+    const sdkErr = Object.assign(new Error("boom-sync"), { status: 500 });
+    const client = fakeClient({
+      create: () => {
+        throw sdkErr;
+      },
+    });
+    const a = new OpenAIAdapter({ client });
+    let caught: unknown;
+    try {
+      await drain(a.stream(REQ));
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(AdapterError);
+    expect((caught as AdapterError).providerId).toBe("openai");
+    expect((caught as { error?: { type?: string } }).error?.type).toBe("overloaded_error");
+  });
+
+  test("stream() wraps a rejected create() promise (await raw throws)", async () => {
+    const sdkErr = Object.assign(new Error("boom-await"), { status: 429 });
+    const client = fakeClient({
+      create: () => Promise.reject(sdkErr),
+    });
+    const a = new OpenAIAdapter({ client });
+    let caught: unknown;
+    try {
+      await drain(a.stream(REQ));
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(AdapterError);
+    expect((caught as { status?: number }).status).toBe(429);
+    expect((caught as { error?: { type?: string } }).error?.type).toBe("overloaded_error");
+  });
+
+  test("stream() wraps a mid-stream iteration error", async () => {
+    const sdkErr = Object.assign(new Error("ctx exceeds the model maximum"), { status: 400 });
+    const client = fakeClient({
+      create: () =>
+        Promise.resolve({
+          [Symbol.asyncIterator]() {
+            let done = false;
+            return {
+              next: () => {
+                if (!done) {
+                  done = true;
+                  // First yield message_start path, then throw on second pull.
+                  return Promise.resolve({
+                    value: mkChunk({ content: "partial" }),
+                    done: false,
+                  });
+                }
+                return Promise.reject(sdkErr);
+              },
+            };
+          },
+        }),
+    });
+    const a = new OpenAIAdapter({ client });
+    let caught: unknown;
+    try {
+      await drain(a.stream(REQ));
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(AdapterError);
+    // 400 + "exceeds the model" → prompt-too-long shape.
+    expect((caught as { error?: { type?: string; message?: string } }).error).toEqual({
+      type: "invalid_request_error",
+      message: "Prompt is too long",
+    });
+  });
+
+  test("stream() passes abort errors through untouched (APIUserAbortError)", async () => {
+    const abortErr = Object.assign(new Error("aborted"), { name: "APIUserAbortError" });
+    const client = fakeClient({
+      create: () => Promise.reject(abortErr),
+    });
+    const a = new OpenAIAdapter({ client });
+    let caught: unknown;
+    try {
+      await drain(a.stream(REQ));
+    } catch (err) {
+      caught = err;
+    }
+    // Returned as-is, NOT wrapped.
+    expect(caught).toBe(abortErr);
+    expect(caught).not.toBeInstanceOf(AdapterError);
+  });
+
+  test("stream() passes AbortError through untouched", async () => {
+    const abortErr = Object.assign(new Error("aborted"), { name: "AbortError" });
+    const client = fakeClient({
+      create: () => {
+        throw abortErr;
+      },
+    });
+    const a = new OpenAIAdapter({ client });
+    let caught: unknown;
+    try {
+      await drain(a.stream(REQ));
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBe(abortErr);
+  });
+
+  test("estimateTokens delegates to token-budget heuristic", () => {
+    const client = fakeClient({ create: () => Promise.resolve(gen([])) });
+    const a = new OpenAIAdapter({ client });
+    // 16 chars / 4 = 4 tokens.
+    expect(a.estimateTokens([{ role: "user", content: "0123456789012345" }])).toBe(4);
+  });
+});
+
+describe("normaliseOpenAIError (via stream())", () => {
+  async function streamError(sdkErr: unknown): Promise<unknown> {
+    const client = fakeClient({ create: () => Promise.reject(sdkErr) });
+    const a = new OpenAIAdapter({ client });
+    try {
+      await drain(a.stream(REQ));
+    } catch (err) {
+      return err;
+    }
+    throw new Error("expected stream() to throw");
+  }
+
+  test("400 with context-length message → prompt_too_long shape", async () => {
+    const err = await streamError(
+      Object.assign(new Error("This model's maximum context length is 8192 tokens"), {
+        status: 400,
+      }),
+    );
+    expect((err as { status?: number }).status).toBe(400);
+    expect((err as { error?: unknown }).error).toEqual({
+      type: "invalid_request_error",
+      message: "Prompt is too long",
+    });
+  });
+
+  test("400 without context-length message → generic invalid_request", async () => {
+    const err = await streamError(Object.assign(new Error("bad parameter foo"), { status: 400 }));
+    expect((err as { status?: number }).status).toBe(400);
+    expect((err as { error?: unknown }).error).toEqual({ type: "invalid_request_error" });
+  });
+
+  test("503 → overloaded shape", async () => {
+    const err = await streamError(Object.assign(new Error("upstream down"), { status: 503 }));
+    expect((err as { status?: number }).status).toBe(503);
+    expect((err as { error?: unknown }).error).toEqual({ type: "overloaded_error" });
+  });
+
+  test("other defined status (404) → status copied, no error.type added", async () => {
+    const err = await streamError(Object.assign(new Error("not found"), { status: 404 }));
+    expect((err as { status?: number }).status).toBe(404);
+    expect((err as { error?: unknown }).error).toBeUndefined();
+  });
+
+  test("non-numeric / missing status → no status, no error.type", async () => {
+    const err = await streamError(new Error("plain failure, no status"));
+    expect((err as { status?: number }).status).toBeUndefined();
+    expect((err as { error?: unknown }).error).toBeUndefined();
+    expect(err).toBeInstanceOf(AdapterError);
+    expect((err as AdapterError).message).toBe("plain failure, no status");
+  });
+
+  test("non-Error thrown value → stringified into the wrapped message", async () => {
+    const err = await streamError("just a string");
+    expect(err).toBeInstanceOf(AdapterError);
+    expect((err as AdapterError).message).toBe("just a string");
+    expect((err as { status?: number }).status).toBeUndefined();
+  });
+});
+
+describe("createOpenAIAdapter", () => {
+  test("builds an adapter from OPENAI_API_KEY in env", () => {
+    const a = createOpenAIAdapter({ OPENAI_API_KEY: "sk-test" } as NodeJS.ProcessEnv);
+    expect(a).toBeInstanceOf(OpenAIAdapter);
+    expect(a.providerId).toBe("openai");
+  });
+
+  test("override.apiKey takes precedence over env", () => {
+    const a = createOpenAIAdapter({ OPENAI_API_KEY: "from-env" } as NodeJS.ProcessEnv, {
+      apiKey: "from-override",
+    });
+    expect(a).toBeInstanceOf(OpenAIAdapter);
+  });
+
+  test("baseURL alone (no key) is allowed — uses 'local' placeholder key", () => {
+    // Empty key but a baseURL set → must NOT throw (local endpoint path).
+    const a = createOpenAIAdapter({} as NodeJS.ProcessEnv, {
+      baseURL: "http://127.0.0.1:11434/v1",
+    });
+    expect(a).toBeInstanceOf(OpenAIAdapter);
+  });
+
+  test("baseURL from env (OPENAI_BASE_URL) with no key is allowed", () => {
+    const a = createOpenAIAdapter({
+      OPENAI_BASE_URL: "http://127.0.0.1:8000/v1",
+    } as NodeJS.ProcessEnv);
+    expect(a).toBeInstanceOf(OpenAIAdapter);
+  });
+
+  test("key + baseURL together both supplied", () => {
+    const a = createOpenAIAdapter({} as NodeJS.ProcessEnv, {
+      apiKey: "sk-real",
+      baseURL: "https://proxy.example/v1",
+    });
+    expect(a).toBeInstanceOf(OpenAIAdapter);
+  });
+
+  test("no key and no baseURL → ProviderAuthError", () => {
+    expect(() => createOpenAIAdapter({} as NodeJS.ProcessEnv)).toThrow(ProviderAuthError);
+    try {
+      createOpenAIAdapter({} as NodeJS.ProcessEnv);
+    } catch (err) {
+      expect(err).toBeInstanceOf(ProviderAuthError);
+      expect((err as ProviderAuthError).providerId).toBe("openai");
+      expect((err as Error).message).toContain("OPENAI_API_KEY");
+    }
+  });
+
+  test("defaults to process.env when no env arg is given", () => {
+    // Exercises the `env = process.env` default param. A present API key
+    // alone satisfies the credential check, so OPENAI_BASE_URL is left
+    // untouched. Restore via Reflect.deleteProperty to avoid leaking a
+    // stale value into sibling tests (and biome's noDelete rule).
+    const prevKey = process.env["OPENAI_API_KEY"];
+    process.env["OPENAI_API_KEY"] = "sk-from-process-env";
+    try {
+      const a = createOpenAIAdapter();
+      expect(a).toBeInstanceOf(OpenAIAdapter);
+    } finally {
+      if (prevKey === undefined) Reflect.deleteProperty(process.env, "OPENAI_API_KEY");
+      else process.env["OPENAI_API_KEY"] = prevKey;
+    }
+  });
+});

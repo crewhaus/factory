@@ -1254,3 +1254,104 @@ indexing:
     ).toThrow(/requires retrieve\.collection/);
   });
 });
+
+describe("parseSpec crew target cross-field invariants (Section 22)", () => {
+  // Two-role crew with a configurable `entry:` line and an optional trailing
+  // routing block, so each post-parse invariant is exercised through a real
+  // Zod-valid spec (the cross-field checks run only after safeParse succeeds).
+  const CREW = (entry: string, routing = "") => `
+name: team
+target: crew
+model: m
+entry: ${entry}
+roles:
+  lead:
+    instructions: coordinate the crew
+  worker:
+    instructions: do the work
+${routing}`;
+
+  test("parses a valid crew with match routing and threads roles/entry/routing", () => {
+    const spec = parseSpec(
+      CREW(
+        "lead",
+        [
+          "routing:",
+          "  kind: match",
+          "  match:",
+          "    lead:",
+          "      - contains: help",
+          "        to: worker",
+        ].join("\n"),
+      ),
+    );
+    if (spec.target !== "crew") expect.unreachable();
+    expect(Object.keys(spec.roles)).toEqual(["lead", "worker"]);
+    expect(spec.entry).toBe("lead");
+    expect(spec.routing).toEqual({
+      kind: "match",
+      match: { lead: [{ contains: "help", to: "worker" }] },
+    });
+  });
+
+  test("accepts llm routing (no match block) — the match-validation loop is skipped", () => {
+    const spec = parseSpec(CREW("lead", ["routing:", "  kind: llm"].join("\n")));
+    if (spec.target !== "crew") expect.unreachable();
+    expect(spec.routing).toEqual({ kind: "llm" });
+  });
+
+  test("accepts a crew with no routing block at all", () => {
+    const spec = parseSpec(CREW("worker"));
+    if (spec.target !== "crew") expect.unreachable();
+    expect(spec.routing).toBeUndefined();
+    expect(spec.entry).toBe("worker");
+  });
+
+  test("rejects a crew whose roles record is empty", () => {
+    expect(() => parseSpec("name: t\ntarget: crew\nmodel: m\nentry: lead\nroles: {}\n")).toThrow(
+      /crew target requires at least one role/,
+    );
+  });
+
+  test("rejects a crew whose entry does not name a declared role", () => {
+    expect(() => parseSpec(CREW("ghost"))).toThrow(
+      /crew\.entry "ghost" must name one of crew\.roles \(got: lead, worker\)/,
+    );
+  });
+
+  test("rejects routing whose match source role is not a declared role", () => {
+    expect(() =>
+      parseSpec(
+        CREW(
+          "lead",
+          [
+            "routing:",
+            "  kind: match",
+            "  match:",
+            "    ghost:",
+            "      - contains: x",
+            "        to: worker",
+          ].join("\n"),
+        ),
+      ),
+    ).toThrow(/crew\.routing\.match\["ghost"\]: source role not in crew\.roles/);
+  });
+
+  test("rejects routing whose match target role is not a declared role", () => {
+    expect(() =>
+      parseSpec(
+        CREW(
+          "lead",
+          [
+            "routing:",
+            "  kind: match",
+            "  match:",
+            "    lead:",
+            "      - contains: x",
+            "        to: ghost",
+          ].join("\n"),
+        ),
+      ),
+    ).toThrow(/crew\.routing\.match\["lead"\]\.to = "ghost" — target role not in crew\.roles/);
+  });
+});

@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { CrewhausError } from "@crewhaus/errors";
 import type { IrManagedV0 } from "@crewhaus/ir";
-import { emitManaged } from "./index";
+import { TargetEmitError, emitManaged } from "./index";
 
 const ir: IrManagedV0 = {
   version: 0,
@@ -68,5 +69,32 @@ describe("emitManaged", () => {
     for (const f of bundle.files) {
       expect(f.content).toContain("DO NOT EDIT");
     }
+  });
+});
+
+describe("TargetEmitError", () => {
+  test("is a compiler-coded CrewhausError carrying message and cause", () => {
+    const cause = new Error("underlying");
+    const err = new TargetEmitError("emit failed", cause);
+    expect(err).toBeInstanceOf(TargetEmitError);
+    expect(err).toBeInstanceOf(CrewhausError);
+    expect(err.name).toBe("TargetEmitError");
+    expect(err.code).toBe("compiler");
+    expect(err.message).toBe("emit failed");
+    expect(err.cause).toBe(cause);
+  });
+
+  test("constructs without a cause", () => {
+    const err = new TargetEmitError("emit failed");
+    expect(err.name).toBe("TargetEmitError");
+    expect(err.code).toBe("compiler");
+    expect(err.cause).toBeUndefined();
+    // Serializes through the CrewhausError contract.
+    expect(err.toJSON()).toEqual({
+      name: "TargetEmitError",
+      code: "compiler",
+      message: "emit failed",
+      cause: undefined,
+    });
   });
 });

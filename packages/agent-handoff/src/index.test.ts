@@ -93,6 +93,38 @@ describe("createHandoffTool", () => {
     expect(bridgeNoMailbox).toContain("crew mailbox is not available");
   });
 
+  test("surfaces an Error thrown by requestHandoff as a clean tool error", async () => {
+    const { mailbox } = makeMailbox(["a", "b"]);
+    mailbox.requestHandoff = () => {
+      throw new Error("refusal-loop guard tripped at depth 2");
+    };
+    const tool = createHandoffTool({ from: "a", targets: ["a", "b"] });
+
+    const result = await tool.execute(
+      { target: "b", reason: "please take over" },
+      { bridge: { crewMailbox: mailbox } as never },
+    );
+
+    expect(result).toBe("[Handoff error] refusal-loop guard tripped at depth 2");
+  });
+
+  test("falls back to String(err) when a thrown value has no message", async () => {
+    const { mailbox } = makeMailbox(["a", "b"]);
+    // Throw a non-Error value whose `.message` is nullish so the
+    // `(err as Error).message ?? String(err)` fallback branch is exercised.
+    mailbox.requestHandoff = () => {
+      throw "mailbox exploded";
+    };
+    const tool = createHandoffTool({ from: "a", targets: ["a", "b"] });
+
+    const result = await tool.execute(
+      { target: "b", reason: "please take over" },
+      { bridge: { crewMailbox: mailbox } as never },
+    );
+
+    expect(result).toBe("[Handoff error] mailbox exploded");
+  });
+
   test("flag profile: read-only, not destructive, opted out of output classifier", () => {
     const tool = createHandoffTool({ from: "a", targets: ["a", "b"] });
     expect(tool.readOnly).toBe(true);

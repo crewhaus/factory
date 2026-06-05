@@ -1,6 +1,6 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { createCipheriv, createHash, randomBytes } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createEnvVarBackend, createSecrets } from "@crewhaus/secrets-manager";
@@ -8,6 +8,10 @@ import {
   AuditEncryptionError,
   type EncryptedRecord,
   InMemoryDekStore,
+  _decryptBytesForTest,
+  _deriveKekKeyForTest,
+  _deriveKekKeyLegacyForTest,
+  _encryptBytesForTest,
   createAuditEncryption,
   createFileDekStore,
   staticKekProvider,
@@ -498,6 +502,317 @@ describe("#163/#164 follow-up — persistent FileDekStore across restart", () =>
     await enc.encryptPayload({ x: 1 }, "tenant-b");
     const tenants = await store.tenants?.();
     expect([...(tenants ?? [])].sort()).toEqual(["tenant-a", "tenant-b"]);
+  });
+});
+
+describe("FileDekStore get/set (non-versioned DekStore surface)", () => {
+  const tmpDirs: string[] = [];
+  function freshDir(): string {
+    const d = mkdtempSync(join(tmpdir(), "audit-enc-getset-"));
+    tmpDirs.push(d);
+    return d;
+  }
+  afterAll(() => {
+    for (const d of tmpDirs) rmSync(d, { recursive: true, force: true });
+  });
+
+  const V1 = "kek-v1-secret-12345678";
+  const V1_REF = "kek:KEK_TEST:v1";
+
+  test("get returns undefined for an unknown tenant", async () => {
+    const dir = freshDir();
+    const store = createFileDekStore(dir, staticKekProvider({ kekRef: V1_REF, kekValue: V1 }));
+    expect(await store.get("nobody")).toBeUndefined();
+  });
+
+  test("set then get round-trips the raw DEK through wrap/unwrap", async () => {
+    const dir = freshDir();
+    const store = createFileDekStore(dir, staticKekProvider({ kekRef: V1_REF, kekValue: V1 }));
+    const dek = randomBytes(32);
+    await store.set("tenant-a", dek);
+    const got = await store.get("tenant-a");
+    expect(got).toBeDefined();
+    // The plain get/set surface persists+restores the exact DEK bytes.
+    expect(Buffer.from(got as Buffer).equals(dek)).toBe(true);
+    // Persisted as version 1 with a reset use-count.
+    const entry = await store.getEntry?.("tenant-a");
+    expect(entry?.version).toBe(1);
+    expect(entry?.uses).toBe(0);
+  });
+
+  test("set preserves the existing version on overwrite (prev.version branch)", async () => {
+    const dir = freshDir();
+    const store = createFileDekStore(dir, staticKekProvider({ kekRef: V1_REF, kekValue: V1 }));
+    // Seed a v3 entry via the versioned surface...
+    await store.setEntry?.("tenant-a", { dek: randomBytes(32), version: 3, uses: 7 });
+    // ...then a plain set must keep version 3 (prev?.version ?? 1 -> 3) and
+    // reset uses to 0.
+    const replacement = randomBytes(32);
+    await store.set("tenant-a", replacement);
+    const entry = await store.getEntry?.("tenant-a");
+    expect(entry?.version).toBe(3);
+    expect(entry?.uses).toBe(0);
+    expect(Buffer.from(entry?.dek as Buffer).equals(replacement)).toBe(true);
+  });
+});
+
+describe("get/set-only DekStore (engine fallback to non-versioned surface)", () => {
+  // A store exposing ONLY get/set — no getEntry/setEntry/tenants. Exercises
+  // the engine's readEntry/writeEntry fallbacks and the rotateKek no-op when
+  // the store cannot iterate tenants.
+  class MinimalDekStore {
+    readonly map = new Map<string, Buffer>();
+    async get(tenantId: string): Promise<Buffer | undefined> {
+      const v = this.map.get(tenantId);
+      return v === undefined ? undefined : Buffer.from(v);
+    }
+    async set(tenantId: string, dek: Buffer): Promise<void> {
+      this.map.set(tenantId, Buffer.from(dek));
+    }
+  }
+
+  test("encrypt+decrypt round-trips and the DEK is treated as version 1", async () => {
+    setKek("KEK_TEST", "kek-secret-12345678");
+    const secrets = createSecrets({ backend: createEnvVarBackend() });
+    const store = new MinimalDekStore();
+    const enc = await createAuditEncryption({ secrets, kekName: "KEK_TEST", dekStore: store });
+    const rec = await enc.encryptPayload({ x: 1 }, "tenant-a");
+    expect(rec.dekRef).toBe("dek:tenant-a:v1");
+    expect(await enc.decryptPayload(rec)).toEqual({ x: 1 });
+    // The engine persisted a 32-byte DEK via the plain set surface.
+    expect((await store.get("tenant-a"))?.length).toBe(32);
+  });
+
+  test("a stored DEK of the wrong length is treated as missing and re-minted", async () => {
+    setKek("KEK_TEST", "kek-secret-12345678");
+    const secrets = createSecrets({ backend: createEnvVarBackend() });
+    const store = new MinimalDekStore();
+    // Pre-seed a malformed (too-short) DEK: readEntry must reject it.
+    store.map.set("tenant-a", Buffer.from("short"));
+    const enc = await createAuditEncryption({ secrets, kekName: "KEK_TEST", dekStore: store });
+    const rec = await enc.encryptPayload({ x: 1 }, "tenant-a");
+    expect(rec.dekRef).toBe("dek:tenant-a:v1");
+    // It overwrote the malformed value with a real 32-byte DEK.
+    expect((await store.get("tenant-a"))?.length).toBe(32);
+    expect(await enc.decryptPayload(rec)).toEqual({ x: 1 });
+  });
+
+  test("rotateKek is a no-op on the store when tenants() is unavailable", async () => {
+    setKek("KEK_TEST", "kek-v1-secret-12345678");
+    const secrets = createSecrets({ backend: createEnvVarBackend() });
+    const store = new MinimalDekStore();
+    const enc = await createAuditEncryption({ secrets, kekName: "KEK_TEST", dekStore: store });
+    const before = await enc.encryptPayload({ era: "v1" }, "tenant-a");
+    // No tenants() -> rotation cannot re-mint per tenant, but must not throw
+    // and historical records must still decrypt.
+    await enc.rotateKek("kek-v2-secret-87654321", "kek:KEK_TEST:v2");
+    expect(enc.kekRef).toBe("kek:KEK_TEST:v2");
+    expect(await enc.decryptPayload(before)).toEqual({ era: "v1" });
+    const after = await enc.encryptPayload({ era: "v2" }, "tenant-a");
+    expect(after.kekRef).toBe("kek:KEK_TEST:v2");
+    expect(await enc.decryptPayload(after)).toEqual({ era: "v2" });
+  });
+});
+
+describe("auto-subscribed rotation via secrets.onRotation", () => {
+  test("a rotation event for the configured KEK re-keys and stays decryptable", async () => {
+    setKek("KEK_TEST", "kek-v1-secret-12345678");
+    const store = new InMemoryDekStore();
+    const secrets = createSecrets({ backend: createEnvVarBackend() });
+    const enc = await createAuditEncryption({ secrets, kekName: "KEK_TEST", dekStore: store });
+
+    const before = await enc.encryptPayload({ era: "v1" }, "tenant-a");
+    expect(before.kekRef).toBe("kek:KEK_TEST:v1");
+
+    // Firing the backend rotation drives the engine's onRotation handler
+    // (no direct rotateKek call). Await it so the async handler settles.
+    await secrets.rotate("KEK_TEST", { newValue: "kek-v2-secret-87654321" });
+
+    // The engine adopted the rotated value: its kekRef now carries the
+    // `kek:KEK_TEST:<rotatedAt>` shape the handler mints.
+    expect(enc.kekRef).toMatch(/^kek:KEK_TEST:\d+$/);
+    expect(enc.kekRef).not.toBe("kek:KEK_TEST:v1");
+
+    // Pre-rotation record still decrypts; new writes use the rotated KEK.
+    expect(await enc.decryptPayload(before)).toEqual({ era: "v1" });
+    const after = await enc.encryptPayload({ era: "v2" }, "tenant-a");
+    expect(after.kekRef).toBe(enc.kekRef);
+    expect(await enc.decryptPayload(after)).toEqual({ era: "v2" });
+  });
+
+  test("a failing event-driven rotation does not surface an unhandled rejection", async () => {
+    // Regression: the onRotation handler used to fire-and-forget the re-key
+    // with a bare `void rotateInternal(...)`. If that promise rejected
+    // (e.g. a DEK-store failure mid-rotation), the rejection escaped as an
+    // unhandledRejection and could crash the host process. The handler now
+    // contains the rejection with `.catch`.
+    class ExplodingTenantsStore extends InMemoryDekStore {
+      override async tenants(): Promise<ReadonlyArray<string>> {
+        throw new Error("boom: tenants() unavailable during rotation");
+      }
+    }
+    setKek("KEK_TEST", "kek-v1-secret-12345678");
+    const secrets = createSecrets({ backend: createEnvVarBackend() });
+    const store = new ExplodingTenantsStore();
+    const enc = await createAuditEncryption({ secrets, kekName: "KEK_TEST", dekStore: store });
+    const before = await enc.encryptPayload({ era: "v1" }, "tenant-a");
+
+    const rejections: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => {
+      rejections.push(reason);
+    };
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      // Drive the event-rotation; rotateInternal will reject inside tenants().
+      await secrets.rotate("KEK_TEST", { newValue: "kek-v2-secret-87654321" });
+      // Let any unhandled rejection surface on the macrotask queue.
+      await new Promise((r) => setTimeout(r, 10));
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+
+    expect(rejections).toHaveLength(0);
+    // The synchronous half of the rotation still adopted the new KEK, and
+    // the pre-rotation record remains decryptable.
+    expect(enc.kekRef).toMatch(/^kek:KEK_TEST:\d+$/);
+    expect(await enc.decryptPayload(before)).toEqual({ era: "v1" });
+  });
+
+  test("a rotation event for a different secret name is ignored", async () => {
+    setKek("KEK_TEST", "kek-v1-secret-12345678");
+    setKek("OTHER_SECRET", "unrelated-value-000000");
+    const secrets = createSecrets({ backend: createEnvVarBackend() });
+    const enc = await createAuditEncryption({ secrets, kekName: "KEK_TEST" });
+    const refBefore = enc.kekRef;
+    // Rotating a secret this engine does not care about must not change its
+    // KEK (exercises the name-guard early return in the handler).
+    await secrets.rotate("OTHER_SECRET", { newValue: "rotated-unrelated-1111" });
+    expect(enc.kekRef).toBe(refBefore);
+    const rec = await enc.encryptPayload({ x: 1 }, "tenant-a");
+    expect(rec.kekRef).toBe(refBefore);
+    expect(await enc.decryptPayload(rec)).toEqual({ x: 1 });
+  });
+});
+
+describe("maxRecordsPerDek guard", () => {
+  test("a non-positive maxRecordsPerDek falls back to the default (no premature roll)", async () => {
+    setKek("KEK_TEST", "kek-secret-12345678");
+    const secrets = createSecrets({ backend: createEnvVarBackend() });
+    const store = new InMemoryDekStore();
+    // 0 is not > 0, so the default threshold applies and the DEK does not
+    // roll on every record.
+    const enc = await createAuditEncryption({
+      secrets,
+      kekName: "KEK_TEST",
+      dekStore: store,
+      maxRecordsPerDek: 0,
+    });
+    const a = await enc.encryptPayload({ n: 1 }, "tenant-a");
+    const b = await enc.encryptPayload({ n: 2 }, "tenant-a");
+    expect(a.dekRef).toBe("dek:tenant-a:v1");
+    expect(b.dekRef).toBe("dek:tenant-a:v1");
+  });
+});
+
+describe("explicit kekRef option", () => {
+  test("a custom boot kekRef is stamped on records and used for decrypt", async () => {
+    setKek("KEK_TEST", "kek-secret-12345678");
+    const secrets = createSecrets({ backend: createEnvVarBackend() });
+    const enc = await createAuditEncryption({
+      secrets,
+      kekName: "KEK_TEST",
+      kekRef: "kek:KEK_TEST:custom-boot",
+    });
+    expect(enc.kekRef).toBe("kek:KEK_TEST:custom-boot");
+    const rec = await enc.encryptPayload({ x: 1 }, "tenant-a");
+    expect(rec.kekRef).toBe("kek:KEK_TEST:custom-boot");
+    expect(await enc.decryptPayload(rec)).toEqual({ x: 1 });
+  });
+
+  test("a retained KEK under the boot ref does not shadow the boot value", async () => {
+    // Boot KEK occupies kek:KEK_TEST:v1; a stale retained entry under the
+    // same ref must be ignored (the !has guard in createAuditEncryption).
+    setKek("KEK_TEST", "real-boot-kek-12345678");
+    const secrets = createSecrets({ backend: createEnvVarBackend() });
+    const enc = await createAuditEncryption({
+      secrets,
+      kekName: "KEK_TEST",
+      retainedKeks: [{ kekRef: "kek:KEK_TEST:v1", kekValue: "stale-shadow-value-000" }],
+    });
+    // If the stale value had shadowed the boot value, decrypt would fail
+    // (different scrypt key). It round-trips because the boot value wins.
+    const rec = await enc.encryptPayload({ x: 1 }, "tenant-a");
+    expect(await enc.decryptPayload(rec)).toEqual({ x: 1 });
+  });
+});
+
+describe("decryptPayload — non-JSON plaintext", () => {
+  test("a record whose decrypted plaintext is not JSON throws AuditEncryptionError", async () => {
+    setKek("KEK_TEST", "kek-secret-12345678");
+    const secrets = createSecrets({ backend: createEnvVarBackend() });
+    const store = new InMemoryDekStore();
+    const enc = await createAuditEncryption({ secrets, kekName: "KEK_TEST", dekStore: store });
+
+    // Encrypt a real record to obtain a valid wrapped DEK + kekSalt, then
+    // hand-build a payload ciphertext over NON-JSON bytes under the same DEK
+    // so unwrap succeeds but JSON.parse fails.
+    const seed = await enc.encryptPayload({ ok: true }, "tenant-a");
+    const dek = (await store.get("tenant-a")) as Buffer;
+    const badIv = randomBytes(12);
+    const c = createCipheriv("aes-256-gcm", dek, badIv);
+    const ct = Buffer.concat([c.update(Buffer.from("not-json{", "utf8")), c.final()]);
+    const tag = c.getAuthTag();
+    const bad: EncryptedRecord = {
+      ...seed,
+      iv: badIv.toString("hex"),
+      tag: tag.toString("hex"),
+      encryptedPayload: ct.toString("hex"),
+    };
+    await expect(enc.decryptPayload(bad)).rejects.toThrow(/not valid JSON/);
+  });
+});
+
+describe("corrupt persisted DEK file", () => {
+  const tmpDirs: string[] = [];
+  function freshDir(): string {
+    const d = mkdtempSync(join(tmpdir(), "audit-enc-corrupt-"));
+    tmpDirs.push(d);
+    return d;
+  }
+  afterAll(() => {
+    for (const d of tmpDirs) rmSync(d, { recursive: true, force: true });
+  });
+
+  test("a non-JSON DEK file surfaces a clear AuditEncryptionError", async () => {
+    const dir = freshDir();
+    const V1 = "kek-v1-secret-12345678";
+    const V1_REF = "kek:KEK_TEST:v1";
+    const store = createFileDekStore(dir, staticKekProvider({ kekRef: V1_REF, kekValue: V1 }));
+    // Hand-write garbage into the tenant's DEK file.
+    writeFileSync(join(dir, "dek-tenant-a.json"), "{ this is not json", "utf8");
+    await expect(store.get("tenant-a")).rejects.toThrow(/corrupt DEK file/);
+    await expect(store.getEntry?.("tenant-a")).rejects.toThrow(/corrupt DEK file/);
+  });
+});
+
+describe("low-level crypto test seams", () => {
+  test("encryptBytes/decryptBytes round-trip", () => {
+    const key = randomBytes(32);
+    const iv = randomBytes(12);
+    const { ciphertext, tag } = _encryptBytesForTest(Buffer.from("hello world"), key, iv);
+    const out = _decryptBytesForTest(ciphertext, key, iv, tag);
+    expect(out.toString("utf8")).toBe("hello world");
+  });
+
+  test("deriveKekKey is salt-dependent and 32 bytes; legacy derivation is bare SHA-256", () => {
+    const salt = randomBytes(16);
+    const k1 = _deriveKekKeyForTest("kek-value", salt);
+    const k2 = _deriveKekKeyForTest("kek-value", randomBytes(16));
+    expect(k1.length).toBe(32);
+    // Different salt => different derived key.
+    expect(k1.equals(k2)).toBe(false);
+    const legacy = _deriveKekKeyLegacyForTest("kek-value");
+    expect(legacy.equals(createHash("sha256").update("kek-value").digest())).toBe(true);
   });
 });
 

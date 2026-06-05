@@ -252,10 +252,22 @@ export async function createIsolatedContext(
   });
 
   const sessionRootDir = opts.sessionRootDir ?? parent.sessionRootDir;
-  const eventLog = await openEventLog(
-    runContext.sessionId,
-    sessionRootDir !== undefined ? { rootDir: sessionRootDir } : {},
-  );
+
+  // openEventLog touches the filesystem (mkdirSync) and can reject. If it does,
+  // tear down the abortTree first so the listener createAbortTree attached to
+  // the parent's signal is removed (see abort-controller's attachParent) —
+  // otherwise a parent that survives many failed spawns accumulates dead abort
+  // listeners on its signal.
+  let eventLog: EventLog;
+  try {
+    eventLog = await openEventLog(
+      runContext.sessionId,
+      sessionRootDir !== undefined ? { rootDir: sessionRootDir } : {},
+    );
+  } catch (err) {
+    abortTree.abort();
+    throw err;
+  }
 
   const state: Store<Record<string, unknown>> = createStore({});
 

@@ -87,3 +87,55 @@ describe("createDriver", () => {
     await expect(d.click(0, 0)).rejects.toThrow(/not connected/);
   });
 });
+
+describe("host backend stub (createDriver → host)", () => {
+  const d = createDriver({ backend: "host" });
+
+  test("connect rejects with the kickoff-forbidden diagnostic", async () => {
+    await expect(d.connect()).rejects.toThrow(/host backend is not implemented in v0/);
+  });
+
+  test("every operation rejects as not implemented", async () => {
+    await expect(d.goto("https://x.com")).rejects.toThrow(/host backend not implemented/);
+    await expect(d.screenshot()).rejects.toThrow(/host backend not implemented/);
+    await expect(d.click(1, 2)).rejects.toThrow(/host backend not implemented/);
+    await expect(d.type("x")).rejects.toThrow(/host backend not implemented/);
+    await expect(d.key("Enter")).rejects.toThrow(/host backend not implemented/);
+    await expect(d.scroll(0, 0)).rejects.toThrow(/host backend not implemented/);
+    await expect(d.getViewport()).rejects.toThrow(/host backend not implemented/);
+  });
+
+  test("disconnect is a silent no-op", async () => {
+    await expect(d.disconnect()).resolves.toBeUndefined();
+  });
+
+  test("operation rejections are ComputerUseDriverError instances", async () => {
+    await expect(d.click(0, 0)).rejects.toBeInstanceOf(ComputerUseDriverError);
+  });
+});
+
+describe("remote backend stub (createDriver → remote)", () => {
+  const d = createDriver({ backend: "remote" });
+
+  test("connect rejects (v0 stub)", async () => {
+    await expect(d.connect()).rejects.toThrow(/remote backend.*not implemented in v0/);
+  });
+
+  test("every operation rejects as not implemented", async () => {
+    await expect(d.goto("https://x.com")).rejects.toThrow(/remote backend not implemented/);
+    await expect(d.screenshot()).rejects.toThrow(/remote backend not implemented/);
+    await expect(d.click(1, 2)).rejects.toThrow(/remote backend not implemented/);
+    await expect(d.type("x")).rejects.toThrow(/remote backend not implemented/);
+    await expect(d.key("Enter")).rejects.toThrow(/remote backend not implemented/);
+    await expect(d.scroll(0, 0)).rejects.toThrow(/remote backend not implemented/);
+    await expect(d.getViewport()).rejects.toThrow(/remote backend not implemented/);
+  });
+
+  test("disconnect is a silent no-op", async () => {
+    await expect(d.disconnect()).resolves.toBeUndefined();
+  });
+
+  test("operation rejections are ComputerUseDriverError instances", async () => {
+    await expect(d.type("x")).rejects.toBeInstanceOf(ComputerUseDriverError);
+  });
+});

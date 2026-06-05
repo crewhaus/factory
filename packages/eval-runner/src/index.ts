@@ -144,10 +144,15 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
 
   const settled = await Promise.allSettled(
     samples.map(async (sample) => {
+      const release = await sem.acquire();
+      // Check *after* acquiring the slot: every callback's synchronous prefix
+      // runs during `.map()` (before any SIGINT can fire), so a pre-acquire
+      // check would never observe a mid-run interrupt. Samples still queued on
+      // the semaphore when SIGINT arrives are skipped here as their turn comes.
       if (interrupted) {
+        release();
         throw new RunnerError(`run interrupted before sample "${sample.id}"`);
       }
-      const release = await sem.acquire();
       try {
         return await runSample({
           sample,

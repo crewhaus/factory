@@ -154,30 +154,6 @@ class InMemoryVectorStore implements VectorStore {
   }
 }
 
-class NotImplementedVectorStore implements VectorStore {
-  readonly backend: VectorBackendId;
-  constructor(backend: VectorBackendId) {
-    this.backend = backend;
-  }
-  private fail(): never {
-    throw new VectorStoreError(
-      `vector-store backend "${this.backend}" is not implemented in v0 — use "in-memory" for tests or wire your own adapter`,
-    );
-  }
-  async upsert(): Promise<void> {
-    this.fail();
-  }
-  async query(): Promise<ReadonlyArray<Hit>> {
-    this.fail();
-  }
-  async delete(): Promise<void> {
-    this.fail();
-  }
-  async count(): Promise<number> {
-    this.fail();
-  }
-}
-
 export function createVectorStore(opts: VectorStoreOptions): VectorStore {
   switch (opts.backend) {
     case "in-memory":

@@ -153,6 +153,78 @@ describe("generateContractTools", () => {
     expect(r.inputs).toEqual(["0xrecipient", "0x64"]);
   });
 
+  test("payable function adds an optional value field and forwards it to the executor", async () => {
+    const PAYABLE_ABI: ReadonlyArray<AbiItem> = [
+      {
+        type: "function",
+        name: "deposit",
+        inputs: [{ name: "to", type: "address" }],
+        outputs: [],
+        stateMutability: "payable",
+      },
+    ];
+    let received: { value?: string; inputs: ReadonlyArray<unknown>; methodName: string } | null =
+      null;
+    const tools = generateContractTools({
+      contract: CONTRACT,
+      abi: PAYABLE_ABI,
+      readExecutor: async () => "0x",
+      writeExecutor: async (args) => {
+        received = { value: args.value, inputs: args.inputs, methodName: args.methodName };
+        return JSON.stringify({ txHash: "0xpay" });
+      },
+    });
+    const deposit = tools.find((t) => t.name === "usdc__deposit");
+    if (deposit === undefined) throw new Error("deposit tool not generated");
+
+    // The payable branch extends the schema with an optional `value` field.
+    const schema = deposit.inputSchema as unknown as {
+      safeParse: (v: unknown) => { success: boolean };
+    };
+    expect(
+      schema.safeParse({ walletId: "treasury", to: "0xrcv", value: "0x16345785d8a0000" }).success,
+    ).toBe(true);
+    // value is optional — a call without it still validates.
+    expect(schema.safeParse({ walletId: "treasury", to: "0xrcv" }).success).toBe(true);
+
+    const out = await deposit.execute({
+      walletId: "treasury",
+      to: "0xrcv",
+      value: "0x16345785d8a0000",
+    });
+    expect(out).toContain("0xpay");
+    const r = received as unknown as { value?: string; methodName: string };
+    expect(r.value).toBe("0x16345785d8a0000");
+    expect(r.methodName).toBe("deposit");
+  });
+
+  test("payable function omits value from executor args when not provided", async () => {
+    const PAYABLE_ABI: ReadonlyArray<AbiItem> = [
+      {
+        type: "function",
+        name: "deposit",
+        inputs: [],
+        outputs: [],
+        stateMutability: "payable",
+      },
+    ];
+    let sawValueKey = true;
+    const tools = generateContractTools({
+      contract: CONTRACT,
+      abi: PAYABLE_ABI,
+      readExecutor: async () => "0x",
+      writeExecutor: async (args) => {
+        sawValueKey = "value" in args;
+        return "{}";
+      },
+    });
+    const deposit = tools.find((t) => t.name === "usdc__deposit");
+    if (deposit === undefined) throw new Error("deposit tool not generated");
+    await deposit.execute({ walletId: "treasury" });
+    // value is undefined → the spread omits the key entirely.
+    expect(sawValueKey).toBe(false);
+  });
+
   test("write tool throws when walletId is missing", async () => {
     const tools = generateContractTools({
       contract: CONTRACT,

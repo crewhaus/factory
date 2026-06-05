@@ -33,7 +33,11 @@ export class MigrationError extends CrewhausError {
 }
 
 export class MigrationEngine {
-  private readonly migrations = new Map<string, Migration>();
+  private readonly migrations: Map<string, Migration>;
+
+  constructor() {
+    this.migrations = new Map<string, Migration>();
+  }
 
   register(m: Migration): void {
     if (m.from === m.to) {

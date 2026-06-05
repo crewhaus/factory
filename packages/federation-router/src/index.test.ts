@@ -365,4 +365,85 @@ describe("subscribe / unsubscribe semantics", () => {
     });
     expect(events.length).toBe(2); // no new events after unsubscribe
   });
+
+  test("a throwing subscriber neither crashes call() nor blocks other subscribers", async () => {
+    const goodEvents: RouterTraceEvent[] = [];
+    let throwingCalls = 0;
+    const router = createFederationRouter({
+      fromDeployment: "deployment-a",
+      credentials: {
+        caCertPem: certs.caCertPem,
+        clientCertPem: certs.clientCertPem,
+        clientKeyPem: certs.clientKeyPem,
+        pinnedFingerprint: certs.pinnedFingerprint,
+      },
+      discovery: fakeDiscovery({}),
+      transport: async () => ({ status: 200, body: '{"reply":"ok"}' }),
+    });
+    // Register the throwing subscriber FIRST so we prove a later subscriber
+    // still fires even when an earlier one throws.
+    router.subscribe(() => {
+      throwingCalls++;
+      throw new Error("subscriber boom");
+    });
+    router.subscribe((e) => goodEvents.push(e));
+
+    const result = await router.call({
+      fromRole: "r",
+      to: { deployment: "deployment-b.example", role: "x" },
+      payload: "p",
+    });
+
+    expect(result.reply).toBe("ok");
+    expect(throwingCalls).toBe(2); // start + end, both threw, both swallowed
+    expect(goodEvents.length).toBe(2); // healthy subscriber unaffected
+  });
+});
+
+describe("envelope construction defaults (kind + traceparent)", () => {
+  function captureEnvelope(callKind?: "question" | "answer" | "notify") {
+    const captured: FederationEnvelope[] = [];
+    const transport: FederationTransport = async (_url, envelope) => {
+      captured.push(envelope);
+      return { status: 200, body: JSON.stringify({ reply: "ok" }) };
+    };
+    const router = createFederationRouter({
+      fromDeployment: "deployment-a",
+      credentials: {
+        caCertPem: certs.caCertPem,
+        clientCertPem: certs.clientCertPem,
+        clientKeyPem: certs.clientKeyPem,
+        pinnedFingerprint: certs.pinnedFingerprint,
+      },
+      discovery: fakeDiscovery({}),
+      transport,
+      // Intentionally NO currentTraceparent — exercise the placeholder branch.
+    });
+    return { captured, router, callKind };
+  }
+
+  test("explicit kind is carried through verbatim (non-default branch)", async () => {
+    const { captured, router } = captureEnvelope();
+    await router.call({
+      fromRole: "researcher",
+      to: { deployment: "deployment-b.example", role: "code-reviewer" },
+      payload: "fyi",
+      kind: "notify",
+    });
+    expect(captured[0]?.kind).toBe("notify");
+  });
+
+  test("omitting currentTraceparent emits the all-zero placeholder traceparent", async () => {
+    const { captured, router } = captureEnvelope();
+    await router.call({
+      fromRole: "researcher",
+      to: { deployment: "deployment-b.example", role: "code-reviewer" },
+      payload: "fyi",
+    });
+    // The documented placeholder OTel rejects — proves the `?? PLACEHOLDER`
+    // fallback fires when no traceparent provider is wired.
+    expect(captured[0]?.traceparent).toBe(
+      "00-00000000000000000000000000000000-0000000000000000-00",
+    );
+  });
 });

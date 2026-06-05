@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CitationTrackerError, createCitationTracker, newRunId } from "./index.js";
@@ -132,6 +132,157 @@ describe("createCitationTracker", () => {
       const fs = await import("node:fs");
       fs.appendFileSync(path, "not-json\n");
       expect(() => createCitationTracker({ runId, rootDir: root })).toThrow(CitationTrackerError);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("malformed jsonl in citations.jsonl surfaces as a CitationTrackerError", () => {
+    const root = newRoot();
+    const runId = newRunId();
+    const path = join(root, runId, "citations.jsonl");
+    try {
+      const t = createCitationTracker({ runId, rootDir: root });
+      t.recordCitation({ url: "u", snippet: "s" });
+      appendFileSync(path, "{not valid json\n");
+      expect(() => createCitationTracker({ runId, rootDir: root })).toThrow(CitationTrackerError);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("getFetchRecord returns metadata for a known URL and undefined otherwise", () => {
+    const root = newRoot();
+    try {
+      const t = createCitationTracker({ rootDir: root });
+      expect(t.getFetchRecord("missing")).toBeUndefined();
+      const rec = t.recordFetch({ url: "u", content: "the body", branchId: "b7" });
+      const got = t.getFetchRecord("u");
+      expect(got).toEqual(rec);
+      expect(got?.sha256).toMatch(/^[0-9a-f]{64}$/);
+      expect(got?.contentBytes).toBe(Buffer.byteLength("the body", "utf8"));
+      expect(got?.branchId).toBe("b7");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("getFetchedContent returns undefined for an unknown URL", () => {
+    const root = newRoot();
+    try {
+      const t = createCitationTracker({ rootDir: root });
+      expect(t.getFetchedContent("never-fetched")).toBeUndefined();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("listFetches returns all fetch records in append order", () => {
+    const root = newRoot();
+    try {
+      const t = createCitationTracker({ rootDir: root });
+      expect(t.listFetches()).toEqual([]);
+      t.recordFetch({ url: "first", content: "1" });
+      t.recordFetch({ url: "second", content: "2" });
+      // Idempotent re-record must NOT add a second entry.
+      t.recordFetch({ url: "first", content: "1-again" });
+      const urls = t.listFetches().map((r) => r.url);
+      expect(urls).toEqual(["first", "second"]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("listFetches survives kill-and-resume in append order", () => {
+    const root = newRoot();
+    const runId = newRunId();
+    try {
+      const t1 = createCitationTracker({ runId, rootDir: root });
+      t1.recordFetch({ url: "a", content: "ka" });
+      t1.recordFetch({ url: "b", content: "kb" });
+      const t2 = createCitationTracker({ runId, rootDir: root });
+      expect(t2.listFetches().map((r) => r.url)).toEqual(["a", "b"]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("recordCitation carries branchId and supportingClaim through to disk", () => {
+    const root = newRoot();
+    const runId = newRunId();
+    try {
+      const t = createCitationTracker({ runId, rootDir: root });
+      const c = t.recordCitation({
+        url: "u",
+        snippet: "s",
+        branchId: "branch-9",
+        supportingClaim: "supports: target shapes list",
+      });
+      expect(c.branchId).toBe("branch-9");
+      expect(c.supportingClaim).toBe("supports: target shapes list");
+
+      // Round-trips verbatim through the JSONL on resume.
+      const reopened = createCitationTracker({ runId, rootDir: root });
+      const persisted = reopened.listCitationsOrdered()[0];
+      expect(persisted?.branchId).toBe("branch-9");
+      expect(persisted?.supportingClaim).toBe("supports: target shapes list");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("now() injection makes retrievedAt deterministic", () => {
+    const root = newRoot();
+    try {
+      const fixed = new Date("2030-01-02T03:04:05.000Z");
+      const t = createCitationTracker({ rootDir: root, now: () => fixed });
+      const f = t.recordFetch({ url: "u", content: "x" });
+      expect(f.retrievedAt).toBe("2030-01-02T03:04:05.000Z");
+      // Citation with no prior fetch also stamps via now().
+      const c = t.recordCitation({ url: "other", snippet: "s" });
+      expect(c.retrievedAt).toBe("2030-01-02T03:04:05.000Z");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("newRunId produces well-formed, accepted run ids", () => {
+    const root = newRoot();
+    try {
+      const id = newRunId();
+      expect(id).toMatch(/^run_[0-9a-f]{16}$/);
+      // A freshly-minted id must be accepted by the validator.
+      const t = createCitationTracker({ runId: id, rootDir: root });
+      expect(t.runId).toBe(id);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("security: a tampered sha256 in fetches.jsonl cannot traverse out of the cache dir", () => {
+    const root = newRoot();
+    const runId = newRunId();
+    try {
+      // Boot once to create the run dir, then overwrite fetches.jsonl with a
+      // record whose sha256 is a path-traversal payload. A secret file lives
+      // two levels up (the runId dir) at a guessable name.
+      createCitationTracker({ runId, rootDir: root });
+      const secretPath = join(root, runId, "stolen.txt");
+      writeFileSync(secretPath, "TOP SECRET CONTENTS");
+      // cache/<sha256>.txt -> cache/../stolen.txt resolves to the secret file.
+      const evilRecord = {
+        version: 1,
+        url: "https://victim.example/x",
+        retrievedAt: "2030-01-01T00:00:00.000Z",
+        sha256: "../stolen",
+        contentBytes: 19,
+      };
+      writeFileSync(join(root, runId, "fetches.jsonl"), `${JSON.stringify(evilRecord)}\n`);
+
+      const t = createCitationTracker({ runId, rootDir: root });
+      expect(t.hasFetched("https://victim.example/x")).toBe(true);
+      // The guard must refuse the malformed sha256 rather than read the secret.
+      expect(t.getFetchedContent("https://victim.example/x")).toBeUndefined();
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

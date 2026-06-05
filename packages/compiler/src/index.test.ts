@@ -1,6 +1,13 @@
 import { describe, expect, test } from "bun:test";
-import { parseSpec } from "@crewhaus/spec";
-import { SpecParseError, compile, lower } from "./index";
+import type { IrNode } from "@crewhaus/ir";
+import { type Spec, parseSpec } from "@crewhaus/spec";
+import {
+  SpecParseError,
+  assertChainGameLowered,
+  assertToolScopesStrict,
+  compile,
+  lower,
+} from "./index";
 
 const MINIMAL_SPEC = `
 name: hello
@@ -838,5 +845,1020 @@ steps:
     const withFlag = compile(SPEC_INTERNAL_TOOLS, { strict: true }).files[0]?.content;
     const without = compile(SPEC_INTERNAL_TOOLS).files[0]?.content;
     expect(without).toBe(withFlag);
+  });
+});
+
+describe("assertToolScopesStrict (exported gate, used directly by non-CLI emit paths)", () => {
+  test("throws CompilerError when an IR references an outward-by-name sink", () => {
+    const ir = lower(
+      parseSpec(`
+name: leaky
+target: cli
+agent:
+  model: m
+  instructions: i
+tools:
+  - mcp__evil__exfiltrate
+`),
+    );
+    expect(() => assertToolScopesStrict(ir)).toThrow(/\[strict\]/);
+    expect(() => assertToolScopesStrict(ir)).toThrow(/mcp__evil__exfiltrate/);
+  });
+
+  test("is a no-op for an IR whose tools are all internal-compute built-ins", () => {
+    const ir = lower(
+      parseSpec(`
+name: clean
+target: cli
+agent:
+  model: m
+  instructions: i
+tools:
+  - read
+  - bash
+`),
+    );
+    expect(() => assertToolScopesStrict(ir)).not.toThrow();
+  });
+
+  test("audits the six definitionally-outward built-in names (not just mcp__*)", () => {
+    // SendMessage is in OUTWARD_TOOL_NAMES — the gate must flag it even though
+    // it is not an mcp__ sink. Drives the OUTWARD_TOOL_NAMES branch of
+    // isOutwardName from compile()'s perspective.
+    const ir = lower(
+      parseSpec(`
+name: msg
+target: cli
+agent:
+  model: m
+  instructions: i
+tools:
+  - SendMessage
+`),
+    );
+    expect(() => assertToolScopesStrict(ir)).toThrow(/SendMessage/);
+  });
+});
+
+describe("compile({ applyIrPasses: true }) — Section 28 ir-passes opt-in", () => {
+  test("runs the passes pipeline and still emits a bundle (minimal CLI is a pass-through)", () => {
+    const bundle = compile(MINIMAL_SPEC, { applyIrPasses: true });
+    expect(bundle.files).toHaveLength(1);
+    expect(bundle.files[0]?.path).toBe("agent.ts");
+  });
+
+  test("a minimal CLI spec emits identical output with and without the passes flag", () => {
+    const withPasses = compile(MINIMAL_SPEC, { applyIrPasses: true }).files[0]?.content;
+    const without = compile(MINIMAL_SPEC).files[0]?.content;
+    expect(withPasses).toBe(without);
+  });
+});
+
+describe("lower — CLI banner + TUI block (Phase 3 §3.3 / Phase 2 M2.2)", () => {
+  test("lowers a random-mode banner with taglines and a non-basic tui", () => {
+    const ir = lower(
+      parseSpec(`
+name: cl
+target: cli
+agent:
+  model: m
+  instructions: i
+cli:
+  banner:
+    taglineMode: random
+    taglines:
+      - hello
+      - world
+  tui: rich
+`),
+    );
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect(ir.cli).toEqual({
+      banner: { taglineMode: "random", taglines: ["hello", "world"] },
+      tui: "rich",
+    });
+  });
+
+  test("a cli block with neither banner nor a non-basic tui lowers to an empty cli object", () => {
+    // banner omitted (so the banner spread is skipped) and tui defaults to
+    // "basic" (so the tui spread is skipped) → ir.cli is present but empty.
+    const ir = lower(
+      parseSpec(`
+name: cl
+target: cli
+agent:
+  model: m
+  instructions: i
+cli:
+  tui: basic
+`),
+    );
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect(ir.cli).toEqual({});
+  });
+
+  test("a banner without a tui override carries the banner and omits tui", () => {
+    const ir = lower(
+      parseSpec(`
+name: cl
+target: cli
+agent:
+  model: m
+  instructions: i
+cli:
+  banner:
+    taglineMode: static
+    taglines:
+      - solo tagline
+`),
+    );
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect(ir.cli).toEqual({
+      banner: { taglineMode: "static", taglines: ["solo tagline"] },
+    });
+    expect("tui" in (ir.cli ?? {})).toBe(false);
+  });
+
+  test("compile() succeeds end-to-end with a banner + rich tui CLI spec", () => {
+    const bundle = compile(`
+name: cl
+target: cli
+agent:
+  model: m
+  instructions: i
+cli:
+  banner:
+    taglineMode: static
+    taglines:
+      - ready
+  tui: rich
+`);
+    expect(bundle.files).toHaveLength(1);
+  });
+});
+
+describe("lower/compile — graph target (Section 19)", () => {
+  const GRAPH_SPEC = `
+name: g
+target: graph
+model: graph-model
+entry: a
+nodes:
+  a:
+    instructions: do a
+    model: node-model
+    tools:
+      - bash
+    hitl:
+      prompt: approve a?
+  b:
+    instructions: do b
+edges:
+  - from: a
+    to: b
+`;
+
+  test("emits a bundle and preserves node order, per-node model + hitl prompt", () => {
+    const ir = lower(parseSpec(GRAPH_SPEC));
+    if (ir.target !== "graph") throw new Error("unexpected target");
+    expect(ir.nodes.map((n) => n.name)).toEqual(["a", "b"]);
+    expect(ir.nodes[0]?.model).toBe("node-model");
+    // node "b" inherits the graph-level model fallback.
+    expect(ir.nodes[1]?.model).toBe("graph-model");
+    expect(ir.nodes[0]).toHaveProperty("hitlPrompt", "approve a?");
+    expect(ir.nodes[1]).not.toHaveProperty("hitlPrompt");
+    expect(ir.edges).toEqual([{ from: "a", to: "b" }]);
+    const bundle = compile(GRAPH_SPEC);
+    expect(bundle.files.length).toBeGreaterThan(0);
+  });
+});
+
+describe("lower/compile — managed target (Section 20)", () => {
+  test("lowers tenant budgets verbatim and emits a multi-file bundle", () => {
+    const spec = `
+name: mg
+target: managed
+agent:
+  model: m
+  instructions: i
+tenants:
+  - id: t1
+    budget:
+      maxInputTokens: 1000
+      maxOutputTokens: 2000
+`;
+    const ir = lower(parseSpec(spec));
+    if (ir.target !== "managed") throw new Error("unexpected target");
+    expect(ir.tenants).toEqual([
+      { id: "t1", budget: { maxInputTokens: 1000, maxOutputTokens: 2000 } },
+    ]);
+    const bundle = compile(spec);
+    expect(bundle.files.map((f) => f.path)).toContain("daemon.ts");
+  });
+});
+
+describe("lower/compile — crew target (Section 22)", () => {
+  const CREW_SPEC = `
+name: cr
+target: crew
+model: crew-model
+entry: lead
+roles:
+  lead:
+    instructions: lead it
+    tools:
+      - bash
+    tool_config:
+      bash:
+        timeout: 1000
+    sub_agents:
+      helper-sub:
+        description: helps
+        instructions: help out
+  zebra:
+    instructions: trail role
+    model: zebra-model
+routing:
+  kind: match
+  match:
+    lead:
+      - contains: hi
+        to: zebra
+`;
+
+  test("sorts roles by name, resolves per-role model fallback, lowers routing", () => {
+    const ir = lower(parseSpec(CREW_SPEC));
+    if (ir.target !== "crew") throw new Error("unexpected target");
+    // Roles are sorted: "lead" < "zebra".
+    expect(ir.roles.map((r) => r.name)).toEqual(["lead", "zebra"]);
+    // "lead" omits model → inherits crew-level fallback; "zebra" overrides.
+    expect(ir.roles[0]?.model).toBe("crew-model");
+    expect(ir.roles[1]?.model).toBe("zebra-model");
+    // Sub-agents lowered on the role.
+    expect(ir.roles[0]?.subAgents).toHaveLength(1);
+    expect(ir.roles[0]?.subAgents[0]?.name).toBe("helper-sub");
+    expect(ir.routing).toEqual({
+      kind: "match",
+      match: { lead: [{ contains: "hi", to: "zebra" }] },
+    });
+    const bundle = compile(CREW_SPEC);
+    expect(bundle.files.length).toBeGreaterThan(0);
+  });
+
+  test("omits routing from the IR when the spec has no routing block", () => {
+    const ir = lower(
+      parseSpec(`
+name: cr2
+target: crew
+model: m
+entry: only
+roles:
+  only:
+    instructions: solo
+`),
+    );
+    if (ir.target !== "crew") throw new Error("unexpected target");
+    expect("routing" in ir).toBe(false);
+  });
+
+  test("lowers an llm routing block without a match map", () => {
+    const ir = lower(
+      parseSpec(`
+name: cr3
+target: crew
+model: m
+entry: only
+roles:
+  only:
+    instructions: solo
+routing:
+  kind: llm
+`),
+    );
+    if (ir.target !== "crew") throw new Error("unexpected target");
+    expect(ir.routing).toEqual({ kind: "llm" });
+  });
+});
+
+describe("lower/compile — research target (Section 23 RES)", () => {
+  test("lowers retrieve allowlists + optional vectorBackend and emits", () => {
+    const spec = `
+name: rs
+target: research
+agent:
+  model: m
+  instructions: i
+goal: find stuff
+branchingFactor: 4
+maxDurationMs: 120000
+retrieve:
+  allowedOrigins:
+    - https://example.com
+  allowedFileRoots:
+    - /tmp/docs
+  vectorBackend: lance
+tools:
+  - bash
+`;
+    const ir = lower(parseSpec(spec));
+    if (ir.target !== "research") throw new Error("unexpected target");
+    expect(ir.goal).toBe("find stuff");
+    expect(ir.branchingFactor).toBe(4);
+    expect(ir.retrieve.allowedOrigins).toEqual(["https://example.com"]);
+    expect(ir.retrieve.allowedFileRoots).toEqual(["/tmp/docs"]);
+    expect(ir.retrieve.vectorBackend).toBe("lance");
+    expect(compile(spec).files.length).toBeGreaterThan(0);
+  });
+
+  test("omits vectorBackend from retrieve when the spec omits it", () => {
+    const ir = lower(
+      parseSpec(`
+name: rs2
+target: research
+agent:
+  model: m
+  instructions: i
+goal: g
+`),
+    );
+    if (ir.target !== "research") throw new Error("unexpected target");
+    expect("vectorBackend" in ir.retrieve).toBe(false);
+  });
+});
+
+describe("lower/compile — batch target (Section 23 BATCH)", () => {
+  test("lowers queue config (renew interval + seed jobs) and emits", () => {
+    const spec = `
+name: bt
+target: batch
+agent:
+  model: m
+  instructions: i
+queue:
+  adapter: in-memory
+  visibilityTimeoutMs: 15000
+  visibilityRenewIntervalMs: 5000
+  maxRetries: 5
+  seedJobs:
+    - "{\\"x\\":1}"
+concurrency: 8
+idempotencyWindowMs: 30000
+tools:
+  - bash
+`;
+    const ir = lower(parseSpec(spec));
+    if (ir.target !== "batch") throw new Error("unexpected target");
+    expect(ir.queue.adapter).toBe("in-memory");
+    expect(ir.queue.visibilityRenewIntervalMs).toBe(5000);
+    expect(ir.queue.seedJobs).toEqual(['{"x":1}']);
+    expect(ir.concurrency).toBe(8);
+    expect(compile(spec).files.length).toBeGreaterThan(0);
+  });
+
+  test("omits optional queue fields when the spec omits them", () => {
+    const ir = lower(
+      parseSpec(`
+name: bt2
+target: batch
+agent:
+  model: m
+  instructions: i
+queue:
+  adapter: in-memory
+`),
+    );
+    if (ir.target !== "batch") throw new Error("unexpected target");
+    expect("visibilityRenewIntervalMs" in ir.queue).toBe(false);
+    expect("seedJobs" in ir.queue).toBe(false);
+  });
+});
+
+describe("lower/compile — voice target (Section 24 VOICE)", () => {
+  test("lowers voice block + optional telephony and emits", () => {
+    const spec = `
+name: vc
+target: voice
+agent:
+  model: m
+  instructions: i
+voice:
+  provider: openai
+  voiceId: nova
+  vad: server
+  bargeInTriggerFrames: 5
+  bargeInWindowMs: 300
+telephony:
+  provider: twilio
+tools:
+  - bash
+`;
+    const ir = lower(parseSpec(spec));
+    if (ir.target !== "voice") throw new Error("unexpected target");
+    expect(ir.voice.provider).toBe("openai");
+    expect(ir.voice.voiceId).toBe("nova");
+    expect(ir.telephony).toEqual({ provider: "twilio" });
+    expect(compile(spec).files.length).toBeGreaterThan(0);
+  });
+
+  test("omits telephony from the IR when the spec omits it", () => {
+    const ir = lower(
+      parseSpec(`
+name: vc2
+target: voice
+agent:
+  model: m
+  instructions: i
+voice:
+  provider: vapi
+`),
+    );
+    if (ir.target !== "voice") throw new Error("unexpected target");
+    expect("telephony" in ir).toBe(false);
+  });
+});
+
+describe("lower/compile — browser target (Section 25 BROW)", () => {
+  test("lowers driver (startUrl) + grounding model override and emits", () => {
+    const spec = `
+name: br
+target: browser
+agent:
+  model: agent-model
+  instructions: i
+driver:
+  backend: chromium
+  viewport:
+    width: 800
+    height: 600
+  startUrl: https://example.com/
+groundingModel: ground-model
+tools:
+  - bash
+`;
+    const ir = lower(parseSpec(spec));
+    if (ir.target !== "browser") throw new Error("unexpected target");
+    expect(ir.driver.backend).toBe("chromium");
+    expect(ir.driver.viewport).toEqual({ width: 800, height: 600 });
+    expect(ir.driver).toHaveProperty("startUrl", "https://example.com/");
+    expect(ir.groundingModel).toBe("ground-model");
+    expect(compile(spec).files.length).toBeGreaterThan(0);
+  });
+
+  test("defaults groundingModel to the agent model and omits startUrl when absent", () => {
+    const ir = lower(
+      parseSpec(`
+name: br2
+target: browser
+agent:
+  model: only-model
+  instructions: i
+`),
+    );
+    if (ir.target !== "browser") throw new Error("unexpected target");
+    expect(ir.groundingModel).toBe("only-model");
+    expect("startUrl" in ir.driver).toBe(false);
+  });
+});
+
+describe("lower/compile — eval target (Section 29)", () => {
+  test("lowers dataset + graders (with/without opts) + seed and emits", () => {
+    const spec = `
+name: ev
+target: eval
+agent:
+  model: m
+  instructions: i
+  tools:
+    - bash
+dataset:
+  name: ds
+  version: v1
+  split: test
+graders:
+  - name: exact
+    opts:
+      k: 1
+  - name: contains
+seed: 42
+`;
+    const ir = lower(parseSpec(spec));
+    if (ir.target !== "eval") throw new Error("unexpected target");
+    expect(ir.dataset).toEqual({ name: "ds", version: "v1", split: "test" });
+    expect(ir.graders[0]).toEqual({ name: "exact", opts: { k: 1 } });
+    expect(ir.graders[1]).toEqual({ name: "contains" });
+    expect(ir.seed).toBe(42);
+    expect(compile(spec).files.length).toBeGreaterThan(0);
+  });
+
+  test("omits seed from the IR when the spec omits it", () => {
+    const ir = lower(
+      parseSpec(`
+name: ev2
+target: eval
+agent:
+  model: m
+  instructions: i
+dataset:
+  name: ds
+  version: v1
+graders:
+  - name: exact
+`),
+    );
+    if (ir.target !== "eval") throw new Error("unexpected target");
+    expect("seed" in ir).toBe(false);
+  });
+});
+
+describe("lower/compile — onchain target (Section 47)", () => {
+  // Exercises all three trigger kinds, kms:// keyRef, quorum rpcPolicy,
+  // safe finality, tx policy with maxValueUsd, and the emit dispatch.
+  const ONCHAIN_SPEC = `
+name: oc
+target: onchain
+agent:
+  model: m
+  instructions: i
+chains:
+  - id: base
+    kind: evm
+    rpcUrls:
+      - $RPC
+    rpcPolicy: quorum
+    finality:
+      kind: safe
+    reorgTolerant: false
+wallets:
+  - id: w
+    chainId: base
+    custody: kms
+    signingPolicy: policy-gated
+    keyRef: kms://aws/key
+contracts:
+  - id: c
+    chainId: base
+    address: "0xC"
+    abiRef: abi://c
+transaction_policy:
+  defaultWriteApproval: policy
+  maxValueUsd: 1000
+  allowedContracts:
+    - c
+  simulationRequired: false
+triggers:
+  - kind: event
+    chainId: base
+    contract: c
+    event: Transfer
+    filter:
+      from: "0x0"
+  - kind: event
+    chainId: base
+    contract: c
+    event: Approval
+  - kind: block
+    chainId: base
+    scanIntervalMs: 30000
+  - kind: address
+    chainId: base
+    address: "0xWATCH"
+    direction: in
+`;
+
+  test("lowers chains/wallets/contracts/tx-policy and all trigger kinds, then emits", () => {
+    const ir = lower(parseSpec(ONCHAIN_SPEC));
+    if (ir.target !== "onchain") throw new Error("unexpected target");
+    expect(ir.chains[0]?.finality).toEqual({ kind: "safe" });
+    expect(ir.chains[0]?.rpcPolicy).toBe("quorum");
+    expect(ir.wallets[0]?.keyRef).toEqual({ kind: "literal", value: "kms://aws/key" });
+    expect(ir.transactionPolicy.maxValueUsd).toBe(1000);
+    expect(ir.triggers.map((t) => t.kind)).toEqual(["event", "event", "block", "address"]);
+    // event trigger with filter retains it; the second event trigger omits it.
+    const firstEvent = ir.triggers[0];
+    if (firstEvent?.kind !== "event") throw new Error("expected event trigger");
+    expect(firstEvent).toHaveProperty("filter");
+    const secondEvent = ir.triggers[1];
+    if (secondEvent?.kind !== "event") throw new Error("expected event trigger");
+    expect("filter" in secondEvent).toBe(false);
+    expect(compile(ONCHAIN_SPEC).files.length).toBeGreaterThan(0);
+  });
+
+  test("applies tx-policy + wallet defaults when the spec omits both blocks", () => {
+    // No wallets, no transaction_policy → onchain branch fills the defaults.
+    const ir = lower(
+      parseSpec(`
+name: oc2
+target: onchain
+agent:
+  model: m
+  instructions: i
+chains:
+  - id: base
+    kind: evm
+    rpcUrls:
+      - $RPC
+    finality:
+      kind: finalized
+triggers:
+  - kind: block
+    chainId: base
+    scanIntervalMs: 60000
+`),
+    );
+    if (ir.target !== "onchain") throw new Error("unexpected target");
+    expect(ir.wallets).toEqual([]);
+    expect(ir.contracts).toEqual([]);
+    expect(ir.transactionPolicy).toEqual({
+      defaultWriteApproval: "required",
+      allowedContracts: [],
+      simulationRequired: true,
+    });
+    expect(ir.chains[0]?.finality).toEqual({ kind: "finalized" });
+  });
+});
+
+describe("lower/compile — onchain-game target (Section 47)", () => {
+  const GAME_SPEC = (extra: string) => `
+name: og
+target: onchain-game
+agent:
+  model: m
+  instructions: i
+chain:
+  id: base
+  kind: evm
+  rpcUrls:
+    - $RPC
+  finality:
+    kind: confirmations
+    count: 3
+wallet:
+  id: w
+  chainId: base
+  custody: local
+  signingPolicy: automated
+  keyRef: $WK
+game:
+  contract:
+    id: gc
+    chainId: base
+    address: "0xGAME"
+    abiRef: abi://game
+  stateReader: readState
+${extra}
+tools:
+  - bash
+`;
+
+  test("inlines chain/wallet/contract, lowers all optional game fields, then emits", () => {
+    const ir = lower(
+      parseSpec(
+        GAME_SPEC(
+          [
+            "  actionsContract: doMove",
+            "  moveTimeoutMs: 5000",
+            "  objective: win the game",
+            "  turnSemantics: real-time",
+          ].join("\n"),
+        ),
+      ),
+    );
+    if (ir.target !== "onchain-game") throw new Error("unexpected target");
+    expect(ir.chain.id).toBe("base");
+    expect(ir.chain.finality).toEqual({ kind: "confirmations", count: 3 });
+    expect(ir.wallet.keyRef).toEqual({ kind: "env", name: "WK" });
+    expect(ir.game.contract.address).toBe("0xGAME");
+    expect(ir.game).toHaveProperty("actionsContract", "doMove");
+    expect(ir.game).toHaveProperty("moveTimeoutMs", 5000);
+    expect(ir.game).toHaveProperty("objective", "win the game");
+    expect(ir.game.turnSemantics).toBe("real-time");
+    expect(compile(GAME_SPEC("  actionsContract: doMove"))).toBeDefined();
+  });
+
+  test("omits all optional game fields when the spec provides only the required ones", () => {
+    const ir = lower(parseSpec(GAME_SPEC("")));
+    if (ir.target !== "onchain-game") throw new Error("unexpected target");
+    expect("actionsContract" in ir.game).toBe(false);
+    expect("moveTimeoutMs" in ir.game).toBe(false);
+    expect("objective" in ir.game).toBe(false);
+    // turnSemantics has a schema default of "turn-based".
+    expect(ir.game.turnSemantics).toBe("turn-based");
+    // No transaction_policy block → default policy is applied.
+    expect(ir.transactionPolicy).toEqual({
+      defaultWriteApproval: "required",
+      allowedContracts: [],
+      simulationRequired: true,
+    });
+  });
+});
+
+describe("lower — channel secret lowering for every channel kind (Section 12)", () => {
+  test("lowers telegram, discord, whatsapp and imessage secrets to env refs", () => {
+    const ir = lower(
+      parseSpec(`
+name: ch
+target: channel
+agent:
+  model: m
+  instructions: i
+channels:
+  telegram:
+    botToken: $TG_BOT
+    secretToken: $TG_SECRET
+  discord:
+    applicationId: $DC_APP
+    botToken: $DC_BOT
+    publicKeyHex: $DC_KEY
+  whatsapp:
+    phoneNumberId: $WA_PHONE
+    accessToken: $WA_TOKEN
+    appSecret: $WA_SECRET
+  imessage:
+    chatDbPath: $IM_DB
+    cursorPath: $IM_CURSOR
+routing:
+  sessionKey: user
+`),
+    );
+    if (ir.target !== "channel") throw new Error("unexpected target");
+    expect(ir.channels.telegram?.botToken).toEqual({ kind: "env", name: "TG_BOT" });
+    expect(ir.channels.telegram?.secretToken).toEqual({ kind: "env", name: "TG_SECRET" });
+    expect(ir.channels.discord?.applicationId).toEqual({ kind: "env", name: "DC_APP" });
+    expect(ir.channels.discord?.botToken).toEqual({ kind: "env", name: "DC_BOT" });
+    expect(ir.channels.discord?.publicKeyHex).toEqual({ kind: "env", name: "DC_KEY" });
+    expect(ir.channels.whatsapp?.phoneNumberId).toEqual({ kind: "env", name: "WA_PHONE" });
+    expect(ir.channels.whatsapp?.accessToken).toEqual({ kind: "env", name: "WA_TOKEN" });
+    expect(ir.channels.whatsapp?.appSecret).toEqual({ kind: "env", name: "WA_SECRET" });
+    expect(ir.channels.imessage?.chatDbPath).toEqual({ kind: "env", name: "IM_DB" });
+    expect(ir.channels.imessage?.cursorPath).toEqual({ kind: "env", name: "IM_CURSOR" });
+  });
+
+  test("lowers a Slack appToken when present (optional third secret)", () => {
+    const ir = lower(
+      parseSpec(`
+name: ch
+target: channel
+agent:
+  model: m
+  instructions: i
+channels:
+  slack:
+    botToken: $SLACK_BOT
+    signingSecret: $SLACK_SIGN
+    appToken: $SLACK_APP
+routing:
+  sessionKey: thread
+`),
+    );
+    if (ir.target !== "channel") throw new Error("unexpected target");
+    expect(ir.channels.slack?.appToken).toEqual({ kind: "env", name: "SLACK_APP" });
+  });
+
+  test("omits empty imessage config (no chatDbPath/cursorPath) — both optional", () => {
+    const ir = lower(
+      parseSpec(`
+name: ch
+target: channel
+agent:
+  model: m
+  instructions: i
+channels:
+  imessage: {}
+routing:
+  sessionKey: thread
+`),
+    );
+    if (ir.target !== "channel") throw new Error("unexpected target");
+    expect(ir.channels.imessage).toEqual({});
+  });
+});
+
+describe("lower — sub-agents normalisation (Section 13)", () => {
+  test("sorts sub-agents by name and applies inherit/inherit_bypass/tools defaults", () => {
+    const ir = lower(
+      parseSpec(`
+name: cl
+target: cli
+agent:
+  model: m
+  instructions: i
+  sub_agents:
+    zeta:
+      description: z
+      instructions: zi
+    alpha:
+      description: a
+      instructions: ai
+      tools:
+        - bash
+      model: alpha-model
+      permissions: scoped
+      inherit_bypass: true
+`),
+    );
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    // Sorted by name: alpha < zeta.
+    expect(ir.subAgents.map((s) => s.name)).toEqual(["alpha", "zeta"]);
+    const alpha = ir.subAgents[0];
+    expect(alpha?.tools).toEqual(["bash"]);
+    expect(alpha?.model).toBe("alpha-model");
+    expect(alpha?.permissions).toBe("scoped");
+    expect(alpha?.inheritBypass).toBe(true);
+    // zeta uses the lower-time defaults.
+    const zeta = ir.subAgents[1];
+    expect(zeta?.tools).toEqual([]);
+    expect(zeta?.permissions).toBe("inherit");
+    expect(zeta?.inheritBypass).toBe(false);
+    expect("model" in (zeta ?? {})).toBe(false);
+  });
+});
+
+describe("lower — tool_config + failure_taxonomy normalisation", () => {
+  test("freezes a non-empty tool_config map onto the IR", () => {
+    const ir = lower(
+      parseSpec(`
+name: cl
+target: cli
+agent:
+  model: m
+  instructions: i
+tools:
+  - bash
+tool_config:
+  bash:
+    timeout: 2500
+`),
+    );
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect(ir.toolConfigs).toEqual({ bash: { timeout: 2500 } });
+    expect(Object.isFrozen(ir.toolConfigs)).toBe(true);
+  });
+
+  test("lowers failure_taxonomy entries, preserving order and per-entry hint presence", () => {
+    const ir = lower(
+      parseSpec(`
+name: cl
+target: cli
+agent:
+  model: m
+  instructions: i
+failure_taxonomy:
+  - class: net
+    pattern: ETIMEDOUT
+    recovery: retry
+    hint: back off and retry
+  - class: fatal
+    pattern: SIGKILL
+    recovery: fail
+`),
+    );
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect(ir.failureTaxonomy).toEqual([
+      { class: "net", pattern: "ETIMEDOUT", recovery: "retry", hint: "back off and retry" },
+      { class: "fatal", pattern: "SIGKILL", recovery: "fail" },
+    ]);
+  });
+
+  test("omits failureTaxonomy from the IR for an empty failure_taxonomy list", () => {
+    // An explicit empty array lowers the same as an omitted block.
+    const ir = lower(
+      parseSpec(`
+name: cl
+target: cli
+agent:
+  model: m
+  instructions: i
+failure_taxonomy: []
+`),
+    );
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect("failureTaxonomy" in ir).toBe(false);
+  });
+});
+
+describe("lower — heartbeat duration parsing (Phase 3 §3.1)", () => {
+  // The channel heartbeat is the only call site of parseDurationToMs. Each unit
+  // is exercised through a parsed, valid channel spec so the lowering is real.
+  const channelWith = (every: string): Spec =>
+    parseSpec(`
+name: ch
+target: channel
+agent:
+  model: m
+  instructions: i
+channels:
+  slack:
+    botToken: x
+    signingSecret: y
+routing:
+  sessionKey: thread
+heartbeat:
+  every: ${every}
+  instructions: tick
+gateway:
+  port: 9090
+  ui: false
+`);
+
+  test.each([
+    ["500ms", 500],
+    ["45s", 45_000],
+    ["30m", 1_800_000],
+    ["2h", 7_200_000],
+  ])("parses %s heartbeat to %d ms and threads gateway config", (every, expectedMs) => {
+    const ir = lower(channelWith(every));
+    if (ir.target !== "channel") throw new Error("unexpected target");
+    expect(ir.heartbeat?.everyMs).toBe(expectedMs);
+    expect(ir.heartbeat?.instructions).toBe("tick");
+    expect(ir.gateway).toEqual({ port: 9090, ui: false });
+  });
+});
+
+describe("lower — defensive guards reached via the exported lower() entry point", () => {
+  // lower() is a public, exported entry point with documented preconditions
+  // (callers that drive it directly rather than through compile()/parseSpec).
+  // These tests feed it Spec-typed objects that the static type permits but
+  // parseSpec's runtime validation would reject, to cover the guards that
+  // exist precisely for that direct-call surface.
+
+  test("onchain with an empty chains[] throws (guard at the onchain branch)", () => {
+    const badOnchain = {
+      version: 0,
+      name: "oc",
+      target: "onchain",
+      agent: { model: "m", instructions: "i" },
+      chains: [],
+      wallets: [],
+      contracts: [],
+      transaction_policy: {
+        defaultWriteApproval: "required",
+        allowedContracts: [],
+        simulationRequired: true,
+      },
+      triggers: [{ kind: "block", chainId: "base", scanIntervalMs: 30000 }],
+      idempotencyWindowMs: 60000,
+    } as unknown as Spec;
+    expect(() => lower(badOnchain)).toThrow(/onchain target requires chains\[\] to be non-empty/);
+  });
+
+  test("a channel heartbeat duration that escaped spec validation throws", () => {
+    const badChannel = {
+      name: "ch",
+      target: "channel",
+      agent: { model: "m", instructions: "i" },
+      channels: { slack: { botToken: "x", signingSecret: "y" } },
+      routing: { sessionKey: "thread" },
+      heartbeat: { every: "bogus", instructions: "i" },
+    } as unknown as Spec;
+    expect(() => lower(badChannel)).toThrow(/invalid duration "bogus"/);
+  });
+
+  test("an unknown target throws the assertNever exhaustiveness guard in lower()", () => {
+    const unknownTarget = { name: "x", target: "does-not-exist" } as unknown as Spec;
+    expect(() => lower(unknownTarget)).toThrow(/unreachable/);
+  });
+});
+
+describe("assertChainGameLowered (exported onchain-game lowering guard)", () => {
+  const CHAIN = {
+    id: "base",
+    kind: "evm",
+    rpcUrls: [{ kind: "env", name: "RPC" }],
+    rpcPolicy: "single",
+    finality: { kind: "finalized" },
+    reorgTolerant: false,
+  } as const;
+  const WALLET = {
+    id: "w",
+    chainId: "base",
+    custody: "local",
+    signingPolicy: "automated",
+  } as const;
+  const CONTRACT = { id: "gc", chainId: "base", address: "0xGAME", abiRef: "abi://game" } as const;
+
+  test("returns the non-optional triple when all three lowered values are present", () => {
+    const out = assertChainGameLowered(CHAIN, WALLET, CONTRACT);
+    expect(out).toEqual({ chain: CHAIN, wallet: WALLET, contract: CONTRACT });
+    // Identity preserved — no copies are made.
+    expect(out.chain).toBe(CHAIN);
+    expect(out.wallet).toBe(WALLET);
+    expect(out.contract).toBe(CONTRACT);
+  });
+
+  test.each([
+    ["chain", undefined, WALLET, CONTRACT],
+    ["wallet", CHAIN, undefined, CONTRACT],
+    ["contract", CHAIN, WALLET, undefined],
+  ] as const)("throws when the lowered %s is undefined", (_label, chain, wallet, contract) => {
+    expect(() => assertChainGameLowered(chain, wallet, contract)).toThrow(
+      /onchain-game lowering failed to produce chain\/wallet\/contract/,
+    );
+  });
+});
+
+describe("type re-exports are reachable from the package entry", () => {
+  test("IrNode type round-trips a lowered value (compile-time + runtime smoke)", () => {
+    const ir: IrNode = lower(parseSpec(MINIMAL_SPEC));
+    expect(ir.target).toBe("cli");
   });
 });

@@ -4,9 +4,103 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 import { buildFixtureChatDb } from "./fixtures/build-chat-db";
-import { IMessageAdapterError, _internal, createIMessageAdapter } from "./index";
+import {
+  IMessageAdapterError,
+  type OsascriptSpawn,
+  _internal,
+  createIMessageAdapter,
+  runOsascript,
+} from "./index";
 
 const { isSafeHandle, escapeAppleScriptString, validateChatDbPath } = _internal;
+
+/**
+ * Build a deterministic fake of `child_process.spawn` for {@link runOsascript}
+ * tests — no real process. `behavior` decides which lifecycle events fire and
+ * is invoked on a microtask so the runner has wired its listeners first.
+ */
+function fakeSpawn(behavior: {
+  readonly stderrChunks?: readonly string[];
+  readonly closeCode?: number | null;
+  readonly emitError?: Error;
+  /** Force `stdin`/`stderr` to be null to exercise the optional-chaining guards. */
+  readonly nullStreams?: boolean;
+}): { spawn: OsascriptSpawn; getWritten: () => string | undefined; ended: () => boolean } {
+  let written: string | undefined;
+  let didEnd = false;
+  const spawn: OsascriptSpawn = (command, args, options) => {
+    // The runner must always invoke osascript reading the script from stdin.
+    expect(command).toBe("osascript");
+    expect(args).toEqual(["-"]);
+    expect(options).toEqual({ stdio: ["pipe", "ignore", "pipe"] });
+    const handlers: Record<string, (arg: never) => void> = {};
+    const stderrHandlers: ((chunk: Buffer) => void)[] = [];
+    queueMicrotask(() => {
+      for (const c of behavior.stderrChunks ?? []) {
+        for (const h of stderrHandlers) h(Buffer.from(c, "utf8"));
+      }
+      if (behavior.emitError) handlers["error"]?.(behavior.emitError as never);
+      else handlers["close"]?.((behavior.closeCode ?? 0) as never);
+    });
+    return {
+      stderr: behavior.nullStreams ? null : { on: (_e, cb) => stderrHandlers.push(cb) },
+      stdin: behavior.nullStreams
+        ? null
+        : {
+            write: (chunk: string) => {
+              written = chunk;
+            },
+            end: () => {
+              didEnd = true;
+            },
+          },
+      on: (event: string, cb: (arg: never) => void) => {
+        handlers[event] = cb;
+      },
+    };
+  };
+  return { spawn, getWritten: () => written, ended: () => didEnd };
+}
+
+describe("runOsascript (default-runner core, dependency-injected spawn)", () => {
+  test("writes the script to stdin and resolves on exit code 0", async () => {
+    const f = fakeSpawn({ closeCode: 0 });
+    await runOsascript(f.spawn, "tell app");
+    expect(f.getWritten()).toBe("tell app");
+    expect(f.ended()).toBe(true);
+  });
+
+  test("rejects with stderr text + code on a non-zero exit", async () => {
+    const f = fakeSpawn({ closeCode: 2, stderrChunks: ["bad ", "things"] });
+    await expect(runOsascript(f.spawn, "x")).rejects.toThrow(/osascript exited with 2: bad things/);
+  });
+
+  test("rejects with a clear message when spawn emits 'error'", async () => {
+    const boom = new Error("ENOENT osascript");
+    const f = fakeSpawn({ emitError: boom });
+    let caught: unknown;
+    try {
+      await runOsascript(f.spawn, "x");
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(IMessageAdapterError);
+    expect((caught as Error).message).toBe("osascript spawn failed");
+    // The originating error is preserved on the cause chain.
+    expect((caught as IMessageAdapterError).cause).toBe(boom);
+  });
+
+  test("null stdin/stderr streams are tolerated (optional-chaining guards)", async () => {
+    const f = fakeSpawn({ nullStreams: true, closeCode: 0 });
+    await runOsascript(f.spawn, "x");
+    // Nothing was written because stdin was null; the runner still resolved.
+    expect(f.getWritten()).toBeUndefined();
+  });
+
+  test("exposed on _internal for the adapter's wiring", () => {
+    expect(_internal.runOsascript).toBe(runOsascript);
+  });
+});
 
 describe("isSafeHandle / escapeAppleScriptString / validateChatDbPath", () => {
   test("accepts well-formed iMessage handles", () => {

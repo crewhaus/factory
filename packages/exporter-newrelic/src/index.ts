@@ -141,4 +141,7 @@ export function attachNewRelicIfEnvSet(
   return attachNewRelicExporter(bus, opts);
 }
 
-export { scrubLicenseKey as _scrubLicenseKeyForTest };
+export {
+  scrubLicenseKey as _scrubLicenseKeyForTest,
+  wrapFetchWithEntityGuid as _wrapFetchWithEntityGuidForTest,
+};

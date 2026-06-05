@@ -2,11 +2,13 @@ import { afterAll, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { RuntimeError } from "@crewhaus/errors";
 import { TenancyError, buildTenant, withTenant } from "@crewhaus/tenancy";
 import type { ToolResult } from "@crewhaus/tool-executor";
 import {
   DEFAULT_PREVIEW_LINES,
   DEFAULT_THRESHOLD_BYTES,
+  assertUnderRoot,
   resolveStoragePath,
   storeAndPreview,
 } from "./index";
@@ -51,6 +53,60 @@ describe("storeAndPreview — under threshold", () => {
     expect(out.persisted).toBe(false);
     expect(out.fullPath).toBeNull();
     expect(out.previewContent).toBe(content);
+  });
+});
+
+describe("storeAndPreview — non-string content", () => {
+  test("image content-block array bypasses persistence and is forwarded verbatim", async () => {
+    const rootDir = newTempRoot();
+    // A large base64 payload that would blow past the byte threshold if it
+    // were a string — confirms the array short-circuits before any sizing.
+    const blocks: ToolResult["content"] = [
+      {
+        type: "image",
+        source: {
+          type: "base64",
+          media_type: "image/png",
+          data: "Q".repeat(DEFAULT_THRESHOLD_BYTES + 10),
+        },
+      },
+    ];
+    const out = await storeAndPreview(
+      { toolUseId: "tu_img", content: blocks, isError: false },
+      {
+        runId: "run_img",
+        toolUseId: "tu_img",
+        rootDir,
+      },
+    );
+    expect(out.persisted).toBe(false);
+    expect(out.fullPath).toBeNull();
+    // Same reference forwarded unchanged — no copy, no preview wrapping.
+    expect(out.previewContent).toBe(blocks);
+    // Nothing was written under the run directory.
+    expect(() => statSync(join(rootDir, "run_img"))).toThrow();
+  });
+
+  test("mixed text + image blocks are also forwarded as-is", async () => {
+    const rootDir = newTempRoot();
+    const blocks: ToolResult["content"] = [
+      { type: "text", text: "caption" },
+      {
+        type: "image",
+        source: { type: "base64", media_type: "image/jpeg", data: "AAAA" },
+      },
+    ];
+    const out = await storeAndPreview(
+      { toolUseId: "tu_mix", content: blocks, isError: false },
+      {
+        runId: "run_mix",
+        toolUseId: "tu_mix",
+        rootDir,
+      },
+    );
+    expect(out.persisted).toBe(false);
+    expect(out.fullPath).toBeNull();
+    expect(out.previewContent).toEqual(blocks);
   });
 });
 
@@ -180,6 +236,20 @@ describe("storeAndPreview — path traversal guard", () => {
   test("resolveStoragePath returns a path under rootDir", () => {
     const path = resolveStoragePath("run_x", "tu_y", "/tmp/cr-test");
     expect(path).toContain("/tmp/cr-test/run_x/tu_y.txt");
+  });
+
+  test("assertUnderRoot accepts a path strictly under root", () => {
+    expect(() => assertUnderRoot("/tmp/cr-root/run/file.txt", "/tmp/cr-root")).not.toThrow();
+  });
+
+  test("assertUnderRoot rejects a path that escapes root (defence-in-depth throw)", () => {
+    // Exercises the boundary check directly: a resolved path that does NOT
+    // sit under root must throw, even though rejectUnsafeSegment normally
+    // makes this unreachable from resolveStoragePath.
+    expect(() => assertUnderRoot("/etc/passwd", "/tmp/cr-root")).toThrow(RuntimeError);
+    expect(() => assertUnderRoot("/tmp/cr-root-sibling/x", "/tmp/cr-root")).toThrow(
+      /escapes rootDir/,
+    );
   });
 });
 

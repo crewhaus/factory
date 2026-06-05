@@ -173,7 +173,11 @@ function matches(record: AuditRecord, filter: AuditEventFilter): boolean {
   if (filter.payloadField !== undefined) {
     const payload = record.payload as Record<string, unknown> | null;
     if (payload === null || typeof payload !== "object") return false;
-    if (!(filter.payloadField in payload)) return false;
+    // Own-property check only: a filter targets a "top-level field within
+    // payload" (see AuditEventFilter.payloadField). The `in` operator would
+    // also walk the prototype chain, so e.g. `payloadField: "toString"` or
+    // "constructor" would spuriously match every object payload.
+    if (!Object.hasOwn(payload, filter.payloadField)) return false;
     if (filter.payloadFieldEquals !== undefined) {
       const value = payload[filter.payloadField];
       if (typeof value === "string") {
@@ -201,6 +205,23 @@ function canonicalDigest(records: ReadonlyArray<AuditRecord>): string {
 
 function signDigest(digest: string, key: string): string {
   return createHmac("sha256", key).update(digest).digest("hex");
+}
+
+/**
+ * Reject any path component that could escape the output directory. Each of
+ * `frameworkId` / `controlId` / `period` becomes one path segment in the
+ * evidence-bundle path; a segment containing a path separator (`/` or `\`),
+ * a `..` traversal token, or a NUL byte could redirect the write to an
+ * arbitrary location on disk. Returns true when the component is unsafe.
+ */
+function isUnsafePathComponent(component: string): boolean {
+  return (
+    component.includes("/") ||
+    component.includes("\\") ||
+    component.includes("\0") ||
+    component === ".." ||
+    component === "."
+  );
 }
 
 // --------------------------------------------------------------------
@@ -291,10 +312,19 @@ export function createComplianceCollector(opts: CollectorOptions): ComplianceCol
     },
 
     writeBundle(bundle: EvidenceBundle): string {
-      if (bundle.frameworkId.includes("/") || bundle.controlId.includes("/")) {
-        throw new ComplianceControlsError(
-          `writeBundle: framework/control id may not contain "/" (got "${bundle.frameworkId}/${bundle.controlId}")`,
-        );
+      // All three components are interpolated into the on-disk path; validate
+      // each so a caller-supplied id or period label cannot traverse out of
+      // outputDir (e.g. period "../../etc/cron.d/x" or an absolute path).
+      for (const [field, value] of [
+        ["frameworkId", bundle.frameworkId],
+        ["controlId", bundle.controlId],
+        ["period", bundle.period],
+      ] as const) {
+        if (isUnsafePathComponent(value)) {
+          throw new ComplianceControlsError(
+            `writeBundle: ${field} may not contain a path separator or ".." segment (got "${value}")`,
+          );
+        }
       }
       const path = join(outputDir, bundle.frameworkId, bundle.controlId, `${bundle.period}.json`);
       mkdirSync(dirname(path), { recursive: true, mode: 0o700 });

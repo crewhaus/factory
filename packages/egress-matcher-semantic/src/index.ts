@@ -154,7 +154,7 @@ export class SemanticEgressMatcher implements EgressMatcher {
     } catch (err) {
       if (this.disableFallback) {
         throw new EgressMatcherSemanticError(
-          `semantic egress matcher embedder failed: ${(err as Error).message ?? String(err)}`,
+          `semantic egress matcher embedder failed: ${(err as Error)?.message ?? String(err)}`,
           err,
         );
       }

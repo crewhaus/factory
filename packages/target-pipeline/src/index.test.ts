@@ -120,4 +120,52 @@ describe("emitPipeline", () => {
     expect(content).toContain('createVectorStore({ backend: "in-memory" })');
     expect(content).not.toContain("apiKey:");
   });
+
+  test("emits permissionMode when the IR carries a mode", () => {
+    const ir: IrPipelineV0 = {
+      ...baseIr,
+      permissions: { mode: "plan", rules: [] },
+    };
+    const content = emitPipeline(ir).files[0]?.content ?? "";
+    expect(content).toContain('permissionMode: "plan",');
+    // No rules → no permission-engine import and no permissionRules block.
+    expect(content).not.toContain("BUILTIN_DEFAULT_RULES");
+    expect(content).not.toContain("permissionRules:");
+  });
+
+  test("emits the permissionRules block + permission-engine import when rules are present", () => {
+    const ir: IrPipelineV0 = {
+      ...baseIr,
+      permissions: {
+        mode: "default",
+        rules: [
+          { type: "alwaysAllow", pattern: "Read(*)" },
+          { type: "alwaysDeny", pattern: "Bash(rm *)" },
+        ],
+      },
+    };
+    const content = emitPipeline(ir).files[0]?.content ?? "";
+    expect(content).toContain(
+      'import { BUILTIN_DEFAULT_RULES } from "@crewhaus/permission-engine";',
+    );
+    expect(content).toContain('permissionMode: "default",');
+    expect(content).toContain("permissionRules: {");
+    expect(content).toContain("builtin: BUILTIN_DEFAULT_RULES,");
+    // Each rule is rendered verbatim into the yaml lane with source "yaml".
+    expect(content).toContain('{ type: "alwaysAllow", pattern: "Read(*)", source: "yaml" },');
+    expect(content).toContain('{ type: "alwaysDeny", pattern: "Bash(rm *)", source: "yaml" },');
+  });
+
+  test("rules without an explicit mode emit permissionRules but no permissionMode", () => {
+    const ir: IrPipelineV0 = {
+      ...baseIr,
+      permissions: {
+        rules: [{ type: "alwaysAsk", pattern: "Write(*)" }],
+      },
+    };
+    const content = emitPipeline(ir).files[0]?.content ?? "";
+    expect(content).not.toContain("permissionMode:");
+    expect(content).toContain('{ type: "alwaysAsk", pattern: "Write(*)", source: "yaml" },');
+    expect(content).toContain("flag: [],");
+  });
 });

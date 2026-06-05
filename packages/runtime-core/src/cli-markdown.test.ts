@@ -4,7 +4,7 @@
  * inline bold/italic/code, blockquotes, and graceful handling of
  * tokens split across chunks.
  */
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { createCliMarkdownRenderer, isCliMarkdownEnabled } from "./cli-markdown";
 
 function capture(): { write: (s: string) => void; out: () => string } {
@@ -135,6 +135,18 @@ describe("createCliMarkdownRenderer", () => {
     expect(strip(c.out())).toMatch(/^─{40}/);
   });
 
+  test("underscore bold (__x__) and underscore italic (_x_) render", () => {
+    const c = capture();
+    const r = createCliMarkdownRenderer({ write: c.write });
+    // __bold__ exercises the __...__ replace callback; a closed _italic_ pair
+    // (word-boundary guarded) exercises the _..._ replace callback. Both are
+    // distinct from the asterisk variants the other tests cover.
+    r.push("make __this__ and _that_ pop\n");
+    expect(strip(c.out())).toBe("make this and that pop\n");
+    expect(c.out()).toContain("\x1b[1m"); // bold from __this__
+    expect(c.out()).toContain("\x1b[3m"); // italic from _that_
+  });
+
   test("does not false-match snake_case identifiers as italic", () => {
     const c = capture();
     const r = createCliMarkdownRenderer({ write: c.write });
@@ -152,6 +164,28 @@ describe("createCliMarkdownRenderer", () => {
     expect(stripped).toContain("• item one");
     expect(stripped).toContain("code");
     expect(stripped).toContain("• item two");
+  });
+
+  test("defaults to process.stdout.write when no write override is supplied", () => {
+    // Exercises the default sink arrow `(s) => process.stdout.write(s)` that
+    // every other test bypasses by passing an explicit `write`. We spy on
+    // stdout so nothing actually prints to the test console.
+    const written: string[] = [];
+    const spy = spyOn(process.stdout, "write").mockImplementation(((chunk: unknown) => {
+      written.push(String(chunk));
+      return true;
+    }) as typeof process.stdout.write);
+    try {
+      const r = createCliMarkdownRenderer(); // no opts → default write
+      r.push("plain line\n"); // flushes a completed line via the default sink
+      r.push("tail-no-newline");
+      r.end(); // flushes the buffered tail via the default sink
+    } finally {
+      spy.mockRestore();
+    }
+    const joined = strip(written.join(""));
+    expect(joined).toContain("plain line");
+    expect(joined).toContain("tail-no-newline");
   });
 });
 

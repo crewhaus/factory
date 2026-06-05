@@ -35,6 +35,14 @@ import { CrewhausError, RuntimeError } from "@crewhaus/errors";
 
 export const DEFAULT_ROOT_DIR = ".crewhaus/research";
 const RUN_ID_RE = /^run_[0-9a-f]{16}$/;
+/**
+ * A sha256 digest is always exactly 64 lowercase hex chars. We re-validate it
+ * before interpolating into the cache file path because the value can originate
+ * from a JSONL line read off disk (boot-time replay), and a corrupted or
+ * tampered `fetches.jsonl` must not be able to steer a read outside `cache/`
+ * (e.g. a `sha256` of "../../../etc/passwd"). Legitimate records always match.
+ */
+const SHA256_RE = /^[0-9a-f]{64}$/;
 
 export type RunId = string;
 
@@ -170,6 +178,9 @@ export function createCitationTracker(opts: CreateCitationTrackerOptions = {}): 
   }
 
   function tryReadCache(rec: FetchRecord): string | undefined {
+    // Defend the cache read against a tampered fetches.jsonl: a sha256 that is
+    // not a clean 64-hex digest could otherwise traverse out of cache/.
+    if (typeof rec.sha256 !== "string" || !SHA256_RE.test(rec.sha256)) return undefined;
     const p = cachePathFor(rec.sha256);
     if (!existsSync(p)) return undefined;
     return readFileSync(p, "utf8");

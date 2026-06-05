@@ -1,9 +1,24 @@
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { existsSync, mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TenancyError, buildTenant, withTenant } from "@crewhaus/tenancy";
 import { createSessionStore } from "./index";
+
+// Snapshot the genuine node:fs/promises implementation ONCE, before any test
+// installs a mock. Bun's `mock.module` mutates the live module namespace in
+// place, so we copy the concrete function *values* into plain locals here —
+// these references stay genuine even after the namespace is later mocked,
+// which lets mocked stat/unlink pass through without recursing into themselves.
+const REAL_FS_PROMISES = { ...(await import("node:fs/promises")) };
+const realStat = REAL_FS_PROMISES.stat;
+const realUnlink = REAL_FS_PROMISES.unlink;
+// `mock.module` registrations accumulate and `mock.restore()` does not reliably
+// undo them, so suites that mock fs restore the real module via this snapshot
+// in their own afterEach.
+const restoreRealFsPromises = () => {
+  mock.module("node:fs/promises", () => ({ ...REAL_FS_PROMISES }));
+};
 
 const TMP_ROOTS: string[] = [];
 function newTempRoot(): string {
@@ -56,6 +71,27 @@ describe("session-store — create / get", () => {
       model: "m",
     });
     expect(session.id).toBe("sess_deadbeefcafebabe");
+  });
+});
+
+describe("session-store — malformed-file parsing (parseSession)", () => {
+  test("get throws RuntimeError on malformed JSON", async () => {
+    const rootDir = newTempRoot();
+    const store = createSessionStore({ rootDir });
+    const id = "sess_0123456789abcdef";
+    writeFileSync(join(rootDir, `${id}.json`), "{ this is not valid json");
+    await expect(store.get(id)).rejects.toThrow(/malformed JSON for "sess_0123456789abcdef"/);
+  });
+
+  test("get throws RuntimeError on an unexpected JSON shape", async () => {
+    const rootDir = newTempRoot();
+    const store = createSessionStore({ rootDir });
+    const id = "sess_fedcba9876543210";
+    // Valid JSON, but missing the required Session fields.
+    writeFileSync(join(rootDir, `${id}.json`), JSON.stringify({ id, notASession: true }));
+    await expect(store.get(id)).rejects.toThrow(
+      /unexpected JSON shape for "sess_fedcba9876543210"/,
+    );
   });
 });
 
@@ -192,6 +228,27 @@ describe("session-store — list and TTL eviction", () => {
     expect(listed[0]?.id).toBe(a.id);
   });
 
+  test("list is best-effort: a malformed surviving file is skipped, not fatal", async () => {
+    const rootDir = newTempRoot();
+    const store = createSessionStore({ rootDir });
+    const good = await store.create({ name: "good", target: "cli", model: "m" });
+    // A well-named, recently-mtimed file that survives the regex + TTL + stat
+    // checks but throws inside readSession() when its JSON is parsed.
+    const badId = "sess_badbadbadbad0000";
+    writeFileSync(join(rootDir, `${badId}.json`), "{ not valid json");
+
+    const errSpy = spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const listed = await store.list();
+      // The malformed file is logged-and-skipped; the good session survives.
+      expect(listed.map((s) => s.id)).toEqual([good.id]);
+      expect(errSpy).toHaveBeenCalledTimes(1);
+      expect(errSpy.mock.calls[0]?.[0]).toContain(`skipping malformed session "${badId}"`);
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
+
   test("custom ttlDays is honoured", async () => {
     const rootDir = newTempRoot();
     const store = createSessionStore({ rootDir, ttlDays: 1 });
@@ -200,6 +257,102 @@ describe("session-store — list and TTL eviction", () => {
     utimesSync(join(rootDir, `${a.id}.json`), old, old);
     const listed = await store.list();
     expect(listed).toEqual([]);
+  });
+});
+
+describe("session-store — list stat() TOCTOU race (ENOENT skip)", () => {
+  afterEach(() => {
+    restoreRealFsPromises();
+  });
+
+  test("a file vanishing between readdir and stat is skipped, not fatal", async () => {
+    const rootDir = newTempRoot();
+    const store = createSessionStore({ rootDir });
+    const present = await store.create({ name: "present", target: "cli", model: "m" });
+    const racedId = "sess_aaaaaaaaaaaaaaaa";
+    // Create a real file so readdir() returns it, but stat() will report it gone.
+    writeFileSync(join(rootDir, `${racedId}.json`), "{}");
+
+    const racedPath = join(rootDir, `${racedId}.json`);
+    mock.module("node:fs/promises", () => ({
+      ...REAL_FS_PROMISES,
+      stat: async (p: string) => {
+        if (typeof p === "string" && p === racedPath) {
+          const err = new Error("ENOENT: no such file") as NodeJS.ErrnoException;
+          err.code = "ENOENT";
+          throw err;
+        }
+        return realStat(p);
+      },
+    }));
+
+    const listed = await store.list();
+    // The raced file is silently skipped; the present session survives.
+    expect(listed.map((s) => s.id)).toEqual([present.id]);
+  });
+
+  test("eviction swallows unlink rejections (best-effort .catch arrows)", async () => {
+    const rootDir = newTempRoot();
+    const store = createSessionStore({ rootDir });
+    const a = await store.create({ name: "a", target: "cli", model: "m" });
+    // Backdate so `a` is evicted on the next list().
+    const old = new Date(Date.now() - 35 * 86_400_000);
+    utimesSync(join(rootDir, `${a.id}.json`), old, old);
+
+    // Make BOTH unlink calls (session file + sibling log) reject so the
+    // `.catch(() => undefined)` callback bodies at the eviction site execute.
+    mock.module("node:fs/promises", () => ({
+      ...REAL_FS_PROMISES,
+      unlink: async () => {
+        throw new Error("EPERM: operation not permitted");
+      },
+    }));
+
+    // Eviction must not throw even though every unlink rejects.
+    const listed = await store.list();
+    expect(listed).toEqual([]);
+  });
+
+  test("delete swallows a sibling-log unlink rejection", async () => {
+    const rootDir = newTempRoot();
+    const store = createSessionStore({ rootDir });
+    const a = await store.create({ name: "a", target: "cli", model: "m" });
+
+    const logPath = join(rootDir, `${a.id}.jsonl`);
+    // Session-file unlink succeeds; the sibling-log unlink rejects, which the
+    // trailing `.catch(() => undefined)` in delete() must swallow.
+    mock.module("node:fs/promises", () => ({
+      ...REAL_FS_PROMISES,
+      unlink: async (p: string) => {
+        if (typeof p === "string" && p === logPath) {
+          throw new Error("EPERM: operation not permitted");
+        }
+        return realUnlink(p);
+      },
+    }));
+
+    await store.delete(a.id);
+    expect(existsSync(join(rootDir, `${a.id}.json`))).toBe(false);
+  });
+
+  test("a non-ENOENT stat error aborts the listing", async () => {
+    const rootDir = newTempRoot();
+    const store = createSessionStore({ rootDir });
+    const present = await store.create({ name: "present", target: "cli", model: "m" });
+    const targetPath = join(rootDir, `${present.id}.json`);
+    mock.module("node:fs/promises", () => ({
+      ...REAL_FS_PROMISES,
+      stat: async (p: string) => {
+        if (typeof p === "string" && p === targetPath) {
+          const err = new Error("EACCES: permission denied") as NodeJS.ErrnoException;
+          err.code = "EACCES";
+          throw err;
+        }
+        return realStat(p);
+      },
+    }));
+
+    await expect(store.list()).rejects.toThrow(/EACCES/);
   });
 });
 

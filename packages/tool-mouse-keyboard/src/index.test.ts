@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { Driver } from "@crewhaus/computer-use-driver";
 import {
+  MouseKeyboardError,
   createAllMouseKeyboardTools,
   createClickTool,
   createKeyTool,
@@ -35,6 +36,33 @@ function recordingDriver(): { driver: Driver; calls: string[] } {
     async disconnect() {},
   };
   return { driver, calls };
+}
+
+// A driver whose single named method rejects; all others are inert no-ops.
+// Lets each tool's error-catch branch be exercised in isolation.
+function throwingDriver(method: "click" | "type" | "key" | "scroll", message: string): Driver {
+  const base: Driver = {
+    backend: "chromium",
+    async connect() {},
+    async goto() {},
+    async screenshot() {
+      return new Uint8Array();
+    },
+    async click() {},
+    async type() {},
+    async key() {},
+    async scroll() {},
+    async getViewport() {
+      return { width: 0, height: 0, devicePixelRatio: 1 };
+    },
+    async disconnect() {},
+  };
+  return {
+    ...base,
+    [method]: async () => {
+      throw new Error(message);
+    },
+  };
 }
 
 describe("Mouse + keyboard tools (T1 wrapping)", () => {
@@ -114,5 +142,69 @@ describe("Mouse + keyboard tools (T1 wrapping)", () => {
     const tool = createClickTool({ driver });
     const r = await tool.execute({ x: 1, y: 1 }, {});
     expect(typeof r === "string" && r.includes("[Click error]")).toBe(true);
+  });
+
+  test("Type driver errors are surfaced as a [Type error] result string", async () => {
+    const driver = throwingDriver("type", "type blew up");
+    const tool = createTypeTool({ driver });
+    const r = await tool.execute({ text: "hi" }, {});
+    expect(typeof r === "string" && r.includes("[Type error] type blew up")).toBe(true);
+  });
+
+  test("Key driver errors are surfaced as a [Key error] result string", async () => {
+    const driver = throwingDriver("key", "key blew up");
+    const tool = createKeyTool({ driver });
+    const r = await tool.execute({ combo: "Enter" }, {});
+    expect(typeof r === "string" && r.includes("[Key error] key blew up")).toBe(true);
+  });
+
+  test("Scroll driver errors are surfaced as a [Scroll error] result string", async () => {
+    const driver = throwingDriver("scroll", "scroll blew up");
+    const tool = createScrollTool({ driver });
+    const r = await tool.execute({ dx: 0, dy: 10 }, {});
+    expect(typeof r === "string" && r.includes("[Scroll error] scroll blew up")).toBe(true);
+  });
+
+  test("non-Error throw still yields a result string (String(err) fallback)", async () => {
+    // err.message is undefined → falls through to String(err).
+    const driver: Driver = {
+      backend: "chromium",
+      async connect() {},
+      async goto() {},
+      async screenshot() {
+        return new Uint8Array();
+      },
+      async click() {
+        throw "raw string failure";
+      },
+      async type() {},
+      async key() {},
+      async scroll() {},
+      async getViewport() {
+        return { width: 0, height: 0, devicePixelRatio: 1 };
+      },
+      async disconnect() {},
+    };
+    const tool = createClickTool({ driver });
+    const r = await tool.execute({ x: 1, y: 1 }, {});
+    expect(typeof r === "string" && r.includes("[Click error] raw string failure")).toBe(true);
+  });
+});
+
+describe("MouseKeyboardError", () => {
+  test("constructs with the 'tool' error code and a stable name", () => {
+    const err = new MouseKeyboardError("input device unavailable");
+    expect(err).toBeInstanceOf(Error);
+    expect(err.name).toBe("MouseKeyboardError");
+    expect(err.message).toBe("input device unavailable");
+    expect(err.code).toBe("tool");
+    expect(err.cause).toBeUndefined();
+  });
+
+  test("threads an underlying cause through to the base error", () => {
+    const root = new Error("driver socket closed");
+    const err = new MouseKeyboardError("scroll failed", root);
+    expect(err.cause).toBe(root);
+    expect(err.code).toBe("tool");
   });
 });

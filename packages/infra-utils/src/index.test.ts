@@ -50,6 +50,16 @@ describe("assertNever", () => {
   });
 });
 
+describe("ArgParseError", () => {
+  it("is an Error subclass that preserves its message and stable name", () => {
+    const err = new ArgParseError("bad flag");
+    expect(err).toBeInstanceOf(Error);
+    expect(err).toBeInstanceOf(ArgParseError);
+    expect(err.message).toBe("bad flag");
+    expect(err.name).toBe("ArgParseError");
+  });
+});
+
 describe("parseArgs", () => {
   const schema = {
     flags: [

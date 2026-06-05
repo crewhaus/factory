@@ -15,6 +15,7 @@ import {
   bunCompileTarget,
   formatTarget,
   isBuildTarget,
+  packagingDir,
   renderDebianControl,
   renderHomebrewFormula,
   renderScoopManifest,
@@ -199,6 +200,11 @@ describe("manifest rendering (T1)", () => {
     expect(scoopText).toContain(
       '"hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"',
     );
+  });
+
+  test("packagingDir() points at the package's packaging/ directory (default root)", () => {
+    // The default on-disk root used by writeAllManifests when no dir is given.
+    expect(packagingDir()).toMatch(/single-binary-cli[/\\]packaging$/);
   });
 });
 

@@ -122,6 +122,26 @@ describe("Match logic (T1)", () => {
     const r = makeRecord({ kind: "policy_decision", payload: {} });
     expect(_matchesAnyForTest(r, [])).toBe(false);
   });
+
+  test("payloadField does not match inherited Object.prototype keys", () => {
+    // Regression: `in` would walk the prototype chain so a filter targeting
+    // "toString" / "constructor" spuriously matched every object payload.
+    // payloadField is documented as a *top-level* (own) field.
+    const r = makeRecord({ kind: "policy_decision", payload: { action: "allow" } });
+    expect(_matchesForTest(r, { kind: "policy_decision", payloadField: "toString" })).toBe(false);
+    expect(_matchesForTest(r, { kind: "policy_decision", payloadField: "constructor" })).toBe(
+      false,
+    );
+    expect(_matchesForTest(r, { kind: "policy_decision", payloadField: "hasOwnProperty" })).toBe(
+      false,
+    );
+    // An own field by the same name still matches.
+    const r2 = makeRecord({
+      kind: "policy_decision",
+      payload: Object.assign(Object.create(null), { toString: "shadowed" }),
+    });
+    expect(_matchesForTest(r2, { kind: "policy_decision", payloadField: "toString" })).toBe(true);
+  });
 });
 
 describe("Digest + signature helpers (T1)", () => {
@@ -263,5 +283,75 @@ describe("writeBundle (T3 — disk persistence)", () => {
       signature: null,
     };
     expect(() => collector.writeBundle(bundle)).toThrow(/may not contain/);
+  });
+
+  test("writeBundle refuses path-traversal in the period label", () => {
+    // Regression: `period` was previously interpolated into the path with no
+    // validation, so a "../../.." period escaped outputDir entirely and wrote
+    // the bundle to an arbitrary location on disk.
+    const collector = createComplianceCollector({
+      auditSource: source([]),
+      outputDir: tmp,
+    });
+    const base = {
+      frameworkId: "soc2",
+      controlId: "CC6.1",
+      description: "x",
+      generatedAt: 1,
+      recordCount: 0,
+      records: [],
+      digest: "x",
+      signature: null,
+    };
+    const escapeTarget = join(tmp, "..", "pwned");
+    expect(() => collector.writeBundle({ ...base, period: "../../../../pwned" })).toThrow(
+      /period may not contain/,
+    );
+    // Absolute-path period is likewise rejected (contains a separator).
+    expect(() => collector.writeBundle({ ...base, period: "/etc/passwd" })).toThrow(
+      /period may not contain/,
+    );
+    // Backslash separator (Windows-style) is rejected too.
+    expect(() => collector.writeBundle({ ...base, period: "..\\win" })).toThrow(
+      /period may not contain/,
+    );
+    // The traversal target must never have been created.
+    expect(existsSync(`${escapeTarget}.json`)).toBe(false);
+  });
+
+  test("writeBundle rejects backslash / dot-segment in framework and control ids", () => {
+    const collector = createComplianceCollector({
+      auditSource: source([]),
+      outputDir: tmp,
+    });
+    const base = {
+      description: "x",
+      period: "2026",
+      generatedAt: 1,
+      recordCount: 0,
+      records: [],
+      digest: "x",
+      signature: null,
+    };
+    expect(() =>
+      collector.writeBundle({ ...base, frameworkId: "..\\evil", controlId: "c" }),
+    ).toThrow(/frameworkId may not contain/);
+    expect(() => collector.writeBundle({ ...base, frameworkId: "soc2", controlId: ".." })).toThrow(
+      /controlId may not contain/,
+    );
+  });
+
+  test("writeBundle still writes a legitimately-labelled period", async () => {
+    const records: AuditRecord[] = [
+      makeRecord({ kind: "policy_decision", payload: {}, hash: "h1" }),
+    ];
+    const collector = createComplianceCollector({
+      auditSource: source(records),
+      outputDir: tmp,
+    });
+    const bundle = await collector.collect("soc2", "CC6.1", { period: "2026-Q2" });
+    const path = collector.writeBundle(bundle);
+    expect(existsSync(path)).toBe(true);
+    expect(path).toBe(join(tmp, "soc2", "CC6.1", "2026-Q2.json"));
   });
 });

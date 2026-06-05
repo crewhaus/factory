@@ -173,7 +173,11 @@ export interface AnchorStore {
  * production — back the seam with a WORM store instead.
  */
 export class InMemoryAnchorStore implements AnchorStore {
-  private readonly anchors = new Map<string, AnchorRecord>();
+  private readonly anchors: Map<string, AnchorRecord>;
+
+  constructor() {
+    this.anchors = new Map<string, AnchorRecord>();
+  }
 
   async putAnchor(logId: string, anchor: AnchorRecord): Promise<void> {
     const existing = this.anchors.get(logId);
@@ -269,9 +273,14 @@ export async function openAuditLog(opts: OpenAuditLogOptions): Promise<AuditLog>
       };
       const hash = hashBody(body, prevHash);
       const record: AuditRecord = { ...body, prevHash, hash };
-      const file = join(opts.rootDir, `${day()}.jsonl`);
+      // Evaluate the day selector exactly once: a second call could straddle
+      // a midnight boundary (with the default UTC-date `day`), writing the
+      // record to one day's file while committing the tail under the next
+      // day — leaving the JSONL filename and the anchor's `day` inconsistent.
+      const today = day();
+      const file = join(opts.rootDir, `${today}.jsonl`);
       appendFileSync(file, `${JSON.stringify(record)}\n`, { mode: 0o600 });
-      writeChainTail(opts.rootDir, day(), hash, seq);
+      writeChainTail(opts.rootDir, today, hash, seq);
       // Best-effort: mirror the new tail to the off-host anchor. A failure
       // here (network/WORM hiccup) must NOT fail the durable local append —
       // the chain remains internally verifiable, and a lagging external
@@ -506,7 +515,23 @@ export async function verify(rootDir: string, options: VerifyOptions = {}): Prom
   // on-host anchor is rewritable by a same-uid attacker (see header); it
   // defends only against truncation by a party that does NOT also rewrite the
   // anchor in lockstep — which is exactly what the external anchor above adds.
-  const tail = readChainTail(rootDir);
+  // A corrupt/partially-written `_chain-tail.json` (truncated by a crash, or
+  // garbled by an attacker) must be REPORTED as a broken link, not crash the
+  // verifier with an unhandled JSON.parse throw — mirroring how a malformed
+  // JSONL line is surfaced above. Throwing here would let a one-byte anchor
+  // corruption turn `verify` into a denial of service.
+  let tail: ChainTail | undefined;
+  try {
+    tail = readChainTail(rootDir);
+  } catch (err) {
+    return {
+      ok: false,
+      recordsChecked,
+      file: indexPath(rootDir),
+      line: 0,
+      reason: `chain-tail anchor unreadable — ${(err as Error).message}`,
+    };
+  }
   if (tail === undefined) {
     return { ok: true, recordsChecked, anchorChecked: false, externalAnchorChecked };
   }

@@ -187,29 +187,20 @@ function normaliseBedrockError(err: unknown): unknown {
 
   const message = err instanceof Error ? err.message : String(err);
   const wrapped = new AdapterError("bedrock", message, err);
-  const e = err as {
-    $metadata?: { httpStatusCode?: number };
-    name?: unknown;
-  };
-  const status = e.$metadata?.httpStatusCode;
+  const e = err as { $metadata?: { httpStatusCode?: number } } | null | undefined;
+  const status = e?.$metadata?.httpStatusCode;
 
   // Bedrock taxonomy → Anthropic-shaped fields recovery-engine reads.
   // ThrottlingException / ServiceQuotaExceededException / TooManyRequestsException → 429.
-  if (
-    typeof e.name === "string" &&
-    /Throttling|TooManyRequests|ServiceQuotaExceeded/.test(e.name)
-  ) {
+  if (typeof name === "string" && /Throttling|TooManyRequests|ServiceQuotaExceeded/.test(name)) {
     (wrapped as unknown as { status: number }).status = 429;
     (wrapped as unknown as { error: { type: string } }).error = { type: "overloaded_error" };
-  } else if (
-    typeof e.name === "string" &&
-    /ModelStreamError|InternalServerException/.test(e.name)
-  ) {
+  } else if (typeof name === "string" && /ModelStreamError|InternalServerException/.test(name)) {
     (wrapped as unknown as { status: number }).status = status ?? 500;
     (wrapped as unknown as { error: { type: string } }).error = { type: "overloaded_error" };
   } else if (
-    typeof e.name === "string" &&
-    /ValidationException/.test(e.name) &&
+    typeof name === "string" &&
+    /ValidationException/.test(name) &&
     /context|input|prompt|too long|exceeds/i.test(message)
   ) {
     (wrapped as unknown as { status: number }).status = 400;

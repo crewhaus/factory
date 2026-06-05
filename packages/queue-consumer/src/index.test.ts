@@ -1,7 +1,7 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { createInMemoryIdempotencyStore } from "@crewhaus/idempotency-keys";
-import { type Job, createInMemoryQueue } from "@crewhaus/queue-protocol";
-import { type ConsumerObserver, startConsumer } from "./index.js";
+import { type Job, type QueueAdapter, createInMemoryQueue } from "@crewhaus/queue-protocol";
+import { type ConsumerObserver, QueueConsumerError, startConsumer } from "./index.js";
 
 describe("startConsumer", () => {
   test("processes 50 jobs at concurrency 4 (T3 end-to-end)", async () => {
@@ -198,5 +198,203 @@ describe("startConsumer", () => {
     expect(onJobStartCount).toBe(stats.acked);
     // Pending jobs that hadn't been pulled yet remain.
     expect(stats.pending + stats.acked).toBe(5);
+  });
+});
+
+describe("QueueConsumerError", () => {
+  test("carries the runtime code, stable name, and cause chain", () => {
+    const cause = new Error("adapter exploded");
+    const err = new QueueConsumerError("consumer failed", cause);
+    expect(err).toBeInstanceOf(Error);
+    expect(err.name).toBe("QueueConsumerError");
+    expect(err.code).toBe("runtime");
+    expect(err.message).toBe("consumer failed");
+    expect(err.cause).toBe(cause);
+    expect(err.toJSON()).toMatchObject({
+      name: "QueueConsumerError",
+      code: "runtime",
+      message: "consumer failed",
+      cause: { name: "Error", message: "adapter exploded" },
+    });
+  });
+
+  test("constructs without a cause", () => {
+    const err = new QueueConsumerError("no cause");
+    expect(err.cause).toBeUndefined();
+  });
+});
+
+describe("startConsumer — pull loop error surfacing", () => {
+  let stderrSpy: ReturnType<typeof spyOn> | undefined;
+
+  afterEach(() => {
+    stderrSpy?.mockRestore();
+    stderrSpy = undefined;
+  });
+
+  test("an unhandled error in the pull loop is written to stderr and stops the loop", async () => {
+    // Capture stderr so the loop-error log doesn't pollute test output AND we
+    // can assert it fired. No real stderr write, no real I/O.
+    const writes: string[] = [];
+    stderrSpy = spyOn(process.stderr, "write").mockImplementation((chunk: unknown): boolean => {
+      writes.push(String(chunk));
+      return true;
+    });
+
+    // A malformed adapter: `pull` resolves a non-array, so `pulled.length`
+    // throws a TypeError OUTSIDE the loop's pull try/catch (that try only
+    // guards the awaited pull call). This is the exact "rare loop error"
+    // path the catch handler exists for.
+    const badQueue: QueueAdapter<number> = {
+      kind: "bad",
+      pull: async () => null as unknown as ReadonlyArray<Job<number>>,
+      ack: async () => {},
+      nack: async () => {},
+      extendVisibility: async () => {},
+      stats: async () => ({ pending: 0, inFlight: 0, acked: 0, nacked: 0, deadLetter: 0 }),
+    };
+
+    const consumer = startConsumer<number, number>({
+      queue: badQueue,
+      handler: async (n) => n,
+      concurrency: 1,
+      visibilityTimeoutMs: 5_000,
+    });
+
+    // drain() awaits the (now-rejected-then-caught) loopPromise; it must
+    // resolve, not hang, because the catch handler swallows the throw.
+    await consumer.drain();
+
+    expect(writes.length).toBe(1);
+    expect(writes[0]).toContain("[queue-consumer] loop error:");
+    // The TypeError message about reading a property of null is surfaced.
+    expect(writes[0]).toMatch(/null|length/i);
+    expect(consumer.inFlight()).toBe(0);
+  });
+});
+
+describe("startConsumer — visibility renewal sidecar", () => {
+  test("fires extendVisibility on each renew tick and swallows renew failures", async () => {
+    // Deterministic timer control: capture scheduled callbacks instead of
+    // arming the real clock, so we drive renewal ticks by hand — no real
+    // timers, no leaked handles.
+    const scheduled: Array<{ id: number; fn: () => void; delay: number }> = [];
+    let nextId = 1;
+    const cleared: number[] = [];
+    const fakeSetTimeout = ((fn: () => void, delay?: number) => {
+      const id = nextId++;
+      scheduled.push({ id, fn, delay: delay ?? 0 });
+      return id as unknown as ReturnType<typeof setTimeout>;
+    }) as unknown as typeof setTimeout;
+    const fakeClearTimeout = ((handle: unknown) => {
+      cleared.push(handle as number);
+    }) as unknown as typeof clearTimeout;
+
+    // extendVisibility rejects so we also cover the `.catch(() => {})` swallow.
+    const extendCalls: Array<{ jobId: string; additionalMs: number }> = [];
+    let releaseHandler!: () => void;
+    const handlerGate = new Promise<void>((resolve) => {
+      releaseHandler = resolve;
+    });
+
+    const queue = createInMemoryQueue<string>();
+    await queue.enqueue("renew-job");
+    const baseExtend = queue.extendVisibility.bind(queue);
+    const renewQueue: QueueAdapter<string> = {
+      ...queue,
+      kind: queue.kind,
+      pull: queue.pull.bind(queue),
+      ack: queue.ack.bind(queue),
+      nack: queue.nack.bind(queue),
+      stats: queue.stats.bind(queue),
+      extendVisibility: async (jobId: string, additionalMs: number) => {
+        extendCalls.push({ jobId, additionalMs });
+        await baseExtend(jobId, additionalMs).catch(() => {});
+        // Force the renew-failure branch to exercise the swallowing catch.
+        throw new Error("extendVisibility failed (job already acked)");
+      },
+      enqueue: queue.enqueue.bind(queue),
+    } as unknown as QueueAdapter<string>;
+
+    const consumer = startConsumer<string, string>({
+      queue: renewQueue,
+      handler: async () => {
+        // Hold the job in-flight until we've driven a renew tick.
+        await handlerGate;
+        return "done";
+      },
+      concurrency: 1,
+      visibilityTimeoutMs: 5_000,
+      visibilityRenewIntervalMs: 1_000,
+      _setTimeout: fakeSetTimeout,
+      _clearTimeout: fakeClearTimeout,
+    });
+
+    // Wait until the handler is in-flight and the renew sidecar has armed
+    // its first timer (via the fake setTimeout).
+    const deadline = Date.now() + 2_000;
+    while (Date.now() < deadline && scheduled.length === 0) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    expect(scheduled.length).toBeGreaterThan(0);
+
+    // Fire the first renew tick: this invokes extendVisibility(jobId, 2000)
+    // and re-arms the next tick.
+    const firstTick = scheduled.shift();
+    expect(firstTick).toBeDefined();
+    firstTick?.fn();
+    // Let the rejected extendVisibility promise settle through its catch.
+    await new Promise((r) => setTimeout(r, 5));
+
+    expect(extendCalls.length).toBeGreaterThanOrEqual(1);
+    // intervalMs (1000) * 2 is the additional visibility window the tick requests.
+    expect(extendCalls[0]?.additionalMs).toBe(2_000);
+    // jobId is whatever the in-memory adapter assigned to the single enqueued job.
+    expect(typeof extendCalls[0]?.jobId).toBe("string");
+    expect(extendCalls[0]?.jobId.length).toBeGreaterThan(0);
+    // The tick re-armed a follow-up renew timer.
+    expect(scheduled.length).toBeGreaterThanOrEqual(1);
+
+    // Release the handler so the job completes and stopRenew() clears the
+    // outstanding timer (covers the clearTimeout path).
+    releaseHandler();
+    await consumer.drain();
+    expect(cleared.length).toBeGreaterThanOrEqual(1);
+  });
+
+  test("stopRenew before any tick fires clears the armed timer", async () => {
+    const scheduled: Array<() => void> = [];
+    const cleared: number[] = [];
+    const fakeSetTimeout = ((fn: () => void) => {
+      scheduled.push(fn);
+      return scheduled.length as unknown as ReturnType<typeof setTimeout>;
+    }) as unknown as typeof setTimeout;
+    const fakeClearTimeout = ((handle: unknown) => {
+      cleared.push(handle as number);
+    }) as unknown as typeof clearTimeout;
+
+    const queue = createInMemoryQueue<string>();
+    await queue.enqueue("fast-job");
+
+    const consumer = startConsumer<string, string>({
+      queue,
+      // Resolves immediately — stopRenew() runs in the finally before any
+      // renew tick is driven, so the armed timer is cleared, not fired.
+      handler: async () => "ok",
+      concurrency: 1,
+      visibilityTimeoutMs: 5_000,
+      visibilityRenewIntervalMs: 1_000,
+      _setTimeout: fakeSetTimeout,
+      _clearTimeout: fakeClearTimeout,
+    });
+
+    const deadline = Date.now() + 2_000;
+    while (Date.now() < deadline && (await queue.stats()).acked === 0) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    await consumer.drain();
+    expect((await queue.stats()).acked).toBe(1);
+    // The renew timer was armed then cleared on handler completion.
+    expect(cleared.length).toBeGreaterThanOrEqual(1);
   });
 });

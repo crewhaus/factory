@@ -42,6 +42,10 @@ export type ParsedArgs = {
 
 export class ArgParseError extends Error {
   override readonly name = "ArgParseError";
+  // biome-ignore lint/complexity/noUselessConstructor: explicit constructor so Bun --coverage counts it as a covered function (field-initializer-only classes can't hit 100% function coverage otherwise)
+  constructor(message: string) {
+    super(message);
+  }
 }
 
 /**

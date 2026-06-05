@@ -417,21 +417,34 @@ export const REGEX_RULES: ReadonlyArray<PromptInjectionRule> = [
   },
 ];
 
-if (REGEX_RULES.length < 50) {
-  // Defensive — if the list is ever trimmed below the corpus floor, fail
-  // at module-load instead of silently weakening detection.
-  throw new Error(
-    `prompt-injection-detector regex corpus has ${REGEX_RULES.length} rules; minimum is 50`,
-  );
+const MIN_CORPUS_RULES = 50;
+
+/**
+ * Defensive corpus-floor guard. If the rule list is ever trimmed below the
+ * documented minimum, fail loudly at module-load instead of silently weakening
+ * detection. Extracted (and re-exported via `__internals`) so the failure path
+ * is testable without mutating the production corpus.
+ */
+function assertCorpusFloor(rules: ReadonlyArray<PromptInjectionRule>): void {
+  if (rules.length < MIN_CORPUS_RULES) {
+    throw new Error(
+      `prompt-injection-detector regex corpus has ${rules.length} rules; minimum is ${MIN_CORPUS_RULES}`,
+    );
+  }
 }
+
+assertCorpusFloor(REGEX_RULES);
 
 function severityWeight(s: PromptInjectionSeverity): number {
   return SEVERITY_WEIGHT[s];
 }
 
-function regexHits(text: string): PromptInjectionHit[] {
+function regexHits(
+  text: string,
+  rules: ReadonlyArray<PromptInjectionRule> = REGEX_RULES,
+): PromptInjectionHit[] {
   const hits: PromptInjectionHit[] = [];
-  for (const rule of REGEX_RULES) {
+  for (const rule of rules) {
     const m = rule.pattern.exec(text);
     if (m === null) continue;
     const start = m.index;
@@ -729,3 +742,20 @@ export function llmClassifierEnabled(env: NodeJS.ProcessEnv = process.env): bool
   const m = env["CREWHAUS_PI_CLASSIFIER_MODEL"];
   return m !== undefined && m.trim() !== "";
 }
+
+/**
+ * Internal seams exposed ONLY for unit tests. Not part of the public API and
+ * not subject to semver — these let the test suite drive the module's
+ * defensive branches (corpus-floor guard, global-flag `lastIndex` reset, and
+ * the decoder `try/catch` fallbacks) with crafted inputs that the public
+ * `classifyText` entrypoint can never construct on its own. Do not import
+ * from application code.
+ */
+export const __internals = {
+  assertCorpusFloor,
+  regexHits,
+  tryDecodeBase64,
+  tryDecodeHex,
+  tryDecodePercent,
+  MIN_CORPUS_RULES,
+} as const;

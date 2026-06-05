@@ -8,18 +8,15 @@ export async function loadCsv(path: string): Promise<LoadedDataset> {
     throw new DatasetLoadError(`file not found: ${path}`);
   }
   const text = await file.text();
-  const rows = parseCsv(text);
-  if (rows.length === 0) {
-    return { name: basename(path).replace(/\.csv$/i, ""), samples: emptyIterable() };
-  }
-  const header = rows[0];
+  const [header, ...dataRows] = parseCsv(text);
+  const name = basename(path).replace(/\.csv$/i, "");
   if (!header) {
-    return { name: basename(path).replace(/\.csv$/i, ""), samples: emptyIterable() };
+    return { name, samples: emptyIterable() };
   }
 
   return {
-    name: basename(path).replace(/\.csv$/i, ""),
-    samples: rowsToSamples(rows.slice(1), header, path),
+    name,
+    samples: rowsToSamples(dataRows, header, path),
   };
 }
 

@@ -85,4 +85,25 @@ describe("emitVoice", () => {
   test("TargetEmitError type is exported", () => {
     expect(TargetEmitError).toBeDefined();
   });
+
+  test("TargetEmitError carries the compiler code, name, and message", () => {
+    const err = new TargetEmitError("voice codegen blew up");
+    expect(err).toBeInstanceOf(TargetEmitError);
+    expect(err).toBeInstanceOf(Error);
+    expect(err.name).toBe("TargetEmitError");
+    expect(err.message).toBe("voice codegen blew up");
+    expect(err.code).toBe("compiler");
+  });
+
+  test("TargetEmitError threads its cause through toJSON()", () => {
+    const root = new Error("disk full");
+    const err = new TargetEmitError("could not emit daemon", root);
+    expect(err.cause).toBe(root);
+    expect(err.toJSON()).toEqual({
+      name: "TargetEmitError",
+      code: "compiler",
+      message: "could not emit daemon",
+      cause: { name: "Error", message: "disk full" },
+    });
+  });
 });

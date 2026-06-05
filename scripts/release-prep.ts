@@ -31,8 +31,8 @@ const ROOT = resolve(flag("root") ?? process.cwd());
 
 const AUTHOR = {
   name: "Max Meier",
-  email: "max@studiomax.io",
-  url: "https://studiomax.io",
+  email: "max@crewhaus.ai",
+  url: "https://crewhaus.ai",
 };
 
 // Map workspace root → GitHub repo info

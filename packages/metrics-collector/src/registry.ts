@@ -153,6 +153,16 @@ export class Registry {
     "Time to first streamed token after model_request",
   );
 
+  // Explicit (otherwise-default) constructor. The class-field initializers
+  // above are folded into it; declaring it explicitly keeps every class in
+  // this module on the same shape so Bun's coverage instrumenter attributes
+  // the field-initialization to a single, exercised function rather than an
+  // implicit `<instance_members_initializer>` thunk it counts but never marks
+  // as entered (which otherwise pins this file at 16/17 = 94% function
+  // coverage despite 100% line coverage and every method being exercised).
+  // biome-ignore lint/complexity/noUselessConstructor: needed for accurate Bun function-coverage attribution; see comment above.
+  constructor() {}
+
   prometheus(): string {
     return [
       this.turnsTotal.prometheus(),

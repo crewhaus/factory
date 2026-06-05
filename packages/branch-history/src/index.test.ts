@@ -76,4 +76,50 @@ describe("diff", () => {
     expect(d[0]?.kind).toBe("same");
     expect(d[1]?.kind).toBe("only-a");
   });
+
+  test("only-b reported when run B is longer than run A", async () => {
+    const a = newGraphRunId();
+    const b = newGraphRunId();
+    await store.save({ graphRunId: a, nodeName: "x", state: 0 });
+    await store.save({ graphRunId: b, nodeName: "x", state: 0 });
+    await new Promise((r) => setTimeout(r, 10));
+    const extra = await store.save({ graphRunId: b, nodeName: "y", state: 1 });
+    const d = await diff(store, a, b);
+    expect(d.length).toBe(2);
+    expect(d[0]?.kind).toBe("same");
+    expect(d[1]?.kind).toBe("only-b");
+    // The only-b row carries B's checkpoint metadata and no `a` side.
+    expect(d[1]?.a).toBeUndefined();
+    expect(d[1]?.b?.checkpointId).toBe(extra.id);
+    expect(d[1]?.b?.nodeName).toBe("y");
+    expect(typeof d[1]?.b?.stateHash).toBe("string");
+  });
+});
+
+describe("stateHash (via diff)", () => {
+  // Regression: a checkpoint whose `state` serializes to `undefined`
+  // (e.g. `state: undefined`) once crashed `diff` with a TypeError from
+  // `createHash().update(undefined)`. It must now hash to a stable sentinel.
+  test("checkpoints with undefined state diff without throwing", async () => {
+    const a = newGraphRunId();
+    const b = newGraphRunId();
+    await store.save({ graphRunId: a, nodeName: "x", state: undefined });
+    await store.save({ graphRunId: b, nodeName: "x", state: undefined });
+    const d = await diff(store, a, b);
+    expect(d.length).toBe(1);
+    // Two undefined states hash identically, so the row is `same`.
+    expect(d[0]?.kind).toBe("same");
+    expect(d[0]?.a?.stateHash).toBe(d[0]?.b?.stateHash);
+  });
+
+  test("undefined state differs from a defined state", async () => {
+    const a = newGraphRunId();
+    const b = newGraphRunId();
+    await store.save({ graphRunId: a, nodeName: "x", state: undefined });
+    await store.save({ graphRunId: b, nodeName: "x", state: { v: 1 } });
+    const d = await diff(store, a, b);
+    expect(d.length).toBe(1);
+    expect(d[0]?.kind).toBe("state-mismatch");
+    expect(d[0]?.a?.stateHash).not.toBe(d[0]?.b?.stateHash);
+  });
 });

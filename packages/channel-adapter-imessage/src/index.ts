@@ -274,13 +274,38 @@ function writeCursor(cursorPath: string, cursor: number): void {
 
 // ─── default osascript runner ──────────────────────────────────────────────
 
-const defaultOsascript = async (script: string): Promise<void> => {
-  const { spawn } = await import("node:child_process");
+/**
+ * Minimal structural type for the slice of `child_process.spawn` that the
+ * osascript runner uses. Keeping it explicit (rather than importing Node's
+ * `ChildProcess`) lets tests inject a deterministic fake without a real
+ * process spawn — mirroring the dependency-injection style used elsewhere in
+ * factory's adapters.
+ */
+type SpawnedChild = {
+  readonly stdout?: { on(event: "data", cb: (chunk: Buffer) => void): void } | null;
+  readonly stderr: { on(event: "data", cb: (chunk: Buffer) => void): void } | null;
+  readonly stdin: { write(chunk: string): void; end(): void } | null;
+  on(event: "error", cb: (err: Error) => void): void;
+  on(event: "close", cb: (code: number | null) => void): void;
+};
+
+export type OsascriptSpawn = (
+  command: string,
+  args: readonly string[],
+  options: { stdio: readonly ["pipe", "ignore", "pipe"] },
+) => SpawnedChild;
+
+/**
+ * Run `osascript` reading the script from stdin, using an injected `spawn`.
+ * Resolves on exit code 0; rejects with an {@link IMessageAdapterError} on a
+ * spawn failure or any non-zero exit (surfacing captured stderr).
+ */
+export function runOsascript(spawn: OsascriptSpawn, script: string): Promise<void> {
   return new Promise<void>((resolve, reject) => {
     const head = "osascript";
     const child = spawn(head, ["-"], { stdio: ["pipe", "ignore", "pipe"] });
     const errBufs: Buffer[] = [];
-    child.stderr.on("data", (b) => errBufs.push(b));
+    child.stderr?.on("data", (b) => errBufs.push(b));
     child.on("error", (e) => reject(new IMessageAdapterError("osascript spawn failed", e)));
     child.on("close", (code) => {
       if (code === 0) resolve();
@@ -291,9 +316,14 @@ const defaultOsascript = async (script: string): Promise<void> => {
           ),
         );
     });
-    child.stdin.write(script);
-    child.stdin.end();
+    child.stdin?.write(script);
+    child.stdin?.end();
   });
+}
+
+const defaultOsascript = async (script: string): Promise<void> => {
+  const { spawn } = await import("node:child_process");
+  return runOsascript(spawn as unknown as OsascriptSpawn, script);
 };
 
 // ─── chat.db row shape + query ──────────────────────────────────────────────
@@ -327,4 +357,5 @@ export const _internal = {
   isSafeHandle,
   escapeAppleScriptString,
   validateChatDbPath,
+  runOsascript,
 };

@@ -1,7 +1,18 @@
 import { beforeEach, describe, expect, test } from "bun:test";
-import { clearBoundaryCache } from "@crewhaus/boundary-classifier";
-import { type RunContext, createRunContext } from "@crewhaus/run-context";
-import { classifyInbound } from "./index";
+import {
+  classifyBoundary as classifyBoundaryDirect,
+  clearBoundaryCache,
+} from "@crewhaus/boundary-classifier";
+import {
+  type RunContext,
+  createRunContext,
+  tagContent as tagContentDirect,
+} from "@crewhaus/run-context";
+import {
+  classifyBoundary as classifyBoundaryReexport,
+  classifyInbound,
+  tagContent as tagContentReexport,
+} from "./index";
 
 // >= 16 chars so tagContent's egress floor (run-context:229) does not skip it.
 const CLEAN = "What is the weather in Berlin today, please?";
@@ -78,5 +89,52 @@ describe("classifyInbound — edge cases", () => {
     // verbatim and tagged.
     expect(out).toBe(MALICIOUS);
     expect(c.dataLineage?.get(MALICIOUS)).toBe("channel");
+  });
+});
+
+describe("classifyInbound — explicit origin option", () => {
+  test("an explicitly-supplied origin 'channel' behaves identically to the default", async () => {
+    // Exercises the left operand of `opts.origin ?? "channel"` (the default
+    // path is covered elsewhere) and confirms the explicit form tags lineage
+    // under the same "channel" origin.
+    const c = ctx();
+    const out = await classifyInbound(CLEAN, c, { origin: "channel" });
+    expect(out).toBe(CLEAN);
+    expect(c.dataLineage?.get(CLEAN)).toBe("channel");
+  });
+
+  test("explicit origin still redacts malicious inbound and tags nothing", async () => {
+    const c = ctx();
+    const out = await classifyInbound(MALICIOUS, c, { origin: "channel" });
+    expect(out).toContain("[tool output redacted");
+    expect(c.dataLineage?.get(MALICIOUS)).toBeUndefined();
+  });
+});
+
+describe("redaction branch — exact substitute, no lineage leak", () => {
+  test("blocked output equals the classifier's redaction notice verbatim", async () => {
+    // Tighten the malicious-path contract: the returned string must be the
+    // *exact* redaction notice that classifyBoundary produces (action
+    // 'redact' + redacted), proving classifyInbound substitutes the notice
+    // rather than emitting its own. Caches are cleared per-test so both
+    // calls classify the same input identically.
+    const c = ctx();
+    const direct = await classifyBoundaryReexport(MALICIOUS, { origin: "channel" });
+    expect(direct.action).toBe("redact");
+    expect(direct.redacted).toBeDefined();
+    clearBoundaryCache();
+    const out = await classifyInbound(MALICIOUS, c);
+    expect(out).toBe(direct.redacted as string);
+    // The attacker text never enters lineage on the redact path.
+    expect(c.dataLineage?.get(MALICIOUS)).toBeUndefined();
+  });
+});
+
+describe("convenience re-exports", () => {
+  test("re-exports the same classifyBoundary and tagContent references", () => {
+    // Channel call sites depend on this single package; the re-exports must
+    // be the very functions from the underlying packages, not shims.
+    expect(classifyBoundaryReexport).toBe(classifyBoundaryDirect);
+    expect(tagContentReexport).toBe(tagContentDirect);
   });
 });

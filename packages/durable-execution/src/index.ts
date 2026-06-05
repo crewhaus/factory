@@ -54,7 +54,10 @@ export interface IdempotencyStore {
 }
 
 class InMemoryIdempotencyStore implements IdempotencyStore {
-  private readonly entries = new Map<IdempotencyKey, IdempotencyRecord>();
+  private readonly entries: Map<IdempotencyKey, IdempotencyRecord>;
+  constructor() {
+    this.entries = new Map<IdempotencyKey, IdempotencyRecord>();
+  }
   async get(key: IdempotencyKey): Promise<IdempotencyRecord | undefined> {
     return this.entries.get(key);
   }

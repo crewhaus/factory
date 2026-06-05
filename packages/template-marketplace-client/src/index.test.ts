@@ -15,6 +15,25 @@ const seed = (overrides: Partial<TemplateManifest> = {}): TemplateManifest => ({
   ...overrides,
 });
 
+describe("MarketplaceClientError", () => {
+  test("carries the config error code and serializes its cause chain", () => {
+    const root = new Error("permission denied");
+    const err = new MarketplaceClientError("install failed", root);
+    expect(err).toBeInstanceOf(MarketplaceClientError);
+    expect(err.name).toBe("MarketplaceClientError");
+    expect(err.code).toBe("config");
+    expect(err.cause).toBe(root);
+    // Exercises the inherited toJSON() (+ its cause serializer) so the full
+    // error-reporting surface the marketplace throws through is verified.
+    expect(err.toJSON()).toEqual({
+      name: "MarketplaceClientError",
+      code: "config",
+      message: "install failed",
+      cause: { name: "Error", message: "permission denied" },
+    });
+  });
+});
+
 describe("MarketplaceClient — search (T1)", () => {
   let tmp: string;
   beforeEach(() => {

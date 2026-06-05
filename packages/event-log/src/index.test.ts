@@ -203,3 +203,60 @@ describe("event-log — cross-tenant fencing (CWE-1230)", () => {
     expect(all.length).toBe(1);
   });
 });
+
+describe("event-log — security invariants", () => {
+  // The header documents owner-only (0o600) append semantics, mirroring the
+  // claude-code sessionStorage precedent. Pin it down so a regression that
+  // drops `{ mode: 0o600 }` (widening the transcript to group/other) fails.
+  test("the JSONL file is created without group/other access", async () => {
+    const rootDir = newTempRoot();
+    const log = await openEventLog(TEST_ID, { rootDir });
+    await log.append({ kind: "user_message", payload: { secret: "transcript" } });
+    const mode = statSync(join(rootDir, `${TEST_ID}.jsonl`)).mode & 0o777;
+    // No bits set for group (0o070) or other (0o007).
+    expect(mode & 0o077).toBe(0);
+  });
+
+  // A hostile/corrupt log line carrying a `__proto__` key must round-trip as
+  // plain data and must NOT pollute Object.prototype (CWE-1321). readEvents
+  // only `JSON.parse`s + yields; it never merges into an existing object, so
+  // there is no pollution sink — this guards against a future refactor adding
+  // one.
+  test("a __proto__ payload does not pollute Object.prototype", async () => {
+    const rootDir = newTempRoot();
+    const log = await openEventLog(TEST_ID, { rootDir });
+    await log.append({ kind: "user_message", payload: {} });
+    writeFileSync(
+      join(rootDir, `${TEST_ID}.jsonl`),
+      `${JSON.stringify({
+        ts: 1,
+        version: 1,
+        kind: "user_message",
+        payload: JSON.parse('{"__proto__":{"polluted":true}}'),
+      })}\n`,
+    );
+    const all = await collect(log.read());
+    expect(all.length).toBe(1);
+    // The global prototype must remain unpolluted for everyone else.
+    expect(({} as Record<string, unknown>)["polluted"]).toBeUndefined();
+    expect((Object.prototype as Record<string, unknown>)["polluted"]).toBeUndefined();
+  });
+
+  // The sessionId becomes part of the on-disk path; only `sess_<16 hex>` is
+  // accepted, so traversal / absolute-path / NUL injection in the id can never
+  // reach the filesystem (CWE-22).
+  test("rejects traversal, separators, and NUL in the session id", async () => {
+    const rootDir = newTempRoot();
+    for (const bad of [
+      "sess_../../etc/passwd",
+      "sess_0123456789abcde/", // 15 hex + slash
+      "sess_0123456789abcdeg", // non-hex char
+      "sess_0123456789ABCDEF", // uppercase hex not allowed
+      "sess_0123456789abcdef0", // 17 hex (too long)
+      "sess_ 000000000000",
+      "../escape",
+    ]) {
+      await expect(openEventLog(bad, { rootDir })).rejects.toThrow(/invalid sessionId/);
+    }
+  });
+});

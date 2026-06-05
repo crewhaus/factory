@@ -124,6 +124,55 @@ describe("renderTemplate primitives (T1)", () => {
     const ctx = renderContext({ ...defaultValues(), target: "channel" });
     expect(renderTemplate("{{ .Values.target | quote }}", ctx)).toBe(`"channel"`);
   });
+
+  // `and`/`or` operands are split at top-level spaces; the mini-evaluator
+  // resolves bare boolean dot-paths per operand. (Parenthesised operands are
+  // only special-cased for has/list, so we use plain boolean paths here.)
+  test("and predicate is true only when every operand is truthy", () => {
+    const bothOn = renderContext({
+      ...defaultValues(),
+      ingress: { ...defaultValues().ingress, enabled: true },
+      otel: { enabled: true, endpoint: "", headers: "" },
+    });
+    expect(
+      renderTemplate("{{ if and .Values.ingress.enabled .Values.otel.enabled }}A{{ end }}", bothOn),
+    ).toBe("A");
+    const oneOff = renderContext({
+      ...defaultValues(),
+      ingress: { ...defaultValues().ingress, enabled: true },
+      otel: { enabled: false, endpoint: "", headers: "" },
+    });
+    expect(
+      renderTemplate(
+        "{{ if and .Values.ingress.enabled .Values.otel.enabled }}A{{ else }}N{{ end }}",
+        oneOff,
+      ),
+    ).toBe("N");
+  });
+
+  test("or predicate is true when any operand is truthy", () => {
+    // first operand false, second true → true
+    const oneOn = renderContext({
+      ...defaultValues(),
+      ingress: { ...defaultValues().ingress, enabled: false },
+      otel: { enabled: true, endpoint: "", headers: "" },
+    });
+    expect(
+      renderTemplate("{{ if or .Values.ingress.enabled .Values.otel.enabled }}O{{ end }}", oneOn),
+    ).toBe("O");
+    // every operand false → false (exercises the else arm)
+    const allOff = renderContext({
+      ...defaultValues(),
+      ingress: { ...defaultValues().ingress, enabled: false },
+      otel: { enabled: false, endpoint: "", headers: "" },
+    });
+    expect(
+      renderTemplate(
+        "{{ if or .Values.ingress.enabled .Values.otel.enabled }}O{{ else }}N{{ end }}",
+        allOff,
+      ),
+    ).toBe("N");
+  });
 });
 
 describe("renderChart() — full render per shape (T1)", () => {
@@ -179,5 +228,123 @@ describe("renderChart() — full render per shape (T1)", () => {
   test("cli deployment does NOT wire Slack env vars", () => {
     const out = renderChart({ ...defaultValues(), target: "cli" });
     expect(out["deployment.yaml"]).not.toContain("SLACK_SIGNING_SECRET");
+  });
+});
+
+describe("range / with bind dot (withDot)", () => {
+  // The `range` body re-binds `.` to each item; `.host` then resolves off
+  // the per-item dot rather than the outer context. This exercises withDot()
+  // and the resolveDotPath `_dot` branch.
+  test("range over a non-empty list rebinds `.` to each element", () => {
+    const ctx = renderContext({
+      ...defaultValues(),
+      ingress: {
+        ...defaultValues().ingress,
+        hosts: [
+          { host: "a.example.com", paths: [] },
+          { host: "b.example.com", paths: [] },
+        ],
+      },
+    });
+    const out = renderTemplate("{{ range .Values.ingress.hosts }}host={{ .host }};{{ end }}", ctx);
+    expect(out).toBe("host=a.example.com;host=b.example.com;");
+  });
+
+  test("range over an empty list yields nothing (no withDot call)", () => {
+    const ctx = renderContext({ ...defaultValues() });
+    const out = renderTemplate("{{ range .Values.ingress.hosts }}X{{ end }}", ctx);
+    expect(out).toBe("");
+  });
+
+  test("with binds `.` to a non-empty object", () => {
+    const ctx = renderContext({
+      ...defaultValues(),
+      ingress: {
+        ...defaultValues().ingress,
+        annotations: { "kubernetes.io/ingress.class": "nginx" },
+      },
+    });
+    // Non-empty object → `with` body executes and dot is rebound via withDot().
+    expect(renderTemplate("{{ with .Values.ingress.annotations }}IN{{ end }}", ctx)).toBe("IN");
+  });
+
+  test("with skips an empty object (falsy guard, no withDot call)", () => {
+    const ctx = renderContext({ ...defaultValues() });
+    // The mini-renderer's `with` has no else arm — the whole body (incl. any
+    // stray `else`) is skipped when the value is an empty object, so we get "".
+    expect(renderTemplate("{{ with .Values.ingress.annotations }}IN{{ end }}", ctx)).toBe("");
+  });
+});
+
+describe("toYaml filter (simpleYaml)", () => {
+  // toYaml is only reachable as a *pipe* filter: `{{ X | toYaml }}`. (The
+  // chart templates' `{{- toYaml . | nindent N }}` head form is treated as a
+  // literal by this mini-renderer, which is why simpleYaml was uncovered.)
+  test("renders a nested object with multiline children", () => {
+    // .Values.resources is { requests: {...}, limits: {...} } — exercises the
+    // object branch, the nested-object (inner includes '\n') branch, strings,
+    // and the recursive descent.
+    const ctx = renderContext({ ...defaultValues() });
+    const out = renderTemplate("{{ .Values.resources | toYaml }}", ctx);
+    expect(out).toContain("requests:");
+    expect(out).toContain('cpu: "100m"');
+    expect(out).toContain('memory: "256Mi"');
+    expect(out).toContain("limits:");
+    expect(out).toContain('cpu: "1000m"');
+  });
+
+  test("renders booleans and numbers unquoted", () => {
+    const ctx = renderContext({
+      ...defaultValues(),
+      podSecurityContext: { runAsNonRoot: true, runAsUser: 10001 },
+    });
+    const out = renderTemplate("{{ .Values.podSecurityContext | toYaml }}", ctx);
+    expect(out).toContain("runAsNonRoot: true");
+    expect(out).toContain("runAsUser: 10001");
+  });
+
+  test("renders a non-empty array as YAML list items", () => {
+    const ctx = renderContext({
+      ...defaultValues(),
+      image: {
+        ...defaultValues().image,
+        pullSecrets: [{ name: "regcred" }, { name: "ghcr" }],
+      },
+    });
+    const out = renderTemplate("{{ .Values.image.pullSecrets | toYaml }}", ctx);
+    expect(out).toContain('- name: "regcred"');
+    expect(out).toContain('- name: "ghcr"');
+  });
+
+  test("renders an empty array as []", () => {
+    const ctx = renderContext({ ...defaultValues() });
+    // defaultValues().image.pullSecrets is [].
+    expect(renderTemplate("{{ .Values.image.pullSecrets | toYaml }}", ctx)).toBe("[]");
+  });
+
+  test("renders an empty object as {}", () => {
+    const ctx = renderContext({ ...defaultValues() });
+    // defaultValues().serviceMonitor.labels is {}.
+    expect(renderTemplate("{{ .Values.serviceMonitor.labels | toYaml }}", ctx)).toBe("{}");
+  });
+
+  test("renders a missing path (undefined) as null", () => {
+    const ctx = renderContext({ ...defaultValues() });
+    expect(renderTemplate("{{ .Values.doesNotExist | toYaml }}", ctx)).toBe("null");
+  });
+
+  test("renders a nested array-of-objects (recursive list + object branch)", () => {
+    const ctx = renderContext({
+      ...defaultValues(),
+      ingress: {
+        ...defaultValues().ingress,
+        tls: [{ hosts: ["a.example.com", "b.example.com"], secretName: "tls-cert" }],
+      },
+    });
+    const out = renderTemplate("{{ .Values.ingress.tls | toYaml }}", ctx);
+    expect(out).toContain('secretName: "tls-cert"');
+    // hosts is a string array nested under an object inside a list item.
+    expect(out).toContain("a.example.com");
+    expect(out).toContain("b.example.com");
   });
 });

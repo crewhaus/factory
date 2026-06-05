@@ -156,4 +156,66 @@ describe("snip", () => {
       expect(useIds.has(id)).toBe(true);
     }
   });
+
+  test("tool_use in head with no matching result anywhere does not move the boundary", () => {
+    // index 1 holds a tool_use whose tool_result is absent from the entire
+    // conversation. The head-side defense must scan the whole array, find no
+    // result (findToolResultIndex → -1), and leave the snip boundary alone.
+    const messages: Anthropic.MessageParam[] = [
+      userMsg("u0"),
+      {
+        role: "assistant",
+        content: [{ type: "tool_use", id: "tu_orphan", name: "Bash", input: { cmd: "ls" } }],
+      },
+      userMsg("u2"),
+      asstMsg("a3"),
+      userMsg("u4"),
+      asstMsg("a5"),
+      userMsg("u6"),
+      asstMsg("a7"),
+    ];
+
+    const out = snip(messages, 2, 2);
+    // Naive cut [2..6) removes 4 messages; nothing pulls the boundary because
+    // the dangling tool_use has no result to rescue.
+    expect(out.length).toBe(5);
+    expect(out[2]).toEqual({
+      role: "assistant",
+      content: "[Context compacted: 4 messages removed]",
+    });
+    // The dangling tool_use stays in the head untouched (a tool_use without a
+    // result is API-legal; only orphan tool_results are rejected).
+    const flat = out.flatMap((m) => (typeof m.content === "string" ? [] : m.content));
+    expect(flat.some((b) => b.type === "tool_use" && b.id === "tu_orphan")).toBe(true);
+  });
+
+  test("pre-orphaned tool_result in tail with no use anywhere does not move the boundary", () => {
+    // index 6 holds a tool_result whose tool_use is absent from the entire
+    // conversation (the input was already orphaned). The tail-side defense must
+    // scan the whole array, find no use (findToolUseIndex → -1), and leave the
+    // snip boundary alone — input orphans are preserved, not "fixed".
+    const messages: Anthropic.MessageParam[] = [
+      userMsg("u0"),
+      asstMsg("a1"),
+      userMsg("u2"),
+      asstMsg("a3"),
+      userMsg("u4"),
+      asstMsg("a5"),
+      {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: "tu_ghost", content: "stale" }],
+      },
+      asstMsg("a7"),
+    ];
+
+    const out = snip(messages, 2, 2);
+    // Naive cut [2..6) removes 4 messages; the pre-orphaned result stays in tail.
+    expect(out.length).toBe(5);
+    expect(out[2]).toEqual({
+      role: "assistant",
+      content: "[Context compacted: 4 messages removed]",
+    });
+    const flat = out.flatMap((m) => (typeof m.content === "string" ? [] : m.content));
+    expect(flat.some((b) => b.type === "tool_result" && b.tool_use_id === "tu_ghost")).toBe(true);
+  });
 });

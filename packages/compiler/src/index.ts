@@ -189,24 +189,21 @@ type SpecWithPermissions = Exclude<Spec, { target: "eval" }>;
  * regex-validated the format at the spec layer; this is the
  * deterministic numeric step.
  */
+const DURATION_UNIT_MS: Record<"ms" | "s" | "m" | "h", number> = {
+  ms: 1,
+  s: 1000,
+  m: 60 * 1000,
+  h: 60 * 60 * 1000,
+};
 function parseDurationToMs(duration: string): number {
-  const m = /^(\d+)(ms|s|m|h)$/.exec(duration);
+  const m = duration.match(/^(\d+)(ms|s|m|h)$/);
   if (!m) {
     throw new Error(`invalid duration "${duration}" (caught past spec validation)`);
   }
   const n = Number.parseInt(m[1] ?? "0", 10);
-  switch (m[2]) {
-    case "ms":
-      return n;
-    case "s":
-      return n * 1000;
-    case "m":
-      return n * 60 * 1000;
-    case "h":
-      return n * 60 * 60 * 1000;
-    default:
-      throw new Error(`unreachable duration unit "${m[2]}"`);
-  }
+  // The capture group is statically one of the table's keys (the regex permits
+  // no other unit), so the lookup is total — no unreachable default arm.
+  return n * DURATION_UNIT_MS[m[2] as keyof typeof DURATION_UNIT_MS];
 }
 
 function lowerPermissions(spec: SpecWithPermissions): IrPermissions {
@@ -592,6 +589,26 @@ function lowerChainSubsystem(spec: SpecChainSubsystem): IrChainSubsystem {
   return out;
 }
 
+/**
+ * Phase 3 §47 — validate that the onchain-game subsystem lowering produced a
+ * chain, wallet, and contract, returning them as a non-optional triple.
+ * lower() builds single-element input arrays, so in the normal flow these are
+ * always present; this guard documents that precondition and is exported so
+ * the direct-call surface (callers that build IR via lower()/this helper
+ * rather than through parseSpec) gets a precise, typed failure instead of an
+ * opaque `undefined` slipping into the IR.
+ */
+export function assertChainGameLowered(
+  chain: IrChainBinding | undefined,
+  wallet: IrWalletBinding | undefined,
+  contract: IrContractBinding | undefined,
+): { chain: IrChainBinding; wallet: IrWalletBinding; contract: IrContractBinding } {
+  if (chain === undefined || wallet === undefined || contract === undefined) {
+    throw new CompilerError("onchain-game lowering failed to produce chain/wallet/contract");
+  }
+  return { chain, wallet, contract };
+}
+
 export function lower(spec: Spec): IrNode {
   switch (spec.target) {
     case "cli":
@@ -952,20 +969,22 @@ export function lower(spec: Spec): IrNode {
       } satisfies IrChainV0;
     }
     case "onchain-game": {
-      // onchain-game inlines a single chain/wallet/contract, so we lower
-      // each one through the shared helpers and then assemble.
+      // onchain-game inlines a single chain/wallet/contract, so we lower them
+      // through the shared subsystem helper and pull the single element out of
+      // each result. The helper sets each output array iff the matching input
+      // array is provided, and we always provide non-empty single-element
+      // inputs here, so chains/wallets/contracts are each a populated [0].
       const lowered = lowerChainSubsystem({
         chains: [spec.chain],
         wallets: [spec.wallet],
         contracts: [spec.game.contract],
         transaction_policy: spec.transaction_policy,
       });
-      const chain = lowered.chains?.[0];
-      const wallet = lowered.wallets?.[0];
-      const contract = lowered.contracts?.[0];
-      if (chain === undefined || wallet === undefined || contract === undefined) {
-        throw new Error("onchain-game lowering failed to produce chain/wallet/contract");
-      }
+      const { chain, wallet, contract } = assertChainGameLowered(
+        lowered.chains?.[0],
+        lowered.wallets?.[0],
+        lowered.contracts?.[0],
+      );
       return {
         version: 0,
         name: spec.name,

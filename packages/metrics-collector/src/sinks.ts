@@ -60,6 +60,46 @@ export type HttpSink = Sink & { readonly port: number; readonly host: string };
  */
 export const DEFAULT_HTTP_HOST = "127.0.0.1";
 
+/** Minimal request surface the scrape handler reads. */
+export type MetricsRequest = { url?: string | undefined };
+/**
+ * Minimal response surface the scrape handler writes. Structurally compatible
+ * with Node's `ServerResponse` (whose `setHeader`/`end` also accept these
+ * args) while staying decoupled from its chainable return types so tests can
+ * pass lightweight stand-ins.
+ */
+export type MetricsResponse = {
+  statusCode: number;
+  setHeader(name: string, value: string): unknown;
+  end(chunk?: string): unknown;
+};
+
+/**
+ * Pull-based scrape handler for the `/metrics` HTTP sink. Extracted from the
+ * `createServer` callback so each routing branch (missing URL → 404,
+ * `/metrics` → 200 exposition, anything else → 404) is unit-testable without
+ * standing up a real socket.
+ */
+export function handleMetricsRequest(
+  registry: Registry,
+  req: MetricsRequest,
+  res: MetricsResponse,
+): void {
+  if (!req.url) {
+    res.statusCode = 404;
+    res.end();
+    return;
+  }
+  if (req.url === "/metrics") {
+    res.statusCode = 200;
+    res.setHeader("Content-Type", "text/plain; version=0.0.4");
+    res.end(registry.prometheus());
+    return;
+  }
+  res.statusCode = 404;
+  res.end();
+}
+
 export async function httpServer(
   registry: Registry,
   port: number,
@@ -69,19 +109,7 @@ export async function httpServer(
   let server: Server | undefined;
   await new Promise<void>((resolve, reject) => {
     server = http.createServer((req, res) => {
-      if (!req.url) {
-        res.statusCode = 404;
-        res.end();
-        return;
-      }
-      if (req.url === "/metrics") {
-        res.statusCode = 200;
-        res.setHeader("Content-Type", "text/plain; version=0.0.4");
-        res.end(registry.prometheus());
-        return;
-      }
-      res.statusCode = 404;
-      res.end();
+      handleMetricsRequest(registry, req, res);
     });
     server.once("error", reject);
     // Bind to `host` (loopback unless an explicit interface was requested) so

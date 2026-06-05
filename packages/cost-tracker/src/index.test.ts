@@ -72,6 +72,19 @@ describe("cost-tracker — T1 pricing table", () => {
     expect(resolvePricing(DEFAULT_PRICING, "openai", "gpt-not-a-real-model")).toBeUndefined();
   });
 
+  test("resolvePricing returns undefined (does not throw) for a known provider with an unmapped model id", () => {
+    // Contract: a known provider but no matching model prefix is a pricing
+    // *miss* (returns undefined), never a throw — an unmapped model id must
+    // not crash an in-flight run. Locks the doc comment to actual behavior.
+    let result: ReturnType<typeof resolvePricing> | "threw";
+    try {
+      result = resolvePricing(DEFAULT_PRICING, "anthropic", "totally-unmapped-model-xyz");
+    } catch {
+      result = "threw";
+    }
+    expect(result).toBeUndefined();
+  });
+
   test("computeCostMicros: integer-rounded sum of input + output costs", () => {
     const row = { inputPer1M: 15.0, outputPer1M: 75.0 };
     // 1000 input × $15/M = $0.015 = 15_000 micros

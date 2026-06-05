@@ -2,7 +2,7 @@
  * T1 — `model_stream_token` events collapse into one rolling summary line.
  * Non-token events are passed through to the caller's formatter.
  */
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import type { TraceEvent } from "@crewhaus/trace-event-bus";
 import { StreamCollapser } from "./stream-collapser";
 
@@ -81,5 +81,37 @@ describe("StreamCollapser", () => {
     // Two writes: the rolling stream update + the (done) finalizer.
     expect(writes.length).toBeGreaterThanOrEqual(2);
     expect(writes[writes.length - 1]).toContain("(done)");
+  });
+});
+
+describe("StreamCollapser default sink", () => {
+  const originalWrite = process.stderr.write.bind(process.stderr);
+
+  afterEach(() => {
+    // Restore the real stderr writer so no mock leaks into other tests.
+    process.stderr.write = originalWrite;
+  });
+
+  test("falls back to process.stderr.write when no sink is supplied", () => {
+    // Exercises the default-sink branch in the constructor without touching
+    // the real terminal: we stub stderr.write to capture the chunk. isTty is
+    // forced false so exactly one (deterministic) summary line is emitted.
+    const captured: string[] = [];
+    process.stderr.write = ((chunk: string | Uint8Array): boolean => {
+      captured.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString());
+      return true;
+    }) as typeof process.stderr.write;
+
+    const collapser = new StreamCollapser({ isTty: false });
+    collapser.consume({
+      ...baseEnv,
+      kind: "model_stream_token",
+      chunkIndex: 0,
+      deltaChars: 4,
+    } as TraceEvent);
+    collapser.finalize();
+
+    expect(captured).toHaveLength(1);
+    expect(captured[0]).toBe("[stream] chunks=1 chars=4 (done)\n");
   });
 });

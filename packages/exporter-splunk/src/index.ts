@@ -155,4 +155,7 @@ export function attachSplunkIfEnvSet(
   return attachSplunkExporter(bus, opts);
 }
 
-export { scrubAccessToken as _scrubAccessTokenForTest };
+export {
+  scrubAccessToken as _scrubAccessTokenForTest,
+  wrapFetchWithSplunkAttrs as _wrapFetchWithSplunkAttrsForTest,
+};

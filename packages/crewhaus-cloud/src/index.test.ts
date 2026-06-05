@@ -1,4 +1,5 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
+import * as nodeCrypto from "node:crypto";
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -187,6 +188,86 @@ describe("deployCloud (T2 dry-run with fake runner)", () => {
         runner,
       }),
     ).rejects.toThrow(/no AWS credentials/);
+  });
+});
+
+describe("randomPassword (CWE-338 regression — CSPRNG, not Math.random)", () => {
+  function passwordFromCalls(calls: string[][]): string | undefined {
+    for (const argv of calls) {
+      const varArg = argv.find((a) => a.startsWith("spec_registry_password="));
+      if (varArg) return varArg.slice("spec_registry_password=".length);
+    }
+    return undefined;
+  }
+
+  test("deploy injects a 24-char hex password sourced from node:crypto.randomBytes", async () => {
+    const randomBytesSpy = spyOn(nodeCrypto, "randomBytes");
+    try {
+      const dir = mkdtempSync(join(tmpdir(), "crewhaus-cloud-pw-"));
+      const calls: string[][] = [];
+      const runner: CloudRunner = async (argv) => {
+        calls.push([...argv]);
+        return { exitCode: 0, stdout: "", stderr: "" };
+      };
+      await deployCloud({
+        config: defaultCloudConfig("aws", "us-east-1"),
+        workingDir: dir,
+        runner,
+      });
+      const pw = passwordFromCalls(calls);
+      expect(pw).toBeDefined();
+      // Same shape as before the fix: exactly 24 lowercase-hex characters.
+      expect(pw).toMatch(/^[0-9a-f]{24}$/);
+      // Proves the placeholder is drawn from the CSPRNG, not Math.random().
+      expect(randomBytesSpy).toHaveBeenCalled();
+    } finally {
+      randomBytesSpy.mockRestore();
+    }
+  });
+
+  test("two separate deploys produce different passwords (not a constant)", async () => {
+    const collect = async (): Promise<string | undefined> => {
+      const dir = mkdtempSync(join(tmpdir(), "crewhaus-cloud-pw-"));
+      const calls: string[][] = [];
+      const runner: CloudRunner = async (argv) => {
+        calls.push([...argv]);
+        return { exitCode: 0, stdout: "", stderr: "" };
+      };
+      await deployCloud({
+        config: defaultCloudConfig("gcp", "us-central1"),
+        workingDir: dir,
+        runner,
+      });
+      return passwordFromCalls(calls);
+    };
+    const [a, b] = [await collect(), await collect()];
+    expect(a).toMatch(/^[0-9a-f]{24}$/);
+    expect(b).toMatch(/^[0-9a-f]{24}$/);
+    expect(a).not.toBe(b);
+  });
+
+  test("teardown also injects a CSPRNG-sourced 24-char hex password", async () => {
+    const randomBytesSpy = spyOn(nodeCrypto, "randomBytes");
+    try {
+      const dir = mkdtempSync(join(tmpdir(), "crewhaus-cloud-pw-td-"));
+      await deployCloud({ config: defaultCloudConfig("aws", "us-east-1"), workingDir: dir });
+      randomBytesSpy.mockClear();
+      const calls: string[][] = [];
+      const runner: CloudRunner = async (argv) => {
+        calls.push([...argv]);
+        return { exitCode: 0, stdout: "", stderr: "" };
+      };
+      await teardownCloud({
+        config: defaultCloudConfig("aws", "us-east-1"),
+        workingDir: dir,
+        runner,
+      });
+      const pw = passwordFromCalls(calls);
+      expect(pw).toMatch(/^[0-9a-f]{24}$/);
+      expect(randomBytesSpy).toHaveBeenCalled();
+    } finally {
+      randomBytesSpy.mockRestore();
+    }
   });
 });
 

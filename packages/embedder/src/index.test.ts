@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { EmbedderError, createEmbedder, parseEmbedderModel } from "./index";
 
 describe("parseEmbedderModel", () => {
@@ -145,5 +145,219 @@ describe("Section 30 — embedder magnitude snapshots", () => {
     expect(() => createEmbedder({ model: "openai/text-embedding-3-small" })).toThrow();
     expect(() => createEmbedder({ model: "voyage/voyage-3" })).toThrow();
     expect(() => createEmbedder({ model: "cohere/embed-v3" })).toThrow();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// createEmbedder — provider branch coverage (env + explicit key).
+// ---------------------------------------------------------------------------
+
+/** Save/restore a single env var around a callback. */
+function withEnv(key: string, value: string | undefined, fn: () => void): void {
+  const original = process.env[key];
+  if (value === undefined) delete process.env[key];
+  else process.env[key] = value;
+  try {
+    fn();
+  } finally {
+    if (original === undefined) delete process.env[key];
+    else process.env[key] = original;
+  }
+}
+
+describe("createEmbedder — provider construction branches", () => {
+  test("openai reads OPENAI_API_KEY from env when no explicit key", () => {
+    withEnv("OPENAI_API_KEY", "sk-env", () => {
+      const e = createEmbedder({ model: "openai/text-embedding-3-small" });
+      expect(e.provider).toBe("openai");
+      expect(e.model).toBe("text-embedding-3-small");
+    });
+  });
+
+  test("openai accepts an explicit apiKey override", () => {
+    withEnv("OPENAI_API_KEY", undefined, () => {
+      const e = createEmbedder({ model: "openai/text-embedding-3-small", apiKey: "sk-explicit" });
+      expect(e.provider).toBe("openai");
+    });
+  });
+
+  test("voyage reads VOYAGE_API_KEY from env", () => {
+    withEnv("VOYAGE_API_KEY", "voyage-env", () => {
+      const e = createEmbedder({ model: "voyage/voyage-3" });
+      expect(e.provider).toBe("voyage");
+    });
+  });
+
+  test("voyage throws fail-loud when VOYAGE_API_KEY is empty", () => {
+    withEnv("VOYAGE_API_KEY", "", () => {
+      expect(() => createEmbedder({ model: "voyage/voyage-3" })).toThrow(/VOYAGE_API_KEY/);
+    });
+  });
+
+  test("cohere reads COHERE_API_KEY from env", () => {
+    withEnv("COHERE_API_KEY", "cohere-env", () => {
+      const e = createEmbedder({ model: "cohere/embed-v3" });
+      expect(e.provider).toBe("cohere");
+    });
+  });
+
+  test("cohere throws fail-loud when COHERE_API_KEY is empty", () => {
+    withEnv("COHERE_API_KEY", "", () => {
+      expect(() => createEmbedder({ model: "cohere/embed-v3" })).toThrow(/COHERE_API_KEY/);
+    });
+  });
+
+  test("local/ honors an explicit baseUrl override over the parsed one", () => {
+    const e = createEmbedder({
+      model: "local/x@http://parsed:1234",
+      baseUrl: "http://override:5678",
+    });
+    expect(e.provider).toBe("local");
+    expect(e.model).toBe("x");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// OpenAILikeEmbedder.embed — network path (fetch mocked, fully deterministic).
+// ---------------------------------------------------------------------------
+
+describe("OpenAILikeEmbedder.embed (mocked fetch)", () => {
+  afterEach(() => {
+    // spyOn(globalThis, "fetch") registers with bun's mock registry; restore
+    // the real implementation after every test so nothing leaks across files.
+    mock.restore();
+  });
+
+  test("empty input short-circuits without a network call", async () => {
+    const fetchSpy = spyOn(globalThis, "fetch");
+    const e = createEmbedder({ model: "openai/text-embedding-3-small", apiKey: "sk-x" });
+    expect(await e.embed([])).toEqual([]);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  test("posts to /v1/embeddings with an Authorization header and parses data", async () => {
+    let capturedUrl = "";
+    let capturedInit: RequestInit | undefined;
+    const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+      capturedUrl = String(input);
+      capturedInit = init;
+      return new Response(JSON.stringify({ data: [{ embedding: [0.1, 0.2, 0.3] }] }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }) as unknown as typeof fetch;
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fetchImpl);
+
+    const e = createEmbedder({ model: "openai/text-embedding-3-small", apiKey: "sk-secret" });
+    const out = await e.embed(["hello"]);
+
+    expect(out).toEqual([[0.1, 0.2, 0.3]]);
+    expect(capturedUrl).toBe("https://api.openai.com/v1/embeddings");
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    const headers = capturedInit?.headers as Record<string, string>;
+    expect(headers["authorization"]).toBe("Bearer sk-secret");
+    expect(headers["content-type"]).toBe("application/json");
+    const body = JSON.parse(String(capturedInit?.body)) as { model: string; input: string[] };
+    expect(body.model).toBe("text-embedding-3-small");
+    expect(body.input).toEqual(["hello"]);
+    // No signal provided → fetch init must not carry one.
+    expect(capturedInit?.signal ?? null).toBeNull();
+  });
+
+  test("local provider without an API key omits the Authorization header", async () => {
+    let capturedInit: RequestInit | undefined;
+    const fetchImpl = (async (_input: string | URL | Request, init?: RequestInit) => {
+      capturedInit = init;
+      return new Response(JSON.stringify({ data: [{ embedding: [1, 0] }] }), { status: 200 });
+    }) as unknown as typeof fetch;
+    spyOn(globalThis, "fetch").mockImplementation(fetchImpl);
+
+    const e = createEmbedder({ model: "local/nomic@http://localhost:11434" });
+    const out = await e.embed(["x"]);
+
+    expect(out).toEqual([[1, 0]]);
+    const headers = capturedInit?.headers as Record<string, string>;
+    expect("authorization" in headers).toBe(false);
+  });
+
+  test("respects a custom batchSize and concatenates batches in order", async () => {
+    const batches: string[][] = [];
+    const fetchImpl = (async (_input: string | URL | Request, init?: RequestInit) => {
+      const parsed = JSON.parse(String(init?.body)) as { input: string[] };
+      batches.push(parsed.input);
+      // Echo one embedding per input text so we can verify ordering.
+      const data = parsed.input.map((t) => ({ embedding: [t.length] }));
+      return new Response(JSON.stringify({ data }), { status: 200 });
+    }) as unknown as typeof fetch;
+    spyOn(globalThis, "fetch").mockImplementation(fetchImpl);
+
+    const e = createEmbedder({ model: "local/m@http://localhost:1234" });
+    const out = await e.embed(["a", "bb", "ccc", "dddd", "eeeee"], { batchSize: 2 });
+
+    // 5 texts / batchSize 2 → batches of [2, 2, 1].
+    expect(batches).toEqual([["a", "bb"], ["ccc", "dddd"], ["eeeee"]]);
+    expect(out).toEqual([[1], [2], [3], [4], [5]]);
+  });
+
+  test("forwards an AbortSignal to fetch", async () => {
+    let capturedSignal: AbortSignal | null | undefined;
+    const fetchImpl = (async (_input: string | URL | Request, init?: RequestInit) => {
+      capturedSignal = init?.signal;
+      return new Response(JSON.stringify({ data: [{ embedding: [0] }] }), { status: 200 });
+    }) as unknown as typeof fetch;
+    spyOn(globalThis, "fetch").mockImplementation(fetchImpl);
+
+    const controller = new AbortController();
+    const e = createEmbedder({ model: "local/m@http://localhost:1234" });
+    await e.embed(["x"], { signal: controller.signal });
+    expect(capturedSignal).toBe(controller.signal);
+  });
+
+  test("throws EmbedderError with status + body on a non-ok response", async () => {
+    const fetchImpl = (async () =>
+      new Response("rate limited", {
+        status: 429,
+        statusText: "Too Many Requests",
+      })) as unknown as typeof fetch;
+    spyOn(globalThis, "fetch").mockImplementation(fetchImpl);
+
+    const e = createEmbedder({ model: "openai/text-embedding-3-small", apiKey: "sk-x" });
+    await expect(e.embed(["x"])).rejects.toThrow(EmbedderError);
+    await expect(e.embed(["x"])).rejects.toThrow(/429 rate limited/);
+  });
+
+  test("non-ok response with an unreadable body still throws (text() rejects)", async () => {
+    // A Response whose .text() rejects exercises the `.catch(() => "")` arm.
+    const brokenResponse = {
+      ok: false,
+      status: 500,
+      text: () => Promise.reject(new Error("stream broken")),
+    } as unknown as Response;
+    const fetchImpl = (async () => brokenResponse) as unknown as typeof fetch;
+    spyOn(globalThis, "fetch").mockImplementation(fetchImpl);
+
+    const e = createEmbedder({ model: "openai/text-embedding-3-small", apiKey: "sk-x" });
+    // Body coerces to empty string → message ends at the status, no trailing text.
+    await expect(e.embed(["x"])).rejects.toThrow(/500 $/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// hashedBow — zero-norm branch (no alphanumeric tokens → all-zero vector).
+// ---------------------------------------------------------------------------
+
+describe("mock embedder — zero vector edge case", () => {
+  test("punctuation/whitespace-only text yields an all-zero, non-normalised vector", async () => {
+    const e = createEmbedder({ model: "mock/det" });
+    const [vec] = await e.embed(["   !!! ??? ---   "]);
+    expect(vec?.length).toBe(256);
+    // norm === 0 → returns the raw zero vector unchanged (no divide-by-zero).
+    expect(vec?.every((x) => x === 0)).toBe(true);
+  });
+
+  test("empty string also yields an all-zero vector", async () => {
+    const e = createEmbedder({ model: "mock/det" });
+    const [vec] = await e.embed([""]);
+    expect(vec?.every((x) => x === 0)).toBe(true);
   });
 });

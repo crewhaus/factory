@@ -5,6 +5,7 @@ import {
   BUDGETS,
   type NamedFailureClass,
   type RecoveryAction,
+  RecoveryEngineError,
   advanceState,
   backoffMs,
   classify,
@@ -285,5 +286,29 @@ describe("Track A — named failure taxonomy", () => {
     ];
     expect(() => matchNamedFailure({ message: "anything" }, badTaxonomy)).not.toThrow();
     expect(matchNamedFailure({ message: "anything" }, badTaxonomy)).toBeUndefined();
+  });
+});
+
+describe("RecoveryEngineError", () => {
+  test("carries the 'runtime' code and the RecoveryEngineError name", () => {
+    const err = new RecoveryEngineError("boom");
+    expect(err).toBeInstanceOf(RecoveryEngineError);
+    expect(err).toBeInstanceOf(Error);
+    expect(err.name).toBe("RecoveryEngineError");
+    expect(err.code).toBe("runtime");
+    expect(err.message).toBe("boom");
+  });
+
+  test("preserves the underlying cause chain", () => {
+    const cause = new Error("upstream");
+    const err = new RecoveryEngineError("wrapped", cause);
+    expect(err.cause).toBe(cause);
+    // toJSON (inherited from CrewhausError) serializes the cause for logging.
+    expect(err.toJSON()).toEqual({
+      name: "RecoveryEngineError",
+      code: "runtime",
+      message: "wrapped",
+      cause: { name: "Error", message: "upstream" },
+    });
   });
 });

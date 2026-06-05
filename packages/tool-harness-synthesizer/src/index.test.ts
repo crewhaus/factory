@@ -1,13 +1,15 @@
 import { describe, expect, test } from "bun:test";
+import type { OptimizerState } from "@crewhaus/prompt-optimizer";
 import type { Sandbox, SandboxExecOptions, SandboxExecResult } from "@crewhaus/sandbox";
 import {
   HarnessSynthesizerError,
+  VerifierMutationProvider,
   type VerifierSample,
   runVerifier,
   synthesizeVerifier,
   thompsonPick,
 } from "./index";
-import { VERIFIER_SENTINEL, evalVerifierPayload } from "./sandboxed-eval";
+import { VERIFIER_SENTINEL, evalVerifierPayload, runVerifierInSandbox } from "./sandboxed-eval";
 
 /**
  * Test double for `@crewhaus/sandbox`. Reports `backend: "docker"` so it
@@ -165,6 +167,28 @@ describe("synthesizeVerifier", () => {
     expect(result.best.heuristic).toBeGreaterThanOrEqual(0.6);
   });
 
+  test("picks the higher-heuristic seed when multiple seeds are supplied", async () => {
+    // Two seeds → the `pool.reduce` comparator runs (with one seed reduce
+    // returns the lone element without invoking the callback). The perfect
+    // seed must win and short-circuit at iteration 0.
+    const result = await synthesizeVerifier({
+      seedCandidates: [
+        "return false", // heuristic 0.4
+        "return typeof output === 'number' && output % 2 === 0", // heuristic 1.0
+      ],
+      samples: evenSamples,
+      refiner: async () => "throw new Error('should not be called')",
+      target: 1.0,
+      rng: () => 0.5,
+      sandbox,
+    });
+    expect(result.converged).toBe(true);
+    expect(result.iterations).toBe(0);
+    expect(result.best.id).toBe("seed_1");
+    expect(result.best.heuristic).toBe(1);
+    expect(result.trajectory).toHaveLength(2);
+  });
+
   test("throws on empty seed candidates", async () => {
     await expect(
       synthesizeVerifier({
@@ -183,6 +207,214 @@ describe("synthesizeVerifier", () => {
         refiner: async () => "return true",
       }),
     ).rejects.toThrow(HarnessSynthesizerError);
+  });
+});
+
+/**
+ * A sandbox whose container call returns a caller-supplied result verbatim, so
+ * tests can drive `runVerifierInSandbox`'s error branches (timeout, nonzero
+ * exit, empty/garbled output) deterministically without a real container.
+ */
+class ScriptedSandbox implements Sandbox {
+  readonly backend = "docker" as const;
+  readonly calls: SandboxExecOptions[] = [];
+  constructor(private readonly result: SandboxExecResult) {}
+  async exec(opts: SandboxExecOptions): Promise<SandboxExecResult> {
+    this.calls.push(opts);
+    return this.result;
+  }
+  async close(): Promise<void> {}
+}
+
+const ioSamples: VerifierSample[] = [{ input: null, output: 0, expected: true }];
+
+describe("VerifierMutationProvider", () => {
+  const baseState = (prompt: string): OptimizerState =>
+    ({
+      iteration: 0,
+      best: { id: "c0", prompt, mutations: [], score: 0.5 },
+      trajectory: [],
+      trainSet: [],
+      devSet: [],
+    }) as OptimizerState;
+
+  test("next() runs the inner search and appends a verifier annotation", async () => {
+    const sandbox = new FakeDockerSandbox();
+    const provider = new VerifierMutationProvider(
+      evenSamples,
+      // Seed is already perfect, so the inner search converges at iteration 0.
+      async () => "return false",
+      ["return typeof output === 'number' && output % 2 === 0"],
+      4,
+      sandbox,
+    );
+    expect(provider.name).toBe("verifier-synthesis");
+    const result = await provider.next(baseState("BASE PROMPT"));
+    expect(result.prompt.startsWith("BASE PROMPT")).toBe(true);
+    expect(result.prompt).toContain("[verifier seed_0, h=1.000]");
+    expect(result.mutations).toEqual([{ kind: "rephrase-instruction" }]);
+    expect(result.rationale).toContain("verifier-synthesis pass 1");
+    expect(result.rationale).toContain("(converged)");
+  });
+
+  test("next() increments the synthesis pass counter across calls", async () => {
+    const sandbox = new FakeDockerSandbox();
+    const provider = new VerifierMutationProvider(
+      evenSamples,
+      async () => "return typeof output === 'number' && output % 2 === 0",
+      ["return typeof output === 'number' && output % 2 === 0"],
+      4,
+      sandbox,
+    );
+    const first = await provider.next(baseState("P"));
+    const second = await provider.next(baseState("P"));
+    expect(first.rationale).toContain("pass 1");
+    expect(second.rationale).toContain("pass 2");
+  });
+
+  test("omits the sandbox option when none is injected (default backend path)", async () => {
+    // No sandbox passed → synthesizeVerifier creates the default backend. Pin it
+    // to `noop` so the fail-closed gate throws BEFORE any container is spawned —
+    // this exercises the `this.sandbox === undefined` branch with zero real I/O.
+    const prev = process.env["CREWHAUS_SANDBOX"];
+    process.env["CREWHAUS_SANDBOX"] = "noop";
+    try {
+      const provider = new VerifierMutationProvider(
+        evenSamples,
+        async () => "return true",
+        ["return true"],
+        1,
+      );
+      await expect(provider.next(baseState("P"))).rejects.toThrow(HarnessSynthesizerError);
+    } finally {
+      // Restore exactly: an unset var must be *removed*, not set to the string
+      // "undefined" (which `readEnvBackend` would reject). `Reflect.deleteProperty`
+      // does this without tripping biome's noDelete rule.
+      if (prev === undefined) Reflect.deleteProperty(process.env, "CREWHAUS_SANDBOX");
+      else process.env["CREWHAUS_SANDBOX"] = prev;
+    }
+  });
+
+  test("non-converged inner search omits the (converged) marker", async () => {
+    const sandbox = new FakeDockerSandbox();
+    const provider = new VerifierMutationProvider(
+      evenSamples,
+      async () => "return false", // 0.4 — never reaches 1.0
+      ["return false"],
+      2,
+      sandbox,
+    );
+    const result = await provider.next(baseState("P"));
+    expect(result.rationale).not.toContain("(converged)");
+  });
+});
+
+describe("runVerifierInSandbox error branches", () => {
+  test("throws on non-JSON-serializable samples (BigInt)", async () => {
+    const sandbox = new FakeDockerSandbox();
+    const bad: VerifierSample[] = [{ input: 1n, output: 0, expected: true }];
+    await expect(runVerifierInSandbox(sandbox, "return true", bad)).rejects.toThrow(
+      /not JSON-serializable/,
+    );
+    // Nothing was shipped to the jail.
+    expect(sandbox.calls).toHaveLength(0);
+  });
+
+  test("throws when the harness times out", async () => {
+    const sandbox = new ScriptedSandbox({
+      stdout: "",
+      stderr: "",
+      exitCode: 0,
+      timedOut: true,
+      durationMs: 1,
+    });
+    await expect(
+      runVerifierInSandbox(sandbox, "return true", ioSamples, { timeoutMs: 1234 }),
+    ).rejects.toThrow(/timed out after 1234ms/);
+  });
+
+  test("throws with stderr tail when the harness exits nonzero and emits no result", async () => {
+    const sandbox = new ScriptedSandbox({
+      stdout: "no sentinel here",
+      stderr: "fatal: allocation failure",
+      exitCode: 137,
+      timedOut: false,
+      durationMs: 1,
+    });
+    await expect(runVerifierInSandbox(sandbox, "return true", ioSamples)).rejects.toThrow(
+      /exited 137: fatal: allocation failure/,
+    );
+  });
+
+  test("throws 'no result' when exit is clean but no sentinel is present", async () => {
+    const sandbox = new ScriptedSandbox({
+      stdout: "garbage without the sentinel",
+      stderr: "",
+      exitCode: 0,
+      timedOut: false,
+      durationMs: 1,
+    });
+    await expect(runVerifierInSandbox(sandbox, "return true", ioSamples)).rejects.toThrow(
+      /produced no result/,
+    );
+  });
+
+  test("throws on a verdict-count mismatch", async () => {
+    // Sentinel present, valid JSON, but two verdicts for one sample.
+    const sandbox = new ScriptedSandbox({
+      stdout: `${VERIFIER_SENTINEL}${JSON.stringify({ verdicts: [true, false], errors: 0 })}`,
+      stderr: "",
+      exitCode: 0,
+      timedOut: false,
+      durationMs: 1,
+    });
+    await expect(runVerifierInSandbox(sandbox, "return true", ioSamples)).rejects.toThrow(
+      /returned 2 verdicts for 1 samples/,
+    );
+  });
+
+  test("surfaces a compileError reported by the harness", async () => {
+    const sandbox = new ScriptedSandbox({
+      stdout: `${VERIFIER_SENTINEL}${JSON.stringify({ compileError: "Unexpected token" })}`,
+      stderr: "",
+      exitCode: 0,
+      timedOut: false,
+      durationMs: 1,
+    });
+    await expect(runVerifierInSandbox(sandbox, "bad {{", ioSamples)).rejects.toThrow(
+      /did not compile: Unexpected token/,
+    );
+  });
+});
+
+describe("parseHarnessResult edge cases (via runVerifierInSandbox)", () => {
+  test("treats a non-JSON result line after the sentinel as no result", async () => {
+    // Exercises the JSON.parse catch inside parseHarnessResult (returns undefined).
+    const sandbox = new ScriptedSandbox({
+      stdout: `${VERIFIER_SENTINEL}this-is-not-json`,
+      stderr: "",
+      exitCode: 0,
+      timedOut: false,
+      durationMs: 1,
+    });
+    await expect(runVerifierInSandbox(sandbox, "return true", ioSamples)).rejects.toThrow(
+      /produced no result/,
+    );
+  });
+
+  test("treats a sentinel-framed object without a verdicts array as no result", async () => {
+    // Valid JSON object, but neither a compileError string nor a verdicts array
+    // → parseHarnessResult falls through to its final `return undefined`.
+    const sandbox = new ScriptedSandbox({
+      stdout: `${VERIFIER_SENTINEL}${JSON.stringify({ verdicts: "not-an-array" })}`,
+      stderr: "",
+      exitCode: 0,
+      timedOut: false,
+      durationMs: 1,
+    });
+    await expect(runVerifierInSandbox(sandbox, "return true", ioSamples)).rejects.toThrow(
+      /produced no result/,
+    );
   });
 });
 

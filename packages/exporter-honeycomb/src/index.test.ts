@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { type TraceEvent, TraceEventBus } from "@crewhaus/trace-event-bus";
 import {
   HC_DEFAULT_API_HOST,
@@ -162,6 +162,80 @@ describe("attachHoneycombExporter — T8 credential-leak guard", () => {
     expect(_scrubApiKeyForTest(msg, undefined)).toBe(msg);
     expect(_scrubApiKeyForTest(msg, "")).toBe(msg);
     expect(_scrubApiKeyForTest("contains: abc", "abc")).toBe("contains: abc");
+  });
+});
+
+describe("attachHoneycombExporter — onError fallback + key handling", () => {
+  test("stderr fallback redacts the API key when no onError is supplied", async () => {
+    const bus = new TraceEventBus({ runId: "run_se", sessionId: "sess_se" });
+    const apiKey = "hc-secret-key-leakable999";
+    const writes: string[] = [];
+    const spy = spyOn(process.stderr, "write").mockImplementation((chunk: unknown) => {
+      writes.push(typeof chunk === "string" ? chunk : String(chunk));
+      return true;
+    });
+    try {
+      const failingFetch = (async () =>
+        new Response(`upstream 500: api-key was ${apiKey}`, {
+          status: 500,
+        })) as unknown as typeof fetch;
+      // No onError => exercises the process.stderr.write fallback branch.
+      const exp = attachHoneycombExporter(bus, {
+        apiKey,
+        fetchImpl: failingFetch,
+        flushIntervalMs: 0,
+      });
+      publishTurnPair(bus);
+      await exp.flush();
+      await exp.shutdown();
+    } finally {
+      spy.mockRestore();
+    }
+    expect(writes.length).toBeGreaterThan(0);
+    const joined = writes.join("");
+    expect(joined).toContain("[exporter-honeycomb] export failed:");
+    expect(joined).not.toContain(apiKey);
+    expect(joined).toContain("[REDACTED:HONEYCOMB_API_KEY]");
+  });
+
+  test("passes the original Error through unchanged when no key is present in the message", async () => {
+    const bus = new TraceEventBus({ runId: "run_orig", sessionId: "sess_orig" });
+    const apiKey = "hc-key-abcdefghijk";
+    const captured: Error[] = [];
+    const networkError = new TypeError("network unreachable");
+    const failingFetch = (async () => {
+      throw networkError;
+    }) as unknown as typeof fetch;
+    const exp = attachHoneycombExporter(bus, {
+      apiKey,
+      fetchImpl: failingFetch,
+      flushIntervalMs: 0,
+      onError: (err) => captured.push(err),
+    });
+    publishTurnPair(bus);
+    await exp.flush();
+    await exp.shutdown();
+    expect(captured.length).toBeGreaterThan(0);
+    // Message has no API key => scrubApiKey is a no-op => the SAME Error instance
+    // is forwarded (the ternary keeps `err`, not a freshly wrapped Error).
+    expect(captured[0]).toBe(networkError);
+    expect(captured[0]?.message).toBe("network unreachable");
+  });
+
+  test("omits the x-honeycomb-team header when no apiKey is provided", async () => {
+    const bus = new TraceEventBus({ runId: "run_nokey", sessionId: "sess_nokey" });
+    const { fetch, calls } = captureFetch();
+    const exp = attachHoneycombExporter(bus, {
+      fetchImpl: fetch,
+      flushIntervalMs: 0,
+    });
+    publishTurnPair(bus);
+    await exp.flush();
+    await exp.shutdown();
+    const c = calls[0];
+    expect(c).toBeDefined();
+    expect(c?.headers["x-honeycomb-dataset"]).toBe("crewhaus");
+    expect(c?.headers["x-honeycomb-team"]).toBeUndefined();
   });
 });
 

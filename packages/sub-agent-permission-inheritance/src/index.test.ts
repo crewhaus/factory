@@ -61,6 +61,44 @@ describe("resolveChildPermissions — modes", () => {
     expect(builtinPatterns).not.toContain("Bash(rm**)");
   });
 
+  test("scoped drops a rule whose pattern fails to compile (defensive catch)", () => {
+    // A malformed pattern that makes compilePattern() throw (unmatched paren).
+    // ruleMatchesAnyAllowedName must swallow the throw and treat the rule as a
+    // non-match, so it is filtered out rather than aborting the scope reduction.
+    const rulesWithBadPattern: RuleSet = {
+      flag: [
+        { type: "alwaysAllow", pattern: "Read", source: "flag" },
+        { type: "alwaysDeny", pattern: "Bash(", source: "flag" },
+      ],
+      settings: [],
+      yaml: [],
+      hooks: [],
+      builtin: [],
+    };
+    const out = resolveChildPermissions(
+      { mode: "default", rules: rulesWithBadPattern },
+      { ...DEF_BASE, tools: ["Read"], permissions: "scoped" },
+    );
+    // The valid "Read" rule survives; the uncompilable "Bash(" rule is dropped.
+    expect(out.rules.flag).toHaveLength(1);
+    expect(out.rules.flag[0]?.pattern).toBe("Read");
+  });
+
+  test("scoped drops a rule with an empty pattern (compilePattern throws)", () => {
+    const rulesWithEmptyPattern: RuleSet = {
+      flag: [{ type: "alwaysAllow", pattern: "   ", source: "flag" }],
+      settings: [],
+      yaml: [],
+      hooks: [],
+      builtin: [],
+    };
+    const out = resolveChildPermissions(
+      { mode: "default", rules: rulesWithEmptyPattern },
+      { ...DEF_BASE, tools: ["Read"], permissions: "scoped" },
+    );
+    expect(out.rules.flag).toHaveLength(0);
+  });
+
   test("scoped with empty def.tools drops every rule", () => {
     const out = resolveChildPermissions(
       { mode: "default", rules: PARENT_RULES },

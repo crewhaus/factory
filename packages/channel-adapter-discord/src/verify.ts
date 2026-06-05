@@ -32,12 +32,11 @@ export function verifyDiscordSignature(args: DiscordVerifyArgs): boolean {
   if (!/^[0-9a-f]{128}$/i.test(sigHex)) return false;
   if (!/^\d+$/.test(timestamp)) return false;
 
-  let signature: Buffer;
-  try {
-    signature = Buffer.from(sigHex, "hex");
-  } catch {
-    return false;
-  }
+  // `sigHex` is regex-validated above to be exactly 128 hex chars, so
+  // `Buffer.from(_, "hex")` always yields exactly 64 bytes and never throws
+  // (`Buffer.from` silently drops invalid hex rather than throwing). The
+  // length re-check below is a cheap, defensive belt for that invariant.
+  const signature = Buffer.from(sigHex, "hex");
   if (signature.length !== 64) return false;
 
   let publicKey: ReturnType<typeof ed25519PublicKeyFromHex>;

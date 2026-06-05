@@ -115,4 +115,46 @@ describe("migration-engine — T4 multi-step chain replay", () => {
     });
     expect(e.list()).toEqual(["0→1", "1→2"]);
   });
+
+  test("clear empties the registry", () => {
+    const e = createDefaultEngine();
+    expect(e.list()).toEqual(["0→1"]);
+    e.clear();
+    expect(e.list()).toEqual([]);
+    // After clearing, the previously-registered step is gone.
+    expect(() => e.migrate({ version: 0 }, 1)).toThrow(MigrationError);
+  });
+});
+
+describe("migration-engine — additional coverage", () => {
+  test("NOOP_0_TO_1.up stamps version 1 and preserves other keys", () => {
+    const out = NOOP_0_TO_1.up({ name: "x", version: 0 });
+    expect(out).toEqual({ name: "x", version: 1 });
+  });
+
+  test("NOOP_0_TO_1.down stamps version 0 and preserves other keys", () => {
+    const out = NOOP_0_TO_1.down({ name: "x", version: 1 });
+    expect(out).toEqual({ name: "x", version: 0 });
+  });
+
+  test("migrate treats a spec with no version field as version 0", () => {
+    const e = createDefaultEngine();
+    // No `version` key at all -> fromVersion defaults to 0, so 0 -> 1 runs.
+    const out = e.migrate({ name: "no-version" }, 1);
+    expect(out.version).toBe(1);
+  });
+
+  test("downgrade throws when the needed step is not registered", () => {
+    const e = new MigrationEngine();
+    // Walking down from 1 to 0 needs the 0→1 step's down(); none registered.
+    expect(() => e.migrate({ version: 1 }, 0)).toThrow(MigrationError);
+  });
+
+  test("MigrationError carries the config code and an optional cause", () => {
+    const cause = new Error("root");
+    const err = new MigrationError("boom", cause);
+    expect(err).toBeInstanceOf(MigrationError);
+    expect(err.name).toBe("MigrationError");
+    expect(err.cause).toBe(cause);
+  });
 });

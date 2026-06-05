@@ -30,6 +30,24 @@ export type SmokeResult = {
   readonly bundle?: Bundle;
 };
 
+/**
+ * Seams for tests. Both default to the production implementations so the
+ * public call shape (`runShapeSmoke(assertion)`,
+ * `runSmokeMatrix()`) is unchanged. Injecting a throwing `compile` or a
+ * mismatched `assertions`/`listFixtureShapes` lets the unit tests reach
+ * the failure/orphan branches without process-global module mocks (which
+ * leak across Bun test files because they share `@crewhaus/compiler`).
+ */
+export type ShapeSmokeDeps = {
+  readonly compile?: (yamlText: string) => Bundle;
+};
+
+export type SmokeMatrixDeps = {
+  readonly assertions?: readonly ShapeAssertion[];
+  readonly listFixtureShapes?: () => readonly string[];
+  readonly runShapeSmoke?: (assertion: ShapeAssertion) => SmokeResult;
+};
+
 export function loadFixture(shape: string): string {
   return readFileSync(join(FIXTURES_DIR, `${shape}.yaml`), "utf-8");
 }
@@ -41,7 +59,8 @@ export function listFixtureShapes(): readonly string[] {
     .sort();
 }
 
-export function runShapeSmoke(assertion: ShapeAssertion): SmokeResult {
+export function runShapeSmoke(assertion: ShapeAssertion, deps: ShapeSmokeDeps = {}): SmokeResult {
+  const compileFn = deps.compile ?? compile;
   const fixture = `${assertion.shape}.yaml`;
   let yamlText: string;
   try {
@@ -57,7 +76,7 @@ export function runShapeSmoke(assertion: ShapeAssertion): SmokeResult {
 
   let bundle: Bundle;
   try {
-    bundle = compile(yamlText);
+    bundle = compileFn(yamlText);
   } catch (err) {
     return {
       shape: assertion.shape,
@@ -99,15 +118,18 @@ export function runShapeSmoke(assertion: ShapeAssertion): SmokeResult {
   };
 }
 
-export function runSmokeMatrix(): readonly SmokeResult[] {
+export function runSmokeMatrix(deps: SmokeMatrixDeps = {}): readonly SmokeResult[] {
+  const assertions = deps.assertions ?? SHAPE_ASSERTIONS;
+  const listShapes = deps.listFixtureShapes ?? listFixtureShapes;
+  const runShape = deps.runShapeSmoke ?? runShapeSmoke;
   // Cross-check: every fixture on disk has an assertion entry and
   // vice versa. Mismatch is itself a smoke failure — it means someone
   // added a shape without wiring it into the matrix, or vice versa.
-  const fixtureShapes = new Set(listFixtureShapes());
-  const assertionShapes = new Set(SHAPE_ASSERTIONS.map((a) => a.shape));
+  const fixtureShapes = new Set(listShapes());
+  const assertionShapes = new Set(assertions.map((a) => a.shape));
   const orphanFixtures = [...fixtureShapes].filter((s) => !assertionShapes.has(s));
   const orphanAssertions = [...assertionShapes].filter((s) => !fixtureShapes.has(s));
-  const matrix = SHAPE_ASSERTIONS.map(runShapeSmoke);
+  const matrix = assertions.map((a) => runShape(a));
   if (orphanFixtures.length > 0 || orphanAssertions.length > 0) {
     return [
       ...matrix,

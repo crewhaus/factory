@@ -40,6 +40,22 @@ describe("toolCallSignature", () => {
   test("undefined values collapse to null in canonical form", () => {
     expect(toolCallSignature("X", undefined)).toBe("X:null");
   });
+
+  test("bigint / symbol / function leaves fall through to a stable string tag", () => {
+    // These typeof branches (bigint, symbol, function) hit the final
+    // `JSON.stringify(String(value))` fall-through in canonicalJson.
+    expect(toolCallSignature("X", 10n)).toBe('X:"10"');
+    const sym = Symbol("loop");
+    expect(toolCallSignature("X", sym)).toBe(`X:${JSON.stringify(String(sym))}`);
+    const fn = function namedFn() {};
+    expect(toolCallSignature("X", fn)).toBe(`X:${JSON.stringify(String(fn))}`);
+    // Same bigint value always yields the same signature (determinism).
+    expect(toolCallSignature("X", 10n)).toBe(toolCallSignature("X", 10n));
+  });
+
+  test("bigint inside a nested object still produces a canonical signature", () => {
+    expect(toolCallSignature("X", { n: 5n })).toBe('X:{"n":"5"}');
+  });
 });
 
 describe("detectLoop — basic shapes", () => {
@@ -114,6 +130,25 @@ describe("detectLoop — window slicing", () => {
   test("threshold 0 or negative is a no-op", () => {
     expect(detectLoop([call("A")], 10, 0)).toBeNull();
     expect(detectLoop([call("A")], 10, -1)).toBeNull();
+  });
+});
+
+describe("detectLoop — threshold 1 (every new signature is an instant hit)", () => {
+  test("a single call with threshold 1 is detected immediately", () => {
+    // threshold === 1 takes the `counts.set` branch and returns on first sight.
+    const out = detectLoop([call("A", { k: "v" })], 10, 1);
+    expect(out).not.toBeNull();
+    expect(out?.toolName).toBe("A");
+    expect(out?.count).toBe(1);
+    expect(out?.threshold).toBe(1);
+    expect(out?.windowSize).toBe(10);
+    expect(out?.signature).toBe('A:{"k":"v"}');
+  });
+
+  test("with threshold 1 the FIRST call in the window wins", () => {
+    const out = detectLoop([call("First"), call("Second"), call("First")], 10, 1);
+    expect(out?.toolName).toBe("First");
+    expect(out?.count).toBe(1);
   });
 });
 

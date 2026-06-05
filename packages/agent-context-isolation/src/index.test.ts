@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { getEventListeners } from "node:events";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type EventLog, openEventLog } from "@crewhaus/event-log";
@@ -174,6 +175,53 @@ describe("createIsolatedContext", () => {
 
       await child.close();
       await parentLog.close();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("a failed openEventLog does not leak an abort listener on the parent signal", async () => {
+    const root = newTempRoot();
+    try {
+      const ac = new AbortController();
+      const runContext = createRunContext({ abortSignal: ac.signal });
+      // Point sessionRootDir at a path *under* a regular file so the
+      // openEventLog mkdirSync throws ENOTDIR — exercising the error path
+      // without any network/clock dependence.
+      const filePath = join(root, "not-a-dir");
+      writeFileSync(filePath, "x");
+      const badRoot = join(filePath, "nested");
+      const parent: ParentRunHandle = {
+        runContext,
+        // A stub log so we never reach a real openEventLog for the parent.
+        eventLog: {
+          append: async () => {},
+          read: () => (async function* () {})(),
+          close: async () => {},
+        } as EventLog,
+        permissionMode: "default",
+        permissionRules: { ...emptyRuleSet },
+        tools: [],
+        model: "test-model",
+        maxTokens: 1024,
+        sessionRootDir: badRoot,
+      };
+
+      const before = getEventListeners(ac.signal, "abort").length;
+      await expect(
+        createIsolatedContext(parent, {
+          name: "leaky",
+          instructions: "x",
+          tools: [],
+        }),
+      ).rejects.toThrow();
+      // The abortTree created before openEventLog must have been torn down,
+      // dropping its listener back off the parent signal.
+      const after = getEventListeners(ac.signal, "abort").length;
+      expect(after).toBe(before);
+
+      // And the parent itself is untouched — child teardown never cascades up.
+      expect(ac.signal.aborted).toBe(false);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

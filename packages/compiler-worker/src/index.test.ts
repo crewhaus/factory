@@ -337,4 +337,201 @@ agent:
       globalThis.fetch = orig;
     }
   });
+
+  test("POST /compile with a non-string yaml field → 400 BAD_REQUEST", async () => {
+    const res = await worker.fetch(
+      request("/compile", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ yaml: 123 }),
+      }),
+      env,
+    );
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: { code: string; message: string } };
+    expect(body.error.code).toBe("BAD_REQUEST");
+    expect(body.error.message).toBe("body.yaml must be a string");
+  });
+
+  test("POST /validate with a non-string yaml field → 400 BAD_REQUEST", async () => {
+    const res = await worker.fetch(
+      request("/validate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ notYaml: true }),
+      }),
+      env,
+    );
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("BAD_REQUEST");
+  });
+
+  test("POST /validate with invalid YAML → 200 { ok: false, errors }", async () => {
+    const res = await worker.fetch(
+      request("/validate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ yaml: "not: valid: yaml: at all:" }),
+      }),
+      env,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { ok: boolean; errors: { message: string }[] };
+    expect(body.ok).toBe(false);
+    expect(Array.isArray(body.errors)).toBe(true);
+    expect(body.errors.length).toBeGreaterThan(0);
+    expect(typeof body.errors[0]?.message).toBe("string");
+  });
+
+  test("POST /compile with non-JSON body → 500 INTERNAL (not valid JSON)", async () => {
+    const res = await worker.fetch(
+      request("/compile", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{ this is not json",
+      }),
+      env,
+    );
+    expect(res.status).toBe(500);
+    const body = (await res.json()) as { error: { code: string; message: string } };
+    expect(body.error.code).toBe("INTERNAL");
+    expect(body.error.message).toBe("request body is not valid JSON");
+  });
+
+  test("oversize body without a content-length header is rejected by the text-length guard", async () => {
+    // No `content-length` header is sent, so the content-length pre-check
+    // (which reads 0) is skipped and the post-read `text.length > max` guard
+    // is what trips. Uses the default 256 KB cap (MAX_BODY_BYTES unset).
+    const huge = JSON.stringify({ yaml: "x".repeat(300_000) });
+    const res = await worker.fetch(
+      request("/compile", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: huge,
+      }),
+      { ALLOWED_ORIGINS: "https://studio.crewhaus.dev" },
+    );
+    expect(res.status).toBe(500);
+    const body = (await res.json()) as { error: { code: string; message: string } };
+    expect(body.error.code).toBe("INTERNAL");
+    expect(body.error.message).toContain("exceeds max");
+  });
+
+  test("/proxy route dispatches to the provider proxy (allowed upstream forwards the token)", async () => {
+    const orig = globalThis.fetch;
+    let captured: { url: string; auth: string | null } = { url: "", auth: null };
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      captured = {
+        url: typeof input === "string" ? input : String(input),
+        auth: new Headers(init?.headers).get("Authorization"),
+      };
+      return new Response(JSON.stringify({ id: "srv-1" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }) as typeof fetch;
+    try {
+      const upstream = encodeURIComponent("https://api.render.com/v1/services");
+      const res = await worker.fetch(
+        request(`/proxy?upstream=${upstream}`, {
+          method: "GET",
+          headers: { Authorization: "Bearer rnd_tkn" },
+        }),
+        env,
+      );
+      expect(res.status).toBe(200);
+      expect(res.headers.get("access-control-allow-origin")).toBe("https://studio.crewhaus.dev");
+      expect(captured.url).toBe("https://api.render.com/v1/services");
+      expect(captured.auth).toBe("Bearer rnd_tkn");
+    } finally {
+      globalThis.fetch = orig;
+    }
+  });
+
+  test("/proxy route returns 403 (no fetch) for a disallowed upstream", async () => {
+    const orig = globalThis.fetch;
+    let called = false;
+    globalThis.fetch = (async () => {
+      called = true;
+      return new Response(null, { status: 200 });
+    }) as unknown as typeof fetch;
+    try {
+      const upstream = encodeURIComponent("https://evil.example.com/apps");
+      const res = await worker.fetch(
+        request(`/proxy?upstream=${upstream}`, { method: "GET" }),
+        env,
+      );
+      expect(res.status).toBe(403);
+      const body = (await res.json()) as { error: { code: string } };
+      expect(body.error.code).toBe("UPSTREAM_NOT_ALLOWED");
+      expect(called).toBe(false);
+    } finally {
+      globalThis.fetch = orig;
+    }
+  });
+
+  // The error reflected to the client is run through redactSecrets: a
+  // secret-looking token that survives into a COMPILE error message must come
+  // back redacted, never verbatim.
+  test("POST /compile redacts secret-looking tokens in the reflected error message", async () => {
+    const yaml = [
+      "name: leaky",
+      "target: cli",
+      "agent:",
+      "  model: claude-haiku-4-5-20251001",
+      "  instructions: hi",
+      "tools:",
+      "  - mcp__evil__sk-ant-ABCDEFGHIJKLMNOPQRSTUVWXYZ012345",
+    ].join("\n");
+    const res = await worker.fetch(
+      request("/compile", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ yaml }),
+      }),
+      env,
+    );
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: { code: string; message: string } };
+    expect(body.error.code).toBe("COMPILE");
+    expect(body.error.message).toContain("sk-ant-REDACTED");
+    expect(body.error.message).not.toContain("sk-ant-ABCDEFGHIJKLMNOPQRSTUVWXYZ012345");
+  });
+
+  // The cf-worker emit branch threads a caller-supplied `allowedOrigins` list
+  // into the emitter. Non-string entries are filtered out by a type-guard
+  // predicate before the list is forwarded.
+  test("POST /compile emitAs:cf-worker forwards allowedOrigins (dropping non-strings)", async () => {
+    const yaml = `
+name: hello-cli
+target: cli
+agent:
+  model: claude-haiku-4-5-20251001
+  instructions: You are a helpful assistant.
+`;
+    const res = await worker.fetch(
+      request("/compile", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          yaml,
+          emitAs: "cf-worker",
+          // 42 is non-string and must be filtered out by the type guard.
+          allowedOrigins: ["https://app.example.com", 42, "https://other.example.com"],
+        }),
+      }),
+      env,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      bundle: { files: { path: string; content: string }[] };
+    };
+    const file = body.bundle.files.find((f) => f.path === "worker.js");
+    expect(file).toBeDefined();
+    expect(file?.content).toContain("https://app.example.com");
+    expect(file?.content).toContain("https://other.example.com");
+    // The non-string entry never reaches the emitted allowlist.
+    expect(file?.content).not.toContain("42");
+  });
 });

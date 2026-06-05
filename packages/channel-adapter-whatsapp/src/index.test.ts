@@ -273,4 +273,311 @@ describe("WhatsAppAdapterError", () => {
     expect(e.code).toBe("channel");
     expect(e.name).toBe("WhatsAppAdapterError");
   });
+
+  test("preserves the cause chain via toJSON()", () => {
+    const root = new Error("socket hang up");
+    const e = new WhatsAppAdapterError("send failed", root);
+    expect(e.cause).toBe(root);
+    expect(e.toJSON()).toEqual({
+      name: "WhatsAppAdapterError",
+      code: "channel",
+      message: "send failed",
+      cause: { name: "Error", message: "socket hang up" },
+    });
+  });
+});
+
+describe("signWhatsAppBody (T8)", () => {
+  test('produces a "sha256=<64-hex>" header that verify accepts', () => {
+    const body = fixture("text_message");
+    const sig = signWhatsAppBody({ body, appSecret: APP_SECRET });
+    expect(sig).toMatch(/^sha256=[0-9a-f]{64}$/);
+    const h = new Headers({ "X-Hub-Signature-256": sig });
+    expect(verifyWhatsAppSignature({ headers: h, body, appSecret: APP_SECRET })).toBe(true);
+  });
+
+  test("is deterministic for a given (body, secret)", () => {
+    const a = signWhatsAppBody({ body: "{}", appSecret: APP_SECRET });
+    const b = signWhatsAppBody({ body: "{}", appSecret: APP_SECRET });
+    expect(a).toBe(b);
+  });
+
+  test("differs when the secret differs", () => {
+    const a = signWhatsAppBody({ body: "{}", appSecret: APP_SECRET });
+    const b = signWhatsAppBody({ body: "{}", appSecret: "other-secret" });
+    expect(a).not.toBe(b);
+  });
+});
+
+describe("parseInbound — branch coverage (T2)", () => {
+  // Build a well-formed text payload and let callers perturb a single field.
+  function payloadWith(msg: Record<string, unknown>, value: Record<string, unknown> = {}): string {
+    return JSON.stringify({
+      object: "whatsapp_business_account",
+      entry: [
+        {
+          id: "100100100100",
+          changes: [
+            {
+              field: "messages",
+              value: {
+                messaging_product: "whatsapp",
+                metadata: { phone_number_id: PHONE_NUMBER_ID },
+                messages: [{ id: "wamid.gen-1", from: "15554443333", ...msg }],
+                ...value,
+              },
+            },
+          ],
+        },
+      ],
+    });
+  }
+
+  test("non-object JSON (e.g. a bare number) → skip", () => {
+    const a = adapter();
+    expect(a.parseInbound({ headers: new Headers(), body: "42" }).kind).toBe("skip");
+  });
+
+  test("JSON null literal → skip", () => {
+    const a = adapter();
+    expect(a.parseInbound({ headers: new Headers(), body: "null" }).kind).toBe("skip");
+  });
+
+  test("change.field other than 'messages' → skip", () => {
+    const a = adapter();
+    const body = JSON.stringify({
+      object: "whatsapp_business_account",
+      entry: [{ changes: [{ field: "message_template_status_update", value: {} }] }],
+    });
+    expect(a.parseInbound({ headers: new Headers(), body }).kind).toBe("skip");
+  });
+
+  test("messages field present but value missing → skip", () => {
+    const a = adapter();
+    const body = JSON.stringify({
+      object: "whatsapp_business_account",
+      entry: [{ changes: [{ field: "messages" }] }],
+    });
+    expect(a.parseInbound({ headers: new Headers(), body }).kind).toBe("skip");
+  });
+
+  test("message missing id (non-string) → skip", () => {
+    const a = adapter();
+    const body = payloadWith({ id: undefined, type: "text", text: { body: "hi" } });
+    expect(a.parseInbound({ headers: new Headers(), body }).kind).toBe("skip");
+  });
+
+  test("message missing from (non-string) → skip", () => {
+    const a = adapter();
+    const body = payloadWith({ from: undefined, type: "text", text: { body: "hi" } });
+    expect(a.parseInbound({ headers: new Headers(), body }).kind).toBe("skip");
+  });
+
+  test("metadata present but phone_number_id empty → skip", () => {
+    const a = adapter();
+    const body = payloadWith(
+      { type: "text", text: { body: "hi" } },
+      { metadata: { display_phone_number: "15551112222" } },
+    );
+    expect(a.parseInbound({ headers: new Headers(), body }).kind).toBe("skip");
+  });
+
+  test("text message with empty body → event with text ''", () => {
+    const a = adapter();
+    const body = payloadWith({ type: "text", text: { body: "" } });
+    const r = a.parseInbound({ headers: new Headers(), body }) as Extract<
+      ParsedInbound,
+      { kind: "event" }
+    >;
+    expect(r.kind).toBe("event");
+    expect(r.event.text).toBe("");
+  });
+
+  test("text message with no text field → event with text ''", () => {
+    const a = adapter();
+    const body = payloadWith({ type: "text" });
+    const r = a.parseInbound({ headers: new Headers(), body }) as Extract<
+      ParsedInbound,
+      { kind: "event" }
+    >;
+    expect(r.event.text).toBe("");
+  });
+
+  test("missing timestamp → event ts defaults to ''", () => {
+    const a = adapter();
+    const body = payloadWith({ type: "text", text: { body: "hi" } });
+    const r = a.parseInbound({ headers: new Headers(), body }) as Extract<
+      ParsedInbound,
+      { kind: "event" }
+    >;
+    expect(r.event.ts).toBe("");
+  });
+
+  test("button_reply with missing id → text '[button:]'", () => {
+    const a = adapter();
+    const body = payloadWith({ type: "interactive", interactive: { type: "button_reply" } });
+    const r = a.parseInbound({ headers: new Headers(), body }) as Extract<
+      ParsedInbound,
+      { kind: "event" }
+    >;
+    expect(r.event.text).toBe("[button:]");
+  });
+
+  test("list_reply with missing id → text '[list:]'", () => {
+    const a = adapter();
+    const body = payloadWith({ type: "interactive", interactive: { type: "list_reply" } });
+    const r = a.parseInbound({ headers: new Headers(), body }) as Extract<
+      ParsedInbound,
+      { kind: "event" }
+    >;
+    expect(r.event.text).toBe("[list:]");
+  });
+
+  test("interactive with unknown sub-type → skip", () => {
+    const a = adapter();
+    const body = payloadWith({ type: "interactive", interactive: { type: "flow_reply" } });
+    expect(a.parseInbound({ headers: new Headers(), body }).kind).toBe("skip");
+  });
+
+  test("interactive with no interactive object → skip", () => {
+    const a = adapter();
+    const body = payloadWith({ type: "interactive" });
+    expect(a.parseInbound({ headers: new Headers(), body }).kind).toBe("skip");
+  });
+
+  test("video type (unsupported) → skip via default branch", () => {
+    const a = adapter();
+    const body = payloadWith({ type: "video" });
+    expect(a.parseInbound({ headers: new Headers(), body }).kind).toBe("skip");
+  });
+
+  test("ignores prototype-polluting keys in the payload", () => {
+    const a = adapter();
+    const body = `{"object":"whatsapp_business_account","__proto__":{"polluted":true},"entry":[{"changes":[{"field":"messages","value":{"metadata":{"phone_number_id":"${PHONE_NUMBER_ID}"},"messages":[{"id":"wamid.p","from":"15554443333","type":"text","text":{"body":"hi"}}]}}]}]}`;
+    const r = a.parseInbound({ headers: new Headers(), body });
+    expect(r.kind).toBe("event");
+    // No global prototype mutation occurred.
+    expect(({} as Record<string, unknown>)["polluted"]).toBeUndefined();
+  });
+});
+
+describe("createWhatsAppAdapter — config / options", () => {
+  const event: InboundEvent = {
+    idempotencyKey: "wamid.xx",
+    workspaceId: PHONE_NUMBER_ID,
+    channelId: "15554443333",
+    userId: "15554443333",
+    ts: "1700000123",
+    text: "hello",
+    subtype: "message",
+  };
+
+  test("id is 'whatsapp'", () => {
+    expect(adapter().id).toBe("whatsapp");
+  });
+
+  test("defaults to graph.facebook.com / v22.0 when no base url given", async () => {
+    const calls: string[] = [];
+    const f = (async (input: string | Request | URL) => {
+      calls.push(String(input));
+      return new Response("", { status: 200 });
+    }) as unknown as typeof fetch;
+    // No apiBaseUrl override and no env var → default host.
+    const prev = process.env["WHATSAPP_API_BASE_URL"];
+    Reflect.deleteProperty(process.env, "WHATSAPP_API_BASE_URL");
+    try {
+      const a = createWhatsAppAdapter(
+        { phoneNumberId: PHONE_NUMBER_ID, accessToken: ACCESS_TOKEN, appSecret: APP_SECRET },
+        { fetch: f },
+      );
+      await a.sendReply({ event, text: "x" });
+    } finally {
+      if (prev === undefined) Reflect.deleteProperty(process.env, "WHATSAPP_API_BASE_URL");
+      else process.env["WHATSAPP_API_BASE_URL"] = prev;
+    }
+    expect(calls[0]).toBe(`https://graph.facebook.com/v22.0/${PHONE_NUMBER_ID}/messages`);
+  });
+
+  test("honours WHATSAPP_API_BASE_URL env override", async () => {
+    const calls: string[] = [];
+    const f = (async (input: string | Request | URL) => {
+      calls.push(String(input));
+      return new Response("", { status: 200 });
+    }) as unknown as typeof fetch;
+    const prev = process.env["WHATSAPP_API_BASE_URL"];
+    process.env["WHATSAPP_API_BASE_URL"] = "https://env.graph.local";
+    try {
+      const a = createWhatsAppAdapter(
+        { phoneNumberId: PHONE_NUMBER_ID, accessToken: ACCESS_TOKEN, appSecret: APP_SECRET },
+        { fetch: f },
+      );
+      await a.sendReply({ event, text: "x" });
+    } finally {
+      if (prev === undefined) Reflect.deleteProperty(process.env, "WHATSAPP_API_BASE_URL");
+      else process.env["WHATSAPP_API_BASE_URL"] = prev;
+    }
+    expect(calls[0]).toBe(`https://env.graph.local/v22.0/${PHONE_NUMBER_ID}/messages`);
+  });
+
+  test("honours apiVersion option", async () => {
+    const calls: string[] = [];
+    const f = (async (input: string | Request | URL) => {
+      calls.push(String(input));
+      return new Response("", { status: 200 });
+    }) as unknown as typeof fetch;
+    const a = createWhatsAppAdapter(
+      { phoneNumberId: PHONE_NUMBER_ID, accessToken: ACCESS_TOKEN, appSecret: APP_SECRET },
+      { apiBaseUrl: "https://test.graph.local", apiVersion: "v21.0", fetch: f },
+    );
+    await a.sendReply({ event, text: "x" });
+    expect(calls[0]).toBe(`https://test.graph.local/v21.0/${PHONE_NUMBER_ID}/messages`);
+  });
+});
+
+describe("sendReply — response handling (T3)", () => {
+  const event: InboundEvent = {
+    idempotencyKey: "wamid.xx",
+    workspaceId: PHONE_NUMBER_ID,
+    channelId: "15554443333",
+    userId: "15554443333",
+    ts: "1700000123",
+    text: "hello",
+    subtype: "message",
+  };
+
+  test("resolves on a 200 with non-JSON content-type (body not parsed)", async () => {
+    const f = (async () =>
+      new Response("OK", {
+        status: 200,
+        headers: { "content-type": "text/plain" },
+      })) as unknown as typeof fetch;
+    const a = adapter({ fetch: f });
+    await expect(a.sendReply({ event, text: "x" })).resolves.toBeUndefined();
+  });
+
+  test("resolves on a 200 with no content-type header", async () => {
+    const f = (async () => new Response("", { status: 200 })) as unknown as typeof fetch;
+    const a = adapter({ fetch: f });
+    await expect(a.sendReply({ event, text: "x" })).resolves.toBeUndefined();
+  });
+
+  test("resolves on a 200 JSON success envelope without an error field", async () => {
+    const f = (async () =>
+      new Response(JSON.stringify({ messages: [{ id: "wamid.ok" }] }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      })) as unknown as typeof fetch;
+    const a = adapter({ fetch: f });
+    await expect(a.sendReply({ event, text: "x" })).resolves.toBeUndefined();
+  });
+
+  test("error envelope with no message falls back to 'unknown'", async () => {
+    const f = (async () =>
+      new Response(JSON.stringify({ error: {} }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      })) as unknown as typeof fetch;
+    const a = adapter({ fetch: f });
+    await expect(a.sendReply({ event, text: "x" })).rejects.toThrow(/messages POST error: unknown/);
+  });
 });

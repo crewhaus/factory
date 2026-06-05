@@ -108,9 +108,14 @@ function isHostAllowed(host: string): boolean {
 export type DnsLookupFn = (
   host: string,
 ) => Promise<{ readonly address: string; readonly family: number }>;
-let dnsLookupFn: DnsLookupFn = (host) => dnsLookup(host, { verbatim: false });
+// Production default — a single named function shared by both the initial
+// binding and the `_setDnsLookup(undefined)` reset path, so there is one
+// resolver definition to reason about (and to cover) rather than two
+// duplicate closures.
+const defaultDnsLookup: DnsLookupFn = (host) => dnsLookup(host, { verbatim: false });
+let dnsLookupFn: DnsLookupFn = defaultDnsLookup;
 export function _setDnsLookup(fn: DnsLookupFn | undefined): void {
-  dnsLookupFn = fn ?? ((host) => dnsLookup(host, { verbatim: false }));
+  dnsLookupFn = fn ?? defaultDnsLookup;
 }
 
 function isPrivateIp(addr: string): boolean {
@@ -180,9 +185,12 @@ const webFetchSchema = z.object({
 });
 
 export type RawFetch = (req: Request) => Promise<Response>;
-let rawFetch: RawFetch = (req) => globalThis.fetch(req);
+// Production default — one named fetcher shared by the initial binding and the
+// `_setRawFetch(undefined)` reset path (see defaultDnsLookup for rationale).
+const defaultRawFetch: RawFetch = (req) => globalThis.fetch(req);
+let rawFetch: RawFetch = defaultRawFetch;
 export function _setRawFetch(fn: RawFetch | undefined): void {
-  rawFetch = fn ?? ((req) => globalThis.fetch(req));
+  rawFetch = fn ?? defaultRawFetch;
 }
 
 async function readBodyCapped(res: Response): Promise<string> {

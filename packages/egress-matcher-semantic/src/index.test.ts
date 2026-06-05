@@ -4,6 +4,7 @@ import { type EmbedOptions, type Embedder, createEmbedder } from "@crewhaus/embe
 import type { TrustOrigin } from "@crewhaus/run-context";
 import {
   DEFAULT_SEMANTIC_THRESHOLD,
+  EgressMatcherSemanticError,
   SemanticEgressMatcher,
   cosineSimilarity,
   createSemanticEgressMatcher,
@@ -174,6 +175,115 @@ describe("SemanticEgressMatcher", () => {
     // biome-ignore lint/suspicious/noExplicitAny: testing runtime guard
     expect(() => new SemanticEgressMatcher({} as any)).toThrow(/requires an `embedder`/);
   });
+
+  test("constructor rejects an embedder whose embed is not a function", () => {
+    // Exercises the *second* operand of the guard: `embedder` is present but
+    // `embed` is not callable (e.g. a half-constructed / wrong-shape object).
+    expect(
+      () =>
+        new SemanticEgressMatcher({
+          // biome-ignore lint/suspicious/noExplicitAny: testing runtime guard
+          embedder: { model: "x", provider: "mock", embed: 123 } as any,
+        }),
+    ).toThrow(/requires an `embedder`/);
+  });
+
+  test("falls back to substring matching when the embedder returns too few vectors", async () => {
+    // An embedder that returns an EMPTY array (so `vectors[0]` is undefined)
+    // is a config error, not an attack: degrade to the substring tripwire.
+    // The payload verbatim-contains the tagged string → substring hit.
+    const emptyEmbedder: Embedder = {
+      model: "mock/empty",
+      provider: "mock",
+      embed: async (): Promise<number[][]> => [],
+    };
+    const tagged = "subagent-extracted secret API_KEY=sleeper-token-9f3a2b1c";
+    const matcher = new SemanticEgressMatcher({ embedder: emptyEmbedder });
+    const result = await matcher.match({
+      payload: `POST body ${tagged} now`,
+      lineage: lineageOf([[tagged, "subagent"]]),
+      minMatchLength: MIN_MATCH_LENGTH,
+    });
+    expect(result.originsFound).toContain("subagent");
+    expect(result.matchCount).toBe(1);
+  });
+
+  test("surfaces a config error when too few vectors are returned and disableFallback is set", async () => {
+    const emptyEmbedder: Embedder = {
+      model: "mock/empty",
+      provider: "mock",
+      embed: async (): Promise<number[][]> => [],
+    };
+    const tagged = "subagent-extracted secret API_KEY=sleeper-token-9f3a2b1c";
+    const matcher = new SemanticEgressMatcher({
+      embedder: emptyEmbedder,
+      disableFallback: true,
+    });
+    await expect(
+      matcher.match({
+        payload: `POST body ${tagged} now`,
+        lineage: lineageOf([[tagged, "subagent"]]),
+        minMatchLength: MIN_MATCH_LENGTH,
+      }),
+    ).rejects.toThrow(/expected 2/);
+  });
+
+  test("skips a candidate whose embedding vector is missing", async () => {
+    // payloadVec is present (index 0) but the embedder returns FEWER vectors
+    // than candidates, so the per-candidate `candVec === undefined` guard
+    // makes the loop skip both candidates → no hits, no throw.
+    const shortEmbedder: Embedder = {
+      model: "mock/short",
+      provider: "mock",
+      // Only one vector back for payload + 2 candidates.
+      embed: async (): Promise<number[][]> => [[1, 0, 0]],
+    };
+    const a = "subagent secret one API_KEY=sleeper-token-aaaaaaaa1111";
+    const b = "subagent secret two API_KEY=sleeper-token-bbbbbbbb2222";
+    const matcher = new SemanticEgressMatcher({ embedder: shortEmbedder, threshold: 0.1 });
+    const result = await matcher.match({
+      payload: `${a} ||| ${b}`,
+      lineage: lineageOf([
+        [a, "subagent"],
+        [b, "subagent"],
+      ]),
+      minMatchLength: MIN_MATCH_LENGTH,
+    });
+    expect(result.originsFound).toEqual([]);
+    expect(result.matchCount).toBe(0);
+  });
+
+  test("surfaces a typed error (not a raw TypeError) when the embedder throws a non-Error and disableFallback is set", async () => {
+    // Regression: the error-message extraction must be null-safe. An embedder
+    // that throws a nullish / non-object value (e.g. `throw null`) previously
+    // made `(err as Error).message` itself throw a TypeError, masking the
+    // failure and breaking the documented "surface the embedder error"
+    // contract. It must reject with EgressMatcherSemanticError carrying the
+    // stringified cause.
+    const nullThrowingEmbedder: Embedder = {
+      model: "mock/null-throwing",
+      provider: "mock",
+      // Reject with a nullish, non-Error value to exercise the source's
+      // `?? String(err)` fallback. A plain rejected promise (rather than an
+      // `async` body that `throw null`s) keeps the rejection reason exactly
+      // `null` without tripping useAwait / noThrowLiteral.
+      embed: (): Promise<number[][]> => Promise.reject(null),
+    };
+    const tagged = "subagent-extracted secret API_KEY=sleeper-token-9f3a2b1c";
+    const matcher = new SemanticEgressMatcher({
+      embedder: nullThrowingEmbedder,
+      disableFallback: true,
+    });
+    const promise = matcher.match({
+      payload: `POST body ${tagged} now`,
+      lineage: lineageOf([[tagged, "subagent"]]),
+      minMatchLength: MIN_MATCH_LENGTH,
+    });
+    await expect(promise).rejects.toBeInstanceOf(EgressMatcherSemanticError);
+    // The cause is stringified into the message, never a "cannot read
+    // properties of null" TypeError.
+    await expect(promise).rejects.toThrow(/embedder failed: null/);
+  });
 });
 
 describe("DEFAULT_SEMANTIC_THRESHOLD", () => {
@@ -190,6 +300,10 @@ describe("cosineSimilarity helper", () => {
   });
   test("returns 0 for a zero vector", () => {
     expect(cosineSimilarity([0, 0], [1, 1])).toBe(0);
+  });
+  test("returns 0 for two empty vectors", () => {
+    // Empty-but-equal-length inputs short-circuit to 0 before the loop.
+    expect(cosineSimilarity([], [])).toBe(0);
   });
   test("throws on dimension mismatch", () => {
     expect(() => cosineSimilarity([1, 2], [1, 2, 3])).toThrow(/dim mismatch/);

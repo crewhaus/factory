@@ -87,10 +87,18 @@ export class McpError extends CrewhausError {
 
 export class McpConnectionError extends McpError {
   override readonly name = "McpConnectionError";
+  // biome-ignore lint/complexity/noUselessConstructor: explicit constructor so Bun --coverage counts it as a covered function (field-initializer-only classes can't hit 100% function coverage otherwise)
+  constructor(message: string, cause?: unknown) {
+    super(message, cause);
+  }
 }
 
 export class McpProtocolError extends McpError {
   override readonly name = "McpProtocolError";
+  // biome-ignore lint/complexity/noUselessConstructor: explicit constructor so Bun --coverage counts it as a covered function (field-initializer-only classes can't hit 100% function coverage otherwise)
+  constructor(message: string, cause?: unknown) {
+    super(message, cause);
+  }
 }
 
 /**
@@ -114,4 +122,8 @@ export class AdapterError extends CrewhausError {
  */
 export class ProviderAuthError extends AdapterError {
   override readonly name = "ProviderAuthError";
+  // biome-ignore lint/complexity/noUselessConstructor: explicit constructor so Bun --coverage counts it as a covered function (field-initializer-only classes can't hit 100% function coverage otherwise)
+  constructor(providerId: string, message: string, cause?: unknown) {
+    super(providerId, message, cause);
+  }
 }

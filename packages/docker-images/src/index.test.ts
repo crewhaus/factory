@@ -8,6 +8,8 @@ import {
   DockerImagesError,
   TARGET_SHAPES,
   buildImage,
+  defaultRunner,
+  digestsPath,
   dockerRoot,
   dockerfilePath,
   dockerfileSize,
@@ -60,6 +62,11 @@ describe("Dockerfiles on disk", () => {
 
   test("dockerRoot points inside the package", () => {
     expect(dockerRoot()).toMatch(/packages\/docker-images\/docker$/);
+  });
+
+  test("digestsPath resolves to docker/digests.json inside the package", () => {
+    expect(digestsPath()).toMatch(/packages\/docker-images\/docker\/digests\.json$/);
+    expect(digestsPath()).toBe(join(dockerRoot(), "digests.json"));
   });
 });
 
@@ -250,5 +257,51 @@ CMD ["--help"]
     expect(fp.hasHealthcheck).toBe(false);
     expect(fp.nonRootUser).toBeUndefined();
     expect(fp.exposedPorts).toEqual([]);
+  });
+});
+
+describe("defaultRunner (spawn integration, deterministic)", () => {
+  // We drive the real spawn-based runner using the running JS binary
+  // (`process.execPath`) with `-e` — no docker, no network, no external
+  // service. argv[0] is the program; the rest are passed verbatim.
+  const exe = process.execPath;
+
+  test("captures stdout, stderr, and a zero exit code", async () => {
+    const result = await defaultRunner(
+      [exe, "-e", 'process.stdout.write("hello-out");process.stderr.write("hello-err")'],
+      process.cwd(),
+    );
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toBe("hello-out");
+    expect(result.stderr).toBe("hello-err");
+  });
+
+  test("propagates a non-zero exit code", async () => {
+    const result = await defaultRunner(
+      [exe, "-e", 'process.stderr.write("boom");process.exit(7)'],
+      process.cwd(),
+    );
+    expect(result.exitCode).toBe(7);
+    expect(result.stderr).toBe("boom");
+  });
+
+  test("resolves with exitCode 1 when the program cannot be spawned (error event)", async () => {
+    const result = await defaultRunner(
+      ["./crewhaus-nonexistent-binary-9f3a2c", "--version"],
+      process.cwd(),
+    );
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout).toBe("");
+    expect(result.stderr.length).toBeGreaterThan(0);
+  });
+
+  test("falls back to exitCode 1 when the child is killed by a signal (null code)", async () => {
+    // A child that SIGKILLs itself terminates via signal, so `close` fires with
+    // code === null — exercising the `code ?? 1` fallback deterministically.
+    const result = await defaultRunner(
+      [exe, "-e", "process.kill(process.pid, 'SIGKILL')"],
+      process.cwd(),
+    );
+    expect(result.exitCode).toBe(1);
   });
 });

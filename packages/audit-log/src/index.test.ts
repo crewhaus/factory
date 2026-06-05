@@ -6,6 +6,7 @@ import {
   type AnchorRecord,
   type AnchorStore,
   type AuditLog,
+  AuditLogError,
   GENESIS_HASH,
   InMemoryAnchorStore,
   openAuditLog,
@@ -141,6 +142,26 @@ describe("verify (T4)", () => {
     if (!r.ok) {
       expect(r.line).toBe(2);
       expect(r.reason).toMatch(/malformed JSON/);
+    }
+  });
+
+  test("a corrupt _chain-tail.json is reported, not thrown (no verifier DoS)", async () => {
+    const log = await makeLog();
+    await log.append({ kind: "model_call", payload: 1 });
+    await log.append({ kind: "model_call", payload: 2 });
+
+    // Garble the on-host anchor (a crash mid-write, or a one-byte attacker
+    // edit, leaves invalid JSON). verify must surface this as a broken link
+    // rather than crash with an unhandled JSON.parse throw.
+    writeFileSync(join(tmp, "_chain-tail.json"), "{ this is not valid json");
+
+    const r = await verify(tmp);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.reason).toMatch(/chain-tail anchor unreadable/);
+      expect(r.file).toMatch(/_chain-tail\.json$/);
+      // The chain walk itself completed before the anchor was consulted.
+      expect(r.recordsChecked).toBe(2);
     }
   });
 });
@@ -489,5 +510,109 @@ describe("off-host anchor (#156-followup)", () => {
     expect(await store.getAnchor("log-a")).toEqual({ seq: 5, hash: "h5" });
     // Distinct logIds are independent.
     expect(await store.getAnchor("log-b")).toBeUndefined();
+  });
+});
+
+describe("openAuditLog input validation", () => {
+  test("an empty rootDir throws AuditLogError", async () => {
+    await expect(openAuditLog({ rootDir: "" })).rejects.toBeInstanceOf(AuditLogError);
+  });
+
+  test("a non-string rootDir throws AuditLogError with the config code", async () => {
+    // The guard is `typeof rootDir !== "string" || rootDir === ""`; exercise the
+    // typeof branch (distinct from the empty-string branch above).
+    await expect(
+      // biome-ignore lint/suspicious/noExplicitAny: deliberately bad input for the guard
+      openAuditLog({ rootDir: undefined as any }),
+    ).rejects.toMatchObject({ name: "AuditLogError", code: "config" });
+  });
+});
+
+describe("default clock + day selector", () => {
+  test("openAuditLog works with the built-in Date.now()/today defaults", async () => {
+    // Opening WITHOUT `now`/`day` exercises the default `() => Date.now()`
+    // clock and the default `todayStr` day selector (UTC ISO date). We assert
+    // structural invariants rather than a fixed value so the test stays
+    // deterministic despite using the real clock.
+    const log = await openAuditLog({ rootDir: tmp });
+    const before = Date.now();
+    const rec = await log.append({ kind: "model_call", payload: { ok: true } });
+    const after = Date.now();
+    expect(rec.seq).toBe(0);
+    expect(rec.prevHash).toBe(GENESIS_HASH);
+    expect(rec.ts).toBeGreaterThanOrEqual(before);
+    expect(rec.ts).toBeLessThanOrEqual(after);
+
+    // The day file is named for today's UTC date (what `todayStr` returns).
+    const today = new Date().toISOString().slice(0, 10);
+    const lines = readFileSync(join(tmp, `${today}.jsonl`), "utf8")
+      .split("\n")
+      .filter((l) => l !== "");
+    expect(lines).toHaveLength(1);
+
+    // read() with the default day selector must round-trip the record back.
+    const out: unknown[] = [];
+    for await (const r of log.read()) out.push(r.payload);
+    expect(out).toEqual([{ ok: true }]);
+
+    const v = await verify(tmp);
+    expect(v.ok).toBe(true);
+  });
+});
+
+describe("read with an explicit day", () => {
+  test("read({ day }) targets that day's file and round-trips its records", async () => {
+    const log = await openAuditLog({ rootDir: tmp, now: fixedNow(), day: () => FIXED_DAY });
+    await log.append({ kind: "model_call", payload: "x" });
+    await log.append({ kind: "model_call", payload: "y" });
+
+    // Explicitly request the known day instead of relying on the default.
+    const out: unknown[] = [];
+    for await (const r of log.read({ day: FIXED_DAY })) out.push(r.payload);
+    expect(out).toEqual(["x", "y"]);
+  });
+
+  test("read({ day }) for a day with no file yields nothing", async () => {
+    const log = await openAuditLog({ rootDir: tmp, now: fixedNow(), day: () => FIXED_DAY });
+    await log.append({ kind: "model_call", payload: "x" });
+
+    const out: unknown[] = [];
+    for await (const r of log.read({ day: "1999-01-01" })) out.push(r.payload);
+    expect(out).toEqual([]);
+  });
+});
+
+describe("append evaluates the day selector once (midnight-boundary safety)", () => {
+  test("the JSONL filename and the chain-tail day stay consistent across a boundary", async () => {
+    // A `day` selector that flips on its SECOND call simulates an append that
+    // straddles midnight. The record file and the persisted anchor's `day`
+    // must agree (both the FIRST value), and the chain must still verify.
+    const days = ["2026-05-08", "2026-05-09"];
+    let calls = 0;
+    const flippingDay = (): string => {
+      const d = days[Math.min(calls, days.length - 1)] as string;
+      calls += 1;
+      return d;
+    };
+
+    const log = await openAuditLog({ rootDir: tmp, now: fixedNow(), day: flippingDay });
+    const rec = await log.append({ kind: "model_call", payload: "boundary" });
+
+    // The record landed in the FIRST day's file...
+    const firstDayLines = readFileSync(join(tmp, "2026-05-08.jsonl"), "utf8")
+      .split("\n")
+      .filter((l) => l !== "");
+    expect(firstDayLines).toHaveLength(1);
+
+    // ...and the anchor's `day` matches that same file (not the flipped value).
+    const anchor = JSON.parse(readFileSync(join(tmp, "_chain-tail.json"), "utf8"));
+    expect(anchor.day).toBe("2026-05-08");
+    expect(anchor.hash).toBe(rec.hash);
+
+    // No second-day file was created by the single append.
+    expect(() => readFileSync(join(tmp, "2026-05-09.jsonl"), "utf8")).toThrow();
+
+    // The single append consumed exactly one `day()` evaluation post-fix.
+    expect(calls).toBe(1);
   });
 });

@@ -31,7 +31,11 @@ export type RegisteredGrader = {
 };
 
 export class GraderRegistry {
-  private readonly graders = new Map<string, Grader>();
+  private readonly graders: Map<string, Grader>;
+
+  constructor() {
+    this.graders = new Map<string, Grader>();
+  }
 
   register(name: string, grader: Grader): void {
     if (!/^[A-Za-z][A-Za-z0-9_.-]*$/.test(name)) {

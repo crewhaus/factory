@@ -1,9 +1,10 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { type TraceEvent, TraceEventBus } from "@crewhaus/trace-event-bus";
 import {
   NR_DEFAULT_ENDPOINT_EU,
   NR_DEFAULT_ENDPOINT_US,
   _scrubLicenseKeyForTest,
+  _wrapFetchWithEntityGuidForTest,
   attachNewRelicExporter,
   attachNewRelicIfEnvSet,
 } from "./index";
@@ -169,6 +170,108 @@ describe("attachNewRelicExporter — T8 credential-leak guard", () => {
     const msg = "upstream 500: refused";
     expect(_scrubLicenseKeyForTest(msg, undefined)).toBe(msg);
     expect(_scrubLicenseKeyForTest("contains: abc", "abc")).toBe("contains: abc");
+  });
+
+  test("default onError writes a scrubbed message to stderr when no handler given", async () => {
+    const bus = new TraceEventBus({ runId: "run_k", sessionId: "sess_b" });
+    const licenseKey = "nr-secret-license-leakable12";
+    const writes: string[] = [];
+    const stderrSpy = spyOn(process.stderr, "write").mockImplementation(((
+      chunk: string | Uint8Array,
+    ): boolean => {
+      writes.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString());
+      return true;
+    }) as typeof process.stderr.write);
+    try {
+      const failingFetch = (async () =>
+        new Response(`upstream 401: license-key was ${licenseKey}`, {
+          status: 401,
+        })) as unknown as typeof fetch;
+      // No onError supplied -> exercises the default stderr branch.
+      const exp = attachNewRelicExporter(bus, {
+        licenseKey,
+        fetchImpl: failingFetch,
+        flushIntervalMs: 0,
+      });
+      publishTurnPair(bus);
+      await exp.flush();
+      await exp.shutdown();
+    } finally {
+      stderrSpy.mockRestore();
+    }
+    const joined = writes.join("");
+    expect(joined).toContain("[exporter-newrelic] export failed:");
+    expect(joined).toContain("[REDACTED:NEW_RELIC_LICENSE_KEY]");
+    expect(joined).not.toContain(licenseKey);
+  });
+});
+
+describe("wrapFetchWithEntityGuid (direct test seam)", () => {
+  const ENTITY = "MTIzNDU2N3xBUE18QVBQTElDQVRJT058MTIzNDU2";
+
+  function recordingFetch(): {
+    fetch: typeof fetch;
+    calls: { input: unknown; init?: RequestInit }[];
+  } {
+    const calls: { input: unknown; init?: RequestInit }[] = [];
+    const fn = (async (input: unknown, init?: RequestInit): Promise<Response> => {
+      calls.push({ input, init });
+      return new Response("", { status: 200 });
+    }) as unknown as typeof fetch;
+    return { fetch: fn, calls };
+  }
+
+  test("injects entity.guid into each resourceSpans resource", async () => {
+    const { fetch, calls } = recordingFetch();
+    const wrapped = _wrapFetchWithEntityGuidForTest(fetch, ENTITY);
+    const body = JSON.stringify({
+      resourceSpans: [
+        { resource: { attributes: [{ key: "service.name", value: { stringValue: "svc" } }] } },
+        {}, // no resource -> existing falls back to []
+      ],
+    });
+    await wrapped("https://otlp.example/v1/traces", { method: "POST", body });
+
+    expect(calls.length).toBe(1);
+    const sent = JSON.parse(String(calls[0]?.init?.body));
+    const attrs0 = sent.resourceSpans[0].resource.attributes;
+    const attrs1 = sent.resourceSpans[1].resource.attributes;
+    // First resource keeps its original attr AND gains entity.guid.
+    expect(attrs0).toContainEqual({ key: "service.name", value: { stringValue: "svc" } });
+    expect(attrs0).toContainEqual({ key: "entity.guid", value: { stringValue: ENTITY } });
+    // Second resource (none originally) gets just entity.guid.
+    expect(attrs1).toEqual([{ key: "entity.guid", value: { stringValue: ENTITY } }]);
+  });
+
+  test("falls through unchanged when body is not valid JSON (catch path)", async () => {
+    const { fetch, calls } = recordingFetch();
+    const wrapped = _wrapFetchWithEntityGuidForTest(fetch, ENTITY);
+    await wrapped("https://otlp.example/v1/traces", { method: "POST", body: "not-json{" });
+    expect(calls.length).toBe(1);
+    // Original (untouched) body forwarded verbatim.
+    expect(calls[0]?.init?.body).toBe("not-json{");
+  });
+
+  test("falls through unchanged when JSON lacks resourceSpans array", async () => {
+    const { fetch, calls } = recordingFetch();
+    const wrapped = _wrapFetchWithEntityGuidForTest(fetch, ENTITY);
+    const body = JSON.stringify({ resourceSpans: "nope" });
+    await wrapped("https://otlp.example/v1/traces", { method: "POST", body });
+    expect(calls.length).toBe(1);
+    expect(calls[0]?.init?.body).toBe(body);
+  });
+
+  test("falls through unchanged when body is absent or non-string", async () => {
+    const { fetch, calls } = recordingFetch();
+    const wrapped = _wrapFetchWithEntityGuidForTest(fetch, ENTITY);
+    // Absent init entirely.
+    await wrapped("https://otlp.example/v1/traces");
+    // Non-string body (e.g. a Uint8Array).
+    const bytes = new Uint8Array([1, 2, 3]);
+    await wrapped("https://otlp.example/v1/traces", { method: "POST", body: bytes });
+    expect(calls.length).toBe(2);
+    expect(calls[0]?.init).toBeUndefined();
+    expect(calls[1]?.init?.body).toBe(bytes);
   });
 });
 

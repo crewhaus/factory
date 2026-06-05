@@ -1,8 +1,25 @@
 /**
  * Tests for the unified-diff renderer used by the Edit tool's result.
  */
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import { renderEditDiff } from "./diff";
+
+// Snapshot + restore the two env knobs `envInt` reads so these tests never
+// leak process.env state into sibling tests.
+const ENV_CONTEXT = "CREWHAUS_EDIT_DIFF_CONTEXT";
+const ENV_MAX = "CREWHAUS_EDIT_DIFF_MAX";
+const savedEnv: Record<string, string | undefined> = {};
+afterEach(() => {
+  for (const key of [ENV_CONTEXT, ENV_MAX]) {
+    if (savedEnv[key] === undefined) delete process.env[key];
+    else process.env[key] = savedEnv[key];
+    delete savedEnv[key];
+  }
+});
+function setEnv(key: string, value: string): void {
+  savedEnv[key] = process.env[key];
+  process.env[key] = value;
+}
 
 describe("renderEditDiff", () => {
   test("renders a basic single-line change with context", () => {
@@ -105,5 +122,43 @@ describe("renderEditDiff", () => {
       newString: "B",
     });
     expect(diff).toMatch(/@@ -\d+,\d+ \+\d+,\d+ @@/);
+  });
+
+  test("honors CREWHAUS_EDIT_DIFF_CONTEXT when no contextLines opt is passed", () => {
+    // A valid positive integer env value drives the parse branch in envInt.
+    setEnv(ENV_CONTEXT, "1");
+    const original = ["a", "b", "c", "d", "e", "f", "g"].join("\n");
+    const diff = renderEditDiff({ path: "x.txt", original, oldString: "d", newString: "D" });
+    // ctx=1 → exactly one context line above and below the change.
+    const stripped = diff.split("\n").filter((l) => l.startsWith(" "));
+    expect(stripped.length).toBe(2);
+  });
+
+  test("honors CREWHAUS_EDIT_DIFF_MAX when no maxLines opt is passed", () => {
+    setEnv(ENV_MAX, "5");
+    const big = Array.from({ length: 50 }, (_, i) => `line ${i}`).join("\n");
+    const diff = renderEditDiff({
+      path: "huge.txt",
+      original: big,
+      oldString: "line 0\nline 1\nline 2\nline 3\nline 4",
+      newString: Array.from({ length: 30 }, (_, i) => `r ${i}`).join("\n"),
+    });
+    expect(diff).toContain("@@ truncated:");
+    // 5 kept lines + the truncation notice line.
+    expect(diff.split("\n").length).toBe(6);
+  });
+
+  test("falls back to defaults when env values are non-numeric or non-positive", () => {
+    // Non-numeric → Number.parseInt yields NaN → Number.isFinite false → default.
+    setEnv(ENV_CONTEXT, "not-a-number");
+    // Non-positive → n > 0 false → default.
+    setEnv(ENV_MAX, "0");
+    const original = ["a", "b", "c", "d", "e", "f", "g", "h", "i"].join("\n");
+    const diff = renderEditDiff({ path: "x.txt", original, oldString: "e", newString: "E" });
+    // Default context is 3 → three lines before + three after.
+    const stripped = diff.split("\n").filter((l) => l.startsWith(" "));
+    expect(stripped.length).toBe(6);
+    // Default max is 80 → this small diff is not truncated.
+    expect(diff).not.toContain("@@ truncated:");
   });
 });

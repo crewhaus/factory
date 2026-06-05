@@ -326,4 +326,310 @@ describe("deployToFly", () => {
     });
     expect(seenUrl).toBe(`${FLY_DEFAULT_API_BASE}/apps`);
   });
+
+  test('falls back to status "created" when launch body omits state', async () => {
+    const fetchImpl = (async (url: string | URL) => {
+      const u = String(url);
+      if (u.endsWith("/apps")) return new Response("{}", { status: 201 });
+      // No `state` field — exercises the `?? "created"` fallback.
+      return new Response(JSON.stringify({ id: "m-nostate" }), { status: 200 });
+    }) as unknown as typeof fetch;
+    const record = await deployToFly({
+      target: "channel",
+      appName: "my-bot",
+      imageRef: "img",
+      apiToken: "fo_testtoken_abc",
+      fetchImpl,
+    });
+    expect(record.machineId).toBe("m-nostate");
+    expect(record.status).toBe("created");
+  });
+
+  test("throws when launch returns 2xx with a non-JSON body", async () => {
+    const fetchImpl = (async (url: string | URL) => {
+      const u = String(url);
+      if (u.endsWith("/apps")) return new Response("{}", { status: 201 });
+      return new Response("not json at all", { status: 200 });
+    }) as unknown as typeof fetch;
+    let caught: Error | undefined;
+    try {
+      await deployToFly({
+        target: "channel",
+        appName: "my-bot",
+        imageRef: "img",
+        apiToken: "fo_testtoken_abc",
+        fetchImpl,
+      });
+    } catch (err) {
+      caught = err as Error;
+    }
+    expect(caught).toBeInstanceOf(FlyAdapterError);
+    expect(caught?.message).toContain("non-JSON body");
+  });
+
+  test("throws when launch body is valid JSON but missing machine id", async () => {
+    const fetchImpl = (async (url: string | URL) => {
+      const u = String(url);
+      if (u.endsWith("/apps")) return new Response("{}", { status: 201 });
+      // Valid JSON, but `id` is absent (or non-string).
+      return new Response(JSON.stringify({ state: "started" }), { status: 200 });
+    }) as unknown as typeof fetch;
+    let caught: Error | undefined;
+    try {
+      await deployToFly({
+        target: "channel",
+        appName: "my-bot",
+        imageRef: "img",
+        apiToken: "fo_testtoken_abc",
+        fetchImpl,
+      });
+    } catch (err) {
+      caught = err as Error;
+    }
+    expect(caught).toBeInstanceOf(FlyAdapterError);
+    expect(caught?.message).toContain("missing machine id");
+  });
+
+  test("wraps a thrown fetch on app-create and scrubs the token", async () => {
+    const fetchImpl = (async () => {
+      throw new Error("network down for fo_leakingtoken_full retry");
+    }) as unknown as typeof fetch;
+    let caught: Error | undefined;
+    try {
+      await deployToFly({
+        target: "channel",
+        appName: "my-bot",
+        imageRef: "img",
+        apiToken: "fo_leakingtoken_full",
+        fetchImpl,
+      });
+    } catch (err) {
+      caught = err as Error;
+    }
+    expect(caught).toBeInstanceOf(FlyAdapterError);
+    expect(caught?.message).toContain("Fly Machines API request failed");
+    expect(caught?.message).not.toContain("fo_leakingtoken_full");
+    expect(caught?.message).toContain("[REDACTED:FLY_API_TOKEN]");
+    expect((caught as FlyAdapterError).cause).toBeInstanceOf(Error);
+  });
+
+  test("wraps a non-Error thrown fetch on machine launch", async () => {
+    const fetchImpl = (async (url: string | URL) => {
+      const u = String(url);
+      if (u.endsWith("/apps")) return new Response("{}", { status: 201 });
+      // Throw a non-Error so the `String(err)` branch is taken.
+      throw "boom-string";
+    }) as unknown as typeof fetch;
+    let caught: Error | undefined;
+    try {
+      await deployToFly({
+        target: "channel",
+        appName: "my-bot",
+        imageRef: "img",
+        apiToken: "fo_testtoken_abc",
+        fetchImpl,
+      });
+    } catch (err) {
+      caught = err as Error;
+    }
+    expect(caught).toBeInstanceOf(FlyAdapterError);
+    expect(caught?.message).toContain("Fly Machines API request failed: boom-string");
+  });
+
+  test("rejects unsupported (one-shot) target shapes before any network call", async () => {
+    let called = false;
+    const fetchImpl = (async () => {
+      called = true;
+      return new Response("", { status: 200 });
+    }) as unknown as typeof fetch;
+    let caught: Error | undefined;
+    try {
+      await deployToFly({
+        target: "eval",
+        appName: "my-bot",
+        imageRef: "img",
+        apiToken: "fo_testtoken_abc",
+        fetchImpl,
+      });
+    } catch (err) {
+      caught = err as Error;
+    }
+    expect(caught).toBeInstanceOf(FlyAdapterError);
+    expect(called).toBe(false);
+  });
+
+  test("rejects unknown target shapes before any network call", async () => {
+    let called = false;
+    const fetchImpl = (async () => {
+      called = true;
+      return new Response("", { status: 200 });
+    }) as unknown as typeof fetch;
+    let caught: Error | undefined;
+    try {
+      await deployToFly({
+        target: "mystery" as never,
+        appName: "my-bot",
+        imageRef: "img",
+        apiToken: "fo_testtoken_abc",
+        fetchImpl,
+      });
+    } catch (err) {
+      caught = err as Error;
+    }
+    expect(caught).toBeInstanceOf(FlyAdapterError);
+    expect(caught?.message).toContain("unknown target shape");
+    expect(called).toBe(false);
+  });
+
+  test("treats an empty-string apiToken as unconfigured", async () => {
+    delete process.env[API_TOKEN_ENV];
+    let caught: Error | undefined;
+    try {
+      await deployToFly({
+        target: "channel",
+        appName: "my-bot",
+        imageRef: "img",
+        apiToken: "",
+      });
+    } catch (err) {
+      caught = err as Error;
+    }
+    expect(caught).toBeInstanceOf(FlyAdapterError);
+    expect(caught?.message).toContain("FLY_API_TOKEN is required");
+  });
+
+  test("honors an explicit org slug + region in the request payload", async () => {
+    let createBody: string | undefined;
+    let launchBody: string | undefined;
+    const fetchImpl = (async (url: string | URL, init?: RequestInit) => {
+      const u = String(url);
+      if (u.endsWith("/apps")) {
+        createBody = init?.body as string;
+        return new Response("{}", { status: 201 });
+      }
+      launchBody = init?.body as string;
+      return new Response(JSON.stringify({ id: "m-1", state: "started" }), { status: 200 });
+    }) as unknown as typeof fetch;
+    const record = await deployToFly({
+      target: "channel",
+      appName: "my-bot",
+      imageRef: "img",
+      apiToken: "fo_testtoken_abc",
+      orgSlug: "acme-co",
+      region: "fra",
+      fetchImpl,
+    });
+    expect(record.region).toBe("fra");
+    expect(JSON.parse(createBody as string).org_slug).toBe("acme-co");
+    expect(JSON.parse(launchBody as string).region).toBe("fra");
+  });
+
+  test("surfaces a scrubbed app-create failure for non-409 statuses", async () => {
+    const fetchImpl = (async () =>
+      new Response("boom fo_leakingtoken_full boom", {
+        status: 500,
+        statusText: "Internal Server Error",
+      })) as unknown as typeof fetch;
+    let caught: Error | undefined;
+    try {
+      await deployToFly({
+        target: "channel",
+        appName: "my-bot",
+        imageRef: "img",
+        apiToken: "fo_leakingtoken_full",
+        fetchImpl,
+      });
+    } catch (err) {
+      caught = err as Error;
+    }
+    expect(caught).toBeInstanceOf(FlyAdapterError);
+    expect(caught?.message).toContain("Fly app create returned 500");
+    expect(caught?.message).not.toContain("fo_leakingtoken_full");
+  });
+});
+
+describe("security: app name guards the Machines API URL path", () => {
+  // Regression: appName is interpolated into `${baseUrl}/apps/${appName}/machines`.
+  // assertAppName must reject path-traversal / SSRF payloads BEFORE any fetch runs.
+  const PAYLOADS = [
+    "../../etc/passwd",
+    "app/../../admin",
+    "app%2F..%2Fadmin",
+    "app name",
+    "app\nmachines",
+    "evil.example.com",
+    "UPPER",
+  ];
+  for (const payload of PAYLOADS) {
+    test(`rejects "${payload}" without calling fetch`, async () => {
+      let called = false;
+      const fetchImpl = (async () => {
+        called = true;
+        return new Response("{}", { status: 200 });
+      }) as unknown as typeof fetch;
+      let caught: Error | undefined;
+      try {
+        await deployToFly({
+          target: "channel",
+          appName: payload,
+          imageRef: "img",
+          apiToken: "fo_testtoken_abc",
+          fetchImpl,
+        });
+      } catch (err) {
+        caught = err as Error;
+      }
+      expect(caught).toBeInstanceOf(FlyAdapterError);
+      expect(called).toBe(false);
+    });
+  }
+});
+
+describe("flyTomlFor: unknown vs unsupported shape branches", () => {
+  test("rejects an entirely unknown shape (isTargetShape=false)", () => {
+    expect(() => flyTomlFor({ target: "mystery" as never, appName: "svc" })).toThrow(
+      /unknown target shape/,
+    );
+  });
+
+  test("skips env entries whose value is undefined", () => {
+    const toml = flyTomlFor({
+      target: "channel",
+      appName: "svc",
+      // `MISSING` is explicitly undefined; it must not emit a line.
+      envVars: { KEEP: "1", MISSING: undefined } as unknown as Record<string, string>,
+    });
+    expect(toml).toContain('KEEP = "1"');
+    expect(toml).not.toContain("MISSING");
+  });
+
+  test("omits the [env] block entirely when envVars is empty", () => {
+    const toml = flyTomlFor({ target: "channel", appName: "svc", envVars: {} });
+    expect(toml).not.toContain("[env]");
+  });
+
+  test("escapes backslashes in env values", () => {
+    const toml = flyTomlFor({
+      target: "channel",
+      appName: "svc",
+      envVars: { WIN: "C:\\path" },
+    });
+    expect(toml).toContain('WIN = "C:\\\\path"');
+  });
+
+  test("uses a custom dockerfile path", () => {
+    const toml = flyTomlFor({
+      target: "channel",
+      appName: "svc",
+      dockerfilePath: "ops/Dockerfile.custom",
+    });
+    expect(toml).toContain('dockerfile = "ops/Dockerfile.custom"');
+  });
+
+  test("supports every web shape and the lone worker shape", () => {
+    for (const shape of ["channel", "managed", "voice", "browser"] as const) {
+      expect(flyTomlFor({ target: shape, appName: "svc" })).toContain("[http_service]");
+    }
+    expect(flyTomlFor({ target: "batch", appName: "svc" })).toContain("[processes]");
+  });
 });

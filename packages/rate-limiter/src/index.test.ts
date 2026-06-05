@@ -11,6 +11,7 @@ import {
   RateLimitError,
   bucketKeyOf,
   createRateLimiter,
+  tokenBucketAvailable,
 } from "./index";
 
 describe("rate-limiter — T1 token-bucket", () => {
@@ -179,5 +180,32 @@ describe("rate-limiter — bucketKeyOf", () => {
   test("formats dimension + id stably", () => {
     const k: AcquireKey = { dimension: "provider", id: "anthropic" };
     expect(bucketKeyOf(k)).toBe("provider:anthropic");
+  });
+});
+
+describe("rate-limiter — tokenBucketAvailable static helper", () => {
+  const config: BucketConfig = { kind: "token-bucket", capacity: 10, refillPerSec: 1 };
+
+  test("returns true when enough tokens are present without refill", () => {
+    // Fresh state at full capacity, now == lastRefill so no time elapses.
+    const state = { tokens: 5, lastRefillMs: 1_000 };
+    expect(tokenBucketAvailable(state, 5, 1_000, config)).toBe(true);
+    // Pure capacity check must not mutate the balance when no time passes.
+    expect(state.tokens).toBe(5);
+  });
+
+  test("returns false when tokens are insufficient even after available refill", () => {
+    const state = { tokens: 0, lastRefillMs: 1_000 };
+    // 500ms later → 0.5 token refilled at 1/sec, still < cost of 5.
+    expect(tokenBucketAvailable(state, 5, 1_500, config)).toBe(false);
+    expect(state.tokens).toBeCloseTo(0.5, 5);
+  });
+
+  test("refills (and mutates state) based on elapsed virtual time before comparing", () => {
+    const state = { tokens: 0, lastRefillMs: 1_000 };
+    // 6s later at 1/sec → 6 tokens refilled, now >= cost of 5.
+    expect(tokenBucketAvailable(state, 5, 7_000, config)).toBe(true);
+    expect(state.tokens).toBeCloseTo(6, 5);
+    expect(state.lastRefillMs).toBe(7_000);
   });
 });

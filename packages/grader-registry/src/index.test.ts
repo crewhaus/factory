@@ -65,6 +65,41 @@ describe("grader-registry — T1 register/lookup", () => {
     expect(reg.has("c")).toBe(false);
     expect(reg.list()).toEqual(["a", "b"]);
   });
+
+  test("clear empties the registry", () => {
+    const reg = new GraderRegistry();
+    reg.register("a", async () => ({ passed: true, score: 1, rationale: "ok" }));
+    reg.register("b", async () => ({ passed: true, score: 1, rationale: "ok" }));
+    expect(reg.list()).toEqual(["a", "b"]);
+    reg.clear();
+    expect(reg.list()).toEqual([]);
+    expect(reg.has("a")).toBe(false);
+    // After clearing, the freed name may be registered again without conflict.
+    reg.register("a", async () => ({ passed: true, score: 1, rationale: "again" }));
+    expect(reg.has("a")).toBe(true);
+  });
+
+  test("upsert rejects malformed names", () => {
+    const reg = new GraderRegistry();
+    expect(() =>
+      reg.upsert("../etc", async () => ({ passed: true, score: 1, rationale: "ok" })),
+    ).toThrow(GraderRegistryError);
+  });
+
+  test("GraderRegistryError carries config code and forwards its cause", () => {
+    const cause = new Error("root cause");
+    const err = new GraderRegistryError("boom", cause);
+    expect(err.name).toBe("GraderRegistryError");
+    expect(err.code).toBe("config");
+    expect(err.message).toBe("boom");
+    expect(err.cause).toBe(cause);
+    expect(err.toJSON()).toMatchObject({
+      name: "GraderRegistryError",
+      code: "config",
+      message: "boom",
+      cause: { name: "Error", message: "root cause" },
+    });
+  });
 });
 
 describe("grader-registry — T8 plugin discovery", () => {

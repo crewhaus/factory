@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type AuditLog, openAuditLog } from "@crewhaus/audit-log";
-import { type PolicyRule, auditPolicyDecision, evaluatePolicy } from "./index";
+import { PolicyEngineError, type PolicyRule, auditPolicyDecision, evaluatePolicy } from "./index";
 
 let tmp: string;
 let log: AuditLog;
@@ -112,6 +112,31 @@ describe("tenant overrides win over defaults", () => {
       { tenantPolicy },
     );
     expect(r.decision).toBe("deny");
+  });
+});
+
+describe("PolicyEngineError", () => {
+  test("carries config code, stable name, and preserves the cause chain", () => {
+    const cause = new Error("bad rule glob");
+    const err = new PolicyEngineError("invalid policy config", cause);
+    expect(err).toBeInstanceOf(Error);
+    expect(err.name).toBe("PolicyEngineError");
+    expect(err.code).toBe("config");
+    expect(err.message).toBe("invalid policy config");
+    expect(err.cause).toBe(cause);
+    // Serializes its cause chain for the logging layer.
+    expect(err.toJSON()).toMatchObject({
+      name: "PolicyEngineError",
+      code: "config",
+      message: "invalid policy config",
+      cause: { name: "Error", message: "bad rule glob" },
+    });
+  });
+
+  test("constructs without a cause", () => {
+    const err = new PolicyEngineError("no cause");
+    expect(err.cause).toBeUndefined();
+    expect(err.toJSON().cause).toBeUndefined();
   });
 });
 

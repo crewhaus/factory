@@ -5,7 +5,7 @@
  */
 import { describe, expect, test } from "bun:test";
 import type { EvalRunSummary, SampleResult } from "@crewhaus/eval-runner";
-import { gate, regress } from "./index";
+import { RegressionError, gate, regress } from "./index";
 
 function sample(id: string, passed: boolean, score: number, latencyMs = 100): SampleResult {
   return {
@@ -175,5 +175,28 @@ describe("regression-runner — T9 threshold monotonicity", () => {
     const tight = gate(prev, next, { regressionThreshold: 0.1 });
     const loose = gate(prev, next, { regressionThreshold: 0.5 });
     if (tight.verdict === "pass") expect(loose.verdict).toBe("pass");
+  });
+});
+
+describe("RegressionError", () => {
+  test("carries the 'config' code and the RegressionError name", () => {
+    const err = new RegressionError("bad summary shape");
+    expect(err).toBeInstanceOf(RegressionError);
+    expect(err).toBeInstanceOf(Error);
+    expect(err.name).toBe("RegressionError");
+    expect(err.code).toBe("config");
+    expect(err.message).toBe("bad summary shape");
+  });
+
+  test("preserves the underlying cause chain", () => {
+    const cause = new Error("parse failed");
+    const err = new RegressionError("wrapped", cause);
+    expect(err.cause).toBe(cause);
+    expect(err.toJSON()).toEqual({
+      name: "RegressionError",
+      code: "config",
+      message: "wrapped",
+      cause: { name: "Error", message: "parse failed" },
+    });
   });
 });

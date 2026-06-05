@@ -77,7 +77,7 @@ The project lead spends roughly 10-15 hours per week on CrewHaus. Of that, suppo
 - 60-90 minutes/week on issue and PR triage
 - 30-60 minutes/week on Discussions
 
-If you've waited a week without a response, it's reasonable to politely bump your issue. If you've waited a month, it's possible your issue fell through the cracks — feel free to comment again or email max@studiomax.io with a link.
+If you've waited a week without a response, it's reasonable to politely bump your issue. If you've waited a month, it's possible your issue fell through the cracks — feel free to comment again or email max@crewhaus.ai with a link.
 
 ## Help us help you
 

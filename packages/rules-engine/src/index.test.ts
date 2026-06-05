@@ -1,8 +1,9 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import * as nodeFs from "node:fs";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadRules, renderRules, resolveProfile } from "./index";
+import { RulesEngineError, loadRules, renderRules, resolveProfile } from "./index";
 
 let projectRoot: string;
 
@@ -122,4 +123,46 @@ describe("resolveProfile", () => {
     expect(resolveProfile("unknown")).toBe("standard");
     expect(resolveProfile("")).toBe("standard");
   });
+});
+
+describe("RulesEngineError", () => {
+  test("carries the 'config' code and the RulesEngineError name", () => {
+    const err = new RulesEngineError("nope");
+    expect(err).toBeInstanceOf(RulesEngineError);
+    expect(err).toBeInstanceOf(Error);
+    expect(err.name).toBe("RulesEngineError");
+    expect(err.code).toBe("config");
+    expect(err.message).toBe("nope");
+  });
+});
+
+describe("loadRules read-failure path", () => {
+  // The bucket/file enumeration runs against the real seeded temp dir; only
+  // readFileSync is forced to throw so loadRules' catch -> RulesEngineError
+  // branch executes (covering the constructor) without any real read failure.
+  afterEach(() => {
+    spyOn(nodeFs, "readFileSync").mockRestore();
+  });
+
+  test("wraps a readFileSync failure in a RulesEngineError naming the rule", () => {
+    seed("common", "broken.md", "body");
+    const spy = spyOn(nodeFs, "readFileSync").mockImplementation(() => {
+      throw new Error("EIO simulated read error");
+    });
+    expect(() => loadRules({ projectRoot })).toThrow(RulesEngineError);
+    try {
+      loadRules({ projectRoot });
+      throw new Error("expected loadRules to throw");
+    } catch (err) {
+      expect(err).toBeInstanceOf(RulesEngineError);
+      expect((err as RulesEngineError).message).toContain("common/broken.md");
+      expect((err as RulesEngineError).message).toContain("EIO simulated read error");
+    }
+    expect(spy).toHaveBeenCalled();
+  });
+});
+
+// Guard: ensure no mock.module leaked from this file affects sibling suites.
+afterEach(() => {
+  mock.restore();
 });

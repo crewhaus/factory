@@ -30,6 +30,16 @@ class FailingEmbedder implements Embedder {
   }
 }
 
+/** Returns a caller-controlled vector list (used to exercise the arity guard). */
+class FixedVectorsEmbedder implements Embedder {
+  readonly model = "mock/fixed";
+  readonly provider = "mock" as const;
+  constructor(private readonly vectors: number[][]) {}
+  async embed(): Promise<number[][]> {
+    return this.vectors;
+  }
+}
+
 describe("cosineSimilarity (T1)", () => {
   test("identical vectors → 1.0", () => {
     expect(_cosineSimilarityForTest([1, 0, 0], [1, 0, 0])).toBeCloseTo(1, 6);
@@ -146,6 +156,29 @@ describe("Fallback to ROUGE-L on embedder error", () => {
     const out = await strict(sample("the cat sat on the mat"), result("the cat sat on the rug"));
     expect(out.passed).toBe(false); // ROUGE-L score won't reach 0.99
     expect(out.rationale).toMatch(/fallback ROUGE-L/);
+  });
+});
+
+describe("embedder arity guard", () => {
+  test("too few vectors (length 1) throws GraderError", async () => {
+    const grader = semanticSimilarity({
+      embedder: new FixedVectorsEmbedder([[1, 0, 0]]),
+      threshold: 0.5,
+    });
+    await expect(grader(sample("hello"), result("world"))).rejects.toThrow(GraderError);
+    await expect(grader(sample("hello"), result("world"))).rejects.toThrow(
+      /returned 1 vectors; expected 2/,
+    );
+  });
+
+  test("empty vector list throws GraderError", async () => {
+    const grader = semanticSimilarity({
+      embedder: new FixedVectorsEmbedder([]),
+      threshold: 0.5,
+    });
+    await expect(grader(sample("hello"), result("world"))).rejects.toThrow(
+      /returned 0 vectors; expected 2/,
+    );
   });
 });
 

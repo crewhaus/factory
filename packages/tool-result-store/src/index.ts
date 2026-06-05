@@ -124,6 +124,19 @@ function rejectUnsafeSegment(label: string, value: string): void {
 }
 
 /**
+ * Defence-in-depth boundary check: assert that a resolved absolute path lives
+ * strictly under `root`. Redundant with `rejectUnsafeSegment` on the normal
+ * code path (which already strips separators and `..`), but kept — and exported
+ * so it can be exercised directly — so a future caller that resolves a path
+ * some other way can't silently escape the storage root.
+ */
+export function assertUnderRoot(abs: string, root: string): void {
+  if (!abs.startsWith(`${root}${sep}`)) {
+    throw new RuntimeError("tool-result-store: resolved path escapes rootDir");
+  }
+}
+
+/**
  * Used by tests to confirm the resolved storage location for a given
  * runId/toolUseId pair. Performs the same traversal rejection as
  * `storeAndPreview()` so callers see the same errors.
@@ -137,10 +150,7 @@ export function resolveStoragePath(
   rejectUnsafeSegment("toolUseId", toolUseId);
   const abs = resolve(rootDir, runId, `${toolUseId}.txt`);
   // Sanity: the resolved path must still live under rootDir.
-  const root = resolve(rootDir);
-  if (!abs.startsWith(`${root}${sep}`)) {
-    throw new RuntimeError("tool-result-store: resolved path escapes rootDir");
-  }
+  assertUnderRoot(abs, resolve(rootDir));
   fence(abs);
   return abs;
 }

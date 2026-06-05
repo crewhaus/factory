@@ -144,6 +144,76 @@ describe("EvmSendTransaction — happy path through wallet-engine", () => {
   });
 });
 
+describe("resolver-binding guards", () => {
+  // These exercise the boot-time "resolver was never bound" branches, which
+  // are distinct from a bound resolver returning undefined. The setters assign
+  // the module-level resolver directly, so passing undefined clears them.
+  test("throws when no WalletResolver is bound", async () => {
+    setWalletResolver(undefined as unknown as (id: string) => undefined);
+    await expect(
+      EVM_TX_TOOL_MAP.evmSendTransaction.execute({
+        walletId: "treasury",
+        to: "0xusdc",
+        data: "0xabcd",
+      }),
+    ).rejects.toThrow(/no WalletResolver bound/);
+  });
+
+  test("throws when no TransactionPolicyResolver is bound", async () => {
+    // Wallet resolves OK so we get past requireWallet into requirePolicy.
+    setWalletResolver(() => WALLET);
+    setTransactionPolicyResolver(undefined as unknown as () => undefined);
+    await expect(
+      EVM_TX_TOOL_MAP.evmSendTransaction.execute({
+        walletId: "treasury",
+        to: "0xusdc",
+        data: "0xabcd",
+      }),
+    ).rejects.toThrow(/no TransactionPolicyResolver bound/);
+  });
+
+  test("throws when the policy resolver returns undefined", async () => {
+    setWalletResolver(() => WALLET);
+    setTransactionPolicyResolver(() => undefined);
+    await expect(
+      EVM_TX_TOOL_MAP.evmSendTransaction.execute({
+        walletId: "treasury",
+        to: "0xusdc",
+        data: "0xabcd",
+      }),
+    ).rejects.toThrow(/no transaction_policy declared/);
+  });
+
+  test("throws when no WalletEngineResolver is bound", async () => {
+    // Wallet + policy resolve OK so we reach requireEngine's unbound branch.
+    setWalletResolver(() => WALLET);
+    setTransactionPolicyResolver(() => POLICY);
+    setWalletEngineResolver(undefined as unknown as () => undefined);
+    await expect(
+      EVM_TX_TOOL_MAP.evmSendTransaction.execute({
+        walletId: "treasury",
+        contractId: "usdc",
+        to: "0xusdc",
+        data: "0xabcd",
+      }),
+    ).rejects.toThrow(/no WalletEngine bound/);
+  });
+
+  test("throws when the engine resolver returns undefined (EvmSimulate path)", async () => {
+    // EvmSimulate calls requireWallet then requireEngine; a bound resolver
+    // returning undefined exercises the `e === undefined` branch.
+    setWalletResolver(() => WALLET);
+    setWalletEngineResolver(() => undefined);
+    await expect(
+      EVM_TX_TOOL_MAP.evmSimulate.execute({
+        walletId: "treasury",
+        to: "0xusdc",
+        data: "0xabcd",
+      }),
+    ).rejects.toThrow(/WalletEngine resolver returned undefined/);
+  });
+});
+
 describe("EvmSimulate", () => {
   test("returns success+gasUsed without broadcasting", async () => {
     const engine = createWalletEngine({

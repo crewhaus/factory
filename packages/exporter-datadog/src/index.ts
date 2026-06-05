@@ -56,12 +56,27 @@ export type DatadogExporterOptions = {
 
 export type AttachedDatadogExporter = AttachedOtelExporter;
 
+// Linear-time validators for a single `k:v` tag. Splitting on the first colon
+// and validating each half avoids the catastrophic backtracking (ReDoS) that a
+// combined `^[A-Za-z_][A-Za-z0-9_./:-]*:[^,\s]+$` pattern exhibits: the key class
+// overlaps the separator `:`, so an input like "a:::::…: " forces quadratic
+// retries. The key head (everything before the first colon) cannot contain a
+// colon, and the value may contain any non-comma/non-whitespace char.
+const DD_TAG_KEY_HEAD = /^[A-Za-z_][A-Za-z0-9_./-]*$/;
+const DD_TAG_VALUE = /^[^,\s]+$/;
+
+function isValidDdTag(tag: string): boolean {
+  const i = tag.indexOf(":");
+  if (i < 0) return false;
+  return DD_TAG_KEY_HEAD.test(tag.slice(0, i)) && DD_TAG_VALUE.test(tag.slice(i + 1));
+}
+
 function parseDdTags(raw: string | undefined): ReadonlyArray<string> {
   if (raw === undefined) return [];
   return raw
     .split(",")
     .map((s) => s.trim())
-    .filter((s) => s.length > 0 && /^[A-Za-z_][A-Za-z0-9_./:-]*:[^,\s]+$/.test(s));
+    .filter((s) => s.length > 0 && isValidDdTag(s));
 }
 
 /**
@@ -196,3 +211,4 @@ export function attachDatadogIfEnvSet(
 
 export { parseDdTags as _parseDdTagsForTest };
 export { scrubApiKey as _scrubApiKeyForTest };
+export { wrapFetchWithDdAttrs as _wrapFetchWithDdAttrsForTest };

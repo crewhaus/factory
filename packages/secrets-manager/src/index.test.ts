@@ -215,6 +215,48 @@ describe("createSecrets — rotation handlers (T3)", () => {
     await secrets.rotate("TOKEN", { newValue: "v2" });
     expect(calls).toBe(1);
   });
+
+  test("async handler that resolves is awaited before rotate() returns", async () => {
+    const root = join(tmpRoot, "secrets");
+    require("node:fs").mkdirSync(root);
+    writeFileSync(join(root, "TOKEN"), "old");
+    const secrets = createSecrets({ backend: createFileBackend({ rootDir: root }) });
+
+    let settled = false;
+    secrets.onRotation(async (e) => {
+      // microtask + macrotask hop to prove rotate() actually awaits us
+      await Promise.resolve();
+      expect(e.newValue).toBe("async-value");
+      settled = true;
+    });
+
+    await secrets.rotate("TOKEN", { newValue: "async-value" });
+    expect(settled).toBe(true);
+  });
+
+  test("async handler that rejects is swallowed and does not block siblings", async () => {
+    const root = join(tmpRoot, "secrets");
+    require("node:fs").mkdirSync(root);
+    writeFileSync(join(root, "TOKEN"), "old");
+    const secrets = createSecrets({ backend: createFileBackend({ rootDir: root }) });
+
+    const order: string[] = [];
+    // rejecting async handler -> exercises the promise .catch(() => {}) path
+    secrets.onRotation(async () => {
+      order.push("rejecting");
+      await Promise.resolve();
+      throw new Error("async handler boom");
+    });
+    // resolving async sibling -> still runs
+    secrets.onRotation(async () => {
+      order.push("resolving");
+    });
+
+    // rotate must resolve (not reject) despite the rejecting handler
+    const v = await secrets.rotate("TOKEN", { newValue: "v" });
+    expect(v).toBe("v");
+    expect(order).toEqual(["rejecting", "resolving"]);
+  });
 });
 
 describe("createSecrets — audit-log integration (T8 tenant isolation)", () => {

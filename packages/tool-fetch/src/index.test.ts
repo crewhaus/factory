@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import {
   FetchPermissionError,
   _resetFetchConfig,
@@ -7,6 +7,7 @@ import {
   assertNotSsrf,
   canonicalizeOrigin,
   fetch,
+  getFetchConfig,
   registerFetchConfig,
 } from "./index";
 
@@ -547,5 +548,229 @@ describe("#155 — non-decimal IPv4 literals are normalised before classificatio
     // 2 ** 32 is too large to be a valid packed IPv4; it must not be classified
     // as private, and with the default public DNS stub it resolves fine.
     await expect(assertNotSsrf("4294967296")).resolves.toBe("93.184.216.34");
+  });
+});
+
+describe("Fetch — ctx.signal cancellation wiring", () => {
+  test("an already-aborted ctx.signal still completes against a mocked fetch", async () => {
+    // Drives the `ctx.signal.aborted === true` branch: ctrl.abort(reason) runs,
+    // but our stub rawFetch ignores the signal and returns a Response.
+    registerFetchConfig({ allowed_origins: ["https://api.example.com"] });
+    _setRawFetch(
+      async () => new Response("ok", { status: 200, headers: { "content-type": "text/plain" } }),
+    );
+    const result = await fetch.execute(
+      { url: "https://api.example.com/" },
+      { signal: AbortSignal.abort(new Error("pre-aborted")) },
+    );
+    if (typeof result !== "string") throw new Error("expected string result");
+    expect(result).toContain("ok");
+  });
+
+  test("a later ctx.signal abort fires the once-listener without affecting the result", async () => {
+    registerFetchConfig({ allowed_origins: ["https://api.example.com"] });
+    _setRawFetch(
+      async () => new Response("ok", { status: 200, headers: { "content-type": "text/plain" } }),
+    );
+    const ctrl = new AbortController();
+    const result = await fetch.execute(
+      { url: "https://api.example.com/" },
+      { signal: ctrl.signal },
+    );
+    // Abort AFTER the fetch resolved — fires the registered "abort" listener
+    // (its callback body runs) on the already-settled inner controller.
+    ctrl.abort(new Error("late"));
+    if (typeof result !== "string") throw new Error("expected string result");
+    expect(result).toContain("ok");
+  });
+
+  test("the fetch-timeout setTimeout callback aborts the controller when fired", async () => {
+    // Capture the timeout callback instead of waiting 30s, then invoke it by
+    // hand so its body (ctrl.abort(new Error("fetch timeout"))) is exercised
+    // deterministically — no real timer, no leaked handle.
+    registerFetchConfig({ allowed_origins: ["https://api.example.com"] });
+    const captured: Array<() => void> = [];
+    const setSpy = spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void) => {
+      captured.push(fn);
+      return 0 as unknown as ReturnType<typeof setTimeout>;
+    }) as typeof setTimeout);
+    const clearSpy = spyOn(globalThis, "clearTimeout").mockImplementation(
+      (() => {}) as typeof clearTimeout,
+    );
+    try {
+      _setRawFetch(
+        async () => new Response("ok", { status: 200, headers: { "content-type": "text/plain" } }),
+      );
+      const result = await fetch.execute({ url: "https://api.example.com/" });
+      if (typeof result !== "string") throw new Error("expected string result");
+      expect(result).toContain("ok");
+      expect(captured.length).toBeGreaterThanOrEqual(1);
+      // Invoke the captured timeout callback — covers the abort closure body.
+      for (const fn of captured) fn();
+    } finally {
+      setSpy.mockRestore();
+      clearSpy.mockRestore();
+    }
+  });
+});
+
+describe("getFetchConfig", () => {
+  test("returns the empty fail-closed config by default", () => {
+    expect(getFetchConfig().allowedOrigins.size).toBe(0);
+  });
+
+  test("reflects registered, canonicalised origins", () => {
+    registerFetchConfig({ allowed_origins: ["HTTPS://API.Example.com:443", "http://x.test:80"] });
+    const cfg = getFetchConfig();
+    expect([...cfg.allowedOrigins].sort()).toEqual(["http://x.test", "https://api.example.com"]);
+  });
+});
+
+/**
+ * Drive the DEFAULT (production) fetcher `pinnedFetch` rather than a test
+ * double, so the IP-pinning rewrite path is exercised. We leave `rawFetch`
+ * at its default (no `_setRawFetch`) and mock `globalThis.fetch` instead —
+ * no real socket is ever opened. The spy is restored after each test so no
+ * global state leaks between cases.
+ */
+describe("pinnedFetch (default fetcher — IP-pinned dial)", () => {
+  let fetchSpy: ReturnType<typeof spyOn<typeof globalThis, "fetch">> | undefined;
+
+  afterEach(() => {
+    fetchSpy?.mockRestore();
+    fetchSpy = undefined;
+  });
+
+  test("GET to a resolved hostname dials the pinned IP, preserving Host + SNI", async () => {
+    registerFetchConfig({ allowed_origins: ["https://api.example.com"] });
+    _setDnsLookup(async () => ({ address: "93.184.216.34", family: 4 }));
+    // Leave rawFetch at the default pinnedFetch.
+    _setRawFetch(undefined);
+
+    let dialedUrl: string | undefined;
+    let init: (RequestInit & { tls?: { serverName: string } }) | undefined;
+    fetchSpy = spyOn(globalThis, "fetch").mockImplementation((async (
+      input: string | URL | Request,
+      reqInit?: RequestInit,
+    ) => {
+      dialedUrl = String(input);
+      init = reqInit as RequestInit & { tls?: { serverName: string } };
+      return new Response("body-from-pinned-ip", {
+        status: 200,
+        headers: { "content-type": "text/plain" },
+      });
+    }) as typeof globalThis.fetch);
+
+    const result = await fetch.execute({ url: "https://api.example.com/v1/items" });
+    if (typeof result !== "string") throw new Error("expected string result");
+
+    // URL hostname was rewritten to the pinned IP …
+    expect(dialedUrl).toBe("https://93.184.216.34/v1/items");
+    // … while Host header + TLS SNI still carry the real name.
+    const headers = new Headers(init?.headers);
+    expect(headers.get("host")).toBe("api.example.com");
+    expect(init?.tls?.serverName).toBe("api.example.com");
+    // GET ⇒ no request body / duplex set.
+    expect(init?.body).toBeUndefined();
+    expect((init as { duplex?: string } | undefined)?.duplex).toBeUndefined();
+    expect(result).toContain("body-from-pinned-ip");
+  });
+
+  test("POST to a resolved hostname forwards the body with duplex: half", async () => {
+    registerFetchConfig({ allowed_origins: ["https://api.example.com"] });
+    _setDnsLookup(async () => ({ address: "93.184.216.34", family: 4 }));
+    _setRawFetch(undefined);
+
+    let init: (RequestInit & { duplex?: string }) | undefined;
+    let dialedUrl: string | undefined;
+    fetchSpy = spyOn(globalThis, "fetch").mockImplementation((async (
+      input: string | URL | Request,
+      reqInit?: RequestInit,
+    ) => {
+      dialedUrl = String(input);
+      init = reqInit as RequestInit & { duplex?: string };
+      return new Response("ok", { status: 200, headers: { "content-type": "text/plain" } });
+    }) as typeof globalThis.fetch);
+
+    const result = await fetch.execute({
+      url: "https://api.example.com/items",
+      method: "POST",
+      body: JSON.stringify({ name: "x" }),
+      headers: { "content-type": "application/json" },
+    });
+    if (typeof result !== "string") throw new Error("expected string result");
+
+    expect(dialedUrl).toBe("https://93.184.216.34/items");
+    expect(init?.method).toBe("POST");
+    // Streaming a request body in Bun/undici requires duplex: "half".
+    expect(init?.duplex).toBe("half");
+    expect(init?.body).toBeDefined();
+  });
+
+  test("preserves a non-default port in the rewritten Host header", async () => {
+    registerFetchConfig({ allowed_origins: ["https://api.example.com:8443"] });
+    _setDnsLookup(async () => ({ address: "93.184.216.34", family: 4 }));
+    _setRawFetch(undefined);
+
+    let init: RequestInit | undefined;
+    let dialedUrl: string | undefined;
+    fetchSpy = spyOn(globalThis, "fetch").mockImplementation((async (
+      input: string | URL | Request,
+      reqInit?: RequestInit,
+    ) => {
+      dialedUrl = String(input);
+      init = reqInit;
+      return new Response("ok", { status: 200, headers: { "content-type": "text/plain" } });
+    }) as typeof globalThis.fetch);
+
+    await fetch.execute({ url: "https://api.example.com:8443/path" });
+    expect(dialedUrl).toBe("https://93.184.216.34:8443/path");
+    const headers = new Headers(init?.headers);
+    expect(headers.get("host")).toBe("api.example.com:8443");
+  });
+
+  test("an IP-literal host needs no rewrite and is dialled via the Request as-is", async () => {
+    registerFetchConfig({ allowed_origins: ["https://93.184.216.34"] });
+    _setRawFetch(undefined);
+
+    let dialedWith: unknown;
+    fetchSpy = spyOn(globalThis, "fetch").mockImplementation((async (
+      input: string | URL | Request,
+    ) => {
+      dialedWith = input;
+      return new Response("literal-ok", {
+        status: 200,
+        headers: { "content-type": "text/plain" },
+      });
+    }) as typeof globalThis.fetch);
+
+    const result = await fetch.execute({ url: "https://93.184.216.34/health" });
+    if (typeof result !== "string") throw new Error("expected string result");
+    // pinnedIp === host ⇒ the original Request object is forwarded unchanged.
+    expect(dialedWith).toBeInstanceOf(Request);
+    expect((dialedWith as Request).url).toBe("https://93.184.216.34/health");
+    expect(result).toContain("literal-ok");
+  });
+
+  test("an IPv6-literal host is dialled via the Request unchanged (bracket-stripped pin)", async () => {
+    // Public IPv6 literal: not private, so assertNotSsrf pins it to itself and
+    // pinnedFetch takes the early no-rewrite branch.
+    registerFetchConfig({ allowed_origins: ["https://[2606:2800:220:1:248:1893:25c8:1946]"] });
+    _setRawFetch(undefined);
+
+    let dialedWith: unknown;
+    fetchSpy = spyOn(globalThis, "fetch").mockImplementation((async (
+      input: string | URL | Request,
+    ) => {
+      dialedWith = input;
+      return new Response("v6-ok", { status: 200, headers: { "content-type": "text/plain" } });
+    }) as typeof globalThis.fetch);
+
+    const result = await fetch.execute({
+      url: "https://[2606:2800:220:1:248:1893:25c8:1946]/x",
+    });
+    if (typeof result !== "string") throw new Error("expected string result");
+    expect(dialedWith).toBeInstanceOf(Request);
+    expect(result).toContain("v6-ok");
   });
 });

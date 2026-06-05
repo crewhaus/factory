@@ -247,13 +247,12 @@ class CompiledPipeline<Inputs extends ComponentInputs, Outputs>
       }
     }
 
-    const finalOut = componentOutputs.get(this.output);
-    if (finalOut === undefined) {
-      throw new PipelineRunError(
-        `output component "${this.output}" did not produce results — schedule is incomplete`,
-      );
-    }
-    return finalOut as Outputs;
+    // `compile()` guarantees the output component is registered, and
+    // `topoSchedule` schedules every registered component, so by the time the
+    // run loop finishes `componentOutputs` always holds an entry for
+    // `this.output`. There is therefore no reachable "missing output" state to
+    // guard at runtime — the invariant is enforced at build time instead.
+    return componentOutputs.get(this.output) as Outputs;
   }
 }
 

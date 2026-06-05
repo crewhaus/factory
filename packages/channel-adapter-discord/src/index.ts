@@ -192,13 +192,19 @@ export function createDiscordAdapter(
 
     async setTyping(args: { event: InboundEvent }): Promise<void> {
       const url = `${apiBaseUrl}/channels/${args.event.channelId}/typing`;
-      await doFetch(url, {
-        method: "POST",
-        headers: {
-          Authorization: `Bot ${config.botToken}`,
-        },
-      });
-      // Best-effort — do not surface failures.
+      // Best-effort — do not surface failures. A failed typing indicator must
+      // never reject and break the caller's reply flow, so we swallow both
+      // network rejections (DNS/abort/connection) and non-2xx responses.
+      try {
+        await doFetch(url, {
+          method: "POST",
+          headers: {
+            Authorization: `Bot ${config.botToken}`,
+          },
+        });
+      } catch {
+        // ignore — typing indicator is non-essential.
+      }
     },
   };
 }

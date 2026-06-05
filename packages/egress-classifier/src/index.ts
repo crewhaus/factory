@@ -182,7 +182,15 @@ export interface EgressMatcher {
  * tagged strings.
  */
 export class SubstringEgressMatcher implements EgressMatcher {
-  readonly name = "substring";
+  // Assigned in the constructor rather than as an inline field initializer:
+  // bun's coverage instruments a class-field initializer as its own function
+  // and (as of bun 1.3.x) cannot mark it covered, leaving an unreachable-by-
+  // tests gap in the function-coverage count. A plain constructor assignment
+  // is equivalent at runtime and is counted normally.
+  readonly name: string;
+  constructor() {
+    this.name = "substring";
+  }
   match(input: EgressMatchInput): EgressMatchResult {
     const seen = new Set<TrustOrigin>();
     let matchCount = 0;
@@ -267,9 +275,6 @@ class LruCache<V> {
       this.map.delete(oldest);
     }
   }
-  has(key: string): boolean {
-    return this.map.has(key);
-  }
   size(): number {
     return this.map.size;
   }
@@ -292,16 +297,21 @@ function cacheKey(
   sinkId: string,
   matcherName: string,
 ): string {
-  const h = createHash("sha256")
-    .update(matcherName)
-    .update("|")
-    .update(sinkScope)
-    .update("|")
-    .update(sinkId)
-    .update("|")
-    .update(payload, "utf8")
-    .digest("hex");
-  return h;
+  // Length-prefix every field before hashing so the component boundaries are
+  // unambiguous. A bare `"|"` delimiter is not injective when a field can
+  // contain `"|"`: (sinkId="tool|", payload="x") and (sinkId="tool",
+  // payload="|x") would otherwise hash identically and cross-serve a cached
+  // verdict for a *different* payload — a cache-poisoning / egress-scan-bypass
+  // vector when sinkId carries attacker influence (e.g. a dynamically
+  // discovered MCP tool name). `<byteLength>:` framing makes each field
+  // self-delimiting regardless of its contents.
+  const h = createHash("sha256");
+  for (const field of [matcherName, sinkScope, sinkId, payload]) {
+    h.update(String(Buffer.byteLength(field, "utf8")));
+    h.update(":");
+    h.update(field, "utf8");
+  }
+  return h.digest("hex");
 }
 
 /**

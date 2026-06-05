@@ -1,8 +1,22 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, mock, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type SlashCommand, expand, loadCommands, parseCommandFile } from "./index";
+import {
+  type SlashCommand,
+  SlashCommandError,
+  expand,
+  loadCommands,
+  parseCommandFile,
+} from "./index";
+
+// Snapshot the genuine node:fs module before any mock so passthroughs hold the
+// real implementations (Bun mutates the live namespace in place when mocking).
+const REAL_FS = { ...(await import("node:fs")) };
+const realReadFileSync = REAL_FS.readFileSync;
+const restoreRealFs = () => {
+  mock.module("node:fs", () => ({ ...REAL_FS }));
+};
 
 function withTempCwd(
   setup: (cwd: string) => void,
@@ -110,6 +124,55 @@ describe("loadCommands", () => {
         expect(cmd?.body.startsWith("---\n")).toBe(true);
       },
     );
+  });
+});
+
+describe("loadCommands — error wrapping (SlashCommandError)", () => {
+  afterEach(() => {
+    restoreRealFs();
+  });
+
+  test("a readFileSync failure is wrapped in a SlashCommandError", async () => {
+    await withTempCwd(
+      (cwd) => {
+        writeCommand(cwd, "boom", "body");
+      },
+      async (cwd) => {
+        const mdFile = join(cwd, ".crewhaus", "commands", "boom.md");
+        // statSync passes (real file), but the read fails — exercises the
+        // readFileSync catch and the SlashCommandError constructor.
+        mock.module("node:fs", () => ({
+          ...REAL_FS,
+          readFileSync: (p: Parameters<typeof realReadFileSync>[0], ...rest: unknown[]) => {
+            if (typeof p === "string" && p === mdFile) {
+              throw new Error("EACCES: permission denied");
+            }
+            // biome-ignore lint/suspicious/noExplicitAny: passthrough shim
+            return (realReadFileSync as any)(p, ...rest);
+          },
+        }));
+
+        const err = await loadCommands({ cwd }).then(
+          () => null,
+          (e) => e,
+        );
+        expect(err).toBeInstanceOf(SlashCommandError);
+        expect((err as SlashCommandError).name).toBe("SlashCommandError");
+        expect((err as Error).message).toContain("failed to read");
+        expect((err as Error).message).toContain("EACCES");
+        // The original error is threaded through as `cause`.
+        expect((err as SlashCommandError).cause).toBeInstanceOf(Error);
+      },
+    );
+  });
+
+  test("SlashCommandError is a config-kind CrewhausError carrying its cause", () => {
+    const cause = new Error("root");
+    const err = new SlashCommandError("nope", cause);
+    expect(err).toBeInstanceOf(SlashCommandError);
+    expect(err.name).toBe("SlashCommandError");
+    expect(err.message).toBe("nope");
+    expect(err.cause).toBe(cause);
   });
 });
 

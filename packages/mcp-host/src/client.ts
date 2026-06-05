@@ -352,10 +352,11 @@ export class McpClient {
       const deferred = this.connectedDeferred;
       deferred.reject(new McpConnectionError(`mcp client "${this.name}" disconnected`));
     }
+    // Replace with a fresh deferred so `connectedDeferred` is never left in a
+    // rejected state. The client is now `closed` (terminal): every reconnect
+    // path is guarded on `closed`, so this deferred is never awaited or
+    // rejected again — hence no `.catch()` is needed here.
     this.connectedDeferred = createDeferred();
-    // Swallow rejection on the just-replaced promise (defensive — `await
-    // ensureConnected()` in flight elsewhere).
-    void this.connectedDeferred.promise.catch(() => undefined);
 
     const t = this.transport;
     this.sdk = null;
@@ -391,16 +392,28 @@ function defaultTransportFactory(config: McpServerConfig): McpClientLikeTranspor
   // requestInit so the SSE GET and the POST messages both carry them.
   const sseOpts: ConstructorParameters<typeof SSEClientTransport>[1] = {};
   if (config.headers !== undefined) {
-    sseOpts.eventSourceInit = {
-      fetch: (url, init) =>
-        fetch(url, {
-          ...init,
-          headers: { ...(init?.headers as Record<string, string>), ...config.headers },
-        }),
-    };
+    sseOpts.eventSourceInit = { fetch: makeSseFetch(config.headers) };
     sseOpts.requestInit = { headers: { ...config.headers } };
   }
   return new SSEClientTransport(new URL(config.url), sseOpts);
+}
+
+/**
+ * Build the `eventSourceInit.fetch` wrapper that layers the configured static
+ * `headers` onto every SSE GET. Extracted (and exported) so it can be unit-
+ * tested without standing up a real EventSource — the SDK only invokes it
+ * once the transport actually connects.
+ *
+ * @internal exported for tests only; not part of the public package surface.
+ */
+export function makeSseFetch(
+  headers: Readonly<Record<string, string>>,
+): (url: string | URL, init?: RequestInit) => Promise<Response> {
+  return (url, init) =>
+    fetch(url, {
+      ...init,
+      headers: { ...(init?.headers as Record<string, string>), ...headers },
+    });
 }
 
 /**

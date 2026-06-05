@@ -7,6 +7,7 @@ import {
   type SttFn,
   aHash,
   audioTranscriptMatch,
+  _decodeImageFromMetadataForTest as decodeImageFromMetadata,
   hammingDistance,
   imageOcrThenGrade,
   imageSimilarity,
@@ -102,6 +103,27 @@ describe("aHash + hammingDistance (T1)", () => {
   });
 });
 
+describe("decodeImageFromMetadata (T1)", () => {
+  test("decodes a well-formed matrix object", () => {
+    const img = decodeImageFromMetadata({ width: 2, height: 1, pixels: [10, 20] });
+    expect(img).toEqual({ width: 2, height: 1, pixels: [10, 20] });
+  });
+
+  test("returns undefined for null / non-object / missing keys", () => {
+    expect(decodeImageFromMetadata(null)).toBeUndefined();
+    expect(decodeImageFromMetadata("nope")).toBeUndefined();
+    expect(decodeImageFromMetadata({ width: 2, height: 1 })).toBeUndefined();
+  });
+
+  test("returns undefined when keys present but wrongly typed", () => {
+    // Has width/height/pixels keys but they fail the inner type guard,
+    // exercising the post-shape `return undefined` branch.
+    expect(decodeImageFromMetadata({ width: "2", height: 1, pixels: [1] })).toBeUndefined();
+    expect(decodeImageFromMetadata({ width: 2, height: 1, pixels: "notarray" })).toBeUndefined();
+    expect(decodeImageFromMetadata({ width: 2, height: 1, pixels: [1, "x", 3] })).toBeUndefined();
+  });
+});
+
 describe("imageSimilarity grader (T1 + T2)", () => {
   test("identical reference + candidate scores 1.0", async () => {
     const ref = checkerboard(32, 32);
@@ -157,6 +179,22 @@ describe("imageSimilarity grader (T1 + T2)", () => {
   test("missing reference + missing candidate throw GraderError", async () => {
     const grader = imageSimilarity({ threshold: 0.5 });
     await expect(grader(sample(), result())).rejects.toThrow(/reference image required/);
+  });
+
+  test("default candidate path reads runResult.producedImage", async () => {
+    // No extractImage supplied → grader decodes from runResult.producedImage.
+    const ref = checkerboard(8, 8);
+    const grader = imageSimilarity({ reference: ref, threshold: 0.5 });
+    const out = await grader(sample(), result("", { producedImage: ref }));
+    expect(out.score).toBe(1);
+    expect(out.passed).toBe(true);
+  });
+
+  test("reference present but candidate missing throws GraderError", async () => {
+    // No extractImage and no producedImage on the run result.
+    const ref = checkerboard(8, 8);
+    const grader = imageSimilarity({ reference: ref, threshold: 0.5 });
+    await expect(grader(sample(), result())).rejects.toThrow(/candidate image not found/);
   });
 });
 
@@ -238,6 +276,27 @@ describe("audioTranscriptMatch (T1 + T3)", () => {
         textGrader: async () => ({ passed: true, score: 1, rationale: "" }),
       }),
     ).toThrow(/`stt` function is required/);
+    expect(() =>
+      audioTranscriptMatch({
+        stt: async () => "x",
+        textGrader: undefined as unknown as ReturnType<typeof audioTranscriptMatch>,
+      }),
+    ).toThrow(/`textGrader` is required/);
+  });
+
+  test("default audio path reads runResult.audioBytes", async () => {
+    // No extractAudioBytes supplied → grader reads runResult.audioBytes.
+    const captured: { runResult?: RunResult } = {};
+    const grader = audioTranscriptMatch({
+      stt: async () => "decoded speech",
+      textGrader: async (_s: Sample, r: RunResult): Promise<GradeResult> => {
+        captured.runResult = r;
+        return { passed: true, score: 1, rationale: "stub" };
+      },
+    });
+    const out = await grader(sample(), result("", { audioBytes: new Uint8Array([9]) }));
+    expect(out.passed).toBe(true);
+    expect(captured.runResult?.agentOutput).toBe("decoded speech");
   });
 });
 

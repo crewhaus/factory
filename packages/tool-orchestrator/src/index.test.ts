@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import { type RegisteredTool, ToolCatalog } from "@crewhaus/tool-catalog";
 import type { ToolUseBlock } from "@crewhaus/turn-state-machine";
 import { isConcurrencySafe, partitionToolCalls } from "./index";
 
@@ -117,6 +117,31 @@ describe("partitionToolCalls — accepts ToolCatalog", () => {
     const out = partitionToolCalls(calls, (name) => map.get(name));
     expect(out.concurrent.length).toBe(1);
     expect(out.concurrent[0]?.[0]?.id).toBe("1");
+  });
+
+  test("accepts a real ToolCatalog object (exercises the .get() lookup adapter)", () => {
+    // Passing a ToolCatalog instance (not a function) routes asLookup through
+    // the `(name) => lookup.get(name)` branch.
+    const catalog = new ToolCatalog();
+    catalog.register(READ);
+    catalog.register(BASH);
+    const calls = [call("Read", "1"), call("Bash", "2"), call("Read", "3")];
+    const out = partitionToolCalls(calls, catalog);
+    // Read is concurrency-safe (own batch), Bash is destructive (serial),
+    // trailing Read opens a fresh batch.
+    expect(out.concurrent.length).toBe(2);
+    expect(out.concurrent[0]?.map((c) => c.id)).toEqual(["1"]);
+    expect(out.concurrent[1]?.map((c) => c.id)).toEqual(["3"]);
+    expect(out.serial.map((c) => c.id)).toEqual(["2"]);
+  });
+
+  test("ToolCatalog lookup treats unregistered names as unknown → serial", () => {
+    const catalog = new ToolCatalog();
+    catalog.register(READ);
+    const calls = [call("Read", "1"), call("Ghost", "2")];
+    const out = partitionToolCalls(calls, catalog);
+    expect(out.concurrent[0]?.map((c) => c.id)).toEqual(["1"]);
+    expect(out.serial.map((c) => c.id)).toEqual(["2"]);
   });
 });
 

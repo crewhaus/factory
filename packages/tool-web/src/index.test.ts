@@ -1,9 +1,10 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import {
   WebFetchPermissionError,
   _resetWebFetchConfig,
   _setDnsLookup,
   _setRawFetch,
+  getWebFetchConfig,
   htmlToMarkdown,
   registerWebFetchConfig,
   webFetch,
@@ -401,5 +402,331 @@ describe("WebSearch — env-driven dispatch", () => {
     if (typeof result !== "string") throw new Error("expected string result");
     expect(result).toContain("good");
     expect(result).not.toContain("evil.com");
+  });
+
+  test("allowed_domains keeps only matching hosts (exact + subdomain)", async () => {
+    process.env["CREWHAUS_SEARCH_PROVIDER"] = "brave";
+    process.env["CREWHAUS_SEARCH_API_KEY"] = "x";
+    _setRawFetch(
+      async () =>
+        new Response(
+          JSON.stringify({
+            web: {
+              results: [
+                { title: "keep-exact", url: "https://example.com/a", description: "" },
+                { title: "keep-sub", url: "https://docs.example.com/b", description: "" },
+                { title: "drop-other", url: "https://other.org/c", description: "" },
+                { title: "drop-bad-url", url: "::not a url::", description: "" },
+              ],
+            },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+    );
+    const result = await webSearch.execute({
+      query: "x",
+      allowed_domains: ["Example.com"],
+    });
+    if (typeof result !== "string") throw new Error("expected string result");
+    expect(result).toContain("keep-exact");
+    expect(result).toContain("keep-sub");
+    expect(result).not.toContain("drop-other");
+    expect(result).not.toContain("drop-bad-url");
+  });
+
+  test("when every hit is filtered out, formatHits returns the empty marker", async () => {
+    process.env["CREWHAUS_SEARCH_PROVIDER"] = "brave";
+    process.env["CREWHAUS_SEARCH_API_KEY"] = "x";
+    _setRawFetch(
+      async () =>
+        new Response(
+          JSON.stringify({
+            web: { results: [{ title: "gone", url: "https://nope.org/x", description: "" }] },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+    );
+    const result = await webSearch.execute({ query: "x", allowed_domains: ["example.com"] });
+    expect(result).toBe("[no results]");
+  });
+});
+
+describe("WebFetch — content-type branches", () => {
+  test("application/json passes through unchanged", async () => {
+    _setRawFetch(
+      async () =>
+        new Response('{"ok":true}', {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+    );
+    const result = await webFetch.execute({ url: "https://example.com/data.json" });
+    if (typeof result !== "string") throw new Error("expected string result");
+    expect(result).toContain('{"ok":true}');
+    expect(result).toContain("Content-Type: application/json");
+  });
+
+  test("application/xhtml+xml is rendered as markdown", async () => {
+    _setRawFetch(
+      async () =>
+        new Response("<h1>Xhtml Title</h1><p>body</p>", {
+          status: 200,
+          headers: { "content-type": "application/xhtml+xml" },
+        }),
+    );
+    const result = await webFetch.execute({ url: "https://example.com/page.xhtml" });
+    if (typeof result !== "string") throw new Error("expected string result");
+    expect(result).toContain("# Xhtml Title");
+  });
+
+  test("a missing content-type (empty) is treated as text and passed through", async () => {
+    // Construct a Response and strip its content-type so `ct === ""` fires.
+    _setRawFetch(async () => {
+      const res = new Response("raw bytes here", { status: 200 });
+      res.headers.delete("content-type");
+      return res;
+    });
+    const result = await webFetch.execute({ url: "https://example.com/blob" });
+    if (typeof result !== "string") throw new Error("expected string result");
+    expect(result).toContain("raw bytes here");
+  });
+
+  test("an unknown binary content-type yields the non-textual placeholder", async () => {
+    _setRawFetch(
+      async () =>
+        new Response("PKzipbytes", {
+          status: 200,
+          headers: { "content-type": "application/zip" },
+        }),
+    );
+    const result = await webFetch.execute({ url: "https://example.com/archive.zip" });
+    if (typeof result !== "string") throw new Error("expected string result");
+    expect(result).toContain("[non-textual content: application/zip");
+    expect(result).toContain("not displayed]");
+  });
+
+  test("an empty (null-body) response yields an empty body string", async () => {
+    // 204 responses have res.body === null — exercises the early return in
+    // readBodyCapped.
+    _setRawFetch(async () => new Response(null, { status: 204 }));
+    const result = await webFetch.execute({ url: "https://example.com/empty" });
+    if (typeof result !== "string") throw new Error("expected string result");
+    expect(result).toContain("Status: 204");
+  });
+});
+
+describe("WebFetch — invalid URL + redirect edge cases", () => {
+  test("a malformed URL throws WebFetchPermissionError before any fetch", async () => {
+    _setRawFetch(async () => {
+      throw new Error("must not fetch");
+    });
+    await expect(webFetch.execute({ url: "not a url" })).rejects.toBeInstanceOf(
+      WebFetchPermissionError,
+    );
+  });
+
+  test("a redirect with an unparseable Location header is rejected", async () => {
+    _setRawFetch(
+      async () =>
+        new Response(null, {
+          status: 302,
+          // A valid HTTP header value that `new URL(loc, base)` still rejects
+          // (incomplete IPv6 literal) drives the redirect-parse catch branch.
+          headers: { location: "http://[" },
+        }),
+    );
+    await expect(webFetch.execute({ url: "https://example.com/" })).rejects.toBeInstanceOf(
+      WebFetchPermissionError,
+    );
+  });
+
+  test("a relative redirect Location is resolved against the current URL", async () => {
+    let hop = 0;
+    _setRawFetch(async (req) => {
+      hop++;
+      if (hop === 1) {
+        return new Response(null, { status: 301, headers: { location: "/landing" } });
+      }
+      expect(req.url).toBe("https://example.com/landing");
+      return new Response("arrived", { status: 200, headers: { "content-type": "text/plain" } });
+    });
+    const result = await webFetch.execute({ url: "https://example.com/start" });
+    if (typeof result !== "string") throw new Error("expected string result");
+    expect(result).toContain("arrived");
+    expect(hop).toBe(2);
+  });
+
+  test("a 3xx without a Location header is treated as a terminal response", async () => {
+    _setRawFetch(
+      async () =>
+        new Response("moved but no location", {
+          status: 304,
+          headers: { "content-type": "text/plain" },
+        }),
+    );
+    const result = await webFetch.execute({ url: "https://example.com/" });
+    if (typeof result !== "string") throw new Error("expected string result");
+    expect(result).toContain("Status: 304");
+    expect(result).toContain("moved but no location");
+  });
+});
+
+describe("getWebFetchConfig", () => {
+  test("reflects the most recently registered allow-list (lower-cased)", () => {
+    expect(getWebFetchConfig().allowedDomains).toEqual([]);
+    registerWebFetchConfig({ allowed_domains: ["Example.COM", "Foo.org"] });
+    expect(getWebFetchConfig().allowedDomains).toEqual(["example.com", "foo.org"]);
+  });
+
+  test("registerWebFetchConfig honours the camelCase alias", () => {
+    registerWebFetchConfig({ allowedDomains: ["Bar.NET"] });
+    expect(getWebFetchConfig().allowedDomains).toEqual(["bar.net"]);
+  });
+});
+
+describe("WebFetch — ctx.signal cancellation wiring", () => {
+  test("an already-aborted ctx.signal still completes against a mocked fetch", async () => {
+    // Drives the `ctx.signal.aborted === true` branch: ctrl.abort(reason) runs,
+    // but our stub rawFetch ignores the signal and returns a Response.
+    _setRawFetch(
+      async () => new Response("ok", { status: 200, headers: { "content-type": "text/plain" } }),
+    );
+    const result = await webFetch.execute(
+      { url: "https://example.com/" },
+      { signal: AbortSignal.abort(new Error("pre-aborted")) },
+    );
+    if (typeof result !== "string") throw new Error("expected string result");
+    expect(result).toContain("ok");
+  });
+
+  test("a later ctx.signal abort fires the once-listener without affecting the result", async () => {
+    _setRawFetch(
+      async () => new Response("ok", { status: 200, headers: { "content-type": "text/plain" } }),
+    );
+    const ctrl = new AbortController();
+    const result = await webFetch.execute({ url: "https://example.com/" }, { signal: ctrl.signal });
+    // Abort AFTER the fetch resolved — fires the registered "abort" listener
+    // (its callback body runs) on the already-settled inner controller.
+    ctrl.abort(new Error("late"));
+    if (typeof result !== "string") throw new Error("expected string result");
+    expect(result).toContain("ok");
+  });
+
+  test("the fetch-timeout setTimeout callback aborts the controller when fired", async () => {
+    // Capture the timeout callback instead of waiting 30s, then invoke it by
+    // hand so its body (ctrl.abort(new Error("fetch timeout"))) is exercised
+    // deterministically — no real timer, no leaked handle.
+    const captured: Array<() => void> = [];
+    const setSpy = spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void) => {
+      captured.push(fn);
+      return 0 as unknown as ReturnType<typeof setTimeout>;
+    }) as typeof setTimeout);
+    const clearSpy = spyOn(globalThis, "clearTimeout").mockImplementation(
+      (() => {}) as typeof clearTimeout,
+    );
+    try {
+      _setRawFetch(
+        async () => new Response("ok", { status: 200, headers: { "content-type": "text/plain" } }),
+      );
+      const result = await webFetch.execute({ url: "https://example.com/" });
+      if (typeof result !== "string") throw new Error("expected string result");
+      expect(result).toContain("ok");
+      expect(captured.length).toBeGreaterThanOrEqual(1);
+      // Invoke the captured timeout callback — covers the abort closure body.
+      for (const fn of captured) fn();
+    } finally {
+      setSpy.mockRestore();
+      clearSpy.mockRestore();
+    }
+  });
+});
+
+describe("WebSearch — ctx.signal cancellation wiring", () => {
+  test("an already-aborted ctx.signal still returns the refusal (env unset)", async () => {
+    const result = await webSearch.execute(
+      { query: "anything" },
+      { signal: AbortSignal.abort(new Error("pre-aborted")) },
+    );
+    if (typeof result !== "string") throw new Error("expected string result");
+    expect(result).toContain("WebSearch unavailable");
+  });
+
+  test("a later ctx.signal abort fires the once-listener", async () => {
+    const ctrl = new AbortController();
+    const result = await webSearch.execute({ query: "anything" }, { signal: ctrl.signal });
+    ctrl.abort(new Error("late"));
+    if (typeof result !== "string") throw new Error("expected string result");
+    expect(result).toContain("WebSearch unavailable");
+  });
+
+  test("the search-timeout setTimeout callback aborts the controller when fired", async () => {
+    const captured: Array<() => void> = [];
+    const setSpy = spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void) => {
+      captured.push(fn);
+      return 0 as unknown as ReturnType<typeof setTimeout>;
+    }) as typeof setTimeout);
+    const clearSpy = spyOn(globalThis, "clearTimeout").mockImplementation(
+      (() => {}) as typeof clearTimeout,
+    );
+    try {
+      const result = await webSearch.execute({ query: "anything" });
+      if (typeof result !== "string") throw new Error("expected string result");
+      expect(result).toContain("WebSearch unavailable");
+      for (const fn of captured) fn();
+    } finally {
+      setSpy.mockRestore();
+      clearSpy.mockRestore();
+    }
+  });
+});
+
+describe("WebFetch — production default fetch/dns wrappers", () => {
+  test("defaultRawFetch delegates to globalThis.fetch when not stubbed", async () => {
+    // Reset rawFetch to its production default, then mock the global fetch so
+    // the default wrapper's body (globalThis.fetch(req)) runs with no network.
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(
+      (async () =>
+        new Response("from global fetch", {
+          status: 200,
+          headers: { "content-type": "text/plain" },
+        })) as unknown as typeof globalThis.fetch,
+    );
+    try {
+      _setRawFetch(undefined); // rawFetch === defaultRawFetch now
+      const result = await webFetch.execute({ url: "https://example.com/" });
+      if (typeof result !== "string") throw new Error("expected string result");
+      expect(result).toContain("from global fetch");
+      expect(fetchSpy).toHaveBeenCalled();
+    } finally {
+      fetchSpy.mockRestore();
+      _setRawFetch(undefined);
+    }
+  });
+
+  test("defaultDnsLookup delegates to node:dns/promises lookup when not stubbed", async () => {
+    // Mock the dns module so the production resolver wrapper body runs offline.
+    const lookupMock = mock(async () => ({ address: "203.0.113.7", family: 4 }));
+    await mock.module("node:dns/promises", () => ({ lookup: lookupMock }));
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(
+      (async () =>
+        new Response("ok", {
+          status: 200,
+          headers: { "content-type": "text/plain" },
+        })) as unknown as typeof globalThis.fetch,
+    );
+    try {
+      _setDnsLookup(undefined); // dnsLookupFn === defaultDnsLookup now
+      _setRawFetch(undefined);
+      const result = await webFetch.execute({ url: "https://public.example/" });
+      if (typeof result !== "string") throw new Error("expected string result");
+      expect(result).toContain("ok");
+      expect(lookupMock).toHaveBeenCalled();
+    } finally {
+      fetchSpy.mockRestore();
+      // Restore the real module so later suites/files are unaffected.
+      mock.restore();
+      _setDnsLookup(undefined);
+      _setRawFetch(undefined);
+    }
   });
 });

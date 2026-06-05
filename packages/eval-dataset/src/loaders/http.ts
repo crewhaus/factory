@@ -76,12 +76,10 @@ async function* parseJsonlText(text: string, source: string): AsyncIterable<Samp
 }
 
 async function* parseCsvText(text: string, source: string): AsyncIterable<Sample> {
-  const rows = parseCsv(text);
-  if (rows.length === 0) return;
-  const header = rows[0];
+  const [header, ...dataRows] = parseCsv(text);
   if (!header) return;
   let rowNo = 1;
-  for (const row of rows.slice(1)) {
+  for (const row of dataRows) {
     rowNo += 1;
     if (row.length === 1 && row[0] === "") continue;
     const obj: Record<string, string | string[]> = {};

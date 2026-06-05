@@ -2,7 +2,11 @@ import { describe, expect, test } from "bun:test";
 import type { ProviderAdapter } from "@crewhaus/adapter-anthropic";
 import type { Sample } from "@crewhaus/eval-dataset";
 import type { OptimizerState } from "@crewhaus/prompt-optimizer";
-import { ClaudeMutationProvider } from "./index";
+import {
+  ClaudeMutationProvider,
+  ClaudeMutationProviderError,
+  createClaudeMutationProvider,
+} from "./index";
 
 const SAMPLE_TRAIN: ReadonlyArray<Sample> = [
   { id: "t1", input: "What is 2+2?", expected_output: "4" },
@@ -249,6 +253,24 @@ describe("ClaudeMutationProvider", () => {
     expect(est).toBeGreaterThan(baseState.best.prompt.length + devTextChars);
   });
 
+  test("createClaudeMutationProvider factory yields an equivalent provider", async () => {
+    const adapter = mockAdapter(
+      `{"rewrite": "Be concise and exact.", "rationale": "Tightens the instruction."}`,
+    );
+    const provider = createClaudeMutationProvider({
+      adapter,
+      model: "claude-sonnet-4-5",
+      maxTokens: 1024,
+    });
+    expect(provider).toBeInstanceOf(ClaudeMutationProvider);
+    expect(provider.name).toBe("claude");
+    expect(provider.modelId).toBe("claude-sonnet-4-5");
+    expect(provider.maxOutputTokens).toBe(1024);
+    // Behaves like the directly-constructed provider end-to-end.
+    const result = await provider.next(baseState);
+    expect(result.prompt).toBe("Be concise and exact.");
+  });
+
   test("estimateInputChars grows with the dev-set failure window", () => {
     const wideDev: ReadonlyArray<Sample> = [
       ...SAMPLE_DEV,
@@ -265,5 +287,28 @@ describe("ClaudeMutationProvider", () => {
     // A larger window serializes more failure text → a larger input estimate,
     // exactly the case the original prompt-only heuristic under-counted.
     expect(wide).toBeGreaterThan(narrow + 18_000);
+  });
+});
+
+describe("ClaudeMutationProviderError", () => {
+  test("carries the adapter code, stable name, and cause chain", () => {
+    const cause = new Error("stream aborted");
+    const err = new ClaudeMutationProviderError("mutation provider failed", cause);
+    expect(err).toBeInstanceOf(Error);
+    expect(err.name).toBe("ClaudeMutationProviderError");
+    expect(err.code).toBe("adapter");
+    expect(err.message).toBe("mutation provider failed");
+    expect(err.cause).toBe(cause);
+    expect(err.toJSON()).toMatchObject({
+      name: "ClaudeMutationProviderError",
+      code: "adapter",
+      message: "mutation provider failed",
+      cause: { name: "Error", message: "stream aborted" },
+    });
+  });
+
+  test("constructs without a cause", () => {
+    const err = new ClaudeMutationProviderError("no cause");
+    expect(err.cause).toBeUndefined();
   });
 });

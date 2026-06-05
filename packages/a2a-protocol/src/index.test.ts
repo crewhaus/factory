@@ -75,6 +75,39 @@ describe("createSendMessageA2ATool", () => {
     expect(r2).toContain("crew mailbox is not available");
   });
 
+  test("wraps a peer-delivery failure as a clean [A2A error] using the Error message", async () => {
+    const mailbox = makeMailbox(["a", "b"]);
+    // Force the async sendA2A to reject with a normal Error.
+    mailbox.sendA2A = async () => {
+      throw new Error("mailbox queue overflowed");
+    };
+    const tool = createSendMessageA2ATool({ from: "a", targets: ["a", "b"] });
+
+    const result = await tool.execute(
+      { target: "b", payload: "hi" },
+      { bridge: { crewMailbox: mailbox } as never },
+    );
+
+    expect(result).toBe("[A2A error] mailbox queue overflowed");
+  });
+
+  test("falls back to String(err) when the rejection has no message", async () => {
+    const mailbox = makeMailbox(["a", "b"]);
+    // Reject with a non-Error whose `.message` is undefined so the
+    // `?? String(err)` fallback branch is exercised.
+    mailbox.sendA2A = async () => {
+      throw "raw string failure";
+    };
+    const tool = createSendMessageA2ATool({ from: "a", targets: ["a", "b"] });
+
+    const result = await tool.execute(
+      { target: "b", payload: "hi" },
+      { bridge: { crewMailbox: mailbox } as never },
+    );
+
+    expect(result).toBe("[A2A error] raw string failure");
+  });
+
   test("flag profile: read-only, not destructive, classifier enabled", () => {
     const tool = createSendMessageA2ATool({ from: "a", targets: ["a", "b"] });
     expect(tool.readOnly).toBe(true);

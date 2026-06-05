@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { type ComponentEvent, PipelineBuildError, createPipeline } from "./index";
+import { type ComponentEvent, PipelineBuildError, PipelineRunError, createPipeline } from "./index";
 
 describe("builder", () => {
   test("rejects compile without setOutput", () => {
@@ -24,6 +24,61 @@ describe("builder", () => {
       .connect("b", "a")
       .setOutput("a");
     expect(() => b.compile()).toThrow(/cycle/);
+  });
+
+  test("rejects an empty component name", () => {
+    expect(() => createPipeline().addComponent("", async () => ({}))).toThrow(
+      /name must be non-empty/,
+    );
+  });
+
+  test("rejects an edge whose `from` component is unknown", () => {
+    const b = createPipeline()
+      .addComponent("a", async () => ({}))
+      .connect("ghost", "a")
+      .setOutput("a");
+    expect(() => b.compile()).toThrow(/unknown component "ghost" \(from\)/);
+  });
+
+  test("rejects an edge whose `to` component is unknown", () => {
+    const b = createPipeline()
+      .addComponent("a", async () => ({}))
+      .connect("a", "ghost")
+      .setOutput("a");
+    expect(() => b.compile()).toThrow(/unknown component "ghost" \(to\)/);
+  });
+
+  test("rejects setInput referencing an unknown component", () => {
+    const b = createPipeline()
+      .addComponent("a", async () => ({}))
+      .setInput("ghost", "seed")
+      .setOutput("a");
+    expect(() => b.compile()).toThrow(/setInput references unknown component "ghost"/);
+  });
+});
+
+describe("PipelineRunError", () => {
+  test("carries its name, message, and an optional cause", () => {
+    const cause = new Error("inner");
+    const err = new PipelineRunError("component disappeared", cause);
+    expect(err).toBeInstanceOf(PipelineRunError);
+    expect(err.name).toBe("PipelineRunError");
+    expect(err.message).toBe("component disappeared");
+    expect(err.cause).toBe(cause);
+  });
+
+  test("run throws when a scheduled component has no function", async () => {
+    // `addComponent` does not validate the function reference, so a caller can
+    // register a component with an `undefined` body. Its name is still a key in
+    // the component map, so `compile()` and the topological schedule accept it,
+    // but at run time `this.o.components.get(name)` resolves to `undefined` and
+    // the defensive guard fires. This is the one reachable path to that guard.
+    const broken = createPipeline()
+      .addComponent("dead", undefined as never)
+      .setOutput("dead")
+      .compile();
+    await expect(broken.run({})).rejects.toBeInstanceOf(PipelineRunError);
+    await expect(broken.run({})).rejects.toThrow(/disappeared from the registry/);
   });
 });
 

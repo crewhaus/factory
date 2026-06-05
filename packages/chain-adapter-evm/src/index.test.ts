@@ -63,6 +63,26 @@ describe("createEvmAdapter — rpcRead", () => {
     );
   });
 
+  test("rejects a 200 response whose body is not valid JSON", async () => {
+    // The classifier passes the (benign) text, but JSON.parse fails — the
+    // adapter must surface a 'not valid JSON' error rather than crash.
+    const fetchImpl = mockFetch(() => new Response("not json at all", { status: 200 }));
+    const adapter = createEvmAdapter(BASE_CONFIG, fetchImpl);
+    let caught: unknown;
+    try {
+      await adapter.rpcRead("eth_blockNumber", [], { bypassCache: true });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(ChainAdapterError);
+    // Single-URL dispatch routes through fallback semantics; the parse
+    // failure is preserved on the cause chain.
+    expect((caught as ChainAdapterError).message).toContain("all 1 RPC URL(s) failed");
+    expect(((caught as ChainAdapterError).cause as Error).message).toContain(
+      "response was not valid JSON",
+    );
+  });
+
   test("surfaces JSON-RPC error envelopes as adapter errors", async () => {
     const fetchImpl = mockFetch(
       () =>
@@ -160,5 +180,58 @@ describe("createEvmAdapter — quorum policy", () => {
       fetchImpl,
     );
     await expect(adapter.rpcRead("eth_blockNumber", [])).rejects.toThrow(/quorum failed/);
+  });
+
+  test("throws 'every RPC URL rejected' when all quorum dispatches fail", async () => {
+    // Every URL returns a non-2xx status, so each dispatchOne rejects and
+    // Promise.allSettled yields zero fulfilled results.
+    let calls = 0;
+    const fetchImpl = mockFetch(() => {
+      calls += 1;
+      return new Response("upstream down", { status: 503 });
+    });
+    const adapter = createEvmAdapter(
+      {
+        ...BASE_CONFIG,
+        rpcUrls: ["https://a.test", "https://b.test", "https://c.test"],
+        rpcPolicy: "quorum",
+      },
+      fetchImpl,
+    );
+    let caught: unknown;
+    try {
+      await adapter.rpcRead("eth_blockNumber", []);
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(ChainAdapterError);
+    expect((caught as ChainAdapterError).message).toContain(
+      "quorum failed: every RPC URL rejected",
+    );
+    // All three URLs were attempted concurrently.
+    expect(calls).toBe(3);
+  });
+});
+
+describe("createEvmAdapter — network errors", () => {
+  test("wraps a fetch rejection (transport-level failure) as a ChainAdapterError", async () => {
+    // fetchImpl throws before producing a Response — e.g. DNS failure,
+    // connection refused, or an aborted socket. This exercises the
+    // dispatchOne network-error catch (not the !res.ok HTTP branch).
+    const fetchImpl = (() =>
+      Promise.reject(new Error("ECONNREFUSED rpc.example.test:443"))) as unknown as typeof fetch;
+    const adapter = createEvmAdapter(BASE_CONFIG, fetchImpl);
+    let caught: unknown;
+    try {
+      await adapter.rpcRead("eth_blockNumber", []);
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(ChainAdapterError);
+    // fallbackDispatch wraps the per-URL failure; the network message is
+    // preserved on the cause chain.
+    expect((caught as ChainAdapterError).message).toContain("all 1 RPC URL(s) failed");
+    expect(((caught as ChainAdapterError).cause as Error).message).toContain("network error");
+    expect(((caught as ChainAdapterError).cause as Error).message).toContain("ECONNREFUSED");
   });
 });

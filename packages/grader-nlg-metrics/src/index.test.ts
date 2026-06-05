@@ -2,12 +2,15 @@ import { describe, expect, test } from "bun:test";
 import type { RunResult, Sample } from "@crewhaus/eval-grader";
 import {
   _bleuScoreForTest,
+  _makeGraderForTest,
   _meteorScoreForTest,
   _rougeLScoreForTest,
   _rougeNForTest,
   _tokenizeForTest,
   bleu,
   bleu1,
+  bleu2,
+  bleu3,
   bleu4,
   meteor,
   rouge1,
@@ -236,5 +239,104 @@ describe("T9 — score-monotonicity property", () => {
     expect(_rougeLScoreForTest(text, text, true)).toBe(1);
     expect(_bleuScoreForTest(text, text, 4, true)).toBeGreaterThan(0.99);
     expect(_meteorScoreForTest(text, text, 0.9, 3, 0.5, true)).toBeGreaterThan(0.95);
+  });
+});
+
+describe("Grader factories — remaining public entrypoints", () => {
+  test("rouge2 grader scores bigram overlap from sample.expected_output", async () => {
+    const grader = rouge2({ threshold: 0.5 });
+    const out = await grader(sample("the cat sat"), result("the cat sat"));
+    expect(out.passed).toBe(true);
+    expect(out.score).toBe(1);
+    expect(out.rationale).toMatch(/ROUGE-2 1\.0000 \(threshold 0\.50\)/);
+  });
+
+  test("rouge2 defaults threshold to 0.5 when omitted", async () => {
+    const grader = rouge2();
+    const out = await grader(sample("the cat sat"), result("the cat sat"));
+    expect(out.passed).toBe(true);
+    expect(out.rationale).toMatch(/threshold 0\.50/);
+  });
+
+  test("rouge2 disjoint bigrams fail the default threshold", async () => {
+    const grader = rouge2();
+    const out = await grader(sample("alpha beta gamma"), result("delta epsilon zeta"));
+    expect(out.score).toBe(0);
+    expect(out.passed).toBe(false);
+  });
+
+  test("bleu2 alias matches bleu(2)", async () => {
+    const a = bleu2({ threshold: 0.5 });
+    const b = bleu(2, { threshold: 0.5 });
+    const out1 = await a(sample("the cat sat on"), result("the cat sat on"));
+    const out2 = await b(sample("the cat sat on"), result("the cat sat on"));
+    expect(out1.score).toBe(out2.score);
+    expect(out1.rationale).toMatch(/BLEU-2/);
+  });
+
+  test("bleu3 alias matches bleu(3)", async () => {
+    const a = bleu3({ threshold: 0.5 });
+    const b = bleu(3, { threshold: 0.5 });
+    const out1 = await a(sample("the cat sat on"), result("the cat sat on"));
+    const out2 = await b(sample("the cat sat on"), result("the cat sat on"));
+    expect(out1.score).toBe(out2.score);
+    expect(out1.rationale).toMatch(/BLEU-3/);
+  });
+
+  test("lowercase:false makes the grader case-sensitive", async () => {
+    const sensitive = rouge1({ threshold: 0.5, lowercase: false });
+    const insensitive = rouge1({ threshold: 0.5, lowercase: true });
+    // Casing differs on every token → 0 overlap when case-sensitive.
+    const out1 = await sensitive(sample("The Cat Sat"), result("the cat sat"));
+    const out2 = await insensitive(sample("The Cat Sat"), result("the cat sat"));
+    expect(out1.score).toBe(0);
+    expect(out2.score).toBe(1);
+  });
+
+  test("meteor honors explicit α/β/γ overrides", async () => {
+    // gamma=0 removes the fragmentation penalty entirely, so a fully
+    // permuted hypothesis (all unigrams match) recovers the fmean.
+    const noPenalty = meteor({ threshold: 0.1, gamma: 0, alpha: 0.5, beta: 1 });
+    const out = await noPenalty(sample("the cat sat on the mat"), result("mat the on sat cat the"));
+    expect(out.score).toBeGreaterThan(0.9);
+    expect(out.passed).toBe(true);
+  });
+});
+
+describe("makeGrader helper", () => {
+  test("returns a Grader that resolves the reference and applies threshold", async () => {
+    const grader = _makeGraderForTest("CUSTOM", (ref, hyp) => (ref === hyp ? 1 : 0), 0.5);
+    const pass = await grader(sample("ref text"), result("ref text"));
+    expect(pass.passed).toBe(true);
+    expect(pass.score).toBe(1);
+    expect(pass.rationale).toBe("CUSTOM score 1.0000 (threshold 0.50)");
+
+    const fail = await grader(sample("ref text"), result("other text"));
+    expect(fail.passed).toBe(false);
+    expect(fail.score).toBe(0);
+    expect(fail.rationale).toBe("CUSTOM score 0.0000 (threshold 0.50)");
+  });
+
+  test("makeGrader resolves the reference from sample.expected_output and throws when absent", async () => {
+    const grader = _makeGraderForTest("CUSTOM", () => 1, 0.5);
+    await expect(grader({ id: "s1", input: "x" }, result("anything"))).rejects.toThrow(
+      /sample\.expected_output is required/,
+    );
+  });
+});
+
+describe("resolveReference edge cases", () => {
+  test("explicit empty-string reference throws options.reference error", async () => {
+    const grader = rougeL({ threshold: 0.5, reference: "" });
+    await expect(grader(sample("ignored"), result("anything"))).rejects.toThrow(
+      /options\.reference is required/,
+    );
+  });
+
+  test("empty-string expected_output throws sample.expected_output error", async () => {
+    const grader = rougeL({ threshold: 0.5 });
+    await expect(grader(sample(""), result("anything"))).rejects.toThrow(
+      /sample\.expected_output is required/,
+    );
   });
 });

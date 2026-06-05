@@ -170,9 +170,6 @@ class LruCache<V> {
       this.map.delete(oldest);
     }
   }
-  has(key: string): boolean {
-    return this.map.has(key);
-  }
   /** Test/diagnostics only. */
   size(): number {
     return this.map.size;

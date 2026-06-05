@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { Driver } from "@crewhaus/computer-use-driver";
-import { createScreenshotTool } from "./index.js";
+import { CrewhausError } from "@crewhaus/errors";
+import { ScreenCaptureError, createScreenshotTool } from "./index.js";
 
 function stubDriver(pngBytes: Uint8Array): Driver {
   return {
@@ -47,5 +48,52 @@ describe("createScreenshotTool", () => {
     expect(tool.destructive).toBe(false);
     expect(tool.classifyOutput).toBe(false);
     expect(tool.name).toBe("Screenshot");
+  });
+
+  test("empty PNG still yields a well-formed image block with empty base64 data", async () => {
+    const driver = stubDriver(new Uint8Array(0));
+    const tool = createScreenshotTool({ driver });
+    const result = await tool.execute({}, {});
+    if (!Array.isArray(result)) throw new Error("expected ToolResultContent array");
+    const block = result[0];
+    if (block?.type !== "image") throw new Error("expected image block");
+    expect(block.source.data).toBe("");
+  });
+
+  test("downscalePercent option is accepted (v0 ships verbatim PNG)", async () => {
+    const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47]);
+    const driver = stubDriver(png);
+    const tool = createScreenshotTool({ driver, downscalePercent: 50 });
+    const result = await tool.execute({}, {});
+    if (!Array.isArray(result)) throw new Error("expected ToolResultContent array");
+    const block = result[0];
+    if (block?.type !== "image") throw new Error("expected image block");
+    // Still the original bytes — downscale is exposed but unimplemented in v0.
+    expect(Array.from(Buffer.from(block.source.data, "base64"))).toEqual(Array.from(png));
+  });
+});
+
+describe("ScreenCaptureError", () => {
+  test("carries the 'tool' error code, a stable name, and the message", () => {
+    const err = new ScreenCaptureError("driver lost the page");
+    expect(err).toBeInstanceOf(ScreenCaptureError);
+    expect(err).toBeInstanceOf(CrewhausError);
+    expect(err).toBeInstanceOf(Error);
+    expect(err.name).toBe("ScreenCaptureError");
+    expect(err.code).toBe("tool");
+    expect(err.message).toBe("driver lost the page");
+    expect(err.cause).toBeUndefined();
+  });
+
+  test("forwards an underlying cause and serializes it via toJSON()", () => {
+    const root = new Error("ETIMEDOUT");
+    const err = new ScreenCaptureError("screenshot failed", root);
+    expect(err.cause).toBe(root);
+    expect(err.toJSON()).toEqual({
+      name: "ScreenCaptureError",
+      code: "tool",
+      message: "screenshot failed",
+      cause: { name: "Error", message: "ETIMEDOUT" },
+    });
   });
 });

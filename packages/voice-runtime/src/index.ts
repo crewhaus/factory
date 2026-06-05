@@ -46,7 +46,9 @@ export type RealtimeEvent =
   | { kind: "tool_use"; id: string; name: string; input: unknown }
   | { kind: "interrupt"; reason: string }
   | { kind: "disconnect"; code?: number; reason?: string }
-  | { kind: "error"; message: string; cause?: unknown };
+  | { kind: "error"; message: string; cause?: unknown }
+  /** Raw provider frame, surfaced verbatim (Vapi adapter passthrough). */
+  | { kind: "raw"; provider: ProviderId; ts: string; payload: unknown };
 
 export type RealtimeEventHandler = (event: RealtimeEvent) => void;
 

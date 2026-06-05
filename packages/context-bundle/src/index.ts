@@ -220,13 +220,13 @@ function walkUpForSibling(
   markers: readonly string[],
 ): string | undefined {
   let current = resolve(from);
-  while (true) {
+  let parent = resolve(current, "..");
+  for (; ; current = parent, parent = resolve(current, "..")) {
     const candidate = resolve(current, siblingName);
     if (existsSync(candidate) && markers.every((m) => existsSync(resolve(candidate, m)))) {
       return candidate;
     }
-    const parent = resolve(current, "..");
-    if (parent === current) return undefined;
-    current = parent;
+    if (parent === current) break;
   }
+  return undefined;
 }

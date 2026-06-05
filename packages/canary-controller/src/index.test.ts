@@ -90,6 +90,48 @@ describe("canary-controller — T3 traffic routing", () => {
       ctrl.route({ name: "x", fromVersion: "v1", toVersion: "v2", trafficPercent: 150 }, "r"),
     ).toThrow(CanaryError);
   });
+
+  test("negative trafficPercent throws", async () => {
+    const reg = createFileBackedRegistry({ rootDir: join(tmpRoot, "specs") });
+    const deploy = createDeploymentController({ registry: reg });
+    const ctrl = createCanaryController({ registry: reg, deploymentController: deploy });
+    expect(() =>
+      ctrl.route({ name: "x", fromVersion: "v1", toVersion: "v2", trafficPercent: -1 }, "r"),
+    ).toThrow(CanaryError);
+  });
+
+  test("NaN trafficPercent throws instead of silently routing all traffic to control", async () => {
+    // Regression: `NaN < 0` and `NaN > 100` are both false, so without an
+    // explicit finiteness check a NaN percentage slips past validation and
+    // every request silently falls back to fromVersion (isCanary always false).
+    const reg = createFileBackedRegistry({ rootDir: join(tmpRoot, "specs") });
+    const deploy = createDeploymentController({ registry: reg });
+    const ctrl = createCanaryController({ registry: reg, deploymentController: deploy });
+    expect(() =>
+      ctrl.route(
+        { name: "x", fromVersion: "v1", toVersion: "v2", trafficPercent: Number.NaN },
+        "r",
+      ),
+    ).toThrow(CanaryError);
+    expect(() =>
+      ctrl.route(
+        { name: "x", fromVersion: "v1", toVersion: "v2", trafficPercent: Number.NaN },
+        "r",
+      ),
+    ).toThrow(/trafficPercent must be in 0\.\.100/);
+  });
+
+  test("Infinity trafficPercent throws", async () => {
+    const reg = createFileBackedRegistry({ rootDir: join(tmpRoot, "specs") });
+    const deploy = createDeploymentController({ registry: reg });
+    const ctrl = createCanaryController({ registry: reg, deploymentController: deploy });
+    expect(() =>
+      ctrl.route(
+        { name: "x", fromVersion: "v1", toVersion: "v2", trafficPercent: Number.POSITIVE_INFINITY },
+        "r",
+      ),
+    ).toThrow(CanaryError);
+  });
 });
 
 describe("canary-controller — eval gate", () => {

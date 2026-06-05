@@ -152,7 +152,7 @@ export async function buildImage(opts: BuildImageOptions): Promise<BuildImageRes
   return { tag: opts.tag, target: opts.target, buildArgv: argv };
 }
 
-const defaultRunner: BuildRunner = async (argv, cwd) => {
+export const defaultRunner: BuildRunner = async (argv, cwd) => {
   const { spawn } = await import("node:child_process");
   return new Promise((resolve_) => {
     const head = argv[0] ?? "docker";

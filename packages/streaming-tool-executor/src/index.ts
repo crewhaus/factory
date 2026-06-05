@@ -149,19 +149,26 @@ export async function executeStreaming(
     if (opts.onEvent) opts.onEvent(e);
   };
 
+  // Mark a queued entry as aborted with the synthetic sibling-failure
+  // result. Used by `processQueue` when the abort signal trips while
+  // entries are still waiting in the queue.
+  const markAborted = (entry: QueueEntry): void => {
+    entry.status = "aborted";
+    results.set(entry.block.id, {
+      type: "tool_result",
+      tool_use_id: entry.block.id,
+      content: "aborted: sibling tool failed",
+      is_error: true,
+    });
+  };
+
+  // `dispatch` is only ever reached via `processQueue`, which already
+  // diverts an aborted entry through `markAborted` before calling here,
+  // so no abort re-check is needed at this point.
   const dispatch = (entry: QueueEntry): void => {
     if (entry.status !== "queued") return;
-    if (siblingAbort.signal.aborted) {
-      entry.status = "aborted";
-      results.set(entry.block.id, {
-        type: "tool_result",
-        tool_use_id: entry.block.id,
-        content: "aborted: sibling tool failed",
-        is_error: true,
-      });
-      return;
-    }
-    if (entry.tool === undefined && opts.runTool === undefined) {
+    const tool = entry.tool;
+    if (tool === undefined && opts.runTool === undefined) {
       entry.status = "done";
       results.set(entry.block.id, {
         type: "tool_result",
@@ -179,28 +186,27 @@ export async function executeStreaming(
       toolName: entry.block.name,
       startedAt,
     });
+    // By the guard above, when `runTool` is absent the entry's `tool`
+    // is guaranteed defined, so the `executeTool` branch never sees an
+    // undefined tool. (A bare `tool === undefined && runTool === undefined`
+    // entry has already short-circuited with an "unknown tool" result.)
+    const runOne = (resolvedTool: RegisteredTool): Promise<Anthropic.ToolResultBlockParam> =>
+      executeTool(resolvedTool, entry.block.input, { toolUseId: entry.block.id }).then(
+        (res): Anthropic.ToolResultBlockParam => ({
+          type: "tool_result",
+          tool_use_id: entry.block.id,
+          content:
+            typeof res.content === "string"
+              ? res.content
+              : (res.content as ReadonlyArray<
+                  Anthropic.TextBlockParam | Anthropic.ImageBlockParam
+                > as Anthropic.ToolResultBlockParam["content"]),
+          is_error: res.isError,
+        }),
+      );
     const dispatchPromise: Promise<Anthropic.ToolResultBlockParam> = opts.runTool
       ? opts.runTool(entry.block)
-      : entry.tool === undefined
-        ? Promise.resolve<Anthropic.ToolResultBlockParam>({
-            type: "tool_result",
-            tool_use_id: entry.block.id,
-            content: `unknown tool "${entry.block.name}"`,
-            is_error: true,
-          })
-        : executeTool(entry.tool, entry.block.input, { toolUseId: entry.block.id }).then(
-            (res): Anthropic.ToolResultBlockParam => ({
-              type: "tool_result",
-              tool_use_id: entry.block.id,
-              content:
-                typeof res.content === "string"
-                  ? res.content
-                  : (res.content as ReadonlyArray<
-                      Anthropic.TextBlockParam | Anthropic.ImageBlockParam
-                    > as Anthropic.ToolResultBlockParam["content"]),
-              is_error: res.isError,
-            }),
-          );
+      : runOne(tool as RegisteredTool);
     const promise = dispatchPromise
       .then((res) => {
         entry.status = "done";
@@ -247,27 +253,22 @@ export async function executeStreaming(
     for (const entry of queue) {
       if (entry.status !== "queued") continue;
       if (siblingAbort.signal.aborted) {
-        entry.status = "aborted";
-        results.set(entry.block.id, {
-          type: "tool_result",
-          tool_use_id: entry.block.id,
-          content: "aborted: sibling tool failed",
-          is_error: true,
-        });
+        markAborted(entry);
         continue;
       }
       if (inFlight.size === 0) {
         dispatch(entry);
         continue;
       }
+      // With work already in flight, only dispatch this entry when the
+      // running set is fully concurrency-safe AND this entry is too;
+      // otherwise stop scanning and wait for the running set to drain.
       const runningAllSafe = queue.every(
         (e) => e.status !== "running" || isConcurrencySafe(e.tool),
       );
-      if (runningAllSafe && isConcurrencySafe(entry.tool)) {
-        dispatch(entry);
-      } else {
-        return;
-      }
+      const canRunConcurrently = runningAllSafe && isConcurrencySafe(entry.tool);
+      if (!canRunConcurrently) return;
+      dispatch(entry);
     }
   };
 
@@ -378,13 +379,16 @@ export async function executeStreaming(
     );
   }
 
-  // Drain any tools still in flight or queued.
+  // Drain any tools still in flight or queued. Re-run the scheduler
+  // after each settle so an entry unblocked by the just-finished tool
+  // (each tool's own `finally` also calls `processQueue`, but doing it
+  // here keeps the drain self-contained) is dispatched and then awaited
+  // on the next pass. The loop exits only once nothing is in flight,
+  // which — because `processQueue` has just run — means the queue is
+  // fully drained.
   while (inFlight.size > 0) {
     await Promise.race(inFlight);
-  }
-  processQueue();
-  while (inFlight.size > 0) {
-    await Promise.race(inFlight);
+    processQueue();
   }
 
   // Build the final content array in open-order so tool_use blocks

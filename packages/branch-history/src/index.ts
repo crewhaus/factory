@@ -45,7 +45,12 @@ export type BranchAtResult = {
 };
 
 function stateHash(c: Checkpoint): string {
-  return createHash("sha256").update(JSON.stringify(c.state)).digest("hex").slice(0, 16);
+  // `JSON.stringify` returns `undefined` for `state === undefined` (and for
+  // values that serialize to nothing, e.g. functions/symbols). Feeding that
+  // straight into `createHash().update()` throws a TypeError, so coalesce to a
+  // stable sentinel — every other state serializes unchanged, preserving hashes.
+  const serialized = JSON.stringify(c.state) ?? "undefined";
+  return createHash("sha256").update(serialized).digest("hex").slice(0, 16);
 }
 
 export async function branchAt(

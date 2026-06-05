@@ -92,7 +92,11 @@ export type CanaryControllerOptions = {
 export function createCanaryController(opts: CanaryControllerOptions): CanaryController {
   return {
     route(config, requestId): CanaryRoutingDecision {
-      if (config.trafficPercent < 0 || config.trafficPercent > 100) {
+      if (
+        !Number.isFinite(config.trafficPercent) ||
+        config.trafficPercent < 0 ||
+        config.trafficPercent > 100
+      ) {
         throw new CanaryError(`trafficPercent must be in 0..100; got ${config.trafficPercent}`);
       }
       const bucket = computeBucket(config.tenantId, requestId);

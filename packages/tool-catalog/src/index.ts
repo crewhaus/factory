@@ -222,7 +222,16 @@ export class ToolCatalogError extends CrewhausError {
 }
 
 export class ToolCatalog {
-  private readonly _tools = new Map<string, RegisteredTool>();
+  // Initialized in the constructor body rather than as a field initializer so
+  // that Bun's coverage instrumentation can mark it executed. A
+  // `= new Map(...)` field initializer is counted in the function denominator
+  // but its hit-count is never incremented by Bun, which would otherwise pin
+  // function coverage below 100% even though the line runs on every `new`.
+  private readonly _tools: Map<string, RegisteredTool>;
+
+  constructor() {
+    this._tools = new Map<string, RegisteredTool>();
+  }
 
   register(tool: RegisteredTool): void {
     if (this._tools.has(tool.name)) {

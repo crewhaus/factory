@@ -36,13 +36,32 @@ const FALLBACK_CLAUDE_CLI_VERSION = "2.1.92";
 
 let warnedAboutCliFallback = false;
 
-function detectClaudeCliVersion(): string {
+/**
+ * Indirection over `child_process.execFileSync` so the detection logic can
+ * be unit-tested without spawning a real process. Only the success/throw
+ * behaviour and the returned string matter to the caller.
+ */
+export type ClaudeVersionProbe = (file: string, args: readonly string[]) => string;
+
+const defaultVersionProbe: ClaudeVersionProbe = (file, args) =>
+  execFileSync(file, [...args], {
+    encoding: "utf-8",
+    timeout: 1000,
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+
+/**
+ * Probe the locally installed `claude` CLI for its version string so the
+ * spoofed OAuth user-agent stays close to what Anthropic's anti-abuse
+ * system expects. Falls back to {@link FALLBACK_CLAUDE_CLI_VERSION} (warning
+ * once) when the binary is absent, not on PATH, or times out.
+ *
+ * `probe` is injectable for unit testing; production callers use the
+ * module-level {@link CLAUDE_CODE_HEADERS} computed at import.
+ */
+export function detectClaudeCliVersion(probe: ClaudeVersionProbe = defaultVersionProbe): string {
   try {
-    const raw = execFileSync("claude", ["--version"], {
-      encoding: "utf-8",
-      timeout: 1000,
-      stdio: ["ignore", "pipe", "ignore"],
-    });
+    const raw = probe("claude", ["--version"]);
     const match = /(\d+\.\d+\.\d+)/.exec(raw);
     if (match?.[1]) return match[1];
   } catch {

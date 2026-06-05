@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { compile } from "@crewhaus/compiler";
-import { type SpawnOptions, type Subprocess, spawn } from "bun";
+import type { SpawnOptions, Subprocess } from "bun";
 import { type RuntimeSmokeResult, runtimeSmokeIsEnabled } from "./runtime.js";
 
 /**
@@ -126,7 +126,7 @@ export async function runBatchRuntimeSmoke(
       stdout: "pipe",
       stderr: "pipe",
     };
-    const proc = spawn([process.execPath, join(bundleDir, "agent.ts")], spawnOpts);
+    const proc = Bun.spawn([process.execPath, join(bundleDir, "agent.ts")], spawnOpts);
     const { stdout, stderr, exitCode } = await captureSubprocess(
       proc,
       opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,

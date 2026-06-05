@@ -1,6 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import type { ProviderAdapter } from "@crewhaus/adapter-anthropic";
-import { ClaudeJustificationJudge, createClaudeJustificationJudge } from "./index";
+import { CrewhausError } from "@crewhaus/errors";
+import {
+  ClaudeJustificationJudge,
+  ClaudeJustificationJudgeError,
+  createClaudeJustificationJudge,
+} from "./index";
 
 /**
  * Build a mock provider adapter whose `.stream()` yields the StreamEvent
@@ -210,5 +215,34 @@ describe("ClaudeJustificationJudge", () => {
       model: "claude-haiku-4-5",
     });
     expect(judge.name).toBe("claude");
+  });
+});
+
+describe("ClaudeJustificationJudgeError", () => {
+  // The judge surface fails *closed* by returning a deny verdict rather than
+  // throwing, so this exported error type is the package's structured-error
+  // escape hatch for callers that DO want to raise. Assert its full contract:
+  // the typed `code`, the stable `name`, the message, cause chaining, and the
+  // `toJSON()` serialization the logging layer relies on.
+  test("carries the 'adapter' code, stable name, and message", () => {
+    const err = new ClaudeJustificationJudgeError("judge backend unreachable");
+    expect(err).toBeInstanceOf(Error);
+    expect(err).toBeInstanceOf(CrewhausError);
+    expect(err).toBeInstanceOf(ClaudeJustificationJudgeError);
+    expect(err.name).toBe("ClaudeJustificationJudgeError");
+    expect(err.code).toBe("adapter");
+    expect(err.message).toBe("judge backend unreachable");
+  });
+
+  test("preserves the cause and serializes the chain via toJSON()", () => {
+    const cause = new Error("socket hang up");
+    const err = new ClaudeJustificationJudgeError("model call failed", cause);
+    expect(err.cause).toBe(cause);
+    expect(err.toJSON()).toEqual({
+      name: "ClaudeJustificationJudgeError",
+      code: "adapter",
+      message: "model call failed",
+      cause: { name: "Error", message: "socket hang up" },
+    });
   });
 });

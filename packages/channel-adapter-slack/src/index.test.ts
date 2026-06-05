@@ -362,4 +362,322 @@ describe("react (Phase 3 §3.2)", () => {
       /invalid_auth/,
     );
   });
+
+  test("does not parse a non-JSON reactions.add body (skips content-type guard)", async () => {
+    // No content-type header => the `ct.includes("application/json")` branch is
+    // false and the body is never read; an ok:false JSON payload would
+    // otherwise throw, so reaching `resolves` proves the branch was skipped.
+    const fakeFetch: typeof fetch = async () =>
+      new Response(JSON.stringify({ ok: false, error: "invalid_auth" }), { status: 200 });
+    const adapter = createSlackAdapter(
+      { botToken: "xoxb", signingSecret: SECRET },
+      { fetch: fakeFetch },
+    );
+    await expect(adapter.react?.({ event: sampleEvent, emoji: "eyes" })).resolves.toBeUndefined();
+  });
+
+  test("throws on a non-OK reactions.add HTTP status", async () => {
+    const fakeFetch: typeof fetch = async () =>
+      new Response("nope", { status: 500, statusText: "Internal Server Error" });
+    const adapter = createSlackAdapter(
+      { botToken: "xoxb", signingSecret: SECRET },
+      { fetch: fakeFetch },
+    );
+    await expect(adapter.react?.({ event: sampleEvent, emoji: "eyes" })).rejects.toThrow(
+      /reactions\.add failed: 500/,
+    );
+  });
+});
+
+describe("createSlackAdapter — verify (adapter method wiring)", () => {
+  test("delegates to verifySlackSignature and accepts a fresh request", () => {
+    const body = APP_MENTION;
+    const headers = signedHeaders(body, SECRET);
+    const adapter = createSlackAdapter({ botToken: "xoxb", signingSecret: SECRET });
+    expect(adapter.verify({ headers, body })).toBe(true);
+  });
+
+  test("rejects a request signed with the wrong secret", () => {
+    const body = APP_MENTION;
+    const headers = signedHeaders(body, "some-other-secret");
+    const adapter = createSlackAdapter({ botToken: "xoxb", signingSecret: SECRET });
+    expect(adapter.verify({ headers, body })).toBe(false);
+  });
+
+  test("forwards an injected `now` so tolerance is deterministic", () => {
+    const body = APP_MENTION;
+    const fixedTs = 1700000000;
+    const headers = signedHeaders(body, SECRET, fixedTs);
+    // `now` far outside the ±5 min window => stale => false, proving the
+    // `opts.now !== undefined` branch threads the clock through to verify.
+    const adapter = createSlackAdapter(
+      { botToken: "xoxb", signingSecret: SECRET },
+      { now: () => fixedTs * 1000 + 60 * 60_000 },
+    );
+    expect(adapter.verify({ headers, body })).toBe(false);
+  });
+});
+
+describe("security regressions (T8 — hardening)", () => {
+  // parseInt is lenient and stops at the first non-digit, so a header like
+  // "1700000000junk" parses to a fresh-looking 1700000000 for the replay-window
+  // check. This must NOT be a bypass: the *raw* header string is bound into the
+  // HMAC base (`v0:${timestamp}:${body}`), so a signature minted for the clean
+  // timestamp cannot validate against the tampered one — and vice-versa.
+  test("a parseInt-lenient timestamp header cannot be swapped past the HMAC", () => {
+    const body = APP_MENTION;
+    const ts = 1700000000;
+    const sig = signSlackBody({ body, timestamp: ts, signingSecret: SECRET });
+
+    const headers = new Headers();
+    // Attacker keeps the timestamp inside the replay window numerically but
+    // appends garbage, hoping parseInt-leniency lets it slide.
+    headers.set("x-slack-request-timestamp", `${ts}junk`);
+    headers.set("x-slack-signature", sig);
+
+    const within = () => ts * 1000 + 1000; // numerically fresh
+    expect(verifySlackSignature({ headers, body, signingSecret: SECRET }, { now: within })).toBe(
+      false,
+    );
+  });
+
+  // The signing secret is the only thing protecting the webhook; confirm that
+  // forging a signature without it is impossible even with a known-good base.
+  test("a signature computed under a different secret never validates", () => {
+    const body = MESSAGE;
+    const ts = 1700000001;
+    const headers = new Headers();
+    headers.set("x-slack-request-timestamp", String(ts));
+    headers.set(
+      "x-slack-signature",
+      signSlackBody({ body, timestamp: ts, signingSecret: "attacker-secret" }),
+    );
+    expect(
+      verifySlackSignature({ headers, body, signingSecret: SECRET }, { now: () => ts * 1000 }),
+    ).toBe(false);
+  });
+
+  // parseInbound walks attacker-controlled JSON. A payload carrying a
+  // "__proto__" key (or polluted nested object) must not mutate Object.prototype
+  // nor leak through as a usable event.
+  test("parseInbound does not pollute Object.prototype from a hostile payload", () => {
+    const adapter = createSlackAdapter({ botToken: "xoxb", signingSecret: SECRET });
+    const hostile =
+      '{"type":"event_callback","__proto__":{"polluted":true},"event":{"type":"message","__proto__":{"polluted":true}}}';
+    const out = adapter.parseInbound({ headers: new Headers(), body: hostile });
+    // Missing required ids => skip, and crucially no prototype mutation.
+    expect(out.kind).toBe("skip");
+    expect(({} as Record<string, unknown>)["polluted"]).toBeUndefined();
+    expect((Object.prototype as Record<string, unknown>)["polluted"]).toBeUndefined();
+  });
+
+  // A non-string text field must coerce to "" rather than leaking a non-string
+  // (or object) into the normalised event the gateway trusts.
+  test("parseInbound coerces a non-string text to empty string", () => {
+    const adapter = createSlackAdapter({ botToken: "xoxb", signingSecret: SECRET });
+    const body = JSON.stringify({
+      type: "event_callback",
+      team_id: "T1",
+      event_id: "E1",
+      event: {
+        type: "message",
+        channel: "C1",
+        user: "U1",
+        ts: "1.0",
+        text: { nested: "object" },
+      },
+    });
+    const out = adapter.parseInbound({ headers: new Headers(), body });
+    expect(out.kind).toBe("event");
+    if (out.kind !== "event") return;
+    expect(out.event.text).toBe("");
+  });
+});
+
+describe("createSlackAdapter — parseInbound selfBotId branches", () => {
+  function bodyWithBot(botId: string) {
+    return JSON.stringify({
+      type: "event_callback",
+      team_id: "T1",
+      event_id: "E1",
+      event: {
+        type: "message",
+        bot_id: botId,
+        text: "hi",
+        channel: "C1",
+        user: "U1",
+        ts: "1.0",
+      },
+    });
+  }
+
+  test("skips a message authored by our own bot (bot_id === selfBotId)", () => {
+    const adapter = createSlackAdapter(
+      { botToken: "xoxb", signingSecret: SECRET },
+      { selfBotId: "B_SELF" },
+    );
+    const out = adapter.parseInbound({ headers: new Headers(), body: bodyWithBot("B_SELF") });
+    expect(out.kind).toBe("skip");
+  });
+
+  test("lets another bot's message through when selfBotId is set", () => {
+    const adapter = createSlackAdapter(
+      { botToken: "xoxb", signingSecret: SECRET },
+      { selfBotId: "B_SELF" },
+    );
+    const out = adapter.parseInbound({ headers: new Headers(), body: bodyWithBot("B_OTHER") });
+    expect(out.kind).toBe("event");
+    if (out.kind !== "event") return;
+    expect(out.event.workspaceId).toBe("T1");
+    expect(out.event.userId).toBe("U1");
+  });
+});
+
+describe("createSlackAdapter — sendReply edge cases", () => {
+  const sampleEvent = {
+    idempotencyKey: "E",
+    workspaceId: "T",
+    channelId: "C",
+    userId: "U",
+    ts: "1.0",
+    text: "x",
+    subtype: "message" as const,
+  };
+
+  test("throws on a non-OK HTTP status from chat.postMessage", async () => {
+    const fakeFetch: typeof fetch = async () =>
+      new Response("boom", { status: 502, statusText: "Bad Gateway" });
+    const adapter = createSlackAdapter(
+      { botToken: "xoxb", signingSecret: SECRET },
+      { fetch: fakeFetch },
+    );
+    await expect(adapter.sendReply({ event: sampleEvent, text: "x" })).rejects.toThrow(
+      /chat\.postMessage failed: 502 Bad Gateway/,
+    );
+  });
+
+  test("does not parse a non-JSON chat.postMessage body (skips content-type guard)", async () => {
+    // ok:false in the body would throw if parsed; no content-type header means
+    // the guard is skipped, so a resolved promise proves the branch was not taken.
+    const fakeFetch: typeof fetch = async () =>
+      new Response(JSON.stringify({ ok: false, error: "channel_not_found" }), { status: 200 });
+    const adapter = createSlackAdapter(
+      { botToken: "xoxb", signingSecret: SECRET },
+      { fetch: fakeFetch },
+    );
+    await expect(adapter.sendReply({ event: sampleEvent, text: "x" })).resolves.toBeUndefined();
+  });
+
+  test("accepts a JSON ok:true response without throwing", async () => {
+    const fakeFetch: typeof fetch = async () =>
+      new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "content-type": "application/json; charset=utf-8" },
+      });
+    const adapter = createSlackAdapter(
+      { botToken: "xoxb", signingSecret: SECRET },
+      { fetch: fakeFetch },
+    );
+    await expect(adapter.sendReply({ event: sampleEvent, text: "x" })).resolves.toBeUndefined();
+  });
+});
+
+describe("createSlackAdapter — setTyping is a no-op", () => {
+  test("resolves to undefined without performing any I/O", async () => {
+    let called = false;
+    const fakeFetch: typeof fetch = (async () => {
+      called = true;
+      return new Response("", { status: 200 });
+    }) as unknown as typeof fetch;
+    const adapter = createSlackAdapter(
+      { botToken: "xoxb", signingSecret: SECRET },
+      { fetch: fakeFetch },
+    );
+    await expect(
+      adapter.setTyping({
+        event: {
+          idempotencyKey: "E",
+          workspaceId: "T",
+          channelId: "C",
+          userId: "U",
+          ts: "1.0",
+          text: "x",
+          subtype: "message",
+        },
+      }),
+    ).resolves.toBeUndefined();
+    expect(called).toBe(false);
+  });
+});
+
+describe("createSlackAdapter — apiBaseUrl resolution", () => {
+  test("falls back to SLACK_API_BASE_URL env when no opt is given", async () => {
+    const prev = process.env["SLACK_API_BASE_URL"];
+    process.env["SLACK_API_BASE_URL"] = "https://env.slack.test/api";
+    try {
+      let capturedUrl = "";
+      const fakeFetch: typeof fetch = async (url) => {
+        capturedUrl = String(url);
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      };
+      const adapter = createSlackAdapter(
+        { botToken: "xoxb", signingSecret: SECRET },
+        { fetch: fakeFetch },
+      );
+      await adapter.sendReply({
+        event: {
+          idempotencyKey: "E",
+          workspaceId: "T",
+          channelId: "C",
+          userId: "U",
+          ts: "1.0",
+          text: "x",
+          subtype: "message",
+        },
+        text: "out",
+      });
+      expect(capturedUrl).toBe("https://env.slack.test/api/chat.postMessage");
+    } finally {
+      if (prev === undefined) Reflect.deleteProperty(process.env, "SLACK_API_BASE_URL");
+      else process.env["SLACK_API_BASE_URL"] = prev;
+    }
+  });
+
+  test("an explicit apiBaseUrl opt takes precedence over the env var", async () => {
+    const prev = process.env["SLACK_API_BASE_URL"];
+    process.env["SLACK_API_BASE_URL"] = "https://env.slack.test/api";
+    try {
+      let capturedUrl = "";
+      const fakeFetch: typeof fetch = async (url) => {
+        capturedUrl = String(url);
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      };
+      const adapter = createSlackAdapter(
+        { botToken: "xoxb", signingSecret: SECRET },
+        { apiBaseUrl: "https://opt.slack.test/api", fetch: fakeFetch },
+      );
+      await adapter.sendReply({
+        event: {
+          idempotencyKey: "E",
+          workspaceId: "T",
+          channelId: "C",
+          userId: "U",
+          ts: "1.0",
+          text: "x",
+          subtype: "message",
+        },
+        text: "out",
+      });
+      expect(capturedUrl).toBe("https://opt.slack.test/api/chat.postMessage");
+    } finally {
+      if (prev === undefined) Reflect.deleteProperty(process.env, "SLACK_API_BASE_URL");
+      else process.env["SLACK_API_BASE_URL"] = prev;
+    }
+  });
 });

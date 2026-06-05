@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type Anthropic from "@anthropic-ai/sdk";
-import { AnthropicAdapter } from "./adapter.js";
+import { AdapterError } from "@crewhaus/errors";
+import { AnthropicAdapter, createAnthropicAdapter } from "./adapter.js";
 import { CLAUDE_CODE_SYSTEM_PREFIX } from "./client.js";
 import type { ProviderRequest } from "./types.js";
 
@@ -191,5 +192,313 @@ describe("AnthropicAdapter", () => {
     }
     const wrapped = caught as { error?: unknown };
     expect(wrapped.error).toBeUndefined();
+  });
+
+  test("abort errors pass through verbatim (APIUserAbortError)", async () => {
+    const abortErr = new Error("Request was aborted.");
+    (abortErr as { name: string }).name = "APIUserAbortError";
+    const client = {
+      messages: {
+        stream: ((_p: Anthropic.MessageStreamParams) => ({
+          [Symbol.asyncIterator]() {
+            return { next: () => Promise.reject(abortErr) };
+          },
+        })) as unknown as Anthropic["messages"]["stream"],
+      },
+    } as unknown as Anthropic;
+    const a = new AnthropicAdapter({ client, isOAuth: false });
+    let caught: unknown;
+    try {
+      for await (const _ev of a.stream(REQ)) void _ev;
+    } catch (err) {
+      caught = err;
+    }
+    // Returned verbatim — same identity, not wrapped in AdapterError.
+    expect(caught).toBe(abortErr);
+  });
+
+  test("abort errors pass through verbatim (AbortError)", async () => {
+    const abortErr = new Error("aborted");
+    (abortErr as { name: string }).name = "AbortError";
+    const client = {
+      messages: {
+        stream: ((_p: Anthropic.MessageStreamParams) => ({
+          [Symbol.asyncIterator]() {
+            return { next: () => Promise.reject(abortErr) };
+          },
+        })) as unknown as Anthropic["messages"]["stream"],
+      },
+    } as unknown as Anthropic;
+    const a = new AnthropicAdapter({ client, isOAuth: false });
+    let caught: unknown;
+    try {
+      for await (const _ev of a.stream(REQ)) void _ev;
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBe(abortErr);
+  });
+
+  test("error thrown synchronously by messages.stream() is normalised", () => {
+    // The SDK can throw during `messages.stream(...)` construction (before
+    // iteration). The adapter's outer try/catch (not the for-await one)
+    // must normalise it too.
+    const boom = new Error("bad request building stream");
+    const client = {
+      messages: {
+        stream: (() => {
+          throw boom;
+        }) as unknown as Anthropic["messages"]["stream"],
+      },
+    } as unknown as Anthropic;
+    const a = new AnthropicAdapter({ client, isOAuth: false });
+    // The async generator throws on first iteration step.
+    const iter = a.stream(REQ)[Symbol.asyncIterator]();
+    return iter.next().then(
+      () => {
+        throw new Error("expected stream construction to reject");
+      },
+      (err: unknown) => {
+        expect(err).toBeInstanceOf(AdapterError);
+        expect((err as Error).message).toBe("bad request building stream");
+        // Cause preserved for debuggability.
+        expect((err as { cause?: unknown }).cause).toBe(boom);
+      },
+    );
+  });
+
+  test("structured SDK error (status + error) has fields copied onto wrapper", async () => {
+    // A typical APIError: has .status and .error already populated — the
+    // recovery-engine reads these directly. Verify they survive wrapping.
+    const sdkErr = Object.assign(new Error("rate limit hit"), {
+      name: "RateLimitError",
+      status: 429,
+      error: { type: "rate_limit_error", message: "slow down" },
+    });
+    const client = {
+      messages: {
+        stream: ((_p: Anthropic.MessageStreamParams) => ({
+          [Symbol.asyncIterator]() {
+            return { next: () => Promise.reject(sdkErr) };
+          },
+        })) as unknown as Anthropic["messages"]["stream"],
+      },
+    } as unknown as Anthropic;
+    const a = new AnthropicAdapter({ client, isOAuth: false });
+    let caught: unknown;
+    try {
+      for await (const _ev of a.stream(REQ)) void _ev;
+    } catch (err) {
+      caught = err;
+    }
+    const w = caught as { status?: number; error?: { type?: string }; name?: string };
+    expect(caught).toBeInstanceOf(AdapterError);
+    expect(w.status).toBe(429);
+    expect(w.error?.type).toBe("rate_limit_error");
+    expect(w.name).toBe("RateLimitError");
+  });
+
+  test("non-Error thrown value (string) is stringified into the message", async () => {
+    // err instanceof Error === false path: String(err) is used.
+    const client = {
+      messages: {
+        stream: ((_p: Anthropic.MessageStreamParams) => ({
+          [Symbol.asyncIterator]() {
+            return { next: () => Promise.reject("plain string failure") };
+          },
+        })) as unknown as Anthropic["messages"]["stream"],
+      },
+    } as unknown as Anthropic;
+    const a = new AnthropicAdapter({ client, isOAuth: false });
+    let caught: unknown;
+    try {
+      for await (const _ev of a.stream(REQ)) void _ev;
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(AdapterError);
+    expect((caught as Error).message).toBe("plain string failure");
+  });
+
+  test("SSE envelope without inner message still classifies by type", async () => {
+    // Envelope has error.type but no error.message — exercises the
+    // `message` spread's empty-object branch in tryParseSseErrorEnvelope.
+    const envelope = JSON.stringify({
+      type: "error",
+      error: { type: "overloaded_error" },
+    });
+    const err = Object.assign(new Error(envelope), { name: "APIConnectionError" });
+    const client = {
+      messages: {
+        stream: ((_p: Anthropic.MessageStreamParams) => ({
+          [Symbol.asyncIterator]() {
+            return { next: () => Promise.reject(err) };
+          },
+        })) as unknown as Anthropic["messages"]["stream"],
+      },
+    } as unknown as Anthropic;
+    const a = new AnthropicAdapter({ client, isOAuth: false });
+    let caught: unknown;
+    try {
+      for await (const _ev of a.stream(REQ)) void _ev;
+    } catch (e) {
+      caught = e;
+    }
+    const w = caught as { error?: { type?: string; message?: string } };
+    expect(w.error?.type).toBe("overloaded_error");
+    expect(w.error?.message).toBeUndefined();
+  });
+
+  test("SSE-Error-prefixed envelope is parsed (older SDK form)", async () => {
+    const envelope = `SSE Error: ${JSON.stringify({
+      type: "error",
+      error: { type: "api_error", message: "boom" },
+    })}`;
+    const err = Object.assign(new Error(envelope), { name: "APIConnectionError" });
+    const client = {
+      messages: {
+        stream: ((_p: Anthropic.MessageStreamParams) => ({
+          [Symbol.asyncIterator]() {
+            return { next: () => Promise.reject(err) };
+          },
+        })) as unknown as Anthropic["messages"]["stream"],
+      },
+    } as unknown as Anthropic;
+    const a = new AnthropicAdapter({ client, isOAuth: false });
+    let caught: unknown;
+    try {
+      for await (const _ev of a.stream(REQ)) void _ev;
+    } catch (e) {
+      caught = e;
+    }
+    const w = caught as { error?: { type?: string; message?: string } };
+    expect(w.error?.type).toBe("api_error");
+    expect(w.error?.message).toBe("boom");
+  });
+
+  test("malformed JSON envelope (starts with { but invalid) → no error field", async () => {
+    const err = Object.assign(new Error("{not valid json"), { name: "APIConnectionError" });
+    const client = {
+      messages: {
+        stream: ((_p: Anthropic.MessageStreamParams) => ({
+          [Symbol.asyncIterator]() {
+            return { next: () => Promise.reject(err) };
+          },
+        })) as unknown as Anthropic["messages"]["stream"],
+      },
+    } as unknown as Anthropic;
+    const a = new AnthropicAdapter({ client, isOAuth: false });
+    let caught: unknown;
+    try {
+      for await (const _ev of a.stream(REQ)) void _ev;
+    } catch (e) {
+      caught = e;
+    }
+    expect((caught as { error?: unknown }).error).toBeUndefined();
+  });
+
+  test("envelope with wrong top-level type → no error field", async () => {
+    // Valid JSON object, but type !== "error": classify() can't use it.
+    const err = Object.assign(new Error(JSON.stringify({ type: "ping", error: { type: "x" } })), {
+      name: "APIConnectionError",
+    });
+    const client = {
+      messages: {
+        stream: ((_p: Anthropic.MessageStreamParams) => ({
+          [Symbol.asyncIterator]() {
+            return { next: () => Promise.reject(err) };
+          },
+        })) as unknown as Anthropic["messages"]["stream"],
+      },
+    } as unknown as Anthropic;
+    const a = new AnthropicAdapter({ client, isOAuth: false });
+    let caught: unknown;
+    try {
+      for await (const _ev of a.stream(REQ)) void _ev;
+    } catch (e) {
+      caught = e;
+    }
+    expect((caught as { error?: unknown }).error).toBeUndefined();
+  });
+
+  test("envelope with non-string inner type → no error field", async () => {
+    const err = Object.assign(new Error(JSON.stringify({ type: "error", error: { type: 123 } })), {
+      name: "APIConnectionError",
+    });
+    const client = {
+      messages: {
+        stream: ((_p: Anthropic.MessageStreamParams) => ({
+          [Symbol.asyncIterator]() {
+            return { next: () => Promise.reject(err) };
+          },
+        })) as unknown as Anthropic["messages"]["stream"],
+      },
+    } as unknown as Anthropic;
+    const a = new AnthropicAdapter({ client, isOAuth: false });
+    let caught: unknown;
+    try {
+      for await (const _ev of a.stream(REQ)) void _ev;
+    } catch (e) {
+      caught = e;
+    }
+    expect((caught as { error?: unknown }).error).toBeUndefined();
+  });
+
+  test("envelope whose error field is null → no error field", async () => {
+    const err = Object.assign(new Error(JSON.stringify({ type: "error", error: null })), {
+      name: "APIConnectionError",
+    });
+    const client = {
+      messages: {
+        stream: ((_p: Anthropic.MessageStreamParams) => ({
+          [Symbol.asyncIterator]() {
+            return { next: () => Promise.reject(err) };
+          },
+        })) as unknown as Anthropic["messages"]["stream"],
+      },
+    } as unknown as Anthropic;
+    const a = new AnthropicAdapter({ client, isOAuth: false });
+    let caught: unknown;
+    try {
+      for await (const _ev of a.stream(REQ)) void _ev;
+    } catch (e) {
+      caught = e;
+    }
+    expect((caught as { error?: unknown }).error).toBeUndefined();
+  });
+
+  test("passes the abort signal through to messages.stream", async () => {
+    const controller = new AbortController();
+    let receivedOpts: { signal?: AbortSignal } | undefined;
+    const client = {
+      messages: {
+        stream: ((_params: Anthropic.MessageStreamParams, opts: { signal?: AbortSignal }) => {
+          receivedOpts = opts;
+          return (async function* () {
+            for (const ev of TEXT_RAW_EVENTS) yield ev;
+          })();
+        }) as unknown as Anthropic["messages"]["stream"],
+      },
+    } as unknown as Anthropic;
+    const a = new AnthropicAdapter({ client, isOAuth: false });
+    for await (const _ev of a.stream({ ...REQ, signal: controller.signal })) void _ev;
+    expect(receivedOpts?.signal).toBe(controller.signal);
+  });
+
+  describe("createAnthropicAdapter", () => {
+    test("builds an adapter from API-key env (non-OAuth)", () => {
+      const adapter = createAnthropicAdapter({ ANTHROPIC_API_KEY: "sk-ant-api01-test" });
+      expect(adapter).toBeInstanceOf(AnthropicAdapter);
+      expect(adapter.providerId).toBe("anthropic");
+    });
+
+    test("builds an OAuth adapter from sk-ant-oat token", () => {
+      const adapter = createAnthropicAdapter({ ANTHROPIC_AUTH_TOKEN: "sk-ant-oat01-test" });
+      expect(adapter).toBeInstanceOf(AnthropicAdapter);
+    });
+
+    test("throws ProviderAuthError when no credentials present", () => {
+      expect(() => createAnthropicAdapter({})).toThrow(/no Anthropic credentials/);
+    });
   });
 });

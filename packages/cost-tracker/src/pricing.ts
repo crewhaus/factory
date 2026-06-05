@@ -87,8 +87,11 @@ export const DEFAULT_PRICING: PricingTable = {
  * key prefix so versioned model ids (e.g. `claude-opus-4-7@beta`) still hit
  * the family base row.
  *
- * Returns `undefined` when the provider isn't in the table; throws when the
- * modelId has no matching row (better fail-loud than charge $0 silently).
+ * Returns `undefined` when the provider isn't in the table, and likewise when
+ * the provider is known but no model prefix matches. Callers (cost-tracker,
+ * the eval budget-gate) treat a `undefined` result as a "pricing miss" and
+ * charge $0 for that response while incrementing a miss counter, rather than
+ * throwing — an unmapped model id must not crash an in-flight run.
  */
 export function resolvePricing(
   table: PricingTable,

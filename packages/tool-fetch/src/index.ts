@@ -134,9 +134,14 @@ export function canonicalizeOrigin(raw: string): string {
 export type DnsLookupFn = (
   host: string,
 ) => Promise<{ readonly address: string; readonly family: number }>;
-let dnsLookupFn: DnsLookupFn = (host) => dnsLookup(host, { verbatim: false });
+// Single production default, referenced by both the initial binding and the
+// `_setDnsLookup(undefined)` restorer so there is exactly one resolver function
+// to reason about (and to cover). `verbatim: false` keeps the v4/v6 ordering
+// deterministic for the SSRF check.
+const defaultDnsLookup: DnsLookupFn = (host) => dnsLookup(host, { verbatim: false });
+let dnsLookupFn: DnsLookupFn = defaultDnsLookup;
 export function _setDnsLookup(fn: DnsLookupFn | undefined): void {
-  dnsLookupFn = fn ?? ((host) => dnsLookup(host, { verbatim: false }));
+  dnsLookupFn = fn ?? defaultDnsLookup;
 }
 
 /**

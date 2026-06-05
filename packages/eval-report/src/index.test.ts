@@ -90,6 +90,48 @@ describe("loadRun (T1)", () => {
     const dir = newTempRoot();
     await expect(loadRun(dir)).rejects.toThrow(ReportError);
   });
+
+  test("rejects malformed results.json with a parse error", async () => {
+    const dir = newTempRoot();
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "results.json"), "{ not: valid json,, }");
+    await expect(loadRun(dir)).rejects.toThrow(ReportError);
+    await expect(loadRun(dir)).rejects.toThrow(/failed to parse/);
+  });
+
+  test("resolves a run_<hex> id under .crewhaus/evals/<id>", async () => {
+    const root = newTempRoot();
+    const runId = "run_abcdef0123456789";
+    const evalsDir = join(root, ".crewhaus", "evals", runId);
+    const summary = makeRunSummary(runId, [makeSampleResult("s1", true, 1)]);
+    persistRun(evalsDir, summary);
+    const prevCwd = process.cwd();
+    try {
+      process.chdir(root);
+      const loaded = await loadRun(runId);
+      expect(loaded.summary.runId).toBe(runId);
+      expect(loaded.summary.samples).toHaveLength(1);
+    } finally {
+      process.chdir(prevCwd);
+    }
+  });
+
+  test("safeRead returns empty string for missing per-sample artifacts", async () => {
+    const dir = newTempRoot();
+    const summary = makeRunSummary("run_aaaa1111aaaa1111", [makeSampleResult("s1", true, 1)]);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "results.json"), JSON.stringify(summary, null, 2));
+    // Create the sample subdir but DO NOT write any artifact files, so every
+    // safeRead() hits its catch branch and falls back to "".
+    mkdirSync(join(dir, "s1"), { recursive: true });
+    const loaded = await loadRun(dir);
+    expect(loaded.perSample["s1"]).toEqual({
+      transcript: "",
+      events: "",
+      grades: "",
+      meta: "",
+    });
+  });
 });
 
 describe("renderReport (T1)", () => {
@@ -123,6 +165,28 @@ describe("renderReport (T1)", () => {
     const out = renderReport(loaded);
     expect(out.html).not.toContain("<script>alert('pwn')");
     expect(out.html).toContain("&lt;script&gt;");
+  });
+
+  test("escapes a sampleId that tries to break out of the drill href attribute", async () => {
+    const dir = newTempRoot();
+    // A sampleId crafted to break out of href="#drill-..." and inject an attribute.
+    const payloadId = 'x" onmouseover="alert(1)';
+    const evil = makeSampleResult(payloadId, true, 1);
+    const summary = makeRunSummary("run_aaaa1111aaaa1111", [evil]);
+    persistRun(dir, summary);
+    const loaded = await loadRun(dir);
+    const out = renderReport(loaded);
+    // The raw injection must not survive into the href attribute.
+    expect(out.html).not.toContain('href="#drill-x" onmouseover="alert(1)"');
+    expect(out.html).not.toContain('onmouseover="alert(1)"');
+    // The quote must be HTML-escaped wherever the sampleId is interpolated.
+    expect(out.html).toContain("&quot; onmouseover=&quot;alert(1)");
+    // The in-page anchor and its target id stay consistent (both escaped),
+    // so the drill link still resolves.
+    const hrefMatch = out.html.match(/href="(#drill-[^"]*)"/);
+    expect(hrefMatch).not.toBeNull();
+    const fragment = hrefMatch?.[1]?.slice(1); // strip leading '#'
+    expect(out.html).toContain(`id="${fragment}"`);
   });
 });
 

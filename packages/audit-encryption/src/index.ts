@@ -166,7 +166,10 @@ export interface DekStore {
 }
 
 export class InMemoryDekStore implements DekStore {
-  private readonly map = new Map<string, DekEntry>();
+  private readonly map: Map<string, DekEntry>;
+  constructor() {
+    this.map = new Map<string, DekEntry>();
+  }
   async get(tenantId: string): Promise<Buffer | undefined> {
     return this.map.get(tenantId)?.dek;
   }
@@ -470,10 +473,16 @@ export async function createAuditEncryption(
     }
   }
 
-  // Auto-subscribe to rotation events.
+  // Auto-subscribe to rotation events. The re-key runs fire-and-forget, but
+  // its rejection is contained locally: a failed event-driven rotation must
+  // never escape as an unhandled rejection (which could crash the host
+  // process). The engine simply keeps its last-good KEK state and historical
+  // records still decrypt.
   const unsubscribeRotation = opts.secrets.onRotation((event) => {
     if (event.name !== opts.kekName) return;
-    void rotateInternal(event.newValue, `kek:${opts.kekName}:${event.rotatedAt}`);
+    void rotateInternal(event.newValue, `kek:${opts.kekName}:${event.rotatedAt}`).catch(() => {
+      /* contained — see comment above */
+    });
   });
   // Suppress unused-variable warning — unsubscribeRotation is intended
   // for future shutdown plumbing; tests can ignore it.

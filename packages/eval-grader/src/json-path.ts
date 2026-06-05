@@ -13,7 +13,12 @@ import { GraderError } from "./errors";
  * Returns ALL matches as an array. The empty array means "no match".
  * Rejects unsupported expressions with a clear error message.
  */
-export class JsonPathError extends GraderError {}
+export class JsonPathError extends GraderError {
+  // biome-ignore lint/complexity/noUselessConstructor: explicit constructor so Bun --coverage counts it as a covered function (field-initializer-only classes can't hit 100% function coverage otherwise)
+  constructor(message: string, cause?: unknown) {
+    super(message, cause);
+  }
+}
 
 type Step =
   | { kind: "child"; key: string }
@@ -89,7 +94,14 @@ export function evalJsonPath(value: unknown, path: string): unknown[] {
     const next: unknown[] = [];
     for (const node of current) {
       if (step.kind === "child") {
-        if (node !== null && typeof node === "object" && step.key in (node as object)) {
+        // Own-property check only: using `in` would traverse the prototype
+        // chain and spuriously match inherited keys like "constructor",
+        // "toString", or "__proto__" on parsed-JSON objects.
+        if (
+          node !== null &&
+          typeof node === "object" &&
+          Object.prototype.hasOwnProperty.call(node, step.key)
+        ) {
           next.push((node as Record<string, unknown>)[step.key]);
         }
       } else if (step.kind === "index") {

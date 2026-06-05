@@ -26,6 +26,38 @@ export interface ModelResolution {
 const adapterCache = new Map<string, ProviderAdapter>();
 
 /**
+ * Dynamic-import seam for the optional provider adapters. Each entry is the
+ * real `await import(...)` by default. Kept behind an indirection so tests can
+ * simulate a missing optionalDependency (the `import()` rejecting) without
+ * mutating the module registry — which would leak across test files. Restore
+ * with `__resetAdapterImporters()` in `afterEach`.
+ *
+ * @internal — not part of the public API; exported only for tests.
+ */
+function importOpenAI(): Promise<typeof import("@crewhaus/adapter-openai")> {
+  return import("@crewhaus/adapter-openai");
+}
+function importGemini(): Promise<typeof import("@crewhaus/adapter-gemini")> {
+  return import("@crewhaus/adapter-gemini");
+}
+function importBedrock(): Promise<typeof import("@crewhaus/adapter-bedrock")> {
+  return import("@crewhaus/adapter-bedrock");
+}
+
+export const __adapterImporters = {
+  openai: importOpenAI,
+  gemini: importGemini,
+  bedrock: importBedrock,
+};
+
+/** @internal — restore the real dynamic-import functions after a test. */
+export function __resetAdapterImporters(): void {
+  __adapterImporters.openai = importOpenAI;
+  __adapterImporters.gemini = importGemini;
+  __adapterImporters.bedrock = importBedrock;
+}
+
+/**
  * For tests: drop every cached adapter so the next `resolveModel`
  * triggers a fresh dynamic import.
  */
@@ -66,46 +98,43 @@ async function loadAdapter(
   parsed: ParsedModelString,
   env: NodeJS.ProcessEnv,
 ): Promise<ProviderAdapter> {
-  switch (parsed.providerId) {
-    case "anthropic": {
-      const mod = await import("@crewhaus/adapter-anthropic");
-      return mod.createAnthropicAdapter(env);
-    }
-    case "openai": {
-      let mod: typeof import("@crewhaus/adapter-openai");
-      try {
-        mod = await import("@crewhaus/adapter-openai");
-      } catch (err) {
-        throw new ConfigError(
-          "model-router: @crewhaus/adapter-openai is not installed — required for openai/* and local/* model strings",
-          err,
-        );
-      }
-      return mod.createOpenAIAdapter(env, parsed.baseUrl ? { baseURL: parsed.baseUrl } : {});
-    }
-    case "gemini": {
-      let mod: typeof import("@crewhaus/adapter-gemini");
-      try {
-        mod = await import("@crewhaus/adapter-gemini");
-      } catch (err) {
-        throw new ConfigError(
-          "model-router: @crewhaus/adapter-gemini is not installed — required for gemini/* model strings",
-          err,
-        );
-      }
-      return mod.createGeminiAdapter(env);
-    }
-    case "bedrock": {
-      let mod: typeof import("@crewhaus/adapter-bedrock");
-      try {
-        mod = await import("@crewhaus/adapter-bedrock");
-      } catch (err) {
-        throw new ConfigError(
-          "model-router: @crewhaus/adapter-bedrock is not installed — required for bedrock/* model strings",
-          err,
-        );
-      }
-      return mod.createBedrockAdapter({ family: parsed.family }, env);
-    }
+  if (parsed.providerId === "anthropic") {
+    const mod = await import("@crewhaus/adapter-anthropic");
+    return mod.createAnthropicAdapter(env);
   }
+  if (parsed.providerId === "openai") {
+    let mod: typeof import("@crewhaus/adapter-openai");
+    try {
+      mod = await __adapterImporters.openai();
+    } catch (err) {
+      throw new ConfigError(
+        "model-router: @crewhaus/adapter-openai is not installed — required for openai/* and local/* model strings",
+        err,
+      );
+    }
+    return mod.createOpenAIAdapter(env, parsed.baseUrl ? { baseURL: parsed.baseUrl } : {});
+  }
+  if (parsed.providerId === "gemini") {
+    let mod: typeof import("@crewhaus/adapter-gemini");
+    try {
+      mod = await __adapterImporters.gemini();
+    } catch (err) {
+      throw new ConfigError(
+        "model-router: @crewhaus/adapter-gemini is not installed — required for gemini/* model strings",
+        err,
+      );
+    }
+    return mod.createGeminiAdapter(env);
+  }
+  // Only `bedrock` remains (ParsedModelString is a closed union).
+  let mod: typeof import("@crewhaus/adapter-bedrock");
+  try {
+    mod = await __adapterImporters.bedrock();
+  } catch (err) {
+    throw new ConfigError(
+      "model-router: @crewhaus/adapter-bedrock is not installed — required for bedrock/* model strings",
+      err,
+    );
+  }
+  return mod.createBedrockAdapter({ family: parsed.family }, env);
 }
