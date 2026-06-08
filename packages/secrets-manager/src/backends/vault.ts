@@ -34,7 +34,7 @@ export function createVaultBackend(opts: VaultBackendOptions): SecretsBackend {
 
   function dataUrl(name: string): string {
     if (!/^[A-Za-z0-9_/.-]+$/.test(name)) {
-      throw new SecretsError(`invalid secret name "${name}" for vault backend`);
+      throw new SecretsError("invalid secret name for vault backend");
     }
     return `${opts.addr}/v1/${encodeURIComponent(mount)}/data/${name}`;
   }
@@ -47,17 +47,15 @@ export function createVaultBackend(opts: VaultBackendOptions): SecretsBackend {
         headers: { "X-Vault-Token": getToken() },
       });
       if (res.status === 404) {
-        throw new SecretsError(`secret "${name}" not found in vault at ${url}`);
+        throw new SecretsError("secret not found in vault (status 404)");
       }
       if (!res.ok) {
-        throw new SecretsError(`vault GET ${name} returned ${res.status}: ${await res.text()}`);
+        throw new SecretsError(`vault request failed (status ${res.status})`);
       }
       const body = (await res.json()) as { data?: { data?: { value?: string } } };
       const v = body?.data?.data?.value;
       if (typeof v !== "string") {
-        throw new SecretsError(
-          `vault response for "${name}" missing data.data.value (KV v2 expected)`,
-        );
+        throw new SecretsError("vault response missing data.data.value (KV v2 expected)");
       }
       return v;
     },
@@ -73,7 +71,7 @@ export function createVaultBackend(opts: VaultBackendOptions): SecretsBackend {
         body: JSON.stringify({ data: { value: newValue } }),
       });
       if (!res.ok) {
-        throw new SecretsError(`vault PUT ${name} returned ${res.status}: ${await res.text()}`);
+        throw new SecretsError(`vault request failed (status ${res.status})`);
       }
       return newValue;
     },

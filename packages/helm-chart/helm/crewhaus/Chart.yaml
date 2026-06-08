@@ -9,7 +9,7 @@ sources:
   - https://github.com/crewhaus/factory
 maintainers:
   - name: CrewHaus
-    email: maintainers@crewhaus.io
+    email: maintainers@crewhaus.ai
 keywords:
   - llm
   - agents

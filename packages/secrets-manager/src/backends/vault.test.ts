@@ -85,7 +85,11 @@ describe("vault backend — dataUrl name validation", () => {
     const { fetchImpl, calls } = stubFetch(() => new Response("{}"));
     const backend = createVaultBackend({ addr: ADDR, token: "t", fetchImpl });
     expect(backend.get("bad name!")).rejects.toBeInstanceOf(SecretsError);
-    await backend.get("bad name!").catch(() => {});
+    await backend.get("bad name!").catch((e: unknown) => {
+      const msg = (e as Error).message;
+      expect(msg).toContain("invalid secret name");
+      expect(msg).not.toContain("bad name!");
+    });
     expect(calls.length).toBe(0);
   });
 
@@ -128,19 +132,30 @@ describe("vault backend — get() response handling", () => {
     expect(await backend.get("K")).toBe("vault-secret");
   });
 
-  test("throws SecretsError on 404 (missing secret)", async () => {
+  test("throws SecretsError on 404 (missing secret) without leaking name or url", async () => {
     const { fetchImpl } = stubFetch(() => new Response("not found", { status: 404 }));
     const backend = createVaultBackend({ addr: ADDR, token: "t", fetchImpl });
-    expect(backend.get("MISSING")).rejects.toBeInstanceOf(SecretsError);
+    expect(backend.get("SENSITIVE_NAME")).rejects.toBeInstanceOf(SecretsError);
+    await backend.get("SENSITIVE_NAME").catch((e: unknown) => {
+      const msg = (e as Error).message;
+      expect(msg).toContain("404");
+      expect(msg).not.toContain("SENSITIVE_NAME");
+      // the url embeds the name + addr; it must not appear either.
+      expect(msg).not.toContain(ADDR);
+    });
   });
 
-  test("throws SecretsError on a non-ok, non-404 status (e.g. 500) including body text", async () => {
+  test("throws SecretsError on a non-ok, non-404 status (e.g. 500) with status but no name/body", async () => {
     const { fetchImpl } = stubFetch(() => new Response("permission denied", { status: 500 }));
     const backend = createVaultBackend({ addr: ADDR, token: "t", fetchImpl });
-    expect(backend.get("K")).rejects.toBeInstanceOf(SecretsError);
-    await backend.get("K").catch((e: unknown) => {
-      expect((e as Error).message).toContain("500");
-      expect((e as Error).message).toContain("permission denied");
+    expect(backend.get("SENSITIVE_NAME")).rejects.toBeInstanceOf(SecretsError);
+    await backend.get("SENSITIVE_NAME").catch((e: unknown) => {
+      const msg = (e as Error).message;
+      // status is retained for debugging...
+      expect(msg).toContain("500");
+      // ...but the raw response body and the secret name are redacted.
+      expect(msg).not.toContain("permission denied");
+      expect(msg).not.toContain("SENSITIVE_NAME");
     });
   });
 
@@ -149,9 +164,11 @@ describe("vault backend — get() response handling", () => {
       () => new Response(JSON.stringify({ data: { data: {} } }), { status: 200 }),
     );
     const backend = createVaultBackend({ addr: ADDR, token: "t", fetchImpl });
-    expect(backend.get("K")).rejects.toBeInstanceOf(SecretsError);
-    await backend.get("K").catch((e: unknown) => {
-      expect((e as Error).message).toContain("missing data.data.value");
+    expect(backend.get("SENSITIVE_NAME")).rejects.toBeInstanceOf(SecretsError);
+    await backend.get("SENSITIVE_NAME").catch((e: unknown) => {
+      const msg = (e as Error).message;
+      expect(msg).toContain("missing data.data.value");
+      expect(msg).not.toContain("SENSITIVE_NAME");
     });
   });
 
@@ -207,13 +224,19 @@ describe("vault backend — rotate()", () => {
     expect(JSON.parse(putBody)).toEqual({ data: { value: v } });
   });
 
-  test("throws SecretsError when the PUT is not ok, including status + body", async () => {
+  test("throws SecretsError when the PUT is not ok, with status but no name/body", async () => {
     const { fetchImpl } = stubFetch(() => new Response("sealed", { status: 503 }));
     const backend = createVaultBackend({ addr: ADDR, token: "t", fetchImpl });
-    expect(backend.rotate("KEY", { newValue: "x" })).rejects.toBeInstanceOf(SecretsError);
-    await backend.rotate("KEY", { newValue: "x" }).catch((e: unknown) => {
-      expect((e as Error).message).toContain("503");
-      expect((e as Error).message).toContain("sealed");
+    expect(backend.rotate("SENSITIVE_NAME", { newValue: "x" })).rejects.toBeInstanceOf(
+      SecretsError,
+    );
+    await backend.rotate("SENSITIVE_NAME", { newValue: "x" }).catch((e: unknown) => {
+      const msg = (e as Error).message;
+      // status is retained for debugging...
+      expect(msg).toContain("503");
+      // ...but the raw response body and the secret name are redacted.
+      expect(msg).not.toContain("sealed");
+      expect(msg).not.toContain("SENSITIVE_NAME");
     });
   });
 });

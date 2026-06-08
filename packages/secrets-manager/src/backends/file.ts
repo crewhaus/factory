@@ -20,7 +20,7 @@ export function createFileBackend(opts: FileBackendOptions): SecretsBackend {
 
   function pathFor(name: string): string {
     if (!/^[A-Za-z0-9_.-]+$/.test(name)) {
-      throw new SecretsError(`invalid secret name "${name}" (must match [A-Za-z0-9_.-]+)`);
+      throw new SecretsError("invalid secret name (must match [A-Za-z0-9_.-]+)");
     }
     return join(rootDir, name);
   }
@@ -30,7 +30,7 @@ export function createFileBackend(opts: FileBackendOptions): SecretsBackend {
     async get(name: string): Promise<SecretValue> {
       const p = pathFor(name);
       if (!existsSync(p)) {
-        throw new SecretsError(`secret "${name}" not found at ${p}`);
+        throw new SecretsError("secret file read failed (not found)");
       }
       return readFileSync(p, "utf8");
     },

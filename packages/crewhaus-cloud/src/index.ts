@@ -130,10 +130,10 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 namespace: ${config.clusterName}
 commonLabels:
-  crewhaus.io/cluster: ${config.clusterName}
-  crewhaus.io/provider: ${config.provider}
-  crewhaus.io/region: ${config.region}
-  crewhaus.io/tier: ${config.tier}
+  crewhaus.ai/cluster: ${config.clusterName}
+  crewhaus.ai/provider: ${config.provider}
+  crewhaus.ai/region: ${config.region}
+  crewhaus.ai/tier: ${config.tier}
 resources:
 ${resourceFiles.map((f) => `  - ${f}`).join("\n")}
 `;

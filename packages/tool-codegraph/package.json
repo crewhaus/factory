@@ -41,7 +41,7 @@
     "url": "https://github.com/crewhaus/factory/issues"
   },
   "publishConfig": {
-    "access": "restricted"
+    "access": "public"
   },
   "files": ["src", "README.md", "LICENSE", "NOTICE"]
 }

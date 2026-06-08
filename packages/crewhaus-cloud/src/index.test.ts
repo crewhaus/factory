@@ -65,8 +65,8 @@ describe("renderKustomizeOverlay", () => {
     const overlay = renderKustomizeOverlay(config);
     expect(overlay.kustomization).toContain("kind: Kustomization");
     expect(overlay.kustomization).toContain(`namespace: ${config.clusterName}`);
-    expect(overlay.kustomization).toContain("crewhaus.io/provider: aws");
-    expect(overlay.kustomization).toContain("crewhaus.io/region: us-east-1");
+    expect(overlay.kustomization).toContain("crewhaus.ai/provider: aws");
+    expect(overlay.kustomization).toContain("crewhaus.ai/region: us-east-1");
     expect(Object.keys(overlay.manifests).length).toBeGreaterThan(0);
     expect(Object.keys(overlay.manifests).some((k) => k.startsWith("managed-"))).toBe(true);
   });

@@ -2,13 +2,13 @@ import { describe, expect, test } from "bun:test";
 import worker from "./index";
 
 const env = {
-  ALLOWED_ORIGINS: "https://studio.crewhaus.dev",
+  ALLOWED_ORIGINS: "https://studio.crewhaus.ai",
   MAX_BODY_BYTES: "262144",
 };
 
 function request(path: string, init?: RequestInit): Request {
-  return new Request(`https://compiler.crewhaus.dev${path}`, {
-    headers: { origin: "https://studio.crewhaus.dev", ...init?.headers },
+  return new Request(`https://compiler.crewhaus.ai${path}`, {
+    headers: { origin: "https://studio.crewhaus.ai", ...init?.headers },
     ...init,
   });
 }
@@ -24,7 +24,7 @@ describe("compiler-worker", () => {
   test("OPTIONS preflight returns CORS headers", async () => {
     const res = await worker.fetch(request("/compile", { method: "OPTIONS" }), env);
     expect(res.status).toBe(204);
-    expect(res.headers.get("access-control-allow-origin")).toBe("https://studio.crewhaus.dev");
+    expect(res.headers.get("access-control-allow-origin")).toBe("https://studio.crewhaus.ai");
   });
 
   test("POST /compile with valid CLI spec returns a bundle", async () => {
@@ -301,7 +301,7 @@ agent:
       request("/health", { headers: { origin: "https://evil.example.com" } }),
       env,
     );
-    expect(res.headers.get("access-control-allow-origin")).toBe("https://studio.crewhaus.dev");
+    expect(res.headers.get("access-control-allow-origin")).toBe("https://studio.crewhaus.ai");
   });
 
   test("OPTIONS preflight allows Authorization + PUT (for /cf proxy)", async () => {
@@ -330,7 +330,7 @@ agent:
         env,
       );
       expect(res.status).toBe(200);
-      expect(res.headers.get("access-control-allow-origin")).toBe("https://studio.crewhaus.dev");
+      expect(res.headers.get("access-control-allow-origin")).toBe("https://studio.crewhaus.ai");
       expect(captured.url).toBe("https://api.cloudflare.com/client/v4/accounts");
       expect(captured.auth).toBe("Bearer tkn");
     } finally {
@@ -410,7 +410,7 @@ agent:
         headers: { "Content-Type": "application/json" },
         body: huge,
       }),
-      { ALLOWED_ORIGINS: "https://studio.crewhaus.dev" },
+      { ALLOWED_ORIGINS: "https://studio.crewhaus.ai" },
     );
     expect(res.status).toBe(500);
     const body = (await res.json()) as { error: { code: string; message: string } };
@@ -441,7 +441,7 @@ agent:
         env,
       );
       expect(res.status).toBe(200);
-      expect(res.headers.get("access-control-allow-origin")).toBe("https://studio.crewhaus.dev");
+      expect(res.headers.get("access-control-allow-origin")).toBe("https://studio.crewhaus.ai");
       expect(captured.url).toBe("https://api.render.com/v1/services");
       expect(captured.auth).toBe("Bearer rnd_tkn");
     } finally {

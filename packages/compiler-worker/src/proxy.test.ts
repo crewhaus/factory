@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { PROVIDER_API_HOSTS, handleProviderProxy, isAllowedUpstream } from "./proxy";
 
 const cors = {
-  "Access-Control-Allow-Origin": "https://studio.crewhaus.dev",
+  "Access-Control-Allow-Origin": "https://studio.crewhaus.ai",
   Vary: "Origin",
 };
 
@@ -50,7 +50,7 @@ describe("isAllowedUpstream", () => {
 });
 
 function proxyRequest(upstream: string, init?: RequestInit): { request: Request; url: URL } {
-  const raw = `https://compiler.crewhaus.dev/proxy?upstream=${encodeURIComponent(upstream)}`;
+  const raw = `https://compiler.crewhaus.ai/proxy?upstream=${encodeURIComponent(upstream)}`;
   return { request: new Request(raw, init), url: new URL(raw) };
 }
 
@@ -83,7 +83,7 @@ describe("handleProviderProxy", () => {
       });
       const res = await handleProviderProxy(request, cors, url);
       expect(res.status).toBe(201);
-      expect(res.headers.get("access-control-allow-origin")).toBe("https://studio.crewhaus.dev");
+      expect(res.headers.get("access-control-allow-origin")).toBe("https://studio.crewhaus.ai");
       const body = (await res.json()) as { id: string };
       expect(body.id).toBe("srv-123");
       expect(captured.url).toBe("https://api.render.com/v1/services");
@@ -108,7 +108,7 @@ describe("handleProviderProxy", () => {
       });
       const res = await handleProviderProxy(request, cors, url);
       expect(res.status).toBe(403);
-      expect(res.headers.get("access-control-allow-origin")).toBe("https://studio.crewhaus.dev");
+      expect(res.headers.get("access-control-allow-origin")).toBe("https://studio.crewhaus.ai");
       const body = (await res.json()) as { error: { code: string } };
       expect(body.error.code).toBe("UPSTREAM_NOT_ALLOWED");
       expect(called).toBe(false);

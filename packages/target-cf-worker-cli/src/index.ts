@@ -12,7 +12,7 @@ export type EmitOptions = {
   readonly allowedOrigins?: readonly string[];
 };
 
-const DEFAULT_ALLOWED_ORIGINS = ["https://studio.crewhaus.dev", "http://localhost:4322"];
+const DEFAULT_ALLOWED_ORIGINS = ["https://studio.crewhaus.ai", "http://localhost:4322"];
 
 /**
  * Emit a Cloudflare Worker bundle for a CLI-target IR. Sibling of

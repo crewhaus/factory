@@ -17,5 +17,5 @@ app.kubernetes.io/name: {{ include "crewhaus.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}
-crewhaus.io/target: {{ .Values.target | quote }}
+crewhaus.ai/target: {{ .Values.target | quote }}
 {{- end -}}

@@ -55,7 +55,7 @@ You cannot:
 
 - Use "Official," "Certified," "Verified," or similar in connection with CrewHaus marks without our explicit written permission.
 - Use the CrewHaus marks in a way that suggests we partner with, endorse, sponsor, or are affiliated with your product or company.
-- Use CrewHaus marks in domain names you control (e.g., `crewhaus-pro.com`, `crewhaus.dev`, `getcrewhaus.com`).
+- Use CrewHaus marks in domain names you control (e.g., `crewhaus-pro.com`, `crewhaus.ai`, `getcrewhaus.ai`).
 - Apply for a trademark on a CrewHaus mark or confusingly-similar mark.
 
 ### Modify the logo

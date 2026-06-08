@@ -216,7 +216,7 @@ Version: ${version}
 Section: utils
 Priority: optional
 Architecture: any
-Maintainer: CrewHaus Maintainers <maintainers@crewhaus.io>
+Maintainer: CrewHaus Maintainers <maintainers@crewhaus.ai>
 Depends: libc6 (>= 2.31)
 Description: Modular meta-harness — compile a single spec into multiple agent runtimes
  CrewHaus compiles a single high-level harness spec into multiple

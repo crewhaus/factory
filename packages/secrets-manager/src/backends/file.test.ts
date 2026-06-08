@@ -88,14 +88,26 @@ describe("file backend — get()", () => {
     expect(await backend.get("API_KEY")).toBe("  secret with spaces \n");
   });
 
-  test("throws SecretsError when the file is missing", async () => {
+  test("throws SecretsError when the file is missing, leaking neither name nor path", async () => {
     const backend = createFileBackend({ rootDir: ROOT });
     expect(backend.get("MISSING")).rejects.toBeInstanceOf(SecretsError);
+    await backend.get("MISSING").catch((e: unknown) => {
+      const msg = (e as Error).message;
+      expect(msg).toBe("secret file read failed (not found)");
+      // the secret name and the on-disk path must not appear in the message.
+      expect(msg).not.toContain("MISSING");
+      expect(msg).not.toContain(ROOT);
+    });
   });
 
-  test("rejects path-traversal names before touching fs", async () => {
+  test("rejects path-traversal names before touching fs, without echoing the name", async () => {
     const backend = createFileBackend({ rootDir: ROOT });
     expect(backend.get("../../etc/passwd")).rejects.toBeInstanceOf(SecretsError);
+    await backend.get("../../etc/passwd").catch((e: unknown) => {
+      const msg = (e as Error).message;
+      expect(msg).toContain("invalid secret name");
+      expect(msg).not.toContain("../../etc/passwd");
+    });
   });
 });
 

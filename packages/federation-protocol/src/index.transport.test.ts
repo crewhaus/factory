@@ -23,11 +23,13 @@ import { afterAll, afterEach, beforeAll, describe, expect, mock, test } from "bu
  *   - happy / end paths resolve naturally once `res` emits `end`;
  *   - paths that only inspect `checkServerIdentity` settle by emitting a
  *     request `"error"` and asserting the call REJECTS;
- *   - the error / timeout paths assert `.rejects`.
- * We deliberately never emit a response-stream `"error"`: `defaultTransport`
- * registers no `res.on("error")` listener, so such a promise could never settle
- * (that exact omission is what hung the previous version of this file). See the
- * note at the bottom for why that single branch is intentionally not exercised.
+ *   - the error / timeout paths assert `.rejects`;
+ *   - the response-stream-error path emits `res.on("error")` and asserts the
+ *     call REJECTS — `defaultTransport` now registers a `res.on("error")`
+ *     listener that rejects, so this settles instead of hanging. (The previous
+ *     version of the transport omitted that listener; emitting a response-stream
+ *     error then could never settle the promise, which is the latent hang this
+ *     fix closes.)
  */
 import { EventEmitter } from "node:events";
 import type { PeerCertificate } from "node:tls";
@@ -77,10 +79,15 @@ let lastCall: Capture | undefined;
  * Behaviour selector, reset to `"manual"` after every test:
  *  - "respond": on the next microtask deliver a response, emit `respondChunks`,
  *               then `end` (happy path — promise resolves).
+ *  - "open":    on the next microtask deliver a response (so `res.on(...)`
+ *               listeners are attached) and emit `respondChunks`, but DO NOT
+ *               emit `end`. The stream is left open for the test to drive — e.g.
+ *               to emit a response-stream `"error"`. The response is captured in
+ *               `lastCall.res` so the test can reach it.
  *  - "manual":  capture `opts` / `req` only; the test drives every event and is
  *               responsible for settling the promise (reject via req `error`).
  */
-let mode: "respond" | "manual" = "manual";
+let mode: "respond" | "open" | "manual" = "manual";
 let respondStatus: number | undefined = 200;
 let respondChunks: Buffer[] = [];
 
@@ -90,7 +97,7 @@ mock.module("node:https", () => ({
     const req = new FakeClientRequest();
     const call: Capture = { opts, req, cb };
     lastCall = call;
-    if (mode === "respond") {
+    if (mode === "respond" || mode === "open") {
       // Deliver the response only after the synchronous body of
       // `defaultTransport` has run `req.write(body)` / `req.end()`.
       queueMicrotask(() => {
@@ -99,7 +106,8 @@ mock.module("node:https", () => ({
         call.res = res;
         cb(res);
         for (const c of respondChunks) res.emit("data", c);
-        res.emit("end");
+        // "open" leaves the stream live so the test can drive `error`/`end`.
+        if (mode === "respond") res.emit("end");
       });
     }
     return req;
@@ -343,18 +351,33 @@ describe("defaultTransport (real node:https path, request mocked)", () => {
     // relies on: the helper and the pin must agree on the same canonical form.
     expect(fingerprintCert(creds.clientCertPem)).toBe(creds.pinnedFingerprint);
   });
-});
 
-/*
- * Intentionally NOT covered: the response-stream-error branch.
- *
- * `defaultTransport`'s response handler (src/index.ts) registers only
- * `res.on("data")` and `res.on("end")` — there is no `res.on("error")`. If a
- * response stream were to emit `"error"` mid-body, the returned Promise would
- * neither resolve nor reject; it would hang forever (and Node would treat it as
- * an unhandled stream error). Driving that branch from a test is therefore
- * impossible without leaving an unsettled promise / open handle, which is the
- * exact defect that hung the previous incarnation of this file. Every other
- * line of the transport (212-272) is exercised above with a settling promise,
- * so this omission does not reduce coverage of any reachable line/function.
- */
+  test("rejects with a FederationProtocolError when the response stream emits 'error'", async () => {
+    // Regression guard for the latent hang: if the response stream errors
+    // mid-body, `defaultTransport` must reject (settle) — never leave the
+    // returned promise pending. "open" delivers a live `res` (so the
+    // production `res.on("error")` listener is attached) and a partial body,
+    // then hands control to the test.
+    mode = "open";
+    respondStatus = 200;
+    respondChunks = [Buffer.from('{"partial":', "utf8")];
+    const call = federationCall({
+      url: "https://deployment-b.example/federation",
+      envelope: baseEnvelope,
+      credentials: creds,
+    });
+    // Let the request assemble + the queued microtask deliver `res` and the
+    // partial chunk, so the response stream is live with listeners attached.
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(lastCall?.res).toBeInstanceOf(EventEmitter);
+    // Mid-body stream failure: without `res.on("error")` this would hang.
+    lastCall?.res?.emit("error", new Error("ECONNRESET mid-body"));
+    await expect(call).rejects.toThrow(/federation transport error: ECONNRESET mid-body/);
+    await call.catch((e) => {
+      expect(e).toBeInstanceOf(FederationProtocolError);
+      // The original stream error is preserved as the cause.
+      expect((e as InstanceType<typeof FederationProtocolError>).cause).toBeInstanceOf(Error);
+    });
+  });
+});

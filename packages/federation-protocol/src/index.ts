@@ -250,6 +250,9 @@ function defaultTransport(timeoutMs: number): FederationTransport {
       const req = httpsRequest(opts, (res) => {
         const chunks: Buffer[] = [];
         res.on("data", (c) => chunks.push(c as Buffer));
+        res.on("error", (err) =>
+          reject(new FederationProtocolError(`federation transport error: ${err.message}`, err)),
+        );
         res.on("end", () =>
           resolve({
             status: res.statusCode ?? 0,
