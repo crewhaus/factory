@@ -23,8 +23,9 @@
  * (provided by `citation-tracker`'s tool helpers) anchor specific
  * snippets back to the fetched content.
  */
-import { readFileSync } from "node:fs";
-import { resolve as resolvePath } from "node:path";
+import { lookup as nodeDnsLookup } from "node:dns/promises";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { basename, dirname, join as joinPath, resolve as resolvePath, sep } from "node:path";
 import type { CitationTracker } from "@crewhaus/citation-tracker";
 import { CrewhausError } from "@crewhaus/errors";
 import { buildTool } from "@crewhaus/tool-builder";
@@ -72,6 +73,154 @@ type DomainBucket = {
   windowStartMs: number;
   callsInWindow: number;
 };
+
+/**
+ * SSRF defenses below mirror `@crewhaus/tool-fetch` (`isPrivateIp` /
+ * `normalizeIpv4` / `assertNotSsrf`). They are duplicated rather than imported
+ * to keep the crawler dependency-free (adding `@crewhaus/tool-fetch` would
+ * mutate the lockfile and break `bun install --frozen-lockfile`) — the project
+ * deliberately keeps per-package copies of these guards (tool-fetch,
+ * tool-navigate). Keep the copies in sync. The IPv4-mapped IPv6 handling is
+ * load-bearing: `new URL` normalizes `[::ffff:127.0.0.1]` to `[::ffff:7f00:1]`,
+ * which a naive loopback check would miss.
+ */
+function normalizeIpv4(raw: string): string | null {
+  const trimmed = raw.trim();
+  if (trimmed === "") return null;
+
+  const parseComponent = (s: string): number | null => {
+    if (s === "") return null;
+    let value: number;
+    if (/^0[xX][0-9a-fA-F]+$/.test(s)) {
+      value = Number.parseInt(s.slice(2), 16);
+    } else if (/^0[0-7]+$/.test(s)) {
+      value = Number.parseInt(s, 8);
+    } else if (/^[0-9]+$/.test(s)) {
+      value = Number.parseInt(s, 10);
+    } else {
+      return null;
+    }
+    return Number.isNaN(value) ? null : value;
+  };
+
+  const segments = trimmed.split(".");
+  if (segments.length > 4) return null;
+
+  const components: number[] = [];
+  for (const seg of segments) {
+    const value = parseComponent(seg);
+    if (value === null || value < 0) return null;
+    components.push(value);
+  }
+
+  const n = components.length;
+  const octets = [0, 0, 0, 0];
+  for (let i = 0; i < n - 1; i++) {
+    const c = components[i] as number;
+    if (c > 255) return null;
+    octets[i] = c;
+  }
+  const last = components[n - 1] as number;
+  const maxLast = 2 ** (8 * (4 - (n - 1)));
+  if (last >= maxLast) return null;
+  let rest = last;
+  for (let i = 3; i >= n - 1; i--) {
+    octets[i] = rest & 0xff;
+    rest = Math.floor(rest / 256);
+  }
+  return octets.join(".");
+}
+
+function isPrivateIp(addr: string): boolean {
+  const ip = addr.replace(/^\[/, "").replace(/\]$/, "");
+  const lowerIp = ip.toLowerCase();
+
+  if (lowerIp === "::" || lowerIp === "::1") return true;
+  if (lowerIp.startsWith("fe80:")) return true;
+  if (lowerIp.startsWith("fc") || lowerIp.startsWith("fd")) return true;
+
+  const mapped = lowerIp.match(/^::ffff:(.+)$/);
+  if (mapped) {
+    const tail = mapped[1] as string;
+    if (tail.includes(".")) {
+      return isPrivateIp(tail);
+    }
+    const hexGroups = tail.split(":");
+    if (hexGroups.length === 2 && hexGroups.every((g) => /^[0-9a-f]{1,4}$/.test(g))) {
+      const hi = Number.parseInt(hexGroups[0] as string, 16);
+      const lo = Number.parseInt(hexGroups[1] as string, 16);
+      return isPrivateIp([(hi >> 8) & 0xff, hi & 0xff, (lo >> 8) & 0xff, lo & 0xff].join("."));
+    }
+    return false;
+  }
+
+  const normalized = normalizeIpv4(ip);
+  if (normalized === null) return false;
+  const parts = normalized.split(".").map((p) => Number.parseInt(p, 10));
+  if (parts.length !== 4 || parts.some((nn) => Number.isNaN(nn) || nn < 0 || nn > 255)) {
+    return false;
+  }
+  const [a, b] = parts as [number, number, number, number];
+
+  if (a === 127) return true; // 127.0.0.0/8 loopback
+  if (a === 10) return true; // 10.0.0.0/8 RFC1918
+  if (a === 169 && b === 254) return true; // 169.254.0.0/16 link-local + cloud metadata
+  if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12 RFC1918
+  if (a === 192 && b === 168) return true; // 192.168.0.0/16 RFC1918
+  if (a === 100 && b >= 64 && b <= 127) return true; // 100.64.0.0/10 CGNAT (RFC6598)
+  if (a === 192 && b === 0 && parts[2] === 0) return true; // 192.0.0.0/24 (RFC6890)
+  if (a === 198 && (b === 18 || b === 19)) return true; // 198.18.0.0/15 (RFC2544)
+  if (a === 0) return true; // 0.0.0.0/8
+  return false;
+}
+
+export type DnsLookupFn = (
+  hostname: string,
+) => Promise<{ readonly address: string; readonly family: number }>;
+
+let dnsLookupFn: DnsLookupFn = nodeDnsLookup;
+
+/** Test hook: override DNS resolution. Pass `undefined` to restore the default. */
+export function _setDnsLookup(fn: DnsLookupFn | undefined): void {
+  dnsLookupFn = fn ?? nodeDnsLookup;
+}
+
+/**
+ * Reject a host that is — or resolves to — a private/loopback/link-local
+ * address, even when its origin is on the allow-list (defense in depth: an
+ * allow-list supplied by an untrusted marketplace/template spec must not be
+ * able to point the crawler at `localhost`/`169.254.169.254`/RFC1918).
+ *
+ * Residual DNS-rebinding TOCTOU: the default `globalThis.fetch` re-resolves at
+ * connect time, so a hostile resolver could answer public here and private at
+ * the socket. Fully closing that needs connection pinning; this guard blocks
+ * the direct vectors (IP literals, loopback names, and names that resolve to a
+ * private range at check time), matching the tool-fetch/tool-navigate posture.
+ */
+async function assertNotSsrf(host: string): Promise<void> {
+  const lower = host.toLowerCase();
+  if (lower === "localhost" || lower.endsWith(".localhost")) {
+    throw new CrawlerError(`SSRF: host "${host}" is loopback`);
+  }
+  if (lower.endsWith(".local")) {
+    throw new CrawlerError(`SSRF: mDNS host "${host}" is not allowed`);
+  }
+  const unbracketed = lower.replace(/^\[/, "").replace(/\]$/, "");
+  if (isPrivateIp(unbracketed)) {
+    throw new CrawlerError(`SSRF: host "${host}" is a private/loopback IP`);
+  }
+  const isIpLiteral = normalizeIpv4(unbracketed) !== null || unbracketed.includes(":");
+  if (isIpLiteral) return;
+  let resolved: { readonly address: string };
+  try {
+    resolved = await dnsLookupFn(unbracketed);
+  } catch (err) {
+    throw new CrawlerError(`SSRF: cannot resolve "${host}": ${(err as Error).message}`);
+  }
+  if (isPrivateIp(resolved.address)) {
+    throw new CrawlerError(`SSRF: host "${host}" resolves to private IP ${resolved.address}`);
+  }
+}
 
 export function createCrawler(opts: {
   readonly tracker: CitationTracker;
@@ -133,6 +282,7 @@ export function createCrawler(opts: {
         `origin "${origin}" is not on the crawler allow-list (got ${allowedOrigins.size} allowed)`,
       );
     }
+    await assertNotSsrf(host);
     await rateLimitGate(host);
 
     const ac = new AbortController();
@@ -156,6 +306,7 @@ export function createCrawler(opts: {
               `redirect target "${next.origin}" is not on the crawler allow-list`,
             );
           }
+          await assertNotSsrf(next.host);
           if (hop === maxRedirects) {
             throw new CrawlerError(`exceeded ${maxRedirects} redirects starting from ${url}`);
           }
@@ -181,10 +332,45 @@ export function createCrawler(opts: {
     const parsed = new URL(url);
     const path = decodeURIComponent(parsed.pathname);
     const abs = resolvePath(path);
-    const rooted = allowedFileRoots.some((root) => abs === root || abs.startsWith(`${root}/`));
+    // 1) Lexical containment — rejects `..` and out-of-root absolute paths.
+    const rooted = allowedFileRoots.some((root) => abs === root || abs.startsWith(`${root}${sep}`));
     if (!rooted) {
       throw new CrawlerError(
         `file path "${abs}" is outside the configured crawler roots (got ${allowedFileRoots.length} roots)`,
+      );
+    }
+    // 2) Symlink-aware containment (CWE-59). The lexical check is fooled by an
+    //    in-root symlink whose real target lies outside a root, so re-check the
+    //    REAL path. The leaf may not exist yet (read error comes after, so
+    //    escaping paths never leak existence), so resolve the deepest existing
+    //    ancestor and re-append the missing tail.
+    let probe = abs;
+    const tail: string[] = [];
+    while (!existsSync(probe)) {
+      tail.unshift(basename(probe));
+      const parent = dirname(probe);
+      if (parent === probe) break; // reached filesystem root
+      probe = parent;
+    }
+    let realAbs: string;
+    try {
+      const probeReal = realpathSync(probe);
+      realAbs = tail.length > 0 ? joinPath(probeReal, ...tail) : probeReal;
+    } catch (err) {
+      throw new CrawlerError(`failed to resolve real path of ${abs}`, err);
+    }
+    const realRooted = allowedFileRoots.some((root) => {
+      let rootReal: string;
+      try {
+        rootReal = realpathSync(root);
+      } catch {
+        return false;
+      }
+      return realAbs === rootReal || realAbs.startsWith(`${rootReal}${sep}`);
+    });
+    if (!realRooted) {
+      throw new CrawlerError(
+        `file path "${abs}" escapes the configured crawler roots via a symlink`,
       );
     }
     let body: string;
