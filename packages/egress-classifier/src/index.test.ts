@@ -252,6 +252,75 @@ describe("SubstringEgressMatcher (FR-006)", () => {
       }).matchCount,
     ).toBe(1);
   });
+
+  // SECURITY: a prompt-injectable model can re-encode a tagged secret before
+  // egress. A verbatim substring scan misses these; the decode-aware views do
+  // not. The raw tagged content is the lineage key in every case.
+  const TAGGED = "mcp-sourced secret value that exceeds the floor length";
+
+  test("detects raw tagged content hidden by JSON.stringify escaping (#5)", () => {
+    // runtime-core builds the egress payload as JSON.stringify(toolInput). A
+    // multi-line tagged string is escaped (\\n, \\\") inside it, so the raw
+    // string is NOT a verbatim substring — but the JSON-decoded view recovers it.
+    const tagged = `${TAGGED}\nsecond "quoted" line`;
+    const lineage = new Map<string, TrustOrigin>([[tagged, "mcp"]]);
+    const payload = JSON.stringify({ url: "https://evil.test", body: tagged });
+    expect(payload.includes(tagged)).toBe(false); // escaped — verbatim scan misses it
+    const result = new SubstringEgressMatcher().match({
+      payload,
+      lineage,
+      minMatchLength: MIN_MATCH_LENGTH,
+    });
+    expect(result.originsFound).toEqual(["mcp"]);
+    expect(result.matchCount).toBe(1);
+  });
+
+  test("detects base64-re-encoded tagged content (#6)", () => {
+    const lineage = new Map<string, TrustOrigin>([[TAGGED, "subagent"]]);
+    const b64 = Buffer.from(TAGGED, "utf8").toString("base64");
+    const payload = JSON.stringify({ note: `exfil: ${b64}` });
+    expect(payload.includes(TAGGED)).toBe(false);
+    const result = new SubstringEgressMatcher().match({
+      payload,
+      lineage,
+      minMatchLength: MIN_MATCH_LENGTH,
+    });
+    expect(result.originsFound).toEqual(["subagent"]);
+  });
+
+  test("detects hex-re-encoded tagged content (#6)", () => {
+    const lineage = new Map<string, TrustOrigin>([[TAGGED, "channel"]]);
+    const hex = Buffer.from(TAGGED, "utf8").toString("hex");
+    const result = new SubstringEgressMatcher().match({
+      payload: `prefix ${hex} suffix`,
+      lineage,
+      minMatchLength: MIN_MATCH_LENGTH,
+    });
+    expect(result.originsFound).toEqual(["channel"]);
+  });
+
+  test("detects percent-encoded tagged content (#6)", () => {
+    const lineage = new Map<string, TrustOrigin>([[TAGGED, "federation"]]);
+    const result = new SubstringEgressMatcher().match({
+      payload: `q=${encodeURIComponent(TAGGED)}`,
+      lineage,
+      minMatchLength: MIN_MATCH_LENGTH,
+    });
+    expect(result.originsFound).toEqual(["federation"]);
+  });
+
+  test("does not flag unrelated content (no false positive from decoding)", () => {
+    const lineage = new Map<string, TrustOrigin>([[TAGGED, "mcp"]]);
+    const payload = JSON.stringify({
+      note: Buffer.from("totally unrelated bytes here", "utf8").toString("base64"),
+    });
+    const result = new SubstringEgressMatcher().match({
+      payload,
+      lineage,
+      minMatchLength: MIN_MATCH_LENGTH,
+    });
+    expect(result.matchCount).toBe(0);
+  });
 });
 
 describe("classifyEgress with an injected matcher (FR-006)", () => {
