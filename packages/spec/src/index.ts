@@ -107,8 +107,80 @@ const subAgentsBlock = z.record(safeName, subAgentDefinitionSchema).optional();
  * `unknown` and forwards it verbatim to the IR. The codegen layer emits
  * an init call (e.g. `registerFetchConfig({ ... })`) for tools whose
  * BUILTIN_TOOL_MAP entry declares an `initSymbol`.
+ *
+ * SECURITY (sandbox-override hardening): the code-execution config is the
+ * one exception to "opaque `unknown`". Its blob is compiled verbatim into
+ * `registerCodeExecutionConfig(...)` in the generated bundle, and the
+ * @crewhaus/sandbox boundary validates images/mounts against THIS same
+ * blob's allowlist (`allowedImages`, `mountWhitelist`). If a spec could set
+ * those — or `backend` (e.g. force `noop`, which is no isolation at all),
+ * `images`, or `mounts` — an untrusted marketplace/template spec would be
+ * supplying its own sandbox allowlist, making the controls self-defeating.
+ * The sandbox boundary must come only from trusted operator config (the CLI
+ * / `CREWHAUS_SANDBOX*` env vars), never from a spec file. So the
+ * code-execution config is constrained to a strict allowlist of non-security
+ * knobs; any sandbox-override key is rejected at parse time (defense in
+ * depth, mirroring `permissions.mode: bypass`).
+ *
+ * The code-execution config can arrive under any of the keys whose
+ * BUILTIN_TOOL_MAP entry maps to `registerCodeExecutionConfig` — the
+ * `codeExecution`/`code_execution` aliases AND the per-tool keys
+ * `python`/`javascript`/`shell` (target-cli `resolveTools` reads the
+ * per-tool key first, then the aliases). All of them must be constrained,
+ * or the guard is trivially bypassed by nesting the blob under `python`.
  */
-const toolConfigBlock = z.record(z.string().min(1), z.unknown()).optional();
+const SANDBOX_OVERRIDE_KEYS = [
+  "sandbox",
+  "backend",
+  "allowedImages",
+  "allowed_images",
+  "mountWhitelist",
+  "mount_whitelist",
+  "images",
+  "mounts",
+] as const;
+
+const CODE_EXECUTION_CONFIG_KEYS = [
+  "codeExecution",
+  "code_execution",
+  "python",
+  "javascript",
+  "shell",
+] as const;
+
+const codeExecutionConfigSchema = z
+  .object({
+    // Non-security knobs only. The sandbox boundary (backend, image
+    // allowlist, mount whitelist, per-language images, mounts) is owned by
+    // trusted operator config and is intentionally NOT settable from a spec.
+    defaultTimeoutMs: z.number().int().positive().optional(),
+    default_timeout_ms: z.number().int().positive().optional(),
+    warmPoolSize: z.number().int().nonnegative().optional(),
+    warm_pool_size: z.number().int().nonnegative().optional(),
+  })
+  .strict(
+    `code-execution config may only set non-security knobs (defaultTimeoutMs, warmPoolSize); sandbox-boundary keys (${SANDBOX_OVERRIDE_KEYS.join(", ")}) are owned by trusted operator config and rejected from specs`,
+  );
+
+const toolConfigBlock = z
+  .record(z.string().min(1), z.unknown())
+  .superRefine((cfg, ctx) => {
+    for (const key of CODE_EXECUTION_CONFIG_KEYS) {
+      const value = cfg[key];
+      if (value === undefined) continue;
+      const parsed = codeExecutionConfigSchema.safeParse(value);
+      if (!parsed.success) {
+        for (const issue of parsed.error.issues) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: [key, ...issue.path],
+            message: issue.message,
+          });
+        }
+      }
+    }
+  })
+  .optional();
 
 /**
  * Section 17 — optional override for the model used by

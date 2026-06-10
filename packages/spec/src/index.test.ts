@@ -160,6 +160,67 @@ tools:
   });
 });
 
+// SECURITY: the code-execution config blob is compiled verbatim into
+// `registerCodeExecutionConfig(...)` and the sandbox boundary validates
+// images/mounts against THIS same blob — so a spec must NOT be able to
+// supply its own sandbox allowlist/backend/mounts. Those keys are owned by
+// trusted operator config (CLI / CREWHAUS_SANDBOX* env), never a spec file.
+// The blob can arrive under codeExecution/code_execution OR the per-tool
+// keys python/javascript/shell (target-cli reads the per-tool key first),
+// so every one of those must be rejected.
+describe("tool_config code-execution sandbox-override hardening", () => {
+  const codeExecKeys = [
+    "codeExecution",
+    "code_execution",
+    "python",
+    "javascript",
+    "shell",
+  ] as const;
+  const overrideKeys = [
+    ["backend", "backend: noop"],
+    ["allowedImages", "allowedImages:\n      - evil/image:latest"],
+    ["allowed_images", "allowed_images:\n      - evil/image:latest"],
+    ["mountWhitelist", 'mountWhitelist:\n      - "/"'],
+    ["mount_whitelist", 'mount_whitelist:\n      - "/"'],
+    ["images", "images:\n      python: evil/image:latest"],
+    ["mounts", "mounts:\n      /etc: /host-etc"],
+    ["sandbox", "sandbox: noop"],
+  ] as const;
+
+  const specWith = (cfgKey: string, body: string) =>
+    `\nname: hello\ntarget: cli\nagent:\n  model: m\n  instructions: i\ntools:\n  - python\ntool_config:\n  ${cfgKey}:\n    ${body}\n`;
+
+  for (const cfgKey of codeExecKeys) {
+    for (const [label, body] of overrideKeys) {
+      test(`rejects sandbox-override key "${label}" under tool_config.${cfgKey}`, () => {
+        expect(() => parseSpec(specWith(cfgKey, body))).toThrow(SpecParseError);
+      });
+    }
+
+    test(`allows non-security knobs under tool_config.${cfgKey}`, () => {
+      const spec = parseSpec(specWith(cfgKey, "defaultTimeoutMs: 5000\n    warmPoolSize: 2"));
+      if (spec.target !== "cli") expect.unreachable();
+      expect(spec.tool_config?.[cfgKey]).toEqual({
+        defaultTimeoutMs: 5000,
+        warmPoolSize: 2,
+      });
+    });
+  }
+
+  test("does not constrain non-code-execution tool configs (fetch stays opaque)", () => {
+    const spec = parseSpec(
+      "\nname: hello\ntarget: cli\nagent:\n  model: m\n  instructions: i\ntools:\n  - fetch\ntool_config:\n  fetch:\n    allowedImages:\n      - anything\n    backend: whatever\n",
+    );
+    if (spec.target !== "cli") expect.unreachable();
+    // `fetch` is not a code-execution tool, so its config is forwarded
+    // verbatim — these keys are meaningless there and harmless.
+    expect(spec.tool_config?.["fetch"]).toEqual({
+      allowedImages: ["anything"],
+      backend: "whatever",
+    });
+  });
+});
+
 describe("Spec schema", () => {
   test("schema is exported as a runtime value (Zod)", () => {
     expect(typeof Spec.safeParse).toBe("function");
