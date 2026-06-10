@@ -181,8 +181,16 @@ export function evaluateWithReason(
           break;
         }
       } catch {
-        // A malformed rule pattern is silently skipped — implicit by
-        // catching the exception and continuing the inner-loop iteration.
+        // A malformed rule pattern fails CLOSED for safety rules: an
+        // uncompilable `alwaysDeny`/`alwaysAsk` still gates (treated as a
+        // match for its own decision), so an attacker-influenced broken guard
+        // — e.g. a deny pattern in an untrusted sub-agent definition — can't
+        // be silently dropped to fail open. A malformed `alwaysAllow` is still
+        // skipped: a broken grant simply isn't honored (no widening).
+        if (rule.type === "alwaysDeny" || rule.type === "alwaysAsk") {
+          baseDecision = ruleTypeToDecision(rule.type);
+          break;
+        }
       }
     }
     if (baseDecision !== undefined) break;

@@ -4,7 +4,9 @@ import {
   BUILTIN_DEFAULT_RULES,
   type PermissionMode,
   type RuleSet,
+  type ToolCallContext,
   emptyRuleSet,
+  evaluate,
 } from "@crewhaus/permission-engine";
 import { resolveChildPermissions } from "./index.js";
 
@@ -110,7 +112,7 @@ describe("resolveChildPermissions — modes", () => {
     expect(out.rules.builtin).toHaveLength(0);
   });
 
-  test("replace { allow, deny } builds yaml allow/deny + keeps builtin floor", () => {
+  test("replace { allow, deny } lifts the safety-floor guards above the replace allows", () => {
     const out = resolveChildPermissions(
       { mode: "default", rules: PARENT_RULES },
       {
@@ -119,13 +121,57 @@ describe("resolveChildPermissions — modes", () => {
       },
     );
     expect(out.rules.flag).toHaveLength(0);
-    expect(out.rules.settings).toHaveLength(0);
+    // Floor GUARD rules (alwaysAsk/alwaysDeny) are lifted into `settings`,
+    // which outranks `yaml` — so they gate before any replace allow.
+    expect(out.rules.settings.map((r) => r.pattern)).toEqual(["Bash(rm**)", "Bash(sudo**)"]);
+    expect(out.rules.settings.every((r) => r.type === "alwaysAsk")).toBe(true);
+    // Replace allow/deny live in yaml.
     const yamlRules = out.rules.yaml;
     expect(yamlRules).toHaveLength(3);
     expect(yamlRules.filter((r) => r.type === "alwaysAllow")).toHaveLength(2);
     expect(yamlRules.filter((r) => r.type === "alwaysDeny")).toHaveLength(1);
-    // Builtin floor preserved (security default).
-    expect(out.rules.builtin).toEqual(BUILTIN_DEFAULT_RULES);
+    // Permissive defaults stay in builtin as a narrow-only fallback.
+    expect(out.rules.builtin.map((r) => r.pattern)).toEqual(["Read", "Glob", "Grep"]);
+    expect(out.rules.builtin.every((r) => r.type === "alwaysAllow")).toBe(true);
+  });
+});
+
+// SECURITY (privilege escalation): in replace mode a child must not be able to
+// grant itself a permission the builtin safety floor gates. Evaluate the
+// resolved rules end-to-end through the engine to prove the floor wins.
+describe("resolveChildPermissions — replace floor is authoritative", () => {
+  // Bare `Bash` is the blanket grant — it matches EVERY Bash command
+  // (including `rm -rf /`), so without the fix the child would run any shell
+  // with no prompt. The floor must claw `rm`/`sudo` back to "ask".
+  const blanketBash: SubAgentDefinition = {
+    ...DEF_BASE,
+    tools: ["Bash"],
+    permissions: { allow: ["Bash"], deny: [] },
+  };
+  const bashRm: ToolCallContext = {
+    toolName: "Bash",
+    input: { command: "rm -rf /" },
+    readOnly: false,
+    destructive: true,
+  };
+  const bashLs: ToolCallContext = {
+    toolName: "Bash",
+    input: { command: "ls" },
+    readOnly: false,
+    destructive: true,
+  };
+
+  test("a blanket replace allow:[Bash] cannot override the Bash(rm**) floor", () => {
+    const out = resolveChildPermissions({ mode: "default", rules: PARENT_RULES }, blanketBash);
+    // The bare `Bash` allow DOES match `rm -rf /`. Before the fix that yaml
+    // allow outranked the builtin floor → "allow" (escalation); now the floor
+    // lives in `settings`, which outranks yaml → "ask".
+    expect(evaluate(bashRm, out.mode, out.rules)).toBe("ask");
+  });
+
+  test("the replace allow still grants non-floor Bash commands", () => {
+    const out = resolveChildPermissions({ mode: "default", rules: PARENT_RULES }, blanketBash);
+    expect(evaluate(bashLs, out.mode, out.rules)).toBe("allow");
   });
 });
 

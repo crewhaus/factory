@@ -95,13 +95,26 @@ describe("evaluate — rule types", () => {
     expect(evaluate(bashLs, "default", rs)).toBe("ask");
   });
 
-  test("a malformed pattern is skipped (engine doesn't crash)", () => {
+  test("a malformed alwaysAllow is skipped (a broken grant is not honored)", () => {
     const rs: RuleSet = {
       ...emptyRuleSet,
       yaml: [rule("alwaysAllow", "Bash(unclosed"), rule("alwaysAllow", "Read")],
     };
-    // First rule errors → skipped; second matches → allow.
+    // First rule errors → skipped (fail closed: no grant); second matches → allow.
     expect(evaluate(readCall, "default", rs)).toBe("allow");
+  });
+
+  // SECURITY: a malformed guard rule must NOT silently fail open. An attacker
+  // who can influence a sub-agent definition could otherwise ship a deny whose
+  // pattern fails to compile and watch it get dropped.
+  test("a malformed alwaysDeny fails CLOSED (gates instead of being dropped)", () => {
+    const rs: RuleSet = { ...emptyRuleSet, yaml: [rule("alwaysDeny", "Bash(unclosed")] };
+    expect(evaluate(bashRm, "default", rs)).toBe("deny");
+  });
+
+  test("a malformed alwaysAsk fails CLOSED (gates instead of being dropped)", () => {
+    const rs: RuleSet = { ...emptyRuleSet, yaml: [rule("alwaysAsk", "Bash(unclosed")] };
+    expect(evaluate(bashLs, "default", rs)).toBe("ask");
   });
 });
 
