@@ -8,10 +8,15 @@
  * calls `node:dns/promises`'s `lookup` — never runs there. We exercise it here
  * with the default resolver restored, but with `node:dns/promises` mocked so NO
  * real DNS query (and no socket) is issued. `mock.module` mutates the
- * process-global module registry, so this lives in its own file to keep the
- * stub from leaking into `index.test.ts`.
+ * process-global module registry and Bun does NOT reset it at the file
+ * boundary (files share one process, in nondeterministic order), so the
+ * `afterAll` below reinstalls the real module to keep the stub from leaking
+ * into `index.test.ts` when this file runs first.
  */
-import { afterEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, mock, test } from "bun:test";
+
+// Captured BEFORE the mock below so afterAll can reinstall the real module.
+const realDnsPromises = require("node:dns/promises") as typeof import("node:dns/promises");
 
 // Record the hosts the default resolver asks about, and answer deterministically
 // — public for the rebind-allow case, private for the rebind-block case.
@@ -24,6 +29,10 @@ mock.module("node:dns/promises", () => ({
     return { address: nextAddress, family: 4 };
   },
 }));
+
+afterAll(() => {
+  mock.module("node:dns/promises", () => realDnsPromises);
+});
 
 // Import AFTER the stub is registered so `import { lookup } from
 // "node:dns/promises"` inside index.ts binds to the mock.

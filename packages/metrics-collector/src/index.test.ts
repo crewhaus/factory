@@ -8,13 +8,20 @@ import { afterEach, describe, expect, mock, test } from "bun:test";
 import { TraceEventBus } from "@crewhaus/trace-event-bus";
 import { attachIfEnvSet, attachMetricsCollector } from "./index";
 
+// Captured before any mock.module call so the afterEach below can reinstall
+// the real module. (`mock.restore()` does NOT undo `mock.module`, and Bun
+// shares one module registry across all test files, in nondeterministic
+// order — only re-mocking the real module prevents cross-file leaks.)
+const realFsPromises = require("node:fs/promises") as typeof import("node:fs/promises");
+
 /** A bus with an empty env so no ambient traceparent leaks in. */
 const makeBus = () => new TraceEventBus({ runId: "run_a", sessionId: "sess_1", env: {} });
 
 describe("attachMetricsCollector — textfile sink", () => {
   afterEach(() => {
-    // Remove the node:fs/promises mock so it never leaks into other files.
-    mock.restore();
+    // Reinstall the real node:fs/promises so the per-test writeFile stub
+    // never leaks into later tests or sibling files.
+    mock.module("node:fs/promises", () => realFsPromises);
   });
 
   test("textfile (default path) wires a sink whose flush writes the exposition", async () => {

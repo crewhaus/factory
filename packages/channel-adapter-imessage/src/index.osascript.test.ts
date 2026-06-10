@@ -6,16 +6,21 @@
  * default. To keep the test deterministic (no real process, no real iMessage
  * send) we replace `node:child_process` with a fake `spawn` via `mock.module`.
  *
- * This lives in its own file so the module mock is isolated from the rest of
- * the suite — Bun resets module mocks at the file boundary, and nothing else
- * here imports `node:child_process`.
+ * This lives in its own file so only these tests see the mock — but Bun does
+ * NOT reset module mocks at the file boundary: `bun test` runs every file in
+ * one process, file order is nondeterministic, and a `mock.module` persists
+ * until overwritten. The `afterAll` below re-mocks the real module so the
+ * fake `spawn` cannot leak into files that happen to run later.
  */
-import { describe, expect, mock, test } from "bun:test";
+import { afterAll, describe, expect, mock, test } from "bun:test";
 import { EventEmitter } from "node:events";
 import { rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 import { buildFixtureChatDb } from "./fixtures/build-chat-db";
+
+// Captured BEFORE the mock below so afterAll can reinstall the real module.
+const realChildProcess = require("node:child_process") as typeof import("node:child_process");
 
 /** Records the scripts handed to the fake `osascript` across the file. */
 const writtenScripts: string[] = [];
@@ -47,6 +52,14 @@ mock.module("node:child_process", () => ({
     return child;
   },
 }));
+
+afterAll(() => {
+  // Bun has no mock.module restore API; re-mocking with the real exports is
+  // the documented way to undo a module mock. Without this, the fake `spawn`
+  // (which asserts it is called as `osascript`) stays registered for every
+  // test file that runs after this one.
+  mock.module("node:child_process", () => realChildProcess);
+});
 
 // Import AFTER registering the mock so the dynamic import inside
 // defaultOsascript resolves to the fake.

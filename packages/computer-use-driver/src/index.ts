@@ -68,6 +68,13 @@ export type CreateDriverOptions = {
   readonly viewport?: { width: number; height: number };
   /** Test injection: a pre-built Driver instance the factory returns verbatim. */
   readonly _injected?: Driver;
+  /**
+   * Test injection: replaces the chromium backend's dynamic
+   * `import("playwright")`. Lets the import-failure path be exercised without
+   * `mock.module` — a throwing module mock cannot be registered once
+   * playwright has been imported anywhere in the test process. chromium-only.
+   */
+  readonly _importPlaywright?: () => Promise<unknown>;
 };
 
 export function createDriver(opts: CreateDriverOptions): Driver {
@@ -113,7 +120,10 @@ function createChromiumDriver(opts: CreateDriverOptions): Driver {
       // The import is dynamic via a string indirection so `tsc` doesn't fail
       // when playwright (an optional peer dep) isn't installed in CI.
       const playwrightModule = "playwright";
-      const mod = await import(playwrightModule);
+      const mod =
+        opts._importPlaywright !== undefined
+          ? await opts._importPlaywright()
+          : await import(playwrightModule);
       return mod as unknown as { chromium: { launch: (...args: unknown[]) => unknown } };
     } catch (err) {
       throw new ComputerUseDriverError(

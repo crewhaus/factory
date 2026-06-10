@@ -8,12 +8,21 @@
  *
  * The fake child fires its stdout/stderr/close|error listeners on a
  * microtask (queueMicrotask), which is deterministic and needs no fake clock.
- * `mock.restore()` in afterEach tears the module mock down so it can't leak
- * into the sibling suite (which uses the real node:crypto / node:fs).
+ * NOTE: `mock.restore()` does NOT undo `mock.module`, and Bun shares one
+ * module registry across all test files (nondeterministic order) — the
+ * `afterAll` below reinstalls the real `node:child_process` so the per-test
+ * spawn fakes can't leak into the sibling suite.
  */
-import { afterEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, mock, test } from "bun:test";
 import { EventEmitter } from "node:events";
 import { SingleBinaryError, buildBinary } from "./index";
+
+// Captured before any mock.module call so afterAll can reinstall the real module.
+const realChildProcess = require("node:child_process") as typeof import("node:child_process");
+
+afterAll(() => {
+  mock.module("node:child_process", () => realChildProcess);
+});
 
 type FakeOpts = {
   readonly stdout?: string;

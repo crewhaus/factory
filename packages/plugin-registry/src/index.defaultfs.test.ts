@@ -9,11 +9,16 @@
  * through the genuine default implementations — exercised against the fake, so
  * no disk, network, timers, or real clock are touched, and no handle leaks.
  *
- * `mock.module` mutates the shared module registry, so this lives in its own
- * file: Bun gives each test file a fresh module graph, keeping the fs stub from
- * leaking into `index.test.ts`.
+ * `mock.module` mutates the shared module registry, and Bun does NOT give
+ * each test file a fresh module graph — all files in a `bun test` run share
+ * one process, in nondeterministic order. The stub therefore lives in its own
+ * file AND is torn down in `afterAll` by re-mocking the real `node:fs`, so it
+ * cannot leak into `index.test.ts` when this file runs first.
  */
-import { afterEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, mock, test } from "bun:test";
+
+// Captured BEFORE the mock below so afterAll can reinstall the real module.
+const realFs = require("node:fs") as typeof import("node:fs");
 
 type FsCall = { fn: string; args: unknown[] };
 const fsCalls: FsCall[] = [];
@@ -41,6 +46,10 @@ mock.module("node:fs", () => ({
     return f.contents;
   },
 }));
+
+afterAll(() => {
+  mock.module("node:fs", () => realFs);
+});
 
 // Import the unit under test AFTER the fs stub is registered.
 const { createPluginRegistry } = await import("./index");

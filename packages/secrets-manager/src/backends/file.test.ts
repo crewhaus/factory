@@ -4,10 +4,15 @@
  * `node:fs` is fully mocked with an in-memory store so no real disk I/O
  * occurs (no tmp dirs, no leaked handles, deterministic). `crypto` is the
  * real WebCrypto for the auto-generate path, but we only assert its shape
- * (64 hex chars), so it stays deterministic in intent. Every mock.module
- * is torn down in afterEach via mock.restore().
+ * (64 hex chars), so it stays deterministic in intent. `mock.restore()` does
+ * NOT undo `mock.module`, and Bun shares one module registry across all test
+ * files (nondeterministic order) — so the `afterAll` below reinstalls the
+ * real `node:fs`, keeping the in-memory fake from leaking into sibling files.
  */
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+
+// Captured BEFORE the mock below so afterAll can reinstall the real module.
+const realFs = require("node:fs") as typeof import("node:fs");
 
 /** In-memory filesystem state shared with the node:fs mock. */
 type FsState = {
@@ -76,9 +81,13 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  // Belt-and-suspenders: reset shared state. The module mock itself is
-  // process-global in bun; restoring it here keeps other files clean.
+  // Reset the in-memory store so each test starts from a clean slate.
   fsState = freshState();
+});
+
+afterAll(() => {
+  // Reinstall the real module so the in-memory fake cannot outlive this file.
+  mock.module("node:fs", () => realFs);
 });
 
 describe("file backend — get()", () => {

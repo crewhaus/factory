@@ -81,8 +81,11 @@ function installPlaywright(rec: Rec, overrides?: { viewportSize?: () => unknown 
 }
 
 afterEach(() => {
-  // Restore a benign working module so a deliberately-throwing mock from one
-  // test cannot bleed into unrelated tests / files run later in the process.
+  // Leave a benign working module registered so per-test fakes cannot bleed
+  // into unrelated tests / files run later in the process. We deliberately do
+  // NOT restore the real playwright: it is an optional peer dep that may be
+  // absent, nothing else in this package's test process imports it, and a
+  // working fake guarantees no test can ever launch a real browser.
   mock.module("playwright", () => fakePlaywright([]));
 });
 
@@ -122,11 +125,11 @@ describe("chromium driver — connect / lifecycle", () => {
     expect(rec.length).toBe(afterFirst);
   });
 
-  // The playwright-import-failure path (loadPlaywright catch) is covered in a
-  // dedicated file — see chromium-import-fail.test.ts. Bun's mock.module is
-  // process-global and evaluates a throwing factory eagerly once the module
-  // has been imported (even as a fake), so the failure case must run in a
-  // file that never successfully imports "playwright".
+  // The playwright-import-failure path (loadPlaywright catch) is covered in
+  // chromium-import-fail.test.ts via the `_importPlaywright` injection seam.
+  // It cannot be tested with mock.module here: bun evaluates a throwing
+  // factory eagerly once the module has been imported (even as a fake, as
+  // these tests do), so registration itself would blow up.
 });
 
 describe("chromium driver — operations after connect", () => {

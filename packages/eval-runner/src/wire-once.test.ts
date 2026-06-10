@@ -43,15 +43,25 @@ import type { SkillRef } from "@crewhaus/skills-registry";
 import type { SlashCommand } from "@crewhaus/slash-commands";
 
 // ── Capture real modules up front (for restoration + non-recursing delegation).
-const realPermissionEngine = await import("@crewhaus/permission-engine");
+// Each capture is a plain-object SNAPSHOT (`{ ...ns }`), not the namespace
+// itself: an ESM namespace is a live view, so once mock.module patches a
+// module the namespace's properties resolve to the stubs — restoring from it
+// in afterAll would silently reinstall the stubs.
+const realPermissionEngine = { ...(await import("@crewhaus/permission-engine")) };
 const realParsePermissionsConfig = realPermissionEngine.parsePermissionsConfig;
-const realMcpHost = await import("@crewhaus/mcp-host");
-const realToolMcp = await import("@crewhaus/tool-mcp");
-const realHooks = await import("@crewhaus/hooks-engine");
-const realSkills = await import("@crewhaus/skills-registry");
-const realSlash = await import("@crewhaus/slash-commands");
-const realTaskTool = await import("@crewhaus/tool-task");
-const realSpawner = await import("@crewhaus/sub-agent-spawner");
+const realMcpHost = { ...(await import("@crewhaus/mcp-host")) };
+const realToolMcp = { ...(await import("@crewhaus/tool-mcp")) };
+const realHooks = { ...(await import("@crewhaus/hooks-engine")) };
+const realSkills = { ...(await import("@crewhaus/skills-registry")) };
+const realSlash = { ...(await import("@crewhaus/slash-commands")) };
+const realTaskTool = { ...(await import("@crewhaus/tool-task")) };
+const realSpawner = { ...(await import("@crewhaus/sub-agent-spawner")) };
+const realToolFs = { ...(await import("@crewhaus/tool-fs")) };
+const realToolBash = { ...(await import("@crewhaus/tool-bash")) };
+const realToolTodo = { ...(await import("@crewhaus/tool-todo")) };
+const realToolWeb = { ...(await import("@crewhaus/tool-web")) };
+const realToolImage = { ...(await import("@crewhaus/tool-image")) };
+const realToolFetch = { ...(await import("@crewhaus/tool-fetch")) };
 
 // ── Recording channels the stubs write to so tests can assert behaviour.
 const calls = {
@@ -250,6 +260,12 @@ afterAll(() => {
   mock.module("@crewhaus/slash-commands", () => realSlash);
   mock.module("@crewhaus/tool-task", () => realTaskTool);
   mock.module("@crewhaus/sub-agent-spawner", () => realSpawner);
+  mock.module("@crewhaus/tool-fs", () => realToolFs);
+  mock.module("@crewhaus/tool-bash", () => realToolBash);
+  mock.module("@crewhaus/tool-todo", () => realToolTodo);
+  mock.module("@crewhaus/tool-web", () => realToolWeb);
+  mock.module("@crewhaus/tool-image", () => realToolImage);
+  mock.module("@crewhaus/tool-fetch", () => realToolFetch);
 });
 
 describe("wireRunOnce — tools", () => {

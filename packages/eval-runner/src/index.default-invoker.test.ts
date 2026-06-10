@@ -24,9 +24,12 @@ const chatLoopCalls: ChatLoopCall[] = [];
 const wireCalls: Array<{ cwd?: string }> = [];
 
 // Capture real modules so `afterAll` can restore them — `mock.module` is
-// process-global and does not auto-restore across test files.
-const realWireOnce = await import("./wire-once");
-const realRuntimeCore = await import("@crewhaus/runtime-core");
+// process-global and does not auto-restore across test files. Each capture is
+// a plain-object SNAPSHOT (`{ ...ns }`): an ESM namespace is a live view that
+// resolves to the stubs once mock.module patches the module, so restoring
+// from the namespace itself would silently reinstall the stubs.
+const realWireOnce = { ...(await import("./wire-once")) };
+const realRuntimeCore = { ...(await import("@crewhaus/runtime-core")) };
 
 // Toggle whether the wired deps include sub-agents (drives the optional
 // subAgents/spawnSubAgent spread in defaultInvoker).
