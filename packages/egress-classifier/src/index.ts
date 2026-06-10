@@ -175,11 +175,127 @@ export interface EgressMatcher {
 }
 
 /**
- * The default, behavior-preserving matcher: the exact substring scan that
- * was inline in `classifyEgress` before FR-006. A tagged entry counts when
- * it is at least `minMatchLength` chars and appears verbatim in the
- * payload. `originsFound` is deduped; `matchCount` counts distinct matched
- * tagged strings.
+ * Decode-aware normalization so a tagged secret that was *re-encoded* before
+ * egress is still detected. A pure verbatim `payload.includes(tagged)` scan is
+ * trivially bypassed by a prompt-injectable model two ways:
+ *
+ *   1. JSON-escaping — runtime-core builds the egress payload as
+ *      `JSON.stringify(toolInput)`, which escapes the newlines/quotes/
+ *      backslashes that tagged MCP/sub-agent/channel content almost always
+ *      contains, so the raw tagged string is no longer a substring.
+ *   2. base64/hex/percent re-encoding — the model emits `base64(secret)`
+ *      instead of the plaintext.
+ *
+ * `buildScanViews` returns the payload plus normalized views (JSON-decoded
+ * string values, and base64/hex/percent-decoded blobs found in either form),
+ * and the matcher tests each tagged entry against ALL of them. The decoders
+ * mirror `@crewhaus/prompt-injection-detector` (replicated, not imported, to
+ * keep egress-classifier dependency-free; keep the copies in sync) and are
+ * bounded (match count + recursion depth) so this is not itself a DoS vector.
+ */
+function isMostlyPrintable(s: string): boolean {
+  if (s.length === 0) return false;
+  let printable = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c === 9 || c === 10 || c === 13 || (c >= 32 && c < 127)) printable++;
+  }
+  return printable / s.length > 0.85;
+}
+
+function tryDecodeBase64(blob: string): string | undefined {
+  if (blob.length < 16 || blob.length % 4 === 1) return undefined;
+  try {
+    const decoded = Buffer.from(blob, "base64").toString("utf8");
+    return isMostlyPrintable(decoded) ? decoded : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function tryDecodeHex(blob: string): string | undefined {
+  if (blob.length < 16 || blob.length % 2 !== 0) return undefined;
+  try {
+    const decoded = Buffer.from(blob, "hex").toString("utf8");
+    return isMostlyPrintable(decoded) ? decoded : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function tryDecodePercent(text: string): string | undefined {
+  try {
+    const decoded = decodeURIComponent(text);
+    return decoded !== text ? decoded : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Recursively decode base64/hex/percent blobs. Bounded for DoS-safety. */
+function decodedVariants(text: string, depth = 2): string[] {
+  if (depth <= 0 || text.length === 0) return [];
+  const out: string[] = [];
+  const push = (s: string | undefined): void => {
+    if (s !== undefined && s.length > 0) out.push(s, ...decodedVariants(s, depth - 1));
+  };
+  for (const m of [...text.matchAll(/[A-Za-z0-9+/]{16,}={0,2}/g)].slice(0, 8)) {
+    push(tryDecodeBase64(m[0]));
+  }
+  for (const m of [...text.matchAll(/(?:[0-9A-Fa-f]{2}){8,}/g)].slice(0, 8)) {
+    push(tryDecodeHex(m[0]));
+  }
+  if (/%[0-9A-Fa-f]{2}/.test(text)) push(tryDecodePercent(text));
+  return out.slice(0, 16);
+}
+
+/** Collect every string leaf of a parsed JSON value (bounded by JSON size). */
+function collectJsonStrings(value: unknown, out: string[]): void {
+  if (typeof value === "string") {
+    out.push(value);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const v of value) collectJsonStrings(v, out);
+    return;
+  }
+  if (value !== null && typeof value === "object") {
+    for (const v of Object.values(value)) collectJsonStrings(v, out);
+  }
+}
+
+/**
+ * The set of strings to scan a tagged entry against: the raw payload, the
+ * JSON-decoded string values (recovers content the `JSON.stringify` egress
+ * encoding escaped), and base64/hex/percent decodings of both.
+ */
+function buildScanViews(payload: string): string[] {
+  const views: string[] = [payload];
+  let jsonView: string | undefined;
+  try {
+    const parsed = JSON.parse(payload);
+    const strings: string[] = [];
+    collectJsonStrings(parsed, strings);
+    if (strings.length > 0) jsonView = strings.join("\n");
+  } catch {
+    // Not JSON — only the raw payload + its decodings are scanned.
+  }
+  if (jsonView !== undefined) views.push(jsonView);
+  const decodeSources = jsonView !== undefined ? [payload, jsonView] : [payload];
+  for (const src of decodeSources) {
+    for (const v of decodedVariants(src)) views.push(v);
+  }
+  return views;
+}
+
+/**
+ * The default egress matcher. A tagged entry counts when it is at least
+ * `minMatchLength` chars and appears in the payload OR in any of its
+ * normalized views (see `buildScanViews`) — so JSON-escaping and
+ * base64/hex/percent re-encoding can no longer slip a tagged secret past the
+ * sink-side fabric. The raw payload is always scanned first, so every match
+ * the old verbatim scan caught is still caught. `originsFound` is deduped;
+ * `matchCount` counts distinct matched tagged strings.
  */
 export class SubstringEgressMatcher implements EgressMatcher {
   // Assigned in the constructor rather than as an inline field initializer:
@@ -192,11 +308,12 @@ export class SubstringEgressMatcher implements EgressMatcher {
     this.name = "substring";
   }
   match(input: EgressMatchInput): EgressMatchResult {
+    const views = buildScanViews(input.payload);
     const seen = new Set<TrustOrigin>();
     let matchCount = 0;
     for (const [tagged, origin] of input.lineage.entries()) {
       if (tagged.length < input.minMatchLength) continue;
-      if (input.payload.includes(tagged)) {
+      if (views.some((view) => view.includes(tagged))) {
         seen.add(origin);
         matchCount += 1;
       }
