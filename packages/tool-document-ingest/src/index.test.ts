@@ -1,34 +1,48 @@
 /**
  * Tests for tool-document-ingest. Built-in handling for plain text /
- * structured / tabular formats, plus operator-registered parsers.
+ * structured / tabular formats, operator-registered parsers, and
+ * workspace path containment (mirrors tool-fs's traversal-rejection
+ * cases).
+ *
+ * The harness chdirs into a temp workspace because IngestDocument is
+ * sandboxed to `process.cwd()` — tests address files by workspace-
+ * relative path.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { CrewhausError } from "@crewhaus/errors";
 import {
   DocumentIngestError,
+  ToolPermissionError,
   clearDocumentParsers,
   ingestDocument,
   registerDocumentParser,
 } from "./index";
 
 let tmp: string;
+let originalCwd: string;
 
 beforeEach(() => {
-  tmp = mkdtempSync(join(tmpdir(), "doc-ingest-"));
+  originalCwd = process.cwd();
+  // realpath so absolute-path-inside-workspace assertions hold on macOS,
+  // where tmpdir() lives behind the /var → /private/var symlink.
+  tmp = realpathSync(mkdtempSync(join(tmpdir(), "doc-ingest-")));
+  process.chdir(tmp);
   clearDocumentParsers();
 });
 
 afterEach(() => {
+  process.chdir(originalCwd);
   rmSync(tmp, { recursive: true, force: true });
   clearDocumentParsers();
 });
 
+/** Write `content` into the temp workspace; returns the workspace-relative path. */
 function writeFile(name: string, content: string): string {
-  const path = join(tmp, name);
-  writeFileSync(path, content);
-  return path;
+  writeFileSync(join(tmp, name), content);
+  return name;
 }
 
 describe("ingestDocument — basics", () => {
@@ -39,7 +53,7 @@ describe("ingestDocument — basics", () => {
   });
 
   test("throws when file does not exist", async () => {
-    await expect(ingestDocument.execute({ path: "/does/not/exist.txt" })).rejects.toThrow(
+    await expect(ingestDocument.execute({ path: "does/not/exist.txt" })).rejects.toThrow(
       DocumentIngestError,
     );
   });
@@ -58,6 +72,62 @@ describe("ingestDocument — basics", () => {
     const result = await ingestDocument.execute({ path });
     expect(result).toMatch(/"ext":"\.md"/);
     expect(result).toMatch(/"lines":3/);
+  });
+});
+
+describe("ingestDocument — path containment", () => {
+  test("ToolPermissionError is a CrewhausError with code 'tool'", () => {
+    const err = new ToolPermissionError("IngestDocument", "../../escape");
+    expect(err).toBeInstanceOf(CrewhausError);
+    expect(err.code).toBe("tool");
+    expect(err.toolName).toBe("IngestDocument");
+    expect(err.path).toBe("../../escape");
+    expect(err.message).toContain("escapes the workspace root");
+  });
+
+  test("rejects parent-directory traversal", async () => {
+    await expect(ingestDocument.execute({ path: "../../../etc/passwd" })).rejects.toBeInstanceOf(
+      ToolPermissionError,
+    );
+  });
+
+  test("rejects absolute path outside workspace", async () => {
+    await expect(ingestDocument.execute({ path: "/etc/passwd" })).rejects.toBeInstanceOf(
+      ToolPermissionError,
+    );
+  });
+
+  test("rejects subdir-then-traversal", async () => {
+    mkdirSync(join(tmp, "sub"));
+    await expect(ingestDocument.execute({ path: "sub/../../escape.txt" })).rejects.toBeInstanceOf(
+      ToolPermissionError,
+    );
+  });
+
+  test("rejects an in-root symlink whose target escapes the workspace", async () => {
+    const outside = mkdtempSync(join(tmpdir(), "doc-ingest-outside-"));
+    try {
+      writeFileSync(join(outside, "secret.txt"), "top secret");
+      symlinkSync(join(outside, "secret.txt"), join(tmp, "link.txt"));
+      await expect(ingestDocument.execute({ path: "link.txt" })).rejects.toBeInstanceOf(
+        ToolPermissionError,
+      );
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test("allows an absolute path inside the workspace", async () => {
+    writeFile("inside.txt", "in-root content");
+    const result = await ingestDocument.execute({ path: join(tmp, "inside.txt") });
+    expect(result).toContain("in-root content");
+  });
+
+  test("allows an in-root symlink to an in-root file (no over-blocking)", async () => {
+    writeFile("real.txt", "linked content");
+    symlinkSync(join(tmp, "real.txt"), join(tmp, "good-link.txt"));
+    const result = await ingestDocument.execute({ path: "good-link.txt" });
+    expect(result).toContain("linked content");
   });
 });
 
