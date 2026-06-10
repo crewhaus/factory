@@ -1200,12 +1200,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     // notice; on suspicious it's kept but the trace event records a
     // warning. Tools opt out by setting `classifyOutput: false` (only the
     // in-process Task wrapper does today).
-    const finalPreview = await applyInjectionClassification(
-      tool,
-      tu,
-      stored.previewContent,
-      raw.isError,
-    );
+    const finalPreview = await applyInjectionClassification(tool, tu, stored.previewContent);
     // Pillar 3 sink-side fabric — tag the (post-classification) tool result
     // into run-context's dataLineage so the egress classifier can detect
     // exfiltration of this content on a subsequent external-tool call.
@@ -1218,7 +1213,11 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     // precise tag now fires unconditionally. This coarse "tool" tag of the
     // (possibly truncated) preview still fires for them as a redundant
     // backstop so the content has lineage even if the precise tag is missed.
-    if (tool.classifyOutput !== false && !raw.isError) {
+    // ERROR results are tagged too: an `is_error` tool result is just as
+    // attacker-controllable and just as exfiltratable as a successful one, so
+    // it must carry lineage (the `!raw.isError` skip here used to let the
+    // egress fabric lose track of error-sourced content entirely).
+    if (tool.classifyOutput !== false) {
       const taggable =
         typeof finalPreview === "string"
           ? finalPreview
@@ -1254,10 +1253,11 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     tool: RegisteredTool,
     tu: TsmToolUseBlock,
     previewContent: string | ReadonlyArray<Anthropic.TextBlockParam | Anthropic.ImageBlockParam>,
-    isError: boolean,
   ): Promise<string | ReadonlyArray<Anthropic.TextBlockParam | Anthropic.ImageBlockParam>> {
+    // Runs on ALL tool results, including `is_error` ones: an error preview is
+    // just as prompt-injectable as a successful one (e.g. an MCP error string),
+    // so it must be scrubbed before the model sees it.
     if (tool.classifyOutput === false) return previewContent;
-    if (isError) return previewContent;
     // Concatenate text-only content for classification. Image blocks are
     // never injection vectors at the byte level we examine here.
     const textForClassification =
