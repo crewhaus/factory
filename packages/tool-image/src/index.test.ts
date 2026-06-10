@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ToolPermissionError, detectMediaType, readImage } from "./index";
@@ -25,7 +25,9 @@ let tmp: string;
 let originalCwd: string;
 beforeEach(() => {
   originalCwd = process.cwd();
-  tmp = mkdtempSync(join(tmpdir(), "tool-image-"));
+  // realpath so symlink-containment assertions hold on macOS, where
+  // tmpdir() lives behind the /var → /private/var symlink.
+  tmp = realpathSync(mkdtempSync(join(tmpdir(), "tool-image-")));
   process.chdir(tmp);
 });
 afterEach(() => {
@@ -105,6 +107,44 @@ describe("T8 — path traversal", () => {
     await expect(readImage.execute({ path: "subdir/../../escape.png" })).rejects.toBeInstanceOf(
       ToolPermissionError,
     );
+  });
+});
+
+describe("T8 — symlink containment (#149)", () => {
+  test("rejects an in-root symlink to an out-of-root image", async () => {
+    const outside = mkdtempSync(join(tmpdir(), "tool-image-outside-"));
+    try {
+      writeFileSync(join(outside, "secret.png"), TINY_PNG);
+      symlinkSync(join(outside, "secret.png"), join(tmp, "link.png"));
+      await expect(readImage.execute({ path: "link.png" })).rejects.toBeInstanceOf(
+        ToolPermissionError,
+      );
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects an in-root symlinked directory whose target is outside", async () => {
+    const outside = mkdtempSync(join(tmpdir(), "tool-image-outside-"));
+    try {
+      writeFileSync(join(outside, "secret.png"), TINY_PNG);
+      symlinkSync(outside, join(tmp, "escape"));
+      await expect(readImage.execute({ path: "escape/secret.png" })).rejects.toBeInstanceOf(
+        ToolPermissionError,
+      );
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test("an in-root symlink to an in-root image still works (no over-blocking)", async () => {
+    writeFileSync(join(tmp, "real.png"), TINY_PNG);
+    symlinkSync(join(tmp, "real.png"), join(tmp, "good-link.png"));
+    const result = await readImage.execute({ path: "good-link.png" });
+    if (typeof result === "string") throw new Error("expected content array");
+    const block = result[0];
+    if (block?.type !== "image") throw new Error("expected image block");
+    expect(block.source.media_type).toBe("image/png");
   });
 });
 

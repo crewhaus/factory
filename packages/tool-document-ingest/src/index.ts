@@ -20,15 +20,18 @@
  * can register their own parser via `registerDocumentParser`; the
  * tool's contract stays the same.
  *
- * Security note: the path is a Bun.file() read of a user-controlled
- * string. The runtime should classify the OUTPUT via boundary-classifier
- * with origin "user" — files in the user's host are developer-trusted,
- * but the contents may contain anything (e.g. a prompt-injecting PDF).
- * Pillar 3 compliance is satisfied by the existing `tool` origin
- * classifier in runtime-core.
+ * Security note: the path is user-controlled (the model supplies it, and
+ * the model may be steered by injected content). Two defenses apply:
+ *   1. Containment — the path is resolved against `process.cwd()` and
+ *      rejected if it escapes the workspace root, lexically (`..` or
+ *      absolute escapes) or via an in-root symlink whose real target
+ *      lies outside (CWE-59). See `resolveSafe` below.
+ *   2. Output classification — the runtime classifies the OUTPUT via
+ *      boundary-classifier with the existing `tool` origin (Pillar 3);
+ *      file contents may contain anything (e.g. a prompt-injecting PDF).
  */
-import { existsSync, readFileSync, statSync } from "node:fs";
-import { basename, extname, resolve } from "node:path";
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { basename, dirname, extname, join, resolve, sep } from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
@@ -47,6 +50,61 @@ export class DocumentIngestError extends CrewhausError {
   constructor(message: string, cause?: unknown) {
     super("tool", message, cause);
   }
+}
+
+export class ToolPermissionError extends CrewhausError {
+  override readonly name = "ToolPermissionError";
+  readonly toolName: string;
+  readonly path: string;
+
+  constructor(toolName: string, attemptedPath: string) {
+    super(
+      "tool",
+      `tool "${toolName}" rejected path "${attemptedPath}": resolved location escapes the workspace root`,
+    );
+    this.toolName = toolName;
+    this.path = attemptedPath;
+  }
+}
+
+/**
+ * Resolve `rel` against the workspace root and reject anything that escapes.
+ * Mirrors `tool-fs`'s `resolveSafe` — duplicated here (like `tool-image`)
+ * rather than extracted to a shared package; keep the copies in sync.
+ */
+function resolveSafe(toolName: string, rel: string, root: string = process.cwd()): string {
+  const rootResolved = resolve(root);
+  const abs = resolve(rootResolved, rel);
+  // 1) Lexical containment — fast path; rejects `..` and absolute escapes.
+  //    The trailing `sep` avoids the `/root` vs `/root-sibling` pitfall.
+  if (abs !== rootResolved && !abs.startsWith(`${rootResolved}${sep}`)) {
+    throw new ToolPermissionError(toolName, rel);
+  }
+  // 2) Symlink-aware containment (CWE-59). The lexical check above is fooled
+  //    by an in-root symlink that points outside the workspace, so re-check
+  //    the REAL path. The leaf may not exist (the file-not-found error comes
+  //    after containment so escaping paths never leak existence info), so
+  //    resolve the deepest existing ancestor and re-append the missing tail.
+  //    Fails closed if realpath errors for any reason other than the walk.
+  try {
+    const rootReal = realpathSync(rootResolved);
+    let probe = abs;
+    const tail: string[] = [];
+    while (!existsSync(probe)) {
+      tail.unshift(basename(probe));
+      const parent = dirname(probe);
+      if (parent === probe) break; // reached the filesystem root
+      probe = parent;
+    }
+    const real = tail.length > 0 ? join(realpathSync(probe), ...tail) : realpathSync(probe);
+    if (real !== rootReal && !real.startsWith(`${rootReal}${sep}`)) {
+      throw new ToolPermissionError(toolName, rel);
+    }
+  } catch (err) {
+    if (err instanceof ToolPermissionError) throw err;
+    throw new ToolPermissionError(toolName, rel);
+  }
+  return abs;
 }
 
 const TEXT_EXTENSIONS = new Set([".txt", ".md", ".mdx", ".log", ".out", ".rst"]);
@@ -84,7 +142,10 @@ export function clearDocumentParsers(): void {
 }
 
 const inputSchema = z.object({
-  path: z.string().min(1).describe("Absolute or cwd-relative path to the file."),
+  path: z
+    .string()
+    .min(1)
+    .describe("Workspace-relative path to the file. Paths escaping the workspace are rejected."),
   maxBytes: z
     .number()
     .int()
@@ -99,12 +160,12 @@ const DEFAULT_MAX_BYTES = 1_000_000;
 export const ingestDocument: RegisteredTool = buildTool({
   name: "IngestDocument",
   description:
-    "Read a file from the host filesystem and return its content with structured metadata. Supports plain text, CSV/TSV, JSON, YAML out of the box; PDF/docx/xlsx need an operator-registered parser.",
+    "Read a file inside the workspace and return its content with structured metadata. Paths escaping the workspace root are rejected. Supports plain text, CSV/TSV, JSON, YAML out of the box; PDF/docx/xlsx need an operator-registered parser.",
   inputSchema,
   readOnly: true,
   destructive: false,
   execute: async (input) => {
-    const abs = resolve(input.path);
+    const abs = resolveSafe("IngestDocument", input.path);
     if (!existsSync(abs)) {
       throw new DocumentIngestError(`file not found: ${abs}`);
     }
