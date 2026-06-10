@@ -1,5 +1,5 @@
-import { describe, expect, spyOn, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type {
@@ -11,7 +11,14 @@ import type {
 } from "@crewhaus/citation-tracker";
 import { createCitationTracker } from "@crewhaus/citation-tracker";
 import type { CrawlResult, Crawler } from "./index.js";
-import { createCiteFactTool, createCrawler, createSourceTool } from "./index.js";
+import { _setDnsLookup, createCiteFactTool, createCrawler, createSourceTool } from "./index.js";
+
+// HTTP fetches now run an SSRF guard that resolves the host before egress.
+// Resolve every name to a public IP by default so the existing transport
+// tests (which use non-resolvable example hostnames) stay hermetic; the SSRF
+// suite below overrides this per-test to exercise the private-IP rejections.
+beforeEach(() => _setDnsLookup(async () => ({ address: "93.184.216.34", family: 4 })));
+afterEach(() => _setDnsLookup(undefined));
 
 function newRoot(): string {
   return mkdtempSync(join(tmpdir(), "crawler-"));
@@ -851,5 +858,185 @@ describe("createCiteFactTool", () => {
     const tool = createCiteFactTool({ tracker });
     await tool.execute({ uri: "u", snippet: "s" });
     expect(tracker.citations[0]).toEqual({ url: "u", snippet: "s" });
+  });
+});
+
+// SECURITY: the crawler's origin allow-list and file roots come from the
+// spec's `retrieve.*`, which ships inside marketplace template YAML — i.e.
+// they can be attacker-chosen. So an allow-list that names loopback/metadata,
+// or a file root that contains an escaping symlink, must NOT let the agent
+// read internal endpoints or host files. The SSRF floor and symlink-aware
+// containment below apply REGARDLESS of the allow-list/roots.
+describe("createCrawler — SSRF floor (http)", () => {
+  const tracker = (root: string) => createCitationTracker({ rootDir: root });
+
+  test("rejects an allow-listed loopback IP-literal origin (no DNS needed)", async () => {
+    const root = newRoot();
+    try {
+      const crawler = createCrawler({
+        tracker: tracker(root),
+        config: {
+          allowedOrigins: new Set(["http://127.0.0.1:8200"]),
+          _httpFetch: async () => new Response("secret", { status: 200 }),
+        },
+      });
+      await expect(crawler.fetch("http://127.0.0.1:8200/v1/secret")).rejects.toThrow(/SSRF/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects an allow-listed cloud-metadata origin", async () => {
+    const root = newRoot();
+    try {
+      const crawler = createCrawler({
+        tracker: tracker(root),
+        config: {
+          allowedOrigins: new Set(["http://169.254.169.254"]),
+          _httpFetch: async () => new Response("creds", { status: 200 }),
+        },
+      });
+      await expect(crawler.fetch("http://169.254.169.254/latest/meta-data/")).rejects.toThrow(
+        /SSRF/,
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects an allow-listed IPv4-mapped IPv6 loopback origin", async () => {
+    const root = newRoot();
+    try {
+      // `new URL` canonicalizes [::ffff:127.0.0.1] to [::ffff:7f00:1], so a
+      // real attacker's allow-list would carry that normalized form. The SSRF
+      // guard must still see through it to the embedded 127.0.0.1.
+      const crawler = createCrawler({
+        tracker: tracker(root),
+        config: {
+          allowedOrigins: new Set(["http://[::ffff:7f00:1]"]),
+          _httpFetch: async () => new Response("x", { status: 200 }),
+        },
+      });
+      await expect(crawler.fetch("http://[::ffff:127.0.0.1]/")).rejects.toThrow(/SSRF/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects an allow-listed public host that resolves to a private IP (rebinding)", async () => {
+    _setDnsLookup(async () => ({ address: "169.254.169.254", family: 4 }));
+    const root = newRoot();
+    try {
+      const crawler = createCrawler({
+        tracker: tracker(root),
+        config: {
+          allowedOrigins: new Set(["https://innocent.example"]),
+          _httpFetch: async () => new Response("x", { status: 200 }),
+        },
+      });
+      await expect(crawler.fetch("https://innocent.example/")).rejects.toThrow(/private IP/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects a redirect to an allow-listed private host", async () => {
+    const root = newRoot();
+    try {
+      const crawler = createCrawler({
+        tracker: tracker(root),
+        config: {
+          // Both origins are allow-listed; the redirect target is private and
+          // must still be rejected by the per-hop SSRF guard.
+          allowedOrigins: new Set(["https://start.example", "http://127.0.0.1"]),
+          _httpFetch: async (url) => {
+            if (url === "https://start.example/x") {
+              return new Response(null, {
+                status: 302,
+                headers: { location: "http://127.0.0.1/" },
+              });
+            }
+            return new Response("secret", { status: 200 });
+          },
+        },
+      });
+      await expect(crawler.fetch("https://start.example/x")).rejects.toThrow(/SSRF/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("still allows an allow-listed public host", async () => {
+    const root = newRoot();
+    try {
+      const crawler = createCrawler({
+        tracker: tracker(root),
+        config: {
+          allowedOrigins: new Set(["https://example.com"]),
+          _httpFetch: async () => new Response("ok", { status: 200 }),
+        },
+      });
+      const r = await crawler.fetch("https://example.com/x");
+      expect(r.content).toBe("ok");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("createCrawler — file:// symlink containment (CWE-59)", () => {
+  test("rejects an in-root symlink whose real target escapes the root", async () => {
+    const root = newRoot();
+    const outside = newRoot();
+    const secret = join(outside, "secret.txt");
+    writeFileSync(secret, "TOP-SECRET");
+    const link = join(root, "innocent.txt");
+    symlinkSync(secret, link);
+    try {
+      const crawler = createCrawler({
+        tracker: createCitationTracker({ rootDir: root }),
+        config: { allowedFileRoots: [root] },
+      });
+      await expect(crawler.fetch(`file://${link}`)).rejects.toThrow(/symlink/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects a path that traverses out via an in-root symlinked directory", async () => {
+    const root = newRoot();
+    const outside = newRoot();
+    mkdirSync(join(outside, "sub"));
+    writeFileSync(join(outside, "sub", "secret.txt"), "TOP-SECRET");
+    symlinkSync(outside, join(root, "linkdir"));
+    try {
+      const crawler = createCrawler({
+        tracker: createCitationTracker({ rootDir: root }),
+        config: { allowedFileRoots: [root] },
+      });
+      await expect(
+        crawler.fetch(`file://${join(root, "linkdir", "sub", "secret.txt")}`),
+      ).rejects.toThrow(/symlink/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test("still reads a genuine in-root file", async () => {
+    const root = newRoot();
+    const fixture = join(root, "ok.txt");
+    writeFileSync(fixture, "in-root-content");
+    try {
+      const crawler = createCrawler({
+        tracker: createCitationTracker({ rootDir: root }),
+        config: { allowedFileRoots: [root] },
+      });
+      const r = await crawler.fetch(`file://${fixture}`);
+      expect(r.content).toBe("in-root-content");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
