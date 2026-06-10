@@ -93,9 +93,6 @@ export function buildMcpRegisteredTool(
       const result = await client.callTool(remote.name, args, {
         ...(ctx?.signal !== undefined ? { signal: ctx.signal } : {}),
       });
-      if (result.isError) {
-        throw new McpError(result.content || `mcp tool "${fullName}" returned an error result`);
-      }
       // Pillar 3 boundary site — classify the FULL MCP response (not just
       // the truncated preview the §18 post-tool classifier sees later).
       // A polymorphic jailbreak hidden mid-payload would otherwise bypass
@@ -103,29 +100,45 @@ export function buildMcpRegisteredTool(
       // bytes that contained it. The boundary-classifier's content-hash
       // cache means a repeated MCP call to a healthy server doesn't burn
       // re-classification budget.
+      //
+      // An ERROR result (`isError`) is just as attacker-controllable and just
+      // as injection-capable as a success result, so it flows through the SAME
+      // classify+tag path here BEFORE being surfaced — rather than thrown raw,
+      // which used to convert the unclassified, untagged attacker string into
+      // an error result that reached the model's context bypassing both halves
+      // of the fabric.
       const boundary = await classifyBoundary(result.content, { origin: "mcp" });
+      let safeContent: string;
       if (boundary.action === "redact" && boundary.redacted !== undefined) {
         // Malicious — substitute the redaction notice. Do NOT tag lineage:
         // the raw attacker text never reaches the model's context, so there
         // is nothing for the egress fabric to track.
-        return boundary.redacted;
+        safeContent = boundary.redacted;
+      } else {
+        safeContent = result.content;
+        // Pillar 3 sink-side fabric (invariant #1) — a module that classifies
+        // external content MUST also tag it so the egress check sees its
+        // provenance. Record the full MCP response under origin "mcp" so the
+        // egress classifier attributes any later exfiltration to the precise
+        // boundary site (rather than the coarse runtime-core "tool" origin).
+        // The RunContext is read from `ctx.runContext` first (#160 follow-up:
+        // the runtime now threads it directly on every run) and falls back to
+        // the opaque `ctx.bridge.runContext` for back-compat with callers that
+        // only wire the bridge. When neither is present this best-effort tag is
+        // skipped and the runtime-core post-tool path still tags the preview
+        // under the coarse "tool" origin.
+        const runContext = resolveRunContext(ctx);
+        if (runContext !== undefined) {
+          tagContent(runContext, result.content, "mcp");
+        }
       }
-      // Pillar 3 sink-side fabric (invariant #1) — a module that classifies
-      // external content MUST also tag it so the egress check sees its
-      // provenance. Record the full MCP response under origin "mcp" so the
-      // egress classifier attributes any later exfiltration to the precise
-      // boundary site (rather than the coarse runtime-core "tool" origin).
-      // The RunContext is read from `ctx.runContext` first (#160 follow-up:
-      // the runtime now threads it directly on every run) and falls back to
-      // the opaque `ctx.bridge.runContext` for back-compat with callers that
-      // only wire the bridge. When neither is present this best-effort tag is
-      // skipped and the runtime-core post-tool path still tags the preview
-      // under the coarse "tool" origin.
-      const runContext = resolveRunContext(ctx);
-      if (runContext !== undefined) {
-        tagContent(runContext, result.content, "mcp");
+      // An MCP error result must still surface to the model as a tool error,
+      // but only AFTER classification/tagging — never the raw attacker text.
+      // tool-executor wraps this McpError into an `is_error` tool result.
+      if (result.isError) {
+        throw new McpError(safeContent || `mcp tool "${fullName}" returned an error result`);
       }
-      return result.content;
+      return safeContent;
     },
   });
 }

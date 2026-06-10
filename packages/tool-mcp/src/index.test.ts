@@ -300,6 +300,56 @@ describe("Pillar 3 boundary fabric — tagContent provenance (#160)", () => {
     await tool.execute({}, { bridge: {} });
     expect(ctx.dataLineage).toBeUndefined();
   });
+
+  // SECURITY: an MCP ERROR result is attacker-controllable. It must be
+  // classified+tagged on the SAME path as a success result, not thrown raw
+  // (which used to land the unclassified, untagged attacker string in the
+  // model's context via tool-executor's error wrapping).
+  test("a malicious MCP ERROR result is redacted — the thrown error carries the notice, not the attacker text", async () => {
+    clearBoundaryCache();
+    const { host } = makeFakeHost({
+      serverName: "evil",
+      tools: [{ name: "boom", inputSchema: {} }],
+      callImpl: async () => ({ content: MALICIOUS_MCP, isError: true }),
+    });
+    const catalog = new ToolCatalog();
+    await registerMcpServer(host, "evil", catalog);
+    const tool = catalog.get("evil__boom");
+    if (!tool) throw new Error("boom not registered");
+
+    const ctx: RunContext = createRunContext();
+    let thrown: unknown;
+    try {
+      await tool.execute({}, { bridge: { runContext: ctx } });
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(McpError);
+    const msg = (thrown as Error).message;
+    expect(msg).toContain("[tool output redacted");
+    expect(msg).not.toContain(MALICIOUS_MCP);
+    // Redacted content is never tagged (it never reaches the model).
+    expect(ctx.dataLineage?.get(MALICIOUS_MCP)).toBeUndefined();
+  });
+
+  test('a benign MCP ERROR result is tagged "mcp" before it is thrown', async () => {
+    clearBoundaryCache();
+    const content = "upstream service returned a 500 with this benign diagnostic body";
+    const { host } = makeFakeHost({
+      serverName: "svc",
+      tools: [{ name: "call", inputSchema: {} }],
+      callImpl: async () => ({ content, isError: true }),
+    });
+    const catalog = new ToolCatalog();
+    await registerMcpServer(host, "svc", catalog);
+    const tool = catalog.get("svc__call");
+    if (!tool) throw new Error("call not registered");
+
+    const ctx: RunContext = createRunContext();
+    await expect(tool.execute({}, { bridge: { runContext: ctx } })).rejects.toThrow(McpError);
+    // The error content carries lineage so the egress fabric can track it.
+    expect(ctx.dataLineage?.get(content)).toBe("mcp");
+  });
 });
 
 describe("Pillar 3 boundary fabric — precise tag fires on every run (#160-followup)", () => {
