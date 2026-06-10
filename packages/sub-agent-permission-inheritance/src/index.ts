@@ -18,8 +18,15 @@
  *                              tools allowed by name; the empty child
  *                              catalog enforces this independently).
  *   - { allow, deny }        → replace yaml-source rules with explicit
- *                              alwaysAllow/alwaysDeny; keep BUILTIN_DEFAULT_RULES
- *                              as the safety floor.
+ *                              alwaysAllow/alwaysDeny. The builtin safety
+ *                              floor's GUARD rules (alwaysAsk/alwaysDeny) are
+ *                              lifted into the higher-priority `settings`
+ *                              source so they OUTRANK the replace allows — a
+ *                              child can never override the floor (e.g.
+ *                              `Bash(rm**)` stays gated even under
+ *                              `allow: ["Bash(**)"]`). The permissive defaults
+ *                              (Read/Glob/Grep) stay in `builtin` as a
+ *                              narrow-only fallback.
  */
 import type { SubAgentDefinition } from "@crewhaus/agent-context-isolation";
 import {
@@ -80,10 +87,26 @@ function buildReplaceRuleSet(allow: ReadonlyArray<string>, deny: ReadonlyArray<s
     pattern,
     source: "yaml" as const,
   }));
+  // The builtin safety floor must OUTRANK the replace-supplied yaml allows.
+  // permission-engine's SOURCE_PRIORITY evaluates yaml before builtin and
+  // first-match wins, so leaving the floor in `builtin` (the old behavior) let
+  // a child's `allow: ["Bash(**)"]` beat the `alwaysAsk Bash(rm**)` guard —
+  // escalating the child past the parent's effective surface. Lift the floor's
+  // GUARD rules (alwaysAsk/alwaysDeny) into `settings`, which outranks `yaml`,
+  // so they gate before any replace allow. The permissive defaults
+  // (alwaysAllow Read/Glob/Grep) stay in `builtin` as a low-priority fallback
+  // that can only narrow, never widen, the child.
+  const floorGuards: PermissionRule[] = BUILTIN_DEFAULT_RULES.filter(
+    (r) => r.type === "alwaysDeny" || r.type === "alwaysAsk",
+  ).map((r) => ({ ...r, source: "settings" as const }));
+  const floorAllows: PermissionRule[] = BUILTIN_DEFAULT_RULES.filter(
+    (r) => r.type === "alwaysAllow",
+  ).map((r) => ({ ...r }));
   return {
     ...emptyRuleSet,
+    settings: floorGuards,
     yaml: [...allowRules, ...denyRules],
-    builtin: BUILTIN_DEFAULT_RULES,
+    builtin: floorAllows,
   };
 }
 
