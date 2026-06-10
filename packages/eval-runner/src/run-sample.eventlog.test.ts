@@ -36,8 +36,11 @@ import { parseGradersConfig } from "@crewhaus/eval-grader";
 
 // Capture the real module (for `afterAll` restoration) AND snapshot the real
 // `openEventLog` function value *before* installing the override, so the
-// pass-through can call it without re-entering this stub.
-const realEventLog = await import("@crewhaus/event-log");
+// pass-through can call it without re-entering this stub. The module capture
+// is a plain-object SNAPSHOT (`{ ...ns }`): an ESM namespace is a live view
+// that resolves to the stub once mock.module patches the module, so restoring
+// from the namespace itself would silently reinstall the stub.
+const realEventLog = { ...(await import("@crewhaus/event-log")) };
 const realOpenEventLog = realEventLog.openEventLog;
 
 // "off" → transparent pass-through to the real log (safe for any leaked call).

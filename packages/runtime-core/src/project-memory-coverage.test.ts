@@ -9,17 +9,26 @@
  * first imported) and gated behind mutable flags so each test toggles only
  * the failure it needs — this sidesteps ESM live-binding caching, where a
  * mock.module call made after the importer is already loaded would not be
- * observed. Flags are reset in afterEach; mock.restore() runs at teardown so
- * nothing leaks into sibling test files.
+ * observed. Flags are reset in afterEach; afterAll reinstalls the REAL
+ * modules — `mock.restore()` does not undo `mock.module`, and Bun shares one
+ * module registry across all test files (nondeterministic order), so only
+ * the re-mock keeps the stubs from leaking into sibling test files.
  */
 import { afterAll, afterEach, describe, expect, mock, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import * as realFsPromises from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+// Real module captured for the afterAll restore.
+import * as realBoundaryClassifierNS from "@crewhaus/boundary-classifier";
 
 const realStat = realFsPromises.stat;
 const realReadFile = realFsPromises.readFile;
+// Plain-object SNAPSHOTS for the afterAll restore: an `import * as` namespace
+// is a live view that resolves to the stubs once mock.module patches the
+// module, so restoring from it would be a no-op.
+const realFsPromisesSnapshot = { ...realFsPromises };
+const realBoundaryClassifierSnapshot = { ...realBoundaryClassifierNS };
 
 // Per-test toggles. When a `*Fails` is set, the corresponding mocked fn
 // rejects for the named file; otherwise it delegates to the real impl.
@@ -55,7 +64,10 @@ afterEach(() => {
 });
 
 afterAll(() => {
-  mock.restore();
+  // Reinstall the real modules — mock.restore() would only undo spies, not
+  // mock.module, so re-mocking is the only way to prevent cross-file leaks.
+  mock.module("node:fs/promises", () => realFsPromisesSnapshot);
+  mock.module("@crewhaus/boundary-classifier", () => realBoundaryClassifierSnapshot);
 });
 
 describe("loadProjectMemory — defensive branches", () => {

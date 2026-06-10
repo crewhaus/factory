@@ -22,8 +22,11 @@ const boundModels: Array<string | undefined> = [];
 const loadedRubrics: unknown[] = [];
 
 // Capture the real module so `afterAll` can restore it — `mock.module` is
-// process-global and does not auto-restore across test files.
-const realEvalJudge = await import("@crewhaus/eval-judge");
+// process-global and does not auto-restore across test files. The capture is
+// a plain-object SNAPSHOT (`{ ...ns }`): an ESM namespace is a live view that
+// resolves to the stubs once mock.module patches the module, so restoring
+// from the namespace itself would silently reinstall the stubs.
+const realEvalJudge = { ...(await import("@crewhaus/eval-judge")) };
 
 mock.module("@crewhaus/eval-judge", () => ({
   ...realEvalJudge,

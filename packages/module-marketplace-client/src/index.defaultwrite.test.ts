@@ -9,13 +9,18 @@
  * (which calls the seam when no override is supplied). Both directory states
  * are covered: a missing dir triggers `mkdirSync`, an existing dir skips it.
  *
- * `mock.module` mutates the shared module registry, so this lives in its own
- * file — Bun gives each test file a fresh module graph, keeping the fs stub
- * from leaking into `index.test.ts`.
+ * `mock.module` mutates the shared module registry, and Bun does NOT give
+ * each test file a fresh module graph — all files in a `bun test` run share
+ * one process, in nondeterministic order. The stub therefore lives in its own
+ * file AND is torn down in `afterAll` by re-mocking the real `node:fs`, so it
+ * cannot leak into `index.test.ts` when this file runs first.
  */
-import { afterEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, mock, test } from "bun:test";
 import type { PluginRegistry, PluginRegistryEntry } from "@crewhaus/plugin-registry";
 import type { PluginManifest } from "@crewhaus/plugin-sdk";
+
+// Captured BEFORE the mock below so afterAll can reinstall the real module.
+const realFs = require("node:fs") as typeof import("node:fs");
 
 // In-memory recording of what the faked node:fs received.
 type FsCall = { fn: "existsSync" | "mkdirSync" | "writeFileSync"; args: unknown[] };
@@ -38,6 +43,10 @@ mock.module("node:fs", () => ({
     writtenFiles.set(p, { contents, opts });
   },
 }));
+
+afterAll(() => {
+  mock.module("node:fs", () => realFs);
+});
 
 // Import the unit under test AFTER the fs stub is registered so its
 // `import { ... } from "node:fs"` binding resolves to the fake.

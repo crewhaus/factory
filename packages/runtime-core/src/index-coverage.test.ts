@@ -6,9 +6,13 @@
  * (no `.crewhaus/` pollution). `@crewhaus/hooks-engine` is module-mocked so
  * lifecycle-hook decisions are scripted without spawning child processes.
  *
- * mock.module replacements are restored in afterEach; the hooks-engine mock
- * is gated behind a flag so the (rare) tests that want the real no-op path
- * can opt out. Nothing here performs real I/O or leaves a handle open.
+ * The hooks-engine mock is gated behind a flag (reset in afterEach) so the
+ * (rare) tests that want the real no-op path can opt out. The module mocks
+ * themselves are reinstalled to the REAL modules in afterAll — `mock.restore()`
+ * does not undo `mock.module`, and Bun shares one module registry across all
+ * test files (nondeterministic order), so without that re-mock the stubs would
+ * leak into sibling suites. Nothing here performs real I/O or leaves a handle
+ * open.
  */
 import { afterAll, afterEach, beforeAll, describe, expect, mock, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -46,6 +50,10 @@ const hookScript: {
 import * as realSessionStoreNS from "@crewhaus/session-store";
 const sessionStoreFlags = { updateFails: false };
 const realCreateSessionStore = realSessionStoreNS.createSessionStore;
+// Plain-object SNAPSHOT for the afterAll restore: the `import * as` namespace
+// is a live view that resolves to the stub once mock.module patches the
+// module, so restoring from it would be a no-op.
+const realSessionStoreSnapshot = { ...realSessionStoreNS };
 mock.module("@crewhaus/session-store", () => ({
   ...realSessionStoreNS,
   createSessionStore: (o: unknown) => {
@@ -60,8 +68,11 @@ mock.module("@crewhaus/session-store", () => ({
   },
 }));
 
+// Real module captured for the afterAll restore — as a plain-object SNAPSHOT
+// (see realSessionStoreSnapshot above for why the live namespace won't do).
+import * as realHooksEngineNS from "@crewhaus/hooks-engine";
+const realHooksEngineSnapshot = { ...realHooksEngineNS };
 mock.module("@crewhaus/hooks-engine", () => ({
-  // Re-export the constant runtime-core imports for the default rule set.
   runHooks: async (event: string) => {
     if (hookScript.throws) throw new Error("hook firing exploded");
     const scripted = hookScript.byEvent.get(event);
@@ -102,6 +113,10 @@ afterEach(() => {
 afterAll(() => {
   process.env["CREWHAUS_SESSION_DIR"] = undefined;
   mock.restore();
+  // Reinstall the real modules — mock.restore() above only undoes spies, not
+  // mock.module, so without these the stubs leak into sibling test files.
+  mock.module("@crewhaus/session-store", () => realSessionStoreSnapshot);
+  mock.module("@crewhaus/hooks-engine", () => realHooksEngineSnapshot);
   rmSync(SESSION_ROOT, { recursive: true, force: true });
 });
 

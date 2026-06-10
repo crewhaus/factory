@@ -13,24 +13,35 @@
  * real implementation untouched. The crew must still complete with `crew_done`
  * and must not surface the close error.
  *
- * `mock.module` mutates the shared module registry, so this lives in its own
- * file: Bun gives each test file a fresh module graph, which keeps the stub
- * from leaking into `index.test.ts`.
+ * `mock.module` mutates the shared module registry, and Bun does NOT give
+ * each test file a fresh module graph — every file in a `bun test` run shares
+ * one process, in nondeterministic order. The stub therefore lives in its own
+ * file AND is torn down in `afterAll` by re-mocking the real module, so it
+ * cannot leak into `index.test.ts` when this file happens to run first.
  */
-import { describe, expect, mock, test } from "bun:test";
+import { afterAll, describe, expect, mock, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ProviderAdapter, StreamEvent } from "@crewhaus/adapter-anthropic";
 import type { EventLog } from "@crewhaus/event-log";
 
-// Capture the REAL `openEventLog` *before* registering the stub below. A
-// dynamic import resolved prior to `mock.module` returns the genuine module
-// binding, so calling `realOpen` from inside the stub delegates to the real
-// implementation instead of recursing into the stub.
-const realOpen = (await import("@crewhaus/event-log")).openEventLog;
+// Capture a SNAPSHOT of the real module *before* registering the stub below.
+// The spread matters: an ESM namespace is a live view, so after `mock.module`
+// patches the module its properties resolve to the stub — restoring from the
+// namespace would reinstall the stub. A plain-object copy of the pre-mock
+// function references is immune, keeps `realOpen` delegating to the genuine
+// implementation (no recursion into the stub), and is what `afterAll`
+// reinstalls.
+const realEventLog = { ...(await import("@crewhaus/event-log")) };
+const realOpen = realEventLog.openEventLog;
 
 let openCalls = 0;
+
+afterAll(() => {
+  // Reinstall the real module so the wrapper cannot outlive this file.
+  mock.module("@crewhaus/event-log", () => realEventLog);
+});
 
 mock.module("@crewhaus/event-log", () => ({
   // Wrap only the FIRST handle (the orchestrator's crew-session log) so its

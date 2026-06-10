@@ -8,13 +8,24 @@
  *   - publishing real `cost_accrual` events through a real TraceEventBus to
  *     exercise the inline-cost stdout handler.
  *
- * mock.module replacements are restored in afterEach so they do not leak
- * into the rest of the runtime-core suite.
+ * The mock.module replacements are reinstalled to the REAL modules in
+ * afterAll — `mock.restore()` (run in afterEach for the spies) does not undo
+ * `mock.module`, and Bun shares one module registry across all test files in
+ * nondeterministic order, so without that re-mock the fakes would leak into
+ * the rest of the runtime-core suite.
  */
-import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+// Real modules captured for the afterAll restore — as plain-object SNAPSHOTS:
+// an `import * as` namespace is a live view that resolves to the fakes once
+// mock.module patches the module, so restoring from it would be a no-op.
+import * as realMetricsCollectorNS from "@crewhaus/metrics-collector";
+import * as realOtelExporterNS from "@crewhaus/otel-exporter";
 import { createRunContext } from "@crewhaus/run-context";
 import { TraceEventBus } from "@crewhaus/trace-event-bus";
 import type { CostAccrualEvent } from "@crewhaus/trace-event-bus";
+
+const realMetricsCollectorSnapshot = { ...realMetricsCollectorNS };
+const realOtelExporterSnapshot = { ...realOtelExporterNS };
 
 // Controllable fakes for the two heavyweight subscribers. The booleans let
 // each test decide whether flush()/shutdown() reject so the catch → logFlushError
@@ -90,6 +101,13 @@ beforeEach(() => {
 
 afterEach(() => {
   mock.restore();
+});
+
+afterAll(() => {
+  // Reinstall the real modules — mock.restore() only undoes spies, not
+  // mock.module, so without these the fakes leak into sibling test files.
+  mock.module("@crewhaus/metrics-collector", () => realMetricsCollectorSnapshot);
+  mock.module("@crewhaus/otel-exporter", () => realOtelExporterSnapshot);
 });
 
 function makeAccrual(overrides: Partial<CostAccrualEvent> = {}): CostAccrualEvent {

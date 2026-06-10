@@ -13,6 +13,12 @@ import {
   stdoutJson,
 } from "./sinks";
 
+// Captured before any mock.module call so the afterEach below can reinstall
+// the real module. (`mock.restore()` does NOT undo `mock.module`, and Bun
+// shares one module registry across all test files, in nondeterministic
+// order — only re-mocking the real module prevents cross-file leaks.)
+const realFsPromises = require("node:fs/promises") as typeof import("node:fs/promises");
+
 /** Minimal ServerResponse stand-in capturing what the handler wrote. */
 function fakeRes() {
   const headers: Record<string, string> = {};
@@ -149,8 +155,9 @@ describe("stdoutJson sink", () => {
 
 describe("prometheusTextfile sink", () => {
   afterEach(() => {
-    // Drop the node:fs/promises mock so no stub leaks into other test files.
-    mock.restore();
+    // Reinstall the real node:fs/promises so the per-test writeFile stub
+    // never leaks into later tests or sibling files.
+    mock.module("node:fs/promises", () => realFsPromises);
   });
 
   test("flush() writes the registry's exposition to the given path (writeFile mocked)", async () => {

@@ -9,17 +9,25 @@
  * `@crewhaus/sandbox`'s `createSandbox` so no real Docker/Podman sandbox is
  * ever constructed (no child processes, no network, no I/O).
  *
- * `mock.module` mutates the process-global module registry, so this lives in
- * its own file: Bun gives each test file a fresh module graph, which keeps the
- * stub from leaking into `index.test.ts`.
+ * `mock.module` mutates the process-global module registry, and Bun does NOT
+ * give each test file a fresh module graph — all files in a `bun test` run
+ * share one process, in nondeterministic order. The stub therefore lives in
+ * its own file AND is torn down in `afterAll` by re-mocking the real module,
+ * so it cannot leak into `index.test.ts` when this file runs first.
  */
-import { afterEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, mock, test } from "bun:test";
 import type {
   Sandbox,
   SandboxExecOptions,
   SandboxExecResult,
   SandboxOptions,
 } from "@crewhaus/sandbox";
+
+// SNAPSHOT of the real module, captured BEFORE the mock below so afterAll can
+// reinstall it. The spread matters: an ESM namespace is a live view, so after
+// `mock.module` patches the module its properties resolve to the stub —
+// restoring from the namespace would reinstall the stub.
+const realSandboxModule = { ...(await import("@crewhaus/sandbox")) };
 
 // Records every `createSandbox` call so we can assert the config is threaded
 // through. The returned sandbox is a fully in-memory stub whose run method
@@ -58,6 +66,11 @@ const { _resetCodeExecutionConfig, getCodeExecutionConfig, registerCodeExecution
 afterEach(() => {
   _resetCodeExecutionConfig();
   createCalls.length = 0;
+});
+
+afterAll(() => {
+  // Reinstall the real module so the stub cannot outlive this file.
+  mock.module("@crewhaus/sandbox", () => realSandboxModule);
 });
 
 describe("getCodeExecutionConfig", () => {
