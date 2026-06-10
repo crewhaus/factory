@@ -1,6 +1,6 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import type { Driver } from "@crewhaus/computer-use-driver";
-import { NavigateError, createNavigateTool } from "./index.js";
+import { NavigateError, _setDnsLookup, createNavigateTool } from "./index.js";
 
 type GotoRecord = { calls: string[] };
 
@@ -27,18 +27,22 @@ function stubDriver(record: GotoRecord, opts: { gotoErr?: Error } = {}): Driver 
 }
 
 describe("createNavigateTool", () => {
+  // A public IP literal skips DNS resolution, keeping these tests hermetic
+  // while still passing the SSRF guard (it's a public, non-loopback address).
+  const PUBLIC_URL = "https://93.184.216.34/";
+
   test("happy path: forwards url to driver.goto and returns a text confirmation", async () => {
     const record: GotoRecord = { calls: [] };
     const tool = createNavigateTool({ driver: stubDriver(record) });
 
-    const result = await tool.execute({ url: "https://example.com/" }, {});
-    expect(record.calls).toEqual(["https://example.com/"]);
+    const result = await tool.execute({ url: PUBLIC_URL }, {});
+    expect(record.calls).toEqual([PUBLIC_URL]);
     expect(Array.isArray(result)).toBe(true);
     if (!Array.isArray(result)) throw new Error("expected ToolResultContent array");
     expect(result).toHaveLength(1);
     const block = result[0];
     if (block?.type !== "text") throw new Error("expected text block");
-    expect(block.text).toBe("navigated to https://example.com/");
+    expect(block.text).toBe(`navigated to ${PUBLIC_URL}`);
   });
 
   test("schema rejects non-URL strings (and missing url)", () => {
@@ -51,15 +55,16 @@ describe("createNavigateTool", () => {
   test("driver.goto failure surfaces as NavigateError with the URL in the message", async () => {
     const record: GotoRecord = { calls: [] };
     const tool = createNavigateTool({
-      driver: stubDriver(record, { gotoErr: new Error("net::ERR_NAME_NOT_RESOLVED") }),
+      driver: stubDriver(record, { gotoErr: new Error("net::ERR_CONNECTION_REFUSED") }),
     });
     try {
-      await tool.execute({ url: "https://does-not-exist.invalid/" }, {});
+      // Public IP literal passes the SSRF guard and reaches driver.goto.
+      await tool.execute({ url: PUBLIC_URL }, {});
       throw new Error("expected NavigateError to be thrown");
     } catch (err) {
       expect(err).toBeInstanceOf(NavigateError);
-      expect((err as Error).message).toContain("https://does-not-exist.invalid/");
-      expect((err as Error).message).toContain("net::ERR_NAME_NOT_RESOLVED");
+      expect((err as Error).message).toContain(PUBLIC_URL);
+      expect((err as Error).message).toContain("net::ERR_CONNECTION_REFUSED");
     }
   });
 
@@ -74,5 +79,78 @@ describe("createNavigateTool", () => {
     expect(tool.classifyOutput).toBe(false);
     expect(tool.scope).toBe("external");
     expect(tool.name).toBe("Navigate");
+  });
+});
+
+// SECURITY: the model picks the navigation URL and is prompt-injectable, so
+// an attacker who controls any untrusted input could steer it to file://,
+// cloud metadata, or a loopback/private host and read the result back via
+// Screenshot. The guard must run before driver.goto.
+describe("Navigate SSRF guard", () => {
+  afterEach(() => _setDnsLookup(undefined));
+
+  const expectBlocked = async (url: string) => {
+    const record: GotoRecord = { calls: [] };
+    const tool = createNavigateTool({ driver: stubDriver(record) });
+    let threw: unknown;
+    try {
+      await tool.execute({ url }, {});
+    } catch (err) {
+      threw = err;
+    }
+    expect(threw).toBeInstanceOf(NavigateError);
+    // The browser must never have been touched.
+    expect(record.calls).toEqual([]);
+  };
+
+  test.each([
+    ["file scheme", "file:///etc/passwd"],
+    ["gopher scheme", "gopher://127.0.0.1:6379/"],
+    ["data scheme", "data:text/html,<h1>x</h1>"],
+    ["loopback IPv4", "http://127.0.0.1/"],
+    ["loopback name", "http://localhost:8080/admin"],
+    ["AWS/GCP metadata", "http://169.254.169.254/latest/meta-data/iam/security-credentials/"],
+    ["RFC1918 10.x", "http://10.0.0.5/"],
+    ["RFC1918 192.168", "http://192.168.1.1/"],
+    ["RFC1918 172.16", "http://172.16.0.1/"],
+    ["CGNAT 100.64", "http://100.64.0.1/"],
+    ["0.0.0.0", "http://0.0.0.0/"],
+    ["IPv6 loopback", "http://[::1]/"],
+    ["IPv4-mapped IPv6 loopback", "http://[::ffff:127.0.0.1]/"],
+    ["IPv4-mapped IPv6 metadata", "http://[::ffff:169.254.169.254]/"],
+    ["octal-encoded loopback", "http://0177.0.0.1/"],
+    ["integer-encoded loopback", "http://2130706433/"],
+    ["mDNS .local", "http://printer.local/"],
+  ])("blocks %s", async (_label, url) => {
+    await expectBlocked(url);
+  });
+
+  test("blocks a public hostname that resolves to a private IP (DNS rebinding at check time)", async () => {
+    _setDnsLookup(async () => ({ address: "127.0.0.1", family: 4 }));
+    const record: GotoRecord = { calls: [] };
+    const tool = createNavigateTool({ driver: stubDriver(record) });
+    await expect(
+      tool.execute({ url: "http://totally-innocent.example/" }, {}),
+    ).rejects.toBeInstanceOf(NavigateError);
+    expect(record.calls).toEqual([]);
+  });
+
+  test("allows a public hostname that resolves to a public IP", async () => {
+    _setDnsLookup(async () => ({ address: "93.184.216.34", family: 4 }));
+    const record: GotoRecord = { calls: [] };
+    const tool = createNavigateTool({ driver: stubDriver(record) });
+    await tool.execute({ url: "http://example.com/" }, {});
+    expect(record.calls).toEqual(["http://example.com/"]);
+  });
+
+  test("allows a public IP literal without any DNS lookup", async () => {
+    // If DNS were consulted for an IP literal this would throw.
+    _setDnsLookup(async () => {
+      throw new Error("DNS must not be called for an IP literal");
+    });
+    const record: GotoRecord = { calls: [] };
+    const tool = createNavigateTool({ driver: stubDriver(record) });
+    await tool.execute({ url: "https://93.184.216.34/" }, {});
+    expect(record.calls).toEqual(["https://93.184.216.34/"]);
   });
 });
