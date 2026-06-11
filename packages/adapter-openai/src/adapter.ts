@@ -27,7 +27,7 @@ import type {
 } from "@crewhaus/adapter-anthropic";
 import { AdapterError, ProviderAuthError } from "@crewhaus/errors";
 import { estimateTokens as tokenBudgetEstimate } from "@crewhaus/token-budget";
-import OpenAI from "openai";
+import OpenAI, { AzureOpenAI } from "openai";
 import { translateOpenAIStream } from "./stream.js";
 import { toOpenAIChatParams } from "./translate.js";
 
@@ -124,6 +124,44 @@ export function createOpenAIAdapter(
   const client = new OpenAI({
     apiKey: apiKey.length > 0 ? apiKey : "local",
     ...(baseURL !== undefined ? { baseURL } : {}),
+  });
+  return new OpenAIAdapter({ client });
+}
+
+export type CreateAzureOpenAIAdapterOptions = {
+  /** Azure OpenAI deployment name (the `azure/<deployment>` segment). */
+  readonly deployment: string;
+};
+
+/**
+ * Build an OpenAIAdapter against Azure OpenAI's classic surface
+ * (deployment-scoped path + `api-key` header + `api-version` query) via
+ * the SDK's `AzureOpenAI` client. Env:
+ *   - AZURE_OPENAI_ENDPOINT     https://<resource>.openai.azure.com
+ *   - AZURE_OPENAI_API_KEY      the resource key
+ *   - AZURE_OPENAI_API_VERSION  optional, defaults to a stable GA version
+ *
+ * The stream/translate path is identical to plain OpenAI — Azure speaks
+ * Chat Completions once the client handles routing and auth.
+ */
+export function createAzureOpenAIAdapter(
+  opts: CreateAzureOpenAIAdapterOptions,
+  env: NodeJS.ProcessEnv = process.env,
+): OpenAIAdapter {
+  const endpoint = env["AZURE_OPENAI_ENDPOINT"] ?? "";
+  const apiKey = env["AZURE_OPENAI_API_KEY"] ?? "";
+  if (endpoint.length === 0 || apiKey.length === 0) {
+    throw new ProviderAuthError(
+      "openai",
+      "azure/<deployment> model strings require AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY (api version via AZURE_OPENAI_API_VERSION, default 2024-10-21)",
+    );
+  }
+  const apiVersion = env["AZURE_OPENAI_API_VERSION"] ?? "2024-10-21";
+  const client = new AzureOpenAI({
+    endpoint,
+    apiKey,
+    apiVersion,
+    deployment: opts.deployment,
   });
   return new OpenAIAdapter({ client });
 }

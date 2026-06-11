@@ -8,10 +8,11 @@
  *   half_open → closed  (probe call succeeded)
  *   half_open → open    (probe call failed)
  *
- * Composes with `model-router` so a tripped Anthropic breaker auto-fails-
- * over to OpenAI when `agent.fallbackModels` is configured. The wrapper
- * does not own the fallback policy itself — it just refuses to stream
- * when open. Downstream `recovery-engine` is upstream of the breaker;
+ * Composes with `model-router` for TypeScript-level failover: callers
+ * hold one breaker per resolved model and route to the next candidate
+ * when a breaker is open (there is no spec-level fallback field). The
+ * wrapper does not own the fallback policy itself — it just refuses to
+ * stream when open. Downstream `recovery-engine` is upstream of the breaker;
  * it should never retry into a tripped breaker.
  *
  * Optionally takes a `TraceEventBus` so state changes surface as

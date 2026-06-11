@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { ConfigError } from "@crewhaus/errors";
-import { parseModelString } from "./parse.js";
+import { OPENAI_COMPAT_HOSTS, parseModelString } from "./parse.js";
 
 describe("parseModelString", () => {
   describe("anthropic (no prefix)", () => {
@@ -222,16 +222,95 @@ describe("parseModelString", () => {
         providerId: "openai",
         modelId: "llama-3.1-8b",
         baseUrl: "http://localhost:11434/v1",
+        localUrl: true,
       });
     });
-    test("rejects missing @url", () => {
-      expect(() => parseModelString("local/llama-3.1-8b")).toThrow(ConfigError);
+    test("local/<model> without @url defaults to the Ollama endpoint", () => {
+      expect(parseModelString("local/llama3.2")).toEqual({
+        providerId: "openai",
+        modelId: "llama3.2",
+        baseUrl: "http://localhost:11434/v1",
+        localUrl: true,
+      });
     });
     test("rejects empty modelId", () => {
       expect(() => parseModelString("local/@http://x")).toThrow(ConfigError);
+      expect(() => parseModelString("local/")).toThrow(ConfigError);
     });
     test("rejects empty url", () => {
       expect(() => parseModelString("local/llama@")).toThrow(ConfigError);
+    });
+  });
+
+  describe("azure/", () => {
+    test("azure/<deployment> routes through openai with azure marker", () => {
+      expect(parseModelString("azure/my-gpt4o-deployment")).toEqual({
+        providerId: "openai",
+        modelId: "my-gpt4o-deployment",
+        azure: { deployment: "my-gpt4o-deployment" },
+      });
+    });
+    test("rejects empty deployment", () => {
+      expect(() => parseModelString("azure/")).toThrow(ConfigError);
+    });
+  });
+
+  describe("vertex/", () => {
+    test("vertex/claude-* routes to anthropic with vertex marker", () => {
+      expect(parseModelString("vertex/claude-sonnet-4-6")).toEqual({
+        providerId: "anthropic",
+        modelId: "claude-sonnet-4-6",
+        vertex: true,
+      });
+    });
+    test("vertex/gemini-* routes to gemini with vertex marker", () => {
+      expect(parseModelString("vertex/gemini-2.5-flash")).toEqual({
+        providerId: "gemini",
+        modelId: "gemini-2.5-flash",
+        vertex: true,
+      });
+    });
+    test("vertex/gemma-* routes to gemini with vertex marker", () => {
+      expect(parseModelString("vertex/gemma-3-27b-it")).toEqual({
+        providerId: "gemini",
+        modelId: "gemma-3-27b-it",
+        vertex: true,
+      });
+    });
+    test("rejects non-claude/gemini ids", () => {
+      expect(() => parseModelString("vertex/gpt-4o")).toThrow(ConfigError);
+      expect(() => parseModelString("vertex/")).toThrow(ConfigError);
+    });
+  });
+
+  describe("named OpenAI-compatible hosts", () => {
+    test("every registry entry parses to openai with its baseUrl and key env", () => {
+      for (const [hostId, host] of Object.entries(OPENAI_COMPAT_HOSTS)) {
+        expect(parseModelString(`${hostId}/some-model`)).toEqual({
+          providerId: "openai",
+          modelId: "some-model",
+          baseUrl: host.baseUrl,
+          hostId,
+          apiKeyEnv: host.apiKeyEnv,
+        });
+      }
+    });
+    test("model ids containing slashes survive (openrouter vendor paths)", () => {
+      expect(parseModelString("openrouter/meta-llama/llama-3.3-70b-instruct")).toMatchObject({
+        providerId: "openai",
+        modelId: "meta-llama/llama-3.3-70b-instruct",
+        hostId: "openrouter",
+      });
+    });
+    test("rejects empty model id", () => {
+      expect(() => parseModelString("groq/")).toThrow(ConfigError);
+    });
+    test("registry baseUrls all include an explicit path segment", () => {
+      // Guards against a host entry that would make the OpenAI SDK hit
+      // the bare domain root.
+      for (const host of Object.values(OPENAI_COMPAT_HOSTS)) {
+        expect(new URL(host.baseUrl).pathname.length).toBeGreaterThan(1);
+      }
     });
   });
 
