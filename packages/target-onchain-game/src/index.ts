@@ -103,6 +103,7 @@ export function emitOnchainGame(ir: IrChainGameV0): Bundle {
     allowedContracts: policy.allowedContracts,
     simulationRequired: policy.simulationRequired,
     ...(policy.maxValueUsd !== undefined ? { maxValueUsd: policy.maxValueUsd } : {}),
+    ...(policy.maxValueWei !== undefined ? { maxValueWei: policy.maxValueWei } : {}),
     contractAddresses,
   });
 

@@ -356,6 +356,8 @@ export type IrContractBinding = {
 export type IrTransactionPolicy = {
   readonly defaultWriteApproval: "required" | "policy" | "none";
   readonly maxValueUsd?: number;
+  /** Oracle-free native-token spend ceiling (wei, decimal or 0x-hex string). */
+  readonly maxValueWei?: string;
   readonly allowedContracts: readonly string[];
   readonly simulationRequired: boolean;
 };

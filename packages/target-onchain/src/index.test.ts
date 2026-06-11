@@ -134,6 +134,24 @@ describe("emitOnchain — happy path", () => {
     expect(c).toContain('"maxValueUsd":5000');
   });
 
+  // SECURITY: maxValueWei is the ONLY native-value cap wallet-engine can
+  // enforce (maxValueUsd hard-throws with no oracle); it must reach the
+  // emitted TRANSACTION_POLICY literal so the ceiling is actually applied.
+  test("renders transaction_policy.maxValueWei into the emitted literal", () => {
+    const bundle = emitOnchain(
+      baseIr({
+        transactionPolicy: {
+          defaultWriteApproval: "policy",
+          allowedContracts: [],
+          simulationRequired: true,
+          maxValueWei: "1000000000000000000",
+        },
+      }),
+    );
+    const c = bundle.files[0]?.content ?? "";
+    expect(c).toContain('"maxValueWei":"1000000000000000000"');
+  });
+
   // #151 activation — the policy must carry a resolved contractId -> address
   // map so the wallet-engine can bind tx.to to the declared contract.
   test("populates transaction_policy.contractAddresses from declared contracts[]", () => {

@@ -528,6 +528,7 @@ type SpecChainSubsystem = {
   readonly transaction_policy?: {
     readonly defaultWriteApproval: "required" | "policy" | "none";
     readonly maxValueUsd?: number;
+    readonly maxValueWei?: string;
     readonly allowedContracts: readonly string[];
     readonly simulationRequired: boolean;
   };
@@ -582,6 +583,7 @@ function lowerChainSubsystem(spec: SpecChainSubsystem): IrChainSubsystem {
     out.transactionPolicy = {
       defaultWriteApproval: tp.defaultWriteApproval,
       ...(tp.maxValueUsd !== undefined ? { maxValueUsd: tp.maxValueUsd } : {}),
+      ...(tp.maxValueWei !== undefined ? { maxValueWei: tp.maxValueWei } : {}),
       allowedContracts: [...tp.allowedContracts],
       simulationRequired: tp.simulationRequired,
     };
