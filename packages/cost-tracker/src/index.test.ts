@@ -31,6 +31,7 @@ function modelResponse(
   bus: TraceEventBus,
   opts: {
     model: string;
+    specModel?: string;
     provider: ProviderId;
     inputTokens: number;
     outputTokens: number;
@@ -43,6 +44,7 @@ function modelResponse(
     runId: opts.runId ?? bus.runId,
     kind: "model_response",
     model: opts.model,
+    ...(opts.specModel !== undefined ? { specModel: opts.specModel } : {}),
     provider: opts.provider,
     stopReason: "end_turn",
     usage: {
@@ -159,6 +161,32 @@ describe("cost-tracker — T3 trace bus integration", () => {
     // sums to (1250 input × 15 + 625 output × 75) = 18_750 + 46_875 = 65_625
     expect(summary.totalUsdMicros).toBe(65_625);
     expect(summary.byProvider.anthropic).toBe(65_625);
+  });
+
+  test("wire model id prices and specModel passes through to cost_accrual", () => {
+    const bus = makeBus();
+    const accruals: CostAccrualEvent[] = [];
+    bus.subscribe((e) => {
+      if (e.kind === "cost_accrual") accruals.push(e);
+    });
+    const tracker = createCostTracker(bus);
+    bus.publish(
+      modelResponse(bus, {
+        // runtime-core publishes the stripped WIRE id; the spec string
+        // (provider-prefixed grammar) rides along as specModel.
+        model: "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        specModel: "bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        provider: "bedrock",
+        inputTokens: 100,
+        outputTokens: 10,
+      }),
+    );
+    expect(tracker.pricingMisses()).toBe(0);
+    expect(accruals.length).toBe(1);
+    expect(accruals[0]?.modelId).toBe("us.anthropic.claude-sonnet-4-5-20250929-v1:0");
+    expect(accruals[0]?.specModel).toBe("bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0");
+    // anthropic.claude-sonnet-4 row: 100 × $3/M + 10 × $15/M = 450 micros
+    expect(accruals[0]?.costUsdMicros).toBe(450);
   });
 
   test("missing pricing → no accrual event, pricingMisses counter increments", () => {

@@ -111,6 +111,8 @@ export function createCostTracker(bus: TraceEventBus, opts: CostTrackerOptions =
     if (event.kind !== "model_response") return;
     const resp = event as ModelResponseEvent;
     const provider: ProviderId = resp.provider ?? "anthropic";
+    // `resp.model` is the WIRE model id (runtime-core strips the spec
+    // grammar before publishing) — the form the pricing table is keyed on.
     const row = resolvePricing(pricing, provider, resp.model);
     if (!row) {
       pricingMisses++;
@@ -128,6 +130,7 @@ export function createCostTracker(bus: TraceEventBus, opts: CostTrackerOptions =
         kind: "cost_accrual",
         provider,
         modelId: resp.model,
+        ...(resp.specModel !== undefined ? { specModel: resp.specModel } : {}),
         inputTokens,
         outputTokens,
         cachedReadTokens,
