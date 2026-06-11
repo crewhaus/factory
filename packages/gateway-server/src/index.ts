@@ -183,6 +183,21 @@ export type CreateGatewayServerOptions = {
    */
   readonly tenantOverrides?: Readonly<Record<string, Tenant>>;
   readonly now?: () => number;
+  /**
+   * Optional per-request cost estimate. It is RESERVED against the tenant's
+   * budget before the handler runs and released after — closing the TOCTOU
+   * where concurrent requests all pass `checkBudget` (which only sees
+   * already-recorded usage) before any of them records its usage, each then
+   * running to full cost. A generic gateway can't know token costs, so supply
+   * a realistic estimate here to bound in-flight spend; the default reserves
+   * nothing (behavior-preserving). Actual usage is still recorded out-of-band
+   * via `recordUsage`.
+   */
+  readonly estimateUsage?: (args: {
+    readonly method: MethodT;
+    readonly params: unknown;
+    readonly tenant: Tenant;
+  }) => UsageDelta;
 };
 
 export type UsageDelta = {
@@ -210,8 +225,13 @@ export interface GatewayServer {
   getAuditLog(tenant: Tenant): Promise<AuditLog>;
 }
 
+const ZERO_USAGE: UsageDelta = { input: 0, output: 0 };
+
 export function createGatewayServer(opts: CreateGatewayServerOptions): GatewayServer {
   const usageByTenant = new Map<string, { input: number; output: number }>();
+  // In-flight reservations, held only for the duration of a request. Counted
+  // by checkBudget so concurrent requests can't all slip past the cap.
+  const reservedByTenant = new Map<string, { input: number; output: number }>();
   const auditLogByTenant = new Map<string, AuditLog>();
   const now = opts.now ?? Date.now;
 
@@ -239,16 +259,39 @@ export function createGatewayServer(opts: CreateGatewayServerOptions): GatewaySe
     });
   }
 
+  function addReservation(tenantId: string, d: UsageDelta): void {
+    if (d.input === 0 && d.output === 0) return;
+    const cur = reservedByTenant.get(tenantId) ?? { input: 0, output: 0 };
+    reservedByTenant.set(tenantId, { input: cur.input + d.input, output: cur.output + d.output });
+  }
+
+  function releaseReservation(tenantId: string, d: UsageDelta): void {
+    if (d.input === 0 && d.output === 0) return;
+    const cur = reservedByTenant.get(tenantId) ?? { input: 0, output: 0 };
+    const next = {
+      input: Math.max(0, cur.input - d.input),
+      output: Math.max(0, cur.output - d.output),
+    };
+    if (next.input === 0 && next.output === 0) reservedByTenant.delete(tenantId);
+    else reservedByTenant.set(tenantId, next);
+  }
+
+  // Budget check counts recorded usage PLUS in-flight reservations, so a single
+  // oversized request (whose estimate already won't fit) and a burst of
+  // concurrent requests are both bounded — not just measured against past usage.
   function checkBudget(tenant: Tenant): void {
     const used = usageByTenant.get(tenant.id) ?? { input: 0, output: 0 };
-    if (used.input >= tenant.budget.maxInputTokens) {
+    const res = reservedByTenant.get(tenant.id) ?? { input: 0, output: 0 };
+    const totalInput = used.input + res.input;
+    const totalOutput = used.output + res.output;
+    if (totalInput >= tenant.budget.maxInputTokens) {
       throw new GatewayServerError(
-        `budget exceeded: input tokens ${used.input}/${tenant.budget.maxInputTokens}`,
+        `budget exceeded: input tokens ${totalInput}/${tenant.budget.maxInputTokens}`,
       );
     }
-    if (used.output >= tenant.budget.maxOutputTokens) {
+    if (totalOutput >= tenant.budget.maxOutputTokens) {
       throw new GatewayServerError(
-        `budget exceeded: output tokens ${used.output}/${tenant.budget.maxOutputTokens}`,
+        `budget exceeded: output tokens ${totalOutput}/${tenant.budget.maxOutputTokens}`,
       );
     }
   }
@@ -263,19 +306,31 @@ export function createGatewayServer(opts: CreateGatewayServerOptions): GatewaySe
       const tenant = tenantFor(claims);
       const decoded = decodeRequest(envelope);
       id = decoded.id;
-      checkBudget(tenant);
-      // Audit every authenticated gateway request.
-      const log = await getAuditLog(tenant);
-      const requestPayload: AppendInput["payload"] = {
-        method: decoded.method,
-        tenantId: tenant.id,
-        sub: claims.sub,
-      };
-      await log.append({ kind: "gateway_request", payload: requestPayload });
-      const result = await withTenant(tenant, () =>
-        opts.handler({ method: decoded.method, params: decoded.params, tenant }),
-      );
-      return encodeSuccess(id, result);
+      // Reserve the estimated cost BEFORE the budget check so this request's
+      // own projected spend, and any concurrent in-flight reservations, are
+      // counted — then release it once the request finishes (actual usage is
+      // recorded out-of-band via recordUsage in the meantime).
+      const estimate =
+        opts.estimateUsage?.({ method: decoded.method, params: decoded.params, tenant }) ??
+        ZERO_USAGE;
+      addReservation(tenant.id, estimate);
+      try {
+        checkBudget(tenant);
+        // Audit every authenticated gateway request.
+        const log = await getAuditLog(tenant);
+        const requestPayload: AppendInput["payload"] = {
+          method: decoded.method,
+          tenantId: tenant.id,
+          sub: claims.sub,
+        };
+        await log.append({ kind: "gateway_request", payload: requestPayload });
+        const result = await withTenant(tenant, () =>
+          opts.handler({ method: decoded.method, params: decoded.params, tenant }),
+        );
+        return encodeSuccess(id, result);
+      } finally {
+        releaseReservation(tenant.id, estimate);
+      }
     } catch (err) {
       if (err instanceof GatewayProtocolError) {
         return encodeError(id, ErrorCode.BadRequest, err.message);
