@@ -266,23 +266,31 @@ export function createWalletEngine(opts: WalletEngineOptions): WalletEngine {
   }
 
   function enforceStaticPolicy(tx: UnsignedTx, policy: TransactionPolicy): void {
-    // `allowedContracts` empty == every declared contract permitted; non-empty
-    // means contractId must be in the list. Raw-address calls (no contractId)
-    // are always rejected when the list is non-empty: the spec author must
-    // declare every callable contract symbolically.
-    if (policy.allowedContracts.length > 0) {
-      if (tx.contractId === undefined) {
-        throw new WalletEngineError(
-          tx.walletId,
-          `transaction_policy.allowedContracts is non-empty; raw-address calls forbidden (to=${tx.to}). Declare a contracts[] entry and pass its id.`,
-        );
-      }
-      if (!policy.allowedContracts.includes(tx.contractId)) {
-        throw new WalletEngineError(
-          tx.walletId,
-          `contract id "${tx.contractId}" not in transaction_policy.allowedContracts ${JSON.stringify(policy.allowedContracts)}`,
-        );
-      }
+    // Fail CLOSED on an empty `allowedContracts`. Previously empty meant "allow
+    // every contract", so an onchain agent on the default policy (allowedContracts
+    // defaults to []) let a prompt-injected model send arbitrary calldata/value
+    // to ANY address — a wallet-drain primitive. Operators must now declare the
+    // callable contract ids in transaction_policy.allowedContracts to permit sends.
+    if (policy.allowedContracts.length === 0) {
+      throw new WalletEngineError(
+        tx.walletId,
+        "transaction_policy.allowedContracts is empty — sends are denied (fail-closed). Declare the callable contract ids in transaction_policy.allowedContracts (bound to addresses via contracts[]).",
+      );
+    }
+    // Non-empty: contractId must be present and whitelisted. Raw-address calls
+    // (no contractId) are rejected — the spec author must declare every callable
+    // contract symbolically.
+    if (tx.contractId === undefined) {
+      throw new WalletEngineError(
+        tx.walletId,
+        `transaction_policy.allowedContracts is non-empty; raw-address calls forbidden (to=${tx.to}). Declare a contracts[] entry and pass its id.`,
+      );
+    }
+    if (!policy.allowedContracts.includes(tx.contractId)) {
+      throw new WalletEngineError(
+        tx.walletId,
+        `contract id "${tx.contractId}" not in transaction_policy.allowedContracts ${JSON.stringify(policy.allowedContracts)}`,
+      );
     }
 
     // #151 — bind `to` to the claimed contractId. `allowedContracts` alone is a
