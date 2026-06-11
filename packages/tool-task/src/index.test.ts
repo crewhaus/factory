@@ -177,6 +177,46 @@ disk instructions`,
       resolveSubAgentDefinition("nonexistent", { subAgentDir: "/tmp/does-not-exist-xyz" }),
     ).toThrow(/unknown subagent_type/);
   });
+
+  // SECURITY: subagent_type is model-filled and becomes `join(dir, name+".md")`,
+  // so an unsanitized `..`/separator escapes the sub-agent dir and loads an
+  // arbitrary host .md as a sub-agent definition. Must be rejected.
+  test.each([
+    "../../../../etc/passwd",
+    "../sibling",
+    "foo/bar",
+    "foo\\bar",
+    "..",
+    ".",
+    "a/../../b",
+  ])("rejects path-traversal subagent_type %p", (evil) => {
+    expect(() =>
+      resolveSubAgentDefinition(evil, { subAgentDir: "/tmp/does-not-exist-xyz" }),
+    ).toThrow(/invalid subagent_type/);
+  });
+
+  test("path-traversal is rejected even when an inline map is present (disk path is the sink)", () => {
+    expect(() =>
+      resolveSubAgentDefinition("../../tmp/evil", {
+        subAgents: new Map(),
+        subAgentDir: "/tmp/does-not-exist-xyz",
+      }),
+    ).toThrow(/invalid subagent_type/);
+  });
+
+  test("ordinary names with dots that are not traversal still resolve via disk", () => {
+    const dir = newTempDir();
+    try {
+      writeFileSync(
+        join(dir, "my.agent.md"),
+        "---\nname: my.agent\ndescription: d\n---\ndo the thing\n",
+      );
+      const out = resolveSubAgentDefinition("my.agent", { subAgentDir: dir });
+      expect(out.name).toBe("my.agent");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("createTaskTool — execute round-trip", () => {

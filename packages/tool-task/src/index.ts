@@ -143,6 +143,27 @@ function loadSubAgentFromDisk(name: string, dir: string): SubAgentDefinition | n
   return parseSubAgentFile(content, name);
 }
 
+/**
+ * `subagent_type` is a model-filled tool argument and model output is
+ * attacker-steerable (via any untrusted input). It becomes a filesystem path
+ * segment in `loadSubAgentFromDisk` (`join(dir, `${name}.md`)`), and `join`
+ * resolves `..` and path separators — so an unsanitized name like
+ * `../../../tmp/evil` reads an arbitrary `.md` on the host and loads it as a
+ * sub-agent definition. Reject anything that isn't a single safe path
+ * component before it reaches the disk lookup. Inline spec-supplied names are
+ * exact-key map lookups that never touch the filesystem, so they are resolved
+ * first (above) and are unaffected.
+ */
+function isUnsafeSubAgentName(name: string): boolean {
+  return (
+    name.includes("/") ||
+    name.includes("\\") ||
+    name.includes("\0") ||
+    name === "." ||
+    name === ".."
+  );
+}
+
 export type CreateTaskToolOptions = {
   /** Inline spec-supplied sub-agent definitions (highest priority). */
   readonly subAgents?: ReadonlyMap<string, SubAgentDefinition>;
@@ -159,6 +180,13 @@ export function resolveSubAgentDefinition(
   if (opts.subAgents !== undefined) {
     const inline = opts.subAgents.get(resolveName);
     if (inline !== undefined) return inline;
+  }
+  // Guard the disk lookup against path traversal (the inline map above is an
+  // exact-key lookup and is intentionally not gated).
+  if (isUnsafeSubAgentName(resolveName)) {
+    throw new SubAgentResolutionError(
+      `invalid subagent_type "${resolveName}" — must not contain path separators, "..", ".", or NUL bytes`,
+    );
   }
   const dir = opts.subAgentDir ?? join(process.cwd(), ".crewhaus", "sub-agents");
   const onDisk = loadSubAgentFromDisk(resolveName, dir);
