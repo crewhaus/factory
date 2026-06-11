@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/sub-agent-permission-inheritance",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "type": "module",
   "description": "resolveChildPermissions — inherit/scoped/replace + bypass non-propagation (Section 13)",
   "main": "src/index.ts",

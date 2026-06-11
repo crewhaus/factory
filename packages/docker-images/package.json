@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/docker-images",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "type": "module",
   "description": "Per-target-shape Docker images (multi-stage, non-root, healthchecked) + crewhaus build-image CLI wrapper (Section 32)",
   "main": "src/index.ts",
