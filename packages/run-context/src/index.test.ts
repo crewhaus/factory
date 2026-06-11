@@ -161,6 +161,34 @@ describe("tagContent (Pillar 3 data-lineage)", () => {
     tagContent(ctx, 123 as any, "subagent");
     expect(ctx.dataLineage).toBeUndefined();
   });
+
+  // SECURITY: partial-reflection coverage. A secret line copied out of a large
+  // multi-line response must still be attributed — whole-blob-only tagging
+  // missed it because the fragment isn't the full tagged string.
+  test("tags each substantial line of a multi-line blob", () => {
+    const ctx = createRunContext();
+    const blob = [
+      "here is a long unremarkable preamble line",
+      "API_KEY=sk-supersecret-value-1234567890",
+      "and a trailing unremarkable footer line",
+    ].join("\n");
+    tagContent(ctx, blob, "mcp");
+    expect(ctx.dataLineage?.get(blob)).toBe("mcp");
+    // Reflecting JUST the secret line is now still attributed to mcp.
+    expect(ctx.dataLineage?.get("API_KEY=sk-supersecret-value-1234567890")).toBe("mcp");
+  });
+
+  test("single-line content still yields exactly one lineage entry", () => {
+    const ctx = createRunContext();
+    tagContent(ctx, "a single line of clearly taggable length", "subagent");
+    expect(ctx.dataLineage?.size).toBe(1);
+  });
+
+  test("skips lines under the 16-char floor", () => {
+    const ctx = createRunContext();
+    tagContent(ctx, "this whole blob is definitely long enough\nshort\n", "mcp");
+    expect(ctx.dataLineage?.has("short")).toBe(false);
+  });
 });
 
 describe("formatAgentIdentity", () => {

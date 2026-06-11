@@ -208,33 +208,68 @@ export function pushOrigin(ctx: RunContext, origin: TrustOrigin): RunContext {
  */
 export const DATA_LINEAGE_CAP = 256;
 
+/** Egress floor: tags shorter than this never produce a substring match. */
+export const MIN_TAG_LENGTH = 16;
+/** Cap on per-call line tags so one huge response can't dominate the lineage. */
+export const MAX_LINE_TAGS = 64;
+
+/**
+ * The set of strings to tag for one piece of content: the whole blob PLUS each
+ * substantial line. Whole-blob tagging catches a full echo; per-line tagging
+ * catches PARTIAL reflection — the realistic exfil shape where the model copies
+ * just the secret line out of a large (e.g. multi-KB MCP) response, which a
+ * whole-blob-only tag misses because the fragment isn't the full tagged string.
+ * Single-line content yields exactly one piece (the blob), unchanged.
+ */
+function lineagePieces(content: string): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const add = (s: string): void => {
+    if (s.length >= MIN_TAG_LENGTH && !seen.has(s)) {
+      seen.add(s);
+      out.push(s);
+    }
+  };
+  add(content);
+  if (content.includes("\n")) {
+    let n = 0;
+    for (const line of content.split("\n")) {
+      if (n >= MAX_LINE_TAGS) break;
+      add(line.trim());
+      n++;
+    }
+  }
+  return out;
+}
+
 /**
  * Tag `content` as having entered the run from `origin`. Called by every
  * Pillar-3 boundary site immediately after `classifyBoundary` returns a
  * non-blocked verdict, so the content that reaches the model's context
  * carries its provenance into the lineage map.
  *
- * Lazy-creates `ctx.dataLineage` if absent. Enforces the size cap by
- * evicting in insertion order (oldest first) — Map's iteration order is
- * insertion order, so `keys().next().value` is the oldest.
- *
- * Does nothing for empty strings (egress-classifier ignores them anyway)
- * and for content shorter than the egress floor (any tag we'd create
- * would never produce a match). The 16-char floor is duplicated here
- * deliberately: callers reading `dataLineage` directly shouldn't have to
- * filter again.
+ * Tags the whole blob AND each substantial line (see `lineagePieces`) so a
+ * single reflected line is still attributed to its origin. Lazy-creates
+ * `ctx.dataLineage`; enforces the size cap by evicting oldest-first (Map
+ * iteration order is insertion order). Pieces shorter than the egress floor
+ * are skipped — any tag we'd create could never produce a match. The floor is
+ * duplicated here deliberately: callers reading `dataLineage` directly
+ * shouldn't have to filter again.
  */
 export function tagContent(ctx: RunContext, content: string, origin: TrustOrigin): void {
   if (typeof content !== "string") return;
-  if (content.length < 16) return;
+  const pieces = lineagePieces(content);
+  if (pieces.length === 0) return;
   if (ctx.dataLineage === undefined) {
     // biome-ignore lint/suspicious/noExplicitAny: legitimate mutation of readonly-ish optional
     (ctx as any).dataLineage = new Map<string, TrustOrigin>();
   }
   const map = ctx.dataLineage as Map<string, TrustOrigin>;
-  // Refresh recency by deleting then re-inserting.
-  if (map.has(content)) map.delete(content);
-  map.set(content, origin);
+  for (const piece of pieces) {
+    // Refresh recency by deleting then re-inserting.
+    if (map.has(piece)) map.delete(piece);
+    map.set(piece, origin);
+  }
   while (map.size > DATA_LINEAGE_CAP) {
     const oldest = map.keys().next().value;
     if (oldest === undefined) break;
