@@ -94,6 +94,8 @@ export type DiscordAdapterConfig = {
 export type DiscordAdapterOptions = {
   readonly apiBaseUrl?: string;
   readonly fetch?: typeof fetch;
+  /** Clock injection for the signature replay-window check (tests). */
+  readonly now?: () => number;
 };
 
 const DEFAULT_API_BASE_URL = "https://discord.com/api/v10";
@@ -110,11 +112,14 @@ export function createDiscordAdapter(
     id: "discord",
 
     verify(req: RawRequest): boolean {
-      return verifyDiscordSignature({
-        headers: req.headers,
-        body: req.body,
-        publicKeyHex: config.publicKeyHex,
-      });
+      return verifyDiscordSignature(
+        {
+          headers: req.headers,
+          body: req.body,
+          publicKeyHex: config.publicKeyHex,
+        },
+        opts.now !== undefined ? { now: opts.now } : {},
+      );
     },
 
     parseInbound(req: RawRequest): ParsedInbound {
