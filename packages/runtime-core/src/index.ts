@@ -148,6 +148,10 @@ import { loadProjectMemory } from "./project-memory";
  */
 
 const DEFAULT_CONTEXT_LIMIT = 200_000;
+// Hard per-turn cap on model→tool cycles. Generous enough that no realistic
+// agentic turn reaches it, low enough to stop a runaway/injected tool loop
+// before it burns a provider quota.
+const DEFAULT_MAX_TOOL_ITERATIONS = 500;
 const DEFAULT_COMPACTION_THRESHOLD = 0.85;
 const DEFAULT_SNIP_KEEP_HEAD = 4;
 const DEFAULT_SNIP_KEEP_TAIL = 20;
@@ -439,6 +443,16 @@ export type RunChatLoopOptions = {
    * this to mark federation-joined or other runtime-discovered sinks dynamic.
    */
   resolveSinkScope?: (toolName: string) => SinkScope;
+  /**
+   * Hard cap on the number of model→tool cycles in a single turn. The loop
+   * detector is advisory (it only injects a one-time warning and is defeated
+   * by trivial argument churn), so this is the ENFORCING bound: a prompt-
+   * injected model steered into an unbounded tool loop is aborted here rather
+   * than burning tokens/tool calls until a provider quota or OOM trips.
+   * Defaults to `DEFAULT_MAX_TOOL_ITERATIONS`; set higher for genuinely long
+   * agentic turns, or lower to tighten.
+   */
+  maxToolIterations?: number;
   /**
    * Section 27 — wrap the resolved primary `ProviderAdapter` in a circuit
    * breaker before any `stream()` call. When the breaker trips, subsequent
@@ -1443,6 +1457,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     let state: TurnState = initialState;
     let terminalContent: Anthropic.ContentBlock[] = [];
     let recovery: RecoveryState = initialRecoveryState;
+    const maxToolIterations = opts.maxToolIterations ?? DEFAULT_MAX_TOOL_ITERATIONS;
+    let toolIterations = 0;
 
     while (state.kind !== "Done") {
       if (turnAbort.signal.aborted) {
@@ -1714,6 +1730,21 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         }
 
         case "NeedTools": {
+          toolIterations += 1;
+          if (toolIterations > maxToolIterations) {
+            // Enforcing loop bound — the advisory loop-detector can't stop a
+            // runaway tool loop (it only warns and is defeated by argument
+            // churn), so fail closed here.
+            await logEvent("error", {
+              name: "ToolLoopLimit",
+              message: `aborting turn: exceeded maxToolIterations (${maxToolIterations}) — possible runaway tool loop`,
+            });
+            runContext.logger.error("tool-iteration cap exceeded — aborting turn", {
+              maxToolIterations,
+            });
+            state = transition(state, { kind: "Aborted" });
+            break;
+          }
           const toolResults = await runToolBatch(state.toolUses);
           messages.push({ role: "user", content: toolResults });
           await logEvent("user_message", { content: toolResults });
