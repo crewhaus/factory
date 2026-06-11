@@ -187,6 +187,15 @@ export interface CustodyProvider {
     readonly walletConfig: WalletConfig;
     readonly adapter: ChainAdapter;
   }): Promise<string>;
+  /**
+   * Optional: the wallet's on-chain address, used as `from` in pre-broadcast
+   * simulation so msg.sender-dependent / access-controlled calls (onlyOwner,
+   * etc.) are modeled as the REAL signer rather than address(0). When a
+   * provider can't (or won't) expose the address ahead of signing, simulation
+   * falls back to no `from` — accurate for stateless calls, best-effort
+   * otherwise.
+   */
+  getAddress?(walletConfig: WalletConfig): Promise<string | undefined>;
 }
 
 /**
@@ -225,12 +234,16 @@ export function createWalletEngine(opts: WalletEngineOptions): WalletEngine {
     return a;
   }
 
-  async function simulate(args: { tx: UnsignedTx }): Promise<SimulationResult> {
+  async function simulate(args: { tx: UnsignedTx; from?: string }): Promise<SimulationResult> {
     const adapter = requireAdapter(args.tx.chainId, args.tx.walletId);
     const callParams: Record<string, unknown> = {
       to: args.tx.to,
       data: args.tx.data,
     };
+    // Run the eth_call AS the signing wallet (not address(0)) so onlyOwner /
+    // msg.sender-dependent logic is modeled faithfully — otherwise a
+    // simulationRequired pre-flight gives false assurance.
+    if (args.from !== undefined) callParams["from"] = args.from;
     if (args.tx.value !== undefined) callParams["value"] = args.tx.value;
     // Prefer eth_call for state-read; fall back to estimateGas for revert detection.
     let returnData: string | undefined;
@@ -370,7 +383,21 @@ export function createWalletEngine(opts: WalletEngineOptions): WalletEngine {
 
     let sim: SimulationResult | undefined;
     if (args.policy.simulationRequired) {
-      sim = await simulate({ tx: args.tx });
+      // Resolve the signer address (best-effort) so simulation runs as the
+      // real wallet, not address(0).
+      let fromAddress: string | undefined;
+      const custody = custodies.get(args.wallet.custody);
+      if (custody?.getAddress !== undefined) {
+        try {
+          fromAddress = await custody.getAddress(args.wallet);
+        } catch {
+          fromAddress = undefined;
+        }
+      }
+      sim = await simulate({
+        tx: args.tx,
+        ...(fromAddress !== undefined ? { from: fromAddress } : {}),
+      });
       if (!sim.success) {
         throw new WalletEngineError(
           args.wallet.id,
