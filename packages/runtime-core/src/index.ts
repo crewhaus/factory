@@ -516,15 +516,37 @@ export function resolveToolResultRoot(): string | undefined {
 }
 
 /**
+ * Sinks whose DESTINATION is chosen at runtime by the (prompt-injectable)
+ * model — a fetched/navigated URL, an on-chain recipient — are effectively
+ * dynamic even though they are spec-declared built-in tools: an attacker who
+ * steers the model picks where the data goes. So non-user cross-origin content
+ * reaching them must reach the egress BLOCK tier, not merely warn. Fixed-
+ * destination sinks are intentionally NOT here: `SendMessage` replies to the
+ * operator-configured channel, `WebSearch`/`ImageGenerate` hit a fixed provider
+ * API — classifying those dynamic would block legitimate replies, so they stay
+ * `"external-configured"` (warn) and can be tightened per-deployment via the
+ * `resolveSinkScope` override or the spec's egress policy.
+ */
+const MODEL_DESTINATION_SINKS: ReadonlySet<string> = new Set([
+  "Fetch",
+  "WebFetch",
+  "Navigate",
+  "EvmSendTransaction",
+]);
+
+/**
  * Default egress sink-scope. Runtime-joined MCP sinks (`mcp__*`) are the
- * canonical dynamically-discovered external sink, so classify them as
- * `"external-dynamic"` — this makes the egress block tier reachable for
- * non-user-origin payloads (#144). Spec-declared built-in sinks stay
+ * canonical dynamically-discovered external sink, and the model-destination
+ * built-ins above are dynamic by virtue of their model-chosen target — both
+ * classify as `"external-dynamic"` so the egress block tier is reachable for
+ * non-user-origin payloads (#144). Other spec-declared built-in sinks stay
  * `"external-configured"` (warn). Override via `runChatLoop({ resolveSinkScope })`
  * to mark federation-joined or other runtime sinks dynamic too.
  */
 export function defaultSinkScope(toolName: string): SinkScope {
-  return toolName.startsWith("mcp__") ? "external-dynamic" : "external-configured";
+  if (toolName.startsWith("mcp__")) return "external-dynamic";
+  if (MODEL_DESTINATION_SINKS.has(toolName)) return "external-dynamic";
+  return "external-configured";
 }
 
 export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
