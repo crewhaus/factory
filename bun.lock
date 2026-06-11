@@ -532,6 +532,13 @@
         "@crewhaus/errors": "workspace:*",
       },
     },
+    "packages/durable-state": {
+      "name": "@crewhaus/durable-state",
+      "version": "0.1.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+      },
+    },
     "packages/egress-classifier": {
       "name": "@crewhaus/egress-classifier",
       "version": "0.1.1",
@@ -738,6 +745,7 @@
       "version": "0.1.1",
       "dependencies": {
         "@crewhaus/audit-log": "workspace:*",
+        "@crewhaus/durable-state": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/gateway-protocol": "workspace:*",
         "@crewhaus/tenancy": "workspace:*",
@@ -2190,6 +2198,8 @@
     "@crewhaus/docker-images": ["@crewhaus/docker-images@workspace:packages/docker-images"],
 
     "@crewhaus/durable-execution": ["@crewhaus/durable-execution@workspace:packages/durable-execution"],
+
+    "@crewhaus/durable-state": ["@crewhaus/durable-state@workspace:packages/durable-state"],
 
     "@crewhaus/egress-classifier": ["@crewhaus/egress-classifier@workspace:packages/egress-classifier"],
 

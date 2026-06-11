@@ -128,7 +128,7 @@ const gateway = createGatewayServer({
       const reply = await runOneTurn({ tenantId: tenant.id, sessionId, input: p.input });
       const inputTokens = Math.ceil(p.input.length / 4);
       const outputTokens = Math.ceil(reply.length / 4);
-      gateway.recordUsage(tenant.id, { input: inputTokens, output: outputTokens });
+      await gateway.recordUsage(tenant.id, { input: inputTokens, output: outputTokens });
       await log.append({
         kind: "model_call",
         payload: { tenantId: tenant.id, sessionId, inputTokens, outputTokens },

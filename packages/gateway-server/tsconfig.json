@@ -6,6 +6,7 @@
   },
   "references": [
     { "path": "../audit-log" },
+    { "path": "../durable-state" },
     { "path": "../errors" },
     { "path": "../gateway-protocol" },
     { "path": "../tenancy" }

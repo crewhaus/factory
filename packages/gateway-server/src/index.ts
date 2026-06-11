@@ -26,6 +26,7 @@
 
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { type AppendInput, type AuditLog, openAuditLog } from "@crewhaus/audit-log";
+import { type BudgetStore, InMemoryBudgetStore } from "@crewhaus/durable-state";
 import { CrewhausError } from "@crewhaus/errors";
 import {
   ErrorCode,
@@ -198,6 +199,16 @@ export type CreateGatewayServerOptions = {
     readonly params: unknown;
     readonly tenant: Tenant;
   }) => UsageDelta;
+  /**
+   * Pluggable budget accounting (audit follow-up R3). Default: in-memory —
+   * per-process semantics identical to before the seam existed. Multi-process
+   * single-host deployments pass a `SqliteBudgetStore` (or a spec-built store
+   * via `createBudgetStore("sqlite:<path>")`) so every replica reserves and
+   * records against the SAME counters; multi-host deployments implement
+   * `BudgetStore` against a network store. Without this, N replicas multiply
+   * every tenant budget by N.
+   */
+  readonly budgetStore?: BudgetStore;
 };
 
 export type UsageDelta = {
@@ -217,10 +228,14 @@ export interface GatewayServer {
    * HTTP layer does.
    */
   handle(request: { readonly bearer?: string; readonly body: unknown }): Promise<unknown>;
-  /** Record token usage against a tenant's running total. */
-  recordUsage(tenantId: string, delta: UsageDelta): void;
+  /**
+   * Record token usage against a tenant's running total. Async since the
+   * budget store may be durable (audit R3); await it so usage is committed
+   * before the response is considered complete.
+   */
+  recordUsage(tenantId: string, delta: UsageDelta): Promise<void>;
   /** Read current usage (mostly for tests). */
-  usage(tenantId: string): { input: number; output: number };
+  usage(tenantId: string): Promise<{ input: number; output: number }>;
   /** Get or build the audit log for a tenant. Memoised. */
   getAuditLog(tenant: Tenant): Promise<AuditLog>;
 }
@@ -228,10 +243,10 @@ export interface GatewayServer {
 const ZERO_USAGE: UsageDelta = { input: 0, output: 0 };
 
 export function createGatewayServer(opts: CreateGatewayServerOptions): GatewayServer {
-  const usageByTenant = new Map<string, { input: number; output: number }>();
-  // In-flight reservations, held only for the duration of a request. Counted
-  // by checkBudget so concurrent requests can't all slip past the cap.
-  const reservedByTenant = new Map<string, { input: number; output: number }>();
+  // Budget accounting (recorded usage + in-flight reservations) lives behind
+  // the BudgetStore seam; the in-memory default preserves the pre-seam
+  // per-process semantics verbatim.
+  const budget = opts.budgetStore ?? new InMemoryBudgetStore();
   const auditLogByTenant = new Map<string, AuditLog>();
   const now = opts.now ?? Date.now;
 
@@ -251,51 +266,6 @@ export function createGatewayServer(opts: CreateGatewayServerOptions): GatewaySe
     return log;
   }
 
-  function bumpUsage(tenantId: string, delta: UsageDelta): void {
-    const cur = usageByTenant.get(tenantId) ?? { input: 0, output: 0 };
-    usageByTenant.set(tenantId, {
-      input: cur.input + delta.input,
-      output: cur.output + delta.output,
-    });
-  }
-
-  function addReservation(tenantId: string, d: UsageDelta): void {
-    if (d.input === 0 && d.output === 0) return;
-    const cur = reservedByTenant.get(tenantId) ?? { input: 0, output: 0 };
-    reservedByTenant.set(tenantId, { input: cur.input + d.input, output: cur.output + d.output });
-  }
-
-  function releaseReservation(tenantId: string, d: UsageDelta): void {
-    if (d.input === 0 && d.output === 0) return;
-    const cur = reservedByTenant.get(tenantId) ?? { input: 0, output: 0 };
-    const next = {
-      input: Math.max(0, cur.input - d.input),
-      output: Math.max(0, cur.output - d.output),
-    };
-    if (next.input === 0 && next.output === 0) reservedByTenant.delete(tenantId);
-    else reservedByTenant.set(tenantId, next);
-  }
-
-  // Budget check counts recorded usage PLUS in-flight reservations, so a single
-  // oversized request (whose estimate already won't fit) and a burst of
-  // concurrent requests are both bounded — not just measured against past usage.
-  function checkBudget(tenant: Tenant): void {
-    const used = usageByTenant.get(tenant.id) ?? { input: 0, output: 0 };
-    const res = reservedByTenant.get(tenant.id) ?? { input: 0, output: 0 };
-    const totalInput = used.input + res.input;
-    const totalOutput = used.output + res.output;
-    if (totalInput >= tenant.budget.maxInputTokens) {
-      throw new GatewayServerError(
-        `budget exceeded: input tokens ${totalInput}/${tenant.budget.maxInputTokens}`,
-      );
-    }
-    if (totalOutput >= tenant.budget.maxOutputTokens) {
-      throw new GatewayServerError(
-        `budget exceeded: output tokens ${totalOutput}/${tenant.budget.maxOutputTokens}`,
-      );
-    }
-  }
-
   async function handleEnvelope(envelope: unknown, bearer: string | undefined): Promise<unknown> {
     let id = "?";
     try {
@@ -306,16 +276,23 @@ export function createGatewayServer(opts: CreateGatewayServerOptions): GatewaySe
       const tenant = tenantFor(claims);
       const decoded = decodeRequest(envelope);
       id = decoded.id;
-      // Reserve the estimated cost BEFORE the budget check so this request's
-      // own projected spend, and any concurrent in-flight reservations, are
-      // counted — then release it once the request finishes (actual usage is
-      // recorded out-of-band via recordUsage in the meantime).
+      // Atomically reserve the estimated cost against recorded + in-flight
+      // usage (the store refuses when the total would exceed the budget on
+      // either dimension) — then release once the request finishes (actual
+      // usage is recorded out-of-band via recordUsage in the meantime). The
+      // check-and-reserve is a single atomic store operation so concurrent
+      // requests — including ones in OTHER processes sharing a durable
+      // store — can't all slip past the cap.
       const estimate =
         opts.estimateUsage?.({ method: decoded.method, params: decoded.params, tenant }) ??
         ZERO_USAGE;
-      addReservation(tenant.id, estimate);
+      const reservation = await budget.tryReserve(tenant.id, estimate, tenant.budget);
+      if (!reservation.ok) {
+        throw new GatewayServerError(
+          `budget exceeded: ${reservation.reason} tokens ${reservation.total}/${reservation.limit}`,
+        );
+      }
       try {
-        checkBudget(tenant);
         // Audit every authenticated gateway request.
         const log = await getAuditLog(tenant);
         const requestPayload: AppendInput["payload"] = {
@@ -329,7 +306,7 @@ export function createGatewayServer(opts: CreateGatewayServerOptions): GatewaySe
         );
         return encodeSuccess(id, result);
       } finally {
-        releaseReservation(tenant.id, estimate);
+        await budget.release(tenant.id, estimate);
       }
     } catch (err) {
       if (err instanceof GatewayProtocolError) {
@@ -394,11 +371,11 @@ export function createGatewayServer(opts: CreateGatewayServerOptions): GatewaySe
     handle(req): Promise<unknown> {
       return handleEnvelope(req.body, req.bearer);
     },
-    recordUsage(tenantId, delta): void {
-      bumpUsage(tenantId, delta);
+    recordUsage(tenantId, delta): Promise<void> {
+      return budget.recordUsage(tenantId, delta);
     },
-    usage(tenantId): { input: number; output: number } {
-      return usageByTenant.get(tenantId) ?? { input: 0, output: 0 };
+    usage(tenantId): Promise<{ input: number; output: number }> {
+      return budget.usage(tenantId);
     },
     getAuditLog,
   };
