@@ -1,4 +1,12 @@
-import { existsSync, realpathSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  constants as fsConstants,
+  fstatSync,
+  openSync,
+  readSync,
+  realpathSync,
+} from "node:fs";
 import * as path from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
 import { buildTool } from "@crewhaus/tool-builder";
@@ -59,6 +67,7 @@ function resolveSafe(toolName: string, rel: string, root: string = process.cwd()
   //    after containment so escaping paths never leak existence info), so
   //    resolve the deepest existing ancestor and re-append the missing tail.
   //    Fails closed if realpath errors for any reason other than the walk.
+  let real: string;
   try {
     const rootReal = realpathSync(rootResolved);
     let probe = abs;
@@ -69,7 +78,7 @@ function resolveSafe(toolName: string, rel: string, root: string = process.cwd()
       if (parent === probe) break; // reached the filesystem root
       probe = parent;
     }
-    const real = tail.length > 0 ? path.join(realpathSync(probe), ...tail) : realpathSync(probe);
+    real = tail.length > 0 ? path.join(realpathSync(probe), ...tail) : realpathSync(probe);
     if (real !== rootReal && !real.startsWith(`${rootReal}${path.sep}`)) {
       throw new ToolPermissionError(toolName, rel);
     }
@@ -77,7 +86,9 @@ function resolveSafe(toolName: string, rel: string, root: string = process.cwd()
     if (err instanceof ToolPermissionError) throw err;
     throw new ToolPermissionError(toolName, rel);
   }
-  return abs;
+  // Return the validated REAL path; the read site opens it with O_NOFOLLOW so a
+  // leaf swapped to a symlink after this check (TOCTOU/CWE-367) is rejected.
+  return real;
 }
 
 export type ImageMediaType = "image/png" | "image/jpeg" | "image/gif" | "image/webp";
@@ -141,19 +152,42 @@ export const readImage: RegisteredTool = buildTool({
   // until the runtime exposes a shared turn store.
   execute: async (input): Promise<string | ToolResultContent> => {
     const abs = resolveSafe("ReadImage", input.path);
-    const file = Bun.file(abs);
-    if (!(await file.exists())) {
-      throw new ToolPermissionError("ReadImage", input.path, "file not found");
+    // Open with O_NOFOLLOW so a leaf swapped to a symlink after the containment
+    // check (TOCTOU/CWE-367) is rejected rather than followed out of the root.
+    let fd: number;
+    try {
+      fd = openSync(abs, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === "ENOENT") {
+        throw new ToolPermissionError("ReadImage", input.path, "file not found");
+      }
+      if (code === "ELOOP") {
+        throw new ToolPermissionError("ReadImage", input.path, "path is a symlink");
+      }
+      throw err;
     }
-    const size = file.size;
-    if (size > MAX_IMAGE_BYTES) {
-      throw new ToolPermissionError(
-        "ReadImage",
-        input.path,
-        `image is ${size} bytes — exceeds the ${MAX_IMAGE_BYTES}-byte cap`,
-      );
+    let buf: Uint8Array;
+    try {
+      const size = fstatSync(fd).size;
+      if (size > MAX_IMAGE_BYTES) {
+        throw new ToolPermissionError(
+          "ReadImage",
+          input.path,
+          `image is ${size} bytes — exceeds the ${MAX_IMAGE_BYTES}-byte cap`,
+        );
+      }
+      const b = Buffer.allocUnsafe(size);
+      let offset = 0;
+      while (offset < size) {
+        const n = readSync(fd, b, offset, size - offset, offset);
+        if (n === 0) break;
+        offset += n;
+      }
+      buf = b.subarray(0, offset);
+    } finally {
+      closeSync(fd);
     }
-    const buf = new Uint8Array(await file.arrayBuffer());
     const mediaType = detectMediaType(buf);
     if (mediaType === null) {
       throw new ToolPermissionError(

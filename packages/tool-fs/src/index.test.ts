@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, rmSync, symlinkSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
@@ -68,6 +68,27 @@ describe("Read tool", () => {
     expect(read.readOnly).toBe(true);
     expect(read.concurrencySafe).toBe(true);
     expect(read.destructive).toBe(false);
+  });
+
+  // SECURITY (CWE-59/367): resolveSafe returns the realpath and the read uses
+  // O_NOFOLLOW. A legitimate IN-workspace symlink still reads (via its real
+  // target); a symlink pointing OUTSIDE the workspace is rejected.
+  test("reads a legitimate in-workspace symlink via its real target", async () => {
+    await writeFile(path.join(tmp, "target.txt"), "real-content");
+    symlinkSync(path.join(tmp, "target.txt"), path.join(tmp, "link.txt"));
+    const result = await read.execute({ path: "link.txt" });
+    expect(result).toBe("real-content");
+  });
+
+  test("rejects an in-workspace symlink that points outside the workspace", async () => {
+    const outside = mkdtempSync(path.join(tmpdir(), "tool-fs-outside-"));
+    try {
+      await writeFile(path.join(outside, "secret.txt"), "OUTSIDE SECRET");
+      symlinkSync(path.join(outside, "secret.txt"), path.join(tmp, "evil.txt"));
+      await expect(read.execute({ path: "evil.txt" })).rejects.toBeInstanceOf(ToolPermissionError);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
   });
 });
 

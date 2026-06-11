@@ -1,5 +1,13 @@
 import { randomBytes } from "node:crypto";
-import { existsSync, realpathSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  constants as fsConstants,
+  fstatSync,
+  openSync,
+  readSync,
+  realpathSync,
+} from "node:fs";
 import { rename, unlink } from "node:fs/promises";
 import * as path from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
@@ -46,6 +54,7 @@ function resolveSafe(toolName: string, rel: string, root: string = process.cwd()
   //    the REAL path. The leaf may not exist yet (Write/Edit create it), so
   //    resolve the deepest existing ancestor and re-append the missing tail.
   //    Fails closed if realpath errors for any reason other than the walk.
+  let real: string;
   try {
     const rootReal = realpathSync(rootResolved);
     let probe = abs;
@@ -56,7 +65,7 @@ function resolveSafe(toolName: string, rel: string, root: string = process.cwd()
       if (parent === probe) break; // reached the filesystem root
       probe = parent;
     }
-    const real = tail.length > 0 ? path.join(realpathSync(probe), ...tail) : realpathSync(probe);
+    real = tail.length > 0 ? path.join(realpathSync(probe), ...tail) : realpathSync(probe);
     if (real !== rootReal && !real.startsWith(`${rootReal}${path.sep}`)) {
       throw new ToolPermissionError(toolName, rel);
     }
@@ -64,7 +73,44 @@ function resolveSafe(toolName: string, rel: string, root: string = process.cwd()
     if (err instanceof ToolPermissionError) throw err;
     throw new ToolPermissionError(toolName, rel);
   }
-  return abs;
+  // Return the validated REAL path, not the lexical one: I/O on the realpath
+  // (with any in-root symlinks already resolved) plus an O_NOFOLLOW open at the
+  // read site closes the check-to-use TOCTOU (CWE-367) — a leaf swapped to a
+  // symlink after this returns is rejected at open, while a legitimate in-root
+  // symlink (resolved here to its real target) still reads fine.
+  return real;
+}
+
+/**
+ * Read a resolveSafe-validated file with O_NOFOLLOW. If the final path
+ * component was swapped to a symlink after the containment check, the open
+ * fails (ELOOP) and we reject rather than follow it out of the workspace.
+ * (Residual: an intermediate-directory swap needs openat-style resolution,
+ * which node does not expose — a much harder attack on a much smaller window.)
+ */
+function readFileNoFollow(toolName: string, absPath: string): Buffer {
+  let fd: number;
+  try {
+    fd = openSync(absPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ELOOP") {
+      throw new ToolPermissionError(toolName, absPath);
+    }
+    throw err;
+  }
+  try {
+    const { size } = fstatSync(fd);
+    const buf = Buffer.allocUnsafe(size);
+    let offset = 0;
+    while (offset < size) {
+      const n = readSync(fd, buf, offset, size - offset, offset);
+      if (n === 0) break;
+      offset += n;
+    }
+    return offset === size ? buf : buf.subarray(0, offset);
+  } finally {
+    closeSync(fd);
+  }
 }
 
 function rejectTraversalPattern(toolName: string, pattern: string): void {
@@ -82,7 +128,7 @@ export const read: RegisteredTool = buildTool({
   concurrencySafe: true,
   execute: async (input) => {
     const abs = resolveSafe("Read", input.path);
-    return await Bun.file(abs).text();
+    return readFileNoFollow("Read", abs).toString("utf8");
   },
 });
 
@@ -120,7 +166,7 @@ export const edit: RegisteredTool = buildTool({
   destructive: true,
   execute: async (input) => {
     const abs = resolveSafe("Edit", input.path);
-    const original = await Bun.file(abs).text();
+    const original = readFileNoFollow("Edit", abs).toString("utf8");
     const occurrences = original.split(input.oldString).length - 1;
     if (occurrences === 0) {
       throw new Error(`oldString not found in "${input.path}"`);
@@ -309,7 +355,8 @@ export const grep: RegisteredTool = buildTool({
       const display = baseRel === "" ? rel : path.join(baseRel, rel);
       let text: string;
       try {
-        text = await Bun.file(fileAbs).text();
+        // O_NOFOLLOW: skip (don't follow) any symlinked entry the glob surfaced.
+        text = readFileNoFollow("Grep", fileAbs).toString("utf8");
       } catch {
         continue;
       }
