@@ -39,6 +39,7 @@ export type {
 } from "./types.js";
 
 export { AnthropicAdapter, createAnthropicAdapter } from "./adapter.js";
+export { createAnthropicVertexAdapter } from "./vertex.js";
 export type { AnthropicAdapterOptions } from "./adapter.js";
 
 export { resolveAuth } from "./auth.js";

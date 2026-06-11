@@ -403,3 +403,21 @@ describe("Gemini error normalisation matrix", () => {
     expect(wrapped.error).toBeUndefined();
   });
 });
+
+describe("createGeminiAdapter — opts.vertexai (router vertex/* path)", () => {
+  test("opts.vertexai forces Vertex mode even with an API key set", () => {
+    const adapter = createGeminiAdapter(
+      { GEMINI_API_KEY: "also-set", GOOGLE_CLOUD_PROJECT: "my-project" },
+      { vertexai: true },
+    );
+    const client = (adapter as unknown as { client: { vertexai: boolean; project?: string } })
+      .client;
+    expect(client.vertexai).toBe(true);
+    expect(client.project).toBe("my-project");
+  });
+
+  test("opts.vertexai without a project throws ProviderAuthError", () => {
+    expect(() => createGeminiAdapter({}, { vertexai: true })).toThrow(ProviderAuthError);
+    expect(() => createGeminiAdapter({}, { vertexai: true })).toThrow(/GOOGLE_CLOUD_PROJECT/);
+  });
+});

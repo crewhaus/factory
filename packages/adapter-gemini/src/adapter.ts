@@ -89,24 +89,33 @@ export class GeminiAdapter implements ProviderAdapter {
   }
 }
 
-export function createGeminiAdapter(env: NodeJS.ProcessEnv = process.env): GeminiAdapter {
+export type CreateGeminiAdapterOptions = {
+  /** Force Vertex AI mode regardless of env flags (the router sets this
+   *  for `vertex/gemini-*` model strings). */
+  readonly vertexai?: boolean;
+};
+
+export function createGeminiAdapter(
+  env: NodeJS.ProcessEnv = process.env,
+  opts: CreateGeminiAdapterOptions = {},
+): GeminiAdapter {
   const apiKey = nonEmpty(env["GEMINI_API_KEY"]) ?? nonEmpty(env["GOOGLE_API_KEY"]);
   const project = nonEmpty(env["GOOGLE_CLOUD_PROJECT"]);
   const location = nonEmpty(env["GOOGLE_CLOUD_LOCATION"]);
   const vertexFlag = (env["GOOGLE_GENAI_USE_VERTEXAI"] ?? "").toLowerCase();
-  const vertexForced = vertexFlag === "true" || vertexFlag === "1";
+  const vertexForced = opts.vertexai === true || vertexFlag === "true" || vertexFlag === "1";
   // Without the explicit flag, a project + location pair (and no API
   // key) is an unambiguous Vertex AI setup — infer it.
   const vertexInferred = apiKey === undefined && project !== undefined && location !== undefined;
 
   if (vertexForced || vertexInferred) {
     if (project === undefined) {
-      // Only reachable when the flag forced Vertex mode — inference
-      // requires a project. Without one the SDK throws an opaque
-      // "Authentication is not set up" Error at construction.
+      // Only reachable when the flag/option forced Vertex mode —
+      // inference requires a project. Without one the SDK throws an
+      // opaque "Authentication is not set up" Error at construction.
       throw new ProviderAuthError(
         "gemini",
-        "GOOGLE_GENAI_USE_VERTEXAI is set but GOOGLE_CLOUD_PROJECT is not — Vertex AI mode requires a Google Cloud project id",
+        "Vertex AI mode is forced (GOOGLE_GENAI_USE_VERTEXAI or a vertex/* model string) but GOOGLE_CLOUD_PROJECT is not set — Vertex AI requires a Google Cloud project id",
       );
     }
     // Vertex AI mode: no API key — auth flows through Application

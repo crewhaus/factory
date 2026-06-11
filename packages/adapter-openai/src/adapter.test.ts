@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import type { ProviderRequest, StreamEvent } from "@crewhaus/adapter-anthropic";
 import { AdapterError, ProviderAuthError } from "@crewhaus/errors";
 import type OpenAI from "openai";
-import { OpenAIAdapter, createOpenAIAdapter } from "./adapter.js";
+import { OpenAIAdapter, createAzureOpenAIAdapter, createOpenAIAdapter } from "./adapter.js";
 
 type ChatChunk = OpenAI.Chat.Completions.ChatCompletionChunk;
 
@@ -462,5 +462,38 @@ describe("createOpenAIAdapter", () => {
       if (prevKey === undefined) Reflect.deleteProperty(process.env, "OPENAI_API_KEY");
       else process.env["OPENAI_API_KEY"] = prevKey;
     }
+  });
+});
+
+describe("createAzureOpenAIAdapter", () => {
+  test("builds an adapter from the AZURE_OPENAI_* env triple", () => {
+    const a = createAzureOpenAIAdapter({ deployment: "my-gpt4o" }, {
+      AZURE_OPENAI_ENDPOINT: "https://fake.openai.azure.com",
+      AZURE_OPENAI_API_KEY: "azure-key",
+    } as NodeJS.ProcessEnv);
+    expect(a).toBeInstanceOf(OpenAIAdapter);
+    expect(a.providerId).toBe("openai");
+  });
+
+  test("honours an explicit AZURE_OPENAI_API_VERSION", () => {
+    const a = createAzureOpenAIAdapter({ deployment: "my-gpt4o" }, {
+      AZURE_OPENAI_ENDPOINT: "https://fake.openai.azure.com",
+      AZURE_OPENAI_API_KEY: "azure-key",
+      AZURE_OPENAI_API_VERSION: "2025-01-01-preview",
+    } as NodeJS.ProcessEnv);
+    expect(a).toBeInstanceOf(OpenAIAdapter);
+  });
+
+  test("missing endpoint or key → ProviderAuthError naming the env vars", () => {
+    expect(() =>
+      createAzureOpenAIAdapter({ deployment: "d" }, {
+        AZURE_OPENAI_API_KEY: "azure-key",
+      } as NodeJS.ProcessEnv),
+    ).toThrow(ProviderAuthError);
+    expect(() =>
+      createAzureOpenAIAdapter({ deployment: "d" }, {
+        AZURE_OPENAI_ENDPOINT: "https://fake.openai.azure.com",
+      } as NodeJS.ProcessEnv),
+    ).toThrow(/AZURE_OPENAI_API_KEY/);
   });
 });
