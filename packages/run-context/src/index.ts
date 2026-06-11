@@ -212,31 +212,119 @@ export const DATA_LINEAGE_CAP = 256;
 export const MIN_TAG_LENGTH = 16;
 /** Cap on per-call line tags so one huge response can't dominate the lineage. */
 export const MAX_LINE_TAGS = 64;
+/**
+ * Token floor (audit follow-up R2). Credential-shaped tokens this long or
+ * longer are tagged even though they're under `MIN_TAG_LENGTH`; the egress
+ * matcher floor (`MIN_MATCH_LENGTH` in egress-classifier) is set to this
+ * value to match — the two must stay in sync.
+ */
+export const MIN_TOKEN_TAG_LENGTH = 8;
+/** Cap on per-call token tags (longest kept) so noise can't flood lineage. */
+export const MAX_TOKEN_TAGS = 16;
+
+/**
+ * Well-known credential prefixes (Stripe sk-/sk_live_/rk_live_, GitHub
+ * ghp_-family + github_pat_, GitLab glpat-, Slack xox?-, AWS AKIA/ASIA,
+ * Google AIza/ya29., npm_, Shopify shpat_/shpss_, Stripe webhook whsec_,
+ * Vault hvs., DigitalOcean dop_v1_, JWT segments eyJ). Curated, not
+ * exhaustive — the assignment-context rule below catches custom schemes.
+ */
+const CREDENTIAL_PREFIX =
+  /^(?:sk-|sk_live_|sk_test_|rk_live_|ghp_|gho_|ghu_|ghs_|ghr_|github_pat_|glpat-|xox[abprs]-|AKIA|ASIA|AIza|ya29\.|npm_|shpat_|shpss_|whsec_|hvs\.|dop_v1_|eyJ)/;
+const HEX_RUN = /^[0-9a-fA-F]{16,}$/;
+const UUID_SHAPE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+const BASE64_SHAPE = /^[A-Za-z0-9+/_=-]{24,}$/;
+/**
+ * `password=...` / `token: ...` style assignments. The KEY context marks the
+ * VALUE as secret regardless of its shape, catching custom credential
+ * schemes the prefix list can't know about.
+ */
+const SECRET_ASSIGNMENT =
+  /(?:password|passwd|pwd|secret|token|api[_-]?key|apikey|access[_-]?key|private[_-]?key|client[_-]?secret|authorization|bearer|credential)["']?\s*[:=]\s*["']?([^\s"'`,;]{8,})/gi;
+
+/**
+ * High-confidence "this token IS a secret" shapes ONLY. A bare
+ * charset-diversity heuristic was considered and rejected: every tool result
+ * is tagged with origin `"tool"` (which blocks at external-dynamic sinks), so
+ * tagging ordinary identifiers like `myVar123` out of file reads would turn
+ * the egress fabric into a false-positive machine. The trade: short secrets
+ * with no recognisable shape and no key=value context are NOT tagged
+ * (documented residual — at that length substring matching cannot
+ * distinguish them from prose anyway).
+ */
+function isCredentialShaped(token: string): boolean {
+  if (CREDENTIAL_PREFIX.test(token)) return true;
+  if (UUID_SHAPE.test(token)) return true;
+  if (HEX_RUN.test(token)) return true;
+  if (BASE64_SHAPE.test(token)) {
+    // Long base64-ish runs qualify only with mixed character classes, so a
+    // long plain word ("internationalization") never does.
+    return /[0-9]/.test(token) && /[a-z]/.test(token) && /[A-Z]/.test(token);
+  }
+  return false;
+}
+
+/** Strip wrapping quotes/brackets/trailing punctuation off a raw token. */
+function trimToken(raw: string): string {
+  return raw.replace(/^["'`(<[{]+/, "").replace(/["'`)\]}>.,;:!?]+$/, "");
+}
+
+/**
+ * Extract credential-shaped tokens (see `isCredentialShaped`) plus values of
+ * secret-keyed assignments. Capped at `MAX_TOKEN_TAGS`, longest first — the
+ * longest candidates are the likeliest real secrets.
+ */
+function credentialTokens(content: string): string[] {
+  const candidates = new Set<string>();
+  for (const raw of content.split(/[\s,;|()<>[\]{}\\]+/)) {
+    const token = trimToken(raw);
+    if (token.length >= MIN_TOKEN_TAG_LENGTH && isCredentialShaped(token)) {
+      candidates.add(token);
+    }
+  }
+  for (const m of content.matchAll(SECRET_ASSIGNMENT)) {
+    const value = trimToken(m[1] ?? "");
+    if (value.length >= MIN_TOKEN_TAG_LENGTH) {
+      candidates.add(value);
+    }
+  }
+  return [...candidates].sort((a, b) => b.length - a.length).slice(0, MAX_TOKEN_TAGS);
+}
 
 /**
  * The set of strings to tag for one piece of content: the whole blob PLUS each
- * substantial line. Whole-blob tagging catches a full echo; per-line tagging
- * catches PARTIAL reflection — the realistic exfil shape where the model copies
- * just the secret line out of a large (e.g. multi-KB MCP) response, which a
- * whole-blob-only tag misses because the fragment isn't the full tagged string.
- * Single-line content yields exactly one piece (the blob), unchanged.
+ * substantial line PLUS credential-shaped tokens. Whole-blob tagging catches a
+ * full echo; per-line tagging catches PARTIAL reflection — the model copying
+ * just the secret line out of a large (e.g. multi-KB MCP) response; token
+ * tagging (audit follow-up R2) catches the model extracting just the SECRET
+ * out of its line ("the key is sk-abc…"), which line pieces miss because the
+ * fragment isn't the full tagged line. Token tagging can be disabled with
+ * `CREWHAUS_DISABLE_TOKEN_LINEAGE=1` (documented escape hatch for operators
+ * whose tool outputs are dense with hex/base64 that is NOT secret).
+ * Single-line content without credential tokens yields exactly one piece
+ * (the blob), unchanged.
  */
 function lineagePieces(content: string): string[] {
   const out: string[] = [];
   const seen = new Set<string>();
-  const add = (s: string): void => {
-    if (s.length >= MIN_TAG_LENGTH && !seen.has(s)) {
+  const add = (s: string, floor: number): void => {
+    if (s.length >= floor && !seen.has(s)) {
       seen.add(s);
       out.push(s);
     }
   };
-  add(content);
+  add(content, MIN_TAG_LENGTH);
   if (content.includes("\n")) {
     let n = 0;
     for (const line of content.split("\n")) {
       if (n >= MAX_LINE_TAGS) break;
-      add(line.trim());
+      add(line.trim(), MIN_TAG_LENGTH);
       n++;
+    }
+  }
+  if (process.env["CREWHAUS_DISABLE_TOKEN_LINEAGE"] !== "1") {
+    for (const token of credentialTokens(content)) {
+      add(token, MIN_TOKEN_TAG_LENGTH);
     }
   }
   return out;
@@ -248,13 +336,14 @@ function lineagePieces(content: string): string[] {
  * non-blocked verdict, so the content that reaches the model's context
  * carries its provenance into the lineage map.
  *
- * Tags the whole blob AND each substantial line (see `lineagePieces`) so a
- * single reflected line is still attributed to its origin. Lazy-creates
- * `ctx.dataLineage`; enforces the size cap by evicting oldest-first (Map
- * iteration order is insertion order). Pieces shorter than the egress floor
- * are skipped — any tag we'd create could never produce a match. The floor is
- * duplicated here deliberately: callers reading `dataLineage` directly
- * shouldn't have to filter again.
+ * Tags the whole blob AND each substantial line AND credential-shaped tokens
+ * (see `lineagePieces`) so a reflected line — or just the extracted secret —
+ * is still attributed to its origin. Lazy-creates `ctx.dataLineage`; enforces
+ * the size cap by evicting oldest-first (Map iteration order is insertion
+ * order). Pieces shorter than their floor (`MIN_TAG_LENGTH` for blob/lines,
+ * `MIN_TOKEN_TAG_LENGTH` for vetted tokens) are skipped — any tag we'd create
+ * could never produce a match. The floors are duplicated here deliberately:
+ * callers reading `dataLineage` directly shouldn't have to filter again.
  */
 export function tagContent(ctx: RunContext, content: string, origin: TrustOrigin): void {
   if (typeof content !== "string") return;

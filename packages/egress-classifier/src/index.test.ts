@@ -162,11 +162,51 @@ describe("classifyEgress", () => {
       classifyEgress(123 as any, ctx, { sinkId: "fetch", sinkScope: "external-configured" }),
     ).rejects.toThrow(/expected a string/);
   });
+
+  // SECURITY (audit R2): the cache key includes a digest of the LINEAGE
+  // CONTENT. The lineage map grows during a run; a verdict computed before a
+  // secret was tagged must not be served after the tag lands — that would be
+  // an egress-scan bypass for every repeated payload.
+  test("lineage growth invalidates a cached verdict for the same payload", async () => {
+    const ctx = createRunContext();
+    tagContent(ctx, "some early boundary content of length", "subagent");
+    const payload = "exfiltrating sk-LaterTagged99 now";
+    const first = await classifyEgress(payload, ctx, {
+      sinkId: "fetch",
+      sinkScope: "external-dynamic",
+    });
+    expect(first.verdict).toBe("pass"); // secret not tagged yet
+    // The secret now crosses a boundary and gets token-tagged.
+    tagContent(ctx, "key issued: sk-LaterTagged99 keep private", "mcp");
+    const second = await classifyEgress(payload, ctx, {
+      sinkId: "fetch",
+      sinkScope: "external-dynamic",
+    });
+    expect(second.fromCache).toBe(false); // NOT served stale
+    expect(second.verdict).toBe("block");
+    expect(second.originsFound).toEqual(["mcp"]);
+  });
+
+  // SECURITY (audit R2): end-to-end short-secret coverage — a credential-
+  // shaped token under the old 16-char floor is tagged at the boundary and
+  // caught at egress when the model extracts JUST the secret from its line.
+  test("a short credential token extracted from its line is caught at egress", async () => {
+    const ctx = createRunContext();
+    tagContent(ctx, "Stripe key for deploys: sk-Ab12Cd34 (rotate quarterly)", "mcp");
+    const result = await classifyEgress("posting sk-Ab12Cd34 to a webhook", ctx, {
+      sinkId: "fetch",
+      sinkScope: "external-dynamic",
+      bypassCache: true,
+    });
+    expect(result.verdict).toBe("block");
+    expect(result.matchCount).toBeGreaterThanOrEqual(1);
+    expect(result.originsFound).toEqual(["mcp"]);
+  });
 });
 
 describe("MIN_MATCH_LENGTH constant", () => {
-  test("is 16", () => {
-    expect(MIN_MATCH_LENGTH).toBe(16);
+  test("is 8 — parity with run-context's MIN_TOKEN_TAG_LENGTH (audit R2)", () => {
+    expect(MIN_MATCH_LENGTH).toBe(8);
   });
 });
 
@@ -234,11 +274,11 @@ describe("SubstringEgressMatcher (FR-006)", () => {
   test("respects the minMatchLength floor passed in the input", () => {
     // Use the concrete class so `.match` is the synchronous overload.
     const m = new SubstringEgressMatcher();
-    const lineage = new Map<string, TrustOrigin>([["shortish", "subagent"]]);
-    // Under default floor → no hit.
+    const lineage = new Map<string, TrustOrigin>([["short67", "subagent"]]);
+    // Under default floor (8) → a 7-char tag never matches.
     expect(
       m.match({
-        payload: "carries shortish inside",
+        payload: "carries short67 inside",
         lineage,
         minMatchLength: MIN_MATCH_LENGTH,
       }).matchCount,
@@ -246,7 +286,7 @@ describe("SubstringEgressMatcher (FR-006)", () => {
     // With a low floor → hit.
     expect(
       m.match({
-        payload: "carries shortish inside",
+        payload: "carries short67 inside",
         lineage,
         minMatchLength: 4,
       }).matchCount,
