@@ -84,7 +84,8 @@ describe("detectFamily", () => {
     expect(detectFamily("us.mistral.pixtral-large-2502-v1:0")).toBe("mistral");
   });
   test("geo prefix does not rescue unknown families", () => {
-    expect(detectFamily("us.cohere.command-r-v1:0")).toBe("unknown");
+    expect(detectFamily("us.cohere.embed-english-v3")).toBe("unknown");
+    expect(detectFamily("us.stability.stable-diffusion-xl-v1")).toBe("unknown");
   });
   test("non-geo segments are not stripped", () => {
     expect(detectFamily("used.anthropic.claude-x")).toBe("unknown");
