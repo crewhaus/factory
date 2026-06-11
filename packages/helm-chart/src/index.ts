@@ -78,7 +78,25 @@ export type ChartValues = {
       readonly signing: { readonly secretName: string; readonly key: string };
       readonly bot: { readonly secretName: string; readonly key: string };
     };
+    /**
+     * Generic provider secret list — one container env var per entry,
+     * each sourced from a Kubernetes Secret. The escape hatch for
+     * non-Anthropic models (OPENAI_API_KEY, GEMINI_API_KEY/GOOGLE_API_KEY,
+     * AWS_BEARER_TOKEN_BEDROCK/AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, …).
+     * Presets are documented in values.yaml.
+     */
+    readonly provider?: ReadonlyArray<{
+      readonly name: string;
+      readonly secretName: string;
+      readonly key: string;
+    }>;
   };
+  /**
+   * Plain (non-secret) env vars appended to the container — provider
+   * region/endpoint selectors like AWS_REGION, OPENAI_BASE_URL,
+   * GOOGLE_CLOUD_PROJECT.
+   */
+  readonly extraEnv?: ReadonlyArray<{ readonly name: string; readonly value: string }>;
   readonly service: {
     readonly type: "ClusterIP" | "LoadBalancer" | "NodePort";
     readonly port: number;
@@ -117,7 +135,9 @@ export function defaultValues(): ChartValues {
         signing: { secretName: "crewhaus-creds", key: "SLACK_SIGNING_SECRET" },
         bot: { secretName: "crewhaus-creds", key: "SLACK_BOT_TOKEN" },
       },
+      provider: [],
     },
+    extraEnv: [],
     service: { type: "ClusterIP", port: 80, targetPort: 3000 },
     ingress: {
       enabled: false,
@@ -159,6 +179,20 @@ export function validateValues(values: ChartValues): void {
   }
   if (!values.image.tag) {
     throw new HelmChartError("image.tag must be non-empty");
+  }
+  for (const entry of values.secrets.provider ?? []) {
+    if (!entry.name || !entry.secretName || !entry.key) {
+      throw new HelmChartError(
+        `secrets.provider entries need name + secretName + key; got ${JSON.stringify(entry)}`,
+      );
+    }
+  }
+  for (const entry of values.extraEnv ?? []) {
+    if (!entry.name || typeof entry.value !== "string") {
+      throw new HelmChartError(
+        `extraEnv entries need name + string value; got ${JSON.stringify(entry)}`,
+      );
+    }
   }
 }
 

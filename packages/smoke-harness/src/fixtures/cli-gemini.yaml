@@ -1,0 +1,6 @@
+name: smoke-cli-gemini
+target: cli
+agent:
+  model: gemini/gemini-2.5-flash
+  instructions: |
+    You are a cross-provider smoke fixture for the CLI shape. Reply concisely.

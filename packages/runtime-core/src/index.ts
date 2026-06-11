@@ -24,7 +24,7 @@ import {
   classifyEgress,
   summarizeEgress,
 } from "@crewhaus/egress-classifier";
-import { RuntimeError } from "@crewhaus/errors";
+import { ConfigError, RuntimeError } from "@crewhaus/errors";
 import { type EventKind, type EventLog, openEventLog } from "@crewhaus/event-log";
 import { type HookDef, type HookEvent, aggregateDecisions, runHooks } from "@crewhaus/hooks-engine";
 import { resolveModel } from "@crewhaus/model-router";
@@ -606,6 +606,15 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   void breakerWrap; // exposed via runtime stats once gateway/eval consumers land
   const providerId: ProviderId = primaryResolution.providerId;
   const wireModelId: string = primaryResolution.modelId;
+  // Section 17 — feature gate: a spec that declares tools cannot run on an
+  // adapter that doesn't speak tool use (e.g. Bedrock Llama/Mistral
+  // families). Fail with a clear ConfigError naming the model instead of
+  // letting the provider 400 (or silently drop the tools) mid-run.
+  if ((opts.tools ?? []).length > 0 && adapter.features.tool_use === false) {
+    throw new ConfigError(
+      `model "${opts.model}" (provider ${providerId}) does not support tool use — remove tools or pick a tool-capable model`,
+    );
+  }
   let compactionAdapter: ProviderAdapter;
   let compactionWireModelId: string;
   if (opts._compactionAdapter !== undefined) {

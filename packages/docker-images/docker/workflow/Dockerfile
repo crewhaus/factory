@@ -21,6 +21,6 @@ USER crewhaus
 ENV NODE_ENV=production CREWHAUS_TARGET=workflow
 EXPOSE 0
 HEALTHCHECK --interval=30s --timeout=5s --start-period=2s --retries=3 \
-  CMD bun /app/crewhaus.js doctor || exit 1
+  CMD bun /app/crewhaus.js doctor --liveness || exit 1
 ENTRYPOINT ["bun", "/app/crewhaus.js"]
 CMD ["run", "/spec/crewhaus.yaml"]

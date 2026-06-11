@@ -1,6 +1,7 @@
 import { CrewhausError } from "@crewhaus/errors";
 import { escapeJsonString } from "@crewhaus/infra-utils";
 import type { Bundle, IrChannelV0, IrSecretRef, IrSubAgentDefinition } from "@crewhaus/ir";
+import { type ParsedModelString, parseModelString } from "@crewhaus/model-router";
 
 /**
  * Emit a self-contained channel-bot bundle for a channel-target IR.
@@ -161,6 +162,44 @@ function requiredEnvNames(ir: IrChannelV0): string[] {
     if (imessage.cursorPath?.kind === "env") names.push(imessage.cursorPath.name);
   }
   return names;
+}
+
+/**
+ * Provider credential env GROUPS derived from `ir.agent.model` at emit
+ * time. Each inner array is an EITHER-OR group: the daemon's startup
+ * check requires at least one name per group to be set — distinct from
+ * `requiredEnvNames` where every name is individually required.
+ *
+ *   anthropic → ANTHROPIC_AUTH_TOKEN | ANTHROPIC_API_KEY
+ *   openai    → OPENAI_API_KEY | OPENAI_BASE_URL
+ *   gemini    → GEMINI_API_KEY | GOOGLE_API_KEY
+ *   bedrock   → none (the AWS SDK's default credential chain is
+ *               authoritative; env vars are only one of its sources)
+ *   local/…   → none (the baseUrl is baked in; no credentials)
+ *
+ * A model string outside the router grammar contributes NO group — the
+ * spec layer does not enforce the grammar here, and runtime-core's
+ * `resolveModel` raises the authoritative ConfigError at run time.
+ */
+function providerEnvGroups(model: string): string[][] {
+  let parsed: ParsedModelString;
+  try {
+    parsed = parseModelString(model);
+  } catch {
+    return [];
+  }
+  switch (parsed.providerId) {
+    case "anthropic":
+      return [["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"]];
+    case "openai":
+      // local/<m>@<url> parses to openai WITH a baked baseUrl — the local
+      // endpoint needs no env credentials.
+      return parsed.baseUrl !== undefined ? [] : [["OPENAI_API_KEY", "OPENAI_BASE_URL"]];
+    case "gemini":
+      return [["GEMINI_API_KEY", "GOOGLE_API_KEY"]];
+    case "bedrock":
+      return [];
+  }
 }
 
 function renderPermissionsField(ir: IrChannelV0): string {
@@ -549,17 +588,41 @@ function renderDaemon(ir: IrChannelV0): string {
   const mcp = renderMcpServers(ir);
   const subAgents = renderSubAgents(ir);
   const envNames = requiredEnvNames(ir);
+  // Provider credential groups (either-or) derived from agent.model at
+  // emit time — a daemon on an openai/gemini model must not demand
+  // Anthropic credentials, and vice versa.
+  const envGroups = providerEnvGroups(ir.agent.model);
 
+  const startupEnvCheckLines: string[] = [];
+  if (envNames.length > 0) {
+    startupEnvCheckLines.push(`const __requiredEnv = ${JSON.stringify(envNames)};`);
+  }
+  if (envGroups.length > 0) {
+    startupEnvCheckLines.push(
+      "// Provider credentials for the agent model — ANY one name per group suffices.",
+      `const __providerEnvAnyOf: string[][] = ${JSON.stringify(envGroups)};`,
+    );
+  }
+  if (envNames.length > 0 || envGroups.length > 0) {
+    startupEnvCheckLines.push(
+      "const __missingEnv: string[] = [",
+      ...(envNames.length > 0 ? ["  ...__requiredEnv.filter((n) => !process.env[n]),"] : []),
+      ...(envGroups.length > 0
+        ? [
+            "  ...__providerEnvAnyOf",
+            "    .filter((g) => !g.some((n) => process.env[n]))",
+            '    .map((g) => g.join(" or ")),',
+          ]
+        : []),
+      "];",
+      "if (__missingEnv.length > 0) {",
+      '  process.stderr.write(`[daemon] missing required env vars: ${__missingEnv.join(", ")}\\n`);',
+      "  process.exit(2);",
+      "}",
+    );
+  }
   const startupEnvCheck =
-    envNames.length > 0
-      ? `const __requiredEnv = ${JSON.stringify(envNames)};
-const __missing = __requiredEnv.filter((n) => !process.env[n]);
-if (__missing.length > 0) {
-  process.stderr.write(\`[daemon] missing required env vars: \${__missing.join(", ")}\\n\`);
-  process.exit(2);
-}
-`
-      : "";
+    startupEnvCheckLines.length > 0 ? `${startupEnvCheckLines.join("\n")}\n` : "";
 
   const adapterImports: string[] = [];
   const adapterConstructs: string[] = [];

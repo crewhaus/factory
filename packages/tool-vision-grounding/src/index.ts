@@ -30,7 +30,7 @@ import {
   extractFirstText,
 } from "@crewhaus/adapter-anthropic";
 import type { Driver } from "@crewhaus/computer-use-driver";
-import { CrewhausError } from "@crewhaus/errors";
+import { ConfigError, CrewhausError } from "@crewhaus/errors";
 import { resolveModel } from "@crewhaus/model-router";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
@@ -195,10 +195,19 @@ export function createFindElementTool(opts: CreateFindElementToolOptions): Regis
     concurrencySafe: false,
     classifyOutput: false,
     execute: async (input) => {
-      const png = await opts.driver.screenshot();
       const resolution = opts._adapter
         ? { adapter: opts._adapter, modelId: opts.model, providerId: opts._adapter.providerId }
         : await resolveModel(opts.model);
+      // Section 17 — feature gate BEFORE taking/sending a screenshot: a
+      // non-vision grounding model (e.g. a text-only Bedrock family) must
+      // fail with a clear ConfigError, not an opaque provider 400 after
+      // the image upload.
+      if (resolution.adapter.features.vision === false) {
+        throw new ConfigError(
+          `grounding model "${opts.model}" (provider ${resolution.providerId}) does not support vision — FindElement needs a vision-capable model (set groundingModel to one)`,
+        );
+      }
+      const png = await opts.driver.screenshot();
       let lastErr: unknown;
       for (let attempt = 0; attempt < 2; attempt++) {
         try {

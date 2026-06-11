@@ -1,0 +1,6 @@
+name: smoke-cli-local
+target: cli
+agent:
+  model: local/llama3.2@http://localhost:11434/v1
+  instructions: |
+    You are a cross-provider smoke fixture for the CLI shape. Reply concisely.

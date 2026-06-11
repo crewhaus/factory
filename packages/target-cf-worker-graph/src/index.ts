@@ -1,6 +1,7 @@
 import { CrewhausError } from "@crewhaus/errors";
 import { escapeJsonString } from "@crewhaus/infra-utils";
 import type { Bundle, IrGraphNode, IrGraphV0 } from "@crewhaus/ir";
+import { parseModelString } from "@crewhaus/model-router";
 
 export type EmitOptions = {
   /**
@@ -62,6 +63,25 @@ export class TargetEmitError extends CrewhausError {
 }
 
 /**
+ * Reject any model string the router would dispatch to a non-Anthropic
+ * provider (openai/, gemini/, bedrock/, local/…) — the inlined worker
+ * client only speaks the Anthropic Messages API.
+ */
+function assertAnthropicModel(model: string, where: string): void {
+  let providerId: string;
+  try {
+    providerId = parseModelString(model).providerId;
+  } catch (err) {
+    throw new TargetEmitError(`${where} model "${model}": ${(err as Error).message}`, err);
+  }
+  if (providerId !== "anthropic") {
+    throw new TargetEmitError(
+      `${where} model "${model}" routes to provider "${providerId}" — cf-worker targets currently support claude-* models only — use the cli target for other providers`,
+    );
+  }
+}
+
+/**
  * Validate the graph the same way `@crewhaus/target-graph`'s `validateGraph`
  * does (entry must be declared; every edge from/to must reference a declared
  * node), reject the features a stateless Worker cannot honour (HITL, tools),
@@ -90,6 +110,10 @@ function linearOrder(ir: IrGraphV0): readonly IrGraphNode[] {
 
   // 2. Feature gating — a stateless single Worker can't honour these.
   for (const n of ir.nodes) {
+    // Provider gate — the emitted worker inlines an api.anthropic.com
+    // client and POSTs each node's model verbatim, so a non-Anthropic
+    // model string would compile cleanly and 502 at runtime.
+    assertAnthropicModel(n.model, `node "${n.name}"`);
     if (n.hitlPrompt !== undefined) {
       throw new TargetEmitError(
         `cf-worker-graph does not support HITL in M2 (node "${n.name}" has hitlPrompt); use the local graph target for HITL`,

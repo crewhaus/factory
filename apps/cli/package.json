@@ -40,6 +40,7 @@
     "@crewhaus/ir": "workspace:*",
     "@crewhaus/logging": "workspace:*",
     "@crewhaus/mcp-host": "workspace:*",
+    "@crewhaus/model-router": "workspace:*",
     "@crewhaus/migration-engine": "workspace:*",
     "@crewhaus/migration-runner": "workspace:*",
     "@crewhaus/permission-engine": "workspace:*",
