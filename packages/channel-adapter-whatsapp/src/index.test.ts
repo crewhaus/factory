@@ -22,6 +22,11 @@ const APP_SECRET = "wa-app-secret";
 const PHONE_NUMBER_ID = "999000999000";
 const ACCESS_TOKEN = "EAAxxxxxxxxx";
 
+// The static fixtures carry a fixed (old) messages[].timestamp; pin the
+// replay-window clock near it so the signature tests exercise auth, not age.
+const FIXTURE_TS = 1700000123;
+const FIXTURE_NOW = () => FIXTURE_TS * 1000;
+
 function signedHeaders(body: string): Headers {
   const sig = signWhatsAppBody({ body, appSecret: APP_SECRET });
   const h = new Headers();
@@ -34,6 +39,7 @@ function adapter(overrides: { fetch?: typeof fetch } = {}): ChannelAdapter {
     { phoneNumberId: PHONE_NUMBER_ID, accessToken: ACCESS_TOKEN, appSecret: APP_SECRET },
     {
       apiBaseUrl: "https://test.graph.local",
+      now: FIXTURE_NOW,
       ...(overrides.fetch ? { fetch: overrides.fetch } : {}),
     },
   );
@@ -42,12 +48,41 @@ function adapter(overrides: { fetch?: typeof fetch } = {}): ChannelAdapter {
 describe("verifyWhatsAppSignature (T8)", () => {
   test("matches a valid signature", () => {
     const body = fixture("text_message");
-    const r = verifyWhatsAppSignature({
-      headers: signedHeaders(body),
-      body,
-      appSecret: APP_SECRET,
-    });
+    const r = verifyWhatsAppSignature(
+      {
+        headers: signedHeaders(body),
+        body,
+        appSecret: APP_SECRET,
+      },
+      { now: FIXTURE_NOW },
+    );
     expect(r).toBe(true);
+  });
+
+  // SECURITY: WhatsApp signs only the body (no signed timestamp), so a captured
+  // signed POST verified forever. Bound it with messages[].timestamp.
+  test("rejects a stale captured message under the real clock (replay window)", () => {
+    const body = fixture("text_message"); // fixture ts is years old vs Date.now()
+    expect(
+      verifyWhatsAppSignature({ headers: signedHeaders(body), body, appSecret: APP_SECRET }),
+    ).toBe(false);
+  });
+
+  test("rejects a message whose timestamp is in the future beyond tolerance", () => {
+    const body = fixture("text_message");
+    expect(
+      verifyWhatsAppSignature(
+        { headers: signedHeaders(body), body, appSecret: APP_SECRET },
+        { now: () => (FIXTURE_TS - 3600) * 1000 },
+      ),
+    ).toBe(false);
+  });
+
+  test("accepts a status-only webhook with no message timestamp (no freshness gate)", () => {
+    const body = fixture("status_only");
+    expect(
+      verifyWhatsAppSignature({ headers: signedHeaders(body), body, appSecret: APP_SECRET }),
+    ).toBe(true);
   });
 
   test("rejects tampered body", () => {
@@ -293,7 +328,9 @@ describe("signWhatsAppBody (T8)", () => {
     const sig = signWhatsAppBody({ body, appSecret: APP_SECRET });
     expect(sig).toMatch(/^sha256=[0-9a-f]{64}$/);
     const h = new Headers({ "X-Hub-Signature-256": sig });
-    expect(verifyWhatsAppSignature({ headers: h, body, appSecret: APP_SECRET })).toBe(true);
+    expect(
+      verifyWhatsAppSignature({ headers: h, body, appSecret: APP_SECRET }, { now: FIXTURE_NOW }),
+    ).toBe(true);
   });
 
   test("is deterministic for a given (body, secret)", () => {
