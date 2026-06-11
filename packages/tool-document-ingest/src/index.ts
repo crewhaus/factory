@@ -30,7 +30,16 @@
  *      boundary-classifier with the existing `tool` origin (Pillar 3);
  *      file contents may contain anything (e.g. a prompt-injecting PDF).
  */
-import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  constants as fsConstants,
+  fstatSync,
+  openSync,
+  readSync,
+  realpathSync,
+  statSync,
+} from "node:fs";
 import { basename, dirname, extname, join, resolve, sep } from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
 import { buildTool } from "@crewhaus/tool-builder";
@@ -86,6 +95,7 @@ function resolveSafe(toolName: string, rel: string, root: string = process.cwd()
   //    after containment so escaping paths never leak existence info), so
   //    resolve the deepest existing ancestor and re-append the missing tail.
   //    Fails closed if realpath errors for any reason other than the walk.
+  let real: string;
   try {
     const rootReal = realpathSync(rootResolved);
     let probe = abs;
@@ -96,7 +106,7 @@ function resolveSafe(toolName: string, rel: string, root: string = process.cwd()
       if (parent === probe) break; // reached the filesystem root
       probe = parent;
     }
-    const real = tail.length > 0 ? join(realpathSync(probe), ...tail) : realpathSync(probe);
+    real = tail.length > 0 ? join(realpathSync(probe), ...tail) : realpathSync(probe);
     if (real !== rootReal && !real.startsWith(`${rootReal}${sep}`)) {
       throw new ToolPermissionError(toolName, rel);
     }
@@ -104,7 +114,40 @@ function resolveSafe(toolName: string, rel: string, root: string = process.cwd()
     if (err instanceof ToolPermissionError) throw err;
     throw new ToolPermissionError(toolName, rel);
   }
-  return abs;
+  // Return the validated REAL path; the read below opens it with O_NOFOLLOW so a
+  // leaf swapped to a symlink after this check (TOCTOU/CWE-367) is rejected.
+  return real;
+}
+
+/**
+ * Read a resolveSafe-validated text file with O_NOFOLLOW so a leaf swapped to a
+ * symlink after the containment check is rejected rather than followed out of
+ * the workspace. (Custom parsers read the resolved realpath themselves and are
+ * out of this guard's scope.)
+ */
+function readTextNoFollow(absPath: string): string {
+  let fd: number;
+  try {
+    fd = openSync(absPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ELOOP") {
+      throw new ToolPermissionError("IngestDocument", absPath);
+    }
+    throw err;
+  }
+  try {
+    const { size } = fstatSync(fd);
+    const b = Buffer.allocUnsafe(size);
+    let offset = 0;
+    while (offset < size) {
+      const n = readSync(fd, b, offset, size - offset, offset);
+      if (n === 0) break;
+      offset += n;
+    }
+    return b.toString("utf-8", 0, offset);
+  } finally {
+    closeSync(fd);
+  }
 }
 
 const TEXT_EXTENSIONS = new Set([".txt", ".md", ".mdx", ".log", ".out", ".rst"]);
@@ -200,7 +243,7 @@ export const ingestDocument: RegisteredTool = buildTool({
       STRUCTURED_EXTENSIONS.has(ext) ||
       ext === ""
     ) {
-      const raw = readFileSync(abs, "utf-8");
+      const raw = readTextNoFollow(abs);
       const metadata: Record<string, unknown> = {
         ext: ext || "(none)",
         size: stat.size,
