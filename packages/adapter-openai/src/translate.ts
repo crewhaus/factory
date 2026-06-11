@@ -16,9 +16,18 @@
  * - Cache markers: OpenAI auto-caches at the API layer — we silently
  *   drop `cache_control` markers (surfaced via `features.caching =
  *   "automatic"`).
+ * - Token cap: reasoning models (o-series, gpt-5 family) reject
+ *   `max_tokens` with a 400 and require `max_completion_tokens`;
+ *   OpenAI-compatible servers (Ollama, vLLM, llama.cpp, …) only
+ *   understand `max_tokens`. We branch on the model id.
+ * - Tool-result images: OpenAI `tool` role messages accept only
+ *   strings, so images inside `tool_result` blocks are re-emitted as a
+ *   follow-up `user` message (each image preceded by a text part naming
+ *   the originating tool call) so vision models still see them.
  */
 
 import type {
+  CanonicalImageBlockParam,
   CanonicalMessage,
   CanonicalTextBlockParam,
   CanonicalTool,
@@ -54,7 +63,11 @@ export function toOpenAIChatParams(
   const params: OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming = {
     model: req.model,
     messages,
-    max_tokens: req.maxTokens,
+    // Reasoning models 400 on `max_tokens`; compat servers only
+    // understand `max_tokens`. Branch on the model id.
+    ...(usesMaxCompletionTokens(req.model)
+      ? { max_completion_tokens: req.maxTokens }
+      : { max_tokens: req.maxTokens }),
     stream: true,
     stream_options: { include_usage: true },
   };
@@ -67,6 +80,16 @@ export function toOpenAIChatParams(
   }
 
   return params;
+}
+
+/**
+ * OpenAI's reasoning models (o1/o3/o4-mini, gpt-5 family) reject
+ * `max_tokens` with a 400 and require `max_completion_tokens` instead.
+ * Everything else — including the long tail of OpenAI-compatible
+ * servers routed through this adapter via baseURL — keeps `max_tokens`.
+ */
+function usesMaxCompletionTokens(model: string): boolean {
+  return /^(o\d|gpt-5)/.test(model);
 }
 
 function collapseSystem(system: ReadonlyArray<CanonicalTextBlockParam>): string {
@@ -120,16 +143,19 @@ function pushUserMessage(
 
   // Walk blocks: text/image → user message parts; tool_result → split
   // into a separate `tool` role message per result (OpenAI's shape).
+  // Images inside tool_results can't ride on the `tool` message (OpenAI
+  // only accepts strings there), so they're queued as follow-up user
+  // parts — emitted after the contiguous run of tool messages so tool
+  // responses stay adjacent to their assistant tool_calls message.
   const userParts: OpenAI.Chat.Completions.ChatCompletionContentPart[] = [];
+  const imageFollowUps: OpenAI.Chat.Completions.ChatCompletionContentPart[] = [];
   for (const block of content) {
     if (block.type === "text") {
+      userParts.push(...imageFollowUps.splice(0));
       userParts.push({ type: "text", text: block.text });
     } else if (block.type === "image") {
-      const url =
-        block.source.type === "base64"
-          ? `data:${block.source.media_type};base64,${block.source.data}`
-          : block.source.url;
-      userParts.push({ type: "image_url", image_url: { url } });
+      userParts.push(...imageFollowUps.splice(0));
+      userParts.push(toImageUrlPart(block));
     } else if (block.type === "tool_result") {
       // Flush accumulated user parts before emitting the tool message
       // so order is preserved.
@@ -142,11 +168,35 @@ function pushUserMessage(
         tool_call_id: block.tool_use_id,
         content: stringifyToolResultContent(block.content),
       });
+      // Queue any images from this result, each labelled with the tool
+      // call it came from so the model can correlate.
+      if (typeof block.content !== "string" && block.content !== undefined) {
+        for (const part of block.content) {
+          if (part.type === "image") {
+            imageFollowUps.push({
+              type: "text",
+              text: `[Image output of tool call ${block.tool_use_id}]`,
+            });
+            imageFollowUps.push(toImageUrlPart(part));
+          }
+        }
+      }
     }
   }
+  userParts.push(...imageFollowUps.splice(0));
   if (userParts.length > 0) {
     messages.push({ role: "user", content: userParts });
   }
+}
+
+function toImageUrlPart(
+  block: CanonicalImageBlockParam,
+): OpenAI.Chat.Completions.ChatCompletionContentPartImage {
+  const url =
+    block.source.type === "base64"
+      ? `data:${block.source.media_type};base64,${block.source.data}`
+      : block.source.url;
+  return { type: "image_url", image_url: { url } };
 }
 
 function pushAssistantMessage(
@@ -188,8 +238,9 @@ function pushAssistantMessage(
 function stringifyToolResultContent(content: CanonicalToolResultContent | undefined): string {
   if (content === undefined) return "";
   if (typeof content === "string") return content;
-  // Array of text/image blocks: text concatenated; images dropped (Chat
-  // tool messages don't accept image parts).
+  // Array of text/image blocks: text concatenated. Images can't appear
+  // here (Chat tool messages don't accept image parts) — they're
+  // re-emitted as a follow-up user message by `pushUserMessage`.
   return content
     .filter((b): b is { type: "text"; text: string } => b.type === "text")
     .map((b) => b.text)

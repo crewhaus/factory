@@ -252,6 +252,87 @@ describe("OpenAIAdapter", () => {
     expect(caught).toBe(abortErr);
   });
 
+  test("stream() retries ONCE without stream_options on a 400 that rejects it", async () => {
+    // Some compat servers/proxies 400 on `stream_options` — the adapter
+    // strips it and retries once instead of tombstoning the request.
+    const calls: {
+      params: OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming;
+      opts: { signal?: AbortSignal };
+    }[] = [];
+    const ctrl = new AbortController();
+    const client = fakeClient({
+      create: (params, opts) => {
+        calls.push({ params, opts });
+        if (calls.length === 1) {
+          return Promise.reject(
+            Object.assign(new Error("Unrecognized request argument supplied: stream_options"), {
+              status: 400,
+            }),
+          );
+        }
+        return Promise.resolve(
+          gen([
+            mkChunk({ content: "ok" }),
+            mkChunk({}, "stop", { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 }),
+          ]),
+        );
+      },
+    });
+    const a = new OpenAIAdapter({ client });
+    const events = await drain(a.stream({ ...REQ, signal: ctrl.signal }));
+    expect(calls).toHaveLength(2);
+    expect(calls[0]?.params.stream_options).toEqual({ include_usage: true });
+    expect(calls[1]?.params.stream_options).toBeUndefined();
+    // Everything else survives the strip, and the abort signal is
+    // forwarded on the retry too.
+    expect(calls[1]?.params.model).toBe(REQ.model);
+    expect(calls[1]?.params.stream).toBe(true);
+    expect(calls[1]?.opts.signal).toBe(ctrl.signal);
+    expect(events.map((e) => e.kind).at(-1)).toBe("message_stop");
+  });
+
+  test("stream() does NOT retry a 400 unrelated to stream_options", async () => {
+    let callCount = 0;
+    const client = fakeClient({
+      create: () => {
+        callCount += 1;
+        return Promise.reject(Object.assign(new Error("bad parameter foo"), { status: 400 }));
+      },
+    });
+    const a = new OpenAIAdapter({ client });
+    let caught: unknown;
+    try {
+      await drain(a.stream(REQ));
+    } catch (err) {
+      caught = err;
+    }
+    expect(callCount).toBe(1);
+    expect(caught).toBeInstanceOf(AdapterError);
+    expect((caught as { error?: { type?: string } }).error?.type).toBe("invalid_request_error");
+  });
+
+  test("stream() gives up after one stream_options retry (no infinite loop)", async () => {
+    let callCount = 0;
+    const client = fakeClient({
+      create: () => {
+        callCount += 1;
+        return Promise.reject(
+          Object.assign(new Error("stream_options is not supported"), { status: 400 }),
+        );
+      },
+    });
+    const a = new OpenAIAdapter({ client });
+    let caught: unknown;
+    try {
+      await drain(a.stream(REQ));
+    } catch (err) {
+      caught = err;
+    }
+    expect(callCount).toBe(2);
+    expect(caught).toBeInstanceOf(AdapterError);
+    expect((caught as { error?: { type?: string } }).error?.type).toBe("invalid_request_error");
+  });
+
   test("estimateTokens delegates to token-budget heuristic", () => {
     const client = fakeClient({ create: () => Promise.resolve(gen([])) });
     const a = new OpenAIAdapter({ client });
