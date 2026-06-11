@@ -77,6 +77,8 @@ export type WhatsAppAdapterOptions = {
   readonly apiBaseUrl?: string;
   readonly fetch?: typeof fetch;
   readonly apiVersion?: string;
+  /** Clock injection for the signature replay-window check (tests). */
+  readonly now?: () => number;
 };
 
 const DEFAULT_API_BASE_URL = "https://graph.facebook.com";
@@ -96,11 +98,14 @@ export function createWhatsAppAdapter(
     id: "whatsapp",
 
     verify(req: RawRequest): boolean {
-      return verifyWhatsAppSignature({
-        headers: req.headers,
-        body: req.body,
-        appSecret: config.appSecret,
-      });
+      return verifyWhatsAppSignature(
+        {
+          headers: req.headers,
+          body: req.body,
+          appSecret: config.appSecret,
+        },
+        opts.now !== undefined ? { now: opts.now } : {},
+      );
     },
 
     parseInbound(req: RawRequest): ParsedInbound {
