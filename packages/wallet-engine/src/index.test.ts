@@ -85,6 +85,58 @@ describe("createWalletEngine — happy path", () => {
   });
 });
 
+// SECURITY: simulationRequired must model the REAL signer, not address(0),
+// or onlyOwner / msg.sender-dependent calls give false assurance (#415).
+describe("createWalletEngine — simulation from-address", () => {
+  test("passes the wallet address as eth_call `from` when custody exposes getAddress", async () => {
+    let seenFrom: unknown = "UNSET";
+    const we = createWalletEngine({
+      resolveAdapter: () =>
+        fakeAdapter((method, params) => {
+          if (method === "eth_call") {
+            seenFrom = (params[0] as Record<string, unknown>)["from"];
+            return "0x";
+          }
+          if (method === "eth_estimateGas") return "0x5208";
+          if (method === "eth_getTransactionReceipt") return { blockNumber: "0x1", status: "0x1" };
+          return null;
+        }),
+      approve: async () => "allow",
+    });
+    we.registerCustody({
+      custody: "local",
+      async signAndBroadcast() {
+        return "0xhash";
+      },
+      async getAddress() {
+        return "0xWALLETADDR";
+      },
+    });
+    await we.requestSignAndBroadcast({ tx: TX_OK, policy: POLICY, wallet: WALLET });
+    expect(seenFrom).toBe("0xWALLETADDR");
+  });
+
+  test("omits `from` (back-compat) when custody does not expose getAddress", async () => {
+    let sawFromKey = true;
+    const we = createWalletEngine({
+      resolveAdapter: () =>
+        fakeAdapter((method, params) => {
+          if (method === "eth_call") {
+            sawFromKey = "from" in (params[0] as Record<string, unknown>);
+            return "0x";
+          }
+          if (method === "eth_estimateGas") return "0x5208";
+          if (method === "eth_getTransactionReceipt") return { blockNumber: "0x1", status: "0x1" };
+          return null;
+        }),
+      approve: async () => "allow",
+    });
+    we.registerCustody(createLocalSignerStub()); // no getAddress
+    await we.requestSignAndBroadcast({ tx: TX_OK, policy: POLICY, wallet: WALLET });
+    expect(sawFromKey).toBe(false);
+  });
+});
+
 describe("createWalletEngine — policy enforcement", () => {
   test("rejects when contractId is missing and allowedContracts is non-empty", async () => {
     const we = createWalletEngine({
