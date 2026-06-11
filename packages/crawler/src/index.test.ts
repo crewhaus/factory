@@ -1040,3 +1040,54 @@ describe("createCrawler — file:// symlink containment (CWE-59)", () => {
     }
   });
 });
+
+// SECURITY: closing the DNS-rebinding TOCTOU — the socket must connect to the
+// exact IP assertNotSsrf validated, not whatever the resolver returns at
+// connect time. The fetcher receives that pinned IP as its 3rd argument.
+describe("createCrawler — DNS-rebinding pin", () => {
+  test("threads the validated (resolved) IP to the fetcher for a hostname", async () => {
+    _setDnsLookup(async () => ({ address: "93.184.216.34", family: 4 }));
+    const root = newRoot();
+    let seenPinnedIp: string | undefined;
+    try {
+      const crawler = createCrawler({
+        tracker: createCitationTracker({ rootDir: root }),
+        config: {
+          allowedOrigins: new Set(["https://innocent.example"]),
+          _httpFetch: async (_url, _init, pinnedIp) => {
+            seenPinnedIp = pinnedIp;
+            return new Response("ok", { status: 200 });
+          },
+        },
+      });
+      const r = await crawler.fetch("https://innocent.example/x");
+      expect(r.content).toBe("ok");
+      // The pin is the IP we vetted at check time — a later rebind to a
+      // private address cannot take effect because the socket targets this IP.
+      expect(seenPinnedIp).toBe("93.184.216.34");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("pins a public IP-literal origin to the literal itself", async () => {
+    const root = newRoot();
+    let seenPinnedIp: string | undefined;
+    try {
+      const crawler = createCrawler({
+        tracker: createCitationTracker({ rootDir: root }),
+        config: {
+          allowedOrigins: new Set(["http://93.184.216.34"]),
+          _httpFetch: async (_url, _init, pinnedIp) => {
+            seenPinnedIp = pinnedIp;
+            return new Response("ok", { status: 200 });
+          },
+        },
+      });
+      await crawler.fetch("http://93.184.216.34/x");
+      expect(seenPinnedIp).toBe("93.184.216.34");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
