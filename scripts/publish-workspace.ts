@@ -25,6 +25,13 @@
  *
  * Brand-new package names can 404 on the registry for a few minutes after a
  * successful publish — poll before assuming failure or re-running.
+ *
+ * Ownership guard: before touching any name that already exists on the
+ * registry (including the already-published skip path), the registry's
+ * `repository` url+directory must match the local package.json's, else the
+ * package is reported as a failure instead of published/skipped. This is
+ * what catches two workspaces accidentally sharing one npm name. The guard
+ * also runs under --dry-run, making it a usable pre-flight.
  */
 
 import { spawnSync } from "node:child_process";
@@ -36,6 +43,8 @@ type PkgInfo = {
   version: string;
   dir: string;
   deps: string[]; // names of internal @crewhaus/* dependencies
+  repoUrl?: string; // package.json repository.url — used for the ownership check
+  repoDir?: string; // package.json repository.directory
 };
 
 const args = process.argv.slice(2);
@@ -95,11 +104,14 @@ function discoverPackages(): PkgInfo[] {
       ...((pkg.dependencies as Record<string, string>) ?? {}),
       ...((pkg.peerDependencies as Record<string, string>) ?? {}),
     };
+    const repo = pkg.repository as { url?: string; directory?: string } | undefined;
     return {
       name: pkg.name as string,
       version: pkg.version as string,
       dir,
       deps: Object.keys(allDeps).filter((d) => allNames.has(d)),
+      repoUrl: repo?.url,
+      repoDir: repo?.directory,
     };
   });
 
@@ -156,6 +168,44 @@ function isPublished(name: string, version: string): boolean {
   });
   if (r.status === 0 && r.stdout.trim().length > 0) return true;
   return false;
+}
+
+/** Normalize a repository URL for comparison: lowercase, strip git+ / .git. */
+function normRepoUrl(url: string | undefined): string {
+  return (url ?? "")
+    .toLowerCase()
+    .replace(/^git\+/, "")
+    .replace(/\.git$/, "");
+}
+
+/**
+ * Ownership guard: if the name already exists on the registry, its
+ * `repository` (url + directory) must match this local package. Two
+ * different local packages publishing to one npm name is otherwise a
+ * SILENT hijack — `@crewhaus/plugin-sdk` was two distinct packages
+ * (factory §41 vs utilities Studio SDK) across 0.1.1→0.1.2 and nobody
+ * was told. Returns null when ok (or name not on the registry yet),
+ * else a human-readable mismatch description.
+ */
+function ownershipMismatch(p: PkgInfo): string | null {
+  const r = spawnSync("npm", ["view", p.name, "repository", "--json"], {
+    encoding: "utf-8",
+  });
+  if (r.status !== 0) return null; // name not on the registry — first publish
+  let repo: { url?: string; directory?: string };
+  try {
+    repo = JSON.parse(r.stdout || "{}") ?? {};
+  } catch {
+    return "registry repository field is unparseable — verify ownership manually";
+  }
+  const urlOk = normRepoUrl(repo.url) === normRepoUrl(p.repoUrl);
+  const dirOk = (repo.directory ?? "") === (p.repoDir ?? "");
+  if (urlOk && dirOk) return null;
+  return (
+    `registry says repository=${repo.url ?? "<none>"} dir=${repo.directory ?? "<none>"}, ` +
+    `local says repository=${p.repoUrl ?? "<none>"} dir=${p.repoDir ?? "<none>"} — ` +
+    "this npm name appears to belong to a DIFFERENT package; publishing would hijack it"
+  );
 }
 
 type PublishResult = "ok" | "already" | "failed";
@@ -218,6 +268,15 @@ let skipped = 0;
 const failures: string[] = [];
 
 for (const p of filtered) {
+  // Ownership first, even on the would-skip path: a version-exists skip is
+  // exactly how a hijacked name hides ("already on registry" tells you
+  // nothing about WHOSE content that is). Runs in dry-run too.
+  const mismatch = ownershipMismatch(p);
+  if (mismatch) {
+    failures.push(`${p.name}@${p.version} (ownership)`);
+    console.error(`✗ ${p.name}: ${mismatch}`);
+    continue;
+  }
   if (!DRY && isPublished(p.name, p.version)) {
     console.log(`= ${p.name}@${p.version} already on registry — skipping`);
     skipped++;
