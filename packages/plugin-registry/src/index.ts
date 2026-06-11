@@ -81,6 +81,13 @@ export type PluginRegistryOptions = {
   /** Trust anchors for signature verification. */
   readonly trustAnchors?: ReadonlyArray<TrustAnchorSource>;
   /**
+   * When `trustAnchors` are configured, `register()` verifies each manifest's
+   * signature and refuses to persist an unsigned or invalidly-signed plugin
+   * (fail closed). Set `allowUnsigned: true` to opt out — e.g. local
+   * development or tests that register fixtures without real signatures.
+   */
+  readonly allowUnsigned?: boolean;
+  /**
    * Secrets backend, required only when any TrustAnchorSource has
    * `kind: "secret"`. Plugin-registry calls `secrets.get(secretName)`
    * to resolve the PEM at verify-time, so rotating the secret takes
@@ -198,6 +205,7 @@ export function createPluginRegistry(opts: PluginRegistryOptions): PluginRegistr
   const writeFile = opts.writeFileImpl ?? defaultWriteFile;
   const exists = opts.existsImpl ?? defaultExists;
   const anchors = opts.trustAnchors ?? [];
+  const allowUnsigned = opts.allowUnsigned ?? false;
   if (anchors.some((a) => a.kind === "secret") && opts.secrets === undefined) {
     throw new PluginRegistryError(
       'plugin-registry: secrets backend required when any trustAnchor is kind: "secret"',
@@ -249,6 +257,24 @@ export function createPluginRegistry(opts: PluginRegistryOptions): PluginRegistr
 
   return {
     async register(args): Promise<PluginRegistryEntry> {
+      // Verify the signature at register time when trust anchors are
+      // configured. Previously any manifest was persisted after schema
+      // validation only, so a forged/unsigned manifest could land in the
+      // on-disk registry and be surfaced to hosts — and folded into
+      // aggregatedPermissions — as a trusted, installed plugin.
+      if (anchors.length > 0 && !allowUnsigned) {
+        const sig = args.manifest.signature;
+        if (sig === undefined) {
+          throw new PluginRegistryError(
+            `plugin-registry: refusing to register unsigned plugin "${args.manifest.name}" — trustAnchors are configured (pass allowUnsigned: true to override)`,
+          );
+        }
+        if (!(await verifyManifestSignature(args.manifest, sig))) {
+          throw new PluginRegistryError(
+            `plugin-registry: signature verification failed for plugin "${args.manifest.name}" — not registered`,
+          );
+        }
+      }
       const shape = load();
       const existing = shape.entries[args.manifest.name];
       if (existing && !args.replace && existing.sourcePath !== args.sourcePath) {

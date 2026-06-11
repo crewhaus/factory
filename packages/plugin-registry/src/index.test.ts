@@ -86,7 +86,7 @@ describe("register / list / get / unregister", () => {
       readFileImpl: mem.read,
       writeFileImpl: mem.write,
       existsImpl: mem.exists,
-    } as never);
+    });
     await reg.register({
       manifest: { name: "alpha", version: "1.0.0" },
       sourcePath: "/p/alpha/manifest.json",
@@ -243,6 +243,9 @@ describe("verifyEntry", () => {
     const reg = createPluginRegistry({
       registryPath: REG_PATH,
       trustAnchors: [{ kind: "pem", name: "trusted", publicKeyPem: trustedPem }],
+      // Bypass the register-time check so we can persist a wrong-key manifest
+      // and exercise verifyEntry's rejection specifically.
+      allowUnsigned: true,
       readFileImpl: mem.read,
       writeFileImpl: mem.write,
       existsImpl: mem.exists,
@@ -263,6 +266,9 @@ describe("verifyEntry", () => {
     const reg = createPluginRegistry({
       registryPath: REG_PATH,
       trustAnchors: [{ kind: "pem", name: "trusted", publicKeyPem }],
+      // Bypass the register-time check so we can persist an unsigned manifest
+      // and exercise verifyEntry's rejection specifically.
+      allowUnsigned: true,
       readFileImpl: mem.read,
       writeFileImpl: mem.write,
       existsImpl: mem.exists,
@@ -346,6 +352,69 @@ describe("verifyEntry", () => {
     });
     await reg.register({ manifest: signed, sourcePath: "/p/alpha/manifest.json" });
     expect(await reg.verifyEntry("alpha")).toBe(true);
+  });
+});
+
+// SECURITY: register() must not persist a forged/unsigned manifest into the
+// on-disk registry when trust anchors are configured — those entries are
+// surfaced to hosts (and folded into aggregatedPermissions) as trusted.
+describe("register signature verification (fail-closed)", () => {
+  test("refuses to register an unsigned manifest under trust anchors", async () => {
+    const { publicKeyPem } = makeKeypair();
+    const reg = createPluginRegistry({
+      registryPath: REG_PATH,
+      trustAnchors: [{ kind: "pem", name: "trusted", publicKeyPem }],
+      readFileImpl: mem.read,
+      writeFileImpl: mem.write,
+      existsImpl: mem.exists,
+    });
+    await expect(
+      reg.register({ manifest: { name: "alpha", version: "1.0.0" }, sourcePath: "/p/alpha" }),
+    ).rejects.toThrow(/unsigned/);
+  });
+
+  test("refuses to register a wrong-key signed manifest under trust anchors", async () => {
+    const { publicKeyPem: trustedPem } = makeKeypair();
+    const { privateKey: untrustedKey } = makeKeypair();
+    const signed = signManifest({ name: "alpha", version: "1.0.0" }, untrustedKey);
+    const reg = createPluginRegistry({
+      registryPath: REG_PATH,
+      trustAnchors: [{ kind: "pem", name: "trusted", publicKeyPem: trustedPem }],
+      readFileImpl: mem.read,
+      writeFileImpl: mem.write,
+      existsImpl: mem.exists,
+    });
+    await expect(reg.register({ manifest: signed, sourcePath: "/p/alpha" })).rejects.toThrow(
+      /verification failed/,
+    );
+  });
+
+  test("registers a correctly-signed manifest", async () => {
+    const { publicKeyPem, privateKey } = makeKeypair();
+    const signed = signManifest({ name: "alpha", version: "1.0.0" }, privateKey);
+    const reg = createPluginRegistry({
+      registryPath: REG_PATH,
+      trustAnchors: [{ kind: "pem", name: "trusted", publicKeyPem }],
+      readFileImpl: mem.read,
+      writeFileImpl: mem.write,
+      existsImpl: mem.exists,
+    });
+    const entry = await reg.register({ manifest: signed, sourcePath: "/p/alpha" });
+    expect(entry.manifest.name).toBe("alpha");
+  });
+
+  test("allows an unsigned manifest when NO trust anchors are configured (back-compat)", async () => {
+    const reg = createPluginRegistry({
+      registryPath: REG_PATH,
+      readFileImpl: mem.read,
+      writeFileImpl: mem.write,
+      existsImpl: mem.exists,
+    });
+    const entry = await reg.register({
+      manifest: { name: "alpha", version: "1.0.0" },
+      sourcePath: "/p/alpha",
+    });
+    expect(entry.manifest.name).toBe("alpha");
   });
 });
 
