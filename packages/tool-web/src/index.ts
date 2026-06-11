@@ -118,17 +118,74 @@ export function _setDnsLookup(fn: DnsLookupFn | undefined): void {
   dnsLookupFn = fn ?? defaultDnsLookup;
 }
 
+// Normalise octal/hex/integer IPv4 literals (e.g. 0177.0.0.1, 0x7f000001,
+// 2130706433) to dotted-decimal so isPrivateIp can classify them — browsers
+// and many HTTP stacks accept these forms, which would otherwise bypass a
+// naive dotted-only check. Mirrors @crewhaus/tool-fetch / crawler.
+function normalizeIpv4(raw: string): string | null {
+  const trimmed = raw.trim();
+  if (trimmed === "") return null;
+  const parseComponent = (s: string): number | null => {
+    if (s === "") return null;
+    let value: number;
+    if (/^0[xX][0-9a-fA-F]+$/.test(s)) value = Number.parseInt(s.slice(2), 16);
+    else if (/^0[0-7]+$/.test(s)) value = Number.parseInt(s, 8);
+    else if (/^[0-9]+$/.test(s)) value = Number.parseInt(s, 10);
+    else return null;
+    return Number.isNaN(value) ? null : value;
+  };
+  const segments = trimmed.split(".");
+  if (segments.length > 4) return null;
+  const components: number[] = [];
+  for (const seg of segments) {
+    const value = parseComponent(seg);
+    if (value === null || value < 0) return null;
+    components.push(value);
+  }
+  const n = components.length;
+  const octets = [0, 0, 0, 0];
+  for (let i = 0; i < n - 1; i++) {
+    const c = components[i] as number;
+    if (c > 255) return null;
+    octets[i] = c;
+  }
+  const last = components[n - 1] as number;
+  const maxLast = 2 ** (8 * (4 - (n - 1)));
+  if (last >= maxLast) return null;
+  let rest = last;
+  for (let i = 3; i >= n - 1; i--) {
+    octets[i] = rest & 0xff;
+    rest = Math.floor(rest / 256);
+  }
+  return octets.join(".");
+}
+
 function isPrivateIp(addr: string): boolean {
-  let ip = addr.replace(/^\[/, "").replace(/\]$/, "").toLowerCase();
-  // IPv4-mapped IPv6 (::ffff:127.0.0.1) — unwrap and re-check the IPv4 tail.
-  const mapped = ip.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
-  if (mapped?.[1] !== undefined) ip = mapped[1];
+  const ip = addr.replace(/^\[/, "").replace(/\]$/, "");
+  const lowerIp = ip.toLowerCase();
 
-  if (ip === "::1" || ip === "::") return true; // IPv6 loopback / unspecified
-  if (ip.startsWith("fe80:")) return true; // IPv6 link-local
-  if (ip.startsWith("fc") || ip.startsWith("fd")) return true; // IPv6 unique-local
+  if (lowerIp === "::" || lowerIp === "::1") return true; // IPv6 unspecified / loopback
+  if (lowerIp.startsWith("fe80:")) return true; // IPv6 link-local
+  if (lowerIp.startsWith("fc") || lowerIp.startsWith("fd")) return true; // IPv6 unique-local
 
-  const parts = ip.split(".").map((p) => Number.parseInt(p, 10));
+  // IPv4-mapped IPv6 — both dotted (::ffff:127.0.0.1) AND hex-compressed
+  // (::ffff:7f00:1, which `new URL` normalizes [::ffff:127.0.0.1] into).
+  const mapped = lowerIp.match(/^::ffff:(.+)$/);
+  if (mapped) {
+    const tail = mapped[1] as string;
+    if (tail.includes(".")) return isPrivateIp(tail);
+    const hexGroups = tail.split(":");
+    if (hexGroups.length === 2 && hexGroups.every((g) => /^[0-9a-f]{1,4}$/.test(g))) {
+      const hi = Number.parseInt(hexGroups[0] as string, 16);
+      const lo = Number.parseInt(hexGroups[1] as string, 16);
+      return isPrivateIp([(hi >> 8) & 0xff, hi & 0xff, (lo >> 8) & 0xff, lo & 0xff].join("."));
+    }
+    return false;
+  }
+
+  const normalized = normalizeIpv4(ip);
+  if (normalized === null) return false;
+  const parts = normalized.split(".").map((p) => Number.parseInt(p, 10));
   if (parts.length !== 4 || parts.some((n) => Number.isNaN(n) || n < 0 || n > 255)) {
     return false;
   }
@@ -138,7 +195,9 @@ function isPrivateIp(addr: string): boolean {
   if (a === 169 && b === 254) return true; // 169.254.0.0/16 link-local + cloud metadata
   if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12 RFC1918
   if (a === 192 && b === 168) return true; // 192.168.0.0/16 RFC1918
-  if (a === 100 && b >= 64 && b <= 127) return true; // 100.64.0.0/10 CGNAT
+  if (a === 100 && b >= 64 && b <= 127) return true; // 100.64.0.0/10 CGNAT (RFC6598)
+  if (a === 192 && b === 0 && parts[2] === 0) return true; // 192.0.0.0/24 (RFC6890)
+  if (a === 198 && (b === 18 || b === 19)) return true; // 198.18.0.0/15 (RFC2544)
   if (a === 0) return true; // 0.0.0.0/8
   return false;
 }
@@ -147,8 +206,14 @@ function isPrivateIp(addr: string): boolean {
  * Reject any host that is — or resolves to — a private/loopback/link-local
  * address. Applied at the initial URL and at every redirect hop, regardless
  * of the allow-list. Fails closed if the name cannot be resolved.
+ *
+ * Returns the validated IP so the caller can PIN the connection to that exact
+ * address — resolving here and letting the default `fetch` re-resolve at
+ * connect time is a DNS-rebinding TOCTOU (CWE-367): a hostile resolver can
+ * answer public for this check and private for the socket. For an IP-literal
+ * host the pinned value is the (normalized) literal itself.
  */
-async function assertNotSsrf(hostname: string): Promise<void> {
+async function assertNotSsrf(hostname: string): Promise<string> {
   const lower = hostname.toLowerCase();
   if (lower === "localhost" || lower.endsWith(".localhost")) {
     throw new WebFetchPermissionError(`WebFetch denied: host "${hostname}" resolves to loopback`);
@@ -156,13 +221,17 @@ async function assertNotSsrf(hostname: string): Promise<void> {
   if (lower.endsWith(".local")) {
     throw new WebFetchPermissionError(`WebFetch denied: mDNS host "${hostname}" is not allowed`);
   }
-  if (isPrivateIp(lower)) {
+  const unbracketed = lower.replace(/^\[/, "").replace(/\]$/, "");
+  if (isPrivateIp(unbracketed)) {
     throw new WebFetchPermissionError(
       `WebFetch denied: host "${hostname}" is a private/loopback IP`,
     );
   }
+  // An IP literal is its own pinned target — nothing to resolve or rebind.
+  const literal = normalizeIpv4(unbracketed) ?? (unbracketed.includes(":") ? unbracketed : null);
+  if (literal !== null) return literal;
   // Resolve so a public-looking name pointing at an internal IP (DNS
-  // rebinding) is still caught.
+  // rebinding) is still caught — and return the address so the caller dials it.
   let resolved: { readonly address: string; readonly family: number };
   try {
     resolved = await dnsLookupFn(lower);
@@ -175,6 +244,7 @@ async function assertNotSsrf(hostname: string): Promise<void> {
       `WebFetch denied: host "${hostname}" resolves to private IP ${resolved.address}`,
     );
   }
+  return resolved.address;
 }
 
 // ─── WebFetch ─────────────────────────────────────────────────────────
@@ -184,10 +254,46 @@ const webFetchSchema = z.object({
   prompt: z.string().optional(),
 });
 
-export type RawFetch = (req: Request) => Promise<Response>;
+/**
+ * `pinnedIp` is the address `assertNotSsrf` validated for the request's host
+ * (empty string ⇒ no pin, e.g. fixed trusted API hosts). The production
+ * fetcher dials that exact IP, preserving the Host header and TLS SNI, so the
+ * socket can't be rebound to a private address between the SSRF check and
+ * connect. Test stubs may ignore the argument.
+ */
+export type RawFetch = (req: Request, pinnedIp: string) => Promise<Response>;
+
+// Dial `pinnedIp` directly while keeping the real host for the Host header and
+// TLS SNI. Mirrors @crewhaus/tool-fetch.
+function pinnedFetch(req: Request, pinnedIp: string): Promise<Response> {
+  const original = new URL(req.url);
+  const host = original.hostname;
+  const hostUnbracketed = host.replace(/^\[/, "").replace(/\]$/, "");
+  if (pinnedIp === "" || hostUnbracketed === pinnedIp) {
+    return globalThis.fetch(req);
+  }
+  const hostForUrl = pinnedIp.includes(":") ? `[${pinnedIp}]` : pinnedIp;
+  const pinnedUrl = new URL(original.toString());
+  pinnedUrl.hostname = hostForUrl;
+  const headers = new Headers(req.headers);
+  headers.set("host", original.port === "" ? host : `${host}:${original.port}`);
+  const init: RequestInit & { tls?: { serverName: string } } = {
+    method: req.method,
+    headers,
+    redirect: "manual",
+    signal: req.signal,
+    tls: { serverName: host },
+  };
+  if (req.method !== "GET" && req.method !== "HEAD") {
+    init.body = req.body;
+    (init as { duplex?: string }).duplex = "half";
+  }
+  return globalThis.fetch(pinnedUrl.toString(), init);
+}
+
 // Production default — one named fetcher shared by the initial binding and the
 // `_setRawFetch(undefined)` reset path (see defaultDnsLookup for rationale).
-const defaultRawFetch: RawFetch = (req) => globalThis.fetch(req);
+const defaultRawFetch: RawFetch = pinnedFetch;
 let rawFetch: RawFetch = defaultRawFetch;
 export function _setRawFetch(fn: RawFetch | undefined): void {
   rawFetch = fn ?? defaultRawFetch;
@@ -240,7 +346,9 @@ async function performWebFetch(initialUrl: URL, signal: AbortSignal): Promise<Re
       );
     }
     // SSRF guard — independent of the allow-list, enforced on every hop.
-    await assertNotSsrf(currentUrl.hostname);
+    // The returned IP pins the socket so a rebinding resolver can't swap in a
+    // private address between this check and connect.
+    const pinnedIp = await assertNotSsrf(currentUrl.hostname);
     if (!isHostAllowed(currentUrl.hostname)) {
       throw new WebFetchPermissionError(
         `WebFetch denied: host "${currentUrl.hostname}" is not in allowed_domains`,
@@ -254,6 +362,7 @@ async function performWebFetch(initialUrl: URL, signal: AbortSignal): Promise<Re
         signal,
         headers: { "user-agent": "crewhaus-tool-web/0.1" },
       }),
+      pinnedIp,
     );
     if (res.status >= 300 && res.status < 400 && res.headers.has("location")) {
       const loc = res.headers.get("location") ?? "";
@@ -404,11 +513,13 @@ async function braveSearch(
   // allowed/blocked as advisory hints rather than binding constraints
   // (the provider doesn't enforce them server-side).
   const url = `https://api.search.brave.com/res/v1/web/search?${params.toString()}`;
+  // Fixed, trusted API host — not model-controlled, so no SSRF pin needed.
   const res = await rawFetch(
     new Request(url, {
       headers: { accept: "application/json", "x-subscription-token": apiKey },
       signal,
     }),
+    "",
   );
   if (!res.ok) {
     throw new WebFetchPermissionError(`Brave search failed: HTTP ${res.status}`);
@@ -446,6 +557,8 @@ async function tavilySearch(
       }),
       signal,
     }),
+    // Fixed, trusted API host — not model-controlled, so no SSRF pin needed.
+    "",
   );
   if (!res.ok) {
     throw new WebFetchPermissionError(`Tavily search failed: HTTP ${res.status}`);

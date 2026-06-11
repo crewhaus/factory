@@ -251,6 +251,48 @@ describe("WebFetch — SSRF guard (#141)", () => {
     );
     await expect(webFetch.execute({ url: "https://example.com/" })).resolves.toBeDefined();
   });
+
+  // `new URL` compresses [::ffff:127.0.0.1] to [::ffff:7f00:1]; the old
+  // dotted-only regex missed the hex form. Now classified via the embedded v4.
+  test("rejects the hex IPv4-mapped IPv6 loopback [::ffff:7f00:1]", async () => {
+    _setRawFetch(async () => {
+      throw new Error("must not fetch");
+    });
+    await expect(webFetch.execute({ url: "http://[::ffff:127.0.0.1]/" })).rejects.toBeInstanceOf(
+      WebFetchPermissionError,
+    );
+  });
+
+  test("rejects an octal-encoded loopback literal", async () => {
+    _setRawFetch(async () => {
+      throw new Error("must not fetch");
+    });
+    await expect(webFetch.execute({ url: "http://0177.0.0.1/" })).rejects.toBeInstanceOf(
+      WebFetchPermissionError,
+    );
+  });
+
+  // The actual rebinding defense: the socket is pinned to the IP we vetted.
+  test("pins the connection to the resolved IP (closes the rebinding TOCTOU)", async () => {
+    _setDnsLookup(async () => ({ address: "93.184.216.34", family: 4 }));
+    let seenPin: string | undefined;
+    _setRawFetch(async (_req, pinnedIp) => {
+      seenPin = pinnedIp;
+      return new Response("ok", { status: 200, headers: { "content-type": "text/plain" } });
+    });
+    await webFetch.execute({ url: "https://innocent.example/" });
+    expect(seenPin).toBe("93.184.216.34");
+  });
+
+  test("pins a public IP-literal host to the literal itself", async () => {
+    let seenPin: string | undefined;
+    _setRawFetch(async (_req, pinnedIp) => {
+      seenPin = pinnedIp;
+      return new Response("ok", { status: 200, headers: { "content-type": "text/plain" } });
+    });
+    await webFetch.execute({ url: "https://93.184.216.34/" });
+    expect(seenPin).toBe("93.184.216.34");
+  });
 });
 
 describe("T8 — WebFetch redirects", () => {
