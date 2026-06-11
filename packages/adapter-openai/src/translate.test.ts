@@ -10,6 +10,30 @@ const baseReq: ProviderRequest = {
 };
 
 describe("toOpenAIChatParams", () => {
+  test("non-reasoning models keep max_tokens (compat servers only understand it)", () => {
+    for (const model of ["gpt-4o", "gpt-4o-mini", "llama3.1:8b", "deepseek-chat"]) {
+      const params = toOpenAIChatParams({ ...baseReq, model });
+      expect(params.max_tokens).toBe(1024);
+      expect(params.max_completion_tokens).toBeUndefined();
+    }
+  });
+
+  test("o-series models send max_completion_tokens instead of max_tokens", () => {
+    for (const model of ["o1", "o3", "o4-mini"]) {
+      const params = toOpenAIChatParams({ ...baseReq, model });
+      expect(params.max_completion_tokens).toBe(1024);
+      expect(params.max_tokens).toBeUndefined();
+    }
+  });
+
+  test("gpt-5 family models send max_completion_tokens instead of max_tokens", () => {
+    for (const model of ["gpt-5", "gpt-5-mini", "gpt-5.1"]) {
+      const params = toOpenAIChatParams({ ...baseReq, model });
+      expect(params.max_completion_tokens).toBe(1024);
+      expect(params.max_tokens).toBeUndefined();
+    }
+  });
+
   test("collapses canonical system array into a leading system message", () => {
     const params = toOpenAIChatParams({
       ...baseReq,
@@ -223,7 +247,7 @@ describe("toOpenAIChatParams", () => {
     });
   });
 
-  test("tool_result with array content: text blocks joined, images dropped", () => {
+  test("tool_result with array content: text joined on the tool message, image re-emitted as a follow-up user message", () => {
     const params = toOpenAIChatParams({
       ...baseReq,
       messages: [
@@ -250,6 +274,90 @@ describe("toOpenAIChatParams", () => {
       role: "tool",
       tool_call_id: "tu_1",
       content: "line one\nline two",
+    });
+    // The image rides a follow-up user message, labelled with the tool
+    // call id (OpenAI tool messages only accept strings).
+    expect(params.messages[2]).toEqual({
+      role: "user",
+      content: [
+        { type: "text", text: "[Image output of tool call tu_1]" },
+        { type: "image_url", image_url: { url: "data:image/png;base64,ZZ" } },
+      ],
+    });
+    expect(params.messages).toHaveLength(3);
+  });
+
+  test("multiple image-bearing tool_results: tool messages stay contiguous, images follow in order", () => {
+    const params = toOpenAIChatParams({
+      ...baseReq,
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "tu_a",
+              content: [
+                { type: "text", text: "shot A" },
+                { type: "image", source: { type: "base64", media_type: "image/png", data: "AA" } },
+              ],
+            },
+            {
+              type: "tool_result",
+              tool_use_id: "tu_b",
+              content: [
+                { type: "image", source: { type: "url", url: "https://img.example/b.png" } },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+    // Tool responses remain adjacent (OpenAI requires them directly
+    // after the assistant tool_calls message)…
+    expect(params.messages[1]).toEqual({ role: "tool", tool_call_id: "tu_a", content: "shot A" });
+    expect(params.messages[2]).toEqual({ role: "tool", tool_call_id: "tu_b", content: "" });
+    // …then a single follow-up user message with both images in tool
+    // result order, each labelled.
+    expect(params.messages[3]).toEqual({
+      role: "user",
+      content: [
+        { type: "text", text: "[Image output of tool call tu_a]" },
+        { type: "image_url", image_url: { url: "data:image/png;base64,AA" } },
+        { type: "text", text: "[Image output of tool call tu_b]" },
+        { type: "image_url", image_url: { url: "https://img.example/b.png" } },
+      ],
+    });
+    expect(params.messages).toHaveLength(4);
+  });
+
+  test("text after an image-bearing tool_result joins the image follow-up message in order", () => {
+    const params = toOpenAIChatParams({
+      ...baseReq,
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "tu_1",
+              content: [
+                { type: "image", source: { type: "base64", media_type: "image/png", data: "QQ" } },
+              ],
+            },
+            { type: "text", text: "what do you see?" },
+          ],
+        },
+      ],
+    });
+    expect(params.messages[1]).toEqual({ role: "tool", tool_call_id: "tu_1", content: "" });
+    expect(params.messages[2]).toEqual({
+      role: "user",
+      content: [
+        { type: "text", text: "[Image output of tool call tu_1]" },
+        { type: "image_url", image_url: { url: "data:image/png;base64,QQ" } },
+        { type: "text", text: "what do you see?" },
+      ],
     });
   });
 
