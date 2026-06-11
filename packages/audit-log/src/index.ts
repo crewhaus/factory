@@ -225,6 +225,24 @@ function hashBody(
     .digest("hex");
 }
 
+/**
+ * Recompute a record's hash from its own fields — the exact derivation
+ * `append` and `verify` use. Lets an external consumer (e.g.
+ * `@crewhaus/compliance-controls`) re-check a record's body↔hash consistency
+ * without re-reading the log files. Compare the result against `record.hash`:
+ * a mismatch means the body (payload/kind/ts/seq) was altered after signing.
+ */
+export function recomputeRecordHash(record: AuditRecord): string {
+  const body = {
+    ts: record.ts,
+    version: record.version,
+    kind: record.kind,
+    seq: record.seq,
+    payload: record.payload,
+  };
+  return hashBody(body, record.prevHash);
+}
+
 function todayStr(): string {
   return new Date().toISOString().slice(0, 10);
 }
