@@ -5,7 +5,8 @@
  *
  *   openai/text-embedding-3-small    → OpenAI Embeddings API
  *   voyage/voyage-3                  → Voyage AI
- *   cohere/embed-v3                  → Cohere
+ *   cohere/embed-v3                  → Cohere (OpenAI-compat endpoint)
+ *   gemini/gemini-embedding-001      → Google Generative Language REST API
  *   local/<model>@<base-url>         → OpenAI-compatible local server
  *   mock/deterministic               → in-process hashed BoW vectors (tests + smoke fallback)
  *
@@ -23,7 +24,7 @@
 import { createHash } from "node:crypto";
 import { CrewhausError } from "@crewhaus/errors";
 
-export type EmbedderProviderId = "openai" | "voyage" | "cohere" | "local" | "mock";
+export type EmbedderProviderId = "openai" | "voyage" | "cohere" | "gemini" | "local" | "mock";
 
 export type ParsedEmbedderModel = {
   readonly providerId: EmbedderProviderId;
@@ -44,6 +45,7 @@ export class EmbedderError extends CrewhausError {
  *   openai/text-embedding-3-small
  *   voyage/voyage-3
  *   cohere/embed-v3
+ *   gemini/gemini-embedding-001
  *   local/<model>@<base-url>
  *   mock/<anything>
  */
@@ -60,6 +62,9 @@ export function parseEmbedderModel(spec: string): ParsedEmbedderModel {
   if (spec.startsWith("cohere/")) {
     return { providerId: "cohere", modelId: spec.slice("cohere/".length) };
   }
+  if (spec.startsWith("gemini/")) {
+    return { providerId: "gemini", modelId: spec.slice("gemini/".length) };
+  }
   if (spec.startsWith("local/")) {
     const rest = spec.slice("local/".length);
     const at = rest.lastIndexOf("@");
@@ -74,7 +79,7 @@ export function parseEmbedderModel(spec: string): ParsedEmbedderModel {
     return { providerId: "mock", modelId: spec.slice("mock/".length) };
   }
   throw new EmbedderError(
-    `unknown embedder prefix in "${spec}" — expected openai/, voyage/, cohere/, local/<m>@<url>, or mock/`,
+    `unknown embedder prefix in "${spec}" — expected openai/, voyage/, cohere/, gemini/, local/<m>@<url>, or mock/`,
   );
 }
 
@@ -133,15 +138,30 @@ class MockEmbedder implements Embedder {
 // servers like Ollama, vLLM, llama.cpp).
 // ---------------------------------------------------------------------------
 
+/**
+ * Normalise a baseUrl before appending `/v1/embeddings`: strip a trailing
+ * slash AND a trailing `/v1` segment so both URL shapes users commonly
+ * supply work (`http://localhost:11434` and `http://localhost:11434/v1`
+ * both resolve to `.../v1/embeddings` — never `.../v1/v1/embeddings`).
+ */
+function normaliseEmbeddingsBaseUrl(baseUrl: string): string {
+  let out = baseUrl;
+  if (out.endsWith("/")) out = out.slice(0, -1);
+  if (out.endsWith("/v1")) out = out.slice(0, -"/v1".length);
+  return out;
+}
+
 class OpenAILikeEmbedder implements Embedder {
   readonly provider: EmbedderProviderId;
+  private readonly baseUrl: string;
   constructor(
     provider: EmbedderProviderId,
     public readonly model: string,
-    private readonly baseUrl: string,
+    baseUrl: string,
     private readonly apiKey: string | undefined,
   ) {
     this.provider = provider;
+    this.baseUrl = normaliseEmbeddingsBaseUrl(baseUrl);
   }
   async embed(texts: ReadonlyArray<string>, opts: EmbedOptions = {}): Promise<number[][]> {
     if (texts.length === 0) return [];
@@ -167,6 +187,53 @@ class OpenAILikeEmbedder implements Embedder {
       }
       const json = (await res.json()) as { data: Array<{ embedding: number[] }> };
       for (const row of json.data) out.push(row.embedding);
+    }
+    return out;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Gemini — Google Generative Language REST API. Not OpenAI-shaped: one
+// POST per text to `models/<model>:embedContent` with the API key as a
+// query param, response carries `embedding.values`. The per-text loop is
+// fine for the embedder's batch sizes (the API has no multi-text body on
+// this endpoint shape).
+// ---------------------------------------------------------------------------
+
+const GEMINI_EMBED_BASE = "https://generativelanguage.googleapis.com/v1beta";
+
+class GeminiEmbedder implements Embedder {
+  readonly provider: EmbedderProviderId = "gemini";
+  constructor(
+    public readonly model: string,
+    private readonly apiKey: string,
+    private readonly baseUrl: string = GEMINI_EMBED_BASE,
+  ) {}
+  async embed(texts: ReadonlyArray<string>, opts: EmbedOptions = {}): Promise<number[][]> {
+    if (texts.length === 0) return [];
+    const out: number[][] = [];
+    for (const text of texts) {
+      const url = `${this.baseUrl}/models/${this.model}:embedContent?key=${encodeURIComponent(this.apiKey)}`;
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ content: { parts: [{ text }] } }),
+        ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
+      });
+      if (!res.ok) {
+        const body = await res.text().catch(() => "");
+        throw new EmbedderError(
+          `embedding request failed (gemini ${this.model}): ${res.status} ${body}`,
+        );
+      }
+      const json = (await res.json()) as { embedding?: { values?: number[] } };
+      const values = json.embedding?.values;
+      if (!Array.isArray(values)) {
+        throw new EmbedderError(
+          `gemini embedding response missing embedding.values (model ${this.model})`,
+        );
+      }
+      out.push(values);
     }
     return out;
   }
@@ -218,12 +285,28 @@ export function createEmbedder(opts: CreateEmbedderOptions): Embedder {
       if (apiKey === undefined || apiKey === "") {
         throw new EmbedderError("cohere embedder requires COHERE_API_KEY");
       }
+      // Cohere's OpenAI-compatible surface lives under /compatibility —
+      // the bare host has no /v1/embeddings path (it 404s).
       return new OpenAILikeEmbedder(
         "cohere",
         parsed.modelId,
-        opts.baseUrl ?? "https://api.cohere.ai",
+        opts.baseUrl ?? "https://api.cohere.ai/compatibility",
         apiKey,
       );
+    }
+    case "gemini": {
+      // Empty-string env values count as unset so GOOGLE_API_KEY can take
+      // over when GEMINI_API_KEY="" (common in CI matrices).
+      const candidates = [
+        opts.apiKey,
+        process.env["GEMINI_API_KEY"],
+        process.env["GOOGLE_API_KEY"],
+      ];
+      const apiKey = candidates.find((k) => k !== undefined && k !== "");
+      if (apiKey === undefined) {
+        throw new EmbedderError("gemini embedder requires GEMINI_API_KEY (or GOOGLE_API_KEY)");
+      }
+      return new GeminiEmbedder(parsed.modelId, apiKey, opts.baseUrl ?? GEMINI_EMBED_BASE);
     }
     case "local":
       return new OpenAILikeEmbedder(

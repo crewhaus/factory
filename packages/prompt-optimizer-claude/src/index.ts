@@ -122,6 +122,17 @@ export class ClaudeMutationProvider implements MutationProvider {
   }
 
   /**
+   * The provider id of the injected adapter, exposed read-only so the
+   * FR-003 cost-gate prices calls against the REAL provider's pricing
+   * table instead of assuming "anthropic". Feature-detected by the
+   * orchestrator like `modelId` — providers without the getter price as
+   * Anthropic (the historical behaviour).
+   */
+  get providerId(): string {
+    return this.adapter.providerId;
+  }
+
+  /**
    * The output-token ceiling for each call, exposed read-only so the
    * cost-gate can compute a worst-case pre-call estimate (the gate must
    * decide BEFORE a call whether it would exceed the budget).

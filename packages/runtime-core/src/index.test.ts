@@ -107,6 +107,52 @@ function makeStubAdapter(reply = "ok"): {
   return { adapter, calls: () => calls };
 }
 
+describe("runChatLoop provider feature gating (Section 17)", () => {
+  const noToolUseAdapter = (): import("@crewhaus/adapter-anthropic").ProviderAdapter => {
+    const { adapter } = makeStubAdapter();
+    return {
+      ...adapter,
+      features: { ...adapter.features, tool_use: false },
+    };
+  };
+
+  test("a spec with tools on a no-tool_use adapter throws a ConfigError naming the model", async () => {
+    const echoTool = buildTool({
+      name: "echo",
+      description: "echo",
+      inputSchema: z.object({ msg: z.string() }).strict(),
+      readOnly: true,
+      destructive: false,
+      concurrencySafe: true,
+      execute: async (i) => i.msg,
+    });
+    const input = new PassThrough();
+    input.end();
+    const run = runChatLoop({
+      model: "bedrock/meta.llama3-3-70b-instruct-v1:0",
+      instructions: "test",
+      _adapter: noToolUseAdapter(),
+      input,
+      tools: [echoTool],
+    });
+    await expect(run).rejects.toThrow(
+      /model "bedrock\/meta\.llama3-3-70b-instruct-v1:0" \(provider anthropic\) does not support tool use — remove tools or pick a tool-capable model/,
+    );
+  });
+
+  test("a tool-less spec on the same adapter still runs (gate keys on declared tools)", async () => {
+    const input = new PassThrough();
+    input.end();
+    await runChatLoop({
+      model: "test-model",
+      instructions: "test",
+      _adapter: noToolUseAdapter(),
+      input,
+      tools: [],
+    });
+  });
+});
+
 describe("runChatLoop stdin EOF handling", () => {
   test("exits cleanly when the input stream is already at EOF", async () => {
     const input = new PassThrough();

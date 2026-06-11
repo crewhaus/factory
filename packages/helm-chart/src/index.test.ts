@@ -231,6 +231,82 @@ describe("renderChart() — full render per shape (T1)", () => {
   });
 });
 
+describe("provider secrets + extraEnv (provider-agnostic deployments)", () => {
+  test("secrets.provider entries render as secretKeyRef env vars", () => {
+    const base = defaultValues();
+    const out = renderChart({
+      ...base,
+      target: "cli",
+      secrets: {
+        ...base.secrets,
+        provider: [
+          { name: "OPENAI_API_KEY", secretName: "crewhaus-creds", key: "OPENAI_API_KEY" },
+          { name: "GEMINI_API_KEY", secretName: "gemini-creds", key: "api-key" },
+        ],
+      },
+    });
+    const d = out["deployment.yaml"] ?? "";
+    expect(d).toContain("- name: OPENAI_API_KEY");
+    expect(d).toContain("name: crewhaus-creds");
+    expect(d).toContain("- name: GEMINI_API_KEY");
+    expect(d).toContain("name: gemini-creds");
+    expect(d).toContain("key: api-key");
+  });
+
+  test("extraEnv entries render as plain name/value env vars (quoted)", () => {
+    const out = renderChart({
+      ...defaultValues(),
+      target: "cli",
+      extraEnv: [
+        { name: "AWS_REGION", value: "us-east-1" },
+        { name: "OPENAI_BASE_URL", value: "http://vllm.internal:8000/v1" },
+      ],
+    });
+    const d = out["deployment.yaml"] ?? "";
+    expect(d).toContain("- name: AWS_REGION");
+    expect(d).toContain('value: "us-east-1"');
+    expect(d).toContain("- name: OPENAI_BASE_URL");
+    expect(d).toContain('value: "http://vllm.internal:8000/v1"');
+  });
+
+  test("default (empty) provider/extraEnv lists render nothing extra", () => {
+    const out = renderChart({ ...defaultValues(), target: "cli" });
+    const d = out["deployment.yaml"] ?? "";
+    expect(d).not.toContain("OPENAI_API_KEY");
+    expect(d).not.toContain("AWS_REGION");
+  });
+
+  test("validateValues rejects malformed provider/extraEnv entries", () => {
+    const base = defaultValues();
+    expect(() =>
+      validateValues({
+        ...base,
+        secrets: {
+          ...base.secrets,
+          provider: [{ name: "OPENAI_API_KEY", secretName: "", key: "k" }],
+        },
+      }),
+    ).toThrow(HelmChartError);
+    expect(() =>
+      validateValues({
+        ...base,
+        extraEnv: [{ name: "", value: "x" }],
+      }),
+    ).toThrow(HelmChartError);
+  });
+
+  test("non-daemon exec probes call doctor --liveness (plain doctor always failed in-pod)", () => {
+    const out = renderChart({ ...defaultValues(), target: "cli" });
+    const d = out["deployment.yaml"] ?? "";
+    expect(d).toContain('["bun", "/app/crewhaus.js", "doctor", "--liveness"]');
+    expect(d).not.toContain('"doctor"]');
+    // Daemon shapes keep their httpGet probes untouched.
+    const daemon = renderChart({ ...defaultValues(), target: "channel" });
+    expect(daemon["deployment.yaml"]).toContain("path: /healthz");
+    expect(daemon["deployment.yaml"]).not.toContain("--liveness");
+  });
+});
+
 describe("range / with bind dot (withDot)", () => {
   // The `range` body re-binds `.` to each item; `.host` then resolves off
   // the per-item dot rather than the outer context. This exercises withDot()

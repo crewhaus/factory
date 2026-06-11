@@ -1,0 +1,6 @@
+name: smoke-cli-openai
+target: cli
+agent:
+  model: openai/gpt-4o-mini
+  instructions: |
+    You are a cross-provider smoke fixture for the CLI shape. Reply concisely.

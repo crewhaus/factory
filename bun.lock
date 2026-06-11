@@ -47,6 +47,7 @@
         "@crewhaus/mcp-host": "workspace:*",
         "@crewhaus/migration-engine": "workspace:*",
         "@crewhaus/migration-runner": "workspace:*",
+        "@crewhaus/model-router": "workspace:*",
         "@crewhaus/permission-engine": "workspace:*",
         "@crewhaus/prompt-optimizer": "workspace:*",
         "@crewhaus/prompt-optimizer-claude": "workspace:*",
@@ -1414,6 +1415,7 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
+        "@crewhaus/model-router": "workspace:*",
       },
     },
     "packages/target-cf-worker-graph": {
@@ -1423,6 +1425,7 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
+        "@crewhaus/model-router": "workspace:*",
       },
     },
     "packages/target-cf-worker-workflow": {
@@ -1432,6 +1435,7 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
+        "@crewhaus/model-router": "workspace:*",
       },
     },
     "packages/target-channel-bot": {
@@ -1441,6 +1445,7 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
+        "@crewhaus/model-router": "workspace:*",
       },
       "peerDependencies": {
         "@crewhaus/channel-adapter-base": "workspace:*",

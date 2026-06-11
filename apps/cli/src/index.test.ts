@@ -392,6 +392,41 @@ describe("crewhaus run", () => {
     expect(result.stderr).toContain("rule-based, claude");
   });
 
+  test("a CrewhausError on the run path surfaces as a clean one-line die(), not a stack trace", async () => {
+    // An unrecognised model string makes the model-router throw ConfigError
+    // inside runChatLoop — previously an uncaught stack trace.
+    writeFileSync(
+      join(tmp, "crewhaus.yaml"),
+      "name: t\ntarget: cli\nagent:\n  model: claude-sonnet-4-5\n  instructions: hi\n",
+    );
+    const result = await runCli(
+      ["run", join(tmp, "crewhaus.yaml"), "--model", "totally-not-a-model"],
+      { cwd: tmp, env: {}, closeStdinImmediately: true },
+    );
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("crewhaus: ");
+    expect(result.stderr).toContain("unrecognised model string");
+    expect(result.stderr).not.toContain("    at "); // no stack frames
+  });
+
+  test("run --help enumerates the model-router grammar", async () => {
+    const result = await runCli(["run", "--help"], { cwd: tmp, env: {} });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("claude-*");
+    expect(result.stdout).toContain("openai/<m>");
+    expect(result.stdout).toContain("gemini/<m>");
+    expect(result.stdout).toContain("bedrock/<id>");
+    expect(result.stdout).toContain("local/<m>@<url>");
+  });
+
+  test("eval --help notes --judge-model takes the router grammar + the default judge's Anthropic requirement", async () => {
+    const result = await runCli(["eval", "--help"], { cwd: tmp, env: {} });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("--judge-model accepts the full router grammar");
+    expect(result.stdout).toContain("claude-sonnet-4-5");
+    expect(result.stdout).toContain("Anthropic credentials");
+  });
+
   test("run --help lists the --justification-judge flag", async () => {
     const result = await runCli(["run", "--help"]);
     expect(result.exitCode).toBe(0);
@@ -428,6 +463,52 @@ describe("crewhaus doctor", () => {
     });
     expect(result.exitCode).toBe(1);
     expect(result.stdout).toContain("✗ crewhaus.yaml in cwd");
+  });
+
+  test("--liveness exits 0 with NO credential or spec checks (container probe)", async () => {
+    // No spec, no env — plain doctor would exit 1 on both counts.
+    const result = await runCli(["doctor", "--liveness"], { cwd: tmp, env: {} });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toBe("ok\n");
+  });
+
+  test("model-aware: an openai/ spec with OPENAI_API_KEY passes without Anthropic creds", async () => {
+    writeFileSync(
+      join(tmp, "crewhaus.yaml"),
+      "name: t\ntarget: cli\nagent:\n  model: openai/gpt-4o-mini\n  instructions: hi\n",
+    );
+    const result = await runCli(["doctor"], { cwd: tmp, env: { OPENAI_API_KEY: "sk-x" } });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("✓ OpenAI credentials (model openai/gpt-4o-mini)");
+    expect(result.stdout).toContain("all checks passed");
+  });
+
+  test("model-aware: an openai/ spec with NO provider env fails on OpenAI, not Anthropic", async () => {
+    writeFileSync(
+      join(tmp, "crewhaus.yaml"),
+      "name: t\ntarget: cli\nagent:\n  model: openai/gpt-4o-mini\n  instructions: hi\n",
+    );
+    const result = await runCli(["doctor"], { cwd: tmp, env: {} });
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout).toContain("✗ OpenAI credentials");
+    expect(result.stdout).not.toContain("✗ Anthropic credentials");
+  });
+
+  test("model-aware: a bedrock/ spec is informational and exits 0 without AWS env", async () => {
+    writeFileSync(
+      join(tmp, "crewhaus.yaml"),
+      "name: t\ntarget: cli\nagent:\n  model: bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0\n  instructions: hi\n",
+    );
+    const result = await runCli(["doctor"], { cwd: tmp, env: {} });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("~ Bedrock (AWS) credentials");
+  });
+
+  test("doctor --help documents --liveness and the model-aware checks", async () => {
+    const result = await runCli(["doctor", "--help"], { cwd: tmp, env: {} });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("--liveness");
+    expect(result.stdout).toContain("model-aware");
   });
 
   // FR-002 — the philosophy-alignment audit now includes a Pillar 3 sink-side

@@ -55,7 +55,18 @@ export async function judge(opts: JudgeOptions): Promise<JudgeResult> {
   // Section 17 — resolve via model-router unless caller injected an
   // adapter. The OAuth Claude-Code prefix logic now lives inside
   // adapter-anthropic; we no longer need to handle it here.
-  const adapter: ProviderAdapter = opts.adapter ?? (await resolveModel(model)).adapter;
+  //
+  // Wire model: when the router resolves the string, the request MUST
+  // carry the resolution's *stripped* modelId (e.g. "openai/gpt-4o-mini"
+  // → "gpt-4o-mini") — providers reject the full prefixed router string
+  // with model-not-found. When the caller injects an adapter we keep the
+  // model as-is (tests pass synthetic ids the stub adapter ignores).
+  // Mirrors planner's resolution (packages/planner/src/index.ts).
+  const resolution = opts.adapter
+    ? { adapter: opts.adapter, modelId: model }
+    : await resolveModel(model);
+  const adapter: ProviderAdapter = resolution.adapter;
+  const wireModelId: string = resolution.modelId;
   const { system, user, sentinel } = buildJudgePrompt({
     rubric: opts.rubric,
     input: opts.sample.input,
@@ -65,7 +76,7 @@ export async function judge(opts: JudgeOptions): Promise<JudgeResult> {
 
   const final = await collectFinalMessage(
     adapter.stream({
-      model,
+      model: wireModelId,
       system: [{ type: "text", text: system }],
       messages: [{ role: "user", content: user }],
       tools: [

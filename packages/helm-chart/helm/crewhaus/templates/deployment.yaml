@@ -49,6 +49,17 @@ spec:
                   name: {{ .Values.secrets.slack.bot.secretName }}
                   key: {{ .Values.secrets.slack.bot.key }}
             {{- end }}
+            {{- range .Values.secrets.provider }}
+            - name: {{ .name }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .secretName }}
+                  key: {{ .key }}
+            {{- end }}
+            {{- range .Values.extraEnv }}
+            - name: {{ .name }}
+              value: {{ .value | quote }}
+            {{- end }}
             {{- if .Values.otel.enabled }}
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: {{ .Values.otel.endpoint | quote }}
@@ -75,11 +86,19 @@ spec:
             initialDelaySeconds: 2
             periodSeconds: 5
           {{- else }}
+          # Process-liveness only: `doctor --liveness` exits 0 without
+          # credential/spec checks. Plain `doctor` always failed here —
+          # /app/crewhaus.yaml never exists in the image.
           livenessProbe:
             exec:
-              command: ["bun", "/app/crewhaus.js", "doctor"]
+              command: ["bun", "/app/crewhaus.js", "doctor", "--liveness"]
             initialDelaySeconds: 5
             periodSeconds: 30
+          readinessProbe:
+            exec:
+              command: ["bun", "/app/crewhaus.js", "doctor", "--liveness"]
+            initialDelaySeconds: 2
+            periodSeconds: 10
           {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}

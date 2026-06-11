@@ -84,6 +84,16 @@ const baseState: OptimizerState = {
 };
 
 describe("ClaudeMutationProvider", () => {
+  test("exposes the adapter's providerId for the FR-003 cost-gate (provider-agnostic pricing)", () => {
+    const adapter = {
+      ...mockAdapter("{}"),
+      providerId: "openai",
+    } as unknown as ProviderAdapter;
+    const provider = new ClaudeMutationProvider({ adapter, model: "gpt-4o-mini" });
+    expect(provider.providerId).toBe("openai");
+    expect(provider.modelId).toBe("gpt-4o-mini");
+  });
+
   test("parses a clean JSON response and returns it as the rewrite", async () => {
     const adapter = mockAdapter(
       `{"rewrite": "Think step by step before answering. Be concise.", "rationale": "Adds explicit chain-of-thought scaffolding which helps on multi-step problems."}`,

@@ -1,6 +1,7 @@
 import { CrewhausError } from "@crewhaus/errors";
 import { escapeJsonString } from "@crewhaus/infra-utils";
 import type { Bundle, IrWorkflowV0 } from "@crewhaus/ir";
+import { parseModelString } from "@crewhaus/model-router";
 
 export type EmitOptions = {
   /**
@@ -43,6 +44,10 @@ export function emitCfWorkerWorkflow(ir: IrWorkflowV0, opts: EmitOptions = {}): 
     );
   }
   for (const step of ir.steps) {
+    // Provider gate — the emitted worker inlines an api.anthropic.com client
+    // and POSTs each step's model verbatim, so a non-Anthropic model string
+    // would compile cleanly and 502 at runtime. Fail at compile time instead.
+    assertAnthropicModel(step.model, `step "${step.name}"`);
     if (step.tools.length > 0) {
       throw new TargetEmitError(
         `cf-worker-workflow does not yet support tools (step "${step.name}"); use the local workflow target`,
@@ -66,6 +71,25 @@ export class TargetEmitError extends CrewhausError {
   override readonly name = "TargetEmitError";
   constructor(message: string, cause?: unknown) {
     super("compiler", message, cause);
+  }
+}
+
+/**
+ * Reject any model string the router would dispatch to a non-Anthropic
+ * provider (openai/, gemini/, bedrock/, local/…) — the inlined worker
+ * client only speaks the Anthropic Messages API.
+ */
+function assertAnthropicModel(model: string, where: string): void {
+  let providerId: string;
+  try {
+    providerId = parseModelString(model).providerId;
+  } catch (err) {
+    throw new TargetEmitError(`${where} model "${model}": ${(err as Error).message}`, err);
+  }
+  if (providerId !== "anthropic") {
+    throw new TargetEmitError(
+      `${where} model "${model}" routes to provider "${providerId}" — cf-worker targets currently support claude-* models only — use the cli target for other providers`,
+    );
   }
 }
 

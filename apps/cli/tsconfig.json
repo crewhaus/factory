@@ -32,6 +32,7 @@
     { "path": "../../packages/ir" },
     { "path": "../../packages/logging" },
     { "path": "../../packages/mcp-host" },
+    { "path": "../../packages/model-router" },
     { "path": "../../packages/migration-engine" },
     { "path": "../../packages/migration-runner" },
     { "path": "../../packages/permission-engine" },

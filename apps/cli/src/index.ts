@@ -28,7 +28,7 @@ import {
   parsePermissionsConfig,
   tagRules,
 } from "@crewhaus/permission-engine";
-import { resolveAuth, runChatLoop } from "@crewhaus/runtime-core";
+import { runChatLoop } from "@crewhaus/runtime-core";
 import { createSessionStore } from "@crewhaus/session-store";
 import { createSkillTool, discoverSkills } from "@crewhaus/skills-registry";
 import { loadCommands } from "@crewhaus/slash-commands";
@@ -38,6 +38,10 @@ import { type RegisteredTool, ToolCatalog } from "@crewhaus/tool-catalog";
 import { registerMcpServer } from "@crewhaus/tool-mcp";
 import { createTaskTool } from "@crewhaus/tool-task";
 import { type CostAccrualEvent, TraceEventBus } from "@crewhaus/trace-event-bus";
+// Model-aware doctor credential checks (provider parsed from the cwd spec's
+// agent.model via the model-router grammar), in a side-effect-free module so
+// it is unit-testable (this entry file runs an argv switch on import).
+import { buildCredentialChecks, extractSpecModel } from "./doctor-checks";
 // FR-006 — Pillar 3 sink-side egress-matcher selection (the substring/semantic
 // selector lowered to ir.security.egressMatcher). Side-effect-free + lazily
 // imports the optional semantic package only when "semantic" is selected, so
@@ -146,6 +150,9 @@ const INIT_SCHEMA: ParseArgsSchema = {
 const DOCTOR_SCHEMA: ParseArgsSchema = {
   flags: [
     { name: "philosophy-alignment", takesValue: false },
+    // Process-liveness only — exit 0 fast, no credential/spec checks. The
+    // probe target for container HEALTHCHECKs and k8s exec probes.
+    { name: "liveness", takesValue: false },
     { name: "help", short: "h" },
   ],
 };
@@ -711,7 +718,8 @@ async function resolveEgressMatcher(
 async function runRun(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
-      "usage: crewhaus run <spec.yaml> [--model <model>] [--permission-mode <default|plan|auto|bypass>] [--resume <sessionId> | --continue] [--prompt <text>] [--justification-judge rule-based|claude] [--egress-matcher substring|semantic] [--egress-embedder <model>]\n",
+      "usage: crewhaus run <spec.yaml> [--model <model>] [--permission-mode <default|plan|auto|bypass>] [--resume <sessionId> | --continue] [--prompt <text>] [--justification-judge rule-based|claude] [--egress-matcher substring|semantic] [--egress-embedder <model>]\n" +
+        "  --model accepts the full router grammar: claude-* (Anthropic), openai/<m>, gemini/<m>, bedrock/<id> (geo prefixes tolerated), local/<m>@<url>\n",
     );
     return;
   }
@@ -1171,10 +1179,23 @@ function runContext(args: ParsedArgs): void {
 async function runDoctor(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
-      "usage: crewhaus doctor [--philosophy-alignment]\n" +
-        "  --philosophy-alignment   audit the codebase + examples against the three architectural pillars\n",
+      "usage: crewhaus doctor [--philosophy-alignment] [--liveness]\n" +
+        "  --philosophy-alignment   audit the codebase + examples against the three architectural pillars\n" +
+        "  --liveness               process-liveness probe: exit 0 immediately, no credential or\n" +
+        "                           spec checks (for container HEALTHCHECKs / k8s exec probes)\n" +
+        "\n" +
+        "  Credential checks are model-aware: doctor parses the cwd crewhaus.yaml's\n" +
+        "  agent.model (claude-*, openai/*, gemini/*, bedrock/*, local/<m>@<url>) and\n" +
+        "  checks the matching provider's env; other providers report informationally.\n",
     );
     return;
+  }
+  // --liveness: pure process-liveness for container/k8s probes. The doctor
+  // binary booting far enough to parse argv IS the signal — no credential or
+  // spec checks (a probe must not flap on missing keys or a spec-less image).
+  if (args.flags["liveness"]) {
+    process.stdout.write("ok\n");
+    process.exit(0);
   }
   if (args.flags["philosophy-alignment"]) {
     await runDoctorPhilosophyAlignment();
@@ -1183,15 +1204,20 @@ async function runDoctor(args: ParsedArgs): Promise<void> {
 
   const checks: DoctorCheck[] = [];
 
-  const auth = resolveAuth(process.env);
-  checks.push({
-    label: "Anthropic credentials",
-    pass: auth.mode !== "none",
-    reason:
-      auth.mode === "none"
-        ? "set ANTHROPIC_AUTH_TOKEN (Claude subscription) or ANTHROPIC_API_KEY"
-        : undefined,
-  });
+  // Model-aware provider credentials: read the cwd spec's agent.model (when
+  // present + parseable) and check the MATCHING provider's env. Falls back to
+  // the legacy Anthropic-first check when no model is extractable. See
+  // doctor-checks.ts for the full policy (bedrock/local are informational).
+  const specPath = join(process.cwd(), "crewhaus.yaml");
+  let specModel: string | undefined;
+  if (existsSync(specPath)) {
+    try {
+      specModel = extractSpecModel(readFileSync(specPath, "utf-8"));
+    } catch {
+      specModel = undefined;
+    }
+  }
+  checks.push(...buildCredentialChecks(specModel, process.env));
 
   const bunCheck = checkBunVersion(Bun.version);
   checks.push({
@@ -1200,7 +1226,6 @@ async function runDoctor(args: ParsedArgs): Promise<void> {
     reason: bunCheck.reason,
   });
 
-  const specPath = join(process.cwd(), "crewhaus.yaml");
   checks.push({
     label: "crewhaus.yaml in cwd",
     pass: existsSync(specPath),
@@ -1208,7 +1233,9 @@ async function runDoctor(args: ParsedArgs): Promise<void> {
   });
 
   for (const c of checks) {
-    if (c.pass) {
+    if (c.warn && c.pass) {
+      process.stdout.write(`~ ${c.label}: ${c.reason ?? "informational"}\n`);
+    } else if (c.pass) {
       process.stdout.write(`✓ ${c.label}\n`);
     } else {
       process.stdout.write(`✗ ${c.label}: ${c.reason ?? "failed"}\n`);
@@ -1512,12 +1539,18 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
   let mutatorImpl: import("@crewhaus/prompt-optimizer").MutationProvider | undefined;
   if (mutator === "claude") {
     const { createClaudeMutationProvider } = await import("@crewhaus/prompt-optimizer-claude");
-    const { createAnthropicAdapter } = await import("@crewhaus/adapter-anthropic");
+    const { resolveModel } = await import("@crewhaus/model-router");
     const ir = lower(parseSpec(readFileSync(absSpec, "utf-8")));
-    const judgeModel = ir.target === "cli" ? ir.agent.model : "claude-sonnet-4-5";
+    const mutatorModel = ir.target === "cli" ? ir.agent.model : "claude-sonnet-4-5";
+    // Resolve via the model-router so non-Anthropic specs drive their own
+    // provider: the resolved adapter + STRIPPED wire modelId replace the old
+    // hardcoded createAnthropicAdapter() + verbatim prefixed string (which
+    // made `--mutator claude` a silent no-op for openai/gemini/bedrock/local
+    // specs — every mutation call failed and the provider fell back).
+    const resolution = await resolveModel(mutatorModel);
     mutatorImpl = createClaudeMutationProvider({
-      adapter: await createAnthropicAdapter(),
-      model: judgeModel,
+      adapter: resolution.adapter,
+      model: resolution.modelId,
     });
   } else if (mutator !== undefined && mutator !== "rule-based") {
     die(`unknown --mutator "${mutator}" — supported: rule-based, claude`);
@@ -1605,7 +1638,10 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
       "usage: crewhaus eval <spec.yaml> --dataset <data> --graders <graders.yaml> " +
-        "[--judge-model <model>] [--concurrency N] [--seed N] -o <out-dir>\n",
+        "[--judge-model <model>] [--concurrency N] [--seed N] -o <out-dir>\n" +
+        "  --judge-model accepts the full router grammar (claude-*, openai/<m>, gemini/<m>,\n" +
+        "  bedrock/<id>, local/<m>@<url>); the default judge claude-sonnet-4-5 requires\n" +
+        "  Anthropic credentials (ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY)\n",
     );
     return;
   }
@@ -2342,7 +2378,18 @@ switch (subcommand) {
     runInit(parseFor(rest, INIT_SCHEMA));
     break;
   case "run":
-    await runRun(parseFor(rest, RUN_SCHEMA));
+    // Mirror runCompile's policy: every structured failure in the run
+    // pipeline (ConfigError from the model-router, ProviderAuthError from
+    // an adapter, RuntimeError, …) extends CrewhausError — route the
+    // family through die() for a clean one-line error + exit 1 instead of
+    // a raw stack trace. A non-CrewhausError (a genuine bug) still
+    // propagates with its full stack for debugging.
+    try {
+      await runRun(parseFor(rest, RUN_SCHEMA));
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
     break;
   case "eval":
     await runEvalSubcommand(parseFor(rest, EVAL_SCHEMA));

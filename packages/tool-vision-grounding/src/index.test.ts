@@ -49,6 +49,49 @@ function scriptedAdapter(reply: string): ProviderAdapter {
   };
 }
 
+describe("createFindElementTool — vision feature gate (Section 17)", () => {
+  test("a non-vision adapter throws a clear ConfigError BEFORE any screenshot is taken", async () => {
+    let screenshotCalls = 0;
+    const driver: Driver = {
+      ...stubDriver(new Uint8Array([1])),
+      async screenshot() {
+        screenshotCalls++;
+        return new Uint8Array([1]);
+      },
+    };
+    const adapter: ProviderAdapter = {
+      ...scriptedAdapter("unused"),
+      features: {
+        caching: false,
+        tool_use: true,
+        vision: false,
+        thinking: false,
+        web_search: false,
+      },
+    };
+    const tool = createFindElementTool({
+      driver,
+      model: "bedrock/mistral.mistral-large-2402-v1:0",
+      _adapter: adapter,
+    });
+    await expect(tool.execute({ description: "the Submit button" }, {})).rejects.toThrow(
+      /grounding model "bedrock\/mistral\.mistral-large-2402-v1:0" .* does not support vision/,
+    );
+    // The gate fires before the screenshot — no wasted capture, no provider 400.
+    expect(screenshotCalls).toBe(0);
+  });
+
+  test("a vision-capable adapter is unaffected by the gate", async () => {
+    const adapter = scriptedAdapter(
+      '```json\n{"bbox":{"x":1,"y":2,"width":3,"height":4},"confidence":"high"}\n```',
+    );
+    const driver = stubDriver(new Uint8Array([0x89]));
+    const tool = createFindElementTool({ driver, model: "stub", _adapter: adapter });
+    const r = await tool.execute({ description: "x" }, {});
+    expect(JSON.parse(String(r)).bbox).toEqual({ x: 1, y: 2, width: 3, height: 4 });
+  });
+});
+
 describe("createFindElementTool", () => {
   test("happy path: parses fenced JSON bbox + computes center coords (T3)", async () => {
     const adapter = scriptedAdapter(

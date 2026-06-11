@@ -46,6 +46,44 @@ export const SHAPE_ASSERTIONS: readonly ShapeAssertion[] = [
       { in: "agent.ts", contains: "@crewhaus/slash-commands" },
     ],
   },
+  // Cross-provider compile-path fixtures (no keys needed): the SAME cli
+  // emitter must compile cleanly for every model-router provider prefix and
+  // bake the full router string into the bundle verbatim — runtime-core's
+  // resolveModel strips it at run time. These pin the provider-agnostic
+  // consumer surface (Section 17) against emitter drift.
+  {
+    shape: "cli-openai",
+    expectedFiles: ["agent.ts"],
+    anchors: [
+      { in: "agent.ts", contains: "openai/gpt-4o-mini" },
+      { in: "agent.ts", contains: "runChatLoop" },
+    ],
+  },
+  {
+    shape: "cli-gemini",
+    expectedFiles: ["agent.ts"],
+    anchors: [
+      { in: "agent.ts", contains: "gemini/gemini-2.5-flash" },
+      { in: "agent.ts", contains: "runChatLoop" },
+    ],
+  },
+  {
+    shape: "cli-bedrock",
+    expectedFiles: ["agent.ts"],
+    anchors: [
+      // Geo-prefixed cross-region inference-profile id, verbatim.
+      { in: "agent.ts", contains: "bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0" },
+      { in: "agent.ts", contains: "runChatLoop" },
+    ],
+  },
+  {
+    shape: "cli-local",
+    expectedFiles: ["agent.ts"],
+    anchors: [
+      { in: "agent.ts", contains: "local/llama3.2@http://localhost:11434/v1" },
+      { in: "agent.ts", contains: "runChatLoop" },
+    ],
+  },
   {
     shape: "browser",
     expectedFiles: ["agent.ts"],

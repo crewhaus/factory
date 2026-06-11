@@ -219,3 +219,41 @@ describe("emitCfWorkerGraph — package.json name injection (#148)", () => {
     expect(parsed.dependencies).toBeUndefined(); // injection did not break out
   });
 });
+
+describe("emitCfWorkerGraph — provider gate", () => {
+  test("a graph with one openai/ node fails at compile time, naming the node", () => {
+    const ir: IrGraphV0 = {
+      ...baseIr,
+      nodes: [
+        node("plan", "Plan the work."),
+        { ...node("execute", "Execute the plan."), model: "openai/gpt-4o-mini" },
+        node("summarise", "Summarise the result."),
+      ],
+    };
+    expect(() => emitCfWorkerGraph(ir)).toThrow(TargetEmitError);
+    expect(() => emitCfWorkerGraph(ir)).toThrow(
+      /cf-worker targets currently support claude-\* models only — use the cli target for other providers/,
+    );
+    expect(() => emitCfWorkerGraph(ir)).toThrow(/node "execute"/);
+  });
+
+  test("gemini/, bedrock/, and local/ node models are all rejected", () => {
+    for (const model of [
+      "gemini/gemini-2.5-flash",
+      "bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+      "local/llama3.2@http://localhost:11434/v1",
+    ]) {
+      const ir: IrGraphV0 = {
+        ...baseIr,
+        nodes: [{ ...node("plan", "P"), model }],
+        edges: [],
+        entry: "plan",
+      };
+      expect(() => emitCfWorkerGraph(ir)).toThrow(TargetEmitError);
+    }
+  });
+
+  test("all-claude nodes still emit cleanly", () => {
+    expect(emitCfWorkerGraph(baseIr).files.length).toBe(3);
+  });
+});

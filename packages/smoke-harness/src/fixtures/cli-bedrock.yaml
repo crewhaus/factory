@@ -1,0 +1,6 @@
+name: smoke-cli-bedrock
+target: cli
+agent:
+  model: bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0
+  instructions: |
+    You are a cross-provider smoke fixture for the CLI shape. Reply concisely.

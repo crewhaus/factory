@@ -510,3 +510,106 @@ describe("optimizeSpec — FR-003 budget gate", () => {
     expect(result.spend.totalUsdMicros).toBe(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Provider-agnostic budget pricing — a model-backed mutator that exposes a
+// `providerId` getter (ClaudeMutationProvider built on a non-Anthropic
+// adapter) must be priced against ITS provider's table, not Anthropic's.
+// ---------------------------------------------------------------------------
+
+class StubOpenAIMutator implements MutationProvider {
+  readonly name = "stub-openai";
+  constructor(
+    private readonly prompt: string,
+    private readonly usage: { input: number; output: number },
+    readonly modelId = "gpt-4o-mini",
+    readonly maxOutputTokens = 100,
+    readonly providerId = "openai",
+  ) {}
+  async next(_state: OptimizerState): Promise<ProviderMutation> {
+    return {
+      prompt: this.prompt,
+      mutations: [{ kind: "rephrase-instruction" }],
+      usage: this.usage,
+    };
+  }
+}
+
+describe("optimizeSpec — provider-aware budget pricing (FR-003)", () => {
+  test("a mutator exposing providerId=openai prices against the openai table", async () => {
+    const specPath = join(tmpRoot, "crewhaus.yaml");
+    writeFileSync(specPath, CLI_YAML);
+
+    const fitness = async (p: string) => p.length / 100;
+    const mutator = new StubOpenAIMutator(
+      "You are a meticulous, careful assistant who explains reasoning.",
+      { input: 1_000, output: 500 },
+    );
+
+    const bus = new TraceEventBus({ runId: "prov-run", sessionId: "prov-sess" });
+    const accruals: CostAccrualEvent[] = [];
+    bus.subscribe((e) => {
+      if (e.kind === "cost_accrual") accruals.push(e as CostAccrualEvent);
+    });
+
+    const result = await optimizeSpec({
+      specPath,
+      fitness,
+      trainSet: [{ id: "t1", input: "x", expected_output: "y" }],
+      devSet: [{ id: "d1", input: "x", expected_output: "y" }],
+      iterations: 3,
+      mutator,
+      traceBus: bus,
+      outDir: join(tmpRoot, "out"),
+    });
+
+    const perCall = accruals.filter((a) => a.summary !== true);
+    expect(perCall.length).toBe(result.spend.perIteration.length);
+    expect(perCall.length).toBeGreaterThan(0);
+    const first = perCall[0] as CostAccrualEvent;
+    expect(first.provider).toBe("openai");
+    expect(first.modelId).toBe("gpt-4o-mini");
+    // gpt-4o-mini: $0.15/M input, $0.60/M output.
+    // 1000 * 0.15 + 500 * 0.60 = 150 + 300 = 450 micros — NOT the 10_500
+    // micros the old hardcoded "anthropic" pricing would have produced
+    // (well, a pricing miss → $0 here; the point is the real row resolves).
+    expect(first.costUsdMicros).toBe(450);
+  });
+
+  test("a mutator with an unknown providerId string falls back to anthropic pricing (non-breaking)", async () => {
+    const specPath = join(tmpRoot, "crewhaus.yaml");
+    writeFileSync(specPath, CLI_YAML);
+
+    const fitness = async (p: string) => p.length / 100;
+    const mutator = new StubOpenAIMutator(
+      "You are a meticulous, careful assistant who explains reasoning.",
+      { input: 1_000, output: 500 },
+      "claude-sonnet-4-5",
+      100,
+      "not-a-provider",
+    );
+
+    const bus = new TraceEventBus({ runId: "prov-run2", sessionId: "prov-sess2" });
+    const accruals: CostAccrualEvent[] = [];
+    bus.subscribe((e) => {
+      if (e.kind === "cost_accrual") accruals.push(e as CostAccrualEvent);
+    });
+
+    await optimizeSpec({
+      specPath,
+      fitness,
+      trainSet: [{ id: "t1", input: "x", expected_output: "y" }],
+      devSet: [{ id: "d1", input: "x", expected_output: "y" }],
+      iterations: 2,
+      mutator,
+      traceBus: bus,
+      outDir: join(tmpRoot, "out"),
+    });
+
+    const perCall = accruals.filter((a) => a.summary !== true);
+    expect(perCall.length).toBeGreaterThan(0);
+    expect((perCall[0] as CostAccrualEvent).provider).toBe("anthropic");
+    // claude-sonnet-4-5: 1000 * $3/M + 500 * $15/M = 3000 + 7500 micros.
+    expect((perCall[0] as CostAccrualEvent).costUsdMicros).toBe(10_500);
+  });
+});
