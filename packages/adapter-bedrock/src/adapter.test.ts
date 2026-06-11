@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import {
   type BedrockRuntimeClient,
+  ConverseStreamCommand,
+  type ConverseStreamOutput,
   InvokeModelWithResponseStreamCommand,
 } from "@aws-sdk/client-bedrock-runtime";
 import type { ProviderRequest, StreamEvent } from "@crewhaus/adapter-anthropic";
@@ -16,27 +18,37 @@ import type { BedrockFamily } from "./family.js";
  * A fake `BedrockRuntimeClient` whose `send()` returns a canned response
  * (or throws a canned error) and records the command it was given. Mirrors
  * the `fakeClient` pattern used by adapter-anthropic's adapter.test.ts.
+ * Invoke commands answer with `{ body }` chunks; Converse commands answer
+ * with `{ stream }` events — matching the two wire paths in adapter.ts.
  */
 type BedrockChunk = { chunk?: { bytes?: Uint8Array } };
 
 function fakeClient(opts: {
   chunks?: BedrockChunk[];
+  converseEvents?: ConverseStreamOutput[];
   bodyUndefined?: boolean;
+  streamUndefined?: boolean;
   sendError?: unknown;
   streamError?: unknown;
 }): {
   client: BedrockRuntimeClient;
-  captured: { command?: InvokeModelWithResponseStreamCommand; sendOpts?: unknown };
+  captured: { command?: unknown; sendOpts?: unknown };
 } {
-  const captured: {
-    command?: InvokeModelWithResponseStreamCommand;
-    sendOpts?: unknown;
-  } = {};
+  const captured: { command?: unknown; sendOpts?: unknown } = {};
   const client = {
-    send: ((command: InvokeModelWithResponseStreamCommand, sendOpts?: unknown) => {
+    send: ((command: unknown, sendOpts?: unknown) => {
       captured.command = command;
       captured.sendOpts = sendOpts;
       if (opts.sendError !== undefined) return Promise.reject(opts.sendError);
+      if (command instanceof ConverseStreamCommand) {
+        const stream = opts.streamUndefined
+          ? undefined
+          : (async function* () {
+              for (const ev of opts.converseEvents ?? []) yield ev;
+              if (opts.streamError !== undefined) throw opts.streamError;
+            })();
+        return Promise.resolve({ stream });
+      }
       const body = opts.bodyUndefined
         ? undefined
         : (async function* () {
@@ -61,6 +73,20 @@ const REQ: ProviderRequest = {
   maxTokens: 64,
 };
 
+/** A minimal happy-path Converse event stream: one text block + terminator. */
+const CONVERSE_TEXT_EVENTS: ConverseStreamOutput[] = [
+  { messageStart: { role: "assistant" } },
+  { contentBlockDelta: { contentBlockIndex: 0, delta: { text: "ok" } } },
+  { contentBlockStop: { contentBlockIndex: 0 } },
+  { messageStop: { stopReason: "end_turn" } },
+  {
+    metadata: {
+      usage: { inputTokens: 3, outputTokens: 1, totalTokens: 4 },
+      metrics: { latencyMs: 5 },
+    },
+  },
+];
+
 async function collect(stream: AsyncIterable<StreamEvent>): Promise<StreamEvent[]> {
   const out: StreamEvent[] = [];
   for await (const ev of stream) out.push(ev);
@@ -76,8 +102,10 @@ describe("BedrockAdapter — construction", () => {
     expect(a.features.tool_use).toBe(true);
     expect(a.features.caching).toBe("explicit");
 
+    // Converse families get genuine tool use; caching stays off.
     const llama = new BedrockAdapter({ client, family: "llama" });
-    expect(llama.features.tool_use).toBe(false);
+    expect(llama.features.tool_use).toBe(true);
+    expect(llama.features.caching).toBe(false);
   });
 
   test("estimateTokens delegates to token-budget heuristic", () => {
@@ -88,7 +116,7 @@ describe("BedrockAdapter — construction", () => {
   });
 });
 
-describe("BedrockAdapter.stream — request marshalling", () => {
+describe("BedrockAdapter.stream — anthropic request marshalling (invoke path)", () => {
   test("builds an InvokeModelWithResponseStream command with JSON body", async () => {
     const { client, captured } = fakeClient({
       chunks: [chunk({ type: "message_stop" })],
@@ -97,7 +125,7 @@ describe("BedrockAdapter.stream — request marshalling", () => {
     await collect(a.stream(REQ));
 
     expect(captured.command).toBeInstanceOf(InvokeModelWithResponseStreamCommand);
-    const input = captured.command?.input as {
+    const input = (captured.command as InvokeModelWithResponseStreamCommand).input as {
       modelId?: string;
       contentType?: string;
       accept?: string;
@@ -126,28 +154,6 @@ describe("BedrockAdapter.stream — request marshalling", () => {
     const a = new BedrockAdapter({ client, family: "anthropic" });
     await collect(a.stream(REQ));
     expect((captured.sendOpts as { abortSignal?: AbortSignal }).abortSignal).toBeUndefined();
-  });
-
-  test("marshals llama bodies as a prompt string", async () => {
-    const { client, captured } = fakeClient({ chunks: [] });
-    const a = new BedrockAdapter({ client, family: "llama" });
-    await collect(a.stream({ ...REQ, model: "meta.llama3-1-8b-instruct-v1:0" }));
-    const body = JSON.parse(
-      new TextDecoder().decode((captured.command?.input as { body?: Uint8Array }).body),
-    );
-    expect(typeof body.prompt).toBe("string");
-    expect(body.max_gen_len).toBe(64);
-  });
-
-  test("marshals mistral bodies as a prompt string", async () => {
-    const { client, captured } = fakeClient({ chunks: [] });
-    const a = new BedrockAdapter({ client, family: "mistral" });
-    await collect(a.stream({ ...REQ, model: "mistral.mistral-large-2402-v1:0" }));
-    const body = JSON.parse(
-      new TextDecoder().decode((captured.command?.input as { body?: Uint8Array }).body),
-    );
-    expect(typeof body.prompt).toBe("string");
-    expect(body.max_tokens).toBe(64);
   });
 });
 
@@ -193,20 +199,39 @@ describe("BedrockAdapter.stream — anthropic family", () => {
   });
 });
 
-describe("BedrockAdapter.stream — llama family", () => {
-  test("decodes generation deltas and the decoder fires its own terminator", async () => {
-    const { client } = fakeClient({
-      chunks: [
-        chunk({ generation: "Hello" }),
-        chunk({ generation: ", world", stop_reason: "stop", generation_token_count: 3 }),
-      ],
-    });
+describe("BedrockAdapter.stream — converse families", () => {
+  test("llama routes through ConverseStreamCommand and passes tools", async () => {
+    const { client, captured } = fakeClient({ converseEvents: CONVERSE_TEXT_EVENTS });
     const a = new BedrockAdapter({ client, family: "llama" });
-    const events = await collect(a.stream({ ...REQ, model: "meta.llama3-70b-instruct-v1:0" }));
+    const events = await collect(
+      a.stream({
+        ...REQ,
+        model: "meta.llama3-1-70b-instruct-v1:0",
+        tools: [{ name: "Read", description: "x", input_schema: { type: "object" } }],
+        toolChoice: { type: "auto" },
+      }),
+    );
+
+    expect(captured.command).toBeInstanceOf(ConverseStreamCommand);
+    const input = (captured.command as ConverseStreamCommand).input;
+    expect(input.modelId).toBe("meta.llama3-1-70b-instruct-v1:0");
+    expect(input.system).toEqual([{ text: "be terse" }]);
+    expect(input.inferenceConfig).toEqual({ maxTokens: 64 });
+    expect(input.toolConfig).toEqual({
+      tools: [
+        {
+          toolSpec: {
+            name: "Read",
+            description: "x",
+            inputSchema: { json: { type: "object" } },
+          },
+        },
+      ],
+      toolChoice: { auto: {} },
+    });
     expect(events.map((e) => e.kind)).toEqual([
       "message_start",
       "content_block_start",
-      "content_block_delta",
       "content_block_delta",
       "content_block_stop",
       "message_delta",
@@ -214,61 +239,95 @@ describe("BedrockAdapter.stream — llama family", () => {
     ]);
   });
 
-  test("synthesizes a terminator when the stream ends without a stop_reason", async () => {
-    const { client } = fakeClient({
-      chunks: [chunk({ generation: "partial" })],
+  test("mistral streams toolUse blocks through the converse decoder", async () => {
+    const { client, captured } = fakeClient({
+      converseEvents: [
+        { messageStart: { role: "assistant" } },
+        {
+          contentBlockStart: {
+            contentBlockIndex: 0,
+            start: { toolUse: { toolUseId: "tu_1", name: "Read" } },
+          },
+        },
+        { contentBlockDelta: { contentBlockIndex: 0, delta: { toolUse: { input: "{}" } } } },
+        { contentBlockStop: { contentBlockIndex: 0 } },
+        { messageStop: { stopReason: "tool_use" } },
+        {
+          metadata: {
+            usage: { inputTokens: 5, outputTokens: 2, totalTokens: 7 },
+            metrics: { latencyMs: 5 },
+          },
+        },
+      ],
     });
-    const a = new BedrockAdapter({ client, family: "llama" });
-    const events = await collect(a.stream({ ...REQ, model: "meta.llama3-70b-instruct-v1:0" }));
-    // No stop_reason in-band: adapter appends message_delta(end_turn) + message_stop.
-    expect(events.map((e) => e.kind)).toEqual([
-      "message_start",
-      "content_block_start",
-      "content_block_delta",
-      "message_delta",
-      "message_stop",
-    ]);
+    const a = new BedrockAdapter({ client, family: "mistral" });
+    const events = await collect(
+      a.stream({
+        ...REQ,
+        model: "mistral.mistral-large-2402-v1:0",
+        tools: [{ name: "Read", description: "x", input_schema: { type: "object" } }],
+      }),
+    );
+    expect(captured.command).toBeInstanceOf(ConverseStreamCommand);
+    expect(events[1]).toEqual({
+      kind: "content_block_start",
+      index: 0,
+      block: { type: "tool_use", id: "tu_1", name: "Read", input: {} },
+    });
     const md = events.find(
       (e): e is Extract<StreamEvent, { kind: "message_delta" }> => e.kind === "message_delta",
     );
-    expect(md?.stopReason).toBe("end_turn");
-  });
-});
-
-describe("BedrockAdapter.stream — mistral family", () => {
-  test("synthesizes a terminator when the stream ends open", async () => {
-    const { client } = fakeClient({
-      chunks: [chunk({ outputs: [{ text: "Bonjour" }] })],
-    });
-    const a = new BedrockAdapter({ client, family: "mistral" });
-    const events = await collect(a.stream({ ...REQ, model: "mistral.mistral-large-2402-v1:0" }));
-    expect(events.map((e) => e.kind)).toEqual([
-      "message_start",
-      "content_block_start",
-      "content_block_delta",
-      "message_delta",
-      "message_stop",
-    ]);
+    expect(md?.stopReason).toBe("tool_use");
+    expect(md?.usage).toEqual({ input: 5, output: 2 });
   });
 
-  test("does not double-terminate when the decoder already closed", async () => {
-    const { client } = fakeClient({
-      chunks: [chunk({ outputs: [{ text: "Bonjour", stop_reason: "stop" }] })],
+  const CONVERSE_FAMILY_MODELS: ReadonlyArray<readonly [BedrockFamily, string]> = [
+    ["nova", "amazon.nova-pro-v1:0"],
+    ["deepseek", "deepseek.r1-v1:0"],
+    ["cohere", "cohere.command-r-plus-v1:0"],
+    ["qwen", "qwen.qwen3-32b-v1:0"],
+    ["gpt-oss", "openai.gpt-oss-120b-1:0"],
+  ];
+
+  for (const [family, model] of CONVERSE_FAMILY_MODELS) {
+    test(`${family} constructs and streams through converse`, async () => {
+      const { client, captured } = fakeClient({ converseEvents: CONVERSE_TEXT_EVENTS });
+      const a = new BedrockAdapter({ client, family });
+      const events = await collect(a.stream({ ...REQ, model }));
+      expect(captured.command).toBeInstanceOf(ConverseStreamCommand);
+      expect((captured.command as ConverseStreamCommand).input.modelId).toBe(model);
+      expect(events[0]?.kind).toBe("message_start");
+      expect(events[events.length - 1]?.kind).toBe("message_stop");
     });
-    const a = new BedrockAdapter({ client, family: "mistral" });
-    const events = await collect(a.stream({ ...REQ, model: "mistral.mistral-large-2402-v1:0" }));
-    // Exactly one message_stop.
-    expect(events.filter((e) => e.kind === "message_stop")).toHaveLength(1);
-    expect(events[events.length - 1]?.kind).toBe("message_stop");
+  }
+
+  test("threads the abort signal into converse send() options", async () => {
+    const controller = new AbortController();
+    const { client, captured } = fakeClient({ converseEvents: CONVERSE_TEXT_EVENTS });
+    const a = new BedrockAdapter({ client, family: "llama" });
+    await collect(
+      a.stream({ ...REQ, model: "meta.llama3-1-70b-instruct-v1:0", signal: controller.signal }),
+    );
+    expect((captured.sendOpts as { abortSignal?: AbortSignal }).abortSignal).toBe(
+      controller.signal,
+    );
   });
 });
 
 describe("BedrockAdapter.stream — error handling", () => {
-  test("throws AdapterError when the response has no body", async () => {
+  test("throws AdapterError when the invoke response has no body", async () => {
     const { client } = fakeClient({ bodyUndefined: true });
     const a = new BedrockAdapter({ client, family: "anthropic" });
     await expect(collect(a.stream(REQ))).rejects.toBeInstanceOf(AdapterError);
     await expect(collect(a.stream(REQ))).rejects.toThrow(/no body/);
+  });
+
+  test("throws AdapterError when the converse response has no stream", async () => {
+    const { client } = fakeClient({ streamUndefined: true });
+    const a = new BedrockAdapter({ client, family: "llama" });
+    const req = { ...REQ, model: "meta.llama3-1-70b-instruct-v1:0" };
+    await expect(collect(a.stream(req))).rejects.toBeInstanceOf(AdapterError);
+    await expect(collect(a.stream(req))).rejects.toThrow(/no stream/);
   });
 
   test("wraps a send() failure through normaliseBedrockError", async () => {
@@ -286,6 +345,20 @@ describe("BedrockAdapter.stream — error handling", () => {
     }
     expect(caught).toBeInstanceOf(AdapterError);
     expect((caught as { status?: number }).status).toBe(400);
+  });
+
+  test("wraps a converse send() failure through normaliseBedrockError", async () => {
+    const sdkErr = Object.assign(new Error("slow down"), { name: "ThrottlingException" });
+    const { client } = fakeClient({ sendError: sdkErr });
+    const a = new BedrockAdapter({ client, family: "nova" });
+    let caught: unknown;
+    try {
+      await collect(a.stream({ ...REQ, model: "amazon.nova-pro-v1:0" }));
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(AdapterError);
+    expect((caught as { status?: number }).status).toBe(429);
   });
 
   test("rethrows an AbortError raised by send() unwrapped", async () => {
@@ -310,31 +383,74 @@ describe("BedrockAdapter.stream — error handling", () => {
     expect((caught as Error).message).toMatch(/failed to parse Bedrock chunk JSON/);
   });
 
-  test("rethrows an AbortError raised mid-stream unwrapped", async () => {
+  test("rethrows an AbortError raised mid-converse-stream unwrapped", async () => {
     const abortErr = Object.assign(new Error("aborted"), { name: "AbortError" });
     const { client } = fakeClient({
-      chunks: [chunk({ generation: "x" })],
+      converseEvents: [{ contentBlockDelta: { contentBlockIndex: 0, delta: { text: "x" } } }],
       streamError: abortErr,
     });
     const a = new BedrockAdapter({ client, family: "llama" });
     await expect(
-      collect(a.stream({ ...REQ, model: "meta.llama3-70b-instruct-v1:0" })),
+      collect(a.stream({ ...REQ, model: "meta.llama3-1-70b-instruct-v1:0" })),
     ).rejects.toBe(abortErr);
   });
 
-  test("normalises a non-abort mid-stream failure", async () => {
+  test("normalises a non-abort mid-converse-stream failure", async () => {
     const sdkErr = Object.assign(new Error("stream blew up"), {
       name: "ModelStreamErrorException",
       $metadata: { httpStatusCode: 500 },
     });
     const { client } = fakeClient({
-      chunks: [chunk({ generation: "x" })],
+      converseEvents: [{ contentBlockDelta: { contentBlockIndex: 0, delta: { text: "x" } } }],
       streamError: sdkErr,
     });
     const a = new BedrockAdapter({ client, family: "llama" });
     let caught: unknown;
     try {
-      await collect(a.stream({ ...REQ, model: "meta.llama3-70b-instruct-v1:0" }));
+      await collect(a.stream({ ...REQ, model: "meta.llama3-1-70b-instruct-v1:0" }));
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(AdapterError);
+    expect((caught as { status?: number }).status).toBe(500);
+    expect((caught as { error?: { type?: string } }).error?.type).toBe("overloaded_error");
+  });
+
+  test("normalises an in-band converse exception event", async () => {
+    const inBand = Object.assign(new Error("throttled mid-stream"), {
+      name: "ThrottlingException",
+    });
+    const { client } = fakeClient({
+      converseEvents: [
+        { contentBlockDelta: { contentBlockIndex: 0, delta: { text: "x" } } },
+        { throttlingException: inBand } as unknown as ConverseStreamOutput,
+      ],
+    });
+    const a = new BedrockAdapter({ client, family: "deepseek" });
+    let caught: unknown;
+    try {
+      await collect(a.stream({ ...REQ, model: "deepseek.r1-v1:0" }));
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(AdapterError);
+    expect((caught as { status?: number }).status).toBe(429);
+    expect((caught as { error?: { type?: string } }).error?.type).toBe("overloaded_error");
+  });
+
+  test("normalises a non-abort mid-invoke-stream failure", async () => {
+    const sdkErr = Object.assign(new Error("stream blew up"), {
+      name: "ModelStreamErrorException",
+      $metadata: { httpStatusCode: 500 },
+    });
+    const { client } = fakeClient({
+      chunks: [chunk({ type: "ping" })],
+      streamError: sdkErr,
+    });
+    const a = new BedrockAdapter({ client, family: "anthropic" });
+    let caught: unknown;
+    try {
+      await collect(a.stream(REQ));
     } catch (err) {
       caught = err;
     }

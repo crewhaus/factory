@@ -8,8 +8,10 @@
  *   - `gemini/<model>`                    → gemini
  *   - `bedrock/<modelId>`                 → bedrock with family inferred
  *                                           from the modelId prefix
- *                                           (anthropic|llama|mistral),
- *                                           tolerating a leading geo segment
+ *                                           (anthropic|llama|mistral|nova|
+ *                                           titan|deepseek|cohere|ai21|qwen|
+ *                                           gpt-oss|writer), tolerating a
+ *                                           leading geo segment
  *                                           ("us." / "eu." / "apac." / ...)
  *                                           from cross-region inference
  *                                           profile ids
@@ -36,6 +38,51 @@ export type ProviderId = "anthropic" | "openai" | "gemini" | "bedrock";
  */
 export const BEDROCK_GEO_PREFIX = /^(?:us|eu|apac|jp|au|ca|sa|us-gov|global)\./;
 
+/**
+ * Bedrock model families the router accepts. Anthropic streams over the
+ * native InvokeModel path; every other family goes through the
+ * model-agnostic Converse API. Twin of `BedrockFamily` in
+ * `@crewhaus/adapter-bedrock` (family.ts) — keep in sync.
+ */
+export type BedrockModelFamily =
+  | "anthropic"
+  | "llama"
+  | "mistral"
+  | "nova"
+  | "titan"
+  | "deepseek"
+  | "cohere"
+  | "ai21"
+  | "qwen"
+  | "gpt-oss"
+  | "writer";
+
+/**
+ * Ordered `(modelId prefix → family)` table, matched after the geo
+ * segment is stripped. Prefixes are deliberately narrow where a vendor
+ * ships non-chat models under the same vendor segment (titan-text vs
+ * titan-embed, cohere.command vs cohere.embed) so genuinely unsupported
+ * models keep being rejected at parse time.
+ * Twin logic: adapter-bedrock/src/family.ts FAMILY_PREFIXES — keep the
+ * two copies and their test vectors in sync.
+ */
+const BEDROCK_FAMILY_PREFIXES: ReadonlyArray<{
+  readonly prefix: string;
+  readonly family: BedrockModelFamily;
+}> = [
+  { prefix: "anthropic.", family: "anthropic" },
+  { prefix: "meta.llama", family: "llama" },
+  { prefix: "mistral.", family: "mistral" },
+  { prefix: "amazon.nova", family: "nova" },
+  { prefix: "amazon.titan-text", family: "titan" },
+  { prefix: "deepseek.", family: "deepseek" },
+  { prefix: "cohere.command", family: "cohere" },
+  { prefix: "ai21.", family: "ai21" },
+  { prefix: "qwen.", family: "qwen" },
+  { prefix: "openai.gpt-oss", family: "gpt-oss" },
+  { prefix: "writer.", family: "writer" },
+];
+
 export type ParsedModelString =
   | { readonly providerId: "anthropic"; readonly modelId: string }
   | { readonly providerId: "openai"; readonly modelId: string; readonly baseUrl?: string }
@@ -43,7 +90,7 @@ export type ParsedModelString =
   | {
       readonly providerId: "bedrock";
       readonly modelId: string;
-      readonly family: "anthropic" | "llama" | "mistral";
+      readonly family: BedrockModelFamily;
     };
 
 export function parseModelString(modelString: string): ParsedModelString {
@@ -101,16 +148,13 @@ export function parseModelString(modelString: string): ParsedModelString {
     // and keep the full id as the wire modelId.
     // Twin logic: adapter-bedrock/src/family.ts detectFamily — keep in sync.
     const stem = modelId.replace(BEDROCK_GEO_PREFIX, "");
-    let family: "anthropic" | "llama" | "mistral";
-    if (stem.startsWith("anthropic.")) family = "anthropic";
-    else if (stem.startsWith("meta.llama")) family = "llama";
-    else if (stem.startsWith("mistral.")) family = "mistral";
-    else {
+    const match = BEDROCK_FAMILY_PREFIXES.find((entry) => stem.startsWith(entry.prefix));
+    if (match === undefined) {
       throw new ConfigError(
-        `model "${modelString}": Bedrock family unknown — expected anthropic.* / meta.llama* / mistral.*, optionally behind a cross-region inference-profile prefix (us. / eu. / apac. / global. / ...)`,
+        `model "${modelString}": Bedrock family unknown — expected anthropic.* / meta.llama* / mistral.* / amazon.nova* / amazon.titan-text* / deepseek.* / cohere.command* / ai21.* / qwen.* / openai.gpt-oss* / writer.*, optionally behind a cross-region inference-profile prefix (us. / eu. / apac. / global. / ...)`,
       );
     }
-    return { providerId: "bedrock", modelId, family };
+    return { providerId: "bedrock", modelId, family: match.family };
   }
 
   // Unprefixed: must be claude-* (Anthropic-direct).

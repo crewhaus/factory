@@ -2,7 +2,7 @@
   "name": "@crewhaus/adapter-bedrock",
   "version": "0.1.1",
   "type": "module",
-  "description": "AWS Bedrock provider adapter (Section 17). Per-family marshalling for Anthropic / Llama / Mistral on Bedrock",
+  "description": "AWS Bedrock provider adapter (Section 17). Anthropic over native InvokeModel; all other families (Llama / Mistral / Nova / DeepSeek / Cohere / AI21 / Qwen / gpt-oss / Titan / Writer) over the Converse API",
   "main": "src/index.ts",
   "types": "src/index.ts",
   "exports": {

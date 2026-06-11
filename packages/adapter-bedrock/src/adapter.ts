@@ -1,6 +1,14 @@
 /**
- * `BedrockAdapter` — AWS Bedrock implementation of `ProviderAdapter`,
- * with per-family request/response marshalling.
+ * `BedrockAdapter` — AWS Bedrock implementation of `ProviderAdapter`.
+ *
+ * Two wire paths, one adapter:
+ *   - anthropic → native InvokeModelWithResponseStream with the
+ *     Messages-API-shaped body (families/anthropic.ts) so explicit
+ *     cache_control and the thinking budget keep working.
+ *   - every other family → the model-agnostic Converse/ConverseStream
+ *     API (converse.ts), which gives llama/mistral/nova/cohere/qwen/
+ *     gpt-oss genuine tool use and deepseek/gpt-oss reasoning without
+ *     per-vendor body marshalling.
  *
  * One adapter instance per family (the model-router caches by
  * `(providerId, family)`). The `features` field carries the family-
@@ -18,8 +26,10 @@
 
 import {
   BedrockRuntimeClient,
+  ConverseStreamCommand,
   InvokeModelWithResponseStreamCommand,
 } from "@aws-sdk/client-bedrock-runtime";
+import type { ConverseStreamOutput } from "@aws-sdk/client-bedrock-runtime";
 import type {
   CanonicalMessage,
   ProviderAdapter,
@@ -29,17 +39,8 @@ import type {
 } from "@crewhaus/adapter-anthropic";
 import { AdapterError } from "@crewhaus/errors";
 import { estimateTokens as tokenBudgetEstimate } from "@crewhaus/token-budget";
+import { buildConverseRequest, translateConverseStream } from "./converse.js";
 import { buildAnthropicBedrockBody, decodeAnthropicBedrockChunk } from "./families/anthropic.js";
-import {
-  buildLlamaBedrockBody,
-  decodeLlamaBedrockChunk,
-  newLlamaStreamState,
-} from "./families/llama.js";
-import {
-  buildMistralBedrockBody,
-  decodeMistralBedrockChunk,
-  newMistralStreamState,
-} from "./families/mistral.js";
 import type { BedrockFamily } from "./family.js";
 import { featuresForFamily } from "./family.js";
 
@@ -64,7 +65,20 @@ export class BedrockAdapter implements ProviderAdapter {
   }
 
   async *stream(req: ProviderRequest): AsyncIterable<StreamEvent> {
-    const body = buildBodyForFamily(req, this.family);
+    if (this.family === "anthropic") {
+      yield* this.streamInvoke(req);
+    } else {
+      yield* this.streamConverse(req);
+    }
+  }
+
+  estimateTokens(messages: ReadonlyArray<CanonicalMessage>): number {
+    return tokenBudgetEstimate(messages as readonly AnthropicMessageParamLike[]);
+  }
+
+  /** Anthropic family: native InvokeModelWithResponseStream path. */
+  private async *streamInvoke(req: ProviderRequest): AsyncIterable<StreamEvent> {
+    const body = buildAnthropicBedrockBody(req);
     const command = new InvokeModelWithResponseStreamCommand({
       modelId: req.model,
       contentType: "application/json",
@@ -91,8 +105,30 @@ export class BedrockAdapter implements ProviderAdapter {
     yield* this.translateBedrockStream(stream);
   }
 
-  estimateTokens(messages: ReadonlyArray<CanonicalMessage>): number {
-    return tokenBudgetEstimate(messages as readonly AnthropicMessageParamLike[]);
+  /** Non-anthropic families: model-agnostic ConverseStream path. */
+  private async *streamConverse(req: ProviderRequest): AsyncIterable<StreamEvent> {
+    const command = new ConverseStreamCommand(buildConverseRequest(req));
+
+    let response: { stream?: AsyncIterable<ConverseStreamOutput> };
+    try {
+      response = (await this.client.send(command, {
+        ...(req.signal !== undefined ? { abortSignal: req.signal } : {}),
+      })) as unknown as { stream?: AsyncIterable<ConverseStreamOutput> };
+    } catch (err) {
+      throw normaliseBedrockError(err);
+    }
+
+    const stream = response.stream;
+    if (stream === undefined) {
+      throw new AdapterError("bedrock", "Bedrock ConverseStream returned no stream");
+    }
+
+    try {
+      yield* translateConverseStream(stream);
+    } catch (err) {
+      if ((err as { name?: unknown })?.name === "AbortError") throw err;
+      throw normaliseBedrockError(err);
+    }
   }
 
   private async *translateBedrockStream(
@@ -100,8 +136,6 @@ export class BedrockAdapter implements ProviderAdapter {
   ): AsyncIterable<StreamEvent> {
     yield { kind: "message_start" };
     const decoder = new TextDecoder();
-    const llamaState = this.family === "llama" ? newLlamaStreamState() : undefined;
-    const mistralState = this.family === "mistral" ? newMistralStreamState() : undefined;
     try {
       for await (const event of stream) {
         const bytes = event.chunk?.bytes;
@@ -117,58 +151,15 @@ export class BedrockAdapter implements ProviderAdapter {
             err,
           );
         }
-        switch (this.family) {
-          case "anthropic": {
-            const ev = decodeAnthropicBedrockChunk(payload);
-            if (ev !== null) yield ev;
-            break;
-          }
-          case "llama":
-            for (const ev of decodeLlamaBedrockChunk(
-              payload as Parameters<typeof decodeLlamaBedrockChunk>[0],
-              // biome-ignore lint/style/noNonNullAssertion: family branch guarantees defined.
-              llamaState!,
-            )) {
-              yield ev;
-            }
-            break;
-          case "mistral":
-            for (const ev of decodeMistralBedrockChunk(
-              payload as Parameters<typeof decodeMistralBedrockChunk>[0],
-              // biome-ignore lint/style/noNonNullAssertion: family branch guarantees defined.
-              mistralState!,
-            )) {
-              yield ev;
-            }
-            break;
-        }
+        const ev = decodeAnthropicBedrockChunk(payload);
+        if (ev !== null) yield ev;
       }
     } catch (err) {
       if ((err as { name?: unknown })?.name === "AbortError") throw err;
       throw normaliseBedrockError(err);
     }
-    // Ensure terminator events fire even if the family decoder didn't.
-    if (this.family === "anthropic") {
-      // Anthropic-on-Bedrock embeds message_stop in its raw events,
-      // so nothing extra to do here.
-    } else if (
-      (llamaState !== undefined && !llamaState.closed) ||
-      (mistralState !== undefined && !mistralState.closed)
-    ) {
-      yield { kind: "message_delta", stopReason: "end_turn" };
-      yield { kind: "message_stop" };
-    }
-  }
-}
-
-function buildBodyForFamily(req: ProviderRequest, family: BedrockFamily): unknown {
-  switch (family) {
-    case "anthropic":
-      return buildAnthropicBedrockBody(req);
-    case "llama":
-      return buildLlamaBedrockBody(req);
-    case "mistral":
-      return buildMistralBedrockBody(req);
+    // Anthropic-on-Bedrock embeds message_delta/message_stop in its raw
+    // events, so no synthetic terminator is needed here.
   }
 }
 
