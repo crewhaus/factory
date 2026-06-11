@@ -106,3 +106,38 @@ describe("emitCfWorkerCli", () => {
     expect(() => parseJs(worker?.content ?? "")).not.toThrow();
   });
 });
+
+describe("emitCfWorkerCli — provider gate", () => {
+  test("an openai/ spec fails at compile time with the cf-worker hint", () => {
+    const ir: IrV0 = {
+      ...baseIr,
+      agent: { ...baseIr.agent, model: "openai/gpt-4o-mini" },
+    };
+    expect(() => emitCfWorkerCli(ir)).toThrow(TargetEmitError);
+    expect(() => emitCfWorkerCli(ir)).toThrow(
+      /cf-worker targets currently support claude-\* models only — use the cli target for other providers/,
+    );
+    expect(() => emitCfWorkerCli(ir)).toThrow(/openai/);
+  });
+
+  test("gemini/, bedrock/, and local/ specs are all rejected", () => {
+    for (const model of [
+      "gemini/gemini-2.5-flash",
+      "bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+      "local/llama3.2@http://localhost:11434/v1",
+    ]) {
+      const ir: IrV0 = { ...baseIr, agent: { ...baseIr.agent, model } };
+      expect(() => emitCfWorkerCli(ir)).toThrow(TargetEmitError);
+    }
+  });
+
+  test("an unparseable model string surfaces as TargetEmitError, not a raw ConfigError", () => {
+    const ir: IrV0 = { ...baseIr, agent: { ...baseIr.agent, model: "gpt-4o-mini" } };
+    expect(() => emitCfWorkerCli(ir)).toThrow(TargetEmitError);
+    expect(() => emitCfWorkerCli(ir)).toThrow(/unrecognised model string/);
+  });
+
+  test("claude-* models still emit cleanly", () => {
+    expect(emitCfWorkerCli(baseIr).files.length).toBe(3);
+  });
+});

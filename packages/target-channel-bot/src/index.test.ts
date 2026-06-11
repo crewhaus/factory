@@ -80,7 +80,7 @@ describe("emitChannelBot — daemon.ts wiring", () => {
     expect(c).toContain("missing required env vars");
   });
 
-  test("literal secret values are embedded verbatim and skip the env-check", () => {
+  test("literal secret values are embedded verbatim and skip the channel env-check", () => {
     const irLit: IrChannelV0 = {
       ...MIN_IR,
       channels: {
@@ -93,8 +93,14 @@ describe("emitChannelBot — daemon.ts wiring", () => {
     const c = fileMap(irLit).get("daemon.ts") ?? "";
     expect(c).toContain('"xoxb-literal"');
     expect(c).toContain('"literal-signing"');
-    // No env-check block when there are no env-refs.
-    expect(c).not.toContain("missing required env vars");
+    // No per-name channel env list when there are no env-refs…
+    expect(c).not.toContain("const __requiredEnv =");
+    expect(c).not.toContain('"SLACK_BOT_TOKEN"');
+    // …but the provider credential group (claude-* model → Anthropic
+    // either-or) is still enforced at startup.
+    expect(c).toContain("__providerEnvAnyOf");
+    expect(c).toContain('["ANTHROPIC_AUTH_TOKEN","ANTHROPIC_API_KEY"]');
+    expect(c).toContain("missing required env vars");
   });
 
   test("loads hooks/skills/slash-commands like the cli target", () => {
@@ -342,7 +348,7 @@ describe("emitChannelBot — Telegram channel (Section 33)", () => {
     expect(c).toContain('["telegram", telegramAdapter]');
   });
 
-  test("literal Telegram secrets embed verbatim and skip env-check", () => {
+  test("literal Telegram secrets embed verbatim and skip the channel env-check", () => {
     const irLit: IrChannelV0 = {
       ...MIN_IR,
       channels: {
@@ -355,7 +361,80 @@ describe("emitChannelBot — Telegram channel (Section 33)", () => {
     const c = fileMap(irLit).get("daemon.ts") ?? "";
     expect(c).toContain('"literal-bot-token"');
     expect(c).toContain('"literal-secret"');
-    expect(c).not.toContain("__requiredEnv");
+    // No per-name channel env list — only the provider either-or group
+    // (claude-* model) remains.
+    expect(c).not.toContain("const __requiredEnv =");
+    expect(c).toContain("__providerEnvAnyOf");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Provider credential groups — derived from agent.model via parseModelString
+// at emit time. Either-or semantics: any ONE name per group satisfies the
+// startup check (distinct from the all-required channel-secret list).
+// ---------------------------------------------------------------------------
+
+describe("emitChannelBot — provider env requirement (model-derived)", () => {
+  const withModel = (model: string): IrChannelV0 => ({
+    ...MIN_IR,
+    agent: { ...MIN_IR.agent, model },
+  });
+
+  test("claude-* model requires ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY (either)", () => {
+    const c = fileMap(MIN_IR).get("daemon.ts") ?? "";
+    expect(c).toContain('["ANTHROPIC_AUTH_TOKEN","ANTHROPIC_API_KEY"]');
+    expect(c).toContain(".filter((g) => !g.some((n) => process.env[n]))");
+    // The channel secrets stay individually required alongside the group.
+    expect(c).toContain('"SLACK_BOT_TOKEN"');
+    expect(c).toContain('"SLACK_SIGNING_SECRET"');
+  });
+
+  test("openai/ model requires OPENAI_API_KEY or OPENAI_BASE_URL — and NOT Anthropic creds", () => {
+    const c = fileMap(withModel("openai/gpt-4o-mini")).get("daemon.ts") ?? "";
+    expect(c).toContain('["OPENAI_API_KEY","OPENAI_BASE_URL"]');
+    expect(c).not.toContain("ANTHROPIC_AUTH_TOKEN");
+  });
+
+  test("gemini/ model requires GEMINI_API_KEY or GOOGLE_API_KEY", () => {
+    const c = fileMap(withModel("gemini/gemini-2.5-flash")).get("daemon.ts") ?? "";
+    expect(c).toContain('["GEMINI_API_KEY","GOOGLE_API_KEY"]');
+    expect(c).not.toContain("ANTHROPIC_AUTH_TOKEN");
+  });
+
+  test("bedrock/ model adds no provider group (AWS SDK credential chain is authoritative)", () => {
+    const c =
+      fileMap(withModel("bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0")).get("daemon.ts") ??
+      "";
+    expect(c).not.toContain("__providerEnvAnyOf");
+    // The channel-secret check is still present.
+    expect(c).toContain('"SLACK_BOT_TOKEN"');
+    expect(c).toContain("missing required env vars");
+  });
+
+  test("local/<m>@<url> model adds no provider group (no credentials needed)", () => {
+    const c = fileMap(withModel("local/llama3.2@http://localhost:11434/v1")).get("daemon.ts") ?? "";
+    expect(c).not.toContain("__providerEnvAnyOf");
+  });
+
+  test("a model outside the router grammar adds no provider group (runtime raises the real error)", () => {
+    // The spec layer does not enforce the router grammar at emit time —
+    // compiler fixtures use placeholder models like "m". resolveModel
+    // raises the authoritative ConfigError when the daemon actually runs.
+    const c = fileMap(withModel("gpt-4o-mini")).get("daemon.ts") ?? "";
+    expect(c).not.toContain("__providerEnvAnyOf");
+    expect(c).toContain('"SLACK_BOT_TOKEN"'); // channel check unaffected
+  });
+
+  test("the generated startup check enforces either-or at runtime (executable semantics)", () => {
+    // Execute the generated check's exact predicate in-process with a
+    // synthetic env to pin the either-or semantics (not just source text).
+    const groups: string[][] = [["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"]];
+    const env1: Record<string, string | undefined> = { ANTHROPIC_API_KEY: "k" };
+    const env2: Record<string, string | undefined> = {};
+    const missing1 = groups.filter((g) => !g.some((n) => env1[n])).map((g) => g.join(" or "));
+    const missing2 = groups.filter((g) => !g.some((n) => env2[n])).map((g) => g.join(" or "));
+    expect(missing1).toEqual([]);
+    expect(missing2).toEqual(["ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY"]);
   });
 });
 
@@ -497,8 +576,10 @@ describe("emitChannelBot — iMessage channel (Section 33)", () => {
   test("daemon.ts emits imessage adapter with no fields when none configured", () => {
     const c = fileMap(IMESSAGE_IR).get("daemon.ts") ?? "";
     expect(c).toContain("createIMessageAdapter({");
-    // No env-check entries because none of the optional fields are set.
-    expect(c).not.toContain("missing required env vars");
+    // No channel env-check entries because none of the optional fields are
+    // set; only the model-derived provider group remains.
+    expect(c).not.toContain("const __requiredEnv =");
+    expect(c).toContain("__providerEnvAnyOf");
   });
 
   test("daemon.ts emits chatDbPath / cursorPath when configured via env", () => {

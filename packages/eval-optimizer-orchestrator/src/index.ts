@@ -375,6 +375,13 @@ export async function optimizeSpec(opts: OptimizeSpecOptions): Promise<OptimizeS
  * id that prices to $0, so the meter never accumulates and the gate never
  * trips — the run is bounded by the iterations cap alone.
  */
+const KNOWN_PROVIDER_IDS: ReadonlySet<string> = new Set([
+  "anthropic",
+  "openai",
+  "gemini",
+  "bedrock",
+]);
+
 function resolveMutatorModel(mutator: MutationProvider | undefined): {
   provider: ProviderId;
   modelId: string;
@@ -391,7 +398,20 @@ function resolveMutatorModel(mutator: MutationProvider | undefined): {
       typeof (mutator as { maxOutputTokens: unknown }).maxOutputTokens === "number"
         ? (mutator as { maxOutputTokens: number }).maxOutputTokens
         : 2048;
-    return { provider: "anthropic", modelId, maxOutputTokens };
+    // Feature-detect the provider id the same way as modelId: a
+    // model-backed provider built on a non-Anthropic adapter (the CLI's
+    // `--mutator claude` on an openai/gemini/bedrock spec) exposes its
+    // adapter's providerId, so the budget gate prices against the REAL
+    // provider's table. Providers without the getter price as Anthropic
+    // (the historical behaviour — non-breaking).
+    const rawProvider =
+      "providerId" in mutator && typeof (mutator as { providerId: unknown }).providerId === "string"
+        ? (mutator as { providerId: string }).providerId
+        : "anthropic";
+    const provider: ProviderId = KNOWN_PROVIDER_IDS.has(rawProvider)
+      ? (rawProvider as ProviderId)
+      : "anthropic";
+    return { provider, modelId, maxOutputTokens };
   }
   // No model exposed → an unpriceable placeholder id (resolvePricing miss
   // ⇒ $0). 2048 is the conventional default ceiling; unused when $0.

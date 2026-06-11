@@ -71,6 +71,29 @@ describe("createJustificationJudge", () => {
       process.env["ANTHROPIC_API_KEY"] = prev;
     }
   });
+
+  test("a non-Anthropic judge model resolves via the model-router and carries the STRIPPED wire model", async () => {
+    // `local/<m>@<url>` resolves the real OpenAI-compatible adapter with NO
+    // API key required, so this exercises the router path end-to-end. The
+    // endpoint is unreachable (port 1) — the judge fails CLOSED, and its
+    // verdict's judgeModel must carry the stripped wire id `<model> (error)`,
+    // NOT the full prefixed router string the old hardcoded
+    // createAnthropicAdapter() path passed verbatim.
+    const judge = await createJustificationJudge(
+      "claude",
+      "local/justification-judge-model@http://127.0.0.1:1/v1",
+    );
+    expect(typeof judge).toBe("function");
+    if (judge === undefined) throw new Error("unreachable");
+    const verdict = await judge({
+      toolName: "SendMessage",
+      justification: "post the summary",
+      sessionGoal: "summarize the channel",
+      input: { text: "hi" },
+    });
+    expect(verdict.allow).toBe(false); // fail-closed on transport error
+    expect(verdict.judgeModel).toBe("justification-judge-model (error)");
+  });
 });
 
 describe("openJustificationAuditSink", () => {

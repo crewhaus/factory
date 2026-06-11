@@ -33,6 +33,39 @@ secrets:
     bot:
       secretName: crewhaus-creds
       key: SLACK_BOT_TOKEN
+  # Generic provider secret list — one entry per env var the spec's model
+  # provider needs, each sourced from a Kubernetes Secret. Use this for
+  # non-Anthropic models (the model-router grammar: openai/*, gemini/*,
+  # bedrock/*, local/<m>@<url>). Presets:
+  #
+  #   openai:   - name: OPENAI_API_KEY          # or OPENAI_BASE_URL for an
+  #                                             # OpenAI-compatible endpoint
+  #   gemini:   - name: GEMINI_API_KEY          # or GOOGLE_API_KEY; Vertex
+  #                                             # users set GOOGLE_CLOUD_PROJECT
+  #                                             # + GOOGLE_GENAI_USE_VERTEXAI
+  #                                             # via extraEnv below
+  #   bedrock:  - name: AWS_BEARER_TOKEN_BEDROCK # or AWS_ACCESS_KEY_ID +
+  #             - name: AWS_SECRET_ACCESS_KEY    # AWS_SECRET_ACCESS_KEY; the
+  #                                              # SDK default chain (IRSA,
+  #                                              # instance profile) needs none
+  #   local:    (no credentials)
+  #
+  # Example:
+  #   provider:
+  #     - name: OPENAI_API_KEY
+  #       secretName: crewhaus-creds
+  #       key: OPENAI_API_KEY
+  provider: []
+
+# Plain (non-secret) env vars appended to the container, e.g. provider
+# region/endpoint selectors:
+#   - name: AWS_REGION
+#     value: us-east-1
+#   - name: OPENAI_BASE_URL
+#     value: http://vllm.internal:8000/v1
+#   - name: GOOGLE_CLOUD_PROJECT
+#     value: my-project
+extraEnv: []
 
 # Service & Ingress (only rendered for daemon shapes: channel, managed, crew,
 # voice, browser).

@@ -134,3 +134,32 @@ describe("emitCfWorkerWorkflow — package.json name injection (#148)", () => {
     expect(parsed.dependencies).toBeUndefined(); // injection did not break out
   });
 });
+
+describe("emitCfWorkerWorkflow — provider gate", () => {
+  test("a workflow with one openai/ step fails at compile time, naming the step", () => {
+    const ir: IrWorkflowV0 = {
+      ...baseIr,
+      steps: [step({ name: "research" }), step({ name: "draft", model: "openai/gpt-4o-mini" })],
+    };
+    expect(() => emitCfWorkerWorkflow(ir)).toThrow(TargetEmitError);
+    expect(() => emitCfWorkerWorkflow(ir)).toThrow(
+      /cf-worker targets currently support claude-\* models only — use the cli target for other providers/,
+    );
+    expect(() => emitCfWorkerWorkflow(ir)).toThrow(/step "draft"/);
+  });
+
+  test("gemini/, bedrock/, and local/ step models are all rejected", () => {
+    for (const model of [
+      "gemini/gemini-2.5-flash",
+      "bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+      "local/llama3.2@http://localhost:11434/v1",
+    ]) {
+      const ir: IrWorkflowV0 = { ...baseIr, steps: [step({ model })] };
+      expect(() => emitCfWorkerWorkflow(ir)).toThrow(TargetEmitError);
+    }
+  });
+
+  test("all-claude steps still emit cleanly", () => {
+    expect(emitCfWorkerWorkflow(baseIr).files.length).toBe(3);
+  });
+});
