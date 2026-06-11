@@ -68,7 +68,7 @@ describe("classifyEgress", () => {
 
   test("ignores tagged content shorter than the match floor", async () => {
     const ctx = createRunContext();
-    tagContent(ctx, "abc", "subagent"); // way under 16-char floor
+    tagContent(ctx, "abc", "subagent"); // way under the 8-char match floor
     const result = await classifyEgress("https://example.com/?q=abc", ctx, {
       sinkId: "fetch",
       sinkScope: "external-configured",
@@ -79,10 +79,11 @@ describe("classifyEgress", () => {
 
   test("respects a custom minMatchLength for fixtures", async () => {
     const ctx = createRunContext();
-    // tagContent itself enforces a 16-char floor to keep lineage clean, so
-    // for short-fixture tests we pre-populate dataLineage directly. In
-    // production, the classifier's floor and tagContent's floor are both
-    // 16; minMatchLength override is intended for tests + recipes.
+    // tagContent enforces its own floors (16 for blob/lines, 8 for vetted
+    // credential tokens) to keep lineage clean, so for short-fixture tests we
+    // pre-populate dataLineage directly. In production the classifier's
+    // MIN_MATCH_LENGTH=8 backstop matches the token floor; the
+    // minMatchLength override is intended for tests + recipes.
     ctx.dataLineage = new Map<string, TrustOrigin>([["shortish", "subagent"]]);
     const result = await classifyEgress("payload shortish embedded", ctx, {
       sinkId: "fetch",
@@ -188,8 +189,9 @@ describe("classifyEgress", () => {
   });
 
   // SECURITY (audit R2): end-to-end short-secret coverage — a credential-
-  // shaped token under the old 16-char floor is tagged at the boundary and
-  // caught at egress when the model extracts JUST the secret from its line.
+  // shaped token too short for line tagging (under 16 chars) is token-tagged
+  // at the boundary and caught at egress when the model extracts JUST the
+  // secret from its line.
   test("a short credential token extracted from its line is caught at egress", async () => {
     const ctx = createRunContext();
     tagContent(ctx, "Stripe key for deploys: sk-Ab12Cd34 (rotate quarterly)", "mcp");
