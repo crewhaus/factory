@@ -1,9 +1,13 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { generateKeyPairSync, sign } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type PluginManifest, manifestPayloadForSigning } from "@crewhaus/plugin-sdk";
+import {
+  type PluginManifest,
+  entrypointDigest,
+  manifestPayloadForSigning,
+} from "@crewhaus/plugin-sdk";
 import {
   PluginLoaderError,
   createPluginLoader,
@@ -141,6 +145,56 @@ describe("plugin-loader.load — happy path", () => {
     });
     const loaded = await loader.load(join(pluginDir, "plugin.json"));
     expect(loaded.signed).toBe(true);
+  });
+
+  // SECURITY: the signature must commit to the CODE, not just the manifest.
+  // entrypointDigest binds index.js; a swapped index.js next to a validly-
+  // signed manifest must be refused.
+  test("loads a signed plugin whose entrypointDigest matches index.js", async () => {
+    const { publicKeyPem, privateKey } = makeKeypair();
+    const code = readFileSync(join(pluginDir, "index.js"));
+    const unsigned: PluginManifest = {
+      name: "my-plugin",
+      version: "1.0.0",
+      entrypointDigest: entrypointDigest(new Uint8Array(code)),
+    };
+    writeFileSync(
+      join(pluginDir, "plugin.json"),
+      JSON.stringify(signManifest(unsigned, privateKey)),
+    );
+    const loader = createPluginLoader({
+      trustedRoots: [tmpRoot],
+      trustAnchors: [{ name: "test", publicKeyPem }],
+    });
+    const loaded = await loader.load(join(pluginDir, "plugin.json"));
+    expect(loaded.signed).toBe(true);
+  });
+
+  test("refuses to import when index.js does not match the signed entrypointDigest", async () => {
+    const { publicKeyPem, privateKey } = makeKeypair();
+    const code = readFileSync(join(pluginDir, "index.js"));
+    const unsigned: PluginManifest = {
+      name: "my-plugin",
+      version: "1.0.0",
+      entrypointDigest: entrypointDigest(new Uint8Array(code)),
+    };
+    writeFileSync(
+      join(pluginDir, "plugin.json"),
+      JSON.stringify(signManifest(unsigned, privateKey)),
+    );
+    // Attacker swaps the entrypoint AFTER the manifest was signed.
+    writeFileSync(join(pluginDir, "index.js"), "export default { pwned: true };\n");
+    let imported = false;
+    const loader = createPluginLoader({
+      trustedRoots: [tmpRoot],
+      trustAnchors: [{ name: "test", publicKeyPem }],
+      importEntrypoint: async () => {
+        imported = true;
+        return { default: {} };
+      },
+    });
+    await expect(loader.load(join(pluginDir, "plugin.json"))).rejects.toThrow(/digest mismatch/);
+    expect(imported).toBe(false); // never reached import()
   });
 });
 

@@ -5,6 +5,7 @@ import { CrewhausError } from "@crewhaus/errors";
 import {
   type PluginManifest,
   type PluginPermissions,
+  entrypointDigest,
   manifestPayloadForSigning,
   validatePluginManifest,
 } from "@crewhaus/plugin-sdk";
@@ -85,6 +86,11 @@ export type PluginLoaderOptions = {
    * doesn't reach for the entrypoint until path + signature checks pass.
    */
   readonly importEntrypoint?: (absPath: string) => Promise<{ default?: unknown }>;
+  /**
+   * Override for tests: read the entrypoint file's bytes for the
+   * `entrypointDigest` integrity check. Defaults to reading via `Bun.file`.
+   */
+  readonly readEntrypoint?: (absPath: string) => Promise<Uint8Array>;
 };
 
 export type LoadedPlugin = {
@@ -151,6 +157,9 @@ export function createPluginLoader(opts: PluginLoaderOptions): PluginLoader {
       const mod = (await import(absPath)) as { default?: unknown };
       return mod;
     });
+  const readEntrypoint =
+    opts.readEntrypoint ??
+    (async (absPath) => new Uint8Array(await Bun.file(absPath).arrayBuffer()));
 
   function assertUnderTrustedRoot(realPath: string): void {
     if (!roots.some((root) => isUnderRoot(realPath, root))) {
@@ -231,6 +240,29 @@ export function createPluginLoader(opts: PluginLoaderOptions): PluginLoader {
       const manifestDir = realManifest.slice(0, realManifest.lastIndexOf(sep));
       const entrypointPath = resolvePath(manifestDir, "index.js");
       assertUnderTrustedRoot(entrypointPath);
+
+      // Code-integrity: the signature only attests to the MANIFEST. When the
+      // manifest carries an entrypointDigest (which is covered by the
+      // signature), recompute the hash of the actual index.js and refuse to
+      // import if it differs — otherwise a swapped index.js next to a validly-
+      // signed manifest would execute while the loader reported signed:true.
+      if (manifest.entrypointDigest !== undefined) {
+        let bytes: Uint8Array;
+        try {
+          bytes = await readEntrypoint(entrypointPath);
+        } catch (err) {
+          throw new PluginLoaderError(
+            `failed to read plugin entrypoint at ${entrypointPath} for digest check: ${err instanceof Error ? err.message : String(err)}`,
+            err,
+          );
+        }
+        const actual = entrypointDigest(bytes);
+        if (actual !== manifest.entrypointDigest) {
+          throw new PluginLoaderError(
+            `plugin "${manifest.name}": entrypoint digest mismatch — index.js does not match the signed entrypointDigest (signature attests to different code). Refusing to import.`,
+          );
+        }
+      }
 
       let module: { default?: unknown };
       try {
