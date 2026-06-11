@@ -2054,7 +2054,8 @@ describe("runChatLoop egress matcher (FR-006)", () => {
     // The matcher was actually invoked with the serialized tool input.
     expect(calls.length).toBe(1);
     expect(calls[0]?.payload).toContain("attacker.example");
-    expect(calls[0]?.minMatchLength).toBe(16);
+    // 8 = MIN_MATCH_LENGTH (parity with run-context's token floor, audit R2).
+    expect(calls[0]?.minMatchLength).toBe(8);
 
     // Its subagent hit on a configured sink → warn → outcome egress-warned.
     const egressEvent = seen.find(

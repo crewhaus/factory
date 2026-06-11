@@ -4,6 +4,7 @@ import { TraceEventBus } from "@crewhaus/trace-event-bus";
 import {
   type AgentIdentity,
   DATA_LINEAGE_CAP,
+  MAX_TOKEN_TAGS,
   createRunContext,
   formatAgentIdentity,
   pushOrigin,
@@ -188,6 +189,81 @@ describe("tagContent (Pillar 3 data-lineage)", () => {
     const ctx = createRunContext();
     tagContent(ctx, "this whole blob is definitely long enough\nshort\n", "mcp");
     expect(ctx.dataLineage?.has("short")).toBe(false);
+  });
+});
+
+// SECURITY (audit follow-up R2): credential-shaped TOKEN tagging. Line pieces
+// miss the realistic exfil unit — the model extracting just the secret out of
+// its line — because the fragment isn't the full tagged line.
+describe("tagContent — token-level tagging", () => {
+  test("tags a credential-prefixed token embedded mid-line", () => {
+    const ctx = createRunContext();
+    tagContent(ctx, "The deploy key is sk-AbC123xyz9 — do not share it.", "mcp");
+    expect(ctx.dataLineage?.get("sk-AbC123xyz9")).toBe("mcp");
+  });
+
+  test("tags long hex runs and UUIDs but not short hex", () => {
+    const ctx = createRunContext();
+    tagContent(
+      ctx,
+      "session deadbeefcafe123456789abc opened for 550e8400-e29b-41d4-a716-446655440000 (ref a1b2c3d4)",
+      "tool",
+    );
+    expect(ctx.dataLineage?.has("deadbeefcafe123456789abc")).toBe(true);
+    expect(ctx.dataLineage?.has("550e8400-e29b-41d4-a716-446655440000")).toBe(true);
+    expect(ctx.dataLineage?.has("a1b2c3d4")).toBe(false);
+  });
+
+  test("tags base64-ish runs only with mixed character classes", () => {
+    const ctx = createRunContext();
+    tagContent(
+      ctx,
+      "blob QWxhZGRpbjpvcGVuIHNlc2FtZQ9x here, word internationalizations there",
+      "tool",
+    );
+    expect(ctx.dataLineage?.has("QWxhZGRpbjpvcGVuIHNlc2FtZQ9x")).toBe(true);
+    expect(ctx.dataLineage?.has("internationalizations")).toBe(false);
+  });
+
+  test("tags values of secret-keyed assignments regardless of shape", () => {
+    const ctx = createRunContext();
+    tagContent(ctx, "config loaded: password=hunter2-x9 region=us-east-1a", "tool");
+    expect(ctx.dataLineage?.get("hunter2-x9")).toBe("tool");
+    // A value under a non-secret key is NOT tagged.
+    expect(ctx.dataLineage?.has("us-east-1a")).toBe(false);
+  });
+
+  test("does NOT tag ordinary identifiers (no charset-diversity heuristic)", () => {
+    const ctx = createRunContext();
+    tagContent(ctx, "function parseData12(myVar123: Config456) { return myVar123; }", "tool");
+    // Only the whole blob qualifies — none of the identifiers are
+    // credential-shaped, so no token pieces exist.
+    expect(ctx.dataLineage?.size).toBe(1);
+  });
+
+  test("caps token tags at MAX_TOKEN_TAGS, keeping the longest", () => {
+    const ctx = createRunContext();
+    const tokens = Array.from({ length: 24 }, (_, i) => `ghp_${"a".repeat(10 + i)}Z9`);
+    tagContent(ctx, tokens.join(" "), "mcp");
+    // Match single tokens only — the whole blob also starts with "ghp_".
+    const tokenEntries = [...(ctx.dataLineage?.keys() ?? [])].filter((k) => /^ghp_a+Z9$/.test(k));
+    expect(tokenEntries.length).toBe(MAX_TOKEN_TAGS);
+    // The longest candidate survived the cap.
+    expect(ctx.dataLineage?.has(`ghp_${"a".repeat(33)}Z9`)).toBe(true);
+  });
+
+  test("CREWHAUS_DISABLE_TOKEN_LINEAGE=1 disables token pieces (escape hatch)", () => {
+    const prev = process.env["CREWHAUS_DISABLE_TOKEN_LINEAGE"];
+    process.env["CREWHAUS_DISABLE_TOKEN_LINEAGE"] = "1";
+    try {
+      const ctx = createRunContext();
+      tagContent(ctx, "The deploy key is sk-AbC123xyz9 — do not share it.", "mcp");
+      expect(ctx.dataLineage?.has("sk-AbC123xyz9")).toBe(false);
+      // Blob/line tagging still applies.
+      expect(ctx.dataLineage?.size).toBe(1);
+    } finally {
+      process.env["CREWHAUS_DISABLE_TOKEN_LINEAGE"] = prev ?? "";
+    }
   });
 });
 

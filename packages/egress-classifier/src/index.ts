@@ -113,13 +113,17 @@ const ORIGIN_DEFAULT_POLICY: SeverityMatrix = {
 };
 
 /**
- * Minimum length for a tagged-content match to count. Short common
- * strings (whitespace, single words, IDs ≤8 chars) produce too many
- * false positives. 16 chars is the floor that empirically lets through
- * benign overlap (`"the"`, `"https"`, short identifiers) while still
- * catching meaningful exfil (URLs, tokens, sentences).
+ * Minimum length for a tagged-content match to count. This is a BACKSTOP
+ * against pathological lineage entries, not the primary false-positive
+ * control: insertion discipline lives in run-context's `tagContent`, which
+ * only admits whole blobs / lines >= 16 chars and credential-shaped tokens
+ * >= 8 chars (audit follow-up R2 — see `MIN_TOKEN_TAG_LENGTH` and
+ * `isCredentialShaped` there). 8 matches the token floor so vetted short
+ * secrets (sk-..., hex runs, key=value secrets) can actually match at
+ * egress; anything shorter is indistinguishable from prose. Keep in sync
+ * with run-context's `MIN_TOKEN_TAG_LENGTH`.
  */
-export const MIN_MATCH_LENGTH = 16;
+export const MIN_MATCH_LENGTH = 8;
 
 /**
  * FR-006 — the matching step factored behind a strategy interface. The
@@ -413,6 +417,7 @@ function cacheKey(
   sinkScope: SinkScope,
   sinkId: string,
   matcherName: string,
+  lineageDigest: string,
 ): string {
   // Length-prefix every field before hashing so the component boundaries are
   // unambiguous. A bare `"|"` delimiter is not injective when a field can
@@ -423,10 +428,33 @@ function cacheKey(
   // discovered MCP tool name). `<byteLength>:` framing makes each field
   // self-delimiting regardless of its contents.
   const h = createHash("sha256");
-  for (const field of [matcherName, sinkScope, sinkId, payload]) {
+  for (const field of [matcherName, sinkScope, sinkId, payload, lineageDigest]) {
     h.update(String(Buffer.byteLength(field, "utf8")));
     h.update(":");
     h.update(field, "utf8");
+  }
+  return h.digest("hex");
+}
+
+/**
+ * Stable digest of the lineage map's CONTENT (keys + origins, sorted), used
+ * as a cache-key component. Without it the cache serves stale verdicts: the
+ * lineage map GROWS during a run (every boundary crossing tags more
+ * content), so the same (payload, sink) pair legitimately classifies
+ * differently once a secret contained in the payload gets tagged. A verdict
+ * cached before that tag would otherwise be served forever — an egress-scan
+ * bypass. Sorting makes the digest insensitive to recency-refresh reordering
+ * (delete + re-insert on re-tag), which changes Map iteration order without
+ * changing content.
+ */
+function lineageDigestOf(lineage: ReadonlyMap<string, TrustOrigin>): string {
+  const h = createHash("sha256");
+  const keys = [...lineage.keys()].sort();
+  for (const k of keys) {
+    h.update(String(Buffer.byteLength(k, "utf8")));
+    h.update(":");
+    h.update(k, "utf8");
+    h.update(lineage.get(k) as string, "utf8");
   }
   return h.digest("hex");
 }
@@ -492,8 +520,17 @@ export async function classifyEgress(
 
   // Namespace the cache by matcher name so a verdict produced by one
   // matcher (e.g. semantic) is never served to a call using another
-  // (e.g. substring) over the same (sinkScope, sinkId, payload).
-  const key = cacheKey(payload, opts.sinkScope, opts.sinkId, matcher.name);
+  // (e.g. substring) over the same (sinkScope, sinkId, payload) — and by a
+  // digest of the lineage content so a verdict computed against an OLDER,
+  // smaller lineage is never served after new tags land (see
+  // `lineageDigestOf`).
+  const key = cacheKey(
+    payload,
+    opts.sinkScope,
+    opts.sinkId,
+    matcher.name,
+    lineageDigestOf(lineage),
+  );
   if (opts.bypassCache !== true) {
     const hit = cache.get(key);
     if (hit !== undefined) {
