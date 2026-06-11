@@ -110,6 +110,21 @@ describe("createWalletEngine — policy enforcement", () => {
     ).rejects.toThrow(/uniswap-router/);
   });
 
+  // SECURITY: empty allowedContracts is now FAIL-CLOSED (was allow-all). The
+  // default onchain policy must not let a prompt-injected model send arbitrary
+  // calldata/value to any address.
+  test("fails closed when allowedContracts is empty (default policy)", async () => {
+    const we = createWalletEngine({
+      resolveAdapter: () => fakeAdapter(() => "0x"),
+      approve: async () => "allow",
+    });
+    we.registerCustody(createLocalSignerStub());
+    const emptyPolicy: TransactionPolicy = { ...POLICY, allowedContracts: [] };
+    await expect(
+      we.requestSignAndBroadcast({ tx: TX_OK, policy: emptyPolicy, wallet: WALLET }),
+    ).rejects.toThrow(/allowedContracts is empty/);
+  });
+
   test("rejects when tx.to does not match the bound contract address (#151)", async () => {
     const we = createWalletEngine({
       resolveAdapter: () => fakeAdapter(() => "0x"),
