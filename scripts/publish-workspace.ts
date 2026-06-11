@@ -201,11 +201,7 @@ function ownershipMismatch(p: PkgInfo): string | null {
   const urlOk = normRepoUrl(repo.url) === normRepoUrl(p.repoUrl);
   const dirOk = (repo.directory ?? "") === (p.repoDir ?? "");
   if (urlOk && dirOk) return null;
-  return (
-    `registry says repository=${repo.url ?? "<none>"} dir=${repo.directory ?? "<none>"}, ` +
-    `local says repository=${p.repoUrl ?? "<none>"} dir=${p.repoDir ?? "<none>"} — ` +
-    "this npm name appears to belong to a DIFFERENT package; publishing would hijack it"
-  );
+  return `registry says repository=${repo.url ?? "<none>"} dir=${repo.directory ?? "<none>"}, local says repository=${p.repoUrl ?? "<none>"} dir=${p.repoDir ?? "<none>"} — this npm name appears to belong to a DIFFERENT package; publishing would hijack it`;
 }
 
 type PublishResult = "ok" | "already" | "failed";
