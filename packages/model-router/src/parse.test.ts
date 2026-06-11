@@ -70,8 +70,72 @@ describe("parseModelString", () => {
         family: "mistral",
       });
     });
-    test("rejects unknown family", () => {
-      expect(() => parseModelString("bedrock/cohere.command-r-v1:0")).toThrow(ConfigError);
+
+    // Converse-only families. Twin vectors:
+    // adapter-bedrock/src/family.test.ts — keep in sync.
+    test("nova family", () => {
+      expect(parseModelString("bedrock/amazon.nova-pro-v1:0")).toEqual({
+        providerId: "bedrock",
+        modelId: "amazon.nova-pro-v1:0",
+        family: "nova",
+      });
+    });
+    test("titan family (titan-text only)", () => {
+      expect(parseModelString("bedrock/amazon.titan-text-express-v1")).toEqual({
+        providerId: "bedrock",
+        modelId: "amazon.titan-text-express-v1",
+        family: "titan",
+      });
+    });
+    test("deepseek family", () => {
+      expect(parseModelString("bedrock/deepseek.r1-v1:0")).toEqual({
+        providerId: "bedrock",
+        modelId: "deepseek.r1-v1:0",
+        family: "deepseek",
+      });
+    });
+    test("cohere family (command only)", () => {
+      expect(parseModelString("bedrock/cohere.command-r-plus-v1:0")).toEqual({
+        providerId: "bedrock",
+        modelId: "cohere.command-r-plus-v1:0",
+        family: "cohere",
+      });
+    });
+    test("ai21 family", () => {
+      expect(parseModelString("bedrock/ai21.jamba-1-5-large-v1:0")).toEqual({
+        providerId: "bedrock",
+        modelId: "ai21.jamba-1-5-large-v1:0",
+        family: "ai21",
+      });
+    });
+    test("qwen family", () => {
+      expect(parseModelString("bedrock/qwen.qwen3-32b-v1:0")).toEqual({
+        providerId: "bedrock",
+        modelId: "qwen.qwen3-32b-v1:0",
+        family: "qwen",
+      });
+    });
+    test("gpt-oss family", () => {
+      expect(parseModelString("bedrock/openai.gpt-oss-120b-1:0")).toEqual({
+        providerId: "bedrock",
+        modelId: "openai.gpt-oss-120b-1:0",
+        family: "gpt-oss",
+      });
+    });
+    test("writer family", () => {
+      expect(parseModelString("bedrock/writer.palmyra-x5-v1:0")).toEqual({
+        providerId: "bedrock",
+        modelId: "writer.palmyra-x5-v1:0",
+        family: "writer",
+      });
+    });
+
+    test("rejects unknown families (non-chat vendor siblings included)", () => {
+      expect(() => parseModelString("bedrock/amazon.titan-embed-text-v2:0")).toThrow(ConfigError);
+      expect(() => parseModelString("bedrock/cohere.embed-english-v3")).toThrow(ConfigError);
+      expect(() => parseModelString("bedrock/stability.stable-diffusion-xl-v1")).toThrow(
+        ConfigError,
+      );
     });
     test("rejects empty modelId", () => {
       expect(() => parseModelString("bedrock/")).toThrow(ConfigError);
@@ -122,8 +186,29 @@ describe("parseModelString", () => {
         family: "mistral",
       });
     });
+    test("us. inference profile (nova)", () => {
+      expect(parseModelString("bedrock/us.amazon.nova-pro-v1:0")).toEqual({
+        providerId: "bedrock",
+        modelId: "us.amazon.nova-pro-v1:0",
+        family: "nova",
+      });
+    });
+    test("eu. inference profile (deepseek)", () => {
+      expect(parseModelString("bedrock/eu.deepseek.r1-v1:0")).toEqual({
+        providerId: "bedrock",
+        modelId: "eu.deepseek.r1-v1:0",
+        family: "deepseek",
+      });
+    });
+    test("us. inference profile (gpt-oss)", () => {
+      expect(parseModelString("bedrock/us.openai.gpt-oss-120b-1:0")).toEqual({
+        providerId: "bedrock",
+        modelId: "us.openai.gpt-oss-120b-1:0",
+        family: "gpt-oss",
+      });
+    });
     test("rejects unknown family behind a geo prefix", () => {
-      expect(() => parseModelString("bedrock/us.cohere.command-r-v1:0")).toThrow(ConfigError);
+      expect(() => parseModelString("bedrock/us.cohere.embed-english-v3")).toThrow(ConfigError);
     });
     test("does not strip non-geo segments", () => {
       // "used." must not be confused with the "us." geo prefix.
