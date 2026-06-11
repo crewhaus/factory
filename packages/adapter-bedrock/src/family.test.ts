@@ -18,6 +18,23 @@ describe("detectFamily", () => {
     expect(detectFamily("amazon.titan-text-express-v1")).toBe("unknown");
     expect(detectFamily("cohere.command-r-v1:0")).toBe("unknown");
   });
+
+  // Cross-region inference-profile ids. Twin vectors:
+  // model-router/src/parse.test.ts — keep in sync.
+  test("geo-prefixed inference-profile ids resolve to their family", () => {
+    expect(detectFamily("us.anthropic.claude-sonnet-4-5-20250929-v1:0")).toBe("anthropic");
+    expect(detectFamily("eu.anthropic.claude-haiku-4-5-20251001-v1:0")).toBe("anthropic");
+    expect(detectFamily("apac.meta.llama3-2-90b-instruct-v1:0")).toBe("llama");
+    expect(detectFamily("global.anthropic.claude-sonnet-4-5-20250929-v1:0")).toBe("anthropic");
+    expect(detectFamily("us-gov.anthropic.claude-haiku-4-5-20251001-v1:0")).toBe("anthropic");
+    expect(detectFamily("us.mistral.pixtral-large-2502-v1:0")).toBe("mistral");
+  });
+  test("geo prefix does not rescue unknown families", () => {
+    expect(detectFamily("us.cohere.command-r-v1:0")).toBe("unknown");
+  });
+  test("non-geo segments are not stripped", () => {
+    expect(detectFamily("used.anthropic.claude-x")).toBe("unknown");
+  });
 });
 
 describe("featuresForFamily", () => {

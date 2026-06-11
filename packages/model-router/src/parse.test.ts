@@ -76,14 +76,67 @@ describe("parseModelString", () => {
     test("rejects empty modelId", () => {
       expect(() => parseModelString("bedrock/")).toThrow(ConfigError);
     });
+
+    // Cross-region inference-profile ids — AWS requires these (not the
+    // bare ids) for on-demand invocation of current-generation models.
+    // Twin vectors: adapter-bedrock/src/family.test.ts.
+    test("us. inference profile (anthropic)", () => {
+      expect(parseModelString("bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0")).toEqual({
+        providerId: "bedrock",
+        modelId: "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        family: "anthropic",
+      });
+    });
+    test("eu. inference profile (anthropic)", () => {
+      expect(parseModelString("bedrock/eu.anthropic.claude-haiku-4-5-20251001-v1:0")).toEqual({
+        providerId: "bedrock",
+        modelId: "eu.anthropic.claude-haiku-4-5-20251001-v1:0",
+        family: "anthropic",
+      });
+    });
+    test("apac. inference profile (llama)", () => {
+      expect(parseModelString("bedrock/apac.meta.llama3-2-90b-instruct-v1:0")).toEqual({
+        providerId: "bedrock",
+        modelId: "apac.meta.llama3-2-90b-instruct-v1:0",
+        family: "llama",
+      });
+    });
+    test("global. inference profile (anthropic)", () => {
+      expect(parseModelString("bedrock/global.anthropic.claude-sonnet-4-5-20250929-v1:0")).toEqual({
+        providerId: "bedrock",
+        modelId: "global.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        family: "anthropic",
+      });
+    });
+    test("us-gov. inference profile (anthropic)", () => {
+      expect(parseModelString("bedrock/us-gov.anthropic.claude-haiku-4-5-20251001-v1:0")).toEqual({
+        providerId: "bedrock",
+        modelId: "us-gov.anthropic.claude-haiku-4-5-20251001-v1:0",
+        family: "anthropic",
+      });
+    });
+    test("us. inference profile (mistral)", () => {
+      expect(parseModelString("bedrock/us.mistral.pixtral-large-2502-v1:0")).toEqual({
+        providerId: "bedrock",
+        modelId: "us.mistral.pixtral-large-2502-v1:0",
+        family: "mistral",
+      });
+    });
+    test("rejects unknown family behind a geo prefix", () => {
+      expect(() => parseModelString("bedrock/us.cohere.command-r-v1:0")).toThrow(ConfigError);
+    });
+    test("does not strip non-geo segments", () => {
+      // "used." must not be confused with the "us." geo prefix.
+      expect(() => parseModelString("bedrock/used.anthropic.claude-x")).toThrow(ConfigError);
+    });
   });
 
   describe("local/", () => {
-    test("local/llama-3.1-8b@http://localhost:11434", () => {
-      expect(parseModelString("local/llama-3.1-8b@http://localhost:11434")).toEqual({
+    test("local/llama-3.1-8b@http://localhost:11434/v1", () => {
+      expect(parseModelString("local/llama-3.1-8b@http://localhost:11434/v1")).toEqual({
         providerId: "openai",
         modelId: "llama-3.1-8b",
-        baseUrl: "http://localhost:11434",
+        baseUrl: "http://localhost:11434/v1",
       });
     });
     test("rejects missing @url", () => {

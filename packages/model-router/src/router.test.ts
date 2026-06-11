@@ -28,7 +28,7 @@ describe("resolveModel", () => {
 
   test("resolves OpenAI with baseURL for local/* model strings", async () => {
     const r = await resolveModel(
-      "local/llama-3.1-8b@http://localhost:11434",
+      "local/llama-3.1-8b@http://localhost:11434/v1",
       // local OpenAI-compatible servers don't need the api key — adapter
       // accepts the base URL alone.
       { ...ENV, OPENAI_API_KEY: "" },

@@ -93,6 +93,15 @@ export const DEFAULT_PRICING: PricingTable = {
  * charge $0 for that response while incrementing a miss counter, rather than
  * throwing — an unmapped model id must not crash an in-flight run.
  */
+/**
+ * Geo segments AWS prepends to Bedrock model ids to form cross-region
+ * inference-profile ids (`us.anthropic.claude-...`). Pricing rows are
+ * keyed on the bare model id; the profile routes to the same model, so
+ * strip the segment before prefix matching. Twin of
+ * model-router/src/parse.ts BEDROCK_GEO_PREFIX — keep in sync.
+ */
+const BEDROCK_GEO_PREFIX = /^(?:us|eu|apac|jp|au|ca|sa|us-gov|global)\./;
+
 export function resolvePricing(
   table: PricingTable,
   provider: ProviderId,
@@ -100,14 +109,11 @@ export function resolvePricing(
 ): PricingRow | undefined {
   const providerTable = table.providers[provider];
   if (!providerTable) return undefined;
+  const bareId = provider === "bedrock" ? modelId.replace(BEDROCK_GEO_PREFIX, "") : modelId;
   // Sort prefixes longest-first for deterministic specificity.
   const prefixes = Object.keys(providerTable).sort((a, b) => b.length - a.length);
   for (const prefix of prefixes) {
-    if (
-      modelId === prefix ||
-      modelId.startsWith(`${prefix}-`) ||
-      modelId.startsWith(`${prefix}@`)
-    ) {
+    if (bareId === prefix || bareId.startsWith(`${prefix}-`) || bareId.startsWith(`${prefix}@`)) {
       return providerTable[prefix];
     }
   }

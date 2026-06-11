@@ -7,8 +7,13 @@
  * specific capabilities.
  *
  * Auth: implicit AWS credential chain (`AWS_ACCESS_KEY_ID` /
- * `AWS_SECRET_ACCESS_KEY` / `AWS_REGION`, IAM roles, profile-based).
- * No env reads here — the SDK handles it.
+ * `AWS_SECRET_ACCESS_KEY`, IAM roles, profile-based) or a Bedrock API
+ * key via `AWS_BEARER_TOKEN_BEDROCK` (SDK ≥ 3.842 reads it natively —
+ * the simplest path for non-AWS-native users). No env reads here for
+ * credentials — the SDK handles it. Region comes from
+ * `AWS_REGION`/`AWS_DEFAULT_REGION` when set; otherwise the client is
+ * built without an explicit region so the SDK's own chain (including
+ * `~/.aws/config` profiles) resolves it.
  */
 
 import {
@@ -176,8 +181,12 @@ export function createBedrockAdapter(
   opts: CreateBedrockAdapterOptions,
   env: NodeJS.ProcessEnv = process.env,
 ): BedrockAdapter {
-  const region = opts.region ?? env["AWS_REGION"] ?? env["AWS_DEFAULT_REGION"] ?? "us-east-1";
-  const client = new BedrockRuntimeClient({ region });
+  // Only pass region when explicitly resolved; otherwise let the SDK's
+  // default provider chain consult ~/.aws/config (profile region). A
+  // hardcoded fallback here silently sent AWS_PROFILE users to the
+  // wrong region, where their model may not even be enabled.
+  const region = opts.region ?? env["AWS_REGION"] ?? env["AWS_DEFAULT_REGION"];
+  const client = new BedrockRuntimeClient(region !== undefined ? { region } : {});
   return new BedrockAdapter({ client, family: opts.family });
 }
 
