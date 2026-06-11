@@ -4,7 +4,16 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
-import { ToolPermissionError, allFsTools, edit, glob, grep, read, write } from "./index";
+import {
+  ToolPermissionError,
+  allFsTools,
+  edit,
+  glob,
+  grep,
+  hasNestedQuantifier,
+  read,
+  write,
+} from "./index";
 
 let tmp: string;
 let originalCwd: string;
@@ -182,6 +191,38 @@ describe("Grep tool", () => {
   test("rejects malformed regex", async () => {
     await expect(grep.execute({ pattern: "(unclosed" })).rejects.toThrow(/invalid regex/);
   });
+
+  // SECURITY: the Grep pattern is model-supplied; a catastrophic-backtracking
+  // pattern run over the workspace pins a CPU core (ReDoS).
+  test("rejects a nested-quantifier ReDoS pattern", async () => {
+    await expect(grep.execute({ pattern: "(a+)+$" })).rejects.toThrow(/nested quantifiers/);
+  });
+
+  test("rejects the (.*a)+ ReDoS shape", async () => {
+    await expect(grep.execute({ pattern: "(.*a)+" })).rejects.toThrow(/nested quantifiers/);
+  });
+
+  test("still allows a safe single-quantifier pattern", async () => {
+    await writeFile(path.join(tmp, "f.txt"), "alpha\nbeta\n");
+    const result = await grep.execute({ pattern: "b.+a" });
+    expect(result).toBe("f.txt:2:beta");
+  });
+});
+
+describe("hasNestedQuantifier (ReDoS guard)", () => {
+  test.each(["(a+)+", "(a*)*", "(.*a)+", "((\\d+)x)*", "(.*a){10}", "(a+)+$"])(
+    "flags catastrophic shape %p",
+    (p) => {
+      expect(hasNestedQuantifier(p)).toBe(true);
+    },
+  );
+
+  test.each(["beta", "a+b", "[0-9]+", "(ab)+", "(\\d{1,3}\\.){3}\\d{1,3}", "foo|bar", "https?://"])(
+    "allows safe pattern %p",
+    (p) => {
+      expect(hasNestedQuantifier(p)).toBe(false);
+    },
+  );
 });
 
 describe("allFsTools export", () => {

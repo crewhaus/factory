@@ -178,6 +178,96 @@ const grepSchema = z.object({
   pattern: z.string(),
   path: z.string().optional(),
 });
+
+// ReDoS bounds. The Grep pattern is model-supplied and model output is
+// attacker-steerable, so a catastrophic-backtracking pattern run over the
+// workspace could pin a CPU core. We bound it three ways:
+//  1. reject nested-quantifier (star-height >= 2) patterns up front — the
+//     shape behind exponential backtracking, which no input cap can save;
+//  2. skip over-long lines so a "safe" (linear/polynomial) pattern can't be
+//     fed a pathological input length;
+//  3. a wall-clock deadline + a scanned-bytes cap bound the aggregate work.
+const GREP_MAX_LINE_LENGTH = 10_000;
+const GREP_MAX_PATTERN_LENGTH = 1_000;
+const GREP_DEADLINE_MS = 2_000;
+const GREP_MAX_TOTAL_BYTES = 64 * 1024 * 1024;
+
+/**
+ * True if the pattern nests one unbounded/large quantifier inside another
+ * (star-height >= 2, e.g. `(a+)+`, `(a*)*`, `(.*a)+`, `((\d+)x)*`). That is
+ * the structural cause of exponential backtracking. Heuristic, not a full
+ * analysis — alternation-overlap ReDoS is only partly covered, which is why
+ * the line/scan caps exist as a backstop.
+ */
+export function hasNestedQuantifier(pattern: string): boolean {
+  // Per group-nesting level, did the body so far contain a quantifier?
+  const quantInGroup: boolean[] = [false];
+  const isBigQuant = (s: string, at: number): boolean => {
+    const c = s[at];
+    if (c === "*" || c === "+") return true;
+    if (c === "{") {
+      // `{n}` is fixed (safe-ish); `{n,}` / `{n,m}` with a high bound recurses.
+      const close = s.indexOf("}", at);
+      if (close === -1) return false;
+      const inner = s.slice(at + 1, close);
+      if (inner.includes(",")) return true;
+      const n = Number.parseInt(inner, 10);
+      return Number.isFinite(n) && n > 8;
+    }
+    return false;
+  };
+  let i = 0;
+  let escaped = false;
+  let inClass = false;
+  while (i < pattern.length) {
+    const c = pattern[i] as string;
+    if (escaped) {
+      escaped = false;
+      i++;
+      continue;
+    }
+    if (c === "\\") {
+      escaped = true;
+      i++;
+      continue;
+    }
+    if (inClass) {
+      if (c === "]") inClass = false;
+      i++;
+      continue;
+    }
+    if (c === "[") {
+      inClass = true;
+      i++;
+      continue;
+    }
+    if (c === "(") {
+      quantInGroup.push(false);
+      i++;
+      continue;
+    }
+    if (c === ")") {
+      const innerHadQuant = quantInGroup.pop() ?? false;
+      const groupQuantified = isBigQuant(pattern, i + 1);
+      // A quantified group whose body already had a quantifier ⇒ star-height ≥ 2.
+      if (innerHadQuant && groupQuantified) return true;
+      // The parent's body contains a quantifier if this group's body did (at
+      // any depth) OR this group is itself quantified — so a redundantly-nested
+      // `((a+))+` is still caught.
+      if (innerHadQuant || groupQuantified) {
+        quantInGroup[quantInGroup.length - 1] = true;
+      }
+      i++;
+      continue;
+    }
+    if (isBigQuant(pattern, i)) {
+      quantInGroup[quantInGroup.length - 1] = true;
+    }
+    i++;
+  }
+  return false;
+}
+
 export const grep: RegisteredTool = buildTool({
   name: "Grep",
   description:
@@ -193,6 +283,14 @@ export const grep: RegisteredTool = buildTool({
       baseAbs = resolveSafe("Grep", input.path, root);
       baseRel = path.relative(root, baseAbs);
     }
+    if (input.pattern.length > GREP_MAX_PATTERN_LENGTH) {
+      throw new Error(`invalid regex pattern: too long (max ${GREP_MAX_PATTERN_LENGTH} chars)`);
+    }
+    if (hasNestedQuantifier(input.pattern)) {
+      throw new Error(
+        "invalid regex pattern: nested quantifiers (e.g. (a+)+) risk catastrophic backtracking — rewrite without a repetition inside a repeated group",
+      );
+    }
     let regex: RegExp;
     try {
       regex = new RegExp(input.pattern);
@@ -201,9 +299,12 @@ export const grep: RegisteredTool = buildTool({
       throw new Error(`invalid regex pattern: ${msg}`);
     }
 
+    const deadline = Date.now() + GREP_DEADLINE_MS;
+    let scannedBytes = 0;
+    let truncated = false;
     const matcher = new Bun.Glob("**/*");
     const hits: string[] = [];
-    for await (const rel of matcher.scan({ cwd: baseAbs, onlyFiles: true })) {
+    outer: for await (const rel of matcher.scan({ cwd: baseAbs, onlyFiles: true })) {
       const fileAbs = path.join(baseAbs, rel);
       const display = baseRel === "" ? rel : path.join(baseRel, rel);
       let text: string;
@@ -212,15 +313,29 @@ export const grep: RegisteredTool = buildTool({
       } catch {
         continue;
       }
+      scannedBytes += text.length;
+      if (scannedBytes > GREP_MAX_TOTAL_BYTES) {
+        truncated = true;
+        break;
+      }
       const lines = text.split("\n");
       for (let i = 0; i < lines.length; i++) {
+        // Check the deadline between lines — bounds aggregate work even though
+        // it can't interrupt a single `.test()` (which the pattern guard +
+        // line cap keep cheap).
+        if ((i & 0x3ff) === 0 && Date.now() > deadline) {
+          truncated = true;
+          break outer;
+        }
         const line = lines[i] ?? "";
+        if (line.length > GREP_MAX_LINE_LENGTH) continue;
         if (regex.test(line)) {
           hits.push(`${display}:${i + 1}:${line}`);
         }
       }
     }
-    return hits.length === 0 ? "no matches" : hits.join("\n");
+    const note = truncated ? "\n[grep: scan stopped early — workspace too large or slow]" : "";
+    return (hits.length === 0 ? "no matches" : hits.join("\n")) + note;
   },
 });
 
