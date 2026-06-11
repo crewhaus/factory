@@ -19,6 +19,19 @@
  *   `toolConfig.functionCallingConfig.mode = "ANY"` with
  *   `allowedFunctionNames` is the analogue of Anthropic's
  *   `tool_choice: { type: "tool", name }`.
+ *
+ * Two more wrinkles handled here:
+ *
+ * - **Thought signatures**: canonical thinking blocks round-trip as
+ *   `{ text, thought: true, thoughtSignature }` parts — newer Gemini
+ *   models require the opaque signature echoed back on
+ *   function-calling turns.
+ *
+ * - **Gemma**: Gemma models on the Gemini API reject
+ *   `systemInstruction` (400 "Developer instruction is not enabled")
+ *   and `functionDeclarations`. For `gemma-*` model ids the collapsed
+ *   system text is inlined as a leading `[System]`-prefixed user turn,
+ *   and a non-empty `req.tools` raises a `ConfigError`.
  */
 
 import type {
@@ -29,6 +42,7 @@ import type {
   ProviderRequest,
   ToolChoice,
 } from "@crewhaus/adapter-anthropic";
+import { ConfigError } from "@crewhaus/errors";
 import {
   type Content,
   FunctionCallingConfigMode,
@@ -43,12 +57,21 @@ export function toGeminiParams(req: ProviderRequest): GenerateContentParameters 
     maxOutputTokens: req.maxTokens,
   };
 
+  // Gemma models reject systemInstruction and functionDeclarations on
+  // the Gemini API — see the module header.
+  const isGemma = req.model.startsWith("gemma-");
+
   const systemText = collapseSystem(req.system);
-  if (systemText.length > 0) {
+  if (systemText.length > 0 && !isGemma) {
     config.systemInstruction = systemText;
   }
 
   if (req.tools !== undefined && req.tools.length > 0) {
+    if (isGemma) {
+      throw new ConfigError(
+        `Gemma models do not support function calling on the Gemini API — remove tools or use a gemini-* model (got "${req.model}")`,
+      );
+    }
     config.tools = [{ functionDeclarations: req.tools.map(toGeminiFunctionDecl) }];
   }
   if (req.toolChoice !== undefined) {
@@ -66,9 +89,17 @@ export function toGeminiParams(req: ProviderRequest): GenerateContentParameters 
     config.abortSignal = req.signal;
   }
 
+  const toolNameById = collectToolUseNames(req.messages);
+  const contents = req.messages.map((m) => toGeminiContent(m, toolNameById));
+  if (isGemma && systemText.length > 0) {
+    // No systemInstruction slot on Gemma — inline the system text as a
+    // leading user turn instead.
+    contents.unshift({ role: "user", parts: [{ text: `[System]\n${systemText}` }] });
+  }
+
   return {
     model: req.model,
-    contents: req.messages.map(toGeminiContent),
+    contents,
     config,
   };
 }
@@ -108,7 +139,39 @@ function toGeminiToolConfig(choice: ToolChoice): GenerateContentConfig["toolConf
   }
 }
 
-function toGeminiContent(m: CanonicalMessage): Content {
+/**
+ * Index canonical `tool_use` ids → declared function names across the
+ * assistant turns of a conversation. Gemini's contract is that
+ * `functionResponse.name` matches `FunctionCall.name` (the declared
+ * function name), but the canonical `tool_result.tool_use_id` carries
+ * our synthetic correlator (`gemini_<fn>_<idx>` from stream.ts) — this
+ * map lets `toGeminiContent` resolve the real name.
+ */
+function collectToolUseNames(messages: ReadonlyArray<CanonicalMessage>): Map<string, string> {
+  const byId = new Map<string, string>();
+  for (const m of messages) {
+    if (m.role !== "assistant" || typeof m.content === "string") continue;
+    for (const block of m.content) {
+      if (block.type === "tool_use") byId.set(block.id, block.name);
+    }
+  }
+  return byId;
+}
+
+const SYNTHETIC_TOOL_USE_ID = /^gemini_(.+)_\d+$/;
+
+/**
+ * Fallback for tool_use ids whose originating `tool_use` block is no
+ * longer in the message window (e.g. after compaction): recover the
+ * function name by stripping the synthetic `gemini_<name>_<idx>` shape.
+ * Non-synthetic ids pass through unchanged.
+ */
+function stripSyntheticToolUseId(id: string): string {
+  const match = SYNTHETIC_TOOL_USE_ID.exec(id);
+  return match?.[1] ?? id;
+}
+
+function toGeminiContent(m: CanonicalMessage, toolNameById: ReadonlyMap<string, string>): Content {
   const role = m.role === "assistant" ? "model" : "user";
   if (typeof m.content === "string") {
     return { role, parts: [{ text: m.content }] };
@@ -137,12 +200,20 @@ function toGeminiContent(m: CanonicalMessage): Content {
     } else if (block.type === "tool_result") {
       parts.push({
         functionResponse: {
-          name: block.tool_use_id, // Gemini uses name as the correlator
+          // Gemini's contract: `name` must be the declared function
+          // name, not our synthetic correlator id — that travels in
+          // `id` instead.
+          name: toolNameById.get(block.tool_use_id) ?? stripSyntheticToolUseId(block.tool_use_id),
+          id: block.tool_use_id,
           response: stringifyToolResultToObj(block.content),
         },
       });
     } else if (block.type === "thinking") {
-      parts.push({ text: block.thinking, thought: true });
+      parts.push({
+        text: block.thinking,
+        thought: true,
+        ...(block.signature !== undefined ? { thoughtSignature: block.signature } : {}),
+      });
     }
   }
   return { role, parts };
