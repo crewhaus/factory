@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { CrewhausError } from "@crewhaus/errors";
 import type { RegisteredTool, ToolDefinition } from "@crewhaus/tool-catalog";
 
@@ -168,6 +169,14 @@ export type PluginManifest = {
   readonly engines?: { readonly crewhaus?: string };
   readonly permissions?: PluginPermissions;
   readonly contributions?: PluginContributions;
+  /**
+   * Lowercase hex SHA-256 of the plugin's entrypoint (`index.js`). It is part
+   * of the manifest, so `manifestPayloadForSigning` includes it and the
+   * signature therefore commits to the CODE, not just the metadata. The loader
+   * refuses to `import()` an entrypoint whose hash does not match. Optional for
+   * back-compat; signed plugins SHOULD set it (compute via `entrypointDigest`).
+   */
+  readonly entrypointDigest?: string;
   readonly signature?: PluginSignature;
 };
 
@@ -232,6 +241,15 @@ export function validatePluginManifest(m: unknown): PluginManifest {
   assertOptionalString(manifest["author"], "author");
   assertOptionalString(manifest["homepage"], "homepage");
   assertOptionalString(manifest["license"], "license");
+
+  if (manifest["entrypointDigest"] !== undefined) {
+    assertString(manifest["entrypointDigest"], "entrypointDigest");
+    if (!/^[a-f0-9]{64}$/.test(manifest["entrypointDigest"] as string)) {
+      throw new PluginSdkError(
+        "plugin manifest: `entrypointDigest` must be a lowercase hex SHA-256 (64 chars)",
+      );
+    }
+  }
 
   if (manifest["engines"] !== undefined) {
     const engines = manifest["engines"];
@@ -322,7 +340,18 @@ export function canonicalJson(value: unknown): string {
  * — the manifest's canonical JSON with `signature` cleared.
  */
 export function manifestPayloadForSigning(manifest: PluginManifest): string {
-  // Shallow clone, drop signature, then canonical-encode.
+  // Shallow clone, drop signature, then canonical-encode. `entrypointDigest`
+  // is NOT dropped, so the signature commits to the plugin code via its hash.
   const { signature: _signature, ...rest } = manifest;
   return canonicalJson(rest);
+}
+
+/**
+ * Compute the `entrypointDigest` for plugin code — the lowercase hex SHA-256 of
+ * the entrypoint file's bytes. Plugin signing tools set the result on the
+ * manifest's `entrypointDigest` before signing; the loader recomputes it from
+ * the on-disk `index.js` and refuses to import on mismatch.
+ */
+export function entrypointDigest(code: string | Uint8Array): string {
+  return createHash("sha256").update(code).digest("hex");
 }
