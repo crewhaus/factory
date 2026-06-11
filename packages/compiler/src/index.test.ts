@@ -1402,6 +1402,7 @@ contracts:
 transaction_policy:
   defaultWriteApproval: policy
   maxValueUsd: 1000
+  maxValueWei: "1000000000000000000"
   allowedContracts:
     - c
   simulationRequired: false
@@ -1432,6 +1433,9 @@ triggers:
     expect(ir.chains[0]?.rpcPolicy).toBe("quorum");
     expect(ir.wallets[0]?.keyRef).toEqual({ kind: "literal", value: "kms://aws/key" });
     expect(ir.transactionPolicy.maxValueUsd).toBe(1000);
+    // SECURITY: the native-token spend ceiling must reach the IR (and thence
+    // the emitted policy) so wallet-engine's only enforceable value cap works.
+    expect(ir.transactionPolicy.maxValueWei).toBe("1000000000000000000");
     expect(ir.triggers.map((t) => t.kind)).toEqual(["event", "event", "block", "address"]);
     // event trigger with filter retains it; the second event trigger omits it.
     const firstEvent = ir.triggers[0];
@@ -1441,6 +1445,18 @@ triggers:
     if (secondEvent?.kind !== "event") throw new Error("expected event trigger");
     expect("filter" in secondEvent).toBe(false);
     expect(compile(ONCHAIN_SPEC).files.length).toBeGreaterThan(0);
+  });
+
+  test("rejects a malformed maxValueWei (not a wei amount) at parse time", () => {
+    const bad = ONCHAIN_SPEC.replace('"1000000000000000000"', '"5 ETH"');
+    expect(() => parseSpec(bad)).toThrow();
+  });
+
+  test("accepts a 0x-hex maxValueWei", () => {
+    const hex = ONCHAIN_SPEC.replace('"1000000000000000000"', '"0xde0b6b3a7640000"');
+    const ir = lower(parseSpec(hex));
+    if (ir.target !== "onchain") throw new Error("unexpected target");
+    expect(ir.transactionPolicy.maxValueWei).toBe("0xde0b6b3a7640000");
   });
 
   test("applies tx-policy + wallet defaults when the spec omits both blocks", () => {

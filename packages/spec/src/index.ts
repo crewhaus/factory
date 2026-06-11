@@ -351,6 +351,16 @@ const transactionPolicySchema = z
   .object({
     defaultWriteApproval: z.enum(["required", "policy", "none"]).default("required"),
     maxValueUsd: z.number().positive().optional(),
+    // Oracle-free native-token spend ceiling (wei). This is the ONLY value cap
+    // wallet-engine can actually enforce — maxValueUsd hard-throws without a
+    // price oracle. Decimal or 0x-hex string (parsed via BigInt downstream).
+    maxValueWei: z
+      .string()
+      .regex(
+        /^(0x[0-9a-fA-F]+|[0-9]+)$/,
+        "maxValueWei must be a wei amount as a decimal or 0x-hex string",
+      )
+      .optional(),
     allowedContracts: z.array(z.string().min(1)).default([]),
     simulationRequired: z.boolean().default(true),
   })
