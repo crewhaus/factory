@@ -258,6 +258,46 @@ function pinnedFetch(
   return globalThis.fetch(pinnedUrl.toString(), pinnedInit);
 }
 
+/**
+ * Read a response body, aborting as soon as the running total exceeds `cap`,
+ * so a hostile/oversized response is never fully materialized in the heap.
+ * Decodes to UTF-8 only after the bounded read completes.
+ */
+async function readBodyCapped(
+  r: Response,
+  cap: number,
+  label: string,
+  abort: () => void,
+): Promise<string> {
+  if (r.body === null) return "";
+  const reader = r.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value === undefined) continue;
+      total += value.byteLength;
+      if (total > cap) {
+        abort();
+        await reader.cancel();
+        throw new CrawlerError(`response body for ${label} exceeds ${cap} bytes`);
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) {
+    merged.set(c, offset);
+    offset += c.byteLength;
+  }
+  return new TextDecoder("utf-8", { fatal: false }).decode(merged);
+}
+
 export function createCrawler(opts: {
   readonly tracker: CitationTracker;
   readonly config?: CrawlerConfig;
@@ -358,11 +398,16 @@ export function createCrawler(opts: {
         if (!r.ok) {
           throw new CrawlerError(`HTTP ${r.status} on ${currentUrl}`);
         }
-        const text = await r.text();
-        if (Buffer.byteLength(text, "utf8") > maxBodyBytes) {
+        // Enforce the body cap WHILE streaming. `await r.text()` would buffer
+        // an arbitrarily large untrusted response fully into the heap BEFORE
+        // any size check could fire (OOM DoS via a multi-GB / no-Content-Length
+        // body). Cheap first gate: reject a declared Content-Length over the cap.
+        const declaredLength = Number(r.headers.get("content-length"));
+        if (Number.isFinite(declaredLength) && declaredLength > maxBodyBytes) {
+          ac.abort();
           throw new CrawlerError(`response body for ${currentUrl} exceeds ${maxBodyBytes} bytes`);
         }
-        return text;
+        return await readBodyCapped(r, maxBodyBytes, currentUrl, () => ac.abort());
       }
       throw new CrawlerError(`exceeded ${maxRedirects} redirects starting from ${url}`);
     } finally {
