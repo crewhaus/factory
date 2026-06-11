@@ -23,16 +23,16 @@ bun x crewhaus compile && bun x crewhaus run
 
 `@crewhaus/cli` transitively pulls in everything else via versioned npm deps (the workspace `workspace:*` references resolve to concrete versions at publish time), so users don't install the rest individually. A generated bundle additionally imports `@crewhaus/runtime-core` directly — that is the one other package consumers see on the receiving end.
 
-> **During the private-scope window.** Maintainer-side `npm login` is required, and the consuming machine must either share the same login or be added to the scope. Once the scope flips to public (see launch checklist below), the install command is unchanged but no auth is needed.
+> **The scope is public** (since the 0.1.x go-public cut): `bun add @crewhaus/cli` needs no auth. During the earlier private-scope window, maintainer-side `npm login` was required on the consuming machine.
 
 ## Versioning
 
-The workspace is on [Changesets](https://github.com/changesets/changesets); see [.changeset/README.md](.changeset/README.md) for day-to-day usage. Summary:
+The workspace versions in **lockstep**: every publishable package ships the same version, stamped by `bun scripts/release-prep.ts --version <next>` at cut time (see the publishing checklist below). Summary:
 
 - All packages cut at **0.1.0** on 2026-05-30 — the initial public-API surface.
 - Pre-1.0, breaking changes bump the minor (0.1.x → 0.2.0), per the [npm semver convention](https://semver.org/#spec-item-4). Features and bugfixes bump the patch.
-- Each PR that touches a publishable package includes a `.changeset/*.md` describing the bump. `bun x changeset version` consumes the queue; `bun x changeset publish` releases.
-- The sibling `utilities/` workspace runs an identical Changesets config rooted at its own repo.
+- No per-package version drift and no per-PR bump bookkeeping — the next cut's version is decided at release time and applied across the board.
+- The sibling `utilities/` workspace releases the same way with its own copy of the scripts.
 
 ## Developing from a clone (contributors)
 
@@ -97,20 +97,20 @@ All ten publish at the same cut version as the factory packages.
 
 ## Publishing checklist (per release cut)
 
-The day-to-day flow is just `bun x changeset publish`; this list is the **launch-day or scope-flip** checklist.
+Releases are **lockstep** — every publishable package ships the same version, cut with the two scripts under `scripts/` (a changesets config existed early on but was never adopted and has been removed).
 
-1. **Bumps applied.** Verify `bun x changeset version` consumed the queue, the `CHANGELOG.md` regenerated, and the workspace builds clean (`bun run typecheck && bun run lint && bun test`).
-2. **Workspace deps resolved.** `bun publish` rewrites `workspace:*` to concrete versions; verify with `bun pm pack --dry-run` on a leaf package and on `@crewhaus/cli`.
-3. **Files-field clean.** Each package's `files: ["src", "README.md", "LICENSE", "NOTICE"]` (set by `scripts/release-prep.ts`) ships the right surface. Custom `files` blocks may override.
-4. **Publish in dependency order.** Leaf packages first; `@crewhaus/cli` last because it transitively imports almost everything else. `bun x changeset publish` handles ordering automatically.
-5. **Verify the install.** From a fresh directory: `bun add -d @crewhaus/cli` → `bun x crewhaus --version` → `bun x crewhaus init demo` → `bun x crewhaus compile`. Round-trip should work end-to-end without referring back to the source repo.
+1. **Bump.** `bun scripts/release-prep.ts --version <next>` stamps every publishable package and re-runs biome over the touched files. Land the bump on `main` via PR with the workspace green (`bun run typecheck && bun run lint && bun test`).
+2. **Auth.** Export a classic npm *Automation* token as `NPM_CONFIG_TOKEN`. A 2FA-bound token dead-ends `bun publish` in a web-OTP prompt.
+3. **Canary.** `bun scripts/publish-workspace.ts --filter @crewhaus/errors` — one leaf package proves auth before the full fan-out.
+4. **Publish.** `bun scripts/publish-workspace.ts` — topological order, skips versions already on the registry. Must stay on `bun publish`: it rewrites `workspace:*` to concrete versions at pack time; `npm publish` would ship the literal range and break every install.
+5. **Verify.** Every name resolves on the registry at the new version (brand-new package names can lag a few minutes before appearing); `npm view @crewhaus/cli@<next> dependencies` shows internal deps pinned at exactly `<next>`; and from a fresh directory `bun add @crewhaus/cli@<next>` followed by `bun x crewhaus compile <spec> -o out` round-trips without the source repo.
 
 ## Flipping the scope to public
 
-When the launch decision lands:
+Completed for the 0.1.x go-public cut (2026-06) — kept for the record:
 
-1. Run `scripts/release-prep.ts --access public` on both `factory/` and `utilities/`. The script rewrites `publishConfig.access` across all package.jsons.
-2. Cut a new changeset describing the visibility flip (typically a `0.2.0` minor or whatever the next planned cut is). Publish.
+1. Run `scripts/release-prep.ts --version <next> --access public` on both `factory/` and `utilities/`. The script rewrites `publishConfig.access` across all package.jsons (public is now the default).
+2. Cut a new lockstep version for the visibility flip (typically a minor). Publish.
 3. Run `npm access public @crewhaus/<pkg>` for any packages that need to flip retroactively on already-published versions. (npm's policy: `restricted` versions stay restricted; new versions inherit `publishConfig.access`. The CLI command above flips the *package*, not just future versions.)
 4. Revert the "private testing" note in [README.md](README.md) and remove the `<!-- Pre-launch note: … -->` banners from the launch-day draft docs (the specific files are tracked in the private launch runbook).
 5. Cut a release tag, push to GitHub, publish to npm in the same change window so docs and packages don't drift.

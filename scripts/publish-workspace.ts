@@ -4,19 +4,27 @@
  * to npm, in topological dependency order, skipping versions that are already
  * on the registry.
  *
- * Designed for the initial v0.1.0 cut (no changeset queue yet). Use this once;
- * subsequent releases should go through `bun x changeset publish` instead,
- * which handles topo order and version skip on its own.
+ * This IS the release path: versioning is lockstep via scripts/release-prep.ts
+ * (a changesets config existed 2026-05→06 but was never adopted and has been
+ * removed). Stay on `bun publish` — never `npm publish` — because bun rewrites
+ * `workspace:*` deps to concrete versions at pack time; npm ships the literal
+ * range and breaks every install.
  *
  * Pre-flight:
- *   npm whoami                # must succeed
- *   bun install               # ensure node_modules are in shape
- *   bun run typecheck         # belt-and-braces
+ *   export NPM_CONFIG_TOKEN=…  # classic npm *Automation* token; a 2FA-bound
+ *                              # token dead-ends `bun publish` in a web-OTP
+ *                              # prompt ("failed to send OTP request")
+ *   npm whoami                 # must succeed
+ *   bun install                # ensure node_modules are in shape
+ *   bun run typecheck          # belt-and-braces
  *
  * Run:
- *   bun scripts/publish-workspace.ts --dry-run   # plan only, no publish
- *   bun scripts/publish-workspace.ts             # publish
- *   bun scripts/publish-workspace.ts --filter @crewhaus/errors
+ *   bun scripts/publish-workspace.ts --dry-run                  # plan only
+ *   bun scripts/publish-workspace.ts --filter @crewhaus/errors  # canary a leaf first
+ *   bun scripts/publish-workspace.ts                            # full run
+ *
+ * Brand-new package names can 404 on the registry for a few minutes after a
+ * successful publish — poll before assuming failure or re-running.
  */
 
 import { spawnSync } from "node:child_process";
