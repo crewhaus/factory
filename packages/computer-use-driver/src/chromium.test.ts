@@ -9,7 +9,27 @@
  * the import fail.
  */
 import { afterEach, describe, expect, mock, test } from "bun:test";
+import * as net from "node:net";
 import { createDriver } from "./index.js";
+
+/** Parse the JSON recorded by the fake's `launch …` entry. */
+function parseLaunch(entry: string | undefined): Record<string, unknown> {
+  if (entry === undefined || !entry.startsWith("launch ")) {
+    throw new Error(`expected a launch record, got: ${entry}`);
+  }
+  return JSON.parse(entry.slice("launch ".length)) as Record<string, unknown>;
+}
+
+/** True once nothing is listening on `port` (loopback). */
+function portRefuses(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const sock = net.connect({ host: "127.0.0.1", port }, () => {
+      sock.destroy();
+      resolve(false);
+    });
+    sock.on("error", () => resolve(true));
+  });
+}
 
 /** Records every call routed through the fake Playwright surface. */
 type Rec = string[];
@@ -95,11 +115,17 @@ describe("chromium driver — connect / lifecycle", () => {
     installPlaywright(rec);
     const d = createDriver({ backend: "chromium" });
     await d.connect();
-    expect(rec).toEqual([
-      `launch ${JSON.stringify({ headless: true })}`,
+    const launch = parseLaunch(rec[0]);
+    expect(launch["headless"]).toBe(true);
+    // SECURITY default — the DNS-pinning proxy is on, with the implicit
+    // localhost proxy-bypass removed (see ssrf-proxy.ts).
+    expect(launch["proxy"]).toMatchObject({ bypass: "<-loopback>" });
+    expect((launch["proxy"] as { server: string }).server).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
+    expect(rec.slice(1)).toEqual([
       `newContext ${JSON.stringify({ viewport: { width: 1280, height: 720 } })}`,
       "newPage",
     ]);
+    await d.disconnect();
   });
 
   test("connect honours playwrightOptions + viewport overrides", async () => {
@@ -111,8 +137,11 @@ describe("chromium driver — connect / lifecycle", () => {
       viewport: { width: 800, height: 600 },
     });
     await d.connect();
-    expect(rec[0]).toBe(`launch ${JSON.stringify({ headless: false, slowMo: 5 })}`);
+    const launch = parseLaunch(rec[0]);
+    expect(launch["headless"]).toBe(false);
+    expect(launch["slowMo"]).toBe(5);
     expect(rec[1]).toBe(`newContext ${JSON.stringify({ viewport: { width: 800, height: 600 } })}`);
+    await d.disconnect();
   });
 
   test("connect is idempotent — second call is a no-op", async () => {
@@ -251,6 +280,60 @@ describe("chromium driver — pre-connect guards", () => {
     await expect(d.scroll(0, 0)).rejects.toThrow(/not connected/);
     await expect(d.getViewport()).rejects.toThrow(/not connected/);
     await expect(d.domText?.()).rejects.toThrow(/not connected/);
+  });
+});
+
+describe("chromium driver — SSRF pinning proxy wiring (audit follow-up R1)", () => {
+  test("the proxy in launchOpts is a LIVE local server, closed by disconnect", async () => {
+    const rec: Rec = [];
+    installPlaywright(rec);
+    const d = createDriver({ backend: "chromium" });
+    await d.connect();
+    const launch = parseLaunch(rec[0]);
+    const url = new URL((launch["proxy"] as { server: string }).server);
+    const port = Number.parseInt(url.port, 10);
+    expect(await portRefuses(port)).toBe(false); // listening while connected
+    await d.disconnect();
+    expect(await portRefuses(port)).toBe(true); // closed after disconnect
+  });
+
+  test("ssrfProxy: false disables the proxy (documented escape hatch)", async () => {
+    const rec: Rec = [];
+    installPlaywright(rec);
+    const d = createDriver({ backend: "chromium", ssrfProxy: false });
+    await d.connect();
+    const launch = parseLaunch(rec[0]);
+    expect(launch["proxy"]).toBeUndefined();
+    await d.disconnect();
+  });
+
+  test("an operator-supplied playwrightOptions.proxy wins (ours is skipped)", async () => {
+    const rec: Rec = [];
+    installPlaywright(rec);
+    const d = createDriver({
+      backend: "chromium",
+      playwrightOptions: { proxy: { server: "http://corp-egress:3128" } },
+    });
+    await d.connect();
+    const launch = parseLaunch(rec[0]);
+    expect(launch["proxy"]).toEqual({ server: "http://corp-egress:3128" });
+    await d.disconnect();
+  });
+
+  test("launch failure closes the proxy instead of leaking it", async () => {
+    const rec: Rec = [];
+    const fake = installPlaywright(rec);
+    (fake.chromium as { launch: (o: unknown) => Promise<unknown> }).launch = async (
+      launchOpts: unknown,
+    ) => {
+      rec.push(`launch ${JSON.stringify(launchOpts)}`);
+      throw new Error("chromium exploded");
+    };
+    const d = createDriver({ backend: "chromium" });
+    await expect(d.connect()).rejects.toThrow("chromium exploded");
+    const launch = parseLaunch(rec[0]);
+    const url = new URL((launch["proxy"] as { server: string }).server);
+    expect(await portRefuses(Number.parseInt(url.port, 10))).toBe(true);
   });
 });
 

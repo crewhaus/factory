@@ -164,12 +164,15 @@ function isPrivateIp(addr: string): boolean {
 
 /**
  * Reject anything that isn't a public http/https target before the browser
- * sees it. Note: Playwright re-resolves DNS at connect time, so a hostile
- * resolver could still rebind a public name to a private IP after this check
- * (the classic DNS-rebinding TOCTOU). Fully closing that needs a network
- * policy at the browser layer; this guard blocks the direct vectors —
- * non-http(s) schemes, IP literals, loopback/mDNS names, and names that
- * resolve to a private range at check time.
+ * sees it. This guard blocks the direct vectors — non-http(s) schemes, IP
+ * literals, loopback/mDNS names, and names that resolve to a private range
+ * at check time. The rebinding TOCTOU this check alone cannot close (the
+ * browser re-resolves DNS at connect time, and sub-resource fetches never
+ * pass through here) is closed at the connection layer by the chromium
+ * backend's DNS-pinning proxy — see `ssrf-proxy.ts` in computer-use-driver,
+ * on by default. The remote (CDP/Browserless) backend launches its browser
+ * elsewhere, so for that backend this pre-goto guard is still the only
+ * navigate-side control; pin egress at the remote browser's host.
  */
 export async function assertSafeNavigationTarget(rawUrl: string): Promise<void> {
   let url: URL;

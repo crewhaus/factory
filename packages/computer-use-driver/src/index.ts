@@ -24,14 +24,16 @@
  * backend in the smoke ("never use `host` backend for the smoke since
  * it would drive the dev's actual desktop").
  */
-import { CrewhausError } from "@crewhaus/errors";
+import { ComputerUseDriverError } from "./errors";
+import { type SsrfPinningProxy, startSsrfPinningProxy } from "./ssrf-proxy";
 
-export class ComputerUseDriverError extends CrewhausError {
-  override readonly name = "ComputerUseDriverError";
-  constructor(message: string, cause?: unknown) {
-    super("tool", message, cause);
-  }
-}
+export { ComputerUseDriverError };
+export {
+  type DnsLookupFn,
+  type SsrfPinningProxy,
+  type StartSsrfPinningProxyOptions,
+  startSsrfPinningProxy,
+} from "./ssrf-proxy";
 
 export type DriverBackend = "host" | "chromium" | "remote";
 export type MouseButton = "left" | "right" | "middle";
@@ -64,6 +66,20 @@ export type CreateDriverOptions = {
   readonly backend: DriverBackend;
   /** Playwright launch overrides (e.g. headless: false). chromium-only. */
   readonly playwrightOptions?: Record<string, unknown>;
+  /**
+   * SECURITY (audit follow-up R1) — route ALL chromium traffic through a
+   * local DNS-pinning forward proxy (see `ssrf-proxy.ts`). The proxy resolves
+   * each hostname once, validates the IP against the private/loopback/
+   * link-local/metadata floor, and dials that exact pinned IP, closing the
+   * DNS-rebinding TOCTOU the pre-goto guard in tool-navigate cannot close
+   * (the browser re-resolves at connect time, and sub-resource fetches never
+   * pass the guard at all). Default true. Set `false` ONLY when the browser
+   * must reach private/internal targets (e.g. testing an intranet app) AND
+   * the page content is trusted. Ignored when `playwrightOptions.proxy` is
+   * set — an operator-supplied proxy wins, and is then responsible for its
+   * own egress policy. chromium-only.
+   */
+  readonly ssrfProxy?: boolean;
   /** Initial viewport — chromium-only. Default 1280x720@1. */
   readonly viewport?: { width: number; height: number };
   /** Test injection: a pre-built Driver instance the factory returns verbatim. */
@@ -111,6 +127,7 @@ function createChromiumDriver(opts: CreateDriverOptions): Driver {
   let context: unknown;
   let page: unknown;
   let connected = false;
+  let ssrfProxy: SsrfPinningProxy | undefined;
 
   async function loadPlaywright(): Promise<{
     chromium: { launch: (...args: unknown[]) => unknown };
@@ -138,20 +155,49 @@ function createChromiumDriver(opts: CreateDriverOptions): Driver {
     async connect() {
       if (connected) return;
       const { chromium } = await loadPlaywright();
-      // Playwright defaults: chromium runs in its own sandbox (its own
-      // sandboxed renderer process). Headless by default.
-      const launchOpts: Record<string, unknown> = {
-        headless: true,
-        ...(opts.playwrightOptions ?? {}),
-      };
-      browser = await (chromium.launch as (o: unknown) => Promise<unknown>)(launchOpts);
-      const ctxOpts: Record<string, unknown> = {
-        viewport: opts.viewport ?? { width: 1280, height: 720 },
-      };
-      context = await (browser as { newContext: (o: unknown) => Promise<unknown> }).newContext(
-        ctxOpts,
-      );
-      page = await (context as { newPage: () => Promise<unknown> }).newPage();
+      const userOpts = opts.playwrightOptions ?? {};
+      // SECURITY — DNS-pinning proxy on by default (see CreateDriverOptions.
+      // ssrfProxy). An operator-supplied playwrightOptions.proxy wins; the
+      // proxy starts only after the playwright import succeeds so the
+      // import-failure path can't leak a listening server.
+      const useSsrfProxy = opts.ssrfProxy !== false && userOpts["proxy"] === undefined;
+      if (useSsrfProxy) {
+        ssrfProxy = await startSsrfPinningProxy();
+      }
+      try {
+        // Playwright defaults: chromium runs in its own sandbox (its own
+        // sandboxed renderer process). Headless by default. The
+        // `<-loopback>` bypass rule removes Chromium's implicit proxy bypass
+        // for localhost targets, so loopback requests also route through the
+        // pinning proxy — and get blocked there.
+        const launchOpts: Record<string, unknown> = {
+          headless: true,
+          ...userOpts,
+          ...(ssrfProxy !== undefined
+            ? { proxy: { server: ssrfProxy.url, bypass: "<-loopback>" } }
+            : {}),
+        };
+        browser = await (chromium.launch as (o: unknown) => Promise<unknown>)(launchOpts);
+        const ctxOpts: Record<string, unknown> = {
+          viewport: opts.viewport ?? { width: 1280, height: 720 },
+        };
+        context = await (browser as { newContext: (o: unknown) => Promise<unknown> }).newContext(
+          ctxOpts,
+        );
+        page = await (context as { newPage: () => Promise<unknown> }).newPage();
+      } catch (err) {
+        // Launch/context failure must not leak the proxy server (or a
+        // half-launched browser).
+        try {
+          await (browser as { close?: () => Promise<void> } | undefined)?.close?.();
+        } catch {
+          // best-effort
+        }
+        browser = undefined;
+        await ssrfProxy?.close();
+        ssrfProxy = undefined;
+        throw err;
+      }
       connected = true;
     },
 
@@ -220,6 +266,8 @@ function createChromiumDriver(opts: CreateDriverOptions): Driver {
       } catch {
         // best-effort
       }
+      await ssrfProxy?.close();
+      ssrfProxy = undefined;
       connected = false;
       browser = undefined;
       context = undefined;
