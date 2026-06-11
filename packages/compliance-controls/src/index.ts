@@ -1,7 +1,7 @@
-import { createHash, createHmac } from "node:crypto";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import type { AuditKind, AuditRecord } from "@crewhaus/audit-log";
+import { type AuditKind, type AuditRecord, recomputeRecordHash } from "@crewhaus/audit-log";
 import { CrewhausError } from "@crewhaus/errors";
 
 /**
@@ -198,13 +198,69 @@ function matchesAny(record: AuditRecord, queries: ReadonlyArray<AuditEventFilter
   return false;
 }
 
+/** Canonical serialization of a record — the bytes the digest must commit to. */
+function canonicalRecord(r: AuditRecord): string {
+  return JSON.stringify({
+    ts: r.ts,
+    version: r.version,
+    kind: r.kind,
+    seq: r.seq,
+    payload: r.payload,
+    prevHash: r.prevHash,
+    hash: r.hash,
+  });
+}
+
 function canonicalDigest(records: ReadonlyArray<AuditRecord>): string {
-  const text = records.map((r) => r.hash).join("|");
+  // Commit to the FULL record (the payload/kind/ts the auditor actually reads),
+  // not just `r.hash`. Hashing only `r.hash` let an attacker rewrite a written
+  // bundle's payload while leaving its hash field untouched, so digest + HMAC
+  // still validated against content that no longer matched.
+  const text = records.map(canonicalRecord).join("\n");
   return createHash("sha256").update(text).digest("hex");
 }
 
 function signDigest(digest: string, key: string): string {
   return createHmac("sha256", key).update(digest).digest("hex");
+}
+
+function constantTimeEqualHex(a: string, b: string): boolean {
+  const ab = Buffer.from(a, "utf8");
+  const bb = Buffer.from(b, "utf8");
+  if (ab.length !== bb.length) return false;
+  return timingSafeEqual(ab, bb);
+}
+
+export type BundleVerification =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly reason: string };
+
+/**
+ * Re-verify an EvidenceBundle on read. Recomputes the digest over the bundle's
+ * records (so a post-signing payload rewrite is detected), re-checks each
+ * record's body↔hash consistency, and — when a signing key is supplied —
+ * re-derives the HMAC and compares it in constant time. Bundles MUST be
+ * verified with this before being trusted as authoritative evidence.
+ */
+export function verifyBundle(bundle: EvidenceBundle, signingKey?: string): BundleVerification {
+  if (!constantTimeEqualHex(canonicalDigest(bundle.records), bundle.digest)) {
+    return {
+      ok: false,
+      reason: "digest does not match bundle.records (records altered after signing)",
+    };
+  }
+  for (const r of bundle.records) {
+    if (r.hash !== recomputeRecordHash(r)) {
+      return { ok: false, reason: `record seq ${r.seq} body does not hash to its stored hash` };
+    }
+  }
+  if (signingKey !== undefined) {
+    if (bundle.signature === null) return { ok: false, reason: "bundle is unsigned" };
+    if (!constantTimeEqualHex(signDigest(bundle.digest, signingKey), bundle.signature)) {
+      return { ok: false, reason: "HMAC signature mismatch" };
+    }
+  }
+  return { ok: true };
 }
 
 /**
@@ -273,8 +329,34 @@ export function createComplianceCollector(opts: CollectorOptions): ComplianceCol
           `collect: control "${framework}/${controlId}" not registered`,
         );
       }
+      // Verify the audit chain BEFORE accepting records as evidence — the
+      // plain `read()` iterator does no validation, so a record whose payload
+      // was rewritten (without repairing its hash), or a record deleted from
+      // the middle of the chain, would otherwise flow straight into a signed
+      // bundle presented to auditors as authoritative. We re-check every
+      // record's body↔hash, and the link + gapless-seq contiguity of the
+      // sequence `read()` yields, then filter the verified records.
       const matched: AuditRecord[] = [];
+      let prev: AuditRecord | undefined;
       for await (const record of opts.auditSource.read()) {
+        if (record.hash !== recomputeRecordHash(record)) {
+          throw new ComplianceControlsError(
+            `collect: audit record at seq ${record.seq} fails hash integrity — its body was modified after signing; refusing to bundle tampered evidence`,
+          );
+        }
+        if (prev !== undefined) {
+          if (record.prevHash !== prev.hash) {
+            throw new ComplianceControlsError(
+              `collect: audit chain broken at seq ${record.seq} — prevHash does not link to the prior record (a record was reordered or removed)`,
+            );
+          }
+          if (record.seq !== prev.seq + 1) {
+            throw new ComplianceControlsError(
+              `collect: audit chain has a seq gap before seq ${record.seq} (expected ${prev.seq + 1}) — a record was removed`,
+            );
+          }
+        }
+        prev = record;
         if (matchesAny(record, def.evidenceQueries)) {
           matched.push(record);
         }

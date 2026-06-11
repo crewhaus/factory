@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AuditRecord } from "@crewhaus/audit-log";
+import { type AuditRecord, recomputeRecordHash } from "@crewhaus/audit-log";
 import {
   type AuditRecordSource,
   BUILT_IN_CONTROLS,
@@ -15,6 +15,7 @@ import {
   _matchesForTest,
   _signDigestForTest,
   createComplianceCollector,
+  verifyBundle,
 } from "./index";
 
 function makeRecord(
@@ -29,6 +30,28 @@ function makeRecord(
     prevHash: partial.prevHash ?? "GENESIS",
     hash: partial.hash ?? `hash-${Math.random()}`,
   };
+}
+
+// Build a properly hash-chained, valid sequence (seq 0,1,…; prevHash links;
+// real hashes) — collect() now verifies the chain, so its evidence must be
+// genuine. The first record links to GENESIS.
+function chainOf(partials: ReadonlyArray<Pick<AuditRecord, "kind" | "payload">>): AuditRecord[] {
+  const out: AuditRecord[] = [];
+  let prevHash = "GENESIS";
+  partials.forEach((p, seq) => {
+    const base = {
+      ts: 1000 + seq,
+      version: 1 as const,
+      kind: p.kind,
+      seq,
+      payload: p.payload,
+      prevHash,
+    };
+    const hash = recomputeRecordHash({ ...base, hash: "" });
+    out.push({ ...base, hash });
+    prevHash = hash;
+  });
+  return out;
 }
 
 function source(records: ReadonlyArray<AuditRecord>): AuditRecordSource {
@@ -193,25 +216,26 @@ describe("createComplianceCollector (T1 + T3)", () => {
   });
 
   test("collect builds evidence bundle for a single control", async () => {
-    const records: AuditRecord[] = [
-      makeRecord({ kind: "policy_decision", payload: { action: "allow" }, hash: "h1" }),
-      makeRecord({ kind: "model_call", payload: { model: "claude" }, hash: "h2" }),
-      makeRecord({ kind: "policy_decision", payload: { action: "deny" }, hash: "h3" }),
-    ];
+    const records = chainOf([
+      { kind: "policy_decision", payload: { action: "allow" } },
+      { kind: "model_call", payload: { model: "claude" } },
+      { kind: "policy_decision", payload: { action: "deny" } },
+    ]);
     const collector = createComplianceCollector({ auditSource: source(records) });
     const bundle = await collector.collect("soc2", "CC6.1", { period: "2026-Q2" });
     expect(bundle.frameworkId).toBe("soc2");
     expect(bundle.controlId).toBe("CC6.1");
     expect(bundle.recordCount).toBe(2);
-    expect(bundle.records.map((r) => r.hash)).toEqual(["h1", "h3"]);
+    expect(bundle.records.map((r) => (r.payload as { action: string }).action)).toEqual([
+      "allow",
+      "deny",
+    ]);
     expect(bundle.signature).toBeNull();
     expect(bundle.digest).toMatch(/^[a-f0-9]{64}$/);
   });
 
   test("collect with signingKey produces a non-null HMAC signature", async () => {
-    const records: AuditRecord[] = [
-      makeRecord({ kind: "policy_decision", payload: {}, hash: "h1" }),
-    ];
+    const records = chainOf([{ kind: "policy_decision", payload: {} }]);
     const collector = createComplianceCollector({ auditSource: source(records) });
     const bundle = await collector.collect("soc2", "CC6.1", {
       period: "2026-Q2",
@@ -229,14 +253,79 @@ describe("createComplianceCollector (T1 + T3)", () => {
   });
 
   test("collectAll returns one bundle per control in the framework", async () => {
-    const records: AuditRecord[] = [
-      makeRecord({ kind: "policy_decision", payload: {}, hash: "h1" }),
-      makeRecord({ kind: "secrets_rotation", payload: {}, hash: "h2" }),
-    ];
+    const records = chainOf([
+      { kind: "policy_decision", payload: {} },
+      { kind: "secrets_rotation", payload: {} },
+    ]);
     const collector = createComplianceCollector({ auditSource: source(records) });
     const bundles = await collector.collectAll("soc2", { period: "2026-Q2" });
     expect(bundles.length).toBe(SOC2_CONTROLS.length);
     expect(bundles.every((b) => b.frameworkId === "soc2")).toBe(true);
+  });
+
+  // SECURITY: the collector must NOT sign tampered or incomplete evidence.
+  test("collect rejects a record whose payload was rewritten (hash no longer matches)", async () => {
+    const [original] = chainOf([{ kind: "policy_decision", payload: { action: "deny" } }]);
+    if (original === undefined) throw new Error("fixture");
+    // Attacker flips deny→allow but leaves the stored hash untouched.
+    const tampered: AuditRecord = { ...original, payload: { action: "allow" } };
+    const collector = createComplianceCollector({ auditSource: source([tampered]) });
+    await expect(collector.collect("soc2", "CC6.1", { period: "2026-Q2" })).rejects.toThrow(
+      /hash integrity/,
+    );
+  });
+
+  test("collect rejects a chain with a deleted middle record (seq gap)", async () => {
+    const [first, , third] = chainOf([
+      { kind: "policy_decision", payload: { action: "deny" } },
+      { kind: "policy_decision", payload: { action: "deny" } },
+      { kind: "policy_decision", payload: { action: "allow" } },
+    ]);
+    if (first === undefined || third === undefined) throw new Error("fixture");
+    // Drop the middle record — the survivors no longer link / are gapless.
+    const collector = createComplianceCollector({ auditSource: source([first, third]) });
+    await expect(collector.collect("soc2", "CC6.1", { period: "2026-Q2" })).rejects.toThrow(
+      /chain (broken|has a seq gap)/,
+    );
+  });
+});
+
+describe("verifyBundle (evidence integrity)", () => {
+  test("accepts a freshly collected + signed bundle", async () => {
+    const records = chainOf([{ kind: "policy_decision", payload: { action: "deny" } }]);
+    const collector = createComplianceCollector({ auditSource: source(records) });
+    const bundle = await collector.collect("soc2", "CC6.1", {
+      period: "2026-Q2",
+      signingKey: "k1",
+    });
+    expect(verifyBundle(bundle, "k1")).toEqual({ ok: true });
+    expect(verifyBundle(bundle)).toEqual({ ok: true });
+  });
+
+  test("rejects a bundle whose record payload was rewritten after signing", async () => {
+    const records = chainOf([{ kind: "policy_decision", payload: { action: "deny" } }]);
+    const collector = createComplianceCollector({ auditSource: source(records) });
+    const bundle = await collector.collect("soc2", "CC6.1", {
+      period: "2026-Q2",
+      signingKey: "k1",
+    });
+    // Rewrite a payload in the written bundle, leaving digest + signature as-is.
+    const [rec0] = bundle.records;
+    if (rec0 === undefined) throw new Error("fixture");
+    const forged = { ...bundle, records: [{ ...rec0, payload: { action: "allow" } }] };
+    const result = verifyBundle(forged, "k1");
+    expect(result.ok).toBe(false);
+  });
+
+  test("rejects a wrong HMAC key", async () => {
+    const records = chainOf([{ kind: "policy_decision", payload: {} }]);
+    const collector = createComplianceCollector({ auditSource: source(records) });
+    const bundle = await collector.collect("soc2", "CC6.1", {
+      period: "2026-Q2",
+      signingKey: "k1",
+    });
+    const result = verifyBundle(bundle, "wrong-key");
+    expect(result.ok).toBe(false);
   });
 });
 
@@ -250,9 +339,7 @@ describe("writeBundle (T3 — disk persistence)", () => {
   });
 
   test("writes bundle to <outputDir>/<framework>/<control>/<period>.json", async () => {
-    const records: AuditRecord[] = [
-      makeRecord({ kind: "policy_decision", payload: {}, hash: "h1" }),
-    ];
+    const records = chainOf([{ kind: "policy_decision", payload: {} }]);
     const collector = createComplianceCollector({
       auditSource: source(records),
       outputDir: tmp,
@@ -342,9 +429,7 @@ describe("writeBundle (T3 — disk persistence)", () => {
   });
 
   test("writeBundle still writes a legitimately-labelled period", async () => {
-    const records: AuditRecord[] = [
-      makeRecord({ kind: "policy_decision", payload: {}, hash: "h1" }),
-    ];
+    const records = chainOf([{ kind: "policy_decision", payload: {} }]);
     const collector = createComplianceCollector({
       auditSource: source(records),
       outputDir: tmp,
