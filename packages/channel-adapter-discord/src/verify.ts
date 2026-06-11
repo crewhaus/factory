@@ -25,12 +25,35 @@ export type DiscordVerifyArgs = {
   readonly publicKeyHex: string;
 };
 
-export function verifyDiscordSignature(args: DiscordVerifyArgs): boolean {
+export type DiscordVerifyOptions = {
+  readonly now?: () => number;
+  readonly toleranceMs?: number;
+};
+
+// Discord recommends rejecting interactions whose timestamp is too far from
+// now; 5 minutes matches the Slack adapter's replay-window cap.
+const DEFAULT_TOLERANCE_MS = 5 * 60 * 1000;
+
+export function verifyDiscordSignature(
+  args: DiscordVerifyArgs,
+  opts: DiscordVerifyOptions = {},
+): boolean {
+  const now = opts.now ?? (() => Date.now());
+  const tolerance = opts.toleranceMs ?? DEFAULT_TOLERANCE_MS;
+
   const sigHex = args.headers.get("x-signature-ed25519");
   const timestamp = args.headers.get("x-signature-timestamp");
   if (!sigHex || !timestamp) return false;
   if (!/^[0-9a-f]{128}$/i.test(sigHex)) return false;
   if (!/^\d+$/.test(timestamp)) return false;
+
+  // Replay-window: the timestamp is folded into the signed payload, so a
+  // captured (timestamp, body, signature) triple verifies indefinitely
+  // without this freshness bound. Reject stale/future timestamps (seconds
+  // since epoch), mirroring the Slack adapter.
+  const tsNum = Number.parseInt(timestamp, 10);
+  if (!Number.isFinite(tsNum)) return false;
+  if (Math.abs(now() - tsNum * 1000) > tolerance) return false;
 
   // `sigHex` is regex-validated above to be exactly 128 hex chars, so
   // `Buffer.from(_, "hex")` always yields exactly 64 bytes and never throws

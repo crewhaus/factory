@@ -30,7 +30,7 @@ beforeAll(() => {
   otherPublicKeyHex = generateEd25519Keypair().publicKeyHex;
 });
 
-function signedHeaders(body: string, ts: string | number = "1700000000"): Headers {
+function signedHeaders(body: string, ts: string | number = Math.floor(Date.now() / 1000)): Headers {
   const sig = signDiscordBody({ body, timestamp: ts, privateKeyPem });
   const h = new Headers();
   h.set("X-Signature-Ed25519", sig);
@@ -115,6 +115,34 @@ describe("verifyDiscordSignature (T8)", () => {
     const body = fixture("ping");
     const headers = signedHeaders(body, "abc");
     expect(verifyDiscordSignature({ headers, body, publicKeyHex })).toBe(false);
+  });
+
+  // SECURITY: the timestamp is signed but was never checked against the clock,
+  // so a captured interaction replayed indefinitely (after a daemon restart or
+  // LRU dedup eviction). Reject stale/future timestamps, mirroring Slack.
+  test("rejects an expired timestamp (replay window)", () => {
+    const body = fixture("ping");
+    const oldTs = Math.floor(Date.now() / 1000) - 10 * 60; // 10 minutes ago
+    expect(
+      verifyDiscordSignature({ headers: signedHeaders(body, oldTs), body, publicKeyHex }),
+    ).toBe(false);
+  });
+
+  test("rejects a future timestamp", () => {
+    const body = fixture("ping");
+    const futureTs = Math.floor(Date.now() / 1000) + 10 * 60;
+    expect(
+      verifyDiscordSignature({ headers: signedHeaders(body, futureTs), body, publicKeyHex }),
+    ).toBe(false);
+  });
+
+  test("a stale-but-validly-signed triple verifies when now() is pinned (gate is freshness, not signature)", () => {
+    const body = fixture("ping");
+    const ts = 1700000000;
+    const headers = signedHeaders(body, ts);
+    expect(verifyDiscordSignature({ headers, body, publicKeyHex }, { now: () => ts * 1000 })).toBe(
+      true,
+    );
   });
 
   test("rejects malformed publicKeyHex", () => {
