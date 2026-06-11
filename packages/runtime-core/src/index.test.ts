@@ -2354,3 +2354,71 @@ describe("runChatLoop egress matcher (FR-006)", () => {
     expect(egressEvent?.reason).toContain("subagent");
   });
 });
+
+// SECURITY: the loop detector is advisory (warn-only, defeated by argument
+// churn). maxToolIterations is the ENFORCING bound — a runaway/injected tool
+// loop must terminate, not burn tokens forever.
+describe("runChatLoop — maxToolIterations enforcement", () => {
+  test("aborts a never-ending tool loop at the cap (does not run forever)", async () => {
+    let calls = 0;
+    // Adapter that ALWAYS returns a tool_use, with churned input so the
+    // advisory signature detector never matches.
+    const loopingAdapter: import("@crewhaus/adapter-anthropic").ProviderAdapter = {
+      providerId: "anthropic",
+      features: {
+        caching: "explicit",
+        tool_use: true,
+        vision: true,
+        thinking: true,
+        web_search: true,
+      },
+      estimateTokens: () => 0,
+      stream: () => {
+        calls += 1;
+        const n = calls;
+        return (async function* () {
+          yield { kind: "message_start", usage: { input: 1, output: 0 } } as const;
+          yield {
+            kind: "content_block_start",
+            index: 0,
+            block: { type: "tool_use", id: `tu_${n}`, name: "noop", input: {} },
+          } as const;
+          yield {
+            kind: "content_block_delta",
+            index: 0,
+            delta: { type: "input_json_delta", partial_json: JSON.stringify({ n }) },
+          } as const;
+          yield { kind: "content_block_stop", index: 0 } as const;
+          yield {
+            kind: "message_delta",
+            stopReason: "tool_use",
+            usage: { input: 1, output: 1 },
+          } as const;
+          yield { kind: "message_stop" } as const;
+        })();
+      },
+    };
+    const noop = buildTool({
+      name: "noop",
+      description: "no-op tool",
+      inputSchema: z.object({ n: z.number().optional() }),
+      execute: async () => "ok",
+    });
+
+    await runChatLoop({
+      model: "test-model",
+      instructions: "loop",
+      _adapter: loopingAdapter,
+      singleTurn: true,
+      seedMessages: [{ role: "user", content: "go" }],
+      tools: [noop],
+      permissionMode: "bypass",
+      maxToolIterations: 3,
+    });
+
+    // Bounded: the turn aborted instead of looping unboundedly. ~one model
+    // call per tool cycle, plus the one that trips the cap.
+    expect(calls).toBeLessThanOrEqual(5);
+    expect(calls).toBeGreaterThanOrEqual(3);
+  });
+});
