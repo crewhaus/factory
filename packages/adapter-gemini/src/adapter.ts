@@ -1,15 +1,33 @@
 /**
  * `GeminiAdapter` — Google Gemini implementation of `ProviderAdapter`.
  *
- * Auth: `GEMINI_API_KEY` (also accepts `GOOGLE_API_KEY`).
+ * Auth — `createGeminiAdapter` resolves one of two modes from the env:
+ *
+ * | Mode       | Env vars                                                     |
+ * |------------|--------------------------------------------------------------|
+ * | Gemini API | `GEMINI_API_KEY` (also accepts `GOOGLE_API_KEY`). Default.   |
+ * | Vertex AI  | `GOOGLE_GENAI_USE_VERTEXAI=true` (or `1`) forces it; it is   |
+ * |            | also inferred when no API key is set but both                |
+ * |            | `GOOGLE_CLOUD_PROJECT` and `GOOGLE_CLOUD_LOCATION` are.      |
+ * |            | `GOOGLE_CLOUD_PROJECT` is required;                          |
+ * |            | `GOOGLE_CLOUD_LOCATION` defaults to `us-central1`. No API    |
+ * |            | key is required — auth flows through Application Default     |
+ * |            | Credentials / the service account in the environment.        |
  *
  * Features:
- *   - `caching: "explicit"` — Gemini's cachedContent reference path.
- *     The runtime carries `cache_control` markers through translate and
- *     a future iteration can mint cachedContent references from them.
+ *   - `caching: "automatic"` — Gemini's implicit caching. The API caches
+ *     repeated prefixes server-side and reports hits via
+ *     `usageMetadata.cachedContentTokenCount` (surfaced as canonical
+ *     `usage.cacheRead`). `cache_control` markers are NOT translated, so
+ *     declaring `"explicit"` would make the runtime's cache-marker
+ *     rotation spin for nothing.
  *   - `tool_use: true` — function calling.
  *   - `vision: true` — inline base64 + URL parts.
  *   - `thinking: true` — Gemini 2.5 thinking-mode (config.thinkingConfig).
+ *     Thought parts surface as canonical thinking blocks and
+ *     `thoughtSignature`s round-trip through the canonical `signature`
+ *     field (newer Gemini models require signatures echoed on
+ *     function-calling turns).
  *   - `web_search: false` — Google Search Grounding is NOT exposed
  *     through this adapter; tool-web is the fallback.
  */
@@ -30,7 +48,7 @@ import { toGeminiParams } from "./translate.js";
 type AnthropicMessageParamLike = Parameters<typeof tokenBudgetEstimate>[0][number];
 
 const GEMINI_FEATURES: ProviderFeatures = {
-  caching: "explicit",
+  caching: "automatic",
   tool_use: true,
   vision: true,
   thinking: true,
@@ -72,14 +90,49 @@ export class GeminiAdapter implements ProviderAdapter {
 }
 
 export function createGeminiAdapter(env: NodeJS.ProcessEnv = process.env): GeminiAdapter {
-  const apiKey = env["GEMINI_API_KEY"] ?? env["GOOGLE_API_KEY"];
-  if (apiKey === undefined || apiKey.length === 0) {
+  const apiKey = nonEmpty(env["GEMINI_API_KEY"]) ?? nonEmpty(env["GOOGLE_API_KEY"]);
+  const project = nonEmpty(env["GOOGLE_CLOUD_PROJECT"]);
+  const location = nonEmpty(env["GOOGLE_CLOUD_LOCATION"]);
+  const vertexFlag = (env["GOOGLE_GENAI_USE_VERTEXAI"] ?? "").toLowerCase();
+  const vertexForced = vertexFlag === "true" || vertexFlag === "1";
+  // Without the explicit flag, a project + location pair (and no API
+  // key) is an unambiguous Vertex AI setup — infer it.
+  const vertexInferred = apiKey === undefined && project !== undefined && location !== undefined;
+
+  if (vertexForced || vertexInferred) {
+    if (project === undefined) {
+      // Only reachable when the flag forced Vertex mode — inference
+      // requires a project. Without one the SDK throws an opaque
+      // "Authentication is not set up" Error at construction.
+      throw new ProviderAuthError(
+        "gemini",
+        "GOOGLE_GENAI_USE_VERTEXAI is set but GOOGLE_CLOUD_PROJECT is not — Vertex AI mode requires a Google Cloud project id",
+      );
+    }
+    // Vertex AI mode: no API key — auth flows through Application
+    // Default Credentials / the ambient service account.
+    return new GeminiAdapter({
+      client: new GoogleGenAI({
+        vertexai: true,
+        project,
+        location: location ?? "us-central1",
+      }),
+    });
+  }
+
+  if (apiKey === undefined) {
     throw new ProviderAuthError(
       "gemini",
-      "no Gemini credentials found: set GEMINI_API_KEY (or GOOGLE_API_KEY)",
+      "no Gemini credentials found: set GEMINI_API_KEY (or GOOGLE_API_KEY) for the Gemini API, " +
+        "or use Vertex AI by setting GOOGLE_GENAI_USE_VERTEXAI=true (or GOOGLE_CLOUD_PROJECT + " +
+        "GOOGLE_CLOUD_LOCATION) with Application Default Credentials",
     );
   }
   return new GeminiAdapter({ client: new GoogleGenAI({ apiKey }) });
+}
+
+function nonEmpty(value: string | undefined): string | undefined {
+  return value !== undefined && value.length > 0 ? value : undefined;
 }
 
 /**

@@ -164,7 +164,7 @@ describe("translateGeminiStream", () => {
     expect(messageDelta?.stopReason).toBe("tool_use");
   });
 
-  test("thought parts are skipped entirely", async () => {
+  test("thought parts surface as a thinking block ahead of the text block", async () => {
     const events = await collect(
       translateGeminiStream(
         synthChunks([
@@ -173,7 +173,11 @@ describe("translateGeminiStream", () => {
               {
                 content: {
                   role: "model",
-                  parts: [{ text: "internal reasoning", thought: true }, { text: "visible" }],
+                  parts: [
+                    { text: "internal ", thought: true },
+                    { text: "reasoning", thought: true },
+                    { text: "visible" },
+                  ],
                 },
               },
             ] as GenerateContentResponse["candidates"],
@@ -181,14 +185,144 @@ describe("translateGeminiStream", () => {
         ]),
       ),
     );
+    const thinkingStart = events.find(
+      (e): e is Extract<StreamEvent, { kind: "content_block_start" }> =>
+        e.kind === "content_block_start" && e.block.type === "thinking",
+    );
+    expect(thinkingStart?.index).toBe(0);
+    const thinkingDeltas = events
+      .filter(
+        (e): e is Extract<StreamEvent, { kind: "content_block_delta" }> =>
+          e.kind === "content_block_delta" && e.delta.type === "thinking_delta",
+      )
+      .map((e) => (e.delta.type === "thinking_delta" ? e.delta.thinking : ""));
+    // Consecutive thought parts accumulate on one thinking block.
+    expect(thinkingDeltas).toEqual(["internal ", "reasoning"]);
+
+    const textStart = events.find(
+      (e): e is Extract<StreamEvent, { kind: "content_block_start" }> =>
+        e.kind === "content_block_start" && e.block.type === "text",
+    );
+    expect(textStart?.index).toBe(1);
     const textDeltas = events
       .filter(
         (e): e is Extract<StreamEvent, { kind: "content_block_delta" }> =>
           e.kind === "content_block_delta" && e.delta.type === "text_delta",
       )
       .map((e) => (e.delta.type === "text_delta" ? e.delta.text : ""));
-    // The thought text must not surface; only the visible delta does.
+    // Thought text never leaks into the visible text block.
     expect(textDeltas).toEqual(["visible"]);
+
+    // The thinking block closes before the text block opens.
+    const kinds = events.map((e) => ("index" in e ? `${e.kind}#${e.index}` : e.kind));
+    expect(kinds.indexOf("content_block_stop#0")).toBeLessThan(
+      kinds.indexOf("content_block_start#1"),
+    );
+  });
+
+  test("a thoughtSignature on a thought part becomes a signature_delta on the thinking block", async () => {
+    const events = await collect(
+      translateGeminiStream(
+        synthChunks([
+          {
+            candidates: [
+              {
+                content: {
+                  role: "model",
+                  parts: [{ text: "reasoning", thought: true, thoughtSignature: "c2ln" }],
+                },
+              },
+            ] as GenerateContentResponse["candidates"],
+          },
+        ]),
+      ),
+    );
+    const sigDelta = events.find(
+      (e): e is Extract<StreamEvent, { kind: "content_block_delta" }> =>
+        e.kind === "content_block_delta" && e.delta.type === "signature_delta",
+    );
+    expect(sigDelta?.index).toBe(0);
+    expect(sigDelta?.delta.type === "signature_delta" && sigDelta.delta.signature).toBe("c2ln");
+  });
+
+  test("a thoughtSignature on a functionCall part lands on the open thinking block", async () => {
+    const events = await collect(
+      translateGeminiStream(
+        synthChunks([
+          {
+            candidates: [
+              {
+                content: {
+                  role: "model",
+                  parts: [
+                    { text: "reasoning", thought: true },
+                    {
+                      functionCall: { name: "Read", args: { path: "/tmp/x" } },
+                      thoughtSignature: "c2ln",
+                    },
+                  ],
+                },
+              },
+            ] as GenerateContentResponse["candidates"],
+          },
+        ]),
+      ),
+    );
+    // Signature routes to the thinking block (index 0), which closes
+    // before the tool block (index 1) starts.
+    const sigDelta = events.find(
+      (e): e is Extract<StreamEvent, { kind: "content_block_delta" }> =>
+        e.kind === "content_block_delta" && e.delta.type === "signature_delta",
+    );
+    expect(sigDelta?.index).toBe(0);
+    const toolStart = events.find(
+      (e): e is Extract<StreamEvent, { kind: "content_block_start" }> =>
+        e.kind === "content_block_start" && e.block.type === "tool_use",
+    );
+    expect(toolStart?.index).toBe(1);
+    const kinds = events.map((e) => ("index" in e ? `${e.kind}#${e.index}` : e.kind));
+    expect(kinds.indexOf("content_block_stop#0")).toBeLessThan(
+      kinds.indexOf("content_block_start#1"),
+    );
+  });
+
+  test("a thoughtSignature with no preceding thought part mints an empty thinking block to carry it", async () => {
+    const events = await collect(
+      translateGeminiStream(
+        synthChunks([
+          {
+            candidates: [
+              {
+                content: {
+                  role: "model",
+                  parts: [
+                    {
+                      functionCall: { name: "Read", args: {} },
+                      thoughtSignature: "c2ln",
+                    },
+                  ],
+                },
+              },
+            ] as GenerateContentResponse["candidates"],
+          },
+        ]),
+      ),
+    );
+    const thinkingStart = events.find(
+      (e): e is Extract<StreamEvent, { kind: "content_block_start" }> =>
+        e.kind === "content_block_start" && e.block.type === "thinking",
+    );
+    expect(thinkingStart?.index).toBe(0);
+    const sigDelta = events.find(
+      (e): e is Extract<StreamEvent, { kind: "content_block_delta" }> =>
+        e.kind === "content_block_delta" && e.delta.type === "signature_delta",
+    );
+    expect(sigDelta?.index).toBe(0);
+    // No thinking_delta — the block exists only to carry the signature.
+    const thinkingDeltas = events.filter(
+      (e) => e.kind === "content_block_delta" && e.delta.type === "thinking_delta",
+    );
+    expect(thinkingDeltas).toHaveLength(0);
   });
 
   test("safety-class finish reasons map to stop_sequence", async () => {
@@ -293,5 +427,28 @@ describe("translateGeminiStream", () => {
       (e): e is Extract<StreamEvent, { kind: "message_delta" }> => e.kind === "message_delta",
     );
     expect(messageDelta?.usage).toEqual({ input: 0, output: 0 });
+  });
+
+  test("cachedContentTokenCount surfaces as canonical usage.cacheRead", async () => {
+    const events = await collect(
+      translateGeminiStream(
+        synthChunks([
+          {
+            candidates: [
+              { finishReason: FinishReason.STOP, content: { role: "model", parts: [] } },
+            ] as GenerateContentResponse["candidates"],
+            usageMetadata: {
+              promptTokenCount: 100,
+              candidatesTokenCount: 7,
+              cachedContentTokenCount: 64,
+            } as GenerateContentResponse["usageMetadata"],
+          },
+        ]),
+      ),
+    );
+    const messageDelta = events.find(
+      (e): e is Extract<StreamEvent, { kind: "message_delta" }> => e.kind === "message_delta",
+    );
+    expect(messageDelta?.usage).toEqual({ input: 100, output: 7, cacheRead: 64 });
   });
 });

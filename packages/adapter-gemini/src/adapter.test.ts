@@ -64,7 +64,7 @@ describe("GeminiAdapter", () => {
     const adapter = new GeminiAdapter({ client });
     expect(adapter.providerId).toBe("gemini");
     expect(adapter.features).toEqual({
-      caching: "explicit",
+      caching: "automatic",
       tool_use: true,
       vision: true,
       thinking: true,
@@ -169,11 +169,30 @@ describe("GeminiAdapter", () => {
   });
 });
 
+/**
+ * Reach through the adapter's private `client` to assert which
+ * `GoogleGenAI` mode the factory selected. `vertexai` is a public
+ * readonly on the SDK client; `project`/`location` are assigned in its
+ * constructor (untyped in the d.ts, hence the structural cast).
+ */
+function clientOf(adapter: GeminiAdapter): {
+  vertexai: boolean;
+  project?: string;
+  location?: string;
+} {
+  return (
+    adapter as unknown as {
+      client: { vertexai: boolean; project?: string; location?: string };
+    }
+  ).client;
+}
+
 describe("createGeminiAdapter", () => {
   test("builds an adapter from GEMINI_API_KEY", () => {
     const adapter = createGeminiAdapter({ GEMINI_API_KEY: "test-key" });
     expect(adapter).toBeInstanceOf(GeminiAdapter);
     expect(adapter.providerId).toBe("gemini");
+    expect(clientOf(adapter).vertexai).toBe(false);
   });
 
   test("falls back to GOOGLE_API_KEY when GEMINI_API_KEY is unset", () => {
@@ -181,13 +200,90 @@ describe("createGeminiAdapter", () => {
     expect(adapter).toBeInstanceOf(GeminiAdapter);
   });
 
-  test("throws ProviderAuthError when no credentials are present", () => {
+  test("throws ProviderAuthError naming both auth paths when no credentials are present", () => {
     expect(() => createGeminiAdapter({})).toThrow(ProviderAuthError);
     expect(() => createGeminiAdapter({})).toThrow(/GEMINI_API_KEY/);
+    expect(() => createGeminiAdapter({})).toThrow(/GOOGLE_GENAI_USE_VERTEXAI/);
+    expect(() => createGeminiAdapter({})).toThrow(/Application Default Credentials/);
   });
 
   test("treats an empty-string key as missing credentials", () => {
     expect(() => createGeminiAdapter({ GEMINI_API_KEY: "" })).toThrow(ProviderAuthError);
+  });
+
+  test("GOOGLE_GENAI_USE_VERTEXAI=true forces Vertex AI mode without an API key", () => {
+    const adapter = createGeminiAdapter({
+      GOOGLE_GENAI_USE_VERTEXAI: "true",
+      GOOGLE_CLOUD_PROJECT: "my-project",
+    });
+    const client = clientOf(adapter);
+    expect(client.vertexai).toBe(true);
+    expect(client.project).toBe("my-project");
+    // Location was unset — the factory defaults it.
+    expect(client.location).toBe("us-central1");
+  });
+
+  test("GOOGLE_GENAI_USE_VERTEXAI=1 also forces Vertex AI mode", () => {
+    const adapter = createGeminiAdapter({
+      GOOGLE_GENAI_USE_VERTEXAI: "1",
+      GOOGLE_CLOUD_PROJECT: "my-project",
+      GOOGLE_CLOUD_LOCATION: "europe-west1",
+    });
+    const client = clientOf(adapter);
+    expect(client.vertexai).toBe(true);
+    expect(client.location).toBe("europe-west1");
+  });
+
+  test("Vertex AI mode wins over an API key when the flag is set", () => {
+    const adapter = createGeminiAdapter({
+      GOOGLE_GENAI_USE_VERTEXAI: "true",
+      GOOGLE_CLOUD_PROJECT: "my-project",
+      GEMINI_API_KEY: "also-set",
+    });
+    expect(clientOf(adapter).vertexai).toBe(true);
+  });
+
+  test("project + location with no API key infers Vertex AI mode", () => {
+    const adapter = createGeminiAdapter({
+      GOOGLE_CLOUD_PROJECT: "my-project",
+      GOOGLE_CLOUD_LOCATION: "us-east5",
+    });
+    const client = clientOf(adapter);
+    expect(client.vertexai).toBe(true);
+    expect(client.project).toBe("my-project");
+    expect(client.location).toBe("us-east5");
+  });
+
+  test("an API key alone stays in Gemini API mode even with project + location set", () => {
+    const adapter = createGeminiAdapter({
+      GEMINI_API_KEY: "test-key",
+      GOOGLE_CLOUD_PROJECT: "my-project",
+      GOOGLE_CLOUD_LOCATION: "us-east5",
+    });
+    expect(clientOf(adapter).vertexai).toBe(false);
+  });
+
+  test("project alone (no location, no key) is not enough to infer Vertex AI", () => {
+    expect(() => createGeminiAdapter({ GOOGLE_CLOUD_PROJECT: "my-project" })).toThrow(
+      ProviderAuthError,
+    );
+  });
+
+  test("forcing Vertex AI without GOOGLE_CLOUD_PROJECT throws ProviderAuthError", () => {
+    expect(() => createGeminiAdapter({ GOOGLE_GENAI_USE_VERTEXAI: "true" })).toThrow(
+      ProviderAuthError,
+    );
+    expect(() => createGeminiAdapter({ GOOGLE_GENAI_USE_VERTEXAI: "true" })).toThrow(
+      /GOOGLE_CLOUD_PROJECT/,
+    );
+  });
+
+  test("a falsy GOOGLE_GENAI_USE_VERTEXAI value leaves API-key mode in charge", () => {
+    const adapter = createGeminiAdapter({
+      GOOGLE_GENAI_USE_VERTEXAI: "false",
+      GEMINI_API_KEY: "test-key",
+    });
+    expect(clientOf(adapter).vertexai).toBe(false);
   });
 
   test("defaults to process.env when no env is supplied", () => {

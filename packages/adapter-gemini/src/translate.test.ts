@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { ProviderRequest } from "@crewhaus/adapter-anthropic";
+import { ConfigError } from "@crewhaus/errors";
 import { FunctionCallingConfigMode } from "@google/genai";
 import { toGeminiParams } from "./translate.js";
 
@@ -65,10 +66,15 @@ describe("toGeminiParams", () => {
     expect(assistantParts?.[1]?.functionCall).toEqual({ name: "Read", args: { path: "/tmp" } });
   });
 
-  test("tool_result blocks become functionResponse parts", () => {
+  test("tool_result functionResponse.name resolves to the declared function name, id carries the correlator", () => {
     const params = toGeminiParams({
       ...baseReq,
       messages: [
+        { role: "user", content: "read it" },
+        {
+          role: "assistant",
+          content: [{ type: "tool_use", id: "tu1", name: "Read", input: { path: "/tmp" } }],
+        },
         {
           role: "user",
           content: [{ type: "tool_result", tool_use_id: "tu1", content: "file contents" }],
@@ -77,13 +83,51 @@ describe("toGeminiParams", () => {
     });
     const contents = params.contents as Array<{
       role?: string;
-      parts?: Array<{ functionResponse?: { name?: string; response?: unknown } }>;
+      parts?: Array<{ functionResponse?: { id?: string; name?: string; response?: unknown } }>;
     }>;
-    expect(contents[0]?.role).toBe("user");
-    expect(contents[0]?.parts?.[0]?.functionResponse).toEqual({
-      name: "tu1",
+    expect(contents[2]?.role).toBe("user");
+    expect(contents[2]?.parts?.[0]?.functionResponse).toEqual({
+      name: "Read", // Gemini's contract: matches FunctionCall.name
+      id: "tu1",
       response: { result: "file contents" },
     });
+  });
+
+  test("orphaned synthetic tool_use_ids fall back to stripping the gemini_<name>_<idx> shape", () => {
+    // No prior assistant tool_use turn (e.g. trimmed by compaction) —
+    // the function name is recovered from the synthetic id pattern.
+    const params = toGeminiParams({
+      ...baseReq,
+      messages: [
+        {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "gemini_my_tool_3", content: "ok" }],
+        },
+      ],
+    });
+    const fr = (
+      params.contents as Array<{
+        parts?: Array<{ functionResponse?: { id?: string; name?: string } }>;
+      }>
+    )[0]?.parts?.[0]?.functionResponse;
+    expect(fr?.name).toBe("my_tool");
+    expect(fr?.id).toBe("gemini_my_tool_3");
+  });
+
+  test("orphaned non-synthetic tool_use_ids pass through as the name unchanged", () => {
+    const params = toGeminiParams({
+      ...baseReq,
+      messages: [
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "tu1", content: "ok" }] },
+      ],
+    });
+    const fr = (
+      params.contents as Array<{
+        parts?: Array<{ functionResponse?: { id?: string; name?: string } }>;
+      }>
+    )[0]?.parts?.[0]?.functionResponse;
+    expect(fr?.name).toBe("tu1");
+    expect(fr?.id).toBe("tu1");
   });
 
   test("toolChoice 'tool' becomes ANY mode + allowedFunctionNames", () => {
@@ -229,6 +273,31 @@ describe("toGeminiParams", () => {
     expect(parts?.[0]).toEqual({ text: "let me reason", thought: true });
   });
 
+  test("thinking blocks with a signature round-trip it as thoughtSignature", () => {
+    const params = toGeminiParams({
+      ...baseReq,
+      messages: [
+        {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "let me reason", signature: "c2lnbmF0dXJl" },
+            { type: "tool_use", id: "tu1", name: "Read", input: {} },
+          ],
+        },
+      ],
+    });
+    const parts = (
+      params.contents as Array<{
+        parts?: Array<{ text?: string; thought?: boolean; thoughtSignature?: string }>;
+      }>
+    )[0]?.parts;
+    expect(parts?.[0]).toEqual({
+      text: "let me reason",
+      thought: true,
+      thoughtSignature: "c2lnbmF0dXJl",
+    });
+  });
+
   test("tool_result with structured (array) content joins text blocks", () => {
     const params = toGeminiParams({
       ...baseReq,
@@ -288,5 +357,45 @@ describe("toGeminiParams", () => {
   test("no toolChoice leaves toolConfig unset", () => {
     const params = toGeminiParams(baseReq);
     expect(params.config?.toolConfig).toBeUndefined();
+  });
+});
+
+describe("toGeminiParams — Gemma models", () => {
+  test("system text is inlined as a leading [System] user turn instead of systemInstruction", () => {
+    const params = toGeminiParams({
+      ...baseReq,
+      model: "gemma-3-27b-it",
+      system: [{ type: "text", text: "be helpful" }],
+    });
+    expect(params.config?.systemInstruction).toBeUndefined();
+    const contents = params.contents as Array<{ role?: string; parts?: Array<{ text?: string }> }>;
+    expect(contents[0]?.role).toBe("user");
+    expect(contents[0]?.parts?.[0]?.text).toBe("[System]\nbe helpful");
+    // The original user turn follows the inlined system turn.
+    expect(contents[1]?.parts?.[0]?.text).toBe("hi");
+  });
+
+  test("no system text means no synthetic leading turn", () => {
+    const params = toGeminiParams({ ...baseReq, model: "gemma-3-27b-it", system: [] });
+    const contents = params.contents as Array<{ parts?: Array<{ text?: string }> }>;
+    expect(contents).toHaveLength(1);
+    expect(contents[0]?.parts?.[0]?.text).toBe("hi");
+  });
+
+  test("tools raise a ConfigError naming the Gemma limitation", () => {
+    const attempt = () =>
+      toGeminiParams({
+        ...baseReq,
+        model: "gemma-3-27b-it",
+        tools: [{ name: "Read", description: "read", input_schema: { type: "object" } }],
+      });
+    expect(attempt).toThrow(ConfigError);
+    expect(attempt).toThrow(/Gemma models do not support function calling/);
+    expect(attempt).toThrow(/gemma-3-27b-it/);
+  });
+
+  test("an empty tools array does not trip the Gemma function-calling guard", () => {
+    const params = toGeminiParams({ ...baseReq, model: "gemma-3-27b-it", tools: [] });
+    expect(params.config?.tools).toBeUndefined();
   });
 });
