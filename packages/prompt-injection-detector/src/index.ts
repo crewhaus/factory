@@ -94,9 +94,18 @@ const HOMOGLYPHS: Record<string, string> = {
   і: "i",
   ѕ: "s",
   ј: "j",
+  // Lowercase Cyrillic look-alikes whose UPPERCASE forms are mapped below.
+  // NFKC does not fold these to Latin, so without them a single lowercase
+  // homoglyph inside a trigger word (e.g. Cyrillic т U+0442 in "insтructions")
+  // slips past the keyword rules even though the uppercase Т is folded.
+  в: "b",
+  к: "k",
+  м: "m",
+  н: "h",
+  т: "t",
   // Capital Cyrillic look-alikes. NFKC does not fold these to Latin, so without
   // them a sentence-initial homoglyph (e.g. "Іgnore all previous instructions",
-  // Cyrillic І U+0406) evades the keyword rules. Mirrors the lowercase set.
+  // Cyrillic І U+0406) evades the keyword rules. Symmetric with the lowercase set.
   А: "A",
   В: "B",
   Е: "E",
@@ -124,6 +133,10 @@ const HOMOGLYPHS: Record<string, string> = {
   α: "a",
   ε: "e",
   ι: "i",
+  // Lowercase Greek look-alikes whose uppercase forms are mapped above.
+  β: "b",
+  τ: "t",
+  χ: "x",
 };
 
 /**
