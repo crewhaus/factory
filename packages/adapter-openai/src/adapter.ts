@@ -59,19 +59,29 @@ export class OpenAIAdapter implements ProviderAdapter {
 
   async *stream(req: ProviderRequest): AsyncIterable<StreamEvent> {
     const params = toOpenAIChatParams(req);
-    let raw: ReturnType<OpenAI["chat"]["completions"]["create"]>;
-    try {
-      raw = this.client.chat.completions.create(params, {
-        ...(req.signal !== undefined ? { signal: req.signal } : {}),
-      });
-    } catch (err) {
-      throw normaliseOpenAIError(err);
-    }
+    const requestOpts = {
+      ...(req.signal !== undefined ? { signal: req.signal } : {}),
+    };
     let stream: AsyncIterable<OpenAI.Chat.Completions.ChatCompletionChunk>;
     try {
-      stream = (await raw) as AsyncIterable<OpenAI.Chat.Completions.ChatCompletionChunk>;
+      stream = (await this.client.chat.completions.create(
+        params,
+        requestOpts,
+      )) as AsyncIterable<OpenAI.Chat.Completions.ChatCompletionChunk>;
     } catch (err) {
-      throw normaliseOpenAIError(err);
+      // Some OpenAI-compatible servers/proxies 400 on `stream_options`
+      // (it's an OpenAI extension). Retry ONCE without it — the stream
+      // translator already tolerates absent usage.
+      if (!isStreamOptionsRejection(err)) throw normaliseOpenAIError(err);
+      const { stream_options: _streamOptions, ...stripped } = params;
+      try {
+        stream = (await this.client.chat.completions.create(
+          stripped,
+          requestOpts,
+        )) as AsyncIterable<OpenAI.Chat.Completions.ChatCompletionChunk>;
+      } catch (retryErr) {
+        throw normaliseOpenAIError(retryErr);
+      }
     }
     try {
       yield* translateOpenAIStream(stream);
@@ -116,6 +126,18 @@ export function createOpenAIAdapter(
     ...(baseURL !== undefined ? { baseURL } : {}),
   });
   return new OpenAIAdapter({ client });
+}
+
+/**
+ * True for a 400 whose message points at `stream_options` — the marker
+ * for an OpenAI-compatible server that doesn't understand the field.
+ * Abort errors and every other status fall through to normalisation.
+ */
+function isStreamOptionsRejection(err: unknown): boolean {
+  const e = err as { status?: unknown; message?: unknown };
+  if (e?.status !== 400) return false;
+  const message = err instanceof Error ? err.message : String(err);
+  return /stream_options/i.test(message);
 }
 
 /**
