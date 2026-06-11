@@ -62,7 +62,7 @@ export type CrawlerConfig = {
   readonly maxBodyBytes?: number;
   readonly timeoutMs?: number;
   /** Test injection: replaces the live `fetch` for HTTP transports. */
-  readonly _httpFetch?: (url: string, init: RequestInit) => Promise<Response>;
+  readonly _httpFetch?: (url: string, init: RequestInit, pinnedIp?: string) => Promise<Response>;
 };
 
 export interface Crawler {
@@ -191,13 +191,14 @@ export function _setDnsLookup(fn: DnsLookupFn | undefined): void {
  * allow-list supplied by an untrusted marketplace/template spec must not be
  * able to point the crawler at `localhost`/`169.254.169.254`/RFC1918).
  *
- * Residual DNS-rebinding TOCTOU: the default `globalThis.fetch` re-resolves at
- * connect time, so a hostile resolver could answer public here and private at
- * the socket. Fully closing that needs connection pinning; this guard blocks
- * the direct vectors (IP literals, loopback names, and names that resolve to a
- * private range at check time), matching the tool-fetch/tool-navigate posture.
+ * Returns the validated IP so the caller can PIN the connection to that exact
+ * address. Resolving here and letting the default `fetch` re-resolve at connect
+ * time is a DNS-rebinding TOCTOU (CWE-367): a hostile resolver can answer
+ * public for this check and private (127.0.0.1, 169.254.169.254, …) for the
+ * socket milliseconds later. `pinnedFetch` dials the returned address directly.
+ * For an IP-literal host the pinned value is the (normalized) literal itself.
  */
-async function assertNotSsrf(host: string): Promise<void> {
+async function assertNotSsrf(host: string): Promise<string> {
   const lower = host.toLowerCase();
   if (lower === "localhost" || lower.endsWith(".localhost")) {
     throw new CrawlerError(`SSRF: host "${host}" is loopback`);
@@ -209,8 +210,9 @@ async function assertNotSsrf(host: string): Promise<void> {
   if (isPrivateIp(unbracketed)) {
     throw new CrawlerError(`SSRF: host "${host}" is a private/loopback IP`);
   }
-  const isIpLiteral = normalizeIpv4(unbracketed) !== null || unbracketed.includes(":");
-  if (isIpLiteral) return;
+  // An IP literal is its own pinned target — nothing to resolve or rebind.
+  const literal = normalizeIpv4(unbracketed) ?? (unbracketed.includes(":") ? unbracketed : null);
+  if (literal !== null) return literal;
   let resolved: { readonly address: string };
   try {
     resolved = await dnsLookupFn(unbracketed);
@@ -220,6 +222,40 @@ async function assertNotSsrf(host: string): Promise<void> {
   if (isPrivateIp(resolved.address)) {
     throw new CrawlerError(`SSRF: host "${host}" resolves to private IP ${resolved.address}`);
   }
+  return resolved.address;
+}
+
+/**
+ * Dial `pinnedIp` directly while keeping the request's original host for the
+ * `Host` header and TLS SNI, so certificate validation and virtual-host
+ * routing still work against the real name. This closes the rebinding TOCTOU:
+ * the socket connects to the exact IP `assertNotSsrf` vetted, not whatever the
+ * resolver returns at connect time. Mirrors `@crewhaus/tool-fetch`.
+ */
+function pinnedFetch(
+  url: string,
+  init: RequestInit,
+  pinnedIp: string | undefined,
+): Promise<Response> {
+  const original = new URL(url);
+  const host = original.hostname;
+  const hostUnbracketed = host.replace(/^\[/, "").replace(/\]$/, "");
+  // No pin, or the host already IS the pinned IP ⇒ nothing to rewrite.
+  if (pinnedIp === undefined || pinnedIp === "" || hostUnbracketed === pinnedIp) {
+    return globalThis.fetch(url, init);
+  }
+  const hostForUrl = pinnedIp.includes(":") ? `[${pinnedIp}]` : pinnedIp;
+  const pinnedUrl = new URL(original.toString());
+  pinnedUrl.hostname = hostForUrl;
+  const headers = new Headers(init.headers ?? {});
+  headers.set("host", original.port === "" ? host : `${host}:${original.port}`);
+  const pinnedInit: RequestInit & { tls?: { serverName: string } } = {
+    ...init,
+    headers,
+    // SNI must stay the real hostname so TLS cert validation passes.
+    tls: { serverName: host },
+  };
+  return globalThis.fetch(pinnedUrl.toString(), pinnedInit);
 }
 
 export function createCrawler(opts: {
@@ -233,7 +269,7 @@ export function createCrawler(opts: {
   const maxBodyBytes = cfg.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
   const timeoutMs = cfg.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const rateMax = cfg.rateLimit?.maxPerSecond ?? Number.POSITIVE_INFINITY;
-  const httpFetch = cfg._httpFetch ?? globalThis.fetch.bind(globalThis);
+  const httpFetch = cfg._httpFetch ?? pinnedFetch;
 
   const domainBuckets = new Map<string, DomainBucket>();
 
@@ -282,7 +318,9 @@ export function createCrawler(opts: {
         `origin "${origin}" is not on the crawler allow-list (got ${allowedOrigins.size} allowed)`,
       );
     }
-    await assertNotSsrf(host);
+    // Resolve+validate once, then PIN the socket to this exact IP so a
+    // rebinding resolver can't swap in a private address before connect.
+    let pinnedIp = await assertNotSsrf(host);
     await rateLimitGate(host);
 
     const ac = new AbortController();
@@ -293,7 +331,11 @@ export function createCrawler(opts: {
     let currentUrl = url;
     try {
       for (let hop = 0; hop <= maxRedirects; hop++) {
-        const r: Response = await httpFetch(currentUrl, { redirect: "manual", signal: ac.signal });
+        const r: Response = await httpFetch(
+          currentUrl,
+          { redirect: "manual", signal: ac.signal },
+          pinnedIp,
+        );
         if (r.status >= 300 && r.status < 400) {
           const loc = r.headers.get("location");
           if (loc === null) {
@@ -306,7 +348,8 @@ export function createCrawler(opts: {
               `redirect target "${next.origin}" is not on the crawler allow-list`,
             );
           }
-          await assertNotSsrf(next.host);
+          // Re-validate AND re-pin for the next hop's host.
+          pinnedIp = await assertNotSsrf(next.host);
           if (hop === maxRedirects) {
             throw new CrawlerError(`exceeded ${maxRedirects} redirects starting from ${url}`);
           }
