@@ -241,6 +241,73 @@ describe("budget enforcement", () => {
       error: { code: "budget_exceeded", message: expect.stringMatching(/input tokens/) },
     });
   });
+
+  // SECURITY: without an in-flight reservation, concurrent requests all pass
+  // checkBudget (which only sees recorded usage = 0) before any records, so a
+  // burst blows past the cap. The reservation counts each in-flight request.
+  test("in-flight reservation bounds a concurrent burst (TOCTOU)", async () => {
+    const tenantA = buildTenant("tenant-a", { tenantsRoot: tmp });
+    const tinyA: Tenant = { ...tenantA, budget: { maxInputTokens: 100, maxOutputTokens: 100 } };
+    const server = createGatewayServer({
+      jwtSecret: SECRET,
+      tenantsRoot: tmp,
+      handler: async () => ({ ok: true }),
+      tenantOverrides: { "tenant-a": tinyA },
+      estimateUsage: () => ({ input: 60, output: 0 }),
+    });
+    const token = signJwt({ tenant_id: "tenant-a" }, SECRET);
+    const req = (id: string) =>
+      server.handle({
+        bearer: token,
+        body: {
+          protocol: "crewhaus.v1",
+          id,
+          method: "runs.create",
+          params: { spec: "s", input: "" },
+        },
+      });
+    // Three concurrent requests @ 60 est. tokens vs a 100-token budget: with
+    // recorded usage 0, all three would pass the old check; the cumulative
+    // reservation (60+60+60) blocks the 2nd and 3rd.
+    const results = await Promise.all([req("1"), req("2"), req("3")]);
+    const rejected = results.filter(
+      (r) =>
+        typeof r === "object" &&
+        r !== null &&
+        "error" in r &&
+        (r as { error: { code: string } }).error.code === "budget_exceeded",
+    );
+    expect(rejected.length).toBeGreaterThanOrEqual(2);
+  });
+
+  test("reservation is released after each request (sequential requests aren't starved)", async () => {
+    const tenantA = buildTenant("tenant-a", { tenantsRoot: tmp });
+    const tinyA: Tenant = { ...tenantA, budget: { maxInputTokens: 100, maxOutputTokens: 100 } };
+    const server = createGatewayServer({
+      jwtSecret: SECRET,
+      tenantsRoot: tmp,
+      handler: async () => ({ ok: true }),
+      tenantOverrides: { "tenant-a": tinyA },
+      estimateUsage: () => ({ input: 60, output: 0 }),
+    });
+    const token = signJwt({ tenant_id: "tenant-a" }, SECRET);
+    const req = () =>
+      server.handle({
+        bearer: token,
+        body: {
+          protocol: "crewhaus.v1",
+          id: "x",
+          method: "runs.create",
+          params: { spec: "s", input: "" },
+        },
+      });
+    // Run-to-completion releases the 60-token reservation, so the next request
+    // (recorded usage still 0 here) reserves freshly and succeeds.
+    const a = await req();
+    const b = await req();
+    expect(a).not.toMatchObject({ error: { code: "budget_exceeded" } });
+    expect(b).not.toMatchObject({ error: { code: "budget_exceeded" } });
+  });
 });
 
 describe("tenancy isolation", () => {
