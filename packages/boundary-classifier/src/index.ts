@@ -189,6 +189,37 @@ function cacheKey(text: string, origin: TrustOrigin): string {
 }
 
 /**
+ * Process-wide default LLM classifier (Layer 3) for boundary classification.
+ *
+ * Boundary call sites — MCP / sub-agent / channel / federation / skill /
+ * compaction / chain / orchestrator — almost never thread an `llmClassifier`
+ * through their `classifyBoundary` call, so without a default the source-side
+ * fabric runs regex/structural only and the model-backed third tier the design
+ * documents is dead at every boundary. The runtime registers this ONCE at
+ * startup (gated on `llmClassifierEnabled`) so Layer 3 reaches every boundary
+ * without threading a callback through each of the 13 call sites.
+ *
+ * Opt-in: unset → boundaries stay regex/structural-only (the prior behaviour).
+ * A per-call `opts.llmClassifier` still takes precedence over this default.
+ */
+let defaultLlmClassifier: PiClassifyOptions["llmClassifier"];
+
+/**
+ * Register (or clear, with `undefined`) the process-wide Layer-3 classifier
+ * used by every `classifyBoundary` call that doesn't pass its own. Idempotent:
+ * re-registering the same function is a no-op. Changing or clearing it flushes
+ * the verdict cache, since cached verdicts may have been computed under the
+ * previous classifier (or none).
+ */
+export function setDefaultBoundaryLlmClassifier(
+  fn: PiClassifyOptions["llmClassifier"] | undefined,
+): void {
+  if (fn === defaultLlmClassifier) return;
+  defaultLlmClassifier = fn;
+  cache.clear();
+}
+
+/**
  * The single chokepoint. Classify content at a trust boundary, applying
  * the origin's default severity policy unless overridden.
  *
@@ -234,10 +265,10 @@ export async function classifyBoundary(
     }
   }
 
-  const verdict = await classifyText(
-    text,
-    opts.llmClassifier !== undefined ? { llmClassifier: opts.llmClassifier } : {},
-  );
+  // Per-call classifier wins; otherwise fall back to the process-wide default
+  // the runtime registers at startup (Layer 3 — model-backed tier).
+  const llmClassifier = opts.llmClassifier ?? defaultLlmClassifier;
+  const verdict = await classifyText(text, llmClassifier !== undefined ? { llmClassifier } : {});
 
   if (opts.bypassCache !== true) {
     cache.set(key, { verdict, origin });

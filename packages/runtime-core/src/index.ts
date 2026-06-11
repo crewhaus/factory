@@ -13,6 +13,7 @@ import type {
   SpawnSubAgentFn,
   SubAgentDefinition,
 } from "@crewhaus/agent-context-isolation";
+import { setDefaultBoundaryLlmClassifier } from "@crewhaus/boundary-classifier";
 import { type WrappedAdapter, wrap as wrapWithCircuitBreaker } from "@crewhaus/circuit-breaker";
 import { autoCompact } from "@crewhaus/compaction-autocompact";
 import { snip } from "@crewhaus/compaction-snip";
@@ -564,6 +565,18 @@ export function defaultSinkScope(toolName: string): SinkScope {
 }
 
 export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
+  // Pillar 3 — make the model-backed Layer-3 classifier reachable at EVERY
+  // trust boundary (MCP / sub-agent / channel / federation / skill /
+  // compaction / chain / orchestrator). Boundary call sites don't thread an
+  // `llmClassifier` through, so we register the runtime's classifier as the
+  // process-wide default — gated on the same `llmClassifierEnabled` env switch
+  // as the post-tool path. Set-or-clear on each entry keeps boundary behaviour
+  // consistent with that gate; idempotent re-registration is a no-op.
+  setDefaultBoundaryLlmClassifier(
+    opts.promptInjectionLlmClassifier !== undefined && llmClassifierEnabled(process.env)
+      ? opts.promptInjectionLlmClassifier
+      : undefined,
+  );
   // Section 17 — resolve the primary adapter via the model-router.
   // The router lazy-loads the matching provider package; an
   // Anthropic-only spec never pulls AWS / OpenAI / Gemini SDKs.
