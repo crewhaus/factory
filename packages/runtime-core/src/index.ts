@@ -27,7 +27,7 @@ import {
 import { ConfigError, RuntimeError } from "@crewhaus/errors";
 import { type EventKind, type EventLog, openEventLog } from "@crewhaus/event-log";
 import { type HookDef, type HookEvent, aggregateDecisions, runHooks } from "@crewhaus/hooks-engine";
-import { resolveModel } from "@crewhaus/model-router";
+import { parseModelString, resolveModel } from "@crewhaus/model-router";
 import {
   BUILTIN_DEFAULT_RULES,
   type JustificationJudge,
@@ -564,6 +564,22 @@ export function defaultSinkScope(toolName: string): SinkScope {
   return "external-configured";
 }
 
+/**
+ * Strip the model-string provider grammar down to the wire model id
+ * (`"bedrock/us.anthropic.claude-..."` → `"us.anthropic.claude-..."`)
+ * WITHOUT loading the provider package. Used on the `_adapter` injection
+ * path where `resolveModel` is bypassed entirely; synthetic ids that
+ * don't parse (`"test-model"`) pass through verbatim so existing test
+ * stubs keep their ids untouched.
+ */
+function bestEffortWireModelId(modelString: string): string {
+  try {
+    return parseModelString(modelString).modelId;
+  } catch {
+    return modelString;
+  }
+}
+
 export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // Pillar 3 — make the model-backed Layer-3 classifier reachable at EVERY
   // trust boundary (MCP / sub-agent / channel / federation / skill /
@@ -583,10 +599,16 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // Section 17 — resolve the primary adapter via the model-router and
   // capture the *stripped* modelId (the form the provider expects, e.g.
   // `openai/gpt-4o-mini` → `gpt-4o-mini`). When the caller injects an
-  // `_adapter`, default to `opts.model` for the wire model id — tests
-  // typically pass synthetic ids the stub adapter ignores.
+  // `_adapter`, still strip any provider prefix grammar (best-effort) so
+  // trace events carry the same wire model id either way — but fall back
+  // to `opts.model` verbatim for the synthetic ids tests typically pass
+  // (`"test-model"`), which the stub adapter ignores.
   const primaryResolution = opts._adapter
-    ? { adapter: opts._adapter, modelId: opts.model, providerId: opts._adapter.providerId }
+    ? {
+        adapter: opts._adapter,
+        modelId: bestEffortWireModelId(opts.model),
+        providerId: opts._adapter.providerId,
+      }
     : await resolveModel(opts.model);
   // Section 27 — wrap the primary adapter in a circuit breaker when
   // `circuitBreaker` opts are set (or by default in production codegen).
@@ -1523,10 +1545,16 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               await opts.rateLimiter.acquire(opts.rateLimitKeys, 1);
             }
             const modelStartEnv = bus.envelope();
+            // Section 27 — `model` carries the WIRE model id (the stripped
+            // form the provider bills against, e.g. `bedrock/us.anthropic.…`
+            // → `us.anthropic.…`) so cost-tracker pricing lookups and the
+            // OTel `gen_ai.request.model` attribute match; the original
+            // spec string rides along as `specModel` when it differs.
             bus.publish({
               ...modelStartEnv,
               kind: "model_request",
-              model: opts.model,
+              model: wireModelId,
+              ...(opts.model !== wireModelId ? { specModel: opts.model } : {}),
               provider: providerId,
               messageCount: messages.length,
               toolCount: anthropicTools?.length ?? 0,
@@ -1615,7 +1643,10 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 ...bus.envelope(),
                 spanId: modelStartEnv.spanId,
                 kind: "model_response",
-                model: opts.model,
+                // Wire model id, NOT the spec string — cost-tracker resolves
+                // pricing on this field (see the model_request publish above).
+                model: wireModelId,
+                ...(opts.model !== wireModelId ? { specModel: opts.model } : {}),
                 provider: providerId,
                 stopReason: stopReason ?? "end_turn",
                 usage,
@@ -1681,7 +1712,10 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               ...bus.envelope(),
               spanId: modelStartEnv.spanId,
               kind: "model_response",
-              model: opts.model,
+              // Wire model id, NOT the spec string — cost-tracker resolves
+              // pricing on this field (see the model_request publish above).
+              model: wireModelId,
+              ...(opts.model !== wireModelId ? { specModel: opts.model } : {}),
               provider: providerId,
               stopReason: final.stopReason,
               usage: final.usage,

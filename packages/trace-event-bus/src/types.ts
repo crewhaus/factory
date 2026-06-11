@@ -41,7 +41,21 @@ export type ProviderId = "anthropic" | "openai" | "gemini" | "bedrock";
 
 export type ModelRequestEvent = TraceEventEnvelope & {
   kind: "model_request";
+  /**
+   * WIRE model id — the stripped form the provider was actually called
+   * with (`"bedrock/us.anthropic.claude-…"` spec → `"us.anthropic.claude-…"`).
+   * This is the id cost-tracker pricing keys and the OTel
+   * `gen_ai.request.model` attribute expect; `provider` carries the
+   * routing half. The original spec string lives in `specModel`.
+   */
   model: string;
+  /**
+   * Original spec model string (`"bedrock/us.anthropic.claude-…"`,
+   * `"groq/llama-3.3-70b"`, …) when it differs from `model`. Preserves
+   * grammar-only routing detail the (provider, model) pair can't recover
+   * — e.g. which OpenAI-compatible host or azure deployment was hit.
+   */
+  specModel?: string;
   provider?: ProviderId;
   messageCount: number;
   toolCount: number;
@@ -57,7 +71,10 @@ export type ModelUsage = {
 
 export type ModelResponseEvent = TraceEventEnvelope & {
   kind: "model_response";
+  /** WIRE model id — see `ModelRequestEvent.model`. Pricing resolves on this. */
   model: string;
+  /** Original spec model string when it differs — see `ModelRequestEvent.specModel`. */
+  specModel?: string;
   provider?: ProviderId;
   stopReason: string;
   usage: ModelUsage;
@@ -260,7 +277,14 @@ export type CrewDoneEvent = TraceEventEnvelope & {
 export type CostAccrualEvent = TraceEventEnvelope & {
   kind: "cost_accrual";
   provider: ProviderId;
+  /**
+   * WIRE model id (copied from `ModelResponseEvent.model`) — together
+   * with `provider` this is exactly the `resolvePricing` lookup key, so
+   * a historical re-aggregation reprices deterministically.
+   */
   modelId: string;
+  /** Original spec model string when it differs — see `ModelRequestEvent.specModel`. */
+  specModel?: string;
   inputTokens: number;
   outputTokens: number;
   cachedReadTokens: number;

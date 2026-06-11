@@ -22,12 +22,12 @@ function formatBody(ev: TraceEvent): string {
         ev.stopReason ? ` stop=${ev.stopReason}` : ""
       }`;
     case "model_request":
-      return `model=${ev.model} messages=${ev.messageCount} tools=${ev.toolCount}${
+      return `model=${ev.model}${ev.specModel !== undefined ? ` spec=${ev.specModel}` : ""} messages=${ev.messageCount} tools=${ev.toolCount}${
         ev.streaming ? " streaming" : ""
       }`;
     case "model_response": {
       const usage = `in=${ev.usage.input} out=${ev.usage.output}`;
-      return `model=${ev.model} stop=${ev.stopReason} ${usage} duration=${ev.durationMs.toFixed(0)}ms`;
+      return `model=${ev.model}${ev.specModel !== undefined ? ` spec=${ev.specModel}` : ""} stop=${ev.stopReason} ${usage} duration=${ev.durationMs.toFixed(0)}ms`;
     }
     case "model_stream_token":
       return `chunk=${ev.chunkIndex} chars=${ev.deltaChars}`;
