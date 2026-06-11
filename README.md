@@ -87,8 +87,10 @@ agent:
 Edit the `instructions` block to describe what your agent should do, then:
 
 ```bash
-# Set a provider credential (the default model is Anthropic;
-# other providers are listed in factory/.env.example)
+# Set a provider credential — the default model is Anthropic; the full
+# provider matrix (OpenAI, Gemini, Bedrock, Vertex, Azure, Groq/Together/
+# OpenRouter/…, and local servers via local/<model>@<url>) is in
+# packages/model-router/README.md and factory/.env.example.
 export ANTHROPIC_API_KEY=sk-ant-...
 
 # Compile crewhaus.yaml to a runnable bundle in ./build
