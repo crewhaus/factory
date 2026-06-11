@@ -377,6 +377,34 @@ describe("createCrawler — http redirect + origin canonicalisation", () => {
     }
   });
 
+  // SECURITY: a streamed body with no Content-Length must be aborted mid-stream
+  // once it exceeds the cap, not buffered whole into the heap (OOM DoS).
+  test("aborts a streamed oversized body early (no Content-Length)", async () => {
+    const root = newRoot();
+    let chunksEmitted = 0;
+    try {
+      const body = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          chunksEmitted++;
+          controller.enqueue(new Uint8Array(8)); // each chunk already over the cap
+        },
+      });
+      const crawler = createCrawler({
+        tracker: createCitationTracker({ rootDir: root }),
+        config: {
+          maxBodyBytes: 4,
+          allowedOrigins: new Set(["https://example.com"]),
+          _httpFetch: async () => new Response(body, { status: 200 }),
+        },
+      });
+      await expect(crawler.fetch("https://example.com/x")).rejects.toThrow(/exceeds 4 bytes/);
+      // Cancelled early — not pulled unboundedly.
+      expect(chunksEmitted).toBeLessThan(5);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("canonicalises explicit default ports and non-default ports", async () => {
     const root = newRoot();
     try {
