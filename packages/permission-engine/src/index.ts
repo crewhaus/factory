@@ -427,6 +427,25 @@ function warnRuleBasedJudgeOnce(toolName: string): void {
  * rule-based judge is no defence against a justification written by the same
  * model. See `warnRuleBasedJudgeOnce`.
  */
+/**
+ * Whether a rule-based `allow` verdict should be overridden to deny. The
+ * rule-based judge scores a justification by token overlap with the goal, but
+ * the SAME (prompt-injectable) model that picked the tool also writes the
+ * justification, so an `allow` from it is no real authorization. We therefore
+ * fail CLOSED in production: a justification-required tool is denied unless an
+ * LLM-backed judge is configured (it reports a different judgeModel and is
+ * never overridden). Two escape hatches keep this from being a hard break:
+ *   - `NODE_ENV=test` (Bun sets it for `bun test`) keeps the judge deterministic
+ *     for the test suite;
+ *   - `CREWHAUS_ALLOW_RULE_BASED_JUSTIFICATION=1` lets an operator explicitly
+ *     accept the rule-based judge's weakness in production.
+ */
+function ruleBasedShouldFailClosed(): boolean {
+  if (process.env.NODE_ENV === "test") return false;
+  if (process.env["CREWHAUS_ALLOW_RULE_BASED_JUSTIFICATION"] === "1") return false;
+  return true;
+}
+
 export async function evaluateJustification(
   input: {
     readonly toolName: string;
@@ -439,6 +458,14 @@ export async function evaluateJustification(
   const verdict = await Promise.resolve(judge(input));
   if (verdict.judgeModel === RULE_BASED_JUDGE_MODEL) {
     warnRuleBasedJudgeOnce(input.toolName);
+    if (verdict.allow && ruleBasedShouldFailClosed()) {
+      return {
+        allow: false,
+        reason:
+          "justification denied (fail-closed): the default rule-based judge is gameable by the same model that wrote the justification, so its `allow` is not trustworthy. Configure security.justification.judge: claude (an LLM-backed judge), or set CREWHAUS_ALLOW_RULE_BASED_JUSTIFICATION=1 to explicitly accept the rule-based judge.",
+        judgeModel: RULE_BASED_JUDGE_MODEL,
+      };
+    }
   }
   return verdict;
 }
