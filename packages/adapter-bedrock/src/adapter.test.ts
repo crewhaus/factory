@@ -351,7 +351,7 @@ describe("createBedrockAdapter — region resolution", () => {
     expect(a.family).toBe("anthropic");
   });
 
-  test("falls back to AWS_REGION, then AWS_DEFAULT_REGION, then us-east-1", () => {
+  test("falls back to AWS_REGION, then AWS_DEFAULT_REGION", () => {
     // Each branch returns a valid adapter; the client construction is the
     // observable effect (a throwing region would fail construction).
     expect(createBedrockAdapter({ family: "llama" }, { AWS_REGION: "ap-south-1" })).toBeInstanceOf(
@@ -360,6 +360,12 @@ describe("createBedrockAdapter — region resolution", () => {
     expect(
       createBedrockAdapter({ family: "llama" }, { AWS_DEFAULT_REGION: "sa-east-1" }),
     ).toBeInstanceOf(BedrockAdapter);
+  });
+
+  test("no explicit region → client still constructs (SDK chain resolves later)", () => {
+    // No region option/env must NOT default to us-east-1 — the client is
+    // built without a region so the SDK's provider chain can consult
+    // ~/.aws/config at send() time.
     expect(createBedrockAdapter({ family: "mistral" }, {})).toBeInstanceOf(BedrockAdapter);
   });
 

@@ -72,6 +72,21 @@ describe("cost-tracker — T1 pricing table", () => {
     expect(resolvePricing(DEFAULT_PRICING, "openai", "gpt-not-a-real-model")).toBeUndefined();
   });
 
+  test("resolvePricing strips Bedrock cross-region inference-profile prefixes", () => {
+    // us.anthropic.* profiles route to the same model as anthropic.* —
+    // pricing rows are keyed on the bare id.
+    const us = resolvePricing(
+      DEFAULT_PRICING,
+      "bedrock",
+      "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+    );
+    expect(us?.inputPer1M).toBe(3.0);
+    const eu = resolvePricing(DEFAULT_PRICING, "bedrock", "eu.meta.llama3-1-8b-instruct-v1:0");
+    expect(eu?.inputPer1M).toBe(0.22);
+    // The strip is bedrock-only: an openai id starting with "us." stays put.
+    expect(resolvePricing(DEFAULT_PRICING, "openai", "us.gpt-4o")).toBeUndefined();
+  });
+
   test("resolvePricing returns undefined (does not throw) for a known provider with an unmapped model id", () => {
     // Contract: a known provider but no matching model prefix is a pricing
     // *miss* (returns undefined), never a throw — an unmapped model id must

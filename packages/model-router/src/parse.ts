@@ -8,8 +8,14 @@
  *   - `gemini/<model>`                    → gemini
  *   - `bedrock/<modelId>`                 → bedrock with family inferred
  *                                           from the modelId prefix
- *                                           (anthropic|llama|mistral)
+ *                                           (anthropic|llama|mistral),
+ *                                           tolerating a leading geo segment
+ *                                           ("us." / "eu." / "apac." / ...)
+ *                                           from cross-region inference
+ *                                           profile ids
  *   - `local/<model>@<url>`               → openai with baseURL=<url>
+ *                                           (the URL must include the `/v1`
+ *                                           segment for Ollama/vLLM/LM Studio)
  *
  * Anything else is rejected with a `ConfigError` carrying a hint so
  * spec authors get a helpful message rather than a runtime crash deep
@@ -19,6 +25,16 @@
 import { ConfigError } from "@crewhaus/errors";
 
 export type ProviderId = "anthropic" | "openai" | "gemini" | "bedrock";
+
+/**
+ * Geo segments AWS prepends to Bedrock model ids to form cross-region
+ * inference-profile ids (e.g. `us.anthropic.claude-...`). Mirrored in
+ * `@crewhaus/adapter-bedrock` (detectFamily) and `@crewhaus/cost-tracker`
+ * (resolvePricing) — those packages cannot share code with this one
+ * without breaking the router's lazy-import seam, so the twin copies
+ * carry identical test vectors instead.
+ */
+export const BEDROCK_GEO_PREFIX = /^(?:us|eu|apac|jp|au|ca|sa|us-gov|global)\./;
 
 export type ParsedModelString =
   | { readonly providerId: "anthropic"; readonly modelId: string }
@@ -41,7 +57,7 @@ export function parseModelString(modelString: string): ParsedModelString {
     const at = rest.indexOf("@");
     if (at === -1) {
       throw new ConfigError(
-        `model "${modelString}": local/* requires "@<url>" suffix (e.g. local/llama-3.1-8b@http://localhost:11434)`,
+        `model "${modelString}": local/* requires "@<url>" suffix (e.g. local/llama-3.1-8b@http://localhost:11434/v1 — include the /v1 segment for Ollama/vLLM/LM Studio)`,
       );
     }
     const modelId = rest.slice(0, at);
@@ -78,13 +94,20 @@ export function parseModelString(modelString: string): ParsedModelString {
         `model "${modelString}": bedrock/* requires a model id after the slash`,
       );
     }
+    // Cross-region inference profiles prefix the family with a geo
+    // segment (us. / eu. / apac. / global. / ...). AWS requires the
+    // profile id — not the bare model id — to invoke current-generation
+    // models on demand, so strip the segment for family sniffing only
+    // and keep the full id as the wire modelId.
+    // Twin logic: adapter-bedrock/src/family.ts detectFamily — keep in sync.
+    const stem = modelId.replace(BEDROCK_GEO_PREFIX, "");
     let family: "anthropic" | "llama" | "mistral";
-    if (modelId.startsWith("anthropic.")) family = "anthropic";
-    else if (modelId.startsWith("meta.llama")) family = "llama";
-    else if (modelId.startsWith("mistral.")) family = "mistral";
+    if (stem.startsWith("anthropic.")) family = "anthropic";
+    else if (stem.startsWith("meta.llama")) family = "llama";
+    else if (stem.startsWith("mistral.")) family = "mistral";
     else {
       throw new ConfigError(
-        `model "${modelString}": Bedrock family unknown — expected anthropic.* / meta.llama* / mistral.*`,
+        `model "${modelString}": Bedrock family unknown — expected anthropic.* / meta.llama* / mistral.*, optionally behind a cross-region inference-profile prefix (us. / eu. / apac. / global. / ...)`,
       );
     }
     return { providerId: "bedrock", modelId, family };

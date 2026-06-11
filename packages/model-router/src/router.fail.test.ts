@@ -49,7 +49,7 @@ describe("loadAdapter — missing optional adapter surfaces ConfigError", () => 
   test("local/* — also routes through the openai loader and fails loud", async () => {
     __adapterImporters.openai = () => Promise.reject(new Error("simulated missing openai adapter"));
     await expect(
-      resolveModel("local/llama-3.1-8b@http://localhost:11434", ENV),
+      resolveModel("local/llama-3.1-8b@http://localhost:11434/v1", ENV),
     ).rejects.toBeInstanceOf(ConfigError);
   });
 
