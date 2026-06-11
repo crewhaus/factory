@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/sandbox-image-rust",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "type": "module",
   "description": "Rust stable polyglot sandbox image: registry registration + multi-stage Dockerfile + T2/T7/T8 contract tests (Section 36)",
   "main": "src/index.ts",

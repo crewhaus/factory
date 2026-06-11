@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/channel-adapter-base",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "type": "module",
   "description": "Channel boundary base: classifies inbound channel text at TrustOrigin \"channel\" before it reaches a model call (Pillar 3 chokepoint, Section 33)",
   "main": "src/index.ts",
