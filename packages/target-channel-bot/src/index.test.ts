@@ -230,6 +230,23 @@ describe("emitChannelBot — gateway.ts", () => {
     expect(c).toContain("dedup");
   });
 
+  // SECURITY (audit R3): the dedup store is pluggable, the in-memory default
+  // is behavior-preserving, and remember() is awaited (an unawaited Promise
+  // is always truthy — every inbound event would be dropped as a duplicate).
+  test("dedup runs through a pluggable DedupStore and remember() is awaited", () => {
+    const c = fileMap(MIN_IR).get("gateway.ts") ?? "";
+    expect(c).toContain('from "@crewhaus/durable-state"');
+    expect(c).toContain("dedupStore?: DedupStore");
+    expect(c).toContain("config.dedupStore ?? new InMemoryDedupStore");
+    expect(c).toContain("await dedup.remember(parsed.event.idempotencyKey)");
+  });
+
+  test("daemon wires CREWHAUS_DEDUP_STORE through createDedupStore", () => {
+    const c = fileMap(MIN_IR).get("daemon.ts") ?? "";
+    expect(c).toContain('createDedupStore(process.env["CREWHAUS_DEDUP_STORE"] ?? "memory")');
+    expect(c).toContain("dedupStore: __dedupStore");
+  });
+
   test("returns 401 on signature mismatch", () => {
     const c = fileMap(MIN_IR).get("gateway.ts") ?? "";
     expect(c).toContain("status: 401");

@@ -3,6 +3,7 @@ import { createHmac } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { SqliteBudgetStore } from "@crewhaus/durable-state";
 import { ErrorCode } from "@crewhaus/gateway-protocol";
 import { type Tenant, buildTenant } from "@crewhaus/tenancy";
 import {
@@ -212,9 +213,9 @@ describe("server.handle (T2/T3 contract)", () => {
 describe("budget enforcement", () => {
   test("recordUsage increments cumulative usage", async () => {
     const { server } = makeServer();
-    server.recordUsage("tenant-a", { input: 1000, output: 200 });
-    server.recordUsage("tenant-a", { input: 500, output: 100 });
-    expect(server.usage("tenant-a")).toEqual({ input: 1500, output: 300 });
+    await server.recordUsage("tenant-a", { input: 1000, output: 200 });
+    await server.recordUsage("tenant-a", { input: 500, output: 100 });
+    expect(await server.usage("tenant-a")).toEqual({ input: 1500, output: 300 });
   });
 
   test("exhausted input budget → 429 budget_exceeded", async () => {
@@ -226,7 +227,7 @@ describe("budget enforcement", () => {
       handler: async () => ({ ok: true }),
       tenantOverrides: { "tenant-a": tinyA },
     });
-    server.recordUsage("tenant-a", { input: 999, output: 0 });
+    await server.recordUsage("tenant-a", { input: 999, output: 0 });
     const token = signJwt({ tenant_id: "tenant-a" }, SECRET);
     const res = await server.handle({
       bearer: token,
@@ -278,6 +279,43 @@ describe("budget enforcement", () => {
         (r as { error: { code: string } }).error.code === "budget_exceeded",
     );
     expect(rejected.length).toBeGreaterThanOrEqual(2);
+  });
+
+  // SECURITY (audit R3): two gateway "replicas" sharing a durable budget
+  // store enforce ONE budget. Before the seam each replica had its own
+  // in-memory maps, multiplying every tenant budget by the replica count.
+  test("replicas sharing a SqliteBudgetStore enforce a single budget", async () => {
+    const tenantA = buildTenant("tenant-a", { tenantsRoot: tmp });
+    const tinyA: Tenant = { ...tenantA, budget: { maxInputTokens: 100, maxOutputTokens: 100 } };
+    const storeFile = join(tmp, "budget.db");
+    const mk = () =>
+      createGatewayServer({
+        jwtSecret: SECRET,
+        tenantsRoot: tmp,
+        handler: async () => ({ ok: true }),
+        tenantOverrides: { "tenant-a": tinyA },
+        estimateUsage: () => ({ input: 60, output: 0 }),
+        budgetStore: new SqliteBudgetStore({ path: storeFile }),
+      });
+    const replicaA = mk();
+    const replicaB = mk();
+    // Usage recorded through replica A is visible to replica B...
+    await replicaA.recordUsage("tenant-a", { input: 70, output: 0 });
+    expect(await replicaB.usage("tenant-a")).toEqual({ input: 70, output: 0 });
+    // ...and bounds replica B's requests (70 recorded + 60 estimate >= 100).
+    const token = signJwt({ tenant_id: "tenant-a" }, SECRET);
+    const res = await replicaB.handle({
+      bearer: token,
+      body: {
+        protocol: "crewhaus.v1",
+        id: "1",
+        method: "runs.create",
+        params: { spec: "s", input: "" },
+      },
+    });
+    expect(res).toMatchObject({
+      error: { code: "budget_exceeded", message: expect.stringMatching(/input tokens 130\/100/) },
+    });
   });
 
   test("reservation is released after each request (sequential requests aren't starved)", async () => {
@@ -520,7 +558,7 @@ describe("createGatewayServer — injected clock + default tenant building", () 
       jwtSecret: SECRET,
       handler: async () => ({ ok: true }),
     });
-    server.recordUsage("tenant-a", { input: 10_000_000, output: 0 });
+    await server.recordUsage("tenant-a", { input: 10_000_000, output: 0 });
     const token = signJwt({ tenant_id: "tenant-a" }, SECRET);
     const res = await server.handle({
       bearer: token,
@@ -545,7 +583,7 @@ describe("budget enforcement — output dimension + internal errors", () => {
       handler: async () => ({ ok: true }),
       tenantOverrides: { "tenant-a": tinyA },
     });
-    server.recordUsage("tenant-a", { input: 0, output: 100 });
+    await server.recordUsage("tenant-a", { input: 0, output: 100 });
     const token = signJwt({ tenant_id: "tenant-a" }, SECRET);
     const res = await server.handle({
       bearer: token,
@@ -737,7 +775,7 @@ describe("listen — real Bun.serve HTTP surface (loopback)", () => {
       handler: async () => ({ ok: true }),
       tenantOverrides: { "tenant-a": tinyA },
     });
-    server.recordUsage("tenant-a", { input: 50, output: 0 });
+    await server.recordUsage("tenant-a", { input: 50, output: 0 });
     const token = signJwt({ tenant_id: "tenant-a" }, SECRET);
     await withHttp(server, async (base) => {
       const res = await fetch(base, {

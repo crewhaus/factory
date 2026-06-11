@@ -1,8 +1,8 @@
 {
-  "name": "@crewhaus/gateway-server",
-  "version": "0.1.1",
+  "name": "@crewhaus/durable-state",
+  "version": "0.1.0",
   "type": "module",
-  "description": "Bun.serve daemon speaking gateway-protocol — JWT auth + per-tenant routing + budget enforcement",
+  "description": "Pluggable dedup + budget stores (audit follow-up R3) — in-memory defaults, bun:sqlite cross-process backend",
   "main": "src/index.ts",
   "types": "src/index.ts",
   "exports": {
@@ -12,11 +12,7 @@
     "test": "bun test src"
   },
   "dependencies": {
-    "@crewhaus/durable-state": "workspace:*",
-    "@crewhaus/audit-log": "workspace:*",
-    "@crewhaus/errors": "workspace:*",
-    "@crewhaus/gateway-protocol": "workspace:*",
-    "@crewhaus/tenancy": "workspace:*"
+    "@crewhaus/errors": "workspace:*"
   },
   "license": "Apache-2.0",
   "author": {
@@ -27,9 +23,9 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/crewhaus/factory.git",
-    "directory": "packages/gateway-server"
+    "directory": "packages/durable-state"
   },
-  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/gateway-server#readme",
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/durable-state#readme",
   "bugs": {
     "url": "https://github.com/crewhaus/factory/issues"
   },
