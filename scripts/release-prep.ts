@@ -6,12 +6,18 @@
  * "@crewhaus/" or "crewhaus-" (root workspace packages stay private as configured).
  *
  * Run:
- *   bun scripts/release-prep.ts                       # apply defaults to this workspace
- *   bun scripts/release-prep.ts --check               # diff-only, no writes
- *   bun scripts/release-prep.ts --version 0.1.1       # override target version
- *   bun scripts/release-prep.ts --access public       # override publishConfig.access
+ *   bun scripts/release-prep.ts --version 0.1.3            # stamp every package (lockstep)
+ *   bun scripts/release-prep.ts --version 0.1.3 --check    # diff-only, no writes
+ *   bun scripts/release-prep.ts --version 0.1.3 --access restricted   # override access
+ *
+ * `--version` is REQUIRED — there is no safe default for a flag that stamps
+ * every publishable package (a bare run used to silently downgrade the whole
+ * workspace to 0.1.0/restricted). Access defaults to "public", the live
+ * scope. After writing, the touched files are re-run through biome so the
+ * bump commits lint-clean.
  */
 
+import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 
@@ -24,8 +30,16 @@ const flag = (name: string) => {
 };
 const has = (name: string) => args.includes(`--${name}`);
 
-const TARGET_VERSION = flag("version") ?? "0.1.0";
-const ACCESS = (flag("access") ?? "restricted") as "restricted" | "public";
+const versionFlag = flag("version");
+if (versionFlag === undefined) {
+  console.error("✗ --version is required: it stamps EVERY publishable package in lockstep.");
+  console.error(
+    "  Usage: bun scripts/release-prep.ts --version <semver> [--access public|restricted] [--check] [--root <dir>]",
+  );
+  process.exit(1);
+}
+const TARGET_VERSION = versionFlag;
+const ACCESS = (flag("access") ?? "public") as "restricted" | "public";
 const CHECK = has("check");
 const ROOT = resolve(flag("root") ?? process.cwd());
 
@@ -178,6 +192,7 @@ console.log("");
 let updated = 0;
 let unchanged = 0;
 const errors: string[] = [];
+const written: string[] = [];
 
 for (const dir of pkgDirs) {
   const path = join(dir, "package.json");
@@ -193,7 +208,10 @@ for (const dir of pkgDirs) {
       }
       updated++;
       console.log(`  ${changed ? "✎" : " "} ${relative(ROOT, path)} → ${pkg.version}`);
-      if (!CHECK) writeJson(path, pkg);
+      if (!CHECK) {
+        writeJson(path, pkg);
+        written.push(path);
+      }
     } else {
       unchanged++;
     }
@@ -208,4 +226,19 @@ if (errors.length) {
   console.error("\nErrors:");
   for (const e of errors) console.error(`  ${e}`);
   process.exit(1);
+}
+
+// writeJson's JSON.stringify array style differs from biome's (single-line
+// `files` arrays get expanded); reformat the touched files so the bump
+// commits lint-clean — the v0.1.2 cut hit 200 lint errors without this.
+if (written.length > 0) {
+  const fmt = spawnSync("bun", ["x", "biome", "check", "--write", ...written], {
+    cwd: ROOT,
+    stdio: "inherit",
+  });
+  if (fmt.status !== 0) {
+    console.error("✗ biome reformat failed; run `bun run lint:fix` before committing the bump.");
+    process.exit(1);
+  }
+  console.log(`Reformatted ${written.length} written file(s) with biome.`);
 }
