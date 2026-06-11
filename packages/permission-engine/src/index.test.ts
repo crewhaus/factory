@@ -405,6 +405,46 @@ describe("Pillar 3 — ruleBasedJustificationJudge", () => {
     expect(v.confidence ?? 0).toBeGreaterThan(0);
   });
 
+  // SECURITY: the rule-based judge is gameable (the same model writes the
+  // justification), so its `allow` must NOT stand in production.
+  const OVERLAPPING = {
+    toolName: "SendMessage",
+    justification: "post the email summary to the #customer-success channel",
+    sessionGoal: "summarize the customer's recent email correspondence",
+    input: {},
+  } as const;
+
+  test("fails closed in production when the rule-based judge would allow", async () => {
+    const prevEnv = process.env.NODE_ENV;
+    const prevOptIn = process.env["CREWHAUS_ALLOW_RULE_BASED_JUSTIFICATION"];
+    process.env.NODE_ENV = "production";
+    process.env["CREWHAUS_ALLOW_RULE_BASED_JUSTIFICATION"] = ""; // not "1" → fail-closed
+    __resetRuleBasedJudgeWarningForTests();
+    try {
+      const v = await evaluateJustification({ ...OVERLAPPING });
+      expect(v.allow).toBe(false);
+      expect(v.reason).toMatch(/fail-closed/);
+    } finally {
+      process.env.NODE_ENV = prevEnv ?? "test";
+      process.env["CREWHAUS_ALLOW_RULE_BASED_JUSTIFICATION"] = prevOptIn ?? "";
+    }
+  });
+
+  test("CREWHAUS_ALLOW_RULE_BASED_JUSTIFICATION=1 restores the rule-based allow in production", async () => {
+    const prevEnv = process.env.NODE_ENV;
+    const prevOptIn = process.env["CREWHAUS_ALLOW_RULE_BASED_JUSTIFICATION"];
+    process.env.NODE_ENV = "production";
+    process.env["CREWHAUS_ALLOW_RULE_BASED_JUSTIFICATION"] = "1";
+    __resetRuleBasedJudgeWarningForTests();
+    try {
+      const v = await evaluateJustification({ ...OVERLAPPING });
+      expect(v.allow).toBe(true);
+    } finally {
+      process.env.NODE_ENV = prevEnv ?? "test";
+      process.env["CREWHAUS_ALLOW_RULE_BASED_JUSTIFICATION"] = prevOptIn ?? "";
+    }
+  });
+
   test("custom judge overrides the default", async () => {
     const custom: JustificationJudge = () => ({
       allow: false,
@@ -511,7 +551,7 @@ describe("Pillar 3 — rule-based judge weakness warning (#161)", () => {
     // Warning is decoupled from the verdict — it fires on allow paths too.
   });
 
-  test("warns on an allow verdict too (not just denials)", async () => {
+  test("warns on the rule-based allow path AND fails it closed in production", async () => {
     process.env.NODE_ENV = "production";
     const v = await evaluateJustification({
       toolName: "SendMessage",
@@ -519,7 +559,10 @@ describe("Pillar 3 — rule-based judge weakness warning (#161)", () => {
       sessionGoal: "summarize the customer's recent email correspondence",
       input: {},
     });
-    expect(v.allow).toBe(true);
+    // The rule-based judge would have allowed (token overlap), so the warning
+    // fires — but the allow is overridden to a fail-closed deny in production.
+    expect(v.allow).toBe(false);
+    expect(v.reason).toMatch(/fail-closed/);
     expect(v.judgeModel).toBe(RULE_BASED_JUDGE_MODEL);
     expect(warnings).toHaveLength(1);
   });
