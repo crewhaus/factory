@@ -15,7 +15,13 @@
  */
 import { afterAll, afterEach, describe, expect, mock, test } from "bun:test";
 import { EventEmitter } from "node:events";
+import { resolve } from "node:path";
 import { SingleBinaryError, buildBinary } from "./index";
+
+// Mirror REPO_ROOT from ./index — two levels above the package root,
+// whatever the checkout or worktree happens to be named. (`tsc -b` also
+// runs this file from dist/, hence the src|dist strip.)
+const REPO_ROOT = resolve(import.meta.dir.replace(/[/\\](src|dist)$/, ""), "..", "..");
 
 // Captured before any mock.module call so afterAll can reinstall the real module.
 const realChildProcess = require("node:child_process") as typeof import("node:child_process");
@@ -76,7 +82,7 @@ describe("defaultRunner (real child_process path, mocked spawn)", () => {
     expect(captured.rest).toContain("--compile");
     expect(captured.rest).toContain("bun-linux-x64");
     // cwd is REPO_ROOT (two levels above the package).
-    expect(captured.cwd).toMatch(/factory$/);
+    expect(captured.cwd).toBe(REPO_ROOT);
     expect(result.outPath).toBe("/tmp/sbc-runner-dist/crewhaus-linux-x64-9.9.9");
     expect(result.buildArgv[0]).toBe("bun");
   });

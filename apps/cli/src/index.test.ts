@@ -678,3 +678,22 @@ describe("crewhaus help and unknown subcommand", () => {
     expect(result.stderr).toContain("unknown subcommand");
   });
 });
+
+describe("crewhaus version", () => {
+  const pkgVersion = (
+    JSON.parse(readFileSync(join(import.meta.dir, "..", "package.json"), "utf-8")) as {
+      version: string;
+    }
+  ).version;
+
+  for (const flag of ["version", "--version", "-v"]) {
+    test(`${flag} prints the package version and exits 0`, async () => {
+      const result = await runCli([flag]);
+      expect(result.exitCode).toBe(0);
+      // stdout must be exactly the version; stderr is left unchecked because
+      // adapter-anthropic logs an import-time warning on hosts without an
+      // installed claude CLI.
+      expect(result.stdout.trim()).toBe(pkgVersion);
+    });
+  }
+});

@@ -105,6 +105,10 @@ export async function buildBinary(opts: BuildBinaryOptions): Promise<BuildBinary
     "--compile",
     "--target",
     bunCompileTarget(t),
+    // Embed the version: inside a compiled binary import.meta.url points
+    // into the virtual /$bunfs tree, so the CLI's runtime ../package.json
+    // read cannot work — `crewhaus --version` uses this constant instead.
+    ...(version ? ["--define", `CREWHAUS_EMBEDDED_VERSION=${JSON.stringify(version)}`] : []),
     CLI_ENTRYPOINT_REL,
     "--outfile",
     outPath,
