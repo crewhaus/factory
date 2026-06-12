@@ -345,6 +345,7 @@ function usage(): never {
       "  compliance evidence                  collect SOC 2 / ISO 27001 / HIPAA evidence (Section 39)",
       "       --framework <id> [--control <id>] --period <p> [--audit-dir <d>]",
       "       [--out-dir <d>] [--signing-key-env <ENV>]",
+      "  version                              print the CLI version (also: --version, -v)",
       "",
     ].join("\n"),
   );
@@ -354,6 +355,32 @@ function usage(): never {
 function die(message: string): never {
   process.stderr.write(`crewhaus: ${message}\n`);
   process.exit(1);
+}
+
+// Substituted at build time by @crewhaus/single-binary-cli's `bun build
+// --compile --define` — standalone binaries have no package.json on disk.
+declare const CREWHAUS_EMBEDDED_VERSION: string | undefined;
+
+function printVersion(): void {
+  if (typeof CREWHAUS_EMBEDDED_VERSION === "string") {
+    process.stdout.write(`${CREWHAUS_EMBEDDED_VERSION}\n`);
+    return;
+  }
+  // The package ships src/ directly (bin → src/index.ts) and tsc -b also
+  // emits dist/, so resolve package.json relative to this module — one level
+  // up lands on apps/cli/package.json from either tree, and on
+  // node_modules/@crewhaus/cli/package.json when installed.
+  let version: string;
+  try {
+    version = (
+      JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf-8")) as {
+        version: string;
+      }
+    ).version;
+  } catch {
+    die("could not locate package.json to determine the version");
+  }
+  process.stdout.write(`${version}\n`);
 }
 
 function parseFor(rest: ReadonlyArray<string>, schema: ParseArgsSchema): ParsedArgs {
@@ -2471,6 +2498,11 @@ switch (subcommand) {
     await runCompliance(parseFor(rest.slice(1), COMPLIANCE_SCHEMA), action);
     break;
   }
+  case "version":
+  case "-v":
+  case "--version":
+    printVersion();
+    break;
   case "":
   case "-h":
   case "--help":

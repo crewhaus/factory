@@ -100,7 +100,23 @@ describe("buildBinary() (T2 dry-run)", () => {
     expect(captured).toContain("bun-linux-x64");
     expect(captured).toContain("--outfile");
     expect(captured).toContain("/tmp/dist/crewhaus-linux-x64-1.2.3");
+    expect(captured).toContain("--define");
+    expect(captured).toContain('CREWHAUS_EMBEDDED_VERSION="1.2.3"');
     expect(result.outPath).toBe("/tmp/dist/crewhaus-linux-x64-1.2.3");
+  });
+
+  test("no version → no --define (the CLI falls back to its package.json read)", async () => {
+    let captured: readonly string[] = [];
+    const runner: BuildBinaryRunner = async (argv) => {
+      captured = argv;
+      return { exitCode: 0, stdout: "", stderr: "" };
+    };
+    await buildBinary({
+      target: { platform: "linux", arch: "x64" },
+      outDir: "/tmp/dist",
+      runner,
+    });
+    expect(captured).not.toContain("--define");
   });
 
   test("rejects unsupported target windows-arm64", async () => {
