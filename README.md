@@ -11,13 +11,6 @@ cd my-agent
 bun x crewhaus compile crewhaus.yaml -o build && bun x crewhaus run crewhaus.yaml
 ```
 
-> **0.1.1 status (2026-05-30).** The `@crewhaus` npm scope is currently published
-> with `publishConfig.access: "restricted"` for private testing. Anyone granted scope
-> access can `bun add -d @crewhaus/cli` as shown above. The scope flips to public
-> per [PACKAGES.md](PACKAGES.md)'s launch checklist; once that happens this README
-> needs no change — the install command is the same. (Pin `^0.1.1` or newer; v0.1.0
-> shipped with broken workspace:* deps and is tombstoned.)
-
 ## Why CrewHaus?
 
 Write the agent once, as a spec (`crewhaus.yaml`). Compile it to the shape each situation calls for — a CLI to run locally, a Slack bot for the team, an eval bundle to grade it — each emitted as code idiomatic to that runtime, not a generic wrapper.
