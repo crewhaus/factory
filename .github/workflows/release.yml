@@ -98,11 +98,13 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
           REPO: ${{ github.repository }}
         run: |
+          # Idempotent: create the release, or (on re-run) re-upload the assets.
           gh release create "v$VERSION" \
             --repo "$REPO" \
             --title "crewhaus v$VERSION" \
             --generate-notes \
-            dist/crewhaus-*
+            dist/crewhaus-* \
+          || gh release upload "v$VERSION" --repo "$REPO" --clobber dist/crewhaus-*
 
       - name: Upload manifests artifact
         uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4
@@ -133,8 +135,12 @@ jobs:
         run: bun scripts/release-prep.ts --version "$VERSION"
       - name: Publish (crewhaus + @crewhaus/*)
         env:
-          NPM_CONFIG_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: bun scripts/publish-workspace.ts
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          # Authenticate npm + bun via .npmrc (NPM_CONFIG_TOKEN sets the legacy
+          # `token` config, which `npm whoami` does not accept in CI).
+          echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > ~/.npmrc
+          bun scripts/publish-workspace.ts
 
   homebrew:
     name: Update Homebrew tap
