@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/prompt-injection-detector",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "type": "module",
   "description": "Cross-cutting safety classifier for tool outputs (regex + structural heuristics + optional LLM tier)",
   "main": "src/index.ts",

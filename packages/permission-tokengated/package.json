@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/permission-tokengated",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "type": "module",
   "description": "Token-gated permission resolver. Reads on-chain ownership (ERC-20 balance, ERC-721 ownerOf) and emits alwaysAllow / alwaysDeny PermissionRule records. §47 slice 1; supports Shape 9 (Tokenized Access) and Shape 12 (DID/credential).",
   "main": "src/index.ts",

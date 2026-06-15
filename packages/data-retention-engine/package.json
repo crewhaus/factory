@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/data-retention-engine",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "type": "module",
   "description": "GDPR-shaped data retention: retain / export / purge with cron-style sweeper + audit window override (Section 39)",
   "main": "src/index.ts",

@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/sandbox-image-ruby",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "type": "module",
   "description": "Ruby 3.3 polyglot sandbox image: registry registration + Dockerfile + T2/T7/T8 contract tests (Section 36)",
   "main": "src/index.ts",

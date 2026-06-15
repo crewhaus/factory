@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/channel-adapter-slack",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "type": "module",
   "description": "Slack channel adapter: webhook signature verification, event parsing, reply-to-thread (Section 12)",
   "main": "src/index.ts",

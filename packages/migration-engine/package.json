@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/migration-engine",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "type": "module",
   "description": "IR version migrations: register up/down chains; migrate(spec, fromVersion, toVersion) walks the chain",
   "main": "src/index.ts",

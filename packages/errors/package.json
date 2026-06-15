@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/errors",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "type": "module",
   "description": "Typed error hierarchy shared across factory layers",
   "main": "src/index.ts",

@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/target-onchain-game",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "type": "module",
   "description": "Codegen for the §47 `onchain-game` perceive-act-perceive loop. Emits a daemon that reads game state, asks the model for a move, broadcasts the move, awaits confirmation, and repeats.",
   "main": "src/index.ts",

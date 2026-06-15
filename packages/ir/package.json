@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/ir",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "type": "module",
   "description": "Canonical typed intermediate representation",
   "main": "src/index.ts",

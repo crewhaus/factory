@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/template-registry",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "type": "module",
   "description": "Backend-agnostic spec-template registry: git/huggingface/npm/local backends + TTL cache + sigstore-style signature verification (Section 40)",
   "main": "src/index.ts",

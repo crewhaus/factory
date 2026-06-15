@@ -243,7 +243,14 @@ jobs:
           gpg --armor --export "$KEYID" > key.gpg
           # Release file + signatures.
           cd dists/stable
-          apt-ftparchive release . > Release
+          apt-ftparchive \
+            -o APT::FTPArchive::Release::Origin=CrewHaus \
+            -o APT::FTPArchive::Release::Label=CrewHaus \
+            -o APT::FTPArchive::Release::Suite=stable \
+            -o APT::FTPArchive::Release::Codename=stable \
+            -o APT::FTPArchive::Release::Architectures="amd64 arm64" \
+            -o APT::FTPArchive::Release::Components=main \
+            release . > Release
           printf '%s' "$APT_GPG_PASSPHRASE" | gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 \
             -abs -u "$KEYID" -o Release.gpg Release
           printf '%s' "$APT_GPG_PASSPHRASE" | gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 \

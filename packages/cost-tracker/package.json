@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/cost-tracker",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "type": "module",
   "description": "Per-run / per-tenant USD aggregation: subscribes to model_response events, emits cost_accrual TraceEvents",
   "main": "src/index.ts",

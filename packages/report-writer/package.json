@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/report-writer",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "type": "module",
   "description": "Markdown + JSON report assembly from citations + branch answers (Section 23 RES)",
   "main": "src/index.ts",
