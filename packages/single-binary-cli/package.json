@@ -10,7 +10,8 @@
   },
   "scripts": {
     "test": "bun test src",
-    "build:binary": "bun src/cli.ts"
+    "build:binary": "bun src/cli.ts",
+    "manifests": "bun src/manifests.ts"
   },
   "dependencies": {
     "@crewhaus/errors": "workspace:*"

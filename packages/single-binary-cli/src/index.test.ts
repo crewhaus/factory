@@ -164,6 +164,7 @@ describe("manifest rendering (T1)", () => {
     expect(formula).toContain('version "1.0.0"');
     expect(formula).toContain("on_macos");
     expect(formula).toContain("on_linux");
+    expect(formula).toContain('license "Apache-2.0"');
     expect(formula).toContain(sha256["macos-arm64"]);
     expect(formula).toContain(sha256["macos-x64"]);
     expect(formula).toContain(sha256["linux-arm64"]);
@@ -184,9 +185,11 @@ describe("manifest rendering (T1)", () => {
   test("Scoop manifest exposes 64bit url + hash", () => {
     const scoop = renderScoopManifest(inputs) as {
       version: string;
+      license: string;
       architecture: { "64bit": { url: string; hash: string } };
     };
     expect(scoop.version).toBe("1.0.0");
+    expect(scoop.license).toBe("Apache-2.0");
     expect(scoop.architecture["64bit"].hash).toBe(sha256["windows-x64"]);
     expect(scoop.architecture["64bit"].url).toContain("crewhaus-windows-x64-1.0.0.exe");
   });
@@ -195,6 +198,7 @@ describe("manifest rendering (T1)", () => {
     const winget = renderWingetManifest(inputs);
     expect(winget).toContain("PackageIdentifier: CrewHaus.CLI");
     expect(winget).toContain("PackageVersion: 1.0.0");
+    expect(winget).toContain("License: Apache-2.0");
     expect(winget).toContain(sha256["windows-x64"].toUpperCase());
   });
 

@@ -94,7 +94,9 @@ function discoverPackages(): PkgInfo[] {
     const pkg = readJson<Record<string, unknown>>(join(dir, "package.json"));
     if (pkg.private === true) continue;
     const name = pkg.name as string | undefined;
-    if (!name || !name.startsWith("@crewhaus/")) continue;
+    // Publishable names: the scoped library packages plus the unscoped
+    // flagship `crewhaus` CLI (apps/cli — the bare package users install).
+    if (!name || !(name === "crewhaus" || name.startsWith("@crewhaus/"))) continue;
     allNames.add(name);
     raw.push({ dir, pkg });
   }
@@ -250,7 +252,7 @@ if (!DRY) {
 }
 
 const pkgs = discoverPackages();
-console.log(`Discovered ${pkgs.length} publishable @crewhaus/* packages in ${ROOT}`);
+console.log(`Discovered ${pkgs.length} publishable packages (crewhaus + @crewhaus/*) in ${ROOT}`);
 
 const sorted = topoSort(pkgs);
 const filtered = FILTER ? sorted.filter((p) => p.name === FILTER) : sorted;

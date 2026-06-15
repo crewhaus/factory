@@ -121,7 +121,10 @@ function discoverWorkspacePackages(rootPkgPath: string): string[] {
 function applyRelease(pkg: Json, pkgDir: string, isRoot: boolean): boolean {
   let changed = false;
   const name = pkg.name as string | undefined;
-  const isPublishable = !isRoot && typeof name === "string" && /^@?crewhaus[-/]/.test(name);
+  // Publishable: scoped @crewhaus/* and crewhaus-* packages, plus the bare
+  // `crewhaus` CLI (apps/cli). The root workspace stays private (isRoot).
+  const isPublishable =
+    !isRoot && typeof name === "string" && (name === "crewhaus" || /^@?crewhaus[-/]/.test(name));
 
   if (!isPublishable) {
     return false; // root workspace packages stay private as-is

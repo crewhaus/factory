@@ -36,9 +36,9 @@ Once we hit 1.0, we will publish a formal support window (likely "current major 
 
 This policy covers:
 
-- `@crewhaus/cli`, `@crewhaus/core`, `@crewhaus/runtime-core` and all other published `@crewhaus/*` npm packages
+- The `crewhaus` CLI package, plus `@crewhaus/core`, `@crewhaus/runtime-core` and all other published `@crewhaus/*` library packages on npm
 - The compiler and target emitters in this repository
-- The `crewhaus.ai` website, plus `docs.crewhaus.ai`, `forge.crewhaus.ai`, and `cloud.crewhaus.ai` once those properties are live
+- The `crewhaus.ai` website, plus `forge.crewhaus.ai` and `cloud.crewhaus.ai` once those properties are live
 
 This policy does NOT cover:
 
@@ -94,7 +94,7 @@ Researchers who have responsibly disclosed vulnerabilities to us are credited he
 
 ## PGP
 
-If you need to encrypt your report, our PGP key is at https://crewhaus.ai/.well-known/security.txt (once the website is live).
+If you need to encrypt your report, our PGP key is at https://crewhaus.ai/.well-known/security.txt.
 
 ## Bug bounty
 

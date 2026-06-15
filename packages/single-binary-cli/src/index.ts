@@ -178,7 +178,7 @@ export function renderHomebrewFormula(inputs: ManifestInputs): string {
   desc "Modular meta-harness — compile a single spec into multiple agent runtimes"
   homepage "${homepage}"
   version "${version}"
-  license "MIT"
+  license "Apache-2.0"
 
   on_macos do
     on_arm do
@@ -237,7 +237,7 @@ export function renderScoopManifest(inputs: ManifestInputs): unknown {
     version,
     description: "Modular meta-harness — compile a single spec into multiple agent runtimes",
     homepage,
-    license: "MIT",
+    license: "Apache-2.0",
     architecture: {
       "64bit": {
         url: `${downloadBaseUrl}/crewhaus-windows-x64-${version}.exe`,
@@ -258,7 +258,7 @@ Publisher: CrewHaus
 Author: CrewHaus
 PackageName: crewhaus
 PackageUrl: ${homepage}
-License: MIT
+License: Apache-2.0
 ShortDescription: Modular meta-harness — compile a single spec into multiple agent runtimes
 Description: |
   CrewHaus compiles a single high-level harness spec into multiple runtime targets.
