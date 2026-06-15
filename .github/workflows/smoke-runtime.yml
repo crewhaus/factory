@@ -14,12 +14,15 @@ name: Smoke (runtime)
 # external PRs don't get the secret, so this job is automatically a
 # no-op for them.
 on:
-  # Trigger only when explicitly requested; keeps API spend predictable.
+  # Dispatch-only: this job issues real Anthropic API calls, so it runs only
+  # when explicitly requested, keeping API spend predictable and avoiding an
+  # unattended schedule that fails (not skips) whenever ANTHROPIC_API_KEY is
+  # absent. Run it from the Actions tab before a release or after a runtime
+  # change.
   workflow_dispatch:
-  schedule:
-    # Daily catch on main so regressions get caught within 24h even if
-    # no PR runs the manual dispatch.
-    - cron: "17 9 * * *"
+
+permissions:
+  contents: read
 
 jobs:
   smoke-runtime:
@@ -27,7 +30,7 @@ jobs:
     if: ${{ github.repository == 'crewhaus/factory' }}
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: ">=1.2.0"
