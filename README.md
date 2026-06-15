@@ -4,6 +4,8 @@
 
 Compile a single spec (a `crewhaus.yaml`) into a CLI agent, channel bot, RAG pipeline, multi-agent crew, eval harness, voice/realtime agent, browser/computer-use agent, and more. Active eval optimization. Trust-aware by default. Apache-2.0.
 
+> **★ If CrewHaus is useful to you, [star the repo](https://github.com/crewhaus/factory).** For an independent, Apache-2.0 project maintained in the open, a star is the clearest signal the work is worth continuing.
+
 ```bash
 # Install the standalone binary — no runtime required:
 brew tap crewhaus/tap && brew install crewhaus          # macOS / Linux (Homebrew)
