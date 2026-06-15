@@ -5,11 +5,55 @@
 Compile a single spec (a `crewhaus.yaml`) into a CLI agent, channel bot, RAG pipeline, multi-agent crew, eval harness, voice/realtime agent, browser/computer-use agent, and more. Active eval optimization. Trust-aware by default. Apache-2.0.
 
 ```bash
-bun add -d @crewhaus/cli
-bun x crewhaus init my-agent
+# Install the standalone binary — no runtime required:
+brew install crewhaus/tap/crewhaus          # macOS / Linux (Homebrew)
+# Windows: scoop install crewhaus · winget install CrewHaus.CLI
+# Debian/Ubuntu (apt) and npm/Bun: see "Install" below
+
+crewhaus --version
+crewhaus init my-agent
 cd my-agent
-bun x crewhaus compile crewhaus.yaml -o build && bun x crewhaus run crewhaus.yaml
+crewhaus compile crewhaus.yaml -o build && crewhaus run crewhaus.yaml
 ```
+
+`crewhaus` is open source under Apache-2.0 and published as a bare package on npm,
+Homebrew, Scoop, winget, and apt — see [Install](#install).
+
+## Install
+
+The fastest path is the self-contained binary — one file, no Bun/Node required:
+
+```bash
+# macOS / Linux (Homebrew)
+brew install crewhaus/tap/crewhaus
+
+# Windows (Scoop)
+scoop bucket add crewhaus https://github.com/crewhaus/scoop-bucket
+scoop install crewhaus
+
+# Windows (winget)
+winget install CrewHaus.CLI
+
+# Debian / Ubuntu (apt)
+curl -fsSL https://crewhaus.github.io/apt/key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/crewhaus.gpg
+echo "deb [signed-by=/usr/share/keyrings/crewhaus.gpg] https://crewhaus.github.io/apt stable main" | sudo tee /etc/apt/sources.list.d/crewhaus.list
+sudo apt update && sudo apt install crewhaus
+```
+
+Prefer npm? The `crewhaus` package runs on [Bun](https://bun.sh) ≥ 1.2:
+
+```bash
+npm install -g crewhaus        # global
+bun add -d crewhaus            # project-local dev dependency
+```
+
+Then confirm your install:
+
+```bash
+crewhaus --version
+```
+
+You can also grab a binary directly from the [GitHub Releases](https://github.com/crewhaus/factory/releases) page.
 
 ## Why CrewHaus?
 
@@ -52,13 +96,11 @@ Full architecture: [`AI-Harness-Systems.md`](https://github.com/crewhaus/docs/bl
 
 ## Quickstart
 
-Requires [Bun](https://bun.sh) ≥ 1.2.
+Install `crewhaus` (see [Install](#install)) — the binary needs no runtime; the npm package needs [Bun](https://bun.sh) ≥ 1.2.
 
 ```bash
-bun add -d @crewhaus/cli
-
 # Create a new agent project — writes a minimal `crewhaus.yaml`
-bun x crewhaus init my-agent
+crewhaus init my-agent
 cd my-agent
 ```
 

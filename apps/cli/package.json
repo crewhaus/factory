@@ -1,8 +1,22 @@
 {
-  "name": "@crewhaus/cli",
+  "name": "crewhaus",
   "version": "0.1.2",
   "type": "module",
-  "description": "factory CLI: compile, run, deploy harness specs",
+  "description": "CrewHaus — the meta-harness compiler for AI agents. Compile one crewhaus.yaml spec into a CLI agent, channel bot, RAG pipeline, multi-agent crew, eval harness, voice or browser agent, and more.",
+  "keywords": [
+    "crewhaus",
+    "ai",
+    "agent",
+    "agents",
+    "llm",
+    "compiler",
+    "meta-harness",
+    "cli",
+    "claude",
+    "anthropic",
+    "rag",
+    "eval"
+  ],
   "main": "src/index.ts",
   "bin": {
     "crewhaus": "src/index.ts"

@@ -1,36 +1,54 @@
-# @crewhaus/cli
+# crewhaus
 
 The [factory](https://github.com/crewhaus/factory) command line: compile, run, eval, and deploy agent harness specs (`crewhaus.yaml`).
 
 CrewHaus compiles one spec into the shape each situation calls for — a CLI agent, channel bot, RAG pipeline, multi-agent crew, eval bundle, and more. Every factory workflow starts with a `crewhaus` subcommand.
 
+> This is the bare, unscoped `crewhaus` package. (The earlier `@crewhaus/cli` name is deprecated and points here; the supporting libraries remain scoped under `@crewhaus/*`.)
+
 ## Install
 
-Requires [Bun](https://bun.sh) ≥ 1.2.
+The fastest path is the self-contained binary — one file, no Bun/Node required:
 
 ```bash
-bun add -d @crewhaus/cli
+brew install crewhaus/tap/crewhaus          # macOS / Linux (Homebrew)
+scoop install crewhaus                       # Windows (Scoop; see repo for the bucket)
+winget install CrewHaus.CLI                   # Windows (winget)
+# Debian / Ubuntu (apt): signed repo at https://crewhaus.github.io/apt
+```
+
+Or install from npm — this package runs on [Bun](https://bun.sh) ≥ 1.2:
+
+```bash
+npm install -g crewhaus        # global
+bun add -d crewhaus            # project-local dev dependency
+```
+
+Confirm it:
+
+```bash
+crewhaus --version
 ```
 
 ## Quickstart
 
 ```bash
 # Scaffold a starter spec
-bun x crewhaus init my-agent
+crewhaus init my-agent
 cd my-agent
 
 # Inspect the lowered IR — a quick sanity check of what the compiler sees
-bun x crewhaus compile crewhaus.yaml --emit-ir
+crewhaus compile crewhaus.yaml --emit-ir
 
 # Set a provider credential (the starter spec uses an Anthropic model;
 # --model accepts other providers, e.g. openai/<m>, gemini/<m>, local/<m>@<url>)
 export ANTHROPIC_API_KEY=sk-ant-...
 
 # Compile in-memory and run the agent
-bun x crewhaus run crewhaus.yaml
+crewhaus run crewhaus.yaml
 ```
 
-To emit a runnable bundle on disk instead, use `bun x crewhaus compile crewhaus.yaml -o build`.
+To emit a runnable bundle on disk instead, use `crewhaus compile crewhaus.yaml -o build`.
 
 ## Subcommands
 
