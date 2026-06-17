@@ -56,8 +56,10 @@ export function createRedisStreamsAdapter<TInput = unknown>(
       const res = await client.xreadgroup(
         opts.consumerGroup,
         opts.consumerName,
-        pullOpts.maxJobs ?? 10,
-        pullOpts.longPollMs ?? 0,
+        pullOpts.maxBatch,
+        // PullOptions carries no long-poll knob; read non-blocking and let the
+        // consumer drive polling cadence.
+        0,
         opts.streamKey,
         ">",
       );
@@ -75,8 +77,8 @@ export function createRedisStreamsAdapter<TInput = unknown>(
           out.push({
             id: m.id,
             input: parsed,
-            enqueuedAt: now,
-            visibilityExpiresAt: now + (pullOpts.visibilityTimeoutMs ?? 60_000),
+            enqueuedAt: new Date(now).toISOString(),
+            visibilityExpiresAt: new Date(now + pullOpts.visibilityTimeoutMs).toISOString(),
             attempt: 1,
           });
         }

@@ -238,7 +238,8 @@ async function* driveCrew(
   );
 
   const queue: CrewEvent[] = [];
-  let resolveNext: ((ev: CrewEvent | "done" | "error") => void) | null = null;
+  type NextResolver = (ev: CrewEvent | "done" | "error") => void;
+  let resolveNext: NextResolver | null = null;
   let driveError: unknown;
 
   function push(ev: CrewEvent): void {
@@ -336,7 +337,8 @@ async function* driveCrew(
   }
 
   // Pending handoff state (set by `requestHandoff`, drained by drive loop).
-  let pendingHandoff: { target: string; reason: string; context?: unknown } | undefined;
+  type PendingHandoff = { target: string; reason: string; context?: unknown };
+  let pendingHandoff: PendingHandoff | undefined;
   let currentRoleName = args.entry;
   let a2aDepth = 0;
 
@@ -525,16 +527,20 @@ async function* driveCrew(
 
         activations += 1;
 
-        if (pendingHandoff !== undefined) {
+        // `pendingHandoff` is set by the `requestHandoff` closure during the turn
+        // above. Control-flow analysis can't see that mutation, so it narrows the
+        // variable to the pre-turn `undefined` reset; assert the declared shape back.
+        const handoff = pendingHandoff as PendingHandoff | undefined;
+        if (handoff !== undefined) {
           consecutiveHandoffs += 1;
           if (consecutiveHandoffs > refusalDepth) {
             throw new HandoffRefusedError(`handoff refused (depth=${consecutiveHandoffs})`);
           }
           const ho: HandoffEventInternal = {
             from: currentRoleName,
-            to: pendingHandoff.target,
-            reason: pendingHandoff.reason,
-            ...(pendingHandoff.context !== undefined ? { context: pendingHandoff.context } : {}),
+            to: handoff.target,
+            reason: handoff.reason,
+            ...(handoff.context !== undefined ? { context: handoff.context } : {}),
           };
           push({
             kind: "handoff",
@@ -610,10 +616,13 @@ async function* driveCrew(
       driveError = err;
     } finally {
       await eventLog.close().catch(() => {});
-      if (resolveNext) {
-        const r = resolveNext;
+      // `resolveNext` is set by the consumer's Promise executor (a sibling closure);
+      // CFA narrows it to the initial `null` inside this drive loop, so assert the
+      // declared resolver-or-null shape back before draining it.
+      const pending = resolveNext as NextResolver | null;
+      if (pending) {
         resolveNext = null;
-        r(driveError !== undefined ? "error" : "done");
+        pending(driveError !== undefined ? "error" : "done");
       } else {
         // Mark sentinel by pushing a synthetic terminal so the consumer
         // exits the loop on next iteration.

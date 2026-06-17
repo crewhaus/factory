@@ -62,7 +62,7 @@ export function createPostgresAdapter<TInput = unknown>(
         FROM leased
         WHERE t.id = leased.id
         RETURNING t.id, t.payload, t.enqueued_at, t.visibility_expires_at, t.attempt`,
-        [pullOpts.maxJobs ?? 10],
+        [pullOpts.maxBatch],
       );
       const out: Job<TInput>[] = [];
       for (const row of result.rows) {
@@ -75,8 +75,8 @@ export function createPostgresAdapter<TInput = unknown>(
         out.push({
           id: row.id,
           input: parsed,
-          enqueuedAt: new Date(row.enqueued_at).getTime(),
-          visibilityExpiresAt: new Date(row.visibility_expires_at).getTime(),
+          enqueuedAt: new Date(row.enqueued_at).toISOString(),
+          visibilityExpiresAt: new Date(row.visibility_expires_at).toISOString(),
           attempt: row.attempt,
         });
       }

@@ -40,7 +40,7 @@ describe("sqs adapter — T2 contract", () => {
       region: "us-east-1",
       _client: client,
     });
-    const jobs = await adapter.pull({ maxJobs: 5, visibilityTimeoutMs: 30_000 });
+    const jobs = await adapter.pull({ maxBatch: 5, visibilityTimeoutMs: 30_000 });
     expect(jobs.length).toBe(1);
     expect(jobs[0]?.id).toBe("msg-1");
     expect(jobs[0]?.input).toEqual({ job: "value" });
@@ -62,7 +62,7 @@ describe("sqs adapter — T2 contract", () => {
       region: "us-east-1",
       _client: client,
     });
-    const jobs = await adapter.pull({});
+    const jobs = await adapter.pull({ maxBatch: 10, visibilityTimeoutMs: 60_000 });
     if (!jobs[0]) throw new Error("expected job");
     await adapter.ack(jobs[0].id);
     expect(deleteCalls).toBe(1);
@@ -84,7 +84,7 @@ describe("sqs adapter — T2 contract", () => {
       region: "r",
       _client: client,
     });
-    const jobs = await adapter.pull({});
+    const jobs = await adapter.pull({ maxBatch: 10, visibilityTimeoutMs: 60_000 });
     if (!jobs[0]) throw new Error("expected job");
     await adapter.nack(jobs[0].id, "transient");
     expect(resetTo).toBe(0);
@@ -106,7 +106,7 @@ describe("sqs adapter — T2 contract", () => {
       region: "r",
       _client: client,
     });
-    const jobs = await adapter.pull({});
+    const jobs = await adapter.pull({ maxBatch: 10, visibilityTimeoutMs: 60_000 });
     if (!jobs[0]) throw new Error("expected job");
     await adapter.nack(jobs[0].id, "permanent");
     const stats = await adapter.stats();
@@ -139,7 +139,7 @@ describe("redis-streams adapter — T2 contract", () => {
       consumerName: "c",
       _client: client,
     });
-    const jobs = await adapter.pull({ maxJobs: 1 });
+    const jobs = await adapter.pull({ maxBatch: 1, visibilityTimeoutMs: 60_000 });
     expect(jobs.length).toBe(1);
     expect(jobs[0]?.input).toEqual({ job: "value" });
   });
@@ -200,7 +200,7 @@ describe("postgres adapter — T2 contract", () => {
       },
     };
     const adapter = createPostgresAdapter({ tableName: "jobs", _client: client });
-    const jobs = await adapter.pull({ maxJobs: 5 });
+    const jobs = await adapter.pull({ maxBatch: 5, visibilityTimeoutMs: 60_000 });
     expect(jobs.length).toBe(1);
     expect(jobs[0]?.input).toEqual({ job: "value" });
     expect(queries[0]).toContain("FOR UPDATE SKIP LOCKED");
@@ -301,7 +301,7 @@ describe("sqs adapter — full lifecycle coverage", () => {
       }),
     });
     const adapter = createSqsAdapter({ queueUrl: "u", region: "r", _client: client });
-    const jobs = await adapter.pull({});
+    const jobs = await adapter.pull({ maxBatch: 10, visibilityTimeoutMs: 60_000 });
     expect(jobs.length).toBe(1);
     // JSON.parse throws → catch keeps the raw string.
     expect(jobs[0]?.input).toBe("not-json-at-all");
@@ -319,20 +319,20 @@ describe("sqs adapter — full lifecycle coverage", () => {
       }),
     });
     const adapter = createSqsAdapter({ queueUrl: "u", region: "r", _client: client });
-    const jobs = await adapter.pull({});
+    const jobs = await adapter.pull({ maxBatch: 10, visibilityTimeoutMs: 60_000 });
     expect(jobs.map((j) => j.id)).toEqual(["ok"]);
   });
 
   test("pull handles an empty receive (no Messages field)", async () => {
     const { client } = makeClient({ receiveMessage: async () => ({}) });
     const adapter = createSqsAdapter({ queueUrl: "u", region: "r", _client: client });
-    expect(await adapter.pull({})).toEqual([]);
+    expect(await adapter.pull({ maxBatch: 10, visibilityTimeoutMs: 60_000 })).toEqual([]);
   });
 
   test("nack(transient) resets visibility, drops the receipt, bumps nacked (lines 103-112)", async () => {
     const { client, visibilityChanges } = makeClient();
     const adapter = createSqsAdapter({ queueUrl: "u", region: "r", _client: client });
-    const [job] = await adapter.pull({});
+    const [job] = await adapter.pull({ maxBatch: 10, visibilityTimeoutMs: 60_000 });
     if (!job) throw new Error("expected job");
     await adapter.nack(job.id, "transient");
     expect(visibilityChanges).toEqual([{ ReceiptHandle: "rh-1", VisibilityTimeout: 0 }]);
@@ -348,7 +348,7 @@ describe("sqs adapter — full lifecycle coverage", () => {
   test("nack(permanent) deletes from main queue and bumps deadLetter+nacked", async () => {
     const { client, deleted } = makeClient();
     const adapter = createSqsAdapter({ queueUrl: "u", region: "r", _client: client });
-    const [job] = await adapter.pull({});
+    const [job] = await adapter.pull({ maxBatch: 10, visibilityTimeoutMs: 60_000 });
     if (!job) throw new Error("expected job");
     await adapter.nack(job.id, "permanent");
     expect(deleted).toEqual([{ QueueUrl: "u", ReceiptHandle: "rh-1" }]);
@@ -368,7 +368,7 @@ describe("sqs adapter — full lifecycle coverage", () => {
   test("extendVisibility pushes the lease forward (lines 114-122)", async () => {
     const { client, visibilityChanges } = makeClient();
     const adapter = createSqsAdapter({ queueUrl: "u", region: "r", _client: client });
-    const [job] = await adapter.pull({});
+    const [job] = await adapter.pull({ maxBatch: 10, visibilityTimeoutMs: 60_000 });
     if (!job) throw new Error("expected job");
     // 4500ms → ceil to 5 seconds.
     await adapter.extendVisibility(job.id, 4_500);
@@ -399,7 +399,7 @@ describe("sqs adapter — full lifecycle coverage", () => {
       }),
     });
     const adapter = createSqsAdapter({ queueUrl: "u", region: "r", _client: client });
-    await adapter.pull({});
+    await adapter.pull({ maxBatch: 10, visibilityTimeoutMs: 60_000 });
     const stats = await adapter.stats();
     expect(stats).toEqual({ pending: 0, inFlight: 2, acked: 0, nacked: 0, deadLetter: 0 });
   });
@@ -440,7 +440,7 @@ describe("redis-streams adapter — full lifecycle coverage", () => {
       consumerName: "c",
       _client: client,
     });
-    const jobs = await adapter.pull({ maxJobs: 1 });
+    const jobs = await adapter.pull({ maxBatch: 1, visibilityTimeoutMs: 60_000 });
     expect(jobs.length).toBe(1);
     expect(jobs[0]?.input).toBe("<<raw>>");
     expect(jobs[0]?.attempt).toBe(1);
@@ -459,7 +459,7 @@ describe("redis-streams adapter — full lifecycle coverage", () => {
       consumerName: "c",
       _client: client,
     });
-    const jobs = await adapter.pull({});
+    const jobs = await adapter.pull({ maxBatch: 10, visibilityTimeoutMs: 60_000 });
     expect(jobs.map((j) => j.id)).toEqual(["1-0", "2-0"]);
     expect(jobs[0]?.input).toEqual({});
     expect(jobs[1]?.input).toEqual({ x: 1 });
@@ -610,21 +610,21 @@ describe("postgres adapter — full lifecycle coverage", () => {
       ],
     }));
     const adapter = createPostgresAdapter({ tableName: "jobs", _client: client });
-    const jobs = await adapter.pull({ maxJobs: 1, visibilityTimeoutMs: 5_000 });
+    const jobs = await adapter.pull({ maxBatch: 1, visibilityTimeoutMs: 5_000 });
     expect(jobs.length).toBe(1);
     expect(jobs[0]?.input).toBe("definitely-not-json");
     expect(jobs[0]?.attempt).toBe(2);
-    // Timestamps are converted to epoch millis.
-    expect(jobs[0]?.enqueuedAt).toBe(0);
-    expect(jobs[0]?.visibilityExpiresAt).toBe(60_000);
+    // Timestamps are ISO8601 strings (per the Job contract).
+    expect(jobs[0]?.enqueuedAt).toBe(new Date(0).toISOString());
+    expect(jobs[0]?.visibilityExpiresAt).toBe(new Date(60_000).toISOString());
   });
 
   test("pull computes visibility seconds from ms (ceil) into the SQL", async () => {
     const { client, calls } = makeClient(() => ({ rows: [] }));
     const adapter = createPostgresAdapter({ tableName: "jobs", _client: client });
-    await adapter.pull({ visibilityTimeoutMs: 1_500 }); // ceil(1500/1000) = 2
+    await adapter.pull({ maxBatch: 10, visibilityTimeoutMs: 1_500 }); // ceil(1500/1000) = 2
     expect(calls[0]?.text).toContain("INTERVAL '2 seconds'");
-    expect(calls[0]?.params).toEqual([10]); // default maxJobs
+    expect(calls[0]?.params).toEqual([10]); // maxBatch flows into LIMIT
   });
 
   test("nack(transient) UPDATEs visibility to NOW and bumps nacked (lines 101-107)", async () => {
