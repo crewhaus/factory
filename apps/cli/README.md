@@ -11,7 +11,7 @@ CrewHaus compiles one spec into the shape each situation calls for — a CLI age
 The fastest path is the self-contained binary — one file, no Bun/Node required:
 
 ```bash
-brew install crewhaus/tap/crewhaus                      # macOS / Linux (Homebrew)
+brew tap crewhaus/tap && brew install crewhaus          # macOS / Linux (Homebrew)
 scoop install crewhaus                       # Windows (Scoop; see repo for the bucket)
 winget install CrewHaus.CLI                   # Windows (winget)
 # Debian / Ubuntu (apt): signed repo at https://crewhaus.github.io/apt
