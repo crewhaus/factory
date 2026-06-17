@@ -16,7 +16,7 @@ This document covers:
 
 Use the [Bug report template](.github/ISSUE_TEMPLATE/bug_report.yml). A good bug report includes:
 
-- The commit SHA of factory you're on (run `git rev-parse HEAD`), and the CLI version if you installed it (run `crewhaus --version`). The CLI ships as the bare `crewhaus` package — `npm install -g crewhaus` or `bun add -d crewhaus` (needs Bun >= 1.2), or a self-contained binary via Homebrew (`brew tap crewhaus/tap && brew install crewhaus`), Scoop, winget, or apt. See [`PACKAGES.md`](PACKAGES.md) for publish status.
+- The commit SHA of factory you're on (run `git rev-parse HEAD`), and the CLI version if you installed it (run `crewhaus --version`). The CLI ships as the bare `crewhaus` package — `npm install -g crewhaus` or `bun add -d crewhaus` (needs Bun >= 1.2), or a self-contained binary via Homebrew (`brew install crewhaus/tap/crewhaus`), Scoop, winget, or apt. See [`PACKAGES.md`](PACKAGES.md) for publish status.
 - Your `spec.yaml` (or a minimal reduction of it)
 - What you ran (`crewhaus compile`, `crewhaus run`, etc.)
 - What you expected to happen
