@@ -9,6 +9,12 @@
  *   bun scripts/release-prep.ts --version 0.1.3            # stamp every package (lockstep)
  *   bun scripts/release-prep.ts --version 0.1.3 --check    # diff-only, no writes
  *   bun scripts/release-prep.ts --version 0.1.3 --access restricted   # override access
+ *   bun scripts/release-prep.ts --version 0.1.3 --for-publish         # also flip src→dist entrypoints (CI publish only)
+ *
+ * The bare `--version` form is what the in-repo lockstep bump commit runs (entrypoints
+ * stay on src so the Bun dev flow needs no build). `--for-publish` is the CI-only form:
+ * the Release workflow runs `bun run build` then this with `--for-publish`, so the packed
+ * tarball ships compiled dist/*.js + .d.ts. Never commit the `--for-publish` output.
  *
  * `--version` is REQUIRED — there is no safe default for a flag that stamps
  * every publishable package (a bare run used to silently downgrade the whole
@@ -34,13 +40,20 @@ const versionFlag = flag("version");
 if (versionFlag === undefined) {
   console.error("✗ --version is required: it stamps EVERY publishable package in lockstep.");
   console.error(
-    "  Usage: bun scripts/release-prep.ts --version <semver> [--access public|restricted] [--check] [--root <dir>]",
+    "  Usage: bun scripts/release-prep.ts --version <semver> [--access public|restricted] [--for-publish] [--check] [--root <dir>]",
   );
   process.exit(1);
 }
 const TARGET_VERSION = versionFlag;
 const ACCESS = (flag("access") ?? "public") as "restricted" | "public";
 const CHECK = has("check");
+// --for-publish additionally rewrites entrypoints (main/types/exports/bin) and the
+// `files` allowlist from src/*.ts to the compiled dist/*.js + .d.ts, so the packed
+// tarball is loadable under plain Node (no TS type-stripping). This is a PUBLISH-ONLY
+// transform — the committed tree stays on src/ so the Bun dev flow needs no build step.
+// The release workflow runs `bun run build` before this and publishes the dist output;
+// a bare `--version` run (the in-repo lockstep version bump) must NOT pass this flag.
+const FOR_PUBLISH = has("for-publish");
 const ROOT = resolve(flag("root") ?? process.cwd());
 
 const AUTHOR = {
@@ -78,6 +91,52 @@ function readJson(path: string): Json {
 
 function writeJson(path: string, data: Json) {
   writeFileSync(path, `${JSON.stringify(data, null, 2)}\n`);
+}
+
+// ─── --for-publish: rewrite src entrypoints to their compiled dist outputs ────
+// tsconfig builds `src/*.ts` (rootDir) → `dist/*.js` + `dist/*.d.ts` (outDir).
+
+/** "./src/index.ts" → "./dist/index.js"; "src/foo.ts" → "dist/foo.js" (preserves ./). */
+function toDist(p: string, ext: ".js" | ".d.ts"): string {
+  const dotSlash = p.startsWith("./");
+  const rel = p
+    .replace(/^\.\//, "")
+    .replace(/^src\//, "dist/")
+    .replace(/\.tsx?$/, ext === ".js" ? ".js" : ".d.ts");
+  return dotSlash ? `./${rel}` : rel;
+}
+
+/** A single exports target: "./src/x.ts" → { types, import }; conditional objects remap in place. */
+function distExportTarget(value: unknown): unknown {
+  if (typeof value === "string") {
+    return /\.tsx?$/.test(value)
+      ? { types: toDist(value, ".d.ts"), import: toDist(value, ".js") }
+      : value;
+  }
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [cond, v] of Object.entries(value as Record<string, unknown>)) {
+      out[cond] =
+        typeof v === "string" && /\.tsx?$/.test(v)
+          ? toDist(v, cond === "types" ? ".d.ts" : ".js")
+          : distExportTarget(v);
+    }
+    return out;
+  }
+  return value;
+}
+
+/** bin: "src/index.ts" or { name: "src/index.ts" } → dist/index.js. */
+function distBin(bin: unknown): unknown {
+  if (typeof bin === "string") return /\.tsx?$/.test(bin) ? toDist(bin, ".js") : bin;
+  if (bin && typeof bin === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [name, v] of Object.entries(bin as Record<string, unknown>)) {
+      out[name] = typeof v === "string" && /\.tsx?$/.test(v) ? toDist(v, ".js") : v;
+    }
+    return out;
+  }
+  return bin;
 }
 
 /** Get glob-expanded list of package dirs from workspace root. */
@@ -173,6 +232,25 @@ function applyRelease(pkg: Json, pkgDir: string, isRoot: boolean): boolean {
   // files (default to src + README + LICENSE; respect existing if present)
   if (pkg.files === undefined) {
     set("files", ["src", "README.md", "LICENSE", "NOTICE"]);
+  }
+
+  // --for-publish: flip entrypoints + the packed `files` from src → built dist so the
+  // tarball is plain-Node loadable. Internal deps stay `workspace:*` (untouched here);
+  // `bun publish` resolves those to the concrete cut version at pack time.
+  if (FOR_PUBLISH) {
+    if (typeof pkg.main === "string") set("main", toDist(pkg.main, ".js"));
+    if (typeof pkg.types === "string") set("types", toDist(pkg.types, ".d.ts"));
+    if (pkg.exports && typeof pkg.exports === "object") {
+      const next: Record<string, unknown> = {};
+      for (const [key, val] of Object.entries(pkg.exports as Record<string, unknown>)) {
+        next[key] = distExportTarget(val);
+      }
+      set("exports", next);
+    } else if (typeof pkg.exports === "string") {
+      set("exports", distExportTarget(pkg.exports));
+    }
+    if (pkg.bin !== undefined) set("bin", distBin(pkg.bin));
+    set("files", ["dist", "README.md", "LICENSE", "NOTICE"]);
   }
 
   return changed;
