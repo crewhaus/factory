@@ -60,9 +60,10 @@ export function createSqsAdapter<TInput = unknown>(opts: SqsAdapterOptions): Que
     async pull(pullOpts: PullOptions): Promise<ReadonlyArray<Job<TInput>>> {
       const result = await client.receiveMessage({
         QueueUrl: opts.queueUrl,
-        MaxNumberOfMessages: Math.min(10, pullOpts.maxJobs ?? 10),
-        VisibilityTimeout: Math.ceil((pullOpts.visibilityTimeoutMs ?? 60_000) / 1000),
-        WaitTimeSeconds: Math.ceil((pullOpts.longPollMs ?? 0) / 1000),
+        MaxNumberOfMessages: Math.min(10, pullOpts.maxBatch),
+        VisibilityTimeout: Math.ceil(pullOpts.visibilityTimeoutMs / 1000),
+        // PullOptions carries no long-poll knob; use SQS short polling.
+        WaitTimeSeconds: 0,
       });
       const out: Job<TInput>[] = [];
       const now = Date.now();
@@ -78,8 +79,8 @@ export function createSqsAdapter<TInput = unknown>(opts: SqsAdapterOptions): Que
         out.push({
           id: m.MessageId,
           input: parsed,
-          enqueuedAt: now,
-          visibilityExpiresAt: now + (pullOpts.visibilityTimeoutMs ?? 60_000),
+          enqueuedAt: new Date(now).toISOString(),
+          visibilityExpiresAt: new Date(now + pullOpts.visibilityTimeoutMs).toISOString(),
           attempt: 1,
         });
       }
