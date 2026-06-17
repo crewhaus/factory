@@ -49,6 +49,46 @@ External sources synthesized for this batch:
 - `bun run test:smoke`: 17/17 pass.
 - Full unit suite: 6016 pass / 0 fail / 2 skip across 440 files.
 
+## [0.1.4] - 2026-06-17
+
+Small CLI/compiler/runtime fixes, each retiring a documented "gotcha" by fixing the
+underlying footgun.
+
+### Fixed
+
+- **Compiler — malformed credential env-refs fail fast.** A new `lowerCredential()` rejects
+  a `$`-prefixed value that is not valid `$UPPER_SNAKE_CASE` on credential fields (channel
+  `botToken`/`signingSecret`/`appToken`, Telegram/Discord/WhatsApp secrets, `retrieve.apiKey`)
+  with a clear compile error instead of silently baking it into the bundle as a literal. The
+  lenient literal fallback survives only for iMessage path fields (`chatDbPath`/`cursorPath`),
+  where a literal `$HOME/...` is legitimate. The `compile` `--emit-ir` and strict-gate catches
+  now route the `CrewhausError` family through `die()`, so it renders as a clean `crewhaus:`
+  one-liner on every path.
+- **CLI — `crewhaus --help`/`-h` exit 0 to stdout** (matching subcommand help); a bare
+  `crewhaus` with no args still exits 1. Safe in `set -e` health checks.
+- **secrets-manager — file backend `rotate()` auto-creates its root dir** (recursive, `0o700`)
+  instead of crashing with a raw `ENOENT` on a fresh project.
+- **CLI — `secrets --backend vault` errors clearly** instead of silently degrading to the
+  env-var backend; unknown backends are rejected; help text lists only `--backend env-var|file`.
+- **runtime-core — `cost_accrual` is mirrored into the session JSONL** when
+  `CREWHAUS_COST_TRACKING` is set (gated; the FR-003 terminal aggregate is skipped to avoid
+  double-counting), added to the event-log `EventKind` union, and ignored by
+  `replayMessageHistory`, so `crewhaus cost-summary --session` sums a tracked run's spend.
+
+### Added
+
+- **Channel reactions for Telegram and WhatsApp.** `react()` is now implemented for Telegram
+  (`setMessageReaction`, status emoji mapped to Telegram's allowed set) and WhatsApp
+  (`type:"reaction"` targeting the inbound message id), joining Slack. Discord (whose inbound
+  is an interaction, not a message) and iMessage (no scriptable reaction API) remain
+  unimplemented; the session router still skips them silently (best-effort).
+
+### Changed
+
+- **vad-engine** — `DetectorOptions.sampleRate` is documented as reserved / no-resample.
+- **spec** — the Slack `appToken` field carries a Zod `.describe()` marking it reserved for a
+  future Socket Mode path (parsed but unused by the v0 webhook daemon).
+
 ## [0.1.0] - 2026-05-15
 
 ### Added

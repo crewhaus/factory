@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/exporter-splunk",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "type": "module",
   "description": "Splunk Observability Cloud OTLP exporter — wraps @crewhaus/otel-exporter with X-SF-TOKEN auth + realm routing (Section 37)",
   "main": "src/index.ts",

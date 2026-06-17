@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/exporter-honeycomb",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "type": "module",
   "description": "Honeycomb OTLP exporter — wraps @crewhaus/otel-exporter with x-honeycomb-team header + dataset routing (Section 37)",
   "main": "src/index.ts",

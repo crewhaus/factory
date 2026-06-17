@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/target-cli",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "type": "module",
   "description": "Codegen backend for CLI target (Claude Code-style coding agent)",
   "main": "src/index.ts",

@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/plugin-registry",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "type": "module",
   "description": "Plugin discovery + version pinning + signature verification + capability declaration (Section 42)",
   "main": "src/index.ts",

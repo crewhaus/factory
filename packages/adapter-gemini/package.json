@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/adapter-gemini",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "type": "module",
   "description": "Google Gemini provider adapter (Section 17). Thinking-mode + function calls",
   "main": "src/index.ts",

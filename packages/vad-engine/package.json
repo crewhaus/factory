@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/vad-engine",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "type": "module",
   "description": "Voice activity detection — energy + ZCR heuristic over PCM 16-bit frames (Section 24 VOICE)",
   "main": "src/index.ts",
