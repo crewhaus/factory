@@ -136,9 +136,18 @@ jobs:
       - name: Publish (crewhaus + @crewhaus/*)
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          # `bun publish` does NOT read ~/.npmrc's `_authToken` (verified: on the
+          # bun 1.3.14 CI runner, `npm whoami` authenticates via .npmrc but every
+          # `bun publish` dies with "missing authentication (run `bunx npm
+          # login`)"). bun authenticates ONLY via NPM_CONFIG_TOKEN — see the
+          # preflight in scripts/publish-workspace.ts. NPM_TOKEN is a classic npm
+          # *Automation* token (2FA-exempt), so there is no web-OTP prompt.
+          NPM_CONFIG_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          # Authenticate npm + bun via .npmrc (NPM_CONFIG_TOKEN sets the legacy
-          # `token` config, which `npm whoami` does not accept in CI).
+          # Conversely, the script's `npm whoami` preflight and `npm view`
+          # ownership/skip checks IGNORE NPM_CONFIG_TOKEN (npm warns "Unknown env
+          # config token") — they need the .npmrc `_authToken`. So write BOTH:
+          # .npmrc for the npm calls, NPM_CONFIG_TOKEN (above) for bun publish.
           echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > ~/.npmrc
           bun scripts/publish-workspace.ts
 
