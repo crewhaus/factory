@@ -8,7 +8,7 @@ Compile a single spec (a `crewhaus.yaml`) into a CLI agent, channel bot, RAG pip
 
 ```bash
 # Install the standalone binary — no runtime required:
-brew tap crewhaus/tap && brew install crewhaus          # macOS / Linux (Homebrew)
+brew install crewhaus/tap/crewhaus                      # macOS / Linux (Homebrew)
 # Windows: scoop install crewhaus · winget install CrewHaus.CLI
 # Debian/Ubuntu (apt) and npm/Bun: see "Install" below
 
@@ -27,7 +27,7 @@ The fastest path is the self-contained binary — one file, no Bun/Node required
 
 ```bash
 # macOS / Linux (Homebrew)
-brew tap crewhaus/tap && brew install crewhaus
+brew install crewhaus/tap/crewhaus
 
 # Windows (Scoop)
 scoop bucket add crewhaus https://github.com/crewhaus/scoop-bucket

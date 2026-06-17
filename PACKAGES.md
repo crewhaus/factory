@@ -21,7 +21,7 @@ The flagship CLI ships as the unscoped **`crewhaus`** package across **five chan
 npm install -g crewhaus        # or: bun add -d crewhaus
 
 # Homebrew (macOS / Linux)
-brew tap crewhaus/tap && brew install crewhaus
+brew install crewhaus/tap/crewhaus
 
 # Scoop (Windows)
 scoop bucket add crewhaus https://github.com/crewhaus/scoop-bucket && scoop install crewhaus
