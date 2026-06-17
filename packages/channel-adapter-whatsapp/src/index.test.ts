@@ -290,6 +290,31 @@ describe("sendReply / setTyping (T3)", () => {
     await a.setTyping({ event });
     expect(calls.length).toBe(0);
   });
+
+  test("react POSTs a type:reaction message targeting the inbound message id", async () => {
+    const { calls, fetch: f } = captureFetch();
+    const a = adapter({ fetch: f });
+    expect(a.react).toBeDefined();
+    await a.react?.({ event, emoji: "white_check_mark" });
+    expect(calls.length).toBe(1);
+    expect(calls[0]?.url).toBe(`https://test.graph.local/v22.0/${PHONE_NUMBER_ID}/messages`);
+    const body = JSON.parse(String(calls[0]?.init.body));
+    expect(body.type).toBe("reaction");
+    expect(body.to).toBe("15554443333");
+    expect(body.reaction).toEqual({ message_id: "wamid.xx", emoji: "✅" });
+    const auth = (calls[0]?.init.headers as Record<string, string> | undefined)?.["Authorization"];
+    expect(auth).toBe(`Bearer ${ACCESS_TOKEN}`);
+  });
+
+  test("react throws on a Meta-side error envelope (router swallows it)", async () => {
+    const f = (async () =>
+      new Response(JSON.stringify({ error: { message: "message not found" } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      })) as unknown as typeof fetch;
+    const a = adapter({ fetch: f });
+    await expect(a.react?.({ event, emoji: "eyes" })).rejects.toThrow(/message not found/);
+  });
 });
 
 describe("createWhatsAppAdapter.verify()", () => {

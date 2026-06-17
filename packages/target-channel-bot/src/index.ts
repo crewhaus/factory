@@ -451,9 +451,10 @@ export function createSessionRouter(config: SessionRouterConfig): SessionRouter 
         });
       }
       // Phase 3 §3.2 — emoji status reactions. Best-effort: a reaction
-      // API failure should not block the model turn. Adapters that
-      // haven't implemented react() (telegram/discord/whatsapp/imessage
-      // pending) silently skip.
+      // API failure should not block the model turn. Slack, Telegram, and
+      // WhatsApp implement react(); Discord (interaction-based, no message to
+      // react to) and iMessage (no scriptable reaction API) leave it
+      // undefined and the hook silently skips.
       const tryReact = async (emoji: string): Promise<void> => {
         if (!adapter.react) return;
         try {

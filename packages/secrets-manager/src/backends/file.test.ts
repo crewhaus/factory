@@ -54,6 +54,9 @@ mock.module("node:fs", () => ({
     }
     fsState.renames.push({ from, to });
   },
+  mkdirSync: (p: string, _opts?: { recursive?: boolean; mode?: number }) => {
+    fsState.dirs.add(p);
+  },
   readdirSync: (p: string) => {
     if (!fsState.dirs.has(p)) {
       const err = new Error(`ENOENT: no such dir ${p}`) as NodeJS.ErrnoException;
@@ -151,6 +154,18 @@ describe("file backend — rotate()", () => {
     const backend = createFileBackend({ rootDir: ROOT });
     expect(backend.rotate("path/with/slash")).rejects.toBeInstanceOf(SecretsError);
     expect(fsState.writes.length).toBe(0);
+  });
+
+  test("creates the root dir on first rotate instead of failing with ENOENT", async () => {
+    const freshRoot = "/fake/brand-new/secrets";
+    expect(fsState.dirs.has(freshRoot)).toBe(false);
+    const backend = createFileBackend({ rootDir: freshRoot });
+
+    const v = await backend.rotate("TOKEN", { newValue: "fresh" });
+
+    expect(v).toBe("fresh");
+    expect(fsState.dirs.has(freshRoot)).toBe(true);
+    expect(fsState.files.get(`${freshRoot}/TOKEN`)?.content).toBe("fresh");
   });
 });
 

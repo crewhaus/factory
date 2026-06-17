@@ -195,6 +195,12 @@ export function createDiscordAdapter(
       }
     },
 
+    // Note: no `react()` hook. Discord's inbound is an *interaction* (slash
+    // command / component / modal), not a channel message, and `event.ts` is
+    // the interaction id — there is no user message to attach a reaction to.
+    // The session-router skips the (undefined) react hook silently, so status
+    // acks simply don't appear on Discord. (Slack/Telegram/WhatsApp implement
+    // react(); iMessage cannot.)
     async setTyping(args: { event: InboundEvent }): Promise<void> {
       const url = `${apiBaseUrl}/channels/${args.event.channelId}/typing`;
       // Best-effort — do not surface failures. A failed typing indicator must

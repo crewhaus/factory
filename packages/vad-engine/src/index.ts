@@ -31,7 +31,14 @@ export type VadVerdict = "speech" | "silence" | "transitioning";
 
 export type DetectorOptions = {
   readonly aggressiveness?: Aggressiveness;
-  /** Sample rate of incoming PCM (Hz). Default 24kHz. */
+  /**
+   * Sample rate of incoming PCM (Hz). RESERVED — currently has no effect on
+   * detection: the energy thresholds and zero-crossing band below are
+   * sample-rate-independent, and the detector does NOT resample. The option is
+   * accepted for forward compatibility (a planned band-pass filter stage). Pass
+   * it for clarity if you like, but do not infer any resampling behaviour from
+   * it.
+   */
   readonly sampleRate?: number;
 };
 

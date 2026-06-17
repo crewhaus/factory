@@ -64,7 +64,7 @@ import { executeTool } from "@crewhaus/tool-executor";
 import { type LoopDetection, detectLoop } from "@crewhaus/tool-loop-detection";
 import { partitionToolCalls } from "@crewhaus/tool-orchestrator";
 import { storeAndPreview } from "@crewhaus/tool-result-store";
-import { TraceEventBus } from "@crewhaus/trace-event-bus";
+import { type CostAccrualEvent, TraceEventBus, type Unsubscribe } from "@crewhaus/trace-event-bus";
 import {
   type ToolUseBlock as TsmToolUseBlock,
   type TurnState,
@@ -744,6 +744,42 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   };
 
   const eventLog: EventLog = await openEventLog(sessionId, { rootDir: sessionRootDir });
+
+  // Section 27 — mirror per-call cost_accrual events from the trace bus into
+  // the session JSONL so `crewhaus cost-summary --session <id>` can sum spend
+  // after the run. Gated on the same switch that attaches the cost-tracker
+  // (CREWHAUS_COST_TRACKING): no tracker → no accruals to persist, and the
+  // message-only transcript stays unchanged by default. Per-call accruals only
+  // — skip the FR-003 terminal `summary` aggregate so a run total never
+  // double-counts. `append()` writes synchronously, and a persist failure must
+  // never abort a turn, so the result is logged rather than thrown.
+  let costPersistUnsubscribe: Unsubscribe | undefined;
+  if (subscribers.costTracker !== undefined) {
+    costPersistUnsubscribe = bus.subscribe((event): void => {
+      if (event.kind !== "cost_accrual") return;
+      const ev = event as CostAccrualEvent;
+      if (ev.summary === true) return;
+      void eventLog
+        .append({
+          kind: "cost_accrual",
+          payload: {
+            provider: ev.provider,
+            modelId: ev.modelId,
+            ...(ev.specModel !== undefined ? { specModel: ev.specModel } : {}),
+            inputTokens: ev.inputTokens,
+            outputTokens: ev.outputTokens,
+            cachedReadTokens: ev.cachedReadTokens,
+            costUsdMicros: ev.costUsdMicros,
+            ...(ev.tenantId !== undefined ? { tenantId: ev.tenantId } : {}),
+          },
+        })
+        .catch((err) => {
+          runContext.logger.error("cost_accrual.persist_failed", {
+            message: err instanceof Error ? err.message : String(err),
+          });
+        });
+    });
+  }
 
   // Per-run state container — coordination surface for hooks/skills/tools
   // landing in Section 11+. Section 10 only ships the plumbing; the
@@ -1999,6 +2035,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       });
       await subscribers.flushAll();
       await subscribers.shutdownAll();
+      costPersistUnsubscribe?.();
       await sessionStore
         .update(sessionId, { lastTurnIndex: runContext.turnNumber })
         .catch((err) => {
@@ -2212,6 +2249,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     });
     await subscribers.flushAll();
     await subscribers.shutdownAll();
+    costPersistUnsubscribe?.();
     if (shouldInstallSigint) {
       process.removeListener("SIGINT", sigintHandler);
     }

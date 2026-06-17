@@ -1630,6 +1630,73 @@ routing:
     expect(ir.channels.slack?.appToken).toEqual({ kind: "env", name: "SLACK_APP" });
   });
 
+  test("rejects a credential field that looks like a malformed env ref instead of baking it as a literal", () => {
+    // A value starting with `$` that is not a valid `$UPPER_SNAKE` env ref is
+    // almost always a typo'd reference (lowercase, leading digit, ${...} braces)
+    // — it must fail compilation rather than silently ship a broken credential.
+    for (const bad of ["$slack_token", "$1PASSWORD", "${SLACK_BOT_TOKEN}"]) {
+      expect(() =>
+        compile(`
+name: ch
+target: channel
+agent:
+  model: m
+  instructions: i
+channels:
+  slack:
+    botToken: "${bad}"
+    signingSecret: $SLACK_SIGN
+routing:
+  sessionKey: thread
+`),
+      ).toThrow(/looks like an environment reference but is not a valid one/);
+    }
+  });
+
+  test("a genuine literal credential (no leading $) still lowers to a literal", () => {
+    const ir = lower(
+      parseSpec(`
+name: ch
+target: channel
+agent:
+  model: m
+  instructions: i
+channels:
+  slack:
+    botToken: xoxb-real-literal
+    signingSecret: deadbeef
+routing:
+  sessionKey: thread
+`),
+    );
+    if (ir.target !== "channel") throw new Error("unexpected target");
+    expect(ir.channels.slack?.botToken).toEqual({ kind: "literal", value: "xoxb-real-literal" });
+  });
+
+  test("imessage path fields keep permissive lowering (a $-prefixed path is a literal, not an error)", () => {
+    // Path-like fields are NOT credential-shaped: a literal value such as
+    // `$HOME/Library/...` is legitimate and must not trip the strict check.
+    const ir = lower(
+      parseSpec(`
+name: ch
+target: channel
+agent:
+  model: m
+  instructions: i
+channels:
+  imessage:
+    chatDbPath: $HOME/Library/Messages/chat.db
+routing:
+  sessionKey: thread
+`),
+    );
+    if (ir.target !== "channel") throw new Error("unexpected target");
+    expect(ir.channels.imessage?.chatDbPath).toEqual({
+      kind: "literal",
+      value: "$HOME/Library/Messages/chat.db",
+    });
+  });
+
   test("omits empty imessage config (no chatDbPath/cursorPath) — both optional", () => {
     const ir = lower(
       parseSpec(`

@@ -568,6 +568,82 @@ describe("sendReply / setTyping (T3)", () => {
   });
 });
 
+describe("react (Phase 3 §3.2)", () => {
+  function captureFetch() {
+    const calls: Array<{ url: string; init: RequestInit }> = [];
+    const f = (async (input: string | Request | URL, init?: RequestInit) => {
+      calls.push({ url: String(input), init: init ?? {} });
+      return new Response(JSON.stringify({ ok: true, result: true }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }) as unknown as typeof fetch;
+    return { calls, fetch: f };
+  }
+
+  const event: InboundEvent = {
+    idempotencyKey: "100001",
+    workspaceId: "4242",
+    channelId: "4242",
+    userId: "4242",
+    ts: "7",
+    text: "hello",
+    subtype: "message",
+  };
+
+  test("posts setMessageReaction with chat_id, message_id, and a mapped allowed emoji", async () => {
+    const { calls, fetch: f } = captureFetch();
+    const a = createTelegramAdapter(
+      { botToken: BOT_TOKEN, secretToken: SECRET },
+      { apiBaseUrl: "https://test.telegram.local", fetch: f },
+    );
+    expect(a.react).toBeDefined();
+    await a.react?.({ event, emoji: "eyes" });
+    expect(calls.length).toBe(1);
+    expect(calls[0]?.url).toBe(`https://test.telegram.local/bot${BOT_TOKEN}/setMessageReaction`);
+    const body = JSON.parse(String(calls[0]?.init.body));
+    expect(body.chat_id).toBe(4242);
+    expect(body.message_id).toBe(7);
+    expect(body.reaction).toEqual([{ type: "emoji", emoji: "👀" }]);
+  });
+
+  test("maps white_check_mark/warning to Telegram-allowed emoji", async () => {
+    const { calls, fetch: f } = captureFetch();
+    const a = createTelegramAdapter(
+      { botToken: BOT_TOKEN, secretToken: SECRET },
+      { apiBaseUrl: "https://test.telegram.local", fetch: f },
+    );
+    await a.react?.({ event, emoji: "white_check_mark" });
+    await a.react?.({ event, emoji: "warning" });
+    expect(JSON.parse(String(calls[0]?.init.body)).reaction[0].emoji).toBe("👍");
+    expect(JSON.parse(String(calls[1]?.init.body)).reaction[0].emoji).toBe("😱");
+  });
+
+  test("rejects when chat/message id is not numeric", async () => {
+    const { fetch: f } = captureFetch();
+    const a = createTelegramAdapter(
+      { botToken: BOT_TOKEN, secretToken: SECRET },
+      { apiBaseUrl: "https://test.telegram.local", fetch: f },
+    );
+    await expect(a.react?.({ event: { ...event, ts: "nope" }, emoji: "eyes" })).rejects.toThrow(
+      TelegramAdapterError,
+    );
+  });
+
+  test("throws on Telegram-side ok:false (router swallows it)", async () => {
+    const f = (async () =>
+      new Response(JSON.stringify({ ok: false, description: "REACTION_INVALID" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      })) as unknown as typeof fetch;
+    const a = createTelegramAdapter(
+      { botToken: BOT_TOKEN, secretToken: SECRET },
+      { apiBaseUrl: "https://test.telegram.local", fetch: f },
+    );
+    await expect(a.react?.({ event, emoji: "eyes" })).rejects.toThrow(/REACTION_INVALID/);
+  });
+});
+
 describe("apiBaseUrl resolution", () => {
   const event: InboundEvent = {
     idempotencyKey: "1",

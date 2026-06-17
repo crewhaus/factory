@@ -20,6 +20,7 @@
  *
  * sendReply: POST to `https://api.telegram.org/bot<token>/sendMessage`.
  * setTyping: POST `sendChatAction` with `action=typing`.
+ * react: POST `setMessageReaction` (Bot API 7.0) — best-effort status emoji.
  */
 import { CrewhausError } from "@crewhaus/errors";
 import { verifyTelegramSecret } from "./verify.js";
@@ -75,6 +76,14 @@ export interface ChannelAdapter {
   parseInbound(req: RawRequest): ParsedInbound;
   sendReply(args: { event: InboundEvent; text: string }): Promise<void>;
   setTyping(args: { event: InboundEvent }): Promise<void>;
+  /**
+   * Phase 3 §3.2 — add an emoji reaction to an inbound message as a
+   * lightweight status acknowledgement (eyes/white_check_mark/warning).
+   * Telegram restricts reactions to a fixed emoji set, so the channel-generic
+   * status names are mapped to the nearest allowed reaction. Optional — the
+   * session-router skips the hook when an adapter leaves it undefined.
+   */
+  react?(args: { event: InboundEvent; emoji: string }): Promise<void>;
 }
 
 export type TelegramAdapterConfig = {
@@ -89,6 +98,15 @@ export type TelegramAdapterOptions = {
 };
 
 const DEFAULT_API_BASE_URL = "https://api.telegram.org";
+
+// Telegram's `setMessageReaction` only accepts emoji from a fixed allowed set
+// (✅ and ⚠️ are NOT in it), so map the channel-generic status names to the
+// nearest allowed reaction. An unrecognised name is passed through verbatim.
+const TELEGRAM_REACTION_EMOJI: Record<string, string> = {
+  eyes: "👀",
+  white_check_mark: "👍",
+  warning: "😱",
+};
 
 export function createTelegramAdapter(
   config: TelegramAdapterConfig,
@@ -241,6 +259,45 @@ export function createTelegramAdapter(
         body: JSON.stringify(body),
       });
       // setTyping is best-effort; a non-200 here should not fail the run.
+    },
+
+    // Phase 3 §3.2 — emoji reactions via Bot API 7.0 `setMessageReaction`.
+    // chat_id comes from the raw chat id (workspaceId); message_id from `ts`.
+    async react(args: { event: InboundEvent; emoji: string }): Promise<void> {
+      const url = botEndpoint("setMessageReaction");
+      const chatId = Number.parseInt(args.event.workspaceId, 10);
+      const messageId = Number.parseInt(args.event.ts, 10);
+      if (!Number.isFinite(chatId) || !Number.isFinite(messageId)) {
+        throw new TelegramAdapterError(
+          `invalid chat/message id for reaction: ${args.event.workspaceId}/${args.event.ts}`,
+        );
+      }
+      const emoji = TELEGRAM_REACTION_EMOJI[args.emoji] ?? args.emoji;
+      const res = await doFetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chat_id: chatId,
+          message_id: messageId,
+          reaction: [{ type: "emoji", emoji }],
+        }),
+      });
+      // Reactions are best-effort — the session-router catches and continues so
+      // a flaky/disallowed reaction never aborts message processing.
+      if (!res.ok) {
+        throw new TelegramAdapterError(
+          `setMessageReaction failed: ${res.status} ${res.statusText}`,
+        );
+      }
+      const ct = res.headers.get("content-type") ?? "";
+      if (ct.includes("application/json")) {
+        const json = (await res.json()) as { ok?: boolean; description?: string };
+        if (json.ok === false) {
+          throw new TelegramAdapterError(
+            `setMessageReaction error: ${json.description ?? "unknown"}`,
+          );
+        }
+      }
     },
   };
 }
