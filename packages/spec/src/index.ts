@@ -500,7 +500,16 @@ const slackChannelSchema = z
   .object({
     botToken: z.string().min(1),
     signingSecret: z.string().min(1),
-    appToken: z.string().min(1).optional(),
+    // Reserved for a future Socket Mode listener. The v0 webhook daemon parses
+    // and carries this field but does not use it, so it is documented as
+    // reserved rather than implying an unimplemented requirement.
+    appToken: z
+      .string()
+      .min(1)
+      .optional()
+      .describe(
+        "reserved for a future Socket Mode path; parsed but unused by the v0 webhook daemon",
+      ),
   })
   .strict();
 

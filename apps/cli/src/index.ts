@@ -296,60 +296,74 @@ const FEDERATION_SCHEMA: ParseArgsSchema = {
   ],
 };
 
+function usageText(): string {
+  return [
+    "usage: crewhaus <subcommand> [args]",
+    "",
+    "subcommands:",
+    "  compile <spec.yaml> -o <out-dir>     compile a spec to a runnable bundle",
+    "                                       (fails if an outward tool is left non-external — FR-002)",
+    "                  [--allow-unmarked-sinks]  opt out of the external-sink scope gate",
+    "  compile <spec.yaml> --emit-ir        print the lowered IR as JSON (debug)",
+    "  run <spec.yaml> [--model <model>]    compile in-memory and execute the agent",
+    "                  [--resume <id>]      resume a specific session (cli targets only)",
+    "                  [--continue]         resume the most-recent session (cli targets only)",
+    "                  [--prompt <text>]    initial user prompt (browser targets; defaults to stdin)",
+    "                  [--justification-judge rule-based|claude]  Pillar 3 intent-gate judge (FR-004)",
+    "                  [--egress-matcher substring|semantic]  Pillar 3 sink-side matcher (FR-006)",
+    "                  [--egress-embedder <model>]  embedder for --egress-matcher semantic",
+    "  eval <spec.yaml> --dataset <data>    run the agent against a dataset and grade",
+    "       --graders <graders.yaml>       (deterministic graders + LLM-as-judge)",
+    "       [--judge-model <model>] [--concurrency N] [--seed N] -o <out-dir>",
+    "  eval-report diff <prev> <new>        compare two eval runs and emit a diff report",
+    "       [-o <out-dir>]",
+    "  optimize <spec.yaml> --dataset <data> --graders <graders.yaml>",
+    "       [--mutator rule-based|claude] [--iterations N] [--seed N]",
+    "       [--budget-usd N]                     stop a model-driven run before it exceeds $N (FR-003)",
+    "       [--write-back] [-o <out-dir>]        active eval-driven optimization (Pillar 2)",
+    "  init [name]                          scaffold a new crewhaus.yaml",
+    "  doctor                               check environment health",
+    "  context --bundle [-o <file>]         emit a single-markdown orientation manifest",
+    "       [--factory-root <p>] [--docs-root <p>] [--demos-root <p>]",
+    "  cost-summary --session <id>          summarize cost_accrual events for a session",
+    "  secrets doctor                       list known secrets via the configured backend",
+    "  secrets rotate <name> [--value V]    rotate a named secret (file backend)",
+    "  spec put|list|get|pin|alias ...      versioned spec storage (Section 28 spec-registry)",
+    "  deploy promote|rollback ...          re-pin a spec for an environment (Section 28)",
+    "  migrate-all --from N --to N          batch-migrate every spec in the registry",
+    "  build-image <target> --tag <tag>     build the docker image for a target shape (Section 32)",
+    "       [--platform <p>] [--push]",
+    "  cloud deploy --provider <p>          deploy a managed CrewHaus cluster (Section 32)",
+    "       --region <r> [--tier <t>] [--image-tag <tag>]",
+    "  cloud teardown --provider <p>        tear down a managed cluster",
+    "       --region <r>",
+    "  federation discover <deployment>     resolve a federated peer's endpoint + cert fingerprint (Section 34)",
+    "       [--srv-domain <d>] [--format json|yaml]",
+    "  sandbox doctor [--probe]             list registered sandbox images + healthcheck status (Section 36)",
+    "       [--format json|table]",
+    "  compliance evidence                  collect SOC 2 / ISO 27001 / HIPAA evidence (Section 39)",
+    "       --framework <id> [--control <id>] --period <p> [--audit-dir <d>]",
+    "       [--out-dir <d>] [--signing-key-env <ENV>]",
+    "  version                              print the CLI version (also: --version, -v)",
+    "",
+  ].join("\n");
+}
+
+/** No subcommand given (or a parse error) — usage to stderr, exit 1. */
 function usage(): never {
-  process.stderr.write(
-    [
-      "usage: crewhaus <subcommand> [args]",
-      "",
-      "subcommands:",
-      "  compile <spec.yaml> -o <out-dir>     compile a spec to a runnable bundle",
-      "                                       (fails if an outward tool is left non-external — FR-002)",
-      "                  [--allow-unmarked-sinks]  opt out of the external-sink scope gate",
-      "  compile <spec.yaml> --emit-ir        print the lowered IR as JSON (debug)",
-      "  run <spec.yaml> [--model <model>]    compile in-memory and execute the agent",
-      "                  [--resume <id>]      resume a specific session (cli targets only)",
-      "                  [--continue]         resume the most-recent session (cli targets only)",
-      "                  [--prompt <text>]    initial user prompt (browser targets; defaults to stdin)",
-      "                  [--justification-judge rule-based|claude]  Pillar 3 intent-gate judge (FR-004)",
-      "                  [--egress-matcher substring|semantic]  Pillar 3 sink-side matcher (FR-006)",
-      "                  [--egress-embedder <model>]  embedder for --egress-matcher semantic",
-      "  eval <spec.yaml> --dataset <data>    run the agent against a dataset and grade",
-      "       --graders <graders.yaml>       (deterministic graders + LLM-as-judge)",
-      "       [--judge-model <model>] [--concurrency N] [--seed N] -o <out-dir>",
-      "  eval-report diff <prev> <new>        compare two eval runs and emit a diff report",
-      "       [-o <out-dir>]",
-      "  optimize <spec.yaml> --dataset <data> --graders <graders.yaml>",
-      "       [--mutator rule-based|claude] [--iterations N] [--seed N]",
-      "       [--budget-usd N]                     stop a model-driven run before it exceeds $N (FR-003)",
-      "       [--write-back] [-o <out-dir>]        active eval-driven optimization (Pillar 2)",
-      "  init [name]                          scaffold a new crewhaus.yaml",
-      "  doctor                               check environment health",
-      "  context --bundle [-o <file>]         emit a single-markdown orientation manifest",
-      "       [--factory-root <p>] [--docs-root <p>] [--demos-root <p>]",
-      "  cost-summary --session <id>          summarize cost_accrual events for a session",
-      "  secrets doctor                       list known secrets via the configured backend",
-      "  secrets rotate <name> [--value V]    rotate a named secret (file or vault backend)",
-      "  spec put|list|get|pin|alias ...      versioned spec storage (Section 28 spec-registry)",
-      "  deploy promote|rollback ...          re-pin a spec for an environment (Section 28)",
-      "  migrate-all --from N --to N          batch-migrate every spec in the registry",
-      "  build-image <target> --tag <tag>     build the docker image for a target shape (Section 32)",
-      "       [--platform <p>] [--push]",
-      "  cloud deploy --provider <p>          deploy a managed CrewHaus cluster (Section 32)",
-      "       --region <r> [--tier <t>] [--image-tag <tag>]",
-      "  cloud teardown --provider <p>        tear down a managed cluster",
-      "       --region <r>",
-      "  federation discover <deployment>     resolve a federated peer's endpoint + cert fingerprint (Section 34)",
-      "       [--srv-domain <d>] [--format json|yaml]",
-      "  sandbox doctor [--probe]             list registered sandbox images + healthcheck status (Section 36)",
-      "       [--format json|table]",
-      "  compliance evidence                  collect SOC 2 / ISO 27001 / HIPAA evidence (Section 39)",
-      "       --framework <id> [--control <id>] --period <p> [--audit-dir <d>]",
-      "       [--out-dir <d>] [--signing-key-env <ENV>]",
-      "  version                              print the CLI version (also: --version, -v)",
-      "",
-    ].join("\n"),
-  );
+  process.stderr.write(usageText());
   process.exit(1);
+}
+
+/**
+ * Explicit `-h`/`--help` at the top level — usage to stdout, exit 0. Help was
+ * requested, so it is not an error; this matches every subcommand's own
+ * `--help` (stdout, exit 0) and lets `crewhaus --help` work in `set -e` health
+ * checks instead of looking like a broken CLI.
+ */
+function help(): never {
+  process.stdout.write(usageText());
+  process.exit(0);
 }
 
 function die(message: string): never {
@@ -464,7 +478,10 @@ async function runCompile(args: ParsedArgs): Promise<void> {
     try {
       ir = lower(parseSpec(yamlText));
     } catch (err) {
-      if (err instanceof SpecParseError) die(err.message);
+      // parseSpec throws SpecParseError; lower() can throw CompilerError (e.g. a
+      // malformed credential env-ref). Both extend CrewhausError — route the
+      // family through die() for a clean one-liner instead of a raw stack trace.
+      if (err instanceof CrewhausError) die(err.message);
       throw err;
     }
     const json = `${JSON.stringify(ir, null, 2)}\n`;
@@ -524,7 +541,10 @@ async function runStrictScopeGate(yamlText: string): Promise<void> {
   try {
     ir = lower(parseSpec(yamlText));
   } catch (err) {
-    if (err instanceof SpecParseError) die(err.message);
+    // SpecParseError (parse) and CompilerError (lower, e.g. a malformed
+    // credential env-ref) both extend CrewhausError — render as a clean die()
+    // one-liner rather than an uncaught stack trace.
+    if (err instanceof CrewhausError) die(err.message);
     throw err;
   }
   const toolNames = collectToolNames(ir);
@@ -1828,13 +1848,21 @@ async function runCostSummary(args: ParsedArgs): Promise<void> {
       "kind" in parsed &&
       (parsed as { kind?: string }).kind === "cost_accrual"
     ) {
-      const e = parsed as unknown as {
-        provider: string;
-        costUsdMicros: number;
+      // event-log writes a `{ ts, version, kind, payload }` envelope, so the
+      // cost fields live under `payload`. Fall back to top-level fields so a
+      // hand-written/flat cost_accrual line still aggregates.
+      const e = parsed as {
+        provider?: string;
+        costUsdMicros?: number;
+        payload?: { provider?: string; costUsdMicros?: number };
       };
-      totalMicros += e.costUsdMicros;
-      byProvider[e.provider] = (byProvider[e.provider] ?? 0) + e.costUsdMicros;
-      count++;
+      const provider = e.payload?.provider ?? e.provider;
+      const micros = e.payload?.costUsdMicros ?? e.costUsdMicros;
+      if (typeof provider === "string" && typeof micros === "number") {
+        totalMicros += micros;
+        byProvider[provider] = (byProvider[provider] ?? 0) + micros;
+        count++;
+      }
     }
   }
   const totalDollars = totalMicros / 1_000_000;
@@ -1855,13 +1883,13 @@ async function runCostSummary(args: ParsedArgs): Promise<void> {
 /**
  * Section 27 — `crewhaus secrets <action> <name> [opts]`. Two actions:
  *   doctor                 list configured secrets and report missing
- *   rotate <name>          rotate the named secret (file or vault backends)
+ *   rotate <name>          rotate the named secret (file backend)
  */
 async function runSecrets(args: ParsedArgs, action: string): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
       "usage:\n" +
-        "  crewhaus secrets doctor [--backend env-var|file|vault] [--root-dir <dir>]\n" +
+        "  crewhaus secrets doctor [--backend env-var|file] [--root-dir <dir>]\n" +
         "  crewhaus secrets rotate <name> [--value <new-value>] [--backend ...]\n",
     );
     return;
@@ -1874,7 +1902,23 @@ async function runSecrets(args: ParsedArgs, action: string): Promise<void> {
   const { createSecrets, createEnvVarBackend, createFileBackend } = await import(
     "@crewhaus/secrets-manager"
   );
-  const backend = backendId === "file" ? createFileBackend({ rootDir }) : createEnvVarBackend();
+  // The `vault` backend exists in @crewhaus/secrets-manager but is not wired
+  // into the CLI (it needs an address/auth story the CLI does not yet expose).
+  // Fail loudly rather than silently degrading a security-sensitive flag to the
+  // env-var backend — a silent fallback would, e.g., make `secrets doctor`
+  // cheerfully list process env var names as if they were Vault secrets.
+  let backend: ReturnType<typeof createFileBackend>;
+  if (backendId === "env-var") {
+    backend = createEnvVarBackend();
+  } else if (backendId === "file") {
+    backend = createFileBackend({ rootDir });
+  } else if (backendId === "vault") {
+    die(
+      "vault backend is not wired into the CLI in this build — construct it programmatically via createVaultBackend(), or use --backend env-var|file",
+    );
+  } else {
+    die(`unknown secrets backend "${backendId}" (expected: env-var | file)`);
+  }
   const secrets = createSecrets({ backend });
 
   if (action === "doctor") {
@@ -2503,9 +2547,11 @@ switch (subcommand) {
   case "--version":
     printVersion();
     break;
-  case "":
   case "-h":
   case "--help":
+    help();
+    break;
+  case "":
     usage();
     break;
   default:

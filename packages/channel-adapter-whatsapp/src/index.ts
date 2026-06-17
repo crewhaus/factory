@@ -11,7 +11,8 @@
  * list-reply payloads from the v22.0 Cloud API. `sendReply` POSTs to
  * `/v22.0/{phoneNumberId}/messages` with the bot's access token.
  * `setTyping` is a no-op — WhatsApp Business does not expose a typing
- * indicator API for cloud-API-based bots.
+ * indicator API for cloud-API-based bots. `react` posts a
+ * `type: "reaction"` message targeting the inbound message id.
  *
  * Per-user session keying: WhatsApp has no thread concept; the gateway
  * keys sessions on the contact's phone number (`messages[].from`).
@@ -62,6 +63,13 @@ export interface ChannelAdapter {
   parseInbound(req: RawRequest): ParsedInbound;
   sendReply(args: { event: InboundEvent; text: string }): Promise<void>;
   setTyping(args: { event: InboundEvent }): Promise<void>;
+  /**
+   * Phase 3 §3.2 — add an emoji reaction to an inbound message as a
+   * lightweight status acknowledgement (eyes/white_check_mark/warning).
+   * WhatsApp accepts any unicode emoji. Optional — the session-router skips
+   * the hook when an adapter leaves it undefined.
+   */
+  react?(args: { event: InboundEvent; emoji: string }): Promise<void>;
 }
 
 export type WhatsAppAdapterConfig = {
@@ -83,6 +91,15 @@ export type WhatsAppAdapterOptions = {
 
 const DEFAULT_API_BASE_URL = "https://graph.facebook.com";
 const DEFAULT_API_VERSION = "v22.0";
+
+// WhatsApp accepts any unicode emoji for reactions, so the channel-generic
+// status names map to their natural glyphs. An unrecognised name passes
+// through verbatim.
+const WHATSAPP_REACTION_EMOJI: Record<string, string> = {
+  eyes: "👀",
+  white_check_mark: "✅",
+  warning: "⚠️",
+};
 
 export function createWhatsAppAdapter(
   config: WhatsAppAdapterConfig,
@@ -182,6 +199,40 @@ export function createWhatsAppAdapter(
 
     async setTyping(_args: { event: InboundEvent }): Promise<void> {
       // No public typing-indicator API for Cloud-API-based WhatsApp bots.
+    },
+
+    // Phase 3 §3.2 — emoji reactions via a `type: "reaction"` message. The
+    // reaction targets the inbound message id (surfaced as idempotencyKey) and
+    // is addressed to the same contact (userId).
+    async react(args: { event: InboundEvent; emoji: string }): Promise<void> {
+      const emoji = WHATSAPP_REACTION_EMOJI[args.emoji] ?? args.emoji;
+      const body = {
+        messaging_product: "whatsapp",
+        recipient_type: "individual",
+        to: args.event.userId,
+        type: "reaction",
+        reaction: { message_id: args.event.idempotencyKey, emoji },
+      };
+      const res = await doFetch(messagesUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${config.accessToken}`,
+        },
+        body: JSON.stringify(body),
+      });
+      // Reactions are best-effort — the session-router catches and continues so
+      // a flaky reaction never aborts message processing.
+      if (!res.ok) {
+        throw new WhatsAppAdapterError(`reaction POST failed: ${res.status} ${res.statusText}`);
+      }
+      const ct = res.headers.get("content-type") ?? "";
+      if (ct.includes("application/json")) {
+        const json = (await res.json()) as { error?: { message?: string } };
+        if (json.error) {
+          throw new WhatsAppAdapterError(`reaction POST error: ${json.error.message ?? "unknown"}`);
+        }
+      }
     },
   };
 }

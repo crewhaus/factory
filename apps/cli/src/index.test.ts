@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseSpec } from "@crewhaus/spec";
@@ -212,6 +212,35 @@ describe("crewhaus compile", () => {
     expect(result.stderr).not.toMatch(/\bat .+:\d+:\d+/);
     expect(existsSync(join(outDir, "agent.ts"))).toBe(false);
   });
+
+  // A malformed credential env-ref (`$lowercase` on a Slack token) is a hard
+  // compile error from lowerCredential(). It must render as a clean die()
+  // one-liner — exit 1, `crewhaus: ` prefix, no uncaught stack trace — on BOTH
+  // the --emit-ir and bundle paths (the lower() catch routes CompilerError, not
+  // just SpecParseError, through die()).
+  const BAD_CRED_SPEC =
+    "name: status-bot\ntarget: channel\nagent:\n  model: claude-sonnet-4-6\n  instructions: announce status\nchannels:\n  slack:\n    botToken: $slack_bot_token\n    signingSecret: $SLACK_SIGNING_SECRET\nrouting:\n  sessionKey: thread\n";
+
+  for (const mode of ["--emit-ir", "bundle"] as const) {
+    test(`compile (${mode}) on a malformed credential $ref fails cleanly (die, not crash)`, async () => {
+      const specPath = join(tmp, "crewhaus.yaml");
+      writeFileSync(specPath, BAD_CRED_SPEC);
+      const outDir = join(tmp, "out");
+      const argv =
+        mode === "--emit-ir"
+          ? ["compile", specPath, "--emit-ir"]
+          : ["compile", specPath, "-o", outDir];
+      const result = await runCli(argv);
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain(
+        'crewhaus: channels.slack.botToken value "$slack_bot_token" looks like an environment reference',
+      );
+      // Not an uncaught crash: no error-class name, no "at file:line:col" frame.
+      expect(result.stderr).not.toContain("CompilerError");
+      expect(result.stderr).not.toMatch(/\bat .+:\d+:\d+/);
+      if (mode === "bundle") expect(existsSync(join(outDir, "agent.ts"))).toBe(false);
+    });
+  }
 
   // (c) CLEAN spec still compiles by default (no flag, no opt-out).
   test("compile (no flag) on a clean (toolless) spec still emits and exits 0", async () => {
@@ -663,19 +692,110 @@ describe("crewhaus optimize --budget-usd", () => {
 });
 
 describe("crewhaus help and unknown subcommand", () => {
-  test("--help prints usage listing all four subcommands", async () => {
-    const result = await runCli(["--help"]);
+  for (const flag of ["--help", "-h"]) {
+    test(`${flag} prints usage to stdout and exits 0 (works in \`set -e\` health checks)`, async () => {
+      const result = await runCli([flag]);
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("compile");
+      expect(result.stdout).toContain("run");
+      expect(result.stdout).toContain("init");
+      expect(result.stdout).toContain("doctor");
+    });
+  }
+
+  test("no subcommand prints usage to stderr and exits 1 (usage error)", async () => {
+    const result = await runCli([]);
     expect(result.exitCode).toBe(1);
-    expect(result.stderr).toContain("compile");
-    expect(result.stderr).toContain("run");
-    expect(result.stderr).toContain("init");
-    expect(result.stderr).toContain("doctor");
+    expect(result.stderr).toContain("usage: crewhaus");
   });
 
   test("unknown subcommand exits 1 with a clear message", async () => {
     const result = await runCli(["frobnicate"]);
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("unknown subcommand");
+  });
+});
+
+describe("crewhaus secrets backend selection", () => {
+  test("--backend vault errors clearly instead of silently using env-var", async () => {
+    const result = await runCli(["secrets", "doctor", "--backend", "vault"]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("vault backend is not wired into the CLI");
+  });
+
+  test("an unknown backend is rejected", async () => {
+    const result = await runCli(["secrets", "doctor", "--backend", "bogus"]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('unknown secrets backend "bogus"');
+  });
+
+  test("--backend file rotates into a not-yet-existing root dir (auto-mkdir)", async () => {
+    const root = join(tmp, "nested", "secrets");
+    const result = await runCli([
+      "secrets",
+      "rotate",
+      "demo",
+      "--backend",
+      "file",
+      "--root-dir",
+      root,
+    ]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("rotated demo");
+    expect(existsSync(join(root, "demo"))).toBe(true);
+  });
+});
+
+describe("crewhaus cost-summary", () => {
+  const SESSION_ID = "sess_00000000000000ab";
+
+  function seedSession(lines: ReadonlyArray<unknown>): void {
+    const dir = join(tmp, ".crewhaus", "sessions");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, `${SESSION_ID}.jsonl`),
+      `${lines.map((l) => JSON.stringify(l)).join("\n")}\n`,
+    );
+  }
+
+  test("sums cost_accrual events written in the real event-log envelope shape", async () => {
+    seedSession([
+      { ts: 1, version: 1, kind: "user_message", payload: { content: "hi" } },
+      {
+        ts: 2,
+        version: 1,
+        kind: "cost_accrual",
+        payload: { provider: "anthropic", modelId: "claude-sonnet-4-6", costUsdMicros: 450 },
+      },
+      {
+        ts: 3,
+        version: 1,
+        kind: "cost_accrual",
+        payload: { provider: "anthropic", modelId: "claude-sonnet-4-6", costUsdMicros: 300 },
+      },
+    ]);
+    const result = await runCli(["cost-summary", "--session", SESSION_ID, "--format", "json"], {
+      cwd: tmp,
+    });
+    expect(result.exitCode).toBe(0);
+    const out = JSON.parse(result.stdout) as {
+      count: number;
+      totalUsdMicros: number;
+      byProvider: Record<string, number>;
+    };
+    expect(out.count).toBe(2);
+    expect(out.totalUsdMicros).toBe(750);
+    expect(out.byProvider["anthropic"]).toBe(750);
+  });
+
+  test("still reads flat (non-enveloped) cost_accrual lines for back-compat", async () => {
+    seedSession([{ kind: "cost_accrual", provider: "openai", costUsdMicros: 1000 }]);
+    const result = await runCli(["cost-summary", "--session", SESSION_ID, "--format", "json"], {
+      cwd: tmp,
+    });
+    expect(result.exitCode).toBe(0);
+    const out = JSON.parse(result.stdout) as { totalUsdMicros: number };
+    expect(out.totalUsdMicros).toBe(1000);
   });
 });
 

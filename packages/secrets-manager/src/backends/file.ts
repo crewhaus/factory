@@ -6,7 +6,14 @@
  * trailing newline-stripping ambiguity). Whitespace is preserved as-is
  * for tokens that may legitimately contain it.
  */
-import { existsSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { type SecretValue, type SecretsBackend, SecretsError } from "../index";
 
@@ -37,6 +44,11 @@ export function createFileBackend(opts: FileBackendOptions): SecretsBackend {
     async rotate(name: string, rotateOpts): Promise<SecretValue> {
       const p = pathFor(name);
       const newValue = rotateOpts?.newValue ?? generateRandomSecret();
+      // Create the secrets root on first use so a fresh checkout can rotate a
+      // secret without a raw ENOENT — recursive mkdir is a no-op when it
+      // already exists. 0o700 keeps the directory owner-only, consistent with
+      // the 0o600 secret files written into it.
+      mkdirSync(rootDir, { recursive: true, mode: 0o700 });
       const tmp = `${p}.tmp`;
       writeFileSync(tmp, newValue, { encoding: "utf8", mode: 0o600 });
       renameSync(tmp, p);

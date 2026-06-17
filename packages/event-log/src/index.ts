@@ -58,7 +58,13 @@ export type EventKind =
   // `sub_agent_start/end` for Section-13 sub-agents.
   | "a2a_turn_start"
   | "a2a_turn_end"
-  | "crew_done";
+  | "crew_done"
+  // Section 27 — per-call cost accrual mirrored from the trace bus into the
+  // session JSONL (opt-in via CREWHAUS_COST_TRACKING) so
+  // `crewhaus cost-summary --session <id>` can sum spend after a run. It is not
+  // a conversational message, so `replayMessageHistory` ignores it and resume
+  // is unaffected.
+  | "cost_accrual";
 
 export type Event = {
   readonly ts: number;

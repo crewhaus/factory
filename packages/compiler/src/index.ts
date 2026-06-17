@@ -266,6 +266,33 @@ function lowerSecret(raw: string): IrSecretRef {
 }
 
 /**
+ * Section 12 (companion to `lowerSecret`) — lower a *credential-shaped* field
+ * (channel bot tokens, signing secrets, retrieval API keys). Identical to
+ * `lowerSecret` for a valid `$VAR_NAME` env reference or a genuine literal,
+ * but a value that *looks like* an env reference — it starts with `$` — yet is
+ * not a valid one is almost always a typo'd env ref (`$slack_token`,
+ * `$1PASSWORD`, `${SLACK_BOT_TOKEN}`). Left alone it would be silently baked
+ * into the compiled bundle as a literal string, shipping a broken credential
+ * that only fails at runtime auth. We fail compilation with a clear message
+ * instead — the same fail-fast stance `lowerWalletKeyRef` takes for signing
+ * keys (#159). `label` is the field path used in the diagnostic. Path-like and
+ * URL fields keep the permissive `lowerSecret` (a literal `$HOME/...` path is
+ * legitimate), so the strict check is scoped to fields that carry secrets.
+ */
+function lowerCredential(label: string, raw: string): IrSecretRef {
+  const m = raw.match(ENV_REF_RE);
+  if (m && typeof m[1] === "string") {
+    return { kind: "env", name: m[1] };
+  }
+  if (raw.startsWith("$")) {
+    throw new CompilerError(
+      `${label} value ${JSON.stringify(raw)} looks like an environment reference but is not a valid one. Environment references must be $UPPER_SNAKE_CASE (e.g. $SLACK_BOT_TOKEN) — no lowercase, no leading digit, no \${...} braces. Fix the variable name, or remove the leading "$" if this is genuinely a literal value.`,
+    );
+  }
+  return { kind: "literal", value: raw };
+}
+
+/**
  * Section 47 (#159, CWE-798) — lower a wallet `keyRef` with a stricter
  * policy than `lowerSecret`. A signing key MUST be an indirection — an
  * `$ENV_REF` (resolved from `process.env` in the compiled bundle) or a
@@ -296,32 +323,34 @@ function lowerWalletKeyRef(walletId: string, raw: string): IrSecretRef {
 
 function lowerSlack(slack: SpecSlackChannel): IrSlackConfig {
   return {
-    botToken: lowerSecret(slack.botToken),
-    signingSecret: lowerSecret(slack.signingSecret),
-    ...(slack.appToken !== undefined ? { appToken: lowerSecret(slack.appToken) } : {}),
+    botToken: lowerCredential("channels.slack.botToken", slack.botToken),
+    signingSecret: lowerCredential("channels.slack.signingSecret", slack.signingSecret),
+    ...(slack.appToken !== undefined
+      ? { appToken: lowerCredential("channels.slack.appToken", slack.appToken) }
+      : {}),
   };
 }
 
 function lowerTelegram(telegram: SpecTelegramChannel): IrTelegramConfig {
   return {
-    botToken: lowerSecret(telegram.botToken),
-    secretToken: lowerSecret(telegram.secretToken),
+    botToken: lowerCredential("channels.telegram.botToken", telegram.botToken),
+    secretToken: lowerCredential("channels.telegram.secretToken", telegram.secretToken),
   };
 }
 
 function lowerDiscord(discord: SpecDiscordChannel): IrDiscordConfig {
   return {
-    applicationId: lowerSecret(discord.applicationId),
-    botToken: lowerSecret(discord.botToken),
-    publicKeyHex: lowerSecret(discord.publicKeyHex),
+    applicationId: lowerCredential("channels.discord.applicationId", discord.applicationId),
+    botToken: lowerCredential("channels.discord.botToken", discord.botToken),
+    publicKeyHex: lowerCredential("channels.discord.publicKeyHex", discord.publicKeyHex),
   };
 }
 
 function lowerWhatsApp(whatsapp: SpecWhatsAppChannel): IrWhatsAppConfig {
   return {
-    phoneNumberId: lowerSecret(whatsapp.phoneNumberId),
-    accessToken: lowerSecret(whatsapp.accessToken),
-    appSecret: lowerSecret(whatsapp.appSecret),
+    phoneNumberId: lowerCredential("channels.whatsapp.phoneNumberId", whatsapp.phoneNumberId),
+    accessToken: lowerCredential("channels.whatsapp.accessToken", whatsapp.accessToken),
+    appSecret: lowerCredential("channels.whatsapp.appSecret", whatsapp.appSecret),
   };
 }
 
@@ -764,7 +793,7 @@ export function lower(spec: Spec): IrNode {
           // apiKey flows through the same `$VAR` → env-ref lowering as other
           // secrets so a real key never lands in the compiled bundle.
           ...(spec.retrieve.apiKey !== undefined
-            ? { apiKey: lowerSecret(spec.retrieve.apiKey) }
+            ? { apiKey: lowerCredential("retrieve.apiKey", spec.retrieve.apiKey) }
             : {}),
         },
         indexing: {
