@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/runtime-core",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "type": "module",
   "description": "Minimal runtime imported by generated harness bundles",
   "main": "src/index.ts",

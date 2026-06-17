@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-loop-detection",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "type": "module",
   "description": "Detect repeated tool calls via sliding-window canonical-JSON signatures",
   "main": "src/index.ts",
