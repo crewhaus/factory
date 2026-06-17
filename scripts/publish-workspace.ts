@@ -214,6 +214,20 @@ function publish(p: PkgInfo): PublishResult {
     console.log("  (dry-run, skipping)");
     return "ok";
   }
+  // Guard: when release-prep --for-publish has flipped entrypoints to dist/, the build
+  // must have run first. If the dist entrypoint is missing, `bun publish` would pack a
+  // tarball with no JS (just README/LICENSE) and ship a broken package — fail loudly.
+  const pj = readJson<{ main?: string }>(join(p.dir, "package.json"));
+  if (
+    typeof pj.main === "string" &&
+    pj.main.startsWith("dist/") &&
+    !existsSync(join(p.dir, pj.main))
+  ) {
+    console.error(
+      `✗ ${p.name}: main="${pj.main}" but ${join(p.dir, pj.main)} is missing — run \`bun run build\` before publishing.`,
+    );
+    return "failed";
+  }
   // Capture output so we can recognize "already published" as success.
   const r = spawnSync("bun", ["publish"], { cwd: p.dir, encoding: "utf-8" });
   const out = (r.stdout ?? "") + (r.stderr ?? "");

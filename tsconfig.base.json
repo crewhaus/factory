@@ -18,10 +18,11 @@
     "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true,
     "declaration": true,
-    "declarationMap": true,
-    "sourceMap": true,
+    "declarationMap": false,
+    "sourceMap": false,
     "composite": true,
     "incremental": true,
     "useDefineForClassFields": true
-  }
+  },
+  "exclude": ["**/*.test.ts", "**/*.test.tsx"]
 }
