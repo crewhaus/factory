@@ -4,9 +4,9 @@ The publish-surface view of the factory workspace — what's on npm, how it's ve
 
 ## Status
 
-**0.1.x — public release line (current cut 0.1.3).** Every `@crewhaus/*` library package in `packages/` is published to the npm registry under the **public** `@crewhaus` scope, and the flagship CLI ships as the bare, unscoped [`crewhaus`](https://www.npmjs.com/package/crewhaus) package (the old `@crewhaus/cli` name is deprecated and now just points at `crewhaus`). The root `factory` workspace is intentionally private and stays that way (`"private": true`); only the inner packages are publishable.
+**0.1.x — public release line (current factory cut 0.1.4).** Every `@crewhaus/*` library package in `packages/` is published to the npm registry under the **public** `@crewhaus` scope, and the flagship CLI ships as the bare, unscoped [`crewhaus`](https://www.npmjs.com/package/crewhaus) package (the old `@crewhaus/cli` name is deprecated and now just points at `crewhaus`). The root `factory` workspace is intentionally private and stays that way (`"private": true`); only the inner packages are publishable.
 
-The same lockstep cut covers the sibling [crewhaus/utilities](https://github.com/crewhaus/utilities) workspace (10 packages — Studio, IDE extensions, the browser playground, trace-viewer, graph-visualizer, wizard, scaffold-templates, plugin-sdk). Together: **206 packages** on the public registry.
+The sibling [crewhaus/utilities](https://github.com/crewhaus/utilities) workspace (12 packages — Studio, IDE extensions, the browser playground, trace-viewer, graph-visualizer, wizard, scaffold-templates, studio-plugin-sdk) versions in its own lockstep and currently sits one patch ahead at 0.1.5. Together: **212 packages** on the public registry.
 
 > **Why we skipped v0.1.0.** A first publish at v0.1.0 went out with broken inter-package dependency ranges — `bun publish` resolved `workspace:*` against a stale `bun.lock` that still recorded the pre-release `0.0.0` versions, leaving every published package pointing at non-existent `@crewhaus/<dep>@0.0.0`. v0.1.1 regenerates `bun.lock` after the version bump so workspace:* resolves to the actual `0.1.1` cut. If you're authoring a new release on this workspace, delete `bun.lock` before `bun install` after a version bump — the `scripts/publish-workspace.ts` flow does this automatically.
 
@@ -43,7 +43,7 @@ cd my-agent
 crewhaus compile && crewhaus run
 ```
 
-`crewhaus --version` prints the build, e.g. `0.1.3`.
+`crewhaus --version` prints the build, e.g. `0.1.4`.
 
 The `crewhaus` package transitively pulls in everything else via versioned npm deps (the workspace `workspace:*` references resolve to concrete versions at publish time), so users don't install the rest individually. A generated bundle additionally imports `@crewhaus/runtime-core` directly — that is the one other package consumers see on the receiving end.
 
@@ -104,11 +104,11 @@ crewhaus init my-agent
 
 The sibling [crewhaus/utilities](https://github.com/crewhaus/utilities) workspace contributes the **Studio + IDE surface**:
 
-- `@crewhaus/studio-server`, `@crewhaus/studio-ui`, `@crewhaus/plugin-sdk`, `@crewhaus/scaffold-templates`, `@crewhaus/wizard`, `@crewhaus/trace-viewer`, `@crewhaus/graph-visualizer`
+- `@crewhaus/studio-server`, `@crewhaus/studio-ui`, `@crewhaus/studio-plugin-sdk`, `@crewhaus/scaffold-templates`, `@crewhaus/wizard`, `@crewhaus/trace-viewer`, `@crewhaus/graph-visualizer`, `@crewhaus/dataset-builder`, `@crewhaus/grader-builder`
 - `@crewhaus/vscode-extension`, `@crewhaus/jetbrains-plugin`
 - `@crewhaus/crewhaus-playground` (browser REPL)
 
-All ten publish at the same cut version as the factory packages.
+All twelve publish in their own lockstep (currently 0.1.5), independent of the factory cut.
 
 ## Intentionally NOT published
 

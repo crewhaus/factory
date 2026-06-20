@@ -1,11 +1,16 @@
 /**
  * @crewhaus/federation-router — Section 34
  *
- * When a `Task` or `SendMessage` tool call references a federated
- * sub-agent (`subAgents[name].federation: { deployment, role }`), the
- * runtime calls into this package instead of `@crewhaus/sub-agent-spawner`.
+ * Forward-looking: this package is the programmatic client for routing a
+ * sub-agent call to a *federated* peer deployment (over mTLS) instead of
+ * spawning it locally via `@crewhaus/sub-agent-spawner`. It is not yet
+ * wired into the runtime — there is no `federation` field in the spec's
+ * sub-agent definition, and `@crewhaus/runtime-core` does not import this
+ * package. A caller drives it directly through `createFederationRouter`
+ * and the returned `router.call({ fromRole, to: { deployment, role },
+ * payload, kind })`.
  *
- * Flow:
+ * Flow (per `call`):
  *   1. Look up the peer's endpoint + cert fingerprint via
  *      `@crewhaus/federation-discovery`.
  *   2. Build a `FederationEnvelope` carrying the question payload + the

@@ -11,7 +11,7 @@ import type { RegisteredTool, ToolDefinition } from "@crewhaus/tool-catalog";
  * discovers them; the §40 sigstore-style signature verification runs
  * before either.
  *
- * v2 widens the v1 surface (Studio-only — see `crewhaus/utilities/plugin-sdk`)
+ * v2 widens the v1 surface (Studio-only — see `crewhaus/utilities/studio-plugin-sdk`)
  * to cover the five extension points the catalog cares about:
  *
  *   1. **Tools** — anything you would otherwise pass to `buildTool()`.

@@ -203,7 +203,7 @@ export const OPTIMIZABLE_PATHS: Readonly<
     Object.freeze(["security", "justification"]),
     // §47 blockchain subsystem (slice 0). Whole-block replacement so the
     // optimizer can tune `chains[*].finality.count`, `chains[*].rpcPolicy`,
-    // `transaction_policy.maxValueUsd`, and `transaction_policy.simulationRequired`
+    // `transaction_policy.maxValueWei`, and `transaction_policy.simulationRequired`
     // by patching their parent block.
     Object.freeze(["chains"]),
     Object.freeze(["transaction_policy"]),

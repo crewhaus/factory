@@ -345,10 +345,12 @@ export type IrContractBinding = {
  * Transaction policy — the safety floor for any tool that signs and
  * broadcasts a transaction. `defaultWriteApproval: "required"` is the
  * default; setting it to `"none"` is only valid when every wallet is
- * `automated` custody, which the §47 IR pass enforces. `maxValueUsd`
- * is an upper bound on native-token transfers (in USD, evaluated at
- * sign-time via the configured price oracle); transactions exceeding
- * the cap are rejected pre-broadcast. `allowedContracts` is a list of
+ * `automated` custody, which the §47 IR pass enforces. `maxValueWei`
+ * is an upper bound on native-token transfers (in wei, the oracle-free
+ * spend ceiling enforced by wallet-engine); transactions exceeding the
+ * cap are rejected pre-broadcast. (`maxValueUsd` cannot be enforced —
+ * there is no price oracle in this build, so it hard-throws at runtime;
+ * use `maxValueWei`.) `allowedContracts` is a list of
  * `IrContractBinding.id` values — destructive calls to any other
  * contract are rejected. `simulationRequired: true` forces every
  * destructive call through a fork-simulator before approval.
