@@ -7,14 +7,22 @@
  * Built-in passes:
  *  - `deadToolElimination` — drop entries from `tools` that no sub-agent
  *    or permission rule references. Catches the common case where a spec
- *    declares `tools: [Read, Write, Bash]` then locks Write down with an
- *    `alwaysDeny` rule and never uses it elsewhere.
+ *    declares `tools: [Read, Write, Bash]` but only ever references some of
+ *    them — e.g. an `alwaysDeny` rule naming `Write` actually counts as a
+ *    reference and KEEPS `Write` in the list; only a tool that no rule and
+ *    no sub-agent mentions at all (say `Bash` here) gets dropped.
  *  - `redundantMcpServerCollapse` — dedup `mcp_servers` map entries by
  *    `(transport, command, args)` signature so two specs that import the
  *    same server under different keys collapse into one boot per process.
  *  - `permissionRuleCanonicalize` — sort + dedup `permissions.rules` by
  *    canonical (type, pattern) tuples; preserves source priority order
  *    (alwaysDeny > alwaysAsk > alwaysAllow) but de-dupes identical entries.
+ *  - `transactionPolicyEnforcement` — §47 validating pass: checks the
+ *    blockchain blocks (wallets/contracts/chains/transaction_policy) for
+ *    referential integrity and throws `IrPassError` on a mismatch.
+ *  - `wellFormednessCheck` — Track F validating pass: checks typed
+ *    multi-agent graphs/crews (edges connect declared nodes, reachability
+ *    from entry, schema/role references resolve) and throws on a violation.
  *  - `promptCachePrefixSort` — TODO: re-orders system-block segments so
  *    the cache prefix is maximised. v0 stub returns IR unchanged so the
  *    pipeline contract holds; v1 follow-up wires this once we land
@@ -22,7 +30,8 @@
  *
  * Pipeline order in `applyPasses` (the safe default):
  *   deadToolElimination → redundantMcpServerCollapse →
- *   permissionRuleCanonicalize → promptCachePrefixSort
+ *   permissionRuleCanonicalize → transactionPolicyEnforcement →
+ *   wellFormednessCheck → promptCachePrefixSort
  */
 import { CrewhausError } from "@crewhaus/errors";
 import type {

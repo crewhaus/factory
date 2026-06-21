@@ -62,12 +62,14 @@ export type ParsedInbound =
   | { readonly kind: "skip" };
 
 /**
- * The iMessage adapter is non-webhook — there's no inbound HTTP. Polling
- * happens via `pollNewMessages()` which the daemon harness calls on a
- * schedule. We still implement the same `ChannelAdapter` interface so
- * the §33 multi-adapter wiring can register it; `verify` and
- * `parseInbound` are never called by the gateway for iMessage (the
- * polling loop emits InboundEvents directly).
+ * The iMessage adapter is non-webhook — there's no inbound HTTP. Instead
+ * the adapter exposes `pollNewMessages()` for the host to call; the
+ * generated channel daemon does NOT run a poll loop, so the caller is
+ * responsible for driving polling on whatever schedule it likes. We
+ * still implement the same `ChannelAdapter` interface so the §33
+ * multi-adapter wiring can register it; `verify` and `parseInbound` are
+ * never called by the gateway for iMessage (the host feeds the
+ * InboundEvents from `pollNewMessages()` into the session router).
  */
 export interface ChannelAdapter {
   readonly id: string;
