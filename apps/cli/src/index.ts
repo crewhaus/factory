@@ -551,13 +551,25 @@ async function runStrictScopeGate(yamlText: string): Promise<void> {
   if (toolNames.length === 0) return;
 
   const toolMap = await loadToolMap();
+  // `loadToolMap` is keyed by the camelCase spec key (`webSearch`), which is how
+  // a top-level `tools:` list names its tools. But a sub-agent `tools:` list
+  // names tools by their REGISTERED name (PascalCase, e.g. `WebSearch`) — the
+  // runtime child-catalog filter (`buildChildCatalog` in tool-task) matches on
+  // `RegisteredTool.name`, not the spec key. `collectToolNames` gathers BOTH
+  // forms from the IR, so also index the map by registered name; otherwise an
+  // outward sub-agent sink like `WebSearch` fails to resolve and is wrongly
+  // flagged as an unverifiable external sink (it resolves to a built-in whose
+  // scope IS statically "external"). A genuinely unknown name (`mcp__*`, a typo)
+  // still resolves to undefined under both keys and is still gated.
+  const byRegisteredName: Record<string, RegisteredTool> = {};
+  for (const tool of Object.values(toolMap)) byRegisteredName[tool.name] = tool;
   // Shared, name-independent audit (see scope-audit.ts):
   //   - resolvable built-ins are checked by capability/outward-name vs scope;
   //   - an outward-by-name sink we CANNOT resolve to a scope:"external" tool
   //     offline (a custom outward name, or any `mcp__*` dynamic sink) is a
   //     finding, because --strict refuses to emit a bundle that reaches a
   //     sink whose external scope it cannot verify at compile time.
-  const findings = auditSpecToolNames(toolNames, (name) => toolMap[name]);
+  const findings = auditSpecToolNames(toolNames, (name) => toolMap[name] ?? byRegisteredName[name]);
   if (findings.length > 0) {
     for (const f of findings) {
       process.stderr.write(`crewhaus: [strict] tool "${f.toolName}" ${f.reason}\n`);

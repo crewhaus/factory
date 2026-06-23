@@ -286,6 +286,28 @@ describe("crewhaus compile", () => {
     expect(existsSync(join(tmp, "agent.ts"))).toBe(true);
     expect(result.stderr).not.toContain("[strict]");
   });
+
+  // Regression: a sub-agent `tools:` list names tools by their REGISTERED name
+  // (PascalCase, e.g. `WebSearch`) — that is the contract the runtime
+  // child-catalog filter (`buildChildCatalog` in tool-task) enforces, matching
+  // on `RegisteredTool.name`, not the camelCase spec key. `collectToolNames`
+  // walks every `tools` array in the IR, so the gate sees `WebSearch` and must
+  // resolve it. The resolver indexes the offline tool map by BOTH the spec key
+  // and the registered name, so the PascalCase outward sink resolves to its
+  // scope:"external" built-in and passes — rather than being wrongly flagged as
+  // an unverifiable external sink. Without the by-name index this exits 1.
+  test("compile (no flag) passes when a SUB-AGENT lists an outward tool by its PascalCase registered name", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    writeFileSync(
+      specPath,
+      "name: subagent-pascal-sink\ntarget: cli\nagent:\n  model: claude-sonnet-4-6\n  instructions: |\n    Delegate web research to the sub-agent.\n  sub_agents:\n    researcher:\n      description: |\n        Web-research sub-agent.\n      instructions: |\n        Search the web and summarise.\n      tools: [WebSearch]\n      permissions:\n        allow:\n          - WebSearch\n        deny: []\ntools:\n  - webSearch\n",
+    );
+    const outDir = join(tmp, "out");
+    const result = await runCli(["compile", specPath, "-o", outDir]);
+    expect(result.exitCode).toBe(0);
+    expect(existsSync(join(outDir, "agent.ts"))).toBe(true);
+    expect(result.stderr).not.toContain("[strict]");
+  });
 });
 
 describe("crewhaus init", () => {
