@@ -1945,3 +1945,42 @@ describe("type re-exports are reachable from the package entry", () => {
     expect(ir.target).toBe("cli");
   });
 });
+
+describe("lower — cli agent.max_tokens (max output tokens knob)", () => {
+  test("lowers spec agent.max_tokens to ir.agent.maxTokens", () => {
+    const ir = lower(
+      parseSpec(`
+name: hello
+target: cli
+agent:
+  model: claude-sonnet-4-6
+  instructions: be helpful
+  max_tokens: 16384
+`),
+    );
+    expect(ir.target).toBe("cli");
+    if (ir.target === "cli") {
+      expect(ir.agent.maxTokens).toBe(16384);
+    }
+  });
+
+  test("leaves ir.agent.maxTokens undefined when the spec is silent", () => {
+    const ir = lower(parseSpec(MINIMAL_SPEC));
+    if (ir.target === "cli") {
+      expect(ir.agent.maxTokens).toBeUndefined();
+    }
+  });
+
+  test("rejects a non-positive or non-integer max_tokens", () => {
+    expect(() =>
+      parseSpec(
+        "name: hello\ntarget: cli\nagent:\n  model: m\n  instructions: i\n  max_tokens: 0\n",
+      ),
+    ).toThrow();
+    expect(() =>
+      parseSpec(
+        "name: hello\ntarget: cli\nagent:\n  model: m\n  instructions: i\n  max_tokens: 1.5\n",
+      ),
+    ).toThrow();
+  });
+});

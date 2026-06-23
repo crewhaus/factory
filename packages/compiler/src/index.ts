@@ -650,6 +650,7 @@ export function lower(spec: Spec): IrNode {
         agent: {
           model: spec.agent.model,
           instructions: spec.agent.instructions,
+          ...(spec.agent.max_tokens !== undefined ? { maxTokens: spec.agent.max_tokens } : {}),
         },
         tools: spec.tools ?? [],
         toolConfigs: lowerToolConfigs(spec.tool_config),

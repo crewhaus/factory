@@ -447,6 +447,10 @@ const cliSchema = z
       .object({
         model: z.string().min(1),
         instructions: z.string().min(1),
+        // Model max OUTPUT tokens for one turn. Optional; when omitted the
+        // runtime default applies. Raise it for turns that emit large
+        // multi-file edits so the model isn't cut off mid-`tool_use`.
+        max_tokens: z.number().int().positive().optional(),
         sub_agents: subAgentsBlock,
       })
       .strict(),

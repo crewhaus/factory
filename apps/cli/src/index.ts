@@ -996,6 +996,9 @@ async function runRunCli(
       skills,
       slashCommands,
       ...(subAgents !== undefined ? { subAgents, spawnSubAgent } : {}),
+      ...(ir.target === "cli" && ir.agent.maxTokens !== undefined
+        ? { maxTokens: ir.agent.maxTokens }
+        : {}),
       ...(resumeId !== undefined ? { resume: { sessionId: resumeId } } : {}),
       ...(justificationJudge !== undefined ? { justificationJudge } : {}),
       ...(justificationAuditSink !== undefined ? { justificationAuditSink } : {}),

@@ -171,6 +171,59 @@ export {
 export type { ResolvedAuth } from "@crewhaus/adapter-anthropic";
 
 /**
+ * Reconcile a message history by dropping "orphan" `tool_use` blocks — a
+ * `tool_use` with no answering `tool_result` anywhere later in the
+ * conversation. The Claude Messages API requires every `tool_use` to be
+ * followed by a matching `tool_result`; an orphan makes every subsequent
+ * request 400 with `tool_use` ids "found without `tool_result` blocks
+ * immediately after". Orphans are born when the model is cut off mid-`tool_use`
+ * by `stop_reason: "max_tokens"`: the partial call is never executed (so a
+ * result is never logged) and its input is truncated / `__parse_error`
+ * garbage, so the only safe reconciliation is to drop it and let the model
+ * re-issue the call. An assistant message left empty after stripping is
+ * removed entirely.
+ *
+ * Idempotent and a no-op on healthy histories. Applied on `--resume` replay
+ * (so a session bricked by a pre-fix runtime self-heals) and by the
+ * `tombstone` recovery action (a universal backstop for any path that still
+ * commits an orphan).
+ */
+export function sanitizeOrphanToolUses(messages: ReadonlyArray<Anthropic.MessageParam>): {
+  messages: Anthropic.MessageParam[];
+  removed: number;
+} {
+  const answered = new Set<string>();
+  for (const m of messages) {
+    if (!Array.isArray(m.content)) continue;
+    for (const block of m.content) {
+      const b = block as { type?: string; tool_use_id?: unknown };
+      if (b.type === "tool_result" && typeof b.tool_use_id === "string") {
+        answered.add(b.tool_use_id);
+      }
+    }
+  }
+  let removed = 0;
+  const out: Anthropic.MessageParam[] = [];
+  for (const m of messages) {
+    if (m.role !== "assistant" || !Array.isArray(m.content)) {
+      out.push(m);
+      continue;
+    }
+    const kept = m.content.filter((block) => {
+      const b = block as { type?: string; id?: unknown };
+      if (b.type === "tool_use" && typeof b.id === "string" && !answered.has(b.id)) {
+        removed += 1;
+        return false;
+      }
+      return true;
+    });
+    if (kept.length === 0) continue;
+    out.push(kept.length === m.content.length ? m : { ...m, content: kept });
+  }
+  return { messages: out, removed };
+}
+
+/**
  * Walk an `EventLog` and reconstruct the SDK message history. Only
  * `user_message` and `assistant_message` events contribute — `tool_use`
  * and `tool_result` events are audit-only because the same data already
@@ -210,7 +263,11 @@ export async function replayMessageHistory(log: EventLog): Promise<Anthropic.Mes
       messages.push({ role: "assistant", content: p.content });
     }
   }
-  return messages;
+  // A session persisted by a pre-fix runtime can carry a dangling `tool_use`
+  // the model was cut off mid-emitting (`stop_reason: "max_tokens"`) with no
+  // following `tool_result`; replaying it verbatim would 400 the first resumed
+  // request. Drop such orphans so `--resume` self-heals. No-op on healthy logs.
+  return sanitizeOrphanToolUses(messages).messages;
 }
 
 /**
@@ -650,7 +707,15 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     compactionAdapter = adapter;
     compactionWireModelId = wireModelId;
   }
-  const maxTokens = opts.maxTokens ?? 4096;
+  // Default model max OUTPUT tokens for one turn. Callers thread the spec's
+  // `agent.max_tokens` here when set (the CLI target's codegen + apps/cli);
+  // this fallback applies when the spec is silent. Kept comfortably above the
+  // old 4096 floor so a single turn that writes a few files no longer truncates
+  // mid-`tool_use` by default — every supported Claude model accepts >= 8192
+  // output tokens. A truncation is no longer fatal regardless (see the
+  // `max_tokens` recovery + `sanitizeOrphanToolUses`), but a higher ceiling
+  // avoids the churn. Raise it per spec with `agent.max_tokens`.
+  const maxTokens = opts.maxTokens ?? 8192;
 
   // Mutual exclusion: resume takes priority and replaces any seedMessages
   // in REPL mode (the resume payload becomes the seed). Section 12 carves
@@ -1669,12 +1734,35 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               );
               endTurn();
 
-              messages.push({
-                role: "assistant",
-                content: finalContent as Anthropic.MessageParam["content"],
-              });
-              await logEvent("assistant_message", { content: finalContent });
-              terminalContent = [...finalContent] as Anthropic.ContentBlock[];
+              // On `stop_reason: "max_tokens"` the model may have been cut off
+              // mid-`tool_use`; the streaming executor only runs a call once its
+              // input JSON closes, so a truncated call has no `tool_result`.
+              // Strip such orphans before they enter history — an unanswered
+              // `tool_use` 400s every later request (see the non-streaming path
+              // and `sanitizeOrphanToolUses`).
+              const answeredStreamIds = new Set(
+                toolResults
+                  .map((r) => (r as { tool_use_id?: unknown }).tool_use_id)
+                  .filter((id): id is string => typeof id === "string"),
+              );
+              const committedStreamContent =
+                stopReason === "max_tokens"
+                  ? finalContent.filter(
+                      (b) =>
+                        b.type !== "tool_use" ||
+                        ((b as { id?: unknown }).id !== undefined &&
+                          answeredStreamIds.has((b as { id: string }).id)),
+                    )
+                  : finalContent;
+
+              if (committedStreamContent.length > 0) {
+                messages.push({
+                  role: "assistant",
+                  content: committedStreamContent as Anthropic.MessageParam["content"],
+                });
+                await logEvent("assistant_message", { content: committedStreamContent });
+              }
+              terminalContent = [...committedStreamContent] as Anthropic.ContentBlock[];
               bus.publish({
                 ...bus.envelope(),
                 spanId: modelStartEnv.spanId,
@@ -1693,7 +1781,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 contentBlocks: finalContent.length,
               });
 
-              const toolUses = finalContent.filter(
+              const toolUses = committedStreamContent.filter(
                 (b): b is Extract<typeof b, { type: "tool_use" }> => b.type === "tool_use",
               );
               if (toolUses.length === 0) {
@@ -1758,25 +1846,42 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               durationMs: performance.now() - t0Model,
             });
 
-            // Persist the assistant turn with the FULL content-block array;
-            // tool_use blocks must survive into history so subsequent
-            // tool_result references resolve.
-            messages.push({
-              role: "assistant",
-              content: final.content as Anthropic.MessageParam["content"],
-            });
-            await logEvent("assistant_message", { content: final.content });
-            terminalContent = [...final.content] as Anthropic.ContentBlock[];
+            // Persist the assistant turn. On a clean stop the FULL content-block
+            // array is committed so subsequent `tool_result` references resolve.
+            //
+            // On `stop_reason: "max_tokens"` the model was cut off mid-reply, so
+            // any `tool_use` it emitted is necessarily un-executed — the
+            // truncation routes to recovery below, BEFORE the `NeedTools` state
+            // runs a tool — and its input is truncated / `__parse_error`
+            // garbage. Committing such an orphan `tool_use` would make every
+            // later request 400 ("tool_use ids ... without tool_result blocks
+            // immediately after"); the recovery loop cannot clear that by
+            // appending a text nudge, so the run bricks once the tombstone
+            // budget is spent. Strip the orphan here, before it enters either
+            // in-memory history OR the resumable event log.
+            const truncatedTurn = final.stopReason === "max_tokens";
+            const committedContent = truncatedTurn
+              ? final.content.filter((b) => b.type !== "tool_use")
+              : final.content;
+            if (committedContent.length > 0) {
+              messages.push({
+                role: "assistant",
+                content: committedContent as Anthropic.MessageParam["content"],
+              });
+              await logEvent("assistant_message", { content: committedContent });
+            }
+            terminalContent = [...committedContent] as Anthropic.ContentBlock[];
             await fireHook("post-model", {
               streaming: false,
               stopReason: final.stopReason,
               contentBlocks: final.content.length,
             });
 
-            // Synthetic max_output_tokens recovery: stop_reason "max_tokens"
-            // means the model was cut off mid-reply. Route through the
-            // recovery state machine so we ask it to continue.
-            if (final.stopReason === "max_tokens") {
+            // Synthetic max_output_tokens recovery: route the truncation through
+            // the recovery state machine so we ask the model to continue. The
+            // orphan `tool_use` (if any) was stripped above, so the `continue`
+            // nudge produces an API-valid next request.
+            if (truncatedTurn) {
               lastErrorForRecovery = {
                 name: "MaxTokensError",
                 error: { type: "max_output_tokens" },
@@ -1920,13 +2025,28 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               break;
             }
             case "tombstone": {
-              // A tombstone fires on an `invalid_request` from the model call.
-              // The model stream is atomic with respect to history: it either
-              // fully succeeds (pushing exactly one assistant message, after
-              // which the turn transitions to Done/NeedTools — never into
-              // recovery) or it throws before pushing anything. So when we
-              // reach here the tail is never a dangling assistant turn, and
-              // there is nothing to pop — we just append the retry nudge.
+              // A tombstone fires on an `invalid_request` (400) from the model
+              // call. The dominant cause is a dangling `tool_use` with no
+              // answering `tool_result` — an orphan the model left when a
+              // `stop_reason: "max_tokens"` cut it off mid-call. (The earlier
+              // claim that the assistant stream is "atomic w.r.t. history" was
+              // wrong: the `max_tokens` path commits the assistant turn and THEN
+              // routes here. The non-streaming path now strips orphans at the
+              // source, but a streaming truncation or a resumed pre-fix session
+              // can still surface one.) Appending a text nudge alone does NOT
+              // clear that 400 — the orphan stays in history and every retry
+              // 400s again until the tombstone budget is spent and the run
+              // bricks. So reconcile FIRST: drop any orphan `tool_use`, then
+              // append the retry nudge. No-op on a healthy history, where the
+              // nudge handles a genuinely malformed block as before.
+              const reconciled = sanitizeOrphanToolUses(messages);
+              if (reconciled.removed > 0) {
+                messages.length = 0;
+                messages.push(...reconciled.messages);
+                runContext.logger.info("recovery.tombstone reconciled orphan tool_use", {
+                  removed: reconciled.removed,
+                });
+              }
               const tombstoneMsg =
                 "[previous assistant turn was rejected as invalid; please retry]";
               messages.push({ role: "user", content: tombstoneMsg });

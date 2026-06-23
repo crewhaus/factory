@@ -8,7 +8,7 @@ import { createLogger } from "@crewhaus/logging";
 import { type RunContext, createRunContext } from "@crewhaus/run-context";
 import { buildTool } from "@crewhaus/tool-builder";
 import { z } from "zod";
-import { replayMessageHistory, resolveAuth, runChatLoop } from "./index";
+import { replayMessageHistory, resolveAuth, runChatLoop, sanitizeOrphanToolUses } from "./index";
 
 // Route session-store/event-log writes to a per-file tmpdir so tests do
 // not pollute `.crewhaus/sessions/` in the repo. runtime-core honours
@@ -2467,5 +2467,344 @@ describe("runChatLoop — maxToolIterations enforcement", () => {
     // call per tool cycle, plus the one that trips the cap.
     expect(calls).toBeLessThanOrEqual(5);
     expect(calls).toBeGreaterThanOrEqual(3);
+  });
+});
+
+describe("max_tokens mid-tool_use truncation does not brick the session", () => {
+  // Regression for the CrewHaus "max_tokens truncation brick": when the model
+  // is cut off mid-`tool_use` by `stop_reason: "max_tokens"`, the partial call
+  // has no `tool_result`. Committing that orphan made every later request 400
+  // ("tool_use ids ... without tool_result blocks"); the `continue`/`tombstone`
+  // recovery actions only appended text, so the run looped to a 400 until the
+  // tombstone budget was spent and threw `recovery failed: tombstone budget
+  // exhausted`. The orphan is now stripped at the source (and on replay, and by
+  // tombstone reconciliation).
+
+  describe("sanitizeOrphanToolUses", () => {
+    test("drops a tool_use with no answering tool_result", () => {
+      const { messages, removed } = sanitizeOrphanToolUses([
+        { role: "user", content: "go" },
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: "writing", citations: null } as Anthropic.TextBlock,
+            {
+              type: "tool_use",
+              id: "tu_orphan",
+              name: "Write",
+              input: {},
+            } as Anthropic.ToolUseBlock,
+          ],
+        },
+      ]);
+      expect(removed).toBe(1);
+      const last = messages[messages.length - 1];
+      expect(last?.role).toBe("assistant");
+      const blocks = last?.content as Anthropic.ContentBlock[];
+      expect(blocks.every((b) => b.type !== "tool_use")).toBe(true);
+      expect(blocks[0]?.type).toBe("text");
+    });
+
+    test("keeps a tool_use that IS answered by a later tool_result", () => {
+      const { messages, removed } = sanitizeOrphanToolUses([
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "tu_ok",
+              name: "echo",
+              input: { msg: "hi" },
+            } as Anthropic.ToolUseBlock,
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "tu_ok",
+              content: "hi",
+            } as Anthropic.ToolResultBlockParam,
+          ],
+        },
+      ]);
+      expect(removed).toBe(0);
+      expect((messages[0]?.content as Anthropic.ContentBlock[])[0]?.type).toBe("tool_use");
+    });
+
+    test("removes an assistant message that becomes empty after stripping", () => {
+      const { messages, removed } = sanitizeOrphanToolUses([
+        { role: "user", content: "go" },
+        {
+          role: "assistant",
+          content: [
+            { type: "tool_use", id: "tu_only", name: "Write", input: {} } as Anthropic.ToolUseBlock,
+          ],
+        },
+      ]);
+      expect(removed).toBe(1);
+      expect(messages.length).toBe(1);
+      expect(messages[0]?.role).toBe("user");
+    });
+
+    test("is a no-op on a healthy history (string + paired tool content untouched)", () => {
+      const healthy: Anthropic.MessageParam[] = [
+        { role: "user", content: "go" },
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "ok", citations: null } as Anthropic.TextBlock],
+        },
+      ];
+      const { messages, removed } = sanitizeOrphanToolUses(healthy);
+      expect(removed).toBe(0);
+      expect(messages).toEqual(healthy);
+    });
+  });
+
+  test("replayMessageHistory drops an orphan tool_use so --resume self-heals", async () => {
+    // A session a pre-fix runtime bricked: the assistant turn was committed
+    // with a dangling tool_use and no tool_result ever followed. (Unique
+    // session id — the event log is keyed by it and shared per test file.)
+    const sessionId = "sess_cccccccccccccccc";
+    const { openEventLog } = await import("@crewhaus/event-log");
+    const log = await openEventLog(sessionId, { rootDir: SHARED_SESSION_ROOT });
+    await log.append({ kind: "user_message", payload: { content: "write the files" } });
+    await log.append({
+      kind: "assistant_message",
+      payload: {
+        content: [
+          { type: "text", text: "starting", citations: null },
+          { type: "tool_use", id: "tu_orphan", name: "Write", input: { __parse_error: true } },
+        ],
+      },
+    });
+    // No tool_result; recovery nudges were appended as plain text, as the
+    // bricked runtime did.
+    await log.append({
+      kind: "user_message",
+      payload: { content: "Please continue from where you left off." },
+    });
+    await log.close();
+
+    const reopened = await openEventLog(sessionId, { rootDir: SHARED_SESSION_ROOT });
+    const replayed = await replayMessageHistory(reopened);
+    await reopened.close();
+
+    const allBlocks = replayed.flatMap((m) =>
+      Array.isArray(m.content) ? (m.content as Anthropic.ContentBlock[]) : [],
+    );
+    expect(allBlocks.some((b) => b.type === "tool_use")).toBe(false);
+    // The assistant's text survives; the orphan tool_use is gone.
+    const assistant = replayed.find((m) => m.role === "assistant");
+    expect(assistant).toBeDefined();
+    expect((assistant?.content as Anthropic.ContentBlock[])[0]?.type).toBe("text");
+  });
+
+  // Adapter whose first turn is cut off mid-tool_use (stop_reason "max_tokens",
+  // no content_block_stop for the tool_use), then completes cleanly on retry.
+  function makeTruncatedThenOkClient(): {
+    adapter: import("@crewhaus/adapter-anthropic").ProviderAdapter;
+    callCount: () => number;
+    capturedMessages: () => ReadonlyArray<ReadonlyArray<Anthropic.MessageParam>>;
+  } {
+    const captures: Anthropic.MessageParam[][] = [];
+    let i = 0;
+    const adapter: import("@crewhaus/adapter-anthropic").ProviderAdapter = {
+      providerId: "anthropic",
+      features: {
+        caching: "explicit",
+        tool_use: true,
+        vision: true,
+        thinking: true,
+        web_search: true,
+      },
+      estimateTokens: () => 0,
+      stream: (req) => {
+        captures.push(req.messages.map((m) => ({ ...m })) as Anthropic.MessageParam[]);
+        const call = i;
+        i++;
+        return (async function* () {
+          yield { kind: "message_start" } as const;
+          if (call === 0) {
+            yield {
+              kind: "content_block_start",
+              index: 0,
+              block: { type: "text", text: "" },
+            } as const;
+            yield {
+              kind: "content_block_delta",
+              index: 0,
+              delta: { type: "text_delta", text: "starting to write files" },
+            } as const;
+            yield { kind: "content_block_stop", index: 0 } as const;
+            // tool_use begins but is NEVER closed — the cutoff.
+            yield {
+              kind: "content_block_start",
+              index: 1,
+              block: { type: "tool_use", id: "tu_trunc", name: "Write", input: {} },
+            } as const;
+            yield {
+              kind: "content_block_delta",
+              index: 1,
+              delta: { type: "input_json_delta", partial_json: '{"path":"/a","content":"par' },
+            } as const;
+            yield { kind: "message_delta", stopReason: "max_tokens" } as const;
+            yield { kind: "message_stop" } as const;
+          } else {
+            yield {
+              kind: "content_block_start",
+              index: 0,
+              block: { type: "text", text: "" },
+            } as const;
+            yield {
+              kind: "content_block_delta",
+              index: 0,
+              delta: { type: "text_delta", text: "done" },
+            } as const;
+            yield { kind: "content_block_stop", index: 0 } as const;
+            yield { kind: "message_delta", stopReason: "end_turn" } as const;
+            yield { kind: "message_stop" } as const;
+          }
+        })();
+      },
+    };
+    return { adapter, callCount: () => i, capturedMessages: () => captures };
+  }
+
+  test("recovers via continue and never sends an orphan tool_use to the API", async () => {
+    const writeTool = buildTool({
+      name: "Write",
+      description: "writes a file",
+      inputSchema: z.object({ path: z.string(), content: z.string() }),
+      execute: async () => "written",
+    });
+    const { adapter, callCount, capturedMessages } = makeTruncatedThenOkClient();
+    const input = new PassThrough();
+    input.write("write some files\n");
+    input.end();
+
+    // The brick used to surface here as a thrown RuntimeError; the run must
+    // now complete normally.
+    await runChatLoop({
+      model: "test-model",
+      instructions: "test",
+      _adapter: adapter,
+      input,
+      tools: [writeTool],
+      permissionMode: "bypass",
+    });
+
+    // The truncation routed to recovery, which asked the model to continue.
+    expect(callCount()).toBeGreaterThanOrEqual(2);
+
+    // The request issued AFTER the truncation must contain NO orphan tool_use
+    // (the only tool_use was the truncated one — it was stripped before commit).
+    const retryMessages = capturedMessages()[1] ?? [];
+    const retryBlocks = retryMessages.flatMap((m) =>
+      Array.isArray(m.content) ? (m.content as Anthropic.ContentBlock[]) : [],
+    );
+    expect(retryBlocks.some((b) => b.type === "tool_use")).toBe(false);
+    // The salvageable text survived, and a continue nudge was appended.
+    expect(
+      retryMessages.some(
+        (m) =>
+          m.role === "assistant" &&
+          Array.isArray(m.content) &&
+          m.content.some((b) => b.type === "text" && b.text.includes("starting to write files")),
+      ),
+    ).toBe(true);
+    expect(
+      retryMessages.some(
+        (m) => m.role === "user" && m.content === "Please continue from where you left off.",
+      ),
+    ).toBe(true);
+  });
+
+  test("a turn truncated to ONLY an orphan tool_use commits nothing and still recovers", async () => {
+    // Same as above but the model emitted no salvageable text before the cutoff,
+    // so stripping the orphan leaves an empty turn that must be skipped (an empty
+    // assistant message is itself a 400).
+    const captures: Anthropic.MessageParam[][] = [];
+    let i = 0;
+    const adapter: import("@crewhaus/adapter-anthropic").ProviderAdapter = {
+      providerId: "anthropic",
+      features: {
+        caching: "explicit",
+        tool_use: true,
+        vision: true,
+        thinking: true,
+        web_search: true,
+      },
+      estimateTokens: () => 0,
+      stream: (req) => {
+        captures.push(req.messages.map((m) => ({ ...m })) as Anthropic.MessageParam[]);
+        const call = i;
+        i++;
+        return (async function* () {
+          yield { kind: "message_start" } as const;
+          if (call === 0) {
+            yield {
+              kind: "content_block_start",
+              index: 0,
+              block: { type: "tool_use", id: "tu_only", name: "Write", input: {} },
+            } as const;
+            yield {
+              kind: "content_block_delta",
+              index: 0,
+              delta: { type: "input_json_delta", partial_json: '{"path":"/x' },
+            } as const;
+            yield { kind: "message_delta", stopReason: "max_tokens" } as const;
+            yield { kind: "message_stop" } as const;
+          } else {
+            yield {
+              kind: "content_block_start",
+              index: 0,
+              block: { type: "text", text: "" },
+            } as const;
+            yield {
+              kind: "content_block_delta",
+              index: 0,
+              delta: { type: "text_delta", text: "done" },
+            } as const;
+            yield { kind: "content_block_stop", index: 0 } as const;
+            yield { kind: "message_delta", stopReason: "end_turn" } as const;
+            yield { kind: "message_stop" } as const;
+          }
+        })();
+      },
+    };
+    const input = new PassThrough();
+    input.write("write a file\n");
+    input.end();
+
+    await runChatLoop({
+      model: "test-model",
+      instructions: "test",
+      _adapter: adapter,
+      input,
+      tools: [
+        buildTool({
+          name: "Write",
+          description: "writes a file",
+          inputSchema: z.object({ path: z.string() }),
+          execute: async () => "written",
+        }),
+      ],
+      permissionMode: "bypass",
+    });
+
+    expect(i).toBeGreaterThanOrEqual(2);
+    const retryMessages = captures[1] ?? [];
+    // No tool_use anywhere, and no empty assistant message was committed.
+    const retryBlocks = retryMessages.flatMap((m) =>
+      Array.isArray(m.content) ? (m.content as Anthropic.ContentBlock[]) : [],
+    );
+    expect(retryBlocks.some((b) => b.type === "tool_use")).toBe(false);
+    expect(
+      retryMessages.some(
+        (m) => m.role === "assistant" && Array.isArray(m.content) && m.content.length === 0,
+      ),
+    ).toBe(false);
   });
 });
