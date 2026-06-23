@@ -7,7 +7,6 @@ import {
   ARCHES,
   BUILD_MATRIX,
   type BuildBinaryRunner,
-  type BuildTarget,
   PLATFORMS,
   SingleBinaryError,
   binaryName,
@@ -39,12 +38,25 @@ describe("BUILD_MATRIX shape", () => {
 });
 
 describe("bunCompileTarget", () => {
-  test.each(BUILD_MATRIX.map((t): [BuildTarget, string] => [t, `bun-${t.platform}-${t.arch}`]))(
-    "%j → %s",
-    (t, expected) => {
-      expect(bunCompileTarget(t)).toBe(expected);
-    },
-  );
+  test("linux/windows x64 compile against the AVX-free -baseline runtime", () => {
+    expect(bunCompileTarget({ platform: "linux", arch: "x64" })).toBe("bun-linux-x64-baseline");
+    expect(bunCompileTarget({ platform: "windows", arch: "x64" })).toBe("bun-windows-x64-baseline");
+  });
+
+  test("macos x64 stays on the default target (Bun ships no AVX-free macOS build)", () => {
+    expect(bunCompileTarget({ platform: "macos", arch: "x64" })).toBe("bun-macos-x64");
+  });
+
+  test("arm64 targets have no baseline variant", () => {
+    expect(bunCompileTarget({ platform: "linux", arch: "arm64" })).toBe("bun-linux-arm64");
+    expect(bunCompileTarget({ platform: "macos", arch: "arm64" })).toBe("bun-macos-arm64");
+  });
+
+  test("every BUILD_MATRIX target produces a valid bun-<platform>-<arch>[-baseline] string", () => {
+    for (const t of BUILD_MATRIX) {
+      expect(bunCompileTarget(t)).toMatch(new RegExp(`^bun-${t.platform}-${t.arch}(-baseline)?$`));
+    }
+  });
 });
 
 describe("binaryName", () => {
@@ -97,7 +109,7 @@ describe("buildBinary() (T2 dry-run)", () => {
     expect(captured).toContain("build");
     expect(captured).toContain("--compile");
     expect(captured).toContain("--target");
-    expect(captured).toContain("bun-linux-x64");
+    expect(captured).toContain("bun-linux-x64-baseline");
     expect(captured).toContain("--outfile");
     expect(captured).toContain("/tmp/dist/crewhaus-linux-x64-1.2.3");
     expect(captured).toContain("--define");
@@ -164,6 +176,9 @@ describe("manifest rendering (T1)", () => {
     expect(formula).toContain('version "1.0.0"');
     expect(formula).toContain("on_macos");
     expect(formula).toContain("on_linux");
+    // Apple Silicon under a Rosetta'd x86_64 brew must still get the arm64 binary
+    // (Bun's macOS x64 runtime needs AVX2, which Rosetta lacks).
+    expect(formula).toContain("Hardware::CPU.physical_cpu_arm64?");
     expect(formula).toContain('license "Apache-2.0"');
     expect(formula).toContain(sha256["macos-arm64"]);
     expect(formula).toContain(sha256["macos-x64"]);
