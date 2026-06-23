@@ -204,6 +204,9 @@ export type IrV0 = {
   readonly agent: {
     readonly model: string;
     readonly instructions: string;
+    /** Model max OUTPUT tokens for one turn (spec `agent.max_tokens`).
+     *  Optional; when absent the runtime default applies. */
+    readonly maxTokens?: number;
   };
   readonly tools: readonly string[];
   readonly toolConfigs: IrToolConfigs;

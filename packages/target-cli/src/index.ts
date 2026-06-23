@@ -436,11 +436,13 @@ if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));`;
   const sandboxField = hasSandboxTools
     ? '\n  sandboxAvailable: ((process.env.CREWHAUS_SANDBOX ?? "docker").toLowerCase() !== "noop"),'
     : "";
+  const maxTokensField =
+    ir.agent.maxTokens !== undefined ? `\n  maxTokens: ${ir.agent.maxTokens},` : "";
   const runChatLoopCall = `await runChatLoop({
   model: ${escapeJsonString(ir.agent.model)},
   instructions: ${escapeJsonString(ir.agent.instructions)},
   sessionName: ${escapeJsonString(ir.name)},
-  sessionTarget: "cli",${toolsField}${permField}${sandboxField}
+  sessionTarget: "cli",${maxTokensField}${toolsField}${permField}${sandboxField}
   hooks: __hooks,
   skills: __skills,
   slashCommands: __slashCommands,${subAgents.subAgentsField}${subAgents.spawnField}${egress.field}

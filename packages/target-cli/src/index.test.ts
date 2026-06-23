@@ -435,3 +435,20 @@ describe("emitCli — egress matcher (Pillar 3 sink-side, FR-006)", () => {
     expect(content).toContain("egressMatcher: __egressMatcher");
   });
 });
+
+describe("emitCli — agent.maxTokens (max output tokens)", () => {
+  test("emits maxTokens in the runChatLoop call when the IR sets it", () => {
+    const content =
+      emitCli(
+        baseIr({
+          agent: { model: "claude-sonnet-4-6", instructions: "be helpful", maxTokens: 16384 },
+        }),
+      ).files[0]?.content ?? "";
+    expect(content).toContain("maxTokens: 16384,");
+  });
+
+  test("omits maxTokens entirely when the IR leaves it unset", () => {
+    const content = emitCli(baseIr()).files[0]?.content ?? "";
+    expect(content).not.toContain("maxTokens:");
+  });
+});
