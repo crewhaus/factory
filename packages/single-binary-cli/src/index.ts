@@ -52,9 +52,23 @@ export const BUILD_MATRIX: readonly BuildTarget[] = [
   { platform: "windows", arch: "x64" },
 ];
 
-/** Bun's --target string for a given (platform, arch) pair. */
+/**
+ * Bun's --target string for a given (platform, arch) pair.
+ *
+ * Linux/Windows x64 compile against Bun's `-baseline` runtime so the binary
+ * runs on x64 CPUs/VMs without AVX2 (older servers, some cloud/CI hosts). Those
+ * baseline builds are genuinely AVX-free, distinct binaries.
+ *
+ * macOS x64 deliberately stays on the default target: Bun ships NO AVX-free
+ * macOS build (`bun-darwin-x64-baseline.zip` contains the byte-identical binary
+ * as `bun-darwin-x64.zip`), so `-baseline` would be a pure no-op there. The real
+ * macOS hazard is an Apple-Silicon host running the x64 binary under Rosetta 2
+ * (which emulates a pre-AVX CPU); those users are steered to the native arm64
+ * binary by the Homebrew formula instead. arm64 has no baseline variant.
+ */
 export function bunCompileTarget(t: BuildTarget): string {
-  return `bun-${t.platform}-${t.arch}`;
+  const baseline = t.arch === "x64" && t.platform !== "macos";
+  return `bun-${t.platform}-${t.arch}${baseline ? "-baseline" : ""}`;
 }
 
 /**
@@ -181,11 +195,16 @@ export function renderHomebrewFormula(inputs: ManifestInputs): string {
   license "Apache-2.0"
 
   on_macos do
-    on_arm do
+    # An x86_64 Homebrew running under Rosetta 2 on Apple Silicon reports
+    # Hardware::CPU.intel?, but the x64 binary then executes under Rosetta — which
+    # emulates a pre-AVX (Westmere) CPU. Bun's macOS x64 runtime requires AVX2 and
+    # there is no AVX-free macOS Bun build, so it warns ("CPU lacks AVX support")
+    # and may crash. Serve the native arm64 binary on every Apple-Silicon host,
+    # translated or not. Genuine Intel Macs (AVX2-capable) still get the x64 build.
+    if Hardware::CPU.physical_cpu_arm64?
       url "${downloadBaseUrl}/crewhaus-macos-arm64-${version}"
       sha256 "${macosArm64}"
-    end
-    on_intel do
+    else
       url "${downloadBaseUrl}/crewhaus-macos-x64-${version}"
       sha256 "${macosX64}"
     end

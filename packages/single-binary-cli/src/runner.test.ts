@@ -80,7 +80,7 @@ describe("defaultRunner (real child_process path, mocked spawn)", () => {
     expect(captured.head).toBe("bun");
     expect(captured.rest).toContain("build");
     expect(captured.rest).toContain("--compile");
-    expect(captured.rest).toContain("bun-linux-x64");
+    expect(captured.rest).toContain("bun-linux-x64-baseline");
     // cwd is REPO_ROOT (two levels above the package).
     expect(captured.cwd).toBe(REPO_ROOT);
     expect(result.outPath).toBe("/tmp/sbc-runner-dist/crewhaus-linux-x64-9.9.9");
