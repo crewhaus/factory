@@ -1445,6 +1445,95 @@ describe("runChatLoop — streaming loop-warning injection", () => {
 });
 
 // ===========================================================================
+// Working-indicator spinner: end-to-end cursor hygiene under streaming with
+// overlapping (concurrency-safe) tools. The spinner hides the cursor on start
+// and must restore it on every stop — so across a full turn the count of
+// hide-cursor escapes must equal show-cursor escapes (no leaked hidden cursor),
+// even when the streaming executor dispatches tools with overlap. `spinner:true`
+// forces the animation on despite the injected `input` (which normally gates it
+// off). Guards the teardown/leak path surfaced by adversarial review.
+// ===========================================================================
+
+describe("runChatLoop — spinner cursor hygiene", () => {
+  const HIDE = "\x1b[?25l";
+  const SHOW = "\x1b[?25h";
+  const countOf = (hay: string, needle: string): number => hay.split(needle).length - 1;
+
+  test("streaming with two concurrency-safe tools leaves no hidden cursor", async () => {
+    const mkTool = (name: string) =>
+      buildTool({
+        name,
+        description: name,
+        inputSchema: z.object({}),
+        readOnly: true,
+        concurrencySafe: true,
+        execute: async () => `ran:${name}`,
+      });
+    // One model response emits BOTH tool_use blocks (the executor may run them
+    // with overlap); the next response ends the turn with text.
+    const adapter = streamingScriptedAdapter([
+      [toolUse("tu_a", "alpha"), toolUse("tu_b", "beta")],
+      [textBlock("done")],
+    ]);
+    const input = new PassThrough();
+    input.write("go\n");
+    input.end();
+
+    const cap = captureStdout();
+    try {
+      await runChatLoopFresh({
+        model: "test-model",
+        instructions: "t",
+        _adapter: adapter,
+        input,
+        tools: [mkTool("alpha"), mkTool("beta")],
+        streaming: true,
+        permissionMode: "bypass",
+        spinner: true,
+      });
+    } finally {
+      cap.restore();
+    }
+
+    const joined = cap.writes.join("");
+    // The animation actually ran...
+    expect(countOf(joined, HIDE)).toBeGreaterThan(0);
+    // ...and every hide-cursor was matched by a show-cursor: no leak, terminal
+    // is left with a visible cursor regardless of tool-dispatch interleaving.
+    expect(countOf(joined, SHOW)).toBe(countOf(joined, HIDE));
+    // Both tool headers and the final text survive the animation intact.
+    expect(joined).toContain("[tool: alpha]");
+    expect(joined).toContain("[tool: beta]");
+    expect(joined).toContain("done");
+  });
+
+  test("spinner stays off (no cursor codes) for piped/non-forced runs", async () => {
+    const adapter = streamingScriptedAdapter([[textBlock("hi")]]);
+    const input = new PassThrough();
+    input.write("yo\n");
+    input.end();
+    const cap = captureStdout();
+    try {
+      // No `spinner` override + injected `input` ⇒ disabled ⇒ byte-identical
+      // to the pre-spinner behavior (no hide/show-cursor escapes at all).
+      await runChatLoopFresh({
+        model: "test-model",
+        instructions: "t",
+        _adapter: adapter,
+        input,
+        streaming: true,
+      });
+    } finally {
+      cap.restore();
+    }
+    const joined = cap.writes.join("");
+    expect(countOf(joined, HIDE)).toBe(0);
+    expect(countOf(joined, SHOW)).toBe(0);
+    expect(joined).toContain("hi");
+  });
+});
+
+// ===========================================================================
 // singleTurn: seeded assistant logging, pre-turn compaction callback,
 // lastTurnIndex update failure in the finally
 // ===========================================================================
