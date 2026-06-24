@@ -79,6 +79,7 @@ import {
 } from "./cli-markdown";
 import { attachDefaultSubscribers } from "./observability";
 import { loadProjectMemory } from "./project-memory";
+import { type CliOutput, createCliOutput, isSpinnerEnabled } from "./spinner";
 
 /**
  * Slice-scope runtime: a multi-turn streaming chat loop with prompt
@@ -370,6 +371,14 @@ export type RunChatLoopOptions = {
    * (mid-stream) rather than waiting for the full response. Default: false.
    */
   streaming?: boolean;
+  /**
+   * Animate a "working" indicator (spinner + status label) on the otherwise
+   * silent waits — model thinking, tool execution, retry/compaction. When
+   * omitted, auto-enables only for an interactive REPL on a TTY with a
+   * spinner-friendly env (see `isSpinnerEnabled`); force off with `false`.
+   * `singleTurn` and injected-`input` runs never spin.
+   */
+  spinner?: boolean;
   /**
    * Override the directory under which session metadata `.json` files and
    * event-log `.jsonl` files live. Defaults to `.crewhaus/sessions`.
@@ -790,22 +799,38 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   void TraceEventBus; // keep type import alive for future direct constructions
   const subscribers = await attachDefaultSubscribers(bus, runContext);
 
+  // Working-indicator spinner. Auto-enables only for an interactive REPL on a
+  // TTY (see `isSpinnerEnabled`); `singleTurn`/injected-`input`/piped runs stay
+  // byte-identical to before. `out.write` is the spinner-aware stdout sink:
+  // every interactive write that can land while the animation is live goes
+  // through it so the two never collide. `opts.spinner` overrides the auto
+  // decision.
+  const spinnerEnabled =
+    opts.spinner ?? (opts.singleTurn !== true && opts.input === undefined && isSpinnerEnabled());
+  const out: CliOutput = createCliOutput({ enabled: spinnerEnabled });
+
   // M2.1 — CLI markdown renderer (env-gated). When CREWHAUS_CLI_MARKDOWN=1,
   // text-delta chunks flow through a streaming markdown → ANSI transform so
   // the user sees rendered bold/italic/headers/lists/code-fences instead of
   // raw asterisks. The renderer is line-buffered; chunks accumulate until a
   // `\n` arrives, then the rendered line writes to stdout. `end()` is
-  // called after the per-turn `\n` to flush any tail content.
+  // called after the per-turn `\n` to flush any tail content. Its sink is the
+  // spinner-aware writer so a flushed line erases any live animation first.
   const mdRenderer: StreamRenderer | undefined = isCliMarkdownEnabled()
-    ? createCliMarkdownRenderer()
+    ? createCliMarkdownRenderer({ write: (s) => out.write(s) })
     : undefined;
   const writeText = (chunk: string): void => {
+    // First real assistant text ends the "thinking" wait; clear the spinner
+    // (idempotent on later chunks) before the answer streams.
+    out.spinner.stop();
     if (mdRenderer) mdRenderer.push(chunk);
-    else process.stdout.write(chunk);
+    else out.write(chunk);
   };
   const endTurn = (): void => {
+    // Covers the no-text/no-tool case where the spinner is still up.
+    out.spinner.stop();
     if (mdRenderer) mdRenderer.end();
-    process.stdout.write("\n");
+    out.write("\n");
   };
 
   const eventLog: EventLog = await openEventLog(sessionId, { rootDir: sessionRootDir });
@@ -1022,6 +1047,26 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   const toolUseHistory: TsmToolUseBlock[] = [];
   const warnedLoopSignatures = new Set<string>();
 
+  // Working-indicator bookkeeping for tool execution. A single shared spinner
+  // serves the whole loop, so the set tracks which tools are mid-flight to
+  // support the concurrent (read-only) partition: the label reflects how many
+  // run at once, and the animation only stops when the last one settles.
+  const activeToolNames: string[] = [];
+  const toolSpinnerLabel = (): string =>
+    activeToolNames.length === 1
+      ? `running ${activeToolNames[0]}`
+      : `running ${activeToolNames.length} tools`;
+  const beginToolWork = (name: string): void => {
+    activeToolNames.push(name);
+    out.spinner.start(toolSpinnerLabel());
+  };
+  const endToolWork = (name: string): void => {
+    const i = activeToolNames.indexOf(name);
+    if (i >= 0) activeToolNames.splice(i, 1);
+    if (activeToolNames.length === 0) out.spinner.stop();
+    else out.spinner.setLabel(toolSpinnerLabel());
+  };
+
   /**
    * Execute one tool_use block end-to-end: permission gate → executeTool
    * with the per-tool abort signal → wrap large output through
@@ -1032,7 +1077,15 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
    * path so the permission/abort/store contract is uniform.
    */
   async function executeOneToolUse(tu: TsmToolUseBlock): Promise<Anthropic.ToolResultBlockParam> {
-    process.stdout.write(`[tool: ${tu.name}]\n`);
+    // End the "thinking" wait — but only when no tool is already mid-flight.
+    // The streaming executor dispatches concurrency-safe tools with overlap, so
+    // an unconditional stop here would tear down a sibling tool's live spinner;
+    // gate on the ref-count so we stop the thinking animation (none running)
+    // without disturbing a running-tools one. The header then goes through the
+    // spinner-aware sink, which erases+redraws around it so the persistent
+    // `[tool: …]` line sits cleanly above any animation that follows.
+    if (activeToolNames.length === 0) out.spinner.stop();
+    out.write(`[tool: ${tu.name}]\n`);
     await logEvent("tool_use", { id: tu.id, name: tu.name, input: tu.input });
     const inputBytes = Buffer.byteLength(JSON.stringify(tu.input ?? null), "utf8");
     const toolStartEnvelope = bus.envelope();
@@ -1328,6 +1381,10 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       ...(opts.spawnSubAgent !== undefined ? { spawnSubAgent: opts.spawnSubAgent } : {}),
       ...(opts.crewMailbox !== undefined ? { crewMailbox: opts.crewMailbox } : {}),
     };
+    // Spin "running <tool>…" for exactly the execution window — started after
+    // every gate (permission/justification/egress) so it never overlaps the
+    // approval prompt, and torn down in `.finally` on success or throw.
+    beginToolWork(tu.name);
     const raw = await executeTool(tool, tu.input, {
       toolUseId: tu.id,
       signal: toolAbort.signal,
@@ -1358,7 +1415,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           { ephemeral: true },
         );
       },
-    });
+    }).finally(() => endToolWork(tu.name));
     const toolResultRoot = resolveToolResultRoot();
     const stored = await storeAndPreview(
       { toolUseId: raw.toolUseId, content: raw.content, isError: raw.isError },
@@ -1613,7 +1670,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
 
       switch (state.kind) {
         case "NeedModel": {
-          process.stdout.write("agent> ");
+          out.write("agent> ");
           // Section 11 — pre-model hook. Deny short-circuits the turn with
           // a synthetic "[blocked by hook]" assistant message so the loop
           // exits cleanly (state transitions through ModelReturnedText →
@@ -1625,7 +1682,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           });
           if (!preModel.allowed) {
             const blockedText = `[blocked by hook] ${preModel.reason ?? "denied"}`;
-            process.stdout.write(`${blockedText}\n`);
+            out.write(`${blockedText}\n`);
             const blockedBlock: Anthropic.TextBlock = {
               type: "text",
               text: blockedText,
@@ -1637,6 +1694,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             state = transition(state, { kind: "ModelReturnedText" });
             break;
           }
+          // Animate "thinking…" through the model wait. The `agent> ` prefix
+          // is kept across redraws and left behind when the spinner stops on
+          // the first text delta (`writeText`) or tool header — so the silent
+          // gap before the model responds now shows live progress. Cleared in
+          // the catch below on any model-call error.
+          out.spinner.start("thinking", { prefix: "agent> " });
           try {
             // Section 27 — rate-limit the model call before opening the
             // stream. The keys are caller-configured (typically
@@ -1909,6 +1972,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               state = transition(state, { kind: "ModelReturnedToolUse", toolUses: tsmBlocks });
             }
           } catch (err) {
+            // Tear down the "thinking" animation before any error/abort output.
+            out.spinner.stop();
             if (isAbortError(err)) {
               state = transition(state, { kind: "Aborted" });
               break;
@@ -1982,6 +2047,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             case "compact": {
               const before = messages.length;
               await fireHook("pre-compact", { kind: "reactive", before });
+              // Reactive compaction summarizes via a model call — show the wait.
+              out.spinner.start("compacting context");
               const compacted = await forceCompact({
                 messages,
                 adapter: compactionAdapter,
@@ -1989,7 +2056,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 snipKeepHead,
                 snipKeepTail,
                 logger: runContext.logger,
-              });
+              }).finally(() => out.spinner.stop());
               messages.length = 0;
               messages.push(...compacted);
               await logEvent("compaction", {
@@ -2014,7 +2081,10 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               break;
             }
             case "retry":
+              // Surface the back-off wait instead of stalling silently.
+              out.spinner.start("retrying");
               await new Promise((resolve) => setTimeout(resolve, action.delayMs));
+              out.spinner.stop();
               state = transition(state, { kind: "RecoveryDone" });
               break;
             case "continue": {
@@ -2148,6 +2218,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         .map((b) => b.text)
         .join("");
     } finally {
+      out.spinner.stop();
       await fireHook("stop", {
         sessionId,
         turnCount: runContext.turnNumber,
@@ -2238,12 +2309,14 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   const shouldInstallSigint = opts.installSigintHandler ?? opts.input === undefined;
   let sigintPresses = 0;
   const sigintHandler = (): void => {
+    // Clear any live animation (and restore the cursor) before the notice.
+    out.spinner.stop();
     sigintPresses += 1;
     if (sigintPresses === 1) {
-      process.stdout.write("\n[turn aborted; press Ctrl-C again to exit]\n");
+      out.write("\n[turn aborted; press Ctrl-C again to exit]\n");
       turnAbort.abort();
     } else {
-      process.stdout.write("\n[exiting]\n");
+      out.write("\n[exiting]\n");
       process.exit(130);
     }
   };
@@ -2343,9 +2416,11 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       try {
         await runOneTurn(messages);
       } catch (err) {
+        // Defensive: tear down any animation a thrown turn left spinning.
+        out.spinner.stop();
         if (isAbortError(err)) {
           // Already-handled abort; loop back to the prompt.
-          process.stdout.write("\n[turn aborted]\n");
+          out.write("\n[turn aborted]\n");
         } else {
           throw err;
         }
@@ -2362,6 +2437,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       });
     }
   } finally {
+    out.spinner.stop();
     await fireHook("stop", {
       sessionId,
       turnCount: runContext.turnNumber,
