@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import type { SubAgentDefinition } from "@crewhaus/agent-context-isolation";
 import { SpecParseError, compile, lower } from "@crewhaus/compiler";
 import { buildContextBundle, discoverRoots } from "@crewhaus/context-bundle";
@@ -606,7 +606,12 @@ agent:
 `;
   writeFileSync(targetFile, yamlText);
   process.stdout.write(`wrote ${targetFile}\n`);
-  process.stdout.write(`next: bun crewhaus run ${targetFile}\n`);
+  // The runtime resolves the spec and the `.crewhaus/` session store from
+  // the current working directory, so guide the user to run from inside
+  // the harness directory (where crewhaus.yaml lives), not from here.
+  const rel = relative(process.cwd(), targetDir);
+  const cd = rel === "" ? "" : `cd ${rel} && `;
+  process.stdout.write(`next: ${cd}crewhaus run crewhaus.yaml\n`);
   logger.debug("init.success", { target: targetFile });
 }
 
@@ -842,8 +847,9 @@ async function runRunCli(
     const sessions = await store.list();
     const match = sessions.find((s: { name: string }) => s.name === ir.name);
     if (match === undefined) {
+      const absSpec = resolve(specPath);
       die(
-        `no prior session for spec "${ir.name}" in ${process.cwd()}/.crewhaus/sessions/. Start one with: crewhaus run ${specPath}`,
+        `no prior session for spec "${ir.name}" in ${process.cwd()}/.crewhaus/sessions/. Sessions are stored under the directory you run from — start one from the harness directory with: cd ${dirname(absSpec)} && crewhaus run ${basename(absSpec)}`,
       );
     }
     resumeId = match.id;

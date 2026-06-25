@@ -322,6 +322,8 @@ describe("crewhaus init", () => {
     expect(spec.agent.model).toBe("claude-opus-4-7");
     expect(spec.agent.instructions.length).toBeGreaterThan(0);
     expect(result.stdout).toMatch(/wrote .*crewhaus\.yaml/);
+    // Scaffolded in cwd → run in place, no cd needed.
+    expect(result.stdout).toContain("next: crewhaus run crewhaus.yaml");
   });
 
   test("scaffolds into a named subdirectory", async () => {
@@ -331,6 +333,9 @@ describe("crewhaus init", () => {
     expect(existsSync(written)).toBe(true);
     const spec = parseSpec(readFileSync(written, "utf-8"));
     expect(spec.name).toBe("myapp");
+    // Scaffolded into a subdir → the hint must cd into it so the runtime
+    // resolves the spec + .crewhaus/ session store from the harness dir.
+    expect(result.stdout).toContain("next: cd myapp && crewhaus run crewhaus.yaml");
   });
 
   test("fails when crewhaus.yaml already exists", async () => {
