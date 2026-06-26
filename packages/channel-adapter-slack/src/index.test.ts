@@ -38,10 +38,12 @@ describe("verifySlackSignature (T8 — security)", () => {
   test("rejects a request with a tampered signature", () => {
     const body = APP_MENTION;
     const headers = signedHeaders(body, SECRET);
-    headers.set(
-      "x-slack-signature",
-      `${headers.get("x-slack-signature")?.slice(0, -2) ?? "v0="}00`,
-    );
+    // Flip the final hex digit so the tamper is ALWAYS a real one-character
+    // change. (The old `slice(0, -2) + "00"` was a no-op ~1/256 of the time —
+    // whenever the timestamp-derived HMAC already ended in "00" — which made
+    // this test flaky.)
+    const real = headers.get("x-slack-signature") ?? "v0=0";
+    headers.set("x-slack-signature", real.slice(0, -1) + (real.endsWith("0") ? "1" : "0"));
     expect(verifySlackSignature({ headers, body, signingSecret: SECRET })).toBe(false);
   });
 
