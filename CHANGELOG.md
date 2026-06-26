@@ -49,6 +49,29 @@ External sources synthesized for this batch:
 - `bun run test:smoke`: 17/17 pass.
 - Full unit suite: 6016 pass / 0 fail / 2 skip across 440 files.
 
+## [0.1.6] - 2026-06-26
+
+Distribution + CLI quality-of-life fixes.
+
+### Fixed
+
+- **Homebrew installs on Apple Silicon under Rosetta no longer warn about AVX.** An
+  x86_64 Homebrew running under Rosetta 2 matched the formula's Intel branch and
+  installed `crewhaus-macos-x64`, which runs under Rosetta (a pre-AVX CPU) while
+  Bun's macOS x64 runtime needs AVX2 — printing "CPU lacks AVX support" on every
+  command. The formula now selects by physical CPU (`Hardware::CPU.physical_cpu_arm64?`)
+  so Apple Silicon always gets the native arm64 binary. Linux/Windows x64 binaries
+  now compile against Bun's AVX-free `-baseline` runtime. ([#250](https://github.com/crewhaus/factory/pull/250))
+- **Flaky `channel-adapter-slack` signature test.** The "tampered signature" case
+  mutated the signature by `slice(0, -2) + "00"`, a no-op ~1/256 of the time
+  (whenever the timestamp-derived HMAC already ended in "00"); it now flips the
+  final hex digit so the tamper is always a real change.
+
+### Added
+
+- **Working indicator during silent CLI waits.** ([#251](https://github.com/crewhaus/factory/pull/251))
+- **`crewhaus init` emits a standalone next-step hint** (`cd <dir> && crewhaus run crewhaus.yaml`). ([#252](https://github.com/crewhaus/factory/pull/252))
+
 ## [0.1.4] - 2026-06-17
 
 Small CLI/compiler/runtime fixes, each retiring a documented "gotcha" by fixing the
