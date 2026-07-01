@@ -70,6 +70,30 @@ function mockAdapter(
   } as unknown as ProviderAdapter;
 }
 
+/**
+ * A mock adapter that records the exact user-message text `next()` sends,
+ * then delegates to a normal `mockAdapter` so the call round-trips. Used
+ * to assert what the meta-prompt actually contains (failure block, grader
+ * rationale, ordering).
+ */
+function capturingAdapter(responseJson: string): {
+  adapter: ProviderAdapter;
+  sent: () => string;
+} {
+  let captured = "";
+  const delegate = mockAdapter(responseJson);
+  const adapter = {
+    ...delegate,
+    // biome-ignore lint/suspicious/noExplicitAny: minimal mock
+    stream(params: any): AsyncIterable<any> {
+      captured = String(params.messages[0].content);
+      // biome-ignore lint/suspicious/noExplicitAny: minimal mock
+      return (delegate.stream as (p: any) => AsyncIterable<any>)(params);
+    },
+  } as unknown as ProviderAdapter;
+  return { adapter, sent: () => captured };
+}
+
 const baseState: OptimizerState = {
   iteration: 1,
   best: {
@@ -297,6 +321,65 @@ describe("ClaudeMutationProvider", () => {
     // A larger window serializes more failure text → a larger input estimate,
     // exactly the case the original prompt-only heuristic under-counted.
     expect(wide).toBeGreaterThan(narrow + 18_000);
+  });
+
+  // Per-sample failure signal (`OptimizerState.bestGrades`). This is the
+  // signal the META_PROMPT_SYSTEM promises: the mutator must surface the
+  // samples the current best ACTUALLY fails — worst-first — WITH the grader
+  // rationale, so the rewrite can address the named root cause.
+  test("bestGrades: renders grader feedback and orders worst-scoring failures first", async () => {
+    const { adapter, sent } = capturingAdapter(`{"rewrite": "R", "rationale": "r"}`);
+    const provider = new ClaudeMutationProvider({ adapter, model: "claude-sonnet-4-5" });
+    const state: OptimizerState = {
+      ...baseState,
+      bestGrades: [
+        { input: "Q-passing", score: 1.0, rationale: "[grounded: ✓] cites docs/spec.md" },
+        { input: "Q-worst", score: 0.0, rationale: "[grounded: ✗] cites no source file" },
+        { input: "Q-mid", score: 0.25, rationale: "[grounded: ✗] weak citation" },
+      ],
+    };
+    await provider.next(state);
+    const msg = sent();
+    // Only below-threshold (score < 0.5) failures are surfaced — the
+    // passing sample is excluded.
+    expect(msg).toContain("Q-worst");
+    expect(msg).toContain("Q-mid");
+    expect(msg).not.toContain("Q-passing");
+    // The grader rationale is rendered so the model sees WHY it failed.
+    expect(msg).toContain("Grader feedback: [grounded: ✗] cites no source file");
+    // Worst score first: Q-worst (0.00) is listed before Q-mid (0.25).
+    expect(msg.indexOf("Q-worst")).toBeLessThan(msg.indexOf("Q-mid"));
+  });
+
+  test("bestGrades absent: falls back to dev-set inputs with no grader feedback", async () => {
+    const { adapter, sent } = capturingAdapter(`{"rewrite": "R", "rationale": "r"}`);
+    const provider = new ClaudeMutationProvider({ adapter, model: "claude-sonnet-4-5" });
+    await provider.next(baseState); // no bestGrades
+    const msg = sent();
+    // Pre-failure-signal behaviour: dev-set inputs surfaced, no rationale line.
+    expect(msg).toContain("What is 3+3?");
+    expect(msg).not.toContain("Grader feedback:");
+  });
+
+  test("bestGrades all above threshold: still surfaces the lowest scorer as a target", async () => {
+    const { adapter, sent } = capturingAdapter(`{"rewrite": "R", "rationale": "r"}`);
+    const provider = new ClaudeMutationProvider({
+      adapter,
+      model: "claude-sonnet-4-5",
+      maxFailuresInPrompt: 1,
+    });
+    const state: OptimizerState = {
+      ...baseState,
+      bestGrades: [
+        { input: "Q-high", score: 0.9 },
+        { input: "Q-lower", score: 0.6 },
+      ],
+    };
+    await provider.next(state);
+    const msg = sent();
+    // No sample is below 0.5, so the single lowest scorer is chosen.
+    expect(msg).toContain("Q-lower");
+    expect(msg).not.toContain("Q-high");
   });
 });
 

@@ -54,11 +54,12 @@ export class ClaudeMutationProviderError extends CrewhausError {
   }
 }
 
-const META_PROMPT_SYSTEM = `You are a prompt-engineering optimiser. You will receive a CURRENT PROMPT and a SAMPLE OF DEV-SET FAILURES (each failure shows the input the model received and how the grader scored its output). Your job is to produce a single rewrite of CURRENT PROMPT that you believe will improve grader scores on the dev set.
+const META_PROMPT_SYSTEM = `You are a prompt-engineering optimiser. You will receive a CURRENT PROMPT and a SAMPLE OF DEV-SET FAILURES. Each failure shows the input the model received, its observed score (0..1, lower is worse), and — when available — the grader's feedback explaining WHY the output lost points. Your job is to produce a single rewrite of CURRENT PROMPT that you believe will improve grader scores on the dev set.
 
 Hard rules:
 - Output exactly one JSON object: {"rewrite": "...", "rationale": "..."}
 - The "rewrite" field is the new prompt verbatim. Do NOT include any wrapper text outside the JSON.
+- Read the grader feedback and address the ROOT CAUSE it names (e.g. "cites no source", "too verbose", "wrong format") with a general instruction — not a fix hard-coded to these specific inputs.
 - Never copy verbatim text from a failure's expected_output into the rewrite (that would leak dev-set answers).
 - Do not introduce instructions that override safety, compliance, or permission rules — your job is to improve task accuracy, not to bypass guardrails.
 - The rationale should be 1-3 sentences explaining WHY this rewrite is likely to help. Keep it specific.`;
@@ -235,7 +236,12 @@ export class ClaudeMutationProvider implements MutationProvider {
   /** Build the user message for the meta-prompt. */
   private buildUserMessage(
     currentPrompt: string,
-    failures: ReadonlyArray<{ input: string; observedScore: number; expected?: string }>,
+    failures: ReadonlyArray<{
+      input: string;
+      observedScore: number;
+      expected?: string;
+      rationale?: string;
+    }>,
   ): string {
     const failureBlock =
       failures.length === 0
@@ -243,25 +249,51 @@ export class ClaudeMutationProvider implements MutationProvider {
         : failures
             .map(
               (f, i) =>
-                `--- Failure ${i + 1} (observed score ${f.observedScore.toFixed(2)}) ---\nInput: ${f.input}\n${f.expected !== undefined ? `Expected output (do NOT copy this verbatim into the rewrite): ${f.expected}\n` : ""}`,
+                `--- Failure ${i + 1} (observed score ${f.observedScore.toFixed(2)}) ---\nInput: ${f.input}\n${f.expected !== undefined ? `Expected output (do NOT copy this verbatim into the rewrite): ${f.expected}\n` : ""}${f.rationale !== undefined ? `Grader feedback: ${f.rationale}\n` : ""}`,
             )
             .join("\n");
     return `CURRENT PROMPT:\n${currentPrompt}\n\nSAMPLE OF DEV-SET FAILURES:\n${failureBlock}\n\nReturn one JSON object: {"rewrite": "...", "rationale": "..."}`;
   }
 
-  /** Identify failure samples from the trajectory. */
-  private selectFailures(
-    state: OptimizerState,
-  ): ReadonlyArray<{ input: string; observedScore: number; expected?: string }> {
-    // The trajectory records aggregate scores per candidate, not per
-    // sample. For v0 we surface the dev set as raw inputs and let
-    // the model reason about them generically; future iterations can
-    // wire a per-sample grade map through the OptimizerState. The
-    // result is still useful because the model sees the dev set
-    // distribution even without per-sample grades.
+  /**
+   * Identify the failing samples to show the model. When the fitness
+   * function supplied per-sample grades (`state.bestGrades`, wired by the
+   * CLI's eval-runner closure), we surface the samples the current best
+   * prompt ACTUALLY fails — worst-scoring first — together with the
+   * grader's rationale, so the meta-prompt can address the named root
+   * cause. This is the signal the system prompt promises. When grades are
+   * absent (a fitness fn returning a bare number, or an all-passing dev
+   * set), we fall back to surfacing the dev-set inputs with the aggregate
+   * score — the pre-failure-signal behaviour — so the search still runs.
+   */
+  private selectFailures(state: OptimizerState): ReadonlyArray<{
+    input: string;
+    observedScore: number;
+    expected?: string;
+    rationale?: string;
+  }> {
+    const graded = state.bestGrades;
+    if (graded !== undefined && graded.length > 0) {
+      const byWorst = [...graded].sort((a, b) => a.score - b.score);
+      // Prefer genuine failures (below the threshold); if the dev set is
+      // already strong, fall back to the lowest scorers so the mutator
+      // still has a concrete target to push on.
+      const belowThreshold = byWorst.filter((g) => g.score < this.failureThreshold);
+      const window = (belowThreshold.length > 0 ? belowThreshold : byWorst).slice(
+        0,
+        this.maxFailuresInPrompt,
+      );
+      return window.map((g) => ({
+        input: g.input,
+        observedScore: g.score,
+        ...(g.expected !== undefined ? { expected: g.expected } : {}),
+        ...(g.rationale !== undefined ? { rationale: g.rationale } : {}),
+      }));
+    }
+    // No per-sample grades wired: surface the dev set as raw inputs with
+    // the aggregate score. The model still sees the dev-set distribution.
     return state.devSet.slice(0, this.maxFailuresInPrompt).map((s) => ({
       input: s.input,
-      // Use the trajectory's most recent score as a coarse signal.
       observedScore: state.best.score,
       ...(s.expected_output !== undefined ? { expected: s.expected_output } : {}),
     }));
