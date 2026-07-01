@@ -7,6 +7,7 @@ import {
   MAX_FEEDBACK_TEXT,
   type SessionTurn,
   buildFeedbackRecord,
+  buildJudgeRubricGrader,
   clipFeedbackText,
   deriveTurns,
   distill,
@@ -265,6 +266,27 @@ describe("extractFeedbackRecords + mergeFeedback", () => {
     expect(merged).toHaveLength(1);
     expect(merged[0]?.rating.thumbs).toBe("up");
   });
+
+  it("merges fields: a later comment-only record keeps the earlier rating", () => {
+    const rated = record({
+      turnNumber: 1,
+      modality: "binary",
+      rating: { thumbs: "up" },
+      ts: "2026-01-01T00:00:00Z",
+    });
+    const commented = record({
+      turnNumber: 1,
+      modality: "comment",
+      rating: {},
+      comment: "nice, cited a source",
+      ts: "2026-02-01T00:00:00Z",
+    });
+    const merged = mergeFeedback([rated, commented]);
+    expect(merged).toHaveLength(1);
+    expect(merged[0]?.rating.thumbs).toBe("up"); // rating preserved
+    expect(merged[0]?.modality).toBe("binary");
+    expect(merged[0]?.comment).toBe("nice, cited a source"); // comment folded in
+  });
 });
 
 describe("distill (tag-all)", () => {
@@ -403,5 +425,42 @@ describe("serialization round-trips through the real eval contracts", () => {
       expect(compiled).toHaveLength(1);
       expect(compiled[0]?.name).toBe(cfg.graders[0].name);
     }
+  });
+});
+
+describe("distill --judge (llm_judge rubric seeded from comments)", () => {
+  it("emits a single llm_judge grader whose YAML validates + carries a judgeSpec", () => {
+    const grader = buildJudgeRubricGrader(["clear and cited a source"], ["too vague; no link"]);
+    const yaml = gradersConfigToYaml({ graders: [grader] });
+    const { compiled } = parseGradersConfig(yaml);
+    expect(compiled).toHaveLength(1); // one grader — never hard-ANDed
+    expect(compiled[0]?.judgeSpec).toBeDefined();
+    const rubric = compiled[0]?.judgeSpec?.rubric;
+    expect(rubric?.criteria).toHaveLength(1);
+    expect(rubric?.criteria[0]?.name).toBe("user_preference");
+    // comment themes are folded into the description as quoted data.
+    expect(rubric?.criteria[0]?.description).toContain("cited a source");
+    expect(rubric?.criteria[0]?.description).toContain("too vague");
+    for (const k of ["1", "2", "3", "4", "5"] as const) {
+      expect((rubric?.criteria[0]?.anchors as Record<string, string>)[k].length).toBeGreaterThan(0);
+    }
+  });
+
+  it("distill(opts.judge) replaces the deterministic grader with the judge", () => {
+    const turns: SessionTurn[] = [
+      { sessionId: SESSION, turnNumber: 1, input: "q", output: "a", toolNames: ["Fetch"] },
+    ];
+    const res = distill(turns, [record({ turnNumber: 1, rating: { thumbs: "up" } })], {
+      minScore: 0.7,
+      judge: true,
+    });
+    expect(res.graders.graders).toHaveLength(1);
+    expect(res.graders.graders[0]?.type).toBe("llm_judge");
+  });
+
+  it("produces a valid rubric even with no comments (generic anchors)", () => {
+    const yaml = gradersConfigToYaml({ graders: [buildJudgeRubricGrader([], [])] });
+    const { compiled } = parseGradersConfig(yaml);
+    expect(compiled[0]?.judgeSpec?.rubric.criteria).toHaveLength(1);
   });
 });

@@ -57,6 +57,35 @@ export type InboundEvent = {
 };
 
 /**
+ * A 👍/👎 reaction a user placed on one of the bot's messages. Normalised from
+ * Slack's `reaction_added` event. `messageTs` is the reacted-to message's ts;
+ * `vote` is the emoji mapped to a thumbs direction. The session-router records
+ * this as a `user_feedback` event-log line rather than driving a model turn.
+ * Only meaningful emojis (👍/👎) reach here — the bot's own status reactions
+ * (👀/✅/⚠️) never map to a vote, so they never produce feedback.
+ */
+export type InboundReaction = {
+  readonly idempotencyKey: string;
+  readonly workspaceId: string;
+  readonly channelId: string;
+  /** ts of the reacted-to message (typically the bot's reply). */
+  readonly messageTs: string;
+  /** the user who added the reaction. */
+  readonly userId: string;
+  readonly vote: "up" | "down";
+};
+
+/** Map a Slack reaction name (no colons) to a thumbs vote, or undefined when
+ *  the emoji is not a 👍/👎 (which then produces no feedback). */
+function reactionToVote(name: unknown): "up" | "down" | undefined {
+  if (typeof name !== "string") return undefined;
+  const n = name.replace(/^:|:$/g, "");
+  if (n === "+1" || n === "thumbsup") return "up";
+  if (n === "-1" || n === "thumbsdown") return "down";
+  return undefined;
+}
+
+/**
  * The result of `parseInbound`. Three shapes:
  *   - { kind: "event", event } — a real inbound message to route
  *   - { kind: "challenge", challenge } — Slack URL-verification handshake;
@@ -66,6 +95,7 @@ export type InboundEvent = {
  */
 export type ParsedInbound =
   | { readonly kind: "event"; readonly event: InboundEvent }
+  | { readonly kind: "reaction"; readonly reaction: InboundReaction }
   | { readonly kind: "challenge"; readonly challenge: string }
   | { readonly kind: "skip" };
 
@@ -143,6 +173,39 @@ export function createSlackAdapter(
       const e = ev as Record<string, unknown>;
 
       const evType = e["type"];
+
+      // Inbound 👍/👎 reaction on one of the bot's messages → feedback. Only
+      // reaction_added produces feedback (a removed reaction does not retract
+      // an append-only event-log line). Non-vote emojis (incl. the bot's own
+      // 👀/✅/⚠️ status reactions) map to no vote and are skipped.
+      if (evType === "reaction_added") {
+        const vote = reactionToVote(e["reaction"]);
+        if (vote === undefined) return { kind: "skip" };
+        const item = e["item"];
+        if (typeof item !== "object" || item === null) return { kind: "skip" };
+        const it = item as Record<string, unknown>;
+        if (it["type"] !== "message") return { kind: "skip" };
+        const rChannelId = typeof it["channel"] === "string" ? it["channel"] : undefined;
+        const rMessageTs = typeof it["ts"] === "string" ? it["ts"] : undefined;
+        const rUserId = typeof e["user"] === "string" ? e["user"] : undefined;
+        const rIdemp = typeof p["event_id"] === "string" ? p["event_id"] : undefined;
+        const rWorkspace = typeof p["team_id"] === "string" ? p["team_id"] : undefined;
+        if (!rChannelId || !rMessageTs || !rUserId || !rIdemp || !rWorkspace) {
+          return { kind: "skip" };
+        }
+        return {
+          kind: "reaction",
+          reaction: {
+            idempotencyKey: rIdemp,
+            workspaceId: rWorkspace,
+            channelId: rChannelId,
+            messageTs: rMessageTs,
+            userId: rUserId,
+            vote,
+          },
+        };
+      }
+
       if (evType !== "app_mention" && evType !== "message") return { kind: "skip" };
 
       // Skip self/bot loops. `bot_id` is present on Slack's bot-authored

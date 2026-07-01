@@ -294,6 +294,27 @@ const failureTaxonomyEntrySchema = z
 const failureTaxonomyBlock = z.array(failureTaxonomyEntrySchema).optional();
 
 /**
+ * Response-feedback block — declares that a harness collects human ratings on
+ * agent responses (thumbs/stars/scale/comment) which `crewhaus distill` turns
+ * into eval datasets + graders. Cross-cutting like security: carried on the
+ * interactive shapes that consume it (cli, channel). `channelReactions` gates
+ * codegen of Slack 👍/👎 → feedback in the channel target; `modality`/`storage`
+ * configure the capture surfaces; `autoDistill` is a forward-looking flag for a
+ * continuous flywheel. `.strict()` so a typo'd sub-key fails the build.
+ */
+const feedbackBlock = z
+  .object({
+    enabled: z.boolean().optional(),
+    modality: z.enum(["binary", "stars", "scale", "comment"]).default("binary"),
+    scale: z.object({ min: z.number().int(), max: z.number().int() }).strict().optional(),
+    storage: z.object({ location: safeName }).strict().optional(),
+    autoDistill: z.boolean().optional(),
+    channelReactions: z.boolean().optional(),
+  })
+  .strict()
+  .optional();
+
+/**
  * Section 47 — blockchain subsystem blocks (cross-cutting). Any shape may
  * declare any subset of `chains` / `wallets` / `contracts` /
  * `transaction_policy`. Authoring rules:
@@ -461,6 +482,7 @@ const cliSchema = z
     compaction: compactionBlock,
     security: securityBlock,
     failure_taxonomy: failureTaxonomyBlock,
+    feedback: feedbackBlock,
     cli: cliOptionsBlock,
     chains: chainsBlock,
     wallets: walletsBlock,
@@ -596,6 +618,7 @@ const channelSchema = z
     permissions: permissionsBlock,
     compaction: compactionBlock,
     failure_taxonomy: failureTaxonomyBlock,
+    feedback: feedbackBlock,
     heartbeat: heartbeatBlock,
     gateway: channelGatewayBlock,
     chains: chainsBlock,
@@ -1158,6 +1181,7 @@ export type SpecMcpServerConfig = z.infer<typeof mcpServerConfigSchema>;
 export type SpecSubAgentDefinition = z.infer<typeof subAgentDefinitionSchema>;
 export type SpecCompactionBlock = z.infer<typeof compactionBlock>;
 export type SpecSecurityBlock = z.infer<typeof securityBlock>;
+export type SpecFeedbackBlock = z.infer<typeof feedbackBlock>;
 export type SpecFailureTaxonomyEntry = z.infer<typeof failureTaxonomyEntrySchema>;
 export type SpecFailureTaxonomy = z.infer<typeof failureTaxonomyBlock>;
 

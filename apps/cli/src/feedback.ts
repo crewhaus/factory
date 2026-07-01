@@ -356,15 +356,55 @@ export function extractFeedbackRecords(objects: ReadonlyArray<unknown>): Feedbac
   return out;
 }
 
-/** Dedupe records to one per (sessionId, turnNumber), last-write-wins by `ts`. */
+/**
+ * Collapse records to one per (sessionId, turnNumber). Rather than pure
+ * last-write-wins — which would let a later comment-only `feedback` erase an
+ * earlier `rate` on the same turn — fields are merged chronologically: the
+ * newest value of each field wins, but a later comment-only record keeps the
+ * earlier record's rating. So `rate --thumbs up` then `feedback --text "…"`
+ * yields one record carrying BOTH.
+ */
 export function mergeFeedback(records: ReadonlyArray<FeedbackRecord>): FeedbackRecord[] {
+  const sorted = [...records].sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
   const byKey = new Map<string, FeedbackRecord>();
-  for (const r of records) {
+  for (const r of sorted) {
     const key = turnKey(r.sessionId, r.turnNumber);
     const existing = byKey.get(key);
-    if (existing === undefined || r.ts >= existing.ts) byKey.set(key, r);
+    byKey.set(key, existing === undefined ? r : foldRecords(existing, r));
   }
   return [...byKey.values()];
+}
+
+function hasRating(r: FeedbackRecord): boolean {
+  return (
+    r.rating.thumbs !== undefined || r.rating.stars !== undefined || r.rating.scale !== undefined
+  );
+}
+
+/** Merge an earlier + later record for the same turn (later ts wins per field;
+ *  a comment-only later record does not erase the earlier rating). */
+function foldRecords(earlier: FeedbackRecord, later: FeedbackRecord): FeedbackRecord {
+  const ratingRecord = hasRating(later) ? later : hasRating(earlier) ? earlier : later;
+  const comment = later.comment ?? earlier.comment;
+  const correction = later.correction ?? earlier.correction;
+  const rater = later.rater ?? earlier.rater;
+  const runId = later.runId ?? earlier.runId;
+  const targetSpanId = later.targetSpanId ?? earlier.targetSpanId;
+  return {
+    schemaVersion: FEEDBACK_SCHEMA_VERSION,
+    id: later.id,
+    sessionId: later.sessionId,
+    turnNumber: later.turnNumber,
+    modality: hasRating(ratingRecord) ? ratingRecord.modality : "comment",
+    rating: ratingRecord.rating,
+    source: later.source,
+    ts: later.ts,
+    ...(runId !== undefined ? { runId } : {}),
+    ...(targetSpanId !== undefined ? { targetSpanId } : {}),
+    ...(comment !== undefined ? { comment } : {}),
+    ...(correction !== undefined ? { correction } : {}),
+    ...(rater !== undefined ? { rater } : {}),
+  };
 }
 
 // -------- distill --------
@@ -377,6 +417,14 @@ type Sample = {
   metadata?: Record<string, unknown>;
 };
 
+export type RubricAnchors = {
+  "1": string;
+  "2": string;
+  "3": string;
+  "4": string;
+  "5": string;
+};
+
 export type GraderSpecObject =
   | {
       name: string;
@@ -385,13 +433,28 @@ export type GraderSpecObject =
       mode: "set" | "subseq" | "exact";
     }
   | { name: string; type: "contains"; substring: string; case_insensitive?: boolean }
-  | { name: string; type: "regex"; pattern: string };
+  | { name: string; type: "regex"; pattern: string }
+  | {
+      name: string;
+      type: "llm_judge";
+      rubric: {
+        criteria: Array<{ name: string; description: string; anchors: RubricAnchors }>;
+        passing_score?: number;
+      };
+      model?: string;
+    };
 
 export type GradersConfigObject = { graders: GraderSpecObject[] };
 
 export type DistillOptions = {
   /** Normalized score at/above which a turn is a positive (gold) sample. */
   minScore: number;
+  /** Emit a single `llm_judge` grader seeded from comment themes instead of the
+   *  deterministic grader. Opt-in (each eval sample then costs a judge call). */
+  judge?: boolean;
+  /** Judge model baked into the emitted llm_judge grader (else the runner's
+   *  `--judge-model` applies at eval time). */
+  judgeModel?: string;
 };
 
 export type DistillStats = {
@@ -429,6 +492,8 @@ export function distill(
   const merged = mergeFeedback(feedback);
   const samples: Sample[] = [];
   const positiveTurns: DerivedTurn[] = [];
+  const positiveComments: string[] = [];
+  const negativeComments: string[] = [];
   const warnings: string[] = [];
   let matched = 0;
   let unmatched = 0;
@@ -474,14 +539,19 @@ export function distill(
     if (isPositive) {
       positives += 1;
       positiveTurns.push(turn);
+      if (fb.comment !== undefined) positiveComments.push(fb.comment);
     } else {
       negatives += 1;
+      if (fb.comment !== undefined) negativeComments.push(fb.comment);
     }
   }
 
   return {
     samples,
-    graders: synthesizeGraders(positiveTurns, warnings),
+    graders:
+      opts.judge === true
+        ? { graders: [buildJudgeRubricGrader(positiveComments, negativeComments, opts.judgeModel)] }
+        : synthesizeGraders(positiveTurns, warnings),
     stats: {
       totalFeedback: merged.length,
       matchedTurns: matched,
@@ -575,6 +645,57 @@ export function synthesizeGraders(
   return { graders: [{ name: "non_empty_answer", type: "regex", pattern: "\\S" }] };
 }
 
+/**
+ * Build a single `llm_judge` grader seeded from the aggregated comment themes.
+ * One criterion ("user_preference") with fixed 1–5 anchors and a description
+ * folding a short, quoted, clipped summary of what users praised vs criticized.
+ * Emitted as the SOLE grader so it is never hard-ANDed with a deterministic one
+ * (the `all(...)` min-collapse). The untrusted comment text is bounded and
+ * quoted-as-data; the rubric is trusted context sent verbatim to the judge.
+ */
+export function buildJudgeRubricGrader(
+  positiveComments: ReadonlyArray<string>,
+  negativeComments: ReadonlyArray<string>,
+  model?: string,
+): GraderSpecObject {
+  const praised = summarizeComments(positiveComments);
+  const criticized = summarizeComments(negativeComments);
+  const praisedNote = praised !== undefined ? ` Users praised responses like: '${praised}'.` : "";
+  const criticizedNote =
+    criticized !== undefined ? ` Users criticized responses like: '${criticized}'.` : "";
+  const description = `Judge how well the response matches the qualities real users prefer, learned from their ratings.${praisedNote}${criticizedNote}`;
+  return {
+    name: "user_preference",
+    type: "llm_judge",
+    rubric: {
+      criteria: [
+        {
+          name: "user_preference",
+          description,
+          anchors: {
+            "1": "Strongly conflicts with what users liked; clearly exhibits the criticized traits.",
+            "2": "Mostly misses the qualities users preferred.",
+            "3": "Partially matches user preferences; a mixed response.",
+            "4": "Largely matches the qualities users praised.",
+            "5": "Strongly matches the user-preferred style and avoids the criticized traits.",
+          },
+        },
+      ],
+      passing_score: 3,
+    },
+    ...(model !== undefined ? { model } : {}),
+  };
+}
+
+/** Dedupe, join, and clip a batch of comments into one short quoted summary for
+ *  a rubric description (~400 chars). Undefined when there are no comments. */
+function summarizeComments(comments: ReadonlyArray<string>): string | undefined {
+  const cleaned = [...new Set(comments.map((c) => c.trim()).filter((c) => c !== ""))];
+  if (cleaned.length === 0) return undefined;
+  const joined = clipFeedbackText(cleaned.slice(0, 8).join("; ")).replace(/'/g, "");
+  return joined.length > 400 ? `${joined.slice(0, 400)}…` : joined;
+}
+
 /** The most frequent distinctive token (alnum, length ≥ 4, non-stopword)
  *  appearing in at least half of the answers. Undefined when none qualifies. */
 function commonToken(answers: ReadonlyArray<string>): string | undefined {
@@ -621,6 +742,21 @@ export function gradersConfigToYaml(config: GradersConfigObject): string {
       lines.push(`    substring: ${JSON.stringify(g.substring)}`);
       if (g.case_insensitive !== undefined)
         lines.push(`    case_insensitive: ${g.case_insensitive}`);
+    } else if (g.type === "llm_judge") {
+      lines.push("    rubric:");
+      lines.push("      criteria:");
+      for (const c of g.rubric.criteria) {
+        lines.push(`        - name: ${JSON.stringify(c.name)}`);
+        lines.push(`          description: ${JSON.stringify(c.description)}`);
+        lines.push("          anchors:");
+        for (const k of ["1", "2", "3", "4", "5"] as const) {
+          lines.push(`            ${JSON.stringify(k)}: ${JSON.stringify(c.anchors[k])}`);
+        }
+      }
+      if (g.rubric.passing_score !== undefined) {
+        lines.push(`      passing_score: ${g.rubric.passing_score}`);
+      }
+      if (g.model !== undefined) lines.push(`    model: ${JSON.stringify(g.model)}`);
     } else {
       lines.push(`    pattern: ${JSON.stringify(g.pattern)}`);
     }

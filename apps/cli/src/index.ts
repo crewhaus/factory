@@ -267,6 +267,8 @@ const DISTILL_SCHEMA: ParseArgsSchema = {
     { name: "out", short: "o", takesValue: true },
     { name: "graders-out", takesValue: true },
     { name: "min-score", takesValue: true },
+    { name: "judge", takesValue: false },
+    { name: "judge-model", takesValue: true },
     { name: "help", short: "h" },
   ],
 };
@@ -2202,7 +2204,7 @@ async function runDistill(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
       "usage: crewhaus distill (--session <id> | --all-sessions) -o <dataset.jsonl> " +
-        "[--graders-out <graders.yaml>] [--min-score F]\n",
+        "[--graders-out <graders.yaml>] [--min-score F] [--judge] [--judge-model <model>]\n",
     );
     return;
   }
@@ -2217,6 +2219,8 @@ async function runDistill(args: ParsedArgs): Promise<void> {
   }
   const minScore = floatFlag(args, "min-score") ?? 0.7;
   if (minScore < 0 || minScore > 1) die(`invalid --min-score "${minScore}" — must be in [0,1]`);
+  const useJudge = args.flags["judge"] === true;
+  const judgeModel = args.flags["judge-model"];
 
   const sessionsDir = join(process.cwd(), SESSIONS_SUBDIR);
   const sessionIds = allSessions ? listSessionIds(sessionsDir) : [session as string];
@@ -2237,7 +2241,11 @@ async function runDistill(args: ParsedArgs): Promise<void> {
     die("no feedback found — record some with `crewhaus rate` / `crewhaus feedback` first");
   }
 
-  const result = distillFeedback(turns, feedback, { minScore });
+  const result = distillFeedback(turns, feedback, {
+    minScore,
+    ...(useJudge ? { judge: true } : {}),
+    ...(typeof judgeModel === "string" ? { judgeModel } : {}),
+  });
   for (const w of result.warnings) process.stderr.write(`[distill] warning: ${w}\n`);
   if (result.samples.length === 0) die("no rated turns could be matched to the transcript(s)");
 

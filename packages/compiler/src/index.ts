@@ -17,6 +17,7 @@ import type {
   IrDiscordConfig,
   IrEvalV0,
   IrFailureTaxonomyEntry,
+  IrFeedback,
   IrGraphV0,
   IrIMessageConfig,
   IrManagedV0,
@@ -512,6 +513,36 @@ function lowerSecurity(spec: SpecWithSecurity): { security?: IrSecurity } {
   };
 }
 
+type SpecWithFeedback = {
+  readonly feedback?: {
+    readonly enabled?: boolean;
+    readonly modality: "binary" | "stars" | "scale" | "comment";
+    readonly scale?: { readonly min: number; readonly max: number };
+    readonly storage?: { readonly location: string };
+    readonly autoDistill?: boolean;
+    readonly channelReactions?: boolean;
+  };
+};
+
+// Lower the cross-cutting `feedback` block, mirroring lowerSecurity's
+// spread-return-{} discipline (Pillar 1): the key is absent from the IR when
+// the spec omits the block. `modality` has a Zod .default("binary") so it is
+// always present post-parse — carry it verbatim.
+function lowerFeedback(spec: SpecWithFeedback): { feedback?: IrFeedback } {
+  const f = spec.feedback;
+  if (f === undefined) return {};
+  return {
+    feedback: {
+      modality: f.modality,
+      ...(f.enabled !== undefined ? { enabled: f.enabled } : {}),
+      ...(f.scale !== undefined ? { scale: { min: f.scale.min, max: f.scale.max } } : {}),
+      ...(f.storage !== undefined ? { storage: { location: f.storage.location } } : {}),
+      ...(f.autoDistill !== undefined ? { autoDistill: f.autoDistill } : {}),
+      ...(f.channelReactions !== undefined ? { channelReactions: f.channelReactions } : {}),
+    },
+  };
+}
+
 /**
  * Section 47 — normalise the cross-cutting blockchain subsystem blocks
  * (chains / wallets / contracts / transaction_policy). Each block is
@@ -660,6 +691,7 @@ export function lower(spec: Spec): IrNode {
         compaction: lowerCompaction(spec),
         ...lowerFailureTaxonomy(spec),
         ...lowerSecurity(spec),
+        ...lowerFeedback(spec),
         // Phase 3 §3.3 — CLI banner config. Plus Phase 2 M2.2 TUI mode
         // gate. Only included when the spec author opted in (cli block
         // and its fields are optional).
@@ -716,6 +748,7 @@ export function lower(spec: Spec): IrNode {
         subAgents: lowerSubAgents(spec.agent.sub_agents),
         compaction: lowerCompaction(spec),
         ...lowerFailureTaxonomy(spec),
+        ...lowerFeedback(spec),
         // Phase 3 §3.1 — heartbeat. Duration string ("2h", "30m") is
         // parsed once at lower time so codegen emits a literal numeric
         // setInterval arg in ms.

@@ -48,6 +48,53 @@ describe("emitChannelBot — bundle structure (T1)", () => {
   });
 });
 
+describe("emitChannelBot — inbound reaction feedback (feedback.channelReactions)", () => {
+  const withReactions = (sessionKey: "channel" | "user" | "thread"): IrChannelV0 => ({
+    ...MIN_IR,
+    routing: { sessionKey },
+    feedback: { modality: "binary", channelReactions: true },
+  });
+
+  test("no feedback block → session-router has no handleReaction; gateway skips reactions", () => {
+    const files = fileMap(MIN_IR);
+    const router = files.get("session-router.ts") ?? "";
+    const gateway = files.get("gateway.ts") ?? "";
+    expect(router).not.toContain("handleReaction");
+    expect(router).not.toContain("user_feedback");
+    // Gateway still narrows the reaction kind (type-safety) but only ACKs it.
+    expect(gateway).toContain('parsed.kind === "reaction"');
+    expect(gateway).not.toContain("handleReaction");
+  });
+
+  test("channel session-key → handleReaction appends a channel-sourced user_feedback line", () => {
+    const files = fileMap(withReactions("channel"));
+    const router = files.get("session-router.ts") ?? "";
+    const gateway = files.get("gateway.ts") ?? "";
+    expect(router).toContain('import { openEventLog } from "@crewhaus/event-log";');
+    expect(router).toContain("async handleReaction(");
+    expect(router).toContain('kind: "user_feedback"');
+    expect(router).toContain('source: "channel"');
+    expect(router).toContain("thumbs: reaction.vote");
+    // channel routing key, not the reaction's own ts.
+    expect(router).toContain("${adapter.id}:${reaction.workspaceId}:${reaction.channelId}");
+    // gateway dedups + dispatches the reaction (and does NOT run a model turn for it).
+    expect(gateway).toContain("config.sessionRouter.handleReaction(parsed.reaction, adapter)");
+    expect(gateway).toContain("dedup.remember(parsed.reaction.idempotencyKey)");
+  });
+
+  test("user session-key → reaction routing key uses the reacting user", () => {
+    const router = fileMap(withReactions("user")).get("session-router.ts") ?? "";
+    expect(router).toContain("${adapter.id}:${reaction.workspaceId}:${reaction.userId}");
+  });
+
+  test("thread session-key → handleReaction is a no-op (can't attribute without a join store)", () => {
+    const router = fileMap(withReactions("thread")).get("session-router.ts") ?? "";
+    expect(router).toContain("async handleReaction(");
+    expect(router).toContain("can't attribute a reaction");
+    expect(router).not.toContain('kind: "user_feedback"');
+  });
+});
+
 describe("emitChannelBot — daemon.ts wiring", () => {
   test("imports the channel-generic gateway, session-router, and agent", () => {
     const c = fileMap(MIN_IR).get("daemon.ts") ?? "";
