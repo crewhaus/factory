@@ -153,6 +153,23 @@ export type IrSecurity = {
 };
 
 /**
+ * Response-feedback config, lowered from `spec.feedback`. Declares that a
+ * harness collects human ratings on responses. `modality` always resolves
+ * (Zod defaults it to `"binary"`); the rest are optional. `channelReactions`
+ * gates the channel target's codegen of Slack 👍/👎 → `user_feedback`. Carried
+ * on the interactive shapes that consume it (IrV0/cli, IrChannelV0). Absent
+ * when the spec omits the `feedback` block.
+ */
+export type IrFeedback = {
+  readonly enabled?: boolean;
+  readonly modality: "binary" | "stars" | "scale" | "comment";
+  readonly scale?: { readonly min: number; readonly max: number };
+  readonly storage?: { readonly location: string };
+  readonly autoDistill?: boolean;
+  readonly channelReactions?: boolean;
+};
+
+/**
  * Track F (Section 57) — typed message schemas (Σ) for multi-agent
  * communication. Source: AgentFlow (arxiv 2604.20801). A typed graph
  * DSL with well-formedness checking makes searching the full multi-
@@ -221,6 +238,8 @@ export type IrV0 = {
    *  selection). Optional; absent when the spec omits the `security`
    *  block. */
   readonly security?: IrSecurity;
+  /** Response-feedback config. Optional; absent when the spec omits `feedback`. */
+  readonly feedback?: IrFeedback;
   /** §47 cross-cutting blockchain subsystem (slice 0). All optional. */
   readonly chains?: readonly IrChainBinding[];
   readonly wallets?: readonly IrWalletBinding[];
@@ -475,6 +494,9 @@ export type IrChannelV0 = {
   readonly gateway?: IrChannelGateway;
   /** Section 55 (Track A) — named failure taxonomy. Optional. */
   readonly failureTaxonomy?: IrFailureTaxonomy;
+  /** Response-feedback config. `feedback.channelReactions` gates Slack 👍/👎
+   *  → user_feedback codegen in this target. Absent when spec omits it. */
+  readonly feedback?: IrFeedback;
   /** §47 cross-cutting blockchain subsystem (slice 0). All optional. */
   readonly chains?: readonly IrChainBinding[];
   readonly wallets?: readonly IrWalletBinding[];

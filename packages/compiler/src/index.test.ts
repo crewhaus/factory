@@ -610,6 +610,68 @@ security: {}
   });
 });
 
+// Response-feedback block lowered into ir.feedback (cli + channel shapes).
+describe("lower — feedback block", () => {
+  test("carries every field verbatim (modality defaults to binary)", () => {
+    const spec = parseSpec(`
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+feedback:
+  enabled: true
+  scale: { min: 1, max: 5 }
+  storage: { location: my-feedback }
+  channelReactions: true
+`);
+    const ir = lower(spec);
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect(ir.feedback).toEqual({
+      modality: "binary",
+      enabled: true,
+      scale: { min: 1, max: 5 },
+      storage: { location: "my-feedback" },
+      channelReactions: true,
+    });
+  });
+
+  test("absent feedback block leaves ir.feedback undefined (spread-out)", () => {
+    const spec = parseSpec(`
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+`);
+    const ir = lower(spec);
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect(ir.feedback).toBeUndefined();
+    expect("feedback" in ir).toBe(false);
+  });
+
+  test("lowers on the channel shape too", () => {
+    const spec = parseSpec(`
+name: hello
+target: channel
+agent:
+  model: m
+  instructions: i
+channels:
+  slack:
+    botToken: $SLACK_BOT_TOKEN
+    signingSecret: $SLACK_SIGNING_SECRET
+routing:
+  sessionKey: thread
+feedback:
+  channelReactions: true
+`);
+    const ir = lower(spec);
+    if (ir.target !== "channel") throw new Error("unexpected target");
+    expect(ir.feedback).toEqual({ modality: "binary", channelReactions: true });
+  });
+});
+
 // FR-006 — Pillar 3 sink-side egress-matcher selector lowered into
 // ir.security.egressMatcher. This is the seam that closes the "flag parsed
 // but not threaded" gap: the run path reads ir.security.egressMatcher and

@@ -22,6 +22,7 @@ import type {
   ModelResponseEvent,
   ModelStreamTokenEvent,
   PermissionDecisionEvent,
+  ResponseRatedEvent,
   SubAgentEndEvent,
   SubAgentStartEvent,
   ToolCallEndEvent,
@@ -112,6 +113,9 @@ export const ATTR = {
   CREWHAUS_SUB_AGENT_CHILD_SESSION_ID: "crewhaus.sub_agent.child_session_id",
   CREWHAUS_SUB_AGENT_TOOL_CALLS: "crewhaus.sub_agent.tool_calls",
   CREWHAUS_SUB_AGENT_FINAL_BYTES: "crewhaus.sub_agent.final_message_bytes",
+  CREWHAUS_FEEDBACK_RATING: "crewhaus.feedback.rating",
+  CREWHAUS_FEEDBACK_SOURCE: "crewhaus.feedback.source",
+  CREWHAUS_FEEDBACK_COMMENT: "crewhaus.feedback.comment",
 } as const;
 
 function attrStr(key: string, v: string): Attribute {
@@ -352,6 +356,27 @@ export function buildPermissionSpan(ev: PermissionDecisionEvent): OtelSpan {
       ...(ev.reason ? [attrStr(ATTR.CREWHAUS_PERMISSION_REASON, ev.reason)] : []),
     ],
     status: ev.decision === "deny" ? { code: STATUS_ERROR } : { code: STATUS_OK },
+  };
+}
+
+export function buildResponseRatedSpan(ev: ResponseRatedEvent): OtelSpan {
+  const endNano = isoToNano(ev.timestamp);
+  const rating = typeof ev.rating === "number" ? ev.rating.toString() : ev.rating;
+  return {
+    traceId: ev.traceId,
+    spanId: ev.spanId,
+    ...(ev.parentSpanId ? { parentSpanId: ev.parentSpanId } : {}),
+    name: "feedback.response_rated",
+    kind: SPAN_KIND_INTERNAL,
+    startTimeUnixNano: endNano,
+    endTimeUnixNano: endNano,
+    attributes: [
+      ...envelopeAttrs(ev),
+      attrStr(ATTR.CREWHAUS_FEEDBACK_RATING, rating),
+      ...(ev.source ? [attrStr(ATTR.CREWHAUS_FEEDBACK_SOURCE, ev.source)] : []),
+      ...(ev.comment ? [attrStr(ATTR.CREWHAUS_FEEDBACK_COMMENT, ev.comment)] : []),
+    ],
+    status: { code: STATUS_OK },
   };
 }
 

@@ -184,6 +184,71 @@ describe("createSlackAdapter — parseInbound (T2 — contract)", () => {
     const out = adapter().parseInbound({ headers: new Headers(), body });
     expect(out.kind).toBe("skip");
   });
+
+  function reactionBody(reaction: string, evType = "reaction_added"): string {
+    return JSON.stringify({
+      type: "event_callback",
+      team_id: "T1",
+      event_id: "Ev_react_1",
+      event: {
+        type: evType,
+        user: "U07USER01",
+        reaction,
+        item: { type: "message", channel: "C0CHAN01", ts: "1700000000.000200" },
+      },
+    });
+  }
+
+  test("parses a 👍 reaction_added into a thumbs-up reaction", () => {
+    const out = adapter().parseInbound({ headers: new Headers(), body: reactionBody("+1") });
+    expect(out.kind).toBe("reaction");
+    if (out.kind !== "reaction") return;
+    expect(out.reaction.vote).toBe("up");
+    expect(out.reaction.channelId).toBe("C0CHAN01");
+    expect(out.reaction.messageTs).toBe("1700000000.000200");
+    expect(out.reaction.userId).toBe("U07USER01");
+    expect(out.reaction.idempotencyKey).toBe("Ev_react_1");
+  });
+
+  test("maps thumbsup/-1/thumbsdown names to up/down", () => {
+    expect(
+      adapter().parseInbound({ headers: new Headers(), body: reactionBody("thumbsup") }),
+    ).toMatchObject({ reaction: { vote: "up" } });
+    expect(
+      adapter().parseInbound({ headers: new Headers(), body: reactionBody("-1") }),
+    ).toMatchObject({ reaction: { vote: "down" } });
+    expect(
+      adapter().parseInbound({ headers: new Headers(), body: reactionBody("thumbsdown") }),
+    ).toMatchObject({ reaction: { vote: "down" } });
+  });
+
+  test("maps skin-tone-modified thumbs (Slack sends +1::skin-tone-N)", () => {
+    expect(
+      adapter().parseInbound({ headers: new Headers(), body: reactionBody("+1::skin-tone-4") }),
+    ).toMatchObject({ reaction: { vote: "up" } });
+    expect(
+      adapter().parseInbound({
+        headers: new Headers(),
+        body: reactionBody("thumbsdown::skin-tone-2"),
+      }),
+    ).toMatchObject({ reaction: { vote: "down" } });
+  });
+
+  test("skips a non-vote emoji (incl. the bot's own status reactions)", () => {
+    for (const e of ["eyes", "white_check_mark", "warning", "tada"]) {
+      expect(adapter().parseInbound({ headers: new Headers(), body: reactionBody(e) }).kind).toBe(
+        "skip",
+      );
+    }
+  });
+
+  test("skips reaction_removed (append-only log can't retract)", () => {
+    const out = adapter().parseInbound({
+      headers: new Headers(),
+      body: reactionBody("+1", "reaction_removed"),
+    });
+    expect(out.kind).toBe("skip");
+  });
 });
 
 describe("createSlackAdapter — sendReply", () => {

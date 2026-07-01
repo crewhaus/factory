@@ -14,6 +14,7 @@ import type {
   ModelResponseEvent,
   ModelStreamTokenEvent,
   PermissionDecisionEvent,
+  ResponseRatedEvent,
   SubAgentEndEvent,
   SubAgentStartEvent,
   ToolCallEndEvent,
@@ -34,6 +35,7 @@ import {
   buildMcpSpan,
   buildModelSpan,
   buildPermissionSpan,
+  buildResponseRatedSpan,
   buildStreamTokenEvent,
   buildSubAgentSpan,
   buildToolSpan,
@@ -129,6 +131,9 @@ export class SpanTracker {
         return;
       case "permission_decision":
         this.emit(buildPermissionSpan(ev as PermissionDecisionEvent));
+        return;
+      case "response_rated":
+        this.emit(buildResponseRatedSpan(ev as ResponseRatedEvent));
         return;
       case "error_recovered":
         this.emit(buildErrorRecoveredSpan(ev as ErrorRecoveredEvent));

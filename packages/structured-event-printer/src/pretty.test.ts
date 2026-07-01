@@ -501,6 +501,24 @@ describe("formatBody — every kind + optional-field branches", () => {
     expect(formatLine(ev)).toBe(`${prefix("test_verdict")}test=t-1 verdict=pass duration=7ms`);
   });
 
+  test("response_rated (thumbs) with source + comment", () => {
+    const ev = {
+      ...envelope,
+      kind: "response_rated",
+      rating: "up",
+      source: "cli",
+      comment: "great cite",
+    } satisfies TraceEvent;
+    expect(formatLine(ev)).toBe(
+      `${prefix("response_rated")}rating=up source=cli comment=great cite`,
+    );
+  });
+
+  test("response_rated (numeric) formats to 2 decimals and omits absent fields", () => {
+    const ev = { ...envelope, kind: "response_rated", rating: 0.5 } satisfies TraceEvent;
+    expect(formatLine(ev)).toBe(`${prefix("response_rated")}rating=0.50`);
+  });
+
   test("program_output", () => {
     const ev = {
       ...envelope,

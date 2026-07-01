@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import type { SubAgentDefinition } from "@crewhaus/agent-context-isolation";
 import { SpecParseError, compile, lower } from "@crewhaus/compiler";
@@ -10,6 +11,7 @@ import { parseGradersConfig } from "@crewhaus/eval-grader";
 import { optimizeSpec } from "@crewhaus/eval-optimizer-orchestrator";
 import { diffReports, loadRun, renderReport } from "@crewhaus/eval-report";
 import { runEval as runEvalLib } from "@crewhaus/eval-runner";
+import { openEventLog } from "@crewhaus/event-log";
 import { loadHooks } from "@crewhaus/hooks-engine";
 import {
   ArgParseError,
@@ -53,6 +55,22 @@ import {
   createEgressMatcher,
   resolveEgressMatcherChoice,
 } from "./egress-matcher";
+// Response-feedback core — pure, side-effect-free so it is unit-testable
+// (this entry file runs an argv switch on import). Powers `rate`/`feedback`
+// (capture) and `distill` (ratings → eval dataset + graders).
+import {
+  type DerivedTurn,
+  FEEDBACK_EVENT_KIND,
+  type FeedbackRecord,
+  type FeedbackSource,
+  type SessionTurn,
+  buildFeedbackRecord,
+  deriveTurns,
+  distill as distillFeedback,
+  extractFeedbackRecords,
+  gradersConfigToYaml,
+  samplesToJsonl,
+} from "./feedback";
 // FR-004 — Pillar 3 intent-gate judge + durable audit-sink resolution, in a
 // side-effect-free module so it is unit-testable (this entry file runs an
 // argv switch on import).
@@ -172,6 +190,11 @@ const OPTIMIZE_SCHEMA: ParseArgsSchema = {
   flags: [
     { name: "dataset", takesValue: true },
     { name: "graders", takesValue: true },
+    // Inline-distill user ratings into the training set (Pillar 2 — close the
+    // loop from real feedback). Value: a session id (sess_<16 hex>) or "all".
+    // Synthesizes the dataset (and, when --graders is omitted, the graders too).
+    { name: "ratings", takesValue: true },
+    { name: "min-score", takesValue: true },
     { name: "mutator", takesValue: true },
     { name: "iterations", takesValue: true },
     { name: "seed", takesValue: true },
@@ -209,6 +232,43 @@ const COST_SUMMARY_SCHEMA: ParseArgsSchema = {
     { name: "session", takesValue: true },
     { name: "tenant", takesValue: true },
     { name: "format", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
+const RATE_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "session", takesValue: true },
+    { name: "turn", takesValue: true },
+    { name: "thumbs", takesValue: true },
+    { name: "stars", takesValue: true },
+    { name: "score", takesValue: true },
+    { name: "comment", takesValue: true },
+    { name: "rater", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
+const FEEDBACK_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "session", takesValue: true },
+    { name: "turn", takesValue: true },
+    { name: "text", takesValue: true },
+    { name: "correction", takesValue: true },
+    { name: "rater", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
+const DISTILL_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "session", takesValue: true },
+    { name: "all-sessions", takesValue: false },
+    { name: "out", short: "o", takesValue: true },
+    { name: "graders-out", takesValue: true },
+    { name: "min-score", takesValue: true },
+    { name: "judge", takesValue: false },
+    { name: "judge-model", takesValue: true },
     { name: "help", short: "h" },
   ],
 };
@@ -320,6 +380,7 @@ function usageText(): string {
     "       [-o <out-dir>]",
     "  optimize <spec.yaml> --dataset <data> --graders <graders.yaml>",
     "       [--mutator rule-based|claude] [--iterations N] [--seed N]",
+    "       [--ratings <session>|all]            distill user ratings into the training set (Pillar 2)",
     "       [--budget-usd N]                     stop a model-driven run before it exceeds $N (FR-003)",
     "       [--write-back] [-o <out-dir>]        active eval-driven optimization (Pillar 2)",
     "  init [name]                          scaffold a new crewhaus.yaml",
@@ -327,6 +388,12 @@ function usageText(): string {
     "  context --bundle [-o <file>]         emit a single-markdown orientation manifest",
     "       [--factory-root <p>] [--docs-root <p>] [--demos-root <p>]",
     "  cost-summary --session <id>          summarize cost_accrual events for a session",
+    "  rate --session <id> [--turn N]       rate an assistant turn 👍/👎, ⭐, or 0–1",
+    "       (--thumbs up|down | --stars 1-5 | --score 0-1) [--comment <t>]",
+    "  feedback --session <id> --text <msg> attach a comment/correction to a turn",
+    "       [--turn N] [--correction <better answer>]",
+    "  distill --session <id> -o <ds.jsonl> turn ratings into an eval dataset + graders",
+    "       [--all-sessions] [--graders-out <g.yaml>] [--min-score F]",
     "  secrets doctor                       list known secrets via the configured backend",
     "  secrets rotate <name> [--value V]    rotate a named secret (file backend)",
     "  spec put|list|get|pin|alias ...      versioned spec storage (Section 28 spec-registry)",
@@ -1489,8 +1556,8 @@ async function runDoctorPhilosophyAlignment(): Promise<void> {
 async function runOptimize(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
-      "usage: crewhaus optimize <spec.yaml> --dataset <data> --graders <graders.yaml> " +
-        "[--mutator rule-based|claude] [--iterations N] [--seed N] [--concurrency N] " +
+      "usage: crewhaus optimize <spec.yaml> (--dataset <data> --graders <graders.yaml> | --ratings <session>) " +
+        "[--min-score F] [--mutator rule-based|claude] [--iterations N] [--seed N] [--concurrency N] " +
         "[--improvement-threshold F] [--budget-usd N] [--write-back] [-o <out-dir>]\n",
     );
     return;
@@ -1499,8 +1566,19 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
   if (typeof specPath !== "string") die("missing <spec.yaml>");
   const datasetPath = args.flags["dataset"];
   const gradersPath = args.flags["graders"];
-  if (typeof datasetPath !== "string") die("missing --dataset <data>");
-  if (typeof gradersPath !== "string") die("missing --graders <graders.yaml>");
+  const ratingsArg = args.flags["ratings"];
+  if (typeof datasetPath !== "string" && typeof ratingsArg !== "string") {
+    die("missing --dataset <data> (or --ratings <session> to distill one from feedback)");
+  }
+  if (typeof gradersPath !== "string" && typeof ratingsArg !== "string") {
+    die("missing --graders <graders.yaml> (or --ratings to synthesize one from feedback)");
+  }
+  const ratingsMinScore = floatFlag(args, "min-score") ?? 0.7;
+  if (ratingsMinScore < 0 || ratingsMinScore > 1) {
+    die(`invalid --min-score "${ratingsMinScore}" — must be in [0,1]`);
+  }
+  const ratingsDistill =
+    typeof ratingsArg === "string" ? distillRatings(ratingsArg, ratingsMinScore) : undefined;
 
   const iterationsFlag = args.flags["iterations"];
   const seedFlag = args.flags["seed"];
@@ -1546,24 +1624,37 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
       : resolve(join(".crewhaus", "optimize", runId));
 
   let gradersYaml: string;
-  try {
-    gradersYaml = readFileSync(resolve(gradersPath), "utf-8");
-  } catch (err) {
-    die(`could not read ${gradersPath}: ${(err as Error).message}`);
+  if (typeof gradersPath === "string") {
+    try {
+      gradersYaml = readFileSync(resolve(gradersPath), "utf-8");
+    } catch (err) {
+      die(`could not read ${gradersPath}: ${(err as Error).message}`);
+    }
+  } else {
+    // No --graders: use the grader synthesized from the ratings (guaranteed
+    // present here because the missing-flags gate required --ratings).
+    gradersYaml = (ratingsDistill as { gradersYaml: string }).gradersYaml;
   }
   const { compiled } = parseGradersConfig(gradersYaml);
-  const dataset = await loadDataset(resolve(datasetPath));
 
-  // Materialize the dataset once — we'll re-iterate per fitness call.
+  // Materialize the training set once — we'll re-iterate per fitness call. It
+  // is the union of the file dataset (if any) and the distilled ratings (if
+  // any); at least one is present per the missing-flags gate above.
   const samples: Array<{ id: string; input: string; expected_output?: string }> = [];
-  for await (const s of dataset.samples) {
-    samples.push({
-      id: s.id,
-      input: s.input,
-      ...(s.expected_output !== undefined ? { expected_output: s.expected_output } : {}),
-    });
+  let datasetName = "ratings";
+  if (typeof datasetPath === "string") {
+    const dataset = await loadDataset(resolve(datasetPath));
+    datasetName = dataset.name;
+    for await (const s of dataset.samples) {
+      samples.push({
+        id: s.id,
+        input: s.input,
+        ...(s.expected_output !== undefined ? { expected_output: s.expected_output } : {}),
+      });
+    }
   }
-  if (samples.length === 0) die(`dataset "${dataset.name}" yielded zero samples`);
+  if (ratingsDistill !== undefined) samples.push(...ratingsDistill.samples);
+  if (samples.length === 0) die(`dataset "${datasetName}" yielded zero samples`);
 
   // Train/dev split: 70/30 deterministic split by sample id ordering.
   const splitIdx = Math.max(1, Math.floor(samples.length * 0.7));
@@ -1615,7 +1706,7 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
     }
     const summary = await runEvalLib({
       ir,
-      dataset: { name: dataset.name, samples: makeAsyncIterable(devSet) },
+      dataset: { name: datasetName, samples: makeAsyncIterable(devSet) },
       compiledGraders: compiled,
       opts: {
         outDir: join(outDir, "evals", `${prompt.length}_${ir.agent.instructions.length}`),
@@ -1657,7 +1748,7 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
   }
 
   process.stdout.write(
-    `[optimize] runId=${runId} spec=${specPath} dataset=${dataset.name} ` +
+    `[optimize] runId=${runId} spec=${specPath} dataset=${datasetName} ` +
       `(${trainSet.length} train / ${devSet.length} dev) iterations=${iterations} ` +
       `mutator=${mutator ?? "rule-based"}\n`,
   );
@@ -1931,6 +2022,306 @@ async function runCostSummary(args: ParsedArgs): Promise<void> {
       process.stdout.write(`  ${p}: $${(m / 1_000_000).toFixed(4)}\n`);
     }
   }
+}
+
+// -------- response feedback: rate / feedback / distill --------
+
+const SESSIONS_SUBDIR = join(".crewhaus", "sessions");
+const FEEDBACK_SUBDIR = join(".crewhaus", "feedback");
+
+function sessionJsonlPath(session: string): string {
+  return join(process.cwd(), SESSIONS_SUBDIR, `${session}.jsonl`);
+}
+
+/** Parse a JSONL blob into objects, skipping blank/malformed lines. */
+function parseJsonlObjects(text: string): unknown[] {
+  const out: unknown[] = [];
+  for (const line of text.split("\n")) {
+    if (line.trim() === "") continue;
+    try {
+      out.push(JSON.parse(line));
+    } catch {
+      // A single malformed line must not abort a read.
+    }
+  }
+  return out;
+}
+
+function readSessionEvents(session: string): Array<{ kind?: string; payload?: unknown }> {
+  const file = sessionJsonlPath(session);
+  if (!existsSync(file)) die(`session log not found at ${file}`);
+  return parseJsonlObjects(readFileSync(file, "utf-8")) as Array<{
+    kind?: string;
+    payload?: unknown;
+  }>;
+}
+
+function strFlag(args: ParsedArgs, name: string): string | undefined {
+  const v = args.flags[name];
+  return typeof v === "string" ? v : undefined;
+}
+
+function intFlag(args: ParsedArgs, name: string): number | undefined {
+  const v = args.flags[name];
+  if (typeof v !== "string") return undefined;
+  const n = Number.parseInt(v, 10);
+  if (Number.isNaN(n)) die(`invalid --${name} "${v}" — must be an integer`);
+  return n;
+}
+
+function floatFlag(args: ParsedArgs, name: string): number | undefined {
+  const v = args.flags[name];
+  if (typeof v !== "string") return undefined;
+  const n = Number.parseFloat(v);
+  if (Number.isNaN(n)) die(`invalid --${name} "${v}" — must be a number`);
+  return n;
+}
+
+/** Resolve --turn against the transcript-derived turns; default to the last. */
+function resolveTurn(args: ParsedArgs, turns: ReadonlyArray<DerivedTurn>): number {
+  const flag = args.flags["turn"];
+  const last = turns[turns.length - 1] as DerivedTurn;
+  if (typeof flag !== "string") return last.turnNumber;
+  const n = Number.parseInt(flag, 10);
+  if (Number.isNaN(n)) die(`invalid --turn "${flag}" — must be an integer`);
+  if (!turns.some((t) => t.turnNumber === n)) {
+    die(`turn ${n} not found — session has turns 1..${turns.length}`);
+  }
+  return n;
+}
+
+/** Shared capture path for `rate` and `feedback`: validate the session, derive
+ *  turns, build a FeedbackRecord, and append it as a `user_feedback` event. */
+async function captureFeedback(
+  args: ParsedArgs,
+  source: FeedbackSource,
+  fields: {
+    thumbs?: "up" | "down";
+    stars?: number;
+    score?: number;
+    comment?: string;
+    correction?: string;
+    rater?: string;
+  },
+): Promise<void> {
+  const session = args.flags["session"];
+  if (typeof session !== "string") die("missing --session <id>");
+  if (!SESSION_ID_REGEX.test(session))
+    die(`invalid --session "${session}" — expected sess_<16 hex>`);
+  const turns = deriveTurns(readSessionEvents(session));
+  if (turns.length === 0) die(`session ${session} has no user turns to rate`);
+  const turnNumber = resolveTurn(args, turns);
+
+  let record: FeedbackRecord;
+  try {
+    record = buildFeedbackRecord({
+      id: `fb_${randomBytes(6).toString("hex")}`,
+      sessionId: session,
+      turnNumber,
+      ts: new Date().toISOString(),
+      source,
+      ...fields,
+    });
+  } catch (err) {
+    die(err instanceof Error ? err.message : String(err));
+  }
+
+  const log = await openEventLog(session, { rootDir: join(process.cwd(), SESSIONS_SUBDIR) });
+  await log.append({ kind: FEEDBACK_EVENT_KIND, payload: record });
+  process.stdout.write(`recorded ${record.modality} feedback on ${session} turn ${turnNumber}\n`);
+}
+
+async function runRate(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus rate --session <id> [--turn N] " +
+        "(--thumbs up|down | --stars 1-5 | --score 0-1) [--comment <text>] [--rater <who>]\n",
+    );
+    return;
+  }
+  const thumbsFlag = args.flags["thumbs"];
+  let thumbs: "up" | "down" | undefined;
+  if (typeof thumbsFlag === "string") {
+    if (thumbsFlag !== "up" && thumbsFlag !== "down")
+      die(`--thumbs must be "up" or "down" (got "${thumbsFlag}")`);
+    thumbs = thumbsFlag;
+  }
+  const stars = intFlag(args, "stars");
+  const score = floatFlag(args, "score");
+  if (thumbs === undefined && stars === undefined && score === undefined) {
+    die("give one of --thumbs up|down, --stars 1-5, or --score 0-1");
+  }
+  await captureFeedback(args, "cli", {
+    ...(thumbs !== undefined ? { thumbs } : {}),
+    ...(stars !== undefined ? { stars } : {}),
+    ...(score !== undefined ? { score } : {}),
+    ...(strFlag(args, "comment") !== undefined ? { comment: strFlag(args, "comment") } : {}),
+    ...(strFlag(args, "rater") !== undefined ? { rater: strFlag(args, "rater") } : {}),
+  });
+}
+
+async function runFeedbackCmd(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus feedback --session <id> [--turn N] --text <msg> [--correction <better answer>] [--rater <who>]\n",
+    );
+    return;
+  }
+  const text = strFlag(args, "text");
+  const correction = strFlag(args, "correction");
+  if (text === undefined && correction === undefined) {
+    die("give --text <msg> and/or --correction <better answer>");
+  }
+  await captureFeedback(args, "cli", {
+    ...(text !== undefined ? { comment: text } : {}),
+    ...(correction !== undefined ? { correction } : {}),
+    ...(strFlag(args, "rater") !== undefined ? { rater: strFlag(args, "rater") } : {}),
+  });
+}
+
+/** List `sess_*` ids that have a transcript under `.crewhaus/sessions`. */
+function listSessionIds(sessionsDir: string): string[] {
+  if (!existsSync(sessionsDir)) return [];
+  return readdirSync(sessionsDir)
+    .filter((f) => f.endsWith(".jsonl"))
+    .map((f) => f.slice(0, -".jsonl".length))
+    .filter((id) => SESSION_ID_REGEX.test(id));
+}
+
+/** Read bare FeedbackRecords from `.crewhaus/feedback/*.jsonl` (the web-UI host
+ *  sink, which has no event-log handle). */
+function readFeedbackDir(feedbackDir: string): FeedbackRecord[] {
+  if (!existsSync(feedbackDir)) return [];
+  const objects: unknown[] = [];
+  for (const f of readdirSync(feedbackDir)) {
+    if (!f.endsWith(".jsonl")) continue;
+    objects.push(...parseJsonlObjects(readFileSync(join(feedbackDir, f), "utf-8")));
+  }
+  return extractFeedbackRecords(objects);
+}
+
+async function runDistill(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus distill (--session <id> | --all-sessions) -o <dataset.jsonl> " +
+        "[--graders-out <graders.yaml>] [--min-score F] [--judge] [--judge-model <model>]\n",
+    );
+    return;
+  }
+  const outPath = args.flags["out"];
+  if (typeof outPath !== "string") die("missing -o <dataset.jsonl>");
+  const allSessions = args.flags["all-sessions"] === true;
+  const session = args.flags["session"];
+  if (!allSessions && typeof session !== "string")
+    die("missing --session <id> (or --all-sessions)");
+  if (typeof session === "string" && !SESSION_ID_REGEX.test(session)) {
+    die(`invalid --session "${session}" — expected sess_<16 hex>`);
+  }
+  const minScore = floatFlag(args, "min-score") ?? 0.7;
+  if (minScore < 0 || minScore > 1) die(`invalid --min-score "${minScore}" — must be in [0,1]`);
+  const useJudge = args.flags["judge"] === true;
+  const judgeModel = args.flags["judge-model"];
+
+  const sessionsDir = join(process.cwd(), SESSIONS_SUBDIR);
+  const sessionIds = allSessions ? listSessionIds(sessionsDir) : [session as string];
+  if (sessionIds.length === 0) die(`no sessions found under ${sessionsDir}`);
+
+  // Derive turns per session (tagged with the sessionId join key) and gather
+  // feedback from both the in-transcript events and the web-UI feedback dir.
+  const turns: SessionTurn[] = [];
+  const feedback: FeedbackRecord[] = [];
+  for (const id of sessionIds) {
+    const events = readSessionEvents(id);
+    for (const t of deriveTurns(events)) turns.push({ ...t, sessionId: id });
+    feedback.push(...extractFeedbackRecords(events));
+  }
+  feedback.push(...readFeedbackDir(join(process.cwd(), FEEDBACK_SUBDIR)));
+
+  if (feedback.length === 0) {
+    die("no feedback found — record some with `crewhaus rate` / `crewhaus feedback` first");
+  }
+
+  const result = distillFeedback(turns, feedback, {
+    minScore,
+    ...(useJudge ? { judge: true } : {}),
+    ...(typeof judgeModel === "string" ? { judgeModel } : {}),
+  });
+  for (const w of result.warnings) process.stderr.write(`[distill] warning: ${w}\n`);
+  if (result.samples.length === 0) die("no rated turns could be matched to the transcript(s)");
+
+  const absOut = resolve(outPath);
+  mkdirSync(dirname(absOut), { recursive: true });
+  writeFileSync(absOut, samplesToJsonl(result.samples), { mode: 0o600 });
+
+  const gradersOut = args.flags["graders-out"];
+  if (typeof gradersOut === "string") {
+    const absGraders = resolve(gradersOut);
+    mkdirSync(dirname(absGraders), { recursive: true });
+    writeFileSync(absGraders, gradersConfigToYaml(result.graders), { mode: 0o600 });
+  }
+
+  const { stats } = result;
+  process.stdout.write(
+    `[distill] ${stats.matchedTurns} rated turn(s) → ${result.samples.length} sample(s) ` +
+      `(${stats.positives} positive, ${stats.negatives} low-rated) → ${absOut}\n`,
+  );
+  if (typeof gradersOut === "string") {
+    const g = result.graders.graders[0];
+    process.stdout.write(`[distill] grader: ${g?.name} (${g?.type}) → ${resolve(gradersOut)}\n`);
+  }
+  if (stats.unmatchedFeedback > 0) {
+    process.stdout.write(
+      `[distill] ${stats.unmatchedFeedback} rating(s) had no matching turn (skipped)\n`,
+    );
+  }
+}
+
+/**
+ * Inline-distill ratings for `crewhaus optimize --ratings`. `ratingsArg` is a
+ * session id or "all". Returns optimizer-shaped samples plus a synthesized
+ * graders.yaml (used only when the user did not pass their own --graders).
+ */
+function distillRatings(
+  ratingsArg: string,
+  minScore: number,
+): {
+  samples: Array<{ id: string; input: string; expected_output?: string }>;
+  gradersYaml: string;
+} {
+  const sessionsDir = join(process.cwd(), SESSIONS_SUBDIR);
+  let sessionIds: string[];
+  if (ratingsArg === "all") {
+    sessionIds = listSessionIds(sessionsDir);
+  } else {
+    if (!SESSION_ID_REGEX.test(ratingsArg)) {
+      die(`invalid --ratings "${ratingsArg}" — expected a session id (sess_<16 hex>) or "all"`);
+    }
+    sessionIds = [ratingsArg];
+  }
+  if (sessionIds.length === 0) die(`no sessions found under ${sessionsDir}`);
+
+  const turns: SessionTurn[] = [];
+  const feedback: FeedbackRecord[] = [];
+  for (const id of sessionIds) {
+    const events = readSessionEvents(id);
+    for (const t of deriveTurns(events)) turns.push({ ...t, sessionId: id });
+    feedback.push(...extractFeedbackRecords(events));
+  }
+  feedback.push(...readFeedbackDir(join(process.cwd(), FEEDBACK_SUBDIR)));
+  if (feedback.length === 0) {
+    die(
+      "no feedback found for --ratings — record some with `crewhaus rate` / `crewhaus feedback` first",
+    );
+  }
+
+  const result = distillFeedback(turns, feedback, { minScore });
+  for (const w of result.warnings) process.stderr.write(`[optimize] ratings warning: ${w}\n`);
+  const samples = result.samples.map((s) => ({
+    id: s.id,
+    input: s.input,
+    ...(s.expected_output !== undefined ? { expected_output: s.expected_output } : {}),
+  }));
+  return { samples, gradersYaml: gradersConfigToYaml(result.graders) };
 }
 
 /**
@@ -2532,6 +2923,15 @@ switch (subcommand) {
     break;
   case "cost-summary":
     await runCostSummary(parseFor(rest, COST_SUMMARY_SCHEMA));
+    break;
+  case "rate":
+    await runRate(parseFor(rest, RATE_SCHEMA));
+    break;
+  case "feedback":
+    await runFeedbackCmd(parseFor(rest, FEEDBACK_SCHEMA));
+    break;
+  case "distill":
+    await runDistill(parseFor(rest, DISTILL_SCHEMA));
     break;
   case "secrets": {
     const action = rest[0] ?? "";

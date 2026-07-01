@@ -77,6 +77,12 @@ function formatBody(ev: TraceEvent): string {
       return `adapter=${ev.adapter} ${ev.fromState}→${ev.toState}${
         ev.reason ? ` reason=${ev.reason}` : ""
       }`;
+    case "response_rated": {
+      const rating = typeof ev.rating === "number" ? ev.rating.toFixed(2) : ev.rating;
+      return `rating=${rating}${ev.source ? ` source=${ev.source}` : ""}${
+        ev.targetSpanId ? ` span=${ev.targetSpanId}` : ""
+      }${ev.comment ? ` comment=${ev.comment}` : ""}`;
+    }
     case "test_verdict":
       return `test=${ev.testId} verdict=${ev.verdict} duration=${ev.durationMs.toFixed(0)}ms${
         ev.reason ? ` reason=${ev.reason}` : ""

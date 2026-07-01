@@ -27,6 +27,7 @@
     { "path": "../../packages/eval-grader" },
     { "path": "../../packages/eval-report" },
     { "path": "../../packages/eval-runner" },
+    { "path": "../../packages/event-log" },
     { "path": "../../packages/hooks-engine" },
     { "path": "../../packages/infra-utils" },
     { "path": "../../packages/ir" },

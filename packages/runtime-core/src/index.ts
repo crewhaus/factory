@@ -1860,7 +1860,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               const warning = maybeBuildLoopWarning();
               if (warning !== null) {
                 messages.push(warning);
-                await logEvent("user_message", { content: warning.content });
+                await logEvent("user_message", { content: warning.content, synthetic: true });
               }
 
               // Synthesize the two transitions the state machine expects:
@@ -2013,7 +2013,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           const warning = maybeBuildLoopWarning();
           if (warning !== null) {
             messages.push(warning);
-            await logEvent("user_message", { content: warning.content });
+            await logEvent("user_message", { content: warning.content, synthetic: true });
           }
           state = transition(state, { kind: "ToolsExecuted" });
           break;
@@ -2088,9 +2088,14 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               state = transition(state, { kind: "RecoveryDone" });
               break;
             case "continue": {
+              // Runtime-injected user_message events (this nudge, the tombstone
+              // retry, and loop warnings) are marked `synthetic: true` in the
+              // event log. They are NOT human turns, so they do not increment
+              // runContext.turnNumber — and `crewhaus distill`'s deriveTurns
+              // skips them so its turn ordinal matches the runtime + web UI.
               const continueMsg = "Please continue from where you left off.";
               messages.push({ role: "user", content: continueMsg });
-              await logEvent("user_message", { content: continueMsg });
+              await logEvent("user_message", { content: continueMsg, synthetic: true });
               state = transition(state, { kind: "RecoveryDone" });
               break;
             }
@@ -2120,7 +2125,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               const tombstoneMsg =
                 "[previous assistant turn was rejected as invalid; please retry]";
               messages.push({ role: "user", content: tombstoneMsg });
-              await logEvent("user_message", { content: tombstoneMsg });
+              await logEvent("user_message", { content: tombstoneMsg, synthetic: true });
               state = transition(state, { kind: "RecoveryDone" });
               break;
             }
