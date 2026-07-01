@@ -48,7 +48,48 @@ export type Candidate = {
   readonly score: number;
 };
 
-export type FitnessFn = (prompt: string) => Promise<number>;
+/**
+ * Per-sample grade detail for one dev-set sample under the candidate
+ * prompt being measured. A fitness function MAY return these alongside
+ * the aggregate score so a model-driven mutator can see *which* samples
+ * failed and *why* (the grader's rationale) instead of guessing from the
+ * aggregate alone. Backward-compatible: a fitness fn that returns a bare
+ * `number` supplies no grades and the mutator falls back to its
+ * dev-set-window heuristic.
+ */
+export type SampleGrade = {
+  /** The input the agent was given for this sample. */
+  readonly input: string;
+  /** This sample's overall grade, 0..1 (mean across graders). */
+  readonly score: number;
+  /** The sample's reference answer, when the dataset carries one. */
+  readonly expected?: string;
+  /** The grader's plain-English rationale (e.g. "[grounded: ✗] no source cited"). */
+  readonly rationale?: string;
+};
+
+/**
+ * Richer fitness return: the aggregate score PLUS optional per-sample
+ * grades for the dev set. Returning grades lets a model-driven mutator
+ * learn from real failure signal (the grader's rationale on the samples
+ * it actually failed). A bare `number` remains valid — the loop
+ * normalises both forms.
+ */
+export type FitnessResult = {
+  readonly score: number;
+  readonly grades?: ReadonlyArray<SampleGrade>;
+};
+
+export type FitnessFn = (prompt: string) => Promise<number | FitnessResult>;
+
+/** Normalise a fitness return to `{ score, grades? }` (bare number → no grades). */
+function normalizeFitness(r: number | FitnessResult): {
+  score: number;
+  grades?: ReadonlyArray<SampleGrade>;
+} {
+  if (typeof r === "number") return { score: r };
+  return { score: r.score, ...(r.grades !== undefined ? { grades: r.grades } : {}) };
+}
 
 /**
  * Pillar 2 — the seam that lets `prompt-optimizer-claude` (or any
@@ -71,6 +112,14 @@ export interface MutationProvider {
 export type OptimizerState = {
   readonly iteration: number;
   readonly best: Candidate;
+  /**
+   * Per-sample grades for `best.prompt` on the dev set, present when the
+   * fitness function returned a `FitnessResult` carrying them. A
+   * model-driven mutator reads these to target the samples the current
+   * best actually fails (and their grader rationale); undefined when the
+   * fitness fn returns a bare number (mutator falls back to its heuristic).
+   */
+  readonly bestGrades?: ReadonlyArray<SampleGrade>;
   readonly trajectory: ReadonlyArray<Candidate>;
   readonly trainSet: ReadonlyArray<Sample>;
   readonly devSet: ReadonlyArray<Sample>;
@@ -248,7 +297,8 @@ export async function optimize(basePrompt: string, opts: OptimizeOptions): Promi
       ...(opts.mutations !== undefined ? { mutations: opts.mutations } : {}),
     });
 
-  const baseScore = await opts.fitness(basePrompt);
+  const base = normalizeFitness(await opts.fitness(basePrompt));
+  const baseScore = base.score;
   const baseCandidate: Candidate = {
     id: "candidate-0",
     prompt: basePrompt,
@@ -257,17 +307,24 @@ export async function optimize(basePrompt: string, opts: OptimizeOptions): Promi
   };
   const trajectory: Candidate[] = [baseCandidate];
   let best: Candidate = baseCandidate;
+  // Per-sample grades for the CURRENT best prompt — surfaced to the
+  // mutator so it can target the samples `best` actually fails. Updated
+  // whenever `best` is replaced (below) so the signal always describes
+  // the prompt being mutated, not a stale earlier candidate.
+  let bestGrades: ReadonlyArray<SampleGrade> | undefined = base.grades;
 
   for (let i = 1; i <= iterations; i++) {
     const state: OptimizerState = {
       iteration: i,
       best,
+      ...(bestGrades !== undefined ? { bestGrades } : {}),
       trajectory,
       trainSet: opts.trainSet,
       devSet: opts.devSet,
     };
     const proposal = await mutator.next(state);
-    const score = await opts.fitness(proposal.prompt);
+    const measured = normalizeFitness(await opts.fitness(proposal.prompt));
+    const score = measured.score;
     const candidate: Candidate = {
       id: `candidate-${i}`,
       prompt: proposal.prompt,
@@ -275,7 +332,10 @@ export async function optimize(basePrompt: string, opts: OptimizeOptions): Promi
       score,
     };
     trajectory.push(candidate);
-    if (score > best.score) best = candidate;
+    if (score > best.score) {
+      best = candidate;
+      bestGrades = measured.grades;
+    }
   }
 
   if (opts.outDir) {

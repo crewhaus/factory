@@ -9,7 +9,33 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Sample } from "@crewhaus/eval-dataset";
-import { PromptOptimizerError, RuleBasedMutationProvider, applyMutation, optimize } from "./index";
+import {
+  type FitnessFn,
+  type MutationProvider,
+  type OptimizerState,
+  PromptOptimizerError,
+  type ProviderMutation,
+  RuleBasedMutationProvider,
+  type SampleGrade,
+  applyMutation,
+  optimize,
+} from "./index";
+
+/**
+ * A mutator that records every `OptimizerState` it is handed, so tests can
+ * assert what signal (notably `bestGrades`) the loop threads to it. The
+ * rewrite it emits is caller-supplied so tests can force an improving or
+ * no-op iteration.
+ */
+class CapturingMutator implements MutationProvider {
+  readonly name = "capturing";
+  readonly states: OptimizerState[] = [];
+  constructor(private readonly rewrite: (prompt: string, iteration: number) => string) {}
+  async next(state: OptimizerState): Promise<ProviderMutation> {
+    this.states.push(state);
+    return { prompt: this.rewrite(state.best.prompt, state.iteration), mutations: [] };
+  }
+}
 
 let tmpRoot = "";
 
@@ -124,6 +150,70 @@ describe("prompt-optimizer — T3 fitness-driven search", () => {
         fitness: async () => 1,
       }),
     ).rejects.toBeInstanceOf(PromptOptimizerError);
+  });
+});
+
+describe("prompt-optimizer — per-sample grades (FitnessResult) threading", () => {
+  const grade = (input: string, score: number, rationale?: string): SampleGrade => ({
+    input,
+    score,
+    ...(rationale !== undefined ? { rationale } : {}),
+  });
+
+  test("optimize normalizes a FitnessResult and threads base grades to the mutator", async () => {
+    const baseGrades = [grade("q0", 0.0, "no citation"), grade("q1", 1.0)];
+    const fitness: FitnessFn = async (prompt) =>
+      prompt.includes("cite")
+        ? { score: 1, grades: [grade("q0", 1), grade("q1", 1)] }
+        : { score: 0.25, grades: baseGrades };
+    const mutator = new CapturingMutator((p) => `${p} (cite sources)`);
+    const samples = [sample("q0", "q0", "a0"), sample("q1", "q1", "a1")];
+    const result = await optimize("answer", {
+      trainSet: samples,
+      devSet: samples,
+      fitness,
+      mutator,
+      iterations: 1,
+    });
+    // Aggregate score is normalized out of the FitnessResult.
+    expect(result.best.score).toBe(1);
+    // Iteration 1 saw the BASE prompt's per-sample grades.
+    expect(mutator.states[0]?.bestGrades).toEqual(baseGrades);
+  });
+
+  test("bestGrades updates to the new best's grades after an improving iteration", async () => {
+    const baseGrades = [grade("q0", 0.0, "no citation")];
+    const improvedGrades = [grade("q0", 1.0, "cites docs/spec.md")];
+    const fitness: FitnessFn = async (prompt) =>
+      prompt.includes("cite")
+        ? { score: 1, grades: improvedGrades }
+        : { score: 0, grades: baseGrades };
+    // Only the first iteration improves; the second is a no-op rewrite.
+    const mutator = new CapturingMutator((p, i) => (i === 1 ? `${p} (cite)` : p));
+    const samples = [sample("q0", "q0", "a0")];
+    await optimize("answer", {
+      trainSet: samples,
+      devSet: samples,
+      fitness,
+      mutator,
+      iterations: 2,
+    });
+    // Iter 1 saw base grades; iter 2 saw the improved best's grades.
+    expect(mutator.states[0]?.bestGrades).toEqual(baseGrades);
+    expect(mutator.states[1]?.bestGrades).toEqual(improvedGrades);
+  });
+
+  test("a bare-number fitness leaves bestGrades undefined (back-compat)", async () => {
+    const mutator = new CapturingMutator((p) => p);
+    const samples = [sample("q0", "q0", "a0")];
+    await optimize("answer", {
+      trainSet: samples,
+      devSet: samples,
+      fitness: async () => 0.5,
+      mutator,
+      iterations: 1,
+    });
+    expect(mutator.states[0]?.bestGrades).toBeUndefined();
   });
 });
 

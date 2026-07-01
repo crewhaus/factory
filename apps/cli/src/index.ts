@@ -175,6 +175,7 @@ const OPTIMIZE_SCHEMA: ParseArgsSchema = {
     { name: "mutator", takesValue: true },
     { name: "iterations", takesValue: true },
     { name: "seed", takesValue: true },
+    { name: "concurrency", takesValue: true },
     { name: "improvement-threshold", takesValue: true },
     // FR-003 — dollar ceiling for model-driven runs (composes with --iterations).
     { name: "budget-usd", takesValue: true },
@@ -1489,7 +1490,7 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
       "usage: crewhaus optimize <spec.yaml> --dataset <data> --graders <graders.yaml> " +
-        "[--mutator rule-based|claude] [--iterations N] [--seed N] " +
+        "[--mutator rule-based|claude] [--iterations N] [--seed N] [--concurrency N] " +
         "[--improvement-threshold F] [--budget-usd N] [--write-back] [-o <out-dir>]\n",
     );
     return;
@@ -1510,6 +1511,17 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
     typeof thresholdFlag === "string" ? Number.parseFloat(thresholdFlag) : 0.01;
   if (Number.isNaN(iterations) || iterations < 1) {
     die(`invalid --iterations "${iterationsFlag}" — must be positive integer`);
+  }
+
+  // Per-candidate eval concurrency. Each iteration runs a full eval pass on
+  // the dev set; on a low provider rate-limit tier a high fan-out trips 429s,
+  // so this is exposed (mirroring `crewhaus eval --concurrency`) and defaults
+  // to 4. The nightly flywheel sets `--concurrency 1` on constrained tiers.
+  const concurrencyFlag = args.flags["concurrency"];
+  const concurrency =
+    typeof concurrencyFlag === "string" ? Number.parseInt(concurrencyFlag, 10) : 4;
+  if (Number.isNaN(concurrency) || concurrency < 1) {
+    die(`invalid --concurrency "${concurrencyFlag}" — must be a positive integer`);
   }
 
   // FR-003 — optional dollar budget for model-driven runs. Omit → today's
@@ -1561,9 +1573,20 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
     die(`dataset has ${samples.length} samples — need at least 2 (70/30 split needs a dev split)`);
   }
 
+  // Index the dev set by id so the fitness fn can join each graded
+  // sample-result back to the input + reference it was scored against.
+  const devById = new Map(devSet.map((s) => [s.id, s]));
+
   // Fitness fn: patch the spec with the candidate prompt, lower to IR,
-  // run eval-runner, return passRate. Each call is one full eval pass.
-  const fitness = async (prompt: string): Promise<number> => {
+  // run eval-runner, and return the pass-rate PLUS per-sample grades. The
+  // aggregate `passRate` still drives the search (unchanged scoring); the
+  // grades are additive — they carry each sample's overall score and the
+  // grader's rationale to the mutator (via OptimizerState.bestGrades) so
+  // a model-driven rewrite can target the samples the prompt actually
+  // fails and the reason it fails them. Each call is one full eval pass.
+  const fitness = async (
+    prompt: string,
+  ): Promise<import("@crewhaus/prompt-optimizer").FitnessResult> => {
     const yamlText = readFileSync(absSpec, "utf-8");
     // Re-parse to capture spec.target without depending on the
     // orchestrator's extractCurrentPrompt internals.
@@ -1583,7 +1606,7 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
     } catch (err) {
       if (err instanceof SpecParseError) {
         process.stderr.write("[optimize] candidate compiled invalid spec, skipping\n");
-        return 0;
+        return { score: 0 };
       }
       throw err;
     }
@@ -1596,11 +1619,20 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
       compiledGraders: compiled,
       opts: {
         outDir: join(outDir, "evals", `${prompt.length}_${ir.agent.instructions.length}`),
-        concurrency: 4,
+        concurrency,
         seed,
       },
     });
-    return summary.aggregates.passRate;
+    const grades = summary.samples.map((r) => {
+      const dev = devById.get(r.sampleId);
+      return {
+        input: dev?.input ?? r.sampleId,
+        score: r.grades.overall.score,
+        ...(dev?.expected_output !== undefined ? { expected: dev.expected_output } : {}),
+        rationale: r.grades.overall.rationale,
+      };
+    });
+    return { score: summary.aggregates.passRate, grades };
   };
 
   const mutator = args.flags["mutator"];
