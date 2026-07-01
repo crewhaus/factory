@@ -222,6 +222,18 @@ describe("createSlackAdapter — parseInbound (T2 — contract)", () => {
     ).toMatchObject({ reaction: { vote: "down" } });
   });
 
+  test("maps skin-tone-modified thumbs (Slack sends +1::skin-tone-N)", () => {
+    expect(
+      adapter().parseInbound({ headers: new Headers(), body: reactionBody("+1::skin-tone-4") }),
+    ).toMatchObject({ reaction: { vote: "up" } });
+    expect(
+      adapter().parseInbound({
+        headers: new Headers(),
+        body: reactionBody("thumbsdown::skin-tone-2"),
+      }),
+    ).toMatchObject({ reaction: { vote: "down" } });
+  });
+
   test("skips a non-vote emoji (incl. the bot's own status reactions)", () => {
     for (const e of ["eyes", "white_check_mark", "warning", "tada"]) {
       expect(adapter().parseInbound({ headers: new Headers(), body: reactionBody(e) }).kind).toBe(

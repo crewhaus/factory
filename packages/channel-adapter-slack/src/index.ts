@@ -75,13 +75,14 @@ export type InboundReaction = {
   readonly vote: "up" | "down";
 };
 
-/** Map a Slack reaction name (no colons) to a thumbs vote, or undefined when
- *  the emoji is not a 👍/👎 (which then produces no feedback). */
+/** Map a Slack reaction name to a thumbs vote, or undefined when the emoji is
+ *  not a 👍/👎 (which then produces no feedback). Slack delivers a skin-toned
+ *  reaction as `+1::skin-tone-4`, so the base name is taken before matching. */
 function reactionToVote(name: unknown): "up" | "down" | undefined {
   if (typeof name !== "string") return undefined;
-  const n = name.replace(/^:|:$/g, "");
-  if (n === "+1" || n === "thumbsup") return "up";
-  if (n === "-1" || n === "thumbsdown") return "down";
+  const base = name.replace(/^:|:$/g, "").split("::")[0] ?? "";
+  if (base === "+1" || base === "thumbsup") return "up";
+  if (base === "-1" || base === "thumbsdown") return "down";
   return undefined;
 }
 
