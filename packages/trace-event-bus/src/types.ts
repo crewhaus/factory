@@ -373,6 +373,26 @@ export type SanitizerReportEvent = TraceEventEnvelope & {
 };
 
 /**
+ * User feedback channel — a rating a human placed on a specific assistant
+ * turn: a thumbs up/down, a star/scalar score, and/or a free-text comment.
+ * Distinct from `test_verdict` (an automated pass/fail): this is a HUMAN
+ * signal. Published onto the bus by in-session capture surfaces (e.g. a
+ * channel reaction) so the pretty printer and OTel exporter can surface it
+ * live. The durable, offline record that `crewhaus distill` reads is the
+ * separate `event-log` `user_feedback` kind — the two are siblings, not the
+ * same wire object. `rating` is normalized at the boundary: the literal
+ * "up"/"down" for a thumbs vote, or a number in [0,1] for a star/scale vote.
+ */
+export type ResponseRatedEvent = TraceEventEnvelope & {
+  kind: "response_rated";
+  /** spanId of the rated `model_response` (its gen_ai.chat span), when known. */
+  targetSpanId?: string;
+  rating: "up" | "down" | number;
+  comment?: string;
+  source?: "user" | "ui" | "channel" | "cli";
+};
+
+/**
  * Section 27 — `circuit-breaker` emits this on every state transition.
  * Subscribers (audit-log, OTel exporter, structured-event-printer) can
  * surface degraded providers without subscribing to the breaker directly.
@@ -411,6 +431,7 @@ export type TraceEvent =
   | CrewDoneEvent
   | CostAccrualEvent
   | CircuitStateChangedEvent
+  | ResponseRatedEvent
   | TestVerdictEvent
   | ProgramOutputEvent
   | CoverageReportEvent

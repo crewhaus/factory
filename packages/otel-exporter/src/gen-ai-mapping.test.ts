@@ -13,6 +13,7 @@ import type {
   ModelResponseEvent,
   ModelStreamTokenEvent,
   PermissionDecisionEvent,
+  ResponseRatedEvent,
   SubAgentEndEvent,
   SubAgentStartEvent,
   ToolCallEndEvent,
@@ -34,6 +35,7 @@ import {
   buildMcpSpan,
   buildModelSpan,
   buildPermissionSpan,
+  buildResponseRatedSpan,
   buildStreamTokenEvent,
   buildSubAgentSpan,
   buildToolSpan,
@@ -632,6 +634,48 @@ describe("buildPermissionSpan", () => {
     };
     const span = buildPermissionSpan(ev);
     expect(span.status.code).toBe(STATUS_OK);
+  });
+});
+
+describe("buildResponseRatedSpan", () => {
+  test("thumbs rating with source + comment → feedback.* attributes, OK status", () => {
+    const ev: ResponseRatedEvent = {
+      ...env(),
+      kind: "response_rated",
+      rating: "up",
+      source: "cli",
+      comment: "great cite",
+    };
+    const span = buildResponseRatedSpan(ev);
+    expect(span.name).toBe("feedback.response_rated");
+    expect(span.kind).toBe(SPAN_KIND_INTERNAL);
+    expect(span.parentSpanId).toBe(ev.parentSpanId);
+    expect(span.startTimeUnixNano).toBe(span.endTimeUnixNano);
+    expect(findAttr(span.attributes, ATTR.CREWHAUS_FEEDBACK_RATING)?.value).toEqual({
+      stringValue: "up",
+    });
+    expect(findAttr(span.attributes, ATTR.CREWHAUS_FEEDBACK_SOURCE)?.value).toEqual({
+      stringValue: "cli",
+    });
+    expect(findAttr(span.attributes, ATTR.CREWHAUS_FEEDBACK_COMMENT)?.value).toEqual({
+      stringValue: "great cite",
+    });
+    expect(span.status.code).toBe(STATUS_OK);
+  });
+
+  test("numeric rating stringified; source/comment omitted when absent", () => {
+    const ev: ResponseRatedEvent = {
+      ...env({ parentSpanId: undefined }),
+      kind: "response_rated",
+      rating: 0.5,
+    };
+    const span = buildResponseRatedSpan(ev);
+    expect(findAttr(span.attributes, ATTR.CREWHAUS_FEEDBACK_RATING)?.value).toEqual({
+      stringValue: "0.5",
+    });
+    expect(findAttr(span.attributes, ATTR.CREWHAUS_FEEDBACK_SOURCE)).toBeUndefined();
+    expect(findAttr(span.attributes, ATTR.CREWHAUS_FEEDBACK_COMMENT)).toBeUndefined();
+    expect("parentSpanId" in span).toBe(false);
   });
 });
 

@@ -64,7 +64,14 @@ export type EventKind =
   // `crewhaus cost-summary --session <id>` can sum spend after a run. It is not
   // a conversational message, so `replayMessageHistory` ignores it and resume
   // is unaffected.
-  | "cost_accrual";
+  | "cost_accrual"
+  // A human rating on a specific assistant turn — a thumbs up/down, a
+  // star/scale score, and/or a free-text comment or correction. Written by
+  // the `crewhaus rate`/`feedback` capture surfaces and read back by
+  // `crewhaus distill` to synthesize eval datasets + graders. Like
+  // `cost_accrual` it is non-conversational, so `replayMessageHistory`
+  // ignores it and `--resume` is unaffected. Payload is a `FeedbackRecord`.
+  | "user_feedback";
 
 export type Event = {
   readonly ts: number;

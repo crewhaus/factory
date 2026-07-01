@@ -29,6 +29,7 @@ export type {
   ProviderId,
   PublishOptions,
   RecentQuery,
+  ResponseRatedEvent,
   RoleEndEvent,
   RoleStartEvent,
   SanitizerReportEvent,

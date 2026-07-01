@@ -1381,6 +1381,43 @@ describe("runChatLoop — Section 10 persistence", () => {
     expect(replayed[3]?.role).toBe("assistant");
   });
 
+  test("replayMessageHistory ignores a user_feedback event (resume-safe)", async () => {
+    // A rating persisted mid-session must never re-enter the conversation as a
+    // role message — it is non-conversational, exactly like cost_accrual. This
+    // locks the invariant the `crewhaus rate` capture surface relies on.
+    const sessionId = "sess_fee6bacc0ffee000";
+    const { openEventLog } = await import("@crewhaus/event-log");
+    const log = await openEventLog(sessionId, { rootDir: SHARED_SESSION_ROOT });
+    await log.append({ kind: "user_message", payload: { content: "hi" } });
+    await log.append({
+      kind: "assistant_message",
+      payload: { content: [{ type: "text", text: "hello", citations: null }] },
+    });
+    await log.append({
+      kind: "user_feedback",
+      payload: {
+        schemaVersion: 1,
+        id: "fb_1",
+        sessionId,
+        turnNumber: 1,
+        modality: "binary",
+        rating: { thumbs: "up" },
+        source: "cli",
+        ts: "2026-07-01T00:00:00.000Z",
+      },
+    });
+    await log.close();
+
+    const reopened = await openEventLog(sessionId, { rootDir: SHARED_SESSION_ROOT });
+    const replayed = await replayMessageHistory(reopened);
+    await reopened.close();
+
+    // Only the user + assistant messages replay; the feedback line is skipped.
+    expect(replayed.length).toBe(2);
+    expect(replayed[0]).toEqual({ role: "user", content: "hi" });
+    expect(replayed[1]?.role).toBe("assistant");
+  });
+
   test("replayMessageHistory tolerates nested a2a brackets (peer of a peer)", async () => {
     // If a peer's inline runChatLoop itself drives another A2A call,
     // the markers nest. Depth-counting keeps any nesting level skipped
