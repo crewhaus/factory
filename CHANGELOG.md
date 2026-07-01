@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.8] - 2026-07-01
+
+Response ratings → self-improving evals/graders/datasets.
+
+### Added
+
+- **Rate agent responses, then distill the ratings into eval artifacts.** New
+  `crewhaus rate` (thumbs/stars/score) and `crewhaus feedback` (comment or
+  `--correction`, a better answer) record a human rating on a session turn as a
+  resume-safe `user_feedback` event in the session JSONL. `crewhaus distill`
+  pairs ratings with their exchanges and emits the two artifacts the eval stack
+  already consumes: a `Sample[]` dataset (positively-rated turns become gold
+  samples — the correction wins when present; low-rated turns become
+  mutation-target hints) and a `graders.yaml` with exactly one synthesized
+  grader. `crewhaus optimize --ratings <session>|all` feeds distilled samples
+  into the existing optimize loop with no optimizer change, so real usage
+  signal drives spec patches (Pillar 2).
+- **`crewhaus distill --judge [--judge-model <m>]`** emits an `llm_judge`
+  grader instead, its rubric seeded from the praised-vs-criticized feedback
+  comment themes (quoted as data; runs one judge call per sample under
+  `crewhaus eval`).
+- **Slack 👍/👎 reactions become ratings.** With the new spec block
+  `feedback: { channelReactions: true }`, the compiled channel bot maps
+  `reaction_added` on a bot reply (`+1`/`thumbsup`/`-1`/`thumbsdown`, including
+  skin-tone variants) to a `user_feedback` event on the reacting session
+  (channel/user session modes; other emojis and the bot's own status reactions
+  are ignored).
+- **Cross-cutting `feedback:` spec block** (`modality`, `scale`, `storage`,
+  `autoDistill`, `channelReactions`) on the cli and channel shapes, lowered to
+  `ir.feedback` (Pillar 1); deliberately *not* in `OPTIMIZABLE_PATHS`.
+- **`response_rated` trace event** wired through the pretty printer and OTel
+  exporters; the web UI (`@crewhaus/ui`) gains a per-turn rating bar that
+  persists to `.crewhaus/feedback/feedback.jsonl`.
+
+### Fixed
+
+- Runtime-injected recovery nudges (loop warning, continue, tombstone) are now
+  logged `synthetic: true` so turn numbering agrees across the CLI, web UI,
+  runtime, and `distill` even after a mid-session recovery.
+
 ## [Unreleased] - §55–§59 integration batch (2026-05-26)
 
 External sources synthesized for this batch:
