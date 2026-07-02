@@ -51,6 +51,20 @@ import type { AuditKind, AuditRecord } from "@crewhaus/audit-log";
  * digest ALSO scans session JSONLs in the window — that is where injection
  * rule-id hit counts come from today.
  *
+ * TRUST BOUNDARY (adversarial-review F1): everything parsed out of session
+ * `tool_result` content is attacker-reachable — any tool that returns
+ * malicious output can start it with a forged denial/redaction notice, so
+ * the session-derived counters are HEURISTIC (best-effort), never
+ * authoritative; the report says so explicitly and keeps them in their own
+ * section, separate from the audit-derived rollups. And because a forged
+ * notice can carry terminal escape codes or newlines aimed at the
+ * operator's terminal, every content-derived string is neutralized at PARSE
+ * time ({@link sanitizeContentString}: C0+C1 controls incl. ESC/newlines
+ * stripped, length clamped) so every renderer — text, JSON, HTML, --notify
+ * payload — sees only sanitized values. Audit-record strings get the same
+ * treatment as defense in depth (judge reasons can embed model-generated
+ * text). The HTML renderer additionally HTML-escapes, as before.
+ *
  * HTML output: apps/cli already depends on `@crewhaus/eval-report`, but its
  * render.ts keeps `shell`/`escapeHtml` private to the eval-report shapes.
  * Rather than widen that package's public API for a CLI-side concern, the
@@ -210,7 +224,11 @@ export type SecurityDigest = {
     readonly auditAndAllow: number;
     readonly topDeniedTools: ReadonlyArray<CountEntry>;
   };
-  /** Durable block-tier residue scanned out of session event logs. */
+  /** Durable block-tier residue scanned out of session event logs. HEURISTIC
+   *  (best-effort) by construction: the markers live in `tool_result`
+   *  content, which any malicious tool output can forge — these counters can
+   *  be inflated (never the audit-derived ones above). Strings in here are
+   *  sanitized at parse time; see the module header's trust-boundary note. */
   readonly sessions: {
     readonly scanned: number;
     readonly justificationDenials: number;
@@ -245,6 +263,35 @@ function asObject(payload: unknown): Record<string, unknown> | undefined {
   return payload !== null && typeof payload === "object" && !Array.isArray(payload)
     ? (payload as Record<string, unknown>)
     : undefined;
+}
+
+/** Length clamp for content-derived strings in the digest (reasons, names). */
+const MAX_CONTENT_STRING_LENGTH = 256;
+/** Tighter clamp for injection rule ids — real ids are short slugs. */
+const MAX_RULE_ID_LENGTH = 64;
+
+// Matches C0 controls (U+0000–U+001F, incl. ESC/newline/CR), DEL (U+007F)
+// and C1 controls (U+0080–U+009F, incl. CSI/OSC single-byte forms).
+// eslint-disable-next-line no-control-regex
+// biome-ignore lint/suspicious/noControlCharactersInRegex: intentional control-character detection/sanitization
+const CONTROL_CHAR_PATTERN = /[\u0000-\u001f\u007f-\u009f]/g;
+
+/**
+ * Neutralize a string parsed out of stored session/audit content before it
+ * enters the digest (adversarial-review F1). Session `tool_result` content
+ * is attacker-reachable — a malicious tool output can embed ANSI escape
+ * sequences (rewrite the operator's terminal, forge "ALL CLEAR" lines) or
+ * newlines (inject whole fake report lines) into anything the text renderer
+ * prints raw. Applied at PARSE time so text, JSON, HTML and the --notify
+ * payload all carry only sanitized values: strips C0/C1 control characters
+ * (including ESC and line breaks) and clamps the length.
+ */
+export function sanitizeContentString(
+  value: string,
+  maxLength: number = MAX_CONTENT_STRING_LENGTH,
+): string {
+  const stripped = value.replace(CONTROL_CHAR_PATTERN, "");
+  return stripped.length > maxLength ? `${stripped.slice(0, maxLength)}…` : stripped;
 }
 
 /** `YYYY-MM-DD` day file → epoch ms of the LAST instant of that UTC day
@@ -339,8 +386,12 @@ export function buildSecurityDigest(opts: {
 
         if (kind === "permission_justification_evaluated") {
           const p = (asObject(record.payload) ?? {}) as JustificationPayload;
-          const toolName = typeof p.toolName === "string" ? p.toolName : "(unknown tool)";
-          const judgeModel = typeof p.judgeModel === "string" ? p.judgeModel : "(unknown judge)";
+          const toolName =
+            typeof p.toolName === "string" ? sanitizeContentString(p.toolName) : "(unknown tool)";
+          const judgeModel =
+            typeof p.judgeModel === "string"
+              ? sanitizeContentString(p.judgeModel)
+              : "(unknown judge)";
           const denied = p.verdict === "deny";
           jEvaluated += 1;
           if (denied) jDenied += 1;
@@ -358,12 +409,13 @@ export function buildSecurityDigest(opts: {
             t.denials += 1;
             t.judges.add(judgeModel);
             if (typeof p.confidence === "number") t.confidences.push(p.confidence);
-            if (typeof p.reason === "string") t.lastReason = p.reason;
+            if (typeof p.reason === "string") t.lastReason = sanitizeContentString(p.reason);
             deniedTools.set(toolName, t);
           }
         } else if (kind === "egress_decision") {
           const p = (asObject(record.payload) ?? {}) as EgressPayload;
-          const sinkId = typeof p.sinkId === "string" ? p.sinkId : "(unknown sink)";
+          const sinkId =
+            typeof p.sinkId === "string" ? sanitizeContentString(p.sinkId) : "(unknown sink)";
           const verdict = p.verdict;
           if (verdict === "warn") eWarned += 1;
           else if (verdict === "block") eBlocked += 1;
@@ -375,8 +427,9 @@ export function buildSecurityDigest(opts: {
             if (Array.isArray(p.originsFound)) {
               for (const o of p.originsFound) {
                 if (typeof o === "string") {
-                  s.origins.add(o);
-                  origins.set(o, (origins.get(o) ?? 0) + 1);
+                  const origin = sanitizeContentString(o);
+                  s.origins.add(origin);
+                  origins.set(origin, (origins.get(origin) ?? 0) + 1);
                 }
               }
             }
@@ -386,7 +439,8 @@ export function buildSecurityDigest(opts: {
           const p = (asObject(record.payload) ?? {}) as PolicyPayload;
           if (p.decision === "deny") {
             pDenied += 1;
-            const toolName = typeof p.toolName === "string" ? p.toolName : "(unknown tool)";
+            const toolName =
+              typeof p.toolName === "string" ? sanitizeContentString(p.toolName) : "(unknown tool)";
             policyDeniedTools.set(toolName, (policyDeniedTools.get(toolName) ?? 0) + 1);
           } else if (p.decision === "audit-and-allow") {
             pAuditAndAllow += 1;
@@ -484,7 +538,10 @@ export const SESSION_DENIAL_MARKERS = {
   hook: "[blocked by hook]",
 } as const;
 
-const REDACTION_NOTICE_REGEX = /^\[tool output redacted: prompt injection detected: ([^\]]*)\]/;
+/** The runtime's redaction notice is a single line; excluding `\n`/`\r` from
+ *  the rule-id capture keeps a forged notice from smuggling multi-line
+ *  content into the parse (the ids are additionally sanitized + clamped). */
+const REDACTION_NOTICE_REGEX = /^\[tool output redacted: prompt injection detected: ([^\]\n\r]*)\]/;
 
 type SessionEvent = {
   readonly ts?: unknown;
@@ -525,7 +582,9 @@ function scanSessionDenials(sessionsDir: string, sinceMs: number): SecurityDiges
           if (m !== null) {
             injectionRedactions += 1;
             for (const rule of (m[1] as string).split(",")) {
-              const id = rule.trim();
+              // Rule ids come from attacker-reachable tool_result content —
+              // neutralize before they can reach a renderer (F1).
+              const id = sanitizeContentString(rule.trim(), MAX_RULE_ID_LENGTH);
               if (id !== "") ruleHits.set(id, (ruleHits.get(id) ?? 0) + 1);
             }
           }
@@ -590,12 +649,18 @@ export function renderSecurityDigestText(d: SecurityDigest): ReadonlyArray<strin
   );
   for (const t of d.policy.topDeniedTools) lines.push(`  ✗ ${t.name} — ${t.count} denial(s)`);
 
+  // Content-derived section — kept apart from the audit-derived rollups
+  // above: these markers live in tool_result content, which any malicious
+  // tool output can forge (adversarial-review F1).
   lines.push(
-    `sessions (${d.sessions.scanned} event log(s)): ${d.sessions.justificationDenials} justification denial notice(s), ${d.sessions.egressBlocks} egress block(s), ${d.sessions.hookBlocks} hook block(s), ${d.sessions.injectionRedactions} injection redaction(s)`,
+    `sessions — content-derived, heuristic (${d.sessions.scanned} event log(s)): ${d.sessions.justificationDenials} justification denial notice(s), ${d.sessions.egressBlocks} egress block(s), ${d.sessions.hookBlocks} hook block(s), ${d.sessions.injectionRedactions} injection redaction(s)`,
   );
   for (const r of d.sessions.injectionRuleHits) {
     lines.push(`  ✗ injection rule ${r.name}: ${r.count} hit(s)`);
   }
+  lines.push(
+    "  ~ session-derived counts are heuristic (parsed from tool_result content, which tool output can forge); audit-derived counts above are authoritative",
+  );
 
   const kindCounts = Object.entries(d.audit.countsByKind)
     .map(([k, n]) => `${k}=${n}`)
@@ -716,6 +781,7 @@ ${tableOf(
   ["Rule", "Hits"],
   d.sessions.injectionRuleHits.map((r) => [r.name, String(r.count)]),
 )}
+<p class="note">Session-derived counts are heuristic — parsed from tool_result content, which tool output can forge; audit-derived counts are authoritative.</p>
 <h2>Audit kinds in window</h2>
 ${tableOf(
   ["Kind", "Records"],
@@ -748,11 +814,17 @@ export class NotifyError extends Error {
  * POST the JSON digest to a webhook. Plain `fetch`, no channel-adapter
  * dependency (see module header); Slack users wrap the payload — incoming
  * webhooks accept `{ text }`, not arbitrary JSON.
+ *
+ * A plain-http URL is allowed (local tunnels/dev receivers) but warned about
+ * on stderr (adversarial-review F3): the digest is security telemetry —
+ * denial counts, tool names, judge reasons — and posting it cleartext leaks
+ * it to every on-path observer. `warn` is injectable for tests.
  */
 export async function notifySecurityDigest(
   url: string,
   digest: SecurityDigest,
   fetchImpl: typeof fetch = fetch,
+  warn: (line: string) => void = (line) => process.stderr.write(`${line}\n`),
 ): Promise<void> {
   let parsed: URL;
   try {
@@ -762,6 +834,11 @@ export async function notifySecurityDigest(
   }
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
     throw new NotifyError(`--notify only supports http(s) URLs (got "${parsed.protocol}//")`);
+  }
+  if (parsed.protocol === "http:") {
+    warn(
+      `warning: --notify ${url} uses plain http — the digest is security telemetry and will transit unencrypted; prefer an https webhook`,
+    );
   }
   let res: Response;
   try {

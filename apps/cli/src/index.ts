@@ -477,6 +477,10 @@ const CHANNEL_SCHEMA: ParseArgsSchema = {
     { name: "out", short: "o", takesValue: true },
     // print every network call (redacted) without performing it.
     { name: "dry-run", takesValue: false },
+    // provision (discord) only: overwrite a DIFFERENT pre-existing
+    // interactions_endpoint_url — read-before-write refuses without it
+    // (mirrors `state restore --force`).
+    { name: "force", takesValue: false },
     { name: "help", short: "h" },
   ],
 };
@@ -619,7 +623,7 @@ function usageText(): string {
     "  channel provision <spec.yaml>        one-command platform app setup for a channel spec (item 61):",
     "       --base-url <public-url>         slack app manifest YAML, telegram setWebhook, discord",
     "       [--platform slack|telegram|discord|all]  interactions endpoint + invite URL",
-    "       [-o <dir>] [--dry-run]",
+    "       [-o <dir>] [--dry-run] [--force]",
     "  channel verify <spec.yaml>           scope doctor: slack auth.test + granted scopes,",
     "       [--platform ...] [--dry-run]    telegram getWebhookInfo, discord application fetch",
     "       [--base-url <public-url>]       (exit 1 on missing scopes / mismatched webhook)",
@@ -3995,7 +3999,8 @@ async function runChannel(args: ParsedArgs, action: "provision" | "verify"): Pro
   if (args.flags["help"]) {
     process.stdout.write(
       "usage: crewhaus channel provision <spec.yaml> --base-url <public-url>\n" +
-        "                                  [--platform slack|telegram|discord|all] [-o <dir>] [--dry-run]\n" +
+        "                                  [--platform slack|telegram|discord|all] [-o <dir>]\n" +
+        "                                  [--dry-run] [--force]\n" +
         "       crewhaus channel verify <spec.yaml> [--platform slack|telegram|discord|all]\n" +
         "                                  [--base-url <public-url>] [--dry-run]\n" +
         "\n" +
@@ -4020,7 +4025,10 @@ async function runChannel(args: ParsedArgs, action: "provision" | "verify"): Pro
         "    discord   applications/@me id / verify_key / interactions endpoint\n" +
         "  --base-url  the daemon's publicly reachable origin (required for provision;\n" +
         "              on verify it upgrades the webhook-URL checks from ~ to ✓/✗)\n" +
-        "  --dry-run   print every network call (secrets redacted) without performing it\n",
+        "  --dry-run   print every network call (secrets redacted) without performing it\n" +
+        "  --force     discord provision reads applications/@me first and REFUSES to\n" +
+        "              overwrite an interactions_endpoint_url that differs from the\n" +
+        "              daemon route; --force replaces it (and reports what it was)\n",
     );
     return;
   }
@@ -4150,6 +4158,11 @@ async function runChannel(args: ParsedArgs, action: "provision" | "verify"): Pro
             `  would PATCH ${provision.display.endpoint} (Authorization: ${provision.display.authorization})\n`,
           );
           process.stdout.write(`  payload: ${JSON.stringify(provision.display.payload)}\n`);
+          process.stdout.write(
+            "  note: a live run first GETs applications/@me — a pre-existing\n" +
+              "        interactions_endpoint_url that differs from the payload above is\n" +
+              "        only replaced with --force (without it, provision refuses)\n",
+          );
           if (provision.missingEnv.length > 0) {
             process.stdout.write(
               `  note: a live run needs ${provision.missingEnv.map((m) => `$${m.envName}`).join(", ")} set\n`,
@@ -4166,10 +4179,17 @@ async function runChannel(args: ParsedArgs, action: "provision" | "verify"): Pro
           );
         } else {
           try {
-            await performDiscordProvision(provision);
+            const result = await performDiscordProvision(provision, fetch, {
+              force: args.flags["force"] === true,
+            });
             process.stdout.write(
               `  ✓ interactions endpoint set to ${provision.display.payload.interactions_endpoint_url}\n`,
             );
+            if (result.replacedPrevious && result.previousEndpoint !== undefined) {
+              process.stdout.write(
+                `    replaced previous endpoint ${result.previousEndpoint} (--force)\n`,
+              );
+            }
           } catch (err) {
             if (err instanceof ChannelApiError) die(err.message);
             throw err;

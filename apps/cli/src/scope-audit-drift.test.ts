@@ -4,7 +4,8 @@
  * load/validate, and the boundary-drift detector over fixture trees.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -54,6 +55,47 @@ describe("findingId", () => {
     expect(findingId(finding({ class: "boundary-drift" }))).not.toBe(base);
     expect(findingId(finding({ file: "packages/other/src/index.ts" }))).not.toBe(base);
     expect(findingId(finding({ symbol: "other-site" }))).not.toBe(base);
+  });
+});
+
+describe("findingId — de-binarized NUL separator (adversarial-review F2)", () => {
+  // These values were computed with the ORIGINAL source (literal NUL bytes as
+  // the separator) BEFORE the escape-sequence rewrite. Pinning them proves the
+  // rewrite is hash-preserving: every previously issued findingId — and every
+  // accepted baseline built from them — stays valid.
+  test("pins known ids: the escape rewrite preserved every hash", () => {
+    expect(
+      findingId({ class: "boundary-drift", file: "packages/x/src", symbol: "mcp-sdk-ingress" }),
+    ).toBe("6a88ee64ac11");
+    expect(findingId({ class: "tool-scope", file: "", symbol: "shell" })).toBe("3ac200095796");
+    expect(
+      findingId({
+        class: "boundary-site",
+        file: "packages/runtime-core/src/loop.ts",
+        symbol: "tool-result",
+      }),
+    ).toBe("65f2f98fe755");
+  });
+
+  test("the runtime separator is still NUL, keeping field boundaries unambiguous", () => {
+    const NUL = String.fromCharCode(0);
+    const manual = createHash("sha256")
+      .update(["boundary-drift", "packages/x/src", "mcp-sdk-ingress"].join(NUL))
+      .digest("hex")
+      .slice(0, 12);
+    expect(manual).toBe(
+      findingId({ class: "boundary-drift", file: "packages/x/src", symbol: "mcp-sdk-ingress" }),
+    );
+  });
+
+  test("the module source contains no literal control bytes (git must diff it as text)", () => {
+    const src = readFileSync(join(import.meta.dir, "scope-audit-drift.ts"), "utf8");
+    const controlBytes = [...src].filter((c) => {
+      const code = c.charCodeAt(0);
+      const allowed = code === 0x0a; // newline is the only control char a text source needs
+      return !allowed && (code < 0x20 || code === 0x7f);
+    });
+    expect(controlBytes).toEqual([]);
   });
 });
 

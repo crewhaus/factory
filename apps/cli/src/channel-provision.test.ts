@@ -409,28 +409,101 @@ describe("Discord interactions-endpoint provision", () => {
     ]);
   });
 
-  test("performs the PATCH; a rejection carries the live-validation hint", async () => {
+  test("performs the PATCH (after the pre-read); a rejection carries the live-validation hint", async () => {
     const discord = channelIr().channels.discord;
     if (discord === undefined) throw new Error("fixture discord missing");
     const provision = buildDiscordProvision(discord, BASE_URL, FULL_ENV);
 
     const ok = fakeFetch(() => ({ body: { id: "app-123" } }));
-    await performDiscordProvision(provision, ok.impl);
-    expect(ok.calls).toHaveLength(1);
-    expect(ok.calls[0]?.init?.method).toBe("PATCH");
+    const result = await performDiscordProvision(provision, ok.impl);
+    // Read-before-write: GET applications/@me first, then the PATCH.
+    expect(ok.calls).toHaveLength(2);
+    expect(ok.calls[0]?.init?.method).toBe("GET");
+    expect(ok.calls[1]?.init?.method).toBe("PATCH");
     expect(
-      (ok.calls[0]?.init?.headers as Record<string, string> | undefined)?.["Authorization"],
+      (ok.calls[1]?.init?.headers as Record<string, string> | undefined)?.["Authorization"],
     ).toBe("Bot real-discord-token");
+    expect(result.previousEndpoint).toBeUndefined();
+    expect(result.replacedPrevious).toBe(false);
 
-    const bad = fakeFetch(() => ({
-      status: 400,
-      statusText: "Bad Request",
-      body: { message: "Invalid interactions endpoint url" },
-    }));
+    const bad = fakeFetch((_url, init) =>
+      init?.method === "GET"
+        ? { body: { id: "app-123" } }
+        : {
+            status: 400,
+            statusText: "Bad Request",
+            body: { message: "Invalid interactions endpoint url" },
+          },
+    );
     const err = await performDiscordProvision(provision, bad.impl).catch((e) => e as Error);
     expect(err).toBeInstanceOf(ChannelApiError);
     expect((err as Error).message).toContain("Invalid interactions endpoint url");
     expect((err as Error).message).toContain("daemon must be running");
+  });
+});
+
+describe("Discord read-before-write overwrite guard (adversarial-review F5)", () => {
+  const PREVIOUS = "https://other-service.example.com/interactions";
+
+  function provisionWithExisting(existing: string | null): {
+    provision: ReturnType<typeof buildDiscordProvision>;
+    impl: typeof fetch;
+    calls: Array<{ url: string; init: RequestInit | undefined }>;
+  } {
+    const discord = channelIr().channels.discord;
+    if (discord === undefined) throw new Error("fixture discord missing");
+    const provision = buildDiscordProvision(discord, BASE_URL, FULL_ENV);
+    const { impl, calls } = fakeFetch((_url, init) =>
+      init?.method === "GET"
+        ? { body: { id: "app-123", interactions_endpoint_url: existing } }
+        : { body: { id: "app-123" } },
+    );
+    return { provision, impl, calls };
+  }
+
+  test("refuses to overwrite a DIFFERENT pre-existing endpoint without --force (no PATCH sent)", async () => {
+    const { provision, impl, calls } = provisionWithExisting(PREVIOUS);
+    const err = await performDiscordProvision(provision, impl).catch((e) => e as Error);
+    expect(err).toBeInstanceOf(ChannelApiError);
+    expect((err as Error).message).toContain(PREVIOUS); // says what it was
+    expect((err as Error).message).toContain("--force");
+    expect(calls).toHaveLength(1); // GET only — the write never happened
+    expect(calls[0]?.init?.method).toBe("GET");
+  });
+
+  test("--force replaces a differing endpoint and reports what it was", async () => {
+    const { provision, impl, calls } = provisionWithExisting(PREVIOUS);
+    const result = await performDiscordProvision(provision, impl, { force: true });
+    expect(calls).toHaveLength(2);
+    expect(calls[1]?.init?.method).toBe("PATCH");
+    expect(result.previousEndpoint).toBe(PREVIOUS);
+    expect(result.replacedPrevious).toBe(true);
+  });
+
+  test("an unset or already-matching endpoint proceeds without --force", async () => {
+    const unset = provisionWithExisting(null);
+    const unsetResult = await performDiscordProvision(unset.provision, unset.impl);
+    expect(unset.calls[1]?.init?.method).toBe("PATCH");
+    expect(unsetResult.replacedPrevious).toBe(false);
+
+    const same = provisionWithExisting("https://bot.example.com/discord/events");
+    const sameResult = await performDiscordProvision(same.provision, same.impl);
+    expect(same.calls[1]?.init?.method).toBe("PATCH"); // idempotent re-run is fine
+    expect(sameResult.previousEndpoint).toBe("https://bot.example.com/discord/events");
+    expect(sameResult.replacedPrevious).toBe(false);
+  });
+
+  test("a failed pre-read blocks the write (fails closed)", async () => {
+    const discord = channelIr().channels.discord;
+    if (discord === undefined) throw new Error("fixture discord missing");
+    const provision = buildDiscordProvision(discord, BASE_URL, FULL_ENV);
+    const { impl, calls } = fakeFetch((_url, init) =>
+      init?.method === "GET" ? { status: 401, statusText: "Unauthorized" } : { body: {} },
+    );
+    const err = await performDiscordProvision(provision, impl).catch((e) => e as Error);
+    expect(err).toBeInstanceOf(ChannelApiError);
+    expect((err as Error).message).toContain("no overwrite was attempted");
+    expect(calls).toHaveLength(1);
   });
 });
 

@@ -620,18 +620,65 @@ export function buildDiscordProvision(
   };
 }
 
-/** Perform the PATCH. A 4xx here usually means Discord's live endpoint
- *  validation failed — surfaced with that hint. */
+export type DiscordProvisionResult = {
+  /** `interactions_endpoint_url` found on the application BEFORE the PATCH
+   *  (undefined when none was set). */
+  readonly previousEndpoint?: string;
+  /** True when a different pre-existing endpoint was overwritten (--force). */
+  readonly replacedPrevious: boolean;
+};
+
+/**
+ * Perform the registration, read-before-write (adversarial-review F5): GET
+ * `applications/@me` first, and if an `interactions_endpoint_url` is already
+ * set to something OTHER than the daemon route, refuse to overwrite it
+ * unless `force` is set — silently clobbering it would detach whatever
+ * service the application currently points at (the same stance as `state
+ * restore`, which refuses to overwrite without --force). A 4xx on the PATCH
+ * usually means Discord's live endpoint validation failed — surfaced with
+ * that hint.
+ */
 export async function performDiscordProvision(
   provision: DiscordProvision,
   fetchImpl: FetchLike = fetch,
-): Promise<void> {
+  opts: { readonly force?: boolean } = {},
+): Promise<DiscordProvisionResult> {
   const request = provision.request;
   if (request === undefined) {
     throw new ChannelApiError(
       `interactions endpoint not registered — unset env: ${provision.missingEnv.map((m) => `$${m.envName}`).join(", ")}`,
     );
   }
+
+  let getRes: Response;
+  try {
+    getRes = await fetchImpl(request.endpoint, {
+      method: "GET",
+      headers: { Authorization: request.authorization },
+    });
+  } catch (err) {
+    throw new ChannelApiError(`GET ${request.endpoint} unreachable: ${(err as Error).message}`);
+  }
+  if (!getRes.ok) {
+    throw new ChannelApiError(
+      `GET ${request.endpoint} failed: ${getRes.status} ${getRes.statusText} — cannot read the existing interactions endpoint, so no overwrite was attempted`,
+    );
+  }
+  const app = (await getRes.json().catch(() => ({}))) as {
+    interactions_endpoint_url?: string | null;
+  };
+  const previousEndpoint =
+    typeof app.interactions_endpoint_url === "string" && app.interactions_endpoint_url !== ""
+      ? app.interactions_endpoint_url
+      : undefined;
+  const target = request.payload.interactions_endpoint_url;
+  const wouldReplace = previousEndpoint !== undefined && previousEndpoint !== target;
+  if (wouldReplace && opts.force !== true) {
+    throw new ChannelApiError(
+      `interactions_endpoint_url is already set to "${previousEndpoint}" — refusing to overwrite it with "${target}" (that would detach whatever currently serves it); re-run with --force to replace`,
+    );
+  }
+
   let res: Response;
   try {
     res = await fetchImpl(request.endpoint, {
@@ -657,6 +704,10 @@ export async function performDiscordProvision(
       `PATCH ${request.endpoint} failed: ${detail} (Discord validates the interactions endpoint live — the daemon must be running and reachable at the --base-url when you provision)`,
     );
   }
+  return {
+    ...(previousEndpoint !== undefined ? { previousEndpoint } : {}),
+    replacedPrevious: wouldReplace,
+  };
 }
 
 /** Post-registration instructions: the invite URL plus the command-
