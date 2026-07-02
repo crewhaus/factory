@@ -5,6 +5,7 @@ import { basename, dirname, join, relative, resolve } from "node:path";
 import type { SubAgentDefinition } from "@crewhaus/agent-context-isolation";
 import { SpecParseError, compile, lower } from "@crewhaus/compiler";
 import { buildContextBundle, discoverRoots } from "@crewhaus/context-bundle";
+import { DEFAULT_PRICING, computeCacheSavingsMicros, resolvePricing } from "@crewhaus/cost-tracker";
 import {
   type DatasetRecord,
   type DatasetSplit,
@@ -12,7 +13,6 @@ import {
   createFileBackedRegistry,
   latestVersion,
 } from "@crewhaus/dataset-registry";
-import { DEFAULT_PRICING, computeCacheSavingsMicros, resolvePricing } from "@crewhaus/cost-tracker";
 import { CrewhausError } from "@crewhaus/errors";
 import { type Sample, loadDataset } from "@crewhaus/eval-dataset";
 import { type CompiledGrader, parseGradersConfig } from "@crewhaus/eval-grader";
@@ -61,6 +61,19 @@ import { type RegisteredTool, ToolCatalog } from "@crewhaus/tool-catalog";
 import { registerMcpServer } from "@crewhaus/tool-mcp";
 import { createTaskTool } from "@crewhaus/tool-task";
 import { type CostAccrualEvent, type ProviderId, TraceEventBus } from "@crewhaus/trace-event-bus";
+// Item 34 — `crewhaus audit verify` plumbing (anchor-flag parsing + per-check
+// summary + doctor mapping), in a side-effect-free module so it is
+// unit-testable (this entry file runs an argv switch on import).
+import {
+  type AnchorFlagChoice,
+  InvalidAnchorFlagError,
+  buildAuditIntegrityCheck,
+  resolveAnchorFlag,
+  summarizeVerifyResult,
+} from "./audit-verify";
+// Item 34 — scheduling ergonomics for `compliance evidence` (--period current
+// resolution + the empty-evidence gate), side-effect-free for the same reason.
+import { findEmptyControls, resolvePeriodFlag } from "./compliance-schedule";
 // Item 12 — dataset-registry CLI plumbing (the `datasets` subcommand family,
 // `distill --register` promotion, and the `--dataset registry:` shorthand
 // shared by eval + optimize), in a side-effect-free module so it is
@@ -77,19 +90,6 @@ import {
   registerDataset,
   resolveRegistryRef,
 } from "./datasets";
-// Item 34 — `crewhaus audit verify` plumbing (anchor-flag parsing + per-check
-// summary + doctor mapping), in a side-effect-free module so it is
-// unit-testable (this entry file runs an argv switch on import).
-import {
-  type AnchorFlagChoice,
-  InvalidAnchorFlagError,
-  buildAuditIntegrityCheck,
-  resolveAnchorFlag,
-  summarizeVerifyResult,
-} from "./audit-verify";
-// Item 34 — scheduling ergonomics for `compliance evidence` (--period current
-// resolution + the empty-evidence gate), side-effect-free for the same reason.
-import { findEmptyControls, resolvePeriodFlag } from "./compliance-schedule";
 // Model-aware doctor credential checks (provider parsed from the cwd spec's
 // agent.model via the model-router grammar), in a side-effect-free module so
 // it is unit-testable (this entry file runs an argv switch on import).
@@ -169,17 +169,6 @@ import {
 // `doctor --philosophy-alignment`. Kept in a side-effect-free module so it is
 // unit-testable (this entry file runs an argv switch on import).
 import { auditSpecToolNames, auditToolScopes, collectToolNames } from "./scope-audit";
-// Item 7 — failure-arbiter wiring: post-eval triage (verdicts.json + report
-// section + one-line summary + bug-sample pinning) and the optimize-side
-// failure-signal pre-filter, in a side-effect-free module so it is
-// unit-testable (this entry file runs an argv switch on import).
-import {
-  finishEvalTriage,
-  formatDatasetFixQueue,
-  formatFitnessTriageLine,
-  tapSamples,
-  triageFitnessSamples,
-} from "./triage";
 // Item 69 — `crewhaus state backup|restore` core (tarball snapshot of the
 // cwd `.crewhaus` state dir + full/merge restore), in a module with no
 // import-time side effects so it is unit-testable (this entry file runs an
@@ -193,6 +182,17 @@ import {
   parseExcludeGlobs,
   restoreStateArchive,
 } from "./state-backup";
+// Item 7 — failure-arbiter wiring: post-eval triage (verdicts.json + report
+// section + one-line summary + bug-sample pinning) and the optimize-side
+// failure-signal pre-filter, in a side-effect-free module so it is
+// unit-testable (this entry file runs an argv switch on import).
+import {
+  finishEvalTriage,
+  formatDatasetFixQueue,
+  formatFitnessTriageLine,
+  tapSamples,
+  triageFitnessSamples,
+} from "./triage";
 
 /**
  * crewhaus — slice-scope CLI.
