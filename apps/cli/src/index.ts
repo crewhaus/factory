@@ -218,6 +218,30 @@ import {
   scaffoldWorkflowFile,
   specIsDirty,
 } from "./flywheel";
+// Item 4 — `crewhaus graders suggest`: deterministic failure-rationale
+// clustering + draft grader suites (plus the pure halves of the
+// model-drafted llm_judge rubric), in a side-effect-free module so it is
+// unit-testable (this entry file runs an argv switch on import).
+import {
+  DEFAULT_SUGGESTED_GRADERS_FILE,
+  DEFAULT_SUGGEST_RUNS,
+  FLOOR_GRADER_HINT,
+  type FailureEvidence,
+  GradersSuggestError,
+  type PassExemplar,
+  RUBRIC_SUGGESTION_SYSTEM,
+  type RunsSelector,
+  type SuggestedGrader,
+  buildRubricSuggestionPrompt,
+  clusterFailures,
+  draftGradersForThemes,
+  evidenceFromFeedback,
+  evidenceFromRun,
+  isFloorGraderConfig,
+  parseRubricSuggestion,
+  parseRunsFlag,
+  renderSuggestedGradersYaml,
+} from "./graders-suggest";
 // FR-004 — Pillar 3 intent-gate judge + durable audit-sink resolution, in a
 // side-effect-free module so it is unit-testable (this entry file runs an
 // argv switch on import).
@@ -449,6 +473,30 @@ const SCAFFOLD_EVALS_SCHEMA: ParseArgsSchema = {
     // the deterministic template fallback.
     { name: "model", takesValue: true },
     // Overwrite existing eval assets (default: refuse).
+    { name: "force", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
+// Item 4 — `crewhaus graders suggest`: draft grader suites from failure
+// rationale accumulated in recent eval runs + user feedback.
+const GRADERS_SUGGEST_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // A run dir, or `last:N` (default: the last 10 indexed runs for the cwd
+    // spec — the item-3 run-history index).
+    { name: "runs", takesValue: true },
+    // Model for the one-shot llm_judge rubric draft from real good/bad
+    // exemplars (model-router grammar). Without it the cwd spec's model is
+    // used when its credentials are visible; else deterministic-only output.
+    { name: "model", takesValue: true },
+    { name: "out", short: "o", takesValue: true },
+    // Override the run-index spec filter (default: the cwd crewhaus.yaml's
+    // name when parseable, else unfiltered).
+    { name: "spec", takesValue: true },
+    // Rating threshold splitting up-rated exemplars from failure evidence
+    // (mirrors `distill --min-score`).
+    { name: "min-score", takesValue: true },
+    // Overwrite an existing review file (default: refuse).
     { name: "force", takesValue: false },
     { name: "help", short: "h" },
   ],
@@ -866,6 +914,12 @@ function usageText(): string {
     "       [--model <m>] [--force]         with credentials, deterministic template without) +",
     "                                       ONE starter grader (spec-goal llm_judge rubric online,",
     "                                       non-empty-answer floor grader offline)",
+    "  graders suggest [-o <file>]          draft grader suites from failure rationale (item 4):",
+    "       [--runs <dir|last:N>]           clusters grades.json rationale (via the run-history",
+    "       [--model <m>] [--spec <name>]   index), judge criterionScores, and rating comments",
+    "       [--min-score F] [--force]       into themes; drafts deterministic graders per theme",
+    "                                       (+ an llm_judge rubric with --model/credentials) into",
+    "                                       a REVIEW file — never auto-applied",
     "  doctor                               check environment health",
     "       [--philosophy-alignment [--json] [--baseline | --accept-baseline]]  pillar audit + scope-audit drift gate (item 49)",
     "  context --bundle [-o <file>]         emit a single-markdown orientation manifest",
@@ -1471,8 +1525,9 @@ function writeScaffoldAssets(opts: {
 /**
  * One model call through the same model-router path `optimize --mutator
  * claude` uses (`resolveModel` → adapter.stream → collectFinalMessage).
- * Drives scaffold-evals sample generation (item 13). Lazy imports keep the
- * credential-free paths free of provider deps.
+ * Shared by scaffold-evals sample generation (item 13) and the `graders
+ * suggest` rubric draft (item 4). Lazy imports keep the credential-free
+ * paths free of provider deps.
  */
 async function oneShotModelText(opts: {
   readonly model: string;
@@ -4791,6 +4846,12 @@ async function runDistill(args: ParsedArgs): Promise<void> {
     ...(typeof judgeModel === "string" ? { judgeModel } : {}),
   });
   for (const w of result.warnings) process.stderr.write(`[distill] warning: ${w}\n`);
+  // Item 4 — the synthesis fell back to the floor grader (no consistent
+  // tool/phrase signal in the ratings): point at the failure-rationale
+  // drafting path, which mines eval runs the ratings can't see.
+  if (isFloorGraderConfig(result.graders)) {
+    process.stdout.write(`[distill] ${FLOOR_GRADER_HINT}\n`);
+  }
   if (result.samples.length === 0) die("no rated turns could be matched to the transcript(s)");
 
   // Plain file output — unchanged default; skipped only when the caller went
@@ -4895,6 +4956,198 @@ function distillRatings(
     ...(s.expected_output !== undefined ? { expected_output: s.expected_output } : {}),
   }));
   return { samples, gradersYaml: gradersConfigToYaml(result.graders) };
+}
+
+// -------- item 4: crewhaus graders suggest --------
+
+/**
+ * Item 4 — `crewhaus graders suggest`: cluster the failure rationale
+ * accumulated in recent eval runs (grades.json via the item-3 run-history
+ * index) and user feedback comments into themes, draft deterministic
+ * graders per theme from the observed up-rated outputs, optionally add a
+ * model-drafted llm_judge rubric, and write a REVIEW file — never applied
+ * automatically. All the pure logic lives in ./graders-suggest; this is
+ * flag parsing + IO per house pattern.
+ */
+async function runGradersSuggest(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus graders suggest [--runs <dir|last:N>] [--model <m>] [-o <file>]\n" +
+        "                                [--spec <name>] [--min-score F] [--force]\n" +
+        "  Draft grader suites from evidence that already exists (item 4):\n" +
+        "    - per-sample grader rationale (grades.json) from recent eval runs —\n" +
+        "      located via the run-history index for the cwd spec (last 10 by\n" +
+        "      default; --runs last:N or --runs <run-dir> to choose)\n" +
+        "    - judge criterionScores where present\n" +
+        "    - user feedback comments (down-rated = failure evidence; up-rated\n" +
+        "      turns = good exemplars)\n" +
+        "  Failure texts cluster into themes DETERMINISTICALLY (token overlap — no\n" +
+        "  model call); each theme gets a deterministic draft grader\n" +
+        "  (tool_call_sequence/json_path/regex/contains) derived from the up-rated\n" +
+        "  outputs. With --model (or visible credentials for the cwd spec's model) a\n" +
+        "  complete llm_judge rubric — all five anchors — is additionally drafted\n" +
+        "  from real good/bad exemplars.\n" +
+        "  Output is a REVIEW file (-o, default graders-suggested.yaml): valid\n" +
+        "  graders.yaml with an evidence comment per grader. It is NEVER applied\n" +
+        "  automatically — and its header documents that stacking graders hard-ANDs\n" +
+        "  their scores, so adopt ONE grader rather than the whole stack.\n",
+    );
+    return;
+  }
+  const force = args.flags["force"] === true;
+  const outPath = resolve(strFlag(args, "out") ?? DEFAULT_SUGGESTED_GRADERS_FILE);
+  if (!force && existsSync(outPath)) {
+    die(`refusing to overwrite ${outPath} — re-run with --force to replace it`);
+  }
+  const minScore = floatFlag(args, "min-score") ?? 0.7;
+  if (minScore < 0 || minScore > 1) die(`invalid --min-score "${minScore}" — must be in [0,1]`);
+
+  // Spec name filter for the run index: --spec > the cwd crewhaus.yaml's
+  // name (tolerant — an unparseable spec just means no filter).
+  let specName = strFlag(args, "spec");
+  const cwdSpecPath = join(process.cwd(), "crewhaus.yaml");
+  const cwdSpecText = existsSync(cwdSpecPath) ? readFileSync(cwdSpecPath, "utf-8") : undefined;
+  if (specName === undefined && cwdSpecText !== undefined) {
+    try {
+      specName = parseSpec(cwdSpecText).name;
+    } catch {
+      // Unparseable cwd spec — suggest across every indexed run.
+    }
+  }
+
+  // Resolve the runs to mine: an explicit run dir, or the last N entries of
+  // the item-3 run-history index (filtered to this spec when known).
+  let selector: RunsSelector = { kind: "last", n: DEFAULT_SUGGEST_RUNS };
+  const runsFlag = strFlag(args, "runs");
+  if (runsFlag !== undefined) {
+    try {
+      selector = parseRunsFlag(runsFlag);
+    } catch (err) {
+      if (err instanceof GradersSuggestError) die(err.message);
+      throw err;
+    }
+  }
+  let runDirs: string[];
+  if (selector.kind === "dir") {
+    runDirs = [resolve(selector.dir)];
+  } else {
+    const entries = readRunIndex().filter((e) => specName === undefined || e.specName === specName);
+    runDirs = entries.slice(-selector.n).map((e) => e.outDir);
+  }
+
+  const failures: FailureEvidence[] = [];
+  const passes: PassExemplar[] = [];
+  let runsSeen = 0;
+  for (const dir of runDirs) {
+    try {
+      const evidence = evidenceFromRun(await loadRun(dir));
+      failures.push(...evidence.failures);
+      passes.push(...evidence.passes);
+      runsSeen += 1;
+    } catch (err) {
+      process.stderr.write(
+        `[graders] run ${dir} unreadable (${err instanceof Error ? err.message : String(err)}) — skipped\n`,
+      );
+    }
+  }
+
+  // User feedback — the same sources `crewhaus distill` reads (transcript
+  // ratings + the web-UI feedback dir).
+  const turns: SessionTurn[] = [];
+  const records: FeedbackRecord[] = [];
+  for (const id of listSessionIds(join(process.cwd(), SESSIONS_SUBDIR))) {
+    const events = readSessionEvents(id);
+    for (const t of deriveTurns(events)) turns.push({ ...t, sessionId: id });
+    records.push(...extractFeedbackRecords(events));
+  }
+  records.push(...readFeedbackDir(join(process.cwd(), FEEDBACK_SUBDIR)));
+  const feedbackEvidence = evidenceFromFeedback(turns, records, minScore);
+  failures.push(...feedbackEvidence.failures);
+  passes.push(...feedbackEvidence.passes);
+
+  if (failures.length === 0) {
+    die(
+      `no failure rationale found in ${runsSeen} eval run(s) or the ratings — run \`crewhaus eval\` (or collect down-rated feedback) first`,
+    );
+  }
+
+  const themes = clusterFailures(failures);
+  const draft = draftGradersForThemes(themes, passes);
+  const suggestions: SuggestedGrader[] = [...draft.suggestions];
+
+  // Model-drafted llm_judge rubric from real good/bad exemplars: --model
+  // opts in outright; otherwise the cwd spec's model when its credentials
+  // are visible. Best-effort — a failed/unusable draft keeps the
+  // deterministic suggestions.
+  const modelFlag = strFlag(args, "model");
+  let rubricModel = modelFlag;
+  if (rubricModel === undefined && cwdSpecText !== undefined) {
+    const specModel = extractSpecModel(cwdSpecText);
+    if (specModel !== undefined && providerCredentialsSatisfied(specModel, process.env)) {
+      rubricModel = specModel;
+    }
+  }
+  if (rubricModel !== undefined) {
+    try {
+      const raw = await oneShotModelText({
+        model: rubricModel,
+        system: RUBRIC_SUGGESTION_SYSTEM,
+        prompt: buildRubricSuggestionPrompt(
+          passes.map((p) => p.output),
+          failures,
+          themes,
+        ),
+      });
+      const rubric = parseRubricSuggestion(raw, modelFlag);
+      if (rubric !== undefined) {
+        suggestions.unshift({
+          spec: rubric,
+          evidence: [
+            `llm_judge rubric drafted by ${rubricModel} from ${passes.length} good exemplar(s) and ${failures.length} failure rationale(s) — review the anchors before adopting`,
+          ],
+        });
+      } else {
+        process.stderr.write(
+          "[graders] rubric draft unusable (bad response shape) — deterministic suggestions only\n",
+        );
+      }
+    } catch (err) {
+      process.stderr.write(
+        `[graders] rubric draft failed (${err instanceof Error ? err.message : String(err)}) — deterministic suggestions only\n`,
+      );
+    }
+  }
+
+  if (suggestions.length === 0) {
+    die(
+      "no graders could be drafted — the failure themes had no deterministic signal in the up-rated outputs; re-run with --model for an llm_judge rubric drafted from the exemplars",
+    );
+  }
+
+  const yaml = renderSuggestedGradersYaml(suggestions, {
+    ...(specName !== undefined ? { specName } : {}),
+    runsSeen,
+    failureCount: failures.length,
+    feedbackCount: feedbackEvidence.failures.length,
+    undraftedLabels: draft.undrafted.map((t) => t.label),
+  });
+  mkdirSync(dirname(outPath), { recursive: true });
+  writeFileSync(outPath, yaml);
+
+  process.stdout.write(
+    `[graders] ${failures.length} failure rationale(s) across ${runsSeen} run(s)` +
+      `${feedbackEvidence.failures.length > 0 ? ` + ${feedbackEvidence.failures.length} rating comment(s)` : ""} → ${themes.length} theme(s)\n`,
+  );
+  for (const t of themes.slice(0, 8)) {
+    process.stdout.write(
+      `[graders]   theme "${t.label}": ${t.items.length} rationale(s) on ${t.sampleIds.length} sample(s)\n`,
+    );
+  }
+  process.stdout.write(`[graders] drafted ${suggestions.length} grader(s) → ${outPath}\n`);
+  process.stdout.write(
+    "[graders] review file — adopt ONE grader into eval/graders.yaml (stacking graders\n" +
+      "    hard-ANDs their scores; see the file header)\n",
+  );
 }
 
 /**
@@ -6451,6 +6704,19 @@ switch (subcommand) {
       throw err;
     }
     break;
+  case "graders": {
+    const action = rest[0] ?? "";
+    if (action !== "suggest") {
+      die(`graders action must be "suggest" (got "${action}")`);
+    }
+    try {
+      await runGradersSuggest(parseFor(rest.slice(1), GRADERS_SUGGEST_SCHEMA));
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
+    break;
+  }
   case "datasets":
     await runDatasets(parseFor(rest, DATASETS_SCHEMA));
     break;

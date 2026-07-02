@@ -434,6 +434,7 @@ export type GraderSpecObject =
     }
   | { name: string; type: "contains"; substring: string; case_insensitive?: boolean }
   | { name: string; type: "regex"; pattern: string }
+  | { name: string; type: "json_path"; path: string; expected?: unknown }
   | {
       name: string;
       type: "llm_judge";
@@ -725,8 +726,8 @@ export function samplesToJsonl(samples: ReadonlyArray<Sample>): string {
 }
 
 /** The default graders.yaml header — distill's provenance note. Callers with
- *  a different provenance (scaffold-evals item 13) pass their own header
- *  lines instead. */
+ *  a different provenance (scaffold-evals item 13, graders suggest item 4)
+ *  pass their own header lines instead. */
 const DISTILL_GRADERS_HEADER: ReadonlyArray<string> = [
   "# Synthesized by `crewhaus distill` from user ratings.",
   "# Exactly one grader — stacking graders hard-ANDs their scores (see eval-grader `all`).",
@@ -751,6 +752,9 @@ export function gradersConfigToYaml(
       lines.push(`    substring: ${JSON.stringify(g.substring)}`);
       if (g.case_insensitive !== undefined)
         lines.push(`    case_insensitive: ${g.case_insensitive}`);
+    } else if (g.type === "json_path") {
+      lines.push(`    path: ${JSON.stringify(g.path)}`);
+      if (g.expected !== undefined) lines.push(`    expected: ${JSON.stringify(g.expected)}`);
     } else if (g.type === "llm_judge") {
       lines.push("    rubric:");
       lines.push("      criteria:");
