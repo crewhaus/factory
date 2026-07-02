@@ -114,7 +114,13 @@ export type AuditKind =
   // redacting it would defeat the purpose. (`runtime-core` declares a minimal
   // structural `JustificationAuditSink` rather than importing this package, to
   // avoid a dependency cycle; this `AuditLog` satisfies that seam.)
-  | "permission_justification_evaluated";
+  | "permission_justification_evaluated"
+  // Section 39 / item 35 — `crewhaus retention sweep|export|purge` appends one
+  // record per REAL (non-dry-run) run so retention enforcement is itself
+  // tamper-evidenced. Payload shape (opaque JSON; see apps/cli/src/retention.ts):
+  //   { action: "sweep"|"export"|"purge", dryRun: false, deletedSessionIds,
+  //     kept/deferred counts, policy inputs (maxAgeDays, pins, windows), ... }
+  | "retention_enforcement";
 
 export type AuditRecord = {
   readonly ts: number;

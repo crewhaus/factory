@@ -94,6 +94,20 @@ import {
   openJustificationAuditSink,
   resolveJudgeChoice,
 } from "./justification-gate";
+// Item 35 — `crewhaus retention` sweep/export/purge (scheduled GDPR/TTL
+// enforcement over the on-disk session + audit stores), in a side-effect-free
+// module so it is unit-testable AND callable as a library by a future daemon
+// janitor (no boot wiring here — see retention.ts).
+import {
+  InvalidRetentionDateError,
+  RetentionConfigError,
+  formatEnforcementReport,
+  formatExportReport,
+  parseRetentionDate,
+  runRetentionExport,
+  runRetentionPurge,
+  runRetentionSweep,
+} from "./retention";
 // FR-002 — Pillar 3 sink-side scope gate, shared by `compile --strict` and
 // `doctor --philosophy-alignment`. Kept in a side-effect-free module so it is
 // unit-testable (this entry file runs an argv switch on import).
@@ -321,6 +335,16 @@ const AUDIT_SCHEMA: ParseArgsSchema = {
   ],
 };
 
+const RETENTION_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "dry-run", takesValue: false },
+    { name: "dir", takesValue: true },
+    { name: "since", takesValue: true },
+    { name: "before", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
 const SECRETS_SCHEMA: ParseArgsSchema = {
   flags: [
     { name: "backend", takesValue: true },
@@ -443,6 +467,12 @@ function usageText(): string {
     "       [--signing-key-env <ENV>] [--allow-empty]",
     "  audit verify [--dir <auditDir>]      verify the hash-chained audit log (tamper check)",
     "       [--anchor file:<path>]          cross-check an append-only file anchor store",
+    "  retention sweep [--dry-run]          scheduled GDPR/TTL enforcement over .crewhaus stores",
+    "       [--dir <root>]                  (sessions expire by .crewhaus/retention.json; audit is export-only)",
+    "  retention export <outDir>            right-to-export: copy session/audit records out",
+    "       [--since <date>] [--dir <root>]",
+    "  retention purge [--before <date>]    right-to-delete: purge expired records now",
+    "       [--dir <root>]",
     "  version                              print the CLI version (also: --version, -v)",
     "",
   ].join("\n");
@@ -3028,6 +3058,97 @@ async function runSandbox(args: ParsedArgs, action: string): Promise<void> {
   }
 }
 
+/**
+ * Item 35 — `crewhaus retention <action>`: scheduled GDPR/TTL enforcement
+ * over a harness directory's two on-disk stores.
+ *
+ *   sweep  [--dry-run]        delete expired sessions (mtime-keyed, same rule
+ *                             as session-store's list() eviction), honoring
+ *                             `.crewhaus/retention.json` pins + audit windows.
+ *   export <outDir> [--since] right-to-export: copy matching records out as
+ *                             raw files (originals untouched).
+ *   purge  [--before <date>]  right-to-delete: same rules as sweep, restricted
+ *                             to records older than the cutoff.
+ *
+ * Audit data (`.crewhaus/audit`) is enumerated + exportable but NEVER deleted:
+ * audit-log's verify() hash chain spans every day file, so deleting any record
+ * or day file — even the oldest — breaks tamper verification of everything
+ * after it (see retention.ts, HarnessRecordStore.delete). Real (non-dry-run)
+ * runs append a `retention_enforcement` record to `.crewhaus/audit`, so
+ * enforcement itself is tamper-evidenced. Designed as a cron target; the
+ * heavy lifting lives in retention.ts so a daemon janitor can call it too.
+ */
+async function runRetention(args: ParsedArgs, action: string): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage:\n" +
+        "  crewhaus retention sweep [--dry-run] [--dir <root>]\n" +
+        "  crewhaus retention export <outDir> [--since <date>] [--dir <root>]\n" +
+        "  crewhaus retention purge [--before <date>] [--dir <root>]\n" +
+        "  Enforces .crewhaus/retention.json over the harness stores:\n" +
+        "    sessions (.crewhaus/sessions)  expire by file mtime after sessions.maxAgeDays\n" +
+        "                                   (default 30, session-store's TTL); pinned ids survive\n" +
+        "    audit (.crewhaus/audit)        NEVER deleted — verify()'s hash chain spans every\n" +
+        "                                   day file, so any deletion breaks tamper verification.\n" +
+        "                                   Export-only.\n" +
+        "  Active auditWindows in the config defer ALL deletion. Real runs append a\n" +
+        "  retention_enforcement record to .crewhaus/audit; --dry-run appends nothing.\n" +
+        "  --dry-run          report what would be deleted/kept and why; delete nothing\n" +
+        "  --dir <root>       harness root directory (default: cwd)\n" +
+        "  --since <date>     export only records at/after this ISO date\n" +
+        "  --before <date>    purge only records older than this ISO date\n",
+    );
+    return;
+  }
+  const dirFlag = args.flags["dir"];
+  const rootDir = typeof dirFlag === "string" ? resolve(dirFlag) : process.cwd();
+  try {
+    if (action === "sweep") {
+      const dryRun = args.flags["dry-run"] === true;
+      const report = await runRetentionSweep({ rootDir, dryRun });
+      process.stdout.write(`retention sweep: ${rootDir}${dryRun ? " (dry run)" : ""}\n`);
+      for (const line of formatEnforcementReport(report)) {
+        process.stdout.write(`  ${line}\n`);
+      }
+      return;
+    }
+    if (action === "export") {
+      const outDir = args.positional[0];
+      if (typeof outDir !== "string") die("missing <outDir>");
+      const sinceFlag = args.flags["since"];
+      const since =
+        typeof sinceFlag === "string" ? parseRetentionDate("--since", sinceFlag) : undefined;
+      const report = await runRetentionExport({
+        rootDir,
+        outDir,
+        ...(since !== undefined ? { since } : {}),
+      });
+      process.stdout.write(`retention export: ${rootDir} → ${report.outDir}\n`);
+      for (const line of formatExportReport(report)) {
+        process.stdout.write(`  ${line}\n`);
+      }
+      return;
+    }
+    // Dispatch guarantees: action === "purge".
+    const beforeFlag = args.flags["before"];
+    const before =
+      typeof beforeFlag === "string" ? parseRetentionDate("--before", beforeFlag) : undefined;
+    const report = await runRetentionPurge({
+      rootDir,
+      ...(before !== undefined ? { before } : {}),
+    });
+    process.stdout.write(`retention purge: ${rootDir}\n`);
+    for (const line of formatEnforcementReport(report)) {
+      process.stdout.write(`  ${line}\n`);
+    }
+  } catch (err) {
+    if (err instanceof RetentionConfigError || err instanceof InvalidRetentionDateError) {
+      die(err.message);
+    }
+    throw err;
+  }
+}
+
 const argv = process.argv.slice(2);
 const subcommand = argv[0] ?? "";
 const rest = argv.slice(1);
@@ -3148,6 +3269,14 @@ switch (subcommand) {
       die(`audit action must be "verify" (got "${action}")`);
     }
     await runAuditVerify(parseFor(rest.slice(1), AUDIT_SCHEMA));
+    break;
+  }
+  case "retention": {
+    const action = rest[0] ?? "";
+    if (action !== "sweep" && action !== "export" && action !== "purge") {
+      die(`retention action must be one of: sweep, export, purge (got "${action}")`);
+    }
+    await runRetention(parseFor(rest.slice(1), RETENTION_SCHEMA), action);
     break;
   }
   case "version":

@@ -6,6 +6,7 @@ import {
   readFileSync,
   readdirSync,
   rmSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -1128,5 +1129,92 @@ describe("crewhaus compliance evidence — scheduling ergonomics (item 34)", () 
     const result = await runCli(["compliance", "evidence", "--period", "2026-Q2"], { cwd: tmp });
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("--framework <id> is required (or pass --all-frameworks)");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Item 35 — `crewhaus retention` sweep/export/purge (GDPR/TTL enforcement).
+// ---------------------------------------------------------------------------
+
+const RETENTION_MS_PER_DAY = 86_400_000;
+
+/** Drop an expired session file (backdated mtime) into `<root>/.crewhaus/sessions`. */
+function seedExpiredSession(root: string, id: string, ageDays: number): string {
+  const dir = join(root, ".crewhaus", "sessions");
+  mkdirSync(dir, { recursive: true });
+  const file = join(dir, `${id}.json`);
+  writeFileSync(file, JSON.stringify({ id, name: "t" }));
+  const old = new Date(Date.now() - ageDays * RETENTION_MS_PER_DAY);
+  utimesSync(file, old, old);
+  return file;
+}
+
+describe("crewhaus retention (item 35)", () => {
+  test("--help documents the verbs, the audit exclusion, and the evidence record", async () => {
+    const result = await runCli(["retention", "sweep", "--help"]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("--dry-run");
+    expect(result.stdout).toContain("NEVER deleted");
+    expect(result.stdout).toContain("retention_enforcement");
+  });
+
+  test("an unknown retention action dies with the allowed list", async () => {
+    const result = await runCli(["retention", "gc"]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("retention action must be one of: sweep, export, purge");
+  });
+
+  test("sweep --dry-run reports the would-delete set without deleting or appending evidence", async () => {
+    const file = seedExpiredSession(tmp, "sess_1111111111111111", 40);
+    const result = await runCli(["retention", "sweep", "--dry-run", "--dir", tmp]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("would delete session:sess_1111111111111111");
+    expect(result.stdout).toContain("dry run: nothing deleted, no evidence appended");
+    expect(existsSync(file)).toBe(true);
+    expect(existsSync(join(tmp, ".crewhaus", "audit"))).toBe(false);
+  });
+
+  test("a real sweep deletes expired sessions, keeps audit day files, and appends verifiable evidence", async () => {
+    const expired = seedExpiredSession(tmp, "sess_1111111111111111", 40);
+    const fresh = seedExpiredSession(tmp, "sess_2222222222222222", 1);
+    const auditDir = join(tmp, ".crewhaus", "audit");
+    await seedAuditLog(auditDir, ["policy_decision"]);
+    const dayFile = readdirSync(auditDir).find((f) => f.endsWith(".jsonl")) as string;
+
+    const result = await runCli(["retention", "sweep", "--dir", tmp]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("deleted session:sess_1111111111111111");
+    expect(result.stdout).toContain("audit chain integrity");
+    expect(result.stdout).toContain("evidence appended to .crewhaus/audit");
+    expect(existsSync(expired)).toBe(false);
+    expect(existsSync(fresh)).toBe(true);
+    expect(existsSync(join(auditDir, dayFile))).toBe(true);
+
+    // The sweep's own evidence record landed on an intact chain.
+    const verifyResult = await runCli(["audit", "verify", "--dir", auditDir]);
+    expect(verifyResult.exitCode).toBe(0);
+    expect(readFileSync(join(auditDir, dayFile), "utf8")).toContain('"retention_enforcement"');
+  });
+
+  test("export copies records out (originals untouched) and writes a manifest", async () => {
+    seedExpiredSession(tmp, "sess_1111111111111111", 40);
+    await seedAuditLog(join(tmp, ".crewhaus", "audit"), ["model_call"]);
+    const outDir = join(tmp, "gdpr-export");
+    const result = await runCli(["retention", "export", outDir, "--dir", tmp]);
+    expect(result.exitCode).toBe(0);
+    expect(existsSync(join(outDir, "sessions", "sess_1111111111111111.json"))).toBe(true);
+    expect(existsSync(join(outDir, "manifest.json"))).toBe(true);
+    expect(existsSync(join(tmp, ".crewhaus", "sessions", "sess_1111111111111111.json"))).toBe(true);
+    expect(result.stdout).toContain("complete audit export");
+  });
+
+  test("export without <outDir> and purge with a bad --before both die cleanly", async () => {
+    const missingOut = await runCli(["retention", "export", "--dir", tmp]);
+    expect(missingOut.exitCode).toBe(1);
+    expect(missingOut.stderr).toContain("missing <outDir>");
+
+    const badBefore = await runCli(["retention", "purge", "--before", "not-a-date", "--dir", tmp]);
+    expect(badBefore.exitCode).toBe(1);
+    expect(badBefore.stderr).toContain('invalid --before "not-a-date"');
   });
 });
