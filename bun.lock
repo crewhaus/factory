@@ -27,6 +27,7 @@
         "@crewhaus/computer-use-driver": "workspace:*",
         "@crewhaus/context-bundle": "workspace:*",
         "@crewhaus/crewhaus-cloud": "workspace:*",
+        "@crewhaus/dataset-registry": "workspace:*",
         "@crewhaus/deployment-controller": "workspace:*",
         "@crewhaus/docker-images": "workspace:*",
         "@crewhaus/egress-classifier": "workspace:*",

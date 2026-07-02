@@ -5,8 +5,15 @@ import { basename, dirname, join, relative, resolve } from "node:path";
 import type { SubAgentDefinition } from "@crewhaus/agent-context-isolation";
 import { SpecParseError, compile, lower } from "@crewhaus/compiler";
 import { buildContextBundle, discoverRoots } from "@crewhaus/context-bundle";
+import {
+  type DatasetRecord,
+  type DatasetSplit,
+  compareVersions,
+  createFileBackedRegistry,
+  latestVersion,
+} from "@crewhaus/dataset-registry";
 import { CrewhausError } from "@crewhaus/errors";
-import { loadDataset } from "@crewhaus/eval-dataset";
+import { type Sample, loadDataset } from "@crewhaus/eval-dataset";
 import { parseGradersConfig } from "@crewhaus/eval-grader";
 import { optimizeSpec } from "@crewhaus/eval-optimizer-orchestrator";
 import {
@@ -49,6 +56,22 @@ import { type RegisteredTool, ToolCatalog } from "@crewhaus/tool-catalog";
 import { registerMcpServer } from "@crewhaus/tool-mcp";
 import { createTaskTool } from "@crewhaus/tool-task";
 import { type CostAccrualEvent, TraceEventBus } from "@crewhaus/trace-event-bus";
+// Item 12 — dataset-registry CLI plumbing (the `datasets` subcommand family,
+// `distill --register` promotion, and the `--dataset registry:` shorthand
+// shared by eval + optimize), in a side-effect-free module so it is
+// unit-testable (this entry file runs an argv switch on import).
+import {
+  DEFAULT_SPLIT_SPEC,
+  DatasetRefError,
+  defaultDatasetsRoot,
+  isDatasetSplit,
+  parseNameVersion,
+  parseRegistryRef,
+  parseSplitSpec,
+  recordToJsonl,
+  registerDataset,
+  resolveRegistryRef,
+} from "./datasets";
 // Model-aware doctor credential checks (provider parsed from the cwd spec's
 // agent.model via the model-router grammar), in a side-effect-free module so
 // it is unit-testable (this entry file runs an argv switch on import).
@@ -292,6 +315,25 @@ const DISTILL_SCHEMA: ParseArgsSchema = {
     { name: "min-score", takesValue: true },
     { name: "judge", takesValue: false },
     { name: "judge-model", takesValue: true },
+    // Item 12 — promote the distilled samples into the dataset registry as a
+    // new auto-bumped version of <name> (deterministic 70/15/15
+    // train/dev/test split), consumable as `--dataset registry:<name>`.
+    // -o becomes optional when given; plain file output stays the default.
+    { name: "register", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
+// Item 12 — the dataset-registry CLI face (`datasets list|get|put`).
+const DATASETS_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // `put` — the file to import (any @crewhaus/eval-dataset format).
+    { name: "file", takesValue: true },
+    // `get` — print one split verbatim instead of the all-splits merge.
+    // `put` — import everything into this single named split.
+    { name: "split", takesValue: true },
+    // `put` — train/dev[/test] percentages for the deterministic split.
+    { name: "split-spec", takesValue: true },
     { name: "help", short: "h" },
   ],
 };
@@ -401,6 +443,7 @@ function usageText(): string {
     "       [--judge-model <model>] [--concurrency N] [--seed N] [-o <out-dir>]",
     "       [--gate]                       exit non-zero on regression vs the pinned baseline",
     "       [--no-promote]                 keep the existing baseline pin after this run",
+    "       --dataset also accepts registry:<name>[@version][#split] (Section 29 registry)",
     "  eval-report diff <prev> <new>        compare two eval runs and emit a diff report",
     "       [-o <out-dir>]",
     "  eval-report history                  list recorded runs (.crewhaus/evals/index.jsonl)",
@@ -409,6 +452,7 @@ function usageText(): string {
     "       [--spec <name>] [--dataset <name>]",
     "  eval-report baseline set <runId>     pin a recorded run as its (spec, dataset) baseline",
     "  optimize <spec.yaml> --dataset <data> --graders <graders.yaml>",
+    "       (--dataset also accepts registry:<name>[@version][#split])",
     "       [--mutator rule-based|claude] [--iterations N] [--seed N]",
     "       [--ratings <session>|all]            distill user ratings into the training set (Pillar 2)",
     "       [--budget-usd N]                     stop a model-driven run before it exceeds $N (FR-003)",
@@ -424,6 +468,12 @@ function usageText(): string {
     "       [--turn N] [--correction <better answer>]",
     "  distill --session <id> -o <ds.jsonl> turn ratings into an eval dataset + graders",
     "       [--all-sessions] [--graders-out <g.yaml>] [--min-score F]",
+    "       [--register <name>]            also promote a new dataset version into the registry",
+    "  datasets list                        all registered datasets + versions (Section 29)",
+    "  datasets get <name>[@version]        print a dataset's samples as JSONL",
+    "       [--split train|dev|test]",
+    "  datasets put <name> --file <f.jsonl> import a file as a new auto-bumped version",
+    "       [--split-spec 70/15/15 | --split train]",
     "  secrets doctor                       list known secrets via the configured backend",
     "  secrets rotate <name> [--value V]    rotate a named secret (file backend)",
     "  spec put|list|get|pin|alias ...      versioned spec storage (Section 28 spec-registry)",
@@ -1588,7 +1638,11 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
     process.stdout.write(
       "usage: crewhaus optimize <spec.yaml> (--dataset <data> --graders <graders.yaml> | --ratings <session>) " +
         "[--min-score F] [--mutator rule-based|claude] [--iterations N] [--seed N] [--concurrency N] " +
-        "[--improvement-threshold F] [--budget-usd N] [--write-back] [-o <out-dir>]\n",
+        "[--improvement-threshold F] [--budget-usd N] [--write-back] [-o <out-dir>]\n" +
+        "  --dataset takes a file path or registry:<name>[@version][#split] (Section 29 registry;\n" +
+        "  default version: latest). A registry record with populated train AND dev splits is\n" +
+        "  used as-is; otherwise the selected samples get the inline 70/30 split. The test\n" +
+        "  split is never optimized against unless #test is explicitly given.\n",
     );
     return;
   }
@@ -1670,28 +1724,88 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
   // Materialize the training set once — we'll re-iterate per fitness call. It
   // is the union of the file dataset (if any) and the distilled ratings (if
   // any); at least one is present per the missing-flags gate above.
-  const samples: Array<{ id: string; input: string; expected_output?: string }> = [];
+  type OptimizerSample = { id: string; input: string; expected_output?: string };
+  const toOptimizerSample = (s: Sample): OptimizerSample => ({
+    id: s.id,
+    input: s.input,
+    ...(s.expected_output !== undefined ? { expected_output: s.expected_output } : {}),
+  });
+  const samples: OptimizerSample[] = [];
   let datasetName = "ratings";
+  // Item 12 — a registry:<name>[@version][#split] dataset whose record
+  // carries BOTH a populated train and dev split (and no explicit #split) is
+  // used as-is instead of being re-split inline; the record's split
+  // assignment is the reproducible source of truth. Otherwise the selected
+  // samples join the pool below and get the inline 70/30 split. The
+  // registry's test split never enters optimization unless #test is
+  // explicitly given.
+  let registrySplits: { train: OptimizerSample[]; dev: OptimizerSample[] } | undefined;
   if (typeof datasetPath === "string") {
-    const dataset = await loadDataset(resolve(datasetPath));
-    datasetName = dataset.name;
-    for await (const s of dataset.samples) {
-      samples.push({
-        id: s.id,
-        input: s.input,
-        ...(s.expected_output !== undefined ? { expected_output: s.expected_output } : {}),
-      });
+    let registryRef: ReturnType<typeof parseRegistryRef>;
+    try {
+      registryRef = parseRegistryRef(datasetPath);
+    } catch (err) {
+      if (err instanceof DatasetRefError) die(err.message);
+      throw err;
+    }
+    if (registryRef !== undefined) {
+      const registry = createFileBackedRegistry({ rootDir: defaultDatasetsRoot() });
+      let resolved: Awaited<ReturnType<typeof resolveRegistryRef>>;
+      try {
+        resolved = await resolveRegistryRef(registry, registryRef);
+      } catch (err) {
+        if (err instanceof DatasetRefError || err instanceof CrewhausError) die(err.message);
+        throw err;
+      }
+      datasetName = resolved.datasetName;
+      const { record } = resolved;
+      if (
+        registryRef.split === undefined &&
+        record.splits.train.length > 0 &&
+        record.splits.dev.length > 0
+      ) {
+        registrySplits = {
+          train: record.splits.train.map(toOptimizerSample),
+          dev: record.splits.dev.map(toOptimizerSample),
+        };
+      } else if (registryRef.split !== undefined) {
+        samples.push(...resolved.samples.map(toOptimizerSample));
+      } else {
+        // Only one populated split — pool train+dev and re-split inline.
+        samples.push(...record.splits.train.map(toOptimizerSample));
+        samples.push(...record.splits.dev.map(toOptimizerSample));
+      }
+    } else {
+      const dataset = await loadDataset(resolve(datasetPath));
+      datasetName = dataset.name;
+      for await (const s of dataset.samples) {
+        samples.push(toOptimizerSample(s));
+      }
     }
   }
-  if (ratingsDistill !== undefined) samples.push(...ratingsDistill.samples);
-  if (samples.length === 0) die(`dataset "${datasetName}" yielded zero samples`);
+  if (ratingsDistill !== undefined) {
+    // Ratings are training signal, never a held-out dev set — with registry
+    // splits in play they extend train; otherwise they join the pool.
+    if (registrySplits !== undefined) registrySplits.train.push(...ratingsDistill.samples);
+    else samples.push(...ratingsDistill.samples);
+  }
 
-  // Train/dev split: 70/30 deterministic split by sample id ordering.
-  const splitIdx = Math.max(1, Math.floor(samples.length * 0.7));
-  const trainSet = samples.slice(0, splitIdx);
-  const devSet = samples.slice(splitIdx);
-  if (devSet.length === 0) {
-    die(`dataset has ${samples.length} samples — need at least 2 (70/30 split needs a dev split)`);
+  let trainSet: OptimizerSample[];
+  let devSet: OptimizerSample[];
+  if (registrySplits !== undefined) {
+    trainSet = registrySplits.train;
+    devSet = registrySplits.dev;
+  } else {
+    if (samples.length === 0) die(`dataset "${datasetName}" yielded zero samples`);
+    // Train/dev split: 70/30 deterministic split by sample id ordering.
+    const splitIdx = Math.max(1, Math.floor(samples.length * 0.7));
+    trainSet = samples.slice(0, splitIdx);
+    devSet = samples.slice(splitIdx);
+    if (devSet.length === 0) {
+      die(
+        `dataset has ${samples.length} samples — need at least 2 (70/30 split needs a dev split)`,
+      );
+    }
   }
 
   // Index the dev set by id so the fitness fn can join each graded
@@ -1861,6 +1975,11 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
       "usage: crewhaus eval <spec.yaml> --dataset <data> --graders <graders.yaml> " +
         "[--judge-model <model>] [--concurrency N] [--seed N] [-o <out-dir>] " +
         "[--gate] [--no-promote]\n" +
+        "  --dataset takes a file path (jsonl/csv/yaml/http) or registry:<name>[@version][#split]\n" +
+        "  — a Section 29 dataset-registry ref (.crewhaus/datasets, or CREWHAUS_DATASETS_DIR).\n" +
+        "  Default version: latest; default samples: the union of all splits (give #train,\n" +
+        "  #dev, or #test to eval one split). Runs key into the history index/baselines as\n" +
+        "  <name>@<version>[#split] with a content hash derived from the record's sample hashes.\n" +
         "  -o defaults to .crewhaus/evals/<runId>. Every run is appended to\n" +
         "  .crewhaus/evals/index.jsonl and diffed against the pinned baseline for its\n" +
         "  (spec, dataset) pair (.crewhaus/evals/baselines.json). The first run for a\n" +
@@ -1921,11 +2040,43 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
     die(`could not read ${gradersPath}: ${(err as Error).message}`);
   }
   const { compiled } = parseGradersConfig(gradersYaml);
-  const absDataset = resolve(datasetPath);
-  const dataset = await loadDataset(absDataset);
-  // Content hash of the dataset file — recorded in run.json/results.json and
-  // the run-history index so lineage changes are detectable later.
-  const datasetHash = hashDatasetFile(absDataset);
+
+  // Item 12 — `--dataset registry:<name>[@version][#split]` resolves via the
+  // Section 29 dataset registry instead of loadDataset. datasetName becomes
+  // `<name>@<version>[#split]` and datasetHash a stable digest of the
+  // record's per-sample content hashes, so the item-3 run-index/baseline
+  // features key on registry content exactly like they key on file bytes.
+  // Bare paths keep the pre-existing loadDataset + hashDatasetFile path.
+  let dataset: { name: string; samples: AsyncIterable<Sample> };
+  let datasetHash: string;
+  let registryRef: ReturnType<typeof parseRegistryRef>;
+  try {
+    registryRef = parseRegistryRef(datasetPath);
+  } catch (err) {
+    if (err instanceof DatasetRefError) die(err.message);
+    throw err;
+  }
+  if (registryRef !== undefined) {
+    const registry = createFileBackedRegistry({ rootDir: defaultDatasetsRoot() });
+    let resolved: Awaited<ReturnType<typeof resolveRegistryRef>>;
+    try {
+      resolved = await resolveRegistryRef(registry, registryRef);
+    } catch (err) {
+      if (err instanceof DatasetRefError || err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
+    if (resolved.samples.length === 0) {
+      die(`dataset "${resolved.datasetName}" yielded zero samples`);
+    }
+    dataset = { name: resolved.datasetName, samples: makeAsyncIterable(resolved.samples) };
+    datasetHash = resolved.datasetHash;
+  } else {
+    const absDataset = resolve(datasetPath);
+    dataset = await loadDataset(absDataset);
+    // Content hash of the dataset file — recorded in run.json/results.json and
+    // the run-history index so lineage changes are detectable later.
+    datasetHash = hashDatasetFile(absDataset);
+  }
 
   const outDest =
     typeof outDirArg === "string" ? resolve(outDirArg) : join(".crewhaus", "evals", "<runId>");
@@ -2131,6 +2282,140 @@ function runEvalReportBaseline(args: ParsedArgs): void {
     default:
       die(`eval-report baseline: unknown action "${sub ?? ""}" — supported: show, set`);
   }
+}
+
+/**
+ * Item 12 — `crewhaus datasets <action>`: the CLI face of Section 29's
+ * dataset-registry (versioned, split-aware datasets under `.crewhaus/datasets`
+ * or CREWHAUS_DATASETS_DIR — the same root the emitted eval-bundle harness
+ * reads). Mirrors eval-report's action-dispatch pattern; the resolution and
+ * split logic lives in `./datasets` so it is unit-testable.
+ */
+async function runDatasets(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus datasets <action>\n" +
+        "  list                                        all datasets + versions (split sizes, createdAt)\n" +
+        "  get <name>[@version] [--split train|dev|test]\n" +
+        "                                              print samples as JSONL to stdout. Default: the\n" +
+        "                                              latest version, all splits merged with a top-level\n" +
+        "                                              `split` column; --split prints one split verbatim\n" +
+        "  put <name> --file <data.jsonl|csv|yaml> [--split-spec 70/15/15 | --split train]\n" +
+        "                                              import a dataset file as a new auto-bumped version\n" +
+        "                                              (v1, v2, …). Split assignment is deterministic —\n" +
+        "                                              stable by sample-id hash, no RNG — per the\n" +
+        "                                              train/dev[/test] percentages (default 70/15/15);\n" +
+        "                                              --split puts every sample into one named split\n" +
+        "  registry root: .crewhaus/datasets (override with CREWHAUS_DATASETS_DIR)\n",
+    );
+    return;
+  }
+  const action = args.positional[0];
+  try {
+    switch (action) {
+      case "list":
+        await runDatasetsList();
+        return;
+      case "get":
+        await runDatasetsGet(args);
+        return;
+      case "put":
+        await runDatasetsPut(args);
+        return;
+      default:
+        die(`datasets: unknown action "${action ?? ""}" — supported: list, get, put`);
+    }
+  } catch (err) {
+    // DatasetRegistryError (invalid name/version, missing record) and the
+    // ./datasets ref/spec errors both map to a clean one-line failure.
+    if (err instanceof CrewhausError || err instanceof DatasetRefError) die(err.message);
+    throw err;
+  }
+}
+
+async function runDatasetsList(): Promise<void> {
+  const registry = createFileBackedRegistry({ rootDir: defaultDatasetsRoot() });
+  const names = [...(await registry.listDatasets())].sort();
+  const rows: string[][] = [];
+  for (const name of names) {
+    for (const version of [...(await registry.list(name))].sort(compareVersions)) {
+      try {
+        const record = await registry.getRecord(name, version);
+        rows.push([
+          name,
+          version,
+          String(record.splits.train.length),
+          String(record.splits.dev.length),
+          record.splits.test !== undefined ? String(record.splits.test.length) : "-",
+          record.createdAt,
+        ]);
+      } catch {
+        // A torn/foreign file must not take down the whole listing.
+      }
+    }
+  }
+  if (rows.length === 0) {
+    process.stdout.write(`[datasets] no datasets registered (${defaultDatasetsRoot()})\n`);
+    return;
+  }
+  writeTable(["dataset", "version", "train", "dev", "test", "createdAt"], rows);
+}
+
+/** Validate a `--split` value or die (undefined when the flag is absent). */
+function splitFlag(args: ParsedArgs): DatasetSplit | undefined {
+  const flag = args.flags["split"];
+  if (typeof flag !== "string") return undefined;
+  if (!isDatasetSplit(flag)) die(`invalid --split "${flag}" — expected train, dev, or test`);
+  return flag;
+}
+
+async function runDatasetsGet(args: ParsedArgs): Promise<void> {
+  const refStr = args.positional[1];
+  if (typeof refStr !== "string") die("datasets get: missing <name>[@version]");
+  const split = splitFlag(args);
+  const registry = createFileBackedRegistry({ rootDir: defaultDatasetsRoot() });
+  const { name, version } = parseNameVersion(refStr);
+  const resolvedVersion = version ?? (await latestVersion(registry, name));
+  if (resolvedVersion === undefined) {
+    die(`dataset "${name}" has no versions in the registry (${defaultDatasetsRoot()})`);
+  }
+  const record = await registry.getRecord(name, resolvedVersion);
+  if (split !== undefined && record.splits[split] === undefined) {
+    die(`split "${split}" not present in "${name}@${resolvedVersion}"`);
+  }
+  process.stdout.write(recordToJsonl(record, split));
+}
+
+async function runDatasetsPut(args: ParsedArgs): Promise<void> {
+  const name = args.positional[1];
+  if (typeof name !== "string") die("datasets put: missing <name>");
+  const filePath = args.flags["file"];
+  if (typeof filePath !== "string") die("datasets put: missing --file <dataset.jsonl>");
+  const split = splitFlag(args);
+  const splitSpecFlag = args.flags["split-spec"];
+  if (split !== undefined && typeof splitSpecFlag === "string") {
+    die("datasets put: --split and --split-spec are mutually exclusive");
+  }
+  const splitSpec =
+    typeof splitSpecFlag === "string" ? parseSplitSpec(splitSpecFlag) : DEFAULT_SPLIT_SPEC;
+
+  const dataset = await loadDataset(resolve(filePath));
+  const samples: Sample[] = [];
+  for await (const s of dataset.samples) samples.push(s);
+  if (samples.length === 0) die(`datasets put: ${filePath} yielded zero samples`);
+
+  const registry = createFileBackedRegistry({ rootDir: defaultDatasetsRoot() });
+  const rec = await registerDataset({
+    registry,
+    name,
+    samples,
+    ...(split !== undefined ? { split } : { splitSpec }),
+  });
+  process.stdout.write(
+    `[datasets] put ${rec.name}@${rec.version} ` +
+      `(train ${rec.splits.train.length} / dev ${rec.splits.dev.length} / ` +
+      `test ${rec.splits.test?.length ?? 0}) — use with --dataset registry:${rec.name}\n`,
+  );
 }
 
 /**
@@ -2387,12 +2672,21 @@ async function runDistill(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
       "usage: crewhaus distill (--session <id> | --all-sessions) -o <dataset.jsonl> " +
-        "[--graders-out <graders.yaml>] [--min-score F] [--judge] [--judge-model <model>]\n",
+        "[--graders-out <graders.yaml>] [--min-score F] [--judge] [--judge-model <model>] " +
+        "[--register <name>]\n" +
+        "  --register promotes the distilled samples into the Section 29 dataset registry\n" +
+        "  (.crewhaus/datasets, or CREWHAUS_DATASETS_DIR) as a new auto-bumped version of\n" +
+        "  <name> with the deterministic default 70/15/15 train/dev/test split (stable by\n" +
+        "  sample-id hash), printing <name>@<version>. -o is optional when --register is\n" +
+        "  given; without --register the plain file output is unchanged.\n",
     );
     return;
   }
   const outPath = args.flags["out"];
-  if (typeof outPath !== "string") die("missing -o <dataset.jsonl>");
+  const registerName = args.flags["register"];
+  if (typeof outPath !== "string" && typeof registerName !== "string") {
+    die("missing -o <dataset.jsonl> (or --register <name> to promote into the registry)");
+  }
   const allSessions = args.flags["all-sessions"] === true;
   const session = args.flags["session"];
   if (!allSessions && typeof session !== "string")
@@ -2432,9 +2726,14 @@ async function runDistill(args: ParsedArgs): Promise<void> {
   for (const w of result.warnings) process.stderr.write(`[distill] warning: ${w}\n`);
   if (result.samples.length === 0) die("no rated turns could be matched to the transcript(s)");
 
-  const absOut = resolve(outPath);
-  mkdirSync(dirname(absOut), { recursive: true });
-  writeFileSync(absOut, samplesToJsonl(result.samples), { mode: 0o600 });
+  // Plain file output — unchanged default; skipped only when the caller went
+  // registry-only (--register without -o).
+  let absOut: string | undefined;
+  if (typeof outPath === "string") {
+    absOut = resolve(outPath);
+    mkdirSync(dirname(absOut), { recursive: true });
+    writeFileSync(absOut, samplesToJsonl(result.samples), { mode: 0o600 });
+  }
 
   const gradersOut = args.flags["graders-out"];
   if (typeof gradersOut === "string") {
@@ -2446,7 +2745,8 @@ async function runDistill(args: ParsedArgs): Promise<void> {
   const { stats } = result;
   process.stdout.write(
     `[distill] ${stats.matchedTurns} rated turn(s) → ${result.samples.length} sample(s) ` +
-      `(${stats.positives} positive, ${stats.negatives} low-rated) → ${absOut}\n`,
+      `(${stats.positives} positive, ${stats.negatives} low-rated)` +
+      `${absOut !== undefined ? ` → ${absOut}` : ""}\n`,
   );
   if (typeof gradersOut === "string") {
     const g = result.graders.graders[0];
@@ -2456,6 +2756,29 @@ async function runDistill(args: ParsedArgs): Promise<void> {
     process.stdout.write(
       `[distill] ${stats.unmatchedFeedback} rating(s) had no matching turn (skipped)\n`,
     );
+  }
+
+  // Item 12 — versioned promotion into the Section 29 dataset registry: a new
+  // auto-bumped version of <name> with the deterministic default 70/15/15
+  // train/dev/test split (stable by sample-id hash — see datasets.ts).
+  if (typeof registerName === "string") {
+    const registry = createFileBackedRegistry({ rootDir: defaultDatasetsRoot() });
+    try {
+      const rec = await registerDataset({
+        registry,
+        name: registerName,
+        samples: result.samples,
+        splitSpec: DEFAULT_SPLIT_SPEC,
+      });
+      process.stdout.write(
+        `[distill] registered ${rec.name}@${rec.version} ` +
+          `(train ${rec.splits.train.length} / dev ${rec.splits.dev.length} / ` +
+          `test ${rec.splits.test?.length ?? 0}) — use with --dataset registry:${rec.name}\n`,
+      );
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
   }
 }
 
@@ -3115,6 +3438,9 @@ switch (subcommand) {
     break;
   case "distill":
     await runDistill(parseFor(rest, DISTILL_SCHEMA));
+    break;
+  case "datasets":
+    await runDatasets(parseFor(rest, DATASETS_SCHEMA));
     break;
   case "secrets": {
     const action = rest[0] ?? "";

@@ -160,3 +160,50 @@ export function createFileBackedRegistry(opts: FileBackedRegistryOptions): Datas
     },
   };
 }
+
+/**
+ * Natural-order version comparator: digit runs compare numerically, other
+ * runs lexicographically — so `v2 < v10` and `1.0.2 < 1.0.10` (a plain string
+ * sort gets both wrong). Digit runs compare by stripped length then digits,
+ * never through `Number()`, so arbitrarily long versions can't lose precision.
+ */
+export function compareVersions(a: string, b: string): number {
+  const at = a.match(/\d+|\D+/g) ?? [];
+  const bt = b.match(/\d+|\D+/g) ?? [];
+  const len = Math.min(at.length, bt.length);
+  for (let i = 0; i < len; i++) {
+    const x = at[i] as string;
+    const y = bt[i] as string;
+    const xNum = /^\d+$/.test(x);
+    const yNum = /^\d+$/.test(y);
+    if (xNum && yNum) {
+      const xs = x.replace(/^0+(?=\d)/, "");
+      const ys = y.replace(/^0+(?=\d)/, "");
+      if (xs.length !== ys.length) return xs.length < ys.length ? -1 : 1;
+      if (xs !== ys) return xs < ys ? -1 : 1;
+    } else if (xNum !== yNum) {
+      // A digit run sorts before a non-digit run ("v1" < "vfinal").
+      return xNum ? -1 : 1;
+    } else if (x !== y) {
+      return x < y ? -1 : 1;
+    }
+  }
+  if (at.length !== bt.length) return at.length < bt.length ? -1 : 1;
+  // Equal token streams — fall back to the raw strings (leading zeros).
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/**
+ * The newest version of `name` under {@link compareVersions} ordering, or
+ * undefined when the dataset has no versions. Standalone (registry passed in)
+ * rather than an interface method so it stays additive — it works with any
+ * `DatasetRegistry` implementation, present or future.
+ */
+export async function latestVersion(
+  registry: DatasetRegistry,
+  name: string,
+): Promise<string | undefined> {
+  const versions = await registry.list(name);
+  if (versions.length === 0) return undefined;
+  return [...versions].sort(compareVersions)[versions.length - 1];
+}
