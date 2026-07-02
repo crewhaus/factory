@@ -35,6 +35,8 @@ const PALETTE: Record<TraceEventKind, string> = {
   circuit_state_changed: "\x1b[31m", // red — degradation warnings stand out
   // Human feedback channel — a user rating on an assistant turn.
   response_rated: "\x1b[92m", // bright green — a human signal worth spotting
+  // Ops item 36 — boot-time self-heal janitor maintenance actions.
+  janitor_action: "\x1b[2m", // dim — routine housekeeping
   // Track F (§57) — AgentFlow-style runtime feedback channels
   test_verdict: "\x1b[32m", // green by default; pretty printer flips to red for fail
   program_output: "\x1b[2m", // dim — high-volume

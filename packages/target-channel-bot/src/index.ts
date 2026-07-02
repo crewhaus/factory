@@ -899,7 +899,9 @@ import { registerChannelAdapter } from "@crewhaus/tool-message-channel";
 ${heartbeatImport}${builtinImportBlock}${mcpImportBlock}${subAgentImportBlock}import { createAgent } from "./agent.js";
 import { createSessionRouter } from "./session-router.js";
 import { createGateway } from "./gateway.js";
+import { loadRetentionConfig } from "@crewhaus/data-retention-engine";
 import { createDedupStore } from "@crewhaus/durable-state";
+import { createJanitor } from "@crewhaus/runtime-core";
 
 ${startupEnvCheck}
 ${adapterConstructBlock}
@@ -930,6 +932,38 @@ ${registerBlock}${mcpBoot}${subAgentBoot}
     dedupStore: __dedupStore,
   });
 
+  // Boot-time self-heal janitor (ops item 36): evicts expired sessions on a
+  // schedule (TTL eviction otherwise only fires as a list() side-effect the
+  // daemon never triggers while idle) and reports orphaned tool_use entries
+  // in recent transcripts (report-only — resume already reconciles orphans
+  // in memory). Eviction honors .crewhaus/retention.json (ops item 35) —
+  // the SAME pins + sessions.maxAgeDays the \`crewhaus retention\` CLI
+  // enforces; a malformed config fails safe (eviction disabled, daemon
+  // keeps serving). CREWHAUS_JANITOR=0 disables entirely;
+  // CREWHAUS_JANITOR_INTERVAL_MS overrides the hourly re-run (0 keeps only
+  // the boot run).
+  let __retentionTtlDays: number;
+  let __retentionPins: readonly string[] = [];
+  try {
+    const __retention = await loadRetentionConfig(__cwd);
+    __retentionTtlDays = __retention.sessionMaxAgeDays;
+    __retentionPins = __retention.pins;
+  } catch (err) {
+    process.stderr.write(
+      \`[daemon] .crewhaus/retention.json unreadable — janitor session eviction disabled: \${(err as Error).message}\\n\`,
+    );
+    __retentionTtlDays = Number.POSITIVE_INFINITY; // fail-safe: evict nothing
+  }
+  const __janitor = createJanitor({
+    sessionTtlDays: __retentionTtlDays,
+    pinnedSessionIds: __retentionPins,
+  });
+  if (process.env["CREWHAUS_JANITOR"] !== "0") {
+    const __janitorReport = await __janitor.runOnce();
+    process.stdout.write(\`[janitor] \${JSON.stringify(__janitorReport.steps)}\\n\`);
+    __janitor.start(Number(process.env["CREWHAUS_JANITOR_INTERVAL_MS"] ?? 3_600_000));
+  }
+
   const port = Number(process.env["PORT"] ?? 3000);
   const server = Bun.serve({ port, fetch: (req) => gateway.handle(req) });
   process.stdout.write(\`[daemon] listening on http://localhost:\${server.port}\\n\`);
@@ -939,6 +973,7 @@ ${gatewayBoot}${heartbeatBoot}
     if (shuttingDown) return;
     shuttingDown = true;
     process.stdout.write(\`[daemon] received \${signal}, shutting down...\\n\`);
+    __janitor.stop();
     try {
       await server.stop(true);${gatewayShutdown}${heartbeatShutdown}${mcpCleanup}
     } catch (err) {

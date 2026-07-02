@@ -415,6 +415,46 @@ describe("off-host anchor (#156-followup)", () => {
     if (!r.ok) expect(r.reason).toMatch(/external anchor mismatch/);
   });
 
+  test("THREAT: a rewritten chain extended past the anchored seq is NOT benign lag", async () => {
+    // Ops-review F8c regression: the lag case (anchor.seq < lastSeq) used to
+    // be waved through automatically. An attacker who rewrites the WHOLE
+    // chain (internally valid, on-host anchor in lockstep) and then appends
+    // fresh records ends up with lastSeq > anchor.seq — indistinguishable
+    // from benign put-lag unless the anchored hash is matched against the
+    // surviving chain's record AT that seq.
+    const store = new InMemoryAnchorStore();
+    const log = await makeLogWith(store);
+    await log.append({ kind: "secrets_access", payload: "original-1" });
+    await log.append({ kind: "secrets_access", payload: "original-2" });
+    const witnessed = await log.append({ kind: "secrets_access", payload: "original-3" });
+    expect((await store.getAnchor(tmp))?.seq).toBe(witnessed.seq); // store pins seq 2
+
+    // Rewrite: wipe the log and rebuild a fully valid chain from GENESIS with
+    // different payloads, opened WITHOUT the store so the external anchor
+    // stays at the original seq-2 hash. Then extend past the anchored height.
+    unlinkSync(join(tmp, `${FIXED_DAY}.jsonl`));
+    unlinkSync(join(tmp, "_chain-tail.json"));
+    const rewritten = await openAuditLog({ rootDir: tmp, now: fixedNow(), day: () => FIXED_DAY });
+    for (let i = 0; i < 5; i += 1) {
+      await rewritten.append({ kind: "secrets_access", payload: `forged-${i}` });
+    }
+
+    // The rewritten chain is internally consistent and its on-host anchor
+    // matches, so an on-host-only verify is fooled.
+    const fooled = await verify(tmp);
+    expect(fooled.ok).toBe(true);
+
+    // With the store consulted, the anchored seq-2 hash no longer matches the
+    // surviving chain's record at seq 2 — rewrite-plus-appends is caught.
+    const caught = await verify(tmp, { anchorStore: store });
+    expect(caught.ok).toBe(false);
+    if (!caught.ok) {
+      expect(caught.reason).toMatch(/external anchor mismatch/);
+      expect(caught.reason).toMatch(/rewritten below the anchored height/);
+      expect(caught.file).toBe("<external-anchor>");
+    }
+  });
+
   test("NO-REGRESSION: a chain that legitimately extends past a lagging anchor verifies", async () => {
     // Anchor lags behind newer appends (benign best-effort put lag): verify
     // must NOT flag it, or normal operation would be over-blocked.

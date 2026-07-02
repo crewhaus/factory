@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TenancyError, buildTenant, withTenant } from "@crewhaus/tenancy";
-import { createSessionStore } from "./index";
+import { createSessionStore, evictExpiredSessions } from "./index";
 
 // Snapshot the genuine node:fs/promises implementation ONCE, before any test
 // installs a mock. Bun's `mock.module` mutates the live module namespace in
@@ -257,6 +257,82 @@ describe("session-store — list and TTL eviction", () => {
     utimesSync(join(rootDir, `${a.id}.json`), old, old);
     const listed = await store.list();
     expect(listed).toEqual([]);
+  });
+});
+
+describe("session-store — evictExpiredSessions (standalone TTL pass)", () => {
+  test("evicts expired sessions (file + sibling log) and returns their ids", async () => {
+    const rootDir = newTempRoot();
+    const store = createSessionStore({ rootDir });
+    const old = await store.create({ name: "old", target: "cli", model: "m" });
+    const fresh = await store.create({ name: "fresh", target: "cli", model: "m" });
+    const oldLog = join(rootDir, `${old.id}.jsonl`);
+    writeFileSync(oldLog, '{"version":1,"ts":1,"kind":"user_message","payload":{}}\n');
+    const backdated = new Date(Date.now() - 35 * 86_400_000);
+    utimesSync(join(rootDir, `${old.id}.json`), backdated, backdated);
+
+    const { evictedIds } = await evictExpiredSessions({ rootDir });
+    expect(evictedIds).toEqual([old.id]);
+    expect(existsSync(join(rootDir, `${old.id}.json`))).toBe(false);
+    expect(existsSync(oldLog)).toBe(false);
+    expect(existsSync(join(rootDir, `${fresh.id}.json`))).toBe(true);
+  });
+
+  test("does not read or parse survivors (malformed survivor is untouched)", async () => {
+    const rootDir = newTempRoot();
+    // A malformed-but-fresh session file would make list() log an error;
+    // the standalone eviction pass must skip reading it entirely.
+    writeFileSync(join(rootDir, "sess_badbadbadbad0000.json"), "{ not valid json");
+    const { evictedIds } = await evictExpiredSessions({ rootDir });
+    expect(evictedIds).toEqual([]);
+    expect(existsSync(join(rootDir, "sess_badbadbadbad0000.json"))).toBe(true);
+  });
+
+  test("honours custom ttlDays and the now seam", async () => {
+    const rootDir = newTempRoot();
+    const store = createSessionStore({ rootDir });
+    const a = await store.create({ name: "a", target: "cli", model: "m" });
+    const twoDaysAgo = new Date(Date.now() - 2 * 86_400_000);
+    utimesSync(join(rootDir, `${a.id}.json`), twoDaysAgo, twoDaysAgo);
+
+    // ttl 3 days → survives; ttl 1 day → evicted.
+    expect((await evictExpiredSessions({ rootDir, ttlDays: 3 })).evictedIds).toEqual([]);
+    expect((await evictExpiredSessions({ rootDir, ttlDays: 1 })).evictedIds).toEqual([a.id]);
+  });
+
+  test("pinnedIds survive eviction even when expired (retention.json pins)", async () => {
+    // Ops-review F2 regression: the daemon janitor threads the config's pins
+    // through here — a pinned session must never be evicted, however old.
+    const rootDir = newTempRoot();
+    const store = createSessionStore({ rootDir });
+    const pinned = await store.create({ name: "pinned", target: "cli", model: "m" });
+    const doomed = await store.create({ name: "doomed", target: "cli", model: "m" });
+    const pinnedLog = join(rootDir, `${pinned.id}.jsonl`);
+    writeFileSync(pinnedLog, '{"version":1,"ts":1,"kind":"user_message","payload":{}}\n');
+    const backdated = new Date(Date.now() - 90 * 86_400_000);
+    for (const id of [pinned.id, doomed.id]) {
+      utimesSync(join(rootDir, `${id}.json`), backdated, backdated);
+    }
+
+    const { evictedIds } = await evictExpiredSessions({ rootDir, pinnedIds: [pinned.id] });
+    expect(evictedIds).toEqual([doomed.id]);
+    expect(existsSync(join(rootDir, `${pinned.id}.json`))).toBe(true);
+    expect(existsSync(pinnedLog)).toBe(true);
+    expect(existsSync(join(rootDir, `${doomed.id}.json`))).toBe(false);
+  });
+
+  test("missing root dir returns no evictions", async () => {
+    const rootDir = join(newTempRoot(), "never-created");
+    expect((await evictExpiredSessions({ rootDir })).evictedIds).toEqual([]);
+  });
+
+  test("skips files that do not match the sess_ id format", async () => {
+    const rootDir = newTempRoot();
+    writeFileSync(join(rootDir, "stray.json"), "{}");
+    const backdated = new Date(Date.now() - 90 * 86_400_000);
+    utimesSync(join(rootDir, "stray.json"), backdated, backdated);
+    expect((await evictExpiredSessions({ rootDir })).evictedIds).toEqual([]);
+    expect(existsSync(join(rootDir, "stray.json"))).toBe(true);
   });
 });
 

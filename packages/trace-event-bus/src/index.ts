@@ -18,6 +18,7 @@ export type {
   ErrorRecoveredEvent,
   HandoffEvent,
   HookFiredEvent,
+  JanitorActionEvent,
   McpCallEndEvent,
   McpCallStartEvent,
   ModelRequestEvent,

@@ -124,6 +124,8 @@ export const SHAPE_ASSERTIONS: readonly ShapeAssertion[] = [
       // the bundle must reach for the env var by exact name.
       { in: "daemon.ts", contains: "SMOKE_SLACK_BOT_TOKEN" },
       { in: "daemon.ts", contains: "SMOKE_SLACK_SIGNING_SECRET" },
+      // Ops item 36 — boot-time self-heal janitor wired into the daemon.
+      { in: "daemon.ts", contains: "createJanitor" },
     ],
   },
   {
@@ -135,6 +137,8 @@ export const SHAPE_ASSERTIONS: readonly ShapeAssertion[] = [
       { in: "agent.ts", contains: "@crewhaus/idempotency-keys" },
       { in: "agent.ts", contains: '"worker_start"' },
       { in: "agent.ts", contains: '"job_start"' },
+      // Ops item 36 — boot-time self-heal janitor wired into the worker.
+      { in: "agent.ts", contains: "createJanitor" },
     ],
   },
   {
@@ -171,6 +175,9 @@ export const SHAPE_ASSERTIONS: readonly ShapeAssertion[] = [
       { in: "daemon.ts", contains: "@crewhaus/gateway-server" },
       { in: "daemon.ts", contains: "@crewhaus/policy-engine" },
       { in: "daemon.ts", contains: "@crewhaus/tenancy" },
+      // Ops item 36 — boot-time self-heal janitor + pluggable budget store.
+      { in: "daemon.ts", contains: "createJanitor" },
+      { in: "daemon.ts", contains: "createBudgetStore" },
     ],
   },
   {

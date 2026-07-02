@@ -40,6 +40,19 @@ import { type RegisteredTool, ToolCatalog } from "@crewhaus/tool-catalog";
 import { registerMcpServer } from "@crewhaus/tool-mcp";
 import { createTaskTool } from "@crewhaus/tool-task";
 import { type CostAccrualEvent, TraceEventBus } from "@crewhaus/trace-event-bus";
+// Item 34 — `crewhaus audit verify` plumbing (anchor-flag parsing + per-check
+// summary + doctor mapping), in a side-effect-free module so it is
+// unit-testable (this entry file runs an argv switch on import).
+import {
+  type AnchorFlagChoice,
+  InvalidAnchorFlagError,
+  buildAuditIntegrityCheck,
+  resolveAnchorFlag,
+  summarizeVerifyResult,
+} from "./audit-verify";
+// Item 34 — scheduling ergonomics for `compliance evidence` (--period current
+// resolution + the empty-evidence gate), side-effect-free for the same reason.
+import { findEmptyControls, resolvePeriodFlag } from "./compliance-schedule";
 // Model-aware doctor credential checks (provider parsed from the cwd spec's
 // agent.model via the model-router grammar), in a side-effect-free module so
 // it is unit-testable (this entry file runs an argv switch on import).
@@ -81,6 +94,20 @@ import {
   openJustificationAuditSink,
   resolveJudgeChoice,
 } from "./justification-gate";
+// Item 35 — `crewhaus retention` sweep/export/purge (scheduled GDPR/TTL
+// enforcement over the on-disk session + audit stores), in a side-effect-free
+// module so it is unit-testable AND callable as a library by a future daemon
+// janitor (no boot wiring here — see retention.ts).
+import {
+  InvalidRetentionDateError,
+  RetentionConfigError,
+  formatEnforcementReport,
+  formatExportReport,
+  parseRetentionDate,
+  runRetentionExport,
+  runRetentionPurge,
+  runRetentionSweep,
+} from "./retention";
 // FR-002 — Pillar 3 sink-side scope gate, shared by `compile --strict` and
 // `doctor --philosophy-alignment`. Kept in a side-effect-free module so it is
 // unit-testable (this entry file runs an argv switch on import).
@@ -284,11 +311,38 @@ const SANDBOX_SCHEMA: ParseArgsSchema = {
 const COMPLIANCE_SCHEMA: ParseArgsSchema = {
   flags: [
     { name: "framework", takesValue: true },
+    // Item 34 — collect every registered framework in one (schedulable) run.
+    { name: "all-frameworks", takesValue: false },
     { name: "control", takesValue: true },
+    // Accepts a literal period label (e.g. 2026-Q2) or "current" (the current
+    // UTC quarter) so a cron job never hardcodes a stale label.
     { name: "period", takesValue: true },
     { name: "audit-dir", takesValue: true },
     { name: "out-dir", takesValue: true },
     { name: "signing-key-env", takesValue: true },
+    // Item 34 / ops-review F4 — opt IN to the empty-evidence tripwire: with
+    // this flag a control that collected 0 records exits 1 (for scheduled
+    // runs); the default is exit 0 with a warning so documented bare
+    // invocations keep working.
+    { name: "fail-on-empty", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
+const AUDIT_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "dir", takesValue: true },
+    { name: "anchor", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
+const RETENTION_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "dry-run", takesValue: false },
+    { name: "dir", takesValue: true },
+    { name: "since", takesValue: true },
+    { name: "before", takesValue: true },
     { name: "help", short: "h" },
   ],
 };
@@ -410,8 +464,17 @@ function usageText(): string {
     "  sandbox doctor [--probe]             list registered sandbox images + healthcheck status (Section 36)",
     "       [--format json|table]",
     "  compliance evidence                  collect SOC 2 / ISO 27001 / HIPAA evidence (Section 39)",
-    "       --framework <id> [--control <id>] --period <p> [--audit-dir <d>]",
-    "       [--out-dir <d>] [--signing-key-env <ENV>]",
+    "       (--framework <id> | --all-frameworks) [--control <id>]",
+    "       --period <p>|current [--audit-dir <d>] [--out-dir <d>]",
+    "       [--signing-key-env <ENV>] [--fail-on-empty]",
+    "  audit verify [--dir <auditDir>]      verify the hash-chained audit log (tamper check)",
+    "       [--anchor file:<path>]          cross-check an append-only file anchor store",
+    "  retention sweep [--dry-run]          scheduled GDPR/TTL enforcement over .crewhaus stores",
+    "       [--dir <root>]                  (sessions expire by .crewhaus/retention.json; audit is export-only)",
+    "  retention export <outDir>            right-to-export: copy session/audit records out",
+    "       [--since <date>] [--dry-run] [--dir <root>]",
+    "  retention purge [--before <date>]    right-to-delete: purge expired records now",
+    "       [--dry-run] [--dir <root>]",
     "  version                              print the CLI version (also: --version, -v)",
     "",
   ].join("\n");
@@ -1367,6 +1430,16 @@ async function runDoctor(args: ParsedArgs): Promise<void> {
     pass: existsSync(specPath),
     reason: existsSync(specPath) ? undefined : `not found at ${specPath} — run \`crewhaus init\``,
   });
+
+  // Item 34 — audit-log integrity. When the cwd carries a `.crewhaus/audit`
+  // store (the run path's justification gate writes one by default), walk the
+  // hash chain so doctor surfaces tampering. Skipped entirely when no store
+  // exists — a fresh checkout must not warn about a log it never wrote.
+  const auditDir = join(process.cwd(), ".crewhaus", "audit");
+  if (existsSync(auditDir)) {
+    const { verify: verifyAuditLog } = await import("@crewhaus/audit-log");
+    checks.push(buildAuditIntegrityCheck(await verifyAuditLog(auditDir)));
+  }
 
   for (const c of checks) {
     if (c.warn && c.pass) {
@@ -2735,6 +2808,69 @@ async function runFederation(rest: ReadonlyArray<string>): Promise<void> {
 }
 
 /**
+ * Item 34 — `crewhaus audit verify` walks the hash-chained audit log at
+ * `.crewhaus/audit` (the same store the `run` justification gate writes and
+ * `compliance evidence` reads) via `@crewhaus/audit-log`'s `verify()`,
+ * prints a per-check summary, and exits non-zero on any tamper finding.
+ * `--anchor file:<path>` additionally cross-checks the chain tip against a
+ * file-backed AnchorStore; a requested anchor that could NOT be consulted
+ * also exits 1 (a scheduled tamper check must not silently skip its
+ * strongest witness). Designed as a cron/CI tripwire.
+ */
+async function runAuditVerify(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus audit verify [--dir <auditDir>] [--anchor file:<path>]\n" +
+        "  Walks every day file of the hash-chained audit log, verifying each\n" +
+        "  record's hash, the prevHash links, the gapless seq run from 0, and\n" +
+        "  the on-host _chain-tail.json anchor (tail-truncation detection).\n" +
+        "  --dir <auditDir>       audit log root (default: ./.crewhaus/audit)\n" +
+        "  --anchor file:<path>   also cross-check the append-only file anchor\n" +
+        "                         store at <path> (mirror of the tail written\n" +
+        "                         when the log was opened with a FileAnchorStore)\n" +
+        "  Exit code: 0 intact; 1 on any tamper finding, or when a requested\n" +
+        "  --anchor store held no anchor to cross-check.\n",
+    );
+    return;
+  }
+  const dirFlag = args.flags["dir"];
+  const auditDir =
+    typeof dirFlag === "string" ? resolve(dirFlag) : join(process.cwd(), ".crewhaus", "audit");
+
+  let anchorChoice: AnchorFlagChoice | undefined;
+  try {
+    const anchorFlag = args.flags["anchor"];
+    anchorChoice = resolveAnchorFlag(typeof anchorFlag === "string" ? anchorFlag : undefined);
+  } catch (err) {
+    if (err instanceof InvalidAnchorFlagError) die(err.message);
+    throw err;
+  }
+
+  const auditLog = await import("@crewhaus/audit-log");
+  // verify() defaults logId to the rootDir it is given; the CLI passes the
+  // resolved absolute dir, matching openAuditLog's default logId for logs
+  // opened at the same absolute root (e.g. the run path's justification sink).
+  const result = await auditLog.verify(
+    auditDir,
+    anchorChoice !== undefined
+      ? { anchorStore: new auditLog.FileAnchorStore(resolve(anchorChoice.path)) }
+      : {},
+  );
+
+  process.stdout.write(`audit verify: ${auditDir}\n`);
+  const summary = summarizeVerifyResult(result, {
+    anchorRequested: anchorChoice !== undefined,
+  });
+  for (const line of summary.lines) {
+    process.stdout.write(`  ${line}\n`);
+  }
+  process.stdout.write(
+    summary.exitCode === 0 ? "\naudit log intact.\n" : "\naudit verification FAILED.\n",
+  );
+  if (summary.exitCode !== 0) process.exit(1);
+}
+
+/**
  * Section 39 — `crewhaus compliance evidence` collects SOC 2 / ISO 27001 /
  * HIPAA evidence bundles by walking an audit-log root and writing signed
  * bundles to `.crewhaus/compliance/<framework>/<controlId>/<period>.json`.
@@ -2743,13 +2879,29 @@ async function runFederation(rest: ReadonlyArray<string>): Promise<void> {
  *   crewhaus compliance evidence --framework soc2 --period 2026-Q2 \
  *     [--control CC6.1] [--audit-dir <d>] [--out-dir <d>] \
  *     [--signing-key-env CREWHAUS_COMPLIANCE_SIGNING_KEY]
+ *
+ * Item 34 scheduling ergonomics: `--period current` resolves the current UTC
+ * quarter and `--all-frameworks` loops every registered framework, so one
+ * cron line can collect everything, every quarter. A control that collects 0
+ * records is always REPORTED as an evidence gap; with `--fail-on-empty` it
+ * also fails the run (exit 1) so a scheduled run trips loudly instead of
+ * hiding the gap until audit time. The default stays exit 0 with a warning
+ * (ops-review F4): bare `crewhaus compliance evidence ...` invocations are
+ * documented externally and must not start failing on quiet periods.
  */
 async function runCompliance(args: ParsedArgs, action: string): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
       "usage:\n" +
-        "  crewhaus compliance evidence --framework <id> [--control <id>] --period <p>\n" +
-        "    [--audit-dir <d>] [--out-dir <d>] [--signing-key-env <ENV>]\n",
+        "  crewhaus compliance evidence (--framework <id> | --all-frameworks)\n" +
+        "    [--control <id>] --period <p>|current [--audit-dir <d>] [--out-dir <d>]\n" +
+        "    [--signing-key-env <ENV>] [--fail-on-empty]\n" +
+        '  --period current    resolve the current UTC quarter (e.g. "2026-Q3") so a\n' +
+        "                      scheduled run never hardcodes a stale label\n" +
+        "  --all-frameworks    collect every registered framework in one run\n" +
+        "  --fail-on-empty     exit 1 when any control collected 0 records — the\n" +
+        "                      tripwire for scheduled/cron runs. Default: exit 0 with\n" +
+        "                      a warning naming each empty control (evidence gap)\n",
     );
     return;
   }
@@ -2757,9 +2909,22 @@ async function runCompliance(args: ParsedArgs, action: string): Promise<void> {
     die(`unknown compliance action "${action}" (expected: evidence)`);
   }
   const frameworkFlag = args.flags["framework"];
+  const allFrameworks = args.flags["all-frameworks"] === true;
+  const controlFlag = args.flags["control"];
   const periodFlag = args.flags["period"];
-  if (typeof frameworkFlag !== "string") die("--framework <id> is required");
-  if (typeof periodFlag !== "string") die("--period <p> is required");
+  if (typeof frameworkFlag === "string" && allFrameworks) {
+    die("--framework and --all-frameworks are mutually exclusive");
+  }
+  if (typeof frameworkFlag !== "string" && !allFrameworks) {
+    die("--framework <id> is required (or pass --all-frameworks)");
+  }
+  if (allFrameworks && typeof controlFlag === "string") {
+    die("--control is framework-specific — it cannot combine with --all-frameworks");
+  }
+  if (typeof periodFlag !== "string") {
+    die('--period <p> is required (accepts "current" for the current UTC quarter)');
+  }
+  const period = resolvePeriodFlag(periodFlag);
 
   const auditDirFlag = args.flags["audit-dir"];
   const outDirFlag = args.flags["out-dir"];
@@ -2793,27 +2958,53 @@ async function runCompliance(args: ParsedArgs, action: string): Promise<void> {
   };
 
   const collector = createComplianceCollector({ auditSource, outputDir: outDir });
-  const controlFlag = args.flags["control"];
 
+  // --all-frameworks loops every framework the registered controls span (the
+  // built-ins today: soc2, iso27001, hipaa — plus anything registered on top),
+  // derived from the collector itself so the flag never drifts from the
+  // package's actual coverage.
+  const frameworks = allFrameworks
+    ? [...new Set(collector.listControls().map((c) => c.frameworkId))].sort()
+    : [frameworkFlag as string];
+
+  const collectOpts = {
+    period,
+    ...(signingKey !== undefined ? { signingKey } : {}),
+  };
   type EvidenceBundle = Awaited<ReturnType<typeof collector.collect>>;
-  let bundles: EvidenceBundle[] | ReadonlyArray<EvidenceBundle>;
+  const bundles: EvidenceBundle[] = [];
   if (typeof controlFlag === "string") {
-    const single = await collector.collect(frameworkFlag, controlFlag, {
-      period: periodFlag,
-      ...(signingKey !== undefined ? { signingKey } : {}),
-    });
-    bundles = [single];
+    // Mutual exclusion above guarantees exactly one framework here.
+    bundles.push(await collector.collect(frameworks[0] as string, controlFlag, collectOpts));
   } else {
-    bundles = await collector.collectAll(frameworkFlag, {
-      period: periodFlag,
-      ...(signingKey !== undefined ? { signingKey } : {}),
-    });
+    for (const framework of frameworks) {
+      bundles.push(...(await collector.collectAll(framework, collectOpts)));
+    }
   }
 
   for (const b of bundles) {
     const path = collector.writeBundle(b);
     process.stdout.write(
-      `${b.frameworkId}/${b.controlId} ${periodFlag}: ${b.recordCount} records → ${path}\n`,
+      `${b.frameworkId}/${b.controlId} ${period}: ${b.recordCount} records → ${path}\n`,
+    );
+  }
+
+  // Item 34 / ops-review F4 — the empty-evidence gate. A control that
+  // collected 0 records is a gap an auditor cannot be shown evidence for, so
+  // it is ALWAYS reported. `--fail-on-empty` (the scheduled/cron tripwire —
+  // the shipped compliance-evidence.yml template passes it) turns the report
+  // into exit 1 so the gap trips the schedule NOW instead of surfacing at
+  // audit time; the bare-invocation default stays exit 0 with a warning, so
+  // externally documented interactive usage keeps working. Bundles are still
+  // written above either way (the non-empty ones remain valid evidence).
+  const empty = findEmptyControls(bundles);
+  if (empty.length > 0) {
+    const gap = `evidence gap — ${empty.length} control(s) collected 0 records for ${period}: ${empty.join(", ")}`;
+    if (args.flags["fail-on-empty"] === true) {
+      die(`${gap} (--fail-on-empty)`);
+    }
+    process.stderr.write(
+      `crewhaus: warning: ${gap} (pass --fail-on-empty to make this fail scheduled runs)\n`,
     );
   }
 }
@@ -2878,6 +3069,122 @@ async function runSandbox(args: ParsedArgs, action: string): Promise<void> {
       ? `last healthy ${s.lastHealthyAt}`
       : (s?.lastError ?? (wantProbe ? "no probe result" : "not yet probed"));
     process.stdout.write(`  ${mark} ${e.id.padEnd(10)} ${e.image.padEnd(28)} ${tail}\n`);
+  }
+}
+
+/**
+ * Item 35 — `crewhaus retention <action>`: scheduled GDPR/TTL enforcement
+ * over a harness directory's two on-disk stores.
+ *
+ *   sweep  [--dry-run]        delete expired sessions (mtime-keyed, same rule
+ *                             as session-store's list() eviction), honoring
+ *                             `.crewhaus/retention.json` pins + audit windows.
+ *   export <outDir> [--since] right-to-export: copy matching records out as
+ *          [--dry-run]        raw files (originals untouched).
+ *   purge  [--before <date>]  right-to-delete: same rules as sweep, restricted
+ *          [--dry-run]        to records older than the cutoff.
+ *
+ * `--dry-run` is honored by EVERY action (ops-review F1): report-only, no
+ * deletion, no files written, no audit evidence. Filter flags are per-action
+ * (`--since` export-only, `--before` purge-only) and rejected — never
+ * silently ignored — elsewhere.
+ *
+ * Audit data (`.crewhaus/audit`) is enumerated + exportable but NEVER deleted:
+ * audit-log's verify() hash chain spans every day file, so deleting any record
+ * or day file — even the oldest — breaks tamper verification of everything
+ * after it (see retention.ts, HarnessRecordStore.delete). Real (non-dry-run)
+ * runs append a `retention_enforcement` record to `.crewhaus/audit`, so
+ * enforcement itself is tamper-evidenced. Designed as a cron target; the
+ * heavy lifting lives in retention.ts so a daemon janitor can call it too.
+ */
+async function runRetention(args: ParsedArgs, action: string): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage:\n" +
+        "  crewhaus retention sweep [--dry-run] [--dir <root>]\n" +
+        "  crewhaus retention export <outDir> [--since <date>] [--dry-run] [--dir <root>]\n" +
+        "  crewhaus retention purge [--before <date>] [--dry-run] [--dir <root>]\n" +
+        "  Enforces .crewhaus/retention.json over the harness stores:\n" +
+        "    sessions (.crewhaus/sessions)  expire by file mtime after sessions.maxAgeDays\n" +
+        "                                   (default 30, session-store's TTL); pinned ids survive\n" +
+        "    audit (.crewhaus/audit)        NEVER deleted — verify()'s hash chain spans every\n" +
+        "                                   day file, so any deletion breaks tamper verification.\n" +
+        "                                   Export-only.\n" +
+        "  Active auditWindows in the config defer ALL deletion. Real runs append a\n" +
+        "  retention_enforcement record to .crewhaus/audit; --dry-run appends nothing.\n" +
+        "  --dry-run          report what the action would do; touch nothing on disk\n" +
+        "                     (sweep/purge: delete nothing; export: write nothing)\n" +
+        "  --dir <root>       harness root directory (default: cwd)\n" +
+        "  --since <date>     export only: records at/after this ISO date\n" +
+        "  --before <date>    purge only: records older than this ISO date\n" +
+        "  A flag on an action that does not support it is an error, never silently\n" +
+        "  ignored (--since is export-only; --before is purge-only).\n",
+    );
+    return;
+  }
+  const dirFlag = args.flags["dir"];
+  const rootDir = typeof dirFlag === "string" ? resolve(dirFlag) : process.cwd();
+  const dryRun = args.flags["dry-run"] === true;
+  const sinceFlag = args.flags["since"];
+  const beforeFlag = args.flags["before"];
+  // Ops-review F1: an accepted-and-ignored filter flag is a trap — an
+  // operator who typed `sweep --before <date>` believed they bounded the
+  // deletion set. Unsupported combos are rejected per action.
+  if (typeof sinceFlag === "string" && action !== "export") {
+    die(
+      `--since is not supported by "retention ${action}" — it filters exports only (use "retention purge --before <date>" to bound deletion)`,
+    );
+  }
+  if (typeof beforeFlag === "string" && action !== "purge") {
+    die(
+      `--before is not supported by "retention ${action}" — it bounds purges only (use "retention export --since <date>" to filter an export)`,
+    );
+  }
+  try {
+    if (action === "sweep") {
+      const report = await runRetentionSweep({ rootDir, dryRun });
+      process.stdout.write(`retention sweep: ${rootDir}${dryRun ? " (dry run)" : ""}\n`);
+      for (const line of formatEnforcementReport(report)) {
+        process.stdout.write(`  ${line}\n`);
+      }
+      return;
+    }
+    if (action === "export") {
+      const outDir = args.positional[0];
+      if (typeof outDir !== "string") die("missing <outDir>");
+      const since =
+        typeof sinceFlag === "string" ? parseRetentionDate("--since", sinceFlag) : undefined;
+      const report = await runRetentionExport({
+        rootDir,
+        outDir,
+        dryRun,
+        ...(since !== undefined ? { since } : {}),
+      });
+      process.stdout.write(
+        `retention export: ${rootDir} → ${report.outDir}${dryRun ? " (dry run)" : ""}\n`,
+      );
+      for (const line of formatExportReport(report)) {
+        process.stdout.write(`  ${line}\n`);
+      }
+      return;
+    }
+    // Dispatch guarantees: action === "purge".
+    const before =
+      typeof beforeFlag === "string" ? parseRetentionDate("--before", beforeFlag) : undefined;
+    const report = await runRetentionPurge({
+      rootDir,
+      dryRun,
+      ...(before !== undefined ? { before } : {}),
+    });
+    process.stdout.write(`retention purge: ${rootDir}${dryRun ? " (dry run)" : ""}\n`);
+    for (const line of formatEnforcementReport(report)) {
+      process.stdout.write(`  ${line}\n`);
+    }
+  } catch (err) {
+    if (err instanceof RetentionConfigError || err instanceof InvalidRetentionDateError) {
+      die(err.message);
+    }
+    throw err;
   }
 }
 
@@ -2993,6 +3300,22 @@ switch (subcommand) {
       die(`compliance action must be "evidence" (got "${action}")`);
     }
     await runCompliance(parseFor(rest.slice(1), COMPLIANCE_SCHEMA), action);
+    break;
+  }
+  case "audit": {
+    const action = rest[0] ?? "";
+    if (action !== "verify") {
+      die(`audit action must be "verify" (got "${action}")`);
+    }
+    await runAuditVerify(parseFor(rest.slice(1), AUDIT_SCHEMA));
+    break;
+  }
+  case "retention": {
+    const action = rest[0] ?? "";
+    if (action !== "sweep" && action !== "export" && action !== "purge") {
+      die(`retention action must be one of: sweep, export, purge (got "${action}")`);
+    }
+    await runRetention(parseFor(rest.slice(1), RETENTION_SCHEMA), action);
     break;
   }
   case "version":

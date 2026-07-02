@@ -64,6 +64,34 @@ describe("emitBatchWorker", () => {
     expect(code).toContain('"worker_stop"');
   });
 
+  test("boots the self-heal janitor before consuming (ops #36)", () => {
+    const code = emitBatchWorker(baseIr).files[0]?.content ?? "";
+    expect(code).toContain('import { createJanitor, runChatLoop } from "@crewhaus/runtime-core"');
+    expect(code).toContain("const janitor = createJanitor({");
+    // Boot-time runOnce, env kill-switch, and configurable hourly interval.
+    expect(code).toContain('process.env["CREWHAUS_JANITOR"] !== "0"');
+    expect(code).toContain("await janitor.runOnce()");
+    expect(code).toContain(
+      'janitor.start(Number(process.env["CREWHAUS_JANITOR_INTERVAL_MS"] ?? 3_600_000))',
+    );
+    // The report goes to stderr so the stdout JSON event stream is untouched.
+    expect(code).toContain("process.stderr.write(`[janitor]");
+    // Both the signal path and the queue_idle exit path halt the interval.
+    expect(code.split("janitor.stop();").length - 1).toBe(2);
+  });
+
+  test("janitor honors .crewhaus/retention.json pins + TTL (ops-review F2)", () => {
+    const code = emitBatchWorker(baseIr).files[0]?.content ?? "";
+    // The SAME loader the retention CLI uses, so the two paths cannot drift.
+    expect(code).toContain('import { loadRetentionConfig } from "@crewhaus/data-retention-engine"');
+    expect(code).toContain("await loadRetentionConfig(process.cwd())");
+    expect(code).toContain("sessionTtlDays: retentionTtlDays");
+    expect(code).toContain("pinnedSessionIds: retentionPins");
+    // A malformed config fails safe: eviction disabled, worker keeps running.
+    expect(code).toContain("retentionTtlDays = Number.POSITIVE_INFINITY");
+    expect(code).toContain("janitor session eviction disabled");
+  });
+
   test("non-in-memory adapter compiles, but boot throws (clean diagnostic)", () => {
     const ir: IrBatchV0 = {
       ...baseIr,
