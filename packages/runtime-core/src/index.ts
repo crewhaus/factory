@@ -77,7 +77,7 @@ import {
   createCliMarkdownRenderer,
   isCliMarkdownEnabled,
 } from "./cli-markdown";
-import { attachDefaultSubscribers } from "./observability";
+import { attachAdvisorPersistence, attachDefaultSubscribers } from "./observability";
 import { loadProjectMemory } from "./project-memory";
 import { type CliOutput, createCliOutput, isSpinnerEnabled } from "./spinner";
 
@@ -890,6 +890,14 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     });
   }
 
+  // Advisor groundwork (item 14) — persist the trace-bus-only advisory
+  // signals (recovery actions, per-call tool stats, resolved permission
+  // decisions, model stop reasons) into the same session JSONL the
+  // transcript already writes to, so `crewhaus advise` can mine sessions
+  // offline. DEFAULT-ON (the lines are tiny and they are the advisor's
+  // food); disable with CREWHAUS_ADVISOR_EVENTS=0. See observability.ts.
+  const advisorPersist = attachAdvisorPersistence(bus, eventLog, runContext);
+
   // Per-run state container — coordination surface for hooks/skills/tools
   // landing in Section 11+. Section 10 only ships the plumbing; the
   // underscore prefix marks the intentional non-consumer.
@@ -1220,6 +1228,21 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           `tool denied: \`${tu.name}\` defaulted to "ask" and single-turn mode has no interactive surface to prompt on. ` +
           `Add an explicit rule to permissions.rules in your spec, e.g. \`{ type: alwaysAllow, pattern: ${tu.name} }\`, or run in REPL mode where "ask" can prompt.`;
       }
+      // Advisor groundwork (item 14) — event the ask RESOLUTION. The publish
+      // above fired BEFORE the approval prompt (decision "ask", no outcome);
+      // this one fires after `askApproval` resolves — or after the
+      // single-turn fallback collapses the ask to a deny — so offline advice
+      // mining can measure how each tool's prompts are actually answered.
+      // The advisor persistence subscriber (observability.ts) keys on
+      // `askOutcome` to persist exactly this resolved form.
+      bus.publish({
+        ...bus.envelope(),
+        kind: "permission_decision",
+        toolName: tu.name,
+        decision: "ask",
+        mode: permissionMode,
+        askOutcome: approved ? "approved" : "denied",
+      });
     }
     if (!approved) {
       return finish({
@@ -2251,6 +2274,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       await subscribers.flushAll();
       await subscribers.shutdownAll();
       costPersistUnsubscribe?.();
+      advisorPersist?.unsubscribe();
       await sessionStore
         .update(sessionId, { lastTurnIndex: runContext.turnNumber })
         .catch((err) => {
@@ -2470,6 +2494,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     await subscribers.flushAll();
     await subscribers.shutdownAll();
     costPersistUnsubscribe?.();
+    advisorPersist?.unsubscribe();
     if (shouldInstallSigint) {
       process.removeListener("SIGINT", sigintHandler);
     }

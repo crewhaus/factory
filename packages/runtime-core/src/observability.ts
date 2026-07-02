@@ -1,4 +1,5 @@
 import { type CostTracker, createCostTracker, formatUsdMicros } from "@crewhaus/cost-tracker";
+import type { EventLog } from "@crewhaus/event-log";
 import {
   type AttachedMetrics,
   attachIfEnvSet as attachMetricsIfEnvSet,
@@ -113,4 +114,99 @@ export async function attachDefaultSubscribers(
 function logFlushError(runContext: RunContext, name: string, err: unknown): void {
   const message = err instanceof Error ? err.message : String(err);
   runContext.logger.error("observability.flush_failed", { name, message });
+}
+
+// -------- advisor signal persistence (item 14 groundwork) --------
+
+export type AttachedAdvisorPersistence = {
+  unsubscribe: Unsubscribe;
+};
+
+/**
+ * Advisor groundwork (items 14/15/17) — mirror the runtime signals that were
+ * previously trace-bus-only into the session JSONL, through the SAME
+ * `event-log` append path the run already writes its transcript with:
+ *
+ *   error_recovered      → `recovery`   { errorName, action, depth }
+ *   tool_call_end        → `tool_stats` { toolName, durationMs, isError }
+ *   permission_decision  → `permission` { toolName, decision, askOutcome }
+ *   model_response       → `model_meta` { stopReason, model }
+ *
+ * Unlike the other `attach*IfEnvSet` subscribers this one is DEFAULT-ON:
+ * the lines are tiny (see the granularity note on the `tool_stats` kind in
+ * `@crewhaus/event-log`) and they are the food `crewhaus advise` mines, so
+ * opting in would starve the advisor on exactly the runs that need it.
+ * Disable with `CREWHAUS_ADVISOR_EVENTS=0` (or `false`).
+ *
+ * Permission mapping detail: a `decision: "ask"` event WITHOUT `askOutcome`
+ * is the pre-prompt publish — skipped here so each ask persists exactly once,
+ * as its resolution (`askOutcome: "approved" | "denied"`). Allow/deny
+ * decisions (including the justification-gate and egress verdicts, which
+ * publish additional `permission_decision` events per call) persist with
+ * `askOutcome: null`.
+ *
+ * `append()` failures must never abort a turn, so — like the cost_accrual
+ * persistence path — the promise result is logged rather than thrown.
+ */
+export function attachAdvisorPersistence(
+  bus: TraceEventBus,
+  eventLog: EventLog,
+  runContext: RunContext,
+  env: NodeJS.ProcessEnv = process.env,
+): AttachedAdvisorPersistence | undefined {
+  const gate = env["CREWHAUS_ADVISOR_EVENTS"];
+  if (gate === "0" || gate === "false") return undefined;
+
+  const persist = (
+    kind: "recovery" | "tool_stats" | "permission" | "model_meta",
+    payload: unknown,
+  ): void => {
+    void eventLog.append({ kind, payload }).catch((err) => {
+      runContext.logger.error("advisor_event.persist_failed", {
+        kind,
+        message: err instanceof Error ? err.message : String(err),
+      });
+    });
+  };
+
+  const unsubscribe = bus.subscribe((event: TraceEvent): void => {
+    switch (event.kind) {
+      case "error_recovered": {
+        persist("recovery", {
+          errorName: event.errorName,
+          action: event.action,
+          depth: event.depth,
+        });
+        return;
+      }
+      case "tool_call_end": {
+        persist("tool_stats", {
+          toolName: event.toolName,
+          // Whole milliseconds — performance.now() floats add line bytes
+          // without adding advisory signal.
+          durationMs: Math.round(event.durationMs),
+          isError: event.isError,
+        });
+        return;
+      }
+      case "permission_decision": {
+        // Pre-prompt ask publish — the resolution (askOutcome set) follows.
+        if (event.decision === "ask" && event.askOutcome === undefined) return;
+        persist("permission", {
+          toolName: event.toolName,
+          decision: event.decision,
+          askOutcome: event.askOutcome ?? null,
+        });
+        return;
+      }
+      case "model_response": {
+        persist("model_meta", { stopReason: event.stopReason, model: event.model });
+        return;
+      }
+      default:
+        return;
+    }
+  });
+
+  return { unsubscribe };
 }
