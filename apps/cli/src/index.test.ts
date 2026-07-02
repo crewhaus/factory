@@ -1563,7 +1563,11 @@ describe("crewhaus build-image — digest recording wiring (item 47)", () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("built crewhaus/cli:t1");
     expect(result.stdout).not.toContain("recorded");
-    expect(result.stderr).toBe("");
+    // stderr must carry no build-image output. Unrelated environment noise
+    // (e.g. adapter-anthropic's claude-CLI-version fallback warning on
+    // machines without the claude binary) is tolerated.
+    expect(result.stderr).not.toContain("build-image");
+    expect(result.stderr).not.toContain("digest");
     expect(existsSync(marker)).toBe(false);
   });
 
@@ -1581,7 +1585,10 @@ describe("crewhaus build-image — digest recording wiring (item 47)", () => {
       "local image ID is not a registry digest — use --push to record a pullable digest",
     );
     expect(result.stdout).not.toContain("recorded sha256:");
-    expect(result.stderr).toBe("");
+    // stderr must carry no build-image output (environment noise tolerated —
+    // see the --no-record test above).
+    expect(result.stderr).not.toContain("build-image");
+    expect(result.stderr).not.toContain("digest");
     // No digest lookup of any kind happened for the --load build.
     expect(existsSync(marker)).toBe(false);
   });
