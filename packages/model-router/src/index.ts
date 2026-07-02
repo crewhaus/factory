@@ -14,5 +14,6 @@ export type {
   FailoverBreakerTuning,
   FailoverCandidateSnapshot,
   FailoverChain,
+  FallbackRankInput,
 } from "./failover.js";
 export { FailoverExhaustedError, createFailoverChain } from "./failover.js";

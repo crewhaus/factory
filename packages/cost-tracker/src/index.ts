@@ -39,6 +39,15 @@ export {
   type PricingTable,
 } from "./pricing";
 
+export {
+  cacheProfileFromTotals,
+  rankCandidates,
+  type RankCandidate,
+  type RankCandidatesOptions,
+  type RankedCandidate,
+  type SessionCacheProfile,
+} from "./ranking";
+
 export type RunCostSummary = {
   readonly totalUsdMicros: number;
   /** Stable order: providers sorted alphabetically. */
