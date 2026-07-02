@@ -187,7 +187,31 @@ import {
 // it is unit-testable (this entry file runs an argv switch on import).
 // Item 61 added the channel-target env check (only fires when the cwd spec
 // lowers to a channel IR).
-import { buildChannelEnvChecks, buildCredentialChecks, extractSpecModel } from "./doctor-checks";
+import {
+  buildChannelEnvChecks,
+  buildCredentialChecks,
+  extractSpecModel,
+  providerEnvStubs,
+  selectedProvider,
+} from "./doctor-checks";
+// Item 40 — `doctor --detect` (read-only inventory) and `doctor --fix`
+// (mechanical remediation) live in side-effect-free modules so this entry file
+// (which runs an argv switch on import) stays testable.
+import {
+  type FetchLike,
+  buildInventory,
+  claudeDesktopConfigPath,
+  formatInventory,
+} from "./doctor-detect";
+import {
+  type FixAction,
+  type FixFs,
+  formatFixPlan,
+  planCrewhausDirs,
+  planEnvStubs,
+  planScaffoldSpec,
+  planScopeFix,
+} from "./doctor-fix";
 // FR-006 — Pillar 3 sink-side egress-matcher selection (the substring/semantic
 // selector lowered to ir.security.egressMatcher). Side-effect-free + lazily
 // imports the optional semantic package only when "semantic" is selected, so
@@ -466,6 +490,17 @@ const DOCTOR_SCHEMA: ParseArgsSchema = {
     { name: "context-pressure", takesValue: false },
     // How many most-recent sessions --context-pressure scans (default 20).
     { name: "sessions", takesValue: true },
+    // Item 40 — `--detect`: read-only inventory of reachable providers, the
+    // local Ollama/vLLM endpoint's models, and MCP servers from
+    // .mcp.json / Claude Desktop config. `--no-probe` skips the localhost HTTP
+    // probe (offline / CI).
+    { name: "detect", takesValue: false },
+    { name: "no-probe", takesValue: false },
+    // Item 40 — `--fix`: apply the mechanical remediations doctor otherwise
+    // only prints (scaffold crewhaus.yaml, create .crewhaus/, mark outward
+    // tools scope:external, append commented .env stubs). Dry-run is the
+    // DEFAULT: without --fix, doctor prints the diff it WOULD apply.
+    { name: "fix", takesValue: false },
     { name: "help", short: "h" },
   ],
 };
@@ -874,6 +909,8 @@ function usageText(): string {
     "       [--force]                       overwrite an existing scaffolded workflow",
     "  doctor                               check environment health",
     "       [--philosophy-alignment [--json] [--baseline | --accept-baseline]]  pillar audit + scope-audit drift gate (item 49)",
+    "       [--detect [--no-probe]]         inventory reachable providers/local models/MCP servers (item 40)",
+    "       [--fix]                         apply mechanical remediations (dry-run by default) (item 40)",
     "  context --bundle [-o <file>]         emit a single-markdown orientation manifest",
     "       [--factory-root <p>] [--docs-root <p>] [--demos-root <p>]",
     "  cost-summary --session <id>          summarize cost_accrual events for a session",
@@ -2038,6 +2075,16 @@ async function runDoctor(args: ParsedArgs): Promise<void> {
         "                             crewhaus advise --all -o . && crewhaus optimize crewhaus.yaml \\\n" +
         "                               --from-advice suggestions.json --write-back ...\n" +
         "                           Always exits 0 — a report, not a gate.\n" +
+        "  --detect                 inventory what's REACHABLE right now: model providers\n" +
+        "                           (from env), the local Ollama/vLLM endpoint's models\n" +
+        "                           (OPENAI_BASE_URL or http://localhost:11434/v1), and MCP\n" +
+        "                           servers from .mcp.json / Claude Desktop config. Read-only.\n" +
+        "       [--no-probe]        skip the localhost HTTP probe (offline / CI)\n" +
+        "  --fix                    apply the mechanical remediations doctor otherwise only\n" +
+        "                           prints: scaffold a missing crewhaus.yaml, create .crewhaus/,\n" +
+        "                           mark outward tools scope:external via a CST spec-patch, and\n" +
+        "                           append commented .env stubs. DRY-RUN IS THE DEFAULT — without\n" +
+        "                           --fix, doctor prints the diff it WOULD apply.\n" +
         "\n" +
         "  Credential checks are model-aware: doctor parses the cwd crewhaus.yaml's\n" +
         "  agent.model (claude-*, openai/*, gemini/*, bedrock/*, local/<m>@<url>) and\n" +
@@ -2058,6 +2105,10 @@ async function runDoctor(args: ParsedArgs): Promise<void> {
   }
   if (args.flags["context-pressure"]) {
     runDoctorContextPressure(args);
+    return;
+  }
+  if (args.flags["detect"]) {
+    await runDoctorDetect(args);
     return;
   }
   // Item 49 — the drift-watch flags only make sense on the philosophy audit.
@@ -2126,9 +2177,144 @@ async function runDoctor(args: ParsedArgs): Promise<void> {
     }
   }
 
+  // Item 40 — the mechanical remediation planner. `--fix` OR dry-run (default):
+  // plan the safe fixes over the checks just run and either print the diff
+  // (dry-run) or apply it (--fix). Runs after the check report so the operator
+  // sees WHAT failed before WHAT would be fixed. A crash here never masks the
+  // check verdict below.
+  await runDoctorFix({ apply: args.flags["fix"] === true, specPath, specModel });
+
   const allPass = checks.every((c) => c.pass);
   process.stdout.write(allPass ? "\nall checks passed.\n" : "\nsome checks failed.\n");
   process.exit(allPass ? 0 : 1);
+}
+
+/**
+ * Item 40 — the real-fs seam wiring for `doctor --detect`. Assembles the
+ * inventory (providers from env, the localhost model probe, MCP servers from
+ * .mcp.json + Claude Desktop config) and prints it. Read-only; always exits 0.
+ */
+async function runDoctorDetect(args: ParsedArgs): Promise<void> {
+  const fetchImpl: FetchLike = async (url, init) => {
+    // Bound the probe so an unreachable endpoint can't hang doctor.
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 1500);
+    try {
+      const res = await fetch(url, { signal: init?.signal ?? controller.signal });
+      return { ok: res.ok, status: res.status, json: () => res.json() };
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+  const configPaths = [join(process.cwd(), ".mcp.json")];
+  const desktop = claudeDesktopConfigPath(process.platform, process.env);
+  if (desktop !== undefined) configPaths.push(desktop);
+  const inventory = await buildInventory({
+    env: process.env,
+    fetchImpl,
+    readConfig: (p) => {
+      try {
+        return existsSync(p) ? readFileSync(p, "utf-8") : undefined;
+      } catch {
+        return undefined;
+      }
+    },
+    configPaths,
+    skipProbe: args.flags["no-probe"] === true,
+  });
+  process.stdout.write(formatInventory(inventory));
+  process.exit(0);
+}
+
+/**
+ * Item 40 — plan + (optionally) apply doctor's mechanical fixes. Dry-run is
+ * the default: without `--fix`, this prints the diff each fixer WOULD write.
+ * Fixers are attached only where a safe mechanical fix exists; anything else
+ * stays advisory (printed by the checks above). The tool-scope fixer resolves
+ * findings via the same `auditSpecToolNames` gate `compile --strict` uses.
+ */
+async function runDoctorFix(opts: {
+  readonly apply: boolean;
+  readonly specPath: string;
+  readonly specModel: string | undefined;
+}): Promise<void> {
+  const fixFs: FixFs = {
+    exists: (p) => existsSync(p),
+    read: (p) => readFileSync(p, "utf-8"),
+    write: (p, content) => {
+      mkdirSync(dirname(p), { recursive: true });
+      writeFileSync(p, content);
+    },
+    mkdirp: (p) => mkdirSync(p, { recursive: true }),
+  };
+  const actions: FixAction[] = [];
+
+  // Fixer 1 — scaffold a missing crewhaus.yaml (cwd basename as the name).
+  const scaffold = planScaffoldSpec({
+    fs: fixFs,
+    specPath: opts.specPath,
+    specName: basename(process.cwd()),
+  });
+  if (scaffold !== undefined) actions.push(scaffold);
+
+  // Fixer 2 — create the .crewhaus state dir.
+  const dirs = planCrewhausDirs({ fs: fixFs, crewhausDir: join(process.cwd(), ".crewhaus") });
+  if (dirs !== undefined) actions.push(dirs);
+
+  // Fixer 3 — mark outward tools scope:external. Only when a spec exists (a
+  // scaffold-only run has no tools to audit yet). Reuses the strict-scope gate
+  // to find outward-by-name sinks that resolve to no external tool, then keeps
+  // only the plain-identifier ones a mechanical scope stamp can safely fix.
+  if (fixFs.exists(opts.specPath)) {
+    try {
+      const yamlText = fixFs.read(opts.specPath);
+      const spec = parseSpec(yamlText);
+      const ir = lower(spec);
+      const toolNames = collectToolNames(ir);
+      if (toolNames.length > 0) {
+        const toolMap = await loadToolMap();
+        const byRegisteredName: Record<string, RegisteredTool> = {};
+        for (const tool of Object.values(toolMap)) byRegisteredName[tool.name] = tool;
+        const findings = auditSpecToolNames(
+          toolNames,
+          (name) => toolMap[name] ?? byRegisteredName[name],
+        );
+        for (const f of findings) {
+          const fix = planScopeFix({
+            fs: fixFs,
+            specPath: opts.specPath,
+            specTarget: spec.target,
+            toolName: f.toolName,
+          });
+          if (fix !== undefined) actions.push(fix);
+        }
+      }
+    } catch {
+      // A spec that doesn't parse/lower can't be scope-audited — the credential
+      // and spec checks above already reported it; skip the scope fixer.
+    }
+  }
+
+  // Fixer 4 — commented .env stubs for the selected provider's missing creds.
+  if (opts.specModel !== undefined) {
+    const provider = selectedProvider(opts.specModel);
+    const neededVars = provider !== undefined ? providerEnvStubs(provider) : [];
+    const missing = neededVars.filter((v) => {
+      const val = process.env[v];
+      return typeof val !== "string" || val === "";
+    });
+    const envStub = planEnvStubs({
+      fs: fixFs,
+      envPath: join(process.cwd(), ".env"),
+      neededVars: missing,
+    });
+    if (envStub !== undefined) actions.push(envStub);
+  }
+
+  if (opts.apply) {
+    for (const a of actions) a.apply();
+  }
+  process.stdout.write(`\n${formatFixPlan(actions, opts.apply)}`);
 }
 
 /**
