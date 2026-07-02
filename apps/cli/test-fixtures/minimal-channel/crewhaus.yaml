@@ -1,0 +1,22 @@
+name: support-bot
+target: channel
+agent:
+  model: claude-sonnet-4-6
+  instructions: |
+    You are a concise support assistant. Answer in two sentences or fewer
+    unless the user asks for more detail.
+channels:
+  slack:
+    botToken: $SLACK_BOT_TOKEN
+    signingSecret: $SLACK_SIGNING_SECRET
+  telegram:
+    botToken: $TELEGRAM_BOT_TOKEN
+    secretToken: $TELEGRAM_SECRET_TOKEN
+  discord:
+    applicationId: $DISCORD_APPLICATION_ID
+    botToken: $DISCORD_BOT_TOKEN
+    publicKeyHex: $DISCORD_PUBLIC_KEY
+routing:
+  sessionKey: channel
+feedback:
+  channelReactions: true

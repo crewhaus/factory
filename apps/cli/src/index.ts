@@ -1,7 +1,16 @@
 #!/usr/bin/env bun
+import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
-import { basename, dirname, join, relative, resolve } from "node:path";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { SubAgentDefinition } from "@crewhaus/agent-context-isolation";
 import { SpecParseError, compile, lower } from "@crewhaus/compiler";
 import { buildContextBundle, discoverRoots } from "@crewhaus/context-bundle";
@@ -101,6 +110,50 @@ import {
   resolveAnchorFlag,
   summarizeVerifyResult,
 } from "./audit-verify";
+// Item 1 — the feedback.autoDistill consumer (watermarked ratings →
+// versioned `<spec>-ratings` registry datasets at run teardown) and the
+// REPL exit-rating gating logic, in a side-effect-free module so it is
+// unit-testable (this entry file runs an argv switch on import).
+import {
+  DISTILL_STATE_RELPATH,
+  EXIT_RATING_PROMPT,
+  EXIT_RATING_TIMEOUT_MS,
+  countAssistantTurns,
+  maybeAutoDistill,
+  parseExitRatingKey,
+  shouldPromptExitRating,
+} from "./autodistill";
+// Item 61 — `crewhaus channel provision|verify` core (adapter-derived Slack
+// manifest, Telegram setWebhook, Discord interactions-endpoint registration,
+// doctor-style scope/webhook probes), in a side-effect-free module so it is
+// unit-testable (this entry file runs an argv switch on import).
+import {
+  ChannelApiError,
+  type ChannelCheck,
+  InvalidBaseUrlError,
+  InvalidPlatformFlagError,
+  SLACK_MANIFEST_FILENAME,
+  buildDiscordProvision,
+  buildSlackManifest,
+  buildTelegramProvision,
+  describeVerifyProbes,
+  discordNextSteps,
+  joinBaseUrl,
+  performDiscordProvision,
+  performTelegramSetWebhook,
+  renderSlackManifestYaml,
+  resolvePlatformsFlag,
+  slackNextSteps,
+  summarizeChannelChecks,
+  verifyDiscordChannel,
+  verifySlackChannel,
+  verifyTelegramChannel,
+} from "./channel-provision";
+// Item 44 — `crewhaus init --ci`: the eval-on-PR CI gate scaffold
+// (.github/workflows/crewhaus-eval.yml — two fresh runs diffed via the
+// item-3 baseline machinery + `eval --gate`), in a side-effect-free module
+// so it is unit-testable (this entry file runs an argv switch on import).
+import { EVAL_CI_WORKFLOW_RELPATH, buildEvalCiWorkflowYaml } from "./ci-scaffold";
 // Item 34 — scheduling ergonomics for `compliance evidence` (--period current
 // resolution + the empty-evidence gate), side-effect-free for the same reason.
 import { findEmptyControls, resolvePeriodFlag } from "./compliance-schedule";
@@ -132,7 +185,9 @@ import {
 // Model-aware doctor credential checks (provider parsed from the cwd spec's
 // agent.model via the model-router grammar), in a side-effect-free module so
 // it is unit-testable (this entry file runs an argv switch on import).
-import { buildCredentialChecks, extractSpecModel } from "./doctor-checks";
+// Item 61 added the channel-target env check (only fires when the cwd spec
+// lowers to a channel IR).
+import { buildChannelEnvChecks, buildCredentialChecks, extractSpecModel } from "./doctor-checks";
 // FR-006 — Pillar 3 sink-side egress-matcher selection (the substring/semantic
 // selector lowered to ir.security.egressMatcher). Side-effect-free + lazily
 // imports the optional semantic package only when "semantic" is selected, so
@@ -176,6 +231,28 @@ import {
   gradersConfigToYaml,
   samplesToJsonl,
 } from "./feedback";
+// Item 45 — `crewhaus flywheel init|run`: the packaged nightly
+// self-improvement loop (knob/default resolution, the accept-then-write
+// loop with injected steps, the report, and the workflow scaffold), in a
+// side-effect-free module so it is unit-testable (this entry file runs an
+// argv switch on import).
+import {
+  CONVENTIONAL_DATASET,
+  CONVENTIONAL_GRADERS,
+  FLYWHEEL_WORKFLOW_RELPATH,
+  FlywheelConfigError,
+  type FlywheelDataResolution,
+  type FlywheelKnobs,
+  type FlywheelOptimizeOutcome,
+  buildFlywheelWorkflowYaml,
+  formatFlywheelKnobsGuide,
+  formatFlywheelReport,
+  resolveFlywheelData,
+  resolveFlywheelKnobs,
+  runFlywheelLoop,
+  scaffoldWorkflowFile,
+  specIsDirty,
+} from "./flywheel";
 // FR-004 — Pillar 3 intent-gate judge + durable audit-sink resolution, in a
 // side-effect-free module so it is unit-testable (this entry file runs an
 // argv switch on import).
@@ -189,7 +266,11 @@ import {
 // Item 9 — per-spec regression suite: post-accept pinning of optimize
 // recoveries + the eval-side default union, in a side-effect-free module so
 // it is unit-testable (this entry file runs an argv switch on import).
-import { applyRegressionUnionGuarded, pinRecoveriesAfterOptimize } from "./regression-pin";
+import {
+  applyRegressionUnionGuarded,
+  isRegistrySafeName,
+  pinRecoveriesAfterOptimize,
+} from "./regression-pin";
 // Item 35 — `crewhaus retention` sweep/export/purge (scheduled GDPR/TTL
 // enforcement over the on-disk session + audit stores), in a side-effect-free
 // module so it is unit-testable AND callable as a library by a future daemon
@@ -208,6 +289,35 @@ import {
 // `doctor --philosophy-alignment`. Kept in a side-effect-free module so it is
 // unit-testable (this entry file runs an argv switch on import).
 import { auditSpecToolNames, auditToolScopes, collectToolNames } from "./scope-audit";
+// Item 49 — scope-audit drift watch (stable finding ids, snapshot
+// persistence, baseline diff gate, boundary-drift detector), in a
+// side-effect-free module so it is unit-testable (this entry file runs an
+// argv switch on import).
+import {
+  type PhilosophyFinding,
+  ScopeAuditBaselineError,
+  buildScopeAuditSnapshot,
+  detectBoundaryDrift,
+  diffScopeAuditSnapshots,
+  loadScopeAuditSnapshot,
+  renderGateReport,
+  scopeAuditBaselinePath,
+  scopeAuditDir,
+  scopeAuditSnapshotPath,
+} from "./scope-audit-drift";
+// Item 48 — `crewhaus security digest` core (windowed rollup over
+// .crewhaus/audit + session event logs, text/json/html renderers, webhook
+// notify), in a side-effect-free module so it is unit-testable (this entry
+// file runs an argv switch on import).
+import {
+  InvalidSinceFlagError,
+  NotifyError,
+  buildSecurityDigest,
+  notifySecurityDigest,
+  parseSinceFlag,
+  renderSecurityDigestHtml,
+  renderSecurityDigestText,
+} from "./security-digest";
 // Item 69 — `crewhaus state backup|restore` core (tarball snapshot of the
 // cwd `.crewhaus` state dir + full/merge restore), in a module with no
 // import-time side effects so it is unit-testable (this entry file runs an
@@ -324,12 +434,29 @@ function isValidPermissionMode(s: string): s is CliPermissionMode {
 }
 
 const INIT_SCHEMA: ParseArgsSchema = {
-  flags: [{ name: "help", short: "h" }],
+  flags: [
+    // Item 44 — also scaffold the eval-on-PR CI workflow. Composable with
+    // an existing harness: `init --ci` in a dir that already has a
+    // crewhaus.yaml adds just the workflow.
+    { name: "ci", takesValue: false },
+    // Overwrite an existing scaffolded workflow (never the spec).
+    { name: "force", takesValue: false },
+    { name: "help", short: "h" },
+  ],
 };
 
 const DOCTOR_SCHEMA: ParseArgsSchema = {
   flags: [
     { name: "philosophy-alignment", takesValue: false },
+    // Item 49 — scope-audit drift watch (compose with --philosophy-alignment):
+    //   --json             persist findings to .crewhaus/scope-audit/<date>.json
+    //                      (stable ids) and print the snapshot JSON
+    //   --baseline         diff against .crewhaus/scope-audit/baseline.json;
+    //                      exit non-zero ONLY on NEW findings
+    //   --accept-baseline  promote the current findings to the baseline
+    { name: "json", takesValue: false },
+    { name: "baseline", takesValue: false },
+    { name: "accept-baseline", takesValue: false },
     // Process-liveness only — exit 0 fast, no credential/spec checks. The
     // probe target for container HEALTHCHECKs and k8s exec probes.
     { name: "liveness", takesValue: false },
@@ -388,6 +515,30 @@ const OPTIMIZE_SCHEMA: ParseArgsSchema = {
     // explicit opt-out (mirrors `compile --no-register`).
     { name: "no-register", takesValue: false },
     { name: "out", short: "o", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
+// Item 45 — `crewhaus flywheel run|init`. Knobs mirror the demo's
+// FLYWHEEL_* env names (flag > env > default — see ./flywheel.ts).
+const FLYWHEEL_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "dataset", takesValue: true },
+    { name: "graders", takesValue: true },
+    { name: "budget-usd", takesValue: true },
+    { name: "iterations", takesValue: true },
+    { name: "seed", takesValue: true },
+    { name: "concurrency", takesValue: true },
+    { name: "mutator", takesValue: true },
+    // Run the whole loop (evals + optimize + acceptance gate) but never
+    // write the spec, register, or pin — a rehearsal run.
+    { name: "dry-run", takesValue: false },
+    // Invariant: the flywheel refuses to run over uncommitted spec changes
+    // (a rejected write-back could not be told apart from the user's own
+    // edits). This is the explicit opt-out.
+    { name: "allow-dirty", takesValue: false },
+    // `flywheel init` — overwrite an existing workflow scaffold.
+    { name: "force", takesValue: false },
     { name: "help", short: "h" },
   ],
 };
@@ -569,6 +720,38 @@ const RETENTION_SCHEMA: ParseArgsSchema = {
   ],
 };
 
+const SECURITY_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // Item 48 — `security digest` rollup window: 7d (default), 30d, or ISO.
+    { name: "since", takesValue: true },
+    { name: "format", takesValue: true },
+    { name: "out", short: "o", takesValue: true },
+    // POST the JSON digest to a webhook (plain fetch — see security-digest.ts
+    // for the deliberate no-channel-adapter decision + the Slack wrapper note).
+    { name: "notify", takesValue: true },
+    // Harness root that owns `.crewhaus/` (mirrors `retention --dir`).
+    { name: "dir", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
+const CHANNEL_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // Item 61 — `channel provision|verify` platform selection + daemon origin.
+    { name: "platform", takesValue: true },
+    { name: "base-url", takesValue: true },
+    // provision only: directory the Slack manifest YAML is written into.
+    { name: "out", short: "o", takesValue: true },
+    // print every network call (redacted) without performing it.
+    { name: "dry-run", takesValue: false },
+    // provision (discord) only: overwrite a DIFFERENT pre-existing
+    // interactions_endpoint_url — read-before-write refuses without it
+    // (mirrors `state restore --force`).
+    { name: "force", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
 const SECRETS_SCHEMA: ParseArgsSchema = {
   flags: [
     { name: "backend", takesValue: true },
@@ -673,8 +856,24 @@ function usageText(): string {
     "       [--ratings <session>|all]            distill user ratings into the training set (Pillar 2)",
     "       [--budget-usd N]                     stop a model-driven run before it exceeds $N (FR-003)",
     "       [--write-back] [-o <out-dir>]        active eval-driven optimization (Pillar 2)",
+    "  flywheel run [spec.yaml]             the nightly self-improvement loop, one command (item 45):",
+    "       compile gate → baseline eval → optimize → after eval → acceptance",
+    "       gate (pass_rate strictly up AND zero regressions) → write-back on",
+    "       accept; a rejected patch never touches the spec.",
+    "       [--dataset <data>] [--graders <g.yaml>] [--budget-usd N] [--iterations N]",
+    "       [--seed N] [--concurrency N] [--mutator rule-based|claude]",
+    "       [--dry-run] [--allow-dirty]",
+    "  flywheel init [--force]              scaffold .github/workflows/crewhaus-flywheel.yml",
+    "       (nightly cron + manual dispatch; accepted improvements arrive as",
+    "       PRs for human review — never auto-merged)",
     "  init [name]                          scaffold a new crewhaus.yaml",
+    "       [--ci]                          also scaffold .github/workflows/crewhaus-eval.yml —",
+    "                                       eval-gated spec PRs (base vs PR spec, two fresh runs,",
+    "                                       score-delta PR comment, check fails on regression);",
+    "                                       with an existing crewhaus.yaml, adds just the workflow",
+    "       [--force]                       overwrite an existing scaffolded workflow",
     "  doctor                               check environment health",
+    "       [--philosophy-alignment [--json] [--baseline | --accept-baseline]]  pillar audit + scope-audit drift gate (item 49)",
     "  context --bundle [-o <file>]         emit a single-markdown orientation manifest",
     "       [--factory-root <p>] [--docs-root <p>] [--demos-root <p>]",
     "  cost-summary --session <id>          summarize cost_accrual events for a session",
@@ -725,6 +924,15 @@ function usageText(): string {
     "       [--since <date>] [--dry-run] [--dir <root>]",
     "  retention purge [--before <date>]    right-to-delete: purge expired records now",
     "       [--dry-run] [--dir <root>]",
+    "  security digest [--since 7d|30d|ISO] triage rollup of denials/egress/injection from .crewhaus stores (item 48)",
+    "       [--format text|json|html] [-o <dir>] [--notify <url>] [--dir <root>]",
+    "  channel provision <spec.yaml>        one-command platform app setup for a channel spec (item 61):",
+    "       --base-url <public-url>         slack app manifest YAML, telegram setWebhook, discord",
+    "       [--platform slack|telegram|discord|all]  interactions endpoint + invite URL",
+    "       [-o <dir>] [--dry-run] [--force]",
+    "  channel verify <spec.yaml>           scope doctor: slack auth.test + granted scopes,",
+    "       [--platform ...] [--dry-run]    telegram getWebhookInfo, discord application fetch",
+    "       [--base-url <public-url>]       (exit 1 on missing scopes / mismatched webhook)",
     "  version                              print the CLI version (also: --version, -v)",
     "",
   ].join("\n");
@@ -1047,22 +1255,67 @@ async function runStrictScopeGate(yamlText: string): Promise<void> {
   }
 }
 
+/**
+ * Finding 7 — GitHub only reads workflows from `.github/workflows` at the
+ * REPO ROOT; a scaffold written inside a nested harness dir never runs.
+ * Resolve where a scaffolded workflow must land: the git toplevel of
+ * `harnessAbsDir` when it is inside a work tree, else `fallbackRoot` (the
+ * cwd — no repo exists yet, so the user's `git init` will land there).
+ * `harnessDir` is the harness's root-relative POSIX path ("" = the harness
+ * IS the root) for the workflow's `defaults.run.working-directory`.
+ */
+function resolveWorkflowRoot(
+  harnessAbsDir: string,
+  fallbackRoot: string,
+): { root: string; harnessDir: string } {
+  const top = spawnSync("git", ["-C", harnessAbsDir, "rev-parse", "--show-toplevel"], {
+    encoding: "utf-8",
+  });
+  const toplevel = top.status === 0 ? top.stdout.trim() : "";
+  // realpath both sides so symlinked paths (macOS /tmp → /private/tmp) do
+  // not derail the relative() computation against git's resolved toplevel.
+  const root = toplevel !== "" ? toplevel : realpathSync(fallbackRoot);
+  const rel = relative(root, realpathSync(harnessAbsDir));
+  if (rel === "" || rel === ".") return { root, harnessDir: "" };
+  // A harness outside the resolved root (odd, but possible with an absolute
+  // [name] arg) scaffolds beside itself rather than inventing a prefix.
+  if (rel.startsWith("..") || isAbsolute(rel)) return { root: harnessAbsDir, harnessDir: "" };
+  return { root, harnessDir: rel.split(sep).join("/") };
+}
+
 function runInit(args: ParsedArgs): void {
   if (args.flags["help"]) {
-    process.stdout.write("usage: crewhaus init [name]\n");
+    process.stdout.write(
+      "usage: crewhaus init [name] [--ci] [--force]\n" +
+        "  --ci     Also scaffold .github/workflows/crewhaus-eval.yml — the eval-on-PR\n" +
+        "           gate (item 44): PRs touching crewhaus.yaml or eval/** run the base\n" +
+        "           branch's spec and the PR's spec on the PR's dataset+graders (two\n" +
+        "           fresh runs, pinned seed, --concurrency 1), post the score-delta\n" +
+        "           table as a PR comment, and fail the check on `eval --gate` failure\n" +
+        "           (any pass-rate drop or per-sample pass→fail flip). In a directory\n" +
+        "           that already has a crewhaus.yaml, `init --ci` adds just the workflow.\n" +
+        "           The workflow is written to .github/workflows at the GIT REPO ROOT\n" +
+        "           (GitHub only reads it there); for a harness in a subdirectory its\n" +
+        "           working-directory and paths filter point back at the harness.\n" +
+        "  --force  Overwrite an existing scaffolded workflow (never the spec).\n",
+    );
     return;
   }
+  const ci = args.flags["ci"] === true;
   const nameArg = args.positional[0];
   const targetDir = typeof nameArg === "string" ? resolve(nameArg) : process.cwd();
   const specName = typeof nameArg === "string" ? nameArg : basename(targetDir);
   const targetFile = join(targetDir, "crewhaus.yaml");
 
   if (existsSync(targetFile)) {
-    die(`${targetFile} already exists — refusing to overwrite`);
-  }
-
-  mkdirSync(targetDir, { recursive: true });
-  const yamlText = `name: ${specName}
+    // Item 44 — `init --ci` composes with an existing harness: keep the
+    // spec, add just the workflow. Without --ci the historical refusal
+    // stands (a bare `init` must never touch existing work).
+    if (!ci) die(`${targetFile} already exists — refusing to overwrite`);
+    process.stdout.write(`kept ${targetFile} (already exists)\n`);
+  } else {
+    mkdirSync(targetDir, { recursive: true });
+    const yamlText = `name: ${specName}
 target: cli
 agent:
   model: claude-opus-4-7
@@ -1070,15 +1323,48 @@ agent:
     You are a helpful assistant. Replace these instructions with your
     agent's actual behavior, persona, and constraints.
 `;
-  writeFileSync(targetFile, yamlText);
-  process.stdout.write(`wrote ${targetFile}\n`);
+    writeFileSync(targetFile, yamlText);
+    process.stdout.write(`wrote ${targetFile}\n`);
+  }
+
+  if (ci) {
+    // Item 44 — the eval-on-PR CI gate. Finding 7: GitHub only reads
+    // .github/workflows at the REPO ROOT, so the workflow lands there (git
+    // toplevel, cwd fallback), with its working-directory/paths filter
+    // pointed back at the harness when the spec lives in a subdirectory.
+    try {
+      const { root: wfRoot, harnessDir } = resolveWorkflowRoot(targetDir, process.cwd());
+      const scaffolded = scaffoldWorkflowFile({
+        rootDir: wfRoot,
+        relPath: EVAL_CI_WORKFLOW_RELPATH,
+        content: buildEvalCiWorkflowYaml({ harnessDir }),
+        force: args.flags["force"] === true,
+      });
+      process.stdout.write(`wrote ${scaffolded.path}\n`);
+      if (harnessDir !== "") {
+        process.stdout.write(
+          `    (workflow written at the repo root, not in ${harnessDir}/ — GitHub only reads\n` +
+            `    .github/workflows there; its working-directory and paths filter point at ${harnessDir}/)\n`,
+        );
+      }
+      const filterBase = harnessDir === "" ? "" : `${harnessDir}/`;
+      process.stdout.write(
+        `ci: set the ANTHROPIC_API_KEY repo secret; PRs touching ${filterBase}crewhaus.yaml or\n` +
+          `    ${filterBase}eval/** are then evaled against the base branch and gated on regressions.\n`,
+      );
+    } catch (err) {
+      if (err instanceof FlywheelConfigError) die(err.message);
+      throw err;
+    }
+  }
+
   // The runtime resolves the spec and the `.crewhaus/` session store from
   // the current working directory, so guide the user to run from inside
   // the harness directory (where crewhaus.yaml lives), not from here.
   const rel = relative(process.cwd(), targetDir);
   const cd = rel === "" ? "" : `cd ${rel} && `;
   process.stdout.write(`next: ${cd}crewhaus run crewhaus.yaml\n`);
-  logger.debug("init.success", { target: targetFile });
+  logger.debug("init.success", { target: targetFile, ci });
 }
 
 /**
@@ -1249,7 +1535,12 @@ async function runRun(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
       "usage: crewhaus run <spec.yaml> [--model <model>] [--permission-mode <default|plan|auto|bypass>] [--resume <sessionId> | --continue] [--prompt <text>] [--justification-judge rule-based|claude] [--egress-matcher substring|semantic] [--egress-embedder <model>]\n" +
-        "  --model accepts the full router grammar: claude-* (Anthropic), openai/<m>, gemini/<m>, bedrock/<id> (geo prefixes tolerated), local/<m>@<url>\n",
+        "  --model accepts the full router grammar: claude-* (Anthropic), openai/<m>, gemini/<m>, bedrock/<id> (geo prefixes tolerated), local/<m>@<url>\n" +
+        "  A spec with a feedback: block asks `rate this session? [g]ood / [b]ad / [enter] skip`\n" +
+        "  on clean REPL exit (one keystroke, 10s timeout, TTY only — never when piped). Opt out\n" +
+        "  with CREWHAUS_NO_EXIT_RATING=1 or feedback.exitPrompt: false. With feedback.autoDistill\n" +
+        "  enabled, accumulated ratings are auto-distilled into the `<specName>-ratings` registry\n" +
+        "  dataset at teardown (item 1) — see `crewhaus optimize --help`.\n",
     );
     return;
   }
@@ -1478,6 +1769,22 @@ async function runRunCli(
     });
   } finally {
     if (mcpHost) await mcpHost.disconnectAll();
+  }
+
+  // Item 1 — post-session feedback teardown: the one-keystroke exit rating
+  // prompt (TTY only) and the feedback.autoDistill consumer. Runs only on a
+  // clean REPL exit (runChatLoop returned; a throw above skips it) and is
+  // best-effort — a teardown failure never turns a successful session into
+  // a non-zero exit. Deliberately CLI teardown code (the in-process analogue
+  // of where the stop hook fires), NOT a spawned hook: hooks run
+  // credential-stripped, and the distill/registry path needs the caller's
+  // full environment.
+  try {
+    await runFeedbackTeardown(ir, resumeId);
+  } catch (err) {
+    process.stderr.write(
+      `[feedback] teardown skipped: ${err instanceof Error ? err.message : String(err)}\n`,
+    );
   }
 }
 
@@ -1713,8 +2020,14 @@ function runContext(args: ParsedArgs): void {
 async function runDoctor(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
-      "usage: crewhaus doctor [--philosophy-alignment] [--liveness] [--context-pressure [--sessions N]]\n" +
+      "usage: crewhaus doctor [--philosophy-alignment [--json] [--baseline | --accept-baseline]]\n" +
+        "                       [--liveness] [--context-pressure [--sessions N]]\n" +
         "  --philosophy-alignment   audit the codebase + examples against the three architectural pillars\n" +
+        "  --json                   persist findings (stable ids) to .crewhaus/scope-audit/<date>.json\n" +
+        "                           and print the snapshot JSON (item 49)\n" +
+        "  --baseline               diff findings against .crewhaus/scope-audit/baseline.json; exit\n" +
+        "                           non-zero ONLY on NEW findings (accepted legacy findings never block)\n" +
+        "  --accept-baseline        promote the current findings to the accepted baseline\n" +
         "  --liveness               process-liveness probe: exit 0 immediately, no credential or\n" +
         "                           spec checks (for container HEALTHCHECKs / k8s exec probes)\n" +
         "  --context-pressure       report truncation recoveries, compaction fires per session\n" +
@@ -1740,12 +2053,18 @@ async function runDoctor(args: ParsedArgs): Promise<void> {
     process.exit(0);
   }
   if (args.flags["philosophy-alignment"]) {
-    await runDoctorPhilosophyAlignment();
+    await runDoctorPhilosophyAlignment(args);
     return;
   }
   if (args.flags["context-pressure"]) {
     runDoctorContextPressure(args);
     return;
+  }
+  // Item 49 — the drift-watch flags only make sense on the philosophy audit.
+  for (const flag of ["json", "baseline", "accept-baseline"] as const) {
+    if (args.flags[flag] === true) {
+      die(`--${flag} requires --philosophy-alignment`);
+    }
   }
 
   const checks: DoctorCheck[] = [];
@@ -1755,15 +2074,24 @@ async function runDoctor(args: ParsedArgs): Promise<void> {
   // the legacy Anthropic-first check when no model is extractable. See
   // doctor-checks.ts for the full policy (bedrock/local are informational).
   const specPath = join(process.cwd(), "crewhaus.yaml");
-  let specModel: string | undefined;
+  let specText: string | undefined;
   if (existsSync(specPath)) {
     try {
-      specModel = extractSpecModel(readFileSync(specPath, "utf-8"));
+      specText = readFileSync(specPath, "utf-8");
     } catch {
-      specModel = undefined;
+      specText = undefined;
     }
   }
+  const specModel = specText !== undefined ? extractSpecModel(specText) : undefined;
   checks.push(...buildCredentialChecks(specModel, process.env));
+
+  // Item 61 — channel-target env checks: only when the cwd spec lowers to a
+  // channel IR (other shapes contribute nothing), one check per configured
+  // slack/telegram/discord platform asserting its required secret env-refs
+  // are set. Live platform probes live in `crewhaus channel verify`.
+  if (specText !== undefined) {
+    checks.push(...buildChannelEnvChecks(specText, process.env));
+  }
 
   const bunCheck = checkBunVersion(Bun.version);
   checks.push({
@@ -1804,13 +2132,14 @@ async function runDoctor(args: ParsedArgs): Promise<void> {
 }
 
 /**
- * Workstream D — `crewhaus doctor --philosophy-alignment`. Audits the
+ * Workstream D — collect the `--philosophy-alignment` findings. Audits the
  * repo against the three architectural pillars (compiler-as-protagonist,
- * eval-is-active, security-is-fabric). Exits 0 on green, 1 on any
- * finding. Designed to be runnable in CI as a soft gate.
+ * eval-is-active, security-is-fabric). Item 49 gave every finding a stable
+ * (class, file, symbol) identity so the drift watch can persist/diff them,
+ * and added the boundary-drift detector on top of the six-site check.
  */
-async function runDoctorPhilosophyAlignment(): Promise<void> {
-  const findings: DoctorCheck[] = [];
+async function collectPhilosophyFindings(): Promise<PhilosophyFinding[]> {
+  const findings: PhilosophyFinding[] = [];
 
   // Pillar 1 — compiler-as-protagonist. The IR-discriminated-union is
   // the contract; the architecture doc must reference the IR variants.
@@ -1823,14 +2152,20 @@ async function runDoctorPhilosophyAlignment(): Promise<void> {
     const referencesIrVariants =
       content.includes("IrV0") && content.includes("IrPipelineV0") && content.includes("IrGraphV0");
     findings.push({
+      class: "pillar-doc",
+      file: "../docs/COMPILER-ARCHITECTURE.md",
+      symbol: "ir-variants",
       label: "Pillar 1 — ../docs/COMPILER-ARCHITECTURE.md references IR variants",
       pass: referencesIrVariants,
-      reason: referencesIrVariants
-        ? undefined
-        : "doc exists but does not enumerate the IR-discriminated-union variants",
+      ...(referencesIrVariants
+        ? {}
+        : { reason: "doc exists but does not enumerate the IR-discriminated-union variants" }),
     });
   } else {
     findings.push({
+      class: "pillar-doc",
+      file: "../docs/COMPILER-ARCHITECTURE.md",
+      symbol: "sibling-checkout",
       label: "Pillar 1 — COMPILER-ARCHITECTURE.md (sibling checkout)",
       pass: true,
       warn: true,
@@ -1848,18 +2183,24 @@ async function runDoctorPhilosophyAlignment(): Promise<void> {
     "package.json",
   );
   findings.push({
+    class: "package-presence",
+    file: "packages/eval-optimizer-orchestrator/package.json",
+    symbol: "eval-optimizer-orchestrator",
     label: "Pillar 2 — eval-optimizer-orchestrator package present",
     pass: existsSync(orchestratorPkg),
-    reason: existsSync(orchestratorPkg)
-      ? undefined
-      : "Workstream B did not land — install or rebuild",
+    ...(existsSync(orchestratorPkg)
+      ? {}
+      : { reason: "Workstream B did not land — install or rebuild" }),
   });
 
   const specPatchPkg = join(process.cwd(), "packages", "spec-patch", "package.json");
   findings.push({
+    class: "package-presence",
+    file: "packages/spec-patch/package.json",
+    symbol: "spec-patch",
     label: "Pillar 2 — spec-patch package present",
     pass: existsSync(specPatchPkg),
-    reason: existsSync(specPatchPkg) ? undefined : "Workstream B did not land",
+    ...(existsSync(specPatchPkg) ? {} : { reason: "Workstream B did not land" }),
   });
 
   // Pillar 3 — security is a fabric. The boundary-classifier package
@@ -1868,9 +2209,12 @@ async function runDoctorPhilosophyAlignment(): Promise<void> {
   // federation-router, channel-adapter-base).
   const boundaryPkg = join(process.cwd(), "packages", "boundary-classifier", "package.json");
   findings.push({
+    class: "package-presence",
+    file: "packages/boundary-classifier/package.json",
+    symbol: "boundary-classifier",
     label: "Pillar 3 — boundary-classifier package present",
     pass: existsSync(boundaryPkg),
-    reason: existsSync(boundaryPkg) ? undefined : "Workstream C did not land",
+    ...(existsSync(boundaryPkg) ? {} : { reason: "Workstream C did not land" }),
   });
 
   const boundarySites: ReadonlyArray<{ name: string; path: string }> = [
@@ -1885,6 +2229,9 @@ async function runDoctorPhilosophyAlignment(): Promise<void> {
     const filePath = join(process.cwd(), site.path);
     if (!existsSync(filePath)) {
       findings.push({
+        class: "boundary-site",
+        file: site.path,
+        symbol: site.name,
         label: `Pillar 3 — ${site.name} source present`,
         pass: false,
         reason: `${site.path} not found`,
@@ -1894,13 +2241,23 @@ async function runDoctorPhilosophyAlignment(): Promise<void> {
     const body = readFileSync(filePath, "utf8");
     const classifies = body.includes("classifyBoundary") || body.includes("boundary-classifier");
     findings.push({
+      class: "boundary-site",
+      file: site.path,
+      symbol: site.name,
       label: `Pillar 3 — ${site.name} calls classifyBoundary`,
       pass: classifies,
-      reason: classifies
-        ? undefined
-        : `no reference to classifyBoundary in ${site.path} — security regression`,
+      ...(classifies
+        ? {}
+        : { reason: `no reference to classifyBoundary in ${site.path} — security regression` }),
     });
   }
+
+  // Item 49 — boundary-site DRIFT. The six-site list above only re-checks
+  // KNOWN sites; this scans every package for cross-trust ingress signals
+  // (same read-the-source substring mechanism) and flags a NEW ingress that
+  // never references the classification fabric. Report-only here (warn);
+  // the --baseline gate is what fails, and only on NEW findings.
+  findings.push(...detectBoundaryDrift(process.cwd()));
 
   // FR-002 — Pillar 3 sink-side. Audit the full built-in tool map: every
   // outward-reaching built-in must carry scope: "external" so the egress
@@ -1912,12 +2269,18 @@ async function runDoctorPhilosophyAlignment(): Promise<void> {
   const scopeFindings = auditToolScopes(Object.values(toolMap));
   if (scopeFindings.length === 0) {
     findings.push({
+      class: "tool-scope",
+      file: "",
+      symbol: "all-builtin-outward-tools",
       label: 'Pillar 3 — all built-in outward tools scope:"external"',
       pass: true,
     });
   } else {
     for (const f of scopeFindings) {
       findings.push({
+        class: "tool-scope",
+        file: "",
+        symbol: f.toolName,
         label: `Pillar 3 — tool "${f.toolName}" outward but scope!="external"`,
         pass: false,
         reason: f.reason,
@@ -1932,22 +2295,101 @@ async function runDoctorPhilosophyAlignment(): Promise<void> {
   const claudemd = join(process.cwd(), "CLAUDE.md");
   const hasContributorCompass = existsSync(agentsmd) || existsSync(claudemd);
   findings.push({
+    class: "contributor-doc",
+    file: "AGENTS.md",
+    symbol: "contributor-compass",
     label: "Contributor doc — AGENTS.md (or CLAUDE.md) at project root",
     pass: hasContributorCompass,
-    reason: hasContributorCompass ? undefined : "missing — contributors will drift",
+    ...(hasContributorCompass ? {} : { reason: "missing — contributors will drift" }),
   });
 
+  return findings;
+}
+
+/**
+ * Workstream D + item 49 — `crewhaus doctor --philosophy-alignment
+ * [--json] [--baseline | --accept-baseline]`.
+ *
+ * Plain mode is unchanged: print ✓/~/✗ per check, exit 0 on green / 1 on
+ * any hard finding (boundary-drift reports are warn-tier and never fail
+ * plain mode). The drift-watch modes:
+ *
+ *   --json             persist the actionable findings (stable ids) to
+ *                      `.crewhaus/scope-audit/<YYYY-MM-DD>.json` and print
+ *                      the snapshot JSON to stdout (status lines → stderr).
+ *   --baseline         diff against `.crewhaus/scope-audit/baseline.json`
+ *                      following regression-runner's gate() shape; exit
+ *                      non-zero ONLY on NEW findings — legacy accepted
+ *                      findings never block. A missing baseline fails when
+ *                      findings exist (a gate nobody armed must not pass).
+ *   --accept-baseline  promote the current findings to the baseline (and
+ *                      write the dated snapshot); exits 0.
+ */
+async function runDoctorPhilosophyAlignment(args: ParsedArgs): Promise<void> {
+  const jsonMode = args.flags["json"] === true;
+  const baselineMode = args.flags["baseline"] === true;
+  const acceptMode = args.flags["accept-baseline"] === true;
+  if (baselineMode && acceptMode) {
+    die("--baseline and --accept-baseline are mutually exclusive");
+  }
+
+  const findings = await collectPhilosophyFindings();
+  const snapshot = buildScopeAuditSnapshot(findings);
+  const rootDir = process.cwd();
+
+  // Human-readable per-check lines. In --json mode they move to stderr so
+  // stdout stays a clean machine surface (mirroring `context -o`'s split).
+  const statusOut = jsonMode
+    ? (line: string): void => void process.stderr.write(line)
+    : (line: string): void => void process.stdout.write(line);
   for (const f of findings) {
     if (f.warn && f.pass) {
-      process.stdout.write(`~ ${f.label}: ${f.reason ?? "skipped"}\n`);
+      statusOut(`~ ${f.label}: ${f.reason ?? "skipped"}\n`);
     } else if (f.pass) {
-      process.stdout.write(`✓ ${f.label}\n`);
+      statusOut(`✓ ${f.label}\n`);
     } else {
-      process.stdout.write(`✗ ${f.label}: ${f.reason ?? "failed"}\n`);
+      statusOut(`✗ ${f.label}: ${f.reason ?? "failed"}\n`);
     }
   }
+
+  // Snapshot persistence: --json always writes the dated file;
+  // --accept-baseline additionally writes baseline.json.
+  if (jsonMode || acceptMode) {
+    mkdirSync(scopeAuditDir(rootDir), { recursive: true });
+    const snapshotPath = scopeAuditSnapshotPath(rootDir, () => Date.now());
+    writeFileSync(snapshotPath, `${JSON.stringify(snapshot, null, 2)}\n`);
+    statusOut(`wrote ${snapshotPath}\n`);
+  }
+
+  if (acceptMode) {
+    mkdirSync(scopeAuditDir(rootDir), { recursive: true });
+    const baselinePath = scopeAuditBaselinePath(rootDir);
+    writeFileSync(baselinePath, `${JSON.stringify(snapshot, null, 2)}\n`);
+    statusOut(
+      `accepted ${snapshot.findings.length} finding(s) as the baseline → ${baselinePath}\n`,
+    );
+    if (jsonMode) process.stdout.write(`${JSON.stringify(snapshot, null, 2)}\n`);
+    process.exit(0);
+  }
+
+  if (baselineMode) {
+    let baseline: ReturnType<typeof loadScopeAuditSnapshot>;
+    try {
+      baseline = loadScopeAuditSnapshot(scopeAuditBaselinePath(rootDir));
+    } catch (err) {
+      if (err instanceof ScopeAuditBaselineError) die(err.message);
+      throw err;
+    }
+    const gate = diffScopeAuditSnapshots(baseline, snapshot);
+    for (const line of renderGateReport(gate)) statusOut(`${line}\n`);
+    if (jsonMode) process.stdout.write(`${JSON.stringify({ snapshot, gate }, null, 2)}\n`);
+    process.exit(gate.verdict === "pass" ? 0 : 1);
+  }
+
+  if (jsonMode) process.stdout.write(`${JSON.stringify(snapshot, null, 2)}\n`);
+
   const allPass = findings.every((f) => f.pass);
-  process.stdout.write(
+  statusOut(
     allPass
       ? "\nphilosophy alignment: green. All three pillars intact.\n"
       : `\nphilosophy alignment: ${findings.filter((f) => !f.pass).length} finding(s). See [/AGENTS.md](AGENTS.md) for invariants.\n`,
@@ -2033,6 +2475,11 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
         "  default version: latest). A registry record with populated train AND dev splits is\n" +
         "  used as-is; otherwise the selected samples get the inline 70/30 split. The test\n" +
         "  split is never optimized against unless #test is explicitly given.\n" +
+        "  User-rating loops (item 1): --ratings <session>|all distills feedback inline for\n" +
+        "  this run only (unchanged). A spec with feedback.autoDistill maintains a VERSIONED\n" +
+        "  `<specName>-ratings` registry dataset at run teardown instead — consume it here\n" +
+        "  (and in `crewhaus eval`) as --dataset registry:<specName>-ratings (latest by\n" +
+        "  default, or pin @vN).\n" +
         "  When a patch is accepted (with or without --write-back), the dev samples that flipped\n" +
         "  fail→pass are pinned into the <specName>-regressions registry dataset (a new version\n" +
         "  unioning the previous one, deduped by sample id) so `crewhaus eval` guards them by\n" +
@@ -2406,20 +2853,7 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
   const mutator = args.flags["mutator"];
   let mutatorImpl: import("@crewhaus/prompt-optimizer").MutationProvider | undefined;
   if (mutator === "claude") {
-    const { createClaudeMutationProvider } = await import("@crewhaus/prompt-optimizer-claude");
-    const { resolveModel } = await import("@crewhaus/model-router");
-    const ir = lower(parseSpec(readFileSync(absSpec, "utf-8")));
-    const mutatorModel = ir.target === "cli" ? ir.agent.model : "claude-sonnet-4-5";
-    // Resolve via the model-router so non-Anthropic specs drive their own
-    // provider: the resolved adapter + STRIPPED wire modelId replace the old
-    // hardcoded createAnthropicAdapter() + verbatim prefixed string (which
-    // made `--mutator claude` a silent no-op for openai/gemini/bedrock/local
-    // specs — every mutation call failed and the provider fell back).
-    const resolution = await resolveModel(mutatorModel);
-    mutatorImpl = createClaudeMutationProvider({
-      adapter: resolution.adapter,
-      model: resolution.modelId,
-    });
+    mutatorImpl = await createClaudeMutatorForSpec(absSpec);
   } else if (mutator !== undefined && mutator !== "rule-based") {
     die(`unknown --mutator "${mutator}" — supported: rule-based, claude`);
   }
@@ -2742,6 +3176,550 @@ function makeAsyncIterable<T>(items: ReadonlyArray<T>): AsyncIterable<T> {
       for (const item of items) yield item;
     },
   };
+}
+
+/**
+ * Build the model-driven Claude mutation provider for a spec — shared by
+ * `optimize --mutator claude` and the flywheel's default mutator. Resolves
+ * via the model-router so non-Anthropic specs drive their own provider:
+ * the resolved adapter + STRIPPED wire modelId replace the old hardcoded
+ * createAnthropicAdapter() + verbatim prefixed string (which made
+ * `--mutator claude` a silent no-op for openai/gemini/bedrock/local specs
+ * — every mutation call failed and the provider fell back).
+ */
+async function createClaudeMutatorForSpec(
+  absSpec: string,
+): Promise<import("@crewhaus/prompt-optimizer").MutationProvider> {
+  const { createClaudeMutationProvider } = await import("@crewhaus/prompt-optimizer-claude");
+  const { resolveModel } = await import("@crewhaus/model-router");
+  const ir = lower(parseSpec(readFileSync(absSpec, "utf-8")));
+  const mutatorModel = ir.target === "cli" ? ir.agent.model : "claude-sonnet-4-5";
+  const resolution = await resolveModel(mutatorModel);
+  return createClaudeMutationProvider({
+    adapter: resolution.adapter,
+    model: resolution.modelId,
+  });
+}
+
+// -------- item 45: crewhaus flywheel init|run --------
+
+/**
+ * Invariant guard: the flywheel must never run over uncommitted spec
+ * changes — after an accepted write-back, `git diff` on the spec must mean
+ * "the flywheel improved this", not "the flywheel's change is tangled with
+ * the user's half-finished edit". Outside a git work tree the check is
+ * moot (nothing to tangle with) and the run proceeds, mirroring the demo
+ * script's NO_GIT path.
+ */
+function gitSpecStatus(absSpec: string): { inRepo: boolean; dirty: boolean } {
+  const dir = dirname(absSpec);
+  const inside = spawnSync("git", ["-C", dir, "rev-parse", "--is-inside-work-tree"], {
+    encoding: "utf-8",
+  });
+  if (inside.status !== 0 || inside.stdout.trim() !== "true") {
+    return { inRepo: false, dirty: false };
+  }
+  const status = spawnSync("git", ["-C", dir, "status", "--porcelain", "--", absSpec], {
+    encoding: "utf-8",
+  });
+  return { inRepo: true, dirty: specIsDirty(status.stdout ?? "") };
+}
+
+/**
+ * Item 45 — `crewhaus flywheel init|run`. `run` executes the complete
+ * nightly self-improvement loop in-process (no shelling out to crewhaus
+ * subcommands): compile gate → baseline eval → optimize (accept-then-write:
+ * NO write-back during the search) → post-patch compile → after eval →
+ * acceptance gate (pass_rate strictly up AND zero per-sample regressions,
+ * via the run-history `gateRuns`) → on accept, the same write-back
+ * semantics as `optimize --write-back` (provenance header + auto-register
+ * + changelog + regression pin). A rejected patch never touches the spec.
+ * `init` scaffolds the nightly GitHub Actions workflow (PRs for human
+ * review, never auto-merged).
+ */
+async function runFlywheelCmd(args: ParsedArgs, action: "init" | "run"): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      `usage:\n  crewhaus flywheel run [spec.yaml] [--dataset <data>] [--graders <graders.yaml>]\n      [--budget-usd N] [--iterations N] [--seed N] [--concurrency N]\n      [--mutator rule-based|claude] [--dry-run] [--allow-dirty]\n  crewhaus flywheel init [--force]\n\n  \`run\` executes the nightly self-improvement loop in one command:\n  compile gate → baseline eval → optimize (budget-capped; claude mutator\n  by default when an ANTHROPIC credential is present, rule-based fallback\n  otherwise) → post-patch compile → after eval → acceptance gate. The\n  patch is applied to the spec ONLY when pass_rate strictly improved with\n  zero per-sample regressions (the same strict gate \`eval --gate\` uses);\n  an accepted write-back then runs the standard auto-register + changelog\n  + regression-pin flow. A rejected patch never touches disk. --dry-run\n  runs everything but never writes.\n\n  Defaults: <spec> is ./crewhaus.yaml; --dataset falls back to\n  ${CONVENTIONAL_DATASET} then registry:<spec>-ratings (when the spec has a\n  feedback: block and ratings were distilled); --graders falls back to\n  ${CONVENTIONAL_GRADERS}; conventional paths resolve from the SPEC's directory,\n  not the cwd, so a spec passed by path brings its own eval/ files. When the\n  dataset is a registry ref (including the ratings fallback), the before/after\n  acceptance evals run over ALL splits — test included — matching \`eval\`'s\n  registry semantics; per-split acceptance gating is a future knob. The\n  optimizer only ever rewrites agent.instructions (OPTIMIZABLE_PATHS) —\n  permissions: stay exactly as a human reviewed them. The flywheel refuses to\n  run over uncommitted spec changes (--allow-dirty opts out).\n\n  \`init\` scaffolds .github/workflows/crewhaus-flywheel.yml: nightly cron +\n  workflow_dispatch, budget knobs as env, PR creation via gh for HUMAN\n  review — the workflow never merges on its own. Refuses to overwrite an\n  existing workflow without --force.\n\n${formatFlywheelKnobsGuide()
+        .map((l) => `  ${l}`)
+        .join("\n")}\n`,
+    );
+    return;
+  }
+  if (action === "init") {
+    runFlywheelInit(args);
+    return;
+  }
+  await runFlywheelRun(args);
+}
+
+function runFlywheelInit(args: ParsedArgs): void {
+  // Finding 7: GitHub only reads .github/workflows at the REPO ROOT — write
+  // there (git toplevel, cwd fallback) and point the workflow's
+  // working-directory (and its root-anchored artifact path) back at the
+  // harness when it lives in a subdirectory.
+  const { root: wfRoot, harnessDir } = resolveWorkflowRoot(process.cwd(), process.cwd());
+  let scaffolded: ReturnType<typeof scaffoldWorkflowFile>;
+  try {
+    scaffolded = scaffoldWorkflowFile({
+      rootDir: wfRoot,
+      relPath: FLYWHEEL_WORKFLOW_RELPATH,
+      content: buildFlywheelWorkflowYaml({ harnessDir }),
+      force: args.flags["force"] === true,
+    });
+  } catch (err) {
+    if (err instanceof FlywheelConfigError) die(err.message);
+    throw err;
+  }
+  process.stdout.write(`wrote ${scaffolded.path}\n`);
+  if (harnessDir !== "") {
+    process.stdout.write(
+      `    (workflow written at the repo root, not in ${harnessDir}/ — GitHub only reads\n` +
+        `    .github/workflows there; its working-directory and artifact path point at ${harnessDir}/)\n`,
+    );
+  }
+  for (const line of formatFlywheelKnobsGuide()) process.stdout.write(`${line}\n`);
+  process.stdout.write(
+    "next: commit the workflow and set the ANTHROPIC_API_KEY + FLYWHEEL_GH_TOKEN repo\n" +
+      "      secrets. The flywheel then runs nightly; accepted improvements arrive as\n" +
+      "      PRs for human review — it never merges on its own.\n",
+  );
+}
+
+async function runFlywheelRun(args: ParsedArgs): Promise<void> {
+  const specPath = args.positional[0] ?? "crewhaus.yaml";
+  const absSpec = resolve(specPath);
+  if (!existsSync(absSpec)) {
+    die(
+      `spec not found at ${absSpec} — run from the harness directory (standalone-harness convention) or pass <spec.yaml>`,
+    );
+  }
+  const dryRun = args.flags["dry-run"] === true;
+
+  // Invariant: never run over uncommitted spec changes (see gitSpecStatus).
+  const git = gitSpecStatus(absSpec);
+  if (git.inRepo && git.dirty) {
+    if (args.flags["allow-dirty"] !== true) {
+      die(
+        `${specPath} has uncommitted changes — the flywheel refuses to run over a dirty spec (an accepted write-back would tangle with your edits). Commit or stash first, or pass --allow-dirty.`,
+      );
+    }
+    process.stderr.write(
+      `crewhaus: [flywheel] warning: running over a dirty ${specPath} (--allow-dirty)\n`,
+    );
+  }
+
+  let knobs: FlywheelKnobs;
+  try {
+    knobs = resolveFlywheelKnobs({ flags: args.flags, env: process.env });
+  } catch (err) {
+    if (err instanceof FlywheelConfigError) die(err.message);
+    throw err;
+  }
+
+  const sourceYaml = readFileSync(absSpec, "utf-8");
+  let ir: ReturnType<typeof lower>;
+  try {
+    ir = lower(parseSpec(sourceYaml));
+  } catch (err) {
+    if (err instanceof CrewhausError) die(err.message);
+    throw err;
+  }
+  if (ir.target !== "cli") {
+    die(
+      `crewhaus flywheel only supports target: cli (got "${ir.target}") — eval/optimize v0 are cli-only`,
+    );
+  }
+
+  // Dataset/graders defaults: flag > standalone-harness convention >
+  // (dataset only) the `<spec>-ratings` registry dataset the feedback
+  // flywheel feeds. Conventional paths resolve from the SPEC's directory
+  // (matching the dirty-check's spec-dir behavior), so a spec passed by
+  // path from a sibling dir finds its own eval/ files; --dataset/--graders
+  // flag paths stay cwd-relative, per the harness convention.
+  const specDir = dirname(absSpec);
+  const registry = createFileBackedRegistry({ rootDir: defaultDatasetsRoot() });
+  let ratingsRegistered = false;
+  const ratingsName = `${ir.name}-ratings`;
+  if (ir.feedback !== undefined && isRegistrySafeName(ratingsName)) {
+    try {
+      ratingsRegistered = (await latestVersion(registry, ratingsName)) !== undefined;
+    } catch {
+      // An unreadable registry just means no ratings default.
+    }
+  }
+  const datasetFlag = strFlag(args, "dataset");
+  const gradersFlag = strFlag(args, "graders");
+  let data: FlywheelDataResolution;
+  try {
+    data = resolveFlywheelData({
+      ...(datasetFlag !== undefined ? { datasetFlag } : {}),
+      ...(gradersFlag !== undefined ? { gradersFlag } : {}),
+      specName: ir.name,
+      specDir,
+      hasConventionalDataset: existsSync(join(specDir, CONVENTIONAL_DATASET)),
+      hasConventionalGraders: existsSync(join(specDir, CONVENTIONAL_GRADERS)),
+      ratingsRegistered,
+    });
+  } catch (err) {
+    if (err instanceof FlywheelConfigError) die(err.message);
+    throw err;
+  }
+
+  let gradersYaml: string;
+  try {
+    gradersYaml = readFileSync(resolve(data.graders), "utf-8");
+  } catch (err) {
+    die(`could not read ${data.graders}: ${(err as Error).message}`);
+  }
+  const { compiled } = parseGradersConfig(gradersYaml);
+
+  // Materialize the dataset once (file path or registry: ref) — the same
+  // sample set feeds the before eval, the optimizer's dev evals, and the
+  // after eval, so the acceptance diff compares like with like.
+  const samples: Sample[] = [];
+  let datasetName: string;
+  let datasetHash: string;
+  let registrySplits: { train: Sample[]; dev: Sample[] } | undefined;
+  let registryRef: ReturnType<typeof parseRegistryRef>;
+  try {
+    registryRef = parseRegistryRef(data.dataset);
+  } catch (err) {
+    if (err instanceof DatasetRefError) die(err.message);
+    throw err;
+  }
+  if (registryRef !== undefined) {
+    let resolved: Awaited<ReturnType<typeof resolveRegistryRef>>;
+    try {
+      resolved = await resolveRegistryRef(registry, registryRef);
+    } catch (err) {
+      if (err instanceof DatasetRefError || err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
+    datasetName = resolved.datasetName;
+    datasetHash = resolved.datasetHash;
+    samples.push(...resolved.samples);
+    // Item 12 — a record with populated train AND dev splits (and no
+    // explicit #split) is the optimizer's reproducible source of truth;
+    // the test split never enters optimization (mirrors `optimize`).
+    const { record } = resolved;
+    if (
+      registryRef.split === undefined &&
+      record.splits.train.length > 0 &&
+      record.splits.dev.length > 0
+    ) {
+      registrySplits = { train: [...record.splits.train], dev: [...record.splits.dev] };
+    }
+  } else {
+    const absDataset = resolve(data.dataset);
+    const dataset = await loadDataset(absDataset);
+    datasetName = dataset.name;
+    datasetHash = hashDatasetFile(absDataset);
+    for await (const s of dataset.samples) samples.push(s);
+  }
+  if (samples.length === 0) die(`dataset "${datasetName}" yielded zero samples`);
+
+  // Optimizer train/dev sets (mirrors `optimize`: registry splits when both
+  // populated, else the deterministic inline 70/30 split).
+  type OptimizerSample = { id: string; input: string; expected_output?: string };
+  const toOptimizerSample = (s: Sample): OptimizerSample => ({
+    id: s.id,
+    input: s.input,
+    ...(s.expected_output !== undefined ? { expected_output: s.expected_output } : {}),
+  });
+  const originalById = new Map(samples.map((s) => [s.id, s] as const));
+  let trainSet: OptimizerSample[];
+  let devSet: OptimizerSample[];
+  if (registrySplits !== undefined) {
+    trainSet = registrySplits.train.map(toOptimizerSample);
+    devSet = registrySplits.dev.map(toOptimizerSample);
+  } else {
+    if (samples.length < 2) {
+      die(
+        `dataset has ${samples.length} sample(s) — the optimizer needs at least 2 (70/30 train/dev split)`,
+      );
+    }
+    const splitIdx = Math.max(1, Math.floor(samples.length * 0.7));
+    trainSet = samples.slice(0, splitIdx).map(toOptimizerSample);
+    devSet = samples.slice(splitIdx).map(toOptimizerSample);
+  }
+  const devById = new Map(devSet.map((s) => [s.id, s] as const));
+
+  // Mutator: flag > credential-aware default (claude when an Anthropic
+  // credential is present, rule-based fallback otherwise — the loop still
+  // runs and gates, only the rewrites are deterministic).
+  const mutatorFlag = strFlag(args, "mutator");
+  let mutatorChoice: "rule-based" | "claude";
+  if (mutatorFlag !== undefined) {
+    if (mutatorFlag !== "rule-based" && mutatorFlag !== "claude") {
+      die(`unknown --mutator "${mutatorFlag}" — supported: rule-based, claude`);
+    }
+    mutatorChoice = mutatorFlag;
+  } else {
+    const hasAnthropicCred =
+      (process.env["ANTHROPIC_API_KEY"] ?? "") !== "" ||
+      (process.env["ANTHROPIC_AUTH_TOKEN"] ?? "") !== "";
+    mutatorChoice = hasAnthropicCred ? "claude" : "rule-based";
+    if (!hasAnthropicCred) {
+      process.stderr.write(
+        "crewhaus: [flywheel] no ANTHROPIC credential — falling back to the rule-based mutator (model-driven rewrites disabled)\n",
+      );
+    }
+  }
+  const mutatorImpl =
+    mutatorChoice === "claude" ? await createClaudeMutatorForSpec(absSpec) : undefined;
+
+  const runId = `fly_${Date.now().toString(16)}`;
+  const outRoot = resolve(join(".crewhaus", "flywheel", runId));
+  mkdirSync(outRoot, { recursive: true });
+  process.stdout.write(
+    `[flywheel] runId=${runId} spec=${specPath} dataset=${datasetName} ` +
+      `(${samples.length} samples; ${trainSet.length} train / ${devSet.length} dev) ` +
+      `mutator=${mutatorChoice} iterations=${knobs.iterations} budget=$${knobs.budgetUsd.toFixed(2)} ` +
+      `seed=${knobs.seed} concurrency=${knobs.concurrency}${dryRun ? " DRY-RUN" : ""}\n`,
+  );
+
+  // ---- injected steps (see runFlywheelLoop in ./flywheel.ts) ----
+
+  const compileCheck = (yaml: string): void => {
+    // Offline parse → lower. Throws SpecParseError / CompilerError (both
+    // CrewhausError) on a spec the compiler rejects.
+    lower(parseSpec(yaml));
+  };
+
+  const evalRun = async (label: "before" | "after", yaml: string) => {
+    const evalIr = lower(parseSpec(yaml));
+    if (evalIr.target !== "cli") {
+      throw new Error(`flywheel eval requires target: cli (got "${evalIr.target}")`);
+    }
+    process.stdout.write(
+      `[flywheel] ${label} eval: ${samples.length} samples → ${join(outRoot, label)}\n`,
+    );
+    const summary = await runEvalLib({
+      ir: evalIr,
+      dataset: { name: datasetName, samples: makeAsyncIterable(samples) },
+      compiledGraders: compiled,
+      opts: {
+        outDir: join(outRoot, label),
+        concurrency: knobs.concurrency,
+        seed: knobs.seed,
+        datasetHash,
+        retryErrors: true,
+      },
+    });
+    process.stdout.write(
+      `[flywheel] ${label} pass_rate=${(summary.aggregates.passRate * 100).toFixed(1)}% ` +
+        `mean_score=${summary.aggregates.meanScore.toFixed(3)} errors=${summary.aggregates.errorCount}\n`,
+    );
+    return summary;
+  };
+
+  // Item 7 — same failure-arbiter pre-filter as `optimize` (noise and
+  // evidence-backed contract-ambiguity are withheld from the mutator's
+  // failure signal; the queue prints at the end of the run).
+  const datasetFixQueue = new Map<string, string>();
+  const stickyAmbiguous = new Set<string>();
+  let evalCallSeq = 0;
+  const fitness = async (
+    prompt: string,
+  ): Promise<import("@crewhaus/prompt-optimizer").FitnessResult> => {
+    const yamlText = readFileSync(absSpec, "utf-8");
+    const parsedTarget = parseSpec(yamlText).target;
+    const { applySpecPatch } = await import("@crewhaus/spec-patch");
+    const { yaml: patchedYaml } = applySpecPatch(yamlText, {
+      target: parsedTarget as never,
+      path: ["agent", "instructions"],
+      op: "replace",
+      value: prompt,
+    });
+    let candidateIr: ReturnType<typeof lower>;
+    try {
+      candidateIr = lower(parseSpec(patchedYaml));
+    } catch (err) {
+      if (err instanceof SpecParseError) {
+        process.stderr.write("[flywheel] candidate compiled invalid spec, skipping\n");
+        return { score: 0 };
+      }
+      throw err;
+    }
+    if (candidateIr.target !== "cli") return { score: 0 };
+    evalCallSeq += 1;
+    const summary = await runEvalLib({
+      ir: candidateIr,
+      dataset: { name: datasetName, samples: makeAsyncIterable(devSet) },
+      compiledGraders: compiled,
+      opts: {
+        outDir: join(
+          outRoot,
+          "optimize",
+          "evals",
+          `${String(evalCallSeq).padStart(3, "0")}_${prompt.length}`,
+        ),
+        concurrency: knobs.concurrency,
+        seed: knobs.seed,
+        retryErrors: true,
+      },
+    });
+    let excludedFromSignal: ReadonlySet<string> = new Set<string>();
+    try {
+      const triage = triageFitnessSamples({
+        samples: summary.samples,
+        samplesById: originalById,
+        alreadyAmbiguous: stickyAmbiguous,
+      });
+      for (const a of triage.ambiguous) {
+        datasetFixQueue.set(a.sampleId, a.reason);
+        if (a.fromGraderEvidence) stickyAmbiguous.add(a.sampleId);
+      }
+      excludedFromSignal = triage.excluded;
+      const line = formatFitnessTriageLine(triage);
+      if (line !== undefined) process.stdout.write(`[flywheel] ${line}\n`);
+    } catch (err) {
+      process.stderr.write(
+        `[flywheel] triage skipped: ${err instanceof Error ? err.message : String(err)}\n`,
+      );
+    }
+    const grades = summary.samples
+      .filter((r) => !excludedFromSignal.has(r.sampleId))
+      .map((r) => {
+        const dev = devById.get(r.sampleId);
+        return {
+          input: dev?.input ?? r.sampleId,
+          score: r.grades.overall.score,
+          ...(dev?.expected_output !== undefined ? { expected: dev.expected_output } : {}),
+          rationale: r.grades.overall.rationale,
+        };
+      });
+    return { score: summary.aggregates.passRate, grades, runDir: summary.outDir };
+  };
+
+  let optimizeResult: Awaited<ReturnType<typeof optimizeSpec>> | undefined;
+  const optimizeStep = async (): Promise<FlywheelOptimizeOutcome> => {
+    process.stdout.write(
+      `[flywheel] optimize: ${knobs.iterations} iteration(s), budget $${knobs.budgetUsd.toFixed(2)}, instructions only (permissions are never optimizer-patchable)\n`,
+    );
+    const traceBus = new TraceEventBus({ runId, sessionId: runId });
+    const result = await optimizeSpec({
+      specPath: absSpec,
+      fitness,
+      trainSet,
+      devSet,
+      iterations: knobs.iterations,
+      seed: knobs.seed,
+      outDir: join(outRoot, "optimize"),
+      // Accept-then-write: the search NEVER writes the source; the patch is
+      // applied by applyAccepted only after the acceptance gate passes.
+      writeBack: false,
+      runId,
+      traceBus,
+      budgetUsd: knobs.budgetUsd,
+      ...(mutatorImpl !== undefined ? { mutator: mutatorImpl } : {}),
+    });
+    optimizeResult = result;
+    process.stdout.write(
+      `[flywheel] optimize: dev score ${result.scoreBefore.toFixed(3)} → ${result.scoreAfter.toFixed(3)} ` +
+        `spend ${result.spend.totalUsd}` +
+        `${result.stoppedReason === "budget-reached" ? " (stopped: budget reached)" : ""}\n`,
+    );
+    return {
+      applied: result.applied,
+      patchedYaml: result.patchedYaml,
+      runId: result.runId,
+      outDir: result.outDir,
+      scoreBefore: result.scoreBefore,
+      scoreAfter: result.scoreAfter,
+      mutatorName: mutatorChoice,
+      iterations: knobs.iterations,
+      spendUsd: result.spend.totalUsd,
+    };
+  };
+
+  const applyAccepted = async (outcome: FlywheelOptimizeOutcome): Promise<void> => {
+    // The kept `optimize --write-back` semantics: stamp the provenance
+    // header spec-changelog distills, write the source, then auto-register
+    // (+ changelog) and pin the fail→pass recoveries into the per-spec
+    // regression suite — exactly what a successful --write-back does.
+    const { formatWriteBackHeader } = await import("@crewhaus/spec-patch");
+    const stamped = `${formatWriteBackHeader({
+      runId: outcome.runId,
+      mutator: outcome.mutatorName,
+      scoreBefore: outcome.scoreBefore,
+      scoreAfter: outcome.scoreAfter,
+      iterations: outcome.iterations,
+    })}${outcome.patchedYaml}`;
+    writeFileSync(absSpec, stamped);
+    process.stdout.write(`[flywheel] wrote patched YAML to ${absSpec}\n`);
+    await autoRegisterSpec(stamped, { patchJsonPath: join(outcome.outDir, "patch.json") });
+    try {
+      const pin = await pinRecoveriesAfterOptimize({
+        registry,
+        specName: ir.name,
+        pin: true,
+        ...(optimizeResult?.baselineEvalDir !== undefined
+          ? { baselineRunDir: optimizeResult.baselineEvalDir }
+          : {}),
+        ...(optimizeResult?.bestEvalDir !== undefined
+          ? { candidateRunDir: optimizeResult.bestEvalDir }
+          : {}),
+        samplesById: originalById,
+        sourceDataset: datasetName,
+        optimizeRunId: outcome.runId,
+      });
+      if (pin !== undefined && pin.pinned > 0) {
+        process.stdout.write(
+          `[flywheel] pinned ${pin.pinned} recovered samples → ${pin.suiteName}@${pin.version}\n`,
+        );
+      }
+    } catch (err) {
+      process.stderr.write(
+        `[flywheel] regression pinning skipped: ${err instanceof Error ? err.message : String(err)}\n`,
+      );
+    }
+  };
+
+  const result = await runFlywheelLoop({
+    sourceYaml,
+    dryRun,
+    hooks: { compileCheck, evalRun, optimize: optimizeStep, applyAccepted },
+  });
+
+  // The demo's step-4 diff artifact (before vs after, side by side), for
+  // the PR body / a human eyeball. Informational — never fails the run.
+  if (result.before !== undefined && result.after !== undefined) {
+    try {
+      const diff = diffReports(
+        await loadRun(join(outRoot, "before")),
+        await loadRun(join(outRoot, "after")),
+      );
+      const diffDir = join(outRoot, "diff");
+      mkdirSync(diffDir, { recursive: true });
+      writeFileSync(join(diffDir, "index.html"), diff.html);
+      writeFileSync(join(diffDir, "diff.json"), diff.json);
+    } catch {
+      // Same sample ids on both sides by construction; a diff failure here
+      // only costs the artifact.
+    }
+  }
+
+  // Item 7 — surface the queued contract-ambiguity samples (dataset fixes,
+  // not prompt mutations). Empty queue → silent.
+  for (const line of formatDatasetFixQueue(datasetFixQueue)) {
+    process.stdout.write(`[flywheel] ${line}\n`);
+  }
+
+  for (const line of formatFlywheelReport(result, {
+    specPath,
+    datasetName,
+    sampleCount: samples.length,
+    budgetUsd: knobs.budgetUsd,
+    artifactsDir: outRoot,
+  })) {
+    process.stdout.write(`[flywheel] ${line}\n`);
+  }
+
+  // Rejection/no-improvement is success-by-doing-nothing (exit 0, like the
+  // demo); a patch the compiler rejects is an optimizer bug — exit 1.
+  if (result.outcome === "patch-compile-failed") die(result.reason);
 }
 
 /** Materialize a streaming dataset. Only invoked lazily by the item-9
@@ -4103,6 +5081,123 @@ function distillRatings(
   return { samples, gradersYaml: gradersConfigToYaml(result.graders) };
 }
 
+/**
+ * Item 1 — post-session feedback teardown for the cli run path. Two halves,
+ * both gated on the compiled spec's `feedback:` block:
+ *
+ *  1. Exit rating prompt: on a clean REPL exit with ≥1 assistant turn, a
+ *     TTY, and no opt-out (CREWHAUS_NO_EXIT_RATING / feedback.exitPrompt:
+ *     false), ask `rate this session? [g]ood / [b]ad / [enter] skip` — one
+ *     keystroke, 10s timeout, appended to the session's event log via the
+ *     same `user_feedback` record `crewhaus rate` writes (source "cli",
+ *     rating the last turn). NEVER prompts in non-TTY/piped mode.
+ *
+ *  2. autoDistill consumer: when `feedback.autoDistill` is enabled and the
+ *     accumulated store (all sessions + the web-UI feedback dir) holds
+ *     enough unprocessed ratings past the watermark, run the existing
+ *     distill() and register the result as a new version of the
+ *     `<specName>-ratings` registry dataset (see ./autodistill.ts) —
+ *     consumable as `--dataset registry:<specName>-ratings` by eval and
+ *     optimize.
+ */
+async function runFeedbackTeardown(
+  ir: Extract<ReturnType<typeof lower>, { target: "cli" }>,
+  resumeId: string | undefined,
+): Promise<void> {
+  if (ir.feedback === undefined) return;
+
+  // Resolve the session that just ran: the resumed id, else the most recent
+  // session recorded for this spec name (the same resolution --continue
+  // uses; runChatLoop does not return its sessionId).
+  let sessionId = resumeId;
+  if (sessionId === undefined) {
+    const store = createSessionStore();
+    const sessions = await store.list();
+    sessionId = sessions.find((s: { name: string }) => s.name === ir.name)?.id;
+  }
+
+  // ---- half 1: the exit rating prompt ----
+  if (sessionId !== undefined && existsSync(sessionJsonlPath(sessionId))) {
+    const turns = deriveTurns(readSessionEvents(sessionId));
+    const decision = shouldPromptExitRating({
+      stdinIsTTY: process.stdin.isTTY === true,
+      env: process.env,
+      feedback: ir.feedback,
+      assistantTurns: countAssistantTurns(turns),
+    });
+    if (decision.prompt && turns.length > 0) {
+      const choice = parseExitRatingKey(await readExitRatingKey(EXIT_RATING_TIMEOUT_MS));
+      if (choice !== "skip") {
+        const turnNumber = (turns[turns.length - 1] as DerivedTurn).turnNumber;
+        const record = buildFeedbackRecord({
+          id: `fb_${randomBytes(6).toString("hex")}`,
+          sessionId,
+          turnNumber,
+          ts: new Date().toISOString(),
+          source: "cli",
+          thumbs: choice,
+        });
+        const log = await openEventLog(sessionId, {
+          rootDir: join(process.cwd(), SESSIONS_SUBDIR),
+        });
+        await log.append({ kind: FEEDBACK_EVENT_KIND, payload: record });
+        process.stdout.write(
+          `[feedback] recorded ${choice === "up" ? "good" : "bad"} on ${sessionId} turn ${turnNumber}\n`,
+        );
+      }
+    }
+  }
+
+  // ---- half 2: the autoDistill consumer ----
+  if (ir.feedback.autoDistill !== true) return;
+  const sessionsDir = join(process.cwd(), SESSIONS_SUBDIR);
+  const turns: SessionTurn[] = [];
+  const records: FeedbackRecord[] = [];
+  for (const id of listSessionIds(sessionsDir)) {
+    const events = readSessionEvents(id);
+    for (const t of deriveTurns(events)) turns.push({ ...t, sessionId: id });
+    records.push(...extractFeedbackRecords(events));
+  }
+  records.push(...readFeedbackDir(join(process.cwd(), FEEDBACK_SUBDIR)));
+  await maybeAutoDistill({
+    specName: ir.name,
+    feedback: ir.feedback,
+    turns,
+    records,
+    registry: createFileBackedRegistry({ rootDir: defaultDatasetsRoot() }),
+    stateFilePath: join(process.cwd(), DISTILL_STATE_RELPATH),
+  });
+}
+
+/**
+ * One raw-mode keystroke with a timeout (undefined on timeout or when
+ * stdin is unusable). Thin IO by design — the prompt gate and the key
+ * mapping are the unit-tested functions in ./autodistill.ts.
+ */
+async function readExitRatingKey(timeoutMs: number): Promise<string | undefined> {
+  const stdin = process.stdin;
+  if (stdin.isTTY !== true || stdin.destroyed) return undefined;
+  process.stdout.write(EXIT_RATING_PROMPT);
+  return await new Promise<string | undefined>((resolveKey) => {
+    let done = false;
+    const finish = (v: string | undefined): void => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      stdin.off("data", onData);
+      if (typeof stdin.setRawMode === "function") stdin.setRawMode(false);
+      stdin.pause();
+      process.stdout.write("\n");
+      resolveKey(v);
+    };
+    const timer = setTimeout(() => finish(undefined), timeoutMs);
+    const onData = (chunk: Buffer | string): void => finish(chunk.toString());
+    if (typeof stdin.setRawMode === "function") stdin.setRawMode(true);
+    stdin.resume();
+    stdin.on("data", onData);
+  });
+}
+
 // -------- state backup / restore (item 69) --------
 
 /** Label for the default backup file name: the cwd spec's harness name when
@@ -5119,6 +6214,348 @@ async function runRetention(args: ParsedArgs, action: string): Promise<void> {
   }
 }
 
+/**
+ * Item 48 — `crewhaus security digest [--since 7d|30d|<ISO>] [--format
+ * text|json|html] [-o <dir>] [--notify <url>] [--dir <root>]`. Walks the
+ * cwd (or --dir) harness's `.crewhaus/audit` + `.crewhaus/sessions` stores
+ * and emits a ranked warn/deny rollup: top justification-denied tools (with
+ * judge identity + confidence), judge deny rate, policy-engine denials,
+ * injection rule-id hits (from session redaction notices), and — the day a
+ * writer lands for the declared-but-writerless `egress_decision` kind — top
+ * warn/block egress sinks + origins. See security-digest.ts for exactly
+ * which audit kinds have writers today and the design decisions (local HTML
+ * helper, plain-fetch notify).
+ *
+ * The digest is a report, not a gate: it exits 0 even when the window is
+ * full of denials. The one loud failure is `--notify` — a scheduled digest
+ * whose notification silently failed would fabricate assurance, so a
+ * non-2xx/unreachable webhook exits 1.
+ */
+async function runSecurityDigest(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus security digest [--since 7d|30d|<ISO>] [--format text|json|html]\n" +
+        "                                [-o <dir>] [--notify <url>] [--dir <root>]\n" +
+        "  --since <w>     rollup window: a trailing day window (7d default, e.g. 30d)\n" +
+        "                  or an ISO date/datetime lower bound\n" +
+        "  --format <f>    text (default), json (the machine shape --notify POSTs),\n" +
+        "                  or html (self-contained page, eval-report styling)\n" +
+        "  -o <dir>        write security-digest.<ext> into <dir> instead of stdout\n" +
+        "  --notify <url>  POST the JSON digest to a webhook (plain fetch; Slack\n" +
+        "                  incoming webhooks need a { text } wrapper — front one with\n" +
+        "                  a proxy that forwards { text: <rendered text> })\n" +
+        "  --dir <root>    harness root that owns .crewhaus/ (default: cwd)\n",
+    );
+    return;
+  }
+  const formatFlag = args.flags["format"];
+  const format = typeof formatFlag === "string" ? formatFlag : "text";
+  if (format !== "text" && format !== "json" && format !== "html") {
+    die(`--format must be "text", "json" or "html" (got "${format}")`);
+  }
+  const dirFlag = args.flags["dir"];
+  const rootDir = typeof dirFlag === "string" ? resolve(dirFlag) : process.cwd();
+  const sinceFlag = args.flags["since"];
+
+  let digest: ReturnType<typeof buildSecurityDigest>;
+  try {
+    const window = parseSinceFlag(typeof sinceFlag === "string" ? sinceFlag : undefined);
+    digest = buildSecurityDigest({ rootDir, window });
+  } catch (err) {
+    if (err instanceof InvalidSinceFlagError) die(err.message);
+    throw err;
+  }
+
+  const rendered =
+    format === "json"
+      ? `${JSON.stringify(digest, null, 2)}\n`
+      : format === "html"
+        ? renderSecurityDigestHtml(digest)
+        : `security digest: ${rootDir}\n${renderSecurityDigestText(digest)
+            .map((l) => `  ${l}`)
+            .join("\n")}\n`;
+
+  const outFlag = args.flags["out"];
+  if (typeof outFlag === "string") {
+    const outDir = resolve(outFlag);
+    mkdirSync(outDir, { recursive: true });
+    const ext = format === "text" ? "txt" : format;
+    const outPath = join(outDir, `security-digest.${ext}`);
+    writeFileSync(outPath, rendered);
+    process.stdout.write(`wrote ${outPath}\n`);
+  } else {
+    process.stdout.write(rendered);
+  }
+
+  const notifyFlag = args.flags["notify"];
+  if (typeof notifyFlag === "string") {
+    try {
+      await notifySecurityDigest(notifyFlag, digest);
+      process.stdout.write(`notified ${notifyFlag}\n`);
+    } catch (err) {
+      if (err instanceof NotifyError) die(err.message);
+      throw err;
+    }
+  }
+}
+
+/**
+ * Item 61 — `crewhaus channel provision|verify <spec.yaml>`: one-command
+ * platform-side setup + scope doctor for channel-target specs. Everything is
+ * derived from the spec + the adapters' actual API usage (see
+ * channel-provision.ts for the per-platform derivations and the two design
+ * decisions: Slack is emit-and-instruct only because the manifest API needs
+ * an app configuration token the adapter/spec never carry, and Discord
+ * registers the interactions endpoint — its adapter is webhook-based, not
+ * gateway-websocket-based — but not application commands, because the spec
+ * declares no command list and the adapter routes any command name).
+ *
+ * `--dry-run` prints every network call with secrets redacted (env-refs as
+ * `$NAME`, inline literals as `[redacted]`) and performs nothing.
+ */
+async function runChannel(args: ParsedArgs, action: "provision" | "verify"): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus channel provision <spec.yaml> --base-url <public-url>\n" +
+        "                                  [--platform slack|telegram|discord|all] [-o <dir>]\n" +
+        "                                  [--dry-run] [--force]\n" +
+        "       crewhaus channel verify <spec.yaml> [--platform slack|telegram|discord|all]\n" +
+        "                                  [--base-url <public-url>] [--dry-run]\n" +
+        "\n" +
+        "  provision — platform-side app setup derived from the spec + compiled daemon:\n" +
+        "    slack     write <dir>/slack-app-manifest.yaml (the bot scopes + event\n" +
+        "              subscriptions the adapter actually needs; request URL =\n" +
+        "              <base-url>/slack/events) and print the console steps. No --apply:\n" +
+        "              Slack's manifest API needs an app *configuration* token, which\n" +
+        "              neither the adapter nor the spec carries.\n" +
+        "    telegram  CALL setWebhook with url = <base-url>/telegram/events and the\n" +
+        "              spec's secretToken (the exact value the adapter verifies on every\n" +
+        "              inbound POST via X-Telegram-Bot-Api-Secret-Token).\n" +
+        "    discord   PATCH applications/@me interactions_endpoint_url =\n" +
+        "              <base-url>/discord/events (start the daemon first — Discord\n" +
+        "              validates the endpoint live) and print the invite URL with\n" +
+        "              adapter-derived permission bits. Slash commands are NOT\n" +
+        "              auto-registered: the spec declares no command list and the\n" +
+        "              adapter routes any command name to the agent.\n" +
+        "  verify — doctor-style probes, ✓/~/✗ per check, exit 1 on hard failures:\n" +
+        "    slack     auth.test + granted scopes (x-oauth-scopes) vs the needed set\n" +
+        "    telegram  getWebhookInfo url / allowed_updates / pending updates / last error\n" +
+        "    discord   applications/@me id / verify_key / interactions endpoint\n" +
+        "  --base-url  the daemon's publicly reachable origin (required for provision;\n" +
+        "              on verify it upgrades the webhook-URL checks from ~ to ✓/✗)\n" +
+        "  --dry-run   print every network call (secrets redacted) without performing it\n" +
+        "  --force     discord provision reads applications/@me first and REFUSES to\n" +
+        "              overwrite an interactions_endpoint_url that differs from the\n" +
+        "              daemon route; --force replaces it (and reports what it was)\n",
+    );
+    return;
+  }
+  const specPath = args.positional[0];
+  if (typeof specPath !== "string") die("missing <spec.yaml>");
+  const absSpec = resolve(specPath);
+  let yamlText: string;
+  try {
+    yamlText = readFileSync(absSpec, "utf-8");
+  } catch (err) {
+    die(`could not read ${absSpec}: ${(err as Error).message}`);
+  }
+  let ir: ReturnType<typeof lower>;
+  try {
+    ir = lower(parseSpec(yamlText));
+  } catch (err) {
+    // parseSpec throws SpecParseError; lower() can throw CompilerError — both
+    // extend CrewhausError, so render as a clean one-liner.
+    if (err instanceof CrewhausError) die(err.message);
+    throw err;
+  }
+  if (ir.target !== "channel") {
+    die(
+      `channel ${action} requires a channel-target spec (got target "${ir.target}") — the platform config lives in the spec's channels block`,
+    );
+  }
+
+  const platformFlag = args.flags["platform"];
+  let selection: ReturnType<typeof resolvePlatformsFlag>;
+  try {
+    selection = resolvePlatformsFlag(
+      typeof platformFlag === "string" ? platformFlag : undefined,
+      ir.channels,
+    );
+  } catch (err) {
+    if (err instanceof InvalidPlatformFlagError) die(err.message);
+    throw err;
+  }
+  for (const p of selection.unsupported) {
+    process.stdout.write(
+      `note: channels.${p} is configured but \`channel ${action}\` does not support it yet (slack|telegram|discord)\n`,
+    );
+  }
+
+  const dryRun = args.flags["dry-run"] === true;
+  const baseUrlFlag = args.flags["base-url"];
+  const baseUrl = typeof baseUrlFlag === "string" ? baseUrlFlag : undefined;
+  if (baseUrl !== undefined) {
+    try {
+      joinBaseUrl(baseUrl, "/");
+    } catch (err) {
+      if (err instanceof InvalidBaseUrlError) die(err.message);
+      throw err;
+    }
+  }
+  const channelReactions = ir.feedback?.channelReactions === true;
+
+  if (action === "provision") {
+    if (baseUrl === undefined) {
+      die(
+        "missing --base-url <public-url> — the daemon's publicly reachable origin (e.g. https://bot.example.com); every platform points at a route under it (slack request_url, telegram webhook url, discord interactions endpoint)",
+      );
+    }
+    const outFlag = args.flags["out"];
+    const outDir = typeof outFlag === "string" ? resolve(outFlag) : process.cwd();
+    process.stdout.write(
+      `channel provision: ${ir.name} (${selection.platforms.join(", ")})${dryRun ? " (dry run)" : ""}\n`,
+    );
+
+    for (const platform of selection.platforms) {
+      if (platform === "slack" && ir.channels.slack !== undefined) {
+        const manifest = buildSlackManifest({ name: ir.name, channelReactions }, baseUrl);
+        const manifestYaml = renderSlackManifestYaml(manifest);
+        const manifestPath = join(outDir, SLACK_MANIFEST_FILENAME);
+        process.stdout.write("\nslack:\n");
+        if (dryRun) {
+          process.stdout.write(`  would write ${manifestPath}:\n`);
+          for (const line of manifestYaml.trimEnd().split("\n")) {
+            process.stdout.write(`    ${line}\n`);
+          }
+        } else {
+          mkdirSync(outDir, { recursive: true });
+          writeFileSync(manifestPath, manifestYaml);
+          process.stdout.write(`  wrote ${manifestPath}\n`);
+        }
+        for (const line of slackNextSteps(ir.channels.slack, manifestPath)) {
+          process.stdout.write(`  ${line}\n`);
+        }
+      }
+
+      if (platform === "telegram" && ir.channels.telegram !== undefined) {
+        const provision = buildTelegramProvision(ir.channels.telegram, baseUrl, process.env);
+        process.stdout.write("\ntelegram:\n");
+        if (dryRun) {
+          process.stdout.write(`  would POST ${provision.display.endpoint}\n`);
+          process.stdout.write(`  payload: ${JSON.stringify(provision.display.payload)}\n`);
+          if (provision.missingEnv.length > 0) {
+            process.stdout.write(
+              `  note: a live run needs ${provision.missingEnv.map((m) => `$${m.envName}`).join(", ")} set\n`,
+            );
+          }
+        } else if (provision.missingEnv.length > 0) {
+          die(
+            `channel provision (telegram): unset env: ${provision.missingEnv
+              .map((m) => `${m.label} → $${m.envName}`)
+              .join(", ")} — export them (or use --dry-run to print the call)`,
+          );
+        } else {
+          try {
+            const description = await performTelegramSetWebhook(provision);
+            process.stdout.write(`  ✓ setWebhook: ${description}\n`);
+            process.stdout.write(
+              `    url ${provision.display.payload.url}, secret_token ${provision.display.payload.secret_token}, allowed_updates ${provision.display.payload.allowed_updates.join("/")}\n`,
+            );
+          } catch (err) {
+            if (err instanceof ChannelApiError) die(err.message);
+            throw err;
+          }
+        }
+      }
+
+      if (platform === "discord" && ir.channels.discord !== undefined) {
+        const provision = buildDiscordProvision(ir.channels.discord, baseUrl, process.env);
+        process.stdout.write("\ndiscord:\n");
+        if (dryRun) {
+          process.stdout.write(
+            `  would PATCH ${provision.display.endpoint} (Authorization: ${provision.display.authorization})\n`,
+          );
+          process.stdout.write(`  payload: ${JSON.stringify(provision.display.payload)}\n`);
+          process.stdout.write(
+            "  note: a live run first GETs applications/@me — a pre-existing\n" +
+              "        interactions_endpoint_url that differs from the payload above is\n" +
+              "        only replaced with --force (without it, provision refuses)\n",
+          );
+          if (provision.missingEnv.length > 0) {
+            process.stdout.write(
+              `  note: a live run needs ${provision.missingEnv.map((m) => `$${m.envName}`).join(", ")} set\n`,
+            );
+          }
+          for (const line of discordNextSteps(provision.display.inviteUrl)) {
+            process.stdout.write(`  ${line}\n`);
+          }
+        } else if (provision.missingEnv.length > 0) {
+          die(
+            `channel provision (discord): unset env: ${provision.missingEnv
+              .map((m) => `${m.label} → $${m.envName}`)
+              .join(", ")} — export them (or use --dry-run to print the call)`,
+          );
+        } else {
+          try {
+            const result = await performDiscordProvision(provision, fetch, {
+              force: args.flags["force"] === true,
+            });
+            process.stdout.write(
+              `  ✓ interactions endpoint set to ${provision.display.payload.interactions_endpoint_url}\n`,
+            );
+            if (result.replacedPrevious && result.previousEndpoint !== undefined) {
+              process.stdout.write(
+                `    replaced previous endpoint ${result.previousEndpoint} (--force)\n`,
+              );
+            }
+          } catch (err) {
+            if (err instanceof ChannelApiError) die(err.message);
+            throw err;
+          }
+          for (const line of discordNextSteps(provision.inviteUrl ?? provision.display.inviteUrl)) {
+            process.stdout.write(`  ${line}\n`);
+          }
+        }
+      }
+    }
+    return;
+  }
+
+  // action === "verify"
+  process.stdout.write(
+    `channel verify: ${ir.name} (${selection.platforms.join(", ")})${dryRun ? " (dry run)" : ""}\n`,
+  );
+  if (dryRun) {
+    for (const platform of selection.platforms) {
+      for (const line of describeVerifyProbes(platform, ir.channels, process.env)) {
+        process.stdout.write(`  ${line}\n`);
+      }
+    }
+    return;
+  }
+  const verifyOpts = {
+    env: process.env,
+    ...(baseUrl !== undefined ? { baseUrl } : {}),
+  };
+  const checks: ChannelCheck[] = [];
+  for (const platform of selection.platforms) {
+    if (platform === "slack" && ir.channels.slack !== undefined) {
+      checks.push(
+        ...(await verifySlackChannel(ir.channels.slack, { channelReactions }, verifyOpts)),
+      );
+    } else if (platform === "telegram" && ir.channels.telegram !== undefined) {
+      checks.push(...(await verifyTelegramChannel(ir.channels.telegram, verifyOpts)));
+    } else if (platform === "discord" && ir.channels.discord !== undefined) {
+      checks.push(...(await verifyDiscordChannel(ir.channels.discord, verifyOpts)));
+    }
+  }
+  const summary = summarizeChannelChecks(checks);
+  for (const line of summary.lines) {
+    process.stdout.write(`  ${line}\n`);
+  }
+  process.exit(summary.exitCode);
+}
+
 const argv = process.argv.slice(2);
 const subcommand = argv[0] ?? "";
 const rest = argv.slice(1);
@@ -5153,6 +6590,22 @@ switch (subcommand) {
   case "optimize":
     await runOptimize(parseFor(rest, OPTIMIZE_SCHEMA));
     break;
+  case "flywheel": {
+    const action = rest[0] ?? "";
+    if (action !== "init" && action !== "run") {
+      die(`flywheel action must be "init" or "run" (got "${action}")`);
+    }
+    // Mirror `run`'s policy: every structured failure in the loop (model
+    // routing, provider auth, the orchestrator, …) extends CrewhausError —
+    // route the family through die() for a clean one-liner.
+    try {
+      await runFlywheelCmd(parseFor(rest.slice(1), FLYWHEEL_SCHEMA), action);
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
+    break;
+  }
   case "doctor":
     await runDoctor(parseFor(rest, DOCTOR_SCHEMA));
     break;
@@ -5261,6 +6714,22 @@ switch (subcommand) {
       die(`retention action must be one of: sweep, export, purge (got "${action}")`);
     }
     await runRetention(parseFor(rest.slice(1), RETENTION_SCHEMA), action);
+    break;
+  }
+  case "security": {
+    const action = rest[0] ?? "";
+    if (action !== "digest") {
+      die(`security action must be "digest" (got "${action}")`);
+    }
+    await runSecurityDigest(parseFor(rest.slice(1), SECURITY_SCHEMA));
+    break;
+  }
+  case "channel": {
+    const action = rest[0] ?? "";
+    if (action !== "provision" && action !== "verify") {
+      die(`channel action must be "provision" or "verify" (got "${action}")`);
+    }
+    await runChannel(parseFor(rest.slice(1), CHANNEL_SCHEMA), action);
     break;
   }
   case "version":

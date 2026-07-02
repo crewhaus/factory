@@ -169,6 +169,9 @@ export type IrFeedback = {
   readonly scale?: { readonly min: number; readonly max: number };
   readonly storage?: { readonly location: string };
   readonly autoDistill?: boolean;
+  /** Item 1 — gate for the CLI REPL's one-keystroke exit rating prompt.
+   *  Absent → prompt (the block's presence opts in); `false` → never. */
+  readonly exitPrompt?: boolean;
   readonly channelReactions?: boolean;
 };
 
