@@ -30,7 +30,12 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
  */
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { runBrowserRuntimeSmoke, runCliRuntimeSmoke, runtimeSmokeIsEnabled } from "./runtime.js";
+import {
+  resolveSmokeModel,
+  runBrowserRuntimeSmoke,
+  runCliRuntimeSmoke,
+  runtimeSmokeIsEnabled,
+} from "./runtime.js";
 
 // ---------------------------------------------------------------------------
 // runtimeSmokeIsEnabled — pure, exported; cover every branch directly.
@@ -67,11 +72,12 @@ describe("runtimeSmokeIsEnabled", () => {
 // Shared env + spy harness.
 // ---------------------------------------------------------------------------
 
-const TOUCHED_ENV = ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"] as const;
+const TOUCHED_ENV = ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "CREWHAUS_SMOKE_MODEL"] as const;
 let savedEnv: Record<string, string | undefined> = {};
 let spawnSpy: ReturnType<typeof spyOn> | undefined;
 let serveSpy: ReturnType<typeof spyOn> | undefined;
 let capturedSpawnEnv: Record<string, string> | undefined;
+let capturedSpawnArgv: string[] | undefined;
 let capturedFetch: ((req: Request) => Response) | undefined;
 
 beforeEach(() => {
@@ -81,6 +87,7 @@ beforeEach(() => {
     delete process.env[k];
   }
   capturedSpawnEnv = undefined;
+  capturedSpawnArgv = undefined;
   capturedFetch = undefined;
 });
 
@@ -167,9 +174,10 @@ function installTimeoutKillSpawn(): { killed: () => boolean; restore: () => void
 
 function installSpawn(cfg: SpawnCfg): void {
   spawnSpy = spyOn(Bun, "spawn").mockImplementation(((
-    _cmd: unknown,
+    cmd: unknown,
     opts: unknown,
   ): ReturnType<typeof Bun.spawn> => {
+    capturedSpawnArgv = cmd as string[];
     const o = opts as { env?: Record<string, string> };
     capturedSpawnEnv = o.env;
     const sessionDir = o.env?.["CREWHAUS_SESSION_DIR"];
@@ -490,5 +498,72 @@ describe("runBrowserRuntimeSmoke", () => {
     const result = await runBrowserRuntimeSmoke();
     expect(result.finalText).toBe("GROUND_TOKEN");
     expect(result.status).toBe("failed"); // GROUND_TOKEN != the random page phrase
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolveSmokeModel + --model passthrough (item 33 — the nightly budget knob).
+// ---------------------------------------------------------------------------
+
+describe("resolveSmokeModel", () => {
+  test("returns the model when CREWHAUS_SMOKE_MODEL is set", () => {
+    expect(resolveSmokeModel({ CREWHAUS_SMOKE_MODEL: "claude-haiku-4-5-20251001" })).toBe(
+      "claude-haiku-4-5-20251001",
+    );
+  });
+
+  test("empty string behaves like unset (inert workflow env block)", () => {
+    expect(resolveSmokeModel({ CREWHAUS_SMOKE_MODEL: "" })).toBeUndefined();
+  });
+
+  test("undefined when the env var is absent", () => {
+    expect(resolveSmokeModel({})).toBeUndefined();
+  });
+
+  test("defaults to reading process.env when no arg is passed", () => {
+    // TOUCHED_ENV clears CREWHAUS_SMOKE_MODEL in beforeEach → undefined.
+    expect(resolveSmokeModel()).toBeUndefined();
+  });
+});
+
+describe("--model passthrough into `crewhaus run`", () => {
+  test("cli: CREWHAUS_SMOKE_MODEL is forwarded as --model", async () => {
+    enableAnthropic();
+    process.env["CREWHAUS_SMOKE_MODEL"] = "claude-haiku-4-5-20251001";
+    installSpawn({ exitCode: 2, jsonl: () => "" });
+    await runCliRuntimeSmoke();
+    const argv = capturedSpawnArgv ?? [];
+    const i = argv.indexOf("--model");
+    expect(i).toBeGreaterThan(-1);
+    expect(argv[i + 1]).toBe("claude-haiku-4-5-20251001");
+  });
+
+  test("cli: opts.model wins over the env knob", async () => {
+    enableAnthropic();
+    process.env["CREWHAUS_SMOKE_MODEL"] = "env-model";
+    installSpawn({ exitCode: 2, jsonl: () => "" });
+    await runCliRuntimeSmoke({ model: "opts-model" });
+    const argv = capturedSpawnArgv ?? [];
+    expect(argv[argv.indexOf("--model") + 1]).toBe("opts-model");
+  });
+
+  test("cli: no --model flag when neither opts nor env provide one", async () => {
+    enableAnthropic();
+    installSpawn({ exitCode: 2, jsonl: () => "" });
+    await runCliRuntimeSmoke();
+    expect((capturedSpawnArgv ?? []).includes("--model")).toBe(false);
+  });
+
+  test("browser: the override rides along with --prompt", async () => {
+    enableAnthropic();
+    process.env["CREWHAUS_SMOKE_MODEL"] = "claude-haiku-4-5-20251001";
+    installServe();
+    installSpawn({ exitCode: 2 });
+    await runBrowserRuntimeSmoke();
+    const argv = capturedSpawnArgv ?? [];
+    const i = argv.indexOf("--model");
+    expect(i).toBeGreaterThan(-1);
+    expect(argv[i + 1]).toBe("claude-haiku-4-5-20251001");
+    expect(argv.indexOf("--prompt")).toBeGreaterThan(i);
   });
 });

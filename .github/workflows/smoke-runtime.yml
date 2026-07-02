@@ -1,6 +1,6 @@
 name: Smoke (runtime)
 
-# Opt-in runtime smoke for the runnable target shapes (cli + browser).
+# Runtime smoke for the runnable target shapes (cli + browser).
 # Issues real Anthropic API calls and asserts each agent actually used
 # the tools it was given:
 #   - browser: agent calls Navigate + Screenshot and grounds its answer
@@ -10,16 +10,25 @@ name: Smoke (runtime)
 # Catches the "compiled + booted but didn't actually use the tools"
 # failure mode — see PR #108 for the canonical example.
 #
-# Gated on the ANTHROPIC_API_KEY repository secret existing. Forks /
-# external PRs don't get the secret, so this job is automatically a
-# no-op for them.
+# Item 33 — this runs on three triggers:
+#   - schedule: nightly, budget-capped by pinning the cheapest capable model
+#     via CREWHAUS_SMOKE_MODEL (2 runs/night; the fixtures' default models
+#     stay untouched for the other triggers), so runtime drift is caught
+#     within a day instead of at the next manual dispatch.
+#   - workflow_call: release.yml `uses:` this workflow as its publish gate —
+#     no channel ships until the runtime smoke is green for the tag.
+#   - workflow_dispatch: on demand from the Actions tab after a runtime change.
+#
+# The job requires the ANTHROPIC_API_KEY repository secret and FAILS (not
+# skips) without it (CREWHAUS_RUNTIME_SMOKE_REQUIRED=1) — an unattended
+# green must never mean "silently skipped". The `github.repository` guard
+# keeps forks (which have neither the secret nor the schedule) at no-op.
 on:
-  # Dispatch-only: this job issues real Anthropic API calls, so it runs only
-  # when explicitly requested, keeping API spend predictable and avoiding an
-  # unattended schedule that fails (not skips) whenever ANTHROPIC_API_KEY is
-  # absent. Run it from the Actions tab before a release or after a runtime
-  # change.
+  schedule:
+    # Nightly at 04:47 UTC — off the top of the hour to dodge the cron rush.
+    - cron: "47 4 * * *"
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
@@ -47,4 +56,9 @@ jobs:
           # Make the runtime tests fail (not skip) if the secret somehow
           # isn't set when this job runs.
           CREWHAUS_RUNTIME_SMOKE_REQUIRED: "1"
+          # Budget cap for the unattended nightly: pin the cheapest capable
+          # model (the harness forwards this as `crewhaus run --model`).
+          # Empty string = unset, so dispatch and release-gate runs exercise
+          # the fixtures' default models.
+          CREWHAUS_SMOKE_MODEL: ${{ github.event_name == 'schedule' && 'claude-haiku-4-5-20251001' || '' }}
         run: bun run test:smoke:runtime

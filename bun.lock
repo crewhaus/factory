@@ -64,6 +64,7 @@
         "@crewhaus/session-store": "workspace:*",
         "@crewhaus/skills-registry": "workspace:*",
         "@crewhaus/slash-commands": "workspace:*",
+        "@crewhaus/smoke-harness": "workspace:*",
         "@crewhaus/spec": "workspace:*",
         "@crewhaus/spec-patch": "workspace:*",
         "@crewhaus/spec-registry": "workspace:*",

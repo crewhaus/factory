@@ -193,6 +193,9 @@ import {
   tapSamples,
   triageFitnessSamples,
 } from "./triage";
+// CLI version resolution (embedded --define constant → package.json), shared
+// with compile-check.ts's dependency pinning.
+import { cliVersion } from "./version";
 
 /**
  * crewhaus — slice-scope CLI.
@@ -229,6 +232,10 @@ const COMPILE_SCHEMA: ParseArgsSchema = {
     // FAILS the compile.
     { name: "allow-unmarked-sinks", takesValue: false },
     { name: "no-strict-scope", takesValue: false },
+    // Item 33 — post-compile verification of the just-emitted bundle
+    // (shape assertion → bun install → credential-free liveness boot).
+    // See compile-check.ts; wired at the very end of the compile path.
+    { name: "check", takesValue: false },
     // Item 42 — README emission into the bundle is DEFAULT-ON; this is the
     // explicit opt-out for users who post-process bundles and don't want
     // the extra file.
@@ -542,6 +549,7 @@ const BUILD_IMAGE_SCHEMA: ParseArgsSchema = {
     { name: "tag", takesValue: true },
     { name: "platform", takesValue: true },
     { name: "push" },
+    { name: "no-record" },
     { name: "help", short: "h" },
   ],
 };
@@ -573,6 +581,7 @@ function usageText(): string {
     "  compile <spec.yaml> -o <out-dir>     compile a spec to a runnable bundle",
     "                                       (fails if an outward tool is left non-external — FR-002)",
     "                  [--allow-unmarked-sinks]  opt out of the external-sink scope gate",
+    "                  [--check]            verify the emitted bundle (shape assertion + install + liveness boot)",
     "  compile <spec.yaml> --emit-ir        print the lowered IR as JSON (debug)",
     "  run <spec.yaml> [--model <model>]    compile in-memory and execute the agent",
     "                  [--resume <id>]      resume a specific session (cli targets only)",
@@ -630,7 +639,9 @@ function usageText(): string {
     "  deploy promote|rollback ...          re-pin a spec for an environment (Section 28)",
     "  migrate-all --from N --to N          batch-migrate every spec in the registry",
     "  build-image <target> --tag <tag>     build the docker image for a target shape (Section 32)",
-    "       [--platform <p>] [--push]",
+    "       [--platform <p>] [--push]        (--push records the registry manifest digest in",
+    "       [--no-record]                     docker/digests.json; --no-record opts out. Local",
+    "                                         --load builds record nothing — not pullable)",
     "  cloud deploy --provider <p>          deploy a managed CrewHaus cluster (Section 32)",
     "       --region <r> [--tier <t>] [--image-tag <tag>]",
     "  cloud teardown --provider <p>        tear down a managed cluster",
@@ -678,33 +689,9 @@ function die(message: string): never {
   process.exit(1);
 }
 
-// Substituted at build time by @crewhaus/single-binary-cli's `bun build
-// --compile --define` — standalone binaries have no package.json on disk.
-declare const CREWHAUS_EMBEDDED_VERSION: string | undefined;
-
-/**
- * Resolve the CLI version string: the build-time embedded constant when this
- * is a standalone binary, else package.json. Undefined when neither source
- * is available (`version` dies on it; the backup manifest stamps "unknown").
- */
-function cliVersion(): string | undefined {
-  if (typeof CREWHAUS_EMBEDDED_VERSION === "string") return CREWHAUS_EMBEDDED_VERSION;
-  // The package ships src/ directly (bin → src/index.ts) and tsc -b also
-  // emits dist/, so resolve package.json relative to this module — one level
-  // up lands on apps/cli/package.json from either tree, and on
-  // node_modules/@crewhaus/cli/package.json when installed.
-  try {
-    return (
-      JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf-8")) as {
-        version: string;
-      }
-    ).version;
-  } catch {
-    return undefined;
-  }
-}
-
 function printVersion(): void {
+  // Resolution (embedded --define constant → apps/cli/package.json) lives in
+  // version.ts so compile-check.ts can pin dependencies to the same version.
   const version = cliVersion();
   if (version === undefined) die("could not locate package.json to determine the version");
   process.stdout.write(`${version}\n`);
@@ -722,10 +709,15 @@ function parseFor(rest: ReadonlyArray<string>, schema: ParseArgsSchema): ParsedA
 async function runCompile(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
-      "usage: crewhaus compile <spec.yaml> [-o <out-dir>] [--emit-ir]\n" +
+      "usage: crewhaus compile <spec.yaml> [-o <out-dir>] [--emit-ir] [--check]\n" +
         "                        [--allow-unmarked-sinks] [--no-readme] [--no-register]\n" +
         "  --emit-ir  Skip code emission; print the lowered IR as JSON to\n" +
         "             stdout (or to <out-dir>/ir.json when -o is set).\n" +
+        "  --check    After emitting, verify the bundle: run the target shape's\n" +
+        "             smoke assertion, `bun install` its deps in the out-dir, and\n" +
+        "             boot it once credential-free (liveness only — shapes whose\n" +
+        "             boot needs live credentials/servers degrade to a reported\n" +
+        "             gate). One green/red verdict line; red exits 1.\n" +
         "\n" +
         "  Every emitted bundle includes a generated README.md documenting\n" +
         "  the harness (name/target/model), its tools and MCP servers, the\n" +
@@ -766,6 +758,8 @@ async function runCompile(args: ParsedArgs): Promise<void> {
   const specPath = args.positional[0];
   const outDir = args.flags["out"];
   const emitIr = args.flags["emit-ir"] === true;
+  const check = args.flags["check"] === true;
+  if (check && emitIr) die("--check verifies emitted files — it cannot combine with --emit-ir");
   // FR-002 — the strict scope gate is DEFAULT-ON. It runs unless the user
   // explicitly opts out with --allow-unmarked-sinks (or its alias
   // --no-strict-scope). `--strict` is now a no-op kept for back-compat.
@@ -885,6 +879,23 @@ async function runCompile(args: ParsedArgs): Promise<void> {
   // registers.
   if (register) await autoRegisterSpec(yamlText);
   logger.debug("compile.success", { files: bundle.files.length, out: absOut });
+
+  // Item 33 — `--check`: verify the just-emitted bundle. Wired at the very
+  // end of the compile path so a plain compile is byte-for-byte unaffected.
+  if (check) {
+    const { runCompileCheck } = await import("./compile-check");
+    // compile() already succeeded, so lowering again for the target
+    // discriminator cannot throw here.
+    const target = lower(parseSpec(yamlText)).target;
+    const result = await runCompileCheck({ target, bundle, outDir: absOut });
+    for (const step of result.steps) {
+      if (step.status === "failed" && step.detail !== undefined) {
+        process.stderr.write(`crewhaus: [check] ${step.step}: ${step.detail}\n`);
+      }
+    }
+    process.stdout.write(`${result.line}\n`);
+    if (!result.green) process.exit(1);
+  }
 }
 
 /**
@@ -4046,9 +4057,14 @@ async function runMigrateAll(args: ParsedArgs): Promise<void> {
 }
 
 /**
- * Section 32 — `crewhaus build-image <target> --tag <tag> [--platform <p>] [--push]`.
+ * Section 32 — `crewhaus build-image <target> --tag <tag> [--platform <p>] [--push] [--no-record]`.
  * Wraps `docker buildx build` for the per-target Dockerfiles in
- * @crewhaus/docker-images.
+ * @crewhaus/docker-images. Item 47: after a successful PUSHED build the
+ * image's registry manifest digest is recorded in docker/digests.json by
+ * default (the maintenance the lockfile header always promised);
+ * `--no-record` opts out. A local `--load` build records nothing — its image
+ * ID is a config digest that `docker pull repo@sha256:…` cannot resolve, so
+ * the CLI says so instead of writing an unpullable pin.
  */
 async function runBuildImage(rest: ReadonlyArray<string>): Promise<void> {
   const positional: string[] = [];
@@ -4058,12 +4074,17 @@ async function runBuildImage(rest: ReadonlyArray<string>): Promise<void> {
     if (a === undefined) continue;
     if (a === "--help" || a === "-h") {
       process.stdout.write(
-        "usage: crewhaus build-image <target> --tag <tag> [--platform <p>] [--push]\n",
+        "usage: crewhaus build-image <target> --tag <tag> [--platform <p>] [--push] [--no-record]\n" +
+          "  --push       push to the registry and record the pushed image's registry\n" +
+          "               manifest digest into docker/digests.json (the only pullable pin)\n" +
+          "  --no-record  skip recording the pushed image's digest into docker/digests.json\n" +
+          "  Local (--load) builds record nothing: a local image ID is a config digest,\n" +
+          "  not a registry digest — `docker pull repo@<id>` would fail.\n",
       );
       return;
     }
-    if (a === "--push") {
-      flags.set("push", true);
+    if (a === "--push" || a === "--no-record") {
+      flags.set(a.slice(2), true);
       continue;
     }
     if (a === "--tag" || a === "--platform") {
@@ -4081,19 +4102,39 @@ async function runBuildImage(rest: ReadonlyArray<string>): Promise<void> {
   if (typeof tag !== "string") die("missing --tag <tag>");
   const platform = flags.get("platform");
   const push = flags.get("push") === true;
+  const record = flags.get("no-record") !== true;
 
-  const { buildImage, isTargetShape } = await import("@crewhaus/docker-images");
+  const { buildImageAndRecord, digestsPath, isTargetShape } = await import(
+    "@crewhaus/docker-images"
+  );
   if (!isTargetShape(target)) {
     die(`unknown target shape: ${target}`);
   }
   try {
-    const result = await buildImage({
+    const result = await buildImageAndRecord({
       target,
       tag,
       platform: typeof platform === "string" ? platform : undefined,
       push,
+      record,
     });
     process.stdout.write(`built crewhaus/${result.target}:${result.tag}\n`);
+    if (result.recorded && result.digest !== undefined) {
+      process.stdout.write(
+        `recorded ${result.digest} for ${result.target}:${result.tag} → ${digestsPath()}\n`,
+      );
+    } else if (record && result.recordSkippedReason !== undefined) {
+      // Informational, not a warning: a --load build has no pullable digest
+      // to record, and pretending otherwise is the exact lie item 47 retires.
+      process.stdout.write(`crewhaus: [build-image] ${result.recordSkippedReason}\n`);
+    } else if (record && result.recordError !== undefined) {
+      // The image exists; a failed digest lookup/record must not fail the
+      // build — but a silently stale lockfile is the exact lie item 47
+      // retires, so say it out loud.
+      process.stderr.write(
+        `crewhaus: warning: image built but its digest was not recorded: ${result.recordError}\n`,
+      );
+    }
   } catch (err) {
     die(`build-image: ${(err as Error).message}`);
   }
