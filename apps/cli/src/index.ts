@@ -1,8 +1,15 @@
 #!/usr/bin/env bun
 import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
-import { basename, dirname, join, relative, resolve } from "node:path";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  writeFileSync,
+} from "node:fs";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { SubAgentDefinition } from "@crewhaus/agent-context-isolation";
 import { SpecParseError, compile, lower } from "@crewhaus/compiler";
 import { buildContextBundle, discoverRoots } from "@crewhaus/context-bundle";
@@ -1065,6 +1072,34 @@ async function runStrictScopeGate(yamlText: string): Promise<void> {
   }
 }
 
+/**
+ * Finding 7 — GitHub only reads workflows from `.github/workflows` at the
+ * REPO ROOT; a scaffold written inside a nested harness dir never runs.
+ * Resolve where a scaffolded workflow must land: the git toplevel of
+ * `harnessAbsDir` when it is inside a work tree, else `fallbackRoot` (the
+ * cwd — no repo exists yet, so the user's `git init` will land there).
+ * `harnessDir` is the harness's root-relative POSIX path ("" = the harness
+ * IS the root) for the workflow's `defaults.run.working-directory`.
+ */
+function resolveWorkflowRoot(
+  harnessAbsDir: string,
+  fallbackRoot: string,
+): { root: string; harnessDir: string } {
+  const top = spawnSync("git", ["-C", harnessAbsDir, "rev-parse", "--show-toplevel"], {
+    encoding: "utf-8",
+  });
+  const toplevel = top.status === 0 ? top.stdout.trim() : "";
+  // realpath both sides so symlinked paths (macOS /tmp → /private/tmp) do
+  // not derail the relative() computation against git's resolved toplevel.
+  const root = toplevel !== "" ? toplevel : realpathSync(fallbackRoot);
+  const rel = relative(root, realpathSync(harnessAbsDir));
+  if (rel === "" || rel === ".") return { root, harnessDir: "" };
+  // A harness outside the resolved root (odd, but possible with an absolute
+  // [name] arg) scaffolds beside itself rather than inventing a prefix.
+  if (rel.startsWith("..") || isAbsolute(rel)) return { root: harnessAbsDir, harnessDir: "" };
+  return { root, harnessDir: rel.split(sep).join("/") };
+}
+
 function runInit(args: ParsedArgs): void {
   if (args.flags["help"]) {
     process.stdout.write(
@@ -1076,6 +1111,9 @@ function runInit(args: ParsedArgs): void {
         "           table as a PR comment, and fail the check on `eval --gate` failure\n" +
         "           (any pass-rate drop or per-sample pass→fail flip). In a directory\n" +
         "           that already has a crewhaus.yaml, `init --ci` adds just the workflow.\n" +
+        "           The workflow is written to .github/workflows at the GIT REPO ROOT\n" +
+        "           (GitHub only reads it there); for a harness in a subdirectory its\n" +
+        "           working-directory and paths filter point back at the harness.\n" +
         "  --force  Overwrite an existing scaffolded workflow (never the spec).\n",
     );
     return;
@@ -1107,20 +1145,29 @@ agent:
   }
 
   if (ci) {
-    // Item 44 — the eval-on-PR CI gate. The workflow lands beside the spec;
-    // it belongs at the repo root (GitHub only reads .github/workflows
-    // there) — the scaffold's comments cover the nested-harness case.
+    // Item 44 — the eval-on-PR CI gate. Finding 7: GitHub only reads
+    // .github/workflows at the REPO ROOT, so the workflow lands there (git
+    // toplevel, cwd fallback), with its working-directory/paths filter
+    // pointed back at the harness when the spec lives in a subdirectory.
     try {
+      const { root: wfRoot, harnessDir } = resolveWorkflowRoot(targetDir, process.cwd());
       const scaffolded = scaffoldWorkflowFile({
-        rootDir: targetDir,
+        rootDir: wfRoot,
         relPath: EVAL_CI_WORKFLOW_RELPATH,
-        content: buildEvalCiWorkflowYaml(),
+        content: buildEvalCiWorkflowYaml({ harnessDir }),
         force: args.flags["force"] === true,
       });
       process.stdout.write(`wrote ${scaffolded.path}\n`);
+      if (harnessDir !== "") {
+        process.stdout.write(
+          `    (workflow written at the repo root, not in ${harnessDir}/ — GitHub only reads\n` +
+            `    .github/workflows there; its working-directory and paths filter point at ${harnessDir}/)\n`,
+        );
+      }
+      const filterBase = harnessDir === "" ? "" : `${harnessDir}/`;
       process.stdout.write(
-        "ci: set the ANTHROPIC_API_KEY repo secret; PRs touching crewhaus.yaml or eval/**\n" +
-          "    are then evaled against the base branch and gated on regressions.\n",
+        `ci: set the ANTHROPIC_API_KEY repo secret; PRs touching ${filterBase}crewhaus.yaml or\n` +
+          `    ${filterBase}eval/** are then evaled against the base branch and gated on regressions.\n`,
       );
     } catch (err) {
       if (err instanceof FlywheelConfigError) die(err.message);
@@ -2559,7 +2606,7 @@ function gitSpecStatus(absSpec: string): { inRepo: boolean; dirty: boolean } {
 async function runFlywheelCmd(args: ParsedArgs, action: "init" | "run"): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
-      `usage:\n  crewhaus flywheel run [spec.yaml] [--dataset <data>] [--graders <graders.yaml>]\n      [--budget-usd N] [--iterations N] [--seed N] [--concurrency N]\n      [--mutator rule-based|claude] [--dry-run] [--allow-dirty]\n  crewhaus flywheel init [--force]\n\n  \`run\` executes the nightly self-improvement loop in one command:\n  compile gate → baseline eval → optimize (budget-capped; claude mutator\n  by default when an ANTHROPIC credential is present, rule-based fallback\n  otherwise) → post-patch compile → after eval → acceptance gate. The\n  patch is applied to the spec ONLY when pass_rate strictly improved with\n  zero per-sample regressions (the same strict gate \`eval --gate\` uses);\n  an accepted write-back then runs the standard auto-register + changelog\n  + regression-pin flow. A rejected patch never touches disk. --dry-run\n  runs everything but never writes.\n\n  Defaults: <spec> is ./crewhaus.yaml; --dataset falls back to\n  ${CONVENTIONAL_DATASET} then registry:<spec>-ratings (when the spec has a\n  feedback: block and ratings were distilled); --graders falls back to\n  ${CONVENTIONAL_GRADERS}. The optimizer only ever rewrites agent.instructions\n  (OPTIMIZABLE_PATHS) — permissions: stay exactly as a human reviewed them.\n  The flywheel refuses to run over uncommitted spec changes (--allow-dirty\n  opts out).\n\n  \`init\` scaffolds .github/workflows/crewhaus-flywheel.yml: nightly cron +\n  workflow_dispatch, budget knobs as env, PR creation via gh for HUMAN\n  review — the workflow never merges on its own. Refuses to overwrite an\n  existing workflow without --force.\n\n${formatFlywheelKnobsGuide()
+      `usage:\n  crewhaus flywheel run [spec.yaml] [--dataset <data>] [--graders <graders.yaml>]\n      [--budget-usd N] [--iterations N] [--seed N] [--concurrency N]\n      [--mutator rule-based|claude] [--dry-run] [--allow-dirty]\n  crewhaus flywheel init [--force]\n\n  \`run\` executes the nightly self-improvement loop in one command:\n  compile gate → baseline eval → optimize (budget-capped; claude mutator\n  by default when an ANTHROPIC credential is present, rule-based fallback\n  otherwise) → post-patch compile → after eval → acceptance gate. The\n  patch is applied to the spec ONLY when pass_rate strictly improved with\n  zero per-sample regressions (the same strict gate \`eval --gate\` uses);\n  an accepted write-back then runs the standard auto-register + changelog\n  + regression-pin flow. A rejected patch never touches disk. --dry-run\n  runs everything but never writes.\n\n  Defaults: <spec> is ./crewhaus.yaml; --dataset falls back to\n  ${CONVENTIONAL_DATASET} then registry:<spec>-ratings (when the spec has a\n  feedback: block and ratings were distilled); --graders falls back to\n  ${CONVENTIONAL_GRADERS}; conventional paths resolve from the SPEC's directory,\n  not the cwd, so a spec passed by path brings its own eval/ files. When the\n  dataset is a registry ref (including the ratings fallback), the before/after\n  acceptance evals run over ALL splits — test included — matching \`eval\`'s\n  registry semantics; per-split acceptance gating is a future knob. The\n  optimizer only ever rewrites agent.instructions (OPTIMIZABLE_PATHS) —\n  permissions: stay exactly as a human reviewed them. The flywheel refuses to\n  run over uncommitted spec changes (--allow-dirty opts out).\n\n  \`init\` scaffolds .github/workflows/crewhaus-flywheel.yml: nightly cron +\n  workflow_dispatch, budget knobs as env, PR creation via gh for HUMAN\n  review — the workflow never merges on its own. Refuses to overwrite an\n  existing workflow without --force.\n\n${formatFlywheelKnobsGuide()
         .map((l) => `  ${l}`)
         .join("\n")}\n`,
     );
@@ -2573,12 +2620,17 @@ async function runFlywheelCmd(args: ParsedArgs, action: "init" | "run"): Promise
 }
 
 function runFlywheelInit(args: ParsedArgs): void {
+  // Finding 7: GitHub only reads .github/workflows at the REPO ROOT — write
+  // there (git toplevel, cwd fallback) and point the workflow's
+  // working-directory (and its root-anchored artifact path) back at the
+  // harness when it lives in a subdirectory.
+  const { root: wfRoot, harnessDir } = resolveWorkflowRoot(process.cwd(), process.cwd());
   let scaffolded: ReturnType<typeof scaffoldWorkflowFile>;
   try {
     scaffolded = scaffoldWorkflowFile({
-      rootDir: process.cwd(),
+      rootDir: wfRoot,
       relPath: FLYWHEEL_WORKFLOW_RELPATH,
-      content: buildFlywheelWorkflowYaml(),
+      content: buildFlywheelWorkflowYaml({ harnessDir }),
       force: args.flags["force"] === true,
     });
   } catch (err) {
@@ -2586,6 +2638,12 @@ function runFlywheelInit(args: ParsedArgs): void {
     throw err;
   }
   process.stdout.write(`wrote ${scaffolded.path}\n`);
+  if (harnessDir !== "") {
+    process.stdout.write(
+      `    (workflow written at the repo root, not in ${harnessDir}/ — GitHub only reads\n` +
+        `    .github/workflows there; its working-directory and artifact path point at ${harnessDir}/)\n`,
+    );
+  }
   for (const line of formatFlywheelKnobsGuide()) process.stdout.write(`${line}\n`);
   process.stdout.write(
     "next: commit the workflow and set the ANTHROPIC_API_KEY + FLYWHEEL_GH_TOKEN repo\n" +
@@ -2641,9 +2699,11 @@ async function runFlywheelRun(args: ParsedArgs): Promise<void> {
 
   // Dataset/graders defaults: flag > standalone-harness convention >
   // (dataset only) the `<spec>-ratings` registry dataset the feedback
-  // flywheel feeds. The spec dir is the base for the conventional paths —
-  // the CLI resolves everything from the cwd per the harness convention,
-  // but a spec passed by path keeps working.
+  // flywheel feeds. Conventional paths resolve from the SPEC's directory
+  // (matching the dirty-check's spec-dir behavior), so a spec passed by
+  // path from a sibling dir finds its own eval/ files; --dataset/--graders
+  // flag paths stay cwd-relative, per the harness convention.
+  const specDir = dirname(absSpec);
   const registry = createFileBackedRegistry({ rootDir: defaultDatasetsRoot() });
   let ratingsRegistered = false;
   const ratingsName = `${ir.name}-ratings`;
@@ -2662,8 +2722,9 @@ async function runFlywheelRun(args: ParsedArgs): Promise<void> {
       ...(datasetFlag !== undefined ? { datasetFlag } : {}),
       ...(gradersFlag !== undefined ? { gradersFlag } : {}),
       specName: ir.name,
-      hasConventionalDataset: existsSync(resolve(CONVENTIONAL_DATASET)),
-      hasConventionalGraders: existsSync(resolve(CONVENTIONAL_GRADERS)),
+      specDir,
+      hasConventionalDataset: existsSync(join(specDir, CONVENTIONAL_DATASET)),
+      hasConventionalGraders: existsSync(join(specDir, CONVENTIONAL_GRADERS)),
       ratingsRegistered,
     });
   } catch (err) {

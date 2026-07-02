@@ -4,7 +4,7 @@
  * no LLM/credentials needed), the report, and the workflow scaffold.
  */
 import { afterAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { EvalRunSummary, SampleResult } from "@crewhaus/eval-runner";
@@ -20,6 +20,7 @@ import {
   evaluateFlywheelAcceptance,
   formatFlywheelKnobsGuide,
   formatFlywheelReport,
+  normalizeHarnessDir,
   resolveFlywheelData,
   resolveFlywheelKnobs,
   runFlywheelLoop,
@@ -171,6 +172,10 @@ describe("resolveFlywheelKnobs", () => {
   test.each([
     [{ "budget-usd": "0" }, "--budget-usd"],
     [{ "budget-usd": "nope" }, "--budget-usd"],
+    // H3 — strict float parsing: parseFloat would silently truncate "2abc"
+    // to 2 and Number would accept "Infinity"; both must reject.
+    [{ "budget-usd": "2abc" }, "--budget-usd"],
+    [{ "budget-usd": "Infinity" }, "--budget-usd"],
     [{ iterations: "0" }, "--iterations"],
     [{ iterations: "2.5" }, "--iterations"],
     [{ concurrency: "-1" }, "--concurrency"],
@@ -178,6 +183,15 @@ describe("resolveFlywheelKnobs", () => {
   ])("invalid flag %j throws naming the flag", (flags, expected) => {
     expect(() => resolveFlywheelKnobs({ flags, env: {} })).toThrow(expected);
   });
+
+  test.each([["2abc"], ["Infinity"], ["-Infinity"], ["NaN"]])(
+    "budget %s rejects with FlywheelConfigError (fail-closed parsing)",
+    (bad) => {
+      expect(() => resolveFlywheelKnobs({ flags: { "budget-usd": bad }, env: {} })).toThrow(
+        FlywheelConfigError,
+      );
+    },
+  );
 
   test("invalid env value throws naming the env knob", () => {
     expect(() =>
@@ -191,6 +205,7 @@ describe("resolveFlywheelKnobs", () => {
 describe("resolveFlywheelData", () => {
   const base = {
     specName: "concierge",
+    specDir: ".",
     hasConventionalDataset: false,
     hasConventionalGraders: false,
     ratingsRegistered: false,
@@ -223,6 +238,30 @@ describe("resolveFlywheelData", () => {
     expect(r.dataset).toBe(CONVENTIONAL_DATASET);
     expect(r.graders).toBe(CONVENTIONAL_GRADERS);
     expect(r.datasetSource).toBe("convention");
+  });
+
+  test("H4 — conventional paths resolve from the SPEC's directory, not the cwd", () => {
+    const r = resolveFlywheelData({
+      ...base,
+      specDir: join("/repo", "agents", "concierge"),
+      hasConventionalDataset: true,
+      hasConventionalGraders: true,
+    });
+    expect(r.dataset).toBe(join("/repo", "agents", "concierge", CONVENTIONAL_DATASET));
+    expect(r.graders).toBe(join("/repo", "agents", "concierge", CONVENTIONAL_GRADERS));
+    expect(r.datasetSource).toBe("convention");
+    expect(r.gradersSource).toBe("convention");
+  });
+
+  test("H4 — flag paths are NOT rebased onto the spec dir (cwd-relative)", () => {
+    const r = resolveFlywheelData({
+      ...base,
+      specDir: "/repo/agents/concierge",
+      datasetFlag: "my.jsonl",
+      gradersFlag: "g.yaml",
+    });
+    expect(r.dataset).toBe("my.jsonl");
+    expect(r.graders).toBe("g.yaml");
   });
 
   test("feedback ratings registry backs the dataset when no file exists", () => {
@@ -290,6 +329,28 @@ describe("evaluateFlywheelAcceptance", () => {
     const v = evaluateFlywheelAcceptance(before, after);
     expect(v.accepted).toBe(false);
     expect(v.regressions).toBe(1);
+  });
+
+  test("H1 — NaN→NaN pass rates REJECT fail-closed (0-sample runs must never auto-accept)", () => {
+    // 0/0 samples → passRate NaN on both sides. NaN satisfies neither
+    // `<=` nor `>`, so the old `after <= before → reject` form ACCEPTED
+    // this pair; the fail-closed gate must reject it with a clear reason.
+    const before = makeSummary("r1", []);
+    const after = makeSummary("r2", []);
+    expect(Number.isNaN(before.aggregates.passRate)).toBe(true);
+    expect(Number.isNaN(after.aggregates.passRate)).toBe(true);
+    const v = evaluateFlywheelAcceptance(before, after);
+    expect(v.accepted).toBe(false);
+    expect(v.reason).toContain("fail-closed");
+    expect(v.reason).toContain("NaN");
+  });
+
+  test("H1 — a one-sided NaN pass rate also rejects", () => {
+    const before = makeSummary("r1", [makeSample("a", false, 0)]);
+    const after = makeSummary("r2", []);
+    const v = evaluateFlywheelAcceptance(before, after);
+    expect(v.accepted).toBe(false);
+    expect(v.reason).toContain("fail-closed");
   });
 
   test("rejects a net improvement that hides a sample regression", () => {
@@ -431,7 +492,8 @@ describe("formatFlywheelReport", () => {
     const text = lines.join("\n");
     expect(text).toContain("pass_rate: 50.0% → 100.0%");
     expect(text).toContain("1 recovered / 0 regressed");
-    expect(text).toContain("spend $0.0000 (budget $2.00)");
+    // H3 — the budget meters only the optimizer; the report line says so.
+    expect(text).toContain("optimizer spend $0.0000 (optimizer budget $2.00)");
     expect(text).toContain("ACCEPTED");
     expect(text).toContain("artifacts: /tmp/fly");
     expect(lines.length).toBeLessThanOrEqual(12);
@@ -490,13 +552,31 @@ describe("scaffoldWorkflowFile", () => {
   });
 });
 
+describe("normalizeHarnessDir", () => {
+  test.each([
+    [undefined, ""],
+    ["", ""],
+    [".", ""],
+    ["./", ""],
+    ["agents/concierge", "agents/concierge"],
+    ["agents/concierge/", "agents/concierge"],
+    ["./agents/concierge", "agents/concierge"],
+    ["agents\\concierge", "agents/concierge"],
+  ])("%j → %j", (input, expected) => {
+    expect(normalizeHarnessDir(input)).toBe(expected);
+  });
+});
+
 describe("buildFlywheelWorkflowYaml", () => {
   const yaml = buildFlywheelWorkflowYaml();
 
   test("nightly cron + manual dispatch with budget knobs", () => {
     expect(yaml).toContain('cron: "13 7 * * *"');
     expect(yaml).toContain("workflow_dispatch:");
-    expect(yaml).toContain("budget_usd:");
+    // H3 — the input is named for what it meters (optimizer mutation calls
+    // only); eval spend is billed outside it and the description says so.
+    expect(yaml).toContain("optimizer_budget_usd:");
+    expect(yaml).toContain("eval spend is billed separately");
     expect(yaml).toContain("iterations:");
   });
 
@@ -504,7 +584,21 @@ describe("buildFlywheelWorkflowYaml", () => {
     for (const knob of Object.values(FLYWHEEL_ENV_KNOBS)) {
       expect(yaml).toContain(`${knob}:`);
     }
+    // H3 — the demo-continuity env name maps from the renamed input.
+    expect(yaml).toContain(
+      "FLYWHEEL_BUDGET_USD: ${{ github.event.inputs.optimizer_budget_usd || '2.00' }}",
+    );
     expect(yaml).toContain("crewhaus flywheel run");
+  });
+
+  test("H5 — harnessDir points working-directory AND the artifact path at the subdir", () => {
+    const nested = buildFlywheelWorkflowYaml({ harnessDir: "agents/concierge" });
+    expect(nested).toContain("working-directory: agents/concierge");
+    // actions paths don't honor working-directory — must be prefixed.
+    expect(nested).toContain("path: agents/concierge/.crewhaus/flywheel/");
+    // Root scaffold stays unprefixed with no working-directory override.
+    expect(yaml).not.toContain("working-directory:");
+    expect(yaml).toContain("path: .crewhaus/flywheel/");
   });
 
   test("opens a PR via gh and NEVER auto-merges", () => {
@@ -530,6 +624,12 @@ describe("formatFlywheelKnobsGuide", () => {
     const text = formatFlywheelKnobsGuide().join("\n");
     for (const knob of Object.values(FLYWHEEL_ENV_KNOBS)) expect(text).toContain(knob);
     expect(text).toContain("2.00");
+  });
+
+  test("H3 — says eval spend is NOT metered by the optimizer budget", () => {
+    const text = formatFlywheelKnobsGuide().join("\n");
+    expect(text).toContain("ONLY the optimizer's mutation model calls");
+    expect(text).toContain("NOT metered by this budget");
   });
 });
 
@@ -576,6 +676,25 @@ describe("crewhaus flywheel (CLI surface)", () => {
     expect(forced.exitCode).toBe(0);
   });
 
+  test("H5 — flywheel init from a repo subdir writes the workflow at the REPO ROOT", async () => {
+    const root = newTempRoot();
+    Bun.spawnSync(["git", "-C", root, "init", "-q"]);
+    const harness = join(root, "agents", "concierge");
+    mkdirSync(harness, { recursive: true });
+
+    const res = await runCli(["flywheel", "init"], harness);
+    expect(res.exitCode).toBe(0);
+    // GitHub only reads .github/workflows at the repo root — nothing may
+    // land inside the harness dir.
+    expect(existsSync(join(root, ".github", "workflows", "crewhaus-flywheel.yml"))).toBe(true);
+    expect(existsSync(join(harness, ".github"))).toBe(false);
+    expect(res.stdout).toContain("repo root");
+
+    const wf = readFileSync(join(root, ".github", "workflows", "crewhaus-flywheel.yml"), "utf-8");
+    expect(wf).toContain("working-directory: agents/concierge");
+    expect(wf).toContain("path: agents/concierge/.crewhaus/flywheel/");
+  });
+
   test("unknown action dies with the allowed set", async () => {
     const root = newTempRoot();
     const res = await runCli(["flywheel", "spin"], root);
@@ -619,6 +738,29 @@ describe("crewhaus flywheel (CLI surface)", () => {
     expect(res.stderr).toContain("spec not found");
   });
 
+  test("H4 — conventional dataset/graders are found beside a spec in a sibling dir", async () => {
+    const root = newTempRoot();
+    const harness = join(root, "harness");
+    mkdirSync(join(harness, "eval"), { recursive: true });
+    writeFileSync(
+      join(harness, "crewhaus.yaml"),
+      "name: hello\ntarget: cli\nagent:\n  model: m\n  instructions: hi\n",
+    );
+    // Zero samples → a deterministic die that happens strictly AFTER data
+    // resolution (and before anything paid), proving the conventional files
+    // were found relative to the SPEC dir, not the cwd (which has no eval/).
+    writeFileSync(join(harness, "eval", "dataset.jsonl"), "");
+    writeFileSync(
+      join(harness, "eval", "graders.yaml"),
+      "graders:\n  - name: g\n    type: contains\n    substring: 'x'\n",
+    );
+
+    const res = await runCli(["flywheel", "run", join("harness", "crewhaus.yaml")], root);
+    expect(res.exitCode).toBe(1);
+    expect(res.stderr).not.toContain("no dataset");
+    expect(res.stderr).toContain("zero samples");
+  });
+
   test("flywheel --help documents the loop, the knobs, and the invariants", async () => {
     const root = newTempRoot();
     const res = await runCli(["flywheel", "run", "--help"], root);
@@ -627,5 +769,10 @@ describe("crewhaus flywheel (CLI surface)", () => {
     expect(res.stdout).toContain("FLYWHEEL_BUDGET_USD");
     expect(res.stdout).toContain("--dry-run");
     expect(res.stdout).toContain("permissions");
+    // H3 — budget scope honesty (evals are billed outside the budget).
+    expect(res.stdout).toContain("NOT metered by this budget");
+    // H6 — registry-ratings acceptance evals span every split, test included.
+    expect(res.stdout).toContain("ALL splits");
+    expect(res.stdout).toContain("per-split acceptance gating is a future knob");
   });
 });

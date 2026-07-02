@@ -76,9 +76,12 @@ type KnobSpec = {
 };
 
 function parsePositiveFloat(raw: string, source: string): number {
-  const n = Number.parseFloat(raw);
-  if (Number.isNaN(n) || n <= 0) {
-    throw new FlywheelConfigError(`invalid ${source} "${raw}" — must be a positive number`);
+  // Number() instead of parseFloat() so trailing garbage ("2abc") is
+  // rejected instead of silently truncated, plus an explicit finite check
+  // so "Infinity" (a valid Number) can never become a budget.
+  const n = Number(raw.trim());
+  if (raw.trim() === "" || !Number.isFinite(n) || n <= 0) {
+    throw new FlywheelConfigError(`invalid ${source} "${raw}" — must be a positive finite number`);
   }
   return n;
 }
@@ -163,7 +166,10 @@ export const CONVENTIONAL_GRADERS = join("eval", "graders.yaml");
 /**
  * Resolve where the flywheel's dataset + graders come from when the flags
  * are omitted: the standalone-harness convention (`eval/dataset.jsonl` /
- * `eval/graders.yaml` beside the spec), and — when the spec declares a
+ * `eval/graders.yaml` beside the SPEC — resolved from the spec's directory,
+ * matching the dirty-check's spec-dir behavior, so `flywheel run
+ * path/to/crewhaus.yaml` from a sibling dir still finds the harness's own
+ * files; flag paths stay cwd-relative), and — when the spec declares a
  * `feedback:` block and ratings have been distilled into the registry —
  * the `registry:<spec>-ratings` dataset the autoDistill flywheel feeds.
  */
@@ -171,6 +177,8 @@ export function resolveFlywheelData(opts: {
   readonly datasetFlag?: string;
   readonly gradersFlag?: string;
   readonly specName: string;
+  /** Directory the spec lives in — the base for the conventional paths. */
+  readonly specDir: string;
   readonly hasConventionalDataset: boolean;
   readonly hasConventionalGraders: boolean;
   /** `registry:<specName>-ratings` has at least one version. */
@@ -182,7 +190,7 @@ export function resolveFlywheelData(opts: {
     dataset = opts.datasetFlag;
     datasetSource = "flag";
   } else if (opts.hasConventionalDataset) {
-    dataset = CONVENTIONAL_DATASET;
+    dataset = join(opts.specDir, CONVENTIONAL_DATASET);
     datasetSource = "convention";
   } else if (opts.ratingsRegistered) {
     dataset = `registry:${opts.specName}-ratings`;
@@ -200,7 +208,7 @@ export function resolveFlywheelData(opts: {
     graders = opts.gradersFlag;
     gradersSource = "flag";
   } else if (opts.hasConventionalGraders) {
-    graders = CONVENTIONAL_GRADERS;
+    graders = join(opts.specDir, CONVENTIONAL_GRADERS);
     gradersSource = "convention";
   } else {
     throw new FlywheelConfigError(
@@ -252,10 +260,25 @@ export function evaluateFlywheelAcceptance(
     regressions: verdict.report.regressions.length,
     recoveries: verdict.report.recoveries.length,
   };
+  // Fail closed on incomparable pass rates: a NaN/undefined rate (e.g. a
+  // 0-sample run) satisfies neither `<=` nor `>`, so a strictly-up check
+  // written as `after <= before → reject` would ACCEPT it. Reject
+  // explicitly before any comparison runs.
+  if (!Number.isFinite(passRateBefore) || !Number.isFinite(passRateAfter)) {
+    return {
+      accepted: false,
+      reason:
+        `pass_rate not comparable (before=${String(passRateBefore)}, ` +
+        `after=${String(passRateAfter)}) — rejecting fail-closed`,
+      ...base,
+    };
+  }
   if (verdict.verdict === "fail") {
     return { accepted: false, reason: verdict.reason ?? "regression gate failed", ...base };
   }
-  if (passRateAfter <= passRateBefore) {
+  // Fail-closed form: only a provable strict improvement accepts — any
+  // non-ordered pair (including NaN, belt to the check above) rejects.
+  if (!(passRateAfter > passRateBefore)) {
     return {
       accepted: false,
       reason:
@@ -425,9 +448,12 @@ export function formatFlywheelReport(
     );
   }
   if (result.optimize !== undefined) {
+    // "optimizer spend/budget", not just "spend/budget": the budget meters
+    // ONLY the optimizer's mutation model calls — eval spend (before/after
+    // acceptance evals + per-iteration fitness evals) bills outside it.
     lines.push(
       `optimizer: ${result.optimize.mutatorName} · ${result.optimize.iterations} iteration(s) · ` +
-        `spend ${result.optimize.spendUsd} (budget $${extras.budgetUsd.toFixed(2)})`,
+        `optimizer spend ${result.optimize.spendUsd} (optimizer budget $${extras.budgetUsd.toFixed(2)})`,
     );
   }
   const verdictLabel: Record<FlywheelOutcome, string> = {
@@ -471,14 +497,46 @@ export function scaffoldWorkflowFile(opts: {
 }
 
 /**
+ * Normalize a repo-root-relative harness dir for embedding in a scaffolded
+ * workflow: POSIX separators, no leading `./`, no trailing slash; "" means
+ * the harness IS the repo root. Shared by both workflow builders.
+ */
+export function normalizeHarnessDir(dir: string | undefined): string {
+  if (dir === undefined) return "";
+  const cleaned = dir.replace(/\\/g, "/").replace(/\/+$/, "").replace(/^\.\//, "");
+  return cleaned === "." ? "" : cleaned;
+}
+
+/**
  * The GitHub Actions schedule, adapted from the EP01 demo's
  * `concierge-flywheel.yml`: nightly cron + manual dispatch, budget knobs as
  * FLYWHEEL_* env, PR creation via `gh` for HUMAN review. It never merges on
  * its own, and `crewhaus flywheel run` never writes an unaccepted patch, so
  * every change that reaches the default branch passed both the acceptance
  * gate and a human.
+ *
+ * `harnessDir` (repo-root-relative, "" = root) points the job's
+ * working-directory at a nested harness AND prefixes the artifact upload
+ * `path:` — actions paths resolve from the repo root and do NOT honor
+ * `defaults.run.working-directory` (finding 7).
  */
-export function buildFlywheelWorkflowYaml(): string {
+export function buildFlywheelWorkflowYaml(opts: { readonly harnessDir?: string } = {}): string {
+  const sub = normalizeHarnessDir(opts.harnessDir);
+  const prefix = sub === "" ? "" : `${sub}/`;
+  const workingDirLine = sub === "" ? "" : `\n        working-directory: ${sub}`;
+  const subdirNote =
+    sub === ""
+      ? `# If your harness lives in a subdirectory, re-run \`crewhaus flywheel init\`
+# from inside it (the CLI detects the git root and prefixes everything), or
+# hand-set jobs.flywheel.defaults.run.working-directory AND prefix the
+# artifact upload path: — actions paths resolve from the repo root and do
+# NOT honor working-directory. The CLI resolves the spec, dataset, graders,
+# and .crewhaus state from the working directory (standalone-harness
+# convention).`
+      : `# Scaffolded for the harness at ${sub}/ — the job's working-directory and
+# the artifact upload path: are already pointed there. The CLI resolves the
+# spec, dataset, graders, and .crewhaus state from the working directory
+# (standalone-harness convention).`;
   return `# crewhaus-flywheel.yml — scaffolded by \`crewhaus flywheel init\`.
 #
 # The nightly self-improvement loop, unattended:
@@ -495,16 +553,16 @@ export function buildFlywheelWorkflowYaml(): string {
 #     gate passes, so a rejected night leaves the tree byte-identical.
 #
 # Required repo secrets:
-#   ANTHROPIC_API_KEY  — billed by eval + optimize (FLYWHEEL_BUDGET_USD caps
-#                        the optimizer's model-call spend)
+#   ANTHROPIC_API_KEY  — billed by eval + optimize. FLYWHEEL_BUDGET_USD caps
+#                        ONLY the optimizer's mutation model calls; eval
+#                        spend (before/after acceptance evals + the
+#                        per-iteration fitness evals) is NOT metered by it.
 #   FLYWHEEL_GH_TOKEN  — a PAT (or GitHub App token) with contents:write +
 #                        pull-requests:write on this repo. Passed explicitly
 #                        instead of the default GITHUB_TOKEN so the opened PR
 #                        can trigger downstream CI (default-token pushes don't).
 #
-# If your harness lives in a subdirectory, set jobs.flywheel.defaults.run.
-# working-directory to it — the CLI resolves the spec, dataset, graders, and
-# .crewhaus state from the working directory (standalone-harness convention).
+${subdirNote}
 
 name: crewhaus-flywheel
 
@@ -515,8 +573,8 @@ on:
     - cron: "13 7 * * *"
   workflow_dispatch:
     inputs:
-      budget_usd:
-        description: "Hard USD cap for the optimizer this run"
+      optimizer_budget_usd:
+        description: "Hard USD cap for the OPTIMIZER's mutation model calls this run (eval spend is billed separately, not metered by this)"
         required: false
         default: "2.00"
       iterations:
@@ -540,7 +598,7 @@ jobs:
     timeout-minutes: 30
     defaults:
       run:
-        shell: bash
+        shell: bash${workingDirLine}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -559,9 +617,11 @@ jobs:
       - name: Run the flywheel
         env:
           ANTHROPIC_API_KEY: \${{ secrets.ANTHROPIC_API_KEY }}
-          # Knobs (workflow_dispatch overrides the nightly defaults). Same
-          # names the EP01 demo used — see \`crewhaus flywheel --help\`.
-          FLYWHEEL_BUDGET_USD: \${{ github.event.inputs.budget_usd || '2.00' }}
+          # Knobs (workflow_dispatch overrides the nightly defaults). The env
+          # name is kept verbatim from the EP01 demo for continuity — the
+          # dispatch input is named for what it actually meters (see
+          # \`crewhaus flywheel --help\`).
+          FLYWHEEL_BUDGET_USD: \${{ github.event.inputs.optimizer_budget_usd || '2.00' }}
           FLYWHEEL_ITERATIONS: \${{ github.event.inputs.iterations || '3' }}
           FLYWHEEL_SEED: "1" # deterministic mutator => reproducible PRs
           FLYWHEEL_CONCURRENCY: "1" # low-TPM-tier safe; raise if your key allows
@@ -596,7 +656,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: flywheel-run-\${{ github.run_id }}
-          path: .crewhaus/flywheel/
+          # Action paths resolve from the repo root — they do NOT honor
+          # defaults.run.working-directory, hence the explicit prefix for a
+          # nested harness.
+          path: ${prefix}.crewhaus/flywheel/
           if-no-files-found: ignore
           retention-days: 30
 `;
@@ -611,5 +674,8 @@ export function formatFlywheelKnobsGuide(): string[] {
     `  ${FLYWHEEL_ENV_KNOBS.iterations}=<n>      optimizer iterations (default ${FLYWHEEL_DEFAULT_KNOBS.iterations})`,
     `  ${FLYWHEEL_ENV_KNOBS.seed}=<n>            deterministic seed (default ${FLYWHEEL_DEFAULT_KNOBS.seed})`,
     `  ${FLYWHEEL_ENV_KNOBS.concurrency}=<n>     eval fan-out (default ${FLYWHEEL_DEFAULT_KNOBS.concurrency}; 30k-TPM-tier safe)`,
+    `  note: ${FLYWHEEL_ENV_KNOBS.budgetUsd} caps ONLY the optimizer's mutation model calls —`,
+    "  eval spend (the before/after acceptance evals and the per-iteration fitness",
+    "  evals) is NOT metered by this budget.",
   ];
 }

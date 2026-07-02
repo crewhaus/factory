@@ -32,6 +32,7 @@
  * `scaffoldWorkflowFile` writer.
  */
 import { join } from "node:path";
+import { normalizeHarnessDir } from "./flywheel";
 
 export const EVAL_CI_WORKFLOW_RELPATH = join(".github", "workflows", "crewhaus-eval.yml");
 
@@ -39,8 +40,30 @@ export const EVAL_CI_WORKFLOW_RELPATH = join(".github", "workflows", "crewhaus-e
  * The eval-gated-PR workflow. Model-budget-conscious by default:
  * `--concurrency 1` (the 30k-TPM default provider tier) and a pinned seed
  * for determinism.
+ *
+ * `harnessDir` (repo-root-relative, "" = root) adapts the scaffold to a
+ * nested harness: the job's working-directory, the `paths:` trigger filter,
+ * and the base-branch checkout `path:` are all repo-root-anchored, so every
+ * one of them needs the prefix (finding 7).
  */
-export function buildEvalCiWorkflowYaml(): string {
+export function buildEvalCiWorkflowYaml(opts: { readonly harnessDir?: string } = {}): string {
+  const sub = normalizeHarnessDir(opts.harnessDir);
+  const prefix = sub === "" ? "" : `${sub}/`;
+  const workingDirLine = sub === "" ? "" : `\n        working-directory: ${sub}`;
+  // Working-dir-relative path of the base branch's spec: the base checkout
+  // lands at <harness>/.crewhaus-ci/base (a FULL repo copy), so a nested
+  // harness's spec sits at .crewhaus-ci/base/<harness>/crewhaus.yaml.
+  const baseSpec = `.crewhaus-ci/base/${prefix}crewhaus.yaml`;
+  const subdirNote =
+    sub === ""
+      ? `#   - If your harness lives in a subdirectory, re-run \`crewhaus init --ci\`
+#     from the repo (the CLI detects the git root and prefixes everything),
+#     or hand-set jobs.eval-gate.defaults.run.working-directory AND prefix
+#     the paths: filter and the base-checkout path: — both resolve from the
+#     repo root, not the working directory.`
+      : `#   - Scaffolded for the harness at ${sub}/ — the job's
+#     working-directory, the paths: filter, and the base-checkout path are
+#     already prefixed.`;
   return `# crewhaus-eval.yml — scaffolded by \`crewhaus init --ci\`.
 #
 # Eval-gated spec PRs (the exact chain EP01 proves by hand): on every pull
@@ -65,17 +88,27 @@ export function buildEvalCiWorkflowYaml(): string {
 # one extra eval per PR + judge nondeterminism, bounded by the pinned
 # EVAL_SEED and EVAL_CONCURRENCY=1 below.
 #
+# BRANCH-PROTECTION CAVEAT — read before marking this check REQUIRED:
+# this workflow only runs on PRs that touch the paths: filter below. A PR
+# that does NOT touch those paths never starts the workflow, so a REQUIRED
+# crewhaus-eval check deadlocks it — stuck forever on "Expected — waiting
+# for status". Leave the check optional, or enforce it only through
+# paths-aware tooling (e.g. a merge queue that understands path filters).
+# COST: every push to a matching PR re-runs the job and bills TWO evals
+# (base spec + PR spec) against ANTHROPIC_API_KEY.
+#
 # Notes:
+#   - First PR introducing the spec: the base branch has no crewhaus.yaml,
+#     so there is no baseline — the base eval and the gate are SKIPPED, the
+#     comment says so, and the check goes green; future PRs will gate.
+#   - Fork PRs: the whole job is skipped (see jobs.eval-gate.if) — GitHub
+#     does not expose the ANTHROPIC_API_KEY secret to fork-triggered runs.
 #   - A PR that renames the spec or changes the dataset's sample keyset
 #     starts a NEW baseline lineage: the gate passes vacuously (nothing
 #     comparable to regress against) and the diff step says so.
 #   - EVAL_CONCURRENCY=1 keeps the job under a low provider rate-limit
 #     tier (the 30k-TPM default tier); raise it if your key allows.
-#   - Fork PRs get a read-only GITHUB_TOKEN — the comment step degrades
-#     gracefully; the gate still gates.
-#   - If your harness lives in a subdirectory, set
-#     jobs.eval-gate.defaults.run.working-directory and adjust the paths
-#     filter — the CLI resolves everything from the working directory.
+${subdirNote}
 #
 # Required repo secret: ANTHROPIC_API_KEY (billed by the two eval runs).
 
@@ -84,8 +117,8 @@ name: crewhaus-eval
 on:
   pull_request:
     paths:
-      - "crewhaus.yaml"
-      - "eval/**"
+      - "${prefix}crewhaus.yaml"
+      - "${prefix}eval/**"
 
 permissions:
   contents: read
@@ -102,11 +135,19 @@ env:
 
 jobs:
   eval-gate:
+    # Fork PRs cannot read secrets.ANTHROPIC_API_KEY (GitHub withholds
+    # secrets from fork-triggered runs), so the evals would fail red at
+    # model-client construction — skip the whole job instead (a skipped
+    # check is neutral, not a red X). Maintainers can gate a fork's change
+    # by pushing its commits to an in-repo branch (same-repo PRs get
+    # secrets), by re-running the eval after merge, or via a manual
+    # workflow_dispatch wrapper of their own.
+    if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 30
     defaults:
       run:
-        shell: bash
+        shell: bash${workingDirLine}
     steps:
       - name: Checkout PR
         uses: actions/checkout@v4
@@ -115,7 +156,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: \${{ github.base_ref }}
-          path: .crewhaus-ci/base
+          # checkout paths resolve from the repo root (working-directory
+          # only applies to run steps).
+          path: ${prefix}.crewhaus-ci/base
 
       - name: Install Bun
         uses: oven-sh/setup-bun@v2
@@ -128,13 +171,27 @@ jobs:
       - name: Compile gate (offline)
         run: crewhaus compile crewhaus.yaml --emit-ir > /dev/null
 
+      - name: Detect the baseline spec
+        id: baseline
+        run: |
+          # First PR introducing the spec: the base branch has nothing to
+          # gate against. Skip the base eval + the gate (green check) — the
+          # comment step reports it; future PRs will gate.
+          if [ -f "${baseSpec}" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "first PR introducing the spec — no baseline; future PRs will gate"
+          fi
+
       - name: Eval base spec (pins the baseline)
+        if: steps.baseline.outputs.exists == 'true'
         env:
           ANTHROPIC_API_KEY: \${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           # Base SPEC, PR dataset+graders: only the spec differs between the
           # two runs, so the gate isolates exactly the PR's spec change.
-          crewhaus eval .crewhaus-ci/base/crewhaus.yaml \\
+          crewhaus eval ${baseSpec} \\
             --dataset eval/dataset.jsonl \\
             --graders eval/graders.yaml \\
             --concurrency "$EVAL_CONCURRENCY" --seed "$EVAL_SEED" \\
@@ -142,6 +199,7 @@ jobs:
 
       - name: Eval PR spec (gated against the base run)
         id: gate
+        if: steps.baseline.outputs.exists == 'true'
         # The comment must post either way; the last step re-fails the check.
         continue-on-error: true
         env:
@@ -167,8 +225,20 @@ jobs:
           PR_ROW="$(read_row .crewhaus-ci/runs/pr)"
           DIFF_LINE="$(crewhaus eval-report diff .crewhaus-ci/runs/base .crewhaus-ci/runs/pr -o .crewhaus-ci/runs/diff 2>/dev/null | tail -n 1 \\
             || echo 'diff unavailable — new baseline lineage (spec renamed / dataset keyset changed) or a run failed')"
+          # Only a FAILING GATE STEP is a regression. A gate that never ran
+          # (no baseline, or an earlier step blew up) must not be labelled
+          # one — its outcome is "skipped", not "failure".
+          BASELINE="\${{ steps.baseline.outputs.exists }}"
           GATE_STATE="\${{ steps.gate.outcome }}"
-          [ "$GATE_STATE" = "success" ] && VERDICT="PASS ✅" || VERDICT="FAIL ❌ (regression vs base)"
+          if [ "$BASELINE" = "false" ]; then
+            VERDICT="NO BASELINE ✅ — first PR introducing the spec; future PRs will gate"
+          elif [ "$GATE_STATE" = "success" ]; then
+            VERDICT="PASS ✅"
+          elif [ "$GATE_STATE" = "failure" ]; then
+            VERDICT="FAIL ❌ (regression vs base)"
+          else
+            VERDICT="NOT RUN ⚠️ — an earlier step failed before the gate (infra, not a regression)"
+          fi
           BODY="$(printf '## crewhaus eval gate: %s\\n\\n| run | pass_rate | mean_score |\\n| --- | --- | --- |\\n| base (%s) | %s |\\n| PR | %s |\\n\\n%s\\n\\n_seed %s · concurrency %s · gate: any pass-rate drop or per-sample pass→fail flip fails_\\n' \\
             "$VERDICT" "\${{ github.base_ref }}" "$BASE_ROW" "$PR_ROW" "$DIFF_LINE" "$EVAL_SEED" "$EVAL_CONCURRENCY")"
           gh api "repos/\${{ github.repository }}/issues/\${{ github.event.pull_request.number }}/comments" \\

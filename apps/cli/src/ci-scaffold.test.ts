@@ -4,7 +4,7 @@
  * harness, refuse-overwrite/--force). No LLM/credentials needed.
  */
 import { afterAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EVAL_CI_WORKFLOW_RELPATH, buildEvalCiWorkflowYaml } from "./ci-scaffold";
@@ -73,6 +73,66 @@ describe("buildEvalCiWorkflowYaml", () => {
   test("degrades gracefully on fork PRs (read-only token)", () => {
     expect(yaml).toContain("comment skipped");
   });
+
+  test("H2a — base-spec-absent: baseline detection skips base eval + gate (first PR goes green)", () => {
+    expect(yaml).toContain("id: baseline");
+    expect(yaml).toContain('echo "exists=true" >> "$GITHUB_OUTPUT"');
+    expect(yaml).toContain('echo "exists=false" >> "$GITHUB_OUTPUT"');
+    // BOTH paid steps are guarded on the baseline existing.
+    const guarded = yaml.split("if: steps.baseline.outputs.exists == 'true'").length - 1;
+    expect(guarded).toBe(2);
+    expect(yaml).toContain("first PR introducing the spec");
+    expect(yaml).toContain("future PRs will gate");
+    // The fail step keys on the gate's own outcome — a skipped gate (no
+    // baseline) leaves the check green.
+    expect(yaml).toContain("if: steps.gate.outcome == 'failure'");
+  });
+
+  test("H2b — fork PRs skip the whole job (no secret access) with an explanatory comment", () => {
+    expect(yaml).toContain(
+      "if: github.event.pull_request.head.repo.full_name == github.repository",
+    );
+    expect(yaml).toContain("Fork PRs cannot read secrets.ANTHROPIC_API_KEY");
+    expect(yaml).toContain("model-client construction");
+    expect(yaml).toContain("re-running the eval after merge");
+    expect(yaml).toContain("workflow_dispatch");
+  });
+
+  test("H2c — the PR comment only labels a FAILING GATE STEP as a regression", () => {
+    // Three-way verdict: no baseline / gate success / gate failure, with an
+    // explicit infra branch for a gate that never ran.
+    expect(yaml).toContain('if [ "$BASELINE" = "false" ]; then');
+    expect(yaml).toContain("NO BASELINE ✅");
+    expect(yaml).toContain('elif [ "$GATE_STATE" = "failure" ]; then');
+    expect(yaml).toContain("FAIL ❌ (regression vs base)");
+    expect(yaml).toContain("infra, not a regression");
+    // "regression vs base" appears exactly once — only in the gate-failure
+    // branch, never as a catch-all for earlier-step failures.
+    expect(yaml.split("regression vs base").length - 1).toBe(1);
+  });
+
+  test("H2d — header warns about REQUIRED-check deadlock and two-evals-per-push billing", () => {
+    expect(yaml).toContain("REQUIRED");
+    expect(yaml).toContain("deadlocks");
+    expect(yaml).toContain("paths:");
+    expect(yaml).toContain("bills TWO evals");
+  });
+
+  test("H5 — harnessDir prefixes working-directory, paths filter, and base checkout", () => {
+    const nested = buildEvalCiWorkflowYaml({ harnessDir: "agents/concierge" });
+    expect(nested).toContain("working-directory: agents/concierge");
+    expect(nested).toContain('- "agents/concierge/crewhaus.yaml"');
+    expect(nested).toContain('- "agents/concierge/eval/**"');
+    // checkout paths resolve from the repo root, not working-directory.
+    expect(nested).toContain("path: agents/concierge/.crewhaus-ci/base");
+    // The base checkout is a FULL repo copy, so the nested harness's base
+    // spec sits below the harness path inside it.
+    expect(nested).toContain("crewhaus eval .crewhaus-ci/base/agents/concierge/crewhaus.yaml");
+    expect(nested).toContain('[ -f ".crewhaus-ci/base/agents/concierge/crewhaus.yaml" ]');
+    // Root scaffold stays unprefixed.
+    expect(yaml).toContain('- "crewhaus.yaml"');
+    expect(yaml).toContain("crewhaus eval .crewhaus-ci/base/crewhaus.yaml");
+  });
 });
 
 // -------- CLI surface (spawned) --------
@@ -140,12 +200,40 @@ describe("crewhaus init --ci (CLI surface)", () => {
     expect(readFileSync(wfPath, "utf-8")).toBe(buildEvalCiWorkflowYaml());
   });
 
-  test("init [name] --ci scaffolds both into the named subdirectory", async () => {
+  test("H5 — init [name] --ci (no repo): spec in the subdir, workflow at the CWD root", async () => {
     const root = newTempRoot();
     const res = await runCli(["init", "myagent", "--ci"], root);
     expect(res.exitCode).toBe(0);
     expect(existsSync(join(root, "myagent", "crewhaus.yaml"))).toBe(true);
-    expect(existsSync(join(root, "myagent", EVAL_CI_WORKFLOW_RELPATH))).toBe(true);
+    // GitHub only reads .github/workflows at the repo root — not a repo
+    // yet, so the cwd (where the user will `git init`) stands in for it.
+    expect(existsSync(join(root, EVAL_CI_WORKFLOW_RELPATH))).toBe(true);
+    expect(existsSync(join(root, "myagent", EVAL_CI_WORKFLOW_RELPATH))).toBe(false);
+    const wf = readFileSync(join(root, EVAL_CI_WORKFLOW_RELPATH), "utf-8");
+    expect(wf).toContain("working-directory: myagent");
+    expect(wf).toContain('- "myagent/crewhaus.yaml"');
+    expect(res.stdout).toContain("repo root");
+  });
+
+  test("H5 — init [name] --ci inside a git repo: workflow at the REPO root, prefixed", async () => {
+    const root = newTempRoot();
+    Bun.spawnSync(["git", "-C", root, "init", "-q"]);
+    const nested = join(root, "packages");
+    mkdirSync(nested, { recursive: true });
+
+    // cwd = <repo>/packages, harness = <repo>/packages/myagent.
+    const res = await runCli(["init", "myagent", "--ci"], nested);
+    expect(res.exitCode).toBe(0);
+    expect(existsSync(join(nested, "myagent", "crewhaus.yaml"))).toBe(true);
+    const wfPath = join(root, EVAL_CI_WORKFLOW_RELPATH);
+    expect(existsSync(wfPath)).toBe(true);
+    expect(existsSync(join(nested, "myagent", EVAL_CI_WORKFLOW_RELPATH))).toBe(false);
+    const wf = readFileSync(wfPath, "utf-8");
+    expect(wf).toContain("working-directory: packages/myagent");
+    expect(wf).toContain('- "packages/myagent/crewhaus.yaml"');
+    expect(wf).toContain('- "packages/myagent/eval/**"');
+    expect(wf).toContain("path: packages/myagent/.crewhaus-ci/base");
+    expect(res.stdout).toContain("repo root");
   });
 
   test("bare init is unchanged: no workflow, still refuses an existing spec", async () => {
