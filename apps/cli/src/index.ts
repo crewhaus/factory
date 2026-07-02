@@ -114,6 +114,19 @@ import {
 // `doctor --philosophy-alignment`. Kept in a side-effect-free module so it is
 // unit-testable (this entry file runs an argv switch on import).
 import { auditSpecToolNames, auditToolScopes, collectToolNames } from "./scope-audit";
+// Item 69 — `crewhaus state backup|restore` core (tarball snapshot of the
+// cwd `.crewhaus` state dir + full/merge restore), in a module with no
+// import-time side effects so it is unit-testable (this entry file runs an
+// argv switch on import).
+import {
+  StateBackupError,
+  createStateBackup,
+  defaultBackupFileName,
+  mergeAllFromArchive,
+  mergeFeedbackFromArchive,
+  parseExcludeGlobs,
+  restoreStateArchive,
+} from "./state-backup";
 
 /**
  * crewhaus — slice-scope CLI.
@@ -314,6 +327,19 @@ const DISTILL_SCHEMA: ParseArgsSchema = {
   ],
 };
 
+const STATE_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // backup
+    { name: "out", short: "o", takesValue: true },
+    { name: "exclude", takesValue: true },
+    // restore
+    { name: "into", takesValue: true },
+    { name: "merge", takesValue: true },
+    { name: "force", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
 const SANDBOX_SCHEMA: ParseArgsSchema = {
   flags: [
     { name: "probe", takesValue: false },
@@ -462,6 +488,10 @@ function usageText(): string {
     "       [--turn N] [--correction <better answer>]",
     "  distill --session <id> -o <ds.jsonl> turn ratings into an eval dataset + graders",
     "       [--all-sessions] [--graders-out <g.yaml>] [--min-score F]",
+    "  state backup [-o <file.tar.gz>]      snapshot the cwd .crewhaus state dir to a tarball (item 69)",
+    "       [--exclude <glob,glob>]",
+    "  state restore <file.tar.gz>          restore a snapshot (refuses a non-empty .crewhaus)",
+    "       [--into <dir>] [--force] [--merge feedback|all]",
     "  secrets doctor                       list known secrets via the configured backend",
     "  secrets rotate <name> [--value V]    rotate a named secret (file backend)",
     "  spec put|list|get|pin|alias|log ...  versioned spec storage + changelog (Section 28 spec-registry)",
@@ -520,25 +550,31 @@ function die(message: string): never {
 // --compile --define` — standalone binaries have no package.json on disk.
 declare const CREWHAUS_EMBEDDED_VERSION: string | undefined;
 
-function printVersion(): void {
-  if (typeof CREWHAUS_EMBEDDED_VERSION === "string") {
-    process.stdout.write(`${CREWHAUS_EMBEDDED_VERSION}\n`);
-    return;
-  }
+/**
+ * Resolve the CLI version string: the build-time embedded constant when this
+ * is a standalone binary, else package.json. Undefined when neither source
+ * is available (`version` dies on it; the backup manifest stamps "unknown").
+ */
+function cliVersion(): string | undefined {
+  if (typeof CREWHAUS_EMBEDDED_VERSION === "string") return CREWHAUS_EMBEDDED_VERSION;
   // The package ships src/ directly (bin → src/index.ts) and tsc -b also
   // emits dist/, so resolve package.json relative to this module — one level
   // up lands on apps/cli/package.json from either tree, and on
   // node_modules/@crewhaus/cli/package.json when installed.
-  let version: string;
   try {
-    version = (
+    return (
       JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf-8")) as {
         version: string;
       }
     ).version;
   } catch {
-    die("could not locate package.json to determine the version");
+    return undefined;
   }
+}
+
+function printVersion(): void {
+  const version = cliVersion();
+  if (version === undefined) die("could not locate package.json to determine the version");
   process.stdout.write(`${version}\n`);
 }
 
@@ -2632,6 +2668,145 @@ function distillRatings(
   return { samples, gradersYaml: gradersConfigToYaml(result.graders) };
 }
 
+// -------- state backup / restore (item 69) --------
+
+/** Label for the default backup file name: the cwd spec's harness name when
+ *  a parseable crewhaus.yaml is present, else the cwd basename. */
+function stateBackupLabel(): string {
+  const specPath = join(process.cwd(), "crewhaus.yaml");
+  if (existsSync(specPath)) {
+    try {
+      return parseSpec(readFileSync(specPath, "utf-8")).name;
+    } catch {
+      // Unparseable spec — fall through to the directory name.
+    }
+  }
+  return basename(process.cwd());
+}
+
+/**
+ * Item 69 — `crewhaus state <backup|restore>`. The cwd-local `.crewhaus/`
+ * dir is a harness's entire accumulated state; `backup` snapshots it to a
+ * transportable tarball, `restore` unpacks it (full replace or additive
+ * merges). The heavy lifting lives in ./state-backup; this is flag parsing
+ * + output only, per house pattern.
+ */
+async function runState(args: ParsedArgs, action: "backup" | "restore"): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage:\n" +
+        "  crewhaus state backup [-o <file.tar.gz>] [--exclude <glob,glob>]\n" +
+        "  crewhaus state restore <file.tar.gz> [--into <dir>] [--merge feedback|all] [--force]\n" +
+        "\n" +
+        "backup: archive the cwd .crewhaus/ state dir (sessions, feedback,\n" +
+        "  memories, datasets, spec registry, optimize runs, durable-state\n" +
+        "  sqlite) to a gzipped tarball. Default name:\n" +
+        "  crewhaus-state-<harnessname-or-dir>-<date>.tar.gz. The archive\n" +
+        "  carries a backup-manifest.json (created ts, source dir, crewhaus\n" +
+        "  version, per-subdir file/byte counts). sqlite files are snapshotted\n" +
+        "  via a read-only bun:sqlite serialize so a live writer cannot tear\n" +
+        "  the copy; if a snapshot fails the raw bytes are copied and the\n" +
+        "  manifest records sqliteConsistent: false. Source files are never\n" +
+        "  modified.\n" +
+        "  --exclude   comma-separated globs matched against paths relative to\n" +
+        "              .crewhaus; a bare pattern also matches file/dir names\n" +
+        '              anywhere (e.g. --exclude "sessions,*.sqlite").\n' +
+        "\n" +
+        "restore: unpack a backup into <dir>/.crewhaus (default: cwd). By\n" +
+        "  default it REFUSES to overwrite an existing non-empty .crewhaus.\n" +
+        "  --force            full replace — the existing dir is first moved\n" +
+        "                     aside to .crewhaus.bak-<ts>, never deleted\n" +
+        "  --merge feedback   fold ONLY the archive's feedback records\n" +
+        "                     (session user_feedback events + feedback/*.jsonl)\n" +
+        "                     into the local store, deduped per (session, turn)\n" +
+        "                     with the same merge `crewhaus distill` uses —\n" +
+        "                     closes the deployed-bot feedback transport gap\n" +
+        "  --merge all        additive per-file copy: only files that don't\n" +
+        "                     exist locally are written; existing files are\n" +
+        "                     skipped (and reported)\n" +
+        "\n" +
+        "out of scope (by design): S3/R2 upload — sync the tarball with your\n" +
+        "  own tooling (aws s3 cp, rclone, …); scheduled backups — pair with\n" +
+        "  cron for now (a templates/ convention is landing separately).\n",
+    );
+    return;
+  }
+
+  if (action === "backup") {
+    const excludeGlobs = parseExcludeGlobs(strFlag(args, "exclude"));
+    const outFile = resolve(
+      strFlag(args, "out") ?? defaultBackupFileName(stateBackupLabel(), new Date()),
+    );
+    try {
+      const result = await createStateBackup({
+        stateDir: join(process.cwd(), ".crewhaus"),
+        outFile,
+        excludeGlobs,
+        crewhausVersion: cliVersion() ?? "unknown",
+      });
+      for (const w of result.warnings) process.stderr.write(`[state] warning: ${w}\n`);
+      if (result.excluded.length > 0) {
+        process.stdout.write(`[state] excluded ${result.excluded.length} file(s) via --exclude\n`);
+      }
+      const { totals } = result.manifest;
+      process.stdout.write(
+        `backed up ${totals.files} file(s) (${totals.bytes} bytes) → ${result.outFile}\n`,
+      );
+    } catch (err) {
+      if (err instanceof StateBackupError) die(err.message);
+      throw err;
+    }
+    return;
+  }
+
+  const archive = args.positional[0];
+  if (typeof archive !== "string") die("missing <file.tar.gz>");
+  const archiveFile = resolve(archive);
+  const intoDir = strFlag(args, "into") ?? process.cwd();
+  const merge = strFlag(args, "merge");
+  const force = args.flags["force"] === true;
+  if (merge !== undefined && force) {
+    die("--merge and --force are mutually exclusive (merge is additive; force replaces)");
+  }
+  if (merge !== undefined && merge !== "feedback" && merge !== "all") {
+    die(`invalid --merge "${merge}" — expected "feedback" or "all"`);
+  }
+
+  try {
+    if (merge === "feedback") {
+      const r = await mergeFeedbackFromArchive({ archiveFile, intoDir });
+      process.stdout.write(
+        `[state] ${r.archivedRecords} archived feedback record(s): ` +
+          `${r.added} new, ${r.updated} updated fold(s), ${r.unchanged} already present (deduped)\n`,
+      );
+      if (r.wroteFile !== undefined) {
+        process.stdout.write(`merged feedback → ${r.wroteFile}\n`);
+      } else {
+        process.stdout.write("nothing to merge — the local store already has it all\n");
+      }
+    } else if (merge === "all") {
+      const r = await mergeAllFromArchive({ archiveFile, intoDir });
+      for (const rel of r.skipped) {
+        process.stdout.write(`[state] skipped ${rel} (exists locally — kept)\n`);
+      }
+      process.stdout.write(
+        `merged ${r.copied.length} new file(s) into ${r.stateDir} ` +
+          `(${r.skipped.length} existing file(s) kept)\n`,
+      );
+    } else {
+      const r = await restoreStateArchive({ archiveFile, intoDir, force });
+      for (const w of r.warnings) process.stderr.write(`[state] warning: ${w}\n`);
+      if (r.movedAsideTo !== undefined) {
+        process.stdout.write(`moved existing state aside → ${r.movedAsideTo}\n`);
+      }
+      process.stdout.write(`restored ${r.filesRestored} file(s) → ${r.stateDir}\n`);
+    }
+  } catch (err) {
+    if (err instanceof StateBackupError) die(err.message);
+    throw err;
+  }
+}
+
 /**
  * Section 27 — `crewhaus secrets <action> <name> [opts]`. Two actions:
  *   doctor                 list configured secrets and report missing
@@ -3519,6 +3694,14 @@ switch (subcommand) {
   case "distill":
     await runDistill(parseFor(rest, DISTILL_SCHEMA));
     break;
+  case "state": {
+    const action = rest[0] ?? "";
+    if (action !== "backup" && action !== "restore") {
+      die(`state action must be "backup" or "restore" (got "${action}")`);
+    }
+    await runState(parseFor(rest.slice(1), STATE_SCHEMA), action);
+    break;
+  }
   case "secrets": {
     const action = rest[0] ?? "";
     if (action !== "doctor" && action !== "rotate") {
