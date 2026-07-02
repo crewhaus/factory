@@ -148,6 +148,10 @@ const COMPILE_SCHEMA: ParseArgsSchema = {
     // FAILS the compile.
     { name: "allow-unmarked-sinks", takesValue: false },
     { name: "no-strict-scope", takesValue: false },
+    // Item 33 — post-compile verification of the just-emitted bundle
+    // (shape assertion → bun install → credential-free liveness boot).
+    // See compile-check.ts; wired at the very end of the compile path.
+    { name: "check", takesValue: false },
     { name: "help", short: "h" },
   ],
 };
@@ -420,6 +424,7 @@ function usageText(): string {
     "  compile <spec.yaml> -o <out-dir>     compile a spec to a runnable bundle",
     "                                       (fails if an outward tool is left non-external — FR-002)",
     "                  [--allow-unmarked-sinks]  opt out of the external-sink scope gate",
+    "                  [--check]            verify the emitted bundle (shape assertion + install + liveness boot)",
     "  compile <spec.yaml> --emit-ir        print the lowered IR as JSON (debug)",
     "  run <spec.yaml> [--model <model>]    compile in-memory and execute the agent",
     "                  [--resume <id>]      resume a specific session (cli targets only)",
@@ -542,10 +547,15 @@ function parseFor(rest: ReadonlyArray<string>, schema: ParseArgsSchema): ParsedA
 async function runCompile(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
-      "usage: crewhaus compile <spec.yaml> [-o <out-dir>] [--emit-ir]\n" +
+      "usage: crewhaus compile <spec.yaml> [-o <out-dir>] [--emit-ir] [--check]\n" +
         "                        [--allow-unmarked-sinks]\n" +
         "  --emit-ir  Skip code emission; print the lowered IR as JSON to\n" +
         "             stdout (or to <out-dir>/ir.json when -o is set).\n" +
+        "  --check    After emitting, verify the bundle: run the target shape's\n" +
+        "             smoke assertion, `bun install` its deps in the out-dir, and\n" +
+        "             boot it once credential-free (liveness only — shapes whose\n" +
+        "             boot needs live credentials/servers degrade to a reported\n" +
+        "             gate). One green/red verdict line; red exits 1.\n" +
         "\n" +
         "  FR-002 — the strict scope gate runs by DEFAULT: the build fails\n" +
         "  (exit 1) if any I/O-capable tool the spec uses is left at a\n" +
@@ -569,6 +579,8 @@ async function runCompile(args: ParsedArgs): Promise<void> {
   const specPath = args.positional[0];
   const outDir = args.flags["out"];
   const emitIr = args.flags["emit-ir"] === true;
+  const check = args.flags["check"] === true;
+  if (check && emitIr) die("--check verifies emitted files — it cannot combine with --emit-ir");
   // FR-002 — the strict scope gate is DEFAULT-ON. It runs unless the user
   // explicitly opts out with --allow-unmarked-sinks (or its alias
   // --no-strict-scope). `--strict` is now a no-op kept for back-compat.
@@ -660,6 +672,23 @@ async function runCompile(args: ParsedArgs): Promise<void> {
   }
   process.stdout.write(`compiled bundle (${bundle.files.length} file(s)) → ${absOut}\n`);
   logger.debug("compile.success", { files: bundle.files.length, out: absOut });
+
+  // Item 33 — `--check`: verify the just-emitted bundle. Wired at the very
+  // end of the compile path so a plain compile is byte-for-byte unaffected.
+  if (check) {
+    const { runCompileCheck } = await import("./compile-check");
+    // compile() already succeeded, so lowering again for the target
+    // discriminator cannot throw here.
+    const target = lower(parseSpec(yamlText)).target;
+    const result = await runCompileCheck({ target, bundle, outDir: absOut });
+    for (const step of result.steps) {
+      if (step.status === "failed" && step.detail !== undefined) {
+        process.stderr.write(`crewhaus: [check] ${step.step}: ${step.detail}\n`);
+      }
+    }
+    process.stdout.write(`${result.line}\n`);
+    if (!result.green) process.exit(1);
+  }
 }
 
 /**

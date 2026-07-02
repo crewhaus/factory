@@ -1359,3 +1359,29 @@ describe("crewhaus build-image — digest recording wiring (item 47)", () => {
     expect(result.stdout).toContain("--no-record");
   });
 });
+
+describe("crewhaus compile --check — flag surface (item 33)", () => {
+  // The check pipeline itself (assertion selection, install/boot behind an
+  // injectable runner, verdict mapping) is covered in compile-check.test.ts;
+  // these pin the CLI wiring without hitting the network.
+  test("--check rejects --emit-ir (nothing emitted to verify)", async () => {
+    const result = await runCli(["compile", HELLO_SPEC, "--emit-ir", "--check", "-o", tmp]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("--check");
+    expect(result.stderr).toContain("--emit-ir");
+  });
+
+  test("compile --help documents --check", async () => {
+    const result = await runCli(["compile", "--help"]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("--check");
+    expect(result.stdout).toContain("liveness");
+  });
+
+  test("plain compile is unaffected — no verdict line without --check", async () => {
+    const result = await runCli(["compile", HELLO_SPEC, "-o", tmp]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).not.toContain("compile --check:");
+    expect(existsSync(join(tmp, "package.json"))).toBe(false);
+  });
+});

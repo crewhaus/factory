@@ -44,6 +44,7 @@
     { "path": "../../packages/spec-registry" },
     { "path": "../../packages/skills-registry" },
     { "path": "../../packages/slash-commands" },
+    { "path": "../../packages/smoke-harness" },
     { "path": "../../packages/spec" },
     { "path": "../../packages/sub-agent-spawner" },
     { "path": "../../packages/trace-event-bus" },

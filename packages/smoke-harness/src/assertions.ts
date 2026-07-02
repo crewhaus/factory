@@ -24,6 +24,16 @@ export type Anchor = {
   /** "any" means: the substring must appear in at least one file. */
   readonly in: "any" | string;
   readonly contains: string;
+  /**
+   * The anchored content round-trips from the smoke FIXTURE spec (env-ref
+   * names, chain ids, step banners, model strings) rather than from the
+   * emitter's scaffold. Fixture-only anchors are applied by the fixture
+   * matrix (`runShapeSmoke`) but skipped when an assertion is applied to an
+   * arbitrary user bundle (`assertBundleAgainstShape`, the `crewhaus
+   * compile --check` path) — a user's spec legitimately carries different
+   * env names / roles / steps.
+   */
+  readonly fixtureOnly?: boolean;
 };
 
 export type ShapeAssertion = {
@@ -55,7 +65,7 @@ export const SHAPE_ASSERTIONS: readonly ShapeAssertion[] = [
     shape: "cli-openai",
     expectedFiles: ["agent.ts"],
     anchors: [
-      { in: "agent.ts", contains: "openai/gpt-4o-mini" },
+      { in: "agent.ts", contains: "openai/gpt-4o-mini", fixtureOnly: true },
       { in: "agent.ts", contains: "runChatLoop" },
     ],
   },
@@ -63,7 +73,7 @@ export const SHAPE_ASSERTIONS: readonly ShapeAssertion[] = [
     shape: "cli-gemini",
     expectedFiles: ["agent.ts"],
     anchors: [
-      { in: "agent.ts", contains: "gemini/gemini-2.5-flash" },
+      { in: "agent.ts", contains: "gemini/gemini-2.5-flash", fixtureOnly: true },
       { in: "agent.ts", contains: "runChatLoop" },
     ],
   },
@@ -72,7 +82,11 @@ export const SHAPE_ASSERTIONS: readonly ShapeAssertion[] = [
     expectedFiles: ["agent.ts"],
     anchors: [
       // Geo-prefixed cross-region inference-profile id, verbatim.
-      { in: "agent.ts", contains: "bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0" },
+      {
+        in: "agent.ts",
+        contains: "bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        fixtureOnly: true,
+      },
       { in: "agent.ts", contains: "runChatLoop" },
     ],
   },
@@ -80,7 +94,7 @@ export const SHAPE_ASSERTIONS: readonly ShapeAssertion[] = [
     shape: "cli-local",
     expectedFiles: ["agent.ts"],
     anchors: [
-      { in: "agent.ts", contains: "local/llama3.2@http://localhost:11434/v1" },
+      { in: "agent.ts", contains: "local/llama3.2@http://localhost:11434/v1", fixtureOnly: true },
       { in: "agent.ts", contains: "runChatLoop" },
     ],
   },
@@ -117,13 +131,15 @@ export const SHAPE_ASSERTIONS: readonly ShapeAssertion[] = [
     shape: "channel",
     expectedFiles: ["agent.ts", "daemon.ts", "gateway.ts", "session-router.ts"],
     anchors: [
-      { in: "daemon.ts", contains: "@crewhaus/channel-adapter-slack" },
-      { in: "daemon.ts", contains: "createSlackAdapter" },
+      // The fixture is a Slack bot; a user's channel spec may wire discord/
+      // telegram/… instead, so the adapter pair is fixture-only.
+      { in: "daemon.ts", contains: "@crewhaus/channel-adapter-slack", fixtureOnly: true },
+      { in: "daemon.ts", contains: "createSlackAdapter", fixtureOnly: true },
       { in: "daemon.ts", contains: "@crewhaus/tool-message-channel" },
       // Env-ref secret rewriting: the spec uses $SMOKE_SLACK_BOT_TOKEN,
       // the bundle must reach for the env var by exact name.
-      { in: "daemon.ts", contains: "SMOKE_SLACK_BOT_TOKEN" },
-      { in: "daemon.ts", contains: "SMOKE_SLACK_SIGNING_SECRET" },
+      { in: "daemon.ts", contains: "SMOKE_SLACK_BOT_TOKEN", fixtureOnly: true },
+      { in: "daemon.ts", contains: "SMOKE_SLACK_SIGNING_SECRET", fixtureOnly: true },
       // Ops item 36 — boot-time self-heal janitor wired into the daemon.
       { in: "daemon.ts", contains: "createJanitor" },
     ],
@@ -146,8 +162,10 @@ export const SHAPE_ASSERTIONS: readonly ShapeAssertion[] = [
     expectedFiles: ["agent_researcher.ts", "agent_writer.ts", "daemon.ts", "orchestrator.ts"],
     anchors: [
       { in: "orchestrator.ts", contains: "@crewhaus/crew-orchestrator" },
-      { in: "agent_researcher.ts", contains: "RoleDefinition" },
-      { in: "agent_writer.ts", contains: "RoleDefinition" },
+      // agent_<role>.ts file names derive from the fixture's role names.
+      { in: "agent_researcher.ts", contains: "RoleDefinition", fixtureOnly: true },
+      { in: "agent_writer.ts", contains: "RoleDefinition", fixtureOnly: true },
+      { in: "any", contains: "RoleDefinition" },
     ],
   },
   {
@@ -189,8 +207,8 @@ export const SHAPE_ASSERTIONS: readonly ShapeAssertion[] = [
       // classify through the egress fabric before the agent sees it.
       { in: "agent.ts", contains: "@crewhaus/boundary-classifier" },
       // The trigger config from the spec must round-trip into the bundle.
-      { in: "agent.ts", contains: '"event"' },
-      { in: "agent.ts", contains: "base-mainnet" },
+      { in: "agent.ts", contains: '"event"', fixtureOnly: true },
+      { in: "agent.ts", contains: "base-mainnet", fixtureOnly: true },
     ],
   },
   {
@@ -199,7 +217,7 @@ export const SHAPE_ASSERTIONS: readonly ShapeAssertion[] = [
     anchors: [
       { in: "agent.ts", contains: "@crewhaus/chain-adapter-evm" },
       { in: "agent.ts", contains: "@crewhaus/boundary-classifier" },
-      { in: "agent.ts", contains: "base-sepolia" },
+      { in: "agent.ts", contains: "base-sepolia", fixtureOnly: true },
     ],
   },
   {
@@ -232,8 +250,10 @@ export const SHAPE_ASSERTIONS: readonly ShapeAssertion[] = [
       // Workflow is sequential; each step name from the fixture must
       // surface in the bundle's step banner so the orchestration
       // scaffold is wired in spec order.
-      { in: "agent.ts", contains: "[step 1/2: list]" },
-      { in: "agent.ts", contains: "[step 2/2: summarise]" },
+      { in: "agent.ts", contains: "[step 1/2: list]", fixtureOnly: true },
+      { in: "agent.ts", contains: "[step 2/2: summarise]", fixtureOnly: true },
+      // Any workflow bundle banners its first step.
+      { in: "agent.ts", contains: "[step 1/" },
     ],
   },
 ];

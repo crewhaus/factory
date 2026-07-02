@@ -18,7 +18,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { compile } from "@crewhaus/compiler";
 import type { Bundle } from "@crewhaus/ir";
-import { SHAPE_ASSERTIONS, type ShapeAssertion } from "./assertions.js";
+import { type Anchor, SHAPE_ASSERTIONS, type ShapeAssertion } from "./assertions.js";
 
 const FIXTURES_DIR = join(dirname(fileURLToPath(import.meta.url)), "fixtures");
 
@@ -93,7 +93,21 @@ export function runShapeSmoke(assertion: ShapeAssertion, deps: ShapeSmokeDeps = 
     failures.push(`expected files ${JSON.stringify(expected)}, got ${JSON.stringify(actualFiles)}`);
   }
 
-  for (const a of assertion.anchors) {
+  failures.push(...anchorFailures(assertion.anchors, bundle));
+
+  return {
+    shape: assertion.shape,
+    fixture,
+    status: failures.length === 0 ? "ok" : "assertion_error",
+    failures,
+    bundle,
+  };
+}
+
+/** Shared anchor walk — used by the fixture matrix and by `assertBundleAgainstShape`. */
+function anchorFailures(anchors: readonly Anchor[], bundle: Bundle): string[] {
+  const failures: string[] = [];
+  for (const a of anchors) {
     if (a.in === "any") {
       const hit = bundle.files.some((f) => f.content.includes(a.contains));
       if (!hit) failures.push(`no file contains ${JSON.stringify(a.contains)}`);
@@ -108,14 +122,44 @@ export function runShapeSmoke(assertion: ShapeAssertion, deps: ShapeSmokeDeps = 
       failures.push(`"${a.in}" missing anchor ${JSON.stringify(a.contains)}`);
     }
   }
+  return failures;
+}
 
-  return {
-    shape: assertion.shape,
-    fixture,
-    status: failures.length === 0 ? "ok" : "assertion_error",
-    failures,
+/**
+ * Exact-match assertion lookup for a compiled bundle's target shape — the
+ * `crewhaus compile --check` selector (item 33). The provider-variant
+ * entries (`cli-openai`, `cli-bedrock`, …) are fixture-matrix-only names
+ * that never equal a spec `target:` literal, so they are unreachable here
+ * by construction; `undefined` means the target ships no shape assertion.
+ */
+export function assertionForTarget(
+  target: string,
+  assertions: readonly ShapeAssertion[] = SHAPE_ASSERTIONS,
+): ShapeAssertion | undefined {
+  return assertions.find((a) => a.shape === target);
+}
+
+/**
+ * Apply a shape assertion to an ARBITRARY bundle (not the smoke fixture) —
+ * the `crewhaus compile --check` path. Two deliberate differences from
+ * `runShapeSmoke`:
+ *   - `expectedFiles` is NOT enforced: several shapes derive file names
+ *     from the spec (crew emits one agent_<role>.ts per role), so the
+ *     fixture's file set does not generalise. Anchors that target a named
+ *     file still fail when that file is missing.
+ *   - anchors marked `fixtureOnly` (content that round-trips from the
+ *     fixture spec: env-ref names, chain ids, step banners) are skipped.
+ * Returns the failure list; empty means the bundle carries the shape's
+ * load-bearing wiring.
+ */
+export function assertBundleAgainstShape(
+  assertion: ShapeAssertion,
+  bundle: Bundle,
+): readonly string[] {
+  return anchorFailures(
+    assertion.anchors.filter((a) => a.fixtureOnly !== true),
     bundle,
-  };
+  );
 }
 
 export function runSmokeMatrix(deps: SmokeMatrixDeps = {}): readonly SmokeResult[] {
@@ -152,4 +196,4 @@ export function runSmokeMatrix(deps: SmokeMatrixDeps = {}): readonly SmokeResult
 }
 
 export { SHAPE_ASSERTIONS } from "./assertions.js";
-export type { ShapeAssertion } from "./assertions.js";
+export type { Anchor, ShapeAssertion } from "./assertions.js";

@@ -25,6 +25,12 @@ name: Release
 # Each channel is an independent job (needs: build) so one channel failing does
 # not block the others. Re-run a single failed job from the Actions UI.
 #
+# Item 33 — the whole fan-out is gated on a green runtime smoke for the tag:
+# `build` needs `smoke-runtime` (which reuses .github/workflows/smoke-runtime.yml
+# via workflow_call and the same ANTHROPIC_API_KEY repository secret), and every
+# channel job needs `build`, so nothing — not even the GitHub Release itself —
+# ships if the runtime smoke is red.
+#
 # Security: every ${{ }} value that flows into a `run:` block is passed via
 # `env:` (never inlined into the shell), per the workflow-injection guidance.
 
@@ -45,8 +51,19 @@ env:
   HOMEPAGE: https://github.com/crewhaus/factory
 
 jobs:
+  smoke-runtime:
+    name: Runtime smoke gate
+    # Item 33 — a release cannot ship without the runtime smoke (real
+    # `crewhaus run` + tool-use assertions) going green for this tag. Reuses
+    # the Smoke (runtime) workflow; `secrets: inherit` hands it the existing
+    # ANTHROPIC_API_KEY repository secret (no new secret names).
+    uses: ./.github/workflows/smoke-runtime.yml
+    secrets: inherit
+
   build:
     name: Build binaries + manifests + GitHub Release
+    # Gating build gates the whole fan-out: every publish job `needs: build`.
+    needs: smoke-runtime
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
