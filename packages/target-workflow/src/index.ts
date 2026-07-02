@@ -1,6 +1,12 @@
 import { CrewhausError } from "@crewhaus/errors";
 import { escapeJsonString } from "@crewhaus/infra-utils";
-import type { Bundle, IrWorkflowStep, IrWorkflowV0 } from "@crewhaus/ir";
+import {
+  type Bundle,
+  type EmitReadmeOptions,
+  type IrWorkflowStep,
+  type IrWorkflowV0,
+  renderBundleReadme,
+} from "@crewhaus/ir";
 
 /**
  * Emit a self-contained workflow agent bundle. The generated agent.ts
@@ -12,15 +18,19 @@ import type { Bundle, IrWorkflowStep, IrWorkflowV0 } from "@crewhaus/ir";
  * Future expansion: parallel/conditional steps, fan-out, retry/branch
  * logic — this v0 emits strictly sequential execution.
  */
-export function emitWorkflow(ir: IrWorkflowV0): Bundle {
-  return {
-    files: [
-      {
-        path: "agent.ts",
-        content: renderAgent(ir),
-      },
-    ],
-  };
+export function emitWorkflow(ir: IrWorkflowV0, opts: EmitReadmeOptions = {}): Bundle {
+  const files = [
+    {
+      path: "agent.ts",
+      content: renderAgent(ir),
+    },
+  ];
+  // Item 42 — generated bundle README; default ON (`crewhaus compile
+  // --no-readme` opts out).
+  if (opts.readme !== false) {
+    files.push({ path: "README.md", content: renderBundleReadme(ir) });
+  }
+  return { files };
 }
 
 export class TargetEmitError extends CrewhausError {

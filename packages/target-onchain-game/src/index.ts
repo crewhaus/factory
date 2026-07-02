@@ -33,7 +33,13 @@
  */
 import { CrewhausError } from "@crewhaus/errors";
 import { escapeJsonString } from "@crewhaus/infra-utils";
-import type { Bundle, IrChainGameV0, IrSecretRef } from "@crewhaus/ir";
+import {
+  type Bundle,
+  type EmitReadmeOptions,
+  type IrChainGameV0,
+  type IrSecretRef,
+  renderBundleReadme,
+} from "@crewhaus/ir";
 
 export class TargetEmitError extends CrewhausError {
   override readonly name = "TargetEmitError";
@@ -67,7 +73,7 @@ function renderWalletKeyRef(walletId: string, ref: IrSecretRef): string {
   return renderSecretRef(ref);
 }
 
-export function emitOnchainGame(ir: IrChainGameV0): Bundle {
+export function emitOnchainGame(ir: IrChainGameV0, opts: EmitReadmeOptions = {}): Bundle {
   if (ir.chain.id !== ir.wallet.chainId) {
     throw new TargetEmitError(
       `wallet.chainId "${ir.wallet.chainId}" does not match chain.id "${ir.chain.id}"`,
@@ -210,5 +216,11 @@ function selectorOf(method: string): string {
 }
 `;
 
-  return { files: [{ path: "agent.ts", content }] };
+  const files = [{ path: "agent.ts", content }];
+  // Item 42 — generated bundle README; default ON (`crewhaus compile
+  // --no-readme` opts out).
+  if (opts.readme !== false) {
+    files.push({ path: "README.md", content: renderBundleReadme(ir) });
+  }
+  return { files };
 }

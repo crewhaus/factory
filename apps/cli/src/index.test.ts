@@ -75,6 +75,46 @@ describe("crewhaus compile", () => {
     expect(result.stdout).toContain("compiled bundle");
   });
 
+  // Item 42 — generated bundle README, DEFAULT-ON.
+  test("emits a generated README.md into the bundle by default (item 42)", async () => {
+    const result = await runCli(["compile", HELLO_SPEC, "-o", tmp]);
+    expect(result.exitCode).toBe(0);
+    const readmePath = join(tmp, "README.md");
+    expect(existsSync(readmePath)).toBe(true);
+    const md = readFileSync(readmePath, "utf-8");
+    expect(md).toContain("<!-- crewhaus:generated-readme -->");
+    expect(md).toContain("| Target | `cli` |");
+    expect(md).toContain("bun agent.ts");
+  });
+
+  test("--no-readme skips the generated README.md (item 42 opt-out)", async () => {
+    const result = await runCli(["compile", HELLO_SPEC, "--no-readme", "-o", tmp]);
+    expect(result.exitCode).toBe(0);
+    expect(existsSync(join(tmp, "agent.ts"))).toBe(true);
+    expect(existsSync(join(tmp, "README.md"))).toBe(false);
+  });
+
+  test("a user-authored README.md in the out-dir is kept, with a notice (item 42)", async () => {
+    const readmePath = join(tmp, "README.md");
+    writeFileSync(readmePath, "# my notes\n\nhand-written\n");
+    const result = await runCli(["compile", HELLO_SPEC, "-o", tmp]);
+    expect(result.exitCode).toBe(0);
+    expect(readFileSync(readmePath, "utf-8")).toBe("# my notes\n\nhand-written\n");
+    expect(result.stdout).toContain("kept");
+    expect(result.stdout).toContain("--no-readme");
+  });
+
+  test("a previously GENERATED README.md is refreshed on recompile (item 42)", async () => {
+    const first = await runCli(["compile", HELLO_SPEC, "-o", tmp]);
+    expect(first.exitCode).toBe(0);
+    const readmePath = join(tmp, "README.md");
+    const generated = readFileSync(readmePath, "utf-8");
+    const second = await runCli(["compile", HELLO_SPEC, "-o", tmp]);
+    expect(second.exitCode).toBe(0);
+    expect(second.stdout).toContain(`wrote ${readmePath}`);
+    expect(readFileSync(readmePath, "utf-8")).toBe(generated);
+  });
+
   test("--emit-ir with -o writes ir.json into the out dir and skips codegen", async () => {
     const result = await runCli(["compile", HELLO_SPEC, "--emit-ir", "-o", tmp]);
     expect(result.exitCode).toBe(0);
@@ -101,6 +141,9 @@ describe("crewhaus compile", () => {
     expect(result.stdout).toContain("by DEFAULT");
     expect(result.stdout).toContain('non-"external"');
     expect(result.stdout).toContain("--allow-unmarked-sinks");
+    // Item 42 — README emission and its opt-out are documented too.
+    expect(result.stdout).toContain("README.md");
+    expect(result.stdout).toContain("--no-readme");
   });
 
   // (a) DEFAULT-ON RED PATH — no flag at all. A spec referencing an `mcp__*`
@@ -834,6 +877,160 @@ describe("crewhaus cost-summary", () => {
     const out = JSON.parse(result.stdout) as { totalUsdMicros: number };
     expect(out.totalUsdMicros).toBe(1000);
   });
+
+  // Item 28 (half 1) — cache economics columns.
+  type CacheSummaryJson = {
+    count: number;
+    totalUsdMicros: number;
+    byProvider: Record<string, number>;
+    inputTokens: number;
+    outputTokens: number;
+    cachedReadTokens: number;
+    cacheCreationTokens: number;
+    cacheHitRatio: number;
+    cacheSavingsUsdMicros: number;
+    cacheByModel: Record<
+      string,
+      {
+        inputTokens: number;
+        outputTokens: number;
+        cachedReadTokens: number;
+        cacheCreationTokens: number;
+        cacheHitRatio: number;
+        cacheSavingsUsdMicros: number | null;
+      }
+    >;
+  };
+
+  function seedCacheSession(): void {
+    seedSession([
+      {
+        ts: 1,
+        version: 1,
+        kind: "cost_accrual",
+        payload: {
+          provider: "anthropic",
+          modelId: "claude-sonnet-4-6",
+          inputTokens: 1000,
+          outputTokens: 100,
+          cachedReadTokens: 4000,
+          cacheCreationTokens: 2000,
+          // 1000×3 + 100×15 + 4000×0.3 + 2000×3.75 (sonnet row + fallback cache rates)
+          costUsdMicros: 13_200,
+        },
+      },
+      {
+        ts: 2,
+        version: 1,
+        kind: "cost_accrual",
+        // Unmapped model — tokens/ratio still aggregate; savings can't be priced.
+        payload: {
+          provider: "openai",
+          modelId: "fictional-model-99",
+          inputTokens: 100,
+          outputTokens: 10,
+          cachedReadTokens: 100,
+          cacheCreationTokens: 50,
+          costUsdMicros: 42,
+        },
+      },
+    ]);
+  }
+
+  test("json gains cache economics: tokens, hit ratio, and realized savings per provider/model + total", async () => {
+    seedCacheSession();
+    const result = await runCli(["cost-summary", "--session", SESSION_ID, "--format", "json"], {
+      cwd: tmp,
+    });
+    expect(result.exitCode).toBe(0);
+    const out = JSON.parse(result.stdout) as CacheSummaryJson;
+    // Pre-existing fields keep their exact shape and values (additive-only).
+    expect(out.count).toBe(2);
+    expect(out.totalUsdMicros).toBe(13_242);
+    expect(out.byProvider["anthropic"]).toBe(13_200);
+    expect(out.byProvider["openai"]).toBe(42);
+    // Totals across models.
+    expect(out.inputTokens).toBe(1100);
+    expect(out.outputTokens).toBe(110);
+    expect(out.cachedReadTokens).toBe(4100);
+    expect(out.cacheCreationTokens).toBe(2050);
+    // hit = cachedRead / (input + cachedRead) = 4100 / 5200
+    expect(out.cacheHitRatio).toBeCloseTo(4100 / 5200, 10);
+    // Savings sum only over priced buckets:
+    // sonnet reads 4000 × ($3 − $0.3) = 10_800; writes 2000 × ($3.75 − $3) = 1_500 → 9_300.
+    expect(out.cacheSavingsUsdMicros).toBe(9_300);
+    const sonnet = out.cacheByModel["anthropic/claude-sonnet-4-6"];
+    expect(sonnet?.cachedReadTokens).toBe(4000);
+    expect(sonnet?.cacheCreationTokens).toBe(2000);
+    expect(sonnet?.cacheHitRatio).toBeCloseTo(0.8, 10);
+    expect(sonnet?.cacheSavingsUsdMicros).toBe(9_300);
+    const unknown = out.cacheByModel["openai/fictional-model-99"];
+    expect(unknown?.cacheHitRatio).toBeCloseTo(0.5, 10);
+    expect(unknown?.cacheSavingsUsdMicros).toBeNull();
+  });
+
+  test("text format appends cache lines per provider/model + total, unknown model prices as n/a", async () => {
+    seedCacheSession();
+    const result = await runCli(["cost-summary", "--session", SESSION_ID], { cwd: tmp });
+    expect(result.exitCode).toBe(0);
+    // Pre-existing lines unchanged.
+    expect(result.stdout).toContain(`session: ${SESSION_ID}`);
+    expect(result.stdout).toContain("accrual events: 2");
+    expect(result.stdout).toContain("total: $0.0132");
+    // New cache economics lines.
+    expect(result.stdout).toContain("cache: read=4100 write=2050 hit=78.8% savings=$0.0093");
+    expect(result.stdout).toContain(
+      "  anthropic/claude-sonnet-4-6: read=4000 write=2000 hit=80.0% savings=$0.0093",
+    );
+    expect(result.stdout).toContain(
+      "  openai/fictional-model-99: read=100 write=50 hit=50.0% savings=n/a",
+    );
+  });
+
+  test("old logs keep parsing: token-less and pre-cache-write accruals aggregate with zero-filled cache fields", async () => {
+    seedSession([
+      // Oldest vintage: no token fields at all.
+      {
+        ts: 1,
+        version: 1,
+        kind: "cost_accrual",
+        payload: { provider: "anthropic", modelId: "claude-sonnet-4-6", costUsdMicros: 450 },
+      },
+      // Mid vintage: cachedReadTokens but no cacheCreationTokens.
+      {
+        ts: 2,
+        version: 1,
+        kind: "cost_accrual",
+        payload: {
+          provider: "anthropic",
+          modelId: "claude-sonnet-4-6",
+          inputTokens: 1000,
+          outputTokens: 10,
+          cachedReadTokens: 500,
+          costUsdMicros: 3_300,
+        },
+      },
+    ]);
+    const result = await runCli(["cost-summary", "--session", SESSION_ID, "--format", "json"], {
+      cwd: tmp,
+    });
+    expect(result.exitCode).toBe(0);
+    const out = JSON.parse(result.stdout) as CacheSummaryJson;
+    expect(out.count).toBe(2);
+    expect(out.totalUsdMicros).toBe(3_750);
+    expect(out.cachedReadTokens).toBe(500);
+    expect(out.cacheCreationTokens).toBe(0);
+    expect(out.cacheHitRatio).toBeCloseTo(500 / 1500, 10);
+    // Savings with zero writes: 500 × ($3 − $0.3) = 1_350 micros.
+    expect(out.cacheSavingsUsdMicros).toBe(1_350);
+  });
+
+  test("cost-summary --help documents the hit-ratio denominator and savings formula", async () => {
+    const result = await runCli(["cost-summary", "--help"]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("cachedReadTokens / (inputTokens + cachedReadTokens)");
+    expect(result.stdout).toContain("cache-write premium");
+  });
 });
 
 describe("crewhaus version", () => {
@@ -1305,5 +1502,153 @@ describe("crewhaus retention (item 35)", () => {
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("overlaps the live store");
     expect(existsSync(join(tmp, ".crewhaus", "sessions", "sess_1111111111111111.json"))).toBe(true);
+  });
+});
+
+describe("crewhaus spec auto-register + changelog (item 46)", () => {
+  // Every run uses `cwd: tmp` so the registry (.crewhaus/specs) lands in the
+  // per-test temp dir, not the repo checkout.
+  const REGISTRY = () => join(tmp, ".crewhaus", "specs");
+
+  function writeSpecVariant(instructions: string): string {
+    const src = readFileSync(HELLO_SPEC, "utf-8");
+    const specPath = join(tmp, "crewhaus.yaml");
+    writeFileSync(
+      specPath,
+      src.replace(/instructions: \|[\s\S]*$/m, `instructions: ${instructions}\n`),
+    );
+    return specPath;
+  }
+
+  test("a successful compile auto-registers v1 and starts the changelog", async () => {
+    const out = join(tmp, "out");
+    const result = await runCli(["compile", HELLO_SPEC, "-o", out], { cwd: tmp });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("registered hello@v1");
+    expect(existsSync(join(REGISTRY(), "hello", "v1.yaml"))).toBe(true);
+    expect(existsSync(join(REGISTRY(), "hello", "manifest.json"))).toBe(true);
+    const changelog = readFileSync(join(REGISTRY(), "hello", "CHANGELOG.md"), "utf-8");
+    expect(changelog).toContain("# Changelog — hello");
+    expect(changelog).toContain("## v1");
+    expect(changelog).toContain("- initial version");
+  });
+
+  test("recompiling an unchanged spec is a registry no-op", async () => {
+    const out = join(tmp, "out");
+    const first = await runCli(["compile", HELLO_SPEC, "-o", out], { cwd: tmp });
+    expect(first.stdout).toContain("registered hello@v1");
+    const second = await runCli(["compile", HELLO_SPEC, "-o", out], { cwd: tmp });
+    expect(second.exitCode).toBe(0);
+    expect(second.stdout).toContain("unchanged hello@v1");
+    const changelog = readFileSync(join(REGISTRY(), "hello", "CHANGELOG.md"), "utf-8");
+    expect(changelog.match(/^## /gm)).toHaveLength(1);
+  });
+
+  test("a changed spec registers v2 with a field-level diff, newest entry first", async () => {
+    const out = join(tmp, "out");
+    const v1 = writeSpecVariant("Answer briefly.");
+    await runCli(["compile", v1, "-o", out], { cwd: tmp });
+    const v2 = writeSpecVariant("Answer thoroughly.");
+    const result = await runCli(["compile", v2, "-o", out], { cwd: tmp });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("registered hello@v2");
+    const changelog = readFileSync(join(REGISTRY(), "hello", "CHANGELOG.md"), "utf-8");
+    expect(changelog).toContain("- changed `agent.instructions`");
+    expect(changelog.indexOf("## v2")).toBeLessThan(changelog.indexOf("## v1"));
+  });
+
+  test("--no-register skips the auto-put entirely", async () => {
+    const out = join(tmp, "out");
+    const result = await runCli(["compile", HELLO_SPEC, "--no-register", "-o", out], { cwd: tmp });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).not.toContain("registered");
+    expect(existsSync(REGISTRY())).toBe(false);
+  });
+
+  test("spec log prints the accumulated changelog", async () => {
+    const out = join(tmp, "out");
+    await runCli(["compile", HELLO_SPEC, "-o", out], { cwd: tmp });
+    const result = await runCli(["spec", "log", "hello"], { cwd: tmp });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("# Changelog — hello");
+    expect(result.stdout).toContain("## v1");
+  });
+
+  test("spec log for an unregistered name dies with a helpful message", async () => {
+    const result = await runCli(["spec", "log", "nope"], { cwd: tmp });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('no changelog for "nope"');
+  });
+
+  test("a manual `spec put` also appends changelog entries (with diff on the second put)", async () => {
+    const f1 = join(tmp, "a.yaml");
+    const f2 = join(tmp, "b.yaml");
+    writeFileSync(f1, "target: cli\nname: demo\nagent:\n  model: m\n  instructions: One.\n");
+    writeFileSync(f2, "target: cli\nname: demo\nagent:\n  model: m\n  instructions: Two.\n");
+    const put1 = await runCli(["spec", "put", "demo", "v1", f1], { cwd: tmp });
+    expect(put1.exitCode).toBe(0);
+    const put2 = await runCli(["spec", "put", "demo", "v2", f2], { cwd: tmp });
+    expect(put2.exitCode).toBe(0);
+    const log = await runCli(["spec", "log", "demo"], { cwd: tmp });
+    expect(log.exitCode).toBe(0);
+    expect(log.stdout).toContain('- changed `agent.instructions`: "One." → "Two."');
+    expect(log.stdout.indexOf("## v2")).toBeLessThan(log.stdout.indexOf("## v1"));
+  });
+
+  test("compile --help and optimize --help document --no-register", async () => {
+    const compileHelp = await runCli(["compile", "--help"]);
+    expect(compileHelp.exitCode).toBe(0);
+    expect(compileHelp.stdout).toContain("--no-register");
+    expect(compileHelp.stdout).toContain("spec log");
+    const optimizeHelp = await runCli(["optimize", "--help"]);
+    expect(optimizeHelp.exitCode).toBe(0);
+    expect(optimizeHelp.stdout).toContain("--no-register");
+  });
+
+  test("spec --help lists the log action", async () => {
+    const result = await runCli(["spec", "log", "--help"]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("spec log <name>");
+    // Review F3: the sanitation behaviour is documented in the help text.
+    expect(result.stdout).toContain('"My Agent" → My-Agent');
+  });
+
+  test("spec log accepts the display name compile registered under its sanitized slot (review F3)", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    writeFileSync(
+      specPath,
+      readFileSync(HELLO_SPEC, "utf-8").replace(/^name: .*$/m, "name: My Agent"),
+    );
+    const out = join(tmp, "out");
+    const compiled = await runCli(["compile", specPath, "-o", out], { cwd: tmp });
+    expect(compiled.exitCode).toBe(0);
+    expect(compiled.stdout).toContain("registered My-Agent@v1");
+    // The raw display name no longer dies — it resolves to the same slot.
+    const log = await runCli(["spec", "log", "My Agent"], { cwd: tmp });
+    expect(log.exitCode).toBe(0);
+    expect(log.stdout).toContain('showing log for My-Agent (sanitized from "My Agent")');
+    expect(log.stdout).toContain("# Changelog — My-Agent");
+    // The sanitized form keeps working too, without the notice.
+    const direct = await runCli(["spec", "log", "My-Agent"], { cwd: tmp });
+    expect(direct.exitCode).toBe(0);
+    expect(direct.stdout).not.toContain("sanitized from");
+  });
+
+  test("changelog + spec log never print credential tokens from instructions (review F1)", async () => {
+    const out = join(tmp, "out");
+    await runCli(["compile", writeSpecVariant("Answer briefly."), "-o", out], { cwd: tmp });
+    const second = await runCli(
+      ["compile", writeSpecVariant("Use key sk-live-DEADBEEFDEADBEEF for calls."), "-o", out],
+      { cwd: tmp },
+    );
+    expect(second.exitCode).toBe(0);
+    const changelog = readFileSync(join(REGISTRY(), "hello", "CHANGELOG.md"), "utf-8");
+    expect(changelog).toContain("- changed `agent.instructions`");
+    expect(changelog).not.toContain("sk-live");
+    expect(changelog).not.toContain("DEADBEEF");
+    expect(changelog).toContain("***");
+    const log = await runCli(["spec", "log", "hello"], { cwd: tmp });
+    expect(log.exitCode).toBe(0);
+    expect(log.stdout).not.toContain("sk-live");
   });
 });

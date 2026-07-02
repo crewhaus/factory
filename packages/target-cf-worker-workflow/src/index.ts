@@ -1,6 +1,6 @@
 import { CrewhausError } from "@crewhaus/errors";
 import { escapeJsonString } from "@crewhaus/infra-utils";
-import type { Bundle, IrWorkflowV0 } from "@crewhaus/ir";
+import { type Bundle, type IrWorkflowV0, renderBundleReadme } from "@crewhaus/ir";
 import { parseModelString } from "@crewhaus/model-router";
 
 export type EmitOptions = {
@@ -11,6 +11,8 @@ export type EmitOptions = {
    * anywhere (pages.dev, ngrok, LAN IP) without editing the emitter.
    */
   readonly allowedOrigins?: readonly string[];
+  /** Item 42 — emit a generated README.md into the bundle. Default true. */
+  readonly readme?: boolean;
 };
 
 const DEFAULT_ALLOWED_ORIGINS = ["https://studio.crewhaus.ai", "http://localhost:4322"];
@@ -58,14 +60,33 @@ export function emitCfWorkerWorkflow(ir: IrWorkflowV0, opts: EmitOptions = {}): 
     opts.allowedOrigins && opts.allowedOrigins.length > 0
       ? [...opts.allowedOrigins]
       : DEFAULT_ALLOWED_ORIGINS;
-  return {
-    files: [
-      { path: "worker.js", content: renderWorker(ir, allowedOrigins) },
-      { path: "wrangler.toml", content: renderWrangler(ir) },
-      { path: "package.json", content: renderPackageJson(ir) },
-    ],
-  };
+  const files = [
+    { path: "worker.js", content: renderWorker(ir, allowedOrigins) },
+    { path: "wrangler.toml", content: renderWrangler(ir) },
+    { path: "package.json", content: renderPackageJson(ir) },
+  ];
+  // Item 42 — generated bundle README; default ON. The default per-target
+  // run snippet keys on ir.target ("workflow" → `bun agent.ts`), which is
+  // wrong for a Worker bundle, so substitute the wrangler flow.
+  if (opts.readme !== false) {
+    files.push({ path: "README.md", content: renderBundleReadme(ir, CF_WORKER_README_OPTS) });
+  }
+  return { files };
 }
+
+const CF_WORKER_README_OPTS = {
+  usage: {
+    heading: "Deploy",
+    body: [
+      "```sh",
+      "wrangler secret put ANTHROPIC_API_KEY   # one-time Worker secret",
+      "wrangler deploy",
+      "```",
+    ].join("\n"),
+  },
+  // A deployed Worker has no local `.crewhaus/` workspace.
+  includeWorkspaceNote: false,
+} as const;
 
 export class TargetEmitError extends CrewhausError {
   override readonly name = "TargetEmitError";

@@ -5,6 +5,7 @@ import { basename, dirname, join, relative, resolve } from "node:path";
 import type { SubAgentDefinition } from "@crewhaus/agent-context-isolation";
 import { SpecParseError, compile, lower } from "@crewhaus/compiler";
 import { buildContextBundle, discoverRoots } from "@crewhaus/context-bundle";
+import { DEFAULT_PRICING, computeCacheSavingsMicros, resolvePricing } from "@crewhaus/cost-tracker";
 import { CrewhausError } from "@crewhaus/errors";
 import { loadDataset } from "@crewhaus/eval-dataset";
 import { parseGradersConfig } from "@crewhaus/eval-grader";
@@ -19,6 +20,7 @@ import {
   type ParsedArgs,
   parseArgs,
 } from "@crewhaus/infra-utils";
+import { GENERATED_README_MARKER } from "@crewhaus/ir";
 import { createLogger } from "@crewhaus/logging";
 import { McpHost } from "@crewhaus/mcp-host";
 import {
@@ -39,7 +41,7 @@ import { spawnSubAgent } from "@crewhaus/sub-agent-spawner";
 import { type RegisteredTool, ToolCatalog } from "@crewhaus/tool-catalog";
 import { registerMcpServer } from "@crewhaus/tool-mcp";
 import { createTaskTool } from "@crewhaus/tool-task";
-import { type CostAccrualEvent, TraceEventBus } from "@crewhaus/trace-event-bus";
+import { type CostAccrualEvent, type ProviderId, TraceEventBus } from "@crewhaus/trace-event-bus";
 // Item 34 — `crewhaus audit verify` plumbing (anchor-flag parsing + per-check
 // summary + doctor mapping), in a side-effect-free module so it is
 // unit-testable (this entry file runs an argv switch on import).
@@ -112,6 +114,19 @@ import {
 // `doctor --philosophy-alignment`. Kept in a side-effect-free module so it is
 // unit-testable (this entry file runs an argv switch on import).
 import { auditSpecToolNames, auditToolScopes, collectToolNames } from "./scope-audit";
+// Item 69 — `crewhaus state backup|restore` core (tarball snapshot of the
+// cwd `.crewhaus` state dir + full/merge restore), in a module with no
+// import-time side effects so it is unit-testable (this entry file runs an
+// argv switch on import).
+import {
+  StateBackupError,
+  createStateBackup,
+  defaultBackupFileName,
+  mergeAllFromArchive,
+  mergeFeedbackFromArchive,
+  parseExcludeGlobs,
+  restoreStateArchive,
+} from "./state-backup";
 
 /**
  * crewhaus — slice-scope CLI.
@@ -148,6 +163,14 @@ const COMPILE_SCHEMA: ParseArgsSchema = {
     // FAILS the compile.
     { name: "allow-unmarked-sinks", takesValue: false },
     { name: "no-strict-scope", takesValue: false },
+    // Item 42 — README emission into the bundle is DEFAULT-ON; this is the
+    // explicit opt-out for users who post-process bundles and don't want
+    // the extra file.
+    { name: "no-readme", takesValue: false },
+    // Item 46 — auto-registration of the compiled spec into the local
+    // spec-registry (with a distilled CHANGELOG.md entry) is DEFAULT-ON;
+    // this is the explicit opt-out.
+    { name: "no-register", takesValue: false },
     { name: "help", short: "h" },
   ],
 };
@@ -230,6 +253,10 @@ const OPTIMIZE_SCHEMA: ParseArgsSchema = {
     // FR-003 — dollar ceiling for model-driven runs (composes with --iterations).
     { name: "budget-usd", takesValue: true },
     { name: "write-back", takesValue: false },
+    // Item 46 — after a successful --write-back the working spec changed, so
+    // the same auto-register + changelog flow as `compile` runs; this is the
+    // explicit opt-out (mirrors `compile --no-register`).
+    { name: "no-register", takesValue: false },
     { name: "out", short: "o", takesValue: true },
     { name: "help", short: "h" },
   ],
@@ -296,6 +323,19 @@ const DISTILL_SCHEMA: ParseArgsSchema = {
     { name: "min-score", takesValue: true },
     { name: "judge", takesValue: false },
     { name: "judge-model", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
+const STATE_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // backup
+    { name: "out", short: "o", takesValue: true },
+    { name: "exclude", takesValue: true },
+    // restore
+    { name: "into", takesValue: true },
+    { name: "merge", takesValue: true },
+    { name: "force", takesValue: false },
     { name: "help", short: "h" },
   ],
 };
@@ -448,9 +488,13 @@ function usageText(): string {
     "       [--turn N] [--correction <better answer>]",
     "  distill --session <id> -o <ds.jsonl> turn ratings into an eval dataset + graders",
     "       [--all-sessions] [--graders-out <g.yaml>] [--min-score F]",
+    "  state backup [-o <file.tar.gz>]      snapshot the cwd .crewhaus state dir to a tarball (item 69)",
+    "       [--exclude <glob,glob>]",
+    "  state restore <file.tar.gz>          restore a snapshot (refuses a non-empty .crewhaus)",
+    "       [--into <dir>] [--force] [--merge feedback|all]",
     "  secrets doctor                       list known secrets via the configured backend",
     "  secrets rotate <name> [--value V]    rotate a named secret (file backend)",
-    "  spec put|list|get|pin|alias ...      versioned spec storage (Section 28 spec-registry)",
+    "  spec put|list|get|pin|alias|log ...  versioned spec storage + changelog (Section 28 spec-registry)",
     "  deploy promote|rollback ...          re-pin a spec for an environment (Section 28)",
     "  migrate-all --from N --to N          batch-migrate every spec in the registry",
     "  build-image <target> --tag <tag>     build the docker image for a target shape (Section 32)",
@@ -506,25 +550,31 @@ function die(message: string): never {
 // --compile --define` — standalone binaries have no package.json on disk.
 declare const CREWHAUS_EMBEDDED_VERSION: string | undefined;
 
-function printVersion(): void {
-  if (typeof CREWHAUS_EMBEDDED_VERSION === "string") {
-    process.stdout.write(`${CREWHAUS_EMBEDDED_VERSION}\n`);
-    return;
-  }
+/**
+ * Resolve the CLI version string: the build-time embedded constant when this
+ * is a standalone binary, else package.json. Undefined when neither source
+ * is available (`version` dies on it; the backup manifest stamps "unknown").
+ */
+function cliVersion(): string | undefined {
+  if (typeof CREWHAUS_EMBEDDED_VERSION === "string") return CREWHAUS_EMBEDDED_VERSION;
   // The package ships src/ directly (bin → src/index.ts) and tsc -b also
   // emits dist/, so resolve package.json relative to this module — one level
   // up lands on apps/cli/package.json from either tree, and on
   // node_modules/@crewhaus/cli/package.json when installed.
-  let version: string;
   try {
-    version = (
+    return (
       JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf-8")) as {
         version: string;
       }
     ).version;
   } catch {
-    die("could not locate package.json to determine the version");
+    return undefined;
   }
+}
+
+function printVersion(): void {
+  const version = cliVersion();
+  if (version === undefined) die("could not locate package.json to determine the version");
   process.stdout.write(`${version}\n`);
 }
 
@@ -541,9 +591,26 @@ async function runCompile(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
       "usage: crewhaus compile <spec.yaml> [-o <out-dir>] [--emit-ir]\n" +
-        "                        [--allow-unmarked-sinks]\n" +
+        "                        [--allow-unmarked-sinks] [--no-readme] [--no-register]\n" +
         "  --emit-ir  Skip code emission; print the lowered IR as JSON to\n" +
         "             stdout (or to <out-dir>/ir.json when -o is set).\n" +
+        "\n" +
+        "  Every emitted bundle includes a generated README.md documenting\n" +
+        "  the harness (name/target/model), its tools and MCP servers, the\n" +
+        "  env vars it needs, and how to launch it. A previously generated\n" +
+        "  README.md in the out-dir is refreshed on recompile; a README.md\n" +
+        "  NOT generated by crewhaus (no generation marker) is kept as-is\n" +
+        "  with a notice.\n" +
+        "  --no-readme  Skip the generated README.md.\n" +
+        "\n" +
+        "  A successful bundle compile also auto-registers the spec in the\n" +
+        "  local registry (.crewhaus/specs): when no stored version matches\n" +
+        "  the spec's content hash, the next vN is put and a distilled entry\n" +
+        "  (field-level diff vs the previous version, plus optimizer\n" +
+        "  provenance for written-back specs) is appended to the per-spec\n" +
+        "  CHANGELOG.md — render it with `crewhaus spec log <name>`.\n" +
+        "  Recompiling an unchanged spec is a no-op (`unchanged <name>@<v>`).\n" +
+        "  --no-register  Skip the registry auto-put + changelog entry.\n" +
         "\n" +
         "  FR-002 — the strict scope gate runs by DEFAULT: the build fails\n" +
         "  (exit 1) if any I/O-capable tool the spec uses is left at a\n" +
@@ -573,6 +640,10 @@ async function runCompile(args: ParsedArgs): Promise<void> {
   const allowUnmarkedSinks =
     args.flags["allow-unmarked-sinks"] === true || args.flags["no-strict-scope"] === true;
   const strict = !allowUnmarkedSinks;
+  // Item 42 — generated bundle README, DEFAULT-ON; --no-readme opts out.
+  const readme = args.flags["no-readme"] !== true;
+  // Item 46 — registry auto-put + changelog, DEFAULT-ON; --no-register opts out.
+  const register = args.flags["no-register"] !== true;
   if (typeof specPath !== "string") die("missing <spec.yaml>");
   if (!emitIr && typeof outDir !== "string") die("missing -o <out-dir>");
 
@@ -633,7 +704,7 @@ async function runCompile(args: ParsedArgs): Promise<void> {
 
   let bundle: ReturnType<typeof compile>;
   try {
-    bundle = compile(yamlText);
+    bundle = compile(yamlText, { readme });
   } catch (err) {
     // compile() runs parse → lower → emit. parseSpec throws SpecParseError;
     // each target emitter throws its own TargetEmitError (e.g. an unresolvable
@@ -652,12 +723,70 @@ async function runCompile(args: ParsedArgs): Promise<void> {
   mkdirSync(absOut, { recursive: true });
   for (const file of bundle.files) {
     const fullPath = join(absOut, file.path);
+    // Item 42 — never silently clobber a USER-AUTHORED README.md. A README
+    // we generated earlier carries GENERATED_README_MARKER and is refreshed
+    // like any other bundle file; one without the marker is kept, with a
+    // notice (pass --no-readme to silence).
+    if (file.path === "README.md" && existsSync(fullPath)) {
+      let existing: string;
+      try {
+        existing = readFileSync(fullPath, "utf-8");
+      } catch {
+        existing = "";
+      }
+      if (!existing.includes(GENERATED_README_MARKER)) {
+        process.stdout.write(
+          `kept ${fullPath} (not generated by crewhaus — pass --no-readme to skip README emission)\n`,
+        );
+        continue;
+      }
+    }
     mkdirSync(dirname(fullPath), { recursive: true });
     writeFileSync(fullPath, file.content);
     process.stdout.write(`wrote ${fullPath}\n`);
   }
   process.stdout.write(`compiled bundle (${bundle.files.length} file(s)) → ${absOut}\n`);
+  // Item 46 — auto-register the just-compiled spec in the local registry so
+  // registry state tracks working files without a manual `crewhaus spec put`.
+  // Bundle mode only: --emit-ir streams JSON to stdout, which a status line
+  // would corrupt. Runs AFTER the success line — a compile that failed never
+  // registers.
+  if (register) await autoRegisterSpec(yamlText);
   logger.debug("compile.success", { files: bundle.files.length, out: absOut });
+}
+
+/**
+ * Item 46 — shared auto-register hook for `compile` and `optimize
+ * --write-back` (wiring only; the logic lives in ./spec-changelog). Content-
+ * hash gated: prints one quiet line — `registered <name>@<vN>` on a new put,
+ * `unchanged <name>@<v>` when some stored version already carries this exact
+ * content. Registration is a convenience, not a gate: any failure warns on
+ * stderr and never fails the parent command.
+ */
+async function autoRegisterSpec(
+  yamlText: string,
+  hooks: { patchJsonPath?: string } = {},
+): Promise<void> {
+  try {
+    const specName = parseSpec(yamlText).name;
+    const rootDir = join(process.cwd(), ".crewhaus", "specs");
+    const { createFileBackedRegistry } = await import("@crewhaus/spec-registry");
+    const { autoRegisterSpecVersion } = await import("./spec-changelog");
+    const result = await autoRegisterSpecVersion({
+      registry: createFileBackedRegistry({ rootDir }),
+      registryRootDir: rootDir,
+      specName,
+      yaml: yamlText,
+      // Default patch.json resolution for changelog provenance: the header's
+      // runId under the standard optimize root (cwd-relative, matching where
+      // `crewhaus optimize` writes when -o is omitted).
+      optimizeRootDir: join(process.cwd(), ".crewhaus", "optimize"),
+      ...(hooks.patchJsonPath !== undefined ? { patchJsonPath: hooks.patchJsonPath } : {}),
+    });
+    process.stdout.write(`${result.status} ${result.name}@${result.version}\n`);
+  } catch (err) {
+    process.stderr.write(`[register] skipped: ${(err as Error).message}\n`);
+  }
 }
 
 /**
@@ -1631,7 +1760,11 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
     process.stdout.write(
       "usage: crewhaus optimize <spec.yaml> (--dataset <data> --graders <graders.yaml> | --ratings <session>) " +
         "[--min-score F] [--mutator rule-based|claude] [--iterations N] [--seed N] [--concurrency N] " +
-        "[--improvement-threshold F] [--budget-usd N] [--write-back] [-o <out-dir>]\n",
+        "[--improvement-threshold F] [--budget-usd N] [--write-back] [--no-register] [-o <out-dir>]\n" +
+        "  A successful --write-back auto-registers the rewritten spec in the local\n" +
+        "  registry (.crewhaus/specs) with a changelog entry carrying the run's\n" +
+        "  score delta and patch rationale — same flow as `crewhaus compile`;\n" +
+        "  --no-register opts out. See `crewhaus spec log <name>`.\n",
     );
     return;
   }
@@ -1878,6 +2011,16 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
   if (result.applied) {
     if (result.writtenTo) {
       process.stdout.write(`[optimize] wrote patched YAML to ${result.writtenTo}\n`);
+      // Item 46 — a successful write-back changed the working spec, so run
+      // the same auto-register + changelog flow as `compile`. Re-read the
+      // written file (it now carries the formatWriteBackHeader stamp the
+      // changelog distills) and pass this run's own patch.json explicitly —
+      // a custom -o relocates it away from .crewhaus/optimize/<runId>/.
+      if (args.flags["no-register"] !== true) {
+        await autoRegisterSpec(readFileSync(result.writtenTo, "utf-8"), {
+          patchJsonPath: join(result.outDir, "patch.json"),
+        });
+      }
     } else {
       process.stdout.write(
         `[optimize] patch ready (improvement ≥ ${improvementThreshold}). Re-run with --write-back to apply.\n`,
@@ -2033,9 +2176,54 @@ async function runEvalReport(args: ParsedArgs): Promise<void> {
  * the cost_accrual events embedded in there. Tenant aggregation lands in
  * §31's studio-server cost dashboard.
  */
+/** Per-(provider/model) cache-economics accumulator for `cost-summary`. */
+type CacheStats = {
+  inputTokens: number;
+  outputTokens: number;
+  cachedReadTokens: number;
+  cacheCreationTokens: number;
+};
+
+/** Cache hit ratio = cachedReadTokens / (inputTokens + cachedReadTokens); 0 when no input observed. */
+function cacheHitRatio(s: CacheStats): number {
+  const denominator = s.inputTokens + s.cachedReadTokens;
+  return denominator === 0 ? 0 : s.cachedReadTokens / denominator;
+}
+
+/**
+ * Realized savings for one provider/model bucket, repriced from the current
+ * DEFAULT_PRICING (the accrual carries `(provider, modelId)` — exactly the
+ * `resolvePricing` key). Unknown provider/model → undefined (savings cannot
+ * be priced; tokens and hit ratio still report).
+ */
+function cacheSavingsMicros(provider: string, modelId: string, s: CacheStats): number | undefined {
+  const row = resolvePricing(DEFAULT_PRICING, provider as ProviderId, modelId);
+  if (!row) return undefined;
+  return computeCacheSavingsMicros(row, s.cachedReadTokens, s.cacheCreationTokens);
+}
+
+function formatCacheLine(s: CacheStats, savings: number | undefined): string {
+  const hitPct = (cacheHitRatio(s) * 100).toFixed(1);
+  const savingsStr = savings === undefined ? "n/a" : `$${(savings / 1_000_000).toFixed(4)}`;
+  return (
+    `read=${s.cachedReadTokens} write=${s.cacheCreationTokens} ` +
+    `hit=${hitPct}% savings=${savingsStr}`
+  );
+}
+
 async function runCostSummary(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
-    process.stdout.write("usage: crewhaus cost-summary --session <id> [--format json|text]\n");
+    process.stdout.write(
+      "usage: crewhaus cost-summary --session <id> [--format json|text]\n" +
+        "\n" +
+        "cache economics columns (per provider/model and total):\n" +
+        "  read     prompt-cache READ tokens (billed at the discounted cached rate)\n" +
+        "  write    prompt-cache WRITE tokens (billed at a premium over input)\n" +
+        "  hit      cache hit ratio = cachedReadTokens / (inputTokens + cachedReadTokens)\n" +
+        "  savings  realized savings = (cached reads at the full input price)\n" +
+        "           - (cached reads at the discounted rate)\n" +
+        "           - (cache-write premium paid above the normal input price)\n",
+    );
     return;
   }
   const session = args.flags["session"];
@@ -2052,6 +2240,14 @@ async function runCostSummary(args: ParsedArgs): Promise<void> {
   let totalMicros = 0;
   const byProvider: Record<string, number> = {};
   let count = 0;
+  const totalCache: CacheStats = {
+    inputTokens: 0,
+    outputTokens: 0,
+    cachedReadTokens: 0,
+    cacheCreationTokens: 0,
+  };
+  // Keyed "provider/modelId"; insertion order == first-seen order, stable for output.
+  const byModel = new Map<string, { provider: string; modelId: string; stats: CacheStats }>();
   for (const raw of lines) {
     let parsed: unknown;
     try {
@@ -2067,25 +2263,96 @@ async function runCostSummary(args: ParsedArgs): Promise<void> {
     ) {
       // event-log writes a `{ ts, version, kind, payload }` envelope, so the
       // cost fields live under `payload`. Fall back to top-level fields so a
-      // hand-written/flat cost_accrual line still aggregates.
-      const e = parsed as {
+      // hand-written/flat cost_accrual line still aggregates. Every token
+      // field is optional — logs persisted before cache economics landed
+      // carry only provider/costUsdMicros (or no cacheCreationTokens) and
+      // must keep parsing.
+      type AccrualFields = {
         provider?: string;
+        modelId?: string;
         costUsdMicros?: number;
-        payload?: { provider?: string; costUsdMicros?: number };
+        inputTokens?: number;
+        outputTokens?: number;
+        cachedReadTokens?: number;
+        cacheCreationTokens?: number;
       };
+      const e = parsed as AccrualFields & { payload?: AccrualFields };
       const provider = e.payload?.provider ?? e.provider;
       const micros = e.payload?.costUsdMicros ?? e.costUsdMicros;
       if (typeof provider === "string" && typeof micros === "number") {
         totalMicros += micros;
         byProvider[provider] = (byProvider[provider] ?? 0) + micros;
         count++;
+        const modelId = e.payload?.modelId ?? e.modelId;
+        const delta: CacheStats = {
+          inputTokens: e.payload?.inputTokens ?? e.inputTokens ?? 0,
+          outputTokens: e.payload?.outputTokens ?? e.outputTokens ?? 0,
+          cachedReadTokens: e.payload?.cachedReadTokens ?? e.cachedReadTokens ?? 0,
+          cacheCreationTokens: e.payload?.cacheCreationTokens ?? e.cacheCreationTokens ?? 0,
+        };
+        totalCache.inputTokens += delta.inputTokens;
+        totalCache.outputTokens += delta.outputTokens;
+        totalCache.cachedReadTokens += delta.cachedReadTokens;
+        totalCache.cacheCreationTokens += delta.cacheCreationTokens;
+        if (typeof modelId === "string") {
+          const key = `${provider}/${modelId}`;
+          const bucket = byModel.get(key) ?? {
+            provider,
+            modelId,
+            stats: { inputTokens: 0, outputTokens: 0, cachedReadTokens: 0, cacheCreationTokens: 0 },
+          };
+          bucket.stats.inputTokens += delta.inputTokens;
+          bucket.stats.outputTokens += delta.outputTokens;
+          bucket.stats.cachedReadTokens += delta.cachedReadTokens;
+          bucket.stats.cacheCreationTokens += delta.cacheCreationTokens;
+          byModel.set(key, bucket);
+        }
       }
     }
   }
+  // Total savings = Σ per-model savings (rates are per-model, so pricing must
+  // resolve per bucket). Unpriced buckets contribute nothing — same "miss ⇒
+  // $0, never crash" contract as the tracker itself.
+  let totalSavings = 0;
+  const modelRows: Array<{
+    key: string;
+    stats: CacheStats;
+    savings: number | undefined;
+  }> = [];
+  for (const [key, { provider, modelId, stats }] of byModel) {
+    const savings = cacheSavingsMicros(provider, modelId, stats);
+    if (savings !== undefined) totalSavings += savings;
+    modelRows.push({ key, stats, savings });
+  }
   const totalDollars = totalMicros / 1_000_000;
   if (format === "json") {
+    // Additive fields only — `session`/`count`/`totalUsdMicros`/`byProvider`
+    // keep their exact pre-cache-economics shape.
+    const cacheByModel: Record<
+      string,
+      CacheStats & { cacheHitRatio: number; cacheSavingsUsdMicros: number | null }
+    > = {};
+    for (const row of modelRows) {
+      cacheByModel[row.key] = {
+        ...row.stats,
+        cacheHitRatio: cacheHitRatio(row.stats),
+        cacheSavingsUsdMicros: row.savings ?? null,
+      };
+    }
     process.stdout.write(
-      `${JSON.stringify({ session, count, totalUsdMicros: totalMicros, byProvider })}\n`,
+      `${JSON.stringify({
+        session,
+        count,
+        totalUsdMicros: totalMicros,
+        byProvider,
+        inputTokens: totalCache.inputTokens,
+        outputTokens: totalCache.outputTokens,
+        cachedReadTokens: totalCache.cachedReadTokens,
+        cacheCreationTokens: totalCache.cacheCreationTokens,
+        cacheHitRatio: cacheHitRatio(totalCache),
+        cacheSavingsUsdMicros: totalSavings,
+        cacheByModel,
+      })}\n`,
     );
   } else {
     process.stdout.write(`session: ${session}\n`);
@@ -2093,6 +2360,10 @@ async function runCostSummary(args: ParsedArgs): Promise<void> {
     process.stdout.write(`total: $${totalDollars.toFixed(4)}\n`);
     for (const [p, m] of Object.entries(byProvider)) {
       process.stdout.write(`  ${p}: $${(m / 1_000_000).toFixed(4)}\n`);
+    }
+    process.stdout.write(`cache: ${formatCacheLine(totalCache, totalSavings)}\n`);
+    for (const row of modelRows) {
+      process.stdout.write(`  ${row.key}: ${formatCacheLine(row.stats, row.savings)}\n`);
     }
   }
 }
@@ -2397,6 +2668,145 @@ function distillRatings(
   return { samples, gradersYaml: gradersConfigToYaml(result.graders) };
 }
 
+// -------- state backup / restore (item 69) --------
+
+/** Label for the default backup file name: the cwd spec's harness name when
+ *  a parseable crewhaus.yaml is present, else the cwd basename. */
+function stateBackupLabel(): string {
+  const specPath = join(process.cwd(), "crewhaus.yaml");
+  if (existsSync(specPath)) {
+    try {
+      return parseSpec(readFileSync(specPath, "utf-8")).name;
+    } catch {
+      // Unparseable spec — fall through to the directory name.
+    }
+  }
+  return basename(process.cwd());
+}
+
+/**
+ * Item 69 — `crewhaus state <backup|restore>`. The cwd-local `.crewhaus/`
+ * dir is a harness's entire accumulated state; `backup` snapshots it to a
+ * transportable tarball, `restore` unpacks it (full replace or additive
+ * merges). The heavy lifting lives in ./state-backup; this is flag parsing
+ * + output only, per house pattern.
+ */
+async function runState(args: ParsedArgs, action: "backup" | "restore"): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage:\n" +
+        "  crewhaus state backup [-o <file.tar.gz>] [--exclude <glob,glob>]\n" +
+        "  crewhaus state restore <file.tar.gz> [--into <dir>] [--merge feedback|all] [--force]\n" +
+        "\n" +
+        "backup: archive the cwd .crewhaus/ state dir (sessions, feedback,\n" +
+        "  memories, datasets, spec registry, optimize runs, durable-state\n" +
+        "  sqlite) to a gzipped tarball. Default name:\n" +
+        "  crewhaus-state-<harnessname-or-dir>-<date>.tar.gz. The archive\n" +
+        "  carries a backup-manifest.json (created ts, source dir, crewhaus\n" +
+        "  version, per-subdir file/byte counts). sqlite files are snapshotted\n" +
+        "  via a read-only bun:sqlite serialize so a live writer cannot tear\n" +
+        "  the copy; if a snapshot fails the raw bytes are copied and the\n" +
+        "  manifest records sqliteConsistent: false. Source files are never\n" +
+        "  modified.\n" +
+        "  --exclude   comma-separated globs matched against paths relative to\n" +
+        "              .crewhaus; a bare pattern also matches file/dir names\n" +
+        '              anywhere (e.g. --exclude "sessions,*.sqlite").\n' +
+        "\n" +
+        "restore: unpack a backup into <dir>/.crewhaus (default: cwd). By\n" +
+        "  default it REFUSES to overwrite an existing non-empty .crewhaus.\n" +
+        "  --force            full replace — the existing dir is first moved\n" +
+        "                     aside to .crewhaus.bak-<ts>, never deleted\n" +
+        "  --merge feedback   fold ONLY the archive's feedback records\n" +
+        "                     (session user_feedback events + feedback/*.jsonl)\n" +
+        "                     into the local store, deduped per (session, turn)\n" +
+        "                     with the same merge `crewhaus distill` uses —\n" +
+        "                     closes the deployed-bot feedback transport gap\n" +
+        "  --merge all        additive per-file copy: only files that don't\n" +
+        "                     exist locally are written; existing files are\n" +
+        "                     skipped (and reported)\n" +
+        "\n" +
+        "out of scope (by design): S3/R2 upload — sync the tarball with your\n" +
+        "  own tooling (aws s3 cp, rclone, …); scheduled backups — pair with\n" +
+        "  cron for now (a templates/ convention is landing separately).\n",
+    );
+    return;
+  }
+
+  if (action === "backup") {
+    const excludeGlobs = parseExcludeGlobs(strFlag(args, "exclude"));
+    const outFile = resolve(
+      strFlag(args, "out") ?? defaultBackupFileName(stateBackupLabel(), new Date()),
+    );
+    try {
+      const result = await createStateBackup({
+        stateDir: join(process.cwd(), ".crewhaus"),
+        outFile,
+        excludeGlobs,
+        crewhausVersion: cliVersion() ?? "unknown",
+      });
+      for (const w of result.warnings) process.stderr.write(`[state] warning: ${w}\n`);
+      if (result.excluded.length > 0) {
+        process.stdout.write(`[state] excluded ${result.excluded.length} file(s) via --exclude\n`);
+      }
+      const { totals } = result.manifest;
+      process.stdout.write(
+        `backed up ${totals.files} file(s) (${totals.bytes} bytes) → ${result.outFile}\n`,
+      );
+    } catch (err) {
+      if (err instanceof StateBackupError) die(err.message);
+      throw err;
+    }
+    return;
+  }
+
+  const archive = args.positional[0];
+  if (typeof archive !== "string") die("missing <file.tar.gz>");
+  const archiveFile = resolve(archive);
+  const intoDir = strFlag(args, "into") ?? process.cwd();
+  const merge = strFlag(args, "merge");
+  const force = args.flags["force"] === true;
+  if (merge !== undefined && force) {
+    die("--merge and --force are mutually exclusive (merge is additive; force replaces)");
+  }
+  if (merge !== undefined && merge !== "feedback" && merge !== "all") {
+    die(`invalid --merge "${merge}" — expected "feedback" or "all"`);
+  }
+
+  try {
+    if (merge === "feedback") {
+      const r = await mergeFeedbackFromArchive({ archiveFile, intoDir });
+      process.stdout.write(
+        `[state] ${r.archivedRecords} archived feedback record(s): ` +
+          `${r.added} new, ${r.updated} updated fold(s), ${r.unchanged} already present (deduped)\n`,
+      );
+      if (r.wroteFile !== undefined) {
+        process.stdout.write(`merged feedback → ${r.wroteFile}\n`);
+      } else {
+        process.stdout.write("nothing to merge — the local store already has it all\n");
+      }
+    } else if (merge === "all") {
+      const r = await mergeAllFromArchive({ archiveFile, intoDir });
+      for (const rel of r.skipped) {
+        process.stdout.write(`[state] skipped ${rel} (exists locally — kept)\n`);
+      }
+      process.stdout.write(
+        `merged ${r.copied.length} new file(s) into ${r.stateDir} ` +
+          `(${r.skipped.length} existing file(s) kept)\n`,
+      );
+    } else {
+      const r = await restoreStateArchive({ archiveFile, intoDir, force });
+      for (const w of r.warnings) process.stderr.write(`[state] warning: ${w}\n`);
+      if (r.movedAsideTo !== undefined) {
+        process.stdout.write(`moved existing state aside → ${r.movedAsideTo}\n`);
+      }
+      process.stdout.write(`restored ${r.filesRestored} file(s) → ${r.stateDir}\n`);
+    }
+  } catch (err) {
+    if (err instanceof StateBackupError) die(err.message);
+    throw err;
+  }
+}
+
 /**
  * Section 27 — `crewhaus secrets <action> <name> [opts]`. Two actions:
  *   doctor                 list configured secrets and report missing
@@ -2462,7 +2872,9 @@ async function runSecrets(args: ParsedArgs, action: string): Promise<void> {
 
 /**
  * Section 28 — `crewhaus spec <action> ...` subcommands wrap the
- * spec-registry. Actions: put / get / list / pin / alias.
+ * spec-registry. Actions: put / get / list / pin / alias / log (item 46 —
+ * render the per-spec CHANGELOG.md that auto-registration and `put` keep
+ * beside the registry manifest, newest entry first).
  */
 async function runSpec(args: ParsedArgs, action: string): Promise<void> {
   if (args.flags["help"]) {
@@ -2472,7 +2884,9 @@ async function runSpec(args: ParsedArgs, action: string): Promise<void> {
         "  crewhaus spec list <name>                                   list versions\n" +
         "  crewhaus spec get <name> <version>                          print yaml\n" +
         "  crewhaus spec pin <name> <env> <version> [--tenant <id>]   pin env → version\n" +
-        "  crewhaus spec alias <name> <env> [--tenant <id>]            resolve env → version\n",
+        "  crewhaus spec alias <name> <env> [--tenant <id>]            resolve env → version\n" +
+        "  crewhaus spec log <name> [--root-dir <dir>]                 print the changelog (newest first;\n" +
+        '                                                              display names sanitize as on compile: "My Agent" → My-Agent)\n',
     );
     return;
   }
@@ -2492,8 +2906,60 @@ async function runSpec(args: ParsedArgs, action: string): Promise<void> {
     if (typeof version !== "string") die("missing <version>");
     if (typeof filePath !== "string") die("missing <spec.yaml>");
     const yaml = readFileSync(resolve(filePath), "utf-8");
+    // Item 46 — capture the previous latest version (manifest order) BEFORE
+    // the put so the changelog entry carries a field-level diff against it.
+    const { appendChangelogEntry } = await import("./spec-changelog");
+    const prior = await reg.manifest(name);
+    const prevVersion = prior.versions[prior.versions.length - 1];
+    let previousYaml: string | undefined;
+    if (prevVersion !== undefined) {
+      try {
+        previousYaml = await reg.get(name, prevVersion);
+      } catch {
+        // Manifest-listed version whose file vanished — entry is diff-less.
+      }
+    }
     await reg.put(name, version, yaml);
+    appendChangelogEntry({
+      registryRootDir: rootDir,
+      name,
+      version,
+      yaml,
+      ...(previousYaml !== undefined ? { previousYaml } : {}),
+      optimizeRootDir: join(process.cwd(), ".crewhaus", "optimize"),
+    });
     process.stdout.write(`stored ${name}@${version} (${yaml.length} bytes)\n`);
+    return;
+  }
+  if (action === "log") {
+    const rawName = args.positional[0];
+    if (typeof rawName !== "string") die("missing <name>");
+    // Item 46 (review F3): compile/write-back auto-registration stores under
+    // the SANITIZED registry grammar (`registrySpecName("My Agent")` →
+    // `My-Agent`), so the lookup must run the same sanitation or a display
+    // name dies here while its changelog sits one transform away. Names
+    // already in the registry grammar (every `spec put` name) pass through
+    // unchanged.
+    const { registrySpecName } = await import("./spec-changelog");
+    const name = registrySpecName(rawName);
+    if (name !== rawName) {
+      process.stdout.write(`showing log for ${name} (sanitized from "${rawName}")\n`);
+    }
+    // Validate the name through the registry's own grammar (same floor as
+    // put/get) so a crafted name can't path-traverse out of the root.
+    try {
+      await reg.manifest(name);
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
+    const changelogPath = join(rootDir, name, "CHANGELOG.md");
+    if (!existsSync(changelogPath)) {
+      die(
+        `no changelog for "${name}" — nothing registered yet (compile the spec or \`crewhaus spec put\` first)`,
+      );
+    }
+    process.stdout.write(readFileSync(changelogPath, "utf-8"));
     return;
   }
   if (action === "list") {
@@ -2540,7 +3006,7 @@ async function runSpec(args: ParsedArgs, action: string): Promise<void> {
     process.stdout.write(`${v}\n`);
     return;
   }
-  die(`unknown spec action "${action}" (expected: put | list | get | pin | alias)`);
+  die(`unknown spec action "${action}" (expected: put | list | get | pin | alias | log)`);
 }
 
 /**
@@ -3240,6 +3706,14 @@ switch (subcommand) {
   case "distill":
     await runDistill(parseFor(rest, DISTILL_SCHEMA));
     break;
+  case "state": {
+    const action = rest[0] ?? "";
+    if (action !== "backup" && action !== "restore") {
+      die(`state action must be "backup" or "restore" (got "${action}")`);
+    }
+    await runState(parseFor(rest.slice(1), STATE_SCHEMA), action);
+    break;
+  }
   case "secrets": {
     const action = rest[0] ?? "";
     if (action !== "doctor" && action !== "rotate") {
@@ -3250,8 +3724,8 @@ switch (subcommand) {
   }
   case "spec": {
     const action = rest[0] ?? "";
-    if (!["put", "list", "get", "pin", "alias"].includes(action)) {
-      die(`spec action must be one of: put, list, get, pin, alias (got "${action}")`);
+    if (!["put", "list", "get", "pin", "alias", "log"].includes(action)) {
+      die(`spec action must be one of: put, list, get, pin, alias, log (got "${action}")`);
     }
     await runSpec(parseFor(rest.slice(1), SPEC_SCHEMA), action);
     break;

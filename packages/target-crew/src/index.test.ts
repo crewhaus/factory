@@ -39,16 +39,22 @@ const minimalIr: IrCrewV0 = {
 };
 
 describe("emitCrew", () => {
-  test("emits orchestrator + daemon + per-role agent files (T1 bundle structure)", () => {
+  test("emits orchestrator + daemon + per-role agent files + README (T1 bundle structure)", () => {
     const bundle = emitCrew(minimalIr);
     const paths = bundle.files.map((f) => f.path).sort();
     expect(paths).toEqual([
+      "README.md",
       "agent_critic.ts",
       "agent_researcher.ts",
       "agent_writer.ts",
       "daemon.ts",
       "orchestrator.ts",
     ]);
+  });
+
+  test("readme: false omits the generated README.md (item 42 opt-out)", () => {
+    const bundle = emitCrew(minimalIr, { readme: false });
+    expect(bundle.files.some((f) => f.path === "README.md")).toBe(false);
   });
 
   test("orchestrator wires every role + sets entry", () => {

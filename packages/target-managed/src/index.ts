@@ -1,6 +1,11 @@
 import { CrewhausError } from "@crewhaus/errors";
 import { escapeJsonString } from "@crewhaus/infra-utils";
-import type { Bundle, IrManagedV0 } from "@crewhaus/ir";
+import {
+  type Bundle,
+  type EmitReadmeOptions,
+  type IrManagedV0,
+  renderBundleReadme,
+} from "@crewhaus/ir";
 
 /**
  * Emit a managed-daemon bundle. Generates `daemon.ts` that wires:
@@ -29,13 +34,17 @@ import type { Bundle, IrManagedV0 } from "@crewhaus/ir";
  * Layer F2. Pairs with `gateway-server`, `tenancy`, `audit-log`,
  * `policy-engine`.
  */
-export function emitManaged(ir: IrManagedV0): Bundle {
-  return {
-    files: [
-      { path: "agent.ts", content: renderAgent(ir) },
-      { path: "daemon.ts", content: renderDaemon(ir) },
-    ],
-  };
+export function emitManaged(ir: IrManagedV0, opts: EmitReadmeOptions = {}): Bundle {
+  const files = [
+    { path: "agent.ts", content: renderAgent(ir) },
+    { path: "daemon.ts", content: renderDaemon(ir) },
+  ];
+  // Item 42 — generated bundle README; default ON (`crewhaus compile
+  // --no-readme` opts out).
+  if (opts.readme !== false) {
+    files.push({ path: "README.md", content: renderBundleReadme(ir) });
+  }
+  return { files };
 }
 
 export class TargetEmitError extends CrewhausError {

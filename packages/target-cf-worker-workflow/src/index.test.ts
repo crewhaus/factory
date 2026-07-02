@@ -34,10 +34,21 @@ const baseIr: IrWorkflowV0 = {
 };
 
 describe("emitCfWorkerWorkflow", () => {
-  test("emits worker.js, wrangler.toml, and package.json", () => {
+  test("emits worker.js, wrangler.toml, package.json, and the generated README (item 42)", () => {
     const bundle = emitCfWorkerWorkflow(baseIr);
     const paths = bundle.files.map((f) => f.path).sort();
-    expect(paths).toEqual(["package.json", "worker.js", "wrangler.toml"]);
+    expect(paths).toEqual(["README.md", "package.json", "worker.js", "wrangler.toml"]);
+    const readme = bundle.files.find((f) => f.path === "README.md")?.content ?? "";
+    expect(readme).toContain("wrangler deploy");
+  });
+
+  test("readme: false restores the three-file bundle (item 42 opt-out)", () => {
+    const bundle = emitCfWorkerWorkflow(baseIr, { readme: false });
+    expect(bundle.files.map((f) => f.path).sort()).toEqual([
+      "package.json",
+      "worker.js",
+      "wrangler.toml",
+    ]);
   });
 
   test("worker.js inlines each step's model and instructions and the Anthropic endpoint", () => {
@@ -160,6 +171,6 @@ describe("emitCfWorkerWorkflow — provider gate", () => {
   });
 
   test("all-claude steps still emit cleanly", () => {
-    expect(emitCfWorkerWorkflow(baseIr).files.length).toBe(3);
+    expect(emitCfWorkerWorkflow(baseIr).files.length).toBe(4);
   });
 });

@@ -51,9 +51,10 @@ function baseIr(overrides: Partial<IrChainV0> = {}): IrChainV0 {
 }
 
 describe("emitOnchain — happy path", () => {
-  test("emits a single agent.ts with the daemon metadata", () => {
+  test("emits agent.ts (plus README, item 42) with the daemon metadata", () => {
     const bundle = emitOnchain(baseIr());
-    expect(bundle.files).toHaveLength(1);
+    expect(bundle.files).toHaveLength(2);
+    expect(bundle.files[1]?.path).toBe("README.md");
     const file = bundle.files[0];
     expect(file?.path).toBe("agent.ts");
     expect(file?.content).toContain('SPEC_NAME = "treasury-watch"');

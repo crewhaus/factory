@@ -22,13 +22,19 @@ const baseIr: IrVoiceV0 = {
 };
 
 describe("emitVoice", () => {
-  test("emits agent.ts + voice-loop.ts + daemon.ts (T1 bundle structure)", () => {
+  test("emits agent.ts + voice-loop.ts + daemon.ts + README (T1 bundle structure)", () => {
     const bundle = emitVoice(baseIr);
     expect(bundle.files.map((f) => f.path).sort()).toEqual([
+      "README.md",
       "agent.ts",
       "daemon.ts",
       "voice-loop.ts",
     ]);
+  });
+
+  test("readme: false omits the generated README.md (item 42 opt-out)", () => {
+    const bundle = emitVoice(baseIr, { readme: false });
+    expect(bundle.files.some((f) => f.path === "README.md")).toBe(false);
   });
 
   test("agent.ts exports AGENT_CONFIG with the spec values inlined", () => {

@@ -49,9 +49,10 @@ function baseIr(overrides: Partial<IrChainGameV0> = {}): IrChainGameV0 {
 }
 
 describe("emitOnchainGame — happy path", () => {
-  test("emits a single agent.ts with game metadata", () => {
+  test("emits agent.ts (plus README, item 42) with game metadata", () => {
     const bundle = emitOnchainGame(baseIr());
-    expect(bundle.files).toHaveLength(1);
+    expect(bundle.files).toHaveLength(2);
+    expect(bundle.files[1]?.path).toBe("README.md");
     const file = bundle.files[0];
     expect(file?.path).toBe("agent.ts");
     expect(file?.content).toContain('SPEC_NAME = "tic-tac-toe-agent"');

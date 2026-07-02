@@ -16,8 +16,12 @@ import { createRunContext } from "@crewhaus/run-context";
 import type { ProviderId } from "@crewhaus/trace-event-bus";
 import { runChatLoop } from "./index";
 
-/** Single text-only turn: 100 input tokens, 10 output tokens. */
-function makeTextAdapter(providerId: ProviderId): ProviderAdapter {
+/** Single text-only turn: 100 input tokens, 10 output tokens, optional cache traffic. */
+function makeTextAdapter(
+  providerId: ProviderId,
+  cache?: { cacheRead: number; cacheCreate: number },
+): ProviderAdapter {
+  const finalUsage = { input: 100, output: 10, ...(cache ?? {}) };
   return {
     providerId,
     features: {
@@ -45,7 +49,7 @@ function makeTextAdapter(providerId: ProviderId): ProviderAdapter {
         yield {
           kind: "message_delta",
           stopReason: "end_turn",
-          usage: { input: 100, output: 10 },
+          usage: finalUsage,
         } as const;
         yield { kind: "message_stop" } as const;
       })(),
@@ -63,11 +67,11 @@ afterEach(() => {
   process.env["CREWHAUS_COST_TRACKING"] = savedTracking;
 });
 
-async function runOnce(): Promise<void> {
+async function runOnce(cache?: { cacheRead: number; cacheCreate: number }): Promise<void> {
   await runChatLoop({
     model: "claude-sonnet-4-6",
     instructions: "test",
-    _adapter: makeTextAdapter("anthropic"),
+    _adapter: makeTextAdapter("anthropic", cache),
     runContext: createRunContext(),
     singleTurn: true,
     seedMessages: [{ role: "user", content: "hello" }],
@@ -77,7 +81,13 @@ async function runOnce(): Promise<void> {
 
 type AccrualLine = {
   kind: string;
-  payload?: { provider?: string; modelId?: string; costUsdMicros?: number };
+  payload?: {
+    provider?: string;
+    modelId?: string;
+    costUsdMicros?: number;
+    cachedReadTokens?: number;
+    cacheCreationTokens?: number;
+  };
 };
 
 function readCostAccruals(): AccrualLine[] {
@@ -109,5 +119,25 @@ describe("cost_accrual persistence into the session JSONL (Section 27)", () => {
     process.env["CREWHAUS_COST_TRACKING"] = undefined;
     await runOnce();
     expect(readCostAccruals().length).toBe(0);
+  });
+
+  test("adapter cache usage lands in the persisted line: cachedReadTokens + cacheCreationTokens, write premium priced in", async () => {
+    process.env["CREWHAUS_COST_TRACKING"] = "1";
+    await runOnce({ cacheRead: 40, cacheCreate: 20 });
+    const accruals = readCostAccruals();
+    expect(accruals.length).toBe(1);
+    expect(accruals[0]?.payload?.cachedReadTokens).toBe(40);
+    expect(accruals[0]?.payload?.cacheCreationTokens).toBe(20);
+    // sonnet row ($3 in / $15 out, fallback $0.3 read / $3.75 write):
+    // 100×3 + 10×15 + 40×0.3 + 20×3.75 = 300+150+12+75 = 537 micros.
+    expect(accruals[0]?.payload?.costUsdMicros).toBe(537);
+  });
+
+  test("cache-less adapter persists cacheCreationTokens 0 (field present, cost unchanged)", async () => {
+    process.env["CREWHAUS_COST_TRACKING"] = "1";
+    await runOnce();
+    const accruals = readCostAccruals();
+    expect(accruals[0]?.payload?.cacheCreationTokens).toBe(0);
+    expect(accruals[0]?.payload?.costUsdMicros).toBe(450);
   });
 });

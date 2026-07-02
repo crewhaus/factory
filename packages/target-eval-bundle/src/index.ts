@@ -8,9 +8,14 @@
  *   4. Writes the result summary to `.crewhaus/evals/<runId>/`
  */
 import { escapeJsonString } from "@crewhaus/infra-utils";
-import type { Bundle, IrEvalV0 } from "@crewhaus/ir";
+import {
+  type Bundle,
+  type EmitReadmeOptions,
+  type IrEvalV0,
+  renderBundleReadme,
+} from "@crewhaus/ir";
 
-export function emitEval(ir: IrEvalV0): Bundle {
+export function emitEval(ir: IrEvalV0, opts: EmitReadmeOptions = {}): Bundle {
   const seedLine = ir.seed !== undefined ? `  seed: ${ir.seed},\n` : "";
   const toolsLine = ir.agent.tools.length > 0 ? `  // Tools: ${ir.agent.tools.join(", ")}\n` : "";
   const gradersJson = JSON.stringify(ir.graders, null, 2)
@@ -85,12 +90,16 @@ main().catch((err) => {
   process.exit(1);
 });
 `;
-  return {
-    files: [
-      {
-        path: "agent.ts",
-        content,
-      },
-    ],
-  };
+  const files = [
+    {
+      path: "agent.ts",
+      content,
+    },
+  ];
+  // Item 42 — generated bundle README; default ON (`crewhaus compile
+  // --no-readme` opts out).
+  if (opts.readme !== false) {
+    files.push({ path: "README.md", content: renderBundleReadme(ir) });
+  }
+  return { files };
 }
