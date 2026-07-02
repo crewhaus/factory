@@ -1350,3 +1350,110 @@ describe("crewhaus retention (item 35)", () => {
     expect(existsSync(join(tmp, ".crewhaus", "sessions", "sess_1111111111111111.json"))).toBe(true);
   });
 });
+
+describe("crewhaus spec auto-register + changelog (item 46)", () => {
+  // Every run uses `cwd: tmp` so the registry (.crewhaus/specs) lands in the
+  // per-test temp dir, not the repo checkout.
+  const REGISTRY = () => join(tmp, ".crewhaus", "specs");
+
+  function writeSpecVariant(instructions: string): string {
+    const src = readFileSync(HELLO_SPEC, "utf-8");
+    const specPath = join(tmp, "crewhaus.yaml");
+    writeFileSync(
+      specPath,
+      src.replace(/instructions: \|[\s\S]*$/m, `instructions: ${instructions}\n`),
+    );
+    return specPath;
+  }
+
+  test("a successful compile auto-registers v1 and starts the changelog", async () => {
+    const out = join(tmp, "out");
+    const result = await runCli(["compile", HELLO_SPEC, "-o", out], { cwd: tmp });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("registered hello@v1");
+    expect(existsSync(join(REGISTRY(), "hello", "v1.yaml"))).toBe(true);
+    expect(existsSync(join(REGISTRY(), "hello", "manifest.json"))).toBe(true);
+    const changelog = readFileSync(join(REGISTRY(), "hello", "CHANGELOG.md"), "utf-8");
+    expect(changelog).toContain("# Changelog — hello");
+    expect(changelog).toContain("## v1");
+    expect(changelog).toContain("- initial version");
+  });
+
+  test("recompiling an unchanged spec is a registry no-op", async () => {
+    const out = join(tmp, "out");
+    const first = await runCli(["compile", HELLO_SPEC, "-o", out], { cwd: tmp });
+    expect(first.stdout).toContain("registered hello@v1");
+    const second = await runCli(["compile", HELLO_SPEC, "-o", out], { cwd: tmp });
+    expect(second.exitCode).toBe(0);
+    expect(second.stdout).toContain("unchanged hello@v1");
+    const changelog = readFileSync(join(REGISTRY(), "hello", "CHANGELOG.md"), "utf-8");
+    expect(changelog.match(/^## /gm)).toHaveLength(1);
+  });
+
+  test("a changed spec registers v2 with a field-level diff, newest entry first", async () => {
+    const out = join(tmp, "out");
+    const v1 = writeSpecVariant("Answer briefly.");
+    await runCli(["compile", v1, "-o", out], { cwd: tmp });
+    const v2 = writeSpecVariant("Answer thoroughly.");
+    const result = await runCli(["compile", v2, "-o", out], { cwd: tmp });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("registered hello@v2");
+    const changelog = readFileSync(join(REGISTRY(), "hello", "CHANGELOG.md"), "utf-8");
+    expect(changelog).toContain("- changed `agent.instructions`");
+    expect(changelog.indexOf("## v2")).toBeLessThan(changelog.indexOf("## v1"));
+  });
+
+  test("--no-register skips the auto-put entirely", async () => {
+    const out = join(tmp, "out");
+    const result = await runCli(["compile", HELLO_SPEC, "--no-register", "-o", out], { cwd: tmp });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).not.toContain("registered");
+    expect(existsSync(REGISTRY())).toBe(false);
+  });
+
+  test("spec log prints the accumulated changelog", async () => {
+    const out = join(tmp, "out");
+    await runCli(["compile", HELLO_SPEC, "-o", out], { cwd: tmp });
+    const result = await runCli(["spec", "log", "hello"], { cwd: tmp });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("# Changelog — hello");
+    expect(result.stdout).toContain("## v1");
+  });
+
+  test("spec log for an unregistered name dies with a helpful message", async () => {
+    const result = await runCli(["spec", "log", "nope"], { cwd: tmp });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('no changelog for "nope"');
+  });
+
+  test("a manual `spec put` also appends changelog entries (with diff on the second put)", async () => {
+    const f1 = join(tmp, "a.yaml");
+    const f2 = join(tmp, "b.yaml");
+    writeFileSync(f1, "target: cli\nname: demo\nagent:\n  model: m\n  instructions: One.\n");
+    writeFileSync(f2, "target: cli\nname: demo\nagent:\n  model: m\n  instructions: Two.\n");
+    const put1 = await runCli(["spec", "put", "demo", "v1", f1], { cwd: tmp });
+    expect(put1.exitCode).toBe(0);
+    const put2 = await runCli(["spec", "put", "demo", "v2", f2], { cwd: tmp });
+    expect(put2.exitCode).toBe(0);
+    const log = await runCli(["spec", "log", "demo"], { cwd: tmp });
+    expect(log.exitCode).toBe(0);
+    expect(log.stdout).toContain('- changed `agent.instructions`: "One." → "Two."');
+    expect(log.stdout.indexOf("## v2")).toBeLessThan(log.stdout.indexOf("## v1"));
+  });
+
+  test("compile --help and optimize --help document --no-register", async () => {
+    const compileHelp = await runCli(["compile", "--help"]);
+    expect(compileHelp.exitCode).toBe(0);
+    expect(compileHelp.stdout).toContain("--no-register");
+    expect(compileHelp.stdout).toContain("spec log");
+    const optimizeHelp = await runCli(["optimize", "--help"]);
+    expect(optimizeHelp.exitCode).toBe(0);
+    expect(optimizeHelp.stdout).toContain("--no-register");
+  });
+
+  test("spec --help lists the log action", async () => {
+    const result = await runCli(["spec", "log", "--help"]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("spec log <name>");
+  });
+});

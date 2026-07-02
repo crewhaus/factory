@@ -32,7 +32,7 @@
  */
 import { CrewhausError } from "@crewhaus/errors";
 import { type Spec, parseSpec } from "@crewhaus/spec";
-import { parseDocument } from "yaml";
+import { parse, parseDocument } from "yaml";
 import { z } from "zod";
 
 export class SpecPatchError extends CrewhausError {
@@ -341,4 +341,181 @@ export function formatWriteBackHeader(opts: {
     `# - generated: ${ts}`,
     "",
   ].join("\n");
+}
+
+/**
+ * Item 46 — the fields `formatWriteBackHeader` stamped into a written-back
+ * spec's leading comment block, recovered by `parseWriteBackHeader`. Only
+ * `runId` is guaranteed (it lives on the stamp's first line); the rest are
+ * best-effort so a hand-trimmed header still yields its surviving fields.
+ */
+export type WriteBackHeaderInfo = {
+  readonly runId: string;
+  readonly mutator?: string;
+  readonly iterations?: number;
+  readonly scoreBefore?: number;
+  readonly scoreAfter?: number;
+  readonly generated?: string;
+};
+
+/**
+ * Inverse of `formatWriteBackHeader`: scan the LEADING comment block of a
+ * YAML text for the optimize write-back stamp and return its fields, or
+ * `undefined` when the text was never written back. Only the leading block
+ * is scanned — a `# crewhaus optimize:` line further down (e.g. quoted
+ * inside an instructions prompt) is document content, not a header.
+ */
+export function parseWriteBackHeader(yamlText: string): WriteBackHeaderInfo | undefined {
+  let runId: string | undefined;
+  let mutator: string | undefined;
+  let iterations: number | undefined;
+  let scoreBefore: number | undefined;
+  let scoreAfter: number | undefined;
+  let generated: string | undefined;
+  for (const rawLine of yamlText.split("\n")) {
+    const line = rawLine.trim();
+    if (line === "") continue;
+    if (!line.startsWith("#")) break; // end of the leading comment block
+    const stamp = /^# crewhaus optimize: runId (\S+)$/.exec(line);
+    if (stamp?.[1] !== undefined) {
+      runId = stamp[1];
+      continue;
+    }
+    // Field lines only count once the stamp line has been seen, so ordinary
+    // leading comments (`# - mutator: ...` in a user's own notes) don't
+    // masquerade as header fields.
+    if (runId === undefined) continue;
+    const field = /^# - ([a-z]+): (.*)$/.exec(line);
+    if (field?.[1] === undefined || field[2] === undefined) continue;
+    const value = field[2].trim();
+    if (field[1] === "mutator") {
+      mutator = value;
+    } else if (field[1] === "iterations") {
+      const n = Number.parseInt(value, 10);
+      if (!Number.isNaN(n)) iterations = n;
+    } else if (field[1] === "score") {
+      const scores = /^([0-9.eE+-]+) → ([0-9.eE+-]+)/.exec(value);
+      const before = scores?.[1] !== undefined ? Number.parseFloat(scores[1]) : Number.NaN;
+      const after = scores?.[2] !== undefined ? Number.parseFloat(scores[2]) : Number.NaN;
+      if (!Number.isNaN(before)) scoreBefore = before;
+      if (!Number.isNaN(after)) scoreAfter = after;
+    } else if (field[1] === "generated") {
+      generated = value;
+    }
+  }
+  if (runId === undefined) return undefined;
+  return {
+    runId,
+    ...(mutator !== undefined ? { mutator } : {}),
+    ...(iterations !== undefined ? { iterations } : {}),
+    ...(scoreBefore !== undefined ? { scoreBefore } : {}),
+    ...(scoreAfter !== undefined ? { scoreAfter } : {}),
+    ...(generated !== undefined ? { generated } : {}),
+  };
+}
+
+/**
+ * Item 46 — one field-level difference between two spec versions (see
+ * `diffSpecYaml`). `path` is dot-joined property keys with array indices
+ * rendered as `[i]` (e.g. `steps[2].prompt`). `before`/`after` carry the
+ * FORMATTED (truncated) values, ready for a changelog line — the differ is
+ * a reporting primitive, not a patch source.
+ */
+export type SpecDiffEntry = {
+  readonly kind: "added" | "removed" | "changed";
+  readonly path: string;
+  /** Formatted old value — absent for `"added"`. */
+  readonly before?: string;
+  /** Formatted new value — absent for `"removed"`. */
+  readonly after?: string;
+};
+
+/** Diff values longer than this render truncated with a trailing ellipsis. */
+export const DIFF_VALUE_MAX_LENGTH = 72;
+
+/**
+ * Render a value for a diff line: scalars as JSON (strings quoted), maps and
+ * sequences as compact JSON, truncated to `maxLength` with an ellipsis so a
+ * multi-paragraph instructions prompt doesn't flood the changelog.
+ */
+export function formatDiffValue(value: unknown, maxLength: number = DIFF_VALUE_MAX_LENGTH): string {
+  const rendered = value === undefined ? "undefined" : (JSON.stringify(value) ?? String(value));
+  if (rendered.length <= maxLength) return rendered;
+  return `${rendered.slice(0, Math.max(1, maxLength - 1))}…`;
+}
+
+/**
+ * Item 46 — structural (field-level) diff between two YAML documents.
+ * Parses both texts and walks the value trees: maps diff by key, sequences
+ * by index, everything else is a leaf compared by value. Comments and
+ * formatting are invisible here BY DESIGN — two texts that parse to the
+ * same values produce an empty diff. Throws `SpecPatchError` when either
+ * text is unparseable.
+ */
+export function diffSpecYaml(beforeYaml: string, afterYaml: string): ReadonlyArray<SpecDiffEntry> {
+  let before: unknown;
+  let after: unknown;
+  try {
+    before = parse(beforeYaml);
+  } catch (err) {
+    throw new SpecPatchError("diff: previous YAML is not parseable", err);
+  }
+  try {
+    after = parse(afterYaml);
+  } catch (err) {
+    throw new SpecPatchError("diff: new YAML is not parseable", err);
+  }
+  const out: SpecDiffEntry[] = [];
+  walkDiff(before, after, "", out);
+  return out;
+}
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+function leafEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+function walkDiff(a: unknown, b: unknown, path: string, out: SpecDiffEntry[]): void {
+  if (isPlainObject(a) && isPlainObject(b)) {
+    // Union of keys, a's ordering first — deterministic output.
+    const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
+    for (const key of keys) {
+      const childPath = path === "" ? key : `${path}.${key}`;
+      if (!(key in a)) {
+        out.push({ kind: "added", path: childPath, after: formatDiffValue(b[key]) });
+      } else if (!(key in b)) {
+        out.push({ kind: "removed", path: childPath, before: formatDiffValue(a[key]) });
+      } else {
+        walkDiff(a[key], b[key], childPath, out);
+      }
+    }
+    return;
+  }
+  if (Array.isArray(a) && Array.isArray(b)) {
+    const len = Math.max(a.length, b.length);
+    for (let i = 0; i < len; i++) {
+      const childPath = `${path}[${i}]`;
+      if (i >= a.length) {
+        out.push({ kind: "added", path: childPath, after: formatDiffValue(b[i]) });
+      } else if (i >= b.length) {
+        out.push({ kind: "removed", path: childPath, before: formatDiffValue(a[i]) });
+      } else {
+        walkDiff(a[i], b[i], childPath, out);
+      }
+    }
+    return;
+  }
+  // Leaf (or type-mismatch, e.g. map → sequence): compare whole values.
+  if (!leafEqual(a, b)) {
+    out.push({
+      kind: "changed",
+      path: path === "" ? "(root)" : path,
+      before: formatDiffValue(a),
+      after: formatDiffValue(b),
+    });
+  }
 }

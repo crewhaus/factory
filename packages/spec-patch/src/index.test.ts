@@ -1,5 +1,15 @@
 import { describe, expect, test } from "bun:test";
-import { OPTIMIZABLE_PATHS, applySpecPatch, formatWriteBackHeader, validatePatch } from "./index";
+import {
+  DIFF_VALUE_MAX_LENGTH,
+  OPTIMIZABLE_PATHS,
+  SpecPatchError,
+  applySpecPatch,
+  diffSpecYaml,
+  formatDiffValue,
+  formatWriteBackHeader,
+  parseWriteBackHeader,
+  validatePatch,
+} from "./index";
 
 const CLI_YAML = `# A simple CLI agent
 target: cli
@@ -232,5 +242,151 @@ describe("formatWriteBackHeader", () => {
     expect(header).toContain("iterations: 12");
     expect(header).toContain("score: 0.450 → 0.780 (Δ 0.330)");
     expect(header).toContain("2026-05-10T12:00:00Z");
+  });
+});
+
+describe("parseWriteBackHeader (item 46)", () => {
+  test("round-trips every field formatWriteBackHeader writes", () => {
+    const header = formatWriteBackHeader({
+      runId: "opt_abc123",
+      mutator: "claude",
+      scoreBefore: 0.3,
+      scoreAfter: 1,
+      iterations: 14,
+      timestamp: "2026-07-01T00:00:00.000Z",
+    });
+    const info = parseWriteBackHeader(`${header}${CLI_YAML}`);
+    expect(info).toBeDefined();
+    expect(info?.runId).toBe("opt_abc123");
+    expect(info?.mutator).toBe("claude");
+    expect(info?.iterations).toBe(14);
+    expect(info?.scoreBefore).toBeCloseTo(0.3);
+    expect(info?.scoreAfter).toBeCloseTo(1.0);
+    expect(info?.generated).toBe("2026-07-01T00:00:00.000Z");
+  });
+
+  test("returns undefined for a spec that was never written back (plain leading comments)", () => {
+    // CLI_YAML starts with an ordinary `# A simple CLI agent` comment.
+    expect(parseWriteBackHeader(CLI_YAML)).toBeUndefined();
+    expect(parseWriteBackHeader(PIPELINE_YAML)).toBeUndefined();
+  });
+
+  test("a crewhaus-optimize line BELOW the leading comment block is content, not a header", () => {
+    const yaml = [
+      "target: cli",
+      "name: quoted",
+      "agent:",
+      "  model: m",
+      "  instructions: |",
+      "    # crewhaus optimize: runId opt_fake",
+      "",
+    ].join("\n");
+    expect(parseWriteBackHeader(yaml)).toBeUndefined();
+  });
+
+  test("field lines before the stamp line are ignored; fields after it are read", () => {
+    const yaml = [
+      "# - mutator: not-a-header-field",
+      "# crewhaus optimize: runId opt_ordered",
+      "# - mutator: rule-based",
+      "target: cli",
+      "name: x",
+      "agent:",
+      "  model: m",
+      "  instructions: hi",
+      "",
+    ].join("\n");
+    const info = parseWriteBackHeader(yaml);
+    expect(info?.runId).toBe("opt_ordered");
+    expect(info?.mutator).toBe("rule-based");
+  });
+});
+
+describe("diffSpecYaml (item 46 structural differ)", () => {
+  const BASE = [
+    "target: cli",
+    "name: hello",
+    "agent:",
+    "  model: claude-sonnet-4-5",
+    "  instructions: Be helpful.",
+    "compaction:",
+    "  threshold: 0.8",
+    "tools:",
+    "  - Read",
+    "  - Write",
+    "",
+  ].join("\n");
+
+  test("reports a changed nested scalar with old → new", () => {
+    const next = BASE.replace("Be helpful.", "Be concise.");
+    const diff = diffSpecYaml(BASE, next);
+    expect(diff).toEqual([
+      {
+        kind: "changed",
+        path: "agent.instructions",
+        before: '"Be helpful."',
+        after: '"Be concise."',
+      },
+    ]);
+  });
+
+  test("reports added and removed nested paths", () => {
+    const next = BASE.replace("  threshold: 0.8", "  curate: true");
+    const diff = diffSpecYaml(BASE, next);
+    expect(diff).toContainEqual({
+      kind: "removed",
+      path: "compaction.threshold",
+      before: "0.8",
+    });
+    expect(diff).toContainEqual({
+      kind: "added",
+      path: "compaction.curate",
+      after: "true",
+    });
+    expect(diff).toHaveLength(2);
+  });
+
+  test("sequence elements diff by index with [i] paths", () => {
+    const next = `${BASE.replace("  - Write", "  - Edit")}  - Bash\n`;
+    const diff = diffSpecYaml(BASE, next);
+    expect(diff).toContainEqual({
+      kind: "changed",
+      path: "tools[1]",
+      before: '"Write"',
+      after: '"Edit"',
+    });
+    expect(diff).toContainEqual({ kind: "added", path: "tools[2]", after: '"Bash"' });
+  });
+
+  test("identical values modulo comments/formatting produce an empty diff", () => {
+    const commented = `# a leading comment\n${BASE.replace("agent:", "agent: # inline comment")}`;
+    expect(diffSpecYaml(BASE, commented)).toEqual([]);
+  });
+
+  test("long values are truncated with a trailing ellipsis", () => {
+    const long = "x".repeat(300);
+    const next = BASE.replace("Be helpful.", long);
+    const diff = diffSpecYaml(BASE, next);
+    expect(diff).toHaveLength(1);
+    const after = diff[0]?.after ?? "";
+    expect(after.length).toBe(DIFF_VALUE_MAX_LENGTH);
+    expect(after.endsWith("…")).toBe(true);
+    // formatDiffValue is the shared primitive behind the truncation.
+    expect(formatDiffValue(long, 10)).toHaveLength(10);
+    expect(formatDiffValue("short")).toBe('"short"');
+  });
+
+  test("a map → sequence type change reports one changed entry at that path", () => {
+    const before = "roles:\n  a:\n    x: 1\n";
+    const after = "roles:\n  - a\n";
+    const diff = diffSpecYaml(before, after);
+    expect(diff).toHaveLength(1);
+    expect(diff[0]?.kind).toBe("changed");
+    expect(diff[0]?.path).toBe("roles");
+  });
+
+  test("unparseable YAML throws SpecPatchError", () => {
+    expect(() => diffSpecYaml("a: [unclosed", BASE)).toThrow(SpecPatchError);
+    expect(() => diffSpecYaml(BASE, "a: [unclosed")).toThrow(SpecPatchError);
   });
 });
