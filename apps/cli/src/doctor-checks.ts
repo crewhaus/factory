@@ -1,6 +1,9 @@
 import { resolveAuth } from "@crewhaus/adapter-anthropic";
+import { lower } from "@crewhaus/compiler";
+import type { IrChannels } from "@crewhaus/ir";
 import { parseModelString } from "@crewhaus/model-router";
 import { parseSpec } from "@crewhaus/spec";
+import { CHANNEL_PLATFORMS, platformSecretRefs } from "./channel-provision";
 
 /**
  * Model-aware credential checks for `crewhaus doctor`, factored out of the
@@ -218,3 +221,65 @@ export function buildCredentialChecks(
   checks.push({ label: "Anthropic credentials", pass: false, reason: anthropic.detail });
   return checks;
 }
+
+/**
+ * Item 61 — tolerantly extract the lowered channels block from a
+ * crewhaus.yaml text. Returns undefined when the spec doesn't parse/lower or
+ * is not a channel target, mirroring {@link extractSpecModel}'s tolerance —
+ * doctor must never fail because the cwd spec is a different shape. Lowering
+ * (not raw parsing) is deliberate: `lower()` is where `$VAR_NAME` strings
+ * become env-refs, so the check shares the compiled daemon's exact env
+ * semantics instead of re-implementing the regex.
+ */
+export function extractChannelIr(yamlText: string): IrChannels | undefined {
+  try {
+    const ir = lower(parseSpec(yamlText));
+    return ir.target === "channel" ? ir.channels : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Item 61 — channel-target doctor checks: one per configured platform
+ * (slack/telegram/discord), asserting that every secret env-ref the compiled
+ * daemon requires at boot (target-channel-bot's startup check exits 2 on the
+ * same set) is actually set. Returns [] for non-channel specs, so the check
+ * only appears when the cwd spec is a channel target. Offline by design —
+ * live platform probes (granted scopes, webhook state) belong to
+ * `crewhaus channel verify`, which the failure reason points at.
+ */
+export function buildChannelEnvChecks(
+  yamlText: string,
+  env: NodeJS.ProcessEnv,
+): DoctorCredentialCheck[] {
+  const channels = extractChannelIr(yamlText);
+  if (channels === undefined) return [];
+  const checks: DoctorCredentialCheck[] = [];
+  for (const platform of CHANNEL_PLATFORMS) {
+    const refs = platformSecretRefs(platform, channels);
+    if (refs.length === 0) continue;
+    const envNames = refs.flatMap((r) => (r.ref.kind === "env" ? [r.ref.name] : []));
+    const missing = envNames.filter((name) => !isSet(env, name)).map((name) => `$${name}`);
+    const label =
+      envNames.length > 0
+        ? `${PLATFORM_TITLE[platform]} channel env (${envNames.join(", ")})`
+        : `${PLATFORM_TITLE[platform]} channel env (inline literals)`;
+    checks.push(
+      missing.length === 0
+        ? { label, pass: true }
+        : {
+            label,
+            pass: false,
+            reason: `unset: ${missing.join(", ")} — the compiled daemon exits at boot without them; run \`crewhaus channel verify\` for live platform probes`,
+          },
+    );
+  }
+  return checks;
+}
+
+const PLATFORM_TITLE: Record<(typeof CHANNEL_PLATFORMS)[number], string> = {
+  slack: "Slack",
+  telegram: "Telegram",
+  discord: "Discord",
+};

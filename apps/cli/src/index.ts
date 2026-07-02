@@ -71,6 +71,32 @@ import {
   resolveAnchorFlag,
   summarizeVerifyResult,
 } from "./audit-verify";
+// Item 61 — `crewhaus channel provision|verify` core (adapter-derived Slack
+// manifest, Telegram setWebhook, Discord interactions-endpoint registration,
+// doctor-style scope/webhook probes), in a side-effect-free module so it is
+// unit-testable (this entry file runs an argv switch on import).
+import {
+  ChannelApiError,
+  type ChannelCheck,
+  InvalidBaseUrlError,
+  InvalidPlatformFlagError,
+  SLACK_MANIFEST_FILENAME,
+  buildDiscordProvision,
+  buildSlackManifest,
+  buildTelegramProvision,
+  describeVerifyProbes,
+  discordNextSteps,
+  joinBaseUrl,
+  performDiscordProvision,
+  performTelegramSetWebhook,
+  renderSlackManifestYaml,
+  resolvePlatformsFlag,
+  slackNextSteps,
+  summarizeChannelChecks,
+  verifyDiscordChannel,
+  verifySlackChannel,
+  verifyTelegramChannel,
+} from "./channel-provision";
 // Item 34 — scheduling ergonomics for `compliance evidence` (--period current
 // resolution + the empty-evidence gate), side-effect-free for the same reason.
 import { findEmptyControls, resolvePeriodFlag } from "./compliance-schedule";
@@ -93,7 +119,9 @@ import {
 // Model-aware doctor credential checks (provider parsed from the cwd spec's
 // agent.model via the model-router grammar), in a side-effect-free module so
 // it is unit-testable (this entry file runs an argv switch on import).
-import { buildCredentialChecks, extractSpecModel } from "./doctor-checks";
+// Item 61 added the channel-target env check (only fires when the cwd spec
+// lowers to a channel IR).
+import { buildChannelEnvChecks, buildCredentialChecks, extractSpecModel } from "./doctor-checks";
 // FR-006 — Pillar 3 sink-side egress-matcher selection (the substring/semantic
 // selector lowered to ir.security.egressMatcher). Side-effect-free + lazily
 // imports the optional semantic package only when "semantic" is selected, so
@@ -169,6 +197,35 @@ import {
 // `doctor --philosophy-alignment`. Kept in a side-effect-free module so it is
 // unit-testable (this entry file runs an argv switch on import).
 import { auditSpecToolNames, auditToolScopes, collectToolNames } from "./scope-audit";
+// Item 49 — scope-audit drift watch (stable finding ids, snapshot
+// persistence, baseline diff gate, boundary-drift detector), in a
+// side-effect-free module so it is unit-testable (this entry file runs an
+// argv switch on import).
+import {
+  type PhilosophyFinding,
+  ScopeAuditBaselineError,
+  buildScopeAuditSnapshot,
+  detectBoundaryDrift,
+  diffScopeAuditSnapshots,
+  loadScopeAuditSnapshot,
+  renderGateReport,
+  scopeAuditBaselinePath,
+  scopeAuditDir,
+  scopeAuditSnapshotPath,
+} from "./scope-audit-drift";
+// Item 48 — `crewhaus security digest` core (windowed rollup over
+// .crewhaus/audit + session event logs, text/json/html renderers, webhook
+// notify), in a side-effect-free module so it is unit-testable (this entry
+// file runs an argv switch on import).
+import {
+  InvalidSinceFlagError,
+  NotifyError,
+  buildSecurityDigest,
+  notifySecurityDigest,
+  parseSinceFlag,
+  renderSecurityDigestHtml,
+  renderSecurityDigestText,
+} from "./security-digest";
 // Item 69 — `crewhaus state backup|restore` core (tarball snapshot of the
 // cwd `.crewhaus` state dir + full/merge restore), in a module with no
 // import-time side effects so it is unit-testable (this entry file runs an
@@ -291,6 +348,15 @@ const INIT_SCHEMA: ParseArgsSchema = {
 const DOCTOR_SCHEMA: ParseArgsSchema = {
   flags: [
     { name: "philosophy-alignment", takesValue: false },
+    // Item 49 — scope-audit drift watch (compose with --philosophy-alignment):
+    //   --json             persist findings to .crewhaus/scope-audit/<date>.json
+    //                      (stable ids) and print the snapshot JSON
+    //   --baseline         diff against .crewhaus/scope-audit/baseline.json;
+    //                      exit non-zero ONLY on NEW findings
+    //   --accept-baseline  promote the current findings to the baseline
+    { name: "json", takesValue: false },
+    { name: "baseline", takesValue: false },
+    { name: "accept-baseline", takesValue: false },
     // Process-liveness only — exit 0 fast, no credential/spec checks. The
     // probe target for container HEALTHCHECKs and k8s exec probes.
     { name: "liveness", takesValue: false },
@@ -508,6 +574,38 @@ const RETENTION_SCHEMA: ParseArgsSchema = {
   ],
 };
 
+const SECURITY_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // Item 48 — `security digest` rollup window: 7d (default), 30d, or ISO.
+    { name: "since", takesValue: true },
+    { name: "format", takesValue: true },
+    { name: "out", short: "o", takesValue: true },
+    // POST the JSON digest to a webhook (plain fetch — see security-digest.ts
+    // for the deliberate no-channel-adapter decision + the Slack wrapper note).
+    { name: "notify", takesValue: true },
+    // Harness root that owns `.crewhaus/` (mirrors `retention --dir`).
+    { name: "dir", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
+const CHANNEL_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // Item 61 — `channel provision|verify` platform selection + daemon origin.
+    { name: "platform", takesValue: true },
+    { name: "base-url", takesValue: true },
+    // provision only: directory the Slack manifest YAML is written into.
+    { name: "out", short: "o", takesValue: true },
+    // print every network call (redacted) without performing it.
+    { name: "dry-run", takesValue: false },
+    // provision (discord) only: overwrite a DIFFERENT pre-existing
+    // interactions_endpoint_url — read-before-write refuses without it
+    // (mirrors `state restore --force`).
+    { name: "force", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
 const SECRETS_SCHEMA: ParseArgsSchema = {
   flags: [
     { name: "backend", takesValue: true },
@@ -614,6 +712,7 @@ function usageText(): string {
     "       [--write-back] [-o <out-dir>]        active eval-driven optimization (Pillar 2)",
     "  init [name]                          scaffold a new crewhaus.yaml",
     "  doctor                               check environment health",
+    "       [--philosophy-alignment [--json] [--baseline | --accept-baseline]]  pillar audit + scope-audit drift gate (item 49)",
     "  context --bundle [-o <file>]         emit a single-markdown orientation manifest",
     "       [--factory-root <p>] [--docs-root <p>] [--demos-root <p>]",
     "  cost-summary --session <id>          summarize cost_accrual events for a session",
@@ -662,6 +761,15 @@ function usageText(): string {
     "       [--since <date>] [--dry-run] [--dir <root>]",
     "  retention purge [--before <date>]    right-to-delete: purge expired records now",
     "       [--dry-run] [--dir <root>]",
+    "  security digest [--since 7d|30d|ISO] triage rollup of denials/egress/injection from .crewhaus stores (item 48)",
+    "       [--format text|json|html] [-o <dir>] [--notify <url>] [--dir <root>]",
+    "  channel provision <spec.yaml>        one-command platform app setup for a channel spec (item 61):",
+    "       --base-url <public-url>         slack app manifest YAML, telegram setWebhook, discord",
+    "       [--platform slack|telegram|discord|all]  interactions endpoint + invite URL",
+    "       [-o <dir>] [--dry-run] [--force]",
+    "  channel verify <spec.yaml>           scope doctor: slack auth.test + granted scopes,",
+    "       [--platform ...] [--dry-run]    telegram getWebhookInfo, discord application fetch",
+    "       [--base-url <public-url>]       (exit 1 on missing scopes / mismatched webhook)",
     "  version                              print the CLI version (also: --version, -v)",
     "",
   ].join("\n");
@@ -1650,8 +1758,13 @@ function runContext(args: ParsedArgs): void {
 async function runDoctor(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
-      "usage: crewhaus doctor [--philosophy-alignment] [--liveness]\n" +
+      "usage: crewhaus doctor [--philosophy-alignment [--json] [--baseline | --accept-baseline]] [--liveness]\n" +
         "  --philosophy-alignment   audit the codebase + examples against the three architectural pillars\n" +
+        "  --json                   persist findings (stable ids) to .crewhaus/scope-audit/<date>.json\n" +
+        "                           and print the snapshot JSON (item 49)\n" +
+        "  --baseline               diff findings against .crewhaus/scope-audit/baseline.json; exit\n" +
+        "                           non-zero ONLY on NEW findings (accepted legacy findings never block)\n" +
+        "  --accept-baseline        promote the current findings to the accepted baseline\n" +
         "  --liveness               process-liveness probe: exit 0 immediately, no credential or\n" +
         "                           spec checks (for container HEALTHCHECKs / k8s exec probes)\n" +
         "\n" +
@@ -1669,8 +1782,14 @@ async function runDoctor(args: ParsedArgs): Promise<void> {
     process.exit(0);
   }
   if (args.flags["philosophy-alignment"]) {
-    await runDoctorPhilosophyAlignment();
+    await runDoctorPhilosophyAlignment(args);
     return;
+  }
+  // Item 49 — the drift-watch flags only make sense on the philosophy audit.
+  for (const flag of ["json", "baseline", "accept-baseline"] as const) {
+    if (args.flags[flag] === true) {
+      die(`--${flag} requires --philosophy-alignment`);
+    }
   }
 
   const checks: DoctorCheck[] = [];
@@ -1680,15 +1799,24 @@ async function runDoctor(args: ParsedArgs): Promise<void> {
   // the legacy Anthropic-first check when no model is extractable. See
   // doctor-checks.ts for the full policy (bedrock/local are informational).
   const specPath = join(process.cwd(), "crewhaus.yaml");
-  let specModel: string | undefined;
+  let specText: string | undefined;
   if (existsSync(specPath)) {
     try {
-      specModel = extractSpecModel(readFileSync(specPath, "utf-8"));
+      specText = readFileSync(specPath, "utf-8");
     } catch {
-      specModel = undefined;
+      specText = undefined;
     }
   }
+  const specModel = specText !== undefined ? extractSpecModel(specText) : undefined;
   checks.push(...buildCredentialChecks(specModel, process.env));
+
+  // Item 61 — channel-target env checks: only when the cwd spec lowers to a
+  // channel IR (other shapes contribute nothing), one check per configured
+  // slack/telegram/discord platform asserting its required secret env-refs
+  // are set. Live platform probes live in `crewhaus channel verify`.
+  if (specText !== undefined) {
+    checks.push(...buildChannelEnvChecks(specText, process.env));
+  }
 
   const bunCheck = checkBunVersion(Bun.version);
   checks.push({
@@ -1729,13 +1857,14 @@ async function runDoctor(args: ParsedArgs): Promise<void> {
 }
 
 /**
- * Workstream D — `crewhaus doctor --philosophy-alignment`. Audits the
+ * Workstream D — collect the `--philosophy-alignment` findings. Audits the
  * repo against the three architectural pillars (compiler-as-protagonist,
- * eval-is-active, security-is-fabric). Exits 0 on green, 1 on any
- * finding. Designed to be runnable in CI as a soft gate.
+ * eval-is-active, security-is-fabric). Item 49 gave every finding a stable
+ * (class, file, symbol) identity so the drift watch can persist/diff them,
+ * and added the boundary-drift detector on top of the six-site check.
  */
-async function runDoctorPhilosophyAlignment(): Promise<void> {
-  const findings: DoctorCheck[] = [];
+async function collectPhilosophyFindings(): Promise<PhilosophyFinding[]> {
+  const findings: PhilosophyFinding[] = [];
 
   // Pillar 1 — compiler-as-protagonist. The IR-discriminated-union is
   // the contract; the architecture doc must reference the IR variants.
@@ -1748,14 +1877,20 @@ async function runDoctorPhilosophyAlignment(): Promise<void> {
     const referencesIrVariants =
       content.includes("IrV0") && content.includes("IrPipelineV0") && content.includes("IrGraphV0");
     findings.push({
+      class: "pillar-doc",
+      file: "../docs/COMPILER-ARCHITECTURE.md",
+      symbol: "ir-variants",
       label: "Pillar 1 — ../docs/COMPILER-ARCHITECTURE.md references IR variants",
       pass: referencesIrVariants,
-      reason: referencesIrVariants
-        ? undefined
-        : "doc exists but does not enumerate the IR-discriminated-union variants",
+      ...(referencesIrVariants
+        ? {}
+        : { reason: "doc exists but does not enumerate the IR-discriminated-union variants" }),
     });
   } else {
     findings.push({
+      class: "pillar-doc",
+      file: "../docs/COMPILER-ARCHITECTURE.md",
+      symbol: "sibling-checkout",
       label: "Pillar 1 — COMPILER-ARCHITECTURE.md (sibling checkout)",
       pass: true,
       warn: true,
@@ -1773,18 +1908,24 @@ async function runDoctorPhilosophyAlignment(): Promise<void> {
     "package.json",
   );
   findings.push({
+    class: "package-presence",
+    file: "packages/eval-optimizer-orchestrator/package.json",
+    symbol: "eval-optimizer-orchestrator",
     label: "Pillar 2 — eval-optimizer-orchestrator package present",
     pass: existsSync(orchestratorPkg),
-    reason: existsSync(orchestratorPkg)
-      ? undefined
-      : "Workstream B did not land — install or rebuild",
+    ...(existsSync(orchestratorPkg)
+      ? {}
+      : { reason: "Workstream B did not land — install or rebuild" }),
   });
 
   const specPatchPkg = join(process.cwd(), "packages", "spec-patch", "package.json");
   findings.push({
+    class: "package-presence",
+    file: "packages/spec-patch/package.json",
+    symbol: "spec-patch",
     label: "Pillar 2 — spec-patch package present",
     pass: existsSync(specPatchPkg),
-    reason: existsSync(specPatchPkg) ? undefined : "Workstream B did not land",
+    ...(existsSync(specPatchPkg) ? {} : { reason: "Workstream B did not land" }),
   });
 
   // Pillar 3 — security is a fabric. The boundary-classifier package
@@ -1793,9 +1934,12 @@ async function runDoctorPhilosophyAlignment(): Promise<void> {
   // federation-router, channel-adapter-base).
   const boundaryPkg = join(process.cwd(), "packages", "boundary-classifier", "package.json");
   findings.push({
+    class: "package-presence",
+    file: "packages/boundary-classifier/package.json",
+    symbol: "boundary-classifier",
     label: "Pillar 3 — boundary-classifier package present",
     pass: existsSync(boundaryPkg),
-    reason: existsSync(boundaryPkg) ? undefined : "Workstream C did not land",
+    ...(existsSync(boundaryPkg) ? {} : { reason: "Workstream C did not land" }),
   });
 
   const boundarySites: ReadonlyArray<{ name: string; path: string }> = [
@@ -1810,6 +1954,9 @@ async function runDoctorPhilosophyAlignment(): Promise<void> {
     const filePath = join(process.cwd(), site.path);
     if (!existsSync(filePath)) {
       findings.push({
+        class: "boundary-site",
+        file: site.path,
+        symbol: site.name,
         label: `Pillar 3 — ${site.name} source present`,
         pass: false,
         reason: `${site.path} not found`,
@@ -1819,13 +1966,23 @@ async function runDoctorPhilosophyAlignment(): Promise<void> {
     const body = readFileSync(filePath, "utf8");
     const classifies = body.includes("classifyBoundary") || body.includes("boundary-classifier");
     findings.push({
+      class: "boundary-site",
+      file: site.path,
+      symbol: site.name,
       label: `Pillar 3 — ${site.name} calls classifyBoundary`,
       pass: classifies,
-      reason: classifies
-        ? undefined
-        : `no reference to classifyBoundary in ${site.path} — security regression`,
+      ...(classifies
+        ? {}
+        : { reason: `no reference to classifyBoundary in ${site.path} — security regression` }),
     });
   }
+
+  // Item 49 — boundary-site DRIFT. The six-site list above only re-checks
+  // KNOWN sites; this scans every package for cross-trust ingress signals
+  // (same read-the-source substring mechanism) and flags a NEW ingress that
+  // never references the classification fabric. Report-only here (warn);
+  // the --baseline gate is what fails, and only on NEW findings.
+  findings.push(...detectBoundaryDrift(process.cwd()));
 
   // FR-002 — Pillar 3 sink-side. Audit the full built-in tool map: every
   // outward-reaching built-in must carry scope: "external" so the egress
@@ -1837,12 +1994,18 @@ async function runDoctorPhilosophyAlignment(): Promise<void> {
   const scopeFindings = auditToolScopes(Object.values(toolMap));
   if (scopeFindings.length === 0) {
     findings.push({
+      class: "tool-scope",
+      file: "",
+      symbol: "all-builtin-outward-tools",
       label: 'Pillar 3 — all built-in outward tools scope:"external"',
       pass: true,
     });
   } else {
     for (const f of scopeFindings) {
       findings.push({
+        class: "tool-scope",
+        file: "",
+        symbol: f.toolName,
         label: `Pillar 3 — tool "${f.toolName}" outward but scope!="external"`,
         pass: false,
         reason: f.reason,
@@ -1857,22 +2020,101 @@ async function runDoctorPhilosophyAlignment(): Promise<void> {
   const claudemd = join(process.cwd(), "CLAUDE.md");
   const hasContributorCompass = existsSync(agentsmd) || existsSync(claudemd);
   findings.push({
+    class: "contributor-doc",
+    file: "AGENTS.md",
+    symbol: "contributor-compass",
     label: "Contributor doc — AGENTS.md (or CLAUDE.md) at project root",
     pass: hasContributorCompass,
-    reason: hasContributorCompass ? undefined : "missing — contributors will drift",
+    ...(hasContributorCompass ? {} : { reason: "missing — contributors will drift" }),
   });
 
+  return findings;
+}
+
+/**
+ * Workstream D + item 49 — `crewhaus doctor --philosophy-alignment
+ * [--json] [--baseline | --accept-baseline]`.
+ *
+ * Plain mode is unchanged: print ✓/~/✗ per check, exit 0 on green / 1 on
+ * any hard finding (boundary-drift reports are warn-tier and never fail
+ * plain mode). The drift-watch modes:
+ *
+ *   --json             persist the actionable findings (stable ids) to
+ *                      `.crewhaus/scope-audit/<YYYY-MM-DD>.json` and print
+ *                      the snapshot JSON to stdout (status lines → stderr).
+ *   --baseline         diff against `.crewhaus/scope-audit/baseline.json`
+ *                      following regression-runner's gate() shape; exit
+ *                      non-zero ONLY on NEW findings — legacy accepted
+ *                      findings never block. A missing baseline fails when
+ *                      findings exist (a gate nobody armed must not pass).
+ *   --accept-baseline  promote the current findings to the baseline (and
+ *                      write the dated snapshot); exits 0.
+ */
+async function runDoctorPhilosophyAlignment(args: ParsedArgs): Promise<void> {
+  const jsonMode = args.flags["json"] === true;
+  const baselineMode = args.flags["baseline"] === true;
+  const acceptMode = args.flags["accept-baseline"] === true;
+  if (baselineMode && acceptMode) {
+    die("--baseline and --accept-baseline are mutually exclusive");
+  }
+
+  const findings = await collectPhilosophyFindings();
+  const snapshot = buildScopeAuditSnapshot(findings);
+  const rootDir = process.cwd();
+
+  // Human-readable per-check lines. In --json mode they move to stderr so
+  // stdout stays a clean machine surface (mirroring `context -o`'s split).
+  const statusOut = jsonMode
+    ? (line: string): void => void process.stderr.write(line)
+    : (line: string): void => void process.stdout.write(line);
   for (const f of findings) {
     if (f.warn && f.pass) {
-      process.stdout.write(`~ ${f.label}: ${f.reason ?? "skipped"}\n`);
+      statusOut(`~ ${f.label}: ${f.reason ?? "skipped"}\n`);
     } else if (f.pass) {
-      process.stdout.write(`✓ ${f.label}\n`);
+      statusOut(`✓ ${f.label}\n`);
     } else {
-      process.stdout.write(`✗ ${f.label}: ${f.reason ?? "failed"}\n`);
+      statusOut(`✗ ${f.label}: ${f.reason ?? "failed"}\n`);
     }
   }
+
+  // Snapshot persistence: --json always writes the dated file;
+  // --accept-baseline additionally writes baseline.json.
+  if (jsonMode || acceptMode) {
+    mkdirSync(scopeAuditDir(rootDir), { recursive: true });
+    const snapshotPath = scopeAuditSnapshotPath(rootDir, () => Date.now());
+    writeFileSync(snapshotPath, `${JSON.stringify(snapshot, null, 2)}\n`);
+    statusOut(`wrote ${snapshotPath}\n`);
+  }
+
+  if (acceptMode) {
+    mkdirSync(scopeAuditDir(rootDir), { recursive: true });
+    const baselinePath = scopeAuditBaselinePath(rootDir);
+    writeFileSync(baselinePath, `${JSON.stringify(snapshot, null, 2)}\n`);
+    statusOut(
+      `accepted ${snapshot.findings.length} finding(s) as the baseline → ${baselinePath}\n`,
+    );
+    if (jsonMode) process.stdout.write(`${JSON.stringify(snapshot, null, 2)}\n`);
+    process.exit(0);
+  }
+
+  if (baselineMode) {
+    let baseline: ReturnType<typeof loadScopeAuditSnapshot>;
+    try {
+      baseline = loadScopeAuditSnapshot(scopeAuditBaselinePath(rootDir));
+    } catch (err) {
+      if (err instanceof ScopeAuditBaselineError) die(err.message);
+      throw err;
+    }
+    const gate = diffScopeAuditSnapshots(baseline, snapshot);
+    for (const line of renderGateReport(gate)) statusOut(`${line}\n`);
+    if (jsonMode) process.stdout.write(`${JSON.stringify({ snapshot, gate }, null, 2)}\n`);
+    process.exit(gate.verdict === "pass" ? 0 : 1);
+  }
+
+  if (jsonMode) process.stdout.write(`${JSON.stringify(snapshot, null, 2)}\n`);
+
   const allPass = findings.every((f) => f.pass);
-  process.stdout.write(
+  statusOut(
     allPass
       ? "\nphilosophy alignment: green. All three pillars intact.\n"
       : `\nphilosophy alignment: ${findings.filter((f) => !f.pass).length} finding(s). See [/AGENTS.md](AGENTS.md) for invariants.\n`,
@@ -4621,6 +4863,348 @@ async function runRetention(args: ParsedArgs, action: string): Promise<void> {
   }
 }
 
+/**
+ * Item 48 — `crewhaus security digest [--since 7d|30d|<ISO>] [--format
+ * text|json|html] [-o <dir>] [--notify <url>] [--dir <root>]`. Walks the
+ * cwd (or --dir) harness's `.crewhaus/audit` + `.crewhaus/sessions` stores
+ * and emits a ranked warn/deny rollup: top justification-denied tools (with
+ * judge identity + confidence), judge deny rate, policy-engine denials,
+ * injection rule-id hits (from session redaction notices), and — the day a
+ * writer lands for the declared-but-writerless `egress_decision` kind — top
+ * warn/block egress sinks + origins. See security-digest.ts for exactly
+ * which audit kinds have writers today and the design decisions (local HTML
+ * helper, plain-fetch notify).
+ *
+ * The digest is a report, not a gate: it exits 0 even when the window is
+ * full of denials. The one loud failure is `--notify` — a scheduled digest
+ * whose notification silently failed would fabricate assurance, so a
+ * non-2xx/unreachable webhook exits 1.
+ */
+async function runSecurityDigest(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus security digest [--since 7d|30d|<ISO>] [--format text|json|html]\n" +
+        "                                [-o <dir>] [--notify <url>] [--dir <root>]\n" +
+        "  --since <w>     rollup window: a trailing day window (7d default, e.g. 30d)\n" +
+        "                  or an ISO date/datetime lower bound\n" +
+        "  --format <f>    text (default), json (the machine shape --notify POSTs),\n" +
+        "                  or html (self-contained page, eval-report styling)\n" +
+        "  -o <dir>        write security-digest.<ext> into <dir> instead of stdout\n" +
+        "  --notify <url>  POST the JSON digest to a webhook (plain fetch; Slack\n" +
+        "                  incoming webhooks need a { text } wrapper — front one with\n" +
+        "                  a proxy that forwards { text: <rendered text> })\n" +
+        "  --dir <root>    harness root that owns .crewhaus/ (default: cwd)\n",
+    );
+    return;
+  }
+  const formatFlag = args.flags["format"];
+  const format = typeof formatFlag === "string" ? formatFlag : "text";
+  if (format !== "text" && format !== "json" && format !== "html") {
+    die(`--format must be "text", "json" or "html" (got "${format}")`);
+  }
+  const dirFlag = args.flags["dir"];
+  const rootDir = typeof dirFlag === "string" ? resolve(dirFlag) : process.cwd();
+  const sinceFlag = args.flags["since"];
+
+  let digest: ReturnType<typeof buildSecurityDigest>;
+  try {
+    const window = parseSinceFlag(typeof sinceFlag === "string" ? sinceFlag : undefined);
+    digest = buildSecurityDigest({ rootDir, window });
+  } catch (err) {
+    if (err instanceof InvalidSinceFlagError) die(err.message);
+    throw err;
+  }
+
+  const rendered =
+    format === "json"
+      ? `${JSON.stringify(digest, null, 2)}\n`
+      : format === "html"
+        ? renderSecurityDigestHtml(digest)
+        : `security digest: ${rootDir}\n${renderSecurityDigestText(digest)
+            .map((l) => `  ${l}`)
+            .join("\n")}\n`;
+
+  const outFlag = args.flags["out"];
+  if (typeof outFlag === "string") {
+    const outDir = resolve(outFlag);
+    mkdirSync(outDir, { recursive: true });
+    const ext = format === "text" ? "txt" : format;
+    const outPath = join(outDir, `security-digest.${ext}`);
+    writeFileSync(outPath, rendered);
+    process.stdout.write(`wrote ${outPath}\n`);
+  } else {
+    process.stdout.write(rendered);
+  }
+
+  const notifyFlag = args.flags["notify"];
+  if (typeof notifyFlag === "string") {
+    try {
+      await notifySecurityDigest(notifyFlag, digest);
+      process.stdout.write(`notified ${notifyFlag}\n`);
+    } catch (err) {
+      if (err instanceof NotifyError) die(err.message);
+      throw err;
+    }
+  }
+}
+
+/**
+ * Item 61 — `crewhaus channel provision|verify <spec.yaml>`: one-command
+ * platform-side setup + scope doctor for channel-target specs. Everything is
+ * derived from the spec + the adapters' actual API usage (see
+ * channel-provision.ts for the per-platform derivations and the two design
+ * decisions: Slack is emit-and-instruct only because the manifest API needs
+ * an app configuration token the adapter/spec never carry, and Discord
+ * registers the interactions endpoint — its adapter is webhook-based, not
+ * gateway-websocket-based — but not application commands, because the spec
+ * declares no command list and the adapter routes any command name).
+ *
+ * `--dry-run` prints every network call with secrets redacted (env-refs as
+ * `$NAME`, inline literals as `[redacted]`) and performs nothing.
+ */
+async function runChannel(args: ParsedArgs, action: "provision" | "verify"): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus channel provision <spec.yaml> --base-url <public-url>\n" +
+        "                                  [--platform slack|telegram|discord|all] [-o <dir>]\n" +
+        "                                  [--dry-run] [--force]\n" +
+        "       crewhaus channel verify <spec.yaml> [--platform slack|telegram|discord|all]\n" +
+        "                                  [--base-url <public-url>] [--dry-run]\n" +
+        "\n" +
+        "  provision — platform-side app setup derived from the spec + compiled daemon:\n" +
+        "    slack     write <dir>/slack-app-manifest.yaml (the bot scopes + event\n" +
+        "              subscriptions the adapter actually needs; request URL =\n" +
+        "              <base-url>/slack/events) and print the console steps. No --apply:\n" +
+        "              Slack's manifest API needs an app *configuration* token, which\n" +
+        "              neither the adapter nor the spec carries.\n" +
+        "    telegram  CALL setWebhook with url = <base-url>/telegram/events and the\n" +
+        "              spec's secretToken (the exact value the adapter verifies on every\n" +
+        "              inbound POST via X-Telegram-Bot-Api-Secret-Token).\n" +
+        "    discord   PATCH applications/@me interactions_endpoint_url =\n" +
+        "              <base-url>/discord/events (start the daemon first — Discord\n" +
+        "              validates the endpoint live) and print the invite URL with\n" +
+        "              adapter-derived permission bits. Slash commands are NOT\n" +
+        "              auto-registered: the spec declares no command list and the\n" +
+        "              adapter routes any command name to the agent.\n" +
+        "  verify — doctor-style probes, ✓/~/✗ per check, exit 1 on hard failures:\n" +
+        "    slack     auth.test + granted scopes (x-oauth-scopes) vs the needed set\n" +
+        "    telegram  getWebhookInfo url / allowed_updates / pending updates / last error\n" +
+        "    discord   applications/@me id / verify_key / interactions endpoint\n" +
+        "  --base-url  the daemon's publicly reachable origin (required for provision;\n" +
+        "              on verify it upgrades the webhook-URL checks from ~ to ✓/✗)\n" +
+        "  --dry-run   print every network call (secrets redacted) without performing it\n" +
+        "  --force     discord provision reads applications/@me first and REFUSES to\n" +
+        "              overwrite an interactions_endpoint_url that differs from the\n" +
+        "              daemon route; --force replaces it (and reports what it was)\n",
+    );
+    return;
+  }
+  const specPath = args.positional[0];
+  if (typeof specPath !== "string") die("missing <spec.yaml>");
+  const absSpec = resolve(specPath);
+  let yamlText: string;
+  try {
+    yamlText = readFileSync(absSpec, "utf-8");
+  } catch (err) {
+    die(`could not read ${absSpec}: ${(err as Error).message}`);
+  }
+  let ir: ReturnType<typeof lower>;
+  try {
+    ir = lower(parseSpec(yamlText));
+  } catch (err) {
+    // parseSpec throws SpecParseError; lower() can throw CompilerError — both
+    // extend CrewhausError, so render as a clean one-liner.
+    if (err instanceof CrewhausError) die(err.message);
+    throw err;
+  }
+  if (ir.target !== "channel") {
+    die(
+      `channel ${action} requires a channel-target spec (got target "${ir.target}") — the platform config lives in the spec's channels block`,
+    );
+  }
+
+  const platformFlag = args.flags["platform"];
+  let selection: ReturnType<typeof resolvePlatformsFlag>;
+  try {
+    selection = resolvePlatformsFlag(
+      typeof platformFlag === "string" ? platformFlag : undefined,
+      ir.channels,
+    );
+  } catch (err) {
+    if (err instanceof InvalidPlatformFlagError) die(err.message);
+    throw err;
+  }
+  for (const p of selection.unsupported) {
+    process.stdout.write(
+      `note: channels.${p} is configured but \`channel ${action}\` does not support it yet (slack|telegram|discord)\n`,
+    );
+  }
+
+  const dryRun = args.flags["dry-run"] === true;
+  const baseUrlFlag = args.flags["base-url"];
+  const baseUrl = typeof baseUrlFlag === "string" ? baseUrlFlag : undefined;
+  if (baseUrl !== undefined) {
+    try {
+      joinBaseUrl(baseUrl, "/");
+    } catch (err) {
+      if (err instanceof InvalidBaseUrlError) die(err.message);
+      throw err;
+    }
+  }
+  const channelReactions = ir.feedback?.channelReactions === true;
+
+  if (action === "provision") {
+    if (baseUrl === undefined) {
+      die(
+        "missing --base-url <public-url> — the daemon's publicly reachable origin (e.g. https://bot.example.com); every platform points at a route under it (slack request_url, telegram webhook url, discord interactions endpoint)",
+      );
+    }
+    const outFlag = args.flags["out"];
+    const outDir = typeof outFlag === "string" ? resolve(outFlag) : process.cwd();
+    process.stdout.write(
+      `channel provision: ${ir.name} (${selection.platforms.join(", ")})${dryRun ? " (dry run)" : ""}\n`,
+    );
+
+    for (const platform of selection.platforms) {
+      if (platform === "slack" && ir.channels.slack !== undefined) {
+        const manifest = buildSlackManifest({ name: ir.name, channelReactions }, baseUrl);
+        const manifestYaml = renderSlackManifestYaml(manifest);
+        const manifestPath = join(outDir, SLACK_MANIFEST_FILENAME);
+        process.stdout.write("\nslack:\n");
+        if (dryRun) {
+          process.stdout.write(`  would write ${manifestPath}:\n`);
+          for (const line of manifestYaml.trimEnd().split("\n")) {
+            process.stdout.write(`    ${line}\n`);
+          }
+        } else {
+          mkdirSync(outDir, { recursive: true });
+          writeFileSync(manifestPath, manifestYaml);
+          process.stdout.write(`  wrote ${manifestPath}\n`);
+        }
+        for (const line of slackNextSteps(ir.channels.slack, manifestPath)) {
+          process.stdout.write(`  ${line}\n`);
+        }
+      }
+
+      if (platform === "telegram" && ir.channels.telegram !== undefined) {
+        const provision = buildTelegramProvision(ir.channels.telegram, baseUrl, process.env);
+        process.stdout.write("\ntelegram:\n");
+        if (dryRun) {
+          process.stdout.write(`  would POST ${provision.display.endpoint}\n`);
+          process.stdout.write(`  payload: ${JSON.stringify(provision.display.payload)}\n`);
+          if (provision.missingEnv.length > 0) {
+            process.stdout.write(
+              `  note: a live run needs ${provision.missingEnv.map((m) => `$${m.envName}`).join(", ")} set\n`,
+            );
+          }
+        } else if (provision.missingEnv.length > 0) {
+          die(
+            `channel provision (telegram): unset env: ${provision.missingEnv
+              .map((m) => `${m.label} → $${m.envName}`)
+              .join(", ")} — export them (or use --dry-run to print the call)`,
+          );
+        } else {
+          try {
+            const description = await performTelegramSetWebhook(provision);
+            process.stdout.write(`  ✓ setWebhook: ${description}\n`);
+            process.stdout.write(
+              `    url ${provision.display.payload.url}, secret_token ${provision.display.payload.secret_token}, allowed_updates ${provision.display.payload.allowed_updates.join("/")}\n`,
+            );
+          } catch (err) {
+            if (err instanceof ChannelApiError) die(err.message);
+            throw err;
+          }
+        }
+      }
+
+      if (platform === "discord" && ir.channels.discord !== undefined) {
+        const provision = buildDiscordProvision(ir.channels.discord, baseUrl, process.env);
+        process.stdout.write("\ndiscord:\n");
+        if (dryRun) {
+          process.stdout.write(
+            `  would PATCH ${provision.display.endpoint} (Authorization: ${provision.display.authorization})\n`,
+          );
+          process.stdout.write(`  payload: ${JSON.stringify(provision.display.payload)}\n`);
+          process.stdout.write(
+            "  note: a live run first GETs applications/@me — a pre-existing\n" +
+              "        interactions_endpoint_url that differs from the payload above is\n" +
+              "        only replaced with --force (without it, provision refuses)\n",
+          );
+          if (provision.missingEnv.length > 0) {
+            process.stdout.write(
+              `  note: a live run needs ${provision.missingEnv.map((m) => `$${m.envName}`).join(", ")} set\n`,
+            );
+          }
+          for (const line of discordNextSteps(provision.display.inviteUrl)) {
+            process.stdout.write(`  ${line}\n`);
+          }
+        } else if (provision.missingEnv.length > 0) {
+          die(
+            `channel provision (discord): unset env: ${provision.missingEnv
+              .map((m) => `${m.label} → $${m.envName}`)
+              .join(", ")} — export them (or use --dry-run to print the call)`,
+          );
+        } else {
+          try {
+            const result = await performDiscordProvision(provision, fetch, {
+              force: args.flags["force"] === true,
+            });
+            process.stdout.write(
+              `  ✓ interactions endpoint set to ${provision.display.payload.interactions_endpoint_url}\n`,
+            );
+            if (result.replacedPrevious && result.previousEndpoint !== undefined) {
+              process.stdout.write(
+                `    replaced previous endpoint ${result.previousEndpoint} (--force)\n`,
+              );
+            }
+          } catch (err) {
+            if (err instanceof ChannelApiError) die(err.message);
+            throw err;
+          }
+          for (const line of discordNextSteps(provision.inviteUrl ?? provision.display.inviteUrl)) {
+            process.stdout.write(`  ${line}\n`);
+          }
+        }
+      }
+    }
+    return;
+  }
+
+  // action === "verify"
+  process.stdout.write(
+    `channel verify: ${ir.name} (${selection.platforms.join(", ")})${dryRun ? " (dry run)" : ""}\n`,
+  );
+  if (dryRun) {
+    for (const platform of selection.platforms) {
+      for (const line of describeVerifyProbes(platform, ir.channels, process.env)) {
+        process.stdout.write(`  ${line}\n`);
+      }
+    }
+    return;
+  }
+  const verifyOpts = {
+    env: process.env,
+    ...(baseUrl !== undefined ? { baseUrl } : {}),
+  };
+  const checks: ChannelCheck[] = [];
+  for (const platform of selection.platforms) {
+    if (platform === "slack" && ir.channels.slack !== undefined) {
+      checks.push(
+        ...(await verifySlackChannel(ir.channels.slack, { channelReactions }, verifyOpts)),
+      );
+    } else if (platform === "telegram" && ir.channels.telegram !== undefined) {
+      checks.push(...(await verifyTelegramChannel(ir.channels.telegram, verifyOpts)));
+    } else if (platform === "discord" && ir.channels.discord !== undefined) {
+      checks.push(...(await verifyDiscordChannel(ir.channels.discord, verifyOpts)));
+    }
+  }
+  const summary = summarizeChannelChecks(checks);
+  for (const line of summary.lines) {
+    process.stdout.write(`  ${line}\n`);
+  }
+  process.exit(summary.exitCode);
+}
+
 const argv = process.argv.slice(2);
 const subcommand = argv[0] ?? "";
 const rest = argv.slice(1);
@@ -4760,6 +5344,22 @@ switch (subcommand) {
       die(`retention action must be one of: sweep, export, purge (got "${action}")`);
     }
     await runRetention(parseFor(rest.slice(1), RETENTION_SCHEMA), action);
+    break;
+  }
+  case "security": {
+    const action = rest[0] ?? "";
+    if (action !== "digest") {
+      die(`security action must be "digest" (got "${action}")`);
+    }
+    await runSecurityDigest(parseFor(rest.slice(1), SECURITY_SCHEMA));
+    break;
+  }
+  case "channel": {
+    const action = rest[0] ?? "";
+    if (action !== "provision" && action !== "verify") {
+      die(`channel action must be "provision" or "verify" (got "${action}")`);
+    }
+    await runChannel(parseFor(rest.slice(1), CHANNEL_SCHEMA), action);
     break;
   }
   case "version":
