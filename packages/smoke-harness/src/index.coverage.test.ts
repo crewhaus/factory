@@ -71,7 +71,8 @@ describe("runShapeSmoke — failure branches", () => {
   test("present 'any' anchor passes (covers the satisfied any-branch)", () => {
     const assertion: ShapeAssertion = {
       shape: "cli",
-      expectedFiles: ["agent.ts"],
+      // Item 42 — every bundle now carries a generated README.md too.
+      expectedFiles: ["README.md", "agent.ts"],
       // cli bundles import runtime-core, so this substring is present.
       anchors: [{ in: "any", contains: "@crewhaus/runtime-core" }],
     };

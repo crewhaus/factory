@@ -31,7 +31,12 @@
  */
 import { CrewhausError } from "@crewhaus/errors";
 import { escapeJsonString } from "@crewhaus/infra-utils";
-import type { Bundle, IrBrowserV0 } from "@crewhaus/ir";
+import {
+  type Bundle,
+  type EmitReadmeOptions,
+  type IrBrowserV0,
+  renderBundleReadme,
+} from "@crewhaus/ir";
 
 export class TargetEmitError extends CrewhausError {
   override readonly name = "TargetEmitError";
@@ -128,8 +133,14 @@ function resolveTools(
   return { imports, inits, registrations };
 }
 
-export function emitBrowserDriver(ir: IrBrowserV0): Bundle {
-  return { files: [{ path: "agent.ts", content: renderAgent(ir) }] };
+export function emitBrowserDriver(ir: IrBrowserV0, opts: EmitReadmeOptions = {}): Bundle {
+  const files = [{ path: "agent.ts", content: renderAgent(ir) }];
+  // Item 42 — generated bundle README; default ON (`crewhaus compile
+  // --no-readme` opts out).
+  if (opts.readme !== false) {
+    files.push({ path: "README.md", content: renderBundleReadme(ir) });
+  }
+  return { files };
 }
 
 function renderAgent(ir: IrBrowserV0): string {

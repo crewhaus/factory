@@ -1,6 +1,13 @@
 import { CrewhausError } from "@crewhaus/errors";
 import { escapeJsonString } from "@crewhaus/infra-utils";
-import type { Bundle, IrChannelV0, IrSecretRef, IrSubAgentDefinition } from "@crewhaus/ir";
+import {
+  type Bundle,
+  type EmitReadmeOptions,
+  type IrChannelV0,
+  type IrSecretRef,
+  type IrSubAgentDefinition,
+  renderBundleReadme,
+} from "@crewhaus/ir";
 import { type ParsedModelString, parseModelString } from "@crewhaus/model-router";
 
 /**
@@ -17,7 +24,7 @@ import { type ParsedModelString, parseModelString } from "@crewhaus/model-router
  * required env-ref is unset, so the daemon never accepts webhooks signed
  * with an empty secret.
  */
-export function emitChannelBot(ir: IrChannelV0): Bundle {
+export function emitChannelBot(ir: IrChannelV0, opts: EmitReadmeOptions = {}): Bundle {
   if (
     ir.channels.slack === undefined &&
     ir.channels.telegram === undefined &&
@@ -29,14 +36,18 @@ export function emitChannelBot(ir: IrChannelV0): Bundle {
       "channel target requires at least one configured channel — none found",
     );
   }
-  return {
-    files: [
-      { path: "agent.ts", content: renderAgent(ir) },
-      { path: "session-router.ts", content: renderSessionRouter(ir) },
-      { path: "gateway.ts", content: renderGateway(ir) },
-      { path: "daemon.ts", content: renderDaemon(ir) },
-    ],
-  };
+  const files = [
+    { path: "agent.ts", content: renderAgent(ir) },
+    { path: "session-router.ts", content: renderSessionRouter(ir) },
+    { path: "gateway.ts", content: renderGateway(ir) },
+    { path: "daemon.ts", content: renderDaemon(ir) },
+  ];
+  // Item 42 — generated bundle README; default ON (`crewhaus compile
+  // --no-readme` opts out).
+  if (opts.readme !== false) {
+    files.push({ path: "README.md", content: renderBundleReadme(ir) });
+  }
+  return { files };
 }
 
 export class TargetEmitError extends CrewhausError {

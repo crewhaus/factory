@@ -18,8 +18,15 @@ agent:
 `;
 
 describe("compile", () => {
-  test("emits a single-file bundle for a minimal CLI spec", () => {
+  test("emits agent.ts plus the generated README.md for a minimal CLI spec (item 42)", () => {
     const bundle = compile(MINIMAL_SPEC);
+    expect(bundle.files).toHaveLength(2);
+    expect(bundle.files[0]?.path).toBe("agent.ts");
+    expect(bundle.files[1]?.path).toBe("README.md");
+  });
+
+  test("readme: false omits the generated README.md (item 42 opt-out)", () => {
+    const bundle = compile(MINIMAL_SPEC, { readme: false });
     expect(bundle.files).toHaveLength(1);
     expect(bundle.files[0]?.path).toBe("agent.ts");
   });
@@ -218,10 +225,11 @@ mcp_servers:
 });
 
 describe("compile workflow target", () => {
-  test("emits a single-file bundle for a workflow spec", () => {
+  test("emits agent.ts plus the generated README.md for a workflow spec (item 42)", () => {
     const bundle = compile(MINIMAL_WORKFLOW_SPEC);
-    expect(bundle.files).toHaveLength(1);
+    expect(bundle.files).toHaveLength(2);
     expect(bundle.files[0]?.path).toBe("agent.ts");
+    expect(bundle.files[1]?.path).toBe("README.md");
   });
 
   test("generated workflow bundle imports runChatLoop and contains both step instructions", () => {
@@ -300,7 +308,13 @@ routing:
   sessionKey: thread
 `);
     const paths = bundle.files.map((f) => f.path).sort();
-    expect(paths).toEqual(["agent.ts", "daemon.ts", "gateway.ts", "session-router.ts"]);
+    expect(paths).toEqual([
+      "README.md",
+      "agent.ts",
+      "daemon.ts",
+      "gateway.ts",
+      "session-router.ts",
+    ]);
   });
 
   test("env-ref secrets lower into process.env reads in daemon.ts", () => {
@@ -441,7 +455,7 @@ compaction:
   dedupeThreshold: 0.9
   relevanceTopK: 10
 `);
-    expect(bundle.files).toHaveLength(1);
+    expect(bundle.files).toHaveLength(2);
   });
 });
 
@@ -881,7 +895,7 @@ tools:
 
   test("passes a spec whose tools are all internal-compute built-ins", () => {
     const bundle = compile(SPEC_INTERNAL_TOOLS, { strict: true });
-    expect(bundle.files).toHaveLength(1);
+    expect(bundle.files).toHaveLength(2);
     expect(bundle.files[0]?.path).toBe("agent.ts");
   });
 
@@ -965,7 +979,7 @@ tools:
 describe("compile({ applyIrPasses: true }) — Section 28 ir-passes opt-in", () => {
   test("runs the passes pipeline and still emits a bundle (minimal CLI is a pass-through)", () => {
     const bundle = compile(MINIMAL_SPEC, { applyIrPasses: true });
-    expect(bundle.files).toHaveLength(1);
+    expect(bundle.files).toHaveLength(2);
     expect(bundle.files[0]?.path).toBe("agent.ts");
   });
 
@@ -1055,7 +1069,7 @@ cli:
       - ready
   tui: rich
 `);
-    expect(bundle.files).toHaveLength(1);
+    expect(bundle.files).toHaveLength(2);
   });
 });
 

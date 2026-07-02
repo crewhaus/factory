@@ -19,10 +19,23 @@ const baseIr: IrV0 = {
 };
 
 describe("emitCfWorkerCli", () => {
-  test("emits worker.js, wrangler.toml, and package.json", () => {
+  test("emits worker.js, wrangler.toml, package.json, and the generated README (item 42)", () => {
     const bundle = emitCfWorkerCli(baseIr);
     const paths = bundle.files.map((f) => f.path).sort();
-    expect(paths).toEqual(["package.json", "worker.js", "wrangler.toml"]);
+    expect(paths).toEqual(["README.md", "package.json", "worker.js", "wrangler.toml"]);
+    // The Worker README substitutes the wrangler flow for the local run snippet.
+    const readme = bundle.files.find((f) => f.path === "README.md")?.content ?? "";
+    expect(readme).toContain("wrangler deploy");
+    expect(readme).not.toContain("bun agent.ts");
+  });
+
+  test("readme: false restores the three-file bundle (item 42 opt-out)", () => {
+    const bundle = emitCfWorkerCli(baseIr, { readme: false });
+    expect(bundle.files.map((f) => f.path).sort()).toEqual([
+      "package.json",
+      "worker.js",
+      "wrangler.toml",
+    ]);
   });
 
   test("worker.js inlines model and instructions", () => {
@@ -138,6 +151,6 @@ describe("emitCfWorkerCli — provider gate", () => {
   });
 
   test("claude-* models still emit cleanly", () => {
-    expect(emitCfWorkerCli(baseIr).files.length).toBe(3);
+    expect(emitCfWorkerCli(baseIr).files.length).toBe(4);
   });
 });

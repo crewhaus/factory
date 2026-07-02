@@ -1,6 +1,12 @@
 import { CrewhausError } from "@crewhaus/errors";
 import { escapeJsonString } from "@crewhaus/infra-utils";
-import type { Bundle, IrGraphNode, IrGraphV0 } from "@crewhaus/ir";
+import {
+  type Bundle,
+  type EmitReadmeOptions,
+  type IrGraphNode,
+  type IrGraphV0,
+  renderBundleReadme,
+} from "@crewhaus/ir";
 
 /**
  * Emit a single-file `agent.ts` bundle that builds the graph via
@@ -25,15 +31,19 @@ import type { Bundle, IrGraphNode, IrGraphV0 } from "@crewhaus/ir";
  * Layer F2. Pairs with `target-cli` (mirrors the codegen contract) and
  * `graph-engine` (R11 — runtime).
  */
-export function emitGraph(ir: IrGraphV0): Bundle {
-  return {
-    files: [
-      {
-        path: "agent.ts",
-        content: renderAgent(ir),
-      },
-    ],
-  };
+export function emitGraph(ir: IrGraphV0, opts: EmitReadmeOptions = {}): Bundle {
+  const files = [
+    {
+      path: "agent.ts",
+      content: renderAgent(ir),
+    },
+  ];
+  // Item 42 — generated bundle README; default ON (`crewhaus compile
+  // --no-readme` opts out).
+  if (opts.readme !== false) {
+    files.push({ path: "README.md", content: renderBundleReadme(ir) });
+  }
+  return { files };
 }
 
 export class TargetEmitError extends CrewhausError {

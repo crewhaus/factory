@@ -23,7 +23,12 @@
  */
 import { CrewhausError } from "@crewhaus/errors";
 import { escapeJsonString } from "@crewhaus/infra-utils";
-import type { Bundle, IrBatchV0 } from "@crewhaus/ir";
+import {
+  type Bundle,
+  type EmitReadmeOptions,
+  type IrBatchV0,
+  renderBundleReadme,
+} from "@crewhaus/ir";
 
 export class TargetEmitError extends CrewhausError {
   override readonly name = "TargetEmitError";
@@ -127,13 +132,19 @@ function renderPermissionsField(ir: IrBatchV0): string {
   return `\n${lines.join("\n")}`;
 }
 
-export function emitBatchWorker(ir: IrBatchV0): Bundle {
+export function emitBatchWorker(ir: IrBatchV0, opts: EmitReadmeOptions = {}): Bundle {
   if (ir.queue.adapter !== "in-memory") {
     // v0 only ships the in-memory adapter; the others are stubs that
     // throw at runtime so the operator sees a clean diagnostic.
     // Codegen still succeeds — we emit the daemon, but boot fails.
   }
-  return { files: [{ path: "agent.ts", content: renderAgent(ir) }] };
+  const files = [{ path: "agent.ts", content: renderAgent(ir) }];
+  // Item 42 — generated bundle README; default ON (`crewhaus compile
+  // --no-readme` opts out).
+  if (opts.readme !== false) {
+    files.push({ path: "README.md", content: renderBundleReadme(ir) });
+  }
+  return { files };
 }
 
 function renderAgent(ir: IrBatchV0): string {

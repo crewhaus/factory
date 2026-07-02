@@ -29,8 +29,15 @@ const baseIr: IrPipelineV0 = {
 };
 
 describe("emitPipeline", () => {
-  test("emits a single agent.ts file", () => {
+  test("emits agent.ts plus the generated README.md (item 42)", () => {
     const bundle = emitPipeline(baseIr);
+    expect(bundle.files.length).toBe(2);
+    expect(bundle.files[0]?.path).toBe("agent.ts");
+    expect(bundle.files[1]?.path).toBe("README.md");
+  });
+
+  test("readme: false restores the single-file bundle (item 42 opt-out)", () => {
+    const bundle = emitPipeline(baseIr, { readme: false });
     expect(bundle.files.length).toBe(1);
     expect(bundle.files[0]?.path).toBe("agent.ts");
   });

@@ -75,6 +75,46 @@ describe("crewhaus compile", () => {
     expect(result.stdout).toContain("compiled bundle");
   });
 
+  // Item 42 — generated bundle README, DEFAULT-ON.
+  test("emits a generated README.md into the bundle by default (item 42)", async () => {
+    const result = await runCli(["compile", HELLO_SPEC, "-o", tmp]);
+    expect(result.exitCode).toBe(0);
+    const readmePath = join(tmp, "README.md");
+    expect(existsSync(readmePath)).toBe(true);
+    const md = readFileSync(readmePath, "utf-8");
+    expect(md).toContain("<!-- crewhaus:generated-readme -->");
+    expect(md).toContain("| Target | `cli` |");
+    expect(md).toContain("bun agent.ts");
+  });
+
+  test("--no-readme skips the generated README.md (item 42 opt-out)", async () => {
+    const result = await runCli(["compile", HELLO_SPEC, "--no-readme", "-o", tmp]);
+    expect(result.exitCode).toBe(0);
+    expect(existsSync(join(tmp, "agent.ts"))).toBe(true);
+    expect(existsSync(join(tmp, "README.md"))).toBe(false);
+  });
+
+  test("a user-authored README.md in the out-dir is kept, with a notice (item 42)", async () => {
+    const readmePath = join(tmp, "README.md");
+    writeFileSync(readmePath, "# my notes\n\nhand-written\n");
+    const result = await runCli(["compile", HELLO_SPEC, "-o", tmp]);
+    expect(result.exitCode).toBe(0);
+    expect(readFileSync(readmePath, "utf-8")).toBe("# my notes\n\nhand-written\n");
+    expect(result.stdout).toContain("kept");
+    expect(result.stdout).toContain("--no-readme");
+  });
+
+  test("a previously GENERATED README.md is refreshed on recompile (item 42)", async () => {
+    const first = await runCli(["compile", HELLO_SPEC, "-o", tmp]);
+    expect(first.exitCode).toBe(0);
+    const readmePath = join(tmp, "README.md");
+    const generated = readFileSync(readmePath, "utf-8");
+    const second = await runCli(["compile", HELLO_SPEC, "-o", tmp]);
+    expect(second.exitCode).toBe(0);
+    expect(second.stdout).toContain(`wrote ${readmePath}`);
+    expect(readFileSync(readmePath, "utf-8")).toBe(generated);
+  });
+
   test("--emit-ir with -o writes ir.json into the out dir and skips codegen", async () => {
     const result = await runCli(["compile", HELLO_SPEC, "--emit-ir", "-o", tmp]);
     expect(result.exitCode).toBe(0);
@@ -101,6 +141,9 @@ describe("crewhaus compile", () => {
     expect(result.stdout).toContain("by DEFAULT");
     expect(result.stdout).toContain('non-"external"');
     expect(result.stdout).toContain("--allow-unmarked-sinks");
+    // Item 42 — README emission and its opt-out are documented too.
+    expect(result.stdout).toContain("README.md");
+    expect(result.stdout).toContain("--no-readme");
   });
 
   // (a) DEFAULT-ON RED PATH — no flag at all. A spec referencing an `mcp__*`
