@@ -263,6 +263,22 @@ import {
   openJustificationAuditSink,
   resolveJudgeChoice,
 } from "./justification-gate";
+// Item 16 — `crewhaus permissions suggest` (mine persisted ask/deny history
+// into reviewable settings.json permission rules), in a side-effect-free
+// module so it is unit-testable (this entry file runs an argv switch on
+// import). Permissions are EXCLUDED from OPTIMIZABLE_PATHS — `--apply` is
+// always an interactive human confirm, never eval-gated auto-apply.
+import {
+  type PermissionSuggestion,
+  aggregateAsks,
+  applyToSettingsRoot,
+  diffPermissions,
+  existingSettingsRules,
+  formatSettingsDiff,
+  formatSuggestionLines,
+  rankSuggestions,
+  readOnlyByName,
+} from "./permissions-suggest";
 // Item 9 — per-spec regression suite: post-accept pinning of optimize
 // recoveries + the eval-side default union, in a side-effect-free module so
 // it is unit-testable (this entry file runs an argv switch on import).
@@ -621,6 +637,15 @@ const TOOLS_SCHEMA: ParseArgsSchema = {
   flags: [{ name: "sessions", takesValue: true }, { name: "json" }, { name: "help", short: "h" }],
 };
 
+const PERMISSIONS_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "sessions", takesValue: true },
+    { name: "apply" },
+    { name: "json" },
+    { name: "help", short: "h" },
+  ],
+};
+
 const RATE_SCHEMA: ParseArgsSchema = {
   flags: [
     { name: "session", takesValue: true },
@@ -899,6 +924,8 @@ function usageText(): string {
     "  tools list                           list every builtin tool + its metadata (item 18)",
     "  tools suggest [spec.yaml]            rank builtins against agent.instructions (keyword match)",
     "  tools audit [--sessions N|all]       mine tool_stats vs. grants — unused/failing/readOnly",
+    "  permissions suggest [--apply]        mine ask/deny history into settings.json rules (item 16)",
+    "       [--sessions N|all] [--json]     --apply is interactive-confirm only (never eval-gated)",
     "  rate --session <id> [--turn N]       rate an assistant turn 👍/👎, ⭐, or 0–1",
     "       (--thumbs up|down | --stars 1-5 | --score 0-1) [--comment <t>]",
     "  feedback --session <id> --text <msg> attach a comment/correction to a turn",
@@ -4946,6 +4973,149 @@ async function runTools(action: string, args: ParsedArgs): Promise<void> {
 /** Default sessions the `tools audit` miner scans (mirrors context-pressure). */
 const DEFAULT_AUDIT_SESSIONS = 20;
 
+// -------- permissions: mine ask/deny history into rules (item 16) --------
+
+/** Default sessions the permissions miner scans (mirrors tools audit). */
+const DEFAULT_PERMISSIONS_SESSIONS = 20;
+
+/**
+ * `crewhaus permissions suggest [--sessions N|all] [--apply] [--json]` — mine
+ * the persisted `permission` ask/deny history across sessions into reviewable
+ * `.crewhaus/settings.json` permission rules: `alwaysAllow` for recurring
+ * human-APPROVED asks (read-only tools first), `alwaysAsk` tightenings for
+ * recurring DENIED asks. Prints an additive diff of the settings permissions
+ * block.
+ *
+ * `--apply` is ALWAYS an interactive human confirm — permissions are excluded
+ * from OPTIMIZABLE_PATHS by design, so this path is NEVER eval-gated
+ * auto-apply. A non-TTY `--apply` REFUSES: it prints the diff and tells the
+ * user to run interactively.
+ */
+async function runPermissions(action: string, args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus permissions suggest [--sessions N|all] [--apply] [--json]\n" +
+        "\n" +
+        "mines .crewhaus/sessions `permission` ask/deny history into rules:\n" +
+        "  alwaysAllow  recurring human-APPROVED asks (read-only tools first)\n" +
+        "  alwaysAsk    recurring DENIED asks (tighten — keep prompting)\n" +
+        "\n" +
+        "  --sessions N|all  how many recent sessions to mine (default 20)\n" +
+        "  --apply           write the additions to .crewhaus/settings.json\n" +
+        "                    (ALWAYS interactive-confirm; refuses in a non-TTY —\n" +
+        "                    permissions are never eval-gated auto-apply)\n" +
+        "  --json            machine-readable output\n",
+    );
+    return;
+  }
+  if (action !== "suggest") {
+    die(`permissions action must be "suggest" (got "${action}")`);
+  }
+
+  const limit = parseSessionsFlag(args, DEFAULT_PERMISSIONS_SESSIONS);
+  const sessions = readRecentSessionEvents(limit);
+  if (sessions.length === 0) {
+    die(
+      `no session logs found at ${join(process.cwd(), ".crewhaus", "sessions")} — run the agent first, then suggest`,
+    );
+  }
+
+  // Read-only-ness comes from the resolvable tool map (keyed by RegisteredTool
+  // `.name`, which is what the ask aggregate is keyed by).
+  const toolMap = await loadToolMap();
+  const readOnly = readOnlyByName(toolMap);
+  const aggregates = aggregateAsks(sessions);
+  const suggestions: PermissionSuggestion[] = rankSuggestions(aggregates, readOnly);
+
+  // Existing settings rules (the exact shape buildRuleSet consumes).
+  const settingsPath = join(process.cwd(), ".crewhaus", "settings.json");
+  let settingsRoot: unknown;
+  if (existsSync(settingsPath)) {
+    try {
+      settingsRoot = JSON.parse(readFileSync(settingsPath, "utf-8"));
+    } catch (err) {
+      die(`failed to parse ${settingsPath}: ${(err as Error).message}`);
+    }
+  }
+  const existing = existingSettingsRules(settingsRoot);
+  const diff = diffPermissions(existing, suggestions);
+
+  if (args.flags["json"] === true) {
+    process.stdout.write(
+      `${JSON.stringify({ sessionIds: sessions.map((s) => s.sessionId), suggestions, diff }, null, 2)}\n`,
+    );
+    if (args.flags["apply"] !== true) return;
+  } else {
+    process.stdout.write(
+      `permissions: ${suggestions.length} suggestion(s) from ${sessions.length} session(s)\n`,
+    );
+    if (suggestions.length === 0) {
+      process.stdout.write("no recurring ask/deny patterns to turn into rules\n");
+    }
+    for (const line of formatSuggestionLines(suggestions)) process.stdout.write(`${line}\n`);
+    process.stdout.write("\n");
+    for (const line of formatSettingsDiff(diff)) process.stdout.write(`${line}\n`);
+  }
+
+  if (args.flags["apply"] !== true) {
+    if (diff.additions.length > 0) {
+      process.stdout.write("\nrun with --apply to write these additions (interactive confirm).\n");
+    }
+    return;
+  }
+
+  // ---- --apply: interactive-confirm ONLY ----
+  if (diff.additions.length === 0) {
+    process.stdout.write("nothing to apply — no new rules.\n");
+    return;
+  }
+  // Non-TTY --apply REFUSES. Permissions must never be widened by an
+  // unattended pipe; the diff is already printed above.
+  if (process.stdin.isTTY !== true || process.stdout.isTTY !== true) {
+    die(
+      "--apply refuses in a non-interactive shell: permissions are never applied unattended. " +
+        "Review the diff above and re-run `crewhaus permissions suggest --apply` in an interactive terminal.",
+    );
+  }
+  const confirmed = await confirmYesNo(
+    `apply ${diff.additions.length} new permission rule(s) to ${relative(process.cwd(), settingsPath) || settingsPath}? [y/N] `,
+  );
+  if (!confirmed) {
+    process.stdout.write("aborted — settings.json unchanged.\n");
+    return;
+  }
+  const newRoot = applyToSettingsRoot(settingsRoot, diff.merged);
+  mkdirSync(dirname(settingsPath), { recursive: true });
+  writeFileSync(settingsPath, `${JSON.stringify(newRoot, null, 2)}\n`);
+  process.stdout.write(`[permissions] wrote ${diff.additions.length} rule(s) to ${settingsPath}\n`);
+}
+
+/**
+ * One-line y/N confirm over a TTY. Returns true only on an explicit
+ * y/yes (default No). Thin IO — the caller has already gated on isTTY.
+ */
+async function confirmYesNo(prompt: string): Promise<boolean> {
+  const stdin = process.stdin;
+  process.stdout.write(prompt);
+  return await new Promise<boolean>((resolveConfirm) => {
+    let done = false;
+    const finish = (v: boolean): void => {
+      if (done) return;
+      done = true;
+      stdin.off("data", onData);
+      stdin.pause();
+      process.stdout.write("\n");
+      resolveConfirm(v);
+    };
+    const onData = (chunk: Buffer | string): void => {
+      const answer = chunk.toString().trim().toLowerCase();
+      finish(answer === "y" || answer === "yes");
+    };
+    stdin.resume();
+    stdin.once("data", onData);
+  });
+}
+
 // -------- response feedback: rate / feedback / distill --------
 
 const SESSIONS_SUBDIR = join(".crewhaus", "sessions");
@@ -6827,6 +6997,14 @@ switch (subcommand) {
       die(`tools action must be one of: list, suggest, audit (got "${action}")`);
     }
     await runTools(action, parseFor(rest.slice(1), TOOLS_SCHEMA));
+    break;
+  }
+  case "permissions": {
+    const action = rest[0] ?? "";
+    if (action !== "suggest") {
+      die(`permissions action must be "suggest" (got "${action}")`);
+    }
+    await runPermissions(action, parseFor(rest.slice(1), PERMISSIONS_SCHEMA));
     break;
   }
   case "rate":
