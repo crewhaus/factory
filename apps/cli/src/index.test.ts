@@ -729,6 +729,29 @@ describe("crewhaus optimize --budget-usd", () => {
     expect(result.stdout).toContain("--budget-usd");
   });
 
+  // F4 — the fitness evals silently inherited the runner's retry with no
+  // opt-out; `--no-retry` is now a real flag (threaded into every fitness
+  // runEval call) and documented in the help text.
+  test("optimize accepts --no-retry (parses past the flag; fails later on the missing graders file)", async () => {
+    const dataset = join(tmp, "dataset.jsonl");
+    writeFileSync(dataset, '{"id":"q1","input":"hi","expected_output":"hi"}');
+    const missingGraders = join(tmp, "does-not-exist-graders.yaml");
+    const result = await runCli(
+      ["optimize", HELLO_SPEC, "--no-retry", "--dataset", dataset, "--graders", missingGraders],
+      { env: { ANTHROPIC_API_KEY: "test-no-call" } },
+    );
+    expect(result.exitCode).toBe(1);
+    // Pre-fix parseArgs died here with `unknown flag: --no-retry`.
+    expect(result.stderr).not.toContain("unknown flag");
+    expect(result.stderr).toContain("could not read");
+  });
+
+  test("optimize --help documents --no-retry", async () => {
+    const result = await runCli(["optimize", "--help"]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("--no-retry");
+  });
+
   test("a rule-based optimize run reports $0 spend + iterations-cap stop in report.json, with the budget forwarded", async () => {
     // Creds-gated: the fitness function runs the real agent (eval-runner),
     // so without an Anthropic token the SDK call would block. Skip in that

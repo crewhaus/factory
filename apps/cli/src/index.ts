@@ -5,12 +5,31 @@ import { basename, dirname, join, relative, resolve } from "node:path";
 import type { SubAgentDefinition } from "@crewhaus/agent-context-isolation";
 import { SpecParseError, compile, lower } from "@crewhaus/compiler";
 import { buildContextBundle, discoverRoots } from "@crewhaus/context-bundle";
+import {
+  type DatasetRecord,
+  type DatasetSplit,
+  compareVersions,
+  createFileBackedRegistry,
+  latestVersion,
+} from "@crewhaus/dataset-registry";
 import { DEFAULT_PRICING, computeCacheSavingsMicros, resolvePricing } from "@crewhaus/cost-tracker";
 import { CrewhausError } from "@crewhaus/errors";
-import { loadDataset } from "@crewhaus/eval-dataset";
-import { parseGradersConfig } from "@crewhaus/eval-grader";
+import { type Sample, loadDataset } from "@crewhaus/eval-dataset";
+import { type CompiledGrader, parseGradersConfig } from "@crewhaus/eval-grader";
 import { optimizeSpec } from "@crewhaus/eval-optimizer-orchestrator";
-import { diffReports, loadRun, renderReport } from "@crewhaus/eval-report";
+import {
+  type RunIndexEntry,
+  buildMatrix,
+  diffReports,
+  formatUsd,
+  hashDatasetFile,
+  loadRun,
+  readBaselines,
+  readRunIndex,
+  renderMatrix,
+  renderReport,
+  setBaseline,
+} from "@crewhaus/eval-report";
 import { runEval as runEvalLib } from "@crewhaus/eval-runner";
 import { openEventLog } from "@crewhaus/event-log";
 import { loadHooks } from "@crewhaus/hooks-engine";
@@ -42,6 +61,22 @@ import { type RegisteredTool, ToolCatalog } from "@crewhaus/tool-catalog";
 import { registerMcpServer } from "@crewhaus/tool-mcp";
 import { createTaskTool } from "@crewhaus/tool-task";
 import { type CostAccrualEvent, type ProviderId, TraceEventBus } from "@crewhaus/trace-event-bus";
+// Item 12 — dataset-registry CLI plumbing (the `datasets` subcommand family,
+// `distill --register` promotion, and the `--dataset registry:` shorthand
+// shared by eval + optimize), in a side-effect-free module so it is
+// unit-testable (this entry file runs an argv switch on import).
+import {
+  DEFAULT_SPLIT_SPEC,
+  DatasetRefError,
+  defaultDatasetsRoot,
+  isDatasetSplit,
+  parseNameVersion,
+  parseRegistryRef,
+  parseSplitSpec,
+  recordToJsonl,
+  registerDataset,
+  resolveRegistryRef,
+} from "./datasets";
 // Item 34 — `crewhaus audit verify` plumbing (anchor-flag parsing + per-check
 // summary + doctor mapping), in a side-effect-free module so it is
 // unit-testable (this entry file runs an argv switch on import).
@@ -70,6 +105,22 @@ import {
   createEgressMatcher,
   resolveEgressMatcherChoice,
 } from "./egress-matcher";
+// Run-history item 3 — post-eval index append + baseline diff/gate/promote,
+// in a side-effect-free module so it is unit-testable (this entry file runs
+// an argv switch on import).
+import { datasetFilterMatches, finishEvalRun } from "./eval-history";
+// Item 11 — `eval --models` benchmark matrix: flag parsing/validation, cell
+// slugs, the failure-isolated cell loop, and the cost-tracker pricing seam,
+// in a side-effect-free module so it is unit-testable (this entry file runs
+// an argv switch on import).
+import {
+  MatrixArgError,
+  assertMatrixFlagsCompatible,
+  assignCellSlugs,
+  defaultMatrixPricing,
+  parseModelsFlag,
+  runMatrixCells,
+} from "./eval-matrix";
 // Response-feedback core — pure, side-effect-free so it is unit-testable
 // (this entry file runs an argv switch on import). Powers `rate`/`feedback`
 // (capture) and `distill` (ratings → eval dataset + graders).
@@ -96,6 +147,10 @@ import {
   openJustificationAuditSink,
   resolveJudgeChoice,
 } from "./justification-gate";
+// Item 9 — per-spec regression suite: post-accept pinning of optimize
+// recoveries + the eval-side default union, in a side-effect-free module so
+// it is unit-testable (this entry file runs an argv switch on import).
+import { applyRegressionUnionGuarded, pinRecoveriesAfterOptimize } from "./regression-pin";
 // Item 35 — `crewhaus retention` sweep/export/purge (scheduled GDPR/TTL
 // enforcement over the on-disk session + audit stores), in a side-effect-free
 // module so it is unit-testable AND callable as a library by a future daemon
@@ -114,6 +169,17 @@ import {
 // `doctor --philosophy-alignment`. Kept in a side-effect-free module so it is
 // unit-testable (this entry file runs an argv switch on import).
 import { auditSpecToolNames, auditToolScopes, collectToolNames } from "./scope-audit";
+// Item 7 — failure-arbiter wiring: post-eval triage (verdicts.json + report
+// section + one-line summary + bug-sample pinning) and the optimize-side
+// failure-signal pre-filter, in a side-effect-free module so it is
+// unit-testable (this entry file runs an argv switch on import).
+import {
+  finishEvalTriage,
+  formatDatasetFixQueue,
+  formatFitnessTriageLine,
+  tapSamples,
+  triageFitnessSamples,
+} from "./triage";
 // Item 69 — `crewhaus state backup|restore` core (tarball snapshot of the
 // cwd `.crewhaus` state dir + full/merge restore), in a module with no
 // import-time side effects so it is unit-testable (this entry file runs an
@@ -253,6 +319,12 @@ const OPTIMIZE_SCHEMA: ParseArgsSchema = {
     // FR-003 — dollar ceiling for model-driven runs (composes with --iterations).
     { name: "budget-usd", takesValue: true },
     { name: "write-back", takesValue: false },
+    // Item 9 — skip pinning an accepted patch's fail→pass recoveries into
+    // the per-spec `<specName>-regressions` registry dataset.
+    { name: "no-pin-regressions", takesValue: false },
+    // Item 7 — opt out of the runner's default one-shot retry of ERRORED
+    // samples inside each candidate's fitness eval (mirrors `eval --no-retry`).
+    { name: "no-retry", takesValue: false },
     // Item 46 — after a successful --write-back the working spec changed, so
     // the same auto-register + changelog flow as `compile` runs; this is the
     // explicit opt-out (mirrors `compile --no-register`).
@@ -269,7 +341,27 @@ const EVAL_SCHEMA: ParseArgsSchema = {
     { name: "judge-model", takesValue: true },
     { name: "concurrency", takesValue: true },
     { name: "seed", takesValue: true },
+    // Item 11 — benchmark matrix: run the same dataset+graders once per
+    // model; each cell writes to <out>/<model-slug>/. Incompatible with
+    // --gate/--no-promote (cells skip the run-history lineage entirely).
+    { name: "models", takesValue: true },
     { name: "out", short: "o", takesValue: true },
+    // Run-history item 3 — exit non-zero when the run regresses against the
+    // pinned (spec, dataset) baseline (regression-runner gate, strict
+    // defaults: any pass-rate drop or sample-level pass→fail flip fails).
+    { name: "gate", takesValue: false },
+    // Run-history item 3 — keep the existing baseline pin instead of
+    // auto-promoting this run on gate pass (also skips the first-run pin).
+    { name: "no-promote", takesValue: false },
+    // Item 9 — skip the default union of the per-spec
+    // `<specName>-regressions` registry dataset into the loaded dataset.
+    // Item 7 — ALSO skips the failure-arbiter's bug-sample pin into that
+    // suite (opting out of regression-suite integration means no writes
+    // to it either).
+    { name: "no-regressions", takesValue: false },
+    // Item 7 — opt out of the runner's default one-shot retry of ERRORED
+    // samples (infra noise, not graded failures).
+    { name: "no-retry", takesValue: false },
     { name: "help", short: "h" },
   ],
 };
@@ -277,6 +369,9 @@ const EVAL_SCHEMA: ParseArgsSchema = {
 const EVAL_REPORT_SCHEMA: ParseArgsSchema = {
   flags: [
     { name: "out", short: "o", takesValue: true },
+    // `history` / `baseline show` filters.
+    { name: "spec", takesValue: true },
+    { name: "dataset", takesValue: true },
     { name: "help", short: "h" },
   ],
 };
@@ -323,6 +418,25 @@ const DISTILL_SCHEMA: ParseArgsSchema = {
     { name: "min-score", takesValue: true },
     { name: "judge", takesValue: false },
     { name: "judge-model", takesValue: true },
+    // Item 12 — promote the distilled samples into the dataset registry as a
+    // new auto-bumped version of <name> (deterministic 70/15/15
+    // train/dev/test split), consumable as `--dataset registry:<name>`.
+    // -o becomes optional when given; plain file output stays the default.
+    { name: "register", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
+// Item 12 — the dataset-registry CLI face (`datasets list|get|put`).
+const DATASETS_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // `put` — the file to import (any @crewhaus/eval-dataset format).
+    { name: "file", takesValue: true },
+    // `get` — print one split verbatim instead of the all-splits merge.
+    // `put` — import everything into this single named split.
+    { name: "split", takesValue: true },
+    // `put` — train/dev[/test] percentages for the deterministic split.
+    { name: "split-spec", takesValue: true },
     { name: "help", short: "h" },
   ],
 };
@@ -469,10 +583,22 @@ function usageText(): string {
     "                  [--egress-embedder <model>]  embedder for --egress-matcher semantic",
     "  eval <spec.yaml> --dataset <data>    run the agent against a dataset and grade",
     "       --graders <graders.yaml>       (deterministic graders + LLM-as-judge)",
-    "       [--judge-model <model>] [--concurrency N] [--seed N] -o <out-dir>",
+    "       [--judge-model <model>] [--concurrency N] [--seed N] [-o <out-dir>]",
+    "       [--gate]                       exit non-zero on regression vs the pinned baseline",
+    "       [--no-promote]                 keep the existing baseline pin after this run",
+    "       [--models <m1,m2,...>]         benchmark matrix: run the dataset once per model",
+    "                                      (cells write to <out>/<model-slug>/; emits matrix.json",
+    "                                      + index.html; incompatible with --gate/--no-promote)",
+    "       --dataset also accepts registry:<name>[@version][#split] (Section 29 registry)",
     "  eval-report diff <prev> <new>        compare two eval runs and emit a diff report",
     "       [-o <out-dir>]",
+    "  eval-report history                  list recorded runs (.crewhaus/evals/index.jsonl)",
+    "       [--spec <name>] [--dataset <name>]",
+    "  eval-report baseline show            print pinned baselines (.crewhaus/evals/baselines.json)",
+    "       [--spec <name>] [--dataset <name>]",
+    "  eval-report baseline set <runId>     pin a recorded run as its (spec, dataset) baseline",
     "  optimize <spec.yaml> --dataset <data> --graders <graders.yaml>",
+    "       (--dataset also accepts registry:<name>[@version][#split])",
     "       [--mutator rule-based|claude] [--iterations N] [--seed N]",
     "       [--ratings <session>|all]            distill user ratings into the training set (Pillar 2)",
     "       [--budget-usd N]                     stop a model-driven run before it exceeds $N (FR-003)",
@@ -488,6 +614,12 @@ function usageText(): string {
     "       [--turn N] [--correction <better answer>]",
     "  distill --session <id> -o <ds.jsonl> turn ratings into an eval dataset + graders",
     "       [--all-sessions] [--graders-out <g.yaml>] [--min-score F]",
+    "       [--register <name>]            also promote a new dataset version into the registry",
+    "  datasets list                        all registered datasets + versions (Section 29)",
+    "  datasets get <name>[@version]        print a dataset's samples as JSONL",
+    "       [--split train|dev|test]",
+    "  datasets put <name> --file <f.jsonl> import a file as a new auto-bumped version",
+    "       [--split-spec 70/15/15 | --split train]",
     "  state backup [-o <file.tar.gz>]      snapshot the cwd .crewhaus state dir to a tarball (item 69)",
     "       [--exclude <glob,glob>]",
     "  state restore <file.tar.gz>          restore a snapshot (refuses a non-empty .crewhaus)",
@@ -1760,7 +1892,24 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
     process.stdout.write(
       "usage: crewhaus optimize <spec.yaml> (--dataset <data> --graders <graders.yaml> | --ratings <session>) " +
         "[--min-score F] [--mutator rule-based|claude] [--iterations N] [--seed N] [--concurrency N] " +
-        "[--improvement-threshold F] [--budget-usd N] [--write-back] [--no-register] [-o <out-dir>]\n" +
+        "[--improvement-threshold F] [--budget-usd N] [--write-back] [--no-register] [--no-pin-regressions] [--no-retry] [-o <out-dir>]\n" +
+        "  --dataset takes a file path or registry:<name>[@version][#split] (Section 29 registry;\n" +
+        "  default version: latest). A registry record with populated train AND dev splits is\n" +
+        "  used as-is; otherwise the selected samples get the inline 70/30 split. The test\n" +
+        "  split is never optimized against unless #test is explicitly given.\n" +
+        "  When a patch is accepted (with or without --write-back), the dev samples that flipped\n" +
+        "  fail→pass are pinned into the <specName>-regressions registry dataset (a new version\n" +
+        "  unioning the previous one, deduped by sample id) so `crewhaus eval` guards them by\n" +
+        "  default. --no-pin-regressions skips the pin.\n" +
+        "  Inside each candidate's fitness eval, samples that ERROR (provider timeout, 429,\n" +
+        "  grader throw — infra noise) are retried once by default, exactly like `crewhaus\n" +
+        "  eval`; --no-retry disables the retry so every first attempt stands.\n" +
+        "  After each candidate's eval the failure arbiter triages failing dev samples;\n" +
+        "  noise (flaky infra) and contract-ambiguity confirmed by structured grader output\n" +
+        "  (bad gold) are excluded from the failure signal the mutator sees. Contract-\n" +
+        "  ambiguity inferred only from a missing gold answer stays IN the signal (on\n" +
+        "  judge-graded/no-gold datasets it is the signal); both kinds collect into a\n" +
+        "  dataset-fix queue printed at the end of the run.\n" +
         "  A successful --write-back auto-registers the rewritten spec in the local\n" +
         "  registry (.crewhaus/specs) with a changelog entry carrying the run's\n" +
         "  score delta and patch rationale — same flow as `crewhaus compile`;\n" +
@@ -1821,6 +1970,9 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
   }
 
   const writeBack = args.flags["write-back"] === true;
+  // Item 7 — the fitness evals inherit the runner's noise auto-retry
+  // (default ON, consistent with `crewhaus eval`); `--no-retry` opts out.
+  const retryErrors = args.flags["no-retry"] !== true;
   const outDirArg = args.flags["out"];
   const absSpec = resolve(specPath);
   const runId = `opt_${Date.now().toString(16)}`;
@@ -1846,33 +1998,121 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
   // Materialize the training set once — we'll re-iterate per fitness call. It
   // is the union of the file dataset (if any) and the distilled ratings (if
   // any); at least one is present per the missing-flags gate above.
-  const samples: Array<{ id: string; input: string; expected_output?: string }> = [];
+  type OptimizerSample = { id: string; input: string; expected_output?: string };
+  const toOptimizerSample = (s: Sample): OptimizerSample => ({
+    id: s.id,
+    input: s.input,
+    ...(s.expected_output !== undefined ? { expected_output: s.expected_output } : {}),
+  });
+  const samples: OptimizerSample[] = [];
+  // Item 9 — the ORIGINAL samples by id, captured before toOptimizerSample
+  // strips expected_tools/metadata, so post-accept regression pinning
+  // appends each recovered sample as it lives in the source dataset (a
+  // pinned sample must re-grade the same way under `crewhaus eval`).
+  const originalById = new Map<string, Sample>();
+  const remember = <T extends Sample>(list: ReadonlyArray<T>): ReadonlyArray<T> => {
+    for (const s of list) if (!originalById.has(s.id)) originalById.set(s.id, s);
+    return list;
+  };
   let datasetName = "ratings";
+  // Item 12 — a registry:<name>[@version][#split] dataset whose record
+  // carries BOTH a populated train and dev split (and no explicit #split) is
+  // used as-is instead of being re-split inline; the record's split
+  // assignment is the reproducible source of truth. Otherwise the selected
+  // samples join the pool below and get the inline 70/30 split. The
+  // registry's test split never enters optimization unless #test is
+  // explicitly given.
+  let registrySplits: { train: OptimizerSample[]; dev: OptimizerSample[] } | undefined;
   if (typeof datasetPath === "string") {
-    const dataset = await loadDataset(resolve(datasetPath));
-    datasetName = dataset.name;
-    for await (const s of dataset.samples) {
-      samples.push({
-        id: s.id,
-        input: s.input,
-        ...(s.expected_output !== undefined ? { expected_output: s.expected_output } : {}),
-      });
+    let registryRef: ReturnType<typeof parseRegistryRef>;
+    try {
+      registryRef = parseRegistryRef(datasetPath);
+    } catch (err) {
+      if (err instanceof DatasetRefError) die(err.message);
+      throw err;
+    }
+    if (registryRef !== undefined) {
+      const registry = createFileBackedRegistry({ rootDir: defaultDatasetsRoot() });
+      let resolved: Awaited<ReturnType<typeof resolveRegistryRef>>;
+      try {
+        resolved = await resolveRegistryRef(registry, registryRef);
+      } catch (err) {
+        if (err instanceof DatasetRefError || err instanceof CrewhausError) die(err.message);
+        throw err;
+      }
+      datasetName = resolved.datasetName;
+      const { record } = resolved;
+      if (
+        registryRef.split === undefined &&
+        record.splits.train.length > 0 &&
+        record.splits.dev.length > 0
+      ) {
+        registrySplits = {
+          train: remember(record.splits.train).map(toOptimizerSample),
+          dev: remember(record.splits.dev).map(toOptimizerSample),
+        };
+      } else if (registryRef.split !== undefined) {
+        samples.push(...remember(resolved.samples).map(toOptimizerSample));
+      } else {
+        // Only one populated split — pool train+dev and re-split inline.
+        samples.push(...remember(record.splits.train).map(toOptimizerSample));
+        samples.push(...remember(record.splits.dev).map(toOptimizerSample));
+      }
+    } else {
+      const dataset = await loadDataset(resolve(datasetPath));
+      datasetName = dataset.name;
+      for await (const s of dataset.samples) {
+        remember([s]);
+        samples.push(toOptimizerSample(s));
+      }
     }
   }
-  if (ratingsDistill !== undefined) samples.push(...ratingsDistill.samples);
-  if (samples.length === 0) die(`dataset "${datasetName}" yielded zero samples`);
+  if (ratingsDistill !== undefined) {
+    // Ratings are training signal, never a held-out dev set — with registry
+    // splits in play they extend train; otherwise they join the pool.
+    remember(ratingsDistill.samples);
+    if (registrySplits !== undefined) registrySplits.train.push(...ratingsDistill.samples);
+    else samples.push(...ratingsDistill.samples);
+  }
 
-  // Train/dev split: 70/30 deterministic split by sample id ordering.
-  const splitIdx = Math.max(1, Math.floor(samples.length * 0.7));
-  const trainSet = samples.slice(0, splitIdx);
-  const devSet = samples.slice(splitIdx);
-  if (devSet.length === 0) {
-    die(`dataset has ${samples.length} samples — need at least 2 (70/30 split needs a dev split)`);
+  let trainSet: OptimizerSample[];
+  let devSet: OptimizerSample[];
+  if (registrySplits !== undefined) {
+    trainSet = registrySplits.train;
+    devSet = registrySplits.dev;
+  } else {
+    if (samples.length === 0) die(`dataset "${datasetName}" yielded zero samples`);
+    // Train/dev split: 70/30 deterministic split by sample id ordering.
+    const splitIdx = Math.max(1, Math.floor(samples.length * 0.7));
+    trainSet = samples.slice(0, splitIdx);
+    devSet = samples.slice(splitIdx);
+    if (devSet.length === 0) {
+      die(
+        `dataset has ${samples.length} samples — need at least 2 (70/30 split needs a dev split)`,
+      );
+    }
   }
 
   // Index the dev set by id so the fitness fn can join each graded
   // sample-result back to the input + reference it was scored against.
   const devById = new Map(devSet.map((s) => [s.id, s]));
+
+  // Item 9 — per-fitness-call sequence number. Folded into each candidate's
+  // eval dir name so two same-length candidate prompts can't overwrite each
+  // other's persisted run (the post-accept regression pinning diffs the
+  // baseline dir against the winner's dir, so both must survive intact).
+  let evalCallSeq = 0;
+
+  // Item 7 — cross-iteration dataset-fix queue: sampleId → arbiter reason
+  // for every dev sample the failure arbiter classified contract-ambiguity.
+  // The queue prints at the end of optimize. Only the ids whose verdict is
+  // backed by structured grader evidence ALSO join the sticky exclusion set
+  // below — those stay excluded from the mutator's failure signal for the
+  // rest of the run (the dataset/contract problem doesn't change with the
+  // candidate prompt). Heuristic (no-gold) verdicts are queued but stay in
+  // the signal: on judge-graded datasets they ARE the failure signal.
+  const datasetFixQueue = new Map<string, string>();
+  const stickyAmbiguous = new Set<string>();
 
   // Fitness fn: patch the spec with the candidate prompt, lower to IR,
   // run eval-runner, and return the pass-rate PLUS per-sample grades. The
@@ -1910,26 +2150,64 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
     if (ir.target !== "cli") {
       die(`crewhaus optimize v0 only supports target: cli (got "${ir.target}")`);
     }
+    evalCallSeq += 1;
     const summary = await runEvalLib({
       ir,
       dataset: { name: datasetName, samples: makeAsyncIterable(devSet) },
       compiledGraders: compiled,
       opts: {
-        outDir: join(outDir, "evals", `${prompt.length}_${ir.agent.instructions.length}`),
+        outDir: join(
+          outDir,
+          "evals",
+          `${String(evalCallSeq).padStart(3, "0")}_${prompt.length}_${ir.agent.instructions.length}`,
+        ),
         concurrency,
         seed,
+        retryErrors,
       },
     });
-    const grades = summary.samples.map((r) => {
-      const dev = devById.get(r.sampleId);
-      return {
-        input: dev?.input ?? r.sampleId,
-        score: r.grades.overall.score,
-        ...(dev?.expected_output !== undefined ? { expected: dev.expected_output } : {}),
-        rationale: r.grades.overall.rationale,
-      };
-    });
-    return { score: summary.aggregates.passRate, grades };
+    // Item 7 — failure-arbiter pre-filter: classify this candidate's failing
+    // samples and withhold noise (flaky infra) and contract-ambiguity (bad
+    // gold) from the failure signal the mutator sees — mutating the prompt
+    // against them wastes mutation budget. Contract-ambiguity ids join the
+    // sticky dataset-fix queue above. Best-effort: a triage error keeps the
+    // unfiltered grades (the pre-item-7 behaviour) rather than failing the
+    // fitness call. The aggregate passRate is NOT filtered — the search
+    // score stays honest; only the mutator's per-sample window narrows.
+    let excludedFromSignal: ReadonlySet<string> = new Set<string>();
+    try {
+      const triage = triageFitnessSamples({
+        samples: summary.samples,
+        samplesById: originalById,
+        alreadyAmbiguous: stickyAmbiguous,
+      });
+      for (const a of triage.ambiguous) {
+        datasetFixQueue.set(a.sampleId, a.reason);
+        // Only evidence-backed ambiguity is sticky-excluded (see above).
+        if (a.fromGraderEvidence) stickyAmbiguous.add(a.sampleId);
+      }
+      excludedFromSignal = triage.excluded;
+      const line = formatFitnessTriageLine(triage);
+      if (line !== undefined) process.stdout.write(`[optimize] ${line}\n`);
+    } catch (err) {
+      process.stderr.write(
+        `[optimize] triage skipped: ${err instanceof Error ? err.message : String(err)}\n`,
+      );
+    }
+    const grades = summary.samples
+      .filter((r) => !excludedFromSignal.has(r.sampleId))
+      .map((r) => {
+        const dev = devById.get(r.sampleId);
+        return {
+          input: dev?.input ?? r.sampleId,
+          score: r.grades.overall.score,
+          ...(dev?.expected_output !== undefined ? { expected: dev.expected_output } : {}),
+          rationale: r.grades.overall.rationale,
+        };
+      });
+    // Item 9 — report where this measurement's eval run was persisted so
+    // the optimizer can surface the baseline/winner dirs for pinning.
+    return { score: summary.aggregates.passRate, grades, runDir: summary.outDir };
   };
 
   const mutator = args.flags["mutator"];
@@ -2026,10 +2304,45 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
         `[optimize] patch ready (improvement ≥ ${improvementThreshold}). Re-run with --write-back to apply.\n`,
       );
     }
+    // Item 9 — the patch was accepted (with or without --write-back): the
+    // dev samples that flipped fail→pass between the baseline eval run and
+    // the winning candidate's are exactly the behaviors the patch fixed.
+    // Pin them into the per-spec regression suite so `crewhaus eval` keeps
+    // guarding them even if the training dataset later churns. Best-effort:
+    // a pinning failure must not fail an otherwise successful optimize.
+    try {
+      const pin = await pinRecoveriesAfterOptimize({
+        registry: createFileBackedRegistry({ rootDir: defaultDatasetsRoot() }),
+        specName: parseSpec(readFileSync(absSpec, "utf-8")).name,
+        pin: args.flags["no-pin-regressions"] !== true,
+        ...(result.baselineEvalDir !== undefined ? { baselineRunDir: result.baselineEvalDir } : {}),
+        ...(result.bestEvalDir !== undefined ? { candidateRunDir: result.bestEvalDir } : {}),
+        // Original (un-stripped) samples — see `originalById` above.
+        samplesById: originalById,
+        sourceDataset: datasetName,
+        optimizeRunId: runId,
+      });
+      if (pin !== undefined && pin.pinned > 0) {
+        process.stdout.write(
+          `[optimize] pinned ${pin.pinned} recovered samples → ${pin.suiteName}@${pin.version}\n`,
+        );
+      }
+    } catch (err) {
+      process.stderr.write(
+        `[optimize] regression pinning skipped: ${err instanceof Error ? err.message : String(err)}\n`,
+      );
+    }
   } else {
     process.stdout.write(
       `[optimize] no improvement above threshold ${improvementThreshold}; source untouched.\n`,
     );
+  }
+
+  // Item 7 — surface the queued contract-ambiguity samples: these need a
+  // dataset/contract fix, not more prompt mutations, which is why they were
+  // withheld from the mutator's failure signal above. Empty queue → silent.
+  for (const line of formatDatasetFixQueue(datasetFixQueue)) {
+    process.stdout.write(`[optimize] ${line}\n`);
   }
 }
 
@@ -2041,14 +2354,62 @@ function makeAsyncIterable<T>(items: ReadonlyArray<T>): AsyncIterable<T> {
   };
 }
 
+/** Materialize a streaming dataset. Only invoked lazily by the item-9
+ *  regression union once a `<specName>-regressions` suite actually exists,
+ *  so the streaming file-dataset path stays streaming when there is none. */
+async function collectSamples(iter: AsyncIterable<Sample>): Promise<Sample[]> {
+  const out: Sample[] = [];
+  for await (const s of iter) out.push(s);
+  return out;
+}
+
 async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
       "usage: crewhaus eval <spec.yaml> --dataset <data> --graders <graders.yaml> " +
-        "[--judge-model <model>] [--concurrency N] [--seed N] -o <out-dir>\n" +
+        "[--judge-model <model>] [--concurrency N] [--seed N] [-o <out-dir>] " +
+        "[--gate] [--no-promote] [--no-regressions] [--no-retry] [--models <m1,m2,...>]\n" +
+        "  --dataset takes a file path (jsonl/csv/yaml/http) or registry:<name>[@version][#split]\n" +
+        "  — a Section 29 dataset-registry ref (.crewhaus/datasets, or CREWHAUS_DATASETS_DIR).\n" +
+        "  Default version: latest; default samples: the union of all splits (give #train,\n" +
+        "  #dev, or #test to eval one split). Runs key into the history index/baselines as\n" +
+        "  <name>@<version>[#split] with a content hash derived from the record's sample hashes.\n" +
+        "  -o defaults to .crewhaus/evals/<runId>. Every run is appended to\n" +
+        "  .crewhaus/evals/index.jsonl and diffed against the pinned baseline for its\n" +
+        "  (spec, dataset) pair (.crewhaus/evals/baselines.json). The first run for a\n" +
+        "  pair pins the baseline; later runs auto-promote when the regression gate\n" +
+        "  passes. --no-promote keeps the existing pin; --gate exits non-zero when the\n" +
+        "  gate fails (any pass-rate drop or sample-level pass→fail flip).\n" +
+        "  When the registry contains <specName>-regressions (pinned by `crewhaus optimize`),\n" +
+        "  its samples are unioned into the dataset by default (dedupe by id, primary wins).\n" +
+        "  When the union actually ADDS samples, datasetName/datasetHash reflect it\n" +
+        "  (`+regressions@vX` suffix + folded hash), so the first adding union starts a new\n" +
+        "  baseline lineage by design; a union that adds nothing keeps the primary identity\n" +
+        "  (and lineage) untouched. --no-regressions skips the union.\n" +
+        "  Samples whose run ERRORS (provider timeout, 429, a grader/judge throw — infra\n" +
+        "  noise, not a graded failure) are retried once by default; the retried outcome\n" +
+        "  replaces the errored one and is tagged retried:true in results.json (the summary\n" +
+        "  line and run index report the retried count). --no-retry disables the retry.\n" +
+        "  After the run, every failing sample is triaged by the failure arbiter into\n" +
+        "  bug / spec-gap / noise / contract-ambiguity: verdicts land in <out>/verdicts.json\n" +
+        "  + a report section + a one-line `triage:` summary. Triage never pins samples the\n" +
+        "  run's own dataset already contains, never pins errored samples, and skips pinning\n" +
+        "  entirely when the run looks infrastructure-failed. Best-effort — a triage failure\n" +
+        "  never fails the eval. Matrix cells (--models) skip triage.\n" +
         "  --judge-model accepts the full router grammar (claude-*, openai/<m>, gemini/<m>,\n" +
         "  bedrock/<id>, local/<m>@<url>); the default judge claude-sonnet-4-5 requires\n" +
-        "  Anthropic credentials (ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY)\n",
+        "  Anthropic credentials (ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY)\n" +
+        "  --models <m1,m2,...> runs a benchmark matrix: the SAME dataset (resolved once,\n" +
+        "  regression union included) and graders once per model, patching the spec's\n" +
+        "  agent.model in-memory like `run --model`. Model strings take the full router\n" +
+        "  grammar and are validated before the first cell runs. Each cell writes a full\n" +
+        "  run dir to <out>/<model-slug>/ (default out: .crewhaus/evals/matrix_<id>), so\n" +
+        "  `eval-report diff` works on any pair of cells; the matrix root gets matrix.json\n" +
+        "  + index.html (pass rate, mean score, latency, tokens, projected $/1k samples —\n" +
+        "  unknown pricing shows n/a). Matrix cells skip the run-history index/baselines\n" +
+        "  (they are comparisons, not lineage), so --gate/--no-promote are rejected. A\n" +
+        "  cell that crashes (bad credentials, 404 model) records an error row and the\n" +
+        "  remaining cells still run; the command then exits non-zero.\n",
     );
     return;
   }
@@ -2059,7 +2420,26 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
   const outDirArg = args.flags["out"];
   if (typeof datasetPath !== "string") die("missing --dataset <data>");
   if (typeof gradersPath !== "string") die("missing --graders <graders.yaml>");
-  if (typeof outDirArg !== "string") die("missing -o <out-dir>");
+  const gateRequested = args.flags["gate"] === true;
+  const promote = args.flags["no-promote"] !== true;
+
+  // Item 11 — `--models` benchmark matrix. Validate the flag combo and every
+  // model string (full router grammar) up front: a typo in model 3 must fail
+  // before cell 1 burns tokens.
+  const modelsFlag = args.flags["models"];
+  let matrixModels: string[] | undefined;
+  if (typeof modelsFlag === "string") {
+    try {
+      assertMatrixFlagsCompatible({
+        gate: gateRequested,
+        noPromote: args.flags["no-promote"] === true,
+      });
+      matrixModels = parseModelsFlag(modelsFlag);
+    } catch (err) {
+      if (err instanceof MatrixArgError) die(err.message);
+      throw err;
+    }
+  }
 
   const concurrencyFlag = args.flags["concurrency"];
   const seedFlag = args.flags["seed"];
@@ -2099,45 +2479,301 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
     die(`could not read ${gradersPath}: ${(err as Error).message}`);
   }
   const { compiled } = parseGradersConfig(gradersYaml);
-  const dataset = await loadDataset(resolve(datasetPath));
 
-  const absOut = resolve(outDirArg);
-  process.stdout.write(`[eval] running ${dataset.name}: ${compiled.length} graders → ${absOut}\n`);
+  // Item 12 — `--dataset registry:<name>[@version][#split]` resolves via the
+  // Section 29 dataset registry instead of loadDataset. datasetName becomes
+  // `<name>@<version>[#split]` and datasetHash a stable digest of the
+  // record's per-sample content hashes, so the item-3 run-index/baseline
+  // features key on registry content exactly like they key on file bytes.
+  // Bare paths keep the pre-existing loadDataset + hashDatasetFile path.
+  let dataset: { name: string; samples: AsyncIterable<Sample> };
+  let datasetHash: string;
+  let registryRef: ReturnType<typeof parseRegistryRef>;
+  try {
+    registryRef = parseRegistryRef(datasetPath);
+  } catch (err) {
+    if (err instanceof DatasetRefError) die(err.message);
+    throw err;
+  }
+  if (registryRef !== undefined) {
+    const registry = createFileBackedRegistry({ rootDir: defaultDatasetsRoot() });
+    let resolved: Awaited<ReturnType<typeof resolveRegistryRef>>;
+    try {
+      resolved = await resolveRegistryRef(registry, registryRef);
+    } catch (err) {
+      if (err instanceof DatasetRefError || err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
+    if (resolved.samples.length === 0) {
+      die(`dataset "${resolved.datasetName}" yielded zero samples`);
+    }
+    dataset = { name: resolved.datasetName, samples: makeAsyncIterable(resolved.samples) };
+    datasetHash = resolved.datasetHash;
+  } else {
+    const absDataset = resolve(datasetPath);
+    dataset = await loadDataset(absDataset);
+    // Content hash of the dataset file — recorded in run.json/results.json and
+    // the run-history index so lineage changes are detectable later.
+    datasetHash = hashDatasetFile(absDataset);
+  }
+
+  // Item 9 — union the per-spec regression suite (<specName>-regressions,
+  // pinned by `crewhaus optimize`) into the loaded dataset by default,
+  // deduped by sample id (the primary dataset wins on collision). A union
+  // that ADDS samples changes the run's sample keyset, so datasetName gets a
+  // `+regressions@vX` suffix and datasetHash folds the suite's content hash
+  // in — the item-3 run index/baselines then key on the honest union lineage
+  // (the first adding union starts a new baseline lineage by design); a
+  // union that adds nothing keeps the primary identity so the existing
+  // lineage stays comparable. Best-effort AND stream-loss-proof: a broken
+  // suite record warns and falls back to the (already materialized when
+  // consumed) primary samples — see applyRegressionUnionGuarded.
+  {
+    const outcome = await applyRegressionUnionGuarded({
+      registry: createFileBackedRegistry({ rootDir: defaultDatasetsRoot() }),
+      specName: ir.name,
+      includeRegressions: args.flags["no-regressions"] !== true,
+      ...(registryRef !== undefined ? { primaryRegistryName: registryRef.name } : {}),
+      primary: dataset,
+      datasetHash,
+    });
+    dataset = { name: outcome.datasetName, samples: outcome.samples };
+    datasetHash = outcome.datasetHash;
+    if (outcome.union !== undefined && outcome.union.added > 0) {
+      process.stdout.write(
+        `[eval] + ${outcome.union.added} regression samples from ${outcome.union.suiteName}@${outcome.union.suiteVersion}\n`,
+      );
+    }
+  }
+
+  // Item 7 — the runner's noise auto-retry is ON by default; `--no-retry`
+  // opts out (threaded into matrix cells and the single-run path alike).
+  const retryErrors = args.flags["no-retry"] !== true;
+
+  // Item 11 — matrix mode: everything above (spec lowering, graders, item-12
+  // registry resolution, item-9 regression union) ran ONCE, so every model
+  // sees the identical sample set. The matrix path never reaches the item-3
+  // finishEvalRun flow below — nor the item-7 triage (matrix cells are model
+  // comparisons; per-cell verdicts/pins would write N conflicting triages).
+  if (matrixModels !== undefined) {
+    return runEvalMatrixCommand({
+      ir,
+      models: matrixModels,
+      datasetName: dataset.name,
+      samples: await collectSamples(dataset.samples),
+      datasetHash,
+      compiled,
+      retryErrors,
+      ...(typeof outDirArg === "string" ? { outDirArg } : {}),
+      ...(concurrency !== undefined ? { concurrency } : {}),
+      ...(seed !== undefined ? { seed } : {}),
+      ...(typeof judgeModelFlag === "string" ? { judgeModel: judgeModelFlag } : {}),
+    });
+  }
+
+  // Item 7 — tee the samples flowing into the runner so post-eval triage can
+  // join each failing SampleResult back to its dataset Sample (reference +
+  // metadata) and pin bug-class samples as they live in the source dataset.
+  const triageSamplesById = new Map<string, Sample>();
+  dataset = { name: dataset.name, samples: tapSamples(dataset.samples, triageSamplesById) };
+
+  const outDest =
+    typeof outDirArg === "string" ? resolve(outDirArg) : join(".crewhaus", "evals", "<runId>");
+  process.stdout.write(`[eval] running ${dataset.name}: ${compiled.length} graders → ${outDest}\n`);
 
   const summary = await runEvalLib({
     ir,
     dataset,
     compiledGraders: compiled,
     opts: {
-      outDir: absOut,
+      ...(typeof outDirArg === "string" ? { outDir: resolve(outDirArg) } : {}),
+      datasetHash,
+      retryErrors,
       ...(concurrency !== undefined ? { concurrency } : {}),
       ...(seed !== undefined ? { seed } : {}),
       ...(typeof judgeModelFlag === "string" ? { judgeModel: judgeModelFlag } : {}),
     },
   });
+  // With -o omitted the runner picks .crewhaus/evals/<runId> relative to the
+  // cwd — resolve to an absolute path for the report + history index.
+  const absOut = resolve(summary.outDir);
 
-  // Render report
+  // Item 7 — failure-arbiter triage: classify every failing sample into
+  // bug / spec-gap / noise / contract-ambiguity, persist verdicts.json next
+  // to results.json, print the one-line `triage:` summary, and pin the
+  // promoteRegression (bug-class) samples into <specName>-regressions.
+  // finishEvalTriage is best-effort by construction (warns, never throws);
+  // the outer catch is belt-and-braces so triage can NEVER fail the eval.
+  let triageVerdicts: Awaited<ReturnType<typeof finishEvalTriage>>;
+  try {
+    triageVerdicts = await finishEvalTriage({
+      samples: summary.samples,
+      samplesById: triageSamplesById,
+      runId: summary.runId,
+      outDir: absOut,
+      specName: ir.name,
+      sourceDataset: dataset.name,
+      registry: createFileBackedRegistry({ rootDir: defaultDatasetsRoot() }),
+      pin: args.flags["no-regressions"] !== true,
+    });
+  } catch (err) {
+    process.stderr.write(
+      `[eval] triage skipped: ${err instanceof Error ? err.message : String(err)}\n`,
+    );
+  }
+
+  // Render report (with the triage section when the run had failures).
   const loaded = await loadRun(absOut);
-  const rendered = renderReport(loaded);
+  const rendered = renderReport(
+    loaded,
+    triageVerdicts !== undefined ? { verdicts: triageVerdicts } : {},
+  );
   writeFileSync(join(absOut, "index.html"), rendered.html);
 
+  // Item 7/F12 — surface retry activity: how many recorded outcomes replaced
+  // an errored first attempt (also recorded in the run index as retriedCount).
+  const retriedCount = summary.samples.filter((s) => s.retried === true).length;
   process.stdout.write(
     `[eval] runId=${summary.runId} pass_rate=${(summary.aggregates.passRate * 100).toFixed(1)}% ` +
       `mean_score=${summary.aggregates.meanScore.toFixed(3)} ` +
       `errors=${summary.aggregates.errorCount} ` +
-      `tokens=${summary.aggregates.totalTokens.input}/${summary.aggregates.totalTokens.output}\n`,
+      `tokens=${summary.aggregates.totalTokens.input}/${summary.aggregates.totalTokens.output}` +
+      `${retriedCount > 0 ? ` (${retriedCount} retried)` : ""}\n`,
   );
   process.stdout.write(`[eval] report: ${join(absOut, "index.html")}\n`);
+
+  // Run-history: append to the index, diff/gate against the pinned baseline,
+  // and promote per policy (see apps/cli/src/eval-history.ts).
+  const finish = await finishEvalRun({
+    summary,
+    specName: ir.name,
+    datasetHash,
+    outDir: absOut,
+    gateRequested,
+    promote,
+  });
+  if (finish.gateFailed) {
+    die(`eval --gate: ${finish.gateReason ?? "regression gate failed"}`);
+  }
+}
+
+/**
+ * Item 11 — `eval --models` matrix execution: one cell per model over the
+ * already-resolved sample set, each patching the lowered ir's `agent.model`
+ * in-memory (the same one-line substitution `run --model` does) and writing
+ * a full run dir to `<root>/<model-slug>/`. Cells deliberately skip the
+ * item-3 finishEvalRun index/baseline/gate flow — they are comparisons, not
+ * lineage runs. One cell crashing records an error row and the loop
+ * continues; ANY crashed cell maps to a non-zero exit after the matrix is
+ * rendered (distinct from cells that ran with failing samples, which is a
+ * normal result).
+ */
+async function runEvalMatrixCommand(opts: {
+  readonly ir: Extract<ReturnType<typeof lower>, { target: "cli" }>;
+  readonly models: ReadonlyArray<string>;
+  readonly datasetName: string;
+  readonly samples: ReadonlyArray<Sample>;
+  readonly datasetHash: string;
+  readonly compiled: ReadonlyArray<CompiledGrader>;
+  /** Item 7 — `!--no-retry`, threaded into every cell's runner options. */
+  readonly retryErrors: boolean;
+  readonly outDirArg?: string;
+  readonly concurrency?: number;
+  readonly seed?: number;
+  readonly judgeModel?: string;
+}): Promise<void> {
+  const rootDir =
+    typeof opts.outDirArg === "string"
+      ? resolve(opts.outDirArg)
+      : resolve(join(".crewhaus", "evals", `matrix_${randomBytes(8).toString("hex")}`));
+  mkdirSync(rootDir, { recursive: true });
+  process.stdout.write(
+    `[eval] matrix: ${opts.models.length} models × ${opts.samples.length} samples ` +
+      `(${opts.datasetName}) → ${rootDir}\n`,
+  );
+
+  const cells = await runMatrixCells({
+    models: opts.models,
+    slugs: assignCellSlugs(opts.models),
+    rootDir,
+    runCell: async (model, cellOutDir) => {
+      const summary = await runEvalLib({
+        ir: { ...opts.ir, agent: { ...opts.ir.agent, model } },
+        dataset: { name: opts.datasetName, samples: makeAsyncIterable(opts.samples) },
+        compiledGraders: opts.compiled,
+        opts: {
+          outDir: cellOutDir,
+          datasetHash: opts.datasetHash,
+          retryErrors: opts.retryErrors,
+          ...(opts.concurrency !== undefined ? { concurrency: opts.concurrency } : {}),
+          ...(opts.seed !== undefined ? { seed: opts.seed } : {}),
+          ...(opts.judgeModel !== undefined ? { judgeModel: opts.judgeModel } : {}),
+        },
+      });
+      // Same per-cell artifact set as a single-model run (results.json +
+      // index.html), so `eval-report diff <cellA> <cellB>` works on any pair.
+      writeFileSync(join(cellOutDir, "index.html"), renderReport(await loadRun(cellOutDir)).html);
+      return summary;
+    },
+  });
+
+  const matrix = buildMatrix(cells, { pricing: defaultMatrixPricing() });
+  const rendered = renderMatrix(matrix);
+  writeFileSync(join(rootDir, "matrix.json"), rendered.json);
+  writeFileSync(join(rootDir, "index.html"), rendered.html);
+
+  writeTable(
+    ["model", "status", "pass_rate", "mean_score", "p95_latency", "est_$/1k"],
+    matrix.rows.map((r) => [
+      r.model,
+      r.status === "ok" ? "ok" : "ERROR",
+      r.passRate !== undefined ? `${(r.passRate * 100).toFixed(1)}%` : "n/a",
+      r.meanScore !== undefined ? r.meanScore.toFixed(3) : "n/a",
+      r.p95LatencyMs !== undefined ? `${Math.round(r.p95LatencyMs)}ms` : "n/a",
+      r.costPer1kSamplesUsd !== undefined ? formatUsd(r.costPer1kSamplesUsd) : "n/a",
+    ]),
+  );
+  process.stdout.write(`[eval] matrix json: ${join(rootDir, "matrix.json")}\n`);
+  process.stdout.write(`[eval] matrix report: ${join(rootDir, "index.html")}\n`);
+
+  const crashed = matrix.rows.filter((r) => r.status === "error");
+  if (crashed.length > 0) {
+    const names = crashed.map((r) => r.model).join(", ");
+    die(`eval --models: ${crashed.length}/${matrix.rows.length} cell(s) failed to run: ${names}`);
+  }
 }
 
 async function runEvalReport(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
-    process.stdout.write("usage: crewhaus eval-report diff <prev> <new> [-o <out-dir>]\n");
+    process.stdout.write(
+      "usage: crewhaus eval-report <action>\n" +
+        "  diff <prev> <new> [-o <out-dir>]            compare two eval runs and emit a diff report\n" +
+        "  history [--spec <name>] [--dataset <name>]  list recorded runs (.crewhaus/evals/index.jsonl)\n" +
+        "  baseline show [--spec <n>] [--dataset <n>]  print pinned baselines (.crewhaus/evals/baselines.json)\n" +
+        "  baseline set <runId>                        pin a recorded run as its (spec, dataset) baseline\n" +
+        "  --dataset matches the recorded name exactly OR with a `+` suffix segment, so\n" +
+        "  `--dataset smoke` also finds runs recorded under the regression-suite union\n" +
+        "  name `smoke+regressions@vX`.\n",
+    );
     return;
   }
   const action = args.positional[0];
-  if (action !== "diff") die(`eval-report: unknown action "${action ?? ""}" — supported: diff`);
+  switch (action) {
+    case "diff":
+      await runEvalReportDiff(args);
+      return;
+    case "history":
+      runEvalReportHistory(args);
+      return;
+    case "baseline":
+      runEvalReportBaseline(args);
+      return;
+    default:
+      die(`eval-report: unknown action "${action ?? ""}" — supported: diff, history, baseline`);
+  }
+}
 
+async function runEvalReportDiff(args: ParsedArgs): Promise<void> {
   const prev = args.positional[1];
   const next = args.positional[2];
   if (typeof prev !== "string" || typeof next !== "string") {
@@ -2163,6 +2799,258 @@ async function runEvalReport(args: ParsedArgs): Promise<void> {
       `recoveries=${result.diff.recoveries.length} ` +
       `score_shifts=${result.diff.scoreShifts.length} ` +
       `unchanged=${result.diff.unchanged}\n`,
+  );
+}
+
+/** Filter helper shared by `history` and `baseline show`. The dataset
+ *  filter also matches `<filter>+…` union names — see datasetFilterMatches. */
+function matchesEvalFilters(args: ParsedArgs, specName: string, datasetName: string): boolean {
+  const specFilter = args.flags["spec"];
+  const datasetFilter = args.flags["dataset"];
+  if (typeof specFilter === "string" && specName !== specFilter) return false;
+  if (typeof datasetFilter === "string" && !datasetFilterMatches(datasetFilter, datasetName)) {
+    return false;
+  }
+  return true;
+}
+
+/** Render rows as space-padded columns (last column unpadded). */
+function writeTable(header: ReadonlyArray<string>, rows: ReadonlyArray<ReadonlyArray<string>>) {
+  const widths = header.map((h, i) => Math.max(h.length, ...rows.map((r) => (r[i] ?? "").length)));
+  const line = (cells: ReadonlyArray<string>): string =>
+    cells
+      .map((c, i) => (i === cells.length - 1 ? c : c.padEnd(widths[i] ?? c.length)))
+      .join("  ")
+      .trimEnd();
+  process.stdout.write(`${line(header)}\n`);
+  for (const row of rows) process.stdout.write(`${line(row)}\n`);
+}
+
+function runEvalReportHistory(args: ParsedArgs): void {
+  const entries = readRunIndex().filter((e) => matchesEvalFilters(args, e.specName, e.datasetName));
+  if (entries.length === 0) {
+    process.stdout.write(
+      `[eval-report] no recorded runs match (${join(".crewhaus", "evals", "index.jsonl")})\n`,
+    );
+    return;
+  }
+  // Mark the run(s) currently pinned as a baseline with `*`.
+  const pinnedRunIds = new Set(Object.values(readBaselines()).map((b) => b.runId));
+  writeTable(
+    [
+      "ts",
+      "runId",
+      "spec",
+      "dataset",
+      "pass_rate",
+      "mean_score",
+      "samples",
+      "retried",
+      "base",
+      "outDir",
+    ],
+    entries.map((e) => [
+      e.ts,
+      e.runId,
+      e.specName,
+      e.datasetName,
+      `${(e.passRate * 100).toFixed(1)}%`,
+      e.meanScore.toFixed(3),
+      String(e.sampleCount),
+      // Additive field — entries recorded before it existed read as 0.
+      String(e.retriedCount ?? 0),
+      pinnedRunIds.has(e.runId) ? "*" : "",
+      e.outDir,
+    ]),
+  );
+}
+
+function runEvalReportBaseline(args: ParsedArgs): void {
+  const sub = args.positional[1];
+  switch (sub) {
+    case "show": {
+      const pins = Object.values(readBaselines()).filter((b) =>
+        matchesEvalFilters(args, b.specName, b.datasetName),
+      );
+      if (pins.length === 0) {
+        process.stdout.write(
+          `[eval-report] no baselines pinned (${join(".crewhaus", "evals", "baselines.json")})\n`,
+        );
+        return;
+      }
+      writeTable(
+        ["spec", "dataset", "runId", "pinned_at", "outDir"],
+        pins.map((b) => [b.specName, b.datasetName, b.runId, b.ts, b.outDir]),
+      );
+      return;
+    }
+    case "set": {
+      const runId = args.positional[2];
+      if (typeof runId !== "string") die("eval-report baseline set: missing <runId>");
+      // Latest index entry wins if a runId somehow appears twice.
+      const index = readRunIndex();
+      let entry: RunIndexEntry | undefined;
+      for (let i = index.length - 1; i >= 0; i--) {
+        if (index[i]?.runId === runId) {
+          entry = index[i];
+          break;
+        }
+      }
+      if (entry === undefined) {
+        die(
+          `eval-report baseline set: runId "${runId}" not found in ` +
+            `${join(".crewhaus", "evals", "index.jsonl")} — run \`crewhaus eval-report history\``,
+        );
+      }
+      setBaseline({
+        specName: entry.specName,
+        datasetName: entry.datasetName,
+        runId: entry.runId,
+        outDir: entry.outDir,
+        datasetHash: entry.datasetHash,
+        ts: new Date().toISOString(),
+      });
+      process.stdout.write(
+        `[eval-report] baseline set: ${entry.specName}/${entry.datasetName} → ${entry.runId}\n`,
+      );
+      return;
+    }
+    default:
+      die(`eval-report baseline: unknown action "${sub ?? ""}" — supported: show, set`);
+  }
+}
+
+/**
+ * Item 12 — `crewhaus datasets <action>`: the CLI face of Section 29's
+ * dataset-registry (versioned, split-aware datasets under `.crewhaus/datasets`
+ * or CREWHAUS_DATASETS_DIR — the same root the emitted eval-bundle harness
+ * reads). Mirrors eval-report's action-dispatch pattern; the resolution and
+ * split logic lives in `./datasets` so it is unit-testable.
+ */
+async function runDatasets(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus datasets <action>\n" +
+        "  list                                        all datasets + versions (split sizes, createdAt)\n" +
+        "  get <name>[@version] [--split train|dev|test]\n" +
+        "                                              print samples as JSONL to stdout. Default: the\n" +
+        "                                              latest version, all splits merged with a top-level\n" +
+        "                                              `split` column; --split prints one split verbatim\n" +
+        "  put <name> --file <data.jsonl|csv|yaml> [--split-spec 70/15/15 | --split train]\n" +
+        "                                              import a dataset file as a new auto-bumped version\n" +
+        "                                              (v1, v2, …). Split assignment is deterministic —\n" +
+        "                                              stable by sample-id hash, no RNG — per the\n" +
+        "                                              train/dev[/test] percentages (default 70/15/15);\n" +
+        "                                              --split puts every sample into one named split\n" +
+        "  registry root: .crewhaus/datasets (override with CREWHAUS_DATASETS_DIR)\n",
+    );
+    return;
+  }
+  const action = args.positional[0];
+  try {
+    switch (action) {
+      case "list":
+        await runDatasetsList();
+        return;
+      case "get":
+        await runDatasetsGet(args);
+        return;
+      case "put":
+        await runDatasetsPut(args);
+        return;
+      default:
+        die(`datasets: unknown action "${action ?? ""}" — supported: list, get, put`);
+    }
+  } catch (err) {
+    // DatasetRegistryError (invalid name/version, missing record) and the
+    // ./datasets ref/spec errors both map to a clean one-line failure.
+    if (err instanceof CrewhausError || err instanceof DatasetRefError) die(err.message);
+    throw err;
+  }
+}
+
+async function runDatasetsList(): Promise<void> {
+  const registry = createFileBackedRegistry({ rootDir: defaultDatasetsRoot() });
+  const names = [...(await registry.listDatasets())].sort();
+  const rows: string[][] = [];
+  for (const name of names) {
+    for (const version of [...(await registry.list(name))].sort(compareVersions)) {
+      try {
+        const record = await registry.getRecord(name, version);
+        rows.push([
+          name,
+          version,
+          String(record.splits.train.length),
+          String(record.splits.dev.length),
+          record.splits.test !== undefined ? String(record.splits.test.length) : "-",
+          record.createdAt,
+        ]);
+      } catch {
+        // A torn/foreign file must not take down the whole listing.
+      }
+    }
+  }
+  if (rows.length === 0) {
+    process.stdout.write(`[datasets] no datasets registered (${defaultDatasetsRoot()})\n`);
+    return;
+  }
+  writeTable(["dataset", "version", "train", "dev", "test", "createdAt"], rows);
+}
+
+/** Validate a `--split` value or die (undefined when the flag is absent). */
+function splitFlag(args: ParsedArgs): DatasetSplit | undefined {
+  const flag = args.flags["split"];
+  if (typeof flag !== "string") return undefined;
+  if (!isDatasetSplit(flag)) die(`invalid --split "${flag}" — expected train, dev, or test`);
+  return flag;
+}
+
+async function runDatasetsGet(args: ParsedArgs): Promise<void> {
+  const refStr = args.positional[1];
+  if (typeof refStr !== "string") die("datasets get: missing <name>[@version]");
+  const split = splitFlag(args);
+  const registry = createFileBackedRegistry({ rootDir: defaultDatasetsRoot() });
+  const { name, version } = parseNameVersion(refStr);
+  const resolvedVersion = version ?? (await latestVersion(registry, name));
+  if (resolvedVersion === undefined) {
+    die(`dataset "${name}" has no versions in the registry (${defaultDatasetsRoot()})`);
+  }
+  const record = await registry.getRecord(name, resolvedVersion);
+  if (split !== undefined && record.splits[split] === undefined) {
+    die(`split "${split}" not present in "${name}@${resolvedVersion}"`);
+  }
+  process.stdout.write(recordToJsonl(record, split));
+}
+
+async function runDatasetsPut(args: ParsedArgs): Promise<void> {
+  const name = args.positional[1];
+  if (typeof name !== "string") die("datasets put: missing <name>");
+  const filePath = args.flags["file"];
+  if (typeof filePath !== "string") die("datasets put: missing --file <dataset.jsonl>");
+  const split = splitFlag(args);
+  const splitSpecFlag = args.flags["split-spec"];
+  if (split !== undefined && typeof splitSpecFlag === "string") {
+    die("datasets put: --split and --split-spec are mutually exclusive");
+  }
+  const splitSpec =
+    typeof splitSpecFlag === "string" ? parseSplitSpec(splitSpecFlag) : DEFAULT_SPLIT_SPEC;
+
+  const dataset = await loadDataset(resolve(filePath));
+  const samples: Sample[] = [];
+  for await (const s of dataset.samples) samples.push(s);
+  if (samples.length === 0) die(`datasets put: ${filePath} yielded zero samples`);
+
+  const registry = createFileBackedRegistry({ rootDir: defaultDatasetsRoot() });
+  const rec = await registerDataset({
+    registry,
+    name,
+    samples,
+    ...(split !== undefined ? { split } : { splitSpec }),
+  });
+  process.stdout.write(
+    `[datasets] put ${rec.name}@${rec.version} ` +
+      `(train ${rec.splits.train.length} / dev ${rec.splits.dev.length} / ` +
+      `test ${rec.splits.test?.length ?? 0}) — use with --dataset registry:${rec.name}\n`,
   );
 }
 
@@ -2548,12 +3436,21 @@ async function runDistill(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
       "usage: crewhaus distill (--session <id> | --all-sessions) -o <dataset.jsonl> " +
-        "[--graders-out <graders.yaml>] [--min-score F] [--judge] [--judge-model <model>]\n",
+        "[--graders-out <graders.yaml>] [--min-score F] [--judge] [--judge-model <model>] " +
+        "[--register <name>]\n" +
+        "  --register promotes the distilled samples into the Section 29 dataset registry\n" +
+        "  (.crewhaus/datasets, or CREWHAUS_DATASETS_DIR) as a new auto-bumped version of\n" +
+        "  <name> with the deterministic default 70/15/15 train/dev/test split (stable by\n" +
+        "  sample-id hash), printing <name>@<version>. -o is optional when --register is\n" +
+        "  given; without --register the plain file output is unchanged.\n",
     );
     return;
   }
   const outPath = args.flags["out"];
-  if (typeof outPath !== "string") die("missing -o <dataset.jsonl>");
+  const registerName = args.flags["register"];
+  if (typeof outPath !== "string" && typeof registerName !== "string") {
+    die("missing -o <dataset.jsonl> (or --register <name> to promote into the registry)");
+  }
   const allSessions = args.flags["all-sessions"] === true;
   const session = args.flags["session"];
   if (!allSessions && typeof session !== "string")
@@ -2593,9 +3490,14 @@ async function runDistill(args: ParsedArgs): Promise<void> {
   for (const w of result.warnings) process.stderr.write(`[distill] warning: ${w}\n`);
   if (result.samples.length === 0) die("no rated turns could be matched to the transcript(s)");
 
-  const absOut = resolve(outPath);
-  mkdirSync(dirname(absOut), { recursive: true });
-  writeFileSync(absOut, samplesToJsonl(result.samples), { mode: 0o600 });
+  // Plain file output — unchanged default; skipped only when the caller went
+  // registry-only (--register without -o).
+  let absOut: string | undefined;
+  if (typeof outPath === "string") {
+    absOut = resolve(outPath);
+    mkdirSync(dirname(absOut), { recursive: true });
+    writeFileSync(absOut, samplesToJsonl(result.samples), { mode: 0o600 });
+  }
 
   const gradersOut = args.flags["graders-out"];
   if (typeof gradersOut === "string") {
@@ -2607,7 +3509,8 @@ async function runDistill(args: ParsedArgs): Promise<void> {
   const { stats } = result;
   process.stdout.write(
     `[distill] ${stats.matchedTurns} rated turn(s) → ${result.samples.length} sample(s) ` +
-      `(${stats.positives} positive, ${stats.negatives} low-rated) → ${absOut}\n`,
+      `(${stats.positives} positive, ${stats.negatives} low-rated)` +
+      `${absOut !== undefined ? ` → ${absOut}` : ""}\n`,
   );
   if (typeof gradersOut === "string") {
     const g = result.graders.graders[0];
@@ -2617,6 +3520,29 @@ async function runDistill(args: ParsedArgs): Promise<void> {
     process.stdout.write(
       `[distill] ${stats.unmatchedFeedback} rating(s) had no matching turn (skipped)\n`,
     );
+  }
+
+  // Item 12 — versioned promotion into the Section 29 dataset registry: a new
+  // auto-bumped version of <name> with the deterministic default 70/15/15
+  // train/dev/test split (stable by sample-id hash — see datasets.ts).
+  if (typeof registerName === "string") {
+    const registry = createFileBackedRegistry({ rootDir: defaultDatasetsRoot() });
+    try {
+      const rec = await registerDataset({
+        registry,
+        name: registerName,
+        samples: result.samples,
+        splitSpec: DEFAULT_SPLIT_SPEC,
+      });
+      process.stdout.write(
+        `[distill] registered ${rec.name}@${rec.version} ` +
+          `(train ${rec.splits.train.length} / dev ${rec.splits.dev.length} / ` +
+          `test ${rec.splits.test?.length ?? 0}) — use with --dataset registry:${rec.name}\n`,
+      );
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
   }
 }
 
@@ -3705,6 +4631,9 @@ switch (subcommand) {
     break;
   case "distill":
     await runDistill(parseFor(rest, DISTILL_SCHEMA));
+    break;
+  case "datasets":
+    await runDatasets(parseFor(rest, DATASETS_SCHEMA));
     break;
   case "state": {
     const action = rest[0] ?? "";

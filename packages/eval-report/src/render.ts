@@ -38,6 +38,12 @@ summary { padding: 12px 16px; cursor: pointer; user-select: none; }
 .recovery-row { background: rgba(76, 175, 80, 0.08); }
 .score-bar { display: inline-block; width: 60px; height: 8px; background: #2a2d33; border-radius: 4px; vertical-align: middle; margin-right: 8px; }
 .score-bar > span { display: block; height: 100%; background: var(--pass); border-radius: 4px; }
+.best { color: var(--pass); font-weight: 600; }
+.na { color: var(--muted); }
+.triage-bug { color: var(--fail); font-weight: 600; }
+.triage-spec-gap { color: #ffb74d; font-weight: 600; }
+.triage-noise { color: var(--muted); font-weight: 600; }
+.triage-contract-ambiguity { color: var(--link); font-weight: 600; }
 `;
 
 const SCRIPT = `
@@ -64,7 +70,7 @@ const SCRIPT = `
 })();
 `;
 
-function escapeHtml(s: string): string {
+export function escapeHtml(s: string): string {
   return s
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
@@ -73,7 +79,7 @@ function escapeHtml(s: string): string {
     .replace(/'/g, "&#39;");
 }
 
-function shell(title: string, body: string): string {
+export function shell(title: string, body: string): string {
   return `<!doctype html>
 <html><head>
 <meta charset="utf-8">
@@ -151,12 +157,70 @@ function sampleDrill(s: SampleResult, perSample?: LoadedRun["perSample"][string]
 </details>`;
 }
 
-export function renderReport(run: LoadedRun): { html: string; json: string } {
+/** One failing sample's triage verdict, as the report renders it. */
+export type ReportVerdictRow = {
+  readonly sampleId: string;
+  readonly class: string;
+  readonly reason: string;
+};
+
+/**
+ * Failure-triage verdicts for a run — written by the CLI's failure-arbiter
+ * wiring (item 7) as `verdicts.json` next to `results.json` and passed to
+ * {@link renderReport}. Deliberately structural (`class` is a plain string,
+ * counts an open record): this package does NOT depend on
+ * eval-optimizer-orchestrator's types, so any object with these fields
+ * renders and an arbiter gaining a fifth class needs no change here.
+ */
+export type ReportVerdicts = {
+  readonly counts: Readonly<Record<string, number>>;
+  readonly dominantClass: string;
+  readonly total: number;
+  readonly verdicts: ReadonlyArray<ReportVerdictRow>;
+};
+
+/** Fixed display order for the four shipped classes (unknown classes append). */
+const TRIAGE_CLASS_ORDER = ["bug", "spec-gap", "noise", "contract-ambiguity"];
+
+function triageSection(v: ReportVerdicts): string {
+  const classes = [
+    ...TRIAGE_CLASS_ORDER.filter((c) => c in v.counts),
+    ...Object.keys(v.counts).filter((c) => !TRIAGE_CLASS_ORDER.includes(c)),
+  ];
+  const countsLine = classes.map((c) => `${escapeHtml(c)} ${v.counts[c] ?? 0}`).join(" · ");
+  const rows = v.verdicts
+    .map((row) => {
+      // Only a known-shaped class name becomes a CSS class; anything else
+      // renders unstyled rather than risking attribute breakout.
+      const cls = /^[a-z][a-z-]*$/.test(row.class) ? ` class="triage-${row.class}"` : "";
+      return `
+<tr>
+  <td>${escapeHtml(row.sampleId)}</td>
+  <td${cls}>${escapeHtml(row.class)}</td>
+  <td>${escapeHtml(row.reason)}</td>
+</tr>`;
+    })
+    .join("");
+  return `
+<section class="diff-section" id="triage">
+  <h2>Failure triage (${v.total} failing)</h2>
+  <p class="meta">${countsLine} · dominant: ${escapeHtml(v.dominantClass)}</p>
+  <table data-sortable>
+    <thead><tr><th>Sample</th><th>Class</th><th>Reason</th></tr></thead>
+    <tbody>${rows}</tbody>
+  </table>
+</section>`;
+}
+
+export function renderReport(
+  run: LoadedRun,
+  opts: { readonly verdicts?: ReportVerdicts } = {},
+): { html: string; json: string } {
   const s = run.summary;
   const body = `
 <h1>Eval run ${escapeHtml(s.runId)}</h1>
 <p class="meta">Started ${escapeHtml(s.startedAt)} · ended ${escapeHtml(s.endedAt)} · model ${escapeHtml(s.config.model)} · concurrency ${s.config.concurrency}${s.config.judgeModel ? ` · judge ${escapeHtml(s.config.judgeModel)}` : ""}</p>
-${aggregateCards(s)}
+${aggregateCards(s)}${opts.verdicts !== undefined ? triageSection(opts.verdicts) : ""}
 <table data-sortable>
   <thead><tr>
     <th>Sample</th><th>Status</th><th>Score</th><th>Turns</th><th>Latency</th><th>Tokens (in/out)</th><th>Drill</th>
