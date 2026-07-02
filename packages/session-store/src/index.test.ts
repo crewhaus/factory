@@ -300,6 +300,27 @@ describe("session-store — evictExpiredSessions (standalone TTL pass)", () => {
     expect((await evictExpiredSessions({ rootDir, ttlDays: 1 })).evictedIds).toEqual([a.id]);
   });
 
+  test("pinnedIds survive eviction even when expired (retention.json pins)", async () => {
+    // Ops-review F2 regression: the daemon janitor threads the config's pins
+    // through here — a pinned session must never be evicted, however old.
+    const rootDir = newTempRoot();
+    const store = createSessionStore({ rootDir });
+    const pinned = await store.create({ name: "pinned", target: "cli", model: "m" });
+    const doomed = await store.create({ name: "doomed", target: "cli", model: "m" });
+    const pinnedLog = join(rootDir, `${pinned.id}.jsonl`);
+    writeFileSync(pinnedLog, '{"version":1,"ts":1,"kind":"user_message","payload":{}}\n');
+    const backdated = new Date(Date.now() - 90 * 86_400_000);
+    for (const id of [pinned.id, doomed.id]) {
+      utimesSync(join(rootDir, `${id}.json`), backdated, backdated);
+    }
+
+    const { evictedIds } = await evictExpiredSessions({ rootDir, pinnedIds: [pinned.id] });
+    expect(evictedIds).toEqual([doomed.id]);
+    expect(existsSync(join(rootDir, `${pinned.id}.json`))).toBe(true);
+    expect(existsSync(pinnedLog)).toBe(true);
+    expect(existsSync(join(rootDir, `${doomed.id}.json`))).toBe(false);
+  });
+
   test("missing root dir returns no evictions", async () => {
     const rootDir = join(newTempRoot(), "never-created");
     expect((await evictExpiredSessions({ rootDir })).evictedIds).toEqual([]);

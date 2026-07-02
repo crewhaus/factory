@@ -160,6 +160,7 @@ function renderAgent(ir: IrBatchV0): string {
 import { createInMemoryQueue } from "@crewhaus/queue-protocol";
 import { startConsumer } from "@crewhaus/queue-consumer";
 import { createInMemoryIdempotencyStore } from "@crewhaus/idempotency-keys";
+import { loadRetentionConfig } from "@crewhaus/data-retention-engine";
 import { createJanitor, runChatLoop } from "@crewhaus/runtime-core";
 import { createRunContext } from "@crewhaus/run-context";
 import { defaultCatalog } from "@crewhaus/tool-catalog";
@@ -196,12 +197,30 @@ async function main(): Promise<void> {
   // Boot-time self-heal janitor (ops item 36): evicts expired sessions on a
   // schedule (TTL eviction otherwise only fires as a list() side-effect an
   // idle worker never triggers) and reports orphaned tool_use entries in
-  // recent transcripts (report-only). The report goes to stderr so the
-  // stdout JSON event stream stays untouched. CREWHAUS_JANITOR=0 disables
-  // entirely; CREWHAUS_JANITOR_INTERVAL_MS overrides the hourly re-run
-  // (0 keeps only the boot run; the timer is unref'd so the queue_idle exit
-  // path still terminates the process).
-  const janitor = createJanitor();
+  // recent transcripts (report-only). Eviction honors
+  // .crewhaus/retention.json (ops item 35) — the SAME pins +
+  // sessions.maxAgeDays the \`crewhaus retention\` CLI enforces; a malformed
+  // config fails safe (eviction disabled, worker keeps running). The report
+  // goes to stderr so the stdout JSON event stream stays untouched.
+  // CREWHAUS_JANITOR=0 disables entirely; CREWHAUS_JANITOR_INTERVAL_MS
+  // overrides the hourly re-run (0 keeps only the boot run; the timer is
+  // unref'd so the queue_idle exit path still terminates the process).
+  let retentionTtlDays: number;
+  let retentionPins: readonly string[] = [];
+  try {
+    const retention = await loadRetentionConfig(process.cwd());
+    retentionTtlDays = retention.sessionMaxAgeDays;
+    retentionPins = retention.pins;
+  } catch (err) {
+    process.stderr.write(
+      \`[batch-worker] .crewhaus/retention.json unreadable — janitor session eviction disabled: \${(err as Error).message}\\n\`,
+    );
+    retentionTtlDays = Number.POSITIVE_INFINITY; // fail-safe: evict nothing
+  }
+  const janitor = createJanitor({
+    sessionTtlDays: retentionTtlDays,
+    pinnedSessionIds: retentionPins,
+  });
   if (process.env["CREWHAUS_JANITOR"] !== "0") {
     const janitorReport = await janitor.runOnce();
     process.stderr.write(\`[janitor] \${JSON.stringify(janitorReport.steps)}\\n\`);

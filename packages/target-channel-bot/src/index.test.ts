@@ -114,7 +114,7 @@ describe("emitChannelBot — daemon.ts wiring", () => {
   test("boots the self-heal janitor before serving webhooks (ops #36)", () => {
     const c = fileMap(MIN_IR).get("daemon.ts") ?? "";
     expect(c).toContain('import { createJanitor } from "@crewhaus/runtime-core";');
-    expect(c).toContain("const __janitor = createJanitor()");
+    expect(c).toContain("const __janitor = createJanitor({");
     // Boot-time runOnce, env kill-switch, and configurable hourly interval.
     expect(c).toContain('process.env["CREWHAUS_JANITOR"] !== "0"');
     expect(c).toContain("await __janitor.runOnce()");
@@ -122,9 +122,21 @@ describe("emitChannelBot — daemon.ts wiring", () => {
       '__janitor.start(Number(process.env["CREWHAUS_JANITOR_INTERVAL_MS"] ?? 3_600_000))',
     );
     // The janitor boots ahead of the webhook listener.
-    expect(c.indexOf("createJanitor()")).toBeLessThan(c.indexOf("Bun.serve({"));
+    expect(c.indexOf("createJanitor({")).toBeLessThan(c.indexOf("Bun.serve({"));
     // Shutdown halts the interval.
     expect(c).toContain("__janitor.stop();");
+  });
+
+  test("janitor honors .crewhaus/retention.json pins + TTL (ops-review F2)", () => {
+    const c = fileMap(MIN_IR).get("daemon.ts") ?? "";
+    // The SAME loader the retention CLI uses, so the two paths cannot drift.
+    expect(c).toContain('import { loadRetentionConfig } from "@crewhaus/data-retention-engine"');
+    expect(c).toContain("await loadRetentionConfig(__cwd)");
+    expect(c).toContain("sessionTtlDays: __retentionTtlDays");
+    expect(c).toContain("pinnedSessionIds: __retentionPins");
+    // A malformed config fails safe: eviction disabled, daemon keeps serving.
+    expect(c).toContain("__retentionTtlDays = Number.POSITIVE_INFINITY");
+    expect(c).toContain("janitor session eviction disabled");
   });
 
   test("constructs createSlackAdapter with the configured secret references", () => {

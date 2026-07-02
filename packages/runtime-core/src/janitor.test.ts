@@ -103,13 +103,16 @@ describe("createJanitor — reservation cleanup", () => {
     expect(calls).toBe(1);
   });
 
-  test("a throwing clearReservations is isolated and retried next run", async () => {
+  test("a throwing clearReservations is isolated and NEVER retried (latch on attempt)", async () => {
+    // Ops-review F3 regression: retrying clearReservations() on an hourly
+    // tick after a failed boot attempt would zero LIVE reservations mid-
+    // traffic. The attempt latch must be set even when the call throws.
     let calls = 0;
     const janitor = createJanitor({
       budgetStore: {
         async clearReservations() {
           calls += 1;
-          if (calls === 1) throw new Error("sqlite locked");
+          throw new Error("sqlite locked");
         },
       },
       sessionRootDirs: [rootDir],
@@ -121,10 +124,16 @@ describe("createJanitor — reservation cleanup", () => {
     // The other steps still ran despite the failure.
     expect(step(first, "session_ttl_eviction").status).toBe("ok");
     expect(step(first, "orphan_tool_use_sweep").status).toBe("ok");
-    // Not marked cleared — the next run retries and succeeds.
+    // Boot-only: every later run reports skipped — the store is NOT called
+    // again (a retry after boot could zero live reservations).
     const second = await janitor.runOnce();
-    expect(step(second, "reservation_cleanup").status).toBe("ok");
-    expect(calls).toBe(2);
+    expect(step(second, "reservation_cleanup").status).toBe("skipped");
+    expect(step(second, "reservation_cleanup").detail).toBe(
+      "skipped (boot-only, earlier attempt failed)",
+    );
+    const third = await janitor.runOnce();
+    expect(step(third, "reservation_cleanup").status).toBe("skipped");
+    expect(calls).toBe(1);
   });
 });
 
@@ -174,6 +183,72 @@ describe("createJanitor — session TTL eviction", () => {
     const result = await janitor.runOnce();
     expect(step(result, "session_ttl_eviction").status).toBe("ok");
     expect(step(result, "session_ttl_eviction").count).toBe(0);
+  });
+
+  test("pinned sessions survive runOnce() even when expired (retention.json pins)", async () => {
+    // Ops-review F2 regression: the janitor must honor the same pins the
+    // `crewhaus retention` CLI enforces — otherwise the daemon deletes what
+    // the operator pinned in .crewhaus/retention.json.
+    await seedSession(sessId(30), 90);
+    await seedLog(sessId(30), [assistantWithToolUse("toolu_pinned")], 90);
+    await seedSession(sessId(31), 90);
+    const janitor = createJanitor({
+      sessionRootDirs: [rootDir],
+      sessionTtlDays: 30,
+      pinnedSessionIds: [sessId(30)],
+    });
+    const result = await janitor.runOnce();
+    expect(step(result, "session_ttl_eviction").count).toBe(1);
+    expect(existsSync(join(rootDir, `${sessId(30)}.json`))).toBe(true);
+    expect(existsSync(join(rootDir, `${sessId(30)}.jsonl`))).toBe(true);
+    expect(existsSync(join(rootDir, `${sessId(31)}.json`))).toBe(false);
+  });
+
+  test("a configured sessionTtlDays keeps sessions the 30-day default would evict", async () => {
+    // Ops-review F2 regression: retention.json's sessions.maxAgeDays must
+    // reach the janitor — a 40-day-old session under a 60-day policy lives.
+    await seedSession(sessId(32), 40);
+    const janitor = createJanitor({ sessionRootDirs: [rootDir], sessionTtlDays: 60 });
+    const result = await janitor.runOnce();
+    expect(step(result, "session_ttl_eviction").count).toBe(0);
+    expect(existsSync(join(rootDir, `${sessId(32)}.json`))).toBe(true);
+  });
+
+  test("tenantsRootDir discovers per-tenant session roots on EVERY run (fallback tenants)", async () => {
+    // Ops-review F6 regression: gateway-server's buildTenant fallback serves
+    // arbitrary authenticated tenants whose roots appear under the tenants
+    // root AFTER boot — the janitor must re-enumerate per run, not snapshot
+    // the spec-declared list at boot.
+    const tenantsRoot = mkdtempSync(join(tmpdir(), "crewhaus-janitor-tenants-"));
+    try {
+      const seedTenantSession = async (tenantId: string, n: number): Promise<string> => {
+        const sessions = join(tenantsRoot, tenantId, "sessions");
+        const store = createSessionStore({ rootDir: sessions });
+        await store.create({ id: sessId(n), name: tenantId, target: "test", model: "m" });
+        const aged = new Date(Date.now() - 40 * MS_PER_DAY);
+        utimesSync(join(sessions, `${sessId(n)}.json`), aged, aged);
+        return join(sessions, `${sessId(n)}.json`);
+      };
+
+      const declared = await seedTenantSession("tenant-a", 40);
+      const janitor = createJanitor({
+        sessionRootDirs: [join(tenantsRoot, "tenant-a", "sessions")],
+        tenantsRootDir: tenantsRoot,
+        sessionTtlDays: 30,
+      });
+      const first = await janitor.runOnce();
+      expect(step(first, "session_ttl_eviction").count).toBe(1);
+      expect(existsSync(declared)).toBe(false);
+
+      // A fallback tenant materialises AFTER the first run — the next run
+      // must sweep it without any reconfiguration.
+      const fallback = await seedTenantSession("tenant-fallback", 41);
+      const second = await janitor.runOnce();
+      expect(step(second, "session_ttl_eviction").count).toBe(1);
+      expect(existsSync(fallback)).toBe(false);
+    } finally {
+      rmSync(tenantsRoot, { recursive: true, force: true });
+    }
   });
 });
 

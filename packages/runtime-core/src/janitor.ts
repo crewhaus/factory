@@ -26,17 +26,25 @@
  *
  * Step semantics:
  *
- *   - reservation_cleanup: runs at most ONCE per janitor (first successful
- *     run, retried after errors), even though `runOnce` re-fires hourly.
- *     `clearReservations()` zeroes ALL reservations — leaked *and live* —
- *     so re-clearing while requests are in flight would briefly disable the
- *     gateway's reserve-ahead TOCTOU guard. At boot the process is the only
- *     writer (single-writer contract from durable-state's header) and every
- *     reservation is by definition leaked; later there is no way to tell
- *     leaked from live, so later runs report `skipped`.
+ *   - reservation_cleanup: ATTEMPTED at most once per janitor — the latch is
+ *     set on the attempt, not on success — even though `runOnce` re-fires
+ *     hourly. `clearReservations()` zeroes ALL reservations — leaked *and
+ *     live* — so re-clearing while requests are in flight would zero live
+ *     reservations and briefly disable the gateway's reserve-ahead TOCTOU
+ *     guard. At boot the process is the only writer (single-writer contract
+ *     from durable-state's header) and every reservation is by definition
+ *     leaked; by the time a FAILED boot attempt could be retried on an
+ *     hourly tick, traffic is flowing and the same live-zeroing hazard
+ *     applies — so a failed attempt reports `error` once and later runs
+ *     report `skipped (boot-only, earlier attempt failed)`, never a retry.
  *   - session_ttl_eviction: `@crewhaus/session-store`'s
  *     `evictExpiredSessions()` — exactly `list()`'s mtime-keyed eviction
- *     side-effect without reading the survivors.
+ *     side-effect without reading the survivors. Honors the harness's
+ *     `.crewhaus/retention.json` when the caller threads it through:
+ *     `sessionTtlDays` (the config's `sessions.maxAgeDays`) and
+ *     `pinnedSessionIds` (the config's `pins`) — otherwise a daemon janitor
+ *     on the 30-day default would delete sessions the `crewhaus retention`
+ *     CLI is contracted to keep.
  *   - orphan_tool_use_sweep: DETECT-AND-REPORT ONLY, by explicit judgment.
  *     Repairing on disk was considered and rejected: (a) `--resume` already
  *     self-heals — `replayMessageHistory` runs `sanitizeOrphanToolUses`
@@ -54,8 +62,9 @@
  * Every step's outcome is returned in the `JanitorRunResult` and — when a
  * `TraceEventBus` is supplied — published as a `janitor_action` trace event.
  */
+import type { Dirent } from "node:fs";
 import { readdir, stat } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { openEventLog } from "@crewhaus/event-log";
 import { DEFAULT_ROOT_DIR, evictExpiredSessions } from "@crewhaus/session-store";
 import type { TraceEventBus } from "@crewhaus/trace-event-bus";
@@ -106,12 +115,34 @@ export type CreateJanitorOptions = {
    * Session directories to sweep — TTL eviction and the orphan scan both
    * walk every listed root. Default: the single root `runChatLoop` itself
    * would use outside a tenant scope (`CREWHAUS_SESSION_DIR` or
-   * `.crewhaus/sessions`). The managed target passes its per-tenant
-   * `sessionRoot`s instead.
+   * `.crewhaus/sessions`), unless `tenantsRootDir` is set (then only the
+   * discovered tenant roots are swept). The managed target passes its
+   * per-tenant `sessionRoot`s here AND `tenantsRootDir` below.
    */
   readonly sessionRootDirs?: ReadonlyArray<string>;
-  /** TTL for session eviction. Default: session-store's own (30 days). */
+  /**
+   * Parent directory whose immediate subdirectories are per-tenant roots
+   * (`<tenantsRootDir>/<tenantId>/sessions` — the layout tenancy's
+   * `buildTenant` produces). Re-enumerated on EVERY run, so tenants that
+   * only appear AFTER boot — gateway-server serves any authenticated tenant
+   * id via its `buildTenant` fallback, not just spec-declared overrides —
+   * are swept too. Discovered roots are merged (deduplicated) with
+   * `sessionRootDirs`.
+   */
+  readonly tenantsRootDir?: string;
+  /**
+   * TTL for session eviction. Default: session-store's own (30 days).
+   * Daemons should pass the harness's `.crewhaus/retention.json`
+   * `sessions.maxAgeDays` (see `@crewhaus/data-retention-engine`'s
+   * `loadRetentionConfig`) so the janitor and the `crewhaus retention` CLI
+   * enforce one policy.
+   */
   readonly sessionTtlDays?: number;
+  /**
+   * Session ids never evicted, however old — `.crewhaus/retention.json`'s
+   * `pins`, threaded into session-store's `evictExpiredSessions`.
+   */
+  readonly pinnedSessionIds?: ReadonlyArray<string>;
   /**
    * Most recent N session logs scanned per root for orphaned tool_use
    * entries. Bounds the sweep on long-lived hosts. Default 20; 0 disables
@@ -183,15 +214,48 @@ export function createJanitor(opts: CreateJanitorOptions = {}): Janitor {
   const now = opts.now ?? (() => new Date());
   // Same non-tenant fallback chain as `resolveSessionRootDir` (the janitor
   // runs at boot, outside any tenant scope; a cycle-free inline keeps this
-  // module import-independent of index.ts).
-  const rootDirs: ReadonlyArray<string> =
+  // module import-independent of index.ts). With a `tenantsRootDir` the
+  // single-root fallback is skipped — a tenant-scoped daemon has no
+  // non-tenant session root to sweep.
+  const staticRootDirs: ReadonlyArray<string> =
     opts.sessionRootDirs !== undefined && opts.sessionRootDirs.length > 0
       ? opts.sessionRootDirs
-      : [process.env["CREWHAUS_SESSION_DIR"] ?? DEFAULT_ROOT_DIR];
+      : opts.tenantsRootDir !== undefined
+        ? []
+        : [process.env["CREWHAUS_SESSION_DIR"] ?? DEFAULT_ROOT_DIR];
   const orphanScanLimit = opts.orphanScanLimit ?? DEFAULT_ORPHAN_SCAN_LIMIT;
   const orphanQuietPeriodMs = opts.orphanQuietPeriodMs ?? DEFAULT_ORPHAN_QUIET_PERIOD_MS;
 
-  let reservationsCleared = false;
+  /**
+   * The roots to sweep THIS run: the static list plus — when a
+   * `tenantsRootDir` is configured — `<tenantsRootDir>/<subdir>/sessions`
+   * for every subdirectory, re-enumerated each run so fallback tenants that
+   * first authenticated after boot are covered (ops-review F6).
+   */
+  async function resolveRootDirs(): Promise<ReadonlyArray<string>> {
+    if (opts.tenantsRootDir === undefined) return staticRootDirs;
+    const merged = new Map<string, string>();
+    for (const dir of staticRootDirs) merged.set(resolve(dir), dir);
+    let entries: Dirent[];
+    try {
+      entries = await readdir(opts.tenantsRootDir, { withFileTypes: true });
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return [...merged.values()];
+      throw err;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const sessionRoot = resolve(opts.tenantsRootDir, entry.name, "sessions");
+      if (!merged.has(sessionRoot)) merged.set(sessionRoot, sessionRoot);
+    }
+    return [...merged.values()];
+  }
+
+  // Boot-only latch, set on the ATTEMPT (not on success): after the first
+  // call — succeeded or not — clearReservations() is never invoked again by
+  // this janitor. See the module header for why a retry is a hazard.
+  let reservationsClearAttempted = false;
+  let reservationsClearSucceeded = false;
   let timer: ReturnType<typeof setInterval> | undefined;
   let tickInFlight = false;
 
@@ -214,24 +278,35 @@ export function createJanitor(opts: CreateJanitorOptions = {}): Janitor {
     if (opts.budgetStore === undefined) {
       return { step, status: "skipped", detail: "no budget store provided" };
     }
-    if (reservationsCleared) {
+    if (reservationsClearAttempted) {
       // Boot-only by design: after boot there is no way to tell a leaked
-      // reservation from a live in-flight one, and re-clearing would zero
-      // live reservations (see module header).
-      return { step, status: "skipped", detail: "already cleared at boot" };
+      // reservation from a live in-flight one, and clearing would zero live
+      // reservations (see module header). This holds for a FAILED boot
+      // attempt too — by the next hourly tick traffic is flowing, so the
+      // attempt is never retried.
+      return {
+        step,
+        status: "skipped",
+        detail: reservationsClearSucceeded
+          ? "already cleared at boot"
+          : "skipped (boot-only, earlier attempt failed)",
+      };
     }
+    // Latch BEFORE the call: a throw must count as the one-and-only attempt.
+    reservationsClearAttempted = true;
     await opts.budgetStore.clearReservations();
-    reservationsCleared = true;
+    reservationsClearSucceeded = true;
     return { step, status: "ok", detail: "cleared crash-leaked reservations" };
   }
 
-  async function sessionTtlEviction(): Promise<JanitorStepResult> {
+  async function sessionTtlEviction(rootDirs: ReadonlyArray<string>): Promise<JanitorStepResult> {
     const step = "session_ttl_eviction" as const;
     let evicted = 0;
     for (const rootDir of rootDirs) {
       const result = await evictExpiredSessions({
         rootDir,
         ...(opts.sessionTtlDays !== undefined ? { ttlDays: opts.sessionTtlDays } : {}),
+        ...(opts.pinnedSessionIds !== undefined ? { pinnedIds: opts.pinnedSessionIds } : {}),
         now,
       });
       evicted += result.evictedIds.length;
@@ -244,7 +319,7 @@ export function createJanitor(opts: CreateJanitorOptions = {}): Janitor {
     };
   }
 
-  async function orphanToolUseSweep(): Promise<JanitorStepResult> {
+  async function orphanToolUseSweep(rootDirs: ReadonlyArray<string>): Promise<JanitorStepResult> {
     const step = "orphan_tool_use_sweep" as const;
     if (orphanScanLimit <= 0) {
       return { step, status: "skipped", detail: "orphanScanLimit is 0" };
@@ -324,10 +399,19 @@ export function createJanitor(opts: CreateJanitorOptions = {}): Janitor {
   async function runOnce(): Promise<JanitorRunResult> {
     const startedAt = now().toISOString();
     const t0 = performance.now();
+    // Resolve the sweep roots per run — with a tenantsRootDir this discovers
+    // tenants that first appeared after boot. A throwing resolution falls
+    // back to the static roots so the run still proceeds.
+    let rootDirs: ReadonlyArray<string>;
+    try {
+      rootDirs = await resolveRootDirs();
+    } catch {
+      rootDirs = staticRootDirs;
+    }
     const steps: JanitorStepResult[] = [
       await runStep("reservation_cleanup", reservationCleanup),
-      await runStep("session_ttl_eviction", sessionTtlEviction),
-      await runStep("orphan_tool_use_sweep", orphanToolUseSweep),
+      await runStep("session_ttl_eviction", () => sessionTtlEviction(rootDirs)),
+      await runStep("orphan_tool_use_sweep", () => orphanToolUseSweep(rootDirs)),
     ];
     return { startedAt, durationMs: performance.now() - t0, steps };
   }

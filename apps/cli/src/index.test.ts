@@ -1042,18 +1042,20 @@ describe("crewhaus compliance evidence — scheduling ergonomics (item 34)", () 
     return `${now.getUTCFullYear()}-Q${Math.floor(now.getUTCMonth() / 3) + 1}`;
   })();
 
-  test("--help documents --period current, --all-frameworks, and --allow-empty", async () => {
+  test("--help documents --period current, --all-frameworks, and --fail-on-empty", async () => {
     const result = await runCli(["compliance", "evidence", "--help"]);
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("--period current");
     expect(result.stdout).toContain("--all-frameworks");
-    expect(result.stdout).toContain("--allow-empty");
+    expect(result.stdout).toContain("--fail-on-empty");
+    // --allow-empty never shipped and was removed with the default flip (F4).
+    expect(result.stdout).not.toContain("--allow-empty");
   });
 
   test("--period current resolves to the current UTC quarter in output + bundle path", async () => {
     await seedAuditLog(join(tmp, ".crewhaus", "audit"), ["policy_decision"]);
     const result = await runCli(
-      ["compliance", "evidence", "--framework", "soc2", "--period", "current", "--allow-empty"],
+      ["compliance", "evidence", "--framework", "soc2", "--period", "current"],
       { cwd: tmp },
     );
     expect(result.exitCode).toBe(0);
@@ -1063,24 +1065,41 @@ describe("crewhaus compliance evidence — scheduling ergonomics (item 34)", () 
     ).toBe(true);
   });
 
-  test("a control with 0 records exits 1 by default, naming the evidence gap", async () => {
+  test("a control with 0 records exits 0 by default with a warning naming the gap (F4)", async () => {
     // policy_decision satisfies CC6.1 only; CC6.7/CC7.2/CC7.3 collect nothing.
+    // The documented bare invocation must keep exiting 0 — the gap is warned,
+    // not fatal, unless --fail-on-empty opts into the scheduled tripwire.
     await seedAuditLog(join(tmp, ".crewhaus", "audit"), ["policy_decision"]);
     const result = await runCli(
       ["compliance", "evidence", "--framework", "soc2", "--period", "2026-Q2"],
       { cwd: tmp },
     );
-    expect(result.exitCode).toBe(1);
-    expect(result.stderr).toContain("evidence gap");
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toContain("warning: evidence gap");
     expect(result.stderr).toContain("soc2/CC6.7");
-    expect(result.stderr).toContain("--allow-empty");
+    expect(result.stderr).toContain("--fail-on-empty");
     // Bundles were still written (the non-empty ones remain valid evidence).
     expect(existsSync(join(tmp, ".crewhaus", "compliance", "soc2", "CC6.1", "2026-Q2.json"))).toBe(
       true,
     );
   });
 
-  test("a framework whose every control collected evidence exits 0 without --allow-empty", async () => {
+  test("--fail-on-empty turns the evidence gap into exit 1 (scheduled tripwire)", async () => {
+    await seedAuditLog(join(tmp, ".crewhaus", "audit"), ["policy_decision"]);
+    const result = await runCli(
+      ["compliance", "evidence", "--framework", "soc2", "--period", "2026-Q2", "--fail-on-empty"],
+      { cwd: tmp },
+    );
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("evidence gap");
+    expect(result.stderr).toContain("soc2/CC6.7");
+    // Bundles were still written (the non-empty ones remain valid evidence).
+    expect(existsSync(join(tmp, ".crewhaus", "compliance", "soc2", "CC6.1", "2026-Q2.json"))).toBe(
+      true,
+    );
+  });
+
+  test("a framework whose every control collected evidence passes --fail-on-empty silently", async () => {
     await seedAuditLog(join(tmp, ".crewhaus", "audit"), [
       "policy_decision", // CC6.1
       "secrets_rotation", // CC6.7
@@ -1088,16 +1107,17 @@ describe("crewhaus compliance evidence — scheduling ergonomics (item 34)", () 
       "gateway_request", // CC7.3
     ]);
     const result = await runCli(
-      ["compliance", "evidence", "--framework", "soc2", "--period", "2026-Q2"],
+      ["compliance", "evidence", "--framework", "soc2", "--period", "2026-Q2", "--fail-on-empty"],
       { cwd: tmp },
     );
     expect(result.exitCode).toBe(0);
+    expect(result.stderr).not.toContain("evidence gap");
   });
 
   test("--all-frameworks collects soc2 + iso27001 + hipaa in one run", async () => {
     await seedAuditLog(join(tmp, ".crewhaus", "audit"), ["policy_decision"]);
     const result = await runCli(
-      ["compliance", "evidence", "--all-frameworks", "--period", "2026-Q2", "--allow-empty"],
+      ["compliance", "evidence", "--all-frameworks", "--period", "2026-Q2"],
       { cwd: tmp },
     );
     expect(result.exitCode).toBe(0);
@@ -1216,5 +1236,74 @@ describe("crewhaus retention (item 35)", () => {
     const badBefore = await runCli(["retention", "purge", "--before", "not-a-date", "--dir", tmp]);
     expect(badBefore.exitCode).toBe(1);
     expect(badBefore.stderr).toContain('invalid --before "not-a-date"');
+  });
+
+  test("purge --dry-run via the CLI leaves files intact and appends no evidence (F1 BLOCKER)", async () => {
+    // Verified-by-execution regression: this exact invocation used to
+    // perform a REAL purge.
+    const file = seedExpiredSession(tmp, "sess_1111111111111111", 40);
+    const result = await runCli(["retention", "purge", "--dry-run", "--dir", tmp]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("(dry run)");
+    expect(result.stdout).toContain("would delete session:sess_1111111111111111");
+    expect(result.stdout).toContain("dry run: nothing deleted, no evidence appended");
+    expect(existsSync(file)).toBe(true);
+    expect(existsSync(join(tmp, ".crewhaus", "audit"))).toBe(false);
+  });
+
+  test("export --dry-run via the CLI writes nothing (F1)", async () => {
+    seedExpiredSession(tmp, "sess_1111111111111111", 40);
+    const outDir = join(tmp, "gdpr-export");
+    const result = await runCli(["retention", "export", outDir, "--dry-run", "--dir", tmp]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("(dry run)");
+    expect(result.stdout).toContain("would export 1 session(s)");
+    expect(result.stdout).toContain("dry run — nothing written, no evidence appended");
+    expect(existsSync(outDir)).toBe(false);
+    expect(existsSync(join(tmp, ".crewhaus", "audit"))).toBe(false);
+  });
+
+  test("filter flags on unsupported actions are REJECTED, not silently ignored (F1)", async () => {
+    const file = seedExpiredSession(tmp, "sess_1111111111111111", 40);
+
+    // --since is export-only.
+    for (const action of ["sweep", "purge"]) {
+      const r = await runCli(["retention", action, "--since", "2026-01-01", "--dir", tmp]);
+      expect(r.exitCode).toBe(1);
+      expect(r.stderr).toContain(`--since is not supported by "retention ${action}"`);
+    }
+    // --before is purge-only.
+    const sweepBefore = await runCli([
+      "retention",
+      "sweep",
+      "--before",
+      "2026-01-01",
+      "--dir",
+      tmp,
+    ]);
+    expect(sweepBefore.exitCode).toBe(1);
+    expect(sweepBefore.stderr).toContain('--before is not supported by "retention sweep"');
+    const exportBefore = await runCli([
+      "retention",
+      "export",
+      join(tmp, "out"),
+      "--before",
+      "2026-01-01",
+      "--dir",
+      tmp,
+    ]);
+    expect(exportBefore.exitCode).toBe(1);
+    expect(exportBefore.stderr).toContain('--before is not supported by "retention export"');
+    // Every rejected invocation deleted/exported nothing.
+    expect(existsSync(file)).toBe(true);
+    expect(existsSync(join(tmp, "out"))).toBe(false);
+  });
+
+  test("export refuses <root>/.crewhaus as outDir (F5 containment)", async () => {
+    seedExpiredSession(tmp, "sess_1111111111111111", 40);
+    const result = await runCli(["retention", "export", join(tmp, ".crewhaus"), "--dir", tmp]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("overlaps the live store");
+    expect(existsSync(join(tmp, ".crewhaus", "sessions", "sess_1111111111111111.json"))).toBe(true);
   });
 });

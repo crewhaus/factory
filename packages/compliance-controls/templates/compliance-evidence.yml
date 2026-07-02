@@ -3,9 +3,11 @@
 # This is a TEMPLATE, not an active workflow: copy it into your deployment
 # repository's `.github/workflows/` and edit the <PLACEHOLDER> comments.
 # One cron line then collects SOC 2 / ISO 27001 / HIPAA evidence bundles for
-# the CURRENT quarter across EVERY registered framework — and fails loudly
-# (non-zero) when any control collected zero records, so an evidence gap
-# trips the schedule instead of surfacing at audit time.
+# the CURRENT quarter across EVERY registered framework — and, via
+# --fail-on-empty, fails loudly (non-zero) when any control collected zero
+# records, so an evidence gap trips the schedule instead of surfacing at
+# audit time. (Without the flag, bare interactive runs exit 0 and only WARN
+# about empty controls.)
 #
 # Prerequisites:
 #   - The runner can reach your audit-log root (`.crewhaus/audit`). Audit logs
@@ -51,8 +53,10 @@ jobs:
         run: crewhaus audit verify --dir .crewhaus/audit
 
       - name: Collect evidence for every framework, current quarter
-        # Exits non-zero when any control collected 0 records (evidence gap).
-        # Append --allow-empty ONLY if quiet periods are expected for your
+        # --fail-on-empty is the scheduled-run tripwire: the job exits
+        # non-zero when any control collected 0 records (evidence gap), so
+        # the cron fails loudly NOW instead of the gap surfacing at audit
+        # time. Drop the flag ONLY if quiet periods are expected for your
         # deployment. Scope with --framework <id> to collect one framework.
         env:
           # <SIGNING-KEY> Set this secret to HMAC-sign the bundles; delete the
@@ -62,6 +66,7 @@ jobs:
           crewhaus compliance evidence --all-frameworks --period current
           --audit-dir .crewhaus/audit --out-dir .crewhaus/compliance
           --signing-key-env CREWHAUS_COMPLIANCE_SIGNING_KEY
+          --fail-on-empty
 
       - name: Upload evidence bundles
         # <RETENTION> Match retention-days to your compliance program's

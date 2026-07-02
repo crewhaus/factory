@@ -320,9 +320,11 @@ const COMPLIANCE_SCHEMA: ParseArgsSchema = {
     { name: "audit-dir", takesValue: true },
     { name: "out-dir", takesValue: true },
     { name: "signing-key-env", takesValue: true },
-    // Item 34 — opt out of the empty-evidence gate (a control with 0 records
-    // exits 1 by default so scheduled runs surface evidence gaps loudly).
-    { name: "allow-empty", takesValue: false },
+    // Item 34 / ops-review F4 — opt IN to the empty-evidence tripwire: with
+    // this flag a control that collected 0 records exits 1 (for scheduled
+    // runs); the default is exit 0 with a warning so documented bare
+    // invocations keep working.
+    { name: "fail-on-empty", takesValue: false },
     { name: "help", short: "h" },
   ],
 };
@@ -464,15 +466,15 @@ function usageText(): string {
     "  compliance evidence                  collect SOC 2 / ISO 27001 / HIPAA evidence (Section 39)",
     "       (--framework <id> | --all-frameworks) [--control <id>]",
     "       --period <p>|current [--audit-dir <d>] [--out-dir <d>]",
-    "       [--signing-key-env <ENV>] [--allow-empty]",
+    "       [--signing-key-env <ENV>] [--fail-on-empty]",
     "  audit verify [--dir <auditDir>]      verify the hash-chained audit log (tamper check)",
     "       [--anchor file:<path>]          cross-check an append-only file anchor store",
     "  retention sweep [--dry-run]          scheduled GDPR/TTL enforcement over .crewhaus stores",
     "       [--dir <root>]                  (sessions expire by .crewhaus/retention.json; audit is export-only)",
     "  retention export <outDir>            right-to-export: copy session/audit records out",
-    "       [--since <date>] [--dir <root>]",
+    "       [--since <date>] [--dry-run] [--dir <root>]",
     "  retention purge [--before <date>]    right-to-delete: purge expired records now",
-    "       [--dir <root>]",
+    "       [--dry-run] [--dir <root>]",
     "  version                              print the CLI version (also: --version, -v)",
     "",
   ].join("\n");
@@ -2879,10 +2881,13 @@ async function runAuditVerify(args: ParsedArgs): Promise<void> {
  *     [--signing-key-env CREWHAUS_COMPLIANCE_SIGNING_KEY]
  *
  * Item 34 scheduling ergonomics: `--period current` resolves the current UTC
- * quarter, `--all-frameworks` loops every registered framework, and any
- * control that collects 0 records fails the run (exit 1) unless
- * `--allow-empty` — so one cron line can collect everything, every quarter,
- * and an evidence gap trips the schedule instead of hiding until audit time.
+ * quarter and `--all-frameworks` loops every registered framework, so one
+ * cron line can collect everything, every quarter. A control that collects 0
+ * records is always REPORTED as an evidence gap; with `--fail-on-empty` it
+ * also fails the run (exit 1) so a scheduled run trips loudly instead of
+ * hiding the gap until audit time. The default stays exit 0 with a warning
+ * (ops-review F4): bare `crewhaus compliance evidence ...` invocations are
+ * documented externally and must not start failing on quiet periods.
  */
 async function runCompliance(args: ParsedArgs, action: string): Promise<void> {
   if (args.flags["help"]) {
@@ -2890,12 +2895,13 @@ async function runCompliance(args: ParsedArgs, action: string): Promise<void> {
       "usage:\n" +
         "  crewhaus compliance evidence (--framework <id> | --all-frameworks)\n" +
         "    [--control <id>] --period <p>|current [--audit-dir <d>] [--out-dir <d>]\n" +
-        "    [--signing-key-env <ENV>] [--allow-empty]\n" +
+        "    [--signing-key-env <ENV>] [--fail-on-empty]\n" +
         '  --period current    resolve the current UTC quarter (e.g. "2026-Q3") so a\n' +
         "                      scheduled run never hardcodes a stale label\n" +
         "  --all-frameworks    collect every registered framework in one run\n" +
-        "  --allow-empty       exit 0 even when a control collected 0 records; by\n" +
-        "                      default an empty control is an evidence gap (exit 1)\n",
+        "  --fail-on-empty     exit 1 when any control collected 0 records — the\n" +
+        "                      tripwire for scheduled/cron runs. Default: exit 0 with\n" +
+        "                      a warning naming each empty control (evidence gap)\n",
     );
     return;
   }
@@ -2983,14 +2989,22 @@ async function runCompliance(args: ParsedArgs, action: string): Promise<void> {
     );
   }
 
-  // Item 34 — the empty-evidence gate. A control that collected 0 records is
-  // a gap an auditor cannot be shown evidence for; a scheduled run must fail
-  // loudly NOW rather than let the gap surface at audit time. Bundles are
-  // still written above (the non-empty ones remain valid evidence).
+  // Item 34 / ops-review F4 — the empty-evidence gate. A control that
+  // collected 0 records is a gap an auditor cannot be shown evidence for, so
+  // it is ALWAYS reported. `--fail-on-empty` (the scheduled/cron tripwire —
+  // the shipped compliance-evidence.yml template passes it) turns the report
+  // into exit 1 so the gap trips the schedule NOW instead of surfacing at
+  // audit time; the bare-invocation default stays exit 0 with a warning, so
+  // externally documented interactive usage keeps working. Bundles are still
+  // written above either way (the non-empty ones remain valid evidence).
   const empty = findEmptyControls(bundles);
-  if (empty.length > 0 && args.flags["allow-empty"] !== true) {
-    die(
-      `evidence gap — ${empty.length} control(s) collected 0 records for ${period}: ${empty.join(", ")} (pass --allow-empty to permit an empty period)`,
+  if (empty.length > 0) {
+    const gap = `evidence gap — ${empty.length} control(s) collected 0 records for ${period}: ${empty.join(", ")}`;
+    if (args.flags["fail-on-empty"] === true) {
+      die(`${gap} (--fail-on-empty)`);
+    }
+    process.stderr.write(
+      `crewhaus: warning: ${gap} (pass --fail-on-empty to make this fail scheduled runs)\n`,
     );
   }
 }
@@ -3066,9 +3080,14 @@ async function runSandbox(args: ParsedArgs, action: string): Promise<void> {
  *                             as session-store's list() eviction), honoring
  *                             `.crewhaus/retention.json` pins + audit windows.
  *   export <outDir> [--since] right-to-export: copy matching records out as
- *                             raw files (originals untouched).
+ *          [--dry-run]        raw files (originals untouched).
  *   purge  [--before <date>]  right-to-delete: same rules as sweep, restricted
- *                             to records older than the cutoff.
+ *          [--dry-run]        to records older than the cutoff.
+ *
+ * `--dry-run` is honored by EVERY action (ops-review F1): report-only, no
+ * deletion, no files written, no audit evidence. Filter flags are per-action
+ * (`--since` export-only, `--before` purge-only) and rejected — never
+ * silently ignored — elsewhere.
  *
  * Audit data (`.crewhaus/audit`) is enumerated + exportable but NEVER deleted:
  * audit-log's verify() hash chain spans every day file, so deleting any record
@@ -3083,8 +3102,8 @@ async function runRetention(args: ParsedArgs, action: string): Promise<void> {
     process.stdout.write(
       "usage:\n" +
         "  crewhaus retention sweep [--dry-run] [--dir <root>]\n" +
-        "  crewhaus retention export <outDir> [--since <date>] [--dir <root>]\n" +
-        "  crewhaus retention purge [--before <date>] [--dir <root>]\n" +
+        "  crewhaus retention export <outDir> [--since <date>] [--dry-run] [--dir <root>]\n" +
+        "  crewhaus retention purge [--before <date>] [--dry-run] [--dir <root>]\n" +
         "  Enforces .crewhaus/retention.json over the harness stores:\n" +
         "    sessions (.crewhaus/sessions)  expire by file mtime after sessions.maxAgeDays\n" +
         "                                   (default 30, session-store's TTL); pinned ids survive\n" +
@@ -3093,18 +3112,36 @@ async function runRetention(args: ParsedArgs, action: string): Promise<void> {
         "                                   Export-only.\n" +
         "  Active auditWindows in the config defer ALL deletion. Real runs append a\n" +
         "  retention_enforcement record to .crewhaus/audit; --dry-run appends nothing.\n" +
-        "  --dry-run          report what would be deleted/kept and why; delete nothing\n" +
+        "  --dry-run          report what the action would do; touch nothing on disk\n" +
+        "                     (sweep/purge: delete nothing; export: write nothing)\n" +
         "  --dir <root>       harness root directory (default: cwd)\n" +
-        "  --since <date>     export only records at/after this ISO date\n" +
-        "  --before <date>    purge only records older than this ISO date\n",
+        "  --since <date>     export only: records at/after this ISO date\n" +
+        "  --before <date>    purge only: records older than this ISO date\n" +
+        "  A flag on an action that does not support it is an error, never silently\n" +
+        "  ignored (--since is export-only; --before is purge-only).\n",
     );
     return;
   }
   const dirFlag = args.flags["dir"];
   const rootDir = typeof dirFlag === "string" ? resolve(dirFlag) : process.cwd();
+  const dryRun = args.flags["dry-run"] === true;
+  const sinceFlag = args.flags["since"];
+  const beforeFlag = args.flags["before"];
+  // Ops-review F1: an accepted-and-ignored filter flag is a trap — an
+  // operator who typed `sweep --before <date>` believed they bounded the
+  // deletion set. Unsupported combos are rejected per action.
+  if (typeof sinceFlag === "string" && action !== "export") {
+    die(
+      `--since is not supported by "retention ${action}" — it filters exports only (use "retention purge --before <date>" to bound deletion)`,
+    );
+  }
+  if (typeof beforeFlag === "string" && action !== "purge") {
+    die(
+      `--before is not supported by "retention ${action}" — it bounds purges only (use "retention export --since <date>" to filter an export)`,
+    );
+  }
   try {
     if (action === "sweep") {
-      const dryRun = args.flags["dry-run"] === true;
       const report = await runRetentionSweep({ rootDir, dryRun });
       process.stdout.write(`retention sweep: ${rootDir}${dryRun ? " (dry run)" : ""}\n`);
       for (const line of formatEnforcementReport(report)) {
@@ -3115,29 +3152,31 @@ async function runRetention(args: ParsedArgs, action: string): Promise<void> {
     if (action === "export") {
       const outDir = args.positional[0];
       if (typeof outDir !== "string") die("missing <outDir>");
-      const sinceFlag = args.flags["since"];
       const since =
         typeof sinceFlag === "string" ? parseRetentionDate("--since", sinceFlag) : undefined;
       const report = await runRetentionExport({
         rootDir,
         outDir,
+        dryRun,
         ...(since !== undefined ? { since } : {}),
       });
-      process.stdout.write(`retention export: ${rootDir} → ${report.outDir}\n`);
+      process.stdout.write(
+        `retention export: ${rootDir} → ${report.outDir}${dryRun ? " (dry run)" : ""}\n`,
+      );
       for (const line of formatExportReport(report)) {
         process.stdout.write(`  ${line}\n`);
       }
       return;
     }
     // Dispatch guarantees: action === "purge".
-    const beforeFlag = args.flags["before"];
     const before =
       typeof beforeFlag === "string" ? parseRetentionDate("--before", beforeFlag) : undefined;
     const report = await runRetentionPurge({
       rootDir,
+      dryRun,
       ...(before !== undefined ? { before } : {}),
     });
-    process.stdout.write(`retention purge: ${rootDir}\n`);
+    process.stdout.write(`retention purge: ${rootDir}${dryRun ? " (dry run)" : ""}\n`);
     for (const line of formatEnforcementReport(report)) {
       process.stdout.write(`  ${line}\n`);
     }

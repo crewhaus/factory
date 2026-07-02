@@ -1,14 +1,32 @@
 import { existsSync } from "node:fs";
-import { copyFile, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { copyFile, mkdir, readdir, stat, writeFile } from "node:fs/promises";
+import { join, resolve, sep } from "node:path";
 import { type AuditRecord, openAuditLog } from "@crewhaus/audit-log";
 import {
   type PurgeResult,
+  RETENTION_CONFIG_RELPATH,
   type RecordStore,
+  type RetentionConfig,
+  RetentionConfigError,
   type RetentionRecord,
+  SESSION_ID_REGEX,
   createDataRetentionEngine,
+  loadRetentionConfig,
 } from "@crewhaus/data-retention-engine";
-import { DEFAULT_TTL_DAYS, createSessionStore } from "@crewhaus/session-store";
+import { createSessionStore } from "@crewhaus/session-store";
+
+// Config loading lives in @crewhaus/data-retention-engine (retention-config.ts)
+// so the daemon janitors read the IDENTICAL policy this CLI enforces
+// (ops-review F2). Re-exported here so callers/tests of this module keep one
+// import surface.
+export {
+  DEFAULT_SESSION_MAX_AGE_DAYS,
+  RETENTION_CONFIG_RELPATH,
+  type RetentionAuditWindowConfig,
+  type RetentionConfig,
+  RetentionConfigError,
+  loadRetentionConfig,
+} from "@crewhaus/data-retention-engine";
 
 /**
  * Item 35 — `crewhaus retention sweep|export|purge` plumbing, factored out of
@@ -36,30 +54,21 @@ import { DEFAULT_TTL_DAYS, createSessionStore } from "@crewhaus/session-store";
  *
  *   2. `.crewhaus/retention.json` — the engine's policies/windows/pins are
  *      purely programmatic (in-memory maps on the engine instance), so the
- *      CLI reads this tiny config file. Schema (all keys optional):
- *
- *        {
- *          "version": 1,
- *          "sessions": { "maxAgeDays": 30 },   // default: session-store's
- *                                              // DEFAULT_TTL_DAYS (30)
- *          "pins": ["sess_0123456789abcdef"],  // session ids never deleted
- *          "auditWindows": [                   // active windows defer ALL
- *            {                                 // deletion (compliance-controls
- *              "frameworkId": "soc2",          // evidence collection in flight)
- *              "controlId": "CC6.1",
- *              "expiresAt": "2026-08-01T00:00:00Z"
- *            }
- *          ]
- *        }
- *
- *      `sessions.maxAgeDays` becomes an engine `retain()` policy, `pins`
- *      become adapter deletion refusals, and `auditWindows` become
- *      `addAuditWindow()` registrations (already-expired entries are ignored).
+ *      config file is read via `@crewhaus/data-retention-engine`'s exported
+ *      `loadRetentionConfig` (schema + safety stance live there, in
+ *      retention-config.ts; the daemon janitors read the SAME file with the
+ *      SAME parser). `sessions.maxAgeDays` becomes an engine `retain()`
+ *      policy, `pins` become adapter deletion refusals, and `auditWindows`
+ *      become `addAuditWindow()` registrations (already-expired entries are
+ *      ignored).
  *
  *   3. Evidence: every REAL (non-dry-run) sweep/export/purge appends one
  *      `retention_enforcement` record to `.crewhaus/audit` — the same
  *      hash-chained store the `run` justification gate writes — so retention
- *      enforcement is itself tamper-evidenced. Dry runs append nothing.
+ *      enforcement is itself tamper-evidenced. Dry runs append nothing. A
+ *      no-op run against a directory with no existing audit store also
+ *      appends nothing: fabricating `.crewhaus/audit` just to log that
+ *      nothing happened would litter arbitrary directories (ops-review F8b).
  *
  * Tenancy: `AuditRecord` carries no tenantId and sessions are per-directory,
  * so everything here operates on the single local tenant (`LOCAL_TENANT`).
@@ -69,7 +78,6 @@ import { DEFAULT_TTL_DAYS, createSessionStore } from "@crewhaus/session-store";
  * orphaned event log), SKIP the entry and report it — never delete.
  */
 
-export const RETENTION_CONFIG_RELPATH = ".crewhaus/retention.json";
 const SESSIONS_RELPATH = ".crewhaus/sessions";
 const AUDIT_RELPATH = ".crewhaus/audit";
 
@@ -84,7 +92,6 @@ const MS_PER_DAY = 86_400_000;
  */
 const NEVER_EXPIRE_DAYS = 36_500;
 
-const SESSION_ID_REGEX = /^sess_[0-9a-f]{16}$/;
 const AUDIT_DAY_FILE_REGEX = /^(\d{4})-(\d{2})-(\d{2})\.jsonl$/;
 const CHAIN_TAIL_FILENAME = "_chain-tail.json";
 
@@ -98,14 +105,6 @@ export const AUDIT_CHAIN_EXCLUSION_REASON =
   "hash chain (prevHash from GENESIS in the oldest file, seq gapless from 0 across " +
   "files), so deleting any record OR any whole day file — even the oldest — breaks " +
   "verification of every surviving record after the gap";
-
-/** Thrown on a malformed `.crewhaus/retention.json` (and on an export outDir
- *  that would write into a store). The CLI entry file catches it and routes
- *  the message through `die()`; tests assert on `.message` without the
- *  process exiting. */
-export class RetentionConfigError extends Error {
-  override readonly name = "RetentionConfigError";
-}
 
 /** Thrown by `parseRetentionDate` on an unparseable `--since`/`--before`. */
 export class InvalidRetentionDateError extends Error {
@@ -122,128 +121,6 @@ export function parseRetentionDate(flag: string, value: string): number {
   const ms = Date.parse(value);
   if (Number.isNaN(ms)) throw new InvalidRetentionDateError(flag, value);
   return ms;
-}
-
-export type RetentionAuditWindowConfig = {
-  readonly frameworkId: string;
-  readonly controlId: string;
-  /** Epoch ms (parsed from the file's ISO string or numeric value). */
-  readonly expiresAt: number;
-};
-
-export type RetentionConfig = {
-  /** Max session age in days before the sweep deletes it (mtime-keyed). */
-  readonly sessionMaxAgeDays: number;
-  /** Session ids (`sess_<16 hex>`) the adapter refuses to delete. */
-  readonly pins: ReadonlyArray<string>;
-  /** Declared audit windows; expired entries are dropped at load. */
-  readonly auditWindows: ReadonlyArray<RetentionAuditWindowConfig>;
-  /** Whether `.crewhaus/retention.json` existed (defaults were used if not). */
-  readonly fromFile: boolean;
-};
-
-function isRecord(v: unknown): v is Record<string, unknown> {
-  return typeof v === "object" && v !== null && !Array.isArray(v);
-}
-
-/**
- * Load `.crewhaus/retention.json` from `rootDir`, falling back to defaults
- * (sessions at session-store's DEFAULT_TTL_DAYS, no pins, no windows) when the
- * file is absent. A malformed file throws `RetentionConfigError` — a sweep
- * that half-understands its policy must not guess.
- */
-export async function loadRetentionConfig(
-  rootDir: string,
-  now: () => number = () => Date.now(),
-): Promise<RetentionConfig> {
-  const path = join(rootDir, RETENTION_CONFIG_RELPATH);
-  let raw: string;
-  try {
-    raw = await readFile(path, "utf8");
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
-      return { sessionMaxAgeDays: DEFAULT_TTL_DAYS, pins: [], auditWindows: [], fromFile: false };
-    }
-    throw err;
-  }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch (err) {
-    throw new RetentionConfigError(`${path}: malformed JSON — ${(err as Error).message}`);
-  }
-  if (!isRecord(parsed)) {
-    throw new RetentionConfigError(`${path}: expected a JSON object at the root`);
-  }
-
-  let sessionMaxAgeDays = DEFAULT_TTL_DAYS;
-  if (parsed["sessions"] !== undefined) {
-    if (!isRecord(parsed["sessions"])) {
-      throw new RetentionConfigError(`${path}: "sessions" must be an object`);
-    }
-    const maxAge = parsed["sessions"]["maxAgeDays"];
-    if (maxAge !== undefined) {
-      if (typeof maxAge !== "number" || !Number.isFinite(maxAge) || maxAge <= 0) {
-        throw new RetentionConfigError(
-          `${path}: "sessions.maxAgeDays" must be a finite number > 0 (got ${JSON.stringify(maxAge)})`,
-        );
-      }
-      sessionMaxAgeDays = maxAge;
-    }
-  }
-
-  const pins: string[] = [];
-  if (parsed["pins"] !== undefined) {
-    if (!Array.isArray(parsed["pins"])) {
-      throw new RetentionConfigError(`${path}: "pins" must be an array of session ids`);
-    }
-    for (const pin of parsed["pins"]) {
-      if (typeof pin !== "string" || !SESSION_ID_REGEX.test(pin)) {
-        throw new RetentionConfigError(
-          `${path}: pin ${JSON.stringify(pin)} is not a session id (expected sess_<16 hex>)`,
-        );
-      }
-      pins.push(pin);
-    }
-  }
-
-  const auditWindows: RetentionAuditWindowConfig[] = [];
-  if (parsed["auditWindows"] !== undefined) {
-    if (!Array.isArray(parsed["auditWindows"])) {
-      throw new RetentionConfigError(`${path}: "auditWindows" must be an array`);
-    }
-    for (const w of parsed["auditWindows"]) {
-      if (
-        !isRecord(w) ||
-        typeof w["frameworkId"] !== "string" ||
-        typeof w["controlId"] !== "string"
-      ) {
-        throw new RetentionConfigError(
-          `${path}: each auditWindow needs string "frameworkId" + "controlId" + "expiresAt"`,
-        );
-      }
-      const rawExpires = w["expiresAt"];
-      const expiresAt =
-        typeof rawExpires === "number" ? rawExpires : Date.parse(String(rawExpires));
-      if (!Number.isFinite(expiresAt)) {
-        throw new RetentionConfigError(
-          `${path}: auditWindow ${w["frameworkId"]}/${w["controlId"]} has an unparseable "expiresAt"`,
-        );
-      }
-      // Already-expired windows are dropped here (the engine's addAuditWindow
-      // throws on a past expiry — a stale config entry should stop deferring,
-      // not brick the sweep).
-      if (expiresAt > now()) {
-        auditWindows.push({
-          frameworkId: w["frameworkId"],
-          controlId: w["controlId"],
-          expiresAt,
-        });
-      }
-    }
-  }
-
-  return { sessionMaxAgeDays, pins, auditWindows, fromFile: true };
 }
 
 export type SkippedEntry = { readonly path: string; readonly reason: string };
@@ -563,7 +440,14 @@ async function runRetentionEnforcement(
   const keptPinned = store.refusals.filter((r) => r.id.startsWith("session:"));
 
   let evidence: EvidenceRef | undefined;
-  if (!opts.dryRun) {
+  // Evidence gating (ops-review F8b): dry runs never append. A REAL run
+  // appends when it deleted something (enforcement happened — evidence it,
+  // creating the audit store if this harness lacked one) or when an audit
+  // store already exists to receive the record. A no-op run in a directory
+  // with no audit store appends nothing — `crewhaus retention sweep` in an
+  // arbitrary directory must not fabricate `.crewhaus/audit`.
+  const auditStoreExists = existsSync(join(rootDir, AUDIT_RELPATH));
+  if (!opts.dryRun && (store.deletions.length > 0 || auditStoreExists)) {
     evidence = await appendEvidence(rootDir, opts.now, {
       action: opts.action,
       dryRun: false,
@@ -646,6 +530,10 @@ export type RunRetentionPurgeOptions = {
   /** Only records with createdAt strictly BEFORE this epoch-ms cutoff are
    *  candidates. Omitted = every expired record (same coverage as sweep). */
   readonly before?: number;
+  /** Report what WOULD be purged; delete nothing, append no evidence.
+   *  (Ops-review F1: `--dry-run` used to be accepted-and-ignored here — a
+   *  dry run that really deletes is the worst possible failure mode.) */
+  readonly dryRun?: boolean;
   readonly now?: () => number;
 };
 
@@ -661,7 +549,7 @@ export async function runRetentionPurge(
   return runRetentionEnforcement({
     rootDir: opts.rootDir,
     action: "purge",
-    dryRun: false,
+    dryRun: opts.dryRun === true,
     ...(opts.before !== undefined ? { before: opts.before } : {}),
     now: opts.now ?? (() => Date.now()),
   });
@@ -670,10 +558,11 @@ export async function runRetentionPurge(
 export type RetentionExportReport = {
   readonly rootDir: string;
   readonly outDir: string;
+  readonly dryRun: boolean;
   readonly since?: number;
-  /** Session ids whose files were copied. */
+  /** Session ids whose files were copied (dry run: WOULD be copied). */
   readonly sessions: ReadonlyArray<string>;
-  /** Audit day labels whose files were copied. */
+  /** Audit day labels whose files were copied (dry run: WOULD be copied). */
   readonly auditDays: ReadonlyArray<string>;
   /**
    * True when the export covered EVERY audit day file and the on-host
@@ -681,10 +570,13 @@ export type RetentionExportReport = {
    * is then independently verifiable with `crewhaus audit verify --dir
    * <outDir>/audit`. A `--since`-filtered (partial) export omits the anchor:
    * its chain starts mid-stream and would fail verification by construction.
+   * (Dry run: whether the anchor WOULD be copied.)
    */
   readonly chainTailCopied: boolean;
   readonly skipped: ReadonlyArray<SkippedEntry>;
-  readonly evidence: EvidenceRef;
+  /** The appended `retention_enforcement` record. Absent on a dry run, and
+   *  on a real no-op export against a harness with no audit store (F8b). */
+  readonly evidence?: EvidenceRef;
 };
 
 export type RunRetentionExportOptions = {
@@ -694,8 +586,16 @@ export type RunRetentionExportOptions = {
    *  mtime; audit at day granularity — a day is included when any instant of
    *  it is >= since, an inclusive over-approximation). */
   readonly since?: number;
+  /** Report what WOULD be exported; write nothing (no outDir, no manifest),
+   *  append no audit evidence. */
+  readonly dryRun?: boolean;
   readonly now?: () => number;
 };
+
+/** True when `a` equals `b`, or either path contains the other. */
+function pathsOverlap(a: string, b: string): boolean {
+  return a === b || a.startsWith(`${b}${sep}`) || b.startsWith(`${a}${sep}`);
+}
 
 /**
  * `crewhaus retention export` — the right-to-export verb. Copies matching
@@ -714,14 +614,24 @@ export async function runRetentionExport(
 ): Promise<RetentionExportReport> {
   const rootDir = resolve(opts.rootDir);
   const outDir = resolve(opts.outDir);
+  const dryRun = opts.dryRun === true;
   const now = opts.now ?? (() => Date.now());
   const sessionsDir = join(rootDir, SESSIONS_RELPATH);
   const auditDir = join(rootDir, AUDIT_RELPATH);
-  for (const storeDir of [sessionsDir, auditDir]) {
-    if (outDir === storeDir || outDir.startsWith(`${storeDir}/`)) {
-      throw new RetentionConfigError(
-        `export outDir ${outDir} is inside the ${storeDir} store — refusing to write records into the store being exported`,
-      );
+  const sessionsOut = join(outDir, "sessions");
+  const auditOut = join(outDir, "audit");
+  // Containment (ops-review F5): refuse any outDir whose RESOLVED output
+  // paths (outDir itself, <outDir>/sessions, <outDir>/audit) equal, sit
+  // inside, or CONTAIN a live store. The classic foot-gun is
+  // `retention export <root>/.crewhaus`, whose sessions/audit outputs are
+  // exactly the live stores — a self-copy onto the data being exported.
+  for (const outPath of [outDir, sessionsOut, auditOut]) {
+    for (const storeDir of [sessionsDir, auditDir]) {
+      if (pathsOverlap(outPath, storeDir)) {
+        throw new RetentionConfigError(
+          `export output path ${outPath} overlaps the live store ${storeDir} — refusing to write export output onto the store being exported`,
+        );
+      }
     }
   }
 
@@ -729,47 +639,70 @@ export async function runRetentionExport(
   const matchesSince = (createdAt: number): boolean =>
     opts.since === undefined || createdAt >= opts.since;
 
-  const sessionsOut = join(outDir, "sessions");
   const exportedSessions: string[] = [];
   for (const s of store.sessions) {
     if (!matchesSince(s.record.createdAt)) continue;
-    await mkdir(sessionsOut, { recursive: true });
-    await copyFile(s.jsonPath, join(sessionsOut, `${s.sessionId}.json`));
-    if (s.eventLogPath !== undefined) {
-      await copyFile(s.eventLogPath, join(sessionsOut, `${s.sessionId}.jsonl`));
+    if (!dryRun) {
+      await mkdir(sessionsOut, { recursive: true });
+      await copyFile(s.jsonPath, join(sessionsOut, `${s.sessionId}.json`));
+      if (s.eventLogPath !== undefined) {
+        await copyFile(s.eventLogPath, join(sessionsOut, `${s.sessionId}.jsonl`));
+      }
     }
     exportedSessions.push(s.sessionId);
   }
 
-  const auditOut = join(outDir, "audit");
   const exportedDays: string[] = [];
   for (const a of store.auditDays) {
     if (!matchesSince(a.record.createdAt)) continue;
-    await mkdir(auditOut, { recursive: true });
-    await copyFile(a.path, join(auditOut, `${a.day}.jsonl`));
+    if (!dryRun) {
+      await mkdir(auditOut, { recursive: true });
+      await copyFile(a.path, join(auditOut, `${a.day}.jsonl`));
+    }
     exportedDays.push(a.day);
   }
   const complete = exportedDays.length === store.auditDays.length && exportedDays.length > 0;
   const chainTailPath = join(auditDir, CHAIN_TAIL_FILENAME);
   const chainTailCopied = complete && existsSync(chainTailPath);
-  if (chainTailCopied) {
+  if (chainTailCopied && !dryRun) {
     await copyFile(chainTailPath, join(auditOut, CHAIN_TAIL_FILENAME));
   }
 
+  // Dry run (ops-review F1): report what WOULD be exported and stop — no
+  // outDir, no manifest, no audit evidence, nothing on disk at all.
+  if (dryRun) {
+    return {
+      rootDir,
+      outDir,
+      dryRun: true,
+      ...(opts.since !== undefined ? { since: opts.since } : {}),
+      sessions: exportedSessions,
+      auditDays: exportedDays,
+      chainTailCopied,
+      skipped: store.skipped,
+    };
+  }
+
   // Evidence AFTER the copies: the record describes the completed export and
-  // must not appear inside the exported snapshot itself.
-  const evidence = await appendEvidence(rootDir, now, {
-    action: "export",
-    dryRun: false,
-    outDir,
-    ...(opts.since !== undefined ? { since: new Date(opts.since).toISOString() } : {}),
-    counts: {
-      sessions: exportedSessions.length,
-      auditDays: exportedDays.length,
-      skipped: store.skipped.length,
-    },
-    chainTailCopied,
-  });
+  // must not appear inside the exported snapshot itself. Gated like the
+  // enforcement verbs (ops-review F8b): appended when something was actually
+  // exported, or when an audit store already exists to receive it — a no-op
+  // export must not fabricate `.crewhaus/audit`.
+  let evidence: EvidenceRef | undefined;
+  if (exportedSessions.length + exportedDays.length > 0 || existsSync(auditDir)) {
+    evidence = await appendEvidence(rootDir, now, {
+      action: "export",
+      dryRun: false,
+      outDir,
+      ...(opts.since !== undefined ? { since: new Date(opts.since).toISOString() } : {}),
+      counts: {
+        sessions: exportedSessions.length,
+        auditDays: exportedDays.length,
+        skipped: store.skipped.length,
+      },
+      chainTailCopied,
+    });
+  }
 
   await mkdir(outDir, { recursive: true });
   await writeFile(
@@ -783,7 +716,7 @@ export async function runRetentionExport(
         auditDays: exportedDays,
         chainTailCopied,
         skipped: store.skipped,
-        evidence,
+        ...(evidence !== undefined ? { evidence } : {}),
       },
       null,
       2,
@@ -793,12 +726,13 @@ export async function runRetentionExport(
   return {
     rootDir,
     outDir,
+    dryRun: false,
     ...(opts.since !== undefined ? { since: opts.since } : {}),
     sessions: exportedSessions,
     auditDays: exportedDays,
     chainTailCopied,
     skipped: store.skipped,
-    evidence,
+    ...(evidence !== undefined ? { evidence } : {}),
   };
 }
 
@@ -849,7 +783,7 @@ export function formatEnforcementReport(report: RetentionEnforcementReport): Rea
         ? ` — evidence appended to ${AUDIT_RELPATH} (seq ${report.evidence.seq})`
         : report.dryRun
           ? " — dry run: nothing deleted, no evidence appended"
-          : ""
+          : ` — no-op: nothing deleted and no ${AUDIT_RELPATH} store present, no evidence appended`
     }`,
   );
   return lines;
@@ -858,20 +792,30 @@ export function formatEnforcementReport(report: RetentionEnforcementReport): Rea
 /** Render an export report as the CLI's indented summary lines. */
 export function formatExportReport(report: RetentionExportReport): ReadonlyArray<string> {
   const lines: string[] = [];
+  const mark = report.dryRun ? "→" : "✓";
+  const verb = report.dryRun ? "would export" : "exported";
   lines.push(
-    `✓ exported ${report.sessions.length} session(s) → ${join(report.outDir, "sessions")}`,
+    `${mark} ${verb} ${report.sessions.length} session(s) → ${join(report.outDir, "sessions")}`,
   );
   lines.push(
-    `✓ exported ${report.auditDays.length} audit day file(s) → ${join(report.outDir, "audit")}`,
+    `${mark} ${verb} ${report.auditDays.length} audit day file(s) → ${join(report.outDir, "audit")}`,
   );
   lines.push(
     report.chainTailCopied
-      ? `✓ complete audit export — _chain-tail.json included, re-verify with: crewhaus audit verify --dir ${join(report.outDir, "audit")}`
+      ? `${mark} complete audit export — _chain-tail.json ${
+          report.dryRun ? "would be included" : "included"
+        }, re-verify with: crewhaus audit verify --dir ${join(report.outDir, "audit")}`
       : "~ partial audit export — _chain-tail.json omitted (a mid-stream chain cannot re-verify standalone)",
   );
   for (const s of report.skipped) lines.push(`~ skipped ${s.path} — ${s.reason}`);
   lines.push(
-    `summary: manifest.json written — evidence appended to ${AUDIT_RELPATH} (seq ${report.evidence.seq})`,
+    report.dryRun
+      ? "summary: dry run — nothing written, no evidence appended"
+      : `summary: manifest.json written${
+          report.evidence !== undefined
+            ? ` — evidence appended to ${AUDIT_RELPATH} (seq ${report.evidence.seq})`
+            : ` — no-op: nothing exported and no ${AUDIT_RELPATH} store present, no evidence appended`
+        }`,
   );
   return lines;
 }

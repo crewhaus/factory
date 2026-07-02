@@ -19,6 +19,12 @@ directory runs from inside the factory repo.
   2. `crewhaus audit verify --dir .crewhaus/audit` — post-sweep tamper
      tripwire over the same chain the sweep just appended to.
 
-  The companion verbs share the sweep's rules: `crewhaus retention export
-  <outDir> [--since <date>]` (right-to-export — copies records out, raw)
-  and `crewhaus retention purge [--before <date>]` (right-to-delete).
+  The companion verbs share the sweep's rules (and all honor `--dry-run`):
+  `crewhaus retention export <outDir> [--since <date>]` (right-to-export —
+  copies records out, raw) and `crewhaus retention purge [--before <date>]`
+  (right-to-delete).
+
+  **Restoring stores onto a runner? Preserve mtimes.** Retention is
+  mtime-keyed, and `aws s3 sync`-style restores stamp files with the
+  download time — the sweep then silently never fires. Use the tar-based
+  round-trip shown in the template's `<STORE>` comments.

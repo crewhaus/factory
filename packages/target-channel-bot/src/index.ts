@@ -899,6 +899,7 @@ import { registerChannelAdapter } from "@crewhaus/tool-message-channel";
 ${heartbeatImport}${builtinImportBlock}${mcpImportBlock}${subAgentImportBlock}import { createAgent } from "./agent.js";
 import { createSessionRouter } from "./session-router.js";
 import { createGateway } from "./gateway.js";
+import { loadRetentionConfig } from "@crewhaus/data-retention-engine";
 import { createDedupStore } from "@crewhaus/durable-state";
 import { createJanitor } from "@crewhaus/runtime-core";
 
@@ -935,10 +936,28 @@ ${registerBlock}${mcpBoot}${subAgentBoot}
   // schedule (TTL eviction otherwise only fires as a list() side-effect the
   // daemon never triggers while idle) and reports orphaned tool_use entries
   // in recent transcripts (report-only — resume already reconciles orphans
-  // in memory). CREWHAUS_JANITOR=0 disables entirely;
+  // in memory). Eviction honors .crewhaus/retention.json (ops item 35) —
+  // the SAME pins + sessions.maxAgeDays the \`crewhaus retention\` CLI
+  // enforces; a malformed config fails safe (eviction disabled, daemon
+  // keeps serving). CREWHAUS_JANITOR=0 disables entirely;
   // CREWHAUS_JANITOR_INTERVAL_MS overrides the hourly re-run (0 keeps only
   // the boot run).
-  const __janitor = createJanitor();
+  let __retentionTtlDays: number;
+  let __retentionPins: readonly string[] = [];
+  try {
+    const __retention = await loadRetentionConfig(__cwd);
+    __retentionTtlDays = __retention.sessionMaxAgeDays;
+    __retentionPins = __retention.pins;
+  } catch (err) {
+    process.stderr.write(
+      \`[daemon] .crewhaus/retention.json unreadable — janitor session eviction disabled: \${(err as Error).message}\\n\`,
+    );
+    __retentionTtlDays = Number.POSITIVE_INFINITY; // fail-safe: evict nothing
+  }
+  const __janitor = createJanitor({
+    sessionTtlDays: __retentionTtlDays,
+    pinnedSessionIds: __retentionPins,
+  });
   if (process.env["CREWHAUS_JANITOR"] !== "0") {
     const __janitorReport = await __janitor.runOnce();
     process.stdout.write(\`[janitor] \${JSON.stringify(__janitorReport.steps)}\\n\`);

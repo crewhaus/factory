@@ -51,6 +51,19 @@ jobs:
       # Replace with however your deployment persists them (restore from
       # object storage, mount a volume, run on the host that owns them, ...).
       # Skip it entirely if this workflow already runs on that machine.
+      #
+      # WARNING — mtimes must survive the round-trip. Session retention is
+      # keyed on each file's filesystem MTIME (the same rule session-store's
+      # own TTL eviction uses), and `aws s3 sync` (like most object-store
+      # download tools) stamps restored files with the DOWNLOAD time — every
+      # session then looks freshly touched and the sweep silently never
+      # deletes anything on a restored runner. Persist/restore an archive
+      # that preserves mtimes instead, e.g. tar (which records and restores
+      # them by default):
+      #   persist: tar -czf crewhaus-store.tgz .crewhaus
+      #            aws s3 cp crewhaus-store.tgz s3://<YOUR-BUCKET>/
+      #   restore: aws s3 cp s3://<YOUR-BUCKET>/crewhaus-store.tgz .
+      #            tar -xpzf crewhaus-store.tgz
       # - name: Restore harness stores
       #   run: aws s3 sync s3://<YOUR-BUCKET>/crewhaus-store .crewhaus
 
@@ -77,5 +90,9 @@ jobs:
       # <STORE> Persist the swept stores back if you restored them above —
       # otherwise the deletions AND the evidence record are lost with the
       # runner and the next sweep re-reports the same expired sessions.
+      # Use the mtime-preserving tar round-trip from the restore step above,
+      # NOT a bare `aws s3 sync` (see the WARNING there).
       # - name: Persist harness stores
-      #   run: aws s3 sync --delete .crewhaus s3://<YOUR-BUCKET>/crewhaus-store
+      #   run: |
+      #     tar -czf crewhaus-store.tgz .crewhaus
+      #     aws s3 cp crewhaus-store.tgz s3://<YOUR-BUCKET>/crewhaus-store.tgz

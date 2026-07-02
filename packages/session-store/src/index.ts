@@ -88,12 +88,16 @@ function sessionLogPath(rootDir: string, id: string): string {
  * The TTL-eviction pass shared by `list()` and `evictExpiredSessions()`.
  * Walks `rootDir` and unlinks every `sess_<16 hex>.json` whose filesystem
  * mtime is older than `cutoffMs` (along with its sibling `.jsonl` event
- * log). Returns the evicted ids plus the ids that survive, so `list()` can
- * read the survivors without a second directory walk.
+ * log). Ids in `pinnedIds` are never evicted (they count as survivors) —
+ * the `.crewhaus/retention.json` pin contract threaded through by
+ * `evictExpiredSessions`. Returns the evicted ids plus the ids that
+ * survive, so `list()` can read the survivors without a second directory
+ * walk.
  */
 async function sweepExpired(
   rootDir: string,
   cutoffMs: number,
+  pinnedIds?: ReadonlySet<string>,
 ): Promise<{ evictedIds: string[]; survivorIds: string[] }> {
   let entries: string[];
   try {
@@ -120,6 +124,11 @@ async function sweepExpired(
       throw err;
     }
     if (mtimeMs < cutoffMs) {
+      if (pinnedIds?.has(id)) {
+        // Pinned in .crewhaus/retention.json — expired but never evicted.
+        survivorIds.push(id);
+        continue;
+      }
       // Evict: unlink both the session file and any sibling event log.
       await unlink(fullPath).catch(() => undefined);
       await unlink(sessionLogPath(rootDir, id)).catch(() => undefined);
@@ -131,6 +140,17 @@ async function sweepExpired(
   return { evictedIds, survivorIds };
 }
 
+export type EvictExpiredSessionsOptions = SessionStoreOptions & {
+  /**
+   * Session ids that must survive eviction even when expired — the
+   * `.crewhaus/retention.json` `pins` contract. Additive: omitted, the
+   * behaviour is unchanged. (`list()`'s implicit eviction takes no pins;
+   * daemon janitors and the retention CLI, which both read the config file,
+   * thread them through here.)
+   */
+  readonly pinnedIds?: ReadonlyArray<string>;
+};
+
 /**
  * Run the TTL-eviction pass standalone — exactly `list()`'s eviction
  * side-effect (mtime-keyed, unlinks `.json` + sibling `.jsonl`) without
@@ -140,13 +160,14 @@ async function sweepExpired(
  * Returns the evicted session ids.
  */
 export async function evictExpiredSessions(
-  opts: SessionStoreOptions = {},
+  opts: EvictExpiredSessionsOptions = {},
 ): Promise<{ evictedIds: string[] }> {
   const rootDir = opts.rootDir ?? DEFAULT_ROOT_DIR;
   const ttlDays = opts.ttlDays ?? DEFAULT_TTL_DAYS;
   const now = opts.now ?? (() => new Date());
   const cutoff = now().getTime() - ttlDays * MS_PER_DAY;
-  const { evictedIds } = await sweepExpired(rootDir, cutoff);
+  const pinned = opts.pinnedIds !== undefined ? new Set(opts.pinnedIds) : undefined;
+  const { evictedIds } = await sweepExpired(rootDir, cutoff, pinned);
   return { evictedIds };
 }
 

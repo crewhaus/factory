@@ -11,9 +11,10 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type AuditRecord, openAuditLog, verify } from "@crewhaus/audit-log";
-import { createSessionStore } from "@crewhaus/session-store";
+import { DEFAULT_TTL_DAYS, createSessionStore } from "@crewhaus/session-store";
 import {
   AUDIT_CHAIN_EXCLUSION_REASON,
+  DEFAULT_SESSION_MAX_AGE_DAYS,
   InvalidRetentionDateError,
   LOCAL_TENANT,
   RetentionConfigError,
@@ -95,6 +96,12 @@ describe("loadRetentionConfig", () => {
   test("missing file → session-store's 30-day TTL, no pins, no windows", async () => {
     const cfg = await loadRetentionConfig(root);
     expect(cfg).toEqual({ sessionMaxAgeDays: 30, pins: [], auditWindows: [], fromFile: false });
+  });
+
+  test("the engine's default TTL cannot drift from session-store's DEFAULT_TTL_DAYS", () => {
+    // data-retention-engine keeps its own 30-day constant (no session-store
+    // dependency); this pin catches either side changing unilaterally.
+    expect(DEFAULT_SESSION_MAX_AGE_DAYS).toBe(DEFAULT_TTL_DAYS);
   });
 
   test("parses maxAgeDays, pins, and ISO-dated windows; drops expired windows", async () => {
@@ -302,6 +309,38 @@ describe("runRetentionSweep", () => {
 });
 
 describe("runRetentionPurge", () => {
+  test("dry run: purge deletes NOTHING and appends NO evidence (ops-review F1)", async () => {
+    // The BLOCKER regression: `retention purge --dry-run` used to run a REAL
+    // purge (the flag was accepted and ignored, dryRun hardcoded false).
+    writeConfig({ sessions: { maxAgeDays: 5 } });
+    await makeSession("sess_aaaaaaaaaaaaaaaa", 60, true);
+    await seedAuditDays(["2020-01-01"]);
+    const recordsBefore = await readTodayRecords();
+
+    const report = await runRetentionPurge({ rootDir: root, dryRun: true });
+    expect(report.dryRun).toBe(true);
+    // The would-delete set is reported…
+    expect(report.deleted.map((d) => d.id)).toEqual(["session:sess_aaaaaaaaaaaaaaaa"]);
+    // …but every file is intact and no evidence record was appended.
+    expect(existsSync(join(sessionsDir(), "sess_aaaaaaaaaaaaaaaa.json"))).toBe(true);
+    expect(existsSync(join(sessionsDir(), "sess_aaaaaaaaaaaaaaaa.jsonl"))).toBe(true);
+    expect(report.evidence).toBeUndefined();
+    expect(await readTodayRecords()).toEqual(recordsBefore);
+  });
+
+  test("dry run with --before is also report-only", async () => {
+    await makeSession("sess_aaaaaaaaaaaaaaaa", 60);
+    const report = await runRetentionPurge({
+      rootDir: root,
+      before: Date.now() - 30 * MS_PER_DAY,
+      dryRun: true,
+    });
+    expect(report.dryRun).toBe(true);
+    expect(report.deleted.map((d) => d.id)).toEqual(["session:sess_aaaaaaaaaaaaaaaa"]);
+    expect(existsSync(join(sessionsDir(), "sess_aaaaaaaaaaaaaaaa.json"))).toBe(true);
+    expect(existsSync(auditDir())).toBe(false);
+  });
+
   test("--before restricts the candidate set; retention rules still apply", async () => {
     writeConfig({ sessions: { maxAgeDays: 5 } });
     await makeSession("sess_aaaaaaaaaaaaaaaa", 60); // expired AND older than cutoff → deleted
@@ -380,10 +419,86 @@ describe("runRetentionExport", () => {
     expect(existsSync(join(outDir, "audit", "_chain-tail.json"))).toBe(false);
   });
 
+  test("dry run: export writes NOTHING and appends NO evidence (ops-review F1)", async () => {
+    await makeSession("sess_aaaaaaaaaaaaaaaa", 40, true);
+    await seedAuditDays(["2020-01-01"]);
+    const recordsBefore = await readTodayRecords();
+    const outDir = join(root, "export");
+
+    const report = await runRetentionExport({ rootDir: root, outDir, dryRun: true });
+    expect(report.dryRun).toBe(true);
+    // The would-export set (and the chain-tail decision) is reported…
+    expect(report.sessions).toEqual(["sess_aaaaaaaaaaaaaaaa"]);
+    expect(report.auditDays).toEqual(["2020-01-01"]);
+    expect(report.chainTailCopied).toBe(true);
+    // …but nothing exists on disk: no outDir, no manifest, no copies.
+    expect(existsSync(outDir)).toBe(false);
+    // And no evidence was appended to the source audit log.
+    expect(report.evidence).toBeUndefined();
+    expect(await readTodayRecords()).toEqual(recordsBefore);
+  });
+
   test("refuses an outDir inside a store being exported", async () => {
     await makeSession("sess_aaaaaaaaaaaaaaaa", 1);
-    expect(
+    await expect(
       runRetentionExport({ rootDir: root, outDir: join(sessionsDir(), "out") }),
     ).rejects.toThrow(RetentionConfigError);
+  });
+
+  test("refuses `<root>/.crewhaus` — output paths would BE the live stores (ops-review F5)", async () => {
+    // The containment regression: outDir = <root>/.crewhaus resolves the
+    // sessions/audit OUTPUT paths onto the live stores themselves — a
+    // self-copy onto the data being exported. Both overlap directions must
+    // be refused, not just "outDir inside a store".
+    await makeSession("sess_aaaaaaaaaaaaaaaa", 1, true);
+    await seedAuditDays(["2020-01-01"]);
+    const sessionFile = join(sessionsDir(), "sess_aaaaaaaaaaaaaaaa.json");
+    const before = readFileSync(sessionFile, "utf8");
+
+    await expect(
+      runRetentionExport({ rootDir: root, outDir: join(root, ".crewhaus") }),
+    ).rejects.toThrow(RetentionConfigError);
+    await expect(
+      runRetentionExport({ rootDir: root, outDir: join(root, ".crewhaus") }),
+    ).rejects.toThrow(/overlaps the live store/);
+    // An output path CONTAINING a store is refused too (store inside outSub).
+    await expect(
+      runRetentionExport({ rootDir: root, outDir: join(root, ".crewhaus", "audit", "deep") }),
+    ).rejects.toThrow(RetentionConfigError);
+    // The live stores were never touched.
+    expect(readFileSync(sessionFile, "utf8")).toBe(before);
+    expect(existsSync(join(root, ".crewhaus", "manifest.json"))).toBe(false);
+  });
+});
+
+describe("no-op runs against a bare directory (ops-review F8b)", () => {
+  test("a real sweep with no .crewhaus present creates NO .crewhaus/audit", async () => {
+    const report = await runRetentionSweep({ rootDir: root });
+    expect(report.deleted).toEqual([]);
+    expect(report.evidence).toBeUndefined();
+    expect(existsSync(join(root, ".crewhaus"))).toBe(false);
+  });
+
+  test("a real purge with no .crewhaus present creates NO .crewhaus/audit", async () => {
+    const report = await runRetentionPurge({ rootDir: root });
+    expect(report.evidence).toBeUndefined();
+    expect(existsSync(join(root, ".crewhaus"))).toBe(false);
+  });
+
+  test("a no-op sweep with sessions but no audit store appends nothing", async () => {
+    await makeSession("sess_aaaaaaaaaaaaaaaa", 1); // fresh — nothing to delete
+    const report = await runRetentionSweep({ rootDir: root });
+    expect(report.deleted).toEqual([]);
+    expect(report.evidence).toBeUndefined();
+    expect(existsSync(auditDir())).toBe(false);
+  });
+
+  test("a sweep that DELETED something is still evidenced, creating the store if needed", async () => {
+    await makeSession("sess_aaaaaaaaaaaaaaaa", 40); // expired — real enforcement
+    const report = await runRetentionSweep({ rootDir: root });
+    expect(report.deleted.map((d) => d.id)).toEqual(["session:sess_aaaaaaaaaaaaaaaa"]);
+    expect(report.evidence).toBeDefined();
+    const records = await readTodayRecords();
+    expect(records.at(-1)?.kind).toBe("retention_enforcement");
   });
 });

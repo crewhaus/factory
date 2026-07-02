@@ -86,6 +86,43 @@ describe("emitManaged", () => {
     expect(daemon.split("janitor.stop();").length - 1).toBe(2);
   });
 
+  test("daemon.ts janitor honors .crewhaus/retention.json (ops-review F2)", () => {
+    const bundle = emitManaged(ir);
+    const daemon = bundle.files.find((f) => f.path === "daemon.ts")?.content ?? "";
+    // The SAME loader the retention CLI uses, so the two paths cannot drift.
+    expect(daemon).toContain(
+      'import { loadRetentionConfig } from "@crewhaus/data-retention-engine"',
+    );
+    expect(daemon).toContain("await loadRetentionConfig(process.cwd())");
+    expect(daemon).toContain("sessionTtlDays: RETENTION_TTL_DAYS");
+    expect(daemon).toContain("pinnedSessionIds: RETENTION_PINS");
+    // A malformed config fails safe: eviction disabled, daemon keeps serving.
+    expect(daemon).toContain("RETENTION_TTL_DAYS = Number.POSITIVE_INFINITY");
+    expect(daemon).toContain("janitor session eviction disabled");
+  });
+
+  test("daemon.ts janitor sweeps fallback tenants via TENANTS_ROOT (ops-review F6)", () => {
+    const bundle = emitManaged(ir);
+    const daemon = bundle.files.find((f) => f.path === "daemon.ts")?.content ?? "";
+    // gateway-server's buildTenant fallback serves arbitrary authenticated
+    // tenants — the janitor must re-enumerate the parent of all tenant roots,
+    // not just the spec-declared overrides.
+    expect(daemon).toContain("tenantsRootDir: TENANTS_ROOT");
+  });
+
+  test("daemon.ts reservation clear is boot-only with a multi-writer opt-out (ops-review F3)", () => {
+    const bundle = emitManaged(ir);
+    const daemon = bundle.files.find((f) => f.path === "daemon.ts")?.content ?? "";
+    // CREWHAUS_JANITOR_CLEAR_RESERVATIONS=0 must remove the budget store from
+    // the janitor entirely (no clear ever happens).
+    expect(daemon).toContain('process.env.CREWHAUS_JANITOR_CLEAR_RESERVATIONS !== "0"');
+    expect(daemon).toContain("? { budgetStore: BUDGET_STORE }");
+    // The comments must not oversell multi-writer sqlite sharing: boot-clear
+    // is scoped to single-writer deployments by durable-state's contract.
+    expect(daemon).toContain("SINGLE-writer");
+    expect(daemon).toContain("CREWHAUS_JANITOR_CLEAR_RESERVATIONS=0");
+  });
+
   test("agent.ts has runOneTurn signature with tenantId + sessionId + input", () => {
     const bundle = emitManaged(ir);
     const agent = bundle.files.find((f) => f.path === "agent.ts");

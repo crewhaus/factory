@@ -12,9 +12,11 @@ directory runs from inside the factory repo.
   1. `crewhaus audit verify [--dir <auditDir>] [--anchor file:<path>]` —
      tamper tripwire over the hash-chained audit log (exit 1 on any broken
      link, or on a requested-but-unconsultable anchor store).
-  2. `crewhaus compliance evidence --all-frameworks --period current` —
-     collects every registered framework for the current UTC quarter and
-     exits 1 when any control gathered 0 records (`--allow-empty` opts out).
+  2. `crewhaus compliance evidence --all-frameworks --period current
+     --fail-on-empty` — collects every registered framework for the current
+     UTC quarter; `--fail-on-empty` makes the scheduled run exit 1 when any
+     control gathered 0 records (without it, an empty control exits 0 with a
+     warning naming the gap).
 
 Bundles land at `.crewhaus/compliance/<framework>/<controlId>/<period>.json`;
 re-verify them with this package's `verifyBundle` before presenting them as

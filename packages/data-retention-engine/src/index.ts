@@ -32,6 +32,20 @@ import { CrewhausError } from "@crewhaus/errors";
  * for audit data), `tenancy` (R-infra — tenant-scoping primitives).
  */
 
+// `.crewhaus/retention.json` — the shared on-disk policy file read by BOTH
+// the `crewhaus retention` CLI and the daemon shapes' boot-time janitor, so
+// the two enforcement paths cannot drift (ops-review F2). See
+// retention-config.ts for the schema + safety stance.
+export {
+  DEFAULT_SESSION_MAX_AGE_DAYS,
+  RETENTION_CONFIG_RELPATH,
+  type RetentionAuditWindowConfig,
+  type RetentionConfig,
+  RetentionConfigError,
+  SESSION_ID_REGEX,
+  loadRetentionConfig,
+} from "./retention-config";
+
 export class DataRetentionError extends CrewhausError {
   override readonly name = "DataRetentionError";
   constructor(message: string, cause?: unknown) {
