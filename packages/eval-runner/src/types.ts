@@ -68,6 +68,8 @@ export type EvalRunSummary = {
   readonly config: {
     readonly specHash: string;
     readonly datasetName: string;
+    /** sha256 of the dataset file bytes, when the caller supplied one. */
+    readonly datasetHash?: string;
     readonly graderNames: ReadonlyArray<string>;
     readonly model: string;
     readonly judgeModel?: string;
@@ -85,6 +87,13 @@ export type RunEvalOptions = {
   readonly judgeModel?: string;
   readonly invoker?: AgentInvoker;
   readonly cwd?: string;
+  /**
+   * Content hash (sha256 hex) of the dataset file the samples came from.
+   * Purely informational — persisted into `run.json` / `results.json` so
+   * downstream consumers (run-history index, dataset-drift detection) can
+   * tell whether two runs saw byte-identical data.
+   */
+  readonly datasetHash?: string;
 };
 
 export type GraderEntry = {

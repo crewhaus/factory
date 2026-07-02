@@ -9,7 +9,16 @@ import { CrewhausError } from "@crewhaus/errors";
 import { loadDataset } from "@crewhaus/eval-dataset";
 import { parseGradersConfig } from "@crewhaus/eval-grader";
 import { optimizeSpec } from "@crewhaus/eval-optimizer-orchestrator";
-import { diffReports, loadRun, renderReport } from "@crewhaus/eval-report";
+import {
+  type RunIndexEntry,
+  diffReports,
+  hashDatasetFile,
+  loadRun,
+  readBaselines,
+  readRunIndex,
+  renderReport,
+  setBaseline,
+} from "@crewhaus/eval-report";
 import { runEval as runEvalLib } from "@crewhaus/eval-runner";
 import { openEventLog } from "@crewhaus/event-log";
 import { loadHooks } from "@crewhaus/hooks-engine";
@@ -55,6 +64,10 @@ import {
   createEgressMatcher,
   resolveEgressMatcherChoice,
 } from "./egress-matcher";
+// Run-history item 3 — post-eval index append + baseline diff/gate/promote,
+// in a side-effect-free module so it is unit-testable (this entry file runs
+// an argv switch on import).
+import { finishEvalRun } from "./eval-history";
 // Response-feedback core — pure, side-effect-free so it is unit-testable
 // (this entry file runs an argv switch on import). Powers `rate`/`feedback`
 // (capture) and `distill` (ratings → eval dataset + graders).
@@ -216,6 +229,13 @@ const EVAL_SCHEMA: ParseArgsSchema = {
     { name: "concurrency", takesValue: true },
     { name: "seed", takesValue: true },
     { name: "out", short: "o", takesValue: true },
+    // Run-history item 3 — exit non-zero when the run regresses against the
+    // pinned (spec, dataset) baseline (regression-runner gate, strict
+    // defaults: any pass-rate drop or sample-level pass→fail flip fails).
+    { name: "gate", takesValue: false },
+    // Run-history item 3 — keep the existing baseline pin instead of
+    // auto-promoting this run on gate pass (also skips the first-run pin).
+    { name: "no-promote", takesValue: false },
     { name: "help", short: "h" },
   ],
 };
@@ -223,6 +243,9 @@ const EVAL_SCHEMA: ParseArgsSchema = {
 const EVAL_REPORT_SCHEMA: ParseArgsSchema = {
   flags: [
     { name: "out", short: "o", takesValue: true },
+    // `history` / `baseline show` filters.
+    { name: "spec", takesValue: true },
+    { name: "dataset", takesValue: true },
     { name: "help", short: "h" },
   ],
 };
@@ -375,9 +398,16 @@ function usageText(): string {
     "                  [--egress-embedder <model>]  embedder for --egress-matcher semantic",
     "  eval <spec.yaml> --dataset <data>    run the agent against a dataset and grade",
     "       --graders <graders.yaml>       (deterministic graders + LLM-as-judge)",
-    "       [--judge-model <model>] [--concurrency N] [--seed N] -o <out-dir>",
+    "       [--judge-model <model>] [--concurrency N] [--seed N] [-o <out-dir>]",
+    "       [--gate]                       exit non-zero on regression vs the pinned baseline",
+    "       [--no-promote]                 keep the existing baseline pin after this run",
     "  eval-report diff <prev> <new>        compare two eval runs and emit a diff report",
     "       [-o <out-dir>]",
+    "  eval-report history                  list recorded runs (.crewhaus/evals/index.jsonl)",
+    "       [--spec <name>] [--dataset <name>]",
+    "  eval-report baseline show            print pinned baselines (.crewhaus/evals/baselines.json)",
+    "       [--spec <name>] [--dataset <name>]",
+    "  eval-report baseline set <runId>     pin a recorded run as its (spec, dataset) baseline",
     "  optimize <spec.yaml> --dataset <data> --graders <graders.yaml>",
     "       [--mutator rule-based|claude] [--iterations N] [--seed N]",
     "       [--ratings <session>|all]            distill user ratings into the training set (Pillar 2)",
@@ -1829,7 +1859,14 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
       "usage: crewhaus eval <spec.yaml> --dataset <data> --graders <graders.yaml> " +
-        "[--judge-model <model>] [--concurrency N] [--seed N] -o <out-dir>\n" +
+        "[--judge-model <model>] [--concurrency N] [--seed N] [-o <out-dir>] " +
+        "[--gate] [--no-promote]\n" +
+        "  -o defaults to .crewhaus/evals/<runId>. Every run is appended to\n" +
+        "  .crewhaus/evals/index.jsonl and diffed against the pinned baseline for its\n" +
+        "  (spec, dataset) pair (.crewhaus/evals/baselines.json). The first run for a\n" +
+        "  pair pins the baseline; later runs auto-promote when the regression gate\n" +
+        "  passes. --no-promote keeps the existing pin; --gate exits non-zero when the\n" +
+        "  gate fails (any pass-rate drop or sample-level pass→fail flip).\n" +
         "  --judge-model accepts the full router grammar (claude-*, openai/<m>, gemini/<m>,\n" +
         "  bedrock/<id>, local/<m>@<url>); the default judge claude-sonnet-4-5 requires\n" +
         "  Anthropic credentials (ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY)\n",
@@ -1843,7 +1880,8 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
   const outDirArg = args.flags["out"];
   if (typeof datasetPath !== "string") die("missing --dataset <data>");
   if (typeof gradersPath !== "string") die("missing --graders <graders.yaml>");
-  if (typeof outDirArg !== "string") die("missing -o <out-dir>");
+  const gateRequested = args.flags["gate"] === true;
+  const promote = args.flags["no-promote"] !== true;
 
   const concurrencyFlag = args.flags["concurrency"];
   const seedFlag = args.flags["seed"];
@@ -1883,22 +1921,31 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
     die(`could not read ${gradersPath}: ${(err as Error).message}`);
   }
   const { compiled } = parseGradersConfig(gradersYaml);
-  const dataset = await loadDataset(resolve(datasetPath));
+  const absDataset = resolve(datasetPath);
+  const dataset = await loadDataset(absDataset);
+  // Content hash of the dataset file — recorded in run.json/results.json and
+  // the run-history index so lineage changes are detectable later.
+  const datasetHash = hashDatasetFile(absDataset);
 
-  const absOut = resolve(outDirArg);
-  process.stdout.write(`[eval] running ${dataset.name}: ${compiled.length} graders → ${absOut}\n`);
+  const outDest =
+    typeof outDirArg === "string" ? resolve(outDirArg) : join(".crewhaus", "evals", "<runId>");
+  process.stdout.write(`[eval] running ${dataset.name}: ${compiled.length} graders → ${outDest}\n`);
 
   const summary = await runEvalLib({
     ir,
     dataset,
     compiledGraders: compiled,
     opts: {
-      outDir: absOut,
+      ...(typeof outDirArg === "string" ? { outDir: resolve(outDirArg) } : {}),
+      datasetHash,
       ...(concurrency !== undefined ? { concurrency } : {}),
       ...(seed !== undefined ? { seed } : {}),
       ...(typeof judgeModelFlag === "string" ? { judgeModel: judgeModelFlag } : {}),
     },
   });
+  // With -o omitted the runner picks .crewhaus/evals/<runId> relative to the
+  // cwd — resolve to an absolute path for the report + history index.
+  const absOut = resolve(summary.outDir);
 
   // Render report
   const loaded = await loadRun(absOut);
@@ -1912,16 +1959,50 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
       `tokens=${summary.aggregates.totalTokens.input}/${summary.aggregates.totalTokens.output}\n`,
   );
   process.stdout.write(`[eval] report: ${join(absOut, "index.html")}\n`);
+
+  // Run-history: append to the index, diff/gate against the pinned baseline,
+  // and promote per policy (see apps/cli/src/eval-history.ts).
+  const finish = await finishEvalRun({
+    summary,
+    specName: ir.name,
+    datasetHash,
+    outDir: absOut,
+    gateRequested,
+    promote,
+  });
+  if (finish.gateFailed) {
+    die(`eval --gate: ${finish.gateReason ?? "regression gate failed"}`);
+  }
 }
 
 async function runEvalReport(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
-    process.stdout.write("usage: crewhaus eval-report diff <prev> <new> [-o <out-dir>]\n");
+    process.stdout.write(
+      "usage: crewhaus eval-report <action>\n" +
+        "  diff <prev> <new> [-o <out-dir>]            compare two eval runs and emit a diff report\n" +
+        "  history [--spec <name>] [--dataset <name>]  list recorded runs (.crewhaus/evals/index.jsonl)\n" +
+        "  baseline show [--spec <n>] [--dataset <n>]  print pinned baselines (.crewhaus/evals/baselines.json)\n" +
+        "  baseline set <runId>                        pin a recorded run as its (spec, dataset) baseline\n",
+    );
     return;
   }
   const action = args.positional[0];
-  if (action !== "diff") die(`eval-report: unknown action "${action ?? ""}" — supported: diff`);
+  switch (action) {
+    case "diff":
+      await runEvalReportDiff(args);
+      return;
+    case "history":
+      runEvalReportHistory(args);
+      return;
+    case "baseline":
+      runEvalReportBaseline(args);
+      return;
+    default:
+      die(`eval-report: unknown action "${action ?? ""}" — supported: diff, history, baseline`);
+  }
+}
 
+async function runEvalReportDiff(args: ParsedArgs): Promise<void> {
   const prev = args.positional[1];
   const next = args.positional[2];
   if (typeof prev !== "string" || typeof next !== "string") {
@@ -1948,6 +2029,108 @@ async function runEvalReport(args: ParsedArgs): Promise<void> {
       `score_shifts=${result.diff.scoreShifts.length} ` +
       `unchanged=${result.diff.unchanged}\n`,
   );
+}
+
+/** Filter helper shared by `history` and `baseline show`. */
+function matchesEvalFilters(args: ParsedArgs, specName: string, datasetName: string): boolean {
+  const specFilter = args.flags["spec"];
+  const datasetFilter = args.flags["dataset"];
+  if (typeof specFilter === "string" && specName !== specFilter) return false;
+  if (typeof datasetFilter === "string" && datasetName !== datasetFilter) return false;
+  return true;
+}
+
+/** Render rows as space-padded columns (last column unpadded). */
+function writeTable(header: ReadonlyArray<string>, rows: ReadonlyArray<ReadonlyArray<string>>) {
+  const widths = header.map((h, i) => Math.max(h.length, ...rows.map((r) => (r[i] ?? "").length)));
+  const line = (cells: ReadonlyArray<string>): string =>
+    cells
+      .map((c, i) => (i === cells.length - 1 ? c : c.padEnd(widths[i] ?? c.length)))
+      .join("  ")
+      .trimEnd();
+  process.stdout.write(`${line(header)}\n`);
+  for (const row of rows) process.stdout.write(`${line(row)}\n`);
+}
+
+function runEvalReportHistory(args: ParsedArgs): void {
+  const entries = readRunIndex().filter((e) => matchesEvalFilters(args, e.specName, e.datasetName));
+  if (entries.length === 0) {
+    process.stdout.write(
+      `[eval-report] no recorded runs match (${join(".crewhaus", "evals", "index.jsonl")})\n`,
+    );
+    return;
+  }
+  // Mark the run(s) currently pinned as a baseline with `*`.
+  const pinnedRunIds = new Set(Object.values(readBaselines()).map((b) => b.runId));
+  writeTable(
+    ["ts", "runId", "spec", "dataset", "pass_rate", "mean_score", "samples", "base", "outDir"],
+    entries.map((e) => [
+      e.ts,
+      e.runId,
+      e.specName,
+      e.datasetName,
+      `${(e.passRate * 100).toFixed(1)}%`,
+      e.meanScore.toFixed(3),
+      String(e.sampleCount),
+      pinnedRunIds.has(e.runId) ? "*" : "",
+      e.outDir,
+    ]),
+  );
+}
+
+function runEvalReportBaseline(args: ParsedArgs): void {
+  const sub = args.positional[1];
+  switch (sub) {
+    case "show": {
+      const pins = Object.values(readBaselines()).filter((b) =>
+        matchesEvalFilters(args, b.specName, b.datasetName),
+      );
+      if (pins.length === 0) {
+        process.stdout.write(
+          `[eval-report] no baselines pinned (${join(".crewhaus", "evals", "baselines.json")})\n`,
+        );
+        return;
+      }
+      writeTable(
+        ["spec", "dataset", "runId", "pinned_at", "outDir"],
+        pins.map((b) => [b.specName, b.datasetName, b.runId, b.ts, b.outDir]),
+      );
+      return;
+    }
+    case "set": {
+      const runId = args.positional[2];
+      if (typeof runId !== "string") die("eval-report baseline set: missing <runId>");
+      // Latest index entry wins if a runId somehow appears twice.
+      const index = readRunIndex();
+      let entry: RunIndexEntry | undefined;
+      for (let i = index.length - 1; i >= 0; i--) {
+        if (index[i]?.runId === runId) {
+          entry = index[i];
+          break;
+        }
+      }
+      if (entry === undefined) {
+        die(
+          `eval-report baseline set: runId "${runId}" not found in ` +
+            `${join(".crewhaus", "evals", "index.jsonl")} — run \`crewhaus eval-report history\``,
+        );
+      }
+      setBaseline({
+        specName: entry.specName,
+        datasetName: entry.datasetName,
+        runId: entry.runId,
+        outDir: entry.outDir,
+        datasetHash: entry.datasetHash,
+        ts: new Date().toISOString(),
+      });
+      process.stdout.write(
+        `[eval-report] baseline set: ${entry.specName}/${entry.datasetName} → ${entry.runId}\n`,
+      );
+      return;
+    }
+    default:
+      die(`eval-report baseline: unknown action "${sub ?? ""}" — supported: show, set`);
+  }
 }
 
 /**

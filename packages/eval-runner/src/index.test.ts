@@ -134,6 +134,51 @@ describe("runEval — T3 5-sample fixture", () => {
     expect(results.aggregates.passRate).toBe(1);
   });
 
+  test("threads an optional datasetHash into run.json and results.json config", async () => {
+    const outDir = newTempRoot();
+    const ir = narrowToAgent(lower(parseSpec(HELLO_SPEC)));
+    const samples: Sample[] = [{ id: "q1", input: "x", expected_output: "y" }];
+    const invoker: AgentInvoker = async ({ sample }) => ({
+      agentOutput: sample.expected_output ?? "",
+      transcript: [],
+      events: [],
+    });
+    const { compiled } = parseGradersConfig(FIXED_GRADERS);
+    const datasetHash = "f".repeat(64);
+    const summary = await runEval({
+      ir,
+      dataset: { name: "hashed", samples: yieldSamples(samples) },
+      compiledGraders: compiled,
+      opts: { invoker, outDir, datasetHash },
+    });
+    expect(summary.config.datasetHash).toBe(datasetHash);
+    const runJson = JSON.parse(readFileSync(join(outDir, "run.json"), "utf-8"));
+    expect(runJson.datasetHash).toBe(datasetHash);
+    const results = JSON.parse(readFileSync(join(outDir, "results.json"), "utf-8"));
+    expect(results.config.datasetHash).toBe(datasetHash);
+  });
+
+  test("omits datasetHash when the caller does not supply one", async () => {
+    const outDir = newTempRoot();
+    const ir = narrowToAgent(lower(parseSpec(HELLO_SPEC)));
+    const samples: Sample[] = [{ id: "q1", input: "x", expected_output: "y" }];
+    const invoker: AgentInvoker = async ({ sample }) => ({
+      agentOutput: sample.expected_output ?? "",
+      transcript: [],
+      events: [],
+    });
+    const { compiled } = parseGradersConfig(FIXED_GRADERS);
+    const summary = await runEval({
+      ir,
+      dataset: { name: "unhashed", samples: yieldSamples(samples) },
+      compiledGraders: compiled,
+      opts: { invoker, outDir },
+    });
+    expect(summary.config.datasetHash).toBeUndefined();
+    const runJson = JSON.parse(readFileSync(join(outDir, "run.json"), "utf-8"));
+    expect("datasetHash" in runJson).toBe(false);
+  });
+
   test("captures grader failures correctly", async () => {
     const outDir = newTempRoot();
     const ir = narrowToAgent(lower(parseSpec(HELLO_SPEC)));

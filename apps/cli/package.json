@@ -59,6 +59,7 @@
     "@crewhaus/migration-engine": "workspace:*",
     "@crewhaus/migration-runner": "workspace:*",
     "@crewhaus/permission-engine": "workspace:*",
+    "@crewhaus/regression-runner": "workspace:*",
     "@crewhaus/run-context": "workspace:*",
     "@crewhaus/runtime-core": "workspace:*",
     "@crewhaus/secrets-manager": "workspace:*",

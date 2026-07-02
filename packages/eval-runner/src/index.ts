@@ -116,6 +116,7 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
         startedAt,
         specHash,
         datasetName: dataset.name,
+        ...(opts.datasetHash !== undefined ? { datasetHash: opts.datasetHash } : {}),
         graderNames: graders.map((g) => g.name),
         model: ir.agent.model,
         ...(opts.judgeModel !== undefined ? { judgeModel: opts.judgeModel } : {}),
@@ -203,6 +204,7 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
     config: {
       specHash,
       datasetName: dataset.name,
+      ...(opts.datasetHash !== undefined ? { datasetHash: opts.datasetHash } : {}),
       graderNames: graders.map((g) => g.name),
       model: ir.agent.model,
       ...(opts.judgeModel !== undefined ? { judgeModel: opts.judgeModel } : {}),

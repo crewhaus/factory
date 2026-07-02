@@ -7,9 +7,29 @@
  *
  * No HTML templating libraries; pure template strings with inlined CSS+JS.
  *
+ * History mode: `history.ts` maintains the append-only run index
+ * (`.crewhaus/evals/index.jsonl`) and the per-(spec, dataset) baseline pins
+ * (`.crewhaus/evals/baselines.json`) behind `crewhaus eval`'s auto-baseline
+ * diff and `crewhaus eval-report history|baseline`.
+ *
  * Reference: build-roadmap.md §16.
  */
 export { loadRun, type LoadedRun } from "./load";
 export { renderReport } from "./render";
-export { diffReports, type ReportDiff } from "./diff";
+export { diffReports, type ReportDiff, type DiffEntry } from "./diff";
 export { ReportError } from "./errors";
+export {
+  BASELINES_FILENAME,
+  type BaselineEntry,
+  type BaselinesFile,
+  DEFAULT_EVALS_DIR,
+  INDEX_FILENAME,
+  type RunIndexEntry,
+  appendRunIndex,
+  baselineKey,
+  getBaseline,
+  hashDatasetFile,
+  readBaselines,
+  readRunIndex,
+  setBaseline,
+} from "./history";
