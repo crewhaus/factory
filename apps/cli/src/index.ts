@@ -85,6 +85,11 @@ import {
   parseExitRatingKey,
   shouldPromptExitRating,
 } from "./autodistill";
+// Item 44 — `crewhaus init --ci`: the eval-on-PR CI gate scaffold
+// (.github/workflows/crewhaus-eval.yml — two fresh runs diffed via the
+// item-3 baseline machinery + `eval --gate`), in a side-effect-free module
+// so it is unit-testable (this entry file runs an argv switch on import).
+import { EVAL_CI_WORKFLOW_RELPATH, buildEvalCiWorkflowYaml } from "./ci-scaffold";
 // Item 34 — scheduling ergonomics for `compliance evidence` (--period current
 // resolution + the empty-evidence gate), side-effect-free for the same reason.
 import { findEmptyControls, resolvePeriodFlag } from "./compliance-schedule";
@@ -318,7 +323,15 @@ function isValidPermissionMode(s: string): s is CliPermissionMode {
 }
 
 const INIT_SCHEMA: ParseArgsSchema = {
-  flags: [{ name: "help", short: "h" }],
+  flags: [
+    // Item 44 — also scaffold the eval-on-PR CI workflow. Composable with
+    // an existing harness: `init --ci` in a dir that already has a
+    // crewhaus.yaml adds just the workflow.
+    { name: "ci", takesValue: false },
+    // Overwrite an existing scaffolded workflow (never the spec).
+    { name: "force", takesValue: false },
+    { name: "help", short: "h" },
+  ],
 };
 
 const DOCTOR_SCHEMA: ParseArgsSchema = {
@@ -678,6 +691,11 @@ function usageText(): string {
     "       (nightly cron + manual dispatch; accepted improvements arrive as",
     "       PRs for human review — never auto-merged)",
     "  init [name]                          scaffold a new crewhaus.yaml",
+    "       [--ci]                          also scaffold .github/workflows/crewhaus-eval.yml —",
+    "                                       eval-gated spec PRs (base vs PR spec, two fresh runs,",
+    "                                       score-delta PR comment, check fails on regression);",
+    "                                       with an existing crewhaus.yaml, adds just the workflow",
+    "       [--force]                       overwrite an existing scaffolded workflow",
     "  doctor                               check environment health",
     "  context --bundle [-o <file>]         emit a single-markdown orientation manifest",
     "       [--factory-root <p>] [--docs-root <p>] [--demos-root <p>]",
@@ -1049,20 +1067,34 @@ async function runStrictScopeGate(yamlText: string): Promise<void> {
 
 function runInit(args: ParsedArgs): void {
   if (args.flags["help"]) {
-    process.stdout.write("usage: crewhaus init [name]\n");
+    process.stdout.write(
+      "usage: crewhaus init [name] [--ci] [--force]\n" +
+        "  --ci     Also scaffold .github/workflows/crewhaus-eval.yml — the eval-on-PR\n" +
+        "           gate (item 44): PRs touching crewhaus.yaml or eval/** run the base\n" +
+        "           branch's spec and the PR's spec on the PR's dataset+graders (two\n" +
+        "           fresh runs, pinned seed, --concurrency 1), post the score-delta\n" +
+        "           table as a PR comment, and fail the check on `eval --gate` failure\n" +
+        "           (any pass-rate drop or per-sample pass→fail flip). In a directory\n" +
+        "           that already has a crewhaus.yaml, `init --ci` adds just the workflow.\n" +
+        "  --force  Overwrite an existing scaffolded workflow (never the spec).\n",
+    );
     return;
   }
+  const ci = args.flags["ci"] === true;
   const nameArg = args.positional[0];
   const targetDir = typeof nameArg === "string" ? resolve(nameArg) : process.cwd();
   const specName = typeof nameArg === "string" ? nameArg : basename(targetDir);
   const targetFile = join(targetDir, "crewhaus.yaml");
 
   if (existsSync(targetFile)) {
-    die(`${targetFile} already exists — refusing to overwrite`);
-  }
-
-  mkdirSync(targetDir, { recursive: true });
-  const yamlText = `name: ${specName}
+    // Item 44 — `init --ci` composes with an existing harness: keep the
+    // spec, add just the workflow. Without --ci the historical refusal
+    // stands (a bare `init` must never touch existing work).
+    if (!ci) die(`${targetFile} already exists — refusing to overwrite`);
+    process.stdout.write(`kept ${targetFile} (already exists)\n`);
+  } else {
+    mkdirSync(targetDir, { recursive: true });
+    const yamlText = `name: ${specName}
 target: cli
 agent:
   model: claude-opus-4-7
@@ -1070,15 +1102,39 @@ agent:
     You are a helpful assistant. Replace these instructions with your
     agent's actual behavior, persona, and constraints.
 `;
-  writeFileSync(targetFile, yamlText);
-  process.stdout.write(`wrote ${targetFile}\n`);
+    writeFileSync(targetFile, yamlText);
+    process.stdout.write(`wrote ${targetFile}\n`);
+  }
+
+  if (ci) {
+    // Item 44 — the eval-on-PR CI gate. The workflow lands beside the spec;
+    // it belongs at the repo root (GitHub only reads .github/workflows
+    // there) — the scaffold's comments cover the nested-harness case.
+    try {
+      const scaffolded = scaffoldWorkflowFile({
+        rootDir: targetDir,
+        relPath: EVAL_CI_WORKFLOW_RELPATH,
+        content: buildEvalCiWorkflowYaml(),
+        force: args.flags["force"] === true,
+      });
+      process.stdout.write(`wrote ${scaffolded.path}\n`);
+      process.stdout.write(
+        "ci: set the ANTHROPIC_API_KEY repo secret; PRs touching crewhaus.yaml or eval/**\n" +
+          "    are then evaled against the base branch and gated on regressions.\n",
+      );
+    } catch (err) {
+      if (err instanceof FlywheelConfigError) die(err.message);
+      throw err;
+    }
+  }
+
   // The runtime resolves the spec and the `.crewhaus/` session store from
   // the current working directory, so guide the user to run from inside
   // the harness directory (where crewhaus.yaml lives), not from here.
   const rel = relative(process.cwd(), targetDir);
   const cd = rel === "" ? "" : `cd ${rel} && `;
   process.stdout.write(`next: ${cd}crewhaus run crewhaus.yaml\n`);
-  logger.debug("init.success", { target: targetFile });
+  logger.debug("init.success", { target: targetFile, ci });
 }
 
 /**
