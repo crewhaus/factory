@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, relative, resolve } from "node:path";
@@ -137,6 +138,28 @@ import {
   gradersConfigToYaml,
   samplesToJsonl,
 } from "./feedback";
+// Item 45 — `crewhaus flywheel init|run`: the packaged nightly
+// self-improvement loop (knob/default resolution, the accept-then-write
+// loop with injected steps, the report, and the workflow scaffold), in a
+// side-effect-free module so it is unit-testable (this entry file runs an
+// argv switch on import).
+import {
+  CONVENTIONAL_DATASET,
+  CONVENTIONAL_GRADERS,
+  FLYWHEEL_WORKFLOW_RELPATH,
+  FlywheelConfigError,
+  type FlywheelDataResolution,
+  type FlywheelKnobs,
+  type FlywheelOptimizeOutcome,
+  buildFlywheelWorkflowYaml,
+  formatFlywheelKnobsGuide,
+  formatFlywheelReport,
+  resolveFlywheelData,
+  resolveFlywheelKnobs,
+  runFlywheelLoop,
+  scaffoldWorkflowFile,
+  specIsDirty,
+} from "./flywheel";
 // FR-004 — Pillar 3 intent-gate judge + durable audit-sink resolution, in a
 // side-effect-free module so it is unit-testable (this entry file runs an
 // argv switch on import).
@@ -150,7 +173,11 @@ import {
 // Item 9 — per-spec regression suite: post-accept pinning of optimize
 // recoveries + the eval-side default union, in a side-effect-free module so
 // it is unit-testable (this entry file runs an argv switch on import).
-import { applyRegressionUnionGuarded, pinRecoveriesAfterOptimize } from "./regression-pin";
+import {
+  applyRegressionUnionGuarded,
+  isRegistrySafeName,
+  pinRecoveriesAfterOptimize,
+} from "./regression-pin";
 // Item 35 — `crewhaus retention` sweep/export/purge (scheduled GDPR/TTL
 // enforcement over the on-disk session + audit stores), in a side-effect-free
 // module so it is unit-testable AND callable as a library by a future daemon
@@ -330,6 +357,30 @@ const OPTIMIZE_SCHEMA: ParseArgsSchema = {
     // explicit opt-out (mirrors `compile --no-register`).
     { name: "no-register", takesValue: false },
     { name: "out", short: "o", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
+// Item 45 — `crewhaus flywheel run|init`. Knobs mirror the demo's
+// FLYWHEEL_* env names (flag > env > default — see ./flywheel.ts).
+const FLYWHEEL_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "dataset", takesValue: true },
+    { name: "graders", takesValue: true },
+    { name: "budget-usd", takesValue: true },
+    { name: "iterations", takesValue: true },
+    { name: "seed", takesValue: true },
+    { name: "concurrency", takesValue: true },
+    { name: "mutator", takesValue: true },
+    // Run the whole loop (evals + optimize + acceptance gate) but never
+    // write the spec, register, or pin — a rehearsal run.
+    { name: "dry-run", takesValue: false },
+    // Invariant: the flywheel refuses to run over uncommitted spec changes
+    // (a rejected write-back could not be told apart from the user's own
+    // edits). This is the explicit opt-out.
+    { name: "allow-dirty", takesValue: false },
+    // `flywheel init` — overwrite an existing workflow scaffold.
+    { name: "force", takesValue: false },
     { name: "help", short: "h" },
   ],
 };
@@ -603,6 +654,16 @@ function usageText(): string {
     "       [--ratings <session>|all]            distill user ratings into the training set (Pillar 2)",
     "       [--budget-usd N]                     stop a model-driven run before it exceeds $N (FR-003)",
     "       [--write-back] [-o <out-dir>]        active eval-driven optimization (Pillar 2)",
+    "  flywheel run [spec.yaml]             the nightly self-improvement loop, one command (item 45):",
+    "       compile gate → baseline eval → optimize → after eval → acceptance",
+    "       gate (pass_rate strictly up AND zero regressions) → write-back on",
+    "       accept; a rejected patch never touches the spec.",
+    "       [--dataset <data>] [--graders <g.yaml>] [--budget-usd N] [--iterations N]",
+    "       [--seed N] [--concurrency N] [--mutator rule-based|claude]",
+    "       [--dry-run] [--allow-dirty]",
+    "  flywheel init [--force]              scaffold .github/workflows/crewhaus-flywheel.yml",
+    "       (nightly cron + manual dispatch; accepted improvements arrive as",
+    "       PRs for human review — never auto-merged)",
     "  init [name]                          scaffold a new crewhaus.yaml",
     "  doctor                               check environment health",
     "  context --bundle [-o <file>]         emit a single-markdown orientation manifest",
@@ -2213,20 +2274,7 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
   const mutator = args.flags["mutator"];
   let mutatorImpl: import("@crewhaus/prompt-optimizer").MutationProvider | undefined;
   if (mutator === "claude") {
-    const { createClaudeMutationProvider } = await import("@crewhaus/prompt-optimizer-claude");
-    const { resolveModel } = await import("@crewhaus/model-router");
-    const ir = lower(parseSpec(readFileSync(absSpec, "utf-8")));
-    const mutatorModel = ir.target === "cli" ? ir.agent.model : "claude-sonnet-4-5";
-    // Resolve via the model-router so non-Anthropic specs drive their own
-    // provider: the resolved adapter + STRIPPED wire modelId replace the old
-    // hardcoded createAnthropicAdapter() + verbatim prefixed string (which
-    // made `--mutator claude` a silent no-op for openai/gemini/bedrock/local
-    // specs — every mutation call failed and the provider fell back).
-    const resolution = await resolveModel(mutatorModel);
-    mutatorImpl = createClaudeMutationProvider({
-      adapter: resolution.adapter,
-      model: resolution.modelId,
-    });
+    mutatorImpl = await createClaudeMutatorForSpec(absSpec);
   } else if (mutator !== undefined && mutator !== "rule-based") {
     die(`unknown --mutator "${mutator}" — supported: rule-based, claude`);
   }
@@ -2352,6 +2400,536 @@ function makeAsyncIterable<T>(items: ReadonlyArray<T>): AsyncIterable<T> {
       for (const item of items) yield item;
     },
   };
+}
+
+/**
+ * Build the model-driven Claude mutation provider for a spec — shared by
+ * `optimize --mutator claude` and the flywheel's default mutator. Resolves
+ * via the model-router so non-Anthropic specs drive their own provider:
+ * the resolved adapter + STRIPPED wire modelId replace the old hardcoded
+ * createAnthropicAdapter() + verbatim prefixed string (which made
+ * `--mutator claude` a silent no-op for openai/gemini/bedrock/local specs
+ * — every mutation call failed and the provider fell back).
+ */
+async function createClaudeMutatorForSpec(
+  absSpec: string,
+): Promise<import("@crewhaus/prompt-optimizer").MutationProvider> {
+  const { createClaudeMutationProvider } = await import("@crewhaus/prompt-optimizer-claude");
+  const { resolveModel } = await import("@crewhaus/model-router");
+  const ir = lower(parseSpec(readFileSync(absSpec, "utf-8")));
+  const mutatorModel = ir.target === "cli" ? ir.agent.model : "claude-sonnet-4-5";
+  const resolution = await resolveModel(mutatorModel);
+  return createClaudeMutationProvider({
+    adapter: resolution.adapter,
+    model: resolution.modelId,
+  });
+}
+
+// -------- item 45: crewhaus flywheel init|run --------
+
+/**
+ * Invariant guard: the flywheel must never run over uncommitted spec
+ * changes — after an accepted write-back, `git diff` on the spec must mean
+ * "the flywheel improved this", not "the flywheel's change is tangled with
+ * the user's half-finished edit". Outside a git work tree the check is
+ * moot (nothing to tangle with) and the run proceeds, mirroring the demo
+ * script's NO_GIT path.
+ */
+function gitSpecStatus(absSpec: string): { inRepo: boolean; dirty: boolean } {
+  const dir = dirname(absSpec);
+  const inside = spawnSync("git", ["-C", dir, "rev-parse", "--is-inside-work-tree"], {
+    encoding: "utf-8",
+  });
+  if (inside.status !== 0 || inside.stdout.trim() !== "true") {
+    return { inRepo: false, dirty: false };
+  }
+  const status = spawnSync("git", ["-C", dir, "status", "--porcelain", "--", absSpec], {
+    encoding: "utf-8",
+  });
+  return { inRepo: true, dirty: specIsDirty(status.stdout ?? "") };
+}
+
+/**
+ * Item 45 — `crewhaus flywheel init|run`. `run` executes the complete
+ * nightly self-improvement loop in-process (no shelling out to crewhaus
+ * subcommands): compile gate → baseline eval → optimize (accept-then-write:
+ * NO write-back during the search) → post-patch compile → after eval →
+ * acceptance gate (pass_rate strictly up AND zero per-sample regressions,
+ * via the run-history `gateRuns`) → on accept, the same write-back
+ * semantics as `optimize --write-back` (provenance header + auto-register
+ * + changelog + regression pin). A rejected patch never touches the spec.
+ * `init` scaffolds the nightly GitHub Actions workflow (PRs for human
+ * review, never auto-merged).
+ */
+async function runFlywheelCmd(args: ParsedArgs, action: "init" | "run"): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      `usage:\n  crewhaus flywheel run [spec.yaml] [--dataset <data>] [--graders <graders.yaml>]\n      [--budget-usd N] [--iterations N] [--seed N] [--concurrency N]\n      [--mutator rule-based|claude] [--dry-run] [--allow-dirty]\n  crewhaus flywheel init [--force]\n\n  \`run\` executes the nightly self-improvement loop in one command:\n  compile gate → baseline eval → optimize (budget-capped; claude mutator\n  by default when an ANTHROPIC credential is present, rule-based fallback\n  otherwise) → post-patch compile → after eval → acceptance gate. The\n  patch is applied to the spec ONLY when pass_rate strictly improved with\n  zero per-sample regressions (the same strict gate \`eval --gate\` uses);\n  an accepted write-back then runs the standard auto-register + changelog\n  + regression-pin flow. A rejected patch never touches disk. --dry-run\n  runs everything but never writes.\n\n  Defaults: <spec> is ./crewhaus.yaml; --dataset falls back to\n  ${CONVENTIONAL_DATASET} then registry:<spec>-ratings (when the spec has a\n  feedback: block and ratings were distilled); --graders falls back to\n  ${CONVENTIONAL_GRADERS}. The optimizer only ever rewrites agent.instructions\n  (OPTIMIZABLE_PATHS) — permissions: stay exactly as a human reviewed them.\n  The flywheel refuses to run over uncommitted spec changes (--allow-dirty\n  opts out).\n\n  \`init\` scaffolds .github/workflows/crewhaus-flywheel.yml: nightly cron +\n  workflow_dispatch, budget knobs as env, PR creation via gh for HUMAN\n  review — the workflow never merges on its own. Refuses to overwrite an\n  existing workflow without --force.\n\n${formatFlywheelKnobsGuide()
+        .map((l) => `  ${l}`)
+        .join("\n")}\n`,
+    );
+    return;
+  }
+  if (action === "init") {
+    runFlywheelInit(args);
+    return;
+  }
+  await runFlywheelRun(args);
+}
+
+function runFlywheelInit(args: ParsedArgs): void {
+  let scaffolded: ReturnType<typeof scaffoldWorkflowFile>;
+  try {
+    scaffolded = scaffoldWorkflowFile({
+      rootDir: process.cwd(),
+      relPath: FLYWHEEL_WORKFLOW_RELPATH,
+      content: buildFlywheelWorkflowYaml(),
+      force: args.flags["force"] === true,
+    });
+  } catch (err) {
+    if (err instanceof FlywheelConfigError) die(err.message);
+    throw err;
+  }
+  process.stdout.write(`wrote ${scaffolded.path}\n`);
+  for (const line of formatFlywheelKnobsGuide()) process.stdout.write(`${line}\n`);
+  process.stdout.write(
+    "next: commit the workflow and set the ANTHROPIC_API_KEY + FLYWHEEL_GH_TOKEN repo\n" +
+      "      secrets. The flywheel then runs nightly; accepted improvements arrive as\n" +
+      "      PRs for human review — it never merges on its own.\n",
+  );
+}
+
+async function runFlywheelRun(args: ParsedArgs): Promise<void> {
+  const specPath = args.positional[0] ?? "crewhaus.yaml";
+  const absSpec = resolve(specPath);
+  if (!existsSync(absSpec)) {
+    die(
+      `spec not found at ${absSpec} — run from the harness directory (standalone-harness convention) or pass <spec.yaml>`,
+    );
+  }
+  const dryRun = args.flags["dry-run"] === true;
+
+  // Invariant: never run over uncommitted spec changes (see gitSpecStatus).
+  const git = gitSpecStatus(absSpec);
+  if (git.inRepo && git.dirty) {
+    if (args.flags["allow-dirty"] !== true) {
+      die(
+        `${specPath} has uncommitted changes — the flywheel refuses to run over a dirty spec (an accepted write-back would tangle with your edits). Commit or stash first, or pass --allow-dirty.`,
+      );
+    }
+    process.stderr.write(
+      `crewhaus: [flywheel] warning: running over a dirty ${specPath} (--allow-dirty)\n`,
+    );
+  }
+
+  let knobs: FlywheelKnobs;
+  try {
+    knobs = resolveFlywheelKnobs({ flags: args.flags, env: process.env });
+  } catch (err) {
+    if (err instanceof FlywheelConfigError) die(err.message);
+    throw err;
+  }
+
+  const sourceYaml = readFileSync(absSpec, "utf-8");
+  let ir: ReturnType<typeof lower>;
+  try {
+    ir = lower(parseSpec(sourceYaml));
+  } catch (err) {
+    if (err instanceof CrewhausError) die(err.message);
+    throw err;
+  }
+  if (ir.target !== "cli") {
+    die(
+      `crewhaus flywheel only supports target: cli (got "${ir.target}") — eval/optimize v0 are cli-only`,
+    );
+  }
+
+  // Dataset/graders defaults: flag > standalone-harness convention >
+  // (dataset only) the `<spec>-ratings` registry dataset the feedback
+  // flywheel feeds. The spec dir is the base for the conventional paths —
+  // the CLI resolves everything from the cwd per the harness convention,
+  // but a spec passed by path keeps working.
+  const registry = createFileBackedRegistry({ rootDir: defaultDatasetsRoot() });
+  let ratingsRegistered = false;
+  const ratingsName = `${ir.name}-ratings`;
+  if (ir.feedback !== undefined && isRegistrySafeName(ratingsName)) {
+    try {
+      ratingsRegistered = (await latestVersion(registry, ratingsName)) !== undefined;
+    } catch {
+      // An unreadable registry just means no ratings default.
+    }
+  }
+  const datasetFlag = strFlag(args, "dataset");
+  const gradersFlag = strFlag(args, "graders");
+  let data: FlywheelDataResolution;
+  try {
+    data = resolveFlywheelData({
+      ...(datasetFlag !== undefined ? { datasetFlag } : {}),
+      ...(gradersFlag !== undefined ? { gradersFlag } : {}),
+      specName: ir.name,
+      hasConventionalDataset: existsSync(resolve(CONVENTIONAL_DATASET)),
+      hasConventionalGraders: existsSync(resolve(CONVENTIONAL_GRADERS)),
+      ratingsRegistered,
+    });
+  } catch (err) {
+    if (err instanceof FlywheelConfigError) die(err.message);
+    throw err;
+  }
+
+  let gradersYaml: string;
+  try {
+    gradersYaml = readFileSync(resolve(data.graders), "utf-8");
+  } catch (err) {
+    die(`could not read ${data.graders}: ${(err as Error).message}`);
+  }
+  const { compiled } = parseGradersConfig(gradersYaml);
+
+  // Materialize the dataset once (file path or registry: ref) — the same
+  // sample set feeds the before eval, the optimizer's dev evals, and the
+  // after eval, so the acceptance diff compares like with like.
+  const samples: Sample[] = [];
+  let datasetName: string;
+  let datasetHash: string;
+  let registrySplits: { train: Sample[]; dev: Sample[] } | undefined;
+  let registryRef: ReturnType<typeof parseRegistryRef>;
+  try {
+    registryRef = parseRegistryRef(data.dataset);
+  } catch (err) {
+    if (err instanceof DatasetRefError) die(err.message);
+    throw err;
+  }
+  if (registryRef !== undefined) {
+    let resolved: Awaited<ReturnType<typeof resolveRegistryRef>>;
+    try {
+      resolved = await resolveRegistryRef(registry, registryRef);
+    } catch (err) {
+      if (err instanceof DatasetRefError || err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
+    datasetName = resolved.datasetName;
+    datasetHash = resolved.datasetHash;
+    samples.push(...resolved.samples);
+    // Item 12 — a record with populated train AND dev splits (and no
+    // explicit #split) is the optimizer's reproducible source of truth;
+    // the test split never enters optimization (mirrors `optimize`).
+    const { record } = resolved;
+    if (
+      registryRef.split === undefined &&
+      record.splits.train.length > 0 &&
+      record.splits.dev.length > 0
+    ) {
+      registrySplits = { train: [...record.splits.train], dev: [...record.splits.dev] };
+    }
+  } else {
+    const absDataset = resolve(data.dataset);
+    const dataset = await loadDataset(absDataset);
+    datasetName = dataset.name;
+    datasetHash = hashDatasetFile(absDataset);
+    for await (const s of dataset.samples) samples.push(s);
+  }
+  if (samples.length === 0) die(`dataset "${datasetName}" yielded zero samples`);
+
+  // Optimizer train/dev sets (mirrors `optimize`: registry splits when both
+  // populated, else the deterministic inline 70/30 split).
+  type OptimizerSample = { id: string; input: string; expected_output?: string };
+  const toOptimizerSample = (s: Sample): OptimizerSample => ({
+    id: s.id,
+    input: s.input,
+    ...(s.expected_output !== undefined ? { expected_output: s.expected_output } : {}),
+  });
+  const originalById = new Map(samples.map((s) => [s.id, s] as const));
+  let trainSet: OptimizerSample[];
+  let devSet: OptimizerSample[];
+  if (registrySplits !== undefined) {
+    trainSet = registrySplits.train.map(toOptimizerSample);
+    devSet = registrySplits.dev.map(toOptimizerSample);
+  } else {
+    if (samples.length < 2) {
+      die(
+        `dataset has ${samples.length} sample(s) — the optimizer needs at least 2 (70/30 train/dev split)`,
+      );
+    }
+    const splitIdx = Math.max(1, Math.floor(samples.length * 0.7));
+    trainSet = samples.slice(0, splitIdx).map(toOptimizerSample);
+    devSet = samples.slice(splitIdx).map(toOptimizerSample);
+  }
+  const devById = new Map(devSet.map((s) => [s.id, s] as const));
+
+  // Mutator: flag > credential-aware default (claude when an Anthropic
+  // credential is present, rule-based fallback otherwise — the loop still
+  // runs and gates, only the rewrites are deterministic).
+  const mutatorFlag = strFlag(args, "mutator");
+  let mutatorChoice: "rule-based" | "claude";
+  if (mutatorFlag !== undefined) {
+    if (mutatorFlag !== "rule-based" && mutatorFlag !== "claude") {
+      die(`unknown --mutator "${mutatorFlag}" — supported: rule-based, claude`);
+    }
+    mutatorChoice = mutatorFlag;
+  } else {
+    const hasAnthropicCred =
+      (process.env["ANTHROPIC_API_KEY"] ?? "") !== "" ||
+      (process.env["ANTHROPIC_AUTH_TOKEN"] ?? "") !== "";
+    mutatorChoice = hasAnthropicCred ? "claude" : "rule-based";
+    if (!hasAnthropicCred) {
+      process.stderr.write(
+        "crewhaus: [flywheel] no ANTHROPIC credential — falling back to the rule-based mutator (model-driven rewrites disabled)\n",
+      );
+    }
+  }
+  const mutatorImpl =
+    mutatorChoice === "claude" ? await createClaudeMutatorForSpec(absSpec) : undefined;
+
+  const runId = `fly_${Date.now().toString(16)}`;
+  const outRoot = resolve(join(".crewhaus", "flywheel", runId));
+  mkdirSync(outRoot, { recursive: true });
+  process.stdout.write(
+    `[flywheel] runId=${runId} spec=${specPath} dataset=${datasetName} ` +
+      `(${samples.length} samples; ${trainSet.length} train / ${devSet.length} dev) ` +
+      `mutator=${mutatorChoice} iterations=${knobs.iterations} budget=$${knobs.budgetUsd.toFixed(2)} ` +
+      `seed=${knobs.seed} concurrency=${knobs.concurrency}${dryRun ? " DRY-RUN" : ""}\n`,
+  );
+
+  // ---- injected steps (see runFlywheelLoop in ./flywheel.ts) ----
+
+  const compileCheck = (yaml: string): void => {
+    // Offline parse → lower. Throws SpecParseError / CompilerError (both
+    // CrewhausError) on a spec the compiler rejects.
+    lower(parseSpec(yaml));
+  };
+
+  const evalRun = async (label: "before" | "after", yaml: string) => {
+    const evalIr = lower(parseSpec(yaml));
+    if (evalIr.target !== "cli") {
+      throw new Error(`flywheel eval requires target: cli (got "${evalIr.target}")`);
+    }
+    process.stdout.write(
+      `[flywheel] ${label} eval: ${samples.length} samples → ${join(outRoot, label)}\n`,
+    );
+    const summary = await runEvalLib({
+      ir: evalIr,
+      dataset: { name: datasetName, samples: makeAsyncIterable(samples) },
+      compiledGraders: compiled,
+      opts: {
+        outDir: join(outRoot, label),
+        concurrency: knobs.concurrency,
+        seed: knobs.seed,
+        datasetHash,
+        retryErrors: true,
+      },
+    });
+    process.stdout.write(
+      `[flywheel] ${label} pass_rate=${(summary.aggregates.passRate * 100).toFixed(1)}% ` +
+        `mean_score=${summary.aggregates.meanScore.toFixed(3)} errors=${summary.aggregates.errorCount}\n`,
+    );
+    return summary;
+  };
+
+  // Item 7 — same failure-arbiter pre-filter as `optimize` (noise and
+  // evidence-backed contract-ambiguity are withheld from the mutator's
+  // failure signal; the queue prints at the end of the run).
+  const datasetFixQueue = new Map<string, string>();
+  const stickyAmbiguous = new Set<string>();
+  let evalCallSeq = 0;
+  const fitness = async (
+    prompt: string,
+  ): Promise<import("@crewhaus/prompt-optimizer").FitnessResult> => {
+    const yamlText = readFileSync(absSpec, "utf-8");
+    const parsedTarget = parseSpec(yamlText).target;
+    const { applySpecPatch } = await import("@crewhaus/spec-patch");
+    const { yaml: patchedYaml } = applySpecPatch(yamlText, {
+      target: parsedTarget as never,
+      path: ["agent", "instructions"],
+      op: "replace",
+      value: prompt,
+    });
+    let candidateIr: ReturnType<typeof lower>;
+    try {
+      candidateIr = lower(parseSpec(patchedYaml));
+    } catch (err) {
+      if (err instanceof SpecParseError) {
+        process.stderr.write("[flywheel] candidate compiled invalid spec, skipping\n");
+        return { score: 0 };
+      }
+      throw err;
+    }
+    if (candidateIr.target !== "cli") return { score: 0 };
+    evalCallSeq += 1;
+    const summary = await runEvalLib({
+      ir: candidateIr,
+      dataset: { name: datasetName, samples: makeAsyncIterable(devSet) },
+      compiledGraders: compiled,
+      opts: {
+        outDir: join(
+          outRoot,
+          "optimize",
+          "evals",
+          `${String(evalCallSeq).padStart(3, "0")}_${prompt.length}`,
+        ),
+        concurrency: knobs.concurrency,
+        seed: knobs.seed,
+        retryErrors: true,
+      },
+    });
+    let excludedFromSignal: ReadonlySet<string> = new Set<string>();
+    try {
+      const triage = triageFitnessSamples({
+        samples: summary.samples,
+        samplesById: originalById,
+        alreadyAmbiguous: stickyAmbiguous,
+      });
+      for (const a of triage.ambiguous) {
+        datasetFixQueue.set(a.sampleId, a.reason);
+        if (a.fromGraderEvidence) stickyAmbiguous.add(a.sampleId);
+      }
+      excludedFromSignal = triage.excluded;
+      const line = formatFitnessTriageLine(triage);
+      if (line !== undefined) process.stdout.write(`[flywheel] ${line}\n`);
+    } catch (err) {
+      process.stderr.write(
+        `[flywheel] triage skipped: ${err instanceof Error ? err.message : String(err)}\n`,
+      );
+    }
+    const grades = summary.samples
+      .filter((r) => !excludedFromSignal.has(r.sampleId))
+      .map((r) => {
+        const dev = devById.get(r.sampleId);
+        return {
+          input: dev?.input ?? r.sampleId,
+          score: r.grades.overall.score,
+          ...(dev?.expected_output !== undefined ? { expected: dev.expected_output } : {}),
+          rationale: r.grades.overall.rationale,
+        };
+      });
+    return { score: summary.aggregates.passRate, grades, runDir: summary.outDir };
+  };
+
+  let optimizeResult: Awaited<ReturnType<typeof optimizeSpec>> | undefined;
+  const optimizeStep = async (): Promise<FlywheelOptimizeOutcome> => {
+    process.stdout.write(
+      `[flywheel] optimize: ${knobs.iterations} iteration(s), budget $${knobs.budgetUsd.toFixed(2)}, instructions only (permissions are never optimizer-patchable)\n`,
+    );
+    const traceBus = new TraceEventBus({ runId, sessionId: runId });
+    const result = await optimizeSpec({
+      specPath: absSpec,
+      fitness,
+      trainSet,
+      devSet,
+      iterations: knobs.iterations,
+      seed: knobs.seed,
+      outDir: join(outRoot, "optimize"),
+      // Accept-then-write: the search NEVER writes the source; the patch is
+      // applied by applyAccepted only after the acceptance gate passes.
+      writeBack: false,
+      runId,
+      traceBus,
+      budgetUsd: knobs.budgetUsd,
+      ...(mutatorImpl !== undefined ? { mutator: mutatorImpl } : {}),
+    });
+    optimizeResult = result;
+    process.stdout.write(
+      `[flywheel] optimize: dev score ${result.scoreBefore.toFixed(3)} → ${result.scoreAfter.toFixed(3)} ` +
+        `spend ${result.spend.totalUsd}` +
+        `${result.stoppedReason === "budget-reached" ? " (stopped: budget reached)" : ""}\n`,
+    );
+    return {
+      applied: result.applied,
+      patchedYaml: result.patchedYaml,
+      runId: result.runId,
+      outDir: result.outDir,
+      scoreBefore: result.scoreBefore,
+      scoreAfter: result.scoreAfter,
+      mutatorName: mutatorChoice,
+      iterations: knobs.iterations,
+      spendUsd: result.spend.totalUsd,
+    };
+  };
+
+  const applyAccepted = async (outcome: FlywheelOptimizeOutcome): Promise<void> => {
+    // The kept `optimize --write-back` semantics: stamp the provenance
+    // header spec-changelog distills, write the source, then auto-register
+    // (+ changelog) and pin the fail→pass recoveries into the per-spec
+    // regression suite — exactly what a successful --write-back does.
+    const { formatWriteBackHeader } = await import("@crewhaus/spec-patch");
+    const stamped = `${formatWriteBackHeader({
+      runId: outcome.runId,
+      mutator: outcome.mutatorName,
+      scoreBefore: outcome.scoreBefore,
+      scoreAfter: outcome.scoreAfter,
+      iterations: outcome.iterations,
+    })}${outcome.patchedYaml}`;
+    writeFileSync(absSpec, stamped);
+    process.stdout.write(`[flywheel] wrote patched YAML to ${absSpec}\n`);
+    await autoRegisterSpec(stamped, { patchJsonPath: join(outcome.outDir, "patch.json") });
+    try {
+      const pin = await pinRecoveriesAfterOptimize({
+        registry,
+        specName: ir.name,
+        pin: true,
+        ...(optimizeResult?.baselineEvalDir !== undefined
+          ? { baselineRunDir: optimizeResult.baselineEvalDir }
+          : {}),
+        ...(optimizeResult?.bestEvalDir !== undefined
+          ? { candidateRunDir: optimizeResult.bestEvalDir }
+          : {}),
+        samplesById: originalById,
+        sourceDataset: datasetName,
+        optimizeRunId: outcome.runId,
+      });
+      if (pin !== undefined && pin.pinned > 0) {
+        process.stdout.write(
+          `[flywheel] pinned ${pin.pinned} recovered samples → ${pin.suiteName}@${pin.version}\n`,
+        );
+      }
+    } catch (err) {
+      process.stderr.write(
+        `[flywheel] regression pinning skipped: ${err instanceof Error ? err.message : String(err)}\n`,
+      );
+    }
+  };
+
+  const result = await runFlywheelLoop({
+    sourceYaml,
+    dryRun,
+    hooks: { compileCheck, evalRun, optimize: optimizeStep, applyAccepted },
+  });
+
+  // The demo's step-4 diff artifact (before vs after, side by side), for
+  // the PR body / a human eyeball. Informational — never fails the run.
+  if (result.before !== undefined && result.after !== undefined) {
+    try {
+      const diff = diffReports(
+        await loadRun(join(outRoot, "before")),
+        await loadRun(join(outRoot, "after")),
+      );
+      const diffDir = join(outRoot, "diff");
+      mkdirSync(diffDir, { recursive: true });
+      writeFileSync(join(diffDir, "index.html"), diff.html);
+      writeFileSync(join(diffDir, "diff.json"), diff.json);
+    } catch {
+      // Same sample ids on both sides by construction; a diff failure here
+      // only costs the artifact.
+    }
+  }
+
+  // Item 7 — surface the queued contract-ambiguity samples (dataset fixes,
+  // not prompt mutations). Empty queue → silent.
+  for (const line of formatDatasetFixQueue(datasetFixQueue)) {
+    process.stdout.write(`[flywheel] ${line}\n`);
+  }
+
+  for (const line of formatFlywheelReport(result, {
+    specPath,
+    datasetName,
+    sampleCount: samples.length,
+    budgetUsd: knobs.budgetUsd,
+    artifactsDir: outRoot,
+  })) {
+    process.stdout.write(`[flywheel] ${line}\n`);
+  }
+
+  // Rejection/no-improvement is success-by-doing-nothing (exit 0, like the
+  // demo); a patch the compiler rejects is an optimizer bug — exit 1.
+  if (result.outcome === "patch-compile-failed") die(result.reason);
 }
 
 /** Materialize a streaming dataset. Only invoked lazily by the item-9
@@ -4614,6 +5192,22 @@ switch (subcommand) {
   case "optimize":
     await runOptimize(parseFor(rest, OPTIMIZE_SCHEMA));
     break;
+  case "flywheel": {
+    const action = rest[0] ?? "";
+    if (action !== "init" && action !== "run") {
+      die(`flywheel action must be "init" or "run" (got "${action}")`);
+    }
+    // Mirror `run`'s policy: every structured failure in the loop (model
+    // routing, provider auth, the orchestrator, …) extends CrewhausError —
+    // route the family through die() for a clean one-liner.
+    try {
+      await runFlywheelCmd(parseFor(rest.slice(1), FLYWHEEL_SCHEMA), action);
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
+    break;
+  }
   case "doctor":
     await runDoctor(parseFor(rest, DOCTOR_SCHEMA));
     break;
