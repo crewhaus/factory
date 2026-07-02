@@ -2064,3 +2064,134 @@ agent:
     ).toThrow();
   });
 });
+
+describe("lower — provider failover chain (item 22: model_fallbacks + circuit_breaker)", () => {
+  const CLI_FAILOVER_SPEC = `
+name: hello
+target: cli
+agent:
+  model: claude-sonnet-4-6
+  instructions: be helpful
+  model_fallbacks:
+    - openai/gpt-4o-mini
+    - bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0
+  circuit_breaker:
+    failureThreshold: 3
+    windowMs: 30000
+    cooldownMs: 15000
+`;
+
+  test("lowers cli agent.model_fallbacks + agent.circuit_breaker verbatim", () => {
+    const ir = lower(parseSpec(CLI_FAILOVER_SPEC));
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect(ir.agent.modelFallbacks).toEqual([
+      "openai/gpt-4o-mini",
+      "bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+    ]);
+    expect(ir.agent.circuitBreaker).toEqual({
+      failureThreshold: 3,
+      windowMs: 30000,
+      cooldownMs: 15000,
+    });
+  });
+
+  test("both fields stay ABSENT from the IR when the spec omits them", () => {
+    const ir = lower(parseSpec(MINIMAL_SPEC));
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect("modelFallbacks" in ir.agent).toBe(false);
+    expect("circuitBreaker" in ir.agent).toBe(false);
+  });
+
+  test("circuit_breaker alone lowers without model_fallbacks (single-adapter breaker)", () => {
+    const ir = lower(
+      parseSpec(`
+name: hello
+target: cli
+agent:
+  model: claude-sonnet-4-6
+  instructions: be helpful
+  circuit_breaker:
+    failureThreshold: 2
+`),
+    );
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect(ir.agent.modelFallbacks).toBeUndefined();
+    expect(ir.agent.circuitBreaker).toEqual({ failureThreshold: 2 });
+  });
+
+  test("channel agent block lowers the same fields", () => {
+    const ir = lower(
+      parseSpec(`
+name: hello-channel
+target: channel
+agent:
+  model: claude-sonnet-4-6
+  instructions: be a good bot
+  model_fallbacks:
+    - openai/gpt-4o-mini
+  circuit_breaker:
+    cooldownMs: 5000
+channels:
+  slack:
+    botToken: $SLACK_BOT_TOKEN
+    signingSecret: $SLACK_SIGNING_SECRET
+routing:
+  sessionKey: thread
+`),
+    );
+    if (ir.target !== "channel") throw new Error("unexpected target");
+    expect(ir.agent.modelFallbacks).toEqual(["openai/gpt-4o-mini"]);
+    expect(ir.agent.circuitBreaker).toEqual({ cooldownMs: 5000 });
+  });
+
+  test("managed agent block lowers the same fields", () => {
+    const ir = lower(
+      parseSpec(`
+name: mg
+target: managed
+agent:
+  model: claude-sonnet-4-6
+  instructions: i
+  model_fallbacks:
+    - openai/gpt-4o-mini
+tenants:
+  - id: t1
+    budget:
+      maxInputTokens: 1000
+      maxOutputTokens: 2000
+`),
+    );
+    if (ir.target !== "managed") throw new Error("unexpected target");
+    expect(ir.agent.modelFallbacks).toEqual(["openai/gpt-4o-mini"]);
+    expect(ir.agent.circuitBreaker).toBeUndefined();
+  });
+
+  test("spec/IR/codegen round-trip: compiled cli bundle threads both fields into runChatLoop", () => {
+    const bundle = compile(CLI_FAILOVER_SPEC);
+    const agentTs = bundle.files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agentTs).toContain(
+      'modelFallbacks: ["openai/gpt-4o-mini", "bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0"],',
+    );
+    expect(agentTs).toContain(
+      'circuitBreaker: {"failureThreshold":3,"windowMs":30000,"cooldownMs":15000},',
+    );
+  });
+
+  test("rejects an empty model_fallbacks list and unknown circuit_breaker keys", () => {
+    expect(() =>
+      parseSpec(
+        "name: hello\ntarget: cli\nagent:\n  model: m\n  instructions: i\n  model_fallbacks: []\n",
+      ),
+    ).toThrow();
+    expect(() =>
+      parseSpec(
+        "name: hello\ntarget: cli\nagent:\n  model: m\n  instructions: i\n  circuit_breaker:\n    halfOpenProbes: 2\n",
+      ),
+    ).toThrow();
+    expect(() =>
+      parseSpec(
+        "name: hello\ntarget: cli\nagent:\n  model: m\n  instructions: i\n  circuit_breaker:\n    failureThreshold: 0\n",
+      ),
+    ).toThrow();
+  });
+});

@@ -514,3 +514,42 @@ describe("emitCli — generated README.md (item 42)", () => {
     expect(bundle.files[0]?.path).toBe("agent.ts");
   });
 });
+
+describe("emitCli — provider failover chain (item 22)", () => {
+  test("emits modelFallbacks + circuitBreaker in the runChatLoop call when the IR sets them", () => {
+    const content =
+      emitCli(
+        baseIr({
+          agent: {
+            model: "claude-sonnet-4-6",
+            instructions: "be helpful",
+            modelFallbacks: ["openai/gpt-4o-mini", "groq/llama-3.3-70b"],
+            circuitBreaker: { failureThreshold: 3, cooldownMs: 15000 },
+          },
+        }),
+      ).files[0]?.content ?? "";
+    expect(content).toContain('modelFallbacks: ["openai/gpt-4o-mini", "groq/llama-3.3-70b"],');
+    expect(content).toContain('circuitBreaker: {"failureThreshold":3,"cooldownMs":15000},');
+  });
+
+  test("emits circuitBreaker alone when no fallbacks are declared (single-adapter breaker)", () => {
+    const content =
+      emitCli(
+        baseIr({
+          agent: {
+            model: "claude-sonnet-4-6",
+            instructions: "be helpful",
+            circuitBreaker: { failureThreshold: 2 },
+          },
+        }),
+      ).files[0]?.content ?? "";
+    expect(content).not.toContain("modelFallbacks:");
+    expect(content).toContain('circuitBreaker: {"failureThreshold":2},');
+  });
+
+  test("omits both fields entirely when the IR leaves them unset", () => {
+    const content = emitCli(baseIr()).files[0]?.content ?? "";
+    expect(content).not.toContain("modelFallbacks:");
+    expect(content).not.toContain("circuitBreaker:");
+  });
+});

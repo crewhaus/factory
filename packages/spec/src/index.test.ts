@@ -1466,3 +1466,115 @@ ${routing}`;
     ).toThrow(/crew\.routing\.match\["lead"\]\.to = "ghost" — target role not in crew\.roles/);
   });
 });
+
+describe("agent.model_fallbacks + agent.circuit_breaker (item 22)", () => {
+  const cliWithAgent = (agentLines: string): string =>
+    [
+      "name: hello",
+      "target: cli",
+      "agent:",
+      "  model: claude-sonnet-4-6",
+      "  instructions: hi",
+      agentLines,
+    ].join("\n");
+
+  test("parses model_fallbacks + circuit_breaker on the cli agent block", () => {
+    const spec = parseSpec(
+      cliWithAgent(
+        [
+          "  model_fallbacks:",
+          "    - openai/gpt-4o-mini",
+          "    - groq/llama-3.3-70b",
+          "  circuit_breaker:",
+          "    failureThreshold: 3",
+          "    windowMs: 60000",
+          "    cooldownMs: 30000",
+        ].join("\n"),
+      ),
+    );
+    if (spec.target !== "cli") throw new Error("unexpected target");
+    expect(spec.agent.model_fallbacks).toEqual(["openai/gpt-4o-mini", "groq/llama-3.3-70b"]);
+    expect(spec.agent.circuit_breaker).toEqual({
+      failureThreshold: 3,
+      windowMs: 60000,
+      cooldownMs: 30000,
+    });
+  });
+
+  test("model_fallbacks entries follow the agent.model validation rules (non-empty strings)", () => {
+    expect(() => parseSpec(cliWithAgent('  model_fallbacks:\n    - ""'))).toThrow(
+      /model_fallbacks/,
+    );
+    expect(() => parseSpec(cliWithAgent("  model_fallbacks: []"))).toThrow(/model_fallbacks/);
+  });
+
+  test("circuit_breaker is strict: a typo'd knob (halfOpenProbes) fails the parse", () => {
+    expect(() => parseSpec(cliWithAgent("  circuit_breaker:\n    halfOpenProbes: 2"))).toThrow(
+      /circuit_breaker/,
+    );
+  });
+
+  test("channel agent block accepts the same fields", () => {
+    const spec = parseSpec(
+      [
+        "name: bot",
+        "target: channel",
+        "agent:",
+        "  model: claude-sonnet-4-6",
+        "  instructions: hi",
+        "  model_fallbacks:",
+        "    - openai/gpt-4o-mini",
+        "  circuit_breaker:",
+        "    cooldownMs: 5000",
+        "channels:",
+        "  slack:",
+        "    botToken: $SLACK_BOT_TOKEN",
+        "    signingSecret: $SLACK_SIGNING_SECRET",
+        "routing:",
+        "  sessionKey: thread",
+      ].join("\n"),
+    );
+    if (spec.target !== "channel") throw new Error("unexpected target");
+    expect(spec.agent.model_fallbacks).toEqual(["openai/gpt-4o-mini"]);
+    expect(spec.agent.circuit_breaker).toEqual({ cooldownMs: 5000 });
+  });
+
+  test("managed agent block accepts the same fields", () => {
+    const spec = parseSpec(
+      [
+        "name: mg",
+        "target: managed",
+        "agent:",
+        "  model: claude-sonnet-4-6",
+        "  instructions: hi",
+        "  model_fallbacks:",
+        "    - openai/gpt-4o-mini",
+        "tenants:",
+        "  - id: t1",
+        "    budget:",
+        "      maxInputTokens: 1",
+        "      maxOutputTokens: 1",
+      ].join("\n"),
+    );
+    if (spec.target !== "managed") throw new Error("unexpected target");
+    expect(spec.agent.model_fallbacks).toEqual(["openai/gpt-4o-mini"]);
+  });
+
+  test("shapes without the wiring still reject the fields (strict agent blocks)", () => {
+    expect(() =>
+      parseSpec(
+        [
+          "name: bt",
+          "target: batch",
+          "agent:",
+          "  model: m",
+          "  instructions: i",
+          "  model_fallbacks:",
+          "    - openai/gpt-4o-mini",
+          "queue:",
+          "  adapter: in-memory",
+        ].join("\n"),
+      ),
+    ).toThrow(/model_fallbacks/);
+  });
+});

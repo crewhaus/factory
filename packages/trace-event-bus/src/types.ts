@@ -437,6 +437,31 @@ export type CircuitStateChangedEvent = TraceEventEnvelope & {
   reason?: string;
 };
 
+/**
+ * Item 22 — emitted by the model-router failover chain each time the serving
+ * candidate changes. `from`/`to` are SPEC model strings (`"claude-opus-4-7"`,
+ * `"openai/gpt-4o-mini"`) — the routing identity, not the wire id — so the
+ * event reads the way the spec's `model` / `model_fallbacks` were written.
+ * Reasons:
+ *   - `breaker_open`     — the previous candidate's circuit breaker is open;
+ *                          traffic routed to the next candidate in the chain.
+ *   - `probe_restore`    — a higher-priority candidate's cooldown elapsed
+ *                          (breaker half-open) and traffic routed back up to
+ *                          probe it — the auto-restore half of the breaker's
+ *                          semantics.
+ *   - `candidate_error`  — the previous candidate could not be constructed
+ *                          when actually tried (missing credential /
+ *                          uninstalled provider package); routed onward.
+ */
+export type ModelFailoverEvent = TraceEventEnvelope & {
+  kind: "model_failover";
+  /** Spec model string of the candidate traffic moved away from. */
+  from: string;
+  /** Spec model string of the candidate now serving. */
+  to: string;
+  reason: "breaker_open" | "probe_restore" | "candidate_error";
+};
+
 export type TraceEvent =
   | TurnStartEvent
   | TurnEndEvent
@@ -461,6 +486,7 @@ export type TraceEvent =
   | CrewDoneEvent
   | CostAccrualEvent
   | CircuitStateChangedEvent
+  | ModelFailoverEvent
   | JanitorActionEvent
   | ResponseRatedEvent
   | TestVerdictEvent

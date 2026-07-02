@@ -92,6 +92,21 @@ export type IrCompaction = {
 };
 
 /**
+ * Item 22 — per-candidate circuit-breaker tuning lowered from the spec's
+ * `agent.circuit_breaker` block. Field names mirror `CircuitBreakerOptions`
+ * in `@crewhaus/circuit-breaker` exactly; every field optional so the
+ * breaker package's own defaults apply per knob. Carried on the agent
+ * blocks of the shapes wired for the failover chain (cli, channel,
+ * managed). Absent when the spec omits the block — declaring it WITHOUT
+ * `modelFallbacks` still breaker-wraps the single primary adapter.
+ */
+export type IrCircuitBreaker = {
+  readonly failureThreshold?: number;
+  readonly windowMs?: number;
+  readonly cooldownMs?: number;
+};
+
+/**
  * Section 55 (Track A) — named failure taxonomy. Cross-cutting; carried
  * through to runtime-core so `recovery-engine` can consult the user's
  * named classes before falling back to its built-in taxonomy.
@@ -227,6 +242,12 @@ export type IrV0 = {
     /** Model max OUTPUT tokens for one turn (spec `agent.max_tokens`).
      *  Optional; when absent the runtime default applies. */
     readonly maxTokens?: number;
+    /** Item 22 — ordered failover models (spec `agent.model_fallbacks`).
+     *  Absent when the spec omits the block; the runtime then keeps its
+     *  single-adapter path. */
+    readonly modelFallbacks?: readonly string[];
+    /** Item 22 — breaker tuning (spec `agent.circuit_breaker`). */
+    readonly circuitBreaker?: IrCircuitBreaker;
   };
   readonly tools: readonly string[];
   readonly toolConfigs: IrToolConfigs;
@@ -484,6 +505,10 @@ export type IrChannelV0 = {
   readonly agent: {
     readonly model: string;
     readonly instructions: string;
+    /** Item 22 — ordered failover models (spec `agent.model_fallbacks`). */
+    readonly modelFallbacks?: readonly string[];
+    /** Item 22 — breaker tuning (spec `agent.circuit_breaker`). */
+    readonly circuitBreaker?: IrCircuitBreaker;
   };
   readonly tools: readonly string[];
   readonly toolConfigs: IrToolConfigs;
@@ -528,6 +553,10 @@ export type IrManagedV0 = {
   readonly agent: {
     readonly model: string;
     readonly instructions: string;
+    /** Item 22 — ordered failover models (spec `agent.model_fallbacks`). */
+    readonly modelFallbacks?: readonly string[];
+    /** Item 22 — breaker tuning (spec `agent.circuit_breaker`). */
+    readonly circuitBreaker?: IrCircuitBreaker;
   };
   readonly tenants: readonly IrManagedTenant[];
   readonly permissions: IrPermissions;

@@ -13,7 +13,9 @@
   },
   "dependencies": {
     "@crewhaus/adapter-anthropic": "workspace:*",
-    "@crewhaus/errors": "workspace:*"
+    "@crewhaus/circuit-breaker": "workspace:*",
+    "@crewhaus/errors": "workspace:*",
+    "@crewhaus/trace-event-bus": "workspace:*"
   },
   "optionalDependencies": {
     "@crewhaus/adapter-bedrock": "workspace:*",

@@ -11,6 +11,7 @@ import type {
   IrChainV0,
   IrChannelV0,
   IrChannels,
+  IrCircuitBreaker,
   IrCompaction,
   IrContractBinding,
   IrCrewRole,
@@ -441,6 +442,42 @@ function lowerCompaction(spec: SpecWithPermissions): IrCompaction {
 }
 
 /**
+ * Item 22 — lower the optional failover-chain fields off an agent block
+ * (`model_fallbacks` + `circuit_breaker`). Mirrors `lowerCompaction`'s
+ * "propagate only defined fields" discipline: the breaker package owns the
+ * per-knob defaults, so the IR carries the user's intent verbatim. Returns
+ * a partial spread into the IR agent object so both fields stay ABSENT when
+ * the spec omits them (emitters gate their codegen on presence).
+ */
+type SpecAgentWithFailover = {
+  readonly model_fallbacks?: readonly string[];
+  readonly circuit_breaker?: {
+    readonly failureThreshold?: number;
+    readonly windowMs?: number;
+    readonly cooldownMs?: number;
+  };
+};
+
+function lowerModelFailover(agent: SpecAgentWithFailover): {
+  modelFallbacks?: readonly string[];
+  circuitBreaker?: IrCircuitBreaker;
+} {
+  const out: { modelFallbacks?: readonly string[]; circuitBreaker?: IrCircuitBreaker } = {};
+  if (agent.model_fallbacks !== undefined && agent.model_fallbacks.length > 0) {
+    out.modelFallbacks = [...agent.model_fallbacks];
+  }
+  const cb = agent.circuit_breaker;
+  if (cb !== undefined) {
+    out.circuitBreaker = {
+      ...(cb.failureThreshold !== undefined ? { failureThreshold: cb.failureThreshold } : {}),
+      ...(cb.windowMs !== undefined ? { windowMs: cb.windowMs } : {}),
+      ...(cb.cooldownMs !== undefined ? { cooldownMs: cb.cooldownMs } : {}),
+    };
+  }
+  return out;
+}
+
+/**
  * Section 55 (Track A) — lower the optional `failure_taxonomy` block.
  * The lower is 1:1 (no normalisation, no dedup, no reordering) so
  * `failureTaxonomy` is added to `OPTIMIZABLE_PATHS` directly.
@@ -692,6 +729,7 @@ export function lower(spec: Spec): IrNode {
           model: spec.agent.model,
           instructions: spec.agent.instructions,
           ...(spec.agent.max_tokens !== undefined ? { maxTokens: spec.agent.max_tokens } : {}),
+          ...lowerModelFailover(spec.agent),
         },
         tools: spec.tools ?? [],
         toolConfigs: lowerToolConfigs(spec.tool_config),
@@ -748,6 +786,7 @@ export function lower(spec: Spec): IrNode {
         agent: {
           model: spec.agent.model,
           instructions: spec.agent.instructions,
+          ...lowerModelFailover(spec.agent),
         },
         tools: spec.agent.tools ?? [],
         toolConfigs: lowerToolConfigs(spec.agent.tool_config),
@@ -808,7 +847,11 @@ export function lower(spec: Spec): IrNode {
         version: 0,
         name: spec.name,
         target: "managed",
-        agent: { model: spec.agent.model, instructions: spec.agent.instructions },
+        agent: {
+          model: spec.agent.model,
+          instructions: spec.agent.instructions,
+          ...lowerModelFailover(spec.agent),
+        },
         tenants: spec.tenants.map((t) => ({
           id: t.id,
           budget: {

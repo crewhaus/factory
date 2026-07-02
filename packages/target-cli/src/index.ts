@@ -449,11 +449,16 @@ if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));`;
     : "";
   const maxTokensField =
     ir.agent.maxTokens !== undefined ? `\n  maxTokens: ${ir.agent.maxTokens},` : "";
+  // Item 22 — provider failover chain: thread `agent.model_fallbacks` +
+  // `agent.circuit_breaker` into the runtime, which constructs the
+  // breaker-driven meta-adapter (see @crewhaus/model-router). Emitted only
+  // when the spec declared them so existing bundles stay byte-identical.
+  const failoverFields = renderModelFailoverFields(ir);
   const runChatLoopCall = `await runChatLoop({
   model: ${escapeJsonString(ir.agent.model)},
   instructions: ${escapeJsonString(ir.agent.instructions)},
   sessionName: ${escapeJsonString(ir.name)},
-  sessionTarget: "cli",${maxTokensField}${toolsField}${permField}${sandboxField}
+  sessionTarget: "cli",${maxTokensField}${failoverFields}${toolsField}${permField}${sandboxField}
   hooks: __hooks,
   skills: __skills,
   slashCommands: __slashCommands,${subAgents.subAgentsField}${subAgents.spawnField}${egress.field}
@@ -480,6 +485,36 @@ ${extensionBoot}
 
 ${bannerBoot}${subAgentsBoot}${egressBoot}${mcpBoot}${wrapped}
 `;
+}
+
+/**
+ * Item 22 — render the failover-chain runChatLoop fields from the IR agent
+ * block. Model strings pass through `escapeJsonString` (they are
+ * user-controlled spec values landing in generated source); the breaker
+ * tuning is a numbers-only object safe to JSON.stringify. Returns "" when
+ * the spec declared neither field, keeping pre-existing bundles
+ * byte-identical. Mirror: target-channel-bot + target-managed render the
+ * same fields — keep the three in sync.
+ */
+function renderModelFailoverFields(ir: {
+  readonly agent: {
+    readonly modelFallbacks?: readonly string[];
+    readonly circuitBreaker?: {
+      readonly failureThreshold?: number;
+      readonly windowMs?: number;
+      readonly cooldownMs?: number;
+    };
+  };
+}): string {
+  const pieces: string[] = [];
+  const fallbacks = ir.agent.modelFallbacks;
+  if (fallbacks !== undefined && fallbacks.length > 0) {
+    pieces.push(`\n  modelFallbacks: [${fallbacks.map((m) => escapeJsonString(m)).join(", ")}],`);
+  }
+  if (ir.agent.circuitBreaker !== undefined) {
+    pieces.push(`\n  circuitBreaker: ${JSON.stringify(ir.agent.circuitBreaker)},`);
+  }
+  return pieces.join("");
 }
 
 /**

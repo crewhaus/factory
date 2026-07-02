@@ -33,6 +33,8 @@ const PALETTE: Record<TraceEventKind, string> = {
   // Section 27 — production hardening events
   cost_accrual: "\x1b[2m", // dim — high-volume per-response accruals
   circuit_state_changed: "\x1b[31m", // red — degradation warnings stand out
+  // Item 22 — provider failover chain rerouted a model call
+  model_failover: "\x1b[91m", // bright red — a provider switch is a headline
   // Human feedback channel — a user rating on an assistant turn.
   response_rated: "\x1b[92m", // bright green — a human signal worth spotting
   // Ops item 36 — boot-time self-heal janitor maintenance actions.

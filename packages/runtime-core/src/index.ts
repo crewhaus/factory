@@ -27,7 +27,12 @@ import {
 import { ConfigError, RuntimeError } from "@crewhaus/errors";
 import { type EventKind, type EventLog, openEventLog } from "@crewhaus/event-log";
 import { type HookDef, type HookEvent, aggregateDecisions, runHooks } from "@crewhaus/hooks-engine";
-import { parseModelString, resolveModel } from "@crewhaus/model-router";
+import {
+  type FailoverChain,
+  createFailoverChain,
+  parseModelString,
+  resolveModel,
+} from "@crewhaus/model-router";
 import {
   BUILTIN_DEFAULT_RULES,
   type JustificationJudge,
@@ -338,6 +343,14 @@ export type RunChatLoopOptions = {
    * When omitted, defaults to `_adapter` (or the routed primary).
    */
   _compactionAdapter?: ProviderAdapter;
+  /**
+   * Item 22 — same injection contract as `_adapter`, for the failover
+   * chain's fallback candidates: pre-built adapters keyed by their spec
+   * model string, bypassing the model-router. Only consulted when
+   * `modelFallbacks` is non-empty. Tests script per-candidate failures
+   * through this map; production callers leave it undefined.
+   */
+  _failoverAdapters?: ReadonlyMap<string, ProviderAdapter>;
   /** Override the input stream (testing). Defaults to process.stdin. */
   input?: NodeJS.ReadableStream;
   /** Tools the model may invoke. When empty/undefined, tools are not advertised. */
@@ -535,16 +548,36 @@ export type RunChatLoopOptions = {
    */
   maxToolIterations?: number;
   /**
-   * Section 27 — wrap the resolved primary `ProviderAdapter` in a circuit
-   * breaker before any `stream()` call. When the breaker trips, subsequent
-   * model calls reject immediately rather than hammering a degraded
-   * upstream. Set via codegen when the spec lists `circuit_breaker:` opts.
+   * Section 27 / item 22 — wrap the resolved primary `ProviderAdapter` in a
+   * circuit breaker before any `stream()` call. When the breaker trips,
+   * subsequent model calls reject immediately rather than hammering a
+   * degraded upstream. Set by codegen (and the `crewhaus run` path) from the
+   * spec's `agent.circuit_breaker` block; field names mirror
+   * `CircuitBreakerOptions` in `@crewhaus/circuit-breaker`. When
+   * `modelFallbacks` is also set, this tuning applies to EVERY candidate's
+   * breaker in the failover chain.
    */
   circuitBreaker?: {
     readonly failureThreshold?: number;
     readonly windowMs?: number;
     readonly cooldownMs?: number;
   };
+  /**
+   * Item 22 — ordered fallback model strings (spec `agent.model_fallbacks`).
+   * When non-empty, the primary adapter is replaced by a
+   * `@crewhaus/model-router` failover chain: every candidate (primary
+   * first) gets its own circuit breaker, each model call routes to the
+   * first candidate whose breaker admits traffic, and routing changes are
+   * published as `model_failover` trace events. Fallbacks resolve their
+   * credentials lazily via the normal `resolveModel` path — a candidate
+   * with a missing key warns at boot (doctor-style, stderr) and is skipped
+   * when actually tried, never hard-failing boot. v1 scope: only the
+   * primary agent model gets the chain — `compactionModel` (when it names
+   * its own model) and judge/grader slots keep their single adapters. When
+   * compaction reuses the primary model (no `compactionModel`), it flows
+   * through the same chain by construction.
+   */
+  modelFallbacks?: ReadonlyArray<string>;
   /**
    * Section 27 — pre-call rate gating. The runtime calls
    * `rateLimiter.acquire(rateLimitKeys, 1)` before each model invocation.
@@ -690,21 +723,55 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         providerId: opts._adapter.providerId,
       }
     : await resolveModel(opts.model);
-  // Section 27 — wrap the primary adapter in a circuit breaker when
-  // `circuitBreaker` opts are set (or by default in production codegen).
-  // The breaker is hung off the run-context's bus so state-change events
-  // surface for audit-log + structured-event-printer + OTel.
+  // Section 27 / item 22 — resilience wrapping around the primary adapter.
+  //   - `modelFallbacks` non-empty → a model-router failover chain: every
+  //     candidate (primary first) breaker-wrapped with the `circuitBreaker`
+  //     tuning; calls route to the first candidate whose breaker admits
+  //     traffic; `model_failover` trace events surface routing changes.
+  //   - `circuitBreaker` alone → the single-adapter breaker wrap.
+  // The chain publishes through a LATE-BOUND bus getter: the run's real bus
+  // is minted below (createRunContext), so `observabilityBus` is re-pointed
+  // at it once it exists — a `crewhaus run` without a caller-supplied
+  // runContext still surfaces model_failover + circuit_state_changed.
   const baseAdapter: ProviderAdapter = primaryResolution.adapter;
   let breakerWrap: WrappedAdapter | undefined;
-  const adapter: ProviderAdapter = (() => {
-    if (opts.circuitBreaker === undefined) return baseAdapter;
+  let failoverChain: FailoverChain | undefined;
+  let observabilityBus: TraceEventBus | undefined = opts.runContext?.eventBus;
+  const modelFallbacks = opts.modelFallbacks ?? [];
+  let adapter: ProviderAdapter;
+  if (modelFallbacks.length > 0) {
+    // Seed the chain with the already-resolved primary (honours `_adapter`
+    // injection and avoids a second resolveModel round-trip) plus any
+    // test-injected fallback adapters.
+    const injectedAdapters = new Map<string, ProviderAdapter>();
+    injectedAdapters.set(opts.model, baseAdapter);
+    for (const [modelString, injected] of opts._failoverAdapters ?? []) {
+      injectedAdapters.set(modelString, injected);
+    }
+    failoverChain = await createFailoverChain({
+      model: opts.model,
+      fallbacks: modelFallbacks,
+      ...(opts.circuitBreaker !== undefined ? { breaker: opts.circuitBreaker } : {}),
+      getBus: () => observabilityBus,
+      adapters: injectedAdapters,
+    });
+    // Doctor-style boot report: fallbacks that failed credential/package
+    // resolution are listed once, loudly, on stderr — and stay in the chain
+    // (they are re-tried when routing actually reaches them; see item 22).
+    for (const warning of failoverChain.warnings()) {
+      process.stderr.write(`[failover] ${warning}\n`);
+    }
+    adapter = failoverChain;
+  } else if (opts.circuitBreaker !== undefined) {
     breakerWrap = wrapWithCircuitBreaker(baseAdapter, {
       ...opts.circuitBreaker,
       adapterName: baseAdapter.providerId,
       bus: opts.runContext?.eventBus,
     });
-    return breakerWrap;
-  })();
+    adapter = breakerWrap;
+  } else {
+    adapter = baseAdapter;
+  }
   void breakerWrap; // exposed via runtime stats once gateway/eval consumers land
   const providerId: ProviderId = primaryResolution.providerId;
   const wireModelId: string = primaryResolution.modelId;
@@ -727,6 +794,11 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     compactionAdapter = c.adapter;
     compactionWireModelId = c.modelId;
   } else {
+    // Item 22 v1 scope note: with no explicit `compactionModel`, compaction
+    // reuses the primary adapter — which IS the failover chain when
+    // `modelFallbacks` is set, so compaction inherits the chain by
+    // construction. An explicit `compactionModel` keeps its own single
+    // adapter (no chain), as do judge/grader slots.
     compactionAdapter = adapter;
     compactionWireModelId = wireModelId;
   }
@@ -811,7 +883,26 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // run with `OTEL_EXPORTER_OTLP_ENDPOINT` set automatically exports.
   const bus: TraceEventBus = runContext.eventBus;
   void TraceEventBus; // keep type import alive for future direct constructions
+  // Item 22 — re-point the failover chain's late-bound bus getter at the
+  // run's real bus (see the chain construction above): the chain and its
+  // per-candidate breakers publish model_failover / circuit_state_changed
+  // through this reference from the first stream() call onward.
+  observabilityBus = bus;
   const subscribers = await attachDefaultSubscribers(bus, runContext);
+
+  // Item 22 — surface each failover on stderr so an operator watching a
+  // plain (non-CREWHAUS_TRACE) run still sees provider switches. NOTE: the
+  // advisor-events session-log subscriber pattern has NOT landed on main
+  // (packages/event-log has no advisor kind) — when it does, failovers
+  // should ALSO persist into the session JSONL through it; until then the
+  // trace event + this stderr note are the observable surfaces.
+  let failoverNoteUnsubscribe: Unsubscribe | undefined;
+  if (failoverChain !== undefined) {
+    failoverNoteUnsubscribe = bus.subscribe((event): void => {
+      if (event.kind !== "model_failover") return;
+      process.stderr.write(`[failover] ${event.from} → ${event.to} (${event.reason})\n`);
+    });
+  }
 
   // Working-indicator spinner. Auto-enables only for an interactive REPL on a
   // TTY (see `isSpinnerEnabled`); `singleTurn`/injected-`input`/piped runs stay
@@ -1733,12 +1824,21 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             // → `us.anthropic.…`) so cost-tracker pricing lookups and the
             // OTel `gen_ai.request.model` attribute match; the original
             // spec string rides along as `specModel` when it differs.
+            // Item 22 — with a failover chain the serving candidate may not
+            // be the primary: stamp the request with the chain's routing
+            // plan (best-effort; the response event below uses lastServed(),
+            // which is exact, so cost-tracker pricing always keys on the
+            // model that actually served).
+            const plannedCandidate = failoverChain?.plan();
+            const reqWireModelId = plannedCandidate?.modelId ?? wireModelId;
+            const reqProviderId = plannedCandidate?.providerId ?? providerId;
+            const reqSpecModel = plannedCandidate?.modelString ?? opts.model;
             bus.publish({
               ...modelStartEnv,
               kind: "model_request",
-              model: wireModelId,
-              ...(opts.model !== wireModelId ? { specModel: opts.model } : {}),
-              provider: providerId,
+              model: reqWireModelId,
+              ...(reqSpecModel !== reqWireModelId ? { specModel: reqSpecModel } : {}),
+              provider: reqProviderId,
               messageCount: messages.length,
               toolCount: anthropicTools?.length ?? 0,
               streaming: opts.streaming === true,
@@ -1760,8 +1860,11 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             // bookkeeping is wire-compatible for the block kinds we
             // actually consume (text / image / tool_use / tool_result
             // / thinking).
+            // Item 22 — the failover chain rewrites `model` per serving
+            // candidate internally; the planned id here is the single-adapter
+            // value and the chain's best-effort prediction otherwise.
             const reqStream = adapter.stream({
-              model: wireModelId,
+              model: reqWireModelId,
               system: systemBlocks.map((b) => ({
                 type: "text" as const,
                 text: b.text,
@@ -1845,15 +1948,20 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 await logEvent("assistant_message", { content: committedStreamContent });
               }
               terminalContent = [...committedStreamContent] as Anthropic.ContentBlock[];
+              // Item 22 — lastServed() is exact: the candidate that actually
+              // streamed this response. Cost-tracker prices off this pair.
+              const servedStreaming = failoverChain?.lastServed();
+              const respModelIdS = servedStreaming?.modelId ?? wireModelId;
+              const respSpecModelS = servedStreaming?.modelString ?? opts.model;
               bus.publish({
                 ...bus.envelope(),
                 spanId: modelStartEnv.spanId,
                 kind: "model_response",
                 // Wire model id, NOT the spec string — cost-tracker resolves
                 // pricing on this field (see the model_request publish above).
-                model: wireModelId,
-                ...(opts.model !== wireModelId ? { specModel: opts.model } : {}),
-                provider: providerId,
+                model: respModelIdS,
+                ...(respSpecModelS !== respModelIdS ? { specModel: respSpecModelS } : {}),
+                provider: servedStreaming?.providerId ?? providerId,
                 stopReason: stopReason ?? "end_turn",
                 usage,
                 durationMs: performance.now() - t0Model,
@@ -1914,15 +2022,20 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             });
             endTurn();
 
+            // Item 22 — lastServed() is exact: the candidate that actually
+            // streamed this response. Cost-tracker prices off this pair.
+            const servedCandidate = failoverChain?.lastServed();
+            const respWireModelId = servedCandidate?.modelId ?? wireModelId;
+            const respSpecModel = servedCandidate?.modelString ?? opts.model;
             bus.publish({
               ...bus.envelope(),
               spanId: modelStartEnv.spanId,
               kind: "model_response",
               // Wire model id, NOT the spec string — cost-tracker resolves
               // pricing on this field (see the model_request publish above).
-              model: wireModelId,
-              ...(opts.model !== wireModelId ? { specModel: opts.model } : {}),
-              provider: providerId,
+              model: respWireModelId,
+              ...(respSpecModel !== respWireModelId ? { specModel: respSpecModel } : {}),
+              provider: servedCandidate?.providerId ?? providerId,
               stopReason: final.stopReason,
               usage: final.usage,
               durationMs: performance.now() - t0Model,
@@ -2251,6 +2364,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       await subscribers.flushAll();
       await subscribers.shutdownAll();
       costPersistUnsubscribe?.();
+      failoverNoteUnsubscribe?.();
       await sessionStore
         .update(sessionId, { lastTurnIndex: runContext.turnNumber })
         .catch((err) => {
@@ -2470,6 +2584,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     await subscribers.flushAll();
     await subscribers.shutdownAll();
     costPersistUnsubscribe?.();
+    failoverNoteUnsubscribe?.();
     if (shouldInstallSigint) {
       process.removeListener("SIGINT", sigintHandler);
     }

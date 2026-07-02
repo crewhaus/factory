@@ -476,6 +476,19 @@ describe("formatBody — every kind + optional-field branches", () => {
     expect(formatLine(ev)).toBe(`${prefix("circuit_state_changed")}adapter=openai open→half_open`);
   });
 
+  test("model_failover renders from/to/reason (item 22)", () => {
+    const ev = {
+      ...envelope,
+      kind: "model_failover",
+      from: "claude-opus-4-7",
+      to: "openai/gpt-4o-mini",
+      reason: "breaker_open",
+    } satisfies TraceEvent;
+    expect(formatLine(ev)).toBe(
+      `${prefix("model_failover")}from=claude-opus-4-7 to=openai/gpt-4o-mini reason=breaker_open`,
+    );
+  });
+
   test("test_verdict WITH reason includes it", () => {
     const ev = {
       ...envelope,

@@ -173,3 +173,25 @@ describe("TargetEmitError", () => {
     });
   });
 });
+
+describe("emitManaged — provider failover chain (item 22)", () => {
+  test("agent.ts threads modelFallbacks + circuitBreaker into runChatLoop when set", () => {
+    const irFailover: IrManagedV0 = {
+      ...ir,
+      agent: {
+        ...ir.agent,
+        modelFallbacks: ["openai/gpt-4o-mini"],
+        circuitBreaker: { cooldownMs: 5000 },
+      },
+    };
+    const agentTs = emitManaged(irFailover).files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agentTs).toContain('modelFallbacks: ["openai/gpt-4o-mini"],');
+    expect(agentTs).toContain('circuitBreaker: {"cooldownMs":5000},');
+  });
+
+  test("agent.ts omits both fields when the IR leaves them unset", () => {
+    const agentTs = emitManaged(ir).files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agentTs).not.toContain("modelFallbacks:");
+    expect(agentTs).not.toContain("circuitBreaker:");
+  });
+});

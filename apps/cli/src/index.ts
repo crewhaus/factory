@@ -1698,6 +1698,20 @@ async function runRunCli(
       ...(ir.target === "cli" && ir.agent.maxTokens !== undefined
         ? { maxTokens: ir.agent.maxTokens }
         : {}),
+      // Item 22 — provider failover chain: thread `agent.model_fallbacks` +
+      // `agent.circuit_breaker` through to the runtime, mirroring the
+      // target-cli codegen path. Skipped when `--model` overrides the
+      // primary — a flag-forced model is an explicit routing decision and
+      // the spec's fallback chain was authored against the spec's primary.
+      ...(ir.target === "cli" &&
+      typeof modelOverride !== "string" &&
+      ir.agent.modelFallbacks !== undefined &&
+      ir.agent.modelFallbacks.length > 0
+        ? { modelFallbacks: ir.agent.modelFallbacks }
+        : {}),
+      ...(ir.target === "cli" && ir.agent.circuitBreaker !== undefined
+        ? { circuitBreaker: ir.agent.circuitBreaker }
+        : {}),
       ...(resumeId !== undefined ? { resume: { sessionId: resumeId } } : {}),
       ...(justificationJudge !== undefined ? { justificationJudge } : {}),
       ...(justificationAuditSink !== undefined ? { justificationAuditSink } : {}),

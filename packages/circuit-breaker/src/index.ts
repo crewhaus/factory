@@ -10,10 +10,13 @@
  *
  * Composes with `model-router` for TypeScript-level failover: callers
  * hold one breaker per resolved model and route to the next candidate
- * when a breaker is open (there is no spec-level fallback field). The
- * wrapper does not own the fallback policy itself — it just refuses to
- * stream when open. Downstream `recovery-engine` is upstream of the breaker;
- * it should never retry into a tripped breaker.
+ * when a breaker is open. That composition is built (item 22):
+ * `model-router`'s `createFailoverChain` wraps each candidate of the
+ * spec's `agent.model` + `agent.model_fallbacks` in its own breaker and
+ * routes per call, with `agent.circuit_breaker` carrying this package's
+ * tuning knobs. The wrapper does not own the fallback policy itself — it
+ * just refuses to stream when open. Downstream `recovery-engine` is
+ * upstream of the breaker; it should never retry into a tripped breaker.
  *
  * Optionally takes a `TraceEventBus` so state changes surface as
  * `circuit_state_changed` TraceEvents (audit-log, OTel, structured

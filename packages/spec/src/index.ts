@@ -183,6 +183,42 @@ const toolConfigBlock = z
   .optional();
 
 /**
+ * Item 22 — spec-declared provider failover chain, on the agent blocks of
+ * the shapes whose emitted runtime calls `runChatLoop` with a single
+ * primary model (cli, channel, managed today).
+ *
+ * `model_fallbacks` is an ordered list of model strings tried when the
+ * primary's circuit breaker is open — each entry follows the SAME
+ * model-string grammar as `agent.model` (`claude-*`, `openai/*`,
+ * `bedrock/*`, `groq/*`, …; validated like `agent.model` at parse time,
+ * with the full grammar enforced by the model-router when resolved).
+ * Cross-provider fallbacks resolve their own credentials lazily via the
+ * normal model-router path — a fallback with a missing key warns at boot
+ * and is skipped when tried, never hard-failing the run.
+ *
+ * `circuit_breaker` tunes the per-candidate breakers. Field names mirror
+ * `CircuitBreakerOptions` in `@crewhaus/circuit-breaker` exactly
+ * (failureThreshold / windowMs / cooldownMs); package defaults (5 failures
+ * / 60s window / 30s cooldown) apply per field when omitted. Declaring
+ * `circuit_breaker` WITHOUT `model_fallbacks` is valid: the primary
+ * adapter alone gets breaker-wrapped (fail-fast on a degraded provider
+ * instead of hammering it).
+ */
+const modelFallbacksBlock = z.array(z.string().min(1)).min(1).optional();
+
+const circuitBreakerBlock = z
+  .object({
+    /** Consecutive failures inside windowMs that trip the breaker. */
+    failureThreshold: z.number().int().positive().optional(),
+    /** Window for counting consecutive failures (ms). */
+    windowMs: z.number().int().positive().optional(),
+    /** How long the breaker stays open before allowing a probe (ms). */
+    cooldownMs: z.number().int().positive().optional(),
+  })
+  .strict()
+  .optional();
+
+/**
  * Section 17 — optional override for the model used by
  * `compaction-autocompact` when summarising long conversations. Defaults
  * to the agent's primary model when omitted, but you can target a
@@ -476,6 +512,9 @@ const cliSchema = z
         // runtime default applies. Raise it for turns that emit large
         // multi-file edits so the model isn't cut off mid-`tool_use`.
         max_tokens: z.number().int().positive().optional(),
+        // Item 22 — provider failover chain (see modelFallbacksBlock docs).
+        model_fallbacks: modelFallbacksBlock,
+        circuit_breaker: circuitBreakerBlock,
         sub_agents: subAgentsBlock,
       })
       .strict(),
@@ -605,6 +644,9 @@ const channelAgentSchema = z
   .object({
     model: z.string().min(1),
     instructions: z.string().min(1),
+    // Item 22 — provider failover chain (see modelFallbacksBlock docs).
+    model_fallbacks: modelFallbacksBlock,
+    circuit_breaker: circuitBreakerBlock,
     tools: z.array(z.string().min(1)).optional(),
     tool_config: toolConfigBlock,
     sub_agents: subAgentsBlock,
@@ -700,6 +742,9 @@ const managedAgentSchema = z
   .object({
     model: z.string().min(1),
     instructions: z.string().min(1),
+    // Item 22 — provider failover chain (see modelFallbacksBlock docs).
+    model_fallbacks: modelFallbacksBlock,
+    circuit_breaker: circuitBreakerBlock,
   })
   .strict();
 
@@ -1184,6 +1229,8 @@ export type SpecEval = z.infer<typeof evalSchema>;
 export type SpecMcpServerConfig = z.infer<typeof mcpServerConfigSchema>;
 export type SpecSubAgentDefinition = z.infer<typeof subAgentDefinitionSchema>;
 export type SpecCompactionBlock = z.infer<typeof compactionBlock>;
+export type SpecModelFallbacks = z.infer<typeof modelFallbacksBlock>;
+export type SpecCircuitBreakerBlock = z.infer<typeof circuitBreakerBlock>;
 export type SpecSecurityBlock = z.infer<typeof securityBlock>;
 export type SpecFeedbackBlock = z.infer<typeof feedbackBlock>;
 export type SpecFailureTaxonomyEntry = z.infer<typeof failureTaxonomyEntrySchema>;
