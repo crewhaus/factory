@@ -7,6 +7,7 @@ import {
   readFileSync,
   readdirSync,
   realpathSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -164,6 +165,21 @@ import {
   createEgressMatcher,
   resolveEgressMatcherChoice,
 } from "./egress-matcher";
+// Item 6 — `crewhaus eval coverage`: production-vs-eval behavior gap
+// detection, in a side-effect-free module so it is unit-testable (this entry
+// file runs an argv switch on import).
+import {
+  type CoverageSample,
+  DEFAULT_COVERAGE_SESSIONS,
+  EvalCoverageError,
+  buildEvalCoverage,
+  buildProdBehavior,
+  computeCoverage,
+  coverageFileName,
+  parseCoverageFormat,
+  parseSessionsFlag,
+  renderCoverage,
+} from "./eval-coverage";
 // Run-history item 3 — post-eval index append + baseline diff/gate/promote,
 // in a side-effect-free module so it is unit-testable (this entry file runs
 // an argv switch on import).
@@ -620,6 +636,24 @@ const EVAL_SCHEMA: ParseArgsSchema = {
   ],
 };
 
+// Item 6 — `crewhaus eval coverage`: detect agent behaviors present in
+// production sessions that no eval sample exercises.
+const EVAL_COVERAGE_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // How many of the cwd spec's most-recent sessions to scan (default 50; `all`).
+    { name: "sessions", takesValue: true },
+    // Intersect against a dataset's expected_tools (file or registry:<ref>);
+    // defaults to the conventional eval/dataset.jsonl next to the cwd spec.
+    { name: "dataset", takesValue: true },
+    // Accepted for symmetry with the other eval-flywheel commands; unused —
+    // coverage is grader-agnostic (it intersects tool behavior, not graders).
+    { name: "graders", takesValue: true },
+    { name: "out", short: "o", takesValue: true },
+    { name: "format", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
 const EVAL_REPORT_SCHEMA: ParseArgsSchema = {
   flags: [
     { name: "out", short: "o", takesValue: true },
@@ -878,6 +912,9 @@ function usageText(): string {
     "                                      (cells write to <out>/<model-slug>/; emits matrix.json",
     "                                      + index.html; incompatible with --gate/--no-promote)",
     "       --dataset also accepts registry:<name>[@version][#split] (Section 29 registry)",
+    "  eval coverage                        detect prod behaviors no eval sample exercises (item 6):",
+    "       [--sessions N|all] [--dataset <d>]  tool/MCP/bigram/compaction gaps ranked by prod",
+    "       [-o <dir>] [--format text|html|json] frequency; json is a backlog for `dataset mine`",
     "  eval-report diff <prev> <new>        compare two eval runs and emit a diff report",
     "       [-o <out-dir>]",
     "  eval-report history                  list recorded runs (.crewhaus/evals/index.jsonl)",
@@ -3719,6 +3756,156 @@ async function collectSamples(iter: AsyncIterable<Sample>): Promise<Sample[]> {
   const out: Sample[] = [];
   for await (const s of iter) out.push(s);
   return out;
+}
+
+/** Session ids under `.crewhaus/sessions`, newest first (by file mtime). */
+function sessionIdsByRecency(sessionsDir: string): string[] {
+  return listSessionIds(sessionsDir)
+    .map((id) => {
+      let mtime = 0;
+      try {
+        mtime = statSync(join(sessionsDir, `${id}.jsonl`)).mtimeMs;
+      } catch {
+        // A vanished file just sorts last.
+      }
+      return { id, mtime };
+    })
+    .sort((a, b) => b.mtime - a.mtime || (a.id < b.id ? -1 : 1))
+    .map((e) => e.id);
+}
+
+/**
+ * Item 6 — `crewhaus eval coverage`: build the production behavior
+ * distribution from the cwd spec's session JSONLs, intersect it with what the
+ * dataset (+ the most recent eval run for this spec) exercises, and print a
+ * ranked backlog of gaps. Never mutates anything — a pure read-side report.
+ */
+async function runEvalCoverage(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus eval coverage [--sessions N|all] [--dataset <file|registry:ref>]\n" +
+        "                              [-o <dir>] [--format text|html|json]\n" +
+        "  Detect agent behaviors present in PRODUCTION sessions that no eval sample\n" +
+        "  exercises (item 6). Builds a behavior distribution from the cwd spec's\n" +
+        "  .crewhaus/sessions/*.jsonl — tool/MCP call frequencies (mcp__-prefixed =\n" +
+        "  MCP), tool sequence bigrams, compaction frequency, clustered user inputs —\n" +
+        "  and intersects it with the dataset's expected_tools plus the tools used in\n" +
+        "  the most recent eval run for this spec (via the run-history index). Reports\n" +
+        "  a ranked list of gaps: 'mcp__jira__CreateIssue appears in 31% of sessions\n" +
+        "  but 0 dataset samples', 'compaction fired in N sessions, never in eval',\n" +
+        "  prod tool sequences no expected_tools covers. --dataset defaults to the\n" +
+        "  conventional eval/dataset.jsonl next to the cwd spec. --format json emits a\n" +
+        "  ranked backlog consumable by `crewhaus dataset mine`.\n",
+    );
+    return;
+  }
+
+  let format: ReturnType<typeof parseCoverageFormat>;
+  let sessionsWanted: number | "all";
+  try {
+    format = parseCoverageFormat(strFlag(args, "format"));
+    sessionsWanted = parseSessionsFlag(strFlag(args, "sessions"));
+  } catch (err) {
+    if (err instanceof EvalCoverageError) die(err.message);
+    throw err;
+  }
+
+  // The cwd spec identifies which sessions/runs belong to this harness.
+  const cwdSpecPath = join(process.cwd(), "crewhaus.yaml");
+  const cwdSpecText = existsSync(cwdSpecPath) ? readFileSync(cwdSpecPath, "utf-8") : undefined;
+  let specName: string | undefined;
+  if (cwdSpecText !== undefined) {
+    try {
+      specName = parseSpec(cwdSpecText).name;
+    } catch {
+      // Unparseable cwd spec — still report over every session/run.
+    }
+  }
+
+  // ---- production behavior ----
+  const sessionsDir = join(process.cwd(), SESSIONS_SUBDIR);
+  const allIds = sessionIdsByRecency(sessionsDir);
+  const ids = sessionsWanted === "all" ? allIds : allIds.slice(0, sessionsWanted);
+  if (ids.length === 0) {
+    die(
+      `no sessions found under ${sessionsDir} — run the harness (crewhaus run) to accumulate production behavior first`,
+    );
+  }
+  const sessions = ids.map((id) => ({ sessionId: id, events: readSessionEvents(id) }));
+  const prod = buildProdBehavior(sessions);
+
+  // ---- eval coverage: dataset expected_tools ----
+  const datasetFlag = strFlag(args, "dataset");
+  const datasetArg = datasetFlag ?? join("eval", "dataset.jsonl");
+  const samples: CoverageSample[] = [];
+  let datasetName: string | undefined;
+  let datasetResolved = false;
+  try {
+    const registryRef = parseRegistryRef(datasetArg);
+    if (registryRef !== undefined) {
+      const registry = createFileBackedRegistry({ rootDir: defaultDatasetsRoot() });
+      const resolved = await resolveRegistryRef(registry, registryRef);
+      for (const s of resolved.samples) samples.push(s);
+      datasetName = resolved.datasetName;
+      datasetResolved = true;
+    } else {
+      const absDataset = resolve(datasetArg);
+      if (existsSync(absDataset)) {
+        const dataset = await loadDataset(absDataset);
+        for await (const s of dataset.samples) samples.push(s);
+        datasetName = dataset.name;
+        datasetResolved = true;
+      }
+    }
+  } catch (err) {
+    // A missing/unreadable dataset is not fatal for a coverage report — we can
+    // still report against the eval-run events and flag that no expected_tools
+    // baseline was available. Registry/ref errors surface as a warning.
+    if (err instanceof DatasetRefError || err instanceof CrewhausError) {
+      process.stderr.write(`[coverage] dataset "${datasetArg}" unusable (${err.message})\n`);
+    } else {
+      throw err;
+    }
+  }
+  if (!datasetResolved && datasetFlag !== undefined) {
+    die(`--dataset "${datasetArg}" not found or unreadable`);
+  }
+
+  // ---- eval coverage: most recent eval run's per-sample tool usage ----
+  const runEventTexts: string[] = [];
+  const entries = readRunIndex().filter((e) => specName === undefined || e.specName === specName);
+  const latest = entries[entries.length - 1];
+  if (latest !== undefined) {
+    try {
+      const run = await loadRun(latest.outDir);
+      for (const sample of Object.values(run.perSample)) {
+        if (sample.events.trim() !== "") runEventTexts.push(sample.events);
+      }
+    } catch {
+      // A vanished/torn run dir just means no run-event coverage this pass.
+    }
+  }
+
+  const evalCov = buildEvalCoverage(samples, runEventTexts);
+  const report = computeCoverage({
+    prod,
+    evalCov,
+    ...(specName !== undefined ? { specName } : {}),
+    ...(datasetName !== undefined ? { datasetName } : {}),
+  });
+
+  const rendered = renderCoverage(report, format);
+  const outDir = strFlag(args, "out");
+  if (outDir !== undefined) {
+    mkdirSync(resolve(outDir), { recursive: true });
+    const outPath = join(resolve(outDir), coverageFileName(format));
+    writeFileSync(outPath, rendered);
+    process.stdout.write(
+      `[coverage] ${report.gaps.length} gap(s) across ${report.sessionsScanned} session(s) → ${outPath}\n`,
+    );
+  } else {
+    process.stdout.write(rendered);
+  }
 }
 
 async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
@@ -6651,7 +6838,18 @@ switch (subcommand) {
     }
     break;
   case "eval":
-    await runEvalSubcommand(parseFor(rest, EVAL_SCHEMA));
+    // Item 6 — `eval coverage` is a distinct read-side report with its own
+    // flags; every other `eval …` invocation is the run path.
+    if (rest[0] === "coverage") {
+      try {
+        await runEvalCoverage(parseFor(rest.slice(1), EVAL_COVERAGE_SCHEMA));
+      } catch (err) {
+        if (err instanceof CrewhausError) die(err.message);
+        throw err;
+      }
+    } else {
+      await runEvalSubcommand(parseFor(rest, EVAL_SCHEMA));
+    }
     break;
   case "eval-report":
     await runEvalReport(parseFor(rest, EVAL_REPORT_SCHEMA));
