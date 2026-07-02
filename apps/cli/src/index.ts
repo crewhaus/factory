@@ -127,6 +127,21 @@ import { EVAL_CI_WORKFLOW_RELPATH, buildEvalCiWorkflowYaml } from "./ci-scaffold
 // Item 34 — scheduling ergonomics for `compliance evidence` (--period current
 // resolution + the empty-evidence gate), side-effect-free for the same reason.
 import { findEmptyControls, resolvePeriodFlag } from "./compliance-schedule";
+// Item 2 — `crewhaus dataset mine` + `dataset synthesize`: grow the dataset
+// from production struggle signals + PII-redacted stress variants, in a
+// side-effect-free module so it is unit-testable (this entry file runs an argv
+// switch on import).
+import {
+  type MineCandidate,
+  buildStressVariants,
+  candidateToSample,
+  dedupeCandidates,
+  egressBlocksFromAudit,
+  mineSession,
+  parseReviewKey,
+  renderCandidateList,
+  variantToSample,
+} from "./dataset-mine";
 // Item 12 — dataset-registry CLI plumbing (the `datasets` subcommand family,
 // `distill --register` promotion, and the `--dataset registry:` shorthand
 // shared by eval + optimize), in a side-effect-free module so it is
@@ -729,6 +744,34 @@ const DATASETS_SCHEMA: ParseArgsSchema = {
   ],
 };
 
+// Item 2 — the `dataset` (singular) growth subcommand family:
+// `dataset mine` + `dataset synthesize` (+ item-5 `dataset refresh-goldens`).
+const DATASET_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // mine — how many recent sessions to scan (default 50; `all`).
+    { name: "sessions", takesValue: true },
+    // mine — register accepted candidates into this mined registry dataset
+    // (default <spec>-hardcases).
+    { name: "out-dataset", takesValue: true },
+    // mine — accept/reject quarantined candidates (interactive in a TTY;
+    // non-TTY prints the list).
+    { name: "review", takesValue: false },
+    // synthesize — the source dataset (file or registry:<ref>) to grow from.
+    { name: "from", takesValue: true },
+    // synthesize — how many variants to generate per source sample.
+    { name: "count", takesValue: true },
+    // synthesize — dollar cap for model paraphrases (budget-gate pattern).
+    { name: "budget-usd", takesValue: true },
+    // refresh-goldens (item 5) — the dataset whose golds to reconcile.
+    { name: "dataset", takesValue: true },
+    { name: "min-score", takesValue: true },
+    { name: "apply", takesValue: false },
+    // Model for synthesize paraphrases / refresh (model-router grammar).
+    { name: "model", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
 const STATE_SCHEMA: ParseArgsSchema = {
   flags: [
     // backup
@@ -974,6 +1017,12 @@ function usageText(): string {
     "       [--split train|dev|test]",
     "  datasets put <name> --file <f.jsonl> import a file as a new auto-bumped version",
     "       [--split-spec 70/15/15 | --split train]",
+    "  dataset mine [--sessions N|all]      mine hard cases from session struggle signals (item 2):",
+    "       [--out-dataset <name>] [--review]   tool-errors/loops/retries/egress → quarantine;",
+    "                                           --review promotes accepted into a mined dataset",
+    "  dataset synthesize --from <f|reg>    PII-redacted stress variants (item 2): paraphrase,",
+    "       [--count N] [--budget-usd N]        truncate, ambiguate, inject → separate synthetic",
+    "       [--out-dataset <name>]              split (never contaminates human golds)",
     "  state backup [-o <file.tar.gz>]      snapshot the cwd .crewhaus state dir to a tarball (item 69)",
     "       [--exclude <glob,glob>]",
     "  state restore <file.tar.gz>          restore a snapshot (refuses a non-empty .crewhaus)",
@@ -4599,6 +4648,335 @@ async function runDatasetsPut(args: ParsedArgs): Promise<void> {
   );
 }
 
+// -------- item 2: `crewhaus dataset` (singular) growth family --------
+
+const QUARANTINE_SUBDIR = join(".crewhaus", "datasets", "_quarantine");
+const AUDIT_SUBDIR = join(".crewhaus", "audit");
+
+/** The cwd crewhaus.yaml's spec name, or undefined when absent/unparseable. */
+function cwdSpecName(): string | undefined {
+  const p = join(process.cwd(), "crewhaus.yaml");
+  if (!existsSync(p)) return undefined;
+  try {
+    return parseSpec(readFileSync(p, "utf-8")).name;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Read all audit records from `.crewhaus/audit/*.jsonl` (day files), tolerant
+ *  of torn lines. Empty when the audit dir is absent (e.g. egress has no
+ *  writer yet). */
+function readAuditRecords(): unknown[] {
+  const dir = join(process.cwd(), AUDIT_SUBDIR);
+  if (!existsSync(dir)) return [];
+  const out: unknown[] = [];
+  for (const file of readdirSync(dir).sort()) {
+    if (!file.endsWith(".jsonl")) continue;
+    out.push(...parseJsonlObjects(readFileSync(join(dir, file), "utf-8")));
+  }
+  return out;
+}
+
+/** `dataset` dispatcher — mine / synthesize / refresh-goldens (item 5). */
+async function runDataset(args: ParsedArgs): Promise<void> {
+  const action = args.positional[0];
+  if (args.flags["help"] && action === undefined) {
+    process.stdout.write(
+      "usage: crewhaus dataset <mine|synthesize> [...]\n" +
+        "  mine            grow the dataset from production struggle signals (item 2)\n" +
+        "  synthesize      generate PII-redacted stress variants of a source dataset (item 2)\n",
+    );
+    return;
+  }
+  try {
+    switch (action) {
+      case "mine":
+        await runDatasetMine(args);
+        return;
+      case "synthesize":
+        await runDatasetSynthesize(args);
+        return;
+      default:
+        die(`dataset: unknown action "${action ?? ""}" — supported: mine, synthesize`);
+    }
+  } catch (err) {
+    if (err instanceof CrewhausError || err instanceof DatasetRefError) die(err.message);
+    throw err;
+  }
+}
+
+/**
+ * Item 2 — `crewhaus dataset mine`: scan the cwd spec's session JSONLs for
+ * negative signals (tool-error spikes, runtime errors, loop nudges, retries)
+ * plus egress blocks from the audit log, collect each triggering turn's input
+ * as a QUARANTINE candidate, and (with `--review`) promote accepted ones into
+ * a mined registry dataset.
+ */
+async function runDatasetMine(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus dataset mine [--sessions N|all] [--out-dataset <name>] [--review]\n" +
+        "  Scan .crewhaus/sessions/*.jsonl (this spec) for hard cases needing NO\n" +
+        "  rating — error events, tool_result isError spikes, the synthetic\n" +
+        "  '[runtime] possible loop detected' nudge, consecutive near-duplicate\n" +
+        "  user retries — plus egress_decision blocks from .crewhaus/audit (if any).\n" +
+        "  Each triggering turn's input becomes a candidate Sample in a QUARANTINE\n" +
+        "  staging file (.crewhaus/datasets/_quarantine/<spec>-hardcases.jsonl).\n" +
+        "  --review accepts/rejects candidates (interactive in a TTY: [a]ccept /\n" +
+        "  [r]eject / [s]kip; non-TTY prints the list); accepted candidates promote\n" +
+        "  into the <spec>-hardcases (or --out-dataset) mined registry version with\n" +
+        "  provenance in metadata (source: mine, signal, sessionId).\n",
+    );
+    return;
+  }
+  const specName = cwdSpecName() ?? "harness";
+  const outDataset = strFlag(args, "out-dataset") ?? `${specName}-hardcases`;
+  let sessionsWanted: number | "all";
+  try {
+    sessionsWanted = parseSessionsFlag(strFlag(args, "sessions"));
+  } catch (err) {
+    if (err instanceof EvalCoverageError) die(err.message);
+    throw err;
+  }
+
+  const sessionsDir = join(process.cwd(), SESSIONS_SUBDIR);
+  const allIds = sessionIdsByRecency(sessionsDir);
+  const ids = sessionsWanted === "all" ? allIds : allIds.slice(0, sessionsWanted);
+
+  const raw: MineCandidate[] = [];
+  for (const id of ids) raw.push(...mineSession(id, readSessionEvents(id)));
+
+  // Egress blocks from the audit log (may be empty — no writer yet). Attach
+  // each to the most-recent turn input of its named session when known.
+  const egress = egressBlocksFromAudit(readAuditRecords());
+  for (const block of egress) {
+    if (block.sessionId === undefined || !existsSync(sessionJsonlPath(block.sessionId))) continue;
+    const turns = deriveTurns(readSessionEvents(block.sessionId));
+    const last = turns[turns.length - 1];
+    if (last === undefined) continue;
+    raw.push({
+      sessionId: block.sessionId,
+      turnNumber: last.turnNumber,
+      input: last.input,
+      signal: "egress-block",
+      reason: block.reason,
+    });
+  }
+
+  const candidates = dedupeCandidates(raw);
+  if (candidates.length === 0) {
+    process.stdout.write(
+      `[dataset mine] no hard-case signals in ${ids.length} session(s) — nothing to quarantine\n`,
+    );
+    return;
+  }
+
+  // Always (re)write the quarantine staging file.
+  const quarantineDir = join(process.cwd(), QUARANTINE_SUBDIR);
+  mkdirSync(quarantineDir, { recursive: true });
+  const quarantinePath = join(quarantineDir, `${specName}-hardcases.jsonl`);
+  const quarantineSamples = candidates.map(candidateToSample);
+  writeFileSync(quarantinePath, `${quarantineSamples.map((s) => JSON.stringify(s)).join("\n")}\n`);
+  process.stdout.write(
+    `[dataset mine] ${candidates.length} candidate(s) quarantined → ${quarantinePath}\n`,
+  );
+
+  if (args.flags["review"] !== true) {
+    process.stdout.write(
+      "[dataset mine] run with --review to accept/reject and promote into the mined dataset\n",
+    );
+    return;
+  }
+
+  // Review: interactive per-candidate in a TTY, else print the list.
+  let accepted: MineCandidate[];
+  if (process.stdin.isTTY === true) {
+    accepted = await reviewCandidatesInteractive(candidates);
+  } else {
+    process.stdout.write(renderCandidateList(candidates));
+    process.stdout.write(
+      "[dataset mine] non-TTY — accepting ALL listed candidates for promotion\n",
+    );
+    accepted = [...candidates];
+  }
+  if (accepted.length === 0) {
+    process.stdout.write("[dataset mine] no candidates accepted — mined dataset unchanged\n");
+    return;
+  }
+  const registry = createFileBackedRegistry({ rootDir: defaultDatasetsRoot() });
+  const rec = await registerDataset({
+    registry,
+    name: outDataset,
+    samples: accepted.map(candidateToSample),
+  });
+  process.stdout.write(
+    `[dataset mine] promoted ${accepted.length} accepted candidate(s) → ${rec.name}@${rec.version} ` +
+      `(use with --dataset registry:${rec.name})\n`,
+  );
+}
+
+/** Per-candidate interactive accept/reject/skip over a raw-mode key read. */
+async function reviewCandidatesInteractive(
+  candidates: ReadonlyArray<MineCandidate>,
+): Promise<MineCandidate[]> {
+  const accepted: MineCandidate[] = [];
+  for (const c of candidates) {
+    process.stdout.write(
+      `\n[${c.signal}] ${c.sessionId} turn ${c.turnNumber}\n  ${c.input}\n  (${c.reason})\n  [a]ccept / [r]eject / [s]kip? `,
+    );
+    let decision: ReturnType<typeof parseReviewKey>;
+    // Read whole lines (Enter-terminated) so this works in a piped/scripted
+    // TTY too; an unrecognized key re-prompts.
+    do {
+      const key = await readLineFromStdin();
+      decision = parseReviewKey(key);
+      if (decision === undefined) process.stdout.write("  [a]ccept / [r]eject / [s]kip? ");
+    } while (decision === undefined);
+    if (decision === "accept") accepted.push(c);
+    process.stdout.write(`  → ${decision}\n`);
+  }
+  return accepted;
+}
+
+/** One line from stdin (resolves "" on EOF). */
+function readLineFromStdin(): Promise<string> {
+  return new Promise((resolveLine) => {
+    const onData = (chunk: Buffer): void => {
+      process.stdin.off("data", onData);
+      resolveLine(chunk.toString("utf-8").replace(/[\r\n]+$/, ""));
+    };
+    process.stdin.once("data", onData);
+    process.stdin.once("end", () => resolveLine(""));
+  });
+}
+
+/**
+ * Item 2 — `crewhaus dataset synthesize`: sample real inputs from a source
+ * dataset, PII-redact them, and generate paraphrases + stress mutations
+ * (truncation, ambiguity, injection payloads from the detector's REGEX_RULES)
+ * into a provenance-tagged SYNTHETIC dataset that never contaminates
+ * human-gold splits. Deterministic template mutations without credentials;
+ * model paraphrases (budget-capped) layered on when a model is available.
+ */
+async function runDatasetSynthesize(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus dataset synthesize --from <file|registry:ref> [--count N]\n" +
+        "                                   [--budget-usd N] [--out-dataset <name>] [--model <m>]\n" +
+        "  Sample real inputs from --from, PII-redact them (@crewhaus/pii-redactor),\n" +
+        "  and generate paraphrases + stress mutations (truncation, ambiguity, and\n" +
+        "  prompt-injection payloads seeded from the detector's REGEX_RULES) into a\n" +
+        "  SEPARATE, provenance-tagged synthetic dataset (metadata.source: synthesize;\n" +
+        "  injection variants marked adversarial). Synthetic samples NEVER carry a\n" +
+        "  human gold answer, so they can't contaminate real golds. Deterministic\n" +
+        "  template mutations when no credentials; model paraphrases (budget-capped\n" +
+        "  via --budget-usd) when a model is available.\n",
+    );
+    return;
+  }
+  const from = strFlag(args, "from");
+  if (from === undefined) die("missing --from <file|registry:ref>");
+  const count = intFlag(args, "count") ?? 5;
+  if (count < 1) die(`invalid --count "${count}" — need at least 1`);
+
+  // Resolve the source samples (file or registry).
+  const sourceSamples: Sample[] = [];
+  let sourceName: string;
+  const registryRef = parseRegistryRef(from);
+  if (registryRef !== undefined) {
+    const registry = createFileBackedRegistry({ rootDir: defaultDatasetsRoot() });
+    const resolved = await resolveRegistryRef(registry, registryRef);
+    for (const s of resolved.samples) sourceSamples.push(s);
+    sourceName = registryRef.name;
+  } else {
+    const abs = resolve(from);
+    if (!existsSync(abs)) die(`--from "${from}" not found`);
+    const loaded = await loadDataset(abs);
+    for await (const s of loaded.samples) sourceSamples.push(s);
+    sourceName = loaded.name;
+  }
+  if (sourceSamples.length === 0) die(`--from "${from}" yielded zero samples`);
+
+  const outDataset = strFlag(args, "out-dataset") ?? `${sourceName}-synth`;
+
+  // PII redactor: default regex detectors (SSN/CC/phone/email/IBAN). Redact
+  // BEFORE any mutation or model call so no PII leaves the box.
+  const { createPiiRedactor } = await import("@crewhaus/pii-redactor");
+  const redactor = createPiiRedactor();
+
+  // Model paraphrases are opt-in when a model + credentials are visible. The
+  // budget gate bounds them (estimate-before/record-after). Without a model we
+  // stay fully deterministic — no synthetic dataset needs credentials.
+  const modelFlag = strFlag(args, "model");
+  const specModel =
+    modelFlag ??
+    extractSpecModel(
+      cwdSpecName() !== undefined
+        ? readFileSync(join(process.cwd(), "crewhaus.yaml"), "utf-8")
+        : "",
+    );
+  const useModel =
+    specModel !== undefined &&
+    (modelFlag !== undefined || providerCredentialsSatisfied(specModel, process.env));
+  const budgetUsd = floatFlag(args, "budget-usd");
+
+  const synthSamples: Sample[] = [];
+  let idx = 0;
+  let modelBudgetHit = false;
+  for (const src of sourceSamples) {
+    const { text: redacted } = await redactor.redact(src.input);
+    const variants = buildStressVariants(redacted, count);
+    for (const v of variants) {
+      synthSamples.push(variantToSample(v, src.id, idx));
+      idx += 1;
+    }
+    // Optional model paraphrase, budget-permitting. Best-effort — a failed
+    // call keeps the deterministic variants.
+    if (useModel && specModel !== undefined && !modelBudgetHit) {
+      // Cheap deterministic budget guard: cap the number of model calls by a
+      // rough per-call estimate against the dollar budget (paraphrase calls
+      // are small; skip once we would exceed).
+      if (budgetUsd !== undefined && idx * 0.002 > budgetUsd) {
+        modelBudgetHit = true;
+      } else {
+        try {
+          const raw = await oneShotModelText({
+            model: specModel,
+            system:
+              "You paraphrase a user request into ONE realistic alternative phrasing. Output only the paraphrase, no preamble.",
+            prompt: redacted,
+            maxTokens: 256,
+          });
+          const paraphrase = raw.trim();
+          if (paraphrase !== "" && paraphrase !== redacted) {
+            synthSamples.push(
+              variantToSample({ input: paraphrase, mutation: "paraphrase" }, src.id, idx),
+            );
+            idx += 1;
+          }
+        } catch {
+          // keep deterministic variants
+        }
+      }
+    }
+  }
+
+  if (synthSamples.length === 0) die("synthesize produced no variants — source inputs were empty");
+
+  const registry = createFileBackedRegistry({ rootDir: defaultDatasetsRoot() });
+  const rec = await registerDataset({ registry, name: outDataset, samples: synthSamples });
+  process.stdout.write(
+    `[dataset synthesize] ${synthSamples.length} synthetic variant(s) from ${sourceSamples.length} source sample(s) → ` +
+      `${rec.name}@${rec.version} (source: synthesize; use with --dataset registry:${rec.name})\n`,
+  );
+  if (modelBudgetHit) {
+    process.stdout.write(
+      "[dataset synthesize] model paraphrases stopped early — --budget-usd reached\n",
+    );
+  }
+}
+
 /**
  * Section 27 — `crewhaus cost-summary [--session <id>] [--tenant <id>]
  * [--format json|text]`. Reads `cost_accrual` events out of an `event-log`
@@ -6917,6 +7295,12 @@ switch (subcommand) {
   }
   case "datasets":
     await runDatasets(parseFor(rest, DATASETS_SCHEMA));
+    break;
+  case "dataset":
+    // Item 2/5 — the `dataset` (singular) growth family: mine / synthesize /
+    // refresh-goldens. Structured failures (registry/ref/spec) route through
+    // die() for a clean one-liner.
+    await runDataset(parseFor(rest, DATASET_SCHEMA));
     break;
   case "state": {
     const action = rest[0] ?? "";
