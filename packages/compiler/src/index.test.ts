@@ -637,6 +637,8 @@ feedback:
   enabled: true
   scale: { min: 1, max: 5 }
   storage: { location: my-feedback }
+  autoDistill: true
+  exitPrompt: false
   channelReactions: true
 `);
     const ir = lower(spec);
@@ -646,6 +648,8 @@ feedback:
       enabled: true,
       scale: { min: 1, max: 5 },
       storage: { location: "my-feedback" },
+      autoDistill: true,
+      exitPrompt: false,
       channelReactions: true,
     });
   });

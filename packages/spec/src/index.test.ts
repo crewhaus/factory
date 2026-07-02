@@ -1168,6 +1168,56 @@ agent:
   });
 });
 
+// Item 1 — the response-feedback block's teardown consumers: autoDistill
+// (versioned ratings datasets at CLI run teardown) and exitPrompt (the REPL
+// exit rating prompt gate — additive optional field).
+describe("parseSpec feedback block (autoDistill + exitPrompt)", () => {
+  test("parses autoDistill and exitPrompt as plain booleans", () => {
+    const spec = parseSpec(`
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+feedback:
+  autoDistill: true
+  exitPrompt: false
+`);
+    if (spec.target !== "cli") expect.unreachable();
+    expect(spec.feedback?.autoDistill).toBe(true);
+    expect(spec.feedback?.exitPrompt).toBe(false);
+  });
+
+  test("both are optional — a bare feedback block parses (modality defaults)", () => {
+    const spec = parseSpec(`
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+feedback: {}
+`);
+    if (spec.target !== "cli") expect.unreachable();
+    expect(spec.feedback?.modality).toBe("binary");
+    expect(spec.feedback?.autoDistill).toBeUndefined();
+    expect(spec.feedback?.exitPrompt).toBeUndefined();
+  });
+
+  test("rejects a typo'd sub-key (strict)", () => {
+    expect(() =>
+      parseSpec(`
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+feedback:
+  exitPromt: false
+`),
+    ).toThrow(SpecParseError);
+  });
+});
+
 // FR-006 — Pillar 3 sink-side fabric (egress matcher selector).
 describe("parseSpec security.egressMatcher", () => {
   test("parses a cli spec with security.egressMatcher: semantic", () => {

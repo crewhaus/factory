@@ -299,8 +299,11 @@ const failureTaxonomyBlock = z.array(failureTaxonomyEntrySchema).optional();
  * into eval datasets + graders. Cross-cutting like security: carried on the
  * interactive shapes that consume it (cli, channel). `channelReactions` gates
  * codegen of Slack 👍/👎 → feedback in the channel target; `modality`/`storage`
- * configure the capture surfaces; `autoDistill` is a forward-looking flag for a
- * continuous flywheel. `.strict()` so a typo'd sub-key fails the build.
+ * configure the capture surfaces; `autoDistill` turns accumulated ratings into
+ * versioned `<name>-ratings` registry datasets at CLI run teardown (item 1);
+ * `exitPrompt` gates the one-keystroke REPL exit rating prompt (default on
+ * when the block is present; set `false` to keep capture surfaces without the
+ * prompt). `.strict()` so a typo'd sub-key fails the build.
  */
 const feedbackBlock = z
   .object({
@@ -309,6 +312,7 @@ const feedbackBlock = z
     scale: z.object({ min: z.number().int(), max: z.number().int() }).strict().optional(),
     storage: z.object({ location: safeName }).strict().optional(),
     autoDistill: z.boolean().optional(),
+    exitPrompt: z.boolean().optional(),
     channelReactions: z.boolean().optional(),
   })
   .strict()

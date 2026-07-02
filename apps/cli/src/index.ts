@@ -72,6 +72,19 @@ import {
   resolveAnchorFlag,
   summarizeVerifyResult,
 } from "./audit-verify";
+// Item 1 — the feedback.autoDistill consumer (watermarked ratings →
+// versioned `<spec>-ratings` registry datasets at run teardown) and the
+// REPL exit-rating gating logic, in a side-effect-free module so it is
+// unit-testable (this entry file runs an argv switch on import).
+import {
+  DISTILL_STATE_RELPATH,
+  EXIT_RATING_PROMPT,
+  EXIT_RATING_TIMEOUT_MS,
+  countAssistantTurns,
+  maybeAutoDistill,
+  parseExitRatingKey,
+  shouldPromptExitRating,
+} from "./autodistill";
 // Item 34 — scheduling ergonomics for `compliance evidence` (--period current
 // resolution + the empty-evidence gate), side-effect-free for the same reason.
 import { findEmptyControls, resolvePeriodFlag } from "./compliance-schedule";
@@ -1236,7 +1249,12 @@ async function runRun(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
       "usage: crewhaus run <spec.yaml> [--model <model>] [--permission-mode <default|plan|auto|bypass>] [--resume <sessionId> | --continue] [--prompt <text>] [--justification-judge rule-based|claude] [--egress-matcher substring|semantic] [--egress-embedder <model>]\n" +
-        "  --model accepts the full router grammar: claude-* (Anthropic), openai/<m>, gemini/<m>, bedrock/<id> (geo prefixes tolerated), local/<m>@<url>\n",
+        "  --model accepts the full router grammar: claude-* (Anthropic), openai/<m>, gemini/<m>, bedrock/<id> (geo prefixes tolerated), local/<m>@<url>\n" +
+        "  A spec with a feedback: block asks `rate this session? [g]ood / [b]ad / [enter] skip`\n" +
+        "  on clean REPL exit (one keystroke, 10s timeout, TTY only — never when piped). Opt out\n" +
+        "  with CREWHAUS_NO_EXIT_RATING=1 or feedback.exitPrompt: false. With feedback.autoDistill\n" +
+        "  enabled, accumulated ratings are auto-distilled into the `<specName>-ratings` registry\n" +
+        "  dataset at teardown (item 1) — see `crewhaus optimize --help`.\n",
     );
     return;
   }
@@ -1465,6 +1483,22 @@ async function runRunCli(
     });
   } finally {
     if (mcpHost) await mcpHost.disconnectAll();
+  }
+
+  // Item 1 — post-session feedback teardown: the one-keystroke exit rating
+  // prompt (TTY only) and the feedback.autoDistill consumer. Runs only on a
+  // clean REPL exit (runChatLoop returned; a throw above skips it) and is
+  // best-effort — a teardown failure never turns a successful session into
+  // a non-zero exit. Deliberately CLI teardown code (the in-process analogue
+  // of where the stop hook fires), NOT a spawned hook: hooks run
+  // credential-stripped, and the distill/registry path needs the caller's
+  // full environment.
+  try {
+    await runFeedbackTeardown(ir, resumeId);
+  } catch (err) {
+    process.stderr.write(
+      `[feedback] teardown skipped: ${err instanceof Error ? err.message : String(err)}\n`,
+    );
   }
 }
 
@@ -1958,6 +1992,11 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
         "  default version: latest). A registry record with populated train AND dev splits is\n" +
         "  used as-is; otherwise the selected samples get the inline 70/30 split. The test\n" +
         "  split is never optimized against unless #test is explicitly given.\n" +
+        "  User-rating loops (item 1): --ratings <session>|all distills feedback inline for\n" +
+        "  this run only (unchanged). A spec with feedback.autoDistill maintains a VERSIONED\n" +
+        "  `<specName>-ratings` registry dataset at run teardown instead — consume it here\n" +
+        "  (and in `crewhaus eval`) as --dataset registry:<specName>-ratings (latest by\n" +
+        "  default, or pin @vN).\n" +
         "  When a patch is accepted (with or without --write-back), the dev samples that flipped\n" +
         "  fail→pass are pinned into the <specName>-regressions registry dataset (a new version\n" +
         "  unioning the previous one, deduped by sample id) so `crewhaus eval` guards them by\n" +
@@ -4170,6 +4209,123 @@ function distillRatings(
     ...(s.expected_output !== undefined ? { expected_output: s.expected_output } : {}),
   }));
   return { samples, gradersYaml: gradersConfigToYaml(result.graders) };
+}
+
+/**
+ * Item 1 — post-session feedback teardown for the cli run path. Two halves,
+ * both gated on the compiled spec's `feedback:` block:
+ *
+ *  1. Exit rating prompt: on a clean REPL exit with ≥1 assistant turn, a
+ *     TTY, and no opt-out (CREWHAUS_NO_EXIT_RATING / feedback.exitPrompt:
+ *     false), ask `rate this session? [g]ood / [b]ad / [enter] skip` — one
+ *     keystroke, 10s timeout, appended to the session's event log via the
+ *     same `user_feedback` record `crewhaus rate` writes (source "cli",
+ *     rating the last turn). NEVER prompts in non-TTY/piped mode.
+ *
+ *  2. autoDistill consumer: when `feedback.autoDistill` is enabled and the
+ *     accumulated store (all sessions + the web-UI feedback dir) holds
+ *     enough unprocessed ratings past the watermark, run the existing
+ *     distill() and register the result as a new version of the
+ *     `<specName>-ratings` registry dataset (see ./autodistill.ts) —
+ *     consumable as `--dataset registry:<specName>-ratings` by eval and
+ *     optimize.
+ */
+async function runFeedbackTeardown(
+  ir: Extract<ReturnType<typeof lower>, { target: "cli" }>,
+  resumeId: string | undefined,
+): Promise<void> {
+  if (ir.feedback === undefined) return;
+
+  // Resolve the session that just ran: the resumed id, else the most recent
+  // session recorded for this spec name (the same resolution --continue
+  // uses; runChatLoop does not return its sessionId).
+  let sessionId = resumeId;
+  if (sessionId === undefined) {
+    const store = createSessionStore();
+    const sessions = await store.list();
+    sessionId = sessions.find((s: { name: string }) => s.name === ir.name)?.id;
+  }
+
+  // ---- half 1: the exit rating prompt ----
+  if (sessionId !== undefined && existsSync(sessionJsonlPath(sessionId))) {
+    const turns = deriveTurns(readSessionEvents(sessionId));
+    const decision = shouldPromptExitRating({
+      stdinIsTTY: process.stdin.isTTY === true,
+      env: process.env,
+      feedback: ir.feedback,
+      assistantTurns: countAssistantTurns(turns),
+    });
+    if (decision.prompt && turns.length > 0) {
+      const choice = parseExitRatingKey(await readExitRatingKey(EXIT_RATING_TIMEOUT_MS));
+      if (choice !== "skip") {
+        const turnNumber = (turns[turns.length - 1] as DerivedTurn).turnNumber;
+        const record = buildFeedbackRecord({
+          id: `fb_${randomBytes(6).toString("hex")}`,
+          sessionId,
+          turnNumber,
+          ts: new Date().toISOString(),
+          source: "cli",
+          thumbs: choice,
+        });
+        const log = await openEventLog(sessionId, {
+          rootDir: join(process.cwd(), SESSIONS_SUBDIR),
+        });
+        await log.append({ kind: FEEDBACK_EVENT_KIND, payload: record });
+        process.stdout.write(
+          `[feedback] recorded ${choice === "up" ? "good" : "bad"} on ${sessionId} turn ${turnNumber}\n`,
+        );
+      }
+    }
+  }
+
+  // ---- half 2: the autoDistill consumer ----
+  if (ir.feedback.autoDistill !== true) return;
+  const sessionsDir = join(process.cwd(), SESSIONS_SUBDIR);
+  const turns: SessionTurn[] = [];
+  const records: FeedbackRecord[] = [];
+  for (const id of listSessionIds(sessionsDir)) {
+    const events = readSessionEvents(id);
+    for (const t of deriveTurns(events)) turns.push({ ...t, sessionId: id });
+    records.push(...extractFeedbackRecords(events));
+  }
+  records.push(...readFeedbackDir(join(process.cwd(), FEEDBACK_SUBDIR)));
+  await maybeAutoDistill({
+    specName: ir.name,
+    feedback: ir.feedback,
+    turns,
+    records,
+    registry: createFileBackedRegistry({ rootDir: defaultDatasetsRoot() }),
+    stateFilePath: join(process.cwd(), DISTILL_STATE_RELPATH),
+  });
+}
+
+/**
+ * One raw-mode keystroke with a timeout (undefined on timeout or when
+ * stdin is unusable). Thin IO by design — the prompt gate and the key
+ * mapping are the unit-tested functions in ./autodistill.ts.
+ */
+async function readExitRatingKey(timeoutMs: number): Promise<string | undefined> {
+  const stdin = process.stdin;
+  if (stdin.isTTY !== true || stdin.destroyed) return undefined;
+  process.stdout.write(EXIT_RATING_PROMPT);
+  return await new Promise<string | undefined>((resolveKey) => {
+    let done = false;
+    const finish = (v: string | undefined): void => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      stdin.off("data", onData);
+      if (typeof stdin.setRawMode === "function") stdin.setRawMode(false);
+      stdin.pause();
+      process.stdout.write("\n");
+      resolveKey(v);
+    };
+    const timer = setTimeout(() => finish(undefined), timeoutMs);
+    const onData = (chunk: Buffer | string): void => finish(chunk.toString());
+    if (typeof stdin.setRawMode === "function") stdin.setRawMode(true);
+    stdin.resume();
+    stdin.on("data", onData);
+  });
 }
 
 // -------- state backup / restore (item 69) --------
