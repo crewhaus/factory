@@ -873,6 +873,11 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             inputTokens: ev.inputTokens,
             outputTokens: ev.outputTokens,
             cachedReadTokens: ev.cachedReadTokens,
+            // Optional on the event (older emitters may omit it) — persist
+            // only when present so old-log parsing stays additive-safe.
+            ...(ev.cacheCreationTokens !== undefined
+              ? { cacheCreationTokens: ev.cacheCreationTokens }
+              : {}),
             costUsdMicros: ev.costUsdMicros,
             ...(ev.tenantId !== undefined ? { tenantId: ev.tenantId } : {}),
           },

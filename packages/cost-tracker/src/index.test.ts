@@ -14,6 +14,7 @@ import {
 } from "@crewhaus/trace-event-bus";
 import {
   DEFAULT_PRICING,
+  computeCacheSavingsMicros,
   computeCostMicros,
   createCostTracker,
   formatUsdMicros,
@@ -36,6 +37,7 @@ function modelResponse(
     inputTokens: number;
     outputTokens: number;
     cacheRead?: number;
+    cacheCreate?: number;
     runId?: string;
   },
 ): ModelResponseEvent {
@@ -51,6 +53,7 @@ function modelResponse(
       input: opts.inputTokens,
       output: opts.outputTokens,
       ...(opts.cacheRead !== undefined ? { cacheRead: opts.cacheRead } : {}),
+      ...(opts.cacheCreate !== undefined ? { cacheCreate: opts.cacheCreate } : {}),
     },
     durationMs: 100,
   };
@@ -114,6 +117,46 @@ describe("cost-tracker — T1 pricing table", () => {
     const row = { inputPer1M: 10.0, outputPer1M: 30.0 };
     // 1000 cache_read × ($10 × 0.1)/M = $0.001 = 1_000 micros
     expect(computeCostMicros(row, 0, 0, 1000)).toBe(1_000);
+  });
+
+  test("computeCostMicros: cacheWritePer1M defaults to inputPer1M × 1.25", () => {
+    const row = { inputPer1M: 10.0, outputPer1M: 30.0 };
+    // 1000 cache_creation × ($10 × 1.25)/M = $0.0125 = 12_500 micros
+    expect(computeCostMicros(row, 0, 0, 0, 1000)).toBe(12_500);
+  });
+
+  test("computeCostMicros: explicit cacheWritePer1M wins over the ×1.25 fallback", () => {
+    // gpt-4o encodes OpenAI's zero-premium writes: cacheWritePer1M === inputPer1M.
+    const row = resolvePricing(DEFAULT_PRICING, "openai", "gpt-4o");
+    if (!row) throw new Error("gpt-4o pricing row missing");
+    expect(row.cacheWritePer1M).toBe(2.5);
+    // 1000 writes × $2.5/M = 2_500 micros — NOT 1000 × $3.125/M.
+    expect(computeCostMicros(row, 0, 0, 0, 1000)).toBe(2_500);
+  });
+
+  test("computeCostMicros: 4-argument legacy call equals an explicit 0 cache-write count", () => {
+    const row = { inputPer1M: 15.0, outputPer1M: 75.0 };
+    expect(computeCostMicros(row, 1000, 500, 200)).toBe(computeCostMicros(row, 1000, 500, 200, 0));
+  });
+
+  test("computeCacheSavingsMicros: read discount minus write premium", () => {
+    const row = { inputPer1M: 10.0, outputPer1M: 30.0 };
+    // reads: 1000 × ($10 − $1)/M = 9_000 micros saved
+    // writes: 400 × ($12.5 − $10)/M = 1_000 micros premium
+    expect(computeCacheSavingsMicros(row, 1000, 400)).toBe(8_000);
+  });
+
+  test("computeCacheSavingsMicros: negative when write premiums outweigh read discounts", () => {
+    const row = { inputPer1M: 10.0, outputPer1M: 30.0 };
+    // no reads, 1000 writes × $2.5/M premium = −2_500 micros
+    expect(computeCacheSavingsMicros(row, 0, 1000)).toBe(-2_500);
+  });
+
+  test("computeCacheSavingsMicros: explicit row prices (zero-premium writes) yield pure read savings", () => {
+    const row = resolvePricing(DEFAULT_PRICING, "openai", "gpt-4o");
+    if (!row) throw new Error("gpt-4o pricing row missing");
+    // reads: 1000 × ($2.5 − $1.25)/M = 1_250; writes: 1000 × ($2.5 − $2.5)/M = 0
+    expect(computeCacheSavingsMicros(row, 1000, 1000)).toBe(1_250);
   });
 
   test("formatUsdMicros: 4-decimal USD string", () => {
@@ -189,6 +232,53 @@ describe("cost-tracker — T3 trace bus integration", () => {
     expect(accruals[0]?.costUsdMicros).toBe(450);
   });
 
+  test("usage.cacheCreate threads into cost_accrual.cacheCreationTokens and is priced at the write premium", () => {
+    const bus = makeBus();
+    const accruals: CostAccrualEvent[] = [];
+    bus.subscribe((e) => {
+      if (e.kind === "cost_accrual") accruals.push(e);
+    });
+    const tracker = createCostTracker(bus);
+    bus.publish(
+      modelResponse(bus, {
+        model: "claude-sonnet-4-6",
+        provider: "anthropic",
+        inputTokens: 1000,
+        outputTokens: 100,
+        cacheRead: 4000,
+        cacheCreate: 2000,
+      }),
+    );
+    expect(accruals.length).toBe(1);
+    expect(accruals[0]?.cachedReadTokens).toBe(4000);
+    expect(accruals[0]?.cacheCreationTokens).toBe(2000);
+    // sonnet row ($3 in / $15 out, fallback $0.3 read / $3.75 write):
+    // 1000×3 + 100×15 + 4000×0.3 + 2000×3.75 = 3000+1500+1200+7500 = 13_200
+    expect(accruals[0]?.costUsdMicros).toBe(13_200);
+    expect(tracker.getRunCost(RUN_ID).totalUsdMicros).toBe(13_200);
+  });
+
+  test("absent usage.cacheCreate → cacheCreationTokens 0 and the pre-cache-write cost total", () => {
+    const bus = makeBus();
+    const accruals: CostAccrualEvent[] = [];
+    bus.subscribe((e) => {
+      if (e.kind === "cost_accrual") accruals.push(e);
+    });
+    createCostTracker(bus);
+    bus.publish(
+      modelResponse(bus, {
+        model: "claude-sonnet-4-6",
+        provider: "anthropic",
+        inputTokens: 1000,
+        outputTokens: 100,
+        cacheRead: 4000,
+      }),
+    );
+    expect(accruals[0]?.cacheCreationTokens).toBe(0);
+    // Exactly the old 4-field total: 3000 + 1500 + 1200 = 5_700 micros.
+    expect(accruals[0]?.costUsdMicros).toBe(5_700);
+  });
+
   test("missing pricing → no accrual event, pricingMisses counter increments", () => {
     const bus = makeBus();
     const accruals: CostAccrualEvent[] = [];
@@ -202,6 +292,10 @@ describe("cost-tracker — T3 trace bus integration", () => {
         provider: "openai",
         inputTokens: 10,
         outputTokens: 10,
+        // Cache traffic on an unmapped model must not change the contract:
+        // miss counter increments, nothing is charged, nothing throws.
+        cacheRead: 100,
+        cacheCreate: 50,
       }),
     );
     expect(accruals.length).toBe(0);

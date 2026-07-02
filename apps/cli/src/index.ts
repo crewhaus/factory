@@ -5,6 +5,7 @@ import { basename, dirname, join, relative, resolve } from "node:path";
 import type { SubAgentDefinition } from "@crewhaus/agent-context-isolation";
 import { SpecParseError, compile, lower } from "@crewhaus/compiler";
 import { buildContextBundle, discoverRoots } from "@crewhaus/context-bundle";
+import { DEFAULT_PRICING, computeCacheSavingsMicros, resolvePricing } from "@crewhaus/cost-tracker";
 import { CrewhausError } from "@crewhaus/errors";
 import { loadDataset } from "@crewhaus/eval-dataset";
 import { parseGradersConfig } from "@crewhaus/eval-grader";
@@ -40,7 +41,7 @@ import { spawnSubAgent } from "@crewhaus/sub-agent-spawner";
 import { type RegisteredTool, ToolCatalog } from "@crewhaus/tool-catalog";
 import { registerMcpServer } from "@crewhaus/tool-mcp";
 import { createTaskTool } from "@crewhaus/tool-task";
-import { type CostAccrualEvent, TraceEventBus } from "@crewhaus/trace-event-bus";
+import { type CostAccrualEvent, type ProviderId, TraceEventBus } from "@crewhaus/trace-event-bus";
 // Item 34 — `crewhaus audit verify` plumbing (anchor-flag parsing + per-check
 // summary + doctor mapping), in a side-effect-free module so it is
 // unit-testable (this entry file runs an argv switch on import).
@@ -2139,9 +2140,54 @@ async function runEvalReport(args: ParsedArgs): Promise<void> {
  * the cost_accrual events embedded in there. Tenant aggregation lands in
  * §31's studio-server cost dashboard.
  */
+/** Per-(provider/model) cache-economics accumulator for `cost-summary`. */
+type CacheStats = {
+  inputTokens: number;
+  outputTokens: number;
+  cachedReadTokens: number;
+  cacheCreationTokens: number;
+};
+
+/** Cache hit ratio = cachedReadTokens / (inputTokens + cachedReadTokens); 0 when no input observed. */
+function cacheHitRatio(s: CacheStats): number {
+  const denominator = s.inputTokens + s.cachedReadTokens;
+  return denominator === 0 ? 0 : s.cachedReadTokens / denominator;
+}
+
+/**
+ * Realized savings for one provider/model bucket, repriced from the current
+ * DEFAULT_PRICING (the accrual carries `(provider, modelId)` — exactly the
+ * `resolvePricing` key). Unknown provider/model → undefined (savings cannot
+ * be priced; tokens and hit ratio still report).
+ */
+function cacheSavingsMicros(provider: string, modelId: string, s: CacheStats): number | undefined {
+  const row = resolvePricing(DEFAULT_PRICING, provider as ProviderId, modelId);
+  if (!row) return undefined;
+  return computeCacheSavingsMicros(row, s.cachedReadTokens, s.cacheCreationTokens);
+}
+
+function formatCacheLine(s: CacheStats, savings: number | undefined): string {
+  const hitPct = (cacheHitRatio(s) * 100).toFixed(1);
+  const savingsStr = savings === undefined ? "n/a" : `$${(savings / 1_000_000).toFixed(4)}`;
+  return (
+    `read=${s.cachedReadTokens} write=${s.cacheCreationTokens} ` +
+    `hit=${hitPct}% savings=${savingsStr}`
+  );
+}
+
 async function runCostSummary(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
-    process.stdout.write("usage: crewhaus cost-summary --session <id> [--format json|text]\n");
+    process.stdout.write(
+      "usage: crewhaus cost-summary --session <id> [--format json|text]\n" +
+        "\n" +
+        "cache economics columns (per provider/model and total):\n" +
+        "  read     prompt-cache READ tokens (billed at the discounted cached rate)\n" +
+        "  write    prompt-cache WRITE tokens (billed at a premium over input)\n" +
+        "  hit      cache hit ratio = cachedReadTokens / (inputTokens + cachedReadTokens)\n" +
+        "  savings  realized savings = (cached reads at the full input price)\n" +
+        "           - (cached reads at the discounted rate)\n" +
+        "           - (cache-write premium paid above the normal input price)\n",
+    );
     return;
   }
   const session = args.flags["session"];
@@ -2158,6 +2204,14 @@ async function runCostSummary(args: ParsedArgs): Promise<void> {
   let totalMicros = 0;
   const byProvider: Record<string, number> = {};
   let count = 0;
+  const totalCache: CacheStats = {
+    inputTokens: 0,
+    outputTokens: 0,
+    cachedReadTokens: 0,
+    cacheCreationTokens: 0,
+  };
+  // Keyed "provider/modelId"; insertion order == first-seen order, stable for output.
+  const byModel = new Map<string, { provider: string; modelId: string; stats: CacheStats }>();
   for (const raw of lines) {
     let parsed: unknown;
     try {
@@ -2173,25 +2227,96 @@ async function runCostSummary(args: ParsedArgs): Promise<void> {
     ) {
       // event-log writes a `{ ts, version, kind, payload }` envelope, so the
       // cost fields live under `payload`. Fall back to top-level fields so a
-      // hand-written/flat cost_accrual line still aggregates.
-      const e = parsed as {
+      // hand-written/flat cost_accrual line still aggregates. Every token
+      // field is optional — logs persisted before cache economics landed
+      // carry only provider/costUsdMicros (or no cacheCreationTokens) and
+      // must keep parsing.
+      type AccrualFields = {
         provider?: string;
+        modelId?: string;
         costUsdMicros?: number;
-        payload?: { provider?: string; costUsdMicros?: number };
+        inputTokens?: number;
+        outputTokens?: number;
+        cachedReadTokens?: number;
+        cacheCreationTokens?: number;
       };
+      const e = parsed as AccrualFields & { payload?: AccrualFields };
       const provider = e.payload?.provider ?? e.provider;
       const micros = e.payload?.costUsdMicros ?? e.costUsdMicros;
       if (typeof provider === "string" && typeof micros === "number") {
         totalMicros += micros;
         byProvider[provider] = (byProvider[provider] ?? 0) + micros;
         count++;
+        const modelId = e.payload?.modelId ?? e.modelId;
+        const delta: CacheStats = {
+          inputTokens: e.payload?.inputTokens ?? e.inputTokens ?? 0,
+          outputTokens: e.payload?.outputTokens ?? e.outputTokens ?? 0,
+          cachedReadTokens: e.payload?.cachedReadTokens ?? e.cachedReadTokens ?? 0,
+          cacheCreationTokens: e.payload?.cacheCreationTokens ?? e.cacheCreationTokens ?? 0,
+        };
+        totalCache.inputTokens += delta.inputTokens;
+        totalCache.outputTokens += delta.outputTokens;
+        totalCache.cachedReadTokens += delta.cachedReadTokens;
+        totalCache.cacheCreationTokens += delta.cacheCreationTokens;
+        if (typeof modelId === "string") {
+          const key = `${provider}/${modelId}`;
+          const bucket = byModel.get(key) ?? {
+            provider,
+            modelId,
+            stats: { inputTokens: 0, outputTokens: 0, cachedReadTokens: 0, cacheCreationTokens: 0 },
+          };
+          bucket.stats.inputTokens += delta.inputTokens;
+          bucket.stats.outputTokens += delta.outputTokens;
+          bucket.stats.cachedReadTokens += delta.cachedReadTokens;
+          bucket.stats.cacheCreationTokens += delta.cacheCreationTokens;
+          byModel.set(key, bucket);
+        }
       }
     }
   }
+  // Total savings = Σ per-model savings (rates are per-model, so pricing must
+  // resolve per bucket). Unpriced buckets contribute nothing — same "miss ⇒
+  // $0, never crash" contract as the tracker itself.
+  let totalSavings = 0;
+  const modelRows: Array<{
+    key: string;
+    stats: CacheStats;
+    savings: number | undefined;
+  }> = [];
+  for (const [key, { provider, modelId, stats }] of byModel) {
+    const savings = cacheSavingsMicros(provider, modelId, stats);
+    if (savings !== undefined) totalSavings += savings;
+    modelRows.push({ key, stats, savings });
+  }
   const totalDollars = totalMicros / 1_000_000;
   if (format === "json") {
+    // Additive fields only — `session`/`count`/`totalUsdMicros`/`byProvider`
+    // keep their exact pre-cache-economics shape.
+    const cacheByModel: Record<
+      string,
+      CacheStats & { cacheHitRatio: number; cacheSavingsUsdMicros: number | null }
+    > = {};
+    for (const row of modelRows) {
+      cacheByModel[row.key] = {
+        ...row.stats,
+        cacheHitRatio: cacheHitRatio(row.stats),
+        cacheSavingsUsdMicros: row.savings ?? null,
+      };
+    }
     process.stdout.write(
-      `${JSON.stringify({ session, count, totalUsdMicros: totalMicros, byProvider })}\n`,
+      `${JSON.stringify({
+        session,
+        count,
+        totalUsdMicros: totalMicros,
+        byProvider,
+        inputTokens: totalCache.inputTokens,
+        outputTokens: totalCache.outputTokens,
+        cachedReadTokens: totalCache.cachedReadTokens,
+        cacheCreationTokens: totalCache.cacheCreationTokens,
+        cacheHitRatio: cacheHitRatio(totalCache),
+        cacheSavingsUsdMicros: totalSavings,
+        cacheByModel,
+      })}\n`,
     );
   } else {
     process.stdout.write(`session: ${session}\n`);
@@ -2199,6 +2324,10 @@ async function runCostSummary(args: ParsedArgs): Promise<void> {
     process.stdout.write(`total: $${totalDollars.toFixed(4)}\n`);
     for (const [p, m] of Object.entries(byProvider)) {
       process.stdout.write(`  ${p}: $${(m / 1_000_000).toFixed(4)}\n`);
+    }
+    process.stdout.write(`cache: ${formatCacheLine(totalCache, totalSavings)}\n`);
+    for (const row of modelRows) {
+      process.stdout.write(`  ${row.key}: ${formatCacheLine(row.stats, row.savings)}\n`);
     }
   }
 }

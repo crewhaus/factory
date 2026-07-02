@@ -877,6 +877,160 @@ describe("crewhaus cost-summary", () => {
     const out = JSON.parse(result.stdout) as { totalUsdMicros: number };
     expect(out.totalUsdMicros).toBe(1000);
   });
+
+  // Item 28 (half 1) — cache economics columns.
+  type CacheSummaryJson = {
+    count: number;
+    totalUsdMicros: number;
+    byProvider: Record<string, number>;
+    inputTokens: number;
+    outputTokens: number;
+    cachedReadTokens: number;
+    cacheCreationTokens: number;
+    cacheHitRatio: number;
+    cacheSavingsUsdMicros: number;
+    cacheByModel: Record<
+      string,
+      {
+        inputTokens: number;
+        outputTokens: number;
+        cachedReadTokens: number;
+        cacheCreationTokens: number;
+        cacheHitRatio: number;
+        cacheSavingsUsdMicros: number | null;
+      }
+    >;
+  };
+
+  function seedCacheSession(): void {
+    seedSession([
+      {
+        ts: 1,
+        version: 1,
+        kind: "cost_accrual",
+        payload: {
+          provider: "anthropic",
+          modelId: "claude-sonnet-4-6",
+          inputTokens: 1000,
+          outputTokens: 100,
+          cachedReadTokens: 4000,
+          cacheCreationTokens: 2000,
+          // 1000×3 + 100×15 + 4000×0.3 + 2000×3.75 (sonnet row + fallback cache rates)
+          costUsdMicros: 13_200,
+        },
+      },
+      {
+        ts: 2,
+        version: 1,
+        kind: "cost_accrual",
+        // Unmapped model — tokens/ratio still aggregate; savings can't be priced.
+        payload: {
+          provider: "openai",
+          modelId: "fictional-model-99",
+          inputTokens: 100,
+          outputTokens: 10,
+          cachedReadTokens: 100,
+          cacheCreationTokens: 50,
+          costUsdMicros: 42,
+        },
+      },
+    ]);
+  }
+
+  test("json gains cache economics: tokens, hit ratio, and realized savings per provider/model + total", async () => {
+    seedCacheSession();
+    const result = await runCli(["cost-summary", "--session", SESSION_ID, "--format", "json"], {
+      cwd: tmp,
+    });
+    expect(result.exitCode).toBe(0);
+    const out = JSON.parse(result.stdout) as CacheSummaryJson;
+    // Pre-existing fields keep their exact shape and values (additive-only).
+    expect(out.count).toBe(2);
+    expect(out.totalUsdMicros).toBe(13_242);
+    expect(out.byProvider["anthropic"]).toBe(13_200);
+    expect(out.byProvider["openai"]).toBe(42);
+    // Totals across models.
+    expect(out.inputTokens).toBe(1100);
+    expect(out.outputTokens).toBe(110);
+    expect(out.cachedReadTokens).toBe(4100);
+    expect(out.cacheCreationTokens).toBe(2050);
+    // hit = cachedRead / (input + cachedRead) = 4100 / 5200
+    expect(out.cacheHitRatio).toBeCloseTo(4100 / 5200, 10);
+    // Savings sum only over priced buckets:
+    // sonnet reads 4000 × ($3 − $0.3) = 10_800; writes 2000 × ($3.75 − $3) = 1_500 → 9_300.
+    expect(out.cacheSavingsUsdMicros).toBe(9_300);
+    const sonnet = out.cacheByModel["anthropic/claude-sonnet-4-6"];
+    expect(sonnet?.cachedReadTokens).toBe(4000);
+    expect(sonnet?.cacheCreationTokens).toBe(2000);
+    expect(sonnet?.cacheHitRatio).toBeCloseTo(0.8, 10);
+    expect(sonnet?.cacheSavingsUsdMicros).toBe(9_300);
+    const unknown = out.cacheByModel["openai/fictional-model-99"];
+    expect(unknown?.cacheHitRatio).toBeCloseTo(0.5, 10);
+    expect(unknown?.cacheSavingsUsdMicros).toBeNull();
+  });
+
+  test("text format appends cache lines per provider/model + total, unknown model prices as n/a", async () => {
+    seedCacheSession();
+    const result = await runCli(["cost-summary", "--session", SESSION_ID], { cwd: tmp });
+    expect(result.exitCode).toBe(0);
+    // Pre-existing lines unchanged.
+    expect(result.stdout).toContain(`session: ${SESSION_ID}`);
+    expect(result.stdout).toContain("accrual events: 2");
+    expect(result.stdout).toContain("total: $0.0132");
+    // New cache economics lines.
+    expect(result.stdout).toContain("cache: read=4100 write=2050 hit=78.8% savings=$0.0093");
+    expect(result.stdout).toContain(
+      "  anthropic/claude-sonnet-4-6: read=4000 write=2000 hit=80.0% savings=$0.0093",
+    );
+    expect(result.stdout).toContain(
+      "  openai/fictional-model-99: read=100 write=50 hit=50.0% savings=n/a",
+    );
+  });
+
+  test("old logs keep parsing: token-less and pre-cache-write accruals aggregate with zero-filled cache fields", async () => {
+    seedSession([
+      // Oldest vintage: no token fields at all.
+      {
+        ts: 1,
+        version: 1,
+        kind: "cost_accrual",
+        payload: { provider: "anthropic", modelId: "claude-sonnet-4-6", costUsdMicros: 450 },
+      },
+      // Mid vintage: cachedReadTokens but no cacheCreationTokens.
+      {
+        ts: 2,
+        version: 1,
+        kind: "cost_accrual",
+        payload: {
+          provider: "anthropic",
+          modelId: "claude-sonnet-4-6",
+          inputTokens: 1000,
+          outputTokens: 10,
+          cachedReadTokens: 500,
+          costUsdMicros: 3_300,
+        },
+      },
+    ]);
+    const result = await runCli(["cost-summary", "--session", SESSION_ID, "--format", "json"], {
+      cwd: tmp,
+    });
+    expect(result.exitCode).toBe(0);
+    const out = JSON.parse(result.stdout) as CacheSummaryJson;
+    expect(out.count).toBe(2);
+    expect(out.totalUsdMicros).toBe(3_750);
+    expect(out.cachedReadTokens).toBe(500);
+    expect(out.cacheCreationTokens).toBe(0);
+    expect(out.cacheHitRatio).toBeCloseTo(500 / 1500, 10);
+    // Savings with zero writes: 500 × ($3 − $0.3) = 1_350 micros.
+    expect(out.cacheSavingsUsdMicros).toBe(1_350);
+  });
+
+  test("cost-summary --help documents the hit-ratio denominator and savings formula", async () => {
+    const result = await runCli(["cost-summary", "--help"]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("cachedReadTokens / (inputTokens + cachedReadTokens)");
+    expect(result.stdout).toContain("cache-write premium");
+  });
 });
 
 describe("crewhaus version", () => {

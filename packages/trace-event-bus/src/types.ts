@@ -288,6 +288,15 @@ export type CostAccrualEvent = TraceEventEnvelope & {
   inputTokens: number;
   outputTokens: number;
   cachedReadTokens: number;
+  /**
+   * Prompt-cache WRITE tokens (Anthropic `cache_creation_input_tokens`,
+   * Bedrock `cacheWriteInputTokens` — the canonical `usage.cacheCreate`),
+   * billed at a premium over the input rate. Optional so `cost_accrual`
+   * records persisted before this field existed keep parsing; absent means
+   * "not tracked", and emitters that do track it write 0 when no cache
+   * segment was created.
+   */
+  cacheCreationTokens?: number;
   costUsdMicros: number;
   tenantId?: string;
   /**

@@ -26,6 +26,7 @@
         "@crewhaus/compliance-controls": "workspace:*",
         "@crewhaus/computer-use-driver": "workspace:*",
         "@crewhaus/context-bundle": "workspace:*",
+        "@crewhaus/cost-tracker": "workspace:*",
         "@crewhaus/crewhaus-cloud": "workspace:*",
         "@crewhaus/data-retention-engine": "workspace:*",
         "@crewhaus/deployment-controller": "workspace:*",
