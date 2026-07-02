@@ -49,11 +49,14 @@
  * verify FAILS, catching a tail truncation that ALSO rewrote the on-host
  * `_chain-tail.json` in lockstep (the attacker cannot reach back into the
  * external store). An anchor that merely lags behind newer appends (the
- * benign best-effort case) is NOT treated as a failure. This package
- * ships only an in-memory `InMemoryAnchorStore` reference implementation
- * for tests/dev; PRODUCTION DEPLOYMENTS SHOULD SUPPLY A WORM-BACKED STORE
- * (object-lock bucket, append-only/separate-privilege service, or
- * transparency log) so the audit writer's own uid cannot rewrite it.
+ * benign best-effort case) is NOT treated as a failure. Two reference
+ * implementations ship: the in-memory `InMemoryAnchorStore` (tests/dev)
+ * and the durable `FileAnchorStore` (append-only anchor files under a
+ * directory — tamper-resistant exactly insofar as that directory is not
+ * writable by the audit writer's uid; see file-anchor-store.ts). PRODUCTION
+ * DEPLOYMENTS SHOULD BACK THE SEAM WITH A WORM STORE (object-lock bucket,
+ * append-only/separate-privilege service, or transparency log) so the audit
+ * writer's own uid cannot rewrite it.
  *
  * Files are created with mode 0o600 (owner-only) so the audit trail
  * cannot be read by other users on the host. Append uses
@@ -190,6 +193,15 @@ export class InMemoryAnchorStore implements AnchorStore {
     return this.anchors.get(logId);
   }
 }
+
+// File-backed AnchorStore (append-only anchors under a directory) — the
+// durable sibling of InMemoryAnchorStore. See file-anchor-store.ts for the
+// layout + threat model (its tamper-resistance is exactly the directory's).
+export {
+  FileAnchorStore,
+  FileAnchorStoreError,
+  type FileAnchorStoreOptions,
+} from "./file-anchor-store";
 
 export type OpenAuditLogOptions = {
   readonly rootDir: string;

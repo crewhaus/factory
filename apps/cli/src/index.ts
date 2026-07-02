@@ -40,6 +40,19 @@ import { type RegisteredTool, ToolCatalog } from "@crewhaus/tool-catalog";
 import { registerMcpServer } from "@crewhaus/tool-mcp";
 import { createTaskTool } from "@crewhaus/tool-task";
 import { type CostAccrualEvent, TraceEventBus } from "@crewhaus/trace-event-bus";
+// Item 34 — `crewhaus audit verify` plumbing (anchor-flag parsing + per-check
+// summary + doctor mapping), in a side-effect-free module so it is
+// unit-testable (this entry file runs an argv switch on import).
+import {
+  type AnchorFlagChoice,
+  InvalidAnchorFlagError,
+  buildAuditIntegrityCheck,
+  resolveAnchorFlag,
+  summarizeVerifyResult,
+} from "./audit-verify";
+// Item 34 — scheduling ergonomics for `compliance evidence` (--period current
+// resolution + the empty-evidence gate), side-effect-free for the same reason.
+import { findEmptyControls, resolvePeriodFlag } from "./compliance-schedule";
 // Model-aware doctor credential checks (provider parsed from the cwd spec's
 // agent.model via the model-router grammar), in a side-effect-free module so
 // it is unit-testable (this entry file runs an argv switch on import).
@@ -284,11 +297,26 @@ const SANDBOX_SCHEMA: ParseArgsSchema = {
 const COMPLIANCE_SCHEMA: ParseArgsSchema = {
   flags: [
     { name: "framework", takesValue: true },
+    // Item 34 — collect every registered framework in one (schedulable) run.
+    { name: "all-frameworks", takesValue: false },
     { name: "control", takesValue: true },
+    // Accepts a literal period label (e.g. 2026-Q2) or "current" (the current
+    // UTC quarter) so a cron job never hardcodes a stale label.
     { name: "period", takesValue: true },
     { name: "audit-dir", takesValue: true },
     { name: "out-dir", takesValue: true },
     { name: "signing-key-env", takesValue: true },
+    // Item 34 — opt out of the empty-evidence gate (a control with 0 records
+    // exits 1 by default so scheduled runs surface evidence gaps loudly).
+    { name: "allow-empty", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
+const AUDIT_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "dir", takesValue: true },
+    { name: "anchor", takesValue: true },
     { name: "help", short: "h" },
   ],
 };
@@ -410,8 +438,11 @@ function usageText(): string {
     "  sandbox doctor [--probe]             list registered sandbox images + healthcheck status (Section 36)",
     "       [--format json|table]",
     "  compliance evidence                  collect SOC 2 / ISO 27001 / HIPAA evidence (Section 39)",
-    "       --framework <id> [--control <id>] --period <p> [--audit-dir <d>]",
-    "       [--out-dir <d>] [--signing-key-env <ENV>]",
+    "       (--framework <id> | --all-frameworks) [--control <id>]",
+    "       --period <p>|current [--audit-dir <d>] [--out-dir <d>]",
+    "       [--signing-key-env <ENV>] [--allow-empty]",
+    "  audit verify [--dir <auditDir>]      verify the hash-chained audit log (tamper check)",
+    "       [--anchor file:<path>]          cross-check an append-only file anchor store",
     "  version                              print the CLI version (also: --version, -v)",
     "",
   ].join("\n");
@@ -1367,6 +1398,16 @@ async function runDoctor(args: ParsedArgs): Promise<void> {
     pass: existsSync(specPath),
     reason: existsSync(specPath) ? undefined : `not found at ${specPath} — run \`crewhaus init\``,
   });
+
+  // Item 34 — audit-log integrity. When the cwd carries a `.crewhaus/audit`
+  // store (the run path's justification gate writes one by default), walk the
+  // hash chain so doctor surfaces tampering. Skipped entirely when no store
+  // exists — a fresh checkout must not warn about a log it never wrote.
+  const auditDir = join(process.cwd(), ".crewhaus", "audit");
+  if (existsSync(auditDir)) {
+    const { verify: verifyAuditLog } = await import("@crewhaus/audit-log");
+    checks.push(buildAuditIntegrityCheck(await verifyAuditLog(auditDir)));
+  }
 
   for (const c of checks) {
     if (c.warn && c.pass) {
@@ -2735,6 +2776,69 @@ async function runFederation(rest: ReadonlyArray<string>): Promise<void> {
 }
 
 /**
+ * Item 34 — `crewhaus audit verify` walks the hash-chained audit log at
+ * `.crewhaus/audit` (the same store the `run` justification gate writes and
+ * `compliance evidence` reads) via `@crewhaus/audit-log`'s `verify()`,
+ * prints a per-check summary, and exits non-zero on any tamper finding.
+ * `--anchor file:<path>` additionally cross-checks the chain tip against a
+ * file-backed AnchorStore; a requested anchor that could NOT be consulted
+ * also exits 1 (a scheduled tamper check must not silently skip its
+ * strongest witness). Designed as a cron/CI tripwire.
+ */
+async function runAuditVerify(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus audit verify [--dir <auditDir>] [--anchor file:<path>]\n" +
+        "  Walks every day file of the hash-chained audit log, verifying each\n" +
+        "  record's hash, the prevHash links, the gapless seq run from 0, and\n" +
+        "  the on-host _chain-tail.json anchor (tail-truncation detection).\n" +
+        "  --dir <auditDir>       audit log root (default: ./.crewhaus/audit)\n" +
+        "  --anchor file:<path>   also cross-check the append-only file anchor\n" +
+        "                         store at <path> (mirror of the tail written\n" +
+        "                         when the log was opened with a FileAnchorStore)\n" +
+        "  Exit code: 0 intact; 1 on any tamper finding, or when a requested\n" +
+        "  --anchor store held no anchor to cross-check.\n",
+    );
+    return;
+  }
+  const dirFlag = args.flags["dir"];
+  const auditDir =
+    typeof dirFlag === "string" ? resolve(dirFlag) : join(process.cwd(), ".crewhaus", "audit");
+
+  let anchorChoice: AnchorFlagChoice | undefined;
+  try {
+    const anchorFlag = args.flags["anchor"];
+    anchorChoice = resolveAnchorFlag(typeof anchorFlag === "string" ? anchorFlag : undefined);
+  } catch (err) {
+    if (err instanceof InvalidAnchorFlagError) die(err.message);
+    throw err;
+  }
+
+  const auditLog = await import("@crewhaus/audit-log");
+  // verify() defaults logId to the rootDir it is given; the CLI passes the
+  // resolved absolute dir, matching openAuditLog's default logId for logs
+  // opened at the same absolute root (e.g. the run path's justification sink).
+  const result = await auditLog.verify(
+    auditDir,
+    anchorChoice !== undefined
+      ? { anchorStore: new auditLog.FileAnchorStore(resolve(anchorChoice.path)) }
+      : {},
+  );
+
+  process.stdout.write(`audit verify: ${auditDir}\n`);
+  const summary = summarizeVerifyResult(result, {
+    anchorRequested: anchorChoice !== undefined,
+  });
+  for (const line of summary.lines) {
+    process.stdout.write(`  ${line}\n`);
+  }
+  process.stdout.write(
+    summary.exitCode === 0 ? "\naudit log intact.\n" : "\naudit verification FAILED.\n",
+  );
+  if (summary.exitCode !== 0) process.exit(1);
+}
+
+/**
  * Section 39 — `crewhaus compliance evidence` collects SOC 2 / ISO 27001 /
  * HIPAA evidence bundles by walking an audit-log root and writing signed
  * bundles to `.crewhaus/compliance/<framework>/<controlId>/<period>.json`.
@@ -2743,13 +2847,25 @@ async function runFederation(rest: ReadonlyArray<string>): Promise<void> {
  *   crewhaus compliance evidence --framework soc2 --period 2026-Q2 \
  *     [--control CC6.1] [--audit-dir <d>] [--out-dir <d>] \
  *     [--signing-key-env CREWHAUS_COMPLIANCE_SIGNING_KEY]
+ *
+ * Item 34 scheduling ergonomics: `--period current` resolves the current UTC
+ * quarter, `--all-frameworks` loops every registered framework, and any
+ * control that collects 0 records fails the run (exit 1) unless
+ * `--allow-empty` — so one cron line can collect everything, every quarter,
+ * and an evidence gap trips the schedule instead of hiding until audit time.
  */
 async function runCompliance(args: ParsedArgs, action: string): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
       "usage:\n" +
-        "  crewhaus compliance evidence --framework <id> [--control <id>] --period <p>\n" +
-        "    [--audit-dir <d>] [--out-dir <d>] [--signing-key-env <ENV>]\n",
+        "  crewhaus compliance evidence (--framework <id> | --all-frameworks)\n" +
+        "    [--control <id>] --period <p>|current [--audit-dir <d>] [--out-dir <d>]\n" +
+        "    [--signing-key-env <ENV>] [--allow-empty]\n" +
+        '  --period current    resolve the current UTC quarter (e.g. "2026-Q3") so a\n' +
+        "                      scheduled run never hardcodes a stale label\n" +
+        "  --all-frameworks    collect every registered framework in one run\n" +
+        "  --allow-empty       exit 0 even when a control collected 0 records; by\n" +
+        "                      default an empty control is an evidence gap (exit 1)\n",
     );
     return;
   }
@@ -2757,9 +2873,22 @@ async function runCompliance(args: ParsedArgs, action: string): Promise<void> {
     die(`unknown compliance action "${action}" (expected: evidence)`);
   }
   const frameworkFlag = args.flags["framework"];
+  const allFrameworks = args.flags["all-frameworks"] === true;
+  const controlFlag = args.flags["control"];
   const periodFlag = args.flags["period"];
-  if (typeof frameworkFlag !== "string") die("--framework <id> is required");
-  if (typeof periodFlag !== "string") die("--period <p> is required");
+  if (typeof frameworkFlag === "string" && allFrameworks) {
+    die("--framework and --all-frameworks are mutually exclusive");
+  }
+  if (typeof frameworkFlag !== "string" && !allFrameworks) {
+    die("--framework <id> is required (or pass --all-frameworks)");
+  }
+  if (allFrameworks && typeof controlFlag === "string") {
+    die("--control is framework-specific — it cannot combine with --all-frameworks");
+  }
+  if (typeof periodFlag !== "string") {
+    die('--period <p> is required (accepts "current" for the current UTC quarter)');
+  }
+  const period = resolvePeriodFlag(periodFlag);
 
   const auditDirFlag = args.flags["audit-dir"];
   const outDirFlag = args.flags["out-dir"];
@@ -2793,27 +2922,45 @@ async function runCompliance(args: ParsedArgs, action: string): Promise<void> {
   };
 
   const collector = createComplianceCollector({ auditSource, outputDir: outDir });
-  const controlFlag = args.flags["control"];
 
+  // --all-frameworks loops every framework the registered controls span (the
+  // built-ins today: soc2, iso27001, hipaa — plus anything registered on top),
+  // derived from the collector itself so the flag never drifts from the
+  // package's actual coverage.
+  const frameworks = allFrameworks
+    ? [...new Set(collector.listControls().map((c) => c.frameworkId))].sort()
+    : [frameworkFlag as string];
+
+  const collectOpts = {
+    period,
+    ...(signingKey !== undefined ? { signingKey } : {}),
+  };
   type EvidenceBundle = Awaited<ReturnType<typeof collector.collect>>;
-  let bundles: EvidenceBundle[] | ReadonlyArray<EvidenceBundle>;
+  const bundles: EvidenceBundle[] = [];
   if (typeof controlFlag === "string") {
-    const single = await collector.collect(frameworkFlag, controlFlag, {
-      period: periodFlag,
-      ...(signingKey !== undefined ? { signingKey } : {}),
-    });
-    bundles = [single];
+    // Mutual exclusion above guarantees exactly one framework here.
+    bundles.push(await collector.collect(frameworks[0] as string, controlFlag, collectOpts));
   } else {
-    bundles = await collector.collectAll(frameworkFlag, {
-      period: periodFlag,
-      ...(signingKey !== undefined ? { signingKey } : {}),
-    });
+    for (const framework of frameworks) {
+      bundles.push(...(await collector.collectAll(framework, collectOpts)));
+    }
   }
 
   for (const b of bundles) {
     const path = collector.writeBundle(b);
     process.stdout.write(
-      `${b.frameworkId}/${b.controlId} ${periodFlag}: ${b.recordCount} records → ${path}\n`,
+      `${b.frameworkId}/${b.controlId} ${period}: ${b.recordCount} records → ${path}\n`,
+    );
+  }
+
+  // Item 34 — the empty-evidence gate. A control that collected 0 records is
+  // a gap an auditor cannot be shown evidence for; a scheduled run must fail
+  // loudly NOW rather than let the gap surface at audit time. Bundles are
+  // still written above (the non-empty ones remain valid evidence).
+  const empty = findEmptyControls(bundles);
+  if (empty.length > 0 && args.flags["allow-empty"] !== true) {
+    die(
+      `evidence gap — ${empty.length} control(s) collected 0 records for ${period}: ${empty.join(", ")} (pass --allow-empty to permit an empty period)`,
     );
   }
 }
@@ -2993,6 +3140,14 @@ switch (subcommand) {
       die(`compliance action must be "evidence" (got "${action}")`);
     }
     await runCompliance(parseFor(rest.slice(1), COMPLIANCE_SCHEMA), action);
+    break;
+  }
+  case "audit": {
+    const action = rest[0] ?? "";
+    if (action !== "verify") {
+      die(`audit action must be "verify" (got "${action}")`);
+    }
+    await runAuditVerify(parseFor(rest.slice(1), AUDIT_SCHEMA));
     break;
   }
   case "version":

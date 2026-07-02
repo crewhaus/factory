@@ -1,7 +1,16 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { type AuditKind, FileAnchorStore, openAuditLog } from "@crewhaus/audit-log";
 import { parseSpec } from "@crewhaus/spec";
 
 // `tsc -b` also compiles this file into `dist/`; resolve the CLI entrypoint
@@ -843,4 +852,281 @@ describe("crewhaus version", () => {
       expect(result.stdout.trim()).toBe(pkgVersion);
     });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Item 34 — `crewhaus audit verify` + schedulable `compliance evidence`.
+// ---------------------------------------------------------------------------
+
+/** Append one audit record per `kind` to `<dir>` (creating the store). */
+async function seedAuditLog(
+  dir: string,
+  kinds: ReadonlyArray<AuditKind>,
+  anchorStore?: FileAnchorStore,
+): Promise<void> {
+  const log = await openAuditLog({ rootDir: dir, ...(anchorStore ? { anchorStore } : {}) });
+  for (const kind of kinds) {
+    await log.append({ kind, payload: { seeded: kind } });
+  }
+}
+
+/** Flip one payload byte on the given line of the newest day file. */
+function tamperAuditLog(dir: string, lineIndex: number): void {
+  const dayFile = readdirSync(dir)
+    .filter((f) => f.endsWith(".jsonl"))
+    .sort()
+    .at(-1) as string;
+  const file = join(dir, dayFile);
+  const lines = readFileSync(file, "utf8")
+    .split("\n")
+    .filter((l) => l !== "");
+  const record = JSON.parse(lines[lineIndex] as string);
+  record.payload = { seeded: "tampered" };
+  lines[lineIndex] = JSON.stringify(record);
+  writeFileSync(file, `${lines.join("\n")}\n`);
+}
+
+describe("crewhaus audit verify", () => {
+  test("--help documents --dir, --anchor, and the exit-code contract", async () => {
+    const result = await runCli(["audit", "verify", "--help"]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("--dir <auditDir>");
+    expect(result.stdout).toContain("--anchor file:<path>");
+    expect(result.stdout).toContain("Exit code: 0 intact");
+  });
+
+  test("an unknown audit action dies with the allowed list", async () => {
+    const result = await runCli(["audit", "frobnicate"]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('audit action must be "verify"');
+  });
+
+  test("verifies the default ./.crewhaus/audit store in cwd and exits 0 when intact", async () => {
+    await seedAuditLog(join(tmp, ".crewhaus", "audit"), ["policy_decision", "model_call"]);
+    const result = await runCli(["audit", "verify"], { cwd: tmp });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("✓ hash chain intact — 2 record(s)");
+    expect(result.stdout).toContain("✓ on-host chain-tail anchor");
+    expect(result.stdout).toContain("audit log intact.");
+  });
+
+  test("an empty/missing store verifies as intact (0 records, anchor limitation noted)", async () => {
+    const result = await runCli(["audit", "verify", "--dir", join(tmp, "no-such-audit")]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("0 record(s)");
+    expect(result.stdout).toContain("~ on-host chain-tail anchor absent");
+  });
+
+  test("a tampered payload exits 1 with the finding's file:line + reason", async () => {
+    const auditDir = join(tmp, "audit");
+    await seedAuditLog(auditDir, ["policy_decision", "secrets_access", "model_call"]);
+    tamperAuditLog(auditDir, 1);
+    const result = await runCli(["audit", "verify", "--dir", auditDir]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout).toContain("✗ tamper finding at");
+    expect(result.stdout).toContain(":2 — hash mismatch");
+    expect(result.stdout).toContain("audit verification FAILED.");
+  });
+
+  test("--anchor file:<path> cross-checks a mirrored FileAnchorStore and exits 0", async () => {
+    const auditDir = join(tmp, "audit");
+    const anchorDir = join(tmp, "anchors");
+    await seedAuditLog(auditDir, ["policy_decision", "model_call"], new FileAnchorStore(anchorDir));
+    const result = await runCli([
+      "audit",
+      "verify",
+      "--dir",
+      auditDir,
+      "--anchor",
+      `file:${anchorDir}`,
+    ]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("✓ external anchor store agrees");
+  });
+
+  test("--anchor catches a truncation that rewrote the on-host anchor in lockstep", async () => {
+    const auditDir = join(tmp, "audit");
+    const anchorDir = join(tmp, "anchors");
+    await seedAuditLog(
+      auditDir,
+      ["secrets_access", "secrets_access", "secrets_access"],
+      new FileAnchorStore(anchorDir),
+    );
+    // Same-uid attacker: drop the tail record AND rewrite _chain-tail.json.
+    const dayFile = readdirSync(auditDir)
+      .filter((f) => f.endsWith(".jsonl"))
+      .sort()
+      .at(-1) as string;
+    const file = join(auditDir, dayFile);
+    const survivors = readFileSync(file, "utf8")
+      .split("\n")
+      .filter((l) => l !== "")
+      .slice(0, 2);
+    writeFileSync(file, `${survivors.join("\n")}\n`);
+    const last = JSON.parse(survivors[1] as string);
+    const day = dayFile.replace(/\.jsonl$/, "");
+    writeFileSync(
+      join(auditDir, "_chain-tail.json"),
+      JSON.stringify({ day, hash: last.hash, seq: last.seq }),
+    );
+
+    // Without the store the lockstep rewrite passes; with it, seq 2 is caught.
+    const fooled = await runCli(["audit", "verify", "--dir", auditDir]);
+    expect(fooled.exitCode).toBe(0);
+    const caught = await runCli([
+      "audit",
+      "verify",
+      "--dir",
+      auditDir,
+      "--anchor",
+      `file:${anchorDir}`,
+    ]);
+    expect(caught.exitCode).toBe(1);
+    expect(caught.stdout).toContain("external anchor mismatch");
+  });
+
+  test("a REQUESTED anchor store with no anchor for the log exits 1 (no silent skip)", async () => {
+    const auditDir = join(tmp, "audit");
+    await seedAuditLog(auditDir, ["policy_decision"]); // opened WITHOUT a store
+    const emptyAnchors = join(tmp, "empty-anchors");
+    mkdirSync(emptyAnchors, { recursive: true });
+    const result = await runCli([
+      "audit",
+      "verify",
+      "--dir",
+      auditDir,
+      "--anchor",
+      `file:${emptyAnchors}`,
+    ]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout).toContain("✗ external anchor requested (--anchor)");
+  });
+
+  test("an unknown --anchor scheme dies with the allowed list", async () => {
+    const result = await runCli(["audit", "verify", "--anchor", "s3://bucket/prefix"], {
+      cwd: tmp,
+    });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('invalid --anchor "s3://bucket/prefix"');
+    expect(result.stderr).toContain("one of: file");
+  });
+});
+
+describe("crewhaus doctor — audit-log integrity (item 34)", () => {
+  test("a tampered .crewhaus/audit store fails doctor even when everything else is healthy", async () => {
+    writeFileSync(join(tmp, "crewhaus.yaml"), "name: t\ntarget: cli\n");
+    const auditDir = join(tmp, ".crewhaus", "audit");
+    await seedAuditLog(auditDir, ["policy_decision", "model_call"]);
+    tamperAuditLog(auditDir, 0);
+    const result = await runCli(["doctor"], { cwd: tmp, env: { ANTHROPIC_API_KEY: "test" } });
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout).toContain("✗ Audit log integrity");
+    expect(result.stdout).toContain("hash mismatch");
+  });
+
+  test("an intact .crewhaus/audit store passes doctor with the record count", async () => {
+    writeFileSync(join(tmp, "crewhaus.yaml"), "name: t\ntarget: cli\n");
+    await seedAuditLog(join(tmp, ".crewhaus", "audit"), ["policy_decision"]);
+    const result = await runCli(["doctor"], { cwd: tmp, env: { ANTHROPIC_API_KEY: "test" } });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("✓ Audit log integrity (.crewhaus/audit, 1 records)");
+  });
+});
+
+describe("crewhaus compliance evidence — scheduling ergonomics (item 34)", () => {
+  // The UTC quarter the CLI must resolve for --period current, computed with
+  // the same arithmetic the implementation uses (compliance-schedule.ts).
+  const expectedQuarter = (() => {
+    const now = new Date();
+    return `${now.getUTCFullYear()}-Q${Math.floor(now.getUTCMonth() / 3) + 1}`;
+  })();
+
+  test("--help documents --period current, --all-frameworks, and --allow-empty", async () => {
+    const result = await runCli(["compliance", "evidence", "--help"]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("--period current");
+    expect(result.stdout).toContain("--all-frameworks");
+    expect(result.stdout).toContain("--allow-empty");
+  });
+
+  test("--period current resolves to the current UTC quarter in output + bundle path", async () => {
+    await seedAuditLog(join(tmp, ".crewhaus", "audit"), ["policy_decision"]);
+    const result = await runCli(
+      ["compliance", "evidence", "--framework", "soc2", "--period", "current", "--allow-empty"],
+      { cwd: tmp },
+    );
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain(`soc2/CC6.1 ${expectedQuarter}: 1 records`);
+    expect(
+      existsSync(join(tmp, ".crewhaus", "compliance", "soc2", "CC6.1", `${expectedQuarter}.json`)),
+    ).toBe(true);
+  });
+
+  test("a control with 0 records exits 1 by default, naming the evidence gap", async () => {
+    // policy_decision satisfies CC6.1 only; CC6.7/CC7.2/CC7.3 collect nothing.
+    await seedAuditLog(join(tmp, ".crewhaus", "audit"), ["policy_decision"]);
+    const result = await runCli(
+      ["compliance", "evidence", "--framework", "soc2", "--period", "2026-Q2"],
+      { cwd: tmp },
+    );
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("evidence gap");
+    expect(result.stderr).toContain("soc2/CC6.7");
+    expect(result.stderr).toContain("--allow-empty");
+    // Bundles were still written (the non-empty ones remain valid evidence).
+    expect(existsSync(join(tmp, ".crewhaus", "compliance", "soc2", "CC6.1", "2026-Q2.json"))).toBe(
+      true,
+    );
+  });
+
+  test("a framework whose every control collected evidence exits 0 without --allow-empty", async () => {
+    await seedAuditLog(join(tmp, ".crewhaus", "audit"), [
+      "policy_decision", // CC6.1
+      "secrets_rotation", // CC6.7
+      "model_call", // CC7.2
+      "gateway_request", // CC7.3
+    ]);
+    const result = await runCli(
+      ["compliance", "evidence", "--framework", "soc2", "--period", "2026-Q2"],
+      { cwd: tmp },
+    );
+    expect(result.exitCode).toBe(0);
+  });
+
+  test("--all-frameworks collects soc2 + iso27001 + hipaa in one run", async () => {
+    await seedAuditLog(join(tmp, ".crewhaus", "audit"), ["policy_decision"]);
+    const result = await runCli(
+      ["compliance", "evidence", "--all-frameworks", "--period", "2026-Q2", "--allow-empty"],
+      { cwd: tmp },
+    );
+    expect(result.exitCode).toBe(0);
+    for (const framework of ["soc2", "iso27001", "hipaa"]) {
+      expect(result.stdout).toContain(`${framework}/`);
+      expect(existsSync(join(tmp, ".crewhaus", "compliance", framework))).toBe(true);
+    }
+  });
+
+  test("--framework and --all-frameworks are mutually exclusive", async () => {
+    const result = await runCli(
+      ["compliance", "evidence", "--framework", "soc2", "--all-frameworks", "--period", "2026-Q2"],
+      { cwd: tmp },
+    );
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("mutually exclusive");
+  });
+
+  test("--control cannot combine with --all-frameworks", async () => {
+    const result = await runCli(
+      ["compliance", "evidence", "--all-frameworks", "--control", "CC6.1", "--period", "2026-Q2"],
+      { cwd: tmp },
+    );
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("--control is framework-specific");
+  });
+
+  test("omitting both --framework and --all-frameworks dies pointing at both options", async () => {
+    const result = await runCli(["compliance", "evidence", "--period", "2026-Q2"], { cwd: tmp });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("--framework <id> is required (or pass --all-frameworks)");
+  });
 });
