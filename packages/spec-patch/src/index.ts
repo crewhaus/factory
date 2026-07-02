@@ -34,6 +34,12 @@ import { CrewhausError } from "@crewhaus/errors";
 import { type Spec, parseSpec } from "@crewhaus/spec";
 import { parse, parseDocument } from "yaml";
 import { z } from "zod";
+import { REDACTED_VALUE, isCredentialKey, maskCredentialTokens } from "./redact";
+
+// Re-exported so downstream renderers (the CLI changelog, future reporters)
+// can apply the SAME redaction to strings the differ never sees (rationales,
+// free-form provenance) without duplicating the pattern table a third time.
+export { REDACTED_VALUE, isCredentialKey, maskCredentialTokens } from "./redact";
 
 export class SpecPatchError extends CrewhausError {
   override readonly name = "SpecPatchError";
@@ -418,8 +424,9 @@ export function parseWriteBackHeader(yamlText: string): WriteBackHeaderInfo | un
  * Item 46 — one field-level difference between two spec versions (see
  * `diffSpecYaml`). `path` is dot-joined property keys with array indices
  * rendered as `[i]` (e.g. `steps[2].prompt`). `before`/`after` carry the
- * FORMATTED (truncated) values, ready for a changelog line — the differ is
- * a reporting primitive, not a patch source.
+ * FORMATTED (truncated, credential-REDACTED — see `renderDiffValue`) values,
+ * ready for a changelog line — the differ is a reporting primitive, not a
+ * patch source.
  */
 export type SpecDiffEntry = {
   readonly kind: "added" | "removed" | "changed";
@@ -436,7 +443,9 @@ export const DIFF_VALUE_MAX_LENGTH = 72;
 /**
  * Render a value for a diff line: scalars as JSON (strings quoted), maps and
  * sequences as compact JSON, truncated to `maxLength` with an ellipsis so a
- * multi-paragraph instructions prompt doesn't flood the changelog.
+ * multi-paragraph instructions prompt doesn't flood the changelog. Pure
+ * formatting — credential redaction happens upstream in `renderDiffValue`,
+ * which is what the differ itself calls.
  */
 export function formatDiffValue(value: unknown, maxLength: number = DIFF_VALUE_MAX_LENGTH): string {
   const rendered = value === undefined ? "undefined" : (JSON.stringify(value) ?? String(value));
@@ -466,7 +475,7 @@ export function diffSpecYaml(beforeYaml: string, afterYaml: string): ReadonlyArr
     throw new SpecPatchError("diff: new YAML is not parseable", err);
   }
   const out: SpecDiffEntry[] = [];
-  walkDiff(before, after, "", out);
+  walkDiff(before, after, "", out, []);
   return out;
 }
 
@@ -479,18 +488,76 @@ function leafEqual(a: unknown, b: unknown): boolean {
   return JSON.stringify(a) === JSON.stringify(b);
 }
 
-function walkDiff(a: unknown, b: unknown, path: string, out: SpecDiffEntry[]): void {
+/**
+ * Adversarial-review F1 — render a diff value with credentials removed.
+ * `diffSpecYaml`'s output lands verbatim in `.crewhaus/specs/<name>/
+ * CHANGELOG.md` on every compile and echoes through `crewhaus spec log`, so
+ * the redaction has to happen HERE in the differ, for every consumer:
+ *
+ *   - a value under a credential-carrying key — final or parent segment
+ *     (`agent.api_key`, `mcp_servers.*.env.TOKEN`, sse `headers.*`) —
+ *     renders as `[redacted]`, never the value;
+ *   - every other value has nested credential keys redacted and
+ *     credential-shaped tokens masked out of its strings (an `sk-…` pasted
+ *     into `instructions` prose) BEFORE `formatDiffValue` truncates.
+ *
+ * `keyTrail` is the chain of property keys down to the value; array indices
+ * are not keys and don't appear in it.
+ */
+function renderDiffValue(value: unknown, keyTrail: ReadonlyArray<string>): string {
+  const finalKey = keyTrail[keyTrail.length - 1];
+  const parentKey = keyTrail[keyTrail.length - 2];
+  if (
+    (finalKey !== undefined && isCredentialKey(finalKey)) ||
+    (parentKey !== undefined && isCredentialKey(parentKey))
+  ) {
+    return REDACTED_VALUE;
+  }
+  return formatDiffValue(redactTree(value));
+}
+
+/** Deep-copy `value` with credential-keyed leaves replaced by `[redacted]`
+ *  and credential-shaped tokens masked inside the remaining strings, so an
+ *  added/removed SUBTREE (a whole MCP server map with an `env` block) can't
+ *  smuggle secrets through its compact-JSON rendering. */
+function redactTree(value: unknown, underCredentialKey = false): unknown {
+  if (Array.isArray(value)) {
+    return value.map((v) => redactTree(v, underCredentialKey));
+  }
+  if (isPlainObject(value)) {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) {
+      out[k] = redactTree(v, underCredentialKey || isCredentialKey(k));
+    }
+    return out;
+  }
+  if (underCredentialKey) return REDACTED_VALUE;
+  return typeof value === "string" ? maskCredentialTokens(value) : value;
+}
+
+function walkDiff(
+  a: unknown,
+  b: unknown,
+  path: string,
+  out: SpecDiffEntry[],
+  keyTrail: ReadonlyArray<string>,
+): void {
   if (isPlainObject(a) && isPlainObject(b)) {
     // Union of keys, a's ordering first — deterministic output.
     const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
     for (const key of keys) {
       const childPath = path === "" ? key : `${path}.${key}`;
+      const childTrail = [...keyTrail, key];
       if (!(key in a)) {
-        out.push({ kind: "added", path: childPath, after: formatDiffValue(b[key]) });
+        out.push({ kind: "added", path: childPath, after: renderDiffValue(b[key], childTrail) });
       } else if (!(key in b)) {
-        out.push({ kind: "removed", path: childPath, before: formatDiffValue(a[key]) });
+        out.push({
+          kind: "removed",
+          path: childPath,
+          before: renderDiffValue(a[key], childTrail),
+        });
       } else {
-        walkDiff(a[key], b[key], childPath, out);
+        walkDiff(a[key], b[key], childPath, out, childTrail);
       }
     }
     return;
@@ -500,11 +567,11 @@ function walkDiff(a: unknown, b: unknown, path: string, out: SpecDiffEntry[]): v
     for (let i = 0; i < len; i++) {
       const childPath = `${path}[${i}]`;
       if (i >= a.length) {
-        out.push({ kind: "added", path: childPath, after: formatDiffValue(b[i]) });
+        out.push({ kind: "added", path: childPath, after: renderDiffValue(b[i], keyTrail) });
       } else if (i >= b.length) {
-        out.push({ kind: "removed", path: childPath, before: formatDiffValue(a[i]) });
+        out.push({ kind: "removed", path: childPath, before: renderDiffValue(a[i], keyTrail) });
       } else {
-        walkDiff(a[i], b[i], childPath, out);
+        walkDiff(a[i], b[i], childPath, out, keyTrail);
       }
     }
     return;
@@ -514,8 +581,8 @@ function walkDiff(a: unknown, b: unknown, path: string, out: SpecDiffEntry[]): v
     out.push({
       kind: "changed",
       path: path === "" ? "(root)" : path,
-      before: formatDiffValue(a),
-      after: formatDiffValue(b),
+      before: renderDiffValue(a, keyTrail),
+      after: renderDiffValue(b, keyTrail),
     });
   }
 }

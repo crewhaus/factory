@@ -1609,5 +1609,46 @@ describe("crewhaus spec auto-register + changelog (item 46)", () => {
     const result = await runCli(["spec", "log", "--help"]);
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("spec log <name>");
+    // Review F3: the sanitation behaviour is documented in the help text.
+    expect(result.stdout).toContain('"My Agent" → My-Agent');
+  });
+
+  test("spec log accepts the display name compile registered under its sanitized slot (review F3)", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    writeFileSync(
+      specPath,
+      readFileSync(HELLO_SPEC, "utf-8").replace(/^name: .*$/m, "name: My Agent"),
+    );
+    const out = join(tmp, "out");
+    const compiled = await runCli(["compile", specPath, "-o", out], { cwd: tmp });
+    expect(compiled.exitCode).toBe(0);
+    expect(compiled.stdout).toContain("registered My-Agent@v1");
+    // The raw display name no longer dies — it resolves to the same slot.
+    const log = await runCli(["spec", "log", "My Agent"], { cwd: tmp });
+    expect(log.exitCode).toBe(0);
+    expect(log.stdout).toContain('showing log for My-Agent (sanitized from "My Agent")');
+    expect(log.stdout).toContain("# Changelog — My-Agent");
+    // The sanitized form keeps working too, without the notice.
+    const direct = await runCli(["spec", "log", "My-Agent"], { cwd: tmp });
+    expect(direct.exitCode).toBe(0);
+    expect(direct.stdout).not.toContain("sanitized from");
+  });
+
+  test("changelog + spec log never print credential tokens from instructions (review F1)", async () => {
+    const out = join(tmp, "out");
+    await runCli(["compile", writeSpecVariant("Answer briefly."), "-o", out], { cwd: tmp });
+    const second = await runCli(
+      ["compile", writeSpecVariant("Use key sk-live-DEADBEEFDEADBEEF for calls."), "-o", out],
+      { cwd: tmp },
+    );
+    expect(second.exitCode).toBe(0);
+    const changelog = readFileSync(join(REGISTRY(), "hello", "CHANGELOG.md"), "utf-8");
+    expect(changelog).toContain("- changed `agent.instructions`");
+    expect(changelog).not.toContain("sk-live");
+    expect(changelog).not.toContain("DEADBEEF");
+    expect(changelog).toContain("***");
+    const log = await runCli(["spec", "log", "hello"], { cwd: tmp });
+    expect(log.exitCode).toBe(0);
+    expect(log.stdout).not.toContain("sk-live");
   });
 });

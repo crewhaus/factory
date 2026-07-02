@@ -2885,7 +2885,8 @@ async function runSpec(args: ParsedArgs, action: string): Promise<void> {
         "  crewhaus spec get <name> <version>                          print yaml\n" +
         "  crewhaus spec pin <name> <env> <version> [--tenant <id>]   pin env → version\n" +
         "  crewhaus spec alias <name> <env> [--tenant <id>]            resolve env → version\n" +
-        "  crewhaus spec log <name> [--root-dir <dir>]                 print the changelog (newest first)\n",
+        "  crewhaus spec log <name> [--root-dir <dir>]                 print the changelog (newest first;\n" +
+        '                                                              display names sanitize as on compile: "My Agent" → My-Agent)\n',
     );
     return;
   }
@@ -2931,8 +2932,19 @@ async function runSpec(args: ParsedArgs, action: string): Promise<void> {
     return;
   }
   if (action === "log") {
-    const name = args.positional[0];
-    if (typeof name !== "string") die("missing <name>");
+    const rawName = args.positional[0];
+    if (typeof rawName !== "string") die("missing <name>");
+    // Item 46 (review F3): compile/write-back auto-registration stores under
+    // the SANITIZED registry grammar (`registrySpecName("My Agent")` →
+    // `My-Agent`), so the lookup must run the same sanitation or a display
+    // name dies here while its changelog sits one transform away. Names
+    // already in the registry grammar (every `spec put` name) pass through
+    // unchanged.
+    const { registrySpecName } = await import("./spec-changelog");
+    const name = registrySpecName(rawName);
+    if (name !== rawName) {
+      process.stdout.write(`showing log for ${name} (sanitized from "${rawName}")\n`);
+    }
     // Validate the name through the registry's own grammar (same floor as
     // put/get) so a crafted name can't path-traverse out of the root.
     try {

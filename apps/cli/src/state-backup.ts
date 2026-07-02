@@ -495,6 +495,25 @@ export async function createStateBackup(opts: BackupOptions): Promise<BackupResu
         }
         mkdirSync(dirname(join(staging, rel)), { recursive: true });
         writeFileSync(join(staging, rel), snapshot);
+        // Adversarial-review F4: `serialize()` preserves the source's
+        // journal mode, so a WAL-mode source yields a WAL-mode snapshot —
+        // which a READ-ONLY consumer cannot open (SQLite needs to create
+        // `-wal`/`-shm` on the first open of a WAL db, and we archive no
+        // sidecars). Flip the STAGED copy to a rollback journal before it
+        // is packed; the live source db is untouched. A failure here falls
+        // through to the raw-copy path below like any other snapshot error.
+        const staged = new Database(join(staging, rel));
+        try {
+          staged.run("PRAGMA journal_mode=DELETE");
+        } finally {
+          staged.close();
+        }
+        // The mode flip itself can leave a stray `-shm` beside the staged
+        // file (observed on bun 1.3 / macOS even after close) — scrub any
+        // sidecars so they don't get packed.
+        for (const suffix of SQLITE_SIDECAR_SUFFIXES) {
+          rmSync(join(staging, `${rel}${suffix}`), { force: true });
+        }
         snapshotted.push(rel);
         // The snapshot folds WAL frames in; archiving the sidecars alongside
         // it would restore a db whose WAL disagrees with its main file.

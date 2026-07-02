@@ -17,6 +17,7 @@
  * copying the value into a second, more-readable artifact.
  */
 import type { IrMcpServers, IrNode } from "./index";
+import { OPAQUE_TOKEN_RE, maskCredentialTokens } from "./redact";
 
 /**
  * Common emitter option controlling README.md emission. Default ON;
@@ -192,7 +193,9 @@ function collectToolUsage(ir: unknown): ReadonlyMap<string, ReadonlySet<string>>
       if (label !== undefined && Array.isArray(value)) {
         for (const item of value) {
           const name = (item as { readonly name?: unknown } | null)?.name;
-          visit(item, typeof name === "string" ? `${label} \`${name}\`` : label);
+          // The context label lands in a table cell verbatim — escape the
+          // interpolated name (F5) but not the intentional backticks here.
+          visit(item, typeof name === "string" ? `${label} \`${escapeCell(name)}\`` : label);
         }
         continue;
       }
@@ -238,6 +241,95 @@ function collectModels(ir: IrNode): readonly string[] {
   }
 }
 
+/**
+ * Adversarial-review F5 — escape an interpolated value for a GFM table
+ * cell: `|` would split the cell, a raw newline would end the row, and a
+ * stray backtick would terminate the code-span the tables wrap values in.
+ */
+function escapeCell(value: string): string {
+  return value.replace(/\|/g, "\\|").replace(/`/g, "\\`").replace(/\r?\n/g, " ");
+}
+
+/**
+ * Adversarial-review F2 — words in a CLI flag name that mark its VALUE as a
+ * credential (`--token=…`, `--api-key …`). Matched per dash-separated word
+ * so `--keyboard-layout` stays visible while `--api-key` masks.
+ */
+const CREDENTIAL_FLAG_WORDS: ReadonlySet<string> = new Set([
+  "key",
+  "apikey",
+  "token",
+  "secret",
+  "password",
+  "pass",
+  "passwd",
+  "pwd",
+  "auth",
+  "authorization",
+  "credential",
+  "credentials",
+  "bearer",
+]);
+
+function isCredentialFlag(arg: string): boolean {
+  const m = arg.match(/^--?([A-Za-z][A-Za-z0-9-]*)$/);
+  if (m?.[1] === undefined) return false;
+  return m[1]
+    .toLowerCase()
+    .split("-")
+    .some((word) => CREDENTIAL_FLAG_WORDS.has(word));
+}
+
+/** Render a stdio server's launch line with credential-valued flags masked
+ *  (`--token=v` and `--token v` forms) and known token shapes (`sk-…`,
+ *  `ghp_…`, …) masked out of every other arg. */
+function maskStdioCommand(command: string, args: ReadonlyArray<string>): string {
+  const masked: string[] = [];
+  let maskNext = false;
+  for (const arg of args) {
+    if (maskNext) {
+      masked.push("***");
+      maskNext = false;
+      continue;
+    }
+    const eq = arg.indexOf("=");
+    if (arg.startsWith("-") && eq > 0 && isCredentialFlag(arg.slice(0, eq))) {
+      masked.push(`${arg.slice(0, eq)}=***`);
+      continue;
+    }
+    if (isCredentialFlag(arg)) {
+      masked.push(arg);
+      maskNext = true;
+      continue;
+    }
+    masked.push(maskCredentialTokens(arg));
+  }
+  return [command, ...masked].join(" ");
+}
+
+/**
+ * Mask the credential-bearing parts of an sse URL: userinfo passwords
+ * (`https://user:***@`), ALL query-parameter values (`?apikey=***` — key
+ * names stay, values never render), and path segments shaped like opaque
+ * credentials (Alchemy/Infura-style `/v2/<key>` → `/v2/***`). Regex-based
+ * so a not-quite-parseable URL still gets masked rather than printed raw.
+ */
+function maskUrlCredentials(url: string): string {
+  // Userinfo: keep the user, mask the password.
+  const out = url.replace(/^([a-z][a-z0-9+.-]*:\/\/[^/@:]+):([^/@]+)@/i, "$1:***@");
+  const q = out.indexOf("?");
+  const query = q === -1 ? "" : out.slice(q).replace(/([?&;][^=&;#]*)=([^&;#]*)/g, "$1=***");
+  let base = q === -1 ? out : out.slice(0, q);
+  const prefix = base.match(/^[a-z][a-z0-9+.-]*:\/\/[^/]*/i)?.[0] ?? "";
+  const path = base
+    .slice(prefix.length)
+    .split("/")
+    .map((seg) => (OPAQUE_TOKEN_RE.test(seg) ? "***" : maskCredentialTokens(seg)))
+    .join("/");
+  base = `${prefix}${path}`;
+  return `${base}${query}`;
+}
+
 function toolScopeHint(name: string): string {
   if (name.startsWith("mcp__")) return "external (MCP)";
   if (OUTWARD_TOOL_NAMES.has(name)) return "external";
@@ -258,7 +350,7 @@ function renderToolsSection(ir: IrNode): string | undefined {
   const configured = collectConfiguredToolNames(ir);
   const rows = [...usage.keys()].sort().map((name) => {
     const contexts = [...(usage.get(name) ?? new Set<string>())].sort().join(", ");
-    return `| \`${name}\` | ${contexts} | ${toolScopeHint(name)} | ${toolNotes(name, configured)} |`;
+    return `| \`${escapeCell(name)}\` | ${contexts} | ${toolScopeHint(name)} | ${toolNotes(name, configured)} |`;
   });
   return ["| Tool | Used by | Scope | Notes |", "| --- | --- | --- | --- |", ...rows].join("\n");
 }
@@ -269,11 +361,14 @@ function renderMcpSection(ir: IrNode): string | undefined {
   const entries = Object.entries(servers);
   if (entries.length === 0) return undefined;
   // Endpoint column: command for stdio, URL for sse. Env values and sse
-  // headers are intentionally NOT rendered — they can carry credentials.
+  // headers are intentionally NOT rendered — they can carry credentials —
+  // and the command/URL themselves are masked (adversarial-review F2):
+  // credential-valued flags, known token shapes in args, URL userinfo
+  // passwords, ALL query-parameter values, and opaque path segments.
   const rows = entries.map(([name, cfg]) =>
     cfg.transport === "stdio"
-      ? `| \`${name}\` | stdio | \`${[cfg.command, ...cfg.args].join(" ")}\` |`
-      : `| \`${name}\` | sse | \`${cfg.url}\` |`,
+      ? `| \`${escapeCell(name)}\` | stdio | \`${escapeCell(maskStdioCommand(cfg.command, cfg.args))}\` |`
+      : `| \`${escapeCell(name)}\` | sse | \`${escapeCell(maskUrlCredentials(cfg.url))}\` |`,
   );
   return ["| Server | Transport | Endpoint |", "| --- | --- | --- |", ...rows].join("\n");
 }
@@ -332,9 +427,11 @@ export function renderBundleReadme(ir: IrNode, opts: BundleReadmeOptions = {}): 
   const harnessRows = [
     "| | |",
     "| --- | --- |",
-    `| Name | \`${ir.name}\` |`,
+    `| Name | \`${escapeCell(ir.name)}\` |`,
     `| Target | \`${ir.target}\` |`,
-    `| ${models.length > 1 ? "Models" : "Model"} | ${models.map((m) => `\`${m}\``).join(", ")} |`,
+    `| ${models.length > 1 ? "Models" : "Model"} | ${models
+      .map((m) => `\`${escapeCell(m)}\``)
+      .join(", ")} |`,
   ].join("\n");
 
   const sections: BundleReadmeSection[] = [{ heading: "Harness", body: harnessRows }];

@@ -638,6 +638,35 @@ describe("sqlite handling", () => {
     }
   });
 
+  test("a restored snapshot of a WAL db opens READ-ONLY (journal mode folded to DELETE — review F4)", async () => {
+    const harness = join(tmp, "src");
+    seedHarness(harness);
+    const dbPath = join(harness, ".crewhaus", "durable-state.sqlite");
+    const db = new Database(dbPath);
+    try {
+      db.run("PRAGMA journal_mode = WAL");
+      db.run("CREATE TABLE kv (k TEXT PRIMARY KEY, v TEXT NOT NULL)");
+      db.run("INSERT INTO kv VALUES ('a', '1')");
+      const out = join(tmp, "b.tar.gz");
+      await makeBackup(harness, out);
+
+      const extracted = await extractTo(out, join(tmp, "x"));
+      // `serialize()` preserves WAL mode; without the staged
+      // journal_mode=DELETE flip, this read-only open (no sidecars in the
+      // archive, none creatable) fails at first query.
+      const restored = new Database(join(extracted, "durable-state.sqlite"), { readonly: true });
+      try {
+        const mode = restored.query("PRAGMA journal_mode").get() as { journal_mode: string };
+        expect(mode.journal_mode).toBe("delete");
+        expect(restored.query("SELECT v FROM kv WHERE k = 'a'").get()).toEqual({ v: "1" });
+      } finally {
+        restored.close();
+      }
+    } finally {
+      db.close();
+    }
+  });
+
   test("an unsnapshotttable sqlite file falls back to a raw copy with a warning", async () => {
     const harness = join(tmp, "src");
     seedHarness(harness);

@@ -224,6 +224,102 @@ describe("renderBundleReadme — MCP servers (item 42)", () => {
   });
 });
 
+describe("renderBundleReadme — MCP credential masking (adversarial review F2)", () => {
+  test("reviewer repro: stdio credential flags are masked in --flag=v AND --flag v form", () => {
+    const ir = baseCliIr({
+      mcp_servers: {
+        github: {
+          transport: "stdio",
+          command: "npx",
+          args: [
+            "-y",
+            "mcp-github",
+            "--token=ghp_abcdefghij0123456789",
+            "--api-key",
+            "SUPERSECRETVALUE",
+            "--verbose",
+          ],
+          env: {},
+        },
+      },
+    });
+    const md = renderBundleReadme(ir);
+    expect(md).not.toContain("ghp_");
+    expect(md).not.toContain("SUPERSECRETVALUE");
+    expect(md).toContain("--token=***");
+    expect(md).toContain("--api-key ***");
+    // Non-credential args survive untouched.
+    expect(md).toContain("npx -y mcp-github");
+    expect(md).toContain("--verbose");
+  });
+
+  test("a bare arg matching a known token shape is masked even without a flag", () => {
+    const ir = baseCliIr({
+      mcp_servers: {
+        payments: {
+          transport: "stdio",
+          command: "stripe-mcp",
+          args: ["sk-live-DEADBEEFDEADBEEF"],
+          env: {},
+        },
+      },
+    });
+    const md = renderBundleReadme(ir);
+    expect(md).not.toContain("sk-live");
+    expect(md).toContain("| `payments` | stdio | `stripe-mcp ***` |");
+  });
+
+  test("reviewer repro: sse URLs mask query values, userinfo passwords, and opaque path segments", () => {
+    const alchemyKey = "AbCdEf0123456789AbCdEf0123456789";
+    const ir = baseCliIr({
+      mcp_servers: {
+        rpc: {
+          transport: "sse",
+          url: `https://user:hunter2@rpc.example.com/v2/${alchemyKey}?apikey=TOPSECRET&region=us`,
+          headers: {},
+        },
+      },
+    });
+    const md = renderBundleReadme(ir);
+    expect(md).not.toContain("hunter2");
+    expect(md).not.toContain("TOPSECRET");
+    expect(md).not.toContain(alchemyKey);
+    expect(md).toContain(
+      "| `rpc` | sse | `https://user:***@rpc.example.com/v2/***?apikey=***&region=***` |",
+    );
+  });
+
+  test("a plain URL without credentials renders verbatim (no false masking)", () => {
+    const ir = baseCliIr({
+      mcp_servers: {
+        search: {
+          transport: "sse",
+          url: "https://mcp.example.com/sse/events",
+          headers: {},
+        },
+      },
+    });
+    expect(renderBundleReadme(ir)).toContain(
+      "| `search` | sse | `https://mcp.example.com/sse/events` |",
+    );
+  });
+});
+
+describe("renderBundleReadme — table-cell escaping (adversarial review F5)", () => {
+  test("pipes, backticks, and newlines in tool names cannot break the markdown table", () => {
+    const ir = baseCliIr({ tools: ["evil|name`x`", "multi\nline"] });
+    const md = renderBundleReadme(ir);
+    expect(md).toContain("evil\\|name\\`x\\`");
+    expect(md).toContain("multi line"); // newline collapsed to a space
+    // Every row of the Tools table still has the column count of its header.
+    const section = md.split("## Tools")[1]?.split("##")[0] ?? "";
+    const rows = section.split("\n").filter((l) => l.startsWith("|"));
+    expect(rows.length).toBeGreaterThan(2);
+    const cols = (line: string) => line.split(/(?<!\\)\|/).length;
+    for (const row of rows) expect(cols(row)).toBe(cols(rows[0] ?? ""));
+  });
+});
+
 describe("renderBundleReadme — per-target run snippet (item 42)", () => {
   test("cli launches agent.ts; channel launches daemon.ts", () => {
     expect(renderBundleReadme(baseCliIr())).toContain("bun agent.ts");

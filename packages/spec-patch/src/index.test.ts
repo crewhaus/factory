@@ -390,3 +390,111 @@ describe("diffSpecYaml (item 46 structural differ)", () => {
     expect(() => diffSpecYaml(BASE, "a: [unclosed")).toThrow(SpecPatchError);
   });
 });
+
+describe("diffSpecYaml — credential redaction (adversarial review F1)", () => {
+  const BASE = [
+    "target: cli",
+    "name: hello",
+    "agent:",
+    "  model: claude-sonnet-4-5",
+    "  instructions: Be helpful.",
+    "",
+  ].join("\n");
+
+  test("reviewer repro: an sk-live token pasted into instructions is masked, never printed", () => {
+    const next = BASE.replace(
+      "instructions: Be helpful.",
+      "instructions: Call the API with key sk-live-DEADBEEFDEADBEEF please.",
+    );
+    const diff = diffSpecYaml(BASE, next);
+    expect(diff).toHaveLength(1);
+    const after = diff[0]?.after ?? "";
+    expect(after).not.toContain("sk-live");
+    expect(after).not.toContain("DEADBEEF");
+    expect(after).toContain("***");
+    expect(diff[0]?.path).toBe("agent.instructions");
+  });
+
+  test("reviewer repro: an agent.api_key change renders [redacted] on both sides", () => {
+    const withKey = (v: string) =>
+      BASE.replace("  instructions: Be helpful.", `  instructions: Be helpful.\n  api_key: ${v}`);
+    const diff = diffSpecYaml(withKey("old-secret-value"), withKey("new-secret-value"));
+    expect(diff).toEqual([
+      {
+        kind: "changed",
+        path: "agent.api_key",
+        before: "[redacted]",
+        after: "[redacted]",
+      },
+    ]);
+    expect(JSON.stringify(diff)).not.toContain("secret-value");
+  });
+
+  test("reviewer repro: MCP env password values render [redacted] for added, changed, AND removed", () => {
+    const mcp = (password: string | undefined) =>
+      [
+        BASE.trimEnd(),
+        "mcp_servers:",
+        "  db:",
+        "    command: pg-mcp",
+        "    env:",
+        ...(password !== undefined ? [`      PASSWORD: ${password}`] : ["      OTHER: x"]),
+        "",
+      ].join("\n");
+    const added = diffSpecYaml(mcp(undefined), mcp("hunter2"));
+    expect(added).toContainEqual({
+      kind: "added",
+      path: "mcp_servers.db.env.PASSWORD",
+      after: "[redacted]",
+    });
+    const changed = diffSpecYaml(mcp("hunter2"), mcp("hunter3"));
+    expect(changed).toEqual([
+      {
+        kind: "changed",
+        path: "mcp_servers.db.env.PASSWORD",
+        before: "[redacted]",
+        after: "[redacted]",
+      },
+    ]);
+    const removed = diffSpecYaml(mcp("hunter2"), mcp(undefined));
+    expect(removed).toContainEqual({
+      kind: "removed",
+      path: "mcp_servers.db.env.PASSWORD",
+      before: "[redacted]",
+    });
+    for (const diff of [added, changed, removed]) {
+      expect(JSON.stringify(diff)).not.toContain("hunter");
+    }
+  });
+
+  test("a whole added MCP server subtree redacts nested credential values in its JSON rendering", () => {
+    const next = [
+      BASE.trimEnd(),
+      "mcp_servers:",
+      "  gh:",
+      "    command: gh-mcp",
+      "    env:",
+      "      GITHUB_TOKEN: ghp_abcdefghij0123456789",
+      "",
+    ].join("\n");
+    const diff = diffSpecYaml(BASE, next);
+    expect(diff).toHaveLength(1);
+    const after = diff[0]?.after ?? "";
+    expect(after).not.toContain("ghp_");
+    expect(after).toContain("[redacted]");
+    expect(after).toContain("gh-mcp"); // non-credential structure still renders
+  });
+
+  test("a benign instructions edit renders normally (no false redaction)", () => {
+    const next = BASE.replace("Be helpful.", "Think step by step before answering.");
+    const diff = diffSpecYaml(BASE, next);
+    expect(diff).toEqual([
+      {
+        kind: "changed",
+        path: "agent.instructions",
+        before: '"Be helpful."',
+        after: '"Think step by step before answering."',
+      },
+    ]);
+  });
+});
