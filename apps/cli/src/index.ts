@@ -61,6 +61,22 @@ import { type RegisteredTool, ToolCatalog } from "@crewhaus/tool-catalog";
 import { registerMcpServer } from "@crewhaus/tool-mcp";
 import { createTaskTool } from "@crewhaus/tool-task";
 import { type CostAccrualEvent, type ProviderId, TraceEventBus } from "@crewhaus/trace-event-bus";
+// Item 15 — `optimize --from-advice` (eval-gated apply of the advisor's
+// SpecPatches: suggestions-file validation, the accept/reject/compose loop
+// with injected compile/eval hooks, decisions.json + write-back stamping),
+// in a side-effect-free module so it is unit-testable (this entry file runs
+// an argv switch on import).
+import {
+  AdviceApplyError,
+  type AdvicePatchDecision,
+  type ParsedAdvicePatch,
+  applyAdvicePatches,
+  assertFromAdviceFlagsCompatible,
+  buildAdviceDecisionsFile,
+  formatAdviceDecisionLine,
+  parseSuggestionsFile,
+  stampAdviceWriteBack,
+} from "./advice-apply";
 // Item 14 — `crewhaus advise` rule library (session-JSONL aggregation +
 // threshold rules + suggestions.json/report.html builders), in a
 // side-effect-free module so it is unit-testable (this entry file runs an
@@ -327,6 +343,12 @@ const OPTIMIZE_SCHEMA: ParseArgsSchema = {
   flags: [
     { name: "dataset", takesValue: true },
     { name: "graders", takesValue: true },
+    // Item 15 — apply `crewhaus advise` SpecPatches (suggestions.json) via
+    // the eval-gated accept/reject/compose loop instead of running the
+    // mutation search. Mutually exclusive with --mutator/--iterations;
+    // --dataset/--graders/--ratings still resolve as usual (the apply path
+    // needs an eval).
+    { name: "from-advice", takesValue: true },
     // Inline-distill user ratings into the training set (Pillar 2 — close the
     // loop from real feedback). Value: a session id (sess_<16 hex>) or "all".
     // Synthesizes the dataset (and, when --graders is omitted, the graders too).
@@ -1929,7 +1951,8 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
     process.stdout.write(
       "usage: crewhaus optimize <spec.yaml> (--dataset <data> --graders <graders.yaml> | --ratings <session>) " +
         "[--min-score F] [--mutator rule-based|claude] [--iterations N] [--seed N] [--concurrency N] " +
-        "[--improvement-threshold F] [--budget-usd N] [--write-back] [--no-register] [--no-pin-regressions] [--no-retry] [-o <out-dir>]\n" +
+        "[--improvement-threshold F] [--budget-usd N] [--from-advice <suggestions.json>] " +
+        "[--write-back] [--no-register] [--no-pin-regressions] [--no-retry] [-o <out-dir>]\n" +
         "  --dataset takes a file path or registry:<name>[@version][#split] (Section 29 registry;\n" +
         "  default version: latest). A registry record with populated train AND dev splits is\n" +
         "  used as-is; otherwise the selected samples get the inline 70/30 split. The test\n" +
@@ -1950,12 +1973,44 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
         "  A successful --write-back auto-registers the rewritten spec in the local\n" +
         "  registry (.crewhaus/specs) with a changelog entry carrying the run's\n" +
         "  score delta and patch rationale — same flow as `crewhaus compile`;\n" +
-        "  --no-register opts out. See `crewhaus spec log <name>`.\n",
+        "  --no-register opts out. See `crewhaus spec log <name>`.\n" +
+        "  --from-advice <suggestions.json> applies the validated SpecPatches `crewhaus advise`\n" +
+        "  emitted (agent.max_tokens, compaction.curate, …) instead of running the mutation\n" +
+        "  search — mutually exclusive with --mutator/--iterations. Each patch is applied\n" +
+        "  in-memory, compile-gated, and evaluated on the dev split against ONE baseline eval\n" +
+        "  of the unpatched spec. Acceptance: the regression gate must pass (no pass-rate drop,\n" +
+        "  no per-sample pass→fail flip), but strict improvement is NOT required — advisor\n" +
+        "  patches tune config for latency/cost/robustness, so an equal pass rate with zero\n" +
+        "  regressions accepts; the delta is printed and persisted either way. Accepted\n" +
+        "  patches compose (patch k+1 applies on top of the accepted spec); rejected patches\n" +
+        "  are reported with their eval delta. Artifacts land under <out>/advice/ (baseline +\n" +
+        "  per-patch eval dirs, decisions.json, patched.yaml). The source spec is only touched\n" +
+        "  with --write-back (same conventions as the search path: provenance header +\n" +
+        "  auto-register + regression pinning).\n" +
+        "  The nightly advisor loop composes:\n" +
+        "    crewhaus advise --all -o . && \\\n" +
+        "    crewhaus optimize crewhaus.yaml --from-advice suggestions.json --write-back \\\n" +
+        "      --dataset eval/dataset.jsonl --graders eval/graders.yaml\n",
     );
     return;
   }
   const specPath = args.positional[0];
   if (typeof specPath !== "string") die("missing <spec.yaml>");
+  // Item 15 — `--from-advice` replaces the mutation search: the knobs that
+  // steer it have nothing to act on, so the combination is rejected up
+  // front (before any dataset is loaded or eval is paid for).
+  const fromAdviceFlag = strFlag(args, "from-advice");
+  if (fromAdviceFlag !== undefined) {
+    try {
+      assertFromAdviceFlagsCompatible({
+        mutator: typeof args.flags["mutator"] === "string",
+        iterations: typeof args.flags["iterations"] === "string",
+      });
+    } catch (err) {
+      if (err instanceof AdviceApplyError) die(err.message);
+      throw err;
+    }
+  }
   const datasetPath = args.flags["dataset"];
   const gradersPath = args.flags["graders"];
   const ratingsArg = args.flags["ratings"];
@@ -2128,6 +2183,31 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
         `dataset has ${samples.length} samples — need at least 2 (70/30 split needs a dev split)`,
       );
     }
+  }
+
+  // Item 15 — `--from-advice`: the eval-gated apply path for the advisor's
+  // SpecPatches. Branches here because it shares everything above (dataset/
+  // graders/ratings resolution, the dev split, the run dirs) and nothing
+  // below (no mutation search, no fitness fn, no mutator).
+  if (fromAdviceFlag !== undefined) {
+    await runOptimizeFromAdvice({
+      fromAdvicePath: fromAdviceFlag,
+      absSpec,
+      specPath,
+      runId,
+      outDir,
+      compiled,
+      devSet,
+      datasetName,
+      concurrency,
+      seed,
+      retryErrors,
+      writeBack,
+      noRegister: args.flags["no-register"] === true,
+      pinRegressions: args.flags["no-pin-regressions"] !== true,
+      originalById,
+    });
+    return;
   }
 
   // Index the dev set by id so the fitness fn can join each graded
@@ -2380,6 +2460,203 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
   // withheld from the mutator's failure signal above. Empty queue → silent.
   for (const line of formatDatasetFixQueue(datasetFixQueue)) {
     process.stdout.write(`[optimize] ${line}\n`);
+  }
+}
+
+/**
+ * Item 15 — the `optimize --from-advice` body (wiring only; the accept/
+ * reject/compose loop lives in ./advice-apply). Reuses the exact seams the
+ * search path uses: `lower(parseSpec(...))` as the offline compile gate and
+ * one `runEvalLib` pass per candidate over the resolved dev split — then
+ * mirrors the flywheel's applyAccepted conventions on `--write-back`
+ * (provenance header via `stampAdviceWriteBack` → write source → auto-
+ * register + changelog → best-effort regression pinning). Without
+ * `--write-back` the source is never touched: the stamped YAML lands at
+ * `<out>/advice/patched.yaml` next to decisions.json and the eval dirs.
+ */
+async function runOptimizeFromAdvice(opts: {
+  readonly fromAdvicePath: string;
+  readonly absSpec: string;
+  readonly specPath: string;
+  readonly runId: string;
+  readonly outDir: string;
+  readonly compiled: ReadonlyArray<CompiledGrader>;
+  readonly devSet: ReadonlyArray<{ id: string; input: string; expected_output?: string }>;
+  readonly datasetName: string;
+  readonly concurrency: number;
+  readonly seed: number;
+  readonly retryErrors: boolean;
+  readonly writeBack: boolean;
+  readonly noRegister: boolean;
+  readonly pinRegressions: boolean;
+  readonly originalById: ReadonlyMap<string, Sample>;
+}): Promise<void> {
+  const pct = (rate: number): string => `${(rate * 100).toFixed(1)}%`;
+
+  let suggestionsText: string;
+  try {
+    suggestionsText = readFileSync(resolve(opts.fromAdvicePath), "utf-8");
+  } catch (err) {
+    die(`could not read ${opts.fromAdvicePath}: ${(err as Error).message}`);
+  }
+  let patches: ParsedAdvicePatch[];
+  try {
+    patches = parseSuggestionsFile(suggestionsText);
+  } catch (err) {
+    if (err instanceof AdviceApplyError) die(err.message);
+    throw err;
+  }
+  if (patches.length === 0) {
+    process.stdout.write(
+      `[optimize] ${opts.fromAdvicePath} carries no spec patches — nothing to apply (advice-only findings are report-only; see the advise report.html)\n`,
+    );
+    return;
+  }
+
+  const sourceYaml = readFileSync(opts.absSpec, "utf-8");
+  const adviceDir = join(opts.outDir, "advice");
+  mkdirSync(adviceDir, { recursive: true });
+
+  process.stdout.write(
+    `[optimize] runId=${opts.runId} spec=${opts.specPath} dataset=${opts.datasetName} ` +
+      `(${opts.devSet.length} dev) from-advice=${opts.fromAdvicePath} patches=${patches.length}\n`,
+  );
+
+  // Injected seams (see applyAdvicePatches in ./advice-apply): the same
+  // offline parse→lower gate and per-candidate eval pass the search path's
+  // fitness fn uses, persisted under <out>/advice/<label>/.
+  const compileCheck = (yaml: string, _label: string): void => {
+    lower(parseSpec(yaml));
+  };
+  const evalRun = async (label: string, yaml: string) => {
+    const evalIr = lower(parseSpec(yaml));
+    if (evalIr.target !== "cli") {
+      die(`crewhaus optimize --from-advice only supports target: cli (got "${evalIr.target}")`);
+    }
+    const summary = await runEvalLib({
+      ir: evalIr,
+      dataset: { name: opts.datasetName, samples: makeAsyncIterable(opts.devSet) },
+      compiledGraders: opts.compiled,
+      opts: {
+        outDir: join(adviceDir, label),
+        concurrency: opts.concurrency,
+        seed: opts.seed,
+        retryErrors: opts.retryErrors,
+      },
+    });
+    process.stdout.write(
+      `[optimize] ${label} eval: pass_rate=${pct(summary.aggregates.passRate)} ` +
+        `mean_score=${summary.aggregates.meanScore.toFixed(3)} errors=${summary.aggregates.errorCount}\n`,
+    );
+    return summary;
+  };
+
+  let result: Awaited<ReturnType<typeof applyAdvicePatches>>;
+  try {
+    result = await applyAdvicePatches({ sourceYaml, patches, hooks: { compileCheck, evalRun } });
+  } catch (err) {
+    // The baseline compile/eval gate failed — a spec the compiler rejects
+    // (or a dataset that can't run) must die cleanly, like the search path.
+    if (err instanceof CrewhausError) die(err.message);
+    throw err;
+  }
+
+  // decisions.json — the per-patch audit trail (accepted/rejected + reason
+  // + eval delta + eval dir), next to the baseline and patch-NNN eval dirs.
+  const decisionsFile = buildAdviceDecisionsFile({
+    runId: opts.runId,
+    generatedAt: new Date().toISOString(),
+    source: opts.fromAdvicePath,
+    baseline: result.baseline,
+    decisions: result.decisions,
+  });
+  writeFileSync(join(adviceDir, "decisions.json"), JSON.stringify(decisionsFile, null, 2), {
+    mode: 0o600,
+  });
+
+  for (const d of result.decisions) {
+    process.stdout.write(`[optimize] ${formatAdviceDecisionLine(d)}\n`);
+  }
+  process.stdout.write(`[optimize] decisions: ${join(adviceDir, "decisions.json")}\n`);
+
+  if (result.accepted === 0 || result.finalSummary === undefined) {
+    process.stdout.write(
+      `[optimize] 0/${result.decisions.length} advice patches accepted — spec untouched.\n`,
+    );
+    return;
+  }
+
+  const passRateBefore = result.baseline.aggregates.passRate;
+  const passRateAfter = result.finalSummary.aggregates.passRate;
+  const stamped = stampAdviceWriteBack({
+    runId: opts.runId,
+    yaml: result.finalYaml,
+    passRateBefore,
+    passRateAfter,
+    patchesEvaluated: result.decisions.length,
+  });
+  // The composed accepted spec is always persisted as an artifact
+  // (accept-then-write: the source is only touched by --write-back below).
+  writeFileSync(join(adviceDir, "patched.yaml"), stamped, { mode: 0o600 });
+  // Aggregate patch.json so `spec log` provenance (autoRegisterSpecVersion
+  // reads its `rationale`) names what this write-back was.
+  const acceptedDecisions = result.decisions.filter(
+    (d): d is AdvicePatchDecision & { status: "accepted" } => d.status === "accepted",
+  );
+  const acceptedIds = acceptedDecisions.map((d) => d.findingId ?? d.patch.path.join("."));
+  writeFileSync(
+    join(adviceDir, "patch.json"),
+    JSON.stringify(
+      {
+        rationale:
+          `advisor: accepted ${result.accepted}/${result.decisions.length} advice patch(es) ` +
+          `[${acceptedIds.join(", ")}]; pass_rate ${pct(passRateBefore)} → ${pct(passRateAfter)}`,
+        patches: acceptedDecisions.map((d) => d.patch),
+      },
+      null,
+      2,
+    ),
+    { mode: 0o600 },
+  );
+  process.stdout.write(
+    `[optimize] accepted ${result.accepted}/${result.decisions.length} advice patches ` +
+      `(pass_rate ${pct(passRateBefore)} → ${pct(passRateAfter)}, Δ ${((passRateAfter - passRateBefore) * 100).toFixed(1)} pts)\n`,
+  );
+
+  if (!opts.writeBack) {
+    process.stdout.write(
+      `[optimize] patched YAML saved to ${join(adviceDir, "patched.yaml")}. Re-run with --write-back to apply it to the source spec.\n`,
+    );
+    return;
+  }
+
+  // --write-back: the flywheel applyAccepted conventions — stamped source
+  // write, auto-register + changelog, best-effort regression pinning.
+  writeFileSync(opts.absSpec, stamped);
+  process.stdout.write(`[optimize] wrote patched YAML to ${opts.absSpec}\n`);
+  if (!opts.noRegister) {
+    await autoRegisterSpec(stamped, { patchJsonPath: join(adviceDir, "patch.json") });
+  }
+  try {
+    const pin = await pinRecoveriesAfterOptimize({
+      registry: createFileBackedRegistry({ rootDir: defaultDatasetsRoot() }),
+      specName: parseSpec(sourceYaml).name,
+      pin: opts.pinRegressions,
+      baselineRunDir: result.baseline.outDir,
+      candidateRunDir: result.finalSummary.outDir,
+      samplesById: opts.originalById,
+      sourceDataset: opts.datasetName,
+      optimizeRunId: opts.runId,
+    });
+    if (pin !== undefined && pin.pinned > 0) {
+      process.stdout.write(
+        `[optimize] pinned ${pin.pinned} recovered samples → ${pin.suiteName}@${pin.version}\n`,
+      );
+    }
+  } catch (err) {
+    process.stderr.write(
+      `[optimize] regression pinning skipped: ${err instanceof Error ? err.message : String(err)}\n`,
+    );
   }
 }
 
