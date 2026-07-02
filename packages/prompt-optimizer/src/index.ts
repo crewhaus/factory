@@ -78,17 +78,31 @@ export type SampleGrade = {
 export type FitnessResult = {
   readonly score: number;
   readonly grades?: ReadonlyArray<SampleGrade>;
+  /**
+   * Item 9 — where this measurement's eval run was persisted (the CLI's
+   * fitness fn reports eval-runner's outDir here). The loop tracks the
+   * base prompt's and the current best's dirs so a post-accept consumer
+   * (the CLI's regression pinning) can diff the two runs and extract the
+   * fail→pass recoveries the winning candidate bought. Optional and
+   * purely additive — a fitness fn that omits it changes nothing.
+   */
+  readonly runDir?: string;
 };
 
 export type FitnessFn = (prompt: string) => Promise<number | FitnessResult>;
 
-/** Normalise a fitness return to `{ score, grades? }` (bare number → no grades). */
+/** Normalise a fitness return to `{ score, grades?, runDir? }` (bare number → neither). */
 function normalizeFitness(r: number | FitnessResult): {
   score: number;
   grades?: ReadonlyArray<SampleGrade>;
+  runDir?: string;
 } {
   if (typeof r === "number") return { score: r };
-  return { score: r.score, ...(r.grades !== undefined ? { grades: r.grades } : {}) };
+  return {
+    score: r.score,
+    ...(r.grades !== undefined ? { grades: r.grades } : {}),
+    ...(r.runDir !== undefined ? { runDir: r.runDir } : {}),
+  };
 }
 
 /**
@@ -182,6 +196,10 @@ export type OptimizeResult = {
   readonly best: Candidate;
   readonly improvement: number;
   readonly trajectory: ReadonlyArray<Candidate>;
+  /** Item 9 — eval-run dir of the base prompt's measurement, when the fitness fn reported one. */
+  readonly baseRunDir?: string;
+  /** Item 9 — eval-run dir of the returned best's measurement, when the fitness fn reported one. */
+  readonly bestRunDir?: string;
 };
 
 const DEFAULT_MUTATIONS: ReadonlyArray<Mutation["kind"]> = [
@@ -312,6 +330,12 @@ export async function optimize(basePrompt: string, opts: OptimizeOptions): Promi
   // whenever `best` is replaced (below) so the signal always describes
   // the prompt being mutated, not a stale earlier candidate.
   let bestGrades: ReadonlyArray<SampleGrade> | undefined = base.grades;
+  // Item 9 — persisted eval-run dirs for the base measurement and the
+  // current best's measurement, tracked in lockstep with `best` so a
+  // post-accept consumer can diff exactly the two runs that produced
+  // `improvement`. Both stay undefined for fitness fns that don't report.
+  const baseRunDir = base.runDir;
+  let bestRunDir = base.runDir;
 
   for (let i = 1; i <= iterations; i++) {
     const state: OptimizerState = {
@@ -335,6 +359,7 @@ export async function optimize(basePrompt: string, opts: OptimizeOptions): Promi
     if (score > best.score) {
       best = candidate;
       bestGrades = measured.grades;
+      bestRunDir = measured.runDir;
     }
   }
 
@@ -351,6 +376,8 @@ export async function optimize(basePrompt: string, opts: OptimizeOptions): Promi
     best,
     improvement: best.score - baseScore,
     trajectory,
+    ...(baseRunDir !== undefined ? { baseRunDir } : {}),
+    ...(bestRunDir !== undefined ? { bestRunDir } : {}),
   };
 }
 

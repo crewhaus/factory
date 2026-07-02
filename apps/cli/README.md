@@ -58,9 +58,9 @@ Run `crewhaus` with no arguments for the full usage text, or any subcommand with
 |---|---|
 | `compile <spec.yaml> -o <out-dir>` | Compile a spec to a runnable bundle; `--emit-ir` prints the lowered IR as JSON instead |
 | `run <spec.yaml>` | Compile in-memory and execute the agent (`--model`, `--resume <id>` / `--continue`, `--prompt <text>`, …) |
-| `eval <spec.yaml> --dataset <data> --graders <graders.yaml>` | Run the agent against a dataset and grade (deterministic graders + LLM-as-judge); every run is indexed and auto-diffed against the pinned baseline (`--gate` exits non-zero on regression, `--no-promote` keeps the pin) |
+| `eval <spec.yaml> --dataset <data> --graders <graders.yaml>` | Run the agent against a dataset and grade (deterministic graders + LLM-as-judge); every run is indexed and auto-diffed against the pinned baseline (`--gate` exits non-zero on regression, `--no-promote` keeps the pin); the per-spec `<specName>-regressions` suite is unioned in by default (`--no-regressions` skips) |
 | `eval-report diff <prev> <new>` | Compare two eval runs and emit a diff report; `history` lists recorded runs, `baseline show\|set <runId>` inspects or pins baselines |
-| `optimize <spec.yaml> --dataset <data> --graders <graders.yaml>` | Active eval-driven optimization; `--write-back` rewrites the spec in place |
+| `optimize <spec.yaml> --dataset <data> --graders <graders.yaml>` | Active eval-driven optimization; `--write-back` rewrites the spec in place; accepted patches pin their fail→pass recoveries into `<specName>-regressions` (`--no-pin-regressions` skips) |
 | `init [name]` | Scaffold a new `crewhaus.yaml` |
 | `doctor` | Check environment health |
 | `context --bundle` | Emit a single-markdown orientation manifest |

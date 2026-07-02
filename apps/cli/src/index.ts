@@ -117,6 +117,10 @@ import {
   openJustificationAuditSink,
   resolveJudgeChoice,
 } from "./justification-gate";
+// Item 9 — per-spec regression suite: post-accept pinning of optimize
+// recoveries + the eval-side default union, in a side-effect-free module so
+// it is unit-testable (this entry file runs an argv switch on import).
+import { applyRegressionUnion, pinRecoveriesAfterOptimize } from "./regression-pin";
 // FR-002 — Pillar 3 sink-side scope gate, shared by `compile --strict` and
 // `doctor --philosophy-alignment`. Kept in a side-effect-free module so it is
 // unit-testable (this entry file runs an argv switch on import).
@@ -239,6 +243,9 @@ const OPTIMIZE_SCHEMA: ParseArgsSchema = {
     // FR-003 — dollar ceiling for model-driven runs (composes with --iterations).
     { name: "budget-usd", takesValue: true },
     { name: "write-back", takesValue: false },
+    // Item 9 — skip pinning an accepted patch's fail→pass recoveries into
+    // the per-spec `<specName>-regressions` registry dataset.
+    { name: "no-pin-regressions", takesValue: false },
     { name: "out", short: "o", takesValue: true },
     { name: "help", short: "h" },
   ],
@@ -259,6 +266,9 @@ const EVAL_SCHEMA: ParseArgsSchema = {
     // Run-history item 3 — keep the existing baseline pin instead of
     // auto-promoting this run on gate pass (also skips the first-run pin).
     { name: "no-promote", takesValue: false },
+    // Item 9 — skip the default union of the per-spec
+    // `<specName>-regressions` registry dataset into the loaded dataset.
+    { name: "no-regressions", takesValue: false },
     { name: "help", short: "h" },
   ],
 };
@@ -1638,11 +1648,15 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
     process.stdout.write(
       "usage: crewhaus optimize <spec.yaml> (--dataset <data> --graders <graders.yaml> | --ratings <session>) " +
         "[--min-score F] [--mutator rule-based|claude] [--iterations N] [--seed N] [--concurrency N] " +
-        "[--improvement-threshold F] [--budget-usd N] [--write-back] [-o <out-dir>]\n" +
+        "[--improvement-threshold F] [--budget-usd N] [--write-back] [--no-pin-regressions] [-o <out-dir>]\n" +
         "  --dataset takes a file path or registry:<name>[@version][#split] (Section 29 registry;\n" +
         "  default version: latest). A registry record with populated train AND dev splits is\n" +
         "  used as-is; otherwise the selected samples get the inline 70/30 split. The test\n" +
-        "  split is never optimized against unless #test is explicitly given.\n",
+        "  split is never optimized against unless #test is explicitly given.\n" +
+        "  When a patch is accepted (with or without --write-back), the dev samples that flipped\n" +
+        "  fail→pass are pinned into the <specName>-regressions registry dataset (a new version\n" +
+        "  unioning the previous one, deduped by sample id) so `crewhaus eval` guards them by\n" +
+        "  default. --no-pin-regressions skips the pin.\n",
     );
     return;
   }
@@ -1731,6 +1745,15 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
     ...(s.expected_output !== undefined ? { expected_output: s.expected_output } : {}),
   });
   const samples: OptimizerSample[] = [];
+  // Item 9 — the ORIGINAL samples by id, captured before toOptimizerSample
+  // strips expected_tools/metadata, so post-accept regression pinning
+  // appends each recovered sample as it lives in the source dataset (a
+  // pinned sample must re-grade the same way under `crewhaus eval`).
+  const originalById = new Map<string, Sample>();
+  const remember = <T extends Sample>(list: ReadonlyArray<T>): ReadonlyArray<T> => {
+    for (const s of list) if (!originalById.has(s.id)) originalById.set(s.id, s);
+    return list;
+  };
   let datasetName = "ratings";
   // Item 12 — a registry:<name>[@version][#split] dataset whose record
   // carries BOTH a populated train and dev split (and no explicit #split) is
@@ -1765,20 +1788,21 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
         record.splits.dev.length > 0
       ) {
         registrySplits = {
-          train: record.splits.train.map(toOptimizerSample),
-          dev: record.splits.dev.map(toOptimizerSample),
+          train: remember(record.splits.train).map(toOptimizerSample),
+          dev: remember(record.splits.dev).map(toOptimizerSample),
         };
       } else if (registryRef.split !== undefined) {
-        samples.push(...resolved.samples.map(toOptimizerSample));
+        samples.push(...remember(resolved.samples).map(toOptimizerSample));
       } else {
         // Only one populated split — pool train+dev and re-split inline.
-        samples.push(...record.splits.train.map(toOptimizerSample));
-        samples.push(...record.splits.dev.map(toOptimizerSample));
+        samples.push(...remember(record.splits.train).map(toOptimizerSample));
+        samples.push(...remember(record.splits.dev).map(toOptimizerSample));
       }
     } else {
       const dataset = await loadDataset(resolve(datasetPath));
       datasetName = dataset.name;
       for await (const s of dataset.samples) {
+        remember([s]);
         samples.push(toOptimizerSample(s));
       }
     }
@@ -1786,6 +1810,7 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
   if (ratingsDistill !== undefined) {
     // Ratings are training signal, never a held-out dev set — with registry
     // splits in play they extend train; otherwise they join the pool.
+    remember(ratingsDistill.samples);
     if (registrySplits !== undefined) registrySplits.train.push(...ratingsDistill.samples);
     else samples.push(...ratingsDistill.samples);
   }
@@ -1811,6 +1836,12 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
   // Index the dev set by id so the fitness fn can join each graded
   // sample-result back to the input + reference it was scored against.
   const devById = new Map(devSet.map((s) => [s.id, s]));
+
+  // Item 9 — per-fitness-call sequence number. Folded into each candidate's
+  // eval dir name so two same-length candidate prompts can't overwrite each
+  // other's persisted run (the post-accept regression pinning diffs the
+  // baseline dir against the winner's dir, so both must survive intact).
+  let evalCallSeq = 0;
 
   // Fitness fn: patch the spec with the candidate prompt, lower to IR,
   // run eval-runner, and return the pass-rate PLUS per-sample grades. The
@@ -1848,12 +1879,17 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
     if (ir.target !== "cli") {
       die(`crewhaus optimize v0 only supports target: cli (got "${ir.target}")`);
     }
+    evalCallSeq += 1;
     const summary = await runEvalLib({
       ir,
       dataset: { name: datasetName, samples: makeAsyncIterable(devSet) },
       compiledGraders: compiled,
       opts: {
-        outDir: join(outDir, "evals", `${prompt.length}_${ir.agent.instructions.length}`),
+        outDir: join(
+          outDir,
+          "evals",
+          `${String(evalCallSeq).padStart(3, "0")}_${prompt.length}_${ir.agent.instructions.length}`,
+        ),
         concurrency,
         seed,
       },
@@ -1867,7 +1903,9 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
         rationale: r.grades.overall.rationale,
       };
     });
-    return { score: summary.aggregates.passRate, grades };
+    // Item 9 — report where this measurement's eval run was persisted so
+    // the optimizer can surface the baseline/winner dirs for pinning.
+    return { score: summary.aggregates.passRate, grades, runDir: summary.outDir };
   };
 
   const mutator = args.flags["mutator"];
@@ -1954,6 +1992,34 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
         `[optimize] patch ready (improvement ≥ ${improvementThreshold}). Re-run with --write-back to apply.\n`,
       );
     }
+    // Item 9 — the patch was accepted (with or without --write-back): the
+    // dev samples that flipped fail→pass between the baseline eval run and
+    // the winning candidate's are exactly the behaviors the patch fixed.
+    // Pin them into the per-spec regression suite so `crewhaus eval` keeps
+    // guarding them even if the training dataset later churns. Best-effort:
+    // a pinning failure must not fail an otherwise successful optimize.
+    try {
+      const pin = await pinRecoveriesAfterOptimize({
+        registry: createFileBackedRegistry({ rootDir: defaultDatasetsRoot() }),
+        specName: parseSpec(readFileSync(absSpec, "utf-8")).name,
+        pin: args.flags["no-pin-regressions"] !== true,
+        ...(result.baselineEvalDir !== undefined ? { baselineRunDir: result.baselineEvalDir } : {}),
+        ...(result.bestEvalDir !== undefined ? { candidateRunDir: result.bestEvalDir } : {}),
+        // Original (un-stripped) samples — see `originalById` above.
+        samplesById: originalById,
+        sourceDataset: datasetName,
+        optimizeRunId: runId,
+      });
+      if (pin !== undefined && pin.pinned > 0) {
+        process.stdout.write(
+          `[optimize] pinned ${pin.pinned} recovered samples → ${pin.suiteName}@${pin.version}\n`,
+        );
+      }
+    } catch (err) {
+      process.stderr.write(
+        `[optimize] regression pinning skipped: ${err instanceof Error ? err.message : String(err)}\n`,
+      );
+    }
   } else {
     process.stdout.write(
       `[optimize] no improvement above threshold ${improvementThreshold}; source untouched.\n`,
@@ -1969,12 +2035,21 @@ function makeAsyncIterable<T>(items: ReadonlyArray<T>): AsyncIterable<T> {
   };
 }
 
+/** Materialize a streaming dataset. Only invoked lazily by the item-9
+ *  regression union once a `<specName>-regressions` suite actually exists,
+ *  so the streaming file-dataset path stays streaming when there is none. */
+async function collectSamples(iter: AsyncIterable<Sample>): Promise<Sample[]> {
+  const out: Sample[] = [];
+  for await (const s of iter) out.push(s);
+  return out;
+}
+
 async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
       "usage: crewhaus eval <spec.yaml> --dataset <data> --graders <graders.yaml> " +
         "[--judge-model <model>] [--concurrency N] [--seed N] [-o <out-dir>] " +
-        "[--gate] [--no-promote]\n" +
+        "[--gate] [--no-promote] [--no-regressions]\n" +
         "  --dataset takes a file path (jsonl/csv/yaml/http) or registry:<name>[@version][#split]\n" +
         "  — a Section 29 dataset-registry ref (.crewhaus/datasets, or CREWHAUS_DATASETS_DIR).\n" +
         "  Default version: latest; default samples: the union of all splits (give #train,\n" +
@@ -1986,6 +2061,11 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
         "  pair pins the baseline; later runs auto-promote when the regression gate\n" +
         "  passes. --no-promote keeps the existing pin; --gate exits non-zero when the\n" +
         "  gate fails (any pass-rate drop or sample-level pass→fail flip).\n" +
+        "  When the registry contains <specName>-regressions (pinned by `crewhaus optimize`),\n" +
+        "  its samples are unioned into the dataset by default (dedupe by id, primary wins);\n" +
+        "  datasetName/datasetHash then reflect the union (`+regressions@vX` suffix + folded\n" +
+        "  hash), so the first unioned run starts a new baseline lineage by design.\n" +
+        "  --no-regressions skips the union.\n" +
         "  --judge-model accepts the full router grammar (claude-*, openai/<m>, gemini/<m>,\n" +
         "  bedrock/<id>, local/<m>@<url>); the default judge claude-sonnet-4-5 requires\n" +
         "  Anthropic credentials (ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY)\n",
@@ -2076,6 +2156,38 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
     // Content hash of the dataset file — recorded in run.json/results.json and
     // the run-history index so lineage changes are detectable later.
     datasetHash = hashDatasetFile(absDataset);
+  }
+
+  // Item 9 — union the per-spec regression suite (<specName>-regressions,
+  // pinned by `crewhaus optimize`) into the loaded dataset by default,
+  // deduped by sample id (the primary dataset wins on collision). The union
+  // changes the run's sample keyset, so datasetName gets a `+regressions@vX`
+  // suffix and datasetHash folds the suite's content hash in — the item-3
+  // run index/baselines then key on the honest union lineage (the first
+  // unioned run starts a new baseline lineage by design). Best-effort: a
+  // broken suite record must not take down the eval itself.
+  try {
+    const primarySamples = dataset.samples;
+    const union = await applyRegressionUnion({
+      registry: createFileBackedRegistry({ rootDir: defaultDatasetsRoot() }),
+      specName: ir.name,
+      includeRegressions: args.flags["no-regressions"] !== true,
+      ...(registryRef !== undefined ? { primaryRegistryName: registryRef.name } : {}),
+      loadPrimarySamples: () => collectSamples(primarySamples),
+      datasetName: dataset.name,
+      datasetHash,
+    });
+    if (union !== undefined) {
+      dataset = { name: union.datasetName, samples: makeAsyncIterable(union.samples) };
+      datasetHash = union.datasetHash;
+      process.stdout.write(
+        `[eval] + ${union.added} regression samples from ${union.suiteName}@${union.suiteVersion}\n`,
+      );
+    }
+  } catch (err) {
+    process.stderr.write(
+      `[eval] regression suite union skipped: ${err instanceof Error ? err.message : String(err)}\n`,
+    );
   }
 
   const outDest =
