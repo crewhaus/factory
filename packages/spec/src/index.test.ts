@@ -1578,3 +1578,41 @@ describe("agent.model_fallbacks + agent.circuit_breaker (item 22)", () => {
     ).toThrow(/model_fallbacks/);
   });
 });
+
+describe("failure_taxonomy switch-model recovery action (item 23)", () => {
+  test("accepts recovery: switch-model", () => {
+    const spec = parseSpec(
+      [
+        "name: c",
+        "target: cli",
+        "agent:",
+        "  model: m",
+        "  instructions: i",
+        "failure_taxonomy:",
+        "  - class: overloaded",
+        "    pattern: /529/",
+        "    recovery: switch-model",
+      ].join("\n"),
+    );
+    if (spec.target !== "cli") throw new Error("unexpected target");
+    expect(spec.failure_taxonomy?.[0]?.recovery).toBe("switch-model");
+  });
+
+  test("still rejects an unknown recovery value", () => {
+    expect(() =>
+      parseSpec(
+        [
+          "name: c",
+          "target: cli",
+          "agent:",
+          "  model: m",
+          "  instructions: i",
+          "failure_taxonomy:",
+          "  - class: x",
+          "    pattern: y",
+          "    recovery: reboot",
+        ].join("\n"),
+      ),
+    ).toThrow();
+  });
+});

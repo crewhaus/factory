@@ -51,6 +51,7 @@ import {
 } from "@crewhaus/prompt-injection-detector";
 import type { RateLimiter } from "@crewhaus/rate-limiter";
 import {
+  type NamedFailureClass,
   type RecoveryState,
   advanceState,
   initialRecoveryState,
@@ -578,6 +579,18 @@ export type RunChatLoopOptions = {
    * through the same chain by construction.
    */
   modelFallbacks?: ReadonlyArray<string>;
+  /**
+   * Section 55 (Track A) / item 23 — the spec's `failure_taxonomy`, lowered
+   * from the IR. Consulted by `recovery-engine.recover()` BEFORE its
+   * built-in classify+recover flow so user-named error classes take
+   * precedence (their declared `recovery` action wins). Item 23 adds the
+   * `switch-model` action: a matched entry reroutes the same turn onto the
+   * next provider-failover candidate (opening the active breaker) instead
+   * of exhausting backoff retries — only meaningful with `modelFallbacks`
+   * set; a no-op re-issue otherwise. When absent, recovery is the built-in
+   * taxonomy exactly as before (zero behaviour change for existing callers).
+   */
+  failureTaxonomy?: ReadonlyArray<NamedFailureClass>;
   /**
    * Section 27 — pre-call rate gating. The runtime calls
    * `rateLimiter.acquire(rateLimitKeys, 1)` before each model invocation.
@@ -2161,7 +2174,10 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         // `NeedCompaction` → `CompactionDone` arm (and cover it) here.
 
         case "NeedRecovery": {
-          const action = recover(lastErrorForRecovery, recovery);
+          // Item 23 / Section 55 — consult the spec's failure_taxonomy first
+          // (named classes take precedence over the built-in flow), so a
+          // matched `switch-model` (or retry/compact/…) entry wins.
+          const action = recover(lastErrorForRecovery, recovery, opts.failureTaxonomy);
           recovery = advanceState(recovery, action);
           runContext.logger.info("recovery.action", {
             kind: action.kind,
@@ -2258,6 +2274,33 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 "[previous assistant turn was rejected as invalid; please retry]";
               messages.push({ role: "user", content: tombstoneMsg });
               await logEvent("user_message", { content: tombstoneMsg, synthetic: true });
+              state = transition(state, { kind: "RecoveryDone" });
+              break;
+            }
+            case "switch-model": {
+              // Item 23 — a `switch-model` failure_taxonomy verdict: abandon
+              // the active provider candidate FOR THIS TURN and re-issue the
+              // same request onto the next failover candidate. Mechanism:
+              // force the active candidate's breaker open so the chain
+              // reroutes on the next `stream()`; the chain publishes the
+              // `model_failover` (reason breaker_open) itself. No message
+              // mutation and no backoff sleep — a switch is instant. Without
+              // a failover chain (no `modelFallbacks`) there is nothing to
+              // switch to: this degrades to a plain re-issue against the same
+              // adapter, which the per-turn budget bounds. RecoveryDone loops
+              // back to NeedModel, which re-streams.
+              const tripped = failoverChain?.tripActive("switch-model recovery");
+              if (tripped !== undefined) {
+                out.spinner.start("switching model");
+                out.spinner.stop();
+                runContext.logger.info("recovery.switch-model tripped candidate", {
+                  from: tripped,
+                });
+              } else {
+                runContext.logger.warn(
+                  "recovery.switch-model: no failover chain — re-issuing on the same model",
+                );
+              }
               state = transition(state, { kind: "RecoveryDone" });
               break;
             }

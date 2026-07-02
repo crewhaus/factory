@@ -454,11 +454,15 @@ if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));`;
   // breaker-driven meta-adapter (see @crewhaus/model-router). Emitted only
   // when the spec declared them so existing bundles stay byte-identical.
   const failoverFields = renderModelFailoverFields(ir);
+  // Section 55 / item 23 — thread the spec's failure_taxonomy so recovery-
+  // engine consults the named error classes (incl. the `switch-model`
+  // verdict) before its built-in flow. Empty when the spec omits it.
+  const failureTaxonomyField = renderFailureTaxonomyField(ir);
   const runChatLoopCall = `await runChatLoop({
   model: ${escapeJsonString(ir.agent.model)},
   instructions: ${escapeJsonString(ir.agent.instructions)},
   sessionName: ${escapeJsonString(ir.name)},
-  sessionTarget: "cli",${maxTokensField}${failoverFields}${toolsField}${permField}${sandboxField}
+  sessionTarget: "cli",${maxTokensField}${failoverFields}${failureTaxonomyField}${toolsField}${permField}${sandboxField}
   hooks: __hooks,
   skills: __skills,
   slashCommands: __slashCommands,${subAgents.subAgentsField}${subAgents.spawnField}${egress.field}
@@ -515,6 +519,21 @@ function renderModelFailoverFields(ir: {
     pieces.push(`\n  circuitBreaker: ${JSON.stringify(ir.agent.circuitBreaker)},`);
   }
   return pieces.join("");
+}
+
+/**
+ * Section 55 / item 23 — render the `failureTaxonomy` runChatLoop field.
+ * The IR entries are `{ class, pattern, recovery, hint? }`; `JSON.stringify`
+ * produces safe double-quoted JS string literals for the user-controlled
+ * class/pattern/hint text (no backtick/template-literal escaping needed —
+ * the field lands in a plain object literal, not a template). Empty when
+ * the spec omits the block, keeping pre-existing bundles byte-identical.
+ * Mirror: target-channel-bot + target-managed render the same field.
+ */
+function renderFailureTaxonomyField(ir: IrV0): string {
+  const taxonomy = ir.failureTaxonomy;
+  if (taxonomy === undefined || taxonomy.length === 0) return "";
+  return `\n  failureTaxonomy: ${JSON.stringify(taxonomy)},`;
 }
 
 /**

@@ -2195,3 +2195,58 @@ tenants:
     ).toThrow();
   });
 });
+
+describe("lower/emit — switch-model recovery action + failureTaxonomy codegen (item 23)", () => {
+  const SWITCH_MODEL_SPEC = `
+name: resilient
+target: cli
+agent:
+  model: claude-sonnet-4-6
+  instructions: be resilient
+  model_fallbacks:
+    - openai/gpt-4o-mini
+failure_taxonomy:
+  - class: provider_overloaded
+    pattern: "/(429|529|overloaded)/i"
+    recovery: switch-model
+    hint: provider is degraded — routing to the fallback
+`;
+
+  test("lowers a switch-model recovery entry verbatim", () => {
+    const ir = lower(parseSpec(SWITCH_MODEL_SPEC));
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect(ir.failureTaxonomy).toEqual([
+      {
+        class: "provider_overloaded",
+        pattern: "/(429|529|overloaded)/i",
+        recovery: "switch-model",
+        hint: "provider is degraded — routing to the fallback",
+      },
+    ]);
+  });
+
+  test("rejects an unknown recovery action (strict enum still holds)", () => {
+    expect(() =>
+      parseSpec(
+        "name: c\ntarget: cli\nagent:\n  model: m\n  instructions: i\nfailure_taxonomy:\n  - class: x\n    pattern: y\n    recovery: teleport\n",
+      ),
+    ).toThrow();
+  });
+
+  test("compiled cli bundle threads failureTaxonomy (incl. switch-model) into runChatLoop", () => {
+    const bundle = compile(SWITCH_MODEL_SPEC);
+    const agentTs = bundle.files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agentTs).toContain('"recovery":"switch-model"');
+    expect(agentTs).toContain("failureTaxonomy:");
+    // And the failover chain the switch reroutes onto is present too.
+    expect(agentTs).toContain('modelFallbacks: ["openai/gpt-4o-mini"],');
+  });
+
+  test("compiled cli bundle omits failureTaxonomy when the spec has none", () => {
+    const agentTs =
+      compile("name: c\ntarget: cli\nagent:\n  model: m\n  instructions: i\n").files.find(
+        (f) => f.path === "agent.ts",
+      )?.content ?? "";
+    expect(agentTs).not.toContain("failureTaxonomy:");
+  });
+});

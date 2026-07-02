@@ -204,9 +204,63 @@ describe("advanceState", () => {
     expect(c.tombstoneCount).toBe(1);
   });
 
+  test("switch-model increments switchModelCount (item 23)", () => {
+    const a = advanceState(initialRecoveryState, { kind: "switch-model" });
+    expect(a.switchModelCount).toBe(1);
+    expect(a.retryCount).toBe(0);
+    expect(a.tombstoneCount).toBe(0);
+  });
+
   test("fail leaves state unchanged", () => {
     const after = advanceState(initialRecoveryState, { kind: "fail", reason: "boom" });
     expect(after).toEqual(initialRecoveryState);
+  });
+});
+
+// Item 23 — the opt-in `switch-model` recovery action. Only reachable via a
+// declared failure_taxonomy entry (never a built-in classify() verdict).
+describe("Item 23 — switch-model recovery action", () => {
+  const taxonomy: NamedFailureClass[] = [
+    { class: "provider_overloaded", pattern: "/(429|529|overloaded)/i", recovery: "switch-model" },
+  ];
+
+  test("a matched entry returns a switch-model action", () => {
+    const action = recover(
+      { message: "Error 529: overloaded_error" },
+      initialRecoveryState,
+      taxonomy,
+    );
+    expect(action.kind).toBe("switch-model");
+  });
+
+  test("built-in classify never produces switch-model (default runs unchanged)", () => {
+    // 529 classifies as overloaded_or_5xx → retry when NO taxonomy is given.
+    const action = recover({ status: 529, message: "overloaded" }, initialRecoveryState);
+    expect(action.kind).toBe("retry");
+  });
+
+  test("switch-model respects its per-turn budget then fails", () => {
+    const exhausted = {
+      ...initialRecoveryState,
+      switchModelCount: BUDGETS.MAX_SWITCH_MODELS,
+    };
+    const action = recover({ message: "429 rate limited" }, exhausted, taxonomy);
+    expect(action.kind).toBe("fail");
+    if (action.kind === "fail") {
+      expect(action.reason).toContain("switch-model budget exhausted");
+      expect(action.reason).toContain("provider_overloaded");
+    }
+  });
+
+  test("walking the chain: budget permits MAX_SWITCH_MODELS hops", () => {
+    let state = initialRecoveryState;
+    for (let i = 0; i < BUDGETS.MAX_SWITCH_MODELS; i++) {
+      const action = recover({ message: "overloaded" }, state, taxonomy);
+      expect(action.kind).toBe("switch-model");
+      state = advanceState(state, action);
+    }
+    // One past the budget → fail.
+    expect(recover({ message: "overloaded" }, state, taxonomy).kind).toBe("fail");
   });
 });
 

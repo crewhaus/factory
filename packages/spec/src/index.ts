@@ -322,7 +322,11 @@ const failureTaxonomyEntrySchema = z
   .object({
     class: z.string().min(1),
     pattern: z.string().min(1),
-    recovery: z.enum(["retry", "compact", "continue", "tombstone", "fail"]),
+    // Item 23 — `switch-model` routes the same turn onto the next provider
+    // failover candidate (pairs with `agent.model_fallbacks`; a no-op
+    // re-issue when no chain is declared). See recovery-engine +
+    // AUTOMATION-OPPORTUNITIES.md item 23.
+    recovery: z.enum(["retry", "compact", "continue", "tombstone", "switch-model", "fail"]),
     hint: z.string().min(1).optional(),
   })
   .strict();

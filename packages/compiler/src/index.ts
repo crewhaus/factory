@@ -490,7 +490,7 @@ type SpecWithFailureTaxonomy = {
   readonly failure_taxonomy?: ReadonlyArray<{
     readonly class: string;
     readonly pattern: string;
-    readonly recovery: "retry" | "compact" | "continue" | "tombstone" | "fail";
+    readonly recovery: "retry" | "compact" | "continue" | "tombstone" | "switch-model" | "fail";
     readonly hint?: string;
   }>;
 };

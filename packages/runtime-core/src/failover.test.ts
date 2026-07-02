@@ -245,3 +245,108 @@ describe("runChatLoop — spec-declared failover chain (item 22)", () => {
     expect(responses[0]?.specModel).toBeUndefined();
   });
 });
+
+/**
+ * Primary that throws a provider-overloaded error while `down` is true. The
+ * message ("529 overloaded_error") does NOT classify as one of the built-in
+ * buckets on its own — the 529 status is what classify() keys on, and this
+ * fake omits `status`. So recovery is driven ONLY by the failure_taxonomy
+ * entry mapping /overloaded/ → switch-model.
+ */
+function overloadedAdapter(down: () => boolean): ProviderAdapter & { requests: ProviderRequest[] } {
+  const requests: ProviderRequest[] = [];
+  return {
+    requests,
+    providerId: "anthropic",
+    features: {
+      caching: "explicit",
+      tool_use: true,
+      vision: true,
+      thinking: false,
+      web_search: false,
+    },
+    estimateTokens: () => 0,
+    stream(req: ProviderRequest): AsyncIterable<StreamEvent> {
+      requests.push(req);
+      return (async function* () {
+        if (down()) throw new Error("529 overloaded_error: provider is overloaded");
+        yield* okEvents("primary says hi");
+      })();
+    },
+  };
+}
+
+describe("runChatLoop — switch-model recovery action (item 23)", () => {
+  test("a matched failure_taxonomy switch-model reroutes the same turn onto the fallback", async () => {
+    const primary = overloadedAdapter(() => true);
+    const fallback = okAdapter("openai", "fallback served");
+    const runContext = createRunContext();
+    const seen: TraceEvent[] = [];
+    runContext.eventBus.subscribe((e) => {
+      seen.push(e);
+    });
+    const finalText = await runChatLoop({
+      model: "claude-opus-4-7",
+      instructions: "test",
+      _adapter: primary,
+      _failoverAdapters: new Map([["openai/gpt-4o-mini", fallback]]),
+      modelFallbacks: ["openai/gpt-4o-mini"],
+      // failureThreshold high so ONLY the switch-model trip opens the breaker,
+      // never a threshold-driven trip.
+      circuitBreaker: { failureThreshold: 50, cooldownMs: 60_000 },
+      failureTaxonomy: [
+        { class: "provider_overloaded", pattern: "/overloaded/i", recovery: "switch-model" },
+      ],
+      runContext,
+      singleTurn: true,
+      seedMessages: [{ role: "user", content: "hello" }],
+    });
+    expect(finalText).toBe("fallback served");
+
+    // Exactly one failover, driven by the switch-model trip (breaker_open).
+    const failovers = seen.filter((e): e is ModelFailoverEvent => e.kind === "model_failover");
+    expect(failovers).toHaveLength(1);
+    expect(failovers[0]).toMatchObject({
+      from: "claude-opus-4-7",
+      to: "openai/gpt-4o-mini",
+      reason: "breaker_open",
+    });
+    // The recovery action was logged as switch-model on the bus.
+    const recovered = seen.filter((e) => e.kind === "error_recovered");
+    expect(recovered.some((e) => (e as { action: string }).action === "switch-model")).toBe(true);
+    // The served response prices against the fallback.
+    const responses = seen.filter((e): e is ModelResponseEvent => e.kind === "model_response");
+    expect(responses.at(-1)).toMatchObject({ model: "gpt-4o-mini", provider: "openai" });
+  });
+
+  test("switch-model with no failover chain degrades to a same-model re-issue", async () => {
+    // No modelFallbacks → tripActive() is undefined; switch-model re-issues
+    // against the same adapter. The primary recovers on the retry so the turn
+    // completes without a model_failover event.
+    let calls = 0;
+    const primary = overloadedAdapter(() => {
+      calls += 1;
+      return calls === 1; // fail once, succeed on the switch-model re-issue
+    });
+    const runContext = createRunContext();
+    const seen: TraceEvent[] = [];
+    runContext.eventBus.subscribe((e) => {
+      seen.push(e);
+    });
+    const finalText = await runChatLoop({
+      model: "claude-opus-4-7",
+      instructions: "test",
+      _adapter: primary,
+      failureTaxonomy: [
+        { class: "provider_overloaded", pattern: "/overloaded/i", recovery: "switch-model" },
+      ],
+      runContext,
+      singleTurn: true,
+      seedMessages: [{ role: "user", content: "hello" }],
+    });
+    expect(finalText).toBe("primary says hi");
+    expect(seen.some((e) => e.kind === "model_failover")).toBe(false);
+    const recovered = seen.filter((e) => e.kind === "error_recovered");
+    expect(recovered.some((e) => (e as { action: string }).action === "switch-model")).toBe(true);
+  });
+});

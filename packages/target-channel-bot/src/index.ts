@@ -236,6 +236,17 @@ function renderModelFailoverFields(ir: IrChannelV0): string {
   return pieces.join("");
 }
 
+/**
+ * Section 55 / item 23 — render the `failureTaxonomy` runChatLoop field,
+ * indented for the generated `createAgent` body. Empty when the spec omits
+ * the block. Mirror: target-cli + target-managed render the same field.
+ */
+function renderFailureTaxonomyField(ir: IrChannelV0): string {
+  const taxonomy = ir.failureTaxonomy;
+  if (taxonomy === undefined || taxonomy.length === 0) return "";
+  return `\n        failureTaxonomy: ${JSON.stringify(taxonomy)},`;
+}
+
 function renderPermissionsField(ir: IrChannelV0): string {
   const { mode, rules } = ir.permissions;
   if (mode === undefined && rules.length === 0) return "";
@@ -408,7 +419,7 @@ export function createAgent(config: AgentConfig): Agent {
       const __inbound = await classifyInbound(args.message, runContext, { origin: "channel" });
       return await runChatLoop({
         model: ${escapeJsonString(ir.agent.model)},
-        instructions: ${escapeJsonString(ir.agent.instructions)},${renderModelFailoverFields(ir)}
+        instructions: ${escapeJsonString(ir.agent.instructions)},${renderModelFailoverFields(ir)}${renderFailureTaxonomyField(ir)}
         sessionName: ${escapeJsonString(ir.name)},
         sessionTarget: "channel",
         ...(config.sessionRootDir !== undefined ? { sessionRootDir: config.sessionRootDir } : {}),

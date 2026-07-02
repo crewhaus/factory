@@ -553,3 +553,27 @@ describe("emitCli — provider failover chain (item 22)", () => {
     expect(content).not.toContain("circuitBreaker:");
   });
 });
+
+describe("emitCli — failureTaxonomy field (item 23)", () => {
+  test("emits failureTaxonomy in the runChatLoop call when the IR sets it", () => {
+    const content =
+      emitCli(
+        baseIr({
+          failureTaxonomy: [
+            { class: "provider_overloaded", pattern: "/overloaded/i", recovery: "switch-model" },
+            { class: "net", pattern: "ETIMEDOUT", recovery: "retry", hint: "back off" },
+          ],
+        }),
+      ).files[0]?.content ?? "";
+    expect(content).toContain("failureTaxonomy:");
+    expect(content).toContain('"recovery":"switch-model"');
+    expect(content).toContain('"pattern":"ETIMEDOUT"');
+  });
+
+  test("omits failureTaxonomy when the IR leaves it unset or empty", () => {
+    expect(emitCli(baseIr()).files[0]?.content ?? "").not.toContain("failureTaxonomy:");
+    expect(emitCli(baseIr({ failureTaxonomy: [] })).files[0]?.content ?? "").not.toContain(
+      "failureTaxonomy:",
+    );
+  });
+});

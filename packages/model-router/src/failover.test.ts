@@ -338,6 +338,53 @@ describe("createFailoverChain — routing", () => {
   });
 });
 
+describe("createFailoverChain — tripActive (item 23 switch-model)", () => {
+  test("tripActive() opens the served candidate so the next call reroutes onward", async () => {
+    const primary = scriptedAdapter({ text: "primary" }); // healthy, but we abandon it
+    const fallback = scriptedAdapter({ providerId: "openai", text: "fallback" });
+    const { bus, failovers } = makeBus();
+    const chain = await createFailoverChain({
+      model: "claude-opus-4-7",
+      fallbacks: ["openai/gpt-4o-mini"],
+      breaker: { failureThreshold: 5, cooldownMs: 60_000 },
+      getBus: () => bus,
+      adapters: new Map<string, ProviderAdapter>([
+        ["claude-opus-4-7", primary],
+        ["openai/gpt-4o-mini", fallback],
+      ]),
+    });
+    // First call serves the healthy primary (creates its breaker).
+    expect((await drain(chain.stream(REQ))).text).toBe("primary");
+    expect(chain.lastServed().modelString).toBe("claude-opus-4-7");
+
+    // switch-model: abandon the active candidate for this turn.
+    const tripped = chain.tripActive("switch-model recovery");
+    expect(tripped).toBe("claude-opus-4-7");
+    expect(chain.candidates()[0]?.breakerState).toBe("open");
+
+    // Next call reroutes to the fallback with a breaker_open failover event.
+    expect((await drain(chain.stream(REQ))).text).toBe("fallback");
+    expect(failovers).toHaveLength(1);
+    expect(failovers[0]).toMatchObject({
+      from: "claude-opus-4-7",
+      to: "openai/gpt-4o-mini",
+      reason: "breaker_open",
+    });
+  });
+
+  test("tripActive() returns undefined before any stream has run (no active breaker)", async () => {
+    const chain = await createFailoverChain({
+      model: "claude-opus-4-7",
+      fallbacks: ["openai/gpt-4o-mini"],
+      adapters: new Map<string, ProviderAdapter>([
+        ["claude-opus-4-7", scriptedAdapter({})],
+        ["openai/gpt-4o-mini", scriptedAdapter({ providerId: "openai" })],
+      ]),
+    });
+    expect(chain.tripActive()).toBeUndefined();
+  });
+});
+
 describe("createFailoverChain — prompt-cache continuity", () => {
   test("explicit-caching candidate keeps cache_control markers verbatim", async () => {
     const primary = scriptedAdapter({ caching: "explicit" });

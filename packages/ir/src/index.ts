@@ -123,7 +123,9 @@ export type IrCircuitBreaker = {
 export type IrFailureTaxonomyEntry = {
   readonly class: string;
   readonly pattern: string;
-  readonly recovery: "retry" | "compact" | "continue" | "tombstone" | "fail";
+  /** Item 23 — `switch-model` reroutes onto the next provider failover
+   *  candidate mid-turn (see recovery-engine). */
+  readonly recovery: "retry" | "compact" | "continue" | "tombstone" | "switch-model" | "fail";
   readonly hint?: string;
 };
 

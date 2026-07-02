@@ -1712,6 +1712,12 @@ async function runRunCli(
       ...(ir.target === "cli" && ir.agent.circuitBreaker !== undefined
         ? { circuitBreaker: ir.agent.circuitBreaker }
         : {}),
+      // Section 55 / item 23 — thread the spec's failure_taxonomy so
+      // recovery-engine consults the user's named error classes (including
+      // the `switch-model` verdict) before its built-in flow.
+      ...(ir.failureTaxonomy !== undefined && ir.failureTaxonomy.length > 0
+        ? { failureTaxonomy: ir.failureTaxonomy }
+        : {}),
       ...(resumeId !== undefined ? { resume: { sessionId: resumeId } } : {}),
       ...(justificationJudge !== undefined ? { justificationJudge } : {}),
       ...(justificationAuditSink !== undefined ? { justificationAuditSink } : {}),

@@ -195,7 +195,10 @@ export type PermissionDecisionEvent = TraceEventEnvelope & {
 
 export type ErrorRecoveredEvent = TraceEventEnvelope & {
   kind: "error_recovered";
-  action: "retry" | "compact" | "continue" | "tombstone" | "fail";
+  // Item 23 — `switch-model` joins the recovery-engine action set (an
+  // opt-in failure_taxonomy verdict that reroutes onto the next failover
+  // candidate mid-turn).
+  action: "retry" | "compact" | "continue" | "tombstone" | "switch-model" | "fail";
   errorName: string;
   depth: number;
 };

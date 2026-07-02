@@ -127,6 +127,18 @@ export interface FailoverChain extends ProviderAdapter {
   plan(): FailoverActiveInfo;
   /** The candidate that served (or is serving) the most recent stream. */
   lastServed(): FailoverActiveInfo;
+  /**
+   * Item 23 — force the LAST-SERVED candidate's breaker open so the next
+   * `stream()` reroutes to the next candidate down the chain. Used by the
+   * `switch-model` recovery action: on a matched provider error the
+   * orchestrator abandons the active candidate for this turn instead of
+   * burning backoff retries against it. Returns the model string of the
+   * candidate that was tripped, or `undefined` when nothing could be
+   * tripped (no stream has run, so the active candidate has no breaker
+   * yet). The breaker's own cooldown/half-open probe still governs when the
+   * tripped candidate is retried, so a transient blip auto-restores.
+   */
+  tripActive(reason?: string): string | undefined;
   /** Routing-state snapshot for every candidate, primary first. */
   candidates(): readonly FailoverCandidateSnapshot[];
   /**
@@ -391,6 +403,12 @@ export async function createFailoverChain(
     },
     lastServed(): FailoverActiveInfo {
       return lastServedInfo;
+    },
+    tripActive(reason?: string): string | undefined {
+      const active = candidates[activeIndex] as CandidateState;
+      if (active.breaker === undefined) return undefined;
+      active.breaker.trip(reason);
+      return active.modelString;
     },
     candidates(): readonly FailoverCandidateSnapshot[] {
       return snapshot();

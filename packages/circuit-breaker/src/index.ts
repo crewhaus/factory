@@ -62,6 +62,16 @@ export interface WrappedAdapter extends ProviderAdapter {
   state(): CircuitState;
   /** Reset the breaker to closed. */
   reset(): void;
+  /**
+   * Item 23 — force the breaker open immediately, as if the failure
+   * threshold had just been crossed. Used by the `switch-model` recovery
+   * action so a matched provider error routes the failover chain onward
+   * without waiting for the threshold to accrue. Starts the same cooldown
+   * → half-open probe cycle a threshold-driven trip does, so a transient
+   * blip still auto-restores. No-op (and emits nothing) if already open.
+   * `reason` rides the `circuit_state_changed` event.
+   */
+  trip(reason?: string): void;
   /** Diagnostic counters. */
   stats(): {
     state: CircuitState;
@@ -174,6 +184,15 @@ export function wrap(adapter: ProviderAdapter, opts: CircuitBreakerOptions = {})
       if (from !== "closed") {
         publishStateChange(from, "closed", "manual reset");
       }
+    },
+
+    trip(reason?: string): void {
+      // Reuse the normal open transition (records lastTrippedAt, publishes
+      // circuit_state_changed, starts the cooldown clock). Clear any partial
+      // failure tally so a later half-open probe starts clean.
+      consecutiveFailures = 0;
+      firstFailureMs = 0;
+      transitionTo("open", reason ?? "forced open (switch-model)");
     },
 
     stats(): {
