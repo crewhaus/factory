@@ -11,6 +11,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { createInterface } from "node:readline";
 import type { SubAgentDefinition } from "@crewhaus/agent-context-isolation";
 import { SpecParseError, compile, lower } from "@crewhaus/compiler";
 import { buildContextBundle, discoverRoots } from "@crewhaus/context-bundle";
@@ -277,6 +278,18 @@ import {
   scaffoldWorkflowFile,
   specIsDirty,
 } from "./flywheel";
+// Item 39 — `crewhaus init --interactive`: the harness-designer interview
+// (validate-and-retry loop + scripted no-credentials fallback) in a
+// side-effect-free module so this entry file stays testable.
+import {
+  EMIT_SPEC_TOOL,
+  type ScriptedAnswers,
+  type ScriptedShape,
+  buildInterviewSystemPrompt,
+  buildScriptedSpec,
+  isScriptedShape,
+  runInterview,
+} from "./init-interactive";
 // FR-004 — Pillar 3 intent-gate judge + durable audit-sink resolution, in a
 // side-effect-free module so it is unit-testable (this entry file runs an
 // argv switch on import).
@@ -465,6 +478,12 @@ const INIT_SCHEMA: ParseArgsSchema = {
     { name: "ci", takesValue: false },
     // Overwrite an existing scaffolded workflow (never the spec).
     { name: "force", takesValue: false },
+    // Item 39 — interactive spec authoring: interview the user (via the
+    // resolved model, or a scripted stdin questionnaire when no credentials)
+    // and emit a parseSpec-validated crewhaus.yaml. Composes with --detect to
+    // prefill the model from what's reachable.
+    { name: "interactive", short: "i", takesValue: false },
+    { name: "detect", takesValue: false },
     { name: "help", short: "h" },
   ],
 };
@@ -902,6 +921,8 @@ function usageText(): string {
     "       (nightly cron + manual dispatch; accepted improvements arrive as",
     "       PRs for human review — never auto-merged)",
     "  init [name]                          scaffold a new crewhaus.yaml",
+    "       [--interactive] [--detect]      interview-driven spec authoring (model, or scripted",
+    "                                       fallback with no credentials); validated via parseSpec (item 39)",
     "       [--ci]                          also scaffold .github/workflows/crewhaus-eval.yml —",
     "                                       eval-gated spec PRs (base vs PR spec, two fresh runs,",
     "                                       score-delta PR comment, check fails on regression);",
@@ -1402,6 +1423,246 @@ agent:
   const cd = rel === "" ? "" : `cd ${rel} && `;
   process.stdout.write(`next: ${cd}crewhaus run crewhaus.yaml\n`);
   logger.debug("init.success", { target: targetFile, ci });
+}
+
+/**
+ * Item 39 — a line-buffered stdin reader for the scripted questionnaire.
+ *
+ * Built on readline's `"line"` event with a queue rather than sequential
+ * `rl.question()` calls: under Bun, chained `question()` calls against a PIPED
+ * stdin (all answers arriving in one chunk) deliver only the first line and
+ * then hang. The event+queue design drains every buffered line, so each
+ * `ask()` returns the next line (or "" once stdin closes). Thin by design; the
+ * questionnaire logic lives in the pure `buildScriptedSpec`.
+ */
+function createLineReader(): { ask(prompt: string): Promise<string>; close(): void } {
+  const rl = createInterface({ input: process.stdin });
+  const queue: string[] = [];
+  const waiters: Array<(v: string) => void> = [];
+  let ended = false;
+  rl.on("line", (line) => {
+    const waiter = waiters.shift();
+    if (waiter) waiter(line);
+    else queue.push(line);
+  });
+  rl.on("close", () => {
+    ended = true;
+    for (const w of waiters.splice(0)) w("");
+  });
+  return {
+    ask: (prompt: string): Promise<string> => {
+      process.stdout.write(prompt);
+      const queued = queue.shift();
+      if (queued !== undefined) return Promise.resolve(queued.trim());
+      if (ended) return Promise.resolve("");
+      return new Promise<string>((resolveLine) => waiters.push((v) => resolveLine(v.trim())));
+    },
+    close: () => rl.close(),
+  };
+}
+
+/**
+ * Item 39 — `crewhaus init --interactive`. Promotes the demos harness-designer
+ * into core: interview the user and emit a `parseSpec`-validated crewhaus.yaml.
+ *
+ * Two paths, chosen by credential availability (like the merged scaffold path):
+ *   - Credentials present → the MODEL interview. `runInterview` (side-effect-
+ *     free) drives a validate-and-retry loop: the model calls `emit_spec` with
+ *     a draft, `parseSpec` validates it in-process, and any structured error is
+ *     fed back for a corrected re-emit. No demos dependency — the shape
+ *     guidance is bundled in `init-interactive.ts`.
+ *   - No credentials → a scripted stdin questionnaire (name/shape/model/tools)
+ *     that still emits a `parseSpec`-validated spec via `buildScriptedSpec`.
+ *
+ * Reuses `runInit`'s exists-check/refuse-overwrite + standalone-dir guidance,
+ * and composes with `--detect` (#40) to prefill the default model from a
+ * reachable local endpoint / provider.
+ */
+async function runInitInteractive(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus init --interactive [name] [--detect]\n" +
+        "  Interview-driven spec authoring. With credentials, an agent interviews you\n" +
+        "  and emits a validated crewhaus.yaml (every draft is checked against the live\n" +
+        "  spec schema and retried on error). Without credentials, a scripted\n" +
+        "  questionnaire (name/shape/model/tools) still emits a validated spec.\n" +
+        "  --detect  prefill the default model from a reachable local endpoint/provider.\n",
+    );
+    return;
+  }
+  const nameArg = args.positional[0];
+  const targetDir = typeof nameArg === "string" ? resolve(nameArg) : process.cwd();
+  const specName = typeof nameArg === "string" ? nameArg : basename(targetDir);
+  const targetFile = join(targetDir, "crewhaus.yaml");
+
+  // Reuse runInit's refuse-overwrite invariant: --interactive must never
+  // clobber existing work.
+  if (existsSync(targetFile)) {
+    die(`${targetFile} already exists — refusing to overwrite`);
+  }
+
+  // Item 39 ↔ #40 — compose with --detect to prefill a default model. When a
+  // local endpoint is reachable, offer its first model as `local/<m>@<url>`;
+  // otherwise fall back to the standard claude default.
+  let defaultModel = "claude-opus-4-7";
+  if (args.flags["detect"] === true) {
+    const prefill = await detectDefaultModel();
+    if (prefill !== undefined) defaultModel = prefill;
+  }
+
+  // Credential-gated path selection: try to resolve the default model's adapter.
+  // A resolution failure (no credentials / missing optional adapter) degrades
+  // to the scripted questionnaire.
+  const interviewer = await tryBuildInterviewer(defaultModel);
+  const reader = createLineReader();
+  let yaml: string;
+  try {
+    if (interviewer !== undefined) {
+      process.stdout.write(
+        `interactive spec authoring (model: ${interviewer.modelId}). Describe the agent you want to build.\n`,
+      );
+      const description = await reader.ask("> ");
+      if (description === "") die("no description given — aborting");
+      const result = await runInterview({
+        proposeSpec: (feedback) => interviewer.propose(description, feedback),
+      });
+      yaml = result.yaml;
+      process.stdout.write(`validated after ${result.attempts} draft(s).\n`);
+    } else {
+      process.stdout.write(
+        "no model credentials detected — falling back to the scripted questionnaire.\n",
+      );
+      yaml = (await runScriptedQuestionnaire({ reader, specName, defaultModel })).yaml;
+    }
+  } finally {
+    reader.close();
+  }
+
+  mkdirSync(targetDir, { recursive: true });
+  writeFileSync(targetFile, yaml);
+  process.stdout.write(`wrote ${targetFile}\n`);
+  const rel = relative(process.cwd(), targetDir);
+  const cd = rel === "" ? "" : `cd ${rel} && `;
+  process.stdout.write(`next: ${cd}crewhaus run crewhaus.yaml\n`);
+  logger.debug("init.interactive.success", { target: targetFile });
+}
+
+/**
+ * Item 39 — the scripted (no-credentials) questionnaire. Collects the answers
+ * `buildScriptedSpec` needs over stdin and returns the validated spec. A
+ * validation failure (e.g. an unsafe name) re-prompts the offending field.
+ */
+async function runScriptedQuestionnaire(opts: {
+  readonly reader: { ask(prompt: string): Promise<string> };
+  readonly specName: string;
+  readonly defaultModel: string;
+}): Promise<{ yaml: string }> {
+  const { ask } = opts.reader;
+  const name = (await ask(`harness name [${opts.specName}]: `)) || opts.specName;
+  const shapeInput = (await ask("target shape (cli | workflow | research) [cli]: ")) || "cli";
+  const shape: ScriptedShape = isScriptedShape(shapeInput) ? shapeInput : "cli";
+  if (!isScriptedShape(shapeInput)) {
+    process.stdout.write(
+      `  "${shapeInput}" is not scriptable here — defaulting to cli (use the model interview for other shapes).\n`,
+    );
+  }
+  const model = (await ask(`model [${opts.defaultModel}]: `)) || opts.defaultModel;
+  const instructions =
+    (await ask("one-line instructions for the agent: ")) || "You are a helpful assistant.";
+  const toolsLine = await ask("tools (comma-separated names, or blank): ");
+  const tools = toolsLine
+    .split(",")
+    .map((t) => t.trim())
+    .filter((t) => t !== "");
+  const goal = shape === "research" ? (await ask("research goal: ")) || instructions : undefined;
+  const answers: ScriptedAnswers = {
+    name,
+    shape,
+    model,
+    instructions,
+    ...(tools.length > 0 ? { tools } : {}),
+    ...(goal !== undefined ? { goal } : {}),
+  };
+  // buildScriptedSpec validates via parseSpec; a bad answer throws
+  // SpecParseError, which the caller's CrewhausError catch routes through die().
+  return buildScriptedSpec(answers);
+}
+
+/**
+ * Item 39 — attempt to build the model interviewer for `model`. Resolves the
+ * adapter via the same `resolveModel` path the scaffold-evals/mutator use;
+ * returns undefined when no credentials/adapter are available so the caller
+ * degrades to the scripted questionnaire. The returned `propose` closure runs
+ * one interview turn: it sends the system prompt + description + the running
+ * validation-feedback log and returns the `emit_spec` YAML (or undefined).
+ */
+async function tryBuildInterviewer(model: string): Promise<
+  | {
+      readonly modelId: string;
+      propose: (desc: string, feedback: readonly string[]) => Promise<string | undefined>;
+    }
+  | undefined
+> {
+  try {
+    const { resolveModel } = await import("@crewhaus/model-router");
+    const { collectFinalMessage, extractToolUse } = await import("@crewhaus/adapter-anthropic");
+    const resolution = await resolveModel(model);
+    const system = buildInterviewSystemPrompt();
+    const propose = async (
+      desc: string,
+      feedback: readonly string[],
+    ): Promise<string | undefined> => {
+      const feedbackText =
+        feedback.length > 0
+          ? `\n\nYour previous draft(s) failed validation with:\n${feedback
+              .map((f) => `- ${f}`)
+              .join("\n")}\nEmit a corrected spec.`
+          : "";
+      const final = await collectFinalMessage(
+        resolution.adapter.stream({
+          model: resolution.modelId,
+          system: [{ type: "text", text: system }],
+          messages: [{ role: "user", content: `Build this agent: ${desc}${feedbackText}` }],
+          tools: [EMIT_SPEC_TOOL],
+          toolChoice: { type: "tool", name: EMIT_SPEC_TOOL.name },
+          maxTokens: 4096,
+        }),
+      );
+      const toolUse = extractToolUse(final, EMIT_SPEC_TOOL.name);
+      const yaml = (toolUse?.input as { yaml?: unknown } | undefined)?.yaml;
+      return typeof yaml === "string" && yaml.length > 0 ? yaml : undefined;
+    };
+    return { modelId: resolution.modelId, propose };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Item 39 ↔ #40 — best-effort default-model prefill for `--interactive
+ * --detect`: probe the local endpoint and, if it advertises models, return the
+ * first as a `local/<model>@<baseUrl>` string. Undefined when nothing is
+ * reachable so the caller keeps the claude default. Never throws.
+ */
+async function detectDefaultModel(): Promise<string | undefined> {
+  try {
+    const { probeLocalEndpoint, localBaseUrl } = await import("./doctor-detect");
+    const baseUrl = localBaseUrl(process.env);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 1500);
+    try {
+      const local = await probeLocalEndpoint(baseUrl, async (url) => {
+        const res = await fetch(url, { signal: controller.signal });
+        return { ok: res.ok, status: res.status, json: () => res.json() };
+      });
+      const first = local.reachable ? local.models[0] : undefined;
+      return first !== undefined ? `local/${first}@${baseUrl}` : undefined;
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -6750,9 +7011,23 @@ switch (subcommand) {
   case "compile":
     await runCompile(parseFor(rest, COMPILE_SCHEMA));
     break;
-  case "init":
-    runInit(parseFor(rest, INIT_SCHEMA));
+  case "init": {
+    const initArgs = parseFor(rest, INIT_SCHEMA);
+    // Item 39 — `--interactive` is an async path (model interview or scripted
+    // stdin questionnaire), so it dispatches to its own handler; the plain
+    // `init [name]` scaffold stays the synchronous default, unchanged.
+    if (initArgs.flags["interactive"] === true) {
+      try {
+        await runInitInteractive(initArgs);
+      } catch (err) {
+        if (err instanceof CrewhausError) die(err.message);
+        throw err;
+      }
+    } else {
+      runInit(initArgs);
+    }
     break;
+  }
   case "run":
     // Mirror runCompile's policy: every structured failure in the run
     // pipeline (ConfigError from the model-router, ProviderAuthError from
