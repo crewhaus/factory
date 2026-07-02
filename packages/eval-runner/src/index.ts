@@ -155,14 +155,27 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
         throw new RunnerError(`run interrupted before sample "${sample.id}"`);
       }
       try {
-        return await runSample({
-          sample,
-          invoker,
-          graders,
-          outDir,
-          model: ir.agent.model,
-          ...(opts.seed !== undefined ? { seed: opts.seed } : {}),
-        });
+        const runOnce = () =>
+          runSample({
+            sample,
+            invoker,
+            graders,
+            outDir,
+            model: ir.agent.model,
+            ...(opts.seed !== undefined ? { seed: opts.seed } : {}),
+          });
+        const first = await runOnce();
+        // Noise auto-retry (failure-arbiter item 7): an errored SampleResult
+        // means the INVOKER failed (provider timeout, 429, sandbox blip) —
+        // infra noise, not a graded failure. Retry exactly once within the
+        // run; the retried outcome replaces the errored one wholesale (the
+        // second runSample rewrites the same per-sample artifact dir) and is
+        // tagged `retried: true` so reports and triage can tell. Skipped on
+        // SIGINT or when the caller opted out (`--no-retry`).
+        if (first.error === undefined || opts.retryErrors === false || interrupted) {
+          return first;
+        }
+        return { ...(await runOnce()), retried: true };
       } finally {
         release();
       }

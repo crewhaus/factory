@@ -11,6 +11,15 @@ export function quantile(sorted: ReadonlyArray<number>, q: number): number {
   return (sorted[lo] ?? 0) * (1 - fract) + (sorted[hi] ?? 0) * fract;
 }
 
+/**
+ * Retry honesty (RunEvalOptions.retryErrors): a retried sample appears in
+ * `samples` exactly ONCE — the retry REPLACED the errored first attempt —
+ * so passRate's denominator still counts each dataset sample once. A retry
+ * that passes counts as a normal pass; a retry that errors again lands in
+ * `errorCount` (and, like every errored sample, drags passRate down while
+ * staying out of meanScore/latency/token aggregates). The discarded first
+ * attempt is counted nowhere, by design: it was infra noise, not a result.
+ */
 export function aggregate(samples: ReadonlyArray<SampleResult>): {
   passRate: number;
   meanScore: number;

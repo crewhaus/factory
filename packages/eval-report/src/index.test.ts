@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { EvalRunSummary, SampleResult } from "@crewhaus/eval-runner";
-import { ReportError, diffReports, loadRun, renderReport } from "./index";
+import { ReportError, type ReportVerdicts, diffReports, loadRun, renderReport } from "./index";
 
 const TMP_ROOTS: string[] = [];
 function newTempRoot(): string {
@@ -247,5 +247,73 @@ describe("diffReports (T1)", () => {
     const nextLoaded = await loadRun(nextDir);
     const result = diffReports(prevLoaded, nextLoaded);
     expect(result.diff.scoreShifts).toHaveLength(1);
+  });
+});
+
+// Item 7 — the failure-arbiter triage section. Verdicts arrive structurally
+// (the CLI passes its RunVerdicts; this package deliberately types them as
+// plain strings/records), render between the aggregate cards and the sample
+// table, and are entirely absent when no verdicts are passed.
+describe("renderReport triage section (item 7)", () => {
+  const verdicts: ReportVerdicts = {
+    counts: { bug: 2, "spec-gap": 0, noise: 1, "contract-ambiguity": 1 },
+    dominantClass: "bug",
+    total: 4,
+    verdicts: [
+      { sampleId: "s1", class: "bug", reason: "Impl violated a clear contract clause." },
+      { sampleId: "s2", class: "noise", reason: "Transient infrastructure error: ETIMEDOUT" },
+      { sampleId: "s3", class: "contract-ambiguity", reason: "Reference is absent" },
+      { sampleId: "s4", class: "bug", reason: "Impl violated a clear contract clause." },
+    ],
+  };
+
+  async function loadedFixture() {
+    const dir = newTempRoot();
+    const summary = makeRunSummary("run_cccc3333cccc3333", [
+      makeSampleResult("s1", false, 0),
+      makeSampleResult("s2", false, 0),
+    ]);
+    persistRun(dir, summary);
+    return loadRun(dir);
+  }
+
+  test("renders counts, dominant class, and one row per verdict", async () => {
+    const out = renderReport(await loadedFixture(), { verdicts });
+    expect(out.html).toContain("Failure triage (4 failing)");
+    expect(out.html).toContain("bug 2 · spec-gap 0 · noise 1 · contract-ambiguity 1");
+    expect(out.html).toContain("dominant: bug");
+    expect(out.html).toContain('class="triage-noise"');
+    expect(out.html).toContain('class="triage-contract-ambiguity"');
+    expect(out.html).toContain("Transient infrastructure error: ETIMEDOUT");
+  });
+
+  test("no verdicts passed → no triage section (existing callers unchanged)", async () => {
+    const out = renderReport(await loadedFixture());
+    expect(out.html).not.toContain("Failure triage");
+    // The stylesheet always ships the triage classes; the section markup
+    // (and therefore any element USING them) must be absent.
+    expect(out.html).not.toContain('id="triage"');
+    expect(out.html).not.toContain('class="triage-');
+  });
+
+  test("escapes verdict text and refuses a class attr for non-conforming class names", async () => {
+    const hostile: ReportVerdicts = {
+      counts: { '"><script>': 1 },
+      dominantClass: '"><script>alert(1)</script>',
+      total: 1,
+      verdicts: [
+        {
+          sampleId: '<img src=x onerror="p()">',
+          class: 'bug" onmouseover="steal()',
+          reason: "<script>alert(1)</script>",
+        },
+      ],
+    };
+    const out = renderReport(await loadedFixture(), { verdicts: hostile });
+    expect(out.html).not.toContain("<script>alert(1)</script>");
+    expect(out.html).not.toContain('<img src=x onerror="p()">');
+    // The hostile class name fails the [a-z-] whitelist → no class attribute.
+    expect(out.html).not.toContain('onmouseover="steal()"');
+    expect(out.html).toContain("&lt;script&gt;alert(1)&lt;/script&gt;");
   });
 });

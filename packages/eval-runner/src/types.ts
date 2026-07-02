@@ -48,6 +48,13 @@ export type SampleResult = {
   readonly agentOutput: string;
   readonly grades: { overall: GradeResult; perGrader: Array<{ name: string } & GradeResult> };
   readonly error?: string;
+  /**
+   * True when this result replaced an ERRORED first attempt via the runner's
+   * bounded noise retry (see {@link RunEvalOptions.retryErrors}). Set on the
+   * retried outcome regardless of whether the retry passed or errored again;
+   * absent on samples that succeeded (or failed grading) on attempt one.
+   */
+  readonly retried?: boolean;
 };
 
 export type EvalRunSummary = {
@@ -87,6 +94,15 @@ export type RunEvalOptions = {
   readonly judgeModel?: string;
   readonly invoker?: AgentInvoker;
   readonly cwd?: string;
+  /**
+   * Retry a sample ONCE, within the run, when its result is an ERROR
+   * (`SampleResult.error` — the INVOKER failed: provider timeout, 429,
+   * sandbox blip; infra noise, not a graded failure). The retried outcome
+   * replaces the errored one wholesale (per-sample artifacts included) and
+   * is tagged `retried: true`. Default: true. `crewhaus eval --no-retry`
+   * opts out. Interrupted runs (SIGINT) never retry.
+   */
+  readonly retryErrors?: boolean;
   /**
    * Content hash (sha256 hex) of the dataset file the samples came from.
    * Purely informational — persisted into `run.json` / `results.json` so

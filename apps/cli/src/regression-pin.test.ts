@@ -162,6 +162,28 @@ describe("pinRecoveredSamples — suite versioning", () => {
     });
   });
 
+  test("item 7 — an explicit `source` lands in metadata.regression_pin.source", async () => {
+    const registry = newRegistry(newTempRoot());
+    await pinRecoveredSamples({
+      registry,
+      specName: "concierge",
+      samples: [sample("r1")],
+      sourceDataset: "support@v3",
+      optimizeRunId: "run_eval1",
+      source: "failure-arbiter",
+      now: () => new Date("2026-07-01T12:00:00Z"),
+    });
+    const record = await registry.getRecord("concierge-regressions", "v1");
+    expect(record.splits.train[0]?.metadata?.["regression_pin"]).toEqual({
+      optimizeRunId: "run_eval1",
+      pinnedAt: "2026-07-01T12:00:00.000Z",
+      sourceDataset: "support@v3",
+      source: "failure-arbiter",
+    });
+    // The first-pin test above proves the field is ABSENT when not given —
+    // the optimize post-accept path's pins stay byte-identical.
+  });
+
   test("no recoveries → no-op (no dataset version is written)", async () => {
     const registry = newRegistry(newTempRoot());
     const result = await pinRecoveredSamples({

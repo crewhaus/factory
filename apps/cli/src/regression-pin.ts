@@ -13,11 +13,12 @@
  * Kept in a side-effect-free module (the CLI entry file runs an argv
  * switch on import) mirroring `eval-history.ts` / `datasets.ts`: all
  * filesystem access goes through an injected `DatasetRegistry` or through
- * eval-report's `loadRun` on caller-supplied run dirs. NOTE for the
- * upcoming failure-arbiter feature: its `ArbiterAction.promoteRegression`
- * flag (eval-optimizer-orchestrator/src/failure-arbiter.ts) is the other
- * intended consumer of {@link pinRecoveredSamples} — call it with the
- * arbiter's promoted samples instead of re-implementing the union.
+ * eval-report's `loadRun` on caller-supplied run dirs. The failure-arbiter
+ * wiring (item 7, `triage.ts`) is the other consumer of
+ * {@link pinRecoveredSamples}: post-eval triage promotes the samples whose
+ * `ArbiterAction.promoteRegression` flag is set (bug-class failures,
+ * eval-optimizer-orchestrator/src/failure-arbiter.ts) with
+ * `source: "failure-arbiter"` provenance.
  */
 import { createHash } from "node:crypto";
 import { type DatasetRegistry, latestVersion } from "@crewhaus/dataset-registry";
@@ -59,8 +60,13 @@ export type PinRecoveredSamplesOptions = {
   readonly samples: ReadonlyArray<Sample>;
   /** Name of the dataset the samples came from (provenance). */
   readonly sourceDataset: string;
-  /** The optimize run that recovered them (provenance). */
+  /** The run that produced the pin (the optimize runId on the post-accept
+   *  path; the eval runId on the failure-arbiter path). */
   readonly optimizeRunId: string;
+  /** Provenance tag naming WHAT produced the pin (e.g. "failure-arbiter").
+   *  Recorded as `metadata.regression_pin.source` when present; absent on
+   *  the optimize post-accept path (byte-identical to the pre-item-7 pin). */
+  readonly source?: string;
   /** Clock override for deterministic tests. */
   readonly now?: () => Date;
 };
@@ -102,6 +108,7 @@ export async function pinRecoveredSamples(
           optimizeRunId: opts.optimizeRunId,
           pinnedAt,
           sourceDataset: opts.sourceDataset,
+          ...(opts.source !== undefined ? { source: opts.source } : {}),
         },
       },
     });

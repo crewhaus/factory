@@ -140,6 +140,17 @@ import { applyRegressionUnion, pinRecoveriesAfterOptimize } from "./regression-p
 // `doctor --philosophy-alignment`. Kept in a side-effect-free module so it is
 // unit-testable (this entry file runs an argv switch on import).
 import { auditSpecToolNames, auditToolScopes, collectToolNames } from "./scope-audit";
+// Item 7 — failure-arbiter wiring: post-eval triage (verdicts.json + report
+// section + one-line summary + bug-sample pinning) and the optimize-side
+// failure-signal pre-filter, in a side-effect-free module so it is
+// unit-testable (this entry file runs an argv switch on import).
+import {
+  finishEvalTriage,
+  formatDatasetFixQueue,
+  formatFitnessTriageLine,
+  tapSamples,
+  triageFitnessSamples,
+} from "./triage";
 
 /**
  * crewhaus — slice-scope CLI.
@@ -287,7 +298,13 @@ const EVAL_SCHEMA: ParseArgsSchema = {
     { name: "no-promote", takesValue: false },
     // Item 9 — skip the default union of the per-spec
     // `<specName>-regressions` registry dataset into the loaded dataset.
+    // Item 7 — ALSO skips the failure-arbiter's bug-sample pin into that
+    // suite (opting out of regression-suite integration means no writes
+    // to it either).
     { name: "no-regressions", takesValue: false },
+    // Item 7 — opt out of the runner's default one-shot retry of ERRORED
+    // samples (infra noise, not graded failures).
+    { name: "no-retry", takesValue: false },
     { name: "help", short: "h" },
   ],
 };
@@ -1678,7 +1695,11 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
         "  When a patch is accepted (with or without --write-back), the dev samples that flipped\n" +
         "  fail→pass are pinned into the <specName>-regressions registry dataset (a new version\n" +
         "  unioning the previous one, deduped by sample id) so `crewhaus eval` guards them by\n" +
-        "  default. --no-pin-regressions skips the pin.\n",
+        "  default. --no-pin-regressions skips the pin.\n" +
+        "  After each candidate's eval the failure arbiter triages failing dev samples;\n" +
+        "  noise (flaky infra) and contract-ambiguity (bad gold) are excluded from the\n" +
+        "  failure signal the mutator sees, and contract-ambiguity samples collect into\n" +
+        "  a dataset-fix queue printed at the end of the run.\n",
     );
     return;
   }
@@ -1865,6 +1886,13 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
   // baseline dir against the winner's dir, so both must survive intact).
   let evalCallSeq = 0;
 
+  // Item 7 — cross-iteration dataset-fix queue: sampleId → arbiter reason
+  // for every dev sample the failure arbiter classified contract-ambiguity.
+  // Queued ids stay excluded from the mutator's failure signal for the rest
+  // of the run (the dataset/contract problem doesn't change with the
+  // candidate prompt) and the queue prints at the end of optimize.
+  const datasetFixQueue = new Map<string, string>();
+
   // Fitness fn: patch the spec with the candidate prompt, lower to IR,
   // run eval-runner, and return the pass-rate PLUS per-sample grades. The
   // aggregate `passRate` still drives the search (unchanged scoring); the
@@ -1916,15 +1944,41 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
         seed,
       },
     });
-    const grades = summary.samples.map((r) => {
-      const dev = devById.get(r.sampleId);
-      return {
-        input: dev?.input ?? r.sampleId,
-        score: r.grades.overall.score,
-        ...(dev?.expected_output !== undefined ? { expected: dev.expected_output } : {}),
-        rationale: r.grades.overall.rationale,
-      };
-    });
+    // Item 7 — failure-arbiter pre-filter: classify this candidate's failing
+    // samples and withhold noise (flaky infra) and contract-ambiguity (bad
+    // gold) from the failure signal the mutator sees — mutating the prompt
+    // against them wastes mutation budget. Contract-ambiguity ids join the
+    // sticky dataset-fix queue above. Best-effort: a triage error keeps the
+    // unfiltered grades (the pre-item-7 behaviour) rather than failing the
+    // fitness call. The aggregate passRate is NOT filtered — the search
+    // score stays honest; only the mutator's per-sample window narrows.
+    let excludedFromSignal: ReadonlySet<string> = new Set<string>();
+    try {
+      const triage = triageFitnessSamples({
+        samples: summary.samples,
+        samplesById: originalById,
+        alreadyAmbiguous: new Set(datasetFixQueue.keys()),
+      });
+      for (const a of triage.ambiguous) datasetFixQueue.set(a.sampleId, a.reason);
+      excludedFromSignal = triage.excluded;
+      const line = formatFitnessTriageLine(triage);
+      if (line !== undefined) process.stdout.write(`[optimize] ${line}\n`);
+    } catch (err) {
+      process.stderr.write(
+        `[optimize] triage skipped: ${err instanceof Error ? err.message : String(err)}\n`,
+      );
+    }
+    const grades = summary.samples
+      .filter((r) => !excludedFromSignal.has(r.sampleId))
+      .map((r) => {
+        const dev = devById.get(r.sampleId);
+        return {
+          input: dev?.input ?? r.sampleId,
+          score: r.grades.overall.score,
+          ...(dev?.expected_output !== undefined ? { expected: dev.expected_output } : {}),
+          rationale: r.grades.overall.rationale,
+        };
+      });
     // Item 9 — report where this measurement's eval run was persisted so
     // the optimizer can surface the baseline/winner dirs for pinning.
     return { score: summary.aggregates.passRate, grades, runDir: summary.outDir };
@@ -2047,6 +2101,13 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
       `[optimize] no improvement above threshold ${improvementThreshold}; source untouched.\n`,
     );
   }
+
+  // Item 7 — surface the queued contract-ambiguity samples: these need a
+  // dataset/contract fix, not more prompt mutations, which is why they were
+  // withheld from the mutator's failure signal above. Empty queue → silent.
+  for (const line of formatDatasetFixQueue(datasetFixQueue)) {
+    process.stdout.write(`[optimize] ${line}\n`);
+  }
 }
 
 function makeAsyncIterable<T>(items: ReadonlyArray<T>): AsyncIterable<T> {
@@ -2071,7 +2132,7 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
     process.stdout.write(
       "usage: crewhaus eval <spec.yaml> --dataset <data> --graders <graders.yaml> " +
         "[--judge-model <model>] [--concurrency N] [--seed N] [-o <out-dir>] " +
-        "[--gate] [--no-promote] [--no-regressions] [--models <m1,m2,...>]\n" +
+        "[--gate] [--no-promote] [--no-regressions] [--no-retry] [--models <m1,m2,...>]\n" +
         "  --dataset takes a file path (jsonl/csv/yaml/http) or registry:<name>[@version][#split]\n" +
         "  — a Section 29 dataset-registry ref (.crewhaus/datasets, or CREWHAUS_DATASETS_DIR).\n" +
         "  Default version: latest; default samples: the union of all splits (give #train,\n" +
@@ -2087,7 +2148,15 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
         "  its samples are unioned into the dataset by default (dedupe by id, primary wins);\n" +
         "  datasetName/datasetHash then reflect the union (`+regressions@vX` suffix + folded\n" +
         "  hash), so the first unioned run starts a new baseline lineage by design.\n" +
-        "  --no-regressions skips the union.\n" +
+        "  --no-regressions skips the union (and the failure-arbiter pin below).\n" +
+        "  Samples whose run ERRORS (provider timeout, 429 — infra noise, not a graded\n" +
+        "  failure) are retried once by default; the retried outcome replaces the errored\n" +
+        "  one and is tagged retried:true in results.json. --no-retry disables the retry.\n" +
+        "  After the run, every failing sample is triaged by the failure arbiter into\n" +
+        "  bug / spec-gap / noise / contract-ambiguity: verdicts land in <out>/verdicts.json\n" +
+        "  + a report section + a one-line `triage:` summary, and bug-class samples are\n" +
+        "  pinned into <specName>-regressions (source: failure-arbiter). Best-effort —\n" +
+        "  a triage failure never fails the eval. Matrix cells (--models) skip triage.\n" +
         "  --judge-model accepts the full router grammar (claude-*, openai/<m>, gemini/<m>,\n" +
         "  bedrock/<id>, local/<m>@<url>); the default judge claude-sonnet-4-5 requires\n" +
         "  Anthropic credentials (ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY)\n" +
@@ -2241,10 +2310,15 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
     );
   }
 
+  // Item 7 — the runner's noise auto-retry is ON by default; `--no-retry`
+  // opts out (threaded into matrix cells and the single-run path alike).
+  const retryErrors = args.flags["no-retry"] !== true;
+
   // Item 11 — matrix mode: everything above (spec lowering, graders, item-12
   // registry resolution, item-9 regression union) ran ONCE, so every model
   // sees the identical sample set. The matrix path never reaches the item-3
-  // finishEvalRun flow below.
+  // finishEvalRun flow below — nor the item-7 triage (matrix cells are model
+  // comparisons; per-cell verdicts/pins would write N conflicting triages).
   if (matrixModels !== undefined) {
     return runEvalMatrixCommand({
       ir,
@@ -2253,12 +2327,19 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
       samples: await collectSamples(dataset.samples),
       datasetHash,
       compiled,
+      retryErrors,
       ...(typeof outDirArg === "string" ? { outDirArg } : {}),
       ...(concurrency !== undefined ? { concurrency } : {}),
       ...(seed !== undefined ? { seed } : {}),
       ...(typeof judgeModelFlag === "string" ? { judgeModel: judgeModelFlag } : {}),
     });
   }
+
+  // Item 7 — tee the samples flowing into the runner so post-eval triage can
+  // join each failing SampleResult back to its dataset Sample (reference +
+  // metadata) and pin bug-class samples as they live in the source dataset.
+  const triageSamplesById = new Map<string, Sample>();
+  dataset = { name: dataset.name, samples: tapSamples(dataset.samples, triageSamplesById) };
 
   const outDest =
     typeof outDirArg === "string" ? resolve(outDirArg) : join(".crewhaus", "evals", "<runId>");
@@ -2271,6 +2352,7 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
     opts: {
       ...(typeof outDirArg === "string" ? { outDir: resolve(outDirArg) } : {}),
       datasetHash,
+      retryErrors,
       ...(concurrency !== undefined ? { concurrency } : {}),
       ...(seed !== undefined ? { seed } : {}),
       ...(typeof judgeModelFlag === "string" ? { judgeModel: judgeModelFlag } : {}),
@@ -2280,9 +2362,36 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
   // cwd — resolve to an absolute path for the report + history index.
   const absOut = resolve(summary.outDir);
 
-  // Render report
+  // Item 7 — failure-arbiter triage: classify every failing sample into
+  // bug / spec-gap / noise / contract-ambiguity, persist verdicts.json next
+  // to results.json, print the one-line `triage:` summary, and pin the
+  // promoteRegression (bug-class) samples into <specName>-regressions.
+  // finishEvalTriage is best-effort by construction (warns, never throws);
+  // the outer catch is belt-and-braces so triage can NEVER fail the eval.
+  let triageVerdicts: Awaited<ReturnType<typeof finishEvalTriage>>;
+  try {
+    triageVerdicts = await finishEvalTriage({
+      samples: summary.samples,
+      samplesById: triageSamplesById,
+      runId: summary.runId,
+      outDir: absOut,
+      specName: ir.name,
+      sourceDataset: dataset.name,
+      registry: createFileBackedRegistry({ rootDir: defaultDatasetsRoot() }),
+      pin: args.flags["no-regressions"] !== true,
+    });
+  } catch (err) {
+    process.stderr.write(
+      `[eval] triage skipped: ${err instanceof Error ? err.message : String(err)}\n`,
+    );
+  }
+
+  // Render report (with the triage section when the run had failures).
   const loaded = await loadRun(absOut);
-  const rendered = renderReport(loaded);
+  const rendered = renderReport(
+    loaded,
+    triageVerdicts !== undefined ? { verdicts: triageVerdicts } : {},
+  );
   writeFileSync(join(absOut, "index.html"), rendered.html);
 
   process.stdout.write(
@@ -2326,6 +2435,8 @@ async function runEvalMatrixCommand(opts: {
   readonly samples: ReadonlyArray<Sample>;
   readonly datasetHash: string;
   readonly compiled: ReadonlyArray<CompiledGrader>;
+  /** Item 7 — `!--no-retry`, threaded into every cell's runner options. */
+  readonly retryErrors: boolean;
   readonly outDirArg?: string;
   readonly concurrency?: number;
   readonly seed?: number;
@@ -2353,6 +2464,7 @@ async function runEvalMatrixCommand(opts: {
         opts: {
           outDir: cellOutDir,
           datasetHash: opts.datasetHash,
+          retryErrors: opts.retryErrors,
           ...(opts.concurrency !== undefined ? { concurrency: opts.concurrency } : {}),
           ...(opts.seed !== undefined ? { seed: opts.seed } : {}),
           ...(opts.judgeModel !== undefined ? { judgeModel: opts.judgeModel } : {}),
