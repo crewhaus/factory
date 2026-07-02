@@ -300,6 +300,18 @@ import {
   openJustificationAuditSink,
   resolveJudgeChoice,
 } from "./justification-gate";
+// Item 41 — `crewhaus lint` (parse + ir-passes collect-all + scope audit) and
+// `compile --watch` (debounced re-validate loop) live in side-effect-free
+// modules so this entry file stays testable.
+import {
+  type LintResult,
+  formatLintJson,
+  formatLintText,
+  nearestToolName,
+  runLint,
+  suggestSafeName,
+  suggestSecretFix,
+} from "./lint";
 // Item 9 — per-spec regression suite: post-accept pinning of optimize
 // recoveries + the eval-side default union, in a side-effect-free module so
 // it is unit-testable (this entry file runs an argv switch on import).
@@ -382,6 +394,7 @@ import {
 // CLI version resolution (embedded --define constant → package.json), shared
 // with compile-check.ts's dependency pinning.
 import { cliVersion } from "./version";
+import { type Watcher, createWatchController, formatCycleLine } from "./watch";
 
 /**
  * crewhaus — slice-scope CLI.
@@ -430,6 +443,22 @@ const COMPILE_SCHEMA: ParseArgsSchema = {
     // spec-registry (with a distilled CHANGELOG.md entry) is DEFAULT-ON;
     // this is the explicit opt-out.
     { name: "no-register", takesValue: false },
+    // Item 41 — re-run parse→lint→compile on every change to the spec /
+    // .crewhaus/commands / skills dirs (the watch mode the header listed as
+    // "future"). Debounced, Ctrl-C-clean, one green/red status per cycle.
+    { name: "watch", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
+// Item 41 — `crewhaus lint [--fix] [--format text|json]`: a check-only command
+// running parseSpec + compile({applyIrPasses:true}) + auditToolScopes WITHOUT
+// emitting, so §47 chain / graph-crew well-formedness checks (skipped on the
+// CLI compile path) surface for authors.
+const LINT_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "fix", takesValue: false },
+    { name: "format", takesValue: true },
     { name: "help", short: "h" },
   ],
 };
@@ -457,6 +486,10 @@ const RUN_SCHEMA: ParseArgsSchema = {
     // @crewhaus/embedder prefix grammar, e.g. openai/text-embedding-3-small,
     // mock/deterministic). Flag > CREWHAUS_EGRESS_EMBEDDER env > default.
     { name: "egress-embedder", takesValue: true },
+    // Item 41 — re-validate (parse→lint→compile-in-memory) on every change to
+    // the spec / .crewhaus/commands / skills dirs, printing a green/red status
+    // per cycle. A pre-run authoring aid; it does NOT re-launch the agent.
+    { name: "watch", takesValue: false },
     { name: "help", short: "h" },
   ],
 };
@@ -881,7 +914,12 @@ function usageText(): string {
     "                  [--allow-unmarked-sinks]  opt out of the external-sink scope gate",
     "                  [--check]            verify the emitted bundle (shape assertion + install + liveness boot)",
     "  compile <spec.yaml> --emit-ir        print the lowered IR as JSON (debug)",
+    "  compile <spec.yaml> --watch          re-run parse→lint→compile on every change (item 41)",
+    "  lint [spec.yaml] [--fix]             check-only: parse + ir-passes (§47 chain / graph-crew",
+    "       [--format text|json]            well-formedness the CLI compile path skips) + scope audit,",
+    "                                       WITHOUT emitting; --fix does nearest-match/typo repairs (item 41)",
     "  run <spec.yaml> [--model <model>]    compile in-memory and execute the agent",
+    "                  [--watch]            re-validate on change (authoring aid; does not re-launch)",
     "                  [--resume <id>]      resume a specific session (cli targets only)",
     "                  [--continue]         resume the most-recent session (cli targets only)",
     "                  [--prompt <text>]    initial user prompt (browser targets; defaults to stdin)",
@@ -1102,6 +1140,16 @@ async function runCompile(args: ParsedArgs): Promise<void> {
   if (typeof specPath !== "string") die("missing <spec.yaml>");
   if (!emitIr && typeof outDir !== "string") die("missing -o <out-dir>");
 
+  // Item 41 — `--watch`: re-run parse→lint→compile on every change. Delegates
+  // to the watch controller, which drives one `compileOnceForWatch` cycle per
+  // debounced change. `--check` is incompatible (a watch cycle is an in-place
+  // re-validate, not a full install+boot verify).
+  if (args.flags["watch"] === true) {
+    if (check) die("--watch and --check are incompatible (a watch cycle re-validates in place)");
+    await runCompileWatch({ specPath, strict, readme });
+    return;
+  }
+
   const absSpec = resolve(specPath);
   logger.debug("compile.start", { spec: absSpec, out: outDir, emitIr, strict, allowUnmarkedSinks });
 
@@ -1225,6 +1273,246 @@ async function runCompile(args: ParsedArgs): Promise<void> {
     process.stdout.write(`${result.line}\n`);
     if (!result.green) process.exit(1);
   }
+}
+
+/**
+ * Item 41 — the tool-name resolver shared by `lint` and its `--fix` nearest-
+ * match. Returns a `(name) => RegisteredTool | undefined` that resolves BOTH
+ * the camelCase spec key (`webSearch`) and the registered PascalCase name
+ * (`WebSearch`, used in sub-agent `tools:`), matching the strict-scope gate.
+ * The camelCase keys + PascalCase names are also returned as the legal-name
+ * candidate set for nearest-match typo suggestions.
+ */
+async function buildToolResolver(): Promise<{
+  resolve: (name: string) => RegisteredTool | undefined;
+  candidates: string[];
+}> {
+  const toolMap = await loadToolMap();
+  const byRegisteredName: Record<string, RegisteredTool> = {};
+  for (const tool of Object.values(toolMap)) byRegisteredName[tool.name] = tool;
+  const candidates = [
+    ...new Set([...Object.keys(toolMap), ...Object.keys(byRegisteredName)]),
+  ].sort();
+  return {
+    resolve: (name) => toolMap[name] ?? byRegisteredName[name],
+    candidates,
+  };
+}
+
+/**
+ * Item 41 — `crewhaus lint [--fix] [--format text|json]`. Runs the check-only
+ * pipeline (`runLint`: parse + ir-passes collect-all + scope audit) over the
+ * cwd (or a named) spec WITHOUT emitting, so the §47 chain / graph-crew
+ * well-formedness checks that the CLI compile path skips surface for authors.
+ * `--fix` applies mechanical corrections (unknown tool → nearest match, `$SECRET`
+ * typo → `$UPPER_SNAKE_CASE`, unsafe name → sanitised) then re-lints. Exit 1 on
+ * any error finding.
+ */
+async function runLintCommand(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus lint [spec.yaml] [--fix] [--format text|json]\n" +
+        "  Check-only: parseSpec + compile ir-passes (§47 chain / graph-crew\n" +
+        "  well-formedness, which the CLI compile path skips) + tool-scope audit,\n" +
+        "  WITHOUT emitting a bundle. Defaults to ./crewhaus.yaml.\n" +
+        "  --format json   structured {message,path,severity,rule} findings for editors/CI.\n" +
+        "                  IR passes are fail-fast per pass; json mode runs each pass\n" +
+        "                  independently (collect-all) so one violation doesn't hide others.\n" +
+        "  --fix           apply mechanical fixes: unknown tool name → nearest match,\n" +
+        "                  $secret typo → $UPPER_SNAKE_CASE, unsafe name → sanitised.\n",
+    );
+    return;
+  }
+  const format = args.flags["format"];
+  if (format !== undefined && format !== "text" && format !== "json") {
+    die(`--format must be "text" or "json" (got "${format}")`);
+  }
+  const specArg = args.positional[0];
+  const absSpec = resolve(
+    typeof specArg === "string" ? specArg : join(process.cwd(), "crewhaus.yaml"),
+  );
+  let yamlText: string;
+  try {
+    yamlText = readFileSync(absSpec, "utf-8");
+  } catch (err) {
+    die(`could not read ${absSpec}: ${(err as Error).message}`);
+  }
+
+  const { resolve: resolveTool, candidates } = await buildToolResolver();
+
+  if (args.flags["fix"] === true) {
+    const { text: fixedYaml, applied } = applyLintFixes(yamlText, candidates);
+    if (applied.length > 0) {
+      writeFileSync(absSpec, fixedYaml);
+      for (const line of applied) process.stdout.write(`fixed: ${line}\n`);
+      yamlText = fixedYaml;
+    } else {
+      process.stdout.write("lint --fix: no mechanical fixes applicable.\n");
+    }
+  }
+
+  const result = runLint(yamlText, resolveTool);
+  process.stdout.write(format === "json" ? formatLintJson(result) : formatLintText(result));
+  process.exit(result.ok ? 0 : 1);
+}
+
+/**
+ * Item 41 — apply `lint --fix`'s mechanical corrections to a spec's YAML by
+ * scanning the raw text for the three fixable classes and rewriting the token
+ * in place. Text-level (not spec-patch) because two of the three classes —
+ * an unsafe `name:` and a mistyped tool in a `tools:` list — must be fixed
+ * BEFORE the spec can parse, and spec-patch requires a parseable document.
+ * Returns the rewritten text + a description of each applied fix.
+ */
+function applyLintFixes(
+  yamlText: string,
+  toolCandidates: readonly string[],
+): { text: string; applied: string[] } {
+  const applied: string[] = [];
+  const lines = yamlText.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (line === undefined) continue;
+
+    // Unsafe `name:` value → sanitised.
+    const nameMatch = /^(\s*name:\s*)(.+?)(\s*)$/.exec(line);
+    if (nameMatch?.[2] !== undefined) {
+      const raw = stripQuotes(nameMatch[2]);
+      const safe = suggestSafeName(raw);
+      if (safe !== undefined) {
+        lines[i] = `${nameMatch[1]}${safe}`;
+        applied.push(`name "${raw}" → "${safe}" (unsafe characters)`);
+        continue;
+      }
+    }
+
+    // A `- toolName` list item that is an unknown tool near a legal name.
+    const toolMatch = /^(\s*-\s*)([A-Za-z]\w*)(\s*)$/.exec(line);
+    if (toolMatch?.[2] !== undefined) {
+      const nearest = nearestToolName(toolMatch[2], toolCandidates);
+      if (nearest !== undefined) {
+        lines[i] = `${toolMatch[1]}${nearest}`;
+        applied.push(`tool "${toolMatch[2]}" → "${nearest}" (nearest match)`);
+        continue;
+      }
+    }
+
+    // A credential value that looks like a malformed env ref → $UPPER_SNAKE_CASE.
+    const secretMatch = /^(\s*\w+:\s*)(\$\S+)(\s*)$/.exec(line);
+    if (secretMatch?.[2] !== undefined) {
+      const fixed = suggestSecretFix(stripQuotes(secretMatch[2]));
+      if (fixed !== undefined) {
+        lines[i] = `${secretMatch[1]}${fixed}`;
+        applied.push(`secret "${secretMatch[2]}" → "${fixed}" ($UPPER_SNAKE_CASE)`);
+      }
+    }
+  }
+  return { text: lines.join("\n"), applied };
+}
+
+/** Strip a single pair of surrounding single/double quotes from a scalar. */
+function stripQuotes(s: string): string {
+  const t = s.trim();
+  if ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'"))) {
+    return t.slice(1, -1);
+  }
+  return t;
+}
+
+/**
+ * Item 41 — `compile --watch`. Watches the spec + `.crewhaus/commands` + skills
+ * dirs and re-runs a parse→lint→compile (in-memory) cycle on every debounced
+ * change, printing one green/red status per cycle. Ctrl-C-clean: the SIGINT
+ * handler stops the controller and closes the fs watchers.
+ */
+async function runCompileWatch(opts: {
+  readonly specPath: string;
+  readonly strict: boolean;
+  readonly readme: boolean;
+}): Promise<void> {
+  const absSpec = resolve(opts.specPath);
+  const specDir = dirname(absSpec);
+  const { resolve: resolveTool } = await buildToolResolver();
+
+  // Watch the spec file plus the two sibling authoring dirs, when present.
+  const watchPaths = [absSpec, join(specDir, ".crewhaus", "commands"), join(specDir, "skills")];
+  const { watch } = await import("node:fs");
+  const handles: Array<{ close(): void }> = [];
+  const subscribers: Array<() => void> = [];
+  const watcher: Watcher = {
+    subscribe: (cb) => subscribers.push(cb),
+    close: () => {
+      for (const h of handles) {
+        try {
+          h.close();
+        } catch {
+          // A path that vanished mid-watch closes with an error; ignore.
+        }
+      }
+    },
+  };
+  for (const p of watchPaths) {
+    if (!existsSync(p)) continue;
+    try {
+      const h = watch(p, { recursive: true }, () => {
+        for (const cb of subscribers) cb();
+      });
+      handles.push(h);
+    } catch {
+      // Non-fatal: an unwatchable path just isn't watched.
+    }
+  }
+
+  const runCycle = async (): Promise<{ green: boolean; line: string }> => {
+    let text: string;
+    try {
+      text = readFileSync(absSpec, "utf-8");
+    } catch (err) {
+      return {
+        green: false,
+        line: formatCycleLine(false, `read failed: ${(err as Error).message}`),
+      };
+    }
+    const result = runLint(text, resolveTool);
+    if (!result.ok) {
+      const first = result.findings[0];
+      const detail = first ? `${result.findings.length} finding(s): ${first.message}` : "findings";
+      return { green: false, line: formatCycleLine(false, `lint ✗ — ${detail}`) };
+    }
+    // Lint clean → compile in-memory (no emit) to confirm the emitters accept it.
+    try {
+      compile(text, { readme: opts.readme, strict: opts.strict });
+      return { green: true, line: formatCycleLine(true, `${basename(absSpec)} ok`) };
+    } catch (err) {
+      const message = err instanceof CrewhausError ? err.message : (err as Error).message;
+      return { green: false, line: formatCycleLine(false, `compile ✗ — ${message}`) };
+    }
+  };
+
+  const controller = createWatchController({
+    watcher,
+    timer: { set: (fn, ms) => setTimeout(fn, ms), clear: (h) => clearTimeout(h as NodeJS.Timeout) },
+    debounceMs: 150,
+    runCycle,
+    print: (line) => process.stdout.write(`${line}\n`),
+  });
+
+  process.stdout.write(
+    `watching ${basename(absSpec)} (+ .crewhaus/commands, skills) — Ctrl-C to stop\n`,
+  );
+  // Run one cycle immediately so the user sees the current status.
+  const initial = await runCycle();
+  process.stdout.write(`${initial.line}\n`);
+
+  await new Promise<void>((resolveWatch) => {
+    const onSigint = (): void => {
+      controller.stop();
+      process.stdout.write("\nwatch stopped.\n");
+      process.off("SIGINT", onSigint);
+      resolveWatch();
+    };
+    process.on("SIGINT", onSigint);
+  });
 }
 
 /**
@@ -1844,6 +2132,14 @@ async function runRun(args: ParsedArgs): Promise<void> {
   }
   const specPath = args.positional[0];
   if (typeof specPath !== "string") die("missing <spec.yaml>");
+
+  // Item 41 — `run --watch`: the same debounced parse→lint→compile re-validate
+  // loop as `compile --watch`, an authoring aid that does NOT re-launch the
+  // agent (which would require tearing down a live REPL/session on every edit).
+  if (args.flags["watch"] === true) {
+    await runCompileWatch({ specPath, strict: true, readme: true });
+    return;
+  }
 
   const absSpec = resolve(specPath);
   logger.debug("run.start", { spec: absSpec });
@@ -7010,6 +7306,12 @@ const rest = argv.slice(1);
 switch (subcommand) {
   case "compile":
     await runCompile(parseFor(rest, COMPILE_SCHEMA));
+    break;
+  case "lint":
+    // Item 41 — parse/lower/ir-pass failures all extend CrewhausError; the
+    // lint pipeline collects them as findings rather than throwing, so a raw
+    // throw here is a genuine bug and should surface with its stack.
+    await runLintCommand(parseFor(rest, LINT_SCHEMA));
     break;
   case "init": {
     const initArgs = parseFor(rest, INIT_SCHEMA);
