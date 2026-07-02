@@ -245,6 +245,23 @@ describe("deriveTurns", () => {
       [2, "second question"],
     ]);
   });
+
+  it("ignores the advisor event kinds (recovery, tool_stats, permission, model_meta)", () => {
+    // Item-14 groundwork persists advisory lines into the same session JSONL.
+    // They are non-conversational — interleaving them must not perturb the
+    // derived turns of any reader (deriveTurns backs both distill and rate).
+    const events: LoggedEvent[] = [
+      { kind: "user_message", payload: { content: "q" } },
+      { kind: "model_meta", payload: { stopReason: "end_turn", model: "m" } },
+      { kind: "tool_stats", payload: { toolName: "Fetch", durationMs: 12, isError: false } },
+      { kind: "permission", payload: { toolName: "Fetch", decision: "allow", askOutcome: null } },
+      { kind: "recovery", payload: { errorName: "MaxTokensError", action: "continue", depth: 1 } },
+      { kind: "assistant_message", payload: { content: [{ type: "text", text: "a" }] } },
+    ];
+    expect(deriveTurns(events)).toEqual([
+      { turnNumber: 1, input: "q", output: "a", toolNames: [] },
+    ]);
+  });
 });
 
 describe("extractFeedbackRecords + mergeFeedback", () => {

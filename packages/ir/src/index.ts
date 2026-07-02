@@ -76,11 +76,14 @@ export type IrToolConfigs = Readonly<Record<string, unknown>>;
  */
 export type IrCompaction = {
   readonly model?: string;
-  /** Pillar 2 — when true, target emitters wire `compaction-curator`
-   *  as a pre-pass before the autocompact threshold check. The spec
-   *  layer accepts this verbatim (validated in `packages/spec`); the
-   *  IR holds it as an opt-in flag with no default so emitters can
-   *  distinguish "user said false" from "user didn't say". */
+  /** Pillar 2 — RESERVED, not yet wired at runtime. Intended to make
+   *  target emitters wire `compaction-curator` as a pre-pass before the
+   *  autocompact threshold check, but no emitter or runtime-core path
+   *  consumes this field today — setting it is currently a no-op. The
+   *  spec layer accepts this verbatim (validated in `packages/spec`) and
+   *  it lowers here unchanged so the value round-trips once wiring lands;
+   *  the IR holds it as an opt-in flag with no default so emitters can
+   *  eventually distinguish "user said false" from "user didn't say". */
   readonly curate?: boolean;
   /** Cosine threshold for the curator's dedupe pass. Curator's own
    *  default (0.92, `DEFAULT_DEDUPE_THRESHOLD` in

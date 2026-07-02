@@ -71,7 +71,41 @@ export type EventKind =
   // `crewhaus distill` to synthesize eval datasets + graders. Like
   // `cost_accrual` it is non-conversational, so `replayMessageHistory`
   // ignores it and `--resume` is unaffected. Payload is a `FeedbackRecord`.
-  | "user_feedback";
+  | "user_feedback"
+  // Advisor groundwork (AUTOMATION-OPPORTUNITIES items 14/15/17) — durable
+  // mirrors of runtime signals that previously lived only on the in-process
+  // trace bus, persisted by runtime-core's advisor subscriber (default-on,
+  // disable with CREWHAUS_ADVISOR_EVENTS=0) so `crewhaus advise` can mine
+  // sessions offline. All four are non-conversational: `replayMessageHistory`
+  // ignores them (so `--resume` is unaffected) and readers written before
+  // these kinds existed keep parsing, because every session-log reader
+  // branches on the kinds it knows and skips the rest.
+  //
+  // One recovery-engine action (payload `{ errorName, action, depth }`),
+  // mirrored from the `error_recovered` trace event. `action: "continue"`
+  // is emitted exclusively for `max_output_tokens` truncations
+  // (recovery-engine's taxonomy), so counting it measures truncation
+  // pressure directly.
+  | "recovery"
+  // One line PER TOOL CALL (payload `{ toolName, durationMs, isError }`),
+  // mirrored from `tool_call_end`. Granularity decision: per-call, not a
+  // per-turn aggregate — the session log already carries a full `tool_use`
+  // line (entire input JSON) and `tool_result` line (entire output text)
+  // for every call, so this ~100-byte stats line adds a few percent to the
+  // per-call footprint at worst while preserving the per-call latency/error
+  // distribution a per-turn aggregate would destroy.
+  | "tool_stats"
+  // One line per RESOLVED permission decision (payload `{ toolName,
+  // decision, askOutcome }`). `decision` is allow|deny|ask; `askOutcome` is
+  // "approved"/"denied" for a resolved ask prompt and null for allow/deny
+  // decisions. An ask that never resolves (e.g. the run is killed at the
+  // prompt) writes nothing — only outcomes persist.
+  | "permission"
+  // One line per model response (payload `{ stopReason, model }`), mirrored
+  // from `model_response`. Persists the stop-reason distribution
+  // (end_turn / tool_use / max_tokens / refusal / …) that was previously
+  // trace-bus-only.
+  | "model_meta";
 
 export type Event = {
   readonly ts: number;

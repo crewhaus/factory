@@ -7,6 +7,7 @@ import {
   readFileSync,
   readdirSync,
   realpathSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -63,12 +64,42 @@ import { runChatLoop } from "@crewhaus/runtime-core";
 import { createSessionStore } from "@crewhaus/session-store";
 import { createSkillTool, discoverSkills } from "@crewhaus/skills-registry";
 import { loadCommands } from "@crewhaus/slash-commands";
-import { parseSpec } from "@crewhaus/spec";
+import { type Spec, parseSpec } from "@crewhaus/spec";
 import { spawnSubAgent } from "@crewhaus/sub-agent-spawner";
 import { type RegisteredTool, ToolCatalog } from "@crewhaus/tool-catalog";
 import { registerMcpServer } from "@crewhaus/tool-mcp";
 import { createTaskTool } from "@crewhaus/tool-task";
 import { type CostAccrualEvent, type ProviderId, TraceEventBus } from "@crewhaus/trace-event-bus";
+// Item 15 — `optimize --from-advice` (eval-gated apply of the advisor's
+// SpecPatches: suggestions-file validation, the accept/reject/compose loop
+// with injected compile/eval hooks, decisions.json + write-back stamping),
+// in a side-effect-free module so it is unit-testable (this entry file runs
+// an argv switch on import).
+import {
+  AdviceApplyError,
+  type AdvicePatchDecision,
+  type ParsedAdvicePatch,
+  applyAdvicePatches,
+  assertFromAdviceFlagsCompatible,
+  buildAdviceDecisionsFile,
+  formatAdviceDecisionLine,
+  parseSuggestionsFile,
+  stampAdviceWriteBack,
+} from "./advice-apply";
+// Item 14 — `crewhaus advise` rule library (session-JSONL aggregation +
+// threshold rules + suggestions.json/report.html builders), in a
+// side-effect-free module so it is unit-testable (this entry file runs an
+// argv switch on import).
+import {
+  type AdviceFinding,
+  type SessionEvents,
+  buildAdviceContext,
+  buildSuggestionsFile,
+  formatFindingLines,
+  parseJsonlObjects as parseAdviseJsonl,
+  renderAdviceHtml,
+  runAdviceRules,
+} from "./advise-rules";
 // Item 34 — `crewhaus audit verify` plumbing (anchor-flag parsing + per-check
 // summary + doctor mapping), in a side-effect-free module so it is
 // unit-testable (this entry file runs an argv switch on import).
@@ -126,6 +157,15 @@ import { EVAL_CI_WORKFLOW_RELPATH, buildEvalCiWorkflowYaml } from "./ci-scaffold
 // Item 34 — scheduling ergonomics for `compliance evidence` (--period current
 // resolution + the empty-evidence gate), side-effect-free for the same reason.
 import { findEmptyControls, resolvePeriodFlag } from "./compliance-schedule";
+// Item 17 (completion) — `doctor --context-pressure` (fold persisted
+// recovery/compaction events into the pressure report + command hints), in a
+// side-effect-free module so it is unit-testable (this entry file runs an
+// argv switch on import).
+import {
+  DEFAULT_CONTEXT_PRESSURE_SESSIONS,
+  buildContextPressureReport,
+  formatContextPressureLines,
+} from "./context-pressure";
 // Item 12 — dataset-registry CLI plumbing (the `datasets` subcommand family,
 // `distill --register` promotion, and the `--dataset registry:` shorthand
 // shared by eval + optimize), in a side-effect-free module so it is
@@ -420,6 +460,12 @@ const DOCTOR_SCHEMA: ParseArgsSchema = {
     // Process-liveness only — exit 0 fast, no credential/spec checks. The
     // probe target for container HEALTHCHECKs and k8s exec probes.
     { name: "liveness", takesValue: false },
+    // Item 17 — context-pressure report over recent sessions (truncation
+    // recoveries, compaction fires, snip-vs-autocompact, spec knobs +
+    // advise/optimize command hints). Report, not gate: exit 0 always.
+    { name: "context-pressure", takesValue: false },
+    // How many most-recent sessions --context-pressure scans (default 20).
+    { name: "sessions", takesValue: true },
     { name: "help", short: "h" },
   ],
 };
@@ -439,6 +485,12 @@ const OPTIMIZE_SCHEMA: ParseArgsSchema = {
   flags: [
     { name: "dataset", takesValue: true },
     { name: "graders", takesValue: true },
+    // Item 15 — apply `crewhaus advise` SpecPatches (suggestions.json) via
+    // the eval-gated accept/reject/compose loop instead of running the
+    // mutation search. Mutually exclusive with --mutator/--iterations;
+    // --dataset/--graders/--ratings still resolve as usual (the apply path
+    // needs an eval).
+    { name: "from-advice", takesValue: true },
     // Inline-distill user ratings into the training set (Pillar 2 — close the
     // loop from real feedback). Value: a session id (sess_<16 hex>) or "all".
     // Synthesizes the dataset (and, when --graders is omitted, the graders too).
@@ -538,6 +590,16 @@ const COST_SUMMARY_SCHEMA: ParseArgsSchema = {
     { name: "session", takesValue: true },
     { name: "tenant", takesValue: true },
     { name: "format", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
+const ADVISE_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "session", takesValue: true },
+    { name: "all" },
+    { name: "json" },
+    { name: "out", short: "o", takesValue: true },
     { name: "help", short: "h" },
   ],
 };
@@ -815,6 +877,8 @@ function usageText(): string {
     "  context --bundle [-o <file>]         emit a single-markdown orientation manifest",
     "       [--factory-root <p>] [--docs-root <p>] [--demos-root <p>]",
     "  cost-summary --session <id>          summarize cost_accrual events for a session",
+    "  advise [--session <id> | --all]      mine session logs for spec advice (item 14)",
+    "       [--json] [-o <dir>]             writes suggestions.json + report.html (default .crewhaus/advice)",
     "  rate --session <id> [--turn N]       rate an assistant turn 👍/👎, ⭐, or 0–1",
     "       (--thumbs up|down | --stars 1-5 | --score 0-1) [--comment <t>]",
     "  feedback --session <id> --text <msg> attach a comment/correction to a turn",
@@ -1956,7 +2020,8 @@ function runContext(args: ParsedArgs): void {
 async function runDoctor(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
-      "usage: crewhaus doctor [--philosophy-alignment [--json] [--baseline | --accept-baseline]] [--liveness]\n" +
+      "usage: crewhaus doctor [--philosophy-alignment [--json] [--baseline | --accept-baseline]]\n" +
+        "                       [--liveness] [--context-pressure [--sessions N]]\n" +
         "  --philosophy-alignment   audit the codebase + examples against the three architectural pillars\n" +
         "  --json                   persist findings (stable ids) to .crewhaus/scope-audit/<date>.json\n" +
         "                           and print the snapshot JSON (item 49)\n" +
@@ -1965,6 +2030,14 @@ async function runDoctor(args: ParsedArgs): Promise<void> {
         "  --accept-baseline        promote the current findings to the accepted baseline\n" +
         "  --liveness               process-liveness probe: exit 0 immediately, no credential or\n" +
         "                           spec checks (for container HEALTHCHECKs / k8s exec probes)\n" +
+        "  --context-pressure       report truncation recoveries, compaction fires per session\n" +
+        "                           (snip vs autocompact split), and the cwd spec's max_tokens/\n" +
+        "                           compaction knobs over the last N sessions (--sessions N,\n" +
+        "                           default 20). When the advise thresholds trip, prints the\n" +
+        "                           exact commands that close the tuning loop:\n" +
+        "                             crewhaus advise --all -o . && crewhaus optimize crewhaus.yaml \\\n" +
+        "                               --from-advice suggestions.json --write-back ...\n" +
+        "                           Always exits 0 — a report, not a gate.\n" +
         "\n" +
         "  Credential checks are model-aware: doctor parses the cwd crewhaus.yaml's\n" +
         "  agent.model (claude-*, openai/*, gemini/*, bedrock/*, local/<m>@<url>) and\n" +
@@ -1981,6 +2054,10 @@ async function runDoctor(args: ParsedArgs): Promise<void> {
   }
   if (args.flags["philosophy-alignment"]) {
     await runDoctorPhilosophyAlignment(args);
+    return;
+  }
+  if (args.flags["context-pressure"]) {
+    runDoctorContextPressure(args);
     return;
   }
   // Item 49 — the drift-watch flags only make sense on the philosophy audit.
@@ -2321,6 +2398,55 @@ async function runDoctorPhilosophyAlignment(args: ParsedArgs): Promise<void> {
 }
 
 /**
+ * Item 17 (completion) — `crewhaus doctor --context-pressure` (wiring only;
+ * the fold + formatting live in ./context-pressure). Reads the N most
+ * recent session logs by mtime ("recent" means what ran last — session ids
+ * are random hex, so name order carries no recency), builds the pressure
+ * report against the cwd spec's knobs, and prints it. A report, not a
+ * gate: this path always exits 0 — thresholds tripping print the exact
+ * advise/optimize commands instead of failing doctor.
+ */
+function runDoctorContextPressure(args: ParsedArgs): void {
+  const limit = intFlag(args, "sessions") ?? DEFAULT_CONTEXT_PRESSURE_SESSIONS;
+  if (limit < 1) {
+    die(`invalid --sessions "${args.flags["sessions"]}" — must be a positive integer`);
+  }
+
+  const sessionsDir = join(process.cwd(), ".crewhaus", "sessions");
+  const files = existsSync(sessionsDir)
+    ? readdirSync(sessionsDir).filter((f) => f.endsWith(".jsonl"))
+    : [];
+  const recent = files
+    .map((f) => {
+      const file = join(sessionsDir, f);
+      return { file, sessionId: f.replace(/\.jsonl$/, ""), mtimeMs: statSync(file).mtimeMs };
+    })
+    .sort((a, b) => b.mtimeMs - a.mtimeMs)
+    .slice(0, limit);
+  const sessions: SessionEvents[] = recent.map((r) => ({
+    sessionId: r.sessionId,
+    objects: parseAdviseJsonl(readFileSync(r.file, "utf-8")),
+  }));
+
+  // The cwd spec surfaces the current knobs next to the pressure numbers;
+  // a missing/broken spec degrades to one report line — never a block.
+  let spec: Spec | undefined;
+  const specPath = join(process.cwd(), "crewhaus.yaml");
+  if (existsSync(specPath)) {
+    try {
+      spec = parseSpec(readFileSync(specPath, "utf-8"));
+    } catch {
+      spec = undefined;
+    }
+  }
+
+  const report = buildContextPressureReport(sessions, spec !== undefined ? { spec } : {});
+  for (const line of formatContextPressureLines(report)) {
+    process.stdout.write(`${line}\n`);
+  }
+}
+
+/**
  * Workstream B — `crewhaus optimize <spec> --dataset <data> --graders
  * <graders.yaml> [--mutator rule-based|claude] [--iterations N]
  * [--budget-usd N] [--write-back] [-o <out-dir>]`. Closes the
@@ -2343,7 +2469,8 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
     process.stdout.write(
       "usage: crewhaus optimize <spec.yaml> (--dataset <data> --graders <graders.yaml> | --ratings <session>) " +
         "[--min-score F] [--mutator rule-based|claude] [--iterations N] [--seed N] [--concurrency N] " +
-        "[--improvement-threshold F] [--budget-usd N] [--write-back] [--no-register] [--no-pin-regressions] [--no-retry] [-o <out-dir>]\n" +
+        "[--improvement-threshold F] [--budget-usd N] [--from-advice <suggestions.json>] " +
+        "[--write-back] [--no-register] [--no-pin-regressions] [--no-retry] [-o <out-dir>]\n" +
         "  --dataset takes a file path or registry:<name>[@version][#split] (Section 29 registry;\n" +
         "  default version: latest). A registry record with populated train AND dev splits is\n" +
         "  used as-is; otherwise the selected samples get the inline 70/30 split. The test\n" +
@@ -2369,12 +2496,44 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
         "  A successful --write-back auto-registers the rewritten spec in the local\n" +
         "  registry (.crewhaus/specs) with a changelog entry carrying the run's\n" +
         "  score delta and patch rationale — same flow as `crewhaus compile`;\n" +
-        "  --no-register opts out. See `crewhaus spec log <name>`.\n",
+        "  --no-register opts out. See `crewhaus spec log <name>`.\n" +
+        "  --from-advice <suggestions.json> applies the validated SpecPatches `crewhaus advise`\n" +
+        "  emitted (agent.max_tokens, compaction.curate, …) instead of running the mutation\n" +
+        "  search — mutually exclusive with --mutator/--iterations. Each patch is applied\n" +
+        "  in-memory, compile-gated, and evaluated on the dev split against ONE baseline eval\n" +
+        "  of the unpatched spec. Acceptance: the regression gate must pass (no pass-rate drop,\n" +
+        "  no per-sample pass→fail flip), but strict improvement is NOT required — advisor\n" +
+        "  patches tune config for latency/cost/robustness, so an equal pass rate with zero\n" +
+        "  regressions accepts; the delta is printed and persisted either way. Accepted\n" +
+        "  patches compose (patch k+1 applies on top of the accepted spec); rejected patches\n" +
+        "  are reported with their eval delta. Artifacts land under <out>/advice/ (baseline +\n" +
+        "  per-patch eval dirs, decisions.json, patched.yaml). The source spec is only touched\n" +
+        "  with --write-back (same conventions as the search path: provenance header +\n" +
+        "  auto-register + regression pinning).\n" +
+        "  The nightly advisor loop composes:\n" +
+        "    crewhaus advise --all -o . && \\\n" +
+        "    crewhaus optimize crewhaus.yaml --from-advice suggestions.json --write-back \\\n" +
+        "      --dataset eval/dataset.jsonl --graders eval/graders.yaml\n",
     );
     return;
   }
   const specPath = args.positional[0];
   if (typeof specPath !== "string") die("missing <spec.yaml>");
+  // Item 15 — `--from-advice` replaces the mutation search: the knobs that
+  // steer it have nothing to act on, so the combination is rejected up
+  // front (before any dataset is loaded or eval is paid for).
+  const fromAdviceFlag = strFlag(args, "from-advice");
+  if (fromAdviceFlag !== undefined) {
+    try {
+      assertFromAdviceFlagsCompatible({
+        mutator: typeof args.flags["mutator"] === "string",
+        iterations: typeof args.flags["iterations"] === "string",
+      });
+    } catch (err) {
+      if (err instanceof AdviceApplyError) die(err.message);
+      throw err;
+    }
+  }
   const datasetPath = args.flags["dataset"];
   const gradersPath = args.flags["graders"];
   const ratingsArg = args.flags["ratings"];
@@ -2547,6 +2706,31 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
         `dataset has ${samples.length} samples — need at least 2 (70/30 split needs a dev split)`,
       );
     }
+  }
+
+  // Item 15 — `--from-advice`: the eval-gated apply path for the advisor's
+  // SpecPatches. Branches here because it shares everything above (dataset/
+  // graders/ratings resolution, the dev split, the run dirs) and nothing
+  // below (no mutation search, no fitness fn, no mutator).
+  if (fromAdviceFlag !== undefined) {
+    await runOptimizeFromAdvice({
+      fromAdvicePath: fromAdviceFlag,
+      absSpec,
+      specPath,
+      runId,
+      outDir,
+      compiled,
+      devSet,
+      datasetName,
+      concurrency,
+      seed,
+      retryErrors,
+      writeBack,
+      noRegister: args.flags["no-register"] === true,
+      pinRegressions: args.flags["no-pin-regressions"] !== true,
+      originalById,
+    });
+    return;
   }
 
   // Index the dev set by id so the fitness fn can join each graded
@@ -2786,6 +2970,203 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
   // withheld from the mutator's failure signal above. Empty queue → silent.
   for (const line of formatDatasetFixQueue(datasetFixQueue)) {
     process.stdout.write(`[optimize] ${line}\n`);
+  }
+}
+
+/**
+ * Item 15 — the `optimize --from-advice` body (wiring only; the accept/
+ * reject/compose loop lives in ./advice-apply). Reuses the exact seams the
+ * search path uses: `lower(parseSpec(...))` as the offline compile gate and
+ * one `runEvalLib` pass per candidate over the resolved dev split — then
+ * mirrors the flywheel's applyAccepted conventions on `--write-back`
+ * (provenance header via `stampAdviceWriteBack` → write source → auto-
+ * register + changelog → best-effort regression pinning). Without
+ * `--write-back` the source is never touched: the stamped YAML lands at
+ * `<out>/advice/patched.yaml` next to decisions.json and the eval dirs.
+ */
+async function runOptimizeFromAdvice(opts: {
+  readonly fromAdvicePath: string;
+  readonly absSpec: string;
+  readonly specPath: string;
+  readonly runId: string;
+  readonly outDir: string;
+  readonly compiled: ReadonlyArray<CompiledGrader>;
+  readonly devSet: ReadonlyArray<{ id: string; input: string; expected_output?: string }>;
+  readonly datasetName: string;
+  readonly concurrency: number;
+  readonly seed: number;
+  readonly retryErrors: boolean;
+  readonly writeBack: boolean;
+  readonly noRegister: boolean;
+  readonly pinRegressions: boolean;
+  readonly originalById: ReadonlyMap<string, Sample>;
+}): Promise<void> {
+  const pct = (rate: number): string => `${(rate * 100).toFixed(1)}%`;
+
+  let suggestionsText: string;
+  try {
+    suggestionsText = readFileSync(resolve(opts.fromAdvicePath), "utf-8");
+  } catch (err) {
+    die(`could not read ${opts.fromAdvicePath}: ${(err as Error).message}`);
+  }
+  let patches: ParsedAdvicePatch[];
+  try {
+    patches = parseSuggestionsFile(suggestionsText);
+  } catch (err) {
+    if (err instanceof AdviceApplyError) die(err.message);
+    throw err;
+  }
+  if (patches.length === 0) {
+    process.stdout.write(
+      `[optimize] ${opts.fromAdvicePath} carries no spec patches — nothing to apply (advice-only findings are report-only; see the advise report.html)\n`,
+    );
+    return;
+  }
+
+  const sourceYaml = readFileSync(opts.absSpec, "utf-8");
+  const adviceDir = join(opts.outDir, "advice");
+  mkdirSync(adviceDir, { recursive: true });
+
+  process.stdout.write(
+    `[optimize] runId=${opts.runId} spec=${opts.specPath} dataset=${opts.datasetName} ` +
+      `(${opts.devSet.length} dev) from-advice=${opts.fromAdvicePath} patches=${patches.length}\n`,
+  );
+
+  // Injected seams (see applyAdvicePatches in ./advice-apply): the same
+  // offline parse→lower gate and per-candidate eval pass the search path's
+  // fitness fn uses, persisted under <out>/advice/<label>/.
+  const compileCheck = (yaml: string, _label: string): void => {
+    lower(parseSpec(yaml));
+  };
+  const evalRun = async (label: string, yaml: string) => {
+    const evalIr = lower(parseSpec(yaml));
+    if (evalIr.target !== "cli") {
+      die(`crewhaus optimize --from-advice only supports target: cli (got "${evalIr.target}")`);
+    }
+    const summary = await runEvalLib({
+      ir: evalIr,
+      dataset: { name: opts.datasetName, samples: makeAsyncIterable(opts.devSet) },
+      compiledGraders: opts.compiled,
+      opts: {
+        outDir: join(adviceDir, label),
+        concurrency: opts.concurrency,
+        seed: opts.seed,
+        retryErrors: opts.retryErrors,
+      },
+    });
+    process.stdout.write(
+      `[optimize] ${label} eval: pass_rate=${pct(summary.aggregates.passRate)} ` +
+        `mean_score=${summary.aggregates.meanScore.toFixed(3)} errors=${summary.aggregates.errorCount}\n`,
+    );
+    return summary;
+  };
+
+  let result: Awaited<ReturnType<typeof applyAdvicePatches>>;
+  try {
+    result = await applyAdvicePatches({ sourceYaml, patches, hooks: { compileCheck, evalRun } });
+  } catch (err) {
+    // The baseline compile/eval gate failed — a spec the compiler rejects
+    // (or a dataset that can't run) must die cleanly, like the search path.
+    if (err instanceof CrewhausError) die(err.message);
+    throw err;
+  }
+
+  // decisions.json — the per-patch audit trail (accepted/rejected + reason
+  // + eval delta + eval dir), next to the baseline and patch-NNN eval dirs.
+  const decisionsFile = buildAdviceDecisionsFile({
+    runId: opts.runId,
+    generatedAt: new Date().toISOString(),
+    source: opts.fromAdvicePath,
+    baseline: result.baseline,
+    decisions: result.decisions,
+  });
+  writeFileSync(join(adviceDir, "decisions.json"), JSON.stringify(decisionsFile, null, 2), {
+    mode: 0o600,
+  });
+
+  for (const d of result.decisions) {
+    process.stdout.write(`[optimize] ${formatAdviceDecisionLine(d)}\n`);
+  }
+  process.stdout.write(`[optimize] decisions: ${join(adviceDir, "decisions.json")}\n`);
+
+  if (result.accepted === 0 || result.finalSummary === undefined) {
+    process.stdout.write(
+      `[optimize] 0/${result.decisions.length} advice patches accepted — spec untouched.\n`,
+    );
+    return;
+  }
+
+  const passRateBefore = result.baseline.aggregates.passRate;
+  const passRateAfter = result.finalSummary.aggregates.passRate;
+  const stamped = stampAdviceWriteBack({
+    runId: opts.runId,
+    yaml: result.finalYaml,
+    passRateBefore,
+    passRateAfter,
+    patchesEvaluated: result.decisions.length,
+  });
+  // The composed accepted spec is always persisted as an artifact
+  // (accept-then-write: the source is only touched by --write-back below).
+  writeFileSync(join(adviceDir, "patched.yaml"), stamped, { mode: 0o600 });
+  // Aggregate patch.json so `spec log` provenance (autoRegisterSpecVersion
+  // reads its `rationale`) names what this write-back was.
+  const acceptedDecisions = result.decisions.filter(
+    (d): d is AdvicePatchDecision & { status: "accepted" } => d.status === "accepted",
+  );
+  const acceptedIds = acceptedDecisions.map((d) => d.findingId ?? d.patch.path.join("."));
+  writeFileSync(
+    join(adviceDir, "patch.json"),
+    JSON.stringify(
+      {
+        rationale:
+          `advisor: accepted ${result.accepted}/${result.decisions.length} advice patch(es) ` +
+          `[${acceptedIds.join(", ")}]; pass_rate ${pct(passRateBefore)} → ${pct(passRateAfter)}`,
+        patches: acceptedDecisions.map((d) => d.patch),
+      },
+      null,
+      2,
+    ),
+    { mode: 0o600 },
+  );
+  process.stdout.write(
+    `[optimize] accepted ${result.accepted}/${result.decisions.length} advice patches ` +
+      `(pass_rate ${pct(passRateBefore)} → ${pct(passRateAfter)}, Δ ${((passRateAfter - passRateBefore) * 100).toFixed(1)} pts)\n`,
+  );
+
+  if (!opts.writeBack) {
+    process.stdout.write(
+      `[optimize] patched YAML saved to ${join(adviceDir, "patched.yaml")}. Re-run with --write-back to apply it to the source spec.\n`,
+    );
+    return;
+  }
+
+  // --write-back: the flywheel applyAccepted conventions — stamped source
+  // write, auto-register + changelog, best-effort regression pinning.
+  writeFileSync(opts.absSpec, stamped);
+  process.stdout.write(`[optimize] wrote patched YAML to ${opts.absSpec}\n`);
+  if (!opts.noRegister) {
+    await autoRegisterSpec(stamped, { patchJsonPath: join(adviceDir, "patch.json") });
+  }
+  try {
+    const pin = await pinRecoveriesAfterOptimize({
+      registry: createFileBackedRegistry({ rootDir: defaultDatasetsRoot() }),
+      specName: parseSpec(sourceYaml).name,
+      pin: opts.pinRegressions,
+      baselineRunDir: result.baseline.outDir,
+      candidateRunDir: result.finalSummary.outDir,
+      samplesById: opts.originalById,
+      sourceDataset: opts.datasetName,
+      optimizeRunId: opts.runId,
+    });
+    if (pin !== undefined && pin.pinned > 0) {
+      process.stdout.write(
+        `[optimize] pinned ${pin.pinned} recovered samples → ${pin.suiteName}@${pin.version}\n`,
+      );
+    }
+  } catch (err) {
+    process.stderr.write(
+      `[optimize] regression pinning skipped: ${err instanceof Error ? err.message : String(err)}\n`,
+    );
   }
 }
 
@@ -4241,6 +4622,125 @@ async function runCostSummary(args: ParsedArgs): Promise<void> {
       process.stdout.write(`  ${row.key}: ${formatCacheLine(row.stats, row.savings)}\n`);
     }
   }
+}
+
+// -------- advise: trace-mining spec advisor (item 14) --------
+
+/**
+ * `crewhaus advise [--session <id> | --all] [--json] [-o <dir>]` — build an
+ * AdviceContext from `.crewhaus/sessions` JSONLs (+ `.crewhaus/audit`
+ * records), run the advise-rules library, print ranked findings with
+ * evidence, and write two artifacts into the out dir (default
+ * `.crewhaus/advice`): `suggestions.json` (the validated SpecPatch list a
+ * future `optimize --from-advice` consumes) and a self-contained
+ * `report.html`. With neither `--session` nor `--all`, mines all sessions.
+ *
+ * The spec (for patch suggestions) is the cwd `crewhaus.yaml` per the
+ * standalone-harness convention; a missing or unparseable spec downgrades
+ * patch suggestions to advice text rather than blocking the mining.
+ */
+async function runAdvise(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus advise [--session <id> | --all] [--json] [-o <dir>]\n" +
+        "\n" +
+        "mines .crewhaus/sessions (+ .crewhaus/audit) for spec advice:\n" +
+        "  repeated tool failures, max_tokens truncation pressure, compaction\n" +
+        "  thrash, permission-ask churn, stop-reason anomalies\n" +
+        "\n" +
+        "  --session <id>  mine one session (default: all sessions)\n" +
+        "  --json          print machine-readable findings to stdout\n" +
+        "  -o <dir>        artifact dir for suggestions.json + report.html\n" +
+        "                  (default .crewhaus/advice)\n",
+    );
+    return;
+  }
+  const sessionFlag = strFlag(args, "session");
+  if (sessionFlag !== undefined && args.flags["all"] === true) {
+    die("--session and --all are mutually exclusive");
+  }
+
+  const sessionsDir = join(process.cwd(), ".crewhaus", "sessions");
+  const sessionFiles: string[] = [];
+  if (sessionFlag !== undefined) {
+    const file = join(sessionsDir, `${sessionFlag}.jsonl`);
+    if (!existsSync(file)) die(`session log not found at ${file}`);
+    sessionFiles.push(file);
+  } else {
+    if (!existsSync(sessionsDir)) {
+      die(`no session logs found at ${sessionsDir} — run the agent first, then advise`);
+    }
+    for (const f of readdirSync(sessionsDir).sort()) {
+      if (f.endsWith(".jsonl")) sessionFiles.push(join(sessionsDir, f));
+    }
+    if (sessionFiles.length === 0) {
+      die(`no session logs found at ${sessionsDir} — run the agent first, then advise`);
+    }
+  }
+  const sessions: SessionEvents[] = sessionFiles.map((file) => ({
+    sessionId: basename(file).replace(/\.jsonl$/, ""),
+    objects: parseAdviseJsonl(readFileSync(file, "utf-8")),
+  }));
+
+  // Audit records are optional context (kind counts land in the report's
+  // future rules); a missing dir is the common case and skips silently.
+  const auditDir = join(process.cwd(), ".crewhaus", "audit");
+  const auditObjects: unknown[] = [];
+  if (existsSync(auditDir)) {
+    for (const f of readdirSync(auditDir).sort()) {
+      if (!f.endsWith(".jsonl")) continue;
+      auditObjects.push(...parseAdviseJsonl(readFileSync(join(auditDir, f), "utf-8")));
+    }
+  }
+
+  // The cwd spec enables patch suggestions; without one (or with a broken
+  // one) rules fall back to advice text — mining must not block on it.
+  let spec: Spec | undefined;
+  const specPath = join(process.cwd(), "crewhaus.yaml");
+  if (existsSync(specPath)) {
+    try {
+      spec = parseSpec(readFileSync(specPath, "utf-8"));
+    } catch (err) {
+      process.stderr.write(
+        `[advise] crewhaus.yaml did not parse (${(err as Error).message}) — patch suggestions downgraded to advice\n`,
+      );
+    }
+  }
+
+  const ctx = buildAdviceContext(sessions, auditObjects);
+  const findings: AdviceFinding[] = runAdviceRules(ctx, spec !== undefined ? { spec } : {});
+  const generatedAt = new Date().toISOString();
+  const suggestions = buildSuggestionsFile(findings, ctx.sessionIds, generatedAt);
+
+  const outDir = strFlag(args, "out") ?? join(process.cwd(), ".crewhaus", "advice");
+  mkdirSync(outDir, { recursive: true });
+  const suggestionsPath = join(outDir, "suggestions.json");
+  const reportPath = join(outDir, "report.html");
+  writeFileSync(suggestionsPath, `${JSON.stringify(suggestions, null, 2)}\n`);
+  writeFileSync(
+    reportPath,
+    renderAdviceHtml({ findings, sessionIds: ctx.sessionIds, generatedAt }),
+  );
+
+  if (args.flags["json"] === true) {
+    process.stdout.write(
+      `${JSON.stringify({ sessionIds: ctx.sessionIds, findings, suggestions: suggestions.suggestions })}\n`,
+    );
+    return;
+  }
+  process.stdout.write(
+    `advisor: ${findings.length} finding${findings.length === 1 ? "" : "s"} across ${ctx.sessionIds.length} session${ctx.sessionIds.length === 1 ? "" : "s"}\n`,
+  );
+  if (findings.length === 0) {
+    process.stdout.write("no findings — the mined sessions look healthy\n");
+  }
+  for (const f of findings) {
+    for (const line of formatFindingLines(f)) {
+      process.stdout.write(`${line}\n`);
+    }
+  }
+  process.stdout.write(`[advise] suggestions: ${suggestionsPath}\n`);
+  process.stdout.write(`[advise] report: ${reportPath}\n`);
 }
 
 // -------- response feedback: rate / feedback / distill --------
@@ -6114,6 +6614,9 @@ switch (subcommand) {
     break;
   case "cost-summary":
     await runCostSummary(parseFor(rest, COST_SUMMARY_SCHEMA));
+    break;
+  case "advise":
+    await runAdvise(parseFor(rest, ADVISE_SCHEMA));
     break;
   case "rate":
     await runRate(parseFor(rest, RATE_SCHEMA));

@@ -1,4 +1,5 @@
 import { type CostTracker, createCostTracker, formatUsdMicros } from "@crewhaus/cost-tracker";
+import type { EventLog } from "@crewhaus/event-log";
 import {
   type AttachedMetrics,
   attachIfEnvSet as attachMetricsIfEnvSet,
@@ -293,4 +294,175 @@ export async function attachDefaultSubscribers(
 function logFlushError(runContext: RunContext, name: string, err: unknown): void {
   const message = err instanceof Error ? err.message : String(err);
   runContext.logger.error("observability.flush_failed", { name, message });
+}
+
+// -------- advisor signal persistence (item 14 groundwork) --------
+
+export type AttachedAdvisorPersistence = {
+  unsubscribe: Unsubscribe;
+  /**
+   * Item 14 in-run digest — the one-line stderr summary the runtime prints
+   * at session end when any cheap advisory threshold tripped, or undefined
+   * when the session looks healthy. Counters only: no LLM, no file reads,
+   * nothing heavier than a Map bump per event in the hot path — the real
+   * analysis is `crewhaus advise`'s job, offline.
+   */
+  digestLine(): string | undefined;
+};
+
+/**
+ * Cheap in-run thresholds for the digest tally. Keep in sync with
+ * `DEFAULT_ADVICE_THRESHOLDS` in `apps/cli/src/advise-rules.ts` — the rule
+ * library owns the canonical values, but runtime-core cannot import from
+ * apps/cli, so the digest mirrors them here (a drift only ever means the
+ * nudge line appears/hides slightly off the report; the report itself is
+ * always authoritative).
+ */
+const DIGEST_THRESHOLDS = {
+  toolFailureMinCalls: 5,
+  toolFailureRate: 0.5,
+  truncationContinues: 2,
+  compactions: 3,
+  asksPerTool: 3,
+  stopMinResponses: 4,
+  stopAnomalyRate: 0.25,
+} as const;
+
+/** Stop reasons that are part of healthy operation; everything else
+ *  (max_tokens, refusal, pause_turn, …) counts as anomalous. */
+const CLEAN_STOP_REASONS = new Set(["end_turn", "tool_use", "stop_sequence"]);
+
+/**
+ * Advisor groundwork (items 14/15/17) — mirror the runtime signals that were
+ * previously trace-bus-only into the session JSONL, through the SAME
+ * `event-log` append path the run already writes its transcript with:
+ *
+ *   error_recovered      → `recovery`   { errorName, action, depth }
+ *   tool_call_end        → `tool_stats` { toolName, durationMs, isError }
+ *   permission_decision  → `permission` { toolName, decision, askOutcome }
+ *   model_response       → `model_meta` { stopReason, model }
+ *
+ * Unlike the other `attach*IfEnvSet` subscribers this one is DEFAULT-ON:
+ * the lines are tiny (see the granularity note on the `tool_stats` kind in
+ * `@crewhaus/event-log`) and they are the food `crewhaus advise` mines, so
+ * opting in would starve the advisor on exactly the runs that need it.
+ * Disable with `CREWHAUS_ADVISOR_EVENTS=0` (or `false`).
+ *
+ * Permission mapping detail: a `decision: "ask"` event WITHOUT `askOutcome`
+ * is the pre-prompt publish — skipped here so each ask persists exactly once,
+ * as its resolution (`askOutcome: "approved" | "denied"`). Allow/deny
+ * decisions (including the justification-gate and egress verdicts, which
+ * publish additional `permission_decision` events per call) persist with
+ * `askOutcome: null`.
+ *
+ * `append()` failures must never abort a turn, so — like the cost_accrual
+ * persistence path — the promise result is logged rather than thrown.
+ */
+export function attachAdvisorPersistence(
+  bus: TraceEventBus,
+  eventLog: EventLog,
+  runContext: RunContext,
+  env: NodeJS.ProcessEnv = process.env,
+): AttachedAdvisorPersistence | undefined {
+  const gate = env["CREWHAUS_ADVISOR_EVENTS"];
+  if (gate === "0" || gate === "false") return undefined;
+
+  const persist = (
+    kind: "recovery" | "tool_stats" | "permission" | "model_meta",
+    payload: unknown,
+  ): void => {
+    void eventLog.append({ kind, payload }).catch((err) => {
+      runContext.logger.error("advisor_event.persist_failed", {
+        kind,
+        message: err instanceof Error ? err.message : String(err),
+      });
+    });
+  };
+
+  // In-run digest counters (item 14). Bumped inline in the same handler so
+  // the digest costs nothing beyond the persistence pass itself.
+  const toolTally = new Map<string, { calls: number; errors: number }>();
+  const askTally = new Map<string, { asks: number; approved: number }>();
+  let truncationContinues = 0;
+  let compactions = 0;
+  let responses = 0;
+  let anomalousStops = 0;
+
+  const unsubscribe = bus.subscribe((event: TraceEvent): void => {
+    switch (event.kind) {
+      case "error_recovered": {
+        if (event.action === "continue") truncationContinues += 1;
+        persist("recovery", {
+          errorName: event.errorName,
+          action: event.action,
+          depth: event.depth,
+        });
+        return;
+      }
+      case "tool_call_end": {
+        const tally = toolTally.get(event.toolName) ?? { calls: 0, errors: 0 };
+        tally.calls += 1;
+        if (event.isError) tally.errors += 1;
+        toolTally.set(event.toolName, tally);
+        persist("tool_stats", {
+          toolName: event.toolName,
+          // Whole milliseconds — performance.now() floats add line bytes
+          // without adding advisory signal.
+          durationMs: Math.round(event.durationMs),
+          isError: event.isError,
+        });
+        return;
+      }
+      case "permission_decision": {
+        // Pre-prompt ask publish — the resolution (askOutcome set) follows.
+        if (event.decision === "ask" && event.askOutcome === undefined) return;
+        if (event.decision === "ask" && event.askOutcome !== undefined) {
+          const ask = askTally.get(event.toolName) ?? { asks: 0, approved: 0 };
+          ask.asks += 1;
+          if (event.askOutcome === "approved") ask.approved += 1;
+          askTally.set(event.toolName, ask);
+        }
+        persist("permission", {
+          toolName: event.toolName,
+          decision: event.decision,
+          askOutcome: event.askOutcome ?? null,
+        });
+        return;
+      }
+      case "model_response": {
+        responses += 1;
+        if (!CLEAN_STOP_REASONS.has(event.stopReason)) anomalousStops += 1;
+        persist("model_meta", { stopReason: event.stopReason, model: event.model });
+        return;
+      }
+      case "compaction_fired": {
+        // Already persisted by the runtime as the `compaction` event-log
+        // kind — tallied here for the digest only.
+        compactions += 1;
+        return;
+      }
+      default:
+        return;
+    }
+  });
+
+  const digestLine = (): string | undefined => {
+    const t = DIGEST_THRESHOLDS;
+    let findings = 0;
+    for (const { calls, errors } of toolTally.values()) {
+      if (calls >= t.toolFailureMinCalls && errors / calls >= t.toolFailureRate) findings += 1;
+    }
+    for (const { asks, approved } of askTally.values()) {
+      if (asks >= t.asksPerTool && approved === asks) findings += 1;
+    }
+    if (truncationContinues >= t.truncationContinues) findings += 1;
+    if (compactions >= t.compactions) findings += 1;
+    if (responses >= t.stopMinResponses && anomalousStops / responses >= t.stopAnomalyRate) {
+      findings += 1;
+    }
+    if (findings === 0) return undefined;
+    return `advisor: ${findings} finding${findings === 1 ? "" : "s"} — run \`crewhaus advise --session ${runContext.sessionId}\``;
+  };
+
+  return { unsubscribe, digestLine };
 }
