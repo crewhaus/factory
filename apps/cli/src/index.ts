@@ -14,15 +14,18 @@ import {
 } from "@crewhaus/dataset-registry";
 import { CrewhausError } from "@crewhaus/errors";
 import { type Sample, loadDataset } from "@crewhaus/eval-dataset";
-import { parseGradersConfig } from "@crewhaus/eval-grader";
+import { type CompiledGrader, parseGradersConfig } from "@crewhaus/eval-grader";
 import { optimizeSpec } from "@crewhaus/eval-optimizer-orchestrator";
 import {
   type RunIndexEntry,
+  buildMatrix,
   diffReports,
+  formatUsd,
   hashDatasetFile,
   loadRun,
   readBaselines,
   readRunIndex,
+  renderMatrix,
   renderReport,
   setBaseline,
 } from "@crewhaus/eval-report";
@@ -91,6 +94,18 @@ import {
 // in a side-effect-free module so it is unit-testable (this entry file runs
 // an argv switch on import).
 import { finishEvalRun } from "./eval-history";
+// Item 11 — `eval --models` benchmark matrix: flag parsing/validation, cell
+// slugs, the failure-isolated cell loop, and the cost-tracker pricing seam,
+// in a side-effect-free module so it is unit-testable (this entry file runs
+// an argv switch on import).
+import {
+  MatrixArgError,
+  assertMatrixFlagsCompatible,
+  assignCellSlugs,
+  defaultMatrixPricing,
+  parseModelsFlag,
+  runMatrixCells,
+} from "./eval-matrix";
 // Response-feedback core — pure, side-effect-free so it is unit-testable
 // (this entry file runs an argv switch on import). Powers `rate`/`feedback`
 // (capture) and `distill` (ratings → eval dataset + graders).
@@ -258,6 +273,10 @@ const EVAL_SCHEMA: ParseArgsSchema = {
     { name: "judge-model", takesValue: true },
     { name: "concurrency", takesValue: true },
     { name: "seed", takesValue: true },
+    // Item 11 — benchmark matrix: run the same dataset+graders once per
+    // model; each cell writes to <out>/<model-slug>/. Incompatible with
+    // --gate/--no-promote (cells skip the run-history lineage entirely).
+    { name: "models", takesValue: true },
     { name: "out", short: "o", takesValue: true },
     // Run-history item 3 — exit non-zero when the run regresses against the
     // pinned (spec, dataset) baseline (regression-runner gate, strict
@@ -453,6 +472,9 @@ function usageText(): string {
     "       [--judge-model <model>] [--concurrency N] [--seed N] [-o <out-dir>]",
     "       [--gate]                       exit non-zero on regression vs the pinned baseline",
     "       [--no-promote]                 keep the existing baseline pin after this run",
+    "       [--models <m1,m2,...>]         benchmark matrix: run the dataset once per model",
+    "                                      (cells write to <out>/<model-slug>/; emits matrix.json",
+    "                                      + index.html; incompatible with --gate/--no-promote)",
     "       --dataset also accepts registry:<name>[@version][#split] (Section 29 registry)",
     "  eval-report diff <prev> <new>        compare two eval runs and emit a diff report",
     "       [-o <out-dir>]",
@@ -2049,7 +2071,7 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
     process.stdout.write(
       "usage: crewhaus eval <spec.yaml> --dataset <data> --graders <graders.yaml> " +
         "[--judge-model <model>] [--concurrency N] [--seed N] [-o <out-dir>] " +
-        "[--gate] [--no-promote] [--no-regressions]\n" +
+        "[--gate] [--no-promote] [--no-regressions] [--models <m1,m2,...>]\n" +
         "  --dataset takes a file path (jsonl/csv/yaml/http) or registry:<name>[@version][#split]\n" +
         "  — a Section 29 dataset-registry ref (.crewhaus/datasets, or CREWHAUS_DATASETS_DIR).\n" +
         "  Default version: latest; default samples: the union of all splits (give #train,\n" +
@@ -2068,7 +2090,18 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
         "  --no-regressions skips the union.\n" +
         "  --judge-model accepts the full router grammar (claude-*, openai/<m>, gemini/<m>,\n" +
         "  bedrock/<id>, local/<m>@<url>); the default judge claude-sonnet-4-5 requires\n" +
-        "  Anthropic credentials (ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY)\n",
+        "  Anthropic credentials (ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY)\n" +
+        "  --models <m1,m2,...> runs a benchmark matrix: the SAME dataset (resolved once,\n" +
+        "  regression union included) and graders once per model, patching the spec's\n" +
+        "  agent.model in-memory like `run --model`. Model strings take the full router\n" +
+        "  grammar and are validated before the first cell runs. Each cell writes a full\n" +
+        "  run dir to <out>/<model-slug>/ (default out: .crewhaus/evals/matrix_<id>), so\n" +
+        "  `eval-report diff` works on any pair of cells; the matrix root gets matrix.json\n" +
+        "  + index.html (pass rate, mean score, latency, tokens, projected $/1k samples —\n" +
+        "  unknown pricing shows n/a). Matrix cells skip the run-history index/baselines\n" +
+        "  (they are comparisons, not lineage), so --gate/--no-promote are rejected. A\n" +
+        "  cell that crashes (bad credentials, 404 model) records an error row and the\n" +
+        "  remaining cells still run; the command then exits non-zero.\n",
     );
     return;
   }
@@ -2081,6 +2114,24 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
   if (typeof gradersPath !== "string") die("missing --graders <graders.yaml>");
   const gateRequested = args.flags["gate"] === true;
   const promote = args.flags["no-promote"] !== true;
+
+  // Item 11 — `--models` benchmark matrix. Validate the flag combo and every
+  // model string (full router grammar) up front: a typo in model 3 must fail
+  // before cell 1 burns tokens.
+  const modelsFlag = args.flags["models"];
+  let matrixModels: string[] | undefined;
+  if (typeof modelsFlag === "string") {
+    try {
+      assertMatrixFlagsCompatible({
+        gate: gateRequested,
+        noPromote: args.flags["no-promote"] === true,
+      });
+      matrixModels = parseModelsFlag(modelsFlag);
+    } catch (err) {
+      if (err instanceof MatrixArgError) die(err.message);
+      throw err;
+    }
+  }
 
   const concurrencyFlag = args.flags["concurrency"];
   const seedFlag = args.flags["seed"];
@@ -2190,6 +2241,25 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
     );
   }
 
+  // Item 11 — matrix mode: everything above (spec lowering, graders, item-12
+  // registry resolution, item-9 regression union) ran ONCE, so every model
+  // sees the identical sample set. The matrix path never reaches the item-3
+  // finishEvalRun flow below.
+  if (matrixModels !== undefined) {
+    return runEvalMatrixCommand({
+      ir,
+      models: matrixModels,
+      datasetName: dataset.name,
+      samples: await collectSamples(dataset.samples),
+      datasetHash,
+      compiled,
+      ...(typeof outDirArg === "string" ? { outDirArg } : {}),
+      ...(concurrency !== undefined ? { concurrency } : {}),
+      ...(seed !== undefined ? { seed } : {}),
+      ...(typeof judgeModelFlag === "string" ? { judgeModel: judgeModelFlag } : {}),
+    });
+  }
+
   const outDest =
     typeof outDirArg === "string" ? resolve(outDirArg) : join(".crewhaus", "evals", "<runId>");
   process.stdout.write(`[eval] running ${dataset.name}: ${compiled.length} graders → ${outDest}\n`);
@@ -2235,6 +2305,89 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
   });
   if (finish.gateFailed) {
     die(`eval --gate: ${finish.gateReason ?? "regression gate failed"}`);
+  }
+}
+
+/**
+ * Item 11 — `eval --models` matrix execution: one cell per model over the
+ * already-resolved sample set, each patching the lowered ir's `agent.model`
+ * in-memory (the same one-line substitution `run --model` does) and writing
+ * a full run dir to `<root>/<model-slug>/`. Cells deliberately skip the
+ * item-3 finishEvalRun index/baseline/gate flow — they are comparisons, not
+ * lineage runs. One cell crashing records an error row and the loop
+ * continues; ANY crashed cell maps to a non-zero exit after the matrix is
+ * rendered (distinct from cells that ran with failing samples, which is a
+ * normal result).
+ */
+async function runEvalMatrixCommand(opts: {
+  readonly ir: Extract<ReturnType<typeof lower>, { target: "cli" }>;
+  readonly models: ReadonlyArray<string>;
+  readonly datasetName: string;
+  readonly samples: ReadonlyArray<Sample>;
+  readonly datasetHash: string;
+  readonly compiled: ReadonlyArray<CompiledGrader>;
+  readonly outDirArg?: string;
+  readonly concurrency?: number;
+  readonly seed?: number;
+  readonly judgeModel?: string;
+}): Promise<void> {
+  const rootDir =
+    typeof opts.outDirArg === "string"
+      ? resolve(opts.outDirArg)
+      : resolve(join(".crewhaus", "evals", `matrix_${randomBytes(8).toString("hex")}`));
+  mkdirSync(rootDir, { recursive: true });
+  process.stdout.write(
+    `[eval] matrix: ${opts.models.length} models × ${opts.samples.length} samples ` +
+      `(${opts.datasetName}) → ${rootDir}\n`,
+  );
+
+  const cells = await runMatrixCells({
+    models: opts.models,
+    slugs: assignCellSlugs(opts.models),
+    rootDir,
+    runCell: async (model, cellOutDir) => {
+      const summary = await runEvalLib({
+        ir: { ...opts.ir, agent: { ...opts.ir.agent, model } },
+        dataset: { name: opts.datasetName, samples: makeAsyncIterable(opts.samples) },
+        compiledGraders: opts.compiled,
+        opts: {
+          outDir: cellOutDir,
+          datasetHash: opts.datasetHash,
+          ...(opts.concurrency !== undefined ? { concurrency: opts.concurrency } : {}),
+          ...(opts.seed !== undefined ? { seed: opts.seed } : {}),
+          ...(opts.judgeModel !== undefined ? { judgeModel: opts.judgeModel } : {}),
+        },
+      });
+      // Same per-cell artifact set as a single-model run (results.json +
+      // index.html), so `eval-report diff <cellA> <cellB>` works on any pair.
+      writeFileSync(join(cellOutDir, "index.html"), renderReport(await loadRun(cellOutDir)).html);
+      return summary;
+    },
+  });
+
+  const matrix = buildMatrix(cells, { pricing: defaultMatrixPricing() });
+  const rendered = renderMatrix(matrix);
+  writeFileSync(join(rootDir, "matrix.json"), rendered.json);
+  writeFileSync(join(rootDir, "index.html"), rendered.html);
+
+  writeTable(
+    ["model", "status", "pass_rate", "mean_score", "p95_latency", "est_$/1k"],
+    matrix.rows.map((r) => [
+      r.model,
+      r.status === "ok" ? "ok" : "ERROR",
+      r.passRate !== undefined ? `${(r.passRate * 100).toFixed(1)}%` : "n/a",
+      r.meanScore !== undefined ? r.meanScore.toFixed(3) : "n/a",
+      r.p95LatencyMs !== undefined ? `${Math.round(r.p95LatencyMs)}ms` : "n/a",
+      r.costPer1kSamplesUsd !== undefined ? formatUsd(r.costPer1kSamplesUsd) : "n/a",
+    ]),
+  );
+  process.stdout.write(`[eval] matrix json: ${join(rootDir, "matrix.json")}\n`);
+  process.stdout.write(`[eval] matrix report: ${join(rootDir, "index.html")}\n`);
+
+  const crashed = matrix.rows.filter((r) => r.status === "error");
+  if (crashed.length > 0) {
+    const names = crashed.map((r) => r.model).join(", ");
+    die(`eval --models: ${crashed.length}/${matrix.rows.length} cell(s) failed to run: ${names}`);
   }
 }
 

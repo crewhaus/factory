@@ -40,6 +40,7 @@
     "@crewhaus/compiler": "workspace:*",
     "@crewhaus/computer-use-driver": "workspace:*",
     "@crewhaus/context-bundle": "workspace:*",
+    "@crewhaus/cost-tracker": "workspace:*",
     "@crewhaus/dataset-registry": "workspace:*",
     "@crewhaus/deployment-controller": "workspace:*",
     "@crewhaus/egress-classifier": "workspace:*",

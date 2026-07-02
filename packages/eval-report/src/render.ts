@@ -38,6 +38,8 @@ summary { padding: 12px 16px; cursor: pointer; user-select: none; }
 .recovery-row { background: rgba(76, 175, 80, 0.08); }
 .score-bar { display: inline-block; width: 60px; height: 8px; background: #2a2d33; border-radius: 4px; vertical-align: middle; margin-right: 8px; }
 .score-bar > span { display: block; height: 100%; background: var(--pass); border-radius: 4px; }
+.best { color: var(--pass); font-weight: 600; }
+.na { color: var(--muted); }
 `;
 
 const SCRIPT = `
@@ -64,7 +66,7 @@ const SCRIPT = `
 })();
 `;
 
-function escapeHtml(s: string): string {
+export function escapeHtml(s: string): string {
   return s
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
@@ -73,7 +75,7 @@ function escapeHtml(s: string): string {
     .replace(/'/g, "&#39;");
 }
 
-function shell(title: string, body: string): string {
+export function shell(title: string, body: string): string {
   return `<!doctype html>
 <html><head>
 <meta charset="utf-8">

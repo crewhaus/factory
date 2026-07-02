@@ -17,6 +17,20 @@
 export { loadRun, type LoadedRun } from "./load";
 export { renderReport } from "./render";
 export { diffReports, type ReportDiff, type DiffEntry } from "./diff";
+// Matrix mode (item 11): fold per-model cells from `crewhaus eval --models`
+// into matrix.json + a best-per-metric-highlighted HTML table. Pricing is
+// injected via `MatrixPricingFn` to keep this package dependency-free.
+export {
+  type BuildMatrixOptions,
+  type MatrixBest,
+  type MatrixCell,
+  type MatrixPricingFn,
+  type MatrixRow,
+  type ModelMatrix,
+  buildMatrix,
+  formatUsd,
+  renderMatrix,
+} from "./matrix";
 export { ReportError } from "./errors";
 export {
   BASELINES_FILENAME,
