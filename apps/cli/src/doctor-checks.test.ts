@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { buildCredentialChecks, extractSpecModel, selectedProvider } from "./doctor-checks";
+import {
+  buildChannelEnvChecks,
+  buildCredentialChecks,
+  extractSpecModel,
+  selectedProvider,
+} from "./doctor-checks";
 
 const yamlFor = (model: string): string =>
   `name: t\ntarget: cli\nagent:\n  model: ${model}\n  instructions: hi\n`;
@@ -118,5 +123,53 @@ describe("buildCredentialChecks — no spec model (legacy fallback)", () => {
     expect(checks[0]?.pass).toBe(true);
     expect(checks[0]?.warn).toBe(true);
     expect(checks[0]?.reason).toContain("OpenAI");
+  });
+});
+
+// Item 61 — channel-target env checks (buildChannelEnvChecks lowers the cwd
+// spec and only contributes checks when it is a channel IR).
+const CHANNEL_YAML = `
+name: support-bot
+target: channel
+agent:
+  model: claude-sonnet-4-6
+  instructions: Answer briefly.
+channels:
+  slack:
+    botToken: $SLACK_BOT_TOKEN
+    signingSecret: $SLACK_SIGNING_SECRET
+  telegram:
+    botToken: $TELEGRAM_BOT_TOKEN
+    secretToken: inline-literal-secret
+routing:
+  sessionKey: channel
+`;
+
+describe("buildChannelEnvChecks (item 61)", () => {
+  test("non-channel specs and unparseable text contribute no checks", () => {
+    expect(buildChannelEnvChecks(yamlFor("claude-sonnet-4-6"), {})).toEqual([]);
+    expect(buildChannelEnvChecks(":::not yaml at all", {})).toEqual([]);
+  });
+
+  test("one check per configured platform; env-refs asserted, literals exempt", () => {
+    const checks = buildChannelEnvChecks(CHANNEL_YAML, {
+      SLACK_BOT_TOKEN: "xoxb-x",
+      SLACK_SIGNING_SECRET: "s",
+      TELEGRAM_BOT_TOKEN: "123:t",
+    });
+    expect(checks).toHaveLength(2);
+    expect(checks[0]?.label).toContain("Slack channel env");
+    expect(checks[0]?.pass).toBe(true);
+    // secretToken is an inline literal — only the botToken env-ref is listed.
+    expect(checks[1]?.label).toBe("Telegram channel env (TELEGRAM_BOT_TOKEN)");
+    expect(checks[1]?.pass).toBe(true);
+  });
+
+  test("missing env-refs fail with the unset names and the channel-verify pointer", () => {
+    const checks = buildChannelEnvChecks(CHANNEL_YAML, { SLACK_BOT_TOKEN: "xoxb-x" });
+    const slack = checks.find((c) => c.label.includes("Slack"));
+    expect(slack?.pass).toBe(false);
+    expect(slack?.reason).toContain("$SLACK_SIGNING_SECRET");
+    expect(slack?.reason).toContain("crewhaus channel verify");
   });
 });

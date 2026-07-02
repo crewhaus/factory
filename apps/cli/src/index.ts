@@ -52,13 +52,41 @@ import {
   resolveAnchorFlag,
   summarizeVerifyResult,
 } from "./audit-verify";
+// Item 61 — `crewhaus channel provision|verify` core (adapter-derived Slack
+// manifest, Telegram setWebhook, Discord interactions-endpoint registration,
+// doctor-style scope/webhook probes), in a side-effect-free module so it is
+// unit-testable (this entry file runs an argv switch on import).
+import {
+  ChannelApiError,
+  type ChannelCheck,
+  InvalidBaseUrlError,
+  InvalidPlatformFlagError,
+  SLACK_MANIFEST_FILENAME,
+  buildDiscordProvision,
+  buildSlackManifest,
+  buildTelegramProvision,
+  describeVerifyProbes,
+  discordNextSteps,
+  joinBaseUrl,
+  performDiscordProvision,
+  performTelegramSetWebhook,
+  renderSlackManifestYaml,
+  resolvePlatformsFlag,
+  slackNextSteps,
+  summarizeChannelChecks,
+  verifyDiscordChannel,
+  verifySlackChannel,
+  verifyTelegramChannel,
+} from "./channel-provision";
 // Item 34 — scheduling ergonomics for `compliance evidence` (--period current
 // resolution + the empty-evidence gate), side-effect-free for the same reason.
 import { findEmptyControls, resolvePeriodFlag } from "./compliance-schedule";
 // Model-aware doctor credential checks (provider parsed from the cwd spec's
 // agent.model via the model-router grammar), in a side-effect-free module so
 // it is unit-testable (this entry file runs an argv switch on import).
-import { buildCredentialChecks, extractSpecModel } from "./doctor-checks";
+// Item 61 added the channel-target env check (only fires when the cwd spec
+// lowers to a channel IR).
+import { buildChannelEnvChecks, buildCredentialChecks, extractSpecModel } from "./doctor-checks";
 // FR-006 — Pillar 3 sink-side egress-matcher selection (the substring/semantic
 // selector lowered to ir.security.egressMatcher). Side-effect-free + lazily
 // imports the optional semantic package only when "semantic" is selected, so
@@ -440,6 +468,19 @@ const SECURITY_SCHEMA: ParseArgsSchema = {
   ],
 };
 
+const CHANNEL_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // Item 61 — `channel provision|verify` platform selection + daemon origin.
+    { name: "platform", takesValue: true },
+    { name: "base-url", takesValue: true },
+    // provision only: directory the Slack manifest YAML is written into.
+    { name: "out", short: "o", takesValue: true },
+    // print every network call (redacted) without performing it.
+    { name: "dry-run", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
 const SECRETS_SCHEMA: ParseArgsSchema = {
   flags: [
     { name: "backend", takesValue: true },
@@ -575,6 +616,13 @@ function usageText(): string {
     "       [--dry-run] [--dir <root>]",
     "  security digest [--since 7d|30d|ISO] triage rollup of denials/egress/injection from .crewhaus stores (item 48)",
     "       [--format text|json|html] [-o <dir>] [--notify <url>] [--dir <root>]",
+    "  channel provision <spec.yaml>        one-command platform app setup for a channel spec (item 61):",
+    "       --base-url <public-url>         slack app manifest YAML, telegram setWebhook, discord",
+    "       [--platform slack|telegram|discord|all]  interactions endpoint + invite URL",
+    "       [-o <dir>] [--dry-run]",
+    "  channel verify <spec.yaml>           scope doctor: slack auth.test + granted scopes,",
+    "       [--platform ...] [--dry-run]    telegram getWebhookInfo, discord application fetch",
+    "       [--base-url <public-url>]       (exit 1 on missing scopes / mismatched webhook)",
     "  version                              print the CLI version (also: --version, -v)",
     "",
   ].join("\n");
@@ -1604,15 +1652,24 @@ async function runDoctor(args: ParsedArgs): Promise<void> {
   // the legacy Anthropic-first check when no model is extractable. See
   // doctor-checks.ts for the full policy (bedrock/local are informational).
   const specPath = join(process.cwd(), "crewhaus.yaml");
-  let specModel: string | undefined;
+  let specText: string | undefined;
   if (existsSync(specPath)) {
     try {
-      specModel = extractSpecModel(readFileSync(specPath, "utf-8"));
+      specText = readFileSync(specPath, "utf-8");
     } catch {
-      specModel = undefined;
+      specText = undefined;
     }
   }
+  const specModel = specText !== undefined ? extractSpecModel(specText) : undefined;
   checks.push(...buildCredentialChecks(specModel, process.env));
+
+  // Item 61 — channel-target env checks: only when the cwd spec lowers to a
+  // channel IR (other shapes contribute nothing), one check per configured
+  // slack/telegram/discord platform asserting its required secret env-refs
+  // are set. Live platform probes live in `crewhaus channel verify`.
+  if (specText !== undefined) {
+    checks.push(...buildChannelEnvChecks(specText, process.env));
+  }
 
   const bunCheck = checkBunVersion(Bun.version);
   checks.push({
@@ -3920,6 +3977,247 @@ async function runSecurityDigest(args: ParsedArgs): Promise<void> {
   }
 }
 
+/**
+ * Item 61 — `crewhaus channel provision|verify <spec.yaml>`: one-command
+ * platform-side setup + scope doctor for channel-target specs. Everything is
+ * derived from the spec + the adapters' actual API usage (see
+ * channel-provision.ts for the per-platform derivations and the two design
+ * decisions: Slack is emit-and-instruct only because the manifest API needs
+ * an app configuration token the adapter/spec never carry, and Discord
+ * registers the interactions endpoint — its adapter is webhook-based, not
+ * gateway-websocket-based — but not application commands, because the spec
+ * declares no command list and the adapter routes any command name).
+ *
+ * `--dry-run` prints every network call with secrets redacted (env-refs as
+ * `$NAME`, inline literals as `[redacted]`) and performs nothing.
+ */
+async function runChannel(args: ParsedArgs, action: "provision" | "verify"): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus channel provision <spec.yaml> --base-url <public-url>\n" +
+        "                                  [--platform slack|telegram|discord|all] [-o <dir>] [--dry-run]\n" +
+        "       crewhaus channel verify <spec.yaml> [--platform slack|telegram|discord|all]\n" +
+        "                                  [--base-url <public-url>] [--dry-run]\n" +
+        "\n" +
+        "  provision — platform-side app setup derived from the spec + compiled daemon:\n" +
+        "    slack     write <dir>/slack-app-manifest.yaml (the bot scopes + event\n" +
+        "              subscriptions the adapter actually needs; request URL =\n" +
+        "              <base-url>/slack/events) and print the console steps. No --apply:\n" +
+        "              Slack's manifest API needs an app *configuration* token, which\n" +
+        "              neither the adapter nor the spec carries.\n" +
+        "    telegram  CALL setWebhook with url = <base-url>/telegram/events and the\n" +
+        "              spec's secretToken (the exact value the adapter verifies on every\n" +
+        "              inbound POST via X-Telegram-Bot-Api-Secret-Token).\n" +
+        "    discord   PATCH applications/@me interactions_endpoint_url =\n" +
+        "              <base-url>/discord/events (start the daemon first — Discord\n" +
+        "              validates the endpoint live) and print the invite URL with\n" +
+        "              adapter-derived permission bits. Slash commands are NOT\n" +
+        "              auto-registered: the spec declares no command list and the\n" +
+        "              adapter routes any command name to the agent.\n" +
+        "  verify — doctor-style probes, ✓/~/✗ per check, exit 1 on hard failures:\n" +
+        "    slack     auth.test + granted scopes (x-oauth-scopes) vs the needed set\n" +
+        "    telegram  getWebhookInfo url / allowed_updates / pending updates / last error\n" +
+        "    discord   applications/@me id / verify_key / interactions endpoint\n" +
+        "  --base-url  the daemon's publicly reachable origin (required for provision;\n" +
+        "              on verify it upgrades the webhook-URL checks from ~ to ✓/✗)\n" +
+        "  --dry-run   print every network call (secrets redacted) without performing it\n",
+    );
+    return;
+  }
+  const specPath = args.positional[0];
+  if (typeof specPath !== "string") die("missing <spec.yaml>");
+  const absSpec = resolve(specPath);
+  let yamlText: string;
+  try {
+    yamlText = readFileSync(absSpec, "utf-8");
+  } catch (err) {
+    die(`could not read ${absSpec}: ${(err as Error).message}`);
+  }
+  let ir: ReturnType<typeof lower>;
+  try {
+    ir = lower(parseSpec(yamlText));
+  } catch (err) {
+    // parseSpec throws SpecParseError; lower() can throw CompilerError — both
+    // extend CrewhausError, so render as a clean one-liner.
+    if (err instanceof CrewhausError) die(err.message);
+    throw err;
+  }
+  if (ir.target !== "channel") {
+    die(
+      `channel ${action} requires a channel-target spec (got target "${ir.target}") — the platform config lives in the spec's channels block`,
+    );
+  }
+
+  const platformFlag = args.flags["platform"];
+  let selection: ReturnType<typeof resolvePlatformsFlag>;
+  try {
+    selection = resolvePlatformsFlag(
+      typeof platformFlag === "string" ? platformFlag : undefined,
+      ir.channels,
+    );
+  } catch (err) {
+    if (err instanceof InvalidPlatformFlagError) die(err.message);
+    throw err;
+  }
+  for (const p of selection.unsupported) {
+    process.stdout.write(
+      `note: channels.${p} is configured but \`channel ${action}\` does not support it yet (slack|telegram|discord)\n`,
+    );
+  }
+
+  const dryRun = args.flags["dry-run"] === true;
+  const baseUrlFlag = args.flags["base-url"];
+  const baseUrl = typeof baseUrlFlag === "string" ? baseUrlFlag : undefined;
+  if (baseUrl !== undefined) {
+    try {
+      joinBaseUrl(baseUrl, "/");
+    } catch (err) {
+      if (err instanceof InvalidBaseUrlError) die(err.message);
+      throw err;
+    }
+  }
+  const channelReactions = ir.feedback?.channelReactions === true;
+
+  if (action === "provision") {
+    if (baseUrl === undefined) {
+      die(
+        "missing --base-url <public-url> — the daemon's publicly reachable origin (e.g. https://bot.example.com); every platform points at a route under it (slack request_url, telegram webhook url, discord interactions endpoint)",
+      );
+    }
+    const outFlag = args.flags["out"];
+    const outDir = typeof outFlag === "string" ? resolve(outFlag) : process.cwd();
+    process.stdout.write(
+      `channel provision: ${ir.name} (${selection.platforms.join(", ")})${dryRun ? " (dry run)" : ""}\n`,
+    );
+
+    for (const platform of selection.platforms) {
+      if (platform === "slack" && ir.channels.slack !== undefined) {
+        const manifest = buildSlackManifest({ name: ir.name, channelReactions }, baseUrl);
+        const manifestYaml = renderSlackManifestYaml(manifest);
+        const manifestPath = join(outDir, SLACK_MANIFEST_FILENAME);
+        process.stdout.write("\nslack:\n");
+        if (dryRun) {
+          process.stdout.write(`  would write ${manifestPath}:\n`);
+          for (const line of manifestYaml.trimEnd().split("\n")) {
+            process.stdout.write(`    ${line}\n`);
+          }
+        } else {
+          mkdirSync(outDir, { recursive: true });
+          writeFileSync(manifestPath, manifestYaml);
+          process.stdout.write(`  wrote ${manifestPath}\n`);
+        }
+        for (const line of slackNextSteps(ir.channels.slack, manifestPath)) {
+          process.stdout.write(`  ${line}\n`);
+        }
+      }
+
+      if (platform === "telegram" && ir.channels.telegram !== undefined) {
+        const provision = buildTelegramProvision(ir.channels.telegram, baseUrl, process.env);
+        process.stdout.write("\ntelegram:\n");
+        if (dryRun) {
+          process.stdout.write(`  would POST ${provision.display.endpoint}\n`);
+          process.stdout.write(`  payload: ${JSON.stringify(provision.display.payload)}\n`);
+          if (provision.missingEnv.length > 0) {
+            process.stdout.write(
+              `  note: a live run needs ${provision.missingEnv.map((m) => `$${m.envName}`).join(", ")} set\n`,
+            );
+          }
+        } else if (provision.missingEnv.length > 0) {
+          die(
+            `channel provision (telegram): unset env: ${provision.missingEnv
+              .map((m) => `${m.label} → $${m.envName}`)
+              .join(", ")} — export them (or use --dry-run to print the call)`,
+          );
+        } else {
+          try {
+            const description = await performTelegramSetWebhook(provision);
+            process.stdout.write(`  ✓ setWebhook: ${description}\n`);
+            process.stdout.write(
+              `    url ${provision.display.payload.url}, secret_token ${provision.display.payload.secret_token}, allowed_updates ${provision.display.payload.allowed_updates.join("/")}\n`,
+            );
+          } catch (err) {
+            if (err instanceof ChannelApiError) die(err.message);
+            throw err;
+          }
+        }
+      }
+
+      if (platform === "discord" && ir.channels.discord !== undefined) {
+        const provision = buildDiscordProvision(ir.channels.discord, baseUrl, process.env);
+        process.stdout.write("\ndiscord:\n");
+        if (dryRun) {
+          process.stdout.write(
+            `  would PATCH ${provision.display.endpoint} (Authorization: ${provision.display.authorization})\n`,
+          );
+          process.stdout.write(`  payload: ${JSON.stringify(provision.display.payload)}\n`);
+          if (provision.missingEnv.length > 0) {
+            process.stdout.write(
+              `  note: a live run needs ${provision.missingEnv.map((m) => `$${m.envName}`).join(", ")} set\n`,
+            );
+          }
+          for (const line of discordNextSteps(provision.display.inviteUrl)) {
+            process.stdout.write(`  ${line}\n`);
+          }
+        } else if (provision.missingEnv.length > 0) {
+          die(
+            `channel provision (discord): unset env: ${provision.missingEnv
+              .map((m) => `${m.label} → $${m.envName}`)
+              .join(", ")} — export them (or use --dry-run to print the call)`,
+          );
+        } else {
+          try {
+            await performDiscordProvision(provision);
+            process.stdout.write(
+              `  ✓ interactions endpoint set to ${provision.display.payload.interactions_endpoint_url}\n`,
+            );
+          } catch (err) {
+            if (err instanceof ChannelApiError) die(err.message);
+            throw err;
+          }
+          for (const line of discordNextSteps(provision.inviteUrl ?? provision.display.inviteUrl)) {
+            process.stdout.write(`  ${line}\n`);
+          }
+        }
+      }
+    }
+    return;
+  }
+
+  // action === "verify"
+  process.stdout.write(
+    `channel verify: ${ir.name} (${selection.platforms.join(", ")})${dryRun ? " (dry run)" : ""}\n`,
+  );
+  if (dryRun) {
+    for (const platform of selection.platforms) {
+      for (const line of describeVerifyProbes(platform, ir.channels, process.env)) {
+        process.stdout.write(`  ${line}\n`);
+      }
+    }
+    return;
+  }
+  const verifyOpts = {
+    env: process.env,
+    ...(baseUrl !== undefined ? { baseUrl } : {}),
+  };
+  const checks: ChannelCheck[] = [];
+  for (const platform of selection.platforms) {
+    if (platform === "slack" && ir.channels.slack !== undefined) {
+      checks.push(
+        ...(await verifySlackChannel(ir.channels.slack, { channelReactions }, verifyOpts)),
+      );
+    } else if (platform === "telegram" && ir.channels.telegram !== undefined) {
+      checks.push(...(await verifyTelegramChannel(ir.channels.telegram, verifyOpts)));
+    } else if (platform === "discord" && ir.channels.discord !== undefined) {
+      checks.push(...(await verifyDiscordChannel(ir.channels.discord, verifyOpts)));
+    }
+  }
+  const summary = summarizeChannelChecks(checks);
+  for (const line of summary.lines) {
+    process.stdout.write(`  ${line}\n`);
+  }
+  process.exit(summary.exitCode);
+}
+
 const argv = process.argv.slice(2);
 const subcommand = argv[0] ?? "";
 const rest = argv.slice(1);
@@ -4064,6 +4362,14 @@ switch (subcommand) {
       die(`security action must be "digest" (got "${action}")`);
     }
     await runSecurityDigest(parseFor(rest.slice(1), SECURITY_SCHEMA));
+    break;
+  }
+  case "channel": {
+    const action = rest[0] ?? "";
+    if (action !== "provision" && action !== "verify") {
+      die(`channel action must be "provision" or "verify" (got "${action}")`);
+    }
+    await runChannel(parseFor(rest.slice(1), CHANNEL_SCHEMA), action);
     break;
   }
   case "version":

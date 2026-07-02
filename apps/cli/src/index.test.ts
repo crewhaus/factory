@@ -22,6 +22,7 @@ const REPO_ROOT = join(import.meta.dir, "../../..");
 const HELLO_SPEC = join(REPO_ROOT, "apps/cli/test-fixtures/minimal-cli/crewhaus.yaml");
 const BROWSER_SPEC = join(REPO_ROOT, "apps/cli/test-fixtures/minimal-browser/crewhaus.yaml");
 const VOICE_SPEC = join(REPO_ROOT, "apps/cli/test-fixtures/minimal-voice/crewhaus.yaml");
+const CHANNEL_SPEC = join(REPO_ROOT, "apps/cli/test-fixtures/minimal-channel/crewhaus.yaml");
 
 type RunResult = {
   exitCode: number;
@@ -1650,5 +1651,125 @@ describe("crewhaus spec auto-register + changelog (item 46)", () => {
     const log = await runCli(["spec", "log", "hello"], { cwd: tmp });
     expect(log.exitCode).toBe(0);
     expect(log.stdout).not.toContain("sk-live");
+  });
+});
+
+// Item 61 — `crewhaus channel provision|verify` wiring. Everything here is
+// network-free: dry-run prints redacted calls, the slack path only writes a
+// manifest file, and the no-env verify fails on env-ref resolution BEFORE
+// any probe would fire.
+describe("crewhaus channel provision|verify (item 61)", () => {
+  test("usage lists the channel subcommand", async () => {
+    const result = await runCli(["--help"]);
+    expect(result.stdout).toContain("channel provision <spec.yaml>");
+    expect(result.stdout).toContain("channel verify <spec.yaml>");
+  });
+
+  test("unknown channel action exits 1 with the allowed set", async () => {
+    const result = await runCli(["channel", "frobnicate"]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('channel action must be "provision" or "verify"');
+  });
+
+  test("a non-channel spec is refused", async () => {
+    const result = await runCli([
+      "channel",
+      "provision",
+      HELLO_SPEC,
+      "--base-url",
+      "https://bot.example.com",
+    ]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("requires a channel-target spec");
+    expect(result.stderr).toContain('"cli"');
+  });
+
+  test("provision requires --base-url", async () => {
+    const result = await runCli(["channel", "provision", CHANNEL_SPEC]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("missing --base-url");
+  });
+
+  test("provision --dry-run prints every platform call with secrets redacted", async () => {
+    const result = await runCli([
+      "channel",
+      "provision",
+      CHANNEL_SPEC,
+      "--base-url",
+      "https://bot.example.com",
+      "--dry-run",
+      "-o",
+      tmp,
+    ]);
+    expect(result.exitCode).toBe(0);
+    // slack: manifest preview + emit-and-instruct (no --apply).
+    expect(result.stdout).toContain("would write");
+    expect(result.stdout).toContain('request_url: "https://bot.example.com/slack/events"');
+    expect(result.stdout).toContain("app *configuration* token");
+    // telegram: the exact setWebhook call, token + secret redacted.
+    expect(result.stdout).toContain(
+      "would POST https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/setWebhook",
+    );
+    expect(result.stdout).toContain('"secret_token":"$TELEGRAM_SECRET_TOKEN"');
+    expect(result.stdout).toContain('"url":"https://bot.example.com/telegram/events"');
+    // discord: interactions endpoint PATCH + invite URL with derived bits.
+    expect(result.stdout).toContain("would PATCH https://discord.com/api/v10/applications/@me");
+    expect(result.stdout).toContain(
+      '"interactions_endpoint_url":"https://bot.example.com/discord/events"',
+    );
+    expect(result.stdout).toContain("permissions=274877910016");
+    // dry-run writes nothing.
+    expect(existsSync(join(tmp, "slack-app-manifest.yaml"))).toBe(false);
+  });
+
+  test("provision --platform slack writes the manifest file (no network involved)", async () => {
+    const result = await runCli([
+      "channel",
+      "provision",
+      CHANNEL_SPEC,
+      "--platform",
+      "slack",
+      "--base-url",
+      "https://bot.example.com",
+      "-o",
+      tmp,
+    ]);
+    expect(result.exitCode).toBe(0);
+    const manifestPath = join(tmp, "slack-app-manifest.yaml");
+    expect(result.stdout).toContain(`wrote ${manifestPath}`);
+    const manifest = readFileSync(manifestPath, "utf-8");
+    expect(manifest).toContain('- "chat:write"');
+    expect(manifest).toContain('- "reactions:read"');
+    expect(manifest).toContain('- "reaction_added"');
+    expect(manifest).toContain('request_url: "https://bot.example.com/slack/events"');
+    // The instructions point the operator at the spec's env refs.
+    expect(result.stdout).toContain("$SLACK_BOT_TOKEN");
+    expect(result.stdout).toContain("$SLACK_SIGNING_SECRET");
+  });
+
+  test("verify --dry-run prints redacted probes and performs nothing", async () => {
+    const result = await runCli(["channel", "verify", CHANNEL_SPEC, "--dry-run"]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("would POST https://slack.com/api/auth.test");
+    expect(result.stdout).toContain(
+      "would GET https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/getWebhookInfo",
+    );
+    expect(result.stdout).toContain("would GET https://discord.com/api/v10/applications/@me");
+  });
+
+  test("verify without the secret env exits 1 on env-ref checks (no probes fire)", async () => {
+    const result = await runCli(["channel", "verify", CHANNEL_SPEC]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout).toContain("✗");
+    expect(result.stdout).toContain("$SLACK_BOT_TOKEN");
+    expect(result.stdout).toContain("$TELEGRAM_BOT_TOKEN");
+    expect(result.stdout).toContain("$DISCORD_BOT_TOKEN");
+    expect(result.stdout).toMatch(/\d+ check\(s\), \d+ failed/);
+  });
+
+  test("--platform must be configured in the spec", async () => {
+    const result = await runCli(["channel", "verify", CHANNEL_SPEC, "--platform", "matrix"]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("expected one of: slack, telegram, discord, all");
   });
 });
