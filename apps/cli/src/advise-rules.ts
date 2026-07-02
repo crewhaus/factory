@@ -100,7 +100,10 @@ export function parseJsonlObjects(text: string): unknown[] {
 
 type LoggedLine = { kind?: unknown; payload?: unknown };
 
-function payloadOf(obj: unknown, kind: string): Record<string, unknown> | undefined {
+/** Tolerantly read a session-JSONL line's payload when its `kind` matches —
+ *  the canonical defensive accessor shared with `context-pressure.ts`
+ *  (`doctor --context-pressure` folds the same persisted events). */
+export function payloadOf(obj: unknown, kind: string): Record<string, unknown> | undefined {
   if (obj === null || typeof obj !== "object") return undefined;
   const line = obj as LoggedLine;
   if (line.kind !== kind) return undefined;

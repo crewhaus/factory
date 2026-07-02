@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import type { SubAgentDefinition } from "@crewhaus/agent-context-isolation";
 import { SpecParseError, compile, lower } from "@crewhaus/compiler";
@@ -104,6 +104,15 @@ import {
 // Item 34 — scheduling ergonomics for `compliance evidence` (--period current
 // resolution + the empty-evidence gate), side-effect-free for the same reason.
 import { findEmptyControls, resolvePeriodFlag } from "./compliance-schedule";
+// Item 17 (completion) — `doctor --context-pressure` (fold persisted
+// recovery/compaction events into the pressure report + command hints), in a
+// side-effect-free module so it is unit-testable (this entry file runs an
+// argv switch on import).
+import {
+  DEFAULT_CONTEXT_PRESSURE_SESSIONS,
+  buildContextPressureReport,
+  formatContextPressureLines,
+} from "./context-pressure";
 // Item 12 — dataset-registry CLI plumbing (the `datasets` subcommand family,
 // `distill --register` promotion, and the `--dataset registry:` shorthand
 // shared by eval + optimize), in a side-effect-free module so it is
@@ -324,6 +333,12 @@ const DOCTOR_SCHEMA: ParseArgsSchema = {
     // Process-liveness only — exit 0 fast, no credential/spec checks. The
     // probe target for container HEALTHCHECKs and k8s exec probes.
     { name: "liveness", takesValue: false },
+    // Item 17 — context-pressure report over recent sessions (truncation
+    // recoveries, compaction fires, snip-vs-autocompact, spec knobs +
+    // advise/optimize command hints). Report, not gate: exit 0 always.
+    { name: "context-pressure", takesValue: false },
+    // How many most-recent sessions --context-pressure scans (default 20).
+    { name: "sessions", takesValue: true },
     { name: "help", short: "h" },
   ],
 };
@@ -1698,10 +1713,18 @@ function runContext(args: ParsedArgs): void {
 async function runDoctor(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
-      "usage: crewhaus doctor [--philosophy-alignment] [--liveness]\n" +
+      "usage: crewhaus doctor [--philosophy-alignment] [--liveness] [--context-pressure [--sessions N]]\n" +
         "  --philosophy-alignment   audit the codebase + examples against the three architectural pillars\n" +
         "  --liveness               process-liveness probe: exit 0 immediately, no credential or\n" +
         "                           spec checks (for container HEALTHCHECKs / k8s exec probes)\n" +
+        "  --context-pressure       report truncation recoveries, compaction fires per session\n" +
+        "                           (snip vs autocompact split), and the cwd spec's max_tokens/\n" +
+        "                           compaction knobs over the last N sessions (--sessions N,\n" +
+        "                           default 20). When the advise thresholds trip, prints the\n" +
+        "                           exact commands that close the tuning loop:\n" +
+        "                             crewhaus advise --all -o . && crewhaus optimize crewhaus.yaml \\\n" +
+        "                               --from-advice suggestions.json --write-back ...\n" +
+        "                           Always exits 0 — a report, not a gate.\n" +
         "\n" +
         "  Credential checks are model-aware: doctor parses the cwd crewhaus.yaml's\n" +
         "  agent.model (claude-*, openai/*, gemini/*, bedrock/*, local/<m>@<url>) and\n" +
@@ -1718,6 +1741,10 @@ async function runDoctor(args: ParsedArgs): Promise<void> {
   }
   if (args.flags["philosophy-alignment"]) {
     await runDoctorPhilosophyAlignment();
+    return;
+  }
+  if (args.flags["context-pressure"]) {
+    runDoctorContextPressure(args);
     return;
   }
 
@@ -1926,6 +1953,55 @@ async function runDoctorPhilosophyAlignment(): Promise<void> {
       : `\nphilosophy alignment: ${findings.filter((f) => !f.pass).length} finding(s). See [/AGENTS.md](AGENTS.md) for invariants.\n`,
   );
   process.exit(allPass ? 0 : 1);
+}
+
+/**
+ * Item 17 (completion) — `crewhaus doctor --context-pressure` (wiring only;
+ * the fold + formatting live in ./context-pressure). Reads the N most
+ * recent session logs by mtime ("recent" means what ran last — session ids
+ * are random hex, so name order carries no recency), builds the pressure
+ * report against the cwd spec's knobs, and prints it. A report, not a
+ * gate: this path always exits 0 — thresholds tripping print the exact
+ * advise/optimize commands instead of failing doctor.
+ */
+function runDoctorContextPressure(args: ParsedArgs): void {
+  const limit = intFlag(args, "sessions") ?? DEFAULT_CONTEXT_PRESSURE_SESSIONS;
+  if (limit < 1) {
+    die(`invalid --sessions "${args.flags["sessions"]}" — must be a positive integer`);
+  }
+
+  const sessionsDir = join(process.cwd(), ".crewhaus", "sessions");
+  const files = existsSync(sessionsDir)
+    ? readdirSync(sessionsDir).filter((f) => f.endsWith(".jsonl"))
+    : [];
+  const recent = files
+    .map((f) => {
+      const file = join(sessionsDir, f);
+      return { file, sessionId: f.replace(/\.jsonl$/, ""), mtimeMs: statSync(file).mtimeMs };
+    })
+    .sort((a, b) => b.mtimeMs - a.mtimeMs)
+    .slice(0, limit);
+  const sessions: SessionEvents[] = recent.map((r) => ({
+    sessionId: r.sessionId,
+    objects: parseAdviseJsonl(readFileSync(r.file, "utf-8")),
+  }));
+
+  // The cwd spec surfaces the current knobs next to the pressure numbers;
+  // a missing/broken spec degrades to one report line — never a block.
+  let spec: Spec | undefined;
+  const specPath = join(process.cwd(), "crewhaus.yaml");
+  if (existsSync(specPath)) {
+    try {
+      spec = parseSpec(readFileSync(specPath, "utf-8"));
+    } catch {
+      spec = undefined;
+    }
+  }
+
+  const report = buildContextPressureReport(sessions, spec !== undefined ? { spec } : {});
+  for (const line of formatContextPressureLines(report)) {
+    process.stdout.write(`${line}\n`);
+  }
 }
 
 /**
