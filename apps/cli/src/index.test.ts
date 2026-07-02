@@ -730,6 +730,29 @@ describe("crewhaus optimize --budget-usd", () => {
     expect(result.stdout).toContain("--budget-usd");
   });
 
+  // F4 — the fitness evals silently inherited the runner's retry with no
+  // opt-out; `--no-retry` is now a real flag (threaded into every fitness
+  // runEval call) and documented in the help text.
+  test("optimize accepts --no-retry (parses past the flag; fails later on the missing graders file)", async () => {
+    const dataset = join(tmp, "dataset.jsonl");
+    writeFileSync(dataset, '{"id":"q1","input":"hi","expected_output":"hi"}');
+    const missingGraders = join(tmp, "does-not-exist-graders.yaml");
+    const result = await runCli(
+      ["optimize", HELLO_SPEC, "--no-retry", "--dataset", dataset, "--graders", missingGraders],
+      { env: { ANTHROPIC_API_KEY: "test-no-call" } },
+    );
+    expect(result.exitCode).toBe(1);
+    // Pre-fix parseArgs died here with `unknown flag: --no-retry`.
+    expect(result.stderr).not.toContain("unknown flag");
+    expect(result.stderr).toContain("could not read");
+  });
+
+  test("optimize --help documents --no-retry", async () => {
+    const result = await runCli(["optimize", "--help"]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("--no-retry");
+  });
+
   test("a rule-based optimize run reports $0 spend + iterations-cap stop in report.json, with the budget forwarded", async () => {
     // Creds-gated: the fitness function runs the real agent (eval-runner),
     // so without an Anthropic token the SDK call would block. Skip in that
@@ -1503,6 +1526,118 @@ describe("crewhaus retention (item 35)", () => {
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("overlaps the live store");
     expect(existsSync(join(tmp, ".crewhaus", "sessions", "sess_1111111111111111.json"))).toBe(true);
+  });
+});
+
+describe("crewhaus build-image — digest recording wiring (item 47)", () => {
+  /**
+   * A fake `docker` on PATH: `buildx build` succeeds; `buildx imagetools
+   * inspect` is scripted per test and touches a marker file so tests can
+   * assert whether a digest lookup happened at all. The push test uses the
+   * inspect-FAILURE path (warning, exit 0) so the suite never mutates the
+   * repo's real docker/digests.json — the successful record round-trip is
+   * covered at the package seam in @crewhaus/docker-images' tests.
+   */
+  function installFakeDocker(dir: string, inspectExit: number): { bin: string; marker: string } {
+    const bin = join(dir, "fakebin");
+    const marker = join(dir, "inspect-called");
+    mkdirSync(bin, { recursive: true });
+    const script = [
+      "#!/bin/bash",
+      'if [ "$1" = "buildx" ] && [ "$2" = "build" ]; then exit 0; fi',
+      'if [ "$1" = "buildx" ] && [ "$2" = "imagetools" ] && [ "$3" = "inspect" ]; then',
+      `  touch "${marker}"`,
+      `  if [ ${inspectExit} -eq 0 ]; then echo "Digest: sha256:${"b".repeat(64)}"; fi`,
+      `  exit ${inspectExit}`,
+      "fi",
+      "exit 1",
+    ].join("\n");
+    writeFileSync(join(bin, "docker"), `${script}\n`, { mode: 0o755 });
+    return { bin, marker };
+  }
+
+  test("--no-record builds without touching the digests lockfile", async () => {
+    const { bin, marker } = installFakeDocker(tmp, 0);
+    const result = await runCli(["build-image", "cli", "--tag", "t1", "--no-record"], {
+      env: { PATH: `${bin}:${process.env["PATH"] ?? ""}` },
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("built crewhaus/cli:t1");
+    expect(result.stdout).not.toContain("recorded");
+    // stderr must carry no build-image output. Unrelated environment noise
+    // (e.g. adapter-anthropic's claude-CLI-version fallback warning on
+    // machines without the claude binary) is tolerated.
+    expect(result.stderr).not.toContain("build-image");
+    expect(result.stderr).not.toContain("digest");
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  // F2 regression: a local (--load) build records NOTHING — the local image
+  // ID is a config digest, not a pullable registry digest — and the CLI says
+  // so with an info line instead of warning or writing an unpullable pin.
+  test("a local build (no --push) records nothing, skips digest inspection, and prints the info line", async () => {
+    const { bin, marker } = installFakeDocker(tmp, 0);
+    const result = await runCli(["build-image", "cli", "--tag", "t2"], {
+      env: { PATH: `${bin}:${process.env["PATH"] ?? ""}` },
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("built crewhaus/cli:t2");
+    expect(result.stdout).toContain(
+      "local image ID is not a registry digest — use --push to record a pullable digest",
+    );
+    expect(result.stdout).not.toContain("recorded sha256:");
+    // stderr must carry no build-image output (environment noise tolerated —
+    // see the --no-record test above).
+    expect(result.stderr).not.toContain("build-image");
+    expect(result.stderr).not.toContain("digest");
+    // No digest lookup of any kind happened for the --load build.
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  test("recording is default-on for --push: a failed registry digest lookup warns but does not fail the build", async () => {
+    const { bin, marker } = installFakeDocker(tmp, 1);
+    const result = await runCli(["build-image", "cli", "--tag", "t3", "--push"], {
+      env: { PATH: `${bin}:${process.env["PATH"] ?? ""}` },
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("built crewhaus/cli:t3");
+    expect(result.stderr).toContain("digest was not recorded");
+    // The lookup went to the registry (imagetools inspect), not the local store.
+    expect(existsSync(marker)).toBe(true);
+  });
+
+  test("--help documents --no-record and the pushed-digests-only contract", async () => {
+    const result = await runCli(["build-image", "--help"]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("--no-record");
+    expect(result.stdout).toContain("registry\n               manifest digest");
+    expect(result.stdout).toContain("Local (--load) builds record nothing");
+  });
+});
+
+describe("crewhaus compile --check — flag surface (item 33)", () => {
+  // The check pipeline itself (assertion selection, install/boot behind an
+  // injectable runner, verdict mapping) is covered in compile-check.test.ts;
+  // these pin the CLI wiring without hitting the network.
+  test("--check rejects --emit-ir (nothing emitted to verify)", async () => {
+    const result = await runCli(["compile", HELLO_SPEC, "--emit-ir", "--check", "-o", tmp]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("--check");
+    expect(result.stderr).toContain("--emit-ir");
+  });
+
+  test("compile --help documents --check", async () => {
+    const result = await runCli(["compile", "--help"]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("--check");
+    expect(result.stdout).toContain("liveness");
+  });
+
+  test("plain compile is unaffected — no verdict line without --check", async () => {
+    const result = await runCli(["compile", HELLO_SPEC, "-o", tmp]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).not.toContain("compile --check:");
+    expect(existsSync(join(tmp, "package.json"))).toBe(false);
   });
 });
 

@@ -8,7 +8,7 @@
  * + JSON shape rather than stdout strings.
  */
 import { afterAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -29,9 +29,12 @@ afterAll(() => {
   for (const dir of TMP_ROOTS) rmSync(dir, { recursive: true, force: true });
 });
 
-async function runCli(args: ReadonlyArray<string>): Promise<{ exitCode: number }> {
+async function runCli(
+  args: ReadonlyArray<string>,
+  cwd: string = REPO_ROOT,
+): Promise<{ exitCode: number }> {
   const proc = Bun.spawn([process.execPath, CLI_PATH, ...args], {
-    cwd: REPO_ROOT,
+    cwd,
     env: {
       PATH: process.env["PATH"] ?? "",
       // CREWHAUS_EVAL_STUB short-circuits the runner to use a deterministic
@@ -126,5 +129,82 @@ describe("crewhaus eval CLI integration (T3)", () => {
   test("eval-report rejects unknown action", async () => {
     const result = await runCli(["eval-report", "bogus"]);
     expect(result.exitCode).toBe(1);
+  });
+});
+
+describe("crewhaus eval-report history/baseline (run-history item 3)", () => {
+  // stdout assertions are avoided (see note at the top of this file) —
+  // assert on exit codes and on-disk side effects instead.
+
+  function indexEntry(runId: string): string {
+    return `${JSON.stringify({
+      runId,
+      specName: "concierge",
+      specHash: "abc123",
+      datasetName: "smoke",
+      datasetHash: "d".repeat(64),
+      passRate: 0.8,
+      meanScore: 0.75,
+      sampleCount: 5,
+      ts: "2026-07-01T00:00:00.000Z",
+      outDir: `/abs/evals/${runId}`,
+    })}\n`;
+  }
+
+  test("history exits 0 with no index and with filters", async () => {
+    const root = newTempRoot();
+    expect((await runCli(["eval-report", "history"], root)).exitCode).toBe(0);
+    mkdirSync(join(root, ".crewhaus", "evals"), { recursive: true });
+    writeFileSync(
+      join(root, ".crewhaus", "evals", "index.jsonl"),
+      indexEntry("run_aaaa1111aaaa1111"),
+    );
+    expect((await runCli(["eval-report", "history"], root)).exitCode).toBe(0);
+    expect(
+      (await runCli(["eval-report", "history", "--spec", "concierge", "--dataset", "smoke"], root))
+        .exitCode,
+    ).toBe(0);
+  });
+
+  test("baseline show exits 0 with no pins", async () => {
+    const root = newTempRoot();
+    expect((await runCli(["eval-report", "baseline", "show"], root)).exitCode).toBe(0);
+  });
+
+  test("baseline set pins a recorded run into baselines.json", async () => {
+    const root = newTempRoot();
+    const evalsDir = join(root, ".crewhaus", "evals");
+    mkdirSync(evalsDir, { recursive: true });
+    writeFileSync(
+      join(evalsDir, "index.jsonl"),
+      indexEntry("run_aaaa1111aaaa1111") + indexEntry("run_bbbb2222bbbb2222"),
+    );
+    const result = await runCli(["eval-report", "baseline", "set", "run_aaaa1111aaaa1111"], root);
+    expect(result.exitCode).toBe(0);
+    const baselines = JSON.parse(readFileSync(join(evalsDir, "baselines.json"), "utf-8"));
+    expect(baselines["concierge::smoke"]).toMatchObject({
+      runId: "run_aaaa1111aaaa1111",
+      specName: "concierge",
+      datasetName: "smoke",
+      outDir: "/abs/evals/run_aaaa1111aaaa1111",
+    });
+    // `baseline show` over the pin still exits 0.
+    expect((await runCli(["eval-report", "baseline", "show"], root)).exitCode).toBe(0);
+  });
+
+  test("baseline set rejects a runId absent from the index", async () => {
+    const root = newTempRoot();
+    const result = await runCli(["eval-report", "baseline", "set", "run_ffff9999ffff9999"], root);
+    expect(result.exitCode).toBe(1);
+  });
+
+  test("baseline set rejects a missing runId argument", async () => {
+    const root = newTempRoot();
+    expect((await runCli(["eval-report", "baseline", "set"], root)).exitCode).toBe(1);
+  });
+
+  test("baseline rejects unknown sub-action", async () => {
+    const root = newTempRoot();
+    expect((await runCli(["eval-report", "baseline", "bogus"], root)).exitCode).toBe(1);
   });
 });

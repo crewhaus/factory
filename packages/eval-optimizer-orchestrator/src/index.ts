@@ -149,6 +149,19 @@ export type OptimizeSpecResult = {
    * AND the gate tripped before the iterations cap.
    */
   readonly stoppedReason: StoppedReason;
+  /**
+   * Item 9 — persisted eval-run directory of the BASELINE (candidate-0)
+   * fitness measurement. Present only when the caller's fitness fn
+   * reports it via `FitnessResult.runDir` — the CLI's does (it persists
+   * one eval-runner run per candidate under
+   * `.crewhaus/optimize/<runId>/evals/`). The CLI's post-accept
+   * regression pinning diffs this run against {@link bestEvalDir} to
+   * extract the fail→pass recoveries the accepted patch bought.
+   */
+  readonly baselineEvalDir?: string;
+  /** Item 9 — persisted eval-run directory of the winning candidate's
+   *  measurement (see {@link baselineEvalDir}). */
+  readonly bestEvalDir?: string;
 };
 
 /**
@@ -362,6 +375,10 @@ export async function optimizeSpec(opts: OptimizeSpecOptions): Promise<OptimizeS
     trajectory: result.trajectory,
     spend,
     stoppedReason,
+    // Item 9 — surface the baseline/winner eval-run dirs (when the fitness
+    // fn reported them) for post-accept regression pinning.
+    ...(result.baseRunDir !== undefined ? { baselineEvalDir: result.baseRunDir } : {}),
+    ...(result.bestRunDir !== undefined ? { bestEvalDir: result.bestRunDir } : {}),
   };
 }
 

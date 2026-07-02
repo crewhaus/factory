@@ -23,8 +23,12 @@
  *
  * Both tracks are gated on `ANTHROPIC_AUTH_TOKEN` (OAuth) or
  * `ANTHROPIC_API_KEY`. The main CI matrix runs key-free (tests skip
- * cleanly); the opt-in `Smoke (runtime)` workflow exports the secret
- * and flips skip → fail via `CREWHAUS_RUNTIME_SMOKE_REQUIRED=1`.
+ * cleanly); the `Smoke (runtime)` workflow (nightly cron + dispatch +
+ * the release gate via workflow_call) exports the secret and flips
+ * skip → fail via `CREWHAUS_RUNTIME_SMOKE_REQUIRED=1`. Cost knob:
+ * `CREWHAUS_SMOKE_MODEL` (see `resolveSmokeModel`) overrides the
+ * fixtures' models so the unattended nightly pins the cheapest capable
+ * model.
  */
 import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -68,6 +72,19 @@ export function runtimeSmokeIsEnabled(env: NodeJS.ProcessEnv = process.env): boo
   if (oauth !== undefined && oauth !== "") return true;
   if (apiKey !== undefined && apiKey !== "" && apiKey !== "test-no-call") return true;
   return false;
+}
+
+/**
+ * Optional model override for smoke runs — the nightly workflow's budget
+ * knob (item 33). When set, `CREWHAUS_SMOKE_MODEL` (or the explicit
+ * `opts.model` a caller passes) is forwarded to `crewhaus run --model <m>`,
+ * overriding each fixture's default model so an unattended schedule can pin
+ * the cheapest capable model. Empty string behaves like unset, so
+ * `CREWHAUS_SMOKE_MODEL=""` in a workflow env block is inert.
+ */
+export function resolveSmokeModel(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const model = env["CREWHAUS_SMOKE_MODEL"];
+  return model === undefined || model === "" ? undefined : model;
 }
 
 /**
@@ -196,6 +213,8 @@ function assistantTexts(events: ReadonlyArray<{ kind: string; payload: unknown }
 export async function runCliRuntimeSmoke(
   opts: {
     timeoutMs?: number;
+    /** Overrides the fixture's model (defaults to CREWHAUS_SMOKE_MODEL when set). */
+    model?: string;
   } = {},
 ): Promise<RuntimeSmokeResult> {
   if (!runtimeSmokeIsEnabled()) {
@@ -225,13 +244,23 @@ export async function runCliRuntimeSmoke(
     if (oauth !== undefined && oauth !== "") env["ANTHROPIC_AUTH_TOKEN"] = oauth;
     if (apiKey !== undefined && apiKey !== "") env["ANTHROPIC_API_KEY"] = apiKey;
 
-    const proc = Bun.spawn([process.execPath, CLI_PATH, "run", fixture], {
-      cwd: REPO_ROOT,
-      env,
-      stdin: "pipe",
-      stdout: "pipe",
-      stderr: "pipe",
-    });
+    const model = opts.model ?? resolveSmokeModel();
+    const proc = Bun.spawn(
+      [
+        process.execPath,
+        CLI_PATH,
+        "run",
+        fixture,
+        ...(model !== undefined ? ["--model", model] : []),
+      ],
+      {
+        cwd: REPO_ROOT,
+        env,
+        stdin: "pipe",
+        stdout: "pipe",
+        stderr: "pipe",
+      },
+    );
 
     // Write the single prompt then close stdin. The REPL's `you>` loop
     // races each rl.question against a closed-stdin signal, so EOF makes
@@ -296,6 +325,8 @@ export async function runCliRuntimeSmoke(
 export async function runBrowserRuntimeSmoke(
   opts: {
     timeoutMs?: number;
+    /** Overrides the fixture's model (defaults to CREWHAUS_SMOKE_MODEL when set). */
+    model?: string;
   } = {},
 ): Promise<RuntimeSmokeResult> {
   if (!runtimeSmokeIsEnabled()) {
@@ -324,13 +355,25 @@ export async function runBrowserRuntimeSmoke(
     if (oauth !== undefined && oauth !== "") env["ANTHROPIC_AUTH_TOKEN"] = oauth;
     if (apiKey !== undefined && apiKey !== "") env["ANTHROPIC_API_KEY"] = apiKey;
 
-    const proc = Bun.spawn([process.execPath, CLI_PATH, "run", fixture, "--prompt", prompt], {
-      cwd: REPO_ROOT,
-      env,
-      stdin: "ignore",
-      stdout: "pipe",
-      stderr: "pipe",
-    });
+    const model = opts.model ?? resolveSmokeModel();
+    const proc = Bun.spawn(
+      [
+        process.execPath,
+        CLI_PATH,
+        "run",
+        fixture,
+        ...(model !== undefined ? ["--model", model] : []),
+        "--prompt",
+        prompt,
+      ],
+      {
+        cwd: REPO_ROOT,
+        env,
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+      },
+    );
 
     const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     const timer = setTimeout(() => proc.kill("SIGKILL"), timeoutMs);

@@ -217,6 +217,67 @@ describe("prompt-optimizer — per-sample grades (FitnessResult) threading", () 
   });
 });
 
+describe("prompt-optimizer — item 9 FitnessResult.runDir tracking", () => {
+  test("optimize surfaces the base and winning best's eval-run dirs", async () => {
+    // Each measurement reports a distinct persisted dir; the loop must
+    // return candidate-0's dir as baseRunDir and the best's as bestRunDir.
+    let call = 0;
+    const fitness: FitnessFn = async (prompt) => {
+      call += 1;
+      return {
+        score: prompt.includes("cite") ? 1 : 0.25,
+        runDir: `/runs/eval-${call}`,
+      };
+    };
+    // Iteration 1 improves; iteration 2 is a no-op rewrite (worse-or-equal).
+    const mutator = new CapturingMutator((p, i) => (i === 1 ? `${p} (cite)` : p));
+    const samples = [sample("q0", "q0", "a0")];
+    const result = await optimize("answer", {
+      trainSet: samples,
+      devSet: samples,
+      fitness,
+      mutator,
+      iterations: 2,
+    });
+    expect(result.baseRunDir).toBe("/runs/eval-1");
+    // Call 2 (iteration 1) produced the winner; call 3 didn't beat it.
+    expect(result.bestRunDir).toBe("/runs/eval-2");
+    expect(result.best.score).toBe(1);
+  });
+
+  test("a bare-number fitness leaves both run dirs undefined (back-compat)", async () => {
+    const samples = [sample("q0", "q0", "a0")];
+    const result = await optimize("answer", {
+      trainSet: samples,
+      devSet: samples,
+      fitness: async (prompt) => prompt.length / 100,
+      iterations: 2,
+      seed: 0x42,
+    });
+    expect(result.baseRunDir).toBeUndefined();
+    expect(result.bestRunDir).toBeUndefined();
+  });
+
+  test("no improving iteration → bestRunDir stays the base measurement's dir", async () => {
+    let call = 0;
+    const fitness: FitnessFn = async () => {
+      call += 1;
+      return { score: 0.5, runDir: `/runs/eval-${call}` };
+    };
+    const mutator = new CapturingMutator((p) => p);
+    const samples = [sample("q0", "q0", "a0")];
+    const result = await optimize("answer", {
+      trainSet: samples,
+      devSet: samples,
+      fitness,
+      mutator,
+      iterations: 2,
+    });
+    expect(result.baseRunDir).toBe("/runs/eval-1");
+    expect(result.bestRunDir).toBe("/runs/eval-1");
+  });
+});
+
 describe("prompt-optimizer — FR-003 ProviderMutation.usage is optional", () => {
   test("RuleBasedMutationProvider.next() leaves usage undefined (no model call)", async () => {
     const provider = new RuleBasedMutationProvider({ seed: 0x42 });

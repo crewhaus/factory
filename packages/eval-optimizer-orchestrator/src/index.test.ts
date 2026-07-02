@@ -613,3 +613,58 @@ describe("optimizeSpec — provider-aware budget pricing (FR-003)", () => {
     expect((perCall[0] as CostAccrualEvent).costUsdMicros).toBe(10_500);
   });
 });
+
+describe("optimizeSpec — item 9 baseline/best eval-run dirs", () => {
+  test("surfaces baselineEvalDir + bestEvalDir when the fitness fn reports runDir", async () => {
+    const specPath = join(tmpRoot, "crewhaus.yaml");
+    writeFileSync(specPath, CLI_YAML);
+
+    // Mirror the CLI's fitness fn: each measurement persists an eval run
+    // and reports where. Longer prompts score higher, so the base prompt
+    // is call 1 and the winner is some later call.
+    let call = 0;
+    const dirs: string[] = [];
+    const fitness = async (prompt: string) => {
+      call += 1;
+      const runDir = join(tmpRoot, "evals", `${call}`);
+      dirs.push(runDir);
+      return { score: prompt.length / 100, runDir };
+    };
+
+    const result = await optimizeSpec({
+      specPath,
+      fitness,
+      trainSet: [{ id: "t1", input: "x", expected_output: "y" }],
+      devSet: [{ id: "d1", input: "x", expected_output: "y" }],
+      iterations: 3,
+      seed: 42,
+      outDir: join(tmpRoot, "out"),
+    });
+
+    expect(result.applied).toBe(true);
+    // Candidate-0's measurement is always the first fitness call.
+    expect(result.baselineEvalDir).toBe(dirs[0] as string);
+    // The winner improved over the base, so its dir is a later call's —
+    // and one this run actually reported.
+    expect(result.bestEvalDir).not.toBe(dirs[0] as string);
+    expect(dirs).toContain(result.bestEvalDir as string);
+  });
+
+  test("dirs stay undefined for fitness fns that don't report runDir (back-compat)", async () => {
+    const specPath = join(tmpRoot, "crewhaus.yaml");
+    writeFileSync(specPath, CLI_YAML);
+
+    const result = await optimizeSpec({
+      specPath,
+      fitness: async (prompt: string) => prompt.length / 100,
+      trainSet: [{ id: "t1", input: "x", expected_output: "y" }],
+      devSet: [{ id: "d1", input: "x", expected_output: "y" }],
+      iterations: 2,
+      seed: 42,
+      outDir: join(tmpRoot, "out"),
+    });
+
+    expect(result.baselineEvalDir).toBeUndefined();
+    expect(result.bestEvalDir).toBeUndefined();
+  });
+});
