@@ -26,8 +26,15 @@ const baseIr: IrBatchV0 = {
 };
 
 describe("emitBatchWorker", () => {
-  test("emits a single agent.ts file (T1 bundle structure)", () => {
+  test("emits agent.ts plus the generated README.md (T1 bundle structure, item 42)", () => {
     const bundle = emitBatchWorker(baseIr);
+    expect(bundle.files).toHaveLength(2);
+    expect(bundle.files[0]?.path).toBe("agent.ts");
+    expect(bundle.files[1]?.path).toBe("README.md");
+  });
+
+  test("readme: false restores the single-file bundle (item 42 opt-out)", () => {
+    const bundle = emitBatchWorker(baseIr, { readme: false });
     expect(bundle.files).toHaveLength(1);
     expect(bundle.files[0]?.path).toBe("agent.ts");
   });

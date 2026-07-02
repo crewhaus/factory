@@ -25,9 +25,16 @@ function makeIr(overrides: Partial<IrEvalV0> = {}): IrEvalV0 {
 }
 
 describe("target-eval-bundle — T1 emitted bundle structure", () => {
-  test("emitEval returns a single-file bundle named agent.ts", () => {
+  test("emitEval returns agent.ts plus the generated README.md (item 42)", () => {
     const ir = makeIr();
     const bundle = emitEval(ir);
+    expect(bundle.files.length).toBe(2);
+    expect(bundle.files[0]?.path).toBe("agent.ts");
+    expect(bundle.files[1]?.path).toBe("README.md");
+  });
+
+  test("readme: false restores the single-file bundle (item 42 opt-out)", () => {
+    const bundle = emitEval(makeIr(), { readme: false });
     expect(bundle.files.length).toBe(1);
     expect(bundle.files[0]?.path).toBe("agent.ts");
   });

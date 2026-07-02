@@ -32,6 +32,7 @@ import { DEFAULT_PRICING, type PricingTable, computeCostMicros, resolvePricing }
 
 export {
   DEFAULT_PRICING,
+  computeCacheSavingsMicros,
   computeCostMicros,
   resolvePricing,
   type PricingRow,
@@ -122,7 +123,14 @@ export function createCostTracker(bus: TraceEventBus, opts: CostTrackerOptions =
     const inputTokens = resp.usage.input;
     const outputTokens = resp.usage.output;
     const cachedReadTokens = resp.usage.cacheRead ?? 0;
-    const costUsdMicros = computeCostMicros(row, inputTokens, outputTokens, cachedReadTokens);
+    const cacheCreationTokens = resp.usage.cacheCreate ?? 0;
+    const costUsdMicros = computeCostMicros(
+      row,
+      inputTokens,
+      outputTokens,
+      cachedReadTokens,
+      cacheCreationTokens,
+    );
     recordCost(resp.runId, provider, costUsdMicros, tenantId);
     if (!suppressEvents) {
       const accrual: CostAccrualEvent = {
@@ -134,6 +142,7 @@ export function createCostTracker(bus: TraceEventBus, opts: CostTrackerOptions =
         inputTokens,
         outputTokens,
         cachedReadTokens,
+        cacheCreationTokens,
         costUsdMicros,
         ...(tenantId !== undefined ? { tenantId } : {}),
       };

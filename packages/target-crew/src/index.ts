@@ -18,7 +18,13 @@
  */
 import { CrewhausError } from "@crewhaus/errors";
 import { escapeJsonString } from "@crewhaus/infra-utils";
-import type { Bundle, IrCrewRole, IrCrewV0 } from "@crewhaus/ir";
+import {
+  type Bundle,
+  type EmitReadmeOptions,
+  type IrCrewRole,
+  type IrCrewV0,
+  renderBundleReadme,
+} from "@crewhaus/ir";
 
 export class TargetEmitError extends CrewhausError {
   override readonly name = "TargetEmitError";
@@ -80,7 +86,7 @@ const BUILTIN_TOOL_MAP: Record<string, BuiltinToolEntry> = {
   codegraphImpact: { package: "@crewhaus/tool-codegraph", export: "codegraphImpact" },
 };
 
-export function emitCrew(ir: IrCrewV0): Bundle {
+export function emitCrew(ir: IrCrewV0, opts: EmitReadmeOptions = {}): Bundle {
   if (ir.roles.length === 0) {
     throw new TargetEmitError("crew target requires at least one role");
   }
@@ -99,6 +105,11 @@ export function emitCrew(ir: IrCrewV0): Bundle {
   ];
   for (const role of ir.roles) {
     files.push({ path: `agent_${safeFileName(role.name)}.ts`, content: renderRoleAgent(ir, role) });
+  }
+  // Item 42 — generated bundle README; default ON (`crewhaus compile
+  // --no-readme` opts out).
+  if (opts.readme !== false) {
+    files.push({ path: "README.md", content: renderBundleReadme(ir) });
   }
   return { files };
 }

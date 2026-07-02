@@ -18,7 +18,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
 import type { Sample } from "@crewhaus/eval-dataset";
-import { DatasetRegistryError, createFileBackedRegistry } from "./index";
+import {
+  DatasetRegistryError,
+  compareVersions,
+  createFileBackedRegistry,
+  latestVersion,
+} from "./index";
 
 let tmpRoot = "";
 
@@ -340,5 +345,65 @@ describe("dataset-registry — security & hardening", () => {
     expect(collect(reg.get("ghost", "v1", "train"))).rejects.toThrow(
       /dataset "ghost@v1" not found/,
     );
+  });
+});
+
+describe("dataset-registry — compareVersions natural ordering", () => {
+  test("digit runs compare numerically: v2 < v10, 1.0.2 < 1.0.10", () => {
+    expect(compareVersions("v2", "v10")).toBeLessThan(0);
+    expect(compareVersions("v10", "v2")).toBeGreaterThan(0);
+    expect(compareVersions("1.0.2", "1.0.10")).toBeLessThan(0);
+    expect(compareVersions("v3", "v3")).toBe(0);
+  });
+
+  test("non-digit runs compare lexicographically; digits sort before letters", () => {
+    expect(compareVersions("v1-alpha", "v1-beta")).toBeLessThan(0);
+    // At the same position, a digit run sorts before a non-digit run.
+    expect(compareVersions("v1", "vfinal")).toBeLessThan(0);
+  });
+
+  test("prefix versions sort before their extensions", () => {
+    expect(compareVersions("1.0", "1.0.1")).toBeLessThan(0);
+  });
+
+  test("huge digit runs don't lose precision through Number()", () => {
+    const a = "v90071992547409919007199254740991";
+    const b = "v90071992547409919007199254740992";
+    expect(compareVersions(a, b)).toBeLessThan(0);
+    expect(compareVersions(b, a)).toBeGreaterThan(0);
+  });
+
+  test("sorts a mixed version list into natural order", () => {
+    const versions = ["v10", "v2", "v1", "1.0.10", "1.0.2"];
+    expect([...versions].sort(compareVersions)).toEqual(["1.0.2", "1.0.10", "v1", "v2", "v10"]);
+  });
+});
+
+describe("dataset-registry — latestVersion", () => {
+  const put = async (
+    reg: ReturnType<typeof createFileBackedRegistry>,
+    name: string,
+    version: string,
+  ) => reg.put({ name, version, splits: { train: [sample("a", "x")], dev: [] } });
+
+  test("returns undefined for a dataset with no versions", async () => {
+    const reg = createFileBackedRegistry({ rootDir: tmpRoot });
+    expect(await latestVersion(reg, "missing")).toBeUndefined();
+  });
+
+  test("picks the naturally-latest version (v10 beats v2 and v9)", async () => {
+    const reg = createFileBackedRegistry({ rootDir: tmpRoot });
+    await put(reg, "x", "v1");
+    await put(reg, "x", "v9");
+    await put(reg, "x", "v10");
+    await put(reg, "x", "v2");
+    expect(await latestVersion(reg, "x")).toBe("v10");
+  });
+
+  test("orders dotted versions numerically per segment", async () => {
+    const reg = createFileBackedRegistry({ rootDir: tmpRoot });
+    await put(reg, "y", "1.0.2");
+    await put(reg, "y", "1.0.10");
+    expect(await latestVersion(reg, "y")).toBe("1.0.10");
   });
 });

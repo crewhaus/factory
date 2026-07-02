@@ -19,10 +19,11 @@ function baseIr(overrides: Partial<IrV0> = {}): IrV0 {
 }
 
 describe("emitCli — bundle shape", () => {
-  test("returns a single agent.ts file", () => {
+  test("returns agent.ts plus the generated README.md (item 42)", () => {
     const bundle = emitCli(baseIr());
-    expect(bundle.files.length).toBe(1);
+    expect(bundle.files.length).toBe(2);
     expect(bundle.files[0]?.path).toBe("agent.ts");
+    expect(bundle.files[1]?.path).toBe("README.md");
   });
 
   test("the emitted file starts with a bun shebang and DO NOT EDIT marker", () => {
@@ -450,5 +451,66 @@ describe("emitCli — agent.maxTokens (max output tokens)", () => {
   test("omits maxTokens entirely when the IR leaves it unset", () => {
     const content = emitCli(baseIr()).files[0]?.content ?? "";
     expect(content).not.toContain("maxTokens:");
+  });
+});
+
+describe("emitCli — generated README.md (item 42)", () => {
+  const readmeOf = (ir: IrV0, opts?: { readme?: boolean }): string | undefined =>
+    emitCli(ir, opts).files.find((f) => f.path === "README.md")?.content;
+
+  test("README.md lands in the emitted bundle with harness metadata and the run snippet", () => {
+    const md = readmeOf(baseIr({ name: "my-bot" })) ?? "";
+    expect(md).toContain("# my-bot");
+    expect(md).toContain("| Target | `cli` |");
+    expect(md).toContain("| Model | `claude-sonnet-4-6` |");
+    expect(md).toContain("bun agent.ts");
+    expect(md).toContain(".crewhaus/sessions");
+  });
+
+  test("README documents the tools and the env vars the bundle needs", () => {
+    const md =
+      readmeOf(
+        baseIr({
+          tools: ["bash", "python"],
+          chains: [
+            {
+              id: "mainnet",
+              kind: "evm",
+              rpcUrls: [{ kind: "env", name: "ALCHEMY_URL" }],
+              rpcPolicy: "single",
+              finality: { kind: "safe" },
+              reorgTolerant: false,
+            },
+          ],
+        }),
+      ) ?? "";
+    expect(md).toContain("| `bash` |");
+    expect(md).toContain("| `python` |");
+    expect(md).toContain("- `ALCHEMY_URL`");
+  });
+
+  test("README never leaks a literal secret value", () => {
+    const md =
+      readmeOf(
+        baseIr({
+          chains: [
+            {
+              id: "mainnet",
+              kind: "evm",
+              rpcUrls: [{ kind: "literal", value: "https://rpc.example.com/key/hunter2" }],
+              rpcPolicy: "single",
+              finality: { kind: "safe" },
+              reorgTolerant: false,
+            },
+          ],
+        }),
+      ) ?? "";
+    expect(md).not.toContain("hunter2");
+  });
+
+  test("readme: false opts out and restores the single-file bundle", () => {
+    const bundle = emitCli(baseIr(), { readme: false });
+    expect(bundle.files.length).toBe(1);
+    expect(bundle.files[0]?.path).toBe("agent.ts");
   });
 });

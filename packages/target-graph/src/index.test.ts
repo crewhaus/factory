@@ -41,8 +41,16 @@ const baseIr: IrGraphV0 = {
 };
 
 describe("emitGraph", () => {
-  test("returns a single agent.ts file", () => {
+  test("returns agent.ts plus the generated README.md (item 42)", () => {
     const bundle = emitGraph(baseIr);
+    expect(bundle.files.length).toBe(2);
+    expect(bundle.files[0]?.path).toBe("agent.ts");
+    expect(bundle.files[1]?.path).toBe("README.md");
+    expect(bundle.files[1]?.content).toContain("| Target | `graph` |");
+  });
+
+  test("readme: false restores the single-file bundle (item 42 opt-out)", () => {
+    const bundle = emitGraph(baseIr, { readme: false });
     expect(bundle.files.length).toBe(1);
     expect(bundle.files[0]?.path).toBe("agent.ts");
   });

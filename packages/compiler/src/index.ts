@@ -2,6 +2,7 @@ import { CompilerError } from "@crewhaus/errors";
 import { assertNever } from "@crewhaus/infra-utils";
 import type {
   Bundle,
+  EmitReadmeOptions,
   IrBatchV0,
   IrBrowserV0,
   IrChainBinding,
@@ -107,6 +108,13 @@ export type CompileOptions = {
    * outward-name rule so they cannot diverge.
    */
   readonly strict?: boolean;
+  /**
+   * Item 42 — emit a generated README.md into the bundle (harness
+   * name/target/model, tool table, MCP servers, required env vars, launch
+   * snippet — see `renderBundleReadme` in `@crewhaus/ir`). Default: true.
+   * `crewhaus compile --no-readme` threads `false` through here.
+   */
+  readonly readme?: boolean;
 };
 
 export function compile(yamlText: string, opts: CompileOptions = {}): Bundle {
@@ -121,7 +129,7 @@ export function compile(yamlText: string, opts: CompileOptions = {}): Bundle {
     // call broke Worker bundling (no `require` in CF Workers runtime).
     ir = applyIrPassesFn(ir);
   }
-  return emit(ir);
+  return emit(ir, { readme: opts.readme !== false });
 }
 
 /**
@@ -1098,36 +1106,36 @@ function lowerCrewRole(name: string, role: SpecCrewRole, fallbackModel: string):
   };
 }
 
-function emit(ir: IrNode): Bundle {
+function emit(ir: IrNode, opts: EmitReadmeOptions = {}): Bundle {
   switch (ir.target) {
     case "cli":
-      return emitCli(ir);
+      return emitCli(ir, opts);
     case "workflow":
-      return emitWorkflow(ir);
+      return emitWorkflow(ir, opts);
     case "channel":
-      return emitChannelBot(ir);
+      return emitChannelBot(ir, opts);
     case "graph":
-      return emitGraph(ir);
+      return emitGraph(ir, opts);
     case "managed":
-      return emitManaged(ir);
+      return emitManaged(ir, opts);
     case "pipeline":
-      return emitPipeline(ir);
+      return emitPipeline(ir, opts);
     case "crew":
-      return emitCrew(ir);
+      return emitCrew(ir, opts);
     case "research":
-      return emitResearchBundle(ir);
+      return emitResearchBundle(ir, opts);
     case "batch":
-      return emitBatchWorker(ir);
+      return emitBatchWorker(ir, opts);
     case "voice":
-      return emitVoice(ir);
+      return emitVoice(ir, opts);
     case "browser":
-      return emitBrowserDriver(ir);
+      return emitBrowserDriver(ir, opts);
     case "eval":
-      return emitEval(ir);
+      return emitEval(ir, opts);
     case "onchain":
-      return emitOnchain(ir);
+      return emitOnchain(ir, opts);
     case "onchain-game":
-      return emitOnchainGame(ir);
+      return emitOnchainGame(ir, opts);
     default:
       return assertNever(ir);
   }
