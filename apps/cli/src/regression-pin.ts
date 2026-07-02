@@ -35,12 +35,27 @@ export function regressionSuiteName(specName: string): string {
  * dataset-registry's name grammar (spec `safeName` additionally allows
  * spaces/colons, which the registry rejects). A spec whose name can't form
  * a valid registry dataset name simply has no regression suite — both the
- * pin and the union become no-ops instead of surfacing a registry error.
+ * pin and the union become no-ops instead of surfacing a registry error
+ * (with a one-line warning per invocation, so the no-op is never silent).
  */
 const REGISTRY_NAME_REGEX = /^[A-Za-z0-9_-][A-Za-z0-9_.-]*$/;
 
 export function isRegistrySafeName(name: string): boolean {
   return REGISTRY_NAME_REGEX.test(name);
+}
+
+/** Default warning sink for the registry-unsafe-name no-ops. */
+const warnToStderr = (line: string): void => {
+  process.stderr.write(`${line}\n`);
+};
+
+/** The one-line "this degraded to a no-op" warning for a spec whose name
+ *  can't map to the registry grammar (see {@link isRegistrySafeName}). */
+function unsafeNameWarning(what: string, specName: string, suiteName: string): string {
+  return (
+    `[eval] ${what} skipped: spec name "${specName}" can't form a registry dataset name ` +
+    `("${suiteName}") — rename the spec to match ${REGISTRY_NAME_REGEX} to enable the regression suite`
+  );
 }
 
 // -------- pinning (optimize post-accept / future failure-arbiter) --------
@@ -67,6 +82,8 @@ export type PinRecoveredSamplesOptions = {
    *  Recorded as `metadata.regression_pin.source` when present; absent on
    *  the optimize post-accept path (byte-identical to the pre-item-7 pin). */
   readonly source?: string;
+  /** Warning sink for the registry-unsafe-name no-op; defaults to stderr. */
+  readonly warn?: (line: string) => void;
   /** Clock override for deterministic tests. */
   readonly now?: () => Date;
 };
@@ -85,7 +102,11 @@ export async function pinRecoveredSamples(
   opts: PinRecoveredSamplesOptions,
 ): Promise<PinRegressionsResult> {
   const suiteName = regressionSuiteName(opts.specName);
-  if (opts.samples.length === 0 || !isRegistrySafeName(suiteName)) {
+  if (opts.samples.length === 0) return { suiteName, pinned: 0 };
+  if (!isRegistrySafeName(suiteName)) {
+    // There WERE samples to pin — surface the degradation instead of
+    // silently dropping them (one warning per invocation).
+    (opts.warn ?? warnToStderr)(unsafeNameWarning("regression pin", opts.specName, suiteName));
     return { suiteName, pinned: 0 };
   }
 
@@ -178,9 +199,12 @@ export async function pinRecoveriesAfterOptimize(
 export type RegressionUnionResult = {
   /** Primary samples first, then suite additions (dedupe: primary wins). */
   readonly samples: Sample[];
-  /** `<primaryName>+regressions@vX` — the honest run-index/baseline key. */
+  /** `<primaryName>+regressions@vX` when the union ADDED samples; the
+   *  untouched primary name when it added none (keyset unchanged → the
+   *  run-index/baseline lineage must stay comparable, see below). */
   readonly datasetName: string;
-  /** Primary hash with the suite's content hash folded in (see below). */
+  /** Primary hash with the suite's content hash folded in when the union
+   *  added samples; the untouched primary hash otherwise. */
   readonly datasetHash: string;
   /** Suite samples actually added (collisions with the primary excluded). */
   readonly added: number;
@@ -204,32 +228,58 @@ export type ApplyRegressionUnionOptions = {
   readonly loadPrimarySamples: () => Promise<ReadonlyArray<Sample>>;
   readonly datasetName: string;
   readonly datasetHash: string;
+  /** Warning sink for the registry-unsafe-name no-op; defaults to stderr. */
+  readonly warn?: (line: string) => void;
 };
 
 /**
  * Union the per-spec regression suite into an eval's dataset (dedupe by
  * sample id; the primary dataset wins on collision). Returns undefined when
- * disabled, when no suite exists, or when the primary IS the suite.
+ * disabled, when no suite exists, or when the primary IS the suite (a
+ * `registry:` ref to it, or a file whose basename matches it — an exported
+ * copy must not union the suite into itself).
  *
- * Item-3 interaction, by design: the union changes the run's sample keyset,
- * so the returned `datasetName` is suffixed `+regressions@vX` and the
- * returned `datasetHash` folds the suite's content hash into the primary's.
- * Run-index entries and (spec, dataset) baselines then key on the honest
- * union lineage — the first unioned run (and the first run after the suite
- * gains a version) starts a new baseline lineage instead of tripping
- * diffReports' keyset-mismatch guard against the pre-union baseline.
+ * Item-3 interaction, by design: a union that ADDS samples changes the
+ * run's sample keyset, so the returned `datasetName` is suffixed
+ * `+regressions@vX` and the returned `datasetHash` folds the suite's
+ * content hash into the primary's. Run-index entries and (spec, dataset)
+ * baselines then key on the honest union lineage — the first ADDING union
+ * starts a new baseline lineage instead of tripping diffReports'
+ * keyset-mismatch guard against the pre-union baseline. A union that adds
+ * NOTHING (every suite sample already in the primary) keeps the primary
+ * identity untouched: the keyset didn't change, so rewriting the key would
+ * orphan the existing baseline and silently disarm the gate.
  */
 export async function applyRegressionUnion(
   opts: ApplyRegressionUnionOptions,
 ): Promise<RegressionUnionResult | undefined> {
   if (!opts.includeRegressions) return undefined;
   const suiteName = regressionSuiteName(opts.specName);
-  if (!isRegistrySafeName(suiteName)) return undefined;
+  if (!isRegistrySafeName(suiteName)) {
+    (opts.warn ?? warnToStderr)(
+      unsafeNameWarning("regression suite union", opts.specName, suiteName),
+    );
+    return undefined;
+  }
   if (opts.primaryRegistryName === suiteName) return undefined;
+  // File-dataset self-union guard: a file literally named after the suite
+  // (`<specName>-regressions.jsonl` — loadDataset names it by basename) is
+  // treated as an export of the suite, same as the registry ref above.
+  if (opts.datasetName === suiteName || opts.datasetName.replace(/\.[^.]+$/, "") === suiteName) {
+    return undefined;
+  }
 
   const suiteVersion = await latestVersion(opts.registry, suiteName);
   if (suiteVersion === undefined) return undefined;
   const record = await opts.registry.getRecord(suiteName, suiteVersion);
+  // Validate the record shape BEFORE materializing the primary stream — a
+  // corrupt suite record must fail here, while the caller's fallback can
+  // still hand the untouched primary stream to the runner.
+  if (!Array.isArray(record?.splits?.train)) {
+    throw new Error(
+      `regression suite ${suiteName}@${suiteVersion} is corrupt (missing splits.train) — re-pin it or delete the record`,
+    );
+  }
 
   const primary = await opts.loadPrimarySamples();
   const seen = new Set(primary.map((s) => s.id));
@@ -241,6 +291,18 @@ export async function applyRegressionUnion(
     samples.push(s);
     added += 1;
   }
+  if (added === 0) {
+    // Keyset unchanged — keep the primary identity so the lineage stays
+    // comparable (see the doc comment above).
+    return {
+      samples,
+      datasetName: opts.datasetName,
+      datasetHash: opts.datasetHash,
+      added,
+      suiteName,
+      suiteVersion,
+    };
+  }
   return {
     samples,
     datasetName: `${opts.datasetName}+regressions@${suiteVersion}`,
@@ -248,6 +310,89 @@ export async function applyRegressionUnion(
     added,
     suiteName,
     suiteVersion,
+  };
+}
+
+// -------- guarded union (stream-loss-proof wrapper) --------
+
+export type GuardedUnionOutcome = {
+  /** Dataset identity to record: the union's when one was applied, the
+   *  untouched primary's otherwise. */
+  readonly datasetName: string;
+  readonly datasetHash: string;
+  /** Samples to run. Always safe to iterate: when the union attempt threw
+   *  AFTER consuming the primary stream, this is the materialized primary
+   *  array — never an exhausted iterable. */
+  readonly samples: AsyncIterable<Sample>;
+  /** Present when a union was applied (its `added` may be 0). */
+  readonly union?: RegressionUnionResult;
+};
+
+/**
+ * `applyRegressionUnion` with the failure semantics `crewhaus eval` needs:
+ * best-effort (a broken suite record warns and falls back to the primary
+ * dataset) AND stream-loss-proof. The primary samples are captured as they
+ * are materialized for the union attempt, so a throw AFTER the one-shot
+ * primary stream was consumed (e.g. a suite record that passes the shape
+ * check but breaks the hash fold) falls back to the captured array instead
+ * of handing the runner an exhausted iterable — which would silently run a
+ * 0-sample eval.
+ */
+export async function applyRegressionUnionGuarded(opts: {
+  readonly registry: DatasetRegistry;
+  readonly specName: string;
+  readonly includeRegressions: boolean;
+  readonly primaryRegistryName?: string;
+  readonly primary: { readonly name: string; readonly samples: AsyncIterable<Sample> };
+  readonly datasetHash: string;
+  /** Warning sink; defaults to stderr. */
+  readonly warn?: (line: string) => void;
+}): Promise<GuardedUnionOutcome> {
+  const warn = opts.warn ?? warnToStderr;
+  let materialized: Sample[] | undefined;
+  try {
+    const union = await applyRegressionUnion({
+      registry: opts.registry,
+      specName: opts.specName,
+      includeRegressions: opts.includeRegressions,
+      ...(opts.primaryRegistryName !== undefined
+        ? { primaryRegistryName: opts.primaryRegistryName }
+        : {}),
+      loadPrimarySamples: async () => {
+        materialized = [];
+        for await (const s of opts.primary.samples) materialized.push(s);
+        return materialized;
+      },
+      datasetName: opts.primary.name,
+      datasetHash: opts.datasetHash,
+      warn,
+    });
+    if (union !== undefined) {
+      return {
+        datasetName: union.datasetName,
+        datasetHash: union.datasetHash,
+        samples: reiterable(union.samples),
+        union,
+      };
+    }
+  } catch (err) {
+    warn(
+      `[eval] regression suite union skipped: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  return {
+    datasetName: opts.primary.name,
+    datasetHash: opts.datasetHash,
+    samples: materialized !== undefined ? reiterable(materialized) : opts.primary.samples,
+  };
+}
+
+/** Re-iterable view over an already-materialized sample array. */
+function reiterable(samples: ReadonlyArray<Sample>): AsyncIterable<Sample> {
+  return {
+    async *[Symbol.asyncIterator]() {
+      for (const s of samples) yield s;
+    },
   };
 }
 

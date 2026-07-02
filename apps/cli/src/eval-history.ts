@@ -57,18 +57,36 @@ export type FinishEvalResult = {
 };
 
 /**
+ * `eval-report history|baseline show --dataset <filter>` matching. Unioned
+ * runs are recorded under `<primary>+regressions@vX`, so the filter matches
+ * a stored datasetName that equals it exactly OR continues it with a `+`
+ * suffix segment — `--dataset smoke` finds `smoke` and
+ * `smoke+regressions@v1`, but not `smoke2`.
+ */
+export function datasetFilterMatches(filter: string, datasetName: string): boolean {
+  return datasetName === filter || datasetName.startsWith(`${filter}+`);
+}
+
+/**
  * Strict gate between a baseline run and a new run. Wraps
  * `regression-runner`'s `gate()` with `regressionThreshold: 0` (any
  * pass-rate drop fails) and additionally fails on sample-level regressions
- * that net out to a flat pass rate. regression-runner's p95-latency default
- * (+5000ms) is kept as-is.
+ * that net out to a flat pass rate. The latency criterion is DISABLED by
+ * default (threshold Infinity): the documented gate is pass-rate/flip-only,
+ * and regression-runner's +5000ms p95 default would fail runs the docs say
+ * pass. Latency gating arrives with explicit CLI flags later — callers can
+ * already opt in via `thresholds.latencyThreshold`.
  */
 export function gateRuns(
   prev: EvalRunSummary,
   next: EvalRunSummary,
   thresholds: GateThresholds = {},
 ): GateVerdict {
-  const verdict = gate(prev, next, { regressionThreshold: 0, ...thresholds });
+  const verdict = gate(prev, next, {
+    regressionThreshold: 0,
+    latencyThreshold: Number.POSITIVE_INFINITY,
+    ...thresholds,
+  });
   if (verdict.verdict === "pass" && verdict.report.regressions.length > 0) {
     const ids = verdict.report.regressions.map((r) => r.sampleId).join(", ");
     return {
@@ -91,6 +109,15 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
   const datasetName = summary.config.datasetName;
   const absOut = resolve(opts.outDir);
 
+  // Belt (the runner already refuses to run zero samples): a 0-sample run
+  // carries no signal and a passRate-0 "clean" entry would poison the index
+  // and could pin an empty baseline — refuse loudly instead of recording it.
+  if (summary.samples.length === 0) {
+    throw new Error(
+      `refusing to record 0-sample eval run ${summary.runId} — dataset "${datasetName}" produced no samples`,
+    );
+  }
+
   const entry: RunIndexEntry = {
     runId: summary.runId,
     specName,
@@ -100,6 +127,7 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
     passRate: summary.aggregates.passRate,
     meanScore: summary.aggregates.meanScore,
     sampleCount: summary.samples.length,
+    retriedCount: summary.samples.filter((s) => s.retried === true).length,
     ts: summary.endedAt,
     outDir: absOut,
   };

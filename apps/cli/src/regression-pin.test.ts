@@ -18,11 +18,13 @@ import type { EvalRunSummary, SampleResult } from "@crewhaus/eval-runner";
 import { finishEvalRun } from "./eval-history";
 import {
   applyRegressionUnion,
+  applyRegressionUnionGuarded,
   foldDatasetHash,
   pinRecoveredSamples,
   pinRecoveriesAfterOptimize,
   regressionSuiteName,
 } from "./regression-pin";
+import { finishEvalTriage } from "./triage";
 
 const TMP_ROOTS: string[] = [];
 function newTempRoot(): string {
@@ -217,16 +219,37 @@ describe("pinRecoveredSamples — suite versioning", () => {
     expect(await registry.list("concierge-regressions")).toEqual(["v1"]);
   });
 
-  test("spec names outside the registry grammar → no-op instead of a registry error", async () => {
+  test("spec names outside the registry grammar → warned no-op instead of a registry error (F9)", async () => {
     const registry = newRegistry(newTempRoot());
+    const warns: string[] = [];
     const result = await pinRecoveredSamples({
       registry,
       specName: "hello world", // spec safeName allows spaces; registry names don't
       samples: [sample("r1")],
       sourceDataset: "support@v3",
       optimizeRunId: "opt_cafe",
+      warn: (l) => warns.push(l),
     });
     expect(result.pinned).toBe(0);
+    // The degradation is no longer silent: exactly one warning, suggesting a rename.
+    expect(warns).toHaveLength(1);
+    expect(warns[0]).toContain('"hello world"');
+    expect(warns[0]).toContain("rename the spec");
+  });
+
+  test("F9: an EMPTY pin with an unsafe name stays silent — nothing was dropped", async () => {
+    const registry = newRegistry(newTempRoot());
+    const warns: string[] = [];
+    const result = await pinRecoveredSamples({
+      registry,
+      specName: "hello world",
+      samples: [],
+      sourceDataset: "support@v3",
+      optimizeRunId: "opt_cafe",
+      warn: (l) => warns.push(l),
+    });
+    expect(result.pinned).toBe(0);
+    expect(warns).toEqual([]);
   });
 });
 
@@ -460,6 +483,108 @@ describe("applyRegressionUnion — eval-side default union", () => {
     expect(union).toBeUndefined();
   });
 
+  test("F10: a FILE dataset named after the suite also skips the self-union (basename guard)", async () => {
+    const registry = newRegistry(newTempRoot());
+    await seedSuite(registry, [sample("r1")]);
+
+    for (const datasetName of ["concierge-regressions", "concierge-regressions.jsonl"]) {
+      let loaded = false;
+      const union = await applyRegressionUnion({
+        registry,
+        specName: "concierge",
+        includeRegressions: true,
+        // No primaryRegistryName: the dataset came from a file path whose
+        // basename loadDataset turned into the dataset name.
+        loadPrimarySamples: async () => {
+          loaded = true;
+          return [sample("r1")];
+        },
+        datasetName,
+        datasetHash: "a".repeat(64),
+      });
+      expect(union).toBeUndefined();
+      expect(loaded).toBe(false);
+    }
+  });
+
+  test("F1(a): a union that adds NOTHING keeps the primary identity untouched (no lineage reset)", async () => {
+    const registry = newRegistry(newTempRoot());
+    // Every suite sample is already in the primary dataset.
+    await seedSuite(registry, [sample("p1")]);
+
+    const union = await applyRegressionUnion({
+      registry,
+      specName: "concierge",
+      includeRegressions: true,
+      loadPrimarySamples: async () => [sample("p1"), sample("p2")],
+      datasetName: "smoke",
+      datasetHash: "a".repeat(64),
+    });
+    expect(union).toBeDefined();
+    expect(union?.added).toBe(0);
+    // Keyset unchanged → identity unchanged: NOT "smoke+regressions@v1".
+    expect(union?.datasetName).toBe("smoke");
+    expect(union?.datasetHash).toBe("a".repeat(64));
+    expect(union?.samples.map((s) => s.id)).toEqual(["p1", "p2"]);
+  });
+
+  test("F9: an unsafe spec name degrades the union to a warned no-op", async () => {
+    const registry = newRegistry(newTempRoot());
+    const warns: string[] = [];
+    let loaded = false;
+    const union = await applyRegressionUnion({
+      registry,
+      specName: "hello world",
+      includeRegressions: true,
+      loadPrimarySamples: async () => {
+        loaded = true;
+        return [sample("p1")];
+      },
+      datasetName: "smoke",
+      datasetHash: "a".repeat(64),
+      warn: (l) => warns.push(l),
+    });
+    expect(union).toBeUndefined();
+    expect(loaded).toBe(false);
+    expect(warns).toHaveLength(1);
+    expect(warns[0]).toContain("rename the spec");
+  });
+
+  test("F6: a corrupt suite record (missing splits.train) throws BEFORE the primary stream is touched", async () => {
+    const root = newTempRoot();
+    const registry = newRegistry(root);
+    const suiteDir = join(root, "datasets", "concierge-regressions");
+    mkdirSync(suiteDir, { recursive: true });
+    writeFileSync(
+      join(suiteDir, "v1.json"),
+      JSON.stringify({
+        name: "concierge-regressions",
+        version: "v1",
+        splits: { dev: [] }, // train MISSING — corrupt
+        sampleHashes: {},
+        createdAt: "2026-07-01T00:00:00Z",
+      }),
+    );
+
+    let loaded = false;
+    await expect(
+      applyRegressionUnion({
+        registry,
+        specName: "concierge",
+        includeRegressions: true,
+        loadPrimarySamples: async () => {
+          loaded = true;
+          return [sample("p1")];
+        },
+        datasetName: "smoke",
+        datasetHash: "a".repeat(64),
+      }),
+    ).rejects.toThrow(/corrupt/);
+    // The shape check ran before materialization — the (possibly one-shot)
+    // primary stream was never consumed.
+    expect(loaded).toBe(false);
+  });
+
   test("foldDatasetHash is order-sensitive across its two inputs", () => {
     const a = "a".repeat(64);
     const b = "b".repeat(64);
@@ -605,5 +730,237 @@ describe("regression union × run-history baselines (item 3 interaction)", () =>
 
     expect(lines).toContain("[eval] dataset changed — starting new baseline lineage");
     expect(getBaseline("concierge", "smoke", evalsDir)?.runId).toBe("run_bbbb2222bbbb2222");
+  });
+});
+
+// -------- applyRegressionUnionGuarded (F6: stream-loss-proof fallback) --------
+
+describe("applyRegressionUnionGuarded — corrupt suite records never lose the primary", () => {
+  /** One-shot async generator: exhausted after a single iteration, like the
+   *  streaming file-dataset loaders. */
+  async function* oneShot(samples: Sample[]): AsyncIterable<Sample> {
+    for (const s of samples) yield s;
+  }
+
+  async function collect(iter: AsyncIterable<Sample>): Promise<string[]> {
+    const out: string[] = [];
+    for await (const s of iter) out.push(s.id);
+    return out;
+  }
+
+  function writeSuiteRecord(root: string, record: unknown): void {
+    const suiteDir = join(root, "datasets", "concierge-regressions");
+    mkdirSync(suiteDir, { recursive: true });
+    writeFileSync(join(suiteDir, "v1.json"), JSON.stringify(record));
+  }
+
+  test("corrupt record shape → warns, falls back, and the eval still sees ALL primary samples", async () => {
+    const root = newTempRoot();
+    const registry = newRegistry(root);
+    writeSuiteRecord(root, {
+      name: "concierge-regressions",
+      version: "v1",
+      splits: { dev: [] }, // train missing — corrupt
+      sampleHashes: {},
+      createdAt: "2026-07-01T00:00:00Z",
+    });
+
+    const warns: string[] = [];
+    const outcome = await applyRegressionUnionGuarded({
+      registry,
+      specName: "concierge",
+      includeRegressions: true,
+      primary: { name: "smoke", samples: oneShot([sample("p1"), sample("p2")]) },
+      datasetHash: "a".repeat(64),
+      warn: (l) => warns.push(l),
+    });
+
+    expect(warns.some((l) => l.includes("regression suite union skipped"))).toBe(true);
+    expect(outcome.union).toBeUndefined();
+    expect(outcome.datasetName).toBe("smoke");
+    expect(outcome.datasetHash).toBe("a".repeat(64));
+    expect(await collect(outcome.samples)).toEqual(["p1", "p2"]);
+  });
+
+  test("a throw AFTER the one-shot primary stream was consumed falls back to the materialized array", async () => {
+    const root = newTempRoot();
+    const registry = newRegistry(root);
+    // splits.train passes the shape check AND adds a new sample (so the
+    // union proceeds past the added===0 early return), but sampleHashes is
+    // missing — overallDatasetHash throws only AFTER loadPrimarySamples ran.
+    writeSuiteRecord(root, {
+      name: "concierge-regressions",
+      version: "v1",
+      splits: { train: [sample("r9")], dev: [] },
+      createdAt: "2026-07-01T00:00:00Z",
+    });
+
+    const warns: string[] = [];
+    const outcome = await applyRegressionUnionGuarded({
+      registry,
+      specName: "concierge",
+      includeRegressions: true,
+      primary: { name: "smoke", samples: oneShot([sample("p1"), sample("p2")]) },
+      datasetHash: "a".repeat(64),
+      warn: (l) => warns.push(l),
+    });
+
+    expect(warns.some((l) => l.includes("regression suite union skipped"))).toBe(true);
+    // Pre-fix this fell back to the EXHAUSTED stream → a 0-sample eval.
+    expect(await collect(outcome.samples)).toEqual(["p1", "p2"]);
+    expect(outcome.datasetName).toBe("smoke");
+    expect(outcome.datasetHash).toBe("a".repeat(64));
+  });
+
+  test("healthy suite → unions normally through the guarded wrapper", async () => {
+    const root = newTempRoot();
+    const registry = newRegistry(root);
+    await pinRecoveredSamples({
+      registry,
+      specName: "concierge",
+      samples: [sample("r1")],
+      sourceDataset: "smoke",
+      optimizeRunId: "opt_cafe",
+    });
+
+    const outcome = await applyRegressionUnionGuarded({
+      registry,
+      specName: "concierge",
+      includeRegressions: true,
+      primary: { name: "smoke", samples: oneShot([sample("p1")]) },
+      datasetHash: "a".repeat(64),
+      warn: () => {},
+    });
+    expect(outcome.union?.added).toBe(1);
+    expect(outcome.datasetName).toBe("smoke+regressions@v1");
+    expect(await collect(outcome.samples)).toEqual(["p1", "r1"]);
+  });
+});
+
+// -------- F1: the gate must NOT disarm itself (3-run regression scenario) --------
+
+describe("gate-disarm regression (F1): fail → (no) pin → retry keeps failing the gate", () => {
+  test("run1 all-pass baseline; run2 regresses (gate FAIL); run3 same dataset still gates against run1", async () => {
+    const root = newTempRoot();
+    const registry = newRegistry(root);
+    const evalsDir = join(root, ".crewhaus", "evals");
+    const lines: string[] = [];
+    const warns: string[] = [];
+    const write = (line: string) => lines.push(line);
+
+    const p1 = sample("p1");
+    const p2 = sample("p2");
+    const samplesById = new Map<string, Sample>([
+      ["p1", p1],
+      ["p2", p2],
+    ]);
+
+    // ---- run 1: all pass → pins the (concierge, smoke) baseline.
+    const run1 = makeSummary(
+      "run_aaaa1111aaaa1111",
+      [makeSampleResult("p1", true, 1), makeSampleResult("p2", true, 1)],
+      join(root, "run1"),
+    );
+    persistRun(run1);
+    await finishEvalRun({
+      summary: run1,
+      specName: "concierge",
+      datasetHash: "a".repeat(64),
+      outDir: run1.outDir,
+      gateRequested: true,
+      promote: true,
+      evalsDir,
+      write,
+    });
+    expect(getBaseline("concierge", "smoke", evalsDir)?.runId).toBe("run_aaaa1111aaaa1111");
+
+    // ---- run 2: p1 regresses (graded failure). Gate FAILS; triage runs
+    // with pinning enabled but must NOT pin p1 (member of the run's own
+    // dataset) — pre-fix it pinned p1 as "bug", arming the disarm loop.
+    const run2Samples = [makeSampleResult("p1", false, 0), makeSampleResult("p2", true, 1)];
+    const run2 = makeSummary("run_bbbb2222bbbb2222", run2Samples, join(root, "run2"));
+    persistRun(run2);
+    await finishEvalTriage({
+      samples: run2Samples,
+      samplesById,
+      runId: run2.runId,
+      outDir: run2.outDir,
+      specName: "concierge",
+      sourceDataset: "smoke",
+      registry,
+      write,
+      warn: (l) => warns.push(l),
+    });
+    expect(await registry.list("concierge-regressions")).toEqual([]); // F1(b)
+
+    const finish2 = await finishEvalRun({
+      summary: run2,
+      specName: "concierge",
+      datasetHash: "a".repeat(64),
+      outDir: run2.outDir,
+      gateRequested: true,
+      promote: true,
+      evalsDir,
+      write,
+    });
+    expect(finish2.gateFailed).toBe(true);
+    expect(getBaseline("concierge", "smoke", evalsDir)?.runId).toBe("run_aaaa1111aaaa1111");
+
+    // ---- Even if the suite HAD been poisoned with a primary sample (the
+    // pre-fix pin, or an optimize pin of an in-primary sample), the union
+    // adds nothing and must keep the "smoke" identity — F1(a).
+    await pinRecoveredSamples({
+      registry,
+      specName: "concierge",
+      samples: [p1],
+      sourceDataset: "smoke",
+      optimizeRunId: "run_bbbb2222bbbb2222",
+      source: "failure-arbiter",
+    });
+    const outcome = await applyRegressionUnionGuarded({
+      registry,
+      specName: "concierge",
+      includeRegressions: true,
+      primary: {
+        name: "smoke",
+        samples: (async function* () {
+          yield p1;
+          yield p2;
+        })(),
+      },
+      datasetHash: "a".repeat(64),
+      warn: (l) => warns.push(l),
+    });
+    expect(outcome.union?.added).toBe(0);
+    expect(outcome.datasetName).toBe("smoke"); // NOT smoke+regressions@v1
+
+    // ---- run 3: same dataset, p1 still failing. Pre-fix the rewritten
+    // dataset key made this a "first run" that PROMOTED the failing run to
+    // baseline; now it must still diff against run1 and FAIL the gate.
+    lines.length = 0;
+    const run3 = makeSummary(
+      "run_cccc3333cccc3333",
+      [makeSampleResult("p1", false, 0), makeSampleResult("p2", true, 1)],
+      join(root, "run3"),
+      outcome.datasetName,
+    );
+    persistRun(run3);
+    const finish3 = await finishEvalRun({
+      summary: run3,
+      specName: "concierge",
+      datasetHash: outcome.datasetHash,
+      outDir: run3.outDir,
+      gateRequested: true,
+      promote: true,
+      evalsDir,
+      write,
+    });
+
+    expect(finish3.gateFailed).toBe(true);
+    // No lineage reset, no silent promotion: run1 is still the baseline.
+    expect(lines.some((l) => l.includes("first run"))).toBe(false);
+    expect(lines.some((l) => l.includes("gate: FAIL"))).toBe(true);
+    expect(getBaseline("concierge", "smoke", evalsDir)?.runId).toBe("run_aaaa1111aaaa1111");
+    expect(getBaseline("concierge", "smoke+regressions@v1", evalsDir)).toBeUndefined();
   });
 });

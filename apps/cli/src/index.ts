@@ -93,7 +93,7 @@ import {
 // Run-history item 3 — post-eval index append + baseline diff/gate/promote,
 // in a side-effect-free module so it is unit-testable (this entry file runs
 // an argv switch on import).
-import { finishEvalRun } from "./eval-history";
+import { datasetFilterMatches, finishEvalRun } from "./eval-history";
 // Item 11 — `eval --models` benchmark matrix: flag parsing/validation, cell
 // slugs, the failure-isolated cell loop, and the cost-tracker pricing seam,
 // in a side-effect-free module so it is unit-testable (this entry file runs
@@ -135,7 +135,7 @@ import {
 // Item 9 — per-spec regression suite: post-accept pinning of optimize
 // recoveries + the eval-side default union, in a side-effect-free module so
 // it is unit-testable (this entry file runs an argv switch on import).
-import { applyRegressionUnion, pinRecoveriesAfterOptimize } from "./regression-pin";
+import { applyRegressionUnionGuarded, pinRecoveriesAfterOptimize } from "./regression-pin";
 // FR-002 — Pillar 3 sink-side scope gate, shared by `compile --strict` and
 // `doctor --philosophy-alignment`. Kept in a side-effect-free module so it is
 // unit-testable (this entry file runs an argv switch on import).
@@ -272,6 +272,9 @@ const OPTIMIZE_SCHEMA: ParseArgsSchema = {
     // Item 9 — skip pinning an accepted patch's fail→pass recoveries into
     // the per-spec `<specName>-regressions` registry dataset.
     { name: "no-pin-regressions", takesValue: false },
+    // Item 7 — opt out of the runner's default one-shot retry of ERRORED
+    // samples inside each candidate's fitness eval (mirrors `eval --no-retry`).
+    { name: "no-retry", takesValue: false },
     { name: "out", short: "o", takesValue: true },
     { name: "help", short: "h" },
   ],
@@ -1687,7 +1690,7 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
     process.stdout.write(
       "usage: crewhaus optimize <spec.yaml> (--dataset <data> --graders <graders.yaml> | --ratings <session>) " +
         "[--min-score F] [--mutator rule-based|claude] [--iterations N] [--seed N] [--concurrency N] " +
-        "[--improvement-threshold F] [--budget-usd N] [--write-back] [--no-pin-regressions] [-o <out-dir>]\n" +
+        "[--improvement-threshold F] [--budget-usd N] [--write-back] [--no-pin-regressions] [--no-retry] [-o <out-dir>]\n" +
         "  --dataset takes a file path or registry:<name>[@version][#split] (Section 29 registry;\n" +
         "  default version: latest). A registry record with populated train AND dev splits is\n" +
         "  used as-is; otherwise the selected samples get the inline 70/30 split. The test\n" +
@@ -1696,10 +1699,15 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
         "  fail→pass are pinned into the <specName>-regressions registry dataset (a new version\n" +
         "  unioning the previous one, deduped by sample id) so `crewhaus eval` guards them by\n" +
         "  default. --no-pin-regressions skips the pin.\n" +
+        "  Inside each candidate's fitness eval, samples that ERROR (provider timeout, 429,\n" +
+        "  grader throw — infra noise) are retried once by default, exactly like `crewhaus\n" +
+        "  eval`; --no-retry disables the retry so every first attempt stands.\n" +
         "  After each candidate's eval the failure arbiter triages failing dev samples;\n" +
-        "  noise (flaky infra) and contract-ambiguity (bad gold) are excluded from the\n" +
-        "  failure signal the mutator sees, and contract-ambiguity samples collect into\n" +
-        "  a dataset-fix queue printed at the end of the run.\n",
+        "  noise (flaky infra) and contract-ambiguity confirmed by structured grader output\n" +
+        "  (bad gold) are excluded from the failure signal the mutator sees. Contract-\n" +
+        "  ambiguity inferred only from a missing gold answer stays IN the signal (on\n" +
+        "  judge-graded/no-gold datasets it is the signal); both kinds collect into a\n" +
+        "  dataset-fix queue printed at the end of the run.\n",
     );
     return;
   }
@@ -1756,6 +1764,9 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
   }
 
   const writeBack = args.flags["write-back"] === true;
+  // Item 7 — the fitness evals inherit the runner's noise auto-retry
+  // (default ON, consistent with `crewhaus eval`); `--no-retry` opts out.
+  const retryErrors = args.flags["no-retry"] !== true;
   const outDirArg = args.flags["out"];
   const absSpec = resolve(specPath);
   const runId = `opt_${Date.now().toString(16)}`;
@@ -1888,10 +1899,14 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
 
   // Item 7 — cross-iteration dataset-fix queue: sampleId → arbiter reason
   // for every dev sample the failure arbiter classified contract-ambiguity.
-  // Queued ids stay excluded from the mutator's failure signal for the rest
-  // of the run (the dataset/contract problem doesn't change with the
-  // candidate prompt) and the queue prints at the end of optimize.
+  // The queue prints at the end of optimize. Only the ids whose verdict is
+  // backed by structured grader evidence ALSO join the sticky exclusion set
+  // below — those stay excluded from the mutator's failure signal for the
+  // rest of the run (the dataset/contract problem doesn't change with the
+  // candidate prompt). Heuristic (no-gold) verdicts are queued but stay in
+  // the signal: on judge-graded datasets they ARE the failure signal.
   const datasetFixQueue = new Map<string, string>();
+  const stickyAmbiguous = new Set<string>();
 
   // Fitness fn: patch the spec with the candidate prompt, lower to IR,
   // run eval-runner, and return the pass-rate PLUS per-sample grades. The
@@ -1942,6 +1957,7 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
         ),
         concurrency,
         seed,
+        retryErrors,
       },
     });
     // Item 7 — failure-arbiter pre-filter: classify this candidate's failing
@@ -1957,9 +1973,13 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
       const triage = triageFitnessSamples({
         samples: summary.samples,
         samplesById: originalById,
-        alreadyAmbiguous: new Set(datasetFixQueue.keys()),
+        alreadyAmbiguous: stickyAmbiguous,
       });
-      for (const a of triage.ambiguous) datasetFixQueue.set(a.sampleId, a.reason);
+      for (const a of triage.ambiguous) {
+        datasetFixQueue.set(a.sampleId, a.reason);
+        // Only evidence-backed ambiguity is sticky-excluded (see above).
+        if (a.fromGraderEvidence) stickyAmbiguous.add(a.sampleId);
+      }
       excludedFromSignal = triage.excluded;
       const line = formatFitnessTriageLine(triage);
       if (line !== undefined) process.stdout.write(`[optimize] ${line}\n`);
@@ -2145,18 +2165,21 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
         "  passes. --no-promote keeps the existing pin; --gate exits non-zero when the\n" +
         "  gate fails (any pass-rate drop or sample-level pass→fail flip).\n" +
         "  When the registry contains <specName>-regressions (pinned by `crewhaus optimize`),\n" +
-        "  its samples are unioned into the dataset by default (dedupe by id, primary wins);\n" +
-        "  datasetName/datasetHash then reflect the union (`+regressions@vX` suffix + folded\n" +
-        "  hash), so the first unioned run starts a new baseline lineage by design.\n" +
-        "  --no-regressions skips the union (and the failure-arbiter pin below).\n" +
-        "  Samples whose run ERRORS (provider timeout, 429 — infra noise, not a graded\n" +
-        "  failure) are retried once by default; the retried outcome replaces the errored\n" +
-        "  one and is tagged retried:true in results.json. --no-retry disables the retry.\n" +
+        "  its samples are unioned into the dataset by default (dedupe by id, primary wins).\n" +
+        "  When the union actually ADDS samples, datasetName/datasetHash reflect it\n" +
+        "  (`+regressions@vX` suffix + folded hash), so the first adding union starts a new\n" +
+        "  baseline lineage by design; a union that adds nothing keeps the primary identity\n" +
+        "  (and lineage) untouched. --no-regressions skips the union.\n" +
+        "  Samples whose run ERRORS (provider timeout, 429, a grader/judge throw — infra\n" +
+        "  noise, not a graded failure) are retried once by default; the retried outcome\n" +
+        "  replaces the errored one and is tagged retried:true in results.json (the summary\n" +
+        "  line and run index report the retried count). --no-retry disables the retry.\n" +
         "  After the run, every failing sample is triaged by the failure arbiter into\n" +
         "  bug / spec-gap / noise / contract-ambiguity: verdicts land in <out>/verdicts.json\n" +
-        "  + a report section + a one-line `triage:` summary, and bug-class samples are\n" +
-        "  pinned into <specName>-regressions (source: failure-arbiter). Best-effort —\n" +
-        "  a triage failure never fails the eval. Matrix cells (--models) skip triage.\n" +
+        "  + a report section + a one-line `triage:` summary. Triage never pins samples the\n" +
+        "  run's own dataset already contains, never pins errored samples, and skips pinning\n" +
+        "  entirely when the run looks infrastructure-failed. Best-effort — a triage failure\n" +
+        "  never fails the eval. Matrix cells (--models) skip triage.\n" +
         "  --judge-model accepts the full router grammar (claude-*, openai/<m>, gemini/<m>,\n" +
         "  bedrock/<id>, local/<m>@<url>); the default judge claude-sonnet-4-5 requires\n" +
         "  Anthropic credentials (ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY)\n" +
@@ -2280,34 +2303,31 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
 
   // Item 9 — union the per-spec regression suite (<specName>-regressions,
   // pinned by `crewhaus optimize`) into the loaded dataset by default,
-  // deduped by sample id (the primary dataset wins on collision). The union
-  // changes the run's sample keyset, so datasetName gets a `+regressions@vX`
-  // suffix and datasetHash folds the suite's content hash in — the item-3
-  // run index/baselines then key on the honest union lineage (the first
-  // unioned run starts a new baseline lineage by design). Best-effort: a
-  // broken suite record must not take down the eval itself.
-  try {
-    const primarySamples = dataset.samples;
-    const union = await applyRegressionUnion({
+  // deduped by sample id (the primary dataset wins on collision). A union
+  // that ADDS samples changes the run's sample keyset, so datasetName gets a
+  // `+regressions@vX` suffix and datasetHash folds the suite's content hash
+  // in — the item-3 run index/baselines then key on the honest union lineage
+  // (the first adding union starts a new baseline lineage by design); a
+  // union that adds nothing keeps the primary identity so the existing
+  // lineage stays comparable. Best-effort AND stream-loss-proof: a broken
+  // suite record warns and falls back to the (already materialized when
+  // consumed) primary samples — see applyRegressionUnionGuarded.
+  {
+    const outcome = await applyRegressionUnionGuarded({
       registry: createFileBackedRegistry({ rootDir: defaultDatasetsRoot() }),
       specName: ir.name,
       includeRegressions: args.flags["no-regressions"] !== true,
       ...(registryRef !== undefined ? { primaryRegistryName: registryRef.name } : {}),
-      loadPrimarySamples: () => collectSamples(primarySamples),
-      datasetName: dataset.name,
+      primary: dataset,
       datasetHash,
     });
-    if (union !== undefined) {
-      dataset = { name: union.datasetName, samples: makeAsyncIterable(union.samples) };
-      datasetHash = union.datasetHash;
+    dataset = { name: outcome.datasetName, samples: outcome.samples };
+    datasetHash = outcome.datasetHash;
+    if (outcome.union !== undefined && outcome.union.added > 0) {
       process.stdout.write(
-        `[eval] + ${union.added} regression samples from ${union.suiteName}@${union.suiteVersion}\n`,
+        `[eval] + ${outcome.union.added} regression samples from ${outcome.union.suiteName}@${outcome.union.suiteVersion}\n`,
       );
     }
-  } catch (err) {
-    process.stderr.write(
-      `[eval] regression suite union skipped: ${err instanceof Error ? err.message : String(err)}\n`,
-    );
   }
 
   // Item 7 — the runner's noise auto-retry is ON by default; `--no-retry`
@@ -2394,11 +2414,15 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
   );
   writeFileSync(join(absOut, "index.html"), rendered.html);
 
+  // Item 7/F12 — surface retry activity: how many recorded outcomes replaced
+  // an errored first attempt (also recorded in the run index as retriedCount).
+  const retriedCount = summary.samples.filter((s) => s.retried === true).length;
   process.stdout.write(
     `[eval] runId=${summary.runId} pass_rate=${(summary.aggregates.passRate * 100).toFixed(1)}% ` +
       `mean_score=${summary.aggregates.meanScore.toFixed(3)} ` +
       `errors=${summary.aggregates.errorCount} ` +
-      `tokens=${summary.aggregates.totalTokens.input}/${summary.aggregates.totalTokens.output}\n`,
+      `tokens=${summary.aggregates.totalTokens.input}/${summary.aggregates.totalTokens.output}` +
+      `${retriedCount > 0 ? ` (${retriedCount} retried)` : ""}\n`,
   );
   process.stdout.write(`[eval] report: ${join(absOut, "index.html")}\n`);
 
@@ -2510,7 +2534,10 @@ async function runEvalReport(args: ParsedArgs): Promise<void> {
         "  diff <prev> <new> [-o <out-dir>]            compare two eval runs and emit a diff report\n" +
         "  history [--spec <name>] [--dataset <name>]  list recorded runs (.crewhaus/evals/index.jsonl)\n" +
         "  baseline show [--spec <n>] [--dataset <n>]  print pinned baselines (.crewhaus/evals/baselines.json)\n" +
-        "  baseline set <runId>                        pin a recorded run as its (spec, dataset) baseline\n",
+        "  baseline set <runId>                        pin a recorded run as its (spec, dataset) baseline\n" +
+        "  --dataset matches the recorded name exactly OR with a `+` suffix segment, so\n" +
+        "  `--dataset smoke` also finds runs recorded under the regression-suite union\n" +
+        "  name `smoke+regressions@vX`.\n",
     );
     return;
   }
@@ -2559,12 +2586,15 @@ async function runEvalReportDiff(args: ParsedArgs): Promise<void> {
   );
 }
 
-/** Filter helper shared by `history` and `baseline show`. */
+/** Filter helper shared by `history` and `baseline show`. The dataset
+ *  filter also matches `<filter>+…` union names — see datasetFilterMatches. */
 function matchesEvalFilters(args: ParsedArgs, specName: string, datasetName: string): boolean {
   const specFilter = args.flags["spec"];
   const datasetFilter = args.flags["dataset"];
   if (typeof specFilter === "string" && specName !== specFilter) return false;
-  if (typeof datasetFilter === "string" && datasetName !== datasetFilter) return false;
+  if (typeof datasetFilter === "string" && !datasetFilterMatches(datasetFilter, datasetName)) {
+    return false;
+  }
   return true;
 }
 
@@ -2591,7 +2621,18 @@ function runEvalReportHistory(args: ParsedArgs): void {
   // Mark the run(s) currently pinned as a baseline with `*`.
   const pinnedRunIds = new Set(Object.values(readBaselines()).map((b) => b.runId));
   writeTable(
-    ["ts", "runId", "spec", "dataset", "pass_rate", "mean_score", "samples", "base", "outDir"],
+    [
+      "ts",
+      "runId",
+      "spec",
+      "dataset",
+      "pass_rate",
+      "mean_score",
+      "samples",
+      "retried",
+      "base",
+      "outDir",
+    ],
     entries.map((e) => [
       e.ts,
       e.runId,
@@ -2600,6 +2641,8 @@ function runEvalReportHistory(args: ParsedArgs): void {
       `${(e.passRate * 100).toFixed(1)}%`,
       e.meanScore.toFixed(3),
       String(e.sampleCount),
+      // Additive field — entries recorded before it existed read as 0.
+      String(e.retriedCount ?? 0),
       pinnedRunIds.has(e.runId) ? "*" : "",
       e.outDir,
     ]),

@@ -166,13 +166,15 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
           });
         const first = await runOnce();
         // Noise auto-retry (failure-arbiter item 7): an errored SampleResult
-        // means the INVOKER failed (provider timeout, 429, sandbox blip) —
-        // infra noise, not a graded failure. Retry exactly once within the
-        // run; the retried outcome replaces the errored one wholesale (the
-        // second runSample rewrites the same per-sample artifact dir) and is
-        // tagged `retried: true` so reports and triage can tell. Skipped on
-        // SIGINT or when the caller opted out (`--no-retry`).
-        if (first.error === undefined || opts.retryErrors === false || interrupted) {
+        // means the INVOKER failed (provider timeout, 429, sandbox blip),
+        // and a graderError means a GRADER threw (judge infra blip) — both
+        // are infra noise, not graded failures. Retry exactly once within
+        // the run; the retried outcome replaces the errored one wholesale
+        // (the second runSample rewrites the same per-sample artifact dir)
+        // and is tagged `retried: true` so reports and triage can tell.
+        // Skipped on SIGINT or when the caller opted out (`--no-retry`).
+        const infraNoise = first.error !== undefined || first.graderError !== undefined;
+        if (!infraNoise || opts.retryErrors === false || interrupted) {
           return first;
         }
         return { ...(await runOnce()), retried: true };

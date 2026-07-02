@@ -35,6 +35,12 @@ export type RunIndexEntry = {
   readonly passRate: number;
   readonly meanScore: number;
   readonly sampleCount: number;
+  /**
+   * Samples whose recorded outcome replaced an errored first attempt via
+   * the runner's noise auto-retry (`SampleResult.retried`). Additive —
+   * absent on entries written before the field existed (read as 0).
+   */
+  readonly retriedCount?: number;
   /** ISO-8601 completion timestamp. */
   readonly ts: string;
   /** Absolute path to the run's output directory. */

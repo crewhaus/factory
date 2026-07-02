@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getBaseline, readRunIndex } from "@crewhaus/eval-report";
 import type { EvalRunSummary, SampleResult } from "@crewhaus/eval-runner";
-import { finishEvalRun, gateRuns } from "./eval-history";
+import { datasetFilterMatches, finishEvalRun, gateRuns } from "./eval-history";
 
 const TMP_ROOTS: string[] = [];
 function newTempRoot(): string {
@@ -306,17 +306,63 @@ describe("gateRuns — strict defaults", () => {
     expect(verdict.report.recoveries).toHaveLength(1);
   });
 
-  test("keeps regression-runner's p95 latency default (+5000ms fails)", () => {
+  test("F7: latency is NOT gated by default — the gate is pass-rate/flip-only, as documented", () => {
+    // Pre-fix this inherited regression-runner's +5000ms p95 default and
+    // failed runs the --gate help text said would pass.
     const prev = makeSummary("run_aaaa1111aaaa1111", [makeSample("a", true, 1)], out, 100);
-    const next = makeSummary("run_bbbb2222bbbb2222", [makeSample("a", true, 1)], out, 6000);
-    const verdict = gateRuns(prev, next);
-    expect(verdict.verdict).toBe("fail");
-    expect(verdict.reason).toMatch(/latency/);
+    const next = makeSummary("run_bbbb2222bbbb2222", [makeSample("a", true, 1)], out, 60_000);
+    expect(gateRuns(prev, next).verdict).toBe("pass");
   });
 
-  test("caller can loosen thresholds", () => {
+  test("caller can still opt INTO latency gating with an explicit threshold", () => {
     const prev = makeSummary("run_aaaa1111aaaa1111", [makeSample("a", true, 1)], out, 100);
     const next = makeSummary("run_bbbb2222bbbb2222", [makeSample("a", true, 1)], out, 6000);
+    const verdict = gateRuns(prev, next, { latencyThreshold: 5000 });
+    expect(verdict.verdict).toBe("fail");
+    expect(verdict.reason).toMatch(/latency/);
     expect(gateRuns(prev, next, { latencyThreshold: 10_000 }).verdict).toBe("pass");
+  });
+});
+
+describe("finishEvalRun — retried count + zero-sample belt (F12 / F6)", () => {
+  test("F12: the index entry records how many samples were retried", async () => {
+    const ctx = newCtx();
+    const samples: SampleResult[] = [
+      makeSample("a", true, 1),
+      { ...makeSample("b", true, 1), retried: true },
+      { ...makeSample("c", false, 0), retried: true },
+    ];
+    const run = makeRun(ctx, "run_aaaa1111aaaa1111", samples);
+    await finish(ctx, run);
+    const index = readRunIndex(ctx.evalsDir);
+    expect(index).toHaveLength(1);
+    expect(index[0]?.retriedCount).toBe(2);
+  });
+
+  test("F12: no retries → retriedCount 0", async () => {
+    const ctx = newCtx();
+    const run = makeRun(ctx, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)]);
+    await finish(ctx, run);
+    expect(readRunIndex(ctx.evalsDir)[0]?.retriedCount).toBe(0);
+  });
+
+  test("F6 belt: a 0-sample run throws loudly and records NOTHING (no index entry, no baseline)", async () => {
+    const ctx = newCtx();
+    const summary = makeSummary("run_zero000000000000", [], join(ctx.root, "run-zero"));
+    persistRun(summary);
+    await expect(finish(ctx, summary)).rejects.toThrow(/0-sample/);
+    expect(readRunIndex(ctx.evalsDir)).toHaveLength(0);
+    expect(getBaseline("concierge", "smoke", ctx.evalsDir)).toBeUndefined();
+  });
+});
+
+describe("datasetFilterMatches (F10 — `eval-report history --dataset`)", () => {
+  test("matches exact names and `+` union-suffixed names, not mere prefixes", () => {
+    expect(datasetFilterMatches("smoke", "smoke")).toBe(true);
+    expect(datasetFilterMatches("smoke", "smoke+regressions@v1")).toBe(true);
+    expect(datasetFilterMatches("smoke", "smoke2")).toBe(false);
+    expect(datasetFilterMatches("smoke", "smoke2+regressions@v1")).toBe(false);
+    expect(datasetFilterMatches("smoke+regressions@v1", "smoke+regressions@v1")).toBe(true);
+    expect(datasetFilterMatches("smoke+regressions@v1", "smoke")).toBe(false);
   });
 });

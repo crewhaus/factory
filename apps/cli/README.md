@@ -76,6 +76,13 @@ Run `crewhaus` with no arguments for the full usage text, or any subcommand with
 | `compliance evidence` | Collect SOC 2 / ISO 27001 / HIPAA evidence |
 | `version` | Print the CLI version (also `--version`, `-v`) |
 
+## Notes
+
+Known limitations of the eval run-history features:
+
+- **Baseline keys ignore spec identity beyond the name.** Run-index entries and baselines key on `(specName, datasetName)`; two different specs sharing a `name:` (or a spec whose instructions changed) share a lineage. The `specHash` is recorded in every index entry for forensics but does not partition baselines yet.
+- **1-sample matrix cells can misclassify a crash.** `eval --models` flags a cell as "never really ran" when *all* of its samples errored; with a 1-sample dataset a single transient provider error is indistinguishable from a bad credential, so the cell is reported as crashed rather than as a result row.
+
 ## Docs
 
 - [Documentation](https://crewhaus.ai/docs) — start with the [quickstart](https://crewhaus.ai/docs/quickstart) and the [CLI target guide](https://crewhaus.ai/docs/targets/cli)

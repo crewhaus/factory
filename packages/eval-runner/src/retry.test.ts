@@ -1,11 +1,12 @@
 /**
  * Item 7 — the runner's bounded noise auto-retry (`RunEvalOptions.retryErrors`,
  * default ON; `crewhaus eval --no-retry` opts out). A sample whose result is
- * an ERROR (the invoker failed — infra noise, not a graded failure) is retried
- * exactly once within the run; the retried outcome REPLACES the errored one
- * and is tagged `retried: true`. Aggregate honesty: retried samples appear
- * once in `samples`, so passRate's denominator counts each dataset sample
- * once (see the aggregate() doc comment).
+ * an ERROR (the invoker failed — infra noise, not a graded failure) or whose
+ * GRADER threw (`graderError` — judge infra noise) is retried exactly once
+ * within the run; the retried outcome REPLACES the errored one and is tagged
+ * `retried: true`. Aggregate honesty: retried samples appear once in
+ * `samples`, so passRate's denominator counts each dataset sample once (see
+ * the aggregate() doc comment).
  */
 import { afterAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -13,7 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { lower } from "@crewhaus/compiler";
 import type { Sample } from "@crewhaus/eval-dataset";
-import { parseGradersConfig } from "@crewhaus/eval-grader";
+import { type CompiledGrader, parseGradersConfig } from "@crewhaus/eval-grader";
 import type { IrNode, IrV0 } from "@crewhaus/ir";
 import { parseSpec } from "@crewhaus/spec";
 import { type AgentInvoker, runEval } from "./index";
@@ -157,5 +158,94 @@ describe("eval-runner noise auto-retry (item 7)", () => {
     expect(summary.aggregates.passRate).toBe(0);
     expect(summary.aggregates.errorCount).toBe(0);
     expect(summary.samples.every((s) => s.retried === undefined)).toBe(true);
+  });
+});
+
+// -------- grader-throw retry (F3) --------
+
+/** Invoker that always answers correctly (so only the grader can fail). */
+const correctInvoker: AgentInvoker = async (req) => ({
+  agentOutput: req.sample.expected_output ?? "",
+});
+
+/** A grader that throws the first `failures` grade calls for `flaky`, then
+ *  passes. Counts every grading attempt per sample. */
+function flakyGrader(failures: number, gradeCalls: Map<string, number>): CompiledGrader {
+  return {
+    name: "flaky-judge",
+    weight: 1,
+    grader: async (sample, run) => {
+      const n = (gradeCalls.get(sample.id) ?? 0) + 1;
+      gradeCalls.set(sample.id, n);
+      if (sample.id === "flaky" && n <= failures) {
+        throw new Error("429 rate limit exceeded contacting judge provider");
+      }
+      return {
+        passed: run.agentOutput === sample.expected_output,
+        score: run.agentOutput === sample.expected_output ? 1 : 0,
+        rationale: "judged",
+      };
+    },
+  };
+}
+
+describe("eval-runner grader-throw retry (F3)", () => {
+  test("grader throws once → sample retried once → clean pass, no graderError left", async () => {
+    const gradeCalls = new Map<string, number>();
+    const summary = await runEval({
+      ir: narrowToAgent(lower(parseSpec(HELLO_SPEC))),
+      dataset: { name: "retry-fixture", samples: yieldSamples(SAMPLES) },
+      compiledGraders: [flakyGrader(1, gradeCalls)],
+      // No retryErrors option — grader throws retry by DEFAULT, like errors.
+      opts: { outDir: join(newTempRoot(), "run"), invoker: correctInvoker },
+    });
+
+    expect(gradeCalls.get("flaky")).toBe(2); // one retry, no more
+    expect(gradeCalls.get("steady")).toBe(1);
+    const flaky = summary.samples.find((s) => s.sampleId === "flaky");
+    expect(flaky?.retried).toBe(true);
+    expect(flaky?.graderError).toBeUndefined(); // the retry graded cleanly
+    expect(flaky?.error).toBeUndefined();
+    expect(flaky?.grades.overall.passed).toBe(true);
+    expect(summary.aggregates.passRate).toBe(1);
+    expect(summary.aggregates.errorCount).toBe(0);
+  });
+
+  test("grader throws on BOTH attempts → failure keeps structured graderError (for triage)", async () => {
+    const gradeCalls = new Map<string, number>();
+    const summary = await runEval({
+      ir: narrowToAgent(lower(parseSpec(HELLO_SPEC))),
+      dataset: { name: "retry-fixture", samples: yieldSamples(SAMPLES) },
+      compiledGraders: [flakyGrader(Number.POSITIVE_INFINITY, gradeCalls)],
+      opts: { outDir: join(newTempRoot(), "run"), invoker: correctInvoker },
+    });
+
+    expect(gradeCalls.get("flaky")).toBe(2); // bounded: never a third attempt
+    const flaky = summary.samples.find((s) => s.sampleId === "flaky");
+    expect(flaky?.retried).toBe(true);
+    expect(flaky?.error).toBeUndefined(); // the INVOKER was fine
+    expect(flaky?.graderError).toContain("grader threw:");
+    expect(flaky?.graderError).toContain("flaky-judge");
+    expect(flaky?.graderError).toContain("429 rate limit");
+    expect(flaky?.grades.overall.passed).toBe(false);
+    // A grader-infra failure is a graded failure, not an invoker error.
+    expect(summary.aggregates.errorCount).toBe(0);
+    expect(summary.aggregates.passRate).toBe(0.5);
+  });
+
+  test("retryErrors: false (--no-retry) keeps the grader-thrown first attempt untouched", async () => {
+    const gradeCalls = new Map<string, number>();
+    const summary = await runEval({
+      ir: narrowToAgent(lower(parseSpec(HELLO_SPEC))),
+      dataset: { name: "retry-fixture", samples: yieldSamples(SAMPLES) },
+      compiledGraders: [flakyGrader(1, gradeCalls)],
+      opts: { outDir: join(newTempRoot(), "run"), invoker: correctInvoker, retryErrors: false },
+    });
+
+    expect(gradeCalls.get("flaky")).toBe(1);
+    const flaky = summary.samples.find((s) => s.sampleId === "flaky");
+    expect(flaky?.retried).toBeUndefined();
+    expect(flaky?.graderError).toContain("429 rate limit");
+    expect(flaky?.grades.overall.passed).toBe(false);
   });
 });

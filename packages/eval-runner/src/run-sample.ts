@@ -110,19 +110,28 @@ export async function runSample(args: {
   };
 
   const perGrader: Array<{ name: string } & GradeResult> = [];
+  // A grader throwing is grader INFRA noise (judge 429/timeout), not a graded
+  // verdict on the agent's output. It still lands as a failed perGrader entry
+  // (so `overall` honestly fails), but the structured `graderError` below
+  // lets the run loop retry the sample and triage classify it as noise.
+  const graderErrors: string[] = [];
   for (const g of graders) {
     let result: GradeResult;
     try {
       result = await g.grader(sample, runResult);
     } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      graderErrors.push(`${g.name}: ${msg}`);
       result = {
         passed: false,
         score: 0,
-        rationale: `grader threw: ${err instanceof Error ? err.message : String(err)}`,
+        rationale: `grader threw: ${msg}`,
       };
     }
     perGrader.push({ name: g.name, ...result });
   }
+  const graderError =
+    graderErrors.length > 0 ? `grader threw: ${graderErrors.join("; ")}` : undefined;
 
   // Overall = AND of all graders, score = mean.
   const overall: GradeResult = {
@@ -147,6 +156,7 @@ export async function runSample(args: {
     agentOutput,
     grades: { overall, perGrader },
     ...(error !== undefined ? { error } : {}),
+    ...(graderError !== undefined ? { graderError } : {}),
   };
 
   await Bun.write(join(sampleDir, "grades.json"), JSON.stringify(sampleResult.grades, null, 2));
@@ -163,6 +173,7 @@ export async function runSample(args: {
         tokens,
         model,
         ...(error !== undefined ? { error } : {}),
+        ...(graderError !== undefined ? { graderError } : {}),
         ...(args.seed !== undefined ? { seed: args.seed } : {}),
       },
       null,

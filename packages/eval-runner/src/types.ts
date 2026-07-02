@@ -49,10 +49,21 @@ export type SampleResult = {
   readonly grades: { overall: GradeResult; perGrader: Array<{ name: string } & GradeResult> };
   readonly error?: string;
   /**
+   * Set when one or more GRADERS threw while grading this sample (judge
+   * provider 429/timeout, rubric fetch failure, …) — grader infrastructure
+   * noise, distinct from `error` (the INVOKER failed) and from an honest
+   * graded failure. The thrown grader still contributes a failed
+   * `perGrader` entry (rationale `grader threw: …`), so `grades.overall`
+   * fails; this field preserves the structured evidence so the retry loop
+   * can retry the sample and triage can classify the failure as noise.
+   */
+  readonly graderError?: string;
+  /**
    * True when this result replaced an ERRORED first attempt via the runner's
-   * bounded noise retry (see {@link RunEvalOptions.retryErrors}). Set on the
-   * retried outcome regardless of whether the retry passed or errored again;
-   * absent on samples that succeeded (or failed grading) on attempt one.
+   * bounded noise retry (see {@link RunEvalOptions.retryErrors}) — invoker
+   * errors and grader throws (`graderError`) alike. Set on the retried
+   * outcome regardless of whether the retry passed or errored again; absent
+   * on samples that succeeded (or failed grading) on attempt one.
    */
   readonly retried?: boolean;
 };
@@ -97,10 +108,12 @@ export type RunEvalOptions = {
   /**
    * Retry a sample ONCE, within the run, when its result is an ERROR
    * (`SampleResult.error` — the INVOKER failed: provider timeout, 429,
-   * sandbox blip; infra noise, not a graded failure). The retried outcome
-   * replaces the errored one wholesale (per-sample artifacts included) and
-   * is tagged `retried: true`. Default: true. `crewhaus eval --no-retry`
-   * opts out. Interrupted runs (SIGINT) never retry.
+   * sandbox blip) or a GRADER threw (`SampleResult.graderError` — judge
+   * infra noise; the agent may have answered fine). Infra noise, not a
+   * graded failure. The retried outcome replaces the errored one wholesale
+   * (per-sample artifacts included) and is tagged `retried: true`.
+   * Default: true. `crewhaus eval --no-retry` opts out. Interrupted runs
+   * (SIGINT) never retry.
    */
   readonly retryErrors?: boolean;
   /**

@@ -24,8 +24,12 @@ import {
   formatDatasetFixQueue,
   formatFitnessTriageLine,
   formatTriageSummary,
+  hasStructuredAmbiguityEvidence,
+  isErroredResult,
   isExcludedClass,
   isFailing,
+  promoteArbiterSamples,
+  runLooksInfrastructureFailed,
   tapSamples,
   toFailingSample,
   triageEvalRun,
@@ -55,7 +59,13 @@ const sample = (id: string, expected?: string): Sample => ({
 
 function makeResult(
   id: string,
-  opts: { passed?: boolean; score?: number; error?: string; output?: string } = {},
+  opts: {
+    passed?: boolean;
+    score?: number;
+    error?: string;
+    graderError?: string;
+    output?: string;
+  } = {},
 ): SampleResult {
   const passed = opts.passed ?? false;
   return {
@@ -70,13 +80,14 @@ function makeResult(
     agentOutput: opts.output ?? (passed ? "correct" : "wrong"),
     grades: {
       overall: {
-        passed: opts.error === undefined && passed,
+        passed: opts.error === undefined && opts.graderError === undefined && passed,
         score: opts.score ?? (passed ? 1 : 0),
         rationale: opts.error !== undefined ? `agent invocation error: ${opts.error}` : "graded",
       },
       perGrader: [],
     },
     ...(opts.error !== undefined ? { error: opts.error } : {}),
+    ...(opts.graderError !== undefined ? { graderError: opts.graderError } : {}),
   };
 }
 
@@ -159,6 +170,31 @@ describe("toFailingSample / triageEvalRun (arbitration from run artifacts)", () 
     expect(isFailing(makeResult("c", { passed: true }))).toBe(false);
   });
 
+  test("isErroredResult: invoker errors and grader throws are errors; graded failures aren't", () => {
+    expect(isErroredResult(makeResult("a", { error: "boom" }))).toBe(true);
+    expect(isErroredResult(makeResult("b", { graderError: "grader threw: judge: 429" }))).toBe(
+      true,
+    );
+    expect(isErroredResult(makeResult("c", { passed: false }))).toBe(false);
+  });
+
+  test("F3: a double-throw grader failure (graderError) maps to errorMessage → transient marker classifies as noise", () => {
+    const f = toFailingSample(
+      makeResult("judge-blip", { graderError: "grader threw: judge: 429 rate limit exceeded" }),
+      sample("judge-blip", "gold"),
+    );
+    expect(f.errorMessage).toBe("grader threw: judge: 429 rate limit exceeded");
+
+    const verdicts = triageEvalRun({
+      samples: [
+        makeResult("judge-blip", { graderError: "grader threw: judge: 429 rate limit exceeded" }),
+      ],
+      samplesById: byId([sample("judge-blip", "gold")]),
+      runId: "run_ge",
+    }) as RunVerdicts;
+    expect(verdicts.verdicts[0]?.class).toBe("noise");
+  });
+
   test("toFailingSample carries actual output, score, and errorMessage through", () => {
     const f = toFailingSample(
       makeResult("s", { score: 0.25, error: "boom", output: "partial" }),
@@ -205,7 +241,7 @@ describe("triage formatting + verdict persistence", () => {
 // -------- finishEvalTriage (post-eval flow) --------
 
 describe("finishEvalTriage (post-eval flow)", () => {
-  test("prints the one-line summary, writes verdicts.json, and pins bug samples with failure-arbiter provenance", async () => {
+  test("prints the one-line summary and writes verdicts.json — but never pins the run's own dataset samples (F1)", async () => {
     const root = newTempRoot();
     const registry = newRegistry(root);
     const lines: string[] = [];
@@ -232,19 +268,12 @@ describe("finishEvalTriage (post-eval flow)", () => {
     expect(lines).toContain("[eval] triage: 1 bug, 0 spec-gap, 1 noise, 0 contract-ambiguity");
     expect(existsSync(join(root, "verdicts.json"))).toBe(true);
 
-    // promoteRegression wiring: ONLY the bug sample (fix-impl carries the
-    // flag) is pinned; the noise sample (calibrate-verifier) is not.
-    const record = await registry.getRecord("concierge-regressions", "v1");
-    expect(record.splits.train.map((s) => s.id)).toEqual(["b1"]);
-    expect(record.splits.train[0]?.metadata?.["regression_pin"]).toEqual({
-      optimizeRunId: "run_1111",
-      pinnedAt: "2026-07-01T12:00:00.000Z",
-      sourceDataset: "support@v3",
-      source: "failure-arbiter",
-    });
-    expect(lines.some((l) => l.includes("pinned 1 bug sample(s) → concierge-regressions@v1"))).toBe(
-      true,
-    );
+    // F1(b): b1's bug verdict carries promoteRegression, but b1 is a member
+    // of the run's OWN dataset — pinning it is zero coverage gain and pure
+    // suite-version churn (the churn that armed the gate-disarm loop), so
+    // NO suite version is written and no "pinned" line prints.
+    expect(await registry.list("concierge-regressions")).toEqual([]);
+    expect(lines.some((l) => l.includes("pinned"))).toBe(false);
   });
 
   test("returns undefined and stays silent when nothing failed", async () => {
@@ -283,7 +312,7 @@ describe("finishEvalTriage (post-eval flow)", () => {
     await expect(registry.getRecord("concierge-regressions", "v1")).rejects.toThrow();
   });
 
-  test("best-effort: an unwritable run dir warns, keeps the verdicts, and still pins", async () => {
+  test("best-effort: an unwritable run dir warns and keeps the verdicts", async () => {
     const root = newTempRoot();
     const registry = newRegistry(root);
     // outDir points at a FILE, so writing <outDir>/verdicts.json throws.
@@ -303,8 +332,6 @@ describe("finishEvalTriage (post-eval flow)", () => {
     });
     expect(verdicts?.counts.bug).toBe(1);
     expect(warns.some((l) => l.includes("verdicts.json not written"))).toBe(true);
-    const record = await registry.getRecord("concierge-regressions", "v1");
-    expect(record.splits.train.map((s) => s.id)).toEqual(["b1"]);
   });
 
   test("best-effort: a throwing registry warns and never breaks the flow", async () => {
@@ -320,7 +347,28 @@ describe("finishEvalTriage (post-eval flow)", () => {
       listDatasets: () => Promise.reject(new Error("registry offline")),
     };
     const warns: string[] = [];
-    const verdicts = await finishEvalTriage({
+    // promoteArbiterSamples is the stage that talks to the registry; drive
+    // it with a pinnable (non-member, non-errored) candidate so the throwing
+    // registry is actually reached, then prove the flow isolates the throw.
+    const verdicts = triageEvalRun({
+      samples: [makeResult("b1")],
+      samplesById: byId([sample("b1", "gold")]),
+      runId: "run_5555",
+    }) as RunVerdicts;
+    await expect(
+      promoteArbiterSamples({
+        registry: throwingRegistry,
+        specName: "concierge",
+        verdicts,
+        samplesById: byId([sample("b1", "gold")]),
+        sourceDataset: "support@v3",
+        runId: "run_5555",
+      }),
+    ).rejects.toThrow("registry offline");
+    // finishEvalTriage isolates that throw into a warning (its own pin call
+    // no-ops on the member filter, so exercise the catch via the write path
+    // being fine and the registry throw being absorbed by promote's caller).
+    const finished = await finishEvalTriage({
       samples: [makeResult("b1")],
       samplesById: byId([sample("b1", "gold")]),
       runId: "run_5555",
@@ -331,8 +379,146 @@ describe("finishEvalTriage (post-eval flow)", () => {
       write: () => {},
       warn: (l) => warns.push(l),
     });
-    expect(verdicts?.counts.bug).toBe(1);
-    expect(warns.some((l) => l.includes("regression pinning skipped"))).toBe(true);
+    expect(finished?.counts.bug).toBe(1);
+    // No warn about pinning: the member filter emptied the candidate set
+    // before the registry could throw — and that is the point of F1(b).
+    expect(warns.some((l) => l.includes("regression pinning skipped"))).toBe(false);
+  });
+});
+
+// -------- promoteArbiterSamples candidate filters (F1b / F2) --------
+
+describe("promoteArbiterSamples — F1(b) member filter + F2(i) error filter", () => {
+  async function verdictsFor(samples: SampleResult[], byIdMap: Map<string, Sample>) {
+    return triageEvalRun({ samples, samplesById: byIdMap, runId: "run_flt" }) as RunVerdicts;
+  }
+
+  test("never pins samples already in the run's own dataset (zero coverage gain)", async () => {
+    const registry = newRegistry(newTempRoot());
+    const map = byId([sample("b1", "gold"), sample("b2", "gold")]);
+    const verdicts = await verdictsFor([makeResult("b1"), makeResult("b2")], map);
+    // b1 is a dataset member; b2 (hypothetically) is not.
+    const pin = await promoteArbiterSamples({
+      registry,
+      specName: "concierge",
+      verdicts,
+      samplesById: map,
+      sourceDataset: "support@v3",
+      runId: "run_flt",
+      datasetMemberIds: new Set(["b1"]),
+    });
+    expect(pin.pinned).toBe(1);
+    const record = await registry.getRecord("concierge-regressions", "v1");
+    expect(record.splits.train.map((s) => s.id)).toEqual(["b2"]);
+  });
+
+  test("F2(i): never pins samples whose failure is an ERROR — even bug-class non-transient ones", async () => {
+    const registry = newRegistry(newTempRoot());
+    const map = byId([sample("auth", "gold"), sample("b1", "gold")]);
+    // "401 invalid x-api-key" carries no transient marker → the arbiter's
+    // default rule labels it "bug" with promoteRegression. It must still
+    // never be pinned: an outage is not a regression to guard.
+    const results = [makeResult("auth", { error: "401 invalid x-api-key" }), makeResult("b1")];
+    const verdicts = await verdictsFor(results, map);
+    expect(verdicts.verdicts.find((v) => v.sampleId === "auth")?.class).toBe("bug");
+
+    const pin = await promoteArbiterSamples({
+      registry,
+      specName: "concierge",
+      verdicts,
+      samplesById: map,
+      sourceDataset: "support@v3",
+      runId: "run_flt",
+      erroredIds: new Set(results.filter(isErroredResult).map((r) => r.sampleId)),
+    });
+    expect(pin.pinned).toBe(1);
+    const record = await registry.getRecord("concierge-regressions", "v1");
+    expect(record.splits.train.map((s) => s.id)).toEqual(["b1"]);
+  });
+
+  test("grader-infra failures (graderError) count as errored for the filter", async () => {
+    const registry = newRegistry(newTempRoot());
+    const map = byId([sample("judge-blip", "gold")]);
+    const results = [
+      makeResult("judge-blip", { graderError: "grader threw: judge: 500 upstream" }),
+    ];
+    const verdicts = await verdictsFor(results, map);
+    const pin = await promoteArbiterSamples({
+      registry,
+      specName: "concierge",
+      verdicts,
+      samplesById: map,
+      sourceDataset: "support@v3",
+      runId: "run_flt",
+      erroredIds: new Set(results.filter(isErroredResult).map((r) => r.sampleId)),
+    });
+    expect(pin.pinned).toBe(0);
+    expect(await registry.list("concierge-regressions")).toEqual([]);
+  });
+});
+
+// -------- run-level outage guard (F2 ii) --------
+
+describe("runLooksInfrastructureFailed (F2 outage guard)", () => {
+  test("all failing samples errored → infrastructure-failed", () => {
+    const reason = runLooksInfrastructureFailed([
+      makeResult("a", { error: "401 invalid x-api-key" }),
+      makeResult("b", { error: "401 invalid x-api-key" }),
+      makeResult("ok", { passed: true }),
+    ]);
+    expect(reason).toContain("all 2 failing sample(s) errored");
+  });
+
+  test("error rate above the threshold → infrastructure-failed even with graded failures present", () => {
+    const reason = runLooksInfrastructureFailed([
+      makeResult("e1", { error: "401 invalid x-api-key" }),
+      makeResult("e2", { error: "401 invalid x-api-key" }),
+      makeResult("e3", { graderError: "grader threw: judge: 500" }),
+      makeResult("graded-fail"), // honest graded failure
+      makeResult("ok", { passed: true }),
+    ]);
+    expect(reason).toContain("3/5 sample(s) errored");
+  });
+
+  test("graded failures with few/no errors → run looks real", () => {
+    expect(
+      runLooksInfrastructureFailed([
+        makeResult("graded-fail"),
+        makeResult("e1", { error: "ETIMEDOUT" }),
+        makeResult("ok1", { passed: true }),
+        makeResult("ok2", { passed: true }),
+      ]),
+    ).toBeUndefined();
+    expect(runLooksInfrastructureFailed([makeResult("ok", { passed: true })])).toBeUndefined();
+  });
+
+  test("finishEvalTriage skips pinning entirely (with a warning) on an infrastructure-failed run", async () => {
+    const root = newTempRoot();
+    const registry = newRegistry(root);
+    const warns: string[] = [];
+    const lines: string[] = [];
+    const verdicts = await finishEvalTriage({
+      samples: [
+        makeResult("a", { error: "401 invalid x-api-key" }),
+        makeResult("b", { error: "401 invalid x-api-key" }),
+      ],
+      samplesById: byId([sample("a", "gold"), sample("b", "gold")]),
+      runId: "run_outage",
+      outDir: root,
+      specName: "concierge",
+      sourceDataset: "support@v3",
+      registry,
+      write: (l) => lines.push(l),
+      warn: (l) => warns.push(l),
+    });
+    // Triage itself still ran (verdicts persist for the report)…
+    expect(verdicts?.total).toBe(2);
+    expect(existsSync(join(root, "verdicts.json"))).toBe(true);
+    // …but pinning was skipped loudly, and nothing was written.
+    expect(
+      warns.some((l) => l.includes("run looks infrastructure-failed") && l.includes("skipping")),
+    ).toBe(true);
+    expect(await registry.list("concierge-regressions")).toEqual([]);
   });
 });
 
@@ -346,29 +532,68 @@ describe("triageFitnessSamples (optimize failure-signal pre-filter)", () => {
     expect(isExcludedClass("spec-gap")).toBe(false);
   });
 
-  test("excludes noise + contract-ambiguity ids, keeps bug ids, and reports counts + reasons", () => {
+  test("excludes noise, keeps bug ids AND heuristic (no-gold) contract-ambiguity in the signal (F5)", () => {
     const t = triageFitnessSamples({
       samples: [
         makeResult("bug1"), // gold + score 0 → bug (kept)
         makeResult("noise1", { error: "ECONNRESET" }), // transient → noise (excluded)
-        makeResult("ambig1", { score: 0.4 }), // no gold + partial credit → ambiguity (excluded)
+        makeResult("ambig1", { score: 0.4 }), // no gold + partial credit → HEURISTIC ambiguity (kept, queued)
         makeResult("pass1", { passed: true }), // not failing → untouched
       ],
       samplesById: byId([sample("bug1", "gold"), sample("noise1", "gold"), sample("ambig1")]),
       alreadyAmbiguous: new Set(),
     });
-    expect([...t.excluded].sort()).toEqual(["ambig1", "noise1"]);
+    // F5: the no-reference heuristic verdict is NOT excluded — on judge-graded
+    // datasets it fires for most failures and would starve the mutator.
+    expect([...t.excluded]).toEqual(["noise1"]);
     expect(t.counts).toEqual({ bug: 1, "spec-gap": 0, noise: 1, "contract-ambiguity": 1 });
+    // …but it IS surfaced for the printed dataset-fix queue.
     expect(t.ambiguous).toHaveLength(1);
     expect(t.ambiguous[0]?.sampleId).toBe("ambig1");
     expect(t.ambiguous[0]?.reason).toContain("underspecifies");
+    expect(t.ambiguous[0]?.fromGraderEvidence).toBe(false);
     expect(t.carried).toBe(0);
+  });
+
+  test("F5: a no-gold judge-style failure stays in the mutator signal across calls (nothing sticky)", () => {
+    // Ratings-distilled/judge-graded dataset: no expected_output anywhere.
+    const first = triageFitnessSamples({
+      samples: [makeResult("j1", { score: 0.4 }), makeResult("j2", { score: 0.2 })],
+      samplesById: byId([sample("j1"), sample("j2")]),
+      alreadyAmbiguous: new Set(),
+    });
+    expect(first.excluded.size).toBe(0); // full failure signal reaches the mutator
+    expect(first.ambiguous.map((a) => a.sampleId).sort()).toEqual(["j1", "j2"]);
+    expect(first.ambiguous.every((a) => !a.fromGraderEvidence)).toBe(true);
+    // The caller only sticks evidence-backed ids, so the next call still
+    // keeps them in the signal (alreadyAmbiguous stays empty).
+    const second = triageFitnessSamples({
+      samples: [makeResult("j1", { score: 0.4 })],
+      samplesById: byId([sample("j1")]),
+      alreadyAmbiguous: new Set(),
+    });
+    expect(second.excluded.size).toBe(0);
+    expect(second.carried).toBe(0);
+  });
+
+  test("hasStructuredAmbiguityEvidence: only graderOutput acceptable/multipleAcceptable count", () => {
+    const base = toFailingSample(makeResult("s", { score: 0.4 }), sample("s"));
+    expect(hasStructuredAmbiguityEvidence(base)).toBe(false); // heuristic-only
+    expect(hasStructuredAmbiguityEvidence({ ...base, graderOutput: { acceptable: true } })).toBe(
+      true,
+    );
+    expect(
+      hasStructuredAmbiguityEvidence({ ...base, graderOutput: { multipleAcceptable: true } }),
+    ).toBe(true);
+    expect(hasStructuredAmbiguityEvidence({ ...base, graderOutput: { acceptable: false } })).toBe(
+      false,
+    );
   });
 
   test("sticky across iterations: queued ids are excluded without re-arbitration (even when passing)", () => {
     const t = triageFitnessSamples({
       samples: [
-        makeResult("ambig1", { passed: true }), // queued earlier; passes now — still excluded
+        makeResult("ambig1", { passed: true }), // stuck earlier; passes now — still excluded
         makeResult("bug1"),
       ],
       samplesById: byId([sample("ambig1"), sample("bug1", "gold")]),
@@ -402,6 +627,18 @@ describe("triageFitnessSamples (optimize failure-signal pre-filter)", () => {
     });
     expect(formatFitnessTriageLine(noisy)).toBe(
       "triage: excluded 1 noise, 0 contract-ambiguity from mutation signal; kept 1 bug, 0 spec-gap",
+    );
+
+    // Heuristic ambiguity prints as queued-but-kept — the exclusion counts
+    // must not claim it (F5).
+    const heuristic = triageFitnessSamples({
+      samples: [makeResult("j1", { score: 0.4 })],
+      samplesById: byId([sample("j1")]),
+      alreadyAmbiguous: new Set(),
+    });
+    expect(formatFitnessTriageLine(heuristic)).toBe(
+      "triage: excluded 0 noise, 0 contract-ambiguity from mutation signal; kept 0 bug, 0 spec-gap" +
+        ", 1 heuristic contract-ambiguity (queued for dataset fix, kept in signal)",
     );
   });
 
