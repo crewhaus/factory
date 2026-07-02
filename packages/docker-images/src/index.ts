@@ -19,9 +19,12 @@ import { fileURLToPath } from "node:url";
  *   - `loadDigests()` / `recordDigest()` over a `docker/digests.json`
  *     lockfile so reproducible builds work offline.
  *   - `resolveImageDigest()` + `buildImageAndRecord()` — item 47 closes the
- *     digests.json loop: the CLI records every successful local build's
- *     content digest by default, and the release workflow records the
- *     pushed ghcr.io digests for each v* tag.
+ *     digests.json loop: PUSHED builds record their registry manifest digest
+ *     (the only digest `docker pull repo@sha256:…` accepts), and the release
+ *     workflow records the pushed ghcr.io digests for each v* tag. A local
+ *     `--load` build records NOTHING — `docker image inspect`'s `.Id` is the
+ *     image CONFIG digest, which no registry can serve, so writing it into
+ *     the lockfile would hand users an unpullable pin.
  */
 import { CrewhausError } from "@crewhaus/errors";
 
@@ -221,24 +224,22 @@ export function recordDigest(
 export type ResolveImageDigestOptions = {
   readonly target: TargetShape;
   readonly tag: string;
-  /**
-   * Whether the image was built with `--push`. A pushed buildx build never
-   * lands in the local image store, so the digest comes from the registry
-   * (`docker buildx imagetools inspect`); a `--load` build is inspected
-   * locally (`docker image inspect`, whose `.Id` IS the content digest).
-   */
-  readonly pushed?: boolean;
   /** Test injection point — defaults to the same spawn runner as buildImage. */
   readonly runner?: BuildRunner;
 };
 
 const SHA256_DIGEST_RE = /sha256:[0-9a-f]{64}/;
 
+/**
+ * Resolve a PUSHED image's registry manifest digest via `docker buildx
+ * imagetools inspect`. Only the manifest digest is pullable
+ * (`docker pull repo@sha256:…`); the local image store's `.Id` is the image
+ * CONFIG digest, which registries do not serve — so there is deliberately no
+ * local-inspect fallback here (a `--load` build has no recordable digest).
+ */
 export async function resolveImageDigest(opts: ResolveImageDigestOptions): Promise<string> {
   const ref = `crewhaus/${opts.target}:${opts.tag}`;
-  const argv = opts.pushed
-    ? ["docker", "buildx", "imagetools", "inspect", ref]
-    : ["docker", "image", "inspect", "--format", "{{.Id}}", ref];
+  const argv = ["docker", "buildx", "imagetools", "inspect", ref];
   const runner = opts.runner ?? defaultRunner;
   const { exitCode, stdout, stderr } = await runner(argv, process.cwd());
   if (exitCode !== 0) {
@@ -263,21 +264,30 @@ export type BuildImageAndRecordOptions = BuildImageOptions & {
 };
 
 export type BuildImageAndRecordResult = BuildImageResult & {
-  /** Content digest of the built image; undefined when recording was skipped or failed. */
+  /** Registry manifest digest of the pushed image; undefined when recording was skipped or failed. */
   readonly digest?: string;
   readonly recorded: boolean;
   /** Why the digest was not recorded (set only when recording was requested but failed). */
   readonly recordError?: string;
+  /**
+   * Set when recording was requested but is not applicable: a `--load` build
+   * only produces a local image whose ID is a CONFIG digest, not a pullable
+   * registry manifest digest, so nothing truthful can land in the lockfile.
+   */
+  readonly recordSkippedReason?: string;
 };
 
 /**
- * `buildImage()` + close the digests.json loop: after a successful build,
- * resolve the image's content digest and record it in the lockfile — the
- * maintenance the digests.json header always promised. `crewhaus
- * build-image` calls this (recording is default-on there; `--no-record`
- * opts out). A digest-resolution/record failure does NOT fail the build —
- * the image exists; the caller decides how loudly to surface the stale
- * lockfile (the CLI prints a warning).
+ * `buildImage()` + close the digests.json loop: after a successful PUSHED
+ * build, resolve the image's registry manifest digest (`docker buildx
+ * imagetools inspect`) and record it in the lockfile — the maintenance the
+ * digests.json header always promised. `crewhaus build-image --push` calls
+ * this (recording is default-on there; `--no-record` opts out). A local
+ * `--load` build records NOTHING (see `recordSkippedReason`): its image ID is
+ * a config digest that `docker pull repo@sha256:…` cannot resolve, and the
+ * lockfile must only ever contain pullable pins. A digest-resolution/record
+ * failure does NOT fail the build — the image exists; the caller decides how
+ * loudly to surface the stale lockfile (the CLI prints a warning).
  */
 export async function buildImageAndRecord(
   opts: BuildImageAndRecordOptions,
@@ -286,12 +296,19 @@ export async function buildImageAndRecord(
   if (opts.record === false) {
     return { ...result, recorded: false };
   }
+  if (opts.push !== true) {
+    return {
+      ...result,
+      recorded: false,
+      recordSkippedReason:
+        "local image ID is not a registry digest — use --push to record a pullable digest",
+    };
+  }
   const record = opts.recordDigestFn ?? recordDigest;
   try {
     const digest = await resolveImageDigest({
       target: opts.target,
       tag: opts.tag,
-      pushed: opts.push === true,
       runner: opts.runner,
     });
     record(opts.target, opts.tag, digest, opts.digestsFile);

@@ -6,12 +6,19 @@
 target: channel
 
 image:
-  repository: crewhaus/${target}
+  # Registry + namespace prefix for the per-shape images. The image NAME is
+  # always derived from `target` (<registry>/<target>), so this is the only
+  # knob needed to point at a mirror or private registry. The default matches
+  # where the release workflow actually publishes — nothing publishes to
+  # docker.io.
+  registry: ghcr.io/crewhaus
   tag: latest
-  # Optional content-digest pin. When set to "sha256:<64 hex>" (as recorded in
-  # packages/docker-images/docker/digests.json by `crewhaus build-image` and the
-  # release workflow), the Deployment references crewhaus/<target>@sha256:...
-  # and `tag` is ignored — reproducible, tamper-evident deploys.
+  # Optional content-digest pin. When set to "sha256:<64 hex>" (a REGISTRY
+  # MANIFEST digest, as recorded in packages/docker-images/docker/digests.json
+  # by `crewhaus build-image --push` and the release workflow's docker-digests
+  # job — local --load builds record nothing pullable), the Deployment
+  # references <registry>/<target>@sha256:... and `tag` is ignored —
+  # reproducible, tamper-evident deploys.
   # digest: "sha256:<digest>"
   pullPolicy: IfNotPresent
   pullSecrets: []

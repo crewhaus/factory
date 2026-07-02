@@ -10,23 +10,29 @@
  *      @crewhaus/smoke-harness applied generically (fixture-only anchors
  *      skipped). Offline + deterministic; skipped only when the target
  *      ships no assertion.
- *   2. install — `bun install` in the out-dir. When the emitter didn't
- *      produce a package.json (only the cf-worker shapes do), a minimal one
- *      is synthesized from the bundle's @crewhaus imports; versions resolve
- *      to the published packages a released CLI emits against.
+ *   2. install — `bun install` in the out-dir (bounded by a 120s timeout so
+ *      a hung registry cannot hang the compile forever). When the emitter
+ *      didn't produce a package.json (only the cf-worker shapes do), a
+ *      minimal one is synthesized from the bundle's @crewhaus imports,
+ *      pinned to this CLI's own version (the packages publish in lockstep,
+ *      so that is exactly the contract this CLI's bundles run against).
  *   3. boot — spawn the bundle's entrypoint once, CREDENTIAL-FREE (env
- *      scrubbed to PATH/HOME), with `doctor --liveness` semantics: booting
- *      far enough to reach the shape's own credential/input gate IS the
- *      signal (see BOOT_GATE_PATTERNS — derived empirically by booting
- *      every fixture bundle key-less). Scrubbing is deliberate: with real
- *      credentials in the env, autonomous shapes (workflow, batch, …)
- *      would EXECUTE their agent on boot — paid model calls from a compile
- *      flag. Shapes whose boot needs live credentials/servers therefore
- *      degrade to "gated" (green) and the verdict reports which step ran;
- *      a structural break (SyntaxError, unresolved import) matches no gate
- *      and stays red.
+ *      scrubbed to PATH/HOME + the credential-free proxy/CA vars), with
+ *      `doctor --liveness` semantics: booting far enough to reach the
+ *      shape's own credential/input gate IS the signal (see
+ *      BOOT_GATE_PATTERNS — derived empirically by booting every fixture
+ *      bundle key-less). Scrubbing is deliberate: with real credentials in
+ *      the env, autonomous shapes (workflow, batch, …) would EXECUTE their
+ *      agent on boot — paid model calls from a compile flag. Bun would
+ *      quietly defeat that scrub by auto-loading a `.env` colocated with
+ *      the bundle, so the boot passes `--env-file=<empty file>` to disable
+ *      the auto-load (see bootArgvFor). Shapes whose boot needs live
+ *      credentials/servers therefore degrade to "gated" (green) and the
+ *      verdict reports which step ran; a structural break (SyntaxError,
+ *      unresolved import) matches no gate and stays red.
  */
-import { writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Bundle } from "@crewhaus/ir";
 import {
@@ -35,6 +41,7 @@ import {
   assertBundleAgainstShape,
   assertionForTarget,
 } from "@crewhaus/smoke-harness";
+import { cliVersion } from "./version";
 
 export type CheckStepName = "assertion" | "install" | "boot";
 export type CheckStepStatus = "ok" | "gated" | "skipped" | "failed";
@@ -60,6 +67,63 @@ export type CheckStepRunner = (opts: {
 }) => Promise<CheckRunResult>;
 
 const DEFAULT_BOOT_TIMEOUT_MS = 10_000;
+// A hung registry must not hang `compile --check` forever — the install step
+// is bounded (override via CompileCheckOptions.installTimeoutMs).
+const DEFAULT_INSTALL_TIMEOUT_MS = 120_000;
+
+/**
+ * Env vars copied through the credential scrub. PATH/HOME are needed to find
+ * bun and its caches; the proxy/CA vars carry no credentials but are required
+ * for `bun install` (and any gated boot probe) to reach the network at all in
+ * proxied/corporate environments.
+ */
+const SCRUB_PASSTHROUGH_VARS = [
+  "PATH",
+  "HOME",
+  "HTTPS_PROXY",
+  "HTTP_PROXY",
+  "NO_PROXY",
+  "SSL_CERT_FILE",
+  "NODE_EXTRA_CA_CERTS",
+] as const;
+
+/** Credential-free child env: only {@link SCRUB_PASSTHROUGH_VARS} survive. */
+export function scrubbedEnv(baseEnv: NodeJS.ProcessEnv): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const name of SCRUB_PASSTHROUGH_VARS) {
+    const value = baseEnv[name];
+    if (value !== undefined) env[name] = value;
+  }
+  return env;
+}
+
+/**
+ * Lazily-created empty env file for `bun --env-file=…`. Without the flag Bun
+ * AUTO-LOADS `.env` from the child's cwd — the out-dir — so a colocated .env
+ * with real keys would silently defeat the credential scrub and let an
+ * autonomous shape execute paid agent runs from a verification flag. An
+ * explicit `--env-file` replaces the auto-load entirely (verified on Bun
+ * 1.3.14: the child sees none of the .env's vars). An empty temp file is
+ * used rather than /dev/null so the flag also works on Windows.
+ */
+let cachedEmptyEnvFile: string | undefined;
+export function emptyEnvFile(): string {
+  if (cachedEmptyEnvFile === undefined) {
+    const path = join(mkdtempSync(join(tmpdir(), "crewhaus-check-env-")), "empty.env");
+    writeFileSync(path, "");
+    cachedEmptyEnvFile = path;
+  }
+  return cachedEmptyEnvFile;
+}
+
+/**
+ * The exact argv `compile --check` boots a bundle entrypoint with. Exported
+ * so the F4 regression tests exercise the REAL construction (flag presence
+ * with an injected runner, and .env invisibility with a live subprocess).
+ */
+export function bootArgvFor(entry: string): readonly string[] {
+  return ["bun", `--env-file=${emptyEnvFile()}`, entry];
+}
 
 /** Collect the @crewhaus/* packages the emitted bundle imports (sorted, deduped). */
 export function collectCrewhausDeps(files: Bundle["files"]): readonly string[] {
@@ -77,14 +141,20 @@ export function collectCrewhausDeps(files: Bundle["files"]): readonly string[] {
 
 /**
  * Minimal manifest for bundles whose emitter ships no package.json.
- * Versions are "latest": the check installs the PUBLISHED packages — the
- * contract a released CLI's bundles run against. (In a dev checkout that
- * can lag unreleased emitter features; the boot step then reports the
- * mismatch, which is a real signal, not a false positive.)
+ * Versions pin to the CLI's OWN version: the @crewhaus/* packages publish in
+ * lockstep (scripts/publish-workspace.ts stamps them all with one version),
+ * so `<cliVersion>` is exactly the published contract this CLI's emitters
+ * were released against — where "latest" would silently verify against
+ * whatever shipped since, making the check's verdict depend on the day it
+ * runs. "latest" remains only as the fallback when no version is resolvable
+ * (a broken installation). (In a dev checkout the pinned publish can lag
+ * unreleased emitter features; the boot step then reports the mismatch,
+ * which is a real signal, not a false positive.)
  */
-export function buildBundlePackageJson(deps: readonly string[]): string {
+export function buildBundlePackageJson(deps: readonly string[], version?: string): string {
+  const pin = version ?? "latest";
   const dependencies: Record<string, string> = {};
-  for (const dep of deps) dependencies[dep] = "latest";
+  for (const dep of deps) dependencies[dep] = pin;
   return `${JSON.stringify(
     { name: "crewhaus-compiled-bundle", private: true, type: "module", dependencies },
     null,
@@ -135,8 +205,12 @@ export function classifyBootOutcome(result: CheckRunResult): {
   if (result.exitCode === 0) {
     return { status: "ok", detail: "booted and exited cleanly" };
   }
+  // Gates are matched against BOTH streams: most shapes print their gate to
+  // stderr, but nothing guarantees it — a stdout-printed gate must not be
+  // misclassified as a structural failure.
+  const output = `${result.stdout}\n${result.stderr}`;
   for (const { pattern, gate } of BOOT_GATE_PATTERNS) {
-    if (pattern.test(result.stderr)) {
+    if (pattern.test(output)) {
       return {
         status: "gated",
         detail: `boot reached its ${gate} gate — full boot needs live ${gate}`,
@@ -192,7 +266,9 @@ export type CompileCheckOptions = {
   /** Test seam — defaults to a real Bun.spawn runner. */
   readonly runner?: CheckStepRunner;
   readonly bootTimeoutMs?: number;
-  /** Base env the scrubbed boot env (PATH/HOME) is drawn from. */
+  /** Upper bound for the `bun install` step (default 120s) — see F5a. */
+  readonly installTimeoutMs?: number;
+  /** Base env the scrubbed child env (PATH/HOME + proxy/CA vars) is drawn from. */
   readonly env?: NodeJS.ProcessEnv;
 };
 
@@ -224,14 +300,24 @@ export async function runCompileCheck(opts: CompileCheckOptions): Promise<Compil
     );
   }
 
-  // 2 — install the bundle's deps in the out-dir.
+  // 2 — install the bundle's deps in the out-dir. Scrubbed env (proxy/CA
+  // vars pass through — bun needs them to reach the registry) + a timeout so
+  // a hung registry cannot hang the compile forever.
+  const baseEnv = opts.env ?? process.env;
+  const childEnv = scrubbedEnv(baseEnv);
   if (!opts.bundle.files.some((f) => f.path === "package.json")) {
     writeFileSync(
       join(opts.outDir, "package.json"),
-      buildBundlePackageJson(collectCrewhausDeps(opts.bundle.files)),
+      buildBundlePackageJson(collectCrewhausDeps(opts.bundle.files), cliVersion()),
     );
   }
-  const install = await runner({ argv: ["bun", "install"], cwd: opts.outDir });
+  const installTimeoutMs = opts.installTimeoutMs ?? DEFAULT_INSTALL_TIMEOUT_MS;
+  const install = await runner({
+    argv: ["bun", "install"],
+    cwd: opts.outDir,
+    env: childEnv,
+    timeoutMs: installTimeoutMs,
+  });
   const installOk = !install.timedOut && install.exitCode === 0;
   steps.push(
     installOk
@@ -239,16 +325,20 @@ export async function runCompileCheck(opts: CompileCheckOptions): Promise<Compil
       : {
           step: "install",
           status: "failed",
-          detail: `bun install exited ${install.exitCode}: ${install.stderr
-            .trim()
-            .split("\n")
-            .slice(-2)
-            .join(" | ")
-            .slice(0, 300)}`,
+          detail: install.timedOut
+            ? `bun install timed out after ${installTimeoutMs}ms (registry unreachable/hung?)`
+            : `bun install exited ${install.exitCode}: ${install.stderr
+                .trim()
+                .split("\n")
+                .slice(-2)
+                .join(" | ")
+                .slice(0, 300)}`,
         },
   );
 
-  // 3 — liveness boot (credential-free by design; see module doc).
+  // 3 — liveness boot (credential-free by design; see module doc). The
+  // --env-file flag in bootArgvFor keeps Bun from auto-loading a `.env`
+  // colocated with the bundle, which would defeat the scrub.
   const entry = resolveBootEntry(opts.bundle.files);
   if (entry === undefined) {
     steps.push({
@@ -259,11 +349,10 @@ export async function runCompileCheck(opts: CompileCheckOptions): Promise<Compil
   } else if (!installOk) {
     steps.push({ step: "boot", status: "skipped", detail: "install failed" });
   } else {
-    const baseEnv = opts.env ?? process.env;
     const boot = await runner({
-      argv: ["bun", entry],
+      argv: bootArgvFor(entry),
       cwd: opts.outDir,
-      env: { PATH: baseEnv["PATH"] ?? "", HOME: baseEnv["HOME"] ?? "" },
+      env: childEnv,
       timeoutMs: opts.bootTimeoutMs ?? DEFAULT_BOOT_TIMEOUT_MS,
     });
     const outcome = classifyBootOutcome(boot);

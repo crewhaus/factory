@@ -368,21 +368,37 @@ jobs:
         # Same argv shape as @crewhaus/docker-images' buildImage() (per-shape
         # Dockerfile against the workspace-root context); buildImage itself only
         # knows local `crewhaus/<target>` refs, so CI tags the ghcr.io refs
-        # directly and pushes both the version tag and :latest.
+        # directly. `:latest` only moves for stable X.Y.Z releases — a
+        # pre-release tag (0.2.0-rc.1) must never become what `:latest` pulls.
+        # Follow-up (documented, not yet built): multi-arch publishing via
+        # `--platform linux/amd64,linux/arm64` needs QEMU/binfmt setup on the
+        # runner; today's images are single-arch (the runner's native amd64).
         run: |
+          TAGS=(--tag "ghcr.io/crewhaus/$TARGET:$VERSION")
+          if printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            TAGS+=(--tag "ghcr.io/crewhaus/$TARGET:latest")
+          else
+            echo "pre-release version $VERSION — not moving :latest"
+          fi
           docker buildx build \
             --file "packages/docker-images/docker/$TARGET/Dockerfile" \
-            --tag "ghcr.io/crewhaus/$TARGET:$VERSION" \
-            --tag "ghcr.io/crewhaus/$TARGET:latest" \
+            "${TAGS[@]}" \
             --push \
             .
 
   docker-digests:
     name: Record image digests
-    needs: [build, docker]
+    # docker-targets is a direct need so this job consumes the SAME target list
+    # the docker job built from the tag's checkout — re-enumerating Dockerfiles
+    # here would list main's shapes, not the tag's.
+    needs: [build, docker, docker-targets]
     runs-on: ubuntu-latest
     permissions:
       contents: write # commit the updated docker/digests.json back to main
+      # Job-level permissions REPLACE the workflow defaults (they don't merge),
+      # so packages must be granted explicitly or the GHCR login below cannot
+      # read the freshly-pushed (private-at-first-publish) packages.
+      packages: read
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -404,7 +420,13 @@ jobs:
       - name: Record pushed digests into docker/digests.json
         env:
           VERSION: ${{ needs.build.outputs.version }}
-        run: bun scripts/record-image-digests.ts --version "$VERSION"
+          # The docker-targets output was enumerated from the TAG's checkout;
+          # this job checks out main (for the lockfile commit), so re-listing
+          # Dockerfiles here could disagree with what the docker job pushed.
+          TARGETS_JSON: ${{ needs.docker-targets.outputs.targets }}
+        run: |
+          TARGETS=$(printf '%s' "$TARGETS_JSON" | jq -r 'join(",")')
+          bun scripts/record-image-digests.ts --version "$VERSION" --targets "$TARGETS"
       - name: Commit digests.json back to main
         env:
           VERSION: ${{ needs.build.outputs.version }}
@@ -412,6 +434,22 @@ jobs:
           git config user.name "crewhaus-release-bot"
           git config user.email "release@crewhaus.ai"
           git add packages/docker-images/docker/digests.json
-          git commit -m "chore(release): record GHCR image digests for v$VERSION" || { echo "no change"; exit 0; }
-          git pull --rebase origin main
-          git push origin HEAD:main
+          # Explicit no-op check: `git commit || exit 0` also swallowed REAL
+          # commit failures (hooks, config, disk) — those must fail the job.
+          if git diff --cached --quiet; then
+            echo "no change"
+            exit 0
+          fi
+          git commit -m "chore(release): record GHCR image digests for v$VERSION"
+          # main can move while this job runs (other channel jobs, humans) —
+          # retry the push with a rebase between attempts instead of failing
+          # the whole release fan-out on the first non-fast-forward.
+          for attempt in 1 2 3; do
+            if git push origin HEAD:main; then
+              exit 0
+            fi
+            echo "push attempt $attempt failed — rebasing onto origin/main and retrying"
+            git pull --rebase origin main
+          done
+          echo "::error::could not push digests.json to main after 3 attempts"
+          exit 1

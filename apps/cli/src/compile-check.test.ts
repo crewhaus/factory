@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
  * would spawn a subprocess goes through an injected `CheckStepRunner`, so
  * no test touches the network, bun's registry, or a real boot.
  */
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ShapeAssertion } from "@crewhaus/smoke-harness";
@@ -12,13 +12,18 @@ import {
   BOOT_GATE_PATTERNS,
   type CheckRunResult,
   type CheckStepRunner,
+  bootArgvFor,
   buildBundlePackageJson,
   buildVerdict,
   classifyBootOutcome,
   collectCrewhausDeps,
+  defaultCheckRunner,
+  emptyEnvFile,
   resolveBootEntry,
   runCompileCheck,
+  scrubbedEnv,
 } from "./compile-check";
+import { cliVersion } from "./version";
 
 let tmp: string;
 beforeEach(() => {
@@ -65,10 +70,20 @@ describe("collectCrewhausDeps", () => {
 });
 
 describe("buildBundlePackageJson", () => {
-  test("emits a private module manifest with latest-pinned deps", () => {
-    const manifest = JSON.parse(buildBundlePackageJson(["@crewhaus/runtime-core"]));
+  test("pins deps to the given CLI version (lockstep-published contract — F5c)", () => {
+    const manifest = JSON.parse(
+      buildBundlePackageJson(["@crewhaus/runtime-core", "@crewhaus/tool-fs"], "0.1.8"),
+    );
     expect(manifest.private).toBe(true);
     expect(manifest.type).toBe("module");
+    expect(manifest.dependencies).toEqual({
+      "@crewhaus/runtime-core": "0.1.8",
+      "@crewhaus/tool-fs": "0.1.8",
+    });
+  });
+
+  test("falls back to latest only when no version is resolvable", () => {
+    const manifest = JSON.parse(buildBundlePackageJson(["@crewhaus/runtime-core"]));
     expect(manifest.dependencies).toEqual({ "@crewhaus/runtime-core": "latest" });
   });
 });
@@ -105,6 +120,14 @@ describe("classifyBootOutcome", () => {
     }
     // Sanity: the table drives the classification.
     expect(BOOT_GATE_PATTERNS.length).toBeGreaterThanOrEqual(6);
+  });
+
+  test("a gate printed to STDOUT still classifies as gated (F6 — combined-stream matching)", () => {
+    const outcome = classifyBootOutcome(
+      run({ exitCode: 1, stdout: "[crew] no input on stdin\n", stderr: "" }),
+    );
+    expect(outcome.status).toBe("gated");
+    expect(outcome.detail).toContain("stdin input");
   });
 
   test("structural breakage matches no gate and stays red with a stderr tail", () => {
@@ -160,13 +183,20 @@ describe("runCompileCheck", () => {
     ],
   };
 
+  type CapturedCall = {
+    argv: readonly string[];
+    cwd: string;
+    env?: Readonly<Record<string, string>>;
+    timeoutMs?: number;
+  };
+
   function scriptedRunner(script: {
     install?: CheckRunResult;
     boot?: CheckRunResult;
-  }): { runner: CheckStepRunner; calls: Array<{ argv: readonly string[]; cwd: string }> } {
-    const calls: Array<{ argv: readonly string[]; cwd: string }> = [];
-    const runner: CheckStepRunner = async ({ argv, cwd }) => {
-      calls.push({ argv, cwd });
+  }): { runner: CheckStepRunner; calls: CapturedCall[] } {
+    const calls: CapturedCall[] = [];
+    const runner: CheckStepRunner = async ({ argv, cwd, env, timeoutMs }) => {
+      calls.push({ argv, cwd, env, timeoutMs });
       if (argv[1] === "install") return script.install ?? run();
       return script.boot ?? run();
     };
@@ -193,13 +223,18 @@ describe("runCompileCheck", () => {
     ]);
     // fixtureOnly anchor excluded from the applied count.
     expect(result.steps[0]?.detail).toBe("1 anchors");
-    // The synthesized manifest landed in the out-dir with the scanned dep.
+    // The synthesized manifest landed in the out-dir with the scanned dep,
+    // pinned to the CLI's own version (lockstep publishing — F5c).
     const manifest = JSON.parse(readFileSync(join(tmp, "package.json"), "utf-8"));
-    expect(manifest.dependencies).toEqual({ "@crewhaus/runtime-core": "latest" });
-    // install ran in the out-dir, then the boot spawned the entrypoint.
+    expect(manifest.dependencies).toEqual({ "@crewhaus/runtime-core": cliVersion() });
+    // install ran in the out-dir (bounded — F5a), then the boot spawned the
+    // entrypoint with the .env auto-load disabled (F4).
     expect(calls[0]?.argv).toEqual(["bun", "install"]);
     expect(calls[0]?.cwd).toBe(tmp);
-    expect(calls[1]?.argv).toEqual(["bun", "agent.ts"]);
+    expect(calls[0]?.timeoutMs).toBe(120_000);
+    expect(calls[1]?.argv[0]).toBe("bun");
+    expect(calls[1]?.argv[1]).toStartWith("--env-file=");
+    expect(calls[1]?.argv[2]).toBe("agent.ts");
   });
 
   test("assertion failure is red but later steps still run and report", async () => {
@@ -292,7 +327,7 @@ describe("runCompileCheck", () => {
     });
     expect(result.steps[2]?.status).toBe("ok");
     expect(result.steps[2]?.detail).toContain("alive");
-    expect(calls[1]?.argv).toEqual(["bun", "daemon.ts"]);
+    expect(calls[1]?.argv).toEqual(bootArgvFor("daemon.ts"));
   });
 
   test("structural boot breakage is red", async () => {
@@ -310,4 +345,172 @@ describe("runCompileCheck", () => {
     expect(result.steps[2]?.status).toBe("failed");
     expect(result.line).toContain("RED");
   });
+
+  // ── F4 — the boot child must not see a .env colocated with the bundle ────
+  test("a .env in the out-dir never reaches the boot child: env is scrubbed and --env-file disables Bun's auto-load", async () => {
+    writeFileSync(join(tmp, ".env"), "ANTHROPIC_API_KEY=sk-fake-should-never-be-seen\n");
+    const { runner, calls } = scriptedRunner({
+      boot: run({ exitCode: 1, stderr: "no Anthropic credentials found: set ..." }),
+    });
+    const result = await runCompileCheck({
+      target: "cli",
+      bundle: CLI_BUNDLE,
+      outDir: tmp,
+      assertions: [CLI_ASSERTION],
+      runner,
+      env: { PATH: "/usr/bin", HOME: "/home/x", ANTHROPIC_API_KEY: "sk-real-secret" },
+    });
+    expect(result.green).toBe(true);
+    const boot = calls[1];
+    // The explicit env passed to the runner carries no credentials…
+    expect(boot?.env).toEqual({ PATH: "/usr/bin", HOME: "/home/x" });
+    // …and the argv disables Bun's cwd .env auto-load, which would otherwise
+    // re-inject the out-dir's keys UNDER the scrubbed env.
+    expect(boot?.argv[1]).toStartWith("--env-file=");
+    const envFile = (boot?.argv[1] ?? "").slice("--env-file=".length);
+    expect(readFileSync(envFile, "utf-8")).toBe("");
+  });
+
+  test("REAL subprocess: the booted child cannot see a colocated .env, and without the flag it would (counterfactual)", async () => {
+    writeFileSync(join(tmp, ".env"), "CREWHAUS_CHECK_FAKE_KEY=sk-fake\n");
+    writeFileSync(
+      join(tmp, "probe.ts"),
+      'process.stdout.write(`FAKE_KEY_PRESENT=${"CREWHAUS_CHECK_FAKE_KEY" in process.env}`);\n',
+    );
+    const env = scrubbedEnv(process.env);
+    // The exact argv shape runCompileCheck boots with (bootArgvFor).
+    const guarded = await defaultCheckRunner({
+      argv: bootArgvFor("probe.ts"),
+      cwd: tmp,
+      env,
+      timeoutMs: 15_000,
+    });
+    expect(guarded.exitCode).toBe(0);
+    expect(guarded.stdout).toBe("FAKE_KEY_PRESENT=false");
+    // Counterfactual: a plain `bun probe.ts` auto-loads the .env — proving
+    // the --env-file flag is load-bearing, not incidental.
+    const unguarded = await defaultCheckRunner({
+      argv: ["bun", "probe.ts"],
+      cwd: tmp,
+      env,
+      timeoutMs: 15_000,
+    });
+    expect(unguarded.stdout).toBe("FAKE_KEY_PRESENT=true");
+  }, 30_000);
+
+  // ── F5a — the install step is bounded ────────────────────────────────────
+  test("a hung bun install times out, fails the step, and skips the boot", async () => {
+    const { runner, calls } = scriptedRunner({
+      install: run({ exitCode: 1, timedOut: true }),
+    });
+    const result = await runCompileCheck({
+      target: "cli",
+      bundle: CLI_BUNDLE,
+      outDir: tmp,
+      assertions: [CLI_ASSERTION],
+      runner,
+      installTimeoutMs: 5_000,
+    });
+    expect(result.green).toBe(false);
+    expect(result.steps[1]?.status).toBe("failed");
+    expect(result.steps[1]?.detail).toContain("timed out after 5000ms");
+    expect(result.steps[2]?.status).toBe("skipped");
+    // The configured bound reached the runner.
+    expect(calls[0]?.timeoutMs).toBe(5_000);
+  });
+
+  // ── F5b — proxy/CA vars survive the scrub; credentials do not ────────────
+  test("HTTPS_PROXY/HTTP_PROXY/NO_PROXY/SSL_CERT_FILE/NODE_EXTRA_CA_CERTS pass through to install AND boot; secrets never do", async () => {
+    const { runner, calls } = scriptedRunner({
+      boot: run({ exitCode: 1, stderr: "no Anthropic credentials found: set ..." }),
+    });
+    const base = {
+      PATH: "/usr/bin",
+      HOME: "/home/x",
+      HTTPS_PROXY: "http://proxy:3128",
+      HTTP_PROXY: "http://proxy:3128",
+      NO_PROXY: "localhost",
+      SSL_CERT_FILE: "/etc/ssl/corp.pem",
+      NODE_EXTRA_CA_CERTS: "/etc/ssl/extra.pem",
+      ANTHROPIC_API_KEY: "sk-secret",
+      AWS_SECRET_ACCESS_KEY: "aws-secret",
+    };
+    await runCompileCheck({
+      target: "cli",
+      bundle: CLI_BUNDLE,
+      outDir: tmp,
+      assertions: [CLI_ASSERTION],
+      runner,
+      env: base,
+    });
+    const expected = {
+      PATH: "/usr/bin",
+      HOME: "/home/x",
+      HTTPS_PROXY: "http://proxy:3128",
+      HTTP_PROXY: "http://proxy:3128",
+      NO_PROXY: "localhost",
+      SSL_CERT_FILE: "/etc/ssl/corp.pem",
+      NODE_EXTRA_CA_CERTS: "/etc/ssl/extra.pem",
+    };
+    expect(calls[0]?.env).toEqual(expected); // install
+    expect(calls[1]?.env).toEqual(expected); // boot
+  });
+
+  test("scrubbedEnv omits unset passthrough vars instead of writing empty strings", () => {
+    expect(scrubbedEnv({ PATH: "/usr/bin" })).toEqual({ PATH: "/usr/bin" });
+  });
+
+  test("emptyEnvFile is created once, empty, and reused across calls", () => {
+    const first = emptyEnvFile();
+    expect(readFileSync(first, "utf-8")).toBe("");
+    expect(emptyEnvFile()).toBe(first);
+  });
+});
+
+// ── F6 — boot-gate strings stay coupled to the sources that emit them ──────
+describe("BOOT_GATE_PATTERNS ↔ emitting workspace sources (F6)", () => {
+  const REPO_ROOT = join(import.meta.dir.replace(/([/\\])dist$/, "$1src"), "../../..");
+
+  /**
+   * Path-anchored coupling: each gate's regex must match the ACTUAL source
+   * that emits the message at runtime. When a package rewords its gate
+   * message, this fails and points at the exact file to re-derive the
+   * pattern from — retiring the silent-drift failure mode where a reworded
+   * gate turns a green "gated" verdict into a red structural failure.
+   */
+  const EMITTING_SOURCES: ReadonlyArray<{ gate: string; files: readonly string[] }> = [
+    {
+      // runtime-core resolveAuth path: the message lives in the anthropic
+      // adapter; the error-name alternative in the shared errors package.
+      gate: "provider credentials",
+      files: ["packages/adapter-anthropic/src/client.ts", "packages/errors/src/index.ts"],
+    },
+    {
+      // Env-ref rewriting: onchain throws it directly; the channel daemon
+      // emits it into its generated boot guard.
+      gate: "spec env refs",
+      files: ["packages/target-onchain/src/index.ts", "packages/target-channel-bot/src/index.ts"],
+    },
+    { gate: "stdin input", files: ["packages/target-crew/src/index.ts"] },
+    { gate: "a --smoke pcm fixture", files: ["packages/target-voice/src/index.ts"] },
+    { gate: "an initial --prompt", files: ["packages/target-browser-driver/src/index.ts"] },
+    { gate: "a registered eval dataset", files: ["packages/dataset-registry/src/index.ts"] },
+  ];
+
+  test("the table covers every gate exactly once", () => {
+    expect(EMITTING_SOURCES.map((s) => s.gate).sort()).toEqual(
+      [...BOOT_GATE_PATTERNS.map((p) => p.gate)].sort(),
+    );
+  });
+
+  for (const { gate, files } of EMITTING_SOURCES) {
+    for (const file of files) {
+      test(`"${gate}" pattern matches its emitter ${file}`, () => {
+        const entry = BOOT_GATE_PATTERNS.find((p) => p.gate === gate);
+        expect(entry).toBeDefined();
+        const source = readFileSync(join(REPO_ROOT, file), "utf-8");
+        expect(entry?.pattern.test(source)).toBe(true);
+      });
+    }
+  }
 });

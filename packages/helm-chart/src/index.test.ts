@@ -52,6 +52,17 @@ describe("defaultValues + validateValues", () => {
     ).toThrow();
   });
 
+  test("rejects an empty, whitespace-carrying, or trailing-slash image.registry (F3)", () => {
+    for (const bad of ["", "ghcr.io/crewhaus/", "ghcr .io/crewhaus", "ghcr.io/crew\nhaus"]) {
+      expect(() =>
+        validateValues({
+          ...defaultValues(),
+          image: { ...defaultValues().image, registry: bad },
+        }),
+      ).toThrow(/image\.registry/);
+    }
+  });
+
   test("accepts a well-formed image.digest and rejects malformed ones", () => {
     const good = `sha256:${"ab".repeat(32)}`;
     expect(() =>
@@ -192,27 +203,53 @@ describe("renderChart() — full render per shape (T1)", () => {
     test(`${target}: deployment.yaml is a Deployment with the right image + replicas`, () => {
       const out = renderChart({ ...defaultValues(), target, replicas: 2 });
       expect(out["deployment.yaml"]).toContain("kind: Deployment");
-      expect(out["deployment.yaml"]).toContain(`crewhaus/${target}:`);
+      // F3 regression: the default image ref points at ghcr.io/crewhaus —
+      // where the release workflow publishes. A bare `crewhaus/<target>`
+      // would resolve to docker.io, where nothing is ever pushed.
+      expect(out["deployment.yaml"]).toContain(`ghcr.io/crewhaus/${target}:`);
       expect(out["deployment.yaml"]).toContain("replicas: 2");
       expect(out["deployment.yaml"]).toContain("livenessProbe");
     });
   }
 
-  test("image.digest pins the container image by digest (item 47)", () => {
+  test("image.digest pins the container image by registry digest (item 47)", () => {
     const digest = `sha256:${"ab".repeat(32)}`;
     const out = renderChart({
       ...defaultValues(),
       target: "channel",
       image: { ...defaultValues().image, digest },
     });
-    expect(out["deployment.yaml"]).toContain(`image: "crewhaus/channel@${digest}"`);
+    expect(out["deployment.yaml"]).toContain(`image: "ghcr.io/crewhaus/channel@${digest}"`);
     expect(out["deployment.yaml"]).not.toContain("crewhaus/channel:");
   });
 
   test("without image.digest the tag-based image reference is unchanged", () => {
     const out = renderChart({ ...defaultValues(), target: "cli" });
-    expect(out["deployment.yaml"]).toContain('image: "crewhaus/cli:latest"');
+    expect(out["deployment.yaml"]).toContain('image: "ghcr.io/crewhaus/cli:latest"');
     expect(out["deployment.yaml"]).not.toContain("@sha256:");
+  });
+
+  test("image.registry is configurable — tag form (F3)", () => {
+    const out = renderChart({
+      ...defaultValues(),
+      target: "cli",
+      image: { ...defaultValues().image, registry: "registry.example.com/mirror", tag: "1.2.3" },
+    });
+    expect(out["deployment.yaml"]).toContain('image: "registry.example.com/mirror/cli:1.2.3"');
+    expect(out["deployment.yaml"]).not.toContain('image: "ghcr.io');
+  });
+
+  test("image.registry is configurable — digest form (F3)", () => {
+    const digest = `sha256:${"cd".repeat(32)}`;
+    const out = renderChart({
+      ...defaultValues(),
+      target: "channel",
+      image: { ...defaultValues().image, registry: "registry.example.com/mirror", digest },
+    });
+    expect(out["deployment.yaml"]).toContain(
+      `image: "registry.example.com/mirror/channel@${digest}"`,
+    );
+    expect(out["deployment.yaml"]).not.toContain('image: "ghcr.io');
   });
 
   test("daemon shape (channel) renders Service", () => {

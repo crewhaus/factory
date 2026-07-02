@@ -112,6 +112,9 @@ import {
 // `doctor --philosophy-alignment`. Kept in a side-effect-free module so it is
 // unit-testable (this entry file runs an argv switch on import).
 import { auditSpecToolNames, auditToolScopes, collectToolNames } from "./scope-audit";
+// CLI version resolution (embedded --define constant → package.json), shared
+// with compile-check.ts's dependency pinning.
+import { cliVersion } from "./version";
 
 /**
  * crewhaus — slice-scope CLI.
@@ -460,8 +463,9 @@ function usageText(): string {
     "  deploy promote|rollback ...          re-pin a spec for an environment (Section 28)",
     "  migrate-all --from N --to N          batch-migrate every spec in the registry",
     "  build-image <target> --tag <tag>     build the docker image for a target shape (Section 32)",
-    "       [--platform <p>] [--push]        (records the digest in docker/digests.json;",
-    "       [--no-record]                     --no-record opts out)",
+    "       [--platform <p>] [--push]        (--push records the registry manifest digest in",
+    "       [--no-record]                     docker/digests.json; --no-record opts out. Local",
+    "                                         --load builds record nothing — not pullable)",
     "  cloud deploy --provider <p>          deploy a managed CrewHaus cluster (Section 32)",
     "       --region <r> [--tier <t>] [--image-tag <tag>]",
     "  cloud teardown --provider <p>        tear down a managed cluster",
@@ -509,27 +513,11 @@ function die(message: string): never {
   process.exit(1);
 }
 
-// Substituted at build time by @crewhaus/single-binary-cli's `bun build
-// --compile --define` — standalone binaries have no package.json on disk.
-declare const CREWHAUS_EMBEDDED_VERSION: string | undefined;
-
 function printVersion(): void {
-  if (typeof CREWHAUS_EMBEDDED_VERSION === "string") {
-    process.stdout.write(`${CREWHAUS_EMBEDDED_VERSION}\n`);
-    return;
-  }
-  // The package ships src/ directly (bin → src/index.ts) and tsc -b also
-  // emits dist/, so resolve package.json relative to this module — one level
-  // up lands on apps/cli/package.json from either tree, and on
-  // node_modules/@crewhaus/cli/package.json when installed.
-  let version: string;
-  try {
-    version = (
-      JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf-8")) as {
-        version: string;
-      }
-    ).version;
-  } catch {
+  // Resolution (embedded --define constant → apps/cli/package.json) lives in
+  // version.ts so compile-check.ts can pin dependencies to the same version.
+  const version = cliVersion();
+  if (version === undefined) {
     die("could not locate package.json to determine the version");
   }
   process.stdout.write(`${version}\n`);
@@ -2687,9 +2675,12 @@ async function runMigrateAll(args: ParsedArgs): Promise<void> {
 /**
  * Section 32 — `crewhaus build-image <target> --tag <tag> [--platform <p>] [--push] [--no-record]`.
  * Wraps `docker buildx build` for the per-target Dockerfiles in
- * @crewhaus/docker-images. Item 47: after a successful build the image's
- * content digest is recorded in docker/digests.json by default (the
- * maintenance the lockfile header always promised); `--no-record` opts out.
+ * @crewhaus/docker-images. Item 47: after a successful PUSHED build the
+ * image's registry manifest digest is recorded in docker/digests.json by
+ * default (the maintenance the lockfile header always promised);
+ * `--no-record` opts out. A local `--load` build records nothing — its image
+ * ID is a config digest that `docker pull repo@sha256:…` cannot resolve, so
+ * the CLI says so instead of writing an unpullable pin.
  */
 async function runBuildImage(rest: ReadonlyArray<string>): Promise<void> {
   const positional: string[] = [];
@@ -2700,7 +2691,11 @@ async function runBuildImage(rest: ReadonlyArray<string>): Promise<void> {
     if (a === "--help" || a === "-h") {
       process.stdout.write(
         "usage: crewhaus build-image <target> --tag <tag> [--platform <p>] [--push] [--no-record]\n" +
-          "  --no-record  skip recording the built image's digest into docker/digests.json\n",
+          "  --push       push to the registry and record the pushed image's registry\n" +
+          "               manifest digest into docker/digests.json (the only pullable pin)\n" +
+          "  --no-record  skip recording the pushed image's digest into docker/digests.json\n" +
+          "  Local (--load) builds record nothing: a local image ID is a config digest,\n" +
+          "  not a registry digest — `docker pull repo@<id>` would fail.\n",
       );
       return;
     }
@@ -2744,6 +2739,10 @@ async function runBuildImage(rest: ReadonlyArray<string>): Promise<void> {
       process.stdout.write(
         `recorded ${result.digest} for ${result.target}:${result.tag} → ${digestsPath()}\n`,
       );
+    } else if (record && result.recordSkippedReason !== undefined) {
+      // Informational, not a warning: a --load build has no pullable digest
+      // to record, and pretending otherwise is the exact lie item 47 retires.
+      process.stdout.write(`crewhaus: [build-image] ${result.recordSkippedReason}\n`);
     } else if (record && result.recordError !== undefined) {
       // The image exists; a failed digest lookup/record must not fail the
       // build — but a silently stale lockfile is the exact lie item 47

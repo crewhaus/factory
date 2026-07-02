@@ -1310,30 +1310,33 @@ describe("crewhaus retention (item 35)", () => {
 
 describe("crewhaus build-image — digest recording wiring (item 47)", () => {
   /**
-   * A fake `docker` on PATH: `buildx build` succeeds; `image inspect` is
-   * scripted per test via a marker file. The default-record test uses the
+   * A fake `docker` on PATH: `buildx build` succeeds; `buildx imagetools
+   * inspect` is scripted per test and touches a marker file so tests can
+   * assert whether a digest lookup happened at all. The push test uses the
    * inspect-FAILURE path (warning, exit 0) so the suite never mutates the
    * repo's real docker/digests.json — the successful record round-trip is
    * covered at the package seam in @crewhaus/docker-images' tests.
    */
-  function installFakeDocker(dir: string, inspectExit: number): string {
+  function installFakeDocker(dir: string, inspectExit: number): { bin: string; marker: string } {
     const bin = join(dir, "fakebin");
+    const marker = join(dir, "inspect-called");
     mkdirSync(bin, { recursive: true });
     const script = [
       "#!/bin/bash",
       'if [ "$1" = "buildx" ] && [ "$2" = "build" ]; then exit 0; fi',
-      'if [ "$1" = "image" ] && [ "$2" = "inspect" ]; then',
-      `  if [ ${inspectExit} -eq 0 ]; then echo "sha256:${"b".repeat(64)}"; fi`,
+      'if [ "$1" = "buildx" ] && [ "$2" = "imagetools" ] && [ "$3" = "inspect" ]; then',
+      `  touch "${marker}"`,
+      `  if [ ${inspectExit} -eq 0 ]; then echo "Digest: sha256:${"b".repeat(64)}"; fi`,
       `  exit ${inspectExit}`,
       "fi",
       "exit 1",
     ].join("\n");
     writeFileSync(join(bin, "docker"), `${script}\n`, { mode: 0o755 });
-    return bin;
+    return { bin, marker };
   }
 
   test("--no-record builds without touching the digests lockfile", async () => {
-    const bin = installFakeDocker(tmp, 0);
+    const { bin, marker } = installFakeDocker(tmp, 0);
     const result = await runCli(["build-image", "cli", "--tag", "t1", "--no-record"], {
       env: { PATH: `${bin}:${process.env["PATH"] ?? ""}` },
     });
@@ -1341,22 +1344,46 @@ describe("crewhaus build-image — digest recording wiring (item 47)", () => {
     expect(result.stdout).toContain("built crewhaus/cli:t1");
     expect(result.stdout).not.toContain("recorded");
     expect(result.stderr).toBe("");
+    expect(existsSync(marker)).toBe(false);
   });
 
-  test("recording is default-on: a failed digest lookup warns but does not fail the build", async () => {
-    const bin = installFakeDocker(tmp, 1);
+  // F2 regression: a local (--load) build records NOTHING — the local image
+  // ID is a config digest, not a pullable registry digest — and the CLI says
+  // so with an info line instead of warning or writing an unpullable pin.
+  test("a local build (no --push) records nothing, skips digest inspection, and prints the info line", async () => {
+    const { bin, marker } = installFakeDocker(tmp, 0);
     const result = await runCli(["build-image", "cli", "--tag", "t2"], {
       env: { PATH: `${bin}:${process.env["PATH"] ?? ""}` },
     });
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("built crewhaus/cli:t2");
-    expect(result.stderr).toContain("digest was not recorded");
+    expect(result.stdout).toContain(
+      "local image ID is not a registry digest — use --push to record a pullable digest",
+    );
+    expect(result.stdout).not.toContain("recorded sha256:");
+    expect(result.stderr).toBe("");
+    // No digest lookup of any kind happened for the --load build.
+    expect(existsSync(marker)).toBe(false);
   });
 
-  test("--help documents --no-record", async () => {
+  test("recording is default-on for --push: a failed registry digest lookup warns but does not fail the build", async () => {
+    const { bin, marker } = installFakeDocker(tmp, 1);
+    const result = await runCli(["build-image", "cli", "--tag", "t3", "--push"], {
+      env: { PATH: `${bin}:${process.env["PATH"] ?? ""}` },
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("built crewhaus/cli:t3");
+    expect(result.stderr).toContain("digest was not recorded");
+    // The lookup went to the registry (imagetools inspect), not the local store.
+    expect(existsSync(marker)).toBe(true);
+  });
+
+  test("--help documents --no-record and the pushed-digests-only contract", async () => {
     const result = await runCli(["build-image", "--help"]);
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("--no-record");
+    expect(result.stdout).toContain("registry\n               manifest digest");
+    expect(result.stdout).toContain("Local (--load) builds record nothing");
   });
 });
 

@@ -311,24 +311,11 @@ describe("defaultRunner (spawn integration, deterministic)", () => {
 describe("resolveImageDigest()", () => {
   const digest = `sha256:${"a".repeat(64)}`;
 
-  test("local (--load) builds inspect the local image store by .Id", async () => {
-    const captured: string[][] = [];
-    const runner: BuildRunner = async (argv) => {
-      captured.push([...argv]);
-      return { exitCode: 0, stdout: `${digest}\n`, stderr: "" };
-    };
-    await expect(resolveImageDigest({ target: "cli", tag: "v1", runner })).resolves.toBe(digest);
-    expect(captured[0]).toEqual([
-      "docker",
-      "image",
-      "inspect",
-      "--format",
-      "{{.Id}}",
-      "crewhaus/cli:v1",
-    ]);
-  });
-
-  test("pushed builds ask the registry via buildx imagetools", async () => {
+  // F2 regression: resolution goes to the REGISTRY (imagetools inspect =
+  // manifest digest, the only pullable form). There must be no local
+  // `docker image inspect .Id` path — `.Id` is the config digest and
+  // `docker pull repo@<.Id>` fails against a real registry.
+  test("always asks the registry via buildx imagetools (never the local image store)", async () => {
     const captured: string[][] = [];
     const runner: BuildRunner = async (argv) => {
       captured.push([...argv]);
@@ -338,9 +325,9 @@ describe("resolveImageDigest()", () => {
         stderr: "",
       };
     };
-    await expect(
-      resolveImageDigest({ target: "channel", tag: "v1", pushed: true, runner }),
-    ).resolves.toBe(digest);
+    await expect(resolveImageDigest({ target: "channel", tag: "v1", runner })).resolves.toBe(
+      digest,
+    );
     expect(captured[0]).toEqual([
       "docker",
       "buildx",
@@ -348,6 +335,7 @@ describe("resolveImageDigest()", () => {
       "inspect",
       "crewhaus/channel:v1",
     ]);
+    expect(captured[0]).not.toContain("{{.Id}}");
   });
 
   test("non-zero exit propagates as DockerImagesError with stderr", async () => {
@@ -389,12 +377,37 @@ describe("buildImageAndRecord()", () => {
     return { runner, calls };
   }
 
-  test("records by default through the recordDigest seam", async () => {
+  // F2 regression: a local --load build must record NOTHING. `.Id` is the
+  // config digest — unpullable — so the truthful lockfile behavior is to skip
+  // recording entirely and say why (the CLI surfaces recordSkippedReason as
+  // an info line pointing at --push).
+  test("a local (--load) build records nothing and reports why", async () => {
     const { runner, calls } = scriptedRunner(`${digest}\n`);
+    let recordCalls = 0;
+    const result = await buildImageAndRecord({
+      target: "cli",
+      tag: "v1",
+      runner,
+      recordDigestFn: () => {
+        recordCalls++;
+      },
+    });
+    expect(result.recorded).toBe(false);
+    expect(result.digest).toBeUndefined();
+    expect(result.recordError).toBeUndefined();
+    expect(result.recordSkippedReason).toContain("local image ID is not a registry digest");
+    expect(result.recordSkippedReason).toContain("--push");
+    expect(recordCalls).toBe(0);
+    expect(calls.length).toBe(1); // build only — no digest inspect at all
+  });
+
+  test("pushed builds record by default through the recordDigest seam", async () => {
+    const { runner, calls } = scriptedRunner(`Digest: ${digest}\n`);
     const recorded: Array<readonly [string, string, string, string | undefined]> = [];
     const result = await buildImageAndRecord({
       target: "cli",
       tag: "v1",
+      push: true,
       runner,
       recordDigestFn: (target, tag, sha256, path) => {
         recorded.push([target, tag, sha256, path]);
@@ -403,19 +416,19 @@ describe("buildImageAndRecord()", () => {
     expect(result.recorded).toBe(true);
     expect(result.digest).toBe(digest);
     expect(result.recordError).toBeUndefined();
+    expect(result.recordSkippedReason).toBeUndefined();
     expect(recorded).toEqual([["cli", "v1", digest, undefined]]);
-    // build then local inspect (no --push → local image store).
     expect(calls.length).toBe(2);
-    expect(calls[1]?.[1]).toBe("image");
   });
 
-  test("round-trips into an overridden digests file via the real recordDigest", async () => {
-    const { runner } = scriptedRunner(`${digest}\n`);
+  test("a pushed build round-trips into an overridden digests file via the real recordDigest", async () => {
+    const { runner } = scriptedRunner(`Digest: ${digest}\n`);
     const dir = mkdtempSync(join(tmpdir(), "crewhaus-digests-"));
     const path = join(dir, "digests.json");
     const result = await buildImageAndRecord({
       target: "voice",
       tag: "v2",
+      push: true,
       runner,
       digestsFile: path,
     });
@@ -455,12 +468,13 @@ describe("buildImageAndRecord()", () => {
     expect(calls[1]?.slice(0, 4)).toEqual(["docker", "buildx", "imagetools", "inspect"]);
   });
 
-  test("digest failure reports recordError without failing the build", async () => {
+  test("digest failure on a pushed build reports recordError without failing the build", async () => {
     const { runner } = scriptedRunner("", 1);
     let recordCalls = 0;
     const result = await buildImageAndRecord({
       target: "cli",
       tag: "v1",
+      push: true,
       runner,
       recordDigestFn: () => {
         recordCalls++;
@@ -468,6 +482,7 @@ describe("buildImageAndRecord()", () => {
     });
     expect(result.recorded).toBe(false);
     expect(result.recordError).toMatch(/could not inspect/);
+    expect(result.recordSkippedReason).toBeUndefined();
     expect(recordCalls).toBe(0);
   });
 
