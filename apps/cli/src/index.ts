@@ -147,7 +147,12 @@ import {
 // it is unit-testable (this entry file runs an argv switch on import).
 // Item 61 added the channel-target env check (only fires when the cwd spec
 // lowers to a channel IR).
-import { buildChannelEnvChecks, buildCredentialChecks, extractSpecModel } from "./doctor-checks";
+import {
+  buildChannelEnvChecks,
+  buildCredentialChecks,
+  extractSpecModel,
+  providerCredentialsSatisfied,
+} from "./doctor-checks";
 // FR-006 — Pillar 3 sink-side egress-matcher selection (the substring/semantic
 // selector lowered to ir.security.egressMatcher). Side-effect-free + lazily
 // imports the optional semantic package only when "semantic" is selected, so
@@ -245,6 +250,28 @@ import {
   runRetentionPurge,
   runRetentionSweep,
 } from "./retention";
+// Item 13 — `crewhaus scaffold-evals` + `init --with-evals`: day-one eval
+// assets generated from the spec (deterministic template / one-shot model
+// sample stubs + a single spec-goal llm_judge or floor grader), in a
+// side-effect-free module so it is unit-testable (this entry file runs an
+// argv switch on import).
+import {
+  DEFAULT_SCAFFOLD_SAMPLES,
+  SCAFFOLD_GENERATION_SYSTEM,
+  SCAFFOLD_GRADERS_HEADER,
+  ScaffoldEvalsError,
+  type ScaffoldGenerator,
+  type ScaffoldInfo,
+  buildSampleGenerationPrompt,
+  buildScaffoldGraders,
+  buildScaffoldSamples,
+  checkNoOverwrite,
+  extractScaffoldInfo,
+  feedbackBlockSuggestion,
+  mergeInputs,
+  parseModelSampleInputs,
+  templateSampleInputs,
+} from "./scaffold-evals";
 // FR-002 — Pillar 3 sink-side scope gate, shared by `compile --strict` and
 // `doctor --philosophy-alignment`. Kept in a side-effect-free module so it is
 // unit-testable (this entry file runs an argv switch on import).
@@ -399,7 +426,29 @@ const INIT_SCHEMA: ParseArgsSchema = {
     // an existing harness: `init --ci` in a dir that already has a
     // crewhaus.yaml adds just the workflow.
     { name: "ci", takesValue: false },
-    // Overwrite an existing scaffolded workflow (never the spec).
+    // Item 13 — also scaffold eval/dataset.jsonl + eval/graders.yaml (the
+    // flywheel's conventional paths) in OFFLINE template mode, so a fresh
+    // harness can `crewhaus eval` on day one. Composable with an existing
+    // harness like --ci: `init --with-evals` adds just the eval assets.
+    { name: "with-evals", takesValue: false },
+    // Overwrite an existing scaffolded workflow or eval assets (never the
+    // spec).
+    { name: "force", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
+// Item 13 — `crewhaus scaffold-evals`: starter eval assets FROM the spec.
+const SCAFFOLD_EVALS_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "out", short: "o", takesValue: true },
+    { name: "samples", takesValue: true },
+    // Model for the one-shot sample-input generation call (model-router
+    // grammar); also baked into the emitted llm_judge grader. Without it the
+    // spec's own agent.model is used when its credentials are visible, else
+    // the deterministic template fallback.
+    { name: "model", takesValue: true },
+    // Overwrite existing eval assets (default: refuse).
     { name: "force", takesValue: false },
     { name: "help", short: "h" },
   ],
@@ -809,7 +858,14 @@ function usageText(): string {
     "                                       eval-gated spec PRs (base vs PR spec, two fresh runs,",
     "                                       score-delta PR comment, check fails on regression);",
     "                                       with an existing crewhaus.yaml, adds just the workflow",
-    "       [--force]                       overwrite an existing scaffolded workflow",
+    "       [--with-evals]                  also scaffold eval/dataset.jsonl + eval/graders.yaml",
+    "                                       (item 13; offline template mode — no credentials needed)",
+    "       [--force]                       overwrite an existing scaffolded workflow / eval assets",
+    "  scaffold-evals <spec.yaml>           day-one eval assets FROM the spec (item 13): sample",
+    "       [-o <dir>] [--samples N]        stubs derived from agent.instructions (one model call",
+    "       [--model <m>] [--force]         with credentials, deterministic template without) +",
+    "                                       ONE starter grader (spec-goal llm_judge rubric online,",
+    "                                       non-empty-answer floor grader offline)",
     "  doctor                               check environment health",
     "       [--philosophy-alignment [--json] [--baseline | --accept-baseline]]  pillar audit + scope-audit drift gate (item 49)",
     "  context --bundle [-o <file>]         emit a single-markdown orientation manifest",
@@ -1222,7 +1278,7 @@ function resolveWorkflowRoot(
 function runInit(args: ParsedArgs): void {
   if (args.flags["help"]) {
     process.stdout.write(
-      "usage: crewhaus init [name] [--ci] [--force]\n" +
+      "usage: crewhaus init [name] [--ci] [--with-evals] [--force]\n" +
         "  --ci     Also scaffold .github/workflows/crewhaus-eval.yml — the eval-on-PR\n" +
         "           gate (item 44): PRs touching crewhaus.yaml or eval/** run the base\n" +
         "           branch's spec and the PR's spec on the PR's dataset+graders (two\n" +
@@ -1233,11 +1289,21 @@ function runInit(args: ParsedArgs): void {
         "           The workflow is written to .github/workflows at the GIT REPO ROOT\n" +
         "           (GitHub only reads it there); for a harness in a subdirectory its\n" +
         "           working-directory and paths filter point back at the harness.\n" +
-        "  --force  Overwrite an existing scaffolded workflow (never the spec).\n",
+        "  --with-evals  Also scaffold eval/dataset.jsonl + eval/graders.yaml (item 13)\n" +
+        "           — the flywheel's conventional paths — so the fresh harness can run\n" +
+        "           `crewhaus eval` on day one. Always OFFLINE template mode (init never\n" +
+        "           requires credentials): deterministic sample stubs derived from the\n" +
+        "           spec's instructions + the safe non-empty-answer floor grader. Run\n" +
+        "           `crewhaus scaffold-evals` later (with credentials) for model-derived\n" +
+        "           inputs and a spec-goal llm_judge rubric. With an existing\n" +
+        "           crewhaus.yaml, adds just the missing eval assets.\n" +
+        "  --force  Overwrite an existing scaffolded workflow or eval assets (never\n" +
+        "           the spec).\n",
     );
     return;
   }
   const ci = args.flags["ci"] === true;
+  const withEvals = args.flags["with-evals"] === true;
   const nameArg = args.positional[0];
   const targetDir = typeof nameArg === "string" ? resolve(nameArg) : process.cwd();
   const specName = typeof nameArg === "string" ? nameArg : basename(targetDir);
@@ -1245,9 +1311,10 @@ function runInit(args: ParsedArgs): void {
 
   if (existsSync(targetFile)) {
     // Item 44 — `init --ci` composes with an existing harness: keep the
-    // spec, add just the workflow. Without --ci the historical refusal
+    // spec, add just the workflow (item 13's --with-evals composes the same
+    // way for the eval assets). Without either flag the historical refusal
     // stands (a bare `init` must never touch existing work).
-    if (!ci) die(`${targetFile} already exists — refusing to overwrite`);
+    if (!ci && !withEvals) die(`${targetFile} already exists — refusing to overwrite`);
     process.stdout.write(`kept ${targetFile} (already exists)\n`);
   } else {
     mkdirSync(targetDir, { recursive: true });
@@ -1294,13 +1361,262 @@ agent:
     }
   }
 
+  // Item 13 — `init --with-evals`: day-one eval assets, ALWAYS in offline
+  // template mode (init must never require credentials). Existing assets are
+  // kept unless --force; the spec is never touched.
+  if (withEvals) {
+    const evalDir = join(targetDir, "eval");
+    const datasetPath = join(evalDir, "dataset.jsonl");
+    const gradersPath = join(evalDir, "graders.yaml");
+    const blocked = checkNoOverwrite(
+      [datasetPath, gradersPath],
+      existsSync,
+      args.flags["force"] === true,
+    );
+    if (blocked !== undefined) {
+      process.stdout.write(
+        `kept existing eval assets in ${evalDir} (--force overwrites scaffolded eval assets, never the spec)\n`,
+      );
+    } else {
+      try {
+        const info = extractScaffoldInfo(readFileSync(targetFile, "utf-8"));
+        const written = writeScaffoldAssets({
+          info,
+          outDir: evalDir,
+          inputs: templateSampleInputs(info, DEFAULT_SCAFFOLD_SAMPLES),
+          generator: "template",
+          online: false,
+        });
+        process.stdout.write(
+          `wrote ${written.datasetPath} (${written.sampleCount} sample stubs)\n`,
+        );
+        process.stdout.write(
+          `wrote ${written.gradersPath} (${written.graderName} floor grader — edit into real graders,\n`,
+        );
+        process.stdout.write(
+          "    or run `crewhaus scaffold-evals crewhaus.yaml --force` with credentials for a\n" +
+            "    spec-goal llm_judge rubric)\n",
+        );
+      } catch (err) {
+        // An existing-but-unscaffoldable spec (unparseable, no instructions)
+        // must not fail the rest of init — report and continue.
+        if (err instanceof ScaffoldEvalsError || err instanceof CrewhausError) {
+          process.stderr.write(`crewhaus: eval scaffolding skipped: ${err.message}\n`);
+        } else {
+          throw err;
+        }
+      }
+    }
+  }
+
   // The runtime resolves the spec and the `.crewhaus/` session store from
   // the current working directory, so guide the user to run from inside
   // the harness directory (where crewhaus.yaml lives), not from here.
   const rel = relative(process.cwd(), targetDir);
   const cd = rel === "" ? "" : `cd ${rel} && `;
   process.stdout.write(`next: ${cd}crewhaus run crewhaus.yaml\n`);
-  logger.debug("init.success", { target: targetFile, ci });
+  if (withEvals) {
+    process.stdout.write(
+      `next: ${cd}crewhaus eval crewhaus.yaml --dataset ${join("eval", "dataset.jsonl")} --graders ${join("eval", "graders.yaml")}\n`,
+    );
+  }
+  logger.debug("init.success", { target: targetFile, ci, withEvals });
+}
+
+// -------- item 13: crewhaus scaffold-evals (+ the init --with-evals core) --------
+
+type ScaffoldAssetsWritten = {
+  readonly datasetPath: string;
+  readonly gradersPath: string;
+  readonly sampleCount: number;
+  readonly graderName: string;
+  readonly graderType: string;
+};
+
+/**
+ * Generate + write `dataset.jsonl` and `graders.yaml` under `outDir`.
+ * Shared by `scaffold-evals` and `init --with-evals` (which always calls it
+ * offline). The caller has already run the {@link checkNoOverwrite} guard.
+ */
+function writeScaffoldAssets(opts: {
+  readonly info: ScaffoldInfo;
+  readonly outDir: string;
+  readonly inputs: ReadonlyArray<string>;
+  readonly generator: ScaffoldGenerator;
+  /** True → the spec-goal llm_judge rubric; false → the floor grader. */
+  readonly online: boolean;
+  /** Explicit --model, baked into the emitted llm_judge grader. */
+  readonly judgeModel?: string;
+}): ScaffoldAssetsWritten {
+  const samples = buildScaffoldSamples(opts.info, opts.inputs, opts.generator);
+  const graders = buildScaffoldGraders(opts.info, {
+    online: opts.online,
+    ...(opts.judgeModel !== undefined ? { model: opts.judgeModel } : {}),
+  });
+  mkdirSync(opts.outDir, { recursive: true });
+  const datasetPath = join(opts.outDir, "dataset.jsonl");
+  const gradersPath = join(opts.outDir, "graders.yaml");
+  writeFileSync(datasetPath, samplesToJsonl(samples));
+  writeFileSync(gradersPath, gradersConfigToYaml(graders, SCAFFOLD_GRADERS_HEADER));
+  const g = graders.graders[0];
+  return {
+    datasetPath,
+    gradersPath,
+    sampleCount: samples.length,
+    graderName: g?.name ?? "",
+    graderType: g?.type ?? "",
+  };
+}
+
+/**
+ * One model call through the same model-router path `optimize --mutator
+ * claude` uses (`resolveModel` → adapter.stream → collectFinalMessage).
+ * Drives scaffold-evals sample generation (item 13). Lazy imports keep the
+ * credential-free paths free of provider deps.
+ */
+async function oneShotModelText(opts: {
+  readonly model: string;
+  readonly system: string;
+  readonly prompt: string;
+  readonly maxTokens?: number;
+}): Promise<string> {
+  const { resolveModel } = await import("@crewhaus/model-router");
+  const { collectFinalMessage, extractFirstText } = await import("@crewhaus/adapter-anthropic");
+  const resolution = await resolveModel(opts.model);
+  const final = await collectFinalMessage(
+    resolution.adapter.stream({
+      model: resolution.modelId,
+      system: [{ type: "text", text: opts.system }],
+      messages: [{ role: "user", content: opts.prompt }],
+      maxTokens: opts.maxTokens ?? 2048,
+    }),
+  );
+  return extractFirstText(final) ?? "";
+}
+
+async function runScaffoldEvals(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus scaffold-evals <spec.yaml> [-o <out-dir>] [--samples N] [--model <m>] [--force]\n" +
+        "  Generate starter eval assets FROM the spec itself (item 13), so a day-one\n" +
+        "  harness can run `crewhaus eval` before its first user rating lands:\n" +
+        "    dataset.jsonl   N sample stubs (default 8) whose inputs derive from\n" +
+        "                    agent.instructions — via ONE model call (model-router\n" +
+        "                    grammar; the spec's own model by default) when credentials\n" +
+        "                    are visible, else a deterministic template that parses the\n" +
+        "                    instruction sentences into task-shaped prompts. Tools the\n" +
+        "                    spec declares are recorded as expected_tools where a\n" +
+        "                    prompt obviously implies them.\n" +
+        "    graders.yaml    exactly ONE starter grader (stacking graders hard-ANDs\n" +
+        "                    their scores): a spec-goal llm_judge rubric with all five\n" +
+        "                    anchors pre-filled when credentials exist, else the safe\n" +
+        "                    non-empty-answer floor grader.\n" +
+        "  -o defaults to eval/ next to the spec (the flywheel's conventional paths).\n" +
+        "  Existing eval assets are never overwritten without --force.\n" +
+        "  If the spec lacks a feedback: block, a suggested one is printed (never\n" +
+        "  auto-applied) — ratings are what later upgrade these stubs via `distill`.\n",
+    );
+    return;
+  }
+  const specPath = args.positional[0];
+  if (typeof specPath !== "string") die("missing <spec.yaml>");
+  const absSpec = resolve(specPath);
+  let yamlText: string;
+  try {
+    yamlText = readFileSync(absSpec, "utf-8");
+  } catch (err) {
+    die(`could not read ${absSpec}: ${(err as Error).message}`);
+  }
+  let info: ScaffoldInfo;
+  try {
+    info = extractScaffoldInfo(yamlText);
+  } catch (err) {
+    if (err instanceof ScaffoldEvalsError || err instanceof CrewhausError) die(err.message);
+    throw err;
+  }
+  const n = intFlag(args, "samples") ?? DEFAULT_SCAFFOLD_SAMPLES;
+  if (n < 1) die(`invalid --samples "${args.flags["samples"]}" — must be a positive integer`);
+  const outArg = strFlag(args, "out");
+  const outDir = outArg !== undefined ? resolve(outArg) : join(dirname(absSpec), "eval");
+  const blocked = checkNoOverwrite(
+    [join(outDir, "dataset.jsonl"), join(outDir, "graders.yaml")],
+    existsSync,
+    args.flags["force"] === true,
+  );
+  if (blocked !== undefined) die(blocked);
+
+  // Mode selection: an explicit --model opts into the model path outright;
+  // otherwise the spec's own model is used when its provider credentials are
+  // visible (shared check with `crewhaus doctor`). No credentials → the
+  // deterministic template fallback, never a doomed call.
+  const modelFlag = strFlag(args, "model");
+  const model = modelFlag ?? info.model;
+  let online =
+    model !== undefined &&
+    (modelFlag !== undefined || providerCredentialsSatisfied(model, process.env));
+  const templateInputs = templateSampleInputs(info, n);
+  let inputs: ReadonlyArray<string> = templateInputs;
+  let generator: ScaffoldGenerator = "template";
+  if (online && model !== undefined) {
+    try {
+      const raw = await oneShotModelText({
+        model,
+        system: SCAFFOLD_GENERATION_SYSTEM,
+        prompt: buildSampleGenerationPrompt(info, n),
+      });
+      const parsed = parseModelSampleInputs(raw, n);
+      if (parsed.length === 0) throw new Error("model returned no usable inputs");
+      // A short model response tops up from the template so the dataset is
+      // always the full N stubs.
+      inputs = mergeInputs(parsed, templateInputs, n);
+      generator = "model";
+    } catch (err) {
+      process.stderr.write(
+        `[scaffold-evals] model generation failed (${err instanceof Error ? err.message : String(err)}) — falling back to the deterministic template\n`,
+      );
+      online = false;
+    }
+  }
+
+  const written = writeScaffoldAssets({
+    info,
+    outDir,
+    inputs,
+    generator,
+    online,
+    ...(modelFlag !== undefined ? { judgeModel: modelFlag } : {}),
+  });
+  process.stdout.write(
+    `[scaffold-evals] wrote ${written.sampleCount} sample stub(s) (${generator} mode) → ${written.datasetPath}\n`,
+  );
+  process.stdout.write(
+    `[scaffold-evals] grader: ${written.graderName} (${written.graderType}) → ${written.gradersPath}\n`,
+  );
+  if (!online) {
+    process.stdout.write(
+      "[scaffold-evals] offline mode: the floor grader only checks for a non-empty answer —\n" +
+        "    re-run with credentials (or --model) for a spec-goal llm_judge rubric, or edit\n" +
+        "    the graders by hand\n",
+    );
+  }
+  if (!info.hasFeedback) {
+    const indented = feedbackBlockSuggestion()
+      .split("\n")
+      .map((l) => `    ${l}`)
+      .join("\n");
+    process.stdout.write(
+      `[scaffold-evals] the spec has no feedback: block — add this to ${basename(absSpec)} to start\n` +
+        `    collecting the ratings that later upgrade these stubs (not auto-applied):\n${indented}\n`,
+    );
+  }
+  // The runtime resolves eval assets relative to the invocation cwd, so
+  // print the command as run from the spec's directory.
+  const specDir = dirname(absSpec);
+  const rel = relative(process.cwd(), specDir);
+  const cd = rel === "" ? "" : `cd ${rel} && `;
+  process.stdout.write(
+    `next: ${cd}crewhaus eval ${basename(absSpec)} --dataset ${relative(specDir, written.datasetPath)} --graders ${relative(specDir, written.gradersPath)}\n`,
+  );
 }
 
 /**
@@ -6123,6 +6439,17 @@ switch (subcommand) {
     break;
   case "distill":
     await runDistill(parseFor(rest, DISTILL_SCHEMA));
+    break;
+  case "scaffold-evals":
+    // Mirror `run`'s policy: structured failures (SpecParseError, model
+    // routing/auth on the one-shot generation call) extend CrewhausError —
+    // route the family through die() for a clean one-liner.
+    try {
+      await runScaffoldEvals(parseFor(rest, SCAFFOLD_EVALS_SCHEMA));
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
     break;
   case "datasets":
     await runDatasets(parseFor(rest, DATASETS_SCHEMA));
