@@ -17,6 +17,7 @@ import { setDefaultBoundaryLlmClassifier } from "@crewhaus/boundary-classifier";
 import { type WrappedAdapter, wrap as wrapWithCircuitBreaker } from "@crewhaus/circuit-breaker";
 import { autoCompact } from "@crewhaus/compaction-autocompact";
 import { snip } from "@crewhaus/compaction-snip";
+import { createCostTracker } from "@crewhaus/cost-tracker";
 import {
   type EgressMatcher,
   type EgressVerdict,
@@ -352,6 +353,13 @@ export type RunChatLoopOptions = {
    * through this map; production callers leave it undefined.
    */
   _failoverAdapters?: ReadonlyMap<string, ProviderAdapter>;
+  /**
+   * Item 27 — test injection for the budget-degrade target: a pre-built
+   * adapter used in place of `resolveModel(budget.onExceed.model)` when a
+   * `degrade` breach fires. Production callers leave it undefined (the
+   * runtime resolves the degrade model through the normal router path).
+   */
+  _budgetDegradeAdapter?: ProviderAdapter;
   /** Override the input stream (testing). Defaults to process.stdin. */
   input?: NodeJS.ReadableStream;
   /** Tools the model may invoke. When empty/undefined, tools are not advertised. */
@@ -611,6 +619,33 @@ export type RunChatLoopOptions = {
    * Pass `0` (or omit) to force a refresh on the first turn.
    */
   promptCacheLastRotatedAt?: number;
+  /**
+   * Item 27 — run-level spend cap with a degradation ladder. Generalizes
+   * the optimizer's `BudgetMeter` to normal runs (`crewhaus run
+   * --budget-usd` / spec `budget: { usd, on_exceed }`). An always-on cost
+   * meter (independent of `CREWHAUS_COST_TRACKING`) accrues per-response
+   * spend priced off the WIRE model that actually served, and a PRE-TURN
+   * check — beside the token-budget/compaction check — enforces the cap
+   * before the next user turn opens:
+   *   - `on_exceed.kind: "stop"` ends the run cleanly with a `[budget]`
+   *     notice (the current turn always completes; the cap gates the NEXT
+   *     turn, so an in-flight turn is never severed mid-tool-call).
+   *   - `on_exceed.kind: "degrade"` re-resolves the primary model to
+   *     `on_exceed.model` ONCE (the cheaper rung of the ladder) and
+   *     continues; a `model_failover` event (reason `budget_degrade`)
+   *     records the switch. If spend later crosses the cap AGAIN on the
+   *     degraded model, the run stops (the ladder has one rung in v1).
+   * `usdMicros` is the ceiling in USD-micros (1 USD = 1_000_000). Absent →
+   * no cap (zero behaviour change for existing callers). A model the
+   * pricing table can't price accrues $0, so an all-unpriced run degrades
+   * to uncapped — same posture as cost-tracker's pricing-miss handling.
+   */
+  budget?: {
+    readonly usdMicros: number;
+    readonly onExceed:
+      | { readonly kind: "stop" }
+      | { readonly kind: "degrade"; readonly model: string };
+  };
 };
 
 /**
@@ -786,8 +821,13 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     adapter = baseAdapter;
   }
   void breakerWrap; // exposed via runtime stats once gateway/eval consumers land
-  const providerId: ProviderId = primaryResolution.providerId;
-  const wireModelId: string = primaryResolution.modelId;
+  // `let` (item 27): a `budget: { on_exceed: degrade }` breach re-resolves
+  // the primary model in place, so these become the degraded model's
+  // identity. `degradedSpecModel` overrides `opts.model` as the specModel
+  // stamped on model_request/response once a degrade has happened.
+  let providerId: ProviderId = primaryResolution.providerId;
+  let wireModelId: string = primaryResolution.modelId;
+  let degradedSpecModel: string | undefined;
   // Section 17 — feature gate: a spec that declares tools cannot run on an
   // adapter that doesn't speak tool use (e.g. Bedrock Llama/Mistral
   // families). Fail with a clear ConfigError naming the model instead of
@@ -916,6 +956,91 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       process.stderr.write(`[failover] ${event.from} → ${event.to} (${event.reason})\n`);
     });
   }
+
+  // Item 27 — run-level spend cap. An ALWAYS-ON cost meter (independent of
+  // the CREWHAUS_COST_TRACKING env flag) accrues per-response spend priced
+  // off the wire model that actually served — `suppressEvents` keeps it off
+  // the trace surface so it never double-prints beside an env-attached
+  // cost-tracker. The pre-turn check (`enforceBudget`, below) reads
+  // `budgetMeter.getRunCost(runId).totalUsdMicros`. `budgetDegraded` gates
+  // the ladder to a single rung: once we degrade, we never degrade again —
+  // a second breach stops the run.
+  const budgetMeter =
+    opts.budget !== undefined ? createCostTracker(bus, { suppressEvents: true }) : undefined;
+  let budgetDegraded = false;
+
+  /**
+   * Item 27 — pre-turn budget gate. Returns "stop" when the run must end
+   * before the next turn opens; "continue" otherwise. On a `degrade` breach
+   * it re-resolves the primary model to the cheaper rung IN PLACE (mutating
+   * `adapter`, `providerId`, `wireModelId`) and emits a `model_failover`
+   * (reason `budget_degrade`) — so the very next model call, and all cost
+   * accrual after it, use the degraded model. The current turn always
+   * completes; this only gates the NEXT turn, so an in-flight tool loop is
+   * never severed. Never throws — a re-resolution failure logs and stops.
+   */
+  const enforceBudget = async (): Promise<"continue" | "stop"> => {
+    if (opts.budget === undefined || budgetMeter === undefined) return "continue";
+    const spent = budgetMeter.getRunCost(bus.runId).totalUsdMicros;
+    if (spent < opts.budget.usdMicros) return "continue";
+    const spentUsd = (spent / 1_000_000).toFixed(4);
+    const capUsd = (opts.budget.usdMicros / 1_000_000).toFixed(4);
+    if (opts.budget.onExceed.kind === "stop" || budgetDegraded) {
+      const why = budgetDegraded ? "degraded model also reached the cap" : "run budget reached";
+      process.stderr.write(
+        `[budget] $${spentUsd} spent ≥ $${capUsd} cap — ${why}; ending the run.\n`,
+      );
+      return "stop";
+    }
+    // degrade: re-resolve the primary model to the cheaper rung, once.
+    const target = opts.budget.onExceed.model;
+    try {
+      const degraded =
+        opts._budgetDegradeAdapter !== undefined
+          ? {
+              adapter: opts._budgetDegradeAdapter,
+              modelId: bestEffortWireModelId(target),
+              providerId: opts._budgetDegradeAdapter.providerId,
+            }
+          : await resolveModel(target);
+      const from = opts.model;
+      adapter =
+        opts.circuitBreaker !== undefined
+          ? wrapWithCircuitBreaker(degraded.adapter, {
+              ...opts.circuitBreaker,
+              adapterName: degraded.adapter.providerId,
+              bus,
+            })
+          : degraded.adapter;
+      // The degraded model is now the serving one; keep the trace/pricing
+      // identity coherent for the model_request/response events below.
+      providerId = degraded.providerId;
+      wireModelId = degraded.modelId;
+      degradedSpecModel = target;
+      // A degrade takes over from the failover chain: subsequent calls hit
+      // the degraded adapter directly (v1 keeps one rung, no re-entry to the
+      // chain). Null it so the request/response stamping stops consulting it.
+      failoverChain = undefined;
+      budgetDegraded = true;
+      bus.publish({
+        ...bus.envelope(),
+        kind: "model_failover",
+        from,
+        to: target,
+        reason: "budget_degrade",
+      });
+      process.stderr.write(
+        `[budget] $${spentUsd} spent ≥ $${capUsd} cap — degrading ${from} → ${target}.\n`,
+      );
+      return "continue";
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      process.stderr.write(
+        `[budget] $${spentUsd} spent ≥ $${capUsd} cap — degrade to "${target}" failed (${message}); ending the run.\n`,
+      );
+      return "stop";
+    }
+  };
 
   // Working-indicator spinner. Auto-enables only for an interactive REPL on a
   // TTY (see `isSpinnerEnabled`); `singleTurn`/injected-`input`/piped runs stay
@@ -1845,7 +1970,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             const plannedCandidate = failoverChain?.plan();
             const reqWireModelId = plannedCandidate?.modelId ?? wireModelId;
             const reqProviderId = plannedCandidate?.providerId ?? providerId;
-            const reqSpecModel = plannedCandidate?.modelString ?? opts.model;
+            // Item 27 — after a budget degrade, `failoverChain` is null and
+            // `degradedSpecModel` is the running spec model.
+            const reqSpecModel = plannedCandidate?.modelString ?? degradedSpecModel ?? opts.model;
             bus.publish({
               ...modelStartEnv,
               kind: "model_request",
@@ -1965,7 +2092,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               // streamed this response. Cost-tracker prices off this pair.
               const servedStreaming = failoverChain?.lastServed();
               const respModelIdS = servedStreaming?.modelId ?? wireModelId;
-              const respSpecModelS = servedStreaming?.modelString ?? opts.model;
+              const respSpecModelS =
+                servedStreaming?.modelString ?? degradedSpecModel ?? opts.model;
               bus.publish({
                 ...bus.envelope(),
                 spanId: modelStartEnv.spanId,
@@ -2039,7 +2167,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             // streamed this response. Cost-tracker prices off this pair.
             const servedCandidate = failoverChain?.lastServed();
             const respWireModelId = servedCandidate?.modelId ?? wireModelId;
-            const respSpecModel = servedCandidate?.modelString ?? opts.model;
+            const respSpecModel = servedCandidate?.modelString ?? degradedSpecModel ?? opts.model;
             bus.publish({
               ...bus.envelope(),
               spanId: modelStartEnv.spanId,
@@ -2408,6 +2536,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       await subscribers.shutdownAll();
       costPersistUnsubscribe?.();
       failoverNoteUnsubscribe?.();
+      budgetMeter?.unsubscribe();
       await sessionStore
         .update(sessionId, { lastTurnIndex: runContext.turnNumber })
         .catch((err) => {
@@ -2551,6 +2680,13 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         }
       }
 
+      // Item 27 — run-level spend cap. Enforced HERE (a real turn is about
+      // to run, input is not exit/blank) so an idle prompt never trips it.
+      // On a `stop` breach we break before committing the input — the turn
+      // never runs. On a `degrade` breach `enforceBudget` has already
+      // swapped the primary adapter, so this turn runs on the cheaper model.
+      if ((await enforceBudget()) === "stop") break;
+
       messages.push({ role: "user", content: effectiveInput });
       await logEvent("user_message", { content: effectiveInput });
       runContext.turnNumber += 1;
@@ -2628,6 +2764,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     await subscribers.shutdownAll();
     costPersistUnsubscribe?.();
     failoverNoteUnsubscribe?.();
+    budgetMeter?.unsubscribe();
     if (shouldInstallSigint) {
       process.removeListener("SIGINT", sigintHandler);
     }

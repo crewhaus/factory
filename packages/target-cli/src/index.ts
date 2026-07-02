@@ -458,11 +458,14 @@ if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));`;
   // engine consults the named error classes (incl. the `switch-model`
   // verdict) before its built-in flow. Empty when the spec omits it.
   const failureTaxonomyField = renderFailureTaxonomyField(ir);
+  // Item 27 — run-level spend cap + degradation ladder. Empty when the spec
+  // omits `budget`, keeping pre-existing bundles byte-identical.
+  const budgetField = renderBudgetField(ir);
   const runChatLoopCall = `await runChatLoop({
   model: ${escapeJsonString(ir.agent.model)},
   instructions: ${escapeJsonString(ir.agent.instructions)},
   sessionName: ${escapeJsonString(ir.name)},
-  sessionTarget: "cli",${maxTokensField}${failoverFields}${failureTaxonomyField}${toolsField}${permField}${sandboxField}
+  sessionTarget: "cli",${maxTokensField}${failoverFields}${failureTaxonomyField}${budgetField}${toolsField}${permField}${sandboxField}
   hooks: __hooks,
   skills: __skills,
   slashCommands: __slashCommands,${subAgents.subAgentsField}${subAgents.spawnField}${egress.field}
@@ -534,6 +537,17 @@ function renderFailureTaxonomyField(ir: IrV0): string {
   const taxonomy = ir.failureTaxonomy;
   if (taxonomy === undefined || taxonomy.length === 0) return "";
   return `\n  failureTaxonomy: ${JSON.stringify(taxonomy)},`;
+}
+
+/**
+ * Item 27 — render the `budget` runChatLoop field. The IR carries a
+ * numbers-and-literals object (`usdMicros` + `onExceed`); `JSON.stringify`
+ * safely quotes the degrade `model` string. Empty when the spec omits it.
+ * Mirror: target-channel-bot + target-managed render the same field.
+ */
+function renderBudgetField(ir: IrV0): string {
+  if (ir.budget === undefined) return "";
+  return `\n  budget: ${JSON.stringify(ir.budget)},`;
 }
 
 /**

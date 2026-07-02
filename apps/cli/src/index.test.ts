@@ -730,6 +730,25 @@ describe("crewhaus optimize --budget-usd", () => {
     expect(result.stdout).toContain("--budget-usd");
   });
 
+  // Item 27 — `crewhaus run --budget-usd` (run-level spend cap). The
+  // invalid-value branch dies before any model call, so it is testable
+  // without credentials.
+  test("run rejects --budget-usd 0 (non-positive) via die()", async () => {
+    const result = await runCli(["run", HELLO_SPEC, "--budget-usd", "0"], {
+      env: { ANTHROPIC_API_KEY: "test-no-call" },
+    });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("invalid --budget-usd");
+  });
+
+  test("run rejects a non-numeric --budget-usd via die()", async () => {
+    const result = await runCli(["run", HELLO_SPEC, "--budget-usd", "lots"], {
+      env: { ANTHROPIC_API_KEY: "test-no-call" },
+    });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("invalid --budget-usd");
+  });
+
   // F4 — the fitness evals silently inherited the runner's retry with no
   // opt-out; `--no-retry` is now a real flag (threaded into every fitness
   // runEval call) and documented in the help text.

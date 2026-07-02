@@ -5,6 +5,7 @@ import type {
   EmitReadmeOptions,
   IrBatchV0,
   IrBrowserV0,
+  IrBudget,
   IrChainBinding,
   IrChainFinality,
   IrChainGameV0,
@@ -513,6 +514,33 @@ function lowerFailureTaxonomy(spec: SpecWithFailureTaxonomy): {
 }
 
 /**
+ * Item 27 — lower the optional `budget` block. Converts the human-facing
+ * dollar ceiling (`usd`) to the runtime's USD-micros unit (× 1e6, rounded
+ * so a fractional cent doesn't drift) and maps `on_exceed.action` → the
+ * IR's `onExceed.kind`. Spread-return-{} discipline (Pillar 1): absent from
+ * the IR when the spec omits the block.
+ */
+type SpecWithBudget = {
+  readonly budget?: {
+    readonly usd: number;
+    readonly on_exceed:
+      | { readonly action: "stop" }
+      | { readonly action: "degrade"; readonly model: string };
+  };
+};
+
+function lowerBudget(spec: SpecWithBudget): { budget?: IrBudget } {
+  const b = spec.budget;
+  if (b === undefined) return {};
+  const usdMicros = Math.round(b.usd * 1_000_000);
+  const onExceed: IrBudget["onExceed"] =
+    b.on_exceed.action === "degrade"
+      ? { kind: "degrade", model: b.on_exceed.model }
+      : { kind: "stop" };
+  return { budget: { usdMicros, onExceed } };
+}
+
+/**
  * Pillar 3 (FR-004) — lower the optional `security` block. Mirrors
  * `lowerCompaction`'s "propagate only defined fields" discipline:
  * defaults belong at the consumer (the cli run path defaults the judge
@@ -738,6 +766,7 @@ export function lower(spec: Spec): IrNode {
         subAgents: lowerSubAgents(spec.agent.sub_agents),
         compaction: lowerCompaction(spec),
         ...lowerFailureTaxonomy(spec),
+        ...lowerBudget(spec),
         ...lowerSecurity(spec),
         ...lowerFeedback(spec),
         // Phase 3 §3.3 — CLI banner config. Plus Phase 2 M2.2 TUI mode
@@ -797,6 +826,7 @@ export function lower(spec: Spec): IrNode {
         subAgents: lowerSubAgents(spec.agent.sub_agents),
         compaction: lowerCompaction(spec),
         ...lowerFailureTaxonomy(spec),
+        ...lowerBudget(spec),
         ...lowerFeedback(spec),
         // Phase 3 §3.1 — heartbeat. Duration string ("2h", "30m") is
         // parsed once at lower time so codegen emits a literal numeric
@@ -862,6 +892,7 @@ export function lower(spec: Spec): IrNode {
         permissions: lowerPermissions(spec),
         compaction: lowerCompaction(spec),
         ...lowerFailureTaxonomy(spec),
+        ...lowerBudget(spec),
       } satisfies IrManagedV0;
     case "pipeline":
       return {

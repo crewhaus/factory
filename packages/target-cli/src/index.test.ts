@@ -577,3 +577,24 @@ describe("emitCli — failureTaxonomy field (item 23)", () => {
     );
   });
 });
+
+describe("emitCli — run-level budget field (item 27)", () => {
+  test("emits budget in the runChatLoop call when the IR sets it", () => {
+    const content =
+      emitCli(
+        baseIr({
+          budget: {
+            usdMicros: 5_000_000,
+            onExceed: { kind: "degrade", model: "claude-haiku-4-5" },
+          },
+        }),
+      ).files[0]?.content ?? "";
+    expect(content).toContain('budget: {"usdMicros":5000000');
+    expect(content).toContain('"kind":"degrade"');
+    expect(content).toContain('"model":"claude-haiku-4-5"');
+  });
+
+  test("omits budget when the IR leaves it unset", () => {
+    expect(emitCli(baseIr()).files[0]?.content ?? "").not.toContain("budget:");
+  });
+});

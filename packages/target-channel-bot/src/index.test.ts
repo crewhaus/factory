@@ -847,3 +847,20 @@ describe("emitChannelBot — provider failover chain (item 22)", () => {
     expect(agentTs).not.toContain("circuitBreaker:");
   });
 });
+
+describe("emitChannelBot — run-level budget field (item 27)", () => {
+  test("agent.ts threads budget into runChatLoop when set", () => {
+    const irBudget: IrChannelV0 = {
+      ...MIN_IR,
+      budget: { usdMicros: 2_000_000, onExceed: { kind: "stop" } },
+    };
+    const agentTs =
+      emitChannelBot(irBudget).files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agentTs).toContain('budget: {"usdMicros":2000000,"onExceed":{"kind":"stop"}},');
+  });
+
+  test("agent.ts omits budget when the IR leaves it unset", () => {
+    const agentTs = emitChannelBot(MIN_IR).files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agentTs).not.toContain("budget:");
+  });
+});

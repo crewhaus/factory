@@ -132,6 +132,22 @@ export type IrFailureTaxonomyEntry = {
 export type IrFailureTaxonomy = readonly IrFailureTaxonomyEntry[];
 
 /**
+ * Item 27 — run-level spend cap with a degradation ladder, lowered from the
+ * spec's `budget` block. `usdMicros` is the dollar ceiling in USD-micros
+ * (1 USD = 1_000_000) — the unit the runtime meters in. `onExceed` decides
+ * the behaviour when accrued spend reaches the cap: `stop` ends the run
+ * before the next turn; `degrade` re-resolves the primary model to `model`
+ * (one cheaper rung) and continues. Carried on the interactive shapes that
+ * loop (cli, channel, managed); absent when the spec omits the block.
+ */
+export type IrBudget = {
+  readonly usdMicros: number;
+  readonly onExceed:
+    | { readonly kind: "stop" }
+    | { readonly kind: "degrade"; readonly model: string };
+};
+
+/**
  * Pillar 3 (FR-004) — per-target security fabric configuration the
  * compiler lowers from the spec's `security` block. Today it carries the
  * intent-gate's judge selection; `egressPolicy` is reserved for the
@@ -260,6 +276,8 @@ export type IrV0 = {
   readonly cli?: IrCliOptions;
   /** Section 55 (Track A) — named failure taxonomy. Optional. */
   readonly failureTaxonomy?: IrFailureTaxonomy;
+  /** Item 27 — run-level spend cap + degradation ladder. Optional. */
+  readonly budget?: IrBudget;
   /** Pillar 3 (FR-004) — security fabric config (intent-gate judge
    *  selection). Optional; absent when the spec omits the `security`
    *  block. */
@@ -524,6 +542,8 @@ export type IrChannelV0 = {
   readonly gateway?: IrChannelGateway;
   /** Section 55 (Track A) — named failure taxonomy. Optional. */
   readonly failureTaxonomy?: IrFailureTaxonomy;
+  /** Item 27 — run-level spend cap + degradation ladder. Optional. */
+  readonly budget?: IrBudget;
   /** Response-feedback config. `feedback.channelReactions` gates Slack 👍/👎
    *  → user_feedback codegen in this target. Absent when spec omits it. */
   readonly feedback?: IrFeedback;
@@ -565,6 +585,8 @@ export type IrManagedV0 = {
   readonly compaction: IrCompaction;
   /** Section 55 (Track A) — named failure taxonomy. Optional. */
   readonly failureTaxonomy?: IrFailureTaxonomy;
+  /** Item 27 — run-level spend cap + degradation ladder. Optional. */
+  readonly budget?: IrBudget;
 };
 
 /**

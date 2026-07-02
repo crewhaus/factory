@@ -1616,3 +1616,53 @@ describe("failure_taxonomy switch-model recovery action (item 23)", () => {
     ).toThrow();
   });
 });
+
+describe("run-level budget cap block (item 27)", () => {
+  const cli = (budgetLines: string): string =>
+    ["name: c", "target: cli", "agent:", "  model: m", "  instructions: i", budgetLines].join("\n");
+
+  test("parses a stop budget", () => {
+    const spec = parseSpec(cli("budget:\n  usd: 5\n  on_exceed:\n    action: stop"));
+    if (spec.target !== "cli") throw new Error("unexpected target");
+    expect(spec.budget?.usd).toBe(5);
+    expect(spec.budget?.on_exceed).toEqual({ action: "stop" });
+  });
+
+  test("parses a degrade ladder", () => {
+    const spec = parseSpec(
+      cli("budget:\n  usd: 12.5\n  on_exceed:\n    action: degrade\n    model: claude-haiku-4-5"),
+    );
+    if (spec.target !== "cli") throw new Error("unexpected target");
+    expect(spec.budget?.on_exceed).toEqual({ action: "degrade", model: "claude-haiku-4-5" });
+  });
+
+  test("on_exceed defaults to stop", () => {
+    const spec = parseSpec(cli("budget:\n  usd: 1"));
+    if (spec.target !== "cli") throw new Error("unexpected target");
+    expect(spec.budget?.on_exceed).toEqual({ action: "stop" });
+  });
+
+  test("rejects usd <= 0, unknown action, and a degrade without model", () => {
+    expect(() => parseSpec(cli("budget:\n  usd: 0"))).toThrow();
+    expect(() => parseSpec(cli("budget:\n  usd: 1\n  on_exceed:\n    action: nope"))).toThrow();
+    expect(() => parseSpec(cli("budget:\n  usd: 1\n  on_exceed:\n    action: degrade"))).toThrow();
+  });
+
+  test("shapes without the wiring reject the budget block (strict)", () => {
+    expect(() =>
+      parseSpec(
+        [
+          "name: bt",
+          "target: batch",
+          "agent:",
+          "  model: m",
+          "  instructions: i",
+          "budget:",
+          "  usd: 1",
+          "queue:",
+          "  adapter: in-memory",
+        ].join("\n"),
+      ),
+    ).toThrow();
+  });
+});

@@ -2250,3 +2250,152 @@ failure_taxonomy:
     expect(agentTs).not.toContain("failureTaxonomy:");
   });
 });
+
+describe("lower/emit — run-level budget cap + degradation ladder (item 27)", () => {
+  test("lowers budget.usd → usdMicros (×1e6) and on_exceed.action → onExceed.kind (stop)", () => {
+    const ir = lower(
+      parseSpec(`
+name: capped
+target: cli
+agent:
+  model: claude-sonnet-4-6
+  instructions: i
+budget:
+  usd: 5.50
+  on_exceed:
+    action: stop
+`),
+    );
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect(ir.budget).toEqual({ usdMicros: 5_500_000, onExceed: { kind: "stop" } });
+  });
+
+  test("lowers a degrade ladder verbatim", () => {
+    const ir = lower(
+      parseSpec(`
+name: capped
+target: cli
+agent:
+  model: claude-opus-4-1
+  instructions: i
+budget:
+  usd: 10
+  on_exceed:
+    action: degrade
+    model: claude-haiku-4-5
+`),
+    );
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect(ir.budget).toEqual({
+      usdMicros: 10_000_000,
+      onExceed: { kind: "degrade", model: "claude-haiku-4-5" },
+    });
+  });
+
+  test("on_exceed defaults to stop when omitted", () => {
+    const ir = lower(
+      parseSpec("name: c\ntarget: cli\nagent:\n  model: m\n  instructions: i\nbudget:\n  usd: 1\n"),
+    );
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect(ir.budget?.onExceed).toEqual({ kind: "stop" });
+  });
+
+  test("budget is absent from the IR when the spec omits it", () => {
+    const ir = lower(parseSpec(MINIMAL_SPEC));
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect("budget" in ir).toBe(false);
+  });
+
+  test("channel + managed agent shapes accept the budget block", () => {
+    const channel = lower(
+      parseSpec(`
+name: bot
+target: channel
+agent:
+  model: m
+  instructions: i
+budget:
+  usd: 2
+  on_exceed:
+    action: degrade
+    model: openai/gpt-4o-mini
+channels:
+  slack:
+    botToken: $T
+    signingSecret: $S
+routing:
+  sessionKey: thread
+`),
+    );
+    if (channel.target !== "channel") throw new Error("unexpected target");
+    expect(channel.budget).toEqual({
+      usdMicros: 2_000_000,
+      onExceed: { kind: "degrade", model: "openai/gpt-4o-mini" },
+    });
+
+    const managed = lower(
+      parseSpec(`
+name: mg
+target: managed
+agent:
+  model: m
+  instructions: i
+budget:
+  usd: 3
+tenants:
+  - id: t1
+    budget:
+      maxInputTokens: 1
+      maxOutputTokens: 1
+`),
+    );
+    if (managed.target !== "managed") throw new Error("unexpected target");
+    // The run-level budget is distinct from the per-tenant token budget.
+    expect(managed.budget).toEqual({ usdMicros: 3_000_000, onExceed: { kind: "stop" } });
+    expect(managed.tenants[0]?.budget).toEqual({ maxInputTokens: 1, maxOutputTokens: 1 });
+  });
+
+  test("rejects a non-positive usd and an unknown on_exceed action", () => {
+    expect(() =>
+      parseSpec("name: c\ntarget: cli\nagent:\n  model: m\n  instructions: i\nbudget:\n  usd: 0\n"),
+    ).toThrow();
+    expect(() =>
+      parseSpec(
+        "name: c\ntarget: cli\nagent:\n  model: m\n  instructions: i\nbudget:\n  usd: 1\n  on_exceed:\n    action: explode\n",
+      ),
+    ).toThrow();
+    // degrade requires a model.
+    expect(() =>
+      parseSpec(
+        "name: c\ntarget: cli\nagent:\n  model: m\n  instructions: i\nbudget:\n  usd: 1\n  on_exceed:\n    action: degrade\n",
+      ),
+    ).toThrow();
+  });
+
+  test("compiled cli bundle threads the budget into runChatLoop", () => {
+    const agentTs =
+      compile(`
+name: capped
+target: cli
+agent:
+  model: claude-opus-4-1
+  instructions: i
+budget:
+  usd: 10
+  on_exceed:
+    action: degrade
+    model: claude-haiku-4-5
+`).files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agentTs).toContain('"usdMicros":10000000');
+    expect(agentTs).toContain('"kind":"degrade"');
+    expect(agentTs).toContain('"model":"claude-haiku-4-5"');
+  });
+
+  test("compiled cli bundle omits budget when the spec has none", () => {
+    const agentTs =
+      compile("name: c\ntarget: cli\nagent:\n  model: m\n  instructions: i\n").files.find(
+        (f) => f.path === "agent.ts",
+      )?.content ?? "";
+    expect(agentTs).not.toContain("budget:");
+  });
+});

@@ -47,7 +47,7 @@ import {
   type ParsedArgs,
   parseArgs,
 } from "@crewhaus/infra-utils";
-import { GENERATED_README_MARKER } from "@crewhaus/ir";
+import { GENERATED_README_MARKER, type IrBudget } from "@crewhaus/ir";
 import { createLogger } from "@crewhaus/logging";
 import { McpHost } from "@crewhaus/mcp-host";
 import {
@@ -380,6 +380,11 @@ const RUN_SCHEMA: ParseArgsSchema = {
     // @crewhaus/embedder prefix grammar, e.g. openai/text-embedding-3-small,
     // mock/deterministic). Flag > CREWHAUS_EGRESS_EMBEDDER env > default.
     { name: "egress-embedder", takesValue: true },
+    // Item 27 — run-level spend cap in dollars. Sets/overrides the spec
+    // `budget.usd` ceiling and keeps the spec's on_exceed ladder (default
+    // `stop`). On reaching the cap the run stops (or degrades) before the
+    // next turn.
+    { name: "budget-usd", takesValue: true },
     { name: "help", short: "h" },
   ],
 };
@@ -1592,6 +1597,25 @@ async function runRunCli(
   const modelOverride = args.flags["model"];
   const model = typeof modelOverride === "string" ? modelOverride : ir.agent.model;
 
+  // Item 27 — run-level spend cap: `--budget-usd <n>` (flag) > spec `budget`.
+  // The flag sets/overrides the dollar ceiling and keeps the spec's on_exceed
+  // ladder (defaulting to `stop` when the spec has no budget block). Absent
+  // flag + absent spec block → no cap.
+  const budgetUsdFlag = args.flags["budget-usd"];
+  let runBudget: IrBudget | undefined;
+  if (typeof budgetUsdFlag === "string") {
+    const usd = Number.parseFloat(budgetUsdFlag);
+    if (!Number.isFinite(usd) || usd <= 0) {
+      die(`invalid --budget-usd "${budgetUsdFlag}" — expected a positive dollar amount`);
+    }
+    runBudget = {
+      usdMicros: Math.round(usd * 1_000_000),
+      onExceed: ir.target === "cli" ? (ir.budget?.onExceed ?? { kind: "stop" }) : { kind: "stop" },
+    };
+  } else if (ir.target === "cli" && ir.budget !== undefined) {
+    runBudget = ir.budget;
+  }
+
   // Permission mode resolution: CLI flag > spec > "default".
   // bypass is reachable only via the flag (the spec parser has already
   // rejected `mode: bypass`).
@@ -1718,6 +1742,8 @@ async function runRunCli(
       ...(ir.failureTaxonomy !== undefined && ir.failureTaxonomy.length > 0
         ? { failureTaxonomy: ir.failureTaxonomy }
         : {}),
+      // Item 27 — run-level spend cap (--budget-usd flag > spec `budget`).
+      ...(runBudget !== undefined ? { budget: runBudget } : {}),
       ...(resumeId !== undefined ? { resume: { sessionId: resumeId } } : {}),
       ...(justificationJudge !== undefined ? { justificationJudge } : {}),
       ...(justificationAuditSink !== undefined ? { justificationAuditSink } : {}),

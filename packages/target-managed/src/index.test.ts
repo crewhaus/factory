@@ -195,3 +195,20 @@ describe("emitManaged — provider failover chain (item 22)", () => {
     expect(agentTs).not.toContain("circuitBreaker:");
   });
 });
+
+describe("emitManaged — run-level budget field (item 27)", () => {
+  test("agent.ts threads budget into runChatLoop when set", () => {
+    const irBudget: IrManagedV0 = {
+      ...ir,
+      budget: { usdMicros: 4_000_000, onExceed: { kind: "degrade", model: "openai/gpt-4o-mini" } },
+    };
+    const agentTs = emitManaged(irBudget).files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agentTs).toContain('budget: {"usdMicros":4000000');
+    expect(agentTs).toContain('"model":"openai/gpt-4o-mini"');
+  });
+
+  test("agent.ts omits budget when the IR leaves it unset", () => {
+    const agentTs = emitManaged(ir).files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agentTs).not.toContain("budget:");
+  });
+});

@@ -334,6 +334,32 @@ const failureTaxonomyEntrySchema = z
 const failureTaxonomyBlock = z.array(failureTaxonomyEntrySchema).optional();
 
 /**
+ * Item 27 — run-level spend cap with a degradation ladder. Generalizes the
+ * optimizer's `--budget-usd` to normal runs. `usd` is the dollar ceiling;
+ * when the run's accrued spend reaches it, `on_exceed` decides:
+ *   - `{ action: "stop" }`      — end the run cleanly before the next turn.
+ *   - `{ action: "degrade", model }` — re-resolve the primary model to the
+ *     cheaper `model` (one rung) and continue; a later breach on the
+ *     degraded model stops the run.
+ * The check is PRE-TURN (beside compaction), so an in-flight turn always
+ * completes. Carried on the same interactive shapes as the failover chain
+ * (cli, channel, managed). `on_exceed.model` follows the agent.model
+ * grammar. Defaults to `{ action: "stop" }` when `on_exceed` is omitted.
+ */
+const budgetBlock = z
+  .object({
+    usd: z.number().positive(),
+    on_exceed: z
+      .discriminatedUnion("action", [
+        z.object({ action: z.literal("stop") }).strict(),
+        z.object({ action: z.literal("degrade"), model: z.string().min(1) }).strict(),
+      ])
+      .default({ action: "stop" }),
+  })
+  .strict()
+  .optional();
+
+/**
  * Response-feedback block — declares that a harness collects human ratings on
  * agent responses (thumbs/stars/scale/comment) which `crewhaus distill` turns
  * into eval datasets + graders. Cross-cutting like security: carried on the
@@ -529,6 +555,7 @@ const cliSchema = z
     compaction: compactionBlock,
     security: securityBlock,
     failure_taxonomy: failureTaxonomyBlock,
+    budget: budgetBlock,
     feedback: feedbackBlock,
     cli: cliOptionsBlock,
     chains: chainsBlock,
@@ -668,6 +695,7 @@ const channelSchema = z
     permissions: permissionsBlock,
     compaction: compactionBlock,
     failure_taxonomy: failureTaxonomyBlock,
+    budget: budgetBlock,
     feedback: feedbackBlock,
     heartbeat: heartbeatBlock,
     gateway: channelGatewayBlock,
@@ -761,6 +789,7 @@ const managedSchema = z
     permissions: permissionsBlock,
     compaction: compactionBlock,
     failure_taxonomy: failureTaxonomyBlock,
+    budget: budgetBlock,
   })
   .strict();
 
@@ -1235,6 +1264,7 @@ export type SpecSubAgentDefinition = z.infer<typeof subAgentDefinitionSchema>;
 export type SpecCompactionBlock = z.infer<typeof compactionBlock>;
 export type SpecModelFallbacks = z.infer<typeof modelFallbacksBlock>;
 export type SpecCircuitBreakerBlock = z.infer<typeof circuitBreakerBlock>;
+export type SpecBudgetBlock = z.infer<typeof budgetBlock>;
 export type SpecSecurityBlock = z.infer<typeof securityBlock>;
 export type SpecFeedbackBlock = z.infer<typeof feedbackBlock>;
 export type SpecFailureTaxonomyEntry = z.infer<typeof failureTaxonomyEntrySchema>;

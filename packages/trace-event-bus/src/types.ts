@@ -455,6 +455,10 @@ export type CircuitStateChangedEvent = TraceEventEnvelope & {
  *   - `candidate_error`  — the previous candidate could not be constructed
  *                          when actually tried (missing credential /
  *                          uninstalled provider package); routed onward.
+ *   - `budget_degrade`   — item 27: the run-level spend cap was reached and
+ *                          the primary model was re-resolved to the cheaper
+ *                          `budget.on_exceed` rung. Not a chain-routing
+ *                          event — the whole primary adapter was swapped.
  */
 export type ModelFailoverEvent = TraceEventEnvelope & {
   kind: "model_failover";
@@ -462,7 +466,7 @@ export type ModelFailoverEvent = TraceEventEnvelope & {
   from: string;
   /** Spec model string of the candidate now serving. */
   to: string;
-  reason: "breaker_open" | "probe_restore" | "candidate_error";
+  reason: "breaker_open" | "probe_restore" | "candidate_error" | "budget_degrade";
 };
 
 export type TraceEvent =
