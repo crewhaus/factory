@@ -528,6 +528,7 @@ type SpecWithFeedback = {
     readonly scale?: { readonly min: number; readonly max: number };
     readonly storage?: { readonly location: string };
     readonly autoDistill?: boolean;
+    readonly exitPrompt?: boolean;
     readonly channelReactions?: boolean;
   };
 };
@@ -546,6 +547,7 @@ function lowerFeedback(spec: SpecWithFeedback): { feedback?: IrFeedback } {
       ...(f.scale !== undefined ? { scale: { min: f.scale.min, max: f.scale.max } } : {}),
       ...(f.storage !== undefined ? { storage: { location: f.storage.location } } : {}),
       ...(f.autoDistill !== undefined ? { autoDistill: f.autoDistill } : {}),
+      ...(f.exitPrompt !== undefined ? { exitPrompt: f.exitPrompt } : {}),
       ...(f.channelReactions !== undefined ? { channelReactions: f.channelReactions } : {}),
     },
   };
