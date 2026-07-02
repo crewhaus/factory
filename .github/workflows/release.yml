@@ -8,6 +8,9 @@ name: Release
 #   • Scoop bucket   → crewhaus/scoop-bucket   (scoop install crewhaus)
 #   • apt repo       → crewhaus/apt (gh-pages) (apt install crewhaus)
 #   • winget         → microsoft/winget-pkgs   (winget install CrewHaus.CLI)
+#   • GHCR           → ghcr.io/crewhaus/<target> (item 47 — one image per
+#                      target shape with a Dockerfile; the pushed digests are
+#                      recorded back into docker/digests.json on main)
 #
 # Trigger: push a tag like `v0.1.3`, or run manually with a version input.
 #
@@ -299,3 +302,99 @@ jobs:
           $url = "$env:DOWNLOAD_BASE_URL/crewhaus-windows-x64-$env:VERSION.exe"
           Invoke-WebRequest https://aka.ms/wingetcreate/latest -OutFile wingetcreate.exe
           .\wingetcreate.exe update CrewHaus.CLI --version $env:VERSION --urls "$url|x64|portable" --submit --token $env:WINGET_TOKEN
+
+  # ── Container images (item 47) ──────────────────────────────────────────────
+  # One GHCR image per target shape with a Dockerfile, then the pushed digests
+  # are recorded back into docker/digests.json — the lockfile the file's own
+  # header promises `crewhaus build-image` maintains (locally it now does, and
+  # this closes the loop for CI-published tags).
+
+  docker-targets:
+    name: Enumerate image target shapes
+    runs-on: ubuntu-latest
+    outputs:
+      targets: ${{ steps.list.outputs.targets }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: List per-shape Dockerfiles
+        id: list
+        # The matrix mirrors TARGET_SHAPES in packages/docker-images — one dir
+        # per shape under docker/<target>/Dockerfile. Enumerated from disk so a
+        # new shape's Dockerfile is picked up without editing this workflow.
+        run: |
+          targets=$(find packages/docker-images/docker -mindepth 2 -maxdepth 2 -name Dockerfile \
+            | sed 's|.*/docker/\(.*\)/Dockerfile|\1|' | sort | jq -R . | jq -sc .)
+          echo "targets=$targets" >> "$GITHUB_OUTPUT"
+
+  docker:
+    name: Publish images to GHCR
+    needs: [build, docker-targets]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # push ghcr.io/crewhaus/<target>
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.docker-targets.outputs.targets) }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Log in to GHCR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+        run: printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+      - name: Build + push image
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.build.outputs.version }}
+        # Same argv shape as @crewhaus/docker-images' buildImage() (per-shape
+        # Dockerfile against the workspace-root context); buildImage itself only
+        # knows local `crewhaus/<target>` refs, so CI tags the ghcr.io refs
+        # directly and pushes both the version tag and :latest.
+        run: |
+          docker buildx build \
+            --file "packages/docker-images/docker/$TARGET/Dockerfile" \
+            --tag "ghcr.io/crewhaus/$TARGET:$VERSION" \
+            --tag "ghcr.io/crewhaus/$TARGET:latest" \
+            --push \
+            .
+
+  docker-digests:
+    name: Record image digests
+    needs: [build, docker]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # commit the updated docker/digests.json back to main
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          # v* tags are cut from main and the lockfile commit lands there too
+          # (main's ruleset allows the bot's direct push — no require-PR).
+          ref: main
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: ">=1.2.0"
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Log in to GHCR
+        # imagetools inspect needs auth while the freshly-pushed packages are
+        # still private (first-publish default).
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+        run: printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+      - name: Record pushed digests into docker/digests.json
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: bun scripts/record-image-digests.ts --version "$VERSION"
+      - name: Commit digests.json back to main
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          git config user.name "crewhaus-release-bot"
+          git config user.email "release@crewhaus.ai"
+          git add packages/docker-images/docker/digests.json
+          git commit -m "chore(release): record GHCR image digests for v$VERSION" || { echo "no change"; exit 0; }
+          git pull --rebase origin main
+          git push origin HEAD:main

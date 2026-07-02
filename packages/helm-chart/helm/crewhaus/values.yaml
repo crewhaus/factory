@@ -8,6 +8,11 @@ target: channel
 image:
   repository: crewhaus/${target}
   tag: latest
+  # Optional content-digest pin. When set to "sha256:<64 hex>" (as recorded in
+  # packages/docker-images/docker/digests.json by `crewhaus build-image` and the
+  # release workflow), the Deployment references crewhaus/<target>@sha256:...
+  # and `tag` is ignored — reproducible, tamper-evident deploys.
+  # digest: "sha256:<digest>"
   pullPolicy: IfNotPresent
   pullSecrets: []
 

@@ -67,6 +67,13 @@ export type ChartValues = {
   readonly image: {
     readonly repository?: string;
     readonly tag: string;
+    /**
+     * Optional content-digest pin (`sha256:<64 hex>`, as recorded in
+     * packages/docker-images/docker/digests.json — item 47). When set, the
+     * Deployment references `crewhaus/<target>@sha256:...` and `tag` is
+     * ignored: reproducible, tamper-evident deploys. Unset → tag-based ref.
+     */
+    readonly digest?: string;
     readonly pullPolicy: "IfNotPresent" | "Always" | "Never";
     readonly pullSecrets: ReadonlyArray<{ readonly name: string }>;
   };
@@ -179,6 +186,13 @@ export function validateValues(values: ChartValues): void {
   }
   if (!values.image.tag) {
     throw new HelmChartError("image.tag must be non-empty");
+  }
+  if (values.image.digest !== undefined && !/^sha256:[0-9a-f]{64}$/.test(values.image.digest)) {
+    throw new HelmChartError(
+      `image.digest must be "sha256:<64 hex>" (as recorded in docker/digests.json); got ${JSON.stringify(
+        values.image.digest,
+      )}`,
+    );
   }
   for (const entry of values.secrets.provider ?? []) {
     if (!entry.name || !entry.secretName || !entry.key) {

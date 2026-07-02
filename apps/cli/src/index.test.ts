@@ -1307,3 +1307,55 @@ describe("crewhaus retention (item 35)", () => {
     expect(existsSync(join(tmp, ".crewhaus", "sessions", "sess_1111111111111111.json"))).toBe(true);
   });
 });
+
+describe("crewhaus build-image — digest recording wiring (item 47)", () => {
+  /**
+   * A fake `docker` on PATH: `buildx build` succeeds; `image inspect` is
+   * scripted per test via a marker file. The default-record test uses the
+   * inspect-FAILURE path (warning, exit 0) so the suite never mutates the
+   * repo's real docker/digests.json — the successful record round-trip is
+   * covered at the package seam in @crewhaus/docker-images' tests.
+   */
+  function installFakeDocker(dir: string, inspectExit: number): string {
+    const bin = join(dir, "fakebin");
+    mkdirSync(bin, { recursive: true });
+    const script = [
+      "#!/bin/bash",
+      'if [ "$1" = "buildx" ] && [ "$2" = "build" ]; then exit 0; fi',
+      'if [ "$1" = "image" ] && [ "$2" = "inspect" ]; then',
+      `  if [ ${inspectExit} -eq 0 ]; then echo "sha256:${"b".repeat(64)}"; fi`,
+      `  exit ${inspectExit}`,
+      "fi",
+      "exit 1",
+    ].join("\n");
+    writeFileSync(join(bin, "docker"), `${script}\n`, { mode: 0o755 });
+    return bin;
+  }
+
+  test("--no-record builds without touching the digests lockfile", async () => {
+    const bin = installFakeDocker(tmp, 0);
+    const result = await runCli(["build-image", "cli", "--tag", "t1", "--no-record"], {
+      env: { PATH: `${bin}:${process.env["PATH"] ?? ""}` },
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("built crewhaus/cli:t1");
+    expect(result.stdout).not.toContain("recorded");
+    expect(result.stderr).toBe("");
+  });
+
+  test("recording is default-on: a failed digest lookup warns but does not fail the build", async () => {
+    const bin = installFakeDocker(tmp, 1);
+    const result = await runCli(["build-image", "cli", "--tag", "t2"], {
+      env: { PATH: `${bin}:${process.env["PATH"] ?? ""}` },
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("built crewhaus/cli:t2");
+    expect(result.stderr).toContain("digest was not recorded");
+  });
+
+  test("--help documents --no-record", async () => {
+    const result = await runCli(["build-image", "--help"]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("--no-record");
+  });
+});

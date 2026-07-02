@@ -18,6 +18,10 @@ import { fileURLToPath } from "node:url";
  *     version` succeeding); injectable `runner` for tests.
  *   - `loadDigests()` / `recordDigest()` over a `docker/digests.json`
  *     lockfile so reproducible builds work offline.
+ *   - `resolveImageDigest()` + `buildImageAndRecord()` — item 47 closes the
+ *     digests.json loop: the CLI records every successful local build's
+ *     content digest by default, and the release workflow records the
+ *     pushed ghcr.io digests for each v* tag.
  */
 import { CrewhausError } from "@crewhaus/errors";
 
@@ -210,6 +214,91 @@ export function recordDigest(
   current._format_version = 1;
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, `${JSON.stringify(current, null, 2)}\n`, { mode: 0o644 });
+}
+
+// ─── digest resolution + record-after-build (item 47) ────────────────────────
+
+export type ResolveImageDigestOptions = {
+  readonly target: TargetShape;
+  readonly tag: string;
+  /**
+   * Whether the image was built with `--push`. A pushed buildx build never
+   * lands in the local image store, so the digest comes from the registry
+   * (`docker buildx imagetools inspect`); a `--load` build is inspected
+   * locally (`docker image inspect`, whose `.Id` IS the content digest).
+   */
+  readonly pushed?: boolean;
+  /** Test injection point — defaults to the same spawn runner as buildImage. */
+  readonly runner?: BuildRunner;
+};
+
+const SHA256_DIGEST_RE = /sha256:[0-9a-f]{64}/;
+
+export async function resolveImageDigest(opts: ResolveImageDigestOptions): Promise<string> {
+  const ref = `crewhaus/${opts.target}:${opts.tag}`;
+  const argv = opts.pushed
+    ? ["docker", "buildx", "imagetools", "inspect", ref]
+    : ["docker", "image", "inspect", "--format", "{{.Id}}", ref];
+  const runner = opts.runner ?? defaultRunner;
+  const { exitCode, stdout, stderr } = await runner(argv, process.cwd());
+  if (exitCode !== 0) {
+    throw new DockerImagesError(
+      `could not inspect ${ref} for its digest (exit ${exitCode}): ${stderr.slice(0, 512)}`,
+    );
+  }
+  const match = SHA256_DIGEST_RE.exec(stdout);
+  if (match === null) {
+    throw new DockerImagesError(`no sha256 digest in docker inspect output for ${ref}`);
+  }
+  return match[0];
+}
+
+export type BuildImageAndRecordOptions = BuildImageOptions & {
+  /** Record the built image's digest into docker/digests.json. Default true. */
+  readonly record?: boolean;
+  /** Override the digests.json location (tests / CI checkouts). */
+  readonly digestsFile?: string;
+  /** Test injection point for the recording seam. Defaults to {@link recordDigest}. */
+  readonly recordDigestFn?: typeof recordDigest;
+};
+
+export type BuildImageAndRecordResult = BuildImageResult & {
+  /** Content digest of the built image; undefined when recording was skipped or failed. */
+  readonly digest?: string;
+  readonly recorded: boolean;
+  /** Why the digest was not recorded (set only when recording was requested but failed). */
+  readonly recordError?: string;
+};
+
+/**
+ * `buildImage()` + close the digests.json loop: after a successful build,
+ * resolve the image's content digest and record it in the lockfile — the
+ * maintenance the digests.json header always promised. `crewhaus
+ * build-image` calls this (recording is default-on there; `--no-record`
+ * opts out). A digest-resolution/record failure does NOT fail the build —
+ * the image exists; the caller decides how loudly to surface the stale
+ * lockfile (the CLI prints a warning).
+ */
+export async function buildImageAndRecord(
+  opts: BuildImageAndRecordOptions,
+): Promise<BuildImageAndRecordResult> {
+  const result = await buildImage(opts);
+  if (opts.record === false) {
+    return { ...result, recorded: false };
+  }
+  const record = opts.recordDigestFn ?? recordDigest;
+  try {
+    const digest = await resolveImageDigest({
+      target: opts.target,
+      tag: opts.tag,
+      pushed: opts.push === true,
+      runner: opts.runner,
+    });
+    record(opts.target, opts.tag, digest, opts.digestsFile);
+    return { ...result, digest, recorded: true };
+  } catch (err) {
+    return { ...result, recorded: false, recordError: (err as Error).message };
+  }
 }
 
 // ─── Dockerfile structural fingerprint (consumed by tests) ───────────────────

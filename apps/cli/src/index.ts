@@ -388,6 +388,7 @@ const BUILD_IMAGE_SCHEMA: ParseArgsSchema = {
     { name: "tag", takesValue: true },
     { name: "platform", takesValue: true },
     { name: "push" },
+    { name: "no-record" },
     { name: "help", short: "h" },
   ],
 };
@@ -454,7 +455,8 @@ function usageText(): string {
     "  deploy promote|rollback ...          re-pin a spec for an environment (Section 28)",
     "  migrate-all --from N --to N          batch-migrate every spec in the registry",
     "  build-image <target> --tag <tag>     build the docker image for a target shape (Section 32)",
-    "       [--platform <p>] [--push]",
+    "       [--platform <p>] [--push]        (records the digest in docker/digests.json;",
+    "       [--no-record]                     --no-record opts out)",
     "  cloud deploy --provider <p>          deploy a managed CrewHaus cluster (Section 32)",
     "       --region <r> [--tier <t>] [--image-tag <tag>]",
     "  cloud teardown --provider <p>        tear down a managed cluster",
@@ -2654,9 +2656,11 @@ async function runMigrateAll(args: ParsedArgs): Promise<void> {
 }
 
 /**
- * Section 32 — `crewhaus build-image <target> --tag <tag> [--platform <p>] [--push]`.
+ * Section 32 — `crewhaus build-image <target> --tag <tag> [--platform <p>] [--push] [--no-record]`.
  * Wraps `docker buildx build` for the per-target Dockerfiles in
- * @crewhaus/docker-images.
+ * @crewhaus/docker-images. Item 47: after a successful build the image's
+ * content digest is recorded in docker/digests.json by default (the
+ * maintenance the lockfile header always promised); `--no-record` opts out.
  */
 async function runBuildImage(rest: ReadonlyArray<string>): Promise<void> {
   const positional: string[] = [];
@@ -2666,12 +2670,13 @@ async function runBuildImage(rest: ReadonlyArray<string>): Promise<void> {
     if (a === undefined) continue;
     if (a === "--help" || a === "-h") {
       process.stdout.write(
-        "usage: crewhaus build-image <target> --tag <tag> [--platform <p>] [--push]\n",
+        "usage: crewhaus build-image <target> --tag <tag> [--platform <p>] [--push] [--no-record]\n" +
+          "  --no-record  skip recording the built image's digest into docker/digests.json\n",
       );
       return;
     }
-    if (a === "--push") {
-      flags.set("push", true);
+    if (a === "--push" || a === "--no-record") {
+      flags.set(a.slice(2), true);
       continue;
     }
     if (a === "--tag" || a === "--platform") {
@@ -2689,19 +2694,35 @@ async function runBuildImage(rest: ReadonlyArray<string>): Promise<void> {
   if (typeof tag !== "string") die("missing --tag <tag>");
   const platform = flags.get("platform");
   const push = flags.get("push") === true;
+  const record = flags.get("no-record") !== true;
 
-  const { buildImage, isTargetShape } = await import("@crewhaus/docker-images");
+  const { buildImageAndRecord, digestsPath, isTargetShape } = await import(
+    "@crewhaus/docker-images"
+  );
   if (!isTargetShape(target)) {
     die(`unknown target shape: ${target}`);
   }
   try {
-    const result = await buildImage({
+    const result = await buildImageAndRecord({
       target,
       tag,
       platform: typeof platform === "string" ? platform : undefined,
       push,
+      record,
     });
     process.stdout.write(`built crewhaus/${result.target}:${result.tag}\n`);
+    if (result.recorded && result.digest !== undefined) {
+      process.stdout.write(
+        `recorded ${result.digest} for ${result.target}:${result.tag} → ${digestsPath()}\n`,
+      );
+    } else if (record && result.recordError !== undefined) {
+      // The image exists; a failed digest lookup/record must not fail the
+      // build — but a silently stale lockfile is the exact lie item 47
+      // retires, so say it out loud.
+      process.stderr.write(
+        `crewhaus: warning: image built but its digest was not recorded: ${result.recordError}\n`,
+      );
+    }
   } catch (err) {
     die(`build-image: ${(err as Error).message}`);
   }

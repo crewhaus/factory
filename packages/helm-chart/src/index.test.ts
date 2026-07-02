@@ -51,6 +51,18 @@ describe("defaultValues + validateValues", () => {
       validateValues({ ...defaultValues(), image: { ...defaultValues().image, tag: "" } }),
     ).toThrow();
   });
+
+  test("accepts a well-formed image.digest and rejects malformed ones", () => {
+    const good = `sha256:${"ab".repeat(32)}`;
+    expect(() =>
+      validateValues({ ...defaultValues(), image: { ...defaultValues().image, digest: good } }),
+    ).not.toThrow();
+    for (const bad of ["latest", "sha256:short", `sha512:${"ab".repeat(32)}`, ""]) {
+      expect(() =>
+        validateValues({ ...defaultValues(), image: { ...defaultValues().image, digest: bad } }),
+      ).toThrow(/image\.digest/);
+    }
+  });
 });
 
 describe("isDaemonShape", () => {
@@ -185,6 +197,23 @@ describe("renderChart() — full render per shape (T1)", () => {
       expect(out["deployment.yaml"]).toContain("livenessProbe");
     });
   }
+
+  test("image.digest pins the container image by digest (item 47)", () => {
+    const digest = `sha256:${"ab".repeat(32)}`;
+    const out = renderChart({
+      ...defaultValues(),
+      target: "channel",
+      image: { ...defaultValues().image, digest },
+    });
+    expect(out["deployment.yaml"]).toContain(`image: "crewhaus/channel@${digest}"`);
+    expect(out["deployment.yaml"]).not.toContain("crewhaus/channel:");
+  });
+
+  test("without image.digest the tag-based image reference is unchanged", () => {
+    const out = renderChart({ ...defaultValues(), target: "cli" });
+    expect(out["deployment.yaml"]).toContain('image: "crewhaus/cli:latest"');
+    expect(out["deployment.yaml"]).not.toContain("@sha256:");
+  });
 
   test("daemon shape (channel) renders Service", () => {
     const out = renderChart({ ...defaultValues(), target: "channel" });

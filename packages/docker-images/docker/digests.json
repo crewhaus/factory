@@ -1,4 +1,4 @@
 {
-  "_comment": "Pinned image digests for reproducible builds. `crewhaus build-image --tag <tag>` writes here. Format: `{ \"<target>\": { \"<tag>\": { \"sha256\": \"<digest>\", \"builtAt\": \"<iso>\" } } }`.",
+  "_comment": "Pinned image digests for reproducible builds. `crewhaus build-image` records here by default after every successful build (opt out with --no-record); the Release workflow's docker-digests job records the pushed ghcr.io/crewhaus/<target> digests for each v* tag. Format: `{ \"<target>\": { \"<tag>\": { \"sha256\": \"<digest>\", \"builtAt\": \"<iso>\" } } }`.",
   "_format_version": 1
 }
