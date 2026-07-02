@@ -22,6 +22,7 @@ const REPO_ROOT = join(import.meta.dir, "../../..");
 const HELLO_SPEC = join(REPO_ROOT, "apps/cli/test-fixtures/minimal-cli/crewhaus.yaml");
 const BROWSER_SPEC = join(REPO_ROOT, "apps/cli/test-fixtures/minimal-browser/crewhaus.yaml");
 const VOICE_SPEC = join(REPO_ROOT, "apps/cli/test-fixtures/minimal-voice/crewhaus.yaml");
+const CHANNEL_SPEC = join(REPO_ROOT, "apps/cli/test-fixtures/minimal-channel/crewhaus.yaml");
 
 type RunResult = {
   exitCode: number;
@@ -1528,6 +1529,118 @@ describe("crewhaus retention (item 35)", () => {
   });
 });
 
+describe("crewhaus build-image — digest recording wiring (item 47)", () => {
+  /**
+   * A fake `docker` on PATH: `buildx build` succeeds; `buildx imagetools
+   * inspect` is scripted per test and touches a marker file so tests can
+   * assert whether a digest lookup happened at all. The push test uses the
+   * inspect-FAILURE path (warning, exit 0) so the suite never mutates the
+   * repo's real docker/digests.json — the successful record round-trip is
+   * covered at the package seam in @crewhaus/docker-images' tests.
+   */
+  function installFakeDocker(dir: string, inspectExit: number): { bin: string; marker: string } {
+    const bin = join(dir, "fakebin");
+    const marker = join(dir, "inspect-called");
+    mkdirSync(bin, { recursive: true });
+    const script = [
+      "#!/bin/bash",
+      'if [ "$1" = "buildx" ] && [ "$2" = "build" ]; then exit 0; fi',
+      'if [ "$1" = "buildx" ] && [ "$2" = "imagetools" ] && [ "$3" = "inspect" ]; then',
+      `  touch "${marker}"`,
+      `  if [ ${inspectExit} -eq 0 ]; then echo "Digest: sha256:${"b".repeat(64)}"; fi`,
+      `  exit ${inspectExit}`,
+      "fi",
+      "exit 1",
+    ].join("\n");
+    writeFileSync(join(bin, "docker"), `${script}\n`, { mode: 0o755 });
+    return { bin, marker };
+  }
+
+  test("--no-record builds without touching the digests lockfile", async () => {
+    const { bin, marker } = installFakeDocker(tmp, 0);
+    const result = await runCli(["build-image", "cli", "--tag", "t1", "--no-record"], {
+      env: { PATH: `${bin}:${process.env["PATH"] ?? ""}` },
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("built crewhaus/cli:t1");
+    expect(result.stdout).not.toContain("recorded");
+    // stderr must carry no build-image output. Unrelated environment noise
+    // (e.g. adapter-anthropic's claude-CLI-version fallback warning on
+    // machines without the claude binary) is tolerated.
+    expect(result.stderr).not.toContain("build-image");
+    expect(result.stderr).not.toContain("digest");
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  // F2 regression: a local (--load) build records NOTHING — the local image
+  // ID is a config digest, not a pullable registry digest — and the CLI says
+  // so with an info line instead of warning or writing an unpullable pin.
+  test("a local build (no --push) records nothing, skips digest inspection, and prints the info line", async () => {
+    const { bin, marker } = installFakeDocker(tmp, 0);
+    const result = await runCli(["build-image", "cli", "--tag", "t2"], {
+      env: { PATH: `${bin}:${process.env["PATH"] ?? ""}` },
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("built crewhaus/cli:t2");
+    expect(result.stdout).toContain(
+      "local image ID is not a registry digest — use --push to record a pullable digest",
+    );
+    expect(result.stdout).not.toContain("recorded sha256:");
+    // stderr must carry no build-image output (environment noise tolerated —
+    // see the --no-record test above).
+    expect(result.stderr).not.toContain("build-image");
+    expect(result.stderr).not.toContain("digest");
+    // No digest lookup of any kind happened for the --load build.
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  test("recording is default-on for --push: a failed registry digest lookup warns but does not fail the build", async () => {
+    const { bin, marker } = installFakeDocker(tmp, 1);
+    const result = await runCli(["build-image", "cli", "--tag", "t3", "--push"], {
+      env: { PATH: `${bin}:${process.env["PATH"] ?? ""}` },
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("built crewhaus/cli:t3");
+    expect(result.stderr).toContain("digest was not recorded");
+    // The lookup went to the registry (imagetools inspect), not the local store.
+    expect(existsSync(marker)).toBe(true);
+  });
+
+  test("--help documents --no-record and the pushed-digests-only contract", async () => {
+    const result = await runCli(["build-image", "--help"]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("--no-record");
+    expect(result.stdout).toContain("registry\n               manifest digest");
+    expect(result.stdout).toContain("Local (--load) builds record nothing");
+  });
+});
+
+describe("crewhaus compile --check — flag surface (item 33)", () => {
+  // The check pipeline itself (assertion selection, install/boot behind an
+  // injectable runner, verdict mapping) is covered in compile-check.test.ts;
+  // these pin the CLI wiring without hitting the network.
+  test("--check rejects --emit-ir (nothing emitted to verify)", async () => {
+    const result = await runCli(["compile", HELLO_SPEC, "--emit-ir", "--check", "-o", tmp]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("--check");
+    expect(result.stderr).toContain("--emit-ir");
+  });
+
+  test("compile --help documents --check", async () => {
+    const result = await runCli(["compile", "--help"]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("--check");
+    expect(result.stdout).toContain("liveness");
+  });
+
+  test("plain compile is unaffected — no verdict line without --check", async () => {
+    const result = await runCli(["compile", HELLO_SPEC, "-o", tmp]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).not.toContain("compile --check:");
+    expect(existsSync(join(tmp, "package.json"))).toBe(false);
+  });
+});
+
 describe("crewhaus spec auto-register + changelog (item 46)", () => {
   // Every run uses `cwd: tmp` so the registry (.crewhaus/specs) lands in the
   // per-test temp dir, not the repo checkout.
@@ -1673,5 +1786,125 @@ describe("crewhaus spec auto-register + changelog (item 46)", () => {
     const log = await runCli(["spec", "log", "hello"], { cwd: tmp });
     expect(log.exitCode).toBe(0);
     expect(log.stdout).not.toContain("sk-live");
+  });
+});
+
+// Item 61 — `crewhaus channel provision|verify` wiring. Everything here is
+// network-free: dry-run prints redacted calls, the slack path only writes a
+// manifest file, and the no-env verify fails on env-ref resolution BEFORE
+// any probe would fire.
+describe("crewhaus channel provision|verify (item 61)", () => {
+  test("usage lists the channel subcommand", async () => {
+    const result = await runCli(["--help"]);
+    expect(result.stdout).toContain("channel provision <spec.yaml>");
+    expect(result.stdout).toContain("channel verify <spec.yaml>");
+  });
+
+  test("unknown channel action exits 1 with the allowed set", async () => {
+    const result = await runCli(["channel", "frobnicate"]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('channel action must be "provision" or "verify"');
+  });
+
+  test("a non-channel spec is refused", async () => {
+    const result = await runCli([
+      "channel",
+      "provision",
+      HELLO_SPEC,
+      "--base-url",
+      "https://bot.example.com",
+    ]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("requires a channel-target spec");
+    expect(result.stderr).toContain('"cli"');
+  });
+
+  test("provision requires --base-url", async () => {
+    const result = await runCli(["channel", "provision", CHANNEL_SPEC]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("missing --base-url");
+  });
+
+  test("provision --dry-run prints every platform call with secrets redacted", async () => {
+    const result = await runCli([
+      "channel",
+      "provision",
+      CHANNEL_SPEC,
+      "--base-url",
+      "https://bot.example.com",
+      "--dry-run",
+      "-o",
+      tmp,
+    ]);
+    expect(result.exitCode).toBe(0);
+    // slack: manifest preview + emit-and-instruct (no --apply).
+    expect(result.stdout).toContain("would write");
+    expect(result.stdout).toContain('request_url: "https://bot.example.com/slack/events"');
+    expect(result.stdout).toContain("app *configuration* token");
+    // telegram: the exact setWebhook call, token + secret redacted.
+    expect(result.stdout).toContain(
+      "would POST https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/setWebhook",
+    );
+    expect(result.stdout).toContain('"secret_token":"$TELEGRAM_SECRET_TOKEN"');
+    expect(result.stdout).toContain('"url":"https://bot.example.com/telegram/events"');
+    // discord: interactions endpoint PATCH + invite URL with derived bits.
+    expect(result.stdout).toContain("would PATCH https://discord.com/api/v10/applications/@me");
+    expect(result.stdout).toContain(
+      '"interactions_endpoint_url":"https://bot.example.com/discord/events"',
+    );
+    expect(result.stdout).toContain("permissions=274877910016");
+    // dry-run writes nothing.
+    expect(existsSync(join(tmp, "slack-app-manifest.yaml"))).toBe(false);
+  });
+
+  test("provision --platform slack writes the manifest file (no network involved)", async () => {
+    const result = await runCli([
+      "channel",
+      "provision",
+      CHANNEL_SPEC,
+      "--platform",
+      "slack",
+      "--base-url",
+      "https://bot.example.com",
+      "-o",
+      tmp,
+    ]);
+    expect(result.exitCode).toBe(0);
+    const manifestPath = join(tmp, "slack-app-manifest.yaml");
+    expect(result.stdout).toContain(`wrote ${manifestPath}`);
+    const manifest = readFileSync(manifestPath, "utf-8");
+    expect(manifest).toContain('- "chat:write"');
+    expect(manifest).toContain('- "reactions:read"');
+    expect(manifest).toContain('- "reaction_added"');
+    expect(manifest).toContain('request_url: "https://bot.example.com/slack/events"');
+    // The instructions point the operator at the spec's env refs.
+    expect(result.stdout).toContain("$SLACK_BOT_TOKEN");
+    expect(result.stdout).toContain("$SLACK_SIGNING_SECRET");
+  });
+
+  test("verify --dry-run prints redacted probes and performs nothing", async () => {
+    const result = await runCli(["channel", "verify", CHANNEL_SPEC, "--dry-run"]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("would POST https://slack.com/api/auth.test");
+    expect(result.stdout).toContain(
+      "would GET https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/getWebhookInfo",
+    );
+    expect(result.stdout).toContain("would GET https://discord.com/api/v10/applications/@me");
+  });
+
+  test("verify without the secret env exits 1 on env-ref checks (no probes fire)", async () => {
+    const result = await runCli(["channel", "verify", CHANNEL_SPEC]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout).toContain("✗");
+    expect(result.stdout).toContain("$SLACK_BOT_TOKEN");
+    expect(result.stdout).toContain("$TELEGRAM_BOT_TOKEN");
+    expect(result.stdout).toContain("$DISCORD_BOT_TOKEN");
+    expect(result.stdout).toMatch(/\d+ check\(s\), \d+ failed/);
+  });
+
+  test("--platform must be configured in the spec", async () => {
+    const result = await runCli(["channel", "verify", CHANNEL_SPEC, "--platform", "matrix"]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("expected one of: slack, telegram, discord, all");
   });
 });

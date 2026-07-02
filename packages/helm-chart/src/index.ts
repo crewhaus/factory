@@ -65,8 +65,22 @@ export type ChartValues = {
   readonly target: TargetShape;
   readonly nameOverride?: string;
   readonly image: {
-    readonly repository?: string;
+    /**
+     * Registry + namespace prefix for the per-shape images; the image NAME is
+     * always derived from `target` (`<registry>/<target>`). Defaults to
+     * `ghcr.io/crewhaus` — where the release workflow actually publishes
+     * (nothing publishes to docker.io).
+     */
+    readonly registry: string;
     readonly tag: string;
+    /**
+     * Optional content-digest pin (`sha256:<64 hex>`, a REGISTRY MANIFEST
+     * digest as recorded in packages/docker-images/docker/digests.json by
+     * pushed builds / release CI — item 47). When set, the Deployment
+     * references `<registry>/<target>@sha256:...` and `tag` is ignored:
+     * reproducible, tamper-evident deploys. Unset → tag-based ref.
+     */
+    readonly digest?: string;
     readonly pullPolicy: "IfNotPresent" | "Always" | "Never";
     readonly pullSecrets: ReadonlyArray<{ readonly name: string }>;
   };
@@ -126,7 +140,12 @@ export type ChartValues = {
 export function defaultValues(): ChartValues {
   return {
     target: "channel",
-    image: { tag: "latest", pullPolicy: "IfNotPresent", pullSecrets: [] },
+    image: {
+      registry: "ghcr.io/crewhaus",
+      tag: "latest",
+      pullPolicy: "IfNotPresent",
+      pullSecrets: [],
+    },
     replicas: 1,
     spec: { configMap: "crewhaus-spec", fileName: "crewhaus.yaml" },
     secrets: {
@@ -179,6 +198,22 @@ export function validateValues(values: ChartValues): void {
   }
   if (!values.image.tag) {
     throw new HelmChartError("image.tag must be non-empty");
+  }
+  if (
+    !values.image.registry ||
+    /[\s\n\r]/.test(values.image.registry) ||
+    values.image.registry.endsWith("/")
+  ) {
+    throw new HelmChartError(
+      `image.registry must be a non-empty registry/namespace prefix without whitespace or a trailing slash (e.g. "ghcr.io/crewhaus"); got ${JSON.stringify(values.image.registry)}`,
+    );
+  }
+  if (values.image.digest !== undefined && !/^sha256:[0-9a-f]{64}$/.test(values.image.digest)) {
+    throw new HelmChartError(
+      `image.digest must be "sha256:<64 hex>" (as recorded in docker/digests.json); got ${JSON.stringify(
+        values.image.digest,
+      )}`,
+    );
   }
   for (const entry of values.secrets.provider ?? []) {
     if (!entry.name || !entry.secretName || !entry.key) {

@@ -70,6 +70,7 @@
     "@crewhaus/spec-registry": "workspace:*",
     "@crewhaus/skills-registry": "workspace:*",
     "@crewhaus/slash-commands": "workspace:*",
+    "@crewhaus/smoke-harness": "workspace:*",
     "@crewhaus/spec": "workspace:*",
     "@crewhaus/sub-agent-spawner": "workspace:*",
     "@crewhaus/trace-event-bus": "workspace:*",
