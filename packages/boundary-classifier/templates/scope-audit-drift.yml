@@ -1,0 +1,67 @@
+# scope-audit-drift.yml — PR-gated scope-audit drift watch TEMPLATE (item 49).
+#
+# This is a TEMPLATE, not an active workflow: copy it into your
+# factory-shaped repository's `.github/workflows/` and edit the
+# <PLACEHOLDER> comments. On every PR that touches package sources or a
+# spec, it re-runs `crewhaus doctor --philosophy-alignment --baseline`:
+# the three-pillar audit (boundary sites, tool scopes) PLUS the
+# boundary-drift detector, diffed against the committed baseline at
+# `.crewhaus/scope-audit/baseline.json`. The job fails ONLY on findings
+# that are NEW relative to the accepted baseline — a fresh cross-trust
+# ingress that skips classifyBoundary trips the PR; the known, deliberate
+# downstream-classified transports you already accepted do not.
+#
+# Prerequisites:
+#   - A committed baseline. `.crewhaus/` is gitignored in the factory repo,
+#     so accepting is an explicit, reviewed act:
+#       crewhaus doctor --philosophy-alignment --accept-baseline
+#       git add -f .crewhaus/scope-audit/baseline.json
+#     Without one, the gate fails whenever any finding exists (a gate nobody
+#     armed must not silently pass).
+#   - The audit is repo-shaped: it reads `packages/*/src`, so run it from
+#     the repository root of a factory-layout checkout.
+
+name: scope-audit-drift
+
+on:
+  pull_request:
+    paths:
+      # Package sources — where a new un-classified ingress would land.
+      - "packages/**"
+      # The CLI that hosts the audit itself.
+      - "apps/**"
+      # Specs: tool lists / scopes referenced by the pillar audit.
+      - "**/crewhaus.yaml"
+      # Baseline changes are exactly the review surface for accepted findings.
+      - ".crewhaus/scope-audit/baseline.json"
+  # Manual runs for baseline reviews outside a PR.
+  workflow_dispatch: {}
+
+jobs:
+  drift-watch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          # <BUN-VERSION> Pin to the repo's toolchain if you pin elsewhere.
+          bun-version: latest
+
+      - name: Install workspace dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Scope-audit drift gate
+        # Exit non-zero ONLY on NEW findings vs .crewhaus/scope-audit/
+        # baseline.json (legacy accepted findings never block). Add --json
+        # to also persist/emit the machine-readable snapshot + gate verdict,
+        # e.g. for uploading as a build artifact:
+        #   bun apps/cli/src/index.ts doctor --philosophy-alignment --baseline --json > scope-audit.json
+        run: bun apps/cli/src/index.ts doctor --philosophy-alignment --baseline
+
+      # <ON-FAILURE> A red run means a NEW finding. Either fix the ingress
+      # (route it through classifyBoundary — see packages/boundary-classifier)
+      # or, if it is classified downstream by design, accept it in a
+      # reviewed commit:
+      #   crewhaus doctor --philosophy-alignment --accept-baseline
+      #   git add -f .crewhaus/scope-audit/baseline.json

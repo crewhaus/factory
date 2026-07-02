@@ -114,6 +114,22 @@ import {
 // `doctor --philosophy-alignment`. Kept in a side-effect-free module so it is
 // unit-testable (this entry file runs an argv switch on import).
 import { auditSpecToolNames, auditToolScopes, collectToolNames } from "./scope-audit";
+// Item 49 — scope-audit drift watch (stable finding ids, snapshot
+// persistence, baseline diff gate, boundary-drift detector), in a
+// side-effect-free module so it is unit-testable (this entry file runs an
+// argv switch on import).
+import {
+  type PhilosophyFinding,
+  ScopeAuditBaselineError,
+  buildScopeAuditSnapshot,
+  detectBoundaryDrift,
+  diffScopeAuditSnapshots,
+  loadScopeAuditSnapshot,
+  renderGateReport,
+  scopeAuditBaselinePath,
+  scopeAuditDir,
+  scopeAuditSnapshotPath,
+} from "./scope-audit-drift";
 // Item 48 — `crewhaus security digest` core (windowed rollup over
 // .crewhaus/audit + session event logs, text/json/html renderers, webhook
 // notify), in a side-effect-free module so it is unit-testable (this entry
@@ -231,6 +247,15 @@ const INIT_SCHEMA: ParseArgsSchema = {
 const DOCTOR_SCHEMA: ParseArgsSchema = {
   flags: [
     { name: "philosophy-alignment", takesValue: false },
+    // Item 49 — scope-audit drift watch (compose with --philosophy-alignment):
+    //   --json             persist findings to .crewhaus/scope-audit/<date>.json
+    //                      (stable ids) and print the snapshot JSON
+    //   --baseline         diff against .crewhaus/scope-audit/baseline.json;
+    //                      exit non-zero ONLY on NEW findings
+    //   --accept-baseline  promote the current findings to the baseline
+    { name: "json", takesValue: false },
+    { name: "baseline", takesValue: false },
+    { name: "accept-baseline", takesValue: false },
     // Process-liveness only — exit 0 fast, no credential/spec checks. The
     // probe target for container HEALTHCHECKs and k8s exec probes.
     { name: "liveness", takesValue: false },
@@ -507,6 +532,7 @@ function usageText(): string {
     "       [--write-back] [-o <out-dir>]        active eval-driven optimization (Pillar 2)",
     "  init [name]                          scaffold a new crewhaus.yaml",
     "  doctor                               check environment health",
+    "       [--philosophy-alignment [--json] [--baseline | --accept-baseline]]  pillar audit + scope-audit drift gate (item 49)",
     "  context --bundle [-o <file>]         emit a single-markdown orientation manifest",
     "       [--factory-root <p>] [--docs-root <p>] [--demos-root <p>]",
     "  cost-summary --session <id>          summarize cost_accrual events for a session",
@@ -1537,8 +1563,13 @@ function runContext(args: ParsedArgs): void {
 async function runDoctor(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
-      "usage: crewhaus doctor [--philosophy-alignment] [--liveness]\n" +
+      "usage: crewhaus doctor [--philosophy-alignment [--json] [--baseline | --accept-baseline]] [--liveness]\n" +
         "  --philosophy-alignment   audit the codebase + examples against the three architectural pillars\n" +
+        "  --json                   persist findings (stable ids) to .crewhaus/scope-audit/<date>.json\n" +
+        "                           and print the snapshot JSON (item 49)\n" +
+        "  --baseline               diff findings against .crewhaus/scope-audit/baseline.json; exit\n" +
+        "                           non-zero ONLY on NEW findings (accepted legacy findings never block)\n" +
+        "  --accept-baseline        promote the current findings to the accepted baseline\n" +
         "  --liveness               process-liveness probe: exit 0 immediately, no credential or\n" +
         "                           spec checks (for container HEALTHCHECKs / k8s exec probes)\n" +
         "\n" +
@@ -1556,8 +1587,14 @@ async function runDoctor(args: ParsedArgs): Promise<void> {
     process.exit(0);
   }
   if (args.flags["philosophy-alignment"]) {
-    await runDoctorPhilosophyAlignment();
+    await runDoctorPhilosophyAlignment(args);
     return;
+  }
+  // Item 49 — the drift-watch flags only make sense on the philosophy audit.
+  for (const flag of ["json", "baseline", "accept-baseline"] as const) {
+    if (args.flags[flag] === true) {
+      die(`--${flag} requires --philosophy-alignment`);
+    }
   }
 
   const checks: DoctorCheck[] = [];
@@ -1616,13 +1653,14 @@ async function runDoctor(args: ParsedArgs): Promise<void> {
 }
 
 /**
- * Workstream D — `crewhaus doctor --philosophy-alignment`. Audits the
+ * Workstream D — collect the `--philosophy-alignment` findings. Audits the
  * repo against the three architectural pillars (compiler-as-protagonist,
- * eval-is-active, security-is-fabric). Exits 0 on green, 1 on any
- * finding. Designed to be runnable in CI as a soft gate.
+ * eval-is-active, security-is-fabric). Item 49 gave every finding a stable
+ * (class, file, symbol) identity so the drift watch can persist/diff them,
+ * and added the boundary-drift detector on top of the six-site check.
  */
-async function runDoctorPhilosophyAlignment(): Promise<void> {
-  const findings: DoctorCheck[] = [];
+async function collectPhilosophyFindings(): Promise<PhilosophyFinding[]> {
+  const findings: PhilosophyFinding[] = [];
 
   // Pillar 1 — compiler-as-protagonist. The IR-discriminated-union is
   // the contract; the architecture doc must reference the IR variants.
@@ -1635,14 +1673,20 @@ async function runDoctorPhilosophyAlignment(): Promise<void> {
     const referencesIrVariants =
       content.includes("IrV0") && content.includes("IrPipelineV0") && content.includes("IrGraphV0");
     findings.push({
+      class: "pillar-doc",
+      file: "../docs/COMPILER-ARCHITECTURE.md",
+      symbol: "ir-variants",
       label: "Pillar 1 — ../docs/COMPILER-ARCHITECTURE.md references IR variants",
       pass: referencesIrVariants,
-      reason: referencesIrVariants
-        ? undefined
-        : "doc exists but does not enumerate the IR-discriminated-union variants",
+      ...(referencesIrVariants
+        ? {}
+        : { reason: "doc exists but does not enumerate the IR-discriminated-union variants" }),
     });
   } else {
     findings.push({
+      class: "pillar-doc",
+      file: "../docs/COMPILER-ARCHITECTURE.md",
+      symbol: "sibling-checkout",
       label: "Pillar 1 — COMPILER-ARCHITECTURE.md (sibling checkout)",
       pass: true,
       warn: true,
@@ -1660,18 +1704,24 @@ async function runDoctorPhilosophyAlignment(): Promise<void> {
     "package.json",
   );
   findings.push({
+    class: "package-presence",
+    file: "packages/eval-optimizer-orchestrator/package.json",
+    symbol: "eval-optimizer-orchestrator",
     label: "Pillar 2 — eval-optimizer-orchestrator package present",
     pass: existsSync(orchestratorPkg),
-    reason: existsSync(orchestratorPkg)
-      ? undefined
-      : "Workstream B did not land — install or rebuild",
+    ...(existsSync(orchestratorPkg)
+      ? {}
+      : { reason: "Workstream B did not land — install or rebuild" }),
   });
 
   const specPatchPkg = join(process.cwd(), "packages", "spec-patch", "package.json");
   findings.push({
+    class: "package-presence",
+    file: "packages/spec-patch/package.json",
+    symbol: "spec-patch",
     label: "Pillar 2 — spec-patch package present",
     pass: existsSync(specPatchPkg),
-    reason: existsSync(specPatchPkg) ? undefined : "Workstream B did not land",
+    ...(existsSync(specPatchPkg) ? {} : { reason: "Workstream B did not land" }),
   });
 
   // Pillar 3 — security is a fabric. The boundary-classifier package
@@ -1680,9 +1730,12 @@ async function runDoctorPhilosophyAlignment(): Promise<void> {
   // federation-router, channel-adapter-base).
   const boundaryPkg = join(process.cwd(), "packages", "boundary-classifier", "package.json");
   findings.push({
+    class: "package-presence",
+    file: "packages/boundary-classifier/package.json",
+    symbol: "boundary-classifier",
     label: "Pillar 3 — boundary-classifier package present",
     pass: existsSync(boundaryPkg),
-    reason: existsSync(boundaryPkg) ? undefined : "Workstream C did not land",
+    ...(existsSync(boundaryPkg) ? {} : { reason: "Workstream C did not land" }),
   });
 
   const boundarySites: ReadonlyArray<{ name: string; path: string }> = [
@@ -1697,6 +1750,9 @@ async function runDoctorPhilosophyAlignment(): Promise<void> {
     const filePath = join(process.cwd(), site.path);
     if (!existsSync(filePath)) {
       findings.push({
+        class: "boundary-site",
+        file: site.path,
+        symbol: site.name,
         label: `Pillar 3 — ${site.name} source present`,
         pass: false,
         reason: `${site.path} not found`,
@@ -1706,13 +1762,23 @@ async function runDoctorPhilosophyAlignment(): Promise<void> {
     const body = readFileSync(filePath, "utf8");
     const classifies = body.includes("classifyBoundary") || body.includes("boundary-classifier");
     findings.push({
+      class: "boundary-site",
+      file: site.path,
+      symbol: site.name,
       label: `Pillar 3 — ${site.name} calls classifyBoundary`,
       pass: classifies,
-      reason: classifies
-        ? undefined
-        : `no reference to classifyBoundary in ${site.path} — security regression`,
+      ...(classifies
+        ? {}
+        : { reason: `no reference to classifyBoundary in ${site.path} — security regression` }),
     });
   }
+
+  // Item 49 — boundary-site DRIFT. The six-site list above only re-checks
+  // KNOWN sites; this scans every package for cross-trust ingress signals
+  // (same read-the-source substring mechanism) and flags a NEW ingress that
+  // never references the classification fabric. Report-only here (warn);
+  // the --baseline gate is what fails, and only on NEW findings.
+  findings.push(...detectBoundaryDrift(process.cwd()));
 
   // FR-002 — Pillar 3 sink-side. Audit the full built-in tool map: every
   // outward-reaching built-in must carry scope: "external" so the egress
@@ -1724,12 +1790,18 @@ async function runDoctorPhilosophyAlignment(): Promise<void> {
   const scopeFindings = auditToolScopes(Object.values(toolMap));
   if (scopeFindings.length === 0) {
     findings.push({
+      class: "tool-scope",
+      file: "",
+      symbol: "all-builtin-outward-tools",
       label: 'Pillar 3 — all built-in outward tools scope:"external"',
       pass: true,
     });
   } else {
     for (const f of scopeFindings) {
       findings.push({
+        class: "tool-scope",
+        file: "",
+        symbol: f.toolName,
         label: `Pillar 3 — tool "${f.toolName}" outward but scope!="external"`,
         pass: false,
         reason: f.reason,
@@ -1744,22 +1816,101 @@ async function runDoctorPhilosophyAlignment(): Promise<void> {
   const claudemd = join(process.cwd(), "CLAUDE.md");
   const hasContributorCompass = existsSync(agentsmd) || existsSync(claudemd);
   findings.push({
+    class: "contributor-doc",
+    file: "AGENTS.md",
+    symbol: "contributor-compass",
     label: "Contributor doc — AGENTS.md (or CLAUDE.md) at project root",
     pass: hasContributorCompass,
-    reason: hasContributorCompass ? undefined : "missing — contributors will drift",
+    ...(hasContributorCompass ? {} : { reason: "missing — contributors will drift" }),
   });
 
+  return findings;
+}
+
+/**
+ * Workstream D + item 49 — `crewhaus doctor --philosophy-alignment
+ * [--json] [--baseline | --accept-baseline]`.
+ *
+ * Plain mode is unchanged: print ✓/~/✗ per check, exit 0 on green / 1 on
+ * any hard finding (boundary-drift reports are warn-tier and never fail
+ * plain mode). The drift-watch modes:
+ *
+ *   --json             persist the actionable findings (stable ids) to
+ *                      `.crewhaus/scope-audit/<YYYY-MM-DD>.json` and print
+ *                      the snapshot JSON to stdout (status lines → stderr).
+ *   --baseline         diff against `.crewhaus/scope-audit/baseline.json`
+ *                      following regression-runner's gate() shape; exit
+ *                      non-zero ONLY on NEW findings — legacy accepted
+ *                      findings never block. A missing baseline fails when
+ *                      findings exist (a gate nobody armed must not pass).
+ *   --accept-baseline  promote the current findings to the baseline (and
+ *                      write the dated snapshot); exits 0.
+ */
+async function runDoctorPhilosophyAlignment(args: ParsedArgs): Promise<void> {
+  const jsonMode = args.flags["json"] === true;
+  const baselineMode = args.flags["baseline"] === true;
+  const acceptMode = args.flags["accept-baseline"] === true;
+  if (baselineMode && acceptMode) {
+    die("--baseline and --accept-baseline are mutually exclusive");
+  }
+
+  const findings = await collectPhilosophyFindings();
+  const snapshot = buildScopeAuditSnapshot(findings);
+  const rootDir = process.cwd();
+
+  // Human-readable per-check lines. In --json mode they move to stderr so
+  // stdout stays a clean machine surface (mirroring `context -o`'s split).
+  const statusOut = jsonMode
+    ? (line: string): void => void process.stderr.write(line)
+    : (line: string): void => void process.stdout.write(line);
   for (const f of findings) {
     if (f.warn && f.pass) {
-      process.stdout.write(`~ ${f.label}: ${f.reason ?? "skipped"}\n`);
+      statusOut(`~ ${f.label}: ${f.reason ?? "skipped"}\n`);
     } else if (f.pass) {
-      process.stdout.write(`✓ ${f.label}\n`);
+      statusOut(`✓ ${f.label}\n`);
     } else {
-      process.stdout.write(`✗ ${f.label}: ${f.reason ?? "failed"}\n`);
+      statusOut(`✗ ${f.label}: ${f.reason ?? "failed"}\n`);
     }
   }
+
+  // Snapshot persistence: --json always writes the dated file;
+  // --accept-baseline additionally writes baseline.json.
+  if (jsonMode || acceptMode) {
+    mkdirSync(scopeAuditDir(rootDir), { recursive: true });
+    const snapshotPath = scopeAuditSnapshotPath(rootDir, () => Date.now());
+    writeFileSync(snapshotPath, `${JSON.stringify(snapshot, null, 2)}\n`);
+    statusOut(`wrote ${snapshotPath}\n`);
+  }
+
+  if (acceptMode) {
+    mkdirSync(scopeAuditDir(rootDir), { recursive: true });
+    const baselinePath = scopeAuditBaselinePath(rootDir);
+    writeFileSync(baselinePath, `${JSON.stringify(snapshot, null, 2)}\n`);
+    statusOut(
+      `accepted ${snapshot.findings.length} finding(s) as the baseline → ${baselinePath}\n`,
+    );
+    if (jsonMode) process.stdout.write(`${JSON.stringify(snapshot, null, 2)}\n`);
+    process.exit(0);
+  }
+
+  if (baselineMode) {
+    let baseline: ReturnType<typeof loadScopeAuditSnapshot>;
+    try {
+      baseline = loadScopeAuditSnapshot(scopeAuditBaselinePath(rootDir));
+    } catch (err) {
+      if (err instanceof ScopeAuditBaselineError) die(err.message);
+      throw err;
+    }
+    const gate = diffScopeAuditSnapshots(baseline, snapshot);
+    for (const line of renderGateReport(gate)) statusOut(`${line}\n`);
+    if (jsonMode) process.stdout.write(`${JSON.stringify({ snapshot, gate }, null, 2)}\n`);
+    process.exit(gate.verdict === "pass" ? 0 : 1);
+  }
+
+  if (jsonMode) process.stdout.write(`${JSON.stringify(snapshot, null, 2)}\n`);
+
   const allPass = findings.every((f) => f.pass);
-  process.stdout.write(
+  statusOut(
     allPass
       ? "\nphilosophy alignment: green. All three pillars intact.\n"
       : `\nphilosophy alignment: ${findings.filter((f) => !f.pass).length} finding(s). See [/AGENTS.md](AGENTS.md) for invariants.\n`,
