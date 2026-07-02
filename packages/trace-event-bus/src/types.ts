@@ -206,7 +206,10 @@ export type PermissionDecisionEvent = TraceEventEnvelope & {
 
 export type ErrorRecoveredEvent = TraceEventEnvelope & {
   kind: "error_recovered";
-  action: "retry" | "compact" | "continue" | "tombstone" | "fail";
+  // Item 23 — `switch-model` joins the recovery-engine action set (an
+  // opt-in failure_taxonomy verdict that reroutes onto the next failover
+  // candidate mid-turn).
+  action: "retry" | "compact" | "continue" | "tombstone" | "switch-model" | "fail";
   errorName: string;
   depth: number;
 };
@@ -448,6 +451,35 @@ export type CircuitStateChangedEvent = TraceEventEnvelope & {
   reason?: string;
 };
 
+/**
+ * Item 22 — emitted by the model-router failover chain each time the serving
+ * candidate changes. `from`/`to` are SPEC model strings (`"claude-opus-4-7"`,
+ * `"openai/gpt-4o-mini"`) — the routing identity, not the wire id — so the
+ * event reads the way the spec's `model` / `model_fallbacks` were written.
+ * Reasons:
+ *   - `breaker_open`     — the previous candidate's circuit breaker is open;
+ *                          traffic routed to the next candidate in the chain.
+ *   - `probe_restore`    — a higher-priority candidate's cooldown elapsed
+ *                          (breaker half-open) and traffic routed back up to
+ *                          probe it — the auto-restore half of the breaker's
+ *                          semantics.
+ *   - `candidate_error`  — the previous candidate could not be constructed
+ *                          when actually tried (missing credential /
+ *                          uninstalled provider package); routed onward.
+ *   - `budget_degrade`   — item 27: the run-level spend cap was reached and
+ *                          the primary model was re-resolved to the cheaper
+ *                          `budget.on_exceed` rung. Not a chain-routing
+ *                          event — the whole primary adapter was swapped.
+ */
+export type ModelFailoverEvent = TraceEventEnvelope & {
+  kind: "model_failover";
+  /** Spec model string of the candidate traffic moved away from. */
+  from: string;
+  /** Spec model string of the candidate now serving. */
+  to: string;
+  reason: "breaker_open" | "probe_restore" | "candidate_error" | "budget_degrade";
+};
+
 export type TraceEvent =
   | TurnStartEvent
   | TurnEndEvent
@@ -472,6 +504,7 @@ export type TraceEvent =
   | CrewDoneEvent
   | CostAccrualEvent
   | CircuitStateChangedEvent
+  | ModelFailoverEvent
   | JanitorActionEvent
   | ResponseRatedEvent
   | TestVerdictEvent

@@ -514,3 +514,87 @@ describe("emitCli — generated README.md (item 42)", () => {
     expect(bundle.files[0]?.path).toBe("agent.ts");
   });
 });
+
+describe("emitCli — provider failover chain (item 22)", () => {
+  test("emits modelFallbacks + circuitBreaker in the runChatLoop call when the IR sets them", () => {
+    const content =
+      emitCli(
+        baseIr({
+          agent: {
+            model: "claude-sonnet-4-6",
+            instructions: "be helpful",
+            modelFallbacks: ["openai/gpt-4o-mini", "groq/llama-3.3-70b"],
+            circuitBreaker: { failureThreshold: 3, cooldownMs: 15000 },
+          },
+        }),
+      ).files[0]?.content ?? "";
+    expect(content).toContain('modelFallbacks: ["openai/gpt-4o-mini", "groq/llama-3.3-70b"],');
+    expect(content).toContain('circuitBreaker: {"failureThreshold":3,"cooldownMs":15000},');
+  });
+
+  test("emits circuitBreaker alone when no fallbacks are declared (single-adapter breaker)", () => {
+    const content =
+      emitCli(
+        baseIr({
+          agent: {
+            model: "claude-sonnet-4-6",
+            instructions: "be helpful",
+            circuitBreaker: { failureThreshold: 2 },
+          },
+        }),
+      ).files[0]?.content ?? "";
+    expect(content).not.toContain("modelFallbacks:");
+    expect(content).toContain('circuitBreaker: {"failureThreshold":2},');
+  });
+
+  test("omits both fields entirely when the IR leaves them unset", () => {
+    const content = emitCli(baseIr()).files[0]?.content ?? "";
+    expect(content).not.toContain("modelFallbacks:");
+    expect(content).not.toContain("circuitBreaker:");
+  });
+});
+
+describe("emitCli — failureTaxonomy field (item 23)", () => {
+  test("emits failureTaxonomy in the runChatLoop call when the IR sets it", () => {
+    const content =
+      emitCli(
+        baseIr({
+          failureTaxonomy: [
+            { class: "provider_overloaded", pattern: "/overloaded/i", recovery: "switch-model" },
+            { class: "net", pattern: "ETIMEDOUT", recovery: "retry", hint: "back off" },
+          ],
+        }),
+      ).files[0]?.content ?? "";
+    expect(content).toContain("failureTaxonomy:");
+    expect(content).toContain('"recovery":"switch-model"');
+    expect(content).toContain('"pattern":"ETIMEDOUT"');
+  });
+
+  test("omits failureTaxonomy when the IR leaves it unset or empty", () => {
+    expect(emitCli(baseIr()).files[0]?.content ?? "").not.toContain("failureTaxonomy:");
+    expect(emitCli(baseIr({ failureTaxonomy: [] })).files[0]?.content ?? "").not.toContain(
+      "failureTaxonomy:",
+    );
+  });
+});
+
+describe("emitCli — run-level budget field (item 27)", () => {
+  test("emits budget in the runChatLoop call when the IR sets it", () => {
+    const content =
+      emitCli(
+        baseIr({
+          budget: {
+            usdMicros: 5_000_000,
+            onExceed: { kind: "degrade", model: "claude-haiku-4-5" },
+          },
+        }),
+      ).files[0]?.content ?? "";
+    expect(content).toContain('budget: {"usdMicros":5000000');
+    expect(content).toContain('"kind":"degrade"');
+    expect(content).toContain('"model":"claude-haiku-4-5"');
+  });
+
+  test("omits budget when the IR leaves it unset", () => {
+    expect(emitCli(baseIr()).files[0]?.content ?? "").not.toContain("budget:");
+  });
+});

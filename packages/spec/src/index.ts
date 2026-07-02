@@ -183,6 +183,42 @@ const toolConfigBlock = z
   .optional();
 
 /**
+ * Item 22 — spec-declared provider failover chain, on the agent blocks of
+ * the shapes whose emitted runtime calls `runChatLoop` with a single
+ * primary model (cli, channel, managed today).
+ *
+ * `model_fallbacks` is an ordered list of model strings tried when the
+ * primary's circuit breaker is open — each entry follows the SAME
+ * model-string grammar as `agent.model` (`claude-*`, `openai/*`,
+ * `bedrock/*`, `groq/*`, …; validated like `agent.model` at parse time,
+ * with the full grammar enforced by the model-router when resolved).
+ * Cross-provider fallbacks resolve their own credentials lazily via the
+ * normal model-router path — a fallback with a missing key warns at boot
+ * and is skipped when tried, never hard-failing the run.
+ *
+ * `circuit_breaker` tunes the per-candidate breakers. Field names mirror
+ * `CircuitBreakerOptions` in `@crewhaus/circuit-breaker` exactly
+ * (failureThreshold / windowMs / cooldownMs); package defaults (5 failures
+ * / 60s window / 30s cooldown) apply per field when omitted. Declaring
+ * `circuit_breaker` WITHOUT `model_fallbacks` is valid: the primary
+ * adapter alone gets breaker-wrapped (fail-fast on a degraded provider
+ * instead of hammering it).
+ */
+const modelFallbacksBlock = z.array(z.string().min(1)).min(1).optional();
+
+const circuitBreakerBlock = z
+  .object({
+    /** Consecutive failures inside windowMs that trip the breaker. */
+    failureThreshold: z.number().int().positive().optional(),
+    /** Window for counting consecutive failures (ms). */
+    windowMs: z.number().int().positive().optional(),
+    /** How long the breaker stays open before allowing a probe (ms). */
+    cooldownMs: z.number().int().positive().optional(),
+  })
+  .strict()
+  .optional();
+
+/**
  * Section 17 — optional override for the model used by
  * `compaction-autocompact` when summarising long conversations. Defaults
  * to the agent's primary model when omitted, but you can target a
@@ -286,12 +322,42 @@ const failureTaxonomyEntrySchema = z
   .object({
     class: z.string().min(1),
     pattern: z.string().min(1),
-    recovery: z.enum(["retry", "compact", "continue", "tombstone", "fail"]),
+    // Item 23 — `switch-model` routes the same turn onto the next provider
+    // failover candidate (pairs with `agent.model_fallbacks`; a no-op
+    // re-issue when no chain is declared). See recovery-engine +
+    // AUTOMATION-OPPORTUNITIES.md item 23.
+    recovery: z.enum(["retry", "compact", "continue", "tombstone", "switch-model", "fail"]),
     hint: z.string().min(1).optional(),
   })
   .strict();
 
 const failureTaxonomyBlock = z.array(failureTaxonomyEntrySchema).optional();
+
+/**
+ * Item 27 — run-level spend cap with a degradation ladder. Generalizes the
+ * optimizer's `--budget-usd` to normal runs. `usd` is the dollar ceiling;
+ * when the run's accrued spend reaches it, `on_exceed` decides:
+ *   - `{ action: "stop" }`      — end the run cleanly before the next turn.
+ *   - `{ action: "degrade", model }` — re-resolve the primary model to the
+ *     cheaper `model` (one rung) and continue; a later breach on the
+ *     degraded model stops the run.
+ * The check is PRE-TURN (beside compaction), so an in-flight turn always
+ * completes. Carried on the same interactive shapes as the failover chain
+ * (cli, channel, managed). `on_exceed.model` follows the agent.model
+ * grammar. Defaults to `{ action: "stop" }` when `on_exceed` is omitted.
+ */
+const budgetBlock = z
+  .object({
+    usd: z.number().positive(),
+    on_exceed: z
+      .discriminatedUnion("action", [
+        z.object({ action: z.literal("stop") }).strict(),
+        z.object({ action: z.literal("degrade"), model: z.string().min(1) }).strict(),
+      ])
+      .default({ action: "stop" }),
+  })
+  .strict()
+  .optional();
 
 /**
  * Response-feedback block — declares that a harness collects human ratings on
@@ -476,6 +542,9 @@ const cliSchema = z
         // runtime default applies. Raise it for turns that emit large
         // multi-file edits so the model isn't cut off mid-`tool_use`.
         max_tokens: z.number().int().positive().optional(),
+        // Item 22 — provider failover chain (see modelFallbacksBlock docs).
+        model_fallbacks: modelFallbacksBlock,
+        circuit_breaker: circuitBreakerBlock,
         sub_agents: subAgentsBlock,
       })
       .strict(),
@@ -486,6 +555,7 @@ const cliSchema = z
     compaction: compactionBlock,
     security: securityBlock,
     failure_taxonomy: failureTaxonomyBlock,
+    budget: budgetBlock,
     feedback: feedbackBlock,
     cli: cliOptionsBlock,
     chains: chainsBlock,
@@ -605,6 +675,9 @@ const channelAgentSchema = z
   .object({
     model: z.string().min(1),
     instructions: z.string().min(1),
+    // Item 22 — provider failover chain (see modelFallbacksBlock docs).
+    model_fallbacks: modelFallbacksBlock,
+    circuit_breaker: circuitBreakerBlock,
     tools: z.array(z.string().min(1)).optional(),
     tool_config: toolConfigBlock,
     sub_agents: subAgentsBlock,
@@ -622,6 +695,7 @@ const channelSchema = z
     permissions: permissionsBlock,
     compaction: compactionBlock,
     failure_taxonomy: failureTaxonomyBlock,
+    budget: budgetBlock,
     feedback: feedbackBlock,
     heartbeat: heartbeatBlock,
     gateway: channelGatewayBlock,
@@ -700,6 +774,9 @@ const managedAgentSchema = z
   .object({
     model: z.string().min(1),
     instructions: z.string().min(1),
+    // Item 22 — provider failover chain (see modelFallbacksBlock docs).
+    model_fallbacks: modelFallbacksBlock,
+    circuit_breaker: circuitBreakerBlock,
   })
   .strict();
 
@@ -712,6 +789,7 @@ const managedSchema = z
     permissions: permissionsBlock,
     compaction: compactionBlock,
     failure_taxonomy: failureTaxonomyBlock,
+    budget: budgetBlock,
   })
   .strict();
 
@@ -1184,6 +1262,9 @@ export type SpecEval = z.infer<typeof evalSchema>;
 export type SpecMcpServerConfig = z.infer<typeof mcpServerConfigSchema>;
 export type SpecSubAgentDefinition = z.infer<typeof subAgentDefinitionSchema>;
 export type SpecCompactionBlock = z.infer<typeof compactionBlock>;
+export type SpecModelFallbacks = z.infer<typeof modelFallbacksBlock>;
+export type SpecCircuitBreakerBlock = z.infer<typeof circuitBreakerBlock>;
+export type SpecBudgetBlock = z.infer<typeof budgetBlock>;
 export type SpecSecurityBlock = z.infer<typeof securityBlock>;
 export type SpecFeedbackBlock = z.infer<typeof feedbackBlock>;
 export type SpecFailureTaxonomyEntry = z.infer<typeof failureTaxonomyEntrySchema>;

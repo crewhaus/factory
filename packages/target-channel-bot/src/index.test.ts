@@ -824,3 +824,43 @@ describe("emitChannelBot — heartbeat (Phase 3 §3.1)", () => {
     expect(c).toContain("Sub-agents (Section 13)");
   });
 });
+
+describe("emitChannelBot — provider failover chain (item 22)", () => {
+  test("agent.ts threads modelFallbacks + circuitBreaker into runChatLoop when set", () => {
+    const irFailover: IrChannelV0 = {
+      ...MIN_IR,
+      agent: {
+        ...MIN_IR.agent,
+        modelFallbacks: ["openai/gpt-4o-mini"],
+        circuitBreaker: { failureThreshold: 3, windowMs: 60000 },
+      },
+    };
+    const agentTs =
+      emitChannelBot(irFailover).files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agentTs).toContain('modelFallbacks: ["openai/gpt-4o-mini"],');
+    expect(agentTs).toContain('circuitBreaker: {"failureThreshold":3,"windowMs":60000},');
+  });
+
+  test("agent.ts omits both fields when the IR leaves them unset", () => {
+    const agentTs = emitChannelBot(MIN_IR).files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agentTs).not.toContain("modelFallbacks:");
+    expect(agentTs).not.toContain("circuitBreaker:");
+  });
+});
+
+describe("emitChannelBot — run-level budget field (item 27)", () => {
+  test("agent.ts threads budget into runChatLoop when set", () => {
+    const irBudget: IrChannelV0 = {
+      ...MIN_IR,
+      budget: { usdMicros: 2_000_000, onExceed: { kind: "stop" } },
+    };
+    const agentTs =
+      emitChannelBot(irBudget).files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agentTs).toContain('budget: {"usdMicros":2000000,"onExceed":{"kind":"stop"}},');
+  });
+
+  test("agent.ts omits budget when the IR leaves it unset", () => {
+    const agentTs = emitChannelBot(MIN_IR).files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agentTs).not.toContain("budget:");
+  });
+});

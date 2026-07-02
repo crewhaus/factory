@@ -95,6 +95,21 @@ export type IrCompaction = {
 };
 
 /**
+ * Item 22 — per-candidate circuit-breaker tuning lowered from the spec's
+ * `agent.circuit_breaker` block. Field names mirror `CircuitBreakerOptions`
+ * in `@crewhaus/circuit-breaker` exactly; every field optional so the
+ * breaker package's own defaults apply per knob. Carried on the agent
+ * blocks of the shapes wired for the failover chain (cli, channel,
+ * managed). Absent when the spec omits the block — declaring it WITHOUT
+ * `modelFallbacks` still breaker-wraps the single primary adapter.
+ */
+export type IrCircuitBreaker = {
+  readonly failureThreshold?: number;
+  readonly windowMs?: number;
+  readonly cooldownMs?: number;
+};
+
+/**
  * Section 55 (Track A) — named failure taxonomy. Cross-cutting; carried
  * through to runtime-core so `recovery-engine` can consult the user's
  * named classes before falling back to its built-in taxonomy.
@@ -111,11 +126,29 @@ export type IrCompaction = {
 export type IrFailureTaxonomyEntry = {
   readonly class: string;
   readonly pattern: string;
-  readonly recovery: "retry" | "compact" | "continue" | "tombstone" | "fail";
+  /** Item 23 — `switch-model` reroutes onto the next provider failover
+   *  candidate mid-turn (see recovery-engine). */
+  readonly recovery: "retry" | "compact" | "continue" | "tombstone" | "switch-model" | "fail";
   readonly hint?: string;
 };
 
 export type IrFailureTaxonomy = readonly IrFailureTaxonomyEntry[];
+
+/**
+ * Item 27 — run-level spend cap with a degradation ladder, lowered from the
+ * spec's `budget` block. `usdMicros` is the dollar ceiling in USD-micros
+ * (1 USD = 1_000_000) — the unit the runtime meters in. `onExceed` decides
+ * the behaviour when accrued spend reaches the cap: `stop` ends the run
+ * before the next turn; `degrade` re-resolves the primary model to `model`
+ * (one cheaper rung) and continues. Carried on the interactive shapes that
+ * loop (cli, channel, managed); absent when the spec omits the block.
+ */
+export type IrBudget = {
+  readonly usdMicros: number;
+  readonly onExceed:
+    | { readonly kind: "stop" }
+    | { readonly kind: "degrade"; readonly model: string };
+};
 
 /**
  * Pillar 3 (FR-004) — per-target security fabric configuration the
@@ -230,6 +263,12 @@ export type IrV0 = {
     /** Model max OUTPUT tokens for one turn (spec `agent.max_tokens`).
      *  Optional; when absent the runtime default applies. */
     readonly maxTokens?: number;
+    /** Item 22 — ordered failover models (spec `agent.model_fallbacks`).
+     *  Absent when the spec omits the block; the runtime then keeps its
+     *  single-adapter path. */
+    readonly modelFallbacks?: readonly string[];
+    /** Item 22 — breaker tuning (spec `agent.circuit_breaker`). */
+    readonly circuitBreaker?: IrCircuitBreaker;
   };
   readonly tools: readonly string[];
   readonly toolConfigs: IrToolConfigs;
@@ -240,6 +279,8 @@ export type IrV0 = {
   readonly cli?: IrCliOptions;
   /** Section 55 (Track A) — named failure taxonomy. Optional. */
   readonly failureTaxonomy?: IrFailureTaxonomy;
+  /** Item 27 — run-level spend cap + degradation ladder. Optional. */
+  readonly budget?: IrBudget;
   /** Pillar 3 (FR-004) — security fabric config (intent-gate judge
    *  selection). Optional; absent when the spec omits the `security`
    *  block. */
@@ -487,6 +528,10 @@ export type IrChannelV0 = {
   readonly agent: {
     readonly model: string;
     readonly instructions: string;
+    /** Item 22 — ordered failover models (spec `agent.model_fallbacks`). */
+    readonly modelFallbacks?: readonly string[];
+    /** Item 22 — breaker tuning (spec `agent.circuit_breaker`). */
+    readonly circuitBreaker?: IrCircuitBreaker;
   };
   readonly tools: readonly string[];
   readonly toolConfigs: IrToolConfigs;
@@ -500,6 +545,8 @@ export type IrChannelV0 = {
   readonly gateway?: IrChannelGateway;
   /** Section 55 (Track A) — named failure taxonomy. Optional. */
   readonly failureTaxonomy?: IrFailureTaxonomy;
+  /** Item 27 — run-level spend cap + degradation ladder. Optional. */
+  readonly budget?: IrBudget;
   /** Response-feedback config. `feedback.channelReactions` gates Slack 👍/👎
    *  → user_feedback codegen in this target. Absent when spec omits it. */
   readonly feedback?: IrFeedback;
@@ -531,12 +578,18 @@ export type IrManagedV0 = {
   readonly agent: {
     readonly model: string;
     readonly instructions: string;
+    /** Item 22 — ordered failover models (spec `agent.model_fallbacks`). */
+    readonly modelFallbacks?: readonly string[];
+    /** Item 22 — breaker tuning (spec `agent.circuit_breaker`). */
+    readonly circuitBreaker?: IrCircuitBreaker;
   };
   readonly tenants: readonly IrManagedTenant[];
   readonly permissions: IrPermissions;
   readonly compaction: IrCompaction;
   /** Section 55 (Track A) — named failure taxonomy. Optional. */
   readonly failureTaxonomy?: IrFailureTaxonomy;
+  /** Item 27 — run-level spend cap + degradation ladder. Optional. */
+  readonly budget?: IrBudget;
 };
 
 /**
