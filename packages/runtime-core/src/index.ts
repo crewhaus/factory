@@ -77,7 +77,11 @@ import {
   createCliMarkdownRenderer,
   isCliMarkdownEnabled,
 } from "./cli-markdown";
-import { attachAdvisorPersistence, attachDefaultSubscribers } from "./observability";
+import {
+  type AttachedAdvisorPersistence,
+  attachAdvisorPersistence,
+  attachDefaultSubscribers,
+} from "./observability";
 import { loadProjectMemory } from "./project-memory";
 import { type CliOutput, createCliOutput, isSpinnerEnabled } from "./spinner";
 
@@ -2275,6 +2279,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       await subscribers.shutdownAll();
       costPersistUnsubscribe?.();
       advisorPersist?.unsubscribe();
+      printAdvisorDigest(advisorPersist);
       await sessionStore
         .update(sessionId, { lastTurnIndex: runContext.turnNumber })
         .catch((err) => {
@@ -2495,6 +2500,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     await subscribers.shutdownAll();
     costPersistUnsubscribe?.();
     advisorPersist?.unsubscribe();
+    printAdvisorDigest(advisorPersist);
     if (shouldInstallSigint) {
       process.removeListener("SIGINT", sigintHandler);
     }
@@ -2508,6 +2514,18 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   }
 
   return "";
+}
+
+/**
+ * Item 14 in-run digest — one stderr line at session end when the advisor
+ * persistence subscriber's cheap tally tripped a threshold, pointing at
+ * `crewhaus advise --session <id>` for the full report. stderr (not stdout)
+ * so piped/captured agent output is never polluted; silent on healthy runs
+ * and when the subscriber is disabled (CREWHAUS_ADVISOR_EVENTS=0).
+ */
+function printAdvisorDigest(advisorPersist: AttachedAdvisorPersistence | undefined): void {
+  const line = advisorPersist?.digestLine();
+  if (line !== undefined) process.stderr.write(`${line}\n`);
 }
 
 function isAbortError(err: unknown): boolean {

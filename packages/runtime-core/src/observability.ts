@@ -120,7 +120,37 @@ function logFlushError(runContext: RunContext, name: string, err: unknown): void
 
 export type AttachedAdvisorPersistence = {
   unsubscribe: Unsubscribe;
+  /**
+   * Item 14 in-run digest — the one-line stderr summary the runtime prints
+   * at session end when any cheap advisory threshold tripped, or undefined
+   * when the session looks healthy. Counters only: no LLM, no file reads,
+   * nothing heavier than a Map bump per event in the hot path — the real
+   * analysis is `crewhaus advise`'s job, offline.
+   */
+  digestLine(): string | undefined;
 };
+
+/**
+ * Cheap in-run thresholds for the digest tally. Keep in sync with
+ * `DEFAULT_ADVICE_THRESHOLDS` in `apps/cli/src/advise-rules.ts` — the rule
+ * library owns the canonical values, but runtime-core cannot import from
+ * apps/cli, so the digest mirrors them here (a drift only ever means the
+ * nudge line appears/hides slightly off the report; the report itself is
+ * always authoritative).
+ */
+const DIGEST_THRESHOLDS = {
+  toolFailureMinCalls: 5,
+  toolFailureRate: 0.5,
+  truncationContinues: 2,
+  compactions: 3,
+  asksPerTool: 3,
+  stopMinResponses: 4,
+  stopAnomalyRate: 0.25,
+} as const;
+
+/** Stop reasons that are part of healthy operation; everything else
+ *  (max_tokens, refusal, pause_turn, …) counts as anomalous. */
+const CLEAN_STOP_REASONS = new Set(["end_turn", "tool_use", "stop_sequence"]);
 
 /**
  * Advisor groundwork (items 14/15/17) — mirror the runtime signals that were
@@ -169,9 +199,19 @@ export function attachAdvisorPersistence(
     });
   };
 
+  // In-run digest counters (item 14). Bumped inline in the same handler so
+  // the digest costs nothing beyond the persistence pass itself.
+  const toolTally = new Map<string, { calls: number; errors: number }>();
+  const askTally = new Map<string, { asks: number; approved: number }>();
+  let truncationContinues = 0;
+  let compactions = 0;
+  let responses = 0;
+  let anomalousStops = 0;
+
   const unsubscribe = bus.subscribe((event: TraceEvent): void => {
     switch (event.kind) {
       case "error_recovered": {
+        if (event.action === "continue") truncationContinues += 1;
         persist("recovery", {
           errorName: event.errorName,
           action: event.action,
@@ -180,6 +220,10 @@ export function attachAdvisorPersistence(
         return;
       }
       case "tool_call_end": {
+        const tally = toolTally.get(event.toolName) ?? { calls: 0, errors: 0 };
+        tally.calls += 1;
+        if (event.isError) tally.errors += 1;
+        toolTally.set(event.toolName, tally);
         persist("tool_stats", {
           toolName: event.toolName,
           // Whole milliseconds — performance.now() floats add line bytes
@@ -192,6 +236,12 @@ export function attachAdvisorPersistence(
       case "permission_decision": {
         // Pre-prompt ask publish — the resolution (askOutcome set) follows.
         if (event.decision === "ask" && event.askOutcome === undefined) return;
+        if (event.decision === "ask" && event.askOutcome !== undefined) {
+          const ask = askTally.get(event.toolName) ?? { asks: 0, approved: 0 };
+          ask.asks += 1;
+          if (event.askOutcome === "approved") ask.approved += 1;
+          askTally.set(event.toolName, ask);
+        }
         persist("permission", {
           toolName: event.toolName,
           decision: event.decision,
@@ -200,7 +250,15 @@ export function attachAdvisorPersistence(
         return;
       }
       case "model_response": {
+        responses += 1;
+        if (!CLEAN_STOP_REASONS.has(event.stopReason)) anomalousStops += 1;
         persist("model_meta", { stopReason: event.stopReason, model: event.model });
+        return;
+      }
+      case "compaction_fired": {
+        // Already persisted by the runtime as the `compaction` event-log
+        // kind — tallied here for the digest only.
+        compactions += 1;
         return;
       }
       default:
@@ -208,5 +266,23 @@ export function attachAdvisorPersistence(
     }
   });
 
-  return { unsubscribe };
+  const digestLine = (): string | undefined => {
+    const t = DIGEST_THRESHOLDS;
+    let findings = 0;
+    for (const { calls, errors } of toolTally.values()) {
+      if (calls >= t.toolFailureMinCalls && errors / calls >= t.toolFailureRate) findings += 1;
+    }
+    for (const { asks, approved } of askTally.values()) {
+      if (asks >= t.asksPerTool && approved === asks) findings += 1;
+    }
+    if (truncationContinues >= t.truncationContinues) findings += 1;
+    if (compactions >= t.compactions) findings += 1;
+    if (responses >= t.stopMinResponses && anomalousStops / responses >= t.stopAnomalyRate) {
+      findings += 1;
+    }
+    if (findings === 0) return undefined;
+    return `advisor: ${findings} finding${findings === 1 ? "" : "s"} — run \`crewhaus advise --session ${runContext.sessionId}\``;
+  };
+
+  return { unsubscribe, digestLine };
 }

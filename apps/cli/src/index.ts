@@ -55,12 +55,26 @@ import { runChatLoop } from "@crewhaus/runtime-core";
 import { createSessionStore } from "@crewhaus/session-store";
 import { createSkillTool, discoverSkills } from "@crewhaus/skills-registry";
 import { loadCommands } from "@crewhaus/slash-commands";
-import { parseSpec } from "@crewhaus/spec";
+import { type Spec, parseSpec } from "@crewhaus/spec";
 import { spawnSubAgent } from "@crewhaus/sub-agent-spawner";
 import { type RegisteredTool, ToolCatalog } from "@crewhaus/tool-catalog";
 import { registerMcpServer } from "@crewhaus/tool-mcp";
 import { createTaskTool } from "@crewhaus/tool-task";
 import { type CostAccrualEvent, type ProviderId, TraceEventBus } from "@crewhaus/trace-event-bus";
+// Item 14 — `crewhaus advise` rule library (session-JSONL aggregation +
+// threshold rules + suggestions.json/report.html builders), in a
+// side-effect-free module so it is unit-testable (this entry file runs an
+// argv switch on import).
+import {
+  type AdviceFinding,
+  type SessionEvents,
+  buildAdviceContext,
+  buildSuggestionsFile,
+  formatFindingLines,
+  parseJsonlObjects as parseAdviseJsonl,
+  renderAdviceHtml,
+  runAdviceRules,
+} from "./advise-rules";
 // Item 34 — `crewhaus audit verify` plumbing (anchor-flag parsing + per-check
 // summary + doctor mapping), in a side-effect-free module so it is
 // unit-testable (this entry file runs an argv switch on import).
@@ -392,6 +406,16 @@ const COST_SUMMARY_SCHEMA: ParseArgsSchema = {
   ],
 };
 
+const ADVISE_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "session", takesValue: true },
+    { name: "all" },
+    { name: "json" },
+    { name: "out", short: "o", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
 const RATE_SCHEMA: ParseArgsSchema = {
   flags: [
     { name: "session", takesValue: true },
@@ -617,6 +641,8 @@ function usageText(): string {
     "  context --bundle [-o <file>]         emit a single-markdown orientation manifest",
     "       [--factory-root <p>] [--docs-root <p>] [--demos-root <p>]",
     "  cost-summary --session <id>          summarize cost_accrual events for a session",
+    "  advise [--session <id> | --all]      mine session logs for spec advice (item 14)",
+    "       [--json] [-o <dir>]             writes suggestions.json + report.html (default .crewhaus/advice)",
     "  rate --session <id> [--turn N]       rate an assistant turn 👍/👎, ⭐, or 0–1",
     "       (--thumbs up|down | --stars 1-5 | --score 0-1) [--comment <t>]",
     "  feedback --session <id> --text <msg> attach a comment/correction to a turn",
@@ -3267,6 +3293,125 @@ async function runCostSummary(args: ParsedArgs): Promise<void> {
   }
 }
 
+// -------- advise: trace-mining spec advisor (item 14) --------
+
+/**
+ * `crewhaus advise [--session <id> | --all] [--json] [-o <dir>]` — build an
+ * AdviceContext from `.crewhaus/sessions` JSONLs (+ `.crewhaus/audit`
+ * records), run the advise-rules library, print ranked findings with
+ * evidence, and write two artifacts into the out dir (default
+ * `.crewhaus/advice`): `suggestions.json` (the validated SpecPatch list a
+ * future `optimize --from-advice` consumes) and a self-contained
+ * `report.html`. With neither `--session` nor `--all`, mines all sessions.
+ *
+ * The spec (for patch suggestions) is the cwd `crewhaus.yaml` per the
+ * standalone-harness convention; a missing or unparseable spec downgrades
+ * patch suggestions to advice text rather than blocking the mining.
+ */
+async function runAdvise(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus advise [--session <id> | --all] [--json] [-o <dir>]\n" +
+        "\n" +
+        "mines .crewhaus/sessions (+ .crewhaus/audit) for spec advice:\n" +
+        "  repeated tool failures, max_tokens truncation pressure, compaction\n" +
+        "  thrash, permission-ask churn, stop-reason anomalies\n" +
+        "\n" +
+        "  --session <id>  mine one session (default: all sessions)\n" +
+        "  --json          print machine-readable findings to stdout\n" +
+        "  -o <dir>        artifact dir for suggestions.json + report.html\n" +
+        "                  (default .crewhaus/advice)\n",
+    );
+    return;
+  }
+  const sessionFlag = strFlag(args, "session");
+  if (sessionFlag !== undefined && args.flags["all"] === true) {
+    die("--session and --all are mutually exclusive");
+  }
+
+  const sessionsDir = join(process.cwd(), ".crewhaus", "sessions");
+  const sessionFiles: string[] = [];
+  if (sessionFlag !== undefined) {
+    const file = join(sessionsDir, `${sessionFlag}.jsonl`);
+    if (!existsSync(file)) die(`session log not found at ${file}`);
+    sessionFiles.push(file);
+  } else {
+    if (!existsSync(sessionsDir)) {
+      die(`no session logs found at ${sessionsDir} — run the agent first, then advise`);
+    }
+    for (const f of readdirSync(sessionsDir).sort()) {
+      if (f.endsWith(".jsonl")) sessionFiles.push(join(sessionsDir, f));
+    }
+    if (sessionFiles.length === 0) {
+      die(`no session logs found at ${sessionsDir} — run the agent first, then advise`);
+    }
+  }
+  const sessions: SessionEvents[] = sessionFiles.map((file) => ({
+    sessionId: basename(file).replace(/\.jsonl$/, ""),
+    objects: parseAdviseJsonl(readFileSync(file, "utf-8")),
+  }));
+
+  // Audit records are optional context (kind counts land in the report's
+  // future rules); a missing dir is the common case and skips silently.
+  const auditDir = join(process.cwd(), ".crewhaus", "audit");
+  const auditObjects: unknown[] = [];
+  if (existsSync(auditDir)) {
+    for (const f of readdirSync(auditDir).sort()) {
+      if (!f.endsWith(".jsonl")) continue;
+      auditObjects.push(...parseAdviseJsonl(readFileSync(join(auditDir, f), "utf-8")));
+    }
+  }
+
+  // The cwd spec enables patch suggestions; without one (or with a broken
+  // one) rules fall back to advice text — mining must not block on it.
+  let spec: Spec | undefined;
+  const specPath = join(process.cwd(), "crewhaus.yaml");
+  if (existsSync(specPath)) {
+    try {
+      spec = parseSpec(readFileSync(specPath, "utf-8"));
+    } catch (err) {
+      process.stderr.write(
+        `[advise] crewhaus.yaml did not parse (${(err as Error).message}) — patch suggestions downgraded to advice\n`,
+      );
+    }
+  }
+
+  const ctx = buildAdviceContext(sessions, auditObjects);
+  const findings: AdviceFinding[] = runAdviceRules(ctx, spec !== undefined ? { spec } : {});
+  const generatedAt = new Date().toISOString();
+  const suggestions = buildSuggestionsFile(findings, ctx.sessionIds, generatedAt);
+
+  const outDir = strFlag(args, "out") ?? join(process.cwd(), ".crewhaus", "advice");
+  mkdirSync(outDir, { recursive: true });
+  const suggestionsPath = join(outDir, "suggestions.json");
+  const reportPath = join(outDir, "report.html");
+  writeFileSync(suggestionsPath, `${JSON.stringify(suggestions, null, 2)}\n`);
+  writeFileSync(
+    reportPath,
+    renderAdviceHtml({ findings, sessionIds: ctx.sessionIds, generatedAt }),
+  );
+
+  if (args.flags["json"] === true) {
+    process.stdout.write(
+      `${JSON.stringify({ sessionIds: ctx.sessionIds, findings, suggestions: suggestions.suggestions })}\n`,
+    );
+    return;
+  }
+  process.stdout.write(
+    `advisor: ${findings.length} finding${findings.length === 1 ? "" : "s"} across ${ctx.sessionIds.length} session${ctx.sessionIds.length === 1 ? "" : "s"}\n`,
+  );
+  if (findings.length === 0) {
+    process.stdout.write("no findings — the mined sessions look healthy\n");
+  }
+  for (const f of findings) {
+    for (const line of formatFindingLines(f)) {
+      process.stdout.write(`${line}\n`);
+    }
+  }
+  process.stdout.write(`[advise] suggestions: ${suggestionsPath}\n`);
+  process.stdout.write(`[advise] report: ${reportPath}\n`);
+}
+
 // -------- response feedback: rate / feedback / distill --------
 
 const SESSIONS_SUBDIR = join(".crewhaus", "sessions");
@@ -4663,6 +4808,9 @@ switch (subcommand) {
     break;
   case "cost-summary":
     await runCostSummary(parseFor(rest, COST_SUMMARY_SCHEMA));
+    break;
+  case "advise":
+    await runAdvise(parseFor(rest, ADVISE_SCHEMA));
     break;
   case "rate":
     await runRate(parseFor(rest, RATE_SCHEMA));

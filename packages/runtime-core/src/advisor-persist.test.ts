@@ -202,6 +202,138 @@ describe("attachAdvisorPersistence gating", () => {
   });
 });
 
+describe("in-run digest tally (item 14)", () => {
+  async function attachOnFreshLog() {
+    const runContext = createRunContext();
+    const log = await openEventLog(runContext.sessionId, { rootDir: sessionRoot });
+    const attached = attachAdvisorPersistence(runContext.eventBus, log, runContext, {});
+    if (attached === undefined) throw new Error("unreachable: empty env attaches");
+    return { runContext, log, attached };
+  }
+
+  test("no events → no digest line", async () => {
+    const { attached, log } = await attachOnFreshLog();
+    expect(attached.digestLine()).toBeUndefined();
+    attached.unsubscribe();
+    await log.close();
+  });
+
+  test("a failing tool at the threshold (5 calls, 50% errors) trips one finding", async () => {
+    const { runContext, attached, log } = await attachOnFreshLog();
+    const bus = runContext.eventBus;
+    for (let i = 0; i < 5; i++) {
+      bus.publish({
+        ...bus.envelope(),
+        kind: "tool_call_end",
+        toolUseId: `tu_${i}`,
+        toolName: "Fetch",
+        isError: i < 3, // 3/5 = 60% ≥ 50%
+        outputBytes: 1,
+        durationMs: 5,
+      });
+    }
+    await bus.flush();
+    expect(attached.digestLine()).toBe(
+      `advisor: 1 finding — run \`crewhaus advise --session ${runContext.sessionId}\``,
+    );
+    attached.unsubscribe();
+    await log.close();
+  });
+
+  test("below-threshold activity stays silent; multiple trips pluralize", async () => {
+    const { runContext, attached, log } = await attachOnFreshLog();
+    const bus = runContext.eventBus;
+    // 4 calls (below the 5-call floor) → silent even at 100% errors.
+    for (let i = 0; i < 4; i++) {
+      bus.publish({
+        ...bus.envelope(),
+        kind: "tool_call_end",
+        toolUseId: `tu_${i}`,
+        toolName: "Bash",
+        isError: true,
+        outputBytes: 1,
+        durationMs: 5,
+      });
+    }
+    await bus.flush();
+    expect(attached.digestLine()).toBeUndefined();
+    // Trip two independent categories: truncation continues + compaction thrash.
+    for (let i = 0; i < 2; i++) {
+      bus.publish({
+        ...bus.envelope(),
+        kind: "error_recovered",
+        action: "continue",
+        errorName: "MaxTokensError",
+        depth: i + 1,
+      });
+    }
+    for (let i = 0; i < 3; i++) {
+      bus.publish({
+        ...bus.envelope(),
+        kind: "compaction_fired",
+        subKind: "snip",
+        before: 40,
+        after: 20,
+        phase: "pre-turn",
+      });
+    }
+    await bus.flush();
+    expect(attached.digestLine()).toBe(
+      `advisor: 2 findings — run \`crewhaus advise --session ${runContext.sessionId}\``,
+    );
+    attached.unsubscribe();
+    await log.close();
+  });
+
+  test("permission churn (3 asks, all approved) and stop anomalies each trip", async () => {
+    const { runContext, attached, log } = await attachOnFreshLog();
+    const bus = runContext.eventBus;
+    for (let i = 0; i < 3; i++) {
+      bus.publish({
+        ...bus.envelope(),
+        kind: "permission_decision",
+        toolName: "Write",
+        decision: "ask",
+        mode: "default",
+        askOutcome: "approved",
+      });
+    }
+    for (let i = 0; i < 4; i++) {
+      bus.publish({
+        ...bus.envelope(),
+        kind: "model_response",
+        model: "m",
+        stopReason: i === 0 ? "max_tokens" : "end_turn", // 1/4 = 25% ≥ 25%
+        usage: { input: 1, output: 1 },
+        durationMs: 1,
+      });
+    }
+    await bus.flush();
+    expect(attached.digestLine()).toMatch(/^advisor: 2 findings — /);
+    attached.unsubscribe();
+    await log.close();
+  });
+
+  test("a denied ask breaks the 100%-approved churn condition", async () => {
+    const { runContext, attached, log } = await attachOnFreshLog();
+    const bus = runContext.eventBus;
+    for (let i = 0; i < 3; i++) {
+      bus.publish({
+        ...bus.envelope(),
+        kind: "permission_decision",
+        toolName: "Write",
+        decision: "ask",
+        mode: "default",
+        askOutcome: i === 0 ? "denied" : "approved",
+      });
+    }
+    await bus.flush();
+    expect(attached.digestLine()).toBeUndefined();
+    attached.unsubscribe();
+    await log.close();
+  });
+});
+
 describe("advisor signal persistence (item 14 groundwork)", () => {
   test("model_meta persists per model_response by default (gate unset)", async () => {
     // Any value other than "0"/"false" (including the unset default) keeps
