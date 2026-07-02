@@ -171,6 +171,20 @@ export {
 } from "@crewhaus/adapter-anthropic";
 export type { ResolvedAuth } from "@crewhaus/adapter-anthropic";
 
+// Ops item 36 — boot-time self-heal janitor for daemon shapes. Lives in its
+// own module (`./janitor`) but is re-exported here because emitted bundles
+// only import the package root.
+export { createJanitor } from "./janitor";
+export type {
+  CreateJanitorOptions,
+  Janitor,
+  JanitorReservationStore,
+  JanitorRunResult,
+  JanitorStepName,
+  JanitorStepResult,
+  JanitorStepStatus,
+} from "./janitor";
+
 /**
  * Reconcile a message history by dropping "orphan" `tool_use` blocks — a
  * `tool_use` with no answering `tool_result` anywhere later in the

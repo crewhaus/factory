@@ -17,6 +17,9 @@
  *      job_end | drain_start | drain_end | worker_stop`).
  *   5. Installs SIGTERM + SIGINT handlers that drain in-flight jobs
  *      cleanly before exit.
+ *   6. Runs the boot-time self-heal janitor (ops item 36) — session TTL
+ *      eviction + orphaned-tool_use report — at boot and hourly
+ *      (`CREWHAUS_JANITOR=0` / `CREWHAUS_JANITOR_INTERVAL_MS` to tune).
  */
 import { CrewhausError } from "@crewhaus/errors";
 import { escapeJsonString } from "@crewhaus/infra-utils";
@@ -157,7 +160,7 @@ function renderAgent(ir: IrBatchV0): string {
 import { createInMemoryQueue } from "@crewhaus/queue-protocol";
 import { startConsumer } from "@crewhaus/queue-consumer";
 import { createInMemoryIdempotencyStore } from "@crewhaus/idempotency-keys";
-import { runChatLoop } from "@crewhaus/runtime-core";
+import { createJanitor, runChatLoop } from "@crewhaus/runtime-core";
 import { createRunContext } from "@crewhaus/run-context";
 import { defaultCatalog } from "@crewhaus/tool-catalog";
 ${permImport}${importBlock}
@@ -190,6 +193,21 @@ function buildQueue(): ReturnType<typeof createInMemoryQueue<string>> {
 }
 
 async function main(): Promise<void> {
+  // Boot-time self-heal janitor (ops item 36): evicts expired sessions on a
+  // schedule (TTL eviction otherwise only fires as a list() side-effect an
+  // idle worker never triggers) and reports orphaned tool_use entries in
+  // recent transcripts (report-only). The report goes to stderr so the
+  // stdout JSON event stream stays untouched. CREWHAUS_JANITOR=0 disables
+  // entirely; CREWHAUS_JANITOR_INTERVAL_MS overrides the hourly re-run
+  // (0 keeps only the boot run; the timer is unref'd so the queue_idle exit
+  // path still terminates the process).
+  const janitor = createJanitor();
+  if (process.env["CREWHAUS_JANITOR"] !== "0") {
+    const janitorReport = await janitor.runOnce();
+    process.stderr.write(\`[janitor] \${JSON.stringify(janitorReport.steps)}\\n\`);
+    janitor.start(Number(process.env["CREWHAUS_JANITOR_INTERVAL_MS"] ?? 3_600_000));
+  }
+
   const queue = buildQueue();
   const idempotencyStore = createInMemoryIdempotencyStore<string>();
   emit({ kind: "worker_start", queueAdapter: SPEC_QUEUE_ADAPTER, concurrency: SPEC_CONCURRENCY });
@@ -243,6 +261,7 @@ async function main(): Promise<void> {
   const shutdown = async (signal: string): Promise<void> => {
     if (stopping) return;
     stopping = true;
+    janitor.stop();
     emit({ kind: "shutdown_received", signal });
     await consumer.drain();
     const stats = await queue.stats();
@@ -271,6 +290,7 @@ async function main(): Promise<void> {
         consumer.inFlight() === 0
       ) {
         emit({ kind: "queue_idle", stats: recheck });
+        janitor.stop();
         await consumer.drain();
         emit({ kind: "worker_stop", stats: await queue.stats() });
         return;

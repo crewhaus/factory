@@ -66,27 +66,101 @@ export interface SessionStore {
   delete(id: string): Promise<void>;
 }
 
+// When a tenant context is active, fail closed on any resolved path that
+// escapes the tenant's sessionRoot (CWE-1230). Outside a tenant scope (the
+// common CLI case) this is a no-op so non-tenant behaviour is unchanged.
+function fencePath(absPath: string): string {
+  if (currentTenantContext() !== undefined) {
+    assertSamePath(absPath, requireTenant().sessionRoot);
+  }
+  return absPath;
+}
+
+function sessionPath(rootDir: string, id: string): string {
+  return fencePath(resolve(rootDir, `${id}.json`));
+}
+
+function sessionLogPath(rootDir: string, id: string): string {
+  return fencePath(resolve(rootDir, `${id}.jsonl`));
+}
+
+/**
+ * The TTL-eviction pass shared by `list()` and `evictExpiredSessions()`.
+ * Walks `rootDir` and unlinks every `sess_<16 hex>.json` whose filesystem
+ * mtime is older than `cutoffMs` (along with its sibling `.jsonl` event
+ * log). Returns the evicted ids plus the ids that survive, so `list()` can
+ * read the survivors without a second directory walk.
+ */
+async function sweepExpired(
+  rootDir: string,
+  cutoffMs: number,
+): Promise<{ evictedIds: string[]; survivorIds: string[] }> {
+  let entries: string[];
+  try {
+    entries = await readdir(rootDir);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      return { evictedIds: [], survivorIds: [] };
+    }
+    throw err;
+  }
+  const evictedIds: string[] = [];
+  const survivorIds: string[] = [];
+  for (const entry of entries) {
+    if (!entry.endsWith(".json")) continue;
+    const id = entry.slice(0, -".json".length);
+    if (!ID_REGEX.test(id)) continue;
+    const fullPath = sessionPath(rootDir, id);
+    let mtimeMs: number;
+    try {
+      const st = await stat(fullPath);
+      mtimeMs = st.mtimeMs;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") continue;
+      throw err;
+    }
+    if (mtimeMs < cutoffMs) {
+      // Evict: unlink both the session file and any sibling event log.
+      await unlink(fullPath).catch(() => undefined);
+      await unlink(sessionLogPath(rootDir, id)).catch(() => undefined);
+      evictedIds.push(id);
+      continue;
+    }
+    survivorIds.push(id);
+  }
+  return { evictedIds, survivorIds };
+}
+
+/**
+ * Run the TTL-eviction pass standalone — exactly `list()`'s eviction
+ * side-effect (mtime-keyed, unlinks `.json` + sibling `.jsonl`) without
+ * reading or parsing the surviving sessions. Daemon shapes that never call
+ * `list()` (managed gateway, channel bots, batch workers) invoke this from
+ * `runtime-core`'s boot-time janitor so idle transcripts still expire.
+ * Returns the evicted session ids.
+ */
+export async function evictExpiredSessions(
+  opts: SessionStoreOptions = {},
+): Promise<{ evictedIds: string[] }> {
+  const rootDir = opts.rootDir ?? DEFAULT_ROOT_DIR;
+  const ttlDays = opts.ttlDays ?? DEFAULT_TTL_DAYS;
+  const now = opts.now ?? (() => new Date());
+  const cutoff = now().getTime() - ttlDays * MS_PER_DAY;
+  const { evictedIds } = await sweepExpired(rootDir, cutoff);
+  return { evictedIds };
+}
+
 export function createSessionStore(opts: SessionStoreOptions = {}): SessionStore {
   const rootDir = opts.rootDir ?? DEFAULT_ROOT_DIR;
   const ttlDays = opts.ttlDays ?? DEFAULT_TTL_DAYS;
   const now = opts.now ?? (() => new Date());
 
-  // When a tenant context is active, fail closed on any resolved path that
-  // escapes the tenant's sessionRoot (CWE-1230). Outside a tenant scope (the
-  // common CLI case) this is a no-op so non-tenant behaviour is unchanged.
-  function fence(absPath: string): string {
-    if (currentTenantContext() !== undefined) {
-      assertSamePath(absPath, requireTenant().sessionRoot);
-    }
-    return absPath;
-  }
-
   function pathFor(id: string): string {
-    return fence(resolve(rootDir, `${id}.json`));
+    return sessionPath(rootDir, id);
   }
 
   function logPathFor(id: string): string {
-    return fence(resolve(rootDir, `${id}.jsonl`));
+    return sessionLogPath(rootDir, id);
   }
 
   function validateId(id: string): void {
@@ -155,34 +229,10 @@ export function createSessionStore(opts: SessionStoreOptions = {}): SessionStore
     },
 
     async list(): Promise<Session[]> {
-      let entries: string[];
-      try {
-        entries = await readdir(rootDir);
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
-        throw err;
-      }
       const cutoff = now().getTime() - ttlDays * MS_PER_DAY;
+      const { survivorIds } = await sweepExpired(rootDir, cutoff);
       const survivors: Session[] = [];
-      for (const entry of entries) {
-        if (!entry.endsWith(".json")) continue;
-        const id = entry.slice(0, -".json".length);
-        if (!ID_REGEX.test(id)) continue;
-        const fullPath = pathFor(id);
-        let mtimeMs: number;
-        try {
-          const st = await stat(fullPath);
-          mtimeMs = st.mtimeMs;
-        } catch (err) {
-          if ((err as NodeJS.ErrnoException).code === "ENOENT") continue;
-          throw err;
-        }
-        if (mtimeMs < cutoff) {
-          // Evict: unlink both the session file and any sibling event log.
-          await unlink(fullPath).catch(() => undefined);
-          await unlink(logPathFor(id)).catch(() => undefined);
-          continue;
-        }
+      for (const id of survivorIds) {
         try {
           const session = await readSession(id);
           if (session !== null) survivors.push(session);

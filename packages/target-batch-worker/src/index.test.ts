@@ -64,6 +64,22 @@ describe("emitBatchWorker", () => {
     expect(code).toContain('"worker_stop"');
   });
 
+  test("boots the self-heal janitor before consuming (ops #36)", () => {
+    const code = emitBatchWorker(baseIr).files[0]?.content ?? "";
+    expect(code).toContain('import { createJanitor, runChatLoop } from "@crewhaus/runtime-core"');
+    expect(code).toContain("const janitor = createJanitor()");
+    // Boot-time runOnce, env kill-switch, and configurable hourly interval.
+    expect(code).toContain('process.env["CREWHAUS_JANITOR"] !== "0"');
+    expect(code).toContain("await janitor.runOnce()");
+    expect(code).toContain(
+      'janitor.start(Number(process.env["CREWHAUS_JANITOR_INTERVAL_MS"] ?? 3_600_000))',
+    );
+    // The report goes to stderr so the stdout JSON event stream is untouched.
+    expect(code).toContain("process.stderr.write(`[janitor]");
+    // Both the signal path and the queue_idle exit path halt the interval.
+    expect(code.split("janitor.stop();").length - 1).toBe(2);
+  });
+
   test("non-in-memory adapter compiles, but boot throws (clean diagnostic)", () => {
     const ir: IrBatchV0 = {
       ...baseIr,

@@ -900,6 +900,7 @@ ${heartbeatImport}${builtinImportBlock}${mcpImportBlock}${subAgentImportBlock}im
 import { createSessionRouter } from "./session-router.js";
 import { createGateway } from "./gateway.js";
 import { createDedupStore } from "@crewhaus/durable-state";
+import { createJanitor } from "@crewhaus/runtime-core";
 
 ${startupEnvCheck}
 ${adapterConstructBlock}
@@ -930,6 +931,20 @@ ${registerBlock}${mcpBoot}${subAgentBoot}
     dedupStore: __dedupStore,
   });
 
+  // Boot-time self-heal janitor (ops item 36): evicts expired sessions on a
+  // schedule (TTL eviction otherwise only fires as a list() side-effect the
+  // daemon never triggers while idle) and reports orphaned tool_use entries
+  // in recent transcripts (report-only — resume already reconciles orphans
+  // in memory). CREWHAUS_JANITOR=0 disables entirely;
+  // CREWHAUS_JANITOR_INTERVAL_MS overrides the hourly re-run (0 keeps only
+  // the boot run).
+  const __janitor = createJanitor();
+  if (process.env["CREWHAUS_JANITOR"] !== "0") {
+    const __janitorReport = await __janitor.runOnce();
+    process.stdout.write(\`[janitor] \${JSON.stringify(__janitorReport.steps)}\\n\`);
+    __janitor.start(Number(process.env["CREWHAUS_JANITOR_INTERVAL_MS"] ?? 3_600_000));
+  }
+
   const port = Number(process.env["PORT"] ?? 3000);
   const server = Bun.serve({ port, fetch: (req) => gateway.handle(req) });
   process.stdout.write(\`[daemon] listening on http://localhost:\${server.port}\\n\`);
@@ -939,6 +954,7 @@ ${gatewayBoot}${heartbeatBoot}
     if (shuttingDown) return;
     shuttingDown = true;
     process.stdout.write(\`[daemon] received \${signal}, shutting down...\\n\`);
+    __janitor.stop();
     try {
       await server.stop(true);${gatewayShutdown}${heartbeatShutdown}${mcpCleanup}
     } catch (err) {

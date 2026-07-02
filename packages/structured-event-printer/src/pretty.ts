@@ -77,6 +77,10 @@ function formatBody(ev: TraceEvent): string {
       return `adapter=${ev.adapter} ${ev.fromState}→${ev.toState}${
         ev.reason ? ` reason=${ev.reason}` : ""
       }`;
+    case "janitor_action":
+      return `step=${ev.step} status=${ev.status}${ev.count !== undefined ? ` count=${ev.count}` : ""}${
+        ev.detail ? ` detail=${ev.detail}` : ""
+      }`;
     case "response_rated": {
       const rating = typeof ev.rating === "number" ? ev.rating.toFixed(2) : ev.rating;
       return `rating=${rating}${ev.source ? ` source=${ev.source}` : ""}${

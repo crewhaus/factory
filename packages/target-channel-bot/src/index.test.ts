@@ -111,6 +111,22 @@ describe("emitChannelBot — daemon.ts wiring", () => {
     expect(c).toContain("server.stop(true)");
   });
 
+  test("boots the self-heal janitor before serving webhooks (ops #36)", () => {
+    const c = fileMap(MIN_IR).get("daemon.ts") ?? "";
+    expect(c).toContain('import { createJanitor } from "@crewhaus/runtime-core";');
+    expect(c).toContain("const __janitor = createJanitor()");
+    // Boot-time runOnce, env kill-switch, and configurable hourly interval.
+    expect(c).toContain('process.env["CREWHAUS_JANITOR"] !== "0"');
+    expect(c).toContain("await __janitor.runOnce()");
+    expect(c).toContain(
+      '__janitor.start(Number(process.env["CREWHAUS_JANITOR_INTERVAL_MS"] ?? 3_600_000))',
+    );
+    // The janitor boots ahead of the webhook listener.
+    expect(c.indexOf("createJanitor()")).toBeLessThan(c.indexOf("Bun.serve({"));
+    // Shutdown halts the interval.
+    expect(c).toContain("__janitor.stop();");
+  });
+
   test("constructs createSlackAdapter with the configured secret references", () => {
     const c = fileMap(MIN_IR).get("daemon.ts") ?? "";
     expect(c).toContain("createSlackAdapter({");

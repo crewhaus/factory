@@ -56,6 +56,36 @@ describe("emitManaged", () => {
     expect(daemon?.content).toContain("SIGINT");
   });
 
+  test("daemon.ts wires a pluggable budget store into the gateway (ops #36)", () => {
+    const bundle = emitManaged(ir);
+    const daemon = bundle.files.find((f) => f.path === "daemon.ts")?.content ?? "";
+    expect(daemon).toContain('import { createBudgetStore } from "@crewhaus/durable-state"');
+    expect(daemon).toContain("CREWHAUS_BUDGET_STORE");
+    expect(daemon).toContain('createBudgetStore(process.env.CREWHAUS_BUDGET_STORE ?? "memory")');
+    // The SAME store instance must reach the gateway (budget enforcement)
+    // and the janitor (crash-leaked reservation cleanup).
+    expect(daemon).toContain("budgetStore: BUDGET_STORE");
+  });
+
+  test("daemon.ts boots the self-heal janitor with tenant session roots (ops #36)", () => {
+    const bundle = emitManaged(ir);
+    const daemon = bundle.files.find((f) => f.path === "daemon.ts")?.content ?? "";
+    expect(daemon).toContain('import { createJanitor } from "@crewhaus/runtime-core"');
+    expect(daemon).toContain("createJanitor({");
+    expect(daemon).toContain("budgetStore: BUDGET_STORE");
+    expect(daemon).toContain(
+      "sessionRootDirs: Object.values(tenantOverrides).map((t) => t.sessionRoot)",
+    );
+    // Boot-time runOnce, env kill-switch, and configurable hourly interval.
+    expect(daemon).toContain('process.env.CREWHAUS_JANITOR !== "0"');
+    expect(daemon).toContain("await janitor.runOnce()");
+    expect(daemon).toContain(
+      "janitor.start(Number(process.env.CREWHAUS_JANITOR_INTERVAL_MS ?? 3_600_000))",
+    );
+    // Both signal handlers halt the interval.
+    expect(daemon.split("janitor.stop();").length - 1).toBe(2);
+  });
+
   test("agent.ts has runOneTurn signature with tenantId + sessionId + input", () => {
     const bundle = emitManaged(ir);
     const agent = bundle.files.find((f) => f.path === "agent.ts");
