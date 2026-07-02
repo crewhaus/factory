@@ -114,6 +114,19 @@ import {
 // `doctor --philosophy-alignment`. Kept in a side-effect-free module so it is
 // unit-testable (this entry file runs an argv switch on import).
 import { auditSpecToolNames, auditToolScopes, collectToolNames } from "./scope-audit";
+// Item 48 — `crewhaus security digest` core (windowed rollup over
+// .crewhaus/audit + session event logs, text/json/html renderers, webhook
+// notify), in a side-effect-free module so it is unit-testable (this entry
+// file runs an argv switch on import).
+import {
+  InvalidSinceFlagError,
+  NotifyError,
+  buildSecurityDigest,
+  notifySecurityDigest,
+  parseSinceFlag,
+  renderSecurityDigestHtml,
+  renderSecurityDigestText,
+} from "./security-digest";
 // Item 69 — `crewhaus state backup|restore` core (tarball snapshot of the
 // cwd `.crewhaus` state dir + full/merge restore), in a module with no
 // import-time side effects so it is unit-testable (this entry file runs an
@@ -387,6 +400,21 @@ const RETENTION_SCHEMA: ParseArgsSchema = {
   ],
 };
 
+const SECURITY_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // Item 48 — `security digest` rollup window: 7d (default), 30d, or ISO.
+    { name: "since", takesValue: true },
+    { name: "format", takesValue: true },
+    { name: "out", short: "o", takesValue: true },
+    // POST the JSON digest to a webhook (plain fetch — see security-digest.ts
+    // for the deliberate no-channel-adapter decision + the Slack wrapper note).
+    { name: "notify", takesValue: true },
+    // Harness root that owns `.crewhaus/` (mirrors `retention --dir`).
+    { name: "dir", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
 const SECRETS_SCHEMA: ParseArgsSchema = {
   flags: [
     { name: "backend", takesValue: true },
@@ -519,6 +547,8 @@ function usageText(): string {
     "       [--since <date>] [--dry-run] [--dir <root>]",
     "  retention purge [--before <date>]    right-to-delete: purge expired records now",
     "       [--dry-run] [--dir <root>]",
+    "  security digest [--since 7d|30d|ISO] triage rollup of denials/egress/injection from .crewhaus stores (item 48)",
+    "       [--format text|json|html] [-o <dir>] [--notify <url>] [--dir <root>]",
     "  version                              print the CLI version (also: --version, -v)",
     "",
   ].join("\n");
@@ -3654,6 +3684,91 @@ async function runRetention(args: ParsedArgs, action: string): Promise<void> {
   }
 }
 
+/**
+ * Item 48 — `crewhaus security digest [--since 7d|30d|<ISO>] [--format
+ * text|json|html] [-o <dir>] [--notify <url>] [--dir <root>]`. Walks the
+ * cwd (or --dir) harness's `.crewhaus/audit` + `.crewhaus/sessions` stores
+ * and emits a ranked warn/deny rollup: top justification-denied tools (with
+ * judge identity + confidence), judge deny rate, policy-engine denials,
+ * injection rule-id hits (from session redaction notices), and — the day a
+ * writer lands for the declared-but-writerless `egress_decision` kind — top
+ * warn/block egress sinks + origins. See security-digest.ts for exactly
+ * which audit kinds have writers today and the design decisions (local HTML
+ * helper, plain-fetch notify).
+ *
+ * The digest is a report, not a gate: it exits 0 even when the window is
+ * full of denials. The one loud failure is `--notify` — a scheduled digest
+ * whose notification silently failed would fabricate assurance, so a
+ * non-2xx/unreachable webhook exits 1.
+ */
+async function runSecurityDigest(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus security digest [--since 7d|30d|<ISO>] [--format text|json|html]\n" +
+        "                                [-o <dir>] [--notify <url>] [--dir <root>]\n" +
+        "  --since <w>     rollup window: a trailing day window (7d default, e.g. 30d)\n" +
+        "                  or an ISO date/datetime lower bound\n" +
+        "  --format <f>    text (default), json (the machine shape --notify POSTs),\n" +
+        "                  or html (self-contained page, eval-report styling)\n" +
+        "  -o <dir>        write security-digest.<ext> into <dir> instead of stdout\n" +
+        "  --notify <url>  POST the JSON digest to a webhook (plain fetch; Slack\n" +
+        "                  incoming webhooks need a { text } wrapper — front one with\n" +
+        "                  a proxy that forwards { text: <rendered text> })\n" +
+        "  --dir <root>    harness root that owns .crewhaus/ (default: cwd)\n",
+    );
+    return;
+  }
+  const formatFlag = args.flags["format"];
+  const format = typeof formatFlag === "string" ? formatFlag : "text";
+  if (format !== "text" && format !== "json" && format !== "html") {
+    die(`--format must be "text", "json" or "html" (got "${format}")`);
+  }
+  const dirFlag = args.flags["dir"];
+  const rootDir = typeof dirFlag === "string" ? resolve(dirFlag) : process.cwd();
+  const sinceFlag = args.flags["since"];
+
+  let digest: ReturnType<typeof buildSecurityDigest>;
+  try {
+    const window = parseSinceFlag(typeof sinceFlag === "string" ? sinceFlag : undefined);
+    digest = buildSecurityDigest({ rootDir, window });
+  } catch (err) {
+    if (err instanceof InvalidSinceFlagError) die(err.message);
+    throw err;
+  }
+
+  const rendered =
+    format === "json"
+      ? `${JSON.stringify(digest, null, 2)}\n`
+      : format === "html"
+        ? renderSecurityDigestHtml(digest)
+        : `security digest: ${rootDir}\n${renderSecurityDigestText(digest)
+            .map((l) => `  ${l}`)
+            .join("\n")}\n`;
+
+  const outFlag = args.flags["out"];
+  if (typeof outFlag === "string") {
+    const outDir = resolve(outFlag);
+    mkdirSync(outDir, { recursive: true });
+    const ext = format === "text" ? "txt" : format;
+    const outPath = join(outDir, `security-digest.${ext}`);
+    writeFileSync(outPath, rendered);
+    process.stdout.write(`wrote ${outPath}\n`);
+  } else {
+    process.stdout.write(rendered);
+  }
+
+  const notifyFlag = args.flags["notify"];
+  if (typeof notifyFlag === "string") {
+    try {
+      await notifySecurityDigest(notifyFlag, digest);
+      process.stdout.write(`notified ${notifyFlag}\n`);
+    } catch (err) {
+      if (err instanceof NotifyError) die(err.message);
+      throw err;
+    }
+  }
+}
+
 const argv = process.argv.slice(2);
 const subcommand = argv[0] ?? "";
 const rest = argv.slice(1);
@@ -3790,6 +3905,14 @@ switch (subcommand) {
       die(`retention action must be one of: sweep, export, purge (got "${action}")`);
     }
     await runRetention(parseFor(rest.slice(1), RETENTION_SCHEMA), action);
+    break;
+  }
+  case "security": {
+    const action = rest[0] ?? "";
+    if (action !== "digest") {
+      die(`security action must be "digest" (got "${action}")`);
+    }
+    await runSecurityDigest(parseFor(rest.slice(1), SECURITY_SCHEMA));
     break;
   }
   case "version":
