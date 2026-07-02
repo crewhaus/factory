@@ -288,6 +288,15 @@ export type CostAccrualEvent = TraceEventEnvelope & {
   inputTokens: number;
   outputTokens: number;
   cachedReadTokens: number;
+  /**
+   * Prompt-cache WRITE tokens (Anthropic `cache_creation_input_tokens`,
+   * Bedrock `cacheWriteInputTokens` — the canonical `usage.cacheCreate`),
+   * billed at a premium over the input rate. Optional so `cost_accrual`
+   * records persisted before this field existed keep parsing; absent means
+   * "not tracked", and emitters that do track it write 0 when no cache
+   * segment was created.
+   */
+  cacheCreationTokens?: number;
   costUsdMicros: number;
   tenantId?: string;
   /**
@@ -393,6 +402,27 @@ export type ResponseRatedEvent = TraceEventEnvelope & {
 };
 
 /**
+ * Ops item 36 — emitted by `runtime-core`'s boot-time self-heal janitor,
+ * once per maintenance step per run (daemon shapes run it at boot and on an
+ * hourly interval). Steps: crash-leaked durable-state reservation cleanup,
+ * session TTL eviction, and the orphaned-`tool_use` transcript sweep
+ * (detect-and-report — the janitor never rewrites the append-only session
+ * log; `--resume` already reconciles orphans in memory via
+ * `sanitizeOrphanToolUses`). `status: "skipped"` records an intentional
+ * no-op (step disabled, nothing to do, or already done at boot); `"error"`
+ * carries the failure in `detail` — a throwing step never aborts the run.
+ */
+export type JanitorActionEvent = TraceEventEnvelope & {
+  kind: "janitor_action";
+  step: "reservation_cleanup" | "session_ttl_eviction" | "orphan_tool_use_sweep";
+  status: "ok" | "skipped" | "error";
+  /** Step tally: sessions evicted / orphaned tool_use ids found. Absent when the step has no meaningful count (reservation cleanup). */
+  count?: number;
+  /** Human-readable summary — skip reason, error message, or sweep stats. */
+  detail?: string;
+};
+
+/**
  * Section 27 — `circuit-breaker` emits this on every state transition.
  * Subscribers (audit-log, OTel exporter, structured-event-printer) can
  * surface degraded providers without subscribing to the breaker directly.
@@ -431,6 +461,7 @@ export type TraceEvent =
   | CrewDoneEvent
   | CostAccrualEvent
   | CircuitStateChangedEvent
+  | JanitorActionEvent
   | ResponseRatedEvent
   | TestVerdictEvent
   | ProgramOutputEvent

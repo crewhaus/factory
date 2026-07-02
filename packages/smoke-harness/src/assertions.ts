@@ -35,7 +35,7 @@ export type ShapeAssertion = {
 export const SHAPE_ASSERTIONS: readonly ShapeAssertion[] = [
   {
     shape: "cli",
-    expectedFiles: ["agent.ts"],
+    expectedFiles: ["README.md", "agent.ts"],
     anchors: [
       { in: "agent.ts", contains: "@crewhaus/runtime-core" },
       { in: "agent.ts", contains: "runChatLoop" },
@@ -53,7 +53,7 @@ export const SHAPE_ASSERTIONS: readonly ShapeAssertion[] = [
   // consumer surface (Section 17) against emitter drift.
   {
     shape: "cli-openai",
-    expectedFiles: ["agent.ts"],
+    expectedFiles: ["README.md", "agent.ts"],
     anchors: [
       { in: "agent.ts", contains: "openai/gpt-4o-mini" },
       { in: "agent.ts", contains: "runChatLoop" },
@@ -61,7 +61,7 @@ export const SHAPE_ASSERTIONS: readonly ShapeAssertion[] = [
   },
   {
     shape: "cli-gemini",
-    expectedFiles: ["agent.ts"],
+    expectedFiles: ["README.md", "agent.ts"],
     anchors: [
       { in: "agent.ts", contains: "gemini/gemini-2.5-flash" },
       { in: "agent.ts", contains: "runChatLoop" },
@@ -69,7 +69,7 @@ export const SHAPE_ASSERTIONS: readonly ShapeAssertion[] = [
   },
   {
     shape: "cli-bedrock",
-    expectedFiles: ["agent.ts"],
+    expectedFiles: ["README.md", "agent.ts"],
     anchors: [
       // Geo-prefixed cross-region inference-profile id, verbatim.
       { in: "agent.ts", contains: "bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0" },
@@ -78,7 +78,7 @@ export const SHAPE_ASSERTIONS: readonly ShapeAssertion[] = [
   },
   {
     shape: "cli-local",
-    expectedFiles: ["agent.ts"],
+    expectedFiles: ["README.md", "agent.ts"],
     anchors: [
       { in: "agent.ts", contains: "local/llama3.2@http://localhost:11434/v1" },
       { in: "agent.ts", contains: "runChatLoop" },
@@ -86,7 +86,7 @@ export const SHAPE_ASSERTIONS: readonly ShapeAssertion[] = [
   },
   {
     shape: "browser",
-    expectedFiles: ["agent.ts"],
+    expectedFiles: ["README.md", "agent.ts"],
     anchors: [
       { in: "agent.ts", contains: "@crewhaus/computer-use-driver" },
       // The exact gap that started this PR series — guard it forever.
@@ -106,7 +106,7 @@ export const SHAPE_ASSERTIONS: readonly ShapeAssertion[] = [
   },
   {
     shape: "voice",
-    expectedFiles: ["agent.ts", "daemon.ts", "voice-loop.ts"],
+    expectedFiles: ["README.md", "agent.ts", "daemon.ts", "voice-loop.ts"],
     anchors: [
       { in: "voice-loop.ts", contains: "@crewhaus/voice-runtime" },
       { in: "voice-loop.ts", contains: "@crewhaus/vad-engine" },
@@ -115,7 +115,7 @@ export const SHAPE_ASSERTIONS: readonly ShapeAssertion[] = [
   },
   {
     shape: "channel",
-    expectedFiles: ["agent.ts", "daemon.ts", "gateway.ts", "session-router.ts"],
+    expectedFiles: ["README.md", "agent.ts", "daemon.ts", "gateway.ts", "session-router.ts"],
     anchors: [
       { in: "daemon.ts", contains: "@crewhaus/channel-adapter-slack" },
       { in: "daemon.ts", contains: "createSlackAdapter" },
@@ -124,22 +124,32 @@ export const SHAPE_ASSERTIONS: readonly ShapeAssertion[] = [
       // the bundle must reach for the env var by exact name.
       { in: "daemon.ts", contains: "SMOKE_SLACK_BOT_TOKEN" },
       { in: "daemon.ts", contains: "SMOKE_SLACK_SIGNING_SECRET" },
+      // Ops item 36 — boot-time self-heal janitor wired into the daemon.
+      { in: "daemon.ts", contains: "createJanitor" },
     ],
   },
   {
     shape: "batch",
-    expectedFiles: ["agent.ts"],
+    expectedFiles: ["README.md", "agent.ts"],
     anchors: [
       { in: "agent.ts", contains: "@crewhaus/queue-protocol" },
       { in: "agent.ts", contains: "@crewhaus/queue-consumer" },
       { in: "agent.ts", contains: "@crewhaus/idempotency-keys" },
       { in: "agent.ts", contains: '"worker_start"' },
       { in: "agent.ts", contains: '"job_start"' },
+      // Ops item 36 — boot-time self-heal janitor wired into the worker.
+      { in: "agent.ts", contains: "createJanitor" },
     ],
   },
   {
     shape: "crew",
-    expectedFiles: ["agent_researcher.ts", "agent_writer.ts", "daemon.ts", "orchestrator.ts"],
+    expectedFiles: [
+      "README.md",
+      "agent_researcher.ts",
+      "agent_writer.ts",
+      "daemon.ts",
+      "orchestrator.ts",
+    ],
     anchors: [
       { in: "orchestrator.ts", contains: "@crewhaus/crew-orchestrator" },
       { in: "agent_researcher.ts", contains: "RoleDefinition" },
@@ -148,7 +158,7 @@ export const SHAPE_ASSERTIONS: readonly ShapeAssertion[] = [
   },
   {
     shape: "eval",
-    expectedFiles: ["agent.ts"],
+    expectedFiles: ["README.md", "agent.ts"],
     anchors: [
       { in: "agent.ts", contains: "@crewhaus/dataset-registry" },
       { in: "agent.ts", contains: "@crewhaus/eval-grader" },
@@ -157,7 +167,7 @@ export const SHAPE_ASSERTIONS: readonly ShapeAssertion[] = [
   },
   {
     shape: "graph",
-    expectedFiles: ["agent.ts"],
+    expectedFiles: ["README.md", "agent.ts"],
     anchors: [
       { in: "agent.ts", contains: "@crewhaus/graph-engine" },
       { in: "agent.ts", contains: "@crewhaus/checkpoint-store" },
@@ -166,16 +176,19 @@ export const SHAPE_ASSERTIONS: readonly ShapeAssertion[] = [
   },
   {
     shape: "managed",
-    expectedFiles: ["agent.ts", "daemon.ts"],
+    expectedFiles: ["README.md", "agent.ts", "daemon.ts"],
     anchors: [
       { in: "daemon.ts", contains: "@crewhaus/gateway-server" },
       { in: "daemon.ts", contains: "@crewhaus/policy-engine" },
       { in: "daemon.ts", contains: "@crewhaus/tenancy" },
+      // Ops item 36 — boot-time self-heal janitor + pluggable budget store.
+      { in: "daemon.ts", contains: "createJanitor" },
+      { in: "daemon.ts", contains: "createBudgetStore" },
     ],
   },
   {
     shape: "onchain",
-    expectedFiles: ["agent.ts"],
+    expectedFiles: ["README.md", "agent.ts"],
     anchors: [
       { in: "agent.ts", contains: "@crewhaus/chain-adapter-evm" },
       // §47 boundary-fabric requirement — every onchain trigger must
@@ -188,7 +201,7 @@ export const SHAPE_ASSERTIONS: readonly ShapeAssertion[] = [
   },
   {
     shape: "onchain-game",
-    expectedFiles: ["agent.ts"],
+    expectedFiles: ["README.md", "agent.ts"],
     anchors: [
       { in: "agent.ts", contains: "@crewhaus/chain-adapter-evm" },
       { in: "agent.ts", contains: "@crewhaus/boundary-classifier" },
@@ -197,7 +210,7 @@ export const SHAPE_ASSERTIONS: readonly ShapeAssertion[] = [
   },
   {
     shape: "pipeline",
-    expectedFiles: ["agent.ts"],
+    expectedFiles: ["README.md", "agent.ts"],
     anchors: [
       { in: "agent.ts", contains: "@crewhaus/pipeline-engine" },
       { in: "agent.ts", contains: "@crewhaus/embedder" },
@@ -207,7 +220,7 @@ export const SHAPE_ASSERTIONS: readonly ShapeAssertion[] = [
   },
   {
     shape: "research",
-    expectedFiles: ["agent.ts"],
+    expectedFiles: ["README.md", "agent.ts"],
     anchors: [
       { in: "agent.ts", contains: "@crewhaus/planner" },
       { in: "agent.ts", contains: "@crewhaus/crawler" },
@@ -218,7 +231,7 @@ export const SHAPE_ASSERTIONS: readonly ShapeAssertion[] = [
   },
   {
     shape: "workflow",
-    expectedFiles: ["agent.ts"],
+    expectedFiles: ["README.md", "agent.ts"],
     anchors: [
       { in: "agent.ts", contains: "@crewhaus/runtime-core" },
       { in: "agent.ts", contains: "runChatLoop" },

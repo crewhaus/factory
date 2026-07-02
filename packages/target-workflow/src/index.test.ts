@@ -28,8 +28,16 @@ const TWO_STEP_IR: IrWorkflowV0 = {
 };
 
 describe("emitWorkflow", () => {
-  test("emits a single-file bundle named agent.ts", () => {
+  test("emits agent.ts plus the generated README.md (item 42)", () => {
     const bundle = emitWorkflow(TWO_STEP_IR);
+    expect(bundle.files).toHaveLength(2);
+    expect(bundle.files[0]?.path).toBe("agent.ts");
+    expect(bundle.files[1]?.path).toBe("README.md");
+    expect(bundle.files[1]?.content).toContain("| Target | `workflow` |");
+  });
+
+  test("readme: false restores the single-file bundle (item 42 opt-out)", () => {
+    const bundle = emitWorkflow(TWO_STEP_IR, { readme: false });
     expect(bundle.files).toHaveLength(1);
     expect(bundle.files[0]?.path).toBe("agent.ts");
   });

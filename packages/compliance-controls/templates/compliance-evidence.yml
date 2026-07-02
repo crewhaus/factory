@@ -1,0 +1,79 @@
+# compliance-evidence.yml — scheduled compliance evidence collection TEMPLATE.
+#
+# This is a TEMPLATE, not an active workflow: copy it into your deployment
+# repository's `.github/workflows/` and edit the <PLACEHOLDER> comments.
+# One cron line then collects SOC 2 / ISO 27001 / HIPAA evidence bundles for
+# the CURRENT quarter across EVERY registered framework — and, via
+# --fail-on-empty, fails loudly (non-zero) when any control collected zero
+# records, so an evidence gap trips the schedule instead of surfacing at
+# audit time. (Without the flag, bare interactive runs exit 0 and only WARN
+# about empty controls.)
+#
+# Prerequisites:
+#   - The runner can reach your audit-log root (`.crewhaus/audit`). Audit logs
+#     live where your agents RUN, so on an ephemeral CI runner you typically
+#     restore/mount that directory first (see the <AUDIT-DIR> step below).
+#   - Optional: an HMAC signing key in the repo's Actions secrets so bundles
+#     are signed (recommended — auditors verify them with `verifyBundle`).
+
+name: compliance-evidence
+
+on:
+  schedule:
+    # <CRON> Quarterly on the 1st of Jan/Apr/Jul/Oct at 06:17 UTC. `--period
+    # current` resolves the quarter from the clock, so a more frequent cron
+    # (e.g. monthly: "17 6 1 * *") simply re-collects the same period label
+    # with fresher records — both are safe.
+    - cron: "17 6 1 1,4,7,10 *"
+  # Manual re-runs for auditor requests.
+  workflow_dispatch: {}
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # <AUDIT-DIR> Make the audit-log root available to this job. Replace
+      # this step with however your deployment persists `.crewhaus/audit`
+      # (restore from object storage, mount a volume, scp from the host that
+      # runs the agents, ...). Skip it entirely if this workflow already runs
+      # on the machine that owns the audit log.
+      # - name: Restore audit log
+      #   run: aws s3 sync s3://<YOUR-BUCKET>/crewhaus-audit .crewhaus/audit
+
+      - name: Install crewhaus
+        # Any channel works: npm i -g crewhaus, brew install crewhaus/tap/crewhaus, ...
+        run: npm install -g crewhaus
+
+      - name: Verify the audit chain before trusting it as evidence
+        # Tamper tripwire — exits non-zero on any broken hash-chain link.
+        # <ANCHOR> If your deployment mirrors chain tails to a file-backed
+        # anchor store (FileAnchorStore), add: --anchor file:<anchor-dir>
+        run: crewhaus audit verify --dir .crewhaus/audit
+
+      - name: Collect evidence for every framework, current quarter
+        # --fail-on-empty is the scheduled-run tripwire: the job exits
+        # non-zero when any control collected 0 records (evidence gap), so
+        # the cron fails loudly NOW instead of the gap surfacing at audit
+        # time. Drop the flag ONLY if quiet periods are expected for your
+        # deployment. Scope with --framework <id> to collect one framework.
+        env:
+          # <SIGNING-KEY> Set this secret to HMAC-sign the bundles; delete the
+          # env block and the --signing-key-env flag to write unsigned ones.
+          CREWHAUS_COMPLIANCE_SIGNING_KEY: ${{ secrets.CREWHAUS_COMPLIANCE_SIGNING_KEY }}
+        run: >
+          crewhaus compliance evidence --all-frameworks --period current
+          --audit-dir .crewhaus/audit --out-dir .crewhaus/compliance
+          --signing-key-env CREWHAUS_COMPLIANCE_SIGNING_KEY
+          --fail-on-empty
+
+      - name: Upload evidence bundles
+        # <RETENTION> Match retention-days to your compliance program's
+        # evidence-retention requirement (or replace this step with a push to
+        # WORM/object-lock storage for non-repudiation).
+        uses: actions/upload-artifact@v4
+        with:
+          name: compliance-evidence-${{ github.run_id }}
+          path: .crewhaus/compliance/
+          retention-days: 400

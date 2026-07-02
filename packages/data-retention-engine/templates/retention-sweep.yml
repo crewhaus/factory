@@ -1,0 +1,98 @@
+# retention-sweep.yml — scheduled GDPR/TTL retention enforcement TEMPLATE.
+#
+# This is a TEMPLATE, not an active workflow: copy it into your deployment
+# repository's `.github/workflows/` and edit the <PLACEHOLDER> comments.
+# One cron line then enforces `.crewhaus/retention.json` over the harness
+# stores on a schedule — expired sessions are deleted under the exact rules
+# session-store's own TTL eviction uses, while the hash-chained audit log is
+# NEVER deleted (any deletion, even a whole oldest day file, would break
+# `crewhaus audit verify`'s tamper check — audit is export-only). Every real
+# sweep appends a `retention_enforcement` record to `.crewhaus/audit`, so the
+# enforcement itself is tamper-evidenced.
+#
+# Prerequisites:
+#   - The runner can reach the harness directory that owns `.crewhaus/`
+#     (sessions + audit). Stores live where your agents RUN, so on an
+#     ephemeral CI runner you typically restore/mount them first — AND
+#     persist them back after the sweep, or the deletions (and the appended
+#     evidence record) evaporate with the runner (see the <STORE> steps).
+#   - Optional: a `.crewhaus/retention.json` in the harness directory. Without
+#     one the sweep uses the safe defaults (sessions expire after 30 days —
+#     session-store's TTL — no pins, no audit windows):
+#       {
+#         "version": 1,
+#         "sessions": { "maxAgeDays": 30 },
+#         "pins": ["sess_0123456789abcdef"],
+#         "auditWindows": [
+#           { "frameworkId": "soc2", "controlId": "CC6.1",
+#             "expiresAt": "2026-08-01T00:00:00Z" }
+#         ]
+#       }
+
+name: retention-sweep
+
+on:
+  schedule:
+    # <CRON> Daily at 04:23 UTC. The sweep is idempotent — anything already
+    # deleted or still inside its retention window is simply reported as
+    # kept — so a more (or less) frequent cron is equally safe.
+    - cron: "23 4 * * *"
+  # Manual runs for right-to-delete requests (pair with `retention export`
+  # first when the data subject also asked for a copy).
+  workflow_dispatch: {}
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # <STORE> Make the harness `.crewhaus/` stores available to this job.
+      # Replace with however your deployment persists them (restore from
+      # object storage, mount a volume, run on the host that owns them, ...).
+      # Skip it entirely if this workflow already runs on that machine.
+      #
+      # WARNING — mtimes must survive the round-trip. Session retention is
+      # keyed on each file's filesystem MTIME (the same rule session-store's
+      # own TTL eviction uses), and `aws s3 sync` (like most object-store
+      # download tools) stamps restored files with the DOWNLOAD time — every
+      # session then looks freshly touched and the sweep silently never
+      # deletes anything on a restored runner. Persist/restore an archive
+      # that preserves mtimes instead, e.g. tar (which records and restores
+      # them by default):
+      #   persist: tar -czf crewhaus-store.tgz .crewhaus
+      #            aws s3 cp crewhaus-store.tgz s3://<YOUR-BUCKET>/
+      #   restore: aws s3 cp s3://<YOUR-BUCKET>/crewhaus-store.tgz .
+      #            tar -xpzf crewhaus-store.tgz
+      # - name: Restore harness stores
+      #   run: aws s3 sync s3://<YOUR-BUCKET>/crewhaus-store .crewhaus
+
+      - name: Install crewhaus
+        # Any channel works: npm i -g crewhaus, brew install crewhaus/tap/crewhaus, ...
+        run: npm install -g crewhaus
+
+      - name: Dry-run first — log what the sweep will delete and why
+        # Deletes nothing and appends no evidence; the report lands in the
+        # job log so a surprising deletion set is visible BEFORE it happens.
+        run: crewhaus retention sweep --dry-run
+
+      - name: Enforce retention
+        # Deletes expired sessions (honoring retention.json pins + audit
+        # windows; audit day files are never deleted) and appends the
+        # tamper-evident `retention_enforcement` record to .crewhaus/audit.
+        run: crewhaus retention sweep
+
+      - name: Verify the audit chain still checks out
+        # The sweep's evidence append must land on an intact chain — a broken
+        # link here means the store was tampered with out-of-band.
+        run: crewhaus audit verify --dir .crewhaus/audit
+
+      # <STORE> Persist the swept stores back if you restored them above —
+      # otherwise the deletions AND the evidence record are lost with the
+      # runner and the next sweep re-reports the same expired sessions.
+      # Use the mtime-preserving tar round-trip from the restore step above,
+      # NOT a bare `aws s3 sync` (see the WARNING there).
+      # - name: Persist harness stores
+      #   run: |
+      #     tar -czf crewhaus-store.tgz .crewhaus
+      #     aws s3 cp crewhaus-store.tgz s3://<YOUR-BUCKET>/crewhaus-store.tgz

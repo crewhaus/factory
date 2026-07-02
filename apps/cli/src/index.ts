@@ -12,6 +12,7 @@ import {
   createFileBackedRegistry,
   latestVersion,
 } from "@crewhaus/dataset-registry";
+import { DEFAULT_PRICING, computeCacheSavingsMicros, resolvePricing } from "@crewhaus/cost-tracker";
 import { CrewhausError } from "@crewhaus/errors";
 import { type Sample, loadDataset } from "@crewhaus/eval-dataset";
 import { type CompiledGrader, parseGradersConfig } from "@crewhaus/eval-grader";
@@ -38,6 +39,7 @@ import {
   type ParsedArgs,
   parseArgs,
 } from "@crewhaus/infra-utils";
+import { GENERATED_README_MARKER } from "@crewhaus/ir";
 import { createLogger } from "@crewhaus/logging";
 import { McpHost } from "@crewhaus/mcp-host";
 import {
@@ -58,7 +60,7 @@ import { spawnSubAgent } from "@crewhaus/sub-agent-spawner";
 import { type RegisteredTool, ToolCatalog } from "@crewhaus/tool-catalog";
 import { registerMcpServer } from "@crewhaus/tool-mcp";
 import { createTaskTool } from "@crewhaus/tool-task";
-import { type CostAccrualEvent, TraceEventBus } from "@crewhaus/trace-event-bus";
+import { type CostAccrualEvent, type ProviderId, TraceEventBus } from "@crewhaus/trace-event-bus";
 // Item 12 — dataset-registry CLI plumbing (the `datasets` subcommand family,
 // `distill --register` promotion, and the `--dataset registry:` shorthand
 // shared by eval + optimize), in a side-effect-free module so it is
@@ -75,6 +77,19 @@ import {
   registerDataset,
   resolveRegistryRef,
 } from "./datasets";
+// Item 34 — `crewhaus audit verify` plumbing (anchor-flag parsing + per-check
+// summary + doctor mapping), in a side-effect-free module so it is
+// unit-testable (this entry file runs an argv switch on import).
+import {
+  type AnchorFlagChoice,
+  InvalidAnchorFlagError,
+  buildAuditIntegrityCheck,
+  resolveAnchorFlag,
+  summarizeVerifyResult,
+} from "./audit-verify";
+// Item 34 — scheduling ergonomics for `compliance evidence` (--period current
+// resolution + the empty-evidence gate), side-effect-free for the same reason.
+import { findEmptyControls, resolvePeriodFlag } from "./compliance-schedule";
 // Model-aware doctor credential checks (provider parsed from the cwd spec's
 // agent.model via the model-router grammar), in a side-effect-free module so
 // it is unit-testable (this entry file runs an argv switch on import).
@@ -136,6 +151,20 @@ import {
 // recoveries + the eval-side default union, in a side-effect-free module so
 // it is unit-testable (this entry file runs an argv switch on import).
 import { applyRegressionUnionGuarded, pinRecoveriesAfterOptimize } from "./regression-pin";
+// Item 35 — `crewhaus retention` sweep/export/purge (scheduled GDPR/TTL
+// enforcement over the on-disk session + audit stores), in a side-effect-free
+// module so it is unit-testable AND callable as a library by a future daemon
+// janitor (no boot wiring here — see retention.ts).
+import {
+  InvalidRetentionDateError,
+  RetentionConfigError,
+  formatEnforcementReport,
+  formatExportReport,
+  parseRetentionDate,
+  runRetentionExport,
+  runRetentionPurge,
+  runRetentionSweep,
+} from "./retention";
 // FR-002 — Pillar 3 sink-side scope gate, shared by `compile --strict` and
 // `doctor --philosophy-alignment`. Kept in a side-effect-free module so it is
 // unit-testable (this entry file runs an argv switch on import).
@@ -151,6 +180,19 @@ import {
   tapSamples,
   triageFitnessSamples,
 } from "./triage";
+// Item 69 — `crewhaus state backup|restore` core (tarball snapshot of the
+// cwd `.crewhaus` state dir + full/merge restore), in a module with no
+// import-time side effects so it is unit-testable (this entry file runs an
+// argv switch on import).
+import {
+  StateBackupError,
+  createStateBackup,
+  defaultBackupFileName,
+  mergeAllFromArchive,
+  mergeFeedbackFromArchive,
+  parseExcludeGlobs,
+  restoreStateArchive,
+} from "./state-backup";
 
 /**
  * crewhaus — slice-scope CLI.
@@ -187,6 +229,14 @@ const COMPILE_SCHEMA: ParseArgsSchema = {
     // FAILS the compile.
     { name: "allow-unmarked-sinks", takesValue: false },
     { name: "no-strict-scope", takesValue: false },
+    // Item 42 — README emission into the bundle is DEFAULT-ON; this is the
+    // explicit opt-out for users who post-process bundles and don't want
+    // the extra file.
+    { name: "no-readme", takesValue: false },
+    // Item 46 — auto-registration of the compiled spec into the local
+    // spec-registry (with a distilled CHANGELOG.md entry) is DEFAULT-ON;
+    // this is the explicit opt-out.
+    { name: "no-register", takesValue: false },
     { name: "help", short: "h" },
   ],
 };
@@ -275,6 +325,10 @@ const OPTIMIZE_SCHEMA: ParseArgsSchema = {
     // Item 7 — opt out of the runner's default one-shot retry of ERRORED
     // samples inside each candidate's fitness eval (mirrors `eval --no-retry`).
     { name: "no-retry", takesValue: false },
+    // Item 46 — after a successful --write-back the working spec changed, so
+    // the same auto-register + changelog flow as `compile` runs; this is the
+    // explicit opt-out (mirrors `compile --no-register`).
+    { name: "no-register", takesValue: false },
     { name: "out", short: "o", takesValue: true },
     { name: "help", short: "h" },
   ],
@@ -387,6 +441,19 @@ const DATASETS_SCHEMA: ParseArgsSchema = {
   ],
 };
 
+const STATE_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // backup
+    { name: "out", short: "o", takesValue: true },
+    { name: "exclude", takesValue: true },
+    // restore
+    { name: "into", takesValue: true },
+    { name: "merge", takesValue: true },
+    { name: "force", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
 const SANDBOX_SCHEMA: ParseArgsSchema = {
   flags: [
     { name: "probe", takesValue: false },
@@ -398,11 +465,38 @@ const SANDBOX_SCHEMA: ParseArgsSchema = {
 const COMPLIANCE_SCHEMA: ParseArgsSchema = {
   flags: [
     { name: "framework", takesValue: true },
+    // Item 34 — collect every registered framework in one (schedulable) run.
+    { name: "all-frameworks", takesValue: false },
     { name: "control", takesValue: true },
+    // Accepts a literal period label (e.g. 2026-Q2) or "current" (the current
+    // UTC quarter) so a cron job never hardcodes a stale label.
     { name: "period", takesValue: true },
     { name: "audit-dir", takesValue: true },
     { name: "out-dir", takesValue: true },
     { name: "signing-key-env", takesValue: true },
+    // Item 34 / ops-review F4 — opt IN to the empty-evidence tripwire: with
+    // this flag a control that collected 0 records exits 1 (for scheduled
+    // runs); the default is exit 0 with a warning so documented bare
+    // invocations keep working.
+    { name: "fail-on-empty", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
+const AUDIT_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "dir", takesValue: true },
+    { name: "anchor", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
+const RETENTION_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "dry-run", takesValue: false },
+    { name: "dir", takesValue: true },
+    { name: "since", takesValue: true },
+    { name: "before", takesValue: true },
     { name: "help", short: "h" },
   ],
 };
@@ -526,9 +620,13 @@ function usageText(): string {
     "       [--split train|dev|test]",
     "  datasets put <name> --file <f.jsonl> import a file as a new auto-bumped version",
     "       [--split-spec 70/15/15 | --split train]",
+    "  state backup [-o <file.tar.gz>]      snapshot the cwd .crewhaus state dir to a tarball (item 69)",
+    "       [--exclude <glob,glob>]",
+    "  state restore <file.tar.gz>          restore a snapshot (refuses a non-empty .crewhaus)",
+    "       [--into <dir>] [--force] [--merge feedback|all]",
     "  secrets doctor                       list known secrets via the configured backend",
     "  secrets rotate <name> [--value V]    rotate a named secret (file backend)",
-    "  spec put|list|get|pin|alias ...      versioned spec storage (Section 28 spec-registry)",
+    "  spec put|list|get|pin|alias|log ...  versioned spec storage + changelog (Section 28 spec-registry)",
     "  deploy promote|rollback ...          re-pin a spec for an environment (Section 28)",
     "  migrate-all --from N --to N          batch-migrate every spec in the registry",
     "  build-image <target> --tag <tag>     build the docker image for a target shape (Section 32)",
@@ -542,8 +640,17 @@ function usageText(): string {
     "  sandbox doctor [--probe]             list registered sandbox images + healthcheck status (Section 36)",
     "       [--format json|table]",
     "  compliance evidence                  collect SOC 2 / ISO 27001 / HIPAA evidence (Section 39)",
-    "       --framework <id> [--control <id>] --period <p> [--audit-dir <d>]",
-    "       [--out-dir <d>] [--signing-key-env <ENV>]",
+    "       (--framework <id> | --all-frameworks) [--control <id>]",
+    "       --period <p>|current [--audit-dir <d>] [--out-dir <d>]",
+    "       [--signing-key-env <ENV>] [--fail-on-empty]",
+    "  audit verify [--dir <auditDir>]      verify the hash-chained audit log (tamper check)",
+    "       [--anchor file:<path>]          cross-check an append-only file anchor store",
+    "  retention sweep [--dry-run]          scheduled GDPR/TTL enforcement over .crewhaus stores",
+    "       [--dir <root>]                  (sessions expire by .crewhaus/retention.json; audit is export-only)",
+    "  retention export <outDir>            right-to-export: copy session/audit records out",
+    "       [--since <date>] [--dry-run] [--dir <root>]",
+    "  retention purge [--before <date>]    right-to-delete: purge expired records now",
+    "       [--dry-run] [--dir <root>]",
     "  version                              print the CLI version (also: --version, -v)",
     "",
   ].join("\n");
@@ -575,25 +682,31 @@ function die(message: string): never {
 // --compile --define` — standalone binaries have no package.json on disk.
 declare const CREWHAUS_EMBEDDED_VERSION: string | undefined;
 
-function printVersion(): void {
-  if (typeof CREWHAUS_EMBEDDED_VERSION === "string") {
-    process.stdout.write(`${CREWHAUS_EMBEDDED_VERSION}\n`);
-    return;
-  }
+/**
+ * Resolve the CLI version string: the build-time embedded constant when this
+ * is a standalone binary, else package.json. Undefined when neither source
+ * is available (`version` dies on it; the backup manifest stamps "unknown").
+ */
+function cliVersion(): string | undefined {
+  if (typeof CREWHAUS_EMBEDDED_VERSION === "string") return CREWHAUS_EMBEDDED_VERSION;
   // The package ships src/ directly (bin → src/index.ts) and tsc -b also
   // emits dist/, so resolve package.json relative to this module — one level
   // up lands on apps/cli/package.json from either tree, and on
   // node_modules/@crewhaus/cli/package.json when installed.
-  let version: string;
   try {
-    version = (
+    return (
       JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf-8")) as {
         version: string;
       }
     ).version;
   } catch {
-    die("could not locate package.json to determine the version");
+    return undefined;
   }
+}
+
+function printVersion(): void {
+  const version = cliVersion();
+  if (version === undefined) die("could not locate package.json to determine the version");
   process.stdout.write(`${version}\n`);
 }
 
@@ -610,9 +723,26 @@ async function runCompile(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
       "usage: crewhaus compile <spec.yaml> [-o <out-dir>] [--emit-ir]\n" +
-        "                        [--allow-unmarked-sinks]\n" +
+        "                        [--allow-unmarked-sinks] [--no-readme] [--no-register]\n" +
         "  --emit-ir  Skip code emission; print the lowered IR as JSON to\n" +
         "             stdout (or to <out-dir>/ir.json when -o is set).\n" +
+        "\n" +
+        "  Every emitted bundle includes a generated README.md documenting\n" +
+        "  the harness (name/target/model), its tools and MCP servers, the\n" +
+        "  env vars it needs, and how to launch it. A previously generated\n" +
+        "  README.md in the out-dir is refreshed on recompile; a README.md\n" +
+        "  NOT generated by crewhaus (no generation marker) is kept as-is\n" +
+        "  with a notice.\n" +
+        "  --no-readme  Skip the generated README.md.\n" +
+        "\n" +
+        "  A successful bundle compile also auto-registers the spec in the\n" +
+        "  local registry (.crewhaus/specs): when no stored version matches\n" +
+        "  the spec's content hash, the next vN is put and a distilled entry\n" +
+        "  (field-level diff vs the previous version, plus optimizer\n" +
+        "  provenance for written-back specs) is appended to the per-spec\n" +
+        "  CHANGELOG.md — render it with `crewhaus spec log <name>`.\n" +
+        "  Recompiling an unchanged spec is a no-op (`unchanged <name>@<v>`).\n" +
+        "  --no-register  Skip the registry auto-put + changelog entry.\n" +
         "\n" +
         "  FR-002 — the strict scope gate runs by DEFAULT: the build fails\n" +
         "  (exit 1) if any I/O-capable tool the spec uses is left at a\n" +
@@ -642,6 +772,10 @@ async function runCompile(args: ParsedArgs): Promise<void> {
   const allowUnmarkedSinks =
     args.flags["allow-unmarked-sinks"] === true || args.flags["no-strict-scope"] === true;
   const strict = !allowUnmarkedSinks;
+  // Item 42 — generated bundle README, DEFAULT-ON; --no-readme opts out.
+  const readme = args.flags["no-readme"] !== true;
+  // Item 46 — registry auto-put + changelog, DEFAULT-ON; --no-register opts out.
+  const register = args.flags["no-register"] !== true;
   if (typeof specPath !== "string") die("missing <spec.yaml>");
   if (!emitIr && typeof outDir !== "string") die("missing -o <out-dir>");
 
@@ -702,7 +836,7 @@ async function runCompile(args: ParsedArgs): Promise<void> {
 
   let bundle: ReturnType<typeof compile>;
   try {
-    bundle = compile(yamlText);
+    bundle = compile(yamlText, { readme });
   } catch (err) {
     // compile() runs parse → lower → emit. parseSpec throws SpecParseError;
     // each target emitter throws its own TargetEmitError (e.g. an unresolvable
@@ -721,12 +855,70 @@ async function runCompile(args: ParsedArgs): Promise<void> {
   mkdirSync(absOut, { recursive: true });
   for (const file of bundle.files) {
     const fullPath = join(absOut, file.path);
+    // Item 42 — never silently clobber a USER-AUTHORED README.md. A README
+    // we generated earlier carries GENERATED_README_MARKER and is refreshed
+    // like any other bundle file; one without the marker is kept, with a
+    // notice (pass --no-readme to silence).
+    if (file.path === "README.md" && existsSync(fullPath)) {
+      let existing: string;
+      try {
+        existing = readFileSync(fullPath, "utf-8");
+      } catch {
+        existing = "";
+      }
+      if (!existing.includes(GENERATED_README_MARKER)) {
+        process.stdout.write(
+          `kept ${fullPath} (not generated by crewhaus — pass --no-readme to skip README emission)\n`,
+        );
+        continue;
+      }
+    }
     mkdirSync(dirname(fullPath), { recursive: true });
     writeFileSync(fullPath, file.content);
     process.stdout.write(`wrote ${fullPath}\n`);
   }
   process.stdout.write(`compiled bundle (${bundle.files.length} file(s)) → ${absOut}\n`);
+  // Item 46 — auto-register the just-compiled spec in the local registry so
+  // registry state tracks working files without a manual `crewhaus spec put`.
+  // Bundle mode only: --emit-ir streams JSON to stdout, which a status line
+  // would corrupt. Runs AFTER the success line — a compile that failed never
+  // registers.
+  if (register) await autoRegisterSpec(yamlText);
   logger.debug("compile.success", { files: bundle.files.length, out: absOut });
+}
+
+/**
+ * Item 46 — shared auto-register hook for `compile` and `optimize
+ * --write-back` (wiring only; the logic lives in ./spec-changelog). Content-
+ * hash gated: prints one quiet line — `registered <name>@<vN>` on a new put,
+ * `unchanged <name>@<v>` when some stored version already carries this exact
+ * content. Registration is a convenience, not a gate: any failure warns on
+ * stderr and never fails the parent command.
+ */
+async function autoRegisterSpec(
+  yamlText: string,
+  hooks: { patchJsonPath?: string } = {},
+): Promise<void> {
+  try {
+    const specName = parseSpec(yamlText).name;
+    const rootDir = join(process.cwd(), ".crewhaus", "specs");
+    const { createFileBackedRegistry } = await import("@crewhaus/spec-registry");
+    const { autoRegisterSpecVersion } = await import("./spec-changelog");
+    const result = await autoRegisterSpecVersion({
+      registry: createFileBackedRegistry({ rootDir }),
+      registryRootDir: rootDir,
+      specName,
+      yaml: yamlText,
+      // Default patch.json resolution for changelog provenance: the header's
+      // runId under the standard optimize root (cwd-relative, matching where
+      // `crewhaus optimize` writes when -o is omitted).
+      optimizeRootDir: join(process.cwd(), ".crewhaus", "optimize"),
+      ...(hooks.patchJsonPath !== undefined ? { patchJsonPath: hooks.patchJsonPath } : {}),
+    });
+    process.stdout.write(`${result.status} ${result.name}@${result.version}\n`);
+  } catch (err) {
+    process.stderr.write(`[register] skipped: ${(err as Error).message}\n`);
+  }
 }
 
 /**
@@ -1500,6 +1692,16 @@ async function runDoctor(args: ParsedArgs): Promise<void> {
     reason: existsSync(specPath) ? undefined : `not found at ${specPath} — run \`crewhaus init\``,
   });
 
+  // Item 34 — audit-log integrity. When the cwd carries a `.crewhaus/audit`
+  // store (the run path's justification gate writes one by default), walk the
+  // hash chain so doctor surfaces tampering. Skipped entirely when no store
+  // exists — a fresh checkout must not warn about a log it never wrote.
+  const auditDir = join(process.cwd(), ".crewhaus", "audit");
+  if (existsSync(auditDir)) {
+    const { verify: verifyAuditLog } = await import("@crewhaus/audit-log");
+    checks.push(buildAuditIntegrityCheck(await verifyAuditLog(auditDir)));
+  }
+
   for (const c of checks) {
     if (c.warn && c.pass) {
       process.stdout.write(`~ ${c.label}: ${c.reason ?? "informational"}\n`);
@@ -1690,7 +1892,7 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
     process.stdout.write(
       "usage: crewhaus optimize <spec.yaml> (--dataset <data> --graders <graders.yaml> | --ratings <session>) " +
         "[--min-score F] [--mutator rule-based|claude] [--iterations N] [--seed N] [--concurrency N] " +
-        "[--improvement-threshold F] [--budget-usd N] [--write-back] [--no-pin-regressions] [--no-retry] [-o <out-dir>]\n" +
+        "[--improvement-threshold F] [--budget-usd N] [--write-back] [--no-register] [--no-pin-regressions] [--no-retry] [-o <out-dir>]\n" +
         "  --dataset takes a file path or registry:<name>[@version][#split] (Section 29 registry;\n" +
         "  default version: latest). A registry record with populated train AND dev splits is\n" +
         "  used as-is; otherwise the selected samples get the inline 70/30 split. The test\n" +
@@ -1707,7 +1909,11 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
         "  (bad gold) are excluded from the failure signal the mutator sees. Contract-\n" +
         "  ambiguity inferred only from a missing gold answer stays IN the signal (on\n" +
         "  judge-graded/no-gold datasets it is the signal); both kinds collect into a\n" +
-        "  dataset-fix queue printed at the end of the run.\n",
+        "  dataset-fix queue printed at the end of the run.\n" +
+        "  A successful --write-back auto-registers the rewritten spec in the local\n" +
+        "  registry (.crewhaus/specs) with a changelog entry carrying the run's\n" +
+        "  score delta and patch rationale — same flow as `crewhaus compile`;\n" +
+        "  --no-register opts out. See `crewhaus spec log <name>`.\n",
     );
     return;
   }
@@ -2083,6 +2289,16 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
   if (result.applied) {
     if (result.writtenTo) {
       process.stdout.write(`[optimize] wrote patched YAML to ${result.writtenTo}\n`);
+      // Item 46 — a successful write-back changed the working spec, so run
+      // the same auto-register + changelog flow as `compile`. Re-read the
+      // written file (it now carries the formatWriteBackHeader stamp the
+      // changelog distills) and pass this run's own patch.json explicitly —
+      // a custom -o relocates it away from .crewhaus/optimize/<runId>/.
+      if (args.flags["no-register"] !== true) {
+        await autoRegisterSpec(readFileSync(result.writtenTo, "utf-8"), {
+          patchJsonPath: join(result.outDir, "patch.json"),
+        });
+      }
     } else {
       process.stdout.write(
         `[optimize] patch ready (improvement ≥ ${improvementThreshold}). Re-run with --write-back to apply.\n`,
@@ -2848,9 +3064,54 @@ async function runDatasetsPut(args: ParsedArgs): Promise<void> {
  * the cost_accrual events embedded in there. Tenant aggregation lands in
  * §31's studio-server cost dashboard.
  */
+/** Per-(provider/model) cache-economics accumulator for `cost-summary`. */
+type CacheStats = {
+  inputTokens: number;
+  outputTokens: number;
+  cachedReadTokens: number;
+  cacheCreationTokens: number;
+};
+
+/** Cache hit ratio = cachedReadTokens / (inputTokens + cachedReadTokens); 0 when no input observed. */
+function cacheHitRatio(s: CacheStats): number {
+  const denominator = s.inputTokens + s.cachedReadTokens;
+  return denominator === 0 ? 0 : s.cachedReadTokens / denominator;
+}
+
+/**
+ * Realized savings for one provider/model bucket, repriced from the current
+ * DEFAULT_PRICING (the accrual carries `(provider, modelId)` — exactly the
+ * `resolvePricing` key). Unknown provider/model → undefined (savings cannot
+ * be priced; tokens and hit ratio still report).
+ */
+function cacheSavingsMicros(provider: string, modelId: string, s: CacheStats): number | undefined {
+  const row = resolvePricing(DEFAULT_PRICING, provider as ProviderId, modelId);
+  if (!row) return undefined;
+  return computeCacheSavingsMicros(row, s.cachedReadTokens, s.cacheCreationTokens);
+}
+
+function formatCacheLine(s: CacheStats, savings: number | undefined): string {
+  const hitPct = (cacheHitRatio(s) * 100).toFixed(1);
+  const savingsStr = savings === undefined ? "n/a" : `$${(savings / 1_000_000).toFixed(4)}`;
+  return (
+    `read=${s.cachedReadTokens} write=${s.cacheCreationTokens} ` +
+    `hit=${hitPct}% savings=${savingsStr}`
+  );
+}
+
 async function runCostSummary(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
-    process.stdout.write("usage: crewhaus cost-summary --session <id> [--format json|text]\n");
+    process.stdout.write(
+      "usage: crewhaus cost-summary --session <id> [--format json|text]\n" +
+        "\n" +
+        "cache economics columns (per provider/model and total):\n" +
+        "  read     prompt-cache READ tokens (billed at the discounted cached rate)\n" +
+        "  write    prompt-cache WRITE tokens (billed at a premium over input)\n" +
+        "  hit      cache hit ratio = cachedReadTokens / (inputTokens + cachedReadTokens)\n" +
+        "  savings  realized savings = (cached reads at the full input price)\n" +
+        "           - (cached reads at the discounted rate)\n" +
+        "           - (cache-write premium paid above the normal input price)\n",
+    );
     return;
   }
   const session = args.flags["session"];
@@ -2867,6 +3128,14 @@ async function runCostSummary(args: ParsedArgs): Promise<void> {
   let totalMicros = 0;
   const byProvider: Record<string, number> = {};
   let count = 0;
+  const totalCache: CacheStats = {
+    inputTokens: 0,
+    outputTokens: 0,
+    cachedReadTokens: 0,
+    cacheCreationTokens: 0,
+  };
+  // Keyed "provider/modelId"; insertion order == first-seen order, stable for output.
+  const byModel = new Map<string, { provider: string; modelId: string; stats: CacheStats }>();
   for (const raw of lines) {
     let parsed: unknown;
     try {
@@ -2882,25 +3151,96 @@ async function runCostSummary(args: ParsedArgs): Promise<void> {
     ) {
       // event-log writes a `{ ts, version, kind, payload }` envelope, so the
       // cost fields live under `payload`. Fall back to top-level fields so a
-      // hand-written/flat cost_accrual line still aggregates.
-      const e = parsed as {
+      // hand-written/flat cost_accrual line still aggregates. Every token
+      // field is optional — logs persisted before cache economics landed
+      // carry only provider/costUsdMicros (or no cacheCreationTokens) and
+      // must keep parsing.
+      type AccrualFields = {
         provider?: string;
+        modelId?: string;
         costUsdMicros?: number;
-        payload?: { provider?: string; costUsdMicros?: number };
+        inputTokens?: number;
+        outputTokens?: number;
+        cachedReadTokens?: number;
+        cacheCreationTokens?: number;
       };
+      const e = parsed as AccrualFields & { payload?: AccrualFields };
       const provider = e.payload?.provider ?? e.provider;
       const micros = e.payload?.costUsdMicros ?? e.costUsdMicros;
       if (typeof provider === "string" && typeof micros === "number") {
         totalMicros += micros;
         byProvider[provider] = (byProvider[provider] ?? 0) + micros;
         count++;
+        const modelId = e.payload?.modelId ?? e.modelId;
+        const delta: CacheStats = {
+          inputTokens: e.payload?.inputTokens ?? e.inputTokens ?? 0,
+          outputTokens: e.payload?.outputTokens ?? e.outputTokens ?? 0,
+          cachedReadTokens: e.payload?.cachedReadTokens ?? e.cachedReadTokens ?? 0,
+          cacheCreationTokens: e.payload?.cacheCreationTokens ?? e.cacheCreationTokens ?? 0,
+        };
+        totalCache.inputTokens += delta.inputTokens;
+        totalCache.outputTokens += delta.outputTokens;
+        totalCache.cachedReadTokens += delta.cachedReadTokens;
+        totalCache.cacheCreationTokens += delta.cacheCreationTokens;
+        if (typeof modelId === "string") {
+          const key = `${provider}/${modelId}`;
+          const bucket = byModel.get(key) ?? {
+            provider,
+            modelId,
+            stats: { inputTokens: 0, outputTokens: 0, cachedReadTokens: 0, cacheCreationTokens: 0 },
+          };
+          bucket.stats.inputTokens += delta.inputTokens;
+          bucket.stats.outputTokens += delta.outputTokens;
+          bucket.stats.cachedReadTokens += delta.cachedReadTokens;
+          bucket.stats.cacheCreationTokens += delta.cacheCreationTokens;
+          byModel.set(key, bucket);
+        }
       }
     }
   }
+  // Total savings = Σ per-model savings (rates are per-model, so pricing must
+  // resolve per bucket). Unpriced buckets contribute nothing — same "miss ⇒
+  // $0, never crash" contract as the tracker itself.
+  let totalSavings = 0;
+  const modelRows: Array<{
+    key: string;
+    stats: CacheStats;
+    savings: number | undefined;
+  }> = [];
+  for (const [key, { provider, modelId, stats }] of byModel) {
+    const savings = cacheSavingsMicros(provider, modelId, stats);
+    if (savings !== undefined) totalSavings += savings;
+    modelRows.push({ key, stats, savings });
+  }
   const totalDollars = totalMicros / 1_000_000;
   if (format === "json") {
+    // Additive fields only — `session`/`count`/`totalUsdMicros`/`byProvider`
+    // keep their exact pre-cache-economics shape.
+    const cacheByModel: Record<
+      string,
+      CacheStats & { cacheHitRatio: number; cacheSavingsUsdMicros: number | null }
+    > = {};
+    for (const row of modelRows) {
+      cacheByModel[row.key] = {
+        ...row.stats,
+        cacheHitRatio: cacheHitRatio(row.stats),
+        cacheSavingsUsdMicros: row.savings ?? null,
+      };
+    }
     process.stdout.write(
-      `${JSON.stringify({ session, count, totalUsdMicros: totalMicros, byProvider })}\n`,
+      `${JSON.stringify({
+        session,
+        count,
+        totalUsdMicros: totalMicros,
+        byProvider,
+        inputTokens: totalCache.inputTokens,
+        outputTokens: totalCache.outputTokens,
+        cachedReadTokens: totalCache.cachedReadTokens,
+        cacheCreationTokens: totalCache.cacheCreationTokens,
+        cacheHitRatio: cacheHitRatio(totalCache),
+        cacheSavingsUsdMicros: totalSavings,
+        cacheByModel,
+      })}\n`,
     );
   } else {
     process.stdout.write(`session: ${session}\n`);
@@ -2908,6 +3248,10 @@ async function runCostSummary(args: ParsedArgs): Promise<void> {
     process.stdout.write(`total: $${totalDollars.toFixed(4)}\n`);
     for (const [p, m] of Object.entries(byProvider)) {
       process.stdout.write(`  ${p}: $${(m / 1_000_000).toFixed(4)}\n`);
+    }
+    process.stdout.write(`cache: ${formatCacheLine(totalCache, totalSavings)}\n`);
+    for (const row of modelRows) {
+      process.stdout.write(`  ${row.key}: ${formatCacheLine(row.stats, row.savings)}\n`);
     }
   }
 }
@@ -3250,6 +3594,145 @@ function distillRatings(
   return { samples, gradersYaml: gradersConfigToYaml(result.graders) };
 }
 
+// -------- state backup / restore (item 69) --------
+
+/** Label for the default backup file name: the cwd spec's harness name when
+ *  a parseable crewhaus.yaml is present, else the cwd basename. */
+function stateBackupLabel(): string {
+  const specPath = join(process.cwd(), "crewhaus.yaml");
+  if (existsSync(specPath)) {
+    try {
+      return parseSpec(readFileSync(specPath, "utf-8")).name;
+    } catch {
+      // Unparseable spec — fall through to the directory name.
+    }
+  }
+  return basename(process.cwd());
+}
+
+/**
+ * Item 69 — `crewhaus state <backup|restore>`. The cwd-local `.crewhaus/`
+ * dir is a harness's entire accumulated state; `backup` snapshots it to a
+ * transportable tarball, `restore` unpacks it (full replace or additive
+ * merges). The heavy lifting lives in ./state-backup; this is flag parsing
+ * + output only, per house pattern.
+ */
+async function runState(args: ParsedArgs, action: "backup" | "restore"): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage:\n" +
+        "  crewhaus state backup [-o <file.tar.gz>] [--exclude <glob,glob>]\n" +
+        "  crewhaus state restore <file.tar.gz> [--into <dir>] [--merge feedback|all] [--force]\n" +
+        "\n" +
+        "backup: archive the cwd .crewhaus/ state dir (sessions, feedback,\n" +
+        "  memories, datasets, spec registry, optimize runs, durable-state\n" +
+        "  sqlite) to a gzipped tarball. Default name:\n" +
+        "  crewhaus-state-<harnessname-or-dir>-<date>.tar.gz. The archive\n" +
+        "  carries a backup-manifest.json (created ts, source dir, crewhaus\n" +
+        "  version, per-subdir file/byte counts). sqlite files are snapshotted\n" +
+        "  via a read-only bun:sqlite serialize so a live writer cannot tear\n" +
+        "  the copy; if a snapshot fails the raw bytes are copied and the\n" +
+        "  manifest records sqliteConsistent: false. Source files are never\n" +
+        "  modified.\n" +
+        "  --exclude   comma-separated globs matched against paths relative to\n" +
+        "              .crewhaus; a bare pattern also matches file/dir names\n" +
+        '              anywhere (e.g. --exclude "sessions,*.sqlite").\n' +
+        "\n" +
+        "restore: unpack a backup into <dir>/.crewhaus (default: cwd). By\n" +
+        "  default it REFUSES to overwrite an existing non-empty .crewhaus.\n" +
+        "  --force            full replace — the existing dir is first moved\n" +
+        "                     aside to .crewhaus.bak-<ts>, never deleted\n" +
+        "  --merge feedback   fold ONLY the archive's feedback records\n" +
+        "                     (session user_feedback events + feedback/*.jsonl)\n" +
+        "                     into the local store, deduped per (session, turn)\n" +
+        "                     with the same merge `crewhaus distill` uses —\n" +
+        "                     closes the deployed-bot feedback transport gap\n" +
+        "  --merge all        additive per-file copy: only files that don't\n" +
+        "                     exist locally are written; existing files are\n" +
+        "                     skipped (and reported)\n" +
+        "\n" +
+        "out of scope (by design): S3/R2 upload — sync the tarball with your\n" +
+        "  own tooling (aws s3 cp, rclone, …); scheduled backups — pair with\n" +
+        "  cron for now (a templates/ convention is landing separately).\n",
+    );
+    return;
+  }
+
+  if (action === "backup") {
+    const excludeGlobs = parseExcludeGlobs(strFlag(args, "exclude"));
+    const outFile = resolve(
+      strFlag(args, "out") ?? defaultBackupFileName(stateBackupLabel(), new Date()),
+    );
+    try {
+      const result = await createStateBackup({
+        stateDir: join(process.cwd(), ".crewhaus"),
+        outFile,
+        excludeGlobs,
+        crewhausVersion: cliVersion() ?? "unknown",
+      });
+      for (const w of result.warnings) process.stderr.write(`[state] warning: ${w}\n`);
+      if (result.excluded.length > 0) {
+        process.stdout.write(`[state] excluded ${result.excluded.length} file(s) via --exclude\n`);
+      }
+      const { totals } = result.manifest;
+      process.stdout.write(
+        `backed up ${totals.files} file(s) (${totals.bytes} bytes) → ${result.outFile}\n`,
+      );
+    } catch (err) {
+      if (err instanceof StateBackupError) die(err.message);
+      throw err;
+    }
+    return;
+  }
+
+  const archive = args.positional[0];
+  if (typeof archive !== "string") die("missing <file.tar.gz>");
+  const archiveFile = resolve(archive);
+  const intoDir = strFlag(args, "into") ?? process.cwd();
+  const merge = strFlag(args, "merge");
+  const force = args.flags["force"] === true;
+  if (merge !== undefined && force) {
+    die("--merge and --force are mutually exclusive (merge is additive; force replaces)");
+  }
+  if (merge !== undefined && merge !== "feedback" && merge !== "all") {
+    die(`invalid --merge "${merge}" — expected "feedback" or "all"`);
+  }
+
+  try {
+    if (merge === "feedback") {
+      const r = await mergeFeedbackFromArchive({ archiveFile, intoDir });
+      process.stdout.write(
+        `[state] ${r.archivedRecords} archived feedback record(s): ` +
+          `${r.added} new, ${r.updated} updated fold(s), ${r.unchanged} already present (deduped)\n`,
+      );
+      if (r.wroteFile !== undefined) {
+        process.stdout.write(`merged feedback → ${r.wroteFile}\n`);
+      } else {
+        process.stdout.write("nothing to merge — the local store already has it all\n");
+      }
+    } else if (merge === "all") {
+      const r = await mergeAllFromArchive({ archiveFile, intoDir });
+      for (const rel of r.skipped) {
+        process.stdout.write(`[state] skipped ${rel} (exists locally — kept)\n`);
+      }
+      process.stdout.write(
+        `merged ${r.copied.length} new file(s) into ${r.stateDir} ` +
+          `(${r.skipped.length} existing file(s) kept)\n`,
+      );
+    } else {
+      const r = await restoreStateArchive({ archiveFile, intoDir, force });
+      for (const w of r.warnings) process.stderr.write(`[state] warning: ${w}\n`);
+      if (r.movedAsideTo !== undefined) {
+        process.stdout.write(`moved existing state aside → ${r.movedAsideTo}\n`);
+      }
+      process.stdout.write(`restored ${r.filesRestored} file(s) → ${r.stateDir}\n`);
+    }
+  } catch (err) {
+    if (err instanceof StateBackupError) die(err.message);
+    throw err;
+  }
+}
+
 /**
  * Section 27 — `crewhaus secrets <action> <name> [opts]`. Two actions:
  *   doctor                 list configured secrets and report missing
@@ -3315,7 +3798,9 @@ async function runSecrets(args: ParsedArgs, action: string): Promise<void> {
 
 /**
  * Section 28 — `crewhaus spec <action> ...` subcommands wrap the
- * spec-registry. Actions: put / get / list / pin / alias.
+ * spec-registry. Actions: put / get / list / pin / alias / log (item 46 —
+ * render the per-spec CHANGELOG.md that auto-registration and `put` keep
+ * beside the registry manifest, newest entry first).
  */
 async function runSpec(args: ParsedArgs, action: string): Promise<void> {
   if (args.flags["help"]) {
@@ -3325,7 +3810,9 @@ async function runSpec(args: ParsedArgs, action: string): Promise<void> {
         "  crewhaus spec list <name>                                   list versions\n" +
         "  crewhaus spec get <name> <version>                          print yaml\n" +
         "  crewhaus spec pin <name> <env> <version> [--tenant <id>]   pin env → version\n" +
-        "  crewhaus spec alias <name> <env> [--tenant <id>]            resolve env → version\n",
+        "  crewhaus spec alias <name> <env> [--tenant <id>]            resolve env → version\n" +
+        "  crewhaus spec log <name> [--root-dir <dir>]                 print the changelog (newest first;\n" +
+        '                                                              display names sanitize as on compile: "My Agent" → My-Agent)\n',
     );
     return;
   }
@@ -3345,8 +3832,60 @@ async function runSpec(args: ParsedArgs, action: string): Promise<void> {
     if (typeof version !== "string") die("missing <version>");
     if (typeof filePath !== "string") die("missing <spec.yaml>");
     const yaml = readFileSync(resolve(filePath), "utf-8");
+    // Item 46 — capture the previous latest version (manifest order) BEFORE
+    // the put so the changelog entry carries a field-level diff against it.
+    const { appendChangelogEntry } = await import("./spec-changelog");
+    const prior = await reg.manifest(name);
+    const prevVersion = prior.versions[prior.versions.length - 1];
+    let previousYaml: string | undefined;
+    if (prevVersion !== undefined) {
+      try {
+        previousYaml = await reg.get(name, prevVersion);
+      } catch {
+        // Manifest-listed version whose file vanished — entry is diff-less.
+      }
+    }
     await reg.put(name, version, yaml);
+    appendChangelogEntry({
+      registryRootDir: rootDir,
+      name,
+      version,
+      yaml,
+      ...(previousYaml !== undefined ? { previousYaml } : {}),
+      optimizeRootDir: join(process.cwd(), ".crewhaus", "optimize"),
+    });
     process.stdout.write(`stored ${name}@${version} (${yaml.length} bytes)\n`);
+    return;
+  }
+  if (action === "log") {
+    const rawName = args.positional[0];
+    if (typeof rawName !== "string") die("missing <name>");
+    // Item 46 (review F3): compile/write-back auto-registration stores under
+    // the SANITIZED registry grammar (`registrySpecName("My Agent")` →
+    // `My-Agent`), so the lookup must run the same sanitation or a display
+    // name dies here while its changelog sits one transform away. Names
+    // already in the registry grammar (every `spec put` name) pass through
+    // unchanged.
+    const { registrySpecName } = await import("./spec-changelog");
+    const name = registrySpecName(rawName);
+    if (name !== rawName) {
+      process.stdout.write(`showing log for ${name} (sanitized from "${rawName}")\n`);
+    }
+    // Validate the name through the registry's own grammar (same floor as
+    // put/get) so a crafted name can't path-traverse out of the root.
+    try {
+      await reg.manifest(name);
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
+    const changelogPath = join(rootDir, name, "CHANGELOG.md");
+    if (!existsSync(changelogPath)) {
+      die(
+        `no changelog for "${name}" — nothing registered yet (compile the spec or \`crewhaus spec put\` first)`,
+      );
+    }
+    process.stdout.write(readFileSync(changelogPath, "utf-8"));
     return;
   }
   if (action === "list") {
@@ -3393,7 +3932,7 @@ async function runSpec(args: ParsedArgs, action: string): Promise<void> {
     process.stdout.write(`${v}\n`);
     return;
   }
-  die(`unknown spec action "${action}" (expected: put | list | get | pin | alias)`);
+  die(`unknown spec action "${action}" (expected: put | list | get | pin | alias | log)`);
 }
 
 /**
@@ -3661,6 +4200,69 @@ async function runFederation(rest: ReadonlyArray<string>): Promise<void> {
 }
 
 /**
+ * Item 34 — `crewhaus audit verify` walks the hash-chained audit log at
+ * `.crewhaus/audit` (the same store the `run` justification gate writes and
+ * `compliance evidence` reads) via `@crewhaus/audit-log`'s `verify()`,
+ * prints a per-check summary, and exits non-zero on any tamper finding.
+ * `--anchor file:<path>` additionally cross-checks the chain tip against a
+ * file-backed AnchorStore; a requested anchor that could NOT be consulted
+ * also exits 1 (a scheduled tamper check must not silently skip its
+ * strongest witness). Designed as a cron/CI tripwire.
+ */
+async function runAuditVerify(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus audit verify [--dir <auditDir>] [--anchor file:<path>]\n" +
+        "  Walks every day file of the hash-chained audit log, verifying each\n" +
+        "  record's hash, the prevHash links, the gapless seq run from 0, and\n" +
+        "  the on-host _chain-tail.json anchor (tail-truncation detection).\n" +
+        "  --dir <auditDir>       audit log root (default: ./.crewhaus/audit)\n" +
+        "  --anchor file:<path>   also cross-check the append-only file anchor\n" +
+        "                         store at <path> (mirror of the tail written\n" +
+        "                         when the log was opened with a FileAnchorStore)\n" +
+        "  Exit code: 0 intact; 1 on any tamper finding, or when a requested\n" +
+        "  --anchor store held no anchor to cross-check.\n",
+    );
+    return;
+  }
+  const dirFlag = args.flags["dir"];
+  const auditDir =
+    typeof dirFlag === "string" ? resolve(dirFlag) : join(process.cwd(), ".crewhaus", "audit");
+
+  let anchorChoice: AnchorFlagChoice | undefined;
+  try {
+    const anchorFlag = args.flags["anchor"];
+    anchorChoice = resolveAnchorFlag(typeof anchorFlag === "string" ? anchorFlag : undefined);
+  } catch (err) {
+    if (err instanceof InvalidAnchorFlagError) die(err.message);
+    throw err;
+  }
+
+  const auditLog = await import("@crewhaus/audit-log");
+  // verify() defaults logId to the rootDir it is given; the CLI passes the
+  // resolved absolute dir, matching openAuditLog's default logId for logs
+  // opened at the same absolute root (e.g. the run path's justification sink).
+  const result = await auditLog.verify(
+    auditDir,
+    anchorChoice !== undefined
+      ? { anchorStore: new auditLog.FileAnchorStore(resolve(anchorChoice.path)) }
+      : {},
+  );
+
+  process.stdout.write(`audit verify: ${auditDir}\n`);
+  const summary = summarizeVerifyResult(result, {
+    anchorRequested: anchorChoice !== undefined,
+  });
+  for (const line of summary.lines) {
+    process.stdout.write(`  ${line}\n`);
+  }
+  process.stdout.write(
+    summary.exitCode === 0 ? "\naudit log intact.\n" : "\naudit verification FAILED.\n",
+  );
+  if (summary.exitCode !== 0) process.exit(1);
+}
+
+/**
  * Section 39 — `crewhaus compliance evidence` collects SOC 2 / ISO 27001 /
  * HIPAA evidence bundles by walking an audit-log root and writing signed
  * bundles to `.crewhaus/compliance/<framework>/<controlId>/<period>.json`.
@@ -3669,13 +4271,29 @@ async function runFederation(rest: ReadonlyArray<string>): Promise<void> {
  *   crewhaus compliance evidence --framework soc2 --period 2026-Q2 \
  *     [--control CC6.1] [--audit-dir <d>] [--out-dir <d>] \
  *     [--signing-key-env CREWHAUS_COMPLIANCE_SIGNING_KEY]
+ *
+ * Item 34 scheduling ergonomics: `--period current` resolves the current UTC
+ * quarter and `--all-frameworks` loops every registered framework, so one
+ * cron line can collect everything, every quarter. A control that collects 0
+ * records is always REPORTED as an evidence gap; with `--fail-on-empty` it
+ * also fails the run (exit 1) so a scheduled run trips loudly instead of
+ * hiding the gap until audit time. The default stays exit 0 with a warning
+ * (ops-review F4): bare `crewhaus compliance evidence ...` invocations are
+ * documented externally and must not start failing on quiet periods.
  */
 async function runCompliance(args: ParsedArgs, action: string): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
       "usage:\n" +
-        "  crewhaus compliance evidence --framework <id> [--control <id>] --period <p>\n" +
-        "    [--audit-dir <d>] [--out-dir <d>] [--signing-key-env <ENV>]\n",
+        "  crewhaus compliance evidence (--framework <id> | --all-frameworks)\n" +
+        "    [--control <id>] --period <p>|current [--audit-dir <d>] [--out-dir <d>]\n" +
+        "    [--signing-key-env <ENV>] [--fail-on-empty]\n" +
+        '  --period current    resolve the current UTC quarter (e.g. "2026-Q3") so a\n' +
+        "                      scheduled run never hardcodes a stale label\n" +
+        "  --all-frameworks    collect every registered framework in one run\n" +
+        "  --fail-on-empty     exit 1 when any control collected 0 records — the\n" +
+        "                      tripwire for scheduled/cron runs. Default: exit 0 with\n" +
+        "                      a warning naming each empty control (evidence gap)\n",
     );
     return;
   }
@@ -3683,9 +4301,22 @@ async function runCompliance(args: ParsedArgs, action: string): Promise<void> {
     die(`unknown compliance action "${action}" (expected: evidence)`);
   }
   const frameworkFlag = args.flags["framework"];
+  const allFrameworks = args.flags["all-frameworks"] === true;
+  const controlFlag = args.flags["control"];
   const periodFlag = args.flags["period"];
-  if (typeof frameworkFlag !== "string") die("--framework <id> is required");
-  if (typeof periodFlag !== "string") die("--period <p> is required");
+  if (typeof frameworkFlag === "string" && allFrameworks) {
+    die("--framework and --all-frameworks are mutually exclusive");
+  }
+  if (typeof frameworkFlag !== "string" && !allFrameworks) {
+    die("--framework <id> is required (or pass --all-frameworks)");
+  }
+  if (allFrameworks && typeof controlFlag === "string") {
+    die("--control is framework-specific — it cannot combine with --all-frameworks");
+  }
+  if (typeof periodFlag !== "string") {
+    die('--period <p> is required (accepts "current" for the current UTC quarter)');
+  }
+  const period = resolvePeriodFlag(periodFlag);
 
   const auditDirFlag = args.flags["audit-dir"];
   const outDirFlag = args.flags["out-dir"];
@@ -3719,27 +4350,53 @@ async function runCompliance(args: ParsedArgs, action: string): Promise<void> {
   };
 
   const collector = createComplianceCollector({ auditSource, outputDir: outDir });
-  const controlFlag = args.flags["control"];
 
+  // --all-frameworks loops every framework the registered controls span (the
+  // built-ins today: soc2, iso27001, hipaa — plus anything registered on top),
+  // derived from the collector itself so the flag never drifts from the
+  // package's actual coverage.
+  const frameworks = allFrameworks
+    ? [...new Set(collector.listControls().map((c) => c.frameworkId))].sort()
+    : [frameworkFlag as string];
+
+  const collectOpts = {
+    period,
+    ...(signingKey !== undefined ? { signingKey } : {}),
+  };
   type EvidenceBundle = Awaited<ReturnType<typeof collector.collect>>;
-  let bundles: EvidenceBundle[] | ReadonlyArray<EvidenceBundle>;
+  const bundles: EvidenceBundle[] = [];
   if (typeof controlFlag === "string") {
-    const single = await collector.collect(frameworkFlag, controlFlag, {
-      period: periodFlag,
-      ...(signingKey !== undefined ? { signingKey } : {}),
-    });
-    bundles = [single];
+    // Mutual exclusion above guarantees exactly one framework here.
+    bundles.push(await collector.collect(frameworks[0] as string, controlFlag, collectOpts));
   } else {
-    bundles = await collector.collectAll(frameworkFlag, {
-      period: periodFlag,
-      ...(signingKey !== undefined ? { signingKey } : {}),
-    });
+    for (const framework of frameworks) {
+      bundles.push(...(await collector.collectAll(framework, collectOpts)));
+    }
   }
 
   for (const b of bundles) {
     const path = collector.writeBundle(b);
     process.stdout.write(
-      `${b.frameworkId}/${b.controlId} ${periodFlag}: ${b.recordCount} records → ${path}\n`,
+      `${b.frameworkId}/${b.controlId} ${period}: ${b.recordCount} records → ${path}\n`,
+    );
+  }
+
+  // Item 34 / ops-review F4 — the empty-evidence gate. A control that
+  // collected 0 records is a gap an auditor cannot be shown evidence for, so
+  // it is ALWAYS reported. `--fail-on-empty` (the scheduled/cron tripwire —
+  // the shipped compliance-evidence.yml template passes it) turns the report
+  // into exit 1 so the gap trips the schedule NOW instead of surfacing at
+  // audit time; the bare-invocation default stays exit 0 with a warning, so
+  // externally documented interactive usage keeps working. Bundles are still
+  // written above either way (the non-empty ones remain valid evidence).
+  const empty = findEmptyControls(bundles);
+  if (empty.length > 0) {
+    const gap = `evidence gap — ${empty.length} control(s) collected 0 records for ${period}: ${empty.join(", ")}`;
+    if (args.flags["fail-on-empty"] === true) {
+      die(`${gap} (--fail-on-empty)`);
+    }
+    process.stderr.write(
+      `crewhaus: warning: ${gap} (pass --fail-on-empty to make this fail scheduled runs)\n`,
     );
   }
 }
@@ -3807,6 +4464,122 @@ async function runSandbox(args: ParsedArgs, action: string): Promise<void> {
   }
 }
 
+/**
+ * Item 35 — `crewhaus retention <action>`: scheduled GDPR/TTL enforcement
+ * over a harness directory's two on-disk stores.
+ *
+ *   sweep  [--dry-run]        delete expired sessions (mtime-keyed, same rule
+ *                             as session-store's list() eviction), honoring
+ *                             `.crewhaus/retention.json` pins + audit windows.
+ *   export <outDir> [--since] right-to-export: copy matching records out as
+ *          [--dry-run]        raw files (originals untouched).
+ *   purge  [--before <date>]  right-to-delete: same rules as sweep, restricted
+ *          [--dry-run]        to records older than the cutoff.
+ *
+ * `--dry-run` is honored by EVERY action (ops-review F1): report-only, no
+ * deletion, no files written, no audit evidence. Filter flags are per-action
+ * (`--since` export-only, `--before` purge-only) and rejected — never
+ * silently ignored — elsewhere.
+ *
+ * Audit data (`.crewhaus/audit`) is enumerated + exportable but NEVER deleted:
+ * audit-log's verify() hash chain spans every day file, so deleting any record
+ * or day file — even the oldest — breaks tamper verification of everything
+ * after it (see retention.ts, HarnessRecordStore.delete). Real (non-dry-run)
+ * runs append a `retention_enforcement` record to `.crewhaus/audit`, so
+ * enforcement itself is tamper-evidenced. Designed as a cron target; the
+ * heavy lifting lives in retention.ts so a daemon janitor can call it too.
+ */
+async function runRetention(args: ParsedArgs, action: string): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage:\n" +
+        "  crewhaus retention sweep [--dry-run] [--dir <root>]\n" +
+        "  crewhaus retention export <outDir> [--since <date>] [--dry-run] [--dir <root>]\n" +
+        "  crewhaus retention purge [--before <date>] [--dry-run] [--dir <root>]\n" +
+        "  Enforces .crewhaus/retention.json over the harness stores:\n" +
+        "    sessions (.crewhaus/sessions)  expire by file mtime after sessions.maxAgeDays\n" +
+        "                                   (default 30, session-store's TTL); pinned ids survive\n" +
+        "    audit (.crewhaus/audit)        NEVER deleted — verify()'s hash chain spans every\n" +
+        "                                   day file, so any deletion breaks tamper verification.\n" +
+        "                                   Export-only.\n" +
+        "  Active auditWindows in the config defer ALL deletion. Real runs append a\n" +
+        "  retention_enforcement record to .crewhaus/audit; --dry-run appends nothing.\n" +
+        "  --dry-run          report what the action would do; touch nothing on disk\n" +
+        "                     (sweep/purge: delete nothing; export: write nothing)\n" +
+        "  --dir <root>       harness root directory (default: cwd)\n" +
+        "  --since <date>     export only: records at/after this ISO date\n" +
+        "  --before <date>    purge only: records older than this ISO date\n" +
+        "  A flag on an action that does not support it is an error, never silently\n" +
+        "  ignored (--since is export-only; --before is purge-only).\n",
+    );
+    return;
+  }
+  const dirFlag = args.flags["dir"];
+  const rootDir = typeof dirFlag === "string" ? resolve(dirFlag) : process.cwd();
+  const dryRun = args.flags["dry-run"] === true;
+  const sinceFlag = args.flags["since"];
+  const beforeFlag = args.flags["before"];
+  // Ops-review F1: an accepted-and-ignored filter flag is a trap — an
+  // operator who typed `sweep --before <date>` believed they bounded the
+  // deletion set. Unsupported combos are rejected per action.
+  if (typeof sinceFlag === "string" && action !== "export") {
+    die(
+      `--since is not supported by "retention ${action}" — it filters exports only (use "retention purge --before <date>" to bound deletion)`,
+    );
+  }
+  if (typeof beforeFlag === "string" && action !== "purge") {
+    die(
+      `--before is not supported by "retention ${action}" — it bounds purges only (use "retention export --since <date>" to filter an export)`,
+    );
+  }
+  try {
+    if (action === "sweep") {
+      const report = await runRetentionSweep({ rootDir, dryRun });
+      process.stdout.write(`retention sweep: ${rootDir}${dryRun ? " (dry run)" : ""}\n`);
+      for (const line of formatEnforcementReport(report)) {
+        process.stdout.write(`  ${line}\n`);
+      }
+      return;
+    }
+    if (action === "export") {
+      const outDir = args.positional[0];
+      if (typeof outDir !== "string") die("missing <outDir>");
+      const since =
+        typeof sinceFlag === "string" ? parseRetentionDate("--since", sinceFlag) : undefined;
+      const report = await runRetentionExport({
+        rootDir,
+        outDir,
+        dryRun,
+        ...(since !== undefined ? { since } : {}),
+      });
+      process.stdout.write(
+        `retention export: ${rootDir} → ${report.outDir}${dryRun ? " (dry run)" : ""}\n`,
+      );
+      for (const line of formatExportReport(report)) {
+        process.stdout.write(`  ${line}\n`);
+      }
+      return;
+    }
+    // Dispatch guarantees: action === "purge".
+    const before =
+      typeof beforeFlag === "string" ? parseRetentionDate("--before", beforeFlag) : undefined;
+    const report = await runRetentionPurge({
+      rootDir,
+      dryRun,
+      ...(before !== undefined ? { before } : {}),
+    });
+    process.stdout.write(`retention purge: ${rootDir}${dryRun ? " (dry run)" : ""}\n`);
+    for (const line of formatEnforcementReport(report)) {
+      process.stdout.write(`  ${line}\n`);
+    }
+  } catch (err) {
+    if (err instanceof RetentionConfigError || err instanceof InvalidRetentionDateError) {
+      die(err.message);
+    }
+    throw err;
+  }
+}
+
 const argv = process.argv.slice(2);
 const subcommand = argv[0] ?? "";
 const rest = argv.slice(1);
@@ -3862,6 +4635,14 @@ switch (subcommand) {
   case "datasets":
     await runDatasets(parseFor(rest, DATASETS_SCHEMA));
     break;
+  case "state": {
+    const action = rest[0] ?? "";
+    if (action !== "backup" && action !== "restore") {
+      die(`state action must be "backup" or "restore" (got "${action}")`);
+    }
+    await runState(parseFor(rest.slice(1), STATE_SCHEMA), action);
+    break;
+  }
   case "secrets": {
     const action = rest[0] ?? "";
     if (action !== "doctor" && action !== "rotate") {
@@ -3872,8 +4653,8 @@ switch (subcommand) {
   }
   case "spec": {
     const action = rest[0] ?? "";
-    if (!["put", "list", "get", "pin", "alias"].includes(action)) {
-      die(`spec action must be one of: put, list, get, pin, alias (got "${action}")`);
+    if (!["put", "list", "get", "pin", "alias", "log"].includes(action)) {
+      die(`spec action must be one of: put, list, get, pin, alias, log (got "${action}")`);
     }
     await runSpec(parseFor(rest.slice(1), SPEC_SCHEMA), action);
     break;
@@ -3922,6 +4703,22 @@ switch (subcommand) {
       die(`compliance action must be "evidence" (got "${action}")`);
     }
     await runCompliance(parseFor(rest.slice(1), COMPLIANCE_SCHEMA), action);
+    break;
+  }
+  case "audit": {
+    const action = rest[0] ?? "";
+    if (action !== "verify") {
+      die(`audit action must be "verify" (got "${action}")`);
+    }
+    await runAuditVerify(parseFor(rest.slice(1), AUDIT_SCHEMA));
+    break;
+  }
+  case "retention": {
+    const action = rest[0] ?? "";
+    if (action !== "sweep" && action !== "export" && action !== "purge") {
+      die(`retention action must be one of: sweep, export, purge (got "${action}")`);
+    }
+    await runRetention(parseFor(rest.slice(1), RETENTION_SCHEMA), action);
     break;
   }
   case "version":

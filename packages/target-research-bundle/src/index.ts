@@ -28,7 +28,12 @@
  */
 import { CrewhausError } from "@crewhaus/errors";
 import { escapeJsonString } from "@crewhaus/infra-utils";
-import type { Bundle, IrResearchV0 } from "@crewhaus/ir";
+import {
+  type Bundle,
+  type EmitReadmeOptions,
+  type IrResearchV0,
+  renderBundleReadme,
+} from "@crewhaus/ir";
 
 export class TargetEmitError extends CrewhausError {
   override readonly name = "TargetEmitError";
@@ -138,8 +143,14 @@ function renderPermissionsField(ir: IrResearchV0): string {
   return `\n${lines.join("\n")}`;
 }
 
-export function emitResearchBundle(ir: IrResearchV0): Bundle {
-  return { files: [{ path: "agent.ts", content: renderAgent(ir) }] };
+export function emitResearchBundle(ir: IrResearchV0, opts: EmitReadmeOptions = {}): Bundle {
+  const files = [{ path: "agent.ts", content: renderAgent(ir) }];
+  // Item 42 — generated bundle README; default ON (`crewhaus compile
+  // --no-readme` opts out).
+  if (opts.readme !== false) {
+    files.push({ path: "README.md", content: renderBundleReadme(ir) });
+  }
+  return { files };
 }
 
 function renderAgent(ir: IrResearchV0): string {

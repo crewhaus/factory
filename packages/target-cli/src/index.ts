@@ -1,6 +1,12 @@
 import { CrewhausError } from "@crewhaus/errors";
 import { escapeJsonString } from "@crewhaus/infra-utils";
-import type { Bundle, IrSubAgentDefinition, IrV0 } from "@crewhaus/ir";
+import {
+  type Bundle,
+  type EmitReadmeOptions,
+  type IrSubAgentDefinition,
+  type IrV0,
+  renderBundleReadme,
+} from "@crewhaus/ir";
 
 /**
  * Emit a self-contained CLI agent bundle for a CLI-target IR.
@@ -15,15 +21,20 @@ import type { Bundle, IrSubAgentDefinition, IrV0 } from "@crewhaus/ir";
  * Future expansion (per catalog F2 target-cli-bundle): hooks, MCP config,
  * settings.json, multi-file output, bundling for distribution.
  */
-export function emitCli(ir: IrV0): Bundle {
-  return {
-    files: [
-      {
-        path: "agent.ts",
-        content: renderAgent(ir),
-      },
-    ],
-  };
+export function emitCli(ir: IrV0, opts: EmitReadmeOptions = {}): Bundle {
+  const files = [
+    {
+      path: "agent.ts",
+      content: renderAgent(ir),
+    },
+  ];
+  // Item 42 — generated bundle README (name/target/model, tool table, MCP
+  // servers, required env vars, launch snippet). Default ON; `crewhaus
+  // compile --no-readme` threads `readme: false` through here.
+  if (opts.readme !== false) {
+    files.push({ path: "README.md", content: renderBundleReadme(ir) });
+  }
+  return { files };
 }
 
 export class TargetEmitError extends CrewhausError {

@@ -28,6 +28,7 @@
         "@crewhaus/context-bundle": "workspace:*",
         "@crewhaus/cost-tracker": "workspace:*",
         "@crewhaus/crewhaus-cloud": "workspace:*",
+        "@crewhaus/data-retention-engine": "workspace:*",
         "@crewhaus/dataset-registry": "workspace:*",
         "@crewhaus/deployment-controller": "workspace:*",
         "@crewhaus/docker-images": "workspace:*",

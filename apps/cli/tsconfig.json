@@ -18,6 +18,7 @@
     { "path": "../../packages/compiler" },
     { "path": "../../packages/computer-use-driver" },
     { "path": "../../packages/context-bundle" },
+    { "path": "../../packages/data-retention-engine" },
     { "path": "../../packages/deployment-controller" },
     { "path": "../../packages/egress-classifier" },
     { "path": "../../packages/egress-matcher-semantic" },

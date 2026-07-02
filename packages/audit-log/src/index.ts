@@ -45,15 +45,21 @@
  * to the store (a put failure never blocks the durable local write). On
  * `verify`, the external anchor is consulted IN ADDITION to
  * `_chain-tail.json`: if it witnesses a `seq` the surviving chain no
- * longer reaches — or a tip hash that disagrees at the anchored seq —
- * verify FAILS, catching a tail truncation that ALSO rewrote the on-host
- * `_chain-tail.json` in lockstep (the attacker cannot reach back into the
- * external store). An anchor that merely lags behind newer appends (the
- * benign best-effort case) is NOT treated as a failure. This package
- * ships only an in-memory `InMemoryAnchorStore` reference implementation
- * for tests/dev; PRODUCTION DEPLOYMENTS SHOULD SUPPLY A WORM-BACKED STORE
- * (object-lock bucket, append-only/separate-privilege service, or
- * transparency log) so the audit writer's own uid cannot rewrite it.
+ * longer reaches — or a hash that disagrees with the surviving chain's
+ * record AT the anchored seq — verify FAILS, catching a tail truncation
+ * that ALSO rewrote the on-host `_chain-tail.json` in lockstep (the
+ * attacker cannot reach back into the external store). An anchor that
+ * merely lags behind newer appends (the benign best-effort case) is NOT
+ * treated as a failure — but its hash must still match the chain's record
+ * at that seq, so a wholesale chain rewrite followed by fresh appends
+ * cannot masquerade as benign lag. Two reference
+ * implementations ship: the in-memory `InMemoryAnchorStore` (tests/dev)
+ * and the durable `FileAnchorStore` (append-only anchor files under a
+ * directory — tamper-resistant exactly insofar as that directory is not
+ * writable by the audit writer's uid; see file-anchor-store.ts). PRODUCTION
+ * DEPLOYMENTS SHOULD BACK THE SEAM WITH A WORM STORE (object-lock bucket,
+ * append-only/separate-privilege service, or transparency log) so the audit
+ * writer's own uid cannot rewrite it.
  *
  * Files are created with mode 0o600 (owner-only) so the audit trail
  * cannot be read by other users on the host. Append uses
@@ -111,7 +117,13 @@ export type AuditKind =
   // redacting it would defeat the purpose. (`runtime-core` declares a minimal
   // structural `JustificationAuditSink` rather than importing this package, to
   // avoid a dependency cycle; this `AuditLog` satisfies that seam.)
-  | "permission_justification_evaluated";
+  | "permission_justification_evaluated"
+  // Section 39 / item 35 — `crewhaus retention sweep|export|purge` appends one
+  // record per REAL (non-dry-run) run so retention enforcement is itself
+  // tamper-evidenced. Payload shape (opaque JSON; see apps/cli/src/retention.ts):
+  //   { action: "sweep"|"export"|"purge", dryRun: false, deletedSessionIds,
+  //     kept/deferred counts, policy inputs (maxAgeDays, pins, windows), ... }
+  | "retention_enforcement";
 
 export type AuditRecord = {
   readonly ts: number;
@@ -190,6 +202,15 @@ export class InMemoryAnchorStore implements AnchorStore {
     return this.anchors.get(logId);
   }
 }
+
+// File-backed AnchorStore (append-only anchors under a directory) — the
+// durable sibling of InMemoryAnchorStore. See file-anchor-store.ts for the
+// layout + threat model (its tamper-resistance is exactly the directory's).
+export {
+  FileAnchorStore,
+  FileAnchorStoreError,
+  type FileAnchorStoreOptions,
+} from "./file-anchor-store";
 
 export type OpenAuditLogOptions = {
   readonly rootDir: string;
@@ -398,12 +419,15 @@ export type VerifyOptions = {
  *
  * If a `{ anchorStore }` is supplied (see {@link VerifyOptions}), the
  * off-host anchor is consulted IN ADDITION to `_chain-tail.json`: when it
- * witnesses a `seq` the surviving chain no longer reaches — or a tip hash
- * that disagrees at the anchored seq — verify FAILS. This catches a tail
- * truncation that ALSO rewrote the on-host anchor in lockstep, since a
- * same-uid attacker cannot reach into the external (ideally WORM) store.
- * An external anchor that merely lags BEHIND newer appends (the benign
- * best-effort case) is not a failure.
+ * witnesses a `seq` the surviving chain no longer reaches — or a hash that
+ * disagrees with the chain's record AT the anchored seq — verify FAILS.
+ * This catches a tail truncation that ALSO rewrote the on-host anchor in
+ * lockstep, since a same-uid attacker cannot reach into the external
+ * (ideally WORM) store. An external anchor that merely lags BEHIND newer
+ * appends (the benign best-effort case) is not a failure, but even a
+ * lagging anchor's hash is matched against the record at its seq — so a
+ * chain rebuilt from scratch and then extended past the anchored height
+ * (rewrite + fresh appends) is still caught.
  *
  * Returns the first broken link (file + line number + reason), or
  * `{ ok: true }` if the chain is intact. On success, `anchorChecked`
@@ -413,11 +437,17 @@ export type VerifyOptions = {
  * (a limitation, not a pass — see the file header on same-uid tamper).
  */
 export async function verify(rootDir: string, options: VerifyOptions = {}): Promise<VerifyResult> {
+  // Fetch the external anchor BEFORE the walk so the walk can capture the
+  // surviving chain's hash AT the anchored seq — the lag case (anchor.seq <
+  // lastSeq) is only benign when that record's hash still matches what the
+  // store witnessed; comparing tips alone would let a wholesale chain rewrite
+  // hide behind a few fresh appends.
+  const externalAnchor = await fetchExternalAnchor(rootDir, options);
   if (!existsSync(rootDir)) {
     // No local chain at all. Even so, an external anchor may witness records
     // that a wholesale deletion (rootDir rm'd) destroyed — cross-check it
     // against the empty (GENESIS-tipped, seq -1) chain before passing.
-    const empty = await crossCheckExternalAnchor(rootDir, options, GENESIS_HASH, -1);
+    const empty = crossCheckExternalAnchor(externalAnchor, GENESIS_HASH, -1, undefined);
     if (empty !== undefined && !empty.ok) {
       return {
         ok: false,
@@ -440,6 +470,9 @@ export async function verify(rootDir: string, options: VerifyOptions = {}): Prom
   let prevHash = GENESIS_HASH;
   let expectedSeq = 0;
   let recordsChecked = 0;
+  // The surviving chain's hash at the externally-anchored seq (captured in
+  // the walk below), for the lag-case cross-check.
+  let hashAtAnchoredSeq: string | undefined;
   for (const f of files) {
     const file = join(rootDir, f);
     const stream = createReadStream(file, { encoding: "utf8" });
@@ -498,6 +531,9 @@ export async function verify(rootDir: string, options: VerifyOptions = {}): Prom
             reason: `hash mismatch — expected "${expected}", got "${r.hash}"`,
           };
         }
+        if (externalAnchor !== undefined && r.seq === externalAnchor.seq) {
+          hashAtAnchoredSeq = r.hash;
+        }
         prevHash = r.hash;
         expectedSeq = r.seq + 1;
         recordsChecked += 1;
@@ -513,7 +549,7 @@ export async function verify(rootDir: string, options: VerifyOptions = {}): Prom
   // Off-host anchor check FIRST: the external store is the only commitment a
   // same-uid attacker cannot rewrite, so it is what catches a truncation that
   // also rewrote `_chain-tail.json` in lockstep. (See file header.)
-  const external = await crossCheckExternalAnchor(rootDir, options, prevHash, lastSeq);
+  const external = crossCheckExternalAnchor(externalAnchor, prevHash, lastSeq, hashAtAnchoredSeq);
   if (external !== undefined && !external.ok) {
     return {
       ok: false,
@@ -579,24 +615,6 @@ export async function verify(rootDir: string, options: VerifyOptions = {}): Prom
   return { ok: true, recordsChecked, anchorChecked: true, externalAnchorChecked };
 }
 
-/**
- * Cross-check the surviving chain tip (`tipHash` at `lastSeq`; an empty
- * chain is `GENESIS_HASH` at `-1`) against an off-host {@link AnchorStore}.
- *
- * Threat model — the store witnesses the highest tail the writer published.
- *  - external `seq > lastSeq`  → the chain no longer reaches a record the
- *    anchor saw ⇒ tail truncation (even if `_chain-tail.json` was rewritten
- *    in lockstep, which the attacker cannot do to the external store) → FAIL.
- *  - external `seq === lastSeq` but `hash !== tipHash` → the tip was rewritten
- *    in place at the anchored height → FAIL.
- *  - external `seq < lastSeq` → the anchor merely lags behind newer appends
- *    (benign best-effort `putAnchor` lag) → pass.
- *
- * Returns `undefined` when no store was supplied; otherwise a partial result
- * carrying `externalAnchorChecked` (true once an anchor was actually read and
- * compared) plus, on mismatch, the failure fields. A `getAnchor` that throws
- * is treated as "anchor unavailable" (not consulted), not as tamper.
- */
 type ExternalAnchorCheck =
   | { readonly ok: true; readonly externalAnchorChecked: boolean }
   | {
@@ -607,23 +625,57 @@ type ExternalAnchorCheck =
       readonly externalAnchorChecked: boolean;
     };
 
-async function crossCheckExternalAnchor(
+/**
+ * Read the off-host anchor for this log, if a store was supplied. Returns
+ * `undefined` when there is no store, no anchor yet, or the backend threw —
+ * "anchor unavailable" degrades to not-checked (`externalAnchorChecked:
+ * false` downstream), never to a fabricated pass or failure.
+ */
+async function fetchExternalAnchor(
   rootDir: string,
   options: VerifyOptions,
-  tipHash: string,
-  lastSeq: number,
-): Promise<ExternalAnchorCheck | undefined> {
+): Promise<AnchorRecord | undefined> {
   const store = options.anchorStore;
   if (store === undefined) return undefined;
   const logId = options.logId ?? rootDir;
-  let anchor: AnchorRecord | undefined;
   try {
-    anchor = await store.getAnchor(logId);
+    return await store.getAnchor(logId);
   } catch {
     // Anchor backend unavailable: cannot rule the truncation gap in OR out,
     // so report "not checked" rather than fabricating a pass or a failure.
-    return { ok: true, externalAnchorChecked: false };
+    return undefined;
   }
+}
+
+/**
+ * Cross-check the surviving chain (tip `tipHash` at `lastSeq`; an empty
+ * chain is `GENESIS_HASH` at `-1`) against a fetched off-host anchor.
+ * `hashAtAnchoredSeq` is the surviving chain's hash at `anchor.seq`, captured
+ * during the verify walk (undefined when the chain never reaches that seq).
+ *
+ * Threat model — the store witnesses the highest tail the writer published.
+ *  - external `seq > lastSeq`  → the chain no longer reaches a record the
+ *    anchor saw ⇒ tail truncation (even if `_chain-tail.json` was rewritten
+ *    in lockstep, which the attacker cannot do to the external store) → FAIL.
+ *  - external `seq === lastSeq` but `hash !== tipHash` → the tip was rewritten
+ *    in place at the anchored height → FAIL.
+ *  - external `seq < lastSeq` AND `hash === hashAtAnchoredSeq` → the anchor
+ *    merely lags behind newer appends (benign best-effort `putAnchor` lag)
+ *    → pass.
+ *  - external `seq < lastSeq` but `hash !== hashAtAnchoredSeq` → the chain
+ *    was rewritten from (at or before) the anchored height and then extended
+ *    with fresh appends — lag alone is NOT proof of innocence → FAIL.
+ *
+ * Returns `undefined` when no anchor was available (store missing, empty, or
+ * unreachable); otherwise a result carrying `externalAnchorChecked: true`
+ * plus, on mismatch, the failure fields.
+ */
+function crossCheckExternalAnchor(
+  anchor: AnchorRecord | undefined,
+  tipHash: string,
+  lastSeq: number,
+  hashAtAnchoredSeq: string | undefined,
+): ExternalAnchorCheck | undefined {
   if (anchor === undefined) return { ok: true, externalAnchorChecked: false };
 
   if (anchor.seq > lastSeq) {
@@ -644,6 +696,19 @@ async function crossCheckExternalAnchor(
       externalAnchorChecked: true,
     };
   }
-  // anchor.seq < lastSeq → benign lag; or matched tip → consistent.
+  if (anchor.seq < lastSeq && anchor.hash !== hashAtAnchoredSeq) {
+    return {
+      ok: false,
+      file: "<external-anchor>",
+      line: 0,
+      reason:
+        `external anchor mismatch — store records hash "${anchor.hash}" at seq ${anchor.seq} ` +
+        `but the surviving chain's record at that seq hashes to ${
+          hashAtAnchoredSeq === undefined ? "nothing (seq not reached)" : `"${hashAtAnchoredSeq}"`
+        } (the chain was rewritten below the anchored height and extended with fresh appends)`,
+      externalAnchorChecked: true,
+    };
+  }
+  // Matched tip, or benign lag whose anchored record still matches.
   return { ok: true, externalAnchorChecked: true };
 }

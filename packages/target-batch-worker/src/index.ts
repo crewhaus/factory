@@ -17,10 +17,18 @@
  *      job_end | drain_start | drain_end | worker_stop`).
  *   5. Installs SIGTERM + SIGINT handlers that drain in-flight jobs
  *      cleanly before exit.
+ *   6. Runs the boot-time self-heal janitor (ops item 36) — session TTL
+ *      eviction + orphaned-tool_use report — at boot and hourly
+ *      (`CREWHAUS_JANITOR=0` / `CREWHAUS_JANITOR_INTERVAL_MS` to tune).
  */
 import { CrewhausError } from "@crewhaus/errors";
 import { escapeJsonString } from "@crewhaus/infra-utils";
-import type { Bundle, IrBatchV0 } from "@crewhaus/ir";
+import {
+  type Bundle,
+  type EmitReadmeOptions,
+  type IrBatchV0,
+  renderBundleReadme,
+} from "@crewhaus/ir";
 
 export class TargetEmitError extends CrewhausError {
   override readonly name = "TargetEmitError";
@@ -124,13 +132,19 @@ function renderPermissionsField(ir: IrBatchV0): string {
   return `\n${lines.join("\n")}`;
 }
 
-export function emitBatchWorker(ir: IrBatchV0): Bundle {
+export function emitBatchWorker(ir: IrBatchV0, opts: EmitReadmeOptions = {}): Bundle {
   if (ir.queue.adapter !== "in-memory") {
     // v0 only ships the in-memory adapter; the others are stubs that
     // throw at runtime so the operator sees a clean diagnostic.
     // Codegen still succeeds — we emit the daemon, but boot fails.
   }
-  return { files: [{ path: "agent.ts", content: renderAgent(ir) }] };
+  const files = [{ path: "agent.ts", content: renderAgent(ir) }];
+  // Item 42 — generated bundle README; default ON (`crewhaus compile
+  // --no-readme` opts out).
+  if (opts.readme !== false) {
+    files.push({ path: "README.md", content: renderBundleReadme(ir) });
+  }
+  return { files };
 }
 
 function renderAgent(ir: IrBatchV0): string {
@@ -157,7 +171,8 @@ function renderAgent(ir: IrBatchV0): string {
 import { createInMemoryQueue } from "@crewhaus/queue-protocol";
 import { startConsumer } from "@crewhaus/queue-consumer";
 import { createInMemoryIdempotencyStore } from "@crewhaus/idempotency-keys";
-import { runChatLoop } from "@crewhaus/runtime-core";
+import { loadRetentionConfig } from "@crewhaus/data-retention-engine";
+import { createJanitor, runChatLoop } from "@crewhaus/runtime-core";
 import { createRunContext } from "@crewhaus/run-context";
 import { defaultCatalog } from "@crewhaus/tool-catalog";
 ${permImport}${importBlock}
@@ -190,6 +205,39 @@ function buildQueue(): ReturnType<typeof createInMemoryQueue<string>> {
 }
 
 async function main(): Promise<void> {
+  // Boot-time self-heal janitor (ops item 36): evicts expired sessions on a
+  // schedule (TTL eviction otherwise only fires as a list() side-effect an
+  // idle worker never triggers) and reports orphaned tool_use entries in
+  // recent transcripts (report-only). Eviction honors
+  // .crewhaus/retention.json (ops item 35) — the SAME pins +
+  // sessions.maxAgeDays the \`crewhaus retention\` CLI enforces; a malformed
+  // config fails safe (eviction disabled, worker keeps running). The report
+  // goes to stderr so the stdout JSON event stream stays untouched.
+  // CREWHAUS_JANITOR=0 disables entirely; CREWHAUS_JANITOR_INTERVAL_MS
+  // overrides the hourly re-run (0 keeps only the boot run; the timer is
+  // unref'd so the queue_idle exit path still terminates the process).
+  let retentionTtlDays: number;
+  let retentionPins: readonly string[] = [];
+  try {
+    const retention = await loadRetentionConfig(process.cwd());
+    retentionTtlDays = retention.sessionMaxAgeDays;
+    retentionPins = retention.pins;
+  } catch (err) {
+    process.stderr.write(
+      \`[batch-worker] .crewhaus/retention.json unreadable — janitor session eviction disabled: \${(err as Error).message}\\n\`,
+    );
+    retentionTtlDays = Number.POSITIVE_INFINITY; // fail-safe: evict nothing
+  }
+  const janitor = createJanitor({
+    sessionTtlDays: retentionTtlDays,
+    pinnedSessionIds: retentionPins,
+  });
+  if (process.env["CREWHAUS_JANITOR"] !== "0") {
+    const janitorReport = await janitor.runOnce();
+    process.stderr.write(\`[janitor] \${JSON.stringify(janitorReport.steps)}\\n\`);
+    janitor.start(Number(process.env["CREWHAUS_JANITOR_INTERVAL_MS"] ?? 3_600_000));
+  }
+
   const queue = buildQueue();
   const idempotencyStore = createInMemoryIdempotencyStore<string>();
   emit({ kind: "worker_start", queueAdapter: SPEC_QUEUE_ADAPTER, concurrency: SPEC_CONCURRENCY });
@@ -243,6 +291,7 @@ async function main(): Promise<void> {
   const shutdown = async (signal: string): Promise<void> => {
     if (stopping) return;
     stopping = true;
+    janitor.stop();
     emit({ kind: "shutdown_received", signal });
     await consumer.drain();
     const stats = await queue.stats();
@@ -271,6 +320,7 @@ async function main(): Promise<void> {
         consumer.inFlight() === 0
       ) {
         emit({ kind: "queue_idle", stats: recheck });
+        janitor.stop();
         await consumer.drain();
         emit({ kind: "worker_stop", stats: await queue.stats() });
         return;

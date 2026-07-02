@@ -1029,3 +1029,15 @@ export type Bundle = {
     readonly content: string;
   }>;
 };
+
+// Generated-bundle README renderer (item 42) — pure functions over the IR,
+// shared by every target emitter. See ./readme.ts for the module docs.
+export {
+  type BundleReadmeOptions,
+  type BundleReadmeSection,
+  type CollectedSecretRefs,
+  type EmitReadmeOptions,
+  GENERATED_README_MARKER,
+  collectSecretRefs,
+  renderBundleReadme,
+} from "./readme";

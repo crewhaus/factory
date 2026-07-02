@@ -20,7 +20,12 @@
  */
 import { CrewhausError } from "@crewhaus/errors";
 import { escapeJsonString } from "@crewhaus/infra-utils";
-import type { Bundle, IrVoiceV0 } from "@crewhaus/ir";
+import {
+  type Bundle,
+  type EmitReadmeOptions,
+  type IrVoiceV0,
+  renderBundleReadme,
+} from "@crewhaus/ir";
 
 export class TargetEmitError extends CrewhausError {
   override readonly name = "TargetEmitError";
@@ -29,14 +34,18 @@ export class TargetEmitError extends CrewhausError {
   }
 }
 
-export function emitVoice(ir: IrVoiceV0): Bundle {
-  return {
-    files: [
-      { path: "agent.ts", content: renderAgent(ir) },
-      { path: "voice-loop.ts", content: renderVoiceLoop(ir) },
-      { path: "daemon.ts", content: renderDaemon(ir) },
-    ],
-  };
+export function emitVoice(ir: IrVoiceV0, opts: EmitReadmeOptions = {}): Bundle {
+  const files = [
+    { path: "agent.ts", content: renderAgent(ir) },
+    { path: "voice-loop.ts", content: renderVoiceLoop(ir) },
+    { path: "daemon.ts", content: renderDaemon(ir) },
+  ];
+  // Item 42 — generated bundle README; default ON (`crewhaus compile
+  // --no-readme` opts out).
+  if (opts.readme !== false) {
+    files.push({ path: "README.md", content: renderBundleReadme(ir) });
+  }
+  return { files };
 }
 
 function renderAgent(ir: IrVoiceV0): string {

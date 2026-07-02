@@ -34,7 +34,13 @@
  */
 import { CrewhausError } from "@crewhaus/errors";
 import { escapeJsonString } from "@crewhaus/infra-utils";
-import type { Bundle, IrChainV0, IrSecretRef } from "@crewhaus/ir";
+import {
+  type Bundle,
+  type EmitReadmeOptions,
+  type IrChainV0,
+  type IrSecretRef,
+  renderBundleReadme,
+} from "@crewhaus/ir";
 
 export class TargetEmitError extends CrewhausError {
   override readonly name = "TargetEmitError";
@@ -121,7 +127,7 @@ function renderTrigger(t: IrChainV0["triggers"][number]): string {
   return `  { kind: "address", chainId: ${JSON.stringify(t.chainId)}, address: ${JSON.stringify(t.address)}, direction: ${JSON.stringify(t.direction)} }`;
 }
 
-export function emitOnchain(ir: IrChainV0): Bundle {
+export function emitOnchain(ir: IrChainV0, opts: EmitReadmeOptions = {}): Bundle {
   if (ir.chains.length === 0) {
     throw new TargetEmitError("onchain target requires at least one chain binding");
   }
@@ -230,5 +236,11 @@ export async function acceptOrRedact(payload: string): Promise<{ accept: boolean
 // callable module that downstream daemons or tests import.
 `;
 
-  return { files: [{ path: "agent.ts", content }] };
+  const files = [{ path: "agent.ts", content }];
+  // Item 42 — generated bundle README; default ON (`crewhaus compile
+  // --no-readme` opts out).
+  if (opts.readme !== false) {
+    files.push({ path: "README.md", content: renderBundleReadme(ir) });
+  }
+  return { files };
 }

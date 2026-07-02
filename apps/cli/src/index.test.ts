@@ -1,7 +1,17 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { type AuditKind, FileAnchorStore, openAuditLog } from "@crewhaus/audit-log";
 import { parseSpec } from "@crewhaus/spec";
 
 // `tsc -b` also compiles this file into `dist/`; resolve the CLI entrypoint
@@ -65,6 +75,46 @@ describe("crewhaus compile", () => {
     expect(result.stdout).toContain("compiled bundle");
   });
 
+  // Item 42 — generated bundle README, DEFAULT-ON.
+  test("emits a generated README.md into the bundle by default (item 42)", async () => {
+    const result = await runCli(["compile", HELLO_SPEC, "-o", tmp]);
+    expect(result.exitCode).toBe(0);
+    const readmePath = join(tmp, "README.md");
+    expect(existsSync(readmePath)).toBe(true);
+    const md = readFileSync(readmePath, "utf-8");
+    expect(md).toContain("<!-- crewhaus:generated-readme -->");
+    expect(md).toContain("| Target | `cli` |");
+    expect(md).toContain("bun agent.ts");
+  });
+
+  test("--no-readme skips the generated README.md (item 42 opt-out)", async () => {
+    const result = await runCli(["compile", HELLO_SPEC, "--no-readme", "-o", tmp]);
+    expect(result.exitCode).toBe(0);
+    expect(existsSync(join(tmp, "agent.ts"))).toBe(true);
+    expect(existsSync(join(tmp, "README.md"))).toBe(false);
+  });
+
+  test("a user-authored README.md in the out-dir is kept, with a notice (item 42)", async () => {
+    const readmePath = join(tmp, "README.md");
+    writeFileSync(readmePath, "# my notes\n\nhand-written\n");
+    const result = await runCli(["compile", HELLO_SPEC, "-o", tmp]);
+    expect(result.exitCode).toBe(0);
+    expect(readFileSync(readmePath, "utf-8")).toBe("# my notes\n\nhand-written\n");
+    expect(result.stdout).toContain("kept");
+    expect(result.stdout).toContain("--no-readme");
+  });
+
+  test("a previously GENERATED README.md is refreshed on recompile (item 42)", async () => {
+    const first = await runCli(["compile", HELLO_SPEC, "-o", tmp]);
+    expect(first.exitCode).toBe(0);
+    const readmePath = join(tmp, "README.md");
+    const generated = readFileSync(readmePath, "utf-8");
+    const second = await runCli(["compile", HELLO_SPEC, "-o", tmp]);
+    expect(second.exitCode).toBe(0);
+    expect(second.stdout).toContain(`wrote ${readmePath}`);
+    expect(readFileSync(readmePath, "utf-8")).toBe(generated);
+  });
+
   test("--emit-ir with -o writes ir.json into the out dir and skips codegen", async () => {
     const result = await runCli(["compile", HELLO_SPEC, "--emit-ir", "-o", tmp]);
     expect(result.exitCode).toBe(0);
@@ -91,6 +141,9 @@ describe("crewhaus compile", () => {
     expect(result.stdout).toContain("by DEFAULT");
     expect(result.stdout).toContain('non-"external"');
     expect(result.stdout).toContain("--allow-unmarked-sinks");
+    // Item 42 — README emission and its opt-out are documented too.
+    expect(result.stdout).toContain("README.md");
+    expect(result.stdout).toContain("--no-readme");
   });
 
   // (a) DEFAULT-ON RED PATH — no flag at all. A spec referencing an `mcp__*`
@@ -847,6 +900,160 @@ describe("crewhaus cost-summary", () => {
     const out = JSON.parse(result.stdout) as { totalUsdMicros: number };
     expect(out.totalUsdMicros).toBe(1000);
   });
+
+  // Item 28 (half 1) — cache economics columns.
+  type CacheSummaryJson = {
+    count: number;
+    totalUsdMicros: number;
+    byProvider: Record<string, number>;
+    inputTokens: number;
+    outputTokens: number;
+    cachedReadTokens: number;
+    cacheCreationTokens: number;
+    cacheHitRatio: number;
+    cacheSavingsUsdMicros: number;
+    cacheByModel: Record<
+      string,
+      {
+        inputTokens: number;
+        outputTokens: number;
+        cachedReadTokens: number;
+        cacheCreationTokens: number;
+        cacheHitRatio: number;
+        cacheSavingsUsdMicros: number | null;
+      }
+    >;
+  };
+
+  function seedCacheSession(): void {
+    seedSession([
+      {
+        ts: 1,
+        version: 1,
+        kind: "cost_accrual",
+        payload: {
+          provider: "anthropic",
+          modelId: "claude-sonnet-4-6",
+          inputTokens: 1000,
+          outputTokens: 100,
+          cachedReadTokens: 4000,
+          cacheCreationTokens: 2000,
+          // 1000×3 + 100×15 + 4000×0.3 + 2000×3.75 (sonnet row + fallback cache rates)
+          costUsdMicros: 13_200,
+        },
+      },
+      {
+        ts: 2,
+        version: 1,
+        kind: "cost_accrual",
+        // Unmapped model — tokens/ratio still aggregate; savings can't be priced.
+        payload: {
+          provider: "openai",
+          modelId: "fictional-model-99",
+          inputTokens: 100,
+          outputTokens: 10,
+          cachedReadTokens: 100,
+          cacheCreationTokens: 50,
+          costUsdMicros: 42,
+        },
+      },
+    ]);
+  }
+
+  test("json gains cache economics: tokens, hit ratio, and realized savings per provider/model + total", async () => {
+    seedCacheSession();
+    const result = await runCli(["cost-summary", "--session", SESSION_ID, "--format", "json"], {
+      cwd: tmp,
+    });
+    expect(result.exitCode).toBe(0);
+    const out = JSON.parse(result.stdout) as CacheSummaryJson;
+    // Pre-existing fields keep their exact shape and values (additive-only).
+    expect(out.count).toBe(2);
+    expect(out.totalUsdMicros).toBe(13_242);
+    expect(out.byProvider["anthropic"]).toBe(13_200);
+    expect(out.byProvider["openai"]).toBe(42);
+    // Totals across models.
+    expect(out.inputTokens).toBe(1100);
+    expect(out.outputTokens).toBe(110);
+    expect(out.cachedReadTokens).toBe(4100);
+    expect(out.cacheCreationTokens).toBe(2050);
+    // hit = cachedRead / (input + cachedRead) = 4100 / 5200
+    expect(out.cacheHitRatio).toBeCloseTo(4100 / 5200, 10);
+    // Savings sum only over priced buckets:
+    // sonnet reads 4000 × ($3 − $0.3) = 10_800; writes 2000 × ($3.75 − $3) = 1_500 → 9_300.
+    expect(out.cacheSavingsUsdMicros).toBe(9_300);
+    const sonnet = out.cacheByModel["anthropic/claude-sonnet-4-6"];
+    expect(sonnet?.cachedReadTokens).toBe(4000);
+    expect(sonnet?.cacheCreationTokens).toBe(2000);
+    expect(sonnet?.cacheHitRatio).toBeCloseTo(0.8, 10);
+    expect(sonnet?.cacheSavingsUsdMicros).toBe(9_300);
+    const unknown = out.cacheByModel["openai/fictional-model-99"];
+    expect(unknown?.cacheHitRatio).toBeCloseTo(0.5, 10);
+    expect(unknown?.cacheSavingsUsdMicros).toBeNull();
+  });
+
+  test("text format appends cache lines per provider/model + total, unknown model prices as n/a", async () => {
+    seedCacheSession();
+    const result = await runCli(["cost-summary", "--session", SESSION_ID], { cwd: tmp });
+    expect(result.exitCode).toBe(0);
+    // Pre-existing lines unchanged.
+    expect(result.stdout).toContain(`session: ${SESSION_ID}`);
+    expect(result.stdout).toContain("accrual events: 2");
+    expect(result.stdout).toContain("total: $0.0132");
+    // New cache economics lines.
+    expect(result.stdout).toContain("cache: read=4100 write=2050 hit=78.8% savings=$0.0093");
+    expect(result.stdout).toContain(
+      "  anthropic/claude-sonnet-4-6: read=4000 write=2000 hit=80.0% savings=$0.0093",
+    );
+    expect(result.stdout).toContain(
+      "  openai/fictional-model-99: read=100 write=50 hit=50.0% savings=n/a",
+    );
+  });
+
+  test("old logs keep parsing: token-less and pre-cache-write accruals aggregate with zero-filled cache fields", async () => {
+    seedSession([
+      // Oldest vintage: no token fields at all.
+      {
+        ts: 1,
+        version: 1,
+        kind: "cost_accrual",
+        payload: { provider: "anthropic", modelId: "claude-sonnet-4-6", costUsdMicros: 450 },
+      },
+      // Mid vintage: cachedReadTokens but no cacheCreationTokens.
+      {
+        ts: 2,
+        version: 1,
+        kind: "cost_accrual",
+        payload: {
+          provider: "anthropic",
+          modelId: "claude-sonnet-4-6",
+          inputTokens: 1000,
+          outputTokens: 10,
+          cachedReadTokens: 500,
+          costUsdMicros: 3_300,
+        },
+      },
+    ]);
+    const result = await runCli(["cost-summary", "--session", SESSION_ID, "--format", "json"], {
+      cwd: tmp,
+    });
+    expect(result.exitCode).toBe(0);
+    const out = JSON.parse(result.stdout) as CacheSummaryJson;
+    expect(out.count).toBe(2);
+    expect(out.totalUsdMicros).toBe(3_750);
+    expect(out.cachedReadTokens).toBe(500);
+    expect(out.cacheCreationTokens).toBe(0);
+    expect(out.cacheHitRatio).toBeCloseTo(500 / 1500, 10);
+    // Savings with zero writes: 500 × ($3 − $0.3) = 1_350 micros.
+    expect(out.cacheSavingsUsdMicros).toBe(1_350);
+  });
+
+  test("cost-summary --help documents the hit-ratio denominator and savings formula", async () => {
+    const result = await runCli(["cost-summary", "--help"]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("cachedReadTokens / (inputTokens + cachedReadTokens)");
+    expect(result.stdout).toContain("cache-write premium");
+  });
 });
 
 describe("crewhaus version", () => {
@@ -866,4 +1073,605 @@ describe("crewhaus version", () => {
       expect(result.stdout.trim()).toBe(pkgVersion);
     });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Item 34 — `crewhaus audit verify` + schedulable `compliance evidence`.
+// ---------------------------------------------------------------------------
+
+/** Append one audit record per `kind` to `<dir>` (creating the store). */
+async function seedAuditLog(
+  dir: string,
+  kinds: ReadonlyArray<AuditKind>,
+  anchorStore?: FileAnchorStore,
+): Promise<void> {
+  const log = await openAuditLog({ rootDir: dir, ...(anchorStore ? { anchorStore } : {}) });
+  for (const kind of kinds) {
+    await log.append({ kind, payload: { seeded: kind } });
+  }
+}
+
+/** Flip one payload byte on the given line of the newest day file. */
+function tamperAuditLog(dir: string, lineIndex: number): void {
+  const dayFile = readdirSync(dir)
+    .filter((f) => f.endsWith(".jsonl"))
+    .sort()
+    .at(-1) as string;
+  const file = join(dir, dayFile);
+  const lines = readFileSync(file, "utf8")
+    .split("\n")
+    .filter((l) => l !== "");
+  const record = JSON.parse(lines[lineIndex] as string);
+  record.payload = { seeded: "tampered" };
+  lines[lineIndex] = JSON.stringify(record);
+  writeFileSync(file, `${lines.join("\n")}\n`);
+}
+
+describe("crewhaus audit verify", () => {
+  test("--help documents --dir, --anchor, and the exit-code contract", async () => {
+    const result = await runCli(["audit", "verify", "--help"]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("--dir <auditDir>");
+    expect(result.stdout).toContain("--anchor file:<path>");
+    expect(result.stdout).toContain("Exit code: 0 intact");
+  });
+
+  test("an unknown audit action dies with the allowed list", async () => {
+    const result = await runCli(["audit", "frobnicate"]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('audit action must be "verify"');
+  });
+
+  test("verifies the default ./.crewhaus/audit store in cwd and exits 0 when intact", async () => {
+    await seedAuditLog(join(tmp, ".crewhaus", "audit"), ["policy_decision", "model_call"]);
+    const result = await runCli(["audit", "verify"], { cwd: tmp });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("✓ hash chain intact — 2 record(s)");
+    expect(result.stdout).toContain("✓ on-host chain-tail anchor");
+    expect(result.stdout).toContain("audit log intact.");
+  });
+
+  test("an empty/missing store verifies as intact (0 records, anchor limitation noted)", async () => {
+    const result = await runCli(["audit", "verify", "--dir", join(tmp, "no-such-audit")]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("0 record(s)");
+    expect(result.stdout).toContain("~ on-host chain-tail anchor absent");
+  });
+
+  test("a tampered payload exits 1 with the finding's file:line + reason", async () => {
+    const auditDir = join(tmp, "audit");
+    await seedAuditLog(auditDir, ["policy_decision", "secrets_access", "model_call"]);
+    tamperAuditLog(auditDir, 1);
+    const result = await runCli(["audit", "verify", "--dir", auditDir]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout).toContain("✗ tamper finding at");
+    expect(result.stdout).toContain(":2 — hash mismatch");
+    expect(result.stdout).toContain("audit verification FAILED.");
+  });
+
+  test("--anchor file:<path> cross-checks a mirrored FileAnchorStore and exits 0", async () => {
+    const auditDir = join(tmp, "audit");
+    const anchorDir = join(tmp, "anchors");
+    await seedAuditLog(auditDir, ["policy_decision", "model_call"], new FileAnchorStore(anchorDir));
+    const result = await runCli([
+      "audit",
+      "verify",
+      "--dir",
+      auditDir,
+      "--anchor",
+      `file:${anchorDir}`,
+    ]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("✓ external anchor store agrees");
+  });
+
+  test("--anchor catches a truncation that rewrote the on-host anchor in lockstep", async () => {
+    const auditDir = join(tmp, "audit");
+    const anchorDir = join(tmp, "anchors");
+    await seedAuditLog(
+      auditDir,
+      ["secrets_access", "secrets_access", "secrets_access"],
+      new FileAnchorStore(anchorDir),
+    );
+    // Same-uid attacker: drop the tail record AND rewrite _chain-tail.json.
+    const dayFile = readdirSync(auditDir)
+      .filter((f) => f.endsWith(".jsonl"))
+      .sort()
+      .at(-1) as string;
+    const file = join(auditDir, dayFile);
+    const survivors = readFileSync(file, "utf8")
+      .split("\n")
+      .filter((l) => l !== "")
+      .slice(0, 2);
+    writeFileSync(file, `${survivors.join("\n")}\n`);
+    const last = JSON.parse(survivors[1] as string);
+    const day = dayFile.replace(/\.jsonl$/, "");
+    writeFileSync(
+      join(auditDir, "_chain-tail.json"),
+      JSON.stringify({ day, hash: last.hash, seq: last.seq }),
+    );
+
+    // Without the store the lockstep rewrite passes; with it, seq 2 is caught.
+    const fooled = await runCli(["audit", "verify", "--dir", auditDir]);
+    expect(fooled.exitCode).toBe(0);
+    const caught = await runCli([
+      "audit",
+      "verify",
+      "--dir",
+      auditDir,
+      "--anchor",
+      `file:${anchorDir}`,
+    ]);
+    expect(caught.exitCode).toBe(1);
+    expect(caught.stdout).toContain("external anchor mismatch");
+  });
+
+  test("a REQUESTED anchor store with no anchor for the log exits 1 (no silent skip)", async () => {
+    const auditDir = join(tmp, "audit");
+    await seedAuditLog(auditDir, ["policy_decision"]); // opened WITHOUT a store
+    const emptyAnchors = join(tmp, "empty-anchors");
+    mkdirSync(emptyAnchors, { recursive: true });
+    const result = await runCli([
+      "audit",
+      "verify",
+      "--dir",
+      auditDir,
+      "--anchor",
+      `file:${emptyAnchors}`,
+    ]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout).toContain("✗ external anchor requested (--anchor)");
+  });
+
+  test("an unknown --anchor scheme dies with the allowed list", async () => {
+    const result = await runCli(["audit", "verify", "--anchor", "s3://bucket/prefix"], {
+      cwd: tmp,
+    });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('invalid --anchor "s3://bucket/prefix"');
+    expect(result.stderr).toContain("one of: file");
+  });
+});
+
+describe("crewhaus doctor — audit-log integrity (item 34)", () => {
+  test("a tampered .crewhaus/audit store fails doctor even when everything else is healthy", async () => {
+    writeFileSync(join(tmp, "crewhaus.yaml"), "name: t\ntarget: cli\n");
+    const auditDir = join(tmp, ".crewhaus", "audit");
+    await seedAuditLog(auditDir, ["policy_decision", "model_call"]);
+    tamperAuditLog(auditDir, 0);
+    const result = await runCli(["doctor"], { cwd: tmp, env: { ANTHROPIC_API_KEY: "test" } });
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout).toContain("✗ Audit log integrity");
+    expect(result.stdout).toContain("hash mismatch");
+  });
+
+  test("an intact .crewhaus/audit store passes doctor with the record count", async () => {
+    writeFileSync(join(tmp, "crewhaus.yaml"), "name: t\ntarget: cli\n");
+    await seedAuditLog(join(tmp, ".crewhaus", "audit"), ["policy_decision"]);
+    const result = await runCli(["doctor"], { cwd: tmp, env: { ANTHROPIC_API_KEY: "test" } });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("✓ Audit log integrity (.crewhaus/audit, 1 records)");
+  });
+});
+
+describe("crewhaus compliance evidence — scheduling ergonomics (item 34)", () => {
+  // The UTC quarter the CLI must resolve for --period current, computed with
+  // the same arithmetic the implementation uses (compliance-schedule.ts).
+  const expectedQuarter = (() => {
+    const now = new Date();
+    return `${now.getUTCFullYear()}-Q${Math.floor(now.getUTCMonth() / 3) + 1}`;
+  })();
+
+  test("--help documents --period current, --all-frameworks, and --fail-on-empty", async () => {
+    const result = await runCli(["compliance", "evidence", "--help"]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("--period current");
+    expect(result.stdout).toContain("--all-frameworks");
+    expect(result.stdout).toContain("--fail-on-empty");
+    // --allow-empty never shipped and was removed with the default flip (F4).
+    expect(result.stdout).not.toContain("--allow-empty");
+  });
+
+  test("--period current resolves to the current UTC quarter in output + bundle path", async () => {
+    await seedAuditLog(join(tmp, ".crewhaus", "audit"), ["policy_decision"]);
+    const result = await runCli(
+      ["compliance", "evidence", "--framework", "soc2", "--period", "current"],
+      { cwd: tmp },
+    );
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain(`soc2/CC6.1 ${expectedQuarter}: 1 records`);
+    expect(
+      existsSync(join(tmp, ".crewhaus", "compliance", "soc2", "CC6.1", `${expectedQuarter}.json`)),
+    ).toBe(true);
+  });
+
+  test("a control with 0 records exits 0 by default with a warning naming the gap (F4)", async () => {
+    // policy_decision satisfies CC6.1 only; CC6.7/CC7.2/CC7.3 collect nothing.
+    // The documented bare invocation must keep exiting 0 — the gap is warned,
+    // not fatal, unless --fail-on-empty opts into the scheduled tripwire.
+    await seedAuditLog(join(tmp, ".crewhaus", "audit"), ["policy_decision"]);
+    const result = await runCli(
+      ["compliance", "evidence", "--framework", "soc2", "--period", "2026-Q2"],
+      { cwd: tmp },
+    );
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toContain("warning: evidence gap");
+    expect(result.stderr).toContain("soc2/CC6.7");
+    expect(result.stderr).toContain("--fail-on-empty");
+    // Bundles were still written (the non-empty ones remain valid evidence).
+    expect(existsSync(join(tmp, ".crewhaus", "compliance", "soc2", "CC6.1", "2026-Q2.json"))).toBe(
+      true,
+    );
+  });
+
+  test("--fail-on-empty turns the evidence gap into exit 1 (scheduled tripwire)", async () => {
+    await seedAuditLog(join(tmp, ".crewhaus", "audit"), ["policy_decision"]);
+    const result = await runCli(
+      ["compliance", "evidence", "--framework", "soc2", "--period", "2026-Q2", "--fail-on-empty"],
+      { cwd: tmp },
+    );
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("evidence gap");
+    expect(result.stderr).toContain("soc2/CC6.7");
+    // Bundles were still written (the non-empty ones remain valid evidence).
+    expect(existsSync(join(tmp, ".crewhaus", "compliance", "soc2", "CC6.1", "2026-Q2.json"))).toBe(
+      true,
+    );
+  });
+
+  test("a framework whose every control collected evidence passes --fail-on-empty silently", async () => {
+    await seedAuditLog(join(tmp, ".crewhaus", "audit"), [
+      "policy_decision", // CC6.1
+      "secrets_rotation", // CC6.7
+      "model_call", // CC7.2
+      "gateway_request", // CC7.3
+    ]);
+    const result = await runCli(
+      ["compliance", "evidence", "--framework", "soc2", "--period", "2026-Q2", "--fail-on-empty"],
+      { cwd: tmp },
+    );
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).not.toContain("evidence gap");
+  });
+
+  test("--all-frameworks collects soc2 + iso27001 + hipaa in one run", async () => {
+    await seedAuditLog(join(tmp, ".crewhaus", "audit"), ["policy_decision"]);
+    const result = await runCli(
+      ["compliance", "evidence", "--all-frameworks", "--period", "2026-Q2"],
+      { cwd: tmp },
+    );
+    expect(result.exitCode).toBe(0);
+    for (const framework of ["soc2", "iso27001", "hipaa"]) {
+      expect(result.stdout).toContain(`${framework}/`);
+      expect(existsSync(join(tmp, ".crewhaus", "compliance", framework))).toBe(true);
+    }
+  });
+
+  test("--framework and --all-frameworks are mutually exclusive", async () => {
+    const result = await runCli(
+      ["compliance", "evidence", "--framework", "soc2", "--all-frameworks", "--period", "2026-Q2"],
+      { cwd: tmp },
+    );
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("mutually exclusive");
+  });
+
+  test("--control cannot combine with --all-frameworks", async () => {
+    const result = await runCli(
+      ["compliance", "evidence", "--all-frameworks", "--control", "CC6.1", "--period", "2026-Q2"],
+      { cwd: tmp },
+    );
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("--control is framework-specific");
+  });
+
+  test("omitting both --framework and --all-frameworks dies pointing at both options", async () => {
+    const result = await runCli(["compliance", "evidence", "--period", "2026-Q2"], { cwd: tmp });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("--framework <id> is required (or pass --all-frameworks)");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Item 35 — `crewhaus retention` sweep/export/purge (GDPR/TTL enforcement).
+// ---------------------------------------------------------------------------
+
+const RETENTION_MS_PER_DAY = 86_400_000;
+
+/** Drop an expired session file (backdated mtime) into `<root>/.crewhaus/sessions`. */
+function seedExpiredSession(root: string, id: string, ageDays: number): string {
+  const dir = join(root, ".crewhaus", "sessions");
+  mkdirSync(dir, { recursive: true });
+  const file = join(dir, `${id}.json`);
+  writeFileSync(file, JSON.stringify({ id, name: "t" }));
+  const old = new Date(Date.now() - ageDays * RETENTION_MS_PER_DAY);
+  utimesSync(file, old, old);
+  return file;
+}
+
+describe("crewhaus retention (item 35)", () => {
+  test("--help documents the verbs, the audit exclusion, and the evidence record", async () => {
+    const result = await runCli(["retention", "sweep", "--help"]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("--dry-run");
+    expect(result.stdout).toContain("NEVER deleted");
+    expect(result.stdout).toContain("retention_enforcement");
+  });
+
+  test("an unknown retention action dies with the allowed list", async () => {
+    const result = await runCli(["retention", "gc"]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("retention action must be one of: sweep, export, purge");
+  });
+
+  test("sweep --dry-run reports the would-delete set without deleting or appending evidence", async () => {
+    const file = seedExpiredSession(tmp, "sess_1111111111111111", 40);
+    const result = await runCli(["retention", "sweep", "--dry-run", "--dir", tmp]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("would delete session:sess_1111111111111111");
+    expect(result.stdout).toContain("dry run: nothing deleted, no evidence appended");
+    expect(existsSync(file)).toBe(true);
+    expect(existsSync(join(tmp, ".crewhaus", "audit"))).toBe(false);
+  });
+
+  test("a real sweep deletes expired sessions, keeps audit day files, and appends verifiable evidence", async () => {
+    const expired = seedExpiredSession(tmp, "sess_1111111111111111", 40);
+    const fresh = seedExpiredSession(tmp, "sess_2222222222222222", 1);
+    const auditDir = join(tmp, ".crewhaus", "audit");
+    await seedAuditLog(auditDir, ["policy_decision"]);
+    const dayFile = readdirSync(auditDir).find((f) => f.endsWith(".jsonl")) as string;
+
+    const result = await runCli(["retention", "sweep", "--dir", tmp]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("deleted session:sess_1111111111111111");
+    expect(result.stdout).toContain("audit chain integrity");
+    expect(result.stdout).toContain("evidence appended to .crewhaus/audit");
+    expect(existsSync(expired)).toBe(false);
+    expect(existsSync(fresh)).toBe(true);
+    expect(existsSync(join(auditDir, dayFile))).toBe(true);
+
+    // The sweep's own evidence record landed on an intact chain.
+    const verifyResult = await runCli(["audit", "verify", "--dir", auditDir]);
+    expect(verifyResult.exitCode).toBe(0);
+    expect(readFileSync(join(auditDir, dayFile), "utf8")).toContain('"retention_enforcement"');
+  });
+
+  test("export copies records out (originals untouched) and writes a manifest", async () => {
+    seedExpiredSession(tmp, "sess_1111111111111111", 40);
+    await seedAuditLog(join(tmp, ".crewhaus", "audit"), ["model_call"]);
+    const outDir = join(tmp, "gdpr-export");
+    const result = await runCli(["retention", "export", outDir, "--dir", tmp]);
+    expect(result.exitCode).toBe(0);
+    expect(existsSync(join(outDir, "sessions", "sess_1111111111111111.json"))).toBe(true);
+    expect(existsSync(join(outDir, "manifest.json"))).toBe(true);
+    expect(existsSync(join(tmp, ".crewhaus", "sessions", "sess_1111111111111111.json"))).toBe(true);
+    expect(result.stdout).toContain("complete audit export");
+  });
+
+  test("export without <outDir> and purge with a bad --before both die cleanly", async () => {
+    const missingOut = await runCli(["retention", "export", "--dir", tmp]);
+    expect(missingOut.exitCode).toBe(1);
+    expect(missingOut.stderr).toContain("missing <outDir>");
+
+    const badBefore = await runCli(["retention", "purge", "--before", "not-a-date", "--dir", tmp]);
+    expect(badBefore.exitCode).toBe(1);
+    expect(badBefore.stderr).toContain('invalid --before "not-a-date"');
+  });
+
+  test("purge --dry-run via the CLI leaves files intact and appends no evidence (F1 BLOCKER)", async () => {
+    // Verified-by-execution regression: this exact invocation used to
+    // perform a REAL purge.
+    const file = seedExpiredSession(tmp, "sess_1111111111111111", 40);
+    const result = await runCli(["retention", "purge", "--dry-run", "--dir", tmp]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("(dry run)");
+    expect(result.stdout).toContain("would delete session:sess_1111111111111111");
+    expect(result.stdout).toContain("dry run: nothing deleted, no evidence appended");
+    expect(existsSync(file)).toBe(true);
+    expect(existsSync(join(tmp, ".crewhaus", "audit"))).toBe(false);
+  });
+
+  test("export --dry-run via the CLI writes nothing (F1)", async () => {
+    seedExpiredSession(tmp, "sess_1111111111111111", 40);
+    const outDir = join(tmp, "gdpr-export");
+    const result = await runCli(["retention", "export", outDir, "--dry-run", "--dir", tmp]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("(dry run)");
+    expect(result.stdout).toContain("would export 1 session(s)");
+    expect(result.stdout).toContain("dry run — nothing written, no evidence appended");
+    expect(existsSync(outDir)).toBe(false);
+    expect(existsSync(join(tmp, ".crewhaus", "audit"))).toBe(false);
+  });
+
+  test("filter flags on unsupported actions are REJECTED, not silently ignored (F1)", async () => {
+    const file = seedExpiredSession(tmp, "sess_1111111111111111", 40);
+
+    // --since is export-only.
+    for (const action of ["sweep", "purge"]) {
+      const r = await runCli(["retention", action, "--since", "2026-01-01", "--dir", tmp]);
+      expect(r.exitCode).toBe(1);
+      expect(r.stderr).toContain(`--since is not supported by "retention ${action}"`);
+    }
+    // --before is purge-only.
+    const sweepBefore = await runCli([
+      "retention",
+      "sweep",
+      "--before",
+      "2026-01-01",
+      "--dir",
+      tmp,
+    ]);
+    expect(sweepBefore.exitCode).toBe(1);
+    expect(sweepBefore.stderr).toContain('--before is not supported by "retention sweep"');
+    const exportBefore = await runCli([
+      "retention",
+      "export",
+      join(tmp, "out"),
+      "--before",
+      "2026-01-01",
+      "--dir",
+      tmp,
+    ]);
+    expect(exportBefore.exitCode).toBe(1);
+    expect(exportBefore.stderr).toContain('--before is not supported by "retention export"');
+    // Every rejected invocation deleted/exported nothing.
+    expect(existsSync(file)).toBe(true);
+    expect(existsSync(join(tmp, "out"))).toBe(false);
+  });
+
+  test("export refuses <root>/.crewhaus as outDir (F5 containment)", async () => {
+    seedExpiredSession(tmp, "sess_1111111111111111", 40);
+    const result = await runCli(["retention", "export", join(tmp, ".crewhaus"), "--dir", tmp]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("overlaps the live store");
+    expect(existsSync(join(tmp, ".crewhaus", "sessions", "sess_1111111111111111.json"))).toBe(true);
+  });
+});
+
+describe("crewhaus spec auto-register + changelog (item 46)", () => {
+  // Every run uses `cwd: tmp` so the registry (.crewhaus/specs) lands in the
+  // per-test temp dir, not the repo checkout.
+  const REGISTRY = () => join(tmp, ".crewhaus", "specs");
+
+  function writeSpecVariant(instructions: string): string {
+    const src = readFileSync(HELLO_SPEC, "utf-8");
+    const specPath = join(tmp, "crewhaus.yaml");
+    writeFileSync(
+      specPath,
+      src.replace(/instructions: \|[\s\S]*$/m, `instructions: ${instructions}\n`),
+    );
+    return specPath;
+  }
+
+  test("a successful compile auto-registers v1 and starts the changelog", async () => {
+    const out = join(tmp, "out");
+    const result = await runCli(["compile", HELLO_SPEC, "-o", out], { cwd: tmp });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("registered hello@v1");
+    expect(existsSync(join(REGISTRY(), "hello", "v1.yaml"))).toBe(true);
+    expect(existsSync(join(REGISTRY(), "hello", "manifest.json"))).toBe(true);
+    const changelog = readFileSync(join(REGISTRY(), "hello", "CHANGELOG.md"), "utf-8");
+    expect(changelog).toContain("# Changelog — hello");
+    expect(changelog).toContain("## v1");
+    expect(changelog).toContain("- initial version");
+  });
+
+  test("recompiling an unchanged spec is a registry no-op", async () => {
+    const out = join(tmp, "out");
+    const first = await runCli(["compile", HELLO_SPEC, "-o", out], { cwd: tmp });
+    expect(first.stdout).toContain("registered hello@v1");
+    const second = await runCli(["compile", HELLO_SPEC, "-o", out], { cwd: tmp });
+    expect(second.exitCode).toBe(0);
+    expect(second.stdout).toContain("unchanged hello@v1");
+    const changelog = readFileSync(join(REGISTRY(), "hello", "CHANGELOG.md"), "utf-8");
+    expect(changelog.match(/^## /gm)).toHaveLength(1);
+  });
+
+  test("a changed spec registers v2 with a field-level diff, newest entry first", async () => {
+    const out = join(tmp, "out");
+    const v1 = writeSpecVariant("Answer briefly.");
+    await runCli(["compile", v1, "-o", out], { cwd: tmp });
+    const v2 = writeSpecVariant("Answer thoroughly.");
+    const result = await runCli(["compile", v2, "-o", out], { cwd: tmp });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("registered hello@v2");
+    const changelog = readFileSync(join(REGISTRY(), "hello", "CHANGELOG.md"), "utf-8");
+    expect(changelog).toContain("- changed `agent.instructions`");
+    expect(changelog.indexOf("## v2")).toBeLessThan(changelog.indexOf("## v1"));
+  });
+
+  test("--no-register skips the auto-put entirely", async () => {
+    const out = join(tmp, "out");
+    const result = await runCli(["compile", HELLO_SPEC, "--no-register", "-o", out], { cwd: tmp });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).not.toContain("registered");
+    expect(existsSync(REGISTRY())).toBe(false);
+  });
+
+  test("spec log prints the accumulated changelog", async () => {
+    const out = join(tmp, "out");
+    await runCli(["compile", HELLO_SPEC, "-o", out], { cwd: tmp });
+    const result = await runCli(["spec", "log", "hello"], { cwd: tmp });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("# Changelog — hello");
+    expect(result.stdout).toContain("## v1");
+  });
+
+  test("spec log for an unregistered name dies with a helpful message", async () => {
+    const result = await runCli(["spec", "log", "nope"], { cwd: tmp });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('no changelog for "nope"');
+  });
+
+  test("a manual `spec put` also appends changelog entries (with diff on the second put)", async () => {
+    const f1 = join(tmp, "a.yaml");
+    const f2 = join(tmp, "b.yaml");
+    writeFileSync(f1, "target: cli\nname: demo\nagent:\n  model: m\n  instructions: One.\n");
+    writeFileSync(f2, "target: cli\nname: demo\nagent:\n  model: m\n  instructions: Two.\n");
+    const put1 = await runCli(["spec", "put", "demo", "v1", f1], { cwd: tmp });
+    expect(put1.exitCode).toBe(0);
+    const put2 = await runCli(["spec", "put", "demo", "v2", f2], { cwd: tmp });
+    expect(put2.exitCode).toBe(0);
+    const log = await runCli(["spec", "log", "demo"], { cwd: tmp });
+    expect(log.exitCode).toBe(0);
+    expect(log.stdout).toContain('- changed `agent.instructions`: "One." → "Two."');
+    expect(log.stdout.indexOf("## v2")).toBeLessThan(log.stdout.indexOf("## v1"));
+  });
+
+  test("compile --help and optimize --help document --no-register", async () => {
+    const compileHelp = await runCli(["compile", "--help"]);
+    expect(compileHelp.exitCode).toBe(0);
+    expect(compileHelp.stdout).toContain("--no-register");
+    expect(compileHelp.stdout).toContain("spec log");
+    const optimizeHelp = await runCli(["optimize", "--help"]);
+    expect(optimizeHelp.exitCode).toBe(0);
+    expect(optimizeHelp.stdout).toContain("--no-register");
+  });
+
+  test("spec --help lists the log action", async () => {
+    const result = await runCli(["spec", "log", "--help"]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("spec log <name>");
+    // Review F3: the sanitation behaviour is documented in the help text.
+    expect(result.stdout).toContain('"My Agent" → My-Agent');
+  });
+
+  test("spec log accepts the display name compile registered under its sanitized slot (review F3)", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    writeFileSync(
+      specPath,
+      readFileSync(HELLO_SPEC, "utf-8").replace(/^name: .*$/m, "name: My Agent"),
+    );
+    const out = join(tmp, "out");
+    const compiled = await runCli(["compile", specPath, "-o", out], { cwd: tmp });
+    expect(compiled.exitCode).toBe(0);
+    expect(compiled.stdout).toContain("registered My-Agent@v1");
+    // The raw display name no longer dies — it resolves to the same slot.
+    const log = await runCli(["spec", "log", "My Agent"], { cwd: tmp });
+    expect(log.exitCode).toBe(0);
+    expect(log.stdout).toContain('showing log for My-Agent (sanitized from "My Agent")');
+    expect(log.stdout).toContain("# Changelog — My-Agent");
+    // The sanitized form keeps working too, without the notice.
+    const direct = await runCli(["spec", "log", "My-Agent"], { cwd: tmp });
+    expect(direct.exitCode).toBe(0);
+    expect(direct.stdout).not.toContain("sanitized from");
+  });
+
+  test("changelog + spec log never print credential tokens from instructions (review F1)", async () => {
+    const out = join(tmp, "out");
+    await runCli(["compile", writeSpecVariant("Answer briefly."), "-o", out], { cwd: tmp });
+    const second = await runCli(
+      ["compile", writeSpecVariant("Use key sk-live-DEADBEEFDEADBEEF for calls."), "-o", out],
+      { cwd: tmp },
+    );
+    expect(second.exitCode).toBe(0);
+    const changelog = readFileSync(join(REGISTRY(), "hello", "CHANGELOG.md"), "utf-8");
+    expect(changelog).toContain("- changed `agent.instructions`");
+    expect(changelog).not.toContain("sk-live");
+    expect(changelog).not.toContain("DEADBEEF");
+    expect(changelog).toContain("***");
+    const log = await runCli(["spec", "log", "hello"], { cwd: tmp });
+    expect(log.exitCode).toBe(0);
+    expect(log.stdout).not.toContain("sk-live");
+  });
 });
