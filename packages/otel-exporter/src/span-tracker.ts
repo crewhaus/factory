@@ -129,9 +129,20 @@ export class SpanTracker {
       case "compaction_fired":
         this.emit(buildCompactionSpan(ev as CompactionFiredEvent));
         return;
-      case "permission_decision":
-        this.emit(buildPermissionSpan(ev as PermissionDecisionEvent));
+      case "permission_decision": {
+        const e = ev as PermissionDecisionEvent;
+        // Item 14 added a second `permission_decision` publish carrying the
+        // ask RESOLUTION (`askOutcome` set) after the pre-prompt publish
+        // (`decision: "ask"` with no `askOutcome`). Mirror the advisor
+        // persistence subscriber's de-dupe (runtime-core/observability.ts):
+        // skip the pre-prompt publish and emit only the resolved form, so
+        // an ask still produces exactly one span — now the more informative
+        // one, carrying the actual approved/denied outcome. Allow/deny
+        // decisions have no `askOutcome` and are unaffected.
+        if (e.decision === "ask" && e.askOutcome === undefined) return;
+        this.emit(buildPermissionSpan(e));
         return;
+      }
       case "response_rated":
         this.emit(buildResponseRatedSpan(ev as ResponseRatedEvent));
         return;

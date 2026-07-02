@@ -268,18 +268,17 @@ describe("ruleCompactionThrash", () => {
     );
   }
 
-  it("fires at the edge (3 compactions in ONE session) with a curate patch", () => {
+  it("fires at the edge (3 compactions in ONE session) as advice, never a patch", () => {
     const ctx = buildAdviceContext([session(SESSION_A, compactions(3))]);
     const findings = ruleCompactionThrash(ctx, { spec: CLI_SPEC });
     expect(findings).toHaveLength(1);
     const suggestion = findings[0]?.suggestion;
-    if (suggestion?.kind !== "spec-patch") throw new Error("expected a spec-patch suggestion");
-    expect(suggestion.patch).toMatchObject({
-      path: ["compaction", "curate"],
-      op: "add",
-      value: true,
-    });
-    expect(() => validatePatch(CLI_SPEC, suggestion.patch)).not.toThrow();
+    if (suggestion?.kind !== "advice") throw new Error("expected an advice suggestion");
+    // compaction.curate is not wired at runtime — the rule must not stamp
+    // an inert patch that `optimize --from-advice` could write into the
+    // user's spec while changing nothing.
+    expect(suggestion.text).toContain("not yet wired at runtime");
+    expect(suggestion.text).toContain("sub-agent");
   });
 
   it("compactions spread across sessions do not trip the per-session threshold", () => {
@@ -290,12 +289,13 @@ describe("ruleCompactionThrash", () => {
     expect(ruleCompactionThrash(ctx, { spec: CLI_SPEC })).toEqual([]);
   });
 
-  it("falls back to tuning advice when curate is already enabled", () => {
+  it("stays advice-only (with a curate-specific caveat) when curate is already enabled", () => {
     const ctx = buildAdviceContext([session(SESSION_A, compactions(4))]);
     const findings = ruleCompactionThrash(ctx, { spec: CLI_SPEC_TUNED });
     const suggestion = findings[0]?.suggestion;
     expect(suggestion?.kind).toBe("advice");
-    expect(suggestion?.kind === "advice" && suggestion.text).toContain("dedupeThreshold");
+    expect(suggestion?.kind === "advice" && suggestion.text).toContain("already set");
+    expect(suggestion?.kind === "advice" && suggestion.text).toContain("not yet wired at runtime");
   });
 });
 
@@ -377,7 +377,10 @@ describe("runAdviceRules", () => {
     ]);
     const findings = runAdviceRules(ctx, { spec: CLI_SPEC });
     const patches = findings.filter((f) => f.suggestion.kind === "spec-patch");
-    expect(patches.length).toBeGreaterThanOrEqual(2);
+    // Only truncation-pressure patches here — compaction-thrash is
+    // advice-only (compaction.curate is not wired at runtime, see
+    // ruleCompactionThrash) and repeated-tool-failures never patches.
+    expect(patches.length).toBeGreaterThanOrEqual(1);
     for (const f of findings) {
       if (f.suggestion.kind === "spec-patch") {
         expect(() => validatePatch(CLI_SPEC, f.suggestion.patch)).not.toThrow();

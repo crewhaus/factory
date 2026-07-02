@@ -382,11 +382,16 @@ export const ruleTruncationPressure: AdviceRule = (ctx, opts) => {
 
 /**
  * Compaction thrash: any single session compacting ≥ threshold times.
- * Suggests enabling the compaction curator (`compaction.curate`, already in
- * OPTIMIZABLE_PATHS), which dedupes/reorders context before the summarizer
- * runs. `compaction.threshold` is ALSO whitelisted, but the strict spec
- * schema carries no such key today, so a threshold patch could never apply
- * — when curate is already on, the rule downgrades to advice instead.
+ * ADVICE-ONLY — no auto-applicable SpecPatch. `compaction.curate` is listed
+ * in OPTIMIZABLE_PATHS and lowers to IR (`packages/ir/src/index.ts`,
+ * `IrCompaction.curate`), but no target emitter or runtime-core path
+ * actually consumes it yet (see the IR field's doc comment). A patch that
+ * flips a runtime no-op would pass the `optimize --from-advice` eval gate
+ * trivially (inert change → equal pass rate) and get written into the
+ * user's spec while changing nothing, so this rule surfaces the finding as
+ * a warning with concrete alternatives instead of proposing `curate: true`.
+ * `compaction.threshold` is ALSO whitelisted, but the strict spec schema
+ * carries no such key today, so a threshold patch could never apply either.
  */
 export const ruleCompactionThrash: AdviceRule = (ctx, opts) => {
   const t = resolveThresholds(opts);
@@ -402,27 +407,19 @@ export const ruleCompactionThrash: AdviceRule = (ctx, opts) => {
   const spec = opts?.spec;
   const compaction = specField<Record<string, unknown>>(spec, "compaction");
   const curateOn = compaction?.["curate"] === true;
-  const adviceText =
-    "Sessions are compacting repeatedly, which burns tokens on re-summarization and loses context each pass. " +
-    "Enable compaction.curate (semantic dedupe + relevance reorder), trim tool output volume, or raise the context budget.";
-  const suggestion: AdviceSuggestion = curateOn
-    ? {
-        kind: "advice",
-        text:
-          "compaction.curate is already enabled but sessions still thrash — tune compaction.dedupeThreshold / compaction.relevanceTopK, " +
-          "reduce tool output volume, or raise the context budget for this workload.",
-      }
-    : patchOrAdvice(
-        spec,
-        {
-          target: spec?.target ?? "cli",
-          path: ["compaction", "curate"],
-          op: compaction !== undefined && "curate" in compaction ? "replace" : "add",
-          value: true,
-          rationale: `advise: ${worstCount} compactions in session ${worstSession}`,
-        },
-        adviceText,
-      );
+  const suggestion: AdviceSuggestion = {
+    kind: "advice",
+    text: curateOn
+      ? "compaction.curate is already set but sessions still thrash — that flag is not yet wired at runtime " +
+        "(reserved for a future compaction-curator pass), so it will not help. Reduce compaction thrash by " +
+        "widening the compaction window, trimming which tools are available (fewer tools per turn means less " +
+        "context to summarize), or splitting the work across a sub-agent so each session carries less history."
+      : "Sessions are compacting repeatedly, which burns tokens on re-summarization and loses context each " +
+        "pass. `compaction.curate` is not yet wired at runtime, so enabling it would not help today. Reduce " +
+        "thrash by widening the compaction window, trimming which tools are available (fewer tools per turn " +
+        "means less context to summarize), or splitting the work across a sub-agent so each session carries " +
+        "less history.",
+  };
   return [
     {
       id: "compaction-thrash",
