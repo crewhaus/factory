@@ -194,6 +194,10 @@ export const OPTIMIZABLE_PATHS: Readonly<
 > = Object.freeze({
   cli: Object.freeze([
     Object.freeze(["agent", "instructions"]),
+    // Item 14 — `crewhaus advise`'s truncation-pressure rule patches the
+    // per-turn output-token cap when max_tokens truncations recur; safe to
+    // autotune (a bigger cap can only trade cost for completeness).
+    Object.freeze(["agent", "max_tokens"]),
     Object.freeze(["failure_taxonomy"]),
     Object.freeze(["compaction", "threshold"]),
     // Pillar 2 active context curation — eval-optimizer can flip the

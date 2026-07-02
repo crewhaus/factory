@@ -191,6 +191,17 @@ export type PermissionDecisionEvent = TraceEventEnvelope & {
    *  it supplied one. Absent on non-justification decisions and on binary
    *  judges that omit confidence. */
   justificationConfidence?: number;
+  /**
+   * Advisor groundwork (item 14) — the RESOLUTION of an "ask" decision.
+   * runtime-core publishes the `decision: "ask"` event BEFORE the approval
+   * prompt runs; once the prompt resolves (or the ask collapses to a deny
+   * because single-turn mode has no interactive surface) it publishes a
+   * SECOND `permission_decision` with `decision: "ask"` and this field set.
+   * Absent on the pre-prompt publish and on ordinary allow/deny decisions —
+   * subscribers that want one line per resolved decision (the advisor
+   * persistence subscriber) key on its presence.
+   */
+  askOutcome?: "approved" | "denied";
 };
 
 export type ErrorRecoveredEvent = TraceEventEnvelope & {
