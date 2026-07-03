@@ -93,6 +93,20 @@ export class MigrationEngine {
     return [...this.migrations.keys()].sort();
   }
 
+  /**
+   * #43 — the highest version this engine can migrate TO, i.e. the current
+   * spec-schema version. It is the max `to` across every registered migration
+   * (`0` when none are registered — nothing to upgrade to). `crewhaus upgrade`
+   * uses this as the drift target so the CLI never hardcodes "1".
+   */
+  latestVersion(): number {
+    let latest = 0;
+    for (const m of this.migrations.values()) {
+      if (m.to > latest) latest = m.to;
+    }
+    return latest;
+  }
+
   /** Reset the registry (tests). */
   clear(): void {
     this.migrations.clear();

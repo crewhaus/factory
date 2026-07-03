@@ -46,6 +46,7 @@
         "@crewhaus/hooks-engine": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
+        "@crewhaus/ir-passes": "workspace:*",
         "@crewhaus/justification-judge-claude": "workspace:*",
         "@crewhaus/logging": "workspace:*",
         "@crewhaus/mcp-host": "workspace:*",
@@ -87,6 +88,7 @@
         "@crewhaus/tool-vision-grounding": "workspace:*",
         "@crewhaus/tool-web": "workspace:*",
         "@crewhaus/trace-event-bus": "workspace:*",
+        "yaml": "^2.6.0",
       },
       "devDependencies": {
         "zod": "^3.23.8",
