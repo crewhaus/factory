@@ -500,6 +500,25 @@ import {
   scopeAuditDir,
   scopeAuditSnapshotPath,
 } from "./scope-audit-drift";
+// AUTOMATION-OPPORTUNITIES.md item 50 — `crewhaus security corpus` core
+// (regression dataset grown from blocked-attempt residue + CI-usable
+// regression check + reviewed candidate detector rules), side-effect-free so
+// it is unit-testable (this entry file runs an argv switch on import).
+import {
+  SecurityCorpusError,
+  buildSecurityCorpus,
+  candidateRulesPath,
+  checkSecurityCorpus,
+  clusterCandidateRules,
+  corpusDir,
+  corpusPath,
+  harvestBlockedAttempts,
+  harvestNearMisses,
+  loadSecurityCorpus,
+  parseCorpusSince,
+  renderCorpusBuildLines,
+  renderCorpusCheckLines,
+} from "./security-corpus";
 // Item 48 — `crewhaus security digest` core (windowed rollup over
 // .crewhaus/audit + session event logs, text/json/html renderers, webhook
 // notify), in a side-effect-free module so it is unit-testable (this entry
@@ -1172,6 +1191,20 @@ const SECURITY_SCHEMA: ParseArgsSchema = {
     { name: "notify", takesValue: true },
     // Harness root that owns `.crewhaus/` (mirrors `retention --dir`).
     { name: "dir", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
+// AUTOMATION-OPPORTUNITIES.md item 50 — `security corpus [check]`.
+const SECURITY_CORPUS_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // rollup window over session logs: <N>d or ISO (default all-time).
+    { name: "since", takesValue: true },
+    // harness root that owns .crewhaus/ (mirrors `security digest --dir`).
+    { name: "dir", takesValue: true },
+    // minimum distinct-snippet cluster support to emit a candidate rule.
+    { name: "min-support", takesValue: true },
+    { name: "json", takesValue: false },
     { name: "help", short: "h" },
   ],
 };
@@ -9774,6 +9807,102 @@ async function runSecurityDigest(args: ParsedArgs): Promise<void> {
 }
 
 /**
+ * AUTOMATION-OPPORTUNITIES.md item 50 — `crewhaus security corpus [check]`.
+ *
+ * `security corpus` — harvest the detector's real block residue (prompt-
+ * injection redaction notices in session `tool_result` content) into a
+ * versioned REGRESSION dataset at `.crewhaus/security-corpus/corpus.json`
+ * (one case per rule observed blocking, pinned to a canonical exemplar built
+ * at runtime — never a stored attack payload), and cluster suspicious near-
+ * misses into REVIEWED candidate detector rules at `candidate-rules.json`
+ * (never auto-merged into REGEX_RULES). See security-corpus.ts for the
+ * durability + no-raw-payload design.
+ *
+ * `security corpus check` — run the corpus against the CURRENT detector and
+ * exit non-zero if any previously-blocked exemplar now passes (a detector
+ * regression). CI-usable.
+ */
+async function runSecurityCorpus(args: ParsedArgs, action: "build" | "check"): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus security corpus [--since <N>d|<ISO>] [--min-support N] [--dir <root>] [--json]\n" +
+        "       crewhaus security corpus check [--dir <root>] [--json]\n" +
+        "\n" +
+        "  corpus         harvest blocked prompt-injection attempts (redaction-notice\n" +
+        "                 residue in session logs) into a versioned regression dataset\n" +
+        "                 (.crewhaus/security-corpus/corpus.json) + reviewed candidate\n" +
+        "                 detector rules (candidate-rules.json). No raw attack payload is\n" +
+        "                 stored — cases pin a canonical exemplar built at runtime.\n" +
+        "  corpus check   run the corpus against the CURRENT detector; exit 1 if any\n" +
+        "                 previously-blocked exemplar now passes (regression). CI-usable.\n" +
+        "\n" +
+        "  --since <w>    window over session logs: <N>d or ISO (default: all-time)\n" +
+        "  --min-support  distinct near-miss snippets to emit a candidate rule (default 3)\n" +
+        "  --dir <root>   harness root that owns .crewhaus/ (default: cwd)\n" +
+        "  --json         machine-readable output\n",
+    );
+    return;
+  }
+  const dirFlag = args.flags["dir"];
+  const rootDir = typeof dirFlag === "string" ? resolve(dirFlag) : process.cwd();
+  const json = args.flags["json"] === true;
+
+  if (action === "check") {
+    const path = corpusPath(rootDir);
+    let corpus: ReturnType<typeof loadSecurityCorpus>;
+    try {
+      corpus = loadSecurityCorpus(path);
+    } catch (err) {
+      if (err instanceof SecurityCorpusError) die(err.message);
+      throw err;
+    }
+    if (corpus === undefined) {
+      die(`no corpus at ${path} — run \`crewhaus security corpus\` first`);
+      return;
+    }
+    const result = await checkSecurityCorpus(corpus);
+    if (json) {
+      process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    } else {
+      process.stdout.write(
+        `security corpus check: ${path}\n${renderCorpusCheckLines(result)
+          .map((l) => `  ${l}`)
+          .join("\n")}\n`,
+      );
+    }
+    // CI-usable exit code: a detector regression fails the process.
+    if (result.verdict === "fail") process.exit(1);
+    return;
+  }
+
+  const window = parseCorpusSince(
+    typeof args.flags["since"] === "string" ? args.flags["since"] : undefined,
+  );
+  const harvest = harvestBlockedAttempts({ rootDir, window });
+  const corpus = buildSecurityCorpus(harvest, window.label);
+  const nearMisses = harvestNearMisses({ rootDir, window });
+  const minSupport = intFlag(args, "min-support") ?? 3;
+  const candidates = clusterCandidateRules(nearMisses, minSupport);
+
+  mkdirSync(corpusDir(rootDir), { recursive: true });
+  const cPath = corpusPath(rootDir);
+  const candPath = candidateRulesPath(rootDir);
+  writeFileSync(cPath, `${JSON.stringify(corpus, null, 2)}\n`);
+  writeFileSync(candPath, `${JSON.stringify(candidates, null, 2)}\n`);
+
+  if (json) {
+    process.stdout.write(`${JSON.stringify({ corpus, candidates }, null, 2)}\n`);
+    return;
+  }
+  process.stdout.write(`security corpus: ${rootDir}\n`);
+  for (const line of renderCorpusBuildLines(corpus)) process.stdout.write(`  ${line}\n`);
+  process.stdout.write(
+    `  candidate rules: ${candidates.candidates.length} clustered from ${nearMisses.length} near-miss(es) (min-support ${minSupport}, review before merging)\n`,
+  );
+  process.stdout.write(`  wrote ${cPath}\n  wrote ${candPath}\n`);
+}
+
+/**
  * Item 61 — `crewhaus channel provision|verify <spec.yaml>`: one-command
  * platform-side setup + scope doctor for channel-target specs. Everything is
  * derived from the spec + the adapters' actual API usage (see
@@ -10320,10 +10449,21 @@ switch (subcommand) {
   }
   case "security": {
     const action = rest[0] ?? "";
-    if (action !== "digest") {
-      die(`security action must be "digest" (got "${action}")`);
+    if (action === "digest") {
+      await runSecurityDigest(parseFor(rest.slice(1), SECURITY_SCHEMA));
+    } else if (action === "corpus") {
+      // `security corpus` builds; `security corpus check` runs the regression.
+      const sub = rest[1] === "check" ? "check" : "build";
+      const argsSlice = sub === "check" ? rest.slice(2) : rest.slice(1);
+      try {
+        await runSecurityCorpus(parseFor(argsSlice, SECURITY_CORPUS_SCHEMA), sub);
+      } catch (err) {
+        if (err instanceof CrewhausError) die(err.message);
+        throw err;
+      }
+    } else {
+      die(`security action must be "digest" or "corpus" (got "${action}")`);
     }
-    await runSecurityDigest(parseFor(rest.slice(1), SECURITY_SCHEMA));
     break;
   }
   case "channel": {
