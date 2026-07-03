@@ -299,6 +299,25 @@ import {
   normalizeRating,
   samplesToJsonl,
 } from "./feedback";
+// Item 58 — `crewhaus fleet list|status|run`: cross-harness discovery,
+// inventory/health rollup, and bulk read-only ops, in a side-effect-free
+// module so it is unit-testable (this entry file runs an argv switch on
+// import). Discovery + aggregation are pure reads; the bulk runner spawns
+// per-harness `crewhaus` invocations through an injected seam.
+import {
+  type BuildInventoryDeps,
+  type EvalHealthReader,
+  FleetError,
+  type FleetRunner,
+  type HarnessInventory,
+  type LastEvalEntry,
+  buildFleetInventory,
+  buildHarnessHealth,
+  formatBulkReport,
+  formatInventory as formatFleetInventory,
+  formatHealth,
+  runFleetBulk,
+} from "./fleet";
 // Item 45 — `crewhaus flywheel init|run`: the packaged nightly
 // self-improvement loop (knob/default resolution, the accept-then-write
 // loop with injected steps, the report, and the workflow scaffold), in a
@@ -904,6 +923,19 @@ const FLYWHEEL_SCHEMA: ParseArgsSchema = {
   ],
 };
 
+// Item 58 — `crewhaus fleet list|status|run`. `--root` scopes discovery;
+// `--filter` narrows a bulk `run`; `--allow-mutating` + per-harness confirm
+// gates a mutating bulk op; `--yes` skips the interactive confirm (CI).
+const FLEET_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "root", takesValue: true },
+    { name: "filter", takesValue: true },
+    { name: "allow-mutating", takesValue: false },
+    { name: "yes", short: "y", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
 const EVAL_SCHEMA: ParseArgsSchema = {
   flags: [
     { name: "dataset", takesValue: true },
@@ -1387,6 +1419,7 @@ function usageText(): string {
     "       [--into <dir>] [--force] [--merge feedback|all]",
     "  secrets doctor                       list known secrets via the configured backend",
     "  secrets rotate <name> [--value V]    rotate a named secret (file backend)",
+    "  fleet list|status|run <sub> ...      cross-harness inventory/health + bulk read-ops (item 58)",
     "  spec put|list|get|pin|alias|log ...  versioned spec storage + changelog (Section 28 spec-registry)",
     "  deploy promote|rollback ...          re-pin a spec for an environment (Section 28)",
     "  migrate-all --from N --to N          batch-migrate every spec in the registry",
@@ -8830,6 +8863,190 @@ async function runSecrets(args: ParsedArgs, action: string): Promise<void> {
 }
 
 /**
+ * Item 58 — `crewhaus fleet list|status|run <sub>`. The cross-harness view.
+ *
+ * `list`   — discover every harness (dir with a `crewhaus.yaml`) under
+ *            `--root` (default cwd) and print the rolled-up inventory.
+ * `status` — the same, rendered as a per-harness health rollup
+ *            (registered? eval healthy vs its pinned baseline? open
+ *            incidents? audit present?).
+ * `run <sub> [--filter <glob>]` — run a READ-ONLY subcommand across the
+ *            filtered fleet, aggregating exit codes. A mutating subcommand is
+ *            refused unless `--allow-mutating` AND each harness is confirmed
+ *            (interactive prompt; `--yes` for CI).
+ *
+ * The heavy lifting (discovery, aggregation, health marks, bulk plan) lives
+ * in the side-effect-free `./fleet` module; this handler only wires the real
+ * reader/runner/confirm seams to it.
+ */
+async function runFleet(args: ParsedArgs, action: string): Promise<void> {
+  if (args.flags["help"] || action === "") {
+    process.stdout.write(
+      "usage:\n" +
+        "  crewhaus fleet list [--root <dir>]                  cross-harness inventory\n" +
+        "  crewhaus fleet status [--root <dir>]                per-harness health rollup\n" +
+        "  crewhaus fleet run <sub> [--filter <glob>] [--root <dir>]\n" +
+        "                                                     bulk-run a read-only subcommand\n" +
+        "         [--allow-mutating] [--yes]                  across the filtered fleet\n" +
+        "\n" +
+        "  A harness is any directory carrying a crewhaus.yaml (the standalone-harness\n" +
+        "  convention). Discovery skips .crewhaus/, node_modules/, .git/, dist/.\n" +
+        "  Read-only bulk subcommands: eval, doctor, security digest, audit verify.\n" +
+        "  A mutating subcommand requires --allow-mutating and per-harness confirmation.\n",
+    );
+    return;
+  }
+
+  const rootFlag = args.flags["root"];
+  const root = typeof rootFlag === "string" ? rootFlag : process.cwd();
+
+  // Manifest reader: open the harness's own `.crewhaus/specs` registry and
+  // read the spec's manifest. A spec never registered there → undefined
+  // (unregistered), the row still renders.
+  const { createFileBackedRegistry } = await import("@crewhaus/spec-registry");
+  const readManifest: BuildInventoryDeps["readManifest"] = async (specName, registryRoot) => {
+    try {
+      const reg = createFileBackedRegistry({ rootDir: registryRoot });
+      const manifest = await reg.manifest(specName);
+      // An empty manifest (no versions, no pins) means "not registered".
+      if (manifest.versions.length === 0 && Object.keys(manifest.pins).length === 0) {
+        return undefined;
+      }
+      return manifest;
+    } catch {
+      return undefined;
+    }
+  };
+
+  // Eval-index reader: the harness's `.crewhaus/evals/index.jsonl`, mapped to
+  // the minimal shape the fleet row needs.
+  const readEvalIndex: BuildInventoryDeps["readEvalIndex"] = (evalsDir): LastEvalEntry[] =>
+    readRunIndex(evalsDir).map((e) => ({
+      datasetName: e.datasetName,
+      passRate: e.passRate,
+      ts: e.ts,
+    }));
+
+  const deps: BuildInventoryDeps = { readManifest, readEvalIndex };
+
+  try {
+    if (action === "list") {
+      const rows = await buildFleetInventory(root, deps);
+      for (const line of formatFleetInventory(rows, root)) process.stdout.write(`${line}\n`);
+      return;
+    }
+    if (action === "status") {
+      const rows = await buildFleetInventory(root, deps);
+      // Eval health: the last run for a (spec, its pinned dataset) baseline
+      // held or beat the baseline's pass rate. No baseline yet → healthy (a
+      // fresh harness isn't "attention"); a last run below the pinned
+      // baseline → attention.
+      const readEvalHealth: EvalHealthReader = (evalsDir) => {
+        const runs = readRunIndex(evalsDir);
+        if (runs.length === 0) return { healthy: true, note: "no runs recorded" };
+        const baselines = readBaselines(evalsDir);
+        const baselineList = Object.values(baselines);
+        if (baselineList.length === 0) {
+          return { healthy: true, note: `${runs.length} run(s), no baseline pinned` };
+        }
+        // Newest run per (spec, dataset), compared to the pinned baseline's run.
+        let regressed = false;
+        const notes: string[] = [];
+        for (const b of baselineList) {
+          const forKey = runs
+            .filter((r) => r.specName === b.specName && r.datasetName === b.datasetName)
+            .sort((x, y) => (x.ts < y.ts ? -1 : 1));
+          const latest = forKey[forKey.length - 1];
+          const baselineRun = runs.find((r) => r.runId === b.runId);
+          if (latest === undefined || baselineRun === undefined) continue;
+          if (latest.passRate < baselineRun.passRate) {
+            regressed = true;
+            notes.push(
+              `${b.datasetName} ${(latest.passRate * 100).toFixed(0)}% < baseline ${(baselineRun.passRate * 100).toFixed(0)}%`,
+            );
+          }
+        }
+        return regressed
+          ? { healthy: false, note: `below baseline: ${notes.join("; ")}` }
+          : { healthy: true, note: "all baselines held" };
+      };
+      const health = [];
+      for (const inv of rows) health.push(await buildHarnessHealth(inv, readEvalHealth));
+      for (const line of formatHealth(health, root)) process.stdout.write(`${line}\n`);
+      return;
+    }
+    if (action === "run") {
+      const tokens = [...args.positional];
+      const filterFlag = args.flags["filter"];
+      const filter = typeof filterFlag === "string" ? filterFlag : undefined;
+      const allowMutating = args.flags["allow-mutating"] === true;
+      const assumeYes = args.flags["yes"] === true;
+
+      // Production runner: spawn `crewhaus <argv>` in the harness dir (the cwd
+      // every subcommand resolves `.crewhaus/` state from). No shell — an argv
+      // array through Bun.spawn. The child inherits this process's argv[0]
+      // (the running CLI) so a bulk `doctor` runs the SAME binary.
+      const runner: FleetRunner = async ({ cwd, argv }) => {
+        const proc = Bun.spawn([process.execPath, process.argv[1] as string, ...argv], {
+          cwd,
+          stdin: "ignore",
+          stdout: "pipe",
+          stderr: "pipe",
+        });
+        const [stdout, stderr, exitCode] = await Promise.all([
+          new Response(proc.stdout as ReadableStream).text(),
+          new Response(proc.stderr as ReadableStream).text(),
+          proc.exited,
+        ]);
+        const combined = `${stdout}${stderr}`.trim();
+        return { exitCode, tail: combined };
+      };
+
+      // Per-harness confirm for a mutating bulk op. `--yes` auto-confirms
+      // (scripted/CI); otherwise a y/N prompt per harness.
+      const confirm = async (
+        inv: HarnessInventory,
+        argv: ReadonlyArray<string>,
+      ): Promise<boolean> => {
+        if (assumeYes) return true;
+        return await promptYesNo(
+          `run mutating \`crewhaus ${argv.join(" ")}\` in ${inv.specName} (${inv.dir})? [y/N] `,
+        );
+      };
+
+      const report = await runFleetBulk({
+        root,
+        subcommandTokens: tokens,
+        ...(filter !== undefined ? { filter } : {}),
+        allowMutating,
+        deps,
+        runner,
+        confirm,
+      });
+      for (const line of formatBulkReport(report)) process.stdout.write(`${line}\n`);
+      if (report.failed > 0) process.exit(1);
+      return;
+    }
+    die(`unknown fleet action "${action}" (expected: list | status | run)`);
+  } catch (err) {
+    if (err instanceof FleetError) die(err.message);
+    if (err instanceof CrewhausError) die(err.message);
+    throw err;
+  }
+}
+
+/** A one-off y/N prompt on stdin. Empty / anything not starting with y → no. */
+async function promptYesNo(question: string): Promise<boolean> {
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const answer = await new Promise<string>((res) => rl.question(question, res));
+    return /^y(es)?$/i.test(answer.trim());
+  } finally {
+    rl.close();
+  }
+}
+
+/**
  * Section 28 — `crewhaus spec <action> ...` subcommands wrap the
  * spec-registry. Actions: put / get / list / pin / alias / log (item 46 —
  * render the per-spec CHANGELOG.md that auto-registration and `put` keep
@@ -10114,6 +10331,16 @@ switch (subcommand) {
   case "doctor":
     await runDoctor(parseFor(rest, DOCTOR_SCHEMA));
     break;
+  case "fleet": {
+    // Item 58 — list | status | run <sub>. `run` takes a subcommand as
+    // positionals after the action, so the schema is parsed over the tail.
+    const action = rest[0] ?? "";
+    if (action !== "" && action !== "list" && action !== "status" && action !== "run") {
+      die(`fleet action must be one of: list, status, run (got "${action}")`);
+    }
+    await runFleet(parseFor(rest.slice(1), FLEET_SCHEMA), action);
+    break;
+  }
   case "model-scan":
     try {
       await runModelScan(parseFor(rest, MODEL_SCAN_SCHEMA));
