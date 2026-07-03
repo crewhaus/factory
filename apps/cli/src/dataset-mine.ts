@@ -29,6 +29,7 @@
  * `apps/cli/src/index.ts`.
  */
 import type { Sample } from "@crewhaus/eval-dataset";
+import { DEFAULT_PII_DETECTORS, type PiiDetector } from "@crewhaus/pii-redactor";
 import { REGEX_RULES } from "@crewhaus/prompt-injection-detector";
 import type { LoggedEvent } from "./feedback";
 import { normalizeEvidenceTokens } from "./graders-suggest";
@@ -63,6 +64,46 @@ export const TOOL_ERROR_SPIKE = 2;
 /** Jaccard threshold at/above which two consecutive user inputs are "the same
  *  question re-asked" (a retry signal). */
 export const RETRY_SIMILARITY = 0.6;
+
+// -------- secret / API-key redaction (synthesize) --------
+
+/**
+ * A `synthesize` source sample is real production input and may carry a
+ * pasted credential (an API key dropped into a bug report, a Slack bot token
+ * quoted in a support transcript, …). `@crewhaus/pii-redactor`'s
+ * `DEFAULT_PII_DETECTORS` only covers SSN/credit-card/phone/email/IBAN, so a
+ * secret would otherwise survive redaction into every synthesized variant AND
+ * the model paraphrase prompt.
+ *
+ * Token shapes below are the SAME patterns already used for credential
+ * masking elsewhere in the repo (`packages/ir/src/redact.ts` /
+ * `packages/spec-patch/src/redact.ts` `TOKEN_SHAPE_RES` / `BEARER_RE` /
+ * `CONTEXTUAL_OPAQUE_RE`) — reused here rather than reinvented so the whole
+ * codebase agrees on what a "credential-shaped token" looks like:
+ *   - `sk-…`            OpenAI/Anthropic/Stripe-style secret keys
+ *   - `gh[oprsu]_…`      GitHub tokens (ghp_/gho_/ghu_/ghs_/ghr_)
+ *   - `xox[abprs]-…`     Slack tokens
+ *   - `AKIA…`            AWS access key ids
+ *   - `Bearer <token>`   bearer auth headers pasted into prose
+ *   - a 32+ char opaque token preceded by key/token/secret/password/
+ *     credential context (so ordinary long ids/hashes in prose survive)
+ *
+ * A single `PiiDetector` combining all of the above via alternation, given
+ * `detectPii`/`PiiRedactor` only accept one `regex` per detector kind.
+ */
+export const SECRET_KEY_DETECTOR: PiiDetector = {
+  kind: "secret",
+  regex:
+    /\bsk-[A-Za-z0-9_-]{8,}\b|\bgh[oprsu]_[A-Za-z0-9]{16,}\b|\bxox[abprs]-[A-Za-z0-9-]{10,}\b|\bAKIA[A-Z0-9]{12,}\b|\bbearer\s+[A-Za-z0-9._~+/-]{8,}=*|\b(?:api[-_ ]?)?(?:key|token|secret|password|credential)s?\b["'\s:=-]{0,5}[A-Za-z0-9+/_-]{32,}/gi,
+};
+
+/** `synthesize`'s full detector set: the shared PII defaults plus the
+ *  secret/API-key detector above. Exported so the CLI and tests share one
+ *  source of truth for "what synthesize redacts before mutation/model use". */
+export const SYNTHESIZE_PII_DETECTORS: ReadonlyArray<PiiDetector> = [
+  ...DEFAULT_PII_DETECTORS,
+  SECRET_KEY_DETECTOR,
+];
 
 // -------- turn-aware session scan --------
 

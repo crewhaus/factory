@@ -133,6 +133,7 @@ import { findEmptyControls, resolvePeriodFlag } from "./compliance-schedule";
 // switch on import).
 import {
   type MineCandidate,
+  SYNTHESIZE_PII_DETECTORS,
   buildStressVariants,
   candidateToSample,
   dedupeCandidates,
@@ -778,8 +779,11 @@ const DATASET_SCHEMA: ParseArgsSchema = {
     // (default <spec>-hardcases).
     { name: "out-dataset", takesValue: true },
     // mine — accept/reject quarantined candidates (interactive in a TTY;
-    // non-TTY prints the list).
+    // non-TTY prints the list unless --yes is also given).
     { name: "review", takesValue: false },
+    // mine — required in non-TTY alongside --review to promote candidates
+    // non-interactively (F3: --review alone must never silently auto-accept).
+    { name: "yes", takesValue: false },
     // synthesize — the source dataset (file or registry:<ref>) to grow from.
     { name: "from", takesValue: true },
     // synthesize — how many variants to generate per source sample.
@@ -4770,17 +4774,20 @@ async function runDataset(args: ParsedArgs): Promise<void> {
 async function runDatasetMine(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
-      "usage: crewhaus dataset mine [--sessions N|all] [--out-dataset <name>] [--review]\n" +
+      "usage: crewhaus dataset mine [--sessions N|all] [--out-dataset <name>] [--review] [--yes]\n" +
         "  Scan .crewhaus/sessions/*.jsonl (this spec) for hard cases needing NO\n" +
         "  rating — error events, tool_result isError spikes, the synthetic\n" +
         "  '[runtime] possible loop detected' nudge, consecutive near-duplicate\n" +
         "  user retries — plus egress_decision blocks from .crewhaus/audit (if any).\n" +
         "  Each triggering turn's input becomes a candidate Sample in a QUARANTINE\n" +
         "  staging file (.crewhaus/datasets/_quarantine/<spec>-hardcases.jsonl).\n" +
-        "  --review accepts/rejects candidates (interactive in a TTY: [a]ccept /\n" +
-        "  [r]eject / [s]kip; non-TTY prints the list); accepted candidates promote\n" +
-        "  into the <spec>-hardcases (or --out-dataset) mined registry version with\n" +
-        "  provenance in metadata (source: mine, signal, sessionId).\n",
+        "  --review accepts/rejects candidates: interactive in a TTY ([a]ccept /\n" +
+        "  [r]eject / [s]kip); in non-TTY it only PRINTS the candidates unless --yes\n" +
+        "  is also given, in which case ALL listed candidates promote. This keeps a\n" +
+        "  scripted/CI --review from silently promoting unreviewed candidates.\n" +
+        "  Accepted candidates promote into the <spec>-hardcases (or --out-dataset)\n" +
+        "  mined registry version with provenance in metadata (source: mine, signal,\n" +
+        "  sessionId).\n",
     );
     return;
   }
@@ -4843,16 +4850,25 @@ async function runDatasetMine(args: ParsedArgs): Promise<void> {
     return;
   }
 
-  // Review: interactive per-candidate in a TTY, else print the list.
+  // Review: interactive per-candidate in a TTY. Non-TTY NEVER auto-promotes
+  // on --review alone — that would silently write unreviewed candidates into
+  // the mined dataset from a script/CI run. --yes opts into non-interactive
+  // promotion explicitly; without it we print the candidates and stop.
   let accepted: MineCandidate[];
   if (process.stdin.isTTY === true) {
     accepted = await reviewCandidatesInteractive(candidates);
+  } else if (args.flags["yes"] === true) {
+    process.stdout.write(renderCandidateList(candidates));
+    process.stdout.write(
+      "[dataset mine] non-TTY --yes — accepting ALL listed candidates for promotion\n",
+    );
+    accepted = [...candidates];
   } else {
     process.stdout.write(renderCandidateList(candidates));
     process.stdout.write(
-      "[dataset mine] non-TTY — accepting ALL listed candidates for promotion\n",
+      "[dataset mine] non-TTY — re-run with --yes to promote non-interactively, or --review in a TTY\n",
     );
-    accepted = [...candidates];
+    return;
   }
   if (accepted.length === 0) {
     process.stdout.write("[dataset mine] no candidates accepted — mined dataset unchanged\n");
@@ -4954,10 +4970,14 @@ async function runDatasetSynthesize(args: ParsedArgs): Promise<void> {
 
   const outDataset = strFlag(args, "out-dataset") ?? `${sourceName}-synth`;
 
-  // PII redactor: default regex detectors (SSN/CC/phone/email/IBAN). Redact
-  // BEFORE any mutation or model call so no PII leaves the box.
+  // PII redactor: default regex detectors (SSN/CC/phone/email/IBAN) PLUS the
+  // secret/API-key detector (sk-/ghp_/xoxb-/AKIA/Bearer <token>/contextual
+  // opaque token — see dataset-mine.ts SYNTHESIZE_PII_DETECTORS) so a pasted
+  // credential in a production input can't survive into a synthesized
+  // variant or the model paraphrase prompt below. Redact BEFORE any mutation
+  // or model call so no PII/secret ever leaves the box.
   const { createPiiRedactor } = await import("@crewhaus/pii-redactor");
-  const redactor = createPiiRedactor();
+  const redactor = createPiiRedactor({ regexDetectors: SYNTHESIZE_PII_DETECTORS });
 
   // Model paraphrases are opt-in when a model + credentials are visible. The
   // budget gate bounds them (estimate-before/record-after). Without a model we

@@ -158,6 +158,9 @@ describe("crewhaus datasets CLI (item 12)", () => {
     expect((await runCli(["datasets", "list"], root)).exitCode).toBe(0);
   });
 
+  // This test does 6 sequential CLI cold-starts; under CI contention the
+  // default 5000ms/test budget is too tight (narrower still with this
+  // branch's +3 import deps), so it gets extra headroom (15000ms, 3rd arg).
   test("get resolves the latest version / an explicit split; failures exit 1", async () => {
     const root = newTempRoot();
     const file = writeDatasetFile(root, 10);
@@ -170,7 +173,7 @@ describe("crewhaus datasets CLI (item 12)", () => {
       1,
     );
     expect((await runCli(["datasets", "get"], root)).exitCode).toBe(1);
-  });
+  }, 15000);
 });
 
 describe("crewhaus distill --register (item 12)", () => {

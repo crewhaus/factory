@@ -10,9 +10,12 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SampleSchema } from "@crewhaus/eval-dataset";
+import { createPiiRedactor } from "@crewhaus/pii-redactor";
 import {
   DatasetMineError,
   type MineCandidate,
+  SECRET_KEY_DETECTOR,
+  SYNTHESIZE_PII_DETECTORS,
   ambiguateInput,
   buildStressVariants,
   candidateId,
@@ -260,6 +263,82 @@ describe("synthesize mutations", () => {
   });
 });
 
+describe("secret/API-key redaction (F1)", () => {
+  const redactor = createPiiRedactor({ regexDetectors: SYNTHESIZE_PII_DETECTORS });
+
+  it("SYNTHESIZE_PII_DETECTORS still includes the shared PII defaults", () => {
+    expect(SYNTHESIZE_PII_DETECTORS.some((d) => d.kind === "email")).toBe(true);
+    expect(SYNTHESIZE_PII_DETECTORS.some((d) => d.kind === "ssn")).toBe(true);
+    expect(SYNTHESIZE_PII_DETECTORS.some((d) => d.kind === "secret")).toBe(true);
+  });
+
+  it("redacts an OpenAI/Anthropic-style sk- key", async () => {
+    const { text } = await redactor.redact(
+      "here is my key sk-DEADBEEF1234567890ABCDEFGHIJ for the integration",
+    );
+    expect(text).not.toContain("sk-DEADBEEF1234567890ABCDEFGHIJ");
+    expect(text).toContain("[REDACTED:secret]");
+  });
+
+  it("redacts a GitHub personal access token", async () => {
+    const { text } = await redactor.redact("token: ghp_1234567890abcdefGHIJKLMNOPQR");
+    expect(text).not.toContain("ghp_1234567890abcdefGHIJKLMNOPQR");
+    expect(text).toContain("[REDACTED:secret]");
+  });
+
+  it("redacts a Slack bot token", async () => {
+    // Built at runtime from parts so the literal token never appears in source
+    // (GitHub push-protection flags a real-shaped Slack token even in a fixture);
+    // the assembled value still matches SECRET_KEY_DETECTOR's xox[abprs]- rule.
+    const slack = ["xoxb", "1234567890", "abcdefghijklmnop"].join("-");
+    const { text } = await redactor.redact(`bot token ${slack}`);
+    expect(text).not.toContain(slack);
+    expect(text).toContain("[REDACTED:secret]");
+  });
+
+  it("redacts an AWS access key id", async () => {
+    const { text } = await redactor.redact("AKIAIOSFODNN7EXAMPLE is the access key");
+    expect(text).not.toContain("AKIAIOSFODNN7EXAMPLE");
+    expect(text).toContain("[REDACTED:secret]");
+  });
+
+  it("redacts a Bearer token in prose", async () => {
+    const { text } = await redactor.redact("call it with Bearer abcdefghijklmnopqrstuvwxyz012345");
+    expect(text).not.toContain("abcdefghijklmnopqrstuvwxyz012345");
+    expect(text).toContain("[REDACTED:secret]");
+  });
+
+  it("redacts a generic 32+ char opaque token behind key-ish context", async () => {
+    const { text } = await redactor.redact(
+      "secret=abcdefghijklmnopqrstuvwxyz0123456789 please rotate it",
+    );
+    expect(text).not.toContain("abcdefghijklmnopqrstuvwxyz0123456789");
+    expect(text).toContain("[REDACTED:secret]");
+  });
+
+  it("leaves ordinary prose (no key-ish context) untouched", async () => {
+    const { text } = await redactor.redact("deploy the payments service to production");
+    expect(text).toBe("deploy the payments service to production");
+  });
+
+  it("still redacts existing PII kinds alongside secrets (SSN + email)", async () => {
+    const { text } = await redactor.redact(
+      "contact jane@example.com re SSN 219-09-9999 and key sk-DEADBEEF1234567890ABCD",
+    );
+    expect(text).not.toContain("jane@example.com");
+    expect(text).not.toContain("219-09-9999");
+    expect(text).not.toContain("sk-DEADBEEF1234567890ABCD");
+    expect(text).toContain("[REDACTED:email]");
+    expect(text).toContain("[REDACTED:ssn]");
+    expect(text).toContain("[REDACTED:secret]");
+  });
+
+  it("SECRET_KEY_DETECTOR is exported standalone with kind 'secret'", () => {
+    expect(SECRET_KEY_DETECTOR.kind).toBe("secret");
+    expect(SECRET_KEY_DETECTOR.regex.test("sk-DEADBEEF1234567890ABCDEFGHIJ")).toBe(true);
+  });
+});
+
 describe("variantToSample", () => {
   it("tags synthetic provenance and NEVER carries an expected_output", () => {
     const s = variantToSample({ input: "paraphrased", mutation: "paraphrase" }, "gold_01", 1);
@@ -369,6 +448,46 @@ describe("crewhaus dataset mine (CLI, offline)", () => {
     writeFileSync(join(root, "crewhaus.yaml"), CLI_SPEC);
     expect((await runCli(["dataset", "mine"], root)).exitCode).toBe(0);
   });
+
+  // F3 — non-TTY `--review` must NOT auto-promote without an explicit --yes.
+  function seedHardCaseSession(root: string): void {
+    writeFileSync(join(root, "crewhaus.yaml"), CLI_SPEC);
+    const sessionsDir = join(root, ".crewhaus", "sessions");
+    mkdirSync(sessionsDir, { recursive: true });
+    const session = [
+      user("deploy the payments service to production"),
+      { kind: "assistant_message", payload: { content: [{ type: "text", text: "trying" }] } },
+      toolResult(true),
+      toolResult(true),
+    ]
+      .map((e) => JSON.stringify(e))
+      .join("\n");
+    writeFileSync(join(sessionsDir, "sess_00000000000000d2.jsonl"), `${session}\n`);
+  }
+
+  it("non-TTY --review WITHOUT --yes promotes nothing (F3)", async () => {
+    const root = newTempRoot();
+    seedHardCaseSession(root);
+
+    const got = await runCli(["dataset", "mine", "--review"], root);
+    expect(got.exitCode).toBe(0);
+    // No mined registry dataset was created — nothing was promoted.
+    expect(existsSync(join(root, ".crewhaus", "datasets", "helper-hardcases"))).toBe(false);
+  });
+
+  it("non-TTY --review WITH --yes promotes all listed candidates (F3)", async () => {
+    const root = newTempRoot();
+    seedHardCaseSession(root);
+
+    const got = await runCli(["dataset", "mine", "--review", "--yes"], root);
+    expect(got.exitCode).toBe(0);
+    const registryDir = join(root, ".crewhaus", "datasets", "helper-hardcases");
+    expect(existsSync(registryDir)).toBe(true);
+    expect(existsSync(join(registryDir, "v1.json"))).toBe(true);
+    const rec = JSON.parse(readFileSync(join(registryDir, "v1.json"), "utf-8"));
+    const all = [...rec.splits.train, ...rec.splits.dev, ...(rec.splits.test ?? [])];
+    expect(all.length).toBe(1);
+  });
 });
 
 describe("crewhaus dataset synthesize (CLI, offline)", () => {
@@ -419,5 +538,56 @@ describe("crewhaus dataset synthesize (CLI, offline)", () => {
       (await runCli(["dataset", "synthesize", "--from", "nope.jsonl", "--out-dataset", "x"], root))
         .exitCode,
     ).toBe(1);
+  });
+
+  // F1 + F2 — redact-before-mutate-and-write ordering. Offline (no provider
+  // credentials in env → the model-paraphrase branch never runs), so this
+  // pins the ordering for the deterministic path: every written -synth
+  // sample must be built from the REDACTED source input, never the raw one.
+  it("redacts a fake SSN + email + API key before any -synth sample is written (F1/F2)", async () => {
+    const root = newTempRoot();
+    const goldPath = join(root, "gold.jsonl");
+    const rawInput =
+      "My SSN is 219-09-9999, email me at jane@example.com, and here is the key " +
+      "sk-DEADBEEF1234567890ABCDEFGHIJ so you can redeploy the workers now please.";
+    writeFileSync(goldPath, JSON.stringify({ id: "g1", input: rawInput, expected_output: "done" }));
+
+    const got = await runCli(
+      ["dataset", "synthesize", "--from", "gold.jsonl", "--count", "5", "--out-dataset", "leaky"],
+      root,
+    );
+    expect(got.exitCode).toBe(0);
+
+    const rec = JSON.parse(
+      readFileSync(join(root, ".crewhaus", "datasets", "leaky", "v1.json"), "utf-8"),
+    );
+    const all = [...rec.splits.train, ...rec.splits.dev, ...(rec.splits.test ?? [])] as Array<{
+      input: string;
+      metadata: Record<string, unknown>;
+    }>;
+    expect(all.length).toBeGreaterThan(0);
+
+    const asText = JSON.stringify(all);
+    // No raw secret/PII anywhere in the written registry version, in ANY
+    // variant — including the truncated one, which only keeps the first
+    // half of the (already-redacted) sentence.
+    expect(asText).not.toContain("sk-DEADBEEF1234567890ABCDEFGHIJ");
+    expect(asText).not.toContain("219-09-9999");
+    expect(asText).not.toContain("jane@example.com");
+    for (const s of all) {
+      expect(s.metadata["source"]).toBe("synthesize");
+    }
+    // Mutation is applied to the ALREADY-redacted text (redact-before-mutate
+    // ordering): every non-truncated variant retains all three markers, and
+    // at least one variant (paraphrase, which doesn't shorten) proves the
+    // key marker survived the full pipeline.
+    const nonTruncated = all.filter((s) => s.metadata["mutation"] !== "truncate");
+    expect(nonTruncated.length).toBeGreaterThan(0);
+    for (const s of nonTruncated) {
+      if (s.metadata["mutation"] === "ambiguate") continue; // rewrites the whole sentence
+      expect(s.input).toContain("[REDACTED:secret]");
+      expect(s.input).toContain("[REDACTED:ssn]");
+      expect(s.input).toContain("[REDACTED:email]");
+    }
   });
 });
