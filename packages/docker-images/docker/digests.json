@@ -1,4 +1,76 @@
 {
   "_comment": "Pinned image digests for reproducible builds. Every entry is a REGISTRY MANIFEST digest (the only digest `docker pull repo@sha256:...` accepts), recorded from pushed builds only: `crewhaus build-image --push` records here by default (opt out with --no-record), and the Release workflow's docker-digests job records the pushed ghcr.io/crewhaus/<target> digests for each v* tag. Local --load builds record nothing — a local image ID is a config digest, not a pullable pin. Format: `{ \"<target>\": { \"<tag>\": { \"sha256\": \"<digest>\", \"builtAt\": \"<iso>\" } } }`.",
-  "_format_version": 1
+  "_format_version": 1,
+  "batch": {
+    "0.2.0": {
+      "sha256": "sha256:4eea75fe9147aad30c11339b1291215a6136ceb1e97d59010a91304cf2a6031a",
+      "builtAt": "2026-07-03T06:44:26.432Z"
+    }
+  },
+  "browser": {
+    "0.2.0": {
+      "sha256": "sha256:55db38c2e88ac16b95a349fc69172669984a061f2b8af9a95660e15c27663e96",
+      "builtAt": "2026-07-03T06:44:27.172Z"
+    }
+  },
+  "channel": {
+    "0.2.0": {
+      "sha256": "sha256:3917cbdda86a401b72767c57e3307a01bae3a8b5467436be69b1c0d43a00e732",
+      "builtAt": "2026-07-03T06:44:27.959Z"
+    }
+  },
+  "cli": {
+    "0.2.0": {
+      "sha256": "sha256:072dabd488f3d24568ba7a76bce13f55d39493fb5f5b79b8ca272190f75fa2be",
+      "builtAt": "2026-07-03T06:44:28.759Z"
+    }
+  },
+  "crew": {
+    "0.2.0": {
+      "sha256": "sha256:bf82a585954fc35bd4b2af6ae2d5b866bf478f9abbcd9d77c8b47ddde610ffde",
+      "builtAt": "2026-07-03T06:44:29.458Z"
+    }
+  },
+  "eval": {
+    "0.2.0": {
+      "sha256": "sha256:7cf684200e60c0985aee9fab5c35140483baee0bcb62fb983d987d70e593d3d7",
+      "builtAt": "2026-07-03T06:44:30.149Z"
+    }
+  },
+  "graph": {
+    "0.2.0": {
+      "sha256": "sha256:c78e2a76ac4cfe86066554671dc835d9b94b217fdd73254f9a15ba55b9ef3765",
+      "builtAt": "2026-07-03T06:44:30.846Z"
+    }
+  },
+  "managed": {
+    "0.2.0": {
+      "sha256": "sha256:d6ac46d7268435028c3327b345b420ae234901fe43480cdcbba17c3688fab43c",
+      "builtAt": "2026-07-03T06:44:31.735Z"
+    }
+  },
+  "pipeline": {
+    "0.2.0": {
+      "sha256": "sha256:78a94fd966bd9e49f5549b4bfb0477a4547355bb65bfff4882ab7920a0c228dc",
+      "builtAt": "2026-07-03T06:44:32.481Z"
+    }
+  },
+  "research": {
+    "0.2.0": {
+      "sha256": "sha256:a104f567eb676633b09d490af30579d60b1eb80e74c3ac86e6931f25f8012968",
+      "builtAt": "2026-07-03T06:44:33.178Z"
+    }
+  },
+  "voice": {
+    "0.2.0": {
+      "sha256": "sha256:ac1da178f6c97ba26531da552de2305ff1f620b95803a463dd98b09a2e3d1c0b",
+      "builtAt": "2026-07-03T06:44:33.893Z"
+    }
+  },
+  "workflow": {
+    "0.2.0": {
+      "sha256": "sha256:850568bc4aa59ded05f30dcb71e0a62a8e0116d1c9dd897d85cd5bc93cbf8e42",
+      "builtAt": "2026-07-03T06:44:34.581Z"
+    }
+  }
 }
