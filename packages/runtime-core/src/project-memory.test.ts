@@ -136,10 +136,42 @@ describe("loadProjectMemory", () => {
       "CLAUDE.md",
       "CODE-COMPANION.md",
       "AGENT.md",
+      "LESSONS.md",
     ]);
   });
 
   test("DEFAULT_PROJECT_MEMORY_CAP_BYTES is 64 KB", () => {
     expect(DEFAULT_PROJECT_MEMORY_CAP_BYTES).toBe(64 * 1024);
+  });
+
+  // Item #56 — LESSONS.md is a canonical memory file, so it auto-loads.
+  test("loads LESSONS.md when present", async () => {
+    const dir = setUpWorkdir({ "LESSONS.md": "# LESSONS\n- prefer bun over npm" });
+    const result = await loadProjectMemory({ cwd: dir });
+    expect(result.files.map((f) => f.filename)).toContain("LESSONS.md");
+    expect(result.prompt).toContain('<project_memory file="LESSONS.md">');
+    expect(result.prompt).toContain("prefer bun over npm");
+  });
+
+  // Item #56 — per-user preference files (absolute paths outside cwd) inject
+  // via `extraFiles`, wrapped like the canonical files.
+  test("injects a per-user preferences file via extraFiles", async () => {
+    const dir = setUpWorkdir({});
+    const prefsDir = mkdtempSync(join(workdir, "prefs-"));
+    const prefsFile = join(prefsDir, "max.md");
+    writeFileSync(prefsFile, "# Preferences — max\n- be concise");
+    const result = await loadProjectMemory({ cwd: dir, extraFiles: [prefsFile] });
+    expect(result.files.map((f) => f.filename)).toContain("max.md");
+    expect(result.prompt).toContain('<project_memory file="max.md">');
+    expect(result.prompt).toContain("be concise");
+  });
+
+  test("extraFiles that do not exist are silently skipped", async () => {
+    const dir = setUpWorkdir({});
+    const result = await loadProjectMemory({
+      cwd: dir,
+      extraFiles: [join(dir, "nope.md")],
+    });
+    expect(result.files).toEqual([]);
   });
 });

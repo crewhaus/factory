@@ -392,6 +392,15 @@ import {
   openJustificationAuditSink,
   resolveJudgeChoice,
 } from "./justification-gate";
+// Item #56 — auto-maintained LESSONS.md + per-user preference files.
+import {
+  mergeLessons,
+  mineLessons,
+  minePreferences,
+  parseLessonsMd,
+  renderLessonsMd,
+  renderPreferencesMd,
+} from "./lessons";
 // Item 41 — `crewhaus lint` (parse + ir-passes collect-all + scope audit) and
 // `compile --watch` (debounced re-validate loop) live in side-effect-free
 // modules so this entry file stays testable.
@@ -623,6 +632,10 @@ const RUN_SCHEMA: ParseArgsSchema = {
     // `stop`). On reaching the cap the run stops (or degrades) before the
     // next turn.
     { name: "budget-usd", takesValue: true },
+    // Item #56 — identify the current user so their
+    // `.crewhaus/preferences/<user>.md` is injected at run start (alongside
+    // the auto-loaded LESSONS.md). Flag > CREWHAUS_USER env.
+    { name: "user", takesValue: true },
     { name: "help", short: "h" },
   ],
 };
@@ -966,6 +979,18 @@ const FAQ_SCHEMA: ParseArgsSchema = {
   ],
 };
 
+// Item #56 — `crewhaus lessons update`: mine corrections + failure→fix
+// patterns into a deduped LESSONS.md and maintain per-user preference files.
+const LESSONS_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "sessions", takesValue: true },
+    { name: "low-score", takesValue: true },
+    // Override the LESSONS.md path (default `<cwd>/LESSONS.md`).
+    { name: "out", short: "o", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
 // Item 12 — the dataset-registry CLI face (`datasets list|get|put`).
 const DATASETS_SCHEMA: ParseArgsSchema = {
   flags: [
@@ -1292,6 +1317,8 @@ function usageText(): string {
     "  fewshot show [--k N]                 print the pool as the injectable prompt block",
     "  faq distill [--sessions N|all]       cluster recurring questions into an auto-loaded FAQ skill (#55)",
     "       [--min-score F] [--min-occurrences N] [-o <skill-dir>]",
+    "  lessons update [--sessions N|all]    mine corrections + failures into an auto-loaded LESSONS.md (#56)",
+    "       [--low-score F] [-o <LESSONS.md>]  + per-user prefs under .crewhaus/preferences/",
     "  datasets list                        all registered datasets + versions (Section 29)",
     "  datasets get <name>[@version]        print a dataset's samples as JSONL",
     "       [--split train|dev|test]",
@@ -2995,6 +3022,19 @@ async function runRunCli(
     };
   }
 
+  // Item #56 — resolve the current user's preference file (flag > env) so the
+  // runtime injects `.crewhaus/preferences/<user>.md` at run start. Absent when
+  // no user is identified or the file doesn't exist yet.
+  const preferenceFiles: string[] = [];
+  const userId = strFlag(args, "user") ?? process.env["CREWHAUS_USER"];
+  if (typeof userId === "string" && userId.trim() !== "") {
+    const prefsFile = join(process.cwd(), PREFERENCES_SUBDIR, preferenceFileName(userId));
+    if (existsSync(prefsFile)) {
+      preferenceFiles.push(prefsFile);
+      process.stdout.write(`[memory] injecting preferences for user "${userId}"\n`);
+    }
+  }
+
   // Section 13 — when the IR carries inline sub-agent definitions, build the
   // registry, register the Task tool, and inject `spawnSubAgent` so the
   // runtime can populate the bridge for framework-aware tools.
@@ -3063,6 +3103,10 @@ async function runRunCli(
       ...(justificationAuditSink !== undefined ? { justificationAuditSink } : {}),
       ...(egressMatcher !== undefined ? { egressMatcher } : {}),
       ...(memoryRunOpt !== undefined ? { memory: memoryRunOpt } : {}),
+      // Item #56 — inject the current user's preference file at run start (via
+      // the project-memory auto-load path). LESSONS.md is auto-loaded already
+      // as a canonical memory file, so no extra wiring is needed for it.
+      ...(preferenceFiles.length > 0 ? { preferenceFiles } : {}),
     });
   } finally {
     if (mcpHost) await mcpHost.disconnectAll();
@@ -7578,6 +7622,84 @@ async function runFaq(args: ParsedArgs): Promise<void> {
   );
 }
 
+/** The per-user preferences directory the runtime injects from at run start. */
+const PREFERENCES_SUBDIR = join(".crewhaus", "preferences");
+
+/** Sanitize a rater identity into a filesystem-safe preferences filename. */
+function preferenceFileName(rater: string): string {
+  return `${rater.replace(/[^a-zA-Z0-9_.-]/g, "_").slice(0, 64) || "user"}.md`;
+}
+
+/**
+ * Item #56 — `crewhaus lessons update [--sessions N|all]`. Mine corrections +
+ * recurring failure→fix patterns into a deduped, idempotent LESSONS.md (a
+ * canonical project-memory file the runtime auto-loads), and maintain per-user
+ * preference files under `.crewhaus/preferences/`.
+ */
+async function runLessons(args: ParsedArgs): Promise<void> {
+  const action = args.positional[0];
+  if (args.flags["help"] === true && action === undefined) {
+    process.stdout.write(
+      "usage: crewhaus lessons update [--sessions N|all] [--low-score F] [-o <LESSONS.md>]\n" +
+        "  Mine corrections + recurring failure→fix patterns into a deduped LESSONS.md\n" +
+        "  (auto-loaded into the system prompt), plus per-user prefs under .crewhaus/preferences/.\n",
+    );
+    return;
+  }
+  if (action !== "update") {
+    die(`lessons: unknown action "${action ?? ""}" — supported: update`);
+  }
+  const lowScore = floatFlag(args, "low-score") ?? 0.5;
+  if (lowScore < 0 || lowScore > 1) die(`invalid --low-score "${lowScore}" — must be in [0,1]`);
+
+  const sessionIds = resolveScanSessionIds(strFlag(args, "sessions"));
+  if (sessionIds.length === 0) die("no sessions found under .crewhaus/sessions/");
+  const { turns, feedback } = gatherTurnsAndFeedback(sessionIds);
+
+  // Failure signals reuse dataset-mine's negative-signal detection.
+  const failureSignals: Array<{ input: string; reason: string }> = [];
+  for (const id of sessionIds) {
+    for (const c of mineSession(id, readSessionEvents(id))) {
+      failureSignals.push({ input: c.input, reason: c.reason });
+    }
+  }
+  if (feedback.length === 0 && failureSignals.length === 0) {
+    die("no corrections/comments or failure signals found to distill lessons from");
+  }
+
+  const { createPiiRedactor } = await import("@crewhaus/pii-redactor");
+  const { SYNTHESIZE_PII_DETECTORS } = await import("./dataset-mine");
+  const redactor = createPiiRedactor({ regexDetectors: SYNTHESIZE_PII_DETECTORS });
+  const redact = async (t: string): Promise<string> => (await redactor.redact(t)).text;
+
+  const freshLessons = await mineLessons(turns, feedback, failureSignals, { lowScore, redact });
+
+  // Merge into the existing LESSONS.md, preserving its human-authored preamble.
+  const lessonsFile = strFlag(args, "out") ?? join(process.cwd(), "LESSONS.md");
+  const existingRaw = existsSync(lessonsFile) ? readFileSync(lessonsFile, "utf-8") : "";
+  const { preamble, lessons: existing } = parseLessonsMd(existingRaw);
+  const merged = mergeLessons(existing, freshLessons);
+  writeFileSync(lessonsFile, renderLessonsMd(merged, preamble), { mode: 0o600 });
+  process.stdout.write(
+    `[lessons] ${freshLessons.length} mined → ${merged.length} in ${lessonsFile} (auto-loaded at run start)\n`,
+  );
+
+  // Per-user preference files.
+  const prefs = await minePreferences(feedback, { redact });
+  if (prefs.length > 0) {
+    const prefsDir = join(process.cwd(), PREFERENCES_SUBDIR);
+    mkdirSync(prefsDir, { recursive: true });
+    for (const p of prefs) {
+      writeFileSync(join(prefsDir, preferenceFileName(p.rater)), renderPreferencesMd(p), {
+        mode: 0o600,
+      });
+    }
+    process.stdout.write(
+      `[lessons] wrote ${prefs.length} per-user preference file(s) under ${prefsDir}\n`,
+    );
+  }
+}
+
 // -------- item 4: crewhaus graders suggest --------
 
 /**
@@ -9408,6 +9530,16 @@ switch (subcommand) {
     // auto-loaded FAQ skill. Structured failures route through die().
     try {
       await runFaq(parseFor(rest, FAQ_SCHEMA));
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
+    break;
+  case "lessons":
+    // Item #56 — `lessons update`: mine corrections + failure→fix patterns
+    // into a deduped LESSONS.md + per-user prefs. Failures route through die().
+    try {
+      await runLessons(parseFor(rest, LESSONS_SCHEMA));
     } catch (err) {
       if (err instanceof CrewhausError) die(err.message);
       throw err;

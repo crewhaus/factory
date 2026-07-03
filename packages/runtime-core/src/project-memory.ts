@@ -41,6 +41,10 @@ export const CANONICAL_MEMORY_FILES = [
   "CLAUDE.md",
   "CODE-COMPANION.md",
   "AGENT.md",
+  // Item #56 — auto-maintained lessons file. `crewhaus lessons update` mines
+  // corrections + recurring failure→fix patterns into this deduped file; the
+  // runtime auto-loads it at run start exactly like the other memory files.
+  "LESSONS.md",
 ] as const;
 
 export const DEFAULT_PROJECT_MEMORY_CAP_BYTES = 64 * 1024;
@@ -52,6 +56,13 @@ export interface ProjectMemoryLoadOptions {
   readonly filenames?: readonly string[];
   /** Maximum total bytes across all loaded files. Defaults to 64 KB. */
   readonly capBytes?: number;
+  /**
+   * Item #56 — absolute path(s) to per-user preference files (outside cwd, e.g.
+   * `.crewhaus/preferences/<rater>.md`). Loaded + injected exactly like the
+   * canonical files when they exist, so the current user's prefs reach the
+   * system prompt. Absent/nonexistent → no-op.
+   */
+  readonly extraFiles?: readonly string[];
 }
 
 export interface LoadedMemoryFile {
@@ -87,6 +98,17 @@ export async function loadProjectMemory(
     try {
       const st = await stat(fullPath);
       if (!st.isFile()) continue;
+      matched.push({ filename, fullPath, size: st.size });
+    } catch {}
+  }
+  // Item #56 — extra per-user preference files (absolute paths outside cwd).
+  for (const fullPath of opts.extraFiles ?? []) {
+    if (!existsSync(fullPath)) continue;
+    try {
+      const st = await stat(fullPath);
+      if (!st.isFile()) continue;
+      // Use the basename as the `file=` label in the wrapper.
+      const filename = fullPath.split(/[/\\]/).pop() ?? fullPath;
       matched.push({ filename, fullPath, size: st.size });
     } catch {}
   }

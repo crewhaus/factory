@@ -494,6 +494,13 @@ export type RunChatLoopOptions = {
     readonly onCapture?: (completedTurns: number, sessionId: string) => Promise<void>;
   };
   /**
+   * Item #56 — absolute paths to per-user preference files injected at run
+   * start via the project-memory auto-load path (alongside LESSONS.md, which
+   * is now a canonical memory file). The CLI resolves the current user's
+   * `.crewhaus/preferences/<user>.md` and threads it here. Absent → no-op.
+   */
+  preferenceFiles?: ReadonlyArray<string>;
+  /**
    * Section 13 — inline sub-agent definitions exposed via the `Task` tool.
    * Threaded into the `RuntimeBridge` and surfaced to framework-aware
    * tools (only `Task` today). Codegen sets this from the IR; ordinary
@@ -1258,7 +1265,11 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // CLAUDE.md auto-load behaviour. Pillar 3 compliance: each file's content
   // is classified via boundary-classifier with origin "user" inside
   // loadProjectMemory() (the user's repo is developer-trusted).
-  const projectMemory = await loadProjectMemory();
+  const projectMemory = await loadProjectMemory(
+    opts.preferenceFiles !== undefined && opts.preferenceFiles.length > 0
+      ? { extraFiles: opts.preferenceFiles }
+      : {},
+  );
   const projectMemoryBlock: Anthropic.TextBlockParam[] =
     projectMemory.prompt.length > 0
       ? [
