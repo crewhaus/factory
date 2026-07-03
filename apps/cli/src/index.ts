@@ -283,6 +283,16 @@ import {
   openJustificationAuditSink,
   resolveJudgeChoice,
 } from "./justification-gate";
+// Item 5 — `crewhaus dataset refresh-goldens`: reconcile user corrections +
+// up-rated turns against an existing dataset's golds, proposing (or applying
+// as a NEW version) updated golds. Side-effect-free so it is unit-testable.
+import {
+  DEFAULT_REFRESH_MIN_SCORE,
+  type RunSampleOutcome,
+  applyProposals,
+  reconcileGoldens,
+  renderProposals,
+} from "./refresh-goldens";
 // Item 9 — per-spec regression suite: post-accept pinning of optimize
 // recoveries + the eval-side default union, in a side-effect-free module so
 // it is unit-testable (this entry file runs an argv switch on import).
@@ -1023,6 +1033,9 @@ function usageText(): string {
     "  dataset synthesize --from <f|reg>    PII-redacted stress variants (item 2): paraphrase,",
     "       [--count N] [--budget-usd N]        truncate, ambiguate, inject → separate synthetic",
     "       [--out-dataset <name>]              split (never contaminates human golds)",
+    "  dataset refresh-goldens              reconcile corrections/up-rated turns with golds (item 5):",
+    "       --dataset <file|registry:ref>       propose gold updates as a review diff; --apply writes",
+    "       [--min-score F] [--apply]           a NEW registry version (never in-place)",
     "  state backup [-o <file.tar.gz>]      snapshot the cwd .crewhaus state dir to a tarball (item 69)",
     "       [--exclude <glob,glob>]",
     "  state restore <file.tar.gz>          restore a snapshot (refuses a non-empty .crewhaus)",
@@ -4683,9 +4696,10 @@ async function runDataset(args: ParsedArgs): Promise<void> {
   const action = args.positional[0];
   if (args.flags["help"] && action === undefined) {
     process.stdout.write(
-      "usage: crewhaus dataset <mine|synthesize> [...]\n" +
+      "usage: crewhaus dataset <mine|synthesize|refresh-goldens> [...]\n" +
         "  mine            grow the dataset from production struggle signals (item 2)\n" +
-        "  synthesize      generate PII-redacted stress variants of a source dataset (item 2)\n",
+        "  synthesize      generate PII-redacted stress variants of a source dataset (item 2)\n" +
+        "  refresh-goldens reconcile user corrections with existing golds (item 5)\n",
     );
     return;
   }
@@ -4697,8 +4711,13 @@ async function runDataset(args: ParsedArgs): Promise<void> {
       case "synthesize":
         await runDatasetSynthesize(args);
         return;
+      case "refresh-goldens":
+        await runRefreshGoldens(args);
+        return;
       default:
-        die(`dataset: unknown action "${action ?? ""}" — supported: mine, synthesize`);
+        die(
+          `dataset: unknown action "${action ?? ""}" — supported: mine, synthesize, refresh-goldens`,
+        );
     }
   } catch (err) {
     if (err instanceof CrewhausError || err instanceof DatasetRefError) die(err.message);
@@ -4975,6 +4994,112 @@ async function runDatasetSynthesize(args: ParsedArgs): Promise<void> {
       "[dataset synthesize] model paraphrases stopped early — --budget-usd reached\n",
     );
   }
+}
+
+/**
+ * Item 5 — `crewhaus dataset refresh-goldens`: reconcile the corrections +
+ * up-rated turns accumulated in production against an existing dataset's gold
+ * answers. Prints a review diff by default; `--apply` writes the reconciled
+ * samples as a NEW registry version (never in-place).
+ */
+async function runRefreshGoldens(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus dataset refresh-goldens --dataset <file|registry:ref>\n" +
+        "                                        [--sessions N|all] [--min-score F] [--apply]\n" +
+        "  Match user corrections + up-rated turns (from sessions + the web-UI\n" +
+        "  feedback dir) against the dataset's samples by input equality then\n" +
+        "  similarity (item 5). Where an accepted/corrected output diverges from the\n" +
+        "  stored expected_output, PROPOSE a gold update (a review diff). Samples that\n" +
+        "  fail consistently across eval runs yet are repeatedly up-rated live are\n" +
+        "  flagged stale (via the run-history index; no history → no stale signal).\n" +
+        "  Default prints the diff only; --apply writes the reconciled samples as a\n" +
+        "  NEW dataset-registry version (never in-place). Sample content hashes give\n" +
+        "  provenance.\n",
+    );
+    return;
+  }
+  const datasetArg = strFlag(args, "dataset");
+  if (datasetArg === undefined) die("missing --dataset <file|registry:ref>");
+  const apply = args.flags["apply"] === true;
+  const minScore = floatFlag(args, "min-score") ?? DEFAULT_REFRESH_MIN_SCORE;
+  if (minScore < 0 || minScore > 1) die(`invalid --min-score "${minScore}" — must be in [0,1]`);
+  let sessionsWanted: number | "all";
+  try {
+    sessionsWanted = parseSessionsFlag(strFlag(args, "sessions"));
+  } catch (err) {
+    if (err instanceof EvalCoverageError) die(err.message);
+    throw err;
+  }
+
+  // Resolve the dataset samples + the registry name to version on --apply.
+  const registryRef = parseRegistryRef(datasetArg);
+  const samples: Sample[] = [];
+  let datasetLabel: string;
+  let registryName: string | undefined;
+  if (registryRef !== undefined) {
+    const registry = createFileBackedRegistry({ rootDir: defaultDatasetsRoot() });
+    const resolved = await resolveRegistryRef(registry, registryRef);
+    for (const s of resolved.samples) samples.push(s);
+    datasetLabel = resolved.datasetName;
+    registryName = registryRef.name;
+  } else {
+    const abs = resolve(datasetArg);
+    if (!existsSync(abs)) die(`--dataset "${datasetArg}" not found`);
+    const loaded = await loadDataset(abs);
+    for await (const s of loaded.samples) samples.push(s);
+    datasetLabel = loaded.name;
+  }
+  if (samples.length === 0) die(`dataset "${datasetArg}" yielded zero samples`);
+  if (apply && registryName === undefined) {
+    die(
+      "--apply requires --dataset registry:<name> — a NEW version is written to the registry, never a file in place",
+    );
+  }
+
+  // Feedback + turns from sessions (bounded by --sessions) + the web-UI dir.
+  const sessionsDir = join(process.cwd(), SESSIONS_SUBDIR);
+  const allIds = sessionIdsByRecency(sessionsDir);
+  const ids = sessionsWanted === "all" ? allIds : allIds.slice(0, sessionsWanted);
+  const turns: SessionTurn[] = [];
+  const records: FeedbackRecord[] = [];
+  for (const id of ids) {
+    const events = readSessionEvents(id);
+    for (const t of deriveTurns(events)) turns.push({ ...t, sessionId: id });
+    records.push(...extractFeedbackRecords(events));
+  }
+  records.push(...readFeedbackDir(join(process.cwd(), FEEDBACK_SUBDIR)));
+
+  // Cross-run pass/fail outcomes for the stale flag — from the recent eval
+  // runs for the cwd spec (best-effort; unreadable runs are skipped).
+  const specName = cwdSpecName();
+  const runOutcomes: RunSampleOutcome[][] = [];
+  const runEntries = readRunIndex().filter(
+    (e) => specName === undefined || e.specName === specName,
+  );
+  for (const entry of runEntries.slice(-10)) {
+    try {
+      const run = await loadRun(entry.outDir);
+      runOutcomes.push(
+        run.summary.samples.map((s) => ({ sampleId: s.sampleId, passed: s.grades.overall.passed })),
+      );
+    } catch {
+      // torn/missing run dir — skip
+    }
+  }
+
+  const result = reconcileGoldens({ samples, turns, records, minScore, runOutcomes });
+  process.stdout.write(renderProposals(result, datasetLabel));
+
+  if (!apply || result.proposals.length === 0) return;
+
+  const updated = applyProposals(samples, result.proposals);
+  const registry = createFileBackedRegistry({ rootDir: defaultDatasetsRoot() });
+  // Registry name is guaranteed defined here (checked above).
+  const rec = await registerDataset({ registry, name: registryName as string, samples: updated });
+  process.stdout.write(
+    `[refresh-goldens] applied ${result.proposals.length} gold update(s) → ${rec.name}@${rec.version} (new version; prior versions untouched)\n`,
+  );
 }
 
 /**
