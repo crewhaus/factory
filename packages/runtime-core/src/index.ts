@@ -84,6 +84,7 @@ import {
   createCliMarkdownRenderer,
   isCliMarkdownEnabled,
 } from "./cli-markdown";
+import { attachIncidentCollector } from "./incident-collector";
 import {
   type AlertSink,
   type AttachedAdvisorPersistence,
@@ -206,6 +207,16 @@ export {
   type AttachDefaultSubscribersOptions,
   attachDefaultSubscribers,
 } from "./observability";
+
+// Ops item 32 — incident collector seams re-exported so the CLI can share the
+// raw-capture shape + trigger classifier with `incident collect`.
+export {
+  type AttachIncidentCollectorOptions,
+  type IncidentCapture,
+  type IncidentTriggerKind,
+  attachIncidentCollector,
+  classifyIncidentTrigger,
+} from "./incident-collector";
 
 /**
  * Reconcile a message history by dropping "orphan" `tool_use` blocks — a
@@ -552,6 +563,14 @@ export type RunChatLoopOptions = {
   alertSink?: AlertSink;
   /** Item 31 — override the per-session metrics-history dir (tests/tenants). */
   alertMetricsDir?: string;
+  /**
+   * Ops item 32 — spec identity stamped into an auto-assembled incident
+   * capture (gated by CREWHAUS_INCIDENTS). Absent → the capture records a null
+   * spec; the CLI `run` path passes `{ name, version?, hash? }`.
+   */
+  incidentSpec?: { readonly name: string; readonly version?: string; readonly hash?: string };
+  /** Item 32 — override the incidents dir (tests/tenants). */
+  incidentsDir?: string;
   /**
    * Pillar 3 sink-side fabric (FR-006) — pluggable egress-matching
    * strategy. When supplied, every external-scope tool call routes its
@@ -971,6 +990,15 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   const subscribers = await attachDefaultSubscribers(bus, runContext, process.env, {
     ...(opts.alertSink !== undefined ? { alertSink: opts.alertSink } : {}),
     ...(opts.alertMetricsDir !== undefined ? { metricsDir: opts.alertMetricsDir } : {}),
+  });
+
+  // Ops item 32 — auto-assemble an incident bundle on the first failure-class
+  // trigger (circuit → open, egress-blocked, justification-deny storm). Gated
+  // by CREWHAUS_INCIDENTS; writes a raw capture (ring buffer + trigger meta)
+  // that `crewhaus incident collect --session <id>` turns into a full bundle.
+  const incidentCollector = attachIncidentCollector(bus, runContext, process.env, {
+    ...(opts.incidentsDir !== undefined ? { incidentsDir: opts.incidentsDir } : {}),
+    ...(opts.incidentSpec !== undefined ? { spec: opts.incidentSpec } : {}),
   });
 
   // Item 22 — surface each failover on stderr so an operator watching a
@@ -2589,6 +2617,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       await subscribers.shutdownAll();
       costPersistUnsubscribe?.();
       failoverNoteUnsubscribe?.();
+      incidentCollector?.unsubscribe();
       budgetMeter?.unsubscribe();
       advisorPersist?.unsubscribe();
       printAdvisorDigest(advisorPersist);
@@ -2819,6 +2848,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     await subscribers.shutdownAll();
     costPersistUnsubscribe?.();
     failoverNoteUnsubscribe?.();
+    incidentCollector?.unsubscribe();
     budgetMeter?.unsubscribe();
     advisorPersist?.unsubscribe();
     printAdvisorDigest(advisorPersist);

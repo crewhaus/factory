@@ -359,6 +359,15 @@ import {
   parseRunsFlag,
   renderSuggestedGradersYaml,
 } from "./graders-suggest";
+// Item 32 — incident bundle assembly (trigger classification, audit-window
+// join, cost summary, eval-report-styled render), in a side-effect-free module
+// so it is unit-testable (this entry file runs an argv switch on import).
+import {
+  type IncidentKind,
+  assembleIncidentBundle,
+  matchAuditRecordsByWindow,
+  summarizeCost,
+} from "./incident";
 // Item 39 — `crewhaus init --interactive`: the harness-designer interview
 // (validate-and-retry loop + scripted no-credentials fallback) in a
 // side-effect-free module so this entry file stays testable.
@@ -1144,6 +1153,18 @@ const MIGRATE_SCHEMA: ParseArgsSchema = {
   ],
 };
 
+// Item 32 — `crewhaus incident collect --session <id>`: assemble a full
+// incident bundle from a session's traces/audit/cost + doctor.
+const INCIDENT_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "session", takesValue: true },
+    { name: "kind", takesValue: true },
+    { name: "reason", takesValue: true },
+    { name: "out", short: "o", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
 // Item 43 — `crewhaus upgrade`: detect the cwd spec's version drift vs the
 // current CLI's spec version, run the migration chain (validated), show a diff.
 // --dry-run (default) previews; --write applies.
@@ -1302,6 +1323,8 @@ function usageText(): string {
     "  deploy canary <spec> <version> ...   eval-gated ramp with auto-rollback (item 29):",
     "       --traffic 5,25,50,100 --dataset <d> --graders <g>  eval both versions per step,",
     "                                       gate on regression-runner, auto-promote/rollback",
+    "  incident collect --session <id>      assemble an incident bundle from a session's",
+    "                                       traces + audit + cost + doctor (item 32)",
     "  migrate-all --from N --to N          batch-migrate every spec in the registry",
     "  upgrade [spec.yaml] [--write]        detect the cwd spec's version drift + run the migration",
     "                                       chain (validated); --dry-run diff by default (item 43)",
@@ -3071,6 +3094,9 @@ async function runRunCli(
       ...(justificationAuditSink !== undefined ? { justificationAuditSink } : {}),
       ...(egressMatcher !== undefined ? { egressMatcher } : {}),
       ...(alertSink !== undefined ? { alertSink } : {}),
+      // Item 32 — stamp the spec name into any auto-assembled incident capture
+      // (gated by CREWHAUS_INCIDENTS inside runtime-core).
+      incidentSpec: { name: ir.name },
     });
   } finally {
     if (mcpHost) await mcpHost.disconnectAll();
@@ -8427,6 +8453,145 @@ async function runMigrateAll(args: ParsedArgs): Promise<void> {
 }
 
 /**
+ * Item 32 — `crewhaus incident collect --session <id>`. Retroactively (or
+ * on-demand) assembles a full incident bundle from a session's traces: reads
+ * the session event-log as both the ring-event proxy and the transcript,
+ * summarizes cost_accrual spend, matches audit records to the session's time
+ * window (the timestamp linkage — audit records carry no sessionId), captures
+ * a doctor inventory, and writes `.crewhaus/incidents/<ts>-<kind>/` with an
+ * eval-report-styled index.html. When the runtime already auto-captured a raw
+ * `incident.json`+`events.jsonl` for this session (CREWHAUS_INCIDENTS), those
+ * ring events are folded in and the kind/reason default from it.
+ */
+async function runIncidentCollect(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus incident collect --session <id> [--kind <kind>] [--reason <text>] [-o <dir>]\n" +
+        "  Assemble an incident bundle from a session's traces + audit + cost + doctor.\n" +
+        "  --kind defaults to run_abort (or the runtime's auto-captured kind, if any);\n" +
+        "  kinds: run_abort | circuit_open | egress_blocked | justification_deny_storm | budget_exceeded.\n" +
+        "  The bundle lands at .crewhaus/incidents/<ts>-<kind>/ (override root with -o).\n" +
+        "  Audit records are matched to the session by TIME WINDOW (records carry no\n" +
+        "  sessionId); the window is [first event, last event] of the session log.\n",
+    );
+    return;
+  }
+  const session = args.flags["session"];
+  if (typeof session !== "string") die("missing --session <id>");
+
+  const cwd = process.cwd();
+  const { openEventLog } = await import("@crewhaus/event-log");
+  const { openAuditLog } = await import("@crewhaus/audit-log");
+
+  // Read the full session transcript (also the ring-event proxy for a
+  // retroactive collect — the live ring buffer is gone, the durable log is
+  // the best available record).
+  let transcript: Array<{ ts: number; kind: string; payload: unknown }>;
+  try {
+    const log = await openEventLog(session, { rootDir: join(cwd, SESSIONS_SUBDIR) });
+    transcript = [];
+    for await (const ev of log.read()) transcript.push(ev);
+    await log.close();
+  } catch (err) {
+    die(`could not read session ${session}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (transcript.length === 0) {
+    die(`session ${session} has no events at ${join(cwd, SESSIONS_SUBDIR)}`);
+  }
+  const startTs = transcript[0]?.ts ?? Date.now();
+  const endTs = transcript.at(-1)?.ts ?? startTs;
+
+  // Ring events: the session log's own events are the durable proxy. cost is
+  // summarized from the log's cost_accrual entries.
+  const ringEvents = transcript;
+  const cost = summarizeCost(ringEvents);
+
+  // Audit records within the session window (the timestamp linkage).
+  const auditRecords: Array<{ ts: number; kind: string; payload: unknown; seq?: number }> = [];
+  try {
+    const audit = await openAuditLog({ rootDir: join(cwd, ".crewhaus", "audit") });
+    for await (const r of audit.read()) {
+      auditRecords.push({ ts: r.ts, kind: r.kind, payload: r.payload, seq: r.seq });
+    }
+  } catch {
+    // No audit log is fine — the bundle notes zero matching records.
+  }
+  const matchedAudit = matchAuditRecordsByWindow(auditRecords, { startTs, endTs });
+
+  // Doctor inventory (read-only, no network probe so a collect never hangs) as
+  // the doctor.txt context. Best-effort — a doctor failure must not block the
+  // bundle.
+  let doctor: string;
+  try {
+    const configPaths = [join(cwd, ".mcp.json")];
+    const desktop = claudeDesktopConfigPath(process.platform, process.env);
+    if (desktop !== undefined) configPaths.push(desktop);
+    const inventory = await buildInventory({
+      env: process.env,
+      fetchImpl: async () => ({ ok: false, status: 0, json: async () => ({}) }),
+      readConfig: (p) => {
+        try {
+          return existsSync(p) ? readFileSync(p, "utf-8") : undefined;
+        } catch {
+          return undefined;
+        }
+      },
+      configPaths,
+      skipProbe: true,
+    });
+    doctor = formatInventory(inventory);
+  } catch (err) {
+    doctor = `doctor inventory unavailable: ${err instanceof Error ? err.message : String(err)}`;
+  }
+
+  const kindFlag = args.flags["kind"];
+  const kind = (typeof kindFlag === "string" ? kindFlag : "run_abort") as IncidentKind;
+  const validKinds: IncidentKind[] = [
+    "run_abort",
+    "circuit_open",
+    "egress_blocked",
+    "justification_deny_storm",
+    "budget_exceeded",
+  ];
+  if (!validKinds.includes(kind)) {
+    die(`--kind must be one of: ${validKinds.join(", ")} (got "${kind}")`);
+  }
+  const reason =
+    typeof args.flags["reason"] === "string"
+      ? args.flags["reason"]
+      : `retroactive collect of session ${session}`;
+
+  const assembled = assembleIncidentBundle({
+    kind,
+    sessionId: session,
+    incidentTs: new Date().toISOString(),
+    reason,
+    ringEvents,
+    transcript,
+    auditRecords: matchedAudit,
+    cost,
+    spec: { name: session },
+    doctor,
+    window: { startTs, endTs },
+  });
+
+  const outRoot =
+    typeof args.flags["out"] === "string"
+      ? resolve(args.flags["out"] as string)
+      : join(cwd, ".crewhaus", "incidents");
+  const dir = join(outRoot, assembled.dirName);
+  mkdirSync(dir, { recursive: true });
+  for (const file of assembled.files) {
+    writeFileSync(join(dir, file.name), file.contents);
+  }
+  process.stdout.write(
+    `[incident] collected ${kind} for ${session}: ${ringEvents.length} events, ` +
+      `${matchedAudit.length} audit records → ${dir}\n`,
+  );
+  process.stdout.write(`[incident] report: ${join(dir, "index.html")}\n`);
+}
+
+/**
  * Item 43 — `crewhaus upgrade [spec.yaml] [--dry-run] [--write]`. Detects the
  * cwd (or named) spec's schema-version drift against the CLI's current spec
  * version (the migration engine's `latestVersion()`), runs the migration chain
@@ -9567,6 +9732,19 @@ switch (subcommand) {
   case "migrate-all":
     await runMigrateAll(parseFor(rest, MIGRATE_SCHEMA));
     break;
+  case "incident": {
+    const action = rest[0] ?? "";
+    if (action !== "collect") {
+      die(`incident action must be "collect" (got "${action}")`);
+    }
+    try {
+      await runIncidentCollect(parseFor(rest.slice(1), INCIDENT_SCHEMA));
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
+    break;
+  }
   case "upgrade":
     try {
       await runUpgrade(parseFor(rest, UPGRADE_SCHEMA));
