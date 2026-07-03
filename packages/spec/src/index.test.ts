@@ -1514,22 +1514,57 @@ describe("parseSpec version field (#43 spec version stamping)", () => {
       cli: "name: t\ntarget: cli\nversion: 1\nagent:\n  model: m\n  instructions: hi\n",
       workflow:
         "name: t\ntarget: workflow\nversion: 1\nmodel: m\nsteps:\n  - name: s\n    instructions: go\n",
+      channel:
+        "name: t\ntarget: channel\nversion: 1\nagent:\n  model: m\n  instructions: hi\nchannels:\n  slack:\n    botToken: xoxb-test\n    signingSecret: shh\nrouting:\n  sessionKey: thread\n",
       graph:
         "name: t\ntarget: graph\nversion: 1\nmodel: m\nentry: a\nnodes:\n  a:\n    instructions: go\nedges: []\n",
       managed:
         "name: t\ntarget: managed\nversion: 1\nagent:\n  model: m\n  instructions: hi\ntenants:\n  - id: t1\n    budget:\n      maxInputTokens: 100\n      maxOutputTokens: 100\n",
+      pipeline:
+        "name: t\ntarget: pipeline\nversion: 1\nagent:\n  model: m\n  instructions: hi\nretrieve:\n  embedderModel: mock/det\nindexing:\n  documents:\n    - id: doc-1\n      text: hi\n",
       crew: "name: t\ntarget: crew\nversion: 1\nmodel: m\nentry: lead\nroles:\n  lead:\n    instructions: go\n",
       research:
         "name: t\ntarget: research\nversion: 1\nagent:\n  model: m\n  instructions: hi\ngoal: find things\n",
+      batch:
+        "name: t\ntarget: batch\nversion: 1\nagent:\n  model: m\n  instructions: hi\nqueue:\n  adapter: in-memory\n",
       voice:
         "name: t\ntarget: voice\nversion: 1\nagent:\n  model: m\n  instructions: hi\nvoice:\n  provider: openai\n",
       browser: "name: t\ntarget: browser\nversion: 1\nagent:\n  model: m\n  instructions: hi\n",
       eval: "name: t\ntarget: eval\nversion: 1\nagent:\n  model: m\n  instructions: hi\ndataset:\n  name: d\n  version: v1\ngraders:\n  - name: g\n",
+      onchain:
+        "name: t\ntarget: onchain\nversion: 1\nagent:\n  model: m\n  instructions: hi\nchains:\n  - id: base\n    kind: evm\n    rpcUrls:\n      - https://rpc.example\n    finality:\n      kind: confirmations\n      count: 12\ncontracts:\n  - id: treasury\n    chainId: base\n    address: '0xtreasury'\n    abiRef: abi://safe\ntriggers:\n  - kind: event\n    chainId: base\n    contract: treasury\n    event: Transfer\n",
+      "onchain-game":
+        "name: t\ntarget: onchain-game\nversion: 1\nagent:\n  model: m\n  instructions: hi\nchain:\n  id: base\n  kind: evm\n  rpcUrls:\n    - https://rpc.example\n  finality:\n    kind: confirmations\n    count: 1\nwallet:\n  id: player\n  chainId: base\n  custody: local\ngame:\n  contract:\n    id: game\n    chainId: base\n    address: '0xgame'\n    abiRef: abi://game\n  stateReader: readState\n",
     };
+    expect(Object.keys(specs)).toHaveLength(14);
     for (const [target, yaml] of Object.entries(specs)) {
       const spec = parseSpec(yaml) as { version?: number; target: string };
       expect(spec.target).toBe(target);
       expect(spec.version).toBe(1);
+    }
+  });
+
+  test("the version field is OPTIONAL on the 5 target members added for full-14 coverage above", () => {
+    // Companion to the EVERY-member test: each of the 5 shapes that test adds
+    // (channel, pipeline, batch, onchain, onchain-game) also parses with NO
+    // version field, and `.version` is undefined — the same back-compat proof
+    // the CLI_NO_VERSION test above gives for `cli`, extended to these 5.
+    const specsNoVersion: Record<string, string> = {
+      channel:
+        "name: t\ntarget: channel\nagent:\n  model: m\n  instructions: hi\nchannels:\n  slack:\n    botToken: xoxb-test\n    signingSecret: shh\nrouting:\n  sessionKey: thread\n",
+      pipeline:
+        "name: t\ntarget: pipeline\nagent:\n  model: m\n  instructions: hi\nretrieve:\n  embedderModel: mock/det\nindexing:\n  documents:\n    - id: doc-1\n      text: hi\n",
+      batch:
+        "name: t\ntarget: batch\nagent:\n  model: m\n  instructions: hi\nqueue:\n  adapter: in-memory\n",
+      onchain:
+        "name: t\ntarget: onchain\nagent:\n  model: m\n  instructions: hi\nchains:\n  - id: base\n    kind: evm\n    rpcUrls:\n      - https://rpc.example\n    finality:\n      kind: confirmations\n      count: 12\ncontracts:\n  - id: treasury\n    chainId: base\n    address: '0xtreasury'\n    abiRef: abi://safe\ntriggers:\n  - kind: event\n    chainId: base\n    contract: treasury\n    event: Transfer\n",
+      "onchain-game":
+        "name: t\ntarget: onchain-game\nagent:\n  model: m\n  instructions: hi\nchain:\n  id: base\n  kind: evm\n  rpcUrls:\n    - https://rpc.example\n  finality:\n    kind: confirmations\n    count: 1\nwallet:\n  id: player\n  chainId: base\n  custody: local\ngame:\n  contract:\n    id: game\n    chainId: base\n    address: '0xgame'\n    abiRef: abi://game\n  stateReader: readState\n",
+    };
+    for (const [target, yaml] of Object.entries(specsNoVersion)) {
+      const spec = parseSpec(yaml) as { version?: number; target: string };
+      expect(spec.target).toBe(target);
+      expect(spec.version).toBeUndefined();
     }
   });
 });

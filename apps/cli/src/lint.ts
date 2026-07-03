@@ -165,27 +165,87 @@ export function levenshtein(a: string, b: string): number {
 }
 
 /**
- * Nearest legal name for a mistyped tool name. `candidates` is the union of the
- * legal spellings — the camelCase BUILTIN_TOOL_MAP keys AND the registered
+ * The outcome of a nearest-match lookup:
+ *  - `undefined` — no candidate close enough (genuinely unknown, not a typo),
+ *    or the name is already legal.
+ *  - `{ kind: "match", name }` — a single unambiguous nearest candidate;
+ *    safe to auto-apply.
+ *  - `{ kind: "ambiguous", candidates }` — two or more equally-near
+ *    candidates whose I/O capability DIFFERS (e.g. a read-only tool vs a
+ *    mutating one), so auto-applying could silently cross a capability
+ *    boundary. Callers should surface this as a suggestion, not a fix.
+ */
+export type NearestToolMatch =
+  | { readonly kind: "match"; readonly name: string }
+  | { readonly kind: "ambiguous"; readonly candidates: readonly string[] };
+
+/**
+ * Nearest legal name(s) for a mistyped tool name. `candidates` is the union of
+ * the legal spellings — the camelCase BUILTIN_TOOL_MAP keys AND the registered
  * PascalCase names (both forms are legal in a spec: top-level `tools:` uses the
  * camelCase key; a sub-agent `tools:` uses the PascalCase registered name). An
  * exact match returns undefined (nothing to fix). Otherwise the closest
- * candidate within `maxDistance` (default 3) is returned, or undefined when
- * nothing is close enough (a genuinely unknown tool, not a typo).
+ * candidate(s) within `maxDistance` (default 3) are considered; undefined
+ * means nothing is close enough (a genuinely unknown tool, not a typo).
+ *
+ * `getReadOnly` is an optional injected lookup from candidate name → the
+ * resolved tool's `readOnly` flag (undefined when the candidate can't be
+ * resolved to a RegisteredTool, e.g. an unregistered custom-tool name — in
+ * that case its capability is unknown and it is never treated as crossing a
+ * boundary against another candidate). When ALL of the closest candidates
+ * (same minimum distance) agree on `readOnly` — including the degenerate
+ * single-candidate case — this returns a `"match"` for the first of them
+ * (stable, deterministic). When they DISAGREE — a typo equidistant from a
+ * read-only tool (e.g. `Read`) and a mutating one (e.g. `Edit`) — this
+ * returns `"ambiguous"` with the full tied set rather than silently picking
+ * one, because auto-applying would cross a read-only/mutating capability
+ * boundary the author never asked for.
  */
 export function nearestToolName(
   name: string,
   candidates: readonly string[],
   maxDistance = 3,
-): string | undefined {
+  getReadOnly?: (candidateName: string) => boolean | undefined,
+): NearestToolMatch | undefined {
   if (candidates.includes(name)) return undefined;
-  let best: { name: string; dist: number } | undefined;
+  let bestDist: number | undefined;
+  let tied: string[] = [];
   for (const cand of candidates) {
     const dist = levenshtein(name, cand);
-    if (best === undefined || dist < best.dist) best = { name: cand, dist };
+    if (bestDist === undefined || dist < bestDist) {
+      bestDist = dist;
+      tied = [cand];
+    } else if (dist === bestDist) {
+      tied.push(cand);
+    }
   }
-  if (best === undefined || best.dist > maxDistance) return undefined;
-  return best.name;
+  if (bestDist === undefined || bestDist > maxDistance) return undefined;
+  if (tied.length === 1) {
+    const only = tied[0];
+    if (only === undefined) return undefined;
+    return { kind: "match", name: only };
+  }
+  // Multiple equally-near candidates. If a capability lookup was injected and
+  // the tied set spans more than one `readOnly` value, that is a genuine
+  // cross-capability ambiguity — refuse to pick one. Candidates with unknown
+  // capability (getReadOnly returns undefined) don't by themselves create
+  // ambiguity: they only conflict when they disagree with a KNOWN capability
+  // among the tied set.
+  if (getReadOnly !== undefined) {
+    const knownCapabilities = new Set(
+      tied.map((c) => getReadOnly(c)).filter((v): v is boolean => v !== undefined),
+    );
+    if (knownCapabilities.size > 1) {
+      return { kind: "ambiguous", candidates: tied };
+    }
+  } else {
+    // No capability signal available — a plain tie is still ambiguous rather
+    // than silently guessing via iteration order.
+    return { kind: "ambiguous", candidates: tied };
+  }
+  const first = tied[0];
+  if (first === undefined) return undefined;
+  return { kind: "match", name: first };
 }
 
 /**

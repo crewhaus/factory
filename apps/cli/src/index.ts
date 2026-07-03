@@ -1332,7 +1332,10 @@ async function runLintCommand(args: ParsedArgs): Promise<void> {
         "                  IR passes are fail-fast per pass; json mode runs each pass\n" +
         "                  independently (collect-all) so one violation doesn't hide others.\n" +
         "  --fix           apply mechanical fixes: unknown tool name → nearest match,\n" +
-        "                  $secret typo → $UPPER_SNAKE_CASE, unsafe name → sanitised.\n",
+        "                  $secret typo → $UPPER_SNAKE_CASE, unsafe name → sanitised.\n" +
+        "                  A typo equidistant from tools of DIFFERENT capability (e.g.\n" +
+        "                  read-only vs mutating) is printed as a suggestion instead of\n" +
+        "                  auto-applied.\n",
     );
     return;
   }
@@ -1354,12 +1357,18 @@ async function runLintCommand(args: ParsedArgs): Promise<void> {
   const { resolve: resolveTool, candidates } = await buildToolResolver();
 
   if (args.flags["fix"] === true) {
-    const { text: fixedYaml, applied } = applyLintFixes(yamlText, candidates);
+    const {
+      text: fixedYaml,
+      applied,
+      suggested,
+    } = applyLintFixes(yamlText, candidates, resolveTool);
     if (applied.length > 0) {
       writeFileSync(absSpec, fixedYaml);
       for (const line of applied) process.stdout.write(`fixed: ${line}\n`);
       yamlText = fixedYaml;
-    } else {
+    }
+    for (const line of suggested) process.stdout.write(`suggestion: ${line}\n`);
+    if (applied.length === 0 && suggested.length === 0) {
       process.stdout.write("lint --fix: no mechanical fixes applicable.\n");
     }
   }
@@ -1376,12 +1385,24 @@ async function runLintCommand(args: ParsedArgs): Promise<void> {
  * an unsafe `name:` and a mistyped tool in a `tools:` list — must be fixed
  * BEFORE the spec can parse, and spec-patch requires a parseable document.
  * Returns the rewritten text + a description of each applied fix.
+ *
+ * `resolveTool` (same resolver `buildToolResolver` returns) supplies the
+ * read-only/mutating capability signal `nearestToolName` uses to detect a
+ * cross-capability typo — e.g. `Reit` is Levenshtein-2 from BOTH `Read`
+ * (read-only) and `Edit` (mutating). Such a typo is NOT auto-applied (the
+ * line is left untouched); it is instead returned in `suggested` as a
+ * printed "did you mean X or Y?" line so the author picks, rather than the
+ * fixer silently rewriting to whichever tie-break happened to win.
  */
 function applyLintFixes(
   yamlText: string,
   toolCandidates: readonly string[],
-): { text: string; applied: string[] } {
+  resolveTool: (name: string) => RegisteredTool | undefined,
+): { text: string; applied: string[]; suggested: string[] } {
   const applied: string[] = [];
+  const suggested: string[] = [];
+  const getReadOnly = (candidateName: string): boolean | undefined =>
+    resolveTool(candidateName)?.readOnly;
   const lines = yamlText.split("\n");
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
@@ -1402,10 +1423,17 @@ function applyLintFixes(
     // A `- toolName` list item that is an unknown tool near a legal name.
     const toolMatch = /^(\s*-\s*)([A-Za-z]\w*)(\s*)$/.exec(line);
     if (toolMatch?.[2] !== undefined) {
-      const nearest = nearestToolName(toolMatch[2], toolCandidates);
-      if (nearest !== undefined) {
-        lines[i] = `${toolMatch[1]}${nearest}`;
-        applied.push(`tool "${toolMatch[2]}" → "${nearest}" (nearest match)`);
+      const nearest = nearestToolName(toolMatch[2], toolCandidates, undefined, getReadOnly);
+      if (nearest?.kind === "match") {
+        lines[i] = `${toolMatch[1]}${nearest.name}`;
+        applied.push(`tool "${toolMatch[2]}" → "${nearest.name}" (nearest match)`);
+        continue;
+      }
+      if (nearest?.kind === "ambiguous") {
+        const options = nearest.candidates.map((c) => `"${c}"`).join(" or ");
+        suggested.push(
+          `tool "${toolMatch[2]}" — did you mean ${options}? (not auto-fixed — ambiguous across tool capabilities)`,
+        );
         continue;
       }
     }
@@ -1420,7 +1448,7 @@ function applyLintFixes(
       }
     }
   }
-  return { text: lines.join("\n"), applied };
+  return { text: lines.join("\n"), applied, suggested };
 }
 
 /** Strip a single pair of surrounding single/double quotes from a scalar. */

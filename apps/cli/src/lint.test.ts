@@ -98,19 +98,58 @@ describe("nearestToolName", () => {
     expect(nearestToolName("WebSearch", candidates)).toBeUndefined();
   });
   test("close typo → nearest legal name", () => {
-    expect(nearestToolName("webSerch", candidates)).toBe("webSearch");
-    expect(nearestToolName("reed", candidates)).toBe("read");
+    // "webSerch" ties "webSearch"/"WebSearch" (same tool, two legal
+    // spellings) at distance 1; without a capability lookup a plain tie is
+    // reported ambiguous by default (see the cross-capability describe block
+    // below), so this passes a resolver reporting the same capability for
+    // both spellings — the realistic shape, since both name the same tool.
+    const sameCapability = () => false;
+    expect(nearestToolName("webSerch", candidates, undefined, sameCapability)).toEqual({
+      kind: "match",
+      name: "webSearch",
+    });
+    expect(nearestToolName("reed", candidates)).toEqual({ kind: "match", name: "read" });
   });
   test("too far → undefined (genuinely unknown, not a typo)", () => {
     expect(nearestToolName("totallyDifferentThing", candidates)).toBeUndefined();
   });
-  test("a typo of a PascalCase name maps to a legal spelling (case-insensitive metric)", () => {
-    // Both "webSearch" and "WebSearch" are distance 1 from "WebSerch"; either
-    // is a correct nearest match (first-wins on tie), so assert it lands on a
-    // legal candidate rather than a specific casing.
-    const match = nearestToolName("WebSerch", candidates);
-    expect(match?.toLowerCase()).toBe("websearch");
-    expect(candidates).toContain(match);
+
+  describe("cross-capability ambiguity (F2 — typo equidistant from tools of different capability)", () => {
+    // Mirrors the real Read (readOnly) / Edit (mutating) collision: "Reit" is
+    // Levenshtein-2 from both.
+    const rwCandidates = ["Read", "Edit", "Write"];
+    const capability = (name: string): boolean | undefined =>
+      ({ Read: true, Edit: false, Write: false })[name];
+
+    test("a typo tied between a read-only and a mutating tool is reported ambiguous, not auto-fixed", () => {
+      const result = nearestToolName("Reit", rwCandidates, undefined, capability);
+      expect(result?.kind).toBe("ambiguous");
+      expect(result?.kind === "ambiguous" && [...result.candidates].sort()).toEqual([
+        "Edit",
+        "Read",
+      ]);
+    });
+
+    test("without a capability lookup, the same tie is still reported ambiguous (fail-safe default)", () => {
+      const result = nearestToolName("Reit", rwCandidates);
+      expect(result?.kind).toBe("ambiguous");
+    });
+
+    test("a tie among candidates that all share the same capability still auto-fixes", () => {
+      // "Edut" is closest to "Edit" alone in this candidate set (no tie), so
+      // it should resolve to a plain match regardless of capability lookup.
+      const result = nearestToolName("Edut", rwCandidates, undefined, capability);
+      expect(result).toEqual({ kind: "match", name: "Edit" });
+    });
+
+    test("an unresolvable candidate (unknown capability) does not itself create ambiguity", () => {
+      // "customTool" is not resolvable (capability undefined); tied only
+      // against itself so it's a plain unambiguous match.
+      const single = ["customTool"];
+      const unknownCapability = (): boolean | undefined => undefined;
+      const result = nearestToolName("customTol", single, undefined, unknownCapability);
+      expect(result).toEqual({ kind: "match", name: "customTool" });
+    });
   });
 });
 
