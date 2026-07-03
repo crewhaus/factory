@@ -1,6 +1,14 @@
 import { describe, expect, test } from "bun:test";
 import type { Classifier, ClassifierResult } from "@crewhaus/grader-safety-classifiers";
-import { PiiRedactor, PiiRedactorError, _sha256ForTest, createPiiRedactor } from "./index";
+import {
+  PiiRedactor,
+  PiiRedactorError,
+  _sha256ForTest,
+  createPiiRedactor,
+  createPiiRedactorWithPolicy,
+  hmacValue,
+  parsePiiPolicy,
+} from "./index";
 
 class FixedClassifier implements Classifier {
   readonly id = "fixed";
@@ -166,5 +174,93 @@ describe("Determinism + helpers", () => {
     expect(_sha256ForTest("hello")).toBe(
       "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
     );
+  });
+});
+
+describe("hashed allow-list (item 51)", () => {
+  const SECRET = "tune-secret";
+  const EMAIL = "jane.doe@example.com";
+
+  test("a hashed allow entry suppresses the matching hit (skipped, not redacted)", async () => {
+    const hash = hmacValue(EMAIL, SECRET);
+    const r = createPiiRedactor({
+      secret: SECRET,
+      hashedAllowList: [{ kind: "email", hash }],
+    });
+    const out = await r.redact(`contact ${EMAIL} for details`);
+    // The allow-listed email is kept verbatim; nothing redacted.
+    expect(out.text).toBe(`contact ${EMAIL} for details`);
+    expect(out.redactedHits.length).toBe(0);
+    expect(out.skippedByPolicy.map((h) => h.kind)).toContain("email");
+  });
+
+  test("only the matching value is allowed; a different email of the same kind is still redacted", async () => {
+    const hash = hmacValue(EMAIL, SECRET);
+    const r = createPiiRedactor({
+      secret: SECRET,
+      hashedAllowList: [{ kind: "email", hash }],
+    });
+    const out = await r.redact(`allowed ${EMAIL} vs blocked other@evil.com`);
+    expect(out.text).toContain(EMAIL); // allow-listed
+    expect(out.text).toContain("[REDACTED:email]"); // the other one
+  });
+
+  test("ignored when no secret is configured (cannot recompute the HMAC)", async () => {
+    const hash = hmacValue(EMAIL, SECRET);
+    const r = createPiiRedactor({ hashedAllowList: [{ kind: "email", hash }] });
+    const out = await r.redact(`contact ${EMAIL}`);
+    // No secret → the allow entry can't be compared → the email is redacted.
+    expect(out.text).toContain("[REDACTED:email]");
+  });
+
+  test("wrong kind does not allow the value", async () => {
+    const hash = hmacValue(EMAIL, SECRET);
+    const r = createPiiRedactor({
+      secret: SECRET,
+      hashedAllowList: [{ kind: "ssn", hash }], // kind mismatch
+    });
+    const out = await r.redact(`contact ${EMAIL}`);
+    expect(out.text).toContain("[REDACTED:email]");
+  });
+});
+
+describe("parsePiiPolicy + createPiiRedactorWithPolicy", () => {
+  const SECRET = "tune-secret";
+  const EMAIL = "jane.doe@example.com";
+
+  test("parses a valid v1 policy, dropping malformed entries", () => {
+    const policy = parsePiiPolicy({
+      version: 1,
+      allow: [
+        { kind: "email", hash: "abc123" },
+        { kind: "email" }, // missing hash → dropped
+        { hash: "def" }, // missing kind → dropped
+        null,
+        "garbage",
+      ],
+    });
+    expect(policy).toEqual({ version: 1, allow: [{ kind: "email", hash: "abc123" }] });
+  });
+
+  test("undefined for non-v1 / non-object input (fail-closed to redact more)", () => {
+    expect(parsePiiPolicy(null)).toBeUndefined();
+    expect(parsePiiPolicy({ version: 2, allow: [] })).toBeUndefined();
+    expect(parsePiiPolicy({ allow: "nope" })).toBeUndefined();
+  });
+
+  test("createPiiRedactorWithPolicy merges the policy's allow entries additively", async () => {
+    const policy = parsePiiPolicy({
+      version: 1,
+      allow: [{ kind: "email", hash: hmacValue(EMAIL, SECRET) }],
+    });
+    const r = createPiiRedactorWithPolicy(policy, { secret: SECRET });
+    const out = await r.redact(`contact ${EMAIL}`);
+    expect(out.text).toBe(`contact ${EMAIL}`); // allow-listed by policy
+  });
+
+  test("createPiiRedactorWithPolicy(undefined) is a plain redactor", async () => {
+    const r = createPiiRedactorWithPolicy(undefined, { secret: SECRET });
+    const out = await r.redact(`contact ${EMAIL}`);
+    expect(out.text).toContain("[REDACTED:email]");
   });
 });

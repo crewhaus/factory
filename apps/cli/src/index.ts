@@ -426,6 +426,18 @@ import {
   rankSuggestions,
   readOnlyByName,
 } from "./permissions-suggest";
+// AUTOMATION-OPPORTUNITIES.md item 51 — `crewhaus pii tune` core (hashed
+// redaction-history aggregation → false-positive over-redaction candidates +
+// coverage gaps → reviewed .crewhaus/pii-policy.json). Side-effect-free; never
+// stores/returns raw PII (only HMAC hashes + counts).
+import {
+  type ScanUnit,
+  buildPiiPolicy,
+  buildPiiTuneContext,
+  findCoverageGaps,
+  findFalsePositives,
+  renderPiiTuneLines,
+} from "./pii-tune";
 // Item 5 — `crewhaus dataset refresh-goldens`: reconcile user corrections +
 // up-rated turns against an existing dataset's golds, proposing (or applying
 // as a NEW version) updated golds. Side-effect-free so it is unit-testable.
@@ -1227,6 +1239,23 @@ const EGRESS_SCHEMA: ParseArgsSchema = {
     // `optimize --from-advice` can consume (mirrors `advise -o`).
     { name: "propose", takesValue: false },
     { name: "out", short: "o", takesValue: true },
+    { name: "json", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
+// AUTOMATION-OPPORTUNITIES.md item 51 — `pii tune`.
+const PII_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // how many recent sessions to scan (default 50; `all`).
+    { name: "sessions", takesValue: true },
+    // harness root that owns .crewhaus/ (mirrors `security digest --dir`).
+    { name: "dir", takesValue: true },
+    // HMAC key for hashing PII values (also read from CREWHAUS_PII_HASH_SECRET).
+    // MUST match the redactor's secret for the emitted policy to apply.
+    { name: "secret", takesValue: true },
+    // write the reviewed allow-list to <dir>/.crewhaus/pii-policy.json.
+    { name: "write", takesValue: false },
     { name: "json", takesValue: false },
     { name: "help", short: "h" },
   ],
@@ -10037,6 +10066,134 @@ async function runEgressReview(args: ParsedArgs): Promise<void> {
 }
 
 /**
+ * AUTOMATION-OPPORTUNITIES.md item 51 — `crewhaus pii tune`.
+ *
+ * Aggregates PII-redaction history across sessions (running the shared
+ * detector over durable session/turn content, HASHING every value on
+ * detection) to find (a) false-positive over-redaction candidates — values
+ * kept in up-rated/accepted outputs — and (b) detector coverage gaps, then
+ * proposes a reviewed `.crewhaus/pii-policy.json` the redactor consults
+ * additively (`createPiiRedactorWithPolicy`).
+ *
+ * NEVER prints or writes a raw PII value: output is hashes + counts + kinds
+ * only. Needs a stable HMAC secret (`--secret` / `CREWHAUS_PII_HASH_SECRET`)
+ * that MATCHES the redactor's secret, or the emitted policy cannot apply at
+ * runtime — so a secret is REQUIRED (a random per-run key would be useless).
+ */
+async function runPiiTune(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus pii tune [--sessions N|all] [--secret <key>] [--write] [--dir <root>] [--json]\n" +
+        "\n" +
+        "aggregates PII-redaction history (HASHED values, never raw) across sessions:\n" +
+        "  false-positive over-redaction candidates (PII kept in accepted outputs)\n" +
+        "  detector coverage gaps\n" +
+        "and proposes a reviewed .crewhaus/pii-policy.json the redactor reads additively.\n" +
+        "\n" +
+        "  --sessions N|all  how many recent sessions to scan (default 50)\n" +
+        "  --secret <key>    HMAC key (or CREWHAUS_PII_HASH_SECRET) — MUST match the\n" +
+        "                    redactor's secret for the policy to apply. Required.\n" +
+        "  --write           write the reviewed allow-list to .crewhaus/pii-policy.json\n" +
+        "  --dir <root>      harness root that owns .crewhaus/ (default: cwd)\n" +
+        "  --json            machine-readable output (hashes + counts only)\n",
+    );
+    return;
+  }
+
+  const secret = strFlag(args, "secret") ?? process.env["CREWHAUS_PII_HASH_SECRET"];
+  if (secret === undefined || secret.length === 0) {
+    die(
+      "pii tune requires a stable HMAC secret (--secret <key> or CREWHAUS_PII_HASH_SECRET) that matches the redactor's secret — a random key would make the emitted policy unusable at runtime",
+    );
+    return;
+  }
+
+  const dirFlag = args.flags["dir"];
+  const rootDir = typeof dirFlag === "string" ? resolve(dirFlag) : process.cwd();
+  const limit = parseSessionsLimit(args, 50);
+
+  // Read sessions from <rootDir>/.crewhaus/sessions, deriving turns so ratings
+  // map to the exact turn they rated (mirrors distill). A rating maps a turn's
+  // OUTPUT to accepted/rejected; unrated turns default to not-accepted (an
+  // unreviewed output is not evidence of a false positive).
+  const sessionsDir = join(rootDir, ".crewhaus", "sessions");
+  // Bare-record feedback (the web-UI host writes `.crewhaus/feedback/*.jsonl`).
+  const feedbackDirRecords: FeedbackRecord[] = [];
+  const feedbackDir = join(rootDir, ".crewhaus", "feedback");
+  if (existsSync(feedbackDir)) {
+    for (const f of readdirSync(feedbackDir).sort()) {
+      if (!f.endsWith(".jsonl")) continue;
+      feedbackDirRecords.push(
+        ...extractFeedbackRecords(parseAdviseJsonl(readFileSync(join(feedbackDir, f), "utf-8"))),
+      );
+    }
+  }
+
+  const units: ScanUnit[] = [];
+  let sessionCount = 0;
+  if (existsSync(sessionsDir)) {
+    const files = readdirSync(sessionsDir)
+      .filter((f) => f.endsWith(".jsonl"))
+      .map((f) => ({
+        file: join(sessionsDir, f),
+        id: f.replace(/\.jsonl$/, ""),
+        mtimeMs: statSync(join(sessionsDir, f)).mtimeMs,
+      }))
+      .sort((a, b) => b.mtimeMs - a.mtimeMs);
+    const chosen = limit === "all" ? files : files.slice(0, limit);
+    for (const { file, id } of chosen) {
+      sessionCount += 1;
+      const objects = parseAdviseJsonl(readFileSync(file, "utf-8"));
+      // Feedback lives in the session event log too (`user_feedback`); merge it
+      // with the bare-record feedback dir, then keep only THIS session's turns.
+      const records = mergeFeedback([
+        ...extractFeedbackRecords(objects),
+        ...feedbackDirRecords.filter((r) => r.sessionId === id),
+      ]);
+      const acceptedTurns = new Set<number>();
+      for (const r of records) {
+        if (r.sessionId !== id) continue;
+        const score = normalizeRating(r);
+        if (score !== undefined && score >= 0.5) acceptedTurns.add(r.turnNumber);
+      }
+      for (const turn of deriveTurns(objects as { kind?: string; payload?: unknown }[])) {
+        if (turn.output === "") continue;
+        units.push({ content: turn.output, accepted: acceptedTurns.has(turn.turnNumber) });
+      }
+    }
+  }
+
+  const ctx = buildPiiTuneContext(units, secret);
+  const candidates = findFalsePositives(ctx);
+  const gaps = findCoverageGaps(ctx);
+  const policy = buildPiiPolicy(candidates);
+
+  if (args.flags["json"] === true) {
+    process.stdout.write(
+      `${JSON.stringify({ context: ctx, candidates, gaps, policy }, null, 2)}\n`,
+    );
+    return;
+  }
+
+  process.stdout.write(`pii tune: ${rootDir} (${sessionCount} session(s) scanned)\n`);
+  for (const line of renderPiiTuneLines(ctx, candidates, gaps)) process.stdout.write(`  ${line}\n`);
+
+  if (args.flags["write"] === true) {
+    const outDir = join(rootDir, ".crewhaus");
+    mkdirSync(outDir, { recursive: true });
+    const policyPath = join(outDir, "pii-policy.json");
+    writeFileSync(policyPath, `${JSON.stringify(policy, null, 2)}\n`);
+    process.stdout.write(
+      `  [write] ${policy.allow.length} hashed allow entry(ies) → ${policyPath} (review, then the redactor honours it additively; keep the SAME --secret)\n`,
+    );
+  } else if (candidates.length > 0) {
+    process.stdout.write(
+      "  (re-run with --write to persist the proposed .crewhaus/pii-policy.json)\n",
+    );
+  }
+}
+
+/**
  * Item 61 — `crewhaus channel provision|verify <spec.yaml>`: one-command
  * platform-side setup + scope doctor for channel-target specs. Everything is
  * derived from the spec + the adapters' actual API usage (see
@@ -10607,6 +10764,19 @@ switch (subcommand) {
     }
     try {
       await runEgressReview(parseFor(rest.slice(1), EGRESS_SCHEMA));
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
+    break;
+  }
+  case "pii": {
+    const action = rest[0] ?? "";
+    if (action !== "tune") {
+      die(`pii action must be "tune" (got "${action}")`);
+    }
+    try {
+      await runPiiTune(parseFor(rest.slice(1), PII_SCHEMA));
     } catch (err) {
       if (err instanceof CrewhausError) die(err.message);
       throw err;
