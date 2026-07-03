@@ -140,6 +140,21 @@ function statusFor(provider: DoctorProviderId, env: NodeJS.ProcessEnv): EnvStatu
   }
 }
 
+/**
+ * Item 13 — online/offline mode selection for `crewhaus scaffold-evals`:
+ * true when the provider `model` routes to has visibly satisfied credentials
+ * (shares `statusFor` with the doctor checks, so the two never disagree).
+ * Unparseable model strings return false — the scaffold then stays on its
+ * deterministic template path instead of attempting a doomed call. Note the
+ * bedrock check is env-visible only (the AWS SDK's default chain may still
+ * work); scaffold prefers the safe offline mode in that ambiguity.
+ */
+export function providerCredentialsSatisfied(model: string, env: NodeJS.ProcessEnv): boolean {
+  const provider = selectedProvider(model);
+  if (provider === undefined) return false;
+  return statusFor(provider, env).satisfied;
+}
+
 const PROVIDER_LABEL: Record<DoctorProviderId, string> = {
   anthropic: "Anthropic credentials",
   openai: "OpenAI credentials",
