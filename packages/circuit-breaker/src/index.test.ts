@@ -522,3 +522,70 @@ describe("circuit-breaker — throw-based failures and isFailure on caught error
     expect(breaker.stats().consecutiveFailures).toBe(0);
   });
 });
+
+describe("circuit-breaker — trip() forced open (item 23)", () => {
+  test("trip() forces a closed breaker open and blocks the next stream", async () => {
+    const events: CircuitStateChangedEvent[] = [];
+    const bus = makeBus();
+    bus.subscribe((e) => {
+      if (e.kind === "circuit_state_changed") events.push(e as CircuitStateChangedEvent);
+    });
+    const breaker = wrap(stubAdapter({}), { cooldownMs: 60_000, bus });
+    expect(breaker.state()).toBe("closed");
+    breaker.trip("switch-model recovery");
+    expect(breaker.state()).toBe("open");
+    // The forced-open transition published a circuit_state_changed event.
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      fromState: "closed",
+      toState: "open",
+      reason: "switch-model recovery",
+    });
+    // A stream while open rejects without touching the adapter.
+    const result = await drain(breaker.stream(REQ));
+    expect(result.ok).toBe(false);
+  });
+
+  test("trip() default reason names switch-model", () => {
+    const events: CircuitStateChangedEvent[] = [];
+    const bus = makeBus();
+    bus.subscribe((e) => {
+      if (e.kind === "circuit_state_changed") events.push(e as CircuitStateChangedEvent);
+    });
+    const breaker = wrap(stubAdapter({}), { bus });
+    breaker.trip();
+    expect(events[0]?.reason).toContain("switch-model");
+  });
+
+  test("a tripped breaker still recovers via the normal cooldown → half_open path", async () => {
+    let nowMs = 1_000;
+    const breaker = wrap(stubAdapter({}), { cooldownMs: 5_000, now: (): number => nowMs });
+    breaker.trip();
+    expect(breaker.state()).toBe("open");
+    nowMs += 5_001;
+    // Cooldown elapsed — the breaker offers a half-open probe just like a
+    // threshold-driven trip, so a transient blip auto-restores.
+    expect(breaker.state()).toBe("half_open");
+    const result = await drain(breaker.stream(REQ));
+    expect(result.ok).toBe(true);
+    expect(breaker.state()).toBe("closed");
+  });
+
+  test("trip() on an already-open breaker is a no-op (no duplicate event)", async () => {
+    const events: CircuitStateChangedEvent[] = [];
+    const bus = makeBus();
+    bus.subscribe((e) => {
+      if (e.kind === "circuit_state_changed") events.push(e as CircuitStateChangedEvent);
+    });
+    const breaker = wrap(stubAdapter({ shouldFail: (): boolean => true }), {
+      failureThreshold: 1,
+      cooldownMs: 60_000,
+      bus,
+    });
+    await drain(breaker.stream(REQ)); // threshold trip → open
+    expect(breaker.state()).toBe("open");
+    const before = events.length;
+    breaker.trip(); // already open — no transition
+    expect(events.length).toBe(before);
+  });
+});

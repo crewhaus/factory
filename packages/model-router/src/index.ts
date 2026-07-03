@@ -8,3 +8,11 @@ export type { BedrockModelFamily, ParsedModelString, ProviderId } from "./parse.
 export { LOCAL_DEFAULT_BASE_URL, OPENAI_COMPAT_HOSTS, parseModelString } from "./parse.js";
 export type { ModelResolution } from "./router.js";
 export { clearAdapterCache, resolveModel } from "./router.js";
+export type {
+  CreateFailoverChainOptions,
+  FailoverActiveInfo,
+  FailoverBreakerTuning,
+  FailoverCandidateSnapshot,
+  FailoverChain,
+} from "./failover.js";
+export { FailoverExhaustedError, createFailoverChain } from "./failover.js";

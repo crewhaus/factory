@@ -1568,3 +1568,203 @@ describe("parseSpec version field (#43 spec version stamping)", () => {
     }
   });
 });
+
+describe("agent.model_fallbacks + agent.circuit_breaker (item 22)", () => {
+  const cliWithAgent = (agentLines: string): string =>
+    [
+      "name: hello",
+      "target: cli",
+      "agent:",
+      "  model: claude-sonnet-4-6",
+      "  instructions: hi",
+      agentLines,
+    ].join("\n");
+
+  test("parses model_fallbacks + circuit_breaker on the cli agent block", () => {
+    const spec = parseSpec(
+      cliWithAgent(
+        [
+          "  model_fallbacks:",
+          "    - openai/gpt-4o-mini",
+          "    - groq/llama-3.3-70b",
+          "  circuit_breaker:",
+          "    failureThreshold: 3",
+          "    windowMs: 60000",
+          "    cooldownMs: 30000",
+        ].join("\n"),
+      ),
+    );
+    if (spec.target !== "cli") throw new Error("unexpected target");
+    expect(spec.agent.model_fallbacks).toEqual(["openai/gpt-4o-mini", "groq/llama-3.3-70b"]);
+    expect(spec.agent.circuit_breaker).toEqual({
+      failureThreshold: 3,
+      windowMs: 60000,
+      cooldownMs: 30000,
+    });
+  });
+
+  test("model_fallbacks entries follow the agent.model validation rules (non-empty strings)", () => {
+    expect(() => parseSpec(cliWithAgent('  model_fallbacks:\n    - ""'))).toThrow(
+      /model_fallbacks/,
+    );
+    expect(() => parseSpec(cliWithAgent("  model_fallbacks: []"))).toThrow(/model_fallbacks/);
+  });
+
+  test("circuit_breaker is strict: a typo'd knob (halfOpenProbes) fails the parse", () => {
+    expect(() => parseSpec(cliWithAgent("  circuit_breaker:\n    halfOpenProbes: 2"))).toThrow(
+      /circuit_breaker/,
+    );
+  });
+
+  test("channel agent block accepts the same fields", () => {
+    const spec = parseSpec(
+      [
+        "name: bot",
+        "target: channel",
+        "agent:",
+        "  model: claude-sonnet-4-6",
+        "  instructions: hi",
+        "  model_fallbacks:",
+        "    - openai/gpt-4o-mini",
+        "  circuit_breaker:",
+        "    cooldownMs: 5000",
+        "channels:",
+        "  slack:",
+        "    botToken: $SLACK_BOT_TOKEN",
+        "    signingSecret: $SLACK_SIGNING_SECRET",
+        "routing:",
+        "  sessionKey: thread",
+      ].join("\n"),
+    );
+    if (spec.target !== "channel") throw new Error("unexpected target");
+    expect(spec.agent.model_fallbacks).toEqual(["openai/gpt-4o-mini"]);
+    expect(spec.agent.circuit_breaker).toEqual({ cooldownMs: 5000 });
+  });
+
+  test("managed agent block accepts the same fields", () => {
+    const spec = parseSpec(
+      [
+        "name: mg",
+        "target: managed",
+        "agent:",
+        "  model: claude-sonnet-4-6",
+        "  instructions: hi",
+        "  model_fallbacks:",
+        "    - openai/gpt-4o-mini",
+        "tenants:",
+        "  - id: t1",
+        "    budget:",
+        "      maxInputTokens: 1",
+        "      maxOutputTokens: 1",
+      ].join("\n"),
+    );
+    if (spec.target !== "managed") throw new Error("unexpected target");
+    expect(spec.agent.model_fallbacks).toEqual(["openai/gpt-4o-mini"]);
+  });
+
+  test("shapes without the wiring still reject the fields (strict agent blocks)", () => {
+    expect(() =>
+      parseSpec(
+        [
+          "name: bt",
+          "target: batch",
+          "agent:",
+          "  model: m",
+          "  instructions: i",
+          "  model_fallbacks:",
+          "    - openai/gpt-4o-mini",
+          "queue:",
+          "  adapter: in-memory",
+        ].join("\n"),
+      ),
+    ).toThrow(/model_fallbacks/);
+  });
+});
+
+describe("failure_taxonomy switch-model recovery action (item 23)", () => {
+  test("accepts recovery: switch-model", () => {
+    const spec = parseSpec(
+      [
+        "name: c",
+        "target: cli",
+        "agent:",
+        "  model: m",
+        "  instructions: i",
+        "failure_taxonomy:",
+        "  - class: overloaded",
+        "    pattern: /529/",
+        "    recovery: switch-model",
+      ].join("\n"),
+    );
+    if (spec.target !== "cli") throw new Error("unexpected target");
+    expect(spec.failure_taxonomy?.[0]?.recovery).toBe("switch-model");
+  });
+
+  test("still rejects an unknown recovery value", () => {
+    expect(() =>
+      parseSpec(
+        [
+          "name: c",
+          "target: cli",
+          "agent:",
+          "  model: m",
+          "  instructions: i",
+          "failure_taxonomy:",
+          "  - class: x",
+          "    pattern: y",
+          "    recovery: reboot",
+        ].join("\n"),
+      ),
+    ).toThrow();
+  });
+});
+
+describe("run-level budget cap block (item 27)", () => {
+  const cli = (budgetLines: string): string =>
+    ["name: c", "target: cli", "agent:", "  model: m", "  instructions: i", budgetLines].join("\n");
+
+  test("parses a stop budget", () => {
+    const spec = parseSpec(cli("budget:\n  usd: 5\n  on_exceed:\n    action: stop"));
+    if (spec.target !== "cli") throw new Error("unexpected target");
+    expect(spec.budget?.usd).toBe(5);
+    expect(spec.budget?.on_exceed).toEqual({ action: "stop" });
+  });
+
+  test("parses a degrade ladder", () => {
+    const spec = parseSpec(
+      cli("budget:\n  usd: 12.5\n  on_exceed:\n    action: degrade\n    model: claude-haiku-4-5"),
+    );
+    if (spec.target !== "cli") throw new Error("unexpected target");
+    expect(spec.budget?.on_exceed).toEqual({ action: "degrade", model: "claude-haiku-4-5" });
+  });
+
+  test("on_exceed defaults to stop", () => {
+    const spec = parseSpec(cli("budget:\n  usd: 1"));
+    if (spec.target !== "cli") throw new Error("unexpected target");
+    expect(spec.budget?.on_exceed).toEqual({ action: "stop" });
+  });
+
+  test("rejects usd <= 0, unknown action, and a degrade without model", () => {
+    expect(() => parseSpec(cli("budget:\n  usd: 0"))).toThrow();
+    expect(() => parseSpec(cli("budget:\n  usd: 1\n  on_exceed:\n    action: nope"))).toThrow();
+    expect(() => parseSpec(cli("budget:\n  usd: 1\n  on_exceed:\n    action: degrade"))).toThrow();
+  });
+
+  test("shapes without the wiring reject the budget block (strict)", () => {
+    expect(() =>
+      parseSpec(
+        [
+          "name: bt",
+          "target: batch",
+          "agent:",
+          "  model: m",
+          "  instructions: i",
+          "budget:",
+          "  usd: 1",
+          "queue:",
+          "  adapter: in-memory",
+        ].join("\n"),
+      ),
+    ).toThrow();
+  });
+});

@@ -935,7 +935,9 @@
       "version": "0.1.4",
       "dependencies": {
         "@crewhaus/adapter-anthropic": "workspace:*",
+        "@crewhaus/circuit-breaker": "workspace:*",
         "@crewhaus/errors": "workspace:*",
+        "@crewhaus/trace-event-bus": "workspace:*",
       },
       "optionalDependencies": {
         "@crewhaus/adapter-bedrock": "workspace:*",

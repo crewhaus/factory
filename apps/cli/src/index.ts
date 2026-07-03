@@ -49,7 +49,7 @@ import {
   type ParsedArgs,
   parseArgs,
 } from "@crewhaus/infra-utils";
-import { GENERATED_README_MARKER } from "@crewhaus/ir";
+import { GENERATED_README_MARKER, type IrBudget } from "@crewhaus/ir";
 import { createLogger } from "@crewhaus/logging";
 import { McpHost } from "@crewhaus/mcp-host";
 import {
@@ -494,6 +494,11 @@ const RUN_SCHEMA: ParseArgsSchema = {
     // the spec / .crewhaus/commands / skills dirs, printing a green/red status
     // per cycle. A pre-run authoring aid; it does NOT re-launch the agent.
     { name: "watch", takesValue: false },
+    // Item 27 — run-level spend cap in dollars. Sets/overrides the spec
+    // `budget.usd` ceiling and keeps the spec's on_exceed ladder (default
+    // `stop`). On reaching the cap the run stops (or degrades) before the
+    // next turn.
+    { name: "budget-usd", takesValue: true },
     { name: "help", short: "h" },
   ],
 };
@@ -2291,6 +2296,25 @@ async function runRunCli(
   const modelOverride = args.flags["model"];
   const model = typeof modelOverride === "string" ? modelOverride : ir.agent.model;
 
+  // Item 27 — run-level spend cap: `--budget-usd <n>` (flag) > spec `budget`.
+  // The flag sets/overrides the dollar ceiling and keeps the spec's on_exceed
+  // ladder (defaulting to `stop` when the spec has no budget block). Absent
+  // flag + absent spec block → no cap.
+  const budgetUsdFlag = args.flags["budget-usd"];
+  let runBudget: IrBudget | undefined;
+  if (typeof budgetUsdFlag === "string") {
+    const usd = Number.parseFloat(budgetUsdFlag);
+    if (!Number.isFinite(usd) || usd <= 0) {
+      die(`invalid --budget-usd "${budgetUsdFlag}" — expected a positive dollar amount`);
+    }
+    runBudget = {
+      usdMicros: Math.round(usd * 1_000_000),
+      onExceed: ir.target === "cli" ? (ir.budget?.onExceed ?? { kind: "stop" }) : { kind: "stop" },
+    };
+  } else if (ir.target === "cli" && ir.budget !== undefined) {
+    runBudget = ir.budget;
+  }
+
   // Permission mode resolution: CLI flag > spec > "default".
   // bypass is reachable only via the flag (the spec parser has already
   // rejected `mode: bypass`).
@@ -2397,6 +2421,28 @@ async function runRunCli(
       ...(ir.target === "cli" && ir.agent.maxTokens !== undefined
         ? { maxTokens: ir.agent.maxTokens }
         : {}),
+      // Item 22 — provider failover chain: thread `agent.model_fallbacks` +
+      // `agent.circuit_breaker` through to the runtime, mirroring the
+      // target-cli codegen path. Skipped when `--model` overrides the
+      // primary — a flag-forced model is an explicit routing decision and
+      // the spec's fallback chain was authored against the spec's primary.
+      ...(ir.target === "cli" &&
+      typeof modelOverride !== "string" &&
+      ir.agent.modelFallbacks !== undefined &&
+      ir.agent.modelFallbacks.length > 0
+        ? { modelFallbacks: ir.agent.modelFallbacks }
+        : {}),
+      ...(ir.target === "cli" && ir.agent.circuitBreaker !== undefined
+        ? { circuitBreaker: ir.agent.circuitBreaker }
+        : {}),
+      // Section 55 / item 23 — thread the spec's failure_taxonomy so
+      // recovery-engine consults the user's named error classes (including
+      // the `switch-model` verdict) before its built-in flow.
+      ...(ir.failureTaxonomy !== undefined && ir.failureTaxonomy.length > 0
+        ? { failureTaxonomy: ir.failureTaxonomy }
+        : {}),
+      // Item 27 — run-level spend cap (--budget-usd flag > spec `budget`).
+      ...(runBudget !== undefined ? { budget: runBudget } : {}),
       ...(resumeId !== undefined ? { resume: { sessionId: resumeId } } : {}),
       ...(justificationJudge !== undefined ? { justificationJudge } : {}),
       ...(justificationAuditSink !== undefined ? { justificationAuditSink } : {}),
