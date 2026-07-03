@@ -10,6 +10,8 @@ import { join } from "node:path";
 import type { TraceEvent, TraceEventEnvelope } from "@crewhaus/trace-event-bus";
 import {
   HEADROOM_FACTOR,
+  MAX_METRICS_HISTORY_LINES,
+  METRICS_FILENAME,
   MIN_BASELINE_SESSIONS,
   SessionMetricsAccumulator,
   type SessionMetricsSnapshot,
@@ -290,5 +292,68 @@ describe("snapshot persistence", () => {
     appendMetricsSnapshot(snap({ sessionId: "c" }), dir);
     const history = readMetricsHistory(dir);
     expect(history.map((s) => s.sessionId)).toEqual(["a", "c"]);
+  });
+
+  // F3 — the history file must never grow unbounded: appendMetricsSnapshot
+  // trims to the trailing MAX_METRICS_HISTORY_LINES, and readMetricsHistory
+  // bounds itself independently on a pre-existing oversized file.
+  describe("F3 — history file is capped", () => {
+    test("file is bounded after many appends, and retains the MOST RECENT lines", () => {
+      const dir = join(tmpRoot, "metrics");
+      const total = MAX_METRICS_HISTORY_LINES + 50;
+      for (let i = 0; i < total; i++) {
+        appendMetricsSnapshot(snap({ sessionId: `s${i}` }), dir);
+      }
+      const { readFileSync } = require("node:fs") as typeof import("node:fs");
+      const raw = readFileSync(join(dir, METRICS_FILENAME), "utf-8");
+      const lineCount = raw.split("\n").filter((l) => l.trim() !== "").length;
+      expect(lineCount).toBe(MAX_METRICS_HISTORY_LINES);
+
+      const history = readMetricsHistory(dir);
+      expect(history).toHaveLength(MAX_METRICS_HISTORY_LINES);
+      // Oldest-first; the retained tail is the LAST `total` sessions appended.
+      expect(history[0]?.sessionId).toBe(`s${total - MAX_METRICS_HISTORY_LINES}`);
+      expect(history[history.length - 1]?.sessionId).toBe(`s${total - 1}`);
+    });
+
+    test("threshold derivation is still correct from the trimmed tail", () => {
+      const dir = join(tmpRoot, "metrics");
+      // Old sessions with a very different turnP95Seconds than the recent
+      // BASELINE_WINDOW — if the trim ever dropped recent data instead of
+      // old data, this would derive the wrong threshold.
+      for (let i = 0; i < MAX_METRICS_HISTORY_LINES; i++) {
+        appendMetricsSnapshot(snap({ sessionId: `old${i}`, turnP95Seconds: 999 }), dir);
+      }
+      // Append exactly MAX_METRICS_HISTORY_LINES fresh sessions — enough to
+      // fully evict every "old" line from the capped file (each append trims
+      // to the trailing cap, so once MAX_METRICS_HISTORY_LINES new lines have
+      // landed, none of the old ones can still be within the trailing cap).
+      for (let i = 0; i < MAX_METRICS_HISTORY_LINES; i++) {
+        appendMetricsSnapshot(snap({ sessionId: `new${i}`, turnP95Seconds: 2 }), dir);
+      }
+      const history = readMetricsHistory(dir);
+      expect(history.every((s) => !s.sessionId.startsWith("old"))).toBe(true);
+      const t = deriveThresholds(history);
+      expect(t.turnP95Seconds).toBeCloseTo(2 * HEADROOM_FACTOR);
+    });
+
+    test("reader bounds itself on a pre-existing oversized file", () => {
+      const dir = join(tmpRoot, "metrics");
+      // Write a raw oversized file directly (bypassing appendMetricsSnapshot's
+      // own trim) to simulate a file grown by an older binary that predates
+      // the cap, or corrupted into growing past it.
+      const { mkdirSync: mk, writeFileSync } = require("node:fs") as typeof import("node:fs");
+      mk(dir, { recursive: true });
+      const total = MAX_METRICS_HISTORY_LINES + 100;
+      const lines = Array.from({ length: total }, (_, i) =>
+        JSON.stringify(snap({ sessionId: `s${i}` })),
+      );
+      writeFileSync(join(dir, METRICS_FILENAME), `${lines.join("\n")}\n`);
+
+      const history = readMetricsHistory(dir);
+      expect(history).toHaveLength(MAX_METRICS_HISTORY_LINES);
+      expect(history[0]?.sessionId).toBe(`s${total - MAX_METRICS_HISTORY_LINES}`);
+      expect(history[history.length - 1]?.sessionId).toBe(`s${total - 1}`);
+    });
   });
 });

@@ -21,6 +21,8 @@ function breach(metric = "turn_p95_seconds"): AlertBreachPayload {
 
 // A webhook host built at runtime so no URL-with-token literal is in source.
 const WEBHOOK_URL = ["https://hooks.example.test", "services", "T000", "B000"].join("/");
+// Plain-http variant, likewise built at runtime, for the F5 scheme-warning tests.
+const HTTP_WEBHOOK_URL = ["http://hooks.example.test", "services", "T000", "B000"].join("/");
 
 describe("buildAlertSink", () => {
   test("no channels configured ⇒ undefined (nothing to wire)", () => {
@@ -100,6 +102,36 @@ describe("buildAlertSink", () => {
     await sink?.fireAlertHook?.(breach());
     expect(warnings.some((w) => w.includes("hook failed"))).toBe(true);
     expect(webhookFired).toBe(true);
+  });
+
+  // F5 — a non-https webhook scheme is advisory (warn, still POST), mirroring
+  // security-digest.ts's notifySecurityDigest http warning.
+  test("http webhook warns on stderr (advisory) but still POSTs", async () => {
+    const warnings: string[] = [];
+    const seen: Array<{ url: string }> = [];
+    const sink = buildAlertSink({
+      webhookUrl: HTTP_WEBHOOK_URL,
+      warn: (l) => warnings.push(l),
+      fetchImpl: (async (url: string) => {
+        seen.push({ url });
+        return { ok: true, status: 200 } as Response;
+      }) as unknown as typeof fetch,
+    });
+    await sink?.fireAlertHook?.(breach());
+    expect(warnings.some((w) => w.includes("plain http"))).toBe(true);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.url).toBe(HTTP_WEBHOOK_URL);
+  });
+
+  test("https webhook is silent on scheme (no warning)", async () => {
+    const warnings: string[] = [];
+    const sink = buildAlertSink({
+      webhookUrl: WEBHOOK_URL,
+      warn: (l) => warnings.push(l),
+      fetchImpl: (async () => ({ ok: true, status: 200 }) as Response) as unknown as typeof fetch,
+    });
+    await sink?.fireAlertHook?.(breach());
+    expect(warnings.some((w) => w.includes("plain http"))).toBe(false);
   });
 });
 

@@ -73,6 +73,16 @@ export function buildAlertSink(opts: BuildAlertSinkOptions): AlertSink | undefin
         }
       }
       if (hasWebhook && opts.webhookUrl !== undefined) {
+        // F5 — warn (never block) on a non-https scheme, mirroring
+        // security-digest.ts's notifySecurityDigest: an alert breach payload
+        // carries session/metric/threshold detail, and posting it cleartext
+        // leaks it to every on-path observer. Advisory only — the webhook
+        // still POSTs; a local tunnel/dev receiver is a legitimate use case.
+        if (isNonHttpsUrl(opts.webhookUrl)) {
+          warn(
+            `[alert] webhook ${opts.webhookUrl} uses plain http — the breach payload will transit unencrypted; prefer an https webhook`,
+          );
+        }
         const doFetch = opts.fetchImpl ?? fetch;
         try {
           const res = await doFetch(opts.webhookUrl, {
@@ -88,6 +98,21 @@ export function buildAlertSink(opts: BuildAlertSinkOptions): AlertSink | undefin
     };
   }
   return sink;
+}
+
+/**
+ * F5 — true when `url` parses and its scheme is anything other than
+ * `https:` (notably plain `http:`). An unparseable URL returns `false` here
+ * — the webhook POST itself will surface that failure via its own
+ * try/catch, so this check only ever adds the scheme warning, never a new
+ * failure mode.
+ */
+function isNonHttpsUrl(url: string): boolean {
+  try {
+    return new URL(url).protocol !== "https:";
+  } catch {
+    return false;
+  }
 }
 
 /**

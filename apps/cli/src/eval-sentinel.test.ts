@@ -26,7 +26,11 @@ function sample(id: string, passed: boolean, score: number): SampleResult {
   };
 }
 
-function loaded(specHash: string, samples: SampleResult[]): LoadedRun {
+function loaded(
+  specHash: string,
+  samples: SampleResult[],
+  configOverrides: Partial<EvalRunSummary["config"]> = {},
+): LoadedRun {
   const passed = samples.filter((s) => s.grades.overall.passed).length;
   const summary: EvalRunSummary = {
     runId: `run_${Math.random().toString(16).slice(2)}`,
@@ -52,6 +56,7 @@ function loaded(specHash: string, samples: SampleResult[]): LoadedRun {
       graderNames: ["g1"],
       model: "claude-sonnet-4-5",
       concurrency: 1,
+      ...configOverrides,
     },
     outDir: "/tmp/x",
   };
@@ -162,5 +167,92 @@ describe("evaluateSentinel", () => {
     });
     expect(r.verdict).toBe("not-comparable");
     expect(r.alert).toBe(true);
+  });
+
+  // F2 — a different judge model or an edited graders.yaml changes what
+  // "pass" MEANS independent of the provider under test; neither ever
+  // touches specHash or the dataset hash, so both must gate separately or a
+  // judge/grader change silently reads as "provider drift".
+  test("different judge model + a score shift ⇒ not-comparable (not drift)", () => {
+    const baseline = loaded(HASH_A, [sample("s1", true, 0.95)], {
+      judgeModel: "claude-sonnet-4-5",
+      gradersHash: "g-hash-1",
+    });
+    // Score moved AND the judge model changed — must not read as drift.
+    const current = loaded(HASH_A, [sample("s1", true, 0.6)], {
+      judgeModel: "claude-opus-4-5",
+      gradersHash: "g-hash-1",
+    });
+    const r = evaluateSentinel({
+      baseline,
+      current,
+      baselineDatasetHash: DS_HASH,
+      currentDatasetHash: DS_HASH,
+    });
+    expect(r.verdict).toBe("not-comparable");
+    expect(r.alert).toBe(true);
+    expect(r.reason).toContain("judge model changed");
+  });
+
+  test("different graders config ⇒ not-comparable", () => {
+    const baseline = loaded(HASH_A, [sample("s1", true, 1)], {
+      judgeModel: "claude-sonnet-4-5",
+      gradersHash: "g-hash-1",
+    });
+    const current = loaded(HASH_A, [sample("s1", true, 1)], {
+      judgeModel: "claude-sonnet-4-5",
+      gradersHash: "g-hash-2",
+    });
+    const r = evaluateSentinel({
+      baseline,
+      current,
+      baselineDatasetHash: DS_HASH,
+      currentDatasetHash: DS_HASH,
+    });
+    expect(r.verdict).toBe("not-comparable");
+    expect(r.alert).toBe(true);
+    expect(r.reason).toContain("graders config changed");
+  });
+
+  test("baseline predates gradersHash (undefined vs recorded) ⇒ not-comparable", () => {
+    // Baseline recorded before this CLI version added gradersHash — undefined
+    // on one side, a real hash on the other, must not silently compare equal.
+    const baseline = loaded(HASH_A, [sample("s1", true, 1)], {
+      judgeModel: "claude-sonnet-4-5",
+      // gradersHash intentionally omitted (undefined).
+    });
+    const current = loaded(HASH_A, [sample("s1", true, 1)], {
+      judgeModel: "claude-sonnet-4-5",
+      gradersHash: "g-hash-1",
+    });
+    const r = evaluateSentinel({
+      baseline,
+      current,
+      baselineDatasetHash: DS_HASH,
+      currentDatasetHash: DS_HASH,
+    });
+    expect(r.verdict).toBe("not-comparable");
+    expect(r.alert).toBe(true);
+    expect(r.reason).toContain("graders config changed");
+  });
+
+  test("judgeModel + gradersHash both equal, score shift ⇒ still drift", () => {
+    const baseline = loaded(HASH_A, [sample("s1", true, 0.95)], {
+      judgeModel: "claude-sonnet-4-5",
+      gradersHash: "g-hash-1",
+    });
+    const current = loaded(HASH_A, [sample("s1", true, 0.6)], {
+      judgeModel: "claude-sonnet-4-5",
+      gradersHash: "g-hash-1",
+    });
+    const r = evaluateSentinel({
+      baseline,
+      current,
+      baselineDatasetHash: DS_HASH,
+      currentDatasetHash: DS_HASH,
+    });
+    expect(r.verdict).toBe("drift");
+    expect(r.alert).toBe(true);
+    expect(r.diff?.scoreShifts.length).toBe(1);
   });
 });

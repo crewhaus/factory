@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 import { spawnSync } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
@@ -25,7 +25,7 @@ import {
 } from "@crewhaus/dataset-registry";
 import { CrewhausError } from "@crewhaus/errors";
 import { type Sample, loadDataset } from "@crewhaus/eval-dataset";
-import { type CompiledGrader, parseGradersConfig } from "@crewhaus/eval-grader";
+import { type CompiledGrader, type GradersConfig, parseGradersConfig } from "@crewhaus/eval-grader";
 import { optimizeSpec } from "@crewhaus/eval-optimizer-orchestrator";
 import {
   type RunIndexEntry,
@@ -4659,6 +4659,31 @@ function makeAsyncIterable<T>(items: ReadonlyArray<T>): AsyncIterable<T> {
 }
 
 /**
+ * F2 (ops pre-merge) — sha256 hex digest of the parsed GradersConfig, keyed
+ * on a deterministically-sorted JSON serialization so two byte-identical
+ * graders.yaml files always hash equal and key ordering never causes a false
+ * mismatch. Mirrors `hashDatasetFile`'s "content identity, not path" shape:
+ * recorded into run.json/results.json so `--sentinel` can assert the graders
+ * a baseline and a fresh run scored with are byte-identical (F2 — without
+ * this, a changed judge model or edited graders.yaml silently reads as
+ * "provider drift" because neither ever touches specHash or the dataset).
+ */
+function hashGradersConfig(config: GradersConfig): string {
+  return createHash("sha256").update(stableStringify(config)).digest("hex");
+}
+
+function stableStringify(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map((v) => stableStringify(v)).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    const keys = Object.keys(value as Record<string, unknown>).sort();
+    return `{${keys
+      .map((k) => `${JSON.stringify(k)}:${stableStringify((value as Record<string, unknown>)[k])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+/**
  * Build the model-driven Claude mutation provider for a spec — shared by
  * `optimize --mutator claude` and the flywheel's default mutator. Resolves
  * via the model-router so non-Anthropic specs drive their own provider:
@@ -5507,7 +5532,11 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
   } catch (err) {
     die(`could not read ${gradersPath}: ${(err as Error).message}`);
   }
-  const { compiled } = parseGradersConfig(gradersYaml);
+  const { compiled, config: gradersConfig } = parseGradersConfig(gradersYaml);
+  // F2 — sha256 of the parsed graders config, recorded into run.json/
+  // results.json so `--sentinel` can assert a fresh run graded with the same
+  // rubric/thresholds as the baseline (see hashGradersConfig doc comment).
+  const gradersHash = hashGradersConfig(gradersConfig);
 
   // Item 12 — `--dataset registry:<name>[@version][#split]` resolves via the
   // Section 29 dataset registry instead of loadDataset. datasetName becomes
@@ -5620,6 +5649,7 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
     opts: {
       ...(typeof outDirArg === "string" ? { outDir: resolve(outDirArg) } : {}),
       datasetHash,
+      gradersHash,
       retryErrors,
       ...(concurrency !== undefined ? { concurrency } : {}),
       ...(seed !== undefined ? { seed } : {}),
@@ -5633,8 +5663,9 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
   // Item 30 — sentinel drift probe. Skip triage + run-history entirely (a
   // sentinel is a one-off provider-drift check, not lineage): render the
   // report, then diff the fresh run against the frozen baseline and attribute
-  // any flip/score-shift to the provider ONLY when specHash AND dataset-hash
-  // are both unchanged. Exit non-zero on drift OR not-comparable.
+  // any flip/score-shift to the provider ONLY when specHash, dataset-hash,
+  // judgeModel, AND gradersHash are all unchanged (F2). Exit non-zero on
+  // drift OR not-comparable.
   if (sentinel) {
     const loadedSentinel = await loadRun(absOut);
     writeFileSync(join(absOut, "index.html"), renderReport(loadedSentinel, {}).html);

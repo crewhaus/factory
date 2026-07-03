@@ -238,6 +238,30 @@ describe("buildSecurityDigest — audit rollup", () => {
     expect(d.audit.absentDeclaredKinds).not.toContain("model_call");
   });
 
+  // F7 — the item-31 alert watchdog's `alert_raised` AuditKind must be
+  // counted like any other declared kind, and must NOT show up as
+  // "absent" once a record for it lands in the window.
+  test("F7: an alert_raised audit record is counted and not reported absent", async () => {
+    await seedAudit([
+      {
+        kind: "alert_raised",
+        payload: {
+          sessionId: "sess_x",
+          metric: "turn_p95_seconds",
+          observed: 30,
+          threshold: 5,
+          baselineSessions: 6,
+          detail: "turn_p95_seconds 30s exceeded baseline threshold 5s",
+        },
+        atMs: NOW - MS_PER_DAY,
+      },
+    ]);
+    const d = buildSecurityDigest({ rootDir: root, window: window(7), now: () => NOW });
+    expect(d.audit.countsByKind).toEqual({ alert_raised: 1 });
+    expect(d.audit.absentDeclaredKinds).not.toContain("alert_raised");
+    expect(DECLARED_AUDIT_KINDS).toContain("alert_raised");
+  });
+
   test("F1 defense in depth: control chars in audit payload strings are stripped and clamped", async () => {
     await seedAudit([
       {

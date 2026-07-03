@@ -23,7 +23,14 @@
  * and appending its own snapshot JSONL); event folding, threshold derivation,
  * and breach detection are pure and unit-tested.
  */
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 import type { TraceEvent } from "@crewhaus/trace-event-bus";
 
@@ -37,6 +44,18 @@ export const MIN_BASELINE_SESSIONS = 5;
 export const HEADROOM_FACTOR = 1.5;
 /** How many trailing sessions the baseline is derived from. */
 export const BASELINE_WINDOW = 50;
+/**
+ * F3 (ops pre-merge) — hard cap on how many lines `sessions.jsonl` is allowed
+ * to grow to. `deriveThresholds` only ever looks at the trailing
+ * {@link BASELINE_WINDOW} sessions, but `appendMetricsSnapshot` was
+ * append-only and `readMetricsHistory` re-read (and re-parsed) the ENTIRE
+ * file every session — unbounded growth for a file nothing ever reads past
+ * its tail. 4× the baseline window is generous headroom over what
+ * `deriveThresholds` consumes, with a 200-line floor so a small
+ * `BASELINE_WINDOW` still keeps a useful amount of history for operators
+ * eyeballing the file by hand.
+ */
+export const MAX_METRICS_HISTORY_LINES = Math.max(BASELINE_WINDOW * 4, 200);
 
 /**
  * The compact per-session snapshot persisted to `sessions.jsonl` and read back
@@ -296,18 +315,32 @@ function fmt(n: number): string {
 
 // --------- snapshot persistence (the only I/O this module owns) ---------
 
-/** Read the persisted session history, oldest first. Torn lines are skipped. */
+/**
+ * Read the persisted session history, oldest first. Torn lines are skipped.
+ *
+ * F3 — bounds itself to the trailing {@link MAX_METRICS_HISTORY_LINES} raw
+ * lines BEFORE parsing, so a pre-existing oversized file (e.g. one written by
+ * an older binary that predates the cap, or a file that grew past the cap
+ * some other way) is never fully materialized into memory just to derive a
+ * threshold from its tail. `appendMetricsSnapshot` keeps the file itself
+ * trimmed going forward; this is the reader's independent bound.
+ */
 export function readMetricsHistory(
   metricsDir: string = DEFAULT_METRICS_DIR,
 ): SessionMetricsSnapshot[] {
   const path = join(metricsDir, METRICS_FILENAME);
   if (!existsSync(path)) return [];
+  // Filter blank lines (incl. the trailing "" from the file's final newline)
+  // BEFORE slicing to the trailing cap — slicing raw split() output would
+  // waste one slot of the cap on that trailing empty entry.
+  const lines = readFileSync(path, "utf-8")
+    .split("\n")
+    .filter((l) => l.trim() !== "");
+  const bounded = lines.slice(-MAX_METRICS_HISTORY_LINES);
   const out: SessionMetricsSnapshot[] = [];
-  for (const line of readFileSync(path, "utf-8").split("\n")) {
-    const trimmed = line.trim();
-    if (trimmed === "") continue;
+  for (const line of bounded) {
     try {
-      out.push(JSON.parse(trimmed) as SessionMetricsSnapshot);
+      out.push(JSON.parse(line.trim()) as SessionMetricsSnapshot);
     } catch {
       // skip corrupt line — an append-only log must survive one torn write.
     }
@@ -315,7 +348,15 @@ export function readMetricsHistory(
   return out;
 }
 
-/** Append one session snapshot to the history JSONL, creating dirs on first use. */
+/**
+ * Append one session snapshot to the history JSONL, creating dirs on first
+ * use, then trim the file to its trailing {@link MAX_METRICS_HISTORY_LINES}
+ * (F3 — the file otherwise grows forever even though `deriveThresholds` only
+ * ever looks at the trailing {@link BASELINE_WINDOW}). The trim is a
+ * temp-write + rename so a crash mid-trim never leaves a torn or truncated
+ * file in place of the real one; a torn LINE within the kept tail is still
+ * tolerated by `readMetricsHistory`.
+ */
 export function appendMetricsSnapshot(
   snapshot: SessionMetricsSnapshot,
   metricsDir: string = DEFAULT_METRICS_DIR,
@@ -323,4 +364,13 @@ export function appendMetricsSnapshot(
   const path = join(metricsDir, METRICS_FILENAME);
   mkdirSync(dirname(path), { recursive: true });
   appendFileSync(path, `${JSON.stringify(snapshot)}\n`);
+
+  const lines = readFileSync(path, "utf-8")
+    .split("\n")
+    .filter((l) => l.trim() !== "");
+  if (lines.length <= MAX_METRICS_HISTORY_LINES) return;
+  const trimmed = lines.slice(-MAX_METRICS_HISTORY_LINES);
+  const tmpPath = `${path}.tmp-${process.pid}-${Date.now()}`;
+  writeFileSync(tmpPath, `${trimmed.join("\n")}\n`);
+  renameSync(tmpPath, path);
 }
