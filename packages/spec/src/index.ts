@@ -404,6 +404,27 @@ const feedbackBlock = z
   .optional();
 
 /**
+ * Feature #53 — cross-session memory block. Its mere presence wires the
+ * Remember/Recall tools into the harness (no hand-editing). The auto-*
+ * switches layer on top: `autoCapture` summarizes the session's durable
+ * outcomes into `.crewhaus/memories/<name>.jsonl` at run teardown;
+ * `autoRecall` injects the top-`recallK` relevant memories into the system
+ * prompt at session start (mirrors project-memory auto-load). Carried on the
+ * interactive shapes that run a chat loop (cli, channel, managed, research).
+ * `.strict()` so a typo'd sub-key fails the build.
+ */
+const memoryBlock = z
+  .object({
+    enabled: z.boolean().optional(),
+    autoCapture: z.boolean().optional(),
+    autoCaptureThreshold: z.number().int().positive().optional(),
+    autoRecall: z.boolean().optional(),
+    recallK: z.number().int().positive().max(50).optional(),
+  })
+  .strict()
+  .optional();
+
+/**
  * Section 47 — blockchain subsystem blocks (cross-cutting). Any shape may
  * declare any subset of `chains` / `wallets` / `contracts` /
  * `transaction_policy`. Authoring rules:
@@ -577,6 +598,7 @@ const cliSchema = z
     failure_taxonomy: failureTaxonomyBlock,
     budget: budgetBlock,
     feedback: feedbackBlock,
+    memory: memoryBlock,
     cli: cliOptionsBlock,
     chains: chainsBlock,
     wallets: walletsBlock,
@@ -719,6 +741,7 @@ const channelSchema = z
     failure_taxonomy: failureTaxonomyBlock,
     budget: budgetBlock,
     feedback: feedbackBlock,
+    memory: memoryBlock,
     heartbeat: heartbeatBlock,
     gateway: channelGatewayBlock,
     chains: chainsBlock,
@@ -814,6 +837,7 @@ const managedSchema = z
     compaction: compactionBlock,
     failure_taxonomy: failureTaxonomyBlock,
     budget: budgetBlock,
+    memory: memoryBlock,
   })
   .strict();
 
@@ -966,6 +990,7 @@ const researchSchema = z
     permissions: permissionsBlock,
     compaction: compactionBlock,
     failure_taxonomy: failureTaxonomyBlock,
+    memory: memoryBlock,
     chains: chainsBlock,
     wallets: walletsBlock,
     contracts: contractsBlock,
@@ -1300,6 +1325,7 @@ export type SpecCircuitBreakerBlock = z.infer<typeof circuitBreakerBlock>;
 export type SpecBudgetBlock = z.infer<typeof budgetBlock>;
 export type SpecSecurityBlock = z.infer<typeof securityBlock>;
 export type SpecFeedbackBlock = z.infer<typeof feedbackBlock>;
+export type SpecMemoryBlock = z.infer<typeof memoryBlock>;
 export type SpecFailureTaxonomyEntry = z.infer<typeof failureTaxonomyEntrySchema>;
 export type SpecFailureTaxonomy = z.infer<typeof failureTaxonomyBlock>;
 

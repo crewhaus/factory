@@ -26,6 +26,7 @@ import type {
   IrManagedV0,
   IrMcpServerConfig,
   IrMcpServers,
+  IrMemory,
   IrNode,
   IrPermissions,
   IrPipelineV0,
@@ -618,6 +619,36 @@ function lowerFeedback(spec: SpecWithFeedback): { feedback?: IrFeedback } {
   };
 }
 
+type SpecWithMemory = {
+  readonly memory?: {
+    readonly enabled?: boolean;
+    readonly autoCapture?: boolean;
+    readonly autoCaptureThreshold?: number;
+    readonly autoRecall?: boolean;
+    readonly recallK?: number;
+  };
+};
+
+// Lower the cross-cutting `memory` block (#53), mirroring lowerFeedback's
+// spread-return-{} discipline (Pillar 1): the key is absent from the IR when
+// the spec omits the block, so codegen/runtime check presence to decide
+// whether to wire Remember/Recall + the auto-capture/recall paths.
+function lowerMemory(spec: SpecWithMemory): { memory?: IrMemory } {
+  const m = spec.memory;
+  if (m === undefined) return {};
+  return {
+    memory: {
+      ...(m.enabled !== undefined ? { enabled: m.enabled } : {}),
+      ...(m.autoCapture !== undefined ? { autoCapture: m.autoCapture } : {}),
+      ...(m.autoCaptureThreshold !== undefined
+        ? { autoCaptureThreshold: m.autoCaptureThreshold }
+        : {}),
+      ...(m.autoRecall !== undefined ? { autoRecall: m.autoRecall } : {}),
+      ...(m.recallK !== undefined ? { recallK: m.recallK } : {}),
+    },
+  };
+}
+
 /**
  * Section 47 — normalise the cross-cutting blockchain subsystem blocks
  * (chains / wallets / contracts / transaction_policy). Each block is
@@ -769,6 +800,7 @@ export function lower(spec: Spec): IrNode {
         ...lowerBudget(spec),
         ...lowerSecurity(spec),
         ...lowerFeedback(spec),
+        ...lowerMemory(spec),
         // Phase 3 §3.3 — CLI banner config. Plus Phase 2 M2.2 TUI mode
         // gate. Only included when the spec author opted in (cli block
         // and its fields are optional).
@@ -828,6 +860,7 @@ export function lower(spec: Spec): IrNode {
         ...lowerFailureTaxonomy(spec),
         ...lowerBudget(spec),
         ...lowerFeedback(spec),
+        ...lowerMemory(spec),
         // Phase 3 §3.1 — heartbeat. Duration string ("2h", "30m") is
         // parsed once at lower time so codegen emits a literal numeric
         // setInterval arg in ms.
@@ -893,6 +926,7 @@ export function lower(spec: Spec): IrNode {
         compaction: lowerCompaction(spec),
         ...lowerFailureTaxonomy(spec),
         ...lowerBudget(spec),
+        ...lowerMemory(spec),
       } satisfies IrManagedV0;
     case "pipeline":
       return {
@@ -974,6 +1008,7 @@ export function lower(spec: Spec): IrNode {
         permissions: lowerPermissions(spec),
         compaction: lowerCompaction(spec),
         ...lowerFailureTaxonomy(spec),
+        ...lowerMemory(spec),
         ...lowerChainSubsystem(spec),
       } satisfies IrResearchV0;
     case "batch":

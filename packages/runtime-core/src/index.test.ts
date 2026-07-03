@@ -2845,3 +2845,94 @@ describe("max_tokens mid-tool_use truncation does not brick the session", () => 
     ).toBe(false);
   });
 });
+
+describe("memory auto-recall + auto-capture (#53)", () => {
+  test("autoRecall injects recalled memories into the system prompt", async () => {
+    let capturedSystem: Anthropic.TextBlockParam[] | undefined;
+    const { adapter } = makeStubAdapter("done");
+    const spyAdapter: import("@crewhaus/adapter-anthropic").ProviderAdapter = {
+      ...adapter,
+      stream: (req: { system?: Anthropic.TextBlockParam[] }) => {
+        capturedSystem = req.system;
+        return adapter.stream(req as never);
+      },
+    };
+    await runChatLoop({
+      model: "test-model",
+      instructions: "be helpful",
+      _adapter: spyAdapter,
+      singleTurn: true,
+      seedMessages: [{ role: "user", content: "hi" }],
+      memory: {
+        autoRecall: true,
+        recallK: 3,
+        recall: async () => ["The user prefers TypeScript.", "Deploys are on Fridays."],
+      },
+    });
+    const joined = (capturedSystem ?? []).map((b) => b.text).join("\n");
+    expect(joined).toContain("<recalled_memory>");
+    expect(joined).toContain("The user prefers TypeScript.");
+    expect(joined).toContain("Deploys are on Fridays.");
+  });
+
+  test("autoRecall injects nothing when recall returns empty", async () => {
+    let capturedSystem: Anthropic.TextBlockParam[] | undefined;
+    const { adapter } = makeStubAdapter("done");
+    const spyAdapter: import("@crewhaus/adapter-anthropic").ProviderAdapter = {
+      ...adapter,
+      stream: (req: { system?: Anthropic.TextBlockParam[] }) => {
+        capturedSystem = req.system;
+        return adapter.stream(req as never);
+      },
+    };
+    await runChatLoop({
+      model: "test-model",
+      instructions: "be helpful",
+      _adapter: spyAdapter,
+      singleTurn: true,
+      seedMessages: [{ role: "user", content: "hi" }],
+      memory: { autoRecall: true, recall: async () => [] },
+    });
+    const joined = (capturedSystem ?? []).map((b) => b.text).join("\n");
+    expect(joined).not.toContain("<recalled_memory>");
+  });
+
+  test("autoCapture invokes onCapture at teardown with the turn count + sessionId", async () => {
+    const { adapter } = makeStubAdapter("done");
+    let seen: { turns: number; sessionId: string } | undefined;
+    await runChatLoop({
+      model: "test-model",
+      instructions: "be helpful",
+      _adapter: adapter,
+      singleTurn: true,
+      seedMessages: [{ role: "user", content: "hi" }],
+      memory: {
+        autoCapture: true,
+        onCapture: async (turns, sessionId) => {
+          seen = { turns, sessionId };
+        },
+      },
+    });
+    expect(seen).toBeDefined();
+    expect(seen?.turns).toBeGreaterThanOrEqual(1);
+    expect(seen?.sessionId).toMatch(/^sess_[0-9a-f]{16}$/);
+  });
+
+  test("a throwing onCapture never fails the run", async () => {
+    const { adapter } = makeStubAdapter("done");
+    const run = runChatLoop({
+      model: "test-model",
+      instructions: "be helpful",
+      _adapter: adapter,
+      singleTurn: true,
+      seedMessages: [{ role: "user", content: "hi" }],
+      memory: {
+        autoCapture: true,
+        onCapture: async () => {
+          throw new Error("boom");
+        },
+      },
+    });
+    await expect(run).resolves.toBeDefined();
+  });
+});

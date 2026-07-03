@@ -53,6 +53,12 @@ import { GENERATED_README_MARKER, type IrBudget } from "@crewhaus/ir";
 import { createLogger } from "@crewhaus/logging";
 import { McpHost } from "@crewhaus/mcp-host";
 import {
+  captureFacts,
+  createMemoryStore,
+  deriveMemoryDecision,
+  summarizeDurableFacts,
+} from "@crewhaus/memory-store";
+import {
   BUILTIN_DEFAULT_RULES,
   type JustificationJudge,
   PermissionConfigError,
@@ -69,6 +75,7 @@ import { type Spec, parseSpec } from "@crewhaus/spec";
 import { spawnSubAgent } from "@crewhaus/sub-agent-spawner";
 import { type RegisteredTool, ToolCatalog } from "@crewhaus/tool-catalog";
 import { registerMcpServer } from "@crewhaus/tool-mcp";
+import { createMemoryTools } from "@crewhaus/tool-memory";
 import { createTaskTool } from "@crewhaus/tool-task";
 import { type CostAccrualEvent, type ProviderId, TraceEventBus } from "@crewhaus/trace-event-bus";
 // Item 15 — `optimize --from-advice` (eval-gated apply of the advisor's
@@ -2884,6 +2891,54 @@ async function runRunCli(
     );
   }
 
+  // Feature #53 — first-class `memory:` block. Its presence wires Remember/
+  // Recall into the tool list (no hand-editing) and — via the auto-* switches
+  // — the runtime's auto-recall (system-prompt injection) and auto-capture
+  // (summarize durable outcomes into the store at teardown). Mirrors the
+  // codegen registration in @crewhaus/target-cli.
+  let memoryRunOpt: Parameters<typeof runChatLoop>[0]["memory"];
+  if (ir.memory !== undefined && ir.memory.enabled !== false) {
+    const memoryStore = createMemoryStore({ specName: ir.name });
+    const memoryBundle = createMemoryTools({ specName: ir.name, store: memoryStore });
+    tools.push(memoryBundle.remember, memoryBundle.recall);
+    const decision = deriveMemoryDecision(ir.memory, Number.MAX_SAFE_INTEGER);
+    process.stdout.write(
+      `[memory] Remember/Recall wired (autoRecall=${decision.recall}, autoCapture=${ir.memory.autoCapture === true})\n`,
+    );
+    memoryRunOpt = {
+      ...(decision.recall
+        ? {
+            autoRecall: true,
+            recallK: decision.recallK,
+            recall: async (query, k) => {
+              const results = await memoryStore.recall(query, k);
+              return results.map((r) => r.entry.text);
+            },
+          }
+        : {}),
+      ...(ir.memory.autoCapture === true
+        ? {
+            autoCapture: true,
+            onCapture: async (completedTurns, sessionId) => {
+              const { capture } = deriveMemoryDecision(ir.memory, completedTurns);
+              if (!capture) return;
+              const events = parseJsonlObjects(
+                readFileSync(sessionJsonlPath(sessionId), "utf-8"),
+              ) as Array<{ kind?: string; payload?: unknown }>;
+              const turns = deriveTurns(events);
+              const facts = summarizeDurableFacts(turns);
+              const written = await captureFacts(memoryStore, facts, ["auto-capture", sessionId]);
+              if (written.length > 0) {
+                process.stdout.write(
+                  `[memory] auto-captured ${written.length} durable fact(s) into ${memoryStore.path()}\n`,
+                );
+              }
+            },
+          }
+        : {}),
+    };
+  }
+
   // Section 13 — when the IR carries inline sub-agent definitions, build the
   // registry, register the Task tool, and inject `spawnSubAgent` so the
   // runtime can populate the bridge for framework-aware tools.
@@ -2951,6 +3006,7 @@ async function runRunCli(
       ...(justificationJudge !== undefined ? { justificationJudge } : {}),
       ...(justificationAuditSink !== undefined ? { justificationAuditSink } : {}),
       ...(egressMatcher !== undefined ? { egressMatcher } : {}),
+      ...(memoryRunOpt !== undefined ? { memory: memoryRunOpt } : {}),
     });
   } finally {
     if (mcpHost) await mcpHost.disconnectAll();

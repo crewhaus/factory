@@ -196,6 +196,200 @@ export function createMemoryStore(opts: MemoryStoreOptions): MemoryStore {
   };
 }
 
+// -------- Feature #53: first-class memory config + auto-capture/recall --------
+
+/**
+ * Memory configuration lowered from the spec `memory:` block. All fields
+ * optional so the block's mere presence wires the Remember/Recall tools; the
+ * auto-* switches are opt-in on top of that.
+ */
+export type MemoryConfig = {
+  /** Register Remember/Recall + honour the auto-* switches. Presence of the
+   *  block implies enabled; an explicit `false` keeps everything off. */
+  readonly enabled?: boolean;
+  /** At teardown, summarize the session's durable outcomes into the store. */
+  readonly autoCapture?: boolean;
+  /** Minimum completed user-text turns before an auto-capture fires (default 1). */
+  readonly autoCaptureThreshold?: number;
+  /** At session start, recall the top-K memories and inject them into the prompt. */
+  readonly autoRecall?: boolean;
+  /** How many memories autoRecall injects. Default 5. */
+  readonly recallK?: number;
+};
+
+export const DEFAULT_AUTO_CAPTURE_THRESHOLD = 1;
+export const DEFAULT_AUTO_RECALL_K = 5;
+
+/** A minimal transcript turn — the durable-fact extractor's input. Matches the
+ *  shape `deriveTurns` in the CLI produces (input/output text per turn). */
+export type CapturableTurn = {
+  readonly input: string;
+  readonly output: string;
+};
+
+/**
+ * Decide, from a memory config and a completed-turn count, whether an
+ * auto-capture should run and how many memories auto-recall should inject.
+ * Pure so the wiring in runtime-core is unit-testable without a filesystem.
+ * A config that is absent, or explicitly `enabled: false`, disables both.
+ */
+export function deriveMemoryDecision(
+  config: MemoryConfig | undefined,
+  completedTurns: number,
+): { capture: boolean; recall: boolean; recallK: number; captureThreshold: number } {
+  const enabled = config !== undefined && config.enabled !== false;
+  const captureThreshold = Math.max(
+    1,
+    config?.autoCaptureThreshold ?? DEFAULT_AUTO_CAPTURE_THRESHOLD,
+  );
+  const recallK = Math.max(1, config?.recallK ?? DEFAULT_AUTO_RECALL_K);
+  return {
+    capture: enabled && config?.autoCapture === true && completedTurns >= captureThreshold,
+    recall: enabled && config?.autoRecall === true,
+    recallK,
+    captureThreshold,
+  };
+}
+
+/** A parsed session event-log line (`{ kind, payload }`). */
+export type SessionEvent = { readonly kind?: string; readonly payload?: unknown };
+
+/**
+ * Reconstruct `CapturableTurn`s from a raw session event log. A dependency-
+ * free mirror of the CLI's `deriveTurns` restricted to what the fact
+ * extractor needs (each user-text turn's final assistant answer). Kept here
+ * so the auto-capture codegen and CLI both consume one extractor without
+ * importing the CLI's feedback module. Synthetic (runtime-injected) user
+ * messages and tool-result echoes are not turns.
+ */
+export function turnsFromEvents(events: readonly SessionEvent[]): CapturableTurn[] {
+  const turns: CapturableTurn[] = [];
+  let current: { input: string; texts: string[] } | undefined;
+  const flush = (): void => {
+    if (current === undefined) return;
+    turns.push({
+      input: current.input,
+      output: current.texts.length > 0 ? (current.texts[current.texts.length - 1] as string) : "",
+    });
+  };
+  for (const ev of events) {
+    if (ev.kind === "user_message") {
+      const text = userEventText(ev.payload);
+      if (text !== undefined) {
+        flush();
+        current = { input: text, texts: [] };
+      }
+    } else if (ev.kind === "assistant_message" && current !== undefined) {
+      const t = assistantEventText(ev.payload);
+      if (t !== "") current.texts.push(t);
+    }
+  }
+  flush();
+  return turns;
+}
+
+type EventBlock = { type?: string; text?: string };
+
+function eventContent(payload: unknown): { blocks: EventBlock[]; text?: string } {
+  const content = (payload as { content?: unknown } | undefined)?.content;
+  if (typeof content === "string") return { blocks: [], text: content };
+  if (Array.isArray(content)) return { blocks: content as EventBlock[] };
+  return { blocks: [] };
+}
+
+function userEventText(payload: unknown): string | undefined {
+  if (
+    payload !== null &&
+    typeof payload === "object" &&
+    (payload as { synthetic?: unknown }).synthetic === true
+  ) {
+    return undefined;
+  }
+  const { blocks, text } = eventContent(payload);
+  if (text !== undefined) return text;
+  if (blocks.some((b) => b.type === "tool_result")) return undefined;
+  const texts = blocks
+    .filter((b) => b.type === "text" && typeof b.text === "string")
+    .map((b) => b.text as string);
+  return texts.length > 0 ? texts.join("\n") : undefined;
+}
+
+function assistantEventText(payload: unknown): string {
+  const { blocks, text } = eventContent(payload);
+  if (text !== undefined) return text;
+  return blocks
+    .filter((b) => b.type === "text" && typeof b.text === "string")
+    .map((b) => b.text as string)
+    .join("\n");
+}
+
+/**
+ * Extract durable, self-contained facts worth remembering from a session's
+ * turns. Deterministic (no model call) so it runs offline and in tests: it
+ * keeps each turn's final answer as one candidate fact, trimmed to a single
+ * sentence-ish line, dropping empty/echo/error turns and near-duplicates.
+ * Callers who have a model available can override with a summary; this is the
+ * always-available fallback the auto-capture path uses when no summarizer is
+ * injected.
+ */
+export function summarizeDurableFacts(
+  turns: readonly CapturableTurn[],
+  opts: { maxFacts?: number; maxLen?: number } = {},
+): string[] {
+  const maxFacts = opts.maxFacts ?? 8;
+  const maxLen = opts.maxLen ?? 240;
+  const seen = new Set<string>();
+  const facts: string[] = [];
+  for (const t of turns) {
+    const answer = (t.output ?? "").trim();
+    if (answer === "") continue;
+    // First non-empty line, collapsed whitespace — a durable one-liner.
+    const firstLine = answer
+      .split("\n")
+      .map((l) => l.trim())
+      .find((l) => l.length > 0);
+    if (firstLine === undefined) continue;
+    let fact = firstLine.replace(/\s+/g, " ");
+    if (fact.length > maxLen) fact = `${fact.slice(0, maxLen - 1).trimEnd()}…`;
+    const key = fact.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    facts.push(fact);
+    if (facts.length >= maxFacts) break;
+  }
+  return facts;
+}
+
+/**
+ * Idempotently persist facts into a store, skipping any whose text (case- and
+ * whitespace-insensitively) already matches an existing entry. Returns the
+ * entries actually written. Re-running the same auto-capture never duplicates.
+ */
+export async function captureFacts(
+  store: MemoryStore,
+  facts: readonly string[],
+  tags: readonly string[] = ["auto-capture"],
+): Promise<MemoryEntry[]> {
+  const written: MemoryEntry[] = [];
+  if (facts.length === 0) return written;
+  // Pull existing entries once (via a broad recall over the fact tokens) so a
+  // re-run is a no-op. recall() needs a query; we normalize existing text by
+  // recalling each fact and checking for an exact normalized match.
+  const norm = (s: string): string => s.toLowerCase().replace(/\s+/g, " ").trim();
+  const existing = new Set<string>();
+  for (const fact of facts) {
+    for (const r of await store.recall(fact, 20)) existing.add(norm(r.entry.text));
+  }
+  const writtenNorms = new Set<string>();
+  for (const fact of facts) {
+    const n = norm(fact);
+    if (existing.has(n) || writtenNorms.has(n)) continue;
+    writtenNorms.add(n);
+    written.push(await store.remember(fact, tags));
+  }
+  return written;
+}
+
 function isMemoryEntry(value: unknown): value is MemoryEntry {
   if (typeof value !== "object" || value === null) return false;
   const v = value as Record<string, unknown>;
