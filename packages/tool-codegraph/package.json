@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-codegraph",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "type": "module",
   "description": "AST-aware code intelligence tool — wraps the codegraph npm SDK so agents can ask for callers/callees/impact-radius instead of greping",
   "main": "src/index.ts",

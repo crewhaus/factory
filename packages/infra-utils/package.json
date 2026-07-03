@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/infra-utils",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "type": "module",
   "description": "Common low-level helpers shared across factory (string, args, exhaustiveness)",
   "main": "src/index.ts",

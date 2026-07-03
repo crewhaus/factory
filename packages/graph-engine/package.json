@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/graph-engine",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "type": "module",
   "description": "Stateful graph runtime: nodes, edges, parallel branches, HITL pauses, checkpoint-store integration",
   "main": "src/index.ts",

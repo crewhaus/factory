@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-permission-matcher",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "type": "module",
   "description": "Pattern matchers for permission rules (Bash(git *), Read, Write(**/src/**))",
   "main": "src/index.ts",

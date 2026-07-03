@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/mcp-host",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "type": "module",
   "description": "MCP client manager: stdio + SSE transports, exp-backoff reconnect, server registry, built on @modelcontextprotocol/sdk",
   "main": "src/index.ts",

@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/target-managed",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "type": "module",
   "description": "Codegen for the MGD target — daemon.ts wiring gateway-server, policy-engine, tenancy, audit-log",
   "main": "src/index.ts",

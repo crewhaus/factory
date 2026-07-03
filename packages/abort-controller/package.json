@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/abort-controller",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "type": "module",
   "description": "Parent/child abort tree with WeakRef cascade for cooperative cancellation",
   "main": "src/index.ts",
