@@ -31,6 +31,7 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
+  browserRuntimeSmokeIsRequired,
   resolveSmokeModel,
   runBrowserRuntimeSmoke,
   runCliRuntimeSmoke,
@@ -78,6 +79,7 @@ let spawnSpy: ReturnType<typeof spyOn> | undefined;
 let serveSpy: ReturnType<typeof spyOn> | undefined;
 let capturedSpawnEnv: Record<string, string> | undefined;
 let capturedSpawnArgv: string[] | undefined;
+let capturedSpawnCwd: string | undefined;
 let capturedFetch: ((req: Request) => Response) | undefined;
 
 beforeEach(() => {
@@ -88,6 +90,7 @@ beforeEach(() => {
   }
   capturedSpawnEnv = undefined;
   capturedSpawnArgv = undefined;
+  capturedSpawnCwd = undefined;
   capturedFetch = undefined;
 });
 
@@ -178,8 +181,9 @@ function installSpawn(cfg: SpawnCfg): void {
     opts: unknown,
   ): ReturnType<typeof Bun.spawn> => {
     capturedSpawnArgv = cmd as string[];
-    const o = opts as { env?: Record<string, string> };
+    const o = opts as { env?: Record<string, string>; cwd?: string };
     capturedSpawnEnv = o.env;
+    capturedSpawnCwd = o.cwd;
     const sessionDir = o.env?.["CREWHAUS_SESSION_DIR"];
 
     // The harness writes the prompt to stdin *synchronously* right after
@@ -262,21 +266,27 @@ describe("runCliRuntimeSmoke", () => {
     enableAnthropic();
     process.env["ANTHROPIC_AUTH_TOKEN"] = "oauth-xyz"; // exercise the oauth-forward branch
 
-    // The harness writes the prompt (which contains the secret-file path)
-    // to our fake stdin. We recover the random phrase by reading that file.
+    // The harness writes the prompt (which names the workspace-relative
+    // secret file) to our fake stdin. We recover the random phrase by
+    // resolving that name against the spawn cwd (the harness's workDir) and
+    // reading it back.
     let phrase = "";
     installSpawn({
       onStdin: (chunk) => {
         const m = chunk.match(/read (\S+\.txt)/);
         if (m !== null) {
-          const content = readFileSync(m[1] as string, "utf-8");
+          const rel = m[1] as string;
+          const abs = capturedSpawnCwd !== undefined ? join(capturedSpawnCwd, rel) : rel;
+          const content = readFileSync(abs, "utf-8");
           const pm = content.match(/magic phrase is: (\S+)/);
           if (pm !== null) phrase = pm[1] as string;
         }
       },
+      // Runtime emits the RegisteredTool's PascalCase `.name` (`Read`), which
+      // the case-insensitive assertion must accept.
       jsonl: () =>
         [
-          JSON.stringify({ kind: "tool_use", payload: { name: "read" } }),
+          JSON.stringify({ kind: "tool_use", payload: { name: "Read" } }),
           JSON.stringify({
             kind: "assistant_message",
             payload: { content: `The phrase: ${phrase}` },
@@ -301,7 +311,7 @@ describe("runCliRuntimeSmoke", () => {
     const joined = result.failures.join("\n");
     expect(joined).toContain("exited non-zero (2)");
     expect(joined).toContain("no event-log .jsonl");
-    expect(joined).toContain('name="read"');
+    expect(joined).toContain('name="Read"');
     expect(joined).toContain("magic phrase");
   });
 
@@ -346,7 +356,7 @@ describe("runCliRuntimeSmoke", () => {
       exitCode: 0,
       jsonl: () =>
         [
-          JSON.stringify({ kind: "tool_use", payload: { name: "read" } }),
+          JSON.stringify({ kind: "tool_use", payload: { name: "Read" } }),
           // absent content → skipped (no push)
           JSON.stringify({ kind: "assistant_message", payload: {} }),
           // array of only non-text blocks → parts empty → skipped
@@ -523,6 +533,26 @@ describe("resolveSmokeModel", () => {
   test("defaults to reading process.env when no arg is passed", () => {
     // TOUCHED_ENV clears CREWHAUS_SMOKE_MODEL in beforeEach → undefined.
     expect(resolveSmokeModel()).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// browserRuntimeSmokeIsRequired — browser runtime smoke is advisory by
+// default; only CREWHAUS_RUNTIME_SMOKE_BROWSER=1 promotes it to a hard gate.
+// ---------------------------------------------------------------------------
+
+describe("browserRuntimeSmokeIsRequired", () => {
+  test("true only when CREWHAUS_RUNTIME_SMOKE_BROWSER=1", () => {
+    expect(browserRuntimeSmokeIsRequired({ CREWHAUS_RUNTIME_SMOKE_BROWSER: "1" })).toBe(true);
+  });
+
+  test("false when unset (advisory by default)", () => {
+    expect(browserRuntimeSmokeIsRequired({})).toBe(false);
+  });
+
+  test('false for any value other than exactly "1"', () => {
+    expect(browserRuntimeSmokeIsRequired({ CREWHAUS_RUNTIME_SMOKE_BROWSER: "true" })).toBe(false);
+    expect(browserRuntimeSmokeIsRequired({ CREWHAUS_RUNTIME_SMOKE_BROWSER: "0" })).toBe(false);
   });
 });
 
