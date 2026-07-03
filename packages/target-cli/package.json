@@ -17,8 +17,10 @@
     "@crewhaus/egress-matcher-semantic": "workspace:*",
     "@crewhaus/embedder": "workspace:*",
     "@crewhaus/hooks-engine": "workspace:*",
+    "@crewhaus/memory-store": "workspace:*",
     "@crewhaus/skills-registry": "workspace:*",
-    "@crewhaus/slash-commands": "workspace:*"
+    "@crewhaus/slash-commands": "workspace:*",
+    "@crewhaus/tool-memory": "workspace:*"
   },
   "peerDependenciesMeta": {
     "@crewhaus/egress-matcher-semantic": {

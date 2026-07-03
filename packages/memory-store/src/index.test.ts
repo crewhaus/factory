@@ -7,7 +7,15 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { appendFileSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { MemoryStoreError, createMemoryStore } from "./index";
+import {
+  DEFAULT_AUTO_CAPTURE_THRESHOLD,
+  DEFAULT_AUTO_RECALL_K,
+  MemoryStoreError,
+  captureFacts,
+  createMemoryStore,
+  deriveMemoryDecision,
+  summarizeDurableFacts,
+} from "./index";
 
 let tmp: string;
 
@@ -128,5 +136,90 @@ describe("remember + recall", () => {
   test("remember rejects empty text", async () => {
     const store = createMemoryStore({ specName: "s", rootDir: tmp });
     await expect(store.remember("")).rejects.toThrow(MemoryStoreError);
+  });
+});
+
+describe("deriveMemoryDecision (#53)", () => {
+  test("absent config disables capture + recall", () => {
+    const d = deriveMemoryDecision(undefined, 100);
+    expect(d.capture).toBe(false);
+    expect(d.recall).toBe(false);
+    expect(d.recallK).toBe(DEFAULT_AUTO_RECALL_K);
+    expect(d.captureThreshold).toBe(DEFAULT_AUTO_CAPTURE_THRESHOLD);
+  });
+
+  test("enabled:false disables both even with auto flags set", () => {
+    const d = deriveMemoryDecision({ enabled: false, autoCapture: true, autoRecall: true }, 100);
+    expect(d.capture).toBe(false);
+    expect(d.recall).toBe(false);
+  });
+
+  test("autoCapture gated by threshold on completed turns", () => {
+    const cfg = { autoCapture: true, autoCaptureThreshold: 3 };
+    expect(deriveMemoryDecision(cfg, 2).capture).toBe(false);
+    expect(deriveMemoryDecision(cfg, 3).capture).toBe(true);
+  });
+
+  test("autoRecall + recallK honoured", () => {
+    const d = deriveMemoryDecision({ autoRecall: true, recallK: 9 }, 0);
+    expect(d.recall).toBe(true);
+    expect(d.recallK).toBe(9);
+  });
+
+  test("threshold and recallK are floored at 1", () => {
+    const d = deriveMemoryDecision({ autoCapture: true, autoCaptureThreshold: 0, recallK: 0 }, 1);
+    expect(d.captureThreshold).toBe(1);
+    expect(d.recallK).toBe(1);
+    expect(d.capture).toBe(true);
+  });
+});
+
+describe("summarizeDurableFacts (#53)", () => {
+  test("keeps one durable line per turn, dropping empties + dupes", () => {
+    const facts = summarizeDurableFacts([
+      { input: "q1", output: "The build uses Bun.\nmore detail" },
+      { input: "q2", output: "   " },
+      { input: "q3", output: "The build uses Bun." },
+      { input: "q4", output: "Deploys go to Cloudflare Workers." },
+    ]);
+    expect(facts).toEqual(["The build uses Bun.", "Deploys go to Cloudflare Workers."]);
+  });
+
+  test("truncates very long answers with an ellipsis", () => {
+    const long = "x".repeat(400);
+    const [fact] = summarizeDurableFacts([{ input: "q", output: long }], { maxLen: 50 });
+    expect(fact?.length).toBe(50);
+    expect(fact?.endsWith("…")).toBe(true);
+  });
+
+  test("caps at maxFacts", () => {
+    const turns = Array.from({ length: 20 }, (_, i) => ({ input: "q", output: `fact ${i}` }));
+    expect(summarizeDurableFacts(turns, { maxFacts: 3 })).toHaveLength(3);
+  });
+});
+
+describe("captureFacts (#53) idempotency", () => {
+  test("writes facts once; re-running is a no-op", async () => {
+    const store = createMemoryStore({ specName: "cap", rootDir: tmp });
+    const facts = ["The user prefers dark mode.", "Releases ship on Fridays."];
+    const first = await captureFacts(store, facts);
+    expect(first).toHaveLength(2);
+    expect(await store.size()).toBe(2);
+    const second = await captureFacts(store, facts);
+    expect(second).toHaveLength(0);
+    expect(await store.size()).toBe(2);
+  });
+
+  test("skips a fact that differs only by case/whitespace from an existing one", async () => {
+    const store = createMemoryStore({ specName: "cap2", rootDir: tmp });
+    await captureFacts(store, ["Deploys go to Cloudflare."]);
+    const again = await captureFacts(store, ["deploys   go to cloudflare."]);
+    expect(again).toHaveLength(0);
+    expect(await store.size()).toBe(1);
+  });
+
+  test("empty facts list writes nothing", async () => {
+    const store = createMemoryStore({ specName: "cap3", rootDir: tmp });
+    expect(await captureFacts(store, [])).toHaveLength(0);
   });
 });

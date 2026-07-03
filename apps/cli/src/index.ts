@@ -35,7 +35,10 @@ import {
 import { CrewhausError } from "@crewhaus/errors";
 import { type Sample, loadDataset } from "@crewhaus/eval-dataset";
 import { type CompiledGrader, parseGradersConfig } from "@crewhaus/eval-grader";
-import { optimizeSpec } from "@crewhaus/eval-optimizer-orchestrator";
+import {
+  extractCurrentPrompt as extractInstructions,
+  optimizeSpec,
+} from "@crewhaus/eval-optimizer-orchestrator";
 import {
   type RunIndexEntry,
   buildMatrix,
@@ -62,6 +65,12 @@ import { GENERATED_README_MARKER, type IrBudget } from "@crewhaus/ir";
 import { createLogger } from "@crewhaus/logging";
 import { McpHost } from "@crewhaus/mcp-host";
 import {
+  captureFacts,
+  createMemoryStore,
+  deriveMemoryDecision,
+  summarizeDurableFacts,
+} from "@crewhaus/memory-store";
+import {
   BUILTIN_DEFAULT_RULES,
   type JustificationJudge,
   PermissionConfigError,
@@ -71,13 +80,14 @@ import {
   tagRules,
 } from "@crewhaus/permission-engine";
 import { runChatLoop } from "@crewhaus/runtime-core";
-import { createSessionStore } from "@crewhaus/session-store";
+import { createSessionStore, evictExpiredSessions } from "@crewhaus/session-store";
 import { createSkillTool, discoverSkills } from "@crewhaus/skills-registry";
 import { loadCommands } from "@crewhaus/slash-commands";
 import { type Spec, parseSpec } from "@crewhaus/spec";
 import { spawnSubAgent } from "@crewhaus/sub-agent-spawner";
 import { type RegisteredTool, ToolCatalog } from "@crewhaus/tool-catalog";
 import { registerMcpServer } from "@crewhaus/tool-mcp";
+import { createMemoryTools } from "@crewhaus/tool-memory";
 import { createTaskTool } from "@crewhaus/tool-task";
 import { type CostAccrualEvent, type ProviderId, TraceEventBus } from "@crewhaus/trace-event-bus";
 // Item 15 — `optimize --from-advice` (eval-gated apply of the advisor's
@@ -281,6 +291,8 @@ import {
   parseModelsFlag,
   runMatrixCells,
 } from "./eval-matrix";
+// Item #55 — distill recurring user questions into an auto-discovered FAQ skill.
+import { buildFaqSkill, distillFaq } from "./faq";
 // Response-feedback core — pure, side-effect-free so it is unit-testable
 // (this entry file runs an argv switch on import). Powers `rate`/`feedback`
 // (capture) and `distill` (ratings → eval dataset + graders).
@@ -299,6 +311,16 @@ import {
   normalizeRating,
   samplesToJsonl,
 } from "./feedback";
+// Item #54 — few-shot pool harvesting (side-effect-free; FS + redactor wiring
+// lives here in index.ts). Powers `fewshot harvest` and `optimize --few-shot`.
+import {
+  type FewShotExample,
+  formatFewShotForPrompt,
+  harvestFewShot,
+  isFewShotExample,
+  mergePools,
+  poolToJsonl,
+} from "./fewshot";
 // Item 45 — `crewhaus flywheel init|run`: the packaged nightly
 // self-improvement loop (knob/default resolution, the accept-then-write
 // loop with injected steps, the report, and the workflow scaffold), in a
@@ -379,6 +401,15 @@ import {
   openJustificationAuditSink,
   resolveJudgeChoice,
 } from "./justification-gate";
+// Item #56 — auto-maintained LESSONS.md + per-user preference files.
+import {
+  mergeLessons,
+  mineLessons,
+  minePreferences,
+  parseLessonsMd,
+  renderLessonsMd,
+  renderPreferencesMd,
+} from "./lessons";
 // Item 41 — `crewhaus lint` (parse + ir-passes collect-all + scope audit) and
 // `compile --watch` (debounced re-validate loop) live in side-effect-free
 // modules so this entry file stays testable.
@@ -513,6 +544,8 @@ import {
   renderSecurityDigestHtml,
   renderSecurityDigestText,
 } from "./security-digest";
+// Item #57 — summarize sessions into a durable index before TTL eviction.
+import { SESSIONS_INDEX_DIRNAME, summarizeSessionIntoIndex } from "./sessions-index";
 // Item 69 — `crewhaus state backup|restore` core (tarball snapshot of the
 // cwd `.crewhaus` state dir + full/merge restore), in a module with no
 // import-time side effects so it is unit-testable (this entry file runs an
@@ -658,6 +691,10 @@ const RUN_SCHEMA: ParseArgsSchema = {
     // `stop`). On reaching the cap the run stops (or degrades) before the
     // next turn.
     { name: "budget-usd", takesValue: true },
+    // Item #56 — identify the current user so their
+    // `.crewhaus/preferences/<user>.md` is injected at run start (alongside
+    // the auto-loaded LESSONS.md). Flag > CREWHAUS_USER env.
+    { name: "user", takesValue: true },
     { name: "help", short: "h" },
   ],
 };
@@ -857,6 +894,12 @@ const OPTIMIZE_SCHEMA: ParseArgsSchema = {
     // Synthesizes the dataset (and, when --graders is omitted, the graders too).
     { name: "ratings", takesValue: true },
     { name: "min-score", takesValue: true },
+    // Item #54 — inject the top-K harvested few-shot examples as in-context
+    // demonstrations at the front of the seed instructions the optimizer
+    // mutates. Value: a pool file path, or "auto" for the cwd default
+    // `.crewhaus/fewshot/<spec>.jsonl`. Composes with --ratings.
+    { name: "few-shot", takesValue: true },
+    { name: "few-shot-k", takesValue: true },
     { name: "mutator", takesValue: true },
     { name: "iterations", takesValue: true },
     { name: "seed", takesValue: true },
@@ -1034,6 +1077,64 @@ const DISTILL_SCHEMA: ParseArgsSchema = {
     // train/dev/test split), consumable as `--dataset registry:<name>`.
     // -o becomes optional when given; plain file output stays the default.
     { name: "register", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
+// Item #54 — `crewhaus fewshot harvest|show`: mine up-rated turns into a
+// golden few-shot pool consumable by `optimize --few-shot`.
+const FEWSHOT_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "session", takesValue: true },
+    { name: "all-sessions", takesValue: false },
+    { name: "min-score", takesValue: true },
+    // Override the pool file (default `.crewhaus/fewshot/<spec>.jsonl`).
+    { name: "out", short: "o", takesValue: true },
+    // show/inject: how many top examples to print/format (default 5).
+    { name: "k", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
+// Item #55 — `crewhaus faq distill`: cluster recurring user questions into an
+// auto-discovered FAQ SKILL.md under `.crewhaus/skills/faq/`.
+const FAQ_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // How many recent sessions to scan (default all; `N` or `all`).
+    { name: "sessions", takesValue: true },
+    { name: "min-score", takesValue: true },
+    // Minimum recurrences for a question cluster to become an FAQ (default 2).
+    { name: "min-occurrences", takesValue: true },
+    // Override the emitted skill directory (default `.crewhaus/skills/faq`).
+    { name: "out", short: "o", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
+// Item #56 — `crewhaus lessons update`: mine corrections + failure→fix
+// patterns into a deduped LESSONS.md and maintain per-user preference files.
+const LESSONS_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "sessions", takesValue: true },
+    { name: "low-score", takesValue: true },
+    // Override the LESSONS.md path (default `<cwd>/LESSONS.md`).
+    { name: "out", short: "o", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
+// Item #57 — `crewhaus sessions summarize`: fold sessions into a durable index
+// (on demand, or before TTL eviction with --evicted).
+const SESSIONS_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // Only summarize sessions last modified strictly BEFORE this date (ISO or
+    // epoch-ms). Omitted → every session in the store.
+    { name: "before", takesValue: true },
+    // Run a TTL eviction pass and summarize each session into the index BEFORE
+    // it is unlinked (the summarize-before-evict hook).
+    { name: "evicted", takesValue: false },
+    // TTL for the --evicted eviction pass (days). Default: session-store's 30.
+    { name: "ttl-days", takesValue: true },
     { name: "help", short: "h" },
   ],
 };
@@ -1364,6 +1465,15 @@ function usageText(): string {
     "  distill --session <id> -o <ds.jsonl> turn ratings into an eval dataset + graders",
     "       [--all-sessions] [--graders-out <g.yaml>] [--min-score F]",
     "       [--register <name>]            also promote a new dataset version into the registry",
+    "  fewshot harvest [--all-sessions]     harvest up-rated turns into a golden few-shot pool (#54)",
+    "       [--min-score F] [-o <pool>]     (PII/secret-redacted); optimize with --few-shot",
+    "  fewshot show [--k N]                 print the pool as the injectable prompt block",
+    "  faq distill [--sessions N|all]       cluster recurring questions into an auto-discovered FAQ skill (#55)",
+    "       [--min-score F] [--min-occurrences N] [-o <skill-dir>]",
+    "  lessons update [--sessions N|all]    mine corrections + failures into an auto-loaded LESSONS.md (#56)",
+    "       [--low-score F] [-o <LESSONS.md>]  + per-user prefs under .crewhaus/preferences/",
+    "  sessions summarize [--before <date>] summarize sessions into a durable index before TTL eviction (#57)",
+    "       [--evicted] [--ttl-days N]        --evicted indexes each session just before it is deleted",
     "  datasets list                        all registered datasets + versions (Section 29)",
     "  datasets get <name>[@version]        print a dataset's samples as JSONL",
     "       [--split train|dev|test]",
@@ -3071,6 +3181,67 @@ async function runRunCli(
     );
   }
 
+  // Feature #53 — first-class `memory:` block. Its presence wires Remember/
+  // Recall into the tool list (no hand-editing) and — via the auto-* switches
+  // — the runtime's auto-recall (system-prompt injection) and auto-capture
+  // (summarize durable outcomes into the store at teardown). Mirrors the
+  // codegen registration in @crewhaus/target-cli.
+  let memoryRunOpt: Parameters<typeof runChatLoop>[0]["memory"];
+  if (ir.memory !== undefined && ir.memory.enabled !== false) {
+    const memoryStore = createMemoryStore({ specName: ir.name });
+    const memoryBundle = createMemoryTools({ specName: ir.name, store: memoryStore });
+    tools.push(memoryBundle.remember, memoryBundle.recall);
+    const decision = deriveMemoryDecision(ir.memory, Number.MAX_SAFE_INTEGER);
+    process.stdout.write(
+      `[memory] Remember/Recall wired (autoRecall=${decision.recall}, autoCapture=${ir.memory.autoCapture === true})\n`,
+    );
+    memoryRunOpt = {
+      ...(decision.recall
+        ? {
+            autoRecall: true,
+            recallK: decision.recallK,
+            recall: async (query, k) => {
+              const results = await memoryStore.recall(query, k);
+              return results.map((r) => r.entry.text);
+            },
+          }
+        : {}),
+      ...(ir.memory.autoCapture === true
+        ? {
+            autoCapture: true,
+            onCapture: async (completedTurns, sessionId) => {
+              const { capture } = deriveMemoryDecision(ir.memory, completedTurns);
+              if (!capture) return;
+              const events = parseJsonlObjects(
+                readFileSync(sessionJsonlPath(sessionId), "utf-8"),
+              ) as Array<{ kind?: string; payload?: unknown }>;
+              const turns = deriveTurns(events);
+              const facts = summarizeDurableFacts(turns);
+              const written = await captureFacts(memoryStore, facts, ["auto-capture", sessionId]);
+              if (written.length > 0) {
+                process.stdout.write(
+                  `[memory] auto-captured ${written.length} durable fact(s) into ${memoryStore.path()}\n`,
+                );
+              }
+            },
+          }
+        : {}),
+    };
+  }
+
+  // Item #56 — resolve the current user's preference file (flag > env) so the
+  // runtime injects `.crewhaus/preferences/<user>.md` at run start. Absent when
+  // no user is identified or the file doesn't exist yet.
+  const preferenceFiles: string[] = [];
+  const userId = strFlag(args, "user") ?? process.env["CREWHAUS_USER"];
+  if (typeof userId === "string" && userId.trim() !== "") {
+    const prefsFile = join(process.cwd(), PREFERENCES_SUBDIR, preferenceFileName(userId));
+    if (existsSync(prefsFile)) {
+      preferenceFiles.push(prefsFile);
+      process.stdout.write(`[memory] injecting preferences for user "${userId}"\n`);
+    }
+  }
+
   // Section 13 — when the IR carries inline sub-agent definitions, build the
   // registry, register the Task tool, and inject `spawnSubAgent` so the
   // runtime can populate the bridge for framework-aware tools.
@@ -3173,6 +3344,11 @@ async function runRunCli(
       ...(justificationJudge !== undefined ? { justificationJudge } : {}),
       ...(justificationAuditSink !== undefined ? { justificationAuditSink } : {}),
       ...(egressMatcher !== undefined ? { egressMatcher } : {}),
+      ...(memoryRunOpt !== undefined ? { memory: memoryRunOpt } : {}),
+      // Item #56 — inject the current user's preference file at run start (via
+      // the project-memory auto-load path). LESSONS.md is auto-loaded already
+      // as a canonical memory file, so no extra wiring is needed for it.
+      ...(preferenceFiles.length > 0 ? { preferenceFiles } : {}),
     });
   } finally {
     if (mcpHost) await mcpHost.disconnectAll();
@@ -4298,6 +4474,55 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
       ? resolve(outDirArg)
       : resolve(join(".crewhaus", "optimize", runId));
 
+  // Item #54 — few-shot injection. When `--few-shot <pool|auto>` is set, prepend
+  // the top-K harvested examples to the spec's `agent.instructions` in an
+  // in-memory augmented temp spec that the optimizer + fitness run against, so
+  // the mutation search improves the prompt WITH the in-context demonstrations
+  // present. The source spec is never mutated on this path (patch-only), so the
+  // examples don't accidentally get baked into the tracked spec; re-run without
+  // --few-shot (or edit instructions) to persist them.
+  const fewShotFlag = strFlag(args, "few-shot");
+  let optimizeSpecPath = absSpec;
+  let fewShotDisablesWriteBack = false;
+  if (typeof fewShotFlag === "string") {
+    const poolFile =
+      fewShotFlag === "auto"
+        ? join(
+            dirname(absSpec),
+            FEWSHOT_SUBDIR,
+            `${parseSpec(readFileSync(absSpec, "utf-8")).name}.jsonl`,
+          )
+        : resolve(fewShotFlag);
+    const pool = readFewShotPool(poolFile);
+    if (pool.length === 0) {
+      die(`no few-shot pool at ${poolFile} — run \`crewhaus fewshot harvest\` first`);
+    }
+    const fewShotK = intFlag(args, "few-shot-k") ?? 5;
+    const block = formatFewShotForPrompt(pool, fewShotK);
+    const yamlText = readFileSync(absSpec, "utf-8");
+    const baseSpec = parseSpec(yamlText);
+    const augmentedInstructions = `${block}\n\n${extractInstructions(baseSpec)}`;
+    const { applySpecPatch } = await import("@crewhaus/spec-patch");
+    const { yaml: augmentedYaml } = applySpecPatch(yamlText, {
+      target: baseSpec.target as never,
+      path: ["agent", "instructions"],
+      op: "replace",
+      value: augmentedInstructions,
+    });
+    mkdirSync(outDir, { recursive: true });
+    optimizeSpecPath = join(outDir, "fewshot-augmented.yaml");
+    writeFileSync(optimizeSpecPath, augmentedYaml, { mode: 0o600 });
+    fewShotDisablesWriteBack = true;
+    process.stdout.write(
+      `[optimize] injected ${Math.min(fewShotK, pool.length)} few-shot example(s) from ${poolFile}\n`,
+    );
+    if (writeBack) {
+      process.stderr.write(
+        "[optimize] --write-back is ignored with --few-shot (the augmented spec is patch-only to keep the tracked spec clean)\n",
+      );
+    }
+  }
+
   let gradersYaml: string;
   if (typeof gradersPath === "string") {
     try {
@@ -4466,7 +4691,9 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
   const fitness = async (
     prompt: string,
   ): Promise<import("@crewhaus/prompt-optimizer").FitnessResult> => {
-    const yamlText = readFileSync(absSpec, "utf-8");
+    // Item #54 — read the (possibly few-shot-augmented) optimize spec so the
+    // fitness eval sees the same in-context examples the search mutates around.
+    const yamlText = readFileSync(optimizeSpecPath, "utf-8");
     // Re-parse to capture spec.target without depending on the
     // orchestrator's extractCurrentPrompt internals.
     const parsedTarget = parseSpec(yamlText).target;
@@ -4586,7 +4813,7 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
   }
 
   const result = await optimizeSpec({
-    specPath: absSpec,
+    specPath: optimizeSpecPath,
     fitness,
     trainSet,
     devSet,
@@ -4594,7 +4821,9 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
     seed,
     improvementThreshold,
     outDir,
-    writeBack,
+    // Item #54 — the few-shot path is patch-only so the injected examples never
+    // land in the tracked spec (they'd double-inject on the next run).
+    writeBack: writeBack && !fewShotDisablesWriteBack,
     runId,
     traceBus,
     ...(mutatorImpl !== undefined ? { mutator: mutatorImpl } : {}),
@@ -7978,6 +8207,7 @@ async function confirmYesNo(prompt: string): Promise<boolean> {
 
 const SESSIONS_SUBDIR = join(".crewhaus", "sessions");
 const FEEDBACK_SUBDIR = join(".crewhaus", "feedback");
+const FEWSHOT_SUBDIR = join(".crewhaus", "fewshot");
 
 function sessionJsonlPath(session: string): string {
   return join(process.cwd(), SESSIONS_SUBDIR, `${session}.jsonl`);
@@ -8316,6 +8546,357 @@ function distillRatings(
     ...(s.expected_output !== undefined ? { expected_output: s.expected_output } : {}),
   }));
   return { samples, gradersYaml: gradersConfigToYaml(result.graders) };
+}
+
+/**
+ * Gather every session's derived turns (tagged with the session join key) plus
+ * all feedback (in-transcript events + the web-UI feedback dir). Shared by the
+ * few-shot / FAQ / lessons harvesters so they read the same corpus `distill`
+ * does. `sessionsArg` is a session id or `"all"`.
+ */
+function resolveHarvestSessionIds(sessionsArg: string | undefined, allFlag: boolean): string[] {
+  const sessionsDir = join(process.cwd(), SESSIONS_SUBDIR);
+  if (allFlag || sessionsArg === "all" || sessionsArg === undefined) {
+    return listSessionIds(sessionsDir);
+  }
+  if (!SESSION_ID_REGEX.test(sessionsArg)) {
+    die(`invalid --session "${sessionsArg}" — expected sess_<16 hex> or "all"`);
+  }
+  return [sessionsArg];
+}
+
+function gatherTurnsAndFeedback(sessionIds: ReadonlyArray<string>): {
+  turns: SessionTurn[];
+  feedback: FeedbackRecord[];
+} {
+  const turns: SessionTurn[] = [];
+  const feedback: FeedbackRecord[] = [];
+  for (const id of sessionIds) {
+    const events = readSessionEvents(id);
+    for (const t of deriveTurns(events)) turns.push({ ...t, sessionId: id });
+    feedback.push(...extractFeedbackRecords(events));
+  }
+  feedback.push(...readFeedbackDir(join(process.cwd(), FEEDBACK_SUBDIR)));
+  return { turns, feedback };
+}
+
+/** Read a persisted few-shot pool file, skipping malformed lines. */
+function readFewShotPool(file: string): FewShotExample[] {
+  if (!existsSync(file)) return [];
+  return parseJsonlObjects(readFileSync(file, "utf-8")).filter(isFewShotExample);
+}
+
+/**
+ * Item #54 — `crewhaus fewshot harvest|show`. `harvest` mines up-rated turns
+ * into a golden few-shot pool (merged idempotently into
+ * `.crewhaus/fewshot/<spec>.jsonl`, PII/secret-redacted); `show` prints the
+ * top-K pool entries as the injectable prompt block.
+ */
+async function runFewshot(args: ParsedArgs): Promise<void> {
+  const action = args.positional[0];
+  if (args.flags["help"] === true && action === undefined) {
+    process.stdout.write(
+      "usage: crewhaus fewshot <harvest|show> [--session <id>|--all-sessions] [--min-score F] [-o <pool.jsonl>] [--k N]\n" +
+        "  harvest  mine up-rated turns into a golden few-shot pool (PII/secret-redacted)\n" +
+        "  show     print the top-K pool examples as the injectable prompt block\n",
+    );
+    return;
+  }
+  // The pool file: --out override, else the cwd spec's name, else a default.
+  const specName = readCwdSpecName();
+  const poolFile = strFlag(args, "out") ?? join(process.cwd(), FEWSHOT_SUBDIR, `${specName}.jsonl`);
+  const k = intFlag(args, "k") ?? 5;
+
+  if (action === "show") {
+    const pool = readFewShotPool(poolFile);
+    if (pool.length === 0)
+      die(`no few-shot pool at ${poolFile} — run \`crewhaus fewshot harvest\``);
+    process.stdout.write(`${formatFewShotForPrompt(pool, k)}\n`);
+    return;
+  }
+  if (action !== "harvest") {
+    die(`fewshot: unknown action "${action ?? ""}" — supported: harvest, show`);
+  }
+
+  const minScore = floatFlag(args, "min-score") ?? 0.7;
+  if (minScore < 0 || minScore > 1) die(`invalid --min-score "${minScore}" — must be in [0,1]`);
+  const sessionIds = resolveHarvestSessionIds(
+    strFlag(args, "session"),
+    args.flags["all-sessions"] === true,
+  );
+  if (sessionIds.length === 0) die("no sessions found under .crewhaus/sessions/");
+  const { turns, feedback } = gatherTurnsAndFeedback(sessionIds);
+  if (feedback.length === 0) {
+    die("no feedback found — record some with `crewhaus rate` / `crewhaus feedback` first");
+  }
+
+  // Redact harvested outputs with the shared secret/API-key + PII detector set
+  // so a pasted credential never lands in the pool or the optimizer prompt.
+  const { createPiiRedactor } = await import("@crewhaus/pii-redactor");
+  const { SYNTHESIZE_PII_DETECTORS } = await import("./dataset-mine");
+  const redactor = createPiiRedactor({ regexDetectors: SYNTHESIZE_PII_DETECTORS });
+
+  const { examples, stats } = await harvestFewShot(turns, feedback, {
+    minScore,
+    redact: async (t) => (await redactor.redact(t)).text,
+  });
+  if (examples.length === 0) {
+    die(`no up-rated turns qualified (min-score ${minScore}); matched ${stats.qualified}`);
+  }
+  const merged = mergePools(readFewShotPool(poolFile), examples);
+  mkdirSync(dirname(poolFile), { recursive: true });
+  writeFileSync(poolFile, poolToJsonl(merged), { mode: 0o600 });
+  process.stdout.write(
+    `[fewshot] harvested ${examples.length} example(s) → ${merged.length} in pool → ${poolFile}\n`,
+  );
+}
+
+/** Best-effort read of the cwd harness spec's `name` for default pool/skill
+ *  paths. Falls back to "harness" when no spec is present in the cwd. */
+function readCwdSpecName(): string {
+  for (const candidate of ["crewhaus.yaml", "crewhaus.yml"]) {
+    const p = join(process.cwd(), candidate);
+    if (existsSync(p)) {
+      try {
+        return parseSpec(readFileSync(p, "utf-8")).name;
+      } catch {
+        // fall through to the default
+      }
+    }
+  }
+  return "harness";
+}
+
+/** Resolve the session ids to scan for the harvest family, honouring
+ *  `--sessions N|all` (N = the N most-recently-modified session logs). */
+function resolveScanSessionIds(sessionsArg: string | undefined): string[] {
+  const sessionsDir = join(process.cwd(), SESSIONS_SUBDIR);
+  const ids = listSessionIds(sessionsDir);
+  if (sessionsArg === undefined || sessionsArg === "all") return ids;
+  const n = Number.parseInt(sessionsArg, 10);
+  if (Number.isNaN(n) || n < 1) die(`invalid --sessions "${sessionsArg}" — expected N or "all"`);
+  const withMtime = ids.map((id) => {
+    let mtimeMs = 0;
+    try {
+      mtimeMs = statSync(join(sessionsDir, `${id}.jsonl`)).mtimeMs;
+    } catch {}
+    return { id, mtimeMs };
+  });
+  withMtime.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  return withMtime.slice(0, n).map((e) => e.id);
+}
+
+/**
+ * Item #55 — `crewhaus faq distill [--sessions N|all]`. Cluster recurring user
+ * questions across sessions, pair each cluster with its best up-rated answer,
+ * and emit an auto-discovered FAQ SKILL.md into `.crewhaus/skills/faq/`.
+ */
+async function runFaq(args: ParsedArgs): Promise<void> {
+  const action = args.positional[0];
+  if (args.flags["help"] === true && action === undefined) {
+    process.stdout.write(
+      "usage: crewhaus faq distill [--sessions N|all] [--min-score F] [--min-occurrences N] [-o <skill-dir>]\n" +
+        "  Cluster recurring user questions, pair each with its best-rated answer, and emit\n" +
+        "  an auto-discovered FAQ skill (SKILL.md) under .crewhaus/skills/faq/ (PII/secret-redacted).\n",
+    );
+    return;
+  }
+  if (action !== "distill") {
+    die(`faq: unknown action "${action ?? ""}" — supported: distill`);
+  }
+  const minScore = floatFlag(args, "min-score") ?? 0.7;
+  if (minScore < 0 || minScore > 1) die(`invalid --min-score "${minScore}" — must be in [0,1]`);
+  const minOccurrences = intFlag(args, "min-occurrences") ?? 2;
+
+  const sessionIds = resolveScanSessionIds(strFlag(args, "sessions"));
+  if (sessionIds.length === 0) die("no sessions found under .crewhaus/sessions/");
+  const { turns, feedback } = gatherTurnsAndFeedback(sessionIds);
+  if (feedback.length === 0) {
+    die("no feedback found — record some with `crewhaus rate` / `crewhaus feedback` first");
+  }
+
+  const { createPiiRedactor } = await import("@crewhaus/pii-redactor");
+  const { SYNTHESIZE_PII_DETECTORS } = await import("./dataset-mine");
+  const redactor = createPiiRedactor({ regexDetectors: SYNTHESIZE_PII_DETECTORS });
+
+  const entries = await distillFaq(turns, feedback, {
+    minScore,
+    minOccurrences,
+    redact: async (t) => (await redactor.redact(t)).text,
+  });
+  if (entries.length === 0) {
+    die(
+      `no recurring questions with an up-rated answer (min-occurrences ${minOccurrences}, min-score ${minScore})`,
+    );
+  }
+
+  const skillDir = strFlag(args, "out") ?? join(process.cwd(), ".crewhaus", "skills", "faq");
+  const skillMd = buildFaqSkill(entries, { harnessName: readCwdSpecName() });
+  // Fail loudly if the emitted skill somehow does not parse — the whole point
+  // is that skills-registry auto-discovers it.
+  try {
+    const { parseSkillFile } = await import("@crewhaus/skills-registry");
+    parseSkillFile(skillMd);
+  } catch (err) {
+    die(`internal: emitted FAQ SKILL.md failed to parse: ${(err as Error).message}`);
+  }
+  mkdirSync(skillDir, { recursive: true });
+  writeFileSync(join(skillDir, "SKILL.md"), skillMd, { mode: 0o600 });
+  process.stdout.write(
+    `[faq] distilled ${entries.length} FAQ entry(ies) → ${join(skillDir, "SKILL.md")} (auto-discovered by future runs)\n`,
+  );
+}
+
+/** The per-user preferences directory the runtime injects from at run start. */
+const PREFERENCES_SUBDIR = join(".crewhaus", "preferences");
+
+/** Sanitize a rater identity into a filesystem-safe preferences filename. */
+function preferenceFileName(rater: string): string {
+  return `${rater.replace(/[^a-zA-Z0-9_.-]/g, "_").slice(0, 64) || "user"}.md`;
+}
+
+/**
+ * Item #56 — `crewhaus lessons update [--sessions N|all]`. Mine corrections +
+ * recurring failure→fix patterns into a deduped, idempotent LESSONS.md (a
+ * canonical project-memory file the runtime auto-loads), and maintain per-user
+ * preference files under `.crewhaus/preferences/`.
+ */
+async function runLessons(args: ParsedArgs): Promise<void> {
+  const action = args.positional[0];
+  if (args.flags["help"] === true && action === undefined) {
+    process.stdout.write(
+      "usage: crewhaus lessons update [--sessions N|all] [--low-score F] [-o <LESSONS.md>]\n" +
+        "  Mine corrections + recurring failure→fix patterns into a deduped LESSONS.md\n" +
+        "  (auto-loaded into the system prompt), plus per-user prefs under .crewhaus/preferences/.\n",
+    );
+    return;
+  }
+  if (action !== "update") {
+    die(`lessons: unknown action "${action ?? ""}" — supported: update`);
+  }
+  const lowScore = floatFlag(args, "low-score") ?? 0.5;
+  if (lowScore < 0 || lowScore > 1) die(`invalid --low-score "${lowScore}" — must be in [0,1]`);
+
+  const sessionIds = resolveScanSessionIds(strFlag(args, "sessions"));
+  if (sessionIds.length === 0) die("no sessions found under .crewhaus/sessions/");
+  const { turns, feedback } = gatherTurnsAndFeedback(sessionIds);
+
+  // Failure signals reuse dataset-mine's negative-signal detection.
+  const failureSignals: Array<{ input: string; reason: string }> = [];
+  for (const id of sessionIds) {
+    for (const c of mineSession(id, readSessionEvents(id))) {
+      failureSignals.push({ input: c.input, reason: c.reason });
+    }
+  }
+  if (feedback.length === 0 && failureSignals.length === 0) {
+    die("no corrections/comments or failure signals found to distill lessons from");
+  }
+
+  const { createPiiRedactor } = await import("@crewhaus/pii-redactor");
+  const { SYNTHESIZE_PII_DETECTORS } = await import("./dataset-mine");
+  const redactor = createPiiRedactor({ regexDetectors: SYNTHESIZE_PII_DETECTORS });
+  const redact = async (t: string): Promise<string> => (await redactor.redact(t)).text;
+
+  const freshLessons = await mineLessons(turns, feedback, failureSignals, { lowScore, redact });
+
+  // Merge into the existing LESSONS.md, preserving its human-authored preamble.
+  const lessonsFile = strFlag(args, "out") ?? join(process.cwd(), "LESSONS.md");
+  const existingRaw = existsSync(lessonsFile) ? readFileSync(lessonsFile, "utf-8") : "";
+  const { preamble, lessons: existing } = parseLessonsMd(existingRaw);
+  const merged = mergeLessons(existing, freshLessons);
+  // TODO(#56 F7): `merged` grows unbounded across updates (dedupe never evicts)
+  // — add a cap/prune (e.g. keep the newest/highest-signal N lessons) so the
+  // auto-injected LESSONS.md can't bloat the system prompt over time.
+  writeFileSync(lessonsFile, renderLessonsMd(merged, preamble), { mode: 0o600 });
+  process.stdout.write(
+    `[lessons] ${freshLessons.length} mined → ${merged.length} in ${lessonsFile} (auto-loaded at run start)\n`,
+  );
+
+  // Per-user preference files.
+  const prefs = await minePreferences(feedback, { redact });
+  if (prefs.length > 0) {
+    const prefsDir = join(process.cwd(), PREFERENCES_SUBDIR);
+    mkdirSync(prefsDir, { recursive: true });
+    for (const p of prefs) {
+      writeFileSync(join(prefsDir, preferenceFileName(p.rater)), renderPreferencesMd(p), {
+        mode: 0o600,
+      });
+    }
+    process.stdout.write(
+      `[lessons] wrote ${prefs.length} per-user preference file(s) under ${prefsDir}\n`,
+    );
+  }
+}
+
+/**
+ * Item #57 — `crewhaus sessions summarize [--before <date>] [--evicted]`. Folds
+ * sessions into the durable `.crewhaus/sessions-index/` before their raw
+ * transcripts are lost to TTL eviction. With `--evicted` it runs an actual TTL
+ * eviction pass with the summarize-before-evict hook wired, so an expiring
+ * session is indexed the instant before it is unlinked; otherwise it summarizes
+ * the sessions currently on disk (optionally only those older than `--before`).
+ */
+async function runSessions(args: ParsedArgs): Promise<void> {
+  const action = args.positional[0];
+  if (args.flags["help"] === true && action === undefined) {
+    process.stdout.write(
+      "usage: crewhaus sessions summarize [--before <date>] [--evicted] [--ttl-days N]\n" +
+        "  Summarize sessions (outcome, tools, ratings, key facts) into the durable\n" +
+        "  .crewhaus/sessions-index/ before their transcripts expire (30-day TTL).\n" +
+        "  --evicted runs a TTL eviction pass and indexes each session just before it is deleted.\n",
+    );
+    return;
+  }
+  if (action !== "summarize") {
+    die(`sessions: unknown action "${action ?? ""}" — supported: summarize`);
+  }
+  const sessionsDir = join(process.cwd(), SESSIONS_SUBDIR);
+  const indexDir = join(process.cwd(), ".crewhaus", SESSIONS_INDEX_DIRNAME);
+
+  if (args.flags["evicted"] === true) {
+    // Summarize-before-evict: wire the session-store hook so each expiring
+    // session is indexed the instant before its files are unlinked.
+    const ttlDays = intFlag(args, "ttl-days") ?? undefined;
+    let indexed = 0;
+    const { evictedIds } = await evictExpiredSessions({
+      rootDir: sessionsDir,
+      ...(ttlDays !== undefined ? { ttlDays } : {}),
+      onBeforeEvict: async (id, rootDir) => {
+        const s = summarizeSessionIntoIndex(id, join(rootDir, `${id}.jsonl`), indexDir);
+        if (s !== undefined) indexed += 1;
+      },
+    });
+    process.stdout.write(
+      `[sessions] evicted ${evictedIds.length} expired session(s); indexed ${indexed} into ${indexDir}\n`,
+    );
+    return;
+  }
+
+  // On-demand: summarize every session on disk (optionally only those older
+  // than --before).
+  let beforeMs: number | undefined;
+  const beforeArg = strFlag(args, "before");
+  if (beforeArg !== undefined) {
+    const parsed = /^\d+$/.test(beforeArg) ? Number.parseInt(beforeArg, 10) : Date.parse(beforeArg);
+    if (Number.isNaN(parsed))
+      die(`invalid --before "${beforeArg}" — expected ISO date or epoch-ms`);
+    beforeMs = parsed;
+  }
+  const ids = listSessionIds(sessionsDir);
+  if (ids.length === 0) die(`no sessions found under ${sessionsDir}`);
+  let indexed = 0;
+  for (const id of ids) {
+    const logPath = join(sessionsDir, `${id}.jsonl`);
+    if (beforeMs !== undefined) {
+      let mtimeMs = Number.POSITIVE_INFINITY;
+      try {
+        mtimeMs = statSync(logPath).mtimeMs;
+      } catch {}
+      if (mtimeMs >= beforeMs) continue;
+    }
+    if (summarizeSessionIntoIndex(id, logPath, indexDir) !== undefined) indexed += 1;
+  }
+  process.stdout.write(`[sessions] summarized ${indexed} session(s) into ${indexDir}\n`);
 }
 
 // -------- item 4: crewhaus graders suggest --------
@@ -10176,6 +10757,47 @@ switch (subcommand) {
     break;
   case "distill":
     await runDistill(parseFor(rest, DISTILL_SCHEMA));
+    break;
+  case "fewshot":
+    // Item #54 — `fewshot harvest|show`: mine up-rated turns into a golden
+    // few-shot pool for `optimize --few-shot`. Structured failures route
+    // through die().
+    try {
+      await runFewshot(parseFor(rest, FEWSHOT_SCHEMA));
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
+    break;
+  case "faq":
+    // Item #55 — `faq distill`: cluster recurring user questions into an
+    // auto-discovered FAQ skill. Structured failures route through die().
+    try {
+      await runFaq(parseFor(rest, FAQ_SCHEMA));
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
+    break;
+  case "lessons":
+    // Item #56 — `lessons update`: mine corrections + failure→fix patterns
+    // into a deduped LESSONS.md + per-user prefs. Failures route through die().
+    try {
+      await runLessons(parseFor(rest, LESSONS_SCHEMA));
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
+    break;
+  case "sessions":
+    // Item #57 — `sessions summarize`: fold sessions into the durable index
+    // (on demand or via the summarize-before-evict hook). Failures → die().
+    try {
+      await runSessions(parseFor(rest, SESSIONS_SCHEMA));
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
     break;
   case "scaffold-evals":
     // Mirror `run`'s policy: structured failures (SpecParseError, model

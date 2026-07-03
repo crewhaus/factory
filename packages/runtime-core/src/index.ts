@@ -13,7 +13,7 @@ import type {
   SpawnSubAgentFn,
   SubAgentDefinition,
 } from "@crewhaus/agent-context-isolation";
-import { setDefaultBoundaryLlmClassifier } from "@crewhaus/boundary-classifier";
+import { classifyBoundary, setDefaultBoundaryLlmClassifier } from "@crewhaus/boundary-classifier";
 import { type WrappedAdapter, wrap as wrapWithCircuitBreaker } from "@crewhaus/circuit-breaker";
 import { autoCompact } from "@crewhaus/compaction-autocompact";
 import { snip } from "@crewhaus/compaction-snip";
@@ -470,6 +470,40 @@ export type RunChatLoopOptions = {
    */
   slashCommands?: ReadonlyMap<string, SlashCommand>;
   /**
+   * Feature #53 — cross-session memory auto-recall/auto-capture wiring. When
+   * `store` is supplied (the caller builds it from `createMemoryStore`), the
+   * runtime honours the auto-* switches:
+   *   - `autoRecall`: at session start, recall the top-`recallK` memories for
+   *     the current context and inject them into the system prompt (mirrors
+   *     the project-memory auto-load block). `recallSeed` is the query used
+   *     (defaults to the agent instructions).
+   *   - `autoCapture`: at run teardown (in the same finally where the `stop`
+   *     hook fires — NOT a credential-stripped hook), the caller-supplied
+   *     `onCapture` is invoked with the completed-turn count so it can
+   *     summarize the session's durable outcomes into the store.
+   * Omitted → no memory injection or capture (Remember/Recall passed via
+   * `tools` still work). Kept as an injected seam so runtime-core does not
+   * depend on memory-store.
+   */
+  memory?: {
+    readonly autoRecall?: boolean;
+    readonly recallK?: number;
+    readonly recallSeed?: string;
+    /** Return recalled memory lines to inject; runtime wraps them in a block. */
+    readonly recall?: (query: string, k: number) => Promise<readonly string[]>;
+    readonly autoCapture?: boolean;
+    /** Invoked at teardown with the completed user-text turn count and the
+     *  run's session id (so the callback can read the transcript to summarize). */
+    readonly onCapture?: (completedTurns: number, sessionId: string) => Promise<void>;
+  };
+  /**
+   * Item #56 — absolute paths to per-user preference files injected at run
+   * start via the project-memory auto-load path (alongside LESSONS.md, which
+   * is now a canonical memory file). The CLI resolves the current user's
+   * `.crewhaus/preferences/<user>.md` and threads it here. Absent → no-op.
+   */
+  preferenceFiles?: ReadonlyArray<string>;
+  /**
    * Section 13 — inline sub-agent definitions exposed via the `Task` tool.
    * Threaded into the `RuntimeBridge` and surfaced to framework-aware
    * tools (only `Task` today). Codegen sets this from the IR; ordinary
@@ -758,6 +792,20 @@ export function defaultSinkScope(toolName: string): SinkScope {
   if (toolName.startsWith("mcp__")) return "external-dynamic";
   if (MODEL_DESTINATION_SINKS.has(toolName)) return "external-dynamic";
   return "external-configured";
+}
+
+/**
+ * Neutralize a boundary-block closing delimiter embedded in untrusted content
+ * so a poisoned line can't terminate its wrapper block early and inject
+ * trailing instructions. Replaces `</tag>` (any casing/whitespace) with a
+ * visually-inert `<\/tag>` so the content survives for the model to read but
+ * no longer parses as the real closing tag. Used for the recalled-memory block
+ * (#53) — recalled memories may carry content shaped by untrusted tool output.
+ */
+function escapeBoundaryDelimiter(text: string, tag: string): string {
+  // Match `</tag>` tolerantly (leading whitespace inside the tag, any casing).
+  const re = new RegExp(`</\\s*${tag}\\s*>`, "gi");
+  return text.replace(re, `<\\/${tag}>`);
 }
 
 /**
@@ -1237,6 +1285,20 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     }
   }
 
+  // Feature #53 — auto-capture at teardown. Runs in the same finally where the
+  // `stop` hook fires, but is NOT a credential-stripped hook: the caller-
+  // supplied `onCapture` (which writes to the memory-store from the CLI's full
+  // environment) needs the process env, exactly like the feedback teardown.
+  // Best-effort — a capture failure never turns a clean exit into an error.
+  const maybeAutoCapture = async (): Promise<void> => {
+    if (opts.memory?.autoCapture !== true || opts.memory.onCapture === undefined) return;
+    try {
+      await opts.memory.onCapture(runContext.turnNumber, sessionId);
+    } catch (err) {
+      runContext.logger.warn("memory auto-capture failed", { error: (err as Error).message });
+    }
+  };
+
   // Section 11 — `session-start` fires once after the persistence + run
   // context boot is complete. Observational only (no deny/block effect).
   await fireHook("session-start", {
@@ -1277,7 +1339,11 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // CLAUDE.md auto-load behaviour. Pillar 3 compliance: each file's content
   // is classified via boundary-classifier with origin "user" inside
   // loadProjectMemory() (the user's repo is developer-trusted).
-  const projectMemory = await loadProjectMemory();
+  const projectMemory = await loadProjectMemory(
+    opts.preferenceFiles !== undefined && opts.preferenceFiles.length > 0
+      ? { extraFiles: opts.preferenceFiles }
+      : {},
+  );
   const projectMemoryBlock: Anthropic.TextBlockParam[] =
     projectMemory.prompt.length > 0
       ? [
@@ -1295,12 +1361,49 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         .join(", ")}\n`,
     );
   }
+  // Feature #53 — auto-recall: at session start, pull the top-K relevant
+  // cross-session memories and inject them as a system block, mirroring the
+  // project-memory auto-load above. The caller supplies the `recall` seam
+  // (runtime-core stays independent of memory-store). Best-effort: a recall
+  // failure never aborts the run.
+  let memoryRecallBlock: Anthropic.TextBlockParam[] = [];
+  if (opts.memory?.autoRecall === true && opts.memory.recall !== undefined) {
+    try {
+      const seed = opts.memory.recallSeed ?? opts.instructions;
+      const k = opts.memory.recallK ?? 5;
+      const lines = await opts.memory.recall(seed, k);
+      if (lines.length > 0) {
+        // Pillar 3 — a recalled memory can embed content shaped by untrusted
+        // tool output from an earlier session, so it is NOT verbatim-safe like
+        // the developer's own repo files. Two defenses, mirroring how the rest
+        // of the security fabric treats injected content:
+        //   1. Delimiter safety — neutralize any `</recalled_memory>` closing
+        //      tag inside a recalled line so a poisoned memory can't break out
+        //      of its block and inject trailing instructions.
+        //   2. Classification — run the assembled block through the SAME
+        //      `classifyBoundary(text, { origin: "user" })` best-effort path
+        //      `loadProjectMemory()` uses (pass policy: classify + emit trace
+        //      events without mutating), so recalled content flows through the
+        //      boundary classifier exactly like every other prompt-bound source.
+        const body = lines
+          .map((l) => `- ${escapeBoundaryDelimiter(l, "recalled_memory")}`)
+          .join("\n");
+        const text = `<recalled_memory>\nRelevant facts remembered from earlier sessions:\n${body}\n</recalled_memory>`;
+        await classifyBoundary(text, { origin: "user" }).catch(() => undefined);
+        memoryRecallBlock = [{ type: "text", text, cache_control: { type: "ephemeral" } }];
+        process.stdout.write(`[memory] recalled ${lines.length} memory(ies) into the prompt\n`);
+      }
+    } catch (err) {
+      runContext.logger.warn("memory auto-recall failed", { error: (err as Error).message });
+    }
+  }
   // Section 17 — runtime-core no longer prepends the Claude Code OAuth
   // prefix; `adapter-anthropic` handles that internally so each adapter
   // owns its provider-specific auth-shape requirements.
   let systemBlocks: Anthropic.TextBlockParam[] = [
     userInstructions,
     ...projectMemoryBlock,
+    ...memoryRecallBlock,
     ...skillsBlock,
   ];
 
@@ -2679,6 +2782,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         turnCount: runContext.turnNumber,
         reason: "complete",
       });
+      await maybeAutoCapture();
       await subscribers.flushAll();
       await subscribers.shutdownAll();
       costPersistUnsubscribe?.();
@@ -2909,6 +3013,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       turnCount: runContext.turnNumber,
       reason: runAbort.signal.aborted ? "abort" : "exit",
     });
+    await maybeAutoCapture();
     await subscribers.flushAll();
     await subscribers.shutdownAll();
     costPersistUnsubscribe?.();
