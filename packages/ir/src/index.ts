@@ -243,6 +243,39 @@ export type IrMemory = {
   readonly recallK?: number;
 };
 
+/** Ops item 37 — a mitigation-ladder rung the runtime SLO monitor walks on a
+ *  sustained breach, in declared order. See {@link IrSlo}. */
+export type IrSloMitigation = "alert" | "pause-intake" | "rollback";
+
+/**
+ * Ops item 37 — production SLO targets + the mitigation ladder, lowered from
+ * `spec.observability.slo`. Every target is optional (declare only the ones you
+ * care about); an omitted target is never evaluated by the monitor. `windowMs`
+ * is the rolling window a breach must persist before the ladder fires (spec's
+ * `window_seconds` × 1000; the monitor defaults it when absent). `mitigation`
+ * defaults to `["alert"]` at lower time so an observe-only spec still warns.
+ * Absent from the IR when the spec omits the block.
+ */
+export type IrSlo = {
+  readonly errorRate?: number;
+  readonly p95LatencyMs?: number;
+  readonly ttftMs?: number;
+  readonly costPerHourUsd?: number;
+  readonly egressBlockRate?: number;
+  readonly windowMs?: number;
+  readonly mitigation: ReadonlyArray<IrSloMitigation>;
+};
+
+/**
+ * Ops item 37 — cross-cutting observability config, lowered from
+ * `spec.observability`. Today it carries one sub-block, `slo`. Carried on the
+ * interactive/daemon shapes that run a chat loop (IrV0/cli, IrChannelV0,
+ * IrManagedV0). Absent when the spec omits the `observability` block.
+ */
+export type IrObservability = {
+  readonly slo?: IrSlo;
+};
+
 /**
  * Track F (Section 57) — typed message schemas (Σ) for multi-agent
  * communication. Source: AgentFlow (arxiv 2604.20801). A typed graph
@@ -326,6 +359,9 @@ export type IrV0 = {
   readonly feedback?: IrFeedback;
   /** #53 cross-session memory config. Optional; absent when the spec omits `memory`. */
   readonly memory?: IrMemory;
+  /** Ops item 37 — SLO targets + mitigation ladder. Optional; absent when the
+   *  spec omits the `observability` block. */
+  readonly observability?: IrObservability;
   /** §47 cross-cutting blockchain subsystem (slice 0). All optional. */
   readonly chains?: readonly IrChainBinding[];
   readonly wallets?: readonly IrWalletBinding[];
@@ -593,6 +629,9 @@ export type IrChannelV0 = {
   readonly feedback?: IrFeedback;
   /** #53 cross-session memory config. Optional; absent when the spec omits `memory`. */
   readonly memory?: IrMemory;
+  /** Ops item 37 — SLO targets + mitigation ladder. Optional; absent when the
+   *  spec omits the `observability` block. */
+  readonly observability?: IrObservability;
   /** §47 cross-cutting blockchain subsystem (slice 0). All optional. */
   readonly chains?: readonly IrChainBinding[];
   readonly wallets?: readonly IrWalletBinding[];
@@ -637,6 +676,10 @@ export type IrManagedV0 = {
   readonly budget?: IrBudget;
   /** #53 cross-session memory config. Optional; absent when the spec omits `memory`. */
   readonly memory?: IrMemory;
+  /** Ops item 37 — SLO targets + mitigation ladder. Optional; absent when the
+   *  spec omits the `observability` block. The managed daemon's `pause-intake`
+   *  rung reuses its `budget_exceeded` 429 path. */
+  readonly observability?: IrObservability;
 };
 
 /**

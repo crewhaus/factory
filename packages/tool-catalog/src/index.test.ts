@@ -77,6 +77,61 @@ describe("defaultCatalog", () => {
   });
 });
 
+// Ops item 38 — unregister / quarantine / restore for MCP auto-quarantine.
+describe("ToolCatalog — quarantine (item 38)", () => {
+  let catalog: ToolCatalog;
+  beforeEach(() => {
+    catalog = new ToolCatalog();
+  });
+
+  test("unregister removes a live tool and returns it; undefined for unknown", () => {
+    const tool = makeTool("weather__forecast");
+    catalog.register(tool);
+    expect(catalog.unregister("weather__forecast")).toBe(tool);
+    expect(catalog.has("weather__forecast")).toBe(false);
+    expect(catalog.unregister("weather__forecast")).toBeUndefined();
+  });
+
+  test("quarantine withdraws a tool from the active surface but stashes it", () => {
+    const tool = makeTool("weather__forecast");
+    catalog.register(tool);
+    expect(catalog.quarantine("weather__forecast", "80% errors", 1000)).toBe(true);
+    // No longer on the model-facing surface.
+    expect(catalog.has("weather__forecast")).toBe(false);
+    expect(catalog.get("weather__forecast")).toBeUndefined();
+    expect(catalog.list()).toEqual([]);
+    // But tracked as quarantined.
+    expect(catalog.isQuarantined("weather__forecast")).toBe(true);
+    expect(catalog.quarantinedNames()).toEqual(["weather__forecast"]);
+    expect(catalog.quarantineInfo("weather__forecast")?.reason).toBe("80% errors");
+    expect(catalog.quarantineInfo("weather__forecast")?.quarantinedAt).toBe(1000);
+  });
+
+  test("quarantine of an unknown tool returns false; of an already-quarantined is idempotent", () => {
+    expect(catalog.quarantine("nope", "x")).toBe(false);
+    catalog.register(makeTool("s__t"));
+    expect(catalog.quarantine("s__t", "x")).toBe(true);
+    expect(catalog.quarantine("s__t", "x")).toBe(true); // idempotent no-op
+  });
+
+  test("restore re-admits a quarantined tool to the active catalog", () => {
+    const tool = makeTool("weather__forecast");
+    catalog.register(tool);
+    catalog.quarantine("weather__forecast", "flaky");
+    expect(catalog.restore("weather__forecast")).toBe(true);
+    expect(catalog.get("weather__forecast")).toBe(tool);
+    expect(catalog.isQuarantined("weather__forecast")).toBe(false);
+    // Restoring a non-quarantined name is a false no-op.
+    expect(catalog.restore("weather__forecast")).toBe(false);
+  });
+
+  test("register refuses a quarantined name (must restore instead)", () => {
+    catalog.register(makeTool("s__t"));
+    catalog.quarantine("s__t", "x");
+    expect(() => catalog.register(makeTool("s__t"))).toThrow(/quarantined/);
+  });
+});
+
 describe("RegisteredTool jsonSchema field", () => {
   test("optional jsonSchema is preserved when set", () => {
     const catalog = new ToolCatalog();

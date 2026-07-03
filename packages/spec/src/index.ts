@@ -452,6 +452,74 @@ const memoryBlock = z
   .optional();
 
 /**
+ * Ops item 37 — cross-cutting `observability` block. Today it carries one
+ * sub-block, `slo`, that declares production Service-Level Objectives + the
+ * mitigation ladder the runtime SLO monitor walks on a SUSTAINED breach.
+ *
+ * The monitor (runtime-core, env/spec-gated) folds bus events into rolling
+ * windows (reusing the alert-watchdog's accumulator + the metrics-collector's
+ * TTFT histogram) and, when a target is breached for `windowSeconds`, executes
+ * the ladder rungs in the declared order: `alert` (webhook/hook), `pause-intake`
+ * (gateway/managed 429 `budget_exceeded` path), `rollback` (auto-rollback the
+ * env pin via deployment-controller). Every rung is audit-logged.
+ *
+ * Targets are all OPTIONAL — declare only the SLOs you care about; an omitted
+ * target is never evaluated. `mitigation` defaults to `["alert"]` (observe-only
+ * is safe) so a spec that lists thresholds without a ladder still warns. Higher
+ * rungs are opt-in because they touch traffic/deploys — a spec must ask for them
+ * explicitly. `.strict()` so a typo'd sub-key fails the build.
+ *
+ * NOTE `egress_block_rate` derives from the `permission_decision` egress
+ * outcomes (no dedicated egress TraceEvent exists); `ttft_ms`/`p95_latency_ms`
+ * derive from the same per-turn/TTFT samples the alert-watchdog accumulates.
+ */
+const sloBlock = z
+  .object({
+    /** Fractional error rate ceiling (unrecovered errors / model calls), e.g. 0.05. */
+    error_rate: z.number().min(0).max(1).optional(),
+    /** p95 per-turn latency ceiling, milliseconds. */
+    p95_latency_ms: z.number().positive().optional(),
+    /** p95 time-to-first-token ceiling, milliseconds. */
+    ttft_ms: z.number().positive().optional(),
+    /** Cost burn ceiling, USD per hour of wall-clock. */
+    cost_per_hour_usd: z.number().positive().optional(),
+    /** Fractional egress-block rate ceiling (egress-blocked / external calls), e.g. 0.1. */
+    egress_block_rate: z.number().min(0).max(1).optional(),
+    /**
+     * Rolling window (seconds) a breach must persist before the ladder fires.
+     * A single blip never mitigates — the monitor only acts on a SUSTAINED
+     * breach across this window. Default 300s (5 min).
+     */
+    window_seconds: z.number().int().positive().optional(),
+    /**
+     * Mitigation ladder, walked in declared order on a sustained breach. Each
+     * rung is executed at most once per session. `alert` is always safe;
+     * `pause-intake` / `rollback` touch traffic + deploys so they are opt-in.
+     */
+    mitigation: z
+      .array(z.enum(["alert", "pause-intake", "rollback"]))
+      .nonempty()
+      .optional(),
+  })
+  .strict()
+  .refine(
+    (s) =>
+      s.error_rate !== undefined ||
+      s.p95_latency_ms !== undefined ||
+      s.ttft_ms !== undefined ||
+      s.cost_per_hour_usd !== undefined ||
+      s.egress_block_rate !== undefined,
+    { message: "observability.slo must declare at least one target threshold" },
+  );
+
+const observabilityBlock = z
+  .object({
+    slo: sloBlock.optional(),
+  })
+  .strict()
+  .optional();
+
+/**
  * Section 47 — blockchain subsystem blocks (cross-cutting). Any shape may
  * declare any subset of `chains` / `wallets` / `contracts` /
  * `transaction_policy`. Authoring rules:
@@ -628,6 +696,7 @@ const cliSchema = z
     budget: budgetBlock,
     feedback: feedbackBlock,
     memory: memoryBlock,
+    observability: observabilityBlock,
     cli: cliOptionsBlock,
     chains: chainsBlock,
     wallets: walletsBlock,
@@ -773,6 +842,7 @@ const channelSchema = z
     budget: budgetBlock,
     feedback: feedbackBlock,
     memory: memoryBlock,
+    observability: observabilityBlock,
     heartbeat: heartbeatBlock,
     gateway: channelGatewayBlock,
     chains: chainsBlock,
@@ -871,6 +941,7 @@ const managedSchema = z
     failure_taxonomy: failureTaxonomyBlock,
     budget: budgetBlock,
     memory: memoryBlock,
+    observability: observabilityBlock,
   })
   .strict();
 

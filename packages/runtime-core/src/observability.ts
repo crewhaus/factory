@@ -41,6 +41,12 @@ import {
   detectBreaches,
   readMetricsHistory,
 } from "./alert-watchdog";
+import {
+  type AttachedSloMonitor,
+  type SloMitigationSink,
+  type SloTargets,
+  attachSloMonitor,
+} from "./slo-monitor";
 
 export type AttachedSubscribers = {
   printer: AttachedPrinter | undefined;
@@ -240,6 +246,11 @@ export type AttachDefaultSubscribersOptions = {
   readonly metricsDir?: string;
   /** Item 31 — durable + off-box alert delivery (see {@link AlertSink}). */
   readonly alertSink?: AlertSink;
+  /** Item 37 — lowered `observability.slo` targets. The SLO monitor is a no-op
+   *  without both this AND CREWHAUS_SLO set. */
+  readonly sloTargets?: SloTargets;
+  /** Item 37 — injected SLO mitigation ladder delivery (see {@link SloMitigationSink}). */
+  readonly sloSink?: SloMitigationSink;
 };
 
 export async function attachDefaultSubscribers(
@@ -303,6 +314,16 @@ export async function attachDefaultSubscribers(
   // raises an alert per breach (trace event + injected audit/hook sinks).
   const watchdog = attachAlertWatchdog(bus, runContext, env, options);
 
+  // Ops item 37 — production-signal SLO monitor, opt-in via CREWHAUS_SLO=1 AND a
+  // lowered `observability.slo` block. Folds events into rolling windows; a
+  // periodic timer evaluates them and walks the declared mitigation ladder
+  // (alert → pause-intake → rollback) on a sustained breach via the injected
+  // sink. No targets / env off ⇒ undefined (zero overhead).
+  const sloMonitor: AttachedSloMonitor | undefined = attachSloMonitor(bus, runContext, env, {
+    ...(options.sloTargets !== undefined ? { targets: options.sloTargets } : {}),
+    ...(options.sloSink !== undefined ? { sink: options.sloSink } : {}),
+  });
+
   const flushAll = async (): Promise<void> => {
     printer?.finalize();
     const tasks: Promise<void>[] = [];
@@ -317,6 +338,14 @@ export async function attachDefaultSubscribers(
     // must never break flushAll, so its own finalize swallows/logs internally.
     if (watchdog !== undefined) {
       await watchdog.finalize().catch((err) => logFlushError(runContext, "alert-watchdog", err));
+    }
+    // A final SLO evaluation at flush so a breach that formed late in a short
+    // run (below the periodic timer's first tick) still walks the ladder, then
+    // stop the timer so it never outlives the run.
+    if (sloMonitor !== undefined) {
+      await sloMonitor.evaluate().catch((err) => logFlushError(runContext, "slo-monitor", err));
+      sloMonitor.stop();
+      sloMonitor.unsubscribe();
     }
   };
   const shutdownAll = async (): Promise<void> => {
@@ -335,6 +364,10 @@ export async function attachDefaultSubscribers(
     if (watchdog !== undefined) {
       await watchdog.finalize().catch((err) => logFlushError(runContext, "alert-watchdog", err));
       watchdog.unsubscribe();
+    }
+    if (sloMonitor !== undefined) {
+      sloMonitor.stop();
+      sloMonitor.unsubscribe();
     }
   };
   return {
@@ -613,4 +646,60 @@ export function attachAdvisorPersistence(
   };
 
   return { unsubscribe, digestLine };
+}
+
+// -------- MCP stats persistence (ops item 38) --------
+
+export type AttachedMcpStatsPersistence = {
+  unsubscribe: Unsubscribe;
+};
+
+/**
+ * Ops item 38 — mirror the trace-bus-only `mcp_call_end` events into the same
+ * session JSONL the transcript already writes to, as the durable `mcp_stats`
+ * kind, so `crewhaus mcp doctor` can score per-server MCP health OFFLINE across
+ * sessions. `mcp_call_start`/`mcp_call_end` are trace-bus-only today — nothing
+ * durably records per-server error-rate / latency — so this subscriber is the
+ * durable history the report reads.
+ *
+ * Payload per line: `{ server, toolName, durationMs, isError }` — the same
+ * granularity decision the advisor's `tool_stats` made: per-call, not a per-turn
+ * aggregate, so the report keeps the full latency/error distribution. Whole
+ * milliseconds only (performance.now() floats add bytes without adding signal).
+ *
+ * Shares the DEFAULT-ON gate with the advisor events (disable with
+ * CREWHAUS_ADVISOR_EVENTS=0): the lines are tiny and they are exactly what the
+ * MCP-health report mines, so opting in would starve the doctor on the runs
+ * that used MCP servers. `append()` failures are logged, never thrown — a
+ * persistence hiccup must not abort a turn.
+ */
+export function attachMcpStatsPersistence(
+  bus: TraceEventBus,
+  eventLog: EventLog,
+  runContext: RunContext,
+  env: NodeJS.ProcessEnv = process.env,
+): AttachedMcpStatsPersistence | undefined {
+  const gate = env["CREWHAUS_ADVISOR_EVENTS"];
+  if (gate === "0" || gate === "false") return undefined;
+
+  const unsubscribe = bus.subscribe((event: TraceEvent): void => {
+    if (event.kind !== "mcp_call_end") return;
+    void eventLog
+      .append({
+        kind: "mcp_stats",
+        payload: {
+          server: event.server,
+          toolName: event.toolName,
+          durationMs: Math.round(event.durationMs),
+          isError: event.isError,
+        },
+      })
+      .catch((err) => {
+        runContext.logger.error("mcp_stats.persist_failed", {
+          message: err instanceof Error ? err.message : String(err),
+        });
+      });
+  });
+
+  return { unsubscribe };
 }

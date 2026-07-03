@@ -852,6 +852,107 @@ memory:
   });
 });
 
+// Ops item 37 — observability.slo block lowered into ir.observability.slo.
+describe("lower — observability.slo block (item 37)", () => {
+  test("carries targets verbatim, folds window_seconds → windowMs, defaults mitigation", () => {
+    const spec = parseSpec(`
+name: hello
+target: cli
+agent:
+  model: claude-opus-4-6
+  instructions: i
+observability:
+  slo:
+    error_rate: 0.05
+    p95_latency_ms: 8000
+    ttft_ms: 1400
+    cost_per_hour_usd: 100
+    egress_block_rate: 0.1
+    window_seconds: 300
+`);
+    const ir = lower(spec);
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect(ir.observability?.slo).toEqual({
+      errorRate: 0.05,
+      p95LatencyMs: 8000,
+      ttftMs: 1400,
+      costPerHourUsd: 100,
+      egressBlockRate: 0.1,
+      windowMs: 300_000,
+      mitigation: ["alert"], // default when the spec omits it
+    });
+  });
+
+  test("carries an explicit mitigation ladder verbatim", () => {
+    const spec = parseSpec(`
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+observability:
+  slo:
+    ttft_ms: 1400
+    mitigation: [alert, pause-intake, rollback]
+`);
+    const ir = lower(spec);
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect(ir.observability?.slo?.mitigation).toEqual(["alert", "pause-intake", "rollback"]);
+  });
+
+  test("absent observability block leaves ir.observability undefined (spread-out)", () => {
+    const spec = parseSpec(`
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+`);
+    const ir = lower(spec);
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect(ir.observability).toBeUndefined();
+    expect("observability" in ir).toBe(false);
+  });
+
+  test("lowers on the managed shape too", () => {
+    const spec = parseSpec(`
+name: hello
+target: managed
+agent:
+  model: m
+  instructions: i
+tenants:
+  - id: t1
+    budget: { maxInputTokens: 1000, maxOutputTokens: 1000 }
+observability:
+  slo:
+    error_rate: 0.02
+    mitigation: [alert, pause-intake]
+`);
+    const ir = lower(spec);
+    if (ir.target !== "managed") throw new Error("unexpected target");
+    expect(ir.observability?.slo).toEqual({
+      errorRate: 0.02,
+      mitigation: ["alert", "pause-intake"],
+    });
+  });
+
+  test("rejects an slo block with no target threshold", () => {
+    expect(() =>
+      parseSpec(`
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+observability:
+  slo:
+    window_seconds: 60
+`),
+    ).toThrow(/at least one target threshold/);
+  });
+});
+
 // FR-006 — Pillar 3 sink-side egress-matcher selector lowered into
 // ir.security.egressMatcher. This is the seam that closes the "flag parsed
 // but not threaded" gap: the run path reads ir.security.egressMatcher and

@@ -221,6 +221,14 @@ export class ToolCatalogError extends CrewhausError {
   }
 }
 
+/** Ops item 38 — a tool that has been temporarily withdrawn from the active
+ *  catalog (its server is chronically failing). `restore()` returns it. */
+export type QuarantinedTool = {
+  readonly tool: RegisteredTool;
+  readonly reason: string;
+  readonly quarantinedAt: number;
+};
+
 export class ToolCatalog {
   // Initialized in the constructor body rather than as a field initializer so
   // that Bun's coverage instrumentation can mark it executed. A
@@ -228,14 +236,26 @@ export class ToolCatalog {
   // but its hit-count is never incremented by Bun, which would otherwise pin
   // function coverage below 100% even though the line runs on every `new`.
   private readonly _tools: Map<string, RegisteredTool>;
+  // Ops item 38 — tools withdrawn by `quarantine()`. Kept out of `_tools` (so
+  // `has`/`get`/`list` — the model-facing surface — no longer see them) but
+  // stashed here so `restore()` can re-admit the exact definition without the
+  // caller re-building it. `register()` still throws on a name that is live OR
+  // quarantined, so a quarantined name is never silently shadowed.
+  private readonly _quarantined: Map<string, QuarantinedTool>;
 
   constructor() {
     this._tools = new Map<string, RegisteredTool>();
+    this._quarantined = new Map<string, QuarantinedTool>();
   }
 
   register(tool: RegisteredTool): void {
     if (this._tools.has(tool.name)) {
       throw new ToolCatalogError(`tool "${tool.name}" is already registered`);
+    }
+    if (this._quarantined.has(tool.name)) {
+      throw new ToolCatalogError(
+        `tool "${tool.name}" is quarantined — restore() it rather than re-registering`,
+      );
     }
     this._tools.set(tool.name, tool);
   }
@@ -250,6 +270,74 @@ export class ToolCatalog {
 
   list(): ReadonlyArray<RegisteredTool> {
     return [...this._tools.values()];
+  }
+
+  /**
+   * Ops item 38 — remove a live tool from the active catalog entirely. Returns
+   * the removed definition (so a caller can re-`register()` it later) or
+   * undefined when the name is not live. Unlike `quarantine()` this keeps no
+   * stash — it is the plain inverse of `register()` (the `circuit-breaker`
+   * wraps ProviderAdapters, never the catalog, so this is a new seam, not a
+   * reuse). `register()` throws on re-register today, so a runtime that needs
+   * to swap a tool must `unregister()` first.
+   */
+  unregister(name: string): RegisteredTool | undefined {
+    const tool = this._tools.get(name);
+    if (tool === undefined) return undefined;
+    this._tools.delete(name);
+    return tool;
+  }
+
+  /**
+   * Ops item 38 — temporarily withdraw a live tool (its MCP server is
+   * chronically failing) so the model routes around it. The tool leaves the
+   * active catalog (`has`/`get`/`list` no longer see it) but its definition is
+   * stashed for `restore()`. Idempotent: quarantining an already-quarantined
+   * tool is a no-op; quarantining a name that is neither live nor quarantined
+   * returns false. The synthetic "this tool is unavailable" notice the model
+   * sees is injected by the runtime (mirroring loop-detection's warning
+   * injection) from `quarantinedNames()`, NOT by this catalog — the catalog
+   * only owns the registration state.
+   */
+  quarantine(name: string, reason: string, now: number = Date.now()): boolean {
+    if (this._quarantined.has(name)) return true;
+    const tool = this._tools.get(name);
+    if (tool === undefined) return false;
+    this._tools.delete(name);
+    this._quarantined.set(name, { tool, reason, quarantinedAt: now });
+    return true;
+  }
+
+  /**
+   * Ops item 38 — re-admit a quarantined tool to the active catalog (its server
+   * passed a background probe). Returns true when a tool was restored, false
+   * when the name was not quarantined. A restore never collides with a live
+   * name because a live name can never have been quarantined (quarantine
+   * removed it from `_tools`, and `register()` refuses a quarantined name).
+   */
+  restore(name: string): boolean {
+    const entry = this._quarantined.get(name);
+    if (entry === undefined) return false;
+    this._quarantined.delete(name);
+    this._tools.set(name, entry.tool);
+    return true;
+  }
+
+  /** Ops item 38 — names of every currently-quarantined tool (for the runtime's
+   *  synthetic-notice injection + `crewhaus mcp doctor`). */
+  quarantinedNames(): ReadonlyArray<string> {
+    return [...this._quarantined.keys()];
+  }
+
+  /** Ops item 38 — is this tool currently quarantined? */
+  isQuarantined(name: string): boolean {
+    return this._quarantined.has(name);
+  }
+
+  /** Ops item 38 — the full quarantine record for a name (reason + timestamp),
+   *  or undefined when not quarantined. */
+  quarantineInfo(name: string): QuarantinedTool | undefined {
+    return this._quarantined.get(name);
   }
 }
 

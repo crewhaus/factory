@@ -290,6 +290,33 @@ describe("buildSecurityDigest — audit rollup", () => {
     expect(DECLARED_AUDIT_KINDS).toContain("alert_raised");
   });
 
+  // F6 — the ops-item-37 SLO monitor's `slo_mitigation` AuditKind must be a
+  // declared kind so a mitigation record (pause-intake / rollback) surfaces in
+  // the digest and is never reported "absent" once one lands in the window.
+  test("F6: an slo_mitigation audit record is counted and not reported absent", async () => {
+    await seedAudit([
+      {
+        kind: "slo_mitigation",
+        payload: {
+          sessionId: "sess_x",
+          rung: "rollback",
+          breach: {
+            metric: "ttft_ms",
+            observed: 2000,
+            target: 1400,
+            detail: "ttft_ms 2000ms exceeded SLO target 1400ms",
+          },
+          windowMs: 300_000,
+        },
+        atMs: NOW - MS_PER_DAY,
+      },
+    ]);
+    const d = buildSecurityDigest({ rootDir: root, window: window(7), now: () => NOW });
+    expect(d.audit.countsByKind).toEqual({ slo_mitigation: 1 });
+    expect(d.audit.absentDeclaredKinds).not.toContain("slo_mitigation");
+    expect(DECLARED_AUDIT_KINDS).toContain("slo_mitigation");
+  });
+
   test("F1 defense in depth: control chars in audit payload strings are stripped and clamped", async () => {
     await seedAudit([
       {

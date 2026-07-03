@@ -466,11 +466,15 @@ if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));`;
   // Item 27 — run-level spend cap + degradation ladder. Empty when the spec
   // omits `budget`, keeping pre-existing bundles byte-identical.
   const budgetField = renderBudgetField(ir);
+  // Item 37 — observability.slo → sloTargets, so a compiled bundle's chat loop
+  // attaches the SLO monitor (sensing + alert, gated by CREWHAUS_SLO). Empty
+  // when the spec omits the block.
+  const sloField = renderSloField(ir);
   const runChatLoopCall = `await runChatLoop({
   model: ${escapeJsonString(ir.agent.model)},
   instructions: ${escapeJsonString(ir.agent.instructions)},
   sessionName: ${escapeJsonString(ir.name)},
-  sessionTarget: "cli",${maxTokensField}${failoverFields}${failureTaxonomyField}${budgetField}${toolsField}${permField}${sandboxField}
+  sessionTarget: "cli",${maxTokensField}${failoverFields}${failureTaxonomyField}${budgetField}${sloField}${toolsField}${permField}${sandboxField}
   hooks: __hooks,
   skills: __skills,
   slashCommands: __slashCommands,${subAgents.subAgentsField}${subAgents.spawnField}${egress.field}${memory.field}
@@ -566,6 +570,25 @@ function renderFailureTaxonomyField(ir: IrV0): string {
 function renderBudgetField(ir: IrV0): string {
   if (ir.budget === undefined) return "";
   return `\n  budget: ${JSON.stringify(ir.budget)},`;
+}
+
+/**
+ * Ops item 37 — render the `sloTargets` runChatLoop field from
+ * `observability.slo`. The IR carries a numbers + literal-union object (no
+ * user-controlled strings — mitigation is a closed `alert|pause-intake|rollback`
+ * union), so `JSON.stringify` is safe. Emitting this makes a compiled CLI bundle
+ * attach the SLO monitor (gated at runtime by CREWHAUS_SLO) so SENSING + the
+ * `alert` rung are portable — parity with the interpreter's runRunCli. Empty
+ * when the spec omits the block, keeping pre-existing bundles byte-identical.
+ * NOTE: the destructive mitigation rungs (pause-intake / rollback) need an
+ * injected registry-backed sink, which a standalone CLI bundle has no way to
+ * build, so a compiled bundle degrades to alert-only; production pause/rollback
+ * mitigation runs in the CLI `run`/managed (registry-backed) context.
+ */
+function renderSloField(ir: IrV0): string {
+  const slo = ir.observability?.slo;
+  if (slo === undefined) return "";
+  return `\n  sloTargets: ${JSON.stringify(slo)},`;
 }
 
 /**

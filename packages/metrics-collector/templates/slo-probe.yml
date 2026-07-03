@@ -1,0 +1,67 @@
+# slo-probe.yml — scheduled SLO / TTFT probe TEMPLATE (ops item 37).
+#
+# This is a TEMPLATE, not an active workflow: copy it into your deployment
+# repository's `.github/workflows/` and edit the <PLACEHOLDER> comments.
+#
+# `crewhaus doctor --slo` compares the RECENT p95 time-to-first-token (from the
+# alert-watchdog's durable `.crewhaus/metrics/sessions.jsonl` history) against
+# the cwd spec's `observability.slo.ttft_ms` target. On a breach it exits 1 and
+# names faster candidate models to eval; within SLO (or with no history yet) it
+# exits 0. That exit code drives this cron: a red run is a paged SLO regression,
+# a green run is a healthy latency budget.
+#
+# For a CONTAINER rather than CI, the same probe is a HEALTHCHECK:
+#   HEALTHCHECK --interval=60s --timeout=10s CMD crewhaus doctor --slo || exit 1
+# (the SLO breach flaps the container health, so an orchestrator restarts /
+# reroutes off the slow replica). The runtime SLO MONITOR — gated by
+# CREWHAUS_SLO with a lowered `observability.slo` block — is the live, in-flight
+# half: it walks the declared `mitigation` ladder (alert → pause-intake →
+# rollback) DURING a run. This probe is the scheduled, out-of-band confirmation.
+#
+# Prerequisites:
+#   - A cwd `crewhaus.yaml` that declares an `observability.slo.ttft_ms` target,
+#     e.g.:
+#       observability:
+#         slo:
+#           ttft_ms: 1400
+#           p95_latency_ms: 8000
+#           error_rate: 0.05
+#           window_seconds: 300
+#           mitigation: [alert, pause-intake, rollback]
+#   - The runner can reach the harness `.crewhaus/metrics/sessions.jsonl` history
+#     (the agent writes it where it RUNS). On an ephemeral CI runner, restore it
+#     first (see the <STORE> step) — with NO history the probe reports "no data"
+#     and exits 0, so a fresh runner never false-pages.
+
+name: slo-probe
+
+on:
+  schedule:
+    # <CRON> Every 15 minutes. The probe is a read-only comparison — run it as
+    # often as your alerting cadence wants.
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # <STORE> Make the harness `.crewhaus/metrics/sessions.jsonl` available to
+      # this job (restore from object storage, mount a volume, or run on the host
+      # that owns it). Skip if this workflow already runs there. With no history
+      # the probe exits 0 (never false-pages a cold store).
+      # - name: Restore harness metrics history
+      #   run: aws s3 cp s3://<YOUR-BUCKET>/crewhaus-store.tgz . && tar -xpzf crewhaus-store.tgz
+
+      - name: Install crewhaus
+        # Any channel works: npm i -g crewhaus, brew install crewhaus/tap/crewhaus, ...
+        run: npm install -g crewhaus
+
+      - name: SLO / TTFT probe
+        # Exit 1 on a sustained p95-TTFT breach (fails the job → your alerting
+        # fires); exit 0 within SLO or with no history yet. On a breach the log
+        # names faster candidate models and the `crewhaus eval --models ...`
+        # command to confirm a swap holds quality before you change the spec.
+        run: crewhaus doctor --slo

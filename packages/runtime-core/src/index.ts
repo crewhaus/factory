@@ -91,10 +91,13 @@ import { attachIncidentCollector } from "./incident-collector";
 import {
   type AlertSink,
   type AttachedAdvisorPersistence,
+  type AttachedMcpStatsPersistence,
   attachAdvisorPersistence,
   attachDefaultSubscribers,
+  attachMcpStatsPersistence,
 } from "./observability";
 import { loadProjectMemory } from "./project-memory";
+import type { SloMitigationSink, SloTargets } from "./slo-monitor";
 import { type CliOutput, createCliOutput, isSpinnerEnabled } from "./spinner";
 
 /**
@@ -210,6 +213,25 @@ export {
   type AttachDefaultSubscribersOptions,
   attachDefaultSubscribers,
 } from "./observability";
+
+// Ops item 37 — SLO monitor seams re-exported so the CLI/codegen can build the
+// injected mitigation ladder (audit / pause-intake / rollback) it passes as
+// `RunChatLoopOptions.sloSink`, and the doctor probe can share the breach types.
+export {
+  type AttachedSloMonitor,
+  type AttachSloMonitorOptions,
+  type SloBreach,
+  type SloMitigationEvent,
+  type SloMitigationRung,
+  type SloMitigationSink,
+  type SloTargets,
+  type SloWindowMetrics,
+  DEFAULT_SLO_WINDOW_MS,
+  MIN_SLO_SAMPLES,
+  SloWindow,
+  attachSloMonitor,
+  detectSloBreaches,
+} from "./slo-monitor";
 
 // Ops item 32 — incident collector seams re-exported so the CLI can share the
 // raw-capture shape + trigger classifier with `incident collect`.
@@ -626,6 +648,17 @@ export type RunChatLoopOptions = {
   alertSink?: AlertSink;
   /** Item 31 — override the per-session metrics-history dir (tests/tenants). */
   alertMetricsDir?: string;
+  /**
+   * Ops item 37 — lowered `observability.slo` targets (gated by CREWHAUS_SLO).
+   * When supplied, the runtime SLO monitor folds live events into rolling
+   * windows and walks the declared mitigation ladder on a sustained breach.
+   * Omitted → no monitor (zero behaviour change). The CLI `run` path lowers
+   * the cwd spec's `observability.slo` block and wires the mitigation sink.
+   */
+  sloTargets?: SloTargets;
+  /** Item 37 — injected SLO mitigation ladder delivery (audit / pause-intake /
+   *  rollback), supplied by the CLI so runtime-core owns no deploy/gateway I/O. */
+  sloSink?: SloMitigationSink;
   /**
    * Ops item 32 — spec identity stamped into an auto-assembled incident
    * capture (gated by CREWHAUS_INCIDENTS). Absent → the capture records a null
@@ -1135,6 +1168,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   const subscribers = await attachDefaultSubscribers(bus, runContext, process.env, {
     ...(opts.alertSink !== undefined ? { alertSink: opts.alertSink } : {}),
     ...(opts.alertMetricsDir !== undefined ? { metricsDir: opts.alertMetricsDir } : {}),
+    ...(opts.sloTargets !== undefined ? { sloTargets: opts.sloTargets } : {}),
+    ...(opts.sloSink !== undefined ? { sloSink: opts.sloSink } : {}),
   });
 
   // Ops item 32 — auto-assemble an incident bundle on the first failure-class
@@ -1329,6 +1364,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // offline. DEFAULT-ON (the lines are tiny and they are the advisor's
   // food); disable with CREWHAUS_ADVISOR_EVENTS=0. See observability.ts.
   const advisorPersist = attachAdvisorPersistence(bus, eventLog, runContext);
+
+  // Ops item 38 — persist the trace-bus-only `mcp_call_end` events into the
+  // session JSONL as the durable `mcp_stats` kind so `crewhaus mcp doctor` can
+  // score per-server MCP health offline. Shares the advisor's DEFAULT-ON gate
+  // (CREWHAUS_ADVISOR_EVENTS=0 disables both). See observability.ts.
+  const mcpStatsPersist = attachMcpStatsPersistence(bus, eventLog, runContext);
 
   // Per-run state container — coordination surface for hooks/skills/tools
   // landing in Section 11+. Section 10 only ships the plumbing; the
@@ -2910,6 +2951,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       incidentCollector?.unsubscribe();
       budgetMeter?.unsubscribe();
       advisorPersist?.unsubscribe();
+      mcpStatsPersist?.unsubscribe();
       printAdvisorDigest(advisorPersist);
       await sessionStore
         .update(sessionId, { lastTurnIndex: runContext.turnNumber })
@@ -3142,6 +3184,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     incidentCollector?.unsubscribe();
     budgetMeter?.unsubscribe();
     advisorPersist?.unsubscribe();
+    mcpStatsPersist?.unsubscribe();
     printAdvisorDigest(advisorPersist);
     if (shouldInstallSigint) {
       process.removeListener("SIGINT", sigintHandler);

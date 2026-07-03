@@ -209,6 +209,18 @@ export type CreateGatewayServerOptions = {
    * every tenant budget by N.
    */
   readonly budgetStore?: BudgetStore;
+  /**
+   * Ops item 37 — the SLO intake gate. Consulted at request admission (BEFORE
+   * the budget reservation): when it returns `{ paused: true }`, the request is
+   * refused down the SAME `429 budget_exceeded` path used for budget overruns,
+   * so an operator (or the SLO monitor's `pause-intake` rung, which flips the
+   * durable `.crewhaus/slo/intake.json` file this reader watches) can shed load
+   * on a sustained SLO breach. A resumed gate (`paused:false`) admits normally.
+   * Default: undefined ⇒ never paused (behaviour-preserving). Synchronous +
+   * cheap — the file-backed reader caches with a short TTL so admission stays
+   * hot.
+   */
+  readonly intakeGate?: () => { readonly paused: boolean; readonly reason?: string };
 };
 
 export type UsageDelta = {
@@ -276,6 +288,19 @@ export function createGatewayServer(opts: CreateGatewayServerOptions): GatewaySe
       const tenant = tenantFor(claims);
       const decoded = decodeRequest(envelope);
       id = decoded.id;
+      // Ops item 37 — SLO intake gate. When the durable gate is paused (an
+      // operator or the SLO monitor's `pause-intake` rung on a sustained
+      // breach), shed the request down the SAME 429 `budget_exceeded` path used
+      // for budget overruns. Checked AFTER auth (so a bad token still 401s) and
+      // BEFORE the budget reservation (so we don't reserve/release for a request
+      // we're about to refuse). The `budget exceeded` prefix routes it to
+      // ErrorCode.BudgetExceeded in the catch below.
+      const gate = opts.intakeGate?.();
+      if (gate?.paused === true) {
+        throw new GatewayServerError(
+          `budget exceeded: intake paused (SLO)${gate.reason !== undefined ? ` — ${gate.reason}` : ""}`,
+        );
+      }
       // Atomically reserve the estimated cost against recorded + in-flight
       // usage (the store refuses when the total would exceed the budget on
       // either dimension) — then release once the request finishes (actual

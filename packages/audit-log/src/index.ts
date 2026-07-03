@@ -147,7 +147,14 @@ export type AuditKind =
   // itself tamper-evidenced. Payload shape (opaque JSON; see the AlertSink the
   // CLI `run` path wires): { sessionId, metric, observed, threshold,
   //   baselineSessions, detail }.
-  | "alert_raised";
+  | "alert_raised"
+  // Ops item 37 — the SLO monitor (CREWHAUS_SLO) appends one record per
+  // ATTEMPTED mitigation rung (alert / pause-intake / rollback) on a sustained
+  // SLO breach, so the mitigation history — including an auto-rollback of a
+  // deployment pin — is itself tamper-evidenced. Payload shape (opaque JSON;
+  // see the SloMitigationSink the CLI `run` path wires): { sessionId, rung,
+  //   breach: { metric, observed, target, detail }, windowMs }.
+  | "slo_mitigation";
 
 export type AuditRecord = {
   readonly ts: number;

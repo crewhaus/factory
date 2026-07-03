@@ -348,6 +348,64 @@ describe("budget enforcement", () => {
   });
 });
 
+describe("SLO intake gate (ops item 37)", () => {
+  function gatedServer(gate: () => { paused: boolean; reason?: string }) {
+    const tenantA = buildTenant("tenant-a", { tenantsRoot: tmp });
+    return createGatewayServer({
+      jwtSecret: SECRET,
+      tenantsRoot: tmp,
+      handler: async () => ({ ok: true }),
+      tenantOverrides: { "tenant-a": tenantA },
+      intakeGate: gate,
+    });
+  }
+  const req = (server: ReturnType<typeof createGatewayServer>) =>
+    server.handle({
+      bearer: signJwt({ tenant_id: "tenant-a" }, SECRET),
+      body: {
+        protocol: "crewhaus.v1",
+        id: "1",
+        method: "runs.create",
+        params: { spec: "s", input: "hi" },
+      },
+    });
+
+  test("paused intake → request refused down the 429 budget_exceeded path", async () => {
+    const server = gatedServer(() => ({ paused: true, reason: "SLO breach: ttft_ms" }));
+    const res = await req(server);
+    expect(res).toMatchObject({
+      error: { code: "budget_exceeded", message: expect.stringMatching(/intake paused \(SLO\)/) },
+    });
+    expect(statusFor("budget_exceeded")).toBe(429);
+  });
+
+  test("resumed (cleared) intake → request admitted normally", async () => {
+    const server = gatedServer(() => ({ paused: false }));
+    const res = await req(server);
+    expect(res).toMatchObject({ id: "1", result: { ok: true } });
+  });
+
+  test("a paused gate refuses BEFORE reserving budget (a bad token still 401s first)", async () => {
+    const server = gatedServer(() => ({ paused: true }));
+    // Unauthenticated: auth runs before the gate, so this is 401, not 429.
+    const res = await server.handle({
+      body: {
+        protocol: "crewhaus.v1",
+        id: "1",
+        method: "runs.create",
+        params: { spec: "s", input: "" },
+      },
+    });
+    expect(res).toMatchObject({ error: { code: "unauthorized" } });
+  });
+
+  test("no gate configured → admits (behaviour-preserving)", async () => {
+    const { server } = makeServer();
+    const res = await req(server);
+    expect(res).not.toMatchObject({ error: { code: "budget_exceeded" } });
+  });
+});
+
 describe("tenancy isolation", () => {
   test("tenant-a's tokens never resolve to tenant-b's context", async () => {
     let seen: string | undefined;

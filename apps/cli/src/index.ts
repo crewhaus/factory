@@ -601,6 +601,21 @@ import {
   installedVersions,
   resolveRegistryRef as resolveMarketplaceRegistryRef,
 } from "./marketplace-cli";
+// Item 38 — `crewhaus mcp doctor` core: per-server health scoring, listTools
+// drift diff, quarantine decision — in a side-effect-free module (this entry
+// file runs an argv switch on import) mirroring doctor-checks.ts.
+import {
+  type McpServerSnapshot,
+  type McpStatsPayload,
+  buildSnapshot,
+  decideQuarantine,
+  diffSnapshots,
+  formatDriftReport,
+  formatHealthReport,
+  quarantineNotice,
+  safeMcpFileName,
+  scoreMcpHealth,
+} from "./mcp-doctor";
 // Item 24 — market scan + doctor --models + pricing sync core, in a
 // side-effect-free module (this entry file runs an argv switch on import).
 import {
@@ -798,6 +813,11 @@ import {
 } from "./security-digest";
 // Item #57 — summarize sessions into a durable index before TTL eviction.
 import { SESSIONS_INDEX_DIRNAME, summarizeSessionIntoIndex } from "./sessions-index";
+// Item 37 — SLO/TTFT doctor probe + mitigation-ladder sink, in side-effect-free
+// modules (this entry file runs an argv switch on import) mirroring
+// doctor-checks.ts / alert-sink.ts.
+import { runSloProbe } from "./slo-doctor";
+import { buildSloSink, intakeGatePayload, lastKnownGoodFromAuditRecords } from "./slo-sink";
 // Item 69 — `crewhaus state backup|restore` core (tarball snapshot of the
 // cwd `.crewhaus` state dir + full/merge restore), in a module with no
 // import-time side effects so it is unit-testable (this entry file runs an
@@ -967,6 +987,10 @@ const RUN_SCHEMA: ParseArgsSchema = {
     // `.crewhaus/preferences/<user>.md` is injected at run start (alongside
     // the auto-loaded LESSONS.md). Flag > CREWHAUS_USER env.
     { name: "user", takesValue: true },
+    // Item 38 — opt out of the MCP auto-quarantine: register even the tools of
+    // servers `crewhaus mcp doctor` marked chronically failing in
+    // `.crewhaus/mcp/quarantine.json` (default: withdraw them + inject a notice).
+    { name: "no-mcp-quarantine", takesValue: false },
     { name: "help", short: "h" },
   ],
 };
@@ -1071,6 +1095,11 @@ const DOCTOR_SCHEMA: ParseArgsSchema = {
     // Item 24 — model advisory: flag spec models missing from the pricing
     // table (silently billed $0), pricing-table staleness, and known sunsets.
     { name: "models", takesValue: false },
+    // Item 37 — SLO/TTFT probe: compare recent p95 TTFT vs the cwd spec's
+    // observability.slo.ttft_ms and name faster candidates on a breach.
+    // Container-HEALTHCHECK exit semantics (0 within/no-data, 1 breach).
+    { name: "slo", takesValue: false },
+    { name: "ttft", takesValue: false },
     { name: "help", short: "h" },
   ],
 };
@@ -1593,6 +1622,19 @@ const SANDBOX_SCHEMA: ParseArgsSchema = {
   ],
 };
 
+// Item 38 — `crewhaus mcp doctor [--probe]`: per-server health scoring, drift
+// watch, runtime auto-quarantine decision.
+const MCP_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // Live `listTools` probe for drift watch (offline without it, scoring only).
+    { name: "probe", takesValue: false },
+    { name: "format", takesValue: true },
+    // How many most-recent sessions to score (default 20).
+    { name: "sessions", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
 const COMPLIANCE_SCHEMA: ParseArgsSchema = {
   flags: [
     { name: "framework", takesValue: true },
@@ -2067,6 +2109,8 @@ function usageText(): string {
     "  federation discover <deployment>     resolve a federated peer's endpoint + cert fingerprint (Section 34)",
     "       [--srv-domain <d>] [--format json|yaml]",
     "  sandbox doctor [--probe]             list registered sandbox images + healthcheck status (Section 36)",
+    "       [--format json|table]",
+    "  mcp doctor [--probe]                 per-server MCP health scoring, drift watch, auto-quarantine (item 38)",
     "       [--format json|table]",
     "  compliance evidence                  collect SOC 2 / ISO 27001 / HIPAA evidence (Section 39)",
     "       (--framework <id> | --all-frameworks) [--control <id>]",
@@ -3718,6 +3762,9 @@ async function runRunCli(
   // tools alongside the built-ins. Mirror of the codegen path in
   // @crewhaus/target-cli (renderMcpServers); keep them in sync.
   let mcpHost: McpHost | undefined;
+  // Item 38 — synthetic notice appended to the agent instructions when the MCP
+  // auto-quarantine withdraws a server's tools (built in the block below).
+  let mcpQuarantineNotice: string | undefined;
   if (Object.keys(ir.mcp_servers).length > 0) {
     const host = new McpHost({ logger });
     mcpHost = host;
@@ -3734,6 +3781,41 @@ async function runRunCli(
       ),
     );
     tools = tempCatalog.list().slice();
+
+    // Item 38 — runtime auto-quarantine. `crewhaus mcp doctor` persists the set
+    // of chronically-failing servers to `.crewhaus/mcp/quarantine.json`; here we
+    // withdraw those servers' namespaced (`<server>__<tool>`) tools from the
+    // catalog so the model can't call them, and append a synthetic notice to the
+    // instructions (mirroring loop-detection's warning injection) so the model
+    // routes around them. Opt out with --no-mcp-quarantine. Auto-restore is
+    // implicit: once `mcp doctor` clears a server from the set (a probe / recent
+    // session showed it healthy), the next run registers its tools normally.
+    if (args.flags["no-mcp-quarantine"] !== true) {
+      const quarantinePath = join(process.cwd(), ".crewhaus", "mcp", "quarantine.json");
+      let quarantinedServers: string[] = [];
+      if (existsSync(quarantinePath)) {
+        try {
+          const parsed = JSON.parse(readFileSync(quarantinePath, "utf-8")) as { servers?: unknown };
+          if (Array.isArray(parsed.servers)) {
+            quarantinedServers = parsed.servers.filter(
+              (s): s is string => typeof s === "string" && s in ir.mcp_servers,
+            );
+          }
+        } catch {
+          // corrupt gate — ignore (never fail a run on a bad quarantine file).
+        }
+      }
+      if (quarantinedServers.length > 0) {
+        const prefixes = quarantinedServers.map((s) => `${s}__`);
+        tools = tools.filter((t) => !prefixes.some((p) => t.name.startsWith(p)));
+        mcpQuarantineNotice = quarantinedServers
+          .map((s) => quarantineNotice(s, "flagged chronically failing by `crewhaus mcp doctor`"))
+          .join("\n");
+        process.stdout.write(
+          `[mcp] quarantined ${quarantinedServers.length} server(s): ${quarantinedServers.join(", ")} — pass --no-mcp-quarantine to override\n`,
+        );
+      }
+    }
   }
 
   const modelOverride = args.flags["model"];
@@ -3865,6 +3947,141 @@ async function runRunCli(
     });
   }
 
+  // Item 37 — SLO monitor targets + mitigation ladder. Targets come from the
+  // lowered `observability.slo` block; the monitor itself is gated inside
+  // runtime-core by CREWHAUS_SLO. Here we build its injected mitigation sink:
+  //   - audit        → the same .crewhaus/audit hash chain the alert sink uses;
+  //   - alert        → reuses the settings.json alert hook / webhook;
+  //   - pause-intake → flips the durable .crewhaus/slo/intake.json gate the
+  //                    gateway/managed daemon reads for its 429 budget_exceeded
+  //                    path (only meaningful for those shapes; harmless else);
+  //   - rollback     → auto-rollback the "prod" env pin via the deployment-
+  //                    controller when the cwd carries a spec-registry.
+  // Only opened when CREWHAUS_SLO is set AND the spec declared SLO targets.
+  const sloEnabled = process.env["CREWHAUS_SLO"] === "1" || process.env["CREWHAUS_SLO"] === "true";
+  const sloIr = (ir as { observability?: { slo?: import("@crewhaus/runtime-core").SloTargets } })
+    .observability?.slo;
+  let sloTargets: import("@crewhaus/runtime-core").SloTargets | undefined;
+  let sloSink: ReturnType<typeof buildSloSink>;
+  if (sloEnabled && sloIr !== undefined) {
+    sloTargets = sloIr;
+    const { openAuditLog } = await import("@crewhaus/audit-log");
+    const sloAudit = await openAuditLog({ rootDir: join(cwd, ".crewhaus", "audit") });
+    // Read alerts.webhook again (independent best-effort; same source as alerts).
+    let webhookUrl: string | undefined;
+    const settingsPath = join(cwd, ".crewhaus", "settings.json");
+    if (existsSync(settingsPath)) {
+      try {
+        webhookUrl = alertWebhookFromSettings(JSON.parse(readFileSync(settingsPath, "utf-8")));
+      } catch {
+        // ignore — surfaced elsewhere.
+      }
+    }
+    const alertHooks = hooks.filter((h) => h.event === "alert");
+    const wantsAlert = sloTargets.mitigation.includes("alert");
+    const wantsPause = sloTargets.mitigation.includes("pause-intake");
+    const wantsRollback = sloTargets.mitigation.includes("rollback");
+    sloSink = buildSloSink({
+      audit: sloAudit,
+      ...(wantsAlert
+        ? {
+            alert: async (event): Promise<void> => {
+              const payload = { ...event.breach, sessionId: event.sessionId, rung: event.rung };
+              if (alertHooks.length > 0) {
+                await runHooks("alert", payload, alertHooks, { matcherKey: "metric" });
+              }
+              if (webhookUrl !== undefined) {
+                try {
+                  await fetch(webhookUrl, {
+                    method: "POST",
+                    headers: { "content-type": "application/json" },
+                    body: JSON.stringify(payload),
+                  });
+                } catch (err) {
+                  process.stderr.write(
+                    `[slo] alert webhook failed: ${err instanceof Error ? err.message : String(err)}\n`,
+                  );
+                }
+              }
+            },
+          }
+        : {}),
+      ...(wantsPause
+        ? {
+            pauseIntake: async (paused, reason): Promise<void> => {
+              const gatePath = join(cwd, ".crewhaus", "slo", "intake.json");
+              mkdirSync(dirname(gatePath), { recursive: true });
+              writeFileSync(
+                gatePath,
+                `${JSON.stringify(intakeGatePayload(paused, reason), null, 2)}\n`,
+              );
+              process.stderr.write(
+                `[slo] intake ${paused ? "PAUSED" : "resumed"} → ${gatePath} (${reason})\n`,
+              );
+            },
+          }
+        : {}),
+      ...(wantsRollback
+        ? {
+            rollback: async (event): Promise<void> => {
+              // Auto-rollback the "prod" env pin to the prior version via the
+              // deployment-controller. Requires a cwd spec-registry; degrades to
+              // an audited no-op (a warning) when none exists.
+              const specRootDir = join(cwd, ".crewhaus", "spec-registry");
+              if (!existsSync(specRootDir)) {
+                process.stderr.write(
+                  "[slo] rollback requested but no .crewhaus/spec-registry — skipping (alert/pause-intake still applied)\n",
+                );
+                return;
+              }
+              const { createFileBackedRegistry } = await import("@crewhaus/spec-registry");
+              const { createDeploymentController } = await import(
+                "@crewhaus/deployment-controller"
+              );
+              const registry = createFileBackedRegistry({ rootDir: specRootDir });
+              const current = await registry.aliasFor(ir.name, "prod");
+              // LAST-KNOWN-GOOD, not a lexicographic guess: the version that was
+              // pinned to prod immediately BEFORE `current`, read from the
+              // deployment-controller's `deployment_action` audit history. A
+              // lexicographic sort would pick e.g. v2 out of [v1,v2,v9,v10] as
+              // "the last non-current version" and roll production back to an
+              // arbitrary/ancient release. Never guess when flipping a prod pin.
+              const prior = lastKnownGoodFromAuditRecords(
+                readAuditRecords(),
+                ir.name,
+                "prod",
+                current,
+              );
+              if (prior === undefined) {
+                process.stderr.write(
+                  "[slo] rollback: no recorded last-known-good predecessor in deployment_action history — skipping (refusing to guess a prod pin; alert/pause-intake still applied)\n",
+                );
+                return;
+              }
+              // Guard: the predecessor must still exist in the registry (a
+              // deleted version can't be re-pinned; the controller would throw).
+              const versions = await registry.list(ir.name);
+              if (!versions.includes(prior)) {
+                process.stderr.write(
+                  `[slo] rollback: last-known-good ${prior} no longer in registry — skipping\n`,
+                );
+                return;
+              }
+              const controller = createDeploymentController({
+                registry,
+                auditLog: sloAudit,
+                actor: "slo-monitor",
+              });
+              await controller.rollback(ir.name, "prod", prior);
+              process.stderr.write(
+                `[slo] auto-rolled-back ${ir.name} prod → ${prior} (last-known-good; SLO breach: ${event.breach.detail})\n`,
+              );
+            },
+          }
+        : {}),
+    });
+  }
+
   // Feature #53 — first-class `memory:` block. Its presence wires Remember/
   // Recall into the tool list (no hand-editing) and — via the auto-* switches
   // — the runtime's auto-recall (system-prompt injection) and auto-capture
@@ -3981,7 +4198,10 @@ async function runRunCli(
   try {
     await runChatLoop({
       model,
-      instructions: ir.agent.instructions,
+      instructions:
+        mcpQuarantineNotice !== undefined
+          ? `${ir.agent.instructions}\n\n${mcpQuarantineNotice}`
+          : ir.agent.instructions,
       tools,
       permissionMode,
       permissionRules,
@@ -4030,6 +4250,10 @@ async function runRunCli(
       ...(egressAuditSink !== undefined ? { egressAuditSink } : {}),
       ...(egressMatcher !== undefined ? { egressMatcher } : {}),
       ...(alertSink !== undefined ? { alertSink } : {}),
+      // Item 37 — SLO monitor targets + injected mitigation ladder (gated by
+      // CREWHAUS_SLO inside runtime-core).
+      ...(sloTargets !== undefined ? { sloTargets } : {}),
+      ...(sloSink !== undefined ? { sloSink } : {}),
       // Item 32 — stamp the spec name into any auto-assembled incident capture
       // (gated by CREWHAUS_INCIDENTS inside runtime-core).
       incidentSpec: { name: ir.name },
@@ -4306,6 +4530,10 @@ async function runDoctor(args: ParsedArgs): Promise<void> {
         "  --accept-baseline        promote the current findings to the accepted baseline\n" +
         "  --liveness               process-liveness probe: exit 0 immediately, no credential or\n" +
         "                           spec checks (for container HEALTHCHECKs / k8s exec probes)\n" +
+        "  --slo | --ttft           compare recent p95 TTFT (.crewhaus/metrics/sessions.jsonl)\n" +
+        "                           against the cwd spec's observability.slo.ttft_ms; on a breach,\n" +
+        "                           name faster candidate models to eval. Exit 1 on breach, else 0\n" +
+        "                           (container-HEALTHCHECK / k8s exec-probe semantics)\n" +
         "  --context-pressure       report truncation recoveries, compaction fires per session\n" +
         "                           (snip vs autocompact split), and the cwd spec's max_tokens/\n" +
         "                           compaction knobs over the last N sessions (--sessions N,\n" +
@@ -4348,6 +4576,10 @@ async function runDoctor(args: ParsedArgs): Promise<void> {
   }
   if (args.flags["models"]) {
     runDoctorModels();
+    return;
+  }
+  if (args.flags["slo"] || args.flags["ttft"]) {
+    await runDoctorSlo();
     return;
   }
   if (args.flags["detect"]) {
@@ -4572,6 +4804,44 @@ async function runPricing(args: ParsedArgs, action: string): Promise<void> {
   process.stdout.write(
     `  ${providers} provider table(s); the newest dated feed here now overrides DEFAULT_PRICING\n`,
   );
+}
+
+/**
+ * Item 37 — `crewhaus doctor --slo` (alias `--ttft`): the latency/TTFT half of
+ * the SLO feature. Reads the cwd spec's lowered `observability.slo.ttft_ms` +
+ * agent model, compares the RECENT p95 TTFT (from the alert-watchdog's durable
+ * `.crewhaus/metrics/sessions.jsonl`) against the target, and on a breach names
+ * faster candidate models to eval. Exits with the probe's code so it composes
+ * with `doctor --liveness`'s container-HEALTHCHECK semantics (0 within SLO / no
+ * data, 1 breach). The heavy lifting lives in slo-doctor.ts (side-effect-free).
+ */
+async function runDoctorSlo(): Promise<void> {
+  const cwd = process.cwd();
+  const specPath = join(cwd, "crewhaus.yaml");
+  let ttftTargetMs: number | undefined;
+  let currentModel: string | undefined;
+  if (existsSync(specPath)) {
+    try {
+      const ir = lower(parseSpec(readFileSync(specPath, "utf-8")));
+      const obs = (ir as { observability?: { slo?: { ttftMs?: number } } }).observability;
+      ttftTargetMs = obs?.slo?.ttftMs;
+      const agent = (ir as { agent?: { model?: unknown } }).agent;
+      if (agent !== undefined && typeof agent.model === "string") currentModel = agent.model;
+    } catch {
+      // A non-parseable / non-agent spec leaves the probe with no target — it
+      // then reports "nothing declared" and exits 0 (never fails on spec shape).
+    }
+  }
+  const sessionsPath = join(cwd, ".crewhaus", "metrics", "sessions.jsonl");
+  const sessionsJsonl = existsSync(sessionsPath) ? readFileSync(sessionsPath, "utf-8") : "";
+  const result = runSloProbe({
+    ttftTargetMs,
+    currentModel,
+    sessionsJsonl,
+    pricing: loadUserPricing(),
+  });
+  for (const line of result.lines) process.stdout.write(`${line}\n`);
+  process.exit(result.exitCode);
 }
 
 /**
@@ -12709,6 +12979,217 @@ async function runCompliance(args: ParsedArgs, action: string): Promise<void> {
 }
 
 /**
+ * Ops item 38 — `crewhaus mcp doctor [--probe]`. Three capabilities, all over
+ * the cwd harness's on-disk stores (mirroring `sandbox doctor` / `retention`):
+ *
+ *   1. HEALTH SCORING — fold the durable `mcp_stats` records from the N most
+ *      recent session logs (`.crewhaus/sessions/*.jsonl`) into per-server
+ *      error-rate / latency / chronic-failure verdicts. mcp_call_* events are
+ *      trace-bus-only, so this durable mirror (runtime-core, default-on with
+ *      the advisor events) is the only cross-session history there is.
+ *
+ *   2. DRIFT WATCH (`--probe`) — connect to each configured MCP server, list
+ *      its tools, and diff the (name + schema-hash) snapshot against the last
+ *      one on disk (`.crewhaus/mcp/<server>.json`), reporting added / removed /
+ *      schema-changed tools BEFORE a production call fails. Offline (no
+ *      `--probe`) it scores health only.
+ *
+ *   3. AUTO-QUARANTINE — persist the chronic/recovered verdicts to
+ *      `.crewhaus/mcp/quarantine.json`; the runtime reads that set and withdraws
+ *      those servers' tools from the ToolCatalog (injecting a synthetic notice
+ *      so the model routes around them), restoring them once healthy again.
+ *
+ * Exit semantics mirror `sandbox doctor --probe`: exit 1 when any server is
+ * chronically failing OR (with `--probe`) drift was detected, so a CI cron
+ * gates on MCP health; else exit 0. `--liveness`-style: a cold store (no
+ * history) is exit 0, never a flap.
+ */
+async function runMcpDoctor(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage:\n" +
+        "  crewhaus mcp doctor [--probe] [--format json|table] [--sessions N]\n" +
+        "  --probe          connect to each configured MCP server + diff listTools against\n" +
+        "                   the last .crewhaus/mcp/<server>.json snapshot (drift watch)\n" +
+        "  --sessions N     score the N most-recent session logs (default 20)\n" +
+        "  --format         table (default) | json\n" +
+        "  Exit 1 on a chronically-failing server or detected drift; else 0.\n",
+    );
+    return;
+  }
+  const cwd = process.cwd();
+  const formatFlag = args.flags["format"];
+  const format = typeof formatFlag === "string" ? formatFlag : "table";
+  if (format !== "json" && format !== "table") {
+    die(`--format must be "json" or "table" (got "${format}")`);
+  }
+  const limit = intFlag(args, "sessions") ?? 20;
+  if (limit < 1) die(`invalid --sessions "${args.flags["sessions"]}" — must be a positive integer`);
+  const wantProbe = args.flags["probe"] === true;
+
+  // 1. Health scoring — read mcp_stats from the N most-recent session logs.
+  const sessionsDir = join(cwd, ".crewhaus", "sessions");
+  const files = existsSync(sessionsDir)
+    ? readdirSync(sessionsDir).filter((f) => f.endsWith(".jsonl"))
+    : [];
+  const recent = files
+    .map((f) => {
+      const file = join(sessionsDir, f);
+      return { file, mtimeMs: statSync(file).mtimeMs };
+    })
+    .sort((a, b) => b.mtimeMs - a.mtimeMs)
+    .slice(0, limit)
+    // Re-sort ASCENDING by mtime so records fold in chronological order (the
+    // consecutive-error-streak proxy depends on order).
+    .sort((a, b) => a.mtimeMs - b.mtimeMs);
+  const statsRecords: McpStatsPayload[] = [];
+  for (const r of recent) {
+    for (const obj of parseAdviseJsonl(readFileSync(r.file, "utf-8"))) {
+      const rec = obj as { kind?: unknown; payload?: unknown };
+      if (rec.kind !== "mcp_stats") continue;
+      const p = rec.payload as Partial<McpStatsPayload>;
+      if (typeof p.server === "string" && typeof p.toolName === "string") {
+        statsRecords.push({
+          server: p.server,
+          toolName: p.toolName,
+          durationMs: typeof p.durationMs === "number" ? p.durationMs : 0,
+          isError: p.isError === true,
+        });
+      }
+    }
+  }
+  const health = scoreMcpHealth(statsRecords);
+
+  // Load the current quarantine set (persisted across runs).
+  const mcpDir = join(cwd, ".crewhaus", "mcp");
+  const quarantinePath = join(mcpDir, "quarantine.json");
+  let quarantined: string[] = [];
+  if (existsSync(quarantinePath)) {
+    try {
+      const parsed = JSON.parse(readFileSync(quarantinePath, "utf-8")) as { servers?: unknown };
+      if (Array.isArray(parsed.servers)) {
+        quarantined = parsed.servers.filter((s): s is string => typeof s === "string");
+      }
+    } catch {
+      // corrupt gate — treat as empty (never crash the doctor on a bad file).
+    }
+  }
+  const decision = decideQuarantine(health, quarantined);
+
+  // 2. Drift watch (--probe): connect to each configured server + diff listTools.
+  type DriftEntry = { server: string; lines: string[] };
+  const driftEntries: DriftEntry[] = [];
+  let driftDetected = false;
+  if (wantProbe) {
+    const specPath = join(cwd, "crewhaus.yaml");
+    let mcpServers: Record<string, import("@crewhaus/mcp-host").McpServerConfig> = {};
+    if (existsSync(specPath)) {
+      try {
+        const ir = lower(parseSpec(readFileSync(specPath, "utf-8")));
+        mcpServers = (ir as { mcp_servers?: typeof mcpServers }).mcp_servers ?? {};
+      } catch {
+        // no/broken spec — nothing to probe (health scoring still ran above).
+      }
+    }
+    if (Object.keys(mcpServers).length > 0) {
+      mkdirSync(mcpDir, { recursive: true });
+      const host = new McpHost({ logger });
+      for (const [name, cfg] of Object.entries(mcpServers)) host.addServer(name, cfg);
+      const nowIso = new Date().toISOString();
+      await Promise.all(
+        Object.keys(mcpServers).map(async (name) => {
+          const lines: string[] = [];
+          try {
+            const client = host.getClient(name);
+            await client.connect();
+            const tools = await client.listTools();
+            const snapshot = buildSnapshot(
+              name,
+              tools.map((t) => ({ name: t.name, inputSchema: t.inputSchema })),
+              nowIso,
+            );
+            // F5 — the server name is an mcp_servers KEY (schema is
+            // z.string().min(1), not safeName), so `../../evil` would escape
+            // .crewhaus/mcp/. Sanitise to a bare filename segment before joining.
+            const snapshotPath = join(mcpDir, `${safeMcpFileName(name)}.json`);
+            let previous: McpServerSnapshot | undefined;
+            if (existsSync(snapshotPath)) {
+              try {
+                previous = JSON.parse(readFileSync(snapshotPath, "utf-8")) as McpServerSnapshot;
+              } catch {
+                previous = undefined;
+              }
+            }
+            const drift = diffSnapshots(previous, snapshot);
+            const driftLines = formatDriftReport(name, drift);
+            if (driftLines.length > 0) {
+              driftDetected = true;
+              lines.push(...driftLines);
+            }
+            // Persist the fresh snapshot as the new baseline.
+            writeFileSync(snapshotPath, `${JSON.stringify(snapshot, null, 2)}\n`);
+          } catch (err) {
+            lines.push(
+              `  ✗ ${name}: probe failed — ${err instanceof Error ? err.message : String(err)}`,
+            );
+            driftDetected = true;
+          }
+          driftEntries.push({ server: name, lines });
+        }),
+      );
+      await host.disconnectAll();
+    }
+  }
+
+  // Persist the updated quarantine set (chronic added, recovered removed).
+  const nextQuarantined = new Set(quarantined);
+  for (const s of decision.quarantine) nextQuarantined.add(s);
+  for (const s of decision.restore) nextQuarantined.delete(s);
+  if (decision.quarantine.length > 0 || decision.restore.length > 0) {
+    mkdirSync(mcpDir, { recursive: true });
+    writeFileSync(
+      quarantinePath,
+      `${JSON.stringify({ version: 1, servers: [...nextQuarantined].sort(), ts: Date.now() }, null, 2)}\n`,
+    );
+  }
+
+  // Render.
+  const anyChronic = health.some((h) => h.chronic);
+  if (format === "json") {
+    process.stdout.write(
+      `${JSON.stringify(
+        {
+          health,
+          quarantine: decision,
+          quarantined: [...nextQuarantined].sort(),
+          ...(wantProbe ? { driftDetected, drift: driftEntries } : {}),
+        },
+        null,
+        2,
+      )}\n`,
+    );
+  } else {
+    for (const line of formatHealthReport(health)) process.stdout.write(`${line}\n`);
+    if (wantProbe) {
+      const withDrift = driftEntries.filter((d) => d.lines.length > 0);
+      if (withDrift.length === 0) process.stdout.write("no tool drift detected\n");
+      for (const d of withDrift) for (const l of d.lines) process.stdout.write(`${l}\n`);
+    }
+    for (const s of decision.quarantine) {
+      const h = health.find((x) => x.server === s);
+      process.stdout.write(
+        `${quarantineNotice(s, `${((h?.errorRate ?? 0) * 100).toFixed(0)}% errors over ${h?.calls ?? 0} calls`)}\n`,
+      );
+    }
+    for (const s of decision.restore) {
+      process.stdout.write(`[mcp] server "${s}" recovered — tools restored\n`);
+    }
+  }
+  // Exit 1 on a chronic server or (probe mode) detected drift; else 0.
+  process.exit(anyChronic || (wantProbe && driftDetected) ? 1 : 0);
+}
+
+/**
  * Section 36 — `crewhaus sandbox <action>`. Single action today: `doctor`.
  *   doctor              list registered sandbox images + healthcheck status
  *
@@ -14485,6 +14966,19 @@ switch (subcommand) {
       die(`sandbox action must be "doctor" (got "${action}")`);
     }
     await runSandbox(parseFor(rest.slice(1), SANDBOX_SCHEMA), action);
+    break;
+  }
+  case "mcp": {
+    const action = rest[0] ?? "";
+    if (action !== "doctor") {
+      die(`mcp action must be "doctor" (got "${action}")`);
+    }
+    try {
+      await runMcpDoctor(parseFor(rest.slice(1), MCP_SCHEMA));
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
     break;
   }
   case "compliance": {
