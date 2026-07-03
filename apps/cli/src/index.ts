@@ -429,6 +429,28 @@ import {
   suggestSafeName,
   suggestSecretFix,
 } from "./lint";
+// Item 60 — the marketplace CLI core: registry-source resolution, the
+// outdated freshness compare, list/outdated formatters, and the publish PR
+// plan, in a side-effect-free module so it is unit-testable (this entry file
+// runs an argv switch on import). Network is behind an injected fetch seam.
+import {
+  MarketplaceCliError,
+  type OutdatedRow,
+  type PublishDraftLike,
+  type PublishPrDriver,
+  type PublishPrPlan,
+  buildPublishPrPlan,
+  computeOutdated,
+  createHttpModuleRegistrySource,
+  createLocalModuleRegistrySource,
+  defaultPluginRegistryPath,
+  defaultPluginsDir,
+  defaultTemplateWorkspaceDir,
+  formatOutdated,
+  formatPluginList,
+  installedVersions,
+  resolveRegistryRef as resolveMarketplaceRegistryRef,
+} from "./marketplace-cli";
 // Item 24 — market scan + doctor --models + pricing sync core, in a
 // side-effect-free module (this entry file runs an argv switch on import).
 import {
@@ -951,6 +973,42 @@ const FLYWHEEL_SCHEMA: ParseArgsSchema = {
     { name: "allow-dirty", takesValue: false },
     // `flywheel init` — overwrite an existing workflow scaffold.
     { name: "force", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
+// Item 60 — `crewhaus plugins {list,search,install,uninstall,publish,outdated}`.
+const PLUGINS_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // Registry backend: a dir (or file:<dir>) of manifest JSONs, or an
+    // http(s):// index URL. Falls back to CREWHAUS_PLUGIN_REGISTRY.
+    { name: "registry", takesValue: true },
+    // search filter.
+    { name: "query", short: "q", takesValue: true },
+    // install: pin a version (default latest).
+    { name: "version", takesValue: true },
+    // Where installed plugins live (default ~/.crewhaus/plugins) + registry file.
+    { name: "plugins-dir", takesValue: true },
+    { name: "registry-file", takesValue: true },
+    // Signing: opt out of fail-closed verification (dev only).
+    { name: "allow-unsigned", takesValue: false },
+    // publish: the manifest JSON to publish.
+    { name: "manifest", takesValue: true },
+    // publish/outdated: assemble + print without touching git/gh / network write.
+    { name: "dry-run", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
+// Item 60 — `crewhaus templates {list,search,use}`.
+const TEMPLATES_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "registry", takesValue: true },
+    { name: "query", short: "q", takesValue: true },
+    { name: "target", takesValue: true },
+    // `use`: workspace dir the template scaffolds into (default cwd) + subdir.
+    { name: "into", takesValue: true },
+    { name: "subdir", takesValue: true },
     { name: "help", short: "h" },
   ],
 };
@@ -1483,6 +1541,8 @@ function usageText(): string {
     "  secrets doctor                       list known secrets via the configured backend",
     "  secrets rotate <name> [--value V]    rotate a named secret (file backend)",
     "  fleet list|status|run <sub> ...      cross-harness inventory/health + bulk read-ops (item 58)",
+    "  plugins list|search|install|...      marketplace plugins CLI + publish/outdated (item 60)",
+    "  templates list|search|use ...        marketplace templates CLI (item 60)",
     "  spec put|list|get|pin|alias|log ...  versioned spec storage + changelog (Section 28 spec-registry)",
     "  deploy promote|rollback ...          re-pin a spec for an environment (Section 28)",
     "       promote --require-approval      gate a protected env on an approval quorum (item 59)",
@@ -9111,6 +9171,337 @@ async function promptYesNo(question: string): Promise<boolean> {
   }
 }
 
+/** Build a `ModuleRegistrySource` from the resolved `--registry` ref (a local
+ *  dir of manifest JSONs, or an http(s):// index). */
+function buildModuleRegistrySource(
+  ref: string | undefined,
+): import("@crewhaus/module-marketplace-client").ModuleRegistrySource {
+  const resolved = resolveMarketplaceRegistryRef(ref, "plugin");
+  if (resolved.kind === "http") {
+    return createHttpModuleRegistrySource({ id: resolved.baseUrl, baseUrl: resolved.baseUrl });
+  }
+  return createLocalModuleRegistrySource({
+    dir: resolved.dir,
+    readdirImpl: (dir) => readdirSync(dir),
+    readFileImpl: (path) => readFileSync(path, "utf-8"),
+    existsImpl: (path) => existsSync(path),
+  });
+}
+
+/**
+ * Item 60 — `crewhaus plugins {list,search,install,uninstall,publish,outdated}`.
+ * Wraps §42 `module-marketplace-client` over §42 `plugin-registry`, closing
+ * the CLI surface those packages deferred. Heavy logic (registry-source
+ * resolution, outdated compare, formatters, publish plan) is in
+ * `./marketplace-cli`; this handler wires the real registry + git/gh driver.
+ */
+async function runPlugins(args: ParsedArgs, action: string): Promise<void> {
+  if (args.flags["help"] || action === "") {
+    process.stdout.write(
+      "usage:\n" +
+        "  crewhaus plugins list [--registry <dir|url>]           list the catalog\n" +
+        "  crewhaus plugins search -q <text> [--registry <ref>]   search the catalog\n" +
+        "  crewhaus plugins install <name> [--version <v>]        fetch + register a plugin\n" +
+        "       [--allow-unsigned] [--plugins-dir <dir>]\n" +
+        "  crewhaus plugins uninstall <name>                      unregister a plugin\n" +
+        "  crewhaus plugins outdated [--registry <ref>]           installed vs latest report\n" +
+        "  crewhaus plugins publish --manifest <plugin.json>      open a publish PR (item 60)\n" +
+        "       [--registry <ref>] [--dry-run]\n" +
+        "\n" +
+        "  The registry backend is a directory of manifest JSONs (or file:<dir>) or an\n" +
+        "  http(s):// index; falls back to CREWHAUS_PLUGIN_REGISTRY. Install respects\n" +
+        "  plugin-registry's fail-closed signature verification; --allow-unsigned opts\n" +
+        "  out for local development.\n",
+    );
+    return;
+  }
+
+  const pluginsDirFlag = args.flags["plugins-dir"];
+  const pluginsDir = typeof pluginsDirFlag === "string" ? pluginsDirFlag : defaultPluginsDir();
+  const registryFileFlag = args.flags["registry-file"];
+  const registryPath =
+    typeof registryFileFlag === "string" ? registryFileFlag : defaultPluginRegistryPath();
+  const allowUnsigned = args.flags["allow-unsigned"] === true;
+  const registryRef =
+    typeof args.flags["registry"] === "string"
+      ? args.flags["registry"]
+      : process.env["CREWHAUS_PLUGIN_REGISTRY"];
+
+  const { createPluginRegistry } = await import("@crewhaus/plugin-registry");
+  const pluginRegistry = createPluginRegistry({ registryPath, allowUnsigned });
+
+  try {
+    if (action === "list" || action === "search") {
+      const source = buildModuleRegistrySource(registryRef);
+      const { createMarketplaceClient } = await import("@crewhaus/module-marketplace-client");
+      const client = createMarketplaceClient({ registry: source, pluginRegistry, pluginsDir });
+      const queryFlag = args.flags["query"];
+      const results = await client.search(
+        action === "search" && typeof queryFlag === "string" ? { query: queryFlag } : {},
+      );
+      for (const line of formatPluginList(results)) process.stdout.write(`${line}\n`);
+      return;
+    }
+    if (action === "install") {
+      const name = args.positional[0];
+      if (typeof name !== "string") die("missing <name>");
+      const source = buildModuleRegistrySource(registryRef);
+      const { createMarketplaceClient } = await import("@crewhaus/module-marketplace-client");
+      const client = createMarketplaceClient({ registry: source, pluginRegistry, pluginsDir });
+      const versionFlag = args.flags["version"];
+      const result = await client.install(
+        name,
+        typeof versionFlag === "string" ? versionFlag : undefined,
+      );
+      process.stdout.write(
+        `installed ${result.manifest.name}@${result.manifest.version} → ${result.manifestPath}\n`,
+      );
+      return;
+    }
+    if (action === "uninstall") {
+      const name = args.positional[0];
+      if (typeof name !== "string") die("missing <name>");
+      const source = buildModuleRegistrySource(registryRef);
+      const { createMarketplaceClient } = await import("@crewhaus/module-marketplace-client");
+      const client = createMarketplaceClient({ registry: source, pluginRegistry, pluginsDir });
+      await client.uninstall(name);
+      process.stdout.write(`uninstalled ${name} (on-disk source left in place)\n`);
+      return;
+    }
+    if (action === "outdated") {
+      const installed = installedVersions(await pluginRegistry.list());
+      if (installed.length === 0) {
+        process.stdout.write("no plugins installed\n");
+        return;
+      }
+      const source = buildModuleRegistrySource(registryRef);
+      const remote = await source.listPlugins();
+      const rows: ReadonlyArray<OutdatedRow> = computeOutdated(installed, remote);
+      for (const line of formatOutdated(rows)) process.stdout.write(`${line}\n`);
+      return;
+    }
+    if (action === "publish") {
+      await runPluginPublish(args, registryRef, { pluginRegistry, pluginsDir });
+      return;
+    }
+    die(
+      `unknown plugins action "${action}" (expected: list | search | install | uninstall | outdated | publish)`,
+    );
+  } catch (err) {
+    if (err instanceof MarketplaceCliError) die(err.message);
+    if (err instanceof CrewhausError) die(err.message);
+    throw err;
+  }
+}
+
+/** `plugins publish` — drive the marketplace client's PublishDraft through an
+ *  actual `gh` PR (the publish loop the packages left open). */
+async function runPluginPublish(
+  args: ParsedArgs,
+  registryRef: string | undefined,
+  ctx: {
+    pluginRegistry: Awaited<
+      ReturnType<typeof import("@crewhaus/plugin-registry").createPluginRegistry>
+    >;
+    pluginsDir: string;
+  },
+): Promise<void> {
+  const manifestFlag = args.flags["manifest"];
+  if (typeof manifestFlag !== "string") die("missing --manifest <plugin.json>");
+  let manifestText: string;
+  try {
+    manifestText = readFileSync(resolve(manifestFlag), "utf-8");
+  } catch (err) {
+    die(`could not read manifest ${manifestFlag}: ${(err as Error).message}`);
+  }
+  const { validatePluginManifest } = await import("@crewhaus/plugin-sdk");
+  let manifest: import("@crewhaus/plugin-sdk").PluginManifest;
+  try {
+    manifest = validatePluginManifest(JSON.parse(manifestText));
+  } catch (err) {
+    die(`invalid plugin manifest: ${(err as Error).message}`);
+  }
+
+  const source = buildModuleRegistrySource(registryRef);
+  const { createMarketplaceClient } = await import("@crewhaus/module-marketplace-client");
+  const client = createMarketplaceClient({
+    registry: source,
+    pluginRegistry: ctx.pluginRegistry,
+    pluginsDir: ctx.pluginsDir,
+  });
+  const draft = client.draftPublish(manifest);
+
+  const draftLike: PublishDraftLike = {
+    prTitle: draft.prTitle,
+    prBody: draft.prBody,
+    manifestRelPath: `plugins/${draft.name}.json`,
+    manifestContents: `${draft.canonicalManifest}\n`,
+    name: draft.name,
+    version: draft.version,
+  };
+  const plan = buildPublishPrPlan(draftLike, new Date());
+
+  if (args.flags["dry-run"] === true) {
+    process.stdout.write(`[publish] ${draft.name}@${draft.version} — dry run (no git/gh)\n`);
+    process.stdout.write(`  branch: ${plan.branch}\n`);
+    process.stdout.write(`  title:  ${plan.title}\n`);
+    process.stdout.write(`  files:  ${Object.keys(plan.files).join(", ")}\n`);
+    return;
+  }
+
+  const driver = createPublishPrDriver();
+  const opened = await driver(plan);
+  process.stdout.write(
+    `[publish] opened PR${opened.prNumber !== undefined ? ` #${opened.prNumber}` : ""}: ${opened.url}\n`,
+  );
+}
+
+/** The production git/gh publish driver — branch → write manifest → commit →
+ *  push → `gh pr create` (argv arrays, no shell). NEVER auto-merges. */
+function createPublishPrDriver(): PublishPrDriver {
+  return async (plan: PublishPrPlan) => {
+    const run = (bin: string, argv: ReadonlyArray<string>): string => {
+      const proc = spawnSync(bin, [...argv], { encoding: "utf-8" });
+      if (proc.status !== 0) {
+        throw new MarketplaceCliError(
+          `\`${bin} ${argv.join(" ")}\` failed (exit ${proc.status ?? "signal"}): ${(proc.stderr ?? "").toString().trim()}`,
+        );
+      }
+      return (proc.stdout ?? "").toString();
+    };
+    const inside = spawnSync("git", ["rev-parse", "--is-inside-work-tree"], { encoding: "utf-8" });
+    if (inside.status !== 0 || inside.stdout?.trim() !== "true") {
+      throw new MarketplaceCliError(
+        "not inside a git repository — `crewhaus plugins publish` opens a PR against the registry repo (run it from the checkout, or use --dry-run)",
+      );
+    }
+    run("git", ["checkout", "-b", plan.branch]);
+    for (const [rel, contents] of Object.entries(plan.files)) {
+      const abs = resolve(process.cwd(), rel);
+      mkdirSync(dirname(abs), { recursive: true });
+      writeFileSync(abs, contents);
+      run("git", ["add", rel]);
+    }
+    run("git", ["commit", "-m", plan.commitMessage]);
+    run("git", ["push", "-u", "origin", plan.branch]);
+    const out = run("gh", [
+      "pr",
+      "create",
+      "--title",
+      plan.title,
+      "--body",
+      plan.body,
+      "--head",
+      plan.branch,
+    ]);
+    const url = out.trim().split("\n").pop() ?? "";
+    const numMatch = /\/pull\/(\d+)/.exec(url);
+    return {
+      url,
+      branch: plan.branch,
+      ...(numMatch ? { prNumber: Number.parseInt(numMatch[1] as string, 10) } : {}),
+    };
+  };
+}
+
+/**
+ * Item 60 — `crewhaus templates {list,search,use}`. Wraps §40
+ * `template-marketplace-client` over §40 `template-registry`. `use` scaffolds
+ * a template's crewhaus.yaml into the workspace (the install verb, named
+ * `use` because that's the harness-init idiom).
+ */
+async function runTemplates(args: ParsedArgs, action: string): Promise<void> {
+  if (args.flags["help"] || action === "") {
+    process.stdout.write(
+      "usage:\n" +
+        "  crewhaus templates list [--registry <dir|url>]         list the catalog\n" +
+        "  crewhaus templates search -q <text> [--target <t>]     search the catalog\n" +
+        "  crewhaus templates use <name> [--into <dir>]           scaffold a template\n" +
+        "       [--subdir <dir>] [--registry <ref>]\n" +
+        "\n" +
+        "  The registry backend is a directory of manifest JSONs (or file:<dir>) or an\n" +
+        "  http(s):// index; falls back to CREWHAUS_TEMPLATE_REGISTRY.\n",
+    );
+    return;
+  }
+  const registryRef =
+    typeof args.flags["registry"] === "string"
+      ? args.flags["registry"]
+      : process.env["CREWHAUS_TEMPLATE_REGISTRY"];
+  const resolved = resolveMarketplaceRegistryRef(registryRef, "template");
+
+  const { LocalRegistrySource, HttpRegistrySource } = await import("@crewhaus/template-registry");
+  const source =
+    resolved.kind === "http"
+      ? new HttpRegistrySource({
+          id: "git",
+          listUrl: resolved.baseUrl,
+          fetchUrl: (name: string) => `${resolved.baseUrl}/${name}.json`,
+        })
+      : new LocalRegistrySource({ rootDir: resolved.dir });
+
+  const { MarketplaceClient } = await import("@crewhaus/template-marketplace-client");
+
+  try {
+    if (action === "list") {
+      const client = new MarketplaceClient({
+        registry: source,
+        workspaceDir: defaultTemplateWorkspaceDir(),
+      });
+      const list = await client.list();
+      if (list.length === 0) {
+        process.stdout.write("no templates in the registry\n");
+        return;
+      }
+      for (const t of list) {
+        process.stdout.write(`${t.name} v${t.version} (${t.target}) — ${t.author}\n`);
+        if (t.description) process.stdout.write(`    ${t.description}\n`);
+      }
+      return;
+    }
+    if (action === "search") {
+      const client = new MarketplaceClient({
+        registry: source,
+        workspaceDir: defaultTemplateWorkspaceDir(),
+      });
+      const queryFlag = args.flags["query"];
+      const targetFlag = args.flags["target"];
+      const results = await client.search({
+        ...(typeof queryFlag === "string" ? { query: queryFlag } : {}),
+        ...(typeof targetFlag === "string" ? { target: targetFlag } : {}),
+      });
+      if (results.length === 0) {
+        process.stdout.write("no matching templates\n");
+        return;
+      }
+      for (const r of results) {
+        process.stdout.write(`${r.metadata.name} v${r.metadata.version} (${r.metadata.target})\n`);
+      }
+      return;
+    }
+    if (action === "use") {
+      const name = args.positional[0];
+      if (typeof name !== "string") die("missing <name>");
+      const intoFlag = args.flags["into"];
+      const workspaceDir =
+        typeof intoFlag === "string" ? resolve(intoFlag) : defaultTemplateWorkspaceDir();
+      const client = new MarketplaceClient({ registry: source, workspaceDir });
+      const subdirFlag = args.flags["subdir"];
+      const result = await client.install(
+        name,
+        typeof subdirFlag === "string" ? { subdir: subdirFlag } : {},
+      );
+      process.stdout.write(`scaffolded ${result.manifest.name} → ${result.path}\n`);
+      return;
+    }
+    die(`unknown templates action "${action}" (expected: list | search | use)`);
+  } catch (err) {
+    if (err instanceof MarketplaceCliError) die(err.message);
+    if (err instanceof CrewhausError) die(err.message);
+    throw err;
+  }
+}
+
 /**
  * Section 28 — `crewhaus spec <action> ...` subcommands wrap the
  * spec-registry. Actions: put / get / list / pin / alias / log (item 46 —
@@ -10924,6 +11315,19 @@ switch (subcommand) {
       throw err;
     }
     break;
+  case "plugins": {
+    // Item 60 — the marketplace plugins CLI. `install`/`uninstall`/`publish`
+    // take a positional after the action; the schema parses the tail.
+    const action = rest[0] ?? "";
+    await runPlugins(parseFor(rest.slice(1), PLUGINS_SCHEMA), action);
+    break;
+  }
+  case "templates": {
+    // Item 60 — the marketplace templates CLI.
+    const action = rest[0] ?? "";
+    await runTemplates(parseFor(rest.slice(1), TEMPLATES_SCHEMA), action);
+    break;
+  }
   case "migrate-all":
     await runMigrateAll(parseFor(rest, MIGRATE_SCHEMA));
     break;
