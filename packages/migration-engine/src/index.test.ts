@@ -158,3 +158,25 @@ describe("migration-engine — additional coverage", () => {
     expect(err.cause).toBe(cause);
   });
 });
+
+describe("latestVersion (#43 — the current spec-schema version)", () => {
+  test("empty engine → 0 (nothing to upgrade to)", () => {
+    expect(new MigrationEngine().latestVersion()).toBe(0);
+  });
+
+  test("the default engine's latest is 1 (the NOOP 0→1 step)", () => {
+    expect(createDefaultEngine().latestVersion()).toBe(1);
+  });
+
+  test("is the max `to` across registered migrations", () => {
+    const e = new MigrationEngine();
+    e.register(NOOP_0_TO_1);
+    e.register({
+      from: 1,
+      to: 2,
+      up: (s) => ({ ...s, version: 2 }),
+      down: (s) => ({ ...s, version: 1 }),
+    });
+    expect(e.latestVersion()).toBe(2);
+  });
+});

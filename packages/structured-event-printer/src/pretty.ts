@@ -77,6 +77,8 @@ function formatBody(ev: TraceEvent): string {
       return `adapter=${ev.adapter} ${ev.fromState}→${ev.toState}${
         ev.reason ? ` reason=${ev.reason}` : ""
       }`;
+    case "model_failover":
+      return `from=${ev.from} to=${ev.to} reason=${ev.reason}`;
     case "janitor_action":
       return `step=${ev.step} status=${ev.status}${ev.count !== undefined ? ` count=${ev.count}` : ""}${
         ev.detail ? ` detail=${ev.detail}` : ""

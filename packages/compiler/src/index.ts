@@ -5,12 +5,14 @@ import type {
   EmitReadmeOptions,
   IrBatchV0,
   IrBrowserV0,
+  IrBudget,
   IrChainBinding,
   IrChainFinality,
   IrChainGameV0,
   IrChainV0,
   IrChannelV0,
   IrChannels,
+  IrCircuitBreaker,
   IrCompaction,
   IrContractBinding,
   IrCrewRole,
@@ -441,6 +443,42 @@ function lowerCompaction(spec: SpecWithPermissions): IrCompaction {
 }
 
 /**
+ * Item 22 — lower the optional failover-chain fields off an agent block
+ * (`model_fallbacks` + `circuit_breaker`). Mirrors `lowerCompaction`'s
+ * "propagate only defined fields" discipline: the breaker package owns the
+ * per-knob defaults, so the IR carries the user's intent verbatim. Returns
+ * a partial spread into the IR agent object so both fields stay ABSENT when
+ * the spec omits them (emitters gate their codegen on presence).
+ */
+type SpecAgentWithFailover = {
+  readonly model_fallbacks?: readonly string[];
+  readonly circuit_breaker?: {
+    readonly failureThreshold?: number;
+    readonly windowMs?: number;
+    readonly cooldownMs?: number;
+  };
+};
+
+function lowerModelFailover(agent: SpecAgentWithFailover): {
+  modelFallbacks?: readonly string[];
+  circuitBreaker?: IrCircuitBreaker;
+} {
+  const out: { modelFallbacks?: readonly string[]; circuitBreaker?: IrCircuitBreaker } = {};
+  if (agent.model_fallbacks !== undefined && agent.model_fallbacks.length > 0) {
+    out.modelFallbacks = [...agent.model_fallbacks];
+  }
+  const cb = agent.circuit_breaker;
+  if (cb !== undefined) {
+    out.circuitBreaker = {
+      ...(cb.failureThreshold !== undefined ? { failureThreshold: cb.failureThreshold } : {}),
+      ...(cb.windowMs !== undefined ? { windowMs: cb.windowMs } : {}),
+      ...(cb.cooldownMs !== undefined ? { cooldownMs: cb.cooldownMs } : {}),
+    };
+  }
+  return out;
+}
+
+/**
  * Section 55 (Track A) — lower the optional `failure_taxonomy` block.
  * The lower is 1:1 (no normalisation, no dedup, no reordering) so
  * `failureTaxonomy` is added to `OPTIMIZABLE_PATHS` directly.
@@ -453,7 +491,7 @@ type SpecWithFailureTaxonomy = {
   readonly failure_taxonomy?: ReadonlyArray<{
     readonly class: string;
     readonly pattern: string;
-    readonly recovery: "retry" | "compact" | "continue" | "tombstone" | "fail";
+    readonly recovery: "retry" | "compact" | "continue" | "tombstone" | "switch-model" | "fail";
     readonly hint?: string;
   }>;
 };
@@ -473,6 +511,33 @@ function lowerFailureTaxonomy(spec: SpecWithFailureTaxonomy): {
         : { class: e.class, pattern: e.pattern, recovery: e.recovery },
     ),
   };
+}
+
+/**
+ * Item 27 — lower the optional `budget` block. Converts the human-facing
+ * dollar ceiling (`usd`) to the runtime's USD-micros unit (× 1e6, rounded
+ * so a fractional cent doesn't drift) and maps `on_exceed.action` → the
+ * IR's `onExceed.kind`. Spread-return-{} discipline (Pillar 1): absent from
+ * the IR when the spec omits the block.
+ */
+type SpecWithBudget = {
+  readonly budget?: {
+    readonly usd: number;
+    readonly on_exceed:
+      | { readonly action: "stop" }
+      | { readonly action: "degrade"; readonly model: string };
+  };
+};
+
+function lowerBudget(spec: SpecWithBudget): { budget?: IrBudget } {
+  const b = spec.budget;
+  if (b === undefined) return {};
+  const usdMicros = Math.round(b.usd * 1_000_000);
+  const onExceed: IrBudget["onExceed"] =
+    b.on_exceed.action === "degrade"
+      ? { kind: "degrade", model: b.on_exceed.model }
+      : { kind: "stop" };
+  return { budget: { usdMicros, onExceed } };
 }
 
 /**
@@ -692,6 +757,7 @@ export function lower(spec: Spec): IrNode {
           model: spec.agent.model,
           instructions: spec.agent.instructions,
           ...(spec.agent.max_tokens !== undefined ? { maxTokens: spec.agent.max_tokens } : {}),
+          ...lowerModelFailover(spec.agent),
         },
         tools: spec.tools ?? [],
         toolConfigs: lowerToolConfigs(spec.tool_config),
@@ -700,6 +766,7 @@ export function lower(spec: Spec): IrNode {
         subAgents: lowerSubAgents(spec.agent.sub_agents),
         compaction: lowerCompaction(spec),
         ...lowerFailureTaxonomy(spec),
+        ...lowerBudget(spec),
         ...lowerSecurity(spec),
         ...lowerFeedback(spec),
         // Phase 3 §3.3 — CLI banner config. Plus Phase 2 M2.2 TUI mode
@@ -748,6 +815,7 @@ export function lower(spec: Spec): IrNode {
         agent: {
           model: spec.agent.model,
           instructions: spec.agent.instructions,
+          ...lowerModelFailover(spec.agent),
         },
         tools: spec.agent.tools ?? [],
         toolConfigs: lowerToolConfigs(spec.agent.tool_config),
@@ -758,6 +826,7 @@ export function lower(spec: Spec): IrNode {
         subAgents: lowerSubAgents(spec.agent.sub_agents),
         compaction: lowerCompaction(spec),
         ...lowerFailureTaxonomy(spec),
+        ...lowerBudget(spec),
         ...lowerFeedback(spec),
         // Phase 3 §3.1 — heartbeat. Duration string ("2h", "30m") is
         // parsed once at lower time so codegen emits a literal numeric
@@ -808,7 +877,11 @@ export function lower(spec: Spec): IrNode {
         version: 0,
         name: spec.name,
         target: "managed",
-        agent: { model: spec.agent.model, instructions: spec.agent.instructions },
+        agent: {
+          model: spec.agent.model,
+          instructions: spec.agent.instructions,
+          ...lowerModelFailover(spec.agent),
+        },
         tenants: spec.tenants.map((t) => ({
           id: t.id,
           budget: {
@@ -819,6 +892,7 @@ export function lower(spec: Spec): IrNode {
         permissions: lowerPermissions(spec),
         compaction: lowerCompaction(spec),
         ...lowerFailureTaxonomy(spec),
+        ...lowerBudget(spec),
       } satisfies IrManagedV0;
     case "pipeline":
       return {

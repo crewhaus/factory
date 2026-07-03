@@ -71,6 +71,30 @@ describe("event-log — round-trip", () => {
     expect(all[0]?.payload).toEqual({ content: "hello" });
   });
 
+  test("advisor kinds (recovery, tool_stats, permission, model_meta) round-trip", async () => {
+    const rootDir = newTempRoot();
+    const log = await openEventLog(TEST_ID, { rootDir });
+    await log.append({
+      kind: "recovery",
+      payload: { errorName: "MaxTokensError", action: "continue", depth: 1 },
+    });
+    await log.append({
+      kind: "tool_stats",
+      payload: { toolName: "Fetch", durationMs: 42, isError: true },
+    });
+    await log.append({
+      kind: "permission",
+      payload: { toolName: "Bash", decision: "ask", askOutcome: "approved" },
+    });
+    await log.append({ kind: "model_meta", payload: { stopReason: "end_turn", model: "m" } });
+    await log.close();
+
+    const all = await collect(log.read());
+    expect(all.map((e) => e.kind)).toEqual(["recovery", "tool_stats", "permission", "model_meta"]);
+    expect(all[1]?.payload).toEqual({ toolName: "Fetch", durationMs: 42, isError: true });
+    expect(all[2]?.payload).toEqual({ toolName: "Bash", decision: "ask", askOutcome: "approved" });
+  });
+
   test("read filters by since and until", async () => {
     const rootDir = newTempRoot();
     let clock = 100;

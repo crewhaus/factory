@@ -21,6 +21,7 @@ export type {
   JanitorActionEvent,
   McpCallEndEvent,
   McpCallStartEvent,
+  ModelFailoverEvent,
   ModelRequestEvent,
   ModelResponseEvent,
   ModelStreamTokenEvent,

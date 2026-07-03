@@ -121,6 +121,7 @@ describe("crewhaus datasets CLI (item 12)", () => {
     expect(rec2.splits.test).toBeUndefined();
   });
 
+  // 6 sequential CLI cold-starts; needs headroom over the 5s default under CI contention.
   test("put rejects --split with --split-spec, a bad spec, a bad split, and a missing file", async () => {
     const root = newTempRoot();
     const file = writeDatasetFile(root, 4);
@@ -136,7 +137,7 @@ describe("crewhaus datasets CLI (item 12)", () => {
       expect((await runCli(args, root)).exitCode).toBe(1);
     }
     expect(existsSync(join(root, ".crewhaus", "datasets", "x"))).toBe(false);
-  });
+  }, 15000);
 
   test("CREWHAUS_DATASETS_DIR overrides the registry root", async () => {
     const root = newTempRoot();
