@@ -110,6 +110,25 @@ export type IrCircuitBreaker = {
 };
 
 /**
+ * Item 26 — two-tier turn-difficulty router config. `fast`/`default` are full
+ * model-router grammar strings; `routing` tunes the per-turn escalation
+ * thresholds (all optional — runtime defaults apply per knob). Carried on the
+ * agent blocks of the failover-capable shapes (cli, channel, managed). Absent
+ * when the spec omits `model_tiers` — codegen gates on presence so an unset
+ * block leaves bundles byte-identical.
+ */
+export type IrModelTiers = {
+  readonly fast: string;
+  readonly default: string;
+  readonly routing?: {
+    readonly contextTokenThreshold?: number;
+    readonly toolsToDefault?: boolean;
+    readonly firstTurnToDefault?: boolean;
+    readonly priorToolDensityThreshold?: number;
+  };
+};
+
+/**
  * Section 55 (Track A) — named failure taxonomy. Cross-cutting; carried
  * through to runtime-core so `recovery-engine` can consult the user's
  * named classes before falling back to its built-in taxonomy.
@@ -285,6 +304,8 @@ export type IrV0 = {
     readonly modelFallbacks?: readonly string[];
     /** Item 22 — breaker tuning (spec `agent.circuit_breaker`). */
     readonly circuitBreaker?: IrCircuitBreaker;
+    /** Item 26 — two-tier turn-difficulty router. Absent → single-model. */
+    readonly modelTiers?: IrModelTiers;
   };
   readonly tools: readonly string[];
   readonly toolConfigs: IrToolConfigs;
@@ -550,6 +571,8 @@ export type IrChannelV0 = {
     readonly modelFallbacks?: readonly string[];
     /** Item 22 — breaker tuning (spec `agent.circuit_breaker`). */
     readonly circuitBreaker?: IrCircuitBreaker;
+    /** Item 26 — two-tier turn-difficulty router. Absent → single-model. */
+    readonly modelTiers?: IrModelTiers;
   };
   readonly tools: readonly string[];
   readonly toolConfigs: IrToolConfigs;
@@ -602,6 +625,8 @@ export type IrManagedV0 = {
     readonly modelFallbacks?: readonly string[];
     /** Item 22 — breaker tuning (spec `agent.circuit_breaker`). */
     readonly circuitBreaker?: IrCircuitBreaker;
+    /** Item 26 — two-tier turn-difficulty router. Absent → single-model. */
+    readonly modelTiers?: IrModelTiers;
   };
   readonly tenants: readonly IrManagedTenant[];
   readonly permissions: IrPermissions;

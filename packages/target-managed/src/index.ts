@@ -70,6 +70,10 @@ function renderModelFailoverFields(ir: IrManagedV0): string {
   if (ir.agent.circuitBreaker !== undefined) {
     pieces.push(`\n    circuitBreaker: ${JSON.stringify(ir.agent.circuitBreaker)},`);
   }
+  // Item 26 — two-tier router (mirror of target-cli). Absent when unset.
+  if (ir.agent.modelTiers !== undefined) {
+    pieces.push(`\n    modelTiers: ${JSON.stringify(ir.agent.modelTiers)},`);
+  }
   return pieces.join("");
 }
 

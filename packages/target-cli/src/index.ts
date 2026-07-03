@@ -66,7 +66,7 @@ type BuiltinToolEntry = {
   readonly initSymbol?: string;
 };
 
-const BUILTIN_TOOL_MAP: Record<string, BuiltinToolEntry> = {
+export const BUILTIN_TOOL_MAP: Record<string, BuiltinToolEntry> = {
   read: { package: "@crewhaus/tool-fs", export: "read" },
   write: { package: "@crewhaus/tool-fs", export: "write" },
   edit: { package: "@crewhaus/tool-fs", export: "edit" },
@@ -518,6 +518,11 @@ function renderModelFailoverFields(ir: {
       readonly windowMs?: number;
       readonly cooldownMs?: number;
     };
+    readonly modelTiers?: {
+      readonly fast: string;
+      readonly default: string;
+      readonly routing?: Record<string, number | boolean>;
+    };
   };
 }): string {
   const pieces: string[] = [];
@@ -527,6 +532,12 @@ function renderModelFailoverFields(ir: {
   }
   if (ir.agent.circuitBreaker !== undefined) {
     pieces.push(`\n  circuitBreaker: ${JSON.stringify(ir.agent.circuitBreaker)},`);
+  }
+  // Item 26 — two-tier router. JSON.stringify safely quotes the fast/default
+  // model strings + numeric routing knobs (a plain object literal, no template
+  // escaping needed). Absent when unset, keeping bundles byte-identical.
+  if (ir.agent.modelTiers !== undefined) {
+    pieces.push(`\n  modelTiers: ${JSON.stringify(ir.agent.modelTiers)},`);
   }
   return pieces.join("");
 }

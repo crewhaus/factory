@@ -30,7 +30,10 @@ import { type EventKind, type EventLog, openEventLog } from "@crewhaus/event-log
 import { type HookDef, type HookEvent, aggregateDecisions, runHooks } from "@crewhaus/hooks-engine";
 import {
   type FailoverChain,
+  type ResolvedTier,
+  type TierRouter,
   createFailoverChain,
+  createTierRouter,
   parseModelString,
   resolveModel,
 } from "@crewhaus/model-router";
@@ -626,6 +629,34 @@ export type RunChatLoopOptions = {
    */
   modelFallbacks?: ReadonlyArray<string>;
   /**
+   * Item 26 — opt-in two-tier turn-difficulty router (spec `agent.model_tiers`).
+   * When set, BOTH tier adapters resolve at boot (mirroring the compaction
+   * second-adapter wiring), and each turn the loop picks a tier from
+   * deterministic signals (estimated context tokens, tools-in-play, turn
+   * index, prior-turn tool_use density), streams through the chosen tier's
+   * adapter, and publishes a `model_tier_route` trace event. A `fast`-tier
+   * turn that FAILS is re-run on `default` (misroute recovery). Absent → the
+   * single primary adapter path, unchanged. Mutually independent of
+   * `modelFallbacks`: when both are set the primary chain still governs the
+   * `default` tier; the `fast` tier is its own single adapter (v1 scope).
+   */
+  modelTiers?: {
+    readonly fast: string;
+    readonly default: string;
+    readonly routing?: {
+      readonly contextTokenThreshold?: number;
+      readonly toolsToDefault?: boolean;
+      readonly firstTurnToDefault?: boolean;
+      readonly priorToolDensityThreshold?: number;
+    };
+  };
+  /**
+   * Item 26 — test injection for the two tier adapters, keyed by their spec
+   * model string (mirrors `_failoverAdapters`). Production callers leave it
+   * undefined (the runtime resolves both tiers through the normal router).
+   */
+  _tierAdapters?: ReadonlyMap<string, ProviderAdapter>;
+  /**
    * Section 55 (Track A) / item 23 — the spec's `failure_taxonomy`, lowered
    * from the IR. Consulted by `recovery-engine.recover()` BEFORE its
    * built-in classify+recover flow so user-named error classes take
@@ -907,6 +938,35 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     compactionAdapter = adapter;
     compactionWireModelId = wireModelId;
   }
+
+  // Item 26 — two-tier turn-difficulty router. When `modelTiers` is set, BOTH
+  // tier adapters resolve HERE at boot (adapters bind once; the per-turn pick
+  // just selects between the two already-resolved adapters — the same
+  // discipline as compaction's second adapter and the failover chain's
+  // multiple candidates). The `_tierAdapters` map is a test seam mirroring
+  // `_failoverAdapters`.
+  let tierRouter: TierRouter | undefined;
+  if (opts.modelTiers !== undefined) {
+    const resolveTier = async (modelString: string): Promise<ResolvedTier> => {
+      const injected = opts._tierAdapters?.get(modelString);
+      if (injected !== undefined) {
+        return { adapter: injected, modelId: bestEffortWireModelId(modelString), modelString };
+      }
+      const r = await resolveModel(modelString);
+      return { adapter: r.adapter, modelId: r.modelId, modelString };
+    };
+    const fast = await resolveTier(opts.modelTiers.fast);
+    const dflt = await resolveTier(opts.modelTiers.default);
+    tierRouter = createTierRouter({
+      fast,
+      default: dflt,
+      ...(opts.modelTiers.routing !== undefined ? { config: opts.modelTiers.routing } : {}),
+    });
+  }
+  // Item 26 — tool_use blocks the PREVIOUS turn produced (a tier-routing
+  // signal). Persists across `runOneTurn` calls; 0 on the first turn.
+  let priorTurnToolUseCount = 0;
+
   // Default model max OUTPUT tokens for one turn. Callers thread the spec's
   // `agent.max_tokens` here when set (the CLI target's codegen + apps/cli);
   // this fallback applies when the spec is silent. Kept comfortably above the
@@ -2039,6 +2099,14 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     let recovery: RecoveryState = initialRecoveryState;
     const maxToolIterations = opts.maxToolIterations ?? DEFAULT_MAX_TOOL_ITERATIONS;
     let toolIterations = 0;
+    // Item 26 — tool_use blocks THIS turn produced (fed to the NEXT turn's
+    // tier decision) and the misroute-recovery escalation latch (a fast-tier
+    // failure forces `default` for the rest of this turn). `servedFastTier`
+    // records whether the LAST attempt streamed on the fast tier, so the
+    // error catch only escalates a genuine fast-tier misroute.
+    let thisTurnToolUseCount = 0;
+    let escalateTier = false;
+    let servedFastTier = false;
 
     while (state.kind !== "Done") {
       if (turnAbort.signal.aborted) {
@@ -2098,11 +2166,47 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             // which is exact, so cost-tracker pricing always keys on the
             // model that actually served).
             const plannedCandidate = failoverChain?.plan();
-            const reqWireModelId = plannedCandidate?.modelId ?? wireModelId;
-            const reqProviderId = plannedCandidate?.providerId ?? providerId;
+            let reqWireModelId = plannedCandidate?.modelId ?? wireModelId;
+            let reqProviderId = plannedCandidate?.providerId ?? providerId;
             // Item 27 — after a budget degrade, `failoverChain` is null and
             // `degradedSpecModel` is the running spec model.
-            const reqSpecModel = plannedCandidate?.modelString ?? degradedSpecModel ?? opts.model;
+            let reqSpecModel = plannedCandidate?.modelString ?? degradedSpecModel ?? opts.model;
+            // The adapter this turn streams through: the primary/chain by
+            // default, or a tier adapter when the two-tier router is active.
+            let turnAdapter: ProviderAdapter = adapter;
+            // Item 26 — two-tier turn-difficulty router. Pick a tier from
+            // DETERMINISTIC per-turn signals (context size, tools-in-play,
+            // turn index, prior-turn tool_use density); a fast-tier misroute
+            // recovery forces `default` (see the catch below). Publish the
+            // decision as a `model_tier_route` event, then stream through the
+            // chosen tier's already-resolved adapter.
+            if (tierRouter !== undefined) {
+              const decision = escalateTier
+                ? { tier: "default" as const, reason: "escalated after fast-tier failure" }
+                : tierRouter.route({
+                    contextTokens: estimateTokens(messages),
+                    toolsInPlay: (anthropicTools?.length ?? 0) > 0,
+                    // `turnNumber` is 1-based (incremented before the turn
+                    // runs); the router wants a 0-based index so its
+                    // first-turn check keys on the opening turn.
+                    turnIndex: Math.max(0, runContext.turnNumber - 1),
+                    priorTurnToolUseCount,
+                  });
+              const chosen = tierRouter.tier(decision.tier);
+              turnAdapter = chosen.adapter;
+              reqWireModelId = chosen.modelId;
+              reqProviderId = chosen.adapter.providerId;
+              reqSpecModel = chosen.modelString;
+              servedFastTier = decision.tier === "fast";
+              bus.publish({
+                ...bus.envelope(),
+                kind: "model_tier_route",
+                tier: decision.tier,
+                model: chosen.modelId,
+                reason: decision.reason,
+                ...(escalateTier ? { escalated: true } : {}),
+              });
+            }
             bus.publish({
               ...modelStartEnv,
               kind: "model_request",
@@ -2133,7 +2237,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             // Item 22 — the failover chain rewrites `model` per serving
             // candidate internally; the planned id here is the single-adapter
             // value and the chain's best-effort prediction otherwise.
-            const reqStream = adapter.stream({
+            const reqStream = turnAdapter.stream({
               model: reqWireModelId,
               system: systemBlocks.map((b) => ({
                 type: "text" as const,
@@ -2250,6 +2354,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 break;
               }
 
+              // Item 26 — accrue this turn's tool_use count (next-turn tier signal).
+              thisTurnToolUseCount += toolUses.length;
               for (const tu of toolUses) {
                 toolUseHistory.push({ id: tu.id, name: tu.name, input: tu.input });
               }
@@ -2382,6 +2488,14 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               break;
             }
             lastErrorForRecovery = err;
+            // Item 26 — a fast-tier turn that FAILED is a MISROUTE: latch the
+            // escalation so the recovery retry re-runs on the `default` tier
+            // (the loop re-enters NeedModel via the recovery ladder, which
+            // then picks `default`). Composes with the existing recovery
+            // actions — a retry/continue now streams on the sturdier tier.
+            if (tierRouter !== undefined && servedFastTier) {
+              escalateTier = true;
+            }
             const errObj = err as { name?: unknown; message?: unknown };
             const errorName = typeof errObj.name === "string" ? errObj.name : "Error";
             const errorMessage = typeof errObj.message === "string" ? errObj.message : String(err);
@@ -2410,6 +2524,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             state = transition(state, { kind: "Aborted" });
             break;
           }
+          // Item 26 — accrue this turn's tool_use count (a next-turn tier
+          // signal): a dense tool turn marks an active multi-step task.
+          thisTurnToolUseCount += state.toolUses.length;
           const toolResults = await runToolBatch(state.toolUses);
           messages.push({ role: "user", content: toolResults });
           await logEvent("user_message", { content: toolResults });
@@ -2570,6 +2687,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       }
     }
 
+    // Item 26 — hand this turn's tool_use count to the next turn's tier
+    // decision (the prior-tool-density signal).
+    priorTurnToolUseCount = thisTurnToolUseCount;
     return { terminalContent };
   }
 

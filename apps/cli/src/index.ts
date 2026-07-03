@@ -10,12 +10,21 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
+import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
 import type { SubAgentDefinition } from "@crewhaus/agent-context-isolation";
 import { SpecParseError, compile, lower } from "@crewhaus/compiler";
 import { buildContextBundle, discoverRoots } from "@crewhaus/context-bundle";
-import { DEFAULT_PRICING, computeCacheSavingsMicros, resolvePricing } from "@crewhaus/cost-tracker";
+import {
+  DEFAULT_PRICING,
+  type PricingTable,
+  classifyPricingStaleness,
+  computeCacheSavingsMicros,
+  parsePricingFeed,
+  pickNewestPricing,
+  resolvePricing,
+} from "@crewhaus/cost-tracker";
 import {
   type DatasetRecord,
   type DatasetSplit,
@@ -43,7 +52,7 @@ import {
   renderReport,
   setBaseline,
 } from "@crewhaus/eval-report";
-import { runEval as runEvalLib } from "@crewhaus/eval-runner";
+import { type EvalRunSummary, runEval as runEvalLib } from "@crewhaus/eval-runner";
 import { openEventLog } from "@crewhaus/event-log";
 import { loadHooks } from "@crewhaus/hooks-engine";
 import {
@@ -413,6 +422,32 @@ import {
   suggestSafeName,
   suggestSecretFix,
 } from "./lint";
+// Item 24 — market scan + doctor --models + pricing sync core, in a
+// side-effect-free module (this entry file runs an argv switch on import).
+import {
+  type ScanCell,
+  buildMarketScan,
+  buildModelChecks,
+  buildProposalArtifact,
+  buildScanCandidates,
+  writeModelField,
+} from "./model-scan";
+// Item 16 — `crewhaus permissions suggest` (mine persisted ask/deny history
+// into reviewable settings.json permission rules), in a side-effect-free
+// module so it is unit-testable (this entry file runs an argv switch on
+// import). Permissions are EXCLUDED from OPTIMIZABLE_PATHS — `--apply` is
+// always an interactive human confirm, never eval-gated auto-apply.
+import {
+  type PermissionSuggestion,
+  aggregateAsks,
+  applyToSettingsRoot,
+  diffPermissions,
+  existingSettingsRules,
+  formatSettingsDiff,
+  formatSuggestionLines,
+  rankSuggestions,
+  readOnlyByName,
+} from "./permissions-suggest";
 // Item 5 — `crewhaus dataset refresh-goldens`: reconcile user corrections +
 // up-rated turns against an existing dataset's golds, proposing (or applying
 // as a NEW version) updated golds. Side-effect-free so it is unit-testable.
@@ -445,6 +480,15 @@ import {
   runRetentionPurge,
   runRetentionSweep,
 } from "./retention";
+// Item 25 — model right-sizing downshift search core (pure enumeration + cost
+// projection + $/score ranking); side-effect-free so it is unit-testable.
+import {
+  type BaselineEvalOutcome,
+  type ModelSlot,
+  type SlotEvalOutcome,
+  buildRightSizeReport,
+  enumerateSlotCandidates,
+} from "./right-size";
 // Item 13 — `crewhaus scaffold-evals` + `init --with-evals`: day-one eval
 // assets generated from the spec (deterministic template / one-shot model
 // sample stubs + a single spec-goal llm_judge or floor grader), in a
@@ -515,6 +559,19 @@ import {
   parseExcludeGlobs,
   restoreStateArchive,
 } from "./state-backup";
+// Item 18 — `crewhaus tools` namespace (list/suggest/audit + the loadToolMap
+// ↔ BUILTIN_TOOL_MAP sync floor), in a side-effect-free module so it is
+// unit-testable (this entry file runs an argv switch on import).
+import {
+  CLI_RUNTIME_TOOL_KEYS,
+  auditTools,
+  buildToolList,
+  buildToolUsage,
+  formatAuditLines,
+  formatSuggestLines,
+  formatToolListLines,
+  suggestTools,
+} from "./tools-cli";
 // Item 7 — failure-arbiter wiring: post-eval triage (verdicts.json + report
 // section + one-line summary + bug-sample pinning) and the optimize-side
 // failure-signal pre-filter, in a side-effect-free module so it is
@@ -736,6 +793,66 @@ const DOCTOR_SCHEMA: ParseArgsSchema = {
     { name: "context-pressure", takesValue: false },
     // How many most-recent sessions --context-pressure scans (default 20).
     { name: "sessions", takesValue: true },
+    // Item 24 — model advisory: flag spec models missing from the pricing
+    // table (silently billed $0), pricing-table staleness, and known sunsets.
+    { name: "models", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
+// Item 24 — `crewhaus model-scan`: scheduled market scan. Enumerate
+// capability-compatible replacements for the cwd spec's agent.model, eval each
+// on the spec's dataset, and emit a proposal (+ patch.json) when a candidate
+// beats current on score at lower cost. Proposal-only unless --write.
+const MODEL_SCAN_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "dataset", takesValue: true },
+    { name: "graders", takesValue: true },
+    { name: "out", short: "o", takesValue: true },
+    { name: "concurrency", takesValue: true },
+    { name: "seed", takesValue: true },
+    { name: "judge-model", takesValue: true },
+    // Restrict candidates to same-provider siblings (keeps credentials + cache).
+    { name: "same-provider", takesValue: false },
+    // Max candidates evaled (cheapest-first). Default 6.
+    { name: "limit", takesValue: true },
+    // Apply the winning proposal to the spec via a direct comment-preserving
+    // CST edit (model fields are outside OPTIMIZABLE_PATHS — this bypasses the
+    // optimizer whitelist deliberately; always human-initiated).
+    { name: "write", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
+// Item 24 — `crewhaus pricing sync|show`: load a versioned pricing feed into
+// ~/.crewhaus/pricing/ so createCostTracker({pricing}) can override without a
+// code release.
+const PRICING_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "file", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
+// Item 25 — `crewhaus model right-size <spec>`: enumerate → compile → eval
+// downshift search for a cheaper model that holds quality. Proposal-only
+// unless --write.
+const MODEL_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "dataset", takesValue: true },
+    { name: "graders", takesValue: true },
+    { name: "out", short: "o", takesValue: true },
+    { name: "concurrency", takesValue: true },
+    { name: "seed", takesValue: true },
+    { name: "judge-model", takesValue: true },
+    // Minimum cost drop (fraction, e.g. 0.2 = 20%) to recommend a downshift.
+    { name: "min-cost-drop", takesValue: true },
+    // Pass-rate tolerance (fraction) a downshift may dip and still recommend.
+    { name: "pass-rate-tolerance", takesValue: true },
+    // Max candidates per slot (cheapest-first). Default 3.
+    { name: "per-slot-limit", takesValue: true },
+    // Apply the winning downshift via a direct comment-preserving CST edit.
+    { name: "write", takesValue: false },
     // Item 40 — `--detect`: read-only inventory of reachable providers, the
     // local Ollama/vLLM endpoint's models, and MCP servers from
     // .mcp.json / Claude Desktop config. `--no-probe` skips the localhost HTTP
@@ -905,6 +1022,19 @@ const ADVISE_SCHEMA: ParseArgsSchema = {
     { name: "all" },
     { name: "json" },
     { name: "out", short: "o", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
+const TOOLS_SCHEMA: ParseArgsSchema = {
+  flags: [{ name: "sessions", takesValue: true }, { name: "json" }, { name: "help", short: "h" }],
+};
+
+const PERMISSIONS_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "sessions", takesValue: true },
+    { name: "apply" },
+    { name: "json" },
     { name: "help", short: "h" },
   ],
 };
@@ -1323,6 +1453,11 @@ function usageText(): string {
     "  cost-summary --session <id>          summarize cost_accrual events for a session",
     "  advise [--session <id> | --all]      mine session logs for spec advice (item 14)",
     "       [--json] [-o <dir>]             writes suggestions.json + report.html (default .crewhaus/advice)",
+    "  tools list                           list every builtin tool + its metadata (item 18)",
+    "  tools suggest [spec.yaml]            rank builtins against agent.instructions (keyword match)",
+    "  tools audit [--sessions N|all]       mine tool_stats vs. grants — unused/failing/readOnly",
+    "  permissions suggest [--apply]        mine ask/deny history into settings.json rules (item 16)",
+    "       [--sessions N|all] [--json]     --apply is interactive-confirm only (never eval-gated)",
     "  rate --session <id> [--turn N]       rate an assistant turn 👍/👎, ⭐, or 0–1",
     "       (--thumbs up|down | --stars 1-5 | --score 0-1) [--comment <t>]",
     "  feedback --session <id> --text <msg> attach a comment/correction to a turn",
@@ -2619,18 +2754,20 @@ async function detectDefaultModel(): Promise<string | undefined> {
  * `BUILTIN_TOOL_MAP` in packages/target-cli/src/index.ts — keep them in sync.
  */
 async function loadToolMap(): Promise<Record<string, RegisteredTool>> {
-  const [fs, bash, todo, web, image, fetchPkg, imageGen, docIngest, codegraph] = await Promise.all([
-    import("@crewhaus/tool-fs"),
-    import("@crewhaus/tool-bash"),
-    import("@crewhaus/tool-todo"),
-    import("@crewhaus/tool-web"),
-    import("@crewhaus/tool-image"),
-    import("@crewhaus/tool-fetch"),
-    import("@crewhaus/tool-image-generation"),
-    import("@crewhaus/tool-document-ingest"),
-    import("@crewhaus/tool-codegraph"),
-  ]);
-  return {
+  const [fs, bash, todo, web, image, fetchPkg, imageGen, docIngest, codegraph, codeExec] =
+    await Promise.all([
+      import("@crewhaus/tool-fs"),
+      import("@crewhaus/tool-bash"),
+      import("@crewhaus/tool-todo"),
+      import("@crewhaus/tool-web"),
+      import("@crewhaus/tool-image"),
+      import("@crewhaus/tool-fetch"),
+      import("@crewhaus/tool-image-generation"),
+      import("@crewhaus/tool-document-ingest"),
+      import("@crewhaus/tool-codegraph"),
+      import("@crewhaus/tool-code-execution"),
+    ]);
+  const map: Record<string, RegisteredTool> = {
     read: fs.read,
     write: fs.write,
     edit: fs.edit,
@@ -2642,6 +2779,14 @@ async function loadToolMap(): Promise<Record<string, RegisteredTool>> {
     webSearch: web.webSearch,
     readImage: image.readImage,
     fetch: fetchPkg.fetch,
+    // Section 18 — sandboxed code execution. These MUST be resolvable at
+    // `crewhaus run` time: `BUILTIN_TOOL_MAP` in target-cli lets a spec's
+    // `tools: [python]` COMPILE, so omitting them here made a compilable CLI
+    // spec crash at run with "unknown tool". The two maps are kept in sync
+    // (guarded by tools-cli's map-sync test).
+    python: codeExec.python,
+    javascript: codeExec.javascript,
+    shell: codeExec.shell,
     imageGenerate: imageGen.imageGenerate,
     ingestDocument: docIngest.ingestDocument,
     // Pillar 2 — AST-aware code intelligence (recipe 54).
@@ -2650,6 +2795,19 @@ async function loadToolMap(): Promise<Record<string, RegisteredTool>> {
     codegraphCallees: codegraph.codegraphCallees,
     codegraphImpact: codegraph.codegraphImpact,
   };
+  // Item 18 map-sync floor: this map's keys ARE the canonical runtime tool
+  // list. `CLI_RUNTIME_TOOL_KEYS` mirrors them (so the map-sync test can
+  // compare against target-cli's BUILTIN_TOOL_MAP without importing the whole
+  // entry file), and `tools list`/`tools audit` resolve `.name`/metadata off
+  // this map. Assert the mirror never drifts from the real map.
+  const built = Object.keys(map).sort();
+  const mirror = [...CLI_RUNTIME_TOOL_KEYS].sort();
+  if (built.length !== mirror.length || built.some((k, i) => k !== mirror[i])) {
+    throw new Error(
+      `loadToolMap keys drifted from CLI_RUNTIME_TOOL_KEYS (tools-cli.ts) — update the mirror. built=${built.join(",")} mirror=${mirror.join(",")}`,
+    );
+  }
+  return map;
 }
 
 /**
@@ -2670,6 +2828,35 @@ async function applyToolConfigs(
     const { registerWebFetchConfig } = await import("@crewhaus/tool-web");
     registerWebFetchConfig(toolConfigs["webFetch"] as Parameters<typeof registerWebFetchConfig>[0]);
   }
+  // Section 18 — code-execution tools (python/javascript/shell) share a single
+  // `registerCodeExecutionConfig`. Mirror target-cli's resolveTools: honor a
+  // per-tool config (first one seen) or the shared `codeExecution`/
+  // `code_execution` alias, register once. Without this the run path ignored
+  // tool_config for code-exec tools that the compiled bundle applies.
+  if (used.has("python") || used.has("javascript") || used.has("shell")) {
+    const cfg =
+      toolConfigs["python"] ??
+      toolConfigs["javascript"] ??
+      toolConfigs["shell"] ??
+      toolConfigs["codeExecution"] ??
+      toolConfigs["code_execution"];
+    if (cfg !== undefined) {
+      const { registerCodeExecutionConfig } = await import("@crewhaus/tool-code-execution");
+      registerCodeExecutionConfig(cfg as Parameters<typeof registerCodeExecutionConfig>[0]);
+    }
+  }
+}
+
+/**
+ * Section 18 — resolve `sandboxAvailable` for the `run` path from the
+ * `CREWHAUS_SANDBOX` env var, using the SAME grammar the compiled bundle
+ * emits (`packages/target-cli` renderRun): unset defaults to `"docker"`
+ * (available); any value whose lowercase is `"noop"` disables the sandbox
+ * floor (code-exec tools are then denied by permission-engine's
+ * `requiresSandbox` floor). Pure — reads only the passed env snapshot.
+ */
+export function resolveSandboxAvailable(env: NodeJS.ProcessEnv = process.env): boolean {
+  return (env["CREWHAUS_SANDBOX"] ?? "docker").toLowerCase() !== "noop";
 }
 
 /**
@@ -3080,6 +3267,33 @@ async function runRunCli(
     );
   }
 
+  // Section 18 — wire the sandbox floor for code-execution tools. #18 made
+  // python/javascript/shell RESOLVABLE at run time, but the run path never set
+  // `sandboxAvailable`, so permission-engine's `requiresSandbox` floor denied
+  // every code-exec call even with a real backend. Mirror the compiled
+  // bundle (target-cli renderRun): resolve availability from CREWHAUS_SANDBOX
+  // and thread it into runChatLoop. Only relevant when the spec declares a
+  // code-exec tool; emit a one-line diagnostic so the state is observable.
+  const hasCodeExecTools = ir.tools.some(
+    (t) => t === "python" || t === "javascript" || t === "shell",
+  );
+  const sandboxAvailable = resolveSandboxAvailable();
+  if (hasCodeExecTools) {
+    if (!sandboxAvailable) {
+      process.stdout.write(
+        "[sandbox] disabled (CREWHAUS_SANDBOX=noop) — python/javascript/shell calls will be denied by the sandbox floor\n",
+      );
+    } else if (process.env["CREWHAUS_SANDBOX"] === undefined) {
+      process.stdout.write(
+        "[sandbox] assuming docker — set CREWHAUS_SANDBOX (docker|podman) to select a backend, or CREWHAUS_SANDBOX=noop to disable code execution\n",
+      );
+    } else {
+      process.stdout.write(
+        `[sandbox] backend "${process.env["CREWHAUS_SANDBOX"]}" — python/javascript/shell enabled (still require an alwaysAllow rule)\n`,
+      );
+    }
+  }
+
   try {
     await runChatLoop({
       model,
@@ -3092,6 +3306,7 @@ async function runRunCli(
       hooks,
       skills,
       slashCommands,
+      ...(hasCodeExecTools ? { sandboxAvailable } : {}),
       ...(subAgents !== undefined ? { subAgents, spawnSubAgent } : {}),
       ...(ir.target === "cli" && ir.agent.maxTokens !== undefined
         ? { maxTokens: ir.agent.maxTokens }
@@ -3109,6 +3324,13 @@ async function runRunCli(
         : {}),
       ...(ir.target === "cli" && ir.agent.circuitBreaker !== undefined
         ? { circuitBreaker: ir.agent.circuitBreaker }
+        : {}),
+      // Item 26 — two-tier turn-difficulty router. A `--model` override
+      // forces a single model, so tiers apply only without an override.
+      ...(ir.target === "cli" &&
+      typeof modelOverride !== "string" &&
+      ir.agent.modelTiers !== undefined
+        ? { modelTiers: ir.agent.modelTiers }
         : {}),
       // Section 55 / item 23 — thread the spec's failure_taxonomy so
       // recovery-engine consults the user's named error classes (including
@@ -3431,6 +3653,10 @@ async function runDoctor(args: ParsedArgs): Promise<void> {
     runDoctorContextPressure(args);
     return;
   }
+  if (args.flags["models"]) {
+    runDoctorModels();
+    return;
+  }
   if (args.flags["detect"]) {
     await runDoctorDetect(args);
     return;
@@ -3511,6 +3737,148 @@ async function runDoctor(args: ParsedArgs): Promise<void> {
   const allPass = checks.every((c) => c.pass);
   process.stdout.write(allPass ? "\nall checks passed.\n" : "\nsome checks failed.\n");
   process.exit(allPass ? 0 : 1);
+}
+
+/**
+ * Item 24 — `~/.crewhaus/pricing/` feed dir. The newest dated feed there
+ * overrides `DEFAULT_PRICING` for cost projections; a broken feed is a loud
+ * error (never a silent $0 regression). Returns the effective table.
+ */
+function pricingDir(): string {
+  return join(homedir(), ".crewhaus", "pricing");
+}
+
+function loadUserPricing(): PricingTable {
+  const dir = pricingDir();
+  if (!existsSync(dir)) return DEFAULT_PRICING;
+  const feeds: PricingTable[] = [];
+  for (const name of readdirSync(dir)) {
+    if (!name.endsWith(".json")) continue;
+    const text = readFileSync(join(dir, name), "utf-8");
+    // Let a parse error propagate as a CLI failure — a corrupt feed silently
+    // billing $0 is exactly the gap doctor --models exists to close.
+    feeds.push(parsePricingFeed(text));
+  }
+  return pickNewestPricing(feeds);
+}
+
+/**
+ * Item 24 — `crewhaus doctor --models`. Reads the cwd spec's agent.model (+
+ * compaction.model when present), and flags: models missing from the pricing
+ * table (silently billed $0), pricing-table staleness, and known sunsets.
+ * Exits non-zero only on a hard pricing MISS (a warn — stale/sunset — never
+ * fails); a report, model-advisory flavour of doctor.
+ */
+function runDoctorModels(): void {
+  const specPath = join(process.cwd(), "crewhaus.yaml");
+  let agentModel: string | undefined;
+  const auxModels: Array<{ slot: string; model: string }> = [];
+  const sentinelResolutions: Array<{ slot: string; resolved: string }> = [];
+  if (existsSync(specPath)) {
+    try {
+      const rawSpec = parseSpec(readFileSync(specPath, "utf-8"));
+      const ir = lower(rawSpec);
+      const agent = (ir as { agent?: { model?: unknown } }).agent;
+      if (agent !== undefined && typeof agent.model === "string") agentModel = agent.model;
+      const compaction = (ir as { compaction?: { model?: unknown } }).compaction;
+      if (compaction !== undefined && typeof compaction.model === "string") {
+        auxModels.push({ slot: "compaction.model", model: compaction.model });
+        // Item 25 — surface what `cheapest` resolved to: the RAW spec said
+        // "cheapest", the lowered IR carries the concrete model.
+        const rawCompaction = (rawSpec as { compaction?: { model?: unknown } }).compaction;
+        if (rawCompaction?.model === "cheapest") {
+          sentinelResolutions.push({ slot: "compaction.model", resolved: compaction.model });
+        }
+      }
+      const subAgents = (ir as { subAgents?: ReadonlyArray<{ name?: string; model?: unknown }> })
+        .subAgents;
+      for (const sa of subAgents ?? []) {
+        if (typeof sa.model === "string") {
+          auxModels.push({ slot: `sub-agent ${sa.name ?? "?"}.model`, model: sa.model });
+        }
+      }
+    } catch {
+      // tolerant: a non-cli / unparseable spec still gets a table-freshness check
+    }
+  }
+  const pricing = loadUserPricing();
+  const checks = buildModelChecks(agentModel, { pricing, auxModels });
+  let anyFail = false;
+  for (const c of checks) {
+    if (c.warn && c.pass) {
+      process.stdout.write(`~ ${c.label}: ${c.reason ?? "informational"}\n`);
+    } else if (c.pass) {
+      process.stdout.write(`✓ ${c.label}\n`);
+    } else {
+      anyFail = true;
+      process.stdout.write(`✗ ${c.label}: ${c.reason ?? "failed"}\n`);
+    }
+  }
+  for (const s of sentinelResolutions) {
+    process.stdout.write(`ℹ ${s.slot}: "cheapest" resolved to ${s.resolved}\n`);
+  }
+  if (agentModel === undefined) {
+    process.stdout.write(
+      "~ no agent.model in the cwd crewhaus.yaml — only the pricing table was checked\n",
+    );
+  }
+  process.stdout.write(anyFail ? "\nsome model checks failed.\n" : "\nmodel checks passed.\n");
+  process.exit(anyFail ? 1 : 0);
+}
+
+/**
+ * Item 24 — `crewhaus pricing sync|show`. `sync --file <feed.json>` validates
+ * a versioned pricing feed and installs it at ~/.crewhaus/pricing/<version>.json,
+ * from where `doctor --models`/cost projections pick up the newest. `show`
+ * prints the effective table's version + freshness.
+ */
+async function runPricing(args: ParsedArgs, action: string): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus pricing <sync|show>\n" +
+        "  sync --file <feed.json>   validate + install a versioned pricing feed into\n" +
+        "                            ~/.crewhaus/pricing/<version>.json (overrides DEFAULT_PRICING\n" +
+        "                            for cost projections without a code release)\n" +
+        "  show                      print the effective pricing table's version + freshness\n",
+    );
+    return;
+  }
+  if (action === "show") {
+    const pricing = loadUserPricing();
+    const staleness = classifyPricingStaleness(pricing, new Date(), 120);
+    process.stdout.write(`pricing table version: ${pricing.version}\n`);
+    process.stdout.write(`${staleness.stale ? "~ " : "✓ "}${staleness.reason}\n`);
+    const dir = pricingDir();
+    process.stdout.write(
+      existsSync(dir)
+        ? `feeds dir: ${dir}\n`
+        : `feeds dir: ${dir} (none installed — using built-in DEFAULT_PRICING)\n`,
+    );
+    return;
+  }
+  // action === "sync"
+  const file = args.flags["file"];
+  if (typeof file !== "string") die("pricing sync: missing --file <feed.json>");
+  let feedText: string;
+  try {
+    feedText = readFileSync(resolve(file), "utf-8");
+  } catch (err) {
+    die(`could not read ${file}: ${(err as Error).message}`);
+  }
+  let table: PricingTable;
+  try {
+    table = parsePricingFeed(feedText);
+  } catch (err) {
+    die((err as Error).message);
+  }
+  const dest = join(pricingDir(), `${table.version.replace(/[^A-Za-z0-9._-]+/g, "_")}.json`);
+  mkdirSync(dirname(dest), { recursive: true });
+  writeFileSync(dest, `${JSON.stringify(table, null, 2)}\n`);
+  process.stdout.write(`✓ installed pricing feed v${table.version} → ${dest}\n`);
+  const providers = Object.keys(table.providers).length;
+  process.stdout.write(
+    `  ${providers} provider table(s); the newest dated feed here now overrides DEFAULT_PRICING\n`,
+  );
 }
 
 /**
@@ -5824,6 +6192,438 @@ async function runEvalMatrixCommand(opts: {
   }
 }
 
+/**
+ * Item 24 — `crewhaus model-scan`. Read the cwd spec's agent.model, enumerate
+ * capability-compatible replacement candidates from the pricing table, eval
+ * current + each candidate on the spec's dataset (same matrix machinery), and
+ * emit a proposal + patch.json when a candidate beats current on score at
+ * lower cost. Model fields are outside OPTIMIZABLE_PATHS, so nothing is
+ * auto-applied — `--write` does a direct comment-preserving CST edit on a
+ * human-reviewed winner.
+ */
+async function runModelScan(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus model-scan --dataset <data> --graders <graders.yaml>\n" +
+        "                           [--same-provider] [--limit N] [--concurrency N] [--seed N]\n" +
+        "                           [--judge-model <m>] [-o <dir>] [--write]\n" +
+        "  Reads the cwd crewhaus.yaml's agent.model, enumerates capability-compatible\n" +
+        "  cheaper replacements from the pricing table (--same-provider restricts to\n" +
+        "  same-provider siblings; --limit caps the count, default 6), evals current +\n" +
+        "  each candidate on the dataset, and prints a proposal when a candidate beats\n" +
+        "  current on mean score at lower projected cost. Writes matrix.json/index.html\n" +
+        "  + (when a winner exists) patch.json to -o (default .crewhaus/model-scan_<id>).\n" +
+        "  --write applies the winner to crewhaus.yaml via a direct comment-preserving\n" +
+        "  CST edit (model fields are outside OPTIMIZABLE_PATHS — this deliberately\n" +
+        "  bypasses the optimizer whitelist; always human-initiated, never automatic).\n",
+    );
+    return;
+  }
+  const datasetPath = args.flags["dataset"];
+  const gradersPath = args.flags["graders"];
+  if (typeof datasetPath !== "string") die("model-scan: missing --dataset <data>");
+  if (typeof gradersPath !== "string") die("model-scan: missing --graders <graders.yaml>");
+
+  const specPath = join(process.cwd(), "crewhaus.yaml");
+  if (!existsSync(specPath)) die(`model-scan: no crewhaus.yaml in ${process.cwd()}`);
+  const yamlText = readFileSync(specPath, "utf-8");
+  let ir: ReturnType<typeof lower>;
+  try {
+    ir = lower(parseSpec(yamlText));
+  } catch (err) {
+    if (err instanceof SpecParseError) die(err.message);
+    throw err;
+  }
+  if (ir.target !== "cli") die(`model-scan only supports target: cli (got "${ir.target}")`);
+  const currentModel = ir.agent.model;
+
+  const pricing = loadUserPricing();
+  const candidates = buildScanCandidates(currentModel, {
+    pricing,
+    sameProviderOnly: args.flags["same-provider"] === true,
+    ...(typeof args.flags["limit"] === "string"
+      ? { limit: Number.parseInt(args.flags["limit"], 10) }
+      : {}),
+  });
+  if (candidates.length === 0) {
+    die(
+      `model-scan: no capability-compatible cheaper candidates for "${currentModel}" in the pricing table (it may be a local/named-host model, or already the cheapest in its class)`,
+    );
+  }
+
+  // Load graders + dataset ONCE (every cell sees the identical samples).
+  const gradersYaml = readFileSync(resolve(gradersPath), "utf-8");
+  const { compiled } = parseGradersConfig(gradersYaml);
+  const dataset = await loadDataset(resolve(datasetPath));
+  const datasetHash = hashDatasetFile(resolve(datasetPath));
+  const samples = await collectSamples(dataset.samples);
+
+  const concurrencyFlag = args.flags["concurrency"];
+  const seedFlag = args.flags["seed"];
+  const judgeModelFlag = args.flags["judge-model"];
+  const concurrency =
+    typeof concurrencyFlag === "string" ? Number.parseInt(concurrencyFlag, 10) : undefined;
+  const seed = typeof seedFlag === "string" ? Number.parseInt(seedFlag, 10) : undefined;
+
+  const outArg = args.flags["out"];
+  const rootDir =
+    typeof outArg === "string"
+      ? resolve(outArg)
+      : resolve(join(".crewhaus", `model-scan_${randomBytes(8).toString("hex")}`));
+  mkdirSync(rootDir, { recursive: true });
+
+  const models = [currentModel, ...candidates];
+  process.stdout.write(
+    `[model-scan] current ${currentModel} vs ${candidates.length} candidate(s) × ${samples.length} samples → ${rootDir}\n`,
+  );
+
+  const cells = await runMatrixCells({
+    models,
+    slugs: assignCellSlugs(models),
+    rootDir,
+    runCell: async (model, cellOutDir) => {
+      const summary = await runEvalLib({
+        ir: { ...ir, agent: { ...ir.agent, model } },
+        dataset: { name: dataset.name, samples: makeAsyncIterable(samples) },
+        compiledGraders: compiled,
+        opts: {
+          outDir: cellOutDir,
+          datasetHash,
+          ...(concurrency !== undefined ? { concurrency } : {}),
+          ...(seed !== undefined ? { seed } : {}),
+          ...(typeof judgeModelFlag === "string" ? { judgeModel: judgeModelFlag } : {}),
+        },
+      });
+      writeFileSync(join(cellOutDir, "index.html"), renderReport(await loadRun(cellOutDir)).html);
+      return summary;
+    },
+  });
+
+  const matrix = buildMatrix(cells, { pricing: defaultMatrixPricing() });
+  const rendered = renderMatrix(matrix);
+  writeFileSync(join(rootDir, "matrix.json"), rendered.json);
+  writeFileSync(join(rootDir, "index.html"), rendered.html);
+
+  // Fold matrix rows into scan cells (model → score + projected cost).
+  const scanCells: ScanCell[] = matrix.rows.map((r) => ({
+    model: r.model,
+    ...(r.passRate !== undefined ? { passRate: r.passRate } : {}),
+    ...(r.meanScore !== undefined ? { meanScore: r.meanScore } : {}),
+    ...(r.costPer1kSamplesUsd !== undefined ? { costPer1kSamplesUsd: r.costPer1kSamplesUsd } : {}),
+    ...(r.status === "error" ? { error: r.error ?? "cell failed" } : {}),
+  }));
+  const scan = buildMarketScan(currentModel, scanCells);
+
+  writeTable(
+    ["candidate", "score Δ", "$/1k Δ", "recommended", "why"],
+    scan.proposals.map((p) => [
+      p.candidateModel,
+      p.scoreDelta >= 0 ? `+${p.scoreDelta.toFixed(3)}` : p.scoreDelta.toFixed(3),
+      p.costDeltaPer1kUsd.toFixed(4),
+      p.recommended ? "YES" : "no",
+      p.reason,
+    ]),
+  );
+
+  if (scan.best !== undefined) {
+    const artifact = buildProposalArtifact(scan);
+    if (artifact !== undefined) {
+      writeFileSync(join(rootDir, "patch.json"), `${JSON.stringify(artifact, null, 2)}\n`);
+    }
+    process.stdout.write(
+      `\n[model-scan] recommendation: ${currentModel} → ${scan.best.candidateModel} ` +
+        `(+${scan.best.scoreDelta.toFixed(3)} score, ${scan.best.costDeltaPer1kUsd.toFixed(4)} $/1k)\n` +
+        `[model-scan] proposal: ${join(rootDir, "patch.json")}\n`,
+    );
+    if (args.flags["write"] === true) {
+      const updated = writeModelField(
+        yamlText,
+        ir.target,
+        ["agent", "model"],
+        scan.best.candidateModel,
+      );
+      writeFileSync(specPath, updated);
+      process.stdout.write(
+        `[model-scan] --write: applied agent.model = ${scan.best.candidateModel} to ${specPath} (comment-preserving CST edit; review the diff before committing)\n`,
+      );
+    } else {
+      process.stdout.write(
+        "[model-scan] apply with `crewhaus model-scan ... --write`, or hand-edit — every model change is human-reviewed.\n",
+      );
+    }
+  } else {
+    process.stdout.write("\n[model-scan] no candidate beats current on score at lower cost.\n");
+  }
+
+  const crashed = matrix.rows.filter((r) => r.status === "error");
+  if (crashed.length > 0) {
+    process.stdout.write(
+      `[model-scan] note: ${crashed.length} cell(s) failed to run (${crashed.map((r) => r.model).join(", ")})\n`,
+    );
+  }
+}
+
+/** Apply a single-slot model swap to a lowered CLI IR, in-memory. `path` is
+ *  ["agent","model"], ["compaction","model"], or ["subAgents", i, "model"]. */
+function patchIrModelSlot(
+  ir: Extract<ReturnType<typeof lower>, { target: "cli" }>,
+  slot: ModelSlot,
+  model: string,
+): Extract<ReturnType<typeof lower>, { target: "cli" }> {
+  if (slot.label === "agent.model") {
+    return { ...ir, agent: { ...ir.agent, model } };
+  }
+  if (slot.label === "compaction.model") {
+    return { ...ir, compaction: { ...ir.compaction, model } };
+  }
+  if (slot.label.startsWith("sub-agent ") && ir.subAgents !== undefined) {
+    const subAgents = ir.subAgents.map((sa) =>
+      sa.model === slot.currentModel && `sub-agent ${sa.name}.model` === slot.label
+        ? { ...sa, model }
+        : sa,
+    );
+    return { ...ir, subAgents };
+  }
+  return ir;
+}
+
+/**
+ * Item 25 — `crewhaus model right-size <spec>`. A dedicated enumerate →
+ * compile → eval loop (NOT the prompt mutator): each candidate is the spec
+ * with ONE model slot (agent.model / sub-agent.model / compaction.model)
+ * swapped to a cheaper same-provider pricing-table sibling. Baseline + each
+ * candidate are evaled; per-candidate USD is projected from the eval's token
+ * aggregates (eval artifacts carry no cost_accrual); the set is ranked by
+ * score-retained-per-dollar-saved. Recommends ONLY when pass-rate holds and
+ * cost drops >= --min-cost-drop. Proposal-only unless --write (a direct
+ * comment-preserving CST edit — model paths stay outside OPTIMIZABLE_PATHS).
+ */
+async function runModelRightSize(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus model right-size [<spec.yaml>] --dataset <data> --graders <graders.yaml>\n" +
+        "                                 [--min-cost-drop 0.2] [--pass-rate-tolerance 0.0]\n" +
+        "                                 [--per-slot-limit 3] [--concurrency N] [--seed N]\n" +
+        "                                 [--judge-model <m>] [-o <dir>] [--write]\n" +
+        "  Enumerate → compile → eval downshift search: for each model slot (agent.model,\n" +
+        "  compaction.model, sub-agents[*].model) tries the cheaper same-provider pricing-\n" +
+        "  table siblings, evals each against the baseline spec on the dataset, projects\n" +
+        "  per-candidate USD from token totals, and ranks by score-retained-per-dollar-\n" +
+        "  saved. Recommends the biggest swap that HOLDS pass-rate (within\n" +
+        "  --pass-rate-tolerance, default 0) and cuts cost by >= --min-cost-drop\n" +
+        "  (default 0.2). Writes matrix.json/index.html + patch.json (the winner) to -o.\n" +
+        "  --write applies the winner to the spec via a direct comment-preserving CST\n" +
+        "  edit (model fields are outside OPTIMIZABLE_PATHS; always human-initiated).\n",
+    );
+    return;
+  }
+  const datasetPath = args.flags["dataset"];
+  const gradersPath = args.flags["graders"];
+  if (typeof datasetPath !== "string") die("model right-size: missing --dataset <data>");
+  if (typeof gradersPath !== "string") die("model right-size: missing --graders <graders.yaml>");
+
+  const specArg = args.positional[0];
+  const specPath =
+    typeof specArg === "string" ? resolve(specArg) : join(process.cwd(), "crewhaus.yaml");
+  if (!existsSync(specPath)) die(`model right-size: no spec at ${specPath}`);
+  const yamlText = readFileSync(specPath, "utf-8");
+  let ir: ReturnType<typeof lower>;
+  try {
+    ir = lower(parseSpec(yamlText));
+  } catch (err) {
+    if (err instanceof SpecParseError) die(err.message);
+    throw err;
+  }
+  if (ir.target !== "cli") die(`model right-size only supports target: cli (got "${ir.target}")`);
+  const cliIr = ir;
+
+  // Collect the swappable slots off the LOWERED ir (compaction.model may be a
+  // resolved `cheapest` — right-size searches from wherever it landed).
+  const slots: ModelSlot[] = [
+    { label: "agent.model", currentModel: cliIr.agent.model, path: ["agent", "model"] },
+  ];
+  if (cliIr.compaction.model !== undefined) {
+    slots.push({
+      label: "compaction.model",
+      currentModel: cliIr.compaction.model,
+      path: ["compaction", "model"],
+    });
+  }
+  for (const sa of cliIr.subAgents ?? []) {
+    if (sa.model !== undefined) {
+      slots.push({ label: `sub-agent ${sa.name}.model`, currentModel: sa.model });
+    }
+  }
+
+  const pricing = loadUserPricing();
+  const candidates = enumerateSlotCandidates(slots, {
+    pricing,
+    ...(typeof args.flags["per-slot-limit"] === "string"
+      ? { perSlotLimit: Number.parseInt(args.flags["per-slot-limit"], 10) }
+      : {}),
+  });
+  if (candidates.length === 0) {
+    die(
+      "model right-size: no cheaper same-provider downshift candidates for any slot (models may already be cheapest-in-class or off the pricing table)",
+    );
+  }
+
+  const gradersYaml = readFileSync(resolve(gradersPath), "utf-8");
+  const { compiled } = parseGradersConfig(gradersYaml);
+  const dataset = await loadDataset(resolve(datasetPath));
+  const datasetHash = hashDatasetFile(resolve(datasetPath));
+  const samples = await collectSamples(dataset.samples);
+
+  const concurrencyFlag = args.flags["concurrency"];
+  const seedFlag = args.flags["seed"];
+  const judgeModelFlag = args.flags["judge-model"];
+  const concurrency =
+    typeof concurrencyFlag === "string" ? Number.parseInt(concurrencyFlag, 10) : undefined;
+  const seed = typeof seedFlag === "string" ? Number.parseInt(seedFlag, 10) : undefined;
+  const minCostDrop =
+    typeof args.flags["min-cost-drop"] === "string"
+      ? Number.parseFloat(args.flags["min-cost-drop"])
+      : 0.2;
+  const passRateTolerance =
+    typeof args.flags["pass-rate-tolerance"] === "string"
+      ? Number.parseFloat(args.flags["pass-rate-tolerance"])
+      : 0;
+
+  const outArg = args.flags["out"];
+  const rootDir =
+    typeof outArg === "string"
+      ? resolve(outArg)
+      : resolve(join(".crewhaus", `right-size_${randomBytes(8).toString("hex")}`));
+  mkdirSync(rootDir, { recursive: true });
+
+  const runOne = async (
+    candidateIr: Extract<ReturnType<typeof lower>, { target: "cli" }>,
+    label: string,
+  ): Promise<EvalRunSummary> => {
+    const cellDir = join(rootDir, label.replace(/[^A-Za-z0-9._-]+/g, "_"));
+    return runEvalLib({
+      ir: candidateIr,
+      dataset: { name: dataset.name, samples: makeAsyncIterable(samples) },
+      compiledGraders: compiled,
+      opts: {
+        outDir: cellDir,
+        datasetHash,
+        ...(concurrency !== undefined ? { concurrency } : {}),
+        ...(seed !== undefined ? { seed } : {}),
+        ...(typeof judgeModelFlag === "string" ? { judgeModel: judgeModelFlag } : {}),
+      },
+    });
+  };
+
+  process.stdout.write(
+    `[right-size] baseline + ${candidates.length} downshift candidate(s) × ${samples.length} samples → ${rootDir}\n`,
+  );
+
+  // Baseline first.
+  const baselineSummary = await runOne(cliIr, "baseline");
+  const baseline: BaselineEvalOutcome = {
+    passRate: baselineSummary.aggregates.passRate,
+    tokens: baselineSummary.aggregates.totalTokens,
+    model: cliIr.agent.model,
+  };
+
+  const outcomes: SlotEvalOutcome[] = [];
+  for (const candidate of candidates) {
+    const label = `${candidate.slot.label}=${candidate.candidateModel}`;
+    try {
+      const summary = await runOne(
+        patchIrModelSlot(cliIr, candidate.slot, candidate.candidateModel),
+        label,
+      );
+      const crashed =
+        summary.samples.length > 0 && summary.aggregates.errorCount >= summary.samples.length;
+      outcomes.push({
+        candidate,
+        passRate: summary.aggregates.passRate,
+        tokens: summary.aggregates.totalTokens,
+        ...(crashed ? { error: "all samples errored" } : {}),
+      });
+    } catch (err) {
+      outcomes.push({
+        candidate,
+        passRate: 0,
+        tokens: { input: 0, output: 0 },
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  const report = buildRightSizeReport(baseline, outcomes, {
+    minCostDropRatio: minCostDrop,
+    passRateTolerance,
+    pricing,
+  });
+  writeFileSync(join(rootDir, "right-size.json"), `${JSON.stringify(report, null, 2)}\n`);
+
+  writeTable(
+    ["slot → model", "pass_rate Δ", "$ saved", "cost drop", "recommend", "why"],
+    report.ranked.map((r) => [
+      `${r.slot} → ${r.modelString}`,
+      `${r.passRateDelta >= 0 ? "+" : ""}${(r.passRateDelta * 100).toFixed(1)}pp`,
+      `$${r.savingUsd.toFixed(4)}`,
+      `${(r.costDropRatio * 100).toFixed(0)}%`,
+      r.recommended ? "YES" : "no",
+      r.reason,
+    ]),
+  );
+
+  if (report.best !== undefined) {
+    const artifact = {
+      kind: "model-right-size-proposal" as const,
+      generatedAt: new Date().toISOString(),
+      slot: report.best.slot,
+      recommendedModel: report.best.modelString,
+      passRateDelta: report.best.passRateDelta,
+      savingUsd: report.best.savingUsd,
+      costDropRatio: report.best.costDropRatio,
+      ...(report.best.slotPath !== undefined
+        ? {
+            patch: {
+              op: "replace" as const,
+              path: report.best.slotPath,
+              value: report.best.modelString,
+            },
+          }
+        : {}),
+    };
+    writeFileSync(join(rootDir, "patch.json"), `${JSON.stringify(artifact, null, 2)}\n`);
+    process.stdout.write(
+      `\n[right-size] recommendation: ${report.best.slot} → ${report.best.modelString} ` +
+        `(saves $${report.best.savingUsd.toFixed(4)}, ${(report.best.costDropRatio * 100).toFixed(0)}% cheaper, pass-rate ${report.best.passRateDelta >= 0 ? "+" : ""}${(report.best.passRateDelta * 100).toFixed(1)}pp)\n`,
+    );
+    if (args.flags["write"] === true && report.best.slotPath !== undefined) {
+      const updated = writeModelField(
+        yamlText,
+        cliIr.target,
+        report.best.slotPath,
+        report.best.modelString,
+      );
+      writeFileSync(specPath, updated);
+      process.stdout.write(
+        `[right-size] --write: applied ${report.best.slot} = ${report.best.modelString} to ${specPath} (comment-preserving CST edit; review the diff)\n`,
+      );
+    } else if (report.best.slotPath === undefined) {
+      process.stdout.write(
+        "[right-size] the winning slot is the judge model (a CLI flag, not a spec field) — pass it via --judge-model on your eval runs.\n",
+      );
+    } else {
+      process.stdout.write(
+        "[right-size] apply with `--write`, or hand-edit — every model change is human-reviewed.\n",
+      );
+    }
+  } else {
+    process.stdout.write(
+      "\n[right-size] no downshift holds pass-rate while cutting cost enough.\n",
+    );
+  }
+  process.stdout.write(`[right-size] report: ${join(rootDir, "right-size.json")}\n`);
+}
+
 async function runEvalReport(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
@@ -7001,7 +7801,9 @@ async function runAdvise(args: ParsedArgs): Promise<void> {
         "\n" +
         "mines .crewhaus/sessions (+ .crewhaus/audit) for spec advice:\n" +
         "  repeated tool failures, max_tokens truncation pressure, compaction\n" +
-        "  thrash, permission-ask churn, stop-reason anomalies\n" +
+        "  thrash, permission-ask churn, stop-reason anomalies, learned\n" +
+        "  failure_taxonomy + loop-break rules, sub-agent splits under\n" +
+        "  chronic context pressure\n" +
         "\n" +
         "  --session <id>  mine one session (default: all sessions)\n" +
         "  --json          print machine-readable findings to stdout\n" +
@@ -7096,6 +7898,309 @@ async function runAdvise(args: ParsedArgs): Promise<void> {
   }
   process.stdout.write(`[advise] suggestions: ${suggestionsPath}\n`);
   process.stdout.write(`[advise] report: ${reportPath}\n`);
+}
+
+// -------- shared: read the N most-recent session logs by mtime --------
+
+/**
+ * Read the `limit` most-recently-modified session JSONLs (or ALL when
+ * `limit === "all"`) from `.crewhaus/sessions`, folded into `SessionEvents`.
+ * "Recent" is by mtime — session ids are random hex, so name order carries
+ * no recency (mirrors `runDoctorContextPressure`). A missing dir yields an
+ * empty list; the caller decides whether that is an error.
+ */
+function readRecentSessionEvents(limit: number | "all"): SessionEvents[] {
+  const sessionsDir = join(process.cwd(), ".crewhaus", "sessions");
+  if (!existsSync(sessionsDir)) return [];
+  const files = readdirSync(sessionsDir).filter((f) => f.endsWith(".jsonl"));
+  const ranked = files
+    .map((f) => {
+      const file = join(sessionsDir, f);
+      return { file, sessionId: f.replace(/\.jsonl$/, ""), mtimeMs: statSync(file).mtimeMs };
+    })
+    .sort((a, b) => b.mtimeMs - a.mtimeMs);
+  const chosen = limit === "all" ? ranked : ranked.slice(0, limit);
+  return chosen.map((r) => ({
+    sessionId: r.sessionId,
+    objects: parseAdviseJsonl(readFileSync(r.file, "utf-8")),
+  }));
+}
+
+/** Parse the `--sessions N|all` flag shared by tools audit + future miners. */
+function parseSessionsLimit(args: ParsedArgs, dflt: number): number | "all" {
+  const raw = strFlag(args, "sessions");
+  if (raw === undefined) return dflt;
+  if (raw === "all") return "all";
+  const n = Number.parseInt(raw, 10);
+  if (Number.isNaN(n) || n < 1) {
+    die(`invalid --sessions "${raw}" — must be a positive integer or "all"`);
+  }
+  return n;
+}
+
+// -------- tools: builtin discovery + usage audit (item 18) --------
+
+/**
+ * `crewhaus tools <list|suggest|audit>` — the observer/advisor face over the
+ * built-in tool catalog.
+ *
+ *   list             every builtin (name/description/scope/io/readOnly/…).
+ *   suggest [spec]   deterministic keyword implication over agent.instructions
+ *                    (default spec: cwd crewhaus.yaml).
+ *   audit [--sessions N|all]  mine tool_stats across sessions vs. the spec's
+ *                    grants — unused / failing / learned-readOnly. ADVICE-ONLY
+ *                    (tools: is not optimizer-whitelisted; every edit is a
+ *                    human-review suggestion).
+ */
+async function runTools(action: string, args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus tools <list|suggest|audit>\n" +
+        "\n" +
+        "  list                     print every builtin tool + its metadata\n" +
+        "  suggest [spec.yaml]      rank builtins against agent.instructions\n" +
+        "                           (deterministic keyword match; default spec\n" +
+        "                           is ./crewhaus.yaml)\n" +
+        "  audit [--sessions N|all] mine tool_stats across sessions vs. the\n" +
+        "                           spec's tools: grants — unused / failing /\n" +
+        "                           learned-readOnly (advice-only; tools: is not\n" +
+        "                           optimizer-whitelisted)\n" +
+        "\n" +
+        "  --json  machine-readable output\n",
+    );
+    return;
+  }
+  const jsonMode = args.flags["json"] === true;
+  const toolMap = await loadToolMap();
+
+  if (action === "list") {
+    const rows = buildToolList(toolMap);
+    if (jsonMode) {
+      process.stdout.write(`${JSON.stringify({ tools: rows }, null, 2)}\n`);
+      return;
+    }
+    process.stdout.write(`${rows.length} builtin tool(s):\n`);
+    for (const line of formatToolListLines(rows)) process.stdout.write(`${line}\n`);
+    return;
+  }
+
+  if (action === "suggest") {
+    const specPath = args.positional[0] ?? join(process.cwd(), "crewhaus.yaml");
+    if (!existsSync(specPath)) {
+      die(`spec not found at ${specPath} — pass a spec path or run from a harness dir`);
+    }
+    let spec: Spec;
+    try {
+      spec = parseSpec(readFileSync(specPath, "utf-8"));
+    } catch (err) {
+      die(`${specPath} did not parse: ${(err as Error).message}`);
+    }
+    const specRecord = spec as unknown as Record<string, unknown>;
+    const agent = specRecord["agent"] as Record<string, unknown> | undefined;
+    const instructions = typeof agent?.["instructions"] === "string" ? agent["instructions"] : "";
+    const specTools = Array.isArray(specRecord["tools"])
+      ? (specRecord["tools"] as unknown[]).filter((t): t is string => typeof t === "string")
+      : [];
+    const result = suggestTools(instructions, specTools, CLI_RUNTIME_TOOL_KEYS, toolMap);
+    if (jsonMode) {
+      process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+      return;
+    }
+    for (const line of formatSuggestLines(result)) process.stdout.write(`${line}\n`);
+    return;
+  }
+
+  if (action === "audit") {
+    const limit = parseSessionsLimit(args, DEFAULT_AUDIT_SESSIONS);
+    const sessions = readRecentSessionEvents(limit);
+    if (sessions.length === 0) {
+      die(
+        `no session logs found at ${join(process.cwd(), ".crewhaus", "sessions")} — run the agent first, then audit`,
+      );
+    }
+    // The cwd spec supplies the grant list; without one we still report the
+    // failing/read-only findings mined purely from usage.
+    let specTools: string[] = [];
+    let hasExplicitToolList = false;
+    const specPath = join(process.cwd(), "crewhaus.yaml");
+    if (existsSync(specPath)) {
+      try {
+        const spec = parseSpec(readFileSync(specPath, "utf-8")) as unknown as Record<
+          string,
+          unknown
+        >;
+        if (Array.isArray(spec["tools"])) {
+          specTools = (spec["tools"] as unknown[]).filter(
+            (t): t is string => typeof t === "string",
+          );
+          hasExplicitToolList = true;
+        }
+      } catch (err) {
+        process.stderr.write(
+          `[tools audit] crewhaus.yaml did not parse (${(err as Error).message}) — auditing usage only\n`,
+        );
+      }
+    }
+    const usage = buildToolUsage(sessions);
+    const result = auditTools({ sessions, specTools, usage, toolMap, hasExplicitToolList });
+    if (jsonMode) {
+      process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+      return;
+    }
+    process.stdout.write(
+      `tools audit: ${result.findings.length} finding(s) across ${result.sessionIds.length} session(s)\n`,
+    );
+    for (const line of formatAuditLines(result)) process.stdout.write(`${line}\n`);
+    return;
+  }
+
+  die(`tools action must be one of: list, suggest, audit (got "${action}")`);
+}
+
+/** Default sessions the `tools audit` miner scans (mirrors context-pressure). */
+const DEFAULT_AUDIT_SESSIONS = 20;
+
+// -------- permissions: mine ask/deny history into rules (item 16) --------
+
+/** Default sessions the permissions miner scans (mirrors tools audit). */
+const DEFAULT_PERMISSIONS_SESSIONS = 20;
+
+/**
+ * `crewhaus permissions suggest [--sessions N|all] [--apply] [--json]` — mine
+ * the persisted `permission` ask/deny history across sessions into reviewable
+ * `.crewhaus/settings.json` permission rules: `alwaysAllow` for recurring
+ * human-APPROVED asks (read-only tools first), `alwaysAsk` tightenings for
+ * recurring DENIED asks. Prints an additive diff of the settings permissions
+ * block.
+ *
+ * `--apply` is ALWAYS an interactive human confirm — permissions are excluded
+ * from OPTIMIZABLE_PATHS by design, so this path is NEVER eval-gated
+ * auto-apply. A non-TTY `--apply` REFUSES: it prints the diff and tells the
+ * user to run interactively.
+ */
+async function runPermissions(action: string, args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus permissions suggest [--sessions N|all] [--apply] [--json]\n" +
+        "\n" +
+        "mines .crewhaus/sessions `permission` ask/deny history into rules:\n" +
+        "  alwaysAllow  recurring human-APPROVED asks (read-only tools first)\n" +
+        "  alwaysAsk    recurring DENIED asks (tighten — keep prompting)\n" +
+        "\n" +
+        "  --sessions N|all  how many recent sessions to mine (default 20)\n" +
+        "  --apply           write the additions to .crewhaus/settings.json\n" +
+        "                    (ALWAYS interactive-confirm; refuses in a non-TTY —\n" +
+        "                    permissions are never eval-gated auto-apply)\n" +
+        "  --json            machine-readable output\n",
+    );
+    return;
+  }
+  if (action !== "suggest") {
+    die(`permissions action must be "suggest" (got "${action}")`);
+  }
+
+  const limit = parseSessionsLimit(args, DEFAULT_PERMISSIONS_SESSIONS);
+  const sessions = readRecentSessionEvents(limit);
+  if (sessions.length === 0) {
+    die(
+      `no session logs found at ${join(process.cwd(), ".crewhaus", "sessions")} — run the agent first, then suggest`,
+    );
+  }
+
+  // Read-only-ness comes from the resolvable tool map (keyed by RegisteredTool
+  // `.name`, which is what the ask aggregate is keyed by).
+  const toolMap = await loadToolMap();
+  const readOnly = readOnlyByName(toolMap);
+  const aggregates = aggregateAsks(sessions);
+  const suggestions: PermissionSuggestion[] = rankSuggestions(aggregates, readOnly);
+
+  // Existing settings rules (the exact shape buildRuleSet consumes).
+  const settingsPath = join(process.cwd(), ".crewhaus", "settings.json");
+  let settingsRoot: unknown;
+  if (existsSync(settingsPath)) {
+    try {
+      settingsRoot = JSON.parse(readFileSync(settingsPath, "utf-8"));
+    } catch (err) {
+      die(`failed to parse ${settingsPath}: ${(err as Error).message}`);
+    }
+  }
+  const existing = existingSettingsRules(settingsRoot);
+  const diff = diffPermissions(existing, suggestions);
+
+  if (args.flags["json"] === true) {
+    process.stdout.write(
+      `${JSON.stringify({ sessionIds: sessions.map((s) => s.sessionId), suggestions, diff }, null, 2)}\n`,
+    );
+    if (args.flags["apply"] !== true) return;
+  } else {
+    process.stdout.write(
+      `permissions: ${suggestions.length} suggestion(s) from ${sessions.length} session(s)\n`,
+    );
+    if (suggestions.length === 0) {
+      process.stdout.write("no recurring ask/deny patterns to turn into rules\n");
+    }
+    for (const line of formatSuggestionLines(suggestions)) process.stdout.write(`${line}\n`);
+    process.stdout.write("\n");
+    for (const line of formatSettingsDiff(diff)) process.stdout.write(`${line}\n`);
+  }
+
+  if (args.flags["apply"] !== true) {
+    if (diff.additions.length > 0) {
+      process.stdout.write("\nrun with --apply to write these additions (interactive confirm).\n");
+    }
+    return;
+  }
+
+  // ---- --apply: interactive-confirm ONLY ----
+  if (diff.additions.length === 0) {
+    process.stdout.write("nothing to apply — no new rules.\n");
+    return;
+  }
+  // Non-TTY --apply REFUSES. Permissions must never be widened by an
+  // unattended pipe; the diff is already printed above.
+  if (process.stdin.isTTY !== true || process.stdout.isTTY !== true) {
+    die(
+      "--apply refuses in a non-interactive shell: permissions are never applied unattended. " +
+        "Review the diff above and re-run `crewhaus permissions suggest --apply` in an interactive terminal.",
+    );
+  }
+  const confirmed = await confirmYesNo(
+    `apply ${diff.additions.length} new permission rule(s) to ${relative(process.cwd(), settingsPath) || settingsPath}? [y/N] `,
+  );
+  if (!confirmed) {
+    process.stdout.write("aborted — settings.json unchanged.\n");
+    return;
+  }
+  const newRoot = applyToSettingsRoot(settingsRoot, diff.merged);
+  mkdirSync(dirname(settingsPath), { recursive: true });
+  writeFileSync(settingsPath, `${JSON.stringify(newRoot, null, 2)}\n`);
+  process.stdout.write(`[permissions] wrote ${diff.additions.length} rule(s) to ${settingsPath}\n`);
+}
+
+/**
+ * One-line y/N confirm over a TTY. Returns true only on an explicit
+ * y/yes (default No). Thin IO — the caller has already gated on isTTY.
+ */
+async function confirmYesNo(prompt: string): Promise<boolean> {
+  const stdin = process.stdin;
+  process.stdout.write(prompt);
+  return await new Promise<boolean>((resolveConfirm) => {
+    let done = false;
+    const finish = (v: boolean): void => {
+      if (done) return;
+      done = true;
+      stdin.off("data", onData);
+      stdin.pause();
+      process.stdout.write("\n");
+      resolveConfirm(v);
+    };
+    const onData = (chunk: Buffer | string): void => {
+      const answer = chunk.toString().trim().toLowerCase();
+      finish(answer === "y" || answer === "yes");
+    };
+    stdin.resume();
+    stdin.once("data", onData);
+  });
 }
 
 // -------- response feedback: rate / feedback / distill --------
@@ -9590,6 +10695,35 @@ switch (subcommand) {
   case "doctor":
     await runDoctor(parseFor(rest, DOCTOR_SCHEMA));
     break;
+  case "model-scan":
+    try {
+      await runModelScan(parseFor(rest, MODEL_SCAN_SCHEMA));
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
+    break;
+  case "pricing": {
+    const action = rest[0] ?? "";
+    if (action !== "sync" && action !== "show") {
+      die(`pricing action must be "sync" or "show" (got "${action}")`);
+    }
+    await runPricing(parseFor(rest.slice(1), PRICING_SCHEMA), action);
+    break;
+  }
+  case "model": {
+    const action = rest[0] ?? "";
+    if (action !== "right-size") {
+      die(`model action must be "right-size" (got "${action}")`);
+    }
+    try {
+      await runModelRightSize(parseFor(rest.slice(1), MODEL_SCHEMA));
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
+    break;
+  }
   case "context":
     runContext(parseFor(rest, CONTEXT_SCHEMA));
     break;
@@ -9599,6 +10733,22 @@ switch (subcommand) {
   case "advise":
     await runAdvise(parseFor(rest, ADVISE_SCHEMA));
     break;
+  case "tools": {
+    const action = rest[0] ?? "";
+    if (action !== "list" && action !== "suggest" && action !== "audit") {
+      die(`tools action must be one of: list, suggest, audit (got "${action}")`);
+    }
+    await runTools(action, parseFor(rest.slice(1), TOOLS_SCHEMA));
+    break;
+  }
+  case "permissions": {
+    const action = rest[0] ?? "";
+    if (action !== "suggest") {
+      die(`permissions action must be "suggest" (got "${action}")`);
+    }
+    await runPermissions(action, parseFor(rest.slice(1), PERMISSIONS_SCHEMA));
+    break;
+  }
   case "rate":
     await runRate(parseFor(rest, RATE_SCHEMA));
     break;

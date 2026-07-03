@@ -25,6 +25,7 @@ export type {
   ModelRequestEvent,
   ModelResponseEvent,
   ModelStreamTokenEvent,
+  ModelTierRouteEvent,
   ModelUsage,
   PermissionDecisionEvent,
   ProgramOutputEvent,
