@@ -26,7 +26,10 @@ import {
 import { CrewhausError } from "@crewhaus/errors";
 import { type Sample, loadDataset } from "@crewhaus/eval-dataset";
 import { type CompiledGrader, parseGradersConfig } from "@crewhaus/eval-grader";
-import { optimizeSpec } from "@crewhaus/eval-optimizer-orchestrator";
+import {
+  extractCurrentPrompt as extractInstructions,
+  optimizeSpec,
+} from "@crewhaus/eval-optimizer-orchestrator";
 import {
   type RunIndexEntry,
   buildMatrix,
@@ -297,6 +300,16 @@ import {
   normalizeRating,
   samplesToJsonl,
 } from "./feedback";
+// Item #54 — few-shot pool harvesting (side-effect-free; FS + redactor wiring
+// lives here in index.ts). Powers `fewshot harvest` and `optimize --few-shot`.
+import {
+  type FewShotExample,
+  formatFewShotForPrompt,
+  harvestFewShot,
+  isFewShotExample,
+  mergePools,
+  poolToJsonl,
+} from "./fewshot";
 // Item 45 — `crewhaus flywheel init|run`: the packaged nightly
 // self-improvement loop (knob/default resolution, the accept-then-write
 // loop with injected steps, the report, and the workflow scaffold), in a
@@ -747,6 +760,12 @@ const OPTIMIZE_SCHEMA: ParseArgsSchema = {
     // Synthesizes the dataset (and, when --graders is omitted, the graders too).
     { name: "ratings", takesValue: true },
     { name: "min-score", takesValue: true },
+    // Item #54 — inject the top-K harvested few-shot examples as in-context
+    // demonstrations at the front of the seed instructions the optimizer
+    // mutates. Value: a pool file path, or "auto" for the cwd default
+    // `.crewhaus/fewshot/<spec>.jsonl`. Composes with --ratings.
+    { name: "few-shot", takesValue: true },
+    { name: "few-shot-k", takesValue: true },
     { name: "mutator", takesValue: true },
     { name: "iterations", takesValue: true },
     { name: "seed", takesValue: true },
@@ -911,6 +930,21 @@ const DISTILL_SCHEMA: ParseArgsSchema = {
     // train/dev/test split), consumable as `--dataset registry:<name>`.
     // -o becomes optional when given; plain file output stays the default.
     { name: "register", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
+// Item #54 — `crewhaus fewshot harvest|show`: mine up-rated turns into a
+// golden few-shot pool consumable by `optimize --few-shot`.
+const FEWSHOT_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "session", takesValue: true },
+    { name: "all-sessions", takesValue: false },
+    { name: "min-score", takesValue: true },
+    // Override the pool file (default `.crewhaus/fewshot/<spec>.jsonl`).
+    { name: "out", short: "o", takesValue: true },
+    // show/inject: how many top examples to print/format (default 5).
+    { name: "k", takesValue: true },
     { name: "help", short: "h" },
   ],
 };
@@ -1236,6 +1270,9 @@ function usageText(): string {
     "  distill --session <id> -o <ds.jsonl> turn ratings into an eval dataset + graders",
     "       [--all-sessions] [--graders-out <g.yaml>] [--min-score F]",
     "       [--register <name>]            also promote a new dataset version into the registry",
+    "  fewshot harvest [--all-sessions]     harvest up-rated turns into a golden few-shot pool (#54)",
+    "       [--min-score F] [-o <pool>]     (PII/secret-redacted); optimize with --few-shot",
+    "  fewshot show [--k N]                 print the pool as the injectable prompt block",
     "  datasets list                        all registered datasets + versions (Section 29)",
     "  datasets get <name>[@version]        print a dataset's samples as JSONL",
     "       [--split train|dev|test]",
@@ -3986,6 +4023,55 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
       ? resolve(outDirArg)
       : resolve(join(".crewhaus", "optimize", runId));
 
+  // Item #54 — few-shot injection. When `--few-shot <pool|auto>` is set, prepend
+  // the top-K harvested examples to the spec's `agent.instructions` in an
+  // in-memory augmented temp spec that the optimizer + fitness run against, so
+  // the mutation search improves the prompt WITH the in-context demonstrations
+  // present. The source spec is never mutated on this path (patch-only), so the
+  // examples don't accidentally get baked into the tracked spec; re-run without
+  // --few-shot (or edit instructions) to persist them.
+  const fewShotFlag = strFlag(args, "few-shot");
+  let optimizeSpecPath = absSpec;
+  let fewShotDisablesWriteBack = false;
+  if (typeof fewShotFlag === "string") {
+    const poolFile =
+      fewShotFlag === "auto"
+        ? join(
+            dirname(absSpec),
+            FEWSHOT_SUBDIR,
+            `${parseSpec(readFileSync(absSpec, "utf-8")).name}.jsonl`,
+          )
+        : resolve(fewShotFlag);
+    const pool = readFewShotPool(poolFile);
+    if (pool.length === 0) {
+      die(`no few-shot pool at ${poolFile} — run \`crewhaus fewshot harvest\` first`);
+    }
+    const fewShotK = intFlag(args, "few-shot-k") ?? 5;
+    const block = formatFewShotForPrompt(pool, fewShotK);
+    const yamlText = readFileSync(absSpec, "utf-8");
+    const baseSpec = parseSpec(yamlText);
+    const augmentedInstructions = `${block}\n\n${extractInstructions(baseSpec)}`;
+    const { applySpecPatch } = await import("@crewhaus/spec-patch");
+    const { yaml: augmentedYaml } = applySpecPatch(yamlText, {
+      target: baseSpec.target as never,
+      path: ["agent", "instructions"],
+      op: "replace",
+      value: augmentedInstructions,
+    });
+    mkdirSync(outDir, { recursive: true });
+    optimizeSpecPath = join(outDir, "fewshot-augmented.yaml");
+    writeFileSync(optimizeSpecPath, augmentedYaml, { mode: 0o600 });
+    fewShotDisablesWriteBack = true;
+    process.stdout.write(
+      `[optimize] injected ${Math.min(fewShotK, pool.length)} few-shot example(s) from ${poolFile}\n`,
+    );
+    if (writeBack) {
+      process.stderr.write(
+        "[optimize] --write-back is ignored with --few-shot (the augmented spec is patch-only to keep the tracked spec clean)\n",
+      );
+    }
+  }
+
   let gradersYaml: string;
   if (typeof gradersPath === "string") {
     try {
@@ -4154,7 +4240,9 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
   const fitness = async (
     prompt: string,
   ): Promise<import("@crewhaus/prompt-optimizer").FitnessResult> => {
-    const yamlText = readFileSync(absSpec, "utf-8");
+    // Item #54 — read the (possibly few-shot-augmented) optimize spec so the
+    // fitness eval sees the same in-context examples the search mutates around.
+    const yamlText = readFileSync(optimizeSpecPath, "utf-8");
     // Re-parse to capture spec.target without depending on the
     // orchestrator's extractCurrentPrompt internals.
     const parsedTarget = parseSpec(yamlText).target;
@@ -4274,7 +4362,7 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
   }
 
   const result = await optimizeSpec({
-    specPath: absSpec,
+    specPath: optimizeSpecPath,
     fitness,
     trainSet,
     devSet,
@@ -4282,7 +4370,9 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
     seed,
     improvementThreshold,
     outDir,
-    writeBack,
+    // Item #54 — the few-shot path is patch-only so the injected examples never
+    // land in the tracked spec (they'd double-inject on the next run).
+    writeBack: writeBack && !fewShotDisablesWriteBack,
     runId,
     traceBus,
     ...(mutatorImpl !== undefined ? { mutator: mutatorImpl } : {}),
@@ -6929,6 +7019,7 @@ async function runAdvise(args: ParsedArgs): Promise<void> {
 
 const SESSIONS_SUBDIR = join(".crewhaus", "sessions");
 const FEEDBACK_SUBDIR = join(".crewhaus", "feedback");
+const FEWSHOT_SUBDIR = join(".crewhaus", "fewshot");
 
 function sessionJsonlPath(session: string): string {
   return join(process.cwd(), SESSIONS_SUBDIR, `${session}.jsonl`);
@@ -7267,6 +7358,125 @@ function distillRatings(
     ...(s.expected_output !== undefined ? { expected_output: s.expected_output } : {}),
   }));
   return { samples, gradersYaml: gradersConfigToYaml(result.graders) };
+}
+
+/**
+ * Gather every session's derived turns (tagged with the session join key) plus
+ * all feedback (in-transcript events + the web-UI feedback dir). Shared by the
+ * few-shot / FAQ / lessons harvesters so they read the same corpus `distill`
+ * does. `sessionsArg` is a session id or `"all"`.
+ */
+function resolveHarvestSessionIds(sessionsArg: string | undefined, allFlag: boolean): string[] {
+  const sessionsDir = join(process.cwd(), SESSIONS_SUBDIR);
+  if (allFlag || sessionsArg === "all" || sessionsArg === undefined) {
+    return listSessionIds(sessionsDir);
+  }
+  if (!SESSION_ID_REGEX.test(sessionsArg)) {
+    die(`invalid --session "${sessionsArg}" — expected sess_<16 hex> or "all"`);
+  }
+  return [sessionsArg];
+}
+
+function gatherTurnsAndFeedback(sessionIds: ReadonlyArray<string>): {
+  turns: SessionTurn[];
+  feedback: FeedbackRecord[];
+} {
+  const turns: SessionTurn[] = [];
+  const feedback: FeedbackRecord[] = [];
+  for (const id of sessionIds) {
+    const events = readSessionEvents(id);
+    for (const t of deriveTurns(events)) turns.push({ ...t, sessionId: id });
+    feedback.push(...extractFeedbackRecords(events));
+  }
+  feedback.push(...readFeedbackDir(join(process.cwd(), FEEDBACK_SUBDIR)));
+  return { turns, feedback };
+}
+
+/** Read a persisted few-shot pool file, skipping malformed lines. */
+function readFewShotPool(file: string): FewShotExample[] {
+  if (!existsSync(file)) return [];
+  return parseJsonlObjects(readFileSync(file, "utf-8")).filter(isFewShotExample);
+}
+
+/**
+ * Item #54 — `crewhaus fewshot harvest|show`. `harvest` mines up-rated turns
+ * into a golden few-shot pool (merged idempotently into
+ * `.crewhaus/fewshot/<spec>.jsonl`, PII/secret-redacted); `show` prints the
+ * top-K pool entries as the injectable prompt block.
+ */
+async function runFewshot(args: ParsedArgs): Promise<void> {
+  const action = args.positional[0];
+  if (args.flags["help"] === true && action === undefined) {
+    process.stdout.write(
+      "usage: crewhaus fewshot <harvest|show> [--session <id>|--all-sessions] [--min-score F] [-o <pool.jsonl>] [--k N]\n" +
+        "  harvest  mine up-rated turns into a golden few-shot pool (PII/secret-redacted)\n" +
+        "  show     print the top-K pool examples as the injectable prompt block\n",
+    );
+    return;
+  }
+  // The pool file: --out override, else the cwd spec's name, else a default.
+  const specName = readCwdSpecName();
+  const poolFile = strFlag(args, "out") ?? join(process.cwd(), FEWSHOT_SUBDIR, `${specName}.jsonl`);
+  const k = intFlag(args, "k") ?? 5;
+
+  if (action === "show") {
+    const pool = readFewShotPool(poolFile);
+    if (pool.length === 0)
+      die(`no few-shot pool at ${poolFile} — run \`crewhaus fewshot harvest\``);
+    process.stdout.write(`${formatFewShotForPrompt(pool, k)}\n`);
+    return;
+  }
+  if (action !== "harvest") {
+    die(`fewshot: unknown action "${action ?? ""}" — supported: harvest, show`);
+  }
+
+  const minScore = floatFlag(args, "min-score") ?? 0.7;
+  if (minScore < 0 || minScore > 1) die(`invalid --min-score "${minScore}" — must be in [0,1]`);
+  const sessionIds = resolveHarvestSessionIds(
+    strFlag(args, "session"),
+    args.flags["all-sessions"] === true,
+  );
+  if (sessionIds.length === 0) die("no sessions found under .crewhaus/sessions/");
+  const { turns, feedback } = gatherTurnsAndFeedback(sessionIds);
+  if (feedback.length === 0) {
+    die("no feedback found — record some with `crewhaus rate` / `crewhaus feedback` first");
+  }
+
+  // Redact harvested outputs with the shared secret/API-key + PII detector set
+  // so a pasted credential never lands in the pool or the optimizer prompt.
+  const { createPiiRedactor } = await import("@crewhaus/pii-redactor");
+  const { SYNTHESIZE_PII_DETECTORS } = await import("./dataset-mine");
+  const redactor = createPiiRedactor({ regexDetectors: SYNTHESIZE_PII_DETECTORS });
+
+  const { examples, stats } = await harvestFewShot(turns, feedback, {
+    minScore,
+    redact: async (t) => (await redactor.redact(t)).text,
+  });
+  if (examples.length === 0) {
+    die(`no up-rated turns qualified (min-score ${minScore}); matched ${stats.qualified}`);
+  }
+  const merged = mergePools(readFewShotPool(poolFile), examples);
+  mkdirSync(dirname(poolFile), { recursive: true });
+  writeFileSync(poolFile, poolToJsonl(merged), { mode: 0o600 });
+  process.stdout.write(
+    `[fewshot] harvested ${examples.length} example(s) → ${merged.length} in pool → ${poolFile}\n`,
+  );
+}
+
+/** Best-effort read of the cwd harness spec's `name` for default pool/skill
+ *  paths. Falls back to "harness" when no spec is present in the cwd. */
+function readCwdSpecName(): string {
+  for (const candidate of ["crewhaus.yaml", "crewhaus.yml"]) {
+    const p = join(process.cwd(), candidate);
+    if (existsSync(p)) {
+      try {
+        return parseSpec(readFileSync(p, "utf-8")).name;
+      } catch {
+        // fall through to the default
+      }
+    }
+  }
+  return "harness";
 }
 
 // -------- item 4: crewhaus graders suggest --------
@@ -9082,6 +9292,17 @@ switch (subcommand) {
     break;
   case "distill":
     await runDistill(parseFor(rest, DISTILL_SCHEMA));
+    break;
+  case "fewshot":
+    // Item #54 — `fewshot harvest|show`: mine up-rated turns into a golden
+    // few-shot pool for `optimize --few-shot`. Structured failures route
+    // through die().
+    try {
+      await runFewshot(parseFor(rest, FEWSHOT_SCHEMA));
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
     break;
   case "scaffold-evals":
     // Mirror `run`'s policy: structured failures (SpecParseError, model
