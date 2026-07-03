@@ -576,6 +576,7 @@ import {
   formatDriftReport,
   formatHealthReport,
   quarantineNotice,
+  safeMcpFileName,
   scoreMcpHealth,
 } from "./mcp-doctor";
 // Item 24 — market scan + doctor --models + pricing sync core, in a
@@ -764,7 +765,7 @@ import { SESSIONS_INDEX_DIRNAME, summarizeSessionIntoIndex } from "./sessions-in
 // modules (this entry file runs an argv switch on import) mirroring
 // doctor-checks.ts / alert-sink.ts.
 import { runSloProbe } from "./slo-doctor";
-import { buildSloSink, intakeGatePayload } from "./slo-sink";
+import { buildSloSink, intakeGatePayload, lastKnownGoodFromAuditRecords } from "./slo-sink";
 // Item 69 — `crewhaus state backup|restore` core (tarball snapshot of the
 // cwd `.crewhaus` state dir + full/merge restore), in a module with no
 // import-time side effects so it is unit-testable (this entry file runs an
@@ -3847,12 +3848,31 @@ async function runRunCli(
                 "@crewhaus/deployment-controller"
               );
               const registry = createFileBackedRegistry({ rootDir: specRootDir });
-              const versions = await registry.list(ir.name);
               const current = await registry.aliasFor(ir.name, "prod");
-              const prior = versions.filter((v) => v !== current).at(-1);
+              // LAST-KNOWN-GOOD, not a lexicographic guess: the version that was
+              // pinned to prod immediately BEFORE `current`, read from the
+              // deployment-controller's `deployment_action` audit history. A
+              // lexicographic sort would pick e.g. v2 out of [v1,v2,v9,v10] as
+              // "the last non-current version" and roll production back to an
+              // arbitrary/ancient release. Never guess when flipping a prod pin.
+              const prior = lastKnownGoodFromAuditRecords(
+                readAuditRecords(),
+                ir.name,
+                "prod",
+                current,
+              );
               if (prior === undefined) {
                 process.stderr.write(
-                  "[slo] rollback: no prior version to roll back to — skipping\n",
+                  "[slo] rollback: no recorded last-known-good predecessor in deployment_action history — skipping (refusing to guess a prod pin; alert/pause-intake still applied)\n",
+                );
+                return;
+              }
+              // Guard: the predecessor must still exist in the registry (a
+              // deleted version can't be re-pinned; the controller would throw).
+              const versions = await registry.list(ir.name);
+              if (!versions.includes(prior)) {
+                process.stderr.write(
+                  `[slo] rollback: last-known-good ${prior} no longer in registry — skipping\n`,
                 );
                 return;
               }
@@ -3863,7 +3883,7 @@ async function runRunCli(
               });
               await controller.rollback(ir.name, "prod", prior);
               process.stderr.write(
-                `[slo] auto-rolled-back ${ir.name} prod → ${prior} (SLO breach: ${event.breach.detail})\n`,
+                `[slo] auto-rolled-back ${ir.name} prod → ${prior} (last-known-good; SLO breach: ${event.breach.detail})\n`,
               );
             },
           }
@@ -12838,7 +12858,10 @@ async function runMcpDoctor(args: ParsedArgs): Promise<void> {
               tools.map((t) => ({ name: t.name, inputSchema: t.inputSchema })),
               nowIso,
             );
-            const snapshotPath = join(mcpDir, `${name}.json`);
+            // F5 — the server name is an mcp_servers KEY (schema is
+            // z.string().min(1), not safeName), so `../../evil` would escape
+            // .crewhaus/mcp/. Sanitise to a bare filename segment before joining.
+            const snapshotPath = join(mcpDir, `${safeMcpFileName(name)}.json`);
             let previous: McpServerSnapshot | undefined;
             if (existsSync(snapshotPath)) {
               try {

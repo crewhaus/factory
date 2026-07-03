@@ -639,3 +639,24 @@ describe("emitCli — memory block (#53)", () => {
     expect(content).not.toContain("createMemoryTools");
   });
 });
+
+describe("emitCli — observability.slo → sloTargets (item 37, F4 codegen parity)", () => {
+  test("a compiled bundle threads sloTargets into runChatLoop so the monitor attaches", () => {
+    const content =
+      emitCli(
+        baseIr({
+          observability: {
+            slo: { ttftMs: 1400, windowMs: 300_000, mitigation: ["alert"] },
+          },
+        }),
+      ).files[0]?.content ?? "";
+    expect(content).toContain("sloTargets:");
+    expect(content).toContain('"ttftMs":1400');
+    expect(content).toContain('"mitigation":["alert"]');
+  });
+
+  test("no observability block ⇒ no sloTargets field (byte-identical to before)", () => {
+    const content = emitCli(baseIr()).files[0]?.content ?? "";
+    expect(content).not.toContain("sloTargets:");
+  });
+});

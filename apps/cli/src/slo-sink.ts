@@ -12,10 +12,15 @@
  *                     breach is an alert;
  *   - `pauseIntake` → flips a durable intake gate (`.crewhaus/slo/intake.json`
  *                     `{ paused: true }`) that the gateway/managed daemon reads
- *                     to send new requests down the 429 `budget_exceeded` path
- *                     until an operator clears it;
- *   - `rollback`    → auto-rollback the env pin to the last-known-good version
- *                     via the injected deployment-controller closure.
+ *                     to send new requests down the 429 `budget_exceeded` path;
+ *                     the SAME writer is invoked with `paused:false` (resume)
+ *                     when the breach clears, so admission re-opens without
+ *                     operator intervention;
+ *   - `rollback`    → auto-rollback the env pin to the LAST-KNOWN-GOOD version —
+ *                     the version that was pinned to the env immediately before
+ *                     the current one, read from the `deployment_action` audit
+ *                     history (see {@link lastKnownGoodFromAuditRecords}), NOT a
+ *                     lexicographic guess — via the injected deployment-controller.
  *
  * Side-effect-free + injected (audit log, alert delivery, intake writer, rollback
  * closure) mirroring `alert-sink.ts`. The CLI `run` path wires the real
@@ -33,7 +38,9 @@ export type SloAuditSink = {
   }): Promise<unknown>;
 };
 
-/** The intake-gate writer seam. Flips a durable pause flag the daemon reads. */
+/** The intake-gate writer seam. Flips a durable pause flag the daemon reads.
+ *  Called with `paused:true` on the `pause-intake` rung and `paused:false` when
+ *  the breach clears (resume), so the gate can honestly re-open admission. */
 export type IntakeGateWriter = (paused: boolean, reason: string) => Promise<void>;
 
 /** The rollback seam — a deployment-controller `rollback` closure bound to the
@@ -93,6 +100,13 @@ export function buildSloSink(opts: BuildSloSinkOptions): SloMitigationSink | und
         warn(`[slo] pause-intake failed: ${err instanceof Error ? err.message : String(err)}`);
       });
     };
+    // Resume is the SAME durable gate flipped back to `paused:false` when the
+    // breach clears, so admission re-opens without operator intervention.
+    sink.resumeIntake = async (event: SloMitigationEvent): Promise<void> => {
+      await opts.pauseIntake?.(false, `SLO recovered: ${event.breach.detail}`).catch((err) => {
+        warn(`[slo] resume-intake failed: ${err instanceof Error ? err.message : String(err)}`);
+      });
+    };
   }
   if (opts.rollback !== undefined) {
     sink.rollback = async (event: SloMitigationEvent): Promise<void> => {
@@ -122,4 +136,76 @@ export function intakeGatePayload(
   now = Date.now(),
 ): IntakeGateFile {
   return { version: 1, paused, ...(reason !== "" ? { reason } : {}), ts: now };
+}
+
+/**
+ * The `deployment_action` audit-record payload shape written by
+ * `@crewhaus/deployment-controller` (a structural mirror of its
+ * `DeploymentRecordPayload`). Every promote/rollback appends one, so the audit
+ * chain IS the pin history. A promote records the destination env in `toEnv`; a
+ * rollback records it in `env`. Both carry `fromVersion` (the env's pin BEFORE
+ * this action) and `toVersion` (the pin AFTER).
+ */
+type DeploymentActionPayload = {
+  readonly action?: string;
+  readonly name?: string;
+  readonly env?: string;
+  readonly toEnv?: string;
+  readonly fromVersion?: string;
+  readonly toVersion?: string;
+  readonly ts?: number;
+};
+
+/** An audit record as read back off the hash chain (only the fields we need). */
+type AuditRecordLike = {
+  readonly kind?: string;
+  readonly ts?: number;
+  readonly payload?: unknown;
+};
+
+/**
+ * Resolve the LAST-KNOWN-GOOD version to roll `name`'s `env` pin back to, from
+ * the `deployment_action` audit history — the actual version that was pinned to
+ * `env` immediately BEFORE `current`, never a lexicographic guess.
+ *
+ * The predecessor is the `fromVersion` of the most recent `deployment_action`
+ * that set `env` to `current` (a promote with `toEnv === env` OR a rollback with
+ * `env === env`, in both cases `toVersion === current`). Records are consulted
+ * newest-first by `ts` so an env that flip-flopped (v1 → v9 → v1 → v9) rolls
+ * back to whatever was live just before THIS pin, not an ancient one.
+ *
+ * Returns `undefined` when the history reveals no distinct predecessor (e.g. the
+ * env was pinned once via a raw `spec pin`, or the recorded predecessor equals
+ * `current`). The caller MUST treat `undefined` as "cannot safely roll back —
+ * skip", never fall back to a lexicographic pick.
+ */
+export function lastKnownGoodFromAuditRecords(
+  records: ReadonlyArray<unknown>,
+  name: string,
+  env: string,
+  current: string | undefined,
+): string | undefined {
+  let best: { fromVersion: string; ts: number } | undefined;
+  for (const raw of records) {
+    if (raw === null || typeof raw !== "object") continue;
+    const rec = raw as AuditRecordLike;
+    if (rec.kind !== "deployment_action") continue;
+    const p = rec.payload;
+    if (p === null || typeof p !== "object") continue;
+    const payload = p as DeploymentActionPayload;
+    if (payload.name !== name) continue;
+    // The env this action targeted: promote → toEnv, rollback → env.
+    const targetEnv = payload.action === "promote" ? payload.toEnv : payload.env;
+    if (targetEnv !== env) continue;
+    // Only actions that produced the CURRENT pin tell us its predecessor. When
+    // `current` is unknown (no live pin), any prior good pin for the env works,
+    // so accept the newest action's fromVersion.
+    if (current !== undefined && payload.toVersion !== current) continue;
+    const from = payload.fromVersion;
+    if (typeof from !== "string" || from === "" || from === current) continue;
+    // Prefer the record with the LATEST timestamp (payload.ts, else record ts).
+    const ts = typeof payload.ts === "number" ? payload.ts : (rec.ts ?? 0);
+    if (best === undefined || ts >= best.ts) best = { fromVersion: from, ts };
+  }
+  return best?.fromVersion;
 }

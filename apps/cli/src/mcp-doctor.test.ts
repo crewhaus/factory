@@ -5,6 +5,7 @@
  * decision, and the report rendering.
  */
 import { describe, expect, test } from "bun:test";
+import { join } from "node:path";
 import {
   type McpStatsPayload,
   buildSnapshot,
@@ -14,6 +15,7 @@ import {
   formatHealthReport,
   isChronic,
   quarantineNotice,
+  safeMcpFileName,
   schemaHash,
   scoreMcpHealth,
 } from "./mcp-doctor";
@@ -172,5 +174,41 @@ describe("rendering", () => {
   test("quarantine notice names the server + reason", () => {
     expect(quarantineNotice("weather", "80% errors")).toContain("weather");
     expect(quarantineNotice("weather", "80% errors")).toContain("80% errors");
+  });
+});
+
+describe("safeMcpFileName — F5 path-traversal safety", () => {
+  const mcpDir = "/repo/.crewhaus/mcp";
+
+  test("a traversal name stays inside the mcp dir", () => {
+    const path = join(mcpDir, `${safeMcpFileName("../../evil")}.json`);
+    expect(path.startsWith(mcpDir)).toBe(true);
+    expect(path).not.toContain("..");
+    // basename("../../evil") is "evil" → the file is .crewhaus/mcp/evil.json.
+    expect(path).toBe(join(mcpDir, "evil.json"));
+  });
+
+  test("a slashed name cannot introduce a subdirectory", () => {
+    const path = join(mcpDir, `${safeMcpFileName("a/b/c")}.json`);
+    expect(path).toBe(join(mcpDir, "c.json"));
+  });
+
+  test("an absolute-path name is neutralised to a bare segment", () => {
+    const path = join(mcpDir, `${safeMcpFileName("/etc/passwd")}.json`);
+    expect(path).toBe(join(mcpDir, "passwd.json"));
+  });
+
+  test("dot-only / empty names floor to a stable placeholder", () => {
+    expect(safeMcpFileName("..")).toBe("_server");
+    expect(safeMcpFileName(".")).toBe("_server");
+    expect(safeMcpFileName("...")).toBe("_server");
+  });
+
+  test("odd characters (spaces, colons) collapse to underscores", () => {
+    expect(safeMcpFileName("we ird:na me")).toBe("we_ird_na_me");
+  });
+
+  test("an ordinary server name is preserved", () => {
+    expect(safeMcpFileName("weather-api_v2.1")).toBe("weather-api_v2.1");
   });
 });

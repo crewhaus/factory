@@ -212,3 +212,34 @@ describe("emitManaged — run-level budget field (item 27)", () => {
     expect(agentTs).not.toContain("budget:");
   });
 });
+
+describe("emitManaged — SLO wiring (ops item 37)", () => {
+  const sloIr: IrManagedV0 = {
+    ...ir,
+    observability: {
+      slo: { ttftMs: 1400, windowMs: 300_000, mitigation: ["alert", "pause-intake"] },
+    },
+  };
+
+  test("daemon.ts wires the durable intake gate into gateway admission (F3 reader)", () => {
+    const daemon = emitManaged(ir).files.find((f) => f.path === "daemon.ts")?.content ?? "";
+    // The reader is unconditional — an operator/monitor can pause a running
+    // daemon even for a spec without a declared SLO block.
+    expect(daemon).toContain("intakeGate: readIntakeGate");
+    expect(daemon).toContain(".crewhaus/slo/intake.json");
+    expect(daemon).toContain("function readIntakeGate");
+    expect(daemon).toContain('import { readFileSync } from "node:fs"');
+  });
+
+  test("agent.ts threads sloTargets into runChatLoop when the spec declares SLO (F4)", () => {
+    const agentTs = emitManaged(sloIr).files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agentTs).toContain("sloTargets:");
+    expect(agentTs).toContain('"ttftMs":1400');
+    expect(agentTs).toContain('"mitigation":["alert","pause-intake"]');
+  });
+
+  test("agent.ts omits sloTargets when the spec has no observability block", () => {
+    const agentTs = emitManaged(ir).files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agentTs).not.toContain("sloTargets:");
+  });
+});

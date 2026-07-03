@@ -24,6 +24,24 @@
  *      CLI; this module only decides.
  */
 import { createHash } from "node:crypto";
+import { basename } from "node:path";
+
+/**
+ * F5 — sanitise an mcp_servers KEY into a single safe filename segment before it
+ * is joined onto `.crewhaus/mcp/` (the drift-snapshot write). The mcp_servers
+ * key schema is `z.string().min(1)` (NOT `safeName`), so a server named
+ * `../../evil` — or one carrying a slash / NUL — would let
+ * `join(mcpDir, `${name}.json`)` escape the directory. We `basename` to strip
+ * path components, then replace every character outside the conservative
+ * `[A-Za-z0-9._-]` set with `_` (the same class the eval-runner + graders use),
+ * and floor an empty / dot-only result to a stable placeholder. The result is
+ * always a bare filename that stays inside the snapshot dir.
+ */
+export function safeMcpFileName(name: string): string {
+  const base = basename(name).replace(/[^A-Za-z0-9._-]+/g, "_");
+  if (base === "" || base === "." || base === ".." || /^\.+$/.test(base)) return "_server";
+  return base;
+}
 
 // -------- 1. health scoring --------
 
