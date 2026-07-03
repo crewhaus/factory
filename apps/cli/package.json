@@ -54,6 +54,7 @@
     "@crewhaus/eval-report": "workspace:*",
     "@crewhaus/eval-runner": "workspace:*",
     "@crewhaus/event-log": "workspace:*",
+    "@crewhaus/grader-safety-classifiers": "workspace:*",
     "@crewhaus/hooks-engine": "workspace:*",
     "@crewhaus/infra-utils": "workspace:*",
     "@crewhaus/ir": "workspace:*",

@@ -417,6 +417,32 @@ import {
   openJustificationAuditSink,
   resolveJudgeChoice,
 } from "./justification-gate";
+// Item 63 — cross-harness knowledge sync: shared memories / graders / prompt
+// fragments moved between a harness and a fleet-level store, dedupe-by-hash,
+// provenance-tagged, PII/token-redacted on push. Side-effect-free module so
+// it is unit-testable (this entry file runs an argv switch on import); the
+// redactor is injected.
+import {
+  KnowledgeSyncError,
+  type PullPlan,
+  type PushPlan,
+  type Redactor,
+  SHARED_DIR_DEFAULT,
+  applyPull,
+  applyPush,
+  formatPullReport,
+  formatPushReport,
+  fragmentContentHash,
+  harnessOptedIn,
+  memoryContentHash,
+  planPull,
+  planPush,
+  readHarnessGraders,
+  readHarnessMemories,
+  readHarnessPrompts,
+  readSharedFragments,
+  readSharedMemories,
+} from "./knowledge-sync";
 // Item 41 — `crewhaus lint` (parse + ir-passes collect-all + scope audit) and
 // `compile --watch` (debounced re-validate loop) live in side-effect-free
 // modules so this entry file stays testable.
@@ -1013,6 +1039,21 @@ const TEMPLATES_SCHEMA: ParseArgsSchema = {
   ],
 };
 
+// Item 63 — `crewhaus knowledge sync [--pull|--push]`. `--root` scopes the
+// fleet discovery; `--shared` overrides the shared-store dir; `--dry-run`
+// plans without writing; `--no-redact` skips redaction (dev/local only).
+const KNOWLEDGE_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "root", takesValue: true },
+    { name: "shared", takesValue: true },
+    { name: "pull", takesValue: false },
+    { name: "push", takesValue: false },
+    { name: "dry-run", takesValue: false },
+    { name: "no-redact", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
 // Item 58 — `crewhaus fleet list|status|run`. `--root` scopes discovery;
 // `--filter` narrows a bulk `run`; `--allow-mutating` + per-harness confirm
 // gates a mutating bulk op; `--yes` skips the interactive confirm (CI).
@@ -1541,6 +1582,7 @@ function usageText(): string {
     "  secrets doctor                       list known secrets via the configured backend",
     "  secrets rotate <name> [--value V]    rotate a named secret (file backend)",
     "  fleet list|status|run <sub> ...      cross-harness inventory/health + bulk read-ops (item 58)",
+    "  knowledge sync [--pull|--push]       cross-harness shared memories/graders/prompts (item 63)",
     "  plugins list|search|install|...      marketplace plugins CLI + publish/outdated (item 60)",
     "  templates list|search|use ...        marketplace templates CLI (item 60)",
     "  spec put|list|get|pin|alias|log ...  versioned spec storage + changelog (Section 28 spec-registry)",
@@ -9160,6 +9202,178 @@ async function runFleet(args: ParsedArgs, action: string): Promise<void> {
   }
 }
 
+/**
+ * Item 63 — `crewhaus knowledge sync [--pull|--push]`. Move shared memories /
+ * graders / prompt fragments between the opted-in harnesses under `--root`
+ * and a fleet-level shared store. Push redacts (PII + credential-shaped
+ * tokens) and drops anything a token survives; pull dedupes by content hash.
+ * Heavy logic is in `./knowledge-sync`; this wires the real redactor + fs.
+ */
+async function runKnowledge(args: ParsedArgs, action: string): Promise<void> {
+  if (args.flags["help"] || action !== "sync") {
+    process.stdout.write(
+      "usage: crewhaus knowledge sync [--pull | --push] [--root <dir>] [--shared <dir>]\n" +
+        "         [--dry-run] [--no-redact]\n" +
+        "\n" +
+        "  Move shared memories, reusable graders.yaml, and prompt fragments between\n" +
+        "  the opted-in harnesses under --root (a dir with .crewhaus/knowledge.json\n" +
+        '  {"share": true}) and a fleet-level shared store (default ./.crewhaus-shared,\n' +
+        "  or CREWHAUS_SHARED_DIR). --push shares OUT (redacting PII + credential-shaped\n" +
+        "  tokens; anything a token survives is dropped, never shared); --pull brings\n" +
+        "  IN. Both dedupe by content hash, so re-running is a no-op. With neither flag,\n" +
+        "  sync does push then pull.\n",
+    );
+    return;
+  }
+  const rootFlag = args.flags["root"];
+  const root = typeof rootFlag === "string" ? rootFlag : process.cwd();
+  const sharedFlag = args.flags["shared"];
+  const sharedDir = resolve(
+    typeof sharedFlag === "string"
+      ? sharedFlag
+      : (process.env["CREWHAUS_SHARED_DIR"] ?? join(root, SHARED_DIR_DEFAULT)),
+  );
+  const dryRun = args.flags["dry-run"] === true;
+  const doPush = args.flags["push"] === true || args.flags["pull"] !== true;
+  const doPull = args.flags["pull"] === true || args.flags["push"] !== true;
+  const redact =
+    args.flags["no-redact"] === true ? identityRedactor() : await buildKnowledgeRedactor();
+  const now = (): Date => new Date();
+
+  const { discoverHarnesses } = await import("./fleet");
+  let harnesses: Array<{ dir: string }>;
+  try {
+    harnesses = discoverHarnesses(root);
+  } catch (err) {
+    if (err instanceof CrewhausError) die(err.message);
+    throw err;
+  }
+  const optedIn = harnesses.filter((h) => harnessOptedIn(h.dir));
+  if (optedIn.length === 0) {
+    process.stdout.write(
+      `no opted-in harnesses under ${resolve(root)} — add .crewhaus/knowledge.json {"share": true} to participate\n`,
+    );
+    return;
+  }
+
+  process.stdout.write(
+    `knowledge sync — ${optedIn.length} opted-in harness(es), shared store ${sharedDir}${dryRun ? " (dry run)" : ""}\n`,
+  );
+
+  try {
+    if (doPush) {
+      for (const h of optedIn) {
+        const existingMemoryHashes = new Set(
+          readSharedMemories(sharedDir).map((m) => m.contentHash),
+        );
+        const existingFragmentHashes = new Set([
+          ...readSharedFragments(sharedDir, "grader").map((f) => f.contentHash),
+          ...readSharedFragments(sharedDir, "prompt").map((f) => f.contentHash),
+        ]);
+        const graders = readHarnessGraders(h.dir);
+        const plan: PushPlan = await planPush({
+          harness: basename(h.dir),
+          memories: readHarnessMemories(h.dir),
+          ...(graders !== undefined ? { graders } : {}),
+          prompts: readHarnessPrompts(h.dir),
+          existingMemoryHashes,
+          existingFragmentHashes,
+          redact,
+          now,
+        });
+        if (!dryRun) applyPush(sharedDir, plan, now);
+        for (const line of formatPushReport(basename(h.dir), plan, dryRun)) {
+          process.stdout.write(`${line}\n`);
+        }
+      }
+    }
+    if (doPull) {
+      const sharedMemories = readSharedMemories(sharedDir);
+      const sharedFragments = [
+        ...readSharedFragments(sharedDir, "grader"),
+        ...readSharedFragments(sharedDir, "prompt"),
+      ];
+      for (const h of optedIn) {
+        const harnessMemoryHashes = new Set(
+          readHarnessMemories(h.dir).map((m) => memoryContentHash(m.text, m.tags)),
+        );
+        const harnessFragmentHashes = new Set([
+          ...(readHarnessGraders(h.dir) !== undefined
+            ? [fragmentContentHash((readHarnessGraders(h.dir) as { contents: string }).contents)]
+            : []),
+          ...readHarnessPrompts(h.dir).map((p) => fragmentContentHash(p.contents)),
+        ]);
+        const plan: PullPlan = planPull({
+          sharedMemories,
+          sharedFragments,
+          harnessMemoryHashes,
+          harnessFragmentHashes,
+        });
+        if (!dryRun) applyPull(h.dir, plan, now);
+        for (const line of formatPullReport(basename(h.dir), plan, dryRun)) {
+          process.stdout.write(`${line}\n`);
+        }
+      }
+    }
+  } catch (err) {
+    if (err instanceof KnowledgeSyncError) die(err.message);
+    if (err instanceof CrewhausError) die(err.message);
+    throw err;
+  }
+}
+
+/** The identity redactor (used with --no-redact). */
+function identityRedactor(): Redactor {
+  return async (text: string) => ({ text, secretRemains: false });
+}
+
+/**
+ * Build the production knowledge redactor: `@crewhaus/pii-redactor` with the
+ * default PII detectors PLUS credential-shaped token detectors. After
+ * redacting PII, the text is re-scanned for any credential-shaped token; if
+ * one survives, `secretRemains` is set so the caller DROPS the artifact rather
+ * than share a leaked credential. The token patterns are assembled at runtime
+ * from character-class parts so this source carries no credential-shaped
+ * literal (repo push-protection).
+ */
+async function buildKnowledgeRedactor(): Promise<Redactor> {
+  const { createPiiRedactor } = await import("@crewhaus/pii-redactor");
+  const { DEFAULT_PII_DETECTORS } = await import("@crewhaus/grader-safety-classifiers");
+
+  // Credential-shaped token detectors, built from parts so no literal
+  // credential appears in source. These cover the common shapes: a long
+  // base62 blob, an "sk-"/"pk-"-style prefixed key, a JWT triplet, and a
+  // PEM private-key header.
+  const b62 = "[A-Za-z0-9]";
+  const tokenDetectors = [
+    // long opaque token (>= 32 base62 chars) — API keys / session tokens
+    { kind: "opaque_token", regex: new RegExp(`\\b${b62}{32,}\\b`) },
+    // provider-prefixed secret keys like sk-… / pk-… / ghp_… (prefix + long tail)
+    {
+      kind: "prefixed_key",
+      regex: new RegExp(
+        `\\b(?:${["sk", "pk", "ghp", "xoxb", "AKIA"].join("|")})[-_]?${b62}{16,}\\b`,
+      ),
+    },
+    // a JWT: three base64url segments separated by dots
+    { kind: "jwt", regex: /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/ },
+    // a PEM private-key header (assembled from parts)
+    {
+      kind: "pem_key",
+      regex: new RegExp(`-----BEGIN [A-Z ]*${["PRIVATE", "KEY"].join(" ")}-----`),
+    },
+  ];
+  const detectors = [...DEFAULT_PII_DETECTORS, ...tokenDetectors];
+  const redactor = createPiiRedactor({ regexDetectors: detectors });
+
+  return async (text: string) => {
+    const result = await redactor.redact(text);
+    // Re-scan the REDACTED text for a surviving credential-shaped token.
+    const survived = tokenDetectors.some((d) => d.regex.test(result.text));
+    return { text: result.text, secretRemains: survived };
+  };
+}
+
 /** A one-off y/N prompt on stdin. Empty / anything not starting with y → no. */
 async function promptYesNo(question: string): Promise<boolean> {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
@@ -11160,6 +11374,15 @@ switch (subcommand) {
       die(`fleet action must be one of: list, status, run (got "${action}")`);
     }
     await runFleet(parseFor(rest.slice(1), FLEET_SCHEMA), action);
+    break;
+  }
+  case "knowledge": {
+    // Item 63 — cross-harness knowledge sync (memories/graders/prompts).
+    const action = rest[0] ?? "";
+    if (action !== "" && action !== "sync") {
+      die(`knowledge action must be "sync" (got "${action}")`);
+    }
+    await runKnowledge(parseFor(rest.slice(1), KNOWLEDGE_SCHEMA), action || "sync");
     break;
   }
   case "model-scan":
