@@ -584,6 +584,19 @@ import {
   buildScanCandidates,
   writeModelField,
 } from "./model-scan";
+// Item 66 — `crewhaus onchain tune|sentinel`: mine wallet-engine receipt +
+// simulation history to propose a tuned transaction_policy and flag anomalous
+// spend. Side-effect-free (this entry file reads history + writes patch/report).
+import {
+  type CurrentPolicy,
+  OnchainTuneError,
+  detectAnomalies,
+  learnSpendBaseline,
+  parseReceiptHistory,
+  proposePolicy,
+  renderSentinelReport,
+  renderTuneReport,
+} from "./onchain-tune";
 // Item 16 — `crewhaus permissions suggest` (mine persisted ask/deny history
 // into reviewable settings.json permission rules), in a side-effect-free
 // module so it is unit-testable (this entry file runs an argv switch on
@@ -1645,6 +1658,26 @@ const PII_SCHEMA: ParseArgsSchema = {
     { name: "secret", takesValue: true },
     // write the reviewed allow-list to <dir>/.crewhaus/pii-policy.json.
     { name: "write", takesValue: false },
+    { name: "json", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
+// AUTOMATION-OPPORTUNITIES.md item 66 — `onchain tune|sentinel`.
+const ONCHAIN_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // receipt-history JSONL (default .crewhaus/onchain/receipts.jsonl).
+    { name: "history", takesValue: true },
+    // tune — headroom multiplier over observed max spend for the cap (default 1.25).
+    { name: "cap-margin", takesValue: true },
+    // tune — write the proposed transaction_policy SpecPatch here (default
+    // .crewhaus/onchain/policy-patch.json); advice-only when not whitelisted.
+    { name: "out", short: "o", takesValue: true },
+    // sentinel — baseline history to learn from; defaults to --history minus
+    // the candidate window. When --baseline is given, --history is the candidate.
+    { name: "baseline", takesValue: true },
+    // sentinel — anomaly threshold: flag spend > N× the per-contract max (default 2).
+    { name: "max-multiple", takesValue: true },
     { name: "json", takesValue: false },
     { name: "help", short: "h" },
   ],
@@ -13343,6 +13376,145 @@ async function runJustification(
  * `--dry-run` prints every network call with secrets redacted (env-refs as
  * `$NAME`, inline literals as `[redacted]`) and performs nothing.
  */
+/**
+ * Item 66 — `crewhaus onchain tune|sentinel`. Reads the spec's current
+ * transaction_policy from its lowered IR (for tune's baseline + whitelisting)
+ * and a receipt-history JSONL, then either proposes a tuned policy (`tune`,
+ * writing a validated SpecPatch when the target whitelists transaction_policy)
+ * or flags anomalous spend vs a learned baseline (`sentinel`). Private keys /
+ * keyRefs never leave the spec — receipts carry only public tx metadata.
+ */
+async function runOnchain(args: ParsedArgs, action: "tune" | "sentinel"): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus onchain tune <spec.yaml> [--history <receipts.jsonl>] [--cap-margin 1.25] [-o <patch.json>]\n" +
+        "       crewhaus onchain sentinel <spec.yaml> [--history <candidate.jsonl>] [--baseline <baseline.jsonl>] [--max-multiple 2]\n" +
+        "\n" +
+        "  tune     — mine successful wallet-engine receipts to propose a\n" +
+        "             transaction_policy (maxValueWei from observed spend + margin,\n" +
+        "             allowedContracts from used ids). When the spec target\n" +
+        "             whitelists transaction_policy (onchain / onchain-game), a\n" +
+        "             validated SpecPatch is written for `optimize --write-back`;\n" +
+        "             otherwise the proposal is advice-only.\n" +
+        "  sentinel — flag anomalous spend (unknown contract id, or > N× the\n" +
+        "             per-contract observed max) against a learned baseline.\n" +
+        "  --history defaults to .crewhaus/onchain/receipts.jsonl. No private keys\n" +
+        "  are ever read — receipts carry only contractId + wei value + status.\n",
+    );
+    return;
+  }
+  const specPath = args.positional[0];
+  if (typeof specPath !== "string") die("missing <spec.yaml>");
+  const absSpec = resolve(specPath);
+  let yamlText: string;
+  try {
+    yamlText = readFileSync(absSpec, "utf-8");
+  } catch (err) {
+    die(`could not read ${absSpec}: ${(err as Error).message}`);
+  }
+  let ir: ReturnType<typeof lower>;
+  try {
+    ir = lower(parseSpec(yamlText));
+  } catch (err) {
+    if (err instanceof CrewhausError) die(err.message);
+    throw err;
+  }
+
+  // Read the current transaction_policy off the lowered IR (onchain /
+  // onchain-game carry it directly; other shapes may carry it optionally).
+  const irPolicy = (ir as { transactionPolicy?: unknown }).transactionPolicy as
+    | {
+        maxValueWei?: string;
+        allowedContracts?: readonly string[];
+        simulationRequired?: boolean;
+      }
+    | undefined;
+  const current: CurrentPolicy = {
+    ...(irPolicy?.maxValueWei !== undefined ? { maxValueWei: irPolicy.maxValueWei } : {}),
+    ...(irPolicy?.allowedContracts !== undefined
+      ? { allowedContracts: irPolicy.allowedContracts }
+      : {}),
+    ...(irPolicy?.simulationRequired !== undefined
+      ? { simulationRequired: irPolicy.simulationRequired }
+      : {}),
+  };
+  // transaction_policy is optimizer-whitelisted only for the §47 onchain shapes.
+  const optimizable = ir.target === "onchain" || ir.target === "onchain-game";
+
+  const historyPath = resolve(
+    strFlag(args, "history") ?? join(".crewhaus", "onchain", "receipts.jsonl"),
+  );
+  if (!existsSync(historyPath)) {
+    die(
+      `receipt history not found at ${historyPath} — record wallet-engine receipts there (one JSON per line), or pass --history`,
+    );
+  }
+  const historyReceipts = parseReceiptHistory(readFileSync(historyPath, "utf-8"));
+
+  if (action === "tune") {
+    const capMargin = floatFlag(args, "cap-margin");
+    const proposal = proposePolicy(historyReceipts, current, {
+      optimizable,
+      target: ir.target,
+      ...(capMargin !== undefined ? { capMarginPct: capMargin } : {}),
+    });
+    if (args.flags["json"] === true) {
+      process.stdout.write(`${JSON.stringify(proposal, null, 2)}\n`);
+    } else {
+      process.stdout.write(renderTuneReport(proposal));
+    }
+    if (proposal.patch !== undefined) {
+      // Pick the SpecPatch op from raw-YAML presence: `add` when the spec has no
+      // transaction_policy block yet (a top-level `transaction_policy:` key),
+      // `replace` when it does. applySpecPatch rejects the wrong op, so this
+      // keeps the emitted patch directly `optimize --write-back`-applicable.
+      const hasBlock = /^transaction_policy:/m.test(yamlText);
+      const specPatch = {
+        target: proposal.patch.target,
+        path: proposal.patch.path,
+        op: hasBlock ? ("replace" as const) : ("add" as const),
+        value: proposal.patch.value,
+        rationale: proposal.patch.rationale,
+      };
+      const outPath = resolve(
+        strFlag(args, "out") ?? join(".crewhaus", "onchain", "policy-patch.json"),
+      );
+      mkdirSync(dirname(outPath), { recursive: true });
+      writeFileSync(outPath, `${JSON.stringify(specPatch, null, 2)}\n`);
+      process.stdout.write(`[onchain] wrote transaction_policy patch → ${outPath}\n`);
+    }
+    return;
+  }
+
+  // action === "sentinel"
+  const baselinePath = strFlag(args, "baseline");
+  let baselineReceipts = historyReceipts;
+  let candidateReceipts = historyReceipts;
+  if (baselinePath !== undefined) {
+    const absBaseline = resolve(baselinePath);
+    if (!existsSync(absBaseline)) die(`baseline history not found at ${absBaseline}`);
+    baselineReceipts = parseReceiptHistory(readFileSync(absBaseline, "utf-8"));
+    candidateReceipts = historyReceipts; // --history is the candidate window
+  }
+  const baseline = learnSpendBaseline(baselineReceipts);
+  const maxMultiple = intFlag(args, "max-multiple");
+  const anomalies = detectAnomalies(candidateReceipts, baseline, {
+    ...(maxMultiple !== undefined ? { maxMultiple } : {}),
+  });
+  if (args.flags["json"] === true) {
+    process.stdout.write(
+      `${JSON.stringify(
+        anomalies.map((a) => ({ ...a, valueWei: a.valueWei.toString() })),
+        null,
+        2,
+      )}\n`,
+    );
+  } else {
+    process.stdout.write(renderSentinelReport(anomalies));
+  }
+  if (anomalies.length > 0) process.exit(1);
+}
+
 async function runChannel(args: ParsedArgs, action: "provision" | "verify"): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
@@ -14050,6 +14222,21 @@ switch (subcommand) {
       die(`channel action must be "provision" or "verify" (got "${action}")`);
     }
     await runChannel(parseFor(rest.slice(1), CHANNEL_SCHEMA), action);
+    break;
+  }
+  case "onchain": {
+    // Item 66 — tune (propose a transaction_policy) | sentinel (flag anomalous
+    // spend). Both take the <spec> positional after the action.
+    const action = rest[0] ?? "";
+    if (action !== "tune" && action !== "sentinel") {
+      die(`onchain action must be "tune" or "sentinel" (got "${action}")`);
+    }
+    try {
+      await runOnchain(parseFor(rest.slice(1), ONCHAIN_SCHEMA), action);
+    } catch (err) {
+      if (err instanceof CrewhausError || err instanceof OnchainTuneError) die(err.message);
+      throw err;
+    }
     break;
   }
   case "version":
