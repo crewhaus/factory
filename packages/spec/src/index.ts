@@ -32,6 +32,25 @@ const safeName = z
  * docs/MODULE-CATALOG.md PART A Layer F1.
  */
 
+/**
+ * Section 28 (#43) — OPTIONAL spec-schema version stamp. Every target schema is
+ * `.strict()`, so before this field a migration that stamped `version: 1` on a
+ * spec's YAML produced a document `parseSpec` REJECTED ("Unrecognized key(s)").
+ * This additive optional field gives migrations somewhere to stamp:
+ *
+ *   - ABSENT  → the spec is current/unversioned (the pre-#43 world). Fully
+ *     back-compat: every existing spec keeps parsing unchanged.
+ *   - PRESENT → a non-negative integer the migration-engine reads as the spec's
+ *     schema version (`spec.version ?? 0` in migration-engine/migration-runner).
+ *
+ * It is a spec-schema knob, NOT the IR `version` (which stays `0` — the IR's
+ * own contract version). `lower()` does not thread this field into the IR; it
+ * exists purely so the versioned-migration chain has a home. Added to EVERY
+ * member of the discriminated union because the union is `.strict()` — a field
+ * absent from a member would still be rejected on that target.
+ */
+const versionField = z.number().int().nonnegative().optional();
+
 // Permissions block (Section 7). SECURITY: `mode: "bypass"` is intentionally
 // absent from the enum — bypass can only enter the system via the CLI flag.
 // Defense in depth: parse-time and runtime checks both reject it.
@@ -560,6 +579,7 @@ const channelGatewayBlock = z
 const cliSchema = z
   .object({
     name: safeName,
+    version: versionField,
     target: z.literal("cli"),
     agent: z
       .object({
@@ -607,6 +627,7 @@ const workflowStepSchema = z
 const workflowSchema = z
   .object({
     name: safeName,
+    version: versionField,
     target: z.literal("workflow"),
     model: z.string().min(1),
     steps: z.array(workflowStepSchema).min(1),
@@ -718,6 +739,7 @@ const channelAgentSchema = z
 const channelSchema = z
   .object({
     name: safeName,
+    version: versionField,
     target: z.literal("channel"),
     agent: channelAgentSchema,
     channels: channelsBlock,
@@ -770,6 +792,7 @@ const graphEdgeSchema = z
 const graphSchema = z
   .object({
     name: safeName,
+    version: versionField,
     target: z.literal("graph"),
     model: z.string().min(1),
     entry: z.string().min(1),
@@ -816,6 +839,7 @@ const managedAgentSchema = z
 const managedSchema = z
   .object({
     name: safeName,
+    version: versionField,
     target: z.literal("managed"),
     agent: managedAgentSchema,
     tenants: z.array(managedTenantSchema).min(1),
@@ -850,6 +874,7 @@ const pipelineDocumentSchema = z
 const pipelineSchema = z
   .object({
     name: safeName,
+    version: versionField,
     target: z.literal("pipeline"),
     agent: z
       .object({
@@ -919,6 +944,7 @@ const crewRoutingSchema = z
 const crewSchema = z
   .object({
     name: safeName,
+    version: versionField,
     target: z.literal("crew"),
     /** Crew-wide model fallback used by any role that omits `role.model`. */
     model: z.string().min(1),
@@ -955,6 +981,7 @@ const researchRetrieveSchema = z
 const researchSchema = z
   .object({
     name: safeName,
+    version: versionField,
     target: z.literal("research"),
     agent: z
       .object({
@@ -996,6 +1023,7 @@ const batchQueueSchema = z
 const batchSchema = z
   .object({
     name: safeName,
+    version: versionField,
     target: z.literal("batch"),
     agent: z
       .object({
@@ -1039,6 +1067,7 @@ const voiceTelephonySchema = z
 const voiceSchema = z
   .object({
     name: safeName,
+    version: versionField,
     target: z.literal("voice"),
     agent: z
       .object({
@@ -1075,6 +1104,7 @@ const browserDriverSchema = z
 const browserSchema = z
   .object({
     name: safeName,
+    version: versionField,
     target: z.literal("browser"),
     agent: z
       .object({
@@ -1105,6 +1135,7 @@ const browserSchema = z
 const evalSchema = z
   .object({
     name: safeName,
+    version: versionField,
     target: z.literal("eval"),
     agent: z
       .object({
@@ -1173,6 +1204,7 @@ const onchainTriggerSchema = z.discriminatedUnion("kind", [
 const onchainSchema = z
   .object({
     name: safeName,
+    version: versionField,
     target: z.literal("onchain"),
     agent: z
       .object({
@@ -1208,6 +1240,7 @@ const onchainSchema = z
 const onchainGameSchema = z
   .object({
     name: safeName,
+    version: versionField,
     target: z.literal("onchain-game"),
     agent: z
       .object({

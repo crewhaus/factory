@@ -502,6 +502,59 @@ describe("crewhaus run", () => {
     expect(result.stderr).toContain("rule-based, claude");
   });
 
+  // Section 18 (#18 remainder) — the run path must wire the sandbox floor for
+  // code-execution tools. Before this, python/javascript/shell resolved but
+  // were always denied because `sandboxAvailable` was never set.
+  const CODE_EXEC_SPEC =
+    "name: coder\ntarget: cli\nagent:\n  model: claude-sonnet-4-6\n  instructions: run code\ntools:\n  - python\n";
+
+  test("run wires the sandbox backend for code-exec tools when CREWHAUS_SANDBOX is set", async () => {
+    writeFileSync(join(tmp, "crewhaus.yaml"), CODE_EXEC_SPEC);
+    const result = await runCli(["run", join(tmp, "crewhaus.yaml")], {
+      cwd: tmp,
+      env: { ANTHROPIC_API_KEY: "test-no-call", CREWHAUS_SANDBOX: "docker" },
+      closeStdinImmediately: true,
+    });
+    expect(result.exitCode).toBe(0);
+    // Diagnostic reflects the resolved (available) backend → sandboxAvailable:true.
+    expect(result.stdout).toContain('[sandbox] backend "docker"');
+    expect(result.stdout).toContain("enabled");
+    expect(result.stdout).toContain("agent ready");
+  });
+
+  test("run prints the CREWHAUS_SANDBOX notice when unset and code-exec tools are declared", async () => {
+    writeFileSync(join(tmp, "crewhaus.yaml"), CODE_EXEC_SPEC);
+    const result = await runCli(["run", join(tmp, "crewhaus.yaml")], {
+      cwd: tmp,
+      env: { ANTHROPIC_API_KEY: "test-no-call" }, // CREWHAUS_SANDBOX intentionally unset
+      closeStdinImmediately: true,
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("[sandbox] assuming docker");
+    expect(result.stdout).toContain("set CREWHAUS_SANDBOX");
+  });
+
+  test("run reports the sandbox floor as disabled under CREWHAUS_SANDBOX=noop", async () => {
+    writeFileSync(join(tmp, "crewhaus.yaml"), CODE_EXEC_SPEC);
+    const result = await runCli(["run", join(tmp, "crewhaus.yaml")], {
+      cwd: tmp,
+      env: { ANTHROPIC_API_KEY: "test-no-call", CREWHAUS_SANDBOX: "noop" },
+      closeStdinImmediately: true,
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("[sandbox] disabled");
+    expect(result.stdout).toContain("will be denied");
+  });
+
+  test("run does NOT print a sandbox diagnostic when no code-exec tools are declared", async () => {
+    const result = await runCli(["run", HELLO_SPEC], {
+      env: { ANTHROPIC_API_KEY: "test-no-call" },
+      closeStdinImmediately: true,
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).not.toContain("[sandbox]");
+  });
+
   test("a CrewhausError on the run path surfaces as a clean one-line die(), not a stack trace", async () => {
     // An unrecognised model string makes the model-router throw ConfigError
     // inside runChatLoop — previously an uncaught stack trace.
@@ -634,6 +687,53 @@ describe("crewhaus doctor", () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain('Pillar 3 — all built-in outward tools scope:"external"');
     expect(result.stdout).toContain("philosophy alignment: green");
+  });
+});
+
+// F2 (post-#41 fix) — `lint --fix`'s nearest-match tool-name correction must
+// not silently cross a read-only/mutating capability boundary. "Reit" is
+// Levenshtein-2 from BOTH the read-only built-in `Read` and the mutating
+// built-in `Edit`; a plain alphabetical tie-break would previously pick one
+// (Edit, alphabetically first) without the author ever consenting to a
+// mutating tool being substituted for a typo. Run from REPO_ROOT so
+// loadToolMap() resolves the real built-in tool packages (Read/Edit/Write
+// among them).
+describe("crewhaus lint --fix — cross-capability tool-name guard (item 41 fix)", () => {
+  test("a typo equidistant from a read-only and a mutating tool is NOT auto-applied; prints a suggestion", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    const original =
+      "name: t\ntarget: cli\nagent:\n  model: m\n  instructions: hi\n  tools:\n    - Reit\n";
+    writeFileSync(specPath, original);
+    const result = await runCli(["lint", specPath, "--fix"], {
+      cwd: REPO_ROOT,
+      env: { ANTHROPIC_API_KEY: "test" },
+    });
+    // Not auto-fixed: the spec on disk is byte-for-byte unchanged.
+    expect(readFileSync(specPath, "utf-8")).toBe(original);
+    // A suggestion is printed naming both candidates, not a silent rewrite.
+    expect(result.stdout).toContain("suggestion:");
+    expect(result.stdout).toContain("Reit");
+    expect(result.stdout).toContain("Read");
+    expect(result.stdout).toContain("Edit");
+    expect(result.stdout).toContain("ambiguous");
+    expect(result.stdout).not.toContain("fixed: tool");
+  });
+
+  test("an unambiguous tool-name typo still auto-fixes", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    // "Reed" is close to "Read" only (far from Edit/Write) — no capability
+    // ambiguity, so --fix should still rewrite it in place.
+    writeFileSync(
+      specPath,
+      "name: t\ntarget: cli\nagent:\n  model: m\n  instructions: hi\n  tools:\n    - Reed\n",
+    );
+    const result = await runCli(["lint", specPath, "--fix"], {
+      cwd: REPO_ROOT,
+      env: { ANTHROPIC_API_KEY: "test" },
+    });
+    expect(result.stdout).toContain('fixed: tool "Reed" → "Read" (nearest match)');
+    expect(readFileSync(specPath, "utf-8")).toContain("- Read");
+    expect(readFileSync(specPath, "utf-8")).not.toContain("Reed");
   });
 });
 

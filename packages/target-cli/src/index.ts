@@ -66,7 +66,7 @@ type BuiltinToolEntry = {
   readonly initSymbol?: string;
 };
 
-const BUILTIN_TOOL_MAP: Record<string, BuiltinToolEntry> = {
+export const BUILTIN_TOOL_MAP: Record<string, BuiltinToolEntry> = {
   read: { package: "@crewhaus/tool-fs", export: "read" },
   write: { package: "@crewhaus/tool-fs", export: "write" },
   edit: { package: "@crewhaus/tool-fs", export: "edit" },

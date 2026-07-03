@@ -121,6 +121,7 @@ describe("crewhaus datasets CLI (item 12)", () => {
     expect(rec2.splits.test).toBeUndefined();
   });
 
+  // 6 sequential CLI cold-starts; needs headroom over the 5s default under CI contention.
   test("put rejects --split with --split-spec, a bad spec, a bad split, and a missing file", async () => {
     const root = newTempRoot();
     const file = writeDatasetFile(root, 4);
@@ -136,7 +137,7 @@ describe("crewhaus datasets CLI (item 12)", () => {
       expect((await runCli(args, root)).exitCode).toBe(1);
     }
     expect(existsSync(join(root, ".crewhaus", "datasets", "x"))).toBe(false);
-  });
+  }, 15000);
 
   test("CREWHAUS_DATASETS_DIR overrides the registry root", async () => {
     const root = newTempRoot();
@@ -158,6 +159,9 @@ describe("crewhaus datasets CLI (item 12)", () => {
     expect((await runCli(["datasets", "list"], root)).exitCode).toBe(0);
   });
 
+  // This test does 6 sequential CLI cold-starts; under CI contention the
+  // default 5000ms/test budget is too tight (narrower still with this
+  // branch's +3 import deps), so it gets extra headroom (15000ms, 3rd arg).
   test("get resolves the latest version / an explicit split; failures exit 1", async () => {
     const root = newTempRoot();
     const file = writeDatasetFile(root, 10);
@@ -170,7 +174,7 @@ describe("crewhaus datasets CLI (item 12)", () => {
       1,
     );
     expect((await runCli(["datasets", "get"], root)).exitCode).toBe(1);
-  });
+  }, 15000);
 });
 
 describe("crewhaus distill --register (item 12)", () => {

@@ -1,0 +1,88 @@
+# crewhaus-upgrade.yml — scheduled spec auto-migration TEMPLATE (item 43).
+#
+# This is a TEMPLATE, not an active workflow: copy it into your harness
+# repository's `.github/workflows/` and edit the <PLACEHOLDER> comments.
+#
+# On a schedule it installs the latest `crewhaus`, runs `crewhaus upgrade` on
+# your spec, and — when a newer CLI has shipped a migration your spec has not
+# taken yet — opens a pull request with the migrated spec for human review.
+# Accepted migrations arrive as PRs; nothing is ever committed to your default
+# branch automatically.
+#
+# WHY A SCHEDULE (not on-push): a spec upgrade is driven by a NEW CLI VERSION,
+# not by a change to your repo. The cron re-checks against the freshest CLI, so
+# the day a migration ships you get a PR without touching your repo.
+#
+# Prerequisites:
+#   - Your spec lives at `<SPEC-PATH>` (default `crewhaus.yaml` at the repo root).
+#   - The workflow has permission to open PRs (see `permissions:` below).
+
+name: crewhaus-upgrade
+
+on:
+  schedule:
+    # <CRON> Weekly, Monday 07:23 UTC. `crewhaus upgrade` is a no-op when the
+    # spec is already current, so a more frequent cron is safe (it just exits
+    # "up-to-date" and opens no PR).
+    - cron: "23 7 * * 1"
+  # Manual trigger for an immediate check after a known CLI release.
+  workflow_dispatch: {}
+
+# The PR-opening step needs write access to contents (to push the branch) and
+# pull-requests (to open the PR). Nothing writes to the default branch directly.
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  upgrade:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the latest crewhaus
+        # Any channel works: npm i -g crewhaus, brew install crewhaus/tap/crewhaus, ...
+        # Pinning to @latest is deliberate — the schedule exists to pick up the
+        # newest migrations the day they ship.
+        run: npm install -g crewhaus@latest
+
+      - name: Check for a spec upgrade (dry-run)
+        id: check
+        # <SPEC-PATH> Point at your spec if it is not ./crewhaus.yaml.
+        # Exit code: 0 when up-to-date OR a clean migration is available; 1 only
+        # when a migration FAILS validation (a broken chain — a real alert).
+        # We capture the diff to decide whether to open a PR.
+        run: |
+          set -o pipefail
+          crewhaus upgrade crewhaus.yaml --dry-run | tee upgrade.out
+          if grep -q '^upgrade: v' upgrade.out; then
+            echo "has_upgrade=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_upgrade=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Apply the migration
+        if: steps.check.outputs.has_upgrade == 'true'
+        # --write rewrites the spec in place; every migrated spec was already
+        # validated by the dry-run above (upgrade validates via parseSpec before
+        # it will write), so this cannot land an unparseable spec.
+        run: crewhaus upgrade crewhaus.yaml --write
+
+      - name: Open a migration PR
+        if: steps.check.outputs.has_upgrade == 'true'
+        # <PR-ACTION> Uses peter-evans/create-pull-request to branch, commit the
+        # migrated spec, and open a PR. Pin to a full SHA in production.
+        uses: peter-evans/create-pull-request@v6
+        with:
+          commit-message: "chore(spec): migrate crewhaus.yaml to the current schema version"
+          branch: crewhaus/spec-upgrade
+          delete-branch: true
+          title: "Migrate crewhaus.yaml to the current spec schema version"
+          body: |
+            An updated `crewhaus` CLI shipped a spec migration this spec had not
+            taken. `crewhaus upgrade --write` applied it; the migrated spec was
+            validated with `parseSpec` before this PR was opened.
+
+            Review the diff and merge to adopt the new schema version. Re-run
+            `crewhaus upgrade --dry-run` locally to reproduce.
+          labels: automated,spec-migration
