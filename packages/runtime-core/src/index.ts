@@ -13,7 +13,7 @@ import type {
   SpawnSubAgentFn,
   SubAgentDefinition,
 } from "@crewhaus/agent-context-isolation";
-import { setDefaultBoundaryLlmClassifier } from "@crewhaus/boundary-classifier";
+import { classifyBoundary, setDefaultBoundaryLlmClassifier } from "@crewhaus/boundary-classifier";
 import { type WrappedAdapter, wrap as wrapWithCircuitBreaker } from "@crewhaus/circuit-breaker";
 import { autoCompact } from "@crewhaus/compaction-autocompact";
 import { snip } from "@crewhaus/compaction-snip";
@@ -764,6 +764,20 @@ export function defaultSinkScope(toolName: string): SinkScope {
 }
 
 /**
+ * Neutralize a boundary-block closing delimiter embedded in untrusted content
+ * so a poisoned line can't terminate its wrapper block early and inject
+ * trailing instructions. Replaces `</tag>` (any casing/whitespace) with a
+ * visually-inert `<\/tag>` so the content survives for the model to read but
+ * no longer parses as the real closing tag. Used for the recalled-memory block
+ * (#53) — recalled memories may carry content shaped by untrusted tool output.
+ */
+function escapeBoundaryDelimiter(text: string, tag: string): string {
+  // Match `</tag>` tolerantly (leading whitespace inside the tag, any casing).
+  const re = new RegExp(`</\\s*${tag}\\s*>`, "gi");
+  return text.replace(re, `<\\/${tag}>`);
+}
+
+/**
  * Strip the model-string provider grammar down to the wire model id
  * (`"bedrock/us.anthropic.claude-..."` → `"us.anthropic.claude-..."`)
  * WITHOUT loading the provider package. Used on the `_adapter` injection
@@ -1299,9 +1313,23 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       const k = opts.memory.recallK ?? 5;
       const lines = await opts.memory.recall(seed, k);
       if (lines.length > 0) {
-        const text = `<recalled_memory>\nRelevant facts remembered from earlier sessions:\n${lines
-          .map((l) => `- ${l}`)
-          .join("\n")}\n</recalled_memory>`;
+        // Pillar 3 — a recalled memory can embed content shaped by untrusted
+        // tool output from an earlier session, so it is NOT verbatim-safe like
+        // the developer's own repo files. Two defenses, mirroring how the rest
+        // of the security fabric treats injected content:
+        //   1. Delimiter safety — neutralize any `</recalled_memory>` closing
+        //      tag inside a recalled line so a poisoned memory can't break out
+        //      of its block and inject trailing instructions.
+        //   2. Classification — run the assembled block through the SAME
+        //      `classifyBoundary(text, { origin: "user" })` best-effort path
+        //      `loadProjectMemory()` uses (pass policy: classify + emit trace
+        //      events without mutating), so recalled content flows through the
+        //      boundary classifier exactly like every other prompt-bound source.
+        const body = lines
+          .map((l) => `- ${escapeBoundaryDelimiter(l, "recalled_memory")}`)
+          .join("\n");
+        const text = `<recalled_memory>\nRelevant facts remembered from earlier sessions:\n${body}\n</recalled_memory>`;
+        await classifyBoundary(text, { origin: "user" }).catch(() => undefined);
         memoryRecallBlock = [{ type: "text", text, cache_control: { type: "ephemeral" } }];
         process.stdout.write(`[memory] recalled ${lines.length} memory(ies) into the prompt\n`);
       }

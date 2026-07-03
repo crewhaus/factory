@@ -144,9 +144,20 @@ describe("loadProjectMemory", () => {
     expect(DEFAULT_PROJECT_MEMORY_CAP_BYTES).toBe(64 * 1024);
   });
 
-  // Item #56 — LESSONS.md is a canonical memory file, so it auto-loads.
-  test("loads LESSONS.md when present", async () => {
+  // Item #56 F2 — LESSONS.md is marker-gated: only a crewhaus-generated file
+  // (carrying `<!-- crewhaus:lessons -->`) auto-loads. A human-authored
+  // LESSONS.md of the same name is NOT silently prepended to the prompt.
+  test("does NOT load a marker-less (human-authored) LESSONS.md", async () => {
     const dir = setUpWorkdir({ "LESSONS.md": "# LESSONS\n- prefer bun over npm" });
+    const result = await loadProjectMemory({ cwd: dir });
+    expect(result.files.map((f) => f.filename)).not.toContain("LESSONS.md");
+    expect(result.prompt).not.toContain("prefer bun over npm");
+  });
+
+  test("loads a marker-bearing (crewhaus-generated) LESSONS.md", async () => {
+    const dir = setUpWorkdir({
+      "LESSONS.md": "# LESSONS\n\n<!-- crewhaus:lessons -->\n\n- prefer bun over npm",
+    });
     const result = await loadProjectMemory({ cwd: dir });
     expect(result.files.map((f) => f.filename)).toContain("LESSONS.md");
     expect(result.prompt).toContain('<project_memory file="LESSONS.md">');

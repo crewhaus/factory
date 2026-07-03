@@ -181,6 +181,22 @@ export function poolToJsonl(examples: ReadonlyArray<FewShotExample>): string {
   return `${examples.map((e) => JSON.stringify(e)).join("\n")}\n`;
 }
 
+const FEWSHOT_CLOSE_TAG_RE = /<\s*\/\s*few_shot_examples\s*>/gi;
+
+/**
+ * #54 F5 — delimiter safety. An example's input/output is user/model text and
+ * can be adversarially shaped, so before interpolating it into the
+ * `<few_shot_examples>` block we neutralize any embedded closing tag: a
+ * `</few_shot_examples>` inside an example would otherwise let a poisoned
+ * example terminate the block early and inject trailing instructions. The
+ * closing tag is rewritten to an inert `<\/few_shot_examples>` (content
+ * preserved for the model, but no longer parses as the real delimiter).
+ * Redaction of secrets/PII already runs upstream — this is purely structural.
+ */
+function escapeFewShotContent(text: string): string {
+  return text.replace(FEWSHOT_CLOSE_TAG_RE, "<\\/few_shot_examples>");
+}
+
 /**
  * Render the top-K examples as an in-context few-shot block for the system
  * prompt / `agent.instructions`. Empty input → "" so callers append
@@ -190,7 +206,12 @@ export function formatFewShotForPrompt(examples: ReadonlyArray<FewShotExample>, 
   const top = examples.slice(0, Math.max(0, k));
   if (top.length === 0) return "";
   const blocks = top
-    .map((e, i) => `Example ${i + 1}:\nUser: ${e.input}\nAssistant: ${e.output}`)
+    .map(
+      (e, i) =>
+        `Example ${i + 1}:\nUser: ${escapeFewShotContent(e.input)}\nAssistant: ${escapeFewShotContent(
+          e.output,
+        )}`,
+    )
     .join("\n\n");
   return `<few_shot_examples>\nThese are examples of responses users rated highly. Follow their style and quality:\n\n${blocks}\n</few_shot_examples>`;
 }

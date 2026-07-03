@@ -134,6 +134,9 @@ export function createMemoryStore(opts: MemoryStoreOptions): MemoryStore {
         createdAt: now().toISOString(),
       };
       await ensureRootDir();
+      // TODO(#53 F7): this append-only store grows unbounded — add a size/age
+      // cap or prune-on-write (e.g. keep the newest N or evict by recall score)
+      // so long-lived harnesses don't accumulate an ever-growing memory file.
       await appendFile(filePath, `${JSON.stringify(entry)}\n`, { mode: 0o600 });
       return entry;
     },

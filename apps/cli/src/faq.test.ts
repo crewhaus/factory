@@ -48,6 +48,32 @@ describe("distillFaq (#55)", () => {
     expect(entries[0]?.answer.toLowerCase()).toContain("deploy");
   });
 
+  test("counts distinct sessions, not repeats within one session (#55 F9)", async () => {
+    // Two matching questions, but BOTH from the same session — this is one
+    // session repeating itself, not a recurring cross-session question.
+    const sameSession = [
+      turn(S1, 1, "how do I deploy?", "Run crewhaus deploy."),
+      turn(S1, 2, "how do I deploy the agent", "Use crewhaus deploy."),
+    ];
+    const sameSessionEntries = await distillFaq(sameSession, [
+      upRating(S1, 1, "up"),
+      upRating(S1, 2, "up"),
+    ]);
+    expect(sameSessionEntries).toHaveLength(0);
+
+    // The same two questions across TWO sessions DO form an FAQ entry.
+    const crossSession = [
+      turn(S1, 1, "how do I deploy?", "Run crewhaus deploy."),
+      turn(S2, 1, "how do I deploy the agent", "Use crewhaus deploy."),
+    ];
+    const crossSessionEntries = await distillFaq(crossSession, [
+      upRating(S1, 1, "up"),
+      upRating(S2, 1, "up"),
+    ]);
+    expect(crossSessionEntries).toHaveLength(1);
+    expect(crossSessionEntries[0]?.sessionCount).toBe(2);
+  });
+
   test("drops a cluster with no qualifying (up-rated) answer", async () => {
     const turns = [
       turn(S1, 1, "how do I deploy?", "answer 1"),
@@ -71,6 +97,28 @@ describe("distillFaq (#55)", () => {
     });
     expect(entries).toHaveLength(1);
     expect(entries[0]?.answer).not.toContain(secret);
+  });
+
+  test("redacts a secret in the QUESTION and in the emitted SKILL.md (#55 F4)", async () => {
+    // A credential pasted into the QUESTION, built at RUNTIME (push-protection).
+    const secret = ["AKIA", "1".repeat(8), "ABCDEFGH"].join("");
+    const email = "leak@example.com";
+    const turns = [
+      turn(S1, 1, `is ${secret} valid for ${email}?`, "It looks valid."),
+      turn(S2, 1, `is ${secret} valid for ${email}`, "Yes, it is valid."),
+    ];
+    const redactor = createPiiRedactor({ regexDetectors: SYNTHESIZE_PII_DETECTORS });
+    const entries = await distillFaq(turns, [upRating(S1, 1, "up"), upRating(S2, 1, "up")], {
+      redact: async (t) => (await redactor.redact(t)).text,
+    });
+    expect(entries).toHaveLength(1);
+    expect(entries[0]?.question).not.toContain(secret);
+    expect(entries[0]?.question).not.toContain(email);
+    // And the redaction survives into the rendered SKILL.md heading.
+    const md = buildFaqSkill(entries, { harnessName: "demo" });
+    expect(md).not.toContain(secret);
+    expect(md).not.toContain(email);
+    expect(md).toContain("[REDACTED:secret]");
   });
 });
 

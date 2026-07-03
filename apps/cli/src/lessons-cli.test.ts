@@ -34,14 +34,23 @@ async function runCli(args: ReadonlyArray<string>, cwd: string): Promise<{ exitC
 
 const S1 = "sess_00000000000000f1";
 
-/** A session with a correction (from rater "max") + a runtime error signal. */
+// A credential-shaped token built at RUNTIME from parts (GitHub push-protection
+// blocks committing a literal secret, even a fake one). Matches
+// SECRET_KEY_DETECTOR's `sk-…` rule, so redaction masks it.
+const FAKE_SECRET = ["sk", "-", "A".repeat(40)].join("");
+
+/** A session with a correction (from rater "max") + a runtime error signal that
+ *  carries a pasted credential in its message (#56 F3 — must be redacted). */
 function writeSession(root: string): void {
   const sessionsDir = join(root, ".crewhaus", "sessions");
   mkdirSync(sessionsDir, { recursive: true });
   const lines = [
     { kind: "user_message", payload: { content: "how do I deploy?" } },
     { kind: "assistant_message", payload: { content: [{ type: "text", text: "wrong" }] } },
-    { kind: "error", payload: { name: "Error", message: "boom happened" } },
+    {
+      kind: "error",
+      payload: { name: "Error", message: `connection refused using key ${FAKE_SECRET}` },
+    },
     {
       kind: "user_feedback",
       payload: {
@@ -83,7 +92,11 @@ describe("crewhaus lessons update (#56)", () => {
     expect(existsSync(lessonsFile)).toBe(true);
     const md1 = readFileSync(lessonsFile, "utf-8");
     expect(md1).toContain("crewhaus deploy"); // correction lesson
-    expect(md1).toContain("boom happened"); // failure-fix lesson
+    // #56 F3 — the failure-fix reason is auto-injected into future prompts, so
+    // a pasted credential in the raw error message is redacted, not written raw.
+    expect(md1).toContain("runtime error"); // failure-fix lesson still present
+    expect(md1).not.toContain(FAKE_SECRET); // the credential is masked
+    expect(md1).toContain("[REDACTED:secret]");
     expect(md1).toContain("<!-- crewhaus:lessons -->");
 
     // Per-user prefs for rater "max".

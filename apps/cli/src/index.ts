@@ -282,7 +282,7 @@ import {
   parseModelsFlag,
   runMatrixCells,
 } from "./eval-matrix";
-// Item #55 — distill recurring user questions into an auto-loaded FAQ skill.
+// Item #55 — distill recurring user questions into an auto-discovered FAQ skill.
 import { buildFaqSkill, distillFaq } from "./faq";
 // Response-feedback core — pure, side-effect-free so it is unit-testable
 // (this entry file runs an argv switch on import). Powers `rate`/`feedback`
@@ -967,7 +967,7 @@ const FEWSHOT_SCHEMA: ParseArgsSchema = {
 };
 
 // Item #55 — `crewhaus faq distill`: cluster recurring user questions into an
-// auto-loaded FAQ SKILL.md under `.crewhaus/skills/faq/`.
+// auto-discovered FAQ SKILL.md under `.crewhaus/skills/faq/`.
 const FAQ_SCHEMA: ParseArgsSchema = {
   flags: [
     // How many recent sessions to scan (default all; `N` or `all`).
@@ -1333,7 +1333,7 @@ function usageText(): string {
     "  fewshot harvest [--all-sessions]     harvest up-rated turns into a golden few-shot pool (#54)",
     "       [--min-score F] [-o <pool>]     (PII/secret-redacted); optimize with --few-shot",
     "  fewshot show [--k N]                 print the pool as the injectable prompt block",
-    "  faq distill [--sessions N|all]       cluster recurring questions into an auto-loaded FAQ skill (#55)",
+    "  faq distill [--sessions N|all]       cluster recurring questions into an auto-discovered FAQ skill (#55)",
     "       [--min-score F] [--min-occurrences N] [-o <skill-dir>]",
     "  lessons update [--sessions N|all]    mine corrections + failures into an auto-loaded LESSONS.md (#56)",
     "       [--low-score F] [-o <LESSONS.md>]  + per-user prefs under .crewhaus/preferences/",
@@ -7592,7 +7592,7 @@ async function runFaq(args: ParsedArgs): Promise<void> {
     process.stdout.write(
       "usage: crewhaus faq distill [--sessions N|all] [--min-score F] [--min-occurrences N] [-o <skill-dir>]\n" +
         "  Cluster recurring user questions, pair each with its best-rated answer, and emit\n" +
-        "  an auto-loaded FAQ skill (SKILL.md) under .crewhaus/skills/faq/ (PII/secret-redacted).\n",
+        "  an auto-discovered FAQ skill (SKILL.md) under .crewhaus/skills/faq/ (PII/secret-redacted).\n",
     );
     return;
   }
@@ -7699,6 +7699,9 @@ async function runLessons(args: ParsedArgs): Promise<void> {
   const existingRaw = existsSync(lessonsFile) ? readFileSync(lessonsFile, "utf-8") : "";
   const { preamble, lessons: existing } = parseLessonsMd(existingRaw);
   const merged = mergeLessons(existing, freshLessons);
+  // TODO(#56 F7): `merged` grows unbounded across updates (dedupe never evicts)
+  // — add a cap/prune (e.g. keep the newest/highest-signal N lessons) so the
+  // auto-injected LESSONS.md can't bloat the system prompt over time.
   writeFileSync(lessonsFile, renderLessonsMd(merged, preamble), { mode: 0o600 });
   process.stdout.write(
     `[lessons] ${freshLessons.length} mined → ${merged.length} in ${lessonsFile} (auto-loaded at run start)\n`,
@@ -9618,7 +9621,7 @@ switch (subcommand) {
     break;
   case "faq":
     // Item #55 — `faq distill`: cluster recurring user questions into an
-    // auto-loaded FAQ skill. Structured failures route through die().
+    // auto-discovered FAQ skill. Structured failures route through die().
     try {
       await runFaq(parseFor(rest, FAQ_SCHEMA));
     } catch (err) {

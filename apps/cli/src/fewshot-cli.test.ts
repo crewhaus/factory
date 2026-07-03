@@ -34,6 +34,23 @@ async function runCli(args: ReadonlyArray<string>, cwd: string): Promise<{ exitC
   return { exitCode: await proc.exited };
 }
 
+/** runCli variant that also returns captured stderr (the few-shot write-back
+ *  notice is on stderr and reliably flushed before the process exits). */
+async function runCliCapture(
+  args: ReadonlyArray<string>,
+  cwd: string,
+): Promise<{ exitCode: number; stderr: string }> {
+  const proc = Bun.spawn([process.execPath, CLI_PATH, ...args], {
+    cwd,
+    env: { PATH: process.env["PATH"] ?? "" },
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const stderr = await new Response(proc.stderr).text();
+  return { exitCode: await proc.exited, stderr };
+}
+
 const SESSION = "sess_0123456789abcdef";
 
 /** One rated up + one rated down turn → one qualifying few-shot example. */
@@ -137,5 +154,58 @@ describe("crewhaus fewshot harvest (#54)", () => {
     writeMinimalSpec(root);
     const result = await runCli(["fewshot", "harvest", "--all-sessions"], root);
     expect(result.exitCode).not.toBe(0);
+  });
+});
+
+describe("optimize --few-shot is patch-only (#54 F8)", () => {
+  test("--few-shot with --write-back never mutates the tracked spec + prints the notice", async () => {
+    const root = newTempRoot();
+    writeSession(root);
+    writeMinimalSpec(root);
+    // Harvest a real pool so `optimize --few-shot auto` has examples to inject.
+    const harvest = await runCli(["fewshot", "harvest", "--all-sessions"], root);
+    expect(harvest.exitCode).toBe(0);
+
+    // Minimal dataset + graders so optimize's arg handling reaches the few-shot
+    // block (dataset resolution runs before it and dies otherwise). No model is
+    // needed to reach the notice — it prints during arg handling.
+    const dataset = join(root, "dataset.jsonl");
+    writeFileSync(dataset, `${JSON.stringify({ id: "s1", input: "hi", expected_output: "ok" })}\n`);
+    const graders = join(root, "graders.yaml");
+    writeFileSync(graders, "graders:\n  - name: g\n    type: contains\n    substring: 'ok'\n");
+
+    // Snapshot the tracked spec BEFORE the optimize run.
+    const specFile = join(root, "crewhaus.yaml");
+    const before = readFileSync(specFile, "utf-8");
+
+    // Run optimize with BOTH --few-shot and --write-back. The few-shot path
+    // forces writeBack:false: the augmented spec is written to a temp outDir,
+    // never the source. (The run itself may exit non-zero for lack of a model —
+    // the safety claim is about the on-disk spec + the stderr notice, both of
+    // which happen during arg handling before any model call.)
+    const r = await runCliCapture(
+      [
+        "optimize",
+        specFile,
+        "--dataset",
+        dataset,
+        "--graders",
+        graders,
+        "--few-shot",
+        "auto",
+        "--write-back",
+        "--mutator",
+        "rule-based",
+        "--iterations",
+        "1",
+      ],
+      root,
+    );
+
+    // 1) The tracked spec is byte-identical — the injected examples never
+    //    landed in it (they'd double-inject on the next run).
+    expect(readFileSync(specFile, "utf-8")).toBe(before);
+    // 2) The safety notice was printed to stderr.
+    expect(r.stderr).toContain("--write-back is ignored with --few-shot");
   });
 });

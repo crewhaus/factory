@@ -1,17 +1,19 @@
 /**
- * Item #55 — distill repeated user questions into an auto-loaded FAQ skill.
+ * Item #55 — distill repeated user questions into an auto-discovered FAQ skill.
  *
  * `crewhaus faq distill` clusters recurring `user_message` questions across
  * sessions (deterministic token clustering — the same greedy-jaccard approach
  * `graders suggest` uses, no model call), pairs each cluster with its best-rated
  * answer (the up-rated turn's output), and emits a SKILL.md FAQ skill into
- * `.crewhaus/skills/faq/` so `@crewhaus/skills-registry` auto-discovers it and
- * future runs auto-load the FAQ.
+ * `.crewhaus/skills/faq/` so `@crewhaus/skills-registry` auto-discovers it —
+ * its name + description go into the prompt and the body loads on demand when
+ * the model invokes the `Skill` tool (the registry is lazy, not eager).
  *
  * Everything here is pure + deterministic so it is unit-testable; the FS access
- * and PII/secret redaction wiring live in `apps/cli/src/index.ts`. The harvested
- * ANSWER text is model output that may carry pasted credentials, so the caller
- * redacts it (via `SYNTHESIZE_PII_DETECTORS`) before it lands in the skill body.
+ * and PII/secret redaction wiring live in `apps/cli/src/index.ts`. Both the
+ * harvested ANSWER and the representative QUESTION are user/model text that may
+ * carry pasted credentials, so the caller redacts BOTH (via
+ * `SYNTHESIZE_PII_DETECTORS`) before they land in the skill body (#55 F4).
  *
  * The emitted SKILL.md is guaranteed valid per skills-registry's `parseSkillFile`
  * (leading `---` frontmatter with `name` + `description`, then the FAQ body).
@@ -36,8 +38,9 @@ export type FaqEntry = {
 export type ClusterOptions = {
   /** Jaccard overlap at/above which a question joins a cluster's seed. Default 0.5. */
   readonly threshold?: number;
-  /** Minimum occurrences for a cluster to become an FAQ entry. Default 2
-   *  (recurring — a one-off question is not an FAQ). */
+  /** Minimum number of DISTINCT sessions that must ask a clustered question
+   *  for it to become an FAQ entry. Default 2 (recurring across sessions — a
+   *  one-off, or a single session that repeats itself, is not an FAQ). */
   readonly minOccurrences?: number;
   /** Normalized rating at/above which an answer is "good". Default 0.7. */
   readonly minScore?: number;
@@ -65,9 +68,9 @@ type QuestionRecord = {
  * Build the FAQ entries from per-session turns + feedback. Deterministic:
  * questions are clustered greedily by normalized-token Jaccard overlap in a
  * stable visit order; each cluster keeps its best-rated answer (highest score,
- * ties broken by session/turn order). Only clusters with ≥ `minOccurrences`
- * AND a qualifying answer (score ≥ `minScore`) become entries. Entries come
- * back most-recurring-first.
+ * ties broken by session/turn order). Only clusters asked in ≥ `minOccurrences`
+ * DISTINCT sessions (#55 F9) AND with a qualifying answer (score ≥ `minScore`)
+ * become entries. Entries come back most-recurring-first.
  */
 export async function distillFaq(
   turnsBySession: ReadonlyArray<SessionTurn>,
@@ -127,7 +130,11 @@ export async function distillFaq(
 
   const entries: FaqEntry[] = [];
   for (const c of clusters) {
-    if (c.items.length < minOccurrences) continue;
+    // #55 F9 — "recurring" means asked across DISTINCT sessions, not the same
+    // session twice. Gate on the distinct-session count so two questions from
+    // one session don't manufacture an FAQ entry at minOccurrences:2.
+    const sessionCount = new Set(c.items.map((i) => i.sessionId)).size;
+    if (sessionCount < minOccurrences) continue;
     // Best answer: highest-scored qualifying turn (stable tie-break by order).
     const qualifying = c.items
       .filter((i) => i.score !== undefined && i.score >= minScore && i.answer.trim() !== "")
@@ -140,16 +147,20 @@ export async function distillFaq(
     const best = qualifying[0];
     if (best === undefined) continue;
     // Representative question: the shortest question in the cluster (most
-    // canonical phrasing), stable tie-break.
-    const question = [...c.items]
+    // canonical phrasing), stable tie-break. #55 F4 — the representative
+    // question is a raw user turn rendered as a Markdown heading in SKILL.md,
+    // so it is redacted with the SAME redactor as the answer (a question can
+    // paste a secret/email just as an answer can).
+    const rawQuestion = [...c.items]
       .map((i) => i.question)
       .sort((a, b) => a.length - b.length || a.localeCompare(b))[0] as string;
+    const question = (await redact(rawQuestion)).trim();
     const answer = (await redact(best.answer)).trim();
-    if (answer === "") continue;
+    if (question === "" || answer === "") continue;
     entries.push({
       question,
       answer,
-      sessionCount: new Set(c.items.map((i) => i.sessionId)).size,
+      sessionCount,
       occurrences: c.items.length,
     });
   }

@@ -76,13 +76,15 @@ export async function mineLessons(
     if (!byKey.has(key)) byKey.set(key, { key, text: clean, kind });
   };
 
-  // Correction lessons from feedback (merged so one per turn).
+  // Correction lessons from feedback (merged so one per turn). #56 F3 — the
+  // echoed question prefix is a raw user turn (may carry a pasted credential),
+  // so it is redacted too, not just the correction/comment body.
   for (const fb of mergeFeedback(feedback)) {
     const turn = turnByKey.get(`${fb.sessionId}#${fb.turnNumber}`);
     const question = turn?.input?.trim();
     const score = normalizeRating(fb);
     if (fb.correction !== undefined && fb.correction.trim() !== "") {
-      const q = question ? `For "${clip(question, 80)}": ` : "";
+      const q = question ? `For "${await redact(clip(question, 80))}": ` : "";
       add(`${q}prefer this answer — ${await redact(fb.correction)}`, "correction");
     } else if (
       fb.comment !== undefined &&
@@ -90,15 +92,19 @@ export async function mineLessons(
       score !== undefined &&
       score <= lowScore
     ) {
-      const q = question ? `For "${clip(question, 80)}": ` : "";
+      const q = question ? `For "${await redact(clip(question, 80))}": ` : "";
       add(`${q}avoid — ${await redact(fb.comment)}`, "correction");
     }
   }
 
-  // Failure→fix lessons from the mined negative signals.
+  // Failure→fix lessons from the mined negative signals. #56 F3 — BOTH the
+  // echoed user input AND the failure reason (raw error messages carry
+  // connection strings / tokens) are redacted before landing in an
+  // auto-injected lesson.
   for (const sig of failureSignals) {
-    const q = sig.input.trim() !== "" ? ` on "${clip(sig.input, 80)}"` : "";
-    add(`Watch out${q}: ${sig.reason}.`, "failure-fix");
+    const redactedInput = sig.input.trim() !== "" ? await redact(clip(sig.input, 80)) : "";
+    const q = redactedInput !== "" ? ` on "${redactedInput}"` : "";
+    add(`Watch out${q}: ${await redact(sig.reason)}.`, "failure-fix");
   }
 
   // Stable order: corrections first (higher-signal), then failure-fixes; each

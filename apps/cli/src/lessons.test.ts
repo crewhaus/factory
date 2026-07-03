@@ -83,6 +83,42 @@ describe("mineLessons (#56)", () => {
     });
     expect(lessons.some((l) => l.text.includes(secret))).toBe(false);
   });
+
+  test("redacts credentials in the failure-fix reason + echoed input (#56 F3)", async () => {
+    const secret = ["sk", "-", "B".repeat(40)].join("");
+    const redactor = createPiiRedactor({ regexDetectors: SYNTHESIZE_PII_DETECTORS });
+    const lessons = await mineLessons(
+      [],
+      [],
+      [
+        // Both the mined input AND the reason carry a pasted credential — a raw
+        // error message routinely embeds connection strings / tokens.
+        { input: `list keys ${secret}`, reason: `auth failed with ${secret}` },
+      ],
+      { redact: async (t) => (await redactor.redact(t)).text },
+    );
+    expect(lessons).toHaveLength(1);
+    const text = lessons[0]?.text ?? "";
+    expect(text).not.toContain(secret);
+    expect(text).toContain("[REDACTED:secret]");
+    // The lesson still reads as a failure-fix ("Watch out … : …").
+    expect(lessons[0]?.kind).toBe("failure-fix");
+    expect(text.startsWith("Watch out")).toBe(true);
+  });
+
+  test("redacts a credential in the echoed correction-question prefix (#56 F3)", async () => {
+    const secret = ["sk", "-", "C".repeat(40)].join("");
+    const turns = [turn(S1, 1, `my key is ${secret}, is this right?`, "no")];
+    const feedback = [fb(S1, 1, { correction: "rotate it immediately" })];
+    const redactor = createPiiRedactor({ regexDetectors: SYNTHESIZE_PII_DETECTORS });
+    const lessons = await mineLessons(turns, feedback, [], {
+      redact: async (t) => (await redactor.redact(t)).text,
+    });
+    // The `For "<question>": ` prefix echoes the raw user turn — it must be
+    // redacted too, not just the correction body.
+    expect(lessons.some((l) => l.text.includes(secret))).toBe(false);
+    expect(lessons.some((l) => l.text.includes("[REDACTED:secret]"))).toBe(true);
+  });
 });
 
 describe("renderLessonsMd + parseLessonsMd idempotency (#56)", () => {
