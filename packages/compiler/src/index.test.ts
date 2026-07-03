@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { findSunset } from "@crewhaus/cost-tracker";
 import type { IrNode } from "@crewhaus/ir";
 import { type Spec, parseSpec } from "@crewhaus/spec";
 import {
@@ -456,6 +457,108 @@ compaction:
   relevanceTopK: 10
 `);
     expect(bundle.files).toHaveLength(2);
+  });
+
+  // Item 25 — the `cheapest` sentinel for compaction.model resolves AT COMPILE
+  // TIME to the cheapest same-provider (as the primary) pricing-table family.
+  test('compaction.model "cheapest" resolves to the cheapest same-provider model', () => {
+    const spec = parseSpec(`
+name: hello
+target: cli
+agent:
+  model: claude-opus-4-7
+  instructions: be helpful
+compaction:
+  model: cheapest
+`);
+    const ir = lower(spec);
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    // claude-3-5-haiku is nominally cheaper but is a KNOWN_SUNSETS family
+    // (retires 2026-10-01) — "cheapest" must skip it and resolve to the
+    // cheapest NON-sunset anthropic family, claude-haiku-4-5.
+    expect(ir.compaction.model).toBe("claude-haiku-4-5");
+  });
+
+  test('compaction.model "cheapest" never resolves to a KNOWN_SUNSETS model', () => {
+    const spec = parseSpec(`
+name: hello
+target: cli
+agent:
+  model: claude-opus-4-7
+  instructions: be helpful
+compaction:
+  model: cheapest
+`);
+    const ir = lower(spec);
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    const resolved = ir.compaction.model;
+    expect(resolved).toBeDefined();
+    expect(findSunset("anthropic", resolved as string)).toBeUndefined();
+  });
+
+  test('"cheapest" follows the primary provider (openai primary → openai aux)', () => {
+    const spec = parseSpec(`
+name: hello
+target: cli
+agent:
+  model: openai/gpt-5
+  instructions: be helpful
+compaction:
+  model: cheapest
+`);
+    const ir = lower(spec);
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect(ir.compaction.model?.startsWith("openai/")).toBe(true);
+  });
+
+  test("a concrete compaction.model passes through unchanged (not a sentinel)", () => {
+    const spec = parseSpec(`
+name: hello
+target: cli
+agent:
+  model: claude-opus-4-7
+  instructions: be helpful
+compaction:
+  model: claude-haiku-4-5
+`);
+    const ir = lower(spec);
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect(ir.compaction.model).toBe("claude-haiku-4-5");
+  });
+
+  test('"cheapest" against a non-table primary is a compile error', () => {
+    expect(() =>
+      lower(
+        parseSpec(`
+name: hello
+target: cli
+agent:
+  model: local/llama3.2@http://localhost:11434/v1
+  instructions: be helpful
+compaction:
+  model: cheapest
+`),
+      ),
+    ).toThrow(/cheapest/);
+  });
+
+  // Item 25/F3 — targets without an `agent` block (workflow/graph/crew) carry
+  // the primary model as a top-level `model` field. `resolveAuxModel` must
+  // fall back to it instead of only checking `agent.model`.
+  test('"cheapest" resolves against a top-level model on an agent-less target (workflow)', () => {
+    const spec = parseSpec(`
+name: hello-workflow
+target: workflow
+model: claude-opus-4-7
+steps:
+  - name: list
+    instructions: list files
+compaction:
+  model: cheapest
+`);
+    const ir = lower(spec);
+    if (ir.target !== "workflow") throw new Error("unexpected target");
+    expect(ir.compaction.model).toBe("claude-haiku-4-5");
   });
 });
 
@@ -2191,6 +2294,122 @@ tenants:
     expect(() =>
       parseSpec(
         "name: hello\ntarget: cli\nagent:\n  model: m\n  instructions: i\n  circuit_breaker:\n    failureThreshold: 0\n",
+      ),
+    ).toThrow();
+  });
+});
+
+describe("lower — two-tier router (item 26: model_tiers)", () => {
+  const CLI_TIERS_SPEC = `
+name: hello
+target: cli
+agent:
+  model: claude-opus-4-7
+  instructions: be helpful
+  model_tiers:
+    fast: claude-haiku-4-5
+    default: claude-sonnet-4-5
+    routing:
+      contextTokenThreshold: 20000
+      toolsToDefault: true
+`;
+
+  test("lowers cli agent.model_tiers (fast/default + routing) verbatim", () => {
+    const ir = lower(parseSpec(CLI_TIERS_SPEC));
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect(ir.agent.modelTiers).toEqual({
+      fast: "claude-haiku-4-5",
+      default: "claude-sonnet-4-5",
+      routing: { contextTokenThreshold: 20000, toolsToDefault: true },
+    });
+  });
+
+  test("model_tiers without routing lowers with just fast/default", () => {
+    const ir = lower(
+      parseSpec(`
+name: hello
+target: cli
+agent:
+  model: claude-opus-4-7
+  instructions: i
+  model_tiers:
+    fast: claude-haiku-4-5
+    default: claude-sonnet-4-5
+`),
+    );
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect(ir.agent.modelTiers).toEqual({
+      fast: "claude-haiku-4-5",
+      default: "claude-sonnet-4-5",
+    });
+  });
+
+  test("modelTiers stays ABSENT from the IR when the spec omits the block (back-compat)", () => {
+    const ir = lower(parseSpec(MINIMAL_SPEC));
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect("modelTiers" in ir.agent).toBe(false);
+  });
+
+  test("channel + managed agent blocks lower model_tiers too", () => {
+    const channelIr = lower(
+      parseSpec(`
+name: hc
+target: channel
+agent:
+  model: claude-opus-4-7
+  instructions: bot
+  model_tiers:
+    fast: claude-haiku-4-5
+    default: claude-sonnet-4-5
+channels:
+  slack:
+    botToken: $SLACK_BOT_TOKEN
+    signingSecret: $SLACK_SIGNING_SECRET
+routing:
+  sessionKey: thread
+`),
+    );
+    if (channelIr.target !== "channel") throw new Error("unexpected target");
+    expect(channelIr.agent.modelTiers?.fast).toBe("claude-haiku-4-5");
+
+    const managedIr = lower(
+      parseSpec(`
+name: mg
+target: managed
+agent:
+  model: claude-opus-4-7
+  instructions: i
+  model_tiers:
+    fast: claude-haiku-4-5
+    default: claude-sonnet-4-5
+tenants:
+  - id: t1
+    budget:
+      maxInputTokens: 1000
+      maxOutputTokens: 2000
+`),
+    );
+    if (managedIr.target !== "managed") throw new Error("unexpected target");
+    expect(managedIr.agent.modelTiers?.default).toBe("claude-sonnet-4-5");
+  });
+
+  test("spec/IR/codegen round-trip: compiled cli bundle threads modelTiers into runChatLoop", () => {
+    const bundle = compile(CLI_TIERS_SPEC);
+    const agentTs = bundle.files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agentTs).toContain(
+      'modelTiers: {"fast":"claude-haiku-4-5","default":"claude-sonnet-4-5","routing":{"contextTokenThreshold":20000,"toolsToDefault":true}},',
+    );
+  });
+
+  test("rejects unknown model_tiers keys and a missing tier", () => {
+    expect(() =>
+      parseSpec(
+        "name: h\ntarget: cli\nagent:\n  model: m\n  instructions: i\n  model_tiers:\n    fast: a\n    default: b\n    bogus: c\n",
+      ),
+    ).toThrow();
+    expect(() =>
+      parseSpec(
+        "name: h\ntarget: cli\nagent:\n  model: m\n  instructions: i\n  model_tiers:\n    fast: a\n",
       ),
     ).toThrow();
   });

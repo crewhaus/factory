@@ -97,6 +97,32 @@ export type CreateFailoverChainOptions = {
    * unit tests; production callers omit it.
    */
   readonly adapters?: ReadonlyMap<string, ProviderAdapter>;
+  /**
+   * Item 28 (half 2) — OPTIONAL cache-hit-aware fallback ordering. When
+   * supplied, the FALLBACK candidates (never the primary — the primary stays
+   * the spec's declared first choice) are reordered by this callback before
+   * routing, so the chain prefers cache-warm same-provider siblings over
+   * nominally-cheaper cross-provider hops. It receives the fallback spec
+   * strings paired with their best-effort parsed (provider, modelId) and
+   * returns them in preferred order; any string it omits is appended in its
+   * original relative position, and unknown strings it invents are ignored.
+   *
+   * Default (undefined) → declared fallback order, byte-for-byte the
+   * pre-#28 behaviour. runtime-core wires this to
+   * `@crewhaus/cost-tracker`'s `rankCandidates` over the run's observed cache
+   * profile; the chain itself stays dependency-free of cost-tracker.
+   */
+  readonly rankFallbacks?: (fallbacks: readonly FallbackRankInput[]) => readonly string[];
+};
+
+/** One fallback candidate handed to the optional `rankFallbacks` seam. */
+export type FallbackRankInput = {
+  /** The fallback spec model string (`agent.model_fallbacks[i]`). */
+  readonly modelString: string;
+  /** Best-effort parsed provider — `undefined` when the string is synthetic/unparseable. */
+  readonly provider?: ProviderId;
+  /** Best-effort parsed wire model id (verbatim string when unparseable). */
+  readonly modelId: string;
 };
 
 /** The (spec string, wire id, provider) triple identifying one candidate. */
@@ -180,6 +206,48 @@ function bestEffortModelId(modelString: string): string {
   }
 }
 
+/**
+ * Item 28 (half 2) — apply the caller's `rankFallbacks` reordering to the
+ * deduped fallback list. Robust against a misbehaving ranker: the result is
+ * always a permutation-plus-tail of the input — every original fallback
+ * appears exactly once, ranked strings first (in the ranker's order, filtered
+ * to real inputs), then any omitted originals in their declared order. Invented
+ * strings are dropped. So a buggy ranker can only reorder, never lose or
+ * duplicate a candidate.
+ */
+function applyFallbackRanking(
+  fallbacks: readonly string[],
+  rank: (inputs: readonly FallbackRankInput[]) => readonly string[],
+): string[] {
+  if (fallbacks.length <= 1) return [...fallbacks];
+  const inputs: FallbackRankInput[] = fallbacks.map((modelString) => {
+    try {
+      const parsed = parseModelString(modelString);
+      return { modelString, provider: parsed.providerId, modelId: parsed.modelId };
+    } catch {
+      return { modelString, modelId: modelString };
+    }
+  });
+  const original = new Set(fallbacks);
+  const ranked = rank(inputs);
+  const ordered: string[] = [];
+  const placed = new Set<string>();
+  for (const m of ranked) {
+    if (original.has(m) && !placed.has(m)) {
+      ordered.push(m);
+      placed.add(m);
+    }
+  }
+  // Append any original fallback the ranker omitted, in declared order.
+  for (const m of fallbacks) {
+    if (!placed.has(m)) {
+      ordered.push(m);
+      placed.add(m);
+    }
+  }
+  return ordered;
+}
+
 type CandidateState = {
   readonly modelString: string;
   resolution: ModelResolution | undefined;
@@ -212,10 +280,19 @@ export async function createFailoverChain(
 
   // Dedupe: a fallback equal to the primary (or to an earlier fallback)
   // would share breaker state anyway — keep the first occurrence only.
-  const fallbackStrings: string[] = [];
+  const dedupedFallbacks: string[] = [];
   for (const m of opts.fallbacks) {
-    if (m !== opts.model && !fallbackStrings.includes(m)) fallbackStrings.push(m);
+    if (m !== opts.model && !dedupedFallbacks.includes(m)) dedupedFallbacks.push(m);
   }
+
+  // Item 28 (half 2) — OPTIONAL cache-hit-aware fallback reordering. The
+  // primary is never reordered (it stays the spec's declared first choice);
+  // only the fallback tier is re-sorted by the caller's ranking. Any string
+  // the ranker omits keeps its original relative position (appended after
+  // the ranked ones); invented strings the ranker returns are ignored.
+  const fallbackStrings = opts.rankFallbacks
+    ? applyFallbackRanking(dedupedFallbacks, opts.rankFallbacks)
+    : dedupedFallbacks;
 
   // Primary resolves fail-fast — identical to the chain-less behaviour.
   const primaryResolution = await resolveCandidate(opts.model);

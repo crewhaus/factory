@@ -390,6 +390,7 @@
       "name": "@crewhaus/compiler",
       "version": "0.1.4",
       "dependencies": {
+        "@crewhaus/cost-tracker": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",

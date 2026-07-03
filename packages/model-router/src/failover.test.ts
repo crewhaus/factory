@@ -423,3 +423,94 @@ describe("createFailoverChain — prompt-cache continuity", () => {
     expect(REQ.system[0]?.cache_control).toEqual({ type: "ephemeral" });
   });
 });
+
+describe("createFailoverChain — rankFallbacks (item 28 half 2)", () => {
+  test("reorders the fallback tier by the caller's ranking, primary stays first", async () => {
+    const chain = await createFailoverChain({
+      model: "claude-opus-4-7",
+      fallbacks: ["openai/gpt-4o-mini", "claude-haiku-4-5"],
+      adapters: new Map<string, ProviderAdapter>([
+        ["claude-opus-4-7", scriptedAdapter({})],
+        ["openai/gpt-4o-mini", scriptedAdapter({ providerId: "openai" })],
+        ["claude-haiku-4-5", scriptedAdapter({})],
+      ]),
+      // A ranker that prefers the same-provider sibling (haiku) over the
+      // cross-provider hop (gpt-4o-mini).
+      rankFallbacks: (inputs) =>
+        [...inputs]
+          .sort(
+            (a, b) => (a.provider === "anthropic" ? -1 : 1) - (b.provider === "anthropic" ? -1 : 1),
+          )
+          .map((i) => i.modelString),
+    });
+    expect(chain.candidates().map((c) => c.modelString)).toEqual([
+      "claude-opus-4-7",
+      "claude-haiku-4-5",
+      "openai/gpt-4o-mini",
+    ]);
+  });
+
+  test("receives best-effort parsed provider/modelId for each fallback", async () => {
+    let seen: ReadonlyArray<{ modelString: string; provider?: string; modelId: string }> = [];
+    await createFailoverChain({
+      model: "claude-opus-4-7",
+      fallbacks: ["openai/gpt-4o-mini", "claude-haiku-4-5"],
+      adapters: new Map<string, ProviderAdapter>([
+        ["claude-opus-4-7", scriptedAdapter({})],
+        ["openai/gpt-4o-mini", scriptedAdapter({ providerId: "openai" })],
+        ["claude-haiku-4-5", scriptedAdapter({})],
+      ]),
+      rankFallbacks: (inputs) => {
+        seen = inputs.map((i) => ({
+          modelString: i.modelString,
+          provider: i.provider,
+          modelId: i.modelId,
+        }));
+        return inputs.map((i) => i.modelString);
+      },
+    });
+    expect(seen).toEqual([
+      { modelString: "openai/gpt-4o-mini", provider: "openai", modelId: "gpt-4o-mini" },
+      { modelString: "claude-haiku-4-5", provider: "anthropic", modelId: "claude-haiku-4-5" },
+    ]);
+  });
+
+  test("a ranker that omits or invents strings cannot lose or duplicate a candidate", async () => {
+    const chain = await createFailoverChain({
+      model: "claude-opus-4-7",
+      fallbacks: ["openai/gpt-4o-mini", "claude-haiku-4-5", "gemini/gemini-2.5-flash"],
+      adapters: new Map<string, ProviderAdapter>([
+        ["claude-opus-4-7", scriptedAdapter({})],
+        ["openai/gpt-4o-mini", scriptedAdapter({ providerId: "openai" })],
+        ["claude-haiku-4-5", scriptedAdapter({})],
+        ["gemini/gemini-2.5-flash", scriptedAdapter({ providerId: "gemini" })],
+      ]),
+      // Names only one real candidate + one invented one, drops the rest.
+      rankFallbacks: () => ["claude-haiku-4-5", "does/not-exist"],
+    });
+    // Ranked-real first, then the omitted originals in declared order.
+    expect(chain.candidates().map((c) => c.modelString)).toEqual([
+      "claude-opus-4-7",
+      "claude-haiku-4-5",
+      "openai/gpt-4o-mini",
+      "gemini/gemini-2.5-flash",
+    ]);
+  });
+
+  test("default (no rankFallbacks) keeps declared order byte-for-byte", async () => {
+    const chain = await createFailoverChain({
+      model: "claude-opus-4-7",
+      fallbacks: ["openai/gpt-4o-mini", "claude-haiku-4-5"],
+      adapters: new Map<string, ProviderAdapter>([
+        ["claude-opus-4-7", scriptedAdapter({})],
+        ["openai/gpt-4o-mini", scriptedAdapter({ providerId: "openai" })],
+        ["claude-haiku-4-5", scriptedAdapter({})],
+      ]),
+    });
+    expect(chain.candidates().map((c) => c.modelString)).toEqual([
+      "claude-opus-4-7",
+      "openai/gpt-4o-mini",
+      "claude-haiku-4-5",
+    ]);
+  });
+});

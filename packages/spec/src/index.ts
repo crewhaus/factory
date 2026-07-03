@@ -238,6 +238,33 @@ const circuitBreakerBlock = z
   .optional();
 
 /**
+ * Item 26 — opt-in two-tier turn-difficulty router. When present, the runtime
+ * picks a model tier PER TURN from deterministic signals (estimated context
+ * tokens, whether tools are in play, turn index, prior-turn tool_use density):
+ * the cheap `fast` model for easy turns, the `default` model for hard ones. A
+ * fast-tier turn that FAILS re-runs on `default` (misroute recovery). Both are
+ * full model-router grammar strings. `routing` tunes the escalation thresholds
+ * (all optional — sensible defaults apply). Omitted entirely → single-model
+ * behaviour, byte-identical bundles.
+ */
+const modelTiersBlock = z
+  .object({
+    fast: z.string().min(1),
+    default: z.string().min(1),
+    routing: z
+      .object({
+        contextTokenThreshold: z.number().int().positive().optional(),
+        toolsToDefault: z.boolean().optional(),
+        firstTurnToDefault: z.boolean().optional(),
+        priorToolDensityThreshold: z.number().int().positive().optional(),
+      })
+      .strict()
+      .optional(),
+  })
+  .strict()
+  .optional();
+
+/**
  * Section 17 — optional override for the model used by
  * `compaction-autocompact` when summarising long conversations. Defaults
  * to the agent's primary model when omitted, but you can target a
@@ -565,6 +592,8 @@ const cliSchema = z
         // Item 22 — provider failover chain (see modelFallbacksBlock docs).
         model_fallbacks: modelFallbacksBlock,
         circuit_breaker: circuitBreakerBlock,
+        // Item 26 — opt-in two-tier turn-difficulty router.
+        model_tiers: modelTiersBlock,
         sub_agents: subAgentsBlock,
       })
       .strict(),
@@ -699,6 +728,8 @@ const channelAgentSchema = z
     // Item 22 — provider failover chain (see modelFallbacksBlock docs).
     model_fallbacks: modelFallbacksBlock,
     circuit_breaker: circuitBreakerBlock,
+    // Item 26 — opt-in two-tier turn-difficulty router.
+    model_tiers: modelTiersBlock,
     tools: z.array(z.string().min(1)).optional(),
     tool_config: toolConfigBlock,
     sub_agents: subAgentsBlock,
@@ -800,6 +831,8 @@ const managedAgentSchema = z
     // Item 22 — provider failover chain (see modelFallbacksBlock docs).
     model_fallbacks: modelFallbacksBlock,
     circuit_breaker: circuitBreakerBlock,
+    // Item 26 — opt-in two-tier turn-difficulty router.
+    model_tiers: modelTiersBlock,
   })
   .strict();
 
@@ -1297,6 +1330,7 @@ export type SpecSubAgentDefinition = z.infer<typeof subAgentDefinitionSchema>;
 export type SpecCompactionBlock = z.infer<typeof compactionBlock>;
 export type SpecModelFallbacks = z.infer<typeof modelFallbacksBlock>;
 export type SpecCircuitBreakerBlock = z.infer<typeof circuitBreakerBlock>;
+export type SpecModelTiersBlock = z.infer<typeof modelTiersBlock>;
 export type SpecBudgetBlock = z.infer<typeof budgetBlock>;
 export type SpecSecurityBlock = z.infer<typeof securityBlock>;
 export type SpecFeedbackBlock = z.infer<typeof feedbackBlock>;
