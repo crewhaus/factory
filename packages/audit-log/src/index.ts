@@ -123,7 +123,25 @@ export type AuditKind =
   // tamper-evidenced. Payload shape (opaque JSON; see apps/cli/src/retention.ts):
   //   { action: "sweep"|"export"|"purge", dryRun: false, deletedSessionIds,
   //     kept/deferred counts, policy inputs (maxAgeDays, pins, windows), ... }
-  | "retention_enforcement";
+  | "retention_enforcement"
+  // Item 59 — approval-gated promotion. `crewhaus deploy promote
+  // --require-approval` appends one record when an approval gate is
+  // EVALUATED for a protected environment: the recorded approvals/tokens or
+  // green PR check that satisfied the quorum (or the refusal), stamped
+  // alongside the promotion it authorized so the approval and the pin flip
+  // sit in the same tamper-evident chain. Payload shape (opaque JSON; see
+  // apps/cli/src/approval-gate.ts):
+  //   { name, toEnv, required, approvals: [{approver, ts, ...}], satisfied,
+  //     prCheck?, ... }
+  | "governance_approval"
+  // Item 59 — PR-based optimize/advise proposals. `crewhaus propose` appends
+  // one record when a spec-change proposal is packaged into a review artifact
+  // (and, when driven, opened as a PR) so the proposal's provenance — source
+  // command, patch hash, eval delta, PR ref — is itself evidenced without
+  // waiting for a human to merge. Payload shape (opaque JSON; see
+  // apps/cli/src/propose.ts):
+  //   { source, specName, patchHash, evalDelta?, prNumber?, prUrl?, ... }
+  | "governance_proposal";
 
 export type AuditRecord = {
   readonly ts: number;

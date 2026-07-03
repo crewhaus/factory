@@ -14,6 +14,10 @@ import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
 import type { SubAgentDefinition } from "@crewhaus/agent-context-isolation";
+// Type-only — the concrete factories are dynamically imported inside the
+// deploy/propose handlers (lazy boot); the approval gate helper needs the
+// registry/audit types for its signature.
+import type { AuditLog } from "@crewhaus/audit-log";
 import { SpecParseError, compile, lower } from "@crewhaus/compiler";
 import { buildContextBundle, discoverRoots } from "@crewhaus/context-bundle";
 import {
@@ -75,6 +79,7 @@ import { createSessionStore } from "@crewhaus/session-store";
 import { createSkillTool, discoverSkills } from "@crewhaus/skills-registry";
 import { loadCommands } from "@crewhaus/slash-commands";
 import { type Spec, parseSpec } from "@crewhaus/spec";
+import type { RegistryAdapter } from "@crewhaus/spec-registry";
 import { spawnSubAgent } from "@crewhaus/sub-agent-spawner";
 import { type RegisteredTool, ToolCatalog } from "@crewhaus/tool-catalog";
 import { registerMcpServer } from "@crewhaus/tool-mcp";
@@ -110,6 +115,20 @@ import {
   renderAdviceHtml,
   runAdviceRules,
 } from "./advise-rules";
+// Item 59 — approval-gated promotion. The protected-env policy + quorum
+// decision for `deploy promote --require-approval`, in a side-effect-free
+// module so it is unit-testable (this entry file runs an argv switch on
+// import). The gate runs BEFORE the deployment-controller flips the pin.
+import {
+  type ApprovalDecisionInput,
+  ApprovalGateError,
+  type PrCheckReader,
+  buildGovernancePayload,
+  decideApproval,
+  loadEnvironmentsConfig,
+  policyForEnv,
+  readApprovals,
+} from "./approval-gate";
 // Item 34 — `crewhaus audit verify` plumbing (anchor-flag parsing + per-check
 // summary + doctor mapping), in a side-effect-free module so it is
 // unit-testable (this entry file runs an argv switch on import).
@@ -436,6 +455,19 @@ import {
   rankSuggestions,
   readOnlyByName,
 } from "./permissions-suggest";
+// Item 59 — PR-based optimize/advise proposals. `crewhaus propose` packages a
+// spec change into a review artifact + opens a PR (never auto-merges), in a
+// side-effect-free module so it is unit-testable (this entry file runs an argv
+// switch on import). Assembly is pure; git/gh live behind an injected driver.
+import {
+  type GitPrDriver,
+  type OpenedPr,
+  ProposeError,
+  type ProposeSource,
+  assembleProposal,
+  buildProposalAuditPayload,
+  buildProposalPrPlan,
+} from "./propose";
 // Item 5 — `crewhaus dataset refresh-goldens`: reconcile user corrections +
 // up-rated turns against an existing dataset's golds, proposing (or applying
 // as a NEW version) updated golds. Side-effect-free so it is unit-testable.
@@ -1247,6 +1279,37 @@ const DEPLOY_SCHEMA: ParseArgsSchema = {
     { name: "root-dir", takesValue: true },
     { name: "tenant", takesValue: true },
     { name: "actor", takesValue: true },
+    // Item 59 — approval gate: a protected env (per .crewhaus/environments.json)
+    // needs a recorded approval quorum / green PR check before the pin flips.
+    { name: "require-approval", takesValue: false },
+    // Consult a PR check as an approval witness (drives `gh pr checks`).
+    { name: "check-pr", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
+// Item 59 — `crewhaus propose <proposed-spec.yaml>`: package a spec change
+// into a review artifact + open a PR (the governance wrapper around
+// optimize/advise write-back). Never auto-merges.
+const PROPOSE_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // The current spec to diff against (default ./crewhaus.yaml).
+    { name: "current", takesValue: true },
+    // Provenance: which verb produced the proposal (optimize|advise|model-scan|manual).
+    { name: "source", takesValue: true },
+    { name: "run-id", takesValue: true },
+    // The version label the changelog/PR uses for the proposed spec.
+    { name: "as-version", takesValue: true },
+    // Eval delta for the PR body (else read from the optimize run if given).
+    { name: "score-before", takesValue: true },
+    { name: "score-after", takesValue: true },
+    { name: "dataset", takesValue: true },
+    // Optimize run dir whose provenance the changelog folds in.
+    { name: "optimize-dir", takesValue: true },
+    // Repo-relative path of the spec file on the branch (default crewhaus.yaml).
+    { name: "spec-path", takesValue: true },
+    // Assemble the bundle + print the plan without touching git/gh.
+    { name: "dry-run", takesValue: false },
     { name: "help", short: "h" },
   ],
 };
@@ -1422,6 +1485,8 @@ function usageText(): string {
     "  fleet list|status|run <sub> ...      cross-harness inventory/health + bulk read-ops (item 58)",
     "  spec put|list|get|pin|alias|log ...  versioned spec storage + changelog (Section 28 spec-registry)",
     "  deploy promote|rollback ...          re-pin a spec for an environment (Section 28)",
+    "       promote --require-approval      gate a protected env on an approval quorum (item 59)",
+    "  propose <proposed.yaml> ...          package a spec change + open a review PR (item 59)",
     "  migrate-all --from N --to N          batch-migrate every spec in the registry",
     "  upgrade [spec.yaml] [--write]        detect the cwd spec's version drift + run the migration",
     "                                       chain (validated); --dry-run diff by default (item 43)",
@@ -9194,13 +9259,24 @@ async function runDeploy(args: ParsedArgs, action: string): Promise<void> {
     process.stdout.write(
       "usage:\n" +
         "  crewhaus deploy promote <name> <fromEnv> <toEnv>  copy env pin\n" +
-        "  crewhaus deploy rollback <name> <env> <version>   re-pin env to version\n",
+        "       [--require-approval] [--check-pr]            gate a protected env (item 59)\n" +
+        "  crewhaus deploy rollback <name> <env> <version>   re-pin env to version\n" +
+        "\n" +
+        "  --require-approval  refuse to flip a PROTECTED env's pin (declared in\n" +
+        "                      .crewhaus/environments.json) until an approval quorum\n" +
+        "                      is met: recorded approvals in .crewhaus/approvals/ and/or\n" +
+        "                      a green proposal PR (--check-pr). The gate decision — met\n" +
+        "                      OR refused — is audit-logged (governance_approval).\n",
     );
     return;
   }
   const rootDirFlag = args.flags["root-dir"];
   const rootDir =
     typeof rootDirFlag === "string" ? rootDirFlag : join(process.cwd(), ".crewhaus", "specs");
+  // The harness root that owns `.crewhaus/environments.json` + `.crewhaus/approvals`.
+  // When --root-dir points AT a `.crewhaus/specs`, the harness root is two up;
+  // otherwise it's the cwd (the standalone-harness convention).
+  const harnessRoot = process.cwd();
   const auditDir = join(process.cwd(), ".crewhaus", "audit");
   const { createFileBackedRegistry } = await import("@crewhaus/spec-registry");
   const { openAuditLog } = await import("@crewhaus/audit-log");
@@ -9225,6 +9301,28 @@ async function runDeploy(args: ParsedArgs, action: string): Promise<void> {
     if (typeof name !== "string") die("missing <name>");
     if (typeof fromEnv !== "string") die("missing <fromEnv>");
     if (typeof toEnv !== "string") die("missing <toEnv>");
+
+    // Item 59 — the approval gate. A protected env (declared in
+    // environments.json OR flagged via --require-approval) must clear a
+    // recorded-approval / green-PR quorum BEFORE the pin flips. The gate runs
+    // here, ahead of the controller, so the controller stays a dumb pin-flipper.
+    try {
+      await enforceApprovalGate({
+        args,
+        harnessRoot,
+        name,
+        fromEnv,
+        toEnv,
+        registry: reg,
+        tenantId,
+        actor,
+        auditLog: audit,
+      });
+    } catch (err) {
+      if (err instanceof ApprovalGateError) die(err.message);
+      throw err;
+    }
+
     const rec = await ctrl.promote(name, fromEnv, toEnv);
     process.stdout.write(
       `promoted ${name} ${fromEnv} → ${toEnv} (now pinned to ${rec.toVersion})\n`,
@@ -9245,6 +9343,338 @@ async function runDeploy(args: ParsedArgs, action: string): Promise<void> {
     return;
   }
   die(`unknown deploy action "${action}" (expected: promote | rollback)`);
+}
+
+/**
+ * Item 59 — the approval gate for `deploy promote`. Runs BEFORE the
+ * deployment-controller flips the pin. Determines whether `toEnv` is
+ * protected (config OR `--require-approval`), and if so requires the recorded
+ * approvals + optional green-PR quorum for the candidate version (the fromEnv
+ * pin promote would copy). The decision — satisfied OR refused — is
+ * audit-logged as `governance_approval`; a refusal throws ApprovalGateError.
+ * An unprotected env is a no-op.
+ */
+async function enforceApprovalGate(opts: {
+  args: ParsedArgs;
+  harnessRoot: string;
+  name: string;
+  fromEnv: string;
+  toEnv: string;
+  registry: RegistryAdapter;
+  tenantId?: string;
+  actor?: string;
+  auditLog: AuditLog;
+}): Promise<void> {
+  const requireFlag = opts.args.flags["require-approval"] === true;
+  const config = loadEnvironmentsConfig(opts.harnessRoot);
+  const policy = policyForEnv(config, opts.toEnv);
+  const protectedEnv = policy.requireApproval || requireFlag;
+  if (!protectedEnv) return; // unprotected — the pre-item-59 path
+
+  // The candidate version is exactly what promote would copy: the fromEnv pin.
+  const toVersion =
+    opts.tenantId !== undefined
+      ? await opts.registry.aliasForTenant(opts.tenantId, opts.name, opts.fromEnv)
+      : await opts.registry.aliasFor(opts.name, opts.fromEnv);
+  if (!toVersion) {
+    // Let the controller produce its own "no pin to copy from" error.
+    return;
+  }
+
+  const approvals = readApprovals(opts.harnessRoot, opts.name, opts.toEnv);
+
+  let prCheck: Awaited<ReturnType<PrCheckReader>> | undefined;
+  if (opts.args.flags["check-pr"] === true) {
+    prCheck = readPrCheckViaGh({ specName: opts.name, env: opts.toEnv, version: toVersion });
+  }
+
+  const decisionInput: ApprovalDecisionInput = {
+    specName: opts.name,
+    toEnv: opts.toEnv,
+    toVersion,
+    policy,
+    approvals,
+    ...(prCheck !== undefined ? { prCheck } : {}),
+  };
+  const decision = decideApproval(decisionInput);
+
+  // Record the gate evaluation (met OR refused) in the same audit chain the
+  // promotion lands in, so a blocked scheduled promotion is evidenced too.
+  await opts.auditLog.append({
+    kind: "governance_approval",
+    payload: buildGovernancePayload(decisionInput, decision, {
+      ...(opts.actor !== undefined ? { actor: opts.actor } : {}),
+      now: () => Date.now(),
+    }),
+  });
+
+  process.stdout.write(
+    `[approval] ${opts.name} → ${opts.toEnv}@${toVersion}: ${decision.reason}\n`,
+  );
+  if (!decision.satisfied) {
+    throw new ApprovalGateError(
+      `promotion of ${opts.name} to protected env "${opts.toEnv}" is blocked — ${decision.reason}`,
+    );
+  }
+}
+
+/** Read a proposal PR's rollup check state via `gh` (the "clients never speak
+ *  git" precedent — shell out to gh, not a git library; argv array, no shell).
+ *  Any gh failure / absence resolves to `conclusion: "none"` (no witness),
+ *  never a throw: a missing gh must not crash a promotion, only withhold the
+ *  PR witness. `GITHUB_TOKEN`/`GH_TOKEN` in the environment authenticates gh. */
+function readPrCheckViaGh(query: {
+  specName: string;
+  env: string;
+  version: string;
+}): Awaited<ReturnType<PrCheckReader>> {
+  try {
+    const list = spawnSync(
+      "gh",
+      [
+        "pr",
+        "list",
+        "--state",
+        "open",
+        "--search",
+        `head:propose/${query.specName}`,
+        "--json",
+        "number,url,statusCheckRollup",
+        "--limit",
+        "1",
+      ],
+      { encoding: "utf-8" },
+    );
+    if (list.status !== 0 || typeof list.stdout !== "string") return { conclusion: "none" };
+    const parsed = JSON.parse(list.stdout) as Array<{
+      number: number;
+      url: string;
+      statusCheckRollup?: Array<{ conclusion?: string; state?: string }>;
+    }>;
+    const pr = parsed[0];
+    if (pr === undefined) return { conclusion: "none" };
+    const rollup = pr.statusCheckRollup ?? [];
+    const anyFail = rollup.some(
+      (c) => c.conclusion === "FAILURE" || c.conclusion === "CANCELLED" || c.state === "FAILURE",
+    );
+    const anyPending = rollup.some(
+      (c) => c.state === "PENDING" || c.state === "IN_PROGRESS" || c.conclusion === "PENDING",
+    );
+    const conclusion = anyFail
+      ? ("failure" as const)
+      : anyPending
+        ? ("pending" as const)
+        : rollup.length > 0
+          ? ("success" as const)
+          : ("none" as const);
+    return { conclusion, prNumber: pr.number, url: pr.url };
+  } catch {
+    return { conclusion: "none" };
+  }
+}
+
+/**
+ * Item 59 — `crewhaus propose <proposed-spec.yaml>`. Package a spec change
+ * into a review artifact (patch.json + changelog + eval delta + provenance)
+ * and open a GitHub PR against the spec's repo. NEVER auto-merges — the PR is
+ * the human gate. Assembly is pure (./propose); this handler wires the real
+ * spec reads + the git/gh driver + the audit record.
+ */
+async function runPropose(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus propose <proposed-spec.yaml> [--current <spec.yaml>]\n" +
+        "         [--source optimize|advise|model-scan|manual] [--run-id <id>]\n" +
+        "         [--as-version <v>] [--score-before <n>] [--score-after <n>]\n" +
+        "         [--dataset <name>] [--optimize-dir <dir>] [--spec-path <rel>]\n" +
+        "         [--dry-run]\n" +
+        "\n" +
+        "  Package a proposed spec change into a review bundle (patch.json field\n" +
+        "  diff + changelog entry + eval delta + provenance) and open a PR on a\n" +
+        "  fresh propose/<id> branch. The live spec is NOT modified; merging the\n" +
+        "  PR is the human gate (there is no auto-merge). GITHUB_TOKEN/GH_TOKEN\n" +
+        "  authenticates gh. --dry-run assembles + prints the plan, touching no\n" +
+        "  git/gh.\n",
+    );
+    return;
+  }
+  const proposedPathArg = args.positional[0];
+  if (typeof proposedPathArg !== "string") die("missing <proposed-spec.yaml>");
+  const proposedPath = resolve(proposedPathArg);
+  const currentArg = args.flags["current"];
+  const currentPath = resolve(
+    typeof currentArg === "string" ? currentArg : join(process.cwd(), "crewhaus.yaml"),
+  );
+
+  let proposedYaml: string;
+  let currentYaml: string;
+  try {
+    proposedYaml = readFileSync(proposedPath, "utf-8");
+  } catch (err) {
+    die(`could not read proposed spec ${proposedPath}: ${(err as Error).message}`);
+  }
+  try {
+    currentYaml = readFileSync(currentPath, "utf-8");
+  } catch (err) {
+    die(`could not read current spec ${currentPath}: ${(err as Error).message}`);
+  }
+
+  // The spec name comes from the current spec (best-effort — a proposal for an
+  // unparseable spec still assembles a diff). Fall back to the proposed spec.
+  let specName: string;
+  try {
+    specName = parseSpec(currentYaml).name;
+  } catch {
+    try {
+      specName = parseSpec(proposedYaml).name;
+    } catch {
+      die("could not determine the spec name — neither the current nor proposed spec parses");
+    }
+  }
+
+  const sourceFlag = args.flags["source"];
+  const validSources: ReadonlyArray<ProposeSource> = ["optimize", "advise", "model-scan", "manual"];
+  const source: ProposeSource =
+    typeof sourceFlag === "string" && (validSources as ReadonlyArray<string>).includes(sourceFlag)
+      ? (sourceFlag as ProposeSource)
+      : "manual";
+  const runIdFlag = args.flags["run-id"];
+  const runId = typeof runIdFlag === "string" ? runIdFlag : undefined;
+  const asVersionFlag = args.flags["as-version"];
+  const proposedVersion = typeof asVersionFlag === "string" ? asVersionFlag : "proposed";
+  const specPathFlag = args.flags["spec-path"];
+  const specRelPath = typeof specPathFlag === "string" ? specPathFlag : "crewhaus.yaml";
+  const optimizeDirFlag = args.flags["optimize-dir"];
+  const optimizeRootDir = typeof optimizeDirFlag === "string" ? optimizeDirFlag : undefined;
+
+  const scoreBefore = floatFlag(args, "score-before");
+  const scoreAfter = floatFlag(args, "score-after");
+  const datasetFlag = args.flags["dataset"];
+  const evalDelta =
+    scoreBefore !== undefined && scoreAfter !== undefined
+      ? {
+          scoreBefore,
+          scoreAfter,
+          ...(typeof datasetFlag === "string" ? { datasetName: datasetFlag } : {}),
+        }
+      : undefined;
+
+  let assembled: ReturnType<typeof assembleProposal>;
+  try {
+    assembled = assembleProposal({
+      specName,
+      currentYaml,
+      proposedYaml,
+      source,
+      ...(runId !== undefined ? { runId } : {}),
+      ...(evalDelta !== undefined ? { evalDelta } : {}),
+      ...(optimizeRootDir !== undefined ? { optimizeRootDir } : {}),
+      proposedVersion,
+    });
+  } catch (err) {
+    if (err instanceof ProposeError) die(err.message);
+    throw err;
+  }
+
+  const { plan, proposalId: id } = buildProposalPrPlan({
+    assembled,
+    proposedYaml,
+    specRelPath,
+    proposedVersion,
+  });
+
+  if (args.flags["dry-run"] === true) {
+    process.stdout.write(`[propose] ${id} — dry run (no git/gh)\n`);
+    process.stdout.write(`  branch: ${plan.branch}\n`);
+    process.stdout.write(`  title:  ${plan.title}\n`);
+    process.stdout.write(`  files:  ${Object.keys(plan.files).join(", ")}\n`);
+    process.stdout.write(`  diff:   ${assembled.patch.diff.length} structural change(s)\n`);
+    process.stdout.write("\n");
+    process.stdout.write(assembled.prBody);
+    return;
+  }
+
+  const driver = createGitPrDriver();
+  let opened: OpenedPr;
+  try {
+    opened = await driver(plan);
+  } catch (err) {
+    if (err instanceof ProposeError) die(err.message);
+    throw err;
+  }
+
+  // Audit the proposal's provenance (source, patch hash, PR ref) so it is
+  // evidenced before any human acts on it.
+  try {
+    const auditLog = await import("@crewhaus/audit-log");
+    const log = await auditLog.openAuditLog({ rootDir: join(process.cwd(), ".crewhaus", "audit") });
+    await log.append({
+      kind: "governance_proposal",
+      payload: buildProposalAuditPayload(assembled, opened, proposedVersion, () => Date.now()),
+    });
+  } catch (err) {
+    process.stderr.write(
+      `crewhaus: warning: could not audit-log the proposal (${(err as Error).message})\n`,
+    );
+  }
+
+  process.stdout.write(
+    `[propose] opened PR${opened.prNumber !== undefined ? ` #${opened.prNumber}` : ""}: ${opened.url}\n`,
+  );
+}
+
+/**
+ * The production git/gh driver: create the propose/ branch, write the spec +
+ * review bundle, commit, push, and `gh pr create`. Shells out to git/gh (no
+ * git library — the "clients never speak git" precedent), all through argv
+ * arrays (no shell). NEVER auto-merges.
+ */
+function createGitPrDriver(): GitPrDriver {
+  return async (plan) => {
+    const run = (bin: string, argv: ReadonlyArray<string>): string => {
+      const proc = spawnSync(bin, [...argv], { encoding: "utf-8" });
+      if (proc.status !== 0) {
+        throw new ProposeError(
+          `\`${bin} ${argv.join(" ")}\` failed (exit ${proc.status ?? "signal"}): ${(proc.stderr ?? "").toString().trim()}`,
+        );
+      }
+      return (proc.stdout ?? "").toString();
+    };
+    // Refuse to run outside a git work tree with a clear message.
+    const inside = spawnSync("git", ["rev-parse", "--is-inside-work-tree"], { encoding: "utf-8" });
+    if (inside.status !== 0 || inside.stdout?.trim() !== "true") {
+      throw new ProposeError(
+        "not inside a git repository — `crewhaus propose` opens a PR against the spec's repo (run it from the checkout, or use --dry-run)",
+      );
+    }
+    run("git", ["checkout", "-b", plan.branch]);
+    for (const [rel, contents] of Object.entries(plan.files)) {
+      const abs = resolve(process.cwd(), rel);
+      mkdirSync(dirname(abs), { recursive: true });
+      writeFileSync(abs, contents);
+      run("git", ["add", rel]);
+    }
+    run("git", ["commit", "-m", plan.commitMessage]);
+    run("git", ["push", "-u", "origin", plan.branch]);
+    // NEVER add --merge/auto-merge here — the PR is the human gate.
+    const out = run("gh", [
+      "pr",
+      "create",
+      "--title",
+      plan.title,
+      "--body",
+      plan.body,
+      "--head",
+      plan.branch,
+    ]);
+    const url = out.trim().split("\n").pop() ?? "";
+    const numMatch = /\/pull\/(\d+)/.exec(url);
+    return {
+      url,
+      branch: plan.branch,
+      ...(numMatch ? { prNumber: Number.parseInt(numMatch[1] as string, 10) } : {}),
+    };
+  };
 }
 
 /**
@@ -10483,6 +10913,17 @@ switch (subcommand) {
     await runDeploy(parseFor(rest.slice(1), DEPLOY_SCHEMA), action);
     break;
   }
+  case "propose":
+    // Item 59 — package a spec change into a review artifact + open a PR.
+    // Structured failures (spec parse, propose assembly, git/gh driver) route
+    // through die() for a clean one-liner.
+    try {
+      await runPropose(parseFor(rest, PROPOSE_SCHEMA));
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
+    break;
   case "migrate-all":
     await runMigrateAll(parseFor(rest, MIGRATE_SCHEMA));
     break;
