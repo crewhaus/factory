@@ -323,6 +323,32 @@ export type JustificationAuditSink = {
   }): Promise<unknown>;
 };
 
+/**
+ * Pillar 3 sink-side fabric — the durable audit sink the egress classifier
+ * appends to. Structurally the same subset of `@crewhaus/audit-log`'s
+ * `AuditLog` as {@link JustificationAuditSink} (its `append({ kind, payload })`),
+ * declared as a minimal interface so runtime-core takes no dependency on (or
+ * cycle with) `@crewhaus/audit-log`.
+ *
+ * BACKGROUND (AUTOMATION-OPPORTUNITIES.md item 20): the `egress_decision`
+ * AuditKind was declared but had NO writer — egress verdicts existed ONLY as
+ * ephemeral trace-bus `permission_decision` events (outcome: `egress-*`), so
+ * nothing could triage egress history offline. This seam closes that: when a
+ * caller wires it, every NON-PASS egress verdict (warn OR block) appends one
+ * durable `egress_decision` record so `crewhaus egress review` can mine it.
+ * The RAW outbound payload is never stored — only the lineage summary the
+ * digest documents (`{ sinkId, sinkScope, verdict, originsFound, matchCount }`),
+ * exactly as `@crewhaus/audit-log`'s AuditKind header specifies. Pass verdicts
+ * are NOT written (they are the overwhelming common case and carry no triage
+ * signal). Omitting the sink is zero behaviour change for existing callers.
+ */
+export type EgressAuditSink = {
+  append(input: {
+    readonly kind: "egress_decision";
+    readonly payload: unknown;
+  }): Promise<unknown>;
+};
+
 export type RunChatLoopOptions = {
   model: string;
   instructions: string;
@@ -545,6 +571,17 @@ export type RunChatLoopOptions = {
    * instance of `@crewhaus/egress-matcher-semantic`.
    */
   egressMatcher?: EgressMatcher;
+  /**
+   * Pillar 3 sink-side fabric — durable egress audit sink (item 20). When
+   * supplied, every NON-PASS egress verdict (warn OR block) appends one
+   * `egress_decision` record (lineage summary only, never the raw payload) to
+   * this hash-chained sink IN ADDITION to the ephemeral `permission_decision`
+   * trace event. This is what makes egress history triageable offline by
+   * `crewhaus egress review`. Omitting it leaves the trace bus as the only
+   * surface (no behaviour change for existing callers). The CLI `run` path
+   * wires a real `@crewhaus/audit-log` instance rooted at `.crewhaus/audit`.
+   */
+  egressAuditSink?: EgressAuditSink;
   /**
    * Pillar 3 sink-side — classify a tool sink as `"external-configured"` (a
    * spec-declared sink → warn on non-user content) or `"external-dynamic"` (a
@@ -1679,6 +1716,35 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           originsFound: egress.originsFound,
           matchCount: egress.matchCount,
         });
+        // Item 20 — emit the durable `egress_decision` audit record for every
+        // non-pass verdict so egress history is triageable offline (the
+        // trace-bus event above is ephemeral). Only the lineage SUMMARY is
+        // stored — never the raw outbound payload (which is sensitive and
+        // often carries the very tagged content that tripped the classifier),
+        // matching the payload shape `@crewhaus/audit-log` documents for this
+        // kind. Best-effort but surfaced: an I/O failure on the audit trail is
+        // logged and swallowed so a full audit disk does not crash a governed
+        // run, mirroring the justification sink above. Absent sink → no-op.
+        if (opts.egressAuditSink !== undefined) {
+          try {
+            await opts.egressAuditSink.append({
+              kind: "egress_decision",
+              payload: {
+                sinkId: egress.sinkId,
+                sinkScope: egress.sinkScope,
+                verdict: egress.verdict,
+                originsFound: egress.originsFound,
+                matchCount: egress.matchCount,
+              },
+            });
+          } catch (err) {
+            runContext.logger.warn("egress audit append failed", {
+              toolUseId: tu.id,
+              toolName: tu.name,
+              error: (err as Error).message,
+            });
+          }
+        }
       }
       if (egress.verdict === "block") {
         return finish({

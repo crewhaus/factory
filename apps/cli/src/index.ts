@@ -250,6 +250,14 @@ import {
   createEgressMatcher,
   resolveEgressMatcherChoice,
 } from "./egress-matcher";
+// AUTOMATION-OPPORTUNITIES.md item 20 — `crewhaus egress review` core (triage
+// durable egress_decision + rule-based justification-denial history into
+// learned security spec suggestions), side-effect-free so it is unit-testable.
+import {
+  buildEgressTriageContext,
+  formatEgressFindingLines,
+  runEgressTriage,
+} from "./egress-triage";
 // Item 6 — `crewhaus eval coverage`: production-vs-eval behavior gap
 // detection, in a side-effect-free module so it is unit-testable (this entry
 // file runs an argv switch on import).
@@ -375,8 +383,9 @@ import {
 import {
   InvalidJudgeChoiceError,
   type JudgeChoice,
+  asEgressAuditSink,
   createJustificationJudge,
-  openJustificationAuditSink,
+  openSecurityAuditSink,
   resolveJudgeChoice,
 } from "./justification-gate";
 // Item 41 — `crewhaus lint` (parse + ir-passes collect-all + scope audit) and
@@ -1204,6 +1213,20 @@ const SECURITY_CORPUS_SCHEMA: ParseArgsSchema = {
     { name: "dir", takesValue: true },
     // minimum distinct-snippet cluster support to emit a candidate rule.
     { name: "min-support", takesValue: true },
+    { name: "json", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
+// AUTOMATION-OPPORTUNITIES.md item 20 — `egress review [--propose]`.
+const EGRESS_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // harness root that owns .crewhaus/audit (mirrors `security digest --dir`).
+    { name: "dir", takesValue: true },
+    // write the eval-gated SpecPatch suggestions to a suggestions.json that
+    // `optimize --from-advice` can consume (mirrors `advise -o`).
+    { name: "propose", takesValue: false },
+    { name: "out", short: "o", takesValue: true },
     { name: "json", takesValue: false },
     { name: "help", short: "h" },
   ],
@@ -3062,14 +3085,19 @@ async function runRunCli(
   // FR-004 — resolve the Pillar 3 intent-gate judge (flag > spec > rule-based).
   // undefined leaves runtime-core on `ruleBasedJustificationJudge`.
   const justificationJudge = await resolveJustificationJudge(args, ir.security?.justification);
-  // FR-004 — open the durable audit sink the intent gate appends a
-  // `permission_justification_evaluated` record to. On by default for `run`
-  // (rooted at .crewhaus/audit); `--no-justification-audit` skips it. undefined
-  // leaves runtime-core writing only the ephemeral trace-bus event.
-  const justificationAuditSink = await openJustificationAuditSink({
+  // FR-004 / item 20 — open the shared durable audit sink both Pillar 3 gates
+  // append to (rooted at .crewhaus/audit): the intent gate writes
+  // `permission_justification_evaluated`, and the egress classifier writes
+  // `egress_decision` for non-pass verdicts (so `crewhaus egress review` can
+  // triage them offline). One log = one hash chain. On by default for `run`;
+  // `--no-justification-audit` skips it. undefined leaves runtime-core writing
+  // only the ephemeral trace-bus events.
+  const securityAuditSink = await openSecurityAuditSink({
     cwd: process.cwd(),
     enabled: args.flags["no-justification-audit"] !== true,
   });
+  const justificationAuditSink = securityAuditSink;
+  const egressAuditSink = asEgressAuditSink(securityAuditSink);
 
   // FR-006 — resolve the Pillar 3 sink-side egress matcher (flag > spec >
   // substring). undefined leaves runtime-core on the built-in
@@ -3205,6 +3233,7 @@ async function runRunCli(
       ...(resumeId !== undefined ? { resume: { sessionId: resumeId } } : {}),
       ...(justificationJudge !== undefined ? { justificationJudge } : {}),
       ...(justificationAuditSink !== undefined ? { justificationAuditSink } : {}),
+      ...(egressAuditSink !== undefined ? { egressAuditSink } : {}),
       ...(egressMatcher !== undefined ? { egressMatcher } : {}),
     });
   } finally {
@@ -3306,12 +3335,15 @@ async function runRunBrowser(
   // (flag > substring); both run paths thread the same matcher into the same
   // egress check inside runChatLoop.
   const egressMatcher = await resolveEgressMatcher(args, undefined);
-  // FR-004 — same durable audit sink as the cli path, so a justification-gated
-  // browser tool also writes the `permission_justification_evaluated` record.
-  const justificationAuditSink = await openJustificationAuditSink({
+  // FR-004 / item 20 — same shared durable audit sink as the cli path, so a
+  // justification-gated browser tool writes `permission_justification_evaluated`
+  // and a non-pass egress verdict writes `egress_decision`.
+  const securityAuditSink = await openSecurityAuditSink({
     cwd: process.cwd(),
     enabled: args.flags["no-justification-audit"] !== true,
   });
+  const justificationAuditSink = securityAuditSink;
+  const egressAuditSink = asEgressAuditSink(securityAuditSink);
 
   // Lazy-import the browser-runtime packages so cli/init/doctor invocations
   // don't pay the playwright + computer-use-driver load cost.
@@ -3367,6 +3399,7 @@ async function runRunBrowser(
       seedMessages: [{ role: "user", content: prompt }],
       ...(justificationJudge !== undefined ? { justificationJudge } : {}),
       ...(justificationAuditSink !== undefined ? { justificationAuditSink } : {}),
+      ...(egressAuditSink !== undefined ? { egressAuditSink } : {}),
       ...(egressMatcher !== undefined ? { egressMatcher } : {}),
       installSigintHandler: false,
       maxTokens: 4096,
@@ -9903,6 +9936,107 @@ async function runSecurityCorpus(args: ParsedArgs, action: "build" | "check"): P
 }
 
 /**
+ * AUTOMATION-OPPORTUNITIES.md item 20 — `crewhaus egress review [--propose]`.
+ *
+ * Mines the durable `.crewhaus/audit` chain for `egress_decision` records (now
+ * written by runtime-core's egress audit sink on every non-pass verdict) plus
+ * rule-based justification denials, clusters them by (sink, origin), and
+ * proposes learned security spec suggestions: per-sink relaxations (advice —
+ * `security.egressPolicy` is reserved for the egress FRs, so we coordinate
+ * rather than add the schema field), `security.egressMatcher: semantic` when
+ * warn-noise is high with zero blocks (advice — not optimizer-whitelisted),
+ * and `security.justification.judge: claude` when rule-based denials are
+ * frequent (a VALIDATED spec-patch that rides `optimize --from-advice`).
+ *
+ * `--propose` (with `-o <dir>`, default `.crewhaus/egress-review`) writes the
+ * whitelisted patches to a `suggestions.json` in the same shape
+ * `optimize --from-advice` consumes. See egress-triage.ts for the design.
+ */
+async function runEgressReview(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus egress review [--propose] [-o <dir>] [--dir <root>] [--json]\n" +
+        "\n" +
+        "triages .crewhaus/audit egress_decision + rule-based justification-denial\n" +
+        "history into learned security spec suggestions:\n" +
+        "  per-sink relaxations (advice — security.egressPolicy is reserved for the\n" +
+        "    egress FRs, so this coordinates rather than adds the schema field),\n" +
+        "  security.egressMatcher: semantic when warn-noise is high with 0 blocks,\n" +
+        "  security.justification.judge: claude when rule-based denials are frequent\n" +
+        "    (an eval-gated spec-patch that rides optimize --from-advice)\n" +
+        "\n" +
+        "  --propose       write whitelisted patches to <dir>/suggestions.json\n" +
+        "  -o <dir>        artifact dir (default .crewhaus/egress-review)\n" +
+        "  --dir <root>    harness root that owns .crewhaus/ (default: cwd)\n" +
+        "  --json          machine-readable findings to stdout\n",
+    );
+    return;
+  }
+  const dirFlag = args.flags["dir"];
+  const rootDir = typeof dirFlag === "string" ? resolve(dirFlag) : process.cwd();
+  const auditDir = join(rootDir, ".crewhaus", "audit");
+  const auditObjects: unknown[] = [];
+  if (existsSync(auditDir)) {
+    for (const f of readdirSync(auditDir).sort()) {
+      if (!f.endsWith(".jsonl")) continue;
+      auditObjects.push(...parseAdviseJsonl(readFileSync(join(auditDir, f), "utf-8")));
+    }
+  }
+
+  // The cwd spec enables the whitelisted justification patch; without one the
+  // rules fall back to advice text (mirrors `advise`).
+  let spec: Spec | undefined;
+  const specPath = join(rootDir, "crewhaus.yaml");
+  if (existsSync(specPath)) {
+    try {
+      spec = parseSpec(readFileSync(specPath, "utf-8"));
+    } catch (err) {
+      process.stderr.write(
+        `[egress review] crewhaus.yaml did not parse (${(err as Error).message}) — patch suggestions downgraded to advice\n`,
+      );
+    }
+  }
+
+  const ctx = buildEgressTriageContext(auditObjects);
+  const findings = runEgressTriage(ctx, spec !== undefined ? { spec } : {});
+  const generatedAt = new Date().toISOString();
+
+  if (args.flags["json"] === true) {
+    process.stdout.write(`${JSON.stringify({ context: ctx, findings }, null, 2)}\n`);
+    return;
+  }
+
+  process.stdout.write(
+    `egress review: ${rootDir}\n` +
+      `  ${ctx.egressRecords} durable egress_decision record(s), ${ctx.totalWarned} warned / ${ctx.totalBlocked} blocked; ${ctx.ruleBasedDenials}/${ctx.ruleBasedEvaluated} rule-based justification denials\n`,
+  );
+  if (ctx.egressRecords === 0 && ctx.ruleBasedEvaluated === 0) {
+    process.stdout.write(
+      "  no durable egress/justification history yet — run the agent (egress verdicts are now written to .crewhaus/audit), then review\n",
+    );
+  }
+  process.stdout.write(`  ${findings.length} suggestion${findings.length === 1 ? "" : "s"}\n`);
+  for (const f of findings) {
+    for (const line of formatEgressFindingLines(f)) process.stdout.write(`  ${line}\n`);
+  }
+
+  if (args.flags["propose"] === true) {
+    const outDir = strFlag(args, "out") ?? join(rootDir, ".crewhaus", "egress-review");
+    mkdirSync(outDir, { recursive: true });
+    const suggestions = buildSuggestionsFile(
+      findings,
+      ctx.clusters.map((c) => c.sinkId),
+      generatedAt,
+    );
+    const suggestionsPath = join(outDir, "suggestions.json");
+    writeFileSync(suggestionsPath, `${JSON.stringify(suggestions, null, 2)}\n`);
+    process.stdout.write(
+      `  [propose] ${suggestions.suggestions.length} eval-gated patch(es) → ${suggestionsPath} (feed to \`optimize --from-advice\`)\n`,
+    );
+  }
+}
+
+/**
  * Item 61 — `crewhaus channel provision|verify <spec.yaml>`: one-command
  * platform-side setup + scope doctor for channel-target specs. Everything is
  * derived from the spec + the adapters' actual API usage (see
@@ -10463,6 +10597,19 @@ switch (subcommand) {
       }
     } else {
       die(`security action must be "digest" or "corpus" (got "${action}")`);
+    }
+    break;
+  }
+  case "egress": {
+    const action = rest[0] ?? "";
+    if (action !== "review") {
+      die(`egress action must be "review" (got "${action}")`);
+    }
+    try {
+      await runEgressReview(parseFor(rest.slice(1), EGRESS_SCHEMA));
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
     }
     break;
   }
