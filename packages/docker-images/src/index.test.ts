@@ -98,8 +98,11 @@ describe("Dockerfile structural contract (T2)", () => {
     }
   });
 
-  test("voice image installs libopus", () => {
-    expect(readDockerfile("voice")).toContain("libopus");
+  test("voice image installs the opus codec", () => {
+    // Alpine's Opus codec library package is `opus` (not `libopus`, which apk
+    // has no package for — that broke the first real GHCR voice build).
+    expect(readDockerfile("voice")).toContain("opus");
+    expect(readDockerfile("voice")).not.toContain("libopus");
   });
 
   test("browser image installs chromium and Playwright env vars", () => {
