@@ -49,6 +49,14 @@ export type ToolCallStats = {
 
 export type AskStats = { asks: number; approved: number; denied: number };
 
+/** Item 19 — per-errorName recovery aggregate: total occurrences plus the
+ *  distribution of recovery actions that error drove. */
+export type ErrorRecoveryStats = {
+  count: number;
+  /** action (`retry`/`compact`/`continue`/`tombstone`/`fail`) → occurrences. */
+  actions: Map<string, number>;
+};
+
 /**
  * Session-derived aggregates the rules consume. Built by
  * `buildAdviceContext` from parsed session-JSONL objects (tolerant of
@@ -62,11 +70,27 @@ export type AdviceContext = {
   /** `recovery` lines grouped by action (`retry`/`compact`/`continue`/…). */
   readonly recoveriesByAction: ReadonlyMap<string, number>;
   /**
+   * Item 19 — `recovery` lines grouped by `errorName`, each carrying the
+   * action distribution that error drove. The failure-taxonomy rule clusters
+   * these into draft `failure_taxonomy` entries (error class → recovery
+   * action). Old-vintage logs (no recovery lines) leave this empty.
+   */
+  readonly recoveriesByErrorName: ReadonlyMap<string, ErrorRecoveryStats>;
+  /**
    * `action: "continue"` recoveries — emitted exclusively for
    * `max_output_tokens` truncations (recovery-engine's taxonomy), so this
    * IS the truncation-pressure count.
    */
   readonly truncationContinues: number;
+  /**
+   * Item 19 — synthetic `[runtime] possible loop detected` nudges mined from
+   * `user_message` lines, grouped by tool signature. `matchNamedFailure`
+   * matches error.message only, so a loop (which is NOT an error — no
+   * exception is thrown) can never be caught by a taxonomy entry; the
+   * loop-break rule turns recurring signatures into instructions-addendum
+   * advice instead.
+   */
+  readonly loopSignatures: ReadonlyMap<string, number>;
   /** `compaction` lines per session (any vintage — this kind predates item 14). */
   readonly compactionsBySession: ReadonlyMap<string, number>;
   /** Resolved permission asks per tool, from `permission` lines. */
@@ -74,6 +98,17 @@ export type AdviceContext = {
   /** Stop-reason distribution over `model_meta` lines. */
   readonly stopReasons: ReadonlyMap<string, number>;
   readonly modelResponses: number;
+  /**
+   * Item 21 — per-tool total byte spend (tool_use input JSON + the correlated
+   * tool_result content), keyed by the PascalCase runtime tool name. The
+   * sub-agent-split rule uses the dominance of one tool's byte spend as the
+   * per-turn-token-pressure proxy (a tool that dominates context is the one
+   * to move behind its own window). Empty on old-vintage logs.
+   */
+  readonly perToolBytes: ReadonlyMap<string, number>;
+  /** Item 21 — total observed tool byte spend across all tools (the
+   *  denominator for the dominance ratio). */
+  readonly totalToolBytes: number;
   /** `.crewhaus/audit` record kinds → counts (report context + future rules). */
   readonly auditKindCounts: ReadonlyMap<string, number>;
 };
@@ -100,6 +135,37 @@ export function parseJsonlObjects(text: string): unknown[] {
 
 type LoggedLine = { kind?: unknown; payload?: unknown };
 
+/** The fixed prefix the runtime stamps on a loop-detection nudge (a
+ *  `user_message` with `synthetic: true`). Exported so a fixture/test can
+ *  build a realistic nudge without hard-coding the string twice. */
+export const LOOP_NUDGE_PREFIX = "[runtime] possible loop detected:";
+
+/** Matches the looping tool name inside a loop-detection nudge string. */
+const LOOP_TOOL_RE = /tool "([^"]+)"/;
+
+/**
+ * Item 19 — extract a loop signature (the looping tool name) from a
+ * `user_message` payload's `content` when it is a runtime loop-detection
+ * nudge, else undefined. The nudge content is the fixed string
+ * `[runtime] possible loop detected: tool "<name>" has been called …`.
+ * Returns `tool:<name>` so recurring loops on the same tool cluster; falls
+ * back to a generic `loop` signature when the tool name can't be parsed.
+ */
+export function loopSignatureOf(content: unknown): string | undefined {
+  if (typeof content !== "string" || !content.startsWith(LOOP_NUDGE_PREFIX)) return undefined;
+  const m = LOOP_TOOL_RE.exec(content);
+  return m?.[1] !== undefined ? `tool:${m[1]}` : "loop";
+}
+
+/** Item 21 — UTF-8 byte length of a logged value: strings measured directly,
+ *  everything else via its JSON encoding (the shape the model actually
+ *  carries). Undefined/unencodable → 0 (never NaN into the byte tally). */
+function byteLength(value: unknown): number {
+  if (value === undefined) return 0;
+  const s = typeof value === "string" ? value : JSON.stringify(value);
+  return typeof s === "string" ? Buffer.byteLength(s, "utf8") : 0;
+}
+
 /** Tolerantly read a session-JSONL line's payload when its `kind` matches —
  *  the canonical defensive accessor shared with `context-pressure.ts`
  *  (`doctor --context-pressure` folds the same persisted events). */
@@ -124,13 +190,26 @@ export function buildAdviceContext(
 ): AdviceContext {
   const toolStats = new Map<string, ToolCallStats>();
   const recoveriesByAction = new Map<string, number>();
+  const recoveriesByErrorName = new Map<string, ErrorRecoveryStats>();
   const compactionsBySession = new Map<string, number>();
   const asksByTool = new Map<string, AskStats>();
   const stopReasons = new Map<string, number>();
+  const loopSignatures = new Map<string, number>();
+  const perToolBytes = new Map<string, number>();
   let truncationContinues = 0;
   let modelResponses = 0;
+  let totalToolBytes = 0;
+
+  const addToolBytes = (name: string, bytes: number): void => {
+    perToolBytes.set(name, (perToolBytes.get(name) ?? 0) + bytes);
+    totalToolBytes += bytes;
+  };
 
   for (const session of sessions) {
+    // Item 21 — correlate tool_result bytes back to the tool_use's name via
+    // the toolUseId (both live on separate lines). Per-session scope so ids
+    // never collide across sessions.
+    const toolUseNameById = new Map<string, string>();
     for (const obj of session.objects) {
       const tool = payloadOf(obj, "tool_stats");
       if (tool !== undefined && typeof tool["toolName"] === "string") {
@@ -150,6 +229,40 @@ export function buildAdviceContext(
         const action = recovery["action"];
         recoveriesByAction.set(action, (recoveriesByAction.get(action) ?? 0) + 1);
         if (action === "continue") truncationContinues += 1;
+        // Item 19 — cluster by errorName for the failure-taxonomy rule.
+        if (typeof recovery["errorName"] === "string" && recovery["errorName"].length > 0) {
+          const errorName = recovery["errorName"];
+          const stats = recoveriesByErrorName.get(errorName) ?? { count: 0, actions: new Map() };
+          stats.count += 1;
+          stats.actions.set(action, (stats.actions.get(action) ?? 0) + 1);
+          recoveriesByErrorName.set(errorName, stats);
+        }
+        continue;
+      }
+      // Item 19 — synthetic loop-detection nudges are `user_message` lines
+      // whose content starts with the runtime's fixed prefix; group by the
+      // tool signature so a recurring loop on the same tool clusters.
+      const userMsg = payloadOf(obj, "user_message");
+      if (userMsg !== undefined) {
+        const signature = loopSignatureOf(userMsg["content"]);
+        if (signature !== undefined) {
+          loopSignatures.set(signature, (loopSignatures.get(signature) ?? 0) + 1);
+        }
+        continue;
+      }
+      // Item 21 — tool_use input bytes count toward the tool's context spend,
+      // and the id→name mapping lets the paired tool_result add its bytes.
+      const toolUse = payloadOf(obj, "tool_use");
+      if (toolUse !== undefined && typeof toolUse["name"] === "string") {
+        const name = toolUse["name"];
+        if (typeof toolUse["id"] === "string") toolUseNameById.set(toolUse["id"], name);
+        addToolBytes(name, byteLength(toolUse["input"]));
+        continue;
+      }
+      const toolResult = payloadOf(obj, "tool_result");
+      if (toolResult !== undefined && typeof toolResult["toolUseId"] === "string") {
+        const name = toolUseNameById.get(toolResult["toolUseId"]);
+        if (name !== undefined) addToolBytes(name, byteLength(toolResult["content"]));
         continue;
       }
       const compaction = payloadOf(obj, "compaction");
@@ -197,11 +310,15 @@ export function buildAdviceContext(
     sessionIds: sessions.map((s) => s.sessionId),
     toolStats,
     recoveriesByAction,
+    recoveriesByErrorName,
     truncationContinues,
+    loopSignatures,
     compactionsBySession,
     asksByTool,
     stopReasons,
     modelResponses,
+    perToolBytes,
+    totalToolBytes,
     auditKindCounts,
   };
 }
@@ -223,6 +340,21 @@ export type AdviceThresholds = {
   stopMinResponses: number;
   /** Anomalous-stop rate at/above which the stop rule fires. */
   stopAnomalyRate: number;
+  /** Item 19 — occurrences of one error CLASS at/above which a
+   *  failure_taxonomy entry is drafted. */
+  recoveryClusterMin: number;
+  /** Item 19 — occurrences of one loop SIGNATURE at/above which loop-break
+   *  instructions advice fires. */
+  loopSignatureMin: number;
+  /** Item 21 — sessions that must each compact ≥ compactionsPerSession
+   *  before a sub-agent restructure is suggested (chronic, not one-off). */
+  chronicCompactionSessions: number;
+  /** Item 21 — fraction of total tool byte-spend one tool must dominate for a
+   *  sub-agent split to be suggested on the dominance signal. */
+  toolByteDominance: number;
+  /** Item 21 — minimum total tool bytes before dominance is judged at all
+   *  (a handful of tiny calls shouldn't trip a restructure). */
+  toolByteMinTotal: number;
 };
 
 /**
@@ -239,6 +371,11 @@ export const DEFAULT_ADVICE_THRESHOLDS: AdviceThresholds = {
   asksPerTool: 3,
   stopMinResponses: 4,
   stopAnomalyRate: 0.25,
+  recoveryClusterMin: 3,
+  loopSignatureMin: 2,
+  chronicCompactionSessions: 2,
+  toolByteDominance: 0.6,
+  toolByteMinTotal: 50_000,
 };
 
 /** Stop reasons that are part of healthy operation; everything else
@@ -503,12 +640,383 @@ export const ruleStopReasonAnomalies: AdviceRule = (ctx, opts) => {
   ];
 };
 
+// -------- item 19: failure_taxonomy + loop-break rules from telemetry --------
+
+/** The recovery actions a drafted `failure_taxonomy` entry may declare —
+ *  exactly the spec's `failureTaxonomyEntrySchema.recovery` enum. */
+const TAXONOMY_RECOVERY_ACTIONS: ReadonlySet<string> = new Set([
+  "retry",
+  "compact",
+  "continue",
+  "tombstone",
+  "fail",
+]);
+
+/** One drafted failure_taxonomy entry (shape = the spec's entry schema:
+ *  `{ class, pattern, recovery, hint? }`). */
+export type FailureTaxonomyEntry = {
+  readonly class: string;
+  readonly pattern: string;
+  readonly recovery: string;
+  readonly hint?: string;
+};
+
+/**
+ * Item 19 — specificity floor for a drafted taxonomy `pattern`. The pattern is
+ * `errorName` verbatim, matched by the recovery engine as a case-insensitive
+ * SUBSTRING of `error.message`. A very short or generic name (e.g. "Error")
+ * drafts a rule that fires on almost every failure — worse than no entry. Such
+ * clusters are surfaced as ADVICE (a human should hand-write a precise pattern)
+ * rather than drafted into a patch.
+ */
+export const TAXONOMY_MIN_PATTERN_LEN = 4;
+/** Generic error tokens too broad to auto-draft, regardless of length. */
+export const TAXONOMY_GENERIC_TOKENS: ReadonlySet<string> = new Set(["error", "fail", "err"]);
+
+/** True when `errorName` is too broad to draft a taxonomy pattern for
+ *  (too short, or a generic token). Case-insensitive. */
+export function taxonomyPatternTooBroad(errorName: string): boolean {
+  const trimmed = errorName.trim();
+  if (trimmed.length < TAXONOMY_MIN_PATTERN_LEN) return true;
+  return TAXONOMY_GENERIC_TOKENS.has(trimmed.toLowerCase());
+}
+
+/** The dominant recovery action observed for an error class (ties broken by
+ *  the enum's declared order → deterministic). Falls back to `retry` when the
+ *  observed action isn't a valid taxonomy action (e.g. a future action name). */
+function dominantRecoveryAction(actions: ReadonlyMap<string, number>): string {
+  let best: string | undefined;
+  let bestCount = -1;
+  for (const action of TAXONOMY_RECOVERY_ACTIONS) {
+    const count = actions.get(action) ?? 0;
+    if (count > bestCount) {
+      bestCount = count;
+      best = action;
+    }
+  }
+  return best ?? "retry";
+}
+
+/** Read the spec's existing `failure_taxonomy`, defensively — returns the
+ *  entries' `class` strings already covered so a draft never duplicates one. */
+function existingTaxonomyClasses(spec: Spec | undefined): Set<string> {
+  const covered = new Set<string>();
+  const taxonomy = specField<unknown>(spec, "failure_taxonomy");
+  if (!Array.isArray(taxonomy)) return covered;
+  for (const entry of taxonomy) {
+    if (entry !== null && typeof entry === "object") {
+      const cls = (entry as { class?: unknown }).class;
+      if (typeof cls === "string") covered.add(cls);
+    }
+  }
+  return covered;
+}
+
+/**
+ * Item 19 — failure-taxonomy learning. Clusters recurring `recovery` events
+ * by `errorName`; each class seen ≥ recoveryClusterMin times (and NOT already
+ * covered by the spec's taxonomy) becomes a draft `failure_taxonomy` entry
+ * whose `recovery` action is the one the runtime actually took most for that
+ * class, and whose `pattern` is a case-insensitive substring of the error
+ * name.
+ *
+ * `failure_taxonomy` IS whitelisted in OPTIMIZABLE_PATHS for every target, so
+ * the emitted patch rides the eval-gated `optimize --from-advice` apply. The
+ * patch REPLACES the whole `failure_taxonomy` array (existing entries +
+ * drafts) when the spec already has one, else ADDS the array — a whole-block
+ * edit the whitelist's prefix match allows. Budget caps aren't a field on the
+ * strict entry schema (`{ class, pattern, recovery, hint? }`), so the drafted
+ * `hint` carries the observed count + the "matches error.message" caveat and
+ * the recovery-engine's per-turn budget note.
+ */
+export const ruleFailureTaxonomy: AdviceRule = (ctx, opts) => {
+  const t = resolveThresholds(opts);
+  const spec = opts?.spec;
+  const covered = existingTaxonomyClasses(spec);
+  const drafts: FailureTaxonomyEntry[] = [];
+  const evidence: string[] = [];
+  let clustered = 0;
+  // Item 19 (F4) — clusters whose errorName is too broad to draft a pattern
+  // for (too short/generic). Surfaced as advice, never a patch.
+  const tooBroad: Array<{ errorName: string; count: number; recovery: string }> = [];
+
+  // Deterministic: sort clusters by count desc, then errorName.
+  const clusters = [...ctx.recoveriesByErrorName.entries()].sort((a, b) => {
+    if (b[1].count !== a[1].count) return b[1].count - a[1].count;
+    return a[0].localeCompare(b[0]);
+  });
+  for (const [errorName, stats] of clusters) {
+    if (stats.count < t.recoveryClusterMin) continue;
+    if (covered.has(errorName)) continue;
+    const recovery = dominantRecoveryAction(stats.actions);
+    // F4 specificity floor: a too-short/generic errorName drafts a rule that
+    // matches almost every error.message. Skip drafting it; collect it for an
+    // advice-only nudge so a human writes a precise pattern instead.
+    if (taxonomyPatternTooBroad(errorName)) {
+      tooBroad.push({ errorName, count: stats.count, recovery });
+      continue;
+    }
+    drafts.push({
+      class: errorName,
+      // matchNamedFailure matches error.MESSAGE (substring/regex); the class
+      // name is the best available proxy — the error message usually contains
+      // it. The reviewer refines to a precise pattern.
+      pattern: errorName,
+      recovery,
+      hint: `observed ${stats.count}× → recovery-engine took "${recovery}" most; refine 'pattern' to a substring of the actual error.message, and note recovery actions are budget-capped per turn (repeated failures still fail-fast)`,
+    });
+    evidence.push(`${errorName}: ${stats.count} recoveries → draft recovery=${recovery}`);
+    clustered += stats.count;
+  }
+
+  const findings: AdviceFinding[] = [];
+
+  if (drafts.length > 0) {
+    // Compose the full array: existing entries (verbatim) + the new drafts.
+    const existingArray = Array.isArray(specField<unknown>(spec, "failure_taxonomy"))
+      ? (specField<unknown[]>(spec, "failure_taxonomy") as unknown[])
+      : [];
+    const value = [...existingArray, ...drafts];
+    const op: SpecPatch["op"] = existingArray.length > 0 ? "replace" : "add";
+    const patch: SpecPatch = {
+      target: spec?.target ?? "cli",
+      path: ["failure_taxonomy"],
+      op,
+      value,
+      rationale: `advise: ${drafts.length} error class(es) recurred ≥${t.recoveryClusterMin}× — drafted failure_taxonomy entries`,
+    };
+    const adviceText = `Recurring error classes were recovered from repeatedly (${evidence.join("; ")}). Add failure_taxonomy entries so the runtime handles them deterministically: ${drafts
+      .map((d) => `${d.class} → ${d.recovery}`)
+      .join(", ")}. Set each 'pattern' to a substring of the real error.message.`;
+
+    findings.push({
+      id: "failure-taxonomy-learned",
+      severity: "warn",
+      summary: `${drafts.length} recurring error class(es) → draft failure_taxonomy`,
+      evidence: [
+        ...evidence,
+        `threshold: ≥${t.recoveryClusterMin} recoveries per class; ${covered.size} class(es) already in the spec were skipped`,
+      ],
+      counts: { classes: drafts.length, recoveries: clustered },
+      suggestion: patchOrAdvice(spec, patch, adviceText),
+    });
+  }
+
+  // F4 — advice-only finding for clusters too broad to auto-draft. Never a
+  // patch: the errorName is too generic to become a `pattern` safely.
+  if (tooBroad.length > 0) {
+    const broadClustered = tooBroad.reduce((sum, c) => sum + c.count, 0);
+    findings.push({
+      id: "failure-taxonomy-too-broad",
+      severity: "info",
+      summary: `${tooBroad.length} recurring error class(es) too generic to auto-draft failure_taxonomy`,
+      evidence: [
+        ...tooBroad.map(
+          (c) => `${c.errorName}: ${c.count} recoveries → recovery=${c.recovery} (NOT drafted)`,
+        ),
+        `skipped: errorName shorter than ${TAXONOMY_MIN_PATTERN_LEN} chars or a generic token (${[...TAXONOMY_GENERIC_TOKENS].join(", ")}) — a verbatim pattern would match nearly every error.message`,
+      ],
+      counts: { classes: tooBroad.length, recoveries: broadClustered },
+      suggestion: {
+        kind: "advice",
+        text: `Recurring but generically-named error classes (${tooBroad
+          .map((c) => `${c.errorName} ×${c.count}`)
+          .join(
+            ", ",
+          )}) were recovered from repeatedly. Their names are too broad to draft a failure_taxonomy 'pattern' automatically (it is matched as a case-insensitive substring of error.message). Hand-write a precise 'pattern' — a distinctive substring of the real error message — before adding a taxonomy entry.`,
+      },
+    });
+  }
+
+  return findings;
+};
+
+/**
+ * Item 19 — loop-break learning. A `[runtime] possible loop detected` nudge
+ * is NOT an error (no exception is thrown), so `matchNamedFailure` — which
+ * matches error.message only — can never catch it; a taxonomy entry is the
+ * wrong tool. This rule instead drafts an instructions-ADDENDUM as advice
+ * text (never a patch: `agent.instructions` IS optimizable, but a
+ * mechanically-appended nudge is a prompt edit a human should own, and the
+ * optimizer already rewrites instructions on its own signal). Fires per
+ * recurring loop signature (same tool looped in ≥ loopSignatureMin sessions/
+ * turns).
+ */
+export const ruleLoopBreak: AdviceRule = (ctx, opts) => {
+  const t = resolveThresholds(opts);
+  const recurring = [...ctx.loopSignatures.entries()]
+    .filter(([, count]) => count >= t.loopSignatureMin)
+    .sort((a, b) => (b[1] !== a[1] ? b[1] - a[1] : a[0].localeCompare(b[0])));
+  if (recurring.length === 0) return [];
+  const tools = recurring.map(([sig]) => sig.replace(/^tool:/, ""));
+  const evidence = recurring.map(([sig, count]) => `${sig}: ${count} loop nudge(s)`);
+  const total = recurring.reduce((sum, [, count]) => sum + count, 0);
+  return [
+    {
+      id: "loop-break",
+      severity: "warn",
+      summary: `${recurring.length} recurring loop signature(s) (${tools.join(", ")})`,
+      evidence: [
+        ...evidence,
+        `threshold: ≥${t.loopSignatureMin} nudges per signature — loops aren't errors, so a failure_taxonomy entry can't catch them (matchNamedFailure matches error.message only)`,
+      ],
+      counts: { signatures: recurring.length, nudges: total },
+      suggestion: {
+        kind: "advice",
+        text: `The agent repeatedly looped on: ${tools.join(", ")}. Add an instructions addendum that breaks the loop, e.g.: "If a tool returns the same result twice for the same input, do NOT call it again — change approach or answer from what you already have. Prefer batching related ${tools[0]} calls and reading the results before deciding the next step." This is an instructions edit (a loop isn't an error, so failure_taxonomy can't match it).`,
+      },
+    },
+  ];
+};
+
+// -------- item 21: sub-agent split under chronic context pressure --------
+
+/**
+ * Targets whose AGENT block carries a `sub_agents:` map, so the drafted
+ * fragment (which sits under `agent:`) pastes in verbatim: cli and channel.
+ * Crew ALSO has sub_agents, but under each ROLE rather than a single `agent`
+ * block, so the paste location differs — it's excluded here rather than emit a
+ * fragment that lands in the wrong place. Any other target has no sub_agents
+ * block at all, so the rule stays silent (nowhere to paste).
+ */
+export const SUB_AGENT_TARGETS: ReadonlySet<string> = new Set(["cli", "channel"]);
+
+/** Reverse map from the RegisteredTool PascalCase `.name` back to the
+ *  camelCase spec/BUILTIN_TOOL_MAP key, for the builtins whose byte spend the
+ *  rule can attribute to a concern. A tool not here still yields a suggestion
+ *  (the sub-agent's `tools:` line is just omitted / left for the human). */
+const TOOL_NAME_TO_SPEC_KEY: Readonly<Record<string, string>> = Object.freeze({
+  Read: "read",
+  Write: "write",
+  Edit: "edit",
+  Glob: "glob",
+  Grep: "grep",
+  Bash: "bash",
+  WebFetch: "webFetch",
+  WebSearch: "webSearch",
+  Fetch: "fetch",
+  ReadImage: "readImage",
+  IngestDocument: "ingestDocument",
+  CodeGraphSearch: "codegraphSearch",
+  CodeGraphCallers: "codegraphCallers",
+  CodeGraphCallees: "codegraphCallees",
+  CodeGraphImpact: "codegraphImpact",
+});
+
+/** The single most byte-dominant tool over the mined sessions, plus its share
+ *  of total tool byte-spend. Undefined when no tool bytes were observed. */
+function dominantTool(
+  ctx: AdviceContext,
+): { name: string; bytes: number; share: number } | undefined {
+  if (ctx.totalToolBytes <= 0) return undefined;
+  let name: string | undefined;
+  let bytes = 0;
+  for (const [tool, b] of ctx.perToolBytes) {
+    if (b > bytes) {
+      bytes = b;
+      name = tool;
+    }
+  }
+  if (name === undefined) return undefined;
+  return { name, bytes, share: bytes / ctx.totalToolBytes };
+}
+
+/** Draft a ready-to-paste `sub_agents:` YAML fragment moving `toolName`'s
+ *  concern into its own sub-agent with its own context window. Two-space
+ *  indented to sit under the spec's `agent:` block (cli/channel) — the CLI
+ *  prints it verbatim in the advice text. */
+export function subAgentFragment(toolName: string): string {
+  const specKey = TOOL_NAME_TO_SPEC_KEY[toolName];
+  const subName = `${(specKey ?? toolName).toLowerCase()}_worker`;
+  const toolsLine = specKey !== undefined ? `\n      tools: [${specKey}]` : "";
+  return [
+    "  # paste under the agent block; move the heavy concern into its own window",
+    "  sub_agents:",
+    `    ${subName}:`,
+    `      description: Handles the ${toolName}-heavy work in an isolated context`,
+    "      instructions: |",
+    `        You are a focused worker. Do ONLY the ${toolName}-heavy sub-task the`,
+    `        parent delegates, then return a concise result — not the full transcript.${toolsLine}`,
+  ].join("\n");
+}
+
+/**
+ * Item 21 — suggest a sub-agent split when context pressure is chronic:
+ * either the mined sessions ROUTINELY compact (≥ chronicCompactionSessions
+ * sessions each compacting ≥ compactionsPerSession times) OR one tool/concern
+ * DOMINATES tool byte-spend (≥ toolByteDominance of ≥ toolByteMinTotal total
+ * bytes). Moving the heavy concern behind a sub-agent's own context window
+ * relieves the parent.
+ *
+ * STRICTLY suggest+scaffold — NEVER a patch: a structural change (adding a
+ * sub-agent + rewriting instructions) isn't eval-safe to auto-apply, so this
+ * emits advice text carrying a ready-to-paste `sub_agents:` fragment (the
+ * correct spec key — NOT `agents:`). Gated per target: only cli/channel/crew
+ * schemas have a `sub_agents` block; on any other target (or with no spec) the
+ * rule stays silent, since there's nowhere to paste it.
+ */
+export const ruleSubAgentSplit: AdviceRule = (ctx, opts) => {
+  const t = resolveThresholds(opts);
+  const spec = opts?.spec;
+  // Gate on target: the fragment is only pasteable where sub_agents exists.
+  if (spec === undefined || !SUB_AGENT_TARGETS.has(spec.target)) return [];
+
+  const chronicSessions = [...ctx.compactionsBySession.values()].filter(
+    (c) => c >= t.compactionsPerSession,
+  ).length;
+  const chronicCompaction = chronicSessions >= t.chronicCompactionSessions;
+
+  const dom = dominantTool(ctx);
+  const dominates =
+    dom !== undefined &&
+    ctx.totalToolBytes >= t.toolByteMinTotal &&
+    dom.share >= t.toolByteDominance;
+
+  if (!chronicCompaction && !dominates) return [];
+
+  // Prefer the dominant tool as the concern to move; fall back to a generic
+  // "heaviest concern" when only the compaction signal tripped.
+  const concernTool = dom?.name ?? "the heaviest tool";
+  const evidence: string[] = [];
+  if (chronicCompaction) {
+    evidence.push(
+      `${chronicSessions} session(s) each compacted ≥${t.compactionsPerSession}× (threshold: ≥${t.chronicCompactionSessions} sessions)`,
+    );
+  }
+  if (dominates && dom !== undefined) {
+    evidence.push(
+      `${dom.name} accounts for ${(dom.share * 100).toFixed(0)}% of ${ctx.totalToolBytes} tool bytes (threshold: ≥${(t.toolByteDominance * 100).toFixed(0)}% of ≥${t.toolByteMinTotal})`,
+    );
+  }
+
+  const fragment = dom !== undefined ? subAgentFragment(dom.name) : subAgentFragment("Bash");
+  return [
+    {
+      id: "sub-agent-split",
+      severity: "warn",
+      summary: `chronic context pressure — consider moving ${concernTool} into a sub-agent`,
+      evidence,
+      counts: {
+        chronicSessions,
+        dominantShare: dom !== undefined ? Math.round(dom.share * 100) : 0,
+      },
+      suggestion: {
+        kind: "advice",
+        text: `Context pressure is chronic. Move the ${concernTool}-heavy concern into a sub-agent so it carries its own context window and the parent stays lean. The runtime already executes sub-agents (the synthetic Task tool). Paste this fragment (note the key is \`sub_agents:\`, NOT \`agents:\`) and delegate the heavy work to it from the parent's instructions:\n${fragment}\n\nThen add to the parent instructions: "For ${concernTool}-heavy work, delegate to the ${(TOOL_NAME_TO_SPEC_KEY[dom?.name ?? ""] ?? "worker").toLowerCase()}_worker sub-agent via the Task tool and use its summarized result." This is a structural change — apply it by hand and re-eval; it is never auto-applied.`,
+      },
+    },
+  ];
+};
+
 export const ADVICE_RULES: ReadonlyArray<AdviceRule> = [
   ruleRepeatedToolFailures,
   ruleTruncationPressure,
   ruleCompactionThrash,
   rulePermissionChurn,
   ruleStopReasonAnomalies,
+  ruleFailureTaxonomy,
+  ruleLoopBreak,
+  ruleSubAgentSplit,
 ];
 
 /**

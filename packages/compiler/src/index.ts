@@ -1,3 +1,4 @@
+import { CHEAPEST_SENTINEL, resolveCheapestForSlot } from "@crewhaus/cost-tracker";
 import { CompilerError } from "@crewhaus/errors";
 import { assertNever } from "@crewhaus/infra-utils";
 import type {
@@ -26,6 +27,8 @@ import type {
   IrManagedV0,
   IrMcpServerConfig,
   IrMcpServers,
+  IrMemory,
+  IrModelTiers,
   IrNode,
   IrPermissions,
   IrPipelineV0,
@@ -435,11 +438,50 @@ function lowerCompaction(spec: SpecWithPermissions): IrCompaction {
   const out: {
     -readonly [K in keyof IrCompaction]: IrCompaction[K];
   } = {};
-  if (c.model !== undefined) out.model = c.model;
+  if (c.model !== undefined) out.model = resolveAuxModel(c.model, spec, "compaction.model");
   if (c.curate !== undefined) out.curate = c.curate;
   if (c.dedupeThreshold !== undefined) out.dedupeThreshold = c.dedupeThreshold;
   if (c.relevanceTopK !== undefined) out.relevanceTopK = c.relevanceTopK;
   return out;
+}
+
+/**
+ * Item 25 — the `cheapest` sentinel for an AUX model knob (compaction.model,
+ * judge model, …). Resolved AT COMPILE TIME to the lowest-cost same-provider
+ * model (as the primary's provider) whose capabilities satisfy the slot, so
+ * the IR — and every emitted bundle — carries a concrete model id. An aux slot
+ * summarizes / grades text, so its capability requirement is empty (any
+ * same-provider family qualifies); `cheapest` therefore resolves to the
+ * provider's cheapest family. A non-`cheapest` value passes through verbatim.
+ *
+ * The primary model lives in different places depending on target shape:
+ * `cli`/`managed`/`pipeline`/`research`/… carry it under `agent.model`, while
+ * `workflow`/`graph`/`crew` carry it as a required TOP-LEVEL `model` field
+ * (no `agent` block at all). `lowerCompaction` runs for every target, so this
+ * checks `agent.model` first and falls back to the top-level `model`.
+ *
+ * When the primary is a provider the pricing table doesn't cover (local/,
+ * azure/, a named host) `cheapest` cannot be resolved offline — the sentinel
+ * is a compile ERROR there (the operator must name a concrete model), because
+ * silently leaving the literal string `"cheapest"` in the IR would fail later
+ * at `resolveModel` with a far less actionable message.
+ */
+function resolveAuxModel(value: string, spec: SpecWithPermissions, slotLabel: string): string {
+  if (value !== CHEAPEST_SENTINEL) return value;
+  const specLike = spec as { agent?: { model?: unknown }; model?: unknown };
+  const primary = specLike.agent?.model ?? specLike.model;
+  if (typeof primary !== "string") {
+    throw new CompilerError(
+      `${slotLabel}: "cheapest" needs a primary agent.model to resolve against, but this spec has none`,
+    );
+  }
+  const resolved = resolveCheapestForSlot(primary);
+  if (resolved === undefined) {
+    throw new CompilerError(
+      `${slotLabel}: "cheapest" cannot be resolved for primary model "${primary}" — its provider is not in the pricing table (local/azure/named-host). Name a concrete model instead.`,
+    );
+  }
+  return resolved;
 }
 
 /**
@@ -457,13 +499,28 @@ type SpecAgentWithFailover = {
     readonly windowMs?: number;
     readonly cooldownMs?: number;
   };
+  readonly model_tiers?: {
+    readonly fast: string;
+    readonly default: string;
+    readonly routing?: {
+      readonly contextTokenThreshold?: number;
+      readonly toolsToDefault?: boolean;
+      readonly firstTurnToDefault?: boolean;
+      readonly priorToolDensityThreshold?: number;
+    };
+  };
 };
 
 function lowerModelFailover(agent: SpecAgentWithFailover): {
   modelFallbacks?: readonly string[];
   circuitBreaker?: IrCircuitBreaker;
+  modelTiers?: IrModelTiers;
 } {
-  const out: { modelFallbacks?: readonly string[]; circuitBreaker?: IrCircuitBreaker } = {};
+  const out: {
+    modelFallbacks?: readonly string[];
+    circuitBreaker?: IrCircuitBreaker;
+    modelTiers?: IrModelTiers;
+  } = {};
   if (agent.model_fallbacks !== undefined && agent.model_fallbacks.length > 0) {
     out.modelFallbacks = [...agent.model_fallbacks];
   }
@@ -473,6 +530,34 @@ function lowerModelFailover(agent: SpecAgentWithFailover): {
       ...(cb.failureThreshold !== undefined ? { failureThreshold: cb.failureThreshold } : {}),
       ...(cb.windowMs !== undefined ? { windowMs: cb.windowMs } : {}),
       ...(cb.cooldownMs !== undefined ? { cooldownMs: cb.cooldownMs } : {}),
+    };
+  }
+  // Item 26 — two-tier router. Only lowered when present; the routing knobs
+  // carry the user's intent verbatim (runtime owns the per-knob defaults).
+  const mt = agent.model_tiers;
+  if (mt !== undefined) {
+    const routing = mt.routing;
+    out.modelTiers = {
+      fast: mt.fast,
+      default: mt.default,
+      ...(routing !== undefined
+        ? {
+            routing: {
+              ...(routing.contextTokenThreshold !== undefined
+                ? { contextTokenThreshold: routing.contextTokenThreshold }
+                : {}),
+              ...(routing.toolsToDefault !== undefined
+                ? { toolsToDefault: routing.toolsToDefault }
+                : {}),
+              ...(routing.firstTurnToDefault !== undefined
+                ? { firstTurnToDefault: routing.firstTurnToDefault }
+                : {}),
+              ...(routing.priorToolDensityThreshold !== undefined
+                ? { priorToolDensityThreshold: routing.priorToolDensityThreshold }
+                : {}),
+            },
+          }
+        : {}),
     };
   }
   return out;
@@ -614,6 +699,36 @@ function lowerFeedback(spec: SpecWithFeedback): { feedback?: IrFeedback } {
       ...(f.autoDistill !== undefined ? { autoDistill: f.autoDistill } : {}),
       ...(f.exitPrompt !== undefined ? { exitPrompt: f.exitPrompt } : {}),
       ...(f.channelReactions !== undefined ? { channelReactions: f.channelReactions } : {}),
+    },
+  };
+}
+
+type SpecWithMemory = {
+  readonly memory?: {
+    readonly enabled?: boolean;
+    readonly autoCapture?: boolean;
+    readonly autoCaptureThreshold?: number;
+    readonly autoRecall?: boolean;
+    readonly recallK?: number;
+  };
+};
+
+// Lower the cross-cutting `memory` block (#53), mirroring lowerFeedback's
+// spread-return-{} discipline (Pillar 1): the key is absent from the IR when
+// the spec omits the block, so codegen/runtime check presence to decide
+// whether to wire Remember/Recall + the auto-capture/recall paths.
+function lowerMemory(spec: SpecWithMemory): { memory?: IrMemory } {
+  const m = spec.memory;
+  if (m === undefined) return {};
+  return {
+    memory: {
+      ...(m.enabled !== undefined ? { enabled: m.enabled } : {}),
+      ...(m.autoCapture !== undefined ? { autoCapture: m.autoCapture } : {}),
+      ...(m.autoCaptureThreshold !== undefined
+        ? { autoCaptureThreshold: m.autoCaptureThreshold }
+        : {}),
+      ...(m.autoRecall !== undefined ? { autoRecall: m.autoRecall } : {}),
+      ...(m.recallK !== undefined ? { recallK: m.recallK } : {}),
     },
   };
 }
@@ -769,6 +884,7 @@ export function lower(spec: Spec): IrNode {
         ...lowerBudget(spec),
         ...lowerSecurity(spec),
         ...lowerFeedback(spec),
+        ...lowerMemory(spec),
         // Phase 3 §3.3 — CLI banner config. Plus Phase 2 M2.2 TUI mode
         // gate. Only included when the spec author opted in (cli block
         // and its fields are optional).
@@ -828,6 +944,7 @@ export function lower(spec: Spec): IrNode {
         ...lowerFailureTaxonomy(spec),
         ...lowerBudget(spec),
         ...lowerFeedback(spec),
+        ...lowerMemory(spec),
         // Phase 3 §3.1 — heartbeat. Duration string ("2h", "30m") is
         // parsed once at lower time so codegen emits a literal numeric
         // setInterval arg in ms.
@@ -893,6 +1010,7 @@ export function lower(spec: Spec): IrNode {
         compaction: lowerCompaction(spec),
         ...lowerFailureTaxonomy(spec),
         ...lowerBudget(spec),
+        ...lowerMemory(spec),
       } satisfies IrManagedV0;
     case "pipeline":
       return {
@@ -974,6 +1092,7 @@ export function lower(spec: Spec): IrNode {
         permissions: lowerPermissions(spec),
         compaction: lowerCompaction(spec),
         ...lowerFailureTaxonomy(spec),
+        ...lowerMemory(spec),
         ...lowerChainSubsystem(spec),
       } satisfies IrResearchV0;
     case "batch":

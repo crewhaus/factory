@@ -13,7 +13,7 @@ import type {
   SpawnSubAgentFn,
   SubAgentDefinition,
 } from "@crewhaus/agent-context-isolation";
-import { setDefaultBoundaryLlmClassifier } from "@crewhaus/boundary-classifier";
+import { classifyBoundary, setDefaultBoundaryLlmClassifier } from "@crewhaus/boundary-classifier";
 import { type WrappedAdapter, wrap as wrapWithCircuitBreaker } from "@crewhaus/circuit-breaker";
 import { autoCompact } from "@crewhaus/compaction-autocompact";
 import { snip } from "@crewhaus/compaction-snip";
@@ -30,7 +30,10 @@ import { type EventKind, type EventLog, openEventLog } from "@crewhaus/event-log
 import { type HookDef, type HookEvent, aggregateDecisions, runHooks } from "@crewhaus/hooks-engine";
 import {
   type FailoverChain,
+  type ResolvedTier,
+  type TierRouter,
   createFailoverChain,
+  createTierRouter,
   parseModelString,
   resolveModel,
 } from "@crewhaus/model-router";
@@ -489,6 +492,40 @@ export type RunChatLoopOptions = {
    */
   slashCommands?: ReadonlyMap<string, SlashCommand>;
   /**
+   * Feature #53 — cross-session memory auto-recall/auto-capture wiring. When
+   * `store` is supplied (the caller builds it from `createMemoryStore`), the
+   * runtime honours the auto-* switches:
+   *   - `autoRecall`: at session start, recall the top-`recallK` memories for
+   *     the current context and inject them into the system prompt (mirrors
+   *     the project-memory auto-load block). `recallSeed` is the query used
+   *     (defaults to the agent instructions).
+   *   - `autoCapture`: at run teardown (in the same finally where the `stop`
+   *     hook fires — NOT a credential-stripped hook), the caller-supplied
+   *     `onCapture` is invoked with the completed-turn count so it can
+   *     summarize the session's durable outcomes into the store.
+   * Omitted → no memory injection or capture (Remember/Recall passed via
+   * `tools` still work). Kept as an injected seam so runtime-core does not
+   * depend on memory-store.
+   */
+  memory?: {
+    readonly autoRecall?: boolean;
+    readonly recallK?: number;
+    readonly recallSeed?: string;
+    /** Return recalled memory lines to inject; runtime wraps them in a block. */
+    readonly recall?: (query: string, k: number) => Promise<readonly string[]>;
+    readonly autoCapture?: boolean;
+    /** Invoked at teardown with the completed user-text turn count and the
+     *  run's session id (so the callback can read the transcript to summarize). */
+    readonly onCapture?: (completedTurns: number, sessionId: string) => Promise<void>;
+  };
+  /**
+   * Item #56 — absolute paths to per-user preference files injected at run
+   * start via the project-memory auto-load path (alongside LESSONS.md, which
+   * is now a canonical memory file). The CLI resolves the current user's
+   * `.crewhaus/preferences/<user>.md` and threads it here. Absent → no-op.
+   */
+  preferenceFiles?: ReadonlyArray<string>;
+  /**
    * Section 13 — inline sub-agent definitions exposed via the `Task` tool.
    * Threaded into the `RuntimeBridge` and surfaced to framework-aware
    * tools (only `Task` today). Codegen sets this from the IR; ordinary
@@ -634,6 +671,34 @@ export type RunChatLoopOptions = {
    */
   modelFallbacks?: ReadonlyArray<string>;
   /**
+   * Item 26 — opt-in two-tier turn-difficulty router (spec `agent.model_tiers`).
+   * When set, BOTH tier adapters resolve at boot (mirroring the compaction
+   * second-adapter wiring), and each turn the loop picks a tier from
+   * deterministic signals (estimated context tokens, tools-in-play, turn
+   * index, prior-turn tool_use density), streams through the chosen tier's
+   * adapter, and publishes a `model_tier_route` trace event. A `fast`-tier
+   * turn that FAILS is re-run on `default` (misroute recovery). Absent → the
+   * single primary adapter path, unchanged. Mutually independent of
+   * `modelFallbacks`: when both are set the primary chain still governs the
+   * `default` tier; the `fast` tier is its own single adapter (v1 scope).
+   */
+  modelTiers?: {
+    readonly fast: string;
+    readonly default: string;
+    readonly routing?: {
+      readonly contextTokenThreshold?: number;
+      readonly toolsToDefault?: boolean;
+      readonly firstTurnToDefault?: boolean;
+      readonly priorToolDensityThreshold?: number;
+    };
+  };
+  /**
+   * Item 26 — test injection for the two tier adapters, keyed by their spec
+   * model string (mirrors `_failoverAdapters`). Production callers leave it
+   * undefined (the runtime resolves both tiers through the normal router).
+   */
+  _tierAdapters?: ReadonlyMap<string, ProviderAdapter>;
+  /**
    * Section 55 (Track A) / item 23 — the spec's `failure_taxonomy`, lowered
    * from the IR. Consulted by `recovery-engine.recover()` BEFORE its
    * built-in classify+recover flow so user-named error classes take
@@ -772,6 +837,20 @@ export function defaultSinkScope(toolName: string): SinkScope {
 }
 
 /**
+ * Neutralize a boundary-block closing delimiter embedded in untrusted content
+ * so a poisoned line can't terminate its wrapper block early and inject
+ * trailing instructions. Replaces `</tag>` (any casing/whitespace) with a
+ * visually-inert `<\/tag>` so the content survives for the model to read but
+ * no longer parses as the real closing tag. Used for the recalled-memory block
+ * (#53) — recalled memories may carry content shaped by untrusted tool output.
+ */
+function escapeBoundaryDelimiter(text: string, tag: string): string {
+  // Match `</tag>` tolerantly (leading whitespace inside the tag, any casing).
+  const re = new RegExp(`</\\s*${tag}\\s*>`, "gi");
+  return text.replace(re, `<\\/${tag}>`);
+}
+
+/**
  * Strip the model-string provider grammar down to the wire model id
  * (`"bedrock/us.anthropic.claude-..."` → `"us.anthropic.claude-..."`)
  * WITHOUT loading the provider package. Used on the `_adapter` injection
@@ -901,6 +980,35 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     compactionAdapter = adapter;
     compactionWireModelId = wireModelId;
   }
+
+  // Item 26 — two-tier turn-difficulty router. When `modelTiers` is set, BOTH
+  // tier adapters resolve HERE at boot (adapters bind once; the per-turn pick
+  // just selects between the two already-resolved adapters — the same
+  // discipline as compaction's second adapter and the failover chain's
+  // multiple candidates). The `_tierAdapters` map is a test seam mirroring
+  // `_failoverAdapters`.
+  let tierRouter: TierRouter | undefined;
+  if (opts.modelTiers !== undefined) {
+    const resolveTier = async (modelString: string): Promise<ResolvedTier> => {
+      const injected = opts._tierAdapters?.get(modelString);
+      if (injected !== undefined) {
+        return { adapter: injected, modelId: bestEffortWireModelId(modelString), modelString };
+      }
+      const r = await resolveModel(modelString);
+      return { adapter: r.adapter, modelId: r.modelId, modelString };
+    };
+    const fast = await resolveTier(opts.modelTiers.fast);
+    const dflt = await resolveTier(opts.modelTiers.default);
+    tierRouter = createTierRouter({
+      fast,
+      default: dflt,
+      ...(opts.modelTiers.routing !== undefined ? { config: opts.modelTiers.routing } : {}),
+    });
+  }
+  // Item 26 — tool_use blocks the PREVIOUS turn produced (a tier-routing
+  // signal). Persists across `runOneTurn` calls; 0 on the first turn.
+  let priorTurnToolUseCount = 0;
+
   // Default model max OUTPUT tokens for one turn. Callers thread the spec's
   // `agent.max_tokens` here when set (the CLI target's codegen + apps/cli);
   // this fallback applies when the spec is silent. Kept comfortably above the
@@ -1231,6 +1339,20 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     }
   }
 
+  // Feature #53 — auto-capture at teardown. Runs in the same finally where the
+  // `stop` hook fires, but is NOT a credential-stripped hook: the caller-
+  // supplied `onCapture` (which writes to the memory-store from the CLI's full
+  // environment) needs the process env, exactly like the feedback teardown.
+  // Best-effort — a capture failure never turns a clean exit into an error.
+  const maybeAutoCapture = async (): Promise<void> => {
+    if (opts.memory?.autoCapture !== true || opts.memory.onCapture === undefined) return;
+    try {
+      await opts.memory.onCapture(runContext.turnNumber, sessionId);
+    } catch (err) {
+      runContext.logger.warn("memory auto-capture failed", { error: (err as Error).message });
+    }
+  };
+
   // Section 11 — `session-start` fires once after the persistence + run
   // context boot is complete. Observational only (no deny/block effect).
   await fireHook("session-start", {
@@ -1271,7 +1393,11 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // CLAUDE.md auto-load behaviour. Pillar 3 compliance: each file's content
   // is classified via boundary-classifier with origin "user" inside
   // loadProjectMemory() (the user's repo is developer-trusted).
-  const projectMemory = await loadProjectMemory();
+  const projectMemory = await loadProjectMemory(
+    opts.preferenceFiles !== undefined && opts.preferenceFiles.length > 0
+      ? { extraFiles: opts.preferenceFiles }
+      : {},
+  );
   const projectMemoryBlock: Anthropic.TextBlockParam[] =
     projectMemory.prompt.length > 0
       ? [
@@ -1289,12 +1415,49 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         .join(", ")}\n`,
     );
   }
+  // Feature #53 — auto-recall: at session start, pull the top-K relevant
+  // cross-session memories and inject them as a system block, mirroring the
+  // project-memory auto-load above. The caller supplies the `recall` seam
+  // (runtime-core stays independent of memory-store). Best-effort: a recall
+  // failure never aborts the run.
+  let memoryRecallBlock: Anthropic.TextBlockParam[] = [];
+  if (opts.memory?.autoRecall === true && opts.memory.recall !== undefined) {
+    try {
+      const seed = opts.memory.recallSeed ?? opts.instructions;
+      const k = opts.memory.recallK ?? 5;
+      const lines = await opts.memory.recall(seed, k);
+      if (lines.length > 0) {
+        // Pillar 3 — a recalled memory can embed content shaped by untrusted
+        // tool output from an earlier session, so it is NOT verbatim-safe like
+        // the developer's own repo files. Two defenses, mirroring how the rest
+        // of the security fabric treats injected content:
+        //   1. Delimiter safety — neutralize any `</recalled_memory>` closing
+        //      tag inside a recalled line so a poisoned memory can't break out
+        //      of its block and inject trailing instructions.
+        //   2. Classification — run the assembled block through the SAME
+        //      `classifyBoundary(text, { origin: "user" })` best-effort path
+        //      `loadProjectMemory()` uses (pass policy: classify + emit trace
+        //      events without mutating), so recalled content flows through the
+        //      boundary classifier exactly like every other prompt-bound source.
+        const body = lines
+          .map((l) => `- ${escapeBoundaryDelimiter(l, "recalled_memory")}`)
+          .join("\n");
+        const text = `<recalled_memory>\nRelevant facts remembered from earlier sessions:\n${body}\n</recalled_memory>`;
+        await classifyBoundary(text, { origin: "user" }).catch(() => undefined);
+        memoryRecallBlock = [{ type: "text", text, cache_control: { type: "ephemeral" } }];
+        process.stdout.write(`[memory] recalled ${lines.length} memory(ies) into the prompt\n`);
+      }
+    } catch (err) {
+      runContext.logger.warn("memory auto-recall failed", { error: (err as Error).message });
+    }
+  }
   // Section 17 — runtime-core no longer prepends the Claude Code OAuth
   // prefix; `adapter-anthropic` handles that internally so each adapter
   // owns its provider-specific auth-shape requirements.
   let systemBlocks: Anthropic.TextBlockParam[] = [
     userInstructions,
     ...projectMemoryBlock,
+    ...memoryRecallBlock,
     ...skillsBlock,
   ];
 
@@ -1990,6 +2153,14 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     let recovery: RecoveryState = initialRecoveryState;
     const maxToolIterations = opts.maxToolIterations ?? DEFAULT_MAX_TOOL_ITERATIONS;
     let toolIterations = 0;
+    // Item 26 — tool_use blocks THIS turn produced (fed to the NEXT turn's
+    // tier decision) and the misroute-recovery escalation latch (a fast-tier
+    // failure forces `default` for the rest of this turn). `servedFastTier`
+    // records whether the LAST attempt streamed on the fast tier, so the
+    // error catch only escalates a genuine fast-tier misroute.
+    let thisTurnToolUseCount = 0;
+    let escalateTier = false;
+    let servedFastTier = false;
 
     while (state.kind !== "Done") {
       if (turnAbort.signal.aborted) {
@@ -2049,11 +2220,47 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             // which is exact, so cost-tracker pricing always keys on the
             // model that actually served).
             const plannedCandidate = failoverChain?.plan();
-            const reqWireModelId = plannedCandidate?.modelId ?? wireModelId;
-            const reqProviderId = plannedCandidate?.providerId ?? providerId;
+            let reqWireModelId = plannedCandidate?.modelId ?? wireModelId;
+            let reqProviderId = plannedCandidate?.providerId ?? providerId;
             // Item 27 — after a budget degrade, `failoverChain` is null and
             // `degradedSpecModel` is the running spec model.
-            const reqSpecModel = plannedCandidate?.modelString ?? degradedSpecModel ?? opts.model;
+            let reqSpecModel = plannedCandidate?.modelString ?? degradedSpecModel ?? opts.model;
+            // The adapter this turn streams through: the primary/chain by
+            // default, or a tier adapter when the two-tier router is active.
+            let turnAdapter: ProviderAdapter = adapter;
+            // Item 26 — two-tier turn-difficulty router. Pick a tier from
+            // DETERMINISTIC per-turn signals (context size, tools-in-play,
+            // turn index, prior-turn tool_use density); a fast-tier misroute
+            // recovery forces `default` (see the catch below). Publish the
+            // decision as a `model_tier_route` event, then stream through the
+            // chosen tier's already-resolved adapter.
+            if (tierRouter !== undefined) {
+              const decision = escalateTier
+                ? { tier: "default" as const, reason: "escalated after fast-tier failure" }
+                : tierRouter.route({
+                    contextTokens: estimateTokens(messages),
+                    toolsInPlay: (anthropicTools?.length ?? 0) > 0,
+                    // `turnNumber` is 1-based (incremented before the turn
+                    // runs); the router wants a 0-based index so its
+                    // first-turn check keys on the opening turn.
+                    turnIndex: Math.max(0, runContext.turnNumber - 1),
+                    priorTurnToolUseCount,
+                  });
+              const chosen = tierRouter.tier(decision.tier);
+              turnAdapter = chosen.adapter;
+              reqWireModelId = chosen.modelId;
+              reqProviderId = chosen.adapter.providerId;
+              reqSpecModel = chosen.modelString;
+              servedFastTier = decision.tier === "fast";
+              bus.publish({
+                ...bus.envelope(),
+                kind: "model_tier_route",
+                tier: decision.tier,
+                model: chosen.modelId,
+                reason: decision.reason,
+                ...(escalateTier ? { escalated: true } : {}),
+              });
+            }
             bus.publish({
               ...modelStartEnv,
               kind: "model_request",
@@ -2084,7 +2291,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             // Item 22 — the failover chain rewrites `model` per serving
             // candidate internally; the planned id here is the single-adapter
             // value and the chain's best-effort prediction otherwise.
-            const reqStream = adapter.stream({
+            const reqStream = turnAdapter.stream({
               model: reqWireModelId,
               system: systemBlocks.map((b) => ({
                 type: "text" as const,
@@ -2201,6 +2408,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 break;
               }
 
+              // Item 26 — accrue this turn's tool_use count (next-turn tier signal).
+              thisTurnToolUseCount += toolUses.length;
               for (const tu of toolUses) {
                 toolUseHistory.push({ id: tu.id, name: tu.name, input: tu.input });
               }
@@ -2333,6 +2542,14 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               break;
             }
             lastErrorForRecovery = err;
+            // Item 26 — a fast-tier turn that FAILED is a MISROUTE: latch the
+            // escalation so the recovery retry re-runs on the `default` tier
+            // (the loop re-enters NeedModel via the recovery ladder, which
+            // then picks `default`). Composes with the existing recovery
+            // actions — a retry/continue now streams on the sturdier tier.
+            if (tierRouter !== undefined && servedFastTier) {
+              escalateTier = true;
+            }
             const errObj = err as { name?: unknown; message?: unknown };
             const errorName = typeof errObj.name === "string" ? errObj.name : "Error";
             const errorMessage = typeof errObj.message === "string" ? errObj.message : String(err);
@@ -2361,6 +2578,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             state = transition(state, { kind: "Aborted" });
             break;
           }
+          // Item 26 — accrue this turn's tool_use count (a next-turn tier
+          // signal): a dense tool turn marks an active multi-step task.
+          thisTurnToolUseCount += state.toolUses.length;
           const toolResults = await runToolBatch(state.toolUses);
           messages.push({ role: "user", content: toolResults });
           await logEvent("user_message", { content: toolResults });
@@ -2521,6 +2741,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       }
     }
 
+    // Item 26 — hand this turn's tool_use count to the next turn's tier
+    // decision (the prior-tool-density signal).
+    priorTurnToolUseCount = thisTurnToolUseCount;
     return { terminalContent };
   }
 
@@ -2613,6 +2836,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         turnCount: runContext.turnNumber,
         reason: "complete",
       });
+      await maybeAutoCapture();
       await subscribers.flushAll();
       await subscribers.shutdownAll();
       costPersistUnsubscribe?.();
@@ -2844,6 +3068,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       turnCount: runContext.turnNumber,
       reason: runAbort.signal.aborted ? "abort" : "exit",
     });
+    await maybeAutoCapture();
     await subscribers.flushAll();
     await subscribers.shutdownAll();
     costPersistUnsubscribe?.();

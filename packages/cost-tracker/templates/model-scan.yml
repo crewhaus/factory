@@ -1,0 +1,100 @@
+# model-scan.yml — scheduled model-market scan (crewhaus item 24).
+#
+# Copy this into your harness repo's .github/workflows/ and replace the
+# <PLACEHOLDER> markers. On a schedule (default: weekly), this workflow runs
+# `crewhaus model-scan` against your spec's agent.model: it enumerates
+# capability-compatible cheaper replacement models from the pricing table,
+# evals current + each candidate on your dataset, and — when a candidate beats
+# current on mean score at lower projected cost — opens a PROPOSAL PR for a
+# human to review. It NEVER edits the spec on its own: model fields are outside
+# OPTIMIZABLE_PATHS by design, and `model-scan --write` is deliberately
+# human-initiated only. This job opens a PR carrying the proposal; a human
+# reviews and merges.
+#
+# COST: every scheduled run bills one eval per candidate + one for the current
+# model against ANTHROPIC_API_KEY (and any candidate provider's key). --limit
+# bounds the candidate count (default 6). Keep the cron infrequent.
+#
+# Required repo secret: ANTHROPIC_API_KEY (+ OPENAI_API_KEY / GEMINI_API_KEY /
+# AWS creds if your candidates span providers — drop --same-provider to allow
+# cross-provider candidates).
+
+name: crewhaus-model-scan
+
+on:
+  schedule:
+    # Weekly, Monday 07:00 UTC. Adjust to taste — model prices/lineups move
+    # on the order of weeks, not hours.
+    - cron: "0 7 * * 1"
+  workflow_dispatch: {} # manual "scan now" button
+
+permissions:
+  contents: write # the proposal branch
+  pull-requests: write # the proposal PR
+
+concurrency:
+  group: crewhaus-model-scan
+  cancel-in-progress: false
+
+env:
+  EVAL_SEED: "1"
+  EVAL_CONCURRENCY: "1" # 30k-TPM-tier default; raise if your key allows
+
+jobs:
+  model-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # <PLACEHOLDER: if your harness lives in a subdirectory, set working-directory>
+    # defaults:
+    #   run:
+    #     working-directory: path/to/harness
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install crewhaus CLI
+        run: |
+          bun add -g crewhaus
+          echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
+
+      - name: Model market scan
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}       # for cross-provider candidates
+          # GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          crewhaus model-scan \
+            --dataset eval/dataset.jsonl \
+            --graders eval/graders.yaml \
+            --same-provider \
+            --concurrency "$EVAL_CONCURRENCY" --seed "$EVAL_SEED" \
+            -o .crewhaus/model-scan-latest
+          # Proposal (when a winner exists) lands at
+          # .crewhaus/model-scan-latest/patch.json — the next step opens a PR.
+
+      - name: Open a proposal PR when a cheaper-and-as-good model was found
+        if: hashFiles('.crewhaus/model-scan-latest/patch.json') != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          NEW_MODEL="$(bun -e "process.stdout.write(JSON.parse(require('fs').readFileSync('.crewhaus/model-scan-latest/patch.json','utf8')).recommendedModel)")"
+          BRANCH="model-scan/$(date -u +%Y%m%d)-${NEW_MODEL//[^A-Za-z0-9._-]/_}"
+          git config user.name "crewhaus-model-scan[bot]"
+          git config user.email "bot@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          # Apply the human-reviewable model swap via the CLI's CST edit.
+          crewhaus model-scan \
+            --dataset eval/dataset.jsonl \
+            --graders eval/graders.yaml \
+            --same-provider \
+            -o .crewhaus/model-scan-latest --write
+          git add crewhaus.yaml
+          git commit -m "proposal: switch agent.model to ${NEW_MODEL} (model-scan)"
+          git push -u origin "$BRANCH"
+          gh pr create \
+            --title "Model proposal: switch to ${NEW_MODEL}" \
+            --body "Automated \`crewhaus model-scan\` found **${NEW_MODEL}** beats the current model on mean score at lower projected cost. See the matrix report + patch.json in the run artifacts. **Review before merging** — model changes are always human-reviewed." \
+            || echo "PR creation skipped (already open or insufficient permissions)"

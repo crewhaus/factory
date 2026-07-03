@@ -6,6 +6,7 @@
   },
   "include": ["src/**/*"],
   "references": [
+    { "path": "../cost-tracker" },
     { "path": "../errors" },
     { "path": "../infra-utils" },
     { "path": "../spec" },

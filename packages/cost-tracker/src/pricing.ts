@@ -39,6 +39,12 @@ export type PricingTable = {
  * Default pricing table snapshotted 2026-05-08. Override at construction
  * time via `createCostTracker(bus, { pricing })` for tests or for
  * historical-run repricing.
+ *
+ * Maintain alongside `DEFAULT_CAPABILITIES` (capabilities.ts) — same family
+ * keys, kept one-to-one — AND `KNOWN_SUNSETS` (feed.ts): a family added here
+ * that is already past (or nearing) its provider's retirement date needs a
+ * `KNOWN_SUNSETS` entry too, or `cheapest`/right-size can silently pick a
+ * model on its way out.
  */
 export const DEFAULT_PRICING: PricingTable = {
   version: "2026-05-08",

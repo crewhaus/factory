@@ -79,6 +79,8 @@ function formatBody(ev: TraceEvent): string {
       }`;
     case "model_failover":
       return `from=${ev.from} to=${ev.to} reason=${ev.reason}`;
+    case "model_tier_route":
+      return `tier=${ev.tier} model=${ev.model}${ev.escalated ? " escalated" : ""} reason=${ev.reason}`;
     case "janitor_action":
       return `step=${ev.step} status=${ev.status}${ev.count !== undefined ? ` count=${ev.count}` : ""}${
         ev.detail ? ` detail=${ev.detail}` : ""

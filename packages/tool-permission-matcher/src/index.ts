@@ -14,6 +14,32 @@ export type CompiledPattern = {
   readonly _argRe: RegExp | null;
 };
 
+/**
+ * The glob metacharacters `globToRegex` treats specially — the ONLY characters
+ * that widen a match beyond a literal (`*` = any run, `?` = one char). Every
+ * other character (`. + ^ $ { } ( ) | [ ] \`) is regex-escaped and matched
+ * literally. `\` is the escape lead-in: `\*`, `\?`, `\\` match the literal
+ * character. Exported so callers that inject an observed literal value into a
+ * pattern (e.g. permission-suggest) can neutralise widening via
+ * `escapeGlobLiteral` and stay in sync with the grammar defined HERE.
+ */
+export const GLOB_METACHARS: readonly string[] = Object.freeze(["\\", "*", "?"]);
+
+/**
+ * Escape a raw string so it matches ONLY itself when spliced into a glob
+ * pattern. Backslash-escapes every {@link GLOB_METACHARS} character (backslash
+ * first, so we don't double-escape the escapes we add). Round-trips through
+ * `globToRegex`: `escapeGlobLiteral("a*b")` → `"a\\*b"` → matches only "a*b".
+ */
+export function escapeGlobLiteral(value: string): string {
+  let out = "";
+  for (const ch of value) {
+    if (ch === "\\" || ch === "*" || ch === "?") out += `\\${ch}`;
+    else out += ch;
+  }
+  return out;
+}
+
 function globToRegex(glob: string): RegExp {
   // Tokenize character by character so replacement text is never re-processed.
   // This avoids the chaining bug where .* emitted for ** gets re-replaced by
@@ -24,7 +50,16 @@ function globToRegex(glob: string): RegExp {
   while (i < glob.length) {
     const ch = glob.charAt(i);
 
-    if (ch === "*" && glob[i + 1] === "*") {
+    if (ch === "\\" && i + 1 < glob.length) {
+      // Escape lead-in: the next char is taken literally (regex-escaped),
+      // never interpreted as a glob metachar. Lets `escapeGlobLiteral` emit
+      // `\*`/`\?`/`\\` that match the literal `*`/`?`/`\`. The escaped char is
+      // regex-escaped against the FULL metachar set (incl. `*`/`?`, which are
+      // regex quantifiers) so e.g. `\?` becomes `\?` in the regex, not a bare
+      // `?` that would make the previous atom optional.
+      re += glob.charAt(i + 1).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      i += 2;
+    } else if (ch === "*" && glob[i + 1] === "*") {
       const prevIsSep = i === 0 || glob[i - 1] === "/";
       const afterTwo = glob[i + 2];
       const nextIsSep = afterTwo === "/" || afterTwo === undefined;
@@ -97,8 +132,13 @@ function stringValues(input: unknown): string[] {
  * arg-glob is meant to constrain. Matching ONLY these stops a decoy field (e.g.
  * Write's `content`, or an attacker-injected key) from satisfying an allow rule
  * (#145). Names cover both the tool-fs fields and the Claude-Code-style aliases.
+ *
+ * EXPORTED as the single source of truth: `crewhaus permissions suggest`
+ * imports this so a suggested pattern always targets the SAME field the matcher
+ * checks (previously hand-copied in permissions-suggest.ts — a silent-desync
+ * risk).
  */
-const OPERATIVE_ARG_FIELDS: Readonly<Record<string, readonly string[]>> = {
+export const OPERATIVE_ARG_FIELDS: Readonly<Record<string, readonly string[]>> = {
   Bash: ["command"],
   Read: ["file_path", "path"],
   Write: ["file_path", "path"],

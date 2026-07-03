@@ -110,6 +110,25 @@ export type IrCircuitBreaker = {
 };
 
 /**
+ * Item 26 — two-tier turn-difficulty router config. `fast`/`default` are full
+ * model-router grammar strings; `routing` tunes the per-turn escalation
+ * thresholds (all optional — runtime defaults apply per knob). Carried on the
+ * agent blocks of the failover-capable shapes (cli, channel, managed). Absent
+ * when the spec omits `model_tiers` — codegen gates on presence so an unset
+ * block leaves bundles byte-identical.
+ */
+export type IrModelTiers = {
+  readonly fast: string;
+  readonly default: string;
+  readonly routing?: {
+    readonly contextTokenThreshold?: number;
+    readonly toolsToDefault?: boolean;
+    readonly firstTurnToDefault?: boolean;
+    readonly priorToolDensityThreshold?: number;
+  };
+};
+
+/**
  * Section 55 (Track A) — named failure taxonomy. Cross-cutting; carried
  * through to runtime-core so `recovery-engine` can consult the user's
  * named classes before falling back to its built-in taxonomy.
@@ -209,6 +228,22 @@ export type IrFeedback = {
 };
 
 /**
+ * Feature #53 — cross-session memory config, lowered from `spec.memory`.
+ * Presence of the block wires Remember/Recall into the target; the auto-*
+ * switches gate auto-capture (summarize durable outcomes at teardown) and
+ * auto-recall (inject top-K memories into the system prompt at session start).
+ * Carried on the interactive shapes that run a chat loop (IrV0/cli,
+ * IrChannelV0, IrManagedV0, IrResearchV0). Absent when the spec omits `memory`.
+ */
+export type IrMemory = {
+  readonly enabled?: boolean;
+  readonly autoCapture?: boolean;
+  readonly autoCaptureThreshold?: number;
+  readonly autoRecall?: boolean;
+  readonly recallK?: number;
+};
+
+/**
  * Track F (Section 57) — typed message schemas (Σ) for multi-agent
  * communication. Source: AgentFlow (arxiv 2604.20801). A typed graph
  * DSL with well-formedness checking makes searching the full multi-
@@ -269,6 +304,8 @@ export type IrV0 = {
     readonly modelFallbacks?: readonly string[];
     /** Item 22 — breaker tuning (spec `agent.circuit_breaker`). */
     readonly circuitBreaker?: IrCircuitBreaker;
+    /** Item 26 — two-tier turn-difficulty router. Absent → single-model. */
+    readonly modelTiers?: IrModelTiers;
   };
   readonly tools: readonly string[];
   readonly toolConfigs: IrToolConfigs;
@@ -287,6 +324,8 @@ export type IrV0 = {
   readonly security?: IrSecurity;
   /** Response-feedback config. Optional; absent when the spec omits `feedback`. */
   readonly feedback?: IrFeedback;
+  /** #53 cross-session memory config. Optional; absent when the spec omits `memory`. */
+  readonly memory?: IrMemory;
   /** §47 cross-cutting blockchain subsystem (slice 0). All optional. */
   readonly chains?: readonly IrChainBinding[];
   readonly wallets?: readonly IrWalletBinding[];
@@ -532,6 +571,8 @@ export type IrChannelV0 = {
     readonly modelFallbacks?: readonly string[];
     /** Item 22 — breaker tuning (spec `agent.circuit_breaker`). */
     readonly circuitBreaker?: IrCircuitBreaker;
+    /** Item 26 — two-tier turn-difficulty router. Absent → single-model. */
+    readonly modelTiers?: IrModelTiers;
   };
   readonly tools: readonly string[];
   readonly toolConfigs: IrToolConfigs;
@@ -550,6 +591,8 @@ export type IrChannelV0 = {
   /** Response-feedback config. `feedback.channelReactions` gates Slack 👍/👎
    *  → user_feedback codegen in this target. Absent when spec omits it. */
   readonly feedback?: IrFeedback;
+  /** #53 cross-session memory config. Optional; absent when the spec omits `memory`. */
+  readonly memory?: IrMemory;
   /** §47 cross-cutting blockchain subsystem (slice 0). All optional. */
   readonly chains?: readonly IrChainBinding[];
   readonly wallets?: readonly IrWalletBinding[];
@@ -582,6 +625,8 @@ export type IrManagedV0 = {
     readonly modelFallbacks?: readonly string[];
     /** Item 22 — breaker tuning (spec `agent.circuit_breaker`). */
     readonly circuitBreaker?: IrCircuitBreaker;
+    /** Item 26 — two-tier turn-difficulty router. Absent → single-model. */
+    readonly modelTiers?: IrModelTiers;
   };
   readonly tenants: readonly IrManagedTenant[];
   readonly permissions: IrPermissions;
@@ -590,6 +635,8 @@ export type IrManagedV0 = {
   readonly failureTaxonomy?: IrFailureTaxonomy;
   /** Item 27 — run-level spend cap + degradation ladder. Optional. */
   readonly budget?: IrBudget;
+  /** #53 cross-session memory config. Optional; absent when the spec omits `memory`. */
+  readonly memory?: IrMemory;
 };
 
 /**
@@ -789,6 +836,8 @@ export type IrResearchV0 = {
   readonly compaction: IrCompaction;
   /** Section 55 (Track A) — named failure taxonomy. Optional. */
   readonly failureTaxonomy?: IrFailureTaxonomy;
+  /** #53 cross-session memory config. Optional; absent when the spec omits `memory`. */
+  readonly memory?: IrMemory;
   /** §47 cross-cutting blockchain subsystem (slice 0). All optional. */
   readonly chains?: readonly IrChainBinding[];
   readonly wallets?: readonly IrWalletBinding[];
