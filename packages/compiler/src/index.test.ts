@@ -2064,3 +2064,338 @@ agent:
     ).toThrow();
   });
 });
+
+describe("lower — provider failover chain (item 22: model_fallbacks + circuit_breaker)", () => {
+  const CLI_FAILOVER_SPEC = `
+name: hello
+target: cli
+agent:
+  model: claude-sonnet-4-6
+  instructions: be helpful
+  model_fallbacks:
+    - openai/gpt-4o-mini
+    - bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0
+  circuit_breaker:
+    failureThreshold: 3
+    windowMs: 30000
+    cooldownMs: 15000
+`;
+
+  test("lowers cli agent.model_fallbacks + agent.circuit_breaker verbatim", () => {
+    const ir = lower(parseSpec(CLI_FAILOVER_SPEC));
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect(ir.agent.modelFallbacks).toEqual([
+      "openai/gpt-4o-mini",
+      "bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+    ]);
+    expect(ir.agent.circuitBreaker).toEqual({
+      failureThreshold: 3,
+      windowMs: 30000,
+      cooldownMs: 15000,
+    });
+  });
+
+  test("both fields stay ABSENT from the IR when the spec omits them", () => {
+    const ir = lower(parseSpec(MINIMAL_SPEC));
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect("modelFallbacks" in ir.agent).toBe(false);
+    expect("circuitBreaker" in ir.agent).toBe(false);
+  });
+
+  test("circuit_breaker alone lowers without model_fallbacks (single-adapter breaker)", () => {
+    const ir = lower(
+      parseSpec(`
+name: hello
+target: cli
+agent:
+  model: claude-sonnet-4-6
+  instructions: be helpful
+  circuit_breaker:
+    failureThreshold: 2
+`),
+    );
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect(ir.agent.modelFallbacks).toBeUndefined();
+    expect(ir.agent.circuitBreaker).toEqual({ failureThreshold: 2 });
+  });
+
+  test("channel agent block lowers the same fields", () => {
+    const ir = lower(
+      parseSpec(`
+name: hello-channel
+target: channel
+agent:
+  model: claude-sonnet-4-6
+  instructions: be a good bot
+  model_fallbacks:
+    - openai/gpt-4o-mini
+  circuit_breaker:
+    cooldownMs: 5000
+channels:
+  slack:
+    botToken: $SLACK_BOT_TOKEN
+    signingSecret: $SLACK_SIGNING_SECRET
+routing:
+  sessionKey: thread
+`),
+    );
+    if (ir.target !== "channel") throw new Error("unexpected target");
+    expect(ir.agent.modelFallbacks).toEqual(["openai/gpt-4o-mini"]);
+    expect(ir.agent.circuitBreaker).toEqual({ cooldownMs: 5000 });
+  });
+
+  test("managed agent block lowers the same fields", () => {
+    const ir = lower(
+      parseSpec(`
+name: mg
+target: managed
+agent:
+  model: claude-sonnet-4-6
+  instructions: i
+  model_fallbacks:
+    - openai/gpt-4o-mini
+tenants:
+  - id: t1
+    budget:
+      maxInputTokens: 1000
+      maxOutputTokens: 2000
+`),
+    );
+    if (ir.target !== "managed") throw new Error("unexpected target");
+    expect(ir.agent.modelFallbacks).toEqual(["openai/gpt-4o-mini"]);
+    expect(ir.agent.circuitBreaker).toBeUndefined();
+  });
+
+  test("spec/IR/codegen round-trip: compiled cli bundle threads both fields into runChatLoop", () => {
+    const bundle = compile(CLI_FAILOVER_SPEC);
+    const agentTs = bundle.files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agentTs).toContain(
+      'modelFallbacks: ["openai/gpt-4o-mini", "bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0"],',
+    );
+    expect(agentTs).toContain(
+      'circuitBreaker: {"failureThreshold":3,"windowMs":30000,"cooldownMs":15000},',
+    );
+  });
+
+  test("rejects an empty model_fallbacks list and unknown circuit_breaker keys", () => {
+    expect(() =>
+      parseSpec(
+        "name: hello\ntarget: cli\nagent:\n  model: m\n  instructions: i\n  model_fallbacks: []\n",
+      ),
+    ).toThrow();
+    expect(() =>
+      parseSpec(
+        "name: hello\ntarget: cli\nagent:\n  model: m\n  instructions: i\n  circuit_breaker:\n    halfOpenProbes: 2\n",
+      ),
+    ).toThrow();
+    expect(() =>
+      parseSpec(
+        "name: hello\ntarget: cli\nagent:\n  model: m\n  instructions: i\n  circuit_breaker:\n    failureThreshold: 0\n",
+      ),
+    ).toThrow();
+  });
+});
+
+describe("lower/emit — switch-model recovery action + failureTaxonomy codegen (item 23)", () => {
+  const SWITCH_MODEL_SPEC = `
+name: resilient
+target: cli
+agent:
+  model: claude-sonnet-4-6
+  instructions: be resilient
+  model_fallbacks:
+    - openai/gpt-4o-mini
+failure_taxonomy:
+  - class: provider_overloaded
+    pattern: "/(429|529|overloaded)/i"
+    recovery: switch-model
+    hint: provider is degraded — routing to the fallback
+`;
+
+  test("lowers a switch-model recovery entry verbatim", () => {
+    const ir = lower(parseSpec(SWITCH_MODEL_SPEC));
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect(ir.failureTaxonomy).toEqual([
+      {
+        class: "provider_overloaded",
+        pattern: "/(429|529|overloaded)/i",
+        recovery: "switch-model",
+        hint: "provider is degraded — routing to the fallback",
+      },
+    ]);
+  });
+
+  test("rejects an unknown recovery action (strict enum still holds)", () => {
+    expect(() =>
+      parseSpec(
+        "name: c\ntarget: cli\nagent:\n  model: m\n  instructions: i\nfailure_taxonomy:\n  - class: x\n    pattern: y\n    recovery: teleport\n",
+      ),
+    ).toThrow();
+  });
+
+  test("compiled cli bundle threads failureTaxonomy (incl. switch-model) into runChatLoop", () => {
+    const bundle = compile(SWITCH_MODEL_SPEC);
+    const agentTs = bundle.files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agentTs).toContain('"recovery":"switch-model"');
+    expect(agentTs).toContain("failureTaxonomy:");
+    // And the failover chain the switch reroutes onto is present too.
+    expect(agentTs).toContain('modelFallbacks: ["openai/gpt-4o-mini"],');
+  });
+
+  test("compiled cli bundle omits failureTaxonomy when the spec has none", () => {
+    const agentTs =
+      compile("name: c\ntarget: cli\nagent:\n  model: m\n  instructions: i\n").files.find(
+        (f) => f.path === "agent.ts",
+      )?.content ?? "";
+    expect(agentTs).not.toContain("failureTaxonomy:");
+  });
+});
+
+describe("lower/emit — run-level budget cap + degradation ladder (item 27)", () => {
+  test("lowers budget.usd → usdMicros (×1e6) and on_exceed.action → onExceed.kind (stop)", () => {
+    const ir = lower(
+      parseSpec(`
+name: capped
+target: cli
+agent:
+  model: claude-sonnet-4-6
+  instructions: i
+budget:
+  usd: 5.50
+  on_exceed:
+    action: stop
+`),
+    );
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect(ir.budget).toEqual({ usdMicros: 5_500_000, onExceed: { kind: "stop" } });
+  });
+
+  test("lowers a degrade ladder verbatim", () => {
+    const ir = lower(
+      parseSpec(`
+name: capped
+target: cli
+agent:
+  model: claude-opus-4-1
+  instructions: i
+budget:
+  usd: 10
+  on_exceed:
+    action: degrade
+    model: claude-haiku-4-5
+`),
+    );
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect(ir.budget).toEqual({
+      usdMicros: 10_000_000,
+      onExceed: { kind: "degrade", model: "claude-haiku-4-5" },
+    });
+  });
+
+  test("on_exceed defaults to stop when omitted", () => {
+    const ir = lower(
+      parseSpec("name: c\ntarget: cli\nagent:\n  model: m\n  instructions: i\nbudget:\n  usd: 1\n"),
+    );
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect(ir.budget?.onExceed).toEqual({ kind: "stop" });
+  });
+
+  test("budget is absent from the IR when the spec omits it", () => {
+    const ir = lower(parseSpec(MINIMAL_SPEC));
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect("budget" in ir).toBe(false);
+  });
+
+  test("channel + managed agent shapes accept the budget block", () => {
+    const channel = lower(
+      parseSpec(`
+name: bot
+target: channel
+agent:
+  model: m
+  instructions: i
+budget:
+  usd: 2
+  on_exceed:
+    action: degrade
+    model: openai/gpt-4o-mini
+channels:
+  slack:
+    botToken: $T
+    signingSecret: $S
+routing:
+  sessionKey: thread
+`),
+    );
+    if (channel.target !== "channel") throw new Error("unexpected target");
+    expect(channel.budget).toEqual({
+      usdMicros: 2_000_000,
+      onExceed: { kind: "degrade", model: "openai/gpt-4o-mini" },
+    });
+
+    const managed = lower(
+      parseSpec(`
+name: mg
+target: managed
+agent:
+  model: m
+  instructions: i
+budget:
+  usd: 3
+tenants:
+  - id: t1
+    budget:
+      maxInputTokens: 1
+      maxOutputTokens: 1
+`),
+    );
+    if (managed.target !== "managed") throw new Error("unexpected target");
+    // The run-level budget is distinct from the per-tenant token budget.
+    expect(managed.budget).toEqual({ usdMicros: 3_000_000, onExceed: { kind: "stop" } });
+    expect(managed.tenants[0]?.budget).toEqual({ maxInputTokens: 1, maxOutputTokens: 1 });
+  });
+
+  test("rejects a non-positive usd and an unknown on_exceed action", () => {
+    expect(() =>
+      parseSpec("name: c\ntarget: cli\nagent:\n  model: m\n  instructions: i\nbudget:\n  usd: 0\n"),
+    ).toThrow();
+    expect(() =>
+      parseSpec(
+        "name: c\ntarget: cli\nagent:\n  model: m\n  instructions: i\nbudget:\n  usd: 1\n  on_exceed:\n    action: explode\n",
+      ),
+    ).toThrow();
+    // degrade requires a model.
+    expect(() =>
+      parseSpec(
+        "name: c\ntarget: cli\nagent:\n  model: m\n  instructions: i\nbudget:\n  usd: 1\n  on_exceed:\n    action: degrade\n",
+      ),
+    ).toThrow();
+  });
+
+  test("compiled cli bundle threads the budget into runChatLoop", () => {
+    const agentTs =
+      compile(`
+name: capped
+target: cli
+agent:
+  model: claude-opus-4-1
+  instructions: i
+budget:
+  usd: 10
+  on_exceed:
+    action: degrade
+    model: claude-haiku-4-5
+`).files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agentTs).toContain('"usdMicros":10000000');
+    expect(agentTs).toContain('"kind":"degrade"');
+    expect(agentTs).toContain('"model":"claude-haiku-4-5"');
+  });
+
+  test("compiled cli bundle omits budget when the spec has none", () => {
+    const agentTs =
+      compile("name: c\ntarget: cli\nagent:\n  model: m\n  instructions: i\n").files.find(
+        (f) => f.path === "agent.ts",
+      )?.content ?? "";
+    expect(agentTs).not.toContain("budget:");
+  });
+});

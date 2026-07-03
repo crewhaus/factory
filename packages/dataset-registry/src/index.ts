@@ -70,7 +70,14 @@ function ensureSafe(name: string, regex: RegExp, kind: string): void {
   }
 }
 
-function hashSample(s: Sample): string {
+/**
+ * Content hash of a single Sample — the per-sample provenance identity folded
+ * into a record's `sampleHashes` (and, via `overallDatasetHash`, the run-index
+ * datasetHash). Exported additively so callers that reconcile against stored
+ * samples (e.g. the CLI `dataset refresh-goldens`) can line their hashes up
+ * with what `put` recorded, instead of re-deriving a divergent sha.
+ */
+export function hashSample(s: Sample): string {
   return createHash("sha256").update(JSON.stringify(s)).digest("hex").slice(0, 16);
 }
 

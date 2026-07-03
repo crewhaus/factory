@@ -213,6 +213,50 @@ function providerEnvGroups(model: string): string[][] {
   }
 }
 
+/**
+ * Item 22 — render the failover-chain runChatLoop fields from the IR agent
+ * block, indented for the generated `createAgent` body. Empty when the spec
+ * declared neither field so existing bundles stay byte-identical. NOTE: the
+ * startup env check (`providerEnvGroups`) intentionally covers ONLY the
+ * primary model — fallback credentials resolve lazily and a missing one
+ * warns at boot instead of failing it. Mirror: target-cli + target-managed
+ * render the same fields — keep the three in sync.
+ */
+function renderModelFailoverFields(ir: IrChannelV0): string {
+  const pieces: string[] = [];
+  const fallbacks = ir.agent.modelFallbacks;
+  if (fallbacks !== undefined && fallbacks.length > 0) {
+    pieces.push(
+      `\n        modelFallbacks: [${fallbacks.map((m) => escapeJsonString(m)).join(", ")}],`,
+    );
+  }
+  if (ir.agent.circuitBreaker !== undefined) {
+    pieces.push(`\n        circuitBreaker: ${JSON.stringify(ir.agent.circuitBreaker)},`);
+  }
+  return pieces.join("");
+}
+
+/**
+ * Section 55 / item 23 — render the `failureTaxonomy` runChatLoop field,
+ * indented for the generated `createAgent` body. Empty when the spec omits
+ * the block. Mirror: target-cli + target-managed render the same field.
+ */
+function renderFailureTaxonomyField(ir: IrChannelV0): string {
+  const taxonomy = ir.failureTaxonomy;
+  if (taxonomy === undefined || taxonomy.length === 0) return "";
+  return `\n        failureTaxonomy: ${JSON.stringify(taxonomy)},`;
+}
+
+/**
+ * Item 27 — render the `budget` runChatLoop field, indented for the
+ * generated `createAgent` body. Empty when the spec omits it. Mirror:
+ * target-cli + target-managed render the same field.
+ */
+function renderBudgetField(ir: IrChannelV0): string {
+  if (ir.budget === undefined) return "";
+  return `\n        budget: ${JSON.stringify(ir.budget)},`;
+}
+
 function renderPermissionsField(ir: IrChannelV0): string {
   const { mode, rules } = ir.permissions;
   if (mode === undefined && rules.length === 0) return "";
@@ -385,7 +429,7 @@ export function createAgent(config: AgentConfig): Agent {
       const __inbound = await classifyInbound(args.message, runContext, { origin: "channel" });
       return await runChatLoop({
         model: ${escapeJsonString(ir.agent.model)},
-        instructions: ${escapeJsonString(ir.agent.instructions)},
+        instructions: ${escapeJsonString(ir.agent.instructions)},${renderModelFailoverFields(ir)}${renderFailureTaxonomyField(ir)}${renderBudgetField(ir)}
         sessionName: ${escapeJsonString(ir.name)},
         sessionTarget: "channel",
         ...(config.sessionRootDir !== undefined ? { sessionRootDir: config.sessionRootDir } : {}),

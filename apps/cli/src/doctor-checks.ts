@@ -140,6 +140,21 @@ function statusFor(provider: DoctorProviderId, env: NodeJS.ProcessEnv): EnvStatu
   }
 }
 
+/**
+ * Item 13 — online/offline mode selection for `crewhaus scaffold-evals`:
+ * true when the provider `model` routes to has visibly satisfied credentials
+ * (shares `statusFor` with the doctor checks, so the two never disagree).
+ * Unparseable model strings return false — the scaffold then stays on its
+ * deterministic template path instead of attempting a doomed call. Note the
+ * bedrock check is env-visible only (the AWS SDK's default chain may still
+ * work); scaffold prefers the safe offline mode in that ambiguity.
+ */
+export function providerCredentialsSatisfied(model: string, env: NodeJS.ProcessEnv): boolean {
+  const provider = selectedProvider(model);
+  if (provider === undefined) return false;
+  return statusFor(provider, env).satisfied;
+}
+
 const PROVIDER_LABEL: Record<DoctorProviderId, string> = {
   anthropic: "Anthropic credentials",
   openai: "OpenAI credentials",
@@ -147,6 +162,27 @@ const PROVIDER_LABEL: Record<DoctorProviderId, string> = {
   bedrock: "Bedrock (AWS) credentials",
   local: "Local endpoint",
 };
+
+/**
+ * Item 40 — the canonical env var(s) `doctor --fix` stubs into `.env` for a
+ * provider whose credential check is failing. One representative name per
+ * provider (the first the status check reads); bedrock/local need no stub
+ * (bedrock uses the SDK default chain; local bakes the URL into the model
+ * string), so they map to []. Kept next to the status tables so the stub set
+ * can't drift from what the checks actually probe.
+ */
+const PROVIDER_ENV_STUBS: Record<DoctorProviderId, readonly string[]> = {
+  anthropic: ["ANTHROPIC_API_KEY"],
+  openai: ["OPENAI_API_KEY"],
+  gemini: ["GEMINI_API_KEY"],
+  bedrock: [],
+  local: [],
+};
+
+/** Env var names `doctor --fix` should stub for a selected provider. */
+export function providerEnvStubs(provider: DoctorProviderId): readonly string[] {
+  return PROVIDER_ENV_STUBS[provider];
+}
 
 /** Providers whose env check is INFORMATIONAL even when selected: the AWS
  *  SDK's default credential chain is authoritative for bedrock (env vars are

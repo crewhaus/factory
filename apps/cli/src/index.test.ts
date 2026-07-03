@@ -690,6 +690,53 @@ describe("crewhaus doctor", () => {
   });
 });
 
+// F2 (post-#41 fix) — `lint --fix`'s nearest-match tool-name correction must
+// not silently cross a read-only/mutating capability boundary. "Reit" is
+// Levenshtein-2 from BOTH the read-only built-in `Read` and the mutating
+// built-in `Edit`; a plain alphabetical tie-break would previously pick one
+// (Edit, alphabetically first) without the author ever consenting to a
+// mutating tool being substituted for a typo. Run from REPO_ROOT so
+// loadToolMap() resolves the real built-in tool packages (Read/Edit/Write
+// among them).
+describe("crewhaus lint --fix — cross-capability tool-name guard (item 41 fix)", () => {
+  test("a typo equidistant from a read-only and a mutating tool is NOT auto-applied; prints a suggestion", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    const original =
+      "name: t\ntarget: cli\nagent:\n  model: m\n  instructions: hi\n  tools:\n    - Reit\n";
+    writeFileSync(specPath, original);
+    const result = await runCli(["lint", specPath, "--fix"], {
+      cwd: REPO_ROOT,
+      env: { ANTHROPIC_API_KEY: "test" },
+    });
+    // Not auto-fixed: the spec on disk is byte-for-byte unchanged.
+    expect(readFileSync(specPath, "utf-8")).toBe(original);
+    // A suggestion is printed naming both candidates, not a silent rewrite.
+    expect(result.stdout).toContain("suggestion:");
+    expect(result.stdout).toContain("Reit");
+    expect(result.stdout).toContain("Read");
+    expect(result.stdout).toContain("Edit");
+    expect(result.stdout).toContain("ambiguous");
+    expect(result.stdout).not.toContain("fixed: tool");
+  });
+
+  test("an unambiguous tool-name typo still auto-fixes", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    // "Reed" is close to "Read" only (far from Edit/Write) — no capability
+    // ambiguity, so --fix should still rewrite it in place.
+    writeFileSync(
+      specPath,
+      "name: t\ntarget: cli\nagent:\n  model: m\n  instructions: hi\n  tools:\n    - Reed\n",
+    );
+    const result = await runCli(["lint", specPath, "--fix"], {
+      cwd: REPO_ROOT,
+      env: { ANTHROPIC_API_KEY: "test" },
+    });
+    expect(result.stdout).toContain('fixed: tool "Reed" → "Read" (nearest match)');
+    expect(readFileSync(specPath, "utf-8")).toContain("- Read");
+    expect(readFileSync(specPath, "utf-8")).not.toContain("Reed");
+  });
+});
+
 // ---------------------------------------------------------------------------
 // FR-003 — `crewhaus optimize --budget-usd` (cost budget gate).
 // Closes the affected-package coverage the FR implies: the flag's
@@ -781,6 +828,25 @@ describe("crewhaus optimize --budget-usd", () => {
     const result = await runCli(["optimize", "--help"]);
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("--budget-usd");
+  });
+
+  // Item 27 — `crewhaus run --budget-usd` (run-level spend cap). The
+  // invalid-value branch dies before any model call, so it is testable
+  // without credentials.
+  test("run rejects --budget-usd 0 (non-positive) via die()", async () => {
+    const result = await runCli(["run", HELLO_SPEC, "--budget-usd", "0"], {
+      env: { ANTHROPIC_API_KEY: "test-no-call" },
+    });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("invalid --budget-usd");
+  });
+
+  test("run rejects a non-numeric --budget-usd via die()", async () => {
+    const result = await runCli(["run", HELLO_SPEC, "--budget-usd", "lots"], {
+      env: { ANTHROPIC_API_KEY: "test-no-call" },
+    });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("invalid --budget-usd");
   });
 
   // F4 — the fitness evals silently inherited the runner's retry with no

@@ -9,7 +9,9 @@
     { "path": "../adapter-bedrock" },
     { "path": "../adapter-gemini" },
     { "path": "../adapter-openai" },
-    { "path": "../errors" }
+    { "path": "../circuit-breaker" },
+    { "path": "../errors" },
+    { "path": "../trace-event-bus" }
   ],
   "include": ["src/**/*"]
 }

@@ -11,6 +11,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { createInterface } from "node:readline";
 import type { SubAgentDefinition } from "@crewhaus/agent-context-isolation";
 import { SpecParseError, compile, lower } from "@crewhaus/compiler";
 import { buildContextBundle, discoverRoots } from "@crewhaus/context-bundle";
@@ -48,7 +49,7 @@ import {
   type ParsedArgs,
   parseArgs,
 } from "@crewhaus/infra-utils";
-import { GENERATED_README_MARKER } from "@crewhaus/ir";
+import { GENERATED_README_MARKER, type IrBudget } from "@crewhaus/ir";
 import { createLogger } from "@crewhaus/logging";
 import { McpHost } from "@crewhaus/mcp-host";
 import {
@@ -166,6 +167,22 @@ import {
   buildContextPressureReport,
   formatContextPressureLines,
 } from "./context-pressure";
+// Item 2 — `crewhaus dataset mine` + `dataset synthesize`: grow the dataset
+// from production struggle signals + PII-redacted stress variants, in a
+// side-effect-free module so it is unit-testable (this entry file runs an argv
+// switch on import).
+import {
+  type MineCandidate,
+  SYNTHESIZE_PII_DETECTORS,
+  buildStressVariants,
+  candidateToSample,
+  dedupeCandidates,
+  egressBlocksFromAudit,
+  mineSession,
+  parseReviewKey,
+  renderCandidateList,
+  variantToSample,
+} from "./dataset-mine";
 // Item 12 — dataset-registry CLI plumbing (the `datasets` subcommand family,
 // `distill --register` promotion, and the `--dataset registry:` shorthand
 // shared by eval + optimize), in a side-effect-free module so it is
@@ -187,7 +204,32 @@ import {
 // it is unit-testable (this entry file runs an argv switch on import).
 // Item 61 added the channel-target env check (only fires when the cwd spec
 // lowers to a channel IR).
-import { buildChannelEnvChecks, buildCredentialChecks, extractSpecModel } from "./doctor-checks";
+import {
+  buildChannelEnvChecks,
+  buildCredentialChecks,
+  extractSpecModel,
+  providerCredentialsSatisfied,
+  providerEnvStubs,
+  selectedProvider,
+} from "./doctor-checks";
+// Item 40 — `doctor --detect` (read-only inventory) and `doctor --fix`
+// (mechanical remediation) live in side-effect-free modules so this entry file
+// (which runs an argv switch on import) stays testable.
+import {
+  type FetchLike,
+  buildInventory,
+  claudeDesktopConfigPath,
+  formatInventory,
+} from "./doctor-detect";
+import {
+  type FixAction,
+  type FixFs,
+  formatFixPlan,
+  planCrewhausDirs,
+  planEnvStubs,
+  planScaffoldSpec,
+  planScopeFix,
+} from "./doctor-fix";
 // FR-006 — Pillar 3 sink-side egress-matcher selection (the substring/semantic
 // selector lowered to ir.security.egressMatcher). Side-effect-free + lazily
 // imports the optional semantic package only when "semantic" is selected, so
@@ -199,6 +241,21 @@ import {
   createEgressMatcher,
   resolveEgressMatcherChoice,
 } from "./egress-matcher";
+// Item 6 — `crewhaus eval coverage`: production-vs-eval behavior gap
+// detection, in a side-effect-free module so it is unit-testable (this entry
+// file runs an argv switch on import).
+import {
+  type CoverageSample,
+  DEFAULT_COVERAGE_SESSIONS,
+  EvalCoverageError,
+  buildEvalCoverage,
+  buildProdBehavior,
+  computeCoverage,
+  coverageFileName,
+  parseCoverageFormat,
+  parseSessionsFlag,
+  renderCoverage,
+} from "./eval-coverage";
 // Run-history item 3 — post-eval index append + baseline diff/gate/promote,
 // in a side-effect-free module so it is unit-testable (this entry file runs
 // an argv switch on import).
@@ -229,6 +286,8 @@ import {
   distill as distillFeedback,
   extractFeedbackRecords,
   gradersConfigToYaml,
+  mergeFeedback,
+  normalizeRating,
   samplesToJsonl,
 } from "./feedback";
 // Item 45 — `crewhaus flywheel init|run`: the packaged nightly
@@ -253,6 +312,54 @@ import {
   scaffoldWorkflowFile,
   specIsDirty,
 } from "./flywheel";
+// Item 4 — `crewhaus graders suggest`: deterministic failure-rationale
+// clustering + draft grader suites (plus the pure halves of the
+// model-drafted llm_judge rubric), in a side-effect-free module so it is
+// unit-testable (this entry file runs an argv switch on import).
+import {
+  DEFAULT_SUGGESTED_GRADERS_FILE,
+  DEFAULT_SUGGEST_RUNS,
+  FLOOR_GRADER_HINT,
+  type FailureEvidence,
+  GradersSuggestError,
+  type PassExemplar,
+  RUBRIC_SUGGESTION_SYSTEM,
+  type RunsSelector,
+  type SuggestedGrader,
+  buildRubricSuggestionPrompt,
+  clusterFailures,
+  draftGradersForThemes,
+  evidenceFromFeedback,
+  evidenceFromRun,
+  isFloorGraderConfig,
+  parseRubricSuggestion,
+  parseRunsFlag,
+  renderSuggestedGradersYaml,
+} from "./graders-suggest";
+// Item 39 — `crewhaus init --interactive`: the harness-designer interview
+// (validate-and-retry loop + scripted no-credentials fallback) in a
+// side-effect-free module so this entry file stays testable.
+import {
+  EMIT_SPEC_TOOL,
+  type ScriptedAnswers,
+  type ScriptedShape,
+  buildInterviewSystemPrompt,
+  buildScriptedSpec,
+  isScriptedShape,
+  runInterview,
+} from "./init-interactive";
+// Item 8 — `crewhaus judge calibrate`: pair human ratings with llm_judge
+// scores and compute agreement/bias/ROC-cut, in a side-effect-free module so
+// the statistics are unit-testable (this entry file runs an argv switch on
+// import).
+import {
+  type CalibrationPair,
+  DEFAULT_JUDGE_CUT,
+  type JudgeCalibrationFile,
+  buildCalibrationCard,
+  buildCalibrationFile,
+  renderCalibrationCard,
+} from "./judge-calibrate";
 // FR-004 — Pillar 3 intent-gate judge + durable audit-sink resolution, in a
 // side-effect-free module so it is unit-testable (this entry file runs an
 // argv switch on import).
@@ -263,6 +370,18 @@ import {
   openJustificationAuditSink,
   resolveJudgeChoice,
 } from "./justification-gate";
+// Item 41 — `crewhaus lint` (parse + ir-passes collect-all + scope audit) and
+// `compile --watch` (debounced re-validate loop) live in side-effect-free
+// modules so this entry file stays testable.
+import {
+  type LintResult,
+  formatLintJson,
+  formatLintText,
+  nearestToolName,
+  runLint,
+  suggestSafeName,
+  suggestSecretFix,
+} from "./lint";
 // Item 16 — `crewhaus permissions suggest` (mine persisted ask/deny history
 // into reviewable settings.json permission rules), in a side-effect-free
 // module so it is unit-testable (this entry file runs an argv switch on
@@ -279,6 +398,16 @@ import {
   rankSuggestions,
   readOnlyByName,
 } from "./permissions-suggest";
+// Item 5 — `crewhaus dataset refresh-goldens`: reconcile user corrections +
+// up-rated turns against an existing dataset's golds, proposing (or applying
+// as a NEW version) updated golds. Side-effect-free so it is unit-testable.
+import {
+  DEFAULT_REFRESH_MIN_SCORE,
+  type RunSampleOutcome,
+  applyProposals,
+  reconcileGoldens,
+  renderProposals,
+} from "./refresh-goldens";
 // Item 9 — per-spec regression suite: post-accept pinning of optimize
 // recoveries + the eval-side default union, in a side-effect-free module so
 // it is unit-testable (this entry file runs an argv switch on import).
@@ -301,6 +430,28 @@ import {
   runRetentionPurge,
   runRetentionSweep,
 } from "./retention";
+// Item 13 — `crewhaus scaffold-evals` + `init --with-evals`: day-one eval
+// assets generated from the spec (deterministic template / one-shot model
+// sample stubs + a single spec-goal llm_judge or floor grader), in a
+// side-effect-free module so it is unit-testable (this entry file runs an
+// argv switch on import).
+import {
+  DEFAULT_SCAFFOLD_SAMPLES,
+  SCAFFOLD_GENERATION_SYSTEM,
+  SCAFFOLD_GRADERS_HEADER,
+  ScaffoldEvalsError,
+  type ScaffoldGenerator,
+  type ScaffoldInfo,
+  buildSampleGenerationPrompt,
+  buildScaffoldGraders,
+  buildScaffoldSamples,
+  checkNoOverwrite,
+  extractScaffoldInfo,
+  feedbackBlockSuggestion,
+  mergeInputs,
+  parseModelSampleInputs,
+  templateSampleInputs,
+} from "./scaffold-evals";
 // FR-002 — Pillar 3 sink-side scope gate, shared by `compile --strict` and
 // `doctor --philosophy-alignment`. Kept in a side-effect-free module so it is
 // unit-testable (this entry file runs an argv switch on import).
@@ -371,9 +522,14 @@ import {
   tapSamples,
   triageFitnessSamples,
 } from "./triage";
+// Item 43 — `crewhaus upgrade`: single-spec version-drift detection + validated
+// migration chain, in a side-effect-free module so this entry file stays
+// testable.
+import { formatUpgradePlan, makeSpecValidator, planUpgrade } from "./upgrade";
 // CLI version resolution (embedded --define constant → package.json), shared
 // with compile-check.ts's dependency pinning.
 import { cliVersion } from "./version";
+import { type Watcher, createWatchController, formatCycleLine } from "./watch";
 
 /**
  * crewhaus — slice-scope CLI.
@@ -422,6 +578,22 @@ const COMPILE_SCHEMA: ParseArgsSchema = {
     // spec-registry (with a distilled CHANGELOG.md entry) is DEFAULT-ON;
     // this is the explicit opt-out.
     { name: "no-register", takesValue: false },
+    // Item 41 — re-run parse→lint→compile on every change to the spec /
+    // .crewhaus/commands / skills dirs (the watch mode the header listed as
+    // "future"). Debounced, Ctrl-C-clean, one green/red status per cycle.
+    { name: "watch", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
+// Item 41 — `crewhaus lint [--fix] [--format text|json]`: a check-only command
+// running parseSpec + compile({applyIrPasses:true}) + auditToolScopes WITHOUT
+// emitting, so §47 chain / graph-crew well-formedness checks (skipped on the
+// CLI compile path) surface for authors.
+const LINT_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "fix", takesValue: false },
+    { name: "format", takesValue: true },
     { name: "help", short: "h" },
   ],
 };
@@ -449,6 +621,15 @@ const RUN_SCHEMA: ParseArgsSchema = {
     // @crewhaus/embedder prefix grammar, e.g. openai/text-embedding-3-small,
     // mock/deterministic). Flag > CREWHAUS_EGRESS_EMBEDDER env > default.
     { name: "egress-embedder", takesValue: true },
+    // Item 41 — re-validate (parse→lint→compile-in-memory) on every change to
+    // the spec / .crewhaus/commands / skills dirs, printing a green/red status
+    // per cycle. A pre-run authoring aid; it does NOT re-launch the agent.
+    { name: "watch", takesValue: false },
+    // Item 27 — run-level spend cap in dollars. Sets/overrides the spec
+    // `budget.usd` ceiling and keeps the spec's on_exceed ladder (default
+    // `stop`). On reaching the cap the run stops (or degrades) before the
+    // next turn.
+    { name: "budget-usd", takesValue: true },
     { name: "help", short: "h" },
   ],
 };
@@ -468,8 +649,60 @@ const INIT_SCHEMA: ParseArgsSchema = {
     // an existing harness: `init --ci` in a dir that already has a
     // crewhaus.yaml adds just the workflow.
     { name: "ci", takesValue: false },
-    // Overwrite an existing scaffolded workflow (never the spec).
+    // Item 13 — also scaffold eval/dataset.jsonl + eval/graders.yaml (the
+    // flywheel's conventional paths) in OFFLINE template mode, so a fresh
+    // harness can `crewhaus eval` on day one. Composable with an existing
+    // harness like --ci: `init --with-evals` adds just the eval assets.
+    { name: "with-evals", takesValue: false },
+    // Overwrite an existing scaffolded workflow or eval assets (never the
+    // spec).
     { name: "force", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
+// Item 13 — `crewhaus scaffold-evals`: starter eval assets FROM the spec.
+const SCAFFOLD_EVALS_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "out", short: "o", takesValue: true },
+    { name: "samples", takesValue: true },
+    // Model for the one-shot sample-input generation call (model-router
+    // grammar); also baked into the emitted llm_judge grader. Without it the
+    // spec's own agent.model is used when its credentials are visible, else
+    // the deterministic template fallback.
+    { name: "model", takesValue: true },
+    // Overwrite existing eval assets (default: refuse).
+    { name: "force", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
+// Item 4 — `crewhaus graders suggest`: draft grader suites from failure
+// rationale accumulated in recent eval runs + user feedback.
+const GRADERS_SUGGEST_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // A run dir, or `last:N` (default: the last 10 indexed runs for the cwd
+    // spec — the item-3 run-history index).
+    { name: "runs", takesValue: true },
+    // Model for the one-shot llm_judge rubric draft from real good/bad
+    // exemplars (model-router grammar). Without it the cwd spec's model is
+    // used when its credentials are visible; else deterministic-only output.
+    { name: "model", takesValue: true },
+    { name: "out", short: "o", takesValue: true },
+    // Override the run-index spec filter (default: the cwd crewhaus.yaml's
+    // name when parseable, else unfiltered).
+    { name: "spec", takesValue: true },
+    // Rating threshold splitting up-rated exemplars from failure evidence
+    // (mirrors `distill --min-score`).
+    { name: "min-score", takesValue: true },
+    // Overwrite an existing review file (default: refuse).
+    { name: "force", takesValue: false },
+    // Item 39 — interactive spec authoring: interview the user (via the
+    // resolved model, or a scripted stdin questionnaire when no credentials)
+    // and emit a parseSpec-validated crewhaus.yaml. Composes with --detect to
+    // prefill the model from what's reachable.
+    { name: "interactive", short: "i", takesValue: false },
+    { name: "detect", takesValue: false },
     { name: "help", short: "h" },
   ],
 };
@@ -495,6 +728,17 @@ const DOCTOR_SCHEMA: ParseArgsSchema = {
     { name: "context-pressure", takesValue: false },
     // How many most-recent sessions --context-pressure scans (default 20).
     { name: "sessions", takesValue: true },
+    // Item 40 — `--detect`: read-only inventory of reachable providers, the
+    // local Ollama/vLLM endpoint's models, and MCP servers from
+    // .mcp.json / Claude Desktop config. `--no-probe` skips the localhost HTTP
+    // probe (offline / CI).
+    { name: "detect", takesValue: false },
+    { name: "no-probe", takesValue: false },
+    // Item 40 — `--fix`: apply the mechanical remediations doctor otherwise
+    // only prints (scaffold crewhaus.yaml, create .crewhaus/, mark outward
+    // tools scope:external, append commented .env stubs). Dry-run is the
+    // DEFAULT: without --fix, doctor prints the diff it WOULD apply.
+    { name: "fix", takesValue: false },
     { name: "help", short: "h" },
   ],
 };
@@ -604,6 +848,24 @@ const EVAL_SCHEMA: ParseArgsSchema = {
   ],
 };
 
+// Item 6 — `crewhaus eval coverage`: detect agent behaviors present in
+// production sessions that no eval sample exercises.
+const EVAL_COVERAGE_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // How many of the cwd spec's most-recent sessions to scan (default 50; `all`).
+    { name: "sessions", takesValue: true },
+    // Intersect against a dataset's expected_tools (file or registry:<ref>);
+    // defaults to the conventional eval/dataset.jsonl next to the cwd spec.
+    { name: "dataset", takesValue: true },
+    // Accepted for symmetry with the other eval-flywheel commands; unused —
+    // coverage is grader-agnostic (it intersects tool behavior, not graders).
+    { name: "graders", takesValue: true },
+    { name: "out", short: "o", takesValue: true },
+    { name: "format", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
 const EVAL_REPORT_SCHEMA: ParseArgsSchema = {
   flags: [
     { name: "out", short: "o", takesValue: true },
@@ -698,6 +960,55 @@ const DATASETS_SCHEMA: ParseArgsSchema = {
     { name: "split", takesValue: true },
     // `put` — train/dev[/test] percentages for the deterministic split.
     { name: "split-spec", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
+// Item 2 — the `dataset` (singular) growth subcommand family:
+// `dataset mine` + `dataset synthesize` (+ item-5 `dataset refresh-goldens`).
+const DATASET_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // mine — how many recent sessions to scan (default 50; `all`).
+    { name: "sessions", takesValue: true },
+    // mine — register accepted candidates into this mined registry dataset
+    // (default <spec>-hardcases).
+    { name: "out-dataset", takesValue: true },
+    // mine — accept/reject quarantined candidates (interactive in a TTY;
+    // non-TTY prints the list unless --yes is also given).
+    { name: "review", takesValue: false },
+    // mine — required in non-TTY alongside --review to promote candidates
+    // non-interactively (F3: --review alone must never silently auto-accept).
+    { name: "yes", takesValue: false },
+    // synthesize — the source dataset (file or registry:<ref>) to grow from.
+    { name: "from", takesValue: true },
+    // synthesize — how many variants to generate per source sample.
+    { name: "count", takesValue: true },
+    // synthesize — dollar cap for model paraphrases (budget-gate pattern).
+    { name: "budget-usd", takesValue: true },
+    // refresh-goldens (item 5) — the dataset whose golds to reconcile.
+    { name: "dataset", takesValue: true },
+    { name: "min-score", takesValue: true },
+    { name: "apply", takesValue: false },
+    // Model for synthesize paraphrases / refresh (model-router grammar).
+    { name: "model", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
+// Item 8 — `crewhaus judge calibrate`: pair human ratings with llm_judge
+// scores over the rated transcript turns.
+const JUDGE_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // The dataset providing sample context for the judge (file or registry).
+    { name: "dataset", takesValue: true },
+    // A graders.yaml whose llm_judge rubric to calibrate (else a default rubric).
+    { name: "graders", takesValue: true },
+    // How many recent sessions' rated turns to calibrate against (default 50; `all`).
+    { name: "sessions", takesValue: true },
+    // The judge model (model-router grammar); default claude-sonnet-4-5.
+    { name: "model", takesValue: true },
+    // Persist the calibrated --min-score default to .crewhaus/judge-calibration.json.
+    { name: "apply", takesValue: false },
     { name: "help", short: "h" },
   ],
 };
@@ -830,6 +1141,13 @@ const MIGRATE_SCHEMA: ParseArgsSchema = {
   ],
 };
 
+// Item 43 — `crewhaus upgrade`: detect the cwd spec's version drift vs the
+// current CLI's spec version, run the migration chain (validated), show a diff.
+// --dry-run (default) previews; --write applies.
+const UPGRADE_SCHEMA: ParseArgsSchema = {
+  flags: [{ name: "dry-run" }, { name: "write" }, { name: "help", short: "h" }],
+};
+
 const BUILD_IMAGE_SCHEMA: ParseArgsSchema = {
   flags: [
     { name: "tag", takesValue: true },
@@ -869,7 +1187,12 @@ function usageText(): string {
     "                  [--allow-unmarked-sinks]  opt out of the external-sink scope gate",
     "                  [--check]            verify the emitted bundle (shape assertion + install + liveness boot)",
     "  compile <spec.yaml> --emit-ir        print the lowered IR as JSON (debug)",
+    "  compile <spec.yaml> --watch          re-run parse→lint→compile on every change (item 41)",
+    "  lint [spec.yaml] [--fix]             check-only: parse + ir-passes (§47 chain / graph-crew",
+    "       [--format text|json]            well-formedness the CLI compile path skips) + scope audit,",
+    "                                       WITHOUT emitting; --fix does nearest-match/typo repairs (item 41)",
     "  run <spec.yaml> [--model <model>]    compile in-memory and execute the agent",
+    "                  [--watch]            re-validate on change (authoring aid; does not re-launch)",
     "                  [--resume <id>]      resume a specific session (cli targets only)",
     "                  [--continue]         resume the most-recent session (cli targets only)",
     "                  [--prompt <text>]    initial user prompt (browser targets; defaults to stdin)",
@@ -885,6 +1208,9 @@ function usageText(): string {
     "                                      (cells write to <out>/<model-slug>/; emits matrix.json",
     "                                      + index.html; incompatible with --gate/--no-promote)",
     "       --dataset also accepts registry:<name>[@version][#split] (Section 29 registry)",
+    "  eval coverage                        detect prod behaviors no eval sample exercises (item 6):",
+    "       [--sessions N|all] [--dataset <d>]  tool/MCP/bigram/compaction gaps ranked by prod",
+    "       [-o <dir>] [--format text|html|json] frequency; json is a backlog for `dataset mine`",
     "  eval-report diff <prev> <new>        compare two eval runs and emit a diff report",
     "       [-o <out-dir>]",
     "  eval-report history                  list recorded runs (.crewhaus/evals/index.jsonl)",
@@ -909,13 +1235,30 @@ function usageText(): string {
     "       (nightly cron + manual dispatch; accepted improvements arrive as",
     "       PRs for human review — never auto-merged)",
     "  init [name]                          scaffold a new crewhaus.yaml",
+    "       [--interactive] [--detect]      interview-driven spec authoring (model, or scripted",
+    "                                       fallback with no credentials); validated via parseSpec (item 39)",
     "       [--ci]                          also scaffold .github/workflows/crewhaus-eval.yml —",
     "                                       eval-gated spec PRs (base vs PR spec, two fresh runs,",
     "                                       score-delta PR comment, check fails on regression);",
     "                                       with an existing crewhaus.yaml, adds just the workflow",
-    "       [--force]                       overwrite an existing scaffolded workflow",
+    "       [--with-evals]                  also scaffold eval/dataset.jsonl + eval/graders.yaml",
+    "                                       (item 13; offline template mode — no credentials needed)",
+    "       [--force]                       overwrite an existing scaffolded workflow / eval assets",
+    "  scaffold-evals <spec.yaml>           day-one eval assets FROM the spec (item 13): sample",
+    "       [-o <dir>] [--samples N]        stubs derived from agent.instructions (one model call",
+    "       [--model <m>] [--force]         with credentials, deterministic template without) +",
+    "                                       ONE starter grader (spec-goal llm_judge rubric online,",
+    "                                       non-empty-answer floor grader offline)",
+    "  graders suggest [-o <file>]          draft grader suites from failure rationale (item 4):",
+    "       [--runs <dir|last:N>]           clusters grades.json rationale (via the run-history",
+    "       [--model <m>] [--spec <name>]   index), judge criterionScores, and rating comments",
+    "       [--min-score F] [--force]       into themes; drafts deterministic graders per theme",
+    "                                       (+ an llm_judge rubric with --model/credentials) into",
+    "                                       a REVIEW file — never auto-applied",
     "  doctor                               check environment health",
     "       [--philosophy-alignment [--json] [--baseline | --accept-baseline]]  pillar audit + scope-audit drift gate (item 49)",
+    "       [--detect [--no-probe]]         inventory reachable providers/local models/MCP servers (item 40)",
+    "       [--fix]                         apply mechanical remediations (dry-run by default) (item 40)",
     "  context --bundle [-o <file>]         emit a single-markdown orientation manifest",
     "       [--factory-root <p>] [--docs-root <p>] [--demos-root <p>]",
     "  cost-summary --session <id>          summarize cost_accrual events for a session",
@@ -938,6 +1281,18 @@ function usageText(): string {
     "       [--split train|dev|test]",
     "  datasets put <name> --file <f.jsonl> import a file as a new auto-bumped version",
     "       [--split-spec 70/15/15 | --split train]",
+    "  dataset mine [--sessions N|all]      mine hard cases from session struggle signals (item 2):",
+    "       [--out-dataset <name>] [--review]   tool-errors/loops/retries/egress → quarantine;",
+    "                                           --review promotes accepted into a mined dataset",
+    "  dataset synthesize --from <f|reg>    PII-redacted stress variants (item 2): paraphrase,",
+    "       [--count N] [--budget-usd N]        truncate, ambiguate, inject → separate synthetic",
+    "       [--out-dataset <name>]              split (never contaminates human golds)",
+    "  dataset refresh-goldens              reconcile corrections/up-rated turns with golds (item 5):",
+    "       --dataset <file|registry:ref>       propose gold updates as a review diff; --apply writes",
+    "       [--min-score F] [--apply]           a NEW registry version (never in-place)",
+    "  judge calibrate                      calibrate an llm_judge against human ratings (item 8):",
+    "       [--graders <g.yaml>] [--model <m>]  correlation/bias/ROC-optimal cut over paired",
+    "       [--sessions N|all] [--apply]        (human rating, judge score); --apply writes the cut",
     "  state backup [-o <file.tar.gz>]      snapshot the cwd .crewhaus state dir to a tarball (item 69)",
     "       [--exclude <glob,glob>]",
     "  state restore <file.tar.gz>          restore a snapshot (refuses a non-empty .crewhaus)",
@@ -947,6 +1302,8 @@ function usageText(): string {
     "  spec put|list|get|pin|alias|log ...  versioned spec storage + changelog (Section 28 spec-registry)",
     "  deploy promote|rollback ...          re-pin a spec for an environment (Section 28)",
     "  migrate-all --from N --to N          batch-migrate every spec in the registry",
+    "  upgrade [spec.yaml] [--write]        detect the cwd spec's version drift + run the migration",
+    "                                       chain (validated); --dry-run diff by default (item 43)",
     "  build-image <target> --tag <tag>     build the docker image for a target shape (Section 32)",
     "       [--platform <p>] [--push]        (--push records the registry manifest digest in",
     "       [--no-record]                     docker/digests.json; --no-record opts out. Local",
@@ -1091,6 +1448,16 @@ async function runCompile(args: ParsedArgs): Promise<void> {
   if (typeof specPath !== "string") die("missing <spec.yaml>");
   if (!emitIr && typeof outDir !== "string") die("missing -o <out-dir>");
 
+  // Item 41 — `--watch`: re-run parse→lint→compile on every change. Delegates
+  // to the watch controller, which drives one `compileOnceForWatch` cycle per
+  // debounced change. `--check` is incompatible (a watch cycle is an in-place
+  // re-validate, not a full install+boot verify).
+  if (args.flags["watch"] === true) {
+    if (check) die("--watch and --check are incompatible (a watch cycle re-validates in place)");
+    await runCompileWatch({ specPath, strict, readme });
+    return;
+  }
+
   const absSpec = resolve(specPath);
   logger.debug("compile.start", { spec: absSpec, out: outDir, emitIr, strict, allowUnmarkedSinks });
 
@@ -1217,6 +1584,274 @@ async function runCompile(args: ParsedArgs): Promise<void> {
 }
 
 /**
+ * Item 41 — the tool-name resolver shared by `lint` and its `--fix` nearest-
+ * match. Returns a `(name) => RegisteredTool | undefined` that resolves BOTH
+ * the camelCase spec key (`webSearch`) and the registered PascalCase name
+ * (`WebSearch`, used in sub-agent `tools:`), matching the strict-scope gate.
+ * The camelCase keys + PascalCase names are also returned as the legal-name
+ * candidate set for nearest-match typo suggestions.
+ */
+async function buildToolResolver(): Promise<{
+  resolve: (name: string) => RegisteredTool | undefined;
+  candidates: string[];
+}> {
+  const toolMap = await loadToolMap();
+  const byRegisteredName: Record<string, RegisteredTool> = {};
+  for (const tool of Object.values(toolMap)) byRegisteredName[tool.name] = tool;
+  const candidates = [
+    ...new Set([...Object.keys(toolMap), ...Object.keys(byRegisteredName)]),
+  ].sort();
+  return {
+    resolve: (name) => toolMap[name] ?? byRegisteredName[name],
+    candidates,
+  };
+}
+
+/**
+ * Item 41 — `crewhaus lint [--fix] [--format text|json]`. Runs the check-only
+ * pipeline (`runLint`: parse + ir-passes collect-all + scope audit) over the
+ * cwd (or a named) spec WITHOUT emitting, so the §47 chain / graph-crew
+ * well-formedness checks that the CLI compile path skips surface for authors.
+ * `--fix` applies mechanical corrections (unknown tool → nearest match, `$SECRET`
+ * typo → `$UPPER_SNAKE_CASE`, unsafe name → sanitised) then re-lints. Exit 1 on
+ * any error finding.
+ */
+async function runLintCommand(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus lint [spec.yaml] [--fix] [--format text|json]\n" +
+        "  Check-only: parseSpec + compile ir-passes (§47 chain / graph-crew\n" +
+        "  well-formedness, which the CLI compile path skips) + tool-scope audit,\n" +
+        "  WITHOUT emitting a bundle. Defaults to ./crewhaus.yaml.\n" +
+        "  --format json   structured {message,path,severity,rule} findings for editors/CI.\n" +
+        "                  IR passes are fail-fast per pass; json mode runs each pass\n" +
+        "                  independently (collect-all) so one violation doesn't hide others.\n" +
+        "  --fix           apply mechanical fixes: unknown tool name → nearest match,\n" +
+        "                  $secret typo → $UPPER_SNAKE_CASE, unsafe name → sanitised.\n" +
+        "                  A typo equidistant from tools of DIFFERENT capability (e.g.\n" +
+        "                  read-only vs mutating) is printed as a suggestion instead of\n" +
+        "                  auto-applied.\n",
+    );
+    return;
+  }
+  const format = args.flags["format"];
+  if (format !== undefined && format !== "text" && format !== "json") {
+    die(`--format must be "text" or "json" (got "${format}")`);
+  }
+  const specArg = args.positional[0];
+  const absSpec = resolve(
+    typeof specArg === "string" ? specArg : join(process.cwd(), "crewhaus.yaml"),
+  );
+  let yamlText: string;
+  try {
+    yamlText = readFileSync(absSpec, "utf-8");
+  } catch (err) {
+    die(`could not read ${absSpec}: ${(err as Error).message}`);
+  }
+
+  const { resolve: resolveTool, candidates } = await buildToolResolver();
+
+  if (args.flags["fix"] === true) {
+    const {
+      text: fixedYaml,
+      applied,
+      suggested,
+    } = applyLintFixes(yamlText, candidates, resolveTool);
+    if (applied.length > 0) {
+      writeFileSync(absSpec, fixedYaml);
+      for (const line of applied) process.stdout.write(`fixed: ${line}\n`);
+      yamlText = fixedYaml;
+    }
+    for (const line of suggested) process.stdout.write(`suggestion: ${line}\n`);
+    if (applied.length === 0 && suggested.length === 0) {
+      process.stdout.write("lint --fix: no mechanical fixes applicable.\n");
+    }
+  }
+
+  const result = runLint(yamlText, resolveTool);
+  process.stdout.write(format === "json" ? formatLintJson(result) : formatLintText(result));
+  process.exit(result.ok ? 0 : 1);
+}
+
+/**
+ * Item 41 — apply `lint --fix`'s mechanical corrections to a spec's YAML by
+ * scanning the raw text for the three fixable classes and rewriting the token
+ * in place. Text-level (not spec-patch) because two of the three classes —
+ * an unsafe `name:` and a mistyped tool in a `tools:` list — must be fixed
+ * BEFORE the spec can parse, and spec-patch requires a parseable document.
+ * Returns the rewritten text + a description of each applied fix.
+ *
+ * `resolveTool` (same resolver `buildToolResolver` returns) supplies the
+ * read-only/mutating capability signal `nearestToolName` uses to detect a
+ * cross-capability typo — e.g. `Reit` is Levenshtein-2 from BOTH `Read`
+ * (read-only) and `Edit` (mutating). Such a typo is NOT auto-applied (the
+ * line is left untouched); it is instead returned in `suggested` as a
+ * printed "did you mean X or Y?" line so the author picks, rather than the
+ * fixer silently rewriting to whichever tie-break happened to win.
+ */
+function applyLintFixes(
+  yamlText: string,
+  toolCandidates: readonly string[],
+  resolveTool: (name: string) => RegisteredTool | undefined,
+): { text: string; applied: string[]; suggested: string[] } {
+  const applied: string[] = [];
+  const suggested: string[] = [];
+  const getReadOnly = (candidateName: string): boolean | undefined =>
+    resolveTool(candidateName)?.readOnly;
+  const lines = yamlText.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (line === undefined) continue;
+
+    // Unsafe `name:` value → sanitised.
+    const nameMatch = /^(\s*name:\s*)(.+?)(\s*)$/.exec(line);
+    if (nameMatch?.[2] !== undefined) {
+      const raw = stripQuotes(nameMatch[2]);
+      const safe = suggestSafeName(raw);
+      if (safe !== undefined) {
+        lines[i] = `${nameMatch[1]}${safe}`;
+        applied.push(`name "${raw}" → "${safe}" (unsafe characters)`);
+        continue;
+      }
+    }
+
+    // A `- toolName` list item that is an unknown tool near a legal name.
+    const toolMatch = /^(\s*-\s*)([A-Za-z]\w*)(\s*)$/.exec(line);
+    if (toolMatch?.[2] !== undefined) {
+      const nearest = nearestToolName(toolMatch[2], toolCandidates, undefined, getReadOnly);
+      if (nearest?.kind === "match") {
+        lines[i] = `${toolMatch[1]}${nearest.name}`;
+        applied.push(`tool "${toolMatch[2]}" → "${nearest.name}" (nearest match)`);
+        continue;
+      }
+      if (nearest?.kind === "ambiguous") {
+        const options = nearest.candidates.map((c) => `"${c}"`).join(" or ");
+        suggested.push(
+          `tool "${toolMatch[2]}" — did you mean ${options}? (not auto-fixed — ambiguous across tool capabilities)`,
+        );
+        continue;
+      }
+    }
+
+    // A credential value that looks like a malformed env ref → $UPPER_SNAKE_CASE.
+    const secretMatch = /^(\s*\w+:\s*)(\$\S+)(\s*)$/.exec(line);
+    if (secretMatch?.[2] !== undefined) {
+      const fixed = suggestSecretFix(stripQuotes(secretMatch[2]));
+      if (fixed !== undefined) {
+        lines[i] = `${secretMatch[1]}${fixed}`;
+        applied.push(`secret "${secretMatch[2]}" → "${fixed}" ($UPPER_SNAKE_CASE)`);
+      }
+    }
+  }
+  return { text: lines.join("\n"), applied, suggested };
+}
+
+/** Strip a single pair of surrounding single/double quotes from a scalar. */
+function stripQuotes(s: string): string {
+  const t = s.trim();
+  if ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'"))) {
+    return t.slice(1, -1);
+  }
+  return t;
+}
+
+/**
+ * Item 41 — `compile --watch`. Watches the spec + `.crewhaus/commands` + skills
+ * dirs and re-runs a parse→lint→compile (in-memory) cycle on every debounced
+ * change, printing one green/red status per cycle. Ctrl-C-clean: the SIGINT
+ * handler stops the controller and closes the fs watchers.
+ */
+async function runCompileWatch(opts: {
+  readonly specPath: string;
+  readonly strict: boolean;
+  readonly readme: boolean;
+}): Promise<void> {
+  const absSpec = resolve(opts.specPath);
+  const specDir = dirname(absSpec);
+  const { resolve: resolveTool } = await buildToolResolver();
+
+  // Watch the spec file plus the two sibling authoring dirs, when present.
+  const watchPaths = [absSpec, join(specDir, ".crewhaus", "commands"), join(specDir, "skills")];
+  const { watch } = await import("node:fs");
+  const handles: Array<{ close(): void }> = [];
+  const subscribers: Array<() => void> = [];
+  const watcher: Watcher = {
+    subscribe: (cb) => subscribers.push(cb),
+    close: () => {
+      for (const h of handles) {
+        try {
+          h.close();
+        } catch {
+          // A path that vanished mid-watch closes with an error; ignore.
+        }
+      }
+    },
+  };
+  for (const p of watchPaths) {
+    if (!existsSync(p)) continue;
+    try {
+      const h = watch(p, { recursive: true }, () => {
+        for (const cb of subscribers) cb();
+      });
+      handles.push(h);
+    } catch {
+      // Non-fatal: an unwatchable path just isn't watched.
+    }
+  }
+
+  const runCycle = async (): Promise<{ green: boolean; line: string }> => {
+    let text: string;
+    try {
+      text = readFileSync(absSpec, "utf-8");
+    } catch (err) {
+      return {
+        green: false,
+        line: formatCycleLine(false, `read failed: ${(err as Error).message}`),
+      };
+    }
+    const result = runLint(text, resolveTool);
+    if (!result.ok) {
+      const first = result.findings[0];
+      const detail = first ? `${result.findings.length} finding(s): ${first.message}` : "findings";
+      return { green: false, line: formatCycleLine(false, `lint ✗ — ${detail}`) };
+    }
+    // Lint clean → compile in-memory (no emit) to confirm the emitters accept it.
+    try {
+      compile(text, { readme: opts.readme, strict: opts.strict });
+      return { green: true, line: formatCycleLine(true, `${basename(absSpec)} ok`) };
+    } catch (err) {
+      const message = err instanceof CrewhausError ? err.message : (err as Error).message;
+      return { green: false, line: formatCycleLine(false, `compile ✗ — ${message}`) };
+    }
+  };
+
+  const controller = createWatchController({
+    watcher,
+    timer: { set: (fn, ms) => setTimeout(fn, ms), clear: (h) => clearTimeout(h as NodeJS.Timeout) },
+    debounceMs: 150,
+    runCycle,
+    print: (line) => process.stdout.write(`${line}\n`),
+  });
+
+  process.stdout.write(
+    `watching ${basename(absSpec)} (+ .crewhaus/commands, skills) — Ctrl-C to stop\n`,
+  );
+  // Run one cycle immediately so the user sees the current status.
+  const initial = await runCycle();
+  process.stdout.write(`${initial.line}\n`);
+
+  await new Promise<void>((resolveWatch) => {
+    const onSigint = (): void => {
+      controller.stop();
+      process.stdout.write("\nwatch stopped.\n");
+      process.off("SIGINT", onSigint);
+      resolveWatch();
+    };
+    process.on("SIGINT", onSigint);
+  });
+}
+
+/**
  * Item 46 — shared auto-register hook for `compile` and `optimize
  * --write-back` (wiring only; the logic lives in ./spec-changelog). Content-
  * hash gated: prints one quiet line — `registered <name>@<vN>` on a new put,
@@ -1333,7 +1968,7 @@ function resolveWorkflowRoot(
 function runInit(args: ParsedArgs): void {
   if (args.flags["help"]) {
     process.stdout.write(
-      "usage: crewhaus init [name] [--ci] [--force]\n" +
+      "usage: crewhaus init [name] [--ci] [--with-evals] [--force]\n" +
         "  --ci     Also scaffold .github/workflows/crewhaus-eval.yml — the eval-on-PR\n" +
         "           gate (item 44): PRs touching crewhaus.yaml or eval/** run the base\n" +
         "           branch's spec and the PR's spec on the PR's dataset+graders (two\n" +
@@ -1344,11 +1979,21 @@ function runInit(args: ParsedArgs): void {
         "           The workflow is written to .github/workflows at the GIT REPO ROOT\n" +
         "           (GitHub only reads it there); for a harness in a subdirectory its\n" +
         "           working-directory and paths filter point back at the harness.\n" +
-        "  --force  Overwrite an existing scaffolded workflow (never the spec).\n",
+        "  --with-evals  Also scaffold eval/dataset.jsonl + eval/graders.yaml (item 13)\n" +
+        "           — the flywheel's conventional paths — so the fresh harness can run\n" +
+        "           `crewhaus eval` on day one. Always OFFLINE template mode (init never\n" +
+        "           requires credentials): deterministic sample stubs derived from the\n" +
+        "           spec's instructions + the safe non-empty-answer floor grader. Run\n" +
+        "           `crewhaus scaffold-evals` later (with credentials) for model-derived\n" +
+        "           inputs and a spec-goal llm_judge rubric. With an existing\n" +
+        "           crewhaus.yaml, adds just the missing eval assets.\n" +
+        "  --force  Overwrite an existing scaffolded workflow or eval assets (never\n" +
+        "           the spec).\n",
     );
     return;
   }
   const ci = args.flags["ci"] === true;
+  const withEvals = args.flags["with-evals"] === true;
   const nameArg = args.positional[0];
   const targetDir = typeof nameArg === "string" ? resolve(nameArg) : process.cwd();
   const specName = typeof nameArg === "string" ? nameArg : basename(targetDir);
@@ -1356,9 +2001,10 @@ function runInit(args: ParsedArgs): void {
 
   if (existsSync(targetFile)) {
     // Item 44 — `init --ci` composes with an existing harness: keep the
-    // spec, add just the workflow. Without --ci the historical refusal
+    // spec, add just the workflow (item 13's --with-evals composes the same
+    // way for the eval assets). Without either flag the historical refusal
     // stands (a bare `init` must never touch existing work).
-    if (!ci) die(`${targetFile} already exists — refusing to overwrite`);
+    if (!ci && !withEvals) die(`${targetFile} already exists — refusing to overwrite`);
     process.stdout.write(`kept ${targetFile} (already exists)\n`);
   } else {
     mkdirSync(targetDir, { recursive: true });
@@ -1405,13 +2051,503 @@ agent:
     }
   }
 
+  // Item 13 — `init --with-evals`: day-one eval assets, ALWAYS in offline
+  // template mode (init must never require credentials). Existing assets are
+  // kept unless --force; the spec is never touched.
+  if (withEvals) {
+    const evalDir = join(targetDir, "eval");
+    const datasetPath = join(evalDir, "dataset.jsonl");
+    const gradersPath = join(evalDir, "graders.yaml");
+    const blocked = checkNoOverwrite(
+      [datasetPath, gradersPath],
+      existsSync,
+      args.flags["force"] === true,
+    );
+    if (blocked !== undefined) {
+      process.stdout.write(
+        `kept existing eval assets in ${evalDir} (--force overwrites scaffolded eval assets, never the spec)\n`,
+      );
+    } else {
+      try {
+        const info = extractScaffoldInfo(readFileSync(targetFile, "utf-8"));
+        const written = writeScaffoldAssets({
+          info,
+          outDir: evalDir,
+          inputs: templateSampleInputs(info, DEFAULT_SCAFFOLD_SAMPLES),
+          generator: "template",
+          online: false,
+        });
+        process.stdout.write(
+          `wrote ${written.datasetPath} (${written.sampleCount} sample stubs)\n`,
+        );
+        process.stdout.write(
+          `wrote ${written.gradersPath} (${written.graderName} floor grader — edit into real graders,\n`,
+        );
+        process.stdout.write(
+          "    or run `crewhaus scaffold-evals crewhaus.yaml --force` with credentials for a\n" +
+            "    spec-goal llm_judge rubric)\n",
+        );
+      } catch (err) {
+        // An existing-but-unscaffoldable spec (unparseable, no instructions)
+        // must not fail the rest of init — report and continue.
+        if (err instanceof ScaffoldEvalsError || err instanceof CrewhausError) {
+          process.stderr.write(`crewhaus: eval scaffolding skipped: ${err.message}\n`);
+        } else {
+          throw err;
+        }
+      }
+    }
+  }
+
   // The runtime resolves the spec and the `.crewhaus/` session store from
   // the current working directory, so guide the user to run from inside
   // the harness directory (where crewhaus.yaml lives), not from here.
   const rel = relative(process.cwd(), targetDir);
   const cd = rel === "" ? "" : `cd ${rel} && `;
   process.stdout.write(`next: ${cd}crewhaus run crewhaus.yaml\n`);
-  logger.debug("init.success", { target: targetFile, ci });
+  if (withEvals) {
+    process.stdout.write(
+      `next: ${cd}crewhaus eval crewhaus.yaml --dataset ${join("eval", "dataset.jsonl")} --graders ${join("eval", "graders.yaml")}\n`,
+    );
+  }
+  logger.debug("init.success", { target: targetFile, ci, withEvals });
+}
+
+// -------- item 13: crewhaus scaffold-evals (+ the init --with-evals core) --------
+
+type ScaffoldAssetsWritten = {
+  readonly datasetPath: string;
+  readonly gradersPath: string;
+  readonly sampleCount: number;
+  readonly graderName: string;
+  readonly graderType: string;
+};
+
+/**
+ * Generate + write `dataset.jsonl` and `graders.yaml` under `outDir`.
+ * Shared by `scaffold-evals` and `init --with-evals` (which always calls it
+ * offline). The caller has already run the {@link checkNoOverwrite} guard.
+ */
+function writeScaffoldAssets(opts: {
+  readonly info: ScaffoldInfo;
+  readonly outDir: string;
+  readonly inputs: ReadonlyArray<string>;
+  readonly generator: ScaffoldGenerator;
+  /** True → the spec-goal llm_judge rubric; false → the floor grader. */
+  readonly online: boolean;
+  /** Explicit --model, baked into the emitted llm_judge grader. */
+  readonly judgeModel?: string;
+}): ScaffoldAssetsWritten {
+  const samples = buildScaffoldSamples(opts.info, opts.inputs, opts.generator);
+  const graders = buildScaffoldGraders(opts.info, {
+    online: opts.online,
+    ...(opts.judgeModel !== undefined ? { model: opts.judgeModel } : {}),
+  });
+  mkdirSync(opts.outDir, { recursive: true });
+  const datasetPath = join(opts.outDir, "dataset.jsonl");
+  const gradersPath = join(opts.outDir, "graders.yaml");
+  writeFileSync(datasetPath, samplesToJsonl(samples));
+  writeFileSync(gradersPath, gradersConfigToYaml(graders, SCAFFOLD_GRADERS_HEADER));
+  const g = graders.graders[0];
+  return {
+    datasetPath,
+    gradersPath,
+    sampleCount: samples.length,
+    graderName: g?.name ?? "",
+    graderType: g?.type ?? "",
+  };
+}
+
+/**
+ * One model call through the same model-router path `optimize --mutator
+ * claude` uses (`resolveModel` → adapter.stream → collectFinalMessage).
+ * Shared by scaffold-evals sample generation (item 13) and the `graders
+ * suggest` rubric draft (item 4). Lazy imports keep the credential-free
+ * paths free of provider deps.
+ */
+async function oneShotModelText(opts: {
+  readonly model: string;
+  readonly system: string;
+  readonly prompt: string;
+  readonly maxTokens?: number;
+}): Promise<string> {
+  const { resolveModel } = await import("@crewhaus/model-router");
+  const { collectFinalMessage, extractFirstText } = await import("@crewhaus/adapter-anthropic");
+  const resolution = await resolveModel(opts.model);
+  const final = await collectFinalMessage(
+    resolution.adapter.stream({
+      model: resolution.modelId,
+      system: [{ type: "text", text: opts.system }],
+      messages: [{ role: "user", content: opts.prompt }],
+      maxTokens: opts.maxTokens ?? 2048,
+    }),
+  );
+  return extractFirstText(final) ?? "";
+}
+
+async function runScaffoldEvals(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus scaffold-evals <spec.yaml> [-o <out-dir>] [--samples N] [--model <m>] [--force]\n" +
+        "  Generate starter eval assets FROM the spec itself (item 13), so a day-one\n" +
+        "  harness can run `crewhaus eval` before its first user rating lands:\n" +
+        "    dataset.jsonl   N sample stubs (default 8) whose inputs derive from\n" +
+        "                    agent.instructions — via ONE model call (model-router\n" +
+        "                    grammar; the spec's own model by default) when credentials\n" +
+        "                    are visible, else a deterministic template that parses the\n" +
+        "                    instruction sentences into task-shaped prompts. Tools the\n" +
+        "                    spec declares are recorded as expected_tools where a\n" +
+        "                    prompt obviously implies them.\n" +
+        "    graders.yaml    exactly ONE starter grader (stacking graders hard-ANDs\n" +
+        "                    their scores): a spec-goal llm_judge rubric with all five\n" +
+        "                    anchors pre-filled when credentials exist, else the safe\n" +
+        "                    non-empty-answer floor grader.\n" +
+        "  -o defaults to eval/ next to the spec (the flywheel's conventional paths).\n" +
+        "  Existing eval assets are never overwritten without --force.\n" +
+        "  If the spec lacks a feedback: block, a suggested one is printed (never\n" +
+        "  auto-applied) — ratings are what later upgrade these stubs via `distill`.\n",
+    );
+    return;
+  }
+  const specPath = args.positional[0];
+  if (typeof specPath !== "string") die("missing <spec.yaml>");
+  const absSpec = resolve(specPath);
+  let yamlText: string;
+  try {
+    yamlText = readFileSync(absSpec, "utf-8");
+  } catch (err) {
+    die(`could not read ${absSpec}: ${(err as Error).message}`);
+  }
+  let info: ScaffoldInfo;
+  try {
+    info = extractScaffoldInfo(yamlText);
+  } catch (err) {
+    if (err instanceof ScaffoldEvalsError || err instanceof CrewhausError) die(err.message);
+    throw err;
+  }
+  const n = intFlag(args, "samples") ?? DEFAULT_SCAFFOLD_SAMPLES;
+  if (n < 1) die(`invalid --samples "${args.flags["samples"]}" — must be a positive integer`);
+  const outArg = strFlag(args, "out");
+  const outDir = outArg !== undefined ? resolve(outArg) : join(dirname(absSpec), "eval");
+  const blocked = checkNoOverwrite(
+    [join(outDir, "dataset.jsonl"), join(outDir, "graders.yaml")],
+    existsSync,
+    args.flags["force"] === true,
+  );
+  if (blocked !== undefined) die(blocked);
+
+  // Mode selection: an explicit --model opts into the model path outright;
+  // otherwise the spec's own model is used when its provider credentials are
+  // visible (shared check with `crewhaus doctor`). No credentials → the
+  // deterministic template fallback, never a doomed call.
+  const modelFlag = strFlag(args, "model");
+  const model = modelFlag ?? info.model;
+  let online =
+    model !== undefined &&
+    (modelFlag !== undefined || providerCredentialsSatisfied(model, process.env));
+  const templateInputs = templateSampleInputs(info, n);
+  let inputs: ReadonlyArray<string> = templateInputs;
+  let generator: ScaffoldGenerator = "template";
+  if (online && model !== undefined) {
+    try {
+      const raw = await oneShotModelText({
+        model,
+        system: SCAFFOLD_GENERATION_SYSTEM,
+        prompt: buildSampleGenerationPrompt(info, n),
+      });
+      const parsed = parseModelSampleInputs(raw, n);
+      if (parsed.length === 0) throw new Error("model returned no usable inputs");
+      // A short model response tops up from the template so the dataset is
+      // always the full N stubs.
+      inputs = mergeInputs(parsed, templateInputs, n);
+      generator = "model";
+    } catch (err) {
+      process.stderr.write(
+        `[scaffold-evals] model generation failed (${err instanceof Error ? err.message : String(err)}) — falling back to the deterministic template\n`,
+      );
+      online = false;
+    }
+  }
+
+  const written = writeScaffoldAssets({
+    info,
+    outDir,
+    inputs,
+    generator,
+    online,
+    ...(modelFlag !== undefined ? { judgeModel: modelFlag } : {}),
+  });
+  process.stdout.write(
+    `[scaffold-evals] wrote ${written.sampleCount} sample stub(s) (${generator} mode) → ${written.datasetPath}\n`,
+  );
+  process.stdout.write(
+    `[scaffold-evals] grader: ${written.graderName} (${written.graderType}) → ${written.gradersPath}\n`,
+  );
+  if (!online) {
+    process.stdout.write(
+      "[scaffold-evals] offline mode: the floor grader only checks for a non-empty answer —\n" +
+        "    re-run with credentials (or --model) for a spec-goal llm_judge rubric, or edit\n" +
+        "    the graders by hand\n",
+    );
+  }
+  if (!info.hasFeedback) {
+    const indented = feedbackBlockSuggestion()
+      .split("\n")
+      .map((l) => `    ${l}`)
+      .join("\n");
+    process.stdout.write(
+      `[scaffold-evals] the spec has no feedback: block — add this to ${basename(absSpec)} to start\n` +
+        `    collecting the ratings that later upgrade these stubs (not auto-applied):\n${indented}\n`,
+    );
+  }
+  // The runtime resolves eval assets relative to the invocation cwd, so
+  // print the command as run from the spec's directory.
+  const specDir = dirname(absSpec);
+  const rel = relative(process.cwd(), specDir);
+  const cd = rel === "" ? "" : `cd ${rel} && `;
+  process.stdout.write(
+    `next: ${cd}crewhaus eval ${basename(absSpec)} --dataset ${relative(specDir, written.datasetPath)} --graders ${relative(specDir, written.gradersPath)}\n`,
+  );
+}
+
+/**
+ * Item 39 — a line-buffered stdin reader for the scripted questionnaire.
+ *
+ * Built on readline's `"line"` event with a queue rather than sequential
+ * `rl.question()` calls: under Bun, chained `question()` calls against a PIPED
+ * stdin (all answers arriving in one chunk) deliver only the first line and
+ * then hang. The event+queue design drains every buffered line, so each
+ * `ask()` returns the next line (or "" once stdin closes). Thin by design; the
+ * questionnaire logic lives in the pure `buildScriptedSpec`.
+ */
+function createLineReader(): { ask(prompt: string): Promise<string>; close(): void } {
+  const rl = createInterface({ input: process.stdin });
+  const queue: string[] = [];
+  const waiters: Array<(v: string) => void> = [];
+  let ended = false;
+  rl.on("line", (line) => {
+    const waiter = waiters.shift();
+    if (waiter) waiter(line);
+    else queue.push(line);
+  });
+  rl.on("close", () => {
+    ended = true;
+    for (const w of waiters.splice(0)) w("");
+  });
+  return {
+    ask: (prompt: string): Promise<string> => {
+      process.stdout.write(prompt);
+      const queued = queue.shift();
+      if (queued !== undefined) return Promise.resolve(queued.trim());
+      if (ended) return Promise.resolve("");
+      return new Promise<string>((resolveLine) => waiters.push((v) => resolveLine(v.trim())));
+    },
+    close: () => rl.close(),
+  };
+}
+
+/**
+ * Item 39 — `crewhaus init --interactive`. Promotes the demos harness-designer
+ * into core: interview the user and emit a `parseSpec`-validated crewhaus.yaml.
+ *
+ * Two paths, chosen by credential availability (like the merged scaffold path):
+ *   - Credentials present → the MODEL interview. `runInterview` (side-effect-
+ *     free) drives a validate-and-retry loop: the model calls `emit_spec` with
+ *     a draft, `parseSpec` validates it in-process, and any structured error is
+ *     fed back for a corrected re-emit. No demos dependency — the shape
+ *     guidance is bundled in `init-interactive.ts`.
+ *   - No credentials → a scripted stdin questionnaire (name/shape/model/tools)
+ *     that still emits a `parseSpec`-validated spec via `buildScriptedSpec`.
+ *
+ * Reuses `runInit`'s exists-check/refuse-overwrite + standalone-dir guidance,
+ * and composes with `--detect` (#40) to prefill the default model from a
+ * reachable local endpoint / provider.
+ */
+async function runInitInteractive(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus init --interactive [name] [--detect]\n" +
+        "  Interview-driven spec authoring. With credentials, an agent interviews you\n" +
+        "  and emits a validated crewhaus.yaml (every draft is checked against the live\n" +
+        "  spec schema and retried on error). Without credentials, a scripted\n" +
+        "  questionnaire (name/shape/model/tools) still emits a validated spec.\n" +
+        "  --detect  prefill the default model from a reachable local endpoint/provider.\n",
+    );
+    return;
+  }
+  const nameArg = args.positional[0];
+  const targetDir = typeof nameArg === "string" ? resolve(nameArg) : process.cwd();
+  const specName = typeof nameArg === "string" ? nameArg : basename(targetDir);
+  const targetFile = join(targetDir, "crewhaus.yaml");
+
+  // Reuse runInit's refuse-overwrite invariant: --interactive must never
+  // clobber existing work.
+  if (existsSync(targetFile)) {
+    die(`${targetFile} already exists — refusing to overwrite`);
+  }
+
+  // Item 39 ↔ #40 — compose with --detect to prefill a default model. When a
+  // local endpoint is reachable, offer its first model as `local/<m>@<url>`;
+  // otherwise fall back to the standard claude default.
+  let defaultModel = "claude-opus-4-7";
+  if (args.flags["detect"] === true) {
+    const prefill = await detectDefaultModel();
+    if (prefill !== undefined) defaultModel = prefill;
+  }
+
+  // Credential-gated path selection: try to resolve the default model's adapter.
+  // A resolution failure (no credentials / missing optional adapter) degrades
+  // to the scripted questionnaire.
+  const interviewer = await tryBuildInterviewer(defaultModel);
+  const reader = createLineReader();
+  let yaml: string;
+  try {
+    if (interviewer !== undefined) {
+      process.stdout.write(
+        `interactive spec authoring (model: ${interviewer.modelId}). Describe the agent you want to build.\n`,
+      );
+      const description = await reader.ask("> ");
+      if (description === "") die("no description given — aborting");
+      const result = await runInterview({
+        proposeSpec: (feedback) => interviewer.propose(description, feedback),
+      });
+      yaml = result.yaml;
+      process.stdout.write(`validated after ${result.attempts} draft(s).\n`);
+    } else {
+      process.stdout.write(
+        "no model credentials detected — falling back to the scripted questionnaire.\n",
+      );
+      yaml = (await runScriptedQuestionnaire({ reader, specName, defaultModel })).yaml;
+    }
+  } finally {
+    reader.close();
+  }
+
+  mkdirSync(targetDir, { recursive: true });
+  writeFileSync(targetFile, yaml);
+  process.stdout.write(`wrote ${targetFile}\n`);
+  const rel = relative(process.cwd(), targetDir);
+  const cd = rel === "" ? "" : `cd ${rel} && `;
+  process.stdout.write(`next: ${cd}crewhaus run crewhaus.yaml\n`);
+  logger.debug("init.interactive.success", { target: targetFile });
+}
+
+/**
+ * Item 39 — the scripted (no-credentials) questionnaire. Collects the answers
+ * `buildScriptedSpec` needs over stdin and returns the validated spec. A
+ * validation failure (e.g. an unsafe name) re-prompts the offending field.
+ */
+async function runScriptedQuestionnaire(opts: {
+  readonly reader: { ask(prompt: string): Promise<string> };
+  readonly specName: string;
+  readonly defaultModel: string;
+}): Promise<{ yaml: string }> {
+  const { ask } = opts.reader;
+  const name = (await ask(`harness name [${opts.specName}]: `)) || opts.specName;
+  const shapeInput = (await ask("target shape (cli | workflow | research) [cli]: ")) || "cli";
+  const shape: ScriptedShape = isScriptedShape(shapeInput) ? shapeInput : "cli";
+  if (!isScriptedShape(shapeInput)) {
+    process.stdout.write(
+      `  "${shapeInput}" is not scriptable here — defaulting to cli (use the model interview for other shapes).\n`,
+    );
+  }
+  const model = (await ask(`model [${opts.defaultModel}]: `)) || opts.defaultModel;
+  const instructions =
+    (await ask("one-line instructions for the agent: ")) || "You are a helpful assistant.";
+  const toolsLine = await ask("tools (comma-separated names, or blank): ");
+  const tools = toolsLine
+    .split(",")
+    .map((t) => t.trim())
+    .filter((t) => t !== "");
+  const goal = shape === "research" ? (await ask("research goal: ")) || instructions : undefined;
+  const answers: ScriptedAnswers = {
+    name,
+    shape,
+    model,
+    instructions,
+    ...(tools.length > 0 ? { tools } : {}),
+    ...(goal !== undefined ? { goal } : {}),
+  };
+  // buildScriptedSpec validates via parseSpec; a bad answer throws
+  // SpecParseError, which the caller's CrewhausError catch routes through die().
+  return buildScriptedSpec(answers);
+}
+
+/**
+ * Item 39 — attempt to build the model interviewer for `model`. Resolves the
+ * adapter via the same `resolveModel` path the scaffold-evals/mutator use;
+ * returns undefined when no credentials/adapter are available so the caller
+ * degrades to the scripted questionnaire. The returned `propose` closure runs
+ * one interview turn: it sends the system prompt + description + the running
+ * validation-feedback log and returns the `emit_spec` YAML (or undefined).
+ */
+async function tryBuildInterviewer(model: string): Promise<
+  | {
+      readonly modelId: string;
+      propose: (desc: string, feedback: readonly string[]) => Promise<string | undefined>;
+    }
+  | undefined
+> {
+  try {
+    const { resolveModel } = await import("@crewhaus/model-router");
+    const { collectFinalMessage, extractToolUse } = await import("@crewhaus/adapter-anthropic");
+    const resolution = await resolveModel(model);
+    const system = buildInterviewSystemPrompt();
+    const propose = async (
+      desc: string,
+      feedback: readonly string[],
+    ): Promise<string | undefined> => {
+      const feedbackText =
+        feedback.length > 0
+          ? `\n\nYour previous draft(s) failed validation with:\n${feedback
+              .map((f) => `- ${f}`)
+              .join("\n")}\nEmit a corrected spec.`
+          : "";
+      const final = await collectFinalMessage(
+        resolution.adapter.stream({
+          model: resolution.modelId,
+          system: [{ type: "text", text: system }],
+          messages: [{ role: "user", content: `Build this agent: ${desc}${feedbackText}` }],
+          tools: [EMIT_SPEC_TOOL],
+          toolChoice: { type: "tool", name: EMIT_SPEC_TOOL.name },
+          maxTokens: 4096,
+        }),
+      );
+      const toolUse = extractToolUse(final, EMIT_SPEC_TOOL.name);
+      const yaml = (toolUse?.input as { yaml?: unknown } | undefined)?.yaml;
+      return typeof yaml === "string" && yaml.length > 0 ? yaml : undefined;
+    };
+    return { modelId: resolution.modelId, propose };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Item 39 ↔ #40 — best-effort default-model prefill for `--interactive
+ * --detect`: probe the local endpoint and, if it advertises models, return the
+ * first as a `local/<model>@<baseUrl>` string. Undefined when nothing is
+ * reachable so the caller keeps the claude default. Never throws.
+ */
+async function detectDefaultModel(): Promise<string | undefined> {
+  try {
+    const { probeLocalEndpoint, localBaseUrl } = await import("./doctor-detect");
+    const baseUrl = localBaseUrl(process.env);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 1500);
+    try {
+      const local = await probeLocalEndpoint(baseUrl, async (url) => {
+        const res = await fetch(url, { signal: controller.signal });
+        return { ok: res.ok, status: res.status, json: () => res.json() };
+      });
+      const first = local.reachable ? local.models[0] : undefined;
+      return first !== undefined ? `local/${first}@${baseUrl}` : undefined;
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -1646,6 +2782,14 @@ async function runRun(args: ParsedArgs): Promise<void> {
   const specPath = args.positional[0];
   if (typeof specPath !== "string") die("missing <spec.yaml>");
 
+  // Item 41 — `run --watch`: the same debounced parse→lint→compile re-validate
+  // loop as `compile --watch`, an authoring aid that does NOT re-launch the
+  // agent (which would require tearing down a live REPL/session on every edit).
+  if (args.flags["watch"] === true) {
+    await runCompileWatch({ specPath, strict: true, readme: true });
+    return;
+  }
+
   const absSpec = resolve(specPath);
   logger.debug("run.start", { spec: absSpec });
 
@@ -1754,6 +2898,25 @@ async function runRunCli(
 
   const modelOverride = args.flags["model"];
   const model = typeof modelOverride === "string" ? modelOverride : ir.agent.model;
+
+  // Item 27 — run-level spend cap: `--budget-usd <n>` (flag) > spec `budget`.
+  // The flag sets/overrides the dollar ceiling and keeps the spec's on_exceed
+  // ladder (defaulting to `stop` when the spec has no budget block). Absent
+  // flag + absent spec block → no cap.
+  const budgetUsdFlag = args.flags["budget-usd"];
+  let runBudget: IrBudget | undefined;
+  if (typeof budgetUsdFlag === "string") {
+    const usd = Number.parseFloat(budgetUsdFlag);
+    if (!Number.isFinite(usd) || usd <= 0) {
+      die(`invalid --budget-usd "${budgetUsdFlag}" — expected a positive dollar amount`);
+    }
+    runBudget = {
+      usdMicros: Math.round(usd * 1_000_000),
+      onExceed: ir.target === "cli" ? (ir.budget?.onExceed ?? { kind: "stop" }) : { kind: "stop" },
+    };
+  } else if (ir.target === "cli" && ir.budget !== undefined) {
+    runBudget = ir.budget;
+  }
 
   // Permission mode resolution: CLI flag > spec > "default".
   // bypass is reachable only via the flag (the spec parser has already
@@ -1889,6 +3052,28 @@ async function runRunCli(
       ...(ir.target === "cli" && ir.agent.maxTokens !== undefined
         ? { maxTokens: ir.agent.maxTokens }
         : {}),
+      // Item 22 — provider failover chain: thread `agent.model_fallbacks` +
+      // `agent.circuit_breaker` through to the runtime, mirroring the
+      // target-cli codegen path. Skipped when `--model` overrides the
+      // primary — a flag-forced model is an explicit routing decision and
+      // the spec's fallback chain was authored against the spec's primary.
+      ...(ir.target === "cli" &&
+      typeof modelOverride !== "string" &&
+      ir.agent.modelFallbacks !== undefined &&
+      ir.agent.modelFallbacks.length > 0
+        ? { modelFallbacks: ir.agent.modelFallbacks }
+        : {}),
+      ...(ir.target === "cli" && ir.agent.circuitBreaker !== undefined
+        ? { circuitBreaker: ir.agent.circuitBreaker }
+        : {}),
+      // Section 55 / item 23 — thread the spec's failure_taxonomy so
+      // recovery-engine consults the user's named error classes (including
+      // the `switch-model` verdict) before its built-in flow.
+      ...(ir.failureTaxonomy !== undefined && ir.failureTaxonomy.length > 0
+        ? { failureTaxonomy: ir.failureTaxonomy }
+        : {}),
+      // Item 27 — run-level spend cap (--budget-usd flag > spec `budget`).
+      ...(runBudget !== undefined ? { budget: runBudget } : {}),
       ...(resumeId !== undefined ? { resume: { sessionId: resumeId } } : {}),
       ...(justificationJudge !== undefined ? { justificationJudge } : {}),
       ...(justificationAuditSink !== undefined ? { justificationAuditSink } : {}),
@@ -2165,6 +3350,16 @@ async function runDoctor(args: ParsedArgs): Promise<void> {
         "                             crewhaus advise --all -o . && crewhaus optimize crewhaus.yaml \\\n" +
         "                               --from-advice suggestions.json --write-back ...\n" +
         "                           Always exits 0 — a report, not a gate.\n" +
+        "  --detect                 inventory what's REACHABLE right now: model providers\n" +
+        "                           (from env), the local Ollama/vLLM endpoint's models\n" +
+        "                           (OPENAI_BASE_URL or http://localhost:11434/v1), and MCP\n" +
+        "                           servers from .mcp.json / Claude Desktop config. Read-only.\n" +
+        "       [--no-probe]        skip the localhost HTTP probe (offline / CI)\n" +
+        "  --fix                    apply the mechanical remediations doctor otherwise only\n" +
+        "                           prints: scaffold a missing crewhaus.yaml, create .crewhaus/,\n" +
+        "                           mark outward tools scope:external via a CST spec-patch, and\n" +
+        "                           append commented .env stubs. DRY-RUN IS THE DEFAULT — without\n" +
+        "                           --fix, doctor prints the diff it WOULD apply.\n" +
         "\n" +
         "  Credential checks are model-aware: doctor parses the cwd crewhaus.yaml's\n" +
         "  agent.model (claude-*, openai/*, gemini/*, bedrock/*, local/<m>@<url>) and\n" +
@@ -2185,6 +3380,10 @@ async function runDoctor(args: ParsedArgs): Promise<void> {
   }
   if (args.flags["context-pressure"]) {
     runDoctorContextPressure(args);
+    return;
+  }
+  if (args.flags["detect"]) {
+    await runDoctorDetect(args);
     return;
   }
   // Item 49 — the drift-watch flags only make sense on the philosophy audit.
@@ -2253,9 +3452,144 @@ async function runDoctor(args: ParsedArgs): Promise<void> {
     }
   }
 
+  // Item 40 — the mechanical remediation planner. `--fix` OR dry-run (default):
+  // plan the safe fixes over the checks just run and either print the diff
+  // (dry-run) or apply it (--fix). Runs after the check report so the operator
+  // sees WHAT failed before WHAT would be fixed. A crash here never masks the
+  // check verdict below.
+  await runDoctorFix({ apply: args.flags["fix"] === true, specPath, specModel });
+
   const allPass = checks.every((c) => c.pass);
   process.stdout.write(allPass ? "\nall checks passed.\n" : "\nsome checks failed.\n");
   process.exit(allPass ? 0 : 1);
+}
+
+/**
+ * Item 40 — the real-fs seam wiring for `doctor --detect`. Assembles the
+ * inventory (providers from env, the localhost model probe, MCP servers from
+ * .mcp.json + Claude Desktop config) and prints it. Read-only; always exits 0.
+ */
+async function runDoctorDetect(args: ParsedArgs): Promise<void> {
+  const fetchImpl: FetchLike = async (url, init) => {
+    // Bound the probe so an unreachable endpoint can't hang doctor.
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 1500);
+    try {
+      const res = await fetch(url, { signal: init?.signal ?? controller.signal });
+      return { ok: res.ok, status: res.status, json: () => res.json() };
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+  const configPaths = [join(process.cwd(), ".mcp.json")];
+  const desktop = claudeDesktopConfigPath(process.platform, process.env);
+  if (desktop !== undefined) configPaths.push(desktop);
+  const inventory = await buildInventory({
+    env: process.env,
+    fetchImpl,
+    readConfig: (p) => {
+      try {
+        return existsSync(p) ? readFileSync(p, "utf-8") : undefined;
+      } catch {
+        return undefined;
+      }
+    },
+    configPaths,
+    skipProbe: args.flags["no-probe"] === true,
+  });
+  process.stdout.write(formatInventory(inventory));
+  process.exit(0);
+}
+
+/**
+ * Item 40 — plan + (optionally) apply doctor's mechanical fixes. Dry-run is
+ * the default: without `--fix`, this prints the diff each fixer WOULD write.
+ * Fixers are attached only where a safe mechanical fix exists; anything else
+ * stays advisory (printed by the checks above). The tool-scope fixer resolves
+ * findings via the same `auditSpecToolNames` gate `compile --strict` uses.
+ */
+async function runDoctorFix(opts: {
+  readonly apply: boolean;
+  readonly specPath: string;
+  readonly specModel: string | undefined;
+}): Promise<void> {
+  const fixFs: FixFs = {
+    exists: (p) => existsSync(p),
+    read: (p) => readFileSync(p, "utf-8"),
+    write: (p, content) => {
+      mkdirSync(dirname(p), { recursive: true });
+      writeFileSync(p, content);
+    },
+    mkdirp: (p) => mkdirSync(p, { recursive: true }),
+  };
+  const actions: FixAction[] = [];
+
+  // Fixer 1 — scaffold a missing crewhaus.yaml (cwd basename as the name).
+  const scaffold = planScaffoldSpec({
+    fs: fixFs,
+    specPath: opts.specPath,
+    specName: basename(process.cwd()),
+  });
+  if (scaffold !== undefined) actions.push(scaffold);
+
+  // Fixer 2 — create the .crewhaus state dir.
+  const dirs = planCrewhausDirs({ fs: fixFs, crewhausDir: join(process.cwd(), ".crewhaus") });
+  if (dirs !== undefined) actions.push(dirs);
+
+  // Fixer 3 — mark outward tools scope:external. Only when a spec exists (a
+  // scaffold-only run has no tools to audit yet). Reuses the strict-scope gate
+  // to find outward-by-name sinks that resolve to no external tool, then keeps
+  // only the plain-identifier ones a mechanical scope stamp can safely fix.
+  if (fixFs.exists(opts.specPath)) {
+    try {
+      const yamlText = fixFs.read(opts.specPath);
+      const spec = parseSpec(yamlText);
+      const ir = lower(spec);
+      const toolNames = collectToolNames(ir);
+      if (toolNames.length > 0) {
+        const toolMap = await loadToolMap();
+        const byRegisteredName: Record<string, RegisteredTool> = {};
+        for (const tool of Object.values(toolMap)) byRegisteredName[tool.name] = tool;
+        const findings = auditSpecToolNames(
+          toolNames,
+          (name) => toolMap[name] ?? byRegisteredName[name],
+        );
+        for (const f of findings) {
+          const fix = planScopeFix({
+            fs: fixFs,
+            specPath: opts.specPath,
+            specTarget: spec.target,
+            toolName: f.toolName,
+          });
+          if (fix !== undefined) actions.push(fix);
+        }
+      }
+    } catch {
+      // A spec that doesn't parse/lower can't be scope-audited — the credential
+      // and spec checks above already reported it; skip the scope fixer.
+    }
+  }
+
+  // Fixer 4 — commented .env stubs for the selected provider's missing creds.
+  if (opts.specModel !== undefined) {
+    const provider = selectedProvider(opts.specModel);
+    const neededVars = provider !== undefined ? providerEnvStubs(provider) : [];
+    const missing = neededVars.filter((v) => {
+      const val = process.env[v];
+      return typeof val !== "string" || val === "";
+    });
+    const envStub = planEnvStubs({
+      fs: fixFs,
+      envPath: join(process.cwd(), ".env"),
+      neededVars: missing,
+    });
+    if (envStub !== undefined) actions.push(envStub);
+  }
+
+  if (opts.apply) {
+    for (const a of actions) a.apply();
+  }
+  process.stdout.write(`\n${formatFixPlan(actions, opts.apply)}`);
 }
 
 /**
@@ -3858,6 +5192,156 @@ async function collectSamples(iter: AsyncIterable<Sample>): Promise<Sample[]> {
   return out;
 }
 
+/** Session ids under `.crewhaus/sessions`, newest first (by file mtime). */
+function sessionIdsByRecency(sessionsDir: string): string[] {
+  return listSessionIds(sessionsDir)
+    .map((id) => {
+      let mtime = 0;
+      try {
+        mtime = statSync(join(sessionsDir, `${id}.jsonl`)).mtimeMs;
+      } catch {
+        // A vanished file just sorts last.
+      }
+      return { id, mtime };
+    })
+    .sort((a, b) => b.mtime - a.mtime || (a.id < b.id ? -1 : 1))
+    .map((e) => e.id);
+}
+
+/**
+ * Item 6 — `crewhaus eval coverage`: build the production behavior
+ * distribution from the cwd spec's session JSONLs, intersect it with what the
+ * dataset (+ the most recent eval run for this spec) exercises, and print a
+ * ranked backlog of gaps. Never mutates anything — a pure read-side report.
+ */
+async function runEvalCoverage(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus eval coverage [--sessions N|all] [--dataset <file|registry:ref>]\n" +
+        "                              [-o <dir>] [--format text|html|json]\n" +
+        "  Detect agent behaviors present in PRODUCTION sessions that no eval sample\n" +
+        "  exercises (item 6). Builds a behavior distribution from the cwd spec's\n" +
+        "  .crewhaus/sessions/*.jsonl — tool/MCP call frequencies (mcp__-prefixed =\n" +
+        "  MCP), tool sequence bigrams, compaction frequency, clustered user inputs —\n" +
+        "  and intersects it with the dataset's expected_tools plus the tools used in\n" +
+        "  the most recent eval run for this spec (via the run-history index). Reports\n" +
+        "  a ranked list of gaps: 'mcp__jira__CreateIssue appears in 31% of sessions\n" +
+        "  but 0 dataset samples', 'compaction fired in N sessions, never in eval',\n" +
+        "  prod tool sequences no expected_tools covers. --dataset defaults to the\n" +
+        "  conventional eval/dataset.jsonl next to the cwd spec. --format json emits a\n" +
+        "  ranked backlog consumable by `crewhaus dataset mine`.\n",
+    );
+    return;
+  }
+
+  let format: ReturnType<typeof parseCoverageFormat>;
+  let sessionsWanted: number | "all";
+  try {
+    format = parseCoverageFormat(strFlag(args, "format"));
+    sessionsWanted = parseSessionsFlag(strFlag(args, "sessions"));
+  } catch (err) {
+    if (err instanceof EvalCoverageError) die(err.message);
+    throw err;
+  }
+
+  // The cwd spec identifies which sessions/runs belong to this harness.
+  const cwdSpecPath = join(process.cwd(), "crewhaus.yaml");
+  const cwdSpecText = existsSync(cwdSpecPath) ? readFileSync(cwdSpecPath, "utf-8") : undefined;
+  let specName: string | undefined;
+  if (cwdSpecText !== undefined) {
+    try {
+      specName = parseSpec(cwdSpecText).name;
+    } catch {
+      // Unparseable cwd spec — still report over every session/run.
+    }
+  }
+
+  // ---- production behavior ----
+  const sessionsDir = join(process.cwd(), SESSIONS_SUBDIR);
+  const allIds = sessionIdsByRecency(sessionsDir);
+  const ids = sessionsWanted === "all" ? allIds : allIds.slice(0, sessionsWanted);
+  if (ids.length === 0) {
+    die(
+      `no sessions found under ${sessionsDir} — run the harness (crewhaus run) to accumulate production behavior first`,
+    );
+  }
+  const sessions = ids.map((id) => ({ sessionId: id, events: readSessionEvents(id) }));
+  const prod = buildProdBehavior(sessions);
+
+  // ---- eval coverage: dataset expected_tools ----
+  const datasetFlag = strFlag(args, "dataset");
+  const datasetArg = datasetFlag ?? join("eval", "dataset.jsonl");
+  const samples: CoverageSample[] = [];
+  let datasetName: string | undefined;
+  let datasetResolved = false;
+  try {
+    const registryRef = parseRegistryRef(datasetArg);
+    if (registryRef !== undefined) {
+      const registry = createFileBackedRegistry({ rootDir: defaultDatasetsRoot() });
+      const resolved = await resolveRegistryRef(registry, registryRef);
+      for (const s of resolved.samples) samples.push(s);
+      datasetName = resolved.datasetName;
+      datasetResolved = true;
+    } else {
+      const absDataset = resolve(datasetArg);
+      if (existsSync(absDataset)) {
+        const dataset = await loadDataset(absDataset);
+        for await (const s of dataset.samples) samples.push(s);
+        datasetName = dataset.name;
+        datasetResolved = true;
+      }
+    }
+  } catch (err) {
+    // A missing/unreadable dataset is not fatal for a coverage report — we can
+    // still report against the eval-run events and flag that no expected_tools
+    // baseline was available. Registry/ref errors surface as a warning.
+    if (err instanceof DatasetRefError || err instanceof CrewhausError) {
+      process.stderr.write(`[coverage] dataset "${datasetArg}" unusable (${err.message})\n`);
+    } else {
+      throw err;
+    }
+  }
+  if (!datasetResolved && datasetFlag !== undefined) {
+    die(`--dataset "${datasetArg}" not found or unreadable`);
+  }
+
+  // ---- eval coverage: most recent eval run's per-sample tool usage ----
+  const runEventTexts: string[] = [];
+  const entries = readRunIndex().filter((e) => specName === undefined || e.specName === specName);
+  const latest = entries[entries.length - 1];
+  if (latest !== undefined) {
+    try {
+      const run = await loadRun(latest.outDir);
+      for (const sample of Object.values(run.perSample)) {
+        if (sample.events.trim() !== "") runEventTexts.push(sample.events);
+      }
+    } catch {
+      // A vanished/torn run dir just means no run-event coverage this pass.
+    }
+  }
+
+  const evalCov = buildEvalCoverage(samples, runEventTexts);
+  const report = computeCoverage({
+    prod,
+    evalCov,
+    ...(specName !== undefined ? { specName } : {}),
+    ...(datasetName !== undefined ? { datasetName } : {}),
+  });
+
+  const rendered = renderCoverage(report, format);
+  const outDir = strFlag(args, "out");
+  if (outDir !== undefined) {
+    mkdirSync(resolve(outDir), { recursive: true });
+    const outPath = join(resolve(outDir), coverageFileName(format));
+    writeFileSync(outPath, rendered);
+    process.stdout.write(
+      `[coverage] ${report.gaps.length} gap(s) across ${report.sessionsScanned} session(s) → ${outPath}\n`,
+    );
+  } else {
+    process.stdout.write(rendered);
+  }
+}
+
 async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
@@ -4549,6 +6033,648 @@ async function runDatasetsPut(args: ParsedArgs): Promise<void> {
   );
 }
 
+// -------- item 2: `crewhaus dataset` (singular) growth family --------
+
+const QUARANTINE_SUBDIR = join(".crewhaus", "datasets", "_quarantine");
+const AUDIT_SUBDIR = join(".crewhaus", "audit");
+
+/** The cwd crewhaus.yaml's spec name, or undefined when absent/unparseable. */
+function cwdSpecName(): string | undefined {
+  const p = join(process.cwd(), "crewhaus.yaml");
+  if (!existsSync(p)) return undefined;
+  try {
+    return parseSpec(readFileSync(p, "utf-8")).name;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Read all audit records from `.crewhaus/audit/*.jsonl` (day files), tolerant
+ *  of torn lines. Empty when the audit dir is absent (e.g. egress has no
+ *  writer yet). */
+function readAuditRecords(): unknown[] {
+  const dir = join(process.cwd(), AUDIT_SUBDIR);
+  if (!existsSync(dir)) return [];
+  const out: unknown[] = [];
+  for (const file of readdirSync(dir).sort()) {
+    if (!file.endsWith(".jsonl")) continue;
+    out.push(...parseJsonlObjects(readFileSync(join(dir, file), "utf-8")));
+  }
+  return out;
+}
+
+/** `dataset` dispatcher — mine / synthesize / refresh-goldens (item 5). */
+async function runDataset(args: ParsedArgs): Promise<void> {
+  const action = args.positional[0];
+  if (args.flags["help"] && action === undefined) {
+    process.stdout.write(
+      "usage: crewhaus dataset <mine|synthesize|refresh-goldens> [...]\n" +
+        "  mine            grow the dataset from production struggle signals (item 2)\n" +
+        "  synthesize      generate PII-redacted stress variants of a source dataset (item 2)\n" +
+        "  refresh-goldens reconcile user corrections with existing golds (item 5)\n",
+    );
+    return;
+  }
+  try {
+    switch (action) {
+      case "mine":
+        await runDatasetMine(args);
+        return;
+      case "synthesize":
+        await runDatasetSynthesize(args);
+        return;
+      case "refresh-goldens":
+        await runRefreshGoldens(args);
+        return;
+      default:
+        die(
+          `dataset: unknown action "${action ?? ""}" — supported: mine, synthesize, refresh-goldens`,
+        );
+    }
+  } catch (err) {
+    if (err instanceof CrewhausError || err instanceof DatasetRefError) die(err.message);
+    throw err;
+  }
+}
+
+/**
+ * Item 2 — `crewhaus dataset mine`: scan the cwd spec's session JSONLs for
+ * negative signals (tool-error spikes, runtime errors, loop nudges, retries)
+ * plus egress blocks from the audit log, collect each triggering turn's input
+ * as a QUARANTINE candidate, and (with `--review`) promote accepted ones into
+ * a mined registry dataset.
+ */
+async function runDatasetMine(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus dataset mine [--sessions N|all] [--out-dataset <name>] [--review] [--yes]\n" +
+        "  Scan .crewhaus/sessions/*.jsonl (this spec) for hard cases needing NO\n" +
+        "  rating — error events, tool_result isError spikes, the synthetic\n" +
+        "  '[runtime] possible loop detected' nudge, consecutive near-duplicate\n" +
+        "  user retries — plus egress_decision blocks from .crewhaus/audit (if any).\n" +
+        "  Each triggering turn's input becomes a candidate Sample in a QUARANTINE\n" +
+        "  staging file (.crewhaus/datasets/_quarantine/<spec>-hardcases.jsonl).\n" +
+        "  --review accepts/rejects candidates: interactive in a TTY ([a]ccept /\n" +
+        "  [r]eject / [s]kip); in non-TTY it only PRINTS the candidates unless --yes\n" +
+        "  is also given, in which case ALL listed candidates promote. This keeps a\n" +
+        "  scripted/CI --review from silently promoting unreviewed candidates.\n" +
+        "  Accepted candidates promote into the <spec>-hardcases (or --out-dataset)\n" +
+        "  mined registry version with provenance in metadata (source: mine, signal,\n" +
+        "  sessionId).\n",
+    );
+    return;
+  }
+  const specName = cwdSpecName() ?? "harness";
+  const outDataset = strFlag(args, "out-dataset") ?? `${specName}-hardcases`;
+  let sessionsWanted: number | "all";
+  try {
+    sessionsWanted = parseSessionsFlag(strFlag(args, "sessions"));
+  } catch (err) {
+    if (err instanceof EvalCoverageError) die(err.message);
+    throw err;
+  }
+
+  const sessionsDir = join(process.cwd(), SESSIONS_SUBDIR);
+  const allIds = sessionIdsByRecency(sessionsDir);
+  const ids = sessionsWanted === "all" ? allIds : allIds.slice(0, sessionsWanted);
+
+  const raw: MineCandidate[] = [];
+  for (const id of ids) raw.push(...mineSession(id, readSessionEvents(id)));
+
+  // Egress blocks from the audit log (may be empty — no writer yet). Attach
+  // each to the most-recent turn input of its named session when known.
+  const egress = egressBlocksFromAudit(readAuditRecords());
+  for (const block of egress) {
+    if (block.sessionId === undefined || !existsSync(sessionJsonlPath(block.sessionId))) continue;
+    const turns = deriveTurns(readSessionEvents(block.sessionId));
+    const last = turns[turns.length - 1];
+    if (last === undefined) continue;
+    raw.push({
+      sessionId: block.sessionId,
+      turnNumber: last.turnNumber,
+      input: last.input,
+      signal: "egress-block",
+      reason: block.reason,
+    });
+  }
+
+  const candidates = dedupeCandidates(raw);
+  if (candidates.length === 0) {
+    process.stdout.write(
+      `[dataset mine] no hard-case signals in ${ids.length} session(s) — nothing to quarantine\n`,
+    );
+    return;
+  }
+
+  // Always (re)write the quarantine staging file.
+  const quarantineDir = join(process.cwd(), QUARANTINE_SUBDIR);
+  mkdirSync(quarantineDir, { recursive: true });
+  const quarantinePath = join(quarantineDir, `${specName}-hardcases.jsonl`);
+  const quarantineSamples = candidates.map(candidateToSample);
+  writeFileSync(quarantinePath, `${quarantineSamples.map((s) => JSON.stringify(s)).join("\n")}\n`);
+  process.stdout.write(
+    `[dataset mine] ${candidates.length} candidate(s) quarantined → ${quarantinePath}\n`,
+  );
+
+  if (args.flags["review"] !== true) {
+    process.stdout.write(
+      "[dataset mine] run with --review to accept/reject and promote into the mined dataset\n",
+    );
+    return;
+  }
+
+  // Review: interactive per-candidate in a TTY. Non-TTY NEVER auto-promotes
+  // on --review alone — that would silently write unreviewed candidates into
+  // the mined dataset from a script/CI run. --yes opts into non-interactive
+  // promotion explicitly; without it we print the candidates and stop.
+  let accepted: MineCandidate[];
+  if (process.stdin.isTTY === true) {
+    accepted = await reviewCandidatesInteractive(candidates);
+  } else if (args.flags["yes"] === true) {
+    process.stdout.write(renderCandidateList(candidates));
+    process.stdout.write(
+      "[dataset mine] non-TTY --yes — accepting ALL listed candidates for promotion\n",
+    );
+    accepted = [...candidates];
+  } else {
+    process.stdout.write(renderCandidateList(candidates));
+    process.stdout.write(
+      "[dataset mine] non-TTY — re-run with --yes to promote non-interactively, or --review in a TTY\n",
+    );
+    return;
+  }
+  if (accepted.length === 0) {
+    process.stdout.write("[dataset mine] no candidates accepted — mined dataset unchanged\n");
+    return;
+  }
+  const registry = createFileBackedRegistry({ rootDir: defaultDatasetsRoot() });
+  const rec = await registerDataset({
+    registry,
+    name: outDataset,
+    samples: accepted.map(candidateToSample),
+  });
+  process.stdout.write(
+    `[dataset mine] promoted ${accepted.length} accepted candidate(s) → ${rec.name}@${rec.version} ` +
+      `(use with --dataset registry:${rec.name})\n`,
+  );
+}
+
+/** Per-candidate interactive accept/reject/skip over a raw-mode key read. */
+async function reviewCandidatesInteractive(
+  candidates: ReadonlyArray<MineCandidate>,
+): Promise<MineCandidate[]> {
+  const accepted: MineCandidate[] = [];
+  for (const c of candidates) {
+    process.stdout.write(
+      `\n[${c.signal}] ${c.sessionId} turn ${c.turnNumber}\n  ${c.input}\n  (${c.reason})\n  [a]ccept / [r]eject / [s]kip? `,
+    );
+    let decision: ReturnType<typeof parseReviewKey>;
+    // Read whole lines (Enter-terminated) so this works in a piped/scripted
+    // TTY too; an unrecognized key re-prompts.
+    do {
+      const key = await readLineFromStdin();
+      decision = parseReviewKey(key);
+      if (decision === undefined) process.stdout.write("  [a]ccept / [r]eject / [s]kip? ");
+    } while (decision === undefined);
+    if (decision === "accept") accepted.push(c);
+    process.stdout.write(`  → ${decision}\n`);
+  }
+  return accepted;
+}
+
+/** One line from stdin (resolves "" on EOF). */
+function readLineFromStdin(): Promise<string> {
+  return new Promise((resolveLine) => {
+    const onData = (chunk: Buffer): void => {
+      process.stdin.off("data", onData);
+      resolveLine(chunk.toString("utf-8").replace(/[\r\n]+$/, ""));
+    };
+    process.stdin.once("data", onData);
+    process.stdin.once("end", () => resolveLine(""));
+  });
+}
+
+/**
+ * Item 2 — `crewhaus dataset synthesize`: sample real inputs from a source
+ * dataset, PII-redact them, and generate paraphrases + stress mutations
+ * (truncation, ambiguity, injection payloads from the detector's REGEX_RULES)
+ * into a provenance-tagged SYNTHETIC dataset that never contaminates
+ * human-gold splits. Deterministic template mutations without credentials;
+ * model paraphrases (budget-capped) layered on when a model is available.
+ */
+async function runDatasetSynthesize(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus dataset synthesize --from <file|registry:ref> [--count N]\n" +
+        "                                   [--budget-usd N] [--out-dataset <name>] [--model <m>]\n" +
+        "  Sample real inputs from --from, PII-redact them (@crewhaus/pii-redactor),\n" +
+        "  and generate paraphrases + stress mutations (truncation, ambiguity, and\n" +
+        "  prompt-injection payloads seeded from the detector's REGEX_RULES) into a\n" +
+        "  SEPARATE, provenance-tagged synthetic dataset (metadata.source: synthesize;\n" +
+        "  injection variants marked adversarial). Synthetic samples NEVER carry a\n" +
+        "  human gold answer, so they can't contaminate real golds. Deterministic\n" +
+        "  template mutations when no credentials; model paraphrases (budget-capped\n" +
+        "  via --budget-usd) when a model is available.\n",
+    );
+    return;
+  }
+  const from = strFlag(args, "from");
+  if (from === undefined) die("missing --from <file|registry:ref>");
+  const count = intFlag(args, "count") ?? 5;
+  if (count < 1) die(`invalid --count "${count}" — need at least 1`);
+
+  // Resolve the source samples (file or registry).
+  const sourceSamples: Sample[] = [];
+  let sourceName: string;
+  const registryRef = parseRegistryRef(from);
+  if (registryRef !== undefined) {
+    const registry = createFileBackedRegistry({ rootDir: defaultDatasetsRoot() });
+    const resolved = await resolveRegistryRef(registry, registryRef);
+    for (const s of resolved.samples) sourceSamples.push(s);
+    sourceName = registryRef.name;
+  } else {
+    const abs = resolve(from);
+    if (!existsSync(abs)) die(`--from "${from}" not found`);
+    const loaded = await loadDataset(abs);
+    for await (const s of loaded.samples) sourceSamples.push(s);
+    sourceName = loaded.name;
+  }
+  if (sourceSamples.length === 0) die(`--from "${from}" yielded zero samples`);
+
+  const outDataset = strFlag(args, "out-dataset") ?? `${sourceName}-synth`;
+
+  // PII redactor: default regex detectors (SSN/CC/phone/email/IBAN) PLUS the
+  // secret/API-key detector (sk-/ghp_/xoxb-/AKIA/Bearer <token>/contextual
+  // opaque token — see dataset-mine.ts SYNTHESIZE_PII_DETECTORS) so a pasted
+  // credential in a production input can't survive into a synthesized
+  // variant or the model paraphrase prompt below. Redact BEFORE any mutation
+  // or model call so no PII/secret ever leaves the box.
+  const { createPiiRedactor } = await import("@crewhaus/pii-redactor");
+  const redactor = createPiiRedactor({ regexDetectors: SYNTHESIZE_PII_DETECTORS });
+
+  // Model paraphrases are opt-in when a model + credentials are visible. The
+  // budget gate bounds them (estimate-before/record-after). Without a model we
+  // stay fully deterministic — no synthetic dataset needs credentials.
+  const modelFlag = strFlag(args, "model");
+  const specModel =
+    modelFlag ??
+    extractSpecModel(
+      cwdSpecName() !== undefined
+        ? readFileSync(join(process.cwd(), "crewhaus.yaml"), "utf-8")
+        : "",
+    );
+  const useModel =
+    specModel !== undefined &&
+    (modelFlag !== undefined || providerCredentialsSatisfied(specModel, process.env));
+  const budgetUsd = floatFlag(args, "budget-usd");
+
+  const synthSamples: Sample[] = [];
+  let idx = 0;
+  let modelBudgetHit = false;
+  for (const src of sourceSamples) {
+    const { text: redacted } = await redactor.redact(src.input);
+    const variants = buildStressVariants(redacted, count);
+    for (const v of variants) {
+      synthSamples.push(variantToSample(v, src.id, idx));
+      idx += 1;
+    }
+    // Optional model paraphrase, budget-permitting. Best-effort — a failed
+    // call keeps the deterministic variants.
+    if (useModel && specModel !== undefined && !modelBudgetHit) {
+      // Cheap deterministic budget guard: cap the number of model calls by a
+      // rough per-call estimate against the dollar budget (paraphrase calls
+      // are small; skip once we would exceed).
+      if (budgetUsd !== undefined && idx * 0.002 > budgetUsd) {
+        modelBudgetHit = true;
+      } else {
+        try {
+          const raw = await oneShotModelText({
+            model: specModel,
+            system:
+              "You paraphrase a user request into ONE realistic alternative phrasing. Output only the paraphrase, no preamble.",
+            prompt: redacted,
+            maxTokens: 256,
+          });
+          const paraphrase = raw.trim();
+          if (paraphrase !== "" && paraphrase !== redacted) {
+            synthSamples.push(
+              variantToSample({ input: paraphrase, mutation: "paraphrase" }, src.id, idx),
+            );
+            idx += 1;
+          }
+        } catch {
+          // keep deterministic variants
+        }
+      }
+    }
+  }
+
+  if (synthSamples.length === 0) die("synthesize produced no variants — source inputs were empty");
+
+  const registry = createFileBackedRegistry({ rootDir: defaultDatasetsRoot() });
+  const rec = await registerDataset({ registry, name: outDataset, samples: synthSamples });
+  process.stdout.write(
+    `[dataset synthesize] ${synthSamples.length} synthetic variant(s) from ${sourceSamples.length} source sample(s) → ` +
+      `${rec.name}@${rec.version} (source: synthesize; use with --dataset registry:${rec.name})\n`,
+  );
+  if (modelBudgetHit) {
+    process.stdout.write(
+      "[dataset synthesize] model paraphrases stopped early — --budget-usd reached\n",
+    );
+  }
+}
+
+/**
+ * Item 5 — `crewhaus dataset refresh-goldens`: reconcile the corrections +
+ * up-rated turns accumulated in production against an existing dataset's gold
+ * answers. Prints a review diff by default; `--apply` writes the reconciled
+ * samples as a NEW registry version (never in-place).
+ */
+async function runRefreshGoldens(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus dataset refresh-goldens --dataset <file|registry:ref>\n" +
+        "                                        [--sessions N|all] [--min-score F] [--apply]\n" +
+        "  Match user corrections + up-rated turns (from sessions + the web-UI\n" +
+        "  feedback dir) against the dataset's samples by input equality then\n" +
+        "  similarity (item 5). Where an accepted/corrected output diverges from the\n" +
+        "  stored expected_output, PROPOSE a gold update (a review diff). Samples that\n" +
+        "  fail consistently across eval runs yet are repeatedly up-rated live are\n" +
+        "  flagged stale (via the run-history index; no history → no stale signal).\n" +
+        "  Default prints the diff only; --apply writes the reconciled samples as a\n" +
+        "  NEW dataset-registry version (never in-place). Sample content hashes give\n" +
+        "  provenance.\n",
+    );
+    return;
+  }
+  const datasetArg = strFlag(args, "dataset");
+  if (datasetArg === undefined) die("missing --dataset <file|registry:ref>");
+  const apply = args.flags["apply"] === true;
+  const minScore = floatFlag(args, "min-score") ?? DEFAULT_REFRESH_MIN_SCORE;
+  if (minScore < 0 || minScore > 1) die(`invalid --min-score "${minScore}" — must be in [0,1]`);
+  let sessionsWanted: number | "all";
+  try {
+    sessionsWanted = parseSessionsFlag(strFlag(args, "sessions"));
+  } catch (err) {
+    if (err instanceof EvalCoverageError) die(err.message);
+    throw err;
+  }
+
+  // Resolve the dataset samples + the registry name to version on --apply.
+  const registryRef = parseRegistryRef(datasetArg);
+  const samples: Sample[] = [];
+  let datasetLabel: string;
+  let registryName: string | undefined;
+  if (registryRef !== undefined) {
+    const registry = createFileBackedRegistry({ rootDir: defaultDatasetsRoot() });
+    const resolved = await resolveRegistryRef(registry, registryRef);
+    for (const s of resolved.samples) samples.push(s);
+    datasetLabel = resolved.datasetName;
+    registryName = registryRef.name;
+  } else {
+    const abs = resolve(datasetArg);
+    if (!existsSync(abs)) die(`--dataset "${datasetArg}" not found`);
+    const loaded = await loadDataset(abs);
+    for await (const s of loaded.samples) samples.push(s);
+    datasetLabel = loaded.name;
+  }
+  if (samples.length === 0) die(`dataset "${datasetArg}" yielded zero samples`);
+  if (apply && registryName === undefined) {
+    die(
+      "--apply requires --dataset registry:<name> — a NEW version is written to the registry, never a file in place",
+    );
+  }
+
+  // Feedback + turns from sessions (bounded by --sessions) + the web-UI dir.
+  const sessionsDir = join(process.cwd(), SESSIONS_SUBDIR);
+  const allIds = sessionIdsByRecency(sessionsDir);
+  const ids = sessionsWanted === "all" ? allIds : allIds.slice(0, sessionsWanted);
+  const turns: SessionTurn[] = [];
+  const records: FeedbackRecord[] = [];
+  for (const id of ids) {
+    const events = readSessionEvents(id);
+    for (const t of deriveTurns(events)) turns.push({ ...t, sessionId: id });
+    records.push(...extractFeedbackRecords(events));
+  }
+  records.push(...readFeedbackDir(join(process.cwd(), FEEDBACK_SUBDIR)));
+
+  // Cross-run pass/fail outcomes for the stale flag — from the recent eval
+  // runs for the cwd spec (best-effort; unreadable runs are skipped).
+  const specName = cwdSpecName();
+  const runOutcomes: RunSampleOutcome[][] = [];
+  const runEntries = readRunIndex().filter(
+    (e) => specName === undefined || e.specName === specName,
+  );
+  for (const entry of runEntries.slice(-10)) {
+    try {
+      const run = await loadRun(entry.outDir);
+      runOutcomes.push(
+        run.summary.samples.map((s) => ({ sampleId: s.sampleId, passed: s.grades.overall.passed })),
+      );
+    } catch {
+      // torn/missing run dir — skip
+    }
+  }
+
+  const result = reconcileGoldens({ samples, turns, records, minScore, runOutcomes });
+  process.stdout.write(renderProposals(result, datasetLabel));
+
+  if (!apply || result.proposals.length === 0) return;
+
+  const updated = applyProposals(samples, result.proposals);
+  const registry = createFileBackedRegistry({ rootDir: defaultDatasetsRoot() });
+  // Registry name is guaranteed defined here (checked above).
+  const rec = await registerDataset({ registry, name: registryName as string, samples: updated });
+  process.stdout.write(
+    `[refresh-goldens] applied ${result.proposals.length} gold update(s) → ${rec.name}@${rec.version} (new version; prior versions untouched)\n`,
+  );
+}
+
+// -------- item 8: crewhaus judge calibrate --------
+
+const JUDGE_CALIBRATION_RELPATH = join(".crewhaus", "judge-calibration.json");
+
+/** The default judge rubric used when no `--graders` llm_judge is supplied. */
+function defaultCalibrationRubric(): {
+  criteria: Array<{
+    name: string;
+    description: string;
+    anchors: { "1": string; "2": string; "3": string; "4": string; "5": string };
+  }>;
+  passing_score: number;
+} {
+  return {
+    criteria: [
+      {
+        name: "answer_quality",
+        description:
+          "Judge how well the assistant's answer serves the user's request — correctness, completeness, and usefulness.",
+        anchors: {
+          "1": "Wrong, off-topic, or unusable.",
+          "2": "Mostly unhelpful; major gaps or errors.",
+          "3": "Partially helpful; noticeable gaps.",
+          "4": "Helpful with only minor gaps.",
+          "5": "Fully correct, complete, and useful.",
+        },
+      },
+    ],
+    passing_score: 3,
+  };
+}
+
+/**
+ * Item 8 — `crewhaus judge calibrate`: pair each turn that has BOTH a human
+ * rating AND a judgeable transcript with the llm_judge's score, then print an
+ * agreement/bias/ROC calibration card. Model-dependent by nature: without
+ * judge credentials it explains what it needs and exits cleanly (never
+ * fabricates scores). `--apply` persists the calibrated cut.
+ */
+async function runJudgeCalibrate(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus judge calibrate [--dataset <file|registry:ref>] [--graders <graders.yaml>]\n" +
+        "                                [--sessions N|all] [--model <judge-model>] [--apply]\n" +
+        "  Pair (human rating, llm_judge score) for turns that carry BOTH a human\n" +
+        "  user_feedback rating AND can be judged (item 8): re-runs the llm_judge\n" +
+        "  grader (from --graders, or a default rubric) over each rated transcript\n" +
+        "  turn. Computes agreement (correlation + confusion at the current cut),\n" +
+        "  systematic bias (judge mean − human mean), and the ROC-optimal cut that\n" +
+        "  best separates up- from down-rated turns, and flags rubric criteria whose\n" +
+        "  judge-human disagreement is high (naming exemplars to re-anchor). Without\n" +
+        "  judge credentials it explains what it needs and exits — it never\n" +
+        "  fabricates scores. --apply writes the calibrated --min-score default to\n" +
+        "  .crewhaus/judge-calibration.json (a file distill/optimize could later read).\n",
+    );
+    return;
+  }
+
+  // Gather rated turns (numeric human rating) from sessions + the feedback dir.
+  const specName = cwdSpecName();
+  let sessionsWanted: number | "all";
+  try {
+    sessionsWanted = parseSessionsFlag(strFlag(args, "sessions"));
+  } catch (err) {
+    if (err instanceof EvalCoverageError) die(err.message);
+    throw err;
+  }
+  const sessionsDir = join(process.cwd(), SESSIONS_SUBDIR);
+  const allIds = sessionIdsByRecency(sessionsDir);
+  const ids = sessionsWanted === "all" ? allIds : allIds.slice(0, sessionsWanted);
+  const turns: SessionTurn[] = [];
+  const records: FeedbackRecord[] = [];
+  for (const id of ids) {
+    const events = readSessionEvents(id);
+    for (const t of deriveTurns(events)) turns.push({ ...t, sessionId: id });
+    records.push(...extractFeedbackRecords(events));
+  }
+  records.push(...readFeedbackDir(join(process.cwd(), FEEDBACK_SUBDIR)));
+
+  const turnByKey = new Map<string, SessionTurn>();
+  for (const t of turns) turnByKey.set(`${t.sessionId}#${t.turnNumber}`, t);
+
+  // Rated turns with a numeric signal AND a non-empty answer to judge.
+  type RatedTurn = { turn: SessionTurn; human: number };
+  const rated: RatedTurn[] = [];
+  for (const fb of mergeFeedback(records)) {
+    const human = normalizeRating(fb);
+    if (human === undefined) continue; // comment-only, no numeric signal
+    const turn = turnByKey.get(`${fb.sessionId}#${fb.turnNumber}`);
+    if (turn === undefined || turn.output.trim() === "") continue;
+    rated.push({ turn, human });
+  }
+  if (rated.length === 0) {
+    die(
+      "no rated turns to calibrate against — collect numeric ratings (crewhaus rate --thumbs/--stars/--score) first",
+    );
+  }
+
+  // Resolve the judge model + credentials. No credentials → explain + exit
+  // cleanly (never fabricate scores).
+  const modelFlag = strFlag(args, "model");
+  const { DEFAULT_JUDGE_MODEL } = await import("@crewhaus/eval-judge");
+  const judgeModel = modelFlag ?? DEFAULT_JUDGE_MODEL;
+  if (!providerCredentialsSatisfied(judgeModel, process.env)) {
+    die(
+      `judge calibrate needs a judge model with visible credentials (tried "${judgeModel}"). Set the provider credentials (e.g. ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN) or pass --model <provider/model> for a model you have keys for, then re-run.`,
+    );
+  }
+
+  // The rubric to calibrate: the graders.yaml llm_judge, else a default rubric.
+  const gradersPath = strFlag(args, "graders");
+  let rubricObject: unknown = defaultCalibrationRubric();
+  if (gradersPath !== undefined) {
+    const { compiled } = parseGradersConfig(readFileSync(resolve(gradersPath), "utf-8"));
+    const judgeEntry = compiled.find((g) => g.judgeSpec !== undefined);
+    if (judgeEntry?.judgeSpec === undefined) {
+      die(`--graders "${gradersPath}" has no llm_judge grader to calibrate`);
+    }
+    rubricObject = judgeEntry.judgeSpec.rubric;
+  }
+
+  const { judge, loadRubric } = await import("@crewhaus/eval-judge");
+  const rubric = loadRubric(rubricObject);
+
+  // Re-run the judge over each rated turn's transcript, pairing to the human
+  // rating. A per-turn judge failure is skipped (best-effort) so one flaky
+  // call cannot abort the whole calibration.
+  const pairs: CalibrationPair[] = [];
+  let judgeFailures = 0;
+  for (const { turn, human } of rated) {
+    try {
+      const result = await judge({
+        rubric,
+        sample: { id: `${turn.sessionId}_t${turn.turnNumber}`, input: turn.input },
+        agentOutput: turn.output,
+        model: judgeModel,
+      });
+      pairs.push({
+        sessionId: turn.sessionId,
+        turnNumber: turn.turnNumber,
+        human,
+        judge: result.score,
+        ...(Object.keys(result.criterionScores).length > 0
+          ? { criterionScores: result.criterionScores }
+          : {}),
+      });
+    } catch {
+      judgeFailures += 1;
+    }
+  }
+  if (pairs.length === 0) {
+    die(`the judge model "${judgeModel}" produced no usable scores (${judgeFailures} failure(s))`);
+  }
+
+  const card = buildCalibrationCard(pairs, {
+    ...(specName !== undefined ? { specName } : {}),
+    model: judgeModel,
+  });
+  process.stdout.write(renderCalibrationCard(card));
+  if (judgeFailures > 0) {
+    process.stdout.write(
+      `[judge calibrate] ${judgeFailures} turn(s) skipped (judge call failed)\n`,
+    );
+  }
+
+  if (args.flags["apply"] === true) {
+    const path = join(process.cwd(), JUDGE_CALIBRATION_RELPATH);
+    let existing: JudgeCalibrationFile | undefined;
+    if (existsSync(path)) {
+      try {
+        existing = JSON.parse(readFileSync(path, "utf-8")) as JudgeCalibrationFile;
+      } catch {
+        // A corrupt file is replaced.
+      }
+    }
+    const file = buildCalibrationFile(existing, card, new Date().toISOString());
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, `${JSON.stringify(file, null, 2)}\n`);
+    const cut = card.recommendedCut?.cut ?? DEFAULT_JUDGE_CUT;
+    process.stdout.write(
+      `[judge calibrate] wrote calibrated --min-score ${cut.toFixed(3)} for "${specName ?? "default"}" → ${path}\n`,
+    );
+  }
+}
+
 /**
  * Section 27 — `crewhaus cost-summary [--session <id>] [--tenant <id>]
  * [--format json|text]`. Reads `cost_accrual` events out of an `event-log`
@@ -4899,7 +7025,7 @@ function readRecentSessionEvents(limit: number | "all"): SessionEvents[] {
 }
 
 /** Parse the `--sessions N|all` flag shared by tools audit + future miners. */
-function parseSessionsFlag(args: ParsedArgs, dflt: number): number | "all" {
+function parseSessionsLimit(args: ParsedArgs, dflt: number): number | "all" {
   const raw = strFlag(args, "sessions");
   if (raw === undefined) return dflt;
   if (raw === "all") return "all";
@@ -4983,7 +7109,7 @@ async function runTools(action: string, args: ParsedArgs): Promise<void> {
   }
 
   if (action === "audit") {
-    const limit = parseSessionsFlag(args, DEFAULT_AUDIT_SESSIONS);
+    const limit = parseSessionsLimit(args, DEFAULT_AUDIT_SESSIONS);
     const sessions = readRecentSessionEvents(limit);
     if (sessions.length === 0) {
       die(
@@ -5071,7 +7197,7 @@ async function runPermissions(action: string, args: ParsedArgs): Promise<void> {
     die(`permissions action must be "suggest" (got "${action}")`);
   }
 
-  const limit = parseSessionsFlag(args, DEFAULT_PERMISSIONS_SESSIONS);
+  const limit = parseSessionsLimit(args, DEFAULT_PERMISSIONS_SESSIONS);
   const sessions = readRecentSessionEvents(limit);
   if (sessions.length === 0) {
     die(
@@ -5407,6 +7533,12 @@ async function runDistill(args: ParsedArgs): Promise<void> {
     ...(typeof judgeModel === "string" ? { judgeModel } : {}),
   });
   for (const w of result.warnings) process.stderr.write(`[distill] warning: ${w}\n`);
+  // Item 4 — the synthesis fell back to the floor grader (no consistent
+  // tool/phrase signal in the ratings): point at the failure-rationale
+  // drafting path, which mines eval runs the ratings can't see.
+  if (isFloorGraderConfig(result.graders)) {
+    process.stdout.write(`[distill] ${FLOOR_GRADER_HINT}\n`);
+  }
   if (result.samples.length === 0) die("no rated turns could be matched to the transcript(s)");
 
   // Plain file output — unchanged default; skipped only when the caller went
@@ -5511,6 +7643,198 @@ function distillRatings(
     ...(s.expected_output !== undefined ? { expected_output: s.expected_output } : {}),
   }));
   return { samples, gradersYaml: gradersConfigToYaml(result.graders) };
+}
+
+// -------- item 4: crewhaus graders suggest --------
+
+/**
+ * Item 4 — `crewhaus graders suggest`: cluster the failure rationale
+ * accumulated in recent eval runs (grades.json via the item-3 run-history
+ * index) and user feedback comments into themes, draft deterministic
+ * graders per theme from the observed up-rated outputs, optionally add a
+ * model-drafted llm_judge rubric, and write a REVIEW file — never applied
+ * automatically. All the pure logic lives in ./graders-suggest; this is
+ * flag parsing + IO per house pattern.
+ */
+async function runGradersSuggest(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus graders suggest [--runs <dir|last:N>] [--model <m>] [-o <file>]\n" +
+        "                                [--spec <name>] [--min-score F] [--force]\n" +
+        "  Draft grader suites from evidence that already exists (item 4):\n" +
+        "    - per-sample grader rationale (grades.json) from recent eval runs —\n" +
+        "      located via the run-history index for the cwd spec (last 10 by\n" +
+        "      default; --runs last:N or --runs <run-dir> to choose)\n" +
+        "    - judge criterionScores where present\n" +
+        "    - user feedback comments (down-rated = failure evidence; up-rated\n" +
+        "      turns = good exemplars)\n" +
+        "  Failure texts cluster into themes DETERMINISTICALLY (token overlap — no\n" +
+        "  model call); each theme gets a deterministic draft grader\n" +
+        "  (tool_call_sequence/json_path/regex/contains) derived from the up-rated\n" +
+        "  outputs. With --model (or visible credentials for the cwd spec's model) a\n" +
+        "  complete llm_judge rubric — all five anchors — is additionally drafted\n" +
+        "  from real good/bad exemplars.\n" +
+        "  Output is a REVIEW file (-o, default graders-suggested.yaml): valid\n" +
+        "  graders.yaml with an evidence comment per grader. It is NEVER applied\n" +
+        "  automatically — and its header documents that stacking graders hard-ANDs\n" +
+        "  their scores, so adopt ONE grader rather than the whole stack.\n",
+    );
+    return;
+  }
+  const force = args.flags["force"] === true;
+  const outPath = resolve(strFlag(args, "out") ?? DEFAULT_SUGGESTED_GRADERS_FILE);
+  if (!force && existsSync(outPath)) {
+    die(`refusing to overwrite ${outPath} — re-run with --force to replace it`);
+  }
+  const minScore = floatFlag(args, "min-score") ?? 0.7;
+  if (minScore < 0 || minScore > 1) die(`invalid --min-score "${minScore}" — must be in [0,1]`);
+
+  // Spec name filter for the run index: --spec > the cwd crewhaus.yaml's
+  // name (tolerant — an unparseable spec just means no filter).
+  let specName = strFlag(args, "spec");
+  const cwdSpecPath = join(process.cwd(), "crewhaus.yaml");
+  const cwdSpecText = existsSync(cwdSpecPath) ? readFileSync(cwdSpecPath, "utf-8") : undefined;
+  if (specName === undefined && cwdSpecText !== undefined) {
+    try {
+      specName = parseSpec(cwdSpecText).name;
+    } catch {
+      // Unparseable cwd spec — suggest across every indexed run.
+    }
+  }
+
+  // Resolve the runs to mine: an explicit run dir, or the last N entries of
+  // the item-3 run-history index (filtered to this spec when known).
+  let selector: RunsSelector = { kind: "last", n: DEFAULT_SUGGEST_RUNS };
+  const runsFlag = strFlag(args, "runs");
+  if (runsFlag !== undefined) {
+    try {
+      selector = parseRunsFlag(runsFlag);
+    } catch (err) {
+      if (err instanceof GradersSuggestError) die(err.message);
+      throw err;
+    }
+  }
+  let runDirs: string[];
+  if (selector.kind === "dir") {
+    runDirs = [resolve(selector.dir)];
+  } else {
+    const entries = readRunIndex().filter((e) => specName === undefined || e.specName === specName);
+    runDirs = entries.slice(-selector.n).map((e) => e.outDir);
+  }
+
+  const failures: FailureEvidence[] = [];
+  const passes: PassExemplar[] = [];
+  let runsSeen = 0;
+  for (const dir of runDirs) {
+    try {
+      const evidence = evidenceFromRun(await loadRun(dir));
+      failures.push(...evidence.failures);
+      passes.push(...evidence.passes);
+      runsSeen += 1;
+    } catch (err) {
+      process.stderr.write(
+        `[graders] run ${dir} unreadable (${err instanceof Error ? err.message : String(err)}) — skipped\n`,
+      );
+    }
+  }
+
+  // User feedback — the same sources `crewhaus distill` reads (transcript
+  // ratings + the web-UI feedback dir).
+  const turns: SessionTurn[] = [];
+  const records: FeedbackRecord[] = [];
+  for (const id of listSessionIds(join(process.cwd(), SESSIONS_SUBDIR))) {
+    const events = readSessionEvents(id);
+    for (const t of deriveTurns(events)) turns.push({ ...t, sessionId: id });
+    records.push(...extractFeedbackRecords(events));
+  }
+  records.push(...readFeedbackDir(join(process.cwd(), FEEDBACK_SUBDIR)));
+  const feedbackEvidence = evidenceFromFeedback(turns, records, minScore);
+  failures.push(...feedbackEvidence.failures);
+  passes.push(...feedbackEvidence.passes);
+
+  if (failures.length === 0) {
+    die(
+      `no failure rationale found in ${runsSeen} eval run(s) or the ratings — run \`crewhaus eval\` (or collect down-rated feedback) first`,
+    );
+  }
+
+  const themes = clusterFailures(failures);
+  const draft = draftGradersForThemes(themes, passes);
+  const suggestions: SuggestedGrader[] = [...draft.suggestions];
+
+  // Model-drafted llm_judge rubric from real good/bad exemplars: --model
+  // opts in outright; otherwise the cwd spec's model when its credentials
+  // are visible. Best-effort — a failed/unusable draft keeps the
+  // deterministic suggestions.
+  const modelFlag = strFlag(args, "model");
+  let rubricModel = modelFlag;
+  if (rubricModel === undefined && cwdSpecText !== undefined) {
+    const specModel = extractSpecModel(cwdSpecText);
+    if (specModel !== undefined && providerCredentialsSatisfied(specModel, process.env)) {
+      rubricModel = specModel;
+    }
+  }
+  if (rubricModel !== undefined) {
+    try {
+      const raw = await oneShotModelText({
+        model: rubricModel,
+        system: RUBRIC_SUGGESTION_SYSTEM,
+        prompt: buildRubricSuggestionPrompt(
+          passes.map((p) => p.output),
+          failures,
+          themes,
+        ),
+      });
+      const rubric = parseRubricSuggestion(raw, modelFlag);
+      if (rubric !== undefined) {
+        suggestions.unshift({
+          spec: rubric,
+          evidence: [
+            `llm_judge rubric drafted by ${rubricModel} from ${passes.length} good exemplar(s) and ${failures.length} failure rationale(s) — review the anchors before adopting`,
+          ],
+        });
+      } else {
+        process.stderr.write(
+          "[graders] rubric draft unusable (bad response shape) — deterministic suggestions only\n",
+        );
+      }
+    } catch (err) {
+      process.stderr.write(
+        `[graders] rubric draft failed (${err instanceof Error ? err.message : String(err)}) — deterministic suggestions only\n`,
+      );
+    }
+  }
+
+  if (suggestions.length === 0) {
+    die(
+      "no graders could be drafted — the failure themes had no deterministic signal in the up-rated outputs; re-run with --model for an llm_judge rubric drafted from the exemplars",
+    );
+  }
+
+  const yaml = renderSuggestedGradersYaml(suggestions, {
+    ...(specName !== undefined ? { specName } : {}),
+    runsSeen,
+    failureCount: failures.length,
+    feedbackCount: feedbackEvidence.failures.length,
+    undraftedLabels: draft.undrafted.map((t) => t.label),
+  });
+  mkdirSync(dirname(outPath), { recursive: true });
+  writeFileSync(outPath, yaml);
+
+  process.stdout.write(
+    `[graders] ${failures.length} failure rationale(s) across ${runsSeen} run(s)` +
+      `${feedbackEvidence.failures.length > 0 ? ` + ${feedbackEvidence.failures.length} rating comment(s)` : ""} → ${themes.length} theme(s)\n`,
+  );
+  for (const t of themes.slice(0, 8)) {
+    process.stdout.write(
+      `[graders]   theme "${t.label}": ${t.items.length} rationale(s) on ${t.sampleIds.length} sample(s)\n`,
+    );
+  }
+  process.stdout.write(`[graders] drafted ${suggestions.length} grader(s) → ${outPath}\n`);
+  process.stdout.write(
+    "[graders] review file — adopt ONE grader into eval/graders.yaml (stacking graders\n" +
+      "    hard-ANDs their scores; see the file header)\n",
+  );
 }
 
 /**
@@ -6079,6 +8403,51 @@ async function runMigrateAll(args: ParsedArgs): Promise<void> {
     `[migrate-all] migrated=${result.migrated} skipped=${result.skipped} failed=${result.failed}${dryNote}\n`,
   );
   if (result.failed > 0) process.exit(1);
+}
+
+/**
+ * Item 43 — `crewhaus upgrade [spec.yaml] [--dry-run] [--write]`. Detects the
+ * cwd (or named) spec's schema-version drift against the CLI's current spec
+ * version (the migration engine's `latestVersion()`), runs the migration chain
+ * with a `parseSpec` VALIDATE callback (the gap `migrate-all` left open — it
+ * wrote migrated specs unchecked), prints a diff, and — with `--write` —
+ * applies it in place. Dry-run is the default.
+ */
+async function runUpgrade(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus upgrade [spec.yaml] [--dry-run] [--write]\n" +
+        "  Detect the spec's schema-version drift vs this CLI's current spec version\n" +
+        "  and run the migration chain (each migrated spec is validated via parseSpec\n" +
+        "  before it can be written). Defaults to ./crewhaus.yaml and to a dry-run diff.\n" +
+        "  --write   apply the migration in place (rewrites the spec file).\n",
+    );
+    return;
+  }
+  const write = args.flags["write"] === true;
+  const specArg = args.positional[0];
+  const absSpec = resolve(
+    typeof specArg === "string" ? specArg : join(process.cwd(), "crewhaus.yaml"),
+  );
+  let yamlText: string;
+  try {
+    yamlText = readFileSync(absSpec, "utf-8");
+  } catch (err) {
+    die(`could not read ${absSpec}: ${(err as Error).message}`);
+  }
+
+  const { createDefaultEngine } = await import("@crewhaus/migration-engine");
+  const engine = createDefaultEngine();
+  // The validate callback the CLI's migrate-all never wired: a migrated spec
+  // must parse through the LIVE Zod union before it can be written back.
+  const plan = planUpgrade(yamlText, engine, makeSpecValidator(parseSpec));
+
+  if (plan.action === "upgrade" && write && plan.migratedYaml !== undefined) {
+    writeFileSync(absSpec, plan.migratedYaml);
+  }
+  process.stdout.write(formatUpgradePlan(plan, write));
+  // A migration/validation failure is a non-zero exit so CI can gate on it.
+  process.exit(plan.action === "validate-fail" ? 1 : 0);
 }
 
 /**
@@ -6996,9 +9365,29 @@ switch (subcommand) {
   case "compile":
     await runCompile(parseFor(rest, COMPILE_SCHEMA));
     break;
-  case "init":
-    runInit(parseFor(rest, INIT_SCHEMA));
+  case "lint":
+    // Item 41 — parse/lower/ir-pass failures all extend CrewhausError; the
+    // lint pipeline collects them as findings rather than throwing, so a raw
+    // throw here is a genuine bug and should surface with its stack.
+    await runLintCommand(parseFor(rest, LINT_SCHEMA));
     break;
+  case "init": {
+    const initArgs = parseFor(rest, INIT_SCHEMA);
+    // Item 39 — `--interactive` is an async path (model interview or scripted
+    // stdin questionnaire), so it dispatches to its own handler; the plain
+    // `init [name]` scaffold stays the synchronous default, unchanged.
+    if (initArgs.flags["interactive"] === true) {
+      try {
+        await runInitInteractive(initArgs);
+      } catch (err) {
+        if (err instanceof CrewhausError) die(err.message);
+        throw err;
+      }
+    } else {
+      runInit(initArgs);
+    }
+    break;
+  }
   case "run":
     // Mirror runCompile's policy: every structured failure in the run
     // pipeline (ConfigError from the model-router, ProviderAuthError from
@@ -7014,7 +9403,18 @@ switch (subcommand) {
     }
     break;
   case "eval":
-    await runEvalSubcommand(parseFor(rest, EVAL_SCHEMA));
+    // Item 6 — `eval coverage` is a distinct read-side report with its own
+    // flags; every other `eval …` invocation is the run path.
+    if (rest[0] === "coverage") {
+      try {
+        await runEvalCoverage(parseFor(rest.slice(1), EVAL_COVERAGE_SCHEMA));
+      } catch (err) {
+        if (err instanceof CrewhausError) die(err.message);
+        throw err;
+      }
+    } else {
+      await runEvalSubcommand(parseFor(rest, EVAL_SCHEMA));
+    }
     break;
   case "eval-report":
     await runEvalReport(parseFor(rest, EVAL_REPORT_SCHEMA));
@@ -7075,9 +9475,53 @@ switch (subcommand) {
   case "distill":
     await runDistill(parseFor(rest, DISTILL_SCHEMA));
     break;
+  case "scaffold-evals":
+    // Mirror `run`'s policy: structured failures (SpecParseError, model
+    // routing/auth on the one-shot generation call) extend CrewhausError —
+    // route the family through die() for a clean one-liner.
+    try {
+      await runScaffoldEvals(parseFor(rest, SCAFFOLD_EVALS_SCHEMA));
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
+    break;
+  case "graders": {
+    const action = rest[0] ?? "";
+    if (action !== "suggest") {
+      die(`graders action must be "suggest" (got "${action}")`);
+    }
+    try {
+      await runGradersSuggest(parseFor(rest.slice(1), GRADERS_SUGGEST_SCHEMA));
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
+    break;
+  }
   case "datasets":
     await runDatasets(parseFor(rest, DATASETS_SCHEMA));
     break;
+  case "dataset":
+    // Item 2/5 — the `dataset` (singular) growth family: mine / synthesize /
+    // refresh-goldens. Structured failures (registry/ref/spec) route through
+    // die() for a clean one-liner.
+    await runDataset(parseFor(rest, DATASET_SCHEMA));
+    break;
+  case "judge": {
+    // Item 8 — `judge calibrate`: pair human ratings with llm_judge scores.
+    const action = rest[0] ?? "";
+    if (action !== "calibrate") {
+      die(`judge action must be "calibrate" (got "${action}")`);
+    }
+    try {
+      await runJudgeCalibrate(parseFor(rest.slice(1), JUDGE_SCHEMA));
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
+    break;
+  }
   case "state": {
     const action = rest[0] ?? "";
     if (action !== "backup" && action !== "restore") {
@@ -7112,6 +9556,14 @@ switch (subcommand) {
   }
   case "migrate-all":
     await runMigrateAll(parseFor(rest, MIGRATE_SCHEMA));
+    break;
+  case "upgrade":
+    try {
+      await runUpgrade(parseFor(rest, UPGRADE_SCHEMA));
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
     break;
   case "build-image":
     await runBuildImage(rest);

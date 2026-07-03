@@ -10,10 +10,13 @@
  *
  * Composes with `model-router` for TypeScript-level failover: callers
  * hold one breaker per resolved model and route to the next candidate
- * when a breaker is open (there is no spec-level fallback field). The
- * wrapper does not own the fallback policy itself — it just refuses to
- * stream when open. Downstream `recovery-engine` is upstream of the breaker;
- * it should never retry into a tripped breaker.
+ * when a breaker is open. That composition is built (item 22):
+ * `model-router`'s `createFailoverChain` wraps each candidate of the
+ * spec's `agent.model` + `agent.model_fallbacks` in its own breaker and
+ * routes per call, with `agent.circuit_breaker` carrying this package's
+ * tuning knobs. The wrapper does not own the fallback policy itself — it
+ * just refuses to stream when open. Downstream `recovery-engine` is
+ * upstream of the breaker; it should never retry into a tripped breaker.
  *
  * Optionally takes a `TraceEventBus` so state changes surface as
  * `circuit_state_changed` TraceEvents (audit-log, OTel, structured
@@ -59,6 +62,16 @@ export interface WrappedAdapter extends ProviderAdapter {
   state(): CircuitState;
   /** Reset the breaker to closed. */
   reset(): void;
+  /**
+   * Item 23 — force the breaker open immediately, as if the failure
+   * threshold had just been crossed. Used by the `switch-model` recovery
+   * action so a matched provider error routes the failover chain onward
+   * without waiting for the threshold to accrue. Starts the same cooldown
+   * → half-open probe cycle a threshold-driven trip does, so a transient
+   * blip still auto-restores. No-op (and emits nothing) if already open.
+   * `reason` rides the `circuit_state_changed` event.
+   */
+  trip(reason?: string): void;
   /** Diagnostic counters. */
   stats(): {
     state: CircuitState;
@@ -171,6 +184,15 @@ export function wrap(adapter: ProviderAdapter, opts: CircuitBreakerOptions = {})
       if (from !== "closed") {
         publishStateChange(from, "closed", "manual reset");
       }
+    },
+
+    trip(reason?: string): void {
+      // Reuse the normal open transition (records lastTrippedAt, publishes
+      // circuit_state_changed, starts the cooldown clock). Clear any partial
+      // failure tally so a later half-open probe starts clean.
+      consecutiveFailures = 0;
+      firstFailureMs = 0;
+      transitionTo("open", reason ?? "forced open (switch-model)");
     },
 
     stats(): {

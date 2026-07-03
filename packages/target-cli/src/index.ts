@@ -449,11 +449,23 @@ if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));`;
     : "";
   const maxTokensField =
     ir.agent.maxTokens !== undefined ? `\n  maxTokens: ${ir.agent.maxTokens},` : "";
+  // Item 22 — provider failover chain: thread `agent.model_fallbacks` +
+  // `agent.circuit_breaker` into the runtime, which constructs the
+  // breaker-driven meta-adapter (see @crewhaus/model-router). Emitted only
+  // when the spec declared them so existing bundles stay byte-identical.
+  const failoverFields = renderModelFailoverFields(ir);
+  // Section 55 / item 23 — thread the spec's failure_taxonomy so recovery-
+  // engine consults the named error classes (incl. the `switch-model`
+  // verdict) before its built-in flow. Empty when the spec omits it.
+  const failureTaxonomyField = renderFailureTaxonomyField(ir);
+  // Item 27 — run-level spend cap + degradation ladder. Empty when the spec
+  // omits `budget`, keeping pre-existing bundles byte-identical.
+  const budgetField = renderBudgetField(ir);
   const runChatLoopCall = `await runChatLoop({
   model: ${escapeJsonString(ir.agent.model)},
   instructions: ${escapeJsonString(ir.agent.instructions)},
   sessionName: ${escapeJsonString(ir.name)},
-  sessionTarget: "cli",${maxTokensField}${toolsField}${permField}${sandboxField}
+  sessionTarget: "cli",${maxTokensField}${failoverFields}${failureTaxonomyField}${budgetField}${toolsField}${permField}${sandboxField}
   hooks: __hooks,
   skills: __skills,
   slashCommands: __slashCommands,${subAgents.subAgentsField}${subAgents.spawnField}${egress.field}
@@ -480,6 +492,62 @@ ${extensionBoot}
 
 ${bannerBoot}${subAgentsBoot}${egressBoot}${mcpBoot}${wrapped}
 `;
+}
+
+/**
+ * Item 22 — render the failover-chain runChatLoop fields from the IR agent
+ * block. Model strings pass through `escapeJsonString` (they are
+ * user-controlled spec values landing in generated source); the breaker
+ * tuning is a numbers-only object safe to JSON.stringify. Returns "" when
+ * the spec declared neither field, keeping pre-existing bundles
+ * byte-identical. Mirror: target-channel-bot + target-managed render the
+ * same fields — keep the three in sync.
+ */
+function renderModelFailoverFields(ir: {
+  readonly agent: {
+    readonly modelFallbacks?: readonly string[];
+    readonly circuitBreaker?: {
+      readonly failureThreshold?: number;
+      readonly windowMs?: number;
+      readonly cooldownMs?: number;
+    };
+  };
+}): string {
+  const pieces: string[] = [];
+  const fallbacks = ir.agent.modelFallbacks;
+  if (fallbacks !== undefined && fallbacks.length > 0) {
+    pieces.push(`\n  modelFallbacks: [${fallbacks.map((m) => escapeJsonString(m)).join(", ")}],`);
+  }
+  if (ir.agent.circuitBreaker !== undefined) {
+    pieces.push(`\n  circuitBreaker: ${JSON.stringify(ir.agent.circuitBreaker)},`);
+  }
+  return pieces.join("");
+}
+
+/**
+ * Section 55 / item 23 — render the `failureTaxonomy` runChatLoop field.
+ * The IR entries are `{ class, pattern, recovery, hint? }`; `JSON.stringify`
+ * produces safe double-quoted JS string literals for the user-controlled
+ * class/pattern/hint text (no backtick/template-literal escaping needed —
+ * the field lands in a plain object literal, not a template). Empty when
+ * the spec omits the block, keeping pre-existing bundles byte-identical.
+ * Mirror: target-channel-bot + target-managed render the same field.
+ */
+function renderFailureTaxonomyField(ir: IrV0): string {
+  const taxonomy = ir.failureTaxonomy;
+  if (taxonomy === undefined || taxonomy.length === 0) return "";
+  return `\n  failureTaxonomy: ${JSON.stringify(taxonomy)},`;
+}
+
+/**
+ * Item 27 — render the `budget` runChatLoop field. The IR carries a
+ * numbers-and-literals object (`usdMicros` + `onExceed`); `JSON.stringify`
+ * safely quotes the degrade `model` string. Empty when the spec omits it.
+ * Mirror: target-channel-bot + target-managed render the same field.
+ */
+function renderBudgetField(ir: IrV0): string {
+  if (ir.budget === undefined) return "";
+  return `\n  budget: ${JSON.stringify(ir.budget)},`;
 }
 
 /**

@@ -173,3 +173,42 @@ describe("TargetEmitError", () => {
     });
   });
 });
+
+describe("emitManaged — provider failover chain (item 22)", () => {
+  test("agent.ts threads modelFallbacks + circuitBreaker into runChatLoop when set", () => {
+    const irFailover: IrManagedV0 = {
+      ...ir,
+      agent: {
+        ...ir.agent,
+        modelFallbacks: ["openai/gpt-4o-mini"],
+        circuitBreaker: { cooldownMs: 5000 },
+      },
+    };
+    const agentTs = emitManaged(irFailover).files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agentTs).toContain('modelFallbacks: ["openai/gpt-4o-mini"],');
+    expect(agentTs).toContain('circuitBreaker: {"cooldownMs":5000},');
+  });
+
+  test("agent.ts omits both fields when the IR leaves them unset", () => {
+    const agentTs = emitManaged(ir).files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agentTs).not.toContain("modelFallbacks:");
+    expect(agentTs).not.toContain("circuitBreaker:");
+  });
+});
+
+describe("emitManaged — run-level budget field (item 27)", () => {
+  test("agent.ts threads budget into runChatLoop when set", () => {
+    const irBudget: IrManagedV0 = {
+      ...ir,
+      budget: { usdMicros: 4_000_000, onExceed: { kind: "degrade", model: "openai/gpt-4o-mini" } },
+    };
+    const agentTs = emitManaged(irBudget).files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agentTs).toContain('budget: {"usdMicros":4000000');
+    expect(agentTs).toContain('"model":"openai/gpt-4o-mini"');
+  });
+
+  test("agent.ts omits budget when the IR leaves it unset", () => {
+    const agentTs = emitManaged(ir).files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agentTs).not.toContain("budget:");
+  });
+});

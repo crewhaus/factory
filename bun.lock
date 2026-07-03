@@ -38,6 +38,7 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/eval-dataset": "workspace:*",
         "@crewhaus/eval-grader": "workspace:*",
+        "@crewhaus/eval-judge": "workspace:*",
         "@crewhaus/eval-optimizer-orchestrator": "workspace:*",
         "@crewhaus/eval-report": "workspace:*",
         "@crewhaus/eval-runner": "workspace:*",
@@ -46,6 +47,7 @@
         "@crewhaus/hooks-engine": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
+        "@crewhaus/ir-passes": "workspace:*",
         "@crewhaus/justification-judge-claude": "workspace:*",
         "@crewhaus/logging": "workspace:*",
         "@crewhaus/mcp-host": "workspace:*",
@@ -53,6 +55,8 @@
         "@crewhaus/migration-runner": "workspace:*",
         "@crewhaus/model-router": "workspace:*",
         "@crewhaus/permission-engine": "workspace:*",
+        "@crewhaus/pii-redactor": "workspace:*",
+        "@crewhaus/prompt-injection-detector": "workspace:*",
         "@crewhaus/prompt-optimizer": "workspace:*",
         "@crewhaus/prompt-optimizer-claude": "workspace:*",
         "@crewhaus/regression-runner": "workspace:*",
@@ -90,6 +94,7 @@
         "@crewhaus/tool-vision-grounding": "workspace:*",
         "@crewhaus/tool-web": "workspace:*",
         "@crewhaus/trace-event-bus": "workspace:*",
+        "yaml": "^2.6.0",
       },
       "devDependencies": {
         "zod": "^3.23.8",
@@ -936,7 +941,9 @@
       "version": "0.1.4",
       "dependencies": {
         "@crewhaus/adapter-anthropic": "workspace:*",
+        "@crewhaus/circuit-breaker": "workspace:*",
         "@crewhaus/errors": "workspace:*",
+        "@crewhaus/trace-event-bus": "workspace:*",
       },
       "optionalDependencies": {
         "@crewhaus/adapter-bedrock": "workspace:*",

@@ -12,6 +12,14 @@
  *   user-aborted         → fail("user_aborted")  — orchestrator handles abort separately
  *   anything else        → fail(message)
  *
+ * Item 23 — `switch-model` is an OPT-IN `failure_taxonomy` recovery action
+ * (never a built-in `classify()` verdict, so default runs are byte-for-byte
+ * unchanged). It tells the orchestrator to route the same turn onto the
+ * next provider-failover candidate (open the active breaker so the chain
+ * reroutes) instead of exhausting backoff retries against a dead provider.
+ * Budgeted per turn like the others; a run without a failover chain treats
+ * it as a retry-shaped no-op re-issue (documented in runtime-core).
+ *
  * References: claude-code/query.ts recovery branches; agent-framework
  * _runner.py retry; AI-Harness-Systems §recovery.
  */
@@ -22,6 +30,7 @@ export type RecoveryAction =
   | { readonly kind: "retry"; readonly delayMs: number; readonly attempt: number }
   | { readonly kind: "continue" }
   | { readonly kind: "tombstone"; readonly messageId?: string }
+  | { readonly kind: "switch-model" }
   | { readonly kind: "fail"; readonly reason: string };
 
 export type RecoveryErrorClass =
@@ -41,6 +50,8 @@ export type RecoveryState = {
   readonly continueCount: number;
   /** Number of `tombstone` actions already chosen in this turn. */
   readonly tombstoneCount: number;
+  /** Item 23 — number of `switch-model` actions already chosen this turn. */
+  readonly switchModelCount: number;
 };
 
 export const initialRecoveryState: RecoveryState = {
@@ -48,6 +59,7 @@ export const initialRecoveryState: RecoveryState = {
   compactCount: 0,
   continueCount: 0,
   tombstoneCount: 0,
+  switchModelCount: 0,
 };
 
 export class RecoveryEngineError extends CrewhausError {
@@ -61,6 +73,10 @@ const MAX_RETRIES = 5;
 const MAX_COMPACTS = 1;
 const MAX_CONTINUES = 3;
 const MAX_TOMBSTONES = 1;
+// Item 23 — cap `switch-model` hops per turn. Generous enough to walk a
+// short failover chain (primary → fallback → fallback), low enough that a
+// mutually-degraded chain fails the turn instead of looping forever.
+const MAX_SWITCH_MODELS = 3;
 
 const BASE_BACKOFF_MS = 1_000;
 const MAX_BACKOFF_MS = 30_000;
@@ -134,7 +150,7 @@ export function classify(error: unknown): RecoveryErrorClass {
 export type NamedFailureClass = {
   readonly class: string;
   readonly pattern: string;
-  readonly recovery: "retry" | "compact" | "continue" | "tombstone" | "fail";
+  readonly recovery: "retry" | "compact" | "continue" | "tombstone" | "switch-model" | "fail";
   readonly hint?: string;
 };
 
@@ -266,6 +282,11 @@ function recoverNamed(named: NamedFailureClass, state: RecoveryState): RecoveryA
         return { kind: "fail", reason: `tombstone budget exhausted: ${reason}` };
       }
       return { kind: "tombstone" };
+    case "switch-model":
+      if (state.switchModelCount >= MAX_SWITCH_MODELS) {
+        return { kind: "fail", reason: `switch-model budget exhausted: ${reason}` };
+      }
+      return { kind: "switch-model" };
     case "fail":
       return { kind: "fail", reason };
   }
@@ -285,6 +306,8 @@ export function advanceState(state: RecoveryState, action: RecoveryAction): Reco
       return { ...state, continueCount: state.continueCount + 1 };
     case "tombstone":
       return { ...state, tombstoneCount: state.tombstoneCount + 1 };
+    case "switch-model":
+      return { ...state, switchModelCount: state.switchModelCount + 1 };
     case "fail":
       return state;
   }
@@ -296,6 +319,7 @@ export const BUDGETS = {
   MAX_COMPACTS,
   MAX_CONTINUES,
   MAX_TOMBSTONES,
+  MAX_SWITCH_MODELS,
   BASE_BACKOFF_MS,
   MAX_BACKOFF_MS,
   MAX_JITTER_MS,

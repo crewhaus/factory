@@ -50,18 +50,22 @@
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/eval-dataset": "workspace:*",
     "@crewhaus/eval-grader": "workspace:*",
+    "@crewhaus/eval-judge": "workspace:*",
     "@crewhaus/eval-report": "workspace:*",
     "@crewhaus/eval-runner": "workspace:*",
     "@crewhaus/event-log": "workspace:*",
     "@crewhaus/hooks-engine": "workspace:*",
     "@crewhaus/infra-utils": "workspace:*",
     "@crewhaus/ir": "workspace:*",
+    "@crewhaus/ir-passes": "workspace:*",
     "@crewhaus/logging": "workspace:*",
     "@crewhaus/mcp-host": "workspace:*",
     "@crewhaus/model-router": "workspace:*",
     "@crewhaus/migration-engine": "workspace:*",
     "@crewhaus/migration-runner": "workspace:*",
     "@crewhaus/permission-engine": "workspace:*",
+    "@crewhaus/pii-redactor": "workspace:*",
+    "@crewhaus/prompt-injection-detector": "workspace:*",
     "@crewhaus/regression-runner": "workspace:*",
     "@crewhaus/run-context": "workspace:*",
     "@crewhaus/runtime-core": "workspace:*",
@@ -99,7 +103,8 @@
     "@crewhaus/federation-discovery": "workspace:*",
     "@crewhaus/sandbox": "workspace:*",
     "@crewhaus/sandbox-image-registry": "workspace:*",
-    "@crewhaus/compliance-controls": "workspace:*"
+    "@crewhaus/compliance-controls": "workspace:*",
+    "yaml": "^2.6.0"
   },
   "devDependencies": {
     "zod": "^3.23.8"
