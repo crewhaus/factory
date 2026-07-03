@@ -282,6 +282,8 @@ import {
   parseModelsFlag,
   runMatrixCells,
 } from "./eval-matrix";
+// Item #55 — distill recurring user questions into an auto-loaded FAQ skill.
+import { buildFaqSkill, distillFaq } from "./faq";
 // Response-feedback core — pure, side-effect-free so it is unit-testable
 // (this entry file runs an argv switch on import). Powers `rate`/`feedback`
 // (capture) and `distill` (ratings → eval dataset + graders).
@@ -949,6 +951,21 @@ const FEWSHOT_SCHEMA: ParseArgsSchema = {
   ],
 };
 
+// Item #55 — `crewhaus faq distill`: cluster recurring user questions into an
+// auto-loaded FAQ SKILL.md under `.crewhaus/skills/faq/`.
+const FAQ_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // How many recent sessions to scan (default all; `N` or `all`).
+    { name: "sessions", takesValue: true },
+    { name: "min-score", takesValue: true },
+    // Minimum recurrences for a question cluster to become an FAQ (default 2).
+    { name: "min-occurrences", takesValue: true },
+    // Override the emitted skill directory (default `.crewhaus/skills/faq`).
+    { name: "out", short: "o", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
 // Item 12 — the dataset-registry CLI face (`datasets list|get|put`).
 const DATASETS_SCHEMA: ParseArgsSchema = {
   flags: [
@@ -1273,6 +1290,8 @@ function usageText(): string {
     "  fewshot harvest [--all-sessions]     harvest up-rated turns into a golden few-shot pool (#54)",
     "       [--min-score F] [-o <pool>]     (PII/secret-redacted); optimize with --few-shot",
     "  fewshot show [--k N]                 print the pool as the injectable prompt block",
+    "  faq distill [--sessions N|all]       cluster recurring questions into an auto-loaded FAQ skill (#55)",
+    "       [--min-score F] [--min-occurrences N] [-o <skill-dir>]",
     "  datasets list                        all registered datasets + versions (Section 29)",
     "  datasets get <name>[@version]        print a dataset's samples as JSONL",
     "       [--split train|dev|test]",
@@ -7479,6 +7498,86 @@ function readCwdSpecName(): string {
   return "harness";
 }
 
+/** Resolve the session ids to scan for the harvest family, honouring
+ *  `--sessions N|all` (N = the N most-recently-modified session logs). */
+function resolveScanSessionIds(sessionsArg: string | undefined): string[] {
+  const sessionsDir = join(process.cwd(), SESSIONS_SUBDIR);
+  const ids = listSessionIds(sessionsDir);
+  if (sessionsArg === undefined || sessionsArg === "all") return ids;
+  const n = Number.parseInt(sessionsArg, 10);
+  if (Number.isNaN(n) || n < 1) die(`invalid --sessions "${sessionsArg}" — expected N or "all"`);
+  const withMtime = ids.map((id) => {
+    let mtimeMs = 0;
+    try {
+      mtimeMs = statSync(join(sessionsDir, `${id}.jsonl`)).mtimeMs;
+    } catch {}
+    return { id, mtimeMs };
+  });
+  withMtime.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  return withMtime.slice(0, n).map((e) => e.id);
+}
+
+/**
+ * Item #55 — `crewhaus faq distill [--sessions N|all]`. Cluster recurring user
+ * questions across sessions, pair each cluster with its best up-rated answer,
+ * and emit an auto-discovered FAQ SKILL.md into `.crewhaus/skills/faq/`.
+ */
+async function runFaq(args: ParsedArgs): Promise<void> {
+  const action = args.positional[0];
+  if (args.flags["help"] === true && action === undefined) {
+    process.stdout.write(
+      "usage: crewhaus faq distill [--sessions N|all] [--min-score F] [--min-occurrences N] [-o <skill-dir>]\n" +
+        "  Cluster recurring user questions, pair each with its best-rated answer, and emit\n" +
+        "  an auto-loaded FAQ skill (SKILL.md) under .crewhaus/skills/faq/ (PII/secret-redacted).\n",
+    );
+    return;
+  }
+  if (action !== "distill") {
+    die(`faq: unknown action "${action ?? ""}" — supported: distill`);
+  }
+  const minScore = floatFlag(args, "min-score") ?? 0.7;
+  if (minScore < 0 || minScore > 1) die(`invalid --min-score "${minScore}" — must be in [0,1]`);
+  const minOccurrences = intFlag(args, "min-occurrences") ?? 2;
+
+  const sessionIds = resolveScanSessionIds(strFlag(args, "sessions"));
+  if (sessionIds.length === 0) die("no sessions found under .crewhaus/sessions/");
+  const { turns, feedback } = gatherTurnsAndFeedback(sessionIds);
+  if (feedback.length === 0) {
+    die("no feedback found — record some with `crewhaus rate` / `crewhaus feedback` first");
+  }
+
+  const { createPiiRedactor } = await import("@crewhaus/pii-redactor");
+  const { SYNTHESIZE_PII_DETECTORS } = await import("./dataset-mine");
+  const redactor = createPiiRedactor({ regexDetectors: SYNTHESIZE_PII_DETECTORS });
+
+  const entries = await distillFaq(turns, feedback, {
+    minScore,
+    minOccurrences,
+    redact: async (t) => (await redactor.redact(t)).text,
+  });
+  if (entries.length === 0) {
+    die(
+      `no recurring questions with an up-rated answer (min-occurrences ${minOccurrences}, min-score ${minScore})`,
+    );
+  }
+
+  const skillDir = strFlag(args, "out") ?? join(process.cwd(), ".crewhaus", "skills", "faq");
+  const skillMd = buildFaqSkill(entries, { harnessName: readCwdSpecName() });
+  // Fail loudly if the emitted skill somehow does not parse — the whole point
+  // is that skills-registry auto-discovers it.
+  try {
+    const { parseSkillFile } = await import("@crewhaus/skills-registry");
+    parseSkillFile(skillMd);
+  } catch (err) {
+    die(`internal: emitted FAQ SKILL.md failed to parse: ${(err as Error).message}`);
+  }
+  mkdirSync(skillDir, { recursive: true });
+  writeFileSync(join(skillDir, "SKILL.md"), skillMd, { mode: 0o600 });
+  process.stdout.write(
+    `[faq] distilled ${entries.length} FAQ entry(ies) → ${join(skillDir, "SKILL.md")} (auto-discovered by future runs)\n`,
+  );
+}
+
 // -------- item 4: crewhaus graders suggest --------
 
 /**
@@ -9299,6 +9398,16 @@ switch (subcommand) {
     // through die().
     try {
       await runFewshot(parseFor(rest, FEWSHOT_SCHEMA));
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
+    break;
+  case "faq":
+    // Item #55 — `faq distill`: cluster recurring user questions into an
+    // auto-loaded FAQ skill. Structured failures route through die().
+    try {
+      await runFaq(parseFor(rest, FAQ_SCHEMA));
     } catch (err) {
       if (err instanceof CrewhausError) die(err.message);
       throw err;
