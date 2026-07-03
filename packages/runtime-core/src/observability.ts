@@ -34,6 +34,13 @@ import type {
   TraceEventBus,
   Unsubscribe,
 } from "@crewhaus/trace-event-bus";
+import {
+  SessionMetricsAccumulator,
+  appendMetricsSnapshot,
+  deriveThresholds,
+  detectBreaches,
+  readMetricsHistory,
+} from "./alert-watchdog";
 
 export type AttachedSubscribers = {
   printer: AttachedPrinter | undefined;
@@ -202,10 +209,44 @@ export function formatSecurityTallyLine(tally: SecurityTally): string {
   return `[security] ${parts.join(" · ")}${rules === "" ? "" : ` [rules: ${rules}]`} — run \`crewhaus security digest\` for the windowed rollup`;
 }
 
+/**
+ * Ops item 31 — how the alert watchdog delivers a breach beyond the
+ * `alert_raised` trace event. Both callbacks are OPTIONAL and injected by the
+ * caller (the CLI/codegen), so runtime-core stays free of audit-log/hook I/O:
+ *   - `appendAudit` writes a tamper-evident record (the CLI passes an
+ *     `openAuditLog(...)`-backed sink);
+ *   - `fireAlertHook` invokes the settings.json `alert` hook and/or POSTs the
+ *     configured webhook.
+ * Absent → the watchdog still persists the snapshot + publishes the trace
+ * event, it just has no durable/off-box delivery.
+ */
+export type AlertSink = {
+  appendAudit?: (breach: AlertBreachPayload) => Promise<void>;
+  fireAlertHook?: (breach: AlertBreachPayload) => Promise<void>;
+};
+
+/** The payload handed to the audit sink / settings.json alert hook / webhook. */
+export type AlertBreachPayload = {
+  readonly sessionId: string;
+  readonly metric: string;
+  readonly observed: number;
+  readonly threshold: number;
+  readonly baselineSessions: number;
+  readonly detail: string;
+};
+
+export type AttachDefaultSubscribersOptions = {
+  /** Item 31 — where the alert watchdog persists its per-session snapshot history. */
+  readonly metricsDir?: string;
+  /** Item 31 — durable + off-box alert delivery (see {@link AlertSink}). */
+  readonly alertSink?: AlertSink;
+};
+
 export async function attachDefaultSubscribers(
   bus: TraceEventBus,
   runContext: RunContext,
   env: NodeJS.ProcessEnv = process.env,
+  options: AttachDefaultSubscribersOptions = {},
 ): Promise<AttachedSubscribers> {
   const printer = attachPrinterIfEnvSet(bus, env);
   const metrics = await attachMetricsIfEnvSet(bus, env);
@@ -254,6 +295,14 @@ export async function attachDefaultSubscribers(
     securityTallyPrinted = true;
     process.stderr.write(`${formatSecurityTallyLine(securityTally)}\n`);
   };
+
+  // Ops item 31 — alert watchdog, opt-in via CREWHAUS_ALERTS=1. Folds the run's
+  // events into a per-session metrics snapshot; at session end it persists the
+  // snapshot (building the history baselines are derived from), derives
+  // baseline thresholds (trailing p95 × headroom) from prior snapshots, and
+  // raises an alert per breach (trace event + injected audit/hook sinks).
+  const watchdog = attachAlertWatchdog(bus, runContext, env, options);
+
   const flushAll = async (): Promise<void> => {
     printer?.finalize();
     const tasks: Promise<void>[] = [];
@@ -264,6 +313,11 @@ export async function attachDefaultSubscribers(
     await Promise.all(tasks);
     // AFTER the bus flush so every in-flight event has reached the tally.
     printSecurityTallyOnce();
+    // AFTER the flush so the snapshot sees every event; a watchdog failure
+    // must never break flushAll, so its own finalize swallows/logs internally.
+    if (watchdog !== undefined) {
+      await watchdog.finalize().catch((err) => logFlushError(runContext, "alert-watchdog", err));
+    }
   };
   const shutdownAll = async (): Promise<void> => {
     printer?.unsubscribe();
@@ -278,6 +332,10 @@ export async function attachDefaultSubscribers(
     // A caller that shuts down without flushing still gets its one line.
     printSecurityTallyOnce();
     securityTallyUnsubscribe?.();
+    if (watchdog !== undefined) {
+      await watchdog.finalize().catch((err) => logFlushError(runContext, "alert-watchdog", err));
+      watchdog.unsubscribe();
+    }
   };
   return {
     printer,
@@ -294,6 +352,96 @@ export async function attachDefaultSubscribers(
 function logFlushError(runContext: RunContext, name: string, err: unknown): void {
   const message = err instanceof Error ? err.message : String(err);
   runContext.logger.error("observability.flush_failed", { name, message });
+}
+
+// -------- alert watchdog (ops item 31) --------
+
+export type AttachedAlertWatchdog = {
+  /** Compute the snapshot, persist it, derive baselines, raise alerts. Idempotent. */
+  finalize(): Promise<void>;
+  unsubscribe: Unsubscribe;
+};
+
+/**
+ * Ops item 31 — attach the alert watchdog when CREWHAUS_ALERTS is set. Folds
+ * events into a per-session {@link SessionMetricsAccumulator}; `finalize()`
+ * (called from flush/shutdown) persists the snapshot, derives baseline
+ * thresholds from the accrued history, and — per breach — publishes an
+ * `alert_raised` trace event, appends an audit record, and fires the alert
+ * hook/webhook via the injected {@link AlertSink}. Returns undefined (a no-op)
+ * when the env gate is off, so it adds zero overhead by default.
+ *
+ * NOTE (spec gate): the primary gate is the CREWHAUS_ALERTS env var, matching
+ * every other subscriber in this file (attachDefaultSubscribers only receives
+ * env). A spec-level `observability.alerts` block would be lowered by the
+ * compiler into an env stamp / options flag on the emitted bundle; that
+ * lowering is the follow-up — the runtime seam here already honours it.
+ */
+export function attachAlertWatchdog(
+  bus: TraceEventBus,
+  runContext: RunContext,
+  env: NodeJS.ProcessEnv,
+  options: AttachDefaultSubscribersOptions = {},
+): AttachedAlertWatchdog | undefined {
+  const gate = env["CREWHAUS_ALERTS"];
+  if (gate !== "1" && gate !== "true") return undefined;
+
+  const acc = new SessionMetricsAccumulator();
+  const unsubscribe = bus.subscribe((event: TraceEvent): void => {
+    acc.fold(event);
+  });
+
+  let finalized = false;
+  const finalize = async (): Promise<void> => {
+    if (finalized) return;
+    finalized = true;
+
+    const snapshot = acc.snapshot(runContext.sessionId);
+    // Derive thresholds from PRIOR history (before this session's snapshot is
+    // appended) so a session is never graded against itself.
+    const history = readMetricsHistory(options.metricsDir);
+    const thresholds = deriveThresholds(history);
+    // Persist AFTER reading history so the next session benefits from this one.
+    appendMetricsSnapshot(snapshot, options.metricsDir);
+
+    const breaches = detectBreaches(snapshot, thresholds);
+    const sink = options.alertSink;
+    for (const breach of breaches) {
+      // Live observable surface.
+      const env2 = bus.envelope();
+      bus.publish({
+        ...env2,
+        kind: "alert_raised",
+        metric: breach.metric,
+        observed: breach.observed,
+        threshold: breach.threshold,
+        baselineSessions: thresholds.baselineSessions,
+        detail: breach.detail,
+      });
+      const payload: AlertBreachPayload = {
+        sessionId: runContext.sessionId,
+        metric: breach.metric,
+        observed: breach.observed,
+        threshold: breach.threshold,
+        baselineSessions: thresholds.baselineSessions,
+        detail: breach.detail,
+      };
+      // Durable + off-box delivery — each best-effort so one failing sink never
+      // blocks the others (or a turn). Errors are logged, not thrown.
+      if (sink?.appendAudit !== undefined) {
+        await sink
+          .appendAudit(payload)
+          .catch((err) => logFlushError(runContext, "alert-audit", err));
+      }
+      if (sink?.fireAlertHook !== undefined) {
+        await sink
+          .fireAlertHook(payload)
+          .catch((err) => logFlushError(runContext, "alert-hook", err));
+      }
+    }
+  };
+
+  return { finalize, unsubscribe };
 }
 
 // -------- advisor signal persistence (item 14 groundwork) --------

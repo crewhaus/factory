@@ -1,9 +1,17 @@
 import { afterAll, afterEach, describe, expect, mock, spyOn, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TenancyError, buildTenant, withTenant } from "@crewhaus/tenancy";
-import { createSessionStore, evictExpiredSessions } from "./index";
+import { createSessionStore, evictExpiredSessions, summarizeSession } from "./index";
 
 // Snapshot the genuine node:fs/promises implementation ONCE, before any test
 // installs a mock. Bun's `mock.module` mutates the live module namespace in
@@ -466,5 +474,113 @@ describe("session-store — cross-tenant fencing (CWE-1230)", () => {
     const store = createSessionStore({ rootDir });
     const created = await store.create({ name: "ok", target: "cli", model: "m" });
     expect(await store.get(created.id)).toEqual(created);
+  });
+});
+
+describe("summarizeSession (#57)", () => {
+  test("counts turns, tools, ratings, and captures the outcome", () => {
+    const events = [
+      { kind: "user_message", payload: { content: "list the files" } },
+      {
+        kind: "assistant_message",
+        payload: {
+          content: [
+            { type: "tool_use", name: "Bash" },
+            { type: "text", text: "Here are the files." },
+          ],
+        },
+      },
+      { kind: "user_message", payload: { content: "and delete one" } },
+      { kind: "assistant_message", payload: { content: [{ type: "text", text: "Deleted foo." }] } },
+      {
+        kind: "user_feedback",
+        payload: { rating: { thumbs: "up" } },
+      },
+      {
+        kind: "user_feedback",
+        payload: { rating: { thumbs: "down" } },
+      },
+    ];
+    const s = summarizeSession("sess_00000000000000a0", events, {
+      now: () => new Date("2026-07-02T00:00:00.000Z"),
+    });
+    expect(s.turnCount).toBe(2);
+    expect(s.toolsUsed).toEqual(["Bash"]);
+    expect(s.ratings).toEqual({ positive: 1, negative: 1 });
+    expect(s.outcome).toBe("Deleted foo.");
+    expect(s.keyFacts).toEqual(["Here are the files.", "Deleted foo."]);
+    expect(s.hadError).toBe(false);
+    expect(s.summarizedAt).toBe("2026-07-02T00:00:00.000Z");
+  });
+
+  test("flags a runtime error and ignores synthetic/tool-result messages", () => {
+    const events = [
+      { kind: "user_message", payload: { synthetic: true, content: "continue" } },
+      { kind: "user_message", payload: { content: [{ type: "tool_result", content: "x" }] } },
+      { kind: "user_message", payload: { content: "real question" } },
+      { kind: "assistant_message", payload: { content: [{ type: "text", text: "answer" }] } },
+      { kind: "error", payload: { message: "boom" } },
+    ];
+    const s = summarizeSession("sess_00000000000000a1", events);
+    expect(s.turnCount).toBe(1);
+    expect(s.hadError).toBe(true);
+  });
+});
+
+describe("evictExpiredSessions onBeforeEvict hook (#57)", () => {
+  test("fires the hook for each evicted session BEFORE unlinking", async () => {
+    const rootDir = newTempRoot();
+    const store = createSessionStore({ rootDir });
+    const doomed = await store.create({ name: "doomed", target: "cli", model: "m" });
+    const log = join(rootDir, `${doomed.id}.jsonl`);
+    writeFileSync(
+      log,
+      `${[
+        JSON.stringify({ kind: "user_message", payload: { content: "hi" } }),
+        JSON.stringify({
+          kind: "assistant_message",
+          payload: { content: [{ type: "text", text: "hello" }] },
+        }),
+      ].join("\n")}\n`,
+    );
+    const backdated = new Date(Date.now() - 35 * 86_400_000);
+    utimesSync(join(rootDir, `${doomed.id}.json`), backdated, backdated);
+
+    const seen: Array<{ id: string; logExisted: boolean; summary: unknown }> = [];
+    const { evictedIds } = await evictExpiredSessions({
+      rootDir,
+      onBeforeEvict: async (id, dir) => {
+        const logPath = join(dir, `${id}.jsonl`);
+        const events = readFileSync(logPath, "utf-8")
+          .split("\n")
+          .filter((l) => l.trim() !== "")
+          .map((l) => JSON.parse(l));
+        seen.push({ id, logExisted: existsSync(logPath), summary: summarizeSession(id, events) });
+      },
+    });
+    expect(evictedIds).toEqual([doomed.id]);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.id).toBe(doomed.id);
+    // The hook ran while the log still existed (before unlink).
+    expect(seen[0]?.logExisted).toBe(true);
+    // The session is actually gone afterward.
+    expect(existsSync(join(rootDir, `${doomed.id}.json`))).toBe(false);
+    expect(existsSync(log)).toBe(false);
+  });
+
+  test("a throwing hook never blocks eviction", async () => {
+    const rootDir = newTempRoot();
+    const store = createSessionStore({ rootDir });
+    const doomed = await store.create({ name: "doomed", target: "cli", model: "m" });
+    const backdated = new Date(Date.now() - 35 * 86_400_000);
+    utimesSync(join(rootDir, `${doomed.id}.json`), backdated, backdated);
+    const { evictedIds } = await evictExpiredSessions({
+      rootDir,
+      onBeforeEvict: async () => {
+        throw new Error("summarizer blew up");
+      },
+    });
+    expect(evictedIds).toEqual([doomed.id]);
+    expect(existsSync(join(rootDir, `${doomed.id}.json`))).toBe(false);
   });
 });

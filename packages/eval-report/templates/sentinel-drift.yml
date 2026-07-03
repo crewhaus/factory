@@ -1,0 +1,82 @@
+# sentinel-drift.yml — nightly model-drift sentinel TEMPLATE (item 30).
+#
+# This is a TEMPLATE, not an active workflow: copy it into your deployment
+# repository's `.github/workflows/` and edit the <PLACEHOLDER> comments.
+# `crewhaus init --sentinel` scaffolds it for you (prefixed for a nested
+# harness, same as `init --ci`).
+#
+# WHAT IT DOES
+# On a nightly cron, it re-runs a SEED-PINNED sentinel dataset against your
+# UNCHANGED spec and diffs the fresh run against a FROZEN baseline run
+# committed to the repo. When the spec's specHash AND the sentinel dataset's
+# content hash are BOTH identical to the baseline's, any pass/fail flip or
+# score shift can ONLY be the provider silently changing model behaviour — the
+# one variable the harness did not hold fixed. `crewhaus eval --sentinel` exits
+# non-zero on drift (and on a not-comparable spec/dataset-hash mismatch — a
+# mis-pointed sentinel is loud, never silently green), so this job goes red and
+# GitHub's scheduled-workflow-failure notification alerts you.
+#
+# WHY A COMMITTED BASELINE (unlike the eval-on-PR gate, which runs two fresh
+# evals): a drift probe needs a fixed "before" that survives across nights and
+# is NOT re-derived from the current provider — that is the whole point. Freeze
+# it once, re-freeze deliberately when you accept a provider change.
+#
+# PREREQUISITES
+#   - A frozen baseline run dir committed at <BASELINE-DIR> (default
+#     eval/sentinel-baseline). Produce it once against the current spec+dataset:
+#       crewhaus eval crewhaus.yaml \
+#         --dataset eval/sentinel.jsonl --graders eval/graders.yaml \
+#         --seed 1 -o eval/sentinel-baseline
+#     then `git add eval/sentinel-baseline && git commit`. Re-freeze it (same
+#     command) whenever you INTENTIONALLY change the spec or the sentinel data,
+#     or knowingly adopt a new provider baseline.
+#   - A seed-pinned sentinel dataset at eval/sentinel.jsonl (small + stable —
+#     a dozen representative samples is plenty; this runs nightly and bills the
+#     provider each time).
+#   - Repo secret ANTHROPIC_API_KEY (billed by the nightly eval run).
+
+name: sentinel-drift
+
+on:
+  schedule:
+    # <CRON> Nightly at 03:17 UTC. Off the hour to dodge the top-of-hour
+    # scheduling backlog GitHub warns about for cron workflows.
+    - cron: "17 3 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  SENTINEL_SEED: "1" # pin the sample order so only the PROVIDER can vary
+
+jobs:
+  sentinel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install crewhaus CLI
+        run: |
+          bun add -g crewhaus
+          echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
+
+      - name: Run the drift sentinel
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          # Re-runs eval/sentinel.jsonl against the UNCHANGED spec and diffs
+          # against the committed baseline. Exits non-zero (failing this job,
+          # which notifies) on provider drift OR a spec/dataset-hash mismatch.
+          # <BASELINE-DIR> defaults to eval/sentinel-baseline.
+          crewhaus eval crewhaus.yaml \
+            --dataset eval/sentinel.jsonl \
+            --graders eval/graders.yaml \
+            --seed "$SENTINEL_SEED" \
+            --sentinel --baseline eval/sentinel-baseline \
+            -o .crewhaus/evals/sentinel-$(date -u +%Y%m%d)

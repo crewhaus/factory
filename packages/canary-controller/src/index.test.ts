@@ -11,7 +11,13 @@ import { join } from "node:path";
 import { type AuditRecord, openAuditLog } from "@crewhaus/audit-log";
 import { createDeploymentController } from "@crewhaus/deployment-controller";
 import { createFileBackedRegistry } from "@crewhaus/spec-registry";
-import { CanaryError, PASSING_GATE, type RegressionGate, createCanaryController } from "./index";
+import {
+  CanaryError,
+  PASSING_GATE,
+  type RegressionGate,
+  createCanaryController,
+  makeRegressionGate,
+} from "./index";
 
 let tmpRoot = "";
 
@@ -206,6 +212,51 @@ describe("canary-controller — eval gate", () => {
     );
     expect(await reg.aliasFor("hello", "prod")).toBe("v1");
     expect(await reg.aliasForTenant("tenant-a", "hello", "prod")).toBe("v2");
+  });
+});
+
+describe("canary-controller — makeRegressionGate (item 29)", () => {
+  test("passes the evaluator verdict straight through on pass", async () => {
+    const gate = makeRegressionGate(async () => ({ verdict: "pass", reason: "flat" }));
+    const result = await gate({ fromVersion: "v1", toVersion: "v2" });
+    expect(result.verdict).toBe("pass");
+    expect(result.reason).toBe("flat");
+  });
+
+  test("passes the evaluator verdict straight through on fail", async () => {
+    const gate = makeRegressionGate(async () => ({ verdict: "fail", reason: "pass-rate dropped" }));
+    const result = await gate({ fromVersion: "v1", toVersion: "v2" });
+    expect(result.verdict).toBe("fail");
+    expect(result.reason).toBe("pass-rate dropped");
+  });
+
+  test("a throwing evaluator becomes a fail verdict (never a silent promote)", async () => {
+    const gate = makeRegressionGate(async () => {
+      throw new Error("provider 429");
+    });
+    const result = await gate({ fromVersion: "v1", toVersion: "v2" });
+    expect(result.verdict).toBe("fail");
+    expect(result.reason).toContain("eval gate errored");
+    expect(result.reason).toContain("provider 429");
+  });
+
+  test("wired into evaluate(): a throwing eval auto-rolls-back to fromVersion", async () => {
+    const reg = createFileBackedRegistry({ rootDir: join(tmpRoot, "specs") });
+    await reg.put("hello", "v1", "x");
+    await reg.put("hello", "v2", "y");
+    await reg.pin("hello", "prod", "v2"); // candidate already live
+    const deploy = createDeploymentController({ registry: reg });
+    const ctrl = createCanaryController({ registry: reg, deploymentController: deploy });
+    const gate = makeRegressionGate(async () => {
+      throw new Error("eval blew up");
+    });
+    const result = await ctrl.evaluate(
+      { name: "hello", fromVersion: "v1", toVersion: "v2", trafficPercent: 100 },
+      { intervalMs: 0, gate },
+    );
+    expect(result.verdict).toBe("fail");
+    expect(result.action).toBe("rollback");
+    expect(await reg.aliasFor("hello", "prod")).toBe("v1");
   });
 });
 

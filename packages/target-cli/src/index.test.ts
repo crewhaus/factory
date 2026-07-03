@@ -598,3 +598,44 @@ describe("emitCli — run-level budget field (item 27)", () => {
     expect(emitCli(baseIr()).files[0]?.content ?? "").not.toContain("budget:");
   });
 });
+
+describe("emitCli — memory block (#53)", () => {
+  test("omits all memory wiring when the IR leaves it unset", () => {
+    const content = emitCli(baseIr()).files[0]?.content ?? "";
+    expect(content).not.toContain("@crewhaus/memory-store");
+    expect(content).not.toContain("createMemoryTools");
+    expect(content).not.toContain("\n  memory: {");
+  });
+
+  test("a bare memory block wires Remember/Recall but no auto-* seams", () => {
+    const content = emitCli(baseIr({ memory: {} })).files[0]?.content ?? "";
+    expect(content).toContain("createMemoryStore");
+    expect(content).toContain("createMemoryTools");
+    expect(content).toContain("__memBundle.remember");
+    expect(content).toContain("__memBundle.recall");
+    expect(content).not.toContain("autoRecall: true");
+    expect(content).not.toContain("autoCapture: true");
+  });
+
+  test("autoRecall emits the recall seam threaded into runChatLoop", () => {
+    const content =
+      emitCli(baseIr({ memory: { autoRecall: true, recallK: 4 } })).files[0]?.content ?? "";
+    expect(content).toContain("autoRecall: true");
+    expect(content).toContain("recall: async (query, k) =>");
+    expect(content).toContain("__memDecision.recallK");
+  });
+
+  test("autoCapture emits the teardown capture seam", () => {
+    const content = emitCli(baseIr({ memory: { autoCapture: true } })).files[0]?.content ?? "";
+    expect(content).toContain("autoCapture: true");
+    expect(content).toContain("onCapture: async (completedTurns, sessionId) =>");
+    expect(content).toContain("summarizeDurableFacts(turnsFromEvents(");
+    expect(content).toContain("captureFacts(__memStore");
+  });
+
+  test("enabled:false disables all memory wiring", () => {
+    const content =
+      emitCli(baseIr({ memory: { enabled: false, autoRecall: true } })).files[0]?.content ?? "";
+    expect(content).not.toContain("createMemoryTools");
+  });
+});

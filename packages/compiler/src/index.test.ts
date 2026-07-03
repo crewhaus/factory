@@ -793,6 +793,65 @@ feedback:
   });
 });
 
+// #53 — cross-session memory block lowered into ir.memory (cli/channel/
+// managed/research shapes).
+describe("lower — memory block (#53)", () => {
+  test("carries every field verbatim on cli", () => {
+    const spec = parseSpec(`
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+memory:
+  enabled: true
+  autoCapture: true
+  autoCaptureThreshold: 2
+  autoRecall: true
+  recallK: 7
+`);
+    const ir = lower(spec);
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect(ir.memory).toEqual({
+      enabled: true,
+      autoCapture: true,
+      autoCaptureThreshold: 2,
+      autoRecall: true,
+      recallK: 7,
+    });
+  });
+
+  test("absent memory block leaves ir.memory undefined (spread-out)", () => {
+    const spec = parseSpec(`
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+`);
+    const ir = lower(spec);
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect(ir.memory).toBeUndefined();
+    expect("memory" in ir).toBe(false);
+  });
+
+  test("lowers on the research shape too (bare block wires tools)", () => {
+    const spec = parseSpec(`
+name: hello
+target: research
+agent:
+  model: m
+  instructions: i
+goal: find things
+memory:
+  autoRecall: true
+`);
+    const ir = lower(spec);
+    if (ir.target !== "research") throw new Error("unexpected target");
+    expect(ir.memory).toEqual({ autoRecall: true });
+  });
+});
+
 // FR-006 — Pillar 3 sink-side egress-matcher selector lowered into
 // ir.security.egressMatcher. This is the seam that closes the "flag parsed
 // but not threaded" gap: the run path reads ir.security.egressMatcher and

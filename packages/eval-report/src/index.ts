@@ -15,7 +15,15 @@
  * Reference: build-roadmap.md §16.
  */
 export { loadRun, type LoadedRun } from "./load";
-export { renderReport, type ReportVerdictRow, type ReportVerdicts } from "./render";
+export {
+  renderReport,
+  type ReportVerdictRow,
+  type ReportVerdicts,
+  // Ops item 32 — the incident-bundle renderer reuses the eval-report HTML
+  // shell + escaping so incident index.html matches the report look-and-feel.
+  shell,
+  escapeHtml,
+} from "./render";
 export { diffReports, type ReportDiff, type DiffEntry } from "./diff";
 // Matrix mode (item 11): fold per-model cells from `crewhaus eval --models`
 // into matrix.json + a best-per-metric-highlighted HTML table. Pricing is

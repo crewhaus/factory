@@ -28,9 +28,11 @@ import type { AuditKind, AuditRecord } from "@crewhaus/audit-log";
  *       { toolName, sideEffect, decision, reason, tenantId, matchedRule }) —
  *       deny/audit-and-allow rows only by default.
  *     - model_call, gateway_request, secrets_rotation, secrets_access,
- *       deployment_action, retention_enforcement — operational kinds; the
- *       digest counts them per-kind (countsByKind) but builds no verdict
- *       rollup from them.
+ *       deployment_action, retention_enforcement, alert_raised (item-31
+ *       alert watchdog's `AlertAuditSink`, see alert-sink.ts; payload
+ *       { sessionId, metric, observed, threshold, baselineSessions, detail })
+ *       — operational kinds; the digest counts them per-kind (countsByKind)
+ *       but builds no verdict rollup from them.
  *
  *   kinds DECLARED in @crewhaus/audit-log but with NO writer anywhere in the
  *   tree today: `egress_decision`, `tool_classification`, `session_fork`,
@@ -93,11 +95,13 @@ const TOP_N = 10;
  * Every kind declared by `@crewhaus/audit-log`. Kept as a local literal list
  * (rather than importing a value — the package only exports the TYPE) so the
  * digest can report declared kinds that produced zero records in the window.
- * `satisfies ReadonlyArray<AuditKind>` only checks that every ENTRY is a valid
- * kind — a SUBSET type-checks fine, so it does NOT catch an omission. This is a
- * maintained list: adding a kind to audit-log means adding it here too (a
- * missing kind just won't be reported as "declared but zero records"), and a
- * regression test asserts a `governance_*` record surfaces in the digest.
+ *
+ * `satisfies ReadonlyArray<AuditKind>` only checks that every entry HERE is a
+ * valid `AuditKind` — it is a subset check, not an exhaustiveness check. It
+ * does NOT catch a NEW kind added to the `AuditKind` union that this list
+ * forgets to list (F7: `alert_raised`, added by the item-31 alert watchdog,
+ * compiled cleanly for a while despite being absent here). Keep this list in
+ * sync BY HAND whenever `AuditKind` gains a member.
  */
 export const DECLARED_AUDIT_KINDS = [
   "policy_decision",
@@ -114,6 +118,7 @@ export const DECLARED_AUDIT_KINDS = [
   "retention_enforcement",
   "governance_approval",
   "governance_proposal",
+  "alert_raised",
 ] as const satisfies ReadonlyArray<AuditKind>;
 
 /** Thrown by `parseSinceFlag` on an unparseable `--since`. The CLI entry
