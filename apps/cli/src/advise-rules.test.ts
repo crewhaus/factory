@@ -9,13 +9,17 @@ import { parseSpec } from "@crewhaus/spec";
 import { validatePatch } from "@crewhaus/spec-patch";
 import {
   type AdviceFinding,
+  LOOP_NUDGE_PREFIX,
   type SessionEvents,
   buildAdviceContext,
   buildSuggestionsFile,
   formatFindingLines,
+  loopSignatureOf,
   parseJsonlObjects,
   renderAdviceHtml,
   ruleCompactionThrash,
+  ruleFailureTaxonomy,
+  ruleLoopBreak,
   rulePermissionChurn,
   ruleRepeatedToolFailures,
   ruleStopReasonAnomalies,
@@ -442,5 +446,171 @@ describe("artifacts", () => {
     const lines = findings.flatMap(formatFindingLines);
     expect(lines.some((l) => l.includes("patch: add agent.max_tokens → 16384"))).toBe(true);
     expect(lines.some((l) => l.startsWith("  advice: "))).toBe(true);
+  });
+});
+
+// -------- item 19: failure_taxonomy + loop-break --------
+
+function recoveryLine(errorName: string, action: string): unknown {
+  return line("recovery", { errorName, action, depth: 1 });
+}
+function loopNudge(toolName: string): unknown {
+  return line("user_message", {
+    content: `${LOOP_NUDGE_PREFIX} tool "${toolName}" has been called 3 times with the same input within the last 5 calls. Reconsider before repeating; respond with a different approach or final text.`,
+    synthetic: true,
+  });
+}
+
+describe("buildAdviceContext — item 19 fields", () => {
+  it("clusters recovery events by errorName with their action distribution", () => {
+    const ctx = buildAdviceContext([
+      session(SESSION_A, [
+        recoveryLine("OverloadedError", "retry"),
+        recoveryLine("OverloadedError", "retry"),
+        recoveryLine("OverloadedError", "fail"),
+        recoveryLine("PromptTooLong", "compact"),
+      ]),
+    ]);
+    const overloaded = ctx.recoveriesByErrorName.get("OverloadedError");
+    expect(overloaded?.count).toBe(3);
+    expect(overloaded?.actions.get("retry")).toBe(2);
+    expect(overloaded?.actions.get("fail")).toBe(1);
+    expect(ctx.recoveriesByErrorName.get("PromptTooLong")?.count).toBe(1);
+  });
+
+  it("mines loop-detection nudges by tool signature", () => {
+    const ctx = buildAdviceContext([
+      session(SESSION_A, [loopNudge("Bash"), loopNudge("Bash"), loopNudge("Read")]),
+    ]);
+    expect(ctx.loopSignatures.get("tool:Bash")).toBe(2);
+    expect(ctx.loopSignatures.get("tool:Read")).toBe(1);
+  });
+
+  it("ignores ordinary user_message content (not a loop nudge)", () => {
+    const ctx = buildAdviceContext([
+      session(SESSION_A, [line("user_message", { content: "please read the file" })]),
+    ]);
+    expect(ctx.loopSignatures.size).toBe(0);
+  });
+});
+
+describe("loopSignatureOf", () => {
+  it("extracts tool:<name> from a nudge and rejects non-nudges", () => {
+    expect(loopSignatureOf(`${LOOP_NUDGE_PREFIX} tool "Grep" has been called`)).toBe("tool:Grep");
+    expect(loopSignatureOf("hello")).toBeUndefined();
+    expect(loopSignatureOf(42)).toBeUndefined();
+    expect(loopSignatureOf([{ type: "text" }])).toBeUndefined();
+  });
+});
+
+describe("ruleFailureTaxonomy", () => {
+  it("drafts a validated failure_taxonomy patch from clustered recoveries", () => {
+    const ctx = buildAdviceContext([
+      session(SESSION_A, [
+        recoveryLine("OverloadedError", "retry"),
+        recoveryLine("OverloadedError", "retry"),
+        recoveryLine("OverloadedError", "fail"),
+      ]),
+    ]);
+    const [finding] = ruleFailureTaxonomy(ctx, { spec: CLI_SPEC });
+    expect(finding?.suggestion.kind).toBe("spec-patch");
+    if (finding?.suggestion.kind === "spec-patch") {
+      const p = finding.suggestion.patch;
+      expect(p.path).toEqual(["failure_taxonomy"]);
+      expect(p.op).toBe("add"); // spec had no taxonomy
+      validatePatch(CLI_SPEC, p); // must not throw (OPTIMIZABLE_PATHS)
+      const entries = p.value as Array<{ class: string; recovery: string }>;
+      expect(entries[0]).toMatchObject({ class: "OverloadedError", recovery: "retry" });
+    }
+  });
+
+  it("respects the cluster threshold (fewer than min → no finding)", () => {
+    const ctx = buildAdviceContext([
+      session(SESSION_A, [recoveryLine("Rare", "retry"), recoveryLine("Rare", "retry")]),
+    ]);
+    expect(ruleFailureTaxonomy(ctx, { spec: CLI_SPEC })).toEqual([]);
+  });
+
+  it("merges with an existing taxonomy and skips already-covered classes", () => {
+    const spec = parseSpec(
+      [
+        "name: hello",
+        "target: cli",
+        "agent:",
+        "  model: claude-sonnet-4-6",
+        "  instructions: help",
+        "failure_taxonomy:",
+        "  - class: OverloadedError",
+        "    pattern: overloaded",
+        "    recovery: retry",
+      ].join("\n"),
+    );
+    const ctx = buildAdviceContext([
+      session(SESSION_A, [
+        // Already covered — must be skipped.
+        recoveryLine("OverloadedError", "retry"),
+        recoveryLine("OverloadedError", "retry"),
+        recoveryLine("OverloadedError", "retry"),
+        // New class — must be drafted, appended after the existing entry.
+        recoveryLine("TimeoutError", "retry"),
+        recoveryLine("TimeoutError", "retry"),
+        recoveryLine("TimeoutError", "retry"),
+      ]),
+    ]);
+    const [finding] = ruleFailureTaxonomy(ctx, { spec });
+    expect(finding?.suggestion.kind).toBe("spec-patch");
+    if (finding?.suggestion.kind === "spec-patch") {
+      const p = finding.suggestion.patch;
+      expect(p.op).toBe("replace"); // existing array present
+      const entries = p.value as Array<{ class: string }>;
+      expect(entries.map((e) => e.class)).toEqual(["OverloadedError", "TimeoutError"]);
+    }
+  });
+
+  it("downgrades to advice text when no spec is available", () => {
+    const ctx = buildAdviceContext([
+      session(SESSION_A, [
+        recoveryLine("OverloadedError", "retry"),
+        recoveryLine("OverloadedError", "retry"),
+        recoveryLine("OverloadedError", "retry"),
+      ]),
+    ]);
+    const [finding] = ruleFailureTaxonomy(ctx, {});
+    expect(finding?.suggestion.kind).toBe("advice");
+  });
+});
+
+describe("ruleLoopBreak", () => {
+  it("drafts instructions ADVICE (never a patch) for recurring loop signatures", () => {
+    const ctx = buildAdviceContext([session(SESSION_A, [loopNudge("Bash"), loopNudge("Bash")])]);
+    const [finding] = ruleLoopBreak(ctx, { spec: CLI_SPEC });
+    expect(finding?.suggestion.kind).toBe("advice");
+    if (finding?.suggestion.kind === "advice") {
+      expect(finding.suggestion.text).toContain("Bash");
+      expect(finding.suggestion.text.toLowerCase()).toContain("loop");
+    }
+    // A loop is not eligible for failure_taxonomy — nothing patchable here.
+    const suggestions = buildSuggestionsFile([finding as AdviceFinding], [SESSION_A], "t");
+    expect(suggestions.suggestions).toEqual([]);
+  });
+
+  it("respects the loop-signature threshold", () => {
+    const ctx = buildAdviceContext([session(SESSION_A, [loopNudge("Bash")])]);
+    expect(ruleLoopBreak(ctx, { spec: CLI_SPEC })).toEqual([]);
+  });
+
+  it("is wired into runAdviceRules", () => {
+    const ctx = buildAdviceContext([
+      session(SESSION_A, [
+        recoveryLine("OverloadedError", "retry"),
+        recoveryLine("OverloadedError", "retry"),
+        recoveryLine("OverloadedError", "retry"),
+        loopNudge("Bash"),
+        loopNudge("Bash"),
+      ]),
+    ]);
+    const ids = runAdviceRules(ctx, { spec: CLI_SPEC }).map((f) => f.id);
+    expect(ids).toContain("failure-taxonomy-learned");
+    expect(ids).toContain("loop-break");
   });
 });

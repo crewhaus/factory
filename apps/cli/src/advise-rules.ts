@@ -49,6 +49,14 @@ export type ToolCallStats = {
 
 export type AskStats = { asks: number; approved: number; denied: number };
 
+/** Item 19 — per-errorName recovery aggregate: total occurrences plus the
+ *  distribution of recovery actions that error drove. */
+export type ErrorRecoveryStats = {
+  count: number;
+  /** action (`retry`/`compact`/`continue`/`tombstone`/`fail`) → occurrences. */
+  actions: Map<string, number>;
+};
+
 /**
  * Session-derived aggregates the rules consume. Built by
  * `buildAdviceContext` from parsed session-JSONL objects (tolerant of
@@ -62,11 +70,27 @@ export type AdviceContext = {
   /** `recovery` lines grouped by action (`retry`/`compact`/`continue`/…). */
   readonly recoveriesByAction: ReadonlyMap<string, number>;
   /**
+   * Item 19 — `recovery` lines grouped by `errorName`, each carrying the
+   * action distribution that error drove. The failure-taxonomy rule clusters
+   * these into draft `failure_taxonomy` entries (error class → recovery
+   * action). Old-vintage logs (no recovery lines) leave this empty.
+   */
+  readonly recoveriesByErrorName: ReadonlyMap<string, ErrorRecoveryStats>;
+  /**
    * `action: "continue"` recoveries — emitted exclusively for
    * `max_output_tokens` truncations (recovery-engine's taxonomy), so this
    * IS the truncation-pressure count.
    */
   readonly truncationContinues: number;
+  /**
+   * Item 19 — synthetic `[runtime] possible loop detected` nudges mined from
+   * `user_message` lines, grouped by tool signature. `matchNamedFailure`
+   * matches error.message only, so a loop (which is NOT an error — no
+   * exception is thrown) can never be caught by a taxonomy entry; the
+   * loop-break rule turns recurring signatures into instructions-addendum
+   * advice instead.
+   */
+  readonly loopSignatures: ReadonlyMap<string, number>;
   /** `compaction` lines per session (any vintage — this kind predates item 14). */
   readonly compactionsBySession: ReadonlyMap<string, number>;
   /** Resolved permission asks per tool, from `permission` lines. */
@@ -100,6 +124,28 @@ export function parseJsonlObjects(text: string): unknown[] {
 
 type LoggedLine = { kind?: unknown; payload?: unknown };
 
+/** The fixed prefix the runtime stamps on a loop-detection nudge (a
+ *  `user_message` with `synthetic: true`). Exported so a fixture/test can
+ *  build a realistic nudge without hard-coding the string twice. */
+export const LOOP_NUDGE_PREFIX = "[runtime] possible loop detected:";
+
+/** Matches the looping tool name inside a loop-detection nudge string. */
+const LOOP_TOOL_RE = /tool "([^"]+)"/;
+
+/**
+ * Item 19 — extract a loop signature (the looping tool name) from a
+ * `user_message` payload's `content` when it is a runtime loop-detection
+ * nudge, else undefined. The nudge content is the fixed string
+ * `[runtime] possible loop detected: tool "<name>" has been called …`.
+ * Returns `tool:<name>` so recurring loops on the same tool cluster; falls
+ * back to a generic `loop` signature when the tool name can't be parsed.
+ */
+export function loopSignatureOf(content: unknown): string | undefined {
+  if (typeof content !== "string" || !content.startsWith(LOOP_NUDGE_PREFIX)) return undefined;
+  const m = LOOP_TOOL_RE.exec(content);
+  return m?.[1] !== undefined ? `tool:${m[1]}` : "loop";
+}
+
 /** Tolerantly read a session-JSONL line's payload when its `kind` matches —
  *  the canonical defensive accessor shared with `context-pressure.ts`
  *  (`doctor --context-pressure` folds the same persisted events). */
@@ -124,9 +170,11 @@ export function buildAdviceContext(
 ): AdviceContext {
   const toolStats = new Map<string, ToolCallStats>();
   const recoveriesByAction = new Map<string, number>();
+  const recoveriesByErrorName = new Map<string, ErrorRecoveryStats>();
   const compactionsBySession = new Map<string, number>();
   const asksByTool = new Map<string, AskStats>();
   const stopReasons = new Map<string, number>();
+  const loopSignatures = new Map<string, number>();
   let truncationContinues = 0;
   let modelResponses = 0;
 
@@ -150,6 +198,25 @@ export function buildAdviceContext(
         const action = recovery["action"];
         recoveriesByAction.set(action, (recoveriesByAction.get(action) ?? 0) + 1);
         if (action === "continue") truncationContinues += 1;
+        // Item 19 — cluster by errorName for the failure-taxonomy rule.
+        if (typeof recovery["errorName"] === "string" && recovery["errorName"].length > 0) {
+          const errorName = recovery["errorName"];
+          const stats = recoveriesByErrorName.get(errorName) ?? { count: 0, actions: new Map() };
+          stats.count += 1;
+          stats.actions.set(action, (stats.actions.get(action) ?? 0) + 1);
+          recoveriesByErrorName.set(errorName, stats);
+        }
+        continue;
+      }
+      // Item 19 — synthetic loop-detection nudges are `user_message` lines
+      // whose content starts with the runtime's fixed prefix; group by the
+      // tool signature so a recurring loop on the same tool clusters.
+      const userMsg = payloadOf(obj, "user_message");
+      if (userMsg !== undefined) {
+        const signature = loopSignatureOf(userMsg["content"]);
+        if (signature !== undefined) {
+          loopSignatures.set(signature, (loopSignatures.get(signature) ?? 0) + 1);
+        }
         continue;
       }
       const compaction = payloadOf(obj, "compaction");
@@ -197,7 +264,9 @@ export function buildAdviceContext(
     sessionIds: sessions.map((s) => s.sessionId),
     toolStats,
     recoveriesByAction,
+    recoveriesByErrorName,
     truncationContinues,
+    loopSignatures,
     compactionsBySession,
     asksByTool,
     stopReasons,
@@ -223,6 +292,12 @@ export type AdviceThresholds = {
   stopMinResponses: number;
   /** Anomalous-stop rate at/above which the stop rule fires. */
   stopAnomalyRate: number;
+  /** Item 19 — occurrences of one error CLASS at/above which a
+   *  failure_taxonomy entry is drafted. */
+  recoveryClusterMin: number;
+  /** Item 19 — occurrences of one loop SIGNATURE at/above which loop-break
+   *  instructions advice fires. */
+  loopSignatureMin: number;
 };
 
 /**
@@ -239,6 +314,8 @@ export const DEFAULT_ADVICE_THRESHOLDS: AdviceThresholds = {
   asksPerTool: 3,
   stopMinResponses: 4,
   stopAnomalyRate: 0.25,
+  recoveryClusterMin: 3,
+  loopSignatureMin: 2,
 };
 
 /** Stop reasons that are part of healthy operation; everything else
@@ -503,12 +580,185 @@ export const ruleStopReasonAnomalies: AdviceRule = (ctx, opts) => {
   ];
 };
 
+// -------- item 19: failure_taxonomy + loop-break rules from telemetry --------
+
+/** The recovery actions a drafted `failure_taxonomy` entry may declare —
+ *  exactly the spec's `failureTaxonomyEntrySchema.recovery` enum. */
+const TAXONOMY_RECOVERY_ACTIONS: ReadonlySet<string> = new Set([
+  "retry",
+  "compact",
+  "continue",
+  "tombstone",
+  "fail",
+]);
+
+/** One drafted failure_taxonomy entry (shape = the spec's entry schema:
+ *  `{ class, pattern, recovery, hint? }`). */
+export type FailureTaxonomyEntry = {
+  readonly class: string;
+  readonly pattern: string;
+  readonly recovery: string;
+  readonly hint?: string;
+};
+
+/** The dominant recovery action observed for an error class (ties broken by
+ *  the enum's declared order → deterministic). Falls back to `retry` when the
+ *  observed action isn't a valid taxonomy action (e.g. a future action name). */
+function dominantRecoveryAction(actions: ReadonlyMap<string, number>): string {
+  let best: string | undefined;
+  let bestCount = -1;
+  for (const action of TAXONOMY_RECOVERY_ACTIONS) {
+    const count = actions.get(action) ?? 0;
+    if (count > bestCount) {
+      bestCount = count;
+      best = action;
+    }
+  }
+  return best ?? "retry";
+}
+
+/** Read the spec's existing `failure_taxonomy`, defensively — returns the
+ *  entries' `class` strings already covered so a draft never duplicates one. */
+function existingTaxonomyClasses(spec: Spec | undefined): Set<string> {
+  const covered = new Set<string>();
+  const taxonomy = specField<unknown>(spec, "failure_taxonomy");
+  if (!Array.isArray(taxonomy)) return covered;
+  for (const entry of taxonomy) {
+    if (entry !== null && typeof entry === "object") {
+      const cls = (entry as { class?: unknown }).class;
+      if (typeof cls === "string") covered.add(cls);
+    }
+  }
+  return covered;
+}
+
+/**
+ * Item 19 — failure-taxonomy learning. Clusters recurring `recovery` events
+ * by `errorName`; each class seen ≥ recoveryClusterMin times (and NOT already
+ * covered by the spec's taxonomy) becomes a draft `failure_taxonomy` entry
+ * whose `recovery` action is the one the runtime actually took most for that
+ * class, and whose `pattern` is a case-insensitive substring of the error
+ * name.
+ *
+ * `failure_taxonomy` IS whitelisted in OPTIMIZABLE_PATHS for every target, so
+ * the emitted patch rides the eval-gated `optimize --from-advice` apply. The
+ * patch REPLACES the whole `failure_taxonomy` array (existing entries +
+ * drafts) when the spec already has one, else ADDS the array — a whole-block
+ * edit the whitelist's prefix match allows. Budget caps aren't a field on the
+ * strict entry schema (`{ class, pattern, recovery, hint? }`), so the drafted
+ * `hint` carries the observed count + the "matches error.message" caveat and
+ * the recovery-engine's per-turn budget note.
+ */
+export const ruleFailureTaxonomy: AdviceRule = (ctx, opts) => {
+  const t = resolveThresholds(opts);
+  const spec = opts?.spec;
+  const covered = existingTaxonomyClasses(spec);
+  const drafts: FailureTaxonomyEntry[] = [];
+  const evidence: string[] = [];
+  let clustered = 0;
+
+  // Deterministic: sort clusters by count desc, then errorName.
+  const clusters = [...ctx.recoveriesByErrorName.entries()].sort((a, b) => {
+    if (b[1].count !== a[1].count) return b[1].count - a[1].count;
+    return a[0].localeCompare(b[0]);
+  });
+  for (const [errorName, stats] of clusters) {
+    if (stats.count < t.recoveryClusterMin) continue;
+    if (covered.has(errorName)) continue;
+    const recovery = dominantRecoveryAction(stats.actions);
+    drafts.push({
+      class: errorName,
+      // matchNamedFailure matches error.MESSAGE (substring/regex); the class
+      // name is the best available proxy — the error message usually contains
+      // it. The reviewer refines to a precise pattern.
+      pattern: errorName,
+      recovery,
+      hint: `observed ${stats.count}× → recovery-engine took "${recovery}" most; refine 'pattern' to a substring of the actual error.message, and note recovery actions are budget-capped per turn (repeated failures still fail-fast)`,
+    });
+    evidence.push(`${errorName}: ${stats.count} recoveries → draft recovery=${recovery}`);
+    clustered += stats.count;
+  }
+
+  if (drafts.length === 0) return [];
+
+  // Compose the full array: existing entries (verbatim) + the new drafts.
+  const existingArray = Array.isArray(specField<unknown>(spec, "failure_taxonomy"))
+    ? (specField<unknown[]>(spec, "failure_taxonomy") as unknown[])
+    : [];
+  const value = [...existingArray, ...drafts];
+  const op: SpecPatch["op"] = existingArray.length > 0 ? "replace" : "add";
+  const patch: SpecPatch = {
+    target: spec?.target ?? "cli",
+    path: ["failure_taxonomy"],
+    op,
+    value,
+    rationale: `advise: ${drafts.length} error class(es) recurred ≥${t.recoveryClusterMin}× — drafted failure_taxonomy entries`,
+  };
+  const adviceText = `Recurring error classes were recovered from repeatedly (${evidence.join("; ")}). Add failure_taxonomy entries so the runtime handles them deterministically: ${drafts
+    .map((d) => `${d.class} → ${d.recovery}`)
+    .join(", ")}. Set each 'pattern' to a substring of the real error.message.`;
+
+  return [
+    {
+      id: "failure-taxonomy-learned",
+      severity: "warn",
+      summary: `${drafts.length} recurring error class(es) → draft failure_taxonomy`,
+      evidence: [
+        ...evidence,
+        `threshold: ≥${t.recoveryClusterMin} recoveries per class; ${covered.size} class(es) already in the spec were skipped`,
+      ],
+      counts: { classes: drafts.length, recoveries: clustered },
+      suggestion: patchOrAdvice(spec, patch, adviceText),
+    },
+  ];
+};
+
+/**
+ * Item 19 — loop-break learning. A `[runtime] possible loop detected` nudge
+ * is NOT an error (no exception is thrown), so `matchNamedFailure` — which
+ * matches error.message only — can never catch it; a taxonomy entry is the
+ * wrong tool. This rule instead drafts an instructions-ADDENDUM as advice
+ * text (never a patch: `agent.instructions` IS optimizable, but a
+ * mechanically-appended nudge is a prompt edit a human should own, and the
+ * optimizer already rewrites instructions on its own signal). Fires per
+ * recurring loop signature (same tool looped in ≥ loopSignatureMin sessions/
+ * turns).
+ */
+export const ruleLoopBreak: AdviceRule = (ctx, opts) => {
+  const t = resolveThresholds(opts);
+  const recurring = [...ctx.loopSignatures.entries()]
+    .filter(([, count]) => count >= t.loopSignatureMin)
+    .sort((a, b) => (b[1] !== a[1] ? b[1] - a[1] : a[0].localeCompare(b[0])));
+  if (recurring.length === 0) return [];
+  const tools = recurring.map(([sig]) => sig.replace(/^tool:/, ""));
+  const evidence = recurring.map(([sig, count]) => `${sig}: ${count} loop nudge(s)`);
+  const total = recurring.reduce((sum, [, count]) => sum + count, 0);
+  return [
+    {
+      id: "loop-break",
+      severity: "warn",
+      summary: `${recurring.length} recurring loop signature(s) (${tools.join(", ")})`,
+      evidence: [
+        ...evidence,
+        `threshold: ≥${t.loopSignatureMin} nudges per signature — loops aren't errors, so a failure_taxonomy entry can't catch them (matchNamedFailure matches error.message only)`,
+      ],
+      counts: { signatures: recurring.length, nudges: total },
+      suggestion: {
+        kind: "advice",
+        text: `The agent repeatedly looped on: ${tools.join(", ")}. Add an instructions addendum that breaks the loop, e.g.: "If a tool returns the same result twice for the same input, do NOT call it again — change approach or answer from what you already have. Prefer batching related ${tools[0]} calls and reading the results before deciding the next step." This is an instructions edit (a loop isn't an error, so failure_taxonomy can't match it).`,
+      },
+    },
+  ];
+};
+
 export const ADVICE_RULES: ReadonlyArray<AdviceRule> = [
   ruleRepeatedToolFailures,
   ruleTruncationPressure,
   ruleCompactionThrash,
   rulePermissionChurn,
   ruleStopReasonAnomalies,
+  ruleFailureTaxonomy,
+  ruleLoopBreak,
 ];
 
 /**
