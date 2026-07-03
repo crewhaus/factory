@@ -27,6 +27,7 @@ import type {
   IrManagedV0,
   IrMcpServerConfig,
   IrMcpServers,
+  IrModelTiers,
   IrNode,
   IrPermissions,
   IrPipelineV0,
@@ -490,13 +491,28 @@ type SpecAgentWithFailover = {
     readonly windowMs?: number;
     readonly cooldownMs?: number;
   };
+  readonly model_tiers?: {
+    readonly fast: string;
+    readonly default: string;
+    readonly routing?: {
+      readonly contextTokenThreshold?: number;
+      readonly toolsToDefault?: boolean;
+      readonly firstTurnToDefault?: boolean;
+      readonly priorToolDensityThreshold?: number;
+    };
+  };
 };
 
 function lowerModelFailover(agent: SpecAgentWithFailover): {
   modelFallbacks?: readonly string[];
   circuitBreaker?: IrCircuitBreaker;
+  modelTiers?: IrModelTiers;
 } {
-  const out: { modelFallbacks?: readonly string[]; circuitBreaker?: IrCircuitBreaker } = {};
+  const out: {
+    modelFallbacks?: readonly string[];
+    circuitBreaker?: IrCircuitBreaker;
+    modelTiers?: IrModelTiers;
+  } = {};
   if (agent.model_fallbacks !== undefined && agent.model_fallbacks.length > 0) {
     out.modelFallbacks = [...agent.model_fallbacks];
   }
@@ -506,6 +522,34 @@ function lowerModelFailover(agent: SpecAgentWithFailover): {
       ...(cb.failureThreshold !== undefined ? { failureThreshold: cb.failureThreshold } : {}),
       ...(cb.windowMs !== undefined ? { windowMs: cb.windowMs } : {}),
       ...(cb.cooldownMs !== undefined ? { cooldownMs: cb.cooldownMs } : {}),
+    };
+  }
+  // Item 26 — two-tier router. Only lowered when present; the routing knobs
+  // carry the user's intent verbatim (runtime owns the per-knob defaults).
+  const mt = agent.model_tiers;
+  if (mt !== undefined) {
+    const routing = mt.routing;
+    out.modelTiers = {
+      fast: mt.fast,
+      default: mt.default,
+      ...(routing !== undefined
+        ? {
+            routing: {
+              ...(routing.contextTokenThreshold !== undefined
+                ? { contextTokenThreshold: routing.contextTokenThreshold }
+                : {}),
+              ...(routing.toolsToDefault !== undefined
+                ? { toolsToDefault: routing.toolsToDefault }
+                : {}),
+              ...(routing.firstTurnToDefault !== undefined
+                ? { firstTurnToDefault: routing.firstTurnToDefault }
+                : {}),
+              ...(routing.priorToolDensityThreshold !== undefined
+                ? { priorToolDensityThreshold: routing.priorToolDensityThreshold }
+                : {}),
+            },
+          }
+        : {}),
     };
   }
   return out;

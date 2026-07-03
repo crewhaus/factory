@@ -17,3 +17,13 @@ export type {
   FallbackRankInput,
 } from "./failover.js";
 export { FailoverExhaustedError, createFailoverChain } from "./failover.js";
+export type {
+  ModelTier,
+  ResolvedTier,
+  TierDecision,
+  TierRouter,
+  TierRouterOptions,
+  TierRoutingConfig,
+  TierSignals,
+} from "./tier-router.js";
+export { createTierRouter, pickTier } from "./tier-router.js";

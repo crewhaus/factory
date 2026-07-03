@@ -502,6 +502,33 @@ describe("formatBody — every kind + optional-field branches", () => {
     );
   });
 
+  test("model_tier_route renders tier/model/reason (item 26)", () => {
+    const ev = {
+      ...envelope,
+      kind: "model_tier_route",
+      tier: "fast",
+      model: "claude-haiku-4-5",
+      reason: "no hard-turn signal → fast tier",
+    } satisfies TraceEvent;
+    expect(formatLine(ev)).toBe(
+      `${prefix("model_tier_route")}tier=fast model=claude-haiku-4-5 reason=no hard-turn signal → fast tier`,
+    );
+  });
+
+  test("model_tier_route marks an escalated misroute recovery (item 26)", () => {
+    const ev = {
+      ...envelope,
+      kind: "model_tier_route",
+      tier: "default",
+      model: "claude-sonnet-4-5",
+      reason: "escalated after fast-tier failure",
+      escalated: true,
+    } satisfies TraceEvent;
+    expect(formatLine(ev)).toBe(
+      `${prefix("model_tier_route")}tier=default model=claude-sonnet-4-5 escalated reason=escalated after fast-tier failure`,
+    );
+  });
+
   test("test_verdict WITH reason includes it", () => {
     const ev = {
       ...envelope,

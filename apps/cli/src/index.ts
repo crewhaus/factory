@@ -1888,6 +1888,13 @@ async function runRunCli(
       ...(ir.target === "cli" && ir.agent.circuitBreaker !== undefined
         ? { circuitBreaker: ir.agent.circuitBreaker }
         : {}),
+      // Item 26 — two-tier turn-difficulty router. A `--model` override
+      // forces a single model, so tiers apply only without an override.
+      ...(ir.target === "cli" &&
+      typeof modelOverride !== "string" &&
+      ir.agent.modelTiers !== undefined
+        ? { modelTiers: ir.agent.modelTiers }
+        : {}),
       // Section 55 / item 23 — thread the spec's failure_taxonomy so
       // recovery-engine consults the user's named error classes (including
       // the `switch-model` verdict) before its built-in flow.

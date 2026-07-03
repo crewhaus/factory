@@ -480,6 +480,31 @@ export type ModelFailoverEvent = TraceEventEnvelope & {
   reason: "breaker_open" | "probe_restore" | "candidate_error" | "budget_degrade";
 };
 
+/**
+ * Item 26 — emitted by the two-tier turn-difficulty router each turn, BEFORE
+ * the model call, recording which tier (`fast` | `default`) was selected and
+ * WHY. The decision is deterministic — derived from signals already computed
+ * in the loop (estimated context tokens, whether tools are in play this turn,
+ * turn index, last-turn tool_use density) — so the event is fully reproducible
+ * from the transcript.
+ *
+ * `tier` is the chosen rung; `model` is the wire model id it resolved to;
+ * `reason` is the human-readable trigger (e.g. "tools in play",
+ * "context 42k > 20k threshold", "escalated after fast-tier failure").
+ * `escalated` is true when this route is a MISROUTE RECOVERY — a fast-tier
+ * turn failed and is being re-run on the default tier (item 23's switch-model
+ * machinery, composed).
+ */
+export type ModelTierRouteEvent = TraceEventEnvelope & {
+  kind: "model_tier_route";
+  tier: "fast" | "default";
+  /** Wire model id the chosen tier resolved to. */
+  model: string;
+  reason: string;
+  /** True when this is a fast→default misroute recovery, not a fresh pick. */
+  escalated?: boolean;
+};
+
 export type TraceEvent =
   | TurnStartEvent
   | TurnEndEvent
@@ -505,6 +530,7 @@ export type TraceEvent =
   | CostAccrualEvent
   | CircuitStateChangedEvent
   | ModelFailoverEvent
+  | ModelTierRouteEvent
   | JanitorActionEvent
   | ResponseRatedEvent
   | TestVerdictEvent
