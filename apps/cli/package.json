@@ -97,7 +97,8 @@
     "@crewhaus/federation-discovery": "workspace:*",
     "@crewhaus/sandbox": "workspace:*",
     "@crewhaus/sandbox-image-registry": "workspace:*",
-    "@crewhaus/compliance-controls": "workspace:*"
+    "@crewhaus/compliance-controls": "workspace:*",
+    "yaml": "^2.6.0"
   },
   "devDependencies": {
     "zod": "^3.23.8"

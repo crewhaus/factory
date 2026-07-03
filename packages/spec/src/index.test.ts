@@ -1466,3 +1466,70 @@ ${routing}`;
     ).toThrow(/crew\.routing\.match\["lead"\]\.to = "ghost" — target role not in crew\.roles/);
   });
 });
+
+// Section 28 (#43) — the OPTIONAL `version:` field. The riskiest change of the
+// batch: it touches the strict discriminated union. These tests are the
+// back-compat proof — old (unversioned) specs AND version-stamped specs both
+// parse, across every target member of the union.
+describe("parseSpec version field (#43 spec version stamping)", () => {
+  const CLI_NO_VERSION =
+    "name: t\ntarget: cli\nagent:\n  model: claude-opus-4-7\n  instructions: hi\n";
+
+  test("BACK-COMPAT: an old spec with NO version field still parses (version undefined)", () => {
+    const spec = parseSpec(CLI_NO_VERSION) as { version?: number };
+    expect(spec.version).toBeUndefined();
+  });
+
+  test("a version-stamped spec (what a migration writes) parses and carries the version", () => {
+    const spec = parseSpec(
+      "name: t\ntarget: cli\nversion: 1\nagent:\n  model: claude-opus-4-7\n  instructions: hi\n",
+    ) as { version?: number };
+    expect(spec.version).toBe(1);
+  });
+
+  test("version: 0 (the unversioned baseline made explicit) parses", () => {
+    const spec = parseSpec(
+      "name: t\ntarget: cli\nversion: 0\nagent:\n  model: claude-opus-4-7\n  instructions: hi\n",
+    ) as { version?: number };
+    expect(spec.version).toBe(0);
+  });
+
+  test("a negative version is rejected (non-negative int)", () => {
+    expect(() =>
+      parseSpec("name: t\ntarget: cli\nversion: -1\nagent:\n  model: m\n  instructions: hi\n"),
+    ).toThrow(SpecParseError);
+  });
+
+  test("a non-integer version is rejected", () => {
+    expect(() =>
+      parseSpec("name: t\ntarget: cli\nversion: 1.5\nagent:\n  model: m\n  instructions: hi\n"),
+    ).toThrow(SpecParseError);
+  });
+
+  test("the version field is accepted on EVERY target member of the strict union", () => {
+    // A representative minimal spec per target, each stamped version: 1. If the
+    // field were missing from any union member, that member's `.strict()` would
+    // reject the stamp — so this asserts the additive change reached all 14.
+    const specs: Record<string, string> = {
+      cli: "name: t\ntarget: cli\nversion: 1\nagent:\n  model: m\n  instructions: hi\n",
+      workflow:
+        "name: t\ntarget: workflow\nversion: 1\nmodel: m\nsteps:\n  - name: s\n    instructions: go\n",
+      graph:
+        "name: t\ntarget: graph\nversion: 1\nmodel: m\nentry: a\nnodes:\n  a:\n    instructions: go\nedges: []\n",
+      managed:
+        "name: t\ntarget: managed\nversion: 1\nagent:\n  model: m\n  instructions: hi\ntenants:\n  - id: t1\n    budget:\n      maxInputTokens: 100\n      maxOutputTokens: 100\n",
+      crew: "name: t\ntarget: crew\nversion: 1\nmodel: m\nentry: lead\nroles:\n  lead:\n    instructions: go\n",
+      research:
+        "name: t\ntarget: research\nversion: 1\nagent:\n  model: m\n  instructions: hi\ngoal: find things\n",
+      voice:
+        "name: t\ntarget: voice\nversion: 1\nagent:\n  model: m\n  instructions: hi\nvoice:\n  provider: openai\n",
+      browser: "name: t\ntarget: browser\nversion: 1\nagent:\n  model: m\n  instructions: hi\n",
+      eval: "name: t\ntarget: eval\nversion: 1\nagent:\n  model: m\n  instructions: hi\ndataset:\n  name: d\n  version: v1\ngraders:\n  - name: g\n",
+    };
+    for (const [target, yaml] of Object.entries(specs)) {
+      const spec = parseSpec(yaml) as { version?: number; target: string };
+      expect(spec.target).toBe(target);
+      expect(spec.version).toBe(1);
+    }
+  });
+});

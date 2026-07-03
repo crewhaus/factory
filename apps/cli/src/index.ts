@@ -391,6 +391,10 @@ import {
   tapSamples,
   triageFitnessSamples,
 } from "./triage";
+// Item 43 — `crewhaus upgrade`: single-spec version-drift detection + validated
+// migration chain, in a side-effect-free module so this entry file stays
+// testable.
+import { formatUpgradePlan, makeSpecValidator, planUpgrade } from "./upgrade";
 // CLI version resolution (embedded --define constant → package.json), shared
 // with compile-check.ts's dependency pinning.
 import { cliVersion } from "./version";
@@ -875,6 +879,13 @@ const MIGRATE_SCHEMA: ParseArgsSchema = {
   ],
 };
 
+// Item 43 — `crewhaus upgrade`: detect the cwd spec's version drift vs the
+// current CLI's spec version, run the migration chain (validated), show a diff.
+// --dry-run (default) previews; --write applies.
+const UPGRADE_SCHEMA: ParseArgsSchema = {
+  flags: [{ name: "dry-run" }, { name: "write" }, { name: "help", short: "h" }],
+};
+
 const BUILD_IMAGE_SCHEMA: ParseArgsSchema = {
   flags: [
     { name: "tag", takesValue: true },
@@ -996,6 +1007,8 @@ function usageText(): string {
     "  spec put|list|get|pin|alias|log ...  versioned spec storage + changelog (Section 28 spec-registry)",
     "  deploy promote|rollback ...          re-pin a spec for an environment (Section 28)",
     "  migrate-all --from N --to N          batch-migrate every spec in the registry",
+    "  upgrade [spec.yaml] [--write]        detect the cwd spec's version drift + run the migration",
+    "                                       chain (validated); --dry-run diff by default (item 43)",
     "  build-image <target> --tag <tag>     build the docker image for a target shape (Section 32)",
     "       [--platform <p>] [--push]        (--push records the registry manifest digest in",
     "       [--no-record]                     docker/digests.json; --no-record opts out. Local",
@@ -6393,6 +6406,51 @@ async function runMigrateAll(args: ParsedArgs): Promise<void> {
 }
 
 /**
+ * Item 43 — `crewhaus upgrade [spec.yaml] [--dry-run] [--write]`. Detects the
+ * cwd (or named) spec's schema-version drift against the CLI's current spec
+ * version (the migration engine's `latestVersion()`), runs the migration chain
+ * with a `parseSpec` VALIDATE callback (the gap `migrate-all` left open — it
+ * wrote migrated specs unchecked), prints a diff, and — with `--write` —
+ * applies it in place. Dry-run is the default.
+ */
+async function runUpgrade(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus upgrade [spec.yaml] [--dry-run] [--write]\n" +
+        "  Detect the spec's schema-version drift vs this CLI's current spec version\n" +
+        "  and run the migration chain (each migrated spec is validated via parseSpec\n" +
+        "  before it can be written). Defaults to ./crewhaus.yaml and to a dry-run diff.\n" +
+        "  --write   apply the migration in place (rewrites the spec file).\n",
+    );
+    return;
+  }
+  const write = args.flags["write"] === true;
+  const specArg = args.positional[0];
+  const absSpec = resolve(
+    typeof specArg === "string" ? specArg : join(process.cwd(), "crewhaus.yaml"),
+  );
+  let yamlText: string;
+  try {
+    yamlText = readFileSync(absSpec, "utf-8");
+  } catch (err) {
+    die(`could not read ${absSpec}: ${(err as Error).message}`);
+  }
+
+  const { createDefaultEngine } = await import("@crewhaus/migration-engine");
+  const engine = createDefaultEngine();
+  // The validate callback the CLI's migrate-all never wired: a migrated spec
+  // must parse through the LIVE Zod union before it can be written back.
+  const plan = planUpgrade(yamlText, engine, makeSpecValidator(parseSpec));
+
+  if (plan.action === "upgrade" && write && plan.migratedYaml !== undefined) {
+    writeFileSync(absSpec, plan.migratedYaml);
+  }
+  process.stdout.write(formatUpgradePlan(plan, write));
+  // A migration/validation failure is a non-zero exit so CI can gate on it.
+  process.exit(plan.action === "validate-fail" ? 1 : 0);
+}
+
+/**
  * Section 32 — `crewhaus build-image <target> --tag <tag> [--platform <p>] [--push] [--no-record]`.
  * Wraps `docker buildx build` for the per-target Dockerfiles in
  * @crewhaus/docker-images. Item 47: after a successful PUSHED build the
@@ -7427,6 +7485,14 @@ switch (subcommand) {
   }
   case "migrate-all":
     await runMigrateAll(parseFor(rest, MIGRATE_SCHEMA));
+    break;
+  case "upgrade":
+    try {
+      await runUpgrade(parseFor(rest, UPGRADE_SCHEMA));
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
     break;
   case "build-image":
     await runBuildImage(rest);
