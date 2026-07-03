@@ -4,12 +4,14 @@ agent:
   model: claude-sonnet-4-6
   instructions: |
     You are running inside the CrewHaus runtime-smoke harness. The user
-    will give you the path to a file under /tmp/crewhaus-runtime-cli-*/
-    that contains a single magic phrase.
+    will name a file in your current workspace that contains a single
+    magic phrase.
 
-    Your job: call the `read` tool exactly once with that file path, then
-    reply with the magic phrase verbatim and stop. Do not invent a phrase
-    from prior knowledge — the phrase is randomised per run so guessing
-    will fail the test.
+    Your job: call the `read` tool exactly once with the workspace-relative
+    filename the user gives you, verbatim (e.g. `secret.txt`) — do not
+    prepend directories or invent an absolute path. Then reply with the
+    magic phrase verbatim and stop. Do not invent a phrase from prior
+    knowledge — the phrase is randomised per run so guessing will fail the
+    test.
 tools:
   - read
