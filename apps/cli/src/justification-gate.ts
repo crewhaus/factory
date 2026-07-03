@@ -1,6 +1,7 @@
 import { join } from "node:path";
+import type { AuditLog } from "@crewhaus/audit-log";
 import type { JustificationJudge } from "@crewhaus/permission-engine";
-import type { JustificationAuditSink } from "@crewhaus/runtime-core";
+import type { EgressAuditSink, JustificationAuditSink } from "@crewhaus/runtime-core";
 
 /**
  * FR-004 — Pillar 3 intent-gate wiring for `crewhaus run`, factored out of
@@ -109,16 +110,44 @@ export type OpenJustificationAuditSinkOptions = {
 };
 
 /**
- * Open the durable `JustificationAuditSink` the gate appends to. Returns
- * `undefined` when disabled (so the caller spreads nothing into
- * `runChatLoop` and the durable path is a no-op). The returned object is a
- * real `@crewhaus/audit-log` `AuditLog`, which structurally satisfies the
- * `JustificationAuditSink` seam (its `append({ kind, payload })`).
+ * Open the durable audit log the Pillar 3 gates append to, rooted at
+ * `<cwd>/.crewhaus/audit`. Returns `undefined` when disabled (so the caller
+ * spreads nothing into `runChatLoop` and the durable path is a no-op).
+ *
+ * The returned object is a real `@crewhaus/audit-log` `AuditLog`, which
+ * structurally satisfies BOTH the `JustificationAuditSink`
+ * (`permission_justification_evaluated`) and the `EgressAuditSink`
+ * (`egress_decision`) seams — its `append({ kind, payload })`. A single log
+ * instance is deliberately shared across both gates so their records land on
+ * ONE hash-chained, gapless chain (item 20): two separate logs would each own
+ * their own `_chain-tail.json` and interleave inconsistently.
+ */
+export async function openSecurityAuditSink(
+  opts: OpenJustificationAuditSinkOptions,
+): Promise<AuditLog | undefined> {
+  if (opts.enabled === false) return undefined;
+  const { openAuditLog } = await import("@crewhaus/audit-log");
+  return await openAuditLog({ rootDir: justificationAuditDir(opts.cwd) });
+}
+
+/**
+ * Back-compat alias — the justification gate's original opener. Returns the
+ * shared `AuditLog` typed down to the `JustificationAuditSink` seam. Prefer
+ * {@link openSecurityAuditSink} when a caller also needs the egress sink from
+ * the same chain.
  */
 export async function openJustificationAuditSink(
   opts: OpenJustificationAuditSinkOptions,
 ): Promise<JustificationAuditSink | undefined> {
-  if (opts.enabled === false) return undefined;
-  const { openAuditLog } = await import("@crewhaus/audit-log");
-  return await openAuditLog({ rootDir: justificationAuditDir(opts.cwd) });
+  return await openSecurityAuditSink(opts);
+}
+
+/**
+ * Narrow a shared security audit log to the `EgressAuditSink` seam. The same
+ * `AuditLog` instance already satisfies `EgressAuditSink` structurally; this
+ * is a typed pass-through so the run path can thread one log into both
+ * `runChatLoop({ justificationAuditSink, egressAuditSink })` fields.
+ */
+export function asEgressAuditSink(sink: AuditLog | undefined): EgressAuditSink | undefined {
+  return sink;
 }

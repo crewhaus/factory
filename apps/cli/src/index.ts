@@ -300,6 +300,14 @@ import {
   createEgressMatcher,
   resolveEgressMatcherChoice,
 } from "./egress-matcher";
+// AUTOMATION-OPPORTUNITIES.md item 20 — `crewhaus egress review` core (triage
+// durable egress_decision + rule-based justification-denial history into
+// learned security spec suggestions), side-effect-free so it is unit-testable.
+import {
+  buildEgressTriageContext,
+  formatEgressFindingLines,
+  runEgressTriage,
+} from "./egress-triage";
 // Item 6 — `crewhaus eval coverage`: production-vs-eval behavior gap
 // detection, in a side-effect-free module so it is unit-testable (this entry
 // file runs an argv switch on import).
@@ -463,14 +471,27 @@ import {
   buildCalibrationFile,
   renderCalibrationCard,
 } from "./judge-calibrate";
+// AUTOMATION-OPPORTUNITIES.md item 52 — `crewhaus justification calibrate` +
+// `justification preflight` core (replay the intent gate over durable
+// permission_justification_evaluated records, compare to per-tool outcome,
+// propose a confidence threshold, flag disagreements). Side-effect-free.
+import {
+  buildToolOutcomes,
+  calibrateJustification,
+  extractJustificationRecords,
+  preflightJustification,
+  renderCalibrationLines,
+  renderPreflightLines,
+} from "./justification-calibrate";
 // FR-004 — Pillar 3 intent-gate judge + durable audit-sink resolution, in a
 // side-effect-free module so it is unit-testable (this entry file runs an
 // argv switch on import).
 import {
   InvalidJudgeChoiceError,
   type JudgeChoice,
+  asEgressAuditSink,
   createJustificationJudge,
-  openJustificationAuditSink,
+  openSecurityAuditSink,
   resolveJudgeChoice,
 } from "./justification-gate";
 // Item 63 — cross-harness knowledge sync: shared memories / graders / prompt
@@ -569,6 +590,18 @@ import {
   rankSuggestions,
   readOnlyByName,
 } from "./permissions-suggest";
+// AUTOMATION-OPPORTUNITIES.md item 51 — `crewhaus pii tune` core (hashed
+// redaction-history aggregation → false-positive over-redaction candidates +
+// coverage gaps → reviewed .crewhaus/pii-policy.json). Side-effect-free; never
+// stores/returns raw PII (only HMAC hashes + counts).
+import {
+  type ScanUnit,
+  buildPiiPolicy,
+  buildPiiTuneContext,
+  findCoverageGaps,
+  findFalsePositives,
+  renderPiiTuneLines,
+} from "./pii-tune";
 // Item 59 — PR-based optimize/advise proposals. `crewhaus propose` packages a
 // spec change into a review artifact + opens a PR (never auto-merges), in a
 // side-effect-free module so it is unit-testable (this entry file runs an argv
@@ -679,6 +712,25 @@ import {
   scopeAuditDir,
   scopeAuditSnapshotPath,
 } from "./scope-audit-drift";
+// AUTOMATION-OPPORTUNITIES.md item 50 — `crewhaus security corpus` core
+// (regression dataset grown from blocked-attempt residue + CI-usable
+// regression check + reviewed candidate detector rules), side-effect-free so
+// it is unit-testable (this entry file runs an argv switch on import).
+import {
+  SecurityCorpusError,
+  buildSecurityCorpus,
+  candidateRulesPath,
+  checkSecurityCorpus,
+  clusterCandidateRules,
+  corpusDir,
+  corpusPath,
+  harvestBlockedAttempts,
+  harvestNearMisses,
+  loadSecurityCorpus,
+  parseCorpusSince,
+  renderCorpusBuildLines,
+  renderCorpusCheckLines,
+} from "./security-corpus";
 // Item 48 — `crewhaus security digest` core (windowed rollup over
 // .crewhaus/audit + session event logs, text/json/html renderers, webhook
 // notify), in a side-effect-free module so it is unit-testable (this entry
@@ -1510,6 +1562,66 @@ const SECURITY_SCHEMA: ParseArgsSchema = {
     { name: "notify", takesValue: true },
     // Harness root that owns `.crewhaus/` (mirrors `retention --dir`).
     { name: "dir", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
+// AUTOMATION-OPPORTUNITIES.md item 50 — `security corpus [check]`.
+const SECURITY_CORPUS_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // rollup window over session logs: <N>d or ISO (default all-time).
+    { name: "since", takesValue: true },
+    // harness root that owns .crewhaus/ (mirrors `security digest --dir`).
+    { name: "dir", takesValue: true },
+    // minimum distinct-snippet cluster support to emit a candidate rule.
+    { name: "min-support", takesValue: true },
+    { name: "json", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
+// AUTOMATION-OPPORTUNITIES.md item 20 — `egress review [--propose]`.
+const EGRESS_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // harness root that owns .crewhaus/audit (mirrors `security digest --dir`).
+    { name: "dir", takesValue: true },
+    // write the eval-gated SpecPatch suggestions to a suggestions.json that
+    // `optimize --from-advice` can consume (mirrors `advise -o`).
+    { name: "propose", takesValue: false },
+    { name: "out", short: "o", takesValue: true },
+    { name: "json", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
+// AUTOMATION-OPPORTUNITIES.md item 51 — `pii tune`.
+const PII_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // how many recent sessions to scan (default 50; `all`).
+    { name: "sessions", takesValue: true },
+    // harness root that owns .crewhaus/ (mirrors `security digest --dir`).
+    { name: "dir", takesValue: true },
+    // HMAC key for hashing PII values (also read from CREWHAUS_PII_HASH_SECRET).
+    // MUST match the redactor's secret for the emitted policy to apply.
+    { name: "secret", takesValue: true },
+    // write the reviewed allow-list to <dir>/.crewhaus/pii-policy.json.
+    { name: "write", takesValue: false },
+    { name: "json", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
+// AUTOMATION-OPPORTUNITIES.md item 52 — `justification calibrate|preflight`.
+const JUSTIFICATION_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // calibrate — how many recent sessions to fold for the outcome proxy.
+    { name: "sessions", takesValue: true },
+    // harness root that owns .crewhaus/ (mirrors `security digest --dir`).
+    { name: "dir", takesValue: true },
+    // preflight — the session goal (spec agent.instructions) is read from the
+    // <spec> positional; this overrides it for ad-hoc replay.
+    { name: "goal", takesValue: true },
+    { name: "json", takesValue: false },
     { name: "help", short: "h" },
   ],
 };
@@ -3478,14 +3590,19 @@ async function runRunCli(
   // FR-004 — resolve the Pillar 3 intent-gate judge (flag > spec > rule-based).
   // undefined leaves runtime-core on `ruleBasedJustificationJudge`.
   const justificationJudge = await resolveJustificationJudge(args, ir.security?.justification);
-  // FR-004 — open the durable audit sink the intent gate appends a
-  // `permission_justification_evaluated` record to. On by default for `run`
-  // (rooted at .crewhaus/audit); `--no-justification-audit` skips it. undefined
-  // leaves runtime-core writing only the ephemeral trace-bus event.
-  const justificationAuditSink = await openJustificationAuditSink({
+  // FR-004 / item 20 — open the shared durable audit sink both Pillar 3 gates
+  // append to (rooted at .crewhaus/audit): the intent gate writes
+  // `permission_justification_evaluated`, and the egress classifier writes
+  // `egress_decision` for non-pass verdicts (so `crewhaus egress review` can
+  // triage them offline). One log = one hash chain. On by default for `run`;
+  // `--no-justification-audit` skips it. undefined leaves runtime-core writing
+  // only the ephemeral trace-bus events.
+  const securityAuditSink = await openSecurityAuditSink({
     cwd: process.cwd(),
     enabled: args.flags["no-justification-audit"] !== true,
   });
+  const justificationAuditSink = securityAuditSink;
+  const egressAuditSink = asEgressAuditSink(securityAuditSink);
 
   // FR-006 — resolve the Pillar 3 sink-side egress matcher (flag > spec >
   // substring). undefined leaves runtime-core on the built-in
@@ -3719,6 +3836,7 @@ async function runRunCli(
       ...(resumeId !== undefined ? { resume: { sessionId: resumeId } } : {}),
       ...(justificationJudge !== undefined ? { justificationJudge } : {}),
       ...(justificationAuditSink !== undefined ? { justificationAuditSink } : {}),
+      ...(egressAuditSink !== undefined ? { egressAuditSink } : {}),
       ...(egressMatcher !== undefined ? { egressMatcher } : {}),
       ...(alertSink !== undefined ? { alertSink } : {}),
       // Item 32 — stamp the spec name into any auto-assembled incident capture
@@ -3829,12 +3947,15 @@ async function runRunBrowser(
   // (flag > substring); both run paths thread the same matcher into the same
   // egress check inside runChatLoop.
   const egressMatcher = await resolveEgressMatcher(args, undefined);
-  // FR-004 — same durable audit sink as the cli path, so a justification-gated
-  // browser tool also writes the `permission_justification_evaluated` record.
-  const justificationAuditSink = await openJustificationAuditSink({
+  // FR-004 / item 20 — same shared durable audit sink as the cli path, so a
+  // justification-gated browser tool writes `permission_justification_evaluated`
+  // and a non-pass egress verdict writes `egress_decision`.
+  const securityAuditSink = await openSecurityAuditSink({
     cwd: process.cwd(),
     enabled: args.flags["no-justification-audit"] !== true,
   });
+  const justificationAuditSink = securityAuditSink;
+  const egressAuditSink = asEgressAuditSink(securityAuditSink);
 
   // Lazy-import the browser-runtime packages so cli/init/doctor invocations
   // don't pay the playwright + computer-use-driver load cost.
@@ -3890,6 +4011,7 @@ async function runRunBrowser(
       seedMessages: [{ role: "user", content: prompt }],
       ...(justificationJudge !== undefined ? { justificationJudge } : {}),
       ...(justificationAuditSink !== undefined ? { justificationAuditSink } : {}),
+      ...(egressAuditSink !== undefined ? { egressAuditSink } : {}),
       ...(egressMatcher !== undefined ? { egressMatcher } : {}),
       installSigintHandler: false,
       maxTokens: 4096,
@@ -12601,6 +12723,461 @@ async function runSecurityDigest(args: ParsedArgs): Promise<void> {
 }
 
 /**
+ * AUTOMATION-OPPORTUNITIES.md item 50 — `crewhaus security corpus [check]`.
+ *
+ * `security corpus` — harvest the detector's real block residue (prompt-
+ * injection redaction notices in session `tool_result` content) into a
+ * versioned REGRESSION dataset at `.crewhaus/security-corpus/corpus.json`
+ * (one case per rule observed blocking, pinned to a canonical exemplar built
+ * at runtime — never a stored attack payload), and cluster suspicious near-
+ * misses into REVIEWED candidate detector rules at `candidate-rules.json`
+ * (never auto-merged into REGEX_RULES; samples are redacted through the same
+ * strong secret+PII detector set the dataset/knowledge synthesis paths use
+ * and reduced to a short hash-first descriptor — never a raw or lightly-
+ * redacted snippet). See security-corpus.ts for the durability + no-raw-
+ * value design.
+ *
+ * `security corpus check` — run the corpus against the CURRENT detector and
+ * exit non-zero if any exemplar's classification has DRIFTED DOWN from the
+ * tier recorded at build time (F2) — e.g. malicious→suspicious, not only a
+ * drop all the way to clean, since only `malicious` redacts at runtime.
+ * CI-usable.
+ */
+async function runSecurityCorpus(args: ParsedArgs, action: "build" | "check"): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus security corpus [--since <N>d|<ISO>] [--min-support N] [--dir <root>] [--json]\n" +
+        "       crewhaus security corpus check [--dir <root>] [--json]\n" +
+        "\n" +
+        "  corpus         harvest blocked prompt-injection attempts (redaction-notice\n" +
+        "                 residue in session logs) into a versioned regression dataset\n" +
+        "                 (.crewhaus/security-corpus/corpus.json) + reviewed candidate\n" +
+        "                 detector rules (candidate-rules.json). corpus.json cases pin a\n" +
+        "                 canonical exemplar built at runtime, never a stored attack\n" +
+        "                 payload; candidate-rules.json samples are redacted + hashed,\n" +
+        "                 never a raw or lightly-redacted snippet.\n" +
+        "  corpus check   run the corpus against the CURRENT detector; exit 1 if any\n" +
+        "                 exemplar's classification tier has drifted DOWN from its\n" +
+        "                 recorded baseline (e.g. malicious→suspicious), not only a\n" +
+        "                 drop to clean. CI-usable.\n" +
+        "\n" +
+        "  --since <w>    window over session logs: <N>d or ISO (default: all-time)\n" +
+        "  --min-support  distinct near-miss snippets to emit a candidate rule (default 3)\n" +
+        "  --dir <root>   harness root that owns .crewhaus/ (default: cwd)\n" +
+        "  --json         machine-readable output\n",
+    );
+    return;
+  }
+  const dirFlag = args.flags["dir"];
+  const rootDir = typeof dirFlag === "string" ? resolve(dirFlag) : process.cwd();
+  const json = args.flags["json"] === true;
+
+  if (action === "check") {
+    const path = corpusPath(rootDir);
+    let corpus: ReturnType<typeof loadSecurityCorpus>;
+    try {
+      corpus = loadSecurityCorpus(path);
+    } catch (err) {
+      if (err instanceof SecurityCorpusError) die(err.message);
+      throw err;
+    }
+    if (corpus === undefined) {
+      die(`no corpus at ${path} — run \`crewhaus security corpus\` first`);
+      return;
+    }
+    const result = await checkSecurityCorpus(corpus);
+    if (json) {
+      process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    } else {
+      process.stdout.write(
+        `security corpus check: ${path}\n${renderCorpusCheckLines(result)
+          .map((l) => `  ${l}`)
+          .join("\n")}\n`,
+      );
+    }
+    // CI-usable exit code: a detector regression fails the process.
+    if (result.verdict === "fail") process.exit(1);
+    return;
+  }
+
+  const window = parseCorpusSince(
+    typeof args.flags["since"] === "string" ? args.flags["since"] : undefined,
+  );
+  const harvest = harvestBlockedAttempts({ rootDir, window });
+  const corpus = await buildSecurityCorpus(harvest, window.label);
+  const nearMisses = harvestNearMisses({ rootDir, window });
+  const minSupport = intFlag(args, "min-support") ?? 3;
+  const candidates = clusterCandidateRules(nearMisses, minSupport);
+
+  mkdirSync(corpusDir(rootDir), { recursive: true });
+  const cPath = corpusPath(rootDir);
+  const candPath = candidateRulesPath(rootDir);
+  writeFileSync(cPath, `${JSON.stringify(corpus, null, 2)}\n`);
+  writeFileSync(candPath, `${JSON.stringify(candidates, null, 2)}\n`);
+
+  if (json) {
+    process.stdout.write(`${JSON.stringify({ corpus, candidates }, null, 2)}\n`);
+    return;
+  }
+  process.stdout.write(`security corpus: ${rootDir}\n`);
+  for (const line of renderCorpusBuildLines(corpus)) process.stdout.write(`  ${line}\n`);
+  process.stdout.write(
+    `  candidate rules: ${candidates.candidates.length} clustered from ${nearMisses.length} near-miss(es) (min-support ${minSupport}, review before merging)\n`,
+  );
+  process.stdout.write(`  wrote ${cPath}\n  wrote ${candPath}\n`);
+}
+
+/**
+ * AUTOMATION-OPPORTUNITIES.md item 20 — `crewhaus egress review [--propose]`.
+ *
+ * Mines the durable `.crewhaus/audit` chain for `egress_decision` records (now
+ * written by runtime-core's egress audit sink on every non-pass verdict) plus
+ * rule-based justification denials, clusters them by (sink, origin), and
+ * proposes learned security spec suggestions: per-sink relaxations (advice —
+ * `security.egressPolicy` is reserved for the egress FRs, so we coordinate
+ * rather than add the schema field), `security.egressMatcher: semantic` when
+ * warn-noise is high with zero blocks (advice — not optimizer-whitelisted),
+ * and `security.justification.judge: claude` when rule-based denials are
+ * frequent (a VALIDATED spec-patch that rides `optimize --from-advice`).
+ *
+ * `--propose` (with `-o <dir>`, default `.crewhaus/egress-review`) writes the
+ * whitelisted patches to a `suggestions.json` in the same shape
+ * `optimize --from-advice` consumes. See egress-triage.ts for the design.
+ */
+async function runEgressReview(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus egress review [--propose] [-o <dir>] [--dir <root>] [--json]\n" +
+        "\n" +
+        "triages .crewhaus/audit egress_decision + rule-based justification-denial\n" +
+        "history into learned security spec suggestions:\n" +
+        "  per-sink relaxations (advice — security.egressPolicy is reserved for the\n" +
+        "    egress FRs, so this coordinates rather than adds the schema field),\n" +
+        "  security.egressMatcher: semantic when warn-noise is high with 0 blocks,\n" +
+        "  security.justification.judge: claude when rule-based denials are frequent\n" +
+        "    (an eval-gated spec-patch that rides optimize --from-advice)\n" +
+        "\n" +
+        "  --propose       write whitelisted patches to <dir>/suggestions.json\n" +
+        "  -o <dir>        artifact dir (default .crewhaus/egress-review)\n" +
+        "  --dir <root>    harness root that owns .crewhaus/ (default: cwd)\n" +
+        "  --json          machine-readable findings to stdout\n",
+    );
+    return;
+  }
+  const dirFlag = args.flags["dir"];
+  const rootDir = typeof dirFlag === "string" ? resolve(dirFlag) : process.cwd();
+  const auditDir = join(rootDir, ".crewhaus", "audit");
+  const auditObjects: unknown[] = [];
+  if (existsSync(auditDir)) {
+    for (const f of readdirSync(auditDir).sort()) {
+      if (!f.endsWith(".jsonl")) continue;
+      auditObjects.push(...parseAdviseJsonl(readFileSync(join(auditDir, f), "utf-8")));
+    }
+  }
+
+  // The cwd spec enables the whitelisted justification patch; without one the
+  // rules fall back to advice text (mirrors `advise`).
+  let spec: Spec | undefined;
+  const specPath = join(rootDir, "crewhaus.yaml");
+  if (existsSync(specPath)) {
+    try {
+      spec = parseSpec(readFileSync(specPath, "utf-8"));
+    } catch (err) {
+      process.stderr.write(
+        `[egress review] crewhaus.yaml did not parse (${(err as Error).message}) — patch suggestions downgraded to advice\n`,
+      );
+    }
+  }
+
+  const ctx = buildEgressTriageContext(auditObjects);
+  const findings = runEgressTriage(ctx, spec !== undefined ? { spec } : {});
+  const generatedAt = new Date().toISOString();
+
+  if (args.flags["json"] === true) {
+    process.stdout.write(`${JSON.stringify({ context: ctx, findings }, null, 2)}\n`);
+    return;
+  }
+
+  process.stdout.write(
+    `egress review: ${rootDir}\n` +
+      `  ${ctx.egressRecords} durable egress_decision record(s), ${ctx.totalWarned} warned / ${ctx.totalBlocked} blocked; ${ctx.ruleBasedDenials}/${ctx.ruleBasedEvaluated} rule-based justification denials\n`,
+  );
+  if (ctx.egressRecords === 0 && ctx.ruleBasedEvaluated === 0) {
+    process.stdout.write(
+      "  no durable egress/justification history yet — run the agent (egress verdicts are now written to .crewhaus/audit), then review\n",
+    );
+  }
+  process.stdout.write(`  ${findings.length} suggestion${findings.length === 1 ? "" : "s"}\n`);
+  for (const f of findings) {
+    for (const line of formatEgressFindingLines(f)) process.stdout.write(`  ${line}\n`);
+  }
+
+  if (args.flags["propose"] === true) {
+    const outDir = strFlag(args, "out") ?? join(rootDir, ".crewhaus", "egress-review");
+    mkdirSync(outDir, { recursive: true });
+    const suggestions = buildSuggestionsFile(
+      findings,
+      ctx.clusters.map((c) => c.sinkId),
+      generatedAt,
+    );
+    const suggestionsPath = join(outDir, "suggestions.json");
+    writeFileSync(suggestionsPath, `${JSON.stringify(suggestions, null, 2)}\n`);
+    process.stdout.write(
+      `  [propose] ${suggestions.suggestions.length} eval-gated patch(es) → ${suggestionsPath} (feed to \`optimize --from-advice\`)\n`,
+    );
+  }
+}
+
+/**
+ * AUTOMATION-OPPORTUNITIES.md item 51 — `crewhaus pii tune`.
+ *
+ * Aggregates PII-redaction history across sessions (running the shared
+ * detector over durable session/turn content, HASHING every value on
+ * detection) to find (a) false-positive over-redaction candidates — values
+ * kept in up-rated/accepted outputs — and (b) detector coverage gaps, then
+ * proposes a reviewed `.crewhaus/pii-policy.json` the redactor consults
+ * additively (`createPiiRedactorWithPolicy`).
+ *
+ * NEVER prints or writes a raw PII value: output is hashes + counts + kinds
+ * only. Needs a stable HMAC secret (`--secret` / `CREWHAUS_PII_HASH_SECRET`)
+ * that MATCHES the redactor's secret, or the emitted policy cannot apply at
+ * runtime — so a secret is REQUIRED (a random per-run key would be useless).
+ */
+async function runPiiTune(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus pii tune [--sessions N|all] [--secret <key>] [--write] [--dir <root>] [--json]\n" +
+        "\n" +
+        "aggregates PII-redaction history (HASHED values, never raw) across sessions:\n" +
+        "  false-positive over-redaction candidates (PII kept in accepted outputs)\n" +
+        "  detector coverage gaps\n" +
+        "and proposes a reviewed .crewhaus/pii-policy.json the redactor reads additively.\n" +
+        "\n" +
+        "  --sessions N|all  how many recent sessions to scan (default 50)\n" +
+        "  --secret <key>    HMAC key (or CREWHAUS_PII_HASH_SECRET) — MUST match the\n" +
+        "                    redactor's secret for the policy to apply. Required.\n" +
+        "  --write           write the reviewed allow-list to .crewhaus/pii-policy.json\n" +
+        "  --dir <root>      harness root that owns .crewhaus/ (default: cwd)\n" +
+        "  --json            machine-readable output (hashes + counts only)\n",
+    );
+    return;
+  }
+
+  const secret = strFlag(args, "secret") ?? process.env["CREWHAUS_PII_HASH_SECRET"];
+  if (secret === undefined || secret.length === 0) {
+    die(
+      "pii tune requires a stable HMAC secret (--secret <key> or CREWHAUS_PII_HASH_SECRET) that matches the redactor's secret — a random key would make the emitted policy unusable at runtime",
+    );
+    return;
+  }
+
+  const dirFlag = args.flags["dir"];
+  const rootDir = typeof dirFlag === "string" ? resolve(dirFlag) : process.cwd();
+  const limit = parseSessionsLimit(args, 50);
+
+  // Read sessions from <rootDir>/.crewhaus/sessions, deriving turns so ratings
+  // map to the exact turn they rated (mirrors distill). A rating maps a turn's
+  // OUTPUT to accepted/rejected; unrated turns default to not-accepted (an
+  // unreviewed output is not evidence of a false positive).
+  const sessionsDir = join(rootDir, ".crewhaus", "sessions");
+  // Bare-record feedback (the web-UI host writes `.crewhaus/feedback/*.jsonl`).
+  const feedbackDirRecords: FeedbackRecord[] = [];
+  const feedbackDir = join(rootDir, ".crewhaus", "feedback");
+  if (existsSync(feedbackDir)) {
+    for (const f of readdirSync(feedbackDir).sort()) {
+      if (!f.endsWith(".jsonl")) continue;
+      feedbackDirRecords.push(
+        ...extractFeedbackRecords(parseAdviseJsonl(readFileSync(join(feedbackDir, f), "utf-8"))),
+      );
+    }
+  }
+
+  const units: ScanUnit[] = [];
+  let sessionCount = 0;
+  if (existsSync(sessionsDir)) {
+    const files = readdirSync(sessionsDir)
+      .filter((f) => f.endsWith(".jsonl"))
+      .map((f) => ({
+        file: join(sessionsDir, f),
+        id: f.replace(/\.jsonl$/, ""),
+        mtimeMs: statSync(join(sessionsDir, f)).mtimeMs,
+      }))
+      .sort((a, b) => b.mtimeMs - a.mtimeMs);
+    const chosen = limit === "all" ? files : files.slice(0, limit);
+    for (const { file, id } of chosen) {
+      sessionCount += 1;
+      const objects = parseAdviseJsonl(readFileSync(file, "utf-8"));
+      // Feedback lives in the session event log too (`user_feedback`); merge it
+      // with the bare-record feedback dir, then keep only THIS session's turns.
+      const records = mergeFeedback([
+        ...extractFeedbackRecords(objects),
+        ...feedbackDirRecords.filter((r) => r.sessionId === id),
+      ]);
+      const acceptedTurns = new Set<number>();
+      for (const r of records) {
+        if (r.sessionId !== id) continue;
+        const score = normalizeRating(r);
+        if (score !== undefined && score >= 0.5) acceptedTurns.add(r.turnNumber);
+      }
+      for (const turn of deriveTurns(objects as { kind?: string; payload?: unknown }[])) {
+        if (turn.output === "") continue;
+        units.push({ content: turn.output, accepted: acceptedTurns.has(turn.turnNumber) });
+      }
+    }
+  }
+
+  const ctx = buildPiiTuneContext(units, secret);
+  const candidates = findFalsePositives(ctx);
+  const gaps = findCoverageGaps(ctx);
+  const policy = buildPiiPolicy(candidates);
+
+  if (args.flags["json"] === true) {
+    process.stdout.write(
+      `${JSON.stringify({ context: ctx, candidates, gaps, policy }, null, 2)}\n`,
+    );
+    return;
+  }
+
+  process.stdout.write(`pii tune: ${rootDir} (${sessionCount} session(s) scanned)\n`);
+  for (const line of renderPiiTuneLines(ctx, candidates, gaps)) process.stdout.write(`  ${line}\n`);
+
+  if (args.flags["write"] === true) {
+    const outDir = join(rootDir, ".crewhaus");
+    mkdirSync(outDir, { recursive: true });
+    const policyPath = join(outDir, "pii-policy.json");
+    writeFileSync(policyPath, `${JSON.stringify(policy, null, 2)}\n`);
+    process.stdout.write(
+      `  [write] ${policy.allow.length} hashed allow entry(ies) → ${policyPath} (review, then the redactor honours it additively; keep the SAME --secret)\n`,
+    );
+  } else if (candidates.length > 0) {
+    process.stdout.write(
+      "  (re-run with --write to persist the proposed .crewhaus/pii-policy.json)\n",
+    );
+  }
+}
+
+/**
+ * AUTOMATION-OPPORTUNITIES.md item 52 — `crewhaus justification calibrate` +
+ * `justification preflight <spec>`.
+ *
+ * calibrate — replay the intent gate's history: fold durable
+ *   `permission_justification_evaluated` records against the per-tool outcome
+ *   proxy (session `tool_stats` error rate) to compute allow-agreement + a
+ *   false-block estimate, propose a tuned confidence threshold, and flag
+ *   high-disagreement tools (allowed but mostly errored).
+ *
+ * preflight <spec> — dry-run the rule-based judge over the historical
+ *   justifications using the spec's `agent.instructions` as the session goal,
+ *   reporting the would-be allow/deny split + flips vs the stored verdicts,
+ *   BEFORE deploy. Offline + credential-free (the LLM-judge path needs a live
+ *   model, which preflight deliberately does not spin up).
+ */
+async function runJustification(
+  args: ParsedArgs,
+  action: "calibrate" | "preflight",
+): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus justification calibrate [--sessions N|all] [--dir <root>] [--json]\n" +
+        "       crewhaus justification preflight [<spec.yaml>] [--goal <text>] [--dir <root>] [--json]\n" +
+        "\n" +
+        "  calibrate   replay .crewhaus/audit permission_justification_evaluated records\n" +
+        "              against the per-tool outcome proxy (tool_stats error rate): allow/\n" +
+        "              deny agreement, false-block estimate, a proposed confidence\n" +
+        "              threshold, and high-disagreement tools\n" +
+        "  preflight   dry-run the rule-based judge over historical justifications using\n" +
+        "              the spec's agent.instructions as the session goal, before deploy\n" +
+        "\n" +
+        "  --sessions N|all  sessions folded for the outcome proxy (default 50)\n" +
+        "  --goal <text>     preflight session goal override (else the spec's instructions)\n" +
+        "  --dir <root>      harness root that owns .crewhaus/ (default: cwd)\n" +
+        "  --json            machine-readable output\n",
+    );
+    return;
+  }
+
+  const dirFlag = args.flags["dir"];
+  const rootDir = typeof dirFlag === "string" ? resolve(dirFlag) : process.cwd();
+
+  // Read the durable justification records from .crewhaus/audit.
+  const auditDir = join(rootDir, ".crewhaus", "audit");
+  const auditObjects: unknown[] = [];
+  if (existsSync(auditDir)) {
+    for (const f of readdirSync(auditDir).sort()) {
+      if (!f.endsWith(".jsonl")) continue;
+      auditObjects.push(...parseAdviseJsonl(readFileSync(join(auditDir, f), "utf-8")));
+    }
+  }
+  const records = extractJustificationRecords(auditObjects);
+
+  if (action === "preflight") {
+    // Session goal: --goal > the positional spec's agent.instructions > "".
+    let goal = strFlag(args, "goal");
+    const specArg = args.positional[0];
+    if (goal === undefined && specArg !== undefined) {
+      const specPath = resolve(rootDir, specArg);
+      if (!existsSync(specPath)) die(`spec not found at ${specPath}`);
+      try {
+        const spec = parseSpec(readFileSync(specPath, "utf-8"));
+        const agent = (spec as unknown as Record<string, unknown>)["agent"];
+        const instr = (agent as Record<string, unknown> | undefined)?.["instructions"];
+        if (typeof instr === "string") goal = instr;
+      } catch (err) {
+        die(`could not parse ${specPath}: ${(err as Error).message}`);
+      }
+    }
+    const result = await preflightJustification(records, goal ?? "");
+    if (args.flags["json"] === true) {
+      process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+      return;
+    }
+    process.stdout.write(`justification preflight: ${rootDir}\n`);
+    if (records.length === 0) {
+      process.stdout.write(
+        "  no permission_justification_evaluated records in .crewhaus/audit — run the agent (justification audit is on by default), then preflight\n",
+      );
+    }
+    for (const line of renderPreflightLines(result)) process.stdout.write(`  ${line}\n`);
+    return;
+  }
+
+  // calibrate — fold the per-tool outcome proxy from recent sessions under
+  // <rootDir> (read directly so --dir works; readRecentSessionEvents is
+  // cwd-bound).
+  const limit = parseSessionsLimit(args, 50);
+  const sessionsDir = join(rootDir, ".crewhaus", "sessions");
+  const sessions: SessionEvents[] = [];
+  if (existsSync(sessionsDir)) {
+    const ranked = readdirSync(sessionsDir)
+      .filter((f) => f.endsWith(".jsonl"))
+      .map((f) => ({
+        file: join(sessionsDir, f),
+        id: f.replace(/\.jsonl$/, ""),
+        mtimeMs: statSync(join(sessionsDir, f)).mtimeMs,
+      }))
+      .sort((a, b) => b.mtimeMs - a.mtimeMs);
+    const chosen = limit === "all" ? ranked : ranked.slice(0, limit);
+    for (const { file, id } of chosen) {
+      sessions.push({ sessionId: id, objects: parseAdviseJsonl(readFileSync(file, "utf-8")) });
+    }
+  }
+  const outcomes = buildToolOutcomes(sessions);
+  const result = calibrateJustification(records, outcomes);
+
+  if (args.flags["json"] === true) {
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    return;
+  }
+  process.stdout.write(`justification calibrate: ${rootDir}\n`);
+  if (records.length === 0) {
+    process.stdout.write(
+      "  no permission_justification_evaluated records in .crewhaus/audit — run the agent (justification audit is on by default), then calibrate\n",
+    );
+  }
+  for (const line of renderCalibrationLines(result)) process.stdout.write(`  ${line}\n`);
+}
+
+/**
  * Item 61 — `crewhaus channel provision|verify <spec.yaml>`: one-command
  * platform-side setup + scope doctor for channel-target specs. Everything is
  * derived from the spec + the adapters' actual API usage (see
@@ -13259,10 +13836,60 @@ switch (subcommand) {
   }
   case "security": {
     const action = rest[0] ?? "";
-    if (action !== "digest") {
-      die(`security action must be "digest" (got "${action}")`);
+    if (action === "digest") {
+      await runSecurityDigest(parseFor(rest.slice(1), SECURITY_SCHEMA));
+    } else if (action === "corpus") {
+      // `security corpus` builds; `security corpus check` runs the regression.
+      const sub = rest[1] === "check" ? "check" : "build";
+      const argsSlice = sub === "check" ? rest.slice(2) : rest.slice(1);
+      try {
+        await runSecurityCorpus(parseFor(argsSlice, SECURITY_CORPUS_SCHEMA), sub);
+      } catch (err) {
+        if (err instanceof CrewhausError) die(err.message);
+        throw err;
+      }
+    } else {
+      die(`security action must be "digest" or "corpus" (got "${action}")`);
     }
-    await runSecurityDigest(parseFor(rest.slice(1), SECURITY_SCHEMA));
+    break;
+  }
+  case "egress": {
+    const action = rest[0] ?? "";
+    if (action !== "review") {
+      die(`egress action must be "review" (got "${action}")`);
+    }
+    try {
+      await runEgressReview(parseFor(rest.slice(1), EGRESS_SCHEMA));
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
+    break;
+  }
+  case "pii": {
+    const action = rest[0] ?? "";
+    if (action !== "tune") {
+      die(`pii action must be "tune" (got "${action}")`);
+    }
+    try {
+      await runPiiTune(parseFor(rest.slice(1), PII_SCHEMA));
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
+    break;
+  }
+  case "justification": {
+    const action = rest[0] ?? "";
+    if (action !== "calibrate" && action !== "preflight") {
+      die(`justification action must be "calibrate" or "preflight" (got "${action}")`);
+    }
+    try {
+      await runJustification(parseFor(rest.slice(1), JUSTIFICATION_SCHEMA), action);
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
     break;
   }
   case "channel": {
