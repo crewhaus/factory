@@ -1908,6 +1908,95 @@ describe("crewhaus spec auto-register + changelog (item 46)", () => {
   });
 });
 
+// Item 59 (F2) — the approval gate must guard EVERY protected-env pin flip:
+// `spec pin` and `deploy rollback`, not just `deploy promote`. A protected env
+// with no approvals refuses AND audit-logs the refusal; a non-protected env
+// stays ungated.
+describe("crewhaus approval gate — all pin doors (item 59, F2)", () => {
+  /** Register demo@v1 + v2 and mark `prod` protected in environments.json. */
+  async function seedProtectedHarness(): Promise<void> {
+    const f1 = join(tmp, "a.yaml");
+    const f2 = join(tmp, "b.yaml");
+    writeFileSync(f1, "target: cli\nname: demo\nagent:\n  model: m\n  instructions: One.\n");
+    writeFileSync(f2, "target: cli\nname: demo\nagent:\n  model: m\n  instructions: Two.\n");
+    expect((await runCli(["spec", "put", "demo", "v1", f1], { cwd: tmp })).exitCode).toBe(0);
+    expect((await runCli(["spec", "put", "demo", "v2", f2], { cwd: tmp })).exitCode).toBe(0);
+    mkdirSync(join(tmp, ".crewhaus"), { recursive: true });
+    writeFileSync(
+      join(tmp, ".crewhaus", "environments.json"),
+      JSON.stringify({ environments: { prod: { requireApproval: true, minApprovals: 1 } } }),
+    );
+  }
+
+  /** Read every governance_approval record from the harness audit store. */
+  async function readGovernanceApprovals(): Promise<Array<Record<string, unknown>>> {
+    const dir = join(tmp, ".crewhaus", "audit");
+    if (!existsSync(dir)) return [];
+    const log = await openAuditLog({ rootDir: dir });
+    const out: Array<Record<string, unknown>> = [];
+    for await (const rec of log.read()) {
+      if ((rec as { kind?: string }).kind === "governance_approval") {
+        out.push(rec as Record<string, unknown>);
+      }
+    }
+    return out;
+  }
+
+  test("spec pin to a PROTECTED env refuses without approval and audit-logs the refusal", async () => {
+    await seedProtectedHarness();
+    const pinned = await runCli(["spec", "pin", "demo", "prod", "v2"], { cwd: tmp });
+    expect(pinned.exitCode).not.toBe(0);
+    expect(`${pinned.stdout}${pinned.stderr}`).toContain("blocked");
+    // The refusal is audit-logged (governance_approval, satisfied:false).
+    const records = await readGovernanceApprovals();
+    expect(records.length).toBeGreaterThanOrEqual(1);
+    const payload = records.at(-1)?.["payload"] as Record<string, unknown>;
+    expect(payload?.["satisfied"]).toBe(false);
+    expect(payload?.["toEnv"]).toBe("prod");
+    // The pin did NOT flip.
+    const alias = await runCli(["spec", "alias", "demo", "prod"], { cwd: tmp });
+    expect(alias.exitCode).not.toBe(0);
+  });
+
+  test("deploy rollback to a PROTECTED env refuses without approval and audit-logs it", async () => {
+    await seedProtectedHarness();
+    const rolled = await runCli(["deploy", "rollback", "demo", "prod", "v1"], { cwd: tmp });
+    expect(rolled.exitCode).not.toBe(0);
+    expect(`${rolled.stdout}${rolled.stderr}`).toContain("blocked");
+    const records = await readGovernanceApprovals();
+    expect(records.length).toBeGreaterThanOrEqual(1);
+    const payload = records.at(-1)?.["payload"] as Record<string, unknown>;
+    expect(payload?.["satisfied"]).toBe(false);
+    // rollback refusal recorded the exact target version.
+    expect(payload?.["toVersion"]).toBe("v1");
+  });
+
+  test("spec pin to a NON-protected env stays ungated (pre-item-59 path)", async () => {
+    await seedProtectedHarness();
+    // `staging` is not declared protected → no gate, pin flips normally.
+    const pinned = await runCli(["spec", "pin", "demo", "staging", "v2"], { cwd: tmp });
+    expect(pinned.exitCode).toBe(0);
+    expect(pinned.stdout).toContain("pinned demo staging → v2");
+    // No governance record for an ungated flip.
+    expect(await readGovernanceApprovals()).toHaveLength(0);
+  });
+
+  test("spec pin to a protected env SUCCEEDS once an approval for the version is recorded", async () => {
+    await seedProtectedHarness();
+    const approvalsDir = join(tmp, ".crewhaus", "approvals");
+    mkdirSync(approvalsDir, { recursive: true });
+    writeFileSync(
+      join(approvalsDir, "demo__prod.json"),
+      JSON.stringify([{ approver: "alice", ts: "2026-07-02T00:00:00Z", version: "v2" }]),
+    );
+    const pinned = await runCli(["spec", "pin", "demo", "prod", "v2"], { cwd: tmp });
+    expect(pinned.exitCode).toBe(0);
+    expect(pinned.stdout).toContain("pinned demo prod → v2");
+    const alias = await runCli(["spec", "alias", "demo", "prod"], { cwd: tmp });
+    expect(alias.stdout.trim()).toBe("v2");
+  });
+});
+
 // Item 61 — `crewhaus channel provision|verify` wiring. Everything here is
 // network-free: dry-run prints redacted calls, the slack path only writes a
 // manifest file, and the no-env verify fails on env-ref resolution BEFORE

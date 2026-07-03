@@ -127,7 +127,9 @@ import {
   decideApproval,
   loadEnvironmentsConfig,
   policyForEnv,
+  prReferencesVersion,
   readApprovals,
+  rollupConclusion,
 } from "./approval-gate";
 // Item 34 — `crewhaus audit verify` plumbing (anchor-flag parsing + per-check
 // summary + doctor mapping), in a side-effect-free module so it is
@@ -430,6 +432,7 @@ import {
   SHARED_DIR_DEFAULT,
   applyPull,
   applyPush,
+  buildKnowledgeRedactor,
   formatPullReport,
   formatPushReport,
   fragmentContentHash,
@@ -9268,7 +9271,9 @@ async function runKnowledge(args: ParsedArgs, action: string): Promise<void> {
   const doPush = args.flags["push"] === true || args.flags["pull"] !== true;
   const doPull = args.flags["pull"] === true || args.flags["push"] !== true;
   const redact =
-    args.flags["no-redact"] === true ? identityRedactor() : await buildKnowledgeRedactor();
+    args.flags["no-redact"] === true
+      ? identityRedactor()
+      : await buildProductionKnowledgeRedactor();
   const now = (): Date => new Date();
 
   const { discoverHarnesses } = await import("./fleet");
@@ -9359,50 +9364,18 @@ function identityRedactor(): Redactor {
 }
 
 /**
- * Build the production knowledge redactor: `@crewhaus/pii-redactor` with the
- * default PII detectors PLUS credential-shaped token detectors. After
- * redacting PII, the text is re-scanned for any credential-shaped token; if
- * one survives, `secretRemains` is set so the caller DROPS the artifact rather
- * than share a leaked credential. The token patterns are assembled at runtime
- * from character-class parts so this source carries no credential-shaped
- * literal (repo push-protection).
+ * Build the production knowledge redactor. Wires `@crewhaus/pii-redactor`'s
+ * default PII detectors as the PII pass, then delegates to the importable,
+ * unit-tested `buildKnowledgeRedactor` in `./knowledge-sync`, which masks every
+ * credential-shaped token (AWS id + secret key, Stripe, `sk-`, GitHub, Slack,
+ * JWT, PEM blocks, Bearer) and applies a STRICT "looks like a secret" fallback
+ * so anything suspicious surviving redaction is DROPPED, not shared.
  */
-async function buildKnowledgeRedactor(): Promise<Redactor> {
+async function buildProductionKnowledgeRedactor(): Promise<Redactor> {
   const { createPiiRedactor } = await import("@crewhaus/pii-redactor");
   const { DEFAULT_PII_DETECTORS } = await import("@crewhaus/grader-safety-classifiers");
-
-  // Credential-shaped token detectors, built from parts so no literal
-  // credential appears in source. These cover the common shapes: a long
-  // base62 blob, an "sk-"/"pk-"-style prefixed key, a JWT triplet, and a
-  // PEM private-key header.
-  const b62 = "[A-Za-z0-9]";
-  const tokenDetectors = [
-    // long opaque token (>= 32 base62 chars) — API keys / session tokens
-    { kind: "opaque_token", regex: new RegExp(`\\b${b62}{32,}\\b`) },
-    // provider-prefixed secret keys like sk-… / pk-… / ghp_… (prefix + long tail)
-    {
-      kind: "prefixed_key",
-      regex: new RegExp(
-        `\\b(?:${["sk", "pk", "ghp", "xoxb", "AKIA"].join("|")})[-_]?${b62}{16,}\\b`,
-      ),
-    },
-    // a JWT: three base64url segments separated by dots
-    { kind: "jwt", regex: /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/ },
-    // a PEM private-key header (assembled from parts)
-    {
-      kind: "pem_key",
-      regex: new RegExp(`-----BEGIN [A-Z ]*${["PRIVATE", "KEY"].join(" ")}-----`),
-    },
-  ];
-  const detectors = [...DEFAULT_PII_DETECTORS, ...tokenDetectors];
-  const redactor = createPiiRedactor({ regexDetectors: detectors });
-
-  return async (text: string) => {
-    const result = await redactor.redact(text);
-    // Re-scan the REDACTED text for a surviving credential-shaped token.
-    const survived = tokenDetectors.some((d) => d.regex.test(result.text));
-    return { text: result.text, secretRemains: survived };
-  };
+  const redactor = createPiiRedactor({ regexDetectors: [...DEFAULT_PII_DETECTORS] });
+  return buildKnowledgeRedactor(async (text) => (await redactor.redact(text)).text);
 }
 
 /**
@@ -9417,14 +9390,17 @@ async function runRetire(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
       "usage: crewhaus retire <spec> [--archive <dir>] [--dry-run] [--force]\n" +
-        "         [--push-knowledge] [--shared <dir>] [--root-dir <dir>]\n" +
+        "         [--force-unverified] [--push-knowledge] [--shared <dir>] [--root-dir <dir>]\n" +
         "\n" +
         "  Decommission a harness with evidence. Refuses to retire a spec with an\n" +
         "  active deployment pin unless --force. Steps (each logged into the archive):\n" +
         "  export durable state → final compliance-evidence bundle → audit verify →\n" +
         "  [--push-knowledge] → tombstone the registry entry (delete versions, clearing\n" +
-        "  every env pin) → archive + remove the live .crewhaus state. --dry-run prints\n" +
-        "  the plan and touches nothing. --archive defaults to ./retired-<spec>-<date>.\n",
+        "  every env pin) → archive + remove the live .crewhaus state. A failing\n" +
+        "  compliance bundle or a tamper-reporting audit verify ABORTS before the\n" +
+        "  destructive move (state left intact) unless --force-unverified. --dry-run\n" +
+        "  prints the plan and touches nothing. --archive defaults to\n" +
+        "  ./retired-<spec>-<date>.\n",
     );
     return;
   }
@@ -9587,7 +9563,7 @@ async function runRetire(args: ParsedArgs): Promise<void> {
             ? sharedFlag
             : (process.env["CREWHAUS_SHARED_DIR"] ?? join(harnessDir, "..", SHARED_DIR_DEFAULT)),
         );
-        const redact = await buildKnowledgeRedactor();
+        const redact = await buildProductionKnowledgeRedactor();
         const graders = readHarnessGraders(harnessDir);
         const plan2 = await planPush({
           harness: registryName,
@@ -9643,7 +9619,12 @@ async function runRetire(args: ParsedArgs): Promise<void> {
 
   let result: Awaited<ReturnType<typeof runRetirement>>;
   try {
-    result = await runRetirement({ plan, steps, dryRun: false });
+    result = await runRetirement({
+      plan,
+      steps,
+      dryRun: false,
+      forceUnverified: args.flags["force-unverified"] === true,
+    });
   } catch (err) {
     if (err instanceof RetireError) die(err.message);
     throw err;
@@ -10007,6 +9988,7 @@ async function runSpec(args: ParsedArgs, action: string): Promise<void> {
         "  crewhaus spec list <name>                                   list versions\n" +
         "  crewhaus spec get <name> <version>                          print yaml\n" +
         "  crewhaus spec pin <name> <env> <version> [--tenant <id>]   pin env → version\n" +
+        "       [--require-approval] [--check-pr] [--actor <id>]      gate a protected env (item 59)\n" +
         "  crewhaus spec alias <name> <env> [--tenant <id>]            resolve env → version\n" +
         "  crewhaus spec log <name> [--root-dir <dir>]                 print the changelog (newest first;\n" +
         '                                                              display names sanitize as on compile: "My Agent" → My-Agent)\n',
@@ -10107,6 +10089,32 @@ async function runSpec(args: ParsedArgs, action: string): Promise<void> {
     if (typeof name !== "string") die("missing <name>");
     if (typeof env !== "string") die("missing <env>");
     if (typeof version !== "string") die("missing <version>");
+
+    // Item 59 (F2) — `spec pin` flips a live env pin exactly like `deploy
+    // promote`/`rollback`, so a pin into a PROTECTED env must clear the same
+    // approval gate. Non-protected envs stay ungated (the pre-item-59 path).
+    const harnessRoot = process.cwd();
+    const actorFlag = args.flags["actor"];
+    const actor = typeof actorFlag === "string" ? actorFlag : undefined;
+    const { openAuditLog } = await import("@crewhaus/audit-log");
+    const audit = await openAuditLog({ rootDir: join(harnessRoot, ".crewhaus", "audit") });
+    try {
+      await enforceProtectedEnvGate({
+        args,
+        harnessRoot,
+        name,
+        toEnv: env,
+        toVersion: version,
+        verb: "pin",
+        ...(tenantId !== undefined ? { tenantId } : {}),
+        ...(actor !== undefined ? { actor } : {}),
+        auditLog: audit,
+      });
+    } catch (err) {
+      if (err instanceof ApprovalGateError) die(err.message);
+      throw err;
+    }
+
     if (tenantId !== undefined) {
       await reg.pinForTenant(tenantId, name, env, version);
       process.stdout.write(`pinned tenant=${tenantId} ${name} ${env} → ${version}\n`);
@@ -10143,6 +10151,7 @@ async function runDeploy(args: ParsedArgs, action: string): Promise<void> {
         "  crewhaus deploy promote <name> <fromEnv> <toEnv>  copy env pin\n" +
         "       [--require-approval] [--check-pr]            gate a protected env (item 59)\n" +
         "  crewhaus deploy rollback <name> <env> <version>   re-pin env to version\n" +
+        "       [--require-approval] [--check-pr]            gate a protected env (item 59)\n" +
         "\n" +
         "  --require-approval  refuse to flip a PROTECTED env's pin (declared in\n" +
         "                      .crewhaus/environments.json) until an approval quorum\n" +
@@ -10218,6 +10227,27 @@ async function runDeploy(args: ParsedArgs, action: string): Promise<void> {
     if (typeof name !== "string") die("missing <name>");
     if (typeof env !== "string") die("missing <env>");
     if (typeof version !== "string") die("missing <version>");
+
+    // Item 59 (F2) — a rollback to a PROTECTED env flips a live pin just like a
+    // promote, so it must clear the same approval gate. The explicit target
+    // version is what the pin will point at.
+    try {
+      await enforceProtectedEnvGate({
+        args,
+        harnessRoot,
+        name,
+        toEnv: env,
+        toVersion: version,
+        verb: "rollback",
+        ...(tenantId !== undefined ? { tenantId } : {}),
+        ...(actor !== undefined ? { actor } : {}),
+        auditLog: audit,
+      });
+    } catch (err) {
+      if (err instanceof ApprovalGateError) die(err.message);
+      throw err;
+    }
+
     const rec = await ctrl.rollback(name, env, version);
     process.stdout.write(
       `rolled back ${name} ${env} → ${version} (was ${rec.fromVersion ?? "unset"})\n`,
@@ -10228,13 +10258,76 @@ async function runDeploy(args: ParsedArgs, action: string): Promise<void> {
 }
 
 /**
- * Item 59 — the approval gate for `deploy promote`. Runs BEFORE the
- * deployment-controller flips the pin. Determines whether `toEnv` is
+ * Item 59 (F2) — the single approval choke point for ANY pin flip into a
+ * protected environment. `deploy promote`, `deploy rollback`, and `spec pin`
+ * all route through this before the pin moves. Determines whether `toEnv` is
  * protected (config OR `--require-approval`), and if so requires the recorded
- * approvals + optional green-PR quorum for the candidate version (the fromEnv
- * pin promote would copy). The decision — satisfied OR refused — is
- * audit-logged as `governance_approval`; a refusal throws ApprovalGateError.
- * An unprotected env is a no-op.
+ * approvals + optional green-PR quorum for the exact `toVersion` being pinned.
+ * The decision — satisfied OR refused — is audit-logged as `governance_approval`
+ * (so even a blocked scheduled flip is evidenced); a refusal throws
+ * ApprovalGateError. An unprotected env is a no-op.
+ *
+ * `verb` only shapes the human-facing messages ("promotion"/"rollback"/"pin").
+ */
+async function enforceProtectedEnvGate(opts: {
+  args: ParsedArgs;
+  harnessRoot: string;
+  name: string;
+  toEnv: string;
+  toVersion: string;
+  verb: "promotion" | "rollback" | "pin";
+  tenantId?: string;
+  actor?: string;
+  auditLog: AuditLog;
+}): Promise<void> {
+  const requireFlag = opts.args.flags["require-approval"] === true;
+  const config = loadEnvironmentsConfig(opts.harnessRoot);
+  const policy = policyForEnv(config, opts.toEnv);
+  const protectedEnv = policy.requireApproval || requireFlag;
+  if (!protectedEnv) return; // unprotected — the pre-item-59 path
+
+  const approvals = readApprovals(opts.harnessRoot, opts.name, opts.toEnv);
+
+  let prCheck: Awaited<ReturnType<PrCheckReader>> | undefined;
+  if (opts.args.flags["check-pr"] === true) {
+    prCheck = readPrCheckViaGh({ specName: opts.name, env: opts.toEnv, version: opts.toVersion });
+  }
+
+  const decisionInput: ApprovalDecisionInput = {
+    specName: opts.name,
+    toEnv: opts.toEnv,
+    toVersion: opts.toVersion,
+    policy,
+    approvals,
+    ...(prCheck !== undefined ? { prCheck } : {}),
+  };
+  const decision = decideApproval(decisionInput);
+
+  // Record the gate evaluation (met OR refused) in the same audit chain the
+  // flip lands in, so a blocked scheduled change is evidenced too.
+  await opts.auditLog.append({
+    kind: "governance_approval",
+    payload: buildGovernancePayload(decisionInput, decision, {
+      ...(opts.actor !== undefined ? { actor: opts.actor } : {}),
+      now: () => Date.now(),
+    }),
+  });
+
+  process.stdout.write(
+    `[approval] ${opts.name} → ${opts.toEnv}@${opts.toVersion}: ${decision.reason}\n`,
+  );
+  if (!decision.satisfied) {
+    throw new ApprovalGateError(
+      `${opts.verb} of ${opts.name} to protected env "${opts.toEnv}" is blocked — ${decision.reason}`,
+    );
+  }
+}
+
+/**
+ * Item 59 — the approval gate for `deploy promote`. Resolves the candidate
+ * version promote would copy (the fromEnv pin) and routes it through the shared
+ * {@link enforceProtectedEnvGate}. An unprotected env / missing fromEnv pin is
+ * a no-op (the controller produces its own "nothing to copy" error).
  */
 async function enforceApprovalGate(opts: {
   args: ParsedArgs;
@@ -10247,57 +10340,33 @@ async function enforceApprovalGate(opts: {
   actor?: string;
   auditLog: AuditLog;
 }): Promise<void> {
-  const requireFlag = opts.args.flags["require-approval"] === true;
-  const config = loadEnvironmentsConfig(opts.harnessRoot);
-  const policy = policyForEnv(config, opts.toEnv);
-  const protectedEnv = policy.requireApproval || requireFlag;
-  if (!protectedEnv) return; // unprotected — the pre-item-59 path
-
   // The candidate version is exactly what promote would copy: the fromEnv pin.
   const toVersion =
     opts.tenantId !== undefined
       ? await opts.registry.aliasForTenant(opts.tenantId, opts.name, opts.fromEnv)
       : await opts.registry.aliasFor(opts.name, opts.fromEnv);
   if (!toVersion) {
-    // Let the controller produce its own "no pin to copy from" error.
+    // Let the controller produce its own "no pin to copy from" error — but only
+    // when the env is unprotected. A protected env with no source pin must not
+    // silently sail through the gate: fall through so the gate still evaluates
+    // (it will refuse for lack of witnesses) unless the env is unprotected.
+    const config = loadEnvironmentsConfig(opts.harnessRoot);
+    const policy = policyForEnv(config, opts.toEnv);
+    if (!(policy.requireApproval || opts.args.flags["require-approval"] === true)) return;
+    // Protected but nothing to copy: defer to the controller's clearer error.
     return;
   }
-
-  const approvals = readApprovals(opts.harnessRoot, opts.name, opts.toEnv);
-
-  let prCheck: Awaited<ReturnType<PrCheckReader>> | undefined;
-  if (opts.args.flags["check-pr"] === true) {
-    prCheck = readPrCheckViaGh({ specName: opts.name, env: opts.toEnv, version: toVersion });
-  }
-
-  const decisionInput: ApprovalDecisionInput = {
-    specName: opts.name,
+  await enforceProtectedEnvGate({
+    args: opts.args,
+    harnessRoot: opts.harnessRoot,
+    name: opts.name,
     toEnv: opts.toEnv,
     toVersion,
-    policy,
-    approvals,
-    ...(prCheck !== undefined ? { prCheck } : {}),
-  };
-  const decision = decideApproval(decisionInput);
-
-  // Record the gate evaluation (met OR refused) in the same audit chain the
-  // promotion lands in, so a blocked scheduled promotion is evidenced too.
-  await opts.auditLog.append({
-    kind: "governance_approval",
-    payload: buildGovernancePayload(decisionInput, decision, {
-      ...(opts.actor !== undefined ? { actor: opts.actor } : {}),
-      now: () => Date.now(),
-    }),
+    verb: "promotion",
+    ...(opts.tenantId !== undefined ? { tenantId: opts.tenantId } : {}),
+    ...(opts.actor !== undefined ? { actor: opts.actor } : {}),
+    auditLog: opts.auditLog,
   });
-
-  process.stdout.write(
-    `[approval] ${opts.name} → ${opts.toEnv}@${toVersion}: ${decision.reason}\n`,
-  );
-  if (!decision.satisfied) {
-    throw new ApprovalGateError(
-      `promotion of ${opts.name} to protected env "${opts.toEnv}" is blocked — ${decision.reason}`,
-    );
-  }
 }
 
 /** Read a proposal PR's rollup check state via `gh` (the "clients never speak
@@ -10321,9 +10390,9 @@ function readPrCheckViaGh(query: {
         "--search",
         `head:propose/${query.specName}`,
         "--json",
-        "number,url,statusCheckRollup",
+        "number,url,headRefName,title,body,statusCheckRollup",
         "--limit",
-        "1",
+        "20",
       ],
       { encoding: "utf-8" },
     );
@@ -10331,25 +10400,23 @@ function readPrCheckViaGh(query: {
     const parsed = JSON.parse(list.stdout) as Array<{
       number: number;
       url: string;
+      headRefName?: string;
+      title?: string;
+      body?: string;
       statusCheckRollup?: Array<{ conclusion?: string; state?: string }>;
     }>;
-    const pr = parsed[0];
+    // F3(b): bind the witness to the EXACT version. `propose` names the branch
+    // `propose/<slug>-<version>-<hash>-<stamp>`, so the version is a bounded
+    // segment of the head ref; also accept a version reference in the title/
+    // body. A green PR for a DIFFERENT version must NOT witness this promotion.
+    const pr = parsed.find((p) => prReferencesVersion(p, query.version));
     if (pr === undefined) return { conclusion: "none" };
-    const rollup = pr.statusCheckRollup ?? [];
-    const anyFail = rollup.some(
-      (c) => c.conclusion === "FAILURE" || c.conclusion === "CANCELLED" || c.state === "FAILURE",
-    );
-    const anyPending = rollup.some(
-      (c) => c.state === "PENDING" || c.state === "IN_PROGRESS" || c.conclusion === "PENDING",
-    );
-    const conclusion = anyFail
-      ? ("failure" as const)
-      : anyPending
-        ? ("pending" as const)
-        : rollup.length > 0
-          ? ("success" as const)
-          : ("none" as const);
-    return { conclusion, prNumber: pr.number, url: pr.url };
+    // F3(a): fail-closed rollup — only an all-SUCCESS (>=1 check) rollup wins.
+    return {
+      conclusion: rollupConclusion(pr.statusCheckRollup ?? []),
+      prNumber: pr.number,
+      url: pr.url,
+    };
   } catch {
     return { conclusion: "none" };
   }

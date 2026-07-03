@@ -124,6 +124,134 @@ export type Redactor = (text: string) => Promise<RedactionOutcome>;
 export const IDENTITY_REDACTOR: Redactor = async (text) => ({ text, secretRemains: false });
 
 // ---------------------------------------------------------------------------
+// credential-shaped token detection (F1 — leak-proof knowledge push)
+// ---------------------------------------------------------------------------
+
+/**
+ * Credential-shaped token detectors, used both to REDACT a token out of pushed
+ * text and to CHECK (post-redaction) that nothing credential-shaped survived —
+ * a memory whose text still holds a secret after redaction is DROPPED, never
+ * shared (a leaked credential poisons every harness that pulls it).
+ *
+ * The prior custom set MISSED whole credential families — AWS secret access
+ * keys (their `/`+`+` alphabet), Stripe `sk_live_…`/`sk_test_…` (the `_` after
+ * the prefix), PEM private-key BODIES (only the header was caught), Slack
+ * `xoxb-` tails — so those leaked verbatim into the shared store. This set is
+ * the union of the battle-tested shapes shipped elsewhere in the repo
+ * (`packages/ir|spec-patch/src/redact.ts` `TOKEN_SHAPE_RES`,
+ * `apps/cli/src/dataset-mine.ts` `SECRET_KEY_DETECTOR`) PLUS the families they
+ * predate.
+ *
+ * Every pattern is assembled from character-class parts / joined literals so
+ * NO credential-shaped literal appears in this source (repo push-protection).
+ */
+const b62 = "[A-Za-z0-9]";
+const b64 = "[A-Za-z0-9+/]"; // base64 alphabet incl. `+` and `/` (AWS secret keys)
+
+/** The credential token shapes, each a global RegExp so `replace` masks every
+ *  occurrence. Order matters only for the PEM block (masked whole, first). */
+export const KNOWLEDGE_SECRET_DETECTORS: ReadonlyArray<{ kind: string; regex: RegExp }> = [
+  // PEM blocks — mask the WHOLE block (header + body + footer), not just the
+  // header. `[\s\S]` so it spans newlines; non-greedy so adjacent blocks split.
+  {
+    kind: "pem_block",
+    regex: /-----BEGIN [^-]+-----[\s\S]*?-----END [^-]+-----/g,
+  },
+  // JWT: three base64url segments separated by dots.
+  {
+    kind: "jwt",
+    regex: /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g,
+  },
+  // Stripe-style keys: (sk|pk|rk)_(live|test)_<tail> — the `_` after the prefix
+  // is what broke the old `sk-`-only match.
+  {
+    kind: "stripe_key",
+    regex: new RegExp(`\\b(?:sk|pk|rk)_(?:live|test)_${b62}{16,}\\b`, "g"),
+  },
+  // Generic provider secret keys: `sk-…` (OpenAI/Anthropic), allowing `_`/`-`.
+  { kind: "sk_key", regex: /\bsk-[A-Za-z0-9_-]{16,}/g },
+  // GitHub tokens: ghp_/gho_/ghu_/ghs_/ghr_ + long tail.
+  { kind: "github_token", regex: /\bgh[oprsu]_[A-Za-z0-9]{16,}/g },
+  // Slack tokens: xox[baprs]-… (the whole dashed tail, not just the prefix).
+  { kind: "slack_token", regex: /\bxox[baprs]-[A-Za-z0-9-]{10,}/g },
+  // AWS access key id: AKIA + 12+ uppercase/digit chars.
+  { kind: "aws_access_key_id", regex: /\bAKIA[A-Z0-9]{12,}/g },
+  // AWS secret access key: a 40-char base64 blob (incl. `/` and `+`), matched
+  // standalone (context-free) — the `/`+`+` alphabet is exactly what the old
+  // base62 detector missed. Longer/shorter high-entropy blobs are caught by the
+  // looksLikeSecret fallback (which DROPS rather than masks).
+  { kind: "aws_secret_key", regex: new RegExp(`\\b${b64}{40}\\b`, "g") },
+  // `Bearer <token>` — scheme word kept, token masked (mirrors repo BEARER_RE).
+  { kind: "bearer", regex: /\b(bearer)\s+[A-Za-z0-9._~+/-]{16,}=*/gi },
+];
+
+/**
+ * A conservative "this looks like a secret" heuristic used as the STRICT
+ * fallback: after redaction, if ANY of these fire on the surviving text the
+ * artifact is DROPPED rather than shared. It combines the named detectors above
+ * with a high-entropy long-token probe (32+ chars mixing letter+digit, or a
+ * 40+-char base64 blob) so a novel credential shape the named set doesn't
+ * recognize is still refused rather than leaked.
+ */
+const HIGH_ENTROPY_MIXED_RE =
+  /\b(?=[A-Za-z0-9+/_-]*[A-Za-z])(?=[A-Za-z0-9+/_-]*[0-9])[A-Za-z0-9+/_-]{32,}\b/;
+const LONG_BASE64_RE = new RegExp(`\\b${b64}{40,}\\b`);
+
+/** True when `text` still contains something credential-shaped — used as the
+ *  `secretRemains` verdict AFTER redaction so anything suspicious is dropped. */
+export function looksLikeSecret(text: string): boolean {
+  for (const d of KNOWLEDGE_SECRET_DETECTORS) {
+    // Fresh lastIndex isn't a concern: `.test` on a `g` regex advances
+    // lastIndex, so reset before each probe to keep this deterministic.
+    d.regex.lastIndex = 0;
+    if (d.regex.test(text)) return true;
+  }
+  return HIGH_ENTROPY_MIXED_RE.test(text) || LONG_BASE64_RE.test(text);
+}
+
+/**
+ * Mask every credential-shaped token in `text` with `***`. PEM blocks are
+ * masked whole. Pure + synchronous — the PII pass is layered on top by
+ * {@link buildKnowledgeRedactor}.
+ */
+export function maskKnowledgeSecrets(text: string): string {
+  let out = text;
+  for (const d of KNOWLEDGE_SECRET_DETECTORS) {
+    d.regex.lastIndex = 0;
+    if (d.kind === "bearer") {
+      // Group 1 is the scheme word "bearer" — keep it, mask only the token.
+      out = out.replace(d.regex, (_m, scheme: string) => `${scheme} ***`);
+    } else {
+      out = out.replace(d.regex, "***");
+    }
+  }
+  return out;
+}
+
+/** Primitive PII pass injected into {@link buildKnowledgeRedactor}: redact PII
+ *  and return the cleaned text. Production wraps `@crewhaus/pii-redactor`;
+ *  tests can inject an identity pass to exercise only the credential layer. */
+export type PiiPass = (text: string) => Promise<string>;
+
+/**
+ * Build the production knowledge redactor: run a PII pass, then mask every
+ * credential-shaped token, then re-scan the result with the STRICT
+ * {@link looksLikeSecret} heuristic — anything that still looks like a secret
+ * sets `secretRemains` so the caller DROPS the artifact rather than share a
+ * leaked credential.
+ *
+ * The `piiPass` is injected so this is unit-testable without the redactor
+ * package (the CLI wires the real `@crewhaus/pii-redactor` pass).
+ */
+export function buildKnowledgeRedactor(piiPass: PiiPass): Redactor {
+  return async (text: string) => {
+    const afterPii = await piiPass(text);
+    const masked = maskKnowledgeSecrets(afterPii);
+    return { text: masked, secretRemains: looksLikeSecret(masked) };
+  };
+}
+
+// ---------------------------------------------------------------------------
 // harness reads
 // ---------------------------------------------------------------------------
 
@@ -197,21 +325,83 @@ export function readHarnessPrompts(
 // shared-store reads
 // ---------------------------------------------------------------------------
 
-/** Read the shared memories.jsonl. Missing → []. */
+/** Upper bound on a shared memory's text length. A shared store is untrusted
+ *  input on pull; an absurdly long "memory" is a poisoning / DoS vector, never
+ *  a real lesson. 64 KiB is far above any genuine memory. */
+export const MAX_SHARED_MEMORY_TEXT = 64 * 1024;
+
+/**
+ * Validate one parsed shared-memory record (F6). A pulled record is UNTRUSTED:
+ * the file could have been hand-edited to poison the harness's dedupe (a lying
+ * `contentHash` so a malicious `text` masquerades as an already-trusted entry)
+ * or to bloat it (oversized text / malformed tags). Returns the record when it
+ * is a well-formed {@link SharedMemory} whose stored `contentHash` MATCHES the
+ * recomputed hash of its own text+tags; otherwise a `reason` for the skip.
+ */
+export function validateSharedMemory(
+  rec: unknown,
+): { ok: true; memory: SharedMemory } | { ok: false; reason: string } {
+  if (rec === null || typeof rec !== "object") return { ok: false, reason: "not an object" };
+  const r = rec as Record<string, unknown>;
+  if (typeof r["contentHash"] !== "string")
+    return { ok: false, reason: "contentHash not a string" };
+  if (typeof r["text"] !== "string") return { ok: false, reason: "text not a string" };
+  if (r["text"].length > MAX_SHARED_MEMORY_TEXT) {
+    return { ok: false, reason: `text exceeds ${MAX_SHARED_MEMORY_TEXT} bytes` };
+  }
+  if (!Array.isArray(r["tags"]) || !r["tags"].every((t) => typeof t === "string")) {
+    return { ok: false, reason: "tags is not a string[]" };
+  }
+  const tags = r["tags"] as string[];
+  // Re-hash text+tags and reject a record whose stored hash lies — this is what
+  // defeats dedupe-poisoning (a forged hash colliding with a trusted entry).
+  const recomputed = memoryContentHash(r["text"], tags);
+  if (recomputed !== r["contentHash"]) {
+    return { ok: false, reason: "contentHash does not match recomputed hash of text+tags" };
+  }
+  const prov = r["provenance"];
+  const provenance: Provenance =
+    prov !== null &&
+    typeof prov === "object" &&
+    typeof (prov as Provenance).harness === "string" &&
+    typeof (prov as Provenance).pushedAt === "string"
+      ? (prov as Provenance)
+      : { harness: "unknown", pushedAt: "unknown" };
+  return {
+    ok: true,
+    memory: { contentHash: r["contentHash"], text: r["text"], tags, provenance },
+  };
+}
+
+/** Read the shared memories.jsonl. Missing → []. Each record is validated as a
+ *  proper {@link SharedMemory} with a matching content hash (F6); invalid
+ *  records are SKIPPED with a warning to stderr, never loaded. */
 export function readSharedMemories(sharedDir: string): SharedMemory[] {
   const path = join(sharedDir, "memories.jsonl");
   if (!existsSync(path)) return [];
   const out: SharedMemory[] = [];
   for (const line of readFileSync(path, "utf-8").split("\n")) {
     if (line.trim() === "") continue;
+    let parsed: unknown;
     try {
-      const rec = JSON.parse(line) as SharedMemory;
-      if (typeof rec.contentHash === "string" && typeof rec.text === "string") out.push(rec);
+      parsed = JSON.parse(line);
     } catch {
-      // tolerated
+      continue; // tolerated — a malformed JSON line
+    }
+    const v = validateSharedMemory(parsed);
+    if (v.ok) {
+      out.push(v.memory);
+    } else {
+      warnSkippedShared(`memory (${v.reason})`);
     }
   }
   return out;
+}
+
+/** Emit a skip warning for a rejected shared artifact. Isolated so tests can
+ *  silence/observe it and the two readers share one message shape. */
+function warnSkippedShared(what: string): void {
+  process.stderr.write(`crewhaus: warning: skipped invalid shared ${what}\n`);
 }
 
 /** Read the shared fragments of a kind (`graders/` or `prompts/`). */
@@ -228,8 +418,23 @@ export function readSharedFragments(
     const contents = readFileSync(join(dir, f), "utf-8");
     // Strip the provenance header line if present; the body is the fragment.
     const { provenance, body } = splitProvenanceHeader(contents);
+    // F6 — the filename IS the claimed content hash. RECOMPUTE it from the body
+    // and reject a mismatch: a fragment file renamed to a trusted hash would
+    // otherwise poison the harness's dedupe (pulled under a hash it thinks it
+    // already vetted). Also bound the body size like memories.
+    const claimedHash = f.slice(0, -ext.length);
+    if (body.length > MAX_SHARED_MEMORY_TEXT) {
+      warnSkippedShared(`${kind} fragment ${f} (exceeds ${MAX_SHARED_MEMORY_TEXT} bytes)`);
+      continue;
+    }
+    if (fragmentContentHash(body) !== claimedHash) {
+      warnSkippedShared(
+        `${kind} fragment ${f} (filename hash does not match recomputed body hash)`,
+      );
+      continue;
+    }
     out.push({
-      contentHash: f.slice(0, -ext.length),
+      contentHash: claimedHash,
       kind,
       filename: f,
       contents: body,

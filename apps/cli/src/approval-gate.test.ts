@@ -13,7 +13,9 @@ import {
   decideApproval,
   loadEnvironmentsConfig,
   policyForEnv,
+  prReferencesVersion,
   readApprovals,
+  rollupConclusion,
 } from "./approval-gate";
 
 let root: string;
@@ -192,5 +194,115 @@ describe("buildGovernancePayload", () => {
     expect(payload.countedApprovers).toEqual(["alice"]);
     expect(payload.actor).toBe("cli");
     expect(payload.ts).toBe(1234);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F3(a) — fail-closed PR-check rollup verdict.
+// ---------------------------------------------------------------------------
+describe("rollupConclusion — fail-closed (F3a)", () => {
+  test("empty rollup → none (no checks, no witness)", () => {
+    expect(rollupConclusion([])).toBe("none");
+  });
+
+  test("all explicit SUCCESS → success", () => {
+    expect(rollupConclusion([{ conclusion: "SUCCESS" }, { state: "SUCCESS" }])).toBe("success");
+  });
+
+  test("a SKIPPED check → NOT a witness (none), not success", () => {
+    expect(rollupConclusion([{ conclusion: "SUCCESS" }, { conclusion: "SKIPPED" }])).toBe("none");
+  });
+
+  test("a NEUTRAL check → NOT a witness (none)", () => {
+    expect(rollupConclusion([{ conclusion: "NEUTRAL" }])).toBe("none");
+  });
+
+  test("TIMED_OUT / ACTION_REQUIRED / STALE → failure (fail-closed)", () => {
+    expect(rollupConclusion([{ conclusion: "SUCCESS" }, { conclusion: "TIMED_OUT" }])).toBe(
+      "failure",
+    );
+    expect(rollupConclusion([{ conclusion: "ACTION_REQUIRED" }])).toBe("failure");
+    expect(rollupConclusion([{ conclusion: "STALE" }])).toBe("failure");
+  });
+
+  test("an unknown conclusion → NOT success (none)", () => {
+    expect(rollupConclusion([{ conclusion: "MYSTERY_STATE" }])).toBe("none");
+  });
+
+  test("a check with neither state nor conclusion → pending (ambiguous, not success)", () => {
+    expect(rollupConclusion([{ conclusion: "SUCCESS" }, {}])).toBe("pending");
+  });
+
+  test("a running check → pending", () => {
+    expect(rollupConclusion([{ state: "IN_PROGRESS" }, { conclusion: "SUCCESS" }])).toBe("pending");
+  });
+
+  test("a SKIPPED-only rollup does NOT witness a promotion (decideApproval)", () => {
+    // The real-world regression: a green-looking PR whose only check was skipped
+    // must not clear the gate.
+    const decision = decideApproval({
+      specName: "bot",
+      toEnv: "prod",
+      toVersion: "v2",
+      policy: { requireApproval: true, minApprovals: 1 },
+      approvals: [],
+      prCheck: { conclusion: rollupConclusion([{ conclusion: "SKIPPED" }]) },
+    });
+    expect(decision.satisfied).toBe(false);
+    expect(decision.prWitness).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F3(b) — bind the PR witness to the exact version.
+// ---------------------------------------------------------------------------
+describe("prReferencesVersion — version binding (F3b)", () => {
+  test("matches the version in a propose/ head ref", () => {
+    expect(
+      prReferencesVersion({ headRefName: "propose/bot-v2-abcd1234-2026-07-02T00-00-00" }, "v2"),
+    ).toBe(true);
+  });
+
+  test("does NOT match a different version (v2 head does not witness v3)", () => {
+    expect(
+      prReferencesVersion({ headRefName: "propose/bot-v2-abcd1234-2026-07-02T00-00-00" }, "v3"),
+    ).toBe(false);
+  });
+
+  test("does NOT let v1 witness v10 (bounded token, not substring)", () => {
+    expect(prReferencesVersion({ headRefName: "propose/bot-v10-abcd1234-stamp" }, "v1")).toBe(
+      false,
+    );
+    expect(prReferencesVersion({ headRefName: "propose/bot-v10-abcd1234-stamp" }, "v10")).toBe(
+      true,
+    );
+  });
+
+  test("matches a version referenced in the title or body", () => {
+    expect(prReferencesVersion({ title: "Propose bot v2 for review" }, "v2")).toBe(true);
+    expect(prReferencesVersion({ body: "This promotes to version v2 today" }, "v2")).toBe(true);
+  });
+
+  test("a trailing dot after the version is treated as ambiguous (v2. could be v2.1) — no match", () => {
+    // Conservative for a security gate: never let `v2` witness when it might be
+    // a truncation of `v2.1`. The head-ref binding (bounded by `-`) is exact.
+    expect(prReferencesVersion({ body: "promotes to v2." }, "v2")).toBe(false);
+  });
+
+  test("no version reference anywhere → false", () => {
+    expect(prReferencesVersion({ headRefName: "propose/bot-nope", title: "x" }, "v2")).toBe(false);
+  });
+
+  test("a green PR for a DIFFERENT version does not witness (integration of a+b)", () => {
+    // A green rollup, but the PR is for v2 while we promote v3 → no witness.
+    const prForV2 = {
+      headRefName: "propose/bot-v2-hash-stamp",
+      statusCheckRollup: [{ conclusion: "SUCCESS" }],
+    };
+    const matches = prReferencesVersion(prForV2, "v3");
+    expect(matches).toBe(false);
+    // The green PR for the EXACT version does witness.
+    expect(prReferencesVersion(prForV2, "v2")).toBe(true);
+    expect(rollupConclusion(prForV2.statusCheckRollup)).toBe("success");
   });
 });

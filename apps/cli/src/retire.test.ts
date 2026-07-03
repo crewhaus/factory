@@ -1,5 +1,13 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -24,7 +32,14 @@ afterEach(() => {
 });
 
 /** A step-seam stub that records call order + lets a step be forced to fail. */
-function stubSteps(opts: { failBackup?: boolean; failTombstone?: boolean } = {}): {
+function stubSteps(
+  opts: {
+    failBackup?: boolean;
+    failTombstone?: boolean;
+    failAudit?: boolean;
+    failCompliance?: boolean;
+  } = {},
+): {
   steps: RetirementSteps;
   calls: string[];
 } {
@@ -42,8 +57,12 @@ function stubSteps(opts: { failBackup?: boolean; failTombstone?: boolean } = {})
       opts.failBackup === true
         ? fail("backupState", "disk full")
         : { ...ok("backupState"), tarball: "state.tar.gz" },
-    complianceEvidence: async () => ok("complianceEvidence"),
-    auditVerify: async () => ok("auditVerify"),
+    complianceEvidence: async () =>
+      opts.failCompliance === true
+        ? fail("complianceEvidence", "collector error")
+        : ok("complianceEvidence"),
+    auditVerify: async () =>
+      opts.failAudit === true ? fail("auditVerify", "chain break at seq 12") : ok("auditVerify"),
     pushKnowledge: async () => ok("pushKnowledge"),
     tombstoneRegistry: async () =>
       opts.failTombstone === true
@@ -227,5 +246,110 @@ describe("runRetirement — real", () => {
     expect(existsSync(stateDir)).toBe(true);
     // log still written
     expect(readRetirementLog(join(root, "archive"))).not.toBeUndefined();
+  });
+
+  // -------------------------------------------------------------------------
+  // F4 — a tamper-reporting auditVerify / failed compliance ABORTS before the
+  // destructive move, and the retirement log is written BEFORE the move.
+  // -------------------------------------------------------------------------
+  test("aborts (state intact) when auditVerify reports tamper", async () => {
+    const stateDir = join(root, ".crewhaus");
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(join(stateDir, "marker"), "x");
+    const archiveDir = join(root, "archive");
+    const plan = buildRetirementPlan({
+      specName: "c",
+      harnessDir: root,
+      archiveDir,
+      pins: {},
+      force: false,
+      pushKnowledge: false,
+    });
+    const { steps, calls } = stubSteps({ failAudit: true });
+    await expect(runRetirement({ plan, steps, dryRun: false })).rejects.toThrow(RetireError);
+    // The destructive tombstone/archive steps NEVER ran.
+    expect(calls).not.toContain("tombstoneRegistry");
+    // State left intact for investigation.
+    expect(existsSync(join(stateDir, "marker"))).toBe(true);
+    // The aborted-run log is still evidenced in the archive.
+    const log = readRetirementLog(archiveDir);
+    expect(log?.archived).toBe(false);
+    expect(log?.outcomes.some((o) => o.step === "auditVerify" && !o.ok)).toBe(true);
+  });
+
+  test("aborts (state intact) when the compliance bundle fails", async () => {
+    const stateDir = join(root, ".crewhaus");
+    mkdirSync(stateDir, { recursive: true });
+    const plan = buildRetirementPlan({
+      specName: "c",
+      harnessDir: root,
+      archiveDir: join(root, "archive"),
+      pins: {},
+      force: false,
+      pushKnowledge: false,
+    });
+    const { steps, calls } = stubSteps({ failCompliance: true });
+    await expect(runRetirement({ plan, steps, dryRun: false })).rejects.toThrow(RetireError);
+    expect(calls).not.toContain("tombstoneRegistry");
+    expect(existsSync(stateDir)).toBe(true);
+  });
+
+  test("--force-unverified proceeds past a tamper finding and still removes state", async () => {
+    const stateDir = join(root, ".crewhaus");
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(join(stateDir, "marker"), "x");
+    const archiveDir = join(root, "archive");
+    const plan = buildRetirementPlan({
+      specName: "c",
+      harnessDir: root,
+      archiveDir,
+      pins: {},
+      force: false,
+      pushKnowledge: false,
+    });
+    const { steps, calls } = stubSteps({ failAudit: true });
+    const result = await runRetirement({
+      plan,
+      steps,
+      dryRun: false,
+      forceUnverified: true,
+    });
+    expect(calls).toContain("tombstoneRegistry");
+    expect(result.removedState).toBe(true);
+    expect(existsSync(stateDir)).toBe(false);
+  });
+
+  test("the retirement log is durably written BEFORE the destructive move (crash-safety)", async () => {
+    // Force the destructive rename to THROW (a read-only archive dir), then
+    // assert the log already exists on disk — proving it was fsynced before the
+    // move, so a crash mid-remove still leaves the evidence.
+    const stateDir = join(root, ".crewhaus");
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(join(stateDir, "marker"), "x");
+    const archiveDir = join(root, "archive");
+    mkdirSync(archiveDir, { recursive: true });
+    const plan = buildRetirementPlan({
+      specName: "c",
+      harnessDir: root,
+      archiveDir,
+      pins: {},
+      force: false,
+      pushKnowledge: false,
+    });
+    const { steps } = stubSteps();
+    // Make the HARNESS dir read-only so renameSync (which must remove the source
+    // .crewhaus from its parent) throws — but the ARCHIVE dir stays writable so
+    // the pre-move log write still lands. This isolates "log written before the
+    // move" from "move succeeded".
+    chmodSync(root, 0o500);
+    try {
+      await expect(runRetirement({ plan, steps, dryRun: false })).rejects.toThrow();
+    } finally {
+      chmodSync(root, 0o700);
+    }
+    // The pre-move durable write landed the log despite the failed move.
+    expect(existsSync(join(archiveDir, RETIREMENT_LOG_FILENAME))).toBe(true);
+    // And the state was NOT lost — the rename never completed.
+    expect(existsSync(join(stateDir, "marker"))).toBe(true);
   });
 });

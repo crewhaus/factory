@@ -192,6 +192,77 @@ export type PrCheckReader = (args: {
   readonly version: string;
 }) => Promise<PrCheckState>;
 
+/** One entry in a GitHub PR's `statusCheckRollup` — a StatusContext carries a
+ *  `state`, a CheckRun carries a `conclusion`; either (or neither) may be set. */
+export type RollupCheck = { readonly conclusion?: string; readonly state?: string };
+
+/** Terminal check conclusions/states that mean FAILURE (fail-closed). */
+const ROLLUP_FAILED: ReadonlySet<string> = new Set([
+  "FAILURE",
+  "CANCELLED",
+  "TIMED_OUT",
+  "ACTION_REQUIRED",
+  "STARTUP_FAILURE",
+  "STALE",
+  "ERROR",
+]);
+
+/** States that mean a check is still RUNNING (not yet a witness). */
+const ROLLUP_RUNNING: ReadonlySet<string> = new Set([
+  "PENDING",
+  "IN_PROGRESS",
+  "QUEUED",
+  "WAITING",
+  "REQUESTED",
+]);
+
+/**
+ * F3(a) — FAIL-CLOSED rollup verdict. A PR is a `success` witness ONLY when it
+ * has at least one check AND every check terminated in an explicit SUCCESS.
+ * Any failure/cancel/timeout, any still-running check, and any
+ * SKIPPED/NEUTRAL/unknown conclusion yields NOT a witness — an ambiguous or
+ * non-passing state must never sign off a protected promotion.
+ */
+export function rollupConclusion(
+  rollup: ReadonlyArray<RollupCheck>,
+): "success" | "pending" | "failure" | "none" {
+  if (rollup.length === 0) return "none";
+  let anyFail = false;
+  let anyPending = false;
+  let allSuccess = true;
+  for (const c of rollup) {
+    const state = (c.state ?? "").toUpperCase();
+    const conclusion = (c.conclusion ?? "").toUpperCase();
+    const terminal = conclusion !== "" ? conclusion : state;
+    if (ROLLUP_RUNNING.has(state) || ROLLUP_RUNNING.has(conclusion) || terminal === "") {
+      anyPending = true;
+    }
+    if (ROLLUP_FAILED.has(state) || ROLLUP_FAILED.has(conclusion)) anyFail = true;
+    // Only an explicit SUCCESS counts toward "all passed"; SKIPPED/NEUTRAL/
+    // anything else leaves allSuccess false (fail-closed).
+    if (terminal !== "SUCCESS") allSuccess = false;
+  }
+  if (anyFail) return "failure";
+  if (anyPending) return "pending";
+  return allSuccess ? "success" : "none";
+}
+
+/**
+ * F3(b) — does this PR reference `version` as a bounded token in its head ref,
+ * title, or body? `propose` names the branch `propose/<slug>-<version>-<hash>-
+ * <stamp>`, so the version is a bounded segment of the head ref; a bare
+ * substring match would let `v1` witness `v10`, so require non-alphanumeric
+ * (or string-edge) bounds. Binds the PR witness to the EXACT promoted version.
+ */
+export function prReferencesVersion(
+  pr: { readonly headRefName?: string; readonly title?: string; readonly body?: string },
+  version: string,
+): boolean {
+  const esc = version.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const bounded = new RegExp(`(^|[^A-Za-z0-9.])${esc}([^A-Za-z0-9.]|$)`);
+  return [pr.headRefName, pr.title, pr.body].some((s) => typeof s === "string" && bounded.test(s));
+}
+
 // ---------------------------------------------------------------------------
 // the gate decision
 // ---------------------------------------------------------------------------

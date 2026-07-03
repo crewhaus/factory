@@ -238,6 +238,34 @@ describe("buildSecurityDigest — audit rollup", () => {
     expect(d.audit.absentDeclaredKinds).not.toContain("model_call");
   });
 
+  test("F5: a governance_approval record surfaces in the digest and is a declared kind", async () => {
+    await seedAudit([
+      {
+        kind: "governance_approval",
+        payload: {
+          name: "concierge",
+          toEnv: "prod",
+          toVersion: "v3",
+          required: 2,
+          satisfied: false,
+          countedApprovers: ["alice"],
+          prWitness: false,
+        },
+        atMs: NOW - MS_PER_DAY,
+      },
+    ]);
+    const d = buildSecurityDigest({ rootDir: root, window: window(7), now: () => NOW });
+    // Counted in the window …
+    expect(d.audit.countsByKind).toEqual({ governance_approval: 1 });
+    // … and NOT reported as an "absent declared kind" that was seen (it was
+    // added to DECLARED_AUDIT_KINDS in F5).
+    expect(DECLARED_AUDIT_KINDS).toContain("governance_approval");
+    expect(DECLARED_AUDIT_KINDS).toContain("governance_proposal");
+    expect(d.audit.absentDeclaredKinds).not.toContain("governance_approval");
+    // A run with no governance records lists both as absent-but-declared.
+    expect(d.audit.absentDeclaredKinds).toContain("governance_proposal");
+  });
+
   test("F1 defense in depth: control chars in audit payload strings are stripped and clamped", async () => {
     await seedAudit([
       {

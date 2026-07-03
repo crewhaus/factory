@@ -29,7 +29,18 @@
  * orchestration (order, refusal, dry-run, the archived log) is unit-tested
  * without running any of them; the CLI wires the real steps.
  */
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+  writeSync,
+} from "node:fs";
 import { dirname, join, resolve } from "node:path";
 
 /** Thrown for operational failures (missing harness, active pin without
@@ -212,6 +223,11 @@ export type RunRetirementOptions = {
   readonly now?: () => Date;
   /** Test seam: whether to actually move/remove the state dir (default true). */
   readonly performArchive?: boolean;
+  /** F4 — proceed with the destructive move EVEN IF `auditVerify` reports
+   *  tamper or `complianceEvidence` failed. Distinct from `--force`
+   *  (`plan.force`, which only overrides the active-pin refusal). Default
+   *  false: a provably-tampered audit chain ABORTS the retire, state intact. */
+  readonly forceUnverified?: boolean;
 };
 
 export type RunRetirementResult = {
@@ -223,11 +239,15 @@ export type RunRetirementResult = {
 };
 
 /**
- * Execute the plan. Each heavy step runs in order and its outcome is recorded;
- * a step that returns `ok: false` ABORTS the retirement BEFORE the destructive
- * archive/remove (a failed backup must not be followed by a delete). The
- * retirement log — every step + outcome — is written INTO the archive so the
- * decommission is self-evidenced. Dry runs execute nothing.
+ * Execute the plan. Each heavy step runs in order and its outcome is recorded.
+ * A step that returns `ok: false` ABORTS the retirement BEFORE the destructive
+ * archive/remove (a failed backup, tombstone, and — per F4 — a failed
+ * compliance-evidence bundle or a tamper-reporting `auditVerify` all abort;
+ * the audit/compliance gate is overridable only with `forceUnverified`). The
+ * retirement log — every step + outcome — is written+fsynced INTO the archive
+ * BEFORE the destructive move (and rewritten after) so a crash mid-remove
+ * still leaves the evidence and the decommission is self-evidenced. Dry runs
+ * execute nothing.
  */
 export async function runRetirement(opts: RunRetirementOptions): Promise<RunRetirementResult> {
   const { plan, steps } = opts;
@@ -257,6 +277,8 @@ export async function runRetirement(opts: RunRetirementOptions): Promise<RunReti
     return o;
   };
 
+  const forceUnverified = opts.forceUnverified ?? false;
+
   // 1–4/5: the non-destructive steps. A failure aborts before archiving.
   const backup = record(await steps.backupState(plan.archiveDir));
   if (!backup.ok)
@@ -264,9 +286,37 @@ export async function runRetirement(opts: RunRetirementOptions): Promise<RunReti
       `state backup failed — aborting before any destructive step: ${backup.detail}`,
     );
 
-  record(await steps.complianceEvidence(plan.archiveDir));
-  record(await steps.auditVerify());
+  // F4 — the compliance-evidence bundle and the audit-verify verdict GATE the
+  // destructive step: a provably-tampered audit chain (or a failed evidence
+  // bundle) must ABORT the retire so the `.crewhaus` state is left intact for
+  // investigation, NOT moved+removed. `--force-unverified` is the explicit
+  // override (distinct from `--force`, which only overrides the active-pin
+  // refusal). The log is written into the archive before we bail, so the
+  // refusal is itself evidenced.
+  const compliance = record(await steps.complianceEvidence(plan.archiveDir));
+  const audit = record(await steps.auditVerify());
   if (plan.pushKnowledge) record(await steps.pushKnowledge(plan.archiveDir));
+
+  const tamperReasons: string[] = [];
+  if (!audit.ok) tamperReasons.push(`audit verify reported tamper: ${audit.detail}`);
+  if (!compliance.ok) tamperReasons.push(`compliance evidence failed: ${compliance.detail}`);
+  if (tamperReasons.length > 0 && !forceUnverified) {
+    // Persist the aborted-run log into the archive so the refusal is evidenced,
+    // then abort BEFORE tombstone/archive — the live state stays put.
+    const abortedLog: RetirementLog = {
+      specName: plan.specName,
+      harnessDir: plan.harnessDir,
+      retiredAt,
+      force: plan.force,
+      activePinsAtRetirement: plan.activePins,
+      outcomes,
+      archived: false,
+    };
+    writeLogDurably(join(plan.archiveDir, RETIREMENT_LOG_FILENAME), abortedLog);
+    throw new RetireError(
+      `aborting retire before any destructive step — ${tamperReasons.join("; ")}. The live .crewhaus state was left intact. Pass --force-unverified to retire anyway.`,
+    );
+  }
 
   const tombstone = record(await steps.tombstoneRegistry());
   if (!tombstone.ok) {
@@ -274,6 +324,22 @@ export async function runRetirement(opts: RunRetirementOptions): Promise<RunReti
       `registry tombstone failed — aborting before archiving: ${tombstone.detail}`,
     );
   }
+
+  // F4 — write + fsync the retirement log into the archive BEFORE the
+  // destructive move, so a crash mid-remove still leaves the evidence beside
+  // the backup that already exists pre-destruction. The `archive` outcome is
+  // appended after the move and the log is rewritten to capture it.
+  const logPath = join(plan.archiveDir, RETIREMENT_LOG_FILENAME);
+  const preMoveLog: RetirementLog = {
+    specName: plan.specName,
+    harnessDir: plan.harnessDir,
+    retiredAt,
+    force: plan.force,
+    activePinsAtRetirement: plan.activePins,
+    outcomes,
+    archived: false,
+  };
+  writeLogDurably(logPath, preMoveLog);
 
   // Destructive archive/remove: move the live .crewhaus into the archive, then
   // it is gone from the harness. Guarded by performArchive for tests.
@@ -308,10 +374,24 @@ export async function runRetirement(opts: RunRetirementOptions): Promise<RunReti
     outcomes,
     archived: removedState,
   };
-  const logPath = join(plan.archiveDir, RETIREMENT_LOG_FILENAME);
-  writeFileSync(logPath, `${JSON.stringify(log, null, 2)}\n`, { mode: 0o600 });
+  // Rewrite the log now that the `archive` outcome is known (the pre-move write
+  // above is the crash-safety copy; this is the final, complete record).
+  writeLogDurably(logPath, log);
 
   return { log, logPath, removedState };
+}
+
+/** Write a retirement log and fsync it to disk before returning, so a crash
+ *  immediately after cannot lose the evidence. */
+function writeLogDurably(logPath: string, log: RetirementLog): void {
+  const body = `${JSON.stringify(log, null, 2)}\n`;
+  const fd = openSync(logPath, "w", 0o600);
+  try {
+    writeSync(fd, body);
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
 }
 
 /** Read a retirement log back (for verification / display). */

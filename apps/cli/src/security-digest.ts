@@ -93,8 +93,11 @@ const TOP_N = 10;
  * Every kind declared by `@crewhaus/audit-log`. Kept as a local literal list
  * (rather than importing a value — the package only exports the TYPE) so the
  * digest can report declared kinds that produced zero records in the window.
- * `satisfies` keeps it in lockstep with the union: adding a kind to
- * audit-log without updating this list is a type error.
+ * `satisfies ReadonlyArray<AuditKind>` only checks that every ENTRY is a valid
+ * kind — a SUBSET type-checks fine, so it does NOT catch an omission. This is a
+ * maintained list: adding a kind to audit-log means adding it here too (a
+ * missing kind just won't be reported as "declared but zero records"), and a
+ * regression test asserts a `governance_*` record surfaces in the digest.
  */
 export const DECLARED_AUDIT_KINDS = [
   "policy_decision",
@@ -109,6 +112,8 @@ export const DECLARED_AUDIT_KINDS = [
   "egress_decision",
   "permission_justification_evaluated",
   "retention_enforcement",
+  "governance_approval",
+  "governance_proposal",
 ] as const satisfies ReadonlyArray<AuditKind>;
 
 /** Thrown by `parseSinceFlag` on an unparseable `--since`. The CLI entry
