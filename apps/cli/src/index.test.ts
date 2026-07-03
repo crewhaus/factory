@@ -2116,3 +2116,127 @@ describe("crewhaus channel provision|verify (item 61)", () => {
     expect(result.stderr).toContain("expected one of: slack, telegram, discord, all");
   });
 });
+
+// F2 (pre-merge fix) — `onchain tune`'s add-vs-replace op must be decided
+// from the SAME parsed-CST existence check applySpecPatch itself uses
+// (`doc.hasIn(path)` via the `yaml` package's parseDocument), not a second
+// raw-text regex that can disagree with it.
+describe("crewhaus onchain tune — add-vs-replace op selection (item 66, #66 F2)", () => {
+  const ONCHAIN_BASE = `name: onchain-test
+target: onchain
+version: 1
+agent:
+  model: claude-sonnet-4-6
+  instructions: React to treasury events.
+chains:
+  - id: base-mainnet
+    kind: evm
+    rpcUrls:
+      - https://rpc.example
+    finality:
+      kind: confirmations
+      count: 12
+contracts:
+  - id: treasury
+    chainId: base-mainnet
+    address: "0xtreasury0000000000000000000000000000smoke"
+    abiRef: abi://safe
+triggers:
+  - kind: event
+    chainId: base-mainnet
+    contract: treasury
+    event: Transfer
+`;
+
+  function writeHistory(): string {
+    const historyPath = join(tmp, "receipts.jsonl");
+    writeFileSync(
+      historyPath,
+      `${JSON.stringify({ ts: 1, contractId: "treasury", valueWei: "1000", status: "0x1", simulated: true })}\n`,
+    );
+    return historyPath;
+  }
+
+  test("spec with no transaction_policy block → op add", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    writeFileSync(specPath, ONCHAIN_BASE);
+    const historyPath = writeHistory();
+    const patchPath = join(tmp, "patch.json");
+    const result = await runCli([
+      "onchain",
+      "tune",
+      specPath,
+      "--history",
+      historyPath,
+      "-o",
+      patchPath,
+    ]);
+    expect(result.exitCode).toBe(0);
+    const patch = JSON.parse(readFileSync(patchPath, "utf-8"));
+    expect(patch.op).toBe("add");
+  });
+
+  test("spec with an existing transaction_policy block → op replace", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    writeFileSync(
+      specPath,
+      `${ONCHAIN_BASE}transaction_policy:\n  defaultWriteApproval: required\n  allowedContracts: []\n  simulationRequired: true\n`,
+    );
+    const historyPath = writeHistory();
+    const patchPath = join(tmp, "patch.json");
+    const result = await runCli([
+      "onchain",
+      "tune",
+      specPath,
+      "--history",
+      historyPath,
+      "-o",
+      patchPath,
+    ]);
+    expect(result.exitCode).toBe(0);
+    const patch = JSON.parse(readFileSync(patchPath, "utf-8"));
+    expect(patch.op).toBe("replace");
+  });
+
+  test("quoted transaction_policy key — parsed-CST check agrees with applySpecPatch, unlike the old raw-text regex", async () => {
+    // `/^transaction_policy:/m` (the old check) does NOT match a quoted key
+    // like `"transaction_policy":`, even though it's valid YAML and the
+    // parsed CST (what applySpecPatch itself uses via doc.hasIn) sees it as
+    // present. The old code would have picked "add" here and the patch
+    // apply would have been rejected by applySpecPatch ("path already
+    // exists"). The fix must pick "replace".
+    const specPath = join(tmp, "crewhaus.yaml");
+    writeFileSync(
+      specPath,
+      `${ONCHAIN_BASE}"transaction_policy":\n  defaultWriteApproval: required\n  allowedContracts: []\n  simulationRequired: true\n`,
+    );
+    const historyPath = writeHistory();
+    const patchPath = join(tmp, "patch.json");
+    const result = await runCli([
+      "onchain",
+      "tune",
+      specPath,
+      "--history",
+      historyPath,
+      "-o",
+      patchPath,
+    ]);
+    expect(result.exitCode).toBe(0);
+    const patch = JSON.parse(readFileSync(patchPath, "utf-8"));
+    expect(patch.op).toBe("replace");
+
+    // And prove the chosen op is actually applySpecPatch-compatible: apply it
+    // for real and confirm no "path already exists" / "does not exist" error.
+    const { applySpecPatch } = await import("@crewhaus/spec-patch");
+    const specYaml = readFileSync(specPath, "utf-8");
+    expect(() =>
+      applySpecPatch(specYaml, {
+        target: patch.target,
+        path: patch.path,
+        op: patch.op,
+        value: patch.value,
+        rationale: patch.rationale,
+      }),
+    ).not.toThrow();
+  });
+});

@@ -333,6 +333,104 @@ export function detectAnomalies(
   return anomalies;
 }
 
+/**
+ * Detect anomalous spend when candidate and baseline are the SAME history
+ * (`crewhaus onchain sentinel` invoked without `--baseline`) — the "self-
+ * compare" mode.
+ *
+ * A naive `learnSpendBaseline(history)` + `detectAnomalies(history, ...)`
+ * self-masks: a receipt's own value is folded into its contract's baseline
+ * max, so a lone 100× spike can never exceed `maxMultiple × (its own value)`.
+ * The value-ceiling check — the headline sentinel feature — is silently
+ * defeated in exactly the default (no-`--baseline`) invocation.
+ *
+ * Fix: leave-one-out. For each candidate receipt, the ceiling is computed
+ * from the max successful spend over every OTHER successful receipt for that
+ * contract — the receipt under test never contributes to its own ceiling. A
+ * lone spike is then measured against the normal population and correctly
+ * flagged; a normal history (every value within range of its peers) still
+ * flags nothing. Unknown-contract detection needs no leave-one-out (a
+ * contract either has ≥1 OTHER successful receipt or it doesn't — a receipt
+ * is never "unknown relative to itself" in a way that matters here, since a
+ * lone successful send to a contract is, by definition, its own baseline of
+ * one and cannot be a value anomaly against itself); this path only ever
+ * calls detectAnomalies-style value/unknown logic per receipt with a leave-
+ * one-out baseline substituted in.
+ */
+export function detectAnomaliesSelfCompare(
+  history: readonly ReceiptRecord[],
+  opts: SentinelOptions = {},
+): SpendAnomaly[] {
+  const maxMultiple = BigInt(Math.max(1, Math.round(opts.maxMultiple ?? 2)));
+  const flagUnknown = opts.flagUnknownContracts !== false;
+  const ok = successfulReceipts(history);
+
+  // Precompute, per contract, the sorted successful wei values so a
+  // leave-one-out max can be derived in O(log n) per receipt instead of an
+  // O(n) rescan. (n is a receipt-history JSONL — expected small, but this
+  // keeps the self-compare path cheap regardless.)
+  const byContract = new Map<string, bigint[]>();
+  for (const r of ok) {
+    const arr = byContract.get(r.contractId);
+    if (arr === undefined) byContract.set(r.contractId, [r.valueWei]);
+    else arr.push(r.valueWei);
+  }
+
+  const anomalies: SpendAnomaly[] = [];
+  for (const r of history) {
+    const contractValues = byContract.get(r.contractId);
+    if (contractValues === undefined) {
+      // Only reachable for a non-successful (reverted/pending) receipt whose
+      // contract never had a successful send — genuinely unknown.
+      if (flagUnknown) {
+        anomalies.push({
+          ts: r.ts,
+          contractId: r.contractId,
+          valueWei: r.valueWei,
+          reason: `send to contract id "${r.contractId}" never seen in the learned baseline`,
+        });
+      }
+      continue;
+    }
+    if (r.status !== "0x1") {
+      // Reverted/pending receipts aren't part of the "legitimate spend"
+      // baseline and aren't value-checked here — mirrors the two-history
+      // path, where only successfulReceipts() feed learnSpendBaseline.
+      continue;
+    }
+    // Leave-one-out: the ceiling for THIS receipt excludes its own value —
+    // one occurrence of it is removed, then the max of the rest is taken.
+    let excludedOne = false;
+    let looMax = 0n;
+    for (const v of contractValues) {
+      if (!excludedOne && v === r.valueWei) {
+        excludedOne = true;
+        continue;
+      }
+      if (v > looMax) looMax = v;
+    }
+    if (!excludedOne) {
+      // Defensive: r.valueWei should always be in contractValues (it was
+      // pushed there while building the map). If not, fall back to the full
+      // max rather than under-count.
+      for (const v of contractValues) if (v > looMax) looMax = v;
+    }
+    // A contract with only this one successful receipt has no "other"
+    // population to compare against — nothing to flag as a ceiling breach.
+    if (contractValues.length < 2) continue;
+    const ceiling = looMax * maxMultiple;
+    if (r.valueWei > ceiling) {
+      anomalies.push({
+        ts: r.ts,
+        contractId: r.contractId,
+        valueWei: r.valueWei,
+        reason: `spend ${r.valueWei} wei exceeds ${maxMultiple}× the observed max ${looMax} wei for "${r.contractId}" (leave-one-out)`,
+      });
+    }
+  }
+  return anomalies;
+}
+
 /** Render a plain-text tune report. */
 export function renderTuneReport(proposal: PolicyProposal): string {
   const lines: string[] = [];

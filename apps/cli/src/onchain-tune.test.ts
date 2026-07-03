@@ -3,6 +3,7 @@ import {
   OnchainTuneError,
   type ReceiptRecord,
   detectAnomalies,
+  detectAnomaliesSelfCompare,
   learnSpendBaseline,
   parseReceiptHistory,
   proposePolicy,
@@ -157,5 +158,104 @@ describe("learnSpendBaseline + detectAnomalies (#66)", () => {
     );
     expect(detectAnomalies(candidate, baseline)).toHaveLength(0);
     expect(renderSentinelReport([])).toContain("no anomalies");
+  });
+});
+
+// F1 (pre-merge fix) — `onchain sentinel` without `--baseline` self-compares
+// history against itself. A naive learnSpendBaseline(history) +
+// detectAnomalies(history, baseline) self-masks: a receipt's own value feeds
+// its contract's baseline max, so a lone spike can never exceed
+// `maxMultiple × itself`. detectAnomaliesSelfCompare fixes this with a
+// leave-one-out per-contract max.
+describe("detectAnomaliesSelfCompare (#66 F1 — sentinel self-compare leave-one-out)", () => {
+  test("a naive self-compare baseline would self-mask a 100x value spike", () => {
+    // Demonstrates the BUG this fix replaces: baseline == candidate == the
+    // same history, so the spike's own value inflates its own ceiling.
+    const history = parseReceiptHistory(
+      jsonl([
+        { ts: 1, contractId: "treasury", valueWei: "1000", status: "0x1" },
+        { ts: 2, contractId: "treasury", valueWei: "1100", status: "0x1" },
+        { ts: 3, contractId: "treasury", valueWei: "1200", status: "0x1" },
+        { ts: 4, contractId: "treasury", valueWei: "100000", status: "0x1" }, // 100x spike
+      ]),
+    );
+    const naiveBaseline = learnSpendBaseline(history);
+    const naiveAnomalies = detectAnomalies(history, naiveBaseline, { maxMultiple: 2 });
+    // The naive self-compare path never flags the spike: 100000 > 2*100000 is false.
+    expect(naiveAnomalies).toHaveLength(0);
+  });
+
+  test("flags a 100x value spike on a known contract in self-compare mode", () => {
+    const history = parseReceiptHistory(
+      jsonl([
+        { ts: 1, contractId: "treasury", valueWei: "1000", status: "0x1" },
+        { ts: 2, contractId: "treasury", valueWei: "1100", status: "0x1" },
+        { ts: 3, contractId: "treasury", valueWei: "1200", status: "0x1" },
+        { ts: 4, contractId: "treasury", valueWei: "100000", status: "0x1" }, // 100x spike
+      ]),
+    );
+    const anomalies = detectAnomaliesSelfCompare(history, { maxMultiple: 2 });
+    expect(anomalies).toHaveLength(1);
+    expect(anomalies[0]?.ts).toBe(4);
+    expect(anomalies[0]?.contractId).toBe("treasury");
+    expect(anomalies[0]?.valueWei).toBe(100000n);
+    expect(anomalies[0]?.reason).toContain("leave-one-out");
+    // The ceiling used is derived from the OTHER receipts (max 1200), not
+    // from the spike itself.
+    expect(anomalies[0]?.reason).toContain("observed max 1200 wei");
+  });
+
+  test("a normal history (no spike) flags nothing in self-compare mode", () => {
+    const history = parseReceiptHistory(
+      jsonl([
+        { ts: 1, contractId: "usdc", valueWei: "1000", status: "0x1" },
+        { ts: 2, contractId: "usdc", valueWei: "1100", status: "0x1" },
+        { ts: 3, contractId: "usdc", valueWei: "1200", status: "0x1" },
+        { ts: 4, contractId: "weth", valueWei: "5000", status: "0x1" },
+        { ts: 5, contractId: "weth", valueWei: "5200", status: "0x1" },
+        // reverted receipts are excluded from the leave-one-out baseline and
+        // never value-checked.
+        { ts: 6, contractId: "weth", valueWei: "999999", status: "0x0" },
+      ]),
+    );
+    expect(detectAnomaliesSelfCompare(history, { maxMultiple: 2 })).toHaveLength(0);
+  });
+
+  test("a lone successful receipt for a contract has nothing to compare against", () => {
+    // Only one successful send ever recorded for "solo" — leave-one-out has
+    // no "other" population, so it cannot be flagged as a ceiling breach
+    // (this mirrors how a single-point baseline can't detect its own outlier).
+    const history = parseReceiptHistory(
+      jsonl([{ ts: 1, contractId: "solo", valueWei: "999999999", status: "0x1" }]),
+    );
+    expect(detectAnomaliesSelfCompare(history)).toHaveLength(0);
+  });
+
+  test("still flags a send to a contract id with zero successful receipts", () => {
+    const history = parseReceiptHistory(
+      jsonl([
+        { ts: 1, contractId: "usdc", valueWei: "1000", status: "0x1" },
+        { ts: 2, contractId: "usdc", valueWei: "1100", status: "0x1" },
+        // a reverted send to a contract that never once succeeded.
+        { ts: 3, contractId: "rugpull", valueWei: "1", status: "0x0" },
+      ]),
+    );
+    const anomalies = detectAnomaliesSelfCompare(history);
+    expect(anomalies).toHaveLength(1);
+    expect(anomalies[0]?.contractId).toBe("rugpull");
+    expect(anomalies[0]?.reason).toContain("never seen in the learned baseline");
+  });
+
+  test("the explicit --baseline path (detectAnomalies + learnSpendBaseline) still works correctly", () => {
+    // Regression guard: this fix must not touch the two-history path, which
+    // never self-masked (baseline excludes the candidate window entirely).
+    const baselineHistory = parseReceiptHistory(HISTORY);
+    const baseline = learnSpendBaseline(baselineHistory);
+    const candidate = parseReceiptHistory(
+      jsonl([{ ts: 99, contractId: "usdc", valueWei: "100000", status: "0x1" }]),
+    );
+    const anomalies = detectAnomalies(candidate, baseline, { maxMultiple: 2 });
+    expect(anomalies).toHaveLength(1);
+    expect(anomalies[0]?.reason).toContain("exceeds 2×");
   });
 });

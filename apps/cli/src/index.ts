@@ -95,6 +95,7 @@ import { registerMcpServer } from "@crewhaus/tool-mcp";
 import { createMemoryTools } from "@crewhaus/tool-memory";
 import { createTaskTool } from "@crewhaus/tool-task";
 import { type CostAccrualEvent, type ProviderId, TraceEventBus } from "@crewhaus/trace-event-bus";
+import { parseDocument } from "yaml";
 // Item 15 — `optimize --from-advice` (eval-gated apply of the advisor's
 // SpecPatches: suggestions-file validation, the accept/reject/compose loop
 // with injected compile/eval hooks, decisions.json + write-back stamping),
@@ -616,7 +617,9 @@ import {
 import {
   type CurrentPolicy,
   OnchainTuneError,
+  type SpendAnomaly,
   detectAnomalies,
+  detectAnomaliesSelfCompare,
   learnSpendBaseline,
   parseReceiptHistory,
   proposePolicy,
@@ -1699,8 +1702,11 @@ const ONCHAIN_SCHEMA: ParseArgsSchema = {
     // tune — write the proposed transaction_policy SpecPatch here (default
     // .crewhaus/onchain/policy-patch.json); advice-only when not whitelisted.
     { name: "out", short: "o", takesValue: true },
-    // sentinel — baseline history to learn from; defaults to --history minus
-    // the candidate window. When --baseline is given, --history is the candidate.
+    // sentinel — baseline history to learn from. When omitted, sentinel
+    // self-compares --history against itself using a leave-one-out
+    // per-contract max (each receipt's ceiling excludes its own value) so a
+    // lone spike is still measured against its peers, not itself. When
+    // --baseline is given, --history is the candidate window instead.
     { name: "baseline", takesValue: true },
     // sentinel — anomaly threshold: flag spend > N× the per-contract max (default 2).
     { name: "max-multiple", takesValue: true },
@@ -13731,7 +13737,9 @@ async function runOnchain(args: ParsedArgs, action: "tune" | "sentinel"): Promis
         "             validated SpecPatch is written for `optimize --write-back`;\n" +
         "             otherwise the proposal is advice-only.\n" +
         "  sentinel — flag anomalous spend (unknown contract id, or > N× the\n" +
-        "             per-contract observed max) against a learned baseline.\n" +
+        "             per-contract observed max) against a learned baseline. Without\n" +
+        "             --baseline, self-compares --history using a leave-one-out\n" +
+        "             per-contract max so a lone spike is still caught.\n" +
         "  --history defaults to .crewhaus/onchain/receipts.jsonl. No private keys\n" +
         "  are ever read — receipts carry only contractId + wei value + status.\n",
     );
@@ -13798,11 +13806,14 @@ async function runOnchain(args: ParsedArgs, action: "tune" | "sentinel"): Promis
       process.stdout.write(renderTuneReport(proposal));
     }
     if (proposal.patch !== undefined) {
-      // Pick the SpecPatch op from raw-YAML presence: `add` when the spec has no
-      // transaction_policy block yet (a top-level `transaction_policy:` key),
-      // `replace` when it does. applySpecPatch rejects the wrong op, so this
-      // keeps the emitted patch directly `optimize --write-back`-applicable.
-      const hasBlock = /^transaction_policy:/m.test(yamlText);
+      // Pick the SpecPatch op from the SAME parsed-CST existence check
+      // applySpecPatch itself uses (`doc.hasIn(path)` on the `yaml` package's
+      // parseDocument), not a second raw-text regex — a regex can disagree
+      // with the parsed check (e.g. `transaction_policy:` appearing only in a
+      // comment or inside a flow-context string), which would pick the wrong
+      // op and get the patch rejected by applySpecPatch's own existence
+      // check. Re-parsing here keeps the two checks structurally identical.
+      const hasBlock = parseDocument(yamlText).hasIn(proposal.patch.path);
       const specPatch = {
         target: proposal.patch.target,
         path: proposal.patch.path,
@@ -13822,19 +13833,27 @@ async function runOnchain(args: ParsedArgs, action: "tune" | "sentinel"): Promis
 
   // action === "sentinel"
   const baselinePath = strFlag(args, "baseline");
-  let baselineReceipts = historyReceipts;
-  let candidateReceipts = historyReceipts;
+  const maxMultiple = intFlag(args, "max-multiple");
+  let anomalies: SpendAnomaly[];
   if (baselinePath !== undefined) {
     const absBaseline = resolve(baselinePath);
     if (!existsSync(absBaseline)) die(`baseline history not found at ${absBaseline}`);
-    baselineReceipts = parseReceiptHistory(readFileSync(absBaseline, "utf-8"));
-    candidateReceipts = historyReceipts; // --history is the candidate window
+    const baselineReceipts = parseReceiptHistory(readFileSync(absBaseline, "utf-8"));
+    const candidateReceipts = historyReceipts; // --history is the candidate window
+    const baseline = learnSpendBaseline(baselineReceipts);
+    anomalies = detectAnomalies(candidateReceipts, baseline, {
+      ...(maxMultiple !== undefined ? { maxMultiple } : {}),
+    });
+  } else {
+    // No --baseline: self-compare mode. Learning the baseline from — and then
+    // diffing against — the SAME history self-masks a value spike (its own
+    // value would be folded into its contract's baseline max, so it could
+    // never exceed maxMultiple × itself). Leave-one-out fixes this: each
+    // receipt's ceiling excludes its own value from the per-contract max.
+    anomalies = detectAnomaliesSelfCompare(historyReceipts, {
+      ...(maxMultiple !== undefined ? { maxMultiple } : {}),
+    });
   }
-  const baseline = learnSpendBaseline(baselineReceipts);
-  const maxMultiple = intFlag(args, "max-multiple");
-  const anomalies = detectAnomalies(candidateReceipts, baseline, {
-    ...(maxMultiple !== undefined ? { maxMultiple } : {}),
-  });
   if (args.flags["json"] === true) {
     process.stdout.write(
       `${JSON.stringify(
