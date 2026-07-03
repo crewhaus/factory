@@ -95,6 +95,7 @@ import { registerMcpServer } from "@crewhaus/tool-mcp";
 import { createMemoryTools } from "@crewhaus/tool-memory";
 import { createTaskTool } from "@crewhaus/tool-task";
 import { type CostAccrualEvent, type ProviderId, TraceEventBus } from "@crewhaus/trace-event-bus";
+import { parseDocument } from "yaml";
 // Item 15 — `optimize --from-advice` (eval-gated apply of the advisor's
 // SpecPatches: suggestions-file validation, the accept/reject/compose loop
 // with injected compile/eval hooks, decisions.json + write-back stamping),
@@ -308,6 +309,16 @@ import {
   formatEgressFindingLines,
   runEgressTriage,
 } from "./egress-triage";
+// Item 10 — `compile --with-eval-harness`: project a non-cli shape's lowered IR
+// into a sibling target: eval bundle (+ per-shape invoker selection), in a
+// side-effect-free module so it is unit-testable (this entry file does the IO).
+import {
+  EVAL_BRIDGE_SUBDIR,
+  EvalBridgeError,
+  describeBridge,
+  projectEvalIr,
+  selectInvoker,
+} from "./eval-bridge";
 // Item 6 — `crewhaus eval coverage`: production-vs-eval behavior gap
 // detection, in a side-effect-free module so it is unit-testable (this entry
 // file runs an argv switch on import).
@@ -459,6 +470,19 @@ import {
   isScriptedShape,
   runInterview,
 } from "./init-interactive";
+// Item 67 — `crewhaus intents`: cluster user_message inputs across sessions +
+// rank by frequency / satisfaction / failure. Side-effect-free (this entry file
+// reads sessions + feedback and redacts the rendered examples).
+import {
+  IntentsError,
+  type TurnSignal,
+  clusterIntents,
+  orderedTurnsFromSessions,
+  redactDigest,
+  renderIntentsHtml,
+  renderIntentsJson,
+  renderIntentsText,
+} from "./intents";
 // Item 8 — `crewhaus judge calibrate`: pair human ratings with llm_judge
 // scores and compute agreement/bias/ROC-cut, in a side-effect-free module so
 // the statistics are unit-testable (this entry file runs an argv switch on
@@ -542,6 +566,19 @@ import {
   suggestSafeName,
   suggestSecretFix,
 } from "./lint";
+// Item 68 — `crewhaus loadtest`: concurrency benchmark + deploy gate for daemon
+// shapes. The runner drives an injected LoadDriver; side-effect-free (this entry
+// file builds the real driver + writes the report).
+import {
+  type GateThresholds,
+  type LoadDriver,
+  LoadtestError,
+  type RequestOutcome,
+  evaluateGate,
+  renderLoadtestHtml,
+  renderLoadtestText,
+  runLoadtest,
+} from "./loadtest";
 // Item 60 — the marketplace CLI core: registry-source resolution, the
 // outdated freshness compare, list/outdated formatters, and the publish PR
 // plan, in a side-effect-free module so it is unit-testable (this entry file
@@ -589,6 +626,21 @@ import {
   buildScanCandidates,
   writeModelField,
 } from "./model-scan";
+// Item 66 — `crewhaus onchain tune|sentinel`: mine wallet-engine receipt +
+// simulation history to propose a tuned transaction_policy and flag anomalous
+// spend. Side-effect-free (this entry file reads history + writes patch/report).
+import {
+  type CurrentPolicy,
+  OnchainTuneError,
+  type SpendAnomaly,
+  detectAnomalies,
+  detectAnomaliesSelfCompare,
+  learnSpendBaseline,
+  parseReceiptHistory,
+  proposePolicy,
+  renderSentinelReport,
+  renderTuneReport,
+} from "./onchain-tune";
 // Item 16 — `crewhaus permissions suggest` (mine persisted ask/deny history
 // into reviewable settings.json permission rules), in a side-effect-free
 // module so it is unit-testable (this entry file runs an argv switch on
@@ -810,6 +862,19 @@ import { formatUpgradePlan, makeSpecValidator, planUpgrade } from "./upgrade";
 // CLI version resolution (embedded --define constant → package.json), shared
 // with compile-check.ts's dependency pinning.
 import { cliVersion } from "./version";
+// Item 65 — `crewhaus eval --voice`: replay recorded call-session logs through
+// the voice grader pack (latency / barge-in / transcript). Side-effect-free
+// (this entry file reads the replay JSONLs + writes the report).
+import {
+  DEFAULT_VOICE_THRESHOLDS,
+  VoiceEvalError,
+  type VoiceSessionResult,
+  type VoiceThresholds,
+  aggregateVoiceEval,
+  gradeVoiceSession,
+  parseReplayLog,
+  renderVoiceReport,
+} from "./voice-eval";
 import { type Watcher, createWatchController, formatCycleLine } from "./watch";
 
 /**
@@ -859,6 +924,13 @@ const COMPILE_SCHEMA: ParseArgsSchema = {
     // spec-registry (with a distilled CHANGELOG.md entry) is DEFAULT-ON;
     // this is the explicit opt-out.
     { name: "no-register", takesValue: false },
+    // Item 10 — also emit an eval bridge (a target: eval bundle projected from
+    // this non-cli spec's own agent) into <out-dir>/eval/, so the shape can
+    // consume its distilled feedback through eval/optimize/flywheel.
+    { name: "with-eval-harness", takesValue: false },
+    // Item 10 — the dataset the projected eval bridge consumes (defaults to
+    // <specName>-eval@v1#dev, the dataset mine/distill convention).
+    { name: "eval-dataset", takesValue: true },
     // Item 41 — re-run parse→lint→compile on every change to the spec /
     // .crewhaus/commands / skills dirs (the watch mode the header listed as
     // "future"). Debounced, Ctrl-C-clean, one green/red status per cycle.
@@ -1293,6 +1365,15 @@ const EVAL_SCHEMA: ParseArgsSchema = {
     // provider drift → exit non-zero. --baseline points at the frozen run dir.
     { name: "sentinel", takesValue: false },
     { name: "baseline", takesValue: true },
+    // Item 65 — voice replay eval: replay recorded call-session logs through
+    // the voice grader pack (latency / barge-in / transcript) instead of the
+    // text model-driven eval. --replay-dir points at the recorded session
+    // JSONLs (default .crewhaus/voice-replays). Latency budgets via --max-*.
+    { name: "voice", takesValue: false },
+    { name: "replay-dir", takesValue: true },
+    { name: "max-ttft-ms", takesValue: true },
+    { name: "max-turn-latency-ms", takesValue: true },
+    { name: "max-barge-in-yield-ms", takesValue: true },
     { name: "help", short: "h" },
   ],
 };
@@ -1649,6 +1730,62 @@ const PII_SCHEMA: ParseArgsSchema = {
     // write the reviewed allow-list to <dir>/.crewhaus/pii-policy.json.
     { name: "write", takesValue: false },
     { name: "json", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
+// AUTOMATION-OPPORTUNITIES.md item 66 — `onchain tune|sentinel`.
+const ONCHAIN_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // receipt-history JSONL (default .crewhaus/onchain/receipts.jsonl).
+    { name: "history", takesValue: true },
+    // tune — headroom multiplier over observed max spend for the cap (default 1.25).
+    { name: "cap-margin", takesValue: true },
+    // tune — write the proposed transaction_policy SpecPatch here (default
+    // .crewhaus/onchain/policy-patch.json); advice-only when not whitelisted.
+    { name: "out", short: "o", takesValue: true },
+    // sentinel — baseline history to learn from. When omitted, sentinel
+    // self-compares --history against itself using a leave-one-out
+    // per-contract max (each receipt's ceiling excludes its own value) so a
+    // lone spike is still measured against its peers, not itself. When
+    // --baseline is given, --history is the candidate window instead.
+    { name: "baseline", takesValue: true },
+    // sentinel — anomaly threshold: flag spend > N× the per-contract max (default 2).
+    { name: "max-multiple", takesValue: true },
+    { name: "json", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
+// AUTOMATION-OPPORTUNITIES.md item 68 — `crewhaus loadtest`.
+const LOADTEST_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "concurrency", short: "c", takesValue: true },
+    // total requests to send (`-n`).
+    { name: "requests", short: "n", takesValue: true },
+    { name: "duration", takesValue: true },
+    { name: "rps", takesValue: true },
+    { name: "format", takesValue: true },
+    { name: "out", short: "o", takesValue: true },
+    // gate mode: exit 1 when p95 latency / error rate exceed the thresholds.
+    { name: "gate", takesValue: false },
+    { name: "max-p95-ms", takesValue: true },
+    { name: "max-error-rate", takesValue: true },
+    // deterministic stub-model latency (ms/request) for a credential-free run.
+    { name: "stub-latency-ms", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
+// AUTOMATION-OPPORTUNITIES.md item 67 — `crewhaus intents`.
+const INTENTS_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // how many of the cwd spec's most-recent sessions to scan (default 100; `all`).
+    { name: "sessions", takesValue: true },
+    { name: "format", takesValue: true },
+    { name: "out", short: "o", takesValue: true },
+    // how many entries to surface per view (default 5).
+    { name: "top", takesValue: true },
     { name: "help", short: "h" },
   ],
 };
@@ -2070,6 +2207,14 @@ async function runCompile(args: ParsedArgs): Promise<void> {
         "  Recompiling an unchanged spec is a no-op (`unchanged <name>@<v>`).\n" +
         "  --no-register  Skip the registry auto-put + changelog entry.\n" +
         "\n" +
+        "  --with-eval-harness  Also emit an eval bridge — a target: eval bundle\n" +
+        "             projected from THIS (non-cli) shape's own agent — into\n" +
+        "             <out-dir>/eval/, so the shape can consume its distilled\n" +
+        "             feedback through eval/optimize/flywheel. Rejected for cli\n" +
+        "             (use `crewhaus eval` directly) and multi-stage shapes.\n" +
+        "  --eval-dataset <name>  Dataset the bridge consumes (default\n" +
+        "             <specName>-eval).\n" +
+        "\n" +
         "  FR-002 — the strict scope gate runs by DEFAULT: the build fails\n" +
         "  (exit 1) if any I/O-capable tool the spec uses is left at a\n" +
         '  non-"external" scope. It flags:\n' +
@@ -2223,6 +2368,52 @@ async function runCompile(args: ParsedArgs): Promise<void> {
   // registers.
   if (register) await autoRegisterSpec(yamlText);
   logger.debug("compile.success", { files: bundle.files.length, out: absOut });
+
+  // Item 10 — `--with-eval-harness`: project this shape's lowered IR into a
+  // sibling `target: eval` bundle so a non-cli shape can consume its own
+  // distilled feedback through eval/optimize/flywheel. Emitted into
+  // <out-dir>/eval/. A cli/eval spec is rejected (nothing to bridge). Runs
+  // AFTER the primary bundle so a plain compile is byte-for-byte unaffected.
+  if (args.flags["with-eval-harness"] === true) {
+    const { emitEval } = await import("@crewhaus/target-eval-bundle");
+    // compile() already succeeded, so re-lowering for projection cannot throw.
+    const sourceIr = lower(parseSpec(yamlText));
+    const evalDatasetFlag = strFlag(args, "eval-dataset");
+    let projected: ReturnType<typeof projectEvalIr>;
+    try {
+      projected = projectEvalIr(sourceIr, {
+        ...(evalDatasetFlag !== undefined ? { datasetName: evalDatasetFlag } : {}),
+      });
+    } catch (err) {
+      if (err instanceof EvalBridgeError) die(err.message);
+      throw err;
+    }
+    const strategy = selectInvoker(sourceIr.target);
+    const evalOut = join(absOut, EVAL_BRIDGE_SUBDIR);
+    mkdirSync(evalOut, { recursive: true });
+    const evalBundle = emitEval(projected, { readme });
+    for (const file of evalBundle.files) {
+      const fullPath = join(evalOut, file.path);
+      if (file.path === "README.md" && existsSync(fullPath)) {
+        let existing: string;
+        try {
+          existing = readFileSync(fullPath, "utf-8");
+        } catch {
+          existing = "";
+        }
+        if (!existing.includes(GENERATED_README_MARKER)) {
+          process.stdout.write(
+            `kept ${fullPath} (not generated by crewhaus — pass --no-readme to skip README emission)\n`,
+          );
+          continue;
+        }
+      }
+      mkdirSync(dirname(fullPath), { recursive: true });
+      writeFileSync(fullPath, file.content);
+      process.stdout.write(`wrote ${fullPath}\n`);
+    }
+    process.stdout.write(`${describeBridge(projected, strategy)}\n`);
+  }
 
   // Item 33 — `--check`: verify the just-emitted bundle. Wired at the very
   // end of the compile path so a plain compile is byte-for-byte unaffected.
@@ -6609,6 +6800,59 @@ async function runEvalCoverage(args: ParsedArgs): Promise<void> {
   }
 }
 
+/**
+ * Item 65 — `crewhaus eval --voice`: replay recorded call-session logs through
+ * the voice grader pack (latency / barge-in / transcript). Reads every
+ * `*.jsonl` under --replay-dir (default `.crewhaus/voice-replays`), grades each
+ * against the latency budgets, renders a report, and writes a machine-readable
+ * `voice-eval.json`. Exits non-zero when any session fails a grader (a
+ * pre-deploy voice gate). Credential-free + deterministic — no live audio.
+ */
+async function runVoiceEval(args: ParsedArgs): Promise<void> {
+  const replayDir = resolve(strFlag(args, "replay-dir") ?? join(".crewhaus", "voice-replays"));
+  if (!existsSync(replayDir)) {
+    die(
+      `voice replay dir not found at ${replayDir} — record call sessions there (one <sessionId>.jsonl per call), or pass --replay-dir`,
+    );
+  }
+  const files = readdirSync(replayDir)
+    .filter((f) => f.endsWith(".jsonl"))
+    .sort();
+  if (files.length === 0) {
+    die(`no *.jsonl replay logs under ${replayDir}`);
+  }
+  const thresholds: VoiceThresholds = {
+    maxTtftMs: intFlag(args, "max-ttft-ms") ?? DEFAULT_VOICE_THRESHOLDS.maxTtftMs,
+    maxTurnLatencyMs:
+      intFlag(args, "max-turn-latency-ms") ?? DEFAULT_VOICE_THRESHOLDS.maxTurnLatencyMs,
+    maxBargeInYieldMs:
+      intFlag(args, "max-barge-in-yield-ms") ?? DEFAULT_VOICE_THRESHOLDS.maxBargeInYieldMs,
+  };
+  const results: VoiceSessionResult[] = [];
+  for (const f of files) {
+    const sessionId = f.slice(0, -".jsonl".length);
+    const jsonl = readFileSync(join(replayDir, f), "utf-8");
+    let result: VoiceSessionResult;
+    try {
+      result = gradeVoiceSession(parseReplayLog(sessionId, jsonl), thresholds);
+    } catch (err) {
+      if (err instanceof VoiceEvalError) die(err.message);
+      throw err;
+    }
+    results.push(result);
+  }
+  const summary = aggregateVoiceEval(results);
+  process.stdout.write(renderVoiceReport(summary));
+
+  const outDir = resolve(strFlag(args, "out") ?? join(".crewhaus", "evals", "voice"));
+  mkdirSync(outDir, { recursive: true });
+  writeFileSync(join(outDir, "voice-eval.json"), `${JSON.stringify(summary, null, 2)}\n`);
+  process.stdout.write(`[voice-eval] wrote ${join(outDir, "voice-eval.json")}\n`);
+
+  const failed = results.filter((r) => !r.passed).length;
+  if (failed > 0) process.exit(1);
+}
+
 async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
@@ -6667,6 +6911,12 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
         "  skips the run-history index/baselines/triage and the regression union (a probe,\n" +
         "  not lineage); --gate/--no-promote/--models are rejected with it.\n",
     );
+    return;
+  }
+  // Item 65 — voice replay eval branches off before the text-eval flags: it
+  // reads recorded call-session JSONLs, not a dataset/graders.yaml.
+  if (args.flags["voice"] === true) {
+    await runVoiceEval(args);
     return;
   }
   const specPath = args.positional[0];
@@ -13672,6 +13922,433 @@ async function runJustification(
  * `--dry-run` prints every network call with secrets redacted (env-refs as
  * `$NAME`, inline literals as `[redacted]`) and performs nothing.
  */
+/**
+ * Item 68 — `crewhaus loadtest <spec> [--concurrency N] [-n requests] [--rps R]`.
+ * Drive a daemon-shape harness (managed gateway / channel-bot / batch) under
+ * concurrent load and report throughput / p50/p95/p99 latency / error rate /
+ * cost per request. `--gate` exits 1 when p95 latency or error rate exceed the
+ * declared thresholds (a pre-deploy gate). Load flows through a real driver
+ * built here — the managed gateway's in-process `handle()` behind a stub/echo
+ * model — so no live server or provider key is needed.
+ */
+async function runLoadtestCmd(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"] === true) {
+    process.stdout.write(
+      "usage: crewhaus loadtest <spec.yaml> [-c/--concurrency N] [-n/--requests N] [--duration ms]\n" +
+        "                         [--rps R] [--format text|html|json] [-o <file>]\n" +
+        "                         [--gate --max-p95-ms N --max-error-rate 0.01]\n" +
+        "  Drive a daemon-shape harness (managed gateway / channel-bot / batch) under\n" +
+        "  concurrent load; report throughput, p50/p95/p99 latency, error rate, and\n" +
+        "  cost/req. Load flows through the shape's real entrypoint behind a stub/echo\n" +
+        "  model, so no live server or provider key is needed. --gate exits 1 when p95\n" +
+        "  latency or error rate exceed the declared thresholds (pre-deploy gate).\n",
+    );
+    return;
+  }
+  const format = strFlag(args, "format") ?? "text";
+  if (format !== "text" && format !== "html" && format !== "json") {
+    die(`--format must be "text", "html", or "json" (got "${format}")`);
+  }
+  const specPath = args.positional[0];
+  if (typeof specPath !== "string") die("missing <spec.yaml>");
+  const absSpec = resolve(specPath);
+  let yamlText: string;
+  try {
+    yamlText = readFileSync(absSpec, "utf-8");
+  } catch (err) {
+    die(`could not read ${absSpec}: ${(err as Error).message}`);
+  }
+  let ir: ReturnType<typeof lower>;
+  try {
+    ir = lower(parseSpec(yamlText));
+  } catch (err) {
+    if (err instanceof CrewhausError) die(err.message);
+    throw err;
+  }
+
+  // Deterministic stub latency per request (default 5ms) — makes a
+  // credential-free run reproducible + fast. The driver returns canned token
+  // usage so cost/req is exercised.
+  const stubLatencyMs = intFlag(args, "stub-latency-ms") ?? 5;
+  const driver = await buildLoadDriver(ir, yamlText, stubLatencyMs);
+
+  const concurrency = intFlag(args, "concurrency");
+  const requests = intFlag(args, "requests");
+  const duration = intFlag(args, "duration");
+  const rps = floatFlag(args, "rps");
+  const report = await runLoadtest(driver, {
+    ...(concurrency !== undefined ? { concurrency } : {}),
+    ...(requests !== undefined ? { requests } : {}),
+    ...(duration !== undefined ? { durationMs: duration } : {}),
+    ...(rps !== undefined ? { rps } : {}),
+  });
+
+  let verdict: ReturnType<typeof evaluateGate> | undefined;
+  if (args.flags["gate"] === true) {
+    const thresholds: GateThresholds = {
+      ...(intFlag(args, "max-p95-ms") !== undefined
+        ? { maxP95LatencyMs: intFlag(args, "max-p95-ms") }
+        : {}),
+      ...(floatFlag(args, "max-error-rate") !== undefined
+        ? { maxErrorRate: floatFlag(args, "max-error-rate") }
+        : {}),
+    };
+    verdict = evaluateGate(report, thresholds);
+  }
+
+  const rendered =
+    format === "json"
+      ? `${JSON.stringify(verdict !== undefined ? { ...report, gate: verdict } : report, null, 2)}\n`
+      : format === "html"
+        ? renderLoadtestHtml(report, verdict)
+        : renderLoadtestText(report, verdict);
+
+  const outPath = strFlag(args, "out");
+  if (outPath !== undefined) {
+    const abs = resolve(outPath);
+    mkdirSync(dirname(abs), { recursive: true });
+    writeFileSync(abs, rendered);
+    process.stdout.write(`[loadtest] wrote ${abs}\n`);
+  } else {
+    process.stdout.write(rendered);
+  }
+  if (verdict !== undefined && !verdict.passed) process.exit(1);
+}
+
+/**
+ * Item 68 — build the real LoadDriver for a lowered daemon-shape IR. For
+ * `managed` the driver drives the gateway-server's in-process `handle()` with a
+ * self-minted JWT + a generous tenant budget behind a stub/echo handler (no
+ * live provider). Other daemon shapes (channel/batch) use the same stub/echo
+ * driver directly. Non-daemon shapes are rejected. Deterministic:
+ * `stubLatencyMs` fixes each request's latency.
+ */
+async function buildLoadDriver(
+  ir: ReturnType<typeof lower>,
+  _yamlText: string,
+  stubLatencyMs: number,
+): Promise<LoadDriver> {
+  const DAEMON_TARGETS = new Set(["managed", "channel", "batch"]);
+  if (!DAEMON_TARGETS.has(ir.target)) {
+    die(
+      `loadtest supports daemon shapes (managed, channel, batch); got target: ${ir.target}. Non-daemon shapes have no concurrent request entrypoint to benchmark.`,
+    );
+  }
+  // A stub/echo "run" — canned token usage so cost/req is exercised, and a
+  // fixed latency so the run is deterministic + credential-free.
+  const stubUsage = { input: 32, output: 16 };
+  const echoOutcome = (): RequestOutcome => ({
+    ok: true,
+    latencyMs: stubLatencyMs,
+    tokens: stubUsage,
+  });
+
+  if (ir.target === "managed") {
+    const { PROTOCOL_VERSION, createGatewayServer, signJwt } = await import(
+      "@crewhaus/gateway-server"
+    );
+    const { buildTenant } = await import("@crewhaus/tenancy");
+    const secret = randomBytes(32).toString("hex");
+    const tenantId = "loadtest";
+    // A generous budget so the benchmark isn't throttled by the budget gate.
+    const base = buildTenant(tenantId, {});
+    const tenant = {
+      ...base,
+      budget: { maxInputTokens: Number.MAX_SAFE_INTEGER, maxOutputTokens: Number.MAX_SAFE_INTEGER },
+    };
+    const server = createGatewayServer({
+      jwtSecret: secret,
+      handler: async () => {
+        // The stub/echo handler stands in for the real run: it returns a canned
+        // result WITHOUT a provider call, so the gateway's auth + tenant +
+        // budget path is exercised under load, credential-free.
+        return { ok: true };
+      },
+      tenantOverrides: { [tenantId]: tenant },
+    });
+    const bearer = signJwt({ tenant_id: tenantId }, secret);
+    return async (idx: number): Promise<RequestOutcome> => {
+      const started = performance.now();
+      const res = (await server.handle({
+        bearer,
+        body: {
+          protocol: PROTOCOL_VERSION,
+          id: `req-${idx}`,
+          method: "runs.create",
+          params: { spec: "loadtest-spec", input: `load request ${idx}` },
+        },
+      })) as { error?: { code?: string; message?: string } };
+      await server.recordUsage(tenantId, stubUsage);
+      const latencyMs = stubLatencyMs > 0 ? stubLatencyMs : performance.now() - started;
+      if (res.error !== undefined) {
+        return { ok: false, latencyMs, errorKind: res.error.code ?? "error" };
+      }
+      return { ok: true, latencyMs, tokens: stubUsage };
+    };
+  }
+
+  // channel / batch — drive the stub/echo run directly (their real entrypoints
+  // are message/queue handlers with no credential-free offline harness here).
+  return async (): Promise<RequestOutcome> => echoOutcome();
+}
+
+/**
+ * Item 67 — `crewhaus intents [--sessions N|all] [--format text|html|json]`.
+ * Cluster user_message inputs across the cwd spec's recent sessions and rank
+ * them by frequency / satisfaction / failure, surfacing top / rising /
+ * low-satisfaction / unmet intents. Rendered examples are PII/secret-redacted.
+ */
+async function runIntents(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"] === true) {
+    process.stdout.write(
+      "usage: crewhaus intents [--sessions N|all] [--format text|html|json] [-o <file>] [--top N]\n" +
+        "  Cluster user questions across .crewhaus/sessions (this harness) and rank\n" +
+        "  by frequency, satisfaction (ratings), and failure (errors/loops/retries).\n" +
+        "  Surfaces top / rising / low-satisfaction / unmet intents. Rendered\n" +
+        "  examples are PII/secret-redacted. Feeds `dataset mine` / `faq distill`.\n",
+    );
+    return;
+  }
+  const format = strFlag(args, "format") ?? "text";
+  if (format !== "text" && format !== "html" && format !== "json") {
+    die(`--format must be "text", "html", or "json" (got "${format}")`);
+  }
+  const sessionsFlag = strFlag(args, "sessions");
+  const limit =
+    sessionsFlag === "all"
+      ? Number.POSITIVE_INFINITY
+      : sessionsFlag !== undefined
+        ? (intFlag(args, "sessions") ?? 100)
+        : 100;
+
+  const sessionsDir = join(process.cwd(), SESSIONS_SUBDIR);
+  const recent = sessionIdsByRecency(sessionsDir);
+  if (recent.length === 0) {
+    die(
+      `no sessions found under ${sessionsDir} — run the harness (crewhaus run) to accumulate user questions first`,
+    );
+  }
+  const ids = recent.slice(0, Number.isFinite(limit) ? (limit as number) : recent.length);
+  // Scan chronologically (oldest→newest) so the `order` ordinal + rising split
+  // reflect real recency.
+  const chronological = [...ids].reverse();
+  const perSession = chronological.map((id) => ({ sessionId: id, events: readSessionEvents(id) }));
+
+  const turns = orderedTurnsFromSessions(perSession, deriveTurns);
+  if (turns.length === 0) {
+    die("scanned sessions have no user turns to analyze");
+  }
+
+  // Feedback (event-log + web-UI sink) across the scanned sessions.
+  const feedback: FeedbackRecord[] = [];
+  for (const { events } of perSession) feedback.push(...extractFeedbackRecords(events));
+  feedback.push(...readFeedbackDir(join(process.cwd(), FEEDBACK_SUBDIR)));
+
+  // Struggle signals per turn — the same negative signals `dataset mine`
+  // recognizes (error / tool-error / loop / retry) mark UNMET intents.
+  const failedTurnKeys: TurnSignal[] = [];
+  for (const { sessionId, events } of perSession) {
+    for (const c of mineSession(sessionId, events)) {
+      failedTurnKeys.push({ sessionId: c.sessionId, turnNumber: c.turnNumber });
+    }
+  }
+
+  const topN = intFlag(args, "top");
+  const digest = clusterIntents(turns, feedback, failedTurnKeys, {
+    ...(topN !== undefined ? { topN } : {}),
+  });
+
+  // Redact every rendered example (representative + examples). Build the same
+  // detector set `faq`/`dataset synthesize` use.
+  const { createPiiRedactor } = await import("@crewhaus/pii-redactor");
+  const redactor = createPiiRedactor({ regexDetectors: SYNTHESIZE_PII_DETECTORS });
+  const redactCache = new Map<string, string>();
+  const redactStrings = new Set<string>();
+  for (const list of [
+    digest.intents,
+    digest.topIntents,
+    digest.risingIntents,
+    digest.lowSatisfactionIntents,
+    digest.unmetIntents,
+  ]) {
+    for (const i of list) {
+      redactStrings.add(i.representative);
+      for (const e of i.examples) redactStrings.add(e);
+    }
+  }
+  for (const s of redactStrings) redactCache.set(s, (await redactor.redact(s)).text);
+  const redacted = redactDigest(digest, (s) => redactCache.get(s) ?? s);
+
+  const rendered =
+    format === "json"
+      ? renderIntentsJson(redacted)
+      : format === "html"
+        ? renderIntentsHtml(redacted)
+        : renderIntentsText(redacted);
+
+  const outPath = strFlag(args, "out");
+  if (outPath !== undefined) {
+    const abs = resolve(outPath);
+    mkdirSync(dirname(abs), { recursive: true });
+    writeFileSync(abs, rendered);
+    process.stdout.write(`[intents] wrote ${abs}\n`);
+  } else {
+    process.stdout.write(rendered);
+  }
+}
+
+/**
+ * Item 66 — `crewhaus onchain tune|sentinel`. Reads the spec's current
+ * transaction_policy from its lowered IR (for tune's baseline + whitelisting)
+ * and a receipt-history JSONL, then either proposes a tuned policy (`tune`,
+ * writing a validated SpecPatch when the target whitelists transaction_policy)
+ * or flags anomalous spend vs a learned baseline (`sentinel`). Private keys /
+ * keyRefs never leave the spec — receipts carry only public tx metadata.
+ */
+async function runOnchain(args: ParsedArgs, action: "tune" | "sentinel"): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus onchain tune <spec.yaml> [--history <receipts.jsonl>] [--cap-margin 1.25] [-o <patch.json>]\n" +
+        "       crewhaus onchain sentinel <spec.yaml> [--history <candidate.jsonl>] [--baseline <baseline.jsonl>] [--max-multiple 2]\n" +
+        "\n" +
+        "  tune     — mine successful wallet-engine receipts to propose a\n" +
+        "             transaction_policy (maxValueWei from observed spend + margin,\n" +
+        "             allowedContracts from used ids). When the spec target\n" +
+        "             whitelists transaction_policy (onchain / onchain-game), a\n" +
+        "             validated SpecPatch is written for `optimize --write-back`;\n" +
+        "             otherwise the proposal is advice-only.\n" +
+        "  sentinel — flag anomalous spend (unknown contract id, or > N× the\n" +
+        "             per-contract observed max) against a learned baseline. Without\n" +
+        "             --baseline, self-compares --history using a leave-one-out\n" +
+        "             per-contract max so a lone spike is still caught.\n" +
+        "  --history defaults to .crewhaus/onchain/receipts.jsonl. No private keys\n" +
+        "  are ever read — receipts carry only contractId + wei value + status.\n",
+    );
+    return;
+  }
+  const specPath = args.positional[0];
+  if (typeof specPath !== "string") die("missing <spec.yaml>");
+  const absSpec = resolve(specPath);
+  let yamlText: string;
+  try {
+    yamlText = readFileSync(absSpec, "utf-8");
+  } catch (err) {
+    die(`could not read ${absSpec}: ${(err as Error).message}`);
+  }
+  let ir: ReturnType<typeof lower>;
+  try {
+    ir = lower(parseSpec(yamlText));
+  } catch (err) {
+    if (err instanceof CrewhausError) die(err.message);
+    throw err;
+  }
+
+  // Read the current transaction_policy off the lowered IR (onchain /
+  // onchain-game carry it directly; other shapes may carry it optionally).
+  const irPolicy = (ir as { transactionPolicy?: unknown }).transactionPolicy as
+    | {
+        maxValueWei?: string;
+        allowedContracts?: readonly string[];
+        simulationRequired?: boolean;
+      }
+    | undefined;
+  const current: CurrentPolicy = {
+    ...(irPolicy?.maxValueWei !== undefined ? { maxValueWei: irPolicy.maxValueWei } : {}),
+    ...(irPolicy?.allowedContracts !== undefined
+      ? { allowedContracts: irPolicy.allowedContracts }
+      : {}),
+    ...(irPolicy?.simulationRequired !== undefined
+      ? { simulationRequired: irPolicy.simulationRequired }
+      : {}),
+  };
+  // transaction_policy is optimizer-whitelisted only for the §47 onchain shapes.
+  const optimizable = ir.target === "onchain" || ir.target === "onchain-game";
+
+  const historyPath = resolve(
+    strFlag(args, "history") ?? join(".crewhaus", "onchain", "receipts.jsonl"),
+  );
+  if (!existsSync(historyPath)) {
+    die(
+      `receipt history not found at ${historyPath} — record wallet-engine receipts there (one JSON per line), or pass --history`,
+    );
+  }
+  const historyReceipts = parseReceiptHistory(readFileSync(historyPath, "utf-8"));
+
+  if (action === "tune") {
+    const capMargin = floatFlag(args, "cap-margin");
+    const proposal = proposePolicy(historyReceipts, current, {
+      optimizable,
+      target: ir.target,
+      ...(capMargin !== undefined ? { capMarginPct: capMargin } : {}),
+    });
+    if (args.flags["json"] === true) {
+      process.stdout.write(`${JSON.stringify(proposal, null, 2)}\n`);
+    } else {
+      process.stdout.write(renderTuneReport(proposal));
+    }
+    if (proposal.patch !== undefined) {
+      // Pick the SpecPatch op from the SAME parsed-CST existence check
+      // applySpecPatch itself uses (`doc.hasIn(path)` on the `yaml` package's
+      // parseDocument), not a second raw-text regex — a regex can disagree
+      // with the parsed check (e.g. `transaction_policy:` appearing only in a
+      // comment or inside a flow-context string), which would pick the wrong
+      // op and get the patch rejected by applySpecPatch's own existence
+      // check. Re-parsing here keeps the two checks structurally identical.
+      const hasBlock = parseDocument(yamlText).hasIn(proposal.patch.path);
+      const specPatch = {
+        target: proposal.patch.target,
+        path: proposal.patch.path,
+        op: hasBlock ? ("replace" as const) : ("add" as const),
+        value: proposal.patch.value,
+        rationale: proposal.patch.rationale,
+      };
+      const outPath = resolve(
+        strFlag(args, "out") ?? join(".crewhaus", "onchain", "policy-patch.json"),
+      );
+      mkdirSync(dirname(outPath), { recursive: true });
+      writeFileSync(outPath, `${JSON.stringify(specPatch, null, 2)}\n`);
+      process.stdout.write(`[onchain] wrote transaction_policy patch → ${outPath}\n`);
+    }
+    return;
+  }
+
+  // action === "sentinel"
+  const baselinePath = strFlag(args, "baseline");
+  const maxMultiple = intFlag(args, "max-multiple");
+  let anomalies: SpendAnomaly[];
+  if (baselinePath !== undefined) {
+    const absBaseline = resolve(baselinePath);
+    if (!existsSync(absBaseline)) die(`baseline history not found at ${absBaseline}`);
+    const baselineReceipts = parseReceiptHistory(readFileSync(absBaseline, "utf-8"));
+    const candidateReceipts = historyReceipts; // --history is the candidate window
+    const baseline = learnSpendBaseline(baselineReceipts);
+    anomalies = detectAnomalies(candidateReceipts, baseline, {
+      ...(maxMultiple !== undefined ? { maxMultiple } : {}),
+    });
+  } else {
+    // No --baseline: self-compare mode. Learning the baseline from — and then
+    // diffing against — the SAME history self-masks a value spike (its own
+    // value would be folded into its contract's baseline max, so it could
+    // never exceed maxMultiple × itself). Leave-one-out fixes this: each
+    // receipt's ceiling excludes its own value from the per-contract max.
+    anomalies = detectAnomaliesSelfCompare(historyReceipts, {
+      ...(maxMultiple !== undefined ? { maxMultiple } : {}),
+    });
+  }
+  if (args.flags["json"] === true) {
+    process.stdout.write(
+      `${JSON.stringify(
+        anomalies.map((a) => ({ ...a, valueWei: a.valueWei.toString() })),
+        null,
+        2,
+      )}\n`,
+    );
+  } else {
+    process.stdout.write(renderSentinelReport(anomalies));
+  }
+  if (anomalies.length > 0) process.exit(1);
+}
+
 async function runChannel(args: ParsedArgs, action: "provision" | "verify"): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
@@ -14394,6 +15071,39 @@ switch (subcommand) {
     await runChannel(parseFor(rest.slice(1), CHANNEL_SCHEMA), action);
     break;
   }
+  case "onchain": {
+    // Item 66 — tune (propose a transaction_policy) | sentinel (flag anomalous
+    // spend). Both take the <spec> positional after the action.
+    const action = rest[0] ?? "";
+    if (action !== "tune" && action !== "sentinel") {
+      die(`onchain action must be "tune" or "sentinel" (got "${action}")`);
+    }
+    try {
+      await runOnchain(parseFor(rest.slice(1), ONCHAIN_SCHEMA), action);
+    } catch (err) {
+      if (err instanceof CrewhausError || err instanceof OnchainTuneError) die(err.message);
+      throw err;
+    }
+    break;
+  }
+  case "intents":
+    // Item 67 — end-user intent analytics digest.
+    try {
+      await runIntents(parseFor(rest, INTENTS_SCHEMA));
+    } catch (err) {
+      if (err instanceof CrewhausError || err instanceof IntentsError) die(err.message);
+      throw err;
+    }
+    break;
+  case "loadtest":
+    // Item 68 — concurrency benchmark + deploy gate for daemon shapes.
+    try {
+      await runLoadtestCmd(parseFor(rest, LOADTEST_SCHEMA));
+    } catch (err) {
+      if (err instanceof CrewhausError || err instanceof LoadtestError) die(err.message);
+      throw err;
+    }
+    break;
   case "version":
   case "-v":
   case "--version":
