@@ -453,6 +453,12 @@ function lowerCompaction(spec: SpecWithPermissions): IrCompaction {
  * same-provider family qualifies); `cheapest` therefore resolves to the
  * provider's cheapest family. A non-`cheapest` value passes through verbatim.
  *
+ * The primary model lives in different places depending on target shape:
+ * `cli`/`managed`/`pipeline`/`research`/… carry it under `agent.model`, while
+ * `workflow`/`graph`/`crew` carry it as a required TOP-LEVEL `model` field
+ * (no `agent` block at all). `lowerCompaction` runs for every target, so this
+ * checks `agent.model` first and falls back to the top-level `model`.
+ *
  * When the primary is a provider the pricing table doesn't cover (local/,
  * azure/, a named host) `cheapest` cannot be resolved offline — the sentinel
  * is a compile ERROR there (the operator must name a concrete model), because
@@ -461,7 +467,8 @@ function lowerCompaction(spec: SpecWithPermissions): IrCompaction {
  */
 function resolveAuxModel(value: string, spec: SpecWithPermissions, slotLabel: string): string {
   if (value !== CHEAPEST_SENTINEL) return value;
-  const primary = (spec as { agent?: { model?: unknown } }).agent?.model;
+  const specLike = spec as { agent?: { model?: unknown }; model?: unknown };
+  const primary = specLike.agent?.model ?? specLike.model;
   if (typeof primary !== "string") {
     throw new CompilerError(
       `${slotLabel}: "cheapest" needs a primary agent.model to resolve against, but this spec has none`,

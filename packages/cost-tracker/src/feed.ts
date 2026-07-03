@@ -129,6 +129,13 @@ export function classifyPricingStaleness(
  *
  * Maintain by hand from provider deprecation notes - a stale entry is
  * harmless (it just over-warns), a missing one only means no warning.
+ *
+ * Maintain ALONGSIDE `DEFAULT_PRICING` (pricing.ts) and `DEFAULT_CAPABILITIES`
+ * (capabilities.ts): `enumerateCandidates`/`resolveCheapest` (candidates.ts)
+ * cross-reference this table to exclude sunset families from the `cheapest`
+ * sentinel's pool, so a family that goes end-of-life here should be checked
+ * against those two tables as well (and vice versa — adding a new family to
+ * pricing/capabilities is a good moment to check it isn't already sunset).
  */
 export type SunsetEntry = {
   readonly modelIdPrefix: string;

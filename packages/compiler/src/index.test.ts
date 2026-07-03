@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { findSunset } from "@crewhaus/cost-tracker";
 import type { IrNode } from "@crewhaus/ir";
 import { type Spec, parseSpec } from "@crewhaus/spec";
 import {
@@ -472,8 +473,27 @@ compaction:
 `);
     const ir = lower(spec);
     if (ir.target !== "cli") throw new Error("unexpected target");
-    // Cheapest anthropic family in DEFAULT_PRICING is claude-3-5-haiku.
-    expect(ir.compaction.model).toBe("claude-3-5-haiku");
+    // claude-3-5-haiku is nominally cheaper but is a KNOWN_SUNSETS family
+    // (retires 2026-10-01) — "cheapest" must skip it and resolve to the
+    // cheapest NON-sunset anthropic family, claude-haiku-4-5.
+    expect(ir.compaction.model).toBe("claude-haiku-4-5");
+  });
+
+  test('compaction.model "cheapest" never resolves to a KNOWN_SUNSETS model', () => {
+    const spec = parseSpec(`
+name: hello
+target: cli
+agent:
+  model: claude-opus-4-7
+  instructions: be helpful
+compaction:
+  model: cheapest
+`);
+    const ir = lower(spec);
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    const resolved = ir.compaction.model;
+    expect(resolved).toBeDefined();
+    expect(findSunset("anthropic", resolved as string)).toBeUndefined();
   });
 
   test('"cheapest" follows the primary provider (openai primary → openai aux)', () => {
@@ -520,6 +540,25 @@ compaction:
 `),
       ),
     ).toThrow(/cheapest/);
+  });
+
+  // Item 25/F3 — targets without an `agent` block (workflow/graph/crew) carry
+  // the primary model as a top-level `model` field. `resolveAuxModel` must
+  // fall back to it instead of only checking `agent.model`.
+  test('"cheapest" resolves against a top-level model on an agent-less target (workflow)', () => {
+    const spec = parseSpec(`
+name: hello-workflow
+target: workflow
+model: claude-opus-4-7
+steps:
+  - name: list
+    instructions: list files
+compaction:
+  model: cheapest
+`);
+    const ir = lower(spec);
+    if (ir.target !== "workflow") throw new Error("unexpected target");
+    expect(ir.compaction.model).toBe("claude-haiku-4-5");
   });
 });
 

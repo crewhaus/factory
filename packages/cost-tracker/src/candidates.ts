@@ -19,6 +19,7 @@ import {
   resolveCapabilities,
   satisfiesCapabilities,
 } from "./capabilities";
+import { findSunset } from "./feed";
 import { DEFAULT_PRICING, type PricingRow, type PricingTable, resolvePricing } from "./pricing";
 
 /** A model-router provider id (pricing/capability tables are keyed on these). */
@@ -71,6 +72,15 @@ export type EnumerateCandidatesOptions = {
   readonly sameProviderOnly?: boolean;
   /** Exclude the current model's own family from the candidate list. */
   readonly excludeCurrent?: boolean;
+  /**
+   * When true, drop families listed in `KNOWN_SUNSETS` for that provider —
+   * a candidate that is itself scheduled for retirement is never a good
+   * "replace this model" answer. The `cheapest` sentinel sets this (it
+   * resolves silently at compile time with no human review); market-scan
+   * defaults to false (its picks are eval-gated and human-reviewed before
+   * `--write`, and `doctor --models` separately flags a sunset pick).
+   */
+  readonly excludeSunsets?: boolean;
 };
 
 /**
@@ -81,8 +91,9 @@ export type EnumerateCandidatesOptions = {
  *
  * A candidate is included when: (a) it is in the pricing table, (b) it
  * satisfies every required capability (unknown-capability rows are excluded
- * when a requirement is set — never over-promise), and (c) it passes the
- * same-provider / exclude-current filters.
+ * when a requirement is set — never over-promise), (c) it passes the
+ * same-provider / exclude-current filters, and (d) — when `excludeSunsets`
+ * is set — it is not itself a `KNOWN_SUNSETS` family for that provider.
  */
 export function enumerateCandidates(
   current: { readonly provider: CandidateProvider; readonly modelId: string },
@@ -105,6 +116,9 @@ export function enumerateCandidates(
     if (table === undefined) continue;
     for (const [familyPrefix, row] of Object.entries(table)) {
       if (opts.excludeCurrent && provider === current.provider && familyPrefix === currentFamily) {
+        continue;
+      }
+      if (opts.excludeSunsets && findSunset(provider, familyPrefix) !== undefined) {
         continue;
       }
       if (require !== undefined) {
@@ -211,6 +225,12 @@ export function resolveCheapestForSlot(
  * inherits the primary's credentials and, for compaction, benefits from cache
  * continuity — a `cheapest` that hopped providers would silently need another
  * key.
+ *
+ * Sunset families are unconditionally excluded: `cheapest` resolves silently
+ * at compile time with no human in the loop, so it must never hand back a
+ * model `doctor --models` would immediately flag for migration. (Contrast
+ * market-scan's `enumerateCandidates` call, which leaves sunsets in — its
+ * picks are eval-gated and human-reviewed before `--write`.)
  */
 export function resolveCheapest(
   current: { readonly provider: CandidateProvider; readonly modelId: string },
@@ -225,6 +245,7 @@ export function resolveCheapest(
     ...(opts.capabilities !== undefined ? { capabilities: opts.capabilities } : {}),
     ...(opts.require !== undefined ? { require: opts.require } : {}),
     sameProviderOnly: true,
+    excludeSunsets: true,
   });
   return candidates[0];
 }

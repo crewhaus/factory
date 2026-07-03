@@ -18,6 +18,12 @@
  * (a family whose members differ takes the SHARED-subset capabilities so a
  * `cheapest`/right-size pick never over-promises).
  *
+ * A THIRD table rides alongside these two: `KNOWN_SUNSETS` in feed.ts. When a
+ * family is retired here or in pricing.ts, check whether it also needs a
+ * `KNOWN_SUNSETS` entry (or an existing entry's `replacement` needs updating)
+ * — `resolveCheapest`/`enumerateCandidates` cross-reference all three so the
+ * `cheapest` sentinel never resolves to a model on its way out.
+ *
  * The flag set mirrors `ProviderFeatures` in `@crewhaus/adapter-anthropic`:
  *   caching: "explicit" | "automatic" | false
  *   tool_use, vision, thinking, web_search: boolean

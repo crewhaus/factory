@@ -12,7 +12,10 @@ import {
   resolveCheapestForSlot,
   specStringFor,
 } from "./candidates";
+import { DEFAULT_CAPABILITIES } from "./capabilities";
 import type { CapabilityTable } from "./capabilities";
+import { KNOWN_SUNSETS, findSunset } from "./feed";
+import { DEFAULT_PRICING } from "./pricing";
 import type { PricingTable } from "./pricing";
 
 // Small seeded tables so enumeration/ranking is legible.
@@ -144,6 +147,41 @@ describe("enumerateCandidates", () => {
       "openai/gpt-big",
     ]);
   });
+
+  // F2 — `excludeSunsets` drops KNOWN_SUNSETS families from the pool.
+  // `enumerateCandidates` checks family prefixes against the REAL
+  // `KNOWN_SUNSETS` table (not an injectable one), so the fixture below uses
+  // "claude-3-5-haiku" — a real KNOWN_SUNSETS.anthropic entry — as its
+  // cheapest family to exercise the actual exclusion path.
+  const PRICING_WITH_REAL_SUNSET: PricingTable = {
+    version: "test",
+    providers: {
+      anthropic: {
+        "claude-opus": { inputPer1M: 15, outputPer1M: 75 },
+        "claude-sonnet": { inputPer1M: 3, outputPer1M: 15 },
+        "claude-haiku-4-5": { inputPer1M: 1, outputPer1M: 5 },
+        // Cheapest by price, but a KNOWN_SUNSETS.anthropic family.
+        "claude-3-5-haiku": { inputPer1M: 0.8, outputPer1M: 4 },
+      },
+    },
+  };
+
+  test("excludeSunsets: false (default) includes a KNOWN_SUNSETS family", () => {
+    const cands = enumerateCandidates(
+      { provider: "anthropic", modelId: "claude-opus" },
+      { pricing: PRICING_WITH_REAL_SUNSET, sameProviderOnly: true },
+    );
+    expect(cands[0]?.modelString).toBe("claude-3-5-haiku");
+  });
+
+  test("excludeSunsets: true drops the KNOWN_SUNSETS family, next-cheapest wins", () => {
+    const cands = enumerateCandidates(
+      { provider: "anthropic", modelId: "claude-opus" },
+      { pricing: PRICING_WITH_REAL_SUNSET, sameProviderOnly: true, excludeSunsets: true },
+    );
+    expect(cands.some((c) => c.modelString === "claude-3-5-haiku")).toBe(false);
+    expect(cands[0]?.modelString).toBe("claude-haiku-4-5");
+  });
 });
 
 describe("familyPrefixOf", () => {
@@ -189,6 +227,36 @@ describe("resolveCheapest sentinel", () => {
       { pricing: PRICING, capabilities: CAPS },
     );
     expect(cheapest?.provider).toBe("anthropic");
+  });
+
+  // F2 — against the REAL DEFAULT_PRICING table, "cheapest" for an anthropic
+  // primary must not resolve to claude-3-5-haiku (a KNOWN_SUNSETS family,
+  // retires 2026-10-01) even though it is the cheapest blended row; it must
+  // resolve to the cheapest NON-sunset family instead.
+  test("never resolves to a KNOWN_SUNSETS model (DEFAULT_PRICING, anthropic primary)", () => {
+    const cheapest = resolveCheapest(
+      { provider: "anthropic", modelId: "claude-opus-4-7" },
+      { pricing: DEFAULT_PRICING, capabilities: DEFAULT_CAPABILITIES },
+    );
+    expect(cheapest).toBeDefined();
+    expect(findSunset("anthropic", cheapest?.familyPrefix as string)).toBeUndefined();
+    expect(cheapest?.modelString).toBe("claude-haiku-4-5");
+  });
+
+  test("resolveCheapestForSlot never resolves to a KNOWN_SUNSETS model", () => {
+    const resolved = resolveCheapestForSlot("claude-opus-4-7", {
+      pricing: DEFAULT_PRICING,
+      capabilities: DEFAULT_CAPABILITIES,
+    });
+    expect(resolved).toBe("claude-haiku-4-5");
+    expect(findSunset("anthropic", resolved as string)).toBeUndefined();
+  });
+
+  test("KNOWN_SUNSETS.anthropic sanity: claude-3-5-haiku is indeed listed", () => {
+    // Guards the two tests above against KNOWN_SUNSETS itself changing shape
+    // silently (if this ever fails, the "cheapest" tests above may need a
+    // different sunset family to stay meaningful).
+    expect(KNOWN_SUNSETS.anthropic?.some((e) => e.modelIdPrefix === "claude-3-5-haiku")).toBe(true);
   });
 });
 
