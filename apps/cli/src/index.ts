@@ -377,6 +377,18 @@ import {
   buildCalibrationFile,
   renderCalibrationCard,
 } from "./judge-calibrate";
+// AUTOMATION-OPPORTUNITIES.md item 52 — `crewhaus justification calibrate` +
+// `justification preflight` core (replay the intent gate over durable
+// permission_justification_evaluated records, compare to per-tool outcome,
+// propose a confidence threshold, flag disagreements). Side-effect-free.
+import {
+  buildToolOutcomes,
+  calibrateJustification,
+  extractJustificationRecords,
+  preflightJustification,
+  renderCalibrationLines,
+  renderPreflightLines,
+} from "./justification-calibrate";
 // FR-004 — Pillar 3 intent-gate judge + durable audit-sink resolution, in a
 // side-effect-free module so it is unit-testable (this entry file runs an
 // argv switch on import).
@@ -1256,6 +1268,21 @@ const PII_SCHEMA: ParseArgsSchema = {
     { name: "secret", takesValue: true },
     // write the reviewed allow-list to <dir>/.crewhaus/pii-policy.json.
     { name: "write", takesValue: false },
+    { name: "json", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
+// AUTOMATION-OPPORTUNITIES.md item 52 — `justification calibrate|preflight`.
+const JUSTIFICATION_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // calibrate — how many recent sessions to fold for the outcome proxy.
+    { name: "sessions", takesValue: true },
+    // harness root that owns .crewhaus/ (mirrors `security digest --dir`).
+    { name: "dir", takesValue: true },
+    // preflight — the session goal (spec agent.instructions) is read from the
+    // <spec> positional; this overrides it for ad-hoc replay.
+    { name: "goal", takesValue: true },
     { name: "json", takesValue: false },
     { name: "help", short: "h" },
   ],
@@ -10194,6 +10221,127 @@ async function runPiiTune(args: ParsedArgs): Promise<void> {
 }
 
 /**
+ * AUTOMATION-OPPORTUNITIES.md item 52 — `crewhaus justification calibrate` +
+ * `justification preflight <spec>`.
+ *
+ * calibrate — replay the intent gate's history: fold durable
+ *   `permission_justification_evaluated` records against the per-tool outcome
+ *   proxy (session `tool_stats` error rate) to compute allow-agreement + a
+ *   false-block estimate, propose a tuned confidence threshold, and flag
+ *   high-disagreement tools (allowed but mostly errored).
+ *
+ * preflight <spec> — dry-run the rule-based judge over the historical
+ *   justifications using the spec's `agent.instructions` as the session goal,
+ *   reporting the would-be allow/deny split + flips vs the stored verdicts,
+ *   BEFORE deploy. Offline + credential-free (the LLM-judge path needs a live
+ *   model, which preflight deliberately does not spin up).
+ */
+async function runJustification(
+  args: ParsedArgs,
+  action: "calibrate" | "preflight",
+): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus justification calibrate [--sessions N|all] [--dir <root>] [--json]\n" +
+        "       crewhaus justification preflight [<spec.yaml>] [--goal <text>] [--dir <root>] [--json]\n" +
+        "\n" +
+        "  calibrate   replay .crewhaus/audit permission_justification_evaluated records\n" +
+        "              against the per-tool outcome proxy (tool_stats error rate): allow/\n" +
+        "              deny agreement, false-block estimate, a proposed confidence\n" +
+        "              threshold, and high-disagreement tools\n" +
+        "  preflight   dry-run the rule-based judge over historical justifications using\n" +
+        "              the spec's agent.instructions as the session goal, before deploy\n" +
+        "\n" +
+        "  --sessions N|all  sessions folded for the outcome proxy (default 50)\n" +
+        "  --goal <text>     preflight session goal override (else the spec's instructions)\n" +
+        "  --dir <root>      harness root that owns .crewhaus/ (default: cwd)\n" +
+        "  --json            machine-readable output\n",
+    );
+    return;
+  }
+
+  const dirFlag = args.flags["dir"];
+  const rootDir = typeof dirFlag === "string" ? resolve(dirFlag) : process.cwd();
+
+  // Read the durable justification records from .crewhaus/audit.
+  const auditDir = join(rootDir, ".crewhaus", "audit");
+  const auditObjects: unknown[] = [];
+  if (existsSync(auditDir)) {
+    for (const f of readdirSync(auditDir).sort()) {
+      if (!f.endsWith(".jsonl")) continue;
+      auditObjects.push(...parseAdviseJsonl(readFileSync(join(auditDir, f), "utf-8")));
+    }
+  }
+  const records = extractJustificationRecords(auditObjects);
+
+  if (action === "preflight") {
+    // Session goal: --goal > the positional spec's agent.instructions > "".
+    let goal = strFlag(args, "goal");
+    const specArg = args.positional[0];
+    if (goal === undefined && specArg !== undefined) {
+      const specPath = resolve(rootDir, specArg);
+      if (!existsSync(specPath)) die(`spec not found at ${specPath}`);
+      try {
+        const spec = parseSpec(readFileSync(specPath, "utf-8"));
+        const agent = (spec as unknown as Record<string, unknown>)["agent"];
+        const instr = (agent as Record<string, unknown> | undefined)?.["instructions"];
+        if (typeof instr === "string") goal = instr;
+      } catch (err) {
+        die(`could not parse ${specPath}: ${(err as Error).message}`);
+      }
+    }
+    const result = await preflightJustification(records, goal ?? "");
+    if (args.flags["json"] === true) {
+      process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+      return;
+    }
+    process.stdout.write(`justification preflight: ${rootDir}\n`);
+    if (records.length === 0) {
+      process.stdout.write(
+        "  no permission_justification_evaluated records in .crewhaus/audit — run the agent (justification audit is on by default), then preflight\n",
+      );
+    }
+    for (const line of renderPreflightLines(result)) process.stdout.write(`  ${line}\n`);
+    return;
+  }
+
+  // calibrate — fold the per-tool outcome proxy from recent sessions under
+  // <rootDir> (read directly so --dir works; readRecentSessionEvents is
+  // cwd-bound).
+  const limit = parseSessionsLimit(args, 50);
+  const sessionsDir = join(rootDir, ".crewhaus", "sessions");
+  const sessions: SessionEvents[] = [];
+  if (existsSync(sessionsDir)) {
+    const ranked = readdirSync(sessionsDir)
+      .filter((f) => f.endsWith(".jsonl"))
+      .map((f) => ({
+        file: join(sessionsDir, f),
+        id: f.replace(/\.jsonl$/, ""),
+        mtimeMs: statSync(join(sessionsDir, f)).mtimeMs,
+      }))
+      .sort((a, b) => b.mtimeMs - a.mtimeMs);
+    const chosen = limit === "all" ? ranked : ranked.slice(0, limit);
+    for (const { file, id } of chosen) {
+      sessions.push({ sessionId: id, objects: parseAdviseJsonl(readFileSync(file, "utf-8")) });
+    }
+  }
+  const outcomes = buildToolOutcomes(sessions);
+  const result = calibrateJustification(records, outcomes);
+
+  if (args.flags["json"] === true) {
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    return;
+  }
+  process.stdout.write(`justification calibrate: ${rootDir}\n`);
+  if (records.length === 0) {
+    process.stdout.write(
+      "  no permission_justification_evaluated records in .crewhaus/audit — run the agent (justification audit is on by default), then calibrate\n",
+    );
+  }
+  for (const line of renderCalibrationLines(result)) process.stdout.write(`  ${line}\n`);
+}
+
+/**
  * Item 61 — `crewhaus channel provision|verify <spec.yaml>`: one-command
  * platform-side setup + scope doctor for channel-target specs. Everything is
  * derived from the spec + the adapters' actual API usage (see
@@ -10777,6 +10925,19 @@ switch (subcommand) {
     }
     try {
       await runPiiTune(parseFor(rest.slice(1), PII_SCHEMA));
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
+    break;
+  }
+  case "justification": {
+    const action = rest[0] ?? "";
+    if (action !== "calibrate" && action !== "preflight") {
+      die(`justification action must be "calibrate" or "preflight" (got "${action}")`);
+    }
+    try {
+      await runJustification(parseFor(rest.slice(1), JUSTIFICATION_SCHEMA), action);
     } catch (err) {
       if (err instanceof CrewhausError) die(err.message);
       throw err;
