@@ -71,7 +71,7 @@ import {
   tagRules,
 } from "@crewhaus/permission-engine";
 import { runChatLoop } from "@crewhaus/runtime-core";
-import { createSessionStore } from "@crewhaus/session-store";
+import { createSessionStore, evictExpiredSessions } from "@crewhaus/session-store";
 import { createSkillTool, discoverSkills } from "@crewhaus/skills-registry";
 import { loadCommands } from "@crewhaus/slash-commands";
 import { type Spec, parseSpec } from "@crewhaus/spec";
@@ -500,6 +500,8 @@ import {
   renderSecurityDigestHtml,
   renderSecurityDigestText,
 } from "./security-digest";
+// Item #57 — summarize sessions into a durable index before TTL eviction.
+import { SESSIONS_INDEX_DIRNAME, summarizeSessionIntoIndex } from "./sessions-index";
 // Item 69 — `crewhaus state backup|restore` core (tarball snapshot of the
 // cwd `.crewhaus` state dir + full/merge restore), in a module with no
 // import-time side effects so it is unit-testable (this entry file runs an
@@ -991,6 +993,22 @@ const LESSONS_SCHEMA: ParseArgsSchema = {
   ],
 };
 
+// Item #57 — `crewhaus sessions summarize`: fold sessions into a durable index
+// (on demand, or before TTL eviction with --evicted).
+const SESSIONS_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // Only summarize sessions last modified strictly BEFORE this date (ISO or
+    // epoch-ms). Omitted → every session in the store.
+    { name: "before", takesValue: true },
+    // Run a TTL eviction pass and summarize each session into the index BEFORE
+    // it is unlinked (the summarize-before-evict hook).
+    { name: "evicted", takesValue: false },
+    // TTL for the --evicted eviction pass (days). Default: session-store's 30.
+    { name: "ttl-days", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
 // Item 12 — the dataset-registry CLI face (`datasets list|get|put`).
 const DATASETS_SCHEMA: ParseArgsSchema = {
   flags: [
@@ -1319,6 +1337,8 @@ function usageText(): string {
     "       [--min-score F] [--min-occurrences N] [-o <skill-dir>]",
     "  lessons update [--sessions N|all]    mine corrections + failures into an auto-loaded LESSONS.md (#56)",
     "       [--low-score F] [-o <LESSONS.md>]  + per-user prefs under .crewhaus/preferences/",
+    "  sessions summarize [--before <date>] summarize sessions into a durable index before TTL eviction (#57)",
+    "       [--evicted] [--ttl-days N]        --evicted indexes each session just before it is deleted",
     "  datasets list                        all registered datasets + versions (Section 29)",
     "  datasets get <name>[@version]        print a dataset's samples as JSONL",
     "       [--split train|dev|test]",
@@ -7700,6 +7720,77 @@ async function runLessons(args: ParsedArgs): Promise<void> {
   }
 }
 
+/**
+ * Item #57 — `crewhaus sessions summarize [--before <date>] [--evicted]`. Folds
+ * sessions into the durable `.crewhaus/sessions-index/` before their raw
+ * transcripts are lost to TTL eviction. With `--evicted` it runs an actual TTL
+ * eviction pass with the summarize-before-evict hook wired, so an expiring
+ * session is indexed the instant before it is unlinked; otherwise it summarizes
+ * the sessions currently on disk (optionally only those older than `--before`).
+ */
+async function runSessions(args: ParsedArgs): Promise<void> {
+  const action = args.positional[0];
+  if (args.flags["help"] === true && action === undefined) {
+    process.stdout.write(
+      "usage: crewhaus sessions summarize [--before <date>] [--evicted] [--ttl-days N]\n" +
+        "  Summarize sessions (outcome, tools, ratings, key facts) into the durable\n" +
+        "  .crewhaus/sessions-index/ before their transcripts expire (30-day TTL).\n" +
+        "  --evicted runs a TTL eviction pass and indexes each session just before it is deleted.\n",
+    );
+    return;
+  }
+  if (action !== "summarize") {
+    die(`sessions: unknown action "${action ?? ""}" — supported: summarize`);
+  }
+  const sessionsDir = join(process.cwd(), SESSIONS_SUBDIR);
+  const indexDir = join(process.cwd(), ".crewhaus", SESSIONS_INDEX_DIRNAME);
+
+  if (args.flags["evicted"] === true) {
+    // Summarize-before-evict: wire the session-store hook so each expiring
+    // session is indexed the instant before its files are unlinked.
+    const ttlDays = intFlag(args, "ttl-days") ?? undefined;
+    let indexed = 0;
+    const { evictedIds } = await evictExpiredSessions({
+      rootDir: sessionsDir,
+      ...(ttlDays !== undefined ? { ttlDays } : {}),
+      onBeforeEvict: async (id, rootDir) => {
+        const s = summarizeSessionIntoIndex(id, join(rootDir, `${id}.jsonl`), indexDir);
+        if (s !== undefined) indexed += 1;
+      },
+    });
+    process.stdout.write(
+      `[sessions] evicted ${evictedIds.length} expired session(s); indexed ${indexed} into ${indexDir}\n`,
+    );
+    return;
+  }
+
+  // On-demand: summarize every session on disk (optionally only those older
+  // than --before).
+  let beforeMs: number | undefined;
+  const beforeArg = strFlag(args, "before");
+  if (beforeArg !== undefined) {
+    const parsed = /^\d+$/.test(beforeArg) ? Number.parseInt(beforeArg, 10) : Date.parse(beforeArg);
+    if (Number.isNaN(parsed))
+      die(`invalid --before "${beforeArg}" — expected ISO date or epoch-ms`);
+    beforeMs = parsed;
+  }
+  const ids = listSessionIds(sessionsDir);
+  if (ids.length === 0) die(`no sessions found under ${sessionsDir}`);
+  let indexed = 0;
+  for (const id of ids) {
+    const logPath = join(sessionsDir, `${id}.jsonl`);
+    if (beforeMs !== undefined) {
+      let mtimeMs = Number.POSITIVE_INFINITY;
+      try {
+        mtimeMs = statSync(logPath).mtimeMs;
+      } catch {}
+      if (mtimeMs >= beforeMs) continue;
+    }
+    if (summarizeSessionIntoIndex(id, logPath, indexDir) !== undefined) indexed += 1;
+  }
+  process.stdout.write(`[sessions] summarized ${indexed} session(s) into ${indexDir}\n`);
+}
+
 // -------- item 4: crewhaus graders suggest --------
 
 /**
@@ -9540,6 +9631,16 @@ switch (subcommand) {
     // into a deduped LESSONS.md + per-user prefs. Failures route through die().
     try {
       await runLessons(parseFor(rest, LESSONS_SCHEMA));
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
+    break;
+  case "sessions":
+    // Item #57 — `sessions summarize`: fold sessions into the durable index
+    // (on demand or via the summarize-before-evict hook). Failures → die().
+    try {
+      await runSessions(parseFor(rest, SESSIONS_SCHEMA));
     } catch (err) {
       if (err instanceof CrewhausError) die(err.message);
       throw err;
