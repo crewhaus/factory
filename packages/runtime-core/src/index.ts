@@ -95,6 +95,7 @@ import {
   attachDefaultSubscribers,
 } from "./observability";
 import { loadProjectMemory } from "./project-memory";
+import type { SloMitigationSink, SloTargets } from "./slo-monitor";
 import { type CliOutput, createCliOutput, isSpinnerEnabled } from "./spinner";
 
 /**
@@ -210,6 +211,25 @@ export {
   type AttachDefaultSubscribersOptions,
   attachDefaultSubscribers,
 } from "./observability";
+
+// Ops item 37 — SLO monitor seams re-exported so the CLI/codegen can build the
+// injected mitigation ladder (audit / pause-intake / rollback) it passes as
+// `RunChatLoopOptions.sloSink`, and the doctor probe can share the breach types.
+export {
+  type AttachedSloMonitor,
+  type AttachSloMonitorOptions,
+  type SloBreach,
+  type SloMitigationEvent,
+  type SloMitigationRung,
+  type SloMitigationSink,
+  type SloTargets,
+  type SloWindowMetrics,
+  DEFAULT_SLO_WINDOW_MS,
+  MIN_SLO_SAMPLES,
+  SloWindow,
+  attachSloMonitor,
+  detectSloBreaches,
+} from "./slo-monitor";
 
 // Ops item 32 — incident collector seams re-exported so the CLI can share the
 // raw-capture shape + trigger classifier with `incident collect`.
@@ -626,6 +646,17 @@ export type RunChatLoopOptions = {
   alertSink?: AlertSink;
   /** Item 31 — override the per-session metrics-history dir (tests/tenants). */
   alertMetricsDir?: string;
+  /**
+   * Ops item 37 — lowered `observability.slo` targets (gated by CREWHAUS_SLO).
+   * When supplied, the runtime SLO monitor folds live events into rolling
+   * windows and walks the declared mitigation ladder on a sustained breach.
+   * Omitted → no monitor (zero behaviour change). The CLI `run` path lowers
+   * the cwd spec's `observability.slo` block and wires the mitigation sink.
+   */
+  sloTargets?: SloTargets;
+  /** Item 37 — injected SLO mitigation ladder delivery (audit / pause-intake /
+   *  rollback), supplied by the CLI so runtime-core owns no deploy/gateway I/O. */
+  sloSink?: SloMitigationSink;
   /**
    * Ops item 32 — spec identity stamped into an auto-assembled incident
    * capture (gated by CREWHAUS_INCIDENTS). Absent → the capture records a null
@@ -1135,6 +1166,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   const subscribers = await attachDefaultSubscribers(bus, runContext, process.env, {
     ...(opts.alertSink !== undefined ? { alertSink: opts.alertSink } : {}),
     ...(opts.alertMetricsDir !== undefined ? { metricsDir: opts.alertMetricsDir } : {}),
+    ...(opts.sloTargets !== undefined ? { sloTargets: opts.sloTargets } : {}),
+    ...(opts.sloSink !== undefined ? { sloSink: opts.sloSink } : {}),
   });
 
   // Ops item 32 — auto-assemble an incident bundle on the first failure-class

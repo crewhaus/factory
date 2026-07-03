@@ -30,6 +30,7 @@ import type {
   IrMemory,
   IrModelTiers,
   IrNode,
+  IrObservability,
   IrPermissions,
   IrPipelineV0,
   IrResearchV0,
@@ -733,6 +734,49 @@ function lowerMemory(spec: SpecWithMemory): { memory?: IrMemory } {
   };
 }
 
+type SpecWithObservability = {
+  readonly observability?: {
+    readonly slo?: {
+      readonly error_rate?: number;
+      readonly p95_latency_ms?: number;
+      readonly ttft_ms?: number;
+      readonly cost_per_hour_usd?: number;
+      readonly egress_block_rate?: number;
+      readonly window_seconds?: number;
+      readonly mitigation?: ReadonlyArray<"alert" | "pause-intake" | "rollback">;
+    };
+  };
+};
+
+/**
+ * Ops item 37 — lower the cross-cutting `observability` block, mirroring
+ * lowerMemory's spread-return-{} discipline (Pillar 1): the key is absent from
+ * the IR when the spec omits the block. `slo.window_seconds` is folded to
+ * `windowMs` (ms) at lower time so the runtime monitor reads a literal duration;
+ * `mitigation` defaults to `["alert"]` here so an observe-only spec that lists
+ * thresholds without a ladder still warns (the safe rung). Targets are carried
+ * verbatim from snake_case spec keys to camelCase IR keys.
+ */
+function lowerObservability(spec: SpecWithObservability): { observability?: IrObservability } {
+  const o = spec.observability;
+  if (o === undefined) return {};
+  const slo = o.slo;
+  if (slo === undefined) return { observability: {} };
+  return {
+    observability: {
+      slo: {
+        ...(slo.error_rate !== undefined ? { errorRate: slo.error_rate } : {}),
+        ...(slo.p95_latency_ms !== undefined ? { p95LatencyMs: slo.p95_latency_ms } : {}),
+        ...(slo.ttft_ms !== undefined ? { ttftMs: slo.ttft_ms } : {}),
+        ...(slo.cost_per_hour_usd !== undefined ? { costPerHourUsd: slo.cost_per_hour_usd } : {}),
+        ...(slo.egress_block_rate !== undefined ? { egressBlockRate: slo.egress_block_rate } : {}),
+        ...(slo.window_seconds !== undefined ? { windowMs: slo.window_seconds * 1000 } : {}),
+        mitigation: slo.mitigation !== undefined ? [...slo.mitigation] : ["alert"],
+      },
+    },
+  };
+}
+
 /**
  * Section 47 — normalise the cross-cutting blockchain subsystem blocks
  * (chains / wallets / contracts / transaction_policy). Each block is
@@ -885,6 +929,7 @@ export function lower(spec: Spec): IrNode {
         ...lowerSecurity(spec),
         ...lowerFeedback(spec),
         ...lowerMemory(spec),
+        ...lowerObservability(spec),
         // Phase 3 §3.3 — CLI banner config. Plus Phase 2 M2.2 TUI mode
         // gate. Only included when the spec author opted in (cli block
         // and its fields are optional).
@@ -945,6 +990,7 @@ export function lower(spec: Spec): IrNode {
         ...lowerBudget(spec),
         ...lowerFeedback(spec),
         ...lowerMemory(spec),
+        ...lowerObservability(spec),
         // Phase 3 §3.1 — heartbeat. Duration string ("2h", "30m") is
         // parsed once at lower time so codegen emits a literal numeric
         // setInterval arg in ms.
@@ -1011,6 +1057,7 @@ export function lower(spec: Spec): IrNode {
         ...lowerFailureTaxonomy(spec),
         ...lowerBudget(spec),
         ...lowerMemory(spec),
+        ...lowerObservability(spec),
       } satisfies IrManagedV0;
     case "pipeline":
       return {

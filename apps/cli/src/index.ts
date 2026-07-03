@@ -746,6 +746,11 @@ import {
 } from "./security-digest";
 // Item #57 — summarize sessions into a durable index before TTL eviction.
 import { SESSIONS_INDEX_DIRNAME, summarizeSessionIntoIndex } from "./sessions-index";
+// Item 37 — SLO/TTFT doctor probe + mitigation-ladder sink, in side-effect-free
+// modules (this entry file runs an argv switch on import) mirroring
+// doctor-checks.ts / alert-sink.ts.
+import { runSloProbe } from "./slo-doctor";
+import { buildSloSink, intakeGatePayload } from "./slo-sink";
 // Item 69 — `crewhaus state backup|restore` core (tarball snapshot of the
 // cwd `.crewhaus` state dir + full/merge restore), in a module with no
 // import-time side effects so it is unit-testable (this entry file runs an
@@ -999,6 +1004,11 @@ const DOCTOR_SCHEMA: ParseArgsSchema = {
     // Item 24 — model advisory: flag spec models missing from the pricing
     // table (silently billed $0), pricing-table staleness, and known sunsets.
     { name: "models", takesValue: false },
+    // Item 37 — SLO/TTFT probe: compare recent p95 TTFT vs the cwd spec's
+    // observability.slo.ttft_ms and name faster candidates on a breach.
+    // Container-HEALTHCHECK exit semantics (0 within/no-data, 1 breach).
+    { name: "slo", takesValue: false },
+    { name: "ttft", takesValue: false },
     { name: "help", short: "h" },
   ],
 };
@@ -3674,6 +3684,122 @@ async function runRunCli(
     });
   }
 
+  // Item 37 — SLO monitor targets + mitigation ladder. Targets come from the
+  // lowered `observability.slo` block; the monitor itself is gated inside
+  // runtime-core by CREWHAUS_SLO. Here we build its injected mitigation sink:
+  //   - audit        → the same .crewhaus/audit hash chain the alert sink uses;
+  //   - alert        → reuses the settings.json alert hook / webhook;
+  //   - pause-intake → flips the durable .crewhaus/slo/intake.json gate the
+  //                    gateway/managed daemon reads for its 429 budget_exceeded
+  //                    path (only meaningful for those shapes; harmless else);
+  //   - rollback     → auto-rollback the "prod" env pin via the deployment-
+  //                    controller when the cwd carries a spec-registry.
+  // Only opened when CREWHAUS_SLO is set AND the spec declared SLO targets.
+  const sloEnabled = process.env["CREWHAUS_SLO"] === "1" || process.env["CREWHAUS_SLO"] === "true";
+  const sloIr = (ir as { observability?: { slo?: import("@crewhaus/runtime-core").SloTargets } })
+    .observability?.slo;
+  let sloTargets: import("@crewhaus/runtime-core").SloTargets | undefined;
+  let sloSink: ReturnType<typeof buildSloSink>;
+  if (sloEnabled && sloIr !== undefined) {
+    sloTargets = sloIr;
+    const { openAuditLog } = await import("@crewhaus/audit-log");
+    const sloAudit = await openAuditLog({ rootDir: join(cwd, ".crewhaus", "audit") });
+    // Read alerts.webhook again (independent best-effort; same source as alerts).
+    let webhookUrl: string | undefined;
+    const settingsPath = join(cwd, ".crewhaus", "settings.json");
+    if (existsSync(settingsPath)) {
+      try {
+        webhookUrl = alertWebhookFromSettings(JSON.parse(readFileSync(settingsPath, "utf-8")));
+      } catch {
+        // ignore — surfaced elsewhere.
+      }
+    }
+    const alertHooks = hooks.filter((h) => h.event === "alert");
+    const wantsAlert = sloTargets.mitigation.includes("alert");
+    const wantsPause = sloTargets.mitigation.includes("pause-intake");
+    const wantsRollback = sloTargets.mitigation.includes("rollback");
+    sloSink = buildSloSink({
+      audit: sloAudit,
+      ...(wantsAlert
+        ? {
+            alert: async (event): Promise<void> => {
+              const payload = { ...event.breach, sessionId: event.sessionId, rung: event.rung };
+              if (alertHooks.length > 0) {
+                await runHooks("alert", payload, alertHooks, { matcherKey: "metric" });
+              }
+              if (webhookUrl !== undefined) {
+                try {
+                  await fetch(webhookUrl, {
+                    method: "POST",
+                    headers: { "content-type": "application/json" },
+                    body: JSON.stringify(payload),
+                  });
+                } catch (err) {
+                  process.stderr.write(
+                    `[slo] alert webhook failed: ${err instanceof Error ? err.message : String(err)}\n`,
+                  );
+                }
+              }
+            },
+          }
+        : {}),
+      ...(wantsPause
+        ? {
+            pauseIntake: async (paused, reason): Promise<void> => {
+              const gatePath = join(cwd, ".crewhaus", "slo", "intake.json");
+              mkdirSync(dirname(gatePath), { recursive: true });
+              writeFileSync(
+                gatePath,
+                `${JSON.stringify(intakeGatePayload(paused, reason), null, 2)}\n`,
+              );
+              process.stderr.write(
+                `[slo] intake ${paused ? "PAUSED" : "resumed"} → ${gatePath} (${reason})\n`,
+              );
+            },
+          }
+        : {}),
+      ...(wantsRollback
+        ? {
+            rollback: async (event): Promise<void> => {
+              // Auto-rollback the "prod" env pin to the prior version via the
+              // deployment-controller. Requires a cwd spec-registry; degrades to
+              // an audited no-op (a warning) when none exists.
+              const specRootDir = join(cwd, ".crewhaus", "spec-registry");
+              if (!existsSync(specRootDir)) {
+                process.stderr.write(
+                  "[slo] rollback requested but no .crewhaus/spec-registry — skipping (alert/pause-intake still applied)\n",
+                );
+                return;
+              }
+              const { createFileBackedRegistry } = await import("@crewhaus/spec-registry");
+              const { createDeploymentController } = await import(
+                "@crewhaus/deployment-controller"
+              );
+              const registry = createFileBackedRegistry({ rootDir: specRootDir });
+              const versions = await registry.list(ir.name);
+              const current = await registry.aliasFor(ir.name, "prod");
+              const prior = versions.filter((v) => v !== current).at(-1);
+              if (prior === undefined) {
+                process.stderr.write(
+                  "[slo] rollback: no prior version to roll back to — skipping\n",
+                );
+                return;
+              }
+              const controller = createDeploymentController({
+                registry,
+                auditLog: sloAudit,
+                actor: "slo-monitor",
+              });
+              await controller.rollback(ir.name, "prod", prior);
+              process.stderr.write(
+                `[slo] auto-rolled-back ${ir.name} prod → ${prior} (SLO breach: ${event.breach.detail})\n`,
+              );
+            },
+          }
+        : {}),
+    });
+  }
+
   // Feature #53 — first-class `memory:` block. Its presence wires Remember/
   // Recall into the tool list (no hand-editing) and — via the auto-* switches
   // — the runtime's auto-recall (system-prompt injection) and auto-capture
@@ -3839,6 +3965,10 @@ async function runRunCli(
       ...(egressAuditSink !== undefined ? { egressAuditSink } : {}),
       ...(egressMatcher !== undefined ? { egressMatcher } : {}),
       ...(alertSink !== undefined ? { alertSink } : {}),
+      // Item 37 — SLO monitor targets + injected mitigation ladder (gated by
+      // CREWHAUS_SLO inside runtime-core).
+      ...(sloTargets !== undefined ? { sloTargets } : {}),
+      ...(sloSink !== undefined ? { sloSink } : {}),
       // Item 32 — stamp the spec name into any auto-assembled incident capture
       // (gated by CREWHAUS_INCIDENTS inside runtime-core).
       incidentSpec: { name: ir.name },
@@ -4115,6 +4245,10 @@ async function runDoctor(args: ParsedArgs): Promise<void> {
         "  --accept-baseline        promote the current findings to the accepted baseline\n" +
         "  --liveness               process-liveness probe: exit 0 immediately, no credential or\n" +
         "                           spec checks (for container HEALTHCHECKs / k8s exec probes)\n" +
+        "  --slo | --ttft           compare recent p95 TTFT (.crewhaus/metrics/sessions.jsonl)\n" +
+        "                           against the cwd spec's observability.slo.ttft_ms; on a breach,\n" +
+        "                           name faster candidate models to eval. Exit 1 on breach, else 0\n" +
+        "                           (container-HEALTHCHECK / k8s exec-probe semantics)\n" +
         "  --context-pressure       report truncation recoveries, compaction fires per session\n" +
         "                           (snip vs autocompact split), and the cwd spec's max_tokens/\n" +
         "                           compaction knobs over the last N sessions (--sessions N,\n" +
@@ -4157,6 +4291,10 @@ async function runDoctor(args: ParsedArgs): Promise<void> {
   }
   if (args.flags["models"]) {
     runDoctorModels();
+    return;
+  }
+  if (args.flags["slo"] || args.flags["ttft"]) {
+    await runDoctorSlo();
     return;
   }
   if (args.flags["detect"]) {
@@ -4381,6 +4519,44 @@ async function runPricing(args: ParsedArgs, action: string): Promise<void> {
   process.stdout.write(
     `  ${providers} provider table(s); the newest dated feed here now overrides DEFAULT_PRICING\n`,
   );
+}
+
+/**
+ * Item 37 — `crewhaus doctor --slo` (alias `--ttft`): the latency/TTFT half of
+ * the SLO feature. Reads the cwd spec's lowered `observability.slo.ttft_ms` +
+ * agent model, compares the RECENT p95 TTFT (from the alert-watchdog's durable
+ * `.crewhaus/metrics/sessions.jsonl`) against the target, and on a breach names
+ * faster candidate models to eval. Exits with the probe's code so it composes
+ * with `doctor --liveness`'s container-HEALTHCHECK semantics (0 within SLO / no
+ * data, 1 breach). The heavy lifting lives in slo-doctor.ts (side-effect-free).
+ */
+async function runDoctorSlo(): Promise<void> {
+  const cwd = process.cwd();
+  const specPath = join(cwd, "crewhaus.yaml");
+  let ttftTargetMs: number | undefined;
+  let currentModel: string | undefined;
+  if (existsSync(specPath)) {
+    try {
+      const ir = lower(parseSpec(readFileSync(specPath, "utf-8")));
+      const obs = (ir as { observability?: { slo?: { ttftMs?: number } } }).observability;
+      ttftTargetMs = obs?.slo?.ttftMs;
+      const agent = (ir as { agent?: { model?: unknown } }).agent;
+      if (agent !== undefined && typeof agent.model === "string") currentModel = agent.model;
+    } catch {
+      // A non-parseable / non-agent spec leaves the probe with no target — it
+      // then reports "nothing declared" and exits 0 (never fails on spec shape).
+    }
+  }
+  const sessionsPath = join(cwd, ".crewhaus", "metrics", "sessions.jsonl");
+  const sessionsJsonl = existsSync(sessionsPath) ? readFileSync(sessionsPath, "utf-8") : "";
+  const result = runSloProbe({
+    ttftTargetMs,
+    currentModel,
+    sessionsJsonl,
+    pricing: loadUserPricing(),
+  });
+  for (const line of result.lines) process.stdout.write(`${line}\n`);
+  process.exit(result.exitCode);
 }
 
 /**

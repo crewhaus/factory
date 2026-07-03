@@ -41,6 +41,12 @@ import {
   detectBreaches,
   readMetricsHistory,
 } from "./alert-watchdog";
+import {
+  type AttachedSloMonitor,
+  type SloMitigationSink,
+  type SloTargets,
+  attachSloMonitor,
+} from "./slo-monitor";
 
 export type AttachedSubscribers = {
   printer: AttachedPrinter | undefined;
@@ -240,6 +246,11 @@ export type AttachDefaultSubscribersOptions = {
   readonly metricsDir?: string;
   /** Item 31 — durable + off-box alert delivery (see {@link AlertSink}). */
   readonly alertSink?: AlertSink;
+  /** Item 37 — lowered `observability.slo` targets. The SLO monitor is a no-op
+   *  without both this AND CREWHAUS_SLO set. */
+  readonly sloTargets?: SloTargets;
+  /** Item 37 — injected SLO mitigation ladder delivery (see {@link SloMitigationSink}). */
+  readonly sloSink?: SloMitigationSink;
 };
 
 export async function attachDefaultSubscribers(
@@ -303,6 +314,16 @@ export async function attachDefaultSubscribers(
   // raises an alert per breach (trace event + injected audit/hook sinks).
   const watchdog = attachAlertWatchdog(bus, runContext, env, options);
 
+  // Ops item 37 — production-signal SLO monitor, opt-in via CREWHAUS_SLO=1 AND a
+  // lowered `observability.slo` block. Folds events into rolling windows; a
+  // periodic timer evaluates them and walks the declared mitigation ladder
+  // (alert → pause-intake → rollback) on a sustained breach via the injected
+  // sink. No targets / env off ⇒ undefined (zero overhead).
+  const sloMonitor: AttachedSloMonitor | undefined = attachSloMonitor(bus, runContext, env, {
+    ...(options.sloTargets !== undefined ? { targets: options.sloTargets } : {}),
+    ...(options.sloSink !== undefined ? { sink: options.sloSink } : {}),
+  });
+
   const flushAll = async (): Promise<void> => {
     printer?.finalize();
     const tasks: Promise<void>[] = [];
@@ -317,6 +338,14 @@ export async function attachDefaultSubscribers(
     // must never break flushAll, so its own finalize swallows/logs internally.
     if (watchdog !== undefined) {
       await watchdog.finalize().catch((err) => logFlushError(runContext, "alert-watchdog", err));
+    }
+    // A final SLO evaluation at flush so a breach that formed late in a short
+    // run (below the periodic timer's first tick) still walks the ladder, then
+    // stop the timer so it never outlives the run.
+    if (sloMonitor !== undefined) {
+      await sloMonitor.evaluate().catch((err) => logFlushError(runContext, "slo-monitor", err));
+      sloMonitor.stop();
+      sloMonitor.unsubscribe();
     }
   };
   const shutdownAll = async (): Promise<void> => {
@@ -335,6 +364,10 @@ export async function attachDefaultSubscribers(
     if (watchdog !== undefined) {
       await watchdog.finalize().catch((err) => logFlushError(runContext, "alert-watchdog", err));
       watchdog.unsubscribe();
+    }
+    if (sloMonitor !== undefined) {
+      sloMonitor.stop();
+      sloMonitor.unsubscribe();
     }
   };
   return {
