@@ -1,10 +1,13 @@
+import { createHash } from "node:crypto";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { type PiiDetector, detectPii } from "@crewhaus/pii-redactor";
 import {
   type PromptInjectionResult,
   REGEX_RULES,
   classifyText,
 } from "@crewhaus/prompt-injection-detector";
+import { SYNTHESIZE_PII_DETECTORS } from "./dataset-mine";
 
 /**
  * AUTOMATION-OPPORTUNITIES.md item 50 — `crewhaus security corpus` core: a
@@ -47,6 +50,20 @@ import {
  * genuinely exists — it can never inject a bogus regression case or smuggle
  * terminal-escape content into the corpus. Every id is length-clamped and
  * control-char-stripped before use.
+ *
+ * `candidate-rules.json` is a SEPARATE, weaker-signal file (see "Candidate new
+ * detector rules" below): `suspicious` tool outputs (near-misses) ARE durable
+ * in the session log — the runtime only warns on `suspicious`, it does not
+ * redact — so this path DOES start from harvested content, unlike
+ * `corpus.json` above. That content is redacted through the same strong
+ * secret+PII detector set the dataset/knowledge synthesis paths use before it
+ * is ever clustered, and the persisted file stores only a short hash-first
+ * descriptor per cluster sample (`describeSample`) — never the redacted
+ * snippet itself, so a redactor miss cannot round-trip a usable secret/PII
+ * fragment into a committed file. See F1 (2026-07 fix) — an earlier version
+ * of this module persisted lightly-redacted snippets and overstated "no raw
+ * values retained" for this path; that has been corrected in both the code
+ * and this doc.
  */
 
 const MS_PER_DAY = 86_400_000;
@@ -254,6 +271,17 @@ export type CorpusCase = {
   /** Deterministic positive fixture the detector must still block. Assembled
    *  at runtime; never a harvested attack payload. */
   readonly exemplar: string;
+  /**
+   * The exemplar's classification tier AT BUILD TIME (F2). `check` compares
+   * the CURRENT classification against this recorded baseline rather than a
+   * fixed "not clean" floor — a rule that used to earn `malicious` and now
+   * only reaches `suspicious` is real protection lost (only `malicious`
+   * redacts at runtime; `suspicious` content is passed through verbatim), so
+   * that drift must fail even though `suspicious !== clean`. A case built
+   * BEFORE this field existed (no `baselineTier` in the loaded JSON) falls
+   * back to the pre-F2 "not clean" floor — see `checkSecurityCorpus`.
+   */
+  readonly baselineTier: PromptInjectionResult["classification"];
 };
 
 export type SecurityCorpus = {
@@ -271,13 +299,16 @@ export type SecurityCorpus = {
 /**
  * Build the regression corpus from a harvest. One case per observed rule that
  * has a canonical exemplar; observed-but-exemplar-less rules are kept
- * separately as gaps. Deterministic given (harvest, generatedAt).
+ * separately as gaps. Deterministic given (harvest, generatedAt) — `async`
+ * because each case's `baselineTier` (F2) is the exemplar's CURRENT
+ * classification, recorded once at build time so `check` can detect a later
+ * downward drift rather than only an absolute drop to `clean`.
  */
-export function buildSecurityCorpus(
+export async function buildSecurityCorpus(
   harvest: HarvestResult,
   windowLabel: string,
   generatedAt: string = new Date().toISOString(),
-): SecurityCorpus {
+): Promise<SecurityCorpus> {
   const cases: CorpusCase[] = [];
   const withoutExemplar: ObservedRuleHit[] = [];
   for (const hit of harvest.ruleHits) {
@@ -286,7 +317,8 @@ export function buildSecurityCorpus(
       withoutExemplar.push(hit);
       continue;
     }
-    cases.push({ rule: hit.rule, observed: hit.count, exemplar });
+    const { classification: baselineTier } = await classifyText(exemplar);
+    cases.push({ rule: hit.rule, observed: hit.count, exemplar, baselineTier });
   }
   return {
     version: 1,
@@ -332,21 +364,38 @@ export function loadSecurityCorpus(path: string): SecurityCorpus | undefined {
 // Regression check
 // ---------------------------------------------------------------------------
 
+/** Ordinal rank for a classification tier — higher is "more flagged". Used to
+ *  detect DOWNWARD drift (F2), not just an absolute floor. */
+const TIER_RANK: Readonly<Record<PromptInjectionResult["classification"], number>> = {
+  clean: 0,
+  suspicious: 1,
+  malicious: 2,
+};
+
 export type CorpusCheckCaseResult = {
   readonly rule: string;
   /** Current detector classification of the exemplar. */
   readonly classification: PromptInjectionResult["classification"];
+  /** The tier this case was pinned at when the corpus was built (F2). Cases
+   *  loaded from a pre-F2 corpus file have no recorded baseline; see
+   *  `checkSecurityCorpus` for the fallback in that case. */
+  readonly baselineTier: PromptInjectionResult["classification"] | undefined;
   /**
-   * Passed = the exemplar is still FLAGGED (classification !== "clean").
+   * Passed = the CURRENT tier has not dropped below the RECORDED baseline
+   * tier (F2: drift, not an absolute `=== malicious` floor).
    *
-   * Deliberately "not clean" rather than "=== malicious": a single medium-
-   * severity rule only reaches `suspicious` on its own, and the detector's
-   * probabilistic-OR score makes the exact tier of a canonical single-rule
-   * exemplar an implementation detail. The regression this guards against is a
-   * rule that used to catch an attack now letting it through ENTIRELY (→
-   * `clean`); a `malicious`→`suspicious` drift is not a security hole (the
-   * content is still surfaced to the operator) and must not red a CI gate.
-   * `classification` is retained on the row so a tier drop stays visible.
+   * At runtime only `malicious` redacts a tool output; `suspicious` content
+   * is passed through to the model verbatim (only logged/warned). So a rule
+   * that used to earn `malicious` and has drifted down to `suspicious` is
+   * real protection lost, even though the exemplar is still "not clean" —
+   * `stillBlocked` catches that drift where a bare `!== "clean"` check would
+   * pass it. A rule whose baseline was only ever `suspicious` (a single
+   * medium-severity rule, or a multi-rule payload that only reaches
+   * `suspicious` on its own — the detector's probabilistic-OR score makes the
+   * exact tier of a canonical single-rule exemplar an implementation detail)
+   * still passes as long as it holds at `suspicious`; it only fails if it
+   * drops all the way to `clean`. Pre-F2 corpus cases with no recorded
+   * baseline fall back to that same "not clean" floor.
    */
   readonly stillBlocked: boolean;
 };
@@ -359,11 +408,15 @@ export type CorpusCheckResult = {
 };
 
 /**
- * Run every corpus case against the CURRENT detector and fail if any
- * previously-flagged exemplar now classifies `clean` (a detector regression —
- * the rule stopped catching the attack it was built for). Exit-code-usable:
- * the CLI maps `verdict === "fail"` to a non-zero exit. Uses `classifyText`
- * with production defaults (no LLM layer), so the check is deterministic and
+ * Run every corpus case against the CURRENT detector and fail if any case's
+ * classification has DRIFTED DOWN from its recorded `baselineTier` (F2) — a
+ * detector regression, whether that drop is malicious→suspicious (real
+ * protection lost: only `malicious` redacts at runtime) or a drop all the way
+ * to `clean` (the rule stopped catching the attack entirely). A case with no
+ * recorded baseline (loaded from a pre-F2 corpus file) falls back to the
+ * original "not clean" floor. Exit-code-usable: the CLI maps
+ * `verdict === "fail"` to a non-zero exit. Uses `classifyText` with
+ * production defaults (no LLM layer), so the check is deterministic and
  * offline.
  */
 export async function checkSecurityCorpus(corpus: SecurityCorpus): Promise<CorpusCheckResult> {
@@ -371,10 +424,15 @@ export async function checkSecurityCorpus(corpus: SecurityCorpus): Promise<Corpu
   const holding: CorpusCheckCaseResult[] = [];
   for (const c of corpus.cases) {
     const result = await classifyText(c.exemplar);
-    const stillBlocked = result.classification !== "clean";
+    const baselineTier = c.baselineTier;
+    const stillBlocked =
+      baselineTier === undefined
+        ? result.classification !== "clean"
+        : TIER_RANK[result.classification] >= TIER_RANK[baselineTier];
     const row: CorpusCheckCaseResult = {
       rule: c.rule,
       classification: result.classification,
+      baselineTier,
       stillBlocked,
     };
     if (stillBlocked) holding.push(row);
@@ -427,17 +485,59 @@ export const NEAR_MISS_SIGNALS: ReadonlyArray<{ signal: string; test: RegExp }> 
   },
 ];
 
-/** Redact anything PII/secret-shaped from a near-miss snippet before it is
- *  written to the reviewed candidate file (defense-in-depth; the snippet came
- *  from a suspicious tool output). Deterministic, no raw values retained. */
+/**
+ * JWT and PEM-block detectors, composed alongside `dataset-mine.ts`'s
+ * `SYNTHESIZE_PII_DETECTORS` (SSN/credit-card/phone/email/IBAN + sk-/ghp_/
+ * xoxb-/AKIA/Bearer/contextual-opaque) so `redactSnippet` catches the two
+ * common secret shapes that set does not: a base64url JWT (`eyJ…`, 3
+ * dot-separated segments) and a PEM key/cert block (`-----BEGIN … KEY-----`).
+ * Assembled here (not added to `SYNTHESIZE_PII_DETECTORS` itself) to keep
+ * this module's redaction surface independently reviewable — see F1.
+ */
+const CANDIDATE_SECRET_DETECTORS: ReadonlyArray<PiiDetector> = [
+  ...SYNTHESIZE_PII_DETECTORS,
+  { kind: "jwt", regex: /\bey[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g },
+  {
+    kind: "pem",
+    regex:
+      /-----BEGIN [A-Z ]*(?:PRIVATE KEY|CERTIFICATE)-----[\s\S]*?-----END [A-Z ]*(?:PRIVATE KEY|CERTIFICATE)-----/g,
+  },
+];
+
+/**
+ * Redact anything PII/secret-shaped from a near-miss snippet, run through the
+ * SAME strong detector set the dataset/knowledge synthesis paths use
+ * (`SYNTHESIZE_PII_DETECTORS`, plus JWT/PEM — see `CANDIDATE_SECRET_DETECTORS`)
+ * rather than the narrow ad hoc email/blob/digit patterns this used to apply.
+ * This is used ONLY for in-memory clustering (dedup/support counting); the
+ * PERSISTED `candidate-rules.json` never stores this snippet at all — see
+ * `hashDescriptor` and F1. Deterministic, no raw values retained.
+ */
 export function redactSnippet(text: string): string {
-  return text
-    .replace(CONTROL_CHAR_PATTERN, " ")
-    .replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, "[EMAIL]")
+  const stripped = text.replace(CONTROL_CHAR_PATTERN, " ");
+  const hits = detectPii(stripped, CANDIDATE_SECRET_DETECTORS);
+  let out = stripped;
+  // Longest-match-first so a shorter hit can't chew a substring of a longer
+  // one (mirrors @crewhaus/pii-redactor's applyReplacements ordering).
+  for (const hit of [...hits].sort((a, b) => b.value.length - a.value.length)) {
+    if (hit.value.length === 0) continue;
+    out = out.split(hit.value).join(`[${hit.kind.toUpperCase()}]`);
+  }
+  return out
     .replace(/\b[A-Za-z0-9+/]{20,}={0,2}\b/g, "[BLOB]")
     .replace(/\b\d{4,}\b/g, "[NUM]")
     .slice(0, 200)
     .trim();
+}
+
+/** First 16 hex chars of SHA-256(redacted snippet) — a stable, non-reversible
+ *  descriptor for the reviewer's dedup/audit trail. Deliberately NOT an HMAC
+ *  (no per-tenant secret is plumbed into this module; this hash is a display
+ *  aid, not an allow-list key like `pii-redactor`'s `hmacValue`), and hashed
+ *  AFTER redaction so it identifies a "shape" (redacted form), never a raw
+ *  secret/PII value. */
+export function hashDescriptor(redacted: string): string {
+  return createHash("sha256").update(redacted).digest("hex").slice(0, 16);
 }
 
 export type CandidateRule = {
@@ -446,12 +546,33 @@ export type CandidateRule = {
   readonly signal: string;
   /** How many distinct near-miss snippets clustered under this signal. */
   readonly support: number;
-  /** Up to a few redacted sample snippets, for the reviewer. */
+  /**
+   * Up to a few short, fully-redacted descriptors of clustered snippets, for
+   * the reviewer's context — NEVER a raw or lightly-redacted sample. Each
+   * entry is `hash:<16-hex>` `[<kinds redacted>]` `<short prefix>` where the
+   * prefix has already passed through `redactSnippet`'s strong secret+PII
+   * detector set and is clamped to `SAMPLE_PREFIX_LENGTH` chars. See F1.
+   */
   readonly samples: ReadonlyArray<string>;
   /** A conservative proposed regex SOURCE (string, never compiled/merged). */
   readonly proposedPattern: string;
   readonly note: string;
 };
+
+/** Short human-readable prefix length kept in a persisted sample descriptor
+ *  — long enough to give a reviewer a shape hint, short enough that even a
+ *  redactor miss can't leave a usable secret/PII fragment (see F1: dashed
+ *  SSNs, short API-key tails, and phone fragments must not survive). */
+const SAMPLE_PREFIX_LENGTH = 24;
+
+/** Build the persisted, hash-first descriptor for one clustered snippet. The
+ *  snippet has ALREADY passed through `redactSnippet`'s strong detector set;
+ *  this additionally truncates hard to `SAMPLE_PREFIX_LENGTH` so no full-length
+ *  secret — redacted or not — round-trips into `candidate-rules.json`. */
+export function describeSample(redactedSnippet: string): string {
+  const prefix = redactedSnippet.slice(0, SAMPLE_PREFIX_LENGTH).trim();
+  return `hash:${hashDescriptor(redactedSnippet)} ${prefix}`;
+}
 
 export type CandidateRulesFile = {
   readonly version: 1;
@@ -521,7 +642,10 @@ export function clusterCandidateRules(
   for (const { signal, test } of NEAR_MISS_SIGNALS) {
     const set = bySignal.get(signal);
     if (set === undefined || set.size < minSupport) continue;
-    const samples = [...set].sort().slice(0, 3);
+    // Sort/slice on the (already redacted) snippet for determinism, THEN
+    // reduce each to a hash-first short descriptor — no redacted snippet,
+    // however strong the redactor, round-trips into the persisted file. F1.
+    const samples = [...set].sort().slice(0, 3).map(describeSample);
     candidates.push({
       id: `candidate-${signal}`,
       signal,
@@ -545,7 +669,9 @@ export function renderCorpusBuildLines(corpus: SecurityCorpus): ReadonlyArray<st
     `window ${corpus.windowLabel}: ${corpus.cases.length} regression case(s) from observed blocks, ${corpus.withoutExemplar.length} observed rule(s) without an exemplar`,
   );
   for (const c of corpus.cases) {
-    lines.push(`  ✓ ${c.rule} — observed ${c.observed}× → regression case pinned`);
+    lines.push(
+      `  ✓ ${c.rule} — observed ${c.observed}× → regression case pinned (baseline tier "${c.baselineTier}")`,
+    );
   }
   for (const g of corpus.withoutExemplar) {
     lines.push(`  ~ ${g.rule} — observed ${g.count}× but no canonical exemplar (corpus gap)`);
@@ -560,11 +686,13 @@ export function renderCorpusCheckLines(result: CorpusCheckResult): ReadonlyArray
   const lines: string[] = [];
   for (const r of result.regressions) {
     lines.push(
-      `  ✗ REGRESSION ${r.rule} — exemplar now classifies "${r.classification}", was blocked`,
+      `  ✗ REGRESSION ${r.rule} — exemplar now classifies "${r.classification}", baseline was "${r.baselineTier ?? "unknown (pre-F2 corpus)"}"`,
     );
   }
   for (const r of result.holding) {
-    lines.push(`  ✓ ${r.rule} — still blocked`);
+    lines.push(
+      `  ✓ ${r.rule} — still "${r.classification}" (baseline "${r.baselineTier ?? "unknown"}")`,
+    );
   }
   lines.push(
     `corpus check: ${result.verdict} (${result.holding.length}/${result.checked} still blocked, ${result.regressions.length} regression(s))`,

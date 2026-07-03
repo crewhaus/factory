@@ -9904,12 +9904,17 @@ async function runSecurityDigest(args: ParsedArgs): Promise<void> {
  * (one case per rule observed blocking, pinned to a canonical exemplar built
  * at runtime — never a stored attack payload), and cluster suspicious near-
  * misses into REVIEWED candidate detector rules at `candidate-rules.json`
- * (never auto-merged into REGEX_RULES). See security-corpus.ts for the
- * durability + no-raw-payload design.
+ * (never auto-merged into REGEX_RULES; samples are redacted through the same
+ * strong secret+PII detector set the dataset/knowledge synthesis paths use
+ * and reduced to a short hash-first descriptor — never a raw or lightly-
+ * redacted snippet). See security-corpus.ts for the durability + no-raw-
+ * value design.
  *
  * `security corpus check` — run the corpus against the CURRENT detector and
- * exit non-zero if any previously-blocked exemplar now passes (a detector
- * regression). CI-usable.
+ * exit non-zero if any exemplar's classification has DRIFTED DOWN from the
+ * tier recorded at build time (F2) — e.g. malicious→suspicious, not only a
+ * drop all the way to clean, since only `malicious` redacts at runtime.
+ * CI-usable.
  */
 async function runSecurityCorpus(args: ParsedArgs, action: "build" | "check"): Promise<void> {
   if (args.flags["help"]) {
@@ -9920,10 +9925,14 @@ async function runSecurityCorpus(args: ParsedArgs, action: "build" | "check"): P
         "  corpus         harvest blocked prompt-injection attempts (redaction-notice\n" +
         "                 residue in session logs) into a versioned regression dataset\n" +
         "                 (.crewhaus/security-corpus/corpus.json) + reviewed candidate\n" +
-        "                 detector rules (candidate-rules.json). No raw attack payload is\n" +
-        "                 stored — cases pin a canonical exemplar built at runtime.\n" +
+        "                 detector rules (candidate-rules.json). corpus.json cases pin a\n" +
+        "                 canonical exemplar built at runtime, never a stored attack\n" +
+        "                 payload; candidate-rules.json samples are redacted + hashed,\n" +
+        "                 never a raw or lightly-redacted snippet.\n" +
         "  corpus check   run the corpus against the CURRENT detector; exit 1 if any\n" +
-        "                 previously-blocked exemplar now passes (regression). CI-usable.\n" +
+        "                 exemplar's classification tier has drifted DOWN from its\n" +
+        "                 recorded baseline (e.g. malicious→suspicious), not only a\n" +
+        "                 drop to clean. CI-usable.\n" +
         "\n" +
         "  --since <w>    window over session logs: <N>d or ISO (default: all-time)\n" +
         "  --min-support  distinct near-miss snippets to emit a candidate rule (default 3)\n" +
@@ -9968,7 +9977,7 @@ async function runSecurityCorpus(args: ParsedArgs, action: "build" | "check"): P
     typeof args.flags["since"] === "string" ? args.flags["since"] : undefined,
   );
   const harvest = harvestBlockedAttempts({ rootDir, window });
-  const corpus = buildSecurityCorpus(harvest, window.label);
+  const corpus = await buildSecurityCorpus(harvest, window.label);
   const nearMisses = harvestNearMisses({ rootDir, window });
   const minSupport = intFlag(args, "min-support") ?? 3;
   const candidates = clusterCandidateRules(nearMisses, minSupport);
