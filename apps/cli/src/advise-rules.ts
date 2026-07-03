@@ -98,6 +98,17 @@ export type AdviceContext = {
   /** Stop-reason distribution over `model_meta` lines. */
   readonly stopReasons: ReadonlyMap<string, number>;
   readonly modelResponses: number;
+  /**
+   * Item 21 — per-tool total byte spend (tool_use input JSON + the correlated
+   * tool_result content), keyed by the PascalCase runtime tool name. The
+   * sub-agent-split rule uses the dominance of one tool's byte spend as the
+   * per-turn-token-pressure proxy (a tool that dominates context is the one
+   * to move behind its own window). Empty on old-vintage logs.
+   */
+  readonly perToolBytes: ReadonlyMap<string, number>;
+  /** Item 21 — total observed tool byte spend across all tools (the
+   *  denominator for the dominance ratio). */
+  readonly totalToolBytes: number;
   /** `.crewhaus/audit` record kinds → counts (report context + future rules). */
   readonly auditKindCounts: ReadonlyMap<string, number>;
 };
@@ -146,6 +157,15 @@ export function loopSignatureOf(content: unknown): string | undefined {
   return m?.[1] !== undefined ? `tool:${m[1]}` : "loop";
 }
 
+/** Item 21 — UTF-8 byte length of a logged value: strings measured directly,
+ *  everything else via its JSON encoding (the shape the model actually
+ *  carries). Undefined/unencodable → 0 (never NaN into the byte tally). */
+function byteLength(value: unknown): number {
+  if (value === undefined) return 0;
+  const s = typeof value === "string" ? value : JSON.stringify(value);
+  return typeof s === "string" ? Buffer.byteLength(s, "utf8") : 0;
+}
+
 /** Tolerantly read a session-JSONL line's payload when its `kind` matches —
  *  the canonical defensive accessor shared with `context-pressure.ts`
  *  (`doctor --context-pressure` folds the same persisted events). */
@@ -175,10 +195,21 @@ export function buildAdviceContext(
   const asksByTool = new Map<string, AskStats>();
   const stopReasons = new Map<string, number>();
   const loopSignatures = new Map<string, number>();
+  const perToolBytes = new Map<string, number>();
   let truncationContinues = 0;
   let modelResponses = 0;
+  let totalToolBytes = 0;
+
+  const addToolBytes = (name: string, bytes: number): void => {
+    perToolBytes.set(name, (perToolBytes.get(name) ?? 0) + bytes);
+    totalToolBytes += bytes;
+  };
 
   for (const session of sessions) {
+    // Item 21 — correlate tool_result bytes back to the tool_use's name via
+    // the toolUseId (both live on separate lines). Per-session scope so ids
+    // never collide across sessions.
+    const toolUseNameById = new Map<string, string>();
     for (const obj of session.objects) {
       const tool = payloadOf(obj, "tool_stats");
       if (tool !== undefined && typeof tool["toolName"] === "string") {
@@ -217,6 +248,21 @@ export function buildAdviceContext(
         if (signature !== undefined) {
           loopSignatures.set(signature, (loopSignatures.get(signature) ?? 0) + 1);
         }
+        continue;
+      }
+      // Item 21 — tool_use input bytes count toward the tool's context spend,
+      // and the id→name mapping lets the paired tool_result add its bytes.
+      const toolUse = payloadOf(obj, "tool_use");
+      if (toolUse !== undefined && typeof toolUse["name"] === "string") {
+        const name = toolUse["name"];
+        if (typeof toolUse["id"] === "string") toolUseNameById.set(toolUse["id"], name);
+        addToolBytes(name, byteLength(toolUse["input"]));
+        continue;
+      }
+      const toolResult = payloadOf(obj, "tool_result");
+      if (toolResult !== undefined && typeof toolResult["toolUseId"] === "string") {
+        const name = toolUseNameById.get(toolResult["toolUseId"]);
+        if (name !== undefined) addToolBytes(name, byteLength(toolResult["content"]));
         continue;
       }
       const compaction = payloadOf(obj, "compaction");
@@ -271,6 +317,8 @@ export function buildAdviceContext(
     asksByTool,
     stopReasons,
     modelResponses,
+    perToolBytes,
+    totalToolBytes,
     auditKindCounts,
   };
 }
@@ -298,6 +346,15 @@ export type AdviceThresholds = {
   /** Item 19 — occurrences of one loop SIGNATURE at/above which loop-break
    *  instructions advice fires. */
   loopSignatureMin: number;
+  /** Item 21 — sessions that must each compact ≥ compactionsPerSession
+   *  before a sub-agent restructure is suggested (chronic, not one-off). */
+  chronicCompactionSessions: number;
+  /** Item 21 — fraction of total tool byte-spend one tool must dominate for a
+   *  sub-agent split to be suggested on the dominance signal. */
+  toolByteDominance: number;
+  /** Item 21 — minimum total tool bytes before dominance is judged at all
+   *  (a handful of tiny calls shouldn't trip a restructure). */
+  toolByteMinTotal: number;
 };
 
 /**
@@ -316,6 +373,9 @@ export const DEFAULT_ADVICE_THRESHOLDS: AdviceThresholds = {
   stopAnomalyRate: 0.25,
   recoveryClusterMin: 3,
   loopSignatureMin: 2,
+  chronicCompactionSessions: 2,
+  toolByteDominance: 0.6,
+  toolByteMinTotal: 50_000,
 };
 
 /** Stop reasons that are part of healthy operation; everything else
@@ -751,6 +811,145 @@ export const ruleLoopBreak: AdviceRule = (ctx, opts) => {
   ];
 };
 
+// -------- item 21: sub-agent split under chronic context pressure --------
+
+/**
+ * Targets whose AGENT block carries a `sub_agents:` map, so the drafted
+ * fragment (which sits under `agent:`) pastes in verbatim: cli and channel.
+ * Crew ALSO has sub_agents, but under each ROLE rather than a single `agent`
+ * block, so the paste location differs — it's excluded here rather than emit a
+ * fragment that lands in the wrong place. Any other target has no sub_agents
+ * block at all, so the rule stays silent (nowhere to paste).
+ */
+export const SUB_AGENT_TARGETS: ReadonlySet<string> = new Set(["cli", "channel"]);
+
+/** Reverse map from the RegisteredTool PascalCase `.name` back to the
+ *  camelCase spec/BUILTIN_TOOL_MAP key, for the builtins whose byte spend the
+ *  rule can attribute to a concern. A tool not here still yields a suggestion
+ *  (the sub-agent's `tools:` line is just omitted / left for the human). */
+const TOOL_NAME_TO_SPEC_KEY: Readonly<Record<string, string>> = Object.freeze({
+  Read: "read",
+  Write: "write",
+  Edit: "edit",
+  Glob: "glob",
+  Grep: "grep",
+  Bash: "bash",
+  WebFetch: "webFetch",
+  WebSearch: "webSearch",
+  Fetch: "fetch",
+  ReadImage: "readImage",
+  IngestDocument: "ingestDocument",
+  CodeGraphSearch: "codegraphSearch",
+  CodeGraphCallers: "codegraphCallers",
+  CodeGraphCallees: "codegraphCallees",
+  CodeGraphImpact: "codegraphImpact",
+});
+
+/** The single most byte-dominant tool over the mined sessions, plus its share
+ *  of total tool byte-spend. Undefined when no tool bytes were observed. */
+function dominantTool(
+  ctx: AdviceContext,
+): { name: string; bytes: number; share: number } | undefined {
+  if (ctx.totalToolBytes <= 0) return undefined;
+  let name: string | undefined;
+  let bytes = 0;
+  for (const [tool, b] of ctx.perToolBytes) {
+    if (b > bytes) {
+      bytes = b;
+      name = tool;
+    }
+  }
+  if (name === undefined) return undefined;
+  return { name, bytes, share: bytes / ctx.totalToolBytes };
+}
+
+/** Draft a ready-to-paste `sub_agents:` YAML fragment moving `toolName`'s
+ *  concern into its own sub-agent with its own context window. Two-space
+ *  indented to sit under the spec's `agent:` block (cli/channel) — the CLI
+ *  prints it verbatim in the advice text. */
+export function subAgentFragment(toolName: string): string {
+  const specKey = TOOL_NAME_TO_SPEC_KEY[toolName];
+  const subName = `${(specKey ?? toolName).toLowerCase()}_worker`;
+  const toolsLine = specKey !== undefined ? `\n      tools: [${specKey}]` : "";
+  return [
+    "  # paste under the agent block; move the heavy concern into its own window",
+    "  sub_agents:",
+    `    ${subName}:`,
+    `      description: Handles the ${toolName}-heavy work in an isolated context`,
+    "      instructions: |",
+    `        You are a focused worker. Do ONLY the ${toolName}-heavy sub-task the`,
+    `        parent delegates, then return a concise result — not the full transcript.${toolsLine}`,
+  ].join("\n");
+}
+
+/**
+ * Item 21 — suggest a sub-agent split when context pressure is chronic:
+ * either the mined sessions ROUTINELY compact (≥ chronicCompactionSessions
+ * sessions each compacting ≥ compactionsPerSession times) OR one tool/concern
+ * DOMINATES tool byte-spend (≥ toolByteDominance of ≥ toolByteMinTotal total
+ * bytes). Moving the heavy concern behind a sub-agent's own context window
+ * relieves the parent.
+ *
+ * STRICTLY suggest+scaffold — NEVER a patch: a structural change (adding a
+ * sub-agent + rewriting instructions) isn't eval-safe to auto-apply, so this
+ * emits advice text carrying a ready-to-paste `sub_agents:` fragment (the
+ * correct spec key — NOT `agents:`). Gated per target: only cli/channel/crew
+ * schemas have a `sub_agents` block; on any other target (or with no spec) the
+ * rule stays silent, since there's nowhere to paste it.
+ */
+export const ruleSubAgentSplit: AdviceRule = (ctx, opts) => {
+  const t = resolveThresholds(opts);
+  const spec = opts?.spec;
+  // Gate on target: the fragment is only pasteable where sub_agents exists.
+  if (spec === undefined || !SUB_AGENT_TARGETS.has(spec.target)) return [];
+
+  const chronicSessions = [...ctx.compactionsBySession.values()].filter(
+    (c) => c >= t.compactionsPerSession,
+  ).length;
+  const chronicCompaction = chronicSessions >= t.chronicCompactionSessions;
+
+  const dom = dominantTool(ctx);
+  const dominates =
+    dom !== undefined &&
+    ctx.totalToolBytes >= t.toolByteMinTotal &&
+    dom.share >= t.toolByteDominance;
+
+  if (!chronicCompaction && !dominates) return [];
+
+  // Prefer the dominant tool as the concern to move; fall back to a generic
+  // "heaviest concern" when only the compaction signal tripped.
+  const concernTool = dom?.name ?? "the heaviest tool";
+  const evidence: string[] = [];
+  if (chronicCompaction) {
+    evidence.push(
+      `${chronicSessions} session(s) each compacted ≥${t.compactionsPerSession}× (threshold: ≥${t.chronicCompactionSessions} sessions)`,
+    );
+  }
+  if (dominates && dom !== undefined) {
+    evidence.push(
+      `${dom.name} accounts for ${(dom.share * 100).toFixed(0)}% of ${ctx.totalToolBytes} tool bytes (threshold: ≥${(t.toolByteDominance * 100).toFixed(0)}% of ≥${t.toolByteMinTotal})`,
+    );
+  }
+
+  const fragment = dom !== undefined ? subAgentFragment(dom.name) : subAgentFragment("Bash");
+  return [
+    {
+      id: "sub-agent-split",
+      severity: "warn",
+      summary: `chronic context pressure — consider moving ${concernTool} into a sub-agent`,
+      evidence,
+      counts: {
+        chronicSessions,
+        dominantShare: dom !== undefined ? Math.round(dom.share * 100) : 0,
+      },
+      suggestion: {
+        kind: "advice",
+        text: `Context pressure is chronic. Move the ${concernTool}-heavy concern into a sub-agent so it carries its own context window and the parent stays lean. The runtime already executes sub-agents (the synthetic Task tool). Paste this fragment (note the key is \`sub_agents:\`, NOT \`agents:\`) and delegate the heavy work to it from the parent's instructions:\n${fragment}\n\nThen add to the parent instructions: "For ${concernTool}-heavy work, delegate to the ${(TOOL_NAME_TO_SPEC_KEY[dom?.name ?? ""] ?? "worker").toLowerCase()}_worker sub-agent via the Task tool and use its summarized result." This is a structural change — apply it by hand and re-eval; it is never auto-applied.`,
+      },
+    },
+  ];
+};
+
 export const ADVICE_RULES: ReadonlyArray<AdviceRule> = [
   ruleRepeatedToolFailures,
   ruleTruncationPressure,
@@ -759,6 +958,7 @@ export const ADVICE_RULES: ReadonlyArray<AdviceRule> = [
   ruleStopReasonAnomalies,
   ruleFailureTaxonomy,
   ruleLoopBreak,
+  ruleSubAgentSplit,
 ];
 
 /**

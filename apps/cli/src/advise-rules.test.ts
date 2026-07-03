@@ -23,8 +23,10 @@ import {
   rulePermissionChurn,
   ruleRepeatedToolFailures,
   ruleStopReasonAnomalies,
+  ruleSubAgentSplit,
   ruleTruncationPressure,
   runAdviceRules,
+  subAgentFragment,
 } from "./advise-rules";
 
 const SESSION_A = "sess_00000000000000aa";
@@ -612,5 +614,128 @@ describe("ruleLoopBreak", () => {
     const ids = runAdviceRules(ctx, { spec: CLI_SPEC }).map((f) => f.id);
     expect(ids).toContain("failure-taxonomy-learned");
     expect(ids).toContain("loop-break");
+  });
+});
+
+// -------- item 21: sub-agent split under chronic context pressure --------
+
+function toolUseLine(id: string, name: string, input: unknown): unknown {
+  return line("tool_use", { id, name, input });
+}
+function toolResultLine(toolUseId: string, content: string): unknown {
+  return line("tool_result", { toolUseId, content, isError: false });
+}
+function compactionLine(): unknown {
+  return line("compaction", { kind: "autocompact", before: 40, after: 20 });
+}
+/** A cli spec has agent.sub_agents; an eval spec does NOT (gating check). */
+const EVAL_SPEC = parseSpec(
+  [
+    "name: e",
+    "target: eval",
+    "agent:",
+    "  model: claude-sonnet-4-6",
+    "  instructions: judge",
+    "dataset:",
+    "  name: ds",
+    "  version: v1",
+    "graders:",
+    "  - name: exact_match",
+  ].join("\n"),
+);
+
+describe("buildAdviceContext — item 21 per-tool bytes", () => {
+  it("attributes tool_use input + correlated tool_result bytes to the tool", () => {
+    const ctx = buildAdviceContext([
+      session(SESSION_A, [
+        toolUseLine("t1", "Bash", { command: "x".repeat(100) }),
+        toolResultLine("t1", "y".repeat(200)),
+        toolUseLine("t2", "Read", { path: "/a" }),
+        toolResultLine("t2", "z".repeat(10)),
+        toolResultLine("orphan", "no matching tool_use"), // unattributed → ignored
+      ]),
+    ]);
+    // Bash: input JSON (~115 bytes) + 200 result bytes; Read much smaller.
+    const bash = ctx.perToolBytes.get("Bash") ?? 0;
+    const read = ctx.perToolBytes.get("Read") ?? 0;
+    expect(bash).toBeGreaterThan(300);
+    expect(read).toBeGreaterThan(0);
+    expect(bash).toBeGreaterThan(read);
+    expect(ctx.totalToolBytes).toBe(bash + read);
+  });
+});
+
+describe("subAgentFragment", () => {
+  it("round-trips into a cli spec's agent.sub_agents via parseSpec", () => {
+    const frag = subAgentFragment("Bash");
+    expect(frag).toContain("sub_agents:"); // the correct key, not `agents:`
+    const spec = parseSpec(
+      [
+        "name: heavy",
+        "target: cli",
+        "agent:",
+        "  model: claude-sonnet-4-6",
+        "  instructions: heavy work",
+        frag,
+      ].join("\n"),
+    );
+    const specRecord = spec as unknown as {
+      agent: { sub_agents?: Record<string, { tools?: string[] }> };
+    };
+    expect(Object.keys(specRecord.agent.sub_agents ?? {})).toEqual(["bash_worker"]);
+    expect(specRecord.agent.sub_agents?.["bash_worker"]?.tools).toEqual(["bash"]);
+  });
+});
+
+describe("ruleSubAgentSplit", () => {
+  const heavyBytes = [
+    session(SESSION_A, [
+      toolUseLine("t1", "Bash", { command: "x".repeat(40_000) }),
+      toolResultLine("t1", "y".repeat(40_000)),
+      toolUseLine("t2", "Read", { path: "/a" }),
+      toolResultLine("t2", "z".repeat(100)),
+    ]),
+  ];
+
+  it("fires on tool byte-dominance and emits a pasteable sub_agents fragment (advice-only)", () => {
+    const ctx = buildAdviceContext(heavyBytes);
+    const [finding] = ruleSubAgentSplit(ctx, { spec: CLI_SPEC });
+    expect(finding?.id).toBe("sub-agent-split");
+    expect(finding?.suggestion.kind).toBe("advice"); // NEVER a patch
+    if (finding?.suggestion.kind === "advice") {
+      expect(finding.suggestion.text).toContain("sub_agents:");
+      expect(finding.suggestion.text).toContain("NOT `agents:`");
+      expect(finding.suggestion.text).toContain("Bash");
+    }
+    // Structural advice never lands in suggestions.json (report-only).
+    const file = buildSuggestionsFile([finding as AdviceFinding], [SESSION_A], "t");
+    expect(file.suggestions).toEqual([]);
+  });
+
+  it("fires on chronic compaction across multiple sessions", () => {
+    const ctx = buildAdviceContext([
+      session(SESSION_A, [compactionLine(), compactionLine(), compactionLine()]),
+      session(SESSION_B, [compactionLine(), compactionLine(), compactionLine()]),
+    ]);
+    const [finding] = ruleSubAgentSplit(ctx, { spec: CLI_SPEC });
+    expect(finding?.id).toBe("sub-agent-split");
+    expect(finding?.evidence.some((e) => e.includes("compacted"))).toBe(true);
+  });
+
+  it("is GATED per target — silent on a target without a sub_agents block (eval)", () => {
+    const ctx = buildAdviceContext(heavyBytes);
+    expect(ruleSubAgentSplit(ctx, { spec: EVAL_SPEC })).toEqual([]);
+  });
+
+  it("is silent with no spec (nowhere to paste the fragment)", () => {
+    const ctx = buildAdviceContext(heavyBytes);
+    expect(ruleSubAgentSplit(ctx, {})).toEqual([]);
+  });
+
+  it("stays silent below the byte-total floor even when one tool dominates", () => {
+    const ctx = buildAdviceContext([
+      session(SESSION_A, [toolUseLine("t1", "Bash", { command: "x" }), toolResultLine("t1", "y")]),
+    ]);
+    expect(ruleSubAgentSplit(ctx, { spec: CLI_SPEC })).toEqual([]);
   });
 });

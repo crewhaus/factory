@@ -4716,7 +4716,9 @@ async function runAdvise(args: ParsedArgs): Promise<void> {
         "\n" +
         "mines .crewhaus/sessions (+ .crewhaus/audit) for spec advice:\n" +
         "  repeated tool failures, max_tokens truncation pressure, compaction\n" +
-        "  thrash, permission-ask churn, stop-reason anomalies\n" +
+        "  thrash, permission-ask churn, stop-reason anomalies, learned\n" +
+        "  failure_taxonomy + loop-break rules, sub-agent splits under\n" +
+        "  chronic context pressure\n" +
         "\n" +
         "  --session <id>  mine one session (default: all sessions)\n" +
         "  --json          print machine-readable findings to stdout\n" +
