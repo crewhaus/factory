@@ -10,11 +10,20 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
+import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { SubAgentDefinition } from "@crewhaus/agent-context-isolation";
 import { SpecParseError, compile, lower } from "@crewhaus/compiler";
 import { buildContextBundle, discoverRoots } from "@crewhaus/context-bundle";
-import { DEFAULT_PRICING, computeCacheSavingsMicros, resolvePricing } from "@crewhaus/cost-tracker";
+import {
+  DEFAULT_PRICING,
+  type PricingTable,
+  classifyPricingStaleness,
+  computeCacheSavingsMicros,
+  parsePricingFeed,
+  pickNewestPricing,
+  resolvePricing,
+} from "@crewhaus/cost-tracker";
 import {
   type DatasetRecord,
   type DatasetSplit,
@@ -263,6 +272,16 @@ import {
   openJustificationAuditSink,
   resolveJudgeChoice,
 } from "./justification-gate";
+// Item 24 — market scan + doctor --models + pricing sync core, in a
+// side-effect-free module (this entry file runs an argv switch on import).
+import {
+  type ScanCell,
+  buildMarketScan,
+  buildModelChecks,
+  buildProposalArtifact,
+  buildScanCandidates,
+  writeModelField,
+} from "./model-scan";
 // Item 9 — per-spec regression suite: post-accept pinning of optimize
 // recoveries + the eval-side default union, in a side-effect-free module so
 // it is unit-testable (this entry file runs an argv switch on import).
@@ -471,6 +490,43 @@ const DOCTOR_SCHEMA: ParseArgsSchema = {
     { name: "context-pressure", takesValue: false },
     // How many most-recent sessions --context-pressure scans (default 20).
     { name: "sessions", takesValue: true },
+    // Item 24 — model advisory: flag spec models missing from the pricing
+    // table (silently billed $0), pricing-table staleness, and known sunsets.
+    { name: "models", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
+// Item 24 — `crewhaus model-scan`: scheduled market scan. Enumerate
+// capability-compatible replacements for the cwd spec's agent.model, eval each
+// on the spec's dataset, and emit a proposal (+ patch.json) when a candidate
+// beats current on score at lower cost. Proposal-only unless --write.
+const MODEL_SCAN_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "dataset", takesValue: true },
+    { name: "graders", takesValue: true },
+    { name: "out", short: "o", takesValue: true },
+    { name: "concurrency", takesValue: true },
+    { name: "seed", takesValue: true },
+    { name: "judge-model", takesValue: true },
+    // Restrict candidates to same-provider siblings (keeps credentials + cache).
+    { name: "same-provider", takesValue: false },
+    // Max candidates evaled (cheapest-first). Default 6.
+    { name: "limit", takesValue: true },
+    // Apply the winning proposal to the spec via a direct comment-preserving
+    // CST edit (model fields are outside OPTIMIZABLE_PATHS — this bypasses the
+    // optimizer whitelist deliberately; always human-initiated).
+    { name: "write", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
+// Item 24 — `crewhaus pricing sync|show`: load a versioned pricing feed into
+// ~/.crewhaus/pricing/ so createCostTracker({pricing}) can override without a
+// code release.
+const PRICING_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "file", takesValue: true },
     { name: "help", short: "h" },
   ],
 };
@@ -2106,6 +2162,10 @@ async function runDoctor(args: ParsedArgs): Promise<void> {
     runDoctorContextPressure(args);
     return;
   }
+  if (args.flags["models"]) {
+    runDoctorModels();
+    return;
+  }
   // Item 49 — the drift-watch flags only make sense on the philosophy audit.
   for (const flag of ["json", "baseline", "accept-baseline"] as const) {
     if (args.flags[flag] === true) {
@@ -2175,6 +2235,137 @@ async function runDoctor(args: ParsedArgs): Promise<void> {
   const allPass = checks.every((c) => c.pass);
   process.stdout.write(allPass ? "\nall checks passed.\n" : "\nsome checks failed.\n");
   process.exit(allPass ? 0 : 1);
+}
+
+/**
+ * Item 24 — `~/.crewhaus/pricing/` feed dir. The newest dated feed there
+ * overrides `DEFAULT_PRICING` for cost projections; a broken feed is a loud
+ * error (never a silent $0 regression). Returns the effective table.
+ */
+function pricingDir(): string {
+  return join(homedir(), ".crewhaus", "pricing");
+}
+
+function loadUserPricing(): PricingTable {
+  const dir = pricingDir();
+  if (!existsSync(dir)) return DEFAULT_PRICING;
+  const feeds: PricingTable[] = [];
+  for (const name of readdirSync(dir)) {
+    if (!name.endsWith(".json")) continue;
+    const text = readFileSync(join(dir, name), "utf-8");
+    // Let a parse error propagate as a CLI failure — a corrupt feed silently
+    // billing $0 is exactly the gap doctor --models exists to close.
+    feeds.push(parsePricingFeed(text));
+  }
+  return pickNewestPricing(feeds);
+}
+
+/**
+ * Item 24 — `crewhaus doctor --models`. Reads the cwd spec's agent.model (+
+ * compaction.model when present), and flags: models missing from the pricing
+ * table (silently billed $0), pricing-table staleness, and known sunsets.
+ * Exits non-zero only on a hard pricing MISS (a warn — stale/sunset — never
+ * fails); a report, model-advisory flavour of doctor.
+ */
+function runDoctorModels(): void {
+  const specPath = join(process.cwd(), "crewhaus.yaml");
+  let agentModel: string | undefined;
+  const auxModels: Array<{ slot: string; model: string }> = [];
+  if (existsSync(specPath)) {
+    try {
+      const ir = lower(parseSpec(readFileSync(specPath, "utf-8")));
+      const agent = (ir as { agent?: { model?: unknown } }).agent;
+      if (agent !== undefined && typeof agent.model === "string") agentModel = agent.model;
+      const compaction = (ir as { compaction?: { model?: unknown } }).compaction;
+      if (compaction !== undefined && typeof compaction.model === "string") {
+        auxModels.push({ slot: "compaction.model", model: compaction.model });
+      }
+      const subAgents = (ir as { subAgents?: ReadonlyArray<{ name?: string; model?: unknown }> })
+        .subAgents;
+      for (const sa of subAgents ?? []) {
+        if (typeof sa.model === "string") {
+          auxModels.push({ slot: `sub-agent ${sa.name ?? "?"}.model`, model: sa.model });
+        }
+      }
+    } catch {
+      // tolerant: a non-cli / unparseable spec still gets a table-freshness check
+    }
+  }
+  const pricing = loadUserPricing();
+  const checks = buildModelChecks(agentModel, { pricing, auxModels });
+  let anyFail = false;
+  for (const c of checks) {
+    if (c.warn && c.pass) {
+      process.stdout.write(`~ ${c.label}: ${c.reason ?? "informational"}\n`);
+    } else if (c.pass) {
+      process.stdout.write(`✓ ${c.label}\n`);
+    } else {
+      anyFail = true;
+      process.stdout.write(`✗ ${c.label}: ${c.reason ?? "failed"}\n`);
+    }
+  }
+  if (agentModel === undefined) {
+    process.stdout.write(
+      "~ no agent.model in the cwd crewhaus.yaml — only the pricing table was checked\n",
+    );
+  }
+  process.stdout.write(anyFail ? "\nsome model checks failed.\n" : "\nmodel checks passed.\n");
+  process.exit(anyFail ? 1 : 0);
+}
+
+/**
+ * Item 24 — `crewhaus pricing sync|show`. `sync --file <feed.json>` validates
+ * a versioned pricing feed and installs it at ~/.crewhaus/pricing/<version>.json,
+ * from where `doctor --models`/cost projections pick up the newest. `show`
+ * prints the effective table's version + freshness.
+ */
+async function runPricing(args: ParsedArgs, action: string): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus pricing <sync|show>\n" +
+        "  sync --file <feed.json>   validate + install a versioned pricing feed into\n" +
+        "                            ~/.crewhaus/pricing/<version>.json (overrides DEFAULT_PRICING\n" +
+        "                            for cost projections without a code release)\n" +
+        "  show                      print the effective pricing table's version + freshness\n",
+    );
+    return;
+  }
+  if (action === "show") {
+    const pricing = loadUserPricing();
+    const staleness = classifyPricingStaleness(pricing, new Date(), 120);
+    process.stdout.write(`pricing table version: ${pricing.version}\n`);
+    process.stdout.write(`${staleness.stale ? "~ " : "✓ "}${staleness.reason}\n`);
+    const dir = pricingDir();
+    process.stdout.write(
+      existsSync(dir)
+        ? `feeds dir: ${dir}\n`
+        : `feeds dir: ${dir} (none installed — using built-in DEFAULT_PRICING)\n`,
+    );
+    return;
+  }
+  // action === "sync"
+  const file = args.flags["file"];
+  if (typeof file !== "string") die("pricing sync: missing --file <feed.json>");
+  let feedText: string;
+  try {
+    feedText = readFileSync(resolve(file), "utf-8");
+  } catch (err) {
+    die(`could not read ${file}: ${(err as Error).message}`);
+  }
+  let table: PricingTable;
+  try {
+    table = parsePricingFeed(feedText);
+  } catch (err) {
+    die((err as Error).message);
+  }
+  const dest = join(pricingDir(), `${table.version.replace(/[^A-Za-z0-9._-]+/g, "_")}.json`);
+  mkdirSync(dirname(dest), { recursive: true });
+  writeFileSync(dest, `${JSON.stringify(table, null, 2)}\n`);
+  process.stdout.write(`✓ installed pricing feed v${table.version} → ${dest}\n`);
+  const providers = Object.keys(table.providers).length;
+  process.stdout.write(
+    `  ${providers} provider table(s); the newest dated feed here now overrides DEFAULT_PRICING\n`,
+  );
 }
 
 /**
@@ -4154,6 +4345,177 @@ async function runEvalMatrixCommand(opts: {
   if (crashed.length > 0) {
     const names = crashed.map((r) => r.model).join(", ");
     die(`eval --models: ${crashed.length}/${matrix.rows.length} cell(s) failed to run: ${names}`);
+  }
+}
+
+/**
+ * Item 24 — `crewhaus model-scan`. Read the cwd spec's agent.model, enumerate
+ * capability-compatible replacement candidates from the pricing table, eval
+ * current + each candidate on the spec's dataset (same matrix machinery), and
+ * emit a proposal + patch.json when a candidate beats current on score at
+ * lower cost. Model fields are outside OPTIMIZABLE_PATHS, so nothing is
+ * auto-applied — `--write` does a direct comment-preserving CST edit on a
+ * human-reviewed winner.
+ */
+async function runModelScan(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus model-scan --dataset <data> --graders <graders.yaml>\n" +
+        "                           [--same-provider] [--limit N] [--concurrency N] [--seed N]\n" +
+        "                           [--judge-model <m>] [-o <dir>] [--write]\n" +
+        "  Reads the cwd crewhaus.yaml's agent.model, enumerates capability-compatible\n" +
+        "  cheaper replacements from the pricing table (--same-provider restricts to\n" +
+        "  same-provider siblings; --limit caps the count, default 6), evals current +\n" +
+        "  each candidate on the dataset, and prints a proposal when a candidate beats\n" +
+        "  current on mean score at lower projected cost. Writes matrix.json/index.html\n" +
+        "  + (when a winner exists) patch.json to -o (default .crewhaus/model-scan_<id>).\n" +
+        "  --write applies the winner to crewhaus.yaml via a direct comment-preserving\n" +
+        "  CST edit (model fields are outside OPTIMIZABLE_PATHS — this deliberately\n" +
+        "  bypasses the optimizer whitelist; always human-initiated, never automatic).\n",
+    );
+    return;
+  }
+  const datasetPath = args.flags["dataset"];
+  const gradersPath = args.flags["graders"];
+  if (typeof datasetPath !== "string") die("model-scan: missing --dataset <data>");
+  if (typeof gradersPath !== "string") die("model-scan: missing --graders <graders.yaml>");
+
+  const specPath = join(process.cwd(), "crewhaus.yaml");
+  if (!existsSync(specPath)) die(`model-scan: no crewhaus.yaml in ${process.cwd()}`);
+  const yamlText = readFileSync(specPath, "utf-8");
+  let ir: ReturnType<typeof lower>;
+  try {
+    ir = lower(parseSpec(yamlText));
+  } catch (err) {
+    if (err instanceof SpecParseError) die(err.message);
+    throw err;
+  }
+  if (ir.target !== "cli") die(`model-scan only supports target: cli (got "${ir.target}")`);
+  const currentModel = ir.agent.model;
+
+  const pricing = loadUserPricing();
+  const candidates = buildScanCandidates(currentModel, {
+    pricing,
+    sameProviderOnly: args.flags["same-provider"] === true,
+    ...(typeof args.flags["limit"] === "string"
+      ? { limit: Number.parseInt(args.flags["limit"], 10) }
+      : {}),
+  });
+  if (candidates.length === 0) {
+    die(
+      `model-scan: no capability-compatible cheaper candidates for "${currentModel}" in the pricing table (it may be a local/named-host model, or already the cheapest in its class)`,
+    );
+  }
+
+  // Load graders + dataset ONCE (every cell sees the identical samples).
+  const gradersYaml = readFileSync(resolve(gradersPath), "utf-8");
+  const { compiled } = parseGradersConfig(gradersYaml);
+  const dataset = await loadDataset(resolve(datasetPath));
+  const datasetHash = hashDatasetFile(resolve(datasetPath));
+  const samples = await collectSamples(dataset.samples);
+
+  const concurrencyFlag = args.flags["concurrency"];
+  const seedFlag = args.flags["seed"];
+  const judgeModelFlag = args.flags["judge-model"];
+  const concurrency =
+    typeof concurrencyFlag === "string" ? Number.parseInt(concurrencyFlag, 10) : undefined;
+  const seed = typeof seedFlag === "string" ? Number.parseInt(seedFlag, 10) : undefined;
+
+  const outArg = args.flags["out"];
+  const rootDir =
+    typeof outArg === "string"
+      ? resolve(outArg)
+      : resolve(join(".crewhaus", `model-scan_${randomBytes(8).toString("hex")}`));
+  mkdirSync(rootDir, { recursive: true });
+
+  const models = [currentModel, ...candidates];
+  process.stdout.write(
+    `[model-scan] current ${currentModel} vs ${candidates.length} candidate(s) × ${samples.length} samples → ${rootDir}\n`,
+  );
+
+  const cells = await runMatrixCells({
+    models,
+    slugs: assignCellSlugs(models),
+    rootDir,
+    runCell: async (model, cellOutDir) => {
+      const summary = await runEvalLib({
+        ir: { ...ir, agent: { ...ir.agent, model } },
+        dataset: { name: dataset.name, samples: makeAsyncIterable(samples) },
+        compiledGraders: compiled,
+        opts: {
+          outDir: cellOutDir,
+          datasetHash,
+          ...(concurrency !== undefined ? { concurrency } : {}),
+          ...(seed !== undefined ? { seed } : {}),
+          ...(typeof judgeModelFlag === "string" ? { judgeModel: judgeModelFlag } : {}),
+        },
+      });
+      writeFileSync(join(cellOutDir, "index.html"), renderReport(await loadRun(cellOutDir)).html);
+      return summary;
+    },
+  });
+
+  const matrix = buildMatrix(cells, { pricing: defaultMatrixPricing() });
+  const rendered = renderMatrix(matrix);
+  writeFileSync(join(rootDir, "matrix.json"), rendered.json);
+  writeFileSync(join(rootDir, "index.html"), rendered.html);
+
+  // Fold matrix rows into scan cells (model → score + projected cost).
+  const scanCells: ScanCell[] = matrix.rows.map((r) => ({
+    model: r.model,
+    ...(r.passRate !== undefined ? { passRate: r.passRate } : {}),
+    ...(r.meanScore !== undefined ? { meanScore: r.meanScore } : {}),
+    ...(r.costPer1kSamplesUsd !== undefined ? { costPer1kSamplesUsd: r.costPer1kSamplesUsd } : {}),
+    ...(r.status === "error" ? { error: r.error ?? "cell failed" } : {}),
+  }));
+  const scan = buildMarketScan(currentModel, scanCells);
+
+  writeTable(
+    ["candidate", "score Δ", "$/1k Δ", "recommended", "why"],
+    scan.proposals.map((p) => [
+      p.candidateModel,
+      p.scoreDelta >= 0 ? `+${p.scoreDelta.toFixed(3)}` : p.scoreDelta.toFixed(3),
+      p.costDeltaPer1kUsd.toFixed(4),
+      p.recommended ? "YES" : "no",
+      p.reason,
+    ]),
+  );
+
+  if (scan.best !== undefined) {
+    const artifact = buildProposalArtifact(scan);
+    if (artifact !== undefined) {
+      writeFileSync(join(rootDir, "patch.json"), `${JSON.stringify(artifact, null, 2)}\n`);
+    }
+    process.stdout.write(
+      `\n[model-scan] recommendation: ${currentModel} → ${scan.best.candidateModel} ` +
+        `(+${scan.best.scoreDelta.toFixed(3)} score, ${scan.best.costDeltaPer1kUsd.toFixed(4)} $/1k)\n` +
+        `[model-scan] proposal: ${join(rootDir, "patch.json")}\n`,
+    );
+    if (args.flags["write"] === true) {
+      const updated = writeModelField(
+        yamlText,
+        ir.target,
+        ["agent", "model"],
+        scan.best.candidateModel,
+      );
+      writeFileSync(specPath, updated);
+      process.stdout.write(
+        `[model-scan] --write: applied agent.model = ${scan.best.candidateModel} to ${specPath} (comment-preserving CST edit; review the diff before committing)\n`,
+      );
+    } else {
+      process.stdout.write(
+        "[model-scan] apply with `crewhaus model-scan ... --write`, or hand-edit — every model change is human-reviewed.\n",
+      );
+    }
+  } else {
+    process.stdout.write("\n[model-scan] no candidate beats current on score at lower cost.\n");
+  }
+
+  const crashed = matrix.rows.filter((r) => r.status === "error");
+  if (crashed.length > 0) {
+    process.stdout.write(
+      `[model-scan] note: ${crashed.length} cell(s) failed to run (${crashed.map((r) => r.model).join(", ")})\n`,
+    );
   }
 }
 
@@ -6655,6 +7017,22 @@ switch (subcommand) {
   case "doctor":
     await runDoctor(parseFor(rest, DOCTOR_SCHEMA));
     break;
+  case "model-scan":
+    try {
+      await runModelScan(parseFor(rest, MODEL_SCAN_SCHEMA));
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
+    break;
+  case "pricing": {
+    const action = rest[0] ?? "";
+    if (action !== "sync" && action !== "show") {
+      die(`pricing action must be "sync" or "show" (got "${action}")`);
+    }
+    await runPricing(parseFor(rest.slice(1), PRICING_SCHEMA), action);
+    break;
+  }
   case "context":
     runContext(parseFor(rest, CONTEXT_SCHEMA));
     break;

@@ -48,6 +48,42 @@ export {
   type SessionCacheProfile,
 } from "./ranking";
 
+export {
+  DEFAULT_CAPABILITIES,
+  resolveCapabilities,
+  satisfiesCapabilities,
+  type CapabilityRequirement,
+  type CapabilityTable,
+  type ModelCapabilities,
+} from "./capabilities";
+
+export {
+  classifyPricingStaleness,
+  findSunset,
+  KNOWN_SUNSETS,
+  parsePricingFeed,
+  pickNewestPricing,
+  pricingTableAgeDays,
+  PricingFeedError,
+  type PricingStaleness,
+  type SunsetEntry,
+} from "./feed";
+
+export {
+  blendedPer1M,
+  enumerateCandidates,
+  familyPrefixOf,
+  rankRightSizeProposals,
+  resolveCheapest,
+  specStringFor,
+  type CandidateProvider,
+  type EnumerateCandidatesOptions,
+  type ModelCandidate,
+  type RankedRightSize,
+  type RightSizeBaseline,
+  type RightSizeProposal,
+} from "./candidates";
+
 export type RunCostSummary = {
   readonly totalUsdMicros: number;
   /** Stable order: providers sorted alphabetically. */

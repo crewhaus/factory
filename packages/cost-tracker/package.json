@@ -8,7 +8,10 @@
   "exports": {
     ".": "./src/index.ts",
     "./pricing": "./src/pricing.ts",
-    "./ranking": "./src/ranking.ts"
+    "./ranking": "./src/ranking.ts",
+    "./capabilities": "./src/capabilities.ts",
+    "./feed": "./src/feed.ts",
+    "./candidates": "./src/candidates.ts"
   },
   "scripts": {
     "test": "bun test src"
@@ -35,5 +38,5 @@
   "publishConfig": {
     "access": "public"
   },
-  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+  "files": ["src", "templates", "README.md", "LICENSE", "NOTICE"]
 }
