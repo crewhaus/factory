@@ -30,6 +30,8 @@
     { "path": "../../packages/eval-runner" },
     { "path": "../../packages/target-eval-bundle" },
     { "path": "../../packages/event-log" },
+    { "path": "../../packages/gateway-server" },
+    { "path": "../../packages/tenancy" },
     { "path": "../../packages/hooks-engine" },
     { "path": "../../packages/infra-utils" },
     { "path": "../../packages/ir" },

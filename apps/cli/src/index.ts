@@ -565,6 +565,19 @@ import {
   suggestSafeName,
   suggestSecretFix,
 } from "./lint";
+// Item 68 — `crewhaus loadtest`: concurrency benchmark + deploy gate for daemon
+// shapes. The runner drives an injected LoadDriver; side-effect-free (this entry
+// file builds the real driver + writes the report).
+import {
+  type GateThresholds,
+  type LoadDriver,
+  LoadtestError,
+  type RequestOutcome,
+  evaluateGate,
+  renderLoadtestHtml,
+  renderLoadtestText,
+  runLoadtest,
+} from "./loadtest";
 // Item 60 — the marketplace CLI core: registry-source resolution, the
 // outdated freshness compare, list/outdated formatters, and the publish PR
 // plan, in a side-effect-free module so it is unit-testable (this entry file
@@ -1692,6 +1705,26 @@ const ONCHAIN_SCHEMA: ParseArgsSchema = {
     // sentinel — anomaly threshold: flag spend > N× the per-contract max (default 2).
     { name: "max-multiple", takesValue: true },
     { name: "json", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
+// AUTOMATION-OPPORTUNITIES.md item 68 — `crewhaus loadtest`.
+const LOADTEST_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "concurrency", short: "c", takesValue: true },
+    // total requests to send (`-n`).
+    { name: "requests", short: "n", takesValue: true },
+    { name: "duration", takesValue: true },
+    { name: "rps", takesValue: true },
+    { name: "format", takesValue: true },
+    { name: "out", short: "o", takesValue: true },
+    // gate mode: exit 1 when p95 latency / error rate exceed the thresholds.
+    { name: "gate", takesValue: false },
+    { name: "max-p95-ms", takesValue: true },
+    { name: "max-error-rate", takesValue: true },
+    // deterministic stub-model latency (ms/request) for a credential-free run.
+    { name: "stub-latency-ms", takesValue: true },
     { name: "help", short: "h" },
   ],
 };
@@ -13403,6 +13436,176 @@ async function runJustification(
  * `$NAME`, inline literals as `[redacted]`) and performs nothing.
  */
 /**
+ * Item 68 — `crewhaus loadtest <spec> [--concurrency N] [-n requests] [--rps R]`.
+ * Drive a daemon-shape harness (managed gateway / channel-bot / batch) under
+ * concurrent load and report throughput / p50/p95/p99 latency / error rate /
+ * cost per request. `--gate` exits 1 when p95 latency or error rate exceed the
+ * declared thresholds (a pre-deploy gate). Load flows through a real driver
+ * built here — the managed gateway's in-process `handle()` behind a stub/echo
+ * model — so no live server or provider key is needed.
+ */
+async function runLoadtestCmd(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"] === true) {
+    process.stdout.write(
+      "usage: crewhaus loadtest <spec.yaml> [-c/--concurrency N] [-n/--requests N] [--duration ms]\n" +
+        "                         [--rps R] [--format text|html|json] [-o <file>]\n" +
+        "                         [--gate --max-p95-ms N --max-error-rate 0.01]\n" +
+        "  Drive a daemon-shape harness (managed gateway / channel-bot / batch) under\n" +
+        "  concurrent load; report throughput, p50/p95/p99 latency, error rate, and\n" +
+        "  cost/req. Load flows through the shape's real entrypoint behind a stub/echo\n" +
+        "  model, so no live server or provider key is needed. --gate exits 1 when p95\n" +
+        "  latency or error rate exceed the declared thresholds (pre-deploy gate).\n",
+    );
+    return;
+  }
+  const format = strFlag(args, "format") ?? "text";
+  if (format !== "text" && format !== "html" && format !== "json") {
+    die(`--format must be "text", "html", or "json" (got "${format}")`);
+  }
+  const specPath = args.positional[0];
+  if (typeof specPath !== "string") die("missing <spec.yaml>");
+  const absSpec = resolve(specPath);
+  let yamlText: string;
+  try {
+    yamlText = readFileSync(absSpec, "utf-8");
+  } catch (err) {
+    die(`could not read ${absSpec}: ${(err as Error).message}`);
+  }
+  let ir: ReturnType<typeof lower>;
+  try {
+    ir = lower(parseSpec(yamlText));
+  } catch (err) {
+    if (err instanceof CrewhausError) die(err.message);
+    throw err;
+  }
+
+  // Deterministic stub latency per request (default 5ms) — makes a
+  // credential-free run reproducible + fast. The driver returns canned token
+  // usage so cost/req is exercised.
+  const stubLatencyMs = intFlag(args, "stub-latency-ms") ?? 5;
+  const driver = await buildLoadDriver(ir, yamlText, stubLatencyMs);
+
+  const concurrency = intFlag(args, "concurrency");
+  const requests = intFlag(args, "requests");
+  const duration = intFlag(args, "duration");
+  const rps = floatFlag(args, "rps");
+  const report = await runLoadtest(driver, {
+    ...(concurrency !== undefined ? { concurrency } : {}),
+    ...(requests !== undefined ? { requests } : {}),
+    ...(duration !== undefined ? { durationMs: duration } : {}),
+    ...(rps !== undefined ? { rps } : {}),
+  });
+
+  let verdict: ReturnType<typeof evaluateGate> | undefined;
+  if (args.flags["gate"] === true) {
+    const thresholds: GateThresholds = {
+      ...(intFlag(args, "max-p95-ms") !== undefined
+        ? { maxP95LatencyMs: intFlag(args, "max-p95-ms") }
+        : {}),
+      ...(floatFlag(args, "max-error-rate") !== undefined
+        ? { maxErrorRate: floatFlag(args, "max-error-rate") }
+        : {}),
+    };
+    verdict = evaluateGate(report, thresholds);
+  }
+
+  const rendered =
+    format === "json"
+      ? `${JSON.stringify(verdict !== undefined ? { ...report, gate: verdict } : report, null, 2)}\n`
+      : format === "html"
+        ? renderLoadtestHtml(report, verdict)
+        : renderLoadtestText(report, verdict);
+
+  const outPath = strFlag(args, "out");
+  if (outPath !== undefined) {
+    const abs = resolve(outPath);
+    mkdirSync(dirname(abs), { recursive: true });
+    writeFileSync(abs, rendered);
+    process.stdout.write(`[loadtest] wrote ${abs}\n`);
+  } else {
+    process.stdout.write(rendered);
+  }
+  if (verdict !== undefined && !verdict.passed) process.exit(1);
+}
+
+/**
+ * Item 68 — build the real LoadDriver for a lowered daemon-shape IR. For
+ * `managed` the driver drives the gateway-server's in-process `handle()` with a
+ * self-minted JWT + a generous tenant budget behind a stub/echo handler (no
+ * live provider). Other daemon shapes (channel/batch) use the same stub/echo
+ * driver directly. Non-daemon shapes are rejected. Deterministic:
+ * `stubLatencyMs` fixes each request's latency.
+ */
+async function buildLoadDriver(
+  ir: ReturnType<typeof lower>,
+  _yamlText: string,
+  stubLatencyMs: number,
+): Promise<LoadDriver> {
+  const DAEMON_TARGETS = new Set(["managed", "channel", "batch"]);
+  if (!DAEMON_TARGETS.has(ir.target)) {
+    die(
+      `loadtest supports daemon shapes (managed, channel, batch); got target: ${ir.target}. Non-daemon shapes have no concurrent request entrypoint to benchmark.`,
+    );
+  }
+  // A stub/echo "run" — canned token usage so cost/req is exercised, and a
+  // fixed latency so the run is deterministic + credential-free.
+  const stubUsage = { input: 32, output: 16 };
+  const echoOutcome = (): RequestOutcome => ({
+    ok: true,
+    latencyMs: stubLatencyMs,
+    tokens: stubUsage,
+  });
+
+  if (ir.target === "managed") {
+    const { PROTOCOL_VERSION, createGatewayServer, signJwt } = await import(
+      "@crewhaus/gateway-server"
+    );
+    const { buildTenant } = await import("@crewhaus/tenancy");
+    const secret = randomBytes(32).toString("hex");
+    const tenantId = "loadtest";
+    // A generous budget so the benchmark isn't throttled by the budget gate.
+    const base = buildTenant(tenantId, {});
+    const tenant = {
+      ...base,
+      budget: { maxInputTokens: Number.MAX_SAFE_INTEGER, maxOutputTokens: Number.MAX_SAFE_INTEGER },
+    };
+    const server = createGatewayServer({
+      jwtSecret: secret,
+      handler: async () => {
+        // The stub/echo handler stands in for the real run: it returns a canned
+        // result WITHOUT a provider call, so the gateway's auth + tenant +
+        // budget path is exercised under load, credential-free.
+        return { ok: true };
+      },
+      tenantOverrides: { [tenantId]: tenant },
+    });
+    const bearer = signJwt({ tenant_id: tenantId }, secret);
+    return async (idx: number): Promise<RequestOutcome> => {
+      const started = performance.now();
+      const res = (await server.handle({
+        bearer,
+        body: {
+          protocol: PROTOCOL_VERSION,
+          id: `req-${idx}`,
+          method: "runs.create",
+          params: { spec: "loadtest-spec", input: `load request ${idx}` },
+        },
+      })) as { error?: { code?: string; message?: string } };
+      await server.recordUsage(tenantId, stubUsage);
+      const latencyMs = stubLatencyMs > 0 ? stubLatencyMs : performance.now() - started;
+      if (res.error !== undefined) {
+        return { ok: false, latencyMs, errorKind: res.error.code ?? "error" };
+      }
+      return { ok: true, latencyMs, tokens: stubUsage };
+    };
+  }
+
+  // channel / batch — drive the stub/echo run directly (their real entrypoints
+  // are message/queue handlers with no credential-free offline harness here).
+  return async (): Promise<RequestOutcome> => echoOutcome();
+}
+
+/**
  * Item 67 — `crewhaus intents [--sessions N|all] [--format text|html|json]`.
  * Cluster user_message inputs across the cwd spec's recent sessions and rank
  * them by frequency / satisfaction / failure, surfacing top / rising /
@@ -14376,6 +14579,15 @@ switch (subcommand) {
       await runIntents(parseFor(rest, INTENTS_SCHEMA));
     } catch (err) {
       if (err instanceof CrewhausError || err instanceof IntentsError) die(err.message);
+      throw err;
+    }
+    break;
+  case "loadtest":
+    // Item 68 — concurrency benchmark + deploy gate for daemon shapes.
+    try {
+      await runLoadtestCmd(parseFor(rest, LOADTEST_SCHEMA));
+    } catch (err) {
+      if (err instanceof CrewhausError || err instanceof LoadtestError) die(err.message);
       throw err;
     }
     break;
