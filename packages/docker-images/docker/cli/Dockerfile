@@ -9,7 +9,7 @@ WORKDIR /app
 COPY bun.lock package.json ./
 COPY packages packages
 COPY apps apps
-RUN bun install --frozen-lockfile --production=false
+RUN bun install --frozen-lockfile
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Stage 2: build (typecheck + bundle the CLI entrypoint)
