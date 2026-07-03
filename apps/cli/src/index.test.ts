@@ -502,6 +502,59 @@ describe("crewhaus run", () => {
     expect(result.stderr).toContain("rule-based, claude");
   });
 
+  // Section 18 (#18 remainder) — the run path must wire the sandbox floor for
+  // code-execution tools. Before this, python/javascript/shell resolved but
+  // were always denied because `sandboxAvailable` was never set.
+  const CODE_EXEC_SPEC =
+    "name: coder\ntarget: cli\nagent:\n  model: claude-sonnet-4-6\n  instructions: run code\ntools:\n  - python\n";
+
+  test("run wires the sandbox backend for code-exec tools when CREWHAUS_SANDBOX is set", async () => {
+    writeFileSync(join(tmp, "crewhaus.yaml"), CODE_EXEC_SPEC);
+    const result = await runCli(["run", join(tmp, "crewhaus.yaml")], {
+      cwd: tmp,
+      env: { ANTHROPIC_API_KEY: "test-no-call", CREWHAUS_SANDBOX: "docker" },
+      closeStdinImmediately: true,
+    });
+    expect(result.exitCode).toBe(0);
+    // Diagnostic reflects the resolved (available) backend → sandboxAvailable:true.
+    expect(result.stdout).toContain('[sandbox] backend "docker"');
+    expect(result.stdout).toContain("enabled");
+    expect(result.stdout).toContain("agent ready");
+  });
+
+  test("run prints the CREWHAUS_SANDBOX notice when unset and code-exec tools are declared", async () => {
+    writeFileSync(join(tmp, "crewhaus.yaml"), CODE_EXEC_SPEC);
+    const result = await runCli(["run", join(tmp, "crewhaus.yaml")], {
+      cwd: tmp,
+      env: { ANTHROPIC_API_KEY: "test-no-call" }, // CREWHAUS_SANDBOX intentionally unset
+      closeStdinImmediately: true,
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("[sandbox] assuming docker");
+    expect(result.stdout).toContain("set CREWHAUS_SANDBOX");
+  });
+
+  test("run reports the sandbox floor as disabled under CREWHAUS_SANDBOX=noop", async () => {
+    writeFileSync(join(tmp, "crewhaus.yaml"), CODE_EXEC_SPEC);
+    const result = await runCli(["run", join(tmp, "crewhaus.yaml")], {
+      cwd: tmp,
+      env: { ANTHROPIC_API_KEY: "test-no-call", CREWHAUS_SANDBOX: "noop" },
+      closeStdinImmediately: true,
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("[sandbox] disabled");
+    expect(result.stdout).toContain("will be denied");
+  });
+
+  test("run does NOT print a sandbox diagnostic when no code-exec tools are declared", async () => {
+    const result = await runCli(["run", HELLO_SPEC], {
+      env: { ANTHROPIC_API_KEY: "test-no-call" },
+      closeStdinImmediately: true,
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).not.toContain("[sandbox]");
+  });
+
   test("a CrewhausError on the run path surfaces as a clean one-line die(), not a stack trace", async () => {
     // An unrecognised model string makes the model-router throw ConfigError
     // inside runChatLoop — previously an uncaught stack trace.

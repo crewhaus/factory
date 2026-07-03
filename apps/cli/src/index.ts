@@ -382,6 +382,22 @@ import {
   suggestSafeName,
   suggestSecretFix,
 } from "./lint";
+// Item 16 — `crewhaus permissions suggest` (mine persisted ask/deny history
+// into reviewable settings.json permission rules), in a side-effect-free
+// module so it is unit-testable (this entry file runs an argv switch on
+// import). Permissions are EXCLUDED from OPTIMIZABLE_PATHS — `--apply` is
+// always an interactive human confirm, never eval-gated auto-apply.
+import {
+  type PermissionSuggestion,
+  aggregateAsks,
+  applyToSettingsRoot,
+  diffPermissions,
+  existingSettingsRules,
+  formatSettingsDiff,
+  formatSuggestionLines,
+  rankSuggestions,
+  readOnlyByName,
+} from "./permissions-suggest";
 // Item 5 — `crewhaus dataset refresh-goldens`: reconcile user corrections +
 // up-rated turns against an existing dataset's golds, proposing (or applying
 // as a NEW version) updated golds. Side-effect-free so it is unit-testable.
@@ -482,6 +498,19 @@ import {
   parseExcludeGlobs,
   restoreStateArchive,
 } from "./state-backup";
+// Item 18 — `crewhaus tools` namespace (list/suggest/audit + the loadToolMap
+// ↔ BUILTIN_TOOL_MAP sync floor), in a side-effect-free module so it is
+// unit-testable (this entry file runs an argv switch on import).
+import {
+  CLI_RUNTIME_TOOL_KEYS,
+  auditTools,
+  buildToolList,
+  buildToolUsage,
+  formatAuditLines,
+  formatSuggestLines,
+  formatToolListLines,
+  suggestTools,
+} from "./tools-cli";
 // Item 7 — failure-arbiter wiring: post-eval triage (verdicts.json + report
 // section + one-line summary + bug-sample pinning) and the optimize-side
 // failure-signal pre-filter, in a side-effect-free module so it is
@@ -866,6 +895,19 @@ const ADVISE_SCHEMA: ParseArgsSchema = {
   ],
 };
 
+const TOOLS_SCHEMA: ParseArgsSchema = {
+  flags: [{ name: "sessions", takesValue: true }, { name: "json" }, { name: "help", short: "h" }],
+};
+
+const PERMISSIONS_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "sessions", takesValue: true },
+    { name: "apply" },
+    { name: "json" },
+    { name: "help", short: "h" },
+  ],
+};
+
 const RATE_SCHEMA: ParseArgsSchema = {
   flags: [
     { name: "session", takesValue: true },
@@ -1222,6 +1264,11 @@ function usageText(): string {
     "  cost-summary --session <id>          summarize cost_accrual events for a session",
     "  advise [--session <id> | --all]      mine session logs for spec advice (item 14)",
     "       [--json] [-o <dir>]             writes suggestions.json + report.html (default .crewhaus/advice)",
+    "  tools list                           list every builtin tool + its metadata (item 18)",
+    "  tools suggest [spec.yaml]            rank builtins against agent.instructions (keyword match)",
+    "  tools audit [--sessions N|all]       mine tool_stats vs. grants — unused/failing/readOnly",
+    "  permissions suggest [--apply]        mine ask/deny history into settings.json rules (item 16)",
+    "       [--sessions N|all] [--json]     --apply is interactive-confirm only (never eval-gated)",
     "  rate --session <id> [--turn N]       rate an assistant turn 👍/👎, ⭐, or 0–1",
     "       (--thumbs up|down | --stars 1-5 | --score 0-1) [--comment <t>]",
     "  feedback --session <id> --text <msg> attach a comment/correction to a turn",
@@ -2509,18 +2556,20 @@ async function detectDefaultModel(): Promise<string | undefined> {
  * `BUILTIN_TOOL_MAP` in packages/target-cli/src/index.ts — keep them in sync.
  */
 async function loadToolMap(): Promise<Record<string, RegisteredTool>> {
-  const [fs, bash, todo, web, image, fetchPkg, imageGen, docIngest, codegraph] = await Promise.all([
-    import("@crewhaus/tool-fs"),
-    import("@crewhaus/tool-bash"),
-    import("@crewhaus/tool-todo"),
-    import("@crewhaus/tool-web"),
-    import("@crewhaus/tool-image"),
-    import("@crewhaus/tool-fetch"),
-    import("@crewhaus/tool-image-generation"),
-    import("@crewhaus/tool-document-ingest"),
-    import("@crewhaus/tool-codegraph"),
-  ]);
-  return {
+  const [fs, bash, todo, web, image, fetchPkg, imageGen, docIngest, codegraph, codeExec] =
+    await Promise.all([
+      import("@crewhaus/tool-fs"),
+      import("@crewhaus/tool-bash"),
+      import("@crewhaus/tool-todo"),
+      import("@crewhaus/tool-web"),
+      import("@crewhaus/tool-image"),
+      import("@crewhaus/tool-fetch"),
+      import("@crewhaus/tool-image-generation"),
+      import("@crewhaus/tool-document-ingest"),
+      import("@crewhaus/tool-codegraph"),
+      import("@crewhaus/tool-code-execution"),
+    ]);
+  const map: Record<string, RegisteredTool> = {
     read: fs.read,
     write: fs.write,
     edit: fs.edit,
@@ -2532,6 +2581,14 @@ async function loadToolMap(): Promise<Record<string, RegisteredTool>> {
     webSearch: web.webSearch,
     readImage: image.readImage,
     fetch: fetchPkg.fetch,
+    // Section 18 — sandboxed code execution. These MUST be resolvable at
+    // `crewhaus run` time: `BUILTIN_TOOL_MAP` in target-cli lets a spec's
+    // `tools: [python]` COMPILE, so omitting them here made a compilable CLI
+    // spec crash at run with "unknown tool". The two maps are kept in sync
+    // (guarded by tools-cli's map-sync test).
+    python: codeExec.python,
+    javascript: codeExec.javascript,
+    shell: codeExec.shell,
     imageGenerate: imageGen.imageGenerate,
     ingestDocument: docIngest.ingestDocument,
     // Pillar 2 — AST-aware code intelligence (recipe 54).
@@ -2540,6 +2597,19 @@ async function loadToolMap(): Promise<Record<string, RegisteredTool>> {
     codegraphCallees: codegraph.codegraphCallees,
     codegraphImpact: codegraph.codegraphImpact,
   };
+  // Item 18 map-sync floor: this map's keys ARE the canonical runtime tool
+  // list. `CLI_RUNTIME_TOOL_KEYS` mirrors them (so the map-sync test can
+  // compare against target-cli's BUILTIN_TOOL_MAP without importing the whole
+  // entry file), and `tools list`/`tools audit` resolve `.name`/metadata off
+  // this map. Assert the mirror never drifts from the real map.
+  const built = Object.keys(map).sort();
+  const mirror = [...CLI_RUNTIME_TOOL_KEYS].sort();
+  if (built.length !== mirror.length || built.some((k, i) => k !== mirror[i])) {
+    throw new Error(
+      `loadToolMap keys drifted from CLI_RUNTIME_TOOL_KEYS (tools-cli.ts) — update the mirror. built=${built.join(",")} mirror=${mirror.join(",")}`,
+    );
+  }
+  return map;
 }
 
 /**
@@ -2560,6 +2630,35 @@ async function applyToolConfigs(
     const { registerWebFetchConfig } = await import("@crewhaus/tool-web");
     registerWebFetchConfig(toolConfigs["webFetch"] as Parameters<typeof registerWebFetchConfig>[0]);
   }
+  // Section 18 — code-execution tools (python/javascript/shell) share a single
+  // `registerCodeExecutionConfig`. Mirror target-cli's resolveTools: honor a
+  // per-tool config (first one seen) or the shared `codeExecution`/
+  // `code_execution` alias, register once. Without this the run path ignored
+  // tool_config for code-exec tools that the compiled bundle applies.
+  if (used.has("python") || used.has("javascript") || used.has("shell")) {
+    const cfg =
+      toolConfigs["python"] ??
+      toolConfigs["javascript"] ??
+      toolConfigs["shell"] ??
+      toolConfigs["codeExecution"] ??
+      toolConfigs["code_execution"];
+    if (cfg !== undefined) {
+      const { registerCodeExecutionConfig } = await import("@crewhaus/tool-code-execution");
+      registerCodeExecutionConfig(cfg as Parameters<typeof registerCodeExecutionConfig>[0]);
+    }
+  }
+}
+
+/**
+ * Section 18 — resolve `sandboxAvailable` for the `run` path from the
+ * `CREWHAUS_SANDBOX` env var, using the SAME grammar the compiled bundle
+ * emits (`packages/target-cli` renderRun): unset defaults to `"docker"`
+ * (available); any value whose lowercase is `"noop"` disables the sandbox
+ * floor (code-exec tools are then denied by permission-engine's
+ * `requiresSandbox` floor). Pure — reads only the passed env snapshot.
+ */
+export function resolveSandboxAvailable(env: NodeJS.ProcessEnv = process.env): boolean {
+  return (env["CREWHAUS_SANDBOX"] ?? "docker").toLowerCase() !== "noop";
 }
 
 /**
@@ -2909,6 +3008,33 @@ async function runRunCli(
     );
   }
 
+  // Section 18 — wire the sandbox floor for code-execution tools. #18 made
+  // python/javascript/shell RESOLVABLE at run time, but the run path never set
+  // `sandboxAvailable`, so permission-engine's `requiresSandbox` floor denied
+  // every code-exec call even with a real backend. Mirror the compiled
+  // bundle (target-cli renderRun): resolve availability from CREWHAUS_SANDBOX
+  // and thread it into runChatLoop. Only relevant when the spec declares a
+  // code-exec tool; emit a one-line diagnostic so the state is observable.
+  const hasCodeExecTools = ir.tools.some(
+    (t) => t === "python" || t === "javascript" || t === "shell",
+  );
+  const sandboxAvailable = resolveSandboxAvailable();
+  if (hasCodeExecTools) {
+    if (!sandboxAvailable) {
+      process.stdout.write(
+        "[sandbox] disabled (CREWHAUS_SANDBOX=noop) — python/javascript/shell calls will be denied by the sandbox floor\n",
+      );
+    } else if (process.env["CREWHAUS_SANDBOX"] === undefined) {
+      process.stdout.write(
+        "[sandbox] assuming docker — set CREWHAUS_SANDBOX (docker|podman) to select a backend, or CREWHAUS_SANDBOX=noop to disable code execution\n",
+      );
+    } else {
+      process.stdout.write(
+        `[sandbox] backend "${process.env["CREWHAUS_SANDBOX"]}" — python/javascript/shell enabled (still require an alwaysAllow rule)\n`,
+      );
+    }
+  }
+
   try {
     await runChatLoop({
       model,
@@ -2921,6 +3047,7 @@ async function runRunCli(
       hooks,
       skills,
       slashCommands,
+      ...(hasCodeExecTools ? { sandboxAvailable } : {}),
       ...(subAgents !== undefined ? { subAgents, spawnSubAgent } : {}),
       ...(ir.target === "cli" && ir.agent.maxTokens !== undefined
         ? { maxTokens: ir.agent.maxTokens }
@@ -6772,7 +6899,9 @@ async function runAdvise(args: ParsedArgs): Promise<void> {
         "\n" +
         "mines .crewhaus/sessions (+ .crewhaus/audit) for spec advice:\n" +
         "  repeated tool failures, max_tokens truncation pressure, compaction\n" +
-        "  thrash, permission-ask churn, stop-reason anomalies\n" +
+        "  thrash, permission-ask churn, stop-reason anomalies, learned\n" +
+        "  failure_taxonomy + loop-break rules, sub-agent splits under\n" +
+        "  chronic context pressure\n" +
         "\n" +
         "  --session <id>  mine one session (default: all sessions)\n" +
         "  --json          print machine-readable findings to stdout\n" +
@@ -6867,6 +6996,309 @@ async function runAdvise(args: ParsedArgs): Promise<void> {
   }
   process.stdout.write(`[advise] suggestions: ${suggestionsPath}\n`);
   process.stdout.write(`[advise] report: ${reportPath}\n`);
+}
+
+// -------- shared: read the N most-recent session logs by mtime --------
+
+/**
+ * Read the `limit` most-recently-modified session JSONLs (or ALL when
+ * `limit === "all"`) from `.crewhaus/sessions`, folded into `SessionEvents`.
+ * "Recent" is by mtime — session ids are random hex, so name order carries
+ * no recency (mirrors `runDoctorContextPressure`). A missing dir yields an
+ * empty list; the caller decides whether that is an error.
+ */
+function readRecentSessionEvents(limit: number | "all"): SessionEvents[] {
+  const sessionsDir = join(process.cwd(), ".crewhaus", "sessions");
+  if (!existsSync(sessionsDir)) return [];
+  const files = readdirSync(sessionsDir).filter((f) => f.endsWith(".jsonl"));
+  const ranked = files
+    .map((f) => {
+      const file = join(sessionsDir, f);
+      return { file, sessionId: f.replace(/\.jsonl$/, ""), mtimeMs: statSync(file).mtimeMs };
+    })
+    .sort((a, b) => b.mtimeMs - a.mtimeMs);
+  const chosen = limit === "all" ? ranked : ranked.slice(0, limit);
+  return chosen.map((r) => ({
+    sessionId: r.sessionId,
+    objects: parseAdviseJsonl(readFileSync(r.file, "utf-8")),
+  }));
+}
+
+/** Parse the `--sessions N|all` flag shared by tools audit + future miners. */
+function parseSessionsLimit(args: ParsedArgs, dflt: number): number | "all" {
+  const raw = strFlag(args, "sessions");
+  if (raw === undefined) return dflt;
+  if (raw === "all") return "all";
+  const n = Number.parseInt(raw, 10);
+  if (Number.isNaN(n) || n < 1) {
+    die(`invalid --sessions "${raw}" — must be a positive integer or "all"`);
+  }
+  return n;
+}
+
+// -------- tools: builtin discovery + usage audit (item 18) --------
+
+/**
+ * `crewhaus tools <list|suggest|audit>` — the observer/advisor face over the
+ * built-in tool catalog.
+ *
+ *   list             every builtin (name/description/scope/io/readOnly/…).
+ *   suggest [spec]   deterministic keyword implication over agent.instructions
+ *                    (default spec: cwd crewhaus.yaml).
+ *   audit [--sessions N|all]  mine tool_stats across sessions vs. the spec's
+ *                    grants — unused / failing / learned-readOnly. ADVICE-ONLY
+ *                    (tools: is not optimizer-whitelisted; every edit is a
+ *                    human-review suggestion).
+ */
+async function runTools(action: string, args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus tools <list|suggest|audit>\n" +
+        "\n" +
+        "  list                     print every builtin tool + its metadata\n" +
+        "  suggest [spec.yaml]      rank builtins against agent.instructions\n" +
+        "                           (deterministic keyword match; default spec\n" +
+        "                           is ./crewhaus.yaml)\n" +
+        "  audit [--sessions N|all] mine tool_stats across sessions vs. the\n" +
+        "                           spec's tools: grants — unused / failing /\n" +
+        "                           learned-readOnly (advice-only; tools: is not\n" +
+        "                           optimizer-whitelisted)\n" +
+        "\n" +
+        "  --json  machine-readable output\n",
+    );
+    return;
+  }
+  const jsonMode = args.flags["json"] === true;
+  const toolMap = await loadToolMap();
+
+  if (action === "list") {
+    const rows = buildToolList(toolMap);
+    if (jsonMode) {
+      process.stdout.write(`${JSON.stringify({ tools: rows }, null, 2)}\n`);
+      return;
+    }
+    process.stdout.write(`${rows.length} builtin tool(s):\n`);
+    for (const line of formatToolListLines(rows)) process.stdout.write(`${line}\n`);
+    return;
+  }
+
+  if (action === "suggest") {
+    const specPath = args.positional[0] ?? join(process.cwd(), "crewhaus.yaml");
+    if (!existsSync(specPath)) {
+      die(`spec not found at ${specPath} — pass a spec path or run from a harness dir`);
+    }
+    let spec: Spec;
+    try {
+      spec = parseSpec(readFileSync(specPath, "utf-8"));
+    } catch (err) {
+      die(`${specPath} did not parse: ${(err as Error).message}`);
+    }
+    const specRecord = spec as unknown as Record<string, unknown>;
+    const agent = specRecord["agent"] as Record<string, unknown> | undefined;
+    const instructions = typeof agent?.["instructions"] === "string" ? agent["instructions"] : "";
+    const specTools = Array.isArray(specRecord["tools"])
+      ? (specRecord["tools"] as unknown[]).filter((t): t is string => typeof t === "string")
+      : [];
+    const result = suggestTools(instructions, specTools, CLI_RUNTIME_TOOL_KEYS, toolMap);
+    if (jsonMode) {
+      process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+      return;
+    }
+    for (const line of formatSuggestLines(result)) process.stdout.write(`${line}\n`);
+    return;
+  }
+
+  if (action === "audit") {
+    const limit = parseSessionsLimit(args, DEFAULT_AUDIT_SESSIONS);
+    const sessions = readRecentSessionEvents(limit);
+    if (sessions.length === 0) {
+      die(
+        `no session logs found at ${join(process.cwd(), ".crewhaus", "sessions")} — run the agent first, then audit`,
+      );
+    }
+    // The cwd spec supplies the grant list; without one we still report the
+    // failing/read-only findings mined purely from usage.
+    let specTools: string[] = [];
+    let hasExplicitToolList = false;
+    const specPath = join(process.cwd(), "crewhaus.yaml");
+    if (existsSync(specPath)) {
+      try {
+        const spec = parseSpec(readFileSync(specPath, "utf-8")) as unknown as Record<
+          string,
+          unknown
+        >;
+        if (Array.isArray(spec["tools"])) {
+          specTools = (spec["tools"] as unknown[]).filter(
+            (t): t is string => typeof t === "string",
+          );
+          hasExplicitToolList = true;
+        }
+      } catch (err) {
+        process.stderr.write(
+          `[tools audit] crewhaus.yaml did not parse (${(err as Error).message}) — auditing usage only\n`,
+        );
+      }
+    }
+    const usage = buildToolUsage(sessions);
+    const result = auditTools({ sessions, specTools, usage, toolMap, hasExplicitToolList });
+    if (jsonMode) {
+      process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+      return;
+    }
+    process.stdout.write(
+      `tools audit: ${result.findings.length} finding(s) across ${result.sessionIds.length} session(s)\n`,
+    );
+    for (const line of formatAuditLines(result)) process.stdout.write(`${line}\n`);
+    return;
+  }
+
+  die(`tools action must be one of: list, suggest, audit (got "${action}")`);
+}
+
+/** Default sessions the `tools audit` miner scans (mirrors context-pressure). */
+const DEFAULT_AUDIT_SESSIONS = 20;
+
+// -------- permissions: mine ask/deny history into rules (item 16) --------
+
+/** Default sessions the permissions miner scans (mirrors tools audit). */
+const DEFAULT_PERMISSIONS_SESSIONS = 20;
+
+/**
+ * `crewhaus permissions suggest [--sessions N|all] [--apply] [--json]` — mine
+ * the persisted `permission` ask/deny history across sessions into reviewable
+ * `.crewhaus/settings.json` permission rules: `alwaysAllow` for recurring
+ * human-APPROVED asks (read-only tools first), `alwaysAsk` tightenings for
+ * recurring DENIED asks. Prints an additive diff of the settings permissions
+ * block.
+ *
+ * `--apply` is ALWAYS an interactive human confirm — permissions are excluded
+ * from OPTIMIZABLE_PATHS by design, so this path is NEVER eval-gated
+ * auto-apply. A non-TTY `--apply` REFUSES: it prints the diff and tells the
+ * user to run interactively.
+ */
+async function runPermissions(action: string, args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus permissions suggest [--sessions N|all] [--apply] [--json]\n" +
+        "\n" +
+        "mines .crewhaus/sessions `permission` ask/deny history into rules:\n" +
+        "  alwaysAllow  recurring human-APPROVED asks (read-only tools first)\n" +
+        "  alwaysAsk    recurring DENIED asks (tighten — keep prompting)\n" +
+        "\n" +
+        "  --sessions N|all  how many recent sessions to mine (default 20)\n" +
+        "  --apply           write the additions to .crewhaus/settings.json\n" +
+        "                    (ALWAYS interactive-confirm; refuses in a non-TTY —\n" +
+        "                    permissions are never eval-gated auto-apply)\n" +
+        "  --json            machine-readable output\n",
+    );
+    return;
+  }
+  if (action !== "suggest") {
+    die(`permissions action must be "suggest" (got "${action}")`);
+  }
+
+  const limit = parseSessionsLimit(args, DEFAULT_PERMISSIONS_SESSIONS);
+  const sessions = readRecentSessionEvents(limit);
+  if (sessions.length === 0) {
+    die(
+      `no session logs found at ${join(process.cwd(), ".crewhaus", "sessions")} — run the agent first, then suggest`,
+    );
+  }
+
+  // Read-only-ness comes from the resolvable tool map (keyed by RegisteredTool
+  // `.name`, which is what the ask aggregate is keyed by).
+  const toolMap = await loadToolMap();
+  const readOnly = readOnlyByName(toolMap);
+  const aggregates = aggregateAsks(sessions);
+  const suggestions: PermissionSuggestion[] = rankSuggestions(aggregates, readOnly);
+
+  // Existing settings rules (the exact shape buildRuleSet consumes).
+  const settingsPath = join(process.cwd(), ".crewhaus", "settings.json");
+  let settingsRoot: unknown;
+  if (existsSync(settingsPath)) {
+    try {
+      settingsRoot = JSON.parse(readFileSync(settingsPath, "utf-8"));
+    } catch (err) {
+      die(`failed to parse ${settingsPath}: ${(err as Error).message}`);
+    }
+  }
+  const existing = existingSettingsRules(settingsRoot);
+  const diff = diffPermissions(existing, suggestions);
+
+  if (args.flags["json"] === true) {
+    process.stdout.write(
+      `${JSON.stringify({ sessionIds: sessions.map((s) => s.sessionId), suggestions, diff }, null, 2)}\n`,
+    );
+    if (args.flags["apply"] !== true) return;
+  } else {
+    process.stdout.write(
+      `permissions: ${suggestions.length} suggestion(s) from ${sessions.length} session(s)\n`,
+    );
+    if (suggestions.length === 0) {
+      process.stdout.write("no recurring ask/deny patterns to turn into rules\n");
+    }
+    for (const line of formatSuggestionLines(suggestions)) process.stdout.write(`${line}\n`);
+    process.stdout.write("\n");
+    for (const line of formatSettingsDiff(diff)) process.stdout.write(`${line}\n`);
+  }
+
+  if (args.flags["apply"] !== true) {
+    if (diff.additions.length > 0) {
+      process.stdout.write("\nrun with --apply to write these additions (interactive confirm).\n");
+    }
+    return;
+  }
+
+  // ---- --apply: interactive-confirm ONLY ----
+  if (diff.additions.length === 0) {
+    process.stdout.write("nothing to apply — no new rules.\n");
+    return;
+  }
+  // Non-TTY --apply REFUSES. Permissions must never be widened by an
+  // unattended pipe; the diff is already printed above.
+  if (process.stdin.isTTY !== true || process.stdout.isTTY !== true) {
+    die(
+      "--apply refuses in a non-interactive shell: permissions are never applied unattended. " +
+        "Review the diff above and re-run `crewhaus permissions suggest --apply` in an interactive terminal.",
+    );
+  }
+  const confirmed = await confirmYesNo(
+    `apply ${diff.additions.length} new permission rule(s) to ${relative(process.cwd(), settingsPath) || settingsPath}? [y/N] `,
+  );
+  if (!confirmed) {
+    process.stdout.write("aborted — settings.json unchanged.\n");
+    return;
+  }
+  const newRoot = applyToSettingsRoot(settingsRoot, diff.merged);
+  mkdirSync(dirname(settingsPath), { recursive: true });
+  writeFileSync(settingsPath, `${JSON.stringify(newRoot, null, 2)}\n`);
+  process.stdout.write(`[permissions] wrote ${diff.additions.length} rule(s) to ${settingsPath}\n`);
+}
+
+/**
+ * One-line y/N confirm over a TTY. Returns true only on an explicit
+ * y/yes (default No). Thin IO — the caller has already gated on isTTY.
+ */
+async function confirmYesNo(prompt: string): Promise<boolean> {
+  const stdin = process.stdin;
+  process.stdout.write(prompt);
+  return await new Promise<boolean>((resolveConfirm) => {
+    let done = false;
+    const finish = (v: boolean): void => {
+      if (done) return;
+      done = true;
+      stdin.off("data", onData);
+      stdin.pause();
+      process.stdout.write("\n");
+      resolveConfirm(v);
+    };
+    const onData = (chunk: Buffer | string): void => {
+      const answer = chunk.toString().trim().toLowerCase();
+      finish(answer === "y" || answer === "yes");
+    };
+    stdin.resume();
+    stdin.once("data", onData);
+  });
 }
 
 // -------- response feedback: rate / feedback / distill --------
@@ -9018,6 +9450,22 @@ switch (subcommand) {
   case "advise":
     await runAdvise(parseFor(rest, ADVISE_SCHEMA));
     break;
+  case "tools": {
+    const action = rest[0] ?? "";
+    if (action !== "list" && action !== "suggest" && action !== "audit") {
+      die(`tools action must be one of: list, suggest, audit (got "${action}")`);
+    }
+    await runTools(action, parseFor(rest.slice(1), TOOLS_SCHEMA));
+    break;
+  }
+  case "permissions": {
+    const action = rest[0] ?? "";
+    if (action !== "suggest") {
+      die(`permissions action must be "suggest" (got "${action}")`);
+    }
+    await runPermissions(action, parseFor(rest.slice(1), PERMISSIONS_SCHEMA));
+    break;
+  }
   case "rate":
     await runRate(parseFor(rest, RATE_SCHEMA));
     break;

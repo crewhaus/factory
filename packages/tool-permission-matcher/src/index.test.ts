@@ -1,6 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import { CrewhausError } from "@crewhaus/errors";
-import { PatternParseError, compilePattern, matchesPattern } from "./index";
+import {
+  GLOB_METACHARS,
+  OPERATIVE_ARG_FIELDS,
+  PatternParseError,
+  compilePattern,
+  escapeGlobLiteral,
+  matchesPattern,
+} from "./index";
 
 describe("compilePattern — no-arg patterns", () => {
   test("exact name matches itself", () => {
@@ -126,5 +133,57 @@ describe("compilePattern — error cases", () => {
 
   test("PatternParseError has code 'tool'", () => {
     expect(new PatternParseError("x").code).toBe("tool");
+  });
+});
+
+describe("escapeGlobLiteral (glob-metachar neutralisation)", () => {
+  test("escapes `*` so it matches only the literal asterisk", () => {
+    const p = compilePattern(`Bash(npm run test:${escapeGlobLiteral("*")})`);
+    // globToRegex must treat the escaped `*` as a literal, not a wildcard.
+    expect(matchesPattern(p, "Bash", { command: "npm run test:*" })).toBe(true);
+    expect(matchesPattern(p, "Bash", { command: "npm run test:DELETE" })).toBe(false);
+  });
+
+  test("escapes `?` so it matches only the literal question mark", () => {
+    const p = compilePattern(`Read(${escapeGlobLiteral("/a?b")})`);
+    expect(matchesPattern(p, "Read", { file_path: "/a?b" })).toBe(true);
+    expect(matchesPattern(p, "Read", { file_path: "/aXb" })).toBe(false);
+  });
+
+  test("escapes a backslash so it round-trips as a literal", () => {
+    const raw = "a\\b*c";
+    const p = compilePattern(`Bash(${escapeGlobLiteral(raw)})`);
+    expect(matchesPattern(p, "Bash", { command: raw })).toBe(true);
+    // The `*` must not widen.
+    expect(matchesPattern(p, "Bash", { command: "a\\bZZZc" })).toBe(false);
+  });
+
+  test("leaves plain values untouched", () => {
+    expect(escapeGlobLiteral("git status")).toBe("git status");
+  });
+
+  test("GLOB_METACHARS lists exactly the widening chars the grammar treats specially", () => {
+    expect([...GLOB_METACHARS].sort()).toEqual(["*", "?", "\\"].sort());
+  });
+});
+
+describe("globToRegex — backslash escape (additive, back-compat)", () => {
+  test("a bare `\\` with no following char is a literal backslash (no crash)", () => {
+    // Trailing backslash: no escape target → matched literally.
+    const p = compilePattern("Bash(a\\)");
+    expect(matchesPattern(p, "Bash", { command: "a\\" })).toBe(true);
+  });
+
+  test("unescaped `*` still widens (grammar unchanged for existing patterns)", () => {
+    const p = compilePattern("Bash(git *)");
+    expect(matchesPattern(p, "Bash", { command: "git status" })).toBe(true);
+  });
+});
+
+describe("OPERATIVE_ARG_FIELDS (exported single source of truth)", () => {
+  test("covers the arg-constrained built-in tools", () => {
+    for (const t of ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "Fetch", "WebFetch"]) {
+      expect(OPERATIVE_ARG_FIELDS[t]?.length ?? 0).toBeGreaterThan(0);
+    }
   });
 });
