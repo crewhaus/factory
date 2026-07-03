@@ -147,6 +147,60 @@ export function familyPrefixOf(
   return undefined;
 }
 
+/** The sentinel value an aux model knob may take instead of a concrete id. */
+export const CHEAPEST_SENTINEL = "cheapest";
+
+/**
+ * Minimal provider + wire-id parse for a spec model string, self-contained so
+ * cost-tracker need not depend on the full model-router grammar. Covers the
+ * four table-backed providers; returns `undefined` for local/azure/named-host
+ * strings (which carry no pricing rows anyway).
+ */
+export function providerOfSpecString(
+  modelString: string,
+): { readonly provider: CandidateProvider; readonly modelId: string } | undefined {
+  if (modelString.startsWith("openai/")) {
+    return { provider: "openai", modelId: modelString.slice("openai/".length) };
+  }
+  if (modelString.startsWith("gemini/")) {
+    return { provider: "gemini", modelId: modelString.slice("gemini/".length) };
+  }
+  if (modelString.startsWith("bedrock/")) {
+    return { provider: "bedrock", modelId: modelString.slice("bedrock/".length) };
+  }
+  if (modelString.startsWith("vertex/claude-")) {
+    return { provider: "anthropic", modelId: modelString.slice("vertex/".length) };
+  }
+  if (modelString.startsWith("vertex/gemini-")) {
+    return { provider: "gemini", modelId: modelString.slice("vertex/".length) };
+  }
+  if (modelString.startsWith("claude-")) {
+    return { provider: "anthropic", modelId: modelString };
+  }
+  // local/azure/named-host/openai-compat: not table-backed.
+  return undefined;
+}
+
+/**
+ * Item 25 — resolve the `cheapest` sentinel for an aux slot given the PRIMARY
+ * model's spec string (the sentinel resolves same-provider to the primary).
+ * Returns the concrete spec model string, or `undefined` when the primary's
+ * provider isn't table-backed or nothing qualifies. Compile/boot calls this;
+ * `doctor` prints the result.
+ */
+export function resolveCheapestForSlot(
+  primaryModel: string,
+  opts: {
+    readonly pricing?: PricingTable;
+    readonly capabilities?: CapabilityTable;
+    readonly require?: CapabilityRequirement;
+  } = {},
+): string | undefined {
+  const parsed = providerOfSpecString(primaryModel);
+  if (parsed === undefined) return undefined;
+  return resolveCheapest(parsed, opts)?.modelString;
+}
+
 /**
  * Resolve the `cheapest` sentinel for an auxiliary slot: the lowest blended
  * price SAME-PROVIDER family whose capabilities satisfy `require`. Returns the

@@ -457,6 +457,70 @@ compaction:
 `);
     expect(bundle.files).toHaveLength(2);
   });
+
+  // Item 25 — the `cheapest` sentinel for compaction.model resolves AT COMPILE
+  // TIME to the cheapest same-provider (as the primary) pricing-table family.
+  test('compaction.model "cheapest" resolves to the cheapest same-provider model', () => {
+    const spec = parseSpec(`
+name: hello
+target: cli
+agent:
+  model: claude-opus-4-7
+  instructions: be helpful
+compaction:
+  model: cheapest
+`);
+    const ir = lower(spec);
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    // Cheapest anthropic family in DEFAULT_PRICING is claude-3-5-haiku.
+    expect(ir.compaction.model).toBe("claude-3-5-haiku");
+  });
+
+  test('"cheapest" follows the primary provider (openai primary → openai aux)', () => {
+    const spec = parseSpec(`
+name: hello
+target: cli
+agent:
+  model: openai/gpt-5
+  instructions: be helpful
+compaction:
+  model: cheapest
+`);
+    const ir = lower(spec);
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect(ir.compaction.model?.startsWith("openai/")).toBe(true);
+  });
+
+  test("a concrete compaction.model passes through unchanged (not a sentinel)", () => {
+    const spec = parseSpec(`
+name: hello
+target: cli
+agent:
+  model: claude-opus-4-7
+  instructions: be helpful
+compaction:
+  model: claude-haiku-4-5
+`);
+    const ir = lower(spec);
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect(ir.compaction.model).toBe("claude-haiku-4-5");
+  });
+
+  test('"cheapest" against a non-table primary is a compile error', () => {
+    expect(() =>
+      lower(
+        parseSpec(`
+name: hello
+target: cli
+agent:
+  model: local/llama3.2@http://localhost:11434/v1
+  instructions: be helpful
+compaction:
+  model: cheapest
+`),
+      ),
+    ).toThrow(/cheapest/);
+  });
 });
 
 // Section 21 — pipeline vector-store backend selection. The IR/spec union

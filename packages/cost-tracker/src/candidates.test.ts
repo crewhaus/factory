@@ -6,8 +6,10 @@ import {
   blendedPer1M,
   enumerateCandidates,
   familyPrefixOf,
+  providerOfSpecString,
   rankRightSizeProposals,
   resolveCheapest,
+  resolveCheapestForSlot,
   specStringFor,
 } from "./candidates";
 import type { CapabilityTable } from "./capabilities";
@@ -194,6 +196,46 @@ describe("blendedPer1M", () => {
   test("3:1 input:output blend", () => {
     // (15*3 + 75)/4 = 30
     expect(blendedPer1M({ inputPer1M: 15, outputPer1M: 75 })).toBe(30);
+  });
+});
+
+describe("providerOfSpecString", () => {
+  test("parses each table-backed provider prefix", () => {
+    expect(providerOfSpecString("claude-opus-4-7")).toEqual({
+      provider: "anthropic",
+      modelId: "claude-opus-4-7",
+    });
+    expect(providerOfSpecString("openai/gpt-5")).toEqual({ provider: "openai", modelId: "gpt-5" });
+    expect(providerOfSpecString("gemini/gemini-2.5-flash")).toEqual({
+      provider: "gemini",
+      modelId: "gemini-2.5-flash",
+    });
+    expect(providerOfSpecString("bedrock/meta.llama3-1-70b")).toEqual({
+      provider: "bedrock",
+      modelId: "meta.llama3-1-70b",
+    });
+  });
+  test("vertex/ maps to the underlying provider", () => {
+    expect(providerOfSpecString("vertex/claude-opus-4")?.provider).toBe("anthropic");
+    expect(providerOfSpecString("vertex/gemini-2.5-pro")?.provider).toBe("gemini");
+  });
+  test("undefined for non-table-backed strings", () => {
+    expect(providerOfSpecString("local/llama@http://x/v1")).toBeUndefined();
+    expect(providerOfSpecString("groq/llama-3.3-70b")).toBeUndefined();
+    expect(providerOfSpecString("azure/dep")).toBeUndefined();
+  });
+});
+
+describe("resolveCheapestForSlot", () => {
+  test("resolves the cheapest same-provider model from a primary spec string", () => {
+    const resolved = resolveCheapestForSlot("claude-opus", {
+      pricing: PRICING,
+      capabilities: CAPS,
+    });
+    expect(resolved).toBe("claude-haiku");
+  });
+  test("undefined when the primary provider isn't table-backed", () => {
+    expect(resolveCheapestForSlot("local/llama@http://x/v1", { pricing: PRICING })).toBeUndefined();
   });
 });
 

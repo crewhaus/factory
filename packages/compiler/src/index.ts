@@ -1,3 +1,4 @@
+import { CHEAPEST_SENTINEL, resolveCheapestForSlot } from "@crewhaus/cost-tracker";
 import { CompilerError } from "@crewhaus/errors";
 import { assertNever } from "@crewhaus/infra-utils";
 import type {
@@ -435,11 +436,43 @@ function lowerCompaction(spec: SpecWithPermissions): IrCompaction {
   const out: {
     -readonly [K in keyof IrCompaction]: IrCompaction[K];
   } = {};
-  if (c.model !== undefined) out.model = c.model;
+  if (c.model !== undefined) out.model = resolveAuxModel(c.model, spec, "compaction.model");
   if (c.curate !== undefined) out.curate = c.curate;
   if (c.dedupeThreshold !== undefined) out.dedupeThreshold = c.dedupeThreshold;
   if (c.relevanceTopK !== undefined) out.relevanceTopK = c.relevanceTopK;
   return out;
+}
+
+/**
+ * Item 25 — the `cheapest` sentinel for an AUX model knob (compaction.model,
+ * judge model, …). Resolved AT COMPILE TIME to the lowest-cost same-provider
+ * model (as the primary's provider) whose capabilities satisfy the slot, so
+ * the IR — and every emitted bundle — carries a concrete model id. An aux slot
+ * summarizes / grades text, so its capability requirement is empty (any
+ * same-provider family qualifies); `cheapest` therefore resolves to the
+ * provider's cheapest family. A non-`cheapest` value passes through verbatim.
+ *
+ * When the primary is a provider the pricing table doesn't cover (local/,
+ * azure/, a named host) `cheapest` cannot be resolved offline — the sentinel
+ * is a compile ERROR there (the operator must name a concrete model), because
+ * silently leaving the literal string `"cheapest"` in the IR would fail later
+ * at `resolveModel` with a far less actionable message.
+ */
+function resolveAuxModel(value: string, spec: SpecWithPermissions, slotLabel: string): string {
+  if (value !== CHEAPEST_SENTINEL) return value;
+  const primary = (spec as { agent?: { model?: unknown } }).agent?.model;
+  if (typeof primary !== "string") {
+    throw new CompilerError(
+      `${slotLabel}: "cheapest" needs a primary agent.model to resolve against, but this spec has none`,
+    );
+  }
+  const resolved = resolveCheapestForSlot(primary);
+  if (resolved === undefined) {
+    throw new CompilerError(
+      `${slotLabel}: "cheapest" cannot be resolved for primary model "${primary}" — its provider is not in the pricing table (local/azure/named-host). Name a concrete model instead.`,
+    );
+  }
+  return resolved;
 }
 
 /**

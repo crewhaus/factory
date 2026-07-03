@@ -48,7 +48,7 @@ import {
   renderReport,
   setBaseline,
 } from "@crewhaus/eval-report";
-import { runEval as runEvalLib } from "@crewhaus/eval-runner";
+import { type EvalRunSummary, runEval as runEvalLib } from "@crewhaus/eval-runner";
 import { openEventLog } from "@crewhaus/event-log";
 import { loadHooks } from "@crewhaus/hooks-engine";
 import {
@@ -304,6 +304,15 @@ import {
   runRetentionPurge,
   runRetentionSweep,
 } from "./retention";
+// Item 25 — model right-sizing downshift search core (pure enumeration + cost
+// projection + $/score ranking); side-effect-free so it is unit-testable.
+import {
+  type BaselineEvalOutcome,
+  type ModelSlot,
+  type SlotEvalOutcome,
+  buildRightSizeReport,
+  enumerateSlotCandidates,
+} from "./right-size";
 // FR-002 — Pillar 3 sink-side scope gate, shared by `compile --strict` and
 // `doctor --philosophy-alignment`. Kept in a side-effect-free module so it is
 // unit-testable (this entry file runs an argv switch on import).
@@ -527,6 +536,29 @@ const MODEL_SCAN_SCHEMA: ParseArgsSchema = {
 const PRICING_SCHEMA: ParseArgsSchema = {
   flags: [
     { name: "file", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
+// Item 25 — `crewhaus model right-size <spec>`: enumerate → compile → eval
+// downshift search for a cheaper model that holds quality. Proposal-only
+// unless --write.
+const MODEL_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "dataset", takesValue: true },
+    { name: "graders", takesValue: true },
+    { name: "out", short: "o", takesValue: true },
+    { name: "concurrency", takesValue: true },
+    { name: "seed", takesValue: true },
+    { name: "judge-model", takesValue: true },
+    // Minimum cost drop (fraction, e.g. 0.2 = 20%) to recommend a downshift.
+    { name: "min-cost-drop", takesValue: true },
+    // Pass-rate tolerance (fraction) a downshift may dip and still recommend.
+    { name: "pass-rate-tolerance", takesValue: true },
+    // Max candidates per slot (cheapest-first). Default 3.
+    { name: "per-slot-limit", takesValue: true },
+    // Apply the winning downshift via a direct comment-preserving CST edit.
+    { name: "write", takesValue: false },
     { name: "help", short: "h" },
   ],
 };
@@ -2271,14 +2303,22 @@ function runDoctorModels(): void {
   const specPath = join(process.cwd(), "crewhaus.yaml");
   let agentModel: string | undefined;
   const auxModels: Array<{ slot: string; model: string }> = [];
+  const sentinelResolutions: Array<{ slot: string; resolved: string }> = [];
   if (existsSync(specPath)) {
     try {
-      const ir = lower(parseSpec(readFileSync(specPath, "utf-8")));
+      const rawSpec = parseSpec(readFileSync(specPath, "utf-8"));
+      const ir = lower(rawSpec);
       const agent = (ir as { agent?: { model?: unknown } }).agent;
       if (agent !== undefined && typeof agent.model === "string") agentModel = agent.model;
       const compaction = (ir as { compaction?: { model?: unknown } }).compaction;
       if (compaction !== undefined && typeof compaction.model === "string") {
         auxModels.push({ slot: "compaction.model", model: compaction.model });
+        // Item 25 — surface what `cheapest` resolved to: the RAW spec said
+        // "cheapest", the lowered IR carries the concrete model.
+        const rawCompaction = (rawSpec as { compaction?: { model?: unknown } }).compaction;
+        if (rawCompaction?.model === "cheapest") {
+          sentinelResolutions.push({ slot: "compaction.model", resolved: compaction.model });
+        }
       }
       const subAgents = (ir as { subAgents?: ReadonlyArray<{ name?: string; model?: unknown }> })
         .subAgents;
@@ -2303,6 +2343,9 @@ function runDoctorModels(): void {
       anyFail = true;
       process.stdout.write(`✗ ${c.label}: ${c.reason ?? "failed"}\n`);
     }
+  }
+  for (const s of sentinelResolutions) {
+    process.stdout.write(`ℹ ${s.slot}: "cheapest" resolved to ${s.resolved}\n`);
   }
   if (agentModel === undefined) {
     process.stdout.write(
@@ -4517,6 +4560,267 @@ async function runModelScan(args: ParsedArgs): Promise<void> {
       `[model-scan] note: ${crashed.length} cell(s) failed to run (${crashed.map((r) => r.model).join(", ")})\n`,
     );
   }
+}
+
+/** Apply a single-slot model swap to a lowered CLI IR, in-memory. `path` is
+ *  ["agent","model"], ["compaction","model"], or ["subAgents", i, "model"]. */
+function patchIrModelSlot(
+  ir: Extract<ReturnType<typeof lower>, { target: "cli" }>,
+  slot: ModelSlot,
+  model: string,
+): Extract<ReturnType<typeof lower>, { target: "cli" }> {
+  if (slot.label === "agent.model") {
+    return { ...ir, agent: { ...ir.agent, model } };
+  }
+  if (slot.label === "compaction.model") {
+    return { ...ir, compaction: { ...ir.compaction, model } };
+  }
+  if (slot.label.startsWith("sub-agent ") && ir.subAgents !== undefined) {
+    const subAgents = ir.subAgents.map((sa) =>
+      sa.model === slot.currentModel && `sub-agent ${sa.name}.model` === slot.label
+        ? { ...sa, model }
+        : sa,
+    );
+    return { ...ir, subAgents };
+  }
+  return ir;
+}
+
+/**
+ * Item 25 — `crewhaus model right-size <spec>`. A dedicated enumerate →
+ * compile → eval loop (NOT the prompt mutator): each candidate is the spec
+ * with ONE model slot (agent.model / sub-agent.model / compaction.model)
+ * swapped to a cheaper same-provider pricing-table sibling. Baseline + each
+ * candidate are evaled; per-candidate USD is projected from the eval's token
+ * aggregates (eval artifacts carry no cost_accrual); the set is ranked by
+ * score-retained-per-dollar-saved. Recommends ONLY when pass-rate holds and
+ * cost drops >= --min-cost-drop. Proposal-only unless --write (a direct
+ * comment-preserving CST edit — model paths stay outside OPTIMIZABLE_PATHS).
+ */
+async function runModelRightSize(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus model right-size [<spec.yaml>] --dataset <data> --graders <graders.yaml>\n" +
+        "                                 [--min-cost-drop 0.2] [--pass-rate-tolerance 0.0]\n" +
+        "                                 [--per-slot-limit 3] [--concurrency N] [--seed N]\n" +
+        "                                 [--judge-model <m>] [-o <dir>] [--write]\n" +
+        "  Enumerate → compile → eval downshift search: for each model slot (agent.model,\n" +
+        "  compaction.model, sub-agents[*].model) tries the cheaper same-provider pricing-\n" +
+        "  table siblings, evals each against the baseline spec on the dataset, projects\n" +
+        "  per-candidate USD from token totals, and ranks by score-retained-per-dollar-\n" +
+        "  saved. Recommends the biggest swap that HOLDS pass-rate (within\n" +
+        "  --pass-rate-tolerance, default 0) and cuts cost by >= --min-cost-drop\n" +
+        "  (default 0.2). Writes matrix.json/index.html + patch.json (the winner) to -o.\n" +
+        "  --write applies the winner to the spec via a direct comment-preserving CST\n" +
+        "  edit (model fields are outside OPTIMIZABLE_PATHS; always human-initiated).\n",
+    );
+    return;
+  }
+  const datasetPath = args.flags["dataset"];
+  const gradersPath = args.flags["graders"];
+  if (typeof datasetPath !== "string") die("model right-size: missing --dataset <data>");
+  if (typeof gradersPath !== "string") die("model right-size: missing --graders <graders.yaml>");
+
+  const specArg = args.positional[0];
+  const specPath =
+    typeof specArg === "string" ? resolve(specArg) : join(process.cwd(), "crewhaus.yaml");
+  if (!existsSync(specPath)) die(`model right-size: no spec at ${specPath}`);
+  const yamlText = readFileSync(specPath, "utf-8");
+  let ir: ReturnType<typeof lower>;
+  try {
+    ir = lower(parseSpec(yamlText));
+  } catch (err) {
+    if (err instanceof SpecParseError) die(err.message);
+    throw err;
+  }
+  if (ir.target !== "cli") die(`model right-size only supports target: cli (got "${ir.target}")`);
+  const cliIr = ir;
+
+  // Collect the swappable slots off the LOWERED ir (compaction.model may be a
+  // resolved `cheapest` — right-size searches from wherever it landed).
+  const slots: ModelSlot[] = [
+    { label: "agent.model", currentModel: cliIr.agent.model, path: ["agent", "model"] },
+  ];
+  if (cliIr.compaction.model !== undefined) {
+    slots.push({
+      label: "compaction.model",
+      currentModel: cliIr.compaction.model,
+      path: ["compaction", "model"],
+    });
+  }
+  for (const sa of cliIr.subAgents ?? []) {
+    if (sa.model !== undefined) {
+      slots.push({ label: `sub-agent ${sa.name}.model`, currentModel: sa.model });
+    }
+  }
+
+  const pricing = loadUserPricing();
+  const candidates = enumerateSlotCandidates(slots, {
+    pricing,
+    ...(typeof args.flags["per-slot-limit"] === "string"
+      ? { perSlotLimit: Number.parseInt(args.flags["per-slot-limit"], 10) }
+      : {}),
+  });
+  if (candidates.length === 0) {
+    die(
+      "model right-size: no cheaper same-provider downshift candidates for any slot (models may already be cheapest-in-class or off the pricing table)",
+    );
+  }
+
+  const gradersYaml = readFileSync(resolve(gradersPath), "utf-8");
+  const { compiled } = parseGradersConfig(gradersYaml);
+  const dataset = await loadDataset(resolve(datasetPath));
+  const datasetHash = hashDatasetFile(resolve(datasetPath));
+  const samples = await collectSamples(dataset.samples);
+
+  const concurrencyFlag = args.flags["concurrency"];
+  const seedFlag = args.flags["seed"];
+  const judgeModelFlag = args.flags["judge-model"];
+  const concurrency =
+    typeof concurrencyFlag === "string" ? Number.parseInt(concurrencyFlag, 10) : undefined;
+  const seed = typeof seedFlag === "string" ? Number.parseInt(seedFlag, 10) : undefined;
+  const minCostDrop =
+    typeof args.flags["min-cost-drop"] === "string"
+      ? Number.parseFloat(args.flags["min-cost-drop"])
+      : 0.2;
+  const passRateTolerance =
+    typeof args.flags["pass-rate-tolerance"] === "string"
+      ? Number.parseFloat(args.flags["pass-rate-tolerance"])
+      : 0;
+
+  const outArg = args.flags["out"];
+  const rootDir =
+    typeof outArg === "string"
+      ? resolve(outArg)
+      : resolve(join(".crewhaus", `right-size_${randomBytes(8).toString("hex")}`));
+  mkdirSync(rootDir, { recursive: true });
+
+  const runOne = async (
+    candidateIr: Extract<ReturnType<typeof lower>, { target: "cli" }>,
+    label: string,
+  ): Promise<EvalRunSummary> => {
+    const cellDir = join(rootDir, label.replace(/[^A-Za-z0-9._-]+/g, "_"));
+    return runEvalLib({
+      ir: candidateIr,
+      dataset: { name: dataset.name, samples: makeAsyncIterable(samples) },
+      compiledGraders: compiled,
+      opts: {
+        outDir: cellDir,
+        datasetHash,
+        ...(concurrency !== undefined ? { concurrency } : {}),
+        ...(seed !== undefined ? { seed } : {}),
+        ...(typeof judgeModelFlag === "string" ? { judgeModel: judgeModelFlag } : {}),
+      },
+    });
+  };
+
+  process.stdout.write(
+    `[right-size] baseline + ${candidates.length} downshift candidate(s) × ${samples.length} samples → ${rootDir}\n`,
+  );
+
+  // Baseline first.
+  const baselineSummary = await runOne(cliIr, "baseline");
+  const baseline: BaselineEvalOutcome = {
+    passRate: baselineSummary.aggregates.passRate,
+    tokens: baselineSummary.aggregates.totalTokens,
+    model: cliIr.agent.model,
+  };
+
+  const outcomes: SlotEvalOutcome[] = [];
+  for (const candidate of candidates) {
+    const label = `${candidate.slot.label}=${candidate.candidateModel}`;
+    try {
+      const summary = await runOne(
+        patchIrModelSlot(cliIr, candidate.slot, candidate.candidateModel),
+        label,
+      );
+      const crashed =
+        summary.samples.length > 0 && summary.aggregates.errorCount >= summary.samples.length;
+      outcomes.push({
+        candidate,
+        passRate: summary.aggregates.passRate,
+        tokens: summary.aggregates.totalTokens,
+        ...(crashed ? { error: "all samples errored" } : {}),
+      });
+    } catch (err) {
+      outcomes.push({
+        candidate,
+        passRate: 0,
+        tokens: { input: 0, output: 0 },
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  const report = buildRightSizeReport(baseline, outcomes, {
+    minCostDropRatio: minCostDrop,
+    passRateTolerance,
+    pricing,
+  });
+  writeFileSync(join(rootDir, "right-size.json"), `${JSON.stringify(report, null, 2)}\n`);
+
+  writeTable(
+    ["slot → model", "pass_rate Δ", "$ saved", "cost drop", "recommend", "why"],
+    report.ranked.map((r) => [
+      `${r.slot} → ${r.modelString}`,
+      `${r.passRateDelta >= 0 ? "+" : ""}${(r.passRateDelta * 100).toFixed(1)}pp`,
+      `$${r.savingUsd.toFixed(4)}`,
+      `${(r.costDropRatio * 100).toFixed(0)}%`,
+      r.recommended ? "YES" : "no",
+      r.reason,
+    ]),
+  );
+
+  if (report.best !== undefined) {
+    const artifact = {
+      kind: "model-right-size-proposal" as const,
+      generatedAt: new Date().toISOString(),
+      slot: report.best.slot,
+      recommendedModel: report.best.modelString,
+      passRateDelta: report.best.passRateDelta,
+      savingUsd: report.best.savingUsd,
+      costDropRatio: report.best.costDropRatio,
+      ...(report.best.slotPath !== undefined
+        ? {
+            patch: {
+              op: "replace" as const,
+              path: report.best.slotPath,
+              value: report.best.modelString,
+            },
+          }
+        : {}),
+    };
+    writeFileSync(join(rootDir, "patch.json"), `${JSON.stringify(artifact, null, 2)}\n`);
+    process.stdout.write(
+      `\n[right-size] recommendation: ${report.best.slot} → ${report.best.modelString} ` +
+        `(saves $${report.best.savingUsd.toFixed(4)}, ${(report.best.costDropRatio * 100).toFixed(0)}% cheaper, pass-rate ${report.best.passRateDelta >= 0 ? "+" : ""}${(report.best.passRateDelta * 100).toFixed(1)}pp)\n`,
+    );
+    if (args.flags["write"] === true && report.best.slotPath !== undefined) {
+      const updated = writeModelField(
+        yamlText,
+        cliIr.target,
+        report.best.slotPath,
+        report.best.modelString,
+      );
+      writeFileSync(specPath, updated);
+      process.stdout.write(
+        `[right-size] --write: applied ${report.best.slot} = ${report.best.modelString} to ${specPath} (comment-preserving CST edit; review the diff)\n`,
+      );
+    } else if (report.best.slotPath === undefined) {
+      process.stdout.write(
+        "[right-size] the winning slot is the judge model (a CLI flag, not a spec field) — pass it via --judge-model on your eval runs.\n",
+      );
+    } else {
+      process.stdout.write(
+        "[right-size] apply with `--write`, or hand-edit — every model change is human-reviewed.\n",
+      );
+    }
+  } else {
+    process.stdout.write(
+      "\n[right-size] no downshift holds pass-rate while cutting cost enough.\n",
+    );
+  }
+  process.stdout.write(`[right-size] report: ${join(rootDir, "right-size.json")}\n`);
 }
 
 async function runEvalReport(args: ParsedArgs): Promise<void> {
@@ -7031,6 +7335,19 @@ switch (subcommand) {
       die(`pricing action must be "sync" or "show" (got "${action}")`);
     }
     await runPricing(parseFor(rest.slice(1), PRICING_SCHEMA), action);
+    break;
+  }
+  case "model": {
+    const action = rest[0] ?? "";
+    if (action !== "right-size") {
+      die(`model action must be "right-size" (got "${action}")`);
+    }
+    try {
+      await runModelRightSize(parseFor(rest.slice(1), MODEL_SCHEMA));
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
     break;
   }
   case "context":

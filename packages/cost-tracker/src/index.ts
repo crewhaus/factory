@@ -71,10 +71,13 @@ export {
 
 export {
   blendedPer1M,
+  CHEAPEST_SENTINEL,
   enumerateCandidates,
   familyPrefixOf,
+  providerOfSpecString,
   rankRightSizeProposals,
   resolveCheapest,
+  resolveCheapestForSlot,
   specStringFor,
   type CandidateProvider,
   type EnumerateCandidatesOptions,

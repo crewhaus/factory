@@ -12,6 +12,7 @@
     "test": "bun test src"
   },
   "dependencies": {
+    "@crewhaus/cost-tracker": "workspace:*",
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/infra-utils": "workspace:*",
     "@crewhaus/ir": "workspace:*",
