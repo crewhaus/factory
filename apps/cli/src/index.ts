@@ -40,7 +40,7 @@ import {
   renderReport,
   setBaseline,
 } from "@crewhaus/eval-report";
-import { runEval as runEvalLib } from "@crewhaus/eval-runner";
+import { type EvalRunSummary, runEval as runEvalLib } from "@crewhaus/eval-runner";
 import { openEventLog } from "@crewhaus/event-log";
 import { loadHooks } from "@crewhaus/hooks-engine";
 import {
@@ -199,6 +199,16 @@ import {
   registerDataset,
   resolveRegistryRef,
 } from "./datasets";
+// Item 29 — `crewhaus deploy canary` eval-gated ramp orchestration, in a
+// side-effect-free module so it is unit-testable (this entry file runs an
+// argv switch on import). The heavy I/O (per-version eval, registry pins,
+// audit) is injected here in index.ts.
+import {
+  CanaryRampError,
+  driveCanaryRamp,
+  makeCanaryEvalGate,
+  parseTrafficSteps,
+} from "./deploy-canary";
 // Model-aware doctor credential checks (provider parsed from the cwd spec's
 // agent.model via the model-router grammar), in a side-effect-free module so
 // it is unit-testable (this entry file runs an argv switch on import).
@@ -1085,6 +1095,19 @@ const DEPLOY_SCHEMA: ParseArgsSchema = {
     { name: "root-dir", takesValue: true },
     { name: "tenant", takesValue: true },
     { name: "actor", takesValue: true },
+    // Item 29 — `deploy canary <spec> <version>` eval-gated ramp flags.
+    { name: "traffic", takesValue: true },
+    { name: "dataset", takesValue: true },
+    { name: "graders", takesValue: true },
+    { name: "env", takesValue: true },
+    { name: "name", takesValue: true },
+    { name: "from", takesValue: true },
+    { name: "concurrency", takesValue: true },
+    { name: "seed", takesValue: true },
+    { name: "judge-model", takesValue: true },
+    // Gate threshold overrides (regression-runner GateThresholds).
+    { name: "max-pass-rate-drop", takesValue: true },
+    { name: "max-p95-latency-ms", takesValue: true },
     { name: "help", short: "h" },
   ],
 };
@@ -1254,6 +1277,9 @@ function usageText(): string {
     "  secrets rotate <name> [--value V]    rotate a named secret (file backend)",
     "  spec put|list|get|pin|alias|log ...  versioned spec storage + changelog (Section 28 spec-registry)",
     "  deploy promote|rollback ...          re-pin a spec for an environment (Section 28)",
+    "  deploy canary <spec> <version> ...   eval-gated ramp with auto-rollback (item 29):",
+    "       --traffic 5,25,50,100 --dataset <d> --graders <g>  eval both versions per step,",
+    "                                       gate on regression-runner, auto-promote/rollback",
     "  migrate-all --from N --to N          batch-migrate every spec in the registry",
     "  upgrade [spec.yaml] [--write]        detect the cwd spec's version drift + run the migration",
     "                                       chain (validated); --dry-run diff by default (item 43)",
@@ -7872,8 +7898,36 @@ async function runDeploy(args: ParsedArgs, action: string): Promise<void> {
     process.stdout.write(
       "usage:\n" +
         "  crewhaus deploy promote <name> <fromEnv> <toEnv>  copy env pin\n" +
-        "  crewhaus deploy rollback <name> <env> <version>   re-pin env to version\n",
+        "  crewhaus deploy rollback <name> <env> <version>   re-pin env to version\n" +
+        "  crewhaus deploy canary <spec.yaml> <version>      eval-gated ramp (item 29)\n" +
+        "    --traffic 5,25,50,100    strictly-increasing ramp steps (default 5,25,50,100)\n" +
+        "    --dataset <data>         eval dataset: a file path or registry:<name>[@ver][#split]\n" +
+        "    --graders <graders.yaml> grader config\n" +
+        "    --from <version>         baseline version (default: the env's current pin)\n" +
+        "    --env <env>              env pin to promote/rollback (default: prod)\n" +
+        "    --name <name>            registry spec name (default: the spec's own name)\n" +
+        "    --concurrency N --seed N --judge-model <m>   eval knobs (as `crewhaus eval`)\n" +
+        "    --max-pass-rate-drop <f> gate: max pass-rate drop before fail (default 0.05)\n" +
+        "    --max-p95-latency-ms <n> gate: max p95 latency rise ms before fail (default 5000)\n" +
+        "\n" +
+        "  `deploy canary` registers the candidate spec version, then drives the ramp\n" +
+        "  steps: at each step it evals BOTH the baseline and candidate versions against\n" +
+        "  the dataset+graders and feeds the two results into the real regression-runner\n" +
+        "  gate (pass-rate + p95-latency). On pass at every step the env pin auto-promotes\n" +
+        "  to the candidate; on the first failing step it auto-rolls-back to the baseline\n" +
+        "  and stops. Every promote/rollback is audit-logged (deployment_action).\n" +
+        "\n" +
+        "  TRAFFIC-SPLIT CAVEAT (v1): `crewhaus eval` runs target: cli, and the canary\n" +
+        "  controller's route() has no serving-path consumer, so the ramp % gates eval\n" +
+        "  SAMPLING/PROMOTION, not a live production traffic split. Each step evals the\n" +
+        "  FULL dataset against both versions; the percentages sequence the confidence\n" +
+        "  ramp. A real request-level split matters only for gateway/managed shapes with\n" +
+        "  a serving-path route() consumer — out of scope for target: cli here.\n",
     );
+    return;
+  }
+  if (action === "canary") {
+    await runDeployCanary(args);
     return;
   }
   const rootDirFlag = args.flags["root-dir"];
@@ -7922,7 +7976,236 @@ async function runDeploy(args: ParsedArgs, action: string): Promise<void> {
     );
     return;
   }
-  die(`unknown deploy action "${action}" (expected: promote | rollback)`);
+  die(`unknown deploy action "${action}" (expected: promote | rollback | canary)`);
+}
+
+/**
+ * Item 29 — `crewhaus deploy canary <spec.yaml> <version> ...`. Registers the
+ * candidate spec version, then drives the declared traffic ramp: at each step
+ * it evals BOTH the baseline and candidate versions against the same
+ * dataset+graders and feeds the two `EvalRunSummary` results into the real
+ * `regression-runner.gate()` (via canary-controller's injected
+ * `RegressionGate`), auto-promoting the env pin on pass and auto-rolling-back
+ * on the first fail — all audit-logged. The eval/registry/audit I/O is wired
+ * here; the ramp logic + gate live in the side-effect-free `deploy-canary.ts`.
+ *
+ * See the TRAFFIC-SPLIT CAVEAT in `--help`: for target: cli the ramp % gates
+ * eval sampling/promotion, not a live request-level split.
+ */
+async function runDeployCanary(args: ParsedArgs): Promise<void> {
+  const specPath = args.positional[0];
+  const candidateVersion = args.positional[1];
+  if (typeof specPath !== "string") die("missing <spec.yaml>");
+  if (typeof candidateVersion !== "string") die("missing <version>");
+  const datasetPath = args.flags["dataset"];
+  const gradersPath = args.flags["graders"];
+  if (typeof datasetPath !== "string") die("missing --dataset <data>");
+  if (typeof gradersPath !== "string") die("missing --graders <graders.yaml>");
+
+  // Ramp steps (default 5,25,50,100).
+  let steps: number[];
+  try {
+    steps = parseTrafficSteps(
+      typeof args.flags["traffic"] === "string" ? args.flags["traffic"] : "5,25,50,100",
+    );
+  } catch (err) {
+    if (err instanceof CanaryRampError) die(err.message);
+    throw err;
+  }
+
+  // Eval knobs, mirroring `crewhaus eval`.
+  const concurrencyFlag = args.flags["concurrency"];
+  const seedFlag = args.flags["seed"];
+  const judgeModelFlag = args.flags["judge-model"];
+  const concurrency =
+    typeof concurrencyFlag === "string" ? Number.parseInt(concurrencyFlag, 10) : undefined;
+  const seed = typeof seedFlag === "string" ? Number.parseInt(seedFlag, 10) : undefined;
+  if (concurrency !== undefined && (Number.isNaN(concurrency) || concurrency < 1)) {
+    die(`invalid --concurrency "${concurrencyFlag}" — must be positive integer`);
+  }
+  if (seed !== undefined && Number.isNaN(seed)) {
+    die(`invalid --seed "${seedFlag}" — must be integer`);
+  }
+
+  // Gate threshold overrides (regression-runner GateThresholds).
+  const gateThresholds: { regressionThreshold?: number; latencyThreshold?: number } = {};
+  const dropFlag = args.flags["max-pass-rate-drop"];
+  const latFlag = args.flags["max-p95-latency-ms"];
+  if (typeof dropFlag === "string") {
+    const v = Number(dropFlag);
+    if (!Number.isFinite(v) || v < 0) die(`invalid --max-pass-rate-drop "${dropFlag}"`);
+    gateThresholds.regressionThreshold = v;
+  }
+  if (typeof latFlag === "string") {
+    const v = Number(latFlag);
+    if (!Number.isFinite(v) || v < 0) die(`invalid --max-p95-latency-ms "${latFlag}"`);
+    gateThresholds.latencyThreshold = v;
+  }
+
+  // Read + validate the candidate spec (must be target: cli for eval).
+  const absSpec = resolve(specPath);
+  let candidateYaml: string;
+  try {
+    candidateYaml = readFileSync(absSpec, "utf-8");
+  } catch (err) {
+    die(`could not read ${absSpec}: ${(err as Error).message}`);
+  }
+  let candidateIr: ReturnType<typeof lower>;
+  try {
+    candidateIr = lower(parseSpec(candidateYaml));
+  } catch (err) {
+    if (err instanceof SpecParseError) die(err.message);
+    throw err;
+  }
+  if (candidateIr.target !== "cli") {
+    die(`crewhaus deploy canary only supports target: cli (got "${candidateIr.target}")`);
+  }
+
+  const specName = typeof args.flags["name"] === "string" ? args.flags["name"] : candidateIr.name;
+  const env = typeof args.flags["env"] === "string" ? args.flags["env"] : "prod";
+
+  const rootDirFlag = args.flags["root-dir"];
+  const specRootDir =
+    typeof rootDirFlag === "string" ? rootDirFlag : join(process.cwd(), ".crewhaus", "specs");
+  const auditDir = join(process.cwd(), ".crewhaus", "audit");
+  const { createFileBackedRegistry: createSpecRegistry } = await import("@crewhaus/spec-registry");
+  const { openAuditLog } = await import("@crewhaus/audit-log");
+  const { createDeploymentController } = await import("@crewhaus/deployment-controller");
+  const { createCanaryController, makeRegressionGate } = await import(
+    "@crewhaus/canary-controller"
+  );
+  const specReg = createSpecRegistry({ rootDir: specRootDir });
+
+  // Register the candidate version (idempotent overwrite of the same bytes).
+  await specReg.put(specName, candidateVersion, candidateYaml);
+
+  // Resolve the baseline version: --from, or the env's current pin.
+  const tenantFlag = args.flags["tenant"];
+  const tenantId = typeof tenantFlag === "string" ? tenantFlag : undefined;
+  const fromFlag = args.flags["from"];
+  let baselineVersion: string | undefined;
+  if (typeof fromFlag === "string") {
+    baselineVersion = fromFlag;
+  } else {
+    baselineVersion =
+      tenantId !== undefined
+        ? await specReg.aliasForTenant(tenantId, specName, env)
+        : await specReg.aliasFor(specName, env);
+  }
+  if (baselineVersion === undefined) {
+    die(
+      `no baseline version for ${specName} ${env} — pin one first (crewhaus deploy promote / spec pin) or pass --from <version>`,
+    );
+  }
+  if (baselineVersion === candidateVersion) {
+    die(`baseline and candidate are the same version (${candidateVersion}) — nothing to canary`);
+  }
+
+  // Resolve dataset + graders ONCE, shared across every eval.
+  const gradersYaml = readFileSync(resolve(gradersPath), "utf-8");
+  const { compiled } = parseGradersConfig(gradersYaml);
+  let sharedSamples: Sample[];
+  let datasetName: string;
+  let datasetHash: string;
+  let registryRef: ReturnType<typeof parseRegistryRef>;
+  try {
+    registryRef = parseRegistryRef(datasetPath);
+  } catch (err) {
+    if (err instanceof DatasetRefError) die(err.message);
+    throw err;
+  }
+  if (registryRef !== undefined) {
+    const dsReg = createFileBackedRegistry({ rootDir: defaultDatasetsRoot() });
+    const resolved = await resolveRegistryRef(dsReg, registryRef);
+    if (resolved.samples.length === 0)
+      die(`dataset "${resolved.datasetName}" yielded zero samples`);
+    sharedSamples = resolved.samples;
+    datasetName = resolved.datasetName;
+    datasetHash = resolved.datasetHash;
+  } else {
+    const absDataset = resolve(datasetPath);
+    const loaded = await loadDataset(absDataset);
+    sharedSamples = await collectSamples(loaded.samples);
+    if (sharedSamples.length === 0) die(`dataset "${loaded.name}" yielded zero samples`);
+    datasetName = loaded.name;
+    datasetHash = hashDatasetFile(absDataset);
+  }
+
+  // Per-version eval closure: read the stored spec version, lower it, and run
+  // a full eval against the shared samples + graders. Reused for both the
+  // baseline and candidate at every ramp step.
+  const evalVersion = async (version: string): Promise<EvalRunSummary> => {
+    const yaml = await specReg.get(specName, version);
+    const ir = lower(parseSpec(yaml));
+    if (ir.target !== "cli") {
+      throw new CrewhausError(
+        "config",
+        `stored version ${specName}@${version} is target: ${ir.target}, not cli`,
+      );
+    }
+    return runEvalLib({
+      ir,
+      dataset: { name: datasetName, samples: makeAsyncIterable(sharedSamples) },
+      compiledGraders: compiled,
+      opts: {
+        datasetHash,
+        ...(concurrency !== undefined ? { concurrency } : {}),
+        ...(seed !== undefined ? { seed } : {}),
+        ...(typeof judgeModelFlag === "string" ? { judgeModel: judgeModelFlag } : {}),
+      },
+    });
+  };
+
+  const audit = await openAuditLog({ rootDir: auditDir });
+  const deploymentController = createDeploymentController({
+    registry: specReg,
+    auditLog: audit,
+    ...(tenantId !== undefined ? { tenantId } : {}),
+  });
+  const canary = createCanaryController({
+    registry: specReg,
+    deploymentController,
+    auditLog: audit,
+  });
+
+  const write = (line: string): void => {
+    process.stdout.write(`${line}\n`);
+  };
+  write(
+    `[canary] ${specName}: baseline ${baselineVersion} → candidate ${candidateVersion} (env ${env})`,
+  );
+  write(
+    `[canary] ramp ${steps.join(",")}% · dataset ${datasetName} (${sharedSamples.length} samples)`,
+  );
+
+  const gate = makeRegressionGate(
+    makeCanaryEvalGate({ evalVersion, thresholds: gateThresholds, write }),
+  );
+
+  const result = await driveCanaryRamp({
+    steps,
+    write,
+    evaluateStep: (trafficPercent) =>
+      canary.evaluate(
+        {
+          name: specName,
+          fromVersion: baselineVersion as string,
+          toVersion: candidateVersion,
+          trafficPercent,
+          env,
+          ...(tenantId !== undefined ? { tenantId } : {}),
+        },
+        { intervalMs: 0, gate },
+      ),
+  });
+
+  if (result.promoted) {
+    write(`[canary] PROMOTED ${specName} ${env} → ${candidateVersion}`);
+    return;
+  }
+  die(
+    `deploy canary: ${specName} regressed at ${result.failedAt}% — rolled back to ${baselineVersion} (env ${env})`,
+  );
 }
 
 /**
@@ -9100,10 +9383,15 @@ switch (subcommand) {
   }
   case "deploy": {
     const action = rest[0] ?? "";
-    if (action !== "promote" && action !== "rollback") {
-      die(`deploy action must be "promote" or "rollback" (got "${action}")`);
+    if (action !== "promote" && action !== "rollback" && action !== "canary") {
+      die(`deploy action must be "promote", "rollback", or "canary" (got "${action}")`);
     }
-    await runDeploy(parseFor(rest.slice(1), DEPLOY_SCHEMA), action);
+    try {
+      await runDeploy(parseFor(rest.slice(1), DEPLOY_SCHEMA), action);
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
     break;
   }
   case "migrate-all":
