@@ -800,6 +800,19 @@ import { formatUpgradePlan, makeSpecValidator, planUpgrade } from "./upgrade";
 // CLI version resolution (embedded --define constant → package.json), shared
 // with compile-check.ts's dependency pinning.
 import { cliVersion } from "./version";
+// Item 65 — `crewhaus eval --voice`: replay recorded call-session logs through
+// the voice grader pack (latency / barge-in / transcript). Side-effect-free
+// (this entry file reads the replay JSONLs + writes the report).
+import {
+  DEFAULT_VOICE_THRESHOLDS,
+  VoiceEvalError,
+  type VoiceSessionResult,
+  type VoiceThresholds,
+  aggregateVoiceEval,
+  gradeVoiceSession,
+  parseReplayLog,
+  renderVoiceReport,
+} from "./voice-eval";
 import { type Watcher, createWatchController, formatCycleLine } from "./watch";
 
 /**
@@ -1281,6 +1294,15 @@ const EVAL_SCHEMA: ParseArgsSchema = {
     // provider drift → exit non-zero. --baseline points at the frozen run dir.
     { name: "sentinel", takesValue: false },
     { name: "baseline", takesValue: true },
+    // Item 65 — voice replay eval: replay recorded call-session logs through
+    // the voice grader pack (latency / barge-in / transcript) instead of the
+    // text model-driven eval. --replay-dir points at the recorded session
+    // JSONLs (default .crewhaus/voice-replays). Latency budgets via --max-*.
+    { name: "voice", takesValue: false },
+    { name: "replay-dir", takesValue: true },
+    { name: "max-ttft-ms", takesValue: true },
+    { name: "max-turn-latency-ms", takesValue: true },
+    { name: "max-barge-in-yield-ms", takesValue: true },
     { name: "help", short: "h" },
   ],
 };
@@ -6410,6 +6432,59 @@ async function runEvalCoverage(args: ParsedArgs): Promise<void> {
   }
 }
 
+/**
+ * Item 65 — `crewhaus eval --voice`: replay recorded call-session logs through
+ * the voice grader pack (latency / barge-in / transcript). Reads every
+ * `*.jsonl` under --replay-dir (default `.crewhaus/voice-replays`), grades each
+ * against the latency budgets, renders a report, and writes a machine-readable
+ * `voice-eval.json`. Exits non-zero when any session fails a grader (a
+ * pre-deploy voice gate). Credential-free + deterministic — no live audio.
+ */
+async function runVoiceEval(args: ParsedArgs): Promise<void> {
+  const replayDir = resolve(strFlag(args, "replay-dir") ?? join(".crewhaus", "voice-replays"));
+  if (!existsSync(replayDir)) {
+    die(
+      `voice replay dir not found at ${replayDir} — record call sessions there (one <sessionId>.jsonl per call), or pass --replay-dir`,
+    );
+  }
+  const files = readdirSync(replayDir)
+    .filter((f) => f.endsWith(".jsonl"))
+    .sort();
+  if (files.length === 0) {
+    die(`no *.jsonl replay logs under ${replayDir}`);
+  }
+  const thresholds: VoiceThresholds = {
+    maxTtftMs: intFlag(args, "max-ttft-ms") ?? DEFAULT_VOICE_THRESHOLDS.maxTtftMs,
+    maxTurnLatencyMs:
+      intFlag(args, "max-turn-latency-ms") ?? DEFAULT_VOICE_THRESHOLDS.maxTurnLatencyMs,
+    maxBargeInYieldMs:
+      intFlag(args, "max-barge-in-yield-ms") ?? DEFAULT_VOICE_THRESHOLDS.maxBargeInYieldMs,
+  };
+  const results: VoiceSessionResult[] = [];
+  for (const f of files) {
+    const sessionId = f.slice(0, -".jsonl".length);
+    const jsonl = readFileSync(join(replayDir, f), "utf-8");
+    let result: VoiceSessionResult;
+    try {
+      result = gradeVoiceSession(parseReplayLog(sessionId, jsonl), thresholds);
+    } catch (err) {
+      if (err instanceof VoiceEvalError) die(err.message);
+      throw err;
+    }
+    results.push(result);
+  }
+  const summary = aggregateVoiceEval(results);
+  process.stdout.write(renderVoiceReport(summary));
+
+  const outDir = resolve(strFlag(args, "out") ?? join(".crewhaus", "evals", "voice"));
+  mkdirSync(outDir, { recursive: true });
+  writeFileSync(join(outDir, "voice-eval.json"), `${JSON.stringify(summary, null, 2)}\n`);
+  process.stdout.write(`[voice-eval] wrote ${join(outDir, "voice-eval.json")}\n`);
+
+  const failed = results.filter((r) => !r.passed).length;
+  if (failed > 0) process.exit(1);
+}
+
 async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
@@ -6468,6 +6543,12 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
         "  skips the run-history index/baselines/triage and the regression union (a probe,\n" +
         "  not lineage); --gate/--no-promote/--models are rejected with it.\n",
     );
+    return;
+  }
+  // Item 65 — voice replay eval branches off before the text-eval flags: it
+  // reads recorded call-session JSONLs, not a dataset/graders.yaml.
+  if (args.flags["voice"] === true) {
+    await runVoiceEval(args);
     return;
   }
   const specPath = args.positional[0];
