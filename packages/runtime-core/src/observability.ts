@@ -647,3 +647,59 @@ export function attachAdvisorPersistence(
 
   return { unsubscribe, digestLine };
 }
+
+// -------- MCP stats persistence (ops item 38) --------
+
+export type AttachedMcpStatsPersistence = {
+  unsubscribe: Unsubscribe;
+};
+
+/**
+ * Ops item 38 — mirror the trace-bus-only `mcp_call_end` events into the same
+ * session JSONL the transcript already writes to, as the durable `mcp_stats`
+ * kind, so `crewhaus mcp doctor` can score per-server MCP health OFFLINE across
+ * sessions. `mcp_call_start`/`mcp_call_end` are trace-bus-only today — nothing
+ * durably records per-server error-rate / latency — so this subscriber is the
+ * durable history the report reads.
+ *
+ * Payload per line: `{ server, toolName, durationMs, isError }` — the same
+ * granularity decision the advisor's `tool_stats` made: per-call, not a per-turn
+ * aggregate, so the report keeps the full latency/error distribution. Whole
+ * milliseconds only (performance.now() floats add bytes without adding signal).
+ *
+ * Shares the DEFAULT-ON gate with the advisor events (disable with
+ * CREWHAUS_ADVISOR_EVENTS=0): the lines are tiny and they are exactly what the
+ * MCP-health report mines, so opting in would starve the doctor on the runs
+ * that used MCP servers. `append()` failures are logged, never thrown — a
+ * persistence hiccup must not abort a turn.
+ */
+export function attachMcpStatsPersistence(
+  bus: TraceEventBus,
+  eventLog: EventLog,
+  runContext: RunContext,
+  env: NodeJS.ProcessEnv = process.env,
+): AttachedMcpStatsPersistence | undefined {
+  const gate = env["CREWHAUS_ADVISOR_EVENTS"];
+  if (gate === "0" || gate === "false") return undefined;
+
+  const unsubscribe = bus.subscribe((event: TraceEvent): void => {
+    if (event.kind !== "mcp_call_end") return;
+    void eventLog
+      .append({
+        kind: "mcp_stats",
+        payload: {
+          server: event.server,
+          toolName: event.toolName,
+          durationMs: Math.round(event.durationMs),
+          isError: event.isError,
+        },
+      })
+      .catch((err) => {
+        runContext.logger.error("mcp_stats.persist_failed", {
+          message: err instanceof Error ? err.message : String(err),
+        });
+      });
+  });
+
+  return { unsubscribe };
+}

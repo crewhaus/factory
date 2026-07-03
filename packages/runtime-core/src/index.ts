@@ -91,8 +91,10 @@ import { attachIncidentCollector } from "./incident-collector";
 import {
   type AlertSink,
   type AttachedAdvisorPersistence,
+  type AttachedMcpStatsPersistence,
   attachAdvisorPersistence,
   attachDefaultSubscribers,
+  attachMcpStatsPersistence,
 } from "./observability";
 import { loadProjectMemory } from "./project-memory";
 import type { SloMitigationSink, SloTargets } from "./slo-monitor";
@@ -1362,6 +1364,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // offline. DEFAULT-ON (the lines are tiny and they are the advisor's
   // food); disable with CREWHAUS_ADVISOR_EVENTS=0. See observability.ts.
   const advisorPersist = attachAdvisorPersistence(bus, eventLog, runContext);
+
+  // Ops item 38 — persist the trace-bus-only `mcp_call_end` events into the
+  // session JSONL as the durable `mcp_stats` kind so `crewhaus mcp doctor` can
+  // score per-server MCP health offline. Shares the advisor's DEFAULT-ON gate
+  // (CREWHAUS_ADVISOR_EVENTS=0 disables both). See observability.ts.
+  const mcpStatsPersist = attachMcpStatsPersistence(bus, eventLog, runContext);
 
   // Per-run state container — coordination surface for hooks/skills/tools
   // landing in Section 11+. Section 10 only ships the plumbing; the
@@ -2943,6 +2951,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       incidentCollector?.unsubscribe();
       budgetMeter?.unsubscribe();
       advisorPersist?.unsubscribe();
+      mcpStatsPersist?.unsubscribe();
       printAdvisorDigest(advisorPersist);
       await sessionStore
         .update(sessionId, { lastTurnIndex: runContext.turnNumber })
@@ -3175,6 +3184,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     incidentCollector?.unsubscribe();
     budgetMeter?.unsubscribe();
     advisorPersist?.unsubscribe();
+    mcpStatsPersist?.unsubscribe();
     printAdvisorDigest(advisorPersist);
     if (shouldInstallSigint) {
       process.removeListener("SIGINT", sigintHandler);

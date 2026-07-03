@@ -105,7 +105,18 @@ export type EventKind =
   // from `model_response`. Persists the stop-reason distribution
   // (end_turn / tool_use / max_tokens / refusal / …) that was previously
   // trace-bus-only.
-  | "model_meta";
+  | "model_meta"
+  // Ops item 38 — one line PER MCP TOOL CALL (payload `{ server, toolName,
+  // durationMs, isError }`), mirrored from the `mcp_call_end` trace event by
+  // runtime-core's mcp-stats subscriber (default-on with the advisor events;
+  // disable with CREWHAUS_ADVISOR_EVENTS=0). `mcp_call_start`/`mcp_call_end`
+  // are trace-bus-ONLY today — nothing durable records per-server MCP health,
+  // so `crewhaus mcp doctor` had no history to score. This durable mirror is
+  // that history: per-server error-rate + latency over past sessions.
+  // Non-conversational, so `replayMessageHistory` ignores it and `--resume` is
+  // unaffected; readers written before this kind existed keep parsing (each
+  // session-log reader branches on the kinds it knows and skips the rest).
+  | "mcp_stats";
 
 export type Event = {
   readonly ts: number;
