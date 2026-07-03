@@ -88,6 +88,7 @@
     "@crewhaus/tool-bash": "workspace:*",
     "@crewhaus/tool-builder": "workspace:*",
     "@crewhaus/target-cli": "workspace:*",
+    "@crewhaus/target-eval-bundle": "workspace:*",
     "@crewhaus/tool-catalog": "workspace:*",
     "@crewhaus/tool-code-execution": "workspace:*",
     "@crewhaus/tool-codegraph": "workspace:*",
