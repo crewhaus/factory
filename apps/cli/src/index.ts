@@ -225,6 +225,8 @@ import {
   distill as distillFeedback,
   extractFeedbackRecords,
   gradersConfigToYaml,
+  mergeFeedback,
+  normalizeRating,
   samplesToJsonl,
 } from "./feedback";
 // Item 45 — `crewhaus flywheel init|run`: the packaged nightly
@@ -273,6 +275,18 @@ import {
   parseRunsFlag,
   renderSuggestedGradersYaml,
 } from "./graders-suggest";
+// Item 8 — `crewhaus judge calibrate`: pair human ratings with llm_judge
+// scores and compute agreement/bias/ROC-cut, in a side-effect-free module so
+// the statistics are unit-testable (this entry file runs an argv switch on
+// import).
+import {
+  type CalibrationPair,
+  DEFAULT_JUDGE_CUT,
+  type JudgeCalibrationFile,
+  buildCalibrationCard,
+  buildCalibrationFile,
+  renderCalibrationCard,
+} from "./judge-calibrate";
 // FR-004 — Pillar 3 intent-gate judge + durable audit-sink resolution, in a
 // side-effect-free module so it is unit-testable (this entry file runs an
 // argv switch on import).
@@ -782,6 +796,24 @@ const DATASET_SCHEMA: ParseArgsSchema = {
   ],
 };
 
+// Item 8 — `crewhaus judge calibrate`: pair human ratings with llm_judge
+// scores over the rated transcript turns.
+const JUDGE_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // The dataset providing sample context for the judge (file or registry).
+    { name: "dataset", takesValue: true },
+    // A graders.yaml whose llm_judge rubric to calibrate (else a default rubric).
+    { name: "graders", takesValue: true },
+    // How many recent sessions' rated turns to calibrate against (default 50; `all`).
+    { name: "sessions", takesValue: true },
+    // The judge model (model-router grammar); default claude-sonnet-4-5.
+    { name: "model", takesValue: true },
+    // Persist the calibrated --min-score default to .crewhaus/judge-calibration.json.
+    { name: "apply", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
 const STATE_SCHEMA: ParseArgsSchema = {
   flags: [
     // backup
@@ -1036,6 +1068,9 @@ function usageText(): string {
     "  dataset refresh-goldens              reconcile corrections/up-rated turns with golds (item 5):",
     "       --dataset <file|registry:ref>       propose gold updates as a review diff; --apply writes",
     "       [--min-score F] [--apply]           a NEW registry version (never in-place)",
+    "  judge calibrate                      calibrate an llm_judge against human ratings (item 8):",
+    "       [--graders <g.yaml>] [--model <m>]  correlation/bias/ROC-optimal cut over paired",
+    "       [--sessions N|all] [--apply]        (human rating, judge score); --apply writes the cut",
     "  state backup [-o <file.tar.gz>]      snapshot the cwd .crewhaus state dir to a tarball (item 69)",
     "       [--exclude <glob,glob>]",
     "  state restore <file.tar.gz>          restore a snapshot (refuses a non-empty .crewhaus)",
@@ -5102,6 +5137,191 @@ async function runRefreshGoldens(args: ParsedArgs): Promise<void> {
   );
 }
 
+// -------- item 8: crewhaus judge calibrate --------
+
+const JUDGE_CALIBRATION_RELPATH = join(".crewhaus", "judge-calibration.json");
+
+/** The default judge rubric used when no `--graders` llm_judge is supplied. */
+function defaultCalibrationRubric(): {
+  criteria: Array<{
+    name: string;
+    description: string;
+    anchors: { "1": string; "2": string; "3": string; "4": string; "5": string };
+  }>;
+  passing_score: number;
+} {
+  return {
+    criteria: [
+      {
+        name: "answer_quality",
+        description:
+          "Judge how well the assistant's answer serves the user's request — correctness, completeness, and usefulness.",
+        anchors: {
+          "1": "Wrong, off-topic, or unusable.",
+          "2": "Mostly unhelpful; major gaps or errors.",
+          "3": "Partially helpful; noticeable gaps.",
+          "4": "Helpful with only minor gaps.",
+          "5": "Fully correct, complete, and useful.",
+        },
+      },
+    ],
+    passing_score: 3,
+  };
+}
+
+/**
+ * Item 8 — `crewhaus judge calibrate`: pair each turn that has BOTH a human
+ * rating AND a judgeable transcript with the llm_judge's score, then print an
+ * agreement/bias/ROC calibration card. Model-dependent by nature: without
+ * judge credentials it explains what it needs and exits cleanly (never
+ * fabricates scores). `--apply` persists the calibrated cut.
+ */
+async function runJudgeCalibrate(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus judge calibrate [--dataset <file|registry:ref>] [--graders <graders.yaml>]\n" +
+        "                                [--sessions N|all] [--model <judge-model>] [--apply]\n" +
+        "  Pair (human rating, llm_judge score) for turns that carry BOTH a human\n" +
+        "  user_feedback rating AND can be judged (item 8): re-runs the llm_judge\n" +
+        "  grader (from --graders, or a default rubric) over each rated transcript\n" +
+        "  turn. Computes agreement (correlation + confusion at the current cut),\n" +
+        "  systematic bias (judge mean − human mean), and the ROC-optimal cut that\n" +
+        "  best separates up- from down-rated turns, and flags rubric criteria whose\n" +
+        "  judge-human disagreement is high (naming exemplars to re-anchor). Without\n" +
+        "  judge credentials it explains what it needs and exits — it never\n" +
+        "  fabricates scores. --apply writes the calibrated --min-score default to\n" +
+        "  .crewhaus/judge-calibration.json (a file distill/optimize could later read).\n",
+    );
+    return;
+  }
+
+  // Gather rated turns (numeric human rating) from sessions + the feedback dir.
+  const specName = cwdSpecName();
+  let sessionsWanted: number | "all";
+  try {
+    sessionsWanted = parseSessionsFlag(strFlag(args, "sessions"));
+  } catch (err) {
+    if (err instanceof EvalCoverageError) die(err.message);
+    throw err;
+  }
+  const sessionsDir = join(process.cwd(), SESSIONS_SUBDIR);
+  const allIds = sessionIdsByRecency(sessionsDir);
+  const ids = sessionsWanted === "all" ? allIds : allIds.slice(0, sessionsWanted);
+  const turns: SessionTurn[] = [];
+  const records: FeedbackRecord[] = [];
+  for (const id of ids) {
+    const events = readSessionEvents(id);
+    for (const t of deriveTurns(events)) turns.push({ ...t, sessionId: id });
+    records.push(...extractFeedbackRecords(events));
+  }
+  records.push(...readFeedbackDir(join(process.cwd(), FEEDBACK_SUBDIR)));
+
+  const turnByKey = new Map<string, SessionTurn>();
+  for (const t of turns) turnByKey.set(`${t.sessionId}#${t.turnNumber}`, t);
+
+  // Rated turns with a numeric signal AND a non-empty answer to judge.
+  type RatedTurn = { turn: SessionTurn; human: number };
+  const rated: RatedTurn[] = [];
+  for (const fb of mergeFeedback(records)) {
+    const human = normalizeRating(fb);
+    if (human === undefined) continue; // comment-only, no numeric signal
+    const turn = turnByKey.get(`${fb.sessionId}#${fb.turnNumber}`);
+    if (turn === undefined || turn.output.trim() === "") continue;
+    rated.push({ turn, human });
+  }
+  if (rated.length === 0) {
+    die(
+      "no rated turns to calibrate against — collect numeric ratings (crewhaus rate --thumbs/--stars/--score) first",
+    );
+  }
+
+  // Resolve the judge model + credentials. No credentials → explain + exit
+  // cleanly (never fabricate scores).
+  const modelFlag = strFlag(args, "model");
+  const { DEFAULT_JUDGE_MODEL } = await import("@crewhaus/eval-judge");
+  const judgeModel = modelFlag ?? DEFAULT_JUDGE_MODEL;
+  if (!providerCredentialsSatisfied(judgeModel, process.env)) {
+    die(
+      `judge calibrate needs a judge model with visible credentials (tried "${judgeModel}"). Set the provider credentials (e.g. ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN) or pass --model <provider/model> for a model you have keys for, then re-run.`,
+    );
+  }
+
+  // The rubric to calibrate: the graders.yaml llm_judge, else a default rubric.
+  const gradersPath = strFlag(args, "graders");
+  let rubricObject: unknown = defaultCalibrationRubric();
+  if (gradersPath !== undefined) {
+    const { compiled } = parseGradersConfig(readFileSync(resolve(gradersPath), "utf-8"));
+    const judgeEntry = compiled.find((g) => g.judgeSpec !== undefined);
+    if (judgeEntry?.judgeSpec === undefined) {
+      die(`--graders "${gradersPath}" has no llm_judge grader to calibrate`);
+    }
+    rubricObject = judgeEntry.judgeSpec.rubric;
+  }
+
+  const { judge, loadRubric } = await import("@crewhaus/eval-judge");
+  const rubric = loadRubric(rubricObject);
+
+  // Re-run the judge over each rated turn's transcript, pairing to the human
+  // rating. A per-turn judge failure is skipped (best-effort) so one flaky
+  // call cannot abort the whole calibration.
+  const pairs: CalibrationPair[] = [];
+  let judgeFailures = 0;
+  for (const { turn, human } of rated) {
+    try {
+      const result = await judge({
+        rubric,
+        sample: { id: `${turn.sessionId}_t${turn.turnNumber}`, input: turn.input },
+        agentOutput: turn.output,
+        model: judgeModel,
+      });
+      pairs.push({
+        sessionId: turn.sessionId,
+        turnNumber: turn.turnNumber,
+        human,
+        judge: result.score,
+        ...(Object.keys(result.criterionScores).length > 0
+          ? { criterionScores: result.criterionScores }
+          : {}),
+      });
+    } catch {
+      judgeFailures += 1;
+    }
+  }
+  if (pairs.length === 0) {
+    die(`the judge model "${judgeModel}" produced no usable scores (${judgeFailures} failure(s))`);
+  }
+
+  const card = buildCalibrationCard(pairs, {
+    ...(specName !== undefined ? { specName } : {}),
+    model: judgeModel,
+  });
+  process.stdout.write(renderCalibrationCard(card));
+  if (judgeFailures > 0) {
+    process.stdout.write(
+      `[judge calibrate] ${judgeFailures} turn(s) skipped (judge call failed)\n`,
+    );
+  }
+
+  if (args.flags["apply"] === true) {
+    const path = join(process.cwd(), JUDGE_CALIBRATION_RELPATH);
+    let existing: JudgeCalibrationFile | undefined;
+    if (existsSync(path)) {
+      try {
+        existing = JSON.parse(readFileSync(path, "utf-8")) as JudgeCalibrationFile;
+      } catch {
+        // A corrupt file is replaced.
+      }
+    }
+    const file = buildCalibrationFile(existing, card, new Date().toISOString());
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, `${JSON.stringify(file, null, 2)}\n`);
+    const cut = card.recommendedCut?.cut ?? DEFAULT_JUDGE_CUT;
+    process.stdout.write(
+      `[judge calibrate] wrote calibrated --min-score ${cut.toFixed(3)} for "${specName ?? "default"}" → ${path}\n`,
+    );
+  }
+}
+
 /**
  * Section 27 — `crewhaus cost-summary [--session <id>] [--tenant <id>]
  * [--format json|text]`. Reads `cost_accrual` events out of an `event-log`
@@ -7427,6 +7647,20 @@ switch (subcommand) {
     // die() for a clean one-liner.
     await runDataset(parseFor(rest, DATASET_SCHEMA));
     break;
+  case "judge": {
+    // Item 8 — `judge calibrate`: pair human ratings with llm_judge scores.
+    const action = rest[0] ?? "";
+    if (action !== "calibrate") {
+      die(`judge action must be "calibrate" (got "${action}")`);
+    }
+    try {
+      await runJudgeCalibrate(parseFor(rest.slice(1), JUDGE_SCHEMA));
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
+    break;
+  }
   case "state": {
     const action = rest[0] ?? "";
     if (action !== "backup" && action !== "restore") {
