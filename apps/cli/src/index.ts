@@ -154,7 +154,12 @@ import {
 // (.github/workflows/crewhaus-eval.yml — two fresh runs diffed via the
 // item-3 baseline machinery + `eval --gate`), in a side-effect-free module
 // so it is unit-testable (this entry file runs an argv switch on import).
-import { EVAL_CI_WORKFLOW_RELPATH, buildEvalCiWorkflowYaml } from "./ci-scaffold";
+import {
+  EVAL_CI_WORKFLOW_RELPATH,
+  SENTINEL_WORKFLOW_RELPATH,
+  buildEvalCiWorkflowYaml,
+  buildSentinelDriftWorkflowYaml,
+} from "./ci-scaffold";
 // Item 34 — scheduling ergonomics for `compliance evidence` (--period current
 // resolution + the empty-evidence gate), side-effect-free for the same reason.
 import { findEmptyControls, resolvePeriodFlag } from "./compliance-schedule";
@@ -282,6 +287,10 @@ import {
   parseModelsFlag,
   runMatrixCells,
 } from "./eval-matrix";
+// Item 30 — model-drift sentinel comparison logic, in a side-effect-free
+// module so it is unit-testable (this entry file runs an argv switch on
+// import). The fresh run + baseline load happen in index.ts; this decides drift.
+import { evaluateSentinel } from "./eval-sentinel";
 // Response-feedback core — pure, side-effect-free so it is unit-testable
 // (this entry file runs an argv switch on import). Powers `rate`/`feedback`
 // (capture) and `distill` (ratings → eval dataset + graders).
@@ -635,6 +644,9 @@ const INIT_SCHEMA: ParseArgsSchema = {
     // harness can `crewhaus eval` on day one. Composable with an existing
     // harness like --ci: `init --with-evals` adds just the eval assets.
     { name: "with-evals", takesValue: false },
+    // Item 30 — also scaffold .github/workflows/sentinel-drift.yml, the nightly
+    // model-drift sentinel cron. Composable with an existing harness like --ci.
+    { name: "sentinel", takesValue: false },
     // Overwrite an existing scaffolded workflow or eval assets (never the
     // spec).
     { name: "force", takesValue: false },
@@ -825,6 +837,12 @@ const EVAL_SCHEMA: ParseArgsSchema = {
     // Item 7 — opt out of the runner's default one-shot retry of ERRORED
     // samples (infra noise, not graded failures).
     { name: "no-retry", takesValue: false },
+    // Item 30 — nightly model-drift sentinel: re-run the (seed-pinned) dataset
+    // against the UNCHANGED spec and diff against a frozen baseline run dir;
+    // any flip/score-shift when specHash AND dataset-hash are both unchanged is
+    // provider drift → exit non-zero. --baseline points at the frozen run dir.
+    { name: "sentinel", takesValue: false },
+    { name: "baseline", takesValue: true },
     { name: "help", short: "h" },
   ],
 };
@@ -1947,7 +1965,7 @@ function resolveWorkflowRoot(
 function runInit(args: ParsedArgs): void {
   if (args.flags["help"]) {
     process.stdout.write(
-      "usage: crewhaus init [name] [--ci] [--with-evals] [--force]\n" +
+      "usage: crewhaus init [name] [--ci] [--with-evals] [--sentinel] [--force]\n" +
         "  --ci     Also scaffold .github/workflows/crewhaus-eval.yml — the eval-on-PR\n" +
         "           gate (item 44): PRs touching crewhaus.yaml or eval/** run the base\n" +
         "           branch's spec and the PR's spec on the PR's dataset+graders (two\n" +
@@ -1966,6 +1984,12 @@ function runInit(args: ParsedArgs): void {
         "           `crewhaus scaffold-evals` later (with credentials) for model-derived\n" +
         "           inputs and a spec-goal llm_judge rubric. With an existing\n" +
         "           crewhaus.yaml, adds just the missing eval assets.\n" +
+        "  --sentinel  Also scaffold .github/workflows/sentinel-drift.yml (item 30) — the\n" +
+        "           nightly model-drift sentinel: re-run a seed-pinned sentinel dataset\n" +
+        "           against the UNCHANGED spec and diff against a frozen baseline run; any\n" +
+        "           flip/score-shift when specHash AND dataset-hash are unchanged is\n" +
+        "           provider drift and fails the job. Freeze + commit the baseline once by\n" +
+        "           hand (init never runs a live eval); the printed note says how.\n" +
         "  --force  Overwrite an existing scaffolded workflow or eval assets (never\n" +
         "           the spec).\n",
     );
@@ -1973,6 +1997,7 @@ function runInit(args: ParsedArgs): void {
   }
   const ci = args.flags["ci"] === true;
   const withEvals = args.flags["with-evals"] === true;
+  const sentinelInit = args.flags["sentinel"] === true;
   const nameArg = args.positional[0];
   const targetDir = typeof nameArg === "string" ? resolve(nameArg) : process.cwd();
   const specName = typeof nameArg === "string" ? nameArg : basename(targetDir);
@@ -1983,7 +2008,9 @@ function runInit(args: ParsedArgs): void {
     // spec, add just the workflow (item 13's --with-evals composes the same
     // way for the eval assets). Without either flag the historical refusal
     // stands (a bare `init` must never touch existing work).
-    if (!ci && !withEvals) die(`${targetFile} already exists — refusing to overwrite`);
+    if (!ci && !withEvals && !sentinelInit) {
+      die(`${targetFile} already exists — refusing to overwrite`);
+    }
     process.stdout.write(`kept ${targetFile} (already exists)\n`);
   } else {
     mkdirSync(targetDir, { recursive: true });
@@ -2023,6 +2050,31 @@ agent:
       process.stdout.write(
         `ci: set the ANTHROPIC_API_KEY repo secret; PRs touching ${filterBase}crewhaus.yaml or\n` +
           `    ${filterBase}eval/** are then evaled against the base branch and gated on regressions.\n`,
+      );
+    } catch (err) {
+      if (err instanceof FlywheelConfigError) die(err.message);
+      throw err;
+    }
+  }
+
+  // Item 30 — `init --sentinel`: scaffold the nightly model-drift sentinel
+  // cron. Lands at the repo root (finding 7) with its working-directory
+  // pointed back at a nested harness. The frozen baseline must be produced +
+  // committed once by hand (init never runs a live eval) — the workflow
+  // comments + the printed note say how.
+  if (sentinelInit) {
+    try {
+      const { root: wfRoot, harnessDir } = resolveWorkflowRoot(targetDir, process.cwd());
+      const scaffolded = scaffoldWorkflowFile({
+        rootDir: wfRoot,
+        relPath: SENTINEL_WORKFLOW_RELPATH,
+        content: buildSentinelDriftWorkflowYaml({ harnessDir }),
+        force: args.flags["force"] === true,
+      });
+      process.stdout.write(`wrote ${scaffolded.path}\n`);
+      const filterBase = harnessDir === "" ? "" : `${harnessDir}/`;
+      process.stdout.write(
+        `sentinel: set the ANTHROPIC_API_KEY repo secret, add a seed-pinned\n    ${filterBase}eval/sentinel.jsonl, then freeze the baseline once:\n    crewhaus eval ${filterBase}crewhaus.yaml --dataset ${filterBase}eval/sentinel.jsonl \\\n      --graders ${filterBase}eval/graders.yaml --seed 1 -o ${filterBase}eval/sentinel-baseline\n    and commit ${filterBase}eval/sentinel-baseline. The nightly cron then flags provider drift.\n`,
       );
     } catch (err) {
       if (err instanceof FlywheelConfigError) die(err.message);
@@ -5287,7 +5339,17 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
         "  unknown pricing shows n/a). Matrix cells skip the run-history index/baselines\n" +
         "  (they are comparisons, not lineage), so --gate/--no-promote are rejected. A\n" +
         "  cell that crashes (bad credentials, 404 model) records an error row and the\n" +
-        "  remaining cells still run; the command then exits non-zero.\n",
+        "  remaining cells still run; the command then exits non-zero.\n" +
+        "  --sentinel --baseline <run-dir> runs the model-drift sentinel (item 30):\n" +
+        "  re-run this dataset against the UNCHANGED spec and diff against the frozen\n" +
+        "  baseline run dir. Pin --seed for a deterministic sample order. When the spec's\n" +
+        "  specHash AND the dataset's content hash are BOTH identical to the baseline's,\n" +
+        "  any pass/fail flip or score shift can only be the provider silently changing\n" +
+        "  model behaviour — the command flags it and exits non-zero so a CI cron alerts.\n" +
+        "  A specHash or dataset-hash mismatch is reported as not-comparable (also exits\n" +
+        "  non-zero — a mis-pointed sentinel is loud, never silently green). Sentinel mode\n" +
+        "  skips the run-history index/baselines/triage and the regression union (a probe,\n" +
+        "  not lineage); --gate/--no-promote/--models are rejected with it.\n",
     );
     return;
   }
@@ -5300,6 +5362,27 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
   if (typeof gradersPath !== "string") die("missing --graders <graders.yaml>");
   const gateRequested = args.flags["gate"] === true;
   const promote = args.flags["no-promote"] !== true;
+
+  // Item 30 — model-drift sentinel. --baseline points at the frozen run dir to
+  // diff against; incompatible with lineage/matrix flags (a sentinel is a
+  // one-off provider-drift probe, not run-history or a model benchmark).
+  const sentinel = args.flags["sentinel"] === true;
+  const sentinelBaseline = args.flags["baseline"];
+  if (sentinel) {
+    if (typeof sentinelBaseline !== "string") {
+      die("--sentinel requires --baseline <run-dir> (the frozen baseline run to diff against)");
+    }
+    if (gateRequested)
+      die("--sentinel and --gate are mutually exclusive (sentinel has its own gate)");
+    if (args.flags["no-promote"] === true) {
+      die("--sentinel never promotes; drop --no-promote");
+    }
+    if (typeof args.flags["models"] === "string") {
+      die("--sentinel and --models are mutually exclusive");
+    }
+  } else if (typeof sentinelBaseline === "string") {
+    die("--baseline is only valid with --sentinel");
+  }
 
   // Item 11 — `--models` benchmark matrix. Validate the flag combo and every
   // model string (full router grammar) up front: a typo in model 3 must fail
@@ -5410,7 +5493,10 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
     const outcome = await applyRegressionUnionGuarded({
       registry: createFileBackedRegistry({ rootDir: defaultDatasetsRoot() }),
       specName: ir.name,
-      includeRegressions: args.flags["no-regressions"] !== true,
+      // Item 30 — a sentinel requires a byte-identical dataset to attribute a
+      // diff to the provider; unioning the regression suite would fold its
+      // hash in and defeat the dataset-hash equality check. Force it off.
+      includeRegressions: !sentinel && args.flags["no-regressions"] !== true,
       ...(registryRef !== undefined ? { primaryRegistryName: registryRef.name } : {}),
       primary: dataset,
       datasetHash,
@@ -5475,6 +5561,48 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
   // With -o omitted the runner picks .crewhaus/evals/<runId> relative to the
   // cwd — resolve to an absolute path for the report + history index.
   const absOut = resolve(summary.outDir);
+
+  // Item 30 — sentinel drift probe. Skip triage + run-history entirely (a
+  // sentinel is a one-off provider-drift check, not lineage): render the
+  // report, then diff the fresh run against the frozen baseline and attribute
+  // any flip/score-shift to the provider ONLY when specHash AND dataset-hash
+  // are both unchanged. Exit non-zero on drift OR not-comparable.
+  if (sentinel) {
+    const loadedSentinel = await loadRun(absOut);
+    writeFileSync(join(absOut, "index.html"), renderReport(loadedSentinel, {}).html);
+    let baselineRun: Awaited<ReturnType<typeof loadRun>>;
+    try {
+      baselineRun = await loadRun(resolve(sentinelBaseline as string));
+    } catch (err) {
+      die(
+        `--sentinel: could not load baseline run at ${sentinelBaseline}: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+    const baselineDatasetHash = baselineRun.summary.config.datasetHash;
+    if (baselineDatasetHash === undefined) {
+      die(
+        `--sentinel: baseline run ${baselineRun.summary.runId} has no recorded datasetHash — re-pin the baseline from a run produced by a datasetHash-recording CLI (any current version)`,
+      );
+    }
+    const result = evaluateSentinel({
+      baseline: baselineRun,
+      current: loadedSentinel,
+      baselineDatasetHash,
+      currentDatasetHash: datasetHash,
+    });
+    process.stdout.write(
+      `[eval] runId=${summary.runId} pass_rate=${(summary.aggregates.passRate * 100).toFixed(1)}% ` +
+        `mean_score=${summary.aggregates.meanScore.toFixed(3)}\n`,
+    );
+    process.stdout.write(`[eval] report: ${join(absOut, "index.html")}\n`);
+    process.stdout.write(`[sentinel] ${result.verdict}: ${result.reason}\n`);
+    if (result.alert) {
+      die(`sentinel drift detected — ${result.reason}`);
+    }
+    return;
+  }
 
   // Item 7 — failure-arbiter triage: classify every failing sample into
   // bug / spec-gap / noise / contract-ambiguity, persist verdicts.json next
