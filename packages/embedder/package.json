@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/embedder",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "type": "module",
   "description": "Embedding provider — openai/voyage/cohere/local/mock backends with prefix-grammar selector",
   "main": "src/index.ts",

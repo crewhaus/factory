@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/pipeline-engine",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "type": "module",
   "description": "Component DAG runtime — topological scheduling with parallel branches",
   "main": "src/index.ts",

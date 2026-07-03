@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/target-batch-worker",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "type": "module",
   "description": "Codegen for the BATCH target — emits a queue-consumer daemon (Section 23 BATCH)",
   "main": "src/index.ts",

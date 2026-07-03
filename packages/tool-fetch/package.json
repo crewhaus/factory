@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-fetch",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "type": "module",
   "description": "Generic HTTP fetch tool with fail-closed origin allow-list, SSRF defense, and credential stripping",
   "main": "src/index.ts",

@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/target-eval-bundle",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "type": "module",
   "description": "Codegen for target: eval. Single-file agent.ts that boots dataset-registry + grader-registry + eval-runner.",
   "main": "src/index.ts",

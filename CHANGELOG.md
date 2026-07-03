@@ -5,6 +5,127 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-07-03
+
+The automation release: CrewHaus harnesses now build their own evals, tune
+themselves from real usage, heal their own operations, and stay safe — with
+manual control preserved everywhere. This lands all 69 items from the
+automation audit (`AUTOMATION-OPPORTUNITIES.md`) across ~18 PRs. Every addition
+is additive and opt-in: existing specs parse and compile byte-identically, and
+every automation is a default or flag over controls that still work by hand.
+
+### Added — the self-building eval flywheel
+
+- **`crewhaus flywheel init|run`** ([#262]) packages the nightly loop
+  (compile → eval → optimize → gate → write-back) as one in-process command,
+  accept-then-write so a spec is only touched when a regression-gated candidate
+  strictly improves. **Eval run-history + auto-baseline + `--gate`** ([#258])
+  records every run under `.crewhaus/evals`, auto-diffs against the pinned
+  baseline, and fails CI on regressions. **`crewhaus datasets` + `distill
+  --register`** ([#258]) give datasets the versioned registry the CLI already
+  gives specs, with a `registry:<name>[@ver][#split]` shorthand for eval/optimize.
+- **Datasets, graders, and judges that build themselves from usage**:
+  `scaffold-evals`/`init --with-evals`, `graders suggest`, `eval coverage`,
+  `dataset mine`/`synthesize` (PII- and secret-redacted, injection-payload
+  stress variants that never touch human-gold splits), `dataset refresh-goldens`,
+  and `judge calibrate` ([#266]). **Regression pinning** ([#258]) makes every
+  accepted fix a permanent test, and the **failure arbiter** ([#258]) auto-triages
+  failing samples (noise retry, bad-gold exclusion) so the optimizer stops
+  burning budget on flaky/mis-specified cases. **`eval --models a,b,c`** ([#258])
+  benchmarks models on one command. **`feedback.autoDistill`** ([#262]) closes
+  the ratings→dataset loop at run teardown; a one-keystroke exit-rating prompt
+  captures CLI signal.
+
+### Added — the observer/advisor (suggestions beyond the prompt)
+
+- **`crewhaus advise`** ([#263]) mines durable session telemetry (a new
+  persistence layer for recovery/tool/permission/model events) into typed,
+  eval-validated `SpecPatch` suggestions — and **`optimize --from-advice`**
+  ([#263]) applies them through the real regression gate. **`doctor
+  --context-pressure`** ([#263]) plus `permissions suggest`, a `tools`
+  namespace (list/suggest/audit + a compile↔runtime map-sync guard that caught a
+  real `python`/`shell` tool-resolution bug), learned `failure_taxonomy`/loop
+  rules, and sub-agent-split suggestions ([#267]).
+
+### Added — model & cost automation
+
+- **Spec-declared provider failover** (`agent.model_fallbacks` + `circuit_breaker`)
+  ([#264]), a **`switch-model` recovery action** ([#264]), and **run-level budget
+  caps** (`budget: { usd, on_exceed: stop|degrade }`, `run --budget-usd`) ([#264]).
+  **Model market scan + `doctor --models` + `pricing sync`**, **right-sizing**
+  with a sunset-aware `cheapest` sentinel, a **two-tier turn-difficulty router**,
+  and **cache-hit-aware candidate ranking** ([#268], [#257]).
+
+### Added — self-healing operations
+
+- **`crewhaus deploy canary`** with a real regression gate + unattended ramp +
+  auto-rollback, **`eval --sentinel`** provider-drift detection, a **baseline-
+  derived alert watchdog**, and **auto-assembled incident bundles** ([#270]).
+  **`observability.slo`** block with a sustained-breach mitigation ladder
+  (alert → pause-intake → last-known-good rollback) and **`crewhaus mcp doctor`**
+  (health scoring, tool-schema drift watch, runtime auto-quarantine) ([#274]).
+  **`crewhaus loadtest`** concurrency benchmark + deploy gate ([#273]).
+
+### Added — DX & lifecycle
+
+- **`doctor --detect/--fix`**, **`init --interactive`** spec authoring,
+  **`crewhaus lint --fix` + `compile --watch`**, and a **spec `version:` field +
+  `crewhaus upgrade`** migration assistant ([#265]). Every compiled bundle now
+  ships a **generated README** ([#257]); compile/write-back **auto-register**
+  spec versions with distilled changelogs (`spec log`) ([#257]); **`crewhaus
+  state backup|restore`** transports a harness's `.crewhaus` state and folds
+  deployed feedback back into the dev loop ([#257]).
+
+### Added — safety that learns
+
+- **`crewhaus security digest`**, **scope-audit drift watch**
+  (`doctor --philosophy-alignment --baseline`), and **`crewhaus channel
+  provision|verify`** ([#261]). **Security regression corpus** + candidate
+  detector rules, **egress triage** (with the previously-missing `egress_decision`
+  audit writer), **HMAC-hashed PII allowlist tuning**, and **justification-judge
+  calibration** ([#272]).
+
+### Added — memory, knowledge & fleets
+
+- First-class spec **`memory:` block** with auto-capture/recall, a golden
+  **few-shot pool** (`optimize --few-shot`), an auto-discovered **FAQ skill**,
+  auto-maintained **LESSONS.md** + per-user prefs, and **summarize-before-evict**
+  session indexing ([#269]) — recalled/injected content is boundary-classified
+  and redacted. **`crewhaus fleet`** (cross-harness inventory/status/bulk-ops),
+  **approval-gated promotion** + `crewhaus propose`, a **marketplace CLI**
+  (`plugins`/`templates` + publish loop), **cross-harness knowledge sync**, and
+  **`crewhaus retire`** ([#271]). **Auto-generated eval bridges** unlock
+  eval/optimize for non-cli shapes; **voice replay evals**, an **onchain policy
+  tuner + spend sentinel**, and an **intent analytics digest** ([#273]).
+
+### Added — release & CI/CD
+
+- **Per-shape container images published to GHCR** on release with the
+  `docker/digests.json` loop closed, a **nightly runtime-smoke schedule + release
+  gate**, and **`crewhaus compile --check`** ([#260]). Plus **`crewhaus audit
+  verify`**, **`crewhaus retention` sweep/export/purge**, and a **boot-time
+  self-heal janitor** for daemon shapes ([#256]).
+
+[0.2.0]: https://github.com/crewhaus/factory/releases/tag/v0.2.0
+[#256]: https://github.com/crewhaus/factory/pull/256
+[#257]: https://github.com/crewhaus/factory/pull/257
+[#258]: https://github.com/crewhaus/factory/pull/258
+[#260]: https://github.com/crewhaus/factory/pull/260
+[#261]: https://github.com/crewhaus/factory/pull/261
+[#262]: https://github.com/crewhaus/factory/pull/262
+[#263]: https://github.com/crewhaus/factory/pull/263
+[#264]: https://github.com/crewhaus/factory/pull/264
+[#265]: https://github.com/crewhaus/factory/pull/265
+[#266]: https://github.com/crewhaus/factory/pull/266
+[#267]: https://github.com/crewhaus/factory/pull/267
+[#268]: https://github.com/crewhaus/factory/pull/268
+[#269]: https://github.com/crewhaus/factory/pull/269
+[#270]: https://github.com/crewhaus/factory/pull/270
+[#271]: https://github.com/crewhaus/factory/pull/271
+[#272]: https://github.com/crewhaus/factory/pull/272
+[#273]: https://github.com/crewhaus/factory/pull/273
+[#274]: https://github.com/crewhaus/factory/pull/274
+
 ## [0.1.8] - 2026-07-01
 
 Response ratings → self-improving evals/graders/datasets.

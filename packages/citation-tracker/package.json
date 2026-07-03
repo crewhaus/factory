@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/citation-tracker",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "type": "module",
   "description": "Per-research-run citation persistence + URL dedup (Section 23 RES)",
   "main": "src/index.ts",

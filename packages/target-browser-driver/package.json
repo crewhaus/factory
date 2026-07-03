@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/target-browser-driver",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "type": "module",
   "description": "Codegen for the BROW target — emits a single agent.ts that boots a chromium driver + vision-grounding tools (Section 25 BROW)",
   "main": "src/index.ts",

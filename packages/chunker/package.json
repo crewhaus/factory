@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/chunker",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "type": "module",
   "description": "Document chunking — fixed / semantic (Intl.Segmenter) / markdown strategies",
   "main": "src/index.ts",

@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/audit-log",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "type": "module",
   "description": "Per-tenant hash-chained JSONL audit trail for the managed-daemon target",
   "main": "src/index.ts",

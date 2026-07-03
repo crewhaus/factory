@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/target-cf-worker-workflow",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "type": "module",
   "description": "Codegen backend for the workflow target emitted as a Cloudflare Worker. Sibling of target-cf-worker-cli; reads the same IrWorkflowV0 variant, emits a self-contained Worker bundle that runs the steps sequentially.",
   "main": "src/index.ts",
