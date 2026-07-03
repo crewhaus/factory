@@ -5,7 +5,7 @@ WORKDIR /app
 COPY bun.lock package.json ./
 COPY packages packages
 COPY apps apps
-RUN bun install --frozen-lockfile --production=false
+RUN bun install --frozen-lockfile
 
 FROM deps AS build
 WORKDIR /app
