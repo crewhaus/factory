@@ -480,6 +480,32 @@ export type ModelFailoverEvent = TraceEventEnvelope & {
   reason: "breaker_open" | "probe_restore" | "candidate_error" | "budget_degrade";
 };
 
+/**
+ * Ops item 31 — emitted by `runtime-core`'s alert watchdog (env/spec-gated via
+ * CREWHAUS_ALERTS) when a live per-session metric breaches a threshold DERIVED
+ * FROM HISTORY (trailing p95 ×1.5 over prior sessions' persisted snapshots)
+ * rather than a hand-configured constant. One event per breached metric. The
+ * watchdog also appends an audit record and invokes the configured
+ * settings.json `alert` hook / webhook, but this trace event is the live
+ * observable surface (the pretty printer + OTel exporter can render it).
+ *
+ * `metric` names the breached signal (e.g. "error_rate", "turn_p95_seconds",
+ * "ttft_p95_seconds", "cost_burn_usd_per_min", "pricing_miss_rate",
+ * "circuit_opens", "egress_blocked"); `observed`/`threshold` are the numeric
+ * comparison; `baselineSessions` is how many historical snapshots the
+ * threshold was derived from (0 ⇒ a bootstrap default was used because there
+ * was no history yet).
+ */
+export type AlertRaisedEvent = TraceEventEnvelope & {
+  kind: "alert_raised";
+  metric: string;
+  observed: number;
+  threshold: number;
+  baselineSessions: number;
+  /** Human-readable one-liner (also used as the audit/hook message). */
+  detail: string;
+};
+
 export type TraceEvent =
   | TurnStartEvent
   | TurnEndEvent
@@ -510,7 +536,8 @@ export type TraceEvent =
   | TestVerdictEvent
   | ProgramOutputEvent
   | CoverageReportEvent
-  | SanitizerReportEvent;
+  | SanitizerReportEvent
+  | AlertRaisedEvent;
 
 export type TraceEventKind = TraceEvent["kind"];
 

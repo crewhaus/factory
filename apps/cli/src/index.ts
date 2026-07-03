@@ -42,7 +42,7 @@ import {
 } from "@crewhaus/eval-report";
 import { type EvalRunSummary, runEval as runEvalLib } from "@crewhaus/eval-runner";
 import { openEventLog } from "@crewhaus/event-log";
-import { loadHooks } from "@crewhaus/hooks-engine";
+import { loadHooks, runHooks } from "@crewhaus/hooks-engine";
 import {
   ArgParseError,
   type ParseArgsSchema,
@@ -101,6 +101,10 @@ import {
   renderAdviceHtml,
   runAdviceRules,
 } from "./advise-rules";
+// Item 31 — alert-watchdog delivery sink builder (audit append + settings.json
+// alert hook + webhook), in a side-effect-free module so it is unit-testable
+// (this entry file runs an argv switch on import).
+import { alertWebhookFromSettings, buildAlertSink } from "./alert-sink";
 // Item 34 — `crewhaus audit verify` plumbing (anchor-flag parsing + per-check
 // summary + doctor mapping), in a side-effect-free module so it is
 // unit-testable (this entry file runs an argv switch on import).
@@ -2962,6 +2966,43 @@ async function runRunCli(
     );
   }
 
+  // Item 31 — alert watchdog delivery. The watchdog itself is gated inside
+  // runtime-core by CREWHAUS_ALERTS; here we build its optional delivery sink
+  // (audit append + settings.json `alert` hook + `alerts.webhook` POST) so a
+  // breach lands durably + off-box. Only opened when CREWHAUS_ALERTS is set —
+  // no audit-log file / hook wiring otherwise. undefined leaves the watchdog
+  // with just its trace event + snapshot.
+  const alertsEnabled =
+    process.env["CREWHAUS_ALERTS"] === "1" || process.env["CREWHAUS_ALERTS"] === "true";
+  let alertSink: ReturnType<typeof buildAlertSink>;
+  if (alertsEnabled) {
+    const { openAuditLog } = await import("@crewhaus/audit-log");
+    const alertAudit = await openAuditLog({ rootDir: join(cwd, ".crewhaus", "audit") });
+    // Read alerts.webhook from settings.json (best-effort; a parse error here
+    // must not block the run — the permission path already surfaces bad JSON).
+    let webhookUrl: string | undefined;
+    const settingsPath = join(cwd, ".crewhaus", "settings.json");
+    if (existsSync(settingsPath)) {
+      try {
+        webhookUrl = alertWebhookFromSettings(JSON.parse(readFileSync(settingsPath, "utf-8")));
+      } catch {
+        // ignore — buildRuleSet already dies loudly on malformed settings.json.
+      }
+    }
+    const alertHooks = hooks.filter((h) => h.event === "alert");
+    alertSink = buildAlertSink({
+      audit: alertAudit,
+      ...(alertHooks.length > 0
+        ? {
+            runAlertHooks: async (event, payload, matcherKey): Promise<void> => {
+              await runHooks(event, payload, alertHooks, { matcherKey });
+            },
+          }
+        : {}),
+      ...(webhookUrl !== undefined ? { webhookUrl } : {}),
+    });
+  }
+
   // Section 13 — when the IR carries inline sub-agent definitions, build the
   // registry, register the Task tool, and inject `spawnSubAgent` so the
   // runtime can populate the bridge for framework-aware tools.
@@ -3029,6 +3070,7 @@ async function runRunCli(
       ...(justificationJudge !== undefined ? { justificationJudge } : {}),
       ...(justificationAuditSink !== undefined ? { justificationAuditSink } : {}),
       ...(egressMatcher !== undefined ? { egressMatcher } : {}),
+      ...(alertSink !== undefined ? { alertSink } : {}),
     });
   } finally {
     if (mcpHost) await mcpHost.disconnectAll();

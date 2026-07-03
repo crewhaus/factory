@@ -99,5 +99,7 @@ function formatBody(ev: TraceEvent): string {
       return `program=${ev.programId} lines=${ev.linesCovered}/${ev.linesTotal} branches=${ev.branchesCovered}/${ev.branchesTotal}`;
     case "sanitizer_report":
       return `program=${ev.programId} sanitizer=${ev.sanitizer} ${ev.isError ? "ERROR " : ""}${ev.summary}`;
+    case "alert_raised":
+      return `metric=${ev.metric} observed=${ev.observed} threshold=${ev.threshold} baseline=${ev.baselineSessions}sess — ${ev.detail}`;
   }
 }

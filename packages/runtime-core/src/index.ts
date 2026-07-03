@@ -85,6 +85,7 @@ import {
   isCliMarkdownEnabled,
 } from "./cli-markdown";
 import {
+  type AlertSink,
   type AttachedAdvisorPersistence,
   attachAdvisorPersistence,
   attachDefaultSubscribers,
@@ -195,6 +196,16 @@ export type {
   JanitorStepResult,
   JanitorStepStatus,
 } from "./janitor";
+
+// Ops item 31 — alert watchdog seams re-exported so the CLI/codegen can build
+// the durable + off-box alert sink (audit append + settings.json alert hook /
+// webhook) it passes as `RunChatLoopOptions.alertSink`.
+export {
+  type AlertBreachPayload,
+  type AlertSink,
+  type AttachDefaultSubscribersOptions,
+  attachDefaultSubscribers,
+} from "./observability";
 
 /**
  * Reconcile a message history by dropping "orphan" `tool_use` blocks — a
@@ -529,6 +540,18 @@ export type RunChatLoopOptions = {
    * `.crewhaus/audit`.
    */
   justificationAuditSink?: JustificationAuditSink;
+  /**
+   * Ops item 31 — durable + off-box delivery for the alert watchdog (gated by
+   * CREWHAUS_ALERTS). When supplied, a baseline-threshold breach appends an
+   * audit record and/or fires the settings.json `alert` hook / webhook via
+   * these callbacks. Omitted → the watchdog still persists its per-session
+   * metrics snapshot and publishes the `alert_raised` trace event, it just has
+   * no durable/off-box delivery (zero behaviour change for existing callers).
+   * The CLI `run` path wires the audit log + settings.json alert hook here.
+   */
+  alertSink?: AlertSink;
+  /** Item 31 — override the per-session metrics-history dir (tests/tenants). */
+  alertMetricsDir?: string;
   /**
    * Pillar 3 sink-side fabric (FR-006) — pluggable egress-matching
    * strategy. When supplied, every external-scope tool call routes its
@@ -945,7 +968,10 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // per-candidate breakers publish model_failover / circuit_state_changed
   // through this reference from the first stream() call onward.
   observabilityBus = bus;
-  const subscribers = await attachDefaultSubscribers(bus, runContext);
+  const subscribers = await attachDefaultSubscribers(bus, runContext, process.env, {
+    ...(opts.alertSink !== undefined ? { alertSink: opts.alertSink } : {}),
+    ...(opts.alertMetricsDir !== undefined ? { metricsDir: opts.alertMetricsDir } : {}),
+  });
 
   // Item 22 — surface each failover on stderr so an operator watching a
   // plain (non-CREWHAUS_TRACE) run still sees provider switches. NOTE: the

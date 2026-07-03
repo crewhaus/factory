@@ -44,6 +44,8 @@ const PALETTE: Record<TraceEventKind, string> = {
   program_output: "\x1b[2m", // dim — high-volume
   coverage_report: "\x1b[34m", // blue
   sanitizer_report: "\x1b[31m", // red — almost always a finding
+  // Ops item 31 — alert watchdog breach against a baseline-derived threshold
+  alert_raised: "\x1b[91m", // bright red — an alert is a headline
 };
 
 export function colorize(kind: TraceEventKind, text: string, useColor: boolean): string {
