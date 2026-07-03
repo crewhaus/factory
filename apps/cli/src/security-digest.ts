@@ -116,6 +116,8 @@ export const DECLARED_AUDIT_KINDS = [
   "egress_decision",
   "permission_justification_evaluated",
   "retention_enforcement",
+  "governance_approval",
+  "governance_proposal",
   "alert_raised",
 ] as const satisfies ReadonlyArray<AuditKind>;
 

@@ -14,6 +14,10 @@ import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
 import type { SubAgentDefinition } from "@crewhaus/agent-context-isolation";
+// Type-only — the concrete factories are dynamically imported inside the
+// deploy/propose handlers (lazy boot); the approval gate helper needs the
+// registry/audit types for its signature.
+import type { AuditLog } from "@crewhaus/audit-log";
 import { SpecParseError, compile, lower } from "@crewhaus/compiler";
 import { buildContextBundle, discoverRoots } from "@crewhaus/context-bundle";
 import {
@@ -84,6 +88,7 @@ import { createSessionStore, evictExpiredSessions } from "@crewhaus/session-stor
 import { createSkillTool, discoverSkills } from "@crewhaus/skills-registry";
 import { loadCommands } from "@crewhaus/slash-commands";
 import { type Spec, parseSpec } from "@crewhaus/spec";
+import type { RegistryAdapter } from "@crewhaus/spec-registry";
 import { spawnSubAgent } from "@crewhaus/sub-agent-spawner";
 import { type RegisteredTool, ToolCatalog } from "@crewhaus/tool-catalog";
 import { registerMcpServer } from "@crewhaus/tool-mcp";
@@ -124,6 +129,22 @@ import {
 // alert hook + webhook), in a side-effect-free module so it is unit-testable
 // (this entry file runs an argv switch on import).
 import { alertWebhookFromSettings, buildAlertSink } from "./alert-sink";
+// Item 59 — approval-gated promotion. The protected-env policy + quorum
+// decision for `deploy promote --require-approval`, in a side-effect-free
+// module so it is unit-testable (this entry file runs an argv switch on
+// import). The gate runs BEFORE the deployment-controller flips the pin.
+import {
+  type ApprovalDecisionInput,
+  ApprovalGateError,
+  type PrCheckReader,
+  buildGovernancePayload,
+  decideApproval,
+  loadEnvironmentsConfig,
+  policyForEnv,
+  prReferencesVersion,
+  readApprovals,
+  rollupConclusion,
+} from "./approval-gate";
 // Item 34 — `crewhaus audit verify` plumbing (anchor-flag parsing + per-check
 // summary + doctor mapping), in a side-effect-free module so it is
 // unit-testable (this entry file runs an argv switch on import).
@@ -344,6 +365,25 @@ import {
   mergePools,
   poolToJsonl,
 } from "./fewshot";
+// Item 58 — `crewhaus fleet list|status|run`: cross-harness discovery,
+// inventory/health rollup, and bulk read-only ops, in a side-effect-free
+// module so it is unit-testable (this entry file runs an argv switch on
+// import). Discovery + aggregation are pure reads; the bulk runner spawns
+// per-harness `crewhaus` invocations through an injected seam.
+import {
+  type BuildInventoryDeps,
+  type EvalHealthReader,
+  FleetError,
+  type FleetRunner,
+  type HarnessInventory,
+  type LastEvalEntry,
+  buildFleetInventory,
+  buildHarnessHealth,
+  formatBulkReport,
+  formatInventory as formatFleetInventory,
+  formatHealth,
+  runFleetBulk,
+} from "./fleet";
 // Item 45 — `crewhaus flywheel init|run`: the packaged nightly
 // self-improvement loop (knob/default resolution, the accept-then-write
 // loop with injected steps, the report, and the workflow scaffold), in a
@@ -433,6 +473,33 @@ import {
   openJustificationAuditSink,
   resolveJudgeChoice,
 } from "./justification-gate";
+// Item 63 — cross-harness knowledge sync: shared memories / graders / prompt
+// fragments moved between a harness and a fleet-level store, dedupe-by-hash,
+// provenance-tagged, PII/token-redacted on push. Side-effect-free module so
+// it is unit-testable (this entry file runs an argv switch on import); the
+// redactor is injected.
+import {
+  KnowledgeSyncError,
+  type PullPlan,
+  type PushPlan,
+  type Redactor,
+  SHARED_DIR_DEFAULT,
+  applyPull,
+  applyPush,
+  buildKnowledgeRedactor,
+  formatPullReport,
+  formatPushReport,
+  fragmentContentHash,
+  harnessOptedIn,
+  memoryContentHash,
+  planPull,
+  planPush,
+  readHarnessGraders,
+  readHarnessMemories,
+  readHarnessPrompts,
+  readSharedFragments,
+  readSharedMemories,
+} from "./knowledge-sync";
 // Item #56 — auto-maintained LESSONS.md + per-user preference files.
 import {
   mergeLessons,
@@ -454,6 +521,28 @@ import {
   suggestSafeName,
   suggestSecretFix,
 } from "./lint";
+// Item 60 — the marketplace CLI core: registry-source resolution, the
+// outdated freshness compare, list/outdated formatters, and the publish PR
+// plan, in a side-effect-free module so it is unit-testable (this entry file
+// runs an argv switch on import). Network is behind an injected fetch seam.
+import {
+  MarketplaceCliError,
+  type OutdatedRow,
+  type PublishDraftLike,
+  type PublishPrDriver,
+  type PublishPrPlan,
+  buildPublishPrPlan,
+  computeOutdated,
+  createHttpModuleRegistrySource,
+  createLocalModuleRegistrySource,
+  defaultPluginRegistryPath,
+  defaultPluginsDir,
+  defaultTemplateWorkspaceDir,
+  formatOutdated,
+  formatPluginList,
+  installedVersions,
+  resolveRegistryRef as resolveMarketplaceRegistryRef,
+} from "./marketplace-cli";
 // Item 24 — market scan + doctor --models + pricing sync core, in a
 // side-effect-free module (this entry file runs an argv switch on import).
 import {
@@ -480,6 +569,19 @@ import {
   rankSuggestions,
   readOnlyByName,
 } from "./permissions-suggest";
+// Item 59 — PR-based optimize/advise proposals. `crewhaus propose` packages a
+// spec change into a review artifact + opens a PR (never auto-merges), in a
+// side-effect-free module so it is unit-testable (this entry file runs an argv
+// switch on import). Assembly is pure; git/gh live behind an injected driver.
+import {
+  type GitPrDriver,
+  type OpenedPr,
+  ProposeError,
+  type ProposeSource,
+  assembleProposal,
+  buildProposalAuditPayload,
+  buildProposalPrPlan,
+} from "./propose";
 // Item 5 — `crewhaus dataset refresh-goldens`: reconcile user corrections +
 // up-rated turns against an existing dataset's golds, proposing (or applying
 // as a NEW version) updated golds. Side-effect-free so it is unit-testable.
@@ -512,6 +614,20 @@ import {
   runRetentionPurge,
   runRetentionSweep,
 } from "./retention";
+// Item 64 — `crewhaus retire`: audited harness decommissioning (active-pin
+// refusal, ordered non-destructive-then-archive steps, retirement log). The
+// orchestration + refusal are pure; heavy steps are an injected seam. In a
+// side-effect-free module so it is unit-testable (this entry file runs an argv
+// switch on import).
+import {
+  RetireError,
+  type RetirementSteps,
+  type StepOutcome,
+  buildRetirementPlan,
+  formatPlan,
+  formatRetirementResult,
+  runRetirement,
+} from "./retire";
 // Item 25 — model right-sizing downshift search core (pure enumeration + cost
 // projection + $/score ranking); side-effect-free so it is unit-testable.
 import {
@@ -982,6 +1098,86 @@ const FLYWHEEL_SCHEMA: ParseArgsSchema = {
   ],
 };
 
+// Item 60 — `crewhaus plugins {list,search,install,uninstall,publish,outdated}`.
+const PLUGINS_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // Registry backend: a dir (or file:<dir>) of manifest JSONs, or an
+    // http(s):// index URL. Falls back to CREWHAUS_PLUGIN_REGISTRY.
+    { name: "registry", takesValue: true },
+    // search filter.
+    { name: "query", short: "q", takesValue: true },
+    // install: pin a version (default latest).
+    { name: "version", takesValue: true },
+    // Where installed plugins live (default ~/.crewhaus/plugins) + registry file.
+    { name: "plugins-dir", takesValue: true },
+    { name: "registry-file", takesValue: true },
+    // Signing: opt out of fail-closed verification (dev only).
+    { name: "allow-unsigned", takesValue: false },
+    // publish: the manifest JSON to publish.
+    { name: "manifest", takesValue: true },
+    // publish/outdated: assemble + print without touching git/gh / network write.
+    { name: "dry-run", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
+// Item 60 — `crewhaus templates {list,search,use}`.
+const TEMPLATES_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "registry", takesValue: true },
+    { name: "query", short: "q", takesValue: true },
+    { name: "target", takesValue: true },
+    // `use`: workspace dir the template scaffolds into (default cwd) + subdir.
+    { name: "into", takesValue: true },
+    { name: "subdir", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
+// Item 64 — `crewhaus retire <spec>`. `--archive <dir>` where the evidence
+// bundle lands; `--dry-run` prints the plan; `--force` retires despite an
+// active pin; `--push-knowledge` shares lessons out first; `--shared` picks
+// the shared store for that push.
+const RETIRE_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "archive", takesValue: true },
+    { name: "dry-run", takesValue: false },
+    { name: "force", takesValue: false },
+    { name: "push-knowledge", takesValue: false },
+    { name: "shared", takesValue: true },
+    { name: "root-dir", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
+// Item 63 — `crewhaus knowledge sync [--pull|--push]`. `--root` scopes the
+// fleet discovery; `--shared` overrides the shared-store dir; `--dry-run`
+// plans without writing; `--no-redact` skips redaction (dev/local only).
+const KNOWLEDGE_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "root", takesValue: true },
+    { name: "shared", takesValue: true },
+    { name: "pull", takesValue: false },
+    { name: "push", takesValue: false },
+    { name: "dry-run", takesValue: false },
+    { name: "no-redact", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
+// Item 58 — `crewhaus fleet list|status|run`. `--root` scopes discovery;
+// `--filter` narrows a bulk `run`; `--allow-mutating` + per-harness confirm
+// gates a mutating bulk op; `--yes` skips the interactive confirm (CI).
+const FLEET_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "root", takesValue: true },
+    { name: "filter", takesValue: true },
+    { name: "allow-mutating", takesValue: false },
+    { name: "yes", short: "y", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
 const EVAL_SCHEMA: ParseArgsSchema = {
   flags: [
     { name: "dataset", takesValue: true },
@@ -1357,6 +1553,37 @@ const DEPLOY_SCHEMA: ParseArgsSchema = {
     { name: "root-dir", takesValue: true },
     { name: "tenant", takesValue: true },
     { name: "actor", takesValue: true },
+    // Item 59 — approval gate: a protected env (per .crewhaus/environments.json)
+    // needs a recorded approval quorum / green PR check before the pin flips.
+    { name: "require-approval", takesValue: false },
+    // Consult a PR check as an approval witness (drives `gh pr checks`).
+    { name: "check-pr", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
+// Item 59 — `crewhaus propose <proposed-spec.yaml>`: package a spec change
+// into a review artifact + open a PR (the governance wrapper around
+// optimize/advise write-back). Never auto-merges.
+const PROPOSE_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // The current spec to diff against (default ./crewhaus.yaml).
+    { name: "current", takesValue: true },
+    // Provenance: which verb produced the proposal (optimize|advise|model-scan|manual).
+    { name: "source", takesValue: true },
+    { name: "run-id", takesValue: true },
+    // The version label the changelog/PR uses for the proposed spec.
+    { name: "as-version", takesValue: true },
+    // Eval delta for the PR body (else read from the optimize run if given).
+    { name: "score-before", takesValue: true },
+    { name: "score-after", takesValue: true },
+    { name: "dataset", takesValue: true },
+    // Optimize run dir whose provenance the changelog folds in.
+    { name: "optimize-dir", takesValue: true },
+    // Repo-relative path of the spec file on the branch (default crewhaus.yaml).
+    { name: "spec-path", takesValue: true },
+    // Assemble the bundle + print the plan without touching git/gh.
+    { name: "dry-run", takesValue: false },
     // Item 29 — `deploy canary <spec> <version>` eval-gated ramp flags.
     { name: "traffic", takesValue: true },
     { name: "dataset", takesValue: true },
@@ -1563,8 +1790,15 @@ function usageText(): string {
     "       [--into <dir>] [--force] [--merge feedback|all]",
     "  secrets doctor                       list known secrets via the configured backend",
     "  secrets rotate <name> [--value V]    rotate a named secret (file backend)",
+    "  fleet list|status|run <sub> ...      cross-harness inventory/health + bulk read-ops (item 58)",
+    "  knowledge sync [--pull|--push]       cross-harness shared memories/graders/prompts (item 63)",
+    "  retire <spec> [--dry-run] [--force]  audited harness decommissioning (item 64)",
+    "  plugins list|search|install|...      marketplace plugins CLI + publish/outdated (item 60)",
+    "  templates list|search|use ...        marketplace templates CLI (item 60)",
     "  spec put|list|get|pin|alias|log ...  versioned spec storage + changelog (Section 28 spec-registry)",
     "  deploy promote|rollback ...          re-pin a spec for an environment (Section 28)",
+    "       promote --require-approval      gate a protected env on an approval quorum (item 59)",
+    "  propose <proposed.yaml> ...          package a spec change + open a review PR (item 59)",
     "  deploy canary <spec> <version> ...   eval-gated ramp with auto-rollback (item 29):",
     "       --traffic 5,25,50,100 --dataset <d> --graders <g>  eval both versions per step,",
     "                                       gate on regression-runner, auto-promote/rollback",
@@ -9664,6 +9898,917 @@ async function runSecrets(args: ParsedArgs, action: string): Promise<void> {
 }
 
 /**
+ * Item 58 — `crewhaus fleet list|status|run <sub>`. The cross-harness view.
+ *
+ * `list`   — discover every harness (dir with a `crewhaus.yaml`) under
+ *            `--root` (default cwd) and print the rolled-up inventory.
+ * `status` — the same, rendered as a per-harness health rollup
+ *            (registered? eval healthy vs its pinned baseline? open
+ *            incidents? audit present?).
+ * `run <sub> [--filter <glob>]` — run a READ-ONLY subcommand across the
+ *            filtered fleet, aggregating exit codes. A mutating subcommand is
+ *            refused unless `--allow-mutating` AND each harness is confirmed
+ *            (interactive prompt; `--yes` for CI).
+ *
+ * The heavy lifting (discovery, aggregation, health marks, bulk plan) lives
+ * in the side-effect-free `./fleet` module; this handler only wires the real
+ * reader/runner/confirm seams to it.
+ */
+async function runFleet(args: ParsedArgs, action: string): Promise<void> {
+  if (args.flags["help"] || action === "") {
+    process.stdout.write(
+      "usage:\n" +
+        "  crewhaus fleet list [--root <dir>]                  cross-harness inventory\n" +
+        "  crewhaus fleet status [--root <dir>]                per-harness health rollup\n" +
+        "  crewhaus fleet run <sub> [--filter <glob>] [--root <dir>]\n" +
+        "                                                     bulk-run a read-only subcommand\n" +
+        "         [--allow-mutating] [--yes]                  across the filtered fleet\n" +
+        "\n" +
+        "  A harness is any directory carrying a crewhaus.yaml (the standalone-harness\n" +
+        "  convention). Discovery skips .crewhaus/, node_modules/, .git/, dist/.\n" +
+        "  Read-only bulk subcommands: eval, doctor, security digest, audit verify.\n" +
+        "  A mutating subcommand requires --allow-mutating and per-harness confirmation.\n",
+    );
+    return;
+  }
+
+  const rootFlag = args.flags["root"];
+  const root = typeof rootFlag === "string" ? rootFlag : process.cwd();
+
+  // Manifest reader: open the harness's own `.crewhaus/specs` registry and
+  // read the spec's manifest. A spec never registered there → undefined
+  // (unregistered), the row still renders.
+  const { createFileBackedRegistry } = await import("@crewhaus/spec-registry");
+  const readManifest: BuildInventoryDeps["readManifest"] = async (specName, registryRoot) => {
+    try {
+      const reg = createFileBackedRegistry({ rootDir: registryRoot });
+      const manifest = await reg.manifest(specName);
+      // An empty manifest (no versions, no pins) means "not registered".
+      if (manifest.versions.length === 0 && Object.keys(manifest.pins).length === 0) {
+        return undefined;
+      }
+      return manifest;
+    } catch {
+      return undefined;
+    }
+  };
+
+  // Eval-index reader: the harness's `.crewhaus/evals/index.jsonl`, mapped to
+  // the minimal shape the fleet row needs.
+  const readEvalIndex: BuildInventoryDeps["readEvalIndex"] = (evalsDir): LastEvalEntry[] =>
+    readRunIndex(evalsDir).map((e) => ({
+      datasetName: e.datasetName,
+      passRate: e.passRate,
+      ts: e.ts,
+    }));
+
+  const deps: BuildInventoryDeps = { readManifest, readEvalIndex };
+
+  try {
+    if (action === "list") {
+      const rows = await buildFleetInventory(root, deps);
+      for (const line of formatFleetInventory(rows, root)) process.stdout.write(`${line}\n`);
+      return;
+    }
+    if (action === "status") {
+      const rows = await buildFleetInventory(root, deps);
+      // Eval health: the last run for a (spec, its pinned dataset) baseline
+      // held or beat the baseline's pass rate. No baseline yet → healthy (a
+      // fresh harness isn't "attention"); a last run below the pinned
+      // baseline → attention.
+      const readEvalHealth: EvalHealthReader = (evalsDir) => {
+        const runs = readRunIndex(evalsDir);
+        if (runs.length === 0) return { healthy: true, note: "no runs recorded" };
+        const baselines = readBaselines(evalsDir);
+        const baselineList = Object.values(baselines);
+        if (baselineList.length === 0) {
+          return { healthy: true, note: `${runs.length} run(s), no baseline pinned` };
+        }
+        // Newest run per (spec, dataset), compared to the pinned baseline's run.
+        let regressed = false;
+        const notes: string[] = [];
+        for (const b of baselineList) {
+          const forKey = runs
+            .filter((r) => r.specName === b.specName && r.datasetName === b.datasetName)
+            .sort((x, y) => (x.ts < y.ts ? -1 : 1));
+          const latest = forKey[forKey.length - 1];
+          const baselineRun = runs.find((r) => r.runId === b.runId);
+          if (latest === undefined || baselineRun === undefined) continue;
+          if (latest.passRate < baselineRun.passRate) {
+            regressed = true;
+            notes.push(
+              `${b.datasetName} ${(latest.passRate * 100).toFixed(0)}% < baseline ${(baselineRun.passRate * 100).toFixed(0)}%`,
+            );
+          }
+        }
+        return regressed
+          ? { healthy: false, note: `below baseline: ${notes.join("; ")}` }
+          : { healthy: true, note: "all baselines held" };
+      };
+      const health = [];
+      for (const inv of rows) health.push(await buildHarnessHealth(inv, readEvalHealth));
+      for (const line of formatHealth(health, root)) process.stdout.write(`${line}\n`);
+      return;
+    }
+    if (action === "run") {
+      const tokens = [...args.positional];
+      const filterFlag = args.flags["filter"];
+      const filter = typeof filterFlag === "string" ? filterFlag : undefined;
+      const allowMutating = args.flags["allow-mutating"] === true;
+      const assumeYes = args.flags["yes"] === true;
+
+      // Production runner: spawn `crewhaus <argv>` in the harness dir (the cwd
+      // every subcommand resolves `.crewhaus/` state from). No shell — an argv
+      // array through Bun.spawn. The child inherits this process's argv[0]
+      // (the running CLI) so a bulk `doctor` runs the SAME binary.
+      const runner: FleetRunner = async ({ cwd, argv }) => {
+        const proc = Bun.spawn([process.execPath, process.argv[1] as string, ...argv], {
+          cwd,
+          stdin: "ignore",
+          stdout: "pipe",
+          stderr: "pipe",
+        });
+        const [stdout, stderr, exitCode] = await Promise.all([
+          new Response(proc.stdout as ReadableStream).text(),
+          new Response(proc.stderr as ReadableStream).text(),
+          proc.exited,
+        ]);
+        const combined = `${stdout}${stderr}`.trim();
+        return { exitCode, tail: combined };
+      };
+
+      // Per-harness confirm for a mutating bulk op. `--yes` auto-confirms
+      // (scripted/CI); otherwise a y/N prompt per harness.
+      const confirm = async (
+        inv: HarnessInventory,
+        argv: ReadonlyArray<string>,
+      ): Promise<boolean> => {
+        if (assumeYes) return true;
+        return await promptYesNo(
+          `run mutating \`crewhaus ${argv.join(" ")}\` in ${inv.specName} (${inv.dir})? [y/N] `,
+        );
+      };
+
+      const report = await runFleetBulk({
+        root,
+        subcommandTokens: tokens,
+        ...(filter !== undefined ? { filter } : {}),
+        allowMutating,
+        deps,
+        runner,
+        confirm,
+      });
+      for (const line of formatBulkReport(report)) process.stdout.write(`${line}\n`);
+      if (report.failed > 0) process.exit(1);
+      return;
+    }
+    die(`unknown fleet action "${action}" (expected: list | status | run)`);
+  } catch (err) {
+    if (err instanceof FleetError) die(err.message);
+    if (err instanceof CrewhausError) die(err.message);
+    throw err;
+  }
+}
+
+/**
+ * Item 63 — `crewhaus knowledge sync [--pull|--push]`. Move shared memories /
+ * graders / prompt fragments between the opted-in harnesses under `--root`
+ * and a fleet-level shared store. Push redacts (PII + credential-shaped
+ * tokens) and drops anything a token survives; pull dedupes by content hash.
+ * Heavy logic is in `./knowledge-sync`; this wires the real redactor + fs.
+ */
+async function runKnowledge(args: ParsedArgs, action: string): Promise<void> {
+  if (args.flags["help"] || action !== "sync") {
+    process.stdout.write(
+      "usage: crewhaus knowledge sync [--pull | --push] [--root <dir>] [--shared <dir>]\n" +
+        "         [--dry-run] [--no-redact]\n" +
+        "\n" +
+        "  Move shared memories, reusable graders.yaml, and prompt fragments between\n" +
+        "  the opted-in harnesses under --root (a dir with .crewhaus/knowledge.json\n" +
+        '  {"share": true}) and a fleet-level shared store (default ./.crewhaus-shared,\n' +
+        "  or CREWHAUS_SHARED_DIR). --push shares OUT (redacting PII + credential-shaped\n" +
+        "  tokens; anything a token survives is dropped, never shared); --pull brings\n" +
+        "  IN. Both dedupe by content hash, so re-running is a no-op. With neither flag,\n" +
+        "  sync does push then pull.\n",
+    );
+    return;
+  }
+  const rootFlag = args.flags["root"];
+  const root = typeof rootFlag === "string" ? rootFlag : process.cwd();
+  const sharedFlag = args.flags["shared"];
+  const sharedDir = resolve(
+    typeof sharedFlag === "string"
+      ? sharedFlag
+      : (process.env["CREWHAUS_SHARED_DIR"] ?? join(root, SHARED_DIR_DEFAULT)),
+  );
+  const dryRun = args.flags["dry-run"] === true;
+  const doPush = args.flags["push"] === true || args.flags["pull"] !== true;
+  const doPull = args.flags["pull"] === true || args.flags["push"] !== true;
+  const redact =
+    args.flags["no-redact"] === true
+      ? identityRedactor()
+      : await buildProductionKnowledgeRedactor();
+  const now = (): Date => new Date();
+
+  const { discoverHarnesses } = await import("./fleet");
+  let harnesses: Array<{ dir: string }>;
+  try {
+    harnesses = discoverHarnesses(root);
+  } catch (err) {
+    if (err instanceof CrewhausError) die(err.message);
+    throw err;
+  }
+  const optedIn = harnesses.filter((h) => harnessOptedIn(h.dir));
+  if (optedIn.length === 0) {
+    process.stdout.write(
+      `no opted-in harnesses under ${resolve(root)} — add .crewhaus/knowledge.json {"share": true} to participate\n`,
+    );
+    return;
+  }
+
+  process.stdout.write(
+    `knowledge sync — ${optedIn.length} opted-in harness(es), shared store ${sharedDir}${dryRun ? " (dry run)" : ""}\n`,
+  );
+
+  try {
+    if (doPush) {
+      for (const h of optedIn) {
+        const existingMemoryHashes = new Set(
+          readSharedMemories(sharedDir).map((m) => m.contentHash),
+        );
+        const existingFragmentHashes = new Set([
+          ...readSharedFragments(sharedDir, "grader").map((f) => f.contentHash),
+          ...readSharedFragments(sharedDir, "prompt").map((f) => f.contentHash),
+        ]);
+        const graders = readHarnessGraders(h.dir);
+        const plan: PushPlan = await planPush({
+          harness: basename(h.dir),
+          memories: readHarnessMemories(h.dir),
+          ...(graders !== undefined ? { graders } : {}),
+          prompts: readHarnessPrompts(h.dir),
+          existingMemoryHashes,
+          existingFragmentHashes,
+          redact,
+          now,
+        });
+        if (!dryRun) applyPush(sharedDir, plan, now);
+        for (const line of formatPushReport(basename(h.dir), plan, dryRun)) {
+          process.stdout.write(`${line}\n`);
+        }
+      }
+    }
+    if (doPull) {
+      const sharedMemories = readSharedMemories(sharedDir);
+      const sharedFragments = [
+        ...readSharedFragments(sharedDir, "grader"),
+        ...readSharedFragments(sharedDir, "prompt"),
+      ];
+      for (const h of optedIn) {
+        const harnessMemoryHashes = new Set(
+          readHarnessMemories(h.dir).map((m) => memoryContentHash(m.text, m.tags)),
+        );
+        const harnessFragmentHashes = new Set([
+          ...(readHarnessGraders(h.dir) !== undefined
+            ? [fragmentContentHash((readHarnessGraders(h.dir) as { contents: string }).contents)]
+            : []),
+          ...readHarnessPrompts(h.dir).map((p) => fragmentContentHash(p.contents)),
+        ]);
+        const plan: PullPlan = planPull({
+          sharedMemories,
+          sharedFragments,
+          harnessMemoryHashes,
+          harnessFragmentHashes,
+        });
+        if (!dryRun) applyPull(h.dir, plan, now);
+        for (const line of formatPullReport(basename(h.dir), plan, dryRun)) {
+          process.stdout.write(`${line}\n`);
+        }
+      }
+    }
+  } catch (err) {
+    if (err instanceof KnowledgeSyncError) die(err.message);
+    if (err instanceof CrewhausError) die(err.message);
+    throw err;
+  }
+}
+
+/** The identity redactor (used with --no-redact). */
+function identityRedactor(): Redactor {
+  return async (text: string) => ({ text, secretRemains: false });
+}
+
+/**
+ * Build the production knowledge redactor. Wires `@crewhaus/pii-redactor`'s
+ * default PII detectors as the PII pass, then delegates to the importable,
+ * unit-tested `buildKnowledgeRedactor` in `./knowledge-sync`, which masks every
+ * credential-shaped token (AWS id + secret key, Stripe, `sk-`, GitHub, Slack,
+ * JWT, PEM blocks, Bearer) and applies a STRICT "looks like a secret" fallback
+ * so anything suspicious surviving redaction is DROPPED, not shared.
+ */
+async function buildProductionKnowledgeRedactor(): Promise<Redactor> {
+  const { createPiiRedactor } = await import("@crewhaus/pii-redactor");
+  const { DEFAULT_PII_DETECTORS } = await import("@crewhaus/grader-safety-classifiers");
+  const redactor = createPiiRedactor({ regexDetectors: [...DEFAULT_PII_DETECTORS] });
+  return buildKnowledgeRedactor(async (text) => (await redactor.redact(text)).text);
+}
+
+/**
+ * Item 64 — `crewhaus retire <spec>`. A clean, evidenced decommission:
+ * refuse an active pin (unless --force), export durable state, record a final
+ * compliance-evidence bundle + audit verify, optionally push knowledge out,
+ * tombstone the registry entry, then archive + remove — every step logged into
+ * the archive. The orchestration + refusal live in `./retire`; this handler
+ * reads the registry pins and wires the real heavy steps.
+ */
+async function runRetire(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus retire <spec> [--archive <dir>] [--dry-run] [--force]\n" +
+        "         [--force-unverified] [--push-knowledge] [--shared <dir>] [--root-dir <dir>]\n" +
+        "\n" +
+        "  Decommission a harness with evidence. Refuses to retire a spec with an\n" +
+        "  active deployment pin unless --force. Steps (each logged into the archive):\n" +
+        "  export durable state → final compliance-evidence bundle → audit verify →\n" +
+        "  [--push-knowledge] → tombstone the registry entry (delete versions, clearing\n" +
+        "  every env pin) → archive + remove the live .crewhaus state. A failing\n" +
+        "  compliance bundle or a tamper-reporting audit verify ABORTS before the\n" +
+        "  destructive move (state left intact) unless --force-unverified. --dry-run\n" +
+        "  prints the plan and touches nothing. --archive defaults to\n" +
+        "  ./retired-<spec>-<date>.\n",
+    );
+    return;
+  }
+  const specArg = args.positional[0];
+  if (typeof specArg !== "string") die("missing <spec>");
+  const harnessDir = process.cwd();
+
+  // The spec name: the registry name of the cwd spec (best-effort parse), or
+  // the argument taken verbatim when it names a registered spec directly.
+  let specName = specArg;
+  const specPath = resolve(specArg);
+  if (existsSync(specPath)) {
+    try {
+      specName = parseSpec(readFileSync(specPath, "utf-8")).name;
+    } catch {
+      // keep the argument as the name
+    }
+  }
+
+  const rootDirFlag = args.flags["root-dir"];
+  const registryRoot =
+    typeof rootDirFlag === "string" ? rootDirFlag : join(harnessDir, ".crewhaus", "specs");
+  const { createFileBackedRegistry } = await import("@crewhaus/spec-registry");
+  const { registrySpecName } = await import("./spec-changelog");
+  const registryName = registrySpecName(specName);
+  const registry = createFileBackedRegistry({ rootDir: registryRoot });
+
+  let pins: Record<string, string> = {};
+  let registeredVersions: ReadonlyArray<string> = [];
+  try {
+    const manifest = await registry.manifest(registryName);
+    pins = { ...manifest.pins };
+    registeredVersions = manifest.versions;
+  } catch {
+    // unregistered — no pins, nothing to tombstone
+  }
+
+  const dryRun = args.flags["dry-run"] === true;
+  const force = args.flags["force"] === true;
+  const pushKnowledge = args.flags["push-knowledge"] === true;
+  const archiveFlag = args.flags["archive"];
+  const archiveDir = resolve(
+    typeof archiveFlag === "string"
+      ? archiveFlag
+      : join(harnessDir, `retired-${registryName}-${new Date().toISOString().slice(0, 10)}`),
+  );
+
+  let plan: ReturnType<typeof buildRetirementPlan>;
+  try {
+    plan = buildRetirementPlan({
+      specName: registryName,
+      harnessDir,
+      archiveDir,
+      pins,
+      force,
+      pushKnowledge,
+    });
+  } catch (err) {
+    if (err instanceof RetireError) die(err.message);
+    throw err;
+  }
+
+  if (dryRun) {
+    for (const line of formatPlan(plan)) process.stdout.write(`${line}\n`);
+    return;
+  }
+
+  // Wire the real heavy steps.
+  const steps: RetirementSteps = {
+    async backupState(archiveDirIn): Promise<StepOutcome & { tarball?: string }> {
+      const stateDir = join(harnessDir, ".crewhaus");
+      if (!existsSync(stateDir)) {
+        return { step: "backupState", ok: true, detail: "no .crewhaus state to back up" };
+      }
+      const outFile = join(archiveDirIn, `${registryName}-state.tar.gz`);
+      try {
+        const result = await createStateBackup({
+          stateDir,
+          outFile,
+          crewhausVersion: cliVersion() ?? "unknown",
+        });
+        return {
+          step: "backupState",
+          ok: true,
+          detail: `${result.manifest.totals.files} file(s) → ${outFile}`,
+          tarball: outFile,
+        };
+      } catch (err) {
+        return { step: "backupState", ok: false, detail: (err as Error).message };
+      }
+    },
+    async complianceEvidence(archiveDirIn): Promise<StepOutcome> {
+      const auditDir = join(harnessDir, ".crewhaus", "audit");
+      if (!existsSync(auditDir)) {
+        return {
+          step: "complianceEvidence",
+          ok: true,
+          detail: "no audit store — no evidence to collect",
+        };
+      }
+      try {
+        const { createComplianceCollector } = await import("@crewhaus/compliance-controls");
+        const auditLog = await import("@crewhaus/audit-log");
+        const outDir = join(archiveDirIn, "compliance");
+        const auditSource = {
+          async *read() {
+            const log = await auditLog.openAuditLog({ rootDir: auditDir });
+            for await (const r of log.read()) yield r;
+          },
+        };
+        const collector = createComplianceCollector({ auditSource, outputDir: outDir });
+        const period = resolvePeriodFlag("current");
+        const frameworks = [...new Set(collector.listControls().map((c) => c.frameworkId))];
+        let written = 0;
+        for (const fw of frameworks) {
+          for (const b of await collector.collectAll(fw, { period })) {
+            collector.writeBundle(b);
+            written += 1;
+          }
+        }
+        return { step: "complianceEvidence", ok: true, detail: `${written} bundle(s) → ${outDir}` };
+      } catch (err) {
+        return { step: "complianceEvidence", ok: false, detail: (err as Error).message };
+      }
+    },
+    async auditVerify(): Promise<StepOutcome> {
+      const auditDir = join(harnessDir, ".crewhaus", "audit");
+      if (!existsSync(auditDir)) {
+        return { step: "auditVerify", ok: true, detail: "no audit store to verify" };
+      }
+      try {
+        const { verify } = await import("@crewhaus/audit-log");
+        const result = await verify(auditDir);
+        const summary = summarizeVerifyResult(result, { anchorRequested: false });
+        return {
+          step: "auditVerify",
+          ok: result.ok,
+          detail: result.ok
+            ? `chain intact (${result.recordsChecked} record(s))`
+            : (summary.lines[0] ?? "tamper finding"),
+        };
+      } catch (err) {
+        return { step: "auditVerify", ok: false, detail: (err as Error).message };
+      }
+    },
+    async pushKnowledge(archiveDirIn): Promise<StepOutcome> {
+      // Push this harness's knowledge to the shared store (#63), gated by the
+      // opt-in marker like a normal sync.
+      if (!harnessOptedIn(harnessDir)) {
+        return {
+          step: "pushKnowledge",
+          ok: true,
+          detail: "harness not opted into knowledge sharing — skipped",
+        };
+      }
+      try {
+        const sharedFlag = args.flags["shared"];
+        const sharedDir = resolve(
+          typeof sharedFlag === "string"
+            ? sharedFlag
+            : (process.env["CREWHAUS_SHARED_DIR"] ?? join(harnessDir, "..", SHARED_DIR_DEFAULT)),
+        );
+        const redact = await buildProductionKnowledgeRedactor();
+        const graders = readHarnessGraders(harnessDir);
+        const plan2 = await planPush({
+          harness: registryName,
+          memories: readHarnessMemories(harnessDir),
+          ...(graders !== undefined ? { graders } : {}),
+          prompts: readHarnessPrompts(harnessDir),
+          existingMemoryHashes: new Set(readSharedMemories(sharedDir).map((m) => m.contentHash)),
+          existingFragmentHashes: new Set([
+            ...readSharedFragments(sharedDir, "grader").map((f) => f.contentHash),
+            ...readSharedFragments(sharedDir, "prompt").map((f) => f.contentHash),
+          ]),
+          redact,
+          now: () => new Date(),
+        });
+        applyPush(sharedDir, plan2, () => new Date());
+        // Also drop a copy of the push plan into the archive for the record.
+        mkdirSync(archiveDirIn, { recursive: true });
+        writeFileSync(
+          join(archiveDirIn, "knowledge-pushed.json"),
+          `${JSON.stringify({ memories: plan2.memories.length, fragments: plan2.fragments.length, droppedSecrets: plan2.droppedSecrets }, null, 2)}\n`,
+        );
+        return {
+          step: "pushKnowledge",
+          ok: true,
+          detail: `pushed ${plan2.memories.length} memory(ies), ${plan2.fragments.length} fragment(s) → ${sharedDir}`,
+        };
+      } catch (err) {
+        return { step: "pushKnowledge", ok: false, detail: (err as Error).message };
+      }
+    },
+    async tombstoneRegistry(): Promise<StepOutcome> {
+      if (registeredVersions.length === 0) {
+        return {
+          step: "tombstoneRegistry",
+          ok: true,
+          detail: "unregistered — nothing to tombstone",
+        };
+      }
+      try {
+        // Delete every registered version — spec-registry's delete() clears any
+        // pin pointing at a deleted version, so this unpins every env too.
+        for (const v of registeredVersions) await registry.delete(registryName, v);
+        return {
+          step: "tombstoneRegistry",
+          ok: true,
+          detail: `deleted ${registeredVersions.length} version(s); ${Object.keys(pins).length} pin(s) cleared`,
+        };
+      } catch (err) {
+        return { step: "tombstoneRegistry", ok: false, detail: (err as Error).message };
+      }
+    },
+  };
+
+  let result: Awaited<ReturnType<typeof runRetirement>>;
+  try {
+    result = await runRetirement({
+      plan,
+      steps,
+      dryRun: false,
+      forceUnverified: args.flags["force-unverified"] === true,
+    });
+  } catch (err) {
+    if (err instanceof RetireError) die(err.message);
+    throw err;
+  }
+  for (const line of formatRetirementResult(result)) process.stdout.write(`${line}\n`);
+}
+
+/** A one-off y/N prompt on stdin. Empty / anything not starting with y → no. */
+async function promptYesNo(question: string): Promise<boolean> {
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const answer = await new Promise<string>((res) => rl.question(question, res));
+    return /^y(es)?$/i.test(answer.trim());
+  } finally {
+    rl.close();
+  }
+}
+
+/** Build a `ModuleRegistrySource` from the resolved `--registry` ref (a local
+ *  dir of manifest JSONs, or an http(s):// index). */
+function buildModuleRegistrySource(
+  ref: string | undefined,
+): import("@crewhaus/module-marketplace-client").ModuleRegistrySource {
+  const resolved = resolveMarketplaceRegistryRef(ref, "plugin");
+  if (resolved.kind === "http") {
+    return createHttpModuleRegistrySource({ id: resolved.baseUrl, baseUrl: resolved.baseUrl });
+  }
+  return createLocalModuleRegistrySource({
+    dir: resolved.dir,
+    readdirImpl: (dir) => readdirSync(dir),
+    readFileImpl: (path) => readFileSync(path, "utf-8"),
+    existsImpl: (path) => existsSync(path),
+  });
+}
+
+/**
+ * Item 60 — `crewhaus plugins {list,search,install,uninstall,publish,outdated}`.
+ * Wraps §42 `module-marketplace-client` over §42 `plugin-registry`, closing
+ * the CLI surface those packages deferred. Heavy logic (registry-source
+ * resolution, outdated compare, formatters, publish plan) is in
+ * `./marketplace-cli`; this handler wires the real registry + git/gh driver.
+ */
+async function runPlugins(args: ParsedArgs, action: string): Promise<void> {
+  if (args.flags["help"] || action === "") {
+    process.stdout.write(
+      "usage:\n" +
+        "  crewhaus plugins list [--registry <dir|url>]           list the catalog\n" +
+        "  crewhaus plugins search -q <text> [--registry <ref>]   search the catalog\n" +
+        "  crewhaus plugins install <name> [--version <v>]        fetch + register a plugin\n" +
+        "       [--allow-unsigned] [--plugins-dir <dir>]\n" +
+        "  crewhaus plugins uninstall <name>                      unregister a plugin\n" +
+        "  crewhaus plugins outdated [--registry <ref>]           installed vs latest report\n" +
+        "  crewhaus plugins publish --manifest <plugin.json>      open a publish PR (item 60)\n" +
+        "       [--registry <ref>] [--dry-run]\n" +
+        "\n" +
+        "  The registry backend is a directory of manifest JSONs (or file:<dir>) or an\n" +
+        "  http(s):// index; falls back to CREWHAUS_PLUGIN_REGISTRY. Install respects\n" +
+        "  plugin-registry's fail-closed signature verification; --allow-unsigned opts\n" +
+        "  out for local development.\n",
+    );
+    return;
+  }
+
+  const pluginsDirFlag = args.flags["plugins-dir"];
+  const pluginsDir = typeof pluginsDirFlag === "string" ? pluginsDirFlag : defaultPluginsDir();
+  const registryFileFlag = args.flags["registry-file"];
+  const registryPath =
+    typeof registryFileFlag === "string" ? registryFileFlag : defaultPluginRegistryPath();
+  const allowUnsigned = args.flags["allow-unsigned"] === true;
+  const registryRef =
+    typeof args.flags["registry"] === "string"
+      ? args.flags["registry"]
+      : process.env["CREWHAUS_PLUGIN_REGISTRY"];
+
+  const { createPluginRegistry } = await import("@crewhaus/plugin-registry");
+  const pluginRegistry = createPluginRegistry({ registryPath, allowUnsigned });
+
+  try {
+    if (action === "list" || action === "search") {
+      const source = buildModuleRegistrySource(registryRef);
+      const { createMarketplaceClient } = await import("@crewhaus/module-marketplace-client");
+      const client = createMarketplaceClient({ registry: source, pluginRegistry, pluginsDir });
+      const queryFlag = args.flags["query"];
+      const results = await client.search(
+        action === "search" && typeof queryFlag === "string" ? { query: queryFlag } : {},
+      );
+      for (const line of formatPluginList(results)) process.stdout.write(`${line}\n`);
+      return;
+    }
+    if (action === "install") {
+      const name = args.positional[0];
+      if (typeof name !== "string") die("missing <name>");
+      const source = buildModuleRegistrySource(registryRef);
+      const { createMarketplaceClient } = await import("@crewhaus/module-marketplace-client");
+      const client = createMarketplaceClient({ registry: source, pluginRegistry, pluginsDir });
+      const versionFlag = args.flags["version"];
+      const result = await client.install(
+        name,
+        typeof versionFlag === "string" ? versionFlag : undefined,
+      );
+      process.stdout.write(
+        `installed ${result.manifest.name}@${result.manifest.version} → ${result.manifestPath}\n`,
+      );
+      return;
+    }
+    if (action === "uninstall") {
+      const name = args.positional[0];
+      if (typeof name !== "string") die("missing <name>");
+      const source = buildModuleRegistrySource(registryRef);
+      const { createMarketplaceClient } = await import("@crewhaus/module-marketplace-client");
+      const client = createMarketplaceClient({ registry: source, pluginRegistry, pluginsDir });
+      await client.uninstall(name);
+      process.stdout.write(`uninstalled ${name} (on-disk source left in place)\n`);
+      return;
+    }
+    if (action === "outdated") {
+      const installed = installedVersions(await pluginRegistry.list());
+      if (installed.length === 0) {
+        process.stdout.write("no plugins installed\n");
+        return;
+      }
+      const source = buildModuleRegistrySource(registryRef);
+      const remote = await source.listPlugins();
+      const rows: ReadonlyArray<OutdatedRow> = computeOutdated(installed, remote);
+      for (const line of formatOutdated(rows)) process.stdout.write(`${line}\n`);
+      return;
+    }
+    if (action === "publish") {
+      await runPluginPublish(args, registryRef, { pluginRegistry, pluginsDir });
+      return;
+    }
+    die(
+      `unknown plugins action "${action}" (expected: list | search | install | uninstall | outdated | publish)`,
+    );
+  } catch (err) {
+    if (err instanceof MarketplaceCliError) die(err.message);
+    if (err instanceof CrewhausError) die(err.message);
+    throw err;
+  }
+}
+
+/** `plugins publish` — drive the marketplace client's PublishDraft through an
+ *  actual `gh` PR (the publish loop the packages left open). */
+async function runPluginPublish(
+  args: ParsedArgs,
+  registryRef: string | undefined,
+  ctx: {
+    pluginRegistry: Awaited<
+      ReturnType<typeof import("@crewhaus/plugin-registry").createPluginRegistry>
+    >;
+    pluginsDir: string;
+  },
+): Promise<void> {
+  const manifestFlag = args.flags["manifest"];
+  if (typeof manifestFlag !== "string") die("missing --manifest <plugin.json>");
+  let manifestText: string;
+  try {
+    manifestText = readFileSync(resolve(manifestFlag), "utf-8");
+  } catch (err) {
+    die(`could not read manifest ${manifestFlag}: ${(err as Error).message}`);
+  }
+  const { validatePluginManifest } = await import("@crewhaus/plugin-sdk");
+  let manifest: import("@crewhaus/plugin-sdk").PluginManifest;
+  try {
+    manifest = validatePluginManifest(JSON.parse(manifestText));
+  } catch (err) {
+    die(`invalid plugin manifest: ${(err as Error).message}`);
+  }
+
+  const source = buildModuleRegistrySource(registryRef);
+  const { createMarketplaceClient } = await import("@crewhaus/module-marketplace-client");
+  const client = createMarketplaceClient({
+    registry: source,
+    pluginRegistry: ctx.pluginRegistry,
+    pluginsDir: ctx.pluginsDir,
+  });
+  const draft = client.draftPublish(manifest);
+
+  const draftLike: PublishDraftLike = {
+    prTitle: draft.prTitle,
+    prBody: draft.prBody,
+    manifestRelPath: `plugins/${draft.name}.json`,
+    manifestContents: `${draft.canonicalManifest}\n`,
+    name: draft.name,
+    version: draft.version,
+  };
+  const plan = buildPublishPrPlan(draftLike, new Date());
+
+  if (args.flags["dry-run"] === true) {
+    process.stdout.write(`[publish] ${draft.name}@${draft.version} — dry run (no git/gh)\n`);
+    process.stdout.write(`  branch: ${plan.branch}\n`);
+    process.stdout.write(`  title:  ${plan.title}\n`);
+    process.stdout.write(`  files:  ${Object.keys(plan.files).join(", ")}\n`);
+    return;
+  }
+
+  const driver = createPublishPrDriver();
+  const opened = await driver(plan);
+  process.stdout.write(
+    `[publish] opened PR${opened.prNumber !== undefined ? ` #${opened.prNumber}` : ""}: ${opened.url}\n`,
+  );
+}
+
+/** The production git/gh publish driver — branch → write manifest → commit →
+ *  push → `gh pr create` (argv arrays, no shell). NEVER auto-merges. */
+function createPublishPrDriver(): PublishPrDriver {
+  return async (plan: PublishPrPlan) => {
+    const run = (bin: string, argv: ReadonlyArray<string>): string => {
+      const proc = spawnSync(bin, [...argv], { encoding: "utf-8" });
+      if (proc.status !== 0) {
+        throw new MarketplaceCliError(
+          `\`${bin} ${argv.join(" ")}\` failed (exit ${proc.status ?? "signal"}): ${(proc.stderr ?? "").toString().trim()}`,
+        );
+      }
+      return (proc.stdout ?? "").toString();
+    };
+    const inside = spawnSync("git", ["rev-parse", "--is-inside-work-tree"], { encoding: "utf-8" });
+    if (inside.status !== 0 || inside.stdout?.trim() !== "true") {
+      throw new MarketplaceCliError(
+        "not inside a git repository — `crewhaus plugins publish` opens a PR against the registry repo (run it from the checkout, or use --dry-run)",
+      );
+    }
+    run("git", ["checkout", "-b", plan.branch]);
+    for (const [rel, contents] of Object.entries(plan.files)) {
+      const abs = resolve(process.cwd(), rel);
+      mkdirSync(dirname(abs), { recursive: true });
+      writeFileSync(abs, contents);
+      run("git", ["add", rel]);
+    }
+    run("git", ["commit", "-m", plan.commitMessage]);
+    run("git", ["push", "-u", "origin", plan.branch]);
+    const out = run("gh", [
+      "pr",
+      "create",
+      "--title",
+      plan.title,
+      "--body",
+      plan.body,
+      "--head",
+      plan.branch,
+    ]);
+    const url = out.trim().split("\n").pop() ?? "";
+    const numMatch = /\/pull\/(\d+)/.exec(url);
+    return {
+      url,
+      branch: plan.branch,
+      ...(numMatch ? { prNumber: Number.parseInt(numMatch[1] as string, 10) } : {}),
+    };
+  };
+}
+
+/**
+ * Item 60 — `crewhaus templates {list,search,use}`. Wraps §40
+ * `template-marketplace-client` over §40 `template-registry`. `use` scaffolds
+ * a template's crewhaus.yaml into the workspace (the install verb, named
+ * `use` because that's the harness-init idiom).
+ */
+async function runTemplates(args: ParsedArgs, action: string): Promise<void> {
+  if (args.flags["help"] || action === "") {
+    process.stdout.write(
+      "usage:\n" +
+        "  crewhaus templates list [--registry <dir|url>]         list the catalog\n" +
+        "  crewhaus templates search -q <text> [--target <t>]     search the catalog\n" +
+        "  crewhaus templates use <name> [--into <dir>]           scaffold a template\n" +
+        "       [--subdir <dir>] [--registry <ref>]\n" +
+        "\n" +
+        "  The registry backend is a directory of manifest JSONs (or file:<dir>) or an\n" +
+        "  http(s):// index; falls back to CREWHAUS_TEMPLATE_REGISTRY.\n",
+    );
+    return;
+  }
+  const registryRef =
+    typeof args.flags["registry"] === "string"
+      ? args.flags["registry"]
+      : process.env["CREWHAUS_TEMPLATE_REGISTRY"];
+  const resolved = resolveMarketplaceRegistryRef(registryRef, "template");
+
+  const { LocalRegistrySource, HttpRegistrySource } = await import("@crewhaus/template-registry");
+  const source =
+    resolved.kind === "http"
+      ? new HttpRegistrySource({
+          id: "git",
+          listUrl: resolved.baseUrl,
+          fetchUrl: (name: string) => `${resolved.baseUrl}/${name}.json`,
+        })
+      : new LocalRegistrySource({ rootDir: resolved.dir });
+
+  const { MarketplaceClient } = await import("@crewhaus/template-marketplace-client");
+
+  try {
+    if (action === "list") {
+      const client = new MarketplaceClient({
+        registry: source,
+        workspaceDir: defaultTemplateWorkspaceDir(),
+      });
+      const list = await client.list();
+      if (list.length === 0) {
+        process.stdout.write("no templates in the registry\n");
+        return;
+      }
+      for (const t of list) {
+        process.stdout.write(`${t.name} v${t.version} (${t.target}) — ${t.author}\n`);
+        if (t.description) process.stdout.write(`    ${t.description}\n`);
+      }
+      return;
+    }
+    if (action === "search") {
+      const client = new MarketplaceClient({
+        registry: source,
+        workspaceDir: defaultTemplateWorkspaceDir(),
+      });
+      const queryFlag = args.flags["query"];
+      const targetFlag = args.flags["target"];
+      const results = await client.search({
+        ...(typeof queryFlag === "string" ? { query: queryFlag } : {}),
+        ...(typeof targetFlag === "string" ? { target: targetFlag } : {}),
+      });
+      if (results.length === 0) {
+        process.stdout.write("no matching templates\n");
+        return;
+      }
+      for (const r of results) {
+        process.stdout.write(`${r.metadata.name} v${r.metadata.version} (${r.metadata.target})\n`);
+      }
+      return;
+    }
+    if (action === "use") {
+      const name = args.positional[0];
+      if (typeof name !== "string") die("missing <name>");
+      const intoFlag = args.flags["into"];
+      const workspaceDir =
+        typeof intoFlag === "string" ? resolve(intoFlag) : defaultTemplateWorkspaceDir();
+      const client = new MarketplaceClient({ registry: source, workspaceDir });
+      const subdirFlag = args.flags["subdir"];
+      const result = await client.install(
+        name,
+        typeof subdirFlag === "string" ? { subdir: subdirFlag } : {},
+      );
+      process.stdout.write(`scaffolded ${result.manifest.name} → ${result.path}\n`);
+      return;
+    }
+    die(`unknown templates action "${action}" (expected: list | search | use)`);
+  } catch (err) {
+    if (err instanceof MarketplaceCliError) die(err.message);
+    if (err instanceof CrewhausError) die(err.message);
+    throw err;
+  }
+}
+
+/**
  * Section 28 — `crewhaus spec <action> ...` subcommands wrap the
  * spec-registry. Actions: put / get / list / pin / alias / log (item 46 —
  * render the per-spec CHANGELOG.md that auto-registration and `put` keep
@@ -9677,6 +10822,7 @@ async function runSpec(args: ParsedArgs, action: string): Promise<void> {
         "  crewhaus spec list <name>                                   list versions\n" +
         "  crewhaus spec get <name> <version>                          print yaml\n" +
         "  crewhaus spec pin <name> <env> <version> [--tenant <id>]   pin env → version\n" +
+        "       [--require-approval] [--check-pr] [--actor <id>]      gate a protected env (item 59)\n" +
         "  crewhaus spec alias <name> <env> [--tenant <id>]            resolve env → version\n" +
         "  crewhaus spec log <name> [--root-dir <dir>]                 print the changelog (newest first;\n" +
         '                                                              display names sanitize as on compile: "My Agent" → My-Agent)\n',
@@ -9777,6 +10923,32 @@ async function runSpec(args: ParsedArgs, action: string): Promise<void> {
     if (typeof name !== "string") die("missing <name>");
     if (typeof env !== "string") die("missing <env>");
     if (typeof version !== "string") die("missing <version>");
+
+    // Item 59 (F2) — `spec pin` flips a live env pin exactly like `deploy
+    // promote`/`rollback`, so a pin into a PROTECTED env must clear the same
+    // approval gate. Non-protected envs stay ungated (the pre-item-59 path).
+    const harnessRoot = process.cwd();
+    const actorFlag = args.flags["actor"];
+    const actor = typeof actorFlag === "string" ? actorFlag : undefined;
+    const { openAuditLog } = await import("@crewhaus/audit-log");
+    const audit = await openAuditLog({ rootDir: join(harnessRoot, ".crewhaus", "audit") });
+    try {
+      await enforceProtectedEnvGate({
+        args,
+        harnessRoot,
+        name,
+        toEnv: env,
+        toVersion: version,
+        verb: "pin",
+        ...(tenantId !== undefined ? { tenantId } : {}),
+        ...(actor !== undefined ? { actor } : {}),
+        auditLog: audit,
+      });
+    } catch (err) {
+      if (err instanceof ApprovalGateError) die(err.message);
+      throw err;
+    }
+
     if (tenantId !== undefined) {
       await reg.pinForTenant(tenantId, name, env, version);
       process.stdout.write(`pinned tenant=${tenantId} ${name} ${env} → ${version}\n`);
@@ -9811,7 +10983,16 @@ async function runDeploy(args: ParsedArgs, action: string): Promise<void> {
     process.stdout.write(
       "usage:\n" +
         "  crewhaus deploy promote <name> <fromEnv> <toEnv>  copy env pin\n" +
+        "       [--require-approval] [--check-pr]            gate a protected env (item 59)\n" +
         "  crewhaus deploy rollback <name> <env> <version>   re-pin env to version\n" +
+        "       [--require-approval] [--check-pr]            gate a protected env (item 59)\n" +
+        "\n" +
+        "  --require-approval  refuse to flip a PROTECTED env's pin (declared in\n" +
+        "                      .crewhaus/environments.json) until an approval quorum\n" +
+        "                      is met: recorded approvals in .crewhaus/approvals/ and/or\n" +
+        "                      a green proposal PR (--check-pr). The gate decision — met\n" +
+        "                      OR refused — is audit-logged (governance_approval).\n" +
+        "\n" +
         "  crewhaus deploy canary <spec.yaml> <version>      eval-gated ramp (item 29)\n" +
         "    --traffic 5,25,50,100    strictly-increasing ramp steps (default 5,25,50,100)\n" +
         "    --dataset <data>         eval dataset: a file path or registry:<name>[@ver][#split]\n" +
@@ -9846,6 +11027,10 @@ async function runDeploy(args: ParsedArgs, action: string): Promise<void> {
   const rootDirFlag = args.flags["root-dir"];
   const rootDir =
     typeof rootDirFlag === "string" ? rootDirFlag : join(process.cwd(), ".crewhaus", "specs");
+  // The harness root that owns `.crewhaus/environments.json` + `.crewhaus/approvals`.
+  // When --root-dir points AT a `.crewhaus/specs`, the harness root is two up;
+  // otherwise it's the cwd (the standalone-harness convention).
+  const harnessRoot = process.cwd();
   const auditDir = join(process.cwd(), ".crewhaus", "audit");
   const { createFileBackedRegistry } = await import("@crewhaus/spec-registry");
   const { openAuditLog } = await import("@crewhaus/audit-log");
@@ -9870,6 +11055,28 @@ async function runDeploy(args: ParsedArgs, action: string): Promise<void> {
     if (typeof name !== "string") die("missing <name>");
     if (typeof fromEnv !== "string") die("missing <fromEnv>");
     if (typeof toEnv !== "string") die("missing <toEnv>");
+
+    // Item 59 — the approval gate. A protected env (declared in
+    // environments.json OR flagged via --require-approval) must clear a
+    // recorded-approval / green-PR quorum BEFORE the pin flips. The gate runs
+    // here, ahead of the controller, so the controller stays a dumb pin-flipper.
+    try {
+      await enforceApprovalGate({
+        args,
+        harnessRoot,
+        name,
+        fromEnv,
+        toEnv,
+        registry: reg,
+        tenantId,
+        actor,
+        auditLog: audit,
+      });
+    } catch (err) {
+      if (err instanceof ApprovalGateError) die(err.message);
+      throw err;
+    }
+
     const rec = await ctrl.promote(name, fromEnv, toEnv);
     process.stdout.write(
       `promoted ${name} ${fromEnv} → ${toEnv} (now pinned to ${rec.toVersion})\n`,
@@ -9883,6 +11090,27 @@ async function runDeploy(args: ParsedArgs, action: string): Promise<void> {
     if (typeof name !== "string") die("missing <name>");
     if (typeof env !== "string") die("missing <env>");
     if (typeof version !== "string") die("missing <version>");
+
+    // Item 59 (F2) — a rollback to a PROTECTED env flips a live pin just like a
+    // promote, so it must clear the same approval gate. The explicit target
+    // version is what the pin will point at.
+    try {
+      await enforceProtectedEnvGate({
+        args,
+        harnessRoot,
+        name,
+        toEnv: env,
+        toVersion: version,
+        verb: "rollback",
+        ...(tenantId !== undefined ? { tenantId } : {}),
+        ...(actor !== undefined ? { actor } : {}),
+        auditLog: audit,
+      });
+    } catch (err) {
+      if (err instanceof ApprovalGateError) die(err.message);
+      throw err;
+    }
+
     const rec = await ctrl.rollback(name, env, version);
     process.stdout.write(
       `rolled back ${name} ${env} → ${version} (was ${rec.fromVersion ?? "unset"})\n`,
@@ -10119,6 +11347,375 @@ async function runDeployCanary(args: ParsedArgs): Promise<void> {
   die(
     `deploy canary: ${specName} regressed at ${result.failedAt}% — rolled back to ${baselineVersion} (env ${env})`,
   );
+}
+
+/**
+ * Item 59 (F2) — the single approval choke point for ANY pin flip into a
+ * protected environment. `deploy promote`, `deploy rollback`, and `spec pin`
+ * all route through this before the pin moves. Determines whether `toEnv` is
+ * protected (config OR `--require-approval`), and if so requires the recorded
+ * approvals + optional green-PR quorum for the exact `toVersion` being pinned.
+ * The decision — satisfied OR refused — is audit-logged as `governance_approval`
+ * (so even a blocked scheduled flip is evidenced); a refusal throws
+ * ApprovalGateError. An unprotected env is a no-op.
+ *
+ * `verb` only shapes the human-facing messages ("promotion"/"rollback"/"pin").
+ */
+async function enforceProtectedEnvGate(opts: {
+  args: ParsedArgs;
+  harnessRoot: string;
+  name: string;
+  toEnv: string;
+  toVersion: string;
+  verb: "promotion" | "rollback" | "pin";
+  tenantId?: string;
+  actor?: string;
+  auditLog: AuditLog;
+}): Promise<void> {
+  const requireFlag = opts.args.flags["require-approval"] === true;
+  const config = loadEnvironmentsConfig(opts.harnessRoot);
+  const policy = policyForEnv(config, opts.toEnv);
+  const protectedEnv = policy.requireApproval || requireFlag;
+  if (!protectedEnv) return; // unprotected — the pre-item-59 path
+
+  const approvals = readApprovals(opts.harnessRoot, opts.name, opts.toEnv);
+
+  let prCheck: Awaited<ReturnType<PrCheckReader>> | undefined;
+  if (opts.args.flags["check-pr"] === true) {
+    prCheck = readPrCheckViaGh({ specName: opts.name, env: opts.toEnv, version: opts.toVersion });
+  }
+
+  const decisionInput: ApprovalDecisionInput = {
+    specName: opts.name,
+    toEnv: opts.toEnv,
+    toVersion: opts.toVersion,
+    policy,
+    approvals,
+    ...(prCheck !== undefined ? { prCheck } : {}),
+  };
+  const decision = decideApproval(decisionInput);
+
+  // Record the gate evaluation (met OR refused) in the same audit chain the
+  // flip lands in, so a blocked scheduled change is evidenced too.
+  await opts.auditLog.append({
+    kind: "governance_approval",
+    payload: buildGovernancePayload(decisionInput, decision, {
+      ...(opts.actor !== undefined ? { actor: opts.actor } : {}),
+      now: () => Date.now(),
+    }),
+  });
+
+  process.stdout.write(
+    `[approval] ${opts.name} → ${opts.toEnv}@${opts.toVersion}: ${decision.reason}\n`,
+  );
+  if (!decision.satisfied) {
+    throw new ApprovalGateError(
+      `${opts.verb} of ${opts.name} to protected env "${opts.toEnv}" is blocked — ${decision.reason}`,
+    );
+  }
+}
+
+/**
+ * Item 59 — the approval gate for `deploy promote`. Resolves the candidate
+ * version promote would copy (the fromEnv pin) and routes it through the shared
+ * {@link enforceProtectedEnvGate}. An unprotected env / missing fromEnv pin is
+ * a no-op (the controller produces its own "nothing to copy" error).
+ */
+async function enforceApprovalGate(opts: {
+  args: ParsedArgs;
+  harnessRoot: string;
+  name: string;
+  fromEnv: string;
+  toEnv: string;
+  registry: RegistryAdapter;
+  tenantId?: string;
+  actor?: string;
+  auditLog: AuditLog;
+}): Promise<void> {
+  // The candidate version is exactly what promote would copy: the fromEnv pin.
+  const toVersion =
+    opts.tenantId !== undefined
+      ? await opts.registry.aliasForTenant(opts.tenantId, opts.name, opts.fromEnv)
+      : await opts.registry.aliasFor(opts.name, opts.fromEnv);
+  if (!toVersion) {
+    // Let the controller produce its own "no pin to copy from" error — but only
+    // when the env is unprotected. A protected env with no source pin must not
+    // silently sail through the gate: fall through so the gate still evaluates
+    // (it will refuse for lack of witnesses) unless the env is unprotected.
+    const config = loadEnvironmentsConfig(opts.harnessRoot);
+    const policy = policyForEnv(config, opts.toEnv);
+    if (!(policy.requireApproval || opts.args.flags["require-approval"] === true)) return;
+    // Protected but nothing to copy: defer to the controller's clearer error.
+    return;
+  }
+  await enforceProtectedEnvGate({
+    args: opts.args,
+    harnessRoot: opts.harnessRoot,
+    name: opts.name,
+    toEnv: opts.toEnv,
+    toVersion,
+    verb: "promotion",
+    ...(opts.tenantId !== undefined ? { tenantId: opts.tenantId } : {}),
+    ...(opts.actor !== undefined ? { actor: opts.actor } : {}),
+    auditLog: opts.auditLog,
+  });
+}
+
+/** Read a proposal PR's rollup check state via `gh` (the "clients never speak
+ *  git" precedent — shell out to gh, not a git library; argv array, no shell).
+ *  Any gh failure / absence resolves to `conclusion: "none"` (no witness),
+ *  never a throw: a missing gh must not crash a promotion, only withhold the
+ *  PR witness. `GITHUB_TOKEN`/`GH_TOKEN` in the environment authenticates gh. */
+function readPrCheckViaGh(query: {
+  specName: string;
+  env: string;
+  version: string;
+}): Awaited<ReturnType<PrCheckReader>> {
+  try {
+    const list = spawnSync(
+      "gh",
+      [
+        "pr",
+        "list",
+        "--state",
+        "open",
+        "--search",
+        `head:propose/${query.specName}`,
+        "--json",
+        "number,url,headRefName,title,body,statusCheckRollup",
+        "--limit",
+        "20",
+      ],
+      { encoding: "utf-8" },
+    );
+    if (list.status !== 0 || typeof list.stdout !== "string") return { conclusion: "none" };
+    const parsed = JSON.parse(list.stdout) as Array<{
+      number: number;
+      url: string;
+      headRefName?: string;
+      title?: string;
+      body?: string;
+      statusCheckRollup?: Array<{ conclusion?: string; state?: string }>;
+    }>;
+    // F3(b): bind the witness to the EXACT version. `propose` names the branch
+    // `propose/<slug>-<version>-<hash>-<stamp>`, so the version is a bounded
+    // segment of the head ref; also accept a version reference in the title/
+    // body. A green PR for a DIFFERENT version must NOT witness this promotion.
+    const pr = parsed.find((p) => prReferencesVersion(p, query.version));
+    if (pr === undefined) return { conclusion: "none" };
+    // F3(a): fail-closed rollup — only an all-SUCCESS (>=1 check) rollup wins.
+    return {
+      conclusion: rollupConclusion(pr.statusCheckRollup ?? []),
+      prNumber: pr.number,
+      url: pr.url,
+    };
+  } catch {
+    return { conclusion: "none" };
+  }
+}
+
+/**
+ * Item 59 — `crewhaus propose <proposed-spec.yaml>`. Package a spec change
+ * into a review artifact (patch.json + changelog + eval delta + provenance)
+ * and open a GitHub PR against the spec's repo. NEVER auto-merges — the PR is
+ * the human gate. Assembly is pure (./propose); this handler wires the real
+ * spec reads + the git/gh driver + the audit record.
+ */
+async function runPropose(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus propose <proposed-spec.yaml> [--current <spec.yaml>]\n" +
+        "         [--source optimize|advise|model-scan|manual] [--run-id <id>]\n" +
+        "         [--as-version <v>] [--score-before <n>] [--score-after <n>]\n" +
+        "         [--dataset <name>] [--optimize-dir <dir>] [--spec-path <rel>]\n" +
+        "         [--dry-run]\n" +
+        "\n" +
+        "  Package a proposed spec change into a review bundle (patch.json field\n" +
+        "  diff + changelog entry + eval delta + provenance) and open a PR on a\n" +
+        "  fresh propose/<id> branch. The live spec is NOT modified; merging the\n" +
+        "  PR is the human gate (there is no auto-merge). GITHUB_TOKEN/GH_TOKEN\n" +
+        "  authenticates gh. --dry-run assembles + prints the plan, touching no\n" +
+        "  git/gh.\n",
+    );
+    return;
+  }
+  const proposedPathArg = args.positional[0];
+  if (typeof proposedPathArg !== "string") die("missing <proposed-spec.yaml>");
+  const proposedPath = resolve(proposedPathArg);
+  const currentArg = args.flags["current"];
+  const currentPath = resolve(
+    typeof currentArg === "string" ? currentArg : join(process.cwd(), "crewhaus.yaml"),
+  );
+
+  let proposedYaml: string;
+  let currentYaml: string;
+  try {
+    proposedYaml = readFileSync(proposedPath, "utf-8");
+  } catch (err) {
+    die(`could not read proposed spec ${proposedPath}: ${(err as Error).message}`);
+  }
+  try {
+    currentYaml = readFileSync(currentPath, "utf-8");
+  } catch (err) {
+    die(`could not read current spec ${currentPath}: ${(err as Error).message}`);
+  }
+
+  // The spec name comes from the current spec (best-effort — a proposal for an
+  // unparseable spec still assembles a diff). Fall back to the proposed spec.
+  let specName: string;
+  try {
+    specName = parseSpec(currentYaml).name;
+  } catch {
+    try {
+      specName = parseSpec(proposedYaml).name;
+    } catch {
+      die("could not determine the spec name — neither the current nor proposed spec parses");
+    }
+  }
+
+  const sourceFlag = args.flags["source"];
+  const validSources: ReadonlyArray<ProposeSource> = ["optimize", "advise", "model-scan", "manual"];
+  const source: ProposeSource =
+    typeof sourceFlag === "string" && (validSources as ReadonlyArray<string>).includes(sourceFlag)
+      ? (sourceFlag as ProposeSource)
+      : "manual";
+  const runIdFlag = args.flags["run-id"];
+  const runId = typeof runIdFlag === "string" ? runIdFlag : undefined;
+  const asVersionFlag = args.flags["as-version"];
+  const proposedVersion = typeof asVersionFlag === "string" ? asVersionFlag : "proposed";
+  const specPathFlag = args.flags["spec-path"];
+  const specRelPath = typeof specPathFlag === "string" ? specPathFlag : "crewhaus.yaml";
+  const optimizeDirFlag = args.flags["optimize-dir"];
+  const optimizeRootDir = typeof optimizeDirFlag === "string" ? optimizeDirFlag : undefined;
+
+  const scoreBefore = floatFlag(args, "score-before");
+  const scoreAfter = floatFlag(args, "score-after");
+  const datasetFlag = args.flags["dataset"];
+  const evalDelta =
+    scoreBefore !== undefined && scoreAfter !== undefined
+      ? {
+          scoreBefore,
+          scoreAfter,
+          ...(typeof datasetFlag === "string" ? { datasetName: datasetFlag } : {}),
+        }
+      : undefined;
+
+  let assembled: ReturnType<typeof assembleProposal>;
+  try {
+    assembled = assembleProposal({
+      specName,
+      currentYaml,
+      proposedYaml,
+      source,
+      ...(runId !== undefined ? { runId } : {}),
+      ...(evalDelta !== undefined ? { evalDelta } : {}),
+      ...(optimizeRootDir !== undefined ? { optimizeRootDir } : {}),
+      proposedVersion,
+    });
+  } catch (err) {
+    if (err instanceof ProposeError) die(err.message);
+    throw err;
+  }
+
+  const { plan, proposalId: id } = buildProposalPrPlan({
+    assembled,
+    proposedYaml,
+    specRelPath,
+    proposedVersion,
+  });
+
+  if (args.flags["dry-run"] === true) {
+    process.stdout.write(`[propose] ${id} — dry run (no git/gh)\n`);
+    process.stdout.write(`  branch: ${plan.branch}\n`);
+    process.stdout.write(`  title:  ${plan.title}\n`);
+    process.stdout.write(`  files:  ${Object.keys(plan.files).join(", ")}\n`);
+    process.stdout.write(`  diff:   ${assembled.patch.diff.length} structural change(s)\n`);
+    process.stdout.write("\n");
+    process.stdout.write(assembled.prBody);
+    return;
+  }
+
+  const driver = createGitPrDriver();
+  let opened: OpenedPr;
+  try {
+    opened = await driver(plan);
+  } catch (err) {
+    if (err instanceof ProposeError) die(err.message);
+    throw err;
+  }
+
+  // Audit the proposal's provenance (source, patch hash, PR ref) so it is
+  // evidenced before any human acts on it.
+  try {
+    const auditLog = await import("@crewhaus/audit-log");
+    const log = await auditLog.openAuditLog({ rootDir: join(process.cwd(), ".crewhaus", "audit") });
+    await log.append({
+      kind: "governance_proposal",
+      payload: buildProposalAuditPayload(assembled, opened, proposedVersion, () => Date.now()),
+    });
+  } catch (err) {
+    process.stderr.write(
+      `crewhaus: warning: could not audit-log the proposal (${(err as Error).message})\n`,
+    );
+  }
+
+  process.stdout.write(
+    `[propose] opened PR${opened.prNumber !== undefined ? ` #${opened.prNumber}` : ""}: ${opened.url}\n`,
+  );
+}
+
+/**
+ * The production git/gh driver: create the propose/ branch, write the spec +
+ * review bundle, commit, push, and `gh pr create`. Shells out to git/gh (no
+ * git library — the "clients never speak git" precedent), all through argv
+ * arrays (no shell). NEVER auto-merges.
+ */
+function createGitPrDriver(): GitPrDriver {
+  return async (plan) => {
+    const run = (bin: string, argv: ReadonlyArray<string>): string => {
+      const proc = spawnSync(bin, [...argv], { encoding: "utf-8" });
+      if (proc.status !== 0) {
+        throw new ProposeError(
+          `\`${bin} ${argv.join(" ")}\` failed (exit ${proc.status ?? "signal"}): ${(proc.stderr ?? "").toString().trim()}`,
+        );
+      }
+      return (proc.stdout ?? "").toString();
+    };
+    // Refuse to run outside a git work tree with a clear message.
+    const inside = spawnSync("git", ["rev-parse", "--is-inside-work-tree"], { encoding: "utf-8" });
+    if (inside.status !== 0 || inside.stdout?.trim() !== "true") {
+      throw new ProposeError(
+        "not inside a git repository — `crewhaus propose` opens a PR against the spec's repo (run it from the checkout, or use --dry-run)",
+      );
+    }
+    run("git", ["checkout", "-b", plan.branch]);
+    for (const [rel, contents] of Object.entries(plan.files)) {
+      const abs = resolve(process.cwd(), rel);
+      mkdirSync(dirname(abs), { recursive: true });
+      writeFileSync(abs, contents);
+      run("git", ["add", rel]);
+    }
+    run("git", ["commit", "-m", plan.commitMessage]);
+    run("git", ["push", "-u", "origin", plan.branch]);
+    // NEVER add --merge/auto-merge here — the PR is the human gate.
+    const out = run("gh", [
+      "pr",
+      "create",
+      "--title",
+      plan.title,
+      "--body",
+      plan.body,
+      "--head",
+      plan.branch,
+    ]);
+    const url = out.trim().split("\n").pop() ?? "";
+    const numMatch = /\/pull\/(\d+)/.exec(url);
+    return {
+      url,
+      branch: plan.branch,
+      ...(numMatch ? { prNumber: Number.parseInt(numMatch[1] as string, 10) } : {}),
+    };
+  };
 }
 
 /**
@@ -11344,6 +12941,35 @@ switch (subcommand) {
   case "doctor":
     await runDoctor(parseFor(rest, DOCTOR_SCHEMA));
     break;
+  case "fleet": {
+    // Item 58 — list | status | run <sub>. `run` takes a subcommand as
+    // positionals after the action, so the schema is parsed over the tail.
+    const action = rest[0] ?? "";
+    if (action !== "" && action !== "list" && action !== "status" && action !== "run") {
+      die(`fleet action must be one of: list, status, run (got "${action}")`);
+    }
+    await runFleet(parseFor(rest.slice(1), FLEET_SCHEMA), action);
+    break;
+  }
+  case "knowledge": {
+    // Item 63 — cross-harness knowledge sync (memories/graders/prompts).
+    const action = rest[0] ?? "";
+    if (action !== "" && action !== "sync") {
+      die(`knowledge action must be "sync" (got "${action}")`);
+    }
+    await runKnowledge(parseFor(rest.slice(1), KNOWLEDGE_SCHEMA), action || "sync");
+    break;
+  }
+  case "retire":
+    // Item 64 — audited harness decommissioning. Structured failures (spec
+    // parse, active-pin refusal, a failed step) route through die().
+    try {
+      await runRetire(parseFor(rest, RETIRE_SCHEMA));
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
+    break;
   case "model-scan":
     try {
       await runModelScan(parseFor(rest, MODEL_SCAN_SCHEMA));
@@ -11530,6 +13156,30 @@ switch (subcommand) {
       if (err instanceof CrewhausError) die(err.message);
       throw err;
     }
+    break;
+  }
+  case "propose":
+    // Item 59 — package a spec change into a review artifact + open a PR.
+    // Structured failures (spec parse, propose assembly, git/gh driver) route
+    // through die() for a clean one-liner.
+    try {
+      await runPropose(parseFor(rest, PROPOSE_SCHEMA));
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
+    break;
+  case "plugins": {
+    // Item 60 — the marketplace plugins CLI. `install`/`uninstall`/`publish`
+    // take a positional after the action; the schema parses the tail.
+    const action = rest[0] ?? "";
+    await runPlugins(parseFor(rest.slice(1), PLUGINS_SCHEMA), action);
+    break;
+  }
+  case "templates": {
+    // Item 60 — the marketplace templates CLI.
+    const action = rest[0] ?? "";
+    await runTemplates(parseFor(rest.slice(1), TEMPLATES_SCHEMA), action);
     break;
   }
   case "migrate-all":

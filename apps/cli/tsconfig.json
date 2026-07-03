@@ -69,6 +69,13 @@
     { "path": "../../packages/federation-discovery" },
     { "path": "../../packages/sandbox" },
     { "path": "../../packages/sandbox-image-registry" },
-    { "path": "../../packages/compliance-controls" }
+    { "path": "../../packages/compliance-controls" },
+    { "path": "../../packages/module-marketplace-client" },
+    { "path": "../../packages/template-marketplace-client" },
+    { "path": "../../packages/template-registry" },
+    { "path": "../../packages/plugin-registry" },
+    { "path": "../../packages/plugin-sdk" },
+    { "path": "../../packages/pii-redactor" },
+    { "path": "../../packages/grader-safety-classifiers" }
   ]
 }
