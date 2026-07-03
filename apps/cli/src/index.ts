@@ -548,6 +548,20 @@ import {
   runRetentionPurge,
   runRetentionSweep,
 } from "./retention";
+// Item 64 — `crewhaus retire`: audited harness decommissioning (active-pin
+// refusal, ordered non-destructive-then-archive steps, retirement log). The
+// orchestration + refusal are pure; heavy steps are an injected seam. In a
+// side-effect-free module so it is unit-testable (this entry file runs an argv
+// switch on import).
+import {
+  RetireError,
+  type RetirementSteps,
+  type StepOutcome,
+  buildRetirementPlan,
+  formatPlan,
+  formatRetirementResult,
+  runRetirement,
+} from "./retire";
 // Item 25 — model right-sizing downshift search core (pure enumeration + cost
 // projection + $/score ranking); side-effect-free so it is unit-testable.
 import {
@@ -1035,6 +1049,22 @@ const TEMPLATES_SCHEMA: ParseArgsSchema = {
     // `use`: workspace dir the template scaffolds into (default cwd) + subdir.
     { name: "into", takesValue: true },
     { name: "subdir", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
+// Item 64 — `crewhaus retire <spec>`. `--archive <dir>` where the evidence
+// bundle lands; `--dry-run` prints the plan; `--force` retires despite an
+// active pin; `--push-knowledge` shares lessons out first; `--shared` picks
+// the shared store for that push.
+const RETIRE_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "archive", takesValue: true },
+    { name: "dry-run", takesValue: false },
+    { name: "force", takesValue: false },
+    { name: "push-knowledge", takesValue: false },
+    { name: "shared", takesValue: true },
+    { name: "root-dir", takesValue: true },
     { name: "help", short: "h" },
   ],
 };
@@ -1583,6 +1613,7 @@ function usageText(): string {
     "  secrets rotate <name> [--value V]    rotate a named secret (file backend)",
     "  fleet list|status|run <sub> ...      cross-harness inventory/health + bulk read-ops (item 58)",
     "  knowledge sync [--pull|--push]       cross-harness shared memories/graders/prompts (item 63)",
+    "  retire <spec> [--dry-run] [--force]  audited harness decommissioning (item 64)",
     "  plugins list|search|install|...      marketplace plugins CLI + publish/outdated (item 60)",
     "  templates list|search|use ...        marketplace templates CLI (item 60)",
     "  spec put|list|get|pin|alias|log ...  versioned spec storage + changelog (Section 28 spec-registry)",
@@ -9374,6 +9405,252 @@ async function buildKnowledgeRedactor(): Promise<Redactor> {
   };
 }
 
+/**
+ * Item 64 — `crewhaus retire <spec>`. A clean, evidenced decommission:
+ * refuse an active pin (unless --force), export durable state, record a final
+ * compliance-evidence bundle + audit verify, optionally push knowledge out,
+ * tombstone the registry entry, then archive + remove — every step logged into
+ * the archive. The orchestration + refusal live in `./retire`; this handler
+ * reads the registry pins and wires the real heavy steps.
+ */
+async function runRetire(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus retire <spec> [--archive <dir>] [--dry-run] [--force]\n" +
+        "         [--push-knowledge] [--shared <dir>] [--root-dir <dir>]\n" +
+        "\n" +
+        "  Decommission a harness with evidence. Refuses to retire a spec with an\n" +
+        "  active deployment pin unless --force. Steps (each logged into the archive):\n" +
+        "  export durable state → final compliance-evidence bundle → audit verify →\n" +
+        "  [--push-knowledge] → tombstone the registry entry (delete versions, clearing\n" +
+        "  every env pin) → archive + remove the live .crewhaus state. --dry-run prints\n" +
+        "  the plan and touches nothing. --archive defaults to ./retired-<spec>-<date>.\n",
+    );
+    return;
+  }
+  const specArg = args.positional[0];
+  if (typeof specArg !== "string") die("missing <spec>");
+  const harnessDir = process.cwd();
+
+  // The spec name: the registry name of the cwd spec (best-effort parse), or
+  // the argument taken verbatim when it names a registered spec directly.
+  let specName = specArg;
+  const specPath = resolve(specArg);
+  if (existsSync(specPath)) {
+    try {
+      specName = parseSpec(readFileSync(specPath, "utf-8")).name;
+    } catch {
+      // keep the argument as the name
+    }
+  }
+
+  const rootDirFlag = args.flags["root-dir"];
+  const registryRoot =
+    typeof rootDirFlag === "string" ? rootDirFlag : join(harnessDir, ".crewhaus", "specs");
+  const { createFileBackedRegistry } = await import("@crewhaus/spec-registry");
+  const { registrySpecName } = await import("./spec-changelog");
+  const registryName = registrySpecName(specName);
+  const registry = createFileBackedRegistry({ rootDir: registryRoot });
+
+  let pins: Record<string, string> = {};
+  let registeredVersions: ReadonlyArray<string> = [];
+  try {
+    const manifest = await registry.manifest(registryName);
+    pins = { ...manifest.pins };
+    registeredVersions = manifest.versions;
+  } catch {
+    // unregistered — no pins, nothing to tombstone
+  }
+
+  const dryRun = args.flags["dry-run"] === true;
+  const force = args.flags["force"] === true;
+  const pushKnowledge = args.flags["push-knowledge"] === true;
+  const archiveFlag = args.flags["archive"];
+  const archiveDir = resolve(
+    typeof archiveFlag === "string"
+      ? archiveFlag
+      : join(harnessDir, `retired-${registryName}-${new Date().toISOString().slice(0, 10)}`),
+  );
+
+  let plan: ReturnType<typeof buildRetirementPlan>;
+  try {
+    plan = buildRetirementPlan({
+      specName: registryName,
+      harnessDir,
+      archiveDir,
+      pins,
+      force,
+      pushKnowledge,
+    });
+  } catch (err) {
+    if (err instanceof RetireError) die(err.message);
+    throw err;
+  }
+
+  if (dryRun) {
+    for (const line of formatPlan(plan)) process.stdout.write(`${line}\n`);
+    return;
+  }
+
+  // Wire the real heavy steps.
+  const steps: RetirementSteps = {
+    async backupState(archiveDirIn): Promise<StepOutcome & { tarball?: string }> {
+      const stateDir = join(harnessDir, ".crewhaus");
+      if (!existsSync(stateDir)) {
+        return { step: "backupState", ok: true, detail: "no .crewhaus state to back up" };
+      }
+      const outFile = join(archiveDirIn, `${registryName}-state.tar.gz`);
+      try {
+        const result = await createStateBackup({
+          stateDir,
+          outFile,
+          crewhausVersion: cliVersion() ?? "unknown",
+        });
+        return {
+          step: "backupState",
+          ok: true,
+          detail: `${result.manifest.totals.files} file(s) → ${outFile}`,
+          tarball: outFile,
+        };
+      } catch (err) {
+        return { step: "backupState", ok: false, detail: (err as Error).message };
+      }
+    },
+    async complianceEvidence(archiveDirIn): Promise<StepOutcome> {
+      const auditDir = join(harnessDir, ".crewhaus", "audit");
+      if (!existsSync(auditDir)) {
+        return {
+          step: "complianceEvidence",
+          ok: true,
+          detail: "no audit store — no evidence to collect",
+        };
+      }
+      try {
+        const { createComplianceCollector } = await import("@crewhaus/compliance-controls");
+        const auditLog = await import("@crewhaus/audit-log");
+        const outDir = join(archiveDirIn, "compliance");
+        const auditSource = {
+          async *read() {
+            const log = await auditLog.openAuditLog({ rootDir: auditDir });
+            for await (const r of log.read()) yield r;
+          },
+        };
+        const collector = createComplianceCollector({ auditSource, outputDir: outDir });
+        const period = resolvePeriodFlag("current");
+        const frameworks = [...new Set(collector.listControls().map((c) => c.frameworkId))];
+        let written = 0;
+        for (const fw of frameworks) {
+          for (const b of await collector.collectAll(fw, { period })) {
+            collector.writeBundle(b);
+            written += 1;
+          }
+        }
+        return { step: "complianceEvidence", ok: true, detail: `${written} bundle(s) → ${outDir}` };
+      } catch (err) {
+        return { step: "complianceEvidence", ok: false, detail: (err as Error).message };
+      }
+    },
+    async auditVerify(): Promise<StepOutcome> {
+      const auditDir = join(harnessDir, ".crewhaus", "audit");
+      if (!existsSync(auditDir)) {
+        return { step: "auditVerify", ok: true, detail: "no audit store to verify" };
+      }
+      try {
+        const { verify } = await import("@crewhaus/audit-log");
+        const result = await verify(auditDir);
+        const summary = summarizeVerifyResult(result, { anchorRequested: false });
+        return {
+          step: "auditVerify",
+          ok: result.ok,
+          detail: result.ok
+            ? `chain intact (${result.recordsChecked} record(s))`
+            : (summary.lines[0] ?? "tamper finding"),
+        };
+      } catch (err) {
+        return { step: "auditVerify", ok: false, detail: (err as Error).message };
+      }
+    },
+    async pushKnowledge(archiveDirIn): Promise<StepOutcome> {
+      // Push this harness's knowledge to the shared store (#63), gated by the
+      // opt-in marker like a normal sync.
+      if (!harnessOptedIn(harnessDir)) {
+        return {
+          step: "pushKnowledge",
+          ok: true,
+          detail: "harness not opted into knowledge sharing — skipped",
+        };
+      }
+      try {
+        const sharedFlag = args.flags["shared"];
+        const sharedDir = resolve(
+          typeof sharedFlag === "string"
+            ? sharedFlag
+            : (process.env["CREWHAUS_SHARED_DIR"] ?? join(harnessDir, "..", SHARED_DIR_DEFAULT)),
+        );
+        const redact = await buildKnowledgeRedactor();
+        const graders = readHarnessGraders(harnessDir);
+        const plan2 = await planPush({
+          harness: registryName,
+          memories: readHarnessMemories(harnessDir),
+          ...(graders !== undefined ? { graders } : {}),
+          prompts: readHarnessPrompts(harnessDir),
+          existingMemoryHashes: new Set(readSharedMemories(sharedDir).map((m) => m.contentHash)),
+          existingFragmentHashes: new Set([
+            ...readSharedFragments(sharedDir, "grader").map((f) => f.contentHash),
+            ...readSharedFragments(sharedDir, "prompt").map((f) => f.contentHash),
+          ]),
+          redact,
+          now: () => new Date(),
+        });
+        applyPush(sharedDir, plan2, () => new Date());
+        // Also drop a copy of the push plan into the archive for the record.
+        mkdirSync(archiveDirIn, { recursive: true });
+        writeFileSync(
+          join(archiveDirIn, "knowledge-pushed.json"),
+          `${JSON.stringify({ memories: plan2.memories.length, fragments: plan2.fragments.length, droppedSecrets: plan2.droppedSecrets }, null, 2)}\n`,
+        );
+        return {
+          step: "pushKnowledge",
+          ok: true,
+          detail: `pushed ${plan2.memories.length} memory(ies), ${plan2.fragments.length} fragment(s) → ${sharedDir}`,
+        };
+      } catch (err) {
+        return { step: "pushKnowledge", ok: false, detail: (err as Error).message };
+      }
+    },
+    async tombstoneRegistry(): Promise<StepOutcome> {
+      if (registeredVersions.length === 0) {
+        return {
+          step: "tombstoneRegistry",
+          ok: true,
+          detail: "unregistered — nothing to tombstone",
+        };
+      }
+      try {
+        // Delete every registered version — spec-registry's delete() clears any
+        // pin pointing at a deleted version, so this unpins every env too.
+        for (const v of registeredVersions) await registry.delete(registryName, v);
+        return {
+          step: "tombstoneRegistry",
+          ok: true,
+          detail: `deleted ${registeredVersions.length} version(s); ${Object.keys(pins).length} pin(s) cleared`,
+        };
+      } catch (err) {
+        return { step: "tombstoneRegistry", ok: false, detail: (err as Error).message };
+      }
+    },
+  };
+
+  let result: Awaited<ReturnType<typeof runRetirement>>;
+  try {
+    result = await runRetirement({ plan, steps, dryRun: false });
+  } catch (err) {
+    if (err instanceof RetireError) die(err.message);
+    throw err;
+  }
+  for (const line of formatRetirementResult(result)) process.stdout.write(`${line}\n`);
+}
+
 /** A one-off y/N prompt on stdin. Empty / anything not starting with y → no. */
 async function promptYesNo(question: string): Promise<boolean> {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
@@ -11385,6 +11662,16 @@ switch (subcommand) {
     await runKnowledge(parseFor(rest.slice(1), KNOWLEDGE_SCHEMA), action || "sync");
     break;
   }
+  case "retire":
+    // Item 64 — audited harness decommissioning. Structured failures (spec
+    // parse, active-pin refusal, a failed step) route through die().
+    try {
+      await runRetire(parseFor(rest, RETIRE_SCHEMA));
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
+    break;
   case "model-scan":
     try {
       await runModelScan(parseFor(rest, MODEL_SCAN_SCHEMA));
