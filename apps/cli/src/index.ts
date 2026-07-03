@@ -469,6 +469,19 @@ import {
   isScriptedShape,
   runInterview,
 } from "./init-interactive";
+// Item 67 — `crewhaus intents`: cluster user_message inputs across sessions +
+// rank by frequency / satisfaction / failure. Side-effect-free (this entry file
+// reads sessions + feedback and redacts the rendered examples).
+import {
+  IntentsError,
+  type TurnSignal,
+  clusterIntents,
+  orderedTurnsFromSessions,
+  redactDigest,
+  renderIntentsHtml,
+  renderIntentsJson,
+  renderIntentsText,
+} from "./intents";
 // Item 8 — `crewhaus judge calibrate`: pair human ratings with llm_judge
 // scores and compute agreement/bias/ROC-cut, in a side-effect-free module so
 // the statistics are unit-testable (this entry file runs an argv switch on
@@ -1679,6 +1692,19 @@ const ONCHAIN_SCHEMA: ParseArgsSchema = {
     // sentinel — anomaly threshold: flag spend > N× the per-contract max (default 2).
     { name: "max-multiple", takesValue: true },
     { name: "json", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
+// AUTOMATION-OPPORTUNITIES.md item 67 — `crewhaus intents`.
+const INTENTS_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // how many of the cwd spec's most-recent sessions to scan (default 100; `all`).
+    { name: "sessions", takesValue: true },
+    { name: "format", takesValue: true },
+    { name: "out", short: "o", takesValue: true },
+    // how many entries to surface per view (default 5).
+    { name: "top", takesValue: true },
     { name: "help", short: "h" },
   ],
 };
@@ -13377,6 +13403,111 @@ async function runJustification(
  * `$NAME`, inline literals as `[redacted]`) and performs nothing.
  */
 /**
+ * Item 67 — `crewhaus intents [--sessions N|all] [--format text|html|json]`.
+ * Cluster user_message inputs across the cwd spec's recent sessions and rank
+ * them by frequency / satisfaction / failure, surfacing top / rising /
+ * low-satisfaction / unmet intents. Rendered examples are PII/secret-redacted.
+ */
+async function runIntents(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"] === true) {
+    process.stdout.write(
+      "usage: crewhaus intents [--sessions N|all] [--format text|html|json] [-o <file>] [--top N]\n" +
+        "  Cluster user questions across .crewhaus/sessions (this harness) and rank\n" +
+        "  by frequency, satisfaction (ratings), and failure (errors/loops/retries).\n" +
+        "  Surfaces top / rising / low-satisfaction / unmet intents. Rendered\n" +
+        "  examples are PII/secret-redacted. Feeds `dataset mine` / `faq distill`.\n",
+    );
+    return;
+  }
+  const format = strFlag(args, "format") ?? "text";
+  if (format !== "text" && format !== "html" && format !== "json") {
+    die(`--format must be "text", "html", or "json" (got "${format}")`);
+  }
+  const sessionsFlag = strFlag(args, "sessions");
+  const limit =
+    sessionsFlag === "all"
+      ? Number.POSITIVE_INFINITY
+      : sessionsFlag !== undefined
+        ? (intFlag(args, "sessions") ?? 100)
+        : 100;
+
+  const sessionsDir = join(process.cwd(), SESSIONS_SUBDIR);
+  const recent = sessionIdsByRecency(sessionsDir);
+  if (recent.length === 0) {
+    die(
+      `no sessions found under ${sessionsDir} — run the harness (crewhaus run) to accumulate user questions first`,
+    );
+  }
+  const ids = recent.slice(0, Number.isFinite(limit) ? (limit as number) : recent.length);
+  // Scan chronologically (oldest→newest) so the `order` ordinal + rising split
+  // reflect real recency.
+  const chronological = [...ids].reverse();
+  const perSession = chronological.map((id) => ({ sessionId: id, events: readSessionEvents(id) }));
+
+  const turns = orderedTurnsFromSessions(perSession, deriveTurns);
+  if (turns.length === 0) {
+    die("scanned sessions have no user turns to analyze");
+  }
+
+  // Feedback (event-log + web-UI sink) across the scanned sessions.
+  const feedback: FeedbackRecord[] = [];
+  for (const { events } of perSession) feedback.push(...extractFeedbackRecords(events));
+  feedback.push(...readFeedbackDir(join(process.cwd(), FEEDBACK_SUBDIR)));
+
+  // Struggle signals per turn — the same negative signals `dataset mine`
+  // recognizes (error / tool-error / loop / retry) mark UNMET intents.
+  const failedTurnKeys: TurnSignal[] = [];
+  for (const { sessionId, events } of perSession) {
+    for (const c of mineSession(sessionId, events)) {
+      failedTurnKeys.push({ sessionId: c.sessionId, turnNumber: c.turnNumber });
+    }
+  }
+
+  const topN = intFlag(args, "top");
+  const digest = clusterIntents(turns, feedback, failedTurnKeys, {
+    ...(topN !== undefined ? { topN } : {}),
+  });
+
+  // Redact every rendered example (representative + examples). Build the same
+  // detector set `faq`/`dataset synthesize` use.
+  const { createPiiRedactor } = await import("@crewhaus/pii-redactor");
+  const redactor = createPiiRedactor({ regexDetectors: SYNTHESIZE_PII_DETECTORS });
+  const redactCache = new Map<string, string>();
+  const redactStrings = new Set<string>();
+  for (const list of [
+    digest.intents,
+    digest.topIntents,
+    digest.risingIntents,
+    digest.lowSatisfactionIntents,
+    digest.unmetIntents,
+  ]) {
+    for (const i of list) {
+      redactStrings.add(i.representative);
+      for (const e of i.examples) redactStrings.add(e);
+    }
+  }
+  for (const s of redactStrings) redactCache.set(s, (await redactor.redact(s)).text);
+  const redacted = redactDigest(digest, (s) => redactCache.get(s) ?? s);
+
+  const rendered =
+    format === "json"
+      ? renderIntentsJson(redacted)
+      : format === "html"
+        ? renderIntentsHtml(redacted)
+        : renderIntentsText(redacted);
+
+  const outPath = strFlag(args, "out");
+  if (outPath !== undefined) {
+    const abs = resolve(outPath);
+    mkdirSync(dirname(abs), { recursive: true });
+    writeFileSync(abs, rendered);
+    process.stdout.write(`[intents] wrote ${abs}\n`);
+  } else {
+    process.stdout.write(rendered);
+  }
+}
+
+/**
  * Item 66 — `crewhaus onchain tune|sentinel`. Reads the spec's current
  * transaction_policy from its lowered IR (for tune's baseline + whitelisting)
  * and a receipt-history JSONL, then either proposes a tuned policy (`tune`,
@@ -14239,6 +14370,15 @@ switch (subcommand) {
     }
     break;
   }
+  case "intents":
+    // Item 67 — end-user intent analytics digest.
+    try {
+      await runIntents(parseFor(rest, INTENTS_SCHEMA));
+    } catch (err) {
+      if (err instanceof CrewhausError || err instanceof IntentsError) die(err.message);
+      throw err;
+    }
+    break;
   case "version":
   case "-v":
   case "--version":
