@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 import { spawnSync } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
@@ -34,7 +34,7 @@ import {
 } from "@crewhaus/dataset-registry";
 import { CrewhausError } from "@crewhaus/errors";
 import { type Sample, loadDataset } from "@crewhaus/eval-dataset";
-import { type CompiledGrader, parseGradersConfig } from "@crewhaus/eval-grader";
+import { type CompiledGrader, type GradersConfig, parseGradersConfig } from "@crewhaus/eval-grader";
 import {
   extractCurrentPrompt as extractInstructions,
   optimizeSpec,
@@ -54,7 +54,7 @@ import {
 } from "@crewhaus/eval-report";
 import { type EvalRunSummary, runEval as runEvalLib } from "@crewhaus/eval-runner";
 import { openEventLog } from "@crewhaus/event-log";
-import { loadHooks } from "@crewhaus/hooks-engine";
+import { loadHooks, runHooks } from "@crewhaus/hooks-engine";
 import {
   ArgParseError,
   type ParseArgsSchema,
@@ -120,6 +120,10 @@ import {
   renderAdviceHtml,
   runAdviceRules,
 } from "./advise-rules";
+// Item 31 — alert-watchdog delivery sink builder (audit append + settings.json
+// alert hook + webhook), in a side-effect-free module so it is unit-testable
+// (this entry file runs an argv switch on import).
+import { alertWebhookFromSettings, buildAlertSink } from "./alert-sink";
 // Item 34 — `crewhaus audit verify` plumbing (anchor-flag parsing + per-check
 // summary + doctor mapping), in a side-effect-free module so it is
 // unit-testable (this entry file runs an argv switch on import).
@@ -173,7 +177,12 @@ import {
 // (.github/workflows/crewhaus-eval.yml — two fresh runs diffed via the
 // item-3 baseline machinery + `eval --gate`), in a side-effect-free module
 // so it is unit-testable (this entry file runs an argv switch on import).
-import { EVAL_CI_WORKFLOW_RELPATH, buildEvalCiWorkflowYaml } from "./ci-scaffold";
+import {
+  EVAL_CI_WORKFLOW_RELPATH,
+  SENTINEL_WORKFLOW_RELPATH,
+  buildEvalCiWorkflowYaml,
+  buildSentinelDriftWorkflowYaml,
+} from "./ci-scaffold";
 // Item 34 — scheduling ergonomics for `compliance evidence` (--period current
 // resolution + the empty-evidence gate), side-effect-free for the same reason.
 import { findEmptyControls, resolvePeriodFlag } from "./compliance-schedule";
@@ -218,6 +227,16 @@ import {
   registerDataset,
   resolveRegistryRef,
 } from "./datasets";
+// Item 29 — `crewhaus deploy canary` eval-gated ramp orchestration, in a
+// side-effect-free module so it is unit-testable (this entry file runs an
+// argv switch on import). The heavy I/O (per-version eval, registry pins,
+// audit) is injected here in index.ts.
+import {
+  CanaryRampError,
+  driveCanaryRamp,
+  makeCanaryEvalGate,
+  parseTrafficSteps,
+} from "./deploy-canary";
 // Model-aware doctor credential checks (provider parsed from the cwd spec's
 // agent.model via the model-router grammar), in a side-effect-free module so
 // it is unit-testable (this entry file runs an argv switch on import).
@@ -291,6 +310,10 @@ import {
   parseModelsFlag,
   runMatrixCells,
 } from "./eval-matrix";
+// Item 30 — model-drift sentinel comparison logic, in a side-effect-free
+// module so it is unit-testable (this entry file runs an argv switch on
+// import). The fresh run + baseline load happen in index.ts; this decides drift.
+import { evaluateSentinel } from "./eval-sentinel";
 // Item #55 — distill recurring user questions into an auto-discovered FAQ skill.
 import { buildFaqSkill, distillFaq } from "./faq";
 // Response-feedback core — pure, side-effect-free so it is unit-testable
@@ -367,6 +390,15 @@ import {
   parseRunsFlag,
   renderSuggestedGradersYaml,
 } from "./graders-suggest";
+// Item 32 — incident bundle assembly (trigger classification, audit-window
+// join, cost summary, eval-report-styled render), in a side-effect-free module
+// so it is unit-testable (this entry file runs an argv switch on import).
+import {
+  type IncidentKind,
+  assembleIncidentBundle,
+  matchAuditRecordsByWindow,
+  summarizeCost,
+} from "./incident";
 // Item 39 — `crewhaus init --interactive`: the harness-designer interview
 // (validate-and-retry loop + scripted no-credentials fallback) in a
 // side-effect-free module so this entry file stays testable.
@@ -719,6 +751,9 @@ const INIT_SCHEMA: ParseArgsSchema = {
     // harness can `crewhaus eval` on day one. Composable with an existing
     // harness like --ci: `init --with-evals` adds just the eval assets.
     { name: "with-evals", takesValue: false },
+    // Item 30 — also scaffold .github/workflows/sentinel-drift.yml, the nightly
+    // model-drift sentinel cron. Composable with an existing harness like --ci.
+    { name: "sentinel", takesValue: false },
     // Overwrite an existing scaffolded workflow or eval assets (never the
     // spec).
     { name: "force", takesValue: false },
@@ -975,6 +1010,12 @@ const EVAL_SCHEMA: ParseArgsSchema = {
     // Item 7 — opt out of the runner's default one-shot retry of ERRORED
     // samples (infra noise, not graded failures).
     { name: "no-retry", takesValue: false },
+    // Item 30 — nightly model-drift sentinel: re-run the (seed-pinned) dataset
+    // against the UNCHANGED spec and diff against a frozen baseline run dir;
+    // any flip/score-shift when specHash AND dataset-hash are both unchanged is
+    // provider drift → exit non-zero. --baseline points at the frozen run dir.
+    { name: "sentinel", takesValue: false },
+    { name: "baseline", takesValue: true },
     { name: "help", short: "h" },
   ],
 };
@@ -1316,6 +1357,19 @@ const DEPLOY_SCHEMA: ParseArgsSchema = {
     { name: "root-dir", takesValue: true },
     { name: "tenant", takesValue: true },
     { name: "actor", takesValue: true },
+    // Item 29 — `deploy canary <spec> <version>` eval-gated ramp flags.
+    { name: "traffic", takesValue: true },
+    { name: "dataset", takesValue: true },
+    { name: "graders", takesValue: true },
+    { name: "env", takesValue: true },
+    { name: "name", takesValue: true },
+    { name: "from", takesValue: true },
+    { name: "concurrency", takesValue: true },
+    { name: "seed", takesValue: true },
+    { name: "judge-model", takesValue: true },
+    // Gate threshold overrides (regression-runner GateThresholds).
+    { name: "max-pass-rate-drop", takesValue: true },
+    { name: "max-p95-latency-ms", takesValue: true },
     { name: "help", short: "h" },
   ],
 };
@@ -1326,6 +1380,18 @@ const MIGRATE_SCHEMA: ParseArgsSchema = {
     { name: "from", takesValue: true },
     { name: "to", takesValue: true },
     { name: "dry-run" },
+    { name: "help", short: "h" },
+  ],
+};
+
+// Item 32 — `crewhaus incident collect --session <id>`: assemble a full
+// incident bundle from a session's traces/audit/cost + doctor.
+const INCIDENT_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "session", takesValue: true },
+    { name: "kind", takesValue: true },
+    { name: "reason", takesValue: true },
+    { name: "out", short: "o", takesValue: true },
     { name: "help", short: "h" },
   ],
 };
@@ -1499,6 +1565,11 @@ function usageText(): string {
     "  secrets rotate <name> [--value V]    rotate a named secret (file backend)",
     "  spec put|list|get|pin|alias|log ...  versioned spec storage + changelog (Section 28 spec-registry)",
     "  deploy promote|rollback ...          re-pin a spec for an environment (Section 28)",
+    "  deploy canary <spec> <version> ...   eval-gated ramp with auto-rollback (item 29):",
+    "       --traffic 5,25,50,100 --dataset <d> --graders <g>  eval both versions per step,",
+    "                                       gate on regression-runner, auto-promote/rollback",
+    "  incident collect --session <id>      assemble an incident bundle from a session's",
+    "                                       traces + audit + cost + doctor (item 32)",
     "  migrate-all --from N --to N          batch-migrate every spec in the registry",
     "  upgrade [spec.yaml] [--write]        detect the cwd spec's version drift + run the migration",
     "                                       chain (validated); --dry-run diff by default (item 43)",
@@ -2166,7 +2237,7 @@ function resolveWorkflowRoot(
 function runInit(args: ParsedArgs): void {
   if (args.flags["help"]) {
     process.stdout.write(
-      "usage: crewhaus init [name] [--ci] [--with-evals] [--force]\n" +
+      "usage: crewhaus init [name] [--ci] [--with-evals] [--sentinel] [--force]\n" +
         "  --ci     Also scaffold .github/workflows/crewhaus-eval.yml — the eval-on-PR\n" +
         "           gate (item 44): PRs touching crewhaus.yaml or eval/** run the base\n" +
         "           branch's spec and the PR's spec on the PR's dataset+graders (two\n" +
@@ -2185,6 +2256,12 @@ function runInit(args: ParsedArgs): void {
         "           `crewhaus scaffold-evals` later (with credentials) for model-derived\n" +
         "           inputs and a spec-goal llm_judge rubric. With an existing\n" +
         "           crewhaus.yaml, adds just the missing eval assets.\n" +
+        "  --sentinel  Also scaffold .github/workflows/sentinel-drift.yml (item 30) — the\n" +
+        "           nightly model-drift sentinel: re-run a seed-pinned sentinel dataset\n" +
+        "           against the UNCHANGED spec and diff against a frozen baseline run; any\n" +
+        "           flip/score-shift when specHash AND dataset-hash are unchanged is\n" +
+        "           provider drift and fails the job. Freeze + commit the baseline once by\n" +
+        "           hand (init never runs a live eval); the printed note says how.\n" +
         "  --force  Overwrite an existing scaffolded workflow or eval assets (never\n" +
         "           the spec).\n",
     );
@@ -2192,6 +2269,7 @@ function runInit(args: ParsedArgs): void {
   }
   const ci = args.flags["ci"] === true;
   const withEvals = args.flags["with-evals"] === true;
+  const sentinelInit = args.flags["sentinel"] === true;
   const nameArg = args.positional[0];
   const targetDir = typeof nameArg === "string" ? resolve(nameArg) : process.cwd();
   const specName = typeof nameArg === "string" ? nameArg : basename(targetDir);
@@ -2202,7 +2280,9 @@ function runInit(args: ParsedArgs): void {
     // spec, add just the workflow (item 13's --with-evals composes the same
     // way for the eval assets). Without either flag the historical refusal
     // stands (a bare `init` must never touch existing work).
-    if (!ci && !withEvals) die(`${targetFile} already exists — refusing to overwrite`);
+    if (!ci && !withEvals && !sentinelInit) {
+      die(`${targetFile} already exists — refusing to overwrite`);
+    }
     process.stdout.write(`kept ${targetFile} (already exists)\n`);
   } else {
     mkdirSync(targetDir, { recursive: true });
@@ -2242,6 +2322,31 @@ agent:
       process.stdout.write(
         `ci: set the ANTHROPIC_API_KEY repo secret; PRs touching ${filterBase}crewhaus.yaml or\n` +
           `    ${filterBase}eval/** are then evaled against the base branch and gated on regressions.\n`,
+      );
+    } catch (err) {
+      if (err instanceof FlywheelConfigError) die(err.message);
+      throw err;
+    }
+  }
+
+  // Item 30 — `init --sentinel`: scaffold the nightly model-drift sentinel
+  // cron. Lands at the repo root (finding 7) with its working-directory
+  // pointed back at a nested harness. The frozen baseline must be produced +
+  // committed once by hand (init never runs a live eval) — the workflow
+  // comments + the printed note say how.
+  if (sentinelInit) {
+    try {
+      const { root: wfRoot, harnessDir } = resolveWorkflowRoot(targetDir, process.cwd());
+      const scaffolded = scaffoldWorkflowFile({
+        rootDir: wfRoot,
+        relPath: SENTINEL_WORKFLOW_RELPATH,
+        content: buildSentinelDriftWorkflowYaml({ harnessDir }),
+        force: args.flags["force"] === true,
+      });
+      process.stdout.write(`wrote ${scaffolded.path}\n`);
+      const filterBase = harnessDir === "" ? "" : `${harnessDir}/`;
+      process.stdout.write(
+        `sentinel: set the ANTHROPIC_API_KEY repo secret, add a seed-pinned\n    ${filterBase}eval/sentinel.jsonl, then freeze the baseline once:\n    crewhaus eval ${filterBase}crewhaus.yaml --dataset ${filterBase}eval/sentinel.jsonl \\\n      --graders ${filterBase}eval/graders.yaml --seed 1 -o ${filterBase}eval/sentinel-baseline\n    and commit ${filterBase}eval/sentinel-baseline. The nightly cron then flags provider drift.\n`,
       );
     } catch (err) {
       if (err instanceof FlywheelConfigError) die(err.message);
@@ -3181,6 +3286,43 @@ async function runRunCli(
     );
   }
 
+  // Item 31 — alert watchdog delivery. The watchdog itself is gated inside
+  // runtime-core by CREWHAUS_ALERTS; here we build its optional delivery sink
+  // (audit append + settings.json `alert` hook + `alerts.webhook` POST) so a
+  // breach lands durably + off-box. Only opened when CREWHAUS_ALERTS is set —
+  // no audit-log file / hook wiring otherwise. undefined leaves the watchdog
+  // with just its trace event + snapshot.
+  const alertsEnabled =
+    process.env["CREWHAUS_ALERTS"] === "1" || process.env["CREWHAUS_ALERTS"] === "true";
+  let alertSink: ReturnType<typeof buildAlertSink>;
+  if (alertsEnabled) {
+    const { openAuditLog } = await import("@crewhaus/audit-log");
+    const alertAudit = await openAuditLog({ rootDir: join(cwd, ".crewhaus", "audit") });
+    // Read alerts.webhook from settings.json (best-effort; a parse error here
+    // must not block the run — the permission path already surfaces bad JSON).
+    let webhookUrl: string | undefined;
+    const settingsPath = join(cwd, ".crewhaus", "settings.json");
+    if (existsSync(settingsPath)) {
+      try {
+        webhookUrl = alertWebhookFromSettings(JSON.parse(readFileSync(settingsPath, "utf-8")));
+      } catch {
+        // ignore — buildRuleSet already dies loudly on malformed settings.json.
+      }
+    }
+    const alertHooks = hooks.filter((h) => h.event === "alert");
+    alertSink = buildAlertSink({
+      audit: alertAudit,
+      ...(alertHooks.length > 0
+        ? {
+            runAlertHooks: async (event, payload, matcherKey): Promise<void> => {
+              await runHooks(event, payload, alertHooks, { matcherKey });
+            },
+          }
+        : {}),
+      ...(webhookUrl !== undefined ? { webhookUrl } : {}),
+    });
+  }
+
   // Feature #53 — first-class `memory:` block. Its presence wires Remember/
   // Recall into the tool list (no hand-editing) and — via the auto-* switches
   // — the runtime's auto-recall (system-prompt injection) and auto-capture
@@ -3344,6 +3486,10 @@ async function runRunCli(
       ...(justificationJudge !== undefined ? { justificationJudge } : {}),
       ...(justificationAuditSink !== undefined ? { justificationAuditSink } : {}),
       ...(egressMatcher !== undefined ? { egressMatcher } : {}),
+      ...(alertSink !== undefined ? { alertSink } : {}),
+      // Item 32 — stamp the spec name into any auto-assembled incident capture
+      // (gated by CREWHAUS_INCIDENTS inside runtime-core).
+      incidentSpec: { name: ir.name },
       ...(memoryRunOpt !== undefined ? { memory: memoryRunOpt } : {}),
       // Item #56 — inject the current user's preference file at run start (via
       // the project-memory auto-load path). LESSONS.md is auto-loaded already
@@ -5110,6 +5256,31 @@ function makeAsyncIterable<T>(items: ReadonlyArray<T>): AsyncIterable<T> {
 }
 
 /**
+ * F2 (ops pre-merge) — sha256 hex digest of the parsed GradersConfig, keyed
+ * on a deterministically-sorted JSON serialization so two byte-identical
+ * graders.yaml files always hash equal and key ordering never causes a false
+ * mismatch. Mirrors `hashDatasetFile`'s "content identity, not path" shape:
+ * recorded into run.json/results.json so `--sentinel` can assert the graders
+ * a baseline and a fresh run scored with are byte-identical (F2 — without
+ * this, a changed judge model or edited graders.yaml silently reads as
+ * "provider drift" because neither ever touches specHash or the dataset).
+ */
+function hashGradersConfig(config: GradersConfig): string {
+  return createHash("sha256").update(stableStringify(config)).digest("hex");
+}
+
+function stableStringify(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map((v) => stableStringify(v)).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    const keys = Object.keys(value as Record<string, unknown>).sort();
+    return `{${keys
+      .map((k) => `${JSON.stringify(k)}:${stableStringify((value as Record<string, unknown>)[k])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+/**
  * Build the model-driven Claude mutation provider for a spec — shared by
  * `optimize --mutator claude` and the flywheel's default mutator. Resolves
  * via the model-router so non-Anthropic specs drive their own provider:
@@ -5858,7 +6029,17 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
         "  unknown pricing shows n/a). Matrix cells skip the run-history index/baselines\n" +
         "  (they are comparisons, not lineage), so --gate/--no-promote are rejected. A\n" +
         "  cell that crashes (bad credentials, 404 model) records an error row and the\n" +
-        "  remaining cells still run; the command then exits non-zero.\n",
+        "  remaining cells still run; the command then exits non-zero.\n" +
+        "  --sentinel --baseline <run-dir> runs the model-drift sentinel (item 30):\n" +
+        "  re-run this dataset against the UNCHANGED spec and diff against the frozen\n" +
+        "  baseline run dir. Pin --seed for a deterministic sample order. When the spec's\n" +
+        "  specHash AND the dataset's content hash are BOTH identical to the baseline's,\n" +
+        "  any pass/fail flip or score shift can only be the provider silently changing\n" +
+        "  model behaviour — the command flags it and exits non-zero so a CI cron alerts.\n" +
+        "  A specHash or dataset-hash mismatch is reported as not-comparable (also exits\n" +
+        "  non-zero — a mis-pointed sentinel is loud, never silently green). Sentinel mode\n" +
+        "  skips the run-history index/baselines/triage and the regression union (a probe,\n" +
+        "  not lineage); --gate/--no-promote/--models are rejected with it.\n",
     );
     return;
   }
@@ -5871,6 +6052,27 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
   if (typeof gradersPath !== "string") die("missing --graders <graders.yaml>");
   const gateRequested = args.flags["gate"] === true;
   const promote = args.flags["no-promote"] !== true;
+
+  // Item 30 — model-drift sentinel. --baseline points at the frozen run dir to
+  // diff against; incompatible with lineage/matrix flags (a sentinel is a
+  // one-off provider-drift probe, not run-history or a model benchmark).
+  const sentinel = args.flags["sentinel"] === true;
+  const sentinelBaseline = args.flags["baseline"];
+  if (sentinel) {
+    if (typeof sentinelBaseline !== "string") {
+      die("--sentinel requires --baseline <run-dir> (the frozen baseline run to diff against)");
+    }
+    if (gateRequested)
+      die("--sentinel and --gate are mutually exclusive (sentinel has its own gate)");
+    if (args.flags["no-promote"] === true) {
+      die("--sentinel never promotes; drop --no-promote");
+    }
+    if (typeof args.flags["models"] === "string") {
+      die("--sentinel and --models are mutually exclusive");
+    }
+  } else if (typeof sentinelBaseline === "string") {
+    die("--baseline is only valid with --sentinel");
+  }
 
   // Item 11 — `--models` benchmark matrix. Validate the flag combo and every
   // model string (full router grammar) up front: a typo in model 3 must fail
@@ -5927,7 +6129,11 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
   } catch (err) {
     die(`could not read ${gradersPath}: ${(err as Error).message}`);
   }
-  const { compiled } = parseGradersConfig(gradersYaml);
+  const { compiled, config: gradersConfig } = parseGradersConfig(gradersYaml);
+  // F2 — sha256 of the parsed graders config, recorded into run.json/
+  // results.json so `--sentinel` can assert a fresh run graded with the same
+  // rubric/thresholds as the baseline (see hashGradersConfig doc comment).
+  const gradersHash = hashGradersConfig(gradersConfig);
 
   // Item 12 — `--dataset registry:<name>[@version][#split]` resolves via the
   // Section 29 dataset registry instead of loadDataset. datasetName becomes
@@ -5981,7 +6187,10 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
     const outcome = await applyRegressionUnionGuarded({
       registry: createFileBackedRegistry({ rootDir: defaultDatasetsRoot() }),
       specName: ir.name,
-      includeRegressions: args.flags["no-regressions"] !== true,
+      // Item 30 — a sentinel requires a byte-identical dataset to attribute a
+      // diff to the provider; unioning the regression suite would fold its
+      // hash in and defeat the dataset-hash equality check. Force it off.
+      includeRegressions: !sentinel && args.flags["no-regressions"] !== true,
       ...(registryRef !== undefined ? { primaryRegistryName: registryRef.name } : {}),
       primary: dataset,
       datasetHash,
@@ -6037,6 +6246,7 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
     opts: {
       ...(typeof outDirArg === "string" ? { outDir: resolve(outDirArg) } : {}),
       datasetHash,
+      gradersHash,
       retryErrors,
       ...(concurrency !== undefined ? { concurrency } : {}),
       ...(seed !== undefined ? { seed } : {}),
@@ -6046,6 +6256,49 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
   // With -o omitted the runner picks .crewhaus/evals/<runId> relative to the
   // cwd — resolve to an absolute path for the report + history index.
   const absOut = resolve(summary.outDir);
+
+  // Item 30 — sentinel drift probe. Skip triage + run-history entirely (a
+  // sentinel is a one-off provider-drift check, not lineage): render the
+  // report, then diff the fresh run against the frozen baseline and attribute
+  // any flip/score-shift to the provider ONLY when specHash, dataset-hash,
+  // judgeModel, AND gradersHash are all unchanged (F2). Exit non-zero on
+  // drift OR not-comparable.
+  if (sentinel) {
+    const loadedSentinel = await loadRun(absOut);
+    writeFileSync(join(absOut, "index.html"), renderReport(loadedSentinel, {}).html);
+    let baselineRun: Awaited<ReturnType<typeof loadRun>>;
+    try {
+      baselineRun = await loadRun(resolve(sentinelBaseline as string));
+    } catch (err) {
+      die(
+        `--sentinel: could not load baseline run at ${sentinelBaseline}: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+    const baselineDatasetHash = baselineRun.summary.config.datasetHash;
+    if (baselineDatasetHash === undefined) {
+      die(
+        `--sentinel: baseline run ${baselineRun.summary.runId} has no recorded datasetHash — re-pin the baseline from a run produced by a datasetHash-recording CLI (any current version)`,
+      );
+    }
+    const result = evaluateSentinel({
+      baseline: baselineRun,
+      current: loadedSentinel,
+      baselineDatasetHash,
+      currentDatasetHash: datasetHash,
+    });
+    process.stdout.write(
+      `[eval] runId=${summary.runId} pass_rate=${(summary.aggregates.passRate * 100).toFixed(1)}% ` +
+        `mean_score=${summary.aggregates.meanScore.toFixed(3)}\n`,
+    );
+    process.stdout.write(`[eval] report: ${join(absOut, "index.html")}\n`);
+    process.stdout.write(`[sentinel] ${result.verdict}: ${result.reason}\n`);
+    if (result.alert) {
+      die(`sentinel drift detected — ${result.reason}`);
+    }
+    return;
+  }
 
   // Item 7 — failure-arbiter triage: classify every failing sample into
   // bug / spec-gap / noise / contract-ambiguity, persist verdicts.json next
@@ -9558,8 +9811,36 @@ async function runDeploy(args: ParsedArgs, action: string): Promise<void> {
     process.stdout.write(
       "usage:\n" +
         "  crewhaus deploy promote <name> <fromEnv> <toEnv>  copy env pin\n" +
-        "  crewhaus deploy rollback <name> <env> <version>   re-pin env to version\n",
+        "  crewhaus deploy rollback <name> <env> <version>   re-pin env to version\n" +
+        "  crewhaus deploy canary <spec.yaml> <version>      eval-gated ramp (item 29)\n" +
+        "    --traffic 5,25,50,100    strictly-increasing ramp steps (default 5,25,50,100)\n" +
+        "    --dataset <data>         eval dataset: a file path or registry:<name>[@ver][#split]\n" +
+        "    --graders <graders.yaml> grader config\n" +
+        "    --from <version>         baseline version (default: the env's current pin)\n" +
+        "    --env <env>              env pin to promote/rollback (default: prod)\n" +
+        "    --name <name>            registry spec name (default: the spec's own name)\n" +
+        "    --concurrency N --seed N --judge-model <m>   eval knobs (as `crewhaus eval`)\n" +
+        "    --max-pass-rate-drop <f> gate: max pass-rate drop before fail (default 0.05)\n" +
+        "    --max-p95-latency-ms <n> gate: max p95 latency rise ms before fail (default 5000)\n" +
+        "\n" +
+        "  `deploy canary` registers the candidate spec version, then drives the ramp\n" +
+        "  steps: at each step it evals BOTH the baseline and candidate versions against\n" +
+        "  the dataset+graders and feeds the two results into the real regression-runner\n" +
+        "  gate (pass-rate + p95-latency). On pass at every step the env pin auto-promotes\n" +
+        "  to the candidate; on the first failing step it auto-rolls-back to the baseline\n" +
+        "  and stops. Every promote/rollback is audit-logged (deployment_action).\n" +
+        "\n" +
+        "  TRAFFIC-SPLIT CAVEAT (v1): `crewhaus eval` runs target: cli, and the canary\n" +
+        "  controller's route() has no serving-path consumer, so the ramp % gates eval\n" +
+        "  SAMPLING/PROMOTION, not a live production traffic split. Each step evals the\n" +
+        "  FULL dataset against both versions; the percentages sequence the confidence\n" +
+        "  ramp. A real request-level split matters only for gateway/managed shapes with\n" +
+        "  a serving-path route() consumer — out of scope for target: cli here.\n",
     );
+    return;
+  }
+  if (action === "canary") {
+    await runDeployCanary(args);
     return;
   }
   const rootDirFlag = args.flags["root-dir"];
@@ -9608,7 +9889,236 @@ async function runDeploy(args: ParsedArgs, action: string): Promise<void> {
     );
     return;
   }
-  die(`unknown deploy action "${action}" (expected: promote | rollback)`);
+  die(`unknown deploy action "${action}" (expected: promote | rollback | canary)`);
+}
+
+/**
+ * Item 29 — `crewhaus deploy canary <spec.yaml> <version> ...`. Registers the
+ * candidate spec version, then drives the declared traffic ramp: at each step
+ * it evals BOTH the baseline and candidate versions against the same
+ * dataset+graders and feeds the two `EvalRunSummary` results into the real
+ * `regression-runner.gate()` (via canary-controller's injected
+ * `RegressionGate`), auto-promoting the env pin on pass and auto-rolling-back
+ * on the first fail — all audit-logged. The eval/registry/audit I/O is wired
+ * here; the ramp logic + gate live in the side-effect-free `deploy-canary.ts`.
+ *
+ * See the TRAFFIC-SPLIT CAVEAT in `--help`: for target: cli the ramp % gates
+ * eval sampling/promotion, not a live request-level split.
+ */
+async function runDeployCanary(args: ParsedArgs): Promise<void> {
+  const specPath = args.positional[0];
+  const candidateVersion = args.positional[1];
+  if (typeof specPath !== "string") die("missing <spec.yaml>");
+  if (typeof candidateVersion !== "string") die("missing <version>");
+  const datasetPath = args.flags["dataset"];
+  const gradersPath = args.flags["graders"];
+  if (typeof datasetPath !== "string") die("missing --dataset <data>");
+  if (typeof gradersPath !== "string") die("missing --graders <graders.yaml>");
+
+  // Ramp steps (default 5,25,50,100).
+  let steps: number[];
+  try {
+    steps = parseTrafficSteps(
+      typeof args.flags["traffic"] === "string" ? args.flags["traffic"] : "5,25,50,100",
+    );
+  } catch (err) {
+    if (err instanceof CanaryRampError) die(err.message);
+    throw err;
+  }
+
+  // Eval knobs, mirroring `crewhaus eval`.
+  const concurrencyFlag = args.flags["concurrency"];
+  const seedFlag = args.flags["seed"];
+  const judgeModelFlag = args.flags["judge-model"];
+  const concurrency =
+    typeof concurrencyFlag === "string" ? Number.parseInt(concurrencyFlag, 10) : undefined;
+  const seed = typeof seedFlag === "string" ? Number.parseInt(seedFlag, 10) : undefined;
+  if (concurrency !== undefined && (Number.isNaN(concurrency) || concurrency < 1)) {
+    die(`invalid --concurrency "${concurrencyFlag}" — must be positive integer`);
+  }
+  if (seed !== undefined && Number.isNaN(seed)) {
+    die(`invalid --seed "${seedFlag}" — must be integer`);
+  }
+
+  // Gate threshold overrides (regression-runner GateThresholds).
+  const gateThresholds: { regressionThreshold?: number; latencyThreshold?: number } = {};
+  const dropFlag = args.flags["max-pass-rate-drop"];
+  const latFlag = args.flags["max-p95-latency-ms"];
+  if (typeof dropFlag === "string") {
+    const v = Number(dropFlag);
+    if (!Number.isFinite(v) || v < 0) die(`invalid --max-pass-rate-drop "${dropFlag}"`);
+    gateThresholds.regressionThreshold = v;
+  }
+  if (typeof latFlag === "string") {
+    const v = Number(latFlag);
+    if (!Number.isFinite(v) || v < 0) die(`invalid --max-p95-latency-ms "${latFlag}"`);
+    gateThresholds.latencyThreshold = v;
+  }
+
+  // Read + validate the candidate spec (must be target: cli for eval).
+  const absSpec = resolve(specPath);
+  let candidateYaml: string;
+  try {
+    candidateYaml = readFileSync(absSpec, "utf-8");
+  } catch (err) {
+    die(`could not read ${absSpec}: ${(err as Error).message}`);
+  }
+  let candidateIr: ReturnType<typeof lower>;
+  try {
+    candidateIr = lower(parseSpec(candidateYaml));
+  } catch (err) {
+    if (err instanceof SpecParseError) die(err.message);
+    throw err;
+  }
+  if (candidateIr.target !== "cli") {
+    die(`crewhaus deploy canary only supports target: cli (got "${candidateIr.target}")`);
+  }
+
+  const specName = typeof args.flags["name"] === "string" ? args.flags["name"] : candidateIr.name;
+  const env = typeof args.flags["env"] === "string" ? args.flags["env"] : "prod";
+
+  const rootDirFlag = args.flags["root-dir"];
+  const specRootDir =
+    typeof rootDirFlag === "string" ? rootDirFlag : join(process.cwd(), ".crewhaus", "specs");
+  const auditDir = join(process.cwd(), ".crewhaus", "audit");
+  const { createFileBackedRegistry: createSpecRegistry } = await import("@crewhaus/spec-registry");
+  const { openAuditLog } = await import("@crewhaus/audit-log");
+  const { createDeploymentController } = await import("@crewhaus/deployment-controller");
+  const { createCanaryController, makeRegressionGate } = await import(
+    "@crewhaus/canary-controller"
+  );
+  const specReg = createSpecRegistry({ rootDir: specRootDir });
+
+  // Register the candidate version (idempotent overwrite of the same bytes).
+  await specReg.put(specName, candidateVersion, candidateYaml);
+
+  // Resolve the baseline version: --from, or the env's current pin.
+  const tenantFlag = args.flags["tenant"];
+  const tenantId = typeof tenantFlag === "string" ? tenantFlag : undefined;
+  const fromFlag = args.flags["from"];
+  let baselineVersion: string | undefined;
+  if (typeof fromFlag === "string") {
+    baselineVersion = fromFlag;
+  } else {
+    baselineVersion =
+      tenantId !== undefined
+        ? await specReg.aliasForTenant(tenantId, specName, env)
+        : await specReg.aliasFor(specName, env);
+  }
+  if (baselineVersion === undefined) {
+    die(
+      `no baseline version for ${specName} ${env} — pin one first (crewhaus deploy promote / spec pin) or pass --from <version>`,
+    );
+  }
+  if (baselineVersion === candidateVersion) {
+    die(`baseline and candidate are the same version (${candidateVersion}) — nothing to canary`);
+  }
+
+  // Resolve dataset + graders ONCE, shared across every eval.
+  const gradersYaml = readFileSync(resolve(gradersPath), "utf-8");
+  const { compiled } = parseGradersConfig(gradersYaml);
+  let sharedSamples: Sample[];
+  let datasetName: string;
+  let datasetHash: string;
+  let registryRef: ReturnType<typeof parseRegistryRef>;
+  try {
+    registryRef = parseRegistryRef(datasetPath);
+  } catch (err) {
+    if (err instanceof DatasetRefError) die(err.message);
+    throw err;
+  }
+  if (registryRef !== undefined) {
+    const dsReg = createFileBackedRegistry({ rootDir: defaultDatasetsRoot() });
+    const resolved = await resolveRegistryRef(dsReg, registryRef);
+    if (resolved.samples.length === 0)
+      die(`dataset "${resolved.datasetName}" yielded zero samples`);
+    sharedSamples = resolved.samples;
+    datasetName = resolved.datasetName;
+    datasetHash = resolved.datasetHash;
+  } else {
+    const absDataset = resolve(datasetPath);
+    const loaded = await loadDataset(absDataset);
+    sharedSamples = await collectSamples(loaded.samples);
+    if (sharedSamples.length === 0) die(`dataset "${loaded.name}" yielded zero samples`);
+    datasetName = loaded.name;
+    datasetHash = hashDatasetFile(absDataset);
+  }
+
+  // Per-version eval closure: read the stored spec version, lower it, and run
+  // a full eval against the shared samples + graders. Reused for both the
+  // baseline and candidate at every ramp step.
+  const evalVersion = async (version: string): Promise<EvalRunSummary> => {
+    const yaml = await specReg.get(specName, version);
+    const ir = lower(parseSpec(yaml));
+    if (ir.target !== "cli") {
+      throw new CrewhausError(
+        "config",
+        `stored version ${specName}@${version} is target: ${ir.target}, not cli`,
+      );
+    }
+    return runEvalLib({
+      ir,
+      dataset: { name: datasetName, samples: makeAsyncIterable(sharedSamples) },
+      compiledGraders: compiled,
+      opts: {
+        datasetHash,
+        ...(concurrency !== undefined ? { concurrency } : {}),
+        ...(seed !== undefined ? { seed } : {}),
+        ...(typeof judgeModelFlag === "string" ? { judgeModel: judgeModelFlag } : {}),
+      },
+    });
+  };
+
+  const audit = await openAuditLog({ rootDir: auditDir });
+  const deploymentController = createDeploymentController({
+    registry: specReg,
+    auditLog: audit,
+    ...(tenantId !== undefined ? { tenantId } : {}),
+  });
+  const canary = createCanaryController({
+    registry: specReg,
+    deploymentController,
+    auditLog: audit,
+  });
+
+  const write = (line: string): void => {
+    process.stdout.write(`${line}\n`);
+  };
+  write(
+    `[canary] ${specName}: baseline ${baselineVersion} → candidate ${candidateVersion} (env ${env})`,
+  );
+  write(
+    `[canary] ramp ${steps.join(",")}% · dataset ${datasetName} (${sharedSamples.length} samples)`,
+  );
+
+  const gate = makeRegressionGate(
+    makeCanaryEvalGate({ evalVersion, thresholds: gateThresholds, write }),
+  );
+
+  const result = await driveCanaryRamp({
+    steps,
+    write,
+    evaluateStep: (trafficPercent) =>
+      canary.evaluate(
+        {
+          name: specName,
+          fromVersion: baselineVersion as string,
+          toVersion: candidateVersion,
+          trafficPercent,
+          env,
+          ...(tenantId !== undefined ? { tenantId } : {}),
+        },
+        { intervalMs: 0, gate },
+      ),
+  });
+
+  if (result.promoted) {
+    write(`[canary] PROMOTED ${specName} ${env} → ${candidateVersion}`);
+    return;
+  }
+  die(
+    `deploy canary: ${specName} regressed at ${result.failedAt}% — rolled back to ${baselineVersion} (env ${env})`,
+  );
 }
 
 /**
@@ -9657,6 +10167,145 @@ async function runMigrateAll(args: ParsedArgs): Promise<void> {
     `[migrate-all] migrated=${result.migrated} skipped=${result.skipped} failed=${result.failed}${dryNote}\n`,
   );
   if (result.failed > 0) process.exit(1);
+}
+
+/**
+ * Item 32 — `crewhaus incident collect --session <id>`. Retroactively (or
+ * on-demand) assembles a full incident bundle from a session's traces: reads
+ * the session event-log as both the ring-event proxy and the transcript,
+ * summarizes cost_accrual spend, matches audit records to the session's time
+ * window (the timestamp linkage — audit records carry no sessionId), captures
+ * a doctor inventory, and writes `.crewhaus/incidents/<ts>-<kind>/` with an
+ * eval-report-styled index.html. When the runtime already auto-captured a raw
+ * `incident.json`+`events.jsonl` for this session (CREWHAUS_INCIDENTS), those
+ * ring events are folded in and the kind/reason default from it.
+ */
+async function runIncidentCollect(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus incident collect --session <id> [--kind <kind>] [--reason <text>] [-o <dir>]\n" +
+        "  Assemble an incident bundle from a session's traces + audit + cost + doctor.\n" +
+        "  --kind defaults to run_abort (or the runtime's auto-captured kind, if any);\n" +
+        "  kinds: run_abort | circuit_open | egress_blocked | justification_deny_storm | budget_exceeded.\n" +
+        "  The bundle lands at .crewhaus/incidents/<ts>-<kind>/ (override root with -o).\n" +
+        "  Audit records are matched to the session by TIME WINDOW (records carry no\n" +
+        "  sessionId); the window is [first event, last event] of the session log.\n",
+    );
+    return;
+  }
+  const session = args.flags["session"];
+  if (typeof session !== "string") die("missing --session <id>");
+
+  const cwd = process.cwd();
+  const { openEventLog } = await import("@crewhaus/event-log");
+  const { openAuditLog } = await import("@crewhaus/audit-log");
+
+  // Read the full session transcript (also the ring-event proxy for a
+  // retroactive collect — the live ring buffer is gone, the durable log is
+  // the best available record).
+  let transcript: Array<{ ts: number; kind: string; payload: unknown }>;
+  try {
+    const log = await openEventLog(session, { rootDir: join(cwd, SESSIONS_SUBDIR) });
+    transcript = [];
+    for await (const ev of log.read()) transcript.push(ev);
+    await log.close();
+  } catch (err) {
+    die(`could not read session ${session}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (transcript.length === 0) {
+    die(`session ${session} has no events at ${join(cwd, SESSIONS_SUBDIR)}`);
+  }
+  const startTs = transcript[0]?.ts ?? Date.now();
+  const endTs = transcript.at(-1)?.ts ?? startTs;
+
+  // Ring events: the session log's own events are the durable proxy. cost is
+  // summarized from the log's cost_accrual entries.
+  const ringEvents = transcript;
+  const cost = summarizeCost(ringEvents);
+
+  // Audit records within the session window (the timestamp linkage).
+  const auditRecords: Array<{ ts: number; kind: string; payload: unknown; seq?: number }> = [];
+  try {
+    const audit = await openAuditLog({ rootDir: join(cwd, ".crewhaus", "audit") });
+    for await (const r of audit.read()) {
+      auditRecords.push({ ts: r.ts, kind: r.kind, payload: r.payload, seq: r.seq });
+    }
+  } catch {
+    // No audit log is fine — the bundle notes zero matching records.
+  }
+  const matchedAudit = matchAuditRecordsByWindow(auditRecords, { startTs, endTs });
+
+  // Doctor inventory (read-only, no network probe so a collect never hangs) as
+  // the doctor.txt context. Best-effort — a doctor failure must not block the
+  // bundle.
+  let doctor: string;
+  try {
+    const configPaths = [join(cwd, ".mcp.json")];
+    const desktop = claudeDesktopConfigPath(process.platform, process.env);
+    if (desktop !== undefined) configPaths.push(desktop);
+    const inventory = await buildInventory({
+      env: process.env,
+      fetchImpl: async () => ({ ok: false, status: 0, json: async () => ({}) }),
+      readConfig: (p) => {
+        try {
+          return existsSync(p) ? readFileSync(p, "utf-8") : undefined;
+        } catch {
+          return undefined;
+        }
+      },
+      configPaths,
+      skipProbe: true,
+    });
+    doctor = formatInventory(inventory);
+  } catch (err) {
+    doctor = `doctor inventory unavailable: ${err instanceof Error ? err.message : String(err)}`;
+  }
+
+  const kindFlag = args.flags["kind"];
+  const kind = (typeof kindFlag === "string" ? kindFlag : "run_abort") as IncidentKind;
+  const validKinds: IncidentKind[] = [
+    "run_abort",
+    "circuit_open",
+    "egress_blocked",
+    "justification_deny_storm",
+    "budget_exceeded",
+  ];
+  if (!validKinds.includes(kind)) {
+    die(`--kind must be one of: ${validKinds.join(", ")} (got "${kind}")`);
+  }
+  const reason =
+    typeof args.flags["reason"] === "string"
+      ? args.flags["reason"]
+      : `retroactive collect of session ${session}`;
+
+  const assembled = assembleIncidentBundle({
+    kind,
+    sessionId: session,
+    incidentTs: new Date().toISOString(),
+    reason,
+    ringEvents,
+    transcript,
+    auditRecords: matchedAudit,
+    cost,
+    spec: { name: session },
+    doctor,
+    window: { startTs, endTs },
+  });
+
+  const outRoot =
+    typeof args.flags["out"] === "string"
+      ? resolve(args.flags["out"] as string)
+      : join(cwd, ".crewhaus", "incidents");
+  const dir = join(outRoot, assembled.dirName);
+  mkdirSync(dir, { recursive: true });
+  for (const file of assembled.files) {
+    writeFileSync(join(dir, file.name), file.contents);
+  }
+  process.stdout.write(
+    `[incident] collected ${kind} for ${session}: ${ringEvents.length} events, ` +
+      `${matchedAudit.length} audit records → ${dir}\n`,
+  );
+  process.stdout.write(`[incident] report: ${join(dir, "index.html")}\n`);
 }
 
 /**
@@ -10872,15 +11521,33 @@ switch (subcommand) {
   }
   case "deploy": {
     const action = rest[0] ?? "";
-    if (action !== "promote" && action !== "rollback") {
-      die(`deploy action must be "promote" or "rollback" (got "${action}")`);
+    if (action !== "promote" && action !== "rollback" && action !== "canary") {
+      die(`deploy action must be "promote", "rollback", or "canary" (got "${action}")`);
     }
-    await runDeploy(parseFor(rest.slice(1), DEPLOY_SCHEMA), action);
+    try {
+      await runDeploy(parseFor(rest.slice(1), DEPLOY_SCHEMA), action);
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
     break;
   }
   case "migrate-all":
     await runMigrateAll(parseFor(rest, MIGRATE_SCHEMA));
     break;
+  case "incident": {
+    const action = rest[0] ?? "";
+    if (action !== "collect") {
+      die(`incident action must be "collect" (got "${action}")`);
+    }
+    try {
+      await runIncidentCollect(parseFor(rest.slice(1), INCIDENT_SCHEMA));
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
+    break;
+  }
   case "upgrade":
     try {
       await runUpgrade(parseFor(rest, UPGRADE_SCHEMA));

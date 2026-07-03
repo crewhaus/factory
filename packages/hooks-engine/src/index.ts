@@ -56,6 +56,11 @@ export const HOOK_EVENTS = [
   "pre-compact",
   "post-compact",
   "pre-slash",
+  // Ops item 31 — fired by the alert watchdog when a per-session metric
+  // breaches a baseline-derived threshold (CREWHAUS_ALERTS). Additive: a
+  // settings.json hook with `event: "alert"` receives the breach payload
+  // (metric, observed, threshold, detail) on stdin like any other hook.
+  "alert",
 ] as const;
 
 export type HookEvent = (typeof HOOK_EVENTS)[number];

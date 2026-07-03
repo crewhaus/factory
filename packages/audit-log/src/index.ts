@@ -123,7 +123,13 @@ export type AuditKind =
   // tamper-evidenced. Payload shape (opaque JSON; see apps/cli/src/retention.ts):
   //   { action: "sweep"|"export"|"purge", dryRun: false, deletedSessionIds,
   //     kept/deferred counts, policy inputs (maxAgeDays, pins, windows), ... }
-  | "retention_enforcement";
+  | "retention_enforcement"
+  // Ops item 31 — the alert watchdog (CREWHAUS_ALERTS) appends one record per
+  // metric breach against a baseline-derived threshold, so the alert history is
+  // itself tamper-evidenced. Payload shape (opaque JSON; see the AlertSink the
+  // CLI `run` path wires): { sessionId, metric, observed, threshold,
+  //   baselineSessions, detail }.
+  | "alert_raised";
 
 export type AuditRecord = {
   readonly ts: number;
