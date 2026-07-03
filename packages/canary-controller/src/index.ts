@@ -6,8 +6,15 @@
  *
  * After `evalIntervalMs` elapses, runs an eval-spec against both versions
  * in parallel and gates promotion on `regression-runner` (Section 29 —
- * but ships pre-§29 with a stub gate that returns "pass" until the real
- * regression-runner lands).
+ * `gate(baseline, candidate)` over two `EvalRunSummary` results).
+ *
+ * The real gate is wired by the caller (item 29 — `crewhaus deploy canary`):
+ * canary-controller stays dependency-inverted (it does NOT import
+ * `regression-runner`/`eval-runner`, keeping this a leaf package). Callers
+ * build a `RegressionGate` with {@link makeRegressionGate}, injecting the
+ * per-step "eval both versions, then compare" closure. {@link PASSING_GATE}
+ * is retained ONLY as an explicit always-pass stub for tests and manual
+ * dry-runs — it is no longer the wired production default.
  *
  * Without an eval gate (manual mode), the controller waits for an
  * explicit `crewhaus deploy promote` call.
@@ -38,8 +45,39 @@ export type RegressionGate = (input: {
   readonly toVersion: string;
 }) => Promise<{ readonly verdict: "pass" | "fail"; readonly reason?: string }>;
 
-/** Stub gate that always passes. Replaced by §29 regression-runner integration. */
+/**
+ * EXPLICIT always-pass stub. NOT the wired production default anymore
+ * (item 29): the CLI builds a real gate via {@link makeRegressionGate} that
+ * evals both versions and runs `regression-runner`'s `gate()`. Kept only for
+ * tests, `--dry-run`, and manual promotions that deliberately skip the eval
+ * gate.
+ */
 export const PASSING_GATE: RegressionGate = async () => ({ verdict: "pass" });
+
+/**
+ * Build a real {@link RegressionGate} from a caller-supplied per-step
+ * evaluator. The evaluator is the seam that keeps canary-controller
+ * dependency-inverted: it evals BOTH versions and returns the comparison
+ * verdict (in the CLI it runs two `eval-runner` passes and feeds the two
+ * `EvalRunSummary` results into `regression-runner.gate()`). Any throw from
+ * the evaluator is surfaced as a `fail` verdict so a broken eval never
+ * silently promotes a candidate — the controller then auto-rolls-back.
+ */
+export function makeRegressionGate(
+  evaluate: (input: {
+    readonly fromVersion: string;
+    readonly toVersion: string;
+  }) => Promise<{ readonly verdict: "pass" | "fail"; readonly reason?: string }>,
+): RegressionGate {
+  return async (input) => {
+    try {
+      return await evaluate(input);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return { verdict: "fail", reason: `eval gate errored: ${message}` };
+    }
+  };
+}
 
 export type CanaryConfig = {
   readonly name: string;

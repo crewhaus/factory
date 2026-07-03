@@ -7,7 +7,12 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { EVAL_CI_WORKFLOW_RELPATH, buildEvalCiWorkflowYaml } from "./ci-scaffold";
+import {
+  EVAL_CI_WORKFLOW_RELPATH,
+  SENTINEL_WORKFLOW_RELPATH,
+  buildEvalCiWorkflowYaml,
+  buildSentinelDriftWorkflowYaml,
+} from "./ci-scaffold";
 
 const TMP_ROOTS: string[] = [];
 function newTempRoot(): string {
@@ -135,6 +140,38 @@ describe("buildEvalCiWorkflowYaml", () => {
   });
 });
 
+describe("buildSentinelDriftWorkflowYaml (item 30)", () => {
+  const yaml = buildSentinelDriftWorkflowYaml();
+
+  test("runs the drift sentinel on a nightly cron + workflow_dispatch", () => {
+    expect(yaml).toContain("name: sentinel-drift");
+    expect(yaml).toContain("schedule:");
+    expect(yaml).toContain("cron:");
+    expect(yaml).toContain("workflow_dispatch: {}");
+  });
+
+  test("invokes eval --sentinel --baseline with a pinned seed", () => {
+    expect(yaml).toContain("--sentinel --baseline eval/sentinel-baseline");
+    expect(yaml).toContain('--seed "$SENTINEL_SEED"');
+    expect(yaml).toContain('SENTINEL_SEED: "1"');
+  });
+
+  test("documents the committed-baseline rationale + how to freeze it", () => {
+    expect(yaml).toContain("FROZEN baseline");
+    expect(yaml).toContain("-o eval/sentinel-baseline");
+    expect(yaml).toContain("git add");
+    expect(yaml).toContain("ANTHROPIC_API_KEY");
+  });
+
+  test("harnessDir prefixes the working-directory + doc paths", () => {
+    const nested = buildSentinelDriftWorkflowYaml({ harnessDir: "agents/concierge" });
+    expect(nested).toContain("working-directory: agents/concierge");
+    expect(nested).toContain("crewhaus eval agents/concierge/crewhaus.yaml");
+    // Root scaffold stays unprefixed.
+    expect(yaml).not.toContain("working-directory:");
+  });
+});
+
 // -------- CLI surface (spawned) --------
 
 const SRC_DIR = import.meta.dir.replace(/([/\\])dist$/, "$1src");
@@ -244,5 +281,51 @@ describe("crewhaus init --ci (CLI surface)", () => {
     const second = await runCli(["init"], root);
     expect(second.exitCode).toBe(1);
     expect(second.stderr).toContain("refusing to overwrite");
+  });
+});
+
+describe("crewhaus init --sentinel (CLI surface, item 30)", () => {
+  test("fresh dir: scaffolds the spec AND the sentinel workflow", async () => {
+    const root = newTempRoot();
+    const res = await runCli(["init", "--sentinel"], root);
+    expect(res.exitCode).toBe(0);
+    expect(existsSync(join(root, "crewhaus.yaml"))).toBe(true);
+    const wfPath = join(root, SENTINEL_WORKFLOW_RELPATH);
+    expect(existsSync(wfPath)).toBe(true);
+    expect(readFileSync(wfPath, "utf-8")).toBe(buildSentinelDriftWorkflowYaml());
+    expect(res.stdout).toContain("sentinel:");
+    expect(res.stdout).toContain("eval/sentinel-baseline");
+  });
+
+  test("existing harness: adds just the sentinel workflow, keeps the spec", async () => {
+    const root = newTempRoot();
+    writeFileSync(join(root, "crewhaus.yaml"), SPEC_YAML);
+    const res = await runCli(["init", "--sentinel"], root);
+    expect(res.exitCode).toBe(0);
+    expect(res.stdout).toContain("kept");
+    expect(readFileSync(join(root, "crewhaus.yaml"), "utf-8")).toBe(SPEC_YAML);
+    expect(existsSync(join(root, SENTINEL_WORKFLOW_RELPATH))).toBe(true);
+  });
+
+  test("refuses to overwrite an existing sentinel workflow without --force", async () => {
+    const root = newTempRoot();
+    writeFileSync(join(root, "crewhaus.yaml"), SPEC_YAML);
+    await runCli(["init", "--sentinel"], root);
+    const wfPath = join(root, SENTINEL_WORKFLOW_RELPATH);
+    writeFileSync(wfPath, "# hand-edited\n");
+    const refused = await runCli(["init", "--sentinel"], root);
+    expect(refused.exitCode).toBe(1);
+    expect(refused.stderr).toContain("--force");
+    const forced = await runCli(["init", "--sentinel", "--force"], root);
+    expect(forced.exitCode).toBe(0);
+    expect(readFileSync(wfPath, "utf-8")).toBe(buildSentinelDriftWorkflowYaml());
+  });
+
+  test("composes with --ci: both workflows land", async () => {
+    const root = newTempRoot();
+    const res = await runCli(["init", "--ci", "--sentinel"], root);
+    expect(res.exitCode).toBe(0);
+    expect(existsSync(join(root, EVAL_CI_WORKFLOW_RELPATH))).toBe(true);
+    expect(existsSync(join(root, SENTINEL_WORKFLOW_RELPATH))).toBe(true);
   });
 });

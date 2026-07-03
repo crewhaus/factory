@@ -35,6 +35,102 @@ import { join } from "node:path";
 import { normalizeHarnessDir } from "./flywheel";
 
 export const EVAL_CI_WORKFLOW_RELPATH = join(".github", "workflows", "crewhaus-eval.yml");
+export const SENTINEL_WORKFLOW_RELPATH = join(".github", "workflows", "sentinel-drift.yml");
+
+/**
+ * Item 30 — the nightly model-drift sentinel workflow, scaffolded by
+ * `crewhaus init --sentinel`. Mirrors the shipped
+ * `@crewhaus/eval-report/templates/sentinel-drift.yml` template but adapts the
+ * paths to a nested harness (finding 7: GitHub only reads `.github/workflows`
+ * at the repo root, so a nested harness's spec/dataset paths are prefixed).
+ *
+ * It re-runs a seed-pinned sentinel dataset against the UNCHANGED spec and
+ * diffs against a FROZEN baseline run committed at `<harness>/eval/
+ * sentinel-baseline`. `crewhaus eval --sentinel` exits non-zero on provider
+ * drift (or a not-comparable spec/dataset-hash mismatch), failing this job so
+ * GitHub's scheduled-workflow-failure notification alerts.
+ */
+export function buildSentinelDriftWorkflowYaml(
+  opts: { readonly harnessDir?: string } = {},
+): string {
+  const sub = normalizeHarnessDir(opts.harnessDir);
+  const prefix = sub === "" ? "" : `${sub}/`;
+  const workingDirLine = sub === "" ? "" : `\n        working-directory: ${sub}`;
+  const subdirNote =
+    sub === ""
+      ? ""
+      : `#   - Scaffolded for the harness at ${sub}/ — the job's working-directory is
+#     set so the spec/dataset/baseline paths resolve inside it.\n`;
+  return `# sentinel-drift.yml — scaffolded by \`crewhaus init --sentinel\` (item 30).
+#
+# Nightly model-drift sentinel: re-runs a SEED-PINNED sentinel dataset against
+# your UNCHANGED spec and diffs the fresh run against a FROZEN baseline run
+# committed to the repo. When the spec's specHash AND the sentinel dataset's
+# content hash are BOTH identical to the baseline's, any pass/fail flip or
+# score shift can ONLY be the provider silently changing model behaviour.
+# \`crewhaus eval --sentinel\` exits non-zero on drift (and on a not-comparable
+# spec/dataset-hash mismatch — a mis-pointed sentinel is loud, never silently
+# green), so this job goes red and GitHub's scheduled-failure email alerts.
+#
+# WHY A COMMITTED BASELINE (unlike the eval-on-PR gate's two fresh runs): a
+# drift probe needs a fixed "before" that survives across nights and is NOT
+# re-derived from the current provider — that is the whole point.
+#
+# BEFORE THIS RUNS, freeze the baseline once against the current spec+dataset:
+#   crewhaus eval ${prefix}crewhaus.yaml \\
+#     --dataset ${prefix}eval/sentinel.jsonl --graders ${prefix}eval/graders.yaml \\
+#     --seed 1 -o ${prefix}eval/sentinel-baseline
+#   git add ${prefix}eval/sentinel-baseline && git commit
+# Re-freeze it (same command) whenever you INTENTIONALLY change the spec or
+# sentinel data, or knowingly adopt a new provider baseline.
+${subdirNote}#
+# Required repo secret: ANTHROPIC_API_KEY (billed by the nightly eval run).
+
+name: sentinel-drift
+
+on:
+  schedule:
+    # Nightly at 03:17 UTC (off the hour to dodge cron scheduling backlog).
+    - cron: "17 3 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  SENTINEL_SEED: "1" # pin the sample order so only the PROVIDER can vary
+
+jobs:
+  sentinel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash${workingDirLine}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install crewhaus CLI
+        run: |
+          bun add -g crewhaus
+          echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
+
+      - name: Run the drift sentinel
+        env:
+          ANTHROPIC_API_KEY: \${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          crewhaus eval crewhaus.yaml \\
+            --dataset eval/sentinel.jsonl \\
+            --graders eval/graders.yaml \\
+            --seed "$SENTINEL_SEED" \\
+            --sentinel --baseline eval/sentinel-baseline \\
+            -o .crewhaus/evals/sentinel-\$(date -u +%Y%m%d)
+`;
+}
 
 /**
  * The eval-gated-PR workflow. Model-budget-conscious by default:

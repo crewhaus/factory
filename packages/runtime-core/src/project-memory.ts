@@ -41,7 +41,29 @@ export const CANONICAL_MEMORY_FILES = [
   "CLAUDE.md",
   "CODE-COMPANION.md",
   "AGENT.md",
+  // Item #56 — auto-maintained lessons file. `crewhaus lessons update` mines
+  // corrections + recurring failure→fix patterns into this deduped file; the
+  // runtime auto-loads it at run start exactly like the other memory files.
+  //
+  // #56 F2 — GATED: unlike the other canonical files, a project's `LESSONS.md`
+  // is a common human-authored convention, so we ONLY auto-inject one that
+  // carries the crewhaus marker (`MARKER_GATED_FILES` below). A marker-less
+  // human LESSONS.md is skipped — we never silently prepend an unrelated file
+  // to the agent's system prompt.
+  "LESSONS.md",
 ] as const;
+
+/**
+ * #56 F2 — canonical files whose auto-load is gated on a crewhaus-generated
+ * marker. These filenames collide with common human-authored conventions, so
+ * only the crewhaus-managed variant (which carries the marker `crewhaus`
+ * writes) is auto-injected. Maps filename → the exact marker substring that
+ * must be present. `LESSONS.md`'s marker mirrors `apps/cli/src/lessons.ts`'s
+ * `LESSONS_MARKER` — the same string `crewhaus lessons update` writes.
+ */
+export const MARKER_GATED_FILES: Readonly<Record<string, string>> = {
+  "LESSONS.md": "<!-- crewhaus:lessons -->",
+};
 
 export const DEFAULT_PROJECT_MEMORY_CAP_BYTES = 64 * 1024;
 
@@ -52,6 +74,13 @@ export interface ProjectMemoryLoadOptions {
   readonly filenames?: readonly string[];
   /** Maximum total bytes across all loaded files. Defaults to 64 KB. */
   readonly capBytes?: number;
+  /**
+   * Item #56 — absolute path(s) to per-user preference files (outside cwd, e.g.
+   * `.crewhaus/preferences/<rater>.md`). Loaded + injected exactly like the
+   * canonical files when they exist, so the current user's prefs reach the
+   * system prompt. Absent/nonexistent → no-op.
+   */
+  readonly extraFiles?: readonly string[];
 }
 
 export interface LoadedMemoryFile {
@@ -90,6 +119,17 @@ export async function loadProjectMemory(
       matched.push({ filename, fullPath, size: st.size });
     } catch {}
   }
+  // Item #56 — extra per-user preference files (absolute paths outside cwd).
+  for (const fullPath of opts.extraFiles ?? []) {
+    if (!existsSync(fullPath)) continue;
+    try {
+      const st = await stat(fullPath);
+      if (!st.isFile()) continue;
+      // Use the basename as the `file=` label in the wrapper.
+      const filename = fullPath.split(/[/\\]/).pop() ?? fullPath;
+      matched.push({ filename, fullPath, size: st.size });
+    } catch {}
+  }
 
   if (matched.length === 0) {
     return { files: [], totalBytes: 0, prompt: "" };
@@ -103,6 +143,13 @@ export async function loadProjectMemory(
     try {
       content = await readFile(m.fullPath, "utf-8");
     } catch {
+      continue;
+    }
+    // #56 F2 — marker-gated files (e.g. LESSONS.md) only auto-inject when they
+    // carry the crewhaus marker; a human-authored file of the same name (no
+    // marker) is skipped so we never silently prepend it to the system prompt.
+    const requiredMarker = MARKER_GATED_FILES[m.filename];
+    if (requiredMarker !== undefined && !content.includes(requiredMarker)) {
       continue;
     }
     let truncated = false;

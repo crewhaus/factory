@@ -88,6 +88,8 @@ export type EvalRunSummary = {
     readonly datasetName: string;
     /** sha256 of the dataset file bytes, when the caller supplied one. */
     readonly datasetHash?: string;
+    /** sha256 of the parsed GradersConfig, when the caller supplied one. */
+    readonly gradersHash?: string;
     readonly graderNames: ReadonlyArray<string>;
     readonly model: string;
     readonly judgeModel?: string;
@@ -123,6 +125,14 @@ export type RunEvalOptions = {
    * tell whether two runs saw byte-identical data.
    */
   readonly datasetHash?: string;
+  /**
+   * Content hash (sha256 hex) of the parsed GradersConfig the graders came
+   * from. Mirrors {@link datasetHash}: purely informational, persisted into
+   * `run.json` / `results.json` so downstream consumers (notably the item-30
+   * sentinel) can tell whether two runs graded with byte-identical config —
+   * a changed rubric/threshold must not be misattributed to provider drift.
+   */
+  readonly gradersHash?: string;
 };
 
 export type GraderEntry = {
