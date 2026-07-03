@@ -6,14 +6,21 @@
 import { describe, expect, it } from "bun:test";
 import { parsePermissionsConfig } from "@crewhaus/permission-engine";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import {
+  OPERATIVE_ARG_FIELDS as MATCHER_OPERATIVE_ARG_FIELDS,
+  compilePattern,
+  matchesPattern,
+} from "@crewhaus/tool-permission-matcher";
 import { z } from "zod";
 import { type SessionEvents, parseJsonlObjects } from "./advise-rules";
 import {
+  OPERATIVE_ARG_FIELDS,
   aggregateAsks,
   applyToSettingsRoot,
   diffPermissions,
   existingSettingsRules,
   formatSettingsDiff,
+  hasUnescapedWildcard,
   patternFor,
   rankSuggestions,
   readOnlyByName,
@@ -56,6 +63,17 @@ function toolUse(name: string, input: unknown): unknown {
 function session(sessionId: string, lines: unknown[]): SessionEvents {
   return { sessionId, objects: parseJsonlObjects(jsonl(lines)) };
 }
+
+// -------- F3: operative-arg-field single source of truth --------
+
+describe("OPERATIVE_ARG_FIELDS (F3 — no silent desync)", () => {
+  it("is the SAME map the matcher exports (single source of truth)", () => {
+    // permissions-suggest re-exports the matcher's map, so a future matcher
+    // edit can never silently desync the suggested pattern's target field.
+    expect(OPERATIVE_ARG_FIELDS).toBe(MATCHER_OPERATIVE_ARG_FIELDS);
+    expect(OPERATIVE_ARG_FIELDS).toEqual(MATCHER_OPERATIVE_ARG_FIELDS);
+  });
+});
 
 // -------- aggregation --------
 
@@ -114,6 +132,73 @@ describe("patternFor", () => {
     expect(patternFor({ toolName: "Todo", asks: 3, approved: 3, denied: 0, argSamples: [] })).toBe(
       "Todo",
     );
+  });
+
+  // F2 — the suggested rule must match ONLY the literal approved value; the
+  // matcher treats `*`/`?` in an arg-glob as widening wildcards.
+  it("a rule from an approved literal does NOT match unapproved siblings", () => {
+    const pattern = patternFor({
+      toolName: "Bash",
+      asks: 3,
+      approved: 3,
+      denied: 0,
+      argSamples: ["npm run test:foo"],
+    });
+    const compiled = compilePattern(pattern);
+    expect(matchesPattern(compiled, "Bash", { command: "npm run test:foo" })).toBe(true);
+    expect(matchesPattern(compiled, "Bash", { command: "npm run test:bar" })).toBe(false);
+  });
+
+  it("escapes glob metacharacters so a value with `*` matches only itself", () => {
+    const pattern = patternFor({
+      toolName: "Bash",
+      asks: 3,
+      approved: 3,
+      denied: 0,
+      argSamples: ["npm run test:*"],
+    });
+    // The emitted glob is escaped — no bare wildcard survives.
+    expect(hasUnescapedWildcard(pattern)).toBe(false);
+    const compiled = compilePattern(pattern);
+    // Must NOT widen to an unapproved sibling…
+    expect(matchesPattern(compiled, "Bash", { command: "npm run test:PRODUCTION-DELETE" })).toBe(
+      false,
+    );
+    // …but must still match the literal value the human approved.
+    expect(matchesPattern(compiled, "Bash", { command: "npm run test:*" })).toBe(true);
+  });
+
+  it("escapes a `?` metacharacter too", () => {
+    const pattern = patternFor({
+      toolName: "Read",
+      asks: 3,
+      approved: 3,
+      denied: 0,
+      argSamples: ["/tmp/a?b"],
+    });
+    const compiled = compilePattern(pattern);
+    expect(matchesPattern(compiled, "Read", { file_path: "/tmp/aXb" })).toBe(false);
+    expect(matchesPattern(compiled, "Read", { file_path: "/tmp/a?b" })).toBe(true);
+  });
+
+  it("falls back to a bare tool glob when the value contains a paren (unrepresentable)", () => {
+    // `(`/`)` break the matcher's Tool(arg) split, which is not escape-aware —
+    // a bare tool glob is safer than a misparsing rule.
+    expect(
+      patternFor({ toolName: "Bash", asks: 3, approved: 3, denied: 0, argSamples: ["echo (hi)"] }),
+    ).toBe("Bash");
+  });
+});
+
+describe("hasUnescapedWildcard (F2 review annotation)", () => {
+  it("detects a bare wildcard", () => {
+    expect(hasUnescapedWildcard("Bash(git *)")).toBe(true);
+    expect(hasUnescapedWildcard("Bash(a?b)")).toBe(true);
+  });
+  it("ignores an escaped metacharacter and plain literals", () => {
+    expect(hasUnescapedWildcard("Bash(npm run test:\\*)")).toBe(false);
+    expect(hasUnescapedWildcard("Bash(git status)")).toBe(false);
+    expect(hasUnescapedWildcard("Read")).toBe(false);
   });
 });
 
@@ -217,6 +302,16 @@ describe("diffPermissions", () => {
     const blob = formatSettingsDiff(diff).join("\n");
     expect(blob).toContain('  + { type: alwaysAllow, pattern: "Read" }');
     expect(blob).toContain('    { type: alwaysDeny, pattern: "Bash(rm**)" }');
+  });
+
+  it("annotates a still-wildcarded pattern (F2)", () => {
+    // An existing hand-authored broad rule keeps its wildcard → flagged.
+    const diff = diffPermissions([{ type: "alwaysDeny", pattern: "Bash(rm**)" }], suggestions);
+    const blob = formatSettingsDiff(diff).join("\n");
+    expect(blob).toContain("(⚠ wildcard — matches multiple)");
+    // The clean `+` suggestion line (pattern "Read") is NOT annotated.
+    const readLine = formatSettingsDiff(diff).find((l) => l.includes('pattern: "Read"'));
+    expect(readLine).not.toContain("wildcard");
   });
 });
 

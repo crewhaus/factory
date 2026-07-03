@@ -661,6 +661,26 @@ export type FailureTaxonomyEntry = {
   readonly hint?: string;
 };
 
+/**
+ * Item 19 — specificity floor for a drafted taxonomy `pattern`. The pattern is
+ * `errorName` verbatim, matched by the recovery engine as a case-insensitive
+ * SUBSTRING of `error.message`. A very short or generic name (e.g. "Error")
+ * drafts a rule that fires on almost every failure — worse than no entry. Such
+ * clusters are surfaced as ADVICE (a human should hand-write a precise pattern)
+ * rather than drafted into a patch.
+ */
+export const TAXONOMY_MIN_PATTERN_LEN = 4;
+/** Generic error tokens too broad to auto-draft, regardless of length. */
+export const TAXONOMY_GENERIC_TOKENS: ReadonlySet<string> = new Set(["error", "fail", "err"]);
+
+/** True when `errorName` is too broad to draft a taxonomy pattern for
+ *  (too short, or a generic token). Case-insensitive. */
+export function taxonomyPatternTooBroad(errorName: string): boolean {
+  const trimmed = errorName.trim();
+  if (trimmed.length < TAXONOMY_MIN_PATTERN_LEN) return true;
+  return TAXONOMY_GENERIC_TOKENS.has(trimmed.toLowerCase());
+}
+
 /** The dominant recovery action observed for an error class (ties broken by
  *  the enum's declared order → deterministic). Falls back to `retry` when the
  *  observed action isn't a valid taxonomy action (e.g. a future action name). */
@@ -716,6 +736,9 @@ export const ruleFailureTaxonomy: AdviceRule = (ctx, opts) => {
   const drafts: FailureTaxonomyEntry[] = [];
   const evidence: string[] = [];
   let clustered = 0;
+  // Item 19 (F4) — clusters whose errorName is too broad to draft a pattern
+  // for (too short/generic). Surfaced as advice, never a patch.
+  const tooBroad: Array<{ errorName: string; count: number; recovery: string }> = [];
 
   // Deterministic: sort clusters by count desc, then errorName.
   const clusters = [...ctx.recoveriesByErrorName.entries()].sort((a, b) => {
@@ -726,6 +749,13 @@ export const ruleFailureTaxonomy: AdviceRule = (ctx, opts) => {
     if (stats.count < t.recoveryClusterMin) continue;
     if (covered.has(errorName)) continue;
     const recovery = dominantRecoveryAction(stats.actions);
+    // F4 specificity floor: a too-short/generic errorName drafts a rule that
+    // matches almost every error.message. Skip drafting it; collect it for an
+    // advice-only nudge so a human writes a precise pattern instead.
+    if (taxonomyPatternTooBroad(errorName)) {
+      tooBroad.push({ errorName, count: stats.count, recovery });
+      continue;
+    }
     drafts.push({
       class: errorName,
       // matchNamedFailure matches error.MESSAGE (substring/regex); the class
@@ -739,27 +769,27 @@ export const ruleFailureTaxonomy: AdviceRule = (ctx, opts) => {
     clustered += stats.count;
   }
 
-  if (drafts.length === 0) return [];
+  const findings: AdviceFinding[] = [];
 
-  // Compose the full array: existing entries (verbatim) + the new drafts.
-  const existingArray = Array.isArray(specField<unknown>(spec, "failure_taxonomy"))
-    ? (specField<unknown[]>(spec, "failure_taxonomy") as unknown[])
-    : [];
-  const value = [...existingArray, ...drafts];
-  const op: SpecPatch["op"] = existingArray.length > 0 ? "replace" : "add";
-  const patch: SpecPatch = {
-    target: spec?.target ?? "cli",
-    path: ["failure_taxonomy"],
-    op,
-    value,
-    rationale: `advise: ${drafts.length} error class(es) recurred ≥${t.recoveryClusterMin}× — drafted failure_taxonomy entries`,
-  };
-  const adviceText = `Recurring error classes were recovered from repeatedly (${evidence.join("; ")}). Add failure_taxonomy entries so the runtime handles them deterministically: ${drafts
-    .map((d) => `${d.class} → ${d.recovery}`)
-    .join(", ")}. Set each 'pattern' to a substring of the real error.message.`;
+  if (drafts.length > 0) {
+    // Compose the full array: existing entries (verbatim) + the new drafts.
+    const existingArray = Array.isArray(specField<unknown>(spec, "failure_taxonomy"))
+      ? (specField<unknown[]>(spec, "failure_taxonomy") as unknown[])
+      : [];
+    const value = [...existingArray, ...drafts];
+    const op: SpecPatch["op"] = existingArray.length > 0 ? "replace" : "add";
+    const patch: SpecPatch = {
+      target: spec?.target ?? "cli",
+      path: ["failure_taxonomy"],
+      op,
+      value,
+      rationale: `advise: ${drafts.length} error class(es) recurred ≥${t.recoveryClusterMin}× — drafted failure_taxonomy entries`,
+    };
+    const adviceText = `Recurring error classes were recovered from repeatedly (${evidence.join("; ")}). Add failure_taxonomy entries so the runtime handles them deterministically: ${drafts
+      .map((d) => `${d.class} → ${d.recovery}`)
+      .join(", ")}. Set each 'pattern' to a substring of the real error.message.`;
 
-  return [
-    {
+    findings.push({
       id: "failure-taxonomy-learned",
       severity: "warn",
       summary: `${drafts.length} recurring error class(es) → draft failure_taxonomy`,
@@ -769,8 +799,36 @@ export const ruleFailureTaxonomy: AdviceRule = (ctx, opts) => {
       ],
       counts: { classes: drafts.length, recoveries: clustered },
       suggestion: patchOrAdvice(spec, patch, adviceText),
-    },
-  ];
+    });
+  }
+
+  // F4 — advice-only finding for clusters too broad to auto-draft. Never a
+  // patch: the errorName is too generic to become a `pattern` safely.
+  if (tooBroad.length > 0) {
+    const broadClustered = tooBroad.reduce((sum, c) => sum + c.count, 0);
+    findings.push({
+      id: "failure-taxonomy-too-broad",
+      severity: "info",
+      summary: `${tooBroad.length} recurring error class(es) too generic to auto-draft failure_taxonomy`,
+      evidence: [
+        ...tooBroad.map(
+          (c) => `${c.errorName}: ${c.count} recoveries → recovery=${c.recovery} (NOT drafted)`,
+        ),
+        `skipped: errorName shorter than ${TAXONOMY_MIN_PATTERN_LEN} chars or a generic token (${[...TAXONOMY_GENERIC_TOKENS].join(", ")}) — a verbatim pattern would match nearly every error.message`,
+      ],
+      counts: { classes: tooBroad.length, recoveries: broadClustered },
+      suggestion: {
+        kind: "advice",
+        text: `Recurring but generically-named error classes (${tooBroad
+          .map((c) => `${c.errorName} ×${c.count}`)
+          .join(
+            ", ",
+          )}) were recovered from repeatedly. Their names are too broad to draft a failure_taxonomy 'pattern' automatically (it is matched as a case-insensitive substring of error.message). Hand-write a precise 'pattern' — a distinctive substring of the real error message — before adding a taxonomy entry.`,
+      },
+    });
+  }
+
+  return findings;
 };
 
 /**

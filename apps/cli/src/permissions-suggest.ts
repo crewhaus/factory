@@ -1,4 +1,5 @@
 import type { PermissionRule, RuleType } from "@crewhaus/permission-engine";
+import type { RegisteredTool } from "@crewhaus/tool-catalog";
 /**
  * Item 16 — `crewhaus permissions suggest`: mine persisted ask/deny history
  * into reviewable permission rules. The pure, side-effect-free half; all
@@ -22,7 +23,10 @@ import type { PermissionRule, RuleType } from "@crewhaus/permission-engine";
  * get an `alwaysAsk` tightening (never a blanket `alwaysDeny` — a human
  * denied THIS call, not necessarily every future one).
  */
-import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import {
+  OPERATIVE_ARG_FIELDS as MATCHER_OPERATIVE_ARG_FIELDS,
+  escapeGlobLiteral,
+} from "@crewhaus/tool-permission-matcher";
 import { type SessionEvents, payloadOf } from "./advise-rules";
 
 // -------- aggregation --------
@@ -39,23 +43,13 @@ export type AskAggregate = {
 
 /**
  * The operative input field(s) per built-in tool — the one a permission
- * arg-glob constrains. Mirrors `OPERATIVE_ARG_FIELDS` in
- * `@crewhaus/tool-permission-matcher` (not exported there); kept in step so a
- * suggested pattern targets the SAME field the matcher will check. Keyed by
- * the PascalCase runtime `.name`.
+ * arg-glob constrains. Re-exported from `@crewhaus/tool-permission-matcher`
+ * (the SINGLE source of truth) so a suggested pattern always targets the SAME
+ * field the matcher checks. This was hand-copied here (a silent-desync risk);
+ * now a matcher edit propagates automatically. Keyed by the PascalCase runtime
+ * `.name`.
  */
-export const OPERATIVE_ARG_FIELDS: Readonly<Record<string, ReadonlyArray<string>>> = Object.freeze({
-  Bash: ["command"],
-  Read: ["file_path", "path"],
-  Write: ["file_path", "path"],
-  Edit: ["file_path", "path"],
-  Glob: ["pattern"],
-  Grep: ["pattern", "path"],
-  Fetch: ["url"],
-  WebFetch: ["url"],
-  WebSearch: ["query"],
-  Navigate: ["url"],
-});
+export const OPERATIVE_ARG_FIELDS = MATCHER_OPERATIVE_ARG_FIELDS;
 
 /** Max distinct operative-arg samples kept per tool (bounds report size). */
 export const MAX_ARG_SAMPLES = 5;
@@ -165,11 +159,25 @@ export function readOnlyByName(
  * distinct values stays a bare tool glob (a per-value rule set would be noise
  * — the human can tighten). Tools with no operative field (or no samples) get
  * the bare tool name.
+ *
+ * SAFETY (glob widening): the observed value is a LITERAL the human approved,
+ * not a glob the human authored. tool-permission-matcher treats `*`/`?` in an
+ * arg-glob as wildcards, so splicing a raw value that contains them would make
+ * the suggested rule match unapproved siblings (`Bash(npm run test:*)` matching
+ * `Bash(npm run test:PRODUCTION-DELETE)`). We `escapeGlobLiteral` the value so
+ * the rule matches ONLY the approved string. A value containing `(`/`)` cannot
+ * be represented in the matcher's `Tool(arg)` format (its paren split isn't
+ * escape-aware), so we fall back to a bare tool glob rather than emit a rule
+ * that misparses — the reviewer can hand-write a tighter one.
  */
 export function patternFor(agg: AskAggregate): string {
   if (agg.argSamples.length === 1 && OPERATIVE_ARG_FIELDS[agg.toolName] !== undefined) {
-    // A single recurring operative value → a precise glob for exactly it.
-    return `${agg.toolName}(${agg.argSamples[0]})`;
+    const value = agg.argSamples[0] as string;
+    if (!value.includes("(") && !value.includes(")")) {
+      // A single recurring operative value → a precise glob for exactly it,
+      // with glob metacharacters neutralised so it matches only the literal.
+      return `${agg.toolName}(${escapeGlobLiteral(value)})`;
+    }
   }
   return agg.toolName;
 }
@@ -298,7 +306,7 @@ export function diffPermissions(
   existing: ReadonlyArray<SettingsPermissionRule>,
   suggestions: ReadonlyArray<PermissionSuggestion>,
 ): PermissionsDiff {
-  const key = (r: SettingsPermissionRule): string => `${r.type} ${r.pattern}`;
+  const key = (r: SettingsPermissionRule): string => `${r.type} ${r.pattern}`;
   const have = new Set(existing.map(key));
   const additions: SettingsPermissionRule[] = [];
   const alreadyPresent: SettingsPermissionRule[] = [];
@@ -360,13 +368,37 @@ export function formatSettingsDiff(diff: PermissionsDiff): string[] {
     lines.push("  (no rules — nothing to suggest)");
     return lines;
   }
-  const addKeys = new Set(diff.additions.map((r) => `${r.type} ${r.pattern}`));
+  const addKeys = new Set(diff.additions.map((r) => `${r.type} ${r.pattern}`));
   for (const r of diff.merged) {
-    const isNew = addKeys.has(`${r.type} ${r.pattern}`);
-    lines.push(`  ${isNew ? "+" : " "} { type: ${r.type}, pattern: ${JSON.stringify(r.pattern)} }`);
+    const isNew = addKeys.has(`${r.type} ${r.pattern}`);
+    // Flag any UNESCAPED wildcard still present — such a rule matches multiple
+    // values (an existing hand-authored broad rule or, defensively, a
+    // suggestion that somehow kept a wildcard). Suggested rules escape their
+    // literals in patternFor, so a `+` line should never trip this.
+    const warn = hasUnescapedWildcard(r.pattern) ? " (⚠ wildcard — matches multiple)" : "";
+    lines.push(
+      `  ${isNew ? "+" : " "} { type: ${r.type}, pattern: ${JSON.stringify(r.pattern)} }${warn}`,
+    );
   }
   if (diff.additions.length === 0) {
     lines.push("  (all suggestions already present — nothing to add)");
   }
   return lines;
+}
+
+/**
+ * True when a pattern contains a glob wildcard (`*`/`?`) that is NOT
+ * backslash-escaped — i.e. one the matcher will treat as widening. A `\\*`/`\\?`
+ * (a literal escaped by `escapeGlobLiteral`) does not count.
+ */
+export function hasUnescapedWildcard(pattern: string): boolean {
+  for (let i = 0; i < pattern.length; i++) {
+    const ch = pattern[i];
+    if (ch === "\\") {
+      i++; // skip the escaped char — it's a literal, not a wildcard
+      continue;
+    }
+    if (ch === "*" || ch === "?") return true;
+  }
+  return false;
 }

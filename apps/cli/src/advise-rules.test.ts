@@ -27,6 +27,7 @@ import {
   ruleTruncationPressure,
   runAdviceRules,
   subAgentFragment,
+  taxonomyPatternTooBroad,
 } from "./advise-rules";
 
 const SESSION_A = "sess_00000000000000aa";
@@ -579,6 +580,73 @@ describe("ruleFailureTaxonomy", () => {
     ]);
     const [finding] = ruleFailureTaxonomy(ctx, {});
     expect(finding?.suggestion.kind).toBe("advice");
+  });
+
+  // F4 — specificity floor: a too-short/generic errorName must NOT draft a
+  // verbatim (broad) pattern; it is surfaced as advice instead.
+  it("does NOT draft a patch for a too-short errorName (< floor) — advice only", () => {
+    const ctx = buildAdviceContext([
+      session(SESSION_A, [
+        recoveryLine("Err", "retry"),
+        recoveryLine("Err", "retry"),
+        recoveryLine("Err", "retry"),
+      ]),
+    ]);
+    const findings = ruleFailureTaxonomy(ctx, { spec: CLI_SPEC });
+    // No spec-patch was drafted from the broad name.
+    expect(findings.some((f) => f.suggestion.kind === "spec-patch")).toBe(false);
+    const broad = findings.find((f) => f.id === "failure-taxonomy-too-broad");
+    expect(broad?.suggestion.kind).toBe("advice");
+    if (broad?.suggestion.kind === "advice") {
+      expect(broad.suggestion.text).toContain("Err");
+      expect(broad.suggestion.text.toLowerCase()).toContain("pattern");
+    }
+  });
+
+  it('does NOT draft a patch for a generic token errorName (e.g. "Error") — advice only', () => {
+    const ctx = buildAdviceContext([
+      session(SESSION_A, [
+        recoveryLine("Error", "retry"),
+        recoveryLine("Error", "retry"),
+        recoveryLine("Error", "retry"),
+      ]),
+    ]);
+    const findings = ruleFailureTaxonomy(ctx, { spec: CLI_SPEC });
+    expect(findings.some((f) => f.suggestion.kind === "spec-patch")).toBe(false);
+    expect(findings.some((f) => f.id === "failure-taxonomy-too-broad")).toBe(true);
+  });
+
+  it("still drafts a patch for a specific errorName alongside a skipped broad one", () => {
+    const ctx = buildAdviceContext([
+      session(SESSION_A, [
+        // Specific → drafts a patch.
+        recoveryLine("OverloadedError", "retry"),
+        recoveryLine("OverloadedError", "retry"),
+        recoveryLine("OverloadedError", "retry"),
+        // Generic → skipped from the patch, surfaced as advice.
+        recoveryLine("fail", "fail"),
+        recoveryLine("fail", "fail"),
+        recoveryLine("fail", "fail"),
+      ]),
+    ]);
+    const findings = ruleFailureTaxonomy(ctx, { spec: CLI_SPEC });
+    const patchFinding = findings.find((f) => f.suggestion.kind === "spec-patch");
+    expect(patchFinding).toBeDefined();
+    if (patchFinding?.suggestion.kind === "spec-patch") {
+      const entries = patchFinding.suggestion.patch.value as Array<{ class: string }>;
+      expect(entries.map((e) => e.class)).toEqual(["OverloadedError"]); // "fail" excluded
+    }
+    expect(findings.some((f) => f.id === "failure-taxonomy-too-broad")).toBe(true);
+  });
+});
+
+describe("taxonomyPatternTooBroad (F4 specificity floor)", () => {
+  it("flags too-short and generic names, passes specific ones", () => {
+    expect(taxonomyPatternTooBroad("Err")).toBe(true); // < 4 chars
+    expect(taxonomyPatternTooBroad("Error")).toBe(true); // generic token
+    expect(taxonomyPatternTooBroad("FAIL")).toBe(true); // generic, case-insensitive
+    expect(taxonomyPatternTooBroad("OverloadedError")).toBe(false);
+    expect(taxonomyPatternTooBroad("PromptTooLong")).toBe(false);
   });
 });
 

@@ -1494,6 +1494,35 @@ async function applyToolConfigs(
     const { registerWebFetchConfig } = await import("@crewhaus/tool-web");
     registerWebFetchConfig(toolConfigs["webFetch"] as Parameters<typeof registerWebFetchConfig>[0]);
   }
+  // Section 18 — code-execution tools (python/javascript/shell) share a single
+  // `registerCodeExecutionConfig`. Mirror target-cli's resolveTools: honor a
+  // per-tool config (first one seen) or the shared `codeExecution`/
+  // `code_execution` alias, register once. Without this the run path ignored
+  // tool_config for code-exec tools that the compiled bundle applies.
+  if (used.has("python") || used.has("javascript") || used.has("shell")) {
+    const cfg =
+      toolConfigs["python"] ??
+      toolConfigs["javascript"] ??
+      toolConfigs["shell"] ??
+      toolConfigs["codeExecution"] ??
+      toolConfigs["code_execution"];
+    if (cfg !== undefined) {
+      const { registerCodeExecutionConfig } = await import("@crewhaus/tool-code-execution");
+      registerCodeExecutionConfig(cfg as Parameters<typeof registerCodeExecutionConfig>[0]);
+    }
+  }
+}
+
+/**
+ * Section 18 — resolve `sandboxAvailable` for the `run` path from the
+ * `CREWHAUS_SANDBOX` env var, using the SAME grammar the compiled bundle
+ * emits (`packages/target-cli` renderRun): unset defaults to `"docker"`
+ * (available); any value whose lowercase is `"noop"` disables the sandbox
+ * floor (code-exec tools are then denied by permission-engine's
+ * `requiresSandbox` floor). Pure — reads only the passed env snapshot.
+ */
+export function resolveSandboxAvailable(env: NodeJS.ProcessEnv = process.env): boolean {
+  return (env["CREWHAUS_SANDBOX"] ?? "docker").toLowerCase() !== "noop";
 }
 
 /**
@@ -1816,6 +1845,33 @@ async function runRunCli(
     );
   }
 
+  // Section 18 — wire the sandbox floor for code-execution tools. #18 made
+  // python/javascript/shell RESOLVABLE at run time, but the run path never set
+  // `sandboxAvailable`, so permission-engine's `requiresSandbox` floor denied
+  // every code-exec call even with a real backend. Mirror the compiled
+  // bundle (target-cli renderRun): resolve availability from CREWHAUS_SANDBOX
+  // and thread it into runChatLoop. Only relevant when the spec declares a
+  // code-exec tool; emit a one-line diagnostic so the state is observable.
+  const hasCodeExecTools = ir.tools.some(
+    (t) => t === "python" || t === "javascript" || t === "shell",
+  );
+  const sandboxAvailable = resolveSandboxAvailable();
+  if (hasCodeExecTools) {
+    if (!sandboxAvailable) {
+      process.stdout.write(
+        "[sandbox] disabled (CREWHAUS_SANDBOX=noop) — python/javascript/shell calls will be denied by the sandbox floor\n",
+      );
+    } else if (process.env["CREWHAUS_SANDBOX"] === undefined) {
+      process.stdout.write(
+        "[sandbox] assuming docker — set CREWHAUS_SANDBOX (docker|podman) to select a backend, or CREWHAUS_SANDBOX=noop to disable code execution\n",
+      );
+    } else {
+      process.stdout.write(
+        `[sandbox] backend "${process.env["CREWHAUS_SANDBOX"]}" — python/javascript/shell enabled (still require an alwaysAllow rule)\n`,
+      );
+    }
+  }
+
   try {
     await runChatLoop({
       model,
@@ -1828,6 +1884,7 @@ async function runRunCli(
       hooks,
       skills,
       slashCommands,
+      ...(hasCodeExecTools ? { sandboxAvailable } : {}),
       ...(subAgents !== undefined ? { subAgents, spawnSubAgent } : {}),
       ...(ir.target === "cli" && ir.agent.maxTokens !== undefined
         ? { maxTokens: ir.agent.maxTokens }
