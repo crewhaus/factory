@@ -737,6 +737,9 @@ import {
   buildRightSizeReport,
   enumerateSlotCandidates,
 } from "./right-size";
+// Adaptive model routing — `crewhaus route status|reset` inspects/clears the
+// per-(routeKey, model) reward scoreboard behind `agent.model_pool`.
+import { runRoute } from "./route";
 // Item 13 — `crewhaus scaffold-evals` + `init --with-evals`: day-one eval
 // assets generated from the spec (deterministic template / one-shot model
 // sample stubs + a single spec-goal llm_judge or floor grader), in a
@@ -2035,6 +2038,8 @@ function usageText(): string {
     "  context --bundle [-o <file>]         emit a single-markdown orientation manifest",
     "       [--factory-root <p>] [--docs-root <p>] [--demos-root <p>]",
     "  cost-summary --session <id>          summarize cost_accrual events for a session",
+    "  route status [--dir <root>]          show the adaptive model_pool reward scoreboard",
+    "  route reset  [--dir <root>]          wipe the scoreboard (default root .crewhaus)",
     "  advise [--session <id> | --all]      mine session logs for spec advice (item 14)",
     "       [--json] [-o <dir>]             writes suggestions.json + report.html (default .crewhaus/advice)",
     "  tools list                           list every builtin tool + its metadata (item 18)",
@@ -14734,6 +14739,16 @@ switch (subcommand) {
     }
     break;
   }
+  case "route":
+    // Adaptive model routing — inspect/reset the reward scoreboard. `runRoute`
+    // throws a plain Error on a bad argument; surface it through die().
+    try {
+      process.stdout.write(`${runRoute(rest)}\n`);
+    } catch (err) {
+      if (err instanceof Error) die(err.message);
+      throw err;
+    }
+    break;
   case "context":
     runContext(parseFor(rest, CONTEXT_SCHEMA));
     break;

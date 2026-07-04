@@ -37,6 +37,8 @@ const PALETTE: Record<TraceEventKind, string> = {
   model_failover: "\x1b[91m", // bright red — a provider switch is a headline
   // Item 26 — two-tier turn-difficulty router picked a tier this turn
   model_tier_route: "\x1b[94m", // bright blue — a routing decision, in the model family
+  // model_pool — the PolicyRouter picked a candidate this turn
+  model_route: "\x1b[94m", // bright blue — a routing decision, in the model family
   // Human feedback channel — a user rating on an assistant turn.
   response_rated: "\x1b[92m", // bright green — a human signal worth spotting
   // Ops item 36 — boot-time self-heal janitor maintenance actions.

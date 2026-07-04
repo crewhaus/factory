@@ -128,6 +128,44 @@ export type IrModelTiers = {
   };
 };
 
+/** One declared candidate in a `model_pool`. */
+export type IrModelPoolCandidate = {
+  readonly model: string;
+  readonly tags: readonly string[];
+};
+
+/**
+ * Adaptive model routing — the N-candidate `model_pool` with a per-turn
+ * selection `policy` (`static` | `heuristic` | `learned`). Carried on the
+ * agent blocks of the routing-capable shapes (cli, channel, managed), mutually
+ * exclusive with `modelTiers`/`modelFallbacks` (enforced in the spec). Absent
+ * when the spec omits `model_pool` — codegen gates on presence so an unset
+ * block leaves bundles byte-identical. `policy` and each candidate's `tags` are
+ * always present (spec defaults them); every other knob is carried verbatim.
+ */
+export type IrModelPool = {
+  readonly candidates: readonly IrModelPoolCandidate[];
+  readonly policy: "static" | "heuristic" | "learned";
+  readonly objective?: {
+    readonly quality?: number;
+    readonly cost?: number;
+    readonly latency?: number;
+  };
+  readonly routing?: {
+    readonly contextTokenThreshold?: number;
+    readonly toolsToDefault?: boolean;
+    readonly firstTurnToDefault?: boolean;
+    readonly priorToolDensityThreshold?: number;
+    readonly strongTag?: string;
+    readonly cheapTag?: string;
+  };
+  readonly learning?: {
+    readonly minSamplesPerArm?: number;
+    readonly costRefUsd?: number;
+    readonly latencyRefMs?: number;
+  };
+};
+
 /**
  * Section 55 (Track A) — named failure taxonomy. Cross-cutting; carried
  * through to runtime-core so `recovery-engine` can consult the user's
@@ -339,6 +377,8 @@ export type IrV0 = {
     readonly circuitBreaker?: IrCircuitBreaker;
     /** Item 26 — two-tier turn-difficulty router. Absent → single-model. */
     readonly modelTiers?: IrModelTiers;
+    /** Adaptive model routing — N-candidate pool. Absent → single-model. */
+    readonly modelPool?: IrModelPool;
   };
   readonly tools: readonly string[];
   readonly toolConfigs: IrToolConfigs;
@@ -609,6 +649,8 @@ export type IrChannelV0 = {
     readonly circuitBreaker?: IrCircuitBreaker;
     /** Item 26 — two-tier turn-difficulty router. Absent → single-model. */
     readonly modelTiers?: IrModelTiers;
+    /** Adaptive model routing — N-candidate pool. Absent → single-model. */
+    readonly modelPool?: IrModelPool;
   };
   readonly tools: readonly string[];
   readonly toolConfigs: IrToolConfigs;
@@ -666,6 +708,8 @@ export type IrManagedV0 = {
     readonly circuitBreaker?: IrCircuitBreaker;
     /** Item 26 — two-tier turn-difficulty router. Absent → single-model. */
     readonly modelTiers?: IrModelTiers;
+    /** Adaptive model routing — N-candidate pool. Absent → single-model. */
+    readonly modelPool?: IrModelPool;
   };
   readonly tenants: readonly IrManagedTenant[];
   readonly permissions: IrPermissions;

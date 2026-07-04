@@ -2575,6 +2575,128 @@ tenants:
   });
 });
 
+describe("lower/emit — adaptive model routing (model_pool)", () => {
+  const CLI_POOL_SPEC = `
+name: pooled
+target: cli
+agent:
+  model: claude-sonnet-5
+  instructions: be helpful
+  model_pool:
+    policy: learned
+    candidates:
+      - model: claude-haiku-4-5
+        tags: [cheap]
+      - model: claude-opus-4-8
+        tags: [strong]
+    objective: { quality: 0.6, cost: 0.3, latency: 0.1 }
+    routing: { contextTokenThreshold: 8000, strongTag: strong }
+    learning: { minSamplesPerArm: 40 }
+`;
+
+  test("lowers cli agent.model_pool verbatim (policy, tags, and defined knobs)", () => {
+    const ir = lower(parseSpec(CLI_POOL_SPEC));
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect(ir.agent.modelPool).toEqual({
+      policy: "learned",
+      candidates: [
+        { model: "claude-haiku-4-5", tags: ["cheap"] },
+        { model: "claude-opus-4-8", tags: ["strong"] },
+      ],
+      objective: { quality: 0.6, cost: 0.3, latency: 0.1 },
+      routing: { contextTokenThreshold: 8000, strongTag: "strong" },
+      learning: { minSamplesPerArm: 40 },
+    });
+  });
+
+  test("defaults flow through: absent policy → heuristic, absent tags → []", () => {
+    const ir = lower(
+      parseSpec(
+        [
+          "name: p",
+          "target: cli",
+          "agent:",
+          "  model: claude-sonnet-5",
+          "  instructions: i",
+          "  model_pool:",
+          "    candidates:",
+          "      - model: claude-haiku-4-5",
+          "      - model: claude-opus-4-8",
+        ].join("\n"),
+      ),
+    );
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect(ir.agent.modelPool?.policy).toBe("heuristic");
+    expect(ir.agent.modelPool?.candidates[0]).toEqual({ model: "claude-haiku-4-5", tags: [] });
+    expect("objective" in (ir.agent.modelPool ?? {})).toBe(false);
+    expect("routing" in (ir.agent.modelPool ?? {})).toBe(false);
+    expect("learning" in (ir.agent.modelPool ?? {})).toBe(false);
+  });
+
+  test("modelPool stays ABSENT from the IR when the spec omits it (back-compat)", () => {
+    const ir = lower(parseSpec(MINIMAL_SPEC));
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect("modelPool" in ir.agent).toBe(false);
+  });
+
+  test("spec/IR/codegen round-trip: compiled cli bundle threads modelPool into runChatLoop", () => {
+    const bundle = compile(CLI_POOL_SPEC);
+    const agentTs = bundle.files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agentTs).toContain("modelPool: {");
+    expect(agentTs).toContain('"policy":"learned"');
+    expect(agentTs).toContain('"model":"claude-haiku-4-5"');
+  });
+
+  test("channel + managed agent blocks lower model_pool too", () => {
+    const channelIr = lower(
+      parseSpec(
+        [
+          "name: hc",
+          "target: channel",
+          "agent:",
+          "  model: claude-sonnet-5",
+          "  instructions: bot",
+          "  model_pool:",
+          "    candidates:",
+          "      - model: claude-haiku-4-5",
+          "      - model: claude-opus-4-8",
+          "channels:",
+          "  slack:",
+          "    botToken: $SLACK_BOT_TOKEN",
+          "    signingSecret: $SLACK_SIGNING_SECRET",
+          "routing:",
+          "  sessionKey: thread",
+        ].join("\n"),
+      ),
+    );
+    if (channelIr.target !== "channel") throw new Error("unexpected target");
+    expect(channelIr.agent.modelPool?.candidates.length).toBe(2);
+
+    const managedIr = lower(
+      parseSpec(
+        [
+          "name: mg",
+          "target: managed",
+          "agent:",
+          "  model: claude-sonnet-5",
+          "  instructions: i",
+          "  model_pool:",
+          "    candidates:",
+          "      - model: claude-haiku-4-5",
+          "      - model: claude-opus-4-8",
+          "tenants:",
+          "  - id: t1",
+          "    budget:",
+          "      maxInputTokens: 1000",
+          "      maxOutputTokens: 2000",
+        ].join("\n"),
+      ),
+    );
+    if (managedIr.target !== "managed") throw new Error("unexpected target");
+    expect(managedIr.agent.modelPool?.policy).toBe("heuristic");
+  });
+});
+
 describe("lower/emit — switch-model recovery action + failureTaxonomy codegen (item 23)", () => {
   const SWITCH_MODEL_SPEC = `
 name: resilient

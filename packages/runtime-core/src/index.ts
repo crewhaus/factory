@@ -1,3 +1,4 @@
+import { dirname as pathDirname } from "node:path";
 import * as readline from "node:readline/promises";
 import type Anthropic from "@anthropic-ai/sdk";
 import { type AbortTree, createAbortTree } from "@crewhaus/abort-controller";
@@ -17,7 +18,12 @@ import { classifyBoundary, setDefaultBoundaryLlmClassifier } from "@crewhaus/bou
 import { type WrappedAdapter, wrap as wrapWithCircuitBreaker } from "@crewhaus/circuit-breaker";
 import { autoCompact } from "@crewhaus/compaction-autocompact";
 import { snip } from "@crewhaus/compaction-snip";
-import { createCostTracker } from "@crewhaus/cost-tracker";
+import {
+  DEFAULT_PRICING,
+  computeCostMicros,
+  createCostTracker,
+  resolvePricing,
+} from "@crewhaus/cost-tracker";
 import {
   type EgressMatcher,
   type EgressVerdict,
@@ -30,9 +36,12 @@ import { type EventKind, type EventLog, openEventLog } from "@crewhaus/event-log
 import { type HookDef, type HookEvent, aggregateDecisions, runHooks } from "@crewhaus/hooks-engine";
 import {
   type FailoverChain,
+  type PolicyRouter,
+  type PoolCandidate,
   type ResolvedTier,
   type TierRouter,
   createFailoverChain,
+  createPolicyRouter,
   createTierRouter,
   parseModelString,
   resolveModel,
@@ -61,6 +70,12 @@ import {
   initialRecoveryState,
   recover,
 } from "@crewhaus/recovery-engine";
+import {
+  type RewardConfig,
+  type Scoreboard,
+  computeReward,
+  openScoreboard,
+} from "@crewhaus/routing-store";
 import { type RunContext, createRunContext, tagContent } from "@crewhaus/run-context";
 import { type SessionStore, createSessionStore } from "@crewhaus/session-store";
 import { type SkillRef, formatSkillsForPrompt } from "@crewhaus/skills-registry";
@@ -769,6 +784,52 @@ export type RunChatLoopOptions = {
    */
   _tierAdapters?: ReadonlyMap<string, ProviderAdapter>;
   /**
+   * Adaptive model routing (spec `agent.model_pool`). When set, every
+   * candidate adapter resolves at boot and each turn a `PolicyRouter` selects
+   * one from deterministic signals (`static`/`heuristic`) or the durable reward
+   * scoreboard (`learned`), publishing a `model_route` trace event. After each
+   * turn the observed outcome (success, latency, cost) is folded into the
+   * scoreboard so selection improves the more the harness runs. Mutually
+   * exclusive with `modelTiers`/`modelFallbacks` (enforced in the spec); the
+   * pool takes precedence if all are somehow set. Absent → single-model path.
+   */
+  modelPool?: {
+    readonly candidates: ReadonlyArray<{
+      readonly model: string;
+      readonly tags: readonly string[];
+    }>;
+    readonly policy: "static" | "heuristic" | "learned";
+    readonly objective?: {
+      readonly quality?: number;
+      readonly cost?: number;
+      readonly latency?: number;
+    };
+    readonly routing?: {
+      readonly contextTokenThreshold?: number;
+      readonly toolsToDefault?: boolean;
+      readonly firstTurnToDefault?: boolean;
+      readonly priorToolDensityThreshold?: number;
+      readonly strongTag?: string;
+      readonly cheapTag?: string;
+    };
+    readonly learning?: {
+      readonly minSamplesPerArm?: number;
+      readonly costRefUsd?: number;
+      readonly latencyRefMs?: number;
+    };
+  };
+  /**
+   * Test injection for the pool candidate adapters, keyed by their spec model
+   * string (mirrors `_tierAdapters`). Production callers leave it undefined.
+   */
+  _poolAdapters?: ReadonlyMap<string, ProviderAdapter>;
+  /**
+   * Test injection for the reward scoreboard. Production callers leave it
+   * undefined (the runtime opens a file-backed scoreboard beside the sessions
+   * dir); tests inject an in-memory or tmp-dir instance to assert learning.
+   */
+  _scoreboard?: Scoreboard;
+  /**
    * Section 55 (Track A) / item 23 — the spec's `failure_taxonomy`, lowered
    * from the IR. Consulted by `recovery-engine.recover()` BEFORE its
    * built-in classify+recover flow so user-named error classes take
@@ -934,6 +995,32 @@ function bestEffortWireModelId(modelString: string): string {
   } catch {
     return modelString;
   }
+}
+
+/**
+ * A short, stable fingerprint of a `model_pool` config, stamped on every
+ * `model_route` event as `policyVersion` so a learned decision can be tied back
+ * to the exact policy that made it. Deterministic (djb2 over the candidate
+ * roster + policy + objective) — no clock, no randomness.
+ */
+function poolFingerprint(pool: {
+  readonly candidates: ReadonlyArray<{ readonly model: string; readonly tags: readonly string[] }>;
+  readonly policy: string;
+  readonly objective?: {
+    readonly quality?: number;
+    readonly cost?: number;
+    readonly latency?: number;
+  };
+}): string {
+  const canonical = JSON.stringify({
+    p: pool.policy,
+    c: pool.candidates.map((c) => [c.model, [...c.tags].sort()]),
+    o: pool.objective ?? null,
+  });
+  let hash = 5381;
+  for (let i = 0; i < canonical.length; i++)
+    hash = ((hash << 5) + hash + canonical.charCodeAt(i)) >>> 0;
+  return `pool-${hash.toString(36)}`;
 }
 
 export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
@@ -1121,6 +1208,93 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // Housekeeping side-effect: evicts any session whose mtime is older than
   // the TTL (default 30 days). The returned list is intentionally discarded.
   await sessionStore.list();
+
+  // Adaptive model routing (spec `agent.model_pool`). Resolve every candidate
+  // adapter ONCE at boot (mirroring the tier router), open the durable reward
+  // scoreboard beside the sessions dir, and build the PolicyRouter. The
+  // scoreboard is opened whenever a pool is present — not just for `learned` —
+  // so `route status` has data and a later switch to `learned` inherits the
+  // accumulated history. `recordPoolOutcome`/`poolCostUsd` fold each turn's
+  // observed result back in; they no-op when no pool is active.
+  let poolRouter: PolicyRouter | undefined;
+  let scoreboard: Scoreboard | undefined;
+  let rewardConfig: RewardConfig | undefined;
+  let poolPolicyVersion: string | undefined;
+  if (opts.modelPool !== undefined) {
+    const pool = opts.modelPool;
+    const candidates: PoolCandidate[] = [];
+    for (const c of pool.candidates) {
+      const injected = opts._poolAdapters?.get(c.model);
+      if (injected !== undefined) {
+        candidates.push({
+          adapter: injected,
+          modelId: bestEffortWireModelId(c.model),
+          modelString: c.model,
+          tags: c.tags,
+        });
+      } else {
+        const r = await resolveModel(c.model);
+        candidates.push({
+          adapter: r.adapter,
+          modelId: r.modelId,
+          modelString: c.model,
+          tags: c.tags,
+        });
+      }
+    }
+    const routingRoot = sessionRootDir !== undefined ? pathDirname(sessionRootDir) : ".crewhaus";
+    scoreboard = opts._scoreboard ?? openScoreboard(routingRoot);
+    const sb = scoreboard;
+    rewardConfig = {
+      ...(pool.objective !== undefined ? { objective: pool.objective } : {}),
+      ...(pool.learning?.costRefUsd !== undefined ? { costRefUsd: pool.learning.costRefUsd } : {}),
+      ...(pool.learning?.latencyRefMs !== undefined
+        ? { latencyRefMs: pool.learning.latencyRefMs }
+        : {}),
+    };
+    poolPolicyVersion = poolFingerprint(pool);
+    poolRouter = createPolicyRouter({
+      candidates,
+      policy: pool.policy,
+      ...(pool.routing !== undefined ? { routing: pool.routing } : {}),
+      ...(pool.learning?.minSamplesPerArm !== undefined
+        ? { learning: { minSamplesPerArm: pool.learning.minSamplesPerArm } }
+        : {}),
+      // The learned policy reads the live scoreboard; static/heuristic ignore it.
+      ...(pool.policy === "learned" ? { score: (rk, m) => sb.score(rk, m) } : {}),
+    });
+  }
+  // Fold one turn's observed outcome into the scoreboard (no-op without a pool).
+  const recordPoolOutcome = (
+    turn: { readonly modelString: string; readonly routeKey: string } | undefined,
+    obs: { readonly success: boolean; readonly latencyMs: number; readonly costUsd?: number },
+  ): void => {
+    // Capture into consts so the narrowing survives (they are closed-over lets).
+    const sb = scoreboard;
+    const rc = rewardConfig;
+    if (turn === undefined || sb === undefined || rc === undefined) return;
+    sb.record(turn.routeKey, turn.modelString, computeReward(obs, rc), obs);
+  };
+  // Per-turn USD cost from token usage + the static pricing table. Undefined
+  // when the served model isn't on the table (the reward then drops the cost
+  // term and reweights over quality + latency).
+  const poolCostUsd = (
+    provider: ProviderId,
+    wireModelId: string,
+    usage: { input: number; output: number; cacheRead?: number; cacheCreate?: number },
+  ): number | undefined => {
+    const row = resolvePricing(DEFAULT_PRICING, provider, wireModelId);
+    if (row === undefined) return undefined;
+    return (
+      computeCostMicros(
+        row,
+        usage.input,
+        usage.output,
+        usage.cacheRead ?? 0,
+        usage.cacheCreate ?? 0,
+      ) / 1_000_000
+    );
+  };
 
   let sessionId: string;
   let resumedMessages: Anthropic.MessageParam[] | undefined;
@@ -2268,6 +2442,10 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     let thisTurnToolUseCount = 0;
     let escalateTier = false;
     let servedFastTier = false;
+    // Adaptive model routing — once a pool candidate fails, stick with the
+    // strongest candidate for the rest of the run (misroute recovery, mirroring
+    // the tier router's fast→default escalation latch).
+    let escalatePool = false;
 
     while (state.kind !== "Done") {
       if (turnAbort.signal.aborted) {
@@ -2307,6 +2485,10 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           // gap before the model responds now shows live progress. Cleared in
           // the catch below on any model-call error.
           out.spinner.start("thinking", { prefix: "agent> " });
+          // Adaptive model routing — declared OUTSIDE the try so the catch can
+          // read the chosen candidate + start time to record a failure reward.
+          let poolTurn: { readonly modelString: string; readonly routeKey: string } | undefined;
+          let modelCallStartMs = performance.now();
           try {
             // Section 27 — rate-limit the model call before opening the
             // stream. The keys are caller-configured (typically
@@ -2335,13 +2517,54 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             // The adapter this turn streams through: the primary/chain by
             // default, or a tier adapter when the two-tier router is active.
             let turnAdapter: ProviderAdapter = adapter;
-            // Item 26 — two-tier turn-difficulty router. Pick a tier from
-            // DETERMINISTIC per-turn signals (context size, tools-in-play,
-            // turn index, prior-turn tool_use density); a fast-tier misroute
-            // recovery forces `default` (see the catch below). Publish the
-            // decision as a `model_tier_route` event, then stream through the
-            // chosen tier's already-resolved adapter.
-            if (tierRouter !== undefined) {
+            // Adaptive model routing — the PolicyRouter picks a pool candidate
+            // this turn (static / heuristic / learned) from the SAME
+            // deterministic signals as the tier router. `escalatePool` forces
+            // the strongest candidate after a prior pool failure (misroute
+            // recovery). Publish a `model_route` event and stream through the
+            // chosen candidate; the outcome is folded into the reward
+            // scoreboard post-turn. Takes precedence over the tier router (the
+            // two are mutually exclusive in the spec).
+            if (poolRouter !== undefined) {
+              const base = poolRouter.route({
+                contextTokens: estimateTokens(messages),
+                toolsInPlay: (anthropicTools?.length ?? 0) > 0,
+                turnIndex: Math.max(0, runContext.turnNumber - 1),
+                priorTurnToolUseCount,
+              });
+              const decision = escalatePool
+                ? {
+                    ...base,
+                    candidate: poolRouter.escalation(),
+                    reason: `escalated to strongest candidate after a pool failure (was: ${base.reason})`,
+                    explored: false,
+                  }
+                : base;
+              turnAdapter = decision.candidate.adapter;
+              reqWireModelId = decision.candidate.modelId;
+              reqProviderId = decision.candidate.adapter.providerId;
+              reqSpecModel = decision.candidate.modelString;
+              poolTurn = {
+                modelString: decision.candidate.modelString,
+                routeKey: decision.routeKey,
+              };
+              bus.publish({
+                ...bus.envelope(),
+                kind: "model_route",
+                routeKey: decision.routeKey,
+                model: decision.candidate.modelId,
+                policy: decision.policy,
+                reason: decision.reason,
+                ...(decision.explored ? { explored: true } : {}),
+                ...(poolPolicyVersion !== undefined ? { policyVersion: poolPolicyVersion } : {}),
+              });
+            } else if (tierRouter !== undefined) {
+              // Item 26 — two-tier turn-difficulty router. Pick a tier from
+              // DETERMINISTIC per-turn signals (context size, tools-in-play,
+              // turn index, prior-turn tool_use density); a fast-tier misroute
+              // recovery forces `default` (see the catch below). Publish the
+              // decision as a `model_tier_route` event, then stream through the
+              // chosen tier's already-resolved adapter.
               const decision = escalateTier
                 ? { tier: "default" as const, reason: "escalated after fast-tier failure" }
                 : tierRouter.route({
@@ -2379,6 +2602,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               streaming: opts.streaming === true,
             });
             const t0Model = performance.now();
+            modelCallStartMs = t0Model;
             let streamChunkIndex = 0;
 
             // Section 17 — `adapter.stream(req)` returns
@@ -2486,9 +2710,18 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               // Item 22 — lastServed() is exact: the candidate that actually
               // streamed this response. Cost-tracker prices off this pair.
               const servedStreaming = failoverChain?.lastServed();
-              const respModelIdS = servedStreaming?.modelId ?? wireModelId;
+              // With a pool, the served identity is the chosen candidate (no
+              // failover chain when pooling), so cost-tracker prices on it.
+              const respModelIdS =
+                poolTurn !== undefined ? reqWireModelId : (servedStreaming?.modelId ?? wireModelId);
               const respSpecModelS =
-                servedStreaming?.modelString ?? degradedSpecModel ?? opts.model;
+                poolTurn !== undefined
+                  ? poolTurn.modelString
+                  : (servedStreaming?.modelString ?? degradedSpecModel ?? opts.model);
+              const respProviderS =
+                poolTurn !== undefined
+                  ? reqProviderId
+                  : (servedStreaming?.providerId ?? providerId);
               bus.publish({
                 ...bus.envelope(),
                 spanId: modelStartEnv.spanId,
@@ -2497,11 +2730,21 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 // pricing on this field (see the model_request publish above).
                 model: respModelIdS,
                 ...(respSpecModelS !== respModelIdS ? { specModel: respSpecModelS } : {}),
-                provider: servedStreaming?.providerId ?? providerId,
+                provider: respProviderS,
                 stopReason: stopReason ?? "end_turn",
                 usage,
                 durationMs: performance.now() - t0Model,
               });
+              // Adaptive model routing — fold this successful turn into the
+              // reward scoreboard so the learned policy improves next run.
+              if (poolTurn !== undefined) {
+                const costUsd = poolCostUsd(respProviderS, respModelIdS, usage);
+                recordPoolOutcome(poolTurn, {
+                  success: true,
+                  latencyMs: performance.now() - t0Model,
+                  ...(costUsd !== undefined ? { costUsd } : {}),
+                });
+              }
               await fireHook("post-model", {
                 streaming: true,
                 contentBlocks: finalContent.length,
@@ -2563,8 +2806,15 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             // Item 22 — lastServed() is exact: the candidate that actually
             // streamed this response. Cost-tracker prices off this pair.
             const servedCandidate = failoverChain?.lastServed();
-            const respWireModelId = servedCandidate?.modelId ?? wireModelId;
-            const respSpecModel = servedCandidate?.modelString ?? degradedSpecModel ?? opts.model;
+            // With a pool, the served identity is the chosen candidate.
+            const respWireModelId =
+              poolTurn !== undefined ? reqWireModelId : (servedCandidate?.modelId ?? wireModelId);
+            const respSpecModel =
+              poolTurn !== undefined
+                ? poolTurn.modelString
+                : (servedCandidate?.modelString ?? degradedSpecModel ?? opts.model);
+            const respProvider =
+              poolTurn !== undefined ? reqProviderId : (servedCandidate?.providerId ?? providerId);
             bus.publish({
               ...bus.envelope(),
               spanId: modelStartEnv.spanId,
@@ -2573,11 +2823,21 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               // pricing on this field (see the model_request publish above).
               model: respWireModelId,
               ...(respSpecModel !== respWireModelId ? { specModel: respSpecModel } : {}),
-              provider: servedCandidate?.providerId ?? providerId,
+              provider: respProvider,
               stopReason: final.stopReason,
               usage: final.usage,
               durationMs: performance.now() - t0Model,
             });
+            // Adaptive model routing — fold this successful turn into the
+            // reward scoreboard so the learned policy improves next run.
+            if (poolTurn !== undefined) {
+              const costUsd = poolCostUsd(respProvider, respWireModelId, final.usage);
+              recordPoolOutcome(poolTurn, {
+                success: true,
+                latencyMs: performance.now() - t0Model,
+                ...(costUsd !== undefined ? { costUsd } : {}),
+              });
+            }
 
             // Persist the assistant turn. On a clean stop the FULL content-block
             // array is committed so subsequent `tool_result` references resolve.
@@ -2656,6 +2916,20 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             // actions — a retry/continue now streams on the sturdier tier.
             if (tierRouter !== undefined && servedFastTier) {
               escalateTier = true;
+            }
+            // Adaptive model routing — record the failed candidate as a
+            // negative reward (drops the cost term: no usage on a throw) and
+            // latch the escalation so the recovery retry re-runs on the
+            // strongest candidate, unless the failed candidate WAS already the
+            // strongest (then escalation buys nothing).
+            if (poolRouter !== undefined && poolTurn !== undefined) {
+              recordPoolOutcome(poolTurn, {
+                success: false,
+                latencyMs: performance.now() - modelCallStartMs,
+              });
+              if (poolTurn.modelString !== poolRouter.escalation().modelString) {
+                escalatePool = true;
+              }
             }
             const errObj = err as { name?: unknown; message?: unknown };
             const errorName = typeof errObj.name === "string" ? errObj.name : "Error";

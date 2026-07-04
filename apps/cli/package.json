@@ -73,6 +73,7 @@
     "@crewhaus/pii-redactor": "workspace:*",
     "@crewhaus/prompt-injection-detector": "workspace:*",
     "@crewhaus/regression-runner": "workspace:*",
+    "@crewhaus/routing-store": "workspace:*",
     "@crewhaus/run-context": "workspace:*",
     "@crewhaus/runtime-core": "workspace:*",
     "@crewhaus/secrets-manager": "workspace:*",

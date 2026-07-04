@@ -531,6 +531,34 @@ export type ModelTierRouteEvent = TraceEventEnvelope & {
   escalated?: boolean;
 };
 
+/**
+ * `model_pool` — emitted by the PolicyRouter each turn, BEFORE the model call,
+ * recording which pool candidate was selected and WHY. The generalisation of
+ * `model_tier_route` (two rungs) to N declared candidates with a selection
+ * `policy`. Deterministic and replayable: for `static`/`heuristic` from the
+ * turn's signals alone, and for `learned` from the persisted reward scoreboard
+ * plus those signals.
+ *
+ * `routeKey` is the learning bucket the decision keys on (`"hard"` | `"easy"`);
+ * `model` is the wire model id it resolved to; `policy` is the active pool
+ * policy; `reason` is the human-readable trigger. `explored` is true when the
+ * learned policy chose an under-sampled arm to gather data on it (rather than
+ * exploiting the current best). `policyVersion` fingerprints the pool config so
+ * a learned decision can be tied back to the exact policy that made it.
+ */
+export type ModelRouteEvent = TraceEventEnvelope & {
+  kind: "model_route";
+  routeKey: string;
+  /** Wire model id the chosen candidate resolved to. */
+  model: string;
+  policy: "static" | "heuristic" | "learned";
+  reason: string;
+  /** True when the learned policy is exploring an under-sampled arm. */
+  explored?: boolean;
+  /** Fingerprint of the pool config that produced this decision. */
+  policyVersion?: string;
+};
+
 export type TraceEvent =
   | TurnStartEvent
   | TurnEndEvent
@@ -557,6 +585,7 @@ export type TraceEvent =
   | CircuitStateChangedEvent
   | ModelFailoverEvent
   | ModelTierRouteEvent
+  | ModelRouteEvent
   | JanitorActionEvent
   | ResponseRatedEvent
   | TestVerdictEvent

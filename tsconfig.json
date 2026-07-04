@@ -180,6 +180,7 @@
     { "path": "./packages/queue-consumer" },
     { "path": "./packages/queue-protocol" },
     { "path": "./packages/report-writer" },
+    { "path": "./packages/routing-store" },
     { "path": "./packages/run-context" },
     { "path": "./packages/session-store" },
     { "path": "./packages/smoke-harness" },

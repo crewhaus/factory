@@ -27,3 +27,15 @@ export type {
   TierSignals,
 } from "./tier-router.js";
 export { createTierRouter, pickTier } from "./tier-router.js";
+export type {
+  ArmScore,
+  PolicyDecision,
+  PolicyRouter,
+  PolicyRouterOptions,
+  PoolCandidate,
+  PoolLearningConfig,
+  PoolPolicy,
+  PoolRoutingConfig,
+  ScoreLookup,
+} from "./policy-router.js";
+export { createPolicyRouter } from "./policy-router.js";

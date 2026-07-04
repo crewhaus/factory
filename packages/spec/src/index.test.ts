@@ -1768,3 +1768,164 @@ describe("run-level budget cap block (item 27)", () => {
     ).toThrow();
   });
 });
+
+describe("parseSpec agent.model_pool", () => {
+  const withPool = (poolYaml: string) =>
+    parseSpec(
+      [
+        "name: pooled",
+        "target: cli",
+        "agent:",
+        "  model: claude-sonnet-5",
+        "  instructions: be helpful",
+        ...poolYaml.split("\n"),
+      ].join("\n"),
+    );
+
+  test("parses a valid pool; tags default to [] and policy to heuristic", () => {
+    const spec = withPool(
+      [
+        "  model_pool:",
+        "    candidates:",
+        "      - model: claude-haiku-4-5",
+        "        tags: [cheap, fast]",
+        "      - model: claude-opus-4-8",
+      ].join("\n"),
+    );
+    if (spec.target !== "cli") expect.unreachable();
+    const pool = spec.agent.model_pool;
+    expect(pool).toBeDefined();
+    expect(pool?.candidates.map((c) => c.model)).toEqual(["claude-haiku-4-5", "claude-opus-4-8"]);
+    expect(pool?.candidates[0].tags).toEqual(["cheap", "fast"]);
+    expect(pool?.candidates[1].tags).toEqual([]); // defaulted
+    expect(pool?.policy).toBe("heuristic"); // defaulted
+  });
+
+  test("parses objective / routing / learning knobs", () => {
+    const spec = withPool(
+      [
+        "  model_pool:",
+        "    policy: learned",
+        "    candidates:",
+        "      - model: claude-haiku-4-5",
+        "        tags: [cheap]",
+        "      - model: claude-opus-4-8",
+        "        tags: [strong]",
+        "    objective: { quality: 0.6, cost: 0.3, latency: 0.1 }",
+        "    routing: { contextTokenThreshold: 8000, strongTag: strong, cheapTag: cheap }",
+        "    learning: { minSamplesPerArm: 40, costRefUsd: 0.02, latencyRefMs: 3000 }",
+      ].join("\n"),
+    );
+    if (spec.target !== "cli") expect.unreachable();
+    const pool = spec.agent.model_pool;
+    expect(pool?.policy).toBe("learned");
+    expect(pool?.objective).toEqual({ quality: 0.6, cost: 0.3, latency: 0.1 });
+    expect(pool?.routing?.strongTag).toBe("strong");
+    expect(pool?.learning?.minSamplesPerArm).toBe(40);
+  });
+
+  test("rejects a pool with fewer than two candidates", () => {
+    expect(() =>
+      withPool(["  model_pool:", "    candidates:", "      - model: claude-haiku-4-5"].join("\n")),
+    ).toThrow(SpecParseError);
+  });
+
+  test("rejects an invalid policy", () => {
+    expect(() =>
+      withPool(
+        [
+          "  model_pool:",
+          "    policy: bandit",
+          "    candidates:",
+          "      - model: a",
+          "      - model: b",
+        ].join("\n"),
+      ),
+    ).toThrow(SpecParseError);
+  });
+
+  test("rejects unknown fields inside a candidate (strict)", () => {
+    expect(() =>
+      withPool(
+        [
+          "  model_pool:",
+          "    candidates:",
+          "      - model: a",
+          "        weight: 3",
+          "      - model: b",
+        ].join("\n"),
+      ),
+    ).toThrow(SpecParseError);
+  });
+
+  test("model_pool is mutually exclusive with model_tiers", () => {
+    expect(() =>
+      withPool(
+        [
+          "  model_tiers: { fast: claude-haiku-4-5, default: claude-opus-4-8 }",
+          "  model_pool:",
+          "    candidates:",
+          "      - model: claude-haiku-4-5",
+          "      - model: claude-opus-4-8",
+        ].join("\n"),
+      ),
+    ).toThrow(/mutually exclusive/);
+  });
+
+  test("model_pool is mutually exclusive with model_fallbacks", () => {
+    expect(() =>
+      withPool(
+        [
+          "  model_fallbacks: [claude-opus-4-8]",
+          "  model_pool:",
+          "    candidates:",
+          "      - model: claude-haiku-4-5",
+          "      - model: claude-opus-4-8",
+        ].join("\n"),
+      ),
+    ).toThrow(/mutually exclusive/);
+  });
+
+  test("model_pool is accepted on channel and managed agent blocks", () => {
+    const channel = parseSpec(
+      [
+        "name: pooled-channel",
+        "target: channel",
+        "agent:",
+        "  model: claude-sonnet-5",
+        "  instructions: help",
+        "  model_pool:",
+        "    candidates:",
+        "      - model: claude-haiku-4-5",
+        "      - model: claude-opus-4-8",
+        "channels:",
+        "  slack:",
+        "    botToken: xoxb-test",
+        "    signingSecret: shh",
+        "routing:",
+        "  sessionKey: thread",
+      ].join("\n"),
+    );
+    if (channel.target !== "channel") expect.unreachable();
+    expect(channel.agent.model_pool?.candidates.length).toBe(2);
+
+    const managed = parseSpec(
+      [
+        "name: pooled-managed",
+        "target: managed",
+        "agent:",
+        "  model: claude-sonnet-5",
+        "  instructions: help",
+        "  model_pool:",
+        "    candidates:",
+        "      - model: claude-haiku-4-5",
+        "      - model: claude-opus-4-8",
+        "tenants:",
+        "  - id: acme",
+        "    budget: { maxInputTokens: 1000, maxOutputTokens: 1000 }",
+      ].join("\n"),
+    );
+    if (managed.target !== "managed") expect.unreachable();
+    expect(managed.agent.model_pool?.policy).toBe("heuristic");
+  });
+});
