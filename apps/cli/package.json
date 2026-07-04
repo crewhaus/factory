@@ -2,7 +2,7 @@
   "name": "crewhaus",
   "version": "0.2.0",
   "type": "module",
-  "description": "CrewHaus — the meta-harness compiler for AI agents. Compile one crewhaus.yaml spec into a CLI agent, channel bot, RAG pipeline, multi-agent crew, eval harness, voice or browser agent, and more.",
+  "description": "Open-source compiler for AI agents. Write one crewhaus.yaml; compile it to a CLI, a Slack bot, and an eval harness from the same spec. Apache-2.0.",
   "keywords": [
     "crewhaus",
     "ai",
