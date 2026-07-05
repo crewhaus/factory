@@ -1098,7 +1098,7 @@ export const rulePoolPolicyUpgrade: AdviceRule = (ctx, opts) => {
     {
       id: "pool-policy-upgrade",
       severity: "info",
-      summary: `model_pool scoreboard is ready — flip policy to learned`,
+      summary: "model_pool scoreboard is ready — flip policy to learned",
       evidence: [
         `bands with every candidate ≥${floor} samples: ${ready.join(", ")}`,
         `${totalSamples} routed decisions recorded across ${ctx.routingArms.length} arm(s)`,
