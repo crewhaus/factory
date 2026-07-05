@@ -265,6 +265,110 @@ const modelTiersBlock = z
   .optional();
 
 /**
+ * Adaptive model routing — an opt-in `model_pool` of user-declared candidate
+ * models the runtime selects among PER TURN, with a selection `policy` that can
+ * improve the more the harness runs. The N-candidate generalisation of
+ * `model_tiers` (which is the two-candidate special case), so the two are
+ * mutually exclusive on an agent block (enforced by a refine on each shape).
+ *
+ * The user always declares the SET; the runtime only ever picks WITHIN it —
+ * `agent.model` (and the optimizer's model-path exclusion) is untouched, so
+ * learning tunes selection policy, never the candidate roster.
+ *
+ *   - `candidates` — ≥2 model-router grammar strings, each with free-form
+ *     `tags` (e.g. `cheap`, `strong`) the heuristic routes on. Declare
+ *     cheapest→strongest; tags override that order.
+ *   - `policy` — `static` (first candidate), `heuristic` (deterministic
+ *     difficulty routing, the default), or `learned` (reward-scoreboard arm
+ *     selection that improves with usage).
+ *   - `objective` — weights for the learned reward (quality / cost / latency);
+ *     defaults to quality-dominant (0.7 / 0.2 / 0.1).
+ *   - `routing` — difficulty thresholds (shared with `model_tiers`) plus the
+ *     `strongTag`/`cheapTag` the heuristic prefers.
+ *   - `learning` — read only for `policy: learned`: the per-arm exploration
+ *     floor and the cost/latency reward references.
+ *
+ * Omitted entirely → single-model behaviour, byte-identical bundles.
+ */
+const modelPoolBlock = z
+  .object({
+    candidates: z
+      .array(
+        z
+          .object({
+            model: z.string().min(1),
+            tags: z.array(z.string().min(1)).default([]),
+          })
+          .strict(),
+      )
+      .min(2),
+    policy: z.enum(["static", "heuristic", "learned"]).default("heuristic"),
+    objective: z
+      .object({
+        quality: z.number().min(0).optional(),
+        cost: z.number().min(0).optional(),
+        latency: z.number().min(0).optional(),
+      })
+      .strict()
+      .optional(),
+    routing: z
+      .object({
+        contextTokenThreshold: z.number().int().positive().optional(),
+        toolsToDefault: z.boolean().optional(),
+        firstTurnToDefault: z.boolean().optional(),
+        priorToolDensityThreshold: z.number().int().positive().optional(),
+        strongTag: z.string().min(1).optional(),
+        cheapTag: z.string().min(1).optional(),
+      })
+      .strict()
+      .optional(),
+    learning: z
+      .object({
+        minSamplesPerArm: z.number().int().positive().optional(),
+        costRefUsd: z.number().positive().optional(),
+        latencyRefMs: z.number().int().positive().optional(),
+      })
+      .strict()
+      .optional(),
+  })
+  .strict()
+  .optional();
+
+/**
+ * Mutual-exclusion refine shared by every agent block that carries model
+ * routing: `model_pool` is the superset of both the two-tier router and the
+ * ordered failover chain, so declaring it alongside either is an error rather
+ * than an ambiguous double-route. (Per-candidate failover chains compose in a
+ * later release; this release keeps precedence unambiguous.)
+ */
+function refineModelSelection(
+  agent: {
+    model_pool?: unknown;
+    model_tiers?: unknown;
+    model_fallbacks?: unknown;
+  },
+  ctx: z.RefinementCtx,
+): void {
+  if (agent.model_pool === undefined) return;
+  if (agent.model_tiers !== undefined) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message:
+        "agent.model_pool and agent.model_tiers are mutually exclusive — model_pool is the N-candidate generalisation of the two-tier router",
+      path: ["model_tiers"],
+    });
+  }
+  if (agent.model_fallbacks !== undefined) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message:
+        "agent.model_pool and agent.model_fallbacks are mutually exclusive in this release — per-candidate failover chains are a future addition",
+      path: ["model_fallbacks"],
+    });
+  }
+}
+
+/**
  * Section 17 — optional override for the model used by
  * `compaction-autocompact` when summarising long conversations. Defaults
  * to the agent's primary model when omitted, but you can target a
@@ -683,9 +787,12 @@ const cliSchema = z
         circuit_breaker: circuitBreakerBlock,
         // Item 26 — opt-in two-tier turn-difficulty router.
         model_tiers: modelTiersBlock,
+        // Adaptive model routing — N-candidate pool with a selection policy.
+        model_pool: modelPoolBlock,
         sub_agents: subAgentsBlock,
       })
-      .strict(),
+      .strict()
+      .superRefine(refineModelSelection),
     tools: z.array(z.string().min(1)).optional(),
     tool_config: toolConfigBlock,
     mcp_servers: mcpServersBlock,
@@ -821,11 +928,14 @@ const channelAgentSchema = z
     circuit_breaker: circuitBreakerBlock,
     // Item 26 — opt-in two-tier turn-difficulty router.
     model_tiers: modelTiersBlock,
+    // Adaptive model routing — N-candidate pool with a selection policy.
+    model_pool: modelPoolBlock,
     tools: z.array(z.string().min(1)).optional(),
     tool_config: toolConfigBlock,
     sub_agents: subAgentsBlock,
   })
-  .strict();
+  .strict()
+  .superRefine(refineModelSelection);
 
 const channelSchema = z
   .object({
@@ -926,8 +1036,11 @@ const managedAgentSchema = z
     circuit_breaker: circuitBreakerBlock,
     // Item 26 — opt-in two-tier turn-difficulty router.
     model_tiers: modelTiersBlock,
+    // Adaptive model routing — N-candidate pool with a selection policy.
+    model_pool: modelPoolBlock,
   })
-  .strict();
+  .strict()
+  .superRefine(refineModelSelection);
 
 const managedSchema = z
   .object({
@@ -1427,6 +1540,7 @@ export type SpecCompactionBlock = z.infer<typeof compactionBlock>;
 export type SpecModelFallbacks = z.infer<typeof modelFallbacksBlock>;
 export type SpecCircuitBreakerBlock = z.infer<typeof circuitBreakerBlock>;
 export type SpecModelTiersBlock = z.infer<typeof modelTiersBlock>;
+export type SpecModelPoolBlock = z.infer<typeof modelPoolBlock>;
 export type SpecBudgetBlock = z.infer<typeof budgetBlock>;
 export type SpecSecurityBlock = z.infer<typeof securityBlock>;
 export type SpecFeedbackBlock = z.infer<typeof feedbackBlock>;

@@ -74,6 +74,10 @@ function renderModelFailoverFields(ir: IrManagedV0): string {
   if (ir.agent.modelTiers !== undefined) {
     pieces.push(`\n    modelTiers: ${JSON.stringify(ir.agent.modelTiers)},`);
   }
+  // Adaptive model routing — the N-candidate pool (mirror of target-cli).
+  if (ir.agent.modelPool !== undefined) {
+    pieces.push(`\n    modelPool: ${JSON.stringify(ir.agent.modelPool)},`);
+  }
   return pieces.join("");
 }
 

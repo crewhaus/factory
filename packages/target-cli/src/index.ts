@@ -543,6 +543,7 @@ function renderModelFailoverFields(ir: {
       readonly default: string;
       readonly routing?: Record<string, number | boolean>;
     };
+    readonly modelPool?: unknown;
   };
 }): string {
   const pieces: string[] = [];
@@ -558,6 +559,11 @@ function renderModelFailoverFields(ir: {
   // escaping needed). Absent when unset, keeping bundles byte-identical.
   if (ir.agent.modelTiers !== undefined) {
     pieces.push(`\n  modelTiers: ${JSON.stringify(ir.agent.modelTiers)},`);
+  }
+  // Adaptive model routing — the N-candidate pool. Same JSON.stringify safety
+  // as modelTiers (a plain object literal of validated strings/numbers).
+  if (ir.agent.modelPool !== undefined) {
+    pieces.push(`\n  modelPool: ${JSON.stringify(ir.agent.modelPool)},`);
   }
   return pieces.join("");
 }

@@ -81,6 +81,8 @@ function formatBody(ev: TraceEvent): string {
       return `from=${ev.from} to=${ev.to} reason=${ev.reason}`;
     case "model_tier_route":
       return `tier=${ev.tier} model=${ev.model}${ev.escalated ? " escalated" : ""} reason=${ev.reason}`;
+    case "model_route":
+      return `routeKey=${ev.routeKey} model=${ev.model} policy=${ev.policy}${ev.explored ? " explored" : ""} reason=${ev.reason}`;
     case "janitor_action":
       return `step=${ev.step} status=${ev.status}${ev.count !== undefined ? ` count=${ev.count}` : ""}${
         ev.detail ? ` detail=${ev.detail}` : ""

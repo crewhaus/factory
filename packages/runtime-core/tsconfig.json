@@ -20,6 +20,7 @@
     { "path": "../permission-engine" },
     { "path": "../prompt-injection-detector" },
     { "path": "../recovery-engine" },
+    { "path": "../routing-store" },
     { "path": "../run-context" },
     { "path": "../session-store" },
     { "path": "../skills-registry" },

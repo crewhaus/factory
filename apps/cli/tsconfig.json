@@ -42,6 +42,7 @@
     { "path": "../../packages/migration-runner" },
     { "path": "../../packages/permission-engine" },
     { "path": "../../packages/regression-runner" },
+    { "path": "../../packages/routing-store" },
     { "path": "../../packages/run-context" },
     { "path": "../../packages/runtime-core" },
     { "path": "../../packages/secrets-manager" },

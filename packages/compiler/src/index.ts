@@ -28,6 +28,7 @@ import type {
   IrMcpServerConfig,
   IrMcpServers,
   IrMemory,
+  IrModelPool,
   IrModelTiers,
   IrNode,
   IrObservability,
@@ -510,17 +511,44 @@ type SpecAgentWithFailover = {
       readonly priorToolDensityThreshold?: number;
     };
   };
+  readonly model_pool?: {
+    readonly candidates: ReadonlyArray<{
+      readonly model: string;
+      readonly tags: readonly string[];
+    }>;
+    readonly policy: "static" | "heuristic" | "learned";
+    readonly objective?: {
+      readonly quality?: number;
+      readonly cost?: number;
+      readonly latency?: number;
+    };
+    readonly routing?: {
+      readonly contextTokenThreshold?: number;
+      readonly toolsToDefault?: boolean;
+      readonly firstTurnToDefault?: boolean;
+      readonly priorToolDensityThreshold?: number;
+      readonly strongTag?: string;
+      readonly cheapTag?: string;
+    };
+    readonly learning?: {
+      readonly minSamplesPerArm?: number;
+      readonly costRefUsd?: number;
+      readonly latencyRefMs?: number;
+    };
+  };
 };
 
 function lowerModelFailover(agent: SpecAgentWithFailover): {
   modelFallbacks?: readonly string[];
   circuitBreaker?: IrCircuitBreaker;
   modelTiers?: IrModelTiers;
+  modelPool?: IrModelPool;
 } {
   const out: {
     modelFallbacks?: readonly string[];
     circuitBreaker?: IrCircuitBreaker;
     modelTiers?: IrModelTiers;
+    modelPool?: IrModelPool;
   } = {};
   if (agent.model_fallbacks !== undefined && agent.model_fallbacks.length > 0) {
     out.modelFallbacks = [...agent.model_fallbacks];
@@ -555,6 +583,62 @@ function lowerModelFailover(agent: SpecAgentWithFailover): {
                 : {}),
               ...(routing.priorToolDensityThreshold !== undefined
                 ? { priorToolDensityThreshold: routing.priorToolDensityThreshold }
+                : {}),
+            },
+          }
+        : {}),
+    };
+  }
+  // Adaptive model routing — lower the N-candidate pool. `policy` and each
+  // candidate's `tags` are always present (spec defaults them); every other
+  // knob carries the user's intent verbatim (runtime owns the per-knob
+  // defaults), so only defined optional blocks are attached.
+  const mp = agent.model_pool;
+  if (mp !== undefined) {
+    const objective = mp.objective;
+    const routing = mp.routing;
+    const learning = mp.learning;
+    out.modelPool = {
+      candidates: mp.candidates.map((c) => ({ model: c.model, tags: [...c.tags] })),
+      policy: mp.policy,
+      ...(objective !== undefined
+        ? {
+            objective: {
+              ...(objective.quality !== undefined ? { quality: objective.quality } : {}),
+              ...(objective.cost !== undefined ? { cost: objective.cost } : {}),
+              ...(objective.latency !== undefined ? { latency: objective.latency } : {}),
+            },
+          }
+        : {}),
+      ...(routing !== undefined
+        ? {
+            routing: {
+              ...(routing.contextTokenThreshold !== undefined
+                ? { contextTokenThreshold: routing.contextTokenThreshold }
+                : {}),
+              ...(routing.toolsToDefault !== undefined
+                ? { toolsToDefault: routing.toolsToDefault }
+                : {}),
+              ...(routing.firstTurnToDefault !== undefined
+                ? { firstTurnToDefault: routing.firstTurnToDefault }
+                : {}),
+              ...(routing.priorToolDensityThreshold !== undefined
+                ? { priorToolDensityThreshold: routing.priorToolDensityThreshold }
+                : {}),
+              ...(routing.strongTag !== undefined ? { strongTag: routing.strongTag } : {}),
+              ...(routing.cheapTag !== undefined ? { cheapTag: routing.cheapTag } : {}),
+            },
+          }
+        : {}),
+      ...(learning !== undefined
+        ? {
+            learning: {
+              ...(learning.minSamplesPerArm !== undefined
+                ? { minSamplesPerArm: learning.minSamplesPerArm }
+                : {}),
+              ...(learning.costRefUsd !== undefined ? { costRefUsd: learning.costRefUsd } : {}),
+              ...(learning.latencyRefMs !== undefined
+                ? { latencyRefMs: learning.latencyRefMs }
                 : {}),
             },
           }
