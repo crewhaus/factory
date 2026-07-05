@@ -63,6 +63,18 @@ describe("emitCli — bundle shape", () => {
     expect(content).toContain('sessionName: "my-bot"');
     expect(content).toContain('sessionTarget: "cli"');
   });
+
+  test("compaction.model is threaded into runChatLoop as compactionModel (escaped)", () => {
+    const content =
+      emitCli(baseIr({ compaction: { model: "claude-haiku-4-5-20251001" } })).files[0]?.content ??
+      "";
+    expect(content).toContain('compactionModel: "claude-haiku-4-5-20251001"');
+  });
+
+  test("no compaction.model → no compactionModel field emitted (bundles stay byte-identical)", () => {
+    const content = emitCli(baseIr()).files[0]?.content ?? "";
+    expect(content).not.toContain("compactionModel:");
+  });
 });
 
 describe("emitCli — tool wiring (Section 2)", () => {

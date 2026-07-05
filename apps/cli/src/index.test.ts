@@ -672,6 +672,33 @@ describe("crewhaus doctor", () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("--liveness");
     expect(result.stdout).toContain("model-aware");
+    // Item 40 — the detect/fix surface is documented AND (see below) parseable.
+    expect(result.stdout).toContain("--detect");
+    expect(result.stdout).toContain("--no-probe");
+    expect(result.stdout).toContain("--fix");
+  });
+
+  // Item 40 — regression guard. The detect/fix flags were documented and
+  // dispatched (`if (args.flags["detect"]) …`) but NEVER registered in
+  // DOCTOR_SCHEMA, so the real arg parser rejected them before dispatch:
+  // `crewhaus doctor --detect` died with `unknown flag: --detect`. These spawn
+  // the real CLI so the flags must survive parseFor(rest, DOCTOR_SCHEMA).
+  test("--detect --no-probe parses and prints the inventory block (item 40)", async () => {
+    const result = await runCli(["doctor", "--detect", "--no-probe"], { cwd: tmp, env: {} });
+    expect(result.stderr).not.toContain("unknown flag");
+    // Read-only inventory always exits 0.
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("inventory (what's reachable right now):");
+  });
+
+  test("--fix parses and prints the mechanical fix-plan report (item 40)", async () => {
+    writeFileSync(join(tmp, "crewhaus.yaml"), "name: t\ntarget: cli\n");
+    const result = await runCli(["doctor", "--fix"], {
+      cwd: tmp,
+      env: { ANTHROPIC_API_KEY: "test" },
+    });
+    expect(result.stderr).not.toContain("unknown flag");
+    expect(result.stdout).toContain("doctor --fix:");
   });
 
   // FR-002 — the philosophy-alignment audit now includes a Pillar 3 sink-side

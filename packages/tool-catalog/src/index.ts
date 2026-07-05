@@ -176,6 +176,23 @@ export interface ToolDefinition<TInput = unknown> {
    * (typically `z.unknown()` for MCP).
    */
   jsonSchema?: unknown;
+  /**
+   * Optional per-invocation concurrency classifier. When present, the
+   * orchestrator calls it with the parsed tool input and the sibling
+   * catalog to decide whether THIS specific call may run in parallel with
+   * its siblings, overriding the static `concurrencySafe`/`readOnly`/
+   * `destructive` flags for partitioning only.
+   *
+   * `Task` uses it: a static flag can't express that a dispatch's safety
+   * depends on WHICH sub-agent it spawns, so Task stays statically
+   * `readOnly: false` (never eligible by flags) and opts specific calls
+   * back in here iff the resolved sub-agent's entire effective tool set is
+   * itself read-only + concurrency-safe + non-destructive.
+   *
+   * Must be a pure, synchronous check. It is treated fail-closed: throwing
+   * or returning `false` routes the call serial.
+   */
+  concurrencyClassifier?: (input: unknown, catalog: ReadonlyArray<RegisteredTool>) => boolean;
 }
 
 /** Normalized form stored in the catalog. All flags are required booleans and
@@ -212,6 +229,9 @@ export interface RegisteredTool {
   /** See ToolDefinition.jsonSchema. Optional; runtime-core falls back to
    *  zodToJsonSchema(inputSchema) when absent. */
   jsonSchema?: unknown;
+  /** See ToolDefinition.concurrencyClassifier. Optional; when absent the
+   *  orchestrator partitions on the static concurrency flags alone. */
+  concurrencyClassifier?: (input: unknown, catalog: ReadonlyArray<RegisteredTool>) => boolean;
 }
 
 export class ToolCatalogError extends CrewhausError {
@@ -294,10 +314,16 @@ export class ToolCatalog {
    * active catalog (`has`/`get`/`list` no longer see it) but its definition is
    * stashed for `restore()`. Idempotent: quarantining an already-quarantined
    * tool is a no-op; quarantining a name that is neither live nor quarantined
-   * returns false. The synthetic "this tool is unavailable" notice the model
-   * sees is injected by the runtime (mirroring loop-detection's warning
-   * injection) from `quarantinedNames()`, NOT by this catalog — the catalog
-   * only owns the registration state.
+   * returns false. This catalog only owns the registration state; producing
+   * any "tool unavailable" notice for the model is the caller's job.
+   *
+   * NOTE: as of v0.2.0 this API has no production caller — the shipped
+   * `crewhaus run` quarantine path (apps/cli `runRunCli`) does NOT use it. It
+   * reads the failing-server set from `.crewhaus/mcp/quarantine.json` (written
+   * by `crewhaus mcp doctor`), filters the plain tools array by the
+   * `<server>__` name prefix, and appends a notice built by `mcp-doctor.ts`'s
+   * `quarantineNotice()` to the agent instructions. This method + `restore()`
+   * + `quarantinedNames()` are a catalog-level API awaiting a caller.
    */
   quarantine(name: string, reason: string, now: number = Date.now()): boolean {
     if (this._quarantined.has(name)) return true;
@@ -323,8 +349,9 @@ export class ToolCatalog {
     return true;
   }
 
-  /** Ops item 38 — names of every currently-quarantined tool (for the runtime's
-   *  synthetic-notice injection + `crewhaus mcp doctor`). */
+  /** Ops item 38 — names of every currently-quarantined tool. (Catalog-level
+   *  API; the shipped `crewhaus mcp doctor` / `run` path tracks quarantine via
+   *  `.crewhaus/mcp/quarantine.json` rather than this method — see `quarantine()`.) */
   quarantinedNames(): ReadonlyArray<string> {
     return [...this._quarantined.keys()];
   }

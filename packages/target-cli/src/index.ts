@@ -73,6 +73,10 @@ export const BUILTIN_TOOL_MAP: Record<string, BuiltinToolEntry> = {
   glob: { package: "@crewhaus/tool-fs", export: "glob" },
   grep: { package: "@crewhaus/tool-fs", export: "grep" },
   bash: { package: "@crewhaus/tool-bash", export: "bash" },
+  // Background-shell companions to `bash` (Claude-Code-style long-running
+  // tasks): poll a detached command's output / stop it. Opt-in like any tool.
+  bashOutput: { package: "@crewhaus/tool-bash", export: "bashOutput" },
+  killShell: { package: "@crewhaus/tool-bash", export: "killShell" },
   todoWrite: { package: "@crewhaus/tool-todo", export: "todoWrite" },
   webFetch: {
     package: "@crewhaus/tool-web",
@@ -429,8 +433,11 @@ if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));`;
 
   // Phase 3 §3.3 — CLI banner with optional tagline rotation. Emitted
   // ahead of runChatLoop so users see the brand on cold start. Suppressed
-  // when CREWHAUS_RESUMED=1 (set by --continue/--resume) so resumed
-  // sessions don't re-banner.
+  // when the environment sets CREWHAUS_RESUMED=1. NOTE: nothing in the
+  // toolchain sets that var — `crewhaus run --continue/--resume` drives the
+  // interpreter path, not a compiled bundle, and never touches the env. It
+  // is purely a hook for an external wrapper that re-invokes a compiled
+  // bundle and wants to skip the re-banner on a resumed run.
   const bannerBoot = ir.cli?.banner
     ? `if (process.env.CREWHAUS_RESUMED !== "1") {
   const __taglines = ${JSON.stringify(ir.cli.banner.taglines)};
@@ -454,6 +461,15 @@ if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));`;
     : "";
   const maxTokensField =
     ir.agent.maxTokens !== undefined ? `\n  maxTokens: ${ir.agent.maxTokens},` : "";
+  // Thread `compaction.model` so the compiled bundle's auto-compaction
+  // summarizes on the spec's chosen model. The compiler already resolved the
+  // `cheapest` sentinel to a concrete id, so this is a raw model string
+  // (escaped like `model:`). Empty when the spec omits it, keeping existing
+  // bundles byte-identical.
+  const compactionModelField =
+    ir.compaction.model !== undefined
+      ? `\n  compactionModel: ${escapeJsonString(ir.compaction.model)},`
+      : "";
   // Item 22 — provider failover chain: thread `agent.model_fallbacks` +
   // `agent.circuit_breaker` into the runtime, which constructs the
   // breaker-driven meta-adapter (see @crewhaus/model-router). Emitted only
@@ -474,7 +490,7 @@ if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));`;
   model: ${escapeJsonString(ir.agent.model)},
   instructions: ${escapeJsonString(ir.agent.instructions)},
   sessionName: ${escapeJsonString(ir.name)},
-  sessionTarget: "cli",${maxTokensField}${failoverFields}${failureTaxonomyField}${budgetField}${sloField}${toolsField}${permField}${sandboxField}
+  sessionTarget: "cli",${maxTokensField}${compactionModelField}${failoverFields}${failureTaxonomyField}${budgetField}${sloField}${toolsField}${permField}${sandboxField}
   hooks: __hooks,
   skills: __skills,
   slashCommands: __slashCommands,${subAgents.subAgentsField}${subAgents.spawnField}${egress.field}${memory.field}

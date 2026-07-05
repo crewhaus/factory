@@ -188,9 +188,43 @@ const DEFAULT_CONTEXT_LIMIT = 200_000;
 // agentic turn reaches it, low enough to stop a runaway/injected tool loop
 // before it burns a provider quota.
 const DEFAULT_MAX_TOOL_ITERATIONS = 500;
+// Upper bound on how many concurrency-safe tool calls in one turn run at
+// once. Bounds parallel sub-agent (`Task`) fan-out so a wide dispatch
+// can't open unbounded model connections and trip a provider rate limit;
+// also caps parallel reads, whose per-call cost is negligible. Configurable
+// via `runChatLoop({ maxConcurrentTools })`.
+const DEFAULT_MAX_CONCURRENT_TOOLS = 4;
 const DEFAULT_COMPACTION_THRESHOLD = 0.85;
 const DEFAULT_SNIP_KEEP_HEAD = 4;
 const DEFAULT_SNIP_KEEP_TAIL = 20;
+
+/**
+ * Run `items` through `fn` with at most `limit` in flight at once,
+ * preserving input order in the returned results. A pool of `limit`
+ * workers pull from a shared cursor, so a slow item never blocks a fast
+ * one behind it (unlike fixed-size `Promise.all` chunks). `limit <= 0`
+ * is clamped to 1; a limit larger than the batch just runs everything.
+ * Exported for unit testing of the concurrency bound.
+ */
+export async function mapWithConcurrency<T, R>(
+  items: ReadonlyArray<T>,
+  limit: number,
+  fn: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  const bound = Math.max(1, Math.min(limit, items.length));
+  let cursor = 0;
+  const worker = async (): Promise<void> => {
+    while (true) {
+      const i = cursor;
+      cursor += 1;
+      if (i >= items.length) return;
+      results[i] = await fn(items[i] as T, i);
+    }
+  };
+  await Promise.all(Array.from({ length: bound }, () => worker()));
+  return results;
+}
 
 // Section 17 — `resolveAuth` / `createAnthropicClient` / `ResolvedAuth` /
 // `OAUTH_BETAS` / `CLAUDE_CODE_HEADERS` / `CLAUDE_CODE_SYSTEM_PREFIX`
@@ -724,6 +758,14 @@ export type RunChatLoopOptions = {
    * agentic turns, or lower to tighten.
    */
   maxToolIterations?: number;
+  /**
+   * Max number of concurrency-safe tool calls executed in parallel within
+   * a single turn. Chiefly bounds parallel sub-agent (`Task`) fan-out so a
+   * wide dispatch can't open unbounded model connections; parallel reads
+   * are also capped but their per-call cost is negligible. Defaults to
+   * `DEFAULT_MAX_CONCURRENT_TOOLS` (4). `<= 0` is clamped to 1 (serial).
+   */
+  maxConcurrentTools?: number;
   /**
    * Section 27 / item 22 — wrap the resolved primary `ProviderAdapter` in a
    * circuit breaker before any `stream()` call. When the breaker trips,
@@ -2370,10 +2412,15 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   async function runToolBatch(
     toolUses: ReadonlyArray<TsmToolUseBlock>,
   ): Promise<Anthropic.ToolResultBlockParam[]> {
-    const partition = partitionToolCalls(toolUses, (n) => toolByName.get(n));
+    // Pass the full catalog so per-call classifiers (Task) can resolve a
+    // dispatch's child tool set; without it, classifier-based tools stay
+    // serial (fail-closed).
+    const partition = partitionToolCalls(toolUses, (n) => toolByName.get(n), tools);
+    const maxConcurrentTools = opts.maxConcurrentTools ?? DEFAULT_MAX_CONCURRENT_TOOLS;
     runContext.logger.debug("tool partition", {
       concurrent: partition.concurrent.map((b) => b.length),
       serial: partition.serial.length,
+      maxConcurrentTools,
     });
     // Map each tool_use's identity to its slot in the original order so
     // results can be placed back in order regardless of the
@@ -2385,7 +2432,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     toolUses.forEach((tu, idx) => indexByBlock.set(tu, idx));
     const results = new Array<Anthropic.ToolResultBlockParam>(toolUses.length);
     for (const batch of partition.concurrent) {
-      const settled = await Promise.all(batch.map((tu) => executeOneToolUse(tu)));
+      const settled = await mapWithConcurrency(batch, maxConcurrentTools, (tu) =>
+        executeOneToolUse(tu),
+      );
       batch.forEach((tu, i) => {
         // biome-ignore lint/style/noNonNullAssertion: every block came from toolUses, so its index is registered.
         results[indexByBlock.get(tu)!] = settled[i] as Anthropic.ToolResultBlockParam;
@@ -2665,6 +2714,10 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                   toolByName,
                   abortSignal: turnAbort.signal,
                   onTextDelta,
+                  // Honor the same concurrency bound as the non-streaming
+                  // path — otherwise `maxConcurrentTools` would be silently
+                  // ignored under `streaming: true`.
+                  maxConcurrent: opts.maxConcurrentTools ?? DEFAULT_MAX_CONCURRENT_TOOLS,
                   runTool: (block) =>
                     executeOneToolUse({
                       id: block.id,

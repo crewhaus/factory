@@ -265,6 +265,17 @@ function renderBudgetField(ir: IrChannelV0): string {
   return `\n        budget: ${JSON.stringify(ir.budget)},`;
 }
 
+/**
+ * Thread `compaction.model` so a channel bot's auto-compaction summarizes on
+ * the spec's chosen model instead of the primary. The compiler already
+ * resolved the `cheapest` sentinel to a concrete id. Empty when omitted.
+ * Mirror: target-cli renders the same field.
+ */
+function renderCompactionModelField(ir: IrChannelV0): string {
+  if (ir.compaction.model === undefined) return "";
+  return `\n        compactionModel: ${escapeJsonString(ir.compaction.model)},`;
+}
+
 function renderPermissionsField(ir: IrChannelV0): string {
   const { mode, rules } = ir.permissions;
   if (mode === undefined && rules.length === 0) return "";
@@ -437,7 +448,7 @@ export function createAgent(config: AgentConfig): Agent {
       const __inbound = await classifyInbound(args.message, runContext, { origin: "channel" });
       return await runChatLoop({
         model: ${escapeJsonString(ir.agent.model)},
-        instructions: ${escapeJsonString(ir.agent.instructions)},${renderModelFailoverFields(ir)}${renderFailureTaxonomyField(ir)}${renderBudgetField(ir)}
+        instructions: ${escapeJsonString(ir.agent.instructions)},${renderModelFailoverFields(ir)}${renderFailureTaxonomyField(ir)}${renderBudgetField(ir)}${renderCompactionModelField(ir)}
         sessionName: ${escapeJsonString(ir.name)},
         sessionTarget: "channel",
         ...(config.sessionRootDir !== undefined ? { sessionRootDir: config.sessionRootDir } : {}),

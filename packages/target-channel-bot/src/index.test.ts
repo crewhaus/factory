@@ -286,6 +286,17 @@ describe("emitChannelBot — agent.ts", () => {
     expect(c).toContain('sessionName: "demo"');
   });
 
+  test("threads compaction.model into runChatLoop as compactionModel (escaped); omitted when absent", () => {
+    const withModel: IrChannelV0 = {
+      ...MIN_IR,
+      compaction: { model: "claude-haiku-4-5-20251001" },
+    };
+    const c = fileMap(withModel).get("agent.ts") ?? "";
+    expect(c).toContain('compactionModel: "claude-haiku-4-5-20251001"');
+    const without = fileMap(MIN_IR).get("agent.ts") ?? "";
+    expect(without).not.toContain("compactionModel:");
+  });
+
   test("classifies inbound channel text at the boundary before seeding the model (Pillar 3, FR-005)", () => {
     const c = fileMap(MIN_IR).get("agent.ts") ?? "";
     // Imports the channel boundary chokepoint.

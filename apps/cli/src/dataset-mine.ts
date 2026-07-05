@@ -260,8 +260,9 @@ export type EgressBlock = {
 
 /**
  * Extract egress-block candidates from parsed audit records. The audit log MAY
- * carry no `egress_decision` records at all (no writer yet) — this returns []
- * in that case. A block is any record whose verdict is not an allow. Because
+ * carry no `egress_decision` records at all (they are written only on warn/block
+ * verdicts) — this returns [] in that case. A block is any record whose verdict
+ * is not an allow. Because
  * the audit payload does not reliably carry a turn input, these become
  * standalone candidates keyed by a best-effort session id + the lineage
  * summary; the CLI attaches them to the matching session's LAST turn input

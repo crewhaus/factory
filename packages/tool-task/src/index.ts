@@ -14,9 +14,19 @@
  *      becomes `instructions`.
  *   3. Built-in `general-purpose` fallback.
  *
- * Concurrency: marked `concurrencySafe: true` because parallel sub-agents
- * are independent — each gets its own IsolatedContext. T7 in
- * sub-agent-spawner exercises 10-way parallelism end-to-end.
+ * Concurrency: a Task dispatch runs in parallel with its siblings ONLY
+ * when the specific sub-agent it spawns is itself entirely read-only —
+ * that per-call decision can't be a static flag, so Task stays statically
+ * `readOnly: false` (never eligible by flags) and supplies a
+ * `concurrencyClassifier` that opts a call back in iff the resolved
+ * sub-agent's whole effective tool catalog is read-only + concurrency-safe
+ * + non-destructive. Each eligible spawn gets its own IsolatedContext
+ * (fresh crypto-random sessionId/runId, own event log), and the parent's
+ * append-only log serialises writes at the syscall, so concurrent spawns
+ * don't collide. A child that can write/edit/bash, spawn its own Task, or
+ * touch module-level tool state (TodoWrite, Remember) is excluded and
+ * serialises. The runtime bounds how many run at once (see
+ * `runChatLoop({ maxConcurrentTools })`, default 4).
  *
  * The bridge is opaque from `tool-catalog`'s perspective; we cast inside
  * `execute` so ordinary tools (which never touch `ctx.bridge`) keep their
@@ -230,6 +240,29 @@ export function createTaskTool(opts: CreateTaskToolOptions = {}): RegisteredTool
     concurrencySafe: true,
     readOnly: false,
     destructive: false,
+    // Per-call parallel eligibility (see the module header). A dispatch is
+    // parallel-safe iff the resolved sub-agent's ENTIRE effective tool set
+    // is read-only + concurrency-safe + non-destructive. Fail-closed: an
+    // unresolvable/unsafe `subagent_type`, a malformed input, or an
+    // inherit-the-whole-catalog child (which would include write/bash/Task)
+    // all return false and route the call serial. `catalog` is the parent
+    // tool set, from which `buildChildCatalog` derives the child's tools.
+    concurrencyClassifier: (input, catalog) => {
+      const parsed = taskInputSchema.safeParse(input);
+      if (!parsed.success) return false;
+      let def: SubAgentDefinition;
+      try {
+        def = resolveSubAgentDefinition(parsed.data.subagent_type, opts);
+      } catch {
+        return false;
+      }
+      const childTools = buildChildCatalog(catalog, def);
+      // An empty child catalog is not provably safe (it means "inherit
+      // nothing" or an unresolved filter) — require an explicit, non-empty,
+      // uniformly-read-only tool set.
+      if (childTools.length === 0) return false;
+      return childTools.every((t) => t.concurrencySafe && t.readOnly && !t.destructive);
+    },
     execute: async (input, ctx) => {
       const bridge = ctx?.bridge as RuntimeBridge | undefined;
       if (bridge === undefined || bridge.spawnSubAgent === undefined) {
