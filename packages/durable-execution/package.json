@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/durable-execution",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "description": "Exactly-once node execution wrapper over graph-engine — idempotency keys + crash-replay",
   "main": "src/index.ts",
@@ -33,5 +33,10 @@
   "publishConfig": {
     "access": "public"
   },
-  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ]
 }

@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/channel-adapter-whatsapp",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "description": "WhatsApp Business Cloud API channel adapter: X-Hub-Signature-256 verification + text/media/interactive parsing + idempotent retry handling (Section 33)",
   "main": "src/index.ts",
@@ -32,5 +32,10 @@
   "publishConfig": {
     "access": "public"
   },
-  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ]
 }

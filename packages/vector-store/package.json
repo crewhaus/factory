@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/vector-store",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "description": "Vector index — in-memory flat L2 default, file-backed lance + HTTP backends (qdrant/pinecone/weaviate)",
   "main": "src/index.ts",
@@ -32,5 +32,10 @@
   "publishConfig": {
     "access": "public"
   },
-  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ]
 }

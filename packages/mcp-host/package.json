@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/mcp-host",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "description": "MCP client manager: stdio + SSE transports, exp-backoff reconnect, server registry, built on @modelcontextprotocol/sdk",
   "main": "src/index.ts",
@@ -36,5 +36,10 @@
   "publishConfig": {
     "access": "public"
   },
-  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ]
 }

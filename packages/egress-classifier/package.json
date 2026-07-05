@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/egress-classifier",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "description": "Pillar-3 sink-side chokepoint — classify content leaving via external sinks (fetch / web / mcp / channel / federation / evm-tx) against the data-lineage carried in run-context",
   "main": "src/index.ts",
@@ -33,5 +33,10 @@
   "publishConfig": {
     "access": "public"
   },
-  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ]
 }

@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/channel-adapter-imessage",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "description": "macOS-only iMessage channel adapter: ~/Library/Messages/chat.db polling + osascript send + cursor-based idempotency (Section 33)",
   "main": "src/index.ts",
@@ -32,5 +32,10 @@
   "publishConfig": {
     "access": "public"
   },
-  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ]
 }

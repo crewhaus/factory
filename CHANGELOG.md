@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-07-05
+
+Publishes the Claude-Code-parity runtime (#282) and adaptive model routing
+(#280) to npm and every install channel — npm 0.2.0 predates the new
+`bashOutput`/`killShell` tools, so specs using them could not compile from the
+published CLI until this release — plus a batch of CLI and documentation fixes.
+
 ### Added — Claude-Code-parity runtime features
 
 - **Parallel read-only sub-agent fan-out**: multiple `Task` calls batched in
@@ -29,6 +36,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for scripting/CI; composes with `--resume`/`--continue`. Previously the
   flag was silently ignored for cli targets.
 
+### Added — adaptive model routing
+
+- **`agent.model_pool`** ([#280]) — declare a set of candidate models and a
+  per-turn selection `policy` (`static` | `heuristic` | `learned`). The runtime
+  picks a model for each turn and, under `learned`, improves the choice the more
+  the harness runs by folding each turn's success/latency/cost into a durable
+  per-`(route, model)` reward scoreboard (new package `@crewhaus/routing-store`).
+  Every decision is published as a `model_route` trace event; inspect or reset
+  the accumulated scoreboard with **`crewhaus route status|reset`**. Opt-in and
+  mutually exclusive with `model_tiers`/`model_fallbacks`; specs without it
+  compile byte-identically.
+
 ### Fixed
 
 - **`compaction.model` is now wired**: `crewhaus run` and the compiled
@@ -43,6 +62,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that described a runtime notice-injection wiring that doesn't exist (the
   shipped path reads `.crewhaus/mcp/quarantine.json` and filters by name
   prefix in the CLI).
+- Declared the `doctor --detect`/`--no-probe`/`--fix` and `init
+  --interactive`/`--detect` flags that those commands already honored but the
+  argument parser rejected ([#283]).
+- Corrected stale `egress_decision` "no writer" claims in `crewhaus security
+  digest` ([#281]).
+
+### Documentation
+
+- Documented the (shipped) provider-failover chain and two-tier turn-difficulty
+  router in the `@crewhaus/model-router` README ([#284]), and clarified in the
+  `rankFallbacks` docstring that its cache-aware fallback-ranking seam is
+  currently caller-less/unwired ([#285]).
+
+[0.2.1]: https://github.com/crewhaus/factory/compare/v0.2.0...v0.2.1
+[#280]: https://github.com/crewhaus/factory/pull/280
+[#281]: https://github.com/crewhaus/factory/pull/281
+[#283]: https://github.com/crewhaus/factory/pull/283
+[#284]: https://github.com/crewhaus/factory/pull/284
+[#285]: https://github.com/crewhaus/factory/pull/285
 
 ## [0.2.0] - 2026-07-03
 

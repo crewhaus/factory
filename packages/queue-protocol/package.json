@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/queue-protocol",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "description": "Abstract queue interface + in-memory adapter for the BATCH target shape (Section 23 BATCH)",
   "main": "src/index.ts",
@@ -32,5 +32,10 @@
   "publishConfig": {
     "access": "public"
   },
-  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ]
 }

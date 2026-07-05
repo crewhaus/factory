@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/memory-store",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "description": "M4.2 — persistent cross-session memory store. File-backed JSONL with simple BM25-style text search. Per-spec scoped.",
   "main": "src/index.ts",
@@ -32,5 +32,10 @@
   "publishConfig": {
     "access": "public"
   },
-  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ]
 }

@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/adapter-anthropic",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "description": "Anthropic provider adapter + shared ProviderAdapter interface (Section 17)",
   "main": "src/index.ts",
@@ -38,5 +38,10 @@
   "publishConfig": {
     "access": "public"
   },
-  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ]
 }

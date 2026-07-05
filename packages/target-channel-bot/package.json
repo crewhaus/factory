@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/target-channel-bot",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "description": "Codegen backend for channel target: emits a multi-file daemon (gateway + session-router + agent + entrypoint)",
   "main": "src/index.ts",
@@ -54,5 +54,10 @@
   "publishConfig": {
     "access": "public"
   },
-  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ]
 }

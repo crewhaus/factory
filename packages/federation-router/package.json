@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/federation-router",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "description": "Routes Task/SendMessage invocations transparently across federated CrewHaus deployments via federation-protocol + federation-discovery (Section 34)",
   "main": "src/index.ts",
@@ -36,5 +36,10 @@
   "publishConfig": {
     "access": "public"
   },
-  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ]
 }

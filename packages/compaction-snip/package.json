@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/compaction-snip",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "description": "Pure middle-message removal with tool-use/result orphan defense",
   "main": "src/index.ts",
@@ -32,5 +32,10 @@
   "publishConfig": {
     "access": "public"
   },
-  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ]
 }

@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/model-router",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "description": "Resolve agent.model strings to a lazy-loaded ProviderAdapter (Section 17)",
   "main": "src/index.ts",
@@ -40,5 +40,10 @@
   "publishConfig": {
     "access": "public"
   },
-  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ]
 }
