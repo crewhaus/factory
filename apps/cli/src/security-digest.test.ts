@@ -98,7 +98,7 @@ describe("buildSecurityDigest — audit rollup", () => {
     expect(d.justification.denyRate).toBeNull();
     expect(d.egress.decisions).toBe(0);
     expect(d.sessions.scanned).toBe(0);
-    // Every declared kind is absent — including the writerless ones.
+    // Every declared kind is absent from an empty window — writerful and writerless alike.
     expect(d.audit.absentDeclaredKinds).toEqual([...DECLARED_AUDIT_KINDS]);
   });
 
@@ -146,10 +146,10 @@ describe("buildSecurityDigest — audit rollup", () => {
     expect(ruleBased?.denied).toBe(2);
   });
 
-  test("aggregates egress_decision records by sink and origin (future writer)", async () => {
-    // NOTE: no production writer appends egress_decision today (the kind is
-    // declared in @crewhaus/audit-log with a documented payload shape) —
-    // this seeds the documented shape so the rollup is proven ready.
+  test("aggregates egress_decision records by sink and origin", async () => {
+    // runtime-core appends egress_decision on every non-pass (warn/block)
+    // verdict (AUTOMATION-OPPORTUNITIES item 20); this seeds the same
+    // documented payload shape to exercise the sink/origin rollup.
     await seedAudit([
       {
         kind: "egress_decision",
@@ -483,7 +483,7 @@ describe("renderers", () => {
     expect(text).toContain("window: 7d");
     expect(text).toContain("justification gate: 1 evaluated, 1 denied (deny rate 100.0%)");
     expect(text).toContain("send_<message> — 1 denial(s) [judge=rule-based");
-    expect(text).toContain("no durable egress_decision records");
+    expect(text).toContain("no egress_decision records in window");
     expect(text).toContain("declared kinds with no records:");
   });
 
