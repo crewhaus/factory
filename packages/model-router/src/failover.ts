@@ -108,9 +108,11 @@ export type CreateFailoverChainOptions = {
    * original relative position, and unknown strings it invents are ignored.
    *
    * Default (undefined) → declared fallback order, byte-for-byte the
-   * pre-#28 behaviour. runtime-core wires this to
-   * `@crewhaus/cost-tracker`'s `rankCandidates` over the run's observed cache
-   * profile; the chain itself stays dependency-free of cost-tracker.
+   * pre-#28 behaviour. Designed for `@crewhaus/cost-tracker`'s
+   * `rankCandidates` over the run's observed cache profile — but no caller
+   * passes it yet (runtime-core's `createFailoverChain` call included), so
+   * the declared order is what ships today. The chain itself stays
+   * dependency-free of cost-tracker.
    */
   readonly rankFallbacks?: (fallbacks: readonly FallbackRankInput[]) => readonly string[];
 };
