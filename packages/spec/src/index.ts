@@ -1079,17 +1079,34 @@ const pipelineDocumentSchema = z
   })
   .strict();
 
+/**
+ * Adaptive model routing — the minimal single-agent block shared by the
+ * pipeline/research/batch/browser shapes, now carrying the opt-in
+ * `model_pool`. Their emitted runtimes each call `runChatLoop` with a single
+ * primary (exactly the cli shape's execution model), so the pool routes there
+ * with zero runtime changes. The superRefine is trivially satisfied today
+ * (these shapes carry no `model_tiers`/`model_fallbacks`) but keeps the
+ * mutual-exclusion rule uniform if they ever gain them. NOT used by
+ * onchain/onchain-game: their emitted bundles are callable modules whose
+ * agent-loop wiring is still deferred (see target-onchain slice-2 notes), so
+ * a `model_pool` there would be an inert spec field.
+ */
+const pooledSingleAgentSchema = z
+  .object({
+    model: z.string().min(1),
+    instructions: z.string().min(1),
+    // Adaptive model routing — N-candidate pool with a selection policy.
+    model_pool: modelPoolBlock,
+  })
+  .strict()
+  .superRefine(refineModelSelection);
+
 const pipelineSchema = z
   .object({
     name: safeName,
     version: versionField,
     target: z.literal("pipeline"),
-    agent: z
-      .object({
-        model: z.string().min(1),
-        instructions: z.string().min(1),
-      })
-      .strict(),
+    agent: pooledSingleAgentSchema,
     retrieve: z
       .object({
         embedderModel: z.string().min(1),
@@ -1191,12 +1208,7 @@ const researchSchema = z
     name: safeName,
     version: versionField,
     target: z.literal("research"),
-    agent: z
-      .object({
-        model: z.string().min(1),
-        instructions: z.string().min(1),
-      })
-      .strict(),
+    agent: pooledSingleAgentSchema,
     goal: z.string().min(1),
     branchingFactor: z.number().int().min(1).max(8).default(3),
     maxDurationMs: z.number().int().positive().default(300_000),
@@ -1234,12 +1246,7 @@ const batchSchema = z
     name: safeName,
     version: versionField,
     target: z.literal("batch"),
-    agent: z
-      .object({
-        model: z.string().min(1),
-        instructions: z.string().min(1),
-      })
-      .strict(),
+    agent: pooledSingleAgentSchema,
     queue: batchQueueSchema,
     concurrency: z.number().int().min(1).max(64).default(4),
     idempotencyWindowMs: z.number().int().positive().default(60_000),
@@ -1315,12 +1322,7 @@ const browserSchema = z
     name: safeName,
     version: versionField,
     target: z.literal("browser"),
-    agent: z
-      .object({
-        model: z.string().min(1),
-        instructions: z.string().min(1),
-      })
-      .strict(),
+    agent: pooledSingleAgentSchema,
     driver: browserDriverSchema.default({}),
     /** Vision-grounding model. Defaults to the agent's primary model. */
     groundingModel: z.string().min(1).optional(),
