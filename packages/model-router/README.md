@@ -5,6 +5,12 @@ Every model call in a compiled CrewHaus harness routes through
 `resolveModel(modelString)` — adapters for providers you don't use are never
 imported, let alone constructed.
 
+Since 0.2.0 the package also owns the two spec-native routing layers built
+on `resolveModel`: the provider [failover chain](#failover-chain-agentmodel_fallbacks)
+(`createFailoverChain`, behind `agent.model_fallbacks` / `agent.circuit_breaker`)
+and the [two-tier turn-difficulty router](#two-tier-router-agentmodel_tiers)
+(`createTierRouter` / `pickTier`, behind `agent.model_tiers`).
+
 ## Model string grammar
 
 | Model string | Provider / wire path | Credentials (env) |
@@ -45,3 +51,70 @@ cache key, kept in a module-local map. Repeat resolutions are free;
 with a `ConfigError` naming the package and the model-string family. The
 same applies to `@anthropic-ai/vertex-sdk` inside `adapter-anthropic` for
 `vertex/claude-*`.
+
+## Failover chain (`agent.model_fallbacks`)
+
+`createFailoverChain({ model, fallbacks, breaker?, getBus?, ... })` builds a
+`ProviderAdapter` that wraps an ordered candidate list — the spec's
+`agent.model` first, then each `agent.model_fallbacks` entry (deduped).
+Every candidate gets its own `@crewhaus/circuit-breaker` wrapper; `breaker`
+mirrors the spec's `agent.circuit_breaker` block (`failureThreshold` /
+`windowMs` / `cooldownMs`, package defaults 5 failures / 60 s window / 30 s
+cooldown). Each `stream()` call routes to the first candidate whose breaker
+is closed or half-open.
+
+Routing transitions publish `model_failover` trace events (when `getBus`
+yields a bus) with one of three reasons:
+
+| Reason | When |
+| --- | --- |
+| `breaker_open` | The candidate's breaker tripped (consecutive failures crossed `failureThreshold`); the next call routes onward to the next candidate. |
+| `probe_restore` | A higher-priority candidate's cooldown elapsed (breaker half-open); the next call routes back up to it as the probe. Probe success closes the breaker; failure re-opens it. |
+| `candidate_error` | The candidate couldn't be constructed when actually tried (missing credential, uninstalled optional provider package). |
+
+Semantics worth knowing:
+
+- Only the **primary** resolves fail-fast. Fallbacks preflight tolerantly: a
+  resolution failure becomes a doctor-style line in `warnings()` and the
+  candidate is re-tried whenever routing actually reaches it — a fallback
+  with a missing key warns at boot, never hard-fails the run.
+- **Mid-stream errors are not rerouted** (partial output re-issued through
+  another provider would duplicate content). The recovery engine's retries
+  re-enter `stream()`; once the failing candidate's breaker opens, the next
+  attempt routes onward.
+- `tripActive(reason?)` force-opens the last-served candidate's breaker —
+  this backs the `switch-model` failure-taxonomy recovery action.
+- Anthropic-shaped `cache_control` markers are stripped from requests served
+  by candidates whose `features.caching !== "explicit"`; explicit-caching
+  candidates keep them verbatim.
+- Every candidate open or unconstructible → `FailoverExhaustedError`, naming
+  each candidate and its breaker state.
+- The optional `rankFallbacks` seam reorders the fallback tier (never the
+  primary) before routing — designed for `@crewhaus/cost-tracker`'s
+  cache-hit-aware `rankCandidates` (item 28). No caller passes it yet, so
+  the declared fallback order is what ships.
+
+Introspection: `plan()` (predicted next candidate), `lastServed()`,
+`candidates()` (per-candidate resolution + breaker snapshot), `warnings()`.
+
+## Two-tier router (`agent.model_tiers`)
+
+`createTierRouter({ fast, default, config? })` holds two boot-resolved tiers
+(`ResolvedTier` = adapter + wire model id + spec string). runtime-core calls
+`route(signals)` each turn, streams through the returned tier's adapter, and
+publishes a `model_tier_route` trace event. The decision (`pickTier`) is
+deterministic — no probe calls, fully reproducible from the transcript. Any
+single hard-turn signal escalates the turn to the `default` tier:
+
+| Signal | Escalates when | Config knob (default) |
+| --- | --- | --- |
+| Turn index | first turn of the run (task framing) | `firstTurnToDefault` (`true`) |
+| Tools | any tools in play this turn | `toolsToDefault` (`true`) |
+| Context size | estimated context tokens exceed the threshold | `contextTokenThreshold` (`16000`) |
+| Prior tool density | previous turn issued ≥ N tool calls | `priorToolDensityThreshold` (`3`) |
+
+No escalator firing → the cheap `fast` tier serves. A fast-tier turn that
+fails re-runs on `default` (`escalation()`) — the misroute recovery,
+composing with the `switch-model` recovery ladder. Unlike the failover chain
+this is not a `stream()` wrapper: the tier decision is a loop-level signal,
+so the loop picks per turn and streams directly through the chosen adapter.
