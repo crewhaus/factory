@@ -27,6 +27,12 @@ import type { AuditKind, AuditRecord } from "@crewhaus/audit-log";
  *     - policy_decision   policy-engine's auditPolicyDecision (payload
  *       { toolName, sideEffect, decision, reason, tenantId, matchedRule }) —
  *       deny/audit-and-allow rows only by default.
+ *     - egress_decision   runtime-core's egress classifier (AUTOMATION-
+ *       OPPORTUNITIES item 20; payload { sinkId, sinkScope, verdict,
+ *       originsFound, matchCount }) — appended durably on every NON-PASS
+ *       (warn/block) verdict when the egress audit sink is wired, so the
+ *       rollup carries warn/block egress history; pass verdicts stay
+ *       ephemeral on the trace bus and leave no audit record.
  *     - model_call, gateway_request, secrets_rotation, secrets_access,
  *       deployment_action, retention_enforcement, alert_raised (item-31
  *       alert watchdog's `AlertAuditSink`, see alert-sink.ts; payload
@@ -35,15 +41,14 @@ import type { AuditKind, AuditRecord } from "@crewhaus/audit-log";
  *       but builds no verdict rollup from them.
  *
  *   kinds DECLARED in @crewhaus/audit-log but with NO writer anywhere in the
- *   tree today: `egress_decision`, `tool_classification`, `session_fork`,
- *   `tenancy_context`. Egress verdicts currently surface ONLY as ephemeral
- *   `permission_decision` trace events (outcome: egress-*) — runtime-core
- *   never appends the documented `egress_decision` audit record. The digest
- *   still aggregates `egress_decision` records by the payload shape the
- *   audit-log header documents ({ sinkId, sinkScope, verdict, originsFound,
- *   matchCount }) so the rollup lights up the day a writer lands, and it
- *   reports these kinds under `absentDeclaredKinds` so "0 egress rows"
- *   reads as "no durable writer yet", not "no egress happened".
+ *   tree today: `tool_classification`, `session_fork`, `tenancy_context`. The
+ *   digest still aggregates records of these kinds by their documented payload
+ *   shape so the rollup lights up the day a writer lands, and reports them
+ *   under `absentDeclaredKinds` so "0 rows" reads as "no durable writer yet",
+ *   not "nothing happened". (egress_decision graduated to the writer list
+ *   above once runtime-core began appending it on warn/block verdicts; a
+ *   window with no warn/block egress still lists it as absent — meaning "no
+ *   warn/block egress in the window", not "no writer".)
  *
  * Because block-tier verdicts DO leave durable residue in the session event
  * logs (`.crewhaus/sessions/<id>.jsonl` `tool_result` events carry the
@@ -205,7 +210,8 @@ export type SecurityDigest = {
     readonly malformedLines: number;
     readonly countsByKind: Readonly<Record<string, number>>;
     /** Kinds @crewhaus/audit-log declares that produced 0 window records —
-     *  today that inevitably includes the writerless kinds (see header). */
+     *  always includes the still-writerless kinds, plus any writerful kind
+     *  (e.g. egress_decision) that simply had no records in the window. */
     readonly absentDeclaredKinds: ReadonlyArray<string>;
   };
   /** Pillar 3 intent gate — from `permission_justification_evaluated`. */
@@ -357,7 +363,8 @@ export function buildSecurityDigest(opts: {
   >();
   const judges = new Map<string, { evaluated: number; denied: number }>();
 
-  // Egress rollup accumulators (no writer today — see module header).
+  // Egress rollup accumulators — fed by egress_decision records (written on
+  // warn/block verdicts; see module header).
   let ePassed = 0;
   let eWarned = 0;
   let eBlocked = 0;
@@ -651,7 +658,7 @@ export function renderSecurityDigestText(d: SecurityDigest): ReadonlyArray<strin
     for (const o of d.egress.topOrigins) lines.push(`  • origin ${o.name}: ${o.count} hit(s)`);
   } else {
     lines.push(
-      "egress: no durable egress_decision records — the kind is declared but has no writer yet; live verdicts surface per-run via CREWHAUS_SECURITY_DIGEST=1",
+      "egress: no egress_decision records in window — records are written on warn/block verdicts; live per-run verdicts via CREWHAUS_SECURITY_DIGEST=1",
     );
   }
 
@@ -771,7 +778,7 @@ ${tableOf(
 <h2>Egress sinks (warn/block)</h2>
 ${
   d.egress.decisions === 0
-    ? '<p class="note">no durable egress_decision records — the kind is declared but has no writer yet; live verdicts surface per-run via CREWHAUS_SECURITY_DIGEST=1</p>'
+    ? '<p class="note">no egress_decision records in window — records are written on warn/block verdicts; live per-run verdicts via CREWHAUS_SECURITY_DIGEST=1</p>'
     : tableOf(
         ["Sink", "Warned", "Blocked", "Origins"],
         d.egress.topSinks.map((s) => [
