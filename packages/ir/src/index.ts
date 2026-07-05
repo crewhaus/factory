@@ -163,6 +163,8 @@ export type IrModelPool = {
     readonly minSamplesPerArm?: number;
     readonly costRefUsd?: number;
     readonly latencyRefMs?: number;
+    readonly explorationRate?: number;
+    readonly seed?: string;
   };
 };
 

@@ -15,7 +15,7 @@
  *  - no `modelPool` → single-model path, no `model_route` events.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type {
@@ -278,5 +278,77 @@ describe("runChatLoop — adaptive model routing (model_pool)", () => {
       seedMessages: [{ role: "user", content: "hi" }],
     });
     expect(seen.filter((e) => e.kind === "model_route")).toHaveLength(0);
+  });
+});
+
+/** Read the persisted model_route lines from a session's event log. */
+function persistedRoutes(sessionId: string): Array<Record<string, unknown>> {
+  const file = join(SHARED_SESSION_ROOT, `${sessionId}.jsonl`);
+  return readFileSync(file, "utf8")
+    .trim()
+    .split("\n")
+    .map((l) => JSON.parse(l) as { kind?: string; payload?: unknown })
+    .filter((e) => e.kind === "model_route")
+    .map((e) => e.payload as Record<string, unknown>);
+}
+
+describe("runChatLoop — model_route persistence + online exploration", () => {
+  test("persists each turn's model_route decision to the session event log", async () => {
+    const cheap = okAdapter("cheap served");
+    const strong = okAdapter("strong served");
+    const runContext = createRunContext();
+    const finalText = await runChatLoop({
+      model: "claude-sonnet-5",
+      instructions: "test",
+      _adapter: okAdapter("primary"),
+      modelPool: { candidates: POOL_CANDIDATES, policy: "heuristic" },
+      _poolAdapters: poolAdapters(cheap, strong),
+      _scoreboard: tmpScoreboard(),
+      runContext,
+      singleTurn: true,
+      seedMessages: [{ role: "user", content: "hello" }],
+    });
+    expect(finalText).toBe("strong served"); // first turn → hard → strong
+    const routes = persistedRoutes(runContext.sessionId);
+    expect(routes).toHaveLength(1);
+    expect(routes[0]).toMatchObject({
+      turnNumber: 1,
+      routeKey: "hard",
+      model: OPUS,
+      policy: "heuristic",
+      explored: false,
+    });
+  });
+
+  test("learned + explorationRate 1 explores a non-best arm and persists explored:true", async () => {
+    // Seed the scoreboard so both hard-band arms are past a floor of 1, with
+    // HAIKU the best — ε=1 then forces a non-best (OPUS) exploration pick.
+    const sb = tmpScoreboard();
+    sb.record("hard", HAIKU, 0.9, { success: true, latencyMs: 100 });
+    sb.record("hard", OPUS, 0.1, { success: true, latencyMs: 100 });
+    const cheap = okAdapter("cheap served");
+    const strong = okAdapter("strong served");
+    const runContext = createRunContext();
+    const finalText = await runChatLoop({
+      model: "claude-sonnet-5",
+      instructions: "test",
+      _adapter: okAdapter("primary"),
+      modelPool: {
+        candidates: POOL_CANDIDATES,
+        policy: "learned",
+        learning: { minSamplesPerArm: 1, explorationRate: 1, seed: "fixed-seed" },
+      },
+      _poolAdapters: poolAdapters(cheap, strong),
+      _scoreboard: sb,
+      runContext,
+      singleTurn: true,
+      seedMessages: [{ role: "user", content: "framing" }], // first turn → hard band
+    });
+    // HAIKU is the best arm, so ε-greedy explore serves the non-best OPUS.
+    expect(finalText).toBe("strong served");
+    expect(strong.requests).toHaveLength(1);
+    const routes = persistedRoutes(runContext.sessionId);
+    expect(routes[0]).toMatchObject({ routeKey: "hard", model: OPUS, explored: true });
+    expect(String(routes[0]?.reason)).toContain("ε-greedy explore");
   });
 });

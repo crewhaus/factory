@@ -2050,6 +2050,7 @@ function usageText(): string {
     "       [--factory-root <p>] [--docs-root <p>] [--demos-root <p>]",
     "  cost-summary --session <id>          summarize cost_accrual events for a session",
     "  route status [--dir <root>]          show the adaptive model_pool reward scoreboard",
+    "  route explain <session> [--dir <r>]  replay a run's per-turn model_route decisions",
     "  route reset  [--dir <root>]          wipe the scoreboard (default root .crewhaus)",
     "  advise [--session <id> | --all]      mine session logs for spec advice (item 14)",
     "       [--json] [-o <dir>]             writes suggestions.json + report.html (default .crewhaus/advice)",
