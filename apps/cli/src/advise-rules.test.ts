@@ -21,6 +21,8 @@ import {
   ruleFailureTaxonomy,
   ruleLoopBreak,
   rulePermissionChurn,
+  rulePoolCandidateDemotion,
+  rulePoolPolicyUpgrade,
   ruleRepeatedToolFailures,
   ruleStopReasonAnomalies,
   ruleSubAgentSplit,
@@ -805,5 +807,184 @@ describe("ruleSubAgentSplit", () => {
       session(SESSION_A, [toolUseLine("t1", "Bash", { command: "x" }), toolResultLine("t1", "y")]),
     ]);
     expect(ruleSubAgentSplit(ctx, { spec: CLI_SPEC })).toEqual([]);
+  });
+});
+
+// -------- adaptive model routing rules (model_pool scoreboard mining) --------
+
+const POOL_SPEC = parseSpec(
+  [
+    "name: pooled",
+    "target: cli",
+    "agent:",
+    "  model: claude-sonnet-4-6",
+    "  instructions: help",
+    "  model_pool:",
+    "    candidates:",
+    "      - { model: claude-haiku-4-5, tags: [cheap] }",
+    "      - { model: claude-sonnet-4-6, tags: [balanced] }",
+    "      - { model: claude-opus-4-1, tags: [strong] }",
+  ].join("\n"),
+);
+
+/** Minimal ArmStats-shaped row for the routing rules. */
+function arm(routeKey: string, model: string, n: number, meanReward: number) {
+  return {
+    routeKey,
+    model,
+    n,
+    meanReward,
+    varReward: 0.01,
+    meanLatencyMs: 500,
+    meanCostUsd: 0.01,
+    costCount: n,
+  };
+}
+
+/** Full-coverage arms: every POOL_SPEC candidate ≥ n in both bands. */
+function fullCoverageArms(n: number) {
+  return [
+    arm("hard", "claude-haiku-4-5", n, 0.3),
+    arm("hard", "claude-sonnet-4-6", n, 0.75),
+    arm("hard", "claude-opus-4-1", n, 0.8),
+    arm("easy", "claude-haiku-4-5", n, 0.85),
+    arm("easy", "claude-sonnet-4-6", n, 0.8),
+    arm("easy", "claude-opus-4-1", n, 0.4),
+  ];
+}
+
+describe("rulePoolPolicyUpgrade", () => {
+  it("proposes flipping policy to learned when every candidate is past the floor", () => {
+    const ctx = buildAdviceContext([], [], fullCoverageArms(30));
+    const findings = rulePoolPolicyUpgrade(ctx, { spec: POOL_SPEC });
+    expect(findings).toHaveLength(1);
+    const f = findings[0];
+    expect(f?.id).toBe("pool-policy-upgrade");
+    if (f?.suggestion.kind !== "spec-patch") throw new Error("expected a spec-patch suggestion");
+    expect(f.suggestion.patch.path).toEqual(["agent", "model_pool", "policy"]);
+    expect(f.suggestion.patch.value).toBe("learned");
+    // POOL_SPEC omits the policy key (zod-defaulted) → `add`, not `replace`.
+    expect(f.suggestion.patch.op).toBe("add");
+    // And the patch survives the whitelist — the end-to-end contract.
+    expect(() => validatePatch(POOL_SPEC, f.suggestion.patch)).not.toThrow();
+  });
+
+  it("uses replace when specHasPath reports the policy key is present", () => {
+    const ctx = buildAdviceContext([], [], fullCoverageArms(30));
+    const findings = rulePoolPolicyUpgrade(ctx, { spec: POOL_SPEC, specHasPath: () => true });
+    if (findings[0]?.suggestion.kind !== "spec-patch") throw new Error("expected patch");
+    expect(findings[0].suggestion.patch.op).toBe("replace");
+  });
+
+  it("does not fire under the floor, when already learned, or without arms", () => {
+    // One candidate short of the floor in BOTH bands → no full-coverage band.
+    const partial = fullCoverageArms(30).map((a) =>
+      a.model === "claude-opus-4-1" ? { ...a, n: 3 } : a,
+    );
+    expect(rulePoolPolicyUpgrade(buildAdviceContext([], [], partial), { spec: POOL_SPEC })).toEqual(
+      [],
+    );
+    // Already learned → nothing to upgrade.
+    const learnedSpec = parseSpec(
+      [
+        "name: pooled",
+        "target: cli",
+        "agent:",
+        "  model: claude-sonnet-4-6",
+        "  instructions: help",
+        "  model_pool:",
+        "    policy: learned",
+        "    candidates:",
+        "      - { model: claude-haiku-4-5 }",
+        "      - { model: claude-opus-4-1 }",
+      ].join("\n"),
+    );
+    expect(
+      rulePoolPolicyUpgrade(buildAdviceContext([], [], fullCoverageArms(30)), {
+        spec: learnedSpec,
+      }),
+    ).toEqual([]);
+    // No arms at all → silent.
+    expect(rulePoolPolicyUpgrade(buildAdviceContext([], [], []), { spec: POOL_SPEC })).toEqual([]);
+  });
+
+  it("honours the spec's own learning.minSamplesPerArm floor", () => {
+    const spec = parseSpec(
+      [
+        "name: pooled",
+        "target: cli",
+        "agent:",
+        "  model: claude-sonnet-4-6",
+        "  instructions: help",
+        "  model_pool:",
+        "    candidates:",
+        "      - { model: claude-haiku-4-5 }",
+        "      - { model: claude-sonnet-4-6 }",
+        "      - { model: claude-opus-4-1 }",
+        "    learning: { minSamplesPerArm: 50 }",
+      ].join("\n"),
+    );
+    // 30 samples clears the default 25 but NOT the spec's 50 → no finding.
+    expect(
+      rulePoolPolicyUpgrade(buildAdviceContext([], [], fullCoverageArms(30)), { spec }),
+    ).toEqual([]);
+    expect(
+      rulePoolPolicyUpgrade(buildAdviceContext([], [], fullCoverageArms(60)), { spec }),
+    ).toHaveLength(1);
+  });
+});
+
+describe("rulePoolCandidateDemotion", () => {
+  it("names a candidate trailing the band best by ≥ the gap in every full band — advice-only", () => {
+    const arms = [
+      arm("hard", "claude-haiku-4-5", 30, 0.8),
+      arm("hard", "claude-sonnet-4-6", 30, 0.75),
+      arm("hard", "claude-opus-4-1", 30, 0.4), // trails 0.8 by 0.4
+      arm("easy", "claude-haiku-4-5", 30, 0.9),
+      arm("easy", "claude-sonnet-4-6", 30, 0.85),
+      arm("easy", "claude-opus-4-1", 30, 0.5), // trails 0.9 by 0.4
+    ];
+    const findings = rulePoolCandidateDemotion(buildAdviceContext([], [], arms), {
+      spec: POOL_SPEC,
+    });
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.id).toBe("pool-candidate-demotion:claude-opus-4-1");
+    expect(findings[0]?.suggestion.kind).toBe("advice"); // roster is human-owned
+  });
+
+  it("does not fire when the trailing candidate wins somewhere, or for a 2-candidate pool", () => {
+    // opus trails hard but WINS easy → not a consistent loser.
+    const mixed = [
+      arm("hard", "claude-haiku-4-5", 30, 0.8),
+      arm("hard", "claude-sonnet-4-6", 30, 0.7),
+      arm("hard", "claude-opus-4-1", 30, 0.4),
+      arm("easy", "claude-haiku-4-5", 30, 0.5),
+      arm("easy", "claude-sonnet-4-6", 30, 0.5),
+      arm("easy", "claude-opus-4-1", 30, 0.9),
+    ];
+    expect(
+      rulePoolCandidateDemotion(buildAdviceContext([], [], mixed), { spec: POOL_SPEC }),
+    ).toEqual([]);
+    // 2-candidate pool → demotion would collapse routing; always silent.
+    const twoSpec = parseSpec(
+      [
+        "name: pooled",
+        "target: cli",
+        "agent:",
+        "  model: claude-sonnet-4-6",
+        "  instructions: help",
+        "  model_pool:",
+        "    candidates:",
+        "      - { model: claude-haiku-4-5 }",
+        "      - { model: claude-opus-4-1 }",
+      ].join("\n"),
+    );
+    const twoArms = [
+      arm("hard", "claude-haiku-4-5", 30, 0.9),
+      arm("hard", "claude-opus-4-1", 30, 0.2),
+    ];
+    expect(
+      rulePoolCandidateDemotion(buildAdviceContext([], [], twoArms), { spec: twoSpec }),
+    ).toEqual([]);
   });
 });

@@ -8,6 +8,7 @@ import {
   formatDiffValue,
   formatWriteBackHeader,
   parseWriteBackHeader,
+  specHasPath,
   validatePatch,
 } from "./index";
 
@@ -496,5 +497,73 @@ describe("diffSpecYaml — credential redaction (adversarial review F1)", () => 
         after: '"Think step by step before answering."',
       },
     ]);
+  });
+});
+
+describe("adaptive model routing — model_pool policy paths", () => {
+  const POOL_YAML = `target: cli
+name: pooled
+agent:
+  model: claude-sonnet-4-5
+  instructions: help
+  model_pool:
+    candidates:
+      - { model: claude-haiku-4-5, tags: [cheap] }
+      - { model: claude-opus-4-1, tags: [strong] }
+`;
+
+  test("pool POLICY paths are whitelisted for cli/channel/managed; roster paths are not", () => {
+    const { spec } = applySpecPatch(POOL_YAML, {
+      target: "cli",
+      path: ["agent", "model_pool", "policy"],
+      op: "add",
+      value: "learned",
+    });
+    for (const path of [
+      ["agent", "model_pool", "policy"],
+      ["agent", "model_pool", "routing"],
+      ["agent", "model_pool", "learning"],
+    ]) {
+      expect(() =>
+        validatePatch(spec, { target: "cli", path, op: "replace", value: "x" }),
+      ).not.toThrow(/not listed/);
+    }
+    // The candidate ROSTER stays human-owned — like ["agent","model"] itself.
+    expect(() =>
+      validatePatch(spec, {
+        target: "cli",
+        path: ["agent", "model_pool", "candidates"],
+        op: "replace",
+        value: [],
+      }),
+    ).toThrow(/not listed in OPTIMIZABLE_PATHS/);
+    expect(() =>
+      validatePatch(spec, {
+        target: "cli",
+        path: ["agent", "model_pool"],
+        op: "replace",
+        value: {},
+      }),
+    ).toThrow(/not listed in OPTIMIZABLE_PATHS/);
+  });
+
+  test("an add patch on the zod-defaulted policy key round-trips the YAML", () => {
+    const { yaml, spec } = applySpecPatch(POOL_YAML, {
+      target: "cli",
+      path: ["agent", "model_pool", "policy"],
+      op: "add",
+      value: "learned",
+    });
+    expect(yaml).toContain("policy: learned");
+    if (spec.target !== "cli") throw new Error("unexpected target");
+    expect(spec.agent.model_pool?.policy).toBe("learned");
+  });
+
+  test("specHasPath sees textual keys, not zod defaults", () => {
+    // POOL_YAML omits `policy` — the parsed spec defaults it, the text lacks it.
+    expect(specHasPath(POOL_YAML, ["agent", "model_pool", "policy"])).toBe(false);
+    expect(specHasPath(POOL_YAML, ["agent", "model_pool", "candidates"])).toBe(true);
+    expect(specHasPath(POOL_YAML, ["agent", "model"])).toBe(true);
+    expect(specHasPath("not: [valid", ["agent"])).toBe(false);
   });
 });

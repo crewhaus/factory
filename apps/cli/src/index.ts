@@ -83,11 +83,16 @@ import {
   parsePermissionsConfig,
   tagRules,
 } from "@crewhaus/permission-engine";
+// Adaptive model routing — `crewhaus route status|reset` inspects/clears the
+// per-(routeKey, model) reward scoreboard behind `agent.model_pool`; advise
+// mines the same scoreboard into pool-policy suggestions.
+import { openScoreboard } from "@crewhaus/routing-store";
 import { runChatLoop } from "@crewhaus/runtime-core";
 import { createSessionStore, evictExpiredSessions } from "@crewhaus/session-store";
 import { createSkillTool, discoverSkills } from "@crewhaus/skills-registry";
 import { loadCommands } from "@crewhaus/slash-commands";
 import { type Spec, parseSpec } from "@crewhaus/spec";
+import { specHasPath } from "@crewhaus/spec-patch";
 import type { RegistryAdapter } from "@crewhaus/spec-registry";
 import { spawnSubAgent } from "@crewhaus/sub-agent-spawner";
 import { type RegisteredTool, ToolCatalog } from "@crewhaus/tool-catalog";
@@ -737,8 +742,6 @@ import {
   buildRightSizeReport,
   enumerateSlotCandidates,
 } from "./right-size";
-// Adaptive model routing — `crewhaus route status|reset` inspects/clears the
-// per-(routeKey, model) reward scoreboard behind `agent.model_pool`.
 import { runRoute } from "./route";
 // Item 13 — `crewhaus scaffold-evals` + `init --with-evals`: day-one eval
 // assets generated from the spec (deterministic template / one-shot model
@@ -8982,11 +8985,13 @@ async function runAdvise(args: ParsedArgs): Promise<void> {
     process.stdout.write(
       "usage: crewhaus advise [--session <id> | --all] [--json] [-o <dir>]\n" +
         "\n" +
-        "mines .crewhaus/sessions (+ .crewhaus/audit) for spec advice:\n" +
+        "mines .crewhaus/sessions (+ .crewhaus/audit + .crewhaus/routing) for spec advice:\n" +
         "  repeated tool failures, max_tokens truncation pressure, compaction\n" +
         "  thrash, permission-ask churn, stop-reason anomalies, learned\n" +
         "  failure_taxonomy + loop-break rules, sub-agent splits under\n" +
-        "  chronic context pressure\n" +
+        "  chronic context pressure, and model_pool scoreboard mining\n" +
+        "  (flip policy to learned once every candidate has enough samples;\n" +
+        "  name consistently-losing candidates — roster edits stay human)\n" +
         "\n" +
         "  --session <id>  mine one session (default: all sessions)\n" +
         "  --json          print machine-readable findings to stdout\n" +
@@ -9036,10 +9041,12 @@ async function runAdvise(args: ParsedArgs): Promise<void> {
   // The cwd spec enables patch suggestions; without one (or with a broken
   // one) rules fall back to advice text — mining must not block on it.
   let spec: Spec | undefined;
+  let specText: string | undefined;
   const specPath = join(process.cwd(), "crewhaus.yaml");
   if (existsSync(specPath)) {
     try {
-      spec = parseSpec(readFileSync(specPath, "utf-8"));
+      specText = readFileSync(specPath, "utf-8");
+      spec = parseSpec(specText);
     } catch (err) {
       process.stderr.write(
         `[advise] crewhaus.yaml did not parse (${(err as Error).message}) — patch suggestions downgraded to advice\n`,
@@ -9047,8 +9054,23 @@ async function runAdvise(args: ParsedArgs): Promise<void> {
     }
   }
 
-  const ctx = buildAdviceContext(sessions, auditObjects);
-  const findings: AdviceFinding[] = runAdviceRules(ctx, spec !== undefined ? { spec } : {});
+  // Adaptive model routing — the pool reward scoreboard, when the harness has
+  // one. A missing/empty store simply produces no routing findings.
+  let routingArms: ReadonlyArray<import("@crewhaus/routing-store").ArmStats> = [];
+  try {
+    routingArms = openScoreboard(join(process.cwd(), ".crewhaus")).snapshot();
+  } catch {
+    // Corrupt store must not block mining the sessions.
+  }
+
+  const ctx = buildAdviceContext(sessions, auditObjects, routingArms);
+  const specTextForOps = specText;
+  const findings: AdviceFinding[] = runAdviceRules(ctx, {
+    ...(spec !== undefined ? { spec } : {}),
+    ...(spec !== undefined && specTextForOps !== undefined
+      ? { specHasPath: (path: readonly string[]) => specHasPath(specTextForOps, path) }
+      : {}),
+  });
   const generatedAt = new Date().toISOString();
   const suggestions = buildSuggestionsFile(findings, ctx.sessionIds, generatedAt);
 
