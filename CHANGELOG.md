@@ -14,6 +14,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dropped `model_pool`, so `crewhaus run` ignored adaptive routing while the
   compiled cli bundle honoured it. `run` now threads it identically (disabled by
   a `--model` override, like the other routing blocks).
+### Added — adaptive model routing on more shapes
+
+- **`agent.model_pool` now works on the pipeline, research, batch, and browser
+  targets** (previously cli/channel/managed only). These shapes' emitted
+  runtimes each call `runChatLoop` with a single primary — exactly the cli
+  execution model — so the pool routes (and, under `policy: learned`, keeps
+  learning) there with zero runtime changes; the compiled bundle threads the
+  lowered pool into `runChatLoop`, and specs without it compile
+  byte-identically. Deliberately NOT extended to onchain/onchain-game (their
+  emitted bundles are callable modules whose agent-loop wiring is still
+  deferred, so the field would be inert) or to workflow/graph/crew (per-unit
+  models — pool attachment there is a future design).
 
 ## [0.2.1] - 2026-07-05
 

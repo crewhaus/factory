@@ -133,6 +133,19 @@ function resolveTools(
   return { imports, inits, registrations };
 }
 
+/**
+ * Adaptive model routing — render the `modelPool` runChatLoop field.
+ * JSON.stringify safely quotes the validated pool object (mirroring
+ * target-cli's renderModelFailoverFields; keep the pipeline/research/batch/
+ * browser copies in sync). Empty when the spec omits `model_pool`, keeping
+ * bundles byte-identical.
+ */
+function poolField(ir: IrBrowserV0, indent: string): string {
+  return ir.agent.modelPool !== undefined
+    ? `\n${indent}modelPool: ${JSON.stringify(ir.agent.modelPool)},`
+    : "";
+}
+
 export function emitBrowserDriver(ir: IrBrowserV0, opts: EmitReadmeOptions = {}): Bundle {
   const files = [{ path: "agent.ts", content: renderAgent(ir) }];
   // Item 42 — generated bundle README; default ON (`crewhaus compile
@@ -223,7 +236,7 @@ async function main(): Promise<void> {
   try {
     finalText = await runChatLoop({
       model: SPEC_MODEL,
-      instructions: SPEC_INSTRUCTIONS,
+      instructions: SPEC_INSTRUCTIONS,${poolField(ir, "      ")}
       runContext,
       sessionName: SPEC_NAME,
       sessionTarget: "browser",

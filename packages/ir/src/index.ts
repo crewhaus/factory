@@ -802,6 +802,8 @@ export type IrPipelineV0 = {
   readonly agent: {
     readonly model: string;
     readonly instructions: string;
+    /** Adaptive model routing — N-candidate pool. Absent → single-model. */
+    readonly modelPool?: IrModelPool;
   };
   readonly retrieve: {
     readonly embedderModel: string;
@@ -901,6 +903,8 @@ export type IrResearchV0 = {
   readonly agent: {
     readonly model: string;
     readonly instructions: string;
+    /** Adaptive model routing — N-candidate pool. Absent → single-model. */
+    readonly modelPool?: IrModelPool;
   };
   /** Default research goal. The daemon's `--goal "..."` flag overrides. */
   readonly goal: string;
@@ -948,6 +952,8 @@ export type IrBatchV0 = {
   readonly agent: {
     readonly model: string;
     readonly instructions: string;
+    /** Adaptive model routing — N-candidate pool. Absent → single-model. */
+    readonly modelPool?: IrModelPool;
   };
   readonly queue: {
     readonly adapter: IrBatchQueueAdapter;
@@ -1032,6 +1038,8 @@ export type IrBrowserV0 = {
   readonly agent: {
     readonly model: string;
     readonly instructions: string;
+    /** Adaptive model routing — N-candidate pool. Absent → single-model. */
+    readonly modelPool?: IrModelPool;
   };
   readonly driver: {
     readonly backend: IrBrowserBackend;
