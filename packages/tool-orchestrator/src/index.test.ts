@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { type RegisteredTool, ToolCatalog } from "@crewhaus/tool-catalog";
 import type { ToolUseBlock } from "@crewhaus/turn-state-machine";
-import { isConcurrencySafe, partitionToolCalls } from "./index";
+import { isCallConcurrencySafe, isConcurrencySafe, partitionToolCalls } from "./index";
 
 // Minimal RegisteredTool factory for tests. The orchestrator never invokes
 // `inputSchema` or `execute`, so we don't pull zod in just to satisfy types.
@@ -203,5 +203,76 @@ describe("partitionToolCalls — T9 property invariant", () => {
       const total = out.concurrent.flat().length + out.serial.length;
       expect(total).toBe(calls.length);
     }
+  });
+});
+
+// A per-call classifier stand-in for `Task`: parallel-safe only when the
+// call input carries `{ parallel: true }`. Statically it looks unsafe
+// (readOnly:false) so, absent the classifier, it would always serialize.
+const CLASSIFIED = makeTool({
+  name: "Task",
+  concurrencySafe: true,
+  readOnly: false,
+  concurrencyClassifier: (input) => (input as { parallel?: boolean }).parallel === true,
+});
+const THROWS = makeTool({
+  name: "Boom",
+  concurrencyClassifier: () => {
+    throw new Error("classifier blew up");
+  },
+});
+const callWith = (name: string, input: unknown, id = `tu_${name}`): ToolUseBlock => ({
+  id,
+  name,
+  input,
+});
+
+describe("isCallConcurrencySafe — per-call classifier", () => {
+  test("classifier decides and overrides the static flags", () => {
+    expect(isCallConcurrencySafe(callWith("Task", { parallel: true }), CLASSIFIED, [])).toBe(true);
+    expect(isCallConcurrencySafe(callWith("Task", { parallel: false }), CLASSIFIED, [])).toBe(
+      false,
+    );
+    // Even though the static flags (concurrencySafe:true, readOnly:false)
+    // would send it serial, the classifier can opt a call back in.
+    expect(isConcurrencySafe(CLASSIFIED)).toBe(false);
+  });
+
+  test("fail-closed: undefined tool, and a throwing classifier, are not safe", () => {
+    expect(isCallConcurrencySafe(callWith("Task", { parallel: true }), undefined, [])).toBe(false);
+    expect(isCallConcurrencySafe(callWith("Boom", {}), THROWS, [])).toBe(false);
+  });
+
+  test("tools without a classifier fall back to static flags", () => {
+    expect(isCallConcurrencySafe(call("Read"), READ, [])).toBe(true);
+    expect(isCallConcurrencySafe(call("Bash"), BASH, [])).toBe(false);
+  });
+});
+
+describe("partitionToolCalls — classifier-driven Task batching", () => {
+  const lookupC = (name: string): RegisteredTool | undefined =>
+    ({ Read: READ, Glob: GLOB, Task: CLASSIFIED })[name];
+
+  test("eligible Task calls batch concurrently; ineligible ones serialize", () => {
+    const calls = [
+      callWith("Task", { parallel: true }, "a"),
+      callWith("Task", { parallel: true }, "b"),
+      callWith("Task", { parallel: false }, "c"),
+    ];
+    const out = partitionToolCalls(calls, lookupC, [READ, GLOB, CLASSIFIED]);
+    // a+b form one concurrent batch; c breaks the run and goes serial.
+    expect(out.concurrent.map((batch) => batch.map((x) => x.id))).toEqual([["a", "b"]]);
+    expect(out.serial.map((x) => x.id)).toEqual(["c"]);
+  });
+
+  test("a read between two eligible Tasks keeps one contiguous batch", () => {
+    const calls = [
+      callWith("Task", { parallel: true }, "a"),
+      call("Read", "r"),
+      callWith("Task", { parallel: true }, "b"),
+    ];
+    const out = partitionToolCalls(calls, lookupC, [READ, GLOB, CLASSIFIED]);
+    expect(out.concurrent.map((batch) => batch.map((x) => x.id))).toEqual([["a", "r", "b"]]);
+    expect(out.serial).toEqual([]);
   });
 });

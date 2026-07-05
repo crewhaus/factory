@@ -407,6 +407,8 @@ export const CLI_RUNTIME_TOOL_KEYS: ReadonlyArray<string> = Object.freeze([
   "glob",
   "grep",
   "bash",
+  "bashOutput",
+  "killShell",
   "todoWrite",
   "webFetch",
   "webSearch",
