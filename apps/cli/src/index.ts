@@ -4283,6 +4283,16 @@ async function runRunCli(
       ir.agent.modelTiers !== undefined
         ? { modelTiers: ir.agent.modelTiers }
         : {}),
+      // Adaptive model routing — thread `agent.model_pool` so `crewhaus run`
+      // routes (and learns) exactly like the compiled cli bundle, not just the
+      // single primary. Mutually exclusive with tiers/fallbacks in the spec;
+      // a `--model` override forces a single model, so the pool applies only
+      // without an override.
+      ...(ir.target === "cli" &&
+      typeof modelOverride !== "string" &&
+      ir.agent.modelPool !== undefined
+        ? { modelPool: ir.agent.modelPool }
+        : {}),
       // Section 55 / item 23 — thread the spec's failure_taxonomy so
       // recovery-engine consults the user's named error classes (including
       // the `switch-model` verdict) before its built-in flow.

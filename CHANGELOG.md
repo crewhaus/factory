@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`crewhaus run` now honours `agent.model_pool`.** The interpreted cli run
+  path threaded `model_tiers` / `model_fallbacks` into the runtime but silently
+  dropped `model_pool`, so `crewhaus run` ignored adaptive routing while the
+  compiled cli bundle honoured it. `run` now threads it identically (disabled by
+  a `--model` override, like the other routing blocks).
+
 ## [0.2.1] - 2026-07-05
 
 Publishes the Claude-Code-parity runtime (#282) and adaptive model routing
