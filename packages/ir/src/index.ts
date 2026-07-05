@@ -165,6 +165,7 @@ export type IrModelPool = {
     readonly latencyRefMs?: number;
     readonly explorationRate?: number;
     readonly seed?: string;
+    readonly bandit?: "epsilon-greedy" | "thompson";
   };
 };
 

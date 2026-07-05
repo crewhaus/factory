@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added — adaptive model routing (P4)
 
+- **Thompson sampling bandit for `agent.model_pool` (`policy: learned`)**: a new
+  `learning.bandit: thompson` (default `epsilon-greedy`) replaces the ε-knob with
+  Gaussian Thompson sampling — each arm is drawn from its reward posterior
+  `Normal(meanReward, varReward / n)` and the highest draw wins, so uncertain
+  arms self-explore and the policy needs no exploration-rate tuning. Same
+  transcript-seeded RNG, so it replays exactly; runs only after the sample-floor
+  warm-up, and `epsilon-greedy` remains the default.
 - **Online ε-greedy exploration for `agent.model_pool` (`policy: learned`)**:
   a new `learning.explorationRate` (default `0`) makes the learned policy keep
   sampling non-best candidates a fraction of the time once every arm has

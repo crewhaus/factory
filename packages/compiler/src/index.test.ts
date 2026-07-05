@@ -2591,7 +2591,7 @@ agent:
         tags: [strong]
     objective: { quality: 0.6, cost: 0.3, latency: 0.1 }
     routing: { contextTokenThreshold: 8000, strongTag: strong }
-    learning: { minSamplesPerArm: 40 }
+    learning: { minSamplesPerArm: 40, explorationRate: 0.1, bandit: thompson, seed: fixed }
 `;
 
   test("lowers cli agent.model_pool verbatim (policy, tags, and defined knobs)", () => {
@@ -2605,7 +2605,7 @@ agent:
       ],
       objective: { quality: 0.6, cost: 0.3, latency: 0.1 },
       routing: { contextTokenThreshold: 8000, strongTag: "strong" },
-      learning: { minSamplesPerArm: 40 },
+      learning: { minSamplesPerArm: 40, explorationRate: 0.1, bandit: "thompson", seed: "fixed" },
     });
   });
 

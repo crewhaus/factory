@@ -67,12 +67,26 @@ export type PoolLearningConfig = {
    * stays replayable from the transcript.
    */
   readonly explorationRate?: number;
+  /**
+   * Which exploration strategy runs in the exploit phase (after every arm
+   * clears `minSamplesPerArm`):
+   *   - `"epsilon-greedy"` (default) — exploit the best arm, explore a random
+   *     non-best arm `explorationRate` of the time.
+   *   - `"thompson"` — Gaussian Thompson sampling: draw each arm from its
+   *     reward posterior `Normal(meanReward, varReward / n)` and take the arm
+   *     with the highest draw. Self-balances explore/exploit (an uncertain arm
+   *     wins more often), so `explorationRate` is ignored under `thompson`.
+   * Both draw from a transcript-seeded RNG, so both replay exactly.
+   */
+  readonly bandit?: "epsilon-greedy" | "thompson";
 };
 
 /** The minimal per-arm read the learned policy needs from the scoreboard. */
 export type ArmScore = {
   readonly n: number;
   readonly meanReward: number;
+  /** Sample variance of reward (0 when n < 2). Consumed by Thompson sampling. */
+  readonly varReward?: number;
 };
 
 /** Injected scoreboard reader: `(routeKey, modelString) → arm stats | undefined`. */
@@ -141,6 +155,18 @@ function uniform01(...parts: ReadonlyArray<string | number>): number {
 }
 
 /**
+ * A standard-normal draw `N(0, 1)` from the same deterministic seed material,
+ * via Box-Muller over two independent `uniform01` draws. Used by Thompson
+ * sampling to draw each arm from its reward posterior. Reproducible from the
+ * transcript for the same reason `uniform01` is.
+ */
+function gaussian(...parts: ReadonlyArray<string | number>): number {
+  const u1 = Math.max(1e-12, uniform01(...parts, "z1"));
+  const u2 = uniform01(...parts, "z2");
+  return Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+}
+
+/**
  * The learning bucket for a turn. Reuses the tier router's escalation logic so
  * a pool with two candidates + `policy: heuristic` behaves identically to the
  * equivalent `model_tiers` block: `"hard"` ⟺ the tier router would pick
@@ -175,6 +201,7 @@ export function createPolicyRouter(opts: PolicyRouterOptions): PolicyRouter {
   const cheapTag = routing.cheapTag ?? CHEAP_TAG;
   const minSamples = Math.max(1, opts.learning?.minSamplesPerArm ?? DEFAULT_MIN_SAMPLES);
   const explorationRate = Math.max(0, Math.min(1, opts.learning?.explorationRate ?? 0));
+  const bandit = opts.learning?.bandit ?? "epsilon-greedy";
   const score = opts.score;
   if (opts.policy === "learned" && score === undefined) {
     throw new Error("model-router: policy 'learned' requires an injected score lookup");
@@ -190,7 +217,12 @@ export function createPolicyRouter(opts: PolicyRouterOptions): PolicyRouter {
     // Snapshot each candidate's sample count / mean reward for THIS band.
     const arms = candidates.map((candidate) => {
       const s = score?.(band, candidate.modelString);
-      return { candidate, n: s?.n ?? 0, meanReward: s?.meanReward ?? 0 };
+      return {
+        candidate,
+        n: s?.n ?? 0,
+        meanReward: s?.meanReward ?? 0,
+        varReward: s?.varReward ?? 0,
+      };
     });
     // Warm-up: any arm below the floor → deterministically pick the least
     // sampled (declared order breaks ties). This round-robins arms up to the
@@ -211,6 +243,27 @@ export function createPolicyRouter(opts: PolicyRouterOptions): PolicyRouter {
     }
     // Exploit-phase best: highest mean reward (declared order breaks ties).
     const best = arms.reduce((hi, a) => (a.meanReward > hi.meanReward ? a : hi));
+    // Thompson sampling: draw each arm from its reward posterior
+    // `Normal(meanReward, varReward / n)` and take the highest draw. Arms with
+    // more uncertainty (higher variance / fewer samples) win more often, so it
+    // self-balances explore/exploit without an ε knob. Deterministic per
+    // (seed, seq, band, model) → replayable from the transcript.
+    if (bandit === "thompson" && arms.length > 1) {
+      const drawn = arms.map((a) => ({
+        arm: a,
+        value:
+          a.meanReward +
+          gaussian(seed, seq, band, a.candidate.modelString) * Math.sqrt(a.varReward / a.n),
+      }));
+      const winner = drawn.reduce((hi, x) => (x.value > hi.value ? x : hi));
+      return {
+        candidate: winner.arm.candidate,
+        routeKey: band,
+        reason: `learned/${band}: thompson draw=${winner.value.toFixed(3)} (mean=${winner.arm.meanReward.toFixed(3)}, n=${winner.arm.n})`,
+        policy: "learned",
+        explored: winner.arm !== best,
+      };
+    }
     // ε-greedy ONLINE exploration: with probability `explorationRate` (per a
     // transcript-seeded draw), try a non-best arm so the policy keeps sampling
     // and can escape a stale optimum. `explorationRate === 0` (the default)

@@ -536,6 +536,7 @@ type SpecAgentWithFailover = {
       readonly latencyRefMs?: number;
       readonly explorationRate?: number;
       readonly seed?: string;
+      readonly bandit?: "epsilon-greedy" | "thompson";
     };
   };
 };
@@ -646,6 +647,7 @@ function lowerModelFailover(agent: SpecAgentWithFailover): {
                 ? { explorationRate: learning.explorationRate }
                 : {}),
               ...(learning.seed !== undefined ? { seed: learning.seed } : {}),
+              ...(learning.bandit !== undefined ? { bandit: learning.bandit } : {}),
             },
           }
         : {}),
