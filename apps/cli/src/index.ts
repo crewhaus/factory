@@ -1968,7 +1968,7 @@ function usageText(): string {
     "                  [--watch]            re-validate on change (authoring aid; does not re-launch)",
     "                  [--resume <id>]      resume a specific session (cli targets only)",
     "                  [--continue]         resume the most-recent session (cli targets only)",
-    "                  [--prompt <text>]    initial user prompt (browser targets; defaults to stdin)",
+    "                  [--prompt <text>]    run one turn and exit, printing the reply (cli: no REPL; browser: the single-turn input, else stdin)",
     "                  [--justification-judge rule-based|claude]  Pillar 3 intent-gate judge (FR-004)",
     "                  [--egress-matcher substring|semantic]  Pillar 3 sink-side matcher (FR-006)",
     "                  [--egress-embedder <model>]  embedder for --egress-matcher semantic",
@@ -3460,6 +3460,8 @@ async function loadToolMap(): Promise<Record<string, RegisteredTool>> {
     glob: fs.glob,
     grep: fs.grep,
     bash: bash.bash,
+    bashOutput: bash.bashOutput,
+    killShell: bash.killShell,
     todoWrite: todo.todoWrite,
     webFetch: web.webFetch,
     webSearch: web.webSearch,
@@ -3654,6 +3656,7 @@ async function runRun(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
       "usage: crewhaus run <spec.yaml> [--model <model>] [--permission-mode <default|plan|auto|bypass>] [--resume <sessionId> | --continue] [--prompt <text>] [--justification-judge rule-based|claude] [--egress-matcher substring|semantic] [--egress-embedder <model>]\n" +
+        "  --prompt <text> runs a single turn non-interactively and prints the reply, then exits (no REPL) — for scripting/CI; composes with --resume/--continue\n" +
         "  --model accepts the full router grammar: claude-* (Anthropic), openai/<m>, gemini/<m>, bedrock/<id> (geo prefixes tolerated), local/<m>@<url>\n" +
         "  A spec with a feedback: block asks `rate this session? [g]ood / [b]ad / [enter] skip`\n" +
         "  on clean REPL exit (one keystroke, 10s timeout, TTY only — never when piped). Opt out\n" +
@@ -3740,6 +3743,20 @@ async function runRunCli(
     process.stdout.write(
       `[continue] resuming session ${match.id} (last updated ${match.updatedAt})\n`,
     );
+  }
+
+  // `--prompt <text>` runs ONE turn non-interactively and exits (no REPL) —
+  // the cli analogue of the browser target's --prompt and `claude -p`, for
+  // scripting/CI/pipelines. The final assistant message is written to stdout.
+  // Composes with --resume/--continue (one more turn on a resumed session).
+  const promptFlag = args.flags["prompt"];
+  let oneShotPrompt: string | undefined;
+  if (typeof promptFlag === "string") {
+    const trimmed = promptFlag.trim();
+    if (trimmed.length === 0) {
+      die("--prompt requires non-empty text");
+    }
+    oneShotPrompt = trimmed;
   }
 
   let tools: RegisteredTool[] = [];
@@ -4195,8 +4212,9 @@ async function runRunCli(
     }
   }
 
+  let oneShotResult: string | undefined;
   try {
-    await runChatLoop({
+    oneShotResult = await runChatLoop({
       model,
       instructions:
         mcpQuarantineNotice !== undefined
@@ -4210,10 +4228,23 @@ async function runRunCli(
       hooks,
       skills,
       slashCommands,
+      // `--prompt` → run exactly one turn from the seeded prompt and return
+      // its final message (no interactive REPL). runChatLoop's singleTurn
+      // mode also suppresses the `you>` / `agent ready` chrome.
+      ...(oneShotPrompt !== undefined
+        ? { singleTurn: true, seedMessages: [{ role: "user" as const, content: oneShotPrompt }] }
+        : {}),
       ...(hasCodeExecTools ? { sandboxAvailable } : {}),
       ...(subAgents !== undefined ? { subAgents, spawnSubAgent } : {}),
       ...(ir.target === "cli" && ir.agent.maxTokens !== undefined
         ? { maxTokens: ir.agent.maxTokens }
+        : {}),
+      // Thread `compaction.model` so auto-compaction summarizes on the
+      // spec's chosen (typically cheaper) model instead of the primary.
+      // The compiler already resolves the `cheapest` sentinel to a concrete
+      // id, so this is a raw model string. Mirrors the target-cli emitter.
+      ...(ir.target === "cli" && ir.compaction.model !== undefined
+        ? { compactionModel: ir.compaction.model }
         : {}),
       // Item 22 — provider failover chain: thread `agent.model_fallbacks` +
       // `agent.circuit_breaker` through to the runtime, mirroring the
@@ -4265,6 +4296,13 @@ async function runRunCli(
     });
   } finally {
     if (mcpHost) await mcpHost.disconnectAll();
+  }
+
+  // One-shot (`--prompt`): emit the final assistant message to stdout so it
+  // can be piped/captured. The REPL path streams as it goes and returns the
+  // same trailing text, so only print it in one-shot mode.
+  if (oneShotPrompt !== undefined && oneShotResult !== undefined) {
+    process.stdout.write(`${oneShotResult}\n`);
   }
 
   // Item 1 — post-session feedback teardown: the one-keystroke exit rating

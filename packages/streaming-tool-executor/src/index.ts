@@ -13,12 +13,17 @@ import type Anthropic from "@anthropic-ai/sdk";
  * The dispatch logic is unchanged:
  *
  *   - No tools currently running → run.
- *   - Currently-running set is all concurrency-safe AND this entry is
- *     concurrency-safe → run.
+ *   - Fewer than `maxConcurrent` in flight AND the running set is all
+ *     concurrency-safe AND this entry is concurrency-safe → run.
  *   - Otherwise → wait for the running set to drain.
  *
- * Concurrency-safety follows the same triple-conjunction as
- * `tool-orchestrator`: `concurrencySafe && readOnly && !destructive`.
+ * Concurrency-safety follows the same rule as `tool-orchestrator`: the
+ * static triple-conjunction `concurrencySafe && readOnly && !destructive`,
+ * UNLESS the tool ships a per-call `concurrencyClassifier` (e.g. `Task`,
+ * whose safety depends on which sub-agent a specific call spawns), in
+ * which case that decides per invocation. `maxConcurrent` bounds the
+ * in-flight set so a wide sub-agent fan-out can't open unbounded model
+ * connections.
  *
  * Sibling abort: a per-call `AbortController` (`siblingAbortController`)
  * is signalled when a tool result errors AND `shouldAbortOnError` says
@@ -76,6 +81,12 @@ export type StreamingExecuteOptions = {
    * persistence).
    */
   readonly runTool?: (block: CompletedToolUseBlock) => Promise<Anthropic.ToolResultBlockParam>;
+  /**
+   * Max concurrency-safe tool calls in flight at once (chiefly parallel
+   * sub-agent spawns). Defaults to `DEFAULT_MAX_CONCURRENT` (4). `<= 0` is
+   * clamped to 1 (serial).
+   */
+  readonly maxConcurrent?: number;
 };
 
 export type StreamingExecuteResult = {
@@ -93,8 +104,15 @@ type AccumulatedBlock =
 type QueueEntry = {
   readonly block: CompletedToolUseBlock;
   readonly tool: RegisteredTool | undefined;
+  /** Per-call parallel eligibility, computed once at enqueue. */
+  readonly safe: boolean;
   status: "queued" | "running" | "done" | "aborted";
 };
+
+// Mirror of runtime-core's DEFAULT_MAX_CONCURRENT_TOOLS — bound the
+// in-flight set so a wide sub-agent fan-out can't open unbounded model
+// connections. Kept in sync intentionally; both default to 4.
+const DEFAULT_MAX_CONCURRENT = 4;
 
 function defaultShouldAbortOnError(
   _failedToolName: string,
@@ -103,8 +121,26 @@ function defaultShouldAbortOnError(
   return tool?.destructive === true;
 }
 
-function isConcurrencySafe(tool: RegisteredTool | undefined): boolean {
-  return tool?.concurrencySafe === true && tool.readOnly && !tool.destructive;
+/**
+ * Per-call concurrency safety. A tool's static flags decide it, unless the
+ * tool ships a `concurrencyClassifier` (Task), which decides per call from
+ * the invocation input and the sibling catalog. Fail-closed: a missing
+ * tool, a throw, or a `false` return all mean "not parallel-safe".
+ */
+function isCallSafe(
+  block: CompletedToolUseBlock,
+  tool: RegisteredTool | undefined,
+  catalog: ReadonlyArray<RegisteredTool>,
+): boolean {
+  if (tool === undefined) return false;
+  if (tool.concurrencyClassifier !== undefined) {
+    try {
+      return tool.concurrencyClassifier(block.input, catalog);
+    } catch {
+      return false;
+    }
+  }
+  return tool.concurrencySafe === true && tool.readOnly && !tool.destructive;
 }
 
 /**
@@ -124,6 +160,10 @@ export async function executeStreaming(
   const inFlight = new Set<Promise<void>>();
   const siblingAbort = new AbortController();
   const shouldAbortOnError = opts.shouldAbortOnError ?? defaultShouldAbortOnError;
+  // Sibling catalog for per-call concurrency classifiers (Task resolves the
+  // child tool set from it). Snapshotted once — the catalog is fixed per run.
+  const catalog: ReadonlyArray<RegisteredTool> = [...opts.toolByName.values()];
+  const maxConcurrent = Math.max(1, opts.maxConcurrent ?? DEFAULT_MAX_CONCURRENT);
   const blocks = new Map<number, AccumulatedBlock>();
   // Order content blocks were OPENED in — tool_use ordering must
   // follow open-order for downstream pairing to work.
@@ -260,13 +300,13 @@ export async function executeStreaming(
         dispatch(entry);
         continue;
       }
-      // With work already in flight, only dispatch this entry when the
-      // running set is fully concurrency-safe AND this entry is too;
-      // otherwise stop scanning and wait for the running set to drain.
-      const runningAllSafe = queue.every(
-        (e) => e.status !== "running" || isConcurrencySafe(e.tool),
-      );
-      const canRunConcurrently = runningAllSafe && isConcurrencySafe(entry.tool);
+      // With work already in flight, only dispatch this entry when we're
+      // under the concurrency cap AND the running set is fully
+      // concurrency-safe AND this entry is too; otherwise stop scanning and
+      // wait for the running set to drain.
+      if (inFlight.size >= maxConcurrent) return;
+      const runningAllSafe = queue.every((e) => e.status !== "running" || e.safe);
+      const canRunConcurrently = runningAllSafe && entry.safe;
       if (!canRunConcurrently) return;
       dispatch(entry);
     }
@@ -338,9 +378,11 @@ export async function executeStreaming(
             // Persist the parsed input on the block so finalContent
             // reflects what we passed to runTool.
             (block as { jsonBuffer: string }).jsonBuffer = JSON.stringify(input);
+            const enqueuedTool = opts.toolByName.get(completed.name);
             queue.push({
               block: completed,
-              tool: opts.toolByName.get(completed.name),
+              tool: enqueuedTool,
+              safe: isCallSafe(completed, enqueuedTool, catalog),
               status: "queued",
             });
             processQueue();

@@ -133,5 +133,11 @@ export function buildTool<TInput>(def: ToolDefinition<TInput>): RegisteredTool {
     // that declares it crosses a boundary, not just the hardcoded outward
     // names. Omitted on the definition ⇒ omitted here.
     ...(def.ioCapability !== undefined ? { ioCapability: def.ioCapability } : {}),
+    // Per-call concurrency classifier (Task): passed through verbatim, like
+    // jsonSchema/ioCapability. Omitted on the definition ⇒ omitted here, so
+    // the orchestrator falls back to the static concurrency flags.
+    ...(def.concurrencyClassifier !== undefined
+      ? { concurrencyClassifier: def.concurrencyClassifier }
+      : {}),
   };
 }

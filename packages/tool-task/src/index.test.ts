@@ -371,3 +371,77 @@ Be brief.`,
     expect(tool.destructive).toBe(false);
   });
 });
+
+describe("createTaskTool — concurrencyClassifier (per-call parallel eligibility)", () => {
+  const read = makeReadTool();
+  const bash = makeBashTool();
+
+  function classify(
+    tool: RegisteredTool,
+    input: unknown,
+    catalog: ReadonlyArray<RegisteredTool>,
+  ): boolean {
+    const fn = tool.concurrencyClassifier;
+    expect(fn).toBeDefined();
+    if (fn === undefined) throw new Error("Task tool should ship a concurrencyClassifier");
+    return fn(input, catalog);
+  }
+
+  const def = (name: string, extra: Partial<SubAgentDefinition> = {}): SubAgentDefinition => ({
+    name,
+    description: "d",
+    instructions: "i",
+    ...extra,
+  });
+  const dispatch = (subagent_type: string): unknown => ({
+    description: "x",
+    prompt: "y",
+    subagent_type,
+  });
+
+  test("a read-only sub-agent (tools: [Read]) is parallel-safe", () => {
+    const tool = createTaskTool({
+      subAgents: new Map([["explorer", def("explorer", { tools: ["Read"] })]]),
+    });
+    expect(classify(tool, dispatch("explorer"), [read, bash])).toBe(true);
+  });
+
+  test("a sub-agent that can Bash is NOT parallel-safe", () => {
+    const tool = createTaskTool({
+      subAgents: new Map([["runner", def("runner", { tools: ["Read", "Bash"] })]]),
+    });
+    expect(classify(tool, dispatch("runner"), [read, bash])).toBe(false);
+  });
+
+  test("an inherit-the-whole-catalog child is NOT parallel-safe (catalog has Bash)", () => {
+    const tool = createTaskTool({
+      subAgents: new Map([["inheritor", def("inheritor", { permissions: "inherit" })]]),
+    });
+    expect(classify(tool, dispatch("inheritor"), [read, bash])).toBe(false);
+  });
+
+  test("a child that can spawn Task is NOT parallel-safe (Task is readOnly:false)", () => {
+    const tool = createTaskTool({
+      subAgents: new Map([["nested", def("nested", { tools: ["Read", "Task"] })]]),
+    });
+    // Include the Task tool itself in the catalog so buildChildCatalog resolves it.
+    expect(classify(tool, dispatch("nested"), [read, tool])).toBe(false);
+  });
+
+  test("a child with an empty tool set is NOT parallel-safe", () => {
+    const tool = createTaskTool({ subAgents: new Map([["empty", def("empty", { tools: [] })]]) });
+    expect(classify(tool, dispatch("empty"), [read, bash])).toBe(false);
+  });
+
+  test("fail-closed: unknown subagent_type routes serial", () => {
+    const tool = createTaskTool({ subAgentDir: "/tmp/nope-xyz-doesntexist" });
+    expect(classify(tool, dispatch("ghost"), [read])).toBe(false);
+  });
+
+  test("fail-closed: malformed input (missing prompt) routes serial", () => {
+    const tool = createTaskTool({
+      subAgents: new Map([["explorer", def("explorer", { tools: ["Read"] })]]),
+    });
+    expect(classify(tool, { description: "x", subagent_type: "explorer" }, [read])).toBe(false);
+  });
+});

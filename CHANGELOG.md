@@ -5,6 +5,45 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added — Claude-Code-parity runtime features
+
+- **Parallel read-only sub-agent fan-out**: multiple `Task` calls batched in
+  one assistant turn now execute CONCURRENTLY when the dispatched sub-agent's
+  entire tool set is read-only + concurrency-safe + non-destructive (e.g. a
+  `[Read, Glob, Grep]` explorer); command/write-capable workers still
+  serialize. Built on a new per-call `concurrencyClassifier` hook on
+  `RegisteredTool` (static flags can't express per-dispatch safety) and
+  bounded by a new `runChatLoop({ maxConcurrentTools })` option (default 4),
+  honored by both the batch and streaming executors.
+- **Background shells**: `Bash` gains `background: true` — detaches the
+  command, returns a `bash_id` immediately, and keeps it running across
+  turns. New companion tools `bashOutput` (incremental stdout/stderr since
+  the last poll + running/exited/killed status) and `killShell` (SIGKILL by
+  id). Live background processes are killed at host exit; per-stream output
+  is capped with truncation reporting. Registered across the compile/run
+  tool maps (spec keys `bashOutput`, `killShell`).
+- **`crewhaus run --prompt <text>` one-shot mode for `target: cli`**: runs a
+  single non-interactive turn, prints the final reply, and exits (no REPL) —
+  for scripting/CI; composes with `--resume`/`--continue`. Previously the
+  flag was silently ignored for cli targets.
+
+### Fixed
+
+- **`compaction.model` is now wired**: `crewhaus run` and the compiled
+  cli/channel bundles thread `ir.compaction.model` into the runtime's
+  `compactionModel` option, so auto-compaction actually summarizes on the
+  spec's chosen (typically cheaper) model instead of always using the
+  primary. Previously the field was parsed and lowered but inert on every
+  execution path (only `doctor --models` / `model right-size` read it).
+- Corrected the compiled-bundle banner comment claiming `CREWHAUS_RESUMED=1`
+  is "set by `--continue`/`--resume`" (nothing in the toolchain sets it; it
+  is an external-wrapper hook), and the `ToolCatalog` quarantine doc comments
+  that described a runtime notice-injection wiring that doesn't exist (the
+  shipped path reads `.crewhaus/mcp/quarantine.json` and filters by name
+  prefix in the CLI).
+
 ## [0.2.0] - 2026-07-03
 
 The automation release: CrewHaus harnesses now build their own evals, tune
