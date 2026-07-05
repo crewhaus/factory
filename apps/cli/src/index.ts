@@ -1021,6 +1021,12 @@ const INIT_SCHEMA: ParseArgsSchema = {
     // Overwrite an existing scaffolded workflow or eval assets (never the
     // spec).
     { name: "force", takesValue: false },
+    // Item 39 — interactive spec authoring: interview the user (via the
+    // resolved model, or a scripted stdin questionnaire when no credentials)
+    // and emit a parseSpec-validated crewhaus.yaml. Composes with --detect to
+    // prefill the model from what's reachable.
+    { name: "interactive", short: "i", takesValue: false },
+    { name: "detect", takesValue: false },
     { name: "help", short: "h" },
   ],
 };
@@ -1061,12 +1067,6 @@ const GRADERS_SUGGEST_SCHEMA: ParseArgsSchema = {
     { name: "min-score", takesValue: true },
     // Overwrite an existing review file (default: refuse).
     { name: "force", takesValue: false },
-    // Item 39 — interactive spec authoring: interview the user (via the
-    // resolved model, or a scripted stdin questionnaire when no credentials)
-    // and emit a parseSpec-validated crewhaus.yaml. Composes with --detect to
-    // prefill the model from what's reachable.
-    { name: "interactive", short: "i", takesValue: false },
-    { name: "detect", takesValue: false },
     { name: "help", short: "h" },
   ],
 };
@@ -1100,6 +1100,17 @@ const DOCTOR_SCHEMA: ParseArgsSchema = {
     // Container-HEALTHCHECK exit semantics (0 within/no-data, 1 breach).
     { name: "slo", takesValue: false },
     { name: "ttft", takesValue: false },
+    // Item 40 — `--detect`: read-only inventory of reachable providers, the
+    // local Ollama/vLLM endpoint's models, and MCP servers from
+    // .mcp.json / Claude Desktop config. `--no-probe` skips the localhost HTTP
+    // probe (offline / CI).
+    { name: "detect", takesValue: false },
+    { name: "no-probe", takesValue: false },
+    // Item 40 — `--fix`: apply the mechanical remediations doctor otherwise
+    // only prints (scaffold crewhaus.yaml, create .crewhaus/, mark outward
+    // tools scope:external, append commented .env stubs). Dry-run is the
+    // DEFAULT: without --fix, doctor prints the diff it WOULD apply.
+    { name: "fix", takesValue: false },
     { name: "help", short: "h" },
   ],
 };
