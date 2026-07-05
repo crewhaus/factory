@@ -5,11 +5,14 @@ Every model call in a compiled CrewHaus harness routes through
 `resolveModel(modelString)` — adapters for providers you don't use are never
 imported, let alone constructed.
 
-Since 0.2.0 the package also owns the two spec-native routing layers built
-on `resolveModel`: the provider [failover chain](#failover-chain-agentmodel_fallbacks)
-(`createFailoverChain`, behind `agent.model_fallbacks` / `agent.circuit_breaker`)
-and the [two-tier turn-difficulty router](#two-tier-router-agentmodel_tiers)
-(`createTierRouter` / `pickTier`, behind `agent.model_tiers`).
+Since 0.2.0 the package also owns the spec-native routing layers built on
+`resolveModel`: the provider [failover chain](#failover-chain-agentmodel_fallbacks)
+(`createFailoverChain`, behind `agent.model_fallbacks` / `agent.circuit_breaker`),
+the [two-tier turn-difficulty router](#two-tier-router-agentmodel_tiers)
+(`createTierRouter` / `pickTier`, behind `agent.model_tiers`), and — since 0.2.1
+— the [adaptive model pool](#model-pool-agentmodel_pool) (`createPolicyRouter`,
+behind `agent.model_pool`), whose `learned` policy improves selection the more
+the harness runs.
 
 ## Model string grammar
 
@@ -118,3 +121,43 @@ fails re-runs on `default` (`escalation()`) — the misroute recovery,
 composing with the `switch-model` recovery ladder. Unlike the failover chain
 this is not a `stream()` wrapper: the tier decision is a loop-level signal,
 so the loop picks per turn and streams directly through the chosen adapter.
+
+## Model pool (`agent.model_pool`)
+
+Since 0.2.1, `createPolicyRouter` generalises the two-tier router to **N
+user-declared candidate models with a selection `policy`** — and, under the
+`learned` policy, a choice that improves the more the harness runs. It is the
+N-candidate superset of `model_tiers` (mutually exclusive with `model_tiers`
+and `model_fallbacks` at the spec layer). Like the tier router, every candidate
+adapter binds once at boot and `route(signals)` only selects among them;
+runtime-core streams through the chosen candidate and publishes a `model_route`
+trace event each turn.
+
+| Policy | Per-turn pick | State |
+| --- | --- | --- |
+| `static` | always the first declared candidate | none |
+| `heuristic` (default) | hard turns → a `strong`-tagged candidate, easy turns → a `cheap`-tagged one (same `pickTier` difficulty signals as `model_tiers`; declaration order is the tag-less fallback) | none |
+| `learned` | the best arm for the turn's difficulty band, off a durable reward scoreboard | `@crewhaus/routing-store` |
+
+The `learned` policy is **deterministic** — no RNG, replayable from the
+persisted scoreboard plus the turn's signals. It explores least-sampled-first
+(declared order breaks ties) until every candidate in a band clears
+`minSamplesPerArm`, then exploits the highest mean reward. Selection is fs-free:
+the policy reads the scoreboard through an injected `score(routeKey, model)`
+lookup, so runtime-core owns all persistence. After each turn runtime-core folds
+the observed outcome (success, latency, token-priced cost — a failed turn scores
+0, so a fast failure can't out-rank a reliable model) into
+[`@crewhaus/routing-store`](../routing-store), whose reward function and
+append-only per-`(routeKey, model)` scoreboard live there. A failed candidate
+escalates to the strongest candidate (`escalation()`), mirroring the tier
+router's fast→default misroute recovery.
+
+Inspect or reset the accumulated scoreboard from the CLI:
+
+```
+crewhaus route status   # per-bucket arms, best-per-band starred
+crewhaus route reset    # wipe the scoreboard (kill switch)
+```
+
+Exports: `createPolicyRouter`, `PolicyRouter`, `PolicyDecision`, `PoolCandidate`,
+`PoolPolicy`, `PoolRoutingConfig`, `PoolLearningConfig`, `ScoreLookup`.
