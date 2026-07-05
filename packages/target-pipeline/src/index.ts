@@ -57,6 +57,19 @@ function renderSecretExpr(ref: IrSecretRef): string {
 }
 
 /**
+ * Adaptive model routing — render the `modelPool` runChatLoop field.
+ * JSON.stringify safely quotes the validated pool object (a plain object
+ * literal, mirroring target-cli's renderModelFailoverFields; keep the
+ * pipeline/research/batch/browser copies in sync). Empty when the spec omits
+ * `model_pool`, keeping bundles byte-identical.
+ */
+function poolField(ir: IrPipelineV0, indent: string): string {
+  return ir.agent.modelPool !== undefined
+    ? `\n${indent}modelPool: ${JSON.stringify(ir.agent.modelPool)},`
+    : "";
+}
+
+/**
  * Build the `createVectorStore({ ... })` call. Only the fields the IR
  * carries are emitted, so an `in-memory` pipeline stays byte-identical to
  * `createVectorStore({ backend: "in-memory" })`; remote/file backends add
@@ -174,7 +187,7 @@ if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));
 
 await runChatLoop({
   model: ${escapeJsonString(ir.agent.model)},
-  instructions: ${escapeJsonString(ir.agent.instructions)},
+  instructions: ${escapeJsonString(ir.agent.instructions)},${poolField(ir, "  ")}
   sessionName: ${escapeJsonString(ir.name)},
   sessionTarget: "pipeline",
   tools: defaultCatalog.list(),${permField}
