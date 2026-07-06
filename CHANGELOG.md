@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`crewhaus run` now honours `agent.model_pool`.** The interpreted cli run
+  path threaded `model_tiers` / `model_fallbacks` into the runtime but silently
+  dropped `model_pool`, so `crewhaus run` ignored adaptive routing while the
+  compiled cli bundle honoured it. `run` now threads it identically (disabled by
+  a `--model` override, like the other routing blocks).
 ### Added — adaptive model routing (P4)
 
 - **Online ε-greedy exploration for `agent.model_pool` (`policy: learned`)**:
