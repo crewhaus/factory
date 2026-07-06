@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+<<<<<<< HEAD
+### Added — adaptive model routing (P3: offline learning)
+
+- **`crewhaus advise` mines the `model_pool` reward scoreboard**
+  (`.crewhaus/routing/arms.jsonl`) into two new findings: a **policy-upgrade
+  SpecPatch** (flip `model_pool.policy` to `learned` once every candidate has
+  cleared the sample floor in a difficulty band) and a **candidate-demotion
+  advisory** (a candidate past the floor that trails the band best by ≥0.3 mean
+  reward in every measured band — advice-only, because the candidate roster is
+  human-owned). `optimize --from-advice` eval-gates the policy patch through
+  the existing accept/compose loop — no new optimize surface needed.
+- **`OPTIMIZABLE_PATHS` gains the pool POLICY knobs only** —
+  `["agent","model_pool","policy"|"routing"|"learning"]` on cli/channel/managed.
+  `["agent","model_pool"]` wholesale and `["agent","model_pool","candidates"]`
+  stay rejected, mirroring the standing `["agent","model"]` exclusion: learning
+  tunes selection within the declared set, never the set.
+- **`specHasPath(yamlText, path)`** in `@crewhaus/spec-patch`: whether the YAML
+  source textually carries a key (Zod-defaulted fields are always present on
+  the parsed spec, but `applySpecPatch` needs `add` vs `replace` to match the
+  document) — used by the advise rules to emit the correct op.
+### Fixed
+
+- **`crewhaus run` now honours `agent.model_pool`.** The interpreted cli run
+  path threaded `model_tiers` / `model_fallbacks` into the runtime but silently
+  dropped `model_pool`, so `crewhaus run` ignored adaptive routing while the
+  compiled cli bundle honoured it. `run` now threads it identically (disabled by
+  a `--model` override, like the other routing blocks).
 ### Added — adaptive model routing (P4)
 
 - **Thompson sampling bandit for `agent.model_pool` (`policy: learned`)**: a new
@@ -16,6 +43,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   arms self-explore and the policy needs no exploration-rate tuning. Same
   transcript-seeded RNG, so it replays exactly; runs only after the sample-floor
   warm-up, and `epsilon-greedy` remains the default.
+=======
+>>>>>>> origin/main
 - **Online ε-greedy exploration for `agent.model_pool` (`policy: learned`)**:
   a new `learning.explorationRate` (default `0`) makes the learned policy keep
   sampling non-best candidates a fraction of the time once every arm has
@@ -31,6 +60,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   turn that runs tools routes more than once as the difficulty band shifts, so
   the same `turnNumber` can appear on consecutive rows. Non-conversational, so
   `--resume` is unaffected.
+<<<<<<< HEAD
+=======
+### Added — adaptive model routing on more shapes
+
+- **`agent.model_pool` now works on the pipeline, research, batch, and browser
+  targets** (previously cli/channel/managed only). These shapes' emitted
+  runtimes each call `runChatLoop` with a single primary — exactly the cli
+  execution model — so the pool routes (and, under `policy: learned`, keeps
+  learning) there with zero runtime changes; the compiled bundle threads the
+  lowered pool into `runChatLoop`, and specs without it compile
+  byte-identically. Deliberately NOT extended to onchain/onchain-game (their
+  emitted bundles are callable modules whose agent-loop wiring is still
+  deferred, so the field would be inert) or to workflow/graph/crew (per-unit
+  models — pool attachment there is a future design).
+>>>>>>> origin/main
 
 ## [0.2.1] - 2026-07-05
 

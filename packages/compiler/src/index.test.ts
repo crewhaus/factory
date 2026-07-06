@@ -2697,6 +2697,115 @@ agent:
   });
 });
 
+describe("lower/emit — model_pool on the pipeline/research/batch/browser shapes", () => {
+  const POOL_BLOCK = [
+    "  model_pool:",
+    "    policy: heuristic",
+    "    candidates:",
+    "      - { model: claude-haiku-4-5, tags: [cheap] }",
+    "      - { model: claude-opus-4-1, tags: [strong] }",
+  ].join("\n");
+
+  // Per shape: the minimal valid spec WITHOUT the pool, and the pool inserted
+  // right after the agent block. Codegen must carry the pool when present and
+  // stay byte-identical when absent.
+  const SHAPES: ReadonlyArray<{ target: string; spec: (pool: string) => string }> = [
+    {
+      target: "pipeline",
+      spec: (pool) => `
+name: p
+target: pipeline
+agent:
+  model: claude-sonnet-4-6
+  instructions: answer using Retrieve
+${pool}retrieve:
+  embedderModel: embed-1
+indexing:
+  chunkStrategy: fixed
+  chunkSize: 200
+  chunkOverlap: 0
+  documents:
+    - id: d1
+      text: hello world
+`,
+    },
+    {
+      target: "research",
+      spec: (pool) => `
+name: rs
+target: research
+agent:
+  model: claude-sonnet-4-6
+  instructions: i
+${pool}goal: find stuff
+`,
+    },
+    {
+      target: "batch",
+      spec: (pool) => `
+name: bt
+target: batch
+agent:
+  model: claude-sonnet-4-6
+  instructions: i
+${pool}queue:
+  adapter: in-memory
+  visibilityTimeoutMs: 15000
+  maxRetries: 3
+`,
+    },
+    {
+      target: "browser",
+      spec: (pool) => `
+name: br
+target: browser
+agent:
+  model: claude-sonnet-4-6
+  instructions: i
+${pool}`,
+    },
+  ];
+
+  test("each shape lowers model_pool and threads it into the emitted runChatLoop", () => {
+    for (const s of SHAPES) {
+      const withPool = s.spec(`${POOL_BLOCK}\n`);
+      const ir = lower(parseSpec(withPool));
+      const agent = (ir as { agent: { modelPool?: { policy: string } } }).agent;
+      expect(agent.modelPool?.policy).toBe("heuristic");
+
+      const agentTs = compile(withPool).files.find((f) => f.path === "agent.ts")?.content ?? "";
+      expect(agentTs).toContain("modelPool: {");
+      expect(agentTs).toContain('"policy":"heuristic"');
+      expect(agentTs).toContain('"model":"claude-haiku-4-5"');
+    }
+  });
+
+  test("without model_pool the emitted bundles carry no modelPool field (byte-identical guard)", () => {
+    for (const s of SHAPES) {
+      const agentTs = compile(s.spec("")).files.find((f) => f.path === "agent.ts")?.content ?? "";
+      expect(agentTs).not.toContain("modelPool");
+    }
+  });
+
+  test("model_pool + model_tiers stays impossible on these shapes (no tiers field at all)", () => {
+    // The shared pooled agent schema is strict: tiers/fallbacks were never
+    // legal on these shapes and adding the pool must not have opened them.
+    expect(() =>
+      parseSpec(
+        [
+          "name: rs",
+          "target: research",
+          "agent:",
+          "  model: m",
+          "  instructions: i",
+          "  model_tiers: { fast: a, default: b }",
+          "goal: g",
+        ].join("\n"),
+      ),
+    ).toThrow();
+  });
+});
+
 describe("lower/emit — switch-model recovery action + failureTaxonomy codegen (item 23)", () => {
   const SWITCH_MODEL_SPEC = `
 name: resilient

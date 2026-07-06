@@ -15,6 +15,7 @@
  * context slice for each missing kind and simply produce no findings — the
  * rules only fire where the data now exists.
  */
+import type { ArmStats } from "@crewhaus/routing-store";
 import type { Spec } from "@crewhaus/spec";
 import { type SpecPatch, validatePatch } from "@crewhaus/spec-patch";
 
@@ -111,6 +112,13 @@ export type AdviceContext = {
   readonly totalToolBytes: number;
   /** `.crewhaus/audit` record kinds → counts (report context + future rules). */
   readonly auditKindCounts: ReadonlyMap<string, number>;
+  /**
+   * Adaptive model routing — the `model_pool` reward scoreboard arms from
+   * `.crewhaus/routing/arms.jsonl` (empty when the harness has never routed a
+   * pool). The routing rules mine these into pool-POLICY suggestions; the
+   * candidate roster itself stays human-owned.
+   */
+  readonly routingArms: ReadonlyArray<ArmStats>;
 };
 
 export type SessionEvents = {
@@ -187,6 +195,7 @@ export function payloadOf(obj: unknown, kind: string): Record<string, unknown> |
 export function buildAdviceContext(
   sessions: ReadonlyArray<SessionEvents>,
   auditObjects: ReadonlyArray<unknown> = [],
+  routingArms: ReadonlyArray<ArmStats> = [],
 ): AdviceContext {
   const toolStats = new Map<string, ToolCallStats>();
   const recoveriesByAction = new Map<string, number>();
@@ -320,6 +329,7 @@ export function buildAdviceContext(
     perToolBytes,
     totalToolBytes,
     auditKindCounts,
+    routingArms,
   };
 }
 
@@ -355,6 +365,13 @@ export type AdviceThresholds = {
   /** Item 21 — minimum total tool bytes before dominance is judged at all
    *  (a handful of tiny calls shouldn't trip a restructure). */
   toolByteMinTotal: number;
+  /** Adaptive routing — samples an arm needs before the routing rules judge
+   *  it, when the spec doesn't set `model_pool.learning.minSamplesPerArm`.
+   *  Mirrors the PolicyRouter's own default floor. */
+  poolMinSamples: number;
+  /** Adaptive routing — mean-reward gap below the band best at/above which a
+   *  candidate is called consistently losing (demotion advice). */
+  poolDemotionGap: number;
 };
 
 /**
@@ -376,6 +393,8 @@ export const DEFAULT_ADVICE_THRESHOLDS: AdviceThresholds = {
   chronicCompactionSessions: 2,
   toolByteDominance: 0.6,
   toolByteMinTotal: 50_000,
+  poolMinSamples: 25,
+  poolDemotionGap: 0.3,
 };
 
 /** Stop reasons that are part of healthy operation; everything else
@@ -391,6 +410,16 @@ export type RuleOptions = {
   /** The cwd spec, when one exists — enables patch suggestions. */
   readonly spec?: Spec;
   readonly thresholds?: Partial<AdviceThresholds>;
+  /**
+   * Whether the RAW spec YAML textually carries a key at `path` (the driver
+   * builds this from `specHasPath` in `@crewhaus/spec-patch`). Zod-defaulted
+   * fields are always present on the parsed `spec`, but `applySpecPatch`
+   * requires `add` for absent keys and `replace` for present ones — a rule
+   * proposing a patch on a defaultable field needs this to pick the op.
+   * Absent → such rules assume the key is absent (the common case for
+   * defaulted fields) and emit `add`.
+   */
+  readonly specHasPath?: (path: ReadonlyArray<string>) => boolean;
 };
 
 export type AdviceRule = (ctx: AdviceContext, opts?: RuleOptions) => AdviceFinding[];
@@ -1008,6 +1037,132 @@ export const ruleSubAgentSplit: AdviceRule = (ctx, opts) => {
   ];
 };
 
+// -------- adaptive model routing (model_pool scoreboard mining) --------
+
+/** Typed view over the spec's `agent.model_pool`, when present. */
+type SpecModelPoolView = {
+  readonly candidates: ReadonlyArray<{ readonly model: string }>;
+  readonly policy: "static" | "heuristic" | "learned";
+  readonly learning?: { readonly minSamplesPerArm?: number };
+};
+
+function agentModelPool(spec: Spec | undefined): SpecModelPoolView | undefined {
+  const agent = specField<Record<string, unknown>>(spec, "agent");
+  const pool = agent?.["model_pool"];
+  if (pool === undefined || pool === null || typeof pool !== "object") return undefined;
+  return pool as SpecModelPoolView;
+}
+
+/** The bands (routeKeys) where EVERY pool candidate has ≥ `floor` samples. */
+function bandsWithFullCoverage(
+  arms: ReadonlyArray<ArmStats>,
+  candidates: ReadonlyArray<{ readonly model: string }>,
+  floor: number,
+): string[] {
+  const bands = [...new Set(arms.map((a) => a.routeKey))];
+  return bands.filter((band) =>
+    candidates.every((c) =>
+      arms.some((a) => a.routeKey === band && a.model === c.model && a.n >= floor),
+    ),
+  );
+}
+
+/**
+ * Pool policy upgrade: the spec declares a `model_pool` that is NOT yet
+ * `learned`, and the reward scoreboard already has full-coverage data (every
+ * candidate past the sample floor in ≥1 difficulty band) — the harness has
+ * earned the right to exploit what it measured. Proposes flipping
+ * `model_pool.policy` to `learned` (whitelisted; `optimize --from-advice`
+ * eval-gates the flip). The candidate ROSTER is never touched.
+ */
+export const rulePoolPolicyUpgrade: AdviceRule = (ctx, opts) => {
+  const t = resolveThresholds(opts);
+  const spec = opts?.spec;
+  const pool = agentModelPool(spec);
+  if (pool === undefined || pool.policy === "learned") return [];
+  if (ctx.routingArms.length === 0 || pool.candidates.length < 2) return [];
+  const floor = pool.learning?.minSamplesPerArm ?? t.poolMinSamples;
+  const ready = bandsWithFullCoverage(ctx.routingArms, pool.candidates, floor);
+  if (ready.length === 0) return [];
+  const totalSamples = ctx.routingArms.reduce((acc, a) => acc + a.n, 0);
+  const adviceText = `The model_pool reward scoreboard has ≥${floor} samples for every candidate in band(s) ${ready.join(", ")} — set model_pool.policy: learned so routing exploits the measured per-band winners instead of the fixed heuristic.`;
+  const policyKeyPresent = opts?.specHasPath?.(["agent", "model_pool", "policy"]) ?? false;
+  const patch: SpecPatch = {
+    target: spec?.target ?? "cli",
+    path: ["agent", "model_pool", "policy"],
+    op: policyKeyPresent ? "replace" : "add",
+    value: "learned",
+    rationale: `advise: scoreboard full coverage (every candidate ≥${floor} samples) in band(s) ${ready.join(", ")} across ${totalSamples} routed decisions`,
+  };
+  return [
+    {
+      id: "pool-policy-upgrade",
+      severity: "info",
+      summary: "model_pool scoreboard is ready — flip policy to learned",
+      evidence: [
+        `bands with every candidate ≥${floor} samples: ${ready.join(", ")}`,
+        `${totalSamples} routed decisions recorded across ${ctx.routingArms.length} arm(s)`,
+        `current policy: ${pool.policy}`,
+      ],
+      counts: { readyBands: ready.length, totalSamples },
+      suggestion: patchOrAdvice(spec, patch, adviceText),
+    },
+  ];
+};
+
+/**
+ * Pool candidate demotion: a candidate that is past the sample floor and
+ * loses to the band best by ≥ `poolDemotionGap` mean reward in EVERY band
+ * with full coverage is consistently wasted spend. ADVICE-ONLY by design:
+ * the candidate roster is human-owned (mirroring the `["agent","model"]`
+ * OPTIMIZABLE_PATHS exclusion), so this never emits a patch — it names the
+ * loser and lets a human edit `model_pool.candidates`.
+ */
+export const rulePoolCandidateDemotion: AdviceRule = (ctx, opts) => {
+  const t = resolveThresholds(opts);
+  const pool = agentModelPool(opts?.spec);
+  if (pool === undefined || ctx.routingArms.length === 0 || pool.candidates.length < 3) {
+    // With only 2 candidates, "demote the loser" would collapse the pool —
+    // routing a 1-model pool is meaningless; leave that call entirely human.
+    return [];
+  }
+  const floor = pool.learning?.minSamplesPerArm ?? t.poolMinSamples;
+  const fullBands = bandsWithFullCoverage(ctx.routingArms, pool.candidates, floor);
+  if (fullBands.length === 0) return [];
+  const losers = pool.candidates.filter((c) =>
+    fullBands.every((band) => {
+      const bandArms = ctx.routingArms.filter((a) => a.routeKey === band);
+      const best = Math.max(...bandArms.map((a) => a.meanReward));
+      const own = bandArms.find((a) => a.model === c.model);
+      return own !== undefined && own.meanReward <= best - t.poolDemotionGap;
+    }),
+  );
+  return losers.map((loser) => {
+    const detail = fullBands
+      .map((band) => {
+        const bandArms = ctx.routingArms.filter((a) => a.routeKey === band);
+        const best = Math.max(...bandArms.map((a) => a.meanReward));
+        const own = bandArms.find((a) => a.model === loser.model);
+        return `${band}: ${own?.meanReward.toFixed(3)} vs best ${best.toFixed(3)}`;
+      })
+      .join("; ");
+    return {
+      id: `pool-candidate-demotion:${loser.model}`,
+      severity: "info" as const,
+      summary: `model_pool candidate ${loser.model} consistently loses`,
+      evidence: [
+        `mean reward trails the band best by ≥${t.poolDemotionGap} in every full-coverage band (${detail})`,
+        "the candidate roster is human-owned — remove it from model_pool.candidates by hand if the trend holds",
+      ],
+      counts: { fullBands: fullBands.length },
+      suggestion: {
+        kind: "advice" as const,
+        text: `Candidate ${loser.model} has enough samples and still trails the best arm by ≥${t.poolDemotionGap} mean reward in every measured band (${detail}). Consider removing it from model_pool.candidates — fewer arms also means less exploration spend. This is a roster change, so it is never auto-applied.`,
+      },
+    };
+  });
+};
+
 export const ADVICE_RULES: ReadonlyArray<AdviceRule> = [
   ruleRepeatedToolFailures,
   ruleTruncationPressure,
@@ -1017,6 +1172,8 @@ export const ADVICE_RULES: ReadonlyArray<AdviceRule> = [
   ruleFailureTaxonomy,
   ruleLoopBreak,
   ruleSubAgentSplit,
+  rulePoolPolicyUpgrade,
+  rulePoolCandidateDemotion,
 ];
 
 /**

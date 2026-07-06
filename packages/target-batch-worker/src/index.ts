@@ -132,6 +132,19 @@ function renderPermissionsField(ir: IrBatchV0): string {
   return `\n${lines.join("\n")}`;
 }
 
+/**
+ * Adaptive model routing — render the `modelPool` runChatLoop field.
+ * JSON.stringify safely quotes the validated pool object (mirroring
+ * target-cli's renderModelFailoverFields; keep the pipeline/research/batch/
+ * browser copies in sync). Empty when the spec omits `model_pool`, keeping
+ * bundles byte-identical.
+ */
+function poolField(ir: IrBatchV0, indent: string): string {
+  return ir.agent.modelPool !== undefined
+    ? `\n${indent}modelPool: ${JSON.stringify(ir.agent.modelPool)},`
+    : "";
+}
+
 export function emitBatchWorker(ir: IrBatchV0, opts: EmitReadmeOptions = {}): Bundle {
   if (ir.queue.adapter !== "in-memory") {
     // v0 only ships the in-memory adapter; the others are stubs that
@@ -249,7 +262,7 @@ async function main(): Promise<void> {
       const runContext = createRunContext();
       const reply = await runChatLoop({
         model: SPEC_MODEL,
-        instructions: SPEC_INSTRUCTIONS,
+        instructions: SPEC_INSTRUCTIONS,${poolField(ir, "        ")}
         runContext,
         sessionName: SPEC_NAME,
         sessionTarget: "batch",

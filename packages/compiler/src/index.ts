@@ -536,7 +536,10 @@ type SpecAgentWithFailover = {
       readonly latencyRefMs?: number;
       readonly explorationRate?: number;
       readonly seed?: string;
+<<<<<<< HEAD
       readonly bandit?: "epsilon-greedy" | "thompson";
+=======
+>>>>>>> origin/main
     };
   };
 };
@@ -647,7 +650,10 @@ function lowerModelFailover(agent: SpecAgentWithFailover): {
                 ? { explorationRate: learning.explorationRate }
                 : {}),
               ...(learning.seed !== undefined ? { seed: learning.seed } : {}),
+<<<<<<< HEAD
               ...(learning.bandit !== undefined ? { bandit: learning.bandit } : {}),
+=======
+>>>>>>> origin/main
             },
           }
         : {}),
@@ -1156,7 +1162,12 @@ export function lower(spec: Spec): IrNode {
         version: 0,
         name: spec.name,
         target: "pipeline",
-        agent: { model: spec.agent.model, instructions: spec.agent.instructions },
+        agent: {
+          model: spec.agent.model,
+          instructions: spec.agent.instructions,
+          // Adaptive model routing — lowers model_pool when declared.
+          ...lowerModelFailover(spec.agent),
+        },
         retrieve: {
           embedderModel: spec.retrieve.embedderModel,
           vectorBackend: spec.retrieve.vectorBackend,
@@ -1214,7 +1225,12 @@ export function lower(spec: Spec): IrNode {
         version: 0,
         name: spec.name,
         target: "research",
-        agent: { model: spec.agent.model, instructions: spec.agent.instructions },
+        agent: {
+          model: spec.agent.model,
+          instructions: spec.agent.instructions,
+          // Adaptive model routing — lowers model_pool when declared.
+          ...lowerModelFailover(spec.agent),
+        },
         goal: spec.goal,
         branchingFactor: spec.branchingFactor,
         maxDurationMs: spec.maxDurationMs,
@@ -1239,7 +1255,12 @@ export function lower(spec: Spec): IrNode {
         version: 0,
         name: spec.name,
         target: "batch",
-        agent: { model: spec.agent.model, instructions: spec.agent.instructions },
+        agent: {
+          model: spec.agent.model,
+          instructions: spec.agent.instructions,
+          // Adaptive model routing — lowers model_pool when declared.
+          ...lowerModelFailover(spec.agent),
+        },
         queue: {
           adapter: spec.queue.adapter,
           visibilityTimeoutMs: spec.queue.visibilityTimeoutMs,
@@ -1287,7 +1308,12 @@ export function lower(spec: Spec): IrNode {
         version: 0,
         name: spec.name,
         target: "browser",
-        agent: { model: spec.agent.model, instructions: spec.agent.instructions },
+        agent: {
+          model: spec.agent.model,
+          instructions: spec.agent.instructions,
+          // Adaptive model routing — lowers model_pool when declared.
+          ...lowerModelFailover(spec.agent),
+        },
         driver: {
           backend: spec.driver.backend,
           viewport: { width: spec.driver.viewport.width, height: spec.driver.viewport.height },
