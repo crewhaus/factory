@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/egress-matcher-semantic",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "type": "module",
   "description": "Optional embedding-backed EgressMatcher — scores outbound payloads against tagged data-lineage by cosine similarity, so semantic (paraphrased / re-encoded) leakage is caught where the substring default would miss it. The default egress path never imports this; it is opt-in per spec/runtime.",
   "main": "src/index.ts",

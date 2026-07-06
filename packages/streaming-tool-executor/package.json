@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/streaming-tool-executor",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "type": "module",
   "description": "Dispatch tool execution mid-stream so tools start before message_stop",
   "main": "src/index.ts",

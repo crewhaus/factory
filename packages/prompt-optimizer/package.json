@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/prompt-optimizer",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "type": "module",
   "description": "DSPy-style automated prompt tuning. Search over candidate prompt mutations using eval-runner as the fitness function.",
   "main": "src/index.ts",

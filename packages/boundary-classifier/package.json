@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/boundary-classifier",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "type": "module",
   "description": "Pillar-3 chokepoint — classify content crossing every trust boundary (MCP / sub-agent / channel / federation / skill / compaction / tool) with origin metadata and a content-hash LRU cache",
   "main": "src/index.ts",

@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/hooks-engine",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "type": "module",
   "description": "Lifecycle hooks engine: load .crewhaus/settings.json, spawn hook commands with restricted env, aggregate decisions",
   "main": "src/index.ts",

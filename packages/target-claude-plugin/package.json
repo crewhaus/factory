@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/target-claude-plugin",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "type": "module",
   "description": "Track H / §59 — emits an Anthropic-compatible Claude Code plugin directory from any CrewHaus IR variant. Source: claude-plugins-official (Anthropic).",
   "main": "src/index.ts",

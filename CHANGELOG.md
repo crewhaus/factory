@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-07-06
+
+The adaptive-routing completion release: `agent.model_pool` learns ONLINE
+(ε-greedy exploration [#287] and a Thompson-sampling bandit [#292]), explains
+itself (`crewhaus route explain`, backed by durable `model_route` events
+[#287]), works everywhere the single-agent loop runs (`crewhaus run` [#288]
+and the pipeline/research/batch/browser shapes [#291]), and closes the offline
+loop (`crewhaus advise` mines the reward scoreboard into eval-gated pool-policy
+patches [#290], [#294]). The `rankFallbacks` seam is deliberately retired with
+the rationale recorded in-code ([#293]).
+
 ### Added — adaptive model routing (P3: offline learning)
 
 - **`crewhaus advise` mines the `model_pool` reward scoreboard**
@@ -87,6 +98,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   order"), and cost-tracker's `rankCandidates` header (caveats for any future
   library caller). Revisit trigger documented: trip-time re-ranking, only if
   durable per-model cache telemetry becomes default-on.
+
+[0.2.2]: https://github.com/crewhaus/factory/compare/v0.2.1...v0.2.2
+[#287]: https://github.com/crewhaus/factory/pull/287
+[#288]: https://github.com/crewhaus/factory/pull/288
+[#290]: https://github.com/crewhaus/factory/pull/290
+[#291]: https://github.com/crewhaus/factory/pull/291
+[#292]: https://github.com/crewhaus/factory/pull/292
+[#293]: https://github.com/crewhaus/factory/pull/293
+[#294]: https://github.com/crewhaus/factory/pull/294
 
 ## [0.2.1] - 2026-07-05
 

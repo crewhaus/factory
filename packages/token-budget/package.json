@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/token-budget",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "type": "module",
   "description": "Token estimation heuristic + running budget tracker",
   "main": "src/index.ts",
