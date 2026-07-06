@@ -2053,6 +2053,7 @@ function usageText(): string {
     "       [--factory-root <p>] [--docs-root <p>] [--demos-root <p>]",
     "  cost-summary --session <id>          summarize cost_accrual events for a session",
     "  route status [--dir <root>]          show the adaptive model_pool reward scoreboard",
+    "  route explain <session> [--dir <r>]  replay a run's per-turn model_route decisions",
     "  route reset  [--dir <root>]          wipe the scoreboard (default root .crewhaus)",
     "  advise [--session <id> | --all]      mine session logs for spec advice (item 14)",
     "       [--json] [-o <dir>]             writes suggestions.json + report.html (default .crewhaus/advice)",
@@ -4285,6 +4286,16 @@ async function runRunCli(
       typeof modelOverride !== "string" &&
       ir.agent.modelTiers !== undefined
         ? { modelTiers: ir.agent.modelTiers }
+        : {}),
+      // Adaptive model routing — thread `agent.model_pool` so `crewhaus run`
+      // routes (and learns) exactly like the compiled cli bundle, not just the
+      // single primary. Mutually exclusive with tiers/fallbacks in the spec;
+      // a `--model` override forces a single model, so the pool applies only
+      // without an override.
+      ...(ir.target === "cli" &&
+      typeof modelOverride !== "string" &&
+      ir.agent.modelPool !== undefined
+        ? { modelPool: ir.agent.modelPool }
         : {}),
       // Section 55 / item 23 — thread the spec's failure_taxonomy so
       // recovery-engine consults the user's named error classes (including

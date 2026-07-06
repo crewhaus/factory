@@ -1,9 +1,16 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openScoreboard } from "@crewhaus/routing-store";
-import { formatRouteStatus, loadArms, parseRouteArgs, resetRouting, runRoute } from "./route";
+import {
+  formatRouteStatus,
+  loadArms,
+  parseRouteArgs,
+  readRouteDecisions,
+  resetRouting,
+  runRoute,
+} from "./route";
 
 const TMP: string[] = [];
 function seededRoot(): string {
@@ -27,8 +34,22 @@ describe("route — arg parsing", () => {
   });
   test("rejects a missing subcommand, unknown args, and a dangling --dir", () => {
     expect(() => parseRouteArgs([])).toThrow(/subcommand/);
-    expect(() => parseRouteArgs(["bogus"])).toThrow(/unknown argument/);
+    expect(() => parseRouteArgs(["bogus"])).toThrow(/unknown argument/); // not a subcommand
+    expect(() => parseRouteArgs(["--bogus"])).toThrow(/unknown argument/); // unknown flag
+    expect(() => parseRouteArgs(["status", "extra"])).toThrow(/unknown argument/); // status takes no positional
     expect(() => parseRouteArgs(["status", "--dir"])).toThrow(/requires a path/);
+  });
+
+  test("a subcommand keyword after `explain` is a session id, not a re-dispatch", () => {
+    // `route explain status` explains a session literally named "status" —
+    // it must NOT silently run `route status`.
+    expect(parseRouteArgs(["explain", "status"])).toEqual({
+      sub: "explain",
+      dir: ".crewhaus",
+      session: "status",
+    });
+    // `route status explain` — status takes no positional → error, not a swap.
+    expect(() => parseRouteArgs(["status", "explain"])).toThrow(/unknown argument/);
   });
 });
 
@@ -75,5 +96,100 @@ describe("route reset", () => {
     const dir = mkdtempSync(join(tmpdir(), "crewhaus-route-reset-empty-"));
     TMP.push(dir);
     expect(resetRouting(dir)).toBe(0);
+  });
+});
+
+/** Write a session JSONL with the given model_route + noise events. */
+function sessionWith(dir: string, sessionId: string, lines: object[]): void {
+  mkdirSync(join(dir, "sessions"), { recursive: true });
+  writeFileSync(
+    join(dir, "sessions", `${sessionId}.jsonl`),
+    `${lines.map((l) => JSON.stringify(l)).join("\n")}\n`,
+  );
+}
+
+describe("route explain — arg parsing", () => {
+  test("requires a session id", () => {
+    expect(() => parseRouteArgs(["explain"])).toThrow(/session.*required/i);
+    expect(parseRouteArgs(["explain", "sess_1"])).toEqual({
+      sub: "explain",
+      dir: ".crewhaus",
+      session: "sess_1",
+    });
+    expect(parseRouteArgs(["explain", "sess_1", "--dir", "/tmp/x"])).toEqual({
+      sub: "explain",
+      dir: "/tmp/x",
+      session: "sess_1",
+    });
+    expect(parseRouteArgs(["--dir", "/tmp/x", "explain", "sess_1"])).toEqual({
+      sub: "explain",
+      dir: "/tmp/x",
+      session: "sess_1",
+    });
+  });
+});
+
+describe("route explain", () => {
+  test("reads model_route events in turn order, skipping noise + malformed lines", () => {
+    const dir = mkdtempSync(join(tmpdir(), "crewhaus-route-explain-"));
+    TMP.push(dir);
+    sessionWith(dir, "sess_abc", [
+      { ts: 1, version: 1, kind: "user_message", payload: { content: "hi" } },
+      {
+        ts: 2,
+        version: 1,
+        kind: "model_route",
+        payload: {
+          turnNumber: 1,
+          routeKey: "hard",
+          model: "claude-opus-4-8",
+          policy: "learned",
+          reason: "first turn",
+          explored: false,
+        },
+      },
+      { ts: 3, version: 1, kind: "model_meta", payload: { stopReason: "end_turn", model: "x" } },
+      {
+        ts: 4,
+        version: 1,
+        kind: "model_route",
+        payload: {
+          turnNumber: 2,
+          routeKey: "easy",
+          model: "claude-haiku-4-5",
+          policy: "learned",
+          reason: "ε-greedy explore",
+          explored: true,
+        },
+      },
+    ]);
+    const decisions = readRouteDecisions(dir, "sess_abc");
+    expect(decisions.map((d) => d.turnNumber)).toEqual([1, 2]);
+    expect(decisions[1]).toMatchObject({
+      routeKey: "easy",
+      model: "claude-haiku-4-5",
+      explored: true,
+    });
+
+    const out = runRoute(["explain", "sess_abc", "--dir", dir]);
+    expect(out).toContain("2 routing decision(s)");
+    expect(out).toContain("claude-opus-4-8");
+    expect(out).toContain("explore"); // the ε-greedy turn's pick column
+    expect(out).toContain("exploit"); // the first-turn exploit
+  });
+
+  test("a missing session log yields a helpful empty message, not an error", () => {
+    const dir = mkdtempSync(join(tmpdir(), "crewhaus-route-explain-empty-"));
+    TMP.push(dir);
+    expect(readRouteDecisions(dir, "sess_nope")).toEqual([]);
+    expect(runRoute(["explain", "sess_nope", "--dir", dir])).toContain("No model_route decisions");
+  });
+
+  test("rejects a path-traversal session id (no reading outside the sessions dir)", () => {
+    expect(() => readRouteDecisions(".crewhaus", "../../../../etc/passwd")).toThrow(
+      /invalid session/,
+    );
+    expect(() => readRouteDecisions(".crewhaus", "a/b")).toThrow(/invalid session/);
+    expect(() => readRouteDecisions(".crewhaus", "")).toThrow(/invalid session/);
   });
 });

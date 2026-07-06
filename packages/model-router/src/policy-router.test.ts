@@ -205,3 +205,103 @@ describe("PolicyRouter — learned", () => {
     expect(a.candidate.modelString).toBe("claude-sonnet-5"); // argmax tie broken by declared order
   });
 });
+
+describe("PolicyRouter — learned ε-greedy online exploration", () => {
+  // All arms past the sample floor (exploit phase), with a clear best (sonnet).
+  const exploitScore = () =>
+    fakeScore({
+      easy: {
+        "claude-haiku-4-5": { n: 30, meanReward: 0.1 },
+        "claude-sonnet-5": { n: 30, meanReward: 0.9 },
+        "claude-opus-4-8": { n: 30, meanReward: 0.1 },
+      },
+    });
+  const learnedPool = (explorationRate: number) =>
+    createPolicyRouter({
+      candidates: POOL,
+      policy: "learned",
+      learning: { minSamplesPerArm: 25, explorationRate },
+      score: exploitScore(),
+    });
+  const turn = (t: number) => ({ ...EASY, turnIndex: t }); // turnIndex ≥ 1 stays in the easy band
+
+  test("explorationRate 0 (default) → always the best arm, never explores (0.2.1-identical)", () => {
+    const r = learnedPool(0);
+    for (let t = 1; t <= 40; t++) {
+      const d = r.route(turn(t), "run-A");
+      expect(d.candidate.modelString).toBe("claude-sonnet-5");
+      expect(d.explored).toBe(false);
+    }
+    // Unset explorationRate behaves the same as 0.
+    const rDefault = createPolicyRouter({
+      candidates: POOL,
+      policy: "learned",
+      learning: { minSamplesPerArm: 25 },
+      score: exploitScore(),
+    });
+    expect(rDefault.route(turn(7), "run-A").explored).toBe(false);
+  });
+
+  test("explorationRate 1 → every exploit-phase turn explores a NON-best arm", () => {
+    const r = learnedPool(1);
+    for (let t = 1; t <= 40; t++) {
+      const d = r.route(turn(t), "run-A");
+      expect(d.explored).toBe(true);
+      expect(d.candidate.modelString).not.toBe("claude-sonnet-5"); // never the best
+      expect(d.reason).toContain("ε-greedy explore");
+    }
+  });
+
+  test("exploration fires on ~explorationRate of turns and is keyed on (seed, turn)", () => {
+    const r = learnedPool(0.3);
+    let explored = 0;
+    for (let t = 1; t <= 300; t++) {
+      const d = r.route(turn(t), "run-A");
+      if (d.explored) {
+        explored++;
+        expect(d.candidate.modelString).not.toBe("claude-sonnet-5");
+      } else {
+        expect(d.candidate.modelString).toBe("claude-sonnet-5");
+      }
+    }
+    // ~30% of 300 = ~90; allow a wide band for a deterministic hash.
+    expect(explored).toBeGreaterThan(50);
+    expect(explored).toBeLessThan(140);
+  });
+
+  test("the ε-greedy decision is reproducible from (seed, turn) and varies by seed", () => {
+    const r = learnedPool(0.3);
+    // Same seed + turn → identical decision.
+    const a = r.route(turn(9), "run-A");
+    const b = r.route(turn(9), "run-A");
+    expect(a.candidate.modelString).toBe(b.candidate.modelString);
+    expect(a.explored).toBe(b.explored);
+    // Different seeds → the explore/exploit pattern differs on at least one turn.
+    let differs = false;
+    for (let t = 1; t <= 60; t++) {
+      if (r.route(turn(t), "run-A").explored !== r.route(turn(t), "run-B").explored) {
+        differs = true;
+        break;
+      }
+    }
+    expect(differs).toBe(true);
+  });
+
+  test("warm-up ignores explorationRate — under-sampled arms still round-robin deterministically", () => {
+    const r = createPolicyRouter({
+      candidates: POOL,
+      policy: "learned",
+      learning: { minSamplesPerArm: 25, explorationRate: 1 },
+      score: fakeScore({
+        easy: {
+          "claude-haiku-4-5": { n: 5, meanReward: 0.9 },
+          "claude-sonnet-5": { n: 2, meanReward: 0.1 }, // least sampled
+          "claude-opus-4-8": { n: 5, meanReward: 0.9 },
+        },
+      }),
+    });
+    const d = r.route(turn(9), "run-A");
+    expect(d.candidate.modelString).toBe("claude-sonnet-5"); // least-sampled, not ε-greedy
+    expect(d.reason).toContain("under-sampled");
+  });
+});

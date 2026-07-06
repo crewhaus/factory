@@ -858,6 +858,8 @@ export type RunChatLoopOptions = {
       readonly minSamplesPerArm?: number;
       readonly costRefUsd?: number;
       readonly latencyRefMs?: number;
+      readonly explorationRate?: number;
+      readonly seed?: string;
     };
   };
   /**
@@ -1299,8 +1301,17 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       candidates,
       policy: pool.policy,
       ...(pool.routing !== undefined ? { routing: pool.routing } : {}),
-      ...(pool.learning?.minSamplesPerArm !== undefined
-        ? { learning: { minSamplesPerArm: pool.learning.minSamplesPerArm } }
+      ...(pool.learning !== undefined
+        ? {
+            learning: {
+              ...(pool.learning.minSamplesPerArm !== undefined
+                ? { minSamplesPerArm: pool.learning.minSamplesPerArm }
+                : {}),
+              ...(pool.learning.explorationRate !== undefined
+                ? { explorationRate: pool.learning.explorationRate }
+                : {}),
+            },
+          }
         : {}),
       // The learned policy reads the live scoreboard; static/heuristic ignore it.
       ...(pool.policy === "learned" ? { score: (rk, m) => sb.score(rk, m) } : {}),
@@ -1369,6 +1380,13 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // Tests that pass their own runContext rely on observing turnNumber on
   // it after the loop returns, so we never silently swap it out.
   const runContext: RunContext = opts.runContext ?? createRunContext({ sessionId });
+
+  // Adaptive model routing — ε-greedy exploration seed. A spec-fixed
+  // `learning.seed` reproduces exploration across runs (tests); otherwise the
+  // sessionId seeds it, so each run explores differently yet still replays
+  // exactly from its own transcript. Constant per run; the per-turn draw mixes
+  // in turnIndex + band (see PolicyRouter.route).
+  const poolSeed = opts.modelPool?.learning?.seed ?? sessionId;
 
   // Section 15 — every observability subscriber (otel, metrics, printer)
   // hangs off this single bus. The default constructor in `createRunContext`
@@ -2575,12 +2593,21 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             // scoreboard post-turn. Takes precedence over the tier router (the
             // two are mutually exclusive in the spec).
             if (poolRouter !== undefined) {
-              const base = poolRouter.route({
-                contextTokens: estimateTokens(messages),
-                toolsInPlay: (anthropicTools?.length ?? 0) > 0,
-                turnIndex: Math.max(0, runContext.turnNumber - 1),
-                priorTurnToolUseCount,
-              });
+              const base = poolRouter.route(
+                {
+                  contextTokens: estimateTokens(messages),
+                  toolsInPlay: (anthropicTools?.length ?? 0) > 0,
+                  turnIndex: Math.max(0, runContext.turnNumber - 1),
+                  priorTurnToolUseCount,
+                },
+                poolSeed,
+                // Monotonic exploration sequence: the transcript length keeps
+                // advancing across `--resume` (and a channel-bot's resume-per-
+                // message), so ε-greedy draws a fresh coin per decision instead
+                // of freezing on the reset-to-0 turnIndex. Deterministic on
+                // replay (the same transcript reconstructs the same length).
+                messages.length,
+              );
               const decision = escalatePool
                 ? {
                     ...base,
@@ -2605,6 +2632,18 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 policy: decision.policy,
                 reason: decision.reason,
                 ...(decision.explored ? { explored: true } : {}),
+                ...(poolPolicyVersion !== undefined ? { policyVersion: poolPolicyVersion } : {}),
+              });
+              // Persist the decision so `crewhaus route explain <session>` can
+              // replay per-turn routing after the fact. Non-conversational, so
+              // `replayMessageHistory` ignores it and `--resume` is unaffected.
+              await logEvent("model_route", {
+                turnNumber: runContext.turnNumber,
+                routeKey: decision.routeKey,
+                model: decision.candidate.modelId,
+                policy: decision.policy,
+                reason: decision.reason,
+                explored: decision.explored,
                 ...(poolPolicyVersion !== undefined ? { policyVersion: poolPolicyVersion } : {}),
               });
             } else if (tierRouter !== undefined) {

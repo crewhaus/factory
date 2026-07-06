@@ -534,6 +534,8 @@ type SpecAgentWithFailover = {
       readonly minSamplesPerArm?: number;
       readonly costRefUsd?: number;
       readonly latencyRefMs?: number;
+      readonly explorationRate?: number;
+      readonly seed?: string;
     };
   };
 };
@@ -640,6 +642,10 @@ function lowerModelFailover(agent: SpecAgentWithFailover): {
               ...(learning.latencyRefMs !== undefined
                 ? { latencyRefMs: learning.latencyRefMs }
                 : {}),
+              ...(learning.explorationRate !== undefined
+                ? { explorationRate: learning.explorationRate }
+                : {}),
+              ...(learning.seed !== undefined ? { seed: learning.seed } : {}),
             },
           }
         : {}),

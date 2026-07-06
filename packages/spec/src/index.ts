@@ -327,6 +327,14 @@ const modelPoolBlock = z
         minSamplesPerArm: z.number().int().positive().optional(),
         costRefUsd: z.number().positive().optional(),
         latencyRefMs: z.number().int().positive().optional(),
+        // ε for ε-greedy online exploration once every arm clears the sample
+        // floor (fraction of exploit-phase turns that try a non-best model).
+        // Default 0 → deterministic explore-then-exploit, no RNG.
+        explorationRate: z.number().min(0).max(1).optional(),
+        // Fixed exploration seed for reproducible-across-runs behaviour (e.g.
+        // tests). Omitted → the runtime seeds from the sessionId, so each run
+        // explores differently while still replaying from its own transcript.
+        seed: z.string().min(1).optional(),
       })
       .strict()
       .optional(),
