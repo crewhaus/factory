@@ -56,6 +56,17 @@ export type PoolRoutingConfig = TierRoutingConfig & {
 export type PoolLearningConfig = {
   /** Observations an arm needs before it can win its band on merit. Default 25. */
   readonly minSamplesPerArm?: number;
+  /**
+   * ε for ε-greedy ONLINE exploration once every arm in a band has cleared
+   * `minSamplesPerArm`: the fraction of exploit-phase turns that try a
+   * non-best candidate instead of the current best, so the policy keeps
+   * sampling (catching drift, escaping a stale local optimum) rather than
+   * hard-committing forever. Default `0` — with `0` the learned policy is
+   * exactly the deterministic explore-then-exploit of 0.2.1 (no RNG). Clamped
+   * to `[0, 1]`. The draw is seeded from the run + turn (see `route`), so it
+   * stays replayable from the transcript.
+   */
+  readonly explorationRate?: number;
 };
 
 /** The minimal per-arm read the learned policy needs from the scoreboard. */
@@ -88,8 +99,21 @@ export type PolicyDecision = {
 };
 
 export interface PolicyRouter {
-  /** The per-turn model decision from the loop's deterministic signals. */
-  route(signals: TierSignals): PolicyDecision;
+  /**
+   * The per-turn model decision from the loop's deterministic signals.
+   *
+   * `seed` + `seq` seed ε-greedy online exploration (only consulted by
+   * `learned` with `explorationRate > 0`). `seed` is a per-RUN-stable value
+   * that varies across runs (runtime-core passes the spec's `learning.seed`
+   * when set, else the `sessionId`). `seq` is a MONOTONIC per-decision counter
+   * that must keep advancing across `--resume` and across a channel-bot's
+   * resume-per-message pattern — runtime-core passes the transcript length, so
+   * every decision (even the first turn of a resumed session) draws a fresh
+   * coin, while replay of the same transcript reproduces it exactly. `seq`
+   * defaults to `signals.turnIndex` for callers/tests that route a single run
+   * without resume. Omitting `seed` is equivalent to `""`.
+   */
+  route(signals: TierSignals, seed?: string, seq?: number): PolicyDecision;
   /** The resolved candidate set (declared order). */
   candidates(): readonly PoolCandidate[];
   /** Strongest candidate — the escalation target for a failed cheap pick. */
@@ -99,6 +123,22 @@ export interface PolicyRouter {
 const DEFAULT_MIN_SAMPLES = 25;
 const STRONG_TAG = "strong";
 const CHEAP_TAG = "cheap";
+
+/**
+ * A deterministic uniform draw in `[0, 1)` from string/number seed material
+ * (FNV-1a over the joined parts). Same inputs → same draw, so ε-greedy
+ * exploration keyed on `(seed, turnIndex, band)` is fully replayable from the
+ * transcript — no persisted RNG state.
+ */
+function uniform01(...parts: ReadonlyArray<string | number>): number {
+  let h = 0x811c9dc5;
+  const s = parts.join("|");
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h / 0x1_0000_0000;
+}
 
 /**
  * The learning bucket for a turn. Reuses the tier router's escalation logic so
@@ -134,6 +174,7 @@ export function createPolicyRouter(opts: PolicyRouterOptions): PolicyRouter {
   const strongTag = routing.strongTag ?? STRONG_TAG;
   const cheapTag = routing.cheapTag ?? CHEAP_TAG;
   const minSamples = Math.max(1, opts.learning?.minSamplesPerArm ?? DEFAULT_MIN_SAMPLES);
+  const explorationRate = Math.max(0, Math.min(1, opts.learning?.explorationRate ?? 0));
   const score = opts.score;
   if (opts.policy === "learned" && score === undefined) {
     throw new Error("model-router: policy 'learned' requires an injected score lookup");
@@ -144,16 +185,17 @@ export function createPolicyRouter(opts: PolicyRouterOptions): PolicyRouter {
   /** Cheapest candidate: first `cheapTag` match, else the first declared. */
   const cheapest = (): PoolCandidate => firstTagged(candidates, cheapTag) ?? firstCandidate;
 
-  const decideLearned = (signals: TierSignals): PolicyDecision => {
+  const decideLearned = (signals: TierSignals, seed: string, seq: number): PolicyDecision => {
     const { band } = routeBand(signals, routing);
     // Snapshot each candidate's sample count / mean reward for THIS band.
     const arms = candidates.map((candidate) => {
       const s = score?.(band, candidate.modelString);
       return { candidate, n: s?.n ?? 0, meanReward: s?.meanReward ?? 0 };
     });
-    // Explore: any arm below the floor → deterministically pick the least
+    // Warm-up: any arm below the floor → deterministically pick the least
     // sampled (declared order breaks ties). This round-robins arms up to the
-    // floor over successive turns/runs, so the store fills without any RNG.
+    // floor over successive turns/runs, so every arm gets sampled without any
+    // RNG BEFORE any exploit/explore trade-off begins.
     const underSampled = arms.filter((a) => a.n < minSamples);
     if (underSampled.length > 0) {
       // Least-sampled wins; declared order breaks ties (reduce keeps the FIRST
@@ -167,9 +209,31 @@ export function createPolicyRouter(opts: PolicyRouterOptions): PolicyRouter {
         explored: true,
       };
     }
-    // Exploit: every arm has enough samples → highest mean reward wins
-    // (declared order breaks ties, keeping the pick deterministic).
+    // Exploit-phase best: highest mean reward (declared order breaks ties).
     const best = arms.reduce((hi, a) => (a.meanReward > hi.meanReward ? a : hi));
+    // ε-greedy ONLINE exploration: with probability `explorationRate` (per a
+    // transcript-seeded draw), try a non-best arm so the policy keeps sampling
+    // and can escape a stale optimum. `explorationRate === 0` (the default)
+    // never draws — the pick is exactly the deterministic argmax of 0.2.1.
+    if (explorationRate > 0 && arms.length > 1) {
+      const draw = uniform01(seed, seq, band, "explore");
+      if (draw < explorationRate) {
+        const alternatives = arms.filter((a) => a !== best);
+        const idx = Math.min(
+          alternatives.length - 1,
+          Math.floor(uniform01(seed, seq, band, "arm") * alternatives.length),
+        );
+        const pick = alternatives[idx] ?? best;
+        return {
+          candidate: pick.candidate,
+          routeKey: band,
+          reason: `learned/${band}: ε-greedy explore (ε=${explorationRate}, draw=${draw.toFixed(3)}) → n=${pick.n} meanReward=${pick.meanReward.toFixed(3)}`,
+          policy: "learned",
+          explored: true,
+        };
+      }
+    }
+    // Exploit: the best arm.
     return {
       candidate: best.candidate,
       routeKey: band,
@@ -180,7 +244,7 @@ export function createPolicyRouter(opts: PolicyRouterOptions): PolicyRouter {
   };
 
   return {
-    route(signals: TierSignals): PolicyDecision {
+    route(signals: TierSignals, seed = "", seq = signals.turnIndex): PolicyDecision {
       if (opts.policy === "static") {
         const { band } = routeBand(signals, routing);
         return {
@@ -202,7 +266,7 @@ export function createPolicyRouter(opts: PolicyRouterOptions): PolicyRouter {
           explored: false,
         };
       }
-      return decideLearned(signals);
+      return decideLearned(signals, seed, seq);
     },
     candidates(): readonly PoolCandidate[] {
       return candidates;

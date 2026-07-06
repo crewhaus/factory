@@ -116,7 +116,15 @@ export type EventKind =
   // Non-conversational, so `replayMessageHistory` ignores it and `--resume` is
   // unaffected; readers written before this kind existed keep parsing (each
   // session-log reader branches on the kinds it knows and skips the rest).
-  | "mcp_stats";
+  | "mcp_stats"
+  // Adaptive model routing — one line per ROUTING DECISION when an
+  // `agent.model_pool` is active (payload `{ turnNumber, routeKey, model,
+  // policy, reason, explored, policyVersion? }`), written by runtime-core's
+  // pool router. A turn that runs tools re-routes as the difficulty band
+  // shifts, so multiple lines can share one `turnNumber`. Feeds `crewhaus
+  // route explain <session>`. Non-conversational, so `replayMessageHistory`
+  // ignores it and `--resume` is unaffected.
+  | "model_route";
 
 export type Event = {
   readonly ts: number;
