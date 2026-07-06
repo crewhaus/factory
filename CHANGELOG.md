@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — adaptive model routing (P3: offline learning)
+
+- **`crewhaus advise` mines the `model_pool` reward scoreboard**
+  (`.crewhaus/routing/arms.jsonl`) into two new findings: a **policy-upgrade
+  SpecPatch** (flip `model_pool.policy` to `learned` once every candidate has
+  cleared the sample floor in a difficulty band) and a **candidate-demotion
+  advisory** (a candidate past the floor that trails the band best by ≥0.3 mean
+  reward in every measured band — advice-only, because the candidate roster is
+  human-owned). `optimize --from-advice` eval-gates the policy patch through
+  the existing accept/compose loop — no new optimize surface needed.
+- **`OPTIMIZABLE_PATHS` gains the pool POLICY knobs only** —
+  `["agent","model_pool","policy"|"routing"|"learning"]` on cli/channel/managed.
+  `["agent","model_pool"]` wholesale and `["agent","model_pool","candidates"]`
+  stay rejected, mirroring the standing `["agent","model"]` exclusion: learning
+  tunes selection within the declared set, never the set.
+- **`specHasPath(yamlText, path)`** in `@crewhaus/spec-patch`: whether the YAML
+  source textually carries a key (Zod-defaulted fields are always present on
+  the parsed spec, but `applySpecPatch` needs `add` vs `replace` to match the
+  document) — used by the advise rules to emit the correct op.
 ### Fixed
 
 - **`crewhaus run` now honours `agent.model_pool`.** The interpreted cli run

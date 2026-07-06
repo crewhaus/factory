@@ -86,6 +86,21 @@ export type ApplySpecPatchResult = {
 };
 
 /**
+ * Whether the YAML source TEXTUALLY carries a key at `path`. Patch producers
+ * need this to pick `add` vs `replace` correctly: Zod-defaulted fields (e.g.
+ * `model_pool.policy`) are always present on the PARSED spec, but `replace`
+ * throws when the key is absent from the document and `add` throws when it is
+ * present — only the CST knows which applies. Unparseable YAML → false.
+ */
+export function specHasPath(yamlText: string, path: ReadonlyArray<string>): boolean {
+  try {
+    return parseDocument(yamlText).hasIn([...path]);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Apply a structured patch to a YAML spec source. Uses the `yaml`
  * package's CST so comments and key order survive the round-trip; the
  * only bytes that change are the ones the patch targets.
@@ -217,6 +232,15 @@ export const OPTIMIZABLE_PATHS: Readonly<
     // by patching their parent block.
     Object.freeze(["chains"]),
     Object.freeze(["transaction_policy"]),
+    // Adaptive model routing — the pool's POLICY knobs are tunable (advise
+    // mines the reward scoreboard into these; optimize --from-advice gates
+    // them), but deliberately NOT ["agent","model_pool"] wholesale and NOT
+    // ["agent","model_pool","candidates"]: the candidate ROSTER is
+    // human-owned, mirroring the standing ["agent","model"] exclusion —
+    // learning tunes selection within the declared set, never the set.
+    Object.freeze(["agent", "model_pool", "policy"]),
+    Object.freeze(["agent", "model_pool", "routing"]),
+    Object.freeze(["agent", "model_pool", "learning"]),
   ]),
   workflow: Object.freeze([
     Object.freeze(["steps"]),
@@ -229,6 +253,10 @@ export const OPTIMIZABLE_PATHS: Readonly<
     Object.freeze(["failure_taxonomy"]),
     Object.freeze(["chains"]),
     Object.freeze(["transaction_policy"]),
+    // Adaptive model routing — pool policy knobs only (see the cli entry).
+    Object.freeze(["agent", "model_pool", "policy"]),
+    Object.freeze(["agent", "model_pool", "routing"]),
+    Object.freeze(["agent", "model_pool", "learning"]),
   ]),
   graph: Object.freeze([
     Object.freeze(["nodes"]),
@@ -239,6 +267,10 @@ export const OPTIMIZABLE_PATHS: Readonly<
   managed: Object.freeze([
     Object.freeze(["agent", "instructions"]),
     Object.freeze(["failure_taxonomy"]),
+    // Adaptive model routing — pool policy knobs only (see the cli entry).
+    Object.freeze(["agent", "model_pool", "policy"]),
+    Object.freeze(["agent", "model_pool", "routing"]),
+    Object.freeze(["agent", "model_pool", "learning"]),
   ]),
   pipeline: Object.freeze([
     Object.freeze(["agent", "instructions"]),

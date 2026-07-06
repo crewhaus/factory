@@ -262,3 +262,61 @@ describe("driveCanaryRamp — rollback on regression", () => {
     expect(await reg.aliasFor("hello", "prod")).toBe("v1");
   });
 });
+
+describe("driveCanaryRamp — model_pool policy changes are canary-eligible", () => {
+  // Adaptive model routing's promotion path: a `model_pool` policy change is
+  // an ordinary spec delta between two pinned versions, so the EXISTING
+  // spec-version canary ramps it with a regression gate and auto-rollback —
+  // no routing-specific canary machinery. This test pins that contract (a
+  // future "no model changes via canary" guard would break it loudly).
+  const POOL_V1 = [
+    "name: pooled",
+    "target: cli",
+    "agent:",
+    "  model: claude-sonnet-4-5",
+    "  instructions: help",
+    "  model_pool:",
+    "    candidates:",
+    "      - { model: claude-haiku-4-5, tags: [cheap] }",
+    "      - { model: claude-opus-4-1, tags: [strong] }",
+  ].join("\n");
+  // v2 differs ONLY in the (advise-proposed) policy flip to `learned`.
+  const POOL_V2 = `${POOL_V1}\n    policy: learned`;
+
+  test("a policy-only delta promotes on pass and rolls back on regression", async () => {
+    for (const regresses of [false, true]) {
+      const root = join(tmpRoot, regresses ? "rb" : "ok");
+      const reg = createFileBackedRegistry({ rootDir: join(root, "specs") });
+      await reg.put("pooled", "v1", POOL_V1);
+      await reg.put("pooled", "v2", POOL_V2);
+      await reg.pin("pooled", "prod", "v1");
+      const deploy = createDeploymentController({ registry: reg });
+      const ctrl = createCanaryController({ registry: reg, deploymentController: deploy });
+      const gate = makeRegressionGate(
+        makeCanaryEvalGate({
+          evalVersion: async (v) =>
+            regresses && v === "v2"
+              ? summary([sample("a", false, 0), sample("b", false, 0)])
+              : summary([sample("a", true, 1), sample("b", true, 1)]),
+        }),
+      );
+      const result = await driveCanaryRamp({
+        steps: [25, 100],
+        evaluateStep: (trafficPercent) =>
+          ctrl.evaluate(
+            { name: "pooled", fromVersion: "v1", toVersion: "v2", trafficPercent },
+            { intervalMs: 0, gate },
+          ),
+      });
+      if (regresses) {
+        expect(result.promoted).toBe(false);
+        expect(await reg.aliasFor("pooled", "prod")).toBe("v1"); // rolled back
+      } else {
+        expect(result.promoted).toBe(true);
+        expect(await reg.aliasFor("pooled", "prod")).toBe("v2"); // learned policy live
+        // The promoted content really is the learned-policy spec.
+        expect(await reg.get("pooled", "v2")).toContain("policy: learned");
+      }
+    }
+  });
+});
