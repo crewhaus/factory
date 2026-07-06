@@ -70,6 +70,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deferred, so the field would be inert) or to workflow/graph/crew (per-unit
   models — pool attachment there is a future design).
 
+### Documentation
+
+- **The `rankFallbacks` seam is deliberately retired, and the decision is now
+  recorded in the code.** A design review concluded the factory runtime must
+  never auto-reorder `agent.model_fallbacks`: the declared order is a trust
+  contract (cost/quality routing belongs to `agent.model_pool`), a boot-time
+  cache-aware ranking is a mathematical no-op (no observed traffic to price —
+  and a pricing-table miss would sort an unpriced model first), and fallback
+  order only matters in rare multi-fallback outage windows. Tombstone notes
+  added to the `rankFallbacks` docstring, the model-router README, the
+  `model_fallbacks` spec docs ("order the list yourself; order = trust
+  order"), and cost-tracker's `rankCandidates` header (caveats for any future
+  library caller). Revisit trigger documented: trip-time re-ranking, only if
+  durable per-model cache telemetry becomes default-on.
+
 ## [0.2.1] - 2026-07-05
 
 Publishes the Claude-Code-parity runtime (#282) and adaptive model routing

@@ -98,21 +98,38 @@ export type CreateFailoverChainOptions = {
    */
   readonly adapters?: ReadonlyMap<string, ProviderAdapter>;
   /**
-   * Item 28 (half 2) — OPTIONAL cache-hit-aware fallback ordering. When
-   * supplied, the FALLBACK candidates (never the primary — the primary stays
-   * the spec's declared first choice) are reordered by this callback before
-   * routing, so the chain prefers cache-warm same-provider siblings over
-   * nominally-cheaper cross-provider hops. It receives the fallback spec
-   * strings paired with their best-effort parsed (provider, modelId) and
-   * returns them in preferred order; any string it omits is appended in its
-   * original relative position, and unknown strings it invents are ignored.
+   * Item 28 (half 2) — OPTIONAL fallback reordering. When supplied, the
+   * FALLBACK candidates (never the primary — the primary stays the spec's
+   * declared first choice) are reordered by this callback before routing. It
+   * receives the fallback spec strings paired with their best-effort parsed
+   * (provider, modelId) and returns them in preferred order; any string it
+   * omits is appended in its original relative position, and unknown strings
+   * it invents are ignored.
+   *
+   * DELIBERATELY UNWIRED — a 2026-07 design review decided the factory
+   * runtime must NOT pass this (runtime-core's `createFailoverChain` call
+   * omits it on purpose), for three reasons:
+   *   1. `model_fallbacks` order is the USER'S declared contract and encodes
+   *      trust ("what do I run when my primary is down"), not cost —
+   *      cost/quality routing belongs to `agent.model_pool`.
+   *   2. The intended pairing (`@crewhaus/cost-tracker`'s cache-aware
+   *      `rankCandidates`) has no data at construction time: the chain binds
+   *      at boot, before any traffic, so a cold profile prices EVERY
+   *      candidate to 0 and the stable sort preserves declared order — a
+   *      boot-time wiring is a no-op unless it invents token counts. A
+   *      pricing-table MISS also prices to 0, which would sort an unpriced
+   *      model FIRST — a trap for any naive wiring.
+   *   3. Fallbacks serve rare outage windows (`probe_restore` returns
+   *      traffic up the list once the primary recovers), so ordering has
+   *      near-zero expected value for the typical 0-1-fallback spec.
+   * The seam stays for LIBRARY consumers composing their own chains. Revisit
+   * only as a trip-time re-rank (at first breaker-open, over the live run's
+   * observed cache profile) if durable per-model cache telemetry ever becomes
+   * default-on — never as a silent default or a boot-time knob.
    *
    * Default (undefined) → declared fallback order, byte-for-byte the
-   * pre-#28 behaviour. Designed for `@crewhaus/cost-tracker`'s
-   * `rankCandidates` over the run's observed cache profile — but no caller
-   * passes it yet (runtime-core's `createFailoverChain` call included), so
-   * the declared order is what ships today. The chain itself stays
-   * dependency-free of cost-tracker.
+   * pre-#28 behaviour. The chain itself stays dependency-free of
+   * cost-tracker.
    */
   readonly rankFallbacks?: (fallbacks: readonly FallbackRankInput[]) => readonly string[];
 };

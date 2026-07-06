@@ -93,9 +93,16 @@ Semantics worth knowing:
 - Every candidate open or unconstructible → `FailoverExhaustedError`, naming
   each candidate and its breaker state.
 - The optional `rankFallbacks` seam reorders the fallback tier (never the
-  primary) before routing — designed for `@crewhaus/cost-tracker`'s
-  cache-hit-aware `rankCandidates` (item 28). No caller passes it yet, so
-  the declared fallback order is what ships.
+  primary) before routing. **Deliberately unwired in the factory runtime**
+  (2026-07 design review): the declared `model_fallbacks` order is a trust
+  ordering the runtime honours verbatim — cost/quality routing belongs to
+  `agent.model_pool`, and the cache-aware ranking it was designed for has no
+  observed traffic to price at boot (a cold profile makes the sort a no-op,
+  and a pricing-table miss would sort an unpriced model first). The seam
+  stays for library consumers composing their own chains; see the
+  `rankFallbacks` docstring in `src/failover.ts` for the full rationale and
+  the revisit trigger (trip-time re-ranking, if durable per-model cache
+  telemetry ever becomes default-on).
 
 Introspection: `plan()` (predicted next candidate), `lastServed()`,
 `candidates()` (per-candidate resolution + breaker snapshot), `warnings()`.

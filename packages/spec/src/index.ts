@@ -215,6 +215,13 @@ const toolConfigBlock = z
  * normal model-router path — a fallback with a missing key warns at boot
  * and is skipped when tried, never hard-failing the run.
  *
+ * The declared ORDER is honoured verbatim — it is a TRUST ordering ("what do
+ * I run when my primary is down"), and the runtime never reorders it (a
+ * 2026-07 design review deliberately retired the cost-ranking idea; see the
+ * `rankFallbacks` docstring in model-router's failover.ts). Want cheaper
+ * models preferred? Order the list yourself — or use `agent.model_pool`,
+ * which is the cost/quality routing surface.
+ *
  * `circuit_breaker` tunes the per-candidate breakers. Field names mirror
  * `CircuitBreakerOptions` in `@crewhaus/circuit-breaker` exactly
  * (failureThreshold / windowMs / cooldownMs); package defaults (5 failures
