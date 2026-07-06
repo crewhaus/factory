@@ -22,6 +22,17 @@
  * "what one representative turn costs on this candidate" from the session's
  * observed per-turn token shape, so a shared, stable ordering falls out
  * without needing to replay traffic.
+ *
+ * STATUS: no production caller. A 2026-07 design review deliberately retired
+ * the planned failover wiring (see `rankFallbacks` in model-router's
+ * failover.ts for the rationale — chiefly: at boot there is no observed
+ * profile, and with `perTurnInputTokens` 0 every candidate prices to 0 so the
+ * stable sort is a no-op). The function stays exported for library consumers.
+ * Two caveats for any future caller: a `pricingMiss` candidate also prices to
+ * 0 and therefore sorts FIRST — tail those explicitly (the flag is advisory,
+ * per the field docs) — and a meaningful ordering requires a profile from
+ * genuinely observed traffic (e.g. `cacheProfileFromTotals` over a live run's
+ * aggregates), never invented token counts.
  */
 import type { ProviderId } from "@crewhaus/trace-event-bus";
 import { type PricingRow, type PricingTable, resolvePricing } from "./pricing";
