@@ -23,6 +23,7 @@ import {
   rulePermissionChurn,
   rulePoolCandidateDemotion,
   rulePoolPolicyUpgrade,
+  rulePoolStaleExploitation,
   ruleRepeatedToolFailures,
   ruleStopReasonAnomalies,
   ruleSubAgentSplit,
@@ -985,6 +986,82 @@ describe("rulePoolCandidateDemotion", () => {
     ];
     expect(
       rulePoolCandidateDemotion(buildAdviceContext([], [], twoArms), { spec: twoSpec }),
+    ).toEqual([]);
+  });
+});
+
+describe("rulePoolStaleExploitation", () => {
+  const learnedSpec = (learningYaml: string) =>
+    parseSpec(
+      [
+        "name: pooled",
+        "target: cli",
+        "agent:",
+        "  model: claude-sonnet-4-6",
+        "  instructions: help",
+        "  model_pool:",
+        "    policy: learned",
+        "    candidates:",
+        "      - { model: claude-haiku-4-5 }",
+        "      - { model: claude-sonnet-4-6 }",
+        "      - { model: claude-opus-4-1 }",
+        ...(learningYaml.length > 0 ? [learningYaml] : []),
+      ].join("\n"),
+    );
+
+  it("proposes explorationRate 0.05 for a converged learned pool, preserving existing learning fields", () => {
+    const spec = learnedSpec("    learning: { minSamplesPerArm: 25, latencyRefMs: 3000 }");
+    const findings = rulePoolStaleExploitation(buildAdviceContext([], [], fullCoverageArms(30)), {
+      spec,
+      specHasPath: (p) => p.join(".") === "agent.model_pool.learning", // learning key present
+    });
+    expect(findings).toHaveLength(1);
+    const f = findings[0];
+    expect(f?.id).toBe("pool-stale-exploitation");
+    if (f?.suggestion.kind !== "spec-patch") throw new Error("expected a spec-patch suggestion");
+    expect(f.suggestion.patch.path).toEqual(["agent", "model_pool", "learning"]);
+    expect(f.suggestion.patch.op).toBe("replace"); // key textually present
+    // Whole-block replace preserves the spec's other learning fields.
+    expect(f.suggestion.patch.value).toEqual({
+      minSamplesPerArm: 25,
+      latencyRefMs: 3000,
+      explorationRate: 0.05,
+    });
+    expect(() => validatePatch(spec, f.suggestion.patch)).not.toThrow();
+  });
+
+  it("uses add when the spec has no learning block", () => {
+    const spec = learnedSpec("");
+    const findings = rulePoolStaleExploitation(buildAdviceContext([], [], fullCoverageArms(30)), {
+      spec, // no specHasPath → assumes absent → add
+    });
+    if (findings[0]?.suggestion.kind !== "spec-patch") throw new Error("expected patch");
+    expect(findings[0].suggestion.patch.op).toBe("add");
+    expect(findings[0].suggestion.patch.value).toEqual({ explorationRate: 0.05 });
+  });
+
+  it("stays silent when already exploring, when thompson, when warming up, or for non-learned pools", () => {
+    const arms = fullCoverageArms(30);
+    // ε already set → healthy.
+    expect(
+      rulePoolStaleExploitation(buildAdviceContext([], [], arms), {
+        spec: learnedSpec("    learning: { explorationRate: 0.1 }"),
+      }),
+    ).toEqual([]);
+    // Thompson self-explores.
+    expect(
+      rulePoolStaleExploitation(buildAdviceContext([], [], arms), {
+        spec: learnedSpec("    learning: { bandit: thompson }"),
+      }),
+    ).toEqual([]);
+    // Still warming up (no full-coverage band) — the floor explores for it.
+    const partial = arms.map((a) => (a.model === "claude-opus-4-1" ? { ...a, n: 3 } : a));
+    expect(
+      rulePoolStaleExploitation(buildAdviceContext([], [], partial), { spec: learnedSpec("") }),
+    ).toEqual([]);
+    // Heuristic pool → not this rule's business (POOL_SPEC defaults to heuristic).
+    expect(
+      rulePoolStaleExploitation(buildAdviceContext([], [], arms), { spec: POOL_SPEC }),
     ).toEqual([]);
   });
 });
