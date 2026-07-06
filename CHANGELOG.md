@@ -14,6 +14,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dropped `model_pool`, so `crewhaus run` ignored adaptive routing while the
   compiled cli bundle honoured it. `run` now threads it identically (disabled by
   a `--model` override, like the other routing blocks).
+### Added — adaptive model routing (P4)
+
+- **Online ε-greedy exploration for `agent.model_pool` (`policy: learned`)**:
+  a new `learning.explorationRate` (default `0`) makes the learned policy keep
+  sampling non-best candidates a fraction of the time once every arm has
+  cleared the sample floor — catching model drift and escaping a stale optimum
+  instead of hard-committing to the argmax forever. The draw is seeded from the
+  run + turn + band (from `learning.seed` when set, else the sessionId), so
+  exploration differs run-to-run yet stays fully replayable from the transcript
+  — no persisted RNG. `explorationRate: 0` is byte-for-byte the deterministic
+  explore-then-exploit of 0.2.1.
+- **`crewhaus route explain <session>`**: replays a run's routing decisions
+  (turn, band, model, policy, explore/exploit, reason), backed by a new durable
+  `model_route` event persisted per routing decision while a pool is active — a
+  turn that runs tools routes more than once as the difficulty band shifts, so
+  the same `turnNumber` can appear on consecutive rows. Non-conversational, so
+  `--resume` is unaffected.
 ### Added — adaptive model routing on more shapes
 
 - **`agent.model_pool` now works on the pipeline, research, batch, and browser
