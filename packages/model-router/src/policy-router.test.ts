@@ -305,7 +305,6 @@ describe("PolicyRouter — learned ε-greedy online exploration", () => {
     expect(d.reason).toContain("under-sampled");
   });
 });
-<<<<<<< HEAD
 
 /** Scoreboard fake carrying variance, for Thompson sampling. */
 function tScore(
@@ -411,5 +410,3 @@ describe("PolicyRouter — learned Thompson sampling", () => {
     expect(d.reason).toContain("under-sampled");
   });
 });
-=======
->>>>>>> origin/main

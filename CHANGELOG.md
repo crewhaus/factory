@@ -7,7 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-<<<<<<< HEAD
 ### Added — adaptive model routing (P3: offline learning)
 
 - **`crewhaus advise` mines the `model_pool` reward scoreboard**
@@ -43,8 +42,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   arms self-explore and the policy needs no exploration-rate tuning. Same
   transcript-seeded RNG, so it replays exactly; runs only after the sample-floor
   warm-up, and `epsilon-greedy` remains the default.
-=======
->>>>>>> origin/main
 - **Online ε-greedy exploration for `agent.model_pool` (`policy: learned`)**:
   a new `learning.explorationRate` (default `0`) makes the learned policy keep
   sampling non-best candidates a fraction of the time once every arm has
@@ -60,8 +57,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   turn that runs tools routes more than once as the difficulty band shifts, so
   the same `turnNumber` can appear on consecutive rows. Non-conversational, so
   `--resume` is unaffected.
-<<<<<<< HEAD
-=======
 ### Added — adaptive model routing on more shapes
 
 - **`agent.model_pool` now works on the pipeline, research, batch, and browser
@@ -74,7 +69,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   emitted bundles are callable modules whose agent-loop wiring is still
   deferred, so the field would be inert) or to workflow/graph/crew (per-unit
   models — pool attachment there is a future design).
->>>>>>> origin/main
 
 ## [0.2.1] - 2026-07-05
 

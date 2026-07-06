@@ -67,7 +67,6 @@ export type PoolLearningConfig = {
    * stays replayable from the transcript.
    */
   readonly explorationRate?: number;
-<<<<<<< HEAD
   /**
    * Which exploration strategy runs in the exploit phase (after every arm
    * clears `minSamplesPerArm`):
@@ -80,8 +79,6 @@ export type PoolLearningConfig = {
    * Both draw from a transcript-seeded RNG, so both replay exactly.
    */
   readonly bandit?: "epsilon-greedy" | "thompson";
-=======
->>>>>>> origin/main
 };
 
 /** The minimal per-arm read the learned policy needs from the scoreboard. */
@@ -158,7 +155,6 @@ function uniform01(...parts: ReadonlyArray<string | number>): number {
 }
 
 /**
-<<<<<<< HEAD
  * A standard-normal draw `N(0, 1)` from the same deterministic seed material,
  * via Box-Muller over two independent `uniform01` draws. Used by Thompson
  * sampling to draw each arm from its reward posterior. Reproducible from the
@@ -171,8 +167,6 @@ function gaussian(...parts: ReadonlyArray<string | number>): number {
 }
 
 /**
-=======
->>>>>>> origin/main
  * The learning bucket for a turn. Reuses the tier router's escalation logic so
  * a pool with two candidates + `policy: heuristic` behaves identically to the
  * equivalent `model_tiers` block: `"hard"` ⟺ the tier router would pick
@@ -207,10 +201,7 @@ export function createPolicyRouter(opts: PolicyRouterOptions): PolicyRouter {
   const cheapTag = routing.cheapTag ?? CHEAP_TAG;
   const minSamples = Math.max(1, opts.learning?.minSamplesPerArm ?? DEFAULT_MIN_SAMPLES);
   const explorationRate = Math.max(0, Math.min(1, opts.learning?.explorationRate ?? 0));
-<<<<<<< HEAD
   const bandit = opts.learning?.bandit ?? "epsilon-greedy";
-=======
->>>>>>> origin/main
   const score = opts.score;
   if (opts.policy === "learned" && score === undefined) {
     throw new Error("model-router: policy 'learned' requires an injected score lookup");
@@ -252,7 +243,6 @@ export function createPolicyRouter(opts: PolicyRouterOptions): PolicyRouter {
     }
     // Exploit-phase best: highest mean reward (declared order breaks ties).
     const best = arms.reduce((hi, a) => (a.meanReward > hi.meanReward ? a : hi));
-<<<<<<< HEAD
     // Thompson sampling: draw each arm from its reward posterior
     // `Normal(meanReward, varReward / n)` and take the highest draw. Arms with
     // more uncertainty (higher variance / fewer samples) win more often, so it
@@ -274,8 +264,6 @@ export function createPolicyRouter(opts: PolicyRouterOptions): PolicyRouter {
         explored: winner.arm !== best,
       };
     }
-=======
->>>>>>> origin/main
     // ε-greedy ONLINE exploration: with probability `explorationRate` (per a
     // transcript-seeded draw), try a non-best arm so the policy keeps sampling
     // and can escape a stale optimum. `explorationRate === 0` (the default)
