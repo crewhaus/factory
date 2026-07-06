@@ -10,12 +10,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added — adaptive model routing (P3: offline learning)
 
 - **`crewhaus advise` mines the `model_pool` reward scoreboard**
-  (`.crewhaus/routing/arms.jsonl`) into two new findings: a **policy-upgrade
+  (`.crewhaus/routing/arms.jsonl`) into three new findings: a **policy-upgrade
   SpecPatch** (flip `model_pool.policy` to `learned` once every candidate has
-  cleared the sample floor in a difficulty band) and a **candidate-demotion
+  cleared the sample floor in a difficulty band), a **candidate-demotion
   advisory** (a candidate past the floor that trails the band best by ≥0.3 mean
   reward in every measured band — advice-only, because the candidate roster is
-  human-owned). `optimize --from-advice` eval-gates the policy patch through
+  human-owned), and a **stale-exploitation SpecPatch** (a converged `learned`
+  pool with `explorationRate` 0 and a non-`thompson` bandit hard-commits to the
+  argmax forever — propose `learning.explorationRate: 0.05`, preserving the
+  block's other fields). `optimize --from-advice` eval-gates the patches through
   the existing accept/compose loop — no new optimize surface needed.
 - **`OPTIMIZABLE_PATHS` gains the pool POLICY knobs only** —
   `["agent","model_pool","policy"|"routing"|"learning"]` on cli/channel/managed.

@@ -1043,7 +1043,14 @@ export const ruleSubAgentSplit: AdviceRule = (ctx, opts) => {
 type SpecModelPoolView = {
   readonly candidates: ReadonlyArray<{ readonly model: string }>;
   readonly policy: "static" | "heuristic" | "learned";
-  readonly learning?: { readonly minSamplesPerArm?: number };
+  readonly learning?: {
+    readonly minSamplesPerArm?: number;
+    readonly costRefUsd?: number;
+    readonly latencyRefMs?: number;
+    readonly explorationRate?: number;
+    readonly seed?: string;
+    readonly bandit?: "epsilon-greedy" | "thompson";
+  };
 };
 
 function agentModelPool(spec: Spec | undefined): SpecModelPoolView | undefined {
@@ -1163,6 +1170,54 @@ export const rulePoolCandidateDemotion: AdviceRule = (ctx, opts) => {
   });
 };
 
+/**
+ * Stale exploitation: a `learned` pool whose scoreboard has full coverage but
+ * whose config never explores again — `explorationRate` unset/0 and the
+ * bandit is not `thompson` (which self-explores via posterior sampling). Once
+ * every arm clears the floor, such a pool hard-commits to the argmax forever
+ * and can never notice model drift or a candidate that improved. Proposes a
+ * small ε (0.05) via a whole-`learning`-block replace that PRESERVES the
+ * spec's other learning fields (whitelisted path; `optimize --from-advice`
+ * eval-gates it).
+ */
+export const rulePoolStaleExploitation: AdviceRule = (ctx, opts) => {
+  const t = resolveThresholds(opts);
+  const spec = opts?.spec;
+  const pool = agentModelPool(spec);
+  if (pool === undefined || pool.policy !== "learned") return [];
+  if (ctx.routingArms.length === 0 || pool.candidates.length < 2) return [];
+  const learning = pool.learning ?? {};
+  // Already exploring (ε > 0) or self-exploring (thompson) → healthy.
+  if ((learning.explorationRate ?? 0) > 0 || learning.bandit === "thompson") return [];
+  const floor = learning.minSamplesPerArm ?? t.poolMinSamples;
+  const ready = bandsWithFullCoverage(ctx.routingArms, pool.candidates, floor);
+  if (ready.length === 0) return []; // still warming up — the floor explores for it
+  const proposedLearning = { ...learning, explorationRate: 0.05 };
+  const learningKeyPresent = opts?.specHasPath?.(["agent", "model_pool", "learning"]) ?? false;
+  const adviceText =
+    "This learned model_pool has cleared its sample floor in every measured band and now exploits the argmax forever — it can no longer notice model drift or an improved candidate. Set model_pool.learning.explorationRate (e.g. 0.05) to keep sampling occasionally, or switch learning.bandit to thompson, which self-balances exploration.";
+  const patch: SpecPatch = {
+    target: spec?.target ?? "cli",
+    path: ["agent", "model_pool", "learning"],
+    op: learningKeyPresent ? "replace" : "add",
+    value: proposedLearning,
+    rationale: `advise: learned pool converged (full coverage in band(s) ${ready.join(", ")}) with explorationRate 0 and a non-thompson bandit — pure exploitation goes stale`,
+  };
+  return [
+    {
+      id: "pool-stale-exploitation",
+      severity: "info",
+      summary: "converged learned model_pool never explores — add explorationRate",
+      evidence: [
+        `full-coverage band(s) at floor ${floor}: ${ready.join(", ")}`,
+        `learning.explorationRate is ${learning.explorationRate ?? "unset"} and bandit is ${learning.bandit ?? "epsilon-greedy"}`,
+      ],
+      counts: { readyBands: ready.length },
+      suggestion: patchOrAdvice(spec, patch, adviceText),
+    },
+  ];
+};
+
 export const ADVICE_RULES: ReadonlyArray<AdviceRule> = [
   ruleRepeatedToolFailures,
   ruleTruncationPressure,
@@ -1174,6 +1229,7 @@ export const ADVICE_RULES: ReadonlyArray<AdviceRule> = [
   ruleSubAgentSplit,
   rulePoolPolicyUpgrade,
   rulePoolCandidateDemotion,
+  rulePoolStaleExploitation,
 ];
 
 /**
