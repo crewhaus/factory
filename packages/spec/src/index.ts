@@ -335,6 +335,10 @@ const modelPoolBlock = z
         // tests). Omitted → the runtime seeds from the sessionId, so each run
         // explores differently while still replaying from its own transcript.
         seed: z.string().min(1).optional(),
+        // Exploit-phase exploration strategy. "epsilon-greedy" (default) uses
+        // explorationRate; "thompson" draws each arm from its reward posterior
+        // and self-balances (explorationRate is then ignored).
+        bandit: z.enum(["epsilon-greedy", "thompson"]).optional(),
       })
       .strict()
       .optional(),

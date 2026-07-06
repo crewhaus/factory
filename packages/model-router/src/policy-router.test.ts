@@ -305,3 +305,108 @@ describe("PolicyRouter — learned ε-greedy online exploration", () => {
     expect(d.reason).toContain("under-sampled");
   });
 });
+
+/** Scoreboard fake carrying variance, for Thompson sampling. */
+function tScore(
+  rows: Record<string, Record<string, { n: number; meanReward: number; varReward: number }>>,
+): ScoreLookup {
+  return (routeKey, model) => rows[routeKey]?.[model];
+}
+
+describe("PolicyRouter — learned Thompson sampling", () => {
+  const thompsonPool = (rows: Parameters<typeof tScore>[0]) =>
+    createPolicyRouter({
+      candidates: POOL,
+      policy: "learned",
+      learning: { minSamplesPerArm: 25, bandit: "thompson" },
+      score: tScore(rows),
+    });
+  const turn = (t: number) => ({ ...EASY, turnIndex: t });
+
+  test("a confident high-mean arm wins the vast majority of turns", () => {
+    const r = thompsonPool({
+      easy: {
+        "claude-haiku-4-5": { n: 30, meanReward: 0.3, varReward: 0.01 },
+        "claude-sonnet-5": { n: 30, meanReward: 0.9, varReward: 0.01 }, // clear best
+        "claude-opus-4-8": { n: 30, meanReward: 0.3, varReward: 0.01 },
+      },
+    });
+    let best = 0;
+    for (let t = 1; t <= 300; t++) {
+      if (r.route(turn(t), "run-A").candidate.modelString === "claude-sonnet-5") best++;
+    }
+    // A confident, well-separated best (means 0.9 vs 0.3, tiny variance) is
+    // ~33 posterior-std apart, so Thompson dominates — up to and including 100%.
+    expect(best).toBeGreaterThan(290);
+  });
+
+  test("an UNCERTAIN arm gets explored more than its mean alone would allow", () => {
+    // haiku's mean (0.5) is below sonnet's (0.6), so pure argmax never picks
+    // it — but its high variance means Thompson samples it above sonnet a
+    // non-trivial fraction of the time.
+    const r = thompsonPool({
+      easy: {
+        "claude-haiku-4-5": { n: 30, meanReward: 0.5, varReward: 0.2 }, // uncertain
+        "claude-sonnet-5": { n: 30, meanReward: 0.6, varReward: 0.001 }, // confident
+        "claude-opus-4-8": { n: 30, meanReward: 0.1, varReward: 0.001 },
+      },
+    });
+    let haiku = 0;
+    for (let t = 1; t <= 400; t++) {
+      const d = r.route(turn(t), "run-A");
+      if (d.candidate.modelString === "claude-haiku-4-5") {
+        haiku++;
+        expect(d.explored).toBe(true); // picking a non-empirical-best arm is exploration
+      }
+    }
+    expect(haiku).toBeGreaterThan(10); // explored
+    expect(haiku).toBeLessThan(200); // but sonnet still wins most
+  });
+
+  test("zero-variance arms collapse Thompson to a deterministic argmax", () => {
+    const r = thompsonPool({
+      easy: {
+        "claude-haiku-4-5": { n: 30, meanReward: 0.4, varReward: 0 },
+        "claude-sonnet-5": { n: 30, meanReward: 0.8, varReward: 0 },
+        "claude-opus-4-8": { n: 30, meanReward: 0.4, varReward: 0 },
+      },
+    });
+    for (let t = 1; t <= 30; t++) {
+      const d = r.route(turn(t), "run-A");
+      expect(d.candidate.modelString).toBe("claude-sonnet-5");
+      expect(d.explored).toBe(false);
+    }
+  });
+
+  test("Thompson picks are reproducible from (seed, seq)", () => {
+    const rows = {
+      easy: {
+        "claude-haiku-4-5": { n: 30, meanReward: 0.5, varReward: 0.1 },
+        "claude-sonnet-5": { n: 30, meanReward: 0.55, varReward: 0.1 },
+        "claude-opus-4-8": { n: 30, meanReward: 0.5, varReward: 0.1 },
+      },
+    };
+    const a = thompsonPool(rows).route(turn(7), "run-A");
+    const b = thompsonPool(rows).route(turn(7), "run-A");
+    expect(a.candidate.modelString).toBe(b.candidate.modelString);
+    expect(a.reason).toContain("thompson");
+  });
+
+  test("Thompson still respects the warm-up (under-sampled arms round-robin first)", () => {
+    const r = createPolicyRouter({
+      candidates: POOL,
+      policy: "learned",
+      learning: { minSamplesPerArm: 25, bandit: "thompson" },
+      score: tScore({
+        easy: {
+          "claude-haiku-4-5": { n: 30, meanReward: 0.9, varReward: 0.01 },
+          "claude-sonnet-5": { n: 3, meanReward: 0.1, varReward: 0.01 }, // under-sampled
+          "claude-opus-4-8": { n: 30, meanReward: 0.9, varReward: 0.01 },
+        },
+      }),
+    });
+    const d = r.route(turn(9), "run-A");
+    expect(d.candidate.modelString).toBe("claude-sonnet-5");
+    expect(d.reason).toContain("under-sampled");
+  });
+});

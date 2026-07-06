@@ -860,6 +860,7 @@ export type RunChatLoopOptions = {
       readonly latencyRefMs?: number;
       readonly explorationRate?: number;
       readonly seed?: string;
+      readonly bandit?: "epsilon-greedy" | "thompson";
     };
   };
   /**
@@ -1310,6 +1311,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               ...(pool.learning.explorationRate !== undefined
                 ? { explorationRate: pool.learning.explorationRate }
                 : {}),
+              ...(pool.learning.bandit !== undefined ? { bandit: pool.learning.bandit } : {}),
             },
           }
         : {}),
