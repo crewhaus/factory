@@ -146,12 +146,27 @@ trace event each turn.
 | `heuristic` (default) | hard turns → a `strong`-tagged candidate, easy turns → a `cheap`-tagged one (same `pickTier` difficulty signals as `model_tiers`; declaration order is the tag-less fallback) | none |
 | `learned` | the best arm for the turn's difficulty band, off a durable reward scoreboard | `@crewhaus/routing-store` |
 
-The `learned` policy is **deterministic** — no RNG, replayable from the
-persisted scoreboard plus the turn's signals. It explores least-sampled-first
-(declared order breaks ties) until every candidate in a band clears
-`minSamplesPerArm`, then exploits the highest mean reward. Selection is fs-free:
-the policy reads the scoreboard through an injected `score(routeKey, model)`
-lookup, so runtime-core owns all persistence. After each turn runtime-core folds
+The `learned` policy **warms up deterministically** — it explores
+least-sampled-first (declared order breaks ties) until every candidate in a
+band clears `minSamplesPerArm`. After warm-up it exploits the highest mean
+reward, with an optional online-exploration strategy (`learning.bandit`, since
+0.2.2) so it keeps sampling and can escape a stale optimum instead of
+hard-committing to the argmax forever:
+
+- **`epsilon-greedy`** (default) — try a non-best arm a fraction
+  `learning.explorationRate` of the time. `explorationRate: 0` (the default)
+  never draws, so it is byte-for-byte the deterministic exploit of 0.2.1.
+- **`thompson`** — draw each arm from its reward posterior
+  `Normal(meanReward, varReward / n)` and take the highest draw; uncertain arms
+  self-explore, so there is no ε to tune.
+
+Both draws are seeded from the run plus a monotonic transcript position
+(`learning.seed` overrides the per-run seed), so exploration stays **replayable
+from the transcript** — no persisted RNG — and keeps drawing a fresh coin
+across `--resume` (and a channel bot's resume-per-message pattern). Selection is
+fs-free: the policy reads the scoreboard through an injected
+`score(routeKey, model)` lookup, so runtime-core owns all persistence. After
+each turn runtime-core folds
 the observed outcome (success, latency, token-priced cost — a failed turn scores
 0, so a fast failure can't out-rank a reliable model) into
 [`@crewhaus/routing-store`](../routing-store), whose reward function and
@@ -159,12 +174,19 @@ append-only per-`(routeKey, model)` scoreboard live there. A failed candidate
 escalates to the strongest candidate (`escalation()`), mirroring the tier
 router's fast→default misroute recovery.
 
-Inspect or reset the accumulated scoreboard from the CLI:
+Inspect the accumulated scoreboard, replay a single run's decisions, or reset,
+from the CLI:
 
 ```
-crewhaus route status   # per-bucket arms, best-per-band starred
-crewhaus route reset    # wipe the scoreboard (kill switch)
+crewhaus route status              # per-bucket arms, best-per-band starred
+crewhaus route explain <session>   # replay one run's per-turn routing decisions
+crewhaus route reset               # wipe the scoreboard (kill switch)
 ```
+
+`route explain` reads the durable `model_route` events runtime-core persists to
+the session log each routing decision (a turn that runs tools re-routes as the
+difficulty band shifts, so a `turnNumber` can repeat), showing band, model,
+policy, explore/exploit, and reason per turn.
 
 Exports: `createPolicyRouter`, `PolicyRouter`, `PolicyDecision`, `PoolCandidate`,
 `PoolPolicy`, `PoolRoutingConfig`, `PoolLearningConfig`, `ScoreLookup`.
