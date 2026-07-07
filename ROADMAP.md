@@ -10,35 +10,39 @@ For day-to-day visibility on what's in flight, see the [GitHub Project](https://
 - The spec schema is versioned from day one (`spec_version: v0`).
 - 1.0 ships when: schema is stable, the eval-driven optimization loop is documented and tested for at least three target shapes, and the boundary-classifier inventory is complete.
 
-## What's in v0.1.0 (current)
+## What's shipped (current: v0.2.2)
+
+**Compiler core (v0.1.0):**
 
 - Compiler core: `parseSpec → lower → applyPasses → emit`
 - IR as a discriminated union of target-shape variants (CLI, channel bot, stateful graph, managed multi-tenant, RAG pipeline, multi-agent crew, autonomous research, batch worker, voice/realtime, browser/computer-use, eval bundle, workflow, on-chain, on-chain game)
 - Target emitters, one per shape: CLI, channel-{slack,discord,telegram,whatsapp,imessage}, graph, managed, pipeline, crew, research, batch, voice, browser, eval, workflow, onchain, onchain-game
 - `crewhaus-runtime-core` — runtime-thin imports for generated bundles
-- `crewhaus init`, `crewhaus compile`, `crewhaus run`, `crewhaus optimize`, `crewhaus validate`, `crewhaus doctor`
+- The CLI surface, grown well past the original six (`init`, `compile`, `run`, `optimize`, `validate`, `doctor`) to include `eval`, `lint`, `flywheel`, `advise`, `route`, `deploy`/`propose`, `fleet`, and more — see the [CLI reference](https://github.com/crewhaus/docs/blob/main/CLI-REFERENCE.md)
 - Eval-driven optimization: rule-based and Claude-driven `MutationProvider`s; spec-patch with YAML CST round-trip
 - Boundary classifier with `TrustOrigin` metadata across the eight boundary sites (MCP, sub-agent, channel, federation, skill, compaction, tool, chain)
 - Hello-world examples for: CLI, workflow, channel-{discord,telegram,whatsapp}, federation, graph, sandbox-image (multiple language variants)
 
-## v0.2.x (Days 30-60)
+**v0.2.0 — the automation release** (the feedback loops now run themselves):
 
-**Reference-corpus integrations (this slice):**
+- **Pillar 3 egress fabric** — sink-side companion to `boundary-classifier`. `packages/egress-classifier`; tool descriptors gain `scope: "internal" | "external"`; `RunContext.dataLineage` tracks per-origin provenance; `runtime-core` scans every external-scope tool input against lineage before invocation. New `egress_decision` audit + `egress-passed | egress-warned | egress-blocked` outcomes. A pluggable `EgressMatcher` (substring / semantic) delivered FR-006. Recipe: [demos/walkthroughs/55-egress-fabric.md](https://github.com/crewhaus/demos/blob/main/walkthroughs/55-egress-fabric.md).
+- **Pillar 3 intent gate (justification)** — `permission-engine` gains `evaluateJustification` + `ruleBasedJustificationJudge` + the `JustificationJudge` interface for LLM-backed judges; tools gain `requireJustification`; new `permission_justification_evaluated` audit (FR-004). Recipe: [demos/walkthroughs/53-justification-gates.md](https://github.com/crewhaus/demos/blob/main/walkthroughs/53-justification-gates.md).
+- **Pillar 2 canonical 12-metric rubric** — `packages/grader-12-metric-rubric` with all 12 named graders + validated thresholds, `summarize12MetricRubric` roll-ups (p50/p95/p99), and the `costPerUsefulOutput` aggregator. Recipe: [demos/walkthroughs/12-eval-harness.md](https://github.com/crewhaus/demos/blob/main/walkthroughs/12-eval-harness.md).
+- **Pillar 2 active context curation** — `packages/compaction-curator` (semantic-dedupe + relevance-reorder + top-K trim); `OPTIMIZABLE_PATHS` exposes `compaction.curate` / `dedupeThreshold` / `relevanceTopK`. Recipe: [demos/walkthroughs/52-context-curation.md](https://github.com/crewhaus/demos/blob/main/walkthroughs/52-context-curation.md).
+- **AST-aware code intelligence** — `packages/tool-codegraph` (`CodeGraphSearch` / `CodeGraphCallers` / `CodeGraphCallees` / `CodeGraphImpact`). Recipe: [demos/walkthroughs/54-codegraph-tool.md](https://github.com/crewhaus/demos/blob/main/walkthroughs/54-codegraph-tool.md).
+- **The self-improvement automation layer, wired end-to-end** — `crewhaus flywheel`, `advise`, `autodistill`, the canary gate, `faq distill` / `lessons update` / `fewshot harvest` / `sessions summarize`, `fleet`, `knowledge sync`, `retire`, and `state backup/restore`.
+- Per-shape GHCR container images, `crewhaus upgrade` spec migrations, an `observability.slo` block, `crewhaus mcp doctor`, and a first-class `memory:` block. Improved `crewhaus doctor --philosophy-alignment` (now covers egress + justification fabric drift).
 
-- **Pillar 3 egress fabric** — symmetric sink-side companion to `boundary-classifier`. New `packages/egress-classifier`. Tool descriptors gain `scope: "internal" | "external"`; `RunContext.dataLineage` tracks per-origin content provenance; `runtime-core` scans every external-scope tool input against lineage before invocation. New audit kind `egress_decision`. New trace outcomes `egress-passed | egress-warned | egress-blocked`. Recipe: [demos/walkthroughs/51-egress-fabric.md](https://github.com/crewhaus/demos/blob/main/walkthroughs/51-egress-fabric.md). Source: OpenAI 2026-05 prompt-injection paper, SACR 2026 runtime-security paper.
-- **Pillar 3 intent gate (justification)** — `permission-engine` adds `evaluateJustification` + `ruleBasedJustificationJudge` + the `JustificationJudge` interface for LLM-backed production judges. Tool descriptors gain `requireJustification: true`. New audit kind `permission_justification_evaluated`. Recipe: [demos/walkthroughs/53-justification-gates.md](https://github.com/crewhaus/demos/blob/main/walkthroughs/53-justification-gates.md). Source: SACR's three-layer model (Cyata's "guardian agent", Apono's intent-based authorization).
-- **Pillar 2 canonical 12-metric rubric** — new `packages/grader-12-metric-rubric` with all 12 named graders + industry-validated thresholds. Cross-sample roll-up via `summarize12MetricRubric` (p50/p95/p99, category roll-ups, threshold-breach flags). `costPerUsefulOutput` aggregator. Recipe: [demos/walkthroughs/12-eval-harness.md](https://github.com/crewhaus/demos/blob/main/walkthroughs/12-eval-harness.md). Source: TDS 2026-05 12-metric framework.
-- **Pillar 2 active context curation** — new `packages/compaction-curator`. Semantic-dedupe + relevance-reorder + top-K trim. `OPTIMIZABLE_PATHS` exposes `compaction.curate`, `compaction.dedupeThreshold`, `compaction.relevanceTopK`. Recipe: [demos/walkthroughs/52-context-curation.md](https://github.com/crewhaus/demos/blob/main/walkthroughs/52-context-curation.md). Source: Routray 2026-03 context-cost article.
-- **AST-aware code intelligence** — new `packages/tool-codegraph` with four tools (`CodeGraphSearch`, `CodeGraphCallers`, `CodeGraphCallees`, `CodeGraphImpact`) wrapping `@colbymchenry/codegraph` as an optional peer. Recipe: [demos/walkthroughs/54-codegraph-tool.md](https://github.com/crewhaus/demos/blob/main/walkthroughs/54-codegraph-tool.md).
+**v0.2.1 / v0.2.2 — adaptive model routing:**
 
-**Other v0.2.x items:**
-
-- More example artifacts: GitHub-issue-triage harness, doc-summarization skill, RAG pipeline, multi-agent customer-support crew, eval bundle
-- Improved `crewhaus doctor --philosophy-alignment` checks (now covers egress + justification fabric drift)
-- Polished error messages from the compiler (especially around invalid IR transitions)
-- Tightened recipes index with task-oriented walkthroughs
+- `agent.model_pool` — declare *N* candidate models and a selection `policy` (`static` / `heuristic` / `learned`); the superset of `model_tiers` + `model_fallbacks`, backed by `@crewhaus/routing-store` (v0.2.1).
+- `crewhaus route status | reset | explain` — inspect, wipe, or replay the durable reward scoreboard.
+- **Online learning (v0.2.2)** — ε-greedy and Thompson-sampling bandits (`learning.bandit`, `learning.explorationRate`); every pick emits a `model_route` trace event.
+- `crewhaus advise` mines the reward scoreboard into eval-gated pool-policy patches; the pool threads through `crewhaus run` and the pipeline/research/batch/browser shapes. Recipes: [57-advisor-loop](https://github.com/crewhaus/demos/blob/main/walkthroughs/57-advisor-loop.md), [59-model-resilience-and-cost](https://github.com/crewhaus/demos/blob/main/walkthroughs/59-model-resilience-and-cost.md).
 
 ## v0.3.x (Days 60-120)
+
+The underlying plugin/template marketplace primitives — `packages/plugin-registry`, `module-marketplace-client`, `template-registry`, and the `crewhaus plugins` / `crewhaus templates` CLI — already landed in v0.2.0. The public Forge and its verified-artifact program are the remaining piece:
 
 - **Crewhaus Forge** (community registry) integration: `crewhaus publish`, artifact validation, artifact pages
 - Public artifact directory at forge.crewhaus.ai
@@ -85,4 +89,4 @@ Open an RFC issue. See [`CONTRIBUTING.md`](CONTRIBUTING.md). We expect to revise
 
 ---
 
-*Last updated: 2026-05-30. Subject to change.*
+*Last updated: 2026-07-07. Subject to change.*
