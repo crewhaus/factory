@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Shape emitters no longer silently drop `failure_taxonomy` ([#296]). The
+  workflow, graph, pipeline, research, batch, and browser emitters now thread
+  the spec's taxonomy into their generated `runChatLoop` calls, and crew runs
+  it crew-wide via the new `crew-orchestrator` `RunOptions.failureTaxonomy`
+  (same scope as `permissionMode`/`permissionRules`). Previously only the
+  cli/channel/managed emitters rendered it, so declared recovery classes
+  (e.g. retry-on-429, continue-on-tool-timeout) never fired on the other
+  shapes. Shapes whose runtimes cannot consume the taxonomy yet (voice, eval,
+  onchain, onchain-game, cf-worker-*) now surface a
+  `// note: failure_taxonomy configured but … ignored` comment in the
+  generated bundle instead of dropping it silently. Bundles without the block
+  stay byte-identical.
+
+[#296]: https://github.com/crewhaus/factory/pull/296
+
 ## [0.2.2] - 2026-07-06
 
 The adaptive-routing completion release: `agent.model_pool` learns ONLINE
