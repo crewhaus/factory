@@ -176,3 +176,25 @@ describe("emitPipeline", () => {
     expect(content).toContain("flag: [],");
   });
 });
+
+describe("emitPipeline — failureTaxonomy field (item 23)", () => {
+  test("threads failureTaxonomy into the runChatLoop call", () => {
+    const ir: IrPipelineV0 = {
+      ...baseIr,
+      failureTaxonomy: [
+        { class: "rate_limited", pattern: "/429|rate.?limit/i", recovery: "retry" },
+        { class: "tool_timeout", pattern: "ETIMEDOUT", recovery: "continue", hint: "slow tool" },
+      ],
+    };
+    const c = emitPipeline(ir).files[0]?.content ?? "";
+    expect(c).toContain("failureTaxonomy:");
+    expect(c).toContain('"recovery":"retry"');
+    expect(c).toContain('"pattern":"ETIMEDOUT"');
+  });
+
+  test("omits failureTaxonomy when the IR leaves it unset or empty", () => {
+    expect(emitPipeline(baseIr).files[0]?.content ?? "").not.toContain("failureTaxonomy:");
+    const empty: IrPipelineV0 = { ...baseIr, failureTaxonomy: [] };
+    expect(emitPipeline(empty).files[0]?.content ?? "").not.toContain("failureTaxonomy:");
+  });
+});

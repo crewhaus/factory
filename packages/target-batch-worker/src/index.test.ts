@@ -131,3 +131,25 @@ describe("emitBatchWorker", () => {
     expect(code).toContain("BUILTIN_DEFAULT_RULES");
   });
 });
+
+describe("emitBatchWorker — failureTaxonomy field (item 23)", () => {
+  test("threads failureTaxonomy into the per-job runChatLoop call", () => {
+    const ir: IrBatchV0 = {
+      ...baseIr,
+      failureTaxonomy: [
+        { class: "rate_limited", pattern: "/429|rate.?limit/i", recovery: "retry" },
+        { class: "tool_timeout", pattern: "ETIMEDOUT", recovery: "continue", hint: "slow tool" },
+      ],
+    };
+    const c = emitBatchWorker(ir).files[0]?.content ?? "";
+    expect(c).toContain("failureTaxonomy:");
+    expect(c).toContain('"recovery":"retry"');
+    expect(c).toContain('"pattern":"ETIMEDOUT"');
+  });
+
+  test("omits failureTaxonomy when the IR leaves it unset or empty", () => {
+    expect(emitBatchWorker(baseIr).files[0]?.content ?? "").not.toContain("failureTaxonomy:");
+    const empty: IrBatchV0 = { ...baseIr, failureTaxonomy: [] };
+    expect(emitBatchWorker(empty).files[0]?.content ?? "").not.toContain("failureTaxonomy:");
+  });
+});

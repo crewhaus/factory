@@ -178,3 +178,21 @@ describe("emitOnchainGame — spec-name codegen injection (#147)", () => {
     expect(content).not.toContain("*/\nglobalThis");
   });
 });
+
+describe("emitOnchainGame — failure_taxonomy ignored-note (item 23)", () => {
+  test("agent.ts carries the ignored-taxonomy note when the spec declares one", () => {
+    const ir = baseIr({
+      failureTaxonomy: [{ class: "rate_limited", pattern: "/429/", recovery: "retry" }],
+    });
+    const code = emitOnchainGame(ir).files[0]?.content ?? "";
+    expect(code).toContain(
+      "failure_taxonomy configured but target-onchain-game does not yet wire it up",
+    );
+  });
+
+  test("no note when the spec omits failure_taxonomy", () => {
+    expect(emitOnchainGame(baseIr()).files[0]?.content ?? "").not.toContain(
+      "failure_taxonomy configured",
+    );
+  });
+});

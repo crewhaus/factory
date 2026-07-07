@@ -302,3 +302,25 @@ describe("emitBrowserDriver — single-turn parity (no mcp_servers, no compactio
     expect(code).not.toContain("@crewhaus/compaction-");
   });
 });
+
+describe("emitBrowserDriver — failureTaxonomy field (item 23)", () => {
+  test("threads failureTaxonomy into the runChatLoop call", () => {
+    const ir: IrBrowserV0 = {
+      ...baseIr,
+      failureTaxonomy: [
+        { class: "rate_limited", pattern: "/429|rate.?limit/i", recovery: "retry" },
+        { class: "tool_timeout", pattern: "ETIMEDOUT", recovery: "continue", hint: "slow tool" },
+      ],
+    };
+    const c = emitBrowserDriver(ir).files[0]?.content ?? "";
+    expect(c).toContain("failureTaxonomy:");
+    expect(c).toContain('"recovery":"retry"');
+    expect(c).toContain('"pattern":"ETIMEDOUT"');
+  });
+
+  test("omits failureTaxonomy when the IR leaves it unset or empty", () => {
+    expect(emitBrowserDriver(baseIr).files[0]?.content ?? "").not.toContain("failureTaxonomy:");
+    const empty: IrBrowserV0 = { ...baseIr, failureTaxonomy: [] };
+    expect(emitBrowserDriver(empty).files[0]?.content ?? "").not.toContain("failureTaxonomy:");
+  });
+});

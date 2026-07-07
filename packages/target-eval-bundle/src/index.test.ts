@@ -103,3 +103,17 @@ describe("target-eval-bundle — T1 emitted bundle structure", () => {
     expect(code).toContain("\\nnewline");
   });
 });
+
+describe("emitEval — failure_taxonomy ignored-note (item 23)", () => {
+  test("agent.ts carries the ignored-taxonomy note when the spec declares one", () => {
+    const ir = makeIr({
+      failureTaxonomy: [{ class: "rate_limited", pattern: "/429/", recovery: "retry" }],
+    });
+    const code = emitEval(ir).files[0]?.content ?? "";
+    expect(code).toContain("failure_taxonomy configured but target-eval does not yet wire it up");
+  });
+
+  test("no note when the spec omits failure_taxonomy", () => {
+    expect(emitEval(makeIr()).files[0]?.content ?? "").not.toContain("failure_taxonomy configured");
+  });
+});

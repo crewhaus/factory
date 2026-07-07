@@ -145,6 +145,18 @@ function poolField(ir: IrBatchV0, indent: string): string {
     : "";
 }
 
+/**
+ * Section 55 / item 23 — render the `failureTaxonomy` runChatLoop field.
+ * Empty when the spec omits the block (mirror: target-cli +
+ * target-channel-bot render the same field; keep the pipeline/research/
+ * batch/browser copies in sync).
+ */
+function taxonomyField(ir: IrBatchV0, indent: string): string {
+  const taxonomy = ir.failureTaxonomy;
+  if (taxonomy === undefined || taxonomy.length === 0) return "";
+  return `\n${indent}failureTaxonomy: ${JSON.stringify(taxonomy)},`;
+}
+
 export function emitBatchWorker(ir: IrBatchV0, opts: EmitReadmeOptions = {}): Bundle {
   if (ir.queue.adapter !== "in-memory") {
     // v0 only ships the in-memory adapter; the others are stubs that
@@ -262,7 +274,7 @@ async function main(): Promise<void> {
       const runContext = createRunContext();
       const reply = await runChatLoop({
         model: SPEC_MODEL,
-        instructions: SPEC_INSTRUCTIONS,${poolField(ir, "        ")}
+        instructions: SPEC_INSTRUCTIONS,${poolField(ir, "        ")}${taxonomyField(ir, "        ")}
         runContext,
         sessionName: SPEC_NAME,
         sessionTarget: "batch",

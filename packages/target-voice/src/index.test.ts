@@ -113,3 +113,21 @@ describe("emitVoice", () => {
     });
   });
 });
+
+describe("emitVoice — failure_taxonomy ignored-note (item 23)", () => {
+  test("voice-loop.ts carries the ignored-taxonomy note when the spec declares one", () => {
+    const ir: IrVoiceV0 = {
+      ...baseIr,
+      failureTaxonomy: [{ class: "rate_limited", pattern: "/429/", recovery: "retry" }],
+    };
+    const loop = emitVoice(ir).files.find((f) => f.path === "voice-loop.ts");
+    expect(loop?.content ?? "").toContain(
+      "failure_taxonomy configured but target-voice does not yet wire it up",
+    );
+  });
+
+  test("no note when the spec omits failure_taxonomy", () => {
+    const loop = emitVoice(baseIr).files.find((f) => f.path === "voice-loop.ts");
+    expect(loop?.content ?? "").not.toContain("failure_taxonomy configured");
+  });
+});
