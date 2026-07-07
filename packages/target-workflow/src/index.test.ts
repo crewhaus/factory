@@ -222,3 +222,26 @@ describe("emitWorkflow", () => {
     expect(c).not.toContain("BUILTIN_DEFAULT_RULES");
   });
 });
+
+describe("emitWorkflow — failureTaxonomy field (item 23)", () => {
+  test("threads failureTaxonomy into every step's runChatLoop call", () => {
+    const ir: IrWorkflowV0 = {
+      ...TWO_STEP_IR,
+      failureTaxonomy: [
+        { class: "rate_limited", pattern: "/429|rate.?limit/i", recovery: "retry" },
+        { class: "tool_timeout", pattern: "ETIMEDOUT", recovery: "continue", hint: "slow tool" },
+      ],
+    };
+    const c = emitWorkflow(ir).files[0]?.content ?? "";
+    const matches = c.match(/failureTaxonomy:/g) ?? [];
+    expect(matches.length).toBe(2); // one per step
+    expect(c).toContain('"recovery":"retry"');
+    expect(c).toContain('"pattern":"ETIMEDOUT"');
+  });
+
+  test("omits failureTaxonomy when the IR leaves it unset or empty", () => {
+    expect(emitWorkflow(TWO_STEP_IR).files[0]?.content ?? "").not.toContain("failureTaxonomy:");
+    const empty: IrWorkflowV0 = { ...TWO_STEP_IR, failureTaxonomy: [] };
+    expect(emitWorkflow(empty).files[0]?.content ?? "").not.toContain("failureTaxonomy:");
+  });
+});

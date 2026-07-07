@@ -268,3 +268,22 @@ describe("emitCfWorkerGraph — provider gate", () => {
     expect(emitCfWorkerGraph(baseIr).files.length).toBe(4);
   });
 });
+
+describe("emitCfWorkerGraph — failure_taxonomy ignored-note (item 23)", () => {
+  test("worker.js carries the ignored-taxonomy note when the spec declares one", () => {
+    const ir: IrGraphV0 = {
+      ...baseIr,
+      failureTaxonomy: [{ class: "rate_limited", pattern: "/429/", recovery: "retry" }],
+    };
+    const code = emitCfWorkerGraph(ir).files[0]?.content ?? "";
+    expect(code).toContain(
+      "failure_taxonomy configured but target-cf-worker-graph does not yet wire it up",
+    );
+  });
+
+  test("no note when the spec omits failure_taxonomy", () => {
+    expect(emitCfWorkerGraph(baseIr).files[0]?.content ?? "").not.toContain(
+      "failure_taxonomy configured",
+    );
+  });
+});

@@ -269,3 +269,21 @@ describe("emitOnchain — spec-name codegen injection (#147)", () => {
     expect(content).not.toContain("*/\nglobalThis");
   });
 });
+
+describe("emitOnchain — failure_taxonomy ignored-note (item 23)", () => {
+  test("agent.ts carries the ignored-taxonomy note when the spec declares one", () => {
+    const ir = baseIr({
+      failureTaxonomy: [{ class: "rate_limited", pattern: "/429/", recovery: "retry" }],
+    });
+    const code = emitOnchain(ir).files[0]?.content ?? "";
+    expect(code).toContain(
+      "failure_taxonomy configured but target-onchain does not yet wire it up",
+    );
+  });
+
+  test("no note when the spec omits failure_taxonomy", () => {
+    expect(emitOnchain(baseIr()).files[0]?.content ?? "").not.toContain(
+      "failure_taxonomy configured",
+    );
+  });
+});

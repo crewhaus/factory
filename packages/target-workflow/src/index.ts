@@ -101,7 +101,13 @@ function resolveAllTools(steps: readonly IrWorkflowStep[]): string[] {
   return imports;
 }
 
-function renderStep(step: IrWorkflowStep, idx: number, total: number, permFields: string): string {
+function renderStep(
+  step: IrWorkflowStep,
+  idx: number,
+  total: number,
+  permFields: string,
+  failureTaxonomyField: string,
+): string {
   const isFirst = idx === 0;
   const stepNum = idx + 1;
   const toolsField = renderStepToolsField(step.tools);
@@ -122,7 +128,7 @@ ${stdinReadLine}  process.stdout.write("\\n[step ${stepNum}/${total}: ${step.nam
     model: ${escapeJsonString(step.model)},
     instructions: ${escapeJsonString(step.instructions)},
     singleTurn: true,
-    seedMessages: [{ role: "user", content: ${userContent} }],${toolsField}${permFields}
+    seedMessages: [{ role: "user", content: ${userContent} }],${toolsField}${permFields}${failureTaxonomyField}
     hooks: __hooks,
     skills: __skills,
     slashCommands: __slashCommands,
@@ -142,6 +148,18 @@ function renderStepToolsField(tools: readonly string[]): string {
     return "\n    tools: __skillTool ? [__skillTool] : [],";
   }
   return `\n    tools: __skillTool ? [${exports.join(", ")}, __skillTool] : [${exports.join(", ")}],`;
+}
+
+/**
+ * Section 55 / item 23 — render the `failureTaxonomy` runChatLoop field.
+ * The taxonomy is spec-level, so every step's runChatLoop call gets the
+ * same classes (mirror: target-cli + target-channel-bot render the same
+ * field). Empty when the spec omits the block.
+ */
+function renderFailureTaxonomyField(ir: IrWorkflowV0): string {
+  const taxonomy = ir.failureTaxonomy;
+  if (taxonomy === undefined || taxonomy.length === 0) return "";
+  return `\n    failureTaxonomy: ${JSON.stringify(taxonomy)},`;
 }
 
 function renderPermissionsFields(ir: IrWorkflowV0): string {
@@ -183,7 +201,10 @@ function renderAgent(ir: IrWorkflowV0): string {
     ? `import { BUILTIN_DEFAULT_RULES } from "@crewhaus/permission-engine";\n`
     : "";
   const permFields = renderPermissionsFields(ir);
-  const stepBodies = ir.steps.map((s, i) => renderStep(s, i, ir.steps.length, permFields)).join("");
+  const failureTaxonomyField = renderFailureTaxonomyField(ir);
+  const stepBodies = ir.steps
+    .map((s, i) => renderStep(s, i, ir.steps.length, permFields, failureTaxonomyField))
+    .join("");
   // Section 9: workflow target ignores mcp_servers in v0. Surface it as a
   // generated comment so users notice rather than wondering why their MCP
   // tools never showed up.

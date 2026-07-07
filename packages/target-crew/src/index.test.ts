@@ -162,3 +162,27 @@ describe("emitCrew", () => {
     expect(daemon?.content).toContain("Handoff");
   });
 });
+
+describe("emitCrew — failureTaxonomy field (item 23)", () => {
+  test("daemon threads failureTaxonomy into crew.run options", () => {
+    const ir: IrCrewV0 = {
+      ...minimalIr,
+      failureTaxonomy: [
+        { class: "rate_limited", pattern: "/429|rate.?limit/i", recovery: "retry" },
+        { class: "tool_timeout", pattern: "ETIMEDOUT", recovery: "continue", hint: "slow tool" },
+      ],
+    };
+    const daemon = emitCrew(ir).files.find((f) => f.path === "daemon.ts");
+    expect(daemon?.content ?? "").toContain("failureTaxonomy:");
+    expect(daemon?.content ?? "").toContain('"recovery":"retry"');
+    expect(daemon?.content ?? "").toContain('"pattern":"ETIMEDOUT"');
+  });
+
+  test("omits failureTaxonomy when the IR leaves it unset or empty", () => {
+    const unset = emitCrew(minimalIr).files.find((f) => f.path === "daemon.ts");
+    expect(unset?.content ?? "").not.toContain("failureTaxonomy:");
+    const empty: IrCrewV0 = { ...minimalIr, failureTaxonomy: [] };
+    const daemon = emitCrew(empty).files.find((f) => f.path === "daemon.ts");
+    expect(daemon?.content ?? "").not.toContain("failureTaxonomy:");
+  });
+});

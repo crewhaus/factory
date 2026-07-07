@@ -70,6 +70,18 @@ function poolField(ir: IrPipelineV0, indent: string): string {
 }
 
 /**
+ * Section 55 / item 23 — render the `failureTaxonomy` runChatLoop field.
+ * Empty when the spec omits the block (mirror: target-cli +
+ * target-channel-bot render the same field; keep the pipeline/research/
+ * batch/browser copies in sync).
+ */
+function taxonomyField(ir: IrPipelineV0, indent: string): string {
+  const taxonomy = ir.failureTaxonomy;
+  if (taxonomy === undefined || taxonomy.length === 0) return "";
+  return `\n${indent}failureTaxonomy: ${JSON.stringify(taxonomy)},`;
+}
+
+/**
  * Build the `createVectorStore({ ... })` call. Only the fields the IR
  * carries are emitted, so an `in-memory` pipeline stays byte-identical to
  * `createVectorStore({ backend: "in-memory" })`; remote/file backends add
@@ -187,7 +199,7 @@ if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));
 
 await runChatLoop({
   model: ${escapeJsonString(ir.agent.model)},
-  instructions: ${escapeJsonString(ir.agent.instructions)},${poolField(ir, "  ")}
+  instructions: ${escapeJsonString(ir.agent.instructions)},${poolField(ir, "  ")}${taxonomyField(ir, "  ")}
   sessionName: ${escapeJsonString(ir.name)},
   sessionTarget: "pipeline",
   tools: defaultCatalog.list(),${permField}

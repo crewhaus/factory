@@ -19,6 +19,7 @@
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/event-log": "workspace:*",
     "@crewhaus/permission-engine": "workspace:*",
+    "@crewhaus/recovery-engine": "workspace:*",
     "@crewhaus/run-context": "workspace:*",
     "@crewhaus/runtime-core": "workspace:*",
     "@crewhaus/tool-catalog": "workspace:*",

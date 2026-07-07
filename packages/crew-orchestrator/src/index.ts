@@ -32,6 +32,7 @@ import {
   type RuleSet,
   emptyRuleSet,
 } from "@crewhaus/permission-engine";
+import type { NamedFailureClass } from "@crewhaus/recovery-engine";
 import { type RunContext, createRunContext, tagContent } from "@crewhaus/run-context";
 import { runChatLoop } from "@crewhaus/runtime-core";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
@@ -94,6 +95,8 @@ export type RunOptions = {
   readonly permissionMode?: PermissionMode;
   /** Permission rules for every role's runChatLoop. Default builtin floor. */
   readonly permissionRules?: RuleSet;
+  /** Item 23 — failure taxonomy for every role's runChatLoop. Default none (built-in classify). */
+  readonly failureTaxonomy?: ReadonlyArray<NamedFailureClass>;
   /** Cap on consecutive handoffs before HandoffRefusedError fires. Default 2. */
   readonly refusalDepth?: number;
   /** Cap on the total number of role activations. Default 16 — keeps runaway crews bounded. */
@@ -205,6 +208,12 @@ async function* driveCrew(
   const maxA2A = args.opts.maxA2ADepth ?? DEFAULT_MAX_A2A_DEPTH;
 
   const permissionMode: PermissionMode = args.opts.permissionMode ?? "default";
+  // Item 23 — the spec-declared taxonomy applies to every role's runChatLoop
+  // (same crew-wide scope as permissionMode/permissionRules).
+  const failureTaxonomy =
+    args.opts.failureTaxonomy !== undefined && args.opts.failureTaxonomy.length > 0
+      ? args.opts.failureTaxonomy
+      : undefined;
   // Always grant the orchestrator-owned tools (Handoff + SendMessage). Crew
   // bundles wire the user's spec rules under `yaml`; we add Handoff +
   // SendMessage allowances under `flag` so they apply regardless of the
@@ -429,6 +438,7 @@ async function* driveCrew(
           }),
           permissionMode,
           permissionRules,
+          ...(failureTaxonomy !== undefined ? { failureTaxonomy } : {}),
           installSigintHandler: false,
           maxTokens: peerDef.maxTokens ?? DEFAULT_MAX_TOKENS,
           crewMailbox: mailbox,
@@ -500,6 +510,7 @@ async function* driveCrew(
           }),
           permissionMode,
           permissionRules,
+          ...(failureTaxonomy !== undefined ? { failureTaxonomy } : {}),
           installSigintHandler: false,
           maxTokens: def.maxTokens ?? DEFAULT_MAX_TOKENS,
           crewMailbox: mailbox,

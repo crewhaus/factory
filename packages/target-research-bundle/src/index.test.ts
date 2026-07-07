@@ -93,3 +93,25 @@ describe("emitResearchBundle", () => {
     expect(code).toContain('"/tmp"');
   });
 });
+
+describe("emitResearchBundle — failureTaxonomy field (item 23)", () => {
+  test("threads failureTaxonomy into the branch runChatLoop call", () => {
+    const ir: IrResearchV0 = {
+      ...baseIr,
+      failureTaxonomy: [
+        { class: "rate_limited", pattern: "/429|rate.?limit/i", recovery: "retry" },
+        { class: "tool_timeout", pattern: "ETIMEDOUT", recovery: "continue", hint: "slow tool" },
+      ],
+    };
+    const c = emitResearchBundle(ir).files[0]?.content ?? "";
+    expect(c).toContain("failureTaxonomy:");
+    expect(c).toContain('"recovery":"retry"');
+    expect(c).toContain('"pattern":"ETIMEDOUT"');
+  });
+
+  test("omits failureTaxonomy when the IR leaves it unset or empty", () => {
+    expect(emitResearchBundle(baseIr).files[0]?.content ?? "").not.toContain("failureTaxonomy:");
+    const empty: IrResearchV0 = { ...baseIr, failureTaxonomy: [] };
+    expect(emitResearchBundle(empty).files[0]?.content ?? "").not.toContain("failureTaxonomy:");
+  });
+});

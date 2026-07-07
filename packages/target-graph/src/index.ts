@@ -77,7 +77,19 @@ function validateGraph(ir: IrGraphV0): void {
  * `state["<nodeName>"]`. When `hitlPrompt` is set, the node calls
  * `ctx.requestApproval` after the LLM turn so the engine can pause.
  */
-function renderNodeBody(node: IrGraphNode): string {
+/**
+ * Section 55 / item 23 — render the `failureTaxonomy` runChatLoop field.
+ * The taxonomy is graph-level, so every node's runChatLoop call gets the
+ * same classes (mirror: target-cli + target-channel-bot render the same
+ * field). Empty when the spec omits the block.
+ */
+function renderFailureTaxonomyField(ir: IrGraphV0): string {
+  const taxonomy = ir.failureTaxonomy;
+  if (taxonomy === undefined || taxonomy.length === 0) return "";
+  return `\n        failureTaxonomy: ${JSON.stringify(taxonomy)},`;
+}
+
+function renderNodeBody(node: IrGraphNode, failureTaxonomyField: string): string {
   const instructionsJs = escapeJsonString(node.instructions);
   const modelJs = escapeJsonString(node.model);
   const nameJs = escapeJsonString(node.name);
@@ -98,7 +110,7 @@ function renderNodeBody(node: IrGraphNode): string {
         sessionName: ${escapeJsonString(node.name)} + "-" + ctx.graphRunId,
         sessionTarget: "graph-node",
         seedMessages: __seed,
-        singleTurn: true,
+        singleTurn: true,${failureTaxonomyField}
         runContext: ctx.runContext,
       });
       const __next = { ...prev, [${nameJs}]: __reply };${hitlBlock}
@@ -109,8 +121,12 @@ function renderNodeBody(node: IrGraphNode): string {
 function renderAgent(ir: IrGraphV0): string {
   validateGraph(ir);
 
+  const failureTaxonomyField = renderFailureTaxonomyField(ir);
   const nodeRegistrations = ir.nodes
-    .map((n) => `  .addNode(${escapeJsonString(n.name)}, ${renderNodeBody(n).trim()})`)
+    .map(
+      (n) =>
+        `  .addNode(${escapeJsonString(n.name)}, ${renderNodeBody(n, failureTaxonomyField).trim()})`,
+    )
     .join("\n");
 
   const edgeRegistrations = ir.edges

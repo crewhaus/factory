@@ -170,3 +170,26 @@ describe("emitGraph", () => {
     expect(content).not.toContain("__next.x = 1; globalThis.__HITL_PWNED__");
   });
 });
+
+describe("emitGraph — failureTaxonomy field (item 23)", () => {
+  test("threads failureTaxonomy into every node's runChatLoop call", () => {
+    const ir: IrGraphV0 = {
+      ...baseIr,
+      failureTaxonomy: [
+        { class: "rate_limited", pattern: "/429|rate.?limit/i", recovery: "retry" },
+        { class: "tool_timeout", pattern: "ETIMEDOUT", recovery: "continue", hint: "slow tool" },
+      ],
+    };
+    const c = emitGraph(ir).files[0]?.content ?? "";
+    const matches = c.match(/failureTaxonomy:/g) ?? [];
+    expect(matches.length).toBe(3); // one per node
+    expect(c).toContain('"recovery":"retry"');
+    expect(c).toContain('"pattern":"ETIMEDOUT"');
+  });
+
+  test("omits failureTaxonomy when the IR leaves it unset or empty", () => {
+    expect(emitGraph(baseIr).files[0]?.content ?? "").not.toContain("failureTaxonomy:");
+    const empty: IrGraphV0 = { ...baseIr, failureTaxonomy: [] };
+    expect(emitGraph(empty).files[0]?.content ?? "").not.toContain("failureTaxonomy:");
+  });
+});
