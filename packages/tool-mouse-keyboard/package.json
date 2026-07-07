@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-mouse-keyboard",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "type": "module",
   "description": "Click / Type / Key / Scroll tools — destructive: true (Section 25 BROW)",
   "main": "src/index.ts",

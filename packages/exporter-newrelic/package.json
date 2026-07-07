@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/exporter-newrelic",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "type": "module",
   "description": "New Relic OTLP exporter — wraps @crewhaus/otel-exporter with api-key auth + entity.guid resource attr (Section 37)",
   "main": "src/index.ts",

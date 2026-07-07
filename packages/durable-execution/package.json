@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/durable-execution",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "type": "module",
   "description": "Exactly-once node execution wrapper over graph-engine — idempotency keys + crash-replay",
   "main": "src/index.ts",

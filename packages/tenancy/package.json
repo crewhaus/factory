@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tenancy",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "type": "module",
   "description": "Per-tenant storage rebase + cross-tenant guard for the managed-daemon target",
   "main": "src/index.ts",

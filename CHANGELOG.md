@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-07-07
+
+A focused fix release: declared `failure_taxonomy` recovery classes now
+fire on every single-agent-loop shape, not just cli/channel/managed.
+
 ### Fixed
 
 - Shape emitters no longer silently drop `failure_taxonomy` ([#296]). The
@@ -23,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stay byte-identical.
 
 [#296]: https://github.com/crewhaus/factory/pull/296
+[0.2.3]: https://github.com/crewhaus/factory/compare/v0.2.2...v0.2.3
 
 ## [0.2.2] - 2026-07-06
 
