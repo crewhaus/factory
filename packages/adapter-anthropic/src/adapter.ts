@@ -54,8 +54,26 @@ export class AnthropicAdapter implements ProviderAdapter {
     const params = toAnthropicParams(req, this.isOAuth);
     let iterator: AsyncIterable<Anthropic.RawMessageStreamEvent>;
     try {
-      iterator = this.client.messages.stream(
-        params,
+      // Consume the RAW streaming `create({ stream: true })` events, NOT the
+      // high-level `messages.stream()` helper. `.stream()` builds a
+      // MessageStream that accumulates and `partialParse`s each tool_use's
+      // input JSON as events arrive; a truncated or malformed tool call (the
+      // model cut off at `max_tokens` mid-args, or emitting slightly invalid
+      // JSON) makes that internal parse THROW ("JSON Parse error: Expected
+      // '}'") from inside the SDK — which bypasses our own guarded
+      // accumulation downstream. Both stream consumers
+      // (`@crewhaus/streaming-tool-executor` and the non-streaming
+      // `consumeStream`) rebuild the tool input from `input_json_delta`
+      // themselves and set `{ __parse_error: true }` on a bad parse, letting
+      // the runtime's `max_tokens` recovery strip the orphan `tool_use` and
+      // ask the model to continue. Feeding them the raw events keeps that
+      // parse in OUR guarded code, so a bad tool call degrades gracefully
+      // instead of crashing the turn with an unrecoverable parse error.
+      iterator = await this.client.messages.create(
+        // `toAnthropicParams` builds the same body `messages.stream()` took;
+        // `MessageStreamParams` widens `output_config` to allow `null` (which
+        // this code never sets), so cast to the streaming-create param type.
+        { ...params, stream: true } as Anthropic.MessageCreateParamsStreaming,
         req.signal !== undefined ? { signal: req.signal } : {},
       );
     } catch (err) {

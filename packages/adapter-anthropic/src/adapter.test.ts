@@ -3,11 +3,14 @@ import type Anthropic from "@anthropic-ai/sdk";
 import { AdapterError } from "@crewhaus/errors";
 import { AnthropicAdapter, createAnthropicAdapter } from "./adapter.js";
 import { CLAUDE_CODE_SYSTEM_PREFIX } from "./client.js";
-import type { ProviderRequest } from "./types.js";
+import type { ProviderRequest, StreamEvent } from "./types.js";
 
 /**
- * Build a fake Anthropic client whose `messages.stream(params, opts)`
- * captures the params and yields the supplied raw events.
+ * Build a fake Anthropic client whose `messages.create(params, opts)`
+ * captures the params and yields the supplied raw events. The adapter
+ * consumes the raw `create({ stream: true })` event stream (NOT the
+ * high-level `messages.stream()` helper) so a truncated/malformed tool
+ * call parses in our own guarded code, not the SDK's.
  */
 function fakeClient(rawEvents: Anthropic.RawMessageStreamEvent[]): {
   client: Anthropic;
@@ -19,12 +22,12 @@ function fakeClient(rawEvents: Anthropic.RawMessageStreamEvent[]): {
       // The real SDK returns an event-emitter that ALSO implements
       // AsyncIterable. Our adapter only uses `for await`, so a plain
       // async generator is enough for the test surface.
-      stream: ((params: Anthropic.MessageStreamParams) => {
+      create: ((params: Anthropic.MessageStreamParams) => {
         captured.params = params;
         return (async function* () {
           for (const ev of rawEvents) yield ev;
         })();
-      }) as unknown as Anthropic["messages"]["stream"],
+      }) as unknown as Anthropic["messages"]["create"],
     },
   } as unknown as Anthropic;
   return { client, captured };
@@ -144,11 +147,11 @@ describe("AnthropicAdapter", () => {
     // are no yields, even though throw-only generators are valid).
     const client = {
       messages: {
-        stream: ((_params: Anthropic.MessageStreamParams) => ({
+        create: ((_params: Anthropic.MessageStreamParams) => ({
           [Symbol.asyncIterator]() {
             return { next: () => Promise.reject(sdkLikeError) };
           },
-        })) as unknown as Anthropic["messages"]["stream"],
+        })) as unknown as Anthropic["messages"]["create"],
       },
     } as unknown as Anthropic;
 
@@ -175,11 +178,11 @@ describe("AnthropicAdapter", () => {
     // are no yields, even though throw-only generators are valid).
     const client = {
       messages: {
-        stream: ((_params: Anthropic.MessageStreamParams) => ({
+        create: ((_params: Anthropic.MessageStreamParams) => ({
           [Symbol.asyncIterator]() {
             return { next: () => Promise.reject(sdkLikeError) };
           },
-        })) as unknown as Anthropic["messages"]["stream"],
+        })) as unknown as Anthropic["messages"]["create"],
       },
     } as unknown as Anthropic;
 
@@ -199,11 +202,11 @@ describe("AnthropicAdapter", () => {
     (abortErr as { name: string }).name = "APIUserAbortError";
     const client = {
       messages: {
-        stream: ((_p: Anthropic.MessageStreamParams) => ({
+        create: ((_p: Anthropic.MessageStreamParams) => ({
           [Symbol.asyncIterator]() {
             return { next: () => Promise.reject(abortErr) };
           },
-        })) as unknown as Anthropic["messages"]["stream"],
+        })) as unknown as Anthropic["messages"]["create"],
       },
     } as unknown as Anthropic;
     const a = new AnthropicAdapter({ client, isOAuth: false });
@@ -222,11 +225,11 @@ describe("AnthropicAdapter", () => {
     (abortErr as { name: string }).name = "AbortError";
     const client = {
       messages: {
-        stream: ((_p: Anthropic.MessageStreamParams) => ({
+        create: ((_p: Anthropic.MessageStreamParams) => ({
           [Symbol.asyncIterator]() {
             return { next: () => Promise.reject(abortErr) };
           },
-        })) as unknown as Anthropic["messages"]["stream"],
+        })) as unknown as Anthropic["messages"]["create"],
       },
     } as unknown as Anthropic;
     const a = new AnthropicAdapter({ client, isOAuth: false });
@@ -239,16 +242,16 @@ describe("AnthropicAdapter", () => {
     expect(caught).toBe(abortErr);
   });
 
-  test("error thrown synchronously by messages.stream() is normalised", () => {
-    // The SDK can throw during `messages.stream(...)` construction (before
+  test("error thrown synchronously by messages.create() is normalised", () => {
+    // The SDK can throw during `messages.create(...)` construction (before
     // iteration). The adapter's outer try/catch (not the for-await one)
     // must normalise it too.
     const boom = new Error("bad request building stream");
     const client = {
       messages: {
-        stream: (() => {
+        create: (() => {
           throw boom;
-        }) as unknown as Anthropic["messages"]["stream"],
+        }) as unknown as Anthropic["messages"]["create"],
       },
     } as unknown as Anthropic;
     const a = new AnthropicAdapter({ client, isOAuth: false });
@@ -267,6 +270,85 @@ describe("AnthropicAdapter", () => {
     );
   });
 
+  test("a TRUNCATED tool call streams through raw without throwing (no SDK-side parse)", async () => {
+    // Regression: the model is cut off at max_tokens mid tool-call args, so
+    // the tool_use input JSON is incomplete (`{"slug":"foo`). The high-level
+    // `messages.stream()` helper would `partialParse` this internally and
+    // THROW ("JSON Parse error: Expected '}'") — crashing the turn. Consuming
+    // the raw `create({ stream: true })` events must instead pass the partial
+    // JSON straight through (our downstream sets `__parse_error` under a
+    // guard). Prove: (a) `.stream()` is never called, (b) no throw, (c) the
+    // truncated partial_json survives verbatim on the canonical event.
+    const rawEvents: Anthropic.RawMessageStreamEvent[] = [
+      {
+        type: "message_start",
+        message: {
+          id: "m",
+          type: "message",
+          role: "assistant",
+          model: "claude-sonnet-4-6",
+          content: [],
+          stop_reason: null,
+          stop_sequence: null,
+          usage: {
+            input_tokens: 3,
+            output_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+          },
+        },
+      } as unknown as Anthropic.RawMessageStreamEvent,
+      {
+        type: "content_block_start",
+        index: 0,
+        content_block: { type: "tool_use", id: "toolu_1", name: "venture_open", input: {} },
+      } as unknown as Anthropic.RawMessageStreamEvent,
+      {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "input_json_delta", partial_json: '{"slug":"foo' },
+      } as Anthropic.RawMessageStreamEvent,
+      { type: "content_block_stop", index: 0 } as Anthropic.RawMessageStreamEvent,
+      {
+        type: "message_delta",
+        delta: { stop_reason: "max_tokens", stop_sequence: null },
+        usage: { output_tokens: 9 },
+      } as unknown as Anthropic.RawMessageStreamEvent,
+      { type: "message_stop" } as Anthropic.RawMessageStreamEvent,
+    ];
+    let streamHelperCalled = false;
+    const client = {
+      messages: {
+        // The buggy path — must never be touched now.
+        stream: (() => {
+          streamHelperCalled = true;
+          throw new Error(
+            "messages.stream() must not be used — it partial-parses tool JSON and throws on truncation",
+          );
+        }) as unknown as Anthropic["messages"]["stream"],
+        create: ((_p: Anthropic.MessageStreamParams) =>
+          (async function* () {
+            for (const ev of rawEvents) yield ev;
+          })()) as unknown as Anthropic["messages"]["create"],
+      },
+    } as unknown as Anthropic;
+    const a = new AnthropicAdapter({ client, isOAuth: false });
+    const events: StreamEvent[] = [];
+    // Must not throw despite the incomplete tool_use JSON.
+    for await (const ev of a.stream(REQ)) events.push(ev);
+    expect(streamHelperCalled).toBe(false);
+    const delta = events.find(
+      (e): e is Extract<StreamEvent, { kind: "content_block_delta" }> =>
+        e.kind === "content_block_delta" && e.delta.type === "input_json_delta",
+    );
+    // The truncated partial_json survives verbatim — the adapter never parsed it.
+    expect(delta?.delta).toEqual({ type: "input_json_delta", partial_json: '{"slug":"foo' });
+    const stop = events.find(
+      (e): e is Extract<StreamEvent, { kind: "message_delta" }> => e.kind === "message_delta",
+    );
+    expect(stop?.stopReason).toBe("max_tokens");
+  });
+
   test("structured SDK error (status + error) has fields copied onto wrapper", async () => {
     // A typical APIError: has .status and .error already populated — the
     // recovery-engine reads these directly. Verify they survive wrapping.
@@ -277,11 +359,11 @@ describe("AnthropicAdapter", () => {
     });
     const client = {
       messages: {
-        stream: ((_p: Anthropic.MessageStreamParams) => ({
+        create: ((_p: Anthropic.MessageStreamParams) => ({
           [Symbol.asyncIterator]() {
             return { next: () => Promise.reject(sdkErr) };
           },
-        })) as unknown as Anthropic["messages"]["stream"],
+        })) as unknown as Anthropic["messages"]["create"],
       },
     } as unknown as Anthropic;
     const a = new AnthropicAdapter({ client, isOAuth: false });
@@ -302,11 +384,11 @@ describe("AnthropicAdapter", () => {
     // err instanceof Error === false path: String(err) is used.
     const client = {
       messages: {
-        stream: ((_p: Anthropic.MessageStreamParams) => ({
+        create: ((_p: Anthropic.MessageStreamParams) => ({
           [Symbol.asyncIterator]() {
             return { next: () => Promise.reject("plain string failure") };
           },
-        })) as unknown as Anthropic["messages"]["stream"],
+        })) as unknown as Anthropic["messages"]["create"],
       },
     } as unknown as Anthropic;
     const a = new AnthropicAdapter({ client, isOAuth: false });
@@ -330,11 +412,11 @@ describe("AnthropicAdapter", () => {
     const err = Object.assign(new Error(envelope), { name: "APIConnectionError" });
     const client = {
       messages: {
-        stream: ((_p: Anthropic.MessageStreamParams) => ({
+        create: ((_p: Anthropic.MessageStreamParams) => ({
           [Symbol.asyncIterator]() {
             return { next: () => Promise.reject(err) };
           },
-        })) as unknown as Anthropic["messages"]["stream"],
+        })) as unknown as Anthropic["messages"]["create"],
       },
     } as unknown as Anthropic;
     const a = new AnthropicAdapter({ client, isOAuth: false });
@@ -357,11 +439,11 @@ describe("AnthropicAdapter", () => {
     const err = Object.assign(new Error(envelope), { name: "APIConnectionError" });
     const client = {
       messages: {
-        stream: ((_p: Anthropic.MessageStreamParams) => ({
+        create: ((_p: Anthropic.MessageStreamParams) => ({
           [Symbol.asyncIterator]() {
             return { next: () => Promise.reject(err) };
           },
-        })) as unknown as Anthropic["messages"]["stream"],
+        })) as unknown as Anthropic["messages"]["create"],
       },
     } as unknown as Anthropic;
     const a = new AnthropicAdapter({ client, isOAuth: false });
@@ -380,11 +462,11 @@ describe("AnthropicAdapter", () => {
     const err = Object.assign(new Error("{not valid json"), { name: "APIConnectionError" });
     const client = {
       messages: {
-        stream: ((_p: Anthropic.MessageStreamParams) => ({
+        create: ((_p: Anthropic.MessageStreamParams) => ({
           [Symbol.asyncIterator]() {
             return { next: () => Promise.reject(err) };
           },
-        })) as unknown as Anthropic["messages"]["stream"],
+        })) as unknown as Anthropic["messages"]["create"],
       },
     } as unknown as Anthropic;
     const a = new AnthropicAdapter({ client, isOAuth: false });
@@ -404,11 +486,11 @@ describe("AnthropicAdapter", () => {
     });
     const client = {
       messages: {
-        stream: ((_p: Anthropic.MessageStreamParams) => ({
+        create: ((_p: Anthropic.MessageStreamParams) => ({
           [Symbol.asyncIterator]() {
             return { next: () => Promise.reject(err) };
           },
-        })) as unknown as Anthropic["messages"]["stream"],
+        })) as unknown as Anthropic["messages"]["create"],
       },
     } as unknown as Anthropic;
     const a = new AnthropicAdapter({ client, isOAuth: false });
@@ -427,11 +509,11 @@ describe("AnthropicAdapter", () => {
     });
     const client = {
       messages: {
-        stream: ((_p: Anthropic.MessageStreamParams) => ({
+        create: ((_p: Anthropic.MessageStreamParams) => ({
           [Symbol.asyncIterator]() {
             return { next: () => Promise.reject(err) };
           },
-        })) as unknown as Anthropic["messages"]["stream"],
+        })) as unknown as Anthropic["messages"]["create"],
       },
     } as unknown as Anthropic;
     const a = new AnthropicAdapter({ client, isOAuth: false });
@@ -450,11 +532,11 @@ describe("AnthropicAdapter", () => {
     });
     const client = {
       messages: {
-        stream: ((_p: Anthropic.MessageStreamParams) => ({
+        create: ((_p: Anthropic.MessageStreamParams) => ({
           [Symbol.asyncIterator]() {
             return { next: () => Promise.reject(err) };
           },
-        })) as unknown as Anthropic["messages"]["stream"],
+        })) as unknown as Anthropic["messages"]["create"],
       },
     } as unknown as Anthropic;
     const a = new AnthropicAdapter({ client, isOAuth: false });
@@ -472,12 +554,12 @@ describe("AnthropicAdapter", () => {
     let receivedOpts: { signal?: AbortSignal } | undefined;
     const client = {
       messages: {
-        stream: ((_params: Anthropic.MessageStreamParams, opts: { signal?: AbortSignal }) => {
+        create: ((_params: Anthropic.MessageStreamParams, opts: { signal?: AbortSignal }) => {
           receivedOpts = opts;
           return (async function* () {
             for (const ev of TEXT_RAW_EVENTS) yield ev;
           })();
-        }) as unknown as Anthropic["messages"]["stream"],
+        }) as unknown as Anthropic["messages"]["create"],
       },
     } as unknown as Anthropic;
     const a = new AnthropicAdapter({ client, isOAuth: false });
