@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/target-graph",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "type": "module",
   "description": "Codegen for the GRPH target shape — emits a graph-engine bundle with checkpoint-store wired in",
   "main": "src/index.ts",

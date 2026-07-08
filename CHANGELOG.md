@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-07-08
+
+A focused fix release: a truncated or malformed tool call no longer bricks the
+turn.
+
 ### Fixed
 
 - **A truncated or malformed tool call no longer bricks the turn.** The
@@ -21,6 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`streaming-tool-executor` / `consumeStream` set `{ __parse_error: true }`)
   and the `max_tokens` recovery strips the orphan `tool_use` and asks the
   model to continue. Behaviour is unchanged for well-formed responses.
+
+[0.2.4]: https://github.com/crewhaus/factory/compare/v0.2.3...v0.2.4
 
 ## [0.2.3] - 2026-07-07
 

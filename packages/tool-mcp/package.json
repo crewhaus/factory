@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-mcp",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "type": "module",
   "description": "Wrap remote MCP tools as RegisteredTool entries via @crewhaus/tool-builder",
   "main": "src/index.ts",

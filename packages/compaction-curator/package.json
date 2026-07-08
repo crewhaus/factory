@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/compaction-curator",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "type": "module",
   "description": "Pillar-2 active context curation — pre-compaction relevance + dedupe pass that lets compaction-autocompact skip the model call when curation alone brings tokens under the trigger threshold",
   "main": "src/index.ts",

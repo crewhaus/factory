@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-bash",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "type": "module",
   "description": "Built-in Bash tool: spawns shell commands via Bun.spawn with a default 30s timeout",
   "main": "src/index.ts",

@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/agent-context-isolation",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "type": "module",
   "description": "IsolatedContext factory + RuntimeBridge type for sub-agent spawning (Section 13)",
   "main": "src/index.ts",

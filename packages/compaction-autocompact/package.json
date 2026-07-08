@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/compaction-autocompact",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "type": "module",
   "description": "Model-summarize-then-replace conversation compaction",
   "main": "src/index.ts",

@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/channel-adapter-telegram",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "type": "module",
   "description": "Telegram channel adapter: secret_token webhook verification, message/edited_message/callback_query parsing, group + topic session keying (Section 33)",
   "main": "src/index.ts",

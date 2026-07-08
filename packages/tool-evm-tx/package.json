@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-evm-tx",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "type": "module",
   "description": "Built-in destructive EVM transaction tools (EvmSendTransaction, EvmSimulate). All destructive: true — gated by permission-engine approval + wallet-engine policy. §47 slice 1.",
   "main": "src/index.ts",
