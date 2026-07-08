@@ -289,11 +289,12 @@ describe("spawnSubAgent", () => {
     try {
       const { parent, parentLog } = await makeParent(root);
 
-      // Stub that throws on `messages.stream` so the runtime's recovery path
-      // exhausts and bubbles up. We force a fail with a non-recoverable error.
+      // Stub that throws on `messages.create` (the raw streaming call the
+      // adapter uses) so the runtime's recovery path exhausts and bubbles up.
+      // We force a fail with a non-recoverable error.
       const throwingClient = {
         messages: {
-          stream: () => {
+          create: () => {
             throw Object.assign(new Error("boom"), { name: "InvalidRequestError" });
           },
         },

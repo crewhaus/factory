@@ -18,8 +18,9 @@
  * apply on Vertex, so the adapter always runs in non-OAuth mode.
  *
  * `AnthropicVertex` shares the core SDK's `messages` surface; the
- * adapter only calls `client.messages.stream(...)`, so the structural
- * cast below is sound even though the two classes have distinct types.
+ * adapter only calls `client.messages.create(..., { stream: true })`, so
+ * the structural cast below is sound even though the two classes have
+ * distinct types.
  */
 
 import type Anthropic from "@anthropic-ai/sdk";

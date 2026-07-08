@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A truncated or malformed tool call no longer bricks the turn.** The
+  Anthropic adapter consumed the SDK's high-level `messages.stream()` helper,
+  which accumulates and `partialParse`s each tool call's input JSON as events
+  arrive. When the model was cut off at `max_tokens` mid-arguments (or emitted
+  slightly invalid JSON), that internal parse threw from inside the SDK
+  (`JSON Parse error: Expected '}'`) — bypassing the runtime's own guarded
+  accumulation and surfacing as an unrecoverable `recovery failed: JSON Parse
+  error`. The adapter now consumes the raw `messages.create({ stream: true })`
+  event stream, so the tool-input parse happens in our guarded code
+  (`streaming-tool-executor` / `consumeStream` set `{ __parse_error: true }`)
+  and the `max_tokens` recovery strips the orphan `tool_use` and asks the
+  model to continue. Behaviour is unchanged for well-formed responses.
+
 ## [0.2.3] - 2026-07-07
 
 A focused fix release: declared `failure_taxonomy` recovery classes now
