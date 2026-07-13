@@ -14,6 +14,8 @@ import {
   RuntimeError,
   SpecParseError,
   formatRunFailure,
+  isRunFailedError,
+  toFailureReport,
 } from "./index";
 
 describe("CrewhausError", () => {
@@ -244,6 +246,72 @@ describe("formatRunFailure", () => {
         "  (exit 30)",
       ].join("\n"),
     );
+  });
+
+  test("opts.notes render after Fix/Docs and before the exit line (the run --continue hint)", () => {
+    const out = formatRunFailure(BILLING_REPORT, {
+      prefix: "crewhaus:",
+      notes: [
+        "Your session is saved — `crewhaus run --continue` resumes exactly where it stopped.",
+      ],
+    });
+    expect(out).toBe(
+      [
+        "crewhaus: run stopped — provider account out of funding",
+        '  Anthropic said: "Your credit balance is too low to access the Anthropic API."',
+        "  Fix: add credits at https://console.anthropic.com/settings/billing, then rerun.",
+        "  Your session is saved — `crewhaus run --continue` resumes exactly where it stopped.",
+        "  (exit 31)",
+      ].join("\n"),
+    );
+  });
+
+  test("empty notes array changes nothing", () => {
+    expect(formatRunFailure(BILLING_REPORT, { notes: [] })).toBe(formatRunFailure(BILLING_REPORT));
+  });
+});
+
+describe("isRunFailedError", () => {
+  test("true for a real RunFailedError instance", () => {
+    expect(isRunFailedError(new RunFailedError(BILLING_REPORT))).toBe(true);
+  });
+
+  test("true for a cross-realm structural twin (duplicated package in a bundle)", () => {
+    const twin = Object.assign(new Error("run stopped — twin"), {
+      name: "RunFailedError",
+      report: BILLING_REPORT,
+    });
+    expect(isRunFailedError(twin)).toBe(true);
+  });
+
+  test("false for other errors, report-less impostors, and non-errors", () => {
+    expect(isRunFailedError(new RuntimeError("recovery failed: x"))).toBe(false);
+    expect(isRunFailedError(Object.assign(new Error("x"), { name: "RunFailedError" }))).toBe(false);
+    expect(isRunFailedError(undefined)).toBe(false);
+    expect(isRunFailedError("run stopped")).toBe(false);
+  });
+});
+
+describe("toFailureReport", () => {
+  test("a RunFailedError yields its own classified report", () => {
+    expect(toFailureReport(new RunFailedError(BILLING_REPORT))).toBe(BILLING_REPORT);
+  });
+
+  test("any other Error synthesizes the generic report (class unknown, exit 1)", () => {
+    const report = toFailureReport(new Error("boom at line 3"));
+    expect(report).toEqual({
+      class: "unknown",
+      title: "unexpected error",
+      detail: "boom at line 3",
+      exitCode: EXIT_CODES.generic,
+    });
+  });
+
+  test("non-Error throwables are stringified into the detail", () => {
+    const report = toFailureReport("string throw");
+    expect(report.class).toBe("unknown");
+    expect(report.detail).toBe("string throw");
+    expect(report.exitCode).toBe(1);
   });
 });
 

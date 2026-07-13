@@ -39,6 +39,19 @@ export type EventKind =
   | "tool_use"
   | "tool_result"
   | "error"
+  // v0.3.0 Goal 6 — the structured TERMINAL failure record, appended by
+  // runtime-core immediately before the run-ending throw (mirrors the
+  // `run_failed` trace event; payload `{ class, message, remediation?,
+  // exitCode }` from the thrown FailureReport). The pre-existing `error`
+  // kind records every recoverable model-call error as it happens; this
+  // kind records the ONE failure the run actually died with, so offline
+  // consumers (`crewhaus advise`, incident collection, session viewers)
+  // can tell "the run ended because the provider account is out of
+  // funding (exit 31)" without re-deriving it from the recovery ladder.
+  // Non-conversational: `replayMessageHistory` ignores it, so `--resume`
+  // is unaffected, and readers written before this kind existed keep
+  // parsing (every session-log reader branches on the kinds it knows).
+  | "run_failed"
   | "compaction"
   | "sub_agent_start"
   | "sub_agent_end"

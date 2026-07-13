@@ -221,9 +221,15 @@ export class RunFailedError extends RuntimeError {
  *       (exit 31)
  *
  * `opts.prefix` replaces the leading `✗` (e.g. `crewhaus:` for the CLI).
- * Dependency-free by design — emitted bundles inline-import this.
+ * `opts.notes` are surface-specific trailing lines rendered after Fix/Docs
+ * and before the exit line (e.g. `crewhaus run`'s "Your session is saved —
+ * …" resume hint). Dependency-free by design — emitted bundles inline-import
+ * this.
  */
-export function formatRunFailure(report: FailureReport, opts?: { prefix?: string }): string {
+export function formatRunFailure(
+  report: FailureReport,
+  opts?: { prefix?: string; notes?: readonly string[] },
+): string {
   const prefix = opts?.prefix ?? "✗";
   const lines: string[] = [`${prefix} run stopped — ${report.title}`];
   if (report.detail.length > 0) {
@@ -237,6 +243,48 @@ export function formatRunFailure(report: FailureReport, opts?: { prefix?: string
   if (report.docsUrl !== undefined && report.docsUrl.length > 0) {
     lines.push(`  Docs: ${report.docsUrl}`);
   }
+  for (const note of opts?.notes ?? []) {
+    lines.push(`  ${note}`);
+  }
   lines.push(`  (exit ${report.exitCode})`);
   return lines.join("\n");
+}
+
+/**
+ * Is `err` a RunFailedError (or a structurally identical wire twin)? The
+ * duck-typed fallback matters for compiled bundles: a bundle and the runtime
+ * it embeds can end up with two copies of this package (duplicated install,
+ * bundler realm split), in which case `instanceof` lies but the shape —
+ * `name === "RunFailedError"` plus a report with a numeric `exitCode` —
+ * does not.
+ */
+export function isRunFailedError(err: unknown): err is RunFailedError {
+  if (err instanceof RunFailedError) return true;
+  const duck = err as { name?: unknown; report?: { exitCode?: unknown } } | null;
+  return (
+    duck !== null &&
+    typeof duck === "object" &&
+    duck.name === "RunFailedError" &&
+    typeof duck.report === "object" &&
+    duck.report !== null &&
+    typeof duck.report.exitCode === "number"
+  );
+}
+
+/**
+ * Coerce any thrown value into a `FailureReport`: a RunFailedError yields
+ * its own classified report; everything else synthesizes a best-effort
+ * generic report (class `"unknown"`, exit {@link EXIT_CODES.generic}) so
+ * every terminal surface — compiled bundles' catch wrappers, daemon mains,
+ * `crewhaus run` — renders ONE shape regardless of what escaped.
+ */
+export function toFailureReport(err: unknown): FailureReport {
+  if (isRunFailedError(err)) return err.report;
+  const detail = err instanceof Error ? err.message : String(err);
+  return {
+    class: "unknown",
+    title: "unexpected error",
+    detail,
+    exitCode: EXIT_CODES.generic,
+  };
 }

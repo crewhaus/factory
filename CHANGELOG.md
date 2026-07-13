@@ -38,6 +38,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `run_failed` trace event, coded process exits, and adapter-side error
   discrimination land in the follow-up PRs.
 
+- **One failure report, every surface: the structured `run_failed` event,
+  coded process exits, and the end of "agent exited" (0.3.0 Goal 6, PR 3).**
+  runtime-core now publishes a first-class **`run_failed { class, message,
+  remediation?, exitCode }`** trace event AND appends the matching
+  `run_failed` session-log record immediately BEFORE every terminal throw —
+  the classified `halt` path carries its `FailureReport` verbatim, and even
+  the generic `fail` path synthesizes a best-effort report (class `unknown`,
+  exit 1), so structured consumers finally see WHY a run died (the old
+  `error_recovered {action:"fail"}` carried only an error name). `halt` also
+  becomes a first-class `error_recovered` action (PR 1's interim halt→"fail"
+  wire mapping is gone); alert-watchdog and the SLO monitor count both
+  `fail` and `halt` as unrecovered, incident-collector auto-captures a
+  bundle on `run_failed`, and the structured-event printer renders the event
+  as the canonical multi-line report block. **Compiled bundles** — the exact
+  "agent exited" fix: target-cli's emitted `await runChatLoop(...)` and the
+  channel-bot / crew / research daemon mains are wrapped in a catch that
+  prints `formatRunFailure()` to stderr and exits with the report's coded
+  status (no more unhandled Bun stack + exit 1); channel-bot heartbeat ticks
+  render the classified report without crashing the daemon, and the managed
+  daemon logs it and keeps serving. **`crewhaus run`**: `die()` special-cases
+  `RunFailedError` — an out-of-funding run now ends with the full report
+  (title, provider text, `Fix:` line, and "Your session is saved —
+  `crewhaus run --continue` resumes exactly where it stopped." when a
+  session exists) and exit 31, while every other fatal keeps the classic
+  one-liner + exit 1. **`fleet run`** decodes coded child exits into
+  `✗ support-bot — provider account out of funding · exit 31` rows plus a
+  class-keyed rollup in the summary (`2 failed (billing ×1, auth ×1)`). New
+  **`crewhaus doctor --probe`**: an opt-in ~1-token live call per configured
+  provider (spec model verbatim + cheap defaults) that catches unfunded or
+  invalid keys before a long run, classifying failures as billing/auth via
+  recovery-engine. Successful runs and non-terminal recoveries emit no
+  `run_failed` (regression-pinned).
+
 ### Fixed
 
 - **`crewhaus fleet run <sub>` works from the compiled binary again.** When the
