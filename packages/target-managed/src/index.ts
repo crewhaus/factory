@@ -161,6 +161,7 @@ function renderDaemon(ir: IrManagedV0): string {
 // Source spec: ${escapeJsonString(ir.name)} (target: managed, ir version: ${ir.version})
 import { loadRetentionConfig } from "@crewhaus/data-retention-engine";
 import { createBudgetStore } from "@crewhaus/durable-state";
+import { formatRunFailure, isRunFailedError } from "@crewhaus/errors";
 import { createGatewayServer } from "@crewhaus/gateway-server";
 import { auditPolicyDecision, evaluatePolicy } from "@crewhaus/policy-engine";
 import { createJanitor } from "@crewhaus/runtime-core";
@@ -299,7 +300,20 @@ const gateway = createGatewayServer({
       if (policy.decision === "deny") {
         throw new Error(\`policy denied: \${policy.reason ?? "no reason"}\`);
       }
-      const reply = await runOneTurn({ tenantId: tenant.id, sessionId, input: p.input });
+      let reply: string;
+      try {
+        reply = await runOneTurn({ tenantId: tenant.id, sessionId, input: p.input });
+      } catch (err) {
+        // v0.3.0 Goal 6 — a classified terminal failure (billing/auth/…)
+        // renders its structured report on the daemon's stderr, then
+        // rethrows so the gateway maps it to an error response. The daemon
+        // itself keeps serving — one tenant's dead provider account must
+        // not take the process down.
+        if (isRunFailedError(err)) {
+          process.stderr.write(\`\${formatRunFailure(err.report, { prefix: "[managed]" })}\\n\`);
+        }
+        throw err;
+      }
       const inputTokens = Math.ceil(p.input.length / 4);
       const outputTokens = Math.ceil(reply.length / 4);
       await gateway.recordUsage(tenant.id, { input: inputTokens, output: outputTokens });

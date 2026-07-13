@@ -49,6 +49,7 @@
  */
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { EXIT_CODES, type FailureClass } from "@crewhaus/errors";
 import type { Manifest } from "@crewhaus/spec-registry";
 import { extractFeedbackRecords, mergeFeedback } from "./feedback";
 
@@ -695,6 +696,38 @@ export async function runFleetBulk(opts: RunFleetBulkOptions): Promise<RunFleetB
   return { plan, results, failed, passed, skipped };
 }
 
+/**
+ * v0.3.0 Goal 6 — decode a child process's exit code back into its failure
+ * class + report title. The coded exits are the documented `EXIT_CODES`
+ * contract every terminal surface (die(), the compiled-bundle catch
+ * wrappers) now honours, so fleet can say "out of funding" instead of
+ * "exit 31" without parsing any output. Titles mirror the
+ * `BUILTIN_FAILURE_CLASSES` wording (recovery-engine) for the provider
+ * classes and the `EXIT_CODES` doc comments for the rest. Exit 0 and
+ * unmapped codes return undefined (a plain `exit N` line).
+ */
+export function describeFleetExit(
+  exitCode: number,
+): { readonly class: FailureClass; readonly title: string } | undefined {
+  const table: Record<number, { readonly class: FailureClass; readonly title: string }> = {
+    [EXIT_CODES.generic]: { class: "unknown", title: "unclassified failure" },
+    [EXIT_CODES.spec]: { class: "spec", title: "spec parse/validation failed" },
+    [EXIT_CODES.config]: { class: "config", title: "config / missing env" },
+    [EXIT_CODES.auth]: { class: "auth", title: "provider rejected the credentials" },
+    [EXIT_CODES.billing]: { class: "billing", title: "provider account out of funding" },
+    [EXIT_CODES.rate_limit]: {
+      class: "rate_limit",
+      title: "provider rate limit still exceeded after retries",
+    },
+    [EXIT_CODES.crewhaus_budget]: {
+      class: "crewhaus_budget",
+      title: "run stopped by the configured budget cap",
+    },
+    [EXIT_CODES.tool]: { class: "tool", title: "tool / MCP failure" },
+  };
+  return table[exitCode];
+}
+
 /** Render a bulk-run report as summary lines for `fleet run`. */
 export function formatBulkReport(report: RunFleetBulkReport): ReadonlyArray<string> {
   const cmd = report.plan.argv.join(" ");
@@ -708,15 +741,34 @@ export function formatBulkReport(report: RunFleetBulkReport): ReadonlyArray<stri
       continue;
     }
     const mark = r.exitCode === 0 ? "✓" : "✗";
-    lines.push(`${mark} ${r.inv.specName} — exit ${r.exitCode}`);
+    // v0.3.0 Goal 6 — a coded exit renders its failure title inline:
+    //   ✗ support-bot — provider account out of funding · exit 31
+    const described = r.exitCode !== 0 ? describeFleetExit(r.exitCode ?? 0) : undefined;
+    lines.push(
+      described !== undefined
+        ? `${mark} ${r.inv.specName} — ${described.title} · exit ${r.exitCode}`
+        : `${mark} ${r.inv.specName} — exit ${r.exitCode}`,
+    );
     const tail = (r.tail ?? "").trim();
     if (tail !== "") {
       for (const line of tail.split("\n").slice(-3)) lines.push(`    ${line}`);
     }
   }
   lines.push("");
+  // v0.3.0 Goal 6 — class-keyed failure rollup: `2 failed (billing ×1,
+  // unknown ×1)` so a fleet-wide funding outage reads at a glance.
+  const classCounts = new Map<string, number>();
+  for (const r of report.results) {
+    if (!r.ran || r.exitCode === 0 || r.exitCode === undefined) continue;
+    const cls = describeFleetExit(r.exitCode)?.class ?? "unknown";
+    classCounts.set(cls, (classCounts.get(cls) ?? 0) + 1);
+  }
+  const rollup =
+    classCounts.size > 0
+      ? ` (${[...classCounts.entries()].map(([cls, n]) => `${cls} ×${n}`).join(", ")})`
+      : "";
   lines.push(
-    `summary: ${report.passed} passed, ${report.failed} failed, ${report.skipped} skipped`,
+    `summary: ${report.passed} passed, ${report.failed} failed${rollup}, ${report.skipped} skipped`,
   );
   return lines;
 }

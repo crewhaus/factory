@@ -95,6 +95,33 @@ describe("event-log — round-trip", () => {
     expect(all[2]?.payload).toEqual({ toolName: "Bash", decision: "ask", askOutcome: "approved" });
   });
 
+  test("run_failed (v0.3.0 Goal 6 terminal failure record) round-trips its report payload", async () => {
+    const rootDir = newTempRoot();
+    const log = await openEventLog(TEST_ID, { rootDir });
+    await log.append({
+      kind: "run_failed",
+      payload: {
+        class: "billing",
+        message:
+          'provider account out of funding: Anthropic said: "Your credit balance is too low to access the Anthropic API."',
+        remediation: "add credits at https://console.anthropic.com/settings/billing, then rerun.",
+        exitCode: 31,
+      },
+    });
+    await log.close();
+
+    const all = await collect(log.read());
+    expect(all.length).toBe(1);
+    expect(all[0]?.kind).toBe("run_failed");
+    expect(all[0]?.payload).toEqual({
+      class: "billing",
+      message:
+        'provider account out of funding: Anthropic said: "Your credit balance is too low to access the Anthropic API."',
+      remediation: "add credits at https://console.anthropic.com/settings/billing, then rerun.",
+      exitCode: 31,
+    });
+  });
+
   test("read filters by since and until", async () => {
     const rootDir = newTempRoot();
     let clock = 100;
