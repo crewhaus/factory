@@ -10,6 +10,7 @@
 
 export type {
   A2AMessageEvent,
+  CacheRotationEvent,
   CircuitStateChangedEvent,
   CompactionFiredEvent,
   CostAccrualEvent,
