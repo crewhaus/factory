@@ -395,11 +395,12 @@ describe("IrMcpServers", () => {
       transport: "stdio",
       command: "npx",
       args: ["-y", "@modelcontextprotocol/server-everything"],
+      env: { EVERYTHING_API_KEY: { kind: "env", name: "EVERYTHING_API_KEY" } },
     };
     const sse: IrMcpServerConfig = {
       transport: "sse",
       url: "https://mcp.example.com/sse",
-      headers: { Authorization: "Bearer x" },
+      headers: { Authorization: { kind: "literal", value: "Bearer x" } },
     };
     const servers: IrMcpServers = { everything: stdio, remote: sse };
     expect(servers["everything"]?.transport).toBe("stdio");

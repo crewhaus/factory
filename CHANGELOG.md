@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Secrets can now reach MCP server child processes.** `mcp_servers` stdio
+  `env` and sse `headers` values route through the same `$UPPER_SNAKE`
+  secret machinery as every other credential field: plain strings stay
+  literals, `$VAR` lowers to an env reference resolved from the *running*
+  process's environment at boot (never baked into the artifact), and a
+  malformed `$…` ref under a credential-shaped key (`*_KEY` / `*_TOKEN` /
+  `*_SECRET` / `*_PASSWORD`, or the `Authorization` / `x-api-key` headers)
+  fails compilation instead of shipping a broken credential.
+  `@crewhaus/mcp-host` gains `resolveSecretRef` / `resolveMcpServerConfig`
+  (throwing a `ConfigError` that names the missing variable), and its stdio
+  transport now merges explicit `env` on top of the SDK's
+  `getDefaultEnvironment()` — previously the SDK's inherit allowlist
+  dropped arbitrary keys, so **no** factory path could deliver a secret
+  (e.g. `THREDZ_API_KEY`) into a spawned MCP server at all. The
+  `target-claude-plugin` emitter renders env refs as Claude Code's
+  `${VAR}` expansion syntax in `.mcp.json`.
+
+### Changed
+
+- **BREAKING (IR, pre-1.0):** `IrMcpStdioConfig.env` and
+  `IrMcpSseConfig.headers` are now `Record<string, IrSecretRef>` instead of
+  `Record<string, string>`. Emitters embed the unresolved config and
+  compiled bundles resolve it at process start; `redundantMcpServerCollapse`
+  compares env/headers structurally, so servers that differ only in
+  credentials no longer collapse into one.
+
 ### Fixed
 
 - **`crewhaus fleet run <sub>` works from the compiled binary again.** When the

@@ -212,6 +212,12 @@ function renderPermissionsField(ir: IrV0): string {
  * a boot block that constructs the host + registers each server (placed
  * before runChatLoop), and a cleanup statement (run inside a finally).
  *
+ * 0.3.0 — env/header values are `IrSecretRef` objects; the UNRESOLVED
+ * config is embedded verbatim (so no secret value ever lands in the
+ * artifact) and `resolveMcpServerConfig` materialises it from the running
+ * process's environment at boot, failing fast with the variable's name
+ * when a referenced env var is unset.
+ *
  * Empty `mcp_servers` returns empty strings so spec files without MCP get
  * the original bare `await runChatLoop(...)` shape (regression guard for
  * the hello-cli example).
@@ -227,11 +233,14 @@ function renderMcpServers(ir: IrV0): {
     return { imports: [], bootBlock: "", cleanupBlock: "", hasAny: false };
   }
   const imports = [
-    `import { McpHost } from "@crewhaus/mcp-host";`,
+    `import { McpHost, resolveMcpServerConfig } from "@crewhaus/mcp-host";`,
     `import { registerMcpServer } from "@crewhaus/tool-mcp";`,
   ];
   const addLines = entries
-    .map(([name, cfg]) => `mcpHost.addServer(${escapeJsonString(name)}, ${JSON.stringify(cfg)});`)
+    .map(
+      ([name, cfg]) =>
+        `mcpHost.addServer(${escapeJsonString(name)}, resolveMcpServerConfig(${JSON.stringify(cfg)}, { name: ${escapeJsonString(name)} }));`,
+    )
     .join("\n");
   const registerLines = entries
     .map(

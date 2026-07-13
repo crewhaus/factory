@@ -189,7 +189,9 @@ describe("emitCli — MCP servers (Section 9)", () => {
           },
         }),
       ).files[0]?.content ?? "";
-    expect(content).toContain('import { McpHost } from "@crewhaus/mcp-host"');
+    expect(content).toContain(
+      'import { McpHost, resolveMcpServerConfig } from "@crewhaus/mcp-host"',
+    );
     expect(content).toContain('import { registerMcpServer } from "@crewhaus/tool-mcp"');
     expect(content).toContain("const mcpHost = new McpHost();");
     expect(content).toContain('mcpHost.addServer("everything"');
@@ -199,6 +201,31 @@ describe("emitCli — MCP servers (Section 9)", () => {
     expect(content).toContain("try {");
     expect(content).toContain("} finally {");
     expect(content).toContain("await mcpHost.disconnectAll();");
+  });
+
+  test("0.3.0 — env secret refs are embedded UNRESOLVED and resolved at boot", () => {
+    const content =
+      emitCli(
+        baseIr({
+          mcp_servers: {
+            thredz: {
+              transport: "stdio",
+              command: "npx",
+              args: ["-y", "thredz-mcp@0.2.0"],
+              env: {
+                THREDZ_API_KEY: { kind: "env", name: "THREDZ_API_KEY" },
+                THREDZ_BASE_URL: { kind: "literal", value: "https://thredz.example/api" },
+              },
+            },
+          },
+        }),
+      ).files[0]?.content ?? "";
+    // The unresolved IrSecretRef JSON is embedded — never a resolved value —
+    // and the boot line materialises it via resolveMcpServerConfig.
+    expect(content).toContain('{"kind":"env","name":"THREDZ_API_KEY"}');
+    expect(content).toContain(
+      'mcpHost.addServer("thredz", resolveMcpServerConfig({"transport":"stdio","command":"npx","args":["-y","thredz-mcp@0.2.0"],"env":{"THREDZ_API_KEY":{"kind":"env","name":"THREDZ_API_KEY"},"THREDZ_BASE_URL":{"kind":"literal","value":"https://thredz.example/api"}}}, { name: "thredz" }));',
+    );
   });
 });
 
