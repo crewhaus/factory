@@ -1,6 +1,17 @@
 /**
  * Catalog R9 `slash-commands` — markdown-templated user-input shortcuts
- * loaded from `<cwd>/.crewhaus/commands/<name>.md`.
+ * loaded from three kinds of roots, lowest precedence first (later roots
+ * override earlier ones by command name):
+ *
+ *   0. builtin directories (`opts.builtinDirs`) — shipped defaults, e.g.
+ *      `@crewhaus/default-skills`' `commands/` dir. Each entry is used as
+ *      the commands directory itself (it is NOT suffixed with
+ *      `.crewhaus/commands`).
+ *   1. `~/.crewhaus/commands/<name>.md` — user-level commands.
+ *   2. `<cwd>/.crewhaus/commands/<name>.md` — project commands.
+ *
+ * A user or project command with a builtin's name replaces it wholesale, so
+ * builtins are overridable (and, with an empty body, effectively disabled).
  *
  * Each file is a markdown body with optional YAML frontmatter:
  *
@@ -25,6 +36,7 @@
  * package is pure: filesystem read + string templating, no I/O elsewhere.
  */
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
 import { parse as parseYaml } from "yaml";
@@ -42,6 +54,15 @@ export type SlashCommand = {
 
 export type LoadCommandsOptions = {
   readonly cwd?: string;
+  /** Home directory override for the user-level root (tests). */
+  readonly homeDir?: string;
+  /**
+   * Builtin command directories, merged at LOWEST precedence. Each entry is
+   * read as a flat directory of `<name>.md` files (no `.crewhaus/commands`
+   * suffix is appended). User (`~/.crewhaus/commands`) and project
+   * (`<cwd>/.crewhaus/commands`) commands override builtins by name.
+   */
+  readonly builtinDirs?: ReadonlyArray<string>;
 };
 
 export type ExpandResult = {
@@ -59,22 +80,36 @@ export class SlashCommandError extends CrewhausError {
 }
 
 /**
- * Read every `.md` file directly under `<cwd>/.crewhaus/commands/`. Each
- * file's basename (sans extension) becomes its key in the returned map.
- * Subdirectories are not currently walked (v1 keeps the namespace flat).
+ * Read every `.md` file directly under each command root — builtin dirs
+ * first, then `~/.crewhaus/commands/`, then `<cwd>/.crewhaus/commands/` —
+ * so later roots override earlier ones by name. Each file's basename (sans
+ * extension) becomes its key in the returned map. Subdirectories are not
+ * currently walked (v1 keeps the namespace flat).
  */
 export async function loadCommands(
   opts: LoadCommandsOptions = {},
 ): Promise<Map<string, SlashCommand>> {
   const cwd = opts.cwd ?? process.cwd();
-  const root = join(cwd, COMMANDS_RELATIVE);
-  if (!existsSync(root)) return new Map();
+  const home = opts.homeDir ?? homedir();
+  const userRoot = join(home, COMMANDS_RELATIVE);
+  const projectRoot = join(cwd, COMMANDS_RELATIVE);
+  const roots: string[] = [...(opts.builtinDirs ?? []), userRoot];
+  if (projectRoot !== userRoot) roots.push(projectRoot);
   const out = new Map<string, SlashCommand>();
+  for (const root of roots) {
+    readCommandsUnder(root, out);
+  }
+  return out;
+}
+
+/** Read one commands root into `out` (later writers override by name). */
+function readCommandsUnder(root: string, out: Map<string, SlashCommand>): void {
+  if (!existsSync(root)) return;
   let entries: string[];
   try {
     entries = readdirSync(root);
   } catch {
-    return out;
+    return;
   }
   for (const entry of entries) {
     if (!entry.endsWith(".md")) continue;
@@ -108,7 +143,6 @@ export async function loadCommands(
       ...(parsed.argumentHint !== undefined ? { argumentHint: parsed.argumentHint } : {}),
     });
   }
-  return out;
 }
 
 type ParsedCommand = {
