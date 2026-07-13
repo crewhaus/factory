@@ -17,6 +17,9 @@
     "@crewhaus/token-budget": "workspace:*",
     "@google/genai": "^1.6.0"
   },
+  "devDependencies": {
+    "@crewhaus/recovery-engine": "workspace:*"
+  },
   "license": "Apache-2.0",
   "author": {
     "name": "Max Meier",

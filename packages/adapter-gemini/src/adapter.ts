@@ -145,11 +145,97 @@ function nonEmpty(value: string | undefined): string | undefined {
 }
 
 /**
+ * The REST error envelope `@google/genai`'s `ApiError` carries in its
+ * message: `ApiError.message` is `JSON.stringify(errorBody)` of
+ * `{ error: { code, message, status, details } }` — `status` is the gRPC
+ * status string ("RESOURCE_EXHAUSTED", "PERMISSION_DENIED", …) and
+ * `details` carries google.rpc records (QuotaFailure, RetryInfo, Help).
+ */
+type GeminiErrorBody = {
+  readonly code?: number;
+  readonly message?: string;
+  readonly status?: string;
+  readonly details?: ReadonlyArray<Record<string, unknown>>;
+};
+
+/**
+ * Parse the REST error envelope back out of an ApiError message. Returns
+ * the inner `error` object, or undefined when the message isn't the
+ * SDK-stringified envelope (e.g. a plain network failure).
+ */
+function tryParseGeminiErrorBody(message: string): GeminiErrorBody | undefined {
+  const start = message.indexOf("{");
+  if (start === -1) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(message.slice(start));
+  } catch {
+    return undefined;
+  }
+  if (parsed === null || typeof parsed !== "object") return undefined;
+  const inner = (parsed as { error?: unknown }).error;
+  if (inner === null || typeof inner !== "object") return undefined;
+  return inner as GeminiErrorBody;
+}
+
+/**
+ * v0.3.0 Goal 6 (PR 2) — true when a RESOURCE_EXHAUSTED body reports a
+ * per-day / free-tier quota violation (google.rpc.QuotaFailure). Gemini
+ * uses RESOURCE_EXHAUSTED for BOTH transient per-minute throttles and
+ * exhausted daily plan quotas; only the latter is billing-class (the
+ * account is out of quota until the plan resets or is upgraded — retrying
+ * inside this run is futile).
+ */
+function isDailyQuotaExhaustion(body: GeminiErrorBody | undefined): boolean {
+  if (body?.status !== "RESOURCE_EXHAUSTED") return false;
+  for (const detail of body.details ?? []) {
+    if (detail["@type"] !== "type.googleapis.com/google.rpc.QuotaFailure") continue;
+    const violations = (detail as { violations?: unknown }).violations;
+    if (!Array.isArray(violations)) continue;
+    for (const violation of violations) {
+      const v = violation as { quotaId?: unknown; quotaMetric?: unknown };
+      const quotaId = typeof v.quotaId === "string" ? v.quotaId : "";
+      const quotaMetric = typeof v.quotaMetric === "string" ? v.quotaMetric : "";
+      if (/PerDay|Daily|FreeTier|free_tier/i.test(`${quotaId} ${quotaMetric}`)) return true;
+    }
+  }
+  return false;
+}
+
+/** google.rpc.RetryInfo `retryDelay` ("26s", "0.8s") → milliseconds. */
+function retryDelayMs(body: GeminiErrorBody | undefined): number | undefined {
+  for (const detail of body?.details ?? []) {
+    if (detail["@type"] !== "type.googleapis.com/google.rpc.RetryInfo") continue;
+    const delay = (detail as { retryDelay?: unknown }).retryDelay;
+    if (typeof delay !== "string") continue;
+    const match = /^(\d+(?:\.\d+)?)s$/.exec(delay.trim());
+    if (match?.[1] !== undefined) return Math.round(Number(match[1]) * 1000);
+  }
+  return undefined;
+}
+
+/**
  * Normalise Gemini errors into the shape `recovery-engine.classify()`
  * expects. Gemini's `ApiError` carries a numeric `status` plus a
- * message — we map 429 + 5xx into the overloaded bucket and 400 with
+ * message — we map 5xx into the overloaded bucket and 400 with
  * "exceeds the maximum" into prompt_too_long, mirroring the Anthropic
  * vocabulary so recovery routes correctly.
+ *
+ * v0.3.0 Goal 6 (PR 2) — 429s are no longer blanket-stamped
+ * `overloaded_error`. Gemini signals both throttles and exhausted plan
+ * quotas as 429 RESOURCE_EXHAUSTED; the QuotaFailure detail discriminates:
+ *   - per-day / free-tier quota exhausted → billing: the wrapper's error
+ *     envelope carries `code: "insufficient_quota"` (the canonical
+ *     cross-provider billing code classify() reads — borrowed from OpenAI's
+ *     vocabulary exactly the way `overloaded_error` is borrowed from
+ *     Anthropic's; the wrapper's own top-level `code` stays CrewhausError's
+ *     ErrorCode "adapter").
+ *   - anything else → rate-limit-shaped: status 429 + `rate_limit_error`,
+ *     with the RetryInfo `retryDelay` threaded as `retryAfterMs` so the
+ *     recovery engine honors the provider's requested delay.
+ * 401/403 pass through on status alone (classify() → auth) with the parsed
+ * body message attached so FailureReports show "Gemini said: …" instead of
+ * a JSON blob.
  */
 function normaliseGeminiError(err: unknown): unknown {
   const name = (err as { name?: unknown })?.name;
@@ -163,8 +249,25 @@ function normaliseGeminiError(err: unknown): unknown {
   else if (typeof e.code === "number") status = e.code;
 
   if (status === 429) {
+    const body = tryParseGeminiErrorBody(message);
+    const innerMessage = typeof body?.message === "string" ? body.message : message;
     (wrapped as unknown as { status: number }).status = 429;
-    (wrapped as unknown as { error: { type: string } }).error = { type: "overloaded_error" };
+    if (isDailyQuotaExhaustion(body)) {
+      (wrapped as unknown as { error: { type: string; code: string; message: string } }).error = {
+        type: "insufficient_quota",
+        code: "insufficient_quota",
+        message: innerMessage,
+      };
+    } else {
+      (wrapped as unknown as { error: { type: string; message: string } }).error = {
+        type: "rate_limit_error",
+        message: innerMessage,
+      };
+      const delay = retryDelayMs(body);
+      if (delay !== undefined) {
+        (wrapped as unknown as { retryAfterMs: number }).retryAfterMs = delay;
+      }
+    }
   } else if (status !== undefined && status >= 500 && status < 600) {
     (wrapped as unknown as { status: number }).status = status;
     (wrapped as unknown as { error: { type: string } }).error = { type: "overloaded_error" };
@@ -182,7 +285,17 @@ function normaliseGeminiError(err: unknown): unknown {
     (wrapped as unknown as { status: number }).status = 400;
     (wrapped as unknown as { error: { type: string } }).error = { type: "invalid_request_error" };
   } else if (status !== undefined) {
+    // Status passthrough (401/403 → classify() "auth", everything else
+    // unknown). No shape stamping — but surface the parsed body message so
+    // failure reports carry the provider's own words, not the JSON blob.
     (wrapped as unknown as { status: number }).status = status;
+    const body = tryParseGeminiErrorBody(message);
+    if (typeof body?.message === "string") {
+      (wrapped as unknown as { error: { type: string; message: string } }).error = {
+        type: body.status ?? "api_error",
+        message: body.message,
+      };
+    }
   }
 
   return wrapped;

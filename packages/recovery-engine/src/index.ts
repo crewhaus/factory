@@ -185,12 +185,13 @@ export function classify(error: unknown): RecoveryErrorClass {
   const innerMessage = typeof errObj.error?.message === "string" ? errObj.error.message : "";
   const message = typeof errObj.message === "string" ? errObj.message : "";
   const status = typeof errObj.status === "number" ? errObj.status : undefined;
-  const code =
-    typeof errObj.code === "string"
-      ? errObj.code
-      : typeof errObj.error?.code === "string"
-        ? errObj.error.code
-        : undefined;
+  // BOTH code slots are consulted independently (PR 2): a raw SDK error
+  // carries the provider code top-level, but adapter WRAPPERS keep
+  // CrewhausError's ErrorCode there ("adapter") and surface the provider
+  // code on the copied error envelope — a top-level string must not shadow
+  // the envelope's discriminator.
+  const code = typeof errObj.code === "string" ? errObj.code : undefined;
+  const innerCode = typeof errObj.error?.code === "string" ? errObj.error.code : undefined;
 
   // v0.3.0 Goal 6 — billing / auth / rate_limit come BEFORE the pre-existing
   // buckets so an out-of-funds 400 is not misrouted through a tombstone and
@@ -203,7 +204,7 @@ export function classify(error: unknown): RecoveryErrorClass {
   //   · Bedrock: ServiceQuotaExceededException by name (a hard account
   //     quota — retrying won't help; raise the quota instead).
   if (status === 402) return "billing";
-  if (code === "insufficient_quota") return "billing";
+  if (code === "insufficient_quota" || innerCode === "insufficient_quota") return "billing";
   if (status === 400 && /credit balance/i.test(innerMessage.length > 0 ? innerMessage : message)) {
     return "billing";
   }

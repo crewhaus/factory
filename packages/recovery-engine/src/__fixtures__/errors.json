@@ -158,5 +158,22 @@
       "message": "402 Payment Required"
     },
     "expectedKind": "halt"
+  },
+  {
+    "label": "AdapterError-wrapped OpenAI insufficient_quota (PR 2: top-level code slot holds the ErrorCode \"adapter\"; the envelope code must not be shadowed)",
+    "shape": {
+      "name": "AdapterError",
+      "code": "adapter",
+      "providerId": "openai",
+      "status": 429,
+      "error": {
+        "message": "You exceeded your current quota, please check your plan and billing details.",
+        "type": "insufficient_quota",
+        "param": null,
+        "code": "insufficient_quota"
+      },
+      "message": "429 You exceeded your current quota, please check your plan and billing details."
+    },
+    "expectedKind": "halt"
   }
 ]

@@ -22,6 +22,13 @@
  * `circuit_state_changed` TraceEvents (audit-log, OTel, structured
  * printer). Without a bus, state changes are silent except for the
  * exposed `state()` getter.
+ *
+ * v0.3.0 Goal 6 — billing-class errors (provider account out of funding /
+ * hard quota: HTTP 402, OpenAI `code: "insufficient_quota"`, Anthropic's
+ * credit-balance 400, Bedrock's ServiceQuotaExceededException) trip the
+ * breaker IMMEDIATELY instead of counting toward `failureThreshold`: an
+ * empty account fails every call identically, so accruing five failures is
+ * pure wasted latency. Tune via the `isFatal` option.
  */
 import type { ProviderAdapter, ProviderRequest, StreamEvent } from "@crewhaus/adapter-anthropic";
 import { CrewhausError } from "@crewhaus/errors";
@@ -52,10 +59,62 @@ export type CircuitBreakerOptions = {
   /**
    * Predicate for which errors count toward the failure threshold. Default:
    * any thrown / caught error. Override to ignore expected errors (e.g.
-   * 4xx schema-failure responses).
+   * 4xx schema-failure responses). An error vetoed here is also never
+   * consulted for `isFatal`.
    */
   readonly isFailure?: (err: unknown) => boolean;
+  /**
+   * v0.3.0 Goal 6 — predicate for errors that trip the breaker IMMEDIATELY
+   * (fail-fast) instead of counting toward `failureThreshold`. Default:
+   * `isBillingError` — one out-of-funding failure is proof the provider
+   * cannot serve. Only consulted for errors that pass `isFailure`.
+   * Override with `() => false` to restore pure threshold behaviour.
+   */
+  readonly isFatal?: (err: unknown) => boolean;
 };
+
+/**
+ * v0.3.0 Goal 6 — structural check for billing-class provider errors: the
+ * shapes the four adapters normalise an out-of-funding account into.
+ *   - HTTP 402 (payment required) anywhere;
+ *   - `code: "insufficient_quota"` (top-level or on the error envelope) —
+ *     OpenAI's out-of-funds 429, and the canonical cross-provider billing
+ *     code the Gemini adapter stamps on exhausted plan quotas;
+ *   - 400 + "credit balance" (Anthropic's out-of-credit signal);
+ *   - `ServiceQuotaExceededException` by name (Bedrock's hard account quota).
+ *
+ * Intentionally duplicates recovery-engine's `billing` classify arm (four
+ * small probes) rather than importing it: the breaker is a leaf utility
+ * wrapped directly around adapters, and recovery-engine sits ABOVE the
+ * breaker in the runtime graph — depending on it here would invert the
+ * layering for one predicate. Keep the two in sync when the billing shapes
+ * grow.
+ */
+export function isBillingError(err: unknown): boolean {
+  if (err === null || typeof err !== "object") return false;
+  const e = err as {
+    status?: unknown;
+    code?: unknown;
+    name?: unknown;
+    message?: unknown;
+    error?: { code?: unknown; message?: unknown };
+  };
+  if (e.status === 402) return true;
+  // Both code slots independently: raw SDK errors carry the provider code
+  // top-level; AdapterError wrappers keep CrewhausError's ErrorCode there
+  // ("adapter") and surface the provider code on the error envelope.
+  if (e.code === "insufficient_quota" || e.error?.code === "insufficient_quota") return true;
+  const innerMessage = typeof e.error?.message === "string" ? e.error.message : "";
+  const message = typeof e.message === "string" ? e.message : "";
+  if (
+    e.status === 400 &&
+    /credit balance/i.test(innerMessage.length > 0 ? innerMessage : message)
+  ) {
+    return true;
+  }
+  if (typeof e.name === "string" && /ServiceQuotaExceeded/.test(e.name)) return true;
+  return false;
+}
 
 export interface WrappedAdapter extends ProviderAdapter {
   /** Current state. */
@@ -87,6 +146,7 @@ export function wrap(adapter: ProviderAdapter, opts: CircuitBreakerOptions = {})
   const windowMs = opts.windowMs ?? 60_000;
   const cooldownMs = opts.cooldownMs ?? 30_000;
   const isFailure = opts.isFailure ?? ((): boolean => true);
+  const isFatal = opts.isFatal ?? isBillingError;
   const now = opts.now ?? ((): number => Date.now());
 
   let state: CircuitState = "closed";
@@ -137,6 +197,15 @@ export function wrap(adapter: ProviderAdapter, opts: CircuitBreakerOptions = {})
 
   function recordFailure(err: unknown): void {
     if (!isFailure(err)) return;
+    // v0.3.0 Goal 6 — fail fast: a fatal (billing-class) error trips the
+    // breaker on FIRST sight. Retrying an empty account four more times
+    // only delays the halt verdict recovery-engine will reach anyway.
+    if (isFatal(err)) {
+      consecutiveFailures = 0;
+      firstFailureMs = 0;
+      transitionTo("open", "fatal billing-class failure (fail-fast)");
+      return;
+    }
     if (state === "half_open") {
       transitionTo("open", "probe failed");
       consecutiveFailures = 0;
