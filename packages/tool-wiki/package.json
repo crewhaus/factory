@@ -1,8 +1,8 @@
 {
-  "name": "@crewhaus/memory-store",
+  "name": "@crewhaus/tool-wiki",
   "version": "0.2.4",
   "type": "module",
-  "description": "M4.2 — persistent cross-session memory store. File-backed JSONL with simple BM25-style text search. Per-spec scoped.",
+  "description": "0.3.0 memory release §3.2 — the thredz-identical wiki tool vocabulary (wiki_recall … log_knowledge_gap) over @crewhaus/wiki-store, with memory-origin boundary classification on every recalled body.",
   "main": "src/index.ts",
   "types": "src/index.ts",
   "exports": {
@@ -12,7 +12,13 @@
     "test": "bun test src"
   },
   "dependencies": {
-    "@crewhaus/errors": "workspace:*"
+    "@crewhaus/boundary-classifier": "workspace:*",
+    "@crewhaus/event-log": "workspace:*",
+    "@crewhaus/run-context": "workspace:*",
+    "@crewhaus/tool-builder": "workspace:*",
+    "@crewhaus/tool-catalog": "workspace:*",
+    "@crewhaus/wiki-store": "workspace:*",
+    "zod": "^3.23.8"
   },
   "devDependencies": {
     "@crewhaus/embedder": "workspace:*"
@@ -26,9 +32,9 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/crewhaus/factory.git",
-    "directory": "packages/memory-store"
+    "directory": "packages/tool-wiki"
   },
-  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/memory-store#readme",
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/tool-wiki#readme",
   "bugs": {
     "url": "https://github.com/crewhaus/factory/issues"
   },

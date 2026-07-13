@@ -118,6 +118,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `target-claude-plugin` emitter renders env refs as Claude Code's
   `${VAR}` expansion syntax in `.mcp.json`.
 
+- **memory-store v2 — explicit forgetting, provenance, and hybrid recall**
+  (0.3.0 memory release, design §3.4). Memory entries gain additive JSONL
+  fields: `schemaVersion` (2 on new writes; absent = v1, read lazily),
+  `expiresAt` (TTL via `remember(…, { ttlMs })`), `supersededBy`, and
+  `provenance { sessionId?, evidence?: toolUseId[] }`. Mixed v1/v2 files read
+  correctly in both directions. New store APIs: `forget(id|query)` appends
+  supersede tombstones (the file stays append-only — never a hard delete),
+  `sweep()` tombstones TTL-expired entries (deterministic, idempotent),
+  `compact()` rewrites the file dropping dead lines (atomic tmp+rename — the
+  growth-bounding answer to the #53 F7 unbounded-growth TODO), and `list()`
+  materializes lifecycle status. Auto-capture is now proof-linked: captured
+  facts carry `provenance.sessionId` and the source turn's successful
+  `tool_result` toolUseIds as `provenance.evidence`. Passing an `embedder`
+  to `createMemoryStore` upgrades recall to a hybrid BM25 + embedding
+  reciprocal-rank fusion in which tool-grounded facts get a documented rank
+  boost; with no embedder the BM25 ranking is byte-identical to before
+  (regression-guarded).
+- **`MemoryForget` tool** (`@crewhaus/tool-memory`): explicit forgetting by
+  id or query — destructive AND justification-gated (Pillar 3 intent gate).
+  `Remember` accepts an optional `ttlDays`.
+- **`crewhaus memory list|show <id>|forget <id|--query <q>>|sweep [--compact]`**:
+  inspect the per-spec fact stores (id/age/tags/provenance/status), explicitly
+  forget memories, and run the TTL sweep + compaction. Destructive verbs
+  preview their match set and prompt unless `--yes`.
+- **`crewhaus migrate memories [--dry-run]`**: idempotent v2 backfill over
+  `.crewhaus/memories/*.jsonl` via the migration-engine chain — stamps
+  `schemaVersion`, derives `provenance.sessionId` from v1 auto-capture tags,
+  preserves every other line verbatim, and records the store version in
+  `.crewhaus/meta.json`.
+
 - **The runtime-core continuity seam: compaction can no longer eat a user's
   requirements (0.3.0 Goal 1, PR 8).** The release's motivating failure — a
   clarification answer living in the middle of message history was deleted
@@ -162,6 +192,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   assert the next rendered model input still carries it verbatim, resume
   and assert again). Spec/IR/emitter threading is PR 11; this PR is the
   runtime seam only.
+
+- **`@crewhaus/wiki-store` — the local wiki substrate** (0.3.0 memory
+  release, design §3.1). Update-in-place semantic memory under
+  `.crewhaus/wiki/<spec>/`: markdown articles with YAML frontmatter (slug,
+  title, tags, confidence, verified, version, sources, supersedes,
+  createdBy), immutable prior versions under `versions/<slug>/<n>.md`
+  (supersede, never delete), and a rebuildable `index.json` carrying
+  `[[wikilink]]` link graphs. `write()` upserts with the Thredz PATCH
+  optimistic-concurrency contract — a stale `expectedVersion` throws a
+  `stale_article_version`-coded conflict, so skills behave identically on
+  both backends. Retrieval is hybrid BM25 + optional embedder via
+  reciprocal-rank fusion over contextual chunks (title + tags prefixed),
+  followed by one-hop link expansion with a documented half-weight re-rank
+  rule — a linked-but-lexically-unrelated article surfaces on recall.
+  Mutations run under the §7.6 advisory `.lock` (wait 2 s → steal >30 s
+  stale → fail naming the holder pid) with tmp+rename atomic writes, and
+  every path is tenant-fenced fail-closed.
+- **`@crewhaus/tool-wiki` — the thredz-identical wiki tool vocabulary**
+  (design §3.2): `wiki_recall`, `wiki_semantic_search`, `wiki_search`,
+  `wiki_get`, `wiki_write`, `wiki_list`, `wiki_related`,
+  `wiki_set_signals`, `wiki_stats`, `log_knowledge_gap` — exact thredz-mcp
+  names and schemas, pinned by a parity test. `wiki_write`/`wiki_set_signals`
+  are destructive + justification-gated; `log_knowledge_gap` is
+  audit-and-allow and, standalone, records gaps as draft wiki articles
+  under the reserved `gaps/` tag (an injected `logGap` callback reroutes it
+  to the plan store in the composition root). With `requireSources: true`,
+  `wiki_write` deterministically rejects bodies without a `## Sources`
+  heading (design §3.3's write-path governance). Mutations emit the new
+  additive `wiki_write` event kind through an injected append seam.
+- **New `memory` TrustOrigin** (Pillar 3, design §7.4): recalled wiki
+  bodies are classified at origin `"memory"` (block tier, like `"skill"`)
+  before reaching the model and lineage-tagged for the egress fabric;
+  redact verdicts return the redaction notice instead of the body. Origin
+  registered across boundary-classifier, run-context, and
+  egress-classifier; tool-wiki joins the doctor `--philosophy-alignment`
+  boundary-site checks.
+- **`crewhaus wiki list|show <slug>|search <q>|stats`**: inspect the
+  per-spec local wikis — stalest-first listing with signals
+  (verified/confidence), full frontmatter + body for one article, BM25
+  keyword search, and corpus-health stats.
 
 ### Changed
 

@@ -72,7 +72,8 @@ import {
   captureFacts,
   createMemoryStore,
   deriveMemoryDecision,
-  summarizeDurableFacts,
+  summarizeDurableFactsWithEvidence,
+  turnsFromEvents,
 } from "@crewhaus/memory-store";
 import {
   BUILTIN_DEFAULT_RULES,
@@ -100,6 +101,9 @@ import { registerMcpServer } from "@crewhaus/tool-mcp";
 import { createMemoryTools } from "@crewhaus/tool-memory";
 import { createTaskTool } from "@crewhaus/tool-task";
 import { type CostAccrualEvent, type ProviderId, TraceEventBus } from "@crewhaus/trace-event-bus";
+// 0.3.0 memory release (design §3.1, PR 9) — the local wiki substrate behind
+// `crewhaus wiki list|show|search|stats`.
+import { createWikiStore } from "@crewhaus/wiki-store";
 import { parseDocument } from "yaml";
 // Item 15 — `optimize --from-advice` (eval-gated apply of the advisor's
 // SpecPatches: suggestions-file validation, the accept/reject/compose loop
@@ -625,6 +629,17 @@ import {
   safeMcpFileName,
   scoreMcpHealth,
 } from "./mcp-doctor";
+// 0.3.0 memory release (design §3.4) — `crewhaus memory list|show|forget|sweep`
+// helpers + the `crewhaus migrate memories` schema-v2 backfill.
+import {
+  MEMORIES_SUBDIR,
+  formatMigrateMemoriesReport,
+  listMemorySpecs,
+  migrateMemories,
+  renderMemoryList,
+  renderMemoryShow,
+  resolveMemorySpec,
+} from "./memory-cli";
 // Item 24 — market scan + doctor --models + pricing sync core, in a
 // side-effect-free module (this entry file runs an argv switch on import).
 import {
@@ -891,6 +906,17 @@ import {
   renderVoiceReport,
 } from "./voice-eval";
 import { type Watcher, createWatchController, formatCycleLine } from "./watch";
+// 0.3.0 memory release (design §3.1/§3.2, PR 9) — `crewhaus wiki
+// list|show|search|stats` helpers over @crewhaus/wiki-store.
+import {
+  WIKI_SUBDIR,
+  listWikiSpecs,
+  renderWikiList,
+  renderWikiSearch,
+  renderWikiShow,
+  renderWikiStats,
+  resolveWikiSpec,
+} from "./wiki-cli";
 
 /**
  * crewhaus — slice-scope CLI.
@@ -1570,6 +1596,50 @@ const SESSIONS_SCHEMA: ParseArgsSchema = {
   ],
 };
 
+// 0.3.0 memory release (design §3.4) — `crewhaus memory list|show|forget|sweep`.
+const MEMORY_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // Which spec's memory file to operate on. `list`/`sweep` default to every
+    // file under .crewhaus/memories/; `show`/`forget` auto-resolve only when a
+    // single file exists.
+    { name: "spec", takesValue: true },
+    // forget — a text query instead of an exact id (forgets EVERY match).
+    { name: "query", short: "q", takesValue: true },
+    // forget / sweep --compact — skip the confirmation prompt (scripted/CI).
+    { name: "yes", takesValue: false },
+    // sweep — additionally rewrite the file(s) dropping tombstoned/expired
+    // lines (atomic tmp+rename; the growth-bounding compaction).
+    { name: "compact", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
+// 0.3.0 memory release — `crewhaus migrate memories [--dry-run]`: backfill
+// schemaVersion + derivable provenance onto v1 entries, stamp .crewhaus/meta.json.
+const MIGRATE_MEMORIES_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "dry-run", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
+// 0.3.0 memory release (design §3.1, PR 9) — `crewhaus wiki list|show|search|stats`.
+const WIKI_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // Which spec's wiki to operate on. `list`/`stats` default to every wiki
+    // under .crewhaus/wiki/; `show`/`search` auto-resolve only when a single
+    // wiki exists.
+    { name: "spec", takesValue: true },
+    // list — filter to articles carrying EVERY listed tag (comma-separated).
+    { name: "tags", takesValue: true },
+    // list — filter by article status (draft|published|review|archived|all).
+    { name: "status", takesValue: true },
+    // search — max results to print. Default 10.
+    { name: "k", short: "k", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
 // Item 12 — the dataset-registry CLI face (`datasets list|get|put`).
 const DATASETS_SCHEMA: ParseArgsSchema = {
   flags: [
@@ -2092,6 +2162,18 @@ function usageText(): string {
     "  lessons update [--sessions N|all]    mine corrections + failures into an auto-loaded LESSONS.md (#56)",
     "       [--low-score F] [-o <LESSONS.md>]  + per-user prefs under .crewhaus/preferences/",
     "  sessions summarize [--before <date>] summarize sessions into a durable index before TTL eviction (#57)",
+    "  memory list [--spec <name>]          inspect the per-spec fact stores: id/age/tags/provenance/status",
+    "  memory show <mem_id>                 full detail for one memory (provenance, expiry, supersededBy)",
+    "  memory forget <mem_id>|--query <q>   explicitly forget memories (append-only supersede tombstones;",
+    "       [--spec <name>] [--yes]             a query forgets EVERY match; prompts unless --yes)",
+    "  memory sweep [--compact] [--yes]     tombstone TTL-expired memories; --compact rewrites the file",
+    "                                       dropping dead lines (atomic; the growth-bounding compaction)",
+    "  migrate memories [--dry-run]         backfill the v2 memory schema + provenance; stamps .crewhaus/meta.json",
+    "  wiki list [--spec <name>]            inspect the per-spec local wikis, stalest first (versions, signals,",
+    "       [--tags <t1,t2>] [--status <s>]     tags; articles live under .crewhaus/wiki/<spec>/articles/)",
+    "  wiki show <slug>                     full frontmatter + body for one article (priors in versions/<slug>/)",
+    "  wiki search <q> [-k <n>]             BM25 keyword search over a spec's articles",
+    "  wiki stats                           corpus health: articles/status/versions/tags/verified/links",
     "       [--evicted] [--ttl-days N]        --evicted indexes each session just before it is deleted",
     "  datasets list                        all registered datasets + versions (Section 29)",
     "  datasets get <name>[@version]        print a dataset's samples as JSONL",
@@ -4178,9 +4260,16 @@ async function runRunCli(
               const events = parseJsonlObjects(
                 readFileSync(sessionJsonlPath(sessionId), "utf-8"),
               ) as Array<{ kind?: string; payload?: unknown }>;
-              const turns = deriveTurns(events);
-              const facts = summarizeDurableFacts(turns);
-              const written = await captureFacts(memoryStore, facts, ["auto-capture", sessionId]);
+              // v2 proof-linked capture: turnsFromEvents (the shared extractor)
+              // carries each turn's successful tool_result ids so captured
+              // facts land with provenance {sessionId, evidence: toolUseIds}.
+              // The sessionId tag is kept for back-compat/grep (and it is what
+              // `crewhaus migrate memories` derives provenance from on v1 files).
+              const turns = turnsFromEvents(events);
+              const facts = summarizeDurableFactsWithEvidence(turns);
+              const written = await captureFacts(memoryStore, facts, ["auto-capture", sessionId], {
+                sessionId,
+              });
               if (written.length > 0) {
                 process.stdout.write(
                   `[memory] auto-captured ${written.length} durable fact(s) into ${memoryStore.path()}\n`,
@@ -5206,6 +5295,9 @@ async function collectPhilosophyFindings(): Promise<PhilosophyFinding[]> {
     { name: "compaction-autocompact", path: "packages/compaction-autocompact/src/index.ts" },
     { name: "federation-router", path: "packages/federation-router/src/index.ts" },
     { name: "channel-adapter-base", path: "packages/channel-adapter-base/src/index.ts" },
+    // 0.3.0 memory release: recalled wiki bodies re-enter the model context
+    // across a session boundary — classified at the "memory" origin.
+    { name: "tool-wiki", path: "packages/tool-wiki/src/index.ts" },
   ];
   for (const site of boundarySites) {
     const filePath = join(process.cwd(), site.path);
@@ -10188,6 +10280,292 @@ async function runSessions(args: ParsedArgs): Promise<void> {
   process.stdout.write(`[sessions] summarized ${indexed} session(s) into ${indexDir}\n`);
 }
 
+// -------- 0.3.0 memory release: crewhaus memory + migrate memories --------
+
+/**
+ * `crewhaus memory list|show <id>|forget <id|--query <q>>|sweep [--compact]`
+ * (design §3.4) — inspect and explicitly forget the per-spec fact stores
+ * under `.crewhaus/memories/`. Forgetting is append-only (supersede
+ * tombstones, never a hard delete); `sweep --compact` is the growth-bounding
+ * rewrite. Destructive verbs prompt unless `--yes`. NOTE: `clear|restore`
+ * (trash + undo) deliberately do NOT live here — they arrive with the
+ * continuity store (design §2.6).
+ */
+async function runMemory(args: ParsedArgs): Promise<void> {
+  const action = args.positional[0];
+  if (args.flags["help"] === true && action === undefined) {
+    process.stdout.write(
+      "usage: crewhaus memory list [--spec <name>]\n" +
+        "       crewhaus memory show <mem_id> [--spec <name>]\n" +
+        "       crewhaus memory forget <mem_id> | --query <q> [--spec <name>] [--yes]\n" +
+        "       crewhaus memory sweep [--compact] [--spec <name>] [--yes]\n" +
+        "  Inspect + explicitly forget the per-spec memory stores under .crewhaus/memories/.\n" +
+        "  forget appends supersede tombstones (append-only; never a hard delete); a --query\n" +
+        "  forgets EVERY matching memory. sweep tombstones TTL-expired entries; --compact\n" +
+        "  additionally rewrites the file dropping dead lines (atomic tmp+rename).\n",
+    );
+    return;
+  }
+  const memoriesDir = join(process.cwd(), MEMORIES_SUBDIR);
+  const nowMs = Date.now();
+  const specFlag = strFlag(args, "spec");
+  const assumeYes = args.flags["yes"] === true;
+  const storeFor = (specName: string): ReturnType<typeof createMemoryStore> =>
+    createMemoryStore({ specName, rootDir: memoriesDir });
+  const confirmOrDie = async (prompt: string): Promise<boolean> => {
+    if (assumeYes) return true;
+    if (process.stdin.isTTY !== true) {
+      die(`memory ${action}: refusing a destructive operation without --yes in a non-TTY session`);
+    }
+    return await promptYesNo(prompt);
+  };
+
+  switch (action) {
+    case "list": {
+      const specs =
+        specFlag !== undefined
+          ? [resolveMemorySpec(memoriesDir, specFlag)]
+          : listMemorySpecs(memoriesDir);
+      if (specs.length === 0) die(`no memory files under ${memoriesDir}`);
+      for (const spec of specs) {
+        const items = await storeFor(spec).list();
+        for (const line of renderMemoryList(spec, items, nowMs)) {
+          process.stdout.write(`${line}\n`);
+        }
+      }
+      return;
+    }
+    case "show": {
+      const id = args.positional[1];
+      if (id === undefined) die("usage: crewhaus memory show <mem_id> [--spec <name>]");
+      const specs =
+        specFlag !== undefined
+          ? [resolveMemorySpec(memoriesDir, specFlag)]
+          : listMemorySpecs(memoriesDir);
+      for (const spec of specs) {
+        const item = (await storeFor(spec).list()).find((i) => i.entry.id === id);
+        if (item !== undefined) {
+          process.stdout.write(`spec:          ${spec}\n`);
+          for (const line of renderMemoryShow(item)) process.stdout.write(`${line}\n`);
+          return;
+        }
+      }
+      die(`no memory with id ${id} under ${memoriesDir}`);
+      return;
+    }
+    case "forget": {
+      const id = args.positional[1];
+      const query = strFlag(args, "query");
+      if ((id === undefined) === (query === undefined)) {
+        die("memory forget: provide exactly one of <mem_id> or --query <q>");
+      }
+      if (id !== undefined && !/^mem_[0-9a-f]{16}$/.test(id)) {
+        die(`memory forget: "${id}" is not a memory id (mem_…) — text goes via --query`);
+      }
+      const spec = resolveMemorySpec(memoriesDir, specFlag);
+      const store = storeFor(spec);
+      // Preview the exact match set forget() will tombstone: for an id the
+      // live entry, for a query every positive BM25 match (recall's set).
+      const items = await store.list();
+      const matches =
+        id !== undefined
+          ? items.filter((i) => i.status === "live" && i.entry.id === id)
+          : (await store.recall(query as string, 10_000)).map((r) => ({
+              entry: r.entry,
+              status: "live" as const,
+            }));
+      if (matches.length === 0) {
+        process.stdout.write(
+          `[memory] nothing to forget — no live memory matched ${id ?? `"${query}"`} in ${spec}\n`,
+        );
+        return;
+      }
+      process.stdout.write(`[memory] will forget ${matches.length} memory(ies) from ${spec}:\n`);
+      for (const line of renderMemoryList(spec, matches, nowMs).slice(1)) {
+        process.stdout.write(`${line}\n`);
+      }
+      const go = await confirmOrDie(`forget ${matches.length} memory(ies) from ${spec}? [y/N] `);
+      if (!go) {
+        process.stdout.write("[memory] aborted — nothing forgotten\n");
+        return;
+      }
+      const forgotten = await store.forget((id ?? query) as string, {
+        reason: "crewhaus memory forget",
+      });
+      process.stdout.write(
+        `[memory] forgot ${forgotten.length} memory(ies) (superseded tombstones in ${store.path()})\n`,
+      );
+      return;
+    }
+    case "sweep": {
+      const specs =
+        specFlag !== undefined
+          ? [resolveMemorySpec(memoriesDir, specFlag)]
+          : listMemorySpecs(memoriesDir);
+      if (specs.length === 0) die(`no memory files under ${memoriesDir}`);
+      for (const spec of specs) {
+        const result = await storeFor(spec).sweep();
+        process.stdout.write(
+          `[memory] ${spec}: swept ${result.swept} expired memory(ies), ${result.live} live\n`,
+        );
+      }
+      if (args.flags["compact"] === true) {
+        const go = await confirmOrDie(
+          `compact ${specs.length} memory file(s) (rewrites dropping tombstoned/expired lines)? [y/N] `,
+        );
+        if (!go) {
+          process.stdout.write("[memory] compact aborted — files untouched\n");
+          return;
+        }
+        for (const spec of specs) {
+          const result = await storeFor(spec).compact();
+          process.stdout.write(
+            `[memory] ${spec}: compacted — kept ${result.kept} line(s), dropped ${result.dropped}\n`,
+          );
+        }
+      }
+      return;
+    }
+    default:
+      die(`memory: unknown action "${action ?? ""}" — supported: list, show, forget, sweep`);
+  }
+}
+
+/**
+ * `crewhaus migrate memories [--dry-run]` — the schema-v2 backfill over
+ * `.crewhaus/memories/*.jsonl` via the Section-28 migration-engine chain:
+ * stamps `schemaVersion: 2` on v1 entries, derives `provenance.sessionId`
+ * where the v1 auto-capture tags carry it, preserves every other line
+ * verbatim, and records the store version in `.crewhaus/meta.json`.
+ * Idempotent — a re-run migrates 0 entries.
+ */
+async function runMigrateMemories(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"] === true) {
+    process.stdout.write(
+      "usage: crewhaus migrate memories [--dry-run]\n" +
+        "  Backfill the v2 memory-entry schema (schemaVersion + derivable provenance)\n" +
+        "  onto .crewhaus/memories/*.jsonl and stamp .crewhaus/meta.json. Idempotent;\n" +
+        "  --dry-run reports the plan without writing.\n",
+    );
+    return;
+  }
+  const report = migrateMemories(process.cwd(), {
+    dryRun: args.flags["dry-run"] === true,
+  });
+  if (report.files.length === 0) {
+    process.stdout.write(
+      `[migrate] no memory files under ${join(process.cwd(), MEMORIES_SUBDIR)} — nothing to do\n`,
+    );
+    return;
+  }
+  for (const line of formatMigrateMemoriesReport(report)) process.stdout.write(`${line}\n`);
+}
+
+// -------- 0.3.0 memory release: crewhaus wiki --------
+
+/**
+ * `crewhaus wiki list|show <slug>|search <q>|stats` (design §3.1/§3.2, PR 9)
+ * — inspect the per-spec local wikis under `.crewhaus/wiki/`. Read-only
+ * verbs only: articles are written by the wiki_write tool (versioned,
+ * supersede-never-delete), `clear|restore` ride the continuity trash
+ * machinery, and `push|pull --thredz` arrives with the Thredz PR.
+ */
+async function runWiki(args: ParsedArgs): Promise<void> {
+  const action = args.positional[0];
+  if (args.flags["help"] === true && action === undefined) {
+    process.stdout.write(
+      "usage: crewhaus wiki list [--spec <name>] [--tags <t1,t2>] [--status <s>]\n" +
+        "       crewhaus wiki show <slug> [--spec <name>]\n" +
+        "       crewhaus wiki search <q> [--spec <name>] [-k <n>]\n" +
+        "       crewhaus wiki stats [--spec <name>]\n" +
+        "  Inspect the per-spec local wikis under .crewhaus/wiki/ (versioned articles;\n" +
+        "  priors are kept under versions/<slug>/ — superseded, never deleted). list is\n" +
+        "  stalest-first (the REFLECT order); search is BM25 keyword ranking.\n",
+    );
+    return;
+  }
+  const wikiDir = join(process.cwd(), WIKI_SUBDIR);
+  const nowMs = Date.now();
+  const specFlag = strFlag(args, "spec");
+  const storeFor = (specName: string): ReturnType<typeof createWikiStore> =>
+    createWikiStore({ specName, rootDir: wikiDir });
+
+  switch (action) {
+    case "list": {
+      const specs =
+        specFlag !== undefined ? [resolveWikiSpec(wikiDir, specFlag)] : listWikiSpecs(wikiDir);
+      if (specs.length === 0) die(`no wikis under ${wikiDir}`);
+      const statusFlag = strFlag(args, "status");
+      const status =
+        statusFlag === "draft" ||
+        statusFlag === "published" ||
+        statusFlag === "review" ||
+        statusFlag === "archived" ||
+        statusFlag === "all"
+          ? statusFlag
+          : undefined;
+      if (statusFlag !== undefined && status === undefined) {
+        die(`wiki list: unknown --status "${statusFlag}" (draft|published|review|archived|all)`);
+      }
+      const tags = (strFlag(args, "tags") ?? "")
+        .split(",")
+        .map((t) => t.trim())
+        .filter((t) => t !== "");
+      for (const spec of specs) {
+        const refs = await storeFor(spec).list({
+          staleFirst: true,
+          ...(status !== undefined ? { status } : {}),
+          ...(tags.length > 0 ? { tags } : {}),
+        });
+        for (const line of renderWikiList(spec, refs, nowMs)) {
+          process.stdout.write(`${line}\n`);
+        }
+      }
+      return;
+    }
+    case "show": {
+      const slug = args.positional[1];
+      if (slug === undefined) die("usage: crewhaus wiki show <slug> [--spec <name>]");
+      const specs =
+        specFlag !== undefined ? [resolveWikiSpec(wikiDir, specFlag)] : listWikiSpecs(wikiDir);
+      for (const spec of specs) {
+        const article = await storeFor(spec).get(slug as string);
+        if (article !== null) {
+          process.stdout.write(`spec:        ${spec}\n`);
+          for (const line of renderWikiShow(article)) process.stdout.write(`${line}\n`);
+          return;
+        }
+      }
+      die(`no wiki article with slug "${slug}" under ${wikiDir}`);
+      return;
+    }
+    case "search": {
+      const query = args.positional[1];
+      if (query === undefined) die("usage: crewhaus wiki search <q> [--spec <name>] [-k <n>]");
+      const k = Math.max(1, Number.parseInt(strFlag(args, "k") ?? "10", 10) || 10);
+      const spec = resolveWikiSpec(wikiDir, specFlag);
+      const refs = await storeFor(spec).search(query as string);
+      for (const line of renderWikiSearch(spec, query as string, refs.slice(0, k))) {
+        process.stdout.write(`${line}\n`);
+      }
+      return;
+    }
+    case "stats": {
+      const specs =
+        specFlag !== undefined ? [resolveWikiSpec(wikiDir, specFlag)] : listWikiSpecs(wikiDir);
+      if (specs.length === 0) die(`no wikis under ${wikiDir}`);
+      for (const spec of specs) {
+        for (const line of renderWikiStats(spec, await storeFor(spec).stats())) {
+          process.stdout.write(`${line}\n`);
+        }
+      }
+      return;
+    }
+    default:
+      die(`wiki: unknown action "${action ?? ""}" — supported: list, show, search, stats`);
+  }
+}
+
 // -------- item 4: crewhaus graders suggest --------
 
 /**
@@ -15003,6 +15381,43 @@ switch (subcommand) {
       throw err;
     }
     break;
+  case "memory":
+    // 0.3.0 memory release (design §3.4) — inspect/forget/sweep the per-spec
+    // fact stores. Structured failures route through die().
+    try {
+      await runMemory(parseFor(rest, MEMORY_SCHEMA));
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
+    break;
+  case "wiki":
+    // 0.3.0 memory release (design §3.1, PR 9) — inspect the per-spec local
+    // wikis (read-only verbs). Structured failures route through die().
+    try {
+      await runWiki(parseFor(rest, WIKI_SCHEMA));
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
+    break;
+  case "migrate": {
+    // 0.3.0 memory release — `migrate memories`: the v2 schema backfill over
+    // .crewhaus/memories/. Spec migrations stay on migrate-all/upgrade.
+    const migrateAction = rest[0] ?? "";
+    if (migrateAction !== "memories") {
+      die(
+        `migrate action must be "memories" (got "${migrateAction}") — spec migrations use migrate-all/upgrade`,
+      );
+    }
+    try {
+      await runMigrateMemories(parseFor(rest.slice(1), MIGRATE_MEMORIES_SCHEMA));
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
+    break;
+  }
   case "scaffold-evals":
     // Mirror `run`'s policy: structured failures (SpecParseError, model
     // routing/auth on the one-shot generation call) extend CrewhausError —

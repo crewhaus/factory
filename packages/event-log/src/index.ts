@@ -160,7 +160,30 @@ export type EventKind =
   // shifts, so multiple lines can share one `turnNumber`. Feeds `crewhaus
   // route explain <session>`. Non-conversational, so `replayMessageHistory`
   // ignores it and `--resume` is unaffected.
-  | "model_route";
+  | "model_route"
+  // 0.3.0 memory release (design §9) — one line per wiki mutation (payload
+  // `WikiWriteEventPayload`), emitted by @crewhaus/tool-wiki through its
+  // injected append seam (the emitter / memory-service composition root
+  // decides where it lands). Non-conversational, so `replayMessageHistory`
+  // ignores it and `--resume` is unaffected; readers written before this
+  // kind existed keep parsing. Additive — kept on its own line so the
+  // parallel 0.3.0 branches (plan_update/goal_update/action_proof,
+  // run_failed) merge trivially.
+  | "wiki_write";
+
+/**
+ * Payload for the `wiki_write` event kind (0.3.0 design §9): which article
+ * was mutated, at what version, and how. `action` distinguishes a body
+ * upsert (`"write"`), a reflection-pass signals change (`"set_signals"`),
+ * and the standalone `log_knowledge_gap` fallback (`"gap"`).
+ */
+export type WikiWriteEventPayload = {
+  readonly slug: string;
+  readonly version: number;
+  readonly action: "write" | "set_signals" | "gap";
+  /** thredz-parity `editMessage`, when the model supplied one. */
+  readonly editMessage?: string;
+};
 
 export type Event = {
   readonly ts: number;

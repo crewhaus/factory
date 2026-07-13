@@ -51,7 +51,7 @@ Section 18's "safety floor" is necessary but not sufficient. Untrusted content c
 
 The fabric has **two symmetric halves**: a source side (classify content coming in) and a sink side (classify content going out). The OpenAI 2026-05 prompt-injection paper and SACR's 2026 runtime-security report converge on the same insight: source classification is necessary but not sufficient; an attacker who controls a source AND an accessible sink can lateral-move across the agent's permissions even when every individual permission check passes. The egress fabric (recommendation A, v0.2.x) is the symmetric companion that closes that loop.
 
-**Source-side chokepoint** — [packages/boundary-classifier](packages/boundary-classifier). It wraps `prompt-injection-detector` with `TrustOrigin` metadata (`"user" | "mcp" | "subagent" | "channel" | "federation" | "skill" | "compaction" | "tool" | "chain"`), a content-hash LRU cache, and a configurable severity policy (default: block on malicious, warn on suspicious). `RunContext.originStack` carries the origin chain so trace events record it. After a non-blocked verdict, the boundary site also calls `tagContent(ctx, content, origin)` which populates `RunContext.dataLineage` for the sink-side check.
+**Source-side chokepoint** — [packages/boundary-classifier](packages/boundary-classifier). It wraps `prompt-injection-detector` with `TrustOrigin` metadata (`"user" | "mcp" | "subagent" | "channel" | "federation" | "skill" | "compaction" | "tool" | "chain" | "memory"`), a content-hash LRU cache, and a configurable severity policy (default: block on malicious, warn on suspicious). `RunContext.originStack` carries the origin chain so trace events record it. After a non-blocked verdict, the boundary site also calls `tagContent(ctx, content, origin)` which populates `RunContext.dataLineage` for the sink-side check.
 
 | Source site | Origin | Where |
 |---|---|---|
@@ -63,6 +63,7 @@ The fabric has **two symmetric halves**: a source side (classify content coming 
 | Compaction summaries | `"compaction"` | `packages/compaction-*` |
 | Tool results | `"tool"` | [packages/runtime-core](packages/runtime-core) |
 | On-chain payloads / receipts | `"chain"` | [packages/target-onchain](packages/target-onchain), [packages/target-onchain-game](packages/target-onchain-game), [packages/wallet-engine](packages/wallet-engine) |
+| Recalled wiki/fact bodies | `"memory"` | [packages/tool-wiki](packages/tool-wiki) |
 
 **Sink-side chokepoint** — [packages/egress-classifier](packages/egress-classifier). On every external-scope tool call (`tool.scope === "external"`), `runtime-core` calls `classifyEgress(payload, ctx, { sinkId, sinkScope })`. The classifier scans `RunContext.dataLineage` for substring matches and folds the per-origin policy across all hits. The default policy is *permissive on `"user"` content, warn on configured sinks, block on dynamic sinks*. Three audit outcomes land in the trace bus and audit-log: `"egress-passed" | "egress-warned" | "egress-blocked"`.
 

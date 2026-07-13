@@ -1,8 +1,8 @@
 {
-  "name": "@crewhaus/memory-store",
+  "name": "@crewhaus/wiki-store",
   "version": "0.2.4",
   "type": "module",
-  "description": "M4.2 — persistent cross-session memory store. File-backed JSONL with simple BM25-style text search. Per-spec scoped.",
+  "description": "0.3.0 memory release §3.1 — local update-in-place wiki: versioned markdown articles (supersede, never delete), optimistic concurrency (stale_article_version), hybrid BM25+embedding recall with one-hop [[wikilink]] expansion.",
   "main": "src/index.ts",
   "types": "src/index.ts",
   "exports": {
@@ -12,7 +12,9 @@
     "test": "bun test src"
   },
   "dependencies": {
-    "@crewhaus/errors": "workspace:*"
+    "@crewhaus/errors": "workspace:*",
+    "@crewhaus/tenancy": "workspace:*",
+    "yaml": "^2.6.0"
   },
   "devDependencies": {
     "@crewhaus/embedder": "workspace:*"
@@ -26,9 +28,9 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/crewhaus/factory.git",
-    "directory": "packages/memory-store"
+    "directory": "packages/wiki-store"
   },
-  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/memory-store#readme",
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/wiki-store#readme",
   "bugs": {
     "url": "https://github.com/crewhaus/factory/issues"
   },

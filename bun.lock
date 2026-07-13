@@ -107,6 +107,7 @@
         "@crewhaus/tool-vision-grounding": "workspace:*",
         "@crewhaus/tool-web": "workspace:*",
         "@crewhaus/trace-event-bus": "workspace:*",
+        "@crewhaus/wiki-store": "workspace:*",
         "yaml": "^2.6.0",
       },
       "devDependencies": {
@@ -929,6 +930,9 @@
       "version": "0.2.4",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
+      },
+      "devDependencies": {
+        "@crewhaus/embedder": "workspace:*",
       },
     },
     "packages/meta-harness-optimizer": {
@@ -2041,6 +2045,22 @@
         "@types/turndown": "^5.0.5",
       },
     },
+    "packages/tool-wiki": {
+      "name": "@crewhaus/tool-wiki",
+      "version": "0.2.4",
+      "dependencies": {
+        "@crewhaus/boundary-classifier": "workspace:*",
+        "@crewhaus/event-log": "workspace:*",
+        "@crewhaus/run-context": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/wiki-store": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/embedder": "workspace:*",
+      },
+    },
     "packages/trace-event-bus": {
       "name": "@crewhaus/trace-event-bus",
       "version": "0.2.4",
@@ -2081,6 +2101,18 @@
         "@crewhaus/boundary-classifier": "workspace:*",
         "@crewhaus/chain-adapter-base": "workspace:*",
         "@crewhaus/errors": "workspace:*",
+      },
+    },
+    "packages/wiki-store": {
+      "name": "@crewhaus/wiki-store",
+      "version": "0.2.4",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tenancy": "workspace:*",
+        "yaml": "^2.6.0",
+      },
+      "devDependencies": {
+        "@crewhaus/embedder": "workspace:*",
       },
     },
   },
@@ -2549,6 +2581,8 @@
 
     "@crewhaus/tool-web": ["@crewhaus/tool-web@workspace:packages/tool-web"],
 
+    "@crewhaus/tool-wiki": ["@crewhaus/tool-wiki@workspace:packages/tool-wiki"],
+
     "@crewhaus/trace-event-bus": ["@crewhaus/trace-event-bus@workspace:packages/trace-event-bus"],
 
     "@crewhaus/turn-state-machine": ["@crewhaus/turn-state-machine@workspace:packages/turn-state-machine"],
@@ -2560,6 +2594,8 @@
     "@crewhaus/voice-runtime": ["@crewhaus/voice-runtime@workspace:packages/voice-runtime"],
 
     "@crewhaus/wallet-engine": ["@crewhaus/wallet-engine@workspace:packages/wallet-engine"],
+
+    "@crewhaus/wiki-store": ["@crewhaus/wiki-store@workspace:packages/wiki-store"],
 
     "@google/genai": ["@google/genai@1.52.0", "", { "dependencies": { "google-auth-library": "^10.3.0", "p-retry": "^4.6.2", "protobufjs": "^7.5.4", "ws": "^8.18.0" }, "peerDependencies": { "@modelcontextprotocol/sdk": "^1.25.2" }, "optionalPeers": ["@modelcontextprotocol/sdk"] }, "sha512-gwSvbpiN/17O9TbsqSsE/OzZcpv5Fo4RQjdngGgogtuB9RsyJ8ZHhX5KjHj1bp5N9snN2eK8LDGXSaWW2hof8Q=="],
 
