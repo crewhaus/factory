@@ -573,6 +573,55 @@ export type FleetRunner = (opts: {
   readonly argv: ReadonlyArray<string>;
 }) => Promise<{ readonly exitCode: number; readonly tail: string }>;
 
+/**
+ * Is `entryPath` the Bun standalone-executable virtual-FS sentinel — i.e. are
+ * we running a `bun build --compile` single-file binary rather than
+ * `bun run …/index.ts`? Bun rewrites the entry (`process.argv[1]` / `Bun.main`)
+ * to a path inside its embedded root: `/$bunfs/root/<name>` on POSIX,
+ * `B:\~BUN\root\<name>` on Windows.
+ */
+export function isCompiledEntryPath(entryPath: string): boolean {
+  return (
+    entryPath.includes("/$bunfs/") || entryPath.includes("\\~BUN\\") || entryPath.includes("/~BUN/")
+  );
+}
+
+/** The runtime facts the self-invoke argv depends on, injected so the builder
+ *  is a pure function: production passes the live `process.execPath` +
+ *  `Bun.main`; tests pass fixed strings for either mode. */
+export type SelfInvokeContext = {
+  /** The real running executable — `bun` in dev, the compiled binary itself
+   *  when compiled (`process.execPath`, NOT `process.argv[0]`, which the
+   *  compiled runtime reports as the literal string `"bun"`). */
+  readonly execPath: string;
+  /** The entry path as the runtime sees it (`process.argv[1]` / `Bun.main`):
+   *  the real `…/index.ts` in dev, the `/$bunfs/…` sentinel when compiled. */
+  readonly entryPath: string;
+};
+
+/**
+ * Build the argv to re-invoke THIS running CLI in a child process with
+ * `childArgv` (e.g. `["doctor"]`) — correct under BOTH `bun run
+ * apps/cli/src/index.ts …` and a `bun build --compile` single-file binary.
+ *
+ * The compiled case is the subtle one. A standalone binary RE-INJECTS its own
+ * embedded entry every time it is spawned, so the child already receives
+ * `[<exe>, /$bunfs/root/<name>, ...childArgv]`. If we ALSO passed our own
+ * `entryPath` (the `/$bunfs/…` sentinel) it would land in the child's user
+ * args and be parsed as the subcommand — the v0.2.4 bug where `fleet run
+ * doctor` reported `unknown subcommand: /$bunfs/root/crewhaus-…` for every
+ * harness. So: compiled → `[execPath, ...childArgv]` and let Bun supply the
+ * entry; dev → `[execPath, entryPath, ...childArgv]` with the real script path.
+ */
+export function fleetSelfInvokeArgv(
+  ctx: SelfInvokeContext,
+  childArgv: ReadonlyArray<string>,
+): string[] {
+  return isCompiledEntryPath(ctx.entryPath)
+    ? [ctx.execPath, ...childArgv]
+    : [ctx.execPath, ctx.entryPath, ...childArgv];
+}
+
 /** Per-harness confirm seam for `--allow-mutating` (interactive prompt in the
  *  CLI; a predicate in tests). Returning false skips that harness. */
 export type ConfirmMutating = (

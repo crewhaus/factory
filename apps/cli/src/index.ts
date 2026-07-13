@@ -403,6 +403,7 @@ import {
   type LastEvalEntry,
   buildFleetInventory,
   buildHarnessHealth,
+  fleetSelfInvokeArgv,
   formatBulkReport,
   formatInventory as formatFleetInventory,
   formatHealth,
@@ -10748,10 +10749,17 @@ async function runFleet(args: ParsedArgs, action: string): Promise<void> {
 
       // Production runner: spawn `crewhaus <argv>` in the harness dir (the cwd
       // every subcommand resolves `.crewhaus/` state from). No shell — an argv
-      // array through Bun.spawn. The child inherits this process's argv[0]
-      // (the running CLI) so a bulk `doctor` runs the SAME binary.
+      // array through Bun.spawn. `fleetSelfInvokeArgv` re-invokes THIS CLI so a
+      // bulk `doctor` runs the SAME binary, correct under both `bun run` and a
+      // `bun build --compile` single-file binary: the compiled binary
+      // re-injects its own `/$bunfs/…` entry, so we must NOT pass our `Bun.main`
+      // as a subcommand (see fleet.ts — that was the v0.2.4 fleet-run bug).
       const runner: FleetRunner = async ({ cwd, argv }) => {
-        const proc = Bun.spawn([process.execPath, process.argv[1] as string, ...argv], {
+        const spawnArgv = fleetSelfInvokeArgv(
+          { execPath: process.execPath, entryPath: Bun.main },
+          argv,
+        );
+        const proc = Bun.spawn(spawnArgv, {
           cwd,
           stdin: "ignore",
           stdout: "pipe",

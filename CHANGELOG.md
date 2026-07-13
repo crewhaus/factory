@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`crewhaus fleet run <sub>` works from the compiled binary again.** When the
+  single-file executable (`bun build --compile`) fanned a read-only subcommand
+  across the fleet, it re-invoked itself as `[execPath, process.argv[1], …sub]`.
+  Inside a standalone binary Bun rewrites `argv[1]` to the embedded-FS sentinel
+  (`/$bunfs/root/crewhaus-…`) AND re-injects that entry on every spawn, so the
+  child read the sentinel as its subcommand — every harness failed with
+  `unknown subcommand: /$bunfs/root/crewhaus-…` and `fleet run doctor` reported
+  `0 passed, N failed`, exit 1. The runner now builds its self-invocation via
+  `fleetSelfInvokeArgv`, which omits the entry when compiled (Bun supplies it)
+  and keeps the real script path under `bun run`. Affects `fleet run` for
+  `doctor` / `eval` / `security digest` / `audit verify` alike. The source CLI
+  was never affected.
+
 ## [0.2.4] - 2026-07-08
 
 A focused fix release: a truncated or malformed tool call no longer bricks the
