@@ -15,10 +15,12 @@ import {
   countOpenIncidents,
   countSessions,
   discoverHarnesses,
+  fleetSelfInvokeArgv,
   formatBulkReport,
   formatHealth,
   formatInventory,
   healthMark,
+  isCompiledEntryPath,
   lastEvalFor,
   matchesFilter,
   readSpecHeader,
@@ -379,6 +381,58 @@ describe("resolveBulkCommand", () => {
 
   test("throws on an empty subcommand", () => {
     expect(() => resolveBulkCommand([], false)).toThrow(FleetError);
+  });
+});
+
+describe("isCompiledEntryPath", () => {
+  test("detects the POSIX standalone-binary sentinel", () => {
+    expect(isCompiledEntryPath("/$bunfs/root/crewhaus-macos-arm64-0.2.4")).toBe(true);
+  });
+  test("detects the Windows standalone-binary sentinel", () => {
+    expect(isCompiledEntryPath("B:\\~BUN\\root\\crewhaus-windows-x64-0.2.4.exe")).toBe(true);
+  });
+  test("a real dev script path is not compiled", () => {
+    expect(isCompiledEntryPath("/Users/me/factory/apps/cli/src/index.ts")).toBe(false);
+  });
+});
+
+describe("fleetSelfInvokeArgv", () => {
+  // The v0.2.4 fleet-run bug: a compiled binary re-injects its own `/$bunfs/…`
+  // entry, so passing that entry as an arg made the child read it as the
+  // subcommand (`unknown subcommand: /$bunfs/root/crewhaus-…`). The compiled
+  // branch must therefore OMIT the entry and let Bun supply it.
+  test("compiled binary: drops the bunfs entry, passes only exe + child argv", () => {
+    expect(
+      fleetSelfInvokeArgv(
+        {
+          execPath: "/usr/local/bin/crewhaus",
+          entryPath: "/$bunfs/root/crewhaus-macos-arm64-0.2.4",
+        },
+        ["doctor"],
+      ),
+    ).toEqual(["/usr/local/bin/crewhaus", "doctor"]);
+  });
+  test("compiled binary: preserves multi-token subcommands + trailing flags", () => {
+    expect(
+      fleetSelfInvokeArgv(
+        {
+          execPath: "/usr/local/bin/crewhaus",
+          entryPath: "/$bunfs/root/crewhaus-macos-arm64-0.2.4",
+        },
+        ["security", "digest", "--since", "7d"],
+      ),
+    ).toEqual(["/usr/local/bin/crewhaus", "security", "digest", "--since", "7d"]);
+  });
+  test("dev process: keeps the script path so `bun <script> <argv>` resolves", () => {
+    expect(
+      fleetSelfInvokeArgv(
+        {
+          execPath: "/Users/me/.bun/bin/bun",
+          entryPath: "/Users/me/factory/apps/cli/src/index.ts",
+        },
+        ["doctor"],
+      ),
+    ).toEqual(["/Users/me/.bun/bin/bun", "/Users/me/factory/apps/cli/src/index.ts", "doctor"]);
   });
 });
 
