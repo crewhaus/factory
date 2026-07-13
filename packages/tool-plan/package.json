@@ -1,0 +1,40 @@
+{
+  "name": "@crewhaus/tool-plan",
+  "version": "0.2.4",
+  "type": "module",
+  "description": "v0.3.0 Goal 1 — Focus*/Plan*/Goal*/MemoryClear RegisteredTools over @crewhaus/continuity-store: the claimed→proven proof ladder as a tool surface, with plan_update/goal_update/action_proof event emission via an injected append seam.",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@crewhaus/continuity-store": "workspace:*",
+    "@crewhaus/event-log": "workspace:*",
+    "@crewhaus/tool-builder": "workspace:*",
+    "@crewhaus/tool-catalog": "workspace:*",
+    "zod": "^3.23.8"
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@crewhaus.ai",
+    "url": "https://crewhaus.ai"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/tool-plan"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/tool-plan#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+}
