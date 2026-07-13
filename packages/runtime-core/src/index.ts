@@ -31,7 +31,7 @@ import {
   classifyEgress,
   summarizeEgress,
 } from "@crewhaus/egress-classifier";
-import { ConfigError, RuntimeError } from "@crewhaus/errors";
+import { ConfigError, RunFailedError, RuntimeError } from "@crewhaus/errors";
 import { type EventKind, type EventLog, openEventLog } from "@crewhaus/event-log";
 import { type HookDef, type HookEvent, aggregateDecisions, runHooks } from "@crewhaus/hooks-engine";
 import {
@@ -3091,7 +3091,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           bus.publish({
             ...bus.envelope(),
             kind: "error_recovered",
-            action: action.kind,
+            // v0.3.0 Goal 6 — `halt` is a classified terminal stop; on the
+            // wire it maps to the existing `fail` action so structured
+            // consumers (alert-watchdog's unrecoveredErrors counter, the UI
+            // feed) keep counting terminal failures unchanged. The
+            // first-class `run_failed` event ships in the follow-up PR.
+            action: action.kind === "halt" ? "fail" : action.kind,
             errorName: state.error.name,
             depth: recovery.retryCount + recovery.compactCount + recovery.continueCount,
           });
@@ -3210,6 +3215,16 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             }
             case "fail":
               throw new RuntimeError(`recovery failed: ${action.reason}`);
+            case "halt":
+              // v0.3.0 Goal 6 — classified terminal stop (billing / auth /
+              // rate-limit exhaustion / hinted taxonomy entries). The report
+              // carries title, raw provider text, remediation, and the coded
+              // exit status; RunFailedError extends RuntimeError so existing
+              // CrewhausError catch sites (e.g. `crewhaus run`'s die())
+              // still produce a clean one-liner. The `run_failed` trace
+              // event, coded process exits, and report rendering land in the
+              // follow-up PR.
+              throw new RunFailedError(action.report, lastErrorForRecovery);
           }
           break;
         }

@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Failure-taxonomy core: out-of-funding, bad-credential, and rate-limit
+  errors are now classified instead of misrouted (0.3.0 Goal 6, PR 1).**
+  `recovery-engine.classify()` gains three buckets ahead of the existing
+  ones: `billing` (HTTP 402; Anthropic's out-of-credit 400 "credit balance is
+  too low"; OpenAI's 429 + `code: "insufficient_quota"`; Bedrock's
+  `ServiceQuotaExceededException`), `auth` (401/403 at runtime), and
+  `rate_limit` (any other 429 — retried with the provider's `Retry-After`
+  honored for the delay, capped at 60 s). Billing and auth resolve to the new
+  terminal `{ kind: "halt", report }` recovery action immediately — no more
+  tombstone detour for an empty Anthropic account or five futile backoff
+  retries against OpenAI's `insufficient_quota`; rate-limit exhaustion halts
+  as class `rate_limit` instead of a generic fail. Reports are built from the
+  new `BUILTIN_FAILURE_CLASSES` table (billing_exhausted, auth_invalid,
+  rate_limited, mcp_boot_failure, crewhaus_budget), consulted after user
+  `failure_taxonomy` entries (user overrides win) and before the generic
+  buckets. `@crewhaus/errors` gains the `FailureReport` shape (class, title,
+  raw provider text, remediation, coded exit status, optional docs URL), the
+  documented `EXIT_CODES` table (0 ok · 1 generic · 20 spec · 21 config ·
+  30 auth · 31 provider funding · 32 quota/rate-limit · 33 crewhaus budget
+  cap · 40 tool/MCP), a dependency-free `formatRunFailure()` renderer, and
+  `RunFailedError` — thrown by runtime-core on a `halt` verdict; it extends
+  `RuntimeError`, so `crewhaus run` keeps printing a clean one-liner (now
+  with the failure title and provider text). The `failure_taxonomy` `hint`
+  field — declared since §55 and never consumed — finally reaches the user:
+  a matched entry that resolves terminally carries its hint as the report's
+  remediation line. Unmatched errors behave exactly as before. The
+  `run_failed` trace event, coded process exits, and adapter-side error
+  discrimination land in the follow-up PRs.
+
 ### Fixed
 
 - **`crewhaus fleet run <sub>` works from the compiled binary again.** When the
