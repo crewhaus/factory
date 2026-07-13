@@ -21,18 +21,25 @@ export type IrPermissions = {
  * MCP server configs carried through to codegen (Section 9). Lower-time
  * normalisation: optional spec fields become required IR fields with
  * empty defaults, so target codegen doesn't need `?? []` guards.
+ *
+ * 0.3.0 (breaking, pre-1.0): stdio `env` and sse `headers` VALUES are
+ * `IrSecretRef`, not plain strings — `$UPPER_SNAKE` spec values lower to
+ * `{ kind: "env" }` references exactly like every other credential field,
+ * so secrets never land in compiled artifacts. Target codegen embeds the
+ * unresolved config verbatim and the emitted bundle resolves it at process
+ * start via `resolveMcpServerConfig` from `@crewhaus/mcp-host`.
  */
 export type IrMcpStdioConfig = {
   readonly transport: "stdio";
   readonly command: string;
   readonly args: readonly string[];
-  readonly env?: Readonly<Record<string, string>>;
+  readonly env?: Readonly<Record<string, IrSecretRef>>;
 };
 
 export type IrMcpSseConfig = {
   readonly transport: "sse";
   readonly url: string;
-  readonly headers?: Readonly<Record<string, string>>;
+  readonly headers?: Readonly<Record<string, IrSecretRef>>;
 };
 
 export type IrMcpServerConfig = IrMcpStdioConfig | IrMcpSseConfig;

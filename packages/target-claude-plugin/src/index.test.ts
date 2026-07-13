@@ -132,6 +132,35 @@ describe("emitClaudePlugin — universal files", () => {
     expect(mcp).toBeDefined();
     expect(JSON.parse(mcp?.content ?? "{}").fs.transport).toBe("stdio");
   });
+
+  test("0.3.0 — secret refs render as Claude Code ${VAR} expansions; literals as plain strings", () => {
+    const ir: IrV0 = {
+      ...baseCli,
+      mcp_servers: {
+        thredz: {
+          transport: "stdio",
+          command: "npx",
+          args: ["-y", "thredz-mcp@0.2.0"],
+          env: {
+            THREDZ_API_KEY: { kind: "env", name: "THREDZ_API_KEY" },
+            THREDZ_BASE_URL: { kind: "literal", value: "https://thredz.example/api" },
+          },
+        },
+        remote: {
+          transport: "sse",
+          url: "https://mcp.example.com/sse",
+          headers: { Authorization: { kind: "env", name: "API_TOKEN" } },
+        },
+      },
+    };
+    const b = emitClaudePlugin(ir, { author: { name: "x" } });
+    const parsed = JSON.parse(b.files.find((f) => f.path === ".mcp.json")?.content ?? "{}");
+    // Claude Code expands ${VAR} from the user's environment at load time —
+    // the secret itself never lands in the plugin artifact.
+    expect(parsed.thredz.env.THREDZ_API_KEY).toBe("${THREDZ_API_KEY}");
+    expect(parsed.thredz.env.THREDZ_BASE_URL).toBe("https://thredz.example/api");
+    expect(parsed.remote.headers.Authorization).toBe("${API_TOKEN}");
+  });
 });
 
 describe("emitClaudePlugin — per-shape emission", () => {

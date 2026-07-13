@@ -67,7 +67,7 @@ import {
 } from "@crewhaus/infra-utils";
 import { GENERATED_README_MARKER, type IrBudget } from "@crewhaus/ir";
 import { createLogger } from "@crewhaus/logging";
-import { McpHost } from "@crewhaus/mcp-host";
+import { McpHost, resolveMcpServerConfig } from "@crewhaus/mcp-host";
 import {
   captureFacts,
   createMemoryStore,
@@ -3829,7 +3829,9 @@ async function runRunCli(
     const host = new McpHost({ logger });
     mcpHost = host;
     for (const [name, cfg] of Object.entries(ir.mcp_servers)) {
-      host.addServer(name, cfg);
+      // 0.3.0 — env/header values are IrSecretRef; resolve them from the
+      // interpreter process's environment (fail-fast, names the variable).
+      host.addServer(name, resolveMcpServerConfig(cfg, { name }));
     }
     const tempCatalog = new ToolCatalog();
     for (const t of tools) tempCatalog.register(t);
@@ -13247,7 +13249,7 @@ async function runMcpDoctor(args: ParsedArgs): Promise<void> {
   let driftDetected = false;
   if (wantProbe) {
     const specPath = join(cwd, "crewhaus.yaml");
-    let mcpServers: Record<string, import("@crewhaus/mcp-host").McpServerConfig> = {};
+    let mcpServers: Record<string, import("@crewhaus/ir").IrMcpServerConfig> = {};
     if (existsSync(specPath)) {
       try {
         const ir = lower(parseSpec(readFileSync(specPath, "utf-8")));
@@ -13259,10 +13261,26 @@ async function runMcpDoctor(args: ParsedArgs): Promise<void> {
     if (Object.keys(mcpServers).length > 0) {
       mkdirSync(mcpDir, { recursive: true });
       const host = new McpHost({ logger });
-      for (const [name, cfg] of Object.entries(mcpServers)) host.addServer(name, cfg);
+      for (const [name, cfg] of Object.entries(mcpServers)) {
+        // 0.3.0 — env/header values are IrSecretRef; an unresolvable env
+        // ref becomes a per-server probe failure (named variable) rather
+        // than crashing the whole doctor run.
+        try {
+          host.addServer(name, resolveMcpServerConfig(cfg, { name }));
+        } catch (err) {
+          driftEntries.push({
+            server: name,
+            lines: [
+              `  ✗ ${name}: probe failed — ${err instanceof Error ? err.message : String(err)}`,
+            ],
+          });
+          driftDetected = true;
+        }
+      }
+      const probeNames = Object.keys(mcpServers).filter((name) => host.has(name));
       const nowIso = new Date().toISOString();
       await Promise.all(
-        Object.keys(mcpServers).map(async (name) => {
+        probeNames.map(async (name) => {
           const lines: string[] = [];
           try {
             const client = host.getClient(name);

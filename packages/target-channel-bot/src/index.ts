@@ -359,11 +359,16 @@ function renderMcpServers(ir: IrChannelV0): {
     return { imports: [], bootBlock: "", cleanupBlock: "", hasAny: false };
   }
   const imports = [
-    `import { McpHost } from "@crewhaus/mcp-host";`,
+    `import { McpHost, resolveMcpServerConfig } from "@crewhaus/mcp-host";`,
     `import { registerMcpServer } from "@crewhaus/tool-mcp";`,
   ];
+  // 0.3.0 — embed the UNRESOLVED IrSecretRef-valued config and resolve at
+  // daemon boot (mirror of target-cli's renderMcpServers; keep in sync).
   const addLines = entries
-    .map(([name, cfg]) => `mcpHost.addServer(${escapeJsonString(name)}, ${JSON.stringify(cfg)});`)
+    .map(
+      ([name, cfg]) =>
+        `mcpHost.addServer(${escapeJsonString(name)}, resolveMcpServerConfig(${JSON.stringify(cfg)}, { name: ${escapeJsonString(name)} }));`,
+    )
     .join("\n");
   const registerLines = entries
     .map(
