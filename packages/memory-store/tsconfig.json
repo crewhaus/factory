@@ -4,6 +4,6 @@
     "rootDir": "src",
     "outDir": "dist"
   },
-  "references": [{ "path": "../errors" }],
+  "references": [{ "path": "../errors" }, { "path": "../embedder" }],
   "include": ["src/**/*"]
 }

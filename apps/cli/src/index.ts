@@ -72,7 +72,8 @@ import {
   captureFacts,
   createMemoryStore,
   deriveMemoryDecision,
-  summarizeDurableFacts,
+  summarizeDurableFactsWithEvidence,
+  turnsFromEvents,
 } from "@crewhaus/memory-store";
 import {
   BUILTIN_DEFAULT_RULES,
@@ -622,6 +623,17 @@ import {
   safeMcpFileName,
   scoreMcpHealth,
 } from "./mcp-doctor";
+// 0.3.0 memory release (design §3.4) — `crewhaus memory list|show|forget|sweep`
+// helpers + the `crewhaus migrate memories` schema-v2 backfill.
+import {
+  MEMORIES_SUBDIR,
+  formatMigrateMemoriesReport,
+  listMemorySpecs,
+  migrateMemories,
+  renderMemoryList,
+  renderMemoryShow,
+  resolveMemorySpec,
+} from "./memory-cli";
 // Item 24 — market scan + doctor --models + pricing sync core, in a
 // side-effect-free module (this entry file runs an argv switch on import).
 import {
@@ -1556,6 +1568,33 @@ const SESSIONS_SCHEMA: ParseArgsSchema = {
   ],
 };
 
+// 0.3.0 memory release (design §3.4) — `crewhaus memory list|show|forget|sweep`.
+const MEMORY_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // Which spec's memory file to operate on. `list`/`sweep` default to every
+    // file under .crewhaus/memories/; `show`/`forget` auto-resolve only when a
+    // single file exists.
+    { name: "spec", takesValue: true },
+    // forget — a text query instead of an exact id (forgets EVERY match).
+    { name: "query", short: "q", takesValue: true },
+    // forget / sweep --compact — skip the confirmation prompt (scripted/CI).
+    { name: "yes", takesValue: false },
+    // sweep — additionally rewrite the file(s) dropping tombstoned/expired
+    // lines (atomic tmp+rename; the growth-bounding compaction).
+    { name: "compact", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
+// 0.3.0 memory release — `crewhaus migrate memories [--dry-run]`: backfill
+// schemaVersion + derivable provenance onto v1 entries, stamp .crewhaus/meta.json.
+const MIGRATE_MEMORIES_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "dry-run", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
 // Item 12 — the dataset-registry CLI face (`datasets list|get|put`).
 const DATASETS_SCHEMA: ParseArgsSchema = {
   flags: [
@@ -2078,6 +2117,13 @@ function usageText(): string {
     "  lessons update [--sessions N|all]    mine corrections + failures into an auto-loaded LESSONS.md (#56)",
     "       [--low-score F] [-o <LESSONS.md>]  + per-user prefs under .crewhaus/preferences/",
     "  sessions summarize [--before <date>] summarize sessions into a durable index before TTL eviction (#57)",
+    "  memory list [--spec <name>]          inspect the per-spec fact stores: id/age/tags/provenance/status",
+    "  memory show <mem_id>                 full detail for one memory (provenance, expiry, supersededBy)",
+    "  memory forget <mem_id>|--query <q>   explicitly forget memories (append-only supersede tombstones;",
+    "       [--spec <name>] [--yes]             a query forgets EVERY match; prompts unless --yes)",
+    "  memory sweep [--compact] [--yes]     tombstone TTL-expired memories; --compact rewrites the file",
+    "                                       dropping dead lines (atomic; the growth-bounding compaction)",
+    "  migrate memories [--dry-run]         backfill the v2 memory schema + provenance; stamps .crewhaus/meta.json",
     "       [--evicted] [--ttl-days N]        --evicted indexes each session just before it is deleted",
     "  datasets list                        all registered datasets + versions (Section 29)",
     "  datasets get <name>[@version]        print a dataset's samples as JSONL",
@@ -4154,9 +4200,16 @@ async function runRunCli(
               const events = parseJsonlObjects(
                 readFileSync(sessionJsonlPath(sessionId), "utf-8"),
               ) as Array<{ kind?: string; payload?: unknown }>;
-              const turns = deriveTurns(events);
-              const facts = summarizeDurableFacts(turns);
-              const written = await captureFacts(memoryStore, facts, ["auto-capture", sessionId]);
+              // v2 proof-linked capture: turnsFromEvents (the shared extractor)
+              // carries each turn's successful tool_result ids so captured
+              // facts land with provenance {sessionId, evidence: toolUseIds}.
+              // The sessionId tag is kept for back-compat/grep (and it is what
+              // `crewhaus migrate memories` derives provenance from on v1 files).
+              const turns = turnsFromEvents(events);
+              const facts = summarizeDurableFactsWithEvidence(turns);
+              const written = await captureFacts(memoryStore, facts, ["auto-capture", sessionId], {
+                sessionId,
+              });
               if (written.length > 0) {
                 process.stdout.write(
                   `[memory] auto-captured ${written.length} durable fact(s) into ${memoryStore.path()}\n`,
@@ -10116,6 +10169,187 @@ async function runSessions(args: ParsedArgs): Promise<void> {
   process.stdout.write(`[sessions] summarized ${indexed} session(s) into ${indexDir}\n`);
 }
 
+// -------- 0.3.0 memory release: crewhaus memory + migrate memories --------
+
+/**
+ * `crewhaus memory list|show <id>|forget <id|--query <q>>|sweep [--compact]`
+ * (design §3.4) — inspect and explicitly forget the per-spec fact stores
+ * under `.crewhaus/memories/`. Forgetting is append-only (supersede
+ * tombstones, never a hard delete); `sweep --compact` is the growth-bounding
+ * rewrite. Destructive verbs prompt unless `--yes`. NOTE: `clear|restore`
+ * (trash + undo) deliberately do NOT live here — they arrive with the
+ * continuity store (design §2.6).
+ */
+async function runMemory(args: ParsedArgs): Promise<void> {
+  const action = args.positional[0];
+  if (args.flags["help"] === true && action === undefined) {
+    process.stdout.write(
+      "usage: crewhaus memory list [--spec <name>]\n" +
+        "       crewhaus memory show <mem_id> [--spec <name>]\n" +
+        "       crewhaus memory forget <mem_id> | --query <q> [--spec <name>] [--yes]\n" +
+        "       crewhaus memory sweep [--compact] [--spec <name>] [--yes]\n" +
+        "  Inspect + explicitly forget the per-spec memory stores under .crewhaus/memories/.\n" +
+        "  forget appends supersede tombstones (append-only; never a hard delete); a --query\n" +
+        "  forgets EVERY matching memory. sweep tombstones TTL-expired entries; --compact\n" +
+        "  additionally rewrites the file dropping dead lines (atomic tmp+rename).\n",
+    );
+    return;
+  }
+  const memoriesDir = join(process.cwd(), MEMORIES_SUBDIR);
+  const nowMs = Date.now();
+  const specFlag = strFlag(args, "spec");
+  const assumeYes = args.flags["yes"] === true;
+  const storeFor = (specName: string): ReturnType<typeof createMemoryStore> =>
+    createMemoryStore({ specName, rootDir: memoriesDir });
+  const confirmOrDie = async (prompt: string): Promise<boolean> => {
+    if (assumeYes) return true;
+    if (process.stdin.isTTY !== true) {
+      die(`memory ${action}: refusing a destructive operation without --yes in a non-TTY session`);
+    }
+    return await promptYesNo(prompt);
+  };
+
+  switch (action) {
+    case "list": {
+      const specs =
+        specFlag !== undefined
+          ? [resolveMemorySpec(memoriesDir, specFlag)]
+          : listMemorySpecs(memoriesDir);
+      if (specs.length === 0) die(`no memory files under ${memoriesDir}`);
+      for (const spec of specs) {
+        const items = await storeFor(spec).list();
+        for (const line of renderMemoryList(spec, items, nowMs)) {
+          process.stdout.write(`${line}\n`);
+        }
+      }
+      return;
+    }
+    case "show": {
+      const id = args.positional[1];
+      if (id === undefined) die("usage: crewhaus memory show <mem_id> [--spec <name>]");
+      const specs =
+        specFlag !== undefined
+          ? [resolveMemorySpec(memoriesDir, specFlag)]
+          : listMemorySpecs(memoriesDir);
+      for (const spec of specs) {
+        const item = (await storeFor(spec).list()).find((i) => i.entry.id === id);
+        if (item !== undefined) {
+          process.stdout.write(`spec:          ${spec}\n`);
+          for (const line of renderMemoryShow(item)) process.stdout.write(`${line}\n`);
+          return;
+        }
+      }
+      die(`no memory with id ${id} under ${memoriesDir}`);
+      return;
+    }
+    case "forget": {
+      const id = args.positional[1];
+      const query = strFlag(args, "query");
+      if ((id === undefined) === (query === undefined)) {
+        die("memory forget: provide exactly one of <mem_id> or --query <q>");
+      }
+      if (id !== undefined && !/^mem_[0-9a-f]{16}$/.test(id)) {
+        die(`memory forget: "${id}" is not a memory id (mem_…) — text goes via --query`);
+      }
+      const spec = resolveMemorySpec(memoriesDir, specFlag);
+      const store = storeFor(spec);
+      // Preview the exact match set forget() will tombstone: for an id the
+      // live entry, for a query every positive BM25 match (recall's set).
+      const items = await store.list();
+      const matches =
+        id !== undefined
+          ? items.filter((i) => i.status === "live" && i.entry.id === id)
+          : (await store.recall(query as string, 10_000)).map((r) => ({
+              entry: r.entry,
+              status: "live" as const,
+            }));
+      if (matches.length === 0) {
+        process.stdout.write(
+          `[memory] nothing to forget — no live memory matched ${id ?? `"${query}"`} in ${spec}\n`,
+        );
+        return;
+      }
+      process.stdout.write(`[memory] will forget ${matches.length} memory(ies) from ${spec}:\n`);
+      for (const line of renderMemoryList(spec, matches, nowMs).slice(1)) {
+        process.stdout.write(`${line}\n`);
+      }
+      const go = await confirmOrDie(`forget ${matches.length} memory(ies) from ${spec}? [y/N] `);
+      if (!go) {
+        process.stdout.write("[memory] aborted — nothing forgotten\n");
+        return;
+      }
+      const forgotten = await store.forget((id ?? query) as string, {
+        reason: "crewhaus memory forget",
+      });
+      process.stdout.write(
+        `[memory] forgot ${forgotten.length} memory(ies) (superseded tombstones in ${store.path()})\n`,
+      );
+      return;
+    }
+    case "sweep": {
+      const specs =
+        specFlag !== undefined
+          ? [resolveMemorySpec(memoriesDir, specFlag)]
+          : listMemorySpecs(memoriesDir);
+      if (specs.length === 0) die(`no memory files under ${memoriesDir}`);
+      for (const spec of specs) {
+        const result = await storeFor(spec).sweep();
+        process.stdout.write(
+          `[memory] ${spec}: swept ${result.swept} expired memory(ies), ${result.live} live\n`,
+        );
+      }
+      if (args.flags["compact"] === true) {
+        const go = await confirmOrDie(
+          `compact ${specs.length} memory file(s) (rewrites dropping tombstoned/expired lines)? [y/N] `,
+        );
+        if (!go) {
+          process.stdout.write("[memory] compact aborted — files untouched\n");
+          return;
+        }
+        for (const spec of specs) {
+          const result = await storeFor(spec).compact();
+          process.stdout.write(
+            `[memory] ${spec}: compacted — kept ${result.kept} line(s), dropped ${result.dropped}\n`,
+          );
+        }
+      }
+      return;
+    }
+    default:
+      die(`memory: unknown action "${action ?? ""}" — supported: list, show, forget, sweep`);
+  }
+}
+
+/**
+ * `crewhaus migrate memories [--dry-run]` — the schema-v2 backfill over
+ * `.crewhaus/memories/*.jsonl` via the Section-28 migration-engine chain:
+ * stamps `schemaVersion: 2` on v1 entries, derives `provenance.sessionId`
+ * where the v1 auto-capture tags carry it, preserves every other line
+ * verbatim, and records the store version in `.crewhaus/meta.json`.
+ * Idempotent — a re-run migrates 0 entries.
+ */
+async function runMigrateMemories(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"] === true) {
+    process.stdout.write(
+      "usage: crewhaus migrate memories [--dry-run]\n" +
+        "  Backfill the v2 memory-entry schema (schemaVersion + derivable provenance)\n" +
+        "  onto .crewhaus/memories/*.jsonl and stamp .crewhaus/meta.json. Idempotent;\n" +
+        "  --dry-run reports the plan without writing.\n",
+    );
+    return;
+  }
+  const report = migrateMemories(process.cwd(), {
+    dryRun: args.flags["dry-run"] === true,
+  });
+  if (report.files.length === 0) {
+    process.stdout.write(
+      `[migrate] no memory files under ${join(process.cwd(), MEMORIES_SUBDIR)} — nothing to do\n`,
+    );
+    return;
+  }
+  for (const line of formatMigrateMemoriesReport(report)) process.stdout.write(`${line}\n`);
+}
+
 // -------- item 4: crewhaus graders suggest --------
 
 /**
@@ -14914,6 +15148,33 @@ switch (subcommand) {
       throw err;
     }
     break;
+  case "memory":
+    // 0.3.0 memory release (design §3.4) — inspect/forget/sweep the per-spec
+    // fact stores. Structured failures route through die().
+    try {
+      await runMemory(parseFor(rest, MEMORY_SCHEMA));
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
+    break;
+  case "migrate": {
+    // 0.3.0 memory release — `migrate memories`: the v2 schema backfill over
+    // .crewhaus/memories/. Spec migrations stay on migrate-all/upgrade.
+    const migrateAction = rest[0] ?? "";
+    if (migrateAction !== "memories") {
+      die(
+        `migrate action must be "memories" (got "${migrateAction}") — spec migrations use migrate-all/upgrade`,
+      );
+    }
+    try {
+      await runMigrateMemories(parseFor(rest.slice(1), MIGRATE_MEMORIES_SCHEMA));
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
+    break;
+  }
   case "scaffold-evals":
     // Mirror `run`'s policy: structured failures (SpecParseError, model
     // routing/auth on the one-shot generation call) extend CrewhausError —
