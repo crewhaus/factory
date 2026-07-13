@@ -86,13 +86,94 @@
     "expectedKind": "fail"
   },
   {
-    "label": "real Anthropic 401 unauthorized (treated as unknown → fail)",
+    "label": "real Anthropic 401 unauthorized (v0.3.0: auth → halt)",
     "shape": {
       "name": "AuthenticationError",
       "status": 401,
       "error": { "type": "authentication_error", "message": "invalid x-api-key" },
       "message": "401 Unauthorized"
     },
-    "expectedKind": "fail"
+    "expectedKind": "halt"
+  },
+  {
+    "label": "real Anthropic 403 permission_error (v0.3.0: auth → halt)",
+    "shape": {
+      "name": "PermissionDeniedError",
+      "status": 403,
+      "error": {
+        "type": "permission_error",
+        "message": "Your API key does not have permission to use the specified resource."
+      },
+      "message": "403 Forbidden"
+    },
+    "expectedKind": "halt"
+  },
+  {
+    "label": "real Anthropic out-of-credit 400 (v0.3.0: billing → halt, no tombstone detour)",
+    "shape": {
+      "name": "BadRequestError",
+      "status": 400,
+      "error": {
+        "type": "invalid_request_error",
+        "message": "Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."
+      },
+      "message": "400 Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."
+    },
+    "expectedKind": "halt"
+  },
+  {
+    "label": "real OpenAI 429 insufficient_quota (v0.3.0: billing → halt, no backoff retries)",
+    "shape": {
+      "name": "RateLimitError",
+      "status": 429,
+      "code": "insufficient_quota",
+      "error": {
+        "message": "You exceeded your current quota, please check your plan and billing details. For more information on this error, read the docs: https://platform.openai.com/docs/guides/error-codes/api-errors.",
+        "type": "insufficient_quota",
+        "param": null,
+        "code": "insufficient_quota"
+      },
+      "message": "429 You exceeded your current quota, please check your plan and billing details."
+    },
+    "expectedKind": "halt"
+  },
+  {
+    "label": "real Anthropic 429 rate_limit_error (v0.3.0: rate_limit → retry)",
+    "shape": {
+      "name": "RateLimitError",
+      "status": 429,
+      "error": {
+        "type": "rate_limit_error",
+        "message": "Number of request tokens has exceeded your per-minute rate limit."
+      },
+      "message": "429 rate_limit_error"
+    },
+    "expectedKind": "retry"
+  },
+  {
+    "label": "HTTP 402 payment required (v0.3.0: billing → halt)",
+    "shape": {
+      "name": "APIError",
+      "status": 402,
+      "message": "402 Payment Required"
+    },
+    "expectedKind": "halt"
+  },
+  {
+    "label": "AdapterError-wrapped OpenAI insufficient_quota (PR 2: top-level code slot holds the ErrorCode \"adapter\"; the envelope code must not be shadowed)",
+    "shape": {
+      "name": "AdapterError",
+      "code": "adapter",
+      "providerId": "openai",
+      "status": 429,
+      "error": {
+        "message": "You exceeded your current quota, please check your plan and billing details.",
+        "type": "insufficient_quota",
+        "param": null,
+        "code": "insufficient_quota"
+      },
+      "message": "429 You exceeded your current quota, please check your plan and billing details."
+    },
+    "expectedKind": "halt"
   }
 ]
