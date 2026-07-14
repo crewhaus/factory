@@ -181,12 +181,29 @@ function isStreamOptionsRejection(err: unknown): boolean {
 /**
  * Normalise OpenAI errors into the shape `recovery-engine.classify()`
  * already understands. OpenAI's status codes overlap directly:
- *   - 429 → overloaded_or_5xx (rate limit)
+ *   - 429 → billing (code "insufficient_quota") or rate_limit (any other)
  *   - 5xx → overloaded_or_5xx
  *   - 400 with "context length" → prompt_too_long
  *   - other 400 → invalid_request
- * We translate by setting `error.type` to the matching Anthropic
+ *   - 401/402/403 → status passthrough (classify() → auth / billing)
+ * 5xx and 400s translate by setting `error.type` to the matching Anthropic
  * vocabulary so classify() catches them.
+ *
+ * v0.3.0 Goal 6 (PR 2) — the discriminating fields ride the wrapper so an
+ * out-of-funds account is no longer conflated with a transient overload:
+ *   - `error.code` (on the copied API body envelope, where classify() reads
+ *     it): OpenAI encodes "insufficient_quota" (out of funds — terminal) vs
+ *     "rate_limit_exceeded" (transient) on otherwise-identical 429s; the
+ *     pre-0.3.0 blanket `overloaded_error` stamp erased that distinction
+ *     and burned five futile backoff retries against an empty account.
+ *     The SDK's top-level `code` is grafted into the envelope when the body
+ *     didn't carry one — it must NOT land on the wrapper's own `code`,
+ *     which is CrewhausError's closed ErrorCode union ("adapter").
+ *   - `error.message` feeds FailureReport `detail` ("OpenAI said: …").
+ *   - `headers`: the SDK exposes no parsed retry-after field, only the raw
+ *     response headers — copying them through is the Retry-After
+ *     passthrough (recovery-engine's `retryAfterMs()` reads
+ *     `headers["retry-after"]` when delaying a rate_limit retry).
  */
 function normaliseOpenAIError(err: unknown): unknown {
   const name = (err as { name?: unknown })?.name;
@@ -194,30 +211,47 @@ function normaliseOpenAIError(err: unknown): unknown {
 
   const message = err instanceof Error ? err.message : String(err);
   const wrapped = new AdapterError("openai", message, err);
-  const e = err as { status?: unknown; message?: unknown; code?: unknown };
+  const e = err as {
+    status?: unknown;
+    message?: unknown;
+    code?: unknown;
+    error?: unknown;
+    headers?: unknown;
+  };
   const status = typeof e.status === "number" ? e.status : undefined;
+  // The wrapper is duck-typed by recovery-engine.classify(); these are plain
+  // runtime properties, so cast once and assign.
+  const w = wrapped as unknown as {
+    status?: number;
+    error?: unknown;
+    headers?: unknown;
+  };
 
-  // OpenAI's rate-limit and overloaded responses share status 429.
-  if (status === 429) {
-    (wrapped as unknown as { status: number }).status = 429;
-    (wrapped as unknown as { error: { type: string } }).error = { type: "overloaded_error" };
-  } else if (status !== undefined && status >= 500 && status < 600) {
-    (wrapped as unknown as { status: number }).status = status;
-    (wrapped as unknown as { error: { type: string } }).error = { type: "overloaded_error" };
+  if (status !== undefined) w.status = status;
+  const body = e.error !== null && typeof e.error === "object" ? e.error : undefined;
+  const sdkCode = typeof e.code === "string" ? e.code : undefined;
+  if (body !== undefined) {
+    const bodyCode = (body as { code?: unknown }).code;
+    w.error =
+      typeof bodyCode === "string" || sdkCode === undefined ? body : { ...body, code: sdkCode };
+  } else if (sdkCode !== undefined) {
+    w.error = { code: sdkCode };
+  }
+  if (e.headers !== null && typeof e.headers === "object") w.headers = e.headers;
+
+  // Shape-stamping is now needed only where OpenAI's own vocabulary doesn't
+  // discriminate. 429s are deliberately NOT stamped: status + code already
+  // route them (classify() → billing for insufficient_quota, rate_limit
+  // otherwise), and 401/402/403 pass through on status alone.
+  if (status !== undefined && status >= 500 && status < 600) {
+    w.error = { type: "overloaded_error" };
   } else if (
     status === 400 &&
     /context length|maximum context|too long|exceeds the model/i.test(message)
   ) {
-    (wrapped as unknown as { status: number }).status = 400;
-    (wrapped as unknown as { error: { type: string; message: string } }).error = {
-      type: "invalid_request_error",
-      message: "Prompt is too long",
-    };
+    w.error = { type: "invalid_request_error", message: "Prompt is too long" };
   } else if (status === 400) {
-    (wrapped as unknown as { status: number }).status = 400;
-    (wrapped as unknown as { error: { type: string } }).error = { type: "invalid_request_error" };
-  } else if (status !== undefined) {
-    (wrapped as unknown as { status: number }).status = status;
+    w.error = { type: "invalid_request_error" };
   }
 
   return wrapped;

@@ -136,6 +136,9 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/token-budget": "workspace:*",
       },
+      "devDependencies": {
+        "@crewhaus/recovery-engine": "workspace:*",
+      },
       "optionalDependencies": {
         "@anthropic-ai/vertex-sdk": "^0.17.0",
       },
@@ -149,6 +152,9 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/token-budget": "workspace:*",
       },
+      "devDependencies": {
+        "@crewhaus/recovery-engine": "workspace:*",
+      },
     },
     "packages/adapter-gemini": {
       "name": "@crewhaus/adapter-gemini",
@@ -159,6 +165,9 @@
         "@crewhaus/token-budget": "workspace:*",
         "@google/genai": "^1.6.0",
       },
+      "devDependencies": {
+        "@crewhaus/recovery-engine": "workspace:*",
+      },
     },
     "packages/adapter-openai": {
       "name": "@crewhaus/adapter-openai",
@@ -168,6 +177,9 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/token-budget": "workspace:*",
         "openai": "^4.65.0",
+      },
+      "devDependencies": {
+        "@crewhaus/recovery-engine": "workspace:*",
       },
     },
     "packages/agent-context-isolation": {

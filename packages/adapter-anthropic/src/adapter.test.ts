@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type Anthropic from "@anthropic-ai/sdk";
 import { AdapterError } from "@crewhaus/errors";
+import { classify, initialRecoveryState, recover, retryAfterMs } from "@crewhaus/recovery-engine";
 import { AnthropicAdapter, createAnthropicAdapter } from "./adapter.js";
 import { CLAUDE_CODE_SYSTEM_PREFIX } from "./client.js";
 import type { ProviderRequest, StreamEvent } from "./types.js";
@@ -582,5 +583,130 @@ describe("AnthropicAdapter", () => {
     test("throws ProviderAuthError when no credentials present", () => {
       expect(() => createAnthropicAdapter({})).toThrow(/no Anthropic credentials/);
     });
+  });
+});
+
+// ===========================================================================
+// v0.3.0 Goal 6 (PR 2) — billing / auth / rate-limit discrimination,
+// end-to-end through normaliseAnthropicError → recovery-engine. Fixtures
+// pin the REAL Anthropic SDK APIError field layout (status / error envelope
+// / name / headers as a fetch Headers instance).
+// ===========================================================================
+describe("Goal 6 — Anthropic error discrimination (via stream())", () => {
+  async function streamError(sdkErr: unknown): Promise<unknown> {
+    const client = {
+      messages: {
+        create: (() => {
+          throw sdkErr;
+        }) as unknown as Anthropic["messages"]["create"],
+      },
+    } as unknown as Anthropic;
+    const a = new AnthropicAdapter({ client, isOAuth: false });
+    try {
+      for await (const _ev of a.stream(REQ)) void _ev;
+    } catch (err) {
+      return err;
+    }
+    throw new Error("expected stream() to throw");
+  }
+
+  /** Real Anthropic out-of-credit 400 (BadRequestError). */
+  const CREDIT_BALANCE_400 = () =>
+    Object.assign(
+      new Error(
+        "400 Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.",
+      ),
+      {
+        name: "BadRequestError",
+        status: 400,
+        error: {
+          type: "invalid_request_error",
+          message:
+            "Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.",
+        },
+        headers: new Headers({ "request-id": "req_abc" }),
+      },
+    );
+
+  test("credit-balance 400 survives normalisation intact → classify() billing", async () => {
+    const err = await streamError(CREDIT_BALANCE_400());
+    expect(err).toBeInstanceOf(AdapterError);
+    expect((err as AdapterError).providerId).toBe("anthropic");
+    expect((err as { status?: number }).status).toBe(400);
+    expect((err as { error?: { type?: string } }).error?.type).toBe("invalid_request_error");
+    expect(classify(err)).toBe("billing");
+  });
+
+  test("credit-balance 400 → recover() halts with the billing report (exit 31, Anthropic attribution)", async () => {
+    const err = await streamError(CREDIT_BALANCE_400());
+    const action = recover(err, initialRecoveryState);
+    expect(action.kind).toBe("halt");
+    if (action.kind !== "halt") return;
+    expect(action.report.class).toBe("billing");
+    expect(action.report.exitCode).toBe(31);
+    expect(action.report.detail).toContain("Anthropic said:");
+    expect(action.report.detail).toContain("Your credit balance is too low");
+    expect(action.report.remediation).toContain("console.anthropic.com");
+  });
+
+  test("401 AuthenticationError → classify() auth → halt (exit 30)", async () => {
+    const err = await streamError(
+      Object.assign(new Error("401 invalid x-api-key"), {
+        name: "AuthenticationError",
+        status: 401,
+        error: { type: "authentication_error", message: "invalid x-api-key" },
+      }),
+    );
+    expect((err as { status?: number }).status).toBe(401);
+    expect(classify(err)).toBe("auth");
+    const action = recover(err, initialRecoveryState);
+    expect(action.kind).toBe("halt");
+    if (action.kind !== "halt") return;
+    expect(action.report.exitCode).toBe(30);
+  });
+
+  test("403 PermissionDeniedError → classify() auth", async () => {
+    const err = await streamError(
+      Object.assign(new Error("403 Forbidden"), {
+        name: "PermissionDeniedError",
+        status: 403,
+        error: {
+          type: "permission_error",
+          message: "Your API key does not have permission to use the specified resource.",
+        },
+      }),
+    );
+    expect(classify(err)).toBe("auth");
+  });
+
+  test("429 rate_limit_error copies headers → Retry-After honored (Headers instance)", async () => {
+    const err = await streamError(
+      Object.assign(new Error("429 rate limited"), {
+        name: "RateLimitError",
+        status: 429,
+        error: {
+          type: "rate_limit_error",
+          message: "Number of request tokens has exceeded your per-minute rate limit.",
+        },
+        headers: new Headers({ "retry-after": "7" }),
+      }),
+    );
+    expect(classify(err)).toBe("rate_limit");
+    expect(retryAfterMs(err)).toBe(7_000);
+    const action = recover(err, initialRecoveryState);
+    expect(action).toEqual({ kind: "retry", delayMs: 7_000, attempt: 1 });
+  });
+
+  test("regression: 529 overloaded keeps its shape and retry semantics", async () => {
+    const err = await streamError(
+      Object.assign(new Error("529 Overloaded"), {
+        name: "APIError",
+        status: 529,
+        error: { type: "overloaded_error", message: "Overloaded" },
+      }),
+    );
+    expect((err as { error?: { type?: string } }).error?.type).toBe("overloaded_error");
+    expect(classify(err)).toBe("overloaded_or_5xx");
+    expect(recover(err, initialRecoveryState).kind).toBe("retry");
   });
 });
