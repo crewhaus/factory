@@ -186,3 +186,22 @@ describe("emitCrew — failureTaxonomy field (item 23)", () => {
     expect(daemon?.content ?? "").not.toContain("failureTaxonomy:");
   });
 });
+
+describe("emitCrew — terminal-failure reporting (0.3.0 Goal 6)", () => {
+  test("daemon renders the structured report and exits coded in both catch sites", () => {
+    const daemon = emitCrew(minimalIr).files.find((f) => f.path === "daemon.ts")?.content ?? "";
+    expect(daemon).toContain(
+      'import { formatRunFailure, toFailureReport } from "@crewhaus/errors";',
+    );
+    // The crew.run loop catch AND main().catch both render the report.
+    const occurrences = daemon.split("toFailureReport(err)").length - 1;
+    expect(occurrences).toBe(2);
+    expect(daemon).toContain(
+      'process.stderr.write(`${formatRunFailure(__report, { prefix: "[crew]" })}\\n`);',
+    );
+    expect(daemon).toContain("process.exit(__report.exitCode);");
+    // The pre-0.3.0 bare one-liners are gone.
+    expect(daemon).not.toContain("[crew] error: ${");
+    expect(daemon).not.toContain("[crew] fatal: ${");
+  });
+});

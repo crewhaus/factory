@@ -176,7 +176,9 @@ mcp_servers:
     args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
 `).files[0]?.content ?? "";
 
-    expect(content).toContain('import { McpHost } from "@crewhaus/mcp-host";');
+    expect(content).toContain(
+      'import { McpHost, resolveMcpServerConfig } from "@crewhaus/mcp-host";',
+    );
     expect(content).toContain('import { registerMcpServer } from "@crewhaus/tool-mcp";');
     expect(content).toContain('import { defaultCatalog } from "@crewhaus/tool-catalog";');
     expect(content).toContain("new McpHost();");
@@ -221,7 +223,111 @@ mcp_servers:
     expect(content).not.toContain("@crewhaus/tool-mcp");
     expect(content).not.toContain("McpHost");
     expect(content).not.toContain("disconnectAll");
-    expect(content).not.toContain("try {");
+    // NOTE: `try {` is no longer MCP-specific — every cli bundle wraps its
+    // runChatLoop in the 0.3.0 Goal 6 terminal-failure catch. Only the MCP
+    // cleanup adds a `finally`.
+    expect(content).not.toContain("} finally {");
+  });
+});
+
+describe("mcp_servers env/header secret lowering (0.3.0)", () => {
+  const mcpSpec = (envBlock: string) => `
+name: hello
+target: cli
+agent:
+  model: claude-sonnet-4-6
+  instructions: be helpful
+mcp_servers:
+  thredz:
+    transport: stdio
+    command: npx
+    args: ["-y", "thredz-mcp@0.2.0"]
+    env:
+${envBlock}
+`;
+
+  const sseSpec = (headersBlock: string) => `
+name: hello
+target: cli
+agent:
+  model: claude-sonnet-4-6
+  instructions: be helpful
+mcp_servers:
+  remote:
+    transport: sse
+    url: https://mcp.example.com/sse
+    headers:
+${headersBlock}
+`;
+
+  const cliMcp = (yaml: string) => {
+    const ir = lower(parseSpec(yaml));
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    return ir.mcp_servers;
+  };
+
+  test("a plain-string env value stays a literal ref", () => {
+    const servers = cliMcp(mcpSpec('      LOG_LEVEL: "debug"'));
+    const cfg = servers["thredz"];
+    if (cfg?.transport !== "stdio") throw new Error("expected stdio");
+    expect(cfg.env?.["LOG_LEVEL"]).toEqual({ kind: "literal", value: "debug" });
+  });
+
+  test("a $UPPER_SNAKE env value lowers to an env ref (no longer baked verbatim)", () => {
+    const servers = cliMcp(mcpSpec("      THREDZ_API_KEY: $THREDZ_API_KEY"));
+    const cfg = servers["thredz"];
+    if (cfg?.transport !== "stdio") throw new Error("expected stdio");
+    expect(cfg.env?.["THREDZ_API_KEY"]).toEqual({ kind: "env", name: "THREDZ_API_KEY" });
+  });
+
+  test("a malformed $ref under a credential-shaped env key fails compilation", () => {
+    expect(() => cliMcp(mcpSpec('      THREDZ_API_KEY: "$thredz_key"'))).toThrow(
+      /mcp_servers\.thredz\.env\.THREDZ_API_KEY/,
+    );
+    expect(() => cliMcp(mcpSpec('      MY_TOKEN: "${THREDZ_API_KEY}"'))).toThrow(
+      /\$UPPER_SNAKE_CASE/,
+    );
+  });
+
+  test("a malformed $ref under a NON-credential env key stays a permissive literal", () => {
+    const servers = cliMcp(mcpSpec('      DB_PATH: "$HOME/data.db"'));
+    const cfg = servers["thredz"];
+    if (cfg?.transport !== "stdio") throw new Error("expected stdio");
+    expect(cfg.env?.["DB_PATH"]).toEqual({ kind: "literal", value: "$HOME/data.db" });
+  });
+
+  test("sse header values lower through the same machinery", () => {
+    const servers = cliMcp(sseSpec("      Authorization: $THREDZ_API_KEY\n      X-Trace: on"));
+    const cfg = servers["remote"];
+    if (cfg?.transport !== "sse") throw new Error("expected sse");
+    expect(cfg.headers?.["Authorization"]).toEqual({ kind: "env", name: "THREDZ_API_KEY" });
+    expect(cfg.headers?.["X-Trace"]).toEqual({ kind: "literal", value: "on" });
+  });
+
+  test("Authorization / x-api-key headers are credential-shaped: malformed $refs fail fast", () => {
+    expect(() => cliMcp(sseSpec('      Authorization: "$bearerToken"'))).toThrow(
+      /mcp_servers\.remote\.headers\.Authorization/,
+    );
+    expect(() => cliMcp(sseSpec('      x-api-key: "$apiKey"'))).toThrow(
+      /mcp_servers\.remote\.headers\.x-api-key/,
+    );
+  });
+
+  test("the emitted bundle embeds the UNRESOLVED ref and resolves at boot — never the secret", () => {
+    const content =
+      compile(mcpSpec("      THREDZ_API_KEY: $THREDZ_API_KEY")).files[0]?.content ?? "";
+    expect(content).toContain(
+      'import { McpHost, resolveMcpServerConfig } from "@crewhaus/mcp-host";',
+    );
+    expect(content).toContain('"env":{"THREDZ_API_KEY":{"kind":"env","name":"THREDZ_API_KEY"}}');
+    expect(content).toContain("resolveMcpServerConfig(");
+    expect(content).toContain('{ name: "thredz" }');
+  });
+
+  test("the generated README lists an mcp env ref in the env-var section (collectSecretRefs)", () => {
+    const bundle = compile(mcpSpec("      THREDZ_API_KEY: $THREDZ_API_KEY"));
+    const readme = bundle.files.find((f) => f.path === "README.md")?.content ?? "";
+    expect(readme).toContain("- `THREDZ_API_KEY`");
   });
 });
 

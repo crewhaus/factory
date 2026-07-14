@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { ProviderRequest, StreamEvent } from "@crewhaus/adapter-anthropic";
 import { AdapterError, ProviderAuthError } from "@crewhaus/errors";
+import { classify, initialRecoveryState, recover, retryAfterMs } from "@crewhaus/recovery-engine";
 import type OpenAI from "openai";
 import { OpenAIAdapter, createAzureOpenAIAdapter, createOpenAIAdapter } from "./adapter.js";
 
@@ -177,7 +178,9 @@ describe("OpenAIAdapter", () => {
     }
     expect(caught).toBeInstanceOf(AdapterError);
     expect((caught as { status?: number }).status).toBe(429);
-    expect((caught as { error?: { type?: string } }).error?.type).toBe("overloaded_error");
+    // v0.3.0 Goal 6 — 429s are no longer stamped `overloaded_error`; the
+    // bare status is the rate-limit discriminator classify() reads.
+    expect((caught as { error?: { type?: string } }).error).toBeUndefined();
   });
 
   test("stream() wraps a mid-stream iteration error", async () => {
@@ -397,6 +400,160 @@ describe("normaliseOpenAIError (via stream())", () => {
     expect(err).toBeInstanceOf(AdapterError);
     expect((err as AdapterError).message).toBe("just a string");
     expect((err as { status?: number }).status).toBeUndefined();
+  });
+
+  // =========================================================================
+  // v0.3.0 Goal 6 (PR 2) — error discrimination, end-to-end through
+  // recovery-engine. Fixtures pin the REAL OpenAI SDK APIError field layout
+  // (status / code / error body / headers as a lowercased plain record).
+  // =========================================================================
+
+  /** Real OpenAI out-of-funds 429 — RateLimitError, code insufficient_quota. */
+  const INSUFFICIENT_QUOTA_429 = () =>
+    Object.assign(
+      new Error("429 You exceeded your current quota, please check your plan and billing details."),
+      {
+        name: "RateLimitError",
+        status: 429,
+        code: "insufficient_quota",
+        param: null,
+        type: "insufficient_quota",
+        error: {
+          message:
+            "You exceeded your current quota, please check your plan and billing details. For more information on this error, read the docs: https://platform.openai.com/docs/guides/error-codes/api-errors.",
+          type: "insufficient_quota",
+          param: null,
+          code: "insufficient_quota",
+        },
+        headers: { "x-request-id": "req_123" },
+      },
+    );
+
+  /** Real OpenAI transient rate limit — same 429, code rate_limit_exceeded. */
+  const RATE_LIMIT_EXCEEDED_429 = () =>
+    Object.assign(new Error("429 Rate limit reached for gpt-4o-mini"), {
+      name: "RateLimitError",
+      status: 429,
+      code: "rate_limit_exceeded",
+      param: null,
+      type: "requests",
+      error: {
+        message:
+          "Rate limit reached for gpt-4o-mini in organization org-x on requests per min (RPM): Limit 3, Used 3, Requested 1. Please try again in 20s.",
+        type: "requests",
+        param: null,
+        code: "rate_limit_exceeded",
+      },
+      headers: { "retry-after": "20", "x-ratelimit-remaining-requests": "0" },
+    });
+
+  test("429 insufficient_quota keeps the envelope code, no overloaded stamp → classify() billing", async () => {
+    const err = await streamError(INSUFFICIENT_QUOTA_429());
+    expect(err).toBeInstanceOf(AdapterError);
+    expect((err as AdapterError).providerId).toBe("openai");
+    expect((err as { status?: number }).status).toBe(429);
+    expect((err as { error?: { code?: string } }).error?.code).toBe("insufficient_quota");
+    // The wrapper's own top-level `code` is CrewhausError's ErrorCode slot —
+    // provider codes must NOT clobber it.
+    expect((err as AdapterError).code).toBe("adapter");
+    expect(classify(err)).toBe("billing");
+  });
+
+  test("a proxy 429 whose body lacks `code` still grafts the SDK top-level code into the envelope", async () => {
+    const err = await streamError(
+      Object.assign(new Error("429 quota exceeded"), {
+        status: 429,
+        code: "insufficient_quota",
+        error: { message: "quota exceeded", type: "insufficient_quota" },
+      }),
+    );
+    expect((err as { error?: { code?: string } }).error?.code).toBe("insufficient_quota");
+    expect(classify(err)).toBe("billing");
+  });
+
+  test("429 insufficient_quota → recover() halts with the billing report (exit 31, OpenAI attribution)", async () => {
+    const err = await streamError(INSUFFICIENT_QUOTA_429());
+    const action = recover(err, initialRecoveryState);
+    expect(action.kind).toBe("halt");
+    if (action.kind !== "halt") return;
+    expect(action.report.class).toBe("billing");
+    expect(action.report.exitCode).toBe(31);
+    expect(action.report.detail).toContain("OpenAI said:");
+    expect(action.report.detail).toContain("You exceeded your current quota");
+    expect(action.report.remediation).toContain("platform.openai.com");
+  });
+
+  test("429 rate_limit_exceeded → classify() rate_limit, Retry-After threaded via headers", async () => {
+    const err = await streamError(RATE_LIMIT_EXCEEDED_429());
+    expect((err as { status?: number }).status).toBe(429);
+    expect((err as { error?: { code?: string } }).error?.code).toBe("rate_limit_exceeded");
+    expect(classify(err)).toBe("rate_limit");
+    // The SDK exposes no parsed retry-after — the copied headers record is
+    // the passthrough recovery-engine reads (20s → 20000ms).
+    expect(retryAfterMs(err)).toBe(20_000);
+    const action = recover(err, initialRecoveryState);
+    expect(action).toEqual({ kind: "retry", delayMs: 20_000, attempt: 1 });
+  });
+
+  test("401 passes through on status → classify() auth (no overloaded stamp)", async () => {
+    const err = await streamError(
+      Object.assign(new Error("401 Incorrect API key provided: sk-bad."), {
+        name: "AuthenticationError",
+        status: 401,
+        code: "invalid_api_key",
+        error: {
+          message:
+            "Incorrect API key provided: sk-bad. You can find your API key at https://platform.openai.com/account/api-keys.",
+          type: "invalid_request_error",
+          param: null,
+          code: "invalid_api_key",
+        },
+      }),
+    );
+    expect((err as { status?: number }).status).toBe(401);
+    expect(classify(err)).toBe("auth");
+    const action = recover(err, initialRecoveryState);
+    expect(action.kind).toBe("halt");
+    if (action.kind !== "halt") return;
+    expect(action.report.class).toBe("auth");
+    expect(action.report.exitCode).toBe(30);
+    expect(action.report.detail).toContain("Incorrect API key provided");
+  });
+
+  test("403 passes through on status → classify() auth", async () => {
+    const err = await streamError(
+      Object.assign(new Error("403 Country not supported"), {
+        name: "PermissionDeniedError",
+        status: 403,
+      }),
+    );
+    expect((err as { status?: number }).status).toBe(403);
+    expect(classify(err)).toBe("auth");
+  });
+
+  test("402 passes through on status → classify() billing", async () => {
+    const err = await streamError(
+      Object.assign(new Error("402 Payment Required"), { status: 402 }),
+    );
+    expect((err as { status?: number }).status).toBe(402);
+    expect(classify(err)).toBe("billing");
+  });
+
+  test("regression: 500/503 keep the exact overloaded shape and retry semantics", async () => {
+    for (const status of [500, 503]) {
+      const err = await streamError(Object.assign(new Error("upstream sad"), { status }));
+      expect((err as { status?: number }).status).toBe(status);
+      expect((err as { error?: unknown }).error).toEqual({ type: "overloaded_error" });
+      expect(classify(err)).toBe("overloaded_or_5xx");
+      expect(recover(err, initialRecoveryState).kind).toBe("retry");
+    }
+  });
+
+  test("regression: plain 400 keeps the exact invalid_request shape (tombstone path)", async () => {
+    const err = await streamError(Object.assign(new Error("bad parameter foo"), { status: 400 }));
+    expect((err as { error?: unknown }).error).toEqual({ type: "invalid_request_error" });
+    expect(classify(err)).toBe("invalid_request");
+    expect(recover(err, initialRecoveryState).kind).toBe("tombstone");
   });
 });
 

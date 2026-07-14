@@ -8,6 +8,10 @@
  *     `@crewhaus/tool-mcp.registerMcpServer`).
  *   - reduced `callTool` result (text/image/audio/resource → string).
  *   - typed errors (`McpError` / `McpConnectionError` / `McpProtocolError`).
+ *   - boot-time secret-ref resolution (`resolveSecretRef` /
+ *     `resolveMcpServerConfig`) for compiler-lowered env/header refs, and a
+ *     stdio child env that merges `getDefaultEnvironment()` under explicit
+ *     keys so configured secrets survive the SDK's inherit allowlist.
  *
  * Limitation in v0: notifications/tools/list_changed is ignored — the
  * catalog is built once at boot. A future section can add a watcher.
@@ -18,6 +22,16 @@ export type { McpClientOptions, McpClientLikeTransport } from "./client.js";
 export { McpHost } from "./host.js";
 export type { McpHostOptions } from "./host.js";
 export { nextBackoffMs } from "./backoff.js";
+export { resolveSecretRef, resolveMcpServerConfig } from "./resolve.js";
+export type {
+  McpSecretRef,
+  McpSecretLike,
+  UnresolvedStdioServerConfig,
+  UnresolvedSseServerConfig,
+  UnresolvedMcpServerConfig,
+  ResolveSecretRefOptions,
+  ResolveMcpServerConfigOptions,
+} from "./resolve.js";
 export type {
   McpServerConfig,
   StdioServerConfig,
@@ -27,4 +41,4 @@ export type {
   McpCallResult,
   McpCallOptions,
 } from "./types.js";
-export { McpError, McpConnectionError, McpProtocolError } from "@crewhaus/errors";
+export { ConfigError, McpError, McpConnectionError, McpProtocolError } from "@crewhaus/errors";

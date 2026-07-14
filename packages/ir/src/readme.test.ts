@@ -202,12 +202,12 @@ describe("renderBundleReadme — MCP servers (item 42)", () => {
           transport: "stdio",
           command: "npx",
           args: ["mcp-github"],
-          env: { GITHUB_TOKEN: "ghp_leaky-literal" },
+          env: { GITHUB_TOKEN: { kind: "literal", value: "ghp_leaky-literal" } },
         },
         search: {
           transport: "sse",
           url: "https://mcp.example.com/sse",
-          headers: { Authorization: "Bearer leaky-header" },
+          headers: { Authorization: { kind: "literal", value: "Bearer leaky-header" } },
         },
       },
     });
@@ -217,6 +217,29 @@ describe("renderBundleReadme — MCP servers (item 42)", () => {
     expect(md).toContain("| `search` | sse | `https://mcp.example.com/sse` |");
     expect(md).not.toContain("ghp_leaky-literal");
     expect(md).not.toContain("leaky-header");
+  });
+
+  test("0.3.0 — mcp env/header refs land in the Environment variables section (collectSecretRefs walk)", () => {
+    const ir = baseCliIr({
+      mcp_servers: {
+        thredz: {
+          transport: "stdio",
+          command: "npx",
+          args: ["-y", "thredz-mcp@0.2.0"],
+          env: { THREDZ_API_KEY: { kind: "env", name: "THREDZ_API_KEY" } },
+        },
+        search: {
+          transport: "sse",
+          url: "https://mcp.example.com/sse",
+          headers: { Authorization: { kind: "env", name: "SEARCH_TOKEN" } },
+        },
+      },
+    });
+    const refs = collectSecretRefs(ir);
+    expect(refs.envNames).toEqual(["SEARCH_TOKEN", "THREDZ_API_KEY"]);
+    const md = renderBundleReadme(ir);
+    expect(md).toContain("- `THREDZ_API_KEY`");
+    expect(md).toContain("- `SEARCH_TOKEN`");
   });
 
   test("the section is omitted when no MCP servers are configured", () => {

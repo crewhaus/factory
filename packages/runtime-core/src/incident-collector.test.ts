@@ -79,6 +79,23 @@ describe("classifyIncidentTrigger", () => {
       "justification_deny_storm",
     );
   });
+  test("run_failed (0.3.0 Goal 6) triggers unconditionally with the class + exit in the reason", () => {
+    const t = classifyIncidentTrigger(
+      {
+        kind: "run_failed",
+        class: "billing",
+        message: 'provider account out of funding: Anthropic said: "credit balance too low"',
+        remediation: "add credits, then rerun.",
+        exitCode: 31,
+      } as TraceEvent,
+      0,
+    );
+    expect(t?.kind).toBe("run_failed");
+    expect(t?.triggeredBy).toBe("run_failed");
+    expect(t?.reason).toBe(
+      'run failed (billing, exit 31): provider account out of funding: Anthropic said: "credit balance too low"',
+    );
+  });
 });
 
 describe("incidentDirName", () => {
