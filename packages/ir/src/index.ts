@@ -276,19 +276,82 @@ export type IrFeedback = {
 };
 
 /**
+ * v0.3.0 §3.1/§9 — the wiki (semantic tier) config, lowered from
+ * `spec.memory.wiki`. Presence (with `enabled` not `false`) registers the
+ * thredz-vocabulary `wiki_*` tools over `@crewhaus/wiki-store`. Every field
+ * is carried only when the spec declared it (absent-when-omitted).
+ */
+export type IrMemoryWiki = {
+  readonly enabled?: boolean;
+  /** Wiki hits fused into auto-recall (1–50). */
+  readonly recallK?: number;
+  /** `@crewhaus/embedder` factory grammar — enables hybrid recall on both
+   *  the wiki and the fact store. */
+  readonly embedder?: string;
+  /** Fuse wiki recall into the session-start memory bundle. */
+  readonly autoRecall?: boolean;
+  /** Learning-mode write governance: `wiki_write` rejects bodies without a
+   *  `## Sources` heading. */
+  readonly requireSources?: boolean;
+};
+
+/**
  * Feature #53 — cross-session memory config, lowered from `spec.memory`.
  * Presence of the block wires Remember/Recall into the target; the auto-*
  * switches gate auto-capture (summarize durable outcomes at teardown) and
  * auto-recall (inject top-K memories into the system prompt at session start).
- * Carried on the interactive shapes that run a chat loop (IrV0/cli,
- * IrChannelV0, IrManagedV0, IrResearchV0). Absent when the spec omits `memory`.
+ * Carried on the agent-loop shapes (IrV0/cli, IrChannelV0, IrManagedV0,
+ * IrResearchV0, IrCrewV0). Absent when the spec omits `memory`.
+ *
+ * v0.3.0 (§9) extensions, all absent-when-omitted: `backend` (`file` |
+ * reserved `thredz`), `ttlMs` (explicit fact forgetting — `spec.memory.ttl`
+ * parsed to milliseconds at lower time, >= 1h enforced there), and `wiki`
+ * (see {@link IrMemoryWiki}).
  */
 export type IrMemory = {
   readonly enabled?: boolean;
+  readonly backend?: "file" | "thredz";
+  readonly ttlMs?: number;
   readonly autoCapture?: boolean;
   readonly autoCaptureThreshold?: number;
   readonly autoRecall?: boolean;
   readonly recallK?: number;
+  readonly wiki?: IrMemoryWiki;
+};
+
+/** v0.3.0 §2.7 — the RESOLVED continuity scope. `auto` is a compiler
+ *  concern: `lower()` resolves it per shape (cli/research/crew/managed →
+ *  `spec`, channel → `session`), so the IR never carries `auto`. */
+export type IrContinuityScope = "spec" | "session";
+
+/**
+ * v0.3.0 Goal 1 (§2.1/§9) — continuity config, lowered from the top-level
+ * `continuity:` block. THE release's one sanctioned default-on: on the five
+ * emit-wired agent-loop shapes (IrV0/cli, IrChannelV0, IrManagedV0,
+ * IrResearchV0, IrCrewV0) an ABSENT spec key lowers to the default-on config
+ * below, and only `continuity: false` (or `enabled: false`) removes this
+ * field — presence means enabled. Also carried, when the spec declares it,
+ * on IrWorkflowV0/IrBatchV0/IrVoiceV0/IrBrowserV0, whose emitters print the
+ * 0.2.3-convention ignored-note comment instead of wiring it.
+ *
+ * All fields except `focusMaxChars` are RESOLVED at lower time (defaults
+ * filled in: plan/ledger/handoff true, proof "ladder", scope per §2.7), so
+ * emitters and the interpreter read one deterministic shape.
+ */
+export type IrContinuity = {
+  /** Plan/goal persistence + the Plan and Goal tool families; `false`
+   *  keeps only FocusRead/FocusWrite + MemoryClear. */
+  readonly plan: boolean;
+  /** §2.4 proof-of-action: `ladder` (default) | `require` | `off`. */
+  readonly proof: "ladder" | "require" | "off";
+  /** §2.3 verbatim requirements ledger (context_evicted externalization). */
+  readonly ledger: boolean;
+  /** §2.8 deterministic teardown handoff.md. */
+  readonly handoff: boolean;
+  /** Resolved store scope (§2.7/§14.5). */
+  readonly scope: IrContinuityScope;
+  /** Hard cap on the mutable tail block. Absent → runtime default (4096). */
+  readonly focusMaxChars?: number;
 };
 
 /** Ops item 37 — a mitigation-ladder rung the runtime SLO monitor walks on a
@@ -409,6 +472,9 @@ export type IrV0 = {
   readonly feedback?: IrFeedback;
   /** #53 cross-session memory config. Optional; absent when the spec omits `memory`. */
   readonly memory?: IrMemory;
+  /** v0.3.0 Goal 1 — continuity config. DEFAULT-ON: present unless the spec
+   *  opted out with `continuity: false`. */
+  readonly continuity?: IrContinuity;
   /** Ops item 37 — SLO targets + mitigation ladder. Optional; absent when the
    *  spec omits the `observability` block. */
   readonly observability?: IrObservability;
@@ -451,6 +517,9 @@ export type IrWorkflowV0 = {
   readonly compaction: IrCompaction;
   /** Section 55 (Track A) — named failure taxonomy. Optional. */
   readonly failureTaxonomy?: IrFailureTaxonomy;
+  /** v0.3.0 — carried when the spec declares `continuity:` (NOT default-on
+   *  here); target-workflow prints the ignored-note comment. */
+  readonly continuity?: IrContinuity;
 };
 
 /**
@@ -681,6 +750,10 @@ export type IrChannelV0 = {
   readonly feedback?: IrFeedback;
   /** #53 cross-session memory config. Optional; absent when the spec omits `memory`. */
   readonly memory?: IrMemory;
+  /** v0.3.0 Goal 1 — continuity config. DEFAULT-ON: present unless the spec
+   *  opted out with `continuity: false`. `scope` resolves to `session` here
+   *  (per-conversation stores riding the session router's sessionId, §14.5). */
+  readonly continuity?: IrContinuity;
   /** Ops item 37 — SLO targets + mitigation ladder. Optional; absent when the
    *  spec omits the `observability` block. */
   readonly observability?: IrObservability;
@@ -730,6 +803,10 @@ export type IrManagedV0 = {
   readonly budget?: IrBudget;
   /** #53 cross-session memory config. Optional; absent when the spec omits `memory`. */
   readonly memory?: IrMemory;
+  /** v0.3.0 Goal 1 — continuity config. DEFAULT-ON: present unless the spec
+   *  opted out with `continuity: false`. `scope` resolves to `spec` here;
+   *  every store is tenant-fenced at boot (deps carry the tenant, §2.7). */
+  readonly continuity?: IrContinuity;
   /** Ops item 37 — SLO targets + mitigation ladder. Optional; absent when the
    *  spec omits the `observability` block. The managed daemon's `pause-intake`
    *  rung reuses its `budget_exceeded` 429 path. */
@@ -891,6 +968,13 @@ export type IrCrewV0 = {
   readonly compaction: IrCompaction;
   /** Section 55 (Track A) — named failure taxonomy. Optional. */
   readonly failureTaxonomy?: IrFailureTaxonomy;
+  /** #53/v0.3.0 — cross-session memory config (crew joins the carrying
+   *  shapes in 0.3.0; roles share the spec-scoped store). Optional. */
+  readonly memory?: IrMemory;
+  /** v0.3.0 Goal 1 — continuity config. DEFAULT-ON: present unless the spec
+   *  opted out with `continuity: false`. Roles share the `spec`-scoped plan
+   *  store — the plan IS the coordination surface (§2.7). */
+  readonly continuity?: IrContinuity;
   /** §47 cross-cutting blockchain subsystem (slice 0). All optional. */
   readonly chains?: readonly IrChainBinding[];
   readonly wallets?: readonly IrWalletBinding[];
@@ -939,6 +1023,9 @@ export type IrResearchV0 = {
   readonly failureTaxonomy?: IrFailureTaxonomy;
   /** #53 cross-session memory config. Optional; absent when the spec omits `memory`. */
   readonly memory?: IrMemory;
+  /** v0.3.0 Goal 1 — continuity config. DEFAULT-ON: present unless the spec
+   *  opted out with `continuity: false`. `scope` resolves to `spec` here. */
+  readonly continuity?: IrContinuity;
   /** §47 cross-cutting blockchain subsystem (slice 0). All optional. */
   readonly chains?: readonly IrChainBinding[];
   readonly wallets?: readonly IrWalletBinding[];
@@ -985,6 +1072,9 @@ export type IrBatchV0 = {
   readonly compaction: IrCompaction;
   /** Section 55 (Track A) — named failure taxonomy. Optional. */
   readonly failureTaxonomy?: IrFailureTaxonomy;
+  /** v0.3.0 — carried when the spec declares `continuity:` (NOT default-on
+   *  here); target-batch-worker prints the ignored-note comment. */
+  readonly continuity?: IrContinuity;
   /** §47 cross-cutting blockchain subsystem (slice 0). All optional. */
   readonly chains?: readonly IrChainBinding[];
   readonly wallets?: readonly IrWalletBinding[];
@@ -1031,6 +1121,9 @@ export type IrVoiceV0 = {
   readonly compaction: IrCompaction;
   /** Section 55 (Track A) — named failure taxonomy. Optional. */
   readonly failureTaxonomy?: IrFailureTaxonomy;
+  /** v0.3.0 — carried when the spec declares `continuity:` (NOT default-on
+   *  here); target-voice prints the ignored-note comment. */
+  readonly continuity?: IrContinuity;
 };
 
 /**
@@ -1069,6 +1162,9 @@ export type IrBrowserV0 = {
   readonly compaction: IrCompaction;
   /** Section 55 (Track A) — named failure taxonomy. Optional. */
   readonly failureTaxonomy?: IrFailureTaxonomy;
+  /** v0.3.0 — carried when the spec declares `continuity:` (NOT default-on
+   *  here); target-browser-driver prints the ignored-note comment. */
+  readonly continuity?: IrContinuity;
 };
 
 /** Discriminated union over every supported target IR. */

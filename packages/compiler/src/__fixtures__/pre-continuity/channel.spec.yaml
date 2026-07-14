@@ -1,0 +1,15 @@
+name: pin-channel
+target: channel
+agent:
+  model: claude-sonnet-4-6
+  instructions: |
+    Byte-restore pin fixture for the channel shape. Reply briefly.
+channels:
+  slack:
+    botToken: $PIN_SLACK_BOT_TOKEN
+    signingSecret: $PIN_SLACK_SIGNING_SECRET
+routing:
+  sessionKey: thread
+memory:
+  autoRecall: true
+  recallK: 3

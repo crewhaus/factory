@@ -20,12 +20,12 @@
  *
  * `MemoryWiringFragment` is a SERIALIZABLE value — an emitter can
  * `JSON.stringify` it into a bundle — describing what to wire. It is the
- * shape the future `IrMemory`/`IrContinuity` (design §9) lower INTO; PR 11
- * owns that threading, so this package deliberately does not import
- * `@crewhaus/ir`. The fragment carries only knobs this root actually wires —
- * no dead config: §9 fields whose engines land later (`dream`, wiki
- * `autoRecall`/`recallK`, continuity `proof`) join the fragment with their
- * PRs (14, 11, 11 respectively).
+ * shape `IrMemory`/`IrContinuity` (design §9) lower into via
+ * {@link memoryFragmentFromIr} (PR 11); this package stays structural and
+ * deliberately does not import `@crewhaus/ir`. The fragment carries only
+ * knobs this root actually wires — no dead config: `dream` joins with its
+ * engine (PR 14); continuity `proof` is the one carried-but-degraded field
+ * (see {@link ContinuityWiringFragment.proof}).
  *
  * ## What gets wired (feature → stores/tools/seams)
  *
@@ -135,26 +135,38 @@ export type MemoryFactsFragment = {
   readonly wiki?: WikiWiringFragment;
 };
 
-/** The `memory.wiki` slice (§3.1/§9). Carries only what is wired in PR 10;
- *  `recallK`/`autoRecall` join with the PR 11 emit threading. */
+/** The `memory.wiki` slice (§3.1/§9). */
 export type WikiWiringFragment = {
   readonly enabled?: boolean;
+  /** Wiki hits fused into the auto-recall bundle (default
+   *  {@link DEFAULT_WIKI_RECALL_K}) when `autoRecall` is on. */
+  readonly recallK?: number;
   /** Embedder factory grammar (`mock/deterministic`, `openai/…`) enabling
    *  hybrid recall on BOTH the wiki and the fact store. A structural
    *  `deps.embedder` wins over this. */
   readonly embedder?: string;
+  /** Fuse top-`recallK` wiki hits into the session-start `<recalled_memory>`
+   *  bundle (§3.4) — the seam's recall() returns fact lines + wiki lines. */
+  readonly autoRecall?: boolean;
   /** Learning-mode write governance (§3.3): `wiki_write` rejects bodies
    *  without a `## Sources` heading. The `learning:` lowering sets this. */
   readonly requireSources?: boolean;
 };
 
 /** The `continuity:` slice (§2.1/§9). `scope` arrives RESOLVED (`auto` is a
- *  compiler concern); `proof` joins when PR 11 threads `require`/`off`. */
+ *  compiler concern). */
 export type ContinuityWiringFragment = {
   readonly enabled?: boolean;
   /** Plan/goal persistence + the Plan/Goal tool families. `false` keeps
    *  only focus (FocusRead/FocusWrite) + MemoryClear. Default true. */
   readonly plan?: boolean;
+  /** §2.4 proof-of-action mode. `"ladder"` (the lowered default) is what
+   *  tool-plan implements: `claimed` is free, the `proven` transition is
+   *  machine-checked. `"require"`/`"off"` are CARRIED for forward compat but
+   *  degrade to the ladder with a boot note — enforcement needs a proof-mode
+   *  seam on tool-plan's `createPlanTools` (noted follow-up; this package
+   *  consumes the store/tool packages, it does not modify them). */
+  readonly proof?: "ladder" | "require" | "off";
   /** The §2.3 requirements ledger — threaded to the runtime seam. Default
    *  true. */
   readonly ledger?: boolean;
@@ -178,40 +190,94 @@ export type MemoryWiringFragment = {
   readonly continuity?: ContinuityWiringFragment;
 };
 
-/** Structural mirror of `IrMemory` (#53) — kept structural so this package
- *  never imports `@crewhaus/ir` (PR 11 owns the real IR threading). */
+/** Structural mirror of `IrMemory` (#53 + the v0.3.0 §9 extensions) — kept
+ *  structural so this package never imports `@crewhaus/ir`. */
 export type IrMemoryLike = {
   readonly enabled?: boolean;
+  readonly backend?: "file" | "thredz";
+  readonly ttlMs?: number;
   readonly autoCapture?: boolean;
   readonly autoCaptureThreshold?: number;
   readonly autoRecall?: boolean;
   readonly recallK?: number;
+  readonly wiki?: {
+    readonly enabled?: boolean;
+    readonly recallK?: number;
+    readonly embedder?: string;
+    readonly autoRecall?: boolean;
+    readonly requireSources?: boolean;
+  };
+};
+
+/** Structural mirror of `IrContinuity` (v0.3.0 §9) — the compiler lowers a
+ *  fully-RESOLVED shape (defaults filled in, `auto` scope resolved), so every
+ *  field but `focusMaxChars` is required there; this mirror keeps them
+ *  optional so hand-built fragments stay ergonomic. */
+export type IrContinuityLike = {
+  readonly plan?: boolean;
+  readonly proof?: "ladder" | "require" | "off";
+  readonly ledger?: boolean;
+  readonly handoff?: boolean;
+  readonly scope?: "spec" | "session";
+  readonly focusMaxChars?: number;
 };
 
 /**
- * Build the fragment from a lowered IR's `name` + `memory` block EXACTLY as
- * the pre-PR-10 `renderMemory` codegen read it — only fields the spec
- * declared are carried, so the serialized fragment (and therefore the
- * emitted bundle) stays minimal and deterministic. Shared by target-cli's
- * codegen and the `crewhaus run` interpreter so the two paths cannot drift.
+ * Build the fragment from a lowered IR's `name` + `memory` + `continuity`
+ * blocks EXACTLY as the pre-PR-10 `renderMemory` codegen read them — only
+ * fields the IR carries are serialized, so the fragment (and therefore the
+ * emitted bundle) stays minimal and deterministic. Shared by every target
+ * emitter and the `crewhaus run` interpreter so the paths cannot drift.
+ * Presence of `ir.continuity` means enabled (the compiler already dropped
+ * `continuity: false` at lower time).
  */
 export function memoryFragmentFromIr(ir: {
   readonly name: string;
   readonly memory?: IrMemoryLike;
+  readonly continuity?: IrContinuityLike;
 }): MemoryWiringFragment {
   const mem = ir.memory;
+  const wiki = mem?.wiki;
+  const cont = ir.continuity;
   return {
     specName: ir.name,
     ...(mem !== undefined
       ? {
           memory: {
             ...(mem.enabled !== undefined ? { enabled: mem.enabled } : {}),
+            ...(mem.backend !== undefined ? { backend: mem.backend } : {}),
+            ...(mem.ttlMs !== undefined ? { ttlMs: mem.ttlMs } : {}),
             ...(mem.autoCapture !== undefined ? { autoCapture: mem.autoCapture } : {}),
             ...(mem.autoCaptureThreshold !== undefined
               ? { autoCaptureThreshold: mem.autoCaptureThreshold }
               : {}),
             ...(mem.autoRecall !== undefined ? { autoRecall: mem.autoRecall } : {}),
             ...(mem.recallK !== undefined ? { recallK: mem.recallK } : {}),
+            ...(wiki !== undefined
+              ? {
+                  wiki: {
+                    ...(wiki.enabled !== undefined ? { enabled: wiki.enabled } : {}),
+                    ...(wiki.recallK !== undefined ? { recallK: wiki.recallK } : {}),
+                    ...(wiki.embedder !== undefined ? { embedder: wiki.embedder } : {}),
+                    ...(wiki.autoRecall !== undefined ? { autoRecall: wiki.autoRecall } : {}),
+                    ...(wiki.requireSources !== undefined
+                      ? { requireSources: wiki.requireSources }
+                      : {}),
+                  },
+                }
+              : {}),
+          },
+        }
+      : {}),
+    ...(cont !== undefined
+      ? {
+          continuity: {
+            ...(cont.plan !== undefined ? { plan: cont.plan } : {}),
+            ...(cont.proof !== undefined ? { proof: cont.proof } : {}),
+            ...(cont.ledger !== undefined ? { ledger: cont.ledger } : {}),
+            ...(cont.handoff !== undefined ? { handoff: cont.handoff } : {}),
+            ...(cont.scope !== undefined ? { scope: cont.scope } : {}),
+            ...(cont.focusMaxChars !== undefined ? { focusMaxChars: cont.focusMaxChars } : {}),
           },
         }
       : {}),
@@ -241,6 +307,12 @@ export type WireMemoryDeps = {
   readonly cwd: string;
   /** Tenant fencing (§2.7) — threaded to every store. */
   readonly tenant?: Tenant;
+  /** Where session `.jsonl` event logs live — proof-evidence verification
+   *  and the auto-capture transcript reads resolve against this. Default
+   *  `<cwd>/.crewhaus/sessions` (ignored under a tenant, whose own
+   *  sessionRoot governs). The eval runner points it at its per-sample
+   *  directory (§7.2 state isolation). */
+  readonly sessionRootDir?: string;
   /** The session id backing `continuity.scope: "session"` stores and the
    *  default session for proof-evidence refs. */
   readonly sessionScope?: string;
@@ -417,7 +489,7 @@ function wireFacts(fragment: MemoryWiringFragment, deps: WireMemoryDeps): WiredF
   // flag + recallK — the real completed-turn count gates capture at teardown
   // (both legacy paths did exactly this).
   const decision = deriveMemoryDecision(mem, Number.MAX_SAFE_INTEGER);
-  const sessionsDir = join(crewhausDirOf(deps), "sessions");
+  const sessionsDir = deps.sessionRootDir ?? join(crewhausDirOf(deps), "sessions");
 
   const memory: MemorySeam = {
     ...(decision.recall
@@ -537,7 +609,7 @@ export function wireContinuity(
       ? { tenant: deps.tenant }
       : {
           rootDir: join(deps.cwd, ".crewhaus", "state"),
-          sessionRootDir: join(deps.cwd, ".crewhaus", "sessions"),
+          sessionRootDir: deps.sessionRootDir ?? join(deps.cwd, ".crewhaus", "sessions"),
         }),
     scope,
     ...(deps.sessionScope !== undefined ? { sessionId: deps.sessionScope } : {}),
@@ -552,6 +624,17 @@ export function wireContinuity(
     ...(deps.appendEvent !== undefined ? { appendEvent: deps.appendEvent } : {}),
     ...(deps.now !== undefined ? { now: deps.now } : {}),
   });
+
+  // §2.4 proof mode: the ladder is what tool-plan implements today. The
+  // stricter/looser modes are carried through the fragment (spec → IR →
+  // here) but degrade to the ladder until tool-plan grows a proof-mode
+  // option — say so at boot instead of silently pretending (this package
+  // consumes the plan-store packages; it does not modify them).
+  if (cont.proof === "require" || cont.proof === "off") {
+    deps.log?.(
+      `[memory] continuity.proof "${cont.proof}" is carried but not enforced yet — running the default claimed→proven ladder (enforcement lands with tool-plan's proof-mode seam)\n`,
+    );
+  }
 
   const plan = cont.plan !== false;
   const tools = plan ? bundle.all : [bundle.focusRead, bundle.focusWrite, bundle.memoryClear];
@@ -726,6 +809,35 @@ export async function wireMemory(
     stores.wiki = wiki.store;
     tools.push(...wiki.tools);
     deps.log?.(`[memory] wiki on — ${wiki.store.path()}\n`);
+
+    // §3.4/§9 — wiki auto-recall: fuse top-`recallK` wiki hits into the
+    // session-start `<recalled_memory>` bundle. Explicit opt-in
+    // (`wiki.autoRecall: true`), mirroring the fact store's autoRecall
+    // semantics. The runtime classifies + delimiter-escapes the assembled
+    // block (the same path fact lines take), so recalled wiki bodies still
+    // flow through the boundary classifier before any model call.
+    const wikiFrag = fragment.memory?.wiki;
+    if (wikiFrag?.autoRecall === true) {
+      const wikiK = wikiFrag.recallK ?? DEFAULT_WIKI_RECALL_K;
+      const wikiStore = wiki.store;
+      const base = options.memory;
+      const baseRecall = base?.recall;
+      options = {
+        ...options,
+        memory: {
+          ...(base ?? {}),
+          autoRecall: true,
+          recall: async (query, k) => {
+            const factLines = baseRecall !== undefined ? await baseRecall(query, k) : [];
+            const hits = await wikiStore.recall(query, wikiK);
+            return [
+              ...factLines,
+              ...hits.map((h) => `[wiki:${h.ref.slug}] ${h.ref.title} — ${excerpt(h.body)}`),
+            ];
+          },
+        },
+      };
+    }
   }
 
   for (const tool of tools) {
@@ -733,4 +845,18 @@ export async function wireMemory(
   }
 
   return { stores, tools, options };
+}
+
+/** Default wiki hits fused into auto-recall (§9's `wiki.recallK: 6`). */
+const DEFAULT_WIKI_RECALL_K = 6;
+
+/** Cap on a fused wiki body inside the recall bundle — recall is a pointer
+ *  surface (`wiki_get` fetches the full article), not a article dump. */
+const WIKI_RECALL_EXCERPT_CHARS = 280;
+
+function excerpt(body: string): string {
+  const flat = body.replace(/\s+/g, " ").trim();
+  return flat.length > WIKI_RECALL_EXCERPT_CHARS
+    ? `${flat.slice(0, WIKI_RECALL_EXCERPT_CHARS)}…`
+    : flat;
 }

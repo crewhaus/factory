@@ -1,0 +1,13 @@
+name: pin-managed
+target: managed
+agent:
+  model: claude-sonnet-4-6
+  instructions: |
+    Byte-restore pin fixture for the managed-daemon shape.
+tenants:
+  - id: tenant-pin
+    budget:
+      maxInputTokens: 100000
+      maxOutputTokens: 20000
+memory:
+  autoRecall: true

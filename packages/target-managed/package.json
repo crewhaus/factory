@@ -2,7 +2,7 @@
   "name": "@crewhaus/target-managed",
   "version": "0.2.4",
   "type": "module",
-  "description": "Codegen for the MGD target — daemon.ts wiring gateway-server, policy-engine, tenancy, audit-log",
+  "description": "Codegen for the MGD target \u2014 daemon.ts wiring gateway-server, policy-engine, tenancy, audit-log",
   "main": "src/index.ts",
   "types": "src/index.ts",
   "exports": {
@@ -14,7 +14,8 @@
   "dependencies": {
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/infra-utils": "workspace:*",
-    "@crewhaus/ir": "workspace:*"
+    "@crewhaus/ir": "workspace:*",
+    "@crewhaus/memory-service": "workspace:*"
   },
   "license": "Apache-2.0",
   "author": {

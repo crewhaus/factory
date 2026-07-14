@@ -41,12 +41,17 @@ module:
 |---|---|---|---|---|
 | Episodic facts | [`@crewhaus/memory-store`](../memory-store) (v2: TTL, supersede tombstones, hybrid BM25+embedding recall, provenance) | `.crewhaus/memories/<spec>.jsonl` | `Remember` / `Recall` / `MemoryForget` (via [`@crewhaus/tool-memory`](../tool-memory)) | `options.memory` — autoRecall injection + provenance-stamping auto-capture |
 | Working memory | [`@crewhaus/continuity-store`](../continuity-store) (focus, REQ ledger, plans with the claimed→proven proof ladder, goals, handoff, trash/restore) | `.crewhaus/state/<spec>/` | `FocusRead/FocusWrite`, `PlanRead/PlanUpdate/PlanComplete`, `GoalWrite/GoalUpdate/GoalList`, `MemoryClear` (via [`@crewhaus/tool-plan`](../tool-plan)) | `options.continuity` — `loadPlan`/`onPlanDirty` (the §2.5 mutable tail), the §2.3 `ledger` flag, `onHandoff` |
-| Semantic knowledge | [`@crewhaus/wiki-store`](../wiki-store) (versioned articles, supersede-never-delete, optimistic concurrency, one-hop link expansion) | `.crewhaus/wiki/<spec>/` | the ten thredz-vocabulary `wiki_*` tools (via [`@crewhaus/tool-wiki`](../tool-wiki)) | tools only (wiki auto-recall threads in PR 11) |
+| Semantic knowledge | [`@crewhaus/wiki-store`](../wiki-store) (versioned articles, supersede-never-delete, optimistic concurrency, one-hop link expansion) | `.crewhaus/wiki/<spec>/` | the ten thredz-vocabulary `wiki_*` tools (via [`@crewhaus/tool-wiki`](../tool-wiki)) | `wiki.autoRecall: true` fuses top-`recallK` wiki hits into `options.memory`'s recall bundle (§3.4) |
 | Model discipline | [`@crewhaus/default-skills`](../default-skills) | compile-time-embedded SKILL.md / command bodies | — | `options.skills` / `options.slashCommands`, merged at lowest precedence |
 
-Consumers: [`@crewhaus/target-cli`](../target-cli) emits the call into
-compiled bundles; `apps/cli`'s `crewhaus run` makes the identical call on the
-interpreter path. [`@crewhaus/runtime-core`](../runtime-core) consumes the
+Consumers: all five agent-loop emitters — [`@crewhaus/target-cli`](../target-cli),
+[`@crewhaus/target-channel-bot`](../target-channel-bot) (per turn, session-scoped),
+[`@crewhaus/target-managed`](../target-managed) (per turn, tenant-fenced),
+[`@crewhaus/target-research-bundle`](../target-research-bundle) and
+[`@crewhaus/target-crew`](../target-crew) (once at boot) — emit the call into
+compiled bundles; `apps/cli`'s `crewhaus run` and the eval runner's default
+invoker (per sample, isolated under the sample dir — §7.2) make the identical
+call. [`@crewhaus/runtime-core`](../runtime-core) consumes the
 seams without ever importing a store.
 
 ## `wireMemory(fragment, deps)`
@@ -55,8 +60,8 @@ seams without ever importing a store.
 
 A **serializable** description of what to wire — emitters embed it as a JSON
 literal; the interpreter builds it with `memoryFragmentFromIr(ir)`. It is the
-shape the future `IrMemory`/`IrContinuity` (design §9) lower into; PR 11 owns
-that threading, so nothing here imports `@crewhaus/ir`.
+shape `IrMemory`/`IrContinuity` (design §9) lower into (PR 11); the mapping
+stays structural, so nothing here imports `@crewhaus/ir`.
 
 ```ts
 type MemoryWiringFragment = {
@@ -71,13 +76,16 @@ type MemoryWiringFragment = {
     recallK?: number;
     wiki?: {
       enabled?: boolean;
+      recallK?: number;            // wiki hits fused into auto-recall (default 6)
       embedder?: string;           // embedder factory grammar, e.g. "mock/deterministic"
+      autoRecall?: boolean;        // fuse wiki hits into the session-start recall bundle (§3.4)
       requireSources?: boolean;    // §3.3 write governance (the learning: lowering sets it)
     };
   };
   continuity?: {
     enabled?: boolean;
     plan?: boolean;                // false ⇒ only FocusRead/FocusWrite + MemoryClear
+    proof?: "ladder" | "require" | "off"; // §2.4 — require/off carried, degrade to the ladder (boot note)
     ledger?: boolean;              // §2.3 requirements ledger flag
     handoff?: boolean;             // deterministic teardown handoff.md
     scope?: "spec" | "session";   // "auto" is resolved by the compiler, not here
@@ -88,8 +96,10 @@ type MemoryWiringFragment = {
 
 The fragment carries **only knobs this root actually wires** — no dead
 config. §9 fields whose engines land later join with their PRs: `dream`
-(PR 14), wiki `recallK`/`autoRecall` and continuity `proof: require|off`
-(PR 11), `backend: "thredz"` implementations (PR 16).
+(PR 14), `backend: "thredz"` implementations (PR 16). The one carried-but-
+degraded field is `continuity.proof`: `require`/`off` need a proof-mode seam
+on tool-plan's `createPlanTools`, so until that lands they run the default
+claimed→proven ladder and say so in a boot note.
 
 ### The deps
 
@@ -98,6 +108,7 @@ type WireMemoryDeps = {
   catalog: { register(tool: RegisteredTool): void }; // defaultCatalog, or a shim
   cwd: string;                    // stores live under <cwd>/.crewhaus/
   tenant?: Tenant;                // §2.7 — re-roots + fences every store
+  sessionRootDir?: string;        // session-log root for proof/capture reads (§7.2 eval isolation)
   sessionScope?: string;          // session id for continuity scope "session"
   appendEvent?: (e: ContinuityEvent | WikiEvent) => void | Promise<void>;
   embedder?: { embed(texts) };    // beats memory.wiki.embedder

@@ -11,6 +11,7 @@ import {
   IrPassError,
   applyPasses,
   deadToolElimination,
+  memoryIntegrityPass,
   permissionRuleCanonicalize,
   promptCachePrefixSort,
   redundantMcpServerCollapse,
@@ -329,8 +330,8 @@ describe("ir-passes — applyPasses + idempotence (T9)", () => {
     expect(calls).toEqual(["a", "b"]);
   });
 
-  test("DEFAULT_PIPELINE has 6 passes (+ wellFormednessCheck from Track F §57)", () => {
-    expect(DEFAULT_PIPELINE.length).toBe(6);
+  test("DEFAULT_PIPELINE has 7 passes (+ memoryIntegrityPass from v0.3.0 PR 11)", () => {
+    expect(DEFAULT_PIPELINE.length).toBe(7);
   });
 });
 
@@ -471,5 +472,93 @@ describe("ir-passes — transactionPolicyEnforcement (T1, T8)", () => {
       compaction: {},
     };
     expect(transactionPolicyEnforcement(ir)).toBe(ir);
+  });
+});
+
+describe("ir-passes — memoryIntegrityPass (v0.3.0 PR 11)", () => {
+  const CONTINUITY = {
+    plan: true,
+    proof: "ladder" as const,
+    ledger: true,
+    handoff: true,
+    scope: "spec" as const,
+  };
+
+  test("no memory/continuity → returns input unchanged", () => {
+    const ir = makeCli();
+    expect(memoryIntegrityPass(ir)).toBe(ir);
+  });
+
+  test("valid memory + continuity pass through unchanged", () => {
+    const ir = makeCli({
+      memory: { autoRecall: true, ttlMs: 7_776_000_000, wiki: { recallK: 6 } },
+      continuity: CONTINUITY,
+    });
+    expect(memoryIntegrityPass(ir)).toBe(ir);
+  });
+
+  test("wiki.recallK out of 1–50 throws", () => {
+    expect(() => memoryIntegrityPass(makeCli({ memory: { wiki: { recallK: 0 } } }))).toThrow(
+      IrPassError,
+    );
+    expect(() => memoryIntegrityPass(makeCli({ memory: { wiki: { recallK: 51 } } }))).toThrow(
+      IrPassError,
+    );
+    expect(() => memoryIntegrityPass(makeCli({ memory: { wiki: { recallK: 2.5 } } }))).toThrow(
+      IrPassError,
+    );
+  });
+
+  test("ttlMs below the 1h floor throws (mirror of the compiler's rule)", () => {
+    expect(() => memoryIntegrityPass(makeCli({ memory: { ttlMs: 30 * 60 * 1000 } }))).toThrow(
+      IrPassError,
+    );
+    expect(() => memoryIntegrityPass(makeCli({ memory: { ttlMs: 60 * 60 * 1000 } }))).not.toThrow();
+  });
+
+  test('continuity.scope "session" only on shapes with session routing (channel)', () => {
+    expect(() =>
+      memoryIntegrityPass(makeCli({ continuity: { ...CONTINUITY, scope: "session" } })),
+    ).toThrow(IrPassError);
+    // The channel shape has the session router — session scope is legal there.
+    const channel = {
+      version: 0,
+      name: "ch",
+      target: "channel",
+      agent: { model: "m", instructions: "i" },
+      tools: [],
+      toolConfigs: {},
+      channels: {},
+      routing: { sessionKey: "thread" },
+      mcp_servers: {},
+      permissions: { rules: [] },
+      subAgents: [],
+      compaction: {},
+      continuity: { ...CONTINUITY, scope: "session" },
+    } as unknown as IrNode;
+    expect(memoryIntegrityPass(channel)).toBe(channel);
+  });
+
+  test("non-JSON-serializable blocks throw (emitters stringify the fragment)", () => {
+    const withDate = makeCli({
+      memory: { ttlMs: 60 * 60 * 1000 },
+      continuity: { ...CONTINUITY, focusMaxChars: new Date() as unknown as number },
+    });
+    expect(() => memoryIntegrityPass(withDate)).toThrow(IrPassError);
+  });
+
+  test("shapes without the fabric fields pass through untouched", () => {
+    const graph = {
+      version: 0,
+      name: "g",
+      target: "graph",
+      model: "m",
+      entry: "a",
+      nodes: [{ name: "a", instructions: "i", model: "m", tools: [], toolConfigs: {} }],
+      edges: [],
+      permissions: { rules: [] },
+      compaction: {},
+    } as unknown as IrNode;
+    expect(memoryIntegrityPass(graph)).toBe(graph);
   });
 });

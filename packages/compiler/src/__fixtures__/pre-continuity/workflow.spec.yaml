@@ -1,0 +1,7 @@
+name: pin-workflow
+target: workflow
+model: claude-sonnet-4-6
+steps:
+  - name: draft
+    instructions: |
+      Draft one paragraph about X.

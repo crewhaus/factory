@@ -1,0 +1,8 @@
+name: pin-voice
+target: voice
+agent:
+  model: claude-sonnet-4-6
+  instructions: |
+    Byte-restore pin fixture for the voice shape.
+voice:
+  provider: openai

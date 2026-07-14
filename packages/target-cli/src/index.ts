@@ -412,16 +412,34 @@ function renderAgent(ir: IrV0): string {
     : "";
   const permField = renderPermissionsField(ir);
 
+  // v0.3.0 Goal 1 — when the IR carries continuity (DEFAULT-ON unless the
+  // spec opted out with `continuity: false`), the composition root owns the
+  // skill/command surface: `wireMemory` merges the builtin continuity skill
+  // and slash commands at lowest precedence with the user's `~/.crewhaus` +
+  // project `.crewhaus` entries, and the bundle registers the Skill tool
+  // from THAT list — the bundle's own discovery would strand the builtin
+  // skill (advertised in the prompt with no tool able to load it).
+  const continuityOn = ir.continuity !== undefined;
+
   // Section 11 — extension surface. The generated bundle discovers hooks /
   // skills / slash commands at runtime from the user's `.crewhaus/`
   // workspace, mirroring `apps/cli`'s `runRun` behaviour. Always emitted
-  // so a compiled bundle has parity with the interpreter path.
-  const extensionImport = [
-    `import { loadHooks } from "@crewhaus/hooks-engine";`,
-    `import { discoverSkills, createSkillTool } from "@crewhaus/skills-registry";`,
-    `import { loadCommands } from "@crewhaus/slash-commands";`,
-  ].join("\n");
-  const extensionBoot = `const __cwd = process.cwd();
+  // so a compiled bundle has parity with the interpreter path. With
+  // continuity on, skills + commands come from `wireMemory` (below) instead.
+  const extensionImport = continuityOn
+    ? [
+        `import { loadHooks } from "@crewhaus/hooks-engine";`,
+        `import { createSkillTool } from "@crewhaus/skills-registry";`,
+      ].join("\n")
+    : [
+        `import { loadHooks } from "@crewhaus/hooks-engine";`,
+        `import { discoverSkills, createSkillTool } from "@crewhaus/skills-registry";`,
+        `import { loadCommands } from "@crewhaus/slash-commands";`,
+      ].join("\n");
+  const extensionBoot = continuityOn
+    ? `const __cwd = process.cwd();
+const __hooks = await loadHooks({ cwd: __cwd });`
+    : `const __cwd = process.cwd();
 const [__hooks, __skills, __slashCommands] = await Promise.all([
   loadHooks({ cwd: __cwd }),
   discoverSkills({ cwd: __cwd }),
@@ -429,9 +447,9 @@ const [__hooks, __skills, __slashCommands] = await Promise.all([
 ]);
 if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));`;
 
-  // Feature #53 — first-class `memory:` block. Its presence wires Remember/
-  // Recall into the catalog and — via the auto-* switches — the runtime's
-  // auto-recall + auto-capture seams. Mirrors apps/cli's runRunCli.
+  // Feature #53 / v0.3.0 Goal 1 — first-class `memory:` + `continuity:`
+  // blocks, wired through the ONE stable composition-root call. Mirrors
+  // apps/cli's runRunCli.
   const memory = renderMemory(ir);
 
   const mcpBoot = mcp.hasAny ? `${mcp.bootBlock}\n\n` : "";
@@ -640,26 +658,51 @@ function renderSloField(ir: IrV0): string {
 }
 
 /**
- * Feature #53 / v0.3.0 PR 10 — render the `memory:` block wiring. When the
- * spec declared a `memory` block (and did not disable it), emit ONE stable
- * composition-root call (design §1 principle 1): the fragment — serialized
- * from `ir.memory` exactly as the old inline codegen read it — goes to
- * `@crewhaus/memory-service`'s `wireMemory`, which constructs the store,
- * registers Remember/Recall/MemoryForget, and returns the runChatLoop
- * seams; the bundle spreads `__memWired.options` into the call. The
- * per-emitter store/seam templating this replaces lived only here (the
- * "keep in sync" mirrors were fiction); every future memory feature lands
- * in the service, not in codegen. Empty when the spec omits `memory` so
- * pre-existing bundles are byte-identical (test-pinned).
+ * Feature #53 / v0.3.0 PR 10+11 — render the memory-fabric wiring. When the
+ * IR carries a `memory` block (and did not disable it) and/or a `continuity`
+ * block (DEFAULT-ON in 0.3.0), emit ONE stable composition-root call
+ * (design §1 principle 1): the fragment — serialized via
+ * `memoryFragmentFromIr` — goes to `@crewhaus/memory-service`'s `wireMemory`,
+ * which constructs the stores, registers the tools, and returns the
+ * runChatLoop seams; the bundle spreads `__memWired.options` into the call.
+ * Every future memory feature lands in the service, not in codegen.
+ *
+ * Two emission shapes, byte-diff-pinned:
+ *   - memory only (a `continuity: false` spec) — EXACTLY the PR 10 bytes, so
+ *     the opt-out restores prior bundles verbatim (the release's compat
+ *     contract, design §12).
+ *   - continuity on — the call moves onto `__cwd`, and the bundle takes its
+ *     skills + slash commands from `wireMemory` (builtin `continuity` skill
+ *     and commands merged at lowest precedence) before registering the
+ *     Skill tool.
+ * Empty when the IR carries neither block, keeping opted-out bundles
+ * byte-identical (test-pinned).
  */
 function renderMemory(ir: IrV0): { imports: string[]; bootBlock: string; field: string } {
   const mem = ir.memory;
-  if (mem === undefined || mem.enabled === false) {
+  const memoryOn = mem !== undefined && mem.enabled !== false;
+  const continuityOn = ir.continuity !== undefined;
+  if (!memoryOn && !continuityOn) {
     return { imports: [], bootBlock: "", field: "" };
   }
   const imports = [`import { wireMemory } from "@crewhaus/memory-service";`];
-  const fragment = JSON.stringify(memoryFragmentFromIr(ir));
-  const bootBlock = `const __memWired = await wireMemory(${fragment}, { catalog: defaultCatalog, cwd: process.cwd() });`;
+  const fragment = JSON.stringify(
+    memoryFragmentFromIr({
+      name: ir.name,
+      ...(memoryOn ? { memory: ir.memory } : {}),
+      ...(continuityOn ? { continuity: ir.continuity } : {}),
+    }),
+  );
+  if (!continuityOn) {
+    // PR 10-pinned bytes: the `continuity: false` opt-out path.
+    const bootBlock = `const __memWired = await wireMemory(${fragment}, { catalog: defaultCatalog, cwd: process.cwd() });`;
+    const field = "\n  ...__memWired.options,";
+    return { imports, bootBlock, field };
+  }
+  const bootBlock = `const __memWired = await wireMemory(${fragment}, { catalog: defaultCatalog, cwd: __cwd });
+const __skills = __memWired.options.skills ?? [];
+const __slashCommands = __memWired.options.slashCommands ?? new Map();
+if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));`;
   const field = "\n  ...__memWired.options,";
   return { imports, bootBlock, field };
 }

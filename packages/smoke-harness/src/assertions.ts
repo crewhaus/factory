@@ -50,10 +50,24 @@ export const SHAPE_ASSERTIONS: readonly ShapeAssertion[] = [
       { in: "agent.ts", contains: "@crewhaus/runtime-core" },
       { in: "agent.ts", contains: "runChatLoop" },
       { in: "agent.ts", contains: "@crewhaus/tool-catalog" },
-      // Section 11 extension surface (hooks/skills/slash-commands) — load-bearing.
+      // Section 11 extension surface — hooks stay bundle-discovered; skills
+      // + slash commands come from the composition root since v0.3.0's
+      // default-on continuity (the builtin `continuity` skill merges at
+      // lowest precedence inside wireMemory).
       { in: "agent.ts", contains: "@crewhaus/hooks-engine" },
       { in: "agent.ts", contains: "@crewhaus/skills-registry" },
-      { in: "agent.ts", contains: "@crewhaus/slash-commands" },
+      // v0.3.0 Goal 1 — continuity is DEFAULT-ON: a spec WITHOUT a
+      // `continuity:` key wires the fabric (only `continuity: false`
+      // removes it — byte-diff-pinned in the compiler's tests).
+      { in: "agent.ts", contains: "@crewhaus/memory-service" },
+      { in: "agent.ts", contains: "const __memWired = await wireMemory(" },
+      { in: "agent.ts", contains: "...__memWired.options," },
+      {
+        in: "agent.ts",
+        contains:
+          '{"specName":"smoke-cli","continuity":{"plan":true,"proof":"ladder","ledger":true,"handoff":true,"scope":"spec"}}',
+        fixtureOnly: true,
+      },
       // 0.3.0 Goal 6 — the terminal-failure catch wrapper (the exact
       // "agent exited" fix): every cli bundle renders formatRunFailure and
       // exits with the report's coded status instead of an unhandled stack.
@@ -62,11 +76,11 @@ export const SHAPE_ASSERTIONS: readonly ShapeAssertion[] = [
       { in: "agent.ts", contains: "process.exit(__report.exitCode)" },
     ],
   },
-  // v0.3.0 PR 10 — the memory fabric's composition root. A `memory:` spec
+  // v0.3.0 PR 10/11 — the memory fabric's composition root. A `memory:` spec
   // must emit ONE stable wireMemory call (fragment serialized from the IR)
   // and spread the returned seams, instead of the retired per-emitter
-  // store/seam codegen. The no-memory cli fixture above stays byte-free of
-  // any memory wiring (its anchors would catch a stray import).
+  // store/seam codegen. With default-on continuity the fragment carries
+  // both blocks and the call anchors on the shared `__cwd`.
   {
     shape: "cli-memory",
     expectedFiles: ["README.md", "agent.ts"],
@@ -74,12 +88,13 @@ export const SHAPE_ASSERTIONS: readonly ShapeAssertion[] = [
       { in: "agent.ts", contains: "@crewhaus/memory-service" },
       { in: "agent.ts", contains: "const __memWired = await wireMemory(" },
       { in: "agent.ts", contains: "...__memWired.options," },
-      { in: "agent.ts", contains: "{ catalog: defaultCatalog, cwd: process.cwd() }" },
-      // The fragment round-trips the fixture's memory block verbatim.
+      { in: "agent.ts", contains: "{ catalog: defaultCatalog, cwd: __cwd }" },
+      // The fragment round-trips the fixture's memory block verbatim, plus
+      // the default-on continuity block the compiler resolved.
       {
         in: "agent.ts",
         contains:
-          '{"specName":"smoke-cli-memory","memory":{"autoCapture":true,"autoRecall":true,"recallK":4}}',
+          '{"specName":"smoke-cli-memory","memory":{"autoCapture":true,"autoRecall":true,"recallK":4},"continuity":{"plan":true,"proof":"ladder","ledger":true,"handoff":true,"scope":"spec"}}',
         fixtureOnly: true,
       },
       { in: "agent.ts", contains: "runChatLoop" },

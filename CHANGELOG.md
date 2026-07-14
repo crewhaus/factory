@@ -9,6 +9,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Continuity is ON BY DEFAULT — the release's one sanctioned behavior
+  change (0.3.0 Goal 1, PR 11).** Every agent-loop harness — **cli, channel,
+  managed, research, crew** — now compiles (and `crewhaus run`s) with the
+  continuity fabric wired without any spec change: persistent focus/plans/
+  goals with the claimed→proven proof ladder (FocusRead/FocusWrite,
+  PlanRead/PlanUpdate/PlanComplete, Goal*, MemoryClear), the §2.3 verbatim
+  requirements ledger, the deterministic teardown `handoff.md`, and the
+  builtin `continuity` skill + slash commands merged at lowest precedence.
+  **Opting out is one line — `continuity: false` — and restores your
+  previous bundle byte-for-byte** (pinned by a byte-diff test suite against
+  pre-PR-11 fixtures — default-on continuity is the only way recompiles
+  differ). The new top-level `continuity:` block accepts the
+  boolean shorthand or a strict object (`enabled`, `plan`, `proof:
+  ladder|require|off`, `ledger`, `handoff`, `scope: auto|spec|session`,
+  `focusMaxChars`); `scope: auto` resolves per shape at lower time —
+  cli/research/crew → `spec`, channel → per-conversation `session` stores
+  riding the session router's sessionId (heartbeat ticks read the daemon's
+  own `spec`-scoped agenda), managed → `spec` + tenant fencing at boot.
+  `proof: require|off` are carried (spec → `IrContinuity` → the wireMemory
+  fragment) but degrade to the ladder with a boot note until tool-plan grows
+  a proof-mode seam. workflow/batch/voice/browser specs may declare the
+  block (NOT default-on there) and compile with the 0.2.3-convention
+  `// note: continuity configured but ignored on <shape> in 0.3.0` comment;
+  graph/pipeline/eval/onchain/onchain-game reject it loudly (strict union).
+  Under `crewhaus eval` (and therefore the optimizer) every sample gets
+  ephemeral stores namespaced inside its own artifact directory, pinned by a
+  two-sample leak test — plan/focus/handoff from sample N never leaks into
+  sample N+1 (§7.2). A validation-only `memoryIntegrityPass` joins the
+  ir-passes DEFAULT_PIPELINE (`crewhaus lint`): wiki.recallK bounds, the ttl
+  floor, session-scope-only-on-channel, and fragment JSON-serializability
+  (the load-bearing copies of those rules live in `lower()` itself).
+
+- **`memory:` is now emit-wired on channel, managed, research, and crew —
+  and crew carries it for the first time (0.3.0 §9, PR 11).** The block was
+  previously parsed and lowered on channel/managed/research but silently
+  ignored by their emitters (only target-cli wired it); all four daemons now
+  make the same single `wireMemory` composition-root call as target-cli —
+  per turn with the conversation's `sessionScope` on channel, per turn with
+  the request's tenant on managed (stores tenant-fenced, §2.7), once at boot
+  on research (every branch shares the catalog) and crew (roles share the
+  spec-scoped stores through the orchestrator's new crew-wide
+  `extraTools`/`memory`/`continuity`/`skills` RunOptions — the plan IS the
+  coordination surface). The block itself gains the §9 extensions, all
+  optional and byte-neutral for existing specs: `backend: file|thredz`
+  (thredz reserved until PR 16), `ttl` (explicit fact forgetting as a
+  duration string — the shared duration grammar now accepts `d` for days,
+  e.g. `90d`, with a 1h floor enforced at compile time; `heartbeat.every`
+  accepts `d` too), and `wiki:` (`enabled`, `recallK`, `embedder`,
+  `autoRecall`, `requireSources`) — `wiki.autoRecall: true` fuses the
+  top-`recallK` wiki hits into the session-start recall bundle alongside
+  fact recall.
+
 - **Failure-taxonomy core: out-of-funding, bad-credential, and rate-limit
   errors are now classified instead of misrouted (0.3.0 Goal 6, PR 1).**
   `recovery-engine.classify()` gains three buckets ahead of the existing
@@ -386,6 +438,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   types and message prefixes (pinned by their existing lock tests).
 
 ### Changed
+
+- **Recompiling an agent-loop spec produces a different bundle than 0.2.x:
+  continuity is default-on** (see the headline entry above; sanctioned by
+  ROADMAP.md's pre-1.0 policy). Add `continuity: false` to restore the
+  previous bytes exactly. No other spec compiles differently unless it
+  declared a `memory:` block on channel/managed/research — that block was
+  dead config on those shapes and is now wired as documented.
 
 - **BREAKING (IR, pre-1.0):** `IrMcpStdioConfig.env` and
   `IrMcpSseConfig.headers` are now `Record<string, IrSecretRef>` instead of

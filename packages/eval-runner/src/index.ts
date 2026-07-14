@@ -27,8 +27,11 @@ import type { Sample } from "@crewhaus/eval-dataset";
 import type { CompiledGrader, Grader } from "@crewhaus/eval-grader";
 import { createJudgeGrader, loadRubric } from "@crewhaus/eval-judge";
 import type { IrV0 } from "@crewhaus/ir";
+import { memoryFragmentFromIr, wireMemory } from "@crewhaus/memory-service";
 import { runChatLoop } from "@crewhaus/runtime-core";
+import { createSkillTool } from "@crewhaus/skills-registry";
 import { currentTenantContext } from "@crewhaus/tenancy";
+import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { aggregate } from "./aggregate";
 import { RunnerError } from "./errors";
 import { runSample } from "./run-sample";
@@ -241,17 +244,62 @@ async function defaultInvoker(ir: IrV0, opts: RunEvalOptions): Promise<AgentInvo
     ir,
     opts.cwd !== undefined ? { cwd: opts.cwd } : {},
   );
+  // v0.3.0 §7.2 — eval/optimizer state ISOLATION. When the IR carries the
+  // memory fabric (an enabled `memory` block and/or `continuity`, which is
+  // DEFAULT-ON on the cli shape since 0.3.0), each sample gets its OWN
+  // ephemeral stores rooted under its per-sample artifact directory
+  // (`.crewhaus/evals/<runId>/<sampleId>/.crewhaus/…`): plan/focus/handoff/
+  // facts written by sample N must never leak into sample N+1 — Pillar 2
+  // assumes spec patches are the only cross-run channel. The per-sample
+  // `sessionRootDir` doubles as the fabric's session-log root so proof
+  // evidence resolves against the sample's own transcript, and `homeDir`
+  // is pinned inside the sample dir so the operator's `~/.crewhaus` skills
+  // can never bleed into a measurement.
+  const fabricOn =
+    (ir.memory !== undefined && ir.memory.enabled !== false) || ir.continuity !== undefined;
   return async (req) => {
+    let tools: RegisteredTool[] = [...wired.tools];
+    let skills = wired.skills;
+    let slashCommands = wired.slashCommands;
+    let memoryOpt: Parameters<typeof runChatLoop>[0]["memory"];
+    let continuityOpt: Parameters<typeof runChatLoop>[0]["continuity"];
+    if (fabricOn) {
+      const memWired = await wireMemory(memoryFragmentFromIr(ir), {
+        catalog: {
+          register: (tool) => {
+            tools.push(tool);
+          },
+        },
+        cwd: req.sessionRootDir,
+        sessionRootDir: req.sessionRootDir,
+        homeDir: req.sessionRootDir,
+      });
+      memoryOpt = memWired.options.memory;
+      continuityOpt = memWired.options.continuity;
+      if (memWired.options.skills !== undefined) {
+        // The fabric owns the skill surface (builtin `continuity` skill at
+        // lowest precedence): replace any Skill tool wireRunOnce registered
+        // so the tool list never advertises two.
+        skills = memWired.options.skills;
+        tools = tools.filter((t) => t.name !== "Skill");
+        if (skills.length > 0) tools.push(createSkillTool(skills));
+      }
+      if (memWired.options.slashCommands !== undefined) {
+        slashCommands = memWired.options.slashCommands;
+      }
+    }
     const agentOutput = await runChatLoop({
       model: wired.model,
       instructions: wired.instructions,
-      tools: [...wired.tools],
+      tools,
       hooks: wired.hooks,
-      skills: wired.skills,
-      slashCommands: wired.slashCommands,
+      skills,
+      slashCommands,
       ...(wired.subAgents !== undefined && wired.spawnSubAgent !== undefined
         ? { subAgents: wired.subAgents, spawnSubAgent: wired.spawnSubAgent }
         : {}),
+      ...(memoryOpt !== undefined ? { memory: memoryOpt } : {}),
+      ...(continuityOpt !== undefined ? { continuity: continuityOpt } : {}),
       permissionRules: wired.permissionRules,
       permissionMode: "auto",
       sessionName: `${wired.sessionName}_${req.sample.id}`,

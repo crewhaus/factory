@@ -559,6 +559,151 @@ describe("status lines (interpreter parity)", () => {
   });
 });
 
+describe("PR 11 — fragment extensions (backend/ttlMs/wiki + continuity)", () => {
+  test("memoryFragmentFromIr carries the §9 memory extensions field-by-field", () => {
+    expect(
+      memoryFragmentFromIr({
+        name: "spec-e",
+        memory: {
+          backend: "file",
+          ttlMs: 7_776_000_000,
+          autoRecall: true,
+          wiki: {
+            enabled: true,
+            recallK: 6,
+            embedder: "mock/deterministic",
+            autoRecall: true,
+            requireSources: true,
+          },
+        },
+      }),
+    ).toEqual({
+      specName: "spec-e",
+      memory: {
+        backend: "file",
+        ttlMs: 7_776_000_000,
+        autoRecall: true,
+        wiki: {
+          enabled: true,
+          recallK: 6,
+          embedder: "mock/deterministic",
+          autoRecall: true,
+          requireSources: true,
+        },
+      },
+    });
+  });
+
+  test("memoryFragmentFromIr carries the resolved IrContinuity (presence = enabled)", () => {
+    expect(
+      memoryFragmentFromIr({
+        name: "spec-f",
+        continuity: {
+          plan: true,
+          proof: "ladder",
+          ledger: true,
+          handoff: true,
+          scope: "spec",
+          focusMaxChars: 2048,
+        },
+      }),
+    ).toEqual({
+      specName: "spec-f",
+      continuity: {
+        plan: true,
+        proof: "ladder",
+        ledger: true,
+        handoff: true,
+        scope: "spec",
+        focusMaxChars: 2048,
+      },
+    });
+    expect(memoryFragmentFromIr({ name: "spec-g" })).toEqual({ specName: "spec-g" });
+  });
+});
+
+describe("PR 11 — wiki auto-recall fusion (§3.4/§9)", () => {
+  test("wiki.autoRecall fuses top-recallK wiki hits into the memory seam", async () => {
+    const { deps: d, catalog } = deps();
+    const wired = await wireMemory(
+      {
+        specName: "wiki-fuse",
+        memory: { autoRecall: true, wiki: { enabled: true, autoRecall: true, recallK: 2 } },
+      },
+      d,
+    );
+    const wikiWrite = catalog.registered.find((t) => t.name === "wiki_write");
+    await wikiWrite?.execute({
+      slug: "csv-delimiters",
+      title: "CSV delimiter conventions",
+      body: "EU locales conventionally use semicolon-delimited CSV.",
+    });
+    const seam = wired.options.memory;
+    expect(seam?.autoRecall).toBe(true);
+    const lines = await seam?.recall?.("csv delimiter conventions", 5);
+    expect(lines?.some((l) => l.startsWith("[wiki:csv-delimiters]"))).toBe(true);
+    expect(lines?.some((l) => l.includes("semicolon-delimited"))).toBe(true);
+  });
+
+  test("wiki.autoRecall turns the seam on even when the fact store's is off", async () => {
+    const { deps: d } = deps();
+    const wired = await wireMemory(
+      { specName: "wiki-only-recall", memory: { wiki: { enabled: true, autoRecall: true } } },
+      d,
+    );
+    expect(wired.options.memory?.autoRecall).toBe(true);
+    expect(wired.options.memory?.recall).toBeDefined();
+  });
+
+  test("without wiki.autoRecall the seam is untouched (fact recall only)", async () => {
+    const { deps: d } = deps();
+    const wired = await wireMemory(
+      { specName: "wiki-no-fuse", memory: { autoRecall: true, wiki: { enabled: true } } },
+      d,
+    );
+    const lines = await wired.options.memory?.recall?.("anything", 3);
+    expect(lines?.every((l) => !l.startsWith("[wiki:"))).toBe(true);
+  });
+});
+
+describe("PR 11 — continuity.proof carried-but-degraded (§2.4)", () => {
+  test('proof "require"/"off" log the degrade note; "ladder"/absent stay silent', async () => {
+    for (const [proof, expectNote] of [
+      ["require", true],
+      ["off", true],
+      ["ladder", false],
+      [undefined, false],
+    ] as const) {
+      const lines: string[] = [];
+      const { deps: d } = deps({ log: (l) => lines.push(l) });
+      await wireMemory(
+        {
+          specName: `proof-${proof ?? "absent"}`,
+          continuity: proof !== undefined ? { proof } : {},
+        },
+        d,
+      );
+      expect(lines.some((l) => l.includes("carried but not enforced yet"))).toBe(expectNote);
+    }
+  });
+});
+
+describe("PR 11 — deps.sessionRootDir override (§7.2 eval isolation)", () => {
+  test("the capture path reads transcripts from the overridden session root", async () => {
+    const sessionRoot = join(tmp, "custom-sessions");
+    writeSessionLog(sessionRoot, SESSION_ID);
+    const { deps: d } = deps({ sessionRootDir: sessionRoot });
+    const wired = await wireMemory(
+      { specName: "session-root-override", memory: { autoCapture: true } },
+      d,
+    );
+    await wired.options.memory?.onCapture?.(3, SESSION_ID);
+    const factsPath = join(tmp, ".crewhaus", "memories", "session-root-override.jsonl");
+    expect(existsSync(factsPath)).toBe(true);
+    expect(readFileSync(factsPath, "utf-8")).toContain("semicolon-delimited");
+  });
+});
+
 // Fragment shape sanity: the type is what PR 11's IR lowering targets.
 const _fragmentShape: MemoryWiringFragment = {
   specName: "shape",
