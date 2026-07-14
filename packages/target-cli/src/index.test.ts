@@ -126,6 +126,45 @@ describe("emitCli — tool wiring (Section 2)", () => {
   });
 });
 
+describe("emitCli — terminal-failure catch wrapper (0.3.0 Goal 6)", () => {
+  test("the top-level runChatLoop is wrapped in a catch that renders the report and exits coded", () => {
+    const content = emitCli(baseIr()).files[0]?.content ?? "";
+    // The bare `await runChatLoop(...)` (the "agent exited" unhandled-stack
+    // path) is gone: every bundle catches, renders formatRunFailure, and
+    // exits with the report's coded status.
+    expect(content).toContain(
+      'import { formatRunFailure, toFailureReport } from "@crewhaus/errors";',
+    );
+    const tryIdx = content.indexOf("try {");
+    const runChatLoopIdx = content.indexOf("await runChatLoop({");
+    const catchIdx = content.indexOf("} catch (__err) {");
+    expect(tryIdx).toBeGreaterThanOrEqual(0);
+    expect(runChatLoopIdx).toBeGreaterThan(tryIdx);
+    expect(catchIdx).toBeGreaterThan(runChatLoopIdx);
+    expect(content).toContain("const __report = toFailureReport(__err);");
+    expect(content).toContain("process.stderr.write(`${formatRunFailure(__report)}\\n`);");
+    expect(content).toContain("process.exit(__report.exitCode);");
+    // No MCP → no finally block.
+    expect(content).not.toContain("} finally {");
+  });
+
+  test("with MCP servers the catch precedes the cleanup finally", () => {
+    const content =
+      emitCli(
+        baseIr({
+          mcp_servers: {
+            things: { transport: "stdio", command: "node", args: ["server.js"] },
+          },
+        }),
+      ).files[0]?.content ?? "";
+    const catchIdx = content.indexOf("} catch (__err) {");
+    const finallyIdx = content.indexOf("} finally {");
+    expect(catchIdx).toBeGreaterThanOrEqual(0);
+    expect(finallyIdx).toBeGreaterThan(catchIdx);
+    expect(content).toContain("await mcpHost.disconnectAll();");
+  });
+});
+
 describe("emitCli — permissions (Section 7)", () => {
   test("no rules and no mode → no permissionMode or permissionRules emitted", () => {
     const content = emitCli(baseIr()).files[0]?.content ?? "";

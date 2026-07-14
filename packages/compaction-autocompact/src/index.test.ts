@@ -161,4 +161,29 @@ describe("autoCompact", () => {
 
     expect(result[1]).toEqual({ role: "assistant", content: benign });
   });
+
+  // v0.3.0 Goal 1 (§2.3) — the requirements-ledger anchor.
+  test("ledgerText is appended to the summarization prompt verbatim (anchoring)", async () => {
+    const { adapter, lastReq } = makeStubAdapter(() => streamWithText("anchored summary"));
+    const ledgerText = "- The CSV export delimiter must be a semicolon (;)";
+    await autoCompact([{ role: "user", content: "history" }], adapter, "m", { ledgerText });
+    const prompt = lastReq()?.messages.at(-1)?.content as string;
+    expect(prompt).toContain("Summarize the prior conversation");
+    expect(prompt).toContain(ledgerText);
+    expect(prompt).toContain("never contradict or drop them");
+  });
+
+  test("absent/empty ledgerText keeps the summarization prompt byte-identical", async () => {
+    const a = makeStubAdapter(() => streamWithText("x"));
+    await autoCompact([], a.adapter, "m");
+    const withoutOpts = a.lastReq()?.messages.at(-1)?.content as string;
+
+    const b = makeStubAdapter(() => streamWithText("x"));
+    await autoCompact([], b.adapter, "m", {});
+    expect(b.lastReq()?.messages.at(-1)?.content as string).toBe(withoutOpts);
+
+    const c = makeStubAdapter(() => streamWithText("x"));
+    await autoCompact([], c.adapter, "m", { ledgerText: "" });
+    expect(c.lastReq()?.messages.at(-1)?.content as string).toBe(withoutOpts);
+  });
 });

@@ -194,6 +194,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSy
 import { join, resolve as resolvePath } from "node:path";
 import { createCitationTracker, newRunId } from "@crewhaus/citation-tracker";
 import { createCrawler, createSourceTool, createCiteFactTool } from "@crewhaus/crawler";
+import { formatRunFailure, toFailureReport } from "@crewhaus/errors";
 import { decompose, type Plan } from "@crewhaus/planner";
 import { writeReport, type BranchAnswer } from "@crewhaus/report-writer";
 import { runChatLoop } from "@crewhaus/runtime-core";
@@ -451,8 +452,12 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
-  process.stderr.write(\`[research] fatal: \${(err as Error).message}\\n\`);
-  process.exit(1);
+  // v0.3.0 Goal 6 — render the one structured failure report (classified
+  // for a RunFailedError, generic otherwise) and exit with its coded
+  // status instead of the bare "[research] fatal:" line + exit 1.
+  const __report = toFailureReport(err);
+  process.stderr.write(\`\${formatRunFailure(__report, { prefix: "[research]" })}\\n\`);
+  process.exit(__report.exitCode);
 });
 `;
 }

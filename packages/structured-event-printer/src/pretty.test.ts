@@ -289,6 +289,54 @@ describe("formatBody — every kind + optional-field branches", () => {
     );
   });
 
+  test("error_recovered renders the halt action (0.3.0 Goal 6)", () => {
+    const ev = {
+      ...envelope,
+      kind: "error_recovered",
+      action: "halt",
+      errorName: "AdapterError",
+      depth: 0,
+    } satisfies TraceEvent;
+    expect(formatLine(ev)).toBe(
+      `${prefix("error_recovered")}action=halt error=AdapterError depth=0`,
+    );
+  });
+
+  test("run_failed renders the canonical multi-line report block (0.3.0 Goal 6)", () => {
+    const ev = {
+      ...envelope,
+      kind: "run_failed",
+      class: "billing",
+      message:
+        'provider account out of funding: Anthropic said: "Your credit balance is too low to access the Anthropic API."',
+      remediation: "add credits at https://console.anthropic.com/settings/billing, then rerun.",
+      exitCode: 31,
+    } satisfies TraceEvent;
+    expect(formatLine(ev)).toBe(
+      [
+        `${prefix("run_failed")}✗ run stopped — provider account out of funding: Anthropic said: "Your credit balance is too low to access the Anthropic API."`,
+        "  Fix: add credits at https://console.anthropic.com/settings/billing, then rerun.",
+        "  (exit 31)",
+      ].join("\n"),
+    );
+  });
+
+  test("run_failed without remediation still prints the coded exit line", () => {
+    const ev = {
+      ...envelope,
+      kind: "run_failed",
+      class: "unknown",
+      message: "recovery failed: tombstone budget exhausted: boom",
+      exitCode: 1,
+    } satisfies TraceEvent;
+    expect(formatLine(ev)).toBe(
+      [
+        `${prefix("run_failed")}✗ run stopped — recovery failed: tombstone budget exhausted: boom`,
+        "  (exit 1)",
+      ].join("\n"),
+    );
+  });
+
   test("sub_agent_start", () => {
     const ev = {
       ...envelope,

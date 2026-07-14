@@ -3,16 +3,76 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   BUDGETS,
+  BUILTIN_FAILURE_CLASSES,
   type NamedFailureClass,
   type RecoveryAction,
   RecoveryEngineError,
   advanceState,
   backoffMs,
+  buildFailureReport,
   classify,
   initialRecoveryState,
   matchNamedFailure,
   recover,
+  retryAfterMs,
 } from "./index";
+
+// Real provider error shapes, pinned. Sources: Anthropic SDK BadRequestError /
+// AuthenticationError envelopes; OpenAI SDK RateLimitError with
+// code "insufficient_quota" (the out-of-funds signal, distinct from a
+// genuine rate limit).
+const ANTHROPIC_CREDIT_BALANCE_400 = {
+  name: "BadRequestError",
+  status: 400,
+  error: {
+    type: "invalid_request_error",
+    message:
+      "Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.",
+  },
+  message:
+    "400 Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.",
+} as const;
+
+const OPENAI_INSUFFICIENT_QUOTA_429 = {
+  name: "RateLimitError",
+  status: 429,
+  code: "insufficient_quota",
+  error: {
+    message:
+      "You exceeded your current quota, please check your plan and billing details. For more information on this error, read the docs: https://platform.openai.com/docs/guides/error-codes/api-errors.",
+    type: "insufficient_quota",
+    param: null,
+    code: "insufficient_quota",
+  },
+  message: "429 You exceeded your current quota, please check your plan and billing details.",
+} as const;
+
+const ANTHROPIC_401 = {
+  name: "AuthenticationError",
+  status: 401,
+  error: { type: "authentication_error", message: "invalid x-api-key" },
+  message: "401 invalid x-api-key",
+} as const;
+
+const ANTHROPIC_403 = {
+  name: "PermissionDeniedError",
+  status: 403,
+  error: {
+    type: "permission_error",
+    message: "Your API key does not have permission to use the specified resource.",
+  },
+  message: "403 Forbidden",
+} as const;
+
+const ANTHROPIC_RATE_LIMIT_429 = {
+  name: "RateLimitError",
+  status: 429,
+  error: {
+    type: "rate_limit_error",
+    message: "Number of request tokens has exceeded your per-minute rate limit.",
+  },
+  message: "429 rate_limit_error",
+} as const;
 
 describe("classify", () => {
   test("531/529/500 → overloaded_or_5xx", () => {
@@ -62,7 +122,9 @@ describe("classify", () => {
     expect(classify(null)).toBe("unknown");
     expect(classify(undefined)).toBe("unknown");
     expect(classify({})).toBe("unknown");
-    expect(classify({ status: 401, message: "auth" })).toBe("unknown");
+    // NOTE: 401 used to land here ("unknown"); since v0.3.0 Goal 6 it
+    // classifies as "auth" (covered in the Goal 6 describe blocks below).
+    expect(classify({ status: 418, message: "teapot" })).toBe("unknown");
   });
 });
 
@@ -340,6 +402,338 @@ describe("Track A — named failure taxonomy", () => {
     ];
     expect(() => matchNamedFailure({ message: "anything" }, badTaxonomy)).not.toThrow();
     expect(matchNamedFailure({ message: "anything" }, badTaxonomy)).toBeUndefined();
+  });
+});
+
+// ===========================================================================
+// v0.3.0 Goal 6 — billing / auth / rate_limit classes, halt action, builtin
+// failure classes, and the finally-consumed `hint` field.
+// ===========================================================================
+
+describe("Goal 6 — classify: billing / auth / rate_limit", () => {
+  test("Anthropic out-of-credit 400 → billing (not invalid_request)", () => {
+    expect(classify(ANTHROPIC_CREDIT_BALANCE_400)).toBe("billing");
+  });
+
+  test("OpenAI 429 + code insufficient_quota → billing (not rate_limit)", () => {
+    expect(classify(OPENAI_INSUFFICIENT_QUOTA_429)).toBe("billing");
+  });
+
+  test("insufficient_quota is detected on the nested error.code too", () => {
+    expect(
+      classify({
+        status: 429,
+        error: { type: "insufficient_quota", code: "insufficient_quota", message: "quota" },
+        message: "429 quota",
+      }),
+    ).toBe("billing");
+  });
+
+  test("a top-level code string does not shadow the envelope's insufficient_quota (PR 2)", () => {
+    // The AdapterError wrapper shape: CrewhausError's ErrorCode occupies the
+    // top-level `code` slot ("adapter"); the provider code rides error.code.
+    expect(
+      classify({
+        name: "AdapterError",
+        code: "adapter",
+        status: 429,
+        error: { type: "insufficient_quota", code: "insufficient_quota", message: "quota" },
+        message: "429 quota",
+      }),
+    ).toBe("billing");
+  });
+
+  test("HTTP 402 anywhere → billing", () => {
+    expect(classify({ status: 402, message: "402 Payment Required" })).toBe("billing");
+  });
+
+  test("Bedrock ServiceQuotaExceededException (by name) → billing", () => {
+    expect(
+      classify({
+        name: "ServiceQuotaExceededException",
+        message: "You have reached the maximum number of requests for this account.",
+      }),
+    ).toBe("billing");
+  });
+
+  test("401 and 403 at runtime → auth", () => {
+    expect(classify(ANTHROPIC_401)).toBe("auth");
+    expect(classify(ANTHROPIC_403)).toBe("auth");
+  });
+
+  test("genuine 429 (not insufficient_quota) → rate_limit", () => {
+    expect(classify(ANTHROPIC_RATE_LIMIT_429)).toBe("rate_limit");
+    expect(classify({ status: 429, message: "429 slow down" })).toBe("rate_limit");
+  });
+
+  test("inner type rate_limit_error → rate_limit even without a status", () => {
+    expect(
+      classify({ error: { type: "rate_limit_error", message: "rate limited" }, message: "x" }),
+    ).toBe("rate_limit");
+  });
+});
+
+describe("Goal 6 — recover: billing and auth halt immediately", () => {
+  test("Anthropic credit-balance 400 → halt with the billing report (exit 31)", () => {
+    const action = recover(ANTHROPIC_CREDIT_BALANCE_400, initialRecoveryState);
+    expect(action.kind).toBe("halt");
+    if (action.kind !== "halt") return;
+    expect(action.report.class).toBe("billing");
+    expect(action.report.title).toBe(BUILTIN_FAILURE_CLASSES.billing_exhausted.title);
+    expect(action.report.exitCode).toBe(31);
+    expect(action.report.detail).toContain("Your credit balance is too low");
+  });
+
+  test("OpenAI insufficient_quota 429 → halt on the FIRST call (never retried)", () => {
+    // The old behavior burned 5 backoff retries before failing; the halt
+    // must come from a fresh state, proving no retry is ever chosen.
+    const action = recover(OPENAI_INSUFFICIENT_QUOTA_429, initialRecoveryState);
+    expect(action.kind).toBe("halt");
+    if (action.kind !== "halt") return;
+    expect(action.report.class).toBe("billing");
+    expect(action.report.exitCode).toBe(31);
+  });
+
+  test("401 → halt with the auth report (exit 30)", () => {
+    const action = recover(ANTHROPIC_401, initialRecoveryState);
+    expect(action.kind).toBe("halt");
+    if (action.kind !== "halt") return;
+    expect(action.report.class).toBe("auth");
+    expect(action.report.exitCode).toBe(30);
+    expect(action.report.detail).toContain("invalid x-api-key");
+  });
+
+  test("403 → halt with the auth report (exit 30)", () => {
+    const action = recover(ANTHROPIC_403, initialRecoveryState);
+    expect(action.kind).toBe("halt");
+    if (action.kind !== "halt") return;
+    expect(action.report.class).toBe("auth");
+    expect(action.report.exitCode).toBe(30);
+  });
+
+  test("halt leaves recovery state unchanged (terminal, like fail)", () => {
+    const action = recover(ANTHROPIC_401, initialRecoveryState);
+    expect(advanceState(initialRecoveryState, action)).toEqual(initialRecoveryState);
+  });
+});
+
+describe("Goal 6 — recover: rate_limit retries honor Retry-After, then halt", () => {
+  test("429 with retry-after header → retry with exactly that delay", () => {
+    const err = { ...ANTHROPIC_RATE_LIMIT_429, headers: { "retry-after": "7" } };
+    const action = recover(err, initialRecoveryState);
+    expect(action.kind).toBe("retry");
+    if (action.kind !== "retry") return;
+    expect(action.delayMs).toBe(7_000);
+    expect(action.attempt).toBe(1);
+  });
+
+  test("429 without retry-after → retry with the normal backoff window", () => {
+    const action = recover(ANTHROPIC_RATE_LIMIT_429, initialRecoveryState);
+    expect(action.kind).toBe("retry");
+    if (action.kind !== "retry") return;
+    expect(action.delayMs).toBeGreaterThanOrEqual(1_000);
+    expect(action.delayMs).toBeLessThanOrEqual(1_250);
+  });
+
+  test("retry budget exhaustion → halt with the rate_limited report (exit 32)", () => {
+    const exhausted = { ...initialRecoveryState, retryCount: BUDGETS.MAX_RETRIES };
+    const action = recover(ANTHROPIC_RATE_LIMIT_429, exhausted);
+    expect(action.kind).toBe("halt");
+    if (action.kind !== "halt") return;
+    expect(action.report.class).toBe("rate_limit");
+    expect(action.report.exitCode).toBe(32);
+  });
+
+  test("walking the budget: MAX_RETRIES retries, then halt", () => {
+    let state = initialRecoveryState;
+    for (let i = 0; i < BUDGETS.MAX_RETRIES; i++) {
+      const action = recover(ANTHROPIC_RATE_LIMIT_429, state);
+      expect(action.kind).toBe("retry");
+      state = advanceState(state, action);
+    }
+    expect(recover(ANTHROPIC_RATE_LIMIT_429, state).kind).toBe("halt");
+  });
+});
+
+describe("Goal 6 — retryAfterMs", () => {
+  test("reads delta-seconds from a plain headers object", () => {
+    expect(retryAfterMs({ headers: { "retry-after": "30" } })).toBe(30_000);
+    expect(retryAfterMs({ headers: { "Retry-After": "2" } })).toBe(2_000);
+  });
+
+  test("reads from a Headers instance (get())", () => {
+    expect(retryAfterMs({ headers: new Headers({ "retry-after": "5" }) })).toBe(5_000);
+  });
+
+  test("reads an HTTP-date form relative to now", () => {
+    const now = Date.parse("2026-07-13T00:00:00Z");
+    const ms = retryAfterMs(
+      { headers: { "retry-after": "Mon, 13 Jul 2026 00:00:10 GMT" } },
+      () => now,
+    );
+    expect(ms).toBe(10_000);
+  });
+
+  test("reads direct retryAfterMs / retryAfter fields", () => {
+    expect(retryAfterMs({ retryAfterMs: 1_500 })).toBe(1_500);
+    expect(retryAfterMs({ retryAfter: 3 })).toBe(3_000);
+  });
+
+  test("clamps into [0, RETRY_AFTER_CAP_MS]", () => {
+    expect(retryAfterMs({ retryAfter: 86_400 })).toBe(BUDGETS.RETRY_AFTER_CAP_MS);
+    const now = Date.parse("2026-07-13T00:00:10Z");
+    // A date in the past clamps to 0, not a negative delay.
+    expect(
+      retryAfterMs({ headers: { "retry-after": "Mon, 13 Jul 2026 00:00:00 GMT" } }, () => now),
+    ).toBe(0);
+  });
+
+  test("absent / malformed values → undefined", () => {
+    expect(retryAfterMs({})).toBeUndefined();
+    expect(retryAfterMs(null)).toBeUndefined();
+    expect(retryAfterMs({ headers: {} })).toBeUndefined();
+    expect(retryAfterMs({ headers: { "retry-after": "soonish" } })).toBeUndefined();
+  });
+});
+
+describe("Goal 6 — buildFailureReport provider attribution", () => {
+  test("an AdapterError-shaped error attributes the provider in detail", () => {
+    const report = buildFailureReport("billing_exhausted", {
+      ...ANTHROPIC_CREDIT_BALANCE_400,
+      providerId: "anthropic",
+    });
+    expect(report.detail).toBe(
+      'Anthropic said: "Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."',
+    );
+    expect(report.remediation).toBe(
+      "add credits at https://console.anthropic.com/settings/billing, then rerun.",
+    );
+  });
+
+  test("without a providerId the raw text stands alone with the generic fix", () => {
+    const report = buildFailureReport("billing_exhausted", ANTHROPIC_CREDIT_BALANCE_400);
+    expect(report.detail).toBe(
+      "Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.",
+    );
+    expect(report.remediation).toBe(BUILTIN_FAILURE_CLASSES.billing_exhausted.remediation);
+  });
+
+  test("an unknown providerId is used verbatim", () => {
+    const report = buildFailureReport("auth_invalid", {
+      providerId: "acme",
+      status: 401,
+      message: "401 nope",
+    });
+    expect(report.detail).toBe('acme said: "401 nope"');
+    expect(report.remediation).toBe(BUILTIN_FAILURE_CLASSES.auth_invalid.remediation);
+  });
+
+  test("every builtin entry carries a class, title, remediation, and exit code", () => {
+    for (const entry of Object.values(BUILTIN_FAILURE_CLASSES)) {
+      expect(entry.title.length).toBeGreaterThan(0);
+      expect(entry.remediation.length).toBeGreaterThan(0);
+      expect(entry.exitCode).toBeGreaterThan(0);
+    }
+    expect(BUILTIN_FAILURE_CLASSES.billing_exhausted.exitCode).toBe(31);
+    expect(BUILTIN_FAILURE_CLASSES.auth_invalid.exitCode).toBe(30);
+    expect(BUILTIN_FAILURE_CLASSES.rate_limited.exitCode).toBe(32);
+    expect(BUILTIN_FAILURE_CLASSES.crewhaus_budget.exitCode).toBe(33);
+    expect(BUILTIN_FAILURE_CLASSES.mcp_boot_failure.exitCode).toBe(40);
+  });
+});
+
+describe("Goal 6 — user failure_taxonomy overrides and the hint field", () => {
+  test("a user entry beats the builtin billing halt (user overrides win)", () => {
+    const taxonomy: NamedFailureClass[] = [
+      { class: "billing_retry_anyway", pattern: "credit balance", recovery: "retry" },
+    ];
+    const action = recover(ANTHROPIC_CREDIT_BALANCE_400, initialRecoveryState, taxonomy);
+    expect(action.kind).toBe("retry");
+  });
+
+  test("a matched fail entry WITH a hint → halt carrying the hint as remediation", () => {
+    const taxonomy: NamedFailureClass[] = [
+      {
+        class: "credits_gone",
+        pattern: "credit balance",
+        recovery: "fail",
+        hint: "top up the shared team account before rerunning.",
+      },
+    ];
+    const action = recover(ANTHROPIC_CREDIT_BALANCE_400, initialRecoveryState, taxonomy);
+    expect(action.kind).toBe("halt");
+    if (action.kind !== "halt") return;
+    expect(action.report.remediation).toBe("top up the shared team account before rerunning.");
+    expect(action.report.title).toBe("failure_taxonomy: credits_gone");
+    expect(action.report.detail).toContain("Your credit balance is too low");
+    expect(action.report.exitCode).toBe(1);
+  });
+
+  test("budget exhaustion on a hinted entry also halts with the hint", () => {
+    const taxonomy: NamedFailureClass[] = [
+      {
+        class: "flaky_tool",
+        pattern: "ETIMEDOUT",
+        recovery: "retry",
+        hint: "the fetch tool times out on the corp proxy; set HTTPS_PROXY.",
+      },
+    ];
+    const exhausted = { ...initialRecoveryState, retryCount: BUDGETS.MAX_RETRIES };
+    const action = recover({ message: "ETIMEDOUT after 30s" }, exhausted, taxonomy);
+    expect(action.kind).toBe("halt");
+    if (action.kind !== "halt") return;
+    expect(action.report.remediation).toBe(
+      "the fetch tool times out on the corp proxy; set HTTPS_PROXY.",
+    );
+    expect(action.report.title).toContain("retry budget exhausted");
+  });
+
+  test("a matched fail entry WITHOUT a hint keeps the pre-0.3.0 fail action", () => {
+    const taxonomy: NamedFailureClass[] = [
+      { class: "hard_stop", pattern: "credit balance", recovery: "fail" },
+    ];
+    const action = recover(ANTHROPIC_CREDIT_BALANCE_400, initialRecoveryState, taxonomy);
+    expect(action).toEqual({ kind: "fail", reason: "failure_taxonomy: hard_stop" });
+  });
+});
+
+describe("Goal 6 — regression: everything else behaves exactly as before", () => {
+  test("a plain 500 still retries then fails generically (no halt)", () => {
+    const err = {
+      name: "APIError",
+      status: 500,
+      error: { type: "api_error", message: "Internal server error" },
+      message: "500 Internal Server Error",
+    };
+    expect(recover(err, initialRecoveryState).kind).toBe("retry");
+    const exhausted = { ...initialRecoveryState, retryCount: BUDGETS.MAX_RETRIES };
+    const action = recover(err, exhausted);
+    expect(action).toEqual({
+      kind: "fail",
+      reason: "retry budget exhausted: 500 Internal Server Error",
+    });
+  });
+
+  test("an overloaded_error still retries then fails generically (no halt)", () => {
+    const err = {
+      name: "APIError",
+      status: 529,
+      error: { type: "overloaded_error", message: "Overloaded" },
+      message: "529 Overloaded",
+    };
+    expect(recover(err, initialRecoveryState).kind).toBe("retry");
+    const exhausted = { ...initialRecoveryState, retryCount: BUDGETS.MAX_RETRIES };
+    expect(recover(err, exhausted).kind).toBe("fail");
+  });
+
+  test("a generic 400 still tombstones (billing needs the credit-balance text)", () => {
+    const err = {
+      name: "BadRequestError",
+      status: 400,
+      error: { type: "invalid_request_error", message: "messages.0: invalid block" },
+      message: "400 Bad Request",
+    };
+    expect(recover(err, initialRecoveryState)).toEqual({ kind: "tombstone" });
   });
 });
 

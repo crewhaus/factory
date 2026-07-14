@@ -14,6 +14,7 @@ import {
   countFeedback,
   countOpenIncidents,
   countSessions,
+  describeFleetExit,
   discoverHarnesses,
   fleetSelfInvokeArgv,
   formatBulkReport,
@@ -536,5 +537,61 @@ describe("runFleetBulk", () => {
     const out = formatBulkReport(report).join("\n");
     expect(out).toContain("✓ concierge");
     expect(out).toContain("1 passed, 0 failed, 0 skipped");
+  });
+
+  test("describeFleetExit decodes the documented EXIT_CODES table (0.3.0 Goal 6)", () => {
+    expect(describeFleetExit(31)).toEqual({
+      class: "billing",
+      title: "provider account out of funding",
+    });
+    expect(describeFleetExit(30)).toEqual({
+      class: "auth",
+      title: "provider rejected the credentials",
+    });
+    expect(describeFleetExit(1)).toEqual({ class: "unknown", title: "unclassified failure" });
+    // 0 is success and unmapped codes stay plain.
+    expect(describeFleetExit(0)).toBeUndefined();
+    expect(describeFleetExit(77)).toBeUndefined();
+  });
+
+  test("formatBulkReport renders the failure title + class rollup for coded exits (0.3.0 Goal 6)", async () => {
+    seedHarness("support-bot", { spec: CLI_SPEC.replace("concierge", "support-bot") });
+    seedHarness("concierge", { spec: CLI_SPEC });
+    const codes = new Map<string, number>([
+      ["support-bot", 31],
+      ["concierge", 0],
+    ]);
+    const report = await runFleetBulk({
+      root,
+      subcommandTokens: ["doctor"],
+      allowMutating: false,
+      deps: emptyDeps(),
+      runner: async ({ cwd }) => ({
+        exitCode: codes.get(cwd.split("/").pop() ?? "") ?? 77,
+        tail: "",
+      }),
+      confirm: async () => true,
+    });
+    const out = formatBulkReport(report).join("\n");
+    // The coded exit renders the design §8.2 shape:
+    expect(out).toContain("✗ support-bot — provider account out of funding · exit 31");
+    expect(out).toContain("✓ concierge — exit 0");
+    // …and the summary rolls failures up by class.
+    expect(out).toContain("1 passed, 1 failed (billing ×1), 0 skipped");
+  });
+
+  test("formatBulkReport keeps the plain exit line for unmapped codes", async () => {
+    seedHarness("bot", { spec: CLI_SPEC });
+    const report = await runFleetBulk({
+      root,
+      subcommandTokens: ["doctor"],
+      allowMutating: false,
+      deps: emptyDeps(),
+      runner: async () => ({ exitCode: 77, tail: "" }),
+      confirm: async () => true,
+    });
+    const out = formatBulkReport(report).join("\n");
+    expect(out).toContain("✗ concierge — exit 77");
+    expect(out).toContain("0 passed, 1 failed (unknown ×1), 0 skipped");
   });
 });
