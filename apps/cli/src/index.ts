@@ -101,6 +101,9 @@ import { registerMcpServer } from "@crewhaus/tool-mcp";
 import { createMemoryTools } from "@crewhaus/tool-memory";
 import { createTaskTool } from "@crewhaus/tool-task";
 import { type CostAccrualEvent, type ProviderId, TraceEventBus } from "@crewhaus/trace-event-bus";
+// 0.3.0 memory release (design §3.1, PR 9) — the local wiki substrate behind
+// `crewhaus wiki list|show|search|stats`.
+import { createWikiStore } from "@crewhaus/wiki-store";
 import { parseDocument } from "yaml";
 // Item 15 — `optimize --from-advice` (eval-gated apply of the advisor's
 // SpecPatches: suggestions-file validation, the accept/reject/compose loop
@@ -903,6 +906,17 @@ import {
   renderVoiceReport,
 } from "./voice-eval";
 import { type Watcher, createWatchController, formatCycleLine } from "./watch";
+// 0.3.0 memory release (design §3.1/§3.2, PR 9) — `crewhaus wiki
+// list|show|search|stats` helpers over @crewhaus/wiki-store.
+import {
+  WIKI_SUBDIR,
+  listWikiSpecs,
+  renderWikiList,
+  renderWikiSearch,
+  renderWikiShow,
+  renderWikiStats,
+  resolveWikiSpec,
+} from "./wiki-cli";
 
 /**
  * crewhaus — slice-scope CLI.
@@ -1609,6 +1623,23 @@ const MIGRATE_MEMORIES_SCHEMA: ParseArgsSchema = {
   ],
 };
 
+// 0.3.0 memory release (design §3.1, PR 9) — `crewhaus wiki list|show|search|stats`.
+const WIKI_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // Which spec's wiki to operate on. `list`/`stats` default to every wiki
+    // under .crewhaus/wiki/; `show`/`search` auto-resolve only when a single
+    // wiki exists.
+    { name: "spec", takesValue: true },
+    // list — filter to articles carrying EVERY listed tag (comma-separated).
+    { name: "tags", takesValue: true },
+    // list — filter by article status (draft|published|review|archived|all).
+    { name: "status", takesValue: true },
+    // search — max results to print. Default 10.
+    { name: "k", short: "k", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
 // Item 12 — the dataset-registry CLI face (`datasets list|get|put`).
 const DATASETS_SCHEMA: ParseArgsSchema = {
   flags: [
@@ -2138,6 +2169,11 @@ function usageText(): string {
     "  memory sweep [--compact] [--yes]     tombstone TTL-expired memories; --compact rewrites the file",
     "                                       dropping dead lines (atomic; the growth-bounding compaction)",
     "  migrate memories [--dry-run]         backfill the v2 memory schema + provenance; stamps .crewhaus/meta.json",
+    "  wiki list [--spec <name>]            inspect the per-spec local wikis, stalest first (versions, signals,",
+    "       [--tags <t1,t2>] [--status <s>]     tags; articles live under .crewhaus/wiki/<spec>/articles/)",
+    "  wiki show <slug>                     full frontmatter + body for one article (priors in versions/<slug>/)",
+    "  wiki search <q> [-k <n>]             BM25 keyword search over a spec's articles",
+    "  wiki stats                           corpus health: articles/status/versions/tags/verified/links",
     "       [--evicted] [--ttl-days N]        --evicted indexes each session just before it is deleted",
     "  datasets list                        all registered datasets + versions (Section 29)",
     "  datasets get <name>[@version]        print a dataset's samples as JSONL",
@@ -5259,6 +5295,9 @@ async function collectPhilosophyFindings(): Promise<PhilosophyFinding[]> {
     { name: "compaction-autocompact", path: "packages/compaction-autocompact/src/index.ts" },
     { name: "federation-router", path: "packages/federation-router/src/index.ts" },
     { name: "channel-adapter-base", path: "packages/channel-adapter-base/src/index.ts" },
+    // 0.3.0 memory release: recalled wiki bodies re-enter the model context
+    // across a session boundary — classified at the "memory" origin.
+    { name: "tool-wiki", path: "packages/tool-wiki/src/index.ts" },
   ];
   for (const site of boundarySites) {
     const filePath = join(process.cwd(), site.path);
@@ -10422,6 +10461,111 @@ async function runMigrateMemories(args: ParsedArgs): Promise<void> {
   for (const line of formatMigrateMemoriesReport(report)) process.stdout.write(`${line}\n`);
 }
 
+// -------- 0.3.0 memory release: crewhaus wiki --------
+
+/**
+ * `crewhaus wiki list|show <slug>|search <q>|stats` (design §3.1/§3.2, PR 9)
+ * — inspect the per-spec local wikis under `.crewhaus/wiki/`. Read-only
+ * verbs only: articles are written by the wiki_write tool (versioned,
+ * supersede-never-delete), `clear|restore` ride the continuity trash
+ * machinery, and `push|pull --thredz` arrives with the Thredz PR.
+ */
+async function runWiki(args: ParsedArgs): Promise<void> {
+  const action = args.positional[0];
+  if (args.flags["help"] === true && action === undefined) {
+    process.stdout.write(
+      "usage: crewhaus wiki list [--spec <name>] [--tags <t1,t2>] [--status <s>]\n" +
+        "       crewhaus wiki show <slug> [--spec <name>]\n" +
+        "       crewhaus wiki search <q> [--spec <name>] [-k <n>]\n" +
+        "       crewhaus wiki stats [--spec <name>]\n" +
+        "  Inspect the per-spec local wikis under .crewhaus/wiki/ (versioned articles;\n" +
+        "  priors are kept under versions/<slug>/ — superseded, never deleted). list is\n" +
+        "  stalest-first (the REFLECT order); search is BM25 keyword ranking.\n",
+    );
+    return;
+  }
+  const wikiDir = join(process.cwd(), WIKI_SUBDIR);
+  const nowMs = Date.now();
+  const specFlag = strFlag(args, "spec");
+  const storeFor = (specName: string): ReturnType<typeof createWikiStore> =>
+    createWikiStore({ specName, rootDir: wikiDir });
+
+  switch (action) {
+    case "list": {
+      const specs =
+        specFlag !== undefined ? [resolveWikiSpec(wikiDir, specFlag)] : listWikiSpecs(wikiDir);
+      if (specs.length === 0) die(`no wikis under ${wikiDir}`);
+      const statusFlag = strFlag(args, "status");
+      const status =
+        statusFlag === "draft" ||
+        statusFlag === "published" ||
+        statusFlag === "review" ||
+        statusFlag === "archived" ||
+        statusFlag === "all"
+          ? statusFlag
+          : undefined;
+      if (statusFlag !== undefined && status === undefined) {
+        die(`wiki list: unknown --status "${statusFlag}" (draft|published|review|archived|all)`);
+      }
+      const tags = (strFlag(args, "tags") ?? "")
+        .split(",")
+        .map((t) => t.trim())
+        .filter((t) => t !== "");
+      for (const spec of specs) {
+        const refs = await storeFor(spec).list({
+          staleFirst: true,
+          ...(status !== undefined ? { status } : {}),
+          ...(tags.length > 0 ? { tags } : {}),
+        });
+        for (const line of renderWikiList(spec, refs, nowMs)) {
+          process.stdout.write(`${line}\n`);
+        }
+      }
+      return;
+    }
+    case "show": {
+      const slug = args.positional[1];
+      if (slug === undefined) die("usage: crewhaus wiki show <slug> [--spec <name>]");
+      const specs =
+        specFlag !== undefined ? [resolveWikiSpec(wikiDir, specFlag)] : listWikiSpecs(wikiDir);
+      for (const spec of specs) {
+        const article = await storeFor(spec).get(slug as string);
+        if (article !== null) {
+          process.stdout.write(`spec:        ${spec}\n`);
+          for (const line of renderWikiShow(article)) process.stdout.write(`${line}\n`);
+          return;
+        }
+      }
+      die(`no wiki article with slug "${slug}" under ${wikiDir}`);
+      return;
+    }
+    case "search": {
+      const query = args.positional[1];
+      if (query === undefined) die("usage: crewhaus wiki search <q> [--spec <name>] [-k <n>]");
+      const k = Math.max(1, Number.parseInt(strFlag(args, "k") ?? "10", 10) || 10);
+      const spec = resolveWikiSpec(wikiDir, specFlag);
+      const refs = await storeFor(spec).search(query as string);
+      for (const line of renderWikiSearch(spec, query as string, refs.slice(0, k))) {
+        process.stdout.write(`${line}\n`);
+      }
+      return;
+    }
+    case "stats": {
+      const specs =
+        specFlag !== undefined ? [resolveWikiSpec(wikiDir, specFlag)] : listWikiSpecs(wikiDir);
+      if (specs.length === 0) die(`no wikis under ${wikiDir}`);
+      for (const spec of specs) {
+        for (const line of renderWikiStats(spec, await storeFor(spec).stats())) {
+          process.stdout.write(`${line}\n`);
+        }
+      }
+      return;
+    }
+    default:
+      die(`wiki: unknown action "${action ?? ""}" — supported: list, show, search, stats`);
+  }
+}
+
 // -------- item 4: crewhaus graders suggest --------
 
 /**
@@ -15242,6 +15386,16 @@ switch (subcommand) {
     // fact stores. Structured failures route through die().
     try {
       await runMemory(parseFor(rest, MEMORY_SCHEMA));
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
+    break;
+  case "wiki":
+    // 0.3.0 memory release (design §3.1, PR 9) — inspect the per-spec local
+    // wikis (read-only verbs). Structured failures route through die().
+    try {
+      await runWiki(parseFor(rest, WIKI_SCHEMA));
     } catch (err) {
       if (err instanceof CrewhausError) die(err.message);
       throw err;

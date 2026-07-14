@@ -38,6 +38,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `schemaVersion`, derives `provenance.sessionId` from v1 auto-capture tags,
   preserves every other line verbatim, and records the store version in
   `.crewhaus/meta.json`.
+- **`@crewhaus/wiki-store` — the local wiki substrate** (0.3.0 memory
+  release, design §3.1). Update-in-place semantic memory under
+  `.crewhaus/wiki/<spec>/`: markdown articles with YAML frontmatter (slug,
+  title, tags, confidence, verified, version, sources, supersedes,
+  createdBy), immutable prior versions under `versions/<slug>/<n>.md`
+  (supersede, never delete), and a rebuildable `index.json` carrying
+  `[[wikilink]]` link graphs. `write()` upserts with the Thredz PATCH
+  optimistic-concurrency contract — a stale `expectedVersion` throws a
+  `stale_article_version`-coded conflict, so skills behave identically on
+  both backends. Retrieval is hybrid BM25 + optional embedder via
+  reciprocal-rank fusion over contextual chunks (title + tags prefixed),
+  followed by one-hop link expansion with a documented half-weight re-rank
+  rule — a linked-but-lexically-unrelated article surfaces on recall.
+  Mutations run under the §7.6 advisory `.lock` (wait 2 s → steal >30 s
+  stale → fail naming the holder pid) with tmp+rename atomic writes, and
+  every path is tenant-fenced fail-closed.
+- **`@crewhaus/tool-wiki` — the thredz-identical wiki tool vocabulary**
+  (design §3.2): `wiki_recall`, `wiki_semantic_search`, `wiki_search`,
+  `wiki_get`, `wiki_write`, `wiki_list`, `wiki_related`,
+  `wiki_set_signals`, `wiki_stats`, `log_knowledge_gap` — exact thredz-mcp
+  names and schemas, pinned by a parity test. `wiki_write`/`wiki_set_signals`
+  are destructive + justification-gated; `log_knowledge_gap` is
+  audit-and-allow and, standalone, records gaps as draft wiki articles
+  under the reserved `gaps/` tag (an injected `logGap` callback reroutes it
+  to the plan store in the composition root). With `requireSources: true`,
+  `wiki_write` deterministically rejects bodies without a `## Sources`
+  heading (design §3.3's write-path governance). Mutations emit the new
+  additive `wiki_write` event kind through an injected append seam.
+- **New `memory` TrustOrigin** (Pillar 3, design §7.4): recalled wiki
+  bodies are classified at origin `"memory"` (block tier, like `"skill"`)
+  before reaching the model and lineage-tagged for the egress fabric;
+  redact verdicts return the redaction notice instead of the body. Origin
+  registered across boundary-classifier, run-context, and
+  egress-classifier; tool-wiki joins the doctor `--philosophy-alignment`
+  boundary-site checks.
+- **`crewhaus wiki list|show <slug>|search <q>|stats`**: inspect the
+  per-spec local wikis — stalest-first listing with signals
+  (verified/confidence), full frontmatter + body for one article, BM25
+  keyword search, and corpus-health stats.
 - **Secrets can now reach MCP server child processes.** `mcp_servers` stdio
   `env` and sse `headers` values route through the same `$UPPER_SNAKE`
   secret machinery as every other credential field: plain strings stay

@@ -63,6 +63,7 @@
     "@crewhaus/logging": "workspace:*",
     "@crewhaus/mcp-host": "workspace:*",
     "@crewhaus/memory-store": "workspace:*",
+    "@crewhaus/wiki-store": "workspace:*",
     "@crewhaus/model-router": "workspace:*",
     "@crewhaus/module-marketplace-client": "workspace:*",
     "@crewhaus/migration-engine": "workspace:*",

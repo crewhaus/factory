@@ -26,7 +26,8 @@ export type TrustOrigin =
   | "skill"
   | "compaction"
   | "tool"
-  | "chain";
+  | "chain"
+  | "memory";
 
 export type RunContext = {
   readonly runId: string;
