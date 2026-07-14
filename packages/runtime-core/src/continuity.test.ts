@@ -860,3 +860,115 @@ describe("continuity — cache rotation bookkeeping (§2.5 dead-wiring fix)", ()
     }
   });
 });
+
+describe("sub-agent bridge seams (v0.3.0 §7.1) — recall-only memory, read-only continuity", () => {
+  test("the bridge projects opts.memory/continuity WITHOUT their write closures, and carries skills + failureTaxonomy", async () => {
+    const rootDir = mkdtempSync(join(tmpdir(), "crewhaus-bridge-seams-"));
+    try {
+      const bridges: Array<Record<string, unknown>> = [];
+      const probe = buildTool({
+        name: "bridge_probe",
+        description: "captures the runtime bridge",
+        inputSchema: z.object({}),
+        execute: async (_input, ctx) => {
+          bridges.push({ ...(ctx?.bridge as Record<string, unknown>) });
+          return "ok";
+        },
+      });
+      const main = makeCapturingAdapter([
+        [{ type: "tool_use", id: "tu_probe", name: "bridge_probe", input: {} }],
+        [{ type: "text", text: "done" }],
+      ]);
+      const taxonomy = [{ class: "custom", pattern: "nope", recovery: "fail" as const }];
+
+      await runChatLoop({
+        model: "test-model",
+        instructions: "t",
+        _adapter: main.adapter,
+        sessionRootDir: rootDir,
+        singleTurn: true,
+        seedMessages: [{ role: "user", content: "probe" }],
+        tools: [probe],
+        permissionMode: "bypass",
+        skills: [{ name: "sk", description: "a skill", filePath: join(rootDir, "SKILL.md") }],
+        failureTaxonomy: taxonomy,
+        memory: {
+          autoRecall: false,
+          recallK: 3,
+          recall: async () => ["remembered line"],
+          // The write half must NOT cross onto the bridge:
+          autoCapture: true,
+          onCapture: async () => {
+            throw new Error("never reached from a child seam");
+          },
+        },
+        continuity: {
+          loadPlan: async () => "PLAN: seam test",
+          // The write closures must NOT cross onto the bridge:
+          onPlanDirty: async () => "PLAN: dirty",
+          onHandoff: async () => {
+            throw new Error("never reached from a child seam");
+          },
+        },
+      });
+
+      expect(bridges).toHaveLength(1);
+      const bridge = bridges[0] as {
+        memory?: Record<string, unknown>;
+        continuity?: Record<string, unknown>;
+        skills?: unknown[];
+        failureTaxonomy?: unknown;
+      };
+      // memory: recall-only projection — capture closures are absent.
+      expect(bridge.memory).toBeDefined();
+      expect(Object.keys(bridge.memory ?? {}).sort()).toEqual(["autoRecall", "recall", "recallK"]);
+      expect(bridge.memory?.["autoRecall"]).toBe(false);
+      // continuity: read-only projection — ONLY loadPlan crosses.
+      expect(bridge.continuity).toBeDefined();
+      expect(Object.keys(bridge.continuity ?? {})).toEqual(["loadPlan"]);
+      // skills + failureTaxonomy thread verbatim.
+      expect(bridge.skills).toHaveLength(1);
+      expect(bridge.failureTaxonomy).toEqual(taxonomy);
+    } finally {
+      rmSync(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  test("a run without the new options builds a bridge WITHOUT the seam fields (pre-0.3.0 shape)", async () => {
+    const rootDir = mkdtempSync(join(tmpdir(), "crewhaus-bridge-noseams-"));
+    try {
+      const bridges: Array<Record<string, unknown>> = [];
+      const probe = buildTool({
+        name: "bridge_probe",
+        description: "captures the runtime bridge",
+        inputSchema: z.object({}),
+        execute: async (_input, ctx) => {
+          bridges.push({ ...(ctx?.bridge as Record<string, unknown>) });
+          return "ok";
+        },
+      });
+      const main = makeCapturingAdapter([
+        [{ type: "tool_use", id: "tu_probe", name: "bridge_probe", input: {} }],
+        [{ type: "text", text: "done" }],
+      ]);
+      await runChatLoop({
+        model: "test-model",
+        instructions: "t",
+        _adapter: main.adapter,
+        sessionRootDir: rootDir,
+        singleTurn: true,
+        seedMessages: [{ role: "user", content: "probe" }],
+        tools: [probe],
+        permissionMode: "bypass",
+      });
+      expect(bridges).toHaveLength(1);
+      const bridge = bridges[0] as Record<string, unknown>;
+      expect("memory" in bridge).toBe(false);
+      expect("continuity" in bridge).toBe(false);
+      expect("skills" in bridge).toBe(false);
+      expect("failureTaxonomy" in bridge).toBe(false);
+    } finally {
+      rmSync(rootDir, { recursive: true, force: true });
+    }
+  });
+});

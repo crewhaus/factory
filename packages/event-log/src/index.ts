@@ -351,6 +351,10 @@ export type PlanUpdateEventPayload = {
   readonly step?: number;
   readonly status?: string;
   readonly title?: string;
+  /** v0.3.0 §7.1 — `formatAgentIdentity` of the acting run context when one
+   *  is set (e.g. `subagent=researcher` for a plan mutation made from inside
+   *  a sub-agent). Absent for top-level runs. */
+  readonly agentIdentity?: string;
 };
 
 /** Payload of a `goal_update` event — one goal creation or mutation. */
@@ -359,6 +363,8 @@ export type GoalUpdateEventPayload = {
   readonly action: "create" | "update";
   readonly status?: string;
   readonly title?: string;
+  /** See `PlanUpdateEventPayload.agentIdentity`. */
+  readonly agentIdentity?: string;
 };
 
 /** Payload of an `action_proof` event — one evidence reference checked
@@ -371,4 +377,6 @@ export type ActionProofEventPayload = {
   readonly step: number;
   readonly toolUseId: string;
   readonly verdict: "verified" | "missing" | "error_result";
+  /** See `PlanUpdateEventPayload.agentIdentity`. */
+  readonly agentIdentity?: string;
 };

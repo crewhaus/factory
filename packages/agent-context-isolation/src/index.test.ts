@@ -54,6 +54,11 @@ describe("createIsolatedContext", () => {
       expect(child.sessionId).toBe(child.runContext.sessionId);
       expect(child.sessionId).toMatch(/^sess_[0-9a-f]{16}$/);
       expect(child.toolResultDir).toBe(`.crewhaus/tool-results/${child.runContext.runId}`);
+      // v0.3.0 §7.1 / Track 10 — the child's identity is stamped at mint
+      // time so child-attributed writes (plan_update, wiki_write, audit
+      // entries) record which sub-agent acted.
+      expect(child.runContext.agentIdentity).toEqual({ subAgentId: "test-child" });
+      expect(parent.runContext.agentIdentity).toBeUndefined();
       await child.close();
       await parent.eventLog.close();
     } finally {

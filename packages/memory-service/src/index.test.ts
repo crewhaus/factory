@@ -278,6 +278,64 @@ describe("wireMemory — seams behavior", () => {
     expect(items?.[0]?.entry.expiresAt).toBeDefined();
   });
 
+  test("onCapture walks sub_agent_start brackets into child session logs (§7.1, PR 13 ∪ PR 10)", async () => {
+    // The composition-root pin for the pr13 reconciliation: BOTH wireMemory
+    // consumers (interpreter + compiled bundles) ride this one capture path,
+    // so the child walk must live HERE, not at a per-caller call site. The
+    // memory-store tests already pin the helper; this pins the wiring.
+    const { deps: d } = deps();
+    const sessionsDir = join(tmp, ".crewhaus", "sessions");
+    const CHILD_SESSION_ID = "sess_child0123456789";
+    mkdirSync(sessionsDir, { recursive: true });
+    // Parent log: one durable turn + the spawner's sub_agent_start bracket.
+    const parentEvents = [
+      { kind: "user_message", payload: { content: "Survey the EU CSV conventions." } },
+      {
+        kind: "sub_agent_start",
+        payload: { name: "researcher", childSessionId: CHILD_SESSION_ID },
+      },
+      { kind: "sub_agent_end", payload: { name: "researcher" } },
+      { kind: "assistant_message", payload: { content: "Survey done; findings captured." } },
+    ];
+    writeFileSync(
+      join(sessionsDir, `${SESSION_ID}.jsonl`),
+      `${parentEvents.map((e) => JSON.stringify(e)).join("\n")}\n`,
+    );
+    // Scripted child session: its own proof-linked durable turn.
+    const childEvents = [
+      { kind: "user_message", payload: { content: "Which delimiter do EU locales use?" } },
+      { kind: "tool_result", payload: { toolUseId: "tu_child_proof", isError: false } },
+      {
+        kind: "assistant_message",
+        payload: { content: "German and French locales default to semicolon-delimited CSV." },
+      },
+    ];
+    writeFileSync(
+      join(sessionsDir, `${CHILD_SESSION_ID}.jsonl`),
+      `${childEvents.map((e) => JSON.stringify(e)).join("\n")}\n`,
+    );
+
+    const wired = await wireMemory(
+      { specName: "seam-capture-children", memory: { autoCapture: true } },
+      d,
+    );
+    await wired.options.memory?.onCapture?.(1, SESSION_ID);
+
+    const items = (await wired.stores.memory?.list()) ?? [];
+    const parentFact = items.find((i) => i.entry.text === "Survey done; findings captured.");
+    const childFact = items.find(
+      (i) => i.entry.text === "German and French locales default to semicolon-delimited CSV.",
+    );
+    expect(parentFact).toBeDefined();
+    expect(parentFact?.entry.provenance?.sessionId).toBe(SESSION_ID);
+    // The child fact carries the CHILD's sessionId provenance (proof/evidence
+    // resolution must walk the child's log) + the subagent:<name> tag.
+    expect(childFact).toBeDefined();
+    expect(childFact?.entry.provenance?.sessionId).toBe(CHILD_SESSION_ID);
+    expect(childFact?.entry.provenance?.evidence).toEqual(["tu_child_proof"]);
+    expect(childFact?.entry.tags).toEqual(["auto-capture", SESSION_ID, "subagent:researcher"]);
+  });
+
   test("continuity seam: loadPlan renders focus + active plan + goals; handoff writes handoff.md", async () => {
     const { deps: d } = deps();
     const wired = await wireMemory({ specName: "seam-cont", continuity: {} }, d);

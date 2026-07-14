@@ -32,20 +32,67 @@ import {
   type IsolatedContext,
   type ParentRunHandle,
   type SpawnSubAgentOptions,
+  type SubAgentFailure,
   type SubAgentMessage,
   type SubAgentResult,
   type ToolCallRecord,
   createIsolatedContext,
 } from "@crewhaus/agent-context-isolation";
 import { classifyBoundary } from "@crewhaus/boundary-classifier";
+import {
+  type FailureReport,
+  RunFailedError,
+  isRunFailedError,
+  toFailureReport,
+} from "@crewhaus/errors";
 import { type EventLog, openEventLog } from "@crewhaus/event-log";
+import { buildFailureReport, classify } from "@crewhaus/recovery-engine";
 import { tagContent } from "@crewhaus/run-context";
 import { runChatLoop } from "@crewhaus/runtime-core";
 
 /**
- * Spawn one sub-agent run. Throws only if `runChatLoop` itself throws
- * non-abort (the abort case is reported as a `sub_agent_end` with
- * `isError: true` and the cancellation message in `finalMessage`).
+ * v0.3.0 §7.1 — classify a child terminal error at the spawner boundary.
+ * A `RunFailedError` (the child loop's recovery already halted with a
+ * report) passes its report through verbatim; everything else runs through
+ * recovery-engine's `classify` + `buildFailureReport` for the terminal
+ * classes and falls back to the generic `toFailureReport` shape otherwise.
+ * `failureClass` keeps the finer classify verdict even when the report
+ * falls back to the generic class — the parent model sees the honest bucket.
+ */
+function classifyChildFailure(err: unknown): SubAgentFailure {
+  if (isRunFailedError(err)) {
+    return { failureClass: err.report.class, report: err.report };
+  }
+  const klass = classify(err);
+  const report: FailureReport =
+    klass === "billing"
+      ? buildFailureReport("billing_exhausted", err)
+      : klass === "auth"
+        ? buildFailureReport("auth_invalid", err)
+        : klass === "rate_limit"
+          ? buildFailureReport("rate_limited", err)
+          : toFailureReport(err);
+  return { failureClass: klass, report };
+}
+
+/**
+ * Spawn one sub-agent run.
+ *
+ * Failure semantics (v0.3.0 §7.1):
+ *   - The parent's abort cascading into the child is reported as a
+ *     `sub_agent_end` with `isError: true` and the legacy cancellation
+ *     message in `finalMessage` (nothing to classify — the parent is
+ *     stopping anyway).
+ *   - Any other child terminal error is CLASSIFIED (see
+ *     `classifyChildFailure`). Non-fatal classes return a result whose
+ *     `failure` carries `{failureClass, report}` and whose `finalMessage`
+ *     is the structured JSON — the Task tool surfaces it as an honest
+ *     `is_error` tool result and the parent run continues.
+ *   - A billing/auth-class failure ESCALATES: after the `sub_agent_end`
+ *     bookkeeping (bracket integrity for capture/proof walkers) the spawner
+ *     rethrows `RunFailedError` so the parent's recovery halts the whole
+ *     run with the child's report — "a billing failure anywhere ends the
+ *     run with the billing message".
  */
 export async function spawnSubAgent(
   parent: ParentRunHandle,
@@ -91,6 +138,8 @@ export async function spawnSubAgent(
   let finalMessage = "";
   let isError = false;
   let errorMessage: string | undefined;
+  let childFailure: SubAgentFailure | undefined;
+  let escalation: RunFailedError | undefined;
 
   try {
     finalMessage = await runChatLoop({
@@ -107,15 +156,52 @@ export async function spawnSubAgent(
       installSigintHandler: false,
       maxTokens: parent.maxTokens,
       ...(sessionRootDir !== undefined ? { sessionRootDir } : {}),
+      // v0.3.0 §7.1 — thread the parent's seams into the child loop:
+      //   - memory: recall ON (the parent's recall closure, so recalled
+      //     context reaches the child's system prompt through the same
+      //     injected seam; autoRecall respects the parent's setting),
+      //     capture OFF by construction (`SubAgentMemorySeam` cannot carry
+      //     the write closures — parents own memory writes).
+      //   - skills: the child loop renders the skills prompt block (the
+      //     Skill tool itself already inherits via the catalog).
+      //   - failureTaxonomy: the child's recovery consults the same named
+      //     classes as the parent.
+      //   - continuity: READ-ONLY — `loadPlan` renders the plan tail;
+      //     `ledger: false` plus the absent onPlanDirty/onHandoff closures
+      //     mean a child never writes the parent's plan-store state
+      //     through the seam.
+      ...(parent.memory !== undefined ? { memory: parent.memory } : {}),
+      ...(parent.skills !== undefined && parent.skills.length > 0 ? { skills: parent.skills } : {}),
+      ...(parent.failureTaxonomy !== undefined ? { failureTaxonomy: parent.failureTaxonomy } : {}),
+      ...(parent.continuity !== undefined
+        ? { continuity: { loadPlan: parent.continuity.loadPlan, ledger: false } }
+        : {}),
       ...(opts._client !== undefined ? { _adapter: opts._client as ProviderAdapter } : {}),
     });
   } catch (err) {
     isError = true;
     errorMessage = (err as Error).message ?? String(err);
-    // Make the failure visible in the result rather than re-throwing — the
-    // Task tool surfaces this as a `tool_result` so the parent model can
-    // recover. Re-throwing would crash the parent's turn.
-    finalMessage = `[sub-agent error] ${errorMessage}`;
+    if (!isRunFailedError(err) && classify(err) === "user_aborted") {
+      // The parent's abort cascaded into the child — nothing to classify;
+      // keep the legacy cancellation shape (the parent is stopping anyway).
+      finalMessage = `[sub-agent error] ${errorMessage}`;
+    } else {
+      // v0.3.0 §7.1 — classify instead of swallowing into a string. The
+      // structured content is what the Task tool surfaces (is_error: true)
+      // for the non-fatal classes; billing/auth escalate below AFTER the
+      // sub_agent_end bookkeeping so the parent transcript keeps a closed
+      // bracket for capture/proof walkers.
+      childFailure = classifyChildFailure(err);
+      finalMessage = JSON.stringify({
+        isError: true,
+        failureClass: childFailure.failureClass,
+        report: childFailure.report,
+      });
+      if (childFailure.report.class === "billing" || childFailure.report.class === "auth") {
+        escalation =
+          err instanceof RunFailedError ? err : new RunFailedError(childFailure.report, err);
+      }
+    }
   }
 
   // Read the child's event log back to assemble transcript + tool calls.
@@ -147,6 +233,7 @@ export async function spawnSubAgent(
       childSessionId: child.sessionId,
       isError,
       ...(errorMessage !== undefined ? { errorMessage } : {}),
+      ...(childFailure !== undefined ? { failureClass: childFailure.failureClass } : {}),
       finalMessageLength: finalMessage.length,
       toolCallCount: toolCalls.length,
     },
@@ -160,12 +247,21 @@ export async function spawnSubAgent(
     childRunId: child.runContext.runId,
     childSessionId: child.sessionId,
     isError,
+    ...(childFailure !== undefined ? { failureClass: childFailure.failureClass } : {}),
     toolCallCount: toolCalls.length,
     finalMessageBytes: Buffer.byteLength(finalMessage, "utf8"),
     durationMs: performance.now() - t0SubAgent,
   });
 
   await child.close();
+
+  // v0.3.0 §7.1 escalation — a billing/auth-class child failure ends the
+  // WHOLE run: rethrow the child's classified report now that the bracket
+  // bookkeeping is complete (sub_agent_end appended, bus notified, child
+  // closed). tool-executor and the streaming executor deliberately let a
+  // RunFailedError pass, and the parent loop's recovery halts with this
+  // exact report.
+  if (escalation !== undefined) throw escalation;
 
   // Pillar 3 boundary site — re-classify the child's final message
   // before handing it back to the parent's context. The child ran
@@ -196,6 +292,7 @@ export async function spawnSubAgent(
     transcript,
     toolCalls,
     usage: { input_tokens: 0, output_tokens: 0 },
+    ...(childFailure !== undefined ? { failure: childFailure } : {}),
   };
 }
 

@@ -35,6 +35,9 @@
  *                      autoCapture/onCapture — the capture path stamps
  *                      `provenance {sessionId, evidence: toolUseIds}` from
  *                      the session event log (§2.4 proof-linked capture)
+ *                      and walks `sub_agent_start` brackets into child
+ *                      session logs (§7.1: child facts carry the child's
+ *                      sessionId provenance + a `subagent:<name>` tag)
  *   continuity on  → `ContinuityStore` (`.crewhaus/state/<spec>/`)
  *                    · tools FocusRead/FocusWrite, PlanRead/PlanUpdate/
  *                      PlanComplete, GoalWrite/GoalUpdate/GoalList,
@@ -102,11 +105,12 @@ import { createEmbedder } from "@crewhaus/embedder";
 import { CrewhausError } from "@crewhaus/errors";
 import {
   type MemoryStore,
+  captureChildFacts,
   captureFacts,
   createMemoryStore,
   deriveMemoryDecision,
   summarizeDurableFactsWithEvidence,
-  turnsFromEvents,
+  turnsFromEventsWithChildren,
 } from "@crewhaus/memory-store";
 import { createPiiRedactor } from "@crewhaus/pii-redactor";
 import { type LoadedSkill, type SkillRef, discoverSkills } from "@crewhaus/skills-registry";
@@ -733,15 +737,38 @@ function wireFacts(fragment: MemoryWiringFragment, deps: WireMemoryDeps): WiredF
             } catch {
               return; // no transcript, nothing to capture
             }
-            // §2.4 proof-linked capture: turnsFromEvents carries each turn's
-            // successful tool_result ids, so captured facts land with
+            // §2.4 proof-linked capture: the turn extraction carries each
+            // turn's successful tool_result ids, so captured facts land with
             // provenance {sessionId, evidence: toolUseIds}.
-            const turns = turnsFromEvents(parseSessionEvents(raw));
+            // v0.3.0 §7.1 (PR 13 ∪ PR 10 reconciliation): the walk follows
+            // sub_agent_start brackets into child session JSONLs (lazy reads,
+            // capped per child by MAX_CAPTURE_EVENTS_PER_CHILD) so sub-agent
+            // findings reach the store on BOTH wireMemory consumers — the
+            // `crewhaus run` interpreter and compiled bundles. Child facts
+            // land with provenance {sessionId: <child>} + a subagent:<name>
+            // tag; unreadable child logs are skipped.
+            const { turns, children } = await turnsFromEventsWithChildren(
+              parseSessionEvents(raw),
+              (childSessionId, maxEvents) => {
+                let childRaw: string;
+                try {
+                  childRaw = readFileSync(join(sessionsDir, `${childSessionId}.jsonl`), "utf-8");
+                } catch {
+                  return undefined; // missing/unreadable child log — skip it
+                }
+                return parseSessionEvents(childRaw).slice(0, maxEvents);
+              },
+            );
             const facts = summarizeDurableFactsWithEvidence(turns);
             const written = await captureFacts(store, facts, ["auto-capture", sessionId], {
               sessionId,
               ...(mem.ttlMs !== undefined ? { ttlMs: mem.ttlMs } : {}),
             });
+            written.push(
+              ...(await captureChildFacts(store, children, ["auto-capture", sessionId], {
+                ...(mem.ttlMs !== undefined ? { ttlMs: mem.ttlMs } : {}),
+              })),
+            );
             if (written.length > 0) {
               deps.log?.(
                 `[memory] auto-captured ${written.length} durable fact(s) into ${store.path()}\n`,
