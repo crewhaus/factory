@@ -148,6 +148,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   preserves every other line verbatim, and records the store version in
   `.crewhaus/meta.json`.
 
+- **Default skills and builtin slash commands** (`@crewhaus/default-skills` —
+  PR 12 of the v0.3.0 memory train). The product now ships three skills:
+  `continuity` (read the plan first, pin user requirements as verbatim REQ
+  entries, claimed-vs-proven status honesty with `PlanComplete` toolUseId
+  evidence, bias to action, accurate handoffs), `learning-loop` (the expert
+  demo's ANSWER/STUDY/REFLECT/EXAM modes productized, templated at compile
+  time via `renderSkill` with `{{domain}}`/`{{curriculum}}`/`{{sources}}` —
+  strict both ways, so a missing or typo'd substitution throws), and `dream`
+  (the consolidation playbook consumed by scheduled dream ticks). Bodies ship
+  both as exported string constants (compile-time embeddable into bundles)
+  and as real SKILL.md files (runtime-discoverable); either way they pass the
+  same `skill`-TrustOrigin classification as any other skill, and a
+  content-lint test pins every tool name they mention to the real v0.3.0
+  tool vocabulary. `discoverSkills` gains a `builtinSkills` option merged at
+  lowest precedence — `~/.crewhaus/skills` and `.crewhaus/skills` override
+  builtins by name, and an empty-body override disables one. `loadCommands`
+  gains builtin (`builtinDirs`) and user-level (`~/.crewhaus/commands`) roots
+  below the existing project root, and eleven builtin commands ship: `/plan`,
+  `/focus <text>`, `/next`, `/handoff`, `/clear-plan`, `/clear-focus`,
+  `/forget <query>`, `/study`, `/reflect`, `/exam`, `/dream`. Emitter and
+  interpreter wiring land in later PRs of the train.
 - **v0.3.0 continuity substrate (Goal 1, PR 7): `@crewhaus/continuity-store` +
   `@crewhaus/tool-plan`.** Two new packages carrying the memory release's
   focus/plans/goals layer — packages only; runtime/compiler/CLI wiring follows
@@ -225,6 +246,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and assert again). Spec/IR/emitter threading is PR 11; this PR is the
   runtime seam only.
 
+- **memory-store v2 — explicit forgetting, provenance, and hybrid recall**
+  (0.3.0 memory release, design §3.4). Memory entries gain additive JSONL
+  fields: `schemaVersion` (2 on new writes; absent = v1, read lazily),
+  `expiresAt` (TTL via `remember(…, { ttlMs })`), `supersededBy`, and
+  `provenance { sessionId?, evidence?: toolUseId[] }`. Mixed v1/v2 files read
+  correctly in both directions. New store APIs: `forget(id|query)` appends
+  supersede tombstones (the file stays append-only — never a hard delete),
+  `sweep()` tombstones TTL-expired entries (deterministic, idempotent),
+  `compact()` rewrites the file dropping dead lines (atomic tmp+rename — the
+  growth-bounding answer to the #53 F7 unbounded-growth TODO), and `list()`
+  materializes lifecycle status. Auto-capture is now proof-linked: captured
+  facts carry `provenance.sessionId` and the source turn's successful
+  `tool_result` toolUseIds as `provenance.evidence`. Passing an `embedder`
+  to `createMemoryStore` upgrades recall to a hybrid BM25 + embedding
+  reciprocal-rank fusion in which tool-grounded facts get a documented rank
+  boost; with no embedder the BM25 ranking is byte-identical to before
+  (regression-guarded).
+- **`MemoryForget` tool** (`@crewhaus/tool-memory`): explicit forgetting by
+  id or query — destructive AND justification-gated (Pillar 3 intent gate).
+  `Remember` accepts an optional `ttlDays`.
+- **`crewhaus memory list|show <id>|forget <id|--query <q>>|sweep [--compact]`**:
+  inspect the per-spec fact stores (id/age/tags/provenance/status), explicitly
+  forget memories, and run the TTL sweep + compaction. Destructive verbs
+  preview their match set and prompt unless `--yes`.
+- **`crewhaus migrate memories [--dry-run]`**: idempotent v2 backfill over
+  `.crewhaus/memories/*.jsonl` via the migration-engine chain — stamps
+  `schemaVersion`, derives `provenance.sessionId` from v1 auto-capture tags,
+  preserves every other line verbatim, and records the store version in
+  `.crewhaus/meta.json`.
 - **`@crewhaus/wiki-store` — the local wiki substrate** (0.3.0 memory
   release, design §3.1). Update-in-place semantic memory under
   `.crewhaus/wiki/<spec>/`: markdown articles with YAML frontmatter (slug,
@@ -286,6 +336,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/focus <text>`, `/next`, `/handoff`, `/clear-plan`, `/clear-focus`,
   `/forget <query>`, `/study`, `/reflect`, `/exam`, `/dream`. Emitter and
   interpreter wiring land in later PRs of the train.
+- **Secrets can now reach MCP server child processes.** `mcp_servers` stdio
+  `env` and sse `headers` values route through the same `$UPPER_SNAKE`
+  secret machinery as every other credential field: plain strings stay
+  literals, `$VAR` lowers to an env reference resolved from the *running*
+  process's environment at boot (never baked into the artifact), and a
+  malformed `$…` ref under a credential-shaped key (`*_KEY` / `*_TOKEN` /
+  `*_SECRET` / `*_PASSWORD`, or the `Authorization` / `x-api-key` headers)
+  fails compilation instead of shipping a broken credential.
+  `@crewhaus/mcp-host` gains `resolveSecretRef` / `resolveMcpServerConfig`
+  (throwing a `ConfigError` that names the missing variable), and its stdio
+  transport now merges explicit `env` on top of the SDK's
+  `getDefaultEnvironment()` — previously the SDK's inherit allowlist
+  dropped arbitrary keys, so **no** factory path could deliver a secret
+  (e.g. `THREDZ_API_KEY`) into a spawned MCP server at all. The
+  `target-claude-plugin` emitter renders env refs as Claude Code's
+  `${VAR}` expansion syntax in `.mcp.json`.
 
 ### Changed
 
@@ -295,6 +361,142 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   compiled bundles resolve it at process start; `redundantMcpServerCollapse`
   compares env/headers structurally, so servers that differ only in
   credentials no longer collapse into one.
+- **Failure-taxonomy core: out-of-funding, bad-credential, and rate-limit
+  errors are now classified instead of misrouted (0.3.0 Goal 6, PR 1).**
+  `recovery-engine.classify()` gains three buckets ahead of the existing
+  ones: `billing` (HTTP 402; Anthropic's out-of-credit 400 "credit balance is
+  too low"; OpenAI's 429 + `code: "insufficient_quota"`; Bedrock's
+  `ServiceQuotaExceededException`), `auth` (401/403 at runtime), and
+  `rate_limit` (any other 429 — retried with the provider's `Retry-After`
+  honored for the delay, capped at 60 s). Billing and auth resolve to the new
+  terminal `{ kind: "halt", report }` recovery action immediately — no more
+  tombstone detour for an empty Anthropic account or five futile backoff
+  retries against OpenAI's `insufficient_quota`; rate-limit exhaustion halts
+  as class `rate_limit` instead of a generic fail. Reports are built from the
+  new `BUILTIN_FAILURE_CLASSES` table (billing_exhausted, auth_invalid,
+  rate_limited, mcp_boot_failure, crewhaus_budget), consulted after user
+  `failure_taxonomy` entries (user overrides win) and before the generic
+  buckets. `@crewhaus/errors` gains the `FailureReport` shape (class, title,
+  raw provider text, remediation, coded exit status, optional docs URL), the
+  documented `EXIT_CODES` table (0 ok · 1 generic · 20 spec · 21 config ·
+  30 auth · 31 provider funding · 32 quota/rate-limit · 33 crewhaus budget
+  cap · 40 tool/MCP), a dependency-free `formatRunFailure()` renderer, and
+  `RunFailedError` — thrown by runtime-core on a `halt` verdict; it extends
+  `RuntimeError`, so `crewhaus run` keeps printing a clean one-liner (now
+  with the failure title and provider text). The `failure_taxonomy` `hint`
+  field — declared since §55 and never consumed — finally reaches the user:
+  a matched entry that resolves terminally carries its hint as the report's
+  remediation line. Unmatched errors behave exactly as before. The
+  `run_failed` trace event, coded process exits, and adapter-side error
+  discrimination land in the follow-up PRs.
+
+- **One failure report, every surface: the structured `run_failed` event,
+  coded process exits, and the end of "agent exited" (0.3.0 Goal 6, PR 3).**
+  runtime-core now publishes a first-class **`run_failed { class, message,
+  remediation?, exitCode }`** trace event AND appends the matching
+  `run_failed` session-log record immediately BEFORE every terminal throw —
+  the classified `halt` path carries its `FailureReport` verbatim, and even
+  the generic `fail` path synthesizes a best-effort report (class `unknown`,
+  exit 1), so structured consumers finally see WHY a run died (the old
+  `error_recovered {action:"fail"}` carried only an error name). `halt` also
+  becomes a first-class `error_recovered` action (PR 1's interim halt→"fail"
+  wire mapping is gone); alert-watchdog and the SLO monitor count both
+  `fail` and `halt` as unrecovered, incident-collector auto-captures a
+  bundle on `run_failed`, and the structured-event printer renders the event
+  as the canonical multi-line report block. **Compiled bundles** — the exact
+  "agent exited" fix: target-cli's emitted `await runChatLoop(...)` and the
+  channel-bot / crew / research daemon mains are wrapped in a catch that
+  prints `formatRunFailure()` to stderr and exits with the report's coded
+  status (no more unhandled Bun stack + exit 1); channel-bot heartbeat ticks
+  render the classified report without crashing the daemon, and the managed
+  daemon logs it and keeps serving. **`crewhaus run`**: `die()` special-cases
+  `RunFailedError` — an out-of-funding run now ends with the full report
+  (title, provider text, `Fix:` line, and "Your session is saved —
+  `crewhaus run --continue` resumes exactly where it stopped." when a
+  session exists) and exit 31, while every other fatal keeps the classic
+  one-liner + exit 1. **`fleet run`** decodes coded child exits into
+  `✗ support-bot — provider account out of funding · exit 31` rows plus a
+  class-keyed rollup in the summary (`2 failed (billing ×1, auth ×1)`). New
+  **`crewhaus doctor --probe`**: an opt-in ~1-token live call per configured
+  provider (spec model verbatim + cheap defaults) that catches unfunded or
+  invalid keys before a long run, classifying failures as billing/auth via
+  recovery-engine. Successful runs and non-terminal recoveries emit no
+  `run_failed` (regression-pinned).
+- **Adapter error discrimination: all four provider adapters now surface the
+  billing / auth / rate-limit signals the classifier reads (0.3.0 Goal 6,
+  PR 2).** adapter-openai stops conflating every 429 into `overloaded_error`:
+  the API body envelope (with its `code` — `insufficient_quota` vs
+  `rate_limit_exceeded`) and the response headers now ride the `AdapterError`
+  wrapper, so an out-of-funds account halts immediately (exit 31) while a
+  genuine rate limit retries honoring `retry-after`; 401/402/403 pass through
+  on status. adapter-anthropic additionally copies the response headers
+  (Retry-After on 429s); its credit-balance 400 / 401 / 403 envelopes already
+  flowed through intact and are now pinned end-to-end. adapter-gemini parses
+  the REST error envelope out of `ApiError.message`: a 429 RESOURCE_EXHAUSTED
+  whose QuotaFailure names a per-day / free-tier quota is billing-class
+  (envelope `code: "insufficient_quota"`), any other 429 is rate-limit-shaped
+  with google.rpc.RetryInfo's `retryDelay` threaded as the retry delay, and
+  passthrough statuses (401/403) carry the parsed body message instead of a
+  JSON blob. adapter-bedrock keeps the original Smithy exception name on the
+  wrapper so `ServiceQuotaExceededException` (a hard account quota, HTTP 400)
+  classifies as billing instead of being fabricated into a 429/overloaded,
+  while `ThrottlingException`/`TooManyRequestsException` stay
+  rate-limit-shaped; 401/403 pass through on status. `recovery-engine`'s
+  `classify()` now consults the top-level `code` and the envelope
+  `error.code` independently — the wrapper's own `code` slot holds
+  CrewhausError's ErrorCode (`"adapter"`) and no longer shadows the
+  provider's billing code. `circuit-breaker` fails fast: a billing-class
+  error (new exported structural check `isBillingError`, tunable via the new
+  `isFatal` option) trips the breaker on first sight instead of counting
+  toward the 5-failure threshold — a dead account no longer needs five
+  identical failures before the failover chain routes around it. Plain 500s,
+  overloads, and 400s behave exactly as before (regression-pinned per
+  provider).
+
+- **The runtime-core continuity seam: compaction can no longer eat a user's
+  requirements (0.3.0 Goal 1, PR 8).** The release's motivating failure — a
+  clarification answer living in the middle of message history was deleted
+  by `snip`, paraphrased away by an unverified `autoCompact` summary, and
+  the model re-asked the question — is now un-reproducible even when the
+  model misbehaves, and the fix is deterministic infrastructure with zero
+  model trust. New `RunChatLoopOptions.continuity` seam (injected closures,
+  like `memory`): when present, runtime-core appends a **volatile tail** of
+  system blocks (`<current_plan>` + `<requirements_ledger>`) AFTER the
+  cache-marked frozen prefix, rebuilt on every model call (hard-capped at
+  the exported `DEFAULT_CONTINUITY_TAIL_MAX_CHARS` = 4096 chars, ledger
+  first, oldest-first truncation with markers) — prompt-cache-manager gains
+  a `volatile: true` block flag that `manage()` never marks, plus a
+  dedicated regression suite pinning that the tail sits after the marker
+  and tail edits never strip or move it. **Requirements ledger (§2.3)**:
+  before `snip` drops middle messages and before `autoCompact` replaces
+  history, every evicted USER message is appended VERBATIM to the session
+  event log as the new additive `context_evicted` kind and folded into the
+  in-run ledger (16KB cap, oldest-first eviction, `[ledger truncated]`
+  marker); evicted assistant text and tool findings are persisted as
+  `context_evicted` too (episodic externalization — recall integration
+  lands later). The ledger re-injects on every call, `--resume` rebuilds it
+  deterministically from the logged events, the autocompact summarizer's
+  prompt receives it as an anchor (nothing depends on the summary being
+  right), and `compaction` event-log records now persist the **summary
+  text** beside the before/after counts. The per-run `_runState`
+  state-store gets its first consumer: plan-mutating tools set
+  `"plan.dirty"` through the RuntimeBridge's new `runState` field and the
+  loop re-renders the plan tail via `continuity.onPlanDirty` before the
+  next model call. **Handoff (§2.8)**: `continuity.onHandoff` fires exactly
+  once at teardown (the `memory.onCapture` finally slot) with a
+  deterministic `HandoffInput` — plan snapshot, ledger entries, session id,
+  stop reason; no model calls. **Cache-rotation bookkeeping (§2.5)**: a
+  boot-time marker rotation now publishes the new `cache_rotation` trace
+  event and invokes the new `onPromptCacheRotated(rotatedAt)` option, and a
+  fresh `promptCacheLastRotatedAt` genuinely skips the force-rotation —
+  the previously dead wiring is live (store persistence lands with
+  memory-service/threading). An ABSENT seam is byte-identical to before:
+  no tail blocks, no `context_evicted` events, an unchanged summarizer
+  prompt — regression-pinned, alongside the motivating-failure
+  reproduction test itself (evict the answer, force snip+autocompact,
+  assert the next rendered model input still carries it verbatim, resume
+  and assert again). Spec/IR/emitter threading is PR 11; this PR is the
+  runtime seam only.
 
 ### Fixed
 
