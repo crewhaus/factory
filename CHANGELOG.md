@@ -566,6 +566,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`acquireFileLock`/`withFileLock`); both stores keep their exact error
   types and message prefixes (pinned by their existing lock tests).
 
+- **`crewhaus init --interactive` is a real conversation** (v0.3.0 §2.9,
+  PR 18 — the scene of the release's motivating failure, rebuilt). The model
+  path is no longer a single-shot forced `emit_spec` call that read one
+  stdin line and silently discarded everything else: it now boots a
+  persisted, resumable `runChatLoop` session with TWO tools and NO forced
+  toolChoice — `ask_user` (the clarifying question is surfaced on the
+  terminal and the answer arrives as the next user message over the
+  multi-turn REPL) and `emit_spec` (same `{ yaml }` contract; `parseSpec`
+  failures return to the conversation as tool errors the model fixes
+  in-context). The continuity fabric is ON for the interview itself — the
+  same `wireMemory` composition-root call every harness makes, spec-scoped
+  as `init-<dirname>` under the target directory — so REQ pinning
+  (FocusWrite), the verbatim requirements ledger, compaction protection, and
+  the teardown handoff protect the creator conversation too; the
+  interviewer's system prompt is a focused variant of the continuity
+  discipline (turn-1 verbatim REQ extraction echoed back, confirmed REQs
+  never re-asked, a REQ → spec-field mapping listed before emitting, which
+  the CLI prints after `wrote crewhaus.yaml`). New flags:
+  `init --interactive --resume` restarts a saved interview — the first
+  assistant message resumes from the ledger ("Resuming: N requirements
+  confirmed, M open questions …") with no work redone — and `--yes` skips
+  the conversation. A terminal failure mid-interview (billing/auth/token
+  exhaustion) prints the classified FailureReport plus "Your interview is
+  saved — `crewhaus init --interactive --resume` continues where it
+  stopped." Without a TTY the conversational path is refused (the scripted
+  questionnaire runs instead); the no-credentials scripted fallback is
+  byte-identical to before (subprocess-pinned).
 - **Sub-agents are no longer memory-blind, and their failures are no longer
   swallowed (0.3.0 §7.1, PR 13).** `spawnSubAgent` threads four seams from
   the parent's bridge into child loops: `memory` — recall ON via the
