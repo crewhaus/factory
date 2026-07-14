@@ -11,6 +11,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createEmbedder } from "@crewhaus/embedder";
+import { openEventLog } from "@crewhaus/event-log";
 import { createRunContext } from "@crewhaus/run-context";
 import { WikiVersionConflictError, createWikiStore } from "@crewhaus/wiki-store";
 import {
@@ -457,5 +458,26 @@ describe("wiki_write event seam", () => {
     });
     expect(events[1]?.payload).toMatchObject({ slug: "a", action: "set_signals" });
     expect(events[2]?.payload).toMatchObject({ slug: "gap-t", version: 1, action: "gap" });
+  });
+
+  test("wiki_write round-trips through a real EventLog (v0.3.0 integration seam)", async () => {
+    // The seam wiring the composition root will use: `WikiEvent` must be
+    // assignable to event-log's `AppendEvent` (a compile-time check against
+    // the merged EventKind union the parallel 0.3.0 branches each extended).
+    const log = await openEventLog("sess_00000000000000bb", {
+      rootDir: join(tmp, ".crewhaus", "sessions"),
+    });
+    const bundle = makeBundle({ appendEvent: (e: WikiEvent) => log.append(e) });
+    await bundle.write.execute({ slug: "a", title: "A", body: "b", editMessage: "seed" });
+
+    const logged: { kind: string; payload: unknown }[] = [];
+    for await (const ev of log.read()) logged.push({ kind: ev.kind, payload: ev.payload });
+    expect(logged).toEqual([
+      {
+        kind: "wiki_write",
+        payload: { slug: "a", version: 1, action: "write", editMessage: "seed" },
+      },
+    ]);
+    await log.close();
   });
 });

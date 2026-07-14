@@ -8,8 +8,9 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { openEventLog } from "@crewhaus/event-log";
 import type { ContinuityEvent } from "./index";
-import { createPlanTools } from "./index";
+import { PLAN_DIRTY_STATE_KEY, createPlanTools } from "./index";
 
 let tmp: string;
 let events: ContinuityEvent[];
@@ -324,5 +325,107 @@ describe("event seam decoupling", () => {
     expect(await bundle.planUpdate.execute({ action: "create", title: "p" })).toContain(
       "created plan-0001",
     );
+  });
+});
+
+describe("plan.dirty — the §2.5 runtime bridge seam", () => {
+  function makeBridgeCtx() {
+    const sets: Record<string, unknown>[] = [];
+    const ctx = {
+      bridge: {
+        runState: {
+          set: (partial: Record<string, unknown>) => {
+            sets.push(partial);
+          },
+        },
+      },
+    };
+    return { ctx, sets };
+  }
+
+  test("every successful mutation flips plan.dirty via bridge.runState", async () => {
+    const bundle = makeTools();
+    logToolPair("tu_1");
+    const { ctx, sets } = makeBridgeCtx();
+
+    await bundle.focusWrite.execute({ focus: "ship it" }, ctx);
+    await bundle.planUpdate.execute({ action: "create", title: "p", steps: ["a"] }, ctx);
+    await bundle.planUpdate.execute({ action: "add_step", text: "b" }, ctx);
+    await bundle.planUpdate.execute({ action: "set_step_status", step: 1, status: "claimed" }, ctx);
+    await bundle.planUpdate.execute({ action: "set_active", planId: "plan-0001" }, ctx);
+    await bundle.planComplete.execute(
+      { step: 1, evidence: [{ toolUseId: "tu_1", sessionId: SESS }] },
+      { ...ctx, runContext: undefined },
+    );
+    await bundle.goalWrite.execute({ title: "coverage" }, ctx);
+    await bundle.goalUpdate.execute({ goalId: "goal-0001", status: "in_progress" }, ctx);
+    await bundle.memoryClear.execute({ scope: "all" }, ctx);
+
+    expect(sets.length).toBe(9);
+    for (const partial of sets) {
+      expect(partial).toEqual({ [PLAN_DIRTY_STATE_KEY]: true });
+    }
+    // The literal runtime-core reads back (its exported PLAN_DIRTY_STATE_KEY).
+    expect(PLAN_DIRTY_STATE_KEY).toBe("plan.dirty");
+  });
+
+  test("read-only tools never flip the flag; failed mutations don't either", async () => {
+    const bundle = makeTools();
+    const { ctx, sets } = makeBridgeCtx();
+    await bundle.planUpdate.execute({ action: "create", title: "p", steps: ["a"] }, ctx);
+    sets.length = 0;
+
+    await bundle.focusRead.execute({}, ctx);
+    await bundle.planRead.execute({}, ctx);
+    await bundle.goalList.execute({}, ctx);
+    // A rejected proof (no such toolUseId anywhere) must not mark the plan dirty.
+    await expect(
+      bundle.planComplete.execute({ step: 1, evidence: [{ toolUseId: "tu_ghost" }] }, ctx),
+    ).rejects.toThrow();
+    expect(sets.length).toBe(0);
+  });
+
+  test("mutations without a bridge (or without runState) stay a no-op", async () => {
+    const bundle = makeTools();
+    await bundle.focusWrite.execute({ focus: "no bridge at all" });
+    await bundle.focusWrite.execute({ focus: "bridge without runState" }, { bridge: {} });
+    // Reaching here without a throw is the assertion.
+    expect(await bundle.focusRead.execute({})).toContain("bridge without runState");
+  });
+});
+
+describe("appendEvent seam against the real event-log union (v0.3.0 integration)", () => {
+  test("plan_update / goal_update / action_proof round-trip through a real EventLog", async () => {
+    // The seam wiring the composition root will use: `ContinuityEvent` must be
+    // assignable to event-log's `AppendEvent` (a compile-time union check —
+    // the parallel 0.3.0 branches each added kinds to the same union).
+    const seamSession = "sess_00000000000000aa";
+    const log = await openEventLog(seamSession, {
+      rootDir: join(tmp, ".crewhaus", "sessions"),
+    });
+    const bundle = makeTools({
+      sessionId: SESS,
+      appendEvent: (e: ContinuityEvent) => log.append(e),
+    });
+
+    await bundle.planUpdate.execute({ action: "create", title: "p", steps: ["a"] });
+    await bundle.goalWrite.execute({ title: "coverage" });
+    logToolPair("tu_seam");
+    await bundle.planComplete.execute({ step: 1, evidence: [{ toolUseId: "tu_seam" }] });
+
+    const kinds: string[] = [];
+    const payloads: unknown[] = [];
+    for await (const ev of log.read()) {
+      kinds.push(ev.kind);
+      payloads.push(ev.payload);
+    }
+    expect(kinds).toEqual(["plan_update", "goal_update", "action_proof", "plan_update"]);
+    expect(payloads[2]).toEqual({
+      planId: "plan-0001",
+      step: 1,
+      toolUseId: "tu_seam",
+      verdict: "verified",
+    });
+    await log.close();
   });
 });

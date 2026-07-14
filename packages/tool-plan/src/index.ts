@@ -73,6 +73,21 @@ export type ContinuityEvent =
  */
 export type AppendContinuityEvent = (event: ContinuityEvent) => void | Promise<void>;
 
+/**
+ * v0.3.0 §2.5 seam — the per-run state-store key plan-mutating tools flip
+ * (through `ToolExecuteContext.bridge.runState`, when the runtime wires one)
+ * so runtime-core re-renders the volatile `<current_plan>` tail before the
+ * next model call. Deliberately a duplicated literal: this package never
+ * imports runtime wiring, and runtime-core exports the same literal as its
+ * own `PLAN_DIRTY_STATE_KEY`; the runtime-core continuity suite pins the
+ * end-to-end round trip (a real PlanUpdate execute → the loop's dirty-check
+ * → tail re-render), so a drift in either literal fails tests.
+ */
+export const PLAN_DIRTY_STATE_KEY = "plan.dirty";
+
+/** Structural view of `RuntimeBridge.runState` — no runtime-core import. */
+type RunStateLike = { set(partial: Record<string, unknown>): void };
+
 export type CreatePlanToolsOptions = {
   readonly specName: string;
   readonly rootDir?: string;
@@ -278,6 +293,15 @@ export function createPlanTools(opts: CreatePlanToolsOptions): PlanToolBundle {
     return ctx?.runContext?.sessionId ?? opts.sessionId;
   }
 
+  /** §2.5 — flag the runtime's per-run state-store after a successful
+   *  mutation so the loop re-renders the plan tail before the next model
+   *  call. No-op when the runtime didn't wire `bridge.runState` (pre-0.3.0
+   *  bridge builders, direct tool execution in tests/CLI verbs). */
+  function markPlanDirty(ctx?: ToolExecuteContext): void {
+    const bridge = ctx?.bridge as { runState?: RunStateLike } | undefined;
+    bridge?.runState?.set({ [PLAN_DIRTY_STATE_KEY]: true });
+  }
+
   async function resolvePlanId(planId: string | undefined): Promise<string> {
     if (planId !== undefined) return planId;
     const active = await store.getActivePlan();
@@ -320,8 +344,9 @@ export function createPlanTools(opts: CreatePlanToolsOptions): PlanToolBundle {
       "Replace the persisted focus body (current objective + next actions). This is the hot loop — keep it current and short (capped at focusMaxChars). Requirements are appended via the ledger, not here.",
     inputSchema: focusWriteSchema,
     destructive: true, // audit-and-allow; deliberately NO requireJustification (§7.4)
-    execute: async (input) => {
+    execute: async (input, ctx) => {
       await store.writeFocus(input.focus);
+      markPlanDirty(ctx);
       return `focus updated (${input.focus.length} chars)`;
     },
   });
@@ -357,7 +382,7 @@ export function createPlanTools(opts: CreatePlanToolsOptions): PlanToolBundle {
       "Mutate the persisted plan: create a plan, add a step, move a step's ladder status (open → in_progress → claimed), or set the active plan. 'claimed' records progress WITHOUT verification — the 'proven' transition goes through PlanComplete with evidence.",
     inputSchema: planUpdateSchema,
     destructive: true, // audit-and-allow (§7.4): a judge call per routine plan update would drown the loop
-    execute: async (input) => {
+    execute: async (input, ctx) => {
       switch (input.action) {
         case "create": {
           const plan = await store.createPlan({
@@ -368,6 +393,7 @@ export function createPlanTools(opts: CreatePlanToolsOptions): PlanToolBundle {
             kind: "plan_update",
             payload: { planId: plan.id, action: "create", title: plan.title },
           });
+          markPlanDirty(ctx);
           return `created ${plan.id} — ${plan.title} (${plan.steps.length} step(s))\n${renderPlan(plan)}`;
         }
         case "add_step": {
@@ -377,6 +403,7 @@ export function createPlanTools(opts: CreatePlanToolsOptions): PlanToolBundle {
             kind: "plan_update",
             payload: { planId, action: "add_step", step: plan.steps.length },
           });
+          markPlanDirty(ctx);
           return `added step ${plan.steps.length} to ${planId}`;
         }
         case "set_step_status": {
@@ -391,6 +418,7 @@ export function createPlanTools(opts: CreatePlanToolsOptions): PlanToolBundle {
               status: input.status,
             },
           });
+          markPlanDirty(ctx);
           return `${planId} step ${input.step} → ${input.status}${
             input.status === "claimed" ? " (unverified — prove it with PlanComplete)" : ""
           }`;
@@ -401,6 +429,7 @@ export function createPlanTools(opts: CreatePlanToolsOptions): PlanToolBundle {
             kind: "plan_update",
             payload: { planId: input.planId, action: "set_active" },
           });
+          markPlanDirty(ctx);
           return `active plan → ${input.planId}`;
         }
       }
@@ -444,6 +473,7 @@ export function createPlanTools(opts: CreatePlanToolsOptions): PlanToolBundle {
           kind: "plan_update",
           payload: { planId, action: "prove_step", step: input.step, status: "proven" },
         });
+        markPlanDirty(ctx);
         return `${planId} step ${input.step} proven — evidence: ${refs
           .map((r) => r.toolUseId)
           .join(", ")}`;
@@ -471,7 +501,7 @@ export function createPlanTools(opts: CreatePlanToolsOptions): PlanToolBundle {
       "Create a persisted goal ({title, target?, current?, unit?}) in goals.yaml. Goals carry the same open → in_progress → claimed → proven ladder as plan steps.",
     inputSchema: goalWriteSchema,
     destructive: true,
-    execute: async (input) => {
+    execute: async (input, ctx) => {
       const goal = await store.writeGoal({
         title: input.title,
         ...(input.target !== undefined ? { target: input.target } : {}),
@@ -482,6 +512,7 @@ export function createPlanTools(opts: CreatePlanToolsOptions): PlanToolBundle {
         kind: "goal_update",
         payload: { goalId: goal.id, action: "create", title: goal.title },
       });
+      markPlanDirty(ctx);
       return `created ${goal.id} — ${goal.title}`;
     },
   });
@@ -518,6 +549,7 @@ export function createPlanTools(opts: CreatePlanToolsOptions): PlanToolBundle {
           ...(input.status !== undefined ? { status: input.status } : {}),
         },
       });
+      markPlanDirty(ctx);
       return `${goal.id} updated — ${renderGoal(goal).slice(2)}`;
     },
   });
@@ -545,11 +577,12 @@ export function createPlanTools(opts: CreatePlanToolsOptions): PlanToolBundle {
     // where the justification judge belongs — unlike the hot-loop
     // Focus/Plan updates, clears are rare and destructive-by-intent.
     requireJustification: true,
-    execute: async (input) => {
+    execute: async (input, ctx) => {
       const result = await store.clear(input.scope);
       if (result.moved.length === 0) {
         return `nothing to clear for scope "${input.scope}" (store is empty)`;
       }
+      markPlanDirty(ctx);
       return (
         `cleared: ${input.scope} (${result.moved.length} file(s)/dir(s)) → ${result.trashDir}\n` +
         `undo: crewhaus memory restore ${result.ts}`

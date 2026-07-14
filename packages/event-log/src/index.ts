@@ -161,19 +161,26 @@ export type EventKind =
   // route explain <session>`. Non-conversational, so `replayMessageHistory`
   // ignores it and `--resume` is unaffected.
   | "model_route"
-  // v0.3.0 continuity (design §2.4) — `plan_update` / `goal_update` /
-  // `action_proof` appended by `@crewhaus/tool-plan`; v0.3.0 memory (design §9)
-  // — `wiki_write` appended by `@crewhaus/tool-wiki`. Both through injected
-  // append seams (the tool packages stay decoupled from runtime wiring). All
-  // non-conversational: `replayMessageHistory` ignores them and readers written
-  // before these kinds existed keep parsing. Each kind sits on its own line so
-  // the parallel 0.3.0 branches merge trivially. Payload shapes are exported
-  // below (`PlanUpdateEventPayload` / `GoalUpdateEventPayload` /
-  // `ActionProofEventPayload` / `WikiWriteEventPayload`).
+  // 0.3.0 memory release (design §9) — one line per wiki mutation (payload
+  // `WikiWriteEventPayload`), emitted by @crewhaus/tool-wiki through its
+  // injected append seam (the emitter / memory-service composition root
+  // decides where it lands). Non-conversational, so `replayMessageHistory`
+  // ignores it and `--resume` is unaffected; readers written before this
+  // kind existed keep parsing. Additive — kept on its own line so the
+  // parallel 0.3.0 branches (plan_update/goal_update/action_proof,
+  // run_failed) merge trivially.
+  | "wiki_write"
+  // v0.3.0 continuity (design §2.4) — plan/goal mutations and machine-checked
+  // action proof, appended by `@crewhaus/tool-plan` through its injected
+  // append seam (the tool package stays decoupled from runtime wiring). All
+  // three are non-conversational: `replayMessageHistory` ignores them and
+  // readers written before these kinds existed keep parsing (every session-log
+  // reader branches on the kinds it knows and skips the rest). Payload shapes
+  // are exported below as `PlanUpdateEventPayload` / `GoalUpdateEventPayload`
+  // / `ActionProofEventPayload`.
   | "plan_update"
   | "goal_update"
-  | "action_proof"
-  | "wiki_write";
+  | "action_proof";
 
 /**
  * Payload for the `wiki_write` event kind (0.3.0 design §9): which article

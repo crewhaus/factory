@@ -25,6 +25,7 @@ import type { ProviderAdapter } from "@crewhaus/adapter-anthropic";
 import { createRunContext } from "@crewhaus/run-context";
 import type { Store } from "@crewhaus/state-store";
 import { buildTool } from "@crewhaus/tool-builder";
+import { createPlanTools } from "@crewhaus/tool-plan";
 import type { TraceEvent } from "@crewhaus/trace-event-bus";
 import { z } from "zod";
 import {
@@ -455,6 +456,69 @@ describe("continuity — plan.dirty refresh via the per-run state-store", () => 
       expect(secondPlan).toContain("PLAN V2: step one done");
       expect(secondPlan).not.toContain("PLAN V1");
       // The flag is consumed: exactly one refresh for one write.
+      expect(planDirtyCalls).toBe(1);
+    } finally {
+      rmSync(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  // v0.3.0 integration seam — PR 7 (tool-plan) and PR 8 (this loop's
+  // dirty-check) were built in parallel; this pins that the REAL PlanUpdate
+  // flips the flag through `bridge.runState` under the key this loop reads
+  // (PLAN_DIRTY_STATE_KEY), end to end: execute → dirty-check → tail
+  // re-render before the NEXT model call.
+  test("the REAL tool-plan PlanUpdate re-renders <current_plan> before the next model call", async () => {
+    const rootDir = mkdtempSync(join(tmpdir(), "crewhaus-continuity-toolplan-"));
+    try {
+      const bundle = createPlanTools({
+        specName: "seam-spec",
+        rootDir: join(rootDir, "state"),
+      });
+      let planDirtyCalls = 0;
+      const renderActive = async (): Promise<string> => {
+        const active = await bundle.store.getActivePlan();
+        return active === null ? "PLAN: (none yet)" : `PLAN: ${active.title}`;
+      };
+      const main = makeCapturingAdapter([
+        [
+          {
+            type: "tool_use",
+            id: "tu_plan_real",
+            name: "PlanUpdate",
+            input: {
+              action: "create",
+              title: "prove the integration seam",
+              steps: ["step one"],
+            },
+          },
+        ],
+        [{ type: "text", text: "done" }],
+      ]);
+
+      await runChatLoop({
+        model: "test-model",
+        instructions: "t",
+        _adapter: main.adapter,
+        sessionRootDir: rootDir,
+        singleTurn: true,
+        seedMessages: [{ role: "user", content: "make a plan" }],
+        tools: [...bundle.all],
+        permissionMode: "bypass",
+        continuity: {
+          loadPlan: renderActive,
+          onPlanDirty: async () => {
+            planDirtyCalls += 1;
+            return renderActive();
+          },
+        },
+      });
+
+      expect(main.callCount()).toBe(2);
+      const first = systemTexts(main.requests()[0]).find((t) => t.includes("<current_plan>"));
+      const second = systemTexts(main.requests()[1]).find((t) => t.includes("<current_plan>"));
+      expect(first).toContain("PLAN: (none yet)");
+      expect(second).toContain("PLAN: prove the integration seam");
+      // Exactly one refresh for one mutation — the flag was set and consumed.
       expect(planDirtyCalls).toBe(1);
     } finally {
       rmSync(rootDir, { recursive: true, force: true });
