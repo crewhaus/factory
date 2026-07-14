@@ -6,6 +6,8 @@ import { clearBoundaryCache } from "@crewhaus/boundary-classifier";
 import { type RunContext, createRunContext } from "@crewhaus/run-context";
 import { discoverSkills, loadSkillBody, parseSkillFile } from "@crewhaus/skills-registry";
 import { expand, loadCommands } from "@crewhaus/slash-commands";
+import { createPlanTools } from "@crewhaus/tool-plan";
+import { THREDZ_WIKI_TOOL_NAMES } from "@crewhaus/tool-wiki";
 import {
   BUILTIN_COMMAND_NAMES,
   CONTINUITY_SKILL_BODY,
@@ -427,6 +429,27 @@ describe("content lint — tool vocabulary", () => {
   test("no stray thredz__ prefixes — tool names are backend-neutral", () => {
     for (const doc of documents) {
       expect(doc.body).not.toContain("thredz__");
+    }
+  });
+
+  // v0.3.0 integration seam — the vocabulary above was pinned while tool-plan
+  // and tool-wiki were still parallel branches. Now that both are in-tree,
+  // tie the pin to the ACTUAL registered tool names so a rename on either
+  // side fails here instead of shipping stale prose.
+  test("the pinned vocabulary matches the REAL registered tool-plan and tool-wiki names", () => {
+    const stateDir = mkdtempSync(join(tmpdir(), "defaults-vocab-"));
+    try {
+      const planNames = createPlanTools({ specName: "vocab-probe", rootDir: stateDir }).all.map(
+        (t) => t.name,
+      );
+      for (const name of planNames) {
+        expect(TOOL_VOCABULARY.has(name)).toBe(true);
+      }
+      for (const name of THREDZ_WIKI_TOOL_NAMES) {
+        expect(TOOL_VOCABULARY.has(name)).toBe(true);
+      }
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true });
     }
   });
 });

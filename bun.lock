@@ -575,6 +575,8 @@
       "devDependencies": {
         "@crewhaus/boundary-classifier": "workspace:*",
         "@crewhaus/run-context": "workspace:*",
+        "@crewhaus/tool-plan": "workspace:*",
+        "@crewhaus/tool-wiki": "workspace:*",
       },
     },
     "packages/deployment-controller": {
@@ -1247,6 +1249,7 @@
       "devDependencies": {
         "@crewhaus/logging": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-plan": "workspace:*",
         "zod": "^3.23.8",
       },
     },
