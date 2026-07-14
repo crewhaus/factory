@@ -51,19 +51,29 @@ export type CapabilityTable = {
 };
 
 /**
- * Snapshotted alongside `DEFAULT_PRICING` (2026-05-08). Rows are keyed on the
+ * Snapshotted alongside `DEFAULT_PRICING` (2026-07-14). Rows are keyed on the
  * SAME family prefixes as the pricing table so `resolveCapabilities` and
  * `resolvePricing` line up one-to-one. Values transcribe the concrete
  * `ProviderFeatures` each adapter declares (adapter-anthropic/adapter-openai/
  * adapter-gemini/adapter-bedrock family.ts).
  */
 export const DEFAULT_CAPABILITIES: CapabilityTable = {
-  version: "2026-05-08",
+  version: "2026-07-14",
   providers: {
     anthropic: {
       // Every current claude-* family: explicit caching, tools, vision,
-      // thinking, hosted web_search (ANTHROPIC_FEATURES).
+      // thinking, hosted web_search (ANTHROPIC_FEATURES). The `claude-opus-4`
+      // major-base covers claude-opus-4-8; `claude-sonnet-5`/`claude-fable-5`
+      // and the bare-family fallbacks cover the current models that don't
+      // share a prefix with the 4.x bases — kept in lockstep with pricing.ts.
       "claude-opus-4": {
+        caching: "explicit",
+        tool_use: true,
+        vision: true,
+        thinking: true,
+        web_search: true,
+      },
+      "claude-sonnet-5": {
         caching: "explicit",
         tool_use: true,
         vision: true,
@@ -78,6 +88,41 @@ export const DEFAULT_CAPABILITIES: CapabilityTable = {
         web_search: true,
       },
       "claude-haiku-4": {
+        caching: "explicit",
+        tool_use: true,
+        vision: true,
+        thinking: true,
+        web_search: true,
+      },
+      "claude-fable-5": {
+        caching: "explicit",
+        tool_use: true,
+        vision: true,
+        thinking: true,
+        web_search: true,
+      },
+      "claude-opus": {
+        caching: "explicit",
+        tool_use: true,
+        vision: true,
+        thinking: true,
+        web_search: true,
+      },
+      "claude-sonnet": {
+        caching: "explicit",
+        tool_use: true,
+        vision: true,
+        thinking: true,
+        web_search: true,
+      },
+      "claude-haiku": {
+        caching: "explicit",
+        tool_use: true,
+        vision: true,
+        thinking: true,
+        web_search: true,
+      },
+      "claude-fable": {
         caching: "explicit",
         tool_use: true,
         vision: true,
@@ -117,6 +162,13 @@ export const DEFAULT_CAPABILITIES: CapabilityTable = {
         thinking: false,
         web_search: false,
       },
+      "gpt-5.1": {
+        caching: "automatic",
+        tool_use: true,
+        vision: true,
+        thinking: false,
+        web_search: false,
+      },
       "gpt-5": {
         caching: "automatic",
         tool_use: true,
@@ -143,6 +195,13 @@ export const DEFAULT_CAPABILITIES: CapabilityTable = {
     gemini: {
       // GEMINI_FEATURES: automatic caching, tools, vision, thinking; no
       // hosted web_search.
+      "gemini-3-pro": {
+        caching: "automatic",
+        tool_use: true,
+        vision: true,
+        thinking: true,
+        web_search: false,
+      },
       "gemini-2.5-pro": {
         caching: "automatic",
         tool_use: true,
@@ -183,6 +242,20 @@ export const DEFAULT_CAPABILITIES: CapabilityTable = {
       // Transcribes adapter-bedrock featuresForFamily(): anthropic on Bedrock
       // keeps explicit caching + thinking; llama/mistral are tools-only;
       // nova adds vision.
+      "anthropic.claude-opus-4-8": {
+        caching: "explicit",
+        tool_use: true,
+        vision: true,
+        thinking: true,
+        web_search: false,
+      },
+      "anthropic.claude-sonnet-5": {
+        caching: "explicit",
+        tool_use: true,
+        vision: true,
+        thinking: true,
+        web_search: false,
+      },
       "anthropic.claude-opus-4": {
         caching: "explicit",
         tool_use: true,

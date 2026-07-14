@@ -7,7 +7,7 @@
  * event lands in the audit-log, a re-aggregation later will produce the
  * same dollar figure even if upstream pricing has changed.
  *
- * Sources (2026-05 — keep current per provider release notes):
+ * Sources (2026-07 — keep current per provider release notes):
  *   anthropic — https://www.anthropic.com/pricing
  *   openai    — https://openai.com/api/pricing
  *   gemini    — https://ai.google.dev/pricing
@@ -36,7 +36,7 @@ export type PricingTable = {
 };
 
 /**
- * Default pricing table snapshotted 2026-05-08. Override at construction
+ * Default pricing table snapshotted 2026-07-14. Override at construction
  * time via `createCostTracker(bus, { pricing })` for tests or for
  * historical-run repricing.
  *
@@ -45,21 +45,51 @@ export type PricingTable = {
  * that is already past (or nearing) its provider's retirement date needs a
  * `KNOWN_SUNSETS` entry too, or `cheapest`/right-size can silently pick a
  * model on its way out.
+ *
+ * Row convention: a version-specific row (`claude-opus-4-8`) is the precise
+ * price; a major-family base (`claude-opus-4`) catches unversioned/older ids
+ * in that major; a bare-family fallback (`claude-opus`) resolves a future
+ * next-major id (`claude-opus-5-…`) at the current-generation rate rather than
+ * silently missing. Longest-prefix match (`resolvePricing`) means the most
+ * specific row always wins, so the fallbacks only ever catch ids no
+ * more-specific row covers.
+ *
+ * Anthropic pricing note (2026-07): current Anthropic prices come from the
+ * `claude-api` skill — Opus 4.5+ is $5/$25 (the `claude-opus-4-8` row and the
+ * `claude-opus` fallback), Sonnet is $3/$15, Haiku is $1/$5, Fable is $10/$50.
+ * The pre-existing `claude-opus-4-7`/`4-6` and the `claude-opus-4` base are
+ * kept at their original $15/$75 (they also price the genuinely-legacy Opus
+ * 4.0/4.1 lineage the base catches) so historical audit-log re-aggregation
+ * against a pinned older table is unchanged and the wide cross-package test
+ * fixtures that key on that rate stay stable.
  */
 export const DEFAULT_PRICING: PricingTable = {
-  version: "2026-05-08",
+  version: "2026-07-14",
   providers: {
     anthropic: {
+      // Current generation (2026-07). Opus 4.5+ dropped to $5/$25.
+      "claude-opus-4-8": { inputPer1M: 5.0, outputPer1M: 25.0 },
+      // Kept at the original Opus rate — see the header note.
       "claude-opus-4-7": { inputPer1M: 15.0, outputPer1M: 75.0 },
       "claude-opus-4-6": { inputPer1M: 15.0, outputPer1M: 75.0 },
       "claude-opus-4": { inputPer1M: 15.0, outputPer1M: 75.0 },
+      "claude-sonnet-5": { inputPer1M: 3.0, outputPer1M: 15.0 },
       "claude-sonnet-4-6": { inputPer1M: 3.0, outputPer1M: 15.0 },
       "claude-sonnet-4-5": { inputPer1M: 3.0, outputPer1M: 15.0 },
       "claude-sonnet-4": { inputPer1M: 3.0, outputPer1M: 15.0 },
       "claude-haiku-4-5": { inputPer1M: 1.0, outputPer1M: 5.0 },
       "claude-haiku-4": { inputPer1M: 1.0, outputPer1M: 5.0 },
+      // Fable 5: Anthropic's most capable widely-released model.
+      "claude-fable-5": { inputPer1M: 10.0, outputPer1M: 50.0 },
       "claude-3-7-sonnet": { inputPer1M: 3.0, outputPer1M: 15.0 },
       "claude-3-5-haiku": { inputPer1M: 0.8, outputPer1M: 4.0 },
+      // Bare-family fallbacks at the current-generation rate so a next-major
+      // id never silently misses. Kept last so the version-specific and
+      // major-base rows above win longest-prefix.
+      "claude-opus": { inputPer1M: 5.0, outputPer1M: 25.0 },
+      "claude-sonnet": { inputPer1M: 3.0, outputPer1M: 15.0 },
+      "claude-haiku": { inputPer1M: 1.0, outputPer1M: 5.0 },
+      "claude-fable": { inputPer1M: 10.0, outputPer1M: 50.0 },
     },
     openai: {
       // OpenAI's automatic prompt caching charges no write premium — cached
@@ -81,6 +111,20 @@ export const DEFAULT_PRICING: PricingTable = {
         cachedReadPer1M: 0.1,
         cacheWritePer1M: 0.4,
       },
+      // gpt-5.1 (current, 2026-07) prices at the gpt-5 rate; best-known
+      // public pricing.
+      "gpt-5.1": {
+        inputPer1M: 1.25,
+        outputPer1M: 10.0,
+        cachedReadPer1M: 0.125,
+        cacheWritePer1M: 1.25,
+      },
+      "gpt-5.1-mini": {
+        inputPer1M: 0.25,
+        outputPer1M: 2.0,
+        cachedReadPer1M: 0.025,
+        cacheWritePer1M: 0.25,
+      },
       "gpt-5": {
         inputPer1M: 1.25,
         outputPer1M: 10.0,
@@ -97,6 +141,9 @@ export const DEFAULT_PRICING: PricingTable = {
       "o3-mini": { inputPer1M: 1.1, outputPer1M: 4.4 },
     },
     gemini: {
+      // Gemini 3 Pro (current, 2026-07); standard-context tier, best-known
+      // public pricing.
+      "gemini-3-pro": { inputPer1M: 2.0, outputPer1M: 12.0 },
       "gemini-2.5-pro": { inputPer1M: 1.25, outputPer1M: 5.0 },
       "gemini-2.5-flash": { inputPer1M: 0.15, outputPer1M: 0.6 },
       "gemini-2.0-flash": { inputPer1M: 0.1, outputPer1M: 0.4 },
@@ -104,6 +151,10 @@ export const DEFAULT_PRICING: PricingTable = {
       "gemini-1.5-flash": { inputPer1M: 0.075, outputPer1M: 0.3 },
     },
     bedrock: {
+      // Current-generation Anthropic-on-Bedrock at first-party rates, so a
+      // current model no longer inherits the legacy $15/$75 base.
+      "anthropic.claude-opus-4-8": { inputPer1M: 5.0, outputPer1M: 25.0 },
+      "anthropic.claude-sonnet-5": { inputPer1M: 3.0, outputPer1M: 15.0 },
       "anthropic.claude-opus-4": { inputPer1M: 15.0, outputPer1M: 75.0 },
       "anthropic.claude-sonnet-4": { inputPer1M: 3.0, outputPer1M: 15.0 },
       "meta.llama3-1-70b": { inputPer1M: 0.99, outputPer1M: 0.99 },

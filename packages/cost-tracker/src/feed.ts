@@ -157,6 +157,30 @@ export const KNOWN_SUNSETS: Readonly<Record<string, readonly SunsetEntry[]>> = {
       retiresOn: "2026-11-01",
       replacement: "claude-sonnet-4-5",
     },
+    {
+      modelIdPrefix: "claude-3-haiku",
+      retiresOn: "2026-04-19",
+      replacement: "claude-haiku-4-5",
+      note: "Claude 3 haiku; migrate to the 4.x haiku",
+    },
+    // Version-specific keys only — a bare `claude-opus-4` / `claude-sonnet-4`
+    // here would wrongly flag the current 4.5+/-5 models (findSunset prefix
+    // match), so the retiring 4.0/4.1 lineage is listed by exact minor.
+    {
+      modelIdPrefix: "claude-opus-4-1",
+      retiresOn: "2026-08-05",
+      replacement: "claude-opus-4-8",
+    },
+    {
+      modelIdPrefix: "claude-opus-4-0",
+      retiresOn: "2026-06-15",
+      replacement: "claude-opus-4-8",
+    },
+    {
+      modelIdPrefix: "claude-sonnet-4-0",
+      retiresOn: "2026-06-15",
+      replacement: "claude-sonnet-5",
+    },
   ],
   openai: [{ modelIdPrefix: "gpt-4o", retiresOn: "2026-09-01", replacement: "gpt-5" }],
   gemini: [

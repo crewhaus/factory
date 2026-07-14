@@ -360,6 +360,18 @@ export type CostAccrualEvent = TraceEventEnvelope & {
    */
   cacheCreationTokens?: number;
   costUsdMicros: number;
+  /**
+   * True when the `(provider, modelId)` pair had NO row in the pricing table,
+   * so `costUsdMicros` is 0 not because the call was free but because it could
+   * not be priced. `cost-tracker` still publishes the accrual (carrying the
+   * REAL `inputTokens`/`outputTokens`) so a downstream token tally survives an
+   * unpriced model, and so the alert-watchdog's pricing-miss detector fires.
+   * Absent (falsy) on every priced accrual — a genuinely-$0 priced call (e.g.
+   * a rounds-to-zero token count) is distinguishable from an unpriced one by
+   * this flag rather than only by the `costUsdMicros === 0 && tokens > 0`
+   * heuristic.
+   */
+  unpriced?: boolean;
   tenantId?: string;
   /**
    * FR-003 — when true, this event is an *aggregate* run total rather than a
