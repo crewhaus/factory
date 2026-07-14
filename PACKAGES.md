@@ -98,6 +98,7 @@ crewhaus init my-agent
 - **Eval & optimization** — `@crewhaus/eval-runner`, `@crewhaus/eval-grader`, `@crewhaus/grader-*`, `@crewhaus/prompt-optimizer`, `@crewhaus/prompt-optimizer-claude`, `@crewhaus/eval-optimizer-orchestrator`, `@crewhaus/spec-patch`
 - **Security fabric** — `@crewhaus/boundary-classifier`, `@crewhaus/egress-classifier`, `@crewhaus/permission-engine`, `@crewhaus/audit-log`, `@crewhaus/audit-encryption`, `@crewhaus/pii-redactor`, `@crewhaus/prompt-injection-detector`
 - **Persistence & state** — `@crewhaus/session-store`, `@crewhaus/checkpoint-store`, `@crewhaus/state-store`, `@crewhaus/vector-store`
+- **Memory & continuity (v0.3.0)** — `@crewhaus/memory-service` (the composition root every emitter calls), `@crewhaus/continuity-store`, `@crewhaus/tool-plan`, `@crewhaus/wiki-store`, `@crewhaus/tool-wiki`, `@crewhaus/dream-engine`, `@crewhaus/default-skills`, `@crewhaus/grader-continuity`
 - **Observability** — `@crewhaus/exporter-datadog`, `@crewhaus/exporter-newrelic`, `@crewhaus/exporter-honeycomb`, `@crewhaus/exporter-splunk`, `@crewhaus/otel-exporter`, `@crewhaus/cost-tracker`, `@crewhaus/run-context`, `@crewhaus/logging`
 - **Utilities (factory-side)** — `@crewhaus/errors`, `@crewhaus/rate-limiter`, `@crewhaus/circuit-breaker`, `@crewhaus/token-budget`, `@crewhaus/idempotency-keys`, `@crewhaus/template-registry`, `@crewhaus/dataset-registry`
 - **Sandbox images** — `@crewhaus/sandbox-image-*`, one per language for `tool-code-execution`. These may ship as container images in addition to npm packages.

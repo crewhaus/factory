@@ -10,7 +10,7 @@ For day-to-day visibility on what's in flight, see the [GitHub Project](https://
 - The spec schema is versioned from day one (`spec_version: v0`).
 - 1.0 ships when: schema is stable, the eval-driven optimization loop is documented and tested for at least three target shapes, and the boundary-classifier inventory is complete.
 
-## What's shipped (current: v0.2.2)
+## What's shipped (current: v0.3.0)
 
 **Compiler core (v0.1.0):**
 
@@ -40,17 +40,26 @@ For day-to-day visibility on what's in flight, see the [GitHub Project](https://
 - **Online learning (v0.2.2)** — ε-greedy and Thompson-sampling bandits (`learning.bandit`, `learning.explorationRate`); every pick emits a `model_route` trace event.
 - `crewhaus advise` mines the reward scoreboard into eval-gated pool-policy patches; the pool threads through `crewhaus run` and the pipeline/research/batch/browser shapes. Recipes: [57-advisor-loop](https://github.com/crewhaus/demos/blob/main/walkthroughs/57-advisor-loop.md), [59-model-resilience-and-cost](https://github.com/crewhaus/demos/blob/main/walkthroughs/59-model-resilience-and-cost.md).
 
+**v0.3.0 — the memory release:** default-on continuity (`continuity:`), the local wiki + `learning:` fabric, one-knob hosted memory (`thredz:`), scheduled `memory.dream` consolidation, and classified run failures with meaningful exit codes. Detail in the v0.3.x section below and the [changelog](CHANGELOG.md).
+
 ## v0.3.x (Days 60-120)
+
+**Shipped in v0.3.0 — the memory release.** Every agent-loop harness (cli, channel, managed, research, crew) now remembers: **continuity is on by default** — persistent focus, plans, and goals with a claimed→proven proof ladder, a verbatim requirements ledger that survives compaction, and a deterministic teardown handoff (`continuity:`; one line, `continuity: false`, restores the 0.2.x bundle byte-for-byte). **Continual learning** lands as the update-in-place local wiki (`memory.wiki`, hybrid recall) plus the `learning:` block that turns a harness into a self-teaching expert with `/study`, `/reflect`, and a first-class `/exam`. **Thredz is one knob** — `thredz: $THREDZ_API_KEY` flips the wiki backend to the hosted service, private by default. Everything stays **local-first**: the whole fabric runs on files under `.crewhaus/` with zero network, and Thredz is a backend flip, not a requirement. **`memory.dream`** consolidates on a schedule — a deterministic maintenance pass plus a budget-capped model phase. And **failures are honest**: billing/auth/rate-limit classification, one `FailureReport` on every surface, and a documented exit-code table — an out-of-credit account no longer reads as "agent exited."
+
+Still on the 0.3.x line:
+
+- Thredz backend wiring on the channel/managed/research/crew shapes (the `thredz:` block is carried there today; cli is emit-wired)
+- `proof: require | off` enforcement in tool-plan (carried; degrades to the ladder with a boot note)
+- `crewhaus wiki push | pull --thredz` — the explicit local ↔ hosted knowledge bridge
+- Better integration with the Anthropic, OpenAI, Google, and open-source model providers
+
+## v0.4.x (Days 120-180)
 
 The underlying plugin/template marketplace primitives — `packages/plugin-registry`, `module-marketplace-client`, `template-registry`, and the `crewhaus plugins` / `crewhaus templates` CLI — already landed in v0.2.0. The public Forge and its verified-artifact program are the remaining piece:
 
 - **Crewhaus Forge** (community registry) integration: `crewhaus publish`, artifact validation, artifact pages
 - Public artifact directory at forge.crewhaus.ai
 - Verified-artifact distinction (community vs reviewed)
-- Better integration with the Anthropic, OpenAI, Google, and open-source model providers
-
-## v0.4.x (Days 120-180)
-
 - More target shapes based on community demand
 - IR-level optimization passes beyond `redundantMcpServerCollapse`
 - Improved boundary classifier with custom-policy support
@@ -89,4 +98,4 @@ Open an RFC issue. See [`CONTRIBUTING.md`](CONTRIBUTING.md). We expect to revise
 
 ---
 
-*Last updated: 2026-07-07. Subject to change.*
+*Last updated: 2026-07-14. Subject to change.*

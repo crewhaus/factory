@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { MigrationEngine, type SpecObject, createDefaultEngine } from "@crewhaus/migration-engine";
 import { parseSpec } from "@crewhaus/spec";
 import { stringify as stringifyYaml } from "yaml";
-import { formatUpgradePlan, planUpgrade } from "./upgrade";
+import { collect030UpgradeNotes, formatUpgradePlan, planUpgrade } from "./upgrade";
 
 const CLI_SPEC = "name: t\ntarget: cli\nagent:\n  model: claude-opus-4-7\n  instructions: hi\n";
 
@@ -101,5 +101,81 @@ describe("formatUpgradePlan", () => {
   test("validate-fail wording carries the error", () => {
     const plan = planUpgrade("{not: yaml: :", createDefaultEngine(), parseSpecValidator);
     expect(formatUpgradePlan(plan, false)).toContain("cannot migrate");
+  });
+});
+
+describe("collect030UpgradeNotes — the 0.2.x→0.3.0 release notes (PR 20)", () => {
+  test("(a) an agent-loop spec with no continuity key gets the `continuity: false` pin offer", () => {
+    const notes = collect030UpgradeNotes(CLI_SPEC);
+    const continuity = notes.find((n) => n.id === "continuity-default-on");
+    expect(continuity).toBeDefined();
+    expect(continuity?.title).toContain("continuity ON by default");
+    expect(continuity?.body.join("\n")).toContain("continuity: false");
+    expect(continuity?.body.join("\n")).toContain("byte-for-byte");
+  });
+
+  test("(a) an explicit continuity key — either form — silences the pin offer", () => {
+    expect(
+      collect030UpgradeNotes(`${CLI_SPEC}continuity: false\n`).some(
+        (n) => n.id === "continuity-default-on",
+      ),
+    ).toBe(false);
+    expect(
+      collect030UpgradeNotes(`${CLI_SPEC}continuity:\n  focusMaxChars: 2048\n`).some(
+        (n) => n.id === "continuity-default-on",
+      ),
+    ).toBe(false);
+  });
+
+  test("(a) non-agent-loop shapes are not offered the pin (continuity is not default-on there)", () => {
+    const workflow = "name: w\ntarget: workflow\nsteps:\n  - name: s1\n    prompt: hi\n";
+    expect(collect030UpgradeNotes(workflow).some((n) => n.id === "continuity-default-on")).toBe(
+      false,
+    );
+  });
+
+  test("(b) a memory: spec is pointed at `crewhaus migrate memories`; a memoryless one is not", () => {
+    const withMemory = `${CLI_SPEC}memory:\n  enabled: true\n`;
+    const note = collect030UpgradeNotes(withMemory).find((n) => n.id === "migrate-memories");
+    expect(note?.body.join("\n")).toContain("crewhaus migrate memories");
+    expect(collect030UpgradeNotes(CLI_SPEC).some((n) => n.id === "migrate-memories")).toBe(false);
+  });
+
+  test("(c) mcp_servers env/headers are flagged BY SERVER NAME as secret-lowered", () => {
+    const withMcp = `${CLI_SPEC}mcp_servers:\n  github:\n    transport: stdio\n    command: npx\n    args: ["-y", "@modelcontextprotocol/server-github"]\n    env:\n      GITHUB_PERSONAL_ACCESS_TOKEN: $GITHUB_TOKEN\n  plain:\n    transport: stdio\n    command: echo\n`;
+    const note = collect030UpgradeNotes(withMcp).find((n) => n.id === "mcp-secret-lowering");
+    expect(note).toBeDefined();
+    expect(note?.title).toContain("github");
+    expect(note?.title).not.toContain("plain"); // no env/headers → unaffected
+    expect(note?.body.join("\n")).toContain("fails compilation");
+  });
+
+  test("unparseable YAML yields no notes (the plan reports the parse failure)", () => {
+    expect(collect030UpgradeNotes("{not: yaml: :")).toEqual([]);
+  });
+
+  test("notes ride the plan and render for both `upgrade` and `up-to-date`", () => {
+    const dryRun = planUpgrade(CLI_SPEC, createDefaultEngine(), parseSpecValidator);
+    expect(dryRun.action).toBe("upgrade");
+    const rendered = formatUpgradePlan(dryRun, false);
+    expect(rendered).toContain("0.2.x → 0.3.0 notes");
+    expect(rendered).toContain("continuity: false");
+
+    const upToDate = planUpgrade(
+      `version: 1\n${CLI_SPEC}`,
+      createDefaultEngine(),
+      parseSpecValidator,
+    );
+    expect(upToDate.action).toBe("up-to-date");
+    expect(formatUpgradePlan(upToDate, false)).toContain("0.2.x → 0.3.0 notes");
+  });
+
+  test("a spec no note applies to renders exactly as before (no empty notes block)", () => {
+    const pinned = "version: 1\nname: w\ntarget: workflow\nsteps:\n  - name: s1\n    prompt: hi\n";
+    const plan = planUpgrade(pinned, createDefaultEngine(), parseSpecValidator);
+    expect(plan.action).toBe("up-to-date");
+    expect(formatUpgradePlan(plan, false)).toBe(
+      "upgrade: spec is already at the current version (v1) — nothing to do.\n",
+    );
   });
 });
