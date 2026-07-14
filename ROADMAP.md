@@ -20,7 +20,7 @@ For day-to-day visibility on what's in flight, see the [GitHub Project](https://
 - `crewhaus-runtime-core` — runtime-thin imports for generated bundles
 - The CLI surface, grown well past the original six (`init`, `compile`, `run`, `optimize`, `validate`, `doctor`) to include `eval`, `lint`, `flywheel`, `advise`, `route`, `deploy`/`propose`, `fleet`, and more — see the [CLI reference](https://github.com/crewhaus/docs/blob/main/CLI-REFERENCE.md)
 - Eval-driven optimization: rule-based and Claude-driven `MutationProvider`s; spec-patch with YAML CST round-trip
-- Boundary classifier with `TrustOrigin` metadata across the eight boundary sites (MCP, sub-agent, channel, federation, skill, compaction, tool, chain)
+- Boundary classifier with `TrustOrigin` metadata across the nine boundary sites (MCP, sub-agent, channel, federation, skill, compaction, tool, chain, memory — recalled wiki/fact bodies via tool-wiki)
 - Hello-world examples for: CLI, workflow, channel-{discord,telegram,whatsapp}, federation, graph, sandbox-image (multiple language variants)
 
 **v0.2.0 — the automation release** (the feedback loops now run themselves):
