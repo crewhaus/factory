@@ -169,7 +169,18 @@ export type EventKind =
   // kind existed keep parsing. Additive — kept on its own line so the
   // parallel 0.3.0 branches (plan_update/goal_update/action_proof,
   // run_failed) merge trivially.
-  | "wiki_write";
+  | "wiki_write"
+  // v0.3.0 continuity (design §2.4) — plan/goal mutations and machine-checked
+  // action proof, appended by `@crewhaus/tool-plan` through its injected
+  // append seam (the tool package stays decoupled from runtime wiring). All
+  // three are non-conversational: `replayMessageHistory` ignores them and
+  // readers written before these kinds existed keep parsing (every session-log
+  // reader branches on the kinds it knows and skips the rest). Payload shapes
+  // are exported below as `PlanUpdateEventPayload` / `GoalUpdateEventPayload`
+  // / `ActionProofEventPayload`.
+  | "plan_update"
+  | "goal_update"
+  | "action_proof";
 
 /**
  * Payload for the `wiki_write` event kind (0.3.0 design §9): which article
@@ -291,3 +302,39 @@ async function* readEvents(
     stream.close();
   }
 }
+
+// ---- v0.3.0 continuity event payloads (design §2.4, PR 7) ----
+// Additive exports only: writers are `@crewhaus/tool-plan`'s injected append
+// seam; readers that predate these kinds skip them by convention.
+
+/** Payload of a `plan_update` event — one plan mutation (creation, a new
+ *  step, a ladder-status move up to `claimed`, the active-plan pointer, or
+ *  the machine-checked `prove_step` transition recorded alongside its
+ *  `action_proof` events). */
+export type PlanUpdateEventPayload = {
+  readonly planId: string;
+  readonly action: "create" | "add_step" | "set_step_status" | "set_active" | "prove_step";
+  readonly step?: number;
+  readonly status?: string;
+  readonly title?: string;
+};
+
+/** Payload of a `goal_update` event — one goal creation or mutation. */
+export type GoalUpdateEventPayload = {
+  readonly goalId: string;
+  readonly action: "create" | "update";
+  readonly status?: string;
+  readonly title?: string;
+};
+
+/** Payload of an `action_proof` event — one evidence reference checked
+ *  during a `proven` transition. `verified` means the cited `tool_use` /
+ *  `tool_result` pair resolved in a session log (parent or child) with
+ *  `isError` false; `missing` and `error_result` record rejected attempts so
+ *  the audit trail shows proof pressure, not just successes. */
+export type ActionProofEventPayload = {
+  readonly planId: string;
+  readonly step: number;
+  readonly toolUseId: string;
+  readonly verdict: "verified" | "missing" | "error_result";
+};

@@ -479,6 +479,16 @@
       "name": "@crewhaus/context-bundle",
       "version": "0.2.4",
     },
+    "packages/continuity-store": {
+      "name": "@crewhaus/continuity-store",
+      "version": "0.2.4",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/event-log": "workspace:*",
+        "@crewhaus/tenancy": "workspace:*",
+        "yaml": "^2.6.0",
+      },
+    },
     "packages/contract-compiler": {
       "name": "@crewhaus/contract-compiler",
       "version": "0.2.4",
@@ -1940,6 +1950,17 @@
         "@crewhaus/errors": "workspace:*",
       },
     },
+    "packages/tool-plan": {
+      "name": "@crewhaus/tool-plan",
+      "version": "0.2.4",
+      "dependencies": {
+        "@crewhaus/continuity-store": "workspace:*",
+        "@crewhaus/event-log": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "zod": "^3.23.8",
+      },
+    },
     "packages/tool-result-store": {
       "name": "@crewhaus/tool-result-store",
       "version": "0.2.4",
@@ -2271,6 +2292,8 @@
 
     "@crewhaus/context-bundle": ["@crewhaus/context-bundle@workspace:packages/context-bundle"],
 
+    "@crewhaus/continuity-store": ["@crewhaus/continuity-store@workspace:packages/continuity-store"],
+
     "@crewhaus/contract-compiler": ["@crewhaus/contract-compiler@workspace:packages/contract-compiler"],
 
     "@crewhaus/cost-tracker": ["@crewhaus/cost-tracker@workspace:packages/cost-tracker"],
@@ -2564,6 +2587,8 @@
     "@crewhaus/tool-orchestrator": ["@crewhaus/tool-orchestrator@workspace:packages/tool-orchestrator"],
 
     "@crewhaus/tool-permission-matcher": ["@crewhaus/tool-permission-matcher@workspace:packages/tool-permission-matcher"],
+
+    "@crewhaus/tool-plan": ["@crewhaus/tool-plan@workspace:packages/tool-plan"],
 
     "@crewhaus/tool-result-store": ["@crewhaus/tool-result-store@workspace:packages/tool-result-store"],
 
