@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { IrV0 } from "@crewhaus/ir";
+import { type MemoryWiringFragment, wireMemory } from "@crewhaus/memory-service";
+import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { TargetEmitError, emitCli } from "./index";
 
 function baseIr(overrides: Partial<IrV0> = {}): IrV0 {
@@ -677,44 +682,102 @@ describe("emitCli — run-level budget field (item 27)", () => {
   });
 });
 
-describe("emitCli — memory block (#53)", () => {
-  test("omits all memory wiring when the IR leaves it unset", () => {
+describe("emitCli — memory block (#53, rewired onto the PR 10 composition root)", () => {
+  test("omits all memory wiring when the IR leaves it unset (byte-identity guard)", () => {
     const content = emitCli(baseIr()).files[0]?.content ?? "";
+    expect(content).not.toContain("@crewhaus/memory-service");
+    expect(content).not.toContain("wireMemory");
+    expect(content).not.toContain("__memWired");
+    // The retired inline codegen must never resurface either.
     expect(content).not.toContain("@crewhaus/memory-store");
     expect(content).not.toContain("createMemoryTools");
     expect(content).not.toContain("\n  memory: {");
   });
 
-  test("a bare memory block wires Remember/Recall but no auto-* seams", () => {
+  test("a memory block emits ONE stable wireMemory call with the serialized fragment", () => {
     const content = emitCli(baseIr({ memory: {} })).files[0]?.content ?? "";
-    expect(content).toContain("createMemoryStore");
-    expect(content).toContain("createMemoryTools");
-    expect(content).toContain("__memBundle.remember");
-    expect(content).toContain("__memBundle.recall");
-    expect(content).not.toContain("autoRecall: true");
-    expect(content).not.toContain("autoCapture: true");
+    expect(content).toContain(`import { wireMemory } from "@crewhaus/memory-service";`);
+    expect(content).toContain(
+      'const __memWired = await wireMemory({"specName":"smoke","memory":{}}, { catalog: defaultCatalog, cwd: process.cwd() });',
+    );
+    expect(content).toContain("...__memWired.options,");
   });
 
-  test("autoRecall emits the recall seam threaded into runChatLoop", () => {
+  test("the fragment carries exactly the declared IR memory fields", () => {
     const content =
-      emitCli(baseIr({ memory: { autoRecall: true, recallK: 4 } })).files[0]?.content ?? "";
-    expect(content).toContain("autoRecall: true");
-    expect(content).toContain("recall: async (query, k) =>");
-    expect(content).toContain("__memDecision.recallK");
+      emitCli(
+        baseIr({
+          memory: { enabled: true, autoRecall: true, recallK: 4, autoCapture: true },
+        }),
+      ).files[0]?.content ?? "";
+    expect(content).toContain(
+      '{"specName":"smoke","memory":{"enabled":true,"autoCapture":true,"autoRecall":true,"recallK":4}}',
+    );
   });
 
-  test("autoCapture emits the teardown capture seam", () => {
-    const content = emitCli(baseIr({ memory: { autoCapture: true } })).files[0]?.content ?? "";
-    expect(content).toContain("autoCapture: true");
-    expect(content).toContain("onCapture: async (completedTurns, sessionId) =>");
-    expect(content).toContain("summarizeDurableFacts(turnsFromEvents(");
-    expect(content).toContain("captureFacts(__memStore");
+  test("the emitted bundle contains NO inline store/seam codegen — the service owns it", () => {
+    const content =
+      emitCli(baseIr({ memory: { autoRecall: true, autoCapture: true } })).files[0]?.content ?? "";
+    expect(content).not.toContain("createMemoryStore");
+    expect(content).not.toContain("createMemoryTools");
+    expect(content).not.toContain("summarizeDurableFacts");
+    expect(content).not.toContain("onCapture: async");
+    expect(content).not.toContain("@crewhaus/memory-store");
   });
 
   test("enabled:false disables all memory wiring", () => {
     const content =
       emitCli(baseIr({ memory: { enabled: false, autoRecall: true } })).files[0]?.content ?? "";
-    expect(content).not.toContain("createMemoryTools");
+    expect(content).not.toContain("wireMemory");
+    expect(content).not.toContain("@crewhaus/memory-service");
+  });
+
+  test("the EMITTED fragment literal drives the real wiring: tool parity + recall/capture round-trip", async () => {
+    // Behavioral-equivalence pin at the emit boundary: pull the exact JSON
+    // literal out of the generated bundle, run it through wireMemory (what
+    // the bundle does at boot), and drive the seams end to end.
+    const content =
+      emitCli(baseIr({ memory: { autoRecall: true, autoCapture: true, recallK: 4 } })).files[0]
+        ?.content ?? "";
+    const match = content.match(/await wireMemory\((\{.*?\}), \{ catalog: defaultCatalog/);
+    expect(match).not.toBeNull();
+    const fragment = JSON.parse(match?.[1] ?? "{}") as MemoryWiringFragment;
+
+    const tmp = mkdtempSync(join(tmpdir(), "target-cli-memory-"));
+    try {
+      const sessionId = "sess_00000000000000ff";
+      const sessionsDir = join(tmp, ".crewhaus", "sessions");
+      mkdirSync(sessionsDir, { recursive: true });
+      writeFileSync(
+        join(sessionsDir, `${sessionId}.jsonl`),
+        `${[
+          JSON.stringify({ kind: "user_message", payload: { content: "delimiter?" } }),
+          JSON.stringify({ kind: "tool_result", payload: { toolUseId: "tu_emit_1" } }),
+          JSON.stringify({
+            kind: "assistant_message",
+            payload: { content: "Semicolons delimit EU CSV files." },
+          }),
+        ].join("\n")}\n`,
+      );
+
+      const registered: RegisteredTool[] = [];
+      const wired = await wireMemory(fragment, {
+        catalog: { register: (t) => registered.push(t) },
+        cwd: tmp,
+        homeDir: join(tmp, "home"),
+      });
+      // Same tool surface the interpreter path wires (Remember/Recall as
+      // before this PR; MemoryForget is the sanctioned §3.4 addition).
+      expect(registered.map((t) => t.name)).toEqual(["Remember", "Recall", "MemoryForget"]);
+      // Capture round-trip through the emitted wiring...
+      await wired.options.memory?.onCapture?.(1, sessionId);
+      // ...and recall of what was captured, with the emitted recallK.
+      expect(wired.options.memory?.recallK).toBe(4);
+      const lines = await wired.options.memory?.recall?.("EU CSV delimiter", 4);
+      expect(lines).toEqual(["Semicolons delimit EU CSV files."]);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
   });
 });
 

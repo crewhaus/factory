@@ -53,6 +53,7 @@
         "@crewhaus/justification-judge-claude": "workspace:*",
         "@crewhaus/logging": "workspace:*",
         "@crewhaus/mcp-host": "workspace:*",
+        "@crewhaus/memory-service": "workspace:*",
         "@crewhaus/memory-store": "workspace:*",
         "@crewhaus/migration-engine": "workspace:*",
         "@crewhaus/migration-runner": "workspace:*",
@@ -485,6 +486,7 @@
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/event-log": "workspace:*",
+        "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/tenancy": "workspace:*",
         "yaml": "^2.6.0",
       },
@@ -948,6 +950,28 @@
         "@crewhaus/trace-event-bus": "workspace:*",
         "@modelcontextprotocol/sdk": "^1.29.0",
         "zod": "^3.23.8",
+      },
+    },
+    "packages/memory-service": {
+      "name": "@crewhaus/memory-service",
+      "version": "0.2.4",
+      "dependencies": {
+        "@crewhaus/continuity-store": "workspace:*",
+        "@crewhaus/default-skills": "workspace:*",
+        "@crewhaus/embedder": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/memory-store": "workspace:*",
+        "@crewhaus/skills-registry": "workspace:*",
+        "@crewhaus/slash-commands": "workspace:*",
+        "@crewhaus/tenancy": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-memory": "workspace:*",
+        "@crewhaus/tool-plan": "workspace:*",
+        "@crewhaus/tool-wiki": "workspace:*",
+        "@crewhaus/wiki-store": "workspace:*",
+      },
+      "devDependencies": {
+        "@crewhaus/runtime-core": "workspace:*",
       },
     },
     "packages/memory-store": {
@@ -1564,15 +1588,14 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
+        "@crewhaus/memory-service": "workspace:*",
       },
       "peerDependencies": {
         "@crewhaus/egress-matcher-semantic": "workspace:*",
         "@crewhaus/embedder": "workspace:*",
         "@crewhaus/hooks-engine": "workspace:*",
-        "@crewhaus/memory-store": "workspace:*",
         "@crewhaus/skills-registry": "workspace:*",
         "@crewhaus/slash-commands": "workspace:*",
-        "@crewhaus/tool-memory": "workspace:*",
       },
       "optionalPeers": [
         "@crewhaus/egress-matcher-semantic",
@@ -2145,6 +2168,7 @@
       "version": "0.2.4",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
+        "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/tenancy": "workspace:*",
         "yaml": "^2.6.0",
       },
@@ -2393,6 +2417,8 @@
     "@crewhaus/logging": ["@crewhaus/logging@workspace:packages/logging"],
 
     "@crewhaus/mcp-host": ["@crewhaus/mcp-host@workspace:packages/mcp-host"],
+
+    "@crewhaus/memory-service": ["@crewhaus/memory-service@workspace:packages/memory-service"],
 
     "@crewhaus/memory-store": ["@crewhaus/memory-store@workspace:packages/memory-store"],
 

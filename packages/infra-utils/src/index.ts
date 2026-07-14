@@ -5,6 +5,16 @@
  * concept (config loading, retries, ids) graduate to their own package.
  */
 
+// §7.6 advisory file lock (two real consumers: continuity-store, wiki-store).
+export {
+  type AcquireFileLockOptions,
+  type FileLockHandle,
+  type FileLockPolicy,
+  DEFAULT_FILE_LOCK_POLICY,
+  acquireFileLock,
+  withFileLock,
+} from "./file-lock";
+
 /**
  * Escape `s` so it is safe to embed as a string literal inside generated
  * TypeScript or JSON source. Returns a JSON-quoted form (includes surrounding

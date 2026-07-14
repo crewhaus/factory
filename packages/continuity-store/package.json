@@ -14,6 +14,7 @@
   "dependencies": {
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/event-log": "workspace:*",
+    "@crewhaus/infra-utils": "workspace:*",
     "@crewhaus/tenancy": "workspace:*",
     "yaml": "^2.6.0"
   },

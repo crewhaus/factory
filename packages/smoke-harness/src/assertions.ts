@@ -62,6 +62,29 @@ export const SHAPE_ASSERTIONS: readonly ShapeAssertion[] = [
       { in: "agent.ts", contains: "process.exit(__report.exitCode)" },
     ],
   },
+  // v0.3.0 PR 10 — the memory fabric's composition root. A `memory:` spec
+  // must emit ONE stable wireMemory call (fragment serialized from the IR)
+  // and spread the returned seams, instead of the retired per-emitter
+  // store/seam codegen. The no-memory cli fixture above stays byte-free of
+  // any memory wiring (its anchors would catch a stray import).
+  {
+    shape: "cli-memory",
+    expectedFiles: ["README.md", "agent.ts"],
+    anchors: [
+      { in: "agent.ts", contains: "@crewhaus/memory-service" },
+      { in: "agent.ts", contains: "const __memWired = await wireMemory(" },
+      { in: "agent.ts", contains: "...__memWired.options," },
+      { in: "agent.ts", contains: "{ catalog: defaultCatalog, cwd: process.cwd() }" },
+      // The fragment round-trips the fixture's memory block verbatim.
+      {
+        in: "agent.ts",
+        contains:
+          '{"specName":"smoke-cli-memory","memory":{"autoCapture":true,"autoRecall":true,"recallK":4}}',
+        fixtureOnly: true,
+      },
+      { in: "agent.ts", contains: "runChatLoop" },
+    ],
+  },
   // Cross-provider compile-path fixtures (no keys needed): the SAME cli
   // emitter must compile cleanly for every model-router provider prefix and
   // bake the full router string into the bundle verbatim — runtime-core's

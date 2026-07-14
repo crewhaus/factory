@@ -4,6 +4,11 @@
     "rootDir": "src",
     "outDir": "dist"
   },
-  "references": [{ "path": "../errors" }, { "path": "../event-log" }, { "path": "../tenancy" }],
+  "references": [
+    { "path": "../errors" },
+    { "path": "../event-log" },
+    { "path": "../infra-utils" },
+    { "path": "../tenancy" }
+  ],
   "include": ["src/**/*"]
 }

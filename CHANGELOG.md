@@ -353,6 +353,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `target-claude-plugin` emitter renders env refs as Claude Code's
   `${VAR}` expansion syntax in `.mcp.json`.
 
+- **The memory fabric's composition root** (`@crewhaus/memory-service` —
+  PR 10 of the v0.3.0 memory train; closes module catalog critical-path #2).
+  `wireMemory(fragment, {catalog, cwd, tenant?, sessionScope?, appendEvent?,
+  embedder?})` takes one serializable fragment (spec name + memory config
+  incl. wiki + continuity config incl. scope — the shape the §9 IR lowers
+  into in PR 11) and does everything the per-emitter memory codegen used to
+  template: constructs the stores (file backends; `backend: "thredz"` is a
+  reserved discriminator that fails fast until PR 16), registers the tools
+  (Remember/Recall/MemoryForget for facts; Focus/Plan/Goal/MemoryClear for
+  continuity, honouring `plan: false`; the ten thredz-vocabulary `wiki_*`
+  tools, with `log_knowledge_gap` routed into the plan store as a `[gap]`
+  goal when continuity is on), and returns spread-ready `RunChatLoopOptions`
+  seams — recall/onCapture over the fact store with the §2.4
+  provenance-stamping capture path, loadPlan/onPlanDirty/onHandoff over the
+  continuity store with the §2.3 ledger flag threaded, and the builtin
+  `continuity` skill + slash commands merged at lowest precedence via
+  `discoverSkills({builtinSkills})`/`loadCommands({builtinDirs})`.
+  `wireContinuity`/`wireWiki` ship as granular entry points; scope
+  (`spec`/`session`) and tenant fencing pass through to every store.
+  **target-cli** and the **`crewhaus run` interpreter** now make this one
+  stable call instead of inlining store/seam wiring: specs without a
+  `memory:` block compile to byte-identical bundles (test-pinned, incl. a
+  new `cli-memory` smoke fixture), and memory specs keep behavioral
+  equivalence (equivalence-pinned recall/capture round-trips) with two
+  sanctioned §3.4/§2.4 upgrades — `MemoryForget` is registered alongside
+  Remember/Recall, and compiled bundles gain the provenance-stamping capture
+  the interpreter already had. The wait-2s/steal-30s/fail-with-pid advisory
+  file lock that continuity-store and wiki-store each shipped on parallel
+  branches is unified into `@crewhaus/infra-utils`
+  (`acquireFileLock`/`withFileLock`); both stores keep their exact error
+  types and message prefixes (pinned by their existing lock tests).
+
 ### Changed
 
 - **BREAKING (IR, pre-1.0):** `IrMcpStdioConfig.env` and
