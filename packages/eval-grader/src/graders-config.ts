@@ -87,6 +87,21 @@ const LlmJudgeSpec = z.object({
   weight: z.number().optional(),
 });
 
+/**
+ * v0.3.0 §7.3 (PR 19) — opt into a grader BY REGISTRY NAME. `grader` is the
+ * name a grader pack registered with `@crewhaus/grader-registry` (e.g.
+ * `continuity.reAskRate` after `registerContinuityGraders(registry)`).
+ * Mirrors the `llm_judge` split exactly: this package stays free of a
+ * grader-registry dep, so compile returns a placeholder carrying
+ * `registrySpec` and the eval-runner substitutes the real grader from the
+ * registry it was handed (`RunEvalOptions.graderRegistry`).
+ */
+const RegistryGraderSpec = z.object({
+  name: z.string(),
+  type: z.literal("registry"),
+  grader: z.string().min(1),
+});
+
 const GraderSpec = z.discriminatedUnion("type", [
   ExactMatchSpec,
   ContainsSpec,
@@ -94,6 +109,7 @@ const GraderSpec = z.discriminatedUnion("type", [
   JsonPathSpec,
   ToolCallSequenceSpec,
   LlmJudgeSpec,
+  RegistryGraderSpec,
 ]);
 
 export const GradersConfigSchema = z.object({
@@ -110,6 +126,9 @@ export type CompiledGrader = {
   readonly grader: Grader;
   readonly weight: number;
   readonly judgeSpec?: { rubric: RubricSpec; model?: string };
+  /** Present for `type: registry` entries — the runner resolves `grader`
+   *  against its `graderRegistry` before invoking (see `RegistryGraderSpec`). */
+  readonly registrySpec?: { grader: string };
 };
 
 /**
@@ -201,6 +220,18 @@ function compile(spec: GraderSpec): CompiledGrader {
           rubric: spec.rubric,
           ...(spec.model !== undefined ? { model: spec.model } : {}),
         },
+      };
+    case "registry":
+      return {
+        name: spec.name,
+        // Placeholder grader; runner substitutes the registry entry.
+        grader: async () => {
+          throw new GraderError(
+            `registry grader "${spec.name}" (→ "${spec.grader}") must be resolved via the eval-runner's graderRegistry before invocation`,
+          );
+        },
+        weight: 1,
+        registrySpec: { grader: spec.grader },
       };
   }
 }

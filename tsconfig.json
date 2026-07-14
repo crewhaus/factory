@@ -70,6 +70,7 @@
     { "path": "./packages/grader-safety-classifiers" },
     { "path": "./packages/grader-multimodal" },
     { "path": "./packages/grader-12-metric-rubric" },
+    { "path": "./packages/grader-continuity" },
     { "path": "./packages/pii-redactor" },
     { "path": "./packages/audit-encryption" },
     { "path": "./packages/data-retention-engine" },

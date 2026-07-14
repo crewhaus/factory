@@ -1,0 +1,17 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "references": [
+    { "path": "../continuity-store" },
+    { "path": "../errors" },
+    { "path": "../eval-dataset" },
+    { "path": "../eval-grader" },
+    { "path": "../event-log" },
+    { "path": "../grader-registry" },
+    { "path": "../tool-plan" }
+  ],
+  "include": ["src/**/*"]
+}

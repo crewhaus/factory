@@ -16,6 +16,32 @@ export type ToolCall = {
   readonly isError: boolean;
 };
 
+/**
+ * v0.3.0 §7.3 (PR 19) — where this sample's on-disk artifacts live. The
+ * eval-runner isolates every sample into its own directory (session JSONLs
+ * at the top level, the memory fabric's ephemeral `.crewhaus/` state root
+ * nested inside — §7.2), and artifact-reading graders (e.g.
+ * `@crewhaus/grader-continuity`) need a way to FIND those files. This is
+ * that seam, and deliberately nothing more: graders read a finished
+ * sample's artifacts off disk; they never receive live store handles from
+ * the host (no layering violation, no way to mutate what they measure).
+ * Optional so hand-built `RunResult`s (tests, transcript-only grading)
+ * stay valid — artifact graders degrade to `transcript` when absent.
+ */
+export type RunArtifacts = {
+  /** The per-sample directory (`.crewhaus/evals/<runId>/<sampleId>`). */
+  readonly sampleDir: string;
+  /** The primary session id — its JSONL is renamed `transcript.jsonl`. */
+  readonly sessionId: string;
+  /** `<sampleDir>/transcript.jsonl` (the primary session's event log). */
+  readonly transcriptPath: string;
+  /** The sample's ephemeral fabric root, `<sampleDir>/.crewhaus` — state/
+   *  (focus, plans, handoff), memories/, wiki/ live under it. */
+  readonly stateRootDir: string;
+  /** The spec name (scopes `.crewhaus/state/<specName>/`), when known. */
+  readonly specName?: string;
+};
+
 export type RunResult = {
   /** Final assistant text returned by `runChatLoop`. */
   readonly agentOutput: string;
@@ -29,6 +55,8 @@ export type RunResult = {
   readonly turns: number;
   /** End-to-end wall-clock latency in ms. */
   readonly latencyMs: number;
+  /** On-disk artifact locations for this sample (see {@link RunArtifacts}). */
+  readonly artifacts?: RunArtifacts;
 };
 
 export type Grader = (sample: Sample, runResult: RunResult) => Promise<GradeResult>;
