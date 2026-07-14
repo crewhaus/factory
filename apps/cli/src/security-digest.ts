@@ -224,8 +224,9 @@ export type SecurityDigest = {
     readonly topDeniedTools: ReadonlyArray<DeniedToolEntry>;
     readonly byJudge: ReadonlyArray<JudgeEntry>;
   };
-  /** Pillar 3 sink-side — from `egress_decision` records (NO writer today;
-   *  see the module header — populated the day one lands). */
+  /** Pillar 3 sink-side — from `egress_decision` records, which runtime-core
+   *  appends on every warn/block verdict when the egress audit sink is wired
+   *  (pass verdicts stay ephemeral on the trace bus; see the module header). */
   readonly egress: {
     readonly decisions: number;
     readonly passed: number;

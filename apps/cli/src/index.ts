@@ -14033,11 +14033,11 @@ async function runRetention(args: ParsedArgs, action: string): Promise<void> {
  * cwd (or --dir) harness's `.crewhaus/audit` + `.crewhaus/sessions` stores
  * and emits a ranked warn/deny rollup: top justification-denied tools (with
  * judge identity + confidence), judge deny rate, policy-engine denials,
- * injection rule-id hits (from session redaction notices), and — the day a
- * writer lands for the declared-but-writerless `egress_decision` kind — top
- * warn/block egress sinks + origins. See security-digest.ts for exactly
- * which audit kinds have writers today and the design decisions (local HTML
- * helper, plain-fetch notify).
+ * injection rule-id hits (from session redaction notices), and top
+ * warn/block egress sinks + origins (from the `egress_decision` records
+ * runtime-core appends on warn/block verdicts). See security-digest.ts for
+ * exactly which audit kinds have writers today and the design decisions
+ * (local HTML helper, plain-fetch notify).
  *
  * The digest is a report, not a gate: it exits 0 even when the window is
  * full of denials. The one loud failure is `--notify` — a scheduled digest
