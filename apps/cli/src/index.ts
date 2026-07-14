@@ -13202,6 +13202,9 @@ async function runUpgrade(args: ParsedArgs): Promise<void> {
         "  Detect the spec's schema-version drift vs this CLI's current spec version\n" +
         "  and run the migration chain (each migrated spec is validated via parseSpec\n" +
         "  before it can be written). Defaults to ./crewhaus.yaml and to a dry-run diff.\n" +
+        "  Also prints the 0.2.x → 0.3.0 release notes that apply to this spec\n" +
+        "  (default-on continuity + the `continuity: false` pin, `crewhaus migrate\n" +
+        "  memories`, MCP env/header secret lowering) — informational only.\n" +
         "  --write   apply the migration in place (rewrites the spec file).\n",
     );
     return;

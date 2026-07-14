@@ -500,6 +500,146 @@ describe("diffSpecYaml — credential redaction (adversarial review F1)", () => 
   });
 });
 
+describe("0.3.0 memory release — memory/continuity knob paths (§7.5, PR 20)", () => {
+  const MEMORY_YAML = `# a memory-carrying support harness
+target: cli
+name: support-bot
+agent:
+  model: claude-sonnet-4-6
+  instructions: Help users with support tickets.
+memory:
+  enabled: true
+  ttl: 90d
+  # The semantic tier — the local wiki:
+  wiki:
+    enabled: true
+    recallK: 6
+  dream:
+    every: 24h
+continuity:
+  # keep the volatile tail small
+  focusMaxChars: 4096
+`;
+
+  const MEMORY_KNOB_PATHS = [
+    ["memory", "recallK"],
+    ["memory", "autoCaptureThreshold"],
+    ["memory", "ttl"],
+    ["memory", "wiki", "recallK"],
+    ["memory", "dream", "budget_usd"],
+    ["continuity", "focusMaxChars"],
+  ] as const;
+
+  test("the six knobs are registered on all five emit-wired memory shapes", () => {
+    for (const target of ["cli", "channel", "managed", "research", "crew"] as const) {
+      for (const path of MEMORY_KNOB_PATHS) {
+        expect(OPTIMIZABLE_PATHS[target]).toContainEqual([...path]);
+      }
+    }
+  });
+
+  test("a nested memory.wiki.recallK patch round-trips with comments and key order intact", () => {
+    const { yaml, spec } = applySpecPatch(MEMORY_YAML, {
+      target: "cli",
+      path: ["memory", "wiki", "recallK"],
+      op: "replace",
+      value: 12,
+    });
+    if (spec.target !== "cli") throw new Error("expected cli spec");
+    expect(spec.memory?.wiki?.recallK).toBe(12);
+    expect(yaml).toContain("recallK: 12");
+    // Comments survive the CST round-trip …
+    expect(yaml).toContain("# a memory-carrying support harness");
+    expect(yaml).toContain("# The semantic tier — the local wiki:");
+    expect(yaml).toContain("# keep the volatile tail small");
+    // … and key order does too: ttl before wiki, memory before continuity.
+    expect(yaml.indexOf("ttl: 90d")).toBeLessThan(yaml.indexOf("wiki:"));
+    expect(yaml.indexOf("memory:")).toBeLessThan(yaml.indexOf("continuity:"));
+    // Only the touched value changed — untouched siblings keep their bytes.
+    expect(yaml).toContain("ttl: 90d");
+    expect(yaml).toContain("every: 24h");
+  });
+
+  test("a continuity.focusMaxChars patch round-trips with its comment preserved", () => {
+    const { yaml, spec } = applySpecPatch(MEMORY_YAML, {
+      target: "cli",
+      path: ["continuity", "focusMaxChars"],
+      op: "replace",
+      value: 2048,
+    });
+    if (spec.target !== "cli") throw new Error("expected cli spec");
+    const continuity = spec.continuity;
+    if (typeof continuity === "boolean" || continuity === undefined) {
+      throw new Error("expected the continuity object form");
+    }
+    expect(continuity.focusMaxChars).toBe(2048);
+    expect(yaml).toContain("focusMaxChars: 2048");
+    expect(yaml).toContain("# keep the volatile tail small");
+  });
+
+  test("an add patch creates memory.dream.budget_usd inside the existing dream block", () => {
+    expect(specHasPath(MEMORY_YAML, ["memory", "dream", "budget_usd"])).toBe(false);
+    const { yaml, spec } = applySpecPatch(MEMORY_YAML, {
+      target: "cli",
+      path: ["memory", "dream", "budget_usd"],
+      op: "add",
+      value: 0.25,
+    });
+    if (spec.target !== "cli") throw new Error("expected cli spec");
+    expect(spec.memory?.dream?.budget_usd).toBe(0.25);
+    expect(yaml).toContain("budget_usd: 0.25");
+  });
+
+  test("validatePatch accepts every registered knob and an out-of-bounds value still fails apply", () => {
+    const { spec } = applySpecPatch(MEMORY_YAML, {
+      target: "cli",
+      path: ["memory", "wiki", "recallK"],
+      op: "replace",
+      value: 8,
+    });
+    for (const path of MEMORY_KNOB_PATHS) {
+      expect(() =>
+        validatePatch(spec, { target: "cli", path: [...path], op: "replace", value: 1 }),
+      ).not.toThrow();
+    }
+    // Bounds are owned by the spec schema: recallK is capped at 50, so an
+    // optimizer overshoot is rejected at apply time by the re-parse.
+    expect(() =>
+      applySpecPatch(MEMORY_YAML, {
+        target: "cli",
+        path: ["memory", "wiki", "recallK"],
+        op: "replace",
+        value: 500,
+      }),
+    ).toThrow(/spec validation failed/);
+  });
+
+  test("enum/behavioral switches stay OUT of the optimization surface", () => {
+    const { spec } = applySpecPatch(MEMORY_YAML, {
+      target: "cli",
+      path: ["memory", "recallK"],
+      op: "add",
+      value: 5,
+    });
+    const excluded = [
+      ["memory", "backend"], // store flip
+      ["memory", "dream", "every"], // side-effecting schedule
+      ["memory", "dream", "mode"], // model-spend switch
+      ["continuity", "proof"], // proof-ladder strictness
+      ["continuity", "scope"], // store scoping
+      ["continuity", "enabled"], // the release's sanctioned default
+      ["thredz"], // credentials
+      ["learning", "sources"], // allowlist = security
+      ["compaction", "preserve_user_messages"], // safety
+    ];
+    for (const path of excluded) {
+      expect(() => validatePatch(spec, { target: "cli", path, op: "replace", value: "x" })).toThrow(
+        /not listed in OPTIMIZABLE_PATHS/,
+      );
+    }
+  });
+});
+
 describe("adaptive model routing — model_pool policy paths", () => {
   const POOL_YAML = `target: cli
 name: pooled

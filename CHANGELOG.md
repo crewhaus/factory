@@ -7,181 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+v0.3.0 — **the memory release**: every agent-loop harness now remembers.
+Continuity — persistent focus, plans, and goals with a claimed→proven proof
+ladder, plus a verbatim requirements ledger that survives compaction — is ON
+by default (`continuity: false` is the one-line opt-out that restores your
+0.2.x bundle byte-for-byte). One knob — `thredz:` — flips the memory fabric
+onto a hosted Thredz wiki; a `learning:` block turns any harness into a
+self-teaching expert; `memory.dream` consolidates what was learned on a
+schedule; and when a run dies it now says WHY — classified billing / auth /
+rate-limit failures with remediation lines and meaningful exit codes instead
+of "agent exited".
+
+### Upgrade notes (0.2.x → 0.3.0)
+
+- **Recompile your bundles.** Compiled 0.2.x artifacts keep running as-is,
+  but everything in this release lands at compile time — recompile each spec
+  (`crewhaus compile …`) to pick it up.
+- **Continuity is default-on** on cli/channel/managed/research/crew:
+  recompiling without any spec change wires the continuity fabric. Add
+  `continuity: false` to restore your previous bundle byte-identically
+  (pinned by the byte-diff suite). `crewhaus upgrade` prints this note — and
+  the two below — for exactly the specs they apply to.
+- **`crewhaus migrate memories [--dry-run]`** — optional, idempotent v2
+  backfill for existing `.crewhaus/memories/*.jsonl` fact stores
+  (provenance/TTL/status fields). Old stores keep reading without it.
+- **Thredz needs `THREDZ_API_KEY`.** A spec with `thredz:` fails fast at
+  boot (exit 21) when the variable is missing; the key resolves from the
+  running process env and is never baked into compiled artifacts. The same
+  applies to any `mcp_servers` env/headers `$VAR` refs, which are now
+  secret-lowered (see the BREAKING note under Changed).
+- **Exit codes are meaningful now**: 0 ok · 1 generic · 20 spec · 21 config ·
+  30 auth · 31 provider funding · 32 quota/rate-limit · 33 crewhaus budget
+  cap · 40 tool/MCP — the documented `EXIT_CODES` table in
+  `@crewhaus/errors` (mirrored in the CLI reference). Update any automation
+  that pattern-matched on a bare exit 1.
+
 ### Added
 
-- **Memory quality is now measurable: continuity graders + the store-backend
-  conformance suite (0.3.0 §7.3/§5, PR 19).** New package
-  `@crewhaus/grader-continuity` ships five DETERMINISTIC (no-LLM) graders
-  computed from a sample's session artifacts — the eval-runner's isolated
-  per-sample session JSONLs + `.crewhaus/` state root (§7.2) — installable
-  with one call, `registerContinuityGraders(registry)`, exactly like the
-  12-metric rubric: `continuity.reAskRate` (question-shaped assistant
-  sentences whose content-token set is already ≥60%-covered by an earlier
-  user statement or a confirmed REQ ledger entry from an earlier session —
-  gate: 0, the motivating failure), `continuity.reqRetention` (fraction of
-  requirement-marker user sentences that survive to the final context:
-  unevicted, or carried by a focus-ledger REQ entry), `continuity.proofHonesty`
-  (past-tense done-claims vs plan steps with a VERIFIED `action_proof`
-  event; a `prove_step` without one is a proven-without-evidence anomaly →
-  score 0), `continuity.pickupSuccess` (two-session samples: does session
-  2's first assistant turn act on the handoff — references a next-action/
-  plan cue, no re-asking, no re-planning from scratch), and
-  `continuity.costPerProvenOutcome` (`cost_accrual` USD per verified proven
-  step, Infinity-safe when zero steps are proven). Cross-sample roll-ups
-  (`summarizeContinuityMetrics`, p50/p95/p99 + pass fractions + threshold
-  breaches, plus the cost ratio's own summarize) match the rubric's
-  summarize shape, and `renderContinuitySummaryLines` emits the report
-  lines. Eval configs opt in BY NAME via the new `type: registry` grader
-  entry (`grader: continuity.reAskRate`), resolved against
-  `RunEvalOptions.graderRegistry` with the same placeholder pattern
-  `llm_judge` uses; the runner now stamps `RunResult.artifacts`
-  (sampleDir/sessionId/transcriptPath/stateRootDir/specName) so artifact
-  graders find a finished sample's files without ever touching live stores.
-  A worked two-session fixture (`CONTINUITY_FIXTURE_SAMPLES` + a scripted
-  mock-adapter invoker that plays the conversations through the REAL
-  event-log/continuity-store/tool-plan code paths) pins the discrimination
-  matrix in tests: one clean run passes every gate, a re-asker fails
-  re-ask/retention/pickup, a claims-without-proof run fails honesty — end
-  to end through `runEval`. And the §5 promise — "local and Thredz are
-  contract-identical" is a test, not a convention — lands as
-  `runWikiBackendConformance` (exported from `@crewhaus/memory-service`, a
-  test-kit function, not a test file): upsert version-conflict semantics
-  incl. the literal `stale_article_version`, recall bundle shape, signals
-  metadata-only (+ verified reset on content writes), list staleness
-  ordering, visibility DEFAULTING TO PRIVATE, and `log_knowledge_gap`
-  behavior, run per-check against a fresh backend from a factory. The file
-  backend enrolls today (wiki-store's test suite, with a last-write-wins
-  negative control proving the suite discriminates); the Thredz backend
-  (PR 16) runs the same suite against a stub server.
-
-- **Learning — continual learning as a first-class capability (0.3.0
-  Goal 2, §3.3, PR 17).** A new top-level `learning:` block on the five
-  memory shapes (cli, channel, managed, research, crew): `domain`
-  (required), `curriculum` (agent-editable ladder file), `sources`
-  (allowlist hints — deliberately NOT optimizable, §7.5), `exam:
-  {dataset, graders}` (spec-relative paths; existence is a runtime
-  concern), and `study: {on_heartbeat, on_dream}` (unattended-study
-  toggles, both defaulting ON — the block is the opt-in, the toggles are
-  the opt-outs). Learning **requires a wiki**: `memory.wiki` (local) or
-  `thredz:` (hosted) must be present — cross-field CompilerError otherwise,
-  mirrored in ir-passes' `memoryIntegrityPass` — and the lowering stamps
-  `memory.wiki.requireSources: true` so `wiki_write` deterministically
-  rejects uncited bodies (an explicit `requireSources: false` alongside
-  learning is rejected as a contradiction). **Skill substitution:**
-  `wireMemory` renders the builtin `learning-loop` skill with
-  `{{domain}}`/`{{curriculum}}`/`{{sources}}` resolved (documented
-  fallbacks when curriculum/sources are omitted — never a literal token in
-  a prompt) and gates in the `/study` `/reflect` commands; a user/project
-  `learning-loop` skill still overrides by name. **First-class EXAM:** the
-  demo-era shell-out-to-`crewhaus eval` hack is replaced by an injected
-  `ExamRunner` seam (`wireMemory({ examRunner })`) driving a new `run_exam`
-  tool — a programmatic eval invocation (eval-runner's new
-  `createExamRunner`: `loadDataset` + `parseGradersConfig` + per-question
-  fresh single-turn sessions grounded in the REAL wiki through the
-  backend-invariant `wireWiki(...).recall` seam and runtime-core's
-  classified memory-injection path; per-sample artifacts under
-  `.crewhaus/evals/exam-<stamp>/`). No Bash permission is ever needed to
-  sit the exam; `/exam` gates in only when the exam is actually runnable
-  (config + runner). **Failed exam samples auto-log knowledge gaps** —
-  Thredz tasks (`log_knowledge_gap`, PII-redacted) on a live hosted
-  backend, plan-store `[gap]` goals locally — closing the gap→study
-  flywheel edge. Wired on the `crewhaus run` interpreter AND compiled cli
-  bundles (the emitted bundle constructs the same runner). **Unattended
-  study:** with `study.on_heartbeat`, target-channel-bot bakes the
-  study-rotation preamble (gaps first, ~3:1 study:reflect, bounded per
-  tick — the expert demo's HEARTBEAT.md policy, productized) ahead of the
-  operator's heartbeat instructions at codegen time; with `study.on_dream`,
-  the dream model phase's seeded prompt gains the top open `[gap]` goals +
-  the next unmastered curriculum rung, composed onto dream-engine's
-  existing `DreamModelPhase` seam. Absent `learning:` block, every emitted
-  bundle stays byte-identical (golden-pinned against the PR 16 emission).
-
-- **Thredz — one knob (0.3.0 Goal 3, §4, PR 16).** A new top-level `thredz:`
-  block on the five memory shapes (cli, channel, managed, research, crew):
-  `thredz: true` (≡ `{api_key: "$THREDZ_API_KEY"}`), the string shorthand
-  `thredz: $THREDZ_API_KEY`, or the object form (`api_key` required and
-  credential-lowered fail-fast; `base_url`; `visibility` defaulting
-  **private** — never Thredz's shared-by-default; `goals` mirror on/off,
-  defaulting to "on when continuity goals are on"; `agents` to register an
-  addressable handle at boot). On the emit-wired **cli** shape the compiler
-  synthesizes an `mcp_servers.thredz` stdio entry (`npx -y thredz-mcp@0.2.0`
-  with `THREDZ_API_KEY` as an `IrSecretRef` env value and
-  `THREDZ_DEFAULT_VISIBILITY` enforced deterministically) riding the §4.2
-  secret machinery end-to-end — the key never lands in compiled artifacts,
-  the generated README lists `THREDZ_API_KEY` automatically, `compile
-  --strict` stays green, and a missing key at boot renders the classified
-  config report (exit 21). A user-declared `mcp_servers.thredz` **wins over
-  synthesis** (explicit beats implicit — the vendored-server escape hatch;
-  `crewhaus lint` warns with the new `thredz-override` rule). **Tool
-  routing (§4.3):** the model keeps ONE vocabulary — the ten
-  `wiki_*`/`log_knowledge_gap` tools plus `goal_*`/`task_*` register as
-  bare-name MCP aliases via tool-mcp's new `registerMcpToolAliases`
-  (collision-guarded; `scope: "external"`, `ioCapability: "network"`,
-  boundary classification + lineage tagging identical to namespaced MCP
-  tools; `wiki_write`/`wiki_set_signals` keep their justification gate),
-  while the local tool-wiki twins are not registered and the local wiki
-  store on disk stays untouched. memory-service's `wireWiki` flips on the
-  thredz backend (replacing the reserved-backend error) and the auto-recall
-  fusion routes `wiki_recall` through the already-connected McpHost client
-  with the same recall-bundle line shape. **Goal mirroring (§4.4, resolved
-  decision 5):** continuity goal writes mirror to Thredz
-  `goal_write`/`goal_update` at the store's write/update sync points — spec
-  scope ONLY, local write always authoritative, mirrored titles
-  PII-redacted, idempotency-keyed creates, and Thredz-side failures
-  skip-and-warn (a free-tier goal cap surfaces as a clear `thredz_quota`
-  warning) without ever failing the local write. **Failure classes
-  (§4.4):** `classifyThredzFailure` maps the thredz-mcp v0.2.0 error
-  contract on status/code shapes (401/403 → `thredz_auth`, 403-disabled →
-  `thredz_billing`, 402/quota codes → `thredz_quota`, 429 →
-  `thredz_rate_limit`, else `thredz_unavailable`); boot failures degrade to
-  the local backend with an `mcp_boot` warning — Thredz codes never kill a
-  run. **`crewhaus doctor --probe`** gains a live `wiki_stats` round-trip
-  through the spec's thredz server (disabled keys and plan caps surface
-  before a long run degrades on them). The non-cli memory shapes carry the
-  block with the 0.2.3-convention ignored-note comment until their wiring
-  lands. The real published server contract is pinned by a read-only
-  integration test against thredz-mcp v0.2.0's `server.ts`.
-
-- **Dream — scheduled memory consolidation (0.3.0 Goal 5, §6, PR 14).** A new
-  `memory.dream` block (`every` in the shared duration grammar with a 5m
-  floor, `mode: deterministic|full` defaulting to `full`, `budget_usd`,
-  optional `instructions` playbook override) lowers to `IrMemoryDream
-  {everyMs, mode, budgetUsd?, instructions?}` on every memory-carrying shape
-  and wires the new **`@crewhaus/dream-engine`**. A dream run is two phases:
-  **phase 1, deterministic** (always; idempotent; zero model spend) — fact
-  TTL sweep + near-duplicate supersede + `compact()` growth bounding,
-  staleness flags (facts >90d, wiki unverified >30d — `STALE_FACT_AFTER_MS`
-  / `STALE_WIKI_UNVERIFIED_AFTER_MS` exported), sessions-index fold-in (the
-  item-57 machinery, lifted into `@crewhaus/session-store` as
-  `summarizeSessionIntoIndex`), proof-excerpt re-validation + retention-pin
-  refresh for records citing sessions nearing TTL, focus/handoff
-  next-actions refresh from open plans, and the trash purge past the 7-day
-  undo window (`purgeTrash`, now in continuity-store) — and **phase 2, model
-  synthesis** (`mode: full` AND `budget_usd > 0`): ONE bounded fresh session
-  (`sessionTarget: "dream"`, singleTurn, capped tool loop) seeded with the
-  builtin `dream` skill + phase-1 findings, acting ONLY through the normal
-  registered tools (`wiki_write`/`wiki_set_signals`/`MemoryForget`/
-  `PlanUpdate` — full justification/audit path), capped by the item-27
-  `budget` option, and **refusing to run an unpriced model** (cost-tracker's
-  `pricingMisses` would make the cap a silent no-op). State lands at
-  `.crewhaus/dream/<spec>/state.json` (`lastRunAt`/`lastOutcome`/
-  `phase1Counts`/`lastEvidence`) plus an additive `dream_run` event-log
-  kind; runs are **window-idempotent** (`dream:<spec>:<floor(now/every)>`
-  through durable-execution's `withIdempotency`, backed by a lock-honoring
-  file store) so a janitor tick, a GH-Actions cron, and a CLI invocation can
-  never double-fire — including under `fleet run` parallelism. Triggers:
-  runtime-core's janitor gains a **pluggable step registry**
-  (`createJanitor({ steps })`, replacing the closed step union;
-  `janitor_action` trace events for free) and the channel daemon registers
-  the full dream step (managed registers a per-tenant deterministic one)
-  with the conventional `CREWHAUS_DREAM=0` / `CREWHAUS_DREAM_INTERVAL_MS`
-  knobs; the cli shape runs a **boot-time deterministic catch-up** when
-  overdue (`[dream] overdue — deterministic pass done; run 'crewhaus dream'
-  for full consolidation`); and **`crewhaus dream run|status|init`** ships
-  cron-safe verbs (`init` scaffolds `.github/workflows/crewhaus-dream.yml`
-  on the odd-minute convention). With a dream schedule configured, the
-  builtin `dream` skill and the `/dream` command join the gated set
-  memory-service wires.
+#### Continuity & planning
 
 - **Continuity is ON BY DEFAULT — the release's one sanctioned behavior
   change (0.3.0 Goal 1, PR 11).** Every agent-loop harness — **cli, channel,
@@ -214,218 +77,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ir-passes DEFAULT_PIPELINE (`crewhaus lint`): wiki.recallK bounds, the ttl
   floor, session-scope-only-on-channel, and fragment JSON-serializability
   (the load-bearing copies of those rules live in `lower()` itself).
-
-- **`memory:` is now emit-wired on channel, managed, research, and crew —
-  and crew carries it for the first time (0.3.0 §9, PR 11).** The block was
-  previously parsed and lowered on channel/managed/research but silently
-  ignored by their emitters (only target-cli wired it); all four daemons now
-  make the same single `wireMemory` composition-root call as target-cli —
-  per turn with the conversation's `sessionScope` on channel, per turn with
-  the request's tenant on managed (stores tenant-fenced, §2.7), once at boot
-  on research (every branch shares the catalog) and crew (roles share the
-  spec-scoped stores through the orchestrator's new crew-wide
-  `extraTools`/`memory`/`continuity`/`skills` RunOptions — the plan IS the
-  coordination surface). The block itself gains the §9 extensions, all
-  optional and byte-neutral for existing specs: `backend: file|thredz`
-  (thredz reserved until PR 16), `ttl` (explicit fact forgetting as a
-  duration string — the shared duration grammar now accepts `d` for days,
-  e.g. `90d`, with a 1h floor enforced at compile time; `heartbeat.every`
-  accepts `d` too), and `wiki:` (`enabled`, `recallK`, `embedder`,
-  `autoRecall`, `requireSources`) — `wiki.autoRecall: true` fuses the
-  top-`recallK` wiki hits into the session-start recall bundle alongside
-  fact recall.
-
-- **Failure-taxonomy core: out-of-funding, bad-credential, and rate-limit
-  errors are now classified instead of misrouted (0.3.0 Goal 6, PR 1).**
-  `recovery-engine.classify()` gains three buckets ahead of the existing
-  ones: `billing` (HTTP 402; Anthropic's out-of-credit 400 "credit balance is
-  too low"; OpenAI's 429 + `code: "insufficient_quota"`; Bedrock's
-  `ServiceQuotaExceededException`), `auth` (401/403 at runtime), and
-  `rate_limit` (any other 429 — retried with the provider's `Retry-After`
-  honored for the delay, capped at 60 s). Billing and auth resolve to the new
-  terminal `{ kind: "halt", report }` recovery action immediately — no more
-  tombstone detour for an empty Anthropic account or five futile backoff
-  retries against OpenAI's `insufficient_quota`; rate-limit exhaustion halts
-  as class `rate_limit` instead of a generic fail. Reports are built from the
-  new `BUILTIN_FAILURE_CLASSES` table (billing_exhausted, auth_invalid,
-  rate_limited, mcp_boot_failure, crewhaus_budget), consulted after user
-  `failure_taxonomy` entries (user overrides win) and before the generic
-  buckets. `@crewhaus/errors` gains the `FailureReport` shape (class, title,
-  raw provider text, remediation, coded exit status, optional docs URL), the
-  documented `EXIT_CODES` table (0 ok · 1 generic · 20 spec · 21 config ·
-  30 auth · 31 provider funding · 32 quota/rate-limit · 33 crewhaus budget
-  cap · 40 tool/MCP), a dependency-free `formatRunFailure()` renderer, and
-  `RunFailedError` — thrown by runtime-core on a `halt` verdict; it extends
-  `RuntimeError`, so `crewhaus run` keeps printing a clean one-liner (now
-  with the failure title and provider text). The `failure_taxonomy` `hint`
-  field — declared since §55 and never consumed — finally reaches the user:
-  a matched entry that resolves terminally carries its hint as the report's
-  remediation line. Unmatched errors behave exactly as before. The
-  `run_failed` trace event, coded process exits, and adapter-side error
-  discrimination land in the follow-up PRs.
-
-- **Adapter error discrimination: all four provider adapters now surface the
-  billing / auth / rate-limit signals the classifier reads (0.3.0 Goal 6,
-  PR 2).** adapter-openai stops conflating every 429 into `overloaded_error`:
-  the API body envelope (with its `code` — `insufficient_quota` vs
-  `rate_limit_exceeded`) and the response headers now ride the `AdapterError`
-  wrapper, so an out-of-funds account halts immediately (exit 31) while a
-  genuine rate limit retries honoring `retry-after`; 401/402/403 pass through
-  on status. adapter-anthropic additionally copies the response headers
-  (Retry-After on 429s); its credit-balance 400 / 401 / 403 envelopes already
-  flowed through intact and are now pinned end-to-end. adapter-gemini parses
-  the REST error envelope out of `ApiError.message`: a 429 RESOURCE_EXHAUSTED
-  whose QuotaFailure names a per-day / free-tier quota is billing-class
-  (envelope `code: "insufficient_quota"`), any other 429 is rate-limit-shaped
-  with google.rpc.RetryInfo's `retryDelay` threaded as the retry delay, and
-  passthrough statuses (401/403) carry the parsed body message instead of a
-  JSON blob. adapter-bedrock keeps the original Smithy exception name on the
-  wrapper so `ServiceQuotaExceededException` (a hard account quota, HTTP 400)
-  classifies as billing instead of being fabricated into a 429/overloaded,
-  while `ThrottlingException`/`TooManyRequestsException` stay
-  rate-limit-shaped; 401/403 pass through on status. `recovery-engine`'s
-  `classify()` now consults the top-level `code` and the envelope
-  `error.code` independently — the wrapper's own `code` slot holds
-  CrewhausError's ErrorCode (`"adapter"`) and no longer shadows the
-  provider's billing code. `circuit-breaker` fails fast: a billing-class
-  error (new exported structural check `isBillingError`, tunable via the new
-  `isFatal` option) trips the breaker on first sight instead of counting
-  toward the 5-failure threshold — a dead account no longer needs five
-  identical failures before the failover chain routes around it. Plain 500s,
-  overloads, and 400s behave exactly as before (regression-pinned per
-  provider).
-- **One failure report, every surface: the structured `run_failed` event,
-  coded process exits, and the end of "agent exited" (0.3.0 Goal 6, PR 3).**
-  runtime-core now publishes a first-class **`run_failed { class, message,
-  remediation?, exitCode }`** trace event AND appends the matching
-  `run_failed` session-log record immediately BEFORE every terminal throw —
-  the classified `halt` path carries its `FailureReport` verbatim, and even
-  the generic `fail` path synthesizes a best-effort report (class `unknown`,
-  exit 1), so structured consumers finally see WHY a run died (the old
-  `error_recovered {action:"fail"}` carried only an error name). `halt` also
-  becomes a first-class `error_recovered` action (PR 1's interim halt→"fail"
-  wire mapping is gone); alert-watchdog and the SLO monitor count both
-  `fail` and `halt` as unrecovered, incident-collector auto-captures a
-  bundle on `run_failed`, and the structured-event printer renders the event
-  as the canonical multi-line report block. **Compiled bundles** — the exact
-  "agent exited" fix: target-cli's emitted `await runChatLoop(...)` and the
-  channel-bot / crew / research daemon mains are wrapped in a catch that
-  prints `formatRunFailure()` to stderr and exits with the report's coded
-  status (no more unhandled Bun stack + exit 1); channel-bot heartbeat ticks
-  render the classified report without crashing the daemon, and the managed
-  daemon logs it and keeps serving. **`crewhaus run`**: `die()` special-cases
-  `RunFailedError` — an out-of-funding run now ends with the full report
-  (title, provider text, `Fix:` line, and "Your session is saved —
-  `crewhaus run --continue` resumes exactly where it stopped." when a
-  session exists) and exit 31, while every other fatal keeps the classic
-  one-liner + exit 1. **`fleet run`** decodes coded child exits into
-  `✗ support-bot — provider account out of funding · exit 31` rows plus a
-  class-keyed rollup in the summary (`2 failed (billing ×1, auth ×1)`). New
-  **`crewhaus doctor --probe`**: an opt-in ~1-token live call per configured
-  provider (spec model verbatim + cheap defaults) that catches unfunded or
-  invalid keys before a long run, classifying failures as billing/auth via
-  recovery-engine. Successful runs and non-terminal recoveries emit no
-  `run_failed` (regression-pinned).
-
-- **Secrets can now reach MCP server child processes.** `mcp_servers` stdio
-  `env` and sse `headers` values route through the same `$UPPER_SNAKE`
-  secret machinery as every other credential field: plain strings stay
-  literals, `$VAR` lowers to an env reference resolved from the *running*
-  process's environment at boot (never baked into the artifact), and a
-  malformed `$…` ref under a credential-shaped key (`*_KEY` / `*_TOKEN` /
-  `*_SECRET` / `*_PASSWORD`, or the `Authorization` / `x-api-key` headers)
-  fails compilation instead of shipping a broken credential.
-  `@crewhaus/mcp-host` gains `resolveSecretRef` / `resolveMcpServerConfig`
-  (throwing a `ConfigError` that names the missing variable), and its stdio
-  transport now merges explicit `env` on top of the SDK's
-  `getDefaultEnvironment()` — previously the SDK's inherit allowlist
-  dropped arbitrary keys, so **no** factory path could deliver a secret
-  (e.g. `THREDZ_API_KEY`) into a spawned MCP server at all. The
-  `target-claude-plugin` emitter renders env refs as Claude Code's
-  `${VAR}` expansion syntax in `.mcp.json`.
-
-- **memory-store v2 — explicit forgetting, provenance, and hybrid recall**
-  (0.3.0 memory release, design §3.4). Memory entries gain additive JSONL
-  fields: `schemaVersion` (2 on new writes; absent = v1, read lazily),
-  `expiresAt` (TTL via `remember(…, { ttlMs })`), `supersededBy`, and
-  `provenance { sessionId?, evidence?: toolUseId[] }`. Mixed v1/v2 files read
-  correctly in both directions. New store APIs: `forget(id|query)` appends
-  supersede tombstones (the file stays append-only — never a hard delete),
-  `sweep()` tombstones TTL-expired entries (deterministic, idempotent),
-  `compact()` rewrites the file dropping dead lines (atomic tmp+rename — the
-  growth-bounding answer to the #53 F7 unbounded-growth TODO), and `list()`
-  materializes lifecycle status. Auto-capture is now proof-linked: captured
-  facts carry `provenance.sessionId` and the source turn's successful
-  `tool_result` toolUseIds as `provenance.evidence`. Passing an `embedder`
-  to `createMemoryStore` upgrades recall to a hybrid BM25 + embedding
-  reciprocal-rank fusion in which tool-grounded facts get a documented rank
-  boost; with no embedder the BM25 ranking is byte-identical to before
-  (regression-guarded).
-- **`MemoryForget` tool** (`@crewhaus/tool-memory`): explicit forgetting by
-  id or query — destructive AND justification-gated (Pillar 3 intent gate).
-  `Remember` accepts an optional `ttlDays`.
-- **`crewhaus memory list|show <id>|forget <id|--query <q>>|sweep [--compact]`**:
-  inspect the per-spec fact stores (id/age/tags/provenance/status), explicitly
-  forget memories, and run the TTL sweep + compaction. Destructive verbs
-  preview their match set and prompt unless `--yes`.
-- **`crewhaus migrate memories [--dry-run]`**: idempotent v2 backfill over
-  `.crewhaus/memories/*.jsonl` via the migration-engine chain — stamps
-  `schemaVersion`, derives `provenance.sessionId` from v1 auto-capture tags,
-  preserves every other line verbatim, and records the store version in
-  `.crewhaus/meta.json`.
-
-- **Default skills and builtin slash commands** (`@crewhaus/default-skills` —
-  PR 12 of the v0.3.0 memory train). The product now ships three skills:
-  `continuity` (read the plan first, pin user requirements as verbatim REQ
-  entries, claimed-vs-proven status honesty with `PlanComplete` toolUseId
-  evidence, bias to action, accurate handoffs), `learning-loop` (the expert
-  demo's ANSWER/STUDY/REFLECT/EXAM modes productized, templated at compile
-  time via `renderSkill` with `{{domain}}`/`{{curriculum}}`/`{{sources}}` —
-  strict both ways, so a missing or typo'd substitution throws), and `dream`
-  (the consolidation playbook consumed by scheduled dream ticks). Bodies ship
-  both as exported string constants (compile-time embeddable into bundles)
-  and as real SKILL.md files (runtime-discoverable); either way they pass the
-  same `skill`-TrustOrigin classification as any other skill, and a
-  content-lint test pins every tool name they mention to the real v0.3.0
-  tool vocabulary. `discoverSkills` gains a `builtinSkills` option merged at
-  lowest precedence — `~/.crewhaus/skills` and `.crewhaus/skills` override
-  builtins by name, and an empty-body override disables one. `loadCommands`
-  gains builtin (`builtinDirs`) and user-level (`~/.crewhaus/commands`) roots
-  below the existing project root, and eleven builtin commands ship: `/plan`,
-  `/focus <text>`, `/next`, `/handoff`, `/clear-plan`, `/clear-focus`,
-  `/forget <query>`, `/study`, `/reflect`, `/exam`, `/dream`. Emitter and
-  interpreter wiring land in later PRs of the train.
-- **v0.3.0 continuity substrate (Goal 1, PR 7): `@crewhaus/continuity-store` +
-  `@crewhaus/tool-plan`.** Two new packages carrying the memory release's
-  focus/plans/goals layer — packages only; runtime/compiler/CLI wiring follows
-  in the later PRs of the train.
-  - `continuity-store`: human-readable artifacts under
-    `.crewhaus/state/<spec>/` — marker-gated `focus.md` (capped body + the
-    verbatim `REQ-nnn` requirements ledger + active-plan pointer),
-    `plans/plan-NNNN-<slug>.md` (YAML frontmatter + numbered steps),
-    `goals.yaml`, and a deterministic `handoff.md` render (no model calls).
-    The `open → in_progress → claimed → proven` proof ladder is
-    machine-checked: `proven` requires `toolUseId` evidence resolved against
-    session event logs (sub-agent child sessions included via the
-    `sub_agent_start` brackets); proven transitions pin cited sessions in
-    `.crewhaus/retention.json` and freeze `{toolName, inputHash,
-    resultDigest}` excerpts so evidence outlives the transcript TTL. Clearing
-    goes through `.crewhaus/trash/<ts>/` with restore — never a hard delete
-    (`moveToTrash` is exported for other stores to adopt). Writes are
-    tmp+rename atomic under an advisory `.lock` (wait 2s → steal stale >30s
-    with a warning → fail naming the holder pid). Session-scoped stores and
-    fail-closed tenant path fencing follow the session-store rules.
-  - `tool-plan`: the tool surface — `FocusRead`/`FocusWrite`, `PlanRead`/
-    `PlanUpdate`/`PlanComplete`, `GoalWrite`/`GoalUpdate`/`GoalList`, and
-    `MemoryClear` (destructive + `requireJustification`). `PlanComplete` is
-    the proven transition and rejects unverifiable citations with an
-    instructive error. Mutations emit the new additive event kinds
-    `plan_update` / `goal_update` / `action_proof` through an injected
-    `appendEvent` seam (no runtime-core dependency).
-  - `event-log`: additive `plan_update`, `goal_update`, `action_proof` kinds +
-    exported payload types (readers skip unknown kinds by design).
-  - Docs-repo module briefs (292+) for the new packages are a follow-up in the
-    docs repository.
 
 - **The runtime-core continuity seam: compaction can no longer eat a user's
   requirements (0.3.0 Goal 1, PR 8).** The release's motivating failure — a
@@ -472,74 +123,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and assert again). Spec/IR/emitter threading is PR 11; this PR is the
   runtime seam only.
 
-- **memory-store v2 — explicit forgetting, provenance, and hybrid recall**
-  (0.3.0 memory release, design §3.4). Memory entries gain additive JSONL
-  fields: `schemaVersion` (2 on new writes; absent = v1, read lazily),
-  `expiresAt` (TTL via `remember(…, { ttlMs })`), `supersededBy`, and
-  `provenance { sessionId?, evidence?: toolUseId[] }`. Mixed v1/v2 files read
-  correctly in both directions. New store APIs: `forget(id|query)` appends
-  supersede tombstones (the file stays append-only — never a hard delete),
-  `sweep()` tombstones TTL-expired entries (deterministic, idempotent),
-  `compact()` rewrites the file dropping dead lines (atomic tmp+rename — the
-  growth-bounding answer to the #53 F7 unbounded-growth TODO), and `list()`
-  materializes lifecycle status. Auto-capture is now proof-linked: captured
-  facts carry `provenance.sessionId` and the source turn's successful
-  `tool_result` toolUseIds as `provenance.evidence`. Passing an `embedder`
-  to `createMemoryStore` upgrades recall to a hybrid BM25 + embedding
-  reciprocal-rank fusion in which tool-grounded facts get a documented rank
-  boost; with no embedder the BM25 ranking is byte-identical to before
-  (regression-guarded).
-- **`MemoryForget` tool** (`@crewhaus/tool-memory`): explicit forgetting by
-  id or query — destructive AND justification-gated (Pillar 3 intent gate).
-  `Remember` accepts an optional `ttlDays`.
-- **`crewhaus memory list|show <id>|forget <id|--query <q>>|sweep [--compact]`**:
-  inspect the per-spec fact stores (id/age/tags/provenance/status), explicitly
-  forget memories, and run the TTL sweep + compaction. Destructive verbs
-  preview their match set and prompt unless `--yes`.
-- **`crewhaus migrate memories [--dry-run]`**: idempotent v2 backfill over
-  `.crewhaus/memories/*.jsonl` via the migration-engine chain — stamps
-  `schemaVersion`, derives `provenance.sessionId` from v1 auto-capture tags,
-  preserves every other line verbatim, and records the store version in
-  `.crewhaus/meta.json`.
-- **`@crewhaus/wiki-store` — the local wiki substrate** (0.3.0 memory
-  release, design §3.1). Update-in-place semantic memory under
-  `.crewhaus/wiki/<spec>/`: markdown articles with YAML frontmatter (slug,
-  title, tags, confidence, verified, version, sources, supersedes,
-  createdBy), immutable prior versions under `versions/<slug>/<n>.md`
-  (supersede, never delete), and a rebuildable `index.json` carrying
-  `[[wikilink]]` link graphs. `write()` upserts with the Thredz PATCH
-  optimistic-concurrency contract — a stale `expectedVersion` throws a
-  `stale_article_version`-coded conflict, so skills behave identically on
-  both backends. Retrieval is hybrid BM25 + optional embedder via
-  reciprocal-rank fusion over contextual chunks (title + tags prefixed),
-  followed by one-hop link expansion with a documented half-weight re-rank
-  rule — a linked-but-lexically-unrelated article surfaces on recall.
-  Mutations run under the §7.6 advisory `.lock` (wait 2 s → steal >30 s
-  stale → fail naming the holder pid) with tmp+rename atomic writes, and
-  every path is tenant-fenced fail-closed.
-- **`@crewhaus/tool-wiki` — the thredz-identical wiki tool vocabulary**
-  (design §3.2): `wiki_recall`, `wiki_semantic_search`, `wiki_search`,
-  `wiki_get`, `wiki_write`, `wiki_list`, `wiki_related`,
-  `wiki_set_signals`, `wiki_stats`, `log_knowledge_gap` — exact thredz-mcp
-  names and schemas, pinned by a parity test. `wiki_write`/`wiki_set_signals`
-  are destructive + justification-gated; `log_knowledge_gap` is
-  audit-and-allow and, standalone, records gaps as draft wiki articles
-  under the reserved `gaps/` tag (an injected `logGap` callback reroutes it
-  to the plan store in the composition root). With `requireSources: true`,
-  `wiki_write` deterministically rejects bodies without a `## Sources`
-  heading (design §3.3's write-path governance). Mutations emit the new
-  additive `wiki_write` event kind through an injected append seam.
-- **New `memory` TrustOrigin** (Pillar 3, design §7.4): recalled wiki
-  bodies are classified at origin `"memory"` (block tier, like `"skill"`)
-  before reaching the model and lineage-tagged for the egress fabric;
-  redact verdicts return the redaction notice instead of the body. Origin
-  registered across boundary-classifier, run-context, and
-  egress-classifier; tool-wiki joins the doctor `--philosophy-alignment`
-  boundary-site checks.
-- **`crewhaus wiki list|show <slug>|search <q>|stats`**: inspect the
-  per-spec local wikis — stalest-first listing with signals
-  (verified/confidence), full frontmatter + body for one article, BM25
-  keyword search, and corpus-health stats.
+- **v0.3.0 continuity substrate (Goal 1, PR 7): `@crewhaus/continuity-store` +
+  `@crewhaus/tool-plan`.** Two new packages carrying the memory release's
+  focus/plans/goals layer — packages only; runtime/compiler/CLI wiring follows
+  in the later PRs of the train.
+  - `continuity-store`: human-readable artifacts under
+    `.crewhaus/state/<spec>/` — marker-gated `focus.md` (capped body + the
+    verbatim `REQ-nnn` requirements ledger + active-plan pointer),
+    `plans/plan-NNNN-<slug>.md` (YAML frontmatter + numbered steps),
+    `goals.yaml`, and a deterministic `handoff.md` render (no model calls).
+    The `open → in_progress → claimed → proven` proof ladder is
+    machine-checked: `proven` requires `toolUseId` evidence resolved against
+    session event logs (sub-agent child sessions included via the
+    `sub_agent_start` brackets); proven transitions pin cited sessions in
+    `.crewhaus/retention.json` and freeze `{toolName, inputHash,
+    resultDigest}` excerpts so evidence outlives the transcript TTL. Clearing
+    goes through `.crewhaus/trash/<ts>/` with restore — never a hard delete
+    (`moveToTrash` is exported for other stores to adopt). Writes are
+    tmp+rename atomic under an advisory `.lock` (wait 2s → steal stale >30s
+    with a warning → fail naming the holder pid). Session-scoped stores and
+    fail-closed tenant path fencing follow the session-store rules.
+  - `tool-plan`: the tool surface — `FocusRead`/`FocusWrite`, `PlanRead`/
+    `PlanUpdate`/`PlanComplete`, `GoalWrite`/`GoalUpdate`/`GoalList`, and
+    `MemoryClear` (destructive + `requireJustification`). `PlanComplete` is
+    the proven transition and rejects unverifiable citations with an
+    instructive error. Mutations emit the new additive event kinds
+    `plan_update` / `goal_update` / `action_proof` through an injected
+    `appendEvent` seam (no runtime-core dependency).
+  - `event-log`: additive `plan_update`, `goal_update`, `action_proof` kinds +
+    exported payload types (readers skip unknown kinds by design).
+  - Docs-repo module briefs (292+) for the new packages are a follow-up in the
+    docs repository.
 
 - **Default skills and builtin slash commands** (`@crewhaus/default-skills` —
   PR 12 of the v0.3.0 memory train). The product now ships three skills:
@@ -562,54 +176,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/focus <text>`, `/next`, `/handoff`, `/clear-plan`, `/clear-focus`,
   `/forget <query>`, `/study`, `/reflect`, `/exam`, `/dream`. Emitter and
   interpreter wiring land in later PRs of the train.
-- **Secrets can now reach MCP server child processes.** `mcp_servers` stdio
-  `env` and sse `headers` values route through the same `$UPPER_SNAKE`
-  secret machinery as every other credential field: plain strings stay
-  literals, `$VAR` lowers to an env reference resolved from the *running*
-  process's environment at boot (never baked into the artifact), and a
-  malformed `$…` ref under a credential-shaped key (`*_KEY` / `*_TOKEN` /
-  `*_SECRET` / `*_PASSWORD`, or the `Authorization` / `x-api-key` headers)
-  fails compilation instead of shipping a broken credential.
-  `@crewhaus/mcp-host` gains `resolveSecretRef` / `resolveMcpServerConfig`
-  (throwing a `ConfigError` that names the missing variable), and its stdio
-  transport now merges explicit `env` on top of the SDK's
-  `getDefaultEnvironment()` — previously the SDK's inherit allowlist
-  dropped arbitrary keys, so **no** factory path could deliver a secret
-  (e.g. `THREDZ_API_KEY`) into a spawned MCP server at all. The
-  `target-claude-plugin` emitter renders env refs as Claude Code's
-  `${VAR}` expansion syntax in `.mcp.json`.
-
-- **The memory fabric's composition root** (`@crewhaus/memory-service` —
-  PR 10 of the v0.3.0 memory train; closes module catalog critical-path #2).
-  `wireMemory(fragment, {catalog, cwd, tenant?, sessionScope?, appendEvent?,
-  embedder?})` takes one serializable fragment (spec name + memory config
-  incl. wiki + continuity config incl. scope — the shape the §9 IR lowers
-  into in PR 11) and does everything the per-emitter memory codegen used to
-  template: constructs the stores (file backends; `backend: "thredz"` is a
-  reserved discriminator that fails fast until PR 16), registers the tools
-  (Remember/Recall/MemoryForget for facts; Focus/Plan/Goal/MemoryClear for
-  continuity, honouring `plan: false`; the ten thredz-vocabulary `wiki_*`
-  tools, with `log_knowledge_gap` routed into the plan store as a `[gap]`
-  goal when continuity is on), and returns spread-ready `RunChatLoopOptions`
-  seams — recall/onCapture over the fact store with the §2.4
-  provenance-stamping capture path, loadPlan/onPlanDirty/onHandoff over the
-  continuity store with the §2.3 ledger flag threaded, and the builtin
-  `continuity` skill + slash commands merged at lowest precedence via
-  `discoverSkills({builtinSkills})`/`loadCommands({builtinDirs})`.
-  `wireContinuity`/`wireWiki` ship as granular entry points; scope
-  (`spec`/`session`) and tenant fencing pass through to every store.
-  **target-cli** and the **`crewhaus run` interpreter** now make this one
-  stable call instead of inlining store/seam wiring: specs without a
-  `memory:` block compile to byte-identical bundles (test-pinned, incl. a
-  new `cli-memory` smoke fixture), and memory specs keep behavioral
-  equivalence (equivalence-pinned recall/capture round-trips) with two
-  sanctioned §3.4/§2.4 upgrades — `MemoryForget` is registered alongside
-  Remember/Recall, and compiled bundles gain the provenance-stamping capture
-  the interpreter already had. The wait-2s/steal-30s/fail-with-pid advisory
-  file lock that continuity-store and wiki-store each shipped on parallel
-  branches is unified into `@crewhaus/infra-utils`
-  (`acquireFileLock`/`withFileLock`); both stores keep their exact error
-  types and message prefixes (pinned by their existing lock tests).
 
 - **Sub-agents are no longer memory-blind, and their failures are no longer
   swallowed (0.3.0 §7.1, PR 13).** `spawnSubAgent` threads four seams from
@@ -672,55 +238,285 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stopped." Without a TTY the conversational path is refused (the scripted
   questionnaire runs instead); the no-credentials scripted fallback is
   byte-identical to before (subprocess-pinned).
-- **Sub-agents are no longer memory-blind, and their failures are no longer
-  swallowed (0.3.0 §7.1, PR 13).** `spawnSubAgent` threads four seams from
-  the parent's bridge into child loops: `memory` — recall ON via the
-  parent's own recall closure (recalled context reaches the child's system
-  prompt through the same injected seam; `autoRecall` respects the parent's
-  setting) and capture OFF by construction (the projected seam cannot carry
-  the write closures — parents own memory writes); `skills` — children
-  finally see the "Available skills:" prompt block, not just the
-  catalog-inherited Skill tool; `failureTaxonomy` — child recovery consults
-  the same named classes; and READ-ONLY `continuity` — `loadPlan` renders
-  the `<current_plan>` tail in child loops while `onPlanDirty`/`onHandoff`/
-  the ledger stay parent-side. Child terminal errors are CLASSIFIED at the
-  spawner boundary instead of dissolving into a `[sub-agent error]` string:
-  non-fatal classes surface as an `is_error` tool result carrying structured
-  `{isError, failureClass, report}` content (the run continues), while a
-  billing/auth-class failure inside a child rethrows `RunFailedError` after
-  the `sub_agent_end` bracket bookkeeping — tool-executor, the streaming
-  executor, and `recover()` all pass an already-classified report through
-  verbatim, so a billing failure anywhere ends the whole run with the
-  child's report (same `run_failed` event + coded exit as a top-level
-  halt). Auto-capture finally SEES sub-agent findings: memory-store gains
-  `turnsFromEventsWithChildren` (walks the parent log's `sub_agent_start`
-  brackets into child session JSONLs — lazy reads, capped at
-  `MAX_CAPTURE_EVENTS_PER_CHILD` = 2000 events per child) and
-  `captureChildFacts` (child facts land with
-  `provenance {sessionId: <childSessionId>}` plus a `subagent:<name>` tag);
-  `crewhaus run`'s onCapture is wired (the target-cli emitter mirror is
-  deferred to the memory-service refactor with a marked TODO). Attribution:
-  `createIsolatedContext` stamps `agentIdentity {subAgentId: <name>}` on
-  every child RunContext, and tool-plan's `plan_update`/`goal_update`/
-  `action_proof` payloads record the formatted identity (e.g.
-  `subagent=researcher`) when one is set. Spawning with none of the new
-  options behaves exactly as before (regression-pinned).
 
-### Changed
+#### Memory & wiki
 
-- **Recompiling an agent-loop spec produces a different bundle than 0.2.x:
-  continuity is default-on** (see the headline entry above; sanctioned by
-  ROADMAP.md's pre-1.0 policy). Add `continuity: false` to restore the
-  previous bytes exactly. No other spec compiles differently unless it
-  declared a `memory:` block on channel/managed/research — that block was
-  dead config on those shapes and is now wired as documented.
+- **`memory:` is now emit-wired on channel, managed, research, and crew —
+  and crew carries it for the first time (0.3.0 §9, PR 11).** The block was
+  previously parsed and lowered on channel/managed/research but silently
+  ignored by their emitters (only target-cli wired it); all four daemons now
+  make the same single `wireMemory` composition-root call as target-cli —
+  per turn with the conversation's `sessionScope` on channel, per turn with
+  the request's tenant on managed (stores tenant-fenced, §2.7), once at boot
+  on research (every branch shares the catalog) and crew (roles share the
+  spec-scoped stores through the orchestrator's new crew-wide
+  `extraTools`/`memory`/`continuity`/`skills` RunOptions — the plan IS the
+  coordination surface). The block itself gains the §9 extensions, all
+  optional and byte-neutral for existing specs: `backend: file|thredz`
+  (thredz reserved until PR 16), `ttl` (explicit fact forgetting as a
+  duration string — the shared duration grammar now accepts `d` for days,
+  e.g. `90d`, with a 1h floor enforced at compile time; `heartbeat.every`
+  accepts `d` too), and `wiki:` (`enabled`, `recallK`, `embedder`,
+  `autoRecall`, `requireSources`) — `wiki.autoRecall: true` fuses the
+  top-`recallK` wiki hits into the session-start recall bundle alongside
+  fact recall.
 
-- **BREAKING (IR, pre-1.0):** `IrMcpStdioConfig.env` and
-  `IrMcpSseConfig.headers` are now `Record<string, IrSecretRef>` instead of
-  `Record<string, string>`. Emitters embed the unresolved config and
-  compiled bundles resolve it at process start; `redundantMcpServerCollapse`
-  compares env/headers structurally, so servers that differ only in
-  credentials no longer collapse into one.
+- **memory-store v2 — explicit forgetting, provenance, and hybrid recall**
+  (0.3.0 memory release, design §3.4). Memory entries gain additive JSONL
+  fields: `schemaVersion` (2 on new writes; absent = v1, read lazily),
+  `expiresAt` (TTL via `remember(…, { ttlMs })`), `supersededBy`, and
+  `provenance { sessionId?, evidence?: toolUseId[] }`. Mixed v1/v2 files read
+  correctly in both directions. New store APIs: `forget(id|query)` appends
+  supersede tombstones (the file stays append-only — never a hard delete),
+  `sweep()` tombstones TTL-expired entries (deterministic, idempotent),
+  `compact()` rewrites the file dropping dead lines (atomic tmp+rename — the
+  growth-bounding answer to the #53 F7 unbounded-growth TODO), and `list()`
+  materializes lifecycle status. Auto-capture is now proof-linked: captured
+  facts carry `provenance.sessionId` and the source turn's successful
+  `tool_result` toolUseIds as `provenance.evidence`. Passing an `embedder`
+  to `createMemoryStore` upgrades recall to a hybrid BM25 + embedding
+  reciprocal-rank fusion in which tool-grounded facts get a documented rank
+  boost; with no embedder the BM25 ranking is byte-identical to before
+  (regression-guarded).
+- **`MemoryForget` tool** (`@crewhaus/tool-memory`): explicit forgetting by
+  id or query — destructive AND justification-gated (Pillar 3 intent gate).
+  `Remember` accepts an optional `ttlDays`.
+- **`crewhaus memory list|show <id>|forget <id|--query <q>>|sweep [--compact]`**:
+  inspect the per-spec fact stores (id/age/tags/provenance/status), explicitly
+  forget memories, and run the TTL sweep + compaction. Destructive verbs
+  preview their match set and prompt unless `--yes`.
+- **`crewhaus migrate memories [--dry-run]`**: idempotent v2 backfill over
+  `.crewhaus/memories/*.jsonl` via the migration-engine chain — stamps
+  `schemaVersion`, derives `provenance.sessionId` from v1 auto-capture tags,
+  preserves every other line verbatim, and records the store version in
+  `.crewhaus/meta.json`.
+
+- **`@crewhaus/wiki-store` — the local wiki substrate** (0.3.0 memory
+  release, design §3.1). Update-in-place semantic memory under
+  `.crewhaus/wiki/<spec>/`: markdown articles with YAML frontmatter (slug,
+  title, tags, confidence, verified, version, sources, supersedes,
+  createdBy), immutable prior versions under `versions/<slug>/<n>.md`
+  (supersede, never delete), and a rebuildable `index.json` carrying
+  `[[wikilink]]` link graphs. `write()` upserts with the Thredz PATCH
+  optimistic-concurrency contract — a stale `expectedVersion` throws a
+  `stale_article_version`-coded conflict, so skills behave identically on
+  both backends. Retrieval is hybrid BM25 + optional embedder via
+  reciprocal-rank fusion over contextual chunks (title + tags prefixed),
+  followed by one-hop link expansion with a documented half-weight re-rank
+  rule — a linked-but-lexically-unrelated article surfaces on recall.
+  Mutations run under the §7.6 advisory `.lock` (wait 2 s → steal >30 s
+  stale → fail naming the holder pid) with tmp+rename atomic writes, and
+  every path is tenant-fenced fail-closed.
+- **`@crewhaus/tool-wiki` — the thredz-identical wiki tool vocabulary**
+  (design §3.2): `wiki_recall`, `wiki_semantic_search`, `wiki_search`,
+  `wiki_get`, `wiki_write`, `wiki_list`, `wiki_related`,
+  `wiki_set_signals`, `wiki_stats`, `log_knowledge_gap` — exact thredz-mcp
+  names and schemas, pinned by a parity test. `wiki_write`/`wiki_set_signals`
+  are destructive + justification-gated; `log_knowledge_gap` is
+  audit-and-allow and, standalone, records gaps as draft wiki articles
+  under the reserved `gaps/` tag (an injected `logGap` callback reroutes it
+  to the plan store in the composition root). With `requireSources: true`,
+  `wiki_write` deterministically rejects bodies without a `## Sources`
+  heading (design §3.3's write-path governance). Mutations emit the new
+  additive `wiki_write` event kind through an injected append seam.
+- **New `memory` TrustOrigin** (Pillar 3, design §7.4): recalled wiki
+  bodies are classified at origin `"memory"` (block tier, like `"skill"`)
+  before reaching the model and lineage-tagged for the egress fabric;
+  redact verdicts return the redaction notice instead of the body. Origin
+  registered across boundary-classifier, run-context, and
+  egress-classifier; tool-wiki joins the doctor `--philosophy-alignment`
+  boundary-site checks.
+- **`crewhaus wiki list|show <slug>|search <q>|stats`**: inspect the
+  per-spec local wikis — stalest-first listing with signals
+  (verified/confidence), full frontmatter + body for one article, BM25
+  keyword search, and corpus-health stats.
+
+- **The memory fabric's composition root** (`@crewhaus/memory-service` —
+  PR 10 of the v0.3.0 memory train; closes module catalog critical-path #2).
+  `wireMemory(fragment, {catalog, cwd, tenant?, sessionScope?, appendEvent?,
+  embedder?})` takes one serializable fragment (spec name + memory config
+  incl. wiki + continuity config incl. scope — the shape the §9 IR lowers
+  into in PR 11) and does everything the per-emitter memory codegen used to
+  template: constructs the stores (file backends; `backend: "thredz"` is a
+  reserved discriminator that fails fast until PR 16), registers the tools
+  (Remember/Recall/MemoryForget for facts; Focus/Plan/Goal/MemoryClear for
+  continuity, honouring `plan: false`; the ten thredz-vocabulary `wiki_*`
+  tools, with `log_knowledge_gap` routed into the plan store as a `[gap]`
+  goal when continuity is on), and returns spread-ready `RunChatLoopOptions`
+  seams — recall/onCapture over the fact store with the §2.4
+  provenance-stamping capture path, loadPlan/onPlanDirty/onHandoff over the
+  continuity store with the §2.3 ledger flag threaded, and the builtin
+  `continuity` skill + slash commands merged at lowest precedence via
+  `discoverSkills({builtinSkills})`/`loadCommands({builtinDirs})`.
+  `wireContinuity`/`wireWiki` ship as granular entry points; scope
+  (`spec`/`session`) and tenant fencing pass through to every store.
+  **target-cli** and the **`crewhaus run` interpreter** now make this one
+  stable call instead of inlining store/seam wiring: specs without a
+  `memory:` block compile to byte-identical bundles (test-pinned, incl. a
+  new `cli-memory` smoke fixture), and memory specs keep behavioral
+  equivalence (equivalence-pinned recall/capture round-trips) with two
+  sanctioned §3.4/§2.4 upgrades — `MemoryForget` is registered alongside
+  Remember/Recall, and compiled bundles gain the provenance-stamping capture
+  the interpreter already had. The wait-2s/steal-30s/fail-with-pid advisory
+  file lock that continuity-store and wiki-store each shipped on parallel
+  branches is unified into `@crewhaus/infra-utils`
+  (`acquireFileLock`/`withFileLock`); both stores keep their exact error
+  types and message prefixes (pinned by their existing lock tests).
+
+#### Thredz
+
+- **Thredz — one knob (0.3.0 Goal 3, §4, PR 16).** A new top-level `thredz:`
+  block on the five memory shapes (cli, channel, managed, research, crew):
+  `thredz: true` (≡ `{api_key: "$THREDZ_API_KEY"}`), the string shorthand
+  `thredz: $THREDZ_API_KEY`, or the object form (`api_key` required and
+  credential-lowered fail-fast; `base_url`; `visibility` defaulting
+  **private** — never Thredz's shared-by-default; `goals` mirror on/off,
+  defaulting to "on when continuity goals are on"; `agents` to register an
+  addressable handle at boot). On the emit-wired **cli** shape the compiler
+  synthesizes an `mcp_servers.thredz` stdio entry (`npx -y thredz-mcp@0.2.0`
+  with `THREDZ_API_KEY` as an `IrSecretRef` env value and
+  `THREDZ_DEFAULT_VISIBILITY` enforced deterministically) riding the §4.2
+  secret machinery end-to-end — the key never lands in compiled artifacts,
+  the generated README lists `THREDZ_API_KEY` automatically, `compile
+  --strict` stays green, and a missing key at boot renders the classified
+  config report (exit 21). A user-declared `mcp_servers.thredz` **wins over
+  synthesis** (explicit beats implicit — the vendored-server escape hatch;
+  `crewhaus lint` warns with the new `thredz-override` rule). **Tool
+  routing (§4.3):** the model keeps ONE vocabulary — the ten
+  `wiki_*`/`log_knowledge_gap` tools plus `goal_*`/`task_*` register as
+  bare-name MCP aliases via tool-mcp's new `registerMcpToolAliases`
+  (collision-guarded; `scope: "external"`, `ioCapability: "network"`,
+  boundary classification + lineage tagging identical to namespaced MCP
+  tools; `wiki_write`/`wiki_set_signals` keep their justification gate),
+  while the local tool-wiki twins are not registered and the local wiki
+  store on disk stays untouched. memory-service's `wireWiki` flips on the
+  thredz backend (replacing the reserved-backend error) and the auto-recall
+  fusion routes `wiki_recall` through the already-connected McpHost client
+  with the same recall-bundle line shape. **Goal mirroring (§4.4, resolved
+  decision 5):** continuity goal writes mirror to Thredz
+  `goal_write`/`goal_update` at the store's write/update sync points — spec
+  scope ONLY, local write always authoritative, mirrored titles
+  PII-redacted, idempotency-keyed creates, and Thredz-side failures
+  skip-and-warn (a free-tier goal cap surfaces as a clear `thredz_quota`
+  warning) without ever failing the local write. **Failure classes
+  (§4.4):** `classifyThredzFailure` maps the thredz-mcp v0.2.0 error
+  contract on status/code shapes (401/403 → `thredz_auth`, 403-disabled →
+  `thredz_billing`, 402/quota codes → `thredz_quota`, 429 →
+  `thredz_rate_limit`, else `thredz_unavailable`); boot failures degrade to
+  the local backend with an `mcp_boot` warning — Thredz codes never kill a
+  run. **`crewhaus doctor --probe`** gains a live `wiki_stats` round-trip
+  through the spec's thredz server (disabled keys and plan caps surface
+  before a long run degrades on them). The non-cli memory shapes carry the
+  block with the 0.2.3-convention ignored-note comment until their wiring
+  lands. The real published server contract is pinned by a read-only
+  integration test against thredz-mcp v0.2.0's `server.ts`.
+
+- **Secrets can now reach MCP server child processes.** `mcp_servers` stdio
+  `env` and sse `headers` values route through the same `$UPPER_SNAKE`
+  secret machinery as every other credential field: plain strings stay
+  literals, `$VAR` lowers to an env reference resolved from the *running*
+  process's environment at boot (never baked into the artifact), and a
+  malformed `$…` ref under a credential-shaped key (`*_KEY` / `*_TOKEN` /
+  `*_SECRET` / `*_PASSWORD`, or the `Authorization` / `x-api-key` headers)
+  fails compilation instead of shipping a broken credential.
+  `@crewhaus/mcp-host` gains `resolveSecretRef` / `resolveMcpServerConfig`
+  (throwing a `ConfigError` that names the missing variable), and its stdio
+  transport now merges explicit `env` on top of the SDK's
+  `getDefaultEnvironment()` — previously the SDK's inherit allowlist
+  dropped arbitrary keys, so **no** factory path could deliver a secret
+  (e.g. `THREDZ_API_KEY`) into a spawned MCP server at all. The
+  `target-claude-plugin` emitter renders env refs as Claude Code's
+  `${VAR}` expansion syntax in `.mcp.json`.
+
+#### Dream
+
+- **Dream — scheduled memory consolidation (0.3.0 Goal 5, §6, PR 14).** A new
+  `memory.dream` block (`every` in the shared duration grammar with a 5m
+  floor, `mode: deterministic|full` defaulting to `full`, `budget_usd`,
+  optional `instructions` playbook override) lowers to `IrMemoryDream
+  {everyMs, mode, budgetUsd?, instructions?}` on every memory-carrying shape
+  and wires the new **`@crewhaus/dream-engine`**. A dream run is two phases:
+  **phase 1, deterministic** (always; idempotent; zero model spend) — fact
+  TTL sweep + near-duplicate supersede + `compact()` growth bounding,
+  staleness flags (facts >90d, wiki unverified >30d — `STALE_FACT_AFTER_MS`
+  / `STALE_WIKI_UNVERIFIED_AFTER_MS` exported), sessions-index fold-in (the
+  item-57 machinery, lifted into `@crewhaus/session-store` as
+  `summarizeSessionIntoIndex`), proof-excerpt re-validation + retention-pin
+  refresh for records citing sessions nearing TTL, focus/handoff
+  next-actions refresh from open plans, and the trash purge past the 7-day
+  undo window (`purgeTrash`, now in continuity-store) — and **phase 2, model
+  synthesis** (`mode: full` AND `budget_usd > 0`): ONE bounded fresh session
+  (`sessionTarget: "dream"`, singleTurn, capped tool loop) seeded with the
+  builtin `dream` skill + phase-1 findings, acting ONLY through the normal
+  registered tools (`wiki_write`/`wiki_set_signals`/`MemoryForget`/
+  `PlanUpdate` — full justification/audit path), capped by the item-27
+  `budget` option, and **refusing to run an unpriced model** (cost-tracker's
+  `pricingMisses` would make the cap a silent no-op). State lands at
+  `.crewhaus/dream/<spec>/state.json` (`lastRunAt`/`lastOutcome`/
+  `phase1Counts`/`lastEvidence`) plus an additive `dream_run` event-log
+  kind; runs are **window-idempotent** (`dream:<spec>:<floor(now/every)>`
+  through durable-execution's `withIdempotency`, backed by a lock-honoring
+  file store) so a janitor tick, a GH-Actions cron, and a CLI invocation can
+  never double-fire — including under `fleet run` parallelism. Triggers:
+  runtime-core's janitor gains a **pluggable step registry**
+  (`createJanitor({ steps })`, replacing the closed step union;
+  `janitor_action` trace events for free) and the channel daemon registers
+  the full dream step (managed registers a per-tenant deterministic one)
+  with the conventional `CREWHAUS_DREAM=0` / `CREWHAUS_DREAM_INTERVAL_MS`
+  knobs; the cli shape runs a **boot-time deterministic catch-up** when
+  overdue (`[dream] overdue — deterministic pass done; run 'crewhaus dream'
+  for full consolidation`); and **`crewhaus dream run|status|init`** ships
+  cron-safe verbs (`init` scaffolds `.github/workflows/crewhaus-dream.yml`
+  on the odd-minute convention). With a dream schedule configured, the
+  builtin `dream` skill and the `/dream` command join the gated set
+  memory-service wires.
+
+#### Learning
+
+- **Learning — continual learning as a first-class capability (0.3.0
+  Goal 2, §3.3, PR 17).** A new top-level `learning:` block on the five
+  memory shapes (cli, channel, managed, research, crew): `domain`
+  (required), `curriculum` (agent-editable ladder file), `sources`
+  (allowlist hints — deliberately NOT optimizable, §7.5), `exam:
+  {dataset, graders}` (spec-relative paths; existence is a runtime
+  concern), and `study: {on_heartbeat, on_dream}` (unattended-study
+  toggles, both defaulting ON — the block is the opt-in, the toggles are
+  the opt-outs). Learning **requires a wiki**: `memory.wiki` (local) or
+  `thredz:` (hosted) must be present — cross-field CompilerError otherwise,
+  mirrored in ir-passes' `memoryIntegrityPass` — and the lowering stamps
+  `memory.wiki.requireSources: true` so `wiki_write` deterministically
+  rejects uncited bodies (an explicit `requireSources: false` alongside
+  learning is rejected as a contradiction). **Skill substitution:**
+  `wireMemory` renders the builtin `learning-loop` skill with
+  `{{domain}}`/`{{curriculum}}`/`{{sources}}` resolved (documented
+  fallbacks when curriculum/sources are omitted — never a literal token in
+  a prompt) and gates in the `/study` `/reflect` commands; a user/project
+  `learning-loop` skill still overrides by name. **First-class EXAM:** the
+  demo-era shell-out-to-`crewhaus eval` hack is replaced by an injected
+  `ExamRunner` seam (`wireMemory({ examRunner })`) driving a new `run_exam`
+  tool — a programmatic eval invocation (eval-runner's new
+  `createExamRunner`: `loadDataset` + `parseGradersConfig` + per-question
+  fresh single-turn sessions grounded in the REAL wiki through the
+  backend-invariant `wireWiki(...).recall` seam and runtime-core's
+  classified memory-injection path; per-sample artifacts under
+  `.crewhaus/evals/exam-<stamp>/`). No Bash permission is ever needed to
+  sit the exam; `/exam` gates in only when the exam is actually runnable
+  (config + runner). **Failed exam samples auto-log knowledge gaps** —
+  Thredz tasks (`log_knowledge_gap`, PII-redacted) on a live hosted
+  backend, plan-store `[gap]` goals locally — closing the gap→study
+  flywheel edge. Wired on the `crewhaus run` interpreter AND compiled cli
+  bundles (the emitted bundle constructs the same runner). **Unattended
+  study:** with `study.on_heartbeat`, target-channel-bot bakes the
+  study-rotation preamble (gaps first, ~3:1 study:reflect, bounded per
+  tick — the expert demo's HEARTBEAT.md policy, productized) ahead of the
+  operator's heartbeat instructions at codegen time; with `study.on_dream`,
+  the dream model phase's seeded prompt gains the top open `[gap]` goals +
+  the next unmastered curriculum rung, composed onto dream-engine's
+  existing `DreamModelPhase` seam. Absent `learning:` block, every emitted
+  bundle stays byte-identical (golden-pinned against the PR 16 emission).
+
+#### Failure messaging
+
 - **Failure-taxonomy core: out-of-funding, bad-credential, and rate-limit
   errors are now classified instead of misrouted (0.3.0 Goal 6, PR 1).**
   `recovery-engine.classify()` gains three buckets ahead of the existing
@@ -750,6 +546,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `run_failed` trace event, coded process exits, and adapter-side error
   discrimination land in the follow-up PRs.
 
+- **Adapter error discrimination: all four provider adapters now surface the
+  billing / auth / rate-limit signals the classifier reads (0.3.0 Goal 6,
+  PR 2).** adapter-openai stops conflating every 429 into `overloaded_error`:
+  the API body envelope (with its `code` — `insufficient_quota` vs
+  `rate_limit_exceeded`) and the response headers now ride the `AdapterError`
+  wrapper, so an out-of-funds account halts immediately (exit 31) while a
+  genuine rate limit retries honoring `retry-after`; 401/402/403 pass through
+  on status. adapter-anthropic additionally copies the response headers
+  (Retry-After on 429s); its credit-balance 400 / 401 / 403 envelopes already
+  flowed through intact and are now pinned end-to-end. adapter-gemini parses
+  the REST error envelope out of `ApiError.message`: a 429 RESOURCE_EXHAUSTED
+  whose QuotaFailure names a per-day / free-tier quota is billing-class
+  (envelope `code: "insufficient_quota"`), any other 429 is rate-limit-shaped
+  with google.rpc.RetryInfo's `retryDelay` threaded as the retry delay, and
+  passthrough statuses (401/403) carry the parsed body message instead of a
+  JSON blob. adapter-bedrock keeps the original Smithy exception name on the
+  wrapper so `ServiceQuotaExceededException` (a hard account quota, HTTP 400)
+  classifies as billing instead of being fabricated into a 429/overloaded,
+  while `ThrottlingException`/`TooManyRequestsException` stay
+  rate-limit-shaped; 401/403 pass through on status. `recovery-engine`'s
+  `classify()` now consults the top-level `code` and the envelope
+  `error.code` independently — the wrapper's own `code` slot holds
+  CrewhausError's ErrorCode (`"adapter"`) and no longer shadows the
+  provider's billing code. `circuit-breaker` fails fast: a billing-class
+  error (new exported structural check `isBillingError`, tunable via the new
+  `isFatal` option) trips the breaker on first sight instead of counting
+  toward the 5-failure threshold — a dead account no longer needs five
+  identical failures before the failover chain routes around it. Plain 500s,
+  overloads, and 400s behave exactly as before (regression-pinned per
+  provider).
 - **One failure report, every surface: the structured `run_failed` event,
   coded process exits, and the end of "agent exited" (0.3.0 Goal 6, PR 3).**
   runtime-core now publishes a first-class **`run_failed { class, message,
@@ -782,81 +608,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   invalid keys before a long run, classifying failures as billing/auth via
   recovery-engine. Successful runs and non-terminal recoveries emit no
   `run_failed` (regression-pinned).
-- **Adapter error discrimination: all four provider adapters now surface the
-  billing / auth / rate-limit signals the classifier reads (0.3.0 Goal 6,
-  PR 2).** adapter-openai stops conflating every 429 into `overloaded_error`:
-  the API body envelope (with its `code` — `insufficient_quota` vs
-  `rate_limit_exceeded`) and the response headers now ride the `AdapterError`
-  wrapper, so an out-of-funds account halts immediately (exit 31) while a
-  genuine rate limit retries honoring `retry-after`; 401/402/403 pass through
-  on status. adapter-anthropic additionally copies the response headers
-  (Retry-After on 429s); its credit-balance 400 / 401 / 403 envelopes already
-  flowed through intact and are now pinned end-to-end. adapter-gemini parses
-  the REST error envelope out of `ApiError.message`: a 429 RESOURCE_EXHAUSTED
-  whose QuotaFailure names a per-day / free-tier quota is billing-class
-  (envelope `code: "insufficient_quota"`), any other 429 is rate-limit-shaped
-  with google.rpc.RetryInfo's `retryDelay` threaded as the retry delay, and
-  passthrough statuses (401/403) carry the parsed body message instead of a
-  JSON blob. adapter-bedrock keeps the original Smithy exception name on the
-  wrapper so `ServiceQuotaExceededException` (a hard account quota, HTTP 400)
-  classifies as billing instead of being fabricated into a 429/overloaded,
-  while `ThrottlingException`/`TooManyRequestsException` stay
-  rate-limit-shaped; 401/403 pass through on status. `recovery-engine`'s
-  `classify()` now consults the top-level `code` and the envelope
-  `error.code` independently — the wrapper's own `code` slot holds
-  CrewhausError's ErrorCode (`"adapter"`) and no longer shadows the
-  provider's billing code. `circuit-breaker` fails fast: a billing-class
-  error (new exported structural check `isBillingError`, tunable via the new
-  `isFatal` option) trips the breaker on first sight instead of counting
-  toward the 5-failure threshold — a dead account no longer needs five
-  identical failures before the failover chain routes around it. Plain 500s,
-  overloads, and 400s behave exactly as before (regression-pinned per
-  provider).
 
-- **The runtime-core continuity seam: compaction can no longer eat a user's
-  requirements (0.3.0 Goal 1, PR 8).** The release's motivating failure — a
-  clarification answer living in the middle of message history was deleted
-  by `snip`, paraphrased away by an unverified `autoCompact` summary, and
-  the model re-asked the question — is now un-reproducible even when the
-  model misbehaves, and the fix is deterministic infrastructure with zero
-  model trust. New `RunChatLoopOptions.continuity` seam (injected closures,
-  like `memory`): when present, runtime-core appends a **volatile tail** of
-  system blocks (`<current_plan>` + `<requirements_ledger>`) AFTER the
-  cache-marked frozen prefix, rebuilt on every model call (hard-capped at
-  the exported `DEFAULT_CONTINUITY_TAIL_MAX_CHARS` = 4096 chars, ledger
-  first, oldest-first truncation with markers) — prompt-cache-manager gains
-  a `volatile: true` block flag that `manage()` never marks, plus a
-  dedicated regression suite pinning that the tail sits after the marker
-  and tail edits never strip or move it. **Requirements ledger (§2.3)**:
-  before `snip` drops middle messages and before `autoCompact` replaces
-  history, every evicted USER message is appended VERBATIM to the session
-  event log as the new additive `context_evicted` kind and folded into the
-  in-run ledger (16KB cap, oldest-first eviction, `[ledger truncated]`
-  marker); evicted assistant text and tool findings are persisted as
-  `context_evicted` too (episodic externalization — recall integration
-  lands later). The ledger re-injects on every call, `--resume` rebuilds it
-  deterministically from the logged events, the autocompact summarizer's
-  prompt receives it as an anchor (nothing depends on the summary being
-  right), and `compaction` event-log records now persist the **summary
-  text** beside the before/after counts. The per-run `_runState`
-  state-store gets its first consumer: plan-mutating tools set
-  `"plan.dirty"` through the RuntimeBridge's new `runState` field and the
-  loop re-renders the plan tail via `continuity.onPlanDirty` before the
-  next model call. **Handoff (§2.8)**: `continuity.onHandoff` fires exactly
-  once at teardown (the `memory.onCapture` finally slot) with a
-  deterministic `HandoffInput` — plan snapshot, ledger entries, session id,
-  stop reason; no model calls. **Cache-rotation bookkeeping (§2.5)**: a
-  boot-time marker rotation now publishes the new `cache_rotation` trace
-  event and invokes the new `onPromptCacheRotated(rotatedAt)` option, and a
-  fresh `promptCacheLastRotatedAt` genuinely skips the force-rotation —
-  the previously dead wiring is live (store persistence lands with
-  memory-service/threading). An ABSENT seam is byte-identical to before:
-  no tail blocks, no `context_evicted` events, an unchanged summarizer
-  prompt — regression-pinned, alongside the motivating-failure
-  reproduction test itself (evict the answer, force snip+autocompact,
-  assert the next rendered model input still carries it verbatim, resume
-  and assert again). Spec/IR/emitter threading is PR 11; this PR is the
-  runtime seam only.
+#### Eval
+
+- **Memory quality is now measurable: continuity graders + the store-backend
+  conformance suite (0.3.0 §7.3/§5, PR 19).** New package
+  `@crewhaus/grader-continuity` ships five DETERMINISTIC (no-LLM) graders
+  computed from a sample's session artifacts — the eval-runner's isolated
+  per-sample session JSONLs + `.crewhaus/` state root (§7.2) — installable
+  with one call, `registerContinuityGraders(registry)`, exactly like the
+  12-metric rubric: `continuity.reAskRate` (question-shaped assistant
+  sentences whose content-token set is already ≥60%-covered by an earlier
+  user statement or a confirmed REQ ledger entry from an earlier session —
+  gate: 0, the motivating failure), `continuity.reqRetention` (fraction of
+  requirement-marker user sentences that survive to the final context:
+  unevicted, or carried by a focus-ledger REQ entry), `continuity.proofHonesty`
+  (past-tense done-claims vs plan steps with a VERIFIED `action_proof`
+  event; a `prove_step` without one is a proven-without-evidence anomaly →
+  score 0), `continuity.pickupSuccess` (two-session samples: does session
+  2's first assistant turn act on the handoff — references a next-action/
+  plan cue, no re-asking, no re-planning from scratch), and
+  `continuity.costPerProvenOutcome` (`cost_accrual` USD per verified proven
+  step, Infinity-safe when zero steps are proven). Cross-sample roll-ups
+  (`summarizeContinuityMetrics`, p50/p95/p99 + pass fractions + threshold
+  breaches, plus the cost ratio's own summarize) match the rubric's
+  summarize shape, and `renderContinuitySummaryLines` emits the report
+  lines. Eval configs opt in BY NAME via the new `type: registry` grader
+  entry (`grader: continuity.reAskRate`), resolved against
+  `RunEvalOptions.graderRegistry` with the same placeholder pattern
+  `llm_judge` uses; the runner now stamps `RunResult.artifacts`
+  (sampleDir/sessionId/transcriptPath/stateRootDir/specName) so artifact
+  graders find a finished sample's files without ever touching live stores.
+  A worked two-session fixture (`CONTINUITY_FIXTURE_SAMPLES` + a scripted
+  mock-adapter invoker that plays the conversations through the REAL
+  event-log/continuity-store/tool-plan code paths) pins the discrimination
+  matrix in tests: one clean run passes every gate, a re-asker fails
+  re-ask/retention/pickup, a claims-without-proof run fails honesty — end
+  to end through `runEval`. And the §5 promise — "local and Thredz are
+  contract-identical" is a test, not a convention — lands as
+  `runWikiBackendConformance` (exported from `@crewhaus/memory-service`, a
+  test-kit function, not a test file): upsert version-conflict semantics
+  incl. the literal `stale_article_version`, recall bundle shape, signals
+  metadata-only (+ verified reset on content writes), list staleness
+  ordering, visibility DEFAULTING TO PRIVATE, and `log_knowledge_gap`
+  behavior, run per-check against a fresh backend from a factory. The file
+  backend enrolls today (wiki-store's test suite, with a last-write-wins
+  negative control proving the suite discriminates); the Thredz backend
+  (PR 16) runs the same suite against a stub server.
+
+### Changed
+
+- **Recompiling an agent-loop spec produces a different bundle than 0.2.x:
+  continuity is default-on** (see the headline entry above; sanctioned by
+  ROADMAP.md's pre-1.0 policy). Add `continuity: false` to restore the
+  previous bytes exactly. No other spec compiles differently unless it
+  declared a `memory:` block on channel/managed/research — that block was
+  dead config on those shapes and is now wired as documented.
+
+- **BREAKING (IR, pre-1.0):** `IrMcpStdioConfig.env` and
+  `IrMcpSseConfig.headers` are now `Record<string, IrSecretRef>` instead of
+  `Record<string, string>`. Emitters embed the unresolved config and
+  compiled bundles resolve it at process start; `redundantMcpServerCollapse`
+  compares env/headers structurally, so servers that differ only in
+  credentials no longer collapse into one.
 
 ### Fixed
 

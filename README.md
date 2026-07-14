@@ -254,6 +254,30 @@ crewhaus compile eval.yaml   -o build/eval    # eval bundle
 
 Other shapes follow the same rule — `retrieve:` + `indexing:` for a RAG pipeline, `queue:` for a batch worker, `voice:` for a realtime agent — but the `agent:` block stays identical across all of them.
 
+## Memory & continuity (v0.3.0)
+
+Every agent-loop harness now remembers:
+
+- **Continuity, on by default** — persistent focus, plans, and goals with a claimed→proven proof ladder, a verbatim requirements ledger that survives compaction, and a deterministic `handoff.md` at teardown. One line — `continuity: false` — restores the 0.2.x bundle byte-for-byte.
+- **A local wiki** — `memory.wiki` is versioned, update-in-place semantic memory with hybrid recall; `memory.dream` consolidates it on a schedule (deterministic pass + budget-capped model pass).
+- **One-knob hosted memory** — `thredz: true` flips the wiki to a hosted [Thredz](https://thredz.crewhaus.ai) backend: one env var, private by default, and a Thredz outage degrades the run instead of killing it.
+- **Self-teaching harnesses** — a `learning:` block wires the shipped `learning-loop` skill: recall-then-answer with citations, gap-driven study, reflection, and a first-class `/exam`.
+- **Honest failures** — an out-of-funding run says so, with a fix line and a meaningful exit code, instead of "agent exited."
+
+The proof is the self-teaching-expert demo, whose ~150-line mechanism prompt shrank to two knobs plus domain content:
+
+```yaml
+thredz: true                  # hosted wiki = long-term memory (one env var)
+
+learning:
+  domain: specialty coffee brewing & extraction science
+  curriculum: curriculum.md
+  sources: ["sca.coffee", "*.edu", "baristahustle.com"]
+  exam: { dataset: eval/dataset.jsonl, graders: eval/graders.yaml }
+```
+
+That's a domain expert that studies, cites, reflects, and sits its own exam — walkthrough [64 — the self-teaching expert](https://github.com/crewhaus/demos/blob/main/walkthroughs/64-self-teaching-expert.md) walks it end to end.
+
 ## Documentation
 
 - **New here?** Start with [Getting Started](https://github.com/crewhaus/docs/blob/main/GETTING-STARTED.md) — a guided tour from first principles to a runnable agent.

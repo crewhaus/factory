@@ -241,6 +241,34 @@ export const OPTIMIZABLE_PATHS: Readonly<
     Object.freeze(["agent", "model_pool", "policy"]),
     Object.freeze(["agent", "model_pool", "routing"]),
     Object.freeze(["agent", "model_pool", "learning"]),
+    // 0.3.0 memory release (design §7.5, PR 20) — the memory/continuity
+    // QUALITY knobs, registered on the five emit-wired memory shapes (cli,
+    // channel, managed, research, crew — mirrored below with a pointer to
+    // this table). Every one is a scalar that survives lower() 1:1, with its
+    // bounds owned by the spec schema (+ the compiler's lower-time floors),
+    // so an out-of-bounds patch fails applySpecPatch's re-parse:
+    //   memory.recallK               int 1..50 — facts fused into recall
+    //   memory.autoCaptureThreshold  int >= 1  — capture sensitivity
+    //   memory.ttl                   duration string ("90d"; >= 1h floor) —
+    //                                the fact-forgetting horizon
+    //   memory.wiki.recallK          int 1..50 — wiki hits fused into recall
+    //   memory.dream.budget_usd      number >= 0 — dream model-phase spend
+    //                                cap (0 = deterministic only)
+    //   continuity.focusMaxChars     int >= 1 (default 4096) — hard cap on
+    //                                the volatile tail block (token cost vs
+    //                                plan/ledger completeness)
+    // Deliberately EXCLUDED — the optimizer tunes quality, never semantics:
+    // thredz.* (credentials), memory.backend (store flip), memory.dream.every
+    // + .mode (side-effecting schedule / model-spend switch), continuity
+    // .proof/.scope/.enabled (behavioral switches), compaction
+    // .preserve_user_messages (safety), learning.sources (allowlist =
+    // security).
+    Object.freeze(["memory", "recallK"]),
+    Object.freeze(["memory", "autoCaptureThreshold"]),
+    Object.freeze(["memory", "ttl"]),
+    Object.freeze(["memory", "wiki", "recallK"]),
+    Object.freeze(["memory", "dream", "budget_usd"]),
+    Object.freeze(["continuity", "focusMaxChars"]),
   ]),
   workflow: Object.freeze([
     Object.freeze(["steps"]),
@@ -257,6 +285,13 @@ export const OPTIMIZABLE_PATHS: Readonly<
     Object.freeze(["agent", "model_pool", "policy"]),
     Object.freeze(["agent", "model_pool", "routing"]),
     Object.freeze(["agent", "model_pool", "learning"]),
+    // 0.3.0 memory/continuity quality knobs — types/bounds at the cli entry.
+    Object.freeze(["memory", "recallK"]),
+    Object.freeze(["memory", "autoCaptureThreshold"]),
+    Object.freeze(["memory", "ttl"]),
+    Object.freeze(["memory", "wiki", "recallK"]),
+    Object.freeze(["memory", "dream", "budget_usd"]),
+    Object.freeze(["continuity", "focusMaxChars"]),
   ]),
   graph: Object.freeze([
     Object.freeze(["nodes"]),
@@ -271,6 +306,13 @@ export const OPTIMIZABLE_PATHS: Readonly<
     Object.freeze(["agent", "model_pool", "policy"]),
     Object.freeze(["agent", "model_pool", "routing"]),
     Object.freeze(["agent", "model_pool", "learning"]),
+    // 0.3.0 memory/continuity quality knobs — types/bounds at the cli entry.
+    Object.freeze(["memory", "recallK"]),
+    Object.freeze(["memory", "autoCaptureThreshold"]),
+    Object.freeze(["memory", "ttl"]),
+    Object.freeze(["memory", "wiki", "recallK"]),
+    Object.freeze(["memory", "dream", "budget_usd"]),
+    Object.freeze(["continuity", "focusMaxChars"]),
   ]),
   pipeline: Object.freeze([
     Object.freeze(["agent", "instructions"]),
@@ -284,6 +326,13 @@ export const OPTIMIZABLE_PATHS: Readonly<
     Object.freeze(["failure_taxonomy"]),
     Object.freeze(["chains"]),
     Object.freeze(["transaction_policy"]),
+    // 0.3.0 memory/continuity quality knobs — types/bounds at the cli entry.
+    Object.freeze(["memory", "recallK"]),
+    Object.freeze(["memory", "autoCaptureThreshold"]),
+    Object.freeze(["memory", "ttl"]),
+    Object.freeze(["memory", "wiki", "recallK"]),
+    Object.freeze(["memory", "dream", "budget_usd"]),
+    Object.freeze(["continuity", "focusMaxChars"]),
   ]) /* whole-role replacement */,
   research: Object.freeze([
     Object.freeze(["agent", "instructions"]),
@@ -291,6 +340,13 @@ export const OPTIMIZABLE_PATHS: Readonly<
     Object.freeze(["retrieve", "maxDepth"]),
     Object.freeze(["chains"]),
     Object.freeze(["transaction_policy"]),
+    // 0.3.0 memory/continuity quality knobs — types/bounds at the cli entry.
+    Object.freeze(["memory", "recallK"]),
+    Object.freeze(["memory", "autoCaptureThreshold"]),
+    Object.freeze(["memory", "ttl"]),
+    Object.freeze(["memory", "wiki", "recallK"]),
+    Object.freeze(["memory", "dream", "budget_usd"]),
+    Object.freeze(["continuity", "focusMaxChars"]),
   ]),
   batch: Object.freeze([
     Object.freeze(["agent", "instructions"]),
