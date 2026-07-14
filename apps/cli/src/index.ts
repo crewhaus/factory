@@ -467,17 +467,20 @@ import {
   matchAuditRecordsByWindow,
   summarizeCost,
 } from "./incident";
-// Item 39 — `crewhaus init --interactive`: the harness-designer interview
-// (validate-and-retry loop + scripted no-credentials fallback) in a
-// side-effect-free module so this entry file stays testable.
+// Item 39 / v0.3.0 §2.9 — `crewhaus init --interactive`: the conversational
+// harness-designer interview (persisted, resumable runChatLoop session) plus
+// the scripted no-credentials fallback, in importable modules so this entry
+// file stays testable.
 import {
-  EMIT_SPEC_TOOL,
+  INIT_INTERVIEW_SAVED_NOTE,
+  conversationalPathAllowed,
+  runConversationalInterview,
+} from "./init-conversation";
+import {
   type ScriptedAnswers,
   type ScriptedShape,
-  buildInterviewSystemPrompt,
   buildScriptedSpec,
   isScriptedShape,
-  runInterview,
 } from "./init-interactive";
 // Item 67 — `crewhaus intents`: cluster user_message inputs across sessions +
 // rank by frequency / satisfaction / failure. Side-effect-free (this entry file
@@ -1064,6 +1067,13 @@ const INIT_SCHEMA: ParseArgsSchema = {
     // prefill the model from what's reachable.
     { name: "interactive", short: "i", takesValue: false },
     { name: "detect", takesValue: false },
+    // v0.3.0 §2.9 — restart a persisted interview session (the conversation
+    // is a runChatLoop session; a crashed/interrupted interview resumes with
+    // its ledger and transcript intact).
+    { name: "resume", takesValue: false },
+    // v0.3.0 §2.9 — skip the conversational interview (scripted
+    // questionnaire), mirroring the non-TTY behavior.
+    { name: "yes", short: "y", takesValue: false },
     { name: "help", short: "h" },
   ],
 };
@@ -3352,17 +3362,24 @@ function createLineReader(): { ask(prompt: string): Promise<string>; close(): vo
 }
 
 /**
- * Item 39 — `crewhaus init --interactive`. Promotes the demos harness-designer
- * into core: interview the user and emit a `parseSpec`-validated crewhaus.yaml.
+ * Item 39 / v0.3.0 §2.9 — `crewhaus init --interactive`. Interview the user
+ * and emit a `parseSpec`-validated crewhaus.yaml.
  *
- * Two paths, chosen by credential availability (like the merged scaffold path):
- *   - Credentials present → the MODEL interview. `runInterview` (side-effect-
- *     free) drives a validate-and-retry loop: the model calls `emit_spec` with
- *     a draft, `parseSpec` validates it in-process, and any structured error is
- *     fed back for a corrected re-emit. No demos dependency — the shape
- *     guidance is bundled in `init-interactive.ts`.
- *   - No credentials → a scripted stdin questionnaire (name/shape/model/tools)
- *     that still emits a `parseSpec`-validated spec via `buildScriptedSpec`.
+ * Three paths:
+ *   - Credentials + a TTY → the CONVERSATIONAL interview (PR 18): a
+ *     persisted, resumable `runChatLoop` session with `ask_user` +
+ *     `emit_spec` and no forced toolChoice, the continuity fabric on
+ *     (requirements ledger, focus pinning, handoff) spec-scoped as
+ *     `init-<dirname>` under the target directory. Validation errors return
+ *     to the conversation as tool errors; a terminal failure prints the
+ *     classified FailureReport plus the saved-interview resume hint;
+ *     `--resume` restarts the session with the ledger intact.
+ *   - Credentials but no TTY (or `--yes`) → the conversational path is
+ *     refused (same convention as the other interactive verbs) and the
+ *     scripted questionnaire runs instead.
+ *   - No credentials → the scripted stdin questionnaire
+ *     (name/shape/model/tools), byte-identical to pre-0.3.0, still emitting
+ *     a `parseSpec`-validated spec via `buildScriptedSpec`.
  *
  * Reuses `runInit`'s exists-check/refuse-overwrite + standalone-dir guidance,
  * and composes with `--detect` (#40) to prefill the default model from a
@@ -3371,12 +3388,14 @@ function createLineReader(): { ask(prompt: string): Promise<string>; close(): vo
 async function runInitInteractive(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
-      "usage: crewhaus init --interactive [name] [--detect]\n" +
-        "  Interview-driven spec authoring. With credentials, an agent interviews you\n" +
-        "  and emits a validated crewhaus.yaml (every draft is checked against the live\n" +
-        "  spec schema and retried on error). Without credentials, a scripted\n" +
+      "usage: crewhaus init --interactive [name] [--detect] [--resume] [--yes]\n" +
+        "  Interview-driven spec authoring. With credentials and a TTY, an agent runs a\n" +
+        "  real multi-turn interview (persisted + resumable; every draft is validated\n" +
+        "  against the live spec schema in-conversation). Without credentials, a scripted\n" +
         "  questionnaire (name/shape/model/tools) still emits a validated spec.\n" +
-        "  --detect  prefill the default model from a reachable local endpoint/provider.\n",
+        "  --detect  prefill the default model from a reachable local endpoint/provider.\n" +
+        "  --resume  continue a saved interview session where it stopped.\n" +
+        "  --yes     skip the conversation; use the scripted questionnaire.\n",
     );
     return;
   }
@@ -3400,37 +3419,78 @@ async function runInitInteractive(args: ParsedArgs): Promise<void> {
     if (prefill !== undefined) defaultModel = prefill;
   }
 
-  // Credential-gated path selection: try to resolve the default model's adapter.
-  // A resolution failure (no credentials / missing optional adapter) degrades
-  // to the scripted questionnaire.
+  // Credential-gated path selection: try to resolve the default model's
+  // adapter. A resolution failure (no credentials / missing optional adapter)
+  // degrades to the scripted questionnaire — byte-identical messaging.
   const interviewer = await tryBuildInterviewer(defaultModel);
-  const reader = createLineReader();
+  const conversational = conversationalPathAllowed({
+    stdinIsTTY: process.stdin.isTTY === true,
+    assumeYes: args.flags["yes"] === true,
+  });
+
   let yaml: string;
-  try {
-    if (interviewer !== undefined) {
-      process.stdout.write(
-        `interactive spec authoring (model: ${interviewer.modelId}). Describe the agent you want to build.\n`,
-      );
-      const description = await reader.ask("> ");
-      if (description === "") die("no description given — aborting");
-      const result = await runInterview({
-        proposeSpec: (feedback) => interviewer.propose(description, feedback),
+  let mappingLines: readonly string[] = [];
+  if (interviewer !== undefined && conversational.allowed) {
+    // v0.3.0 §2.9 — the conversational interview owns stdin via runChatLoop's
+    // REPL (no line reader here: a second readline would steal input).
+    process.stdout.write(
+      args.flags["resume"] === true
+        ? `interactive spec authoring (model: ${interviewer.modelId}) — resuming your saved interview.\n`
+        : `interactive spec authoring (model: ${interviewer.modelId}). Describe the agent you want to build.\n`,
+    );
+    try {
+      const result = await runConversationalInterview({
+        targetDir,
+        specName: `init-${basename(targetDir)}`,
+        model: defaultModel,
+        resume: args.flags["resume"] === true,
       });
       yaml = result.yaml;
-      process.stdout.write(`validated after ${result.attempts} draft(s).\n`);
-    } else {
-      process.stdout.write(
-        "no model credentials detected — falling back to the scripted questionnaire.\n",
-      );
-      yaml = (await runScriptedQuestionnaire({ reader, specName, defaultModel })).yaml;
+      mappingLines = result.mappingLines;
+    } catch (err) {
+      // A classified terminal failure (billing/auth/token exhaustion) prints
+      // the PR-3 FailureReport with the saved-interview hint and the coded
+      // exit — the session + ledger are on disk, `--resume` continues.
+      if (err instanceof RunFailedError) {
+        const rendered = renderCliFailure(err, { notes: [INIT_INTERVIEW_SAVED_NOTE] });
+        process.stderr.write(`${rendered.text}\n`);
+        process.exit(rendered.exitCode);
+      }
+      throw err;
     }
-  } finally {
-    reader.close();
+  } else {
+    if (args.flags["resume"] === true) {
+      die(
+        "crewhaus init --interactive --resume needs the conversational interview (model credentials and an interactive terminal)",
+      );
+    }
+    const reader = createLineReader();
+    try {
+      if (interviewer === undefined) {
+        process.stdout.write(
+          "no model credentials detected — falling back to the scripted questionnaire.\n",
+        );
+      } else {
+        process.stdout.write(
+          `${conversational.reason ?? "conversational interview unavailable"} — falling back to the scripted questionnaire.\n`,
+        );
+      }
+      yaml = (await runScriptedQuestionnaire({ reader, specName, defaultModel })).yaml;
+    } finally {
+      reader.close();
+    }
   }
 
   mkdirSync(targetDir, { recursive: true });
   writeFileSync(targetFile, yaml);
   process.stdout.write(`wrote ${targetFile}\n`);
+  // v0.3.0 §2.9 — the REQ → spec-field mapping the model produced before
+  // emit_spec, surfaced as the interview's closing summary.
+  if (mappingLines.length > 0) {
+    process.stdout.write(
+      `requirements → spec mapping (from the interview):\n${mappingLines.map((l) => `  ${l}`).join("\n")}\n`,
+    );
+  }
   const rel = relative(process.cwd(), targetDir);
   const cd = rel === "" ? "" : `cd ${rel} && `;
   process.stdout.write(`next: ${cd}crewhaus run crewhaus.yaml\n`);
@@ -3479,50 +3539,21 @@ async function runScriptedQuestionnaire(opts: {
 }
 
 /**
- * Item 39 — attempt to build the model interviewer for `model`. Resolves the
- * adapter via the same `resolveModel` path the scaffold-evals/mutator use;
- * returns undefined when no credentials/adapter are available so the caller
- * degrades to the scripted questionnaire. The returned `propose` closure runs
- * one interview turn: it sends the system prompt + description + the running
- * validation-feedback log and returns the `emit_spec` YAML (or undefined).
+ * Item 39 / v0.3.0 §2.9 — credential gate for the conversational interview.
+ * Resolves the model's adapter via the same `resolveModel` path the
+ * scaffold-evals/mutator use; returns undefined when no credentials/adapter
+ * are available so the caller degrades to the scripted questionnaire. The
+ * interview itself runs on `runChatLoop` (init-conversation.ts), which
+ * resolves the model again through the normal router path — the single-shot
+ * forced-`emit_spec` propose closure this used to carry is gone (PR 18).
  */
-async function tryBuildInterviewer(model: string): Promise<
-  | {
-      readonly modelId: string;
-      propose: (desc: string, feedback: readonly string[]) => Promise<string | undefined>;
-    }
-  | undefined
-> {
+async function tryBuildInterviewer(
+  model: string,
+): Promise<{ readonly modelId: string } | undefined> {
   try {
     const { resolveModel } = await import("@crewhaus/model-router");
-    const { collectFinalMessage, extractToolUse } = await import("@crewhaus/adapter-anthropic");
     const resolution = await resolveModel(model);
-    const system = buildInterviewSystemPrompt();
-    const propose = async (
-      desc: string,
-      feedback: readonly string[],
-    ): Promise<string | undefined> => {
-      const feedbackText =
-        feedback.length > 0
-          ? `\n\nYour previous draft(s) failed validation with:\n${feedback
-              .map((f) => `- ${f}`)
-              .join("\n")}\nEmit a corrected spec.`
-          : "";
-      const final = await collectFinalMessage(
-        resolution.adapter.stream({
-          model: resolution.modelId,
-          system: [{ type: "text", text: system }],
-          messages: [{ role: "user", content: `Build this agent: ${desc}${feedbackText}` }],
-          tools: [EMIT_SPEC_TOOL],
-          toolChoice: { type: "tool", name: EMIT_SPEC_TOOL.name },
-          maxTokens: 4096,
-        }),
-      );
-      const toolUse = extractToolUse(final, EMIT_SPEC_TOOL.name);
-      const yaml = (toolUse?.input as { yaml?: unknown } | undefined)?.yaml;
-      return typeof yaml === "string" && yaml.length > 0 ? yaml : undefined;
-    };
-    return { modelId: resolution.modelId, propose };
+    return { modelId: resolution.modelId };
   } catch {
     return undefined;
   }
