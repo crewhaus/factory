@@ -25,6 +25,7 @@ import type {
   IrFeedback,
   IrGraphV0,
   IrIMessageConfig,
+  IrLearning,
   IrManagedV0,
   IrMcpServerConfig,
   IrMcpServers,
@@ -1188,6 +1189,98 @@ function lowerThredzCarried(
   return thredz !== undefined ? { thredz } : {};
 }
 
+// ---------------------------------------------------------------------------
+// v0.3.0 Goal 2 (§3.3, PR 17) — the `learning:` block, lowered here.
+// ---------------------------------------------------------------------------
+
+type SpecWithLearning = {
+  readonly learning?: {
+    readonly enabled?: boolean;
+    readonly domain: string;
+    readonly curriculum?: string;
+    readonly sources?: readonly string[];
+    readonly exam?: { readonly dataset: string; readonly graders: string };
+    readonly study?: { readonly on_heartbeat?: boolean; readonly on_dream?: boolean };
+  };
+  readonly memory?: {
+    readonly wiki?: { readonly enabled?: boolean; readonly requireSources?: boolean };
+  };
+  readonly thredz?: SpecThredz;
+};
+
+/**
+ * Lower the `learning:` block to a RESOLVED `IrLearning` (study toggles
+ * defaulted to true so downstream reads one deterministic shape). Cross-field
+ * validation lives HERE (LOAD-BEARING — ir-passes are opt-in and skipped on
+ * the plain compile path), mirrored by ir-passes' `memoryIntegrityPass` for
+ * direct-IR builders:
+ *
+ *   - learning NEEDS a wiki (the knowledge lives there): `memory.wiki`
+ *     (local, not explicitly disabled) or `thredz:` (hosted) must be present;
+ *   - an explicit `memory.wiki.requireSources: false` contradicts learning's
+ *     deterministic Sources-required write governance (§3.3) — rejected
+ *     loudly rather than silently overridden.
+ *
+ * Whether `curriculum`/`exam.dataset`/`exam.graders` files EXIST is a
+ * RUNTIME concern (the study/exam paths fail with clear errors); the
+ * compiler validates shape only.
+ */
+function lowerLearning(spec: SpecWithLearning): { learning?: IrLearning } {
+  const l = spec.learning;
+  if (l === undefined || l.enabled === false) return {};
+
+  const wikiOn = spec.memory?.wiki !== undefined && spec.memory.wiki.enabled !== false;
+  const thredzOn = spec.thredz !== undefined && spec.thredz !== false;
+  if (!wikiOn && !thredzOn) {
+    throw new CompilerError(
+      "learning: needs a wiki to learn into — enable the local one (memory: { wiki: { enabled: true } }) or add the hosted backend (thredz: $THREDZ_API_KEY). The learning loop commits knowledge to wiki articles, not to the prompt.",
+    );
+  }
+  if (spec.memory?.wiki?.requireSources === false) {
+    throw new CompilerError(
+      "memory.wiki.requireSources: false contradicts the learning: block — learning enforces Sources-required wiki writes deterministically (design §3.3: no source, no commit). Drop the override (or remove learning:) and recompile.",
+    );
+  }
+
+  return {
+    learning: {
+      domain: l.domain,
+      ...(l.curriculum !== undefined ? { curriculum: l.curriculum } : {}),
+      ...(l.sources !== undefined ? { sources: [...l.sources] } : {}),
+      ...(l.exam !== undefined
+        ? { exam: { dataset: l.exam.dataset, graders: l.exam.graders } }
+        : {}),
+      // Resolved defaults: unattended study is ON for a learning harness —
+      // the block itself is the opt-in; the toggles are the opt-outs.
+      study: {
+        onHeartbeat: l.study?.on_heartbeat ?? true,
+        onDream: l.study?.on_dream ?? true,
+      },
+    },
+  };
+}
+
+/**
+ * §3.3 write-path governance, applied at lower time: with learning ON,
+ * `memory.wiki.requireSources` is stamped `true` on the lowered memory block
+ * so `wiki_write` deterministically rejects bodies without a `## Sources`
+ * heading (the contradiction — an explicit `false` — was rejected in
+ * `lowerLearning`). No learning, or no local wiki block (thredz-only), and
+ * the lowered memory passes through untouched — byte-identical IR.
+ */
+function applyLearningWikiGovernance(
+  lowered: { memory?: IrMemory },
+  learningOn: boolean,
+): { memory?: IrMemory } {
+  if (!learningOn || lowered.memory?.wiki === undefined) return lowered;
+  return {
+    memory: {
+      ...lowered.memory,
+      wiki: { ...lowered.memory.wiki, requireSources: true },
+    },
+  };
+}
+
 type SpecWithObservability = {
   readonly observability?: {
     readonly slo?: {
@@ -1375,6 +1468,13 @@ export function lower(spec: Spec): IrNode {
         mcpServers: lowerMcpServers(spec.mcp_servers),
         memory: lowerMemory(spec),
       });
+      // v0.3.0 Goal 2 — the `learning:` block (validated against the wiki/
+      // thredz surface it needs) + the §3.3 Sources-required wiki stamp.
+      const learning = lowerLearning(spec);
+      const memoryLowered = applyLearningWikiGovernance(
+        thredzLowered.memory !== undefined ? { memory: thredzLowered.memory } : {},
+        learning.learning !== undefined,
+      );
       return {
         version: 0,
         name: spec.name,
@@ -1395,9 +1495,10 @@ export function lower(spec: Spec): IrNode {
         ...lowerBudget(spec),
         ...lowerSecurity(spec),
         ...lowerFeedback(spec),
-        ...(thredzLowered.memory !== undefined ? { memory: thredzLowered.memory } : {}),
+        ...memoryLowered,
         ...continuity,
         ...(thredzLowered.thredz !== undefined ? { thredz: thredzLowered.thredz } : {}),
+        ...learning,
         ...lowerObservability(spec),
         // Phase 3 §3.3 — CLI banner config. Plus Phase 2 M2.2 TUI mode
         // gate. Only included when the spec author opted in (cli block
@@ -1443,6 +1544,8 @@ export function lower(spec: Spec): IrNode {
       } satisfies IrWorkflowV0;
     case "channel": {
       const continuity = lowerContinuity(spec, { defaultOn: true, autoScope: "session" });
+      // v0.3.0 Goal 2 — learning (validated + Sources-required wiki stamp).
+      const learning = lowerLearning(spec);
       return {
         version: 0,
         name: spec.name,
@@ -1463,7 +1566,7 @@ export function lower(spec: Spec): IrNode {
         ...lowerFailureTaxonomy(spec),
         ...lowerBudget(spec),
         ...lowerFeedback(spec),
-        ...lowerMemory(spec),
+        ...applyLearningWikiGovernance(lowerMemory(spec), learning.learning !== undefined),
         // v0.3.0 Goal 1 — DEFAULT-ON continuity. `auto` scope resolves to
         // `session` on channel: per-conversation stores ride the session
         // router's sessionId (§2.7/§14.5); heartbeat ticks read spec scope.
@@ -1471,6 +1574,7 @@ export function lower(spec: Spec): IrNode {
         // v0.3.0 Goal 3 — thredz is CARRIED on this shape (ignored-note in
         // the emitted daemon), not emit-wired yet.
         ...lowerThredzCarried(spec, continuity.continuity?.plan === true, "channel"),
+        ...learning,
         ...lowerObservability(spec),
         // Phase 3 §3.1 — heartbeat. Duration string ("2h", "30m") is
         // parsed once at lower time so codegen emits a literal numeric
@@ -1519,6 +1623,8 @@ export function lower(spec: Spec): IrNode {
       } satisfies IrGraphV0;
     case "managed": {
       const continuity = lowerContinuity(spec, { defaultOn: true, autoScope: "spec" });
+      // v0.3.0 Goal 2 — learning (validated + Sources-required wiki stamp).
+      const learning = lowerLearning(spec);
       return {
         version: 0,
         name: spec.name,
@@ -1539,7 +1645,7 @@ export function lower(spec: Spec): IrNode {
         compaction: lowerCompaction(spec),
         ...lowerFailureTaxonomy(spec),
         ...lowerBudget(spec),
-        ...lowerMemory(spec),
+        ...applyLearningWikiGovernance(lowerMemory(spec), learning.learning !== undefined),
         // v0.3.0 Goal 1 — DEFAULT-ON continuity. `auto` resolves to `spec`
         // scope; the managed daemon tenant-fences every store at boot (the
         // wireMemory deps carry the tenant, §2.7).
@@ -1547,6 +1653,7 @@ export function lower(spec: Spec): IrNode {
         // v0.3.0 Goal 3 — thredz is CARRIED on this shape (ignored-note in
         // the emitted daemon), not emit-wired yet.
         ...lowerThredzCarried(spec, continuity.continuity?.plan === true, "managed"),
+        ...learning,
         ...lowerObservability(spec),
       } satisfies IrManagedV0;
     }
@@ -1591,6 +1698,8 @@ export function lower(spec: Spec): IrNode {
       } satisfies IrPipelineV0;
     case "crew": {
       const continuity = lowerContinuity(spec, { defaultOn: true, autoScope: "spec" });
+      // v0.3.0 Goal 2 — learning (validated + Sources-required wiki stamp).
+      const learning = lowerLearning(spec);
       return {
         version: 0,
         name: spec.name,
@@ -1615,16 +1724,19 @@ export function lower(spec: Spec): IrNode {
         // v0.3.0 — crew joins the memory-carrying shapes (§9) and gets
         // DEFAULT-ON continuity: roles share the `spec`-scoped plan store
         // (the plan IS the coordination surface, §2.7).
-        ...lowerMemory(spec),
+        ...applyLearningWikiGovernance(lowerMemory(spec), learning.learning !== undefined),
         ...continuity,
         // v0.3.0 Goal 3 — thredz is CARRIED on this shape (ignored-note in
         // the emitted bundle), not emit-wired yet.
         ...lowerThredzCarried(spec, continuity.continuity?.plan === true, "crew"),
+        ...learning,
         ...lowerChainSubsystem(spec),
       } satisfies IrCrewV0;
     }
     case "research": {
       const continuity = lowerContinuity(spec, { defaultOn: true, autoScope: "spec" });
+      // v0.3.0 Goal 2 — learning (validated + Sources-required wiki stamp).
+      const learning = lowerLearning(spec);
       return {
         version: 0,
         name: spec.name,
@@ -1651,12 +1763,13 @@ export function lower(spec: Spec): IrNode {
         permissions: lowerPermissions(spec),
         compaction: lowerCompaction(spec),
         ...lowerFailureTaxonomy(spec),
-        ...lowerMemory(spec),
+        ...applyLearningWikiGovernance(lowerMemory(spec), learning.learning !== undefined),
         // v0.3.0 Goal 1 — DEFAULT-ON continuity, `spec` scope (§2.7).
         ...continuity,
         // v0.3.0 Goal 3 — thredz is CARRIED on this shape (ignored-note in
         // the emitted daemon), not emit-wired yet.
         ...lowerThredzCarried(spec, continuity.continuity?.plan === true, "research"),
+        ...learning,
         ...lowerChainSubsystem(spec),
       } satisfies IrResearchV0;
     }

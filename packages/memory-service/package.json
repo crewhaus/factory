@@ -23,12 +23,14 @@
     "@crewhaus/skills-registry": "workspace:*",
     "@crewhaus/slash-commands": "workspace:*",
     "@crewhaus/tenancy": "workspace:*",
+    "@crewhaus/tool-builder": "workspace:*",
     "@crewhaus/tool-catalog": "workspace:*",
     "@crewhaus/tool-mcp": "workspace:*",
     "@crewhaus/tool-memory": "workspace:*",
     "@crewhaus/tool-plan": "workspace:*",
     "@crewhaus/tool-wiki": "workspace:*",
-    "@crewhaus/wiki-store": "workspace:*"
+    "@crewhaus/wiki-store": "workspace:*",
+    "zod": "^3.23.8"
   },
   "devDependencies": {
     "@crewhaus/runtime-core": "workspace:*"

@@ -411,6 +411,55 @@ export type IrThredz = {
   readonly agentName?: string;
 };
 
+/** v0.3.0 Goal 2 (§3.3, PR 17) — the first-class competency exam: dataset +
+ *  graders paths, spec-relative. Whether the files EXIST is a runtime
+ *  concern (the `run_exam` tool fails with a clear error); the compiler
+ *  validates shape only. */
+export type IrLearningExam = {
+  /** Spec-relative path to the exam dataset (jsonl). */
+  readonly dataset: string;
+  /** Spec-relative path to the graders config (yaml). */
+  readonly graders: string;
+};
+
+/** v0.3.0 Goal 2 (§3.3, PR 17) — unattended-study toggles, RESOLVED at lower
+ *  time (both default true) so downstream reads one deterministic shape. */
+export type IrLearningStudy = {
+  /** Prepend the study-rotation preamble (gaps first, ~3:1 study:reflect,
+   *  bounded per tick) to channel heartbeat instructions. */
+  readonly onHeartbeat: boolean;
+  /** Seed the dream model phase's findings with the top open knowledge gaps
+   *  + the next unmastered curriculum rung. */
+  readonly onDream: boolean;
+};
+
+/**
+ * v0.3.0 Goal 2 (§3.3, PR 17) — continual-learning config, lowered from the
+ * top-level `learning:` block. Presence means learning is ON (the compiler
+ * dropped `enabled: false` at lower time). Learning REQUIRES a wiki —
+ * `lower()` rejects the block without `memory.wiki` (local) or `thredz:`
+ * (hosted) — and deterministically stamps `memory.wiki.requireSources: true`
+ * (Sources-required write governance, what was prompt-only in the expert
+ * demo).
+ *
+ * `domain`/`curriculum`/`sources` are substituted into the builtin
+ * `learning-loop` skill body at wire time; `exam` drives the programmatic
+ * `run_exam` tool; `study` carries the resolved unattended-study toggles.
+ * Carried on the five memory shapes (IrV0/cli, IrChannelV0, IrManagedV0,
+ * IrResearchV0, IrCrewV0).
+ */
+export type IrLearning = {
+  /** One sentence naming the field of expertise. */
+  readonly domain: string;
+  /** Spec-relative path to the agent-editable curriculum ladder. Absent →
+   *  the skill keeps the ladder in the wiki. */
+  readonly curriculum?: string;
+  /** Source-allowlist hints. NOT optimizable — allowlist = security (§7.5). */
+  readonly sources?: readonly string[];
+  readonly exam?: IrLearningExam;
+  readonly study: IrLearningStudy;
+};
+
 /** Ops item 37 — a mitigation-ladder rung the runtime SLO monitor walks on a
  *  sustained breach, in declared order. See {@link IrSlo}. */
 export type IrSloMitigation = "alert" | "pause-intake" | "rollback";
@@ -535,6 +584,9 @@ export type IrV0 = {
   /** v0.3.0 Goal 3 — Thredz config. Present when the spec declares `thredz:`;
    *  the compiler also synthesizes `mcp_servers.thredz` on this shape. */
   readonly thredz?: IrThredz;
+  /** v0.3.0 Goal 2 — continual-learning config (§3.3, PR 17). Present
+   *  when the spec declares an enabled `learning:` block. */
+  readonly learning?: IrLearning;
   /** Ops item 37 — SLO targets + mitigation ladder. Optional; absent when the
    *  spec omits the `observability` block. */
   readonly observability?: IrObservability;
@@ -817,6 +869,9 @@ export type IrChannelV0 = {
   /** v0.3.0 Goal 3 — Thredz config, CARRIED but not emit-wired on this shape
    *  in this release (the emitter prints the ignored-note comment). */
   readonly thredz?: IrThredz;
+  /** v0.3.0 Goal 2 — continual-learning config (§3.3, PR 17). Present
+   *  when the spec declares an enabled `learning:` block. */
+  readonly learning?: IrLearning;
   /** Ops item 37 — SLO targets + mitigation ladder. Optional; absent when the
    *  spec omits the `observability` block. */
   readonly observability?: IrObservability;
@@ -873,6 +928,9 @@ export type IrManagedV0 = {
   /** v0.3.0 Goal 3 — Thredz config, CARRIED but not emit-wired on this shape
    *  in this release (the emitter prints the ignored-note comment). */
   readonly thredz?: IrThredz;
+  /** v0.3.0 Goal 2 — continual-learning config (§3.3, PR 17). Present
+   *  when the spec declares an enabled `learning:` block. */
+  readonly learning?: IrLearning;
   /** Ops item 37 — SLO targets + mitigation ladder. Optional; absent when the
    *  spec omits the `observability` block. The managed daemon's `pause-intake`
    *  rung reuses its `budget_exceeded` 429 path. */
@@ -1044,6 +1102,9 @@ export type IrCrewV0 = {
   /** v0.3.0 Goal 3 — Thredz config, CARRIED but not emit-wired on this shape
    *  in this release (the emitter prints the ignored-note comment). */
   readonly thredz?: IrThredz;
+  /** v0.3.0 Goal 2 — continual-learning config (§3.3, PR 17). Present
+   *  when the spec declares an enabled `learning:` block. */
+  readonly learning?: IrLearning;
   /** §47 cross-cutting blockchain subsystem (slice 0). All optional. */
   readonly chains?: readonly IrChainBinding[];
   readonly wallets?: readonly IrWalletBinding[];
@@ -1098,6 +1159,9 @@ export type IrResearchV0 = {
   /** v0.3.0 Goal 3 — Thredz config, CARRIED but not emit-wired on this shape
    *  in this release (the emitter prints the ignored-note comment). */
   readonly thredz?: IrThredz;
+  /** v0.3.0 Goal 2 — continual-learning config (§3.3, PR 17). Present
+   *  when the spec declares an enabled `learning:` block. */
+  readonly learning?: IrLearning;
   /** §47 cross-cutting blockchain subsystem (slice 0). All optional. */
   readonly chains?: readonly IrChainBinding[];
   readonly wallets?: readonly IrWalletBinding[];

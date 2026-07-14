@@ -9,6 +9,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Learning — continual learning as a first-class capability (0.3.0
+  Goal 2, §3.3, PR 17).** A new top-level `learning:` block on the five
+  memory shapes (cli, channel, managed, research, crew): `domain`
+  (required), `curriculum` (agent-editable ladder file), `sources`
+  (allowlist hints — deliberately NOT optimizable, §7.5), `exam:
+  {dataset, graders}` (spec-relative paths; existence is a runtime
+  concern), and `study: {on_heartbeat, on_dream}` (unattended-study
+  toggles, both defaulting ON — the block is the opt-in, the toggles are
+  the opt-outs). Learning **requires a wiki**: `memory.wiki` (local) or
+  `thredz:` (hosted) must be present — cross-field CompilerError otherwise,
+  mirrored in ir-passes' `memoryIntegrityPass` — and the lowering stamps
+  `memory.wiki.requireSources: true` so `wiki_write` deterministically
+  rejects uncited bodies (an explicit `requireSources: false` alongside
+  learning is rejected as a contradiction). **Skill substitution:**
+  `wireMemory` renders the builtin `learning-loop` skill with
+  `{{domain}}`/`{{curriculum}}`/`{{sources}}` resolved (documented
+  fallbacks when curriculum/sources are omitted — never a literal token in
+  a prompt) and gates in the `/study` `/reflect` commands; a user/project
+  `learning-loop` skill still overrides by name. **First-class EXAM:** the
+  demo-era shell-out-to-`crewhaus eval` hack is replaced by an injected
+  `ExamRunner` seam (`wireMemory({ examRunner })`) driving a new `run_exam`
+  tool — a programmatic eval invocation (eval-runner's new
+  `createExamRunner`: `loadDataset` + `parseGradersConfig` + per-question
+  fresh single-turn sessions grounded in the REAL wiki through the
+  backend-invariant `wireWiki(...).recall` seam and runtime-core's
+  classified memory-injection path; per-sample artifacts under
+  `.crewhaus/evals/exam-<stamp>/`). No Bash permission is ever needed to
+  sit the exam; `/exam` gates in only when the exam is actually runnable
+  (config + runner). **Failed exam samples auto-log knowledge gaps** —
+  Thredz tasks (`log_knowledge_gap`, PII-redacted) on a live hosted
+  backend, plan-store `[gap]` goals locally — closing the gap→study
+  flywheel edge. Wired on the `crewhaus run` interpreter AND compiled cli
+  bundles (the emitted bundle constructs the same runner). **Unattended
+  study:** with `study.on_heartbeat`, target-channel-bot bakes the
+  study-rotation preamble (gaps first, ~3:1 study:reflect, bounded per
+  tick — the expert demo's HEARTBEAT.md policy, productized) ahead of the
+  operator's heartbeat instructions at codegen time; with `study.on_dream`,
+  the dream model phase's seeded prompt gains the top open `[gap]` goals +
+  the next unmastered curriculum rung, composed onto dream-engine's
+  existing `DreamModelPhase` seam. Absent `learning:` block, every emitted
+  bundle stays byte-identical (golden-pinned against the PR 16 emission).
+
 - **Thredz — one knob (0.3.0 Goal 3, §4, PR 16).** A new top-level `thredz:`
   block on the five memory shapes (cli, channel, managed, research, crew):
   `thredz: true` (≡ `{api_key: "$THREDZ_API_KEY"}`), the string shorthand

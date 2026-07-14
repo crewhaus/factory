@@ -757,6 +757,65 @@ const thredzObject = z
 const thredzBlock = z.union([z.boolean(), z.string().min(1), thredzObject]).optional();
 
 /**
+ * v0.3.0 Goal 2 (§3.3, PR 17) — the top-level `learning:` block: continual
+ * learning as a first-class capability. Presence (with `enabled` not `false`)
+ * registers the builtin `learning-loop` skill with `domain`/`curriculum`/
+ * `sources` substituted at compile time, gates in the `/study` `/reflect`
+ * (and, with `exam`, `/exam`) slash commands, and enforces Sources-required
+ * wiki writes deterministically.
+ *
+ * Learning NEEDS a wiki — the knowledge lives there, not in the prompt — so
+ * the compiler REQUIRES `memory.wiki` (local files) or `thredz:` (hosted)
+ * alongside this block (cross-field CompilerError otherwise).
+ *
+ *   - `domain` (required): one sentence naming the field of expertise —
+ *     substituted into the learning-loop skill body.
+ *   - `curriculum`: spec-relative path to an agent-editable checkbox-ladder
+ *     file (e.g. `curriculum.md`). Optional; without it the skill keeps the
+ *     ladder in the wiki. Whether the file EXISTS is a runtime concern.
+ *   - `sources`: source-allowlist hints (domains/patterns) woven into the
+ *     skill's STUDY gathering rules. Deliberately NOT optimizable — an
+ *     allowlist is a security surface (§7.5).
+ *   - `exam`: spec-relative `dataset` (jsonl) + `graders` (yaml) paths for
+ *     the first-class competency exam: `/exam` drives a programmatic
+ *     eval-runner invocation (the `run_exam` tool — no Bash shell-out), and
+ *     every failed sample is logged as a knowledge gap automatically.
+ *   - `study`: unattended-study toggles, both default ON —
+ *       · `on_heartbeat`: prepend the study-rotation preamble (gaps first,
+ *         ~3:1 study:reflect, bounded per tick) to channel heartbeat
+ *         instructions;
+ *       · `on_dream`: seed the dream model phase's findings with the top
+ *         open knowledge gaps + the next unmastered curriculum rung.
+ *
+ * Carried on the five memory shapes (cli, channel, managed, research, crew);
+ * the strict unions reject it loudly elsewhere. `.strict()` throughout so a
+ * typo'd sub-key fails the build.
+ */
+const learningBlock = z
+  .object({
+    enabled: z.boolean().optional(),
+    domain: z.string().min(1),
+    curriculum: z.string().min(1).optional(),
+    sources: z.array(z.string().min(1)).optional(),
+    exam: z
+      .object({
+        dataset: z.string().min(1),
+        graders: z.string().min(1),
+      })
+      .strict()
+      .optional(),
+    study: z
+      .object({
+        on_heartbeat: z.boolean().optional(),
+        on_dream: z.boolean().optional(),
+      })
+      .strict()
+      .optional(),
+  })
+  .strict()
+  .optional();
+
+/**
  * Ops item 37 — cross-cutting `observability` block. Today it carries one
  * sub-block, `slo`, that declares production Service-Level Objectives + the
  * mitigation ladder the runtime SLO monitor walks on a SUSTAINED breach.
@@ -1004,6 +1063,7 @@ const cliSchema = z
     memory: memoryBlock,
     continuity: continuityBlock,
     thredz: thredzBlock,
+    learning: learningBlock,
     observability: observabilityBlock,
     cli: cliOptionsBlock,
     chains: chainsBlock,
@@ -1158,6 +1218,7 @@ const channelSchema = z
     memory: memoryBlock,
     continuity: continuityBlock,
     thredz: thredzBlock,
+    learning: learningBlock,
     observability: observabilityBlock,
     heartbeat: heartbeatBlock,
     gateway: channelGatewayBlock,
@@ -1262,6 +1323,7 @@ const managedSchema = z
     memory: memoryBlock,
     continuity: continuityBlock,
     thredz: thredzBlock,
+    learning: learningBlock,
     observability: observabilityBlock,
   })
   .strict();
@@ -1394,6 +1456,7 @@ const crewSchema = z
     memory: memoryBlock,
     continuity: continuityBlock,
     thredz: thredzBlock,
+    learning: learningBlock,
     chains: chainsBlock,
     wallets: walletsBlock,
     contracts: contractsBlock,
@@ -1436,6 +1499,7 @@ const researchSchema = z
     memory: memoryBlock,
     continuity: continuityBlock,
     thredz: thredzBlock,
+    learning: learningBlock,
     chains: chainsBlock,
     wallets: walletsBlock,
     contracts: contractsBlock,
@@ -1783,6 +1847,8 @@ export type SpecContinuityBlock = z.infer<typeof continuityBlock>;
 export type SpecThredzObject = z.infer<typeof thredzObject>;
 /** The full `thredz:` surface: boolean/string shorthand or the object form. */
 export type SpecThredzBlock = z.infer<typeof thredzBlock>;
+/** The `learning:` block (v0.3.0 §3.3, PR 17). */
+export type SpecLearningBlock = z.infer<typeof learningBlock>;
 export type SpecFailureTaxonomyEntry = z.infer<typeof failureTaxonomyEntrySchema>;
 export type SpecFailureTaxonomy = z.infer<typeof failureTaxonomyBlock>;
 

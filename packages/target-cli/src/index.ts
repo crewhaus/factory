@@ -436,13 +436,15 @@ function renderAgent(ir: IrV0): string {
   const permField = renderPermissionsField(ir);
 
   // v0.3.0 Goal 1 — when the IR carries continuity (DEFAULT-ON unless the
-  // spec opted out with `continuity: false`), the composition root owns the
-  // skill/command surface: `wireMemory` merges the builtin continuity skill
-  // and slash commands at lowest precedence with the user's `~/.crewhaus` +
-  // project `.crewhaus` entries, and the bundle registers the Skill tool
-  // from THAT list — the bundle's own discovery would strand the builtin
-  // skill (advertised in the prompt with no tool able to load it).
-  const continuityOn = ir.continuity !== undefined;
+  // spec opted out with `continuity: false`) or learning (PR 17 — its
+  // rendered learning-loop skill and /study /reflect /exam commands come
+  // from the same root), the composition root owns the skill/command
+  // surface: `wireMemory` merges the builtin skills and slash commands at
+  // lowest precedence with the user's `~/.crewhaus` + project `.crewhaus`
+  // entries, and the bundle registers the Skill tool from THAT list — the
+  // bundle's own discovery would strand the builtin skills (advertised in
+  // the prompt with no tool able to load them).
+  const continuityOn = ir.continuity !== undefined || ir.learning !== undefined;
 
   // Section 11 — extension surface. The generated bundle discovers hooks /
   // skills / slash commands at runtime from the user's `.crewhaus/`
@@ -721,8 +723,16 @@ function renderMemory(ir: IrV0): { imports: string[]; bootBlock: string; field: 
   // the full consolidation. Only emitted when the spec configured
   // memory.dream, so dream-less bundles keep their pinned bytes.
   const dreamOn = memoryOn && mem?.dream !== undefined;
+  // v0.3.0 Goal 2 (§3.3, PR 17) — the first-class exam: with `learning.exam`
+  // configured, the bundle constructs the programmatic exam runner
+  // (eval-runner's `createExamRunner`) and hands it to wireMemory, which
+  // registers the `run_exam` tool + gates in `/exam`. No Bash shell-out —
+  // the compiled bundle sits its exam in-process, same as the interpreter.
+  const learningOn = ir.learning !== undefined;
+  const examOn = learningOn && ir.learning?.exam !== undefined;
   const imports = [
     `import { wireMemory${dreamOn ? ", runDreamBootCatchUp" : ""} } from "@crewhaus/memory-service";`,
+    ...(examOn ? [`import { createExamRunner } from "@crewhaus/eval-runner";`] : []),
   ];
   const fragment = JSON.stringify(
     memoryFragmentFromIr({
@@ -730,24 +740,34 @@ function renderMemory(ir: IrV0): { imports: string[]; bootBlock: string; field: 
       ...(memoryOn ? { memory: ir.memory } : {}),
       ...(continuityOn ? { continuity: ir.continuity } : {}),
       ...(thredzOn ? { thredz: ir.thredz } : {}),
+      ...(learningOn ? { learning: ir.learning } : {}),
     }),
   );
   // v0.3.0 Goal 3 — hand wireMemory the live thredz connection from the MCP
   // boot block (which runs first when thredz is on); null means boot failed
   // and wireMemory degrades to local files with a warning (§4.4).
   const thredzDep = thredzOn ? ", thredz: __thredz" : "";
+  // The exam runner reuses the bundle's own identity (model + instructions —
+  // the examinee is THIS harness) and the same fragment/thredz wiring the
+  // memory fabric boots with. The instructions literal appears once more in
+  // the runChatLoop call below; duplicating the string keeps the no-learning
+  // emission byte-identical (a shared const would reshape every bundle).
+  const examDep = (cwdExpr: string): string =>
+    examOn
+      ? `, examRunner: createExamRunner({ specName: ${escapeJsonString(ir.name)}, model: ${escapeJsonString(ir.agent.model)}, instructions: ${escapeJsonString(ir.agent.instructions)}, fragment: ${fragment}, cwd: ${cwdExpr}${thredzOn ? ", thredz: __thredz" : ""} })`
+      : "";
   const dreamBoot = (cwdExpr: string): string =>
     dreamOn
       ? `\nconst __dreamNote = await runDreamBootCatchUp(${fragment}, { cwd: ${cwdExpr} });
 if (__dreamNote !== null) process.stdout.write(\`\${__dreamNote}\\n\`);`
       : "";
-  if (!continuityOn) {
+  if (!continuityOn && !learningOn) {
     // PR 10-pinned bytes: the `continuity: false` opt-out path.
-    const bootBlock = `const __memWired = await wireMemory(${fragment}, { catalog: defaultCatalog, cwd: process.cwd()${thredzDep} });${dreamBoot("process.cwd()")}`;
+    const bootBlock = `const __memWired = await wireMemory(${fragment}, { catalog: defaultCatalog, cwd: process.cwd()${thredzDep}${examDep("process.cwd()")} });${dreamBoot("process.cwd()")}`;
     const field = "\n  ...__memWired.options,";
     return { imports, bootBlock, field };
   }
-  const bootBlock = `const __memWired = await wireMemory(${fragment}, { catalog: defaultCatalog, cwd: __cwd${thredzDep} });
+  const bootBlock = `const __memWired = await wireMemory(${fragment}, { catalog: defaultCatalog, cwd: __cwd${thredzDep}${examDep("__cwd")} });
 const __skills = __memWired.options.skills ?? [];
 const __slashCommands = __memWired.options.slashCommands ?? new Map();
 if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));${dreamBoot("__cwd")}`;

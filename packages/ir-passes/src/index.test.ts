@@ -563,6 +563,57 @@ describe("ir-passes — memoryIntegrityPass (v0.3.0 PR 11)", () => {
     expect(() => memoryIntegrityPass(withDate)).toThrow(IrPassError);
   });
 
+  // v0.3.0 PR 17 — the learning mirror of the compiler's cross-field check.
+  const LEARNING = { domain: "coffee", study: { onHeartbeat: true, onDream: true } };
+
+  test("learning with an enabled wiki passes through unchanged", () => {
+    const ir = makeCli({ memory: { wiki: { enabled: true } }, learning: LEARNING });
+    expect(memoryIntegrityPass(ir)).toBe(ir);
+  });
+
+  test("learning with a thredz block (no local wiki) passes through unchanged", () => {
+    const ir = makeCli({
+      learning: LEARNING,
+      thredz: {
+        apiKey: { kind: "env", name: "THREDZ_API_KEY" },
+        visibility: "private",
+        goals: true,
+      },
+    } as never);
+    expect(memoryIntegrityPass(ir)).toBe(ir);
+  });
+
+  test("learning without a wiki (no memory.wiki, no thredz) throws", () => {
+    expect(() => memoryIntegrityPass(makeCli({ learning: LEARNING }))).toThrow(
+      /learning needs a wiki/,
+    );
+    expect(() =>
+      memoryIntegrityPass(makeCli({ memory: { autoRecall: true }, learning: LEARNING })),
+    ).toThrow(IrPassError);
+    expect(() =>
+      memoryIntegrityPass(makeCli({ memory: { wiki: { enabled: false } }, learning: LEARNING })),
+    ).toThrow(IrPassError);
+  });
+
+  test("an empty learning.domain throws (direct-IR builders skip the zod bound)", () => {
+    expect(() =>
+      memoryIntegrityPass(
+        makeCli({ memory: { wiki: { enabled: true } }, learning: { ...LEARNING, domain: "" } }),
+      ),
+    ).toThrow(/learning.domain/);
+  });
+
+  test("a non-JSON-serializable learning block throws", () => {
+    expect(() =>
+      memoryIntegrityPass(
+        makeCli({
+          memory: { wiki: { enabled: true } },
+          learning: { ...LEARNING, curriculum: new Date() as unknown as string },
+        }),
+      ),
+    ).toThrow(IrPassError);
+  });
+
   test("shapes without the fabric fields pass through untouched", () => {
     const graph = {
       version: 0,

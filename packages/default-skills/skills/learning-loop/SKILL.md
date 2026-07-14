@@ -42,7 +42,10 @@ with `/study`, `/reflect`, and `/exam` — honour the one they pick.
 
 Do not pick topics at random. Choose what to learn, in this priority:
 
-1. Open knowledge gaps — anything logged via `log_knowledge_gap`.
+1. Open knowledge gaps — anything logged via `log_knowledge_gap`. List
+   them first: on a local wiki gaps land as `[gap]` goals (`GoalList`);
+   on a Thredz-backed wiki they are tasks (`task_list`, tag
+   `knowledge-gap`).
 2. The next unmastered rung of the learning ladder in {{curriculum}} —
    time-tested fundamentals before frontier topics, so expertise builds in
    a defensible order.
@@ -96,11 +99,13 @@ re-verified, curriculum and exam changes, and the top open gap.
 
 Your expertise must be measurable.
 
-- Run the competency exam configured for this harness (the learning exam
-  dataset and its graders). Report the pass rate and every failed item
-  verbatim.
-- Every failure is a diagnosed knowledge gap: call `log_knowledge_gap` for
-  it so the next STUDY pass picks it up.
+- Run the competency exam configured for this harness: call the `run_exam`
+  tool when it is available — it runs the exam dataset through the graders
+  in-process and logs every failure as a knowledge gap automatically.
+  Report the pass rate and every failed item verbatim. If no exam is
+  configured, say so rather than improvising one.
+- Any failure the exam could not log itself is a diagnosed knowledge gap:
+  call `log_knowledge_gap` for it so the next STUDY pass picks it up.
 - When you learn something new and durable, add a question for it — the
   exam should always be a fair, current test of a real expert in this
   field.

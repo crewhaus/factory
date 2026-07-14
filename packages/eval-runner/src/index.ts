@@ -48,6 +48,15 @@ import { type SharedAgentDeps, wireRunOnce } from "./wire-once";
 export type { AgentInvoker, EvalRunSummary, GraderEntry, RunEvalOptions, SampleResult };
 export type { SharedAgentDeps };
 export { wireRunOnce };
+// v0.3.0 Goal 2 (§3.3, PR 17) — the first-class competency exam: the
+// reference implementation of memory-service's injected `ExamRunner` seam.
+export {
+  EXAM_SESSION_PREAMBLE,
+  createExamRunner,
+  type CreateExamRunnerOptions,
+  type ExamChatLoopFn,
+  type ExamChatLoopOptions,
+} from "./exam";
 export { Semaphore };
 export { aggregate };
 export { RunnerError };

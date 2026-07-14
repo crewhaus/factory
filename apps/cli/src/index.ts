@@ -56,7 +56,11 @@ import {
   renderReport,
   setBaseline,
 } from "@crewhaus/eval-report";
-import { type EvalRunSummary, runEval as runEvalLib } from "@crewhaus/eval-runner";
+import {
+  type EvalRunSummary,
+  createExamRunner,
+  runEval as runEvalLib,
+} from "@crewhaus/eval-runner";
 import { openEventLog } from "@crewhaus/event-log";
 import { loadHooks, runHooks } from "@crewhaus/hooks-engine";
 import {
@@ -4104,6 +4108,21 @@ async function runRunCli(
       // v0.3.0 Goal 3 — the live connection (or null after a boot failure,
       // which wireMemory degrades from). Absent when thredz is off.
       ...(ir.thredz !== undefined ? { thredz: thredzConn } : {}),
+      // v0.3.0 Goal 2 (§3.3, PR 17) — the first-class exam: `/exam` drives
+      // the run_exam tool, which invokes the eval library programmatically
+      // (no agent-shells-to-`crewhaus` hack, no Bash permission needed).
+      ...(ir.learning?.exam !== undefined
+        ? {
+            examRunner: createExamRunner({
+              specName: ir.name,
+              model,
+              instructions: ir.agent.instructions,
+              fragment: memoryFragmentFromIr(ir),
+              cwd: process.cwd(),
+              ...(ir.thredz !== undefined ? { thredz: thredzConn } : {}),
+            }),
+          }
+        : {}),
     });
     memoryRunOpt = wiredMemory.options.memory;
     continuityRunOpt = wiredMemory.options.continuity;
