@@ -34,7 +34,7 @@ import {
 } from "@crewhaus/permission-engine";
 import type { NamedFailureClass } from "@crewhaus/recovery-engine";
 import { type RunContext, createRunContext, tagContent } from "@crewhaus/run-context";
-import { runChatLoop } from "@crewhaus/runtime-core";
+import { type RunChatLoopOptions, runChatLoop } from "@crewhaus/runtime-core";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import type {
   A2AMessageEvent,
@@ -97,6 +97,23 @@ export type RunOptions = {
   readonly permissionRules?: RuleSet;
   /** Item 23 — failure taxonomy for every role's runChatLoop. Default none (built-in classify). */
   readonly failureTaxonomy?: ReadonlyArray<NamedFailureClass>;
+  /**
+   * v0.3.0 PR 11 — crew-wide extra tools appended to EVERY role's tool set
+   * (after the role's own tools, before the orchestrator-owned Handoff/
+   * SendMessage pair). The memory fabric threads its Remember/Recall/Plan/
+   * Goal/wiki tools here: roles share the spec-scoped stores — the plan IS
+   * the coordination surface (design §2.7).
+   */
+  readonly extraTools?: ReadonlyArray<RegisteredTool>;
+  /** v0.3.0 PR 11 — the memory seam (auto-recall/auto-capture), threaded
+   *  verbatim into every role's runChatLoop. Constructed by memory-service. */
+  readonly memory?: RunChatLoopOptions["memory"];
+  /** v0.3.0 PR 11 — the continuity seam (plan tail/ledger/handoff), threaded
+   *  verbatim into every role's runChatLoop. Constructed by memory-service. */
+  readonly continuity?: RunChatLoopOptions["continuity"];
+  /** v0.3.0 PR 11 — skills advertised in every role's system prompt (the
+   *  caller registers the matching Skill tool via `extraTools`). */
+  readonly skills?: RunChatLoopOptions["skills"];
   /** Cap on consecutive handoffs before HandoffRefusedError fires. Default 2. */
   readonly refusalDepth?: number;
   /** Cap on the total number of role activations. Default 16 — keeps runaway crews bounded. */
@@ -435,10 +452,15 @@ async function* driveCrew(
             role: toRole,
             roles: args.roleNames,
             roleTools: peerDef.tools ?? [],
+            ...(args.opts.extraTools !== undefined ? { extraTools: args.opts.extraTools } : {}),
           }),
           permissionMode,
           permissionRules,
           ...(failureTaxonomy !== undefined ? { failureTaxonomy } : {}),
+          // v0.3.0 — the memory fabric's seams/skills, crew-wide (§2.7).
+          ...(args.opts.memory !== undefined ? { memory: args.opts.memory } : {}),
+          ...(args.opts.continuity !== undefined ? { continuity: args.opts.continuity } : {}),
+          ...(args.opts.skills !== undefined ? { skills: args.opts.skills } : {}),
           installSigintHandler: false,
           maxTokens: peerDef.maxTokens ?? DEFAULT_MAX_TOKENS,
           crewMailbox: mailbox,
@@ -507,10 +529,15 @@ async function* driveCrew(
             role: currentRoleName,
             roles: args.roleNames,
             roleTools: def.tools ?? [],
+            ...(args.opts.extraTools !== undefined ? { extraTools: args.opts.extraTools } : {}),
           }),
           permissionMode,
           permissionRules,
           ...(failureTaxonomy !== undefined ? { failureTaxonomy } : {}),
+          // v0.3.0 — the memory fabric's seams/skills, crew-wide (§2.7).
+          ...(args.opts.memory !== undefined ? { memory: args.opts.memory } : {}),
+          ...(args.opts.continuity !== undefined ? { continuity: args.opts.continuity } : {}),
+          ...(args.opts.skills !== undefined ? { skills: args.opts.skills } : {}),
           installSigintHandler: false,
           maxTokens: def.maxTokens ?? DEFAULT_MAX_TOKENS,
           crewMailbox: mailbox,
@@ -731,15 +758,16 @@ function composeRoleTools(args: {
   role: string;
   roles: ReadonlyArray<string>;
   roleTools: ReadonlyArray<RegisteredTool>;
+  extraTools?: ReadonlyArray<RegisteredTool>;
 }): ReadonlyArray<RegisteredTool> {
   const handoff = createHandoffTool({ from: args.role, targets: args.roles });
   const a2a = createSendMessageA2ATool({ from: args.role, targets: args.roles });
   // Spec-supplied tools first so explicit user choices win in any future
-  // catalog dedup; Handoff/SendMessage are appended last and never
-  // collide (no spec-side tool today is named "Handoff" or "SendMessage"
-  // in a CRW bundle — channel-bot's SendMessage lives in a different
-  // target shape).
-  return [...args.roleTools, handoff, a2a];
+  // catalog dedup; crew-wide extras (the memory fabric, v0.3.0) follow;
+  // Handoff/SendMessage are appended last and never collide (no spec-side
+  // tool today is named "Handoff" or "SendMessage" in a CRW bundle —
+  // channel-bot's SendMessage lives in a different target shape).
+  return [...args.roleTools, ...(args.extraTools ?? []), handoff, a2a];
 }
 
 export { createHandoffTool, createSendMessageA2ATool };

@@ -5,5 +5,10 @@
     "outDir": "dist"
   },
   "include": ["src/**/*"],
-  "references": [{ "path": "../errors" }, { "path": "../infra-utils" }, { "path": "../ir" }]
+  "references": [
+    { "path": "../errors" },
+    { "path": "../infra-utils" },
+    { "path": "../ir" },
+    { "path": "../memory-service" }
+  ]
 }

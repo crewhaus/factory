@@ -2,7 +2,7 @@
   "name": "@crewhaus/target-crew",
   "version": "0.2.4",
   "type": "module",
-  "description": "Codegen for the CRW target — emits a daemon + per-role agent files driven by crew-orchestrator (Section 22)",
+  "description": "Codegen for the CRW target \u2014 emits a daemon + per-role agent files driven by crew-orchestrator (Section 22)",
   "main": "src/index.ts",
   "types": "src/index.ts",
   "exports": {
@@ -14,7 +14,8 @@
   "dependencies": {
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/infra-utils": "workspace:*",
-    "@crewhaus/ir": "workspace:*"
+    "@crewhaus/ir": "workspace:*",
+    "@crewhaus/memory-service": "workspace:*"
   },
   "license": "Apache-2.0",
   "author": {

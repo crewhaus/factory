@@ -6,9 +6,20 @@
   },
   "include": ["src/**/*"],
   "references": [
-    { "path": "../errors" },
-    { "path": "../infra-utils" },
-    { "path": "../ir" },
-    { "path": "../model-router" }
+    {
+      "path": "../errors"
+    },
+    {
+      "path": "../infra-utils"
+    },
+    {
+      "path": "../ir"
+    },
+    {
+      "path": "../memory-service"
+    },
+    {
+      "path": "../model-router"
+    }
   ]
 }

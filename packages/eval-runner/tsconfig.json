@@ -6,34 +6,95 @@
   },
   "include": ["src/**/*"],
   "references": [
-    { "path": "../agent-context-isolation" },
-    { "path": "../compiler" },
-    { "path": "../errors" },
-    { "path": "../eval-dataset" },
-    { "path": "../eval-grader" },
-    { "path": "../eval-judge" },
-    { "path": "../event-log" },
-    { "path": "../hooks-engine" },
-    { "path": "../ir" },
-    { "path": "../logging" },
-    { "path": "../mcp-host" },
-    { "path": "../permission-engine" },
-    { "path": "../run-context" },
-    { "path": "../runtime-core" },
-    { "path": "../skills-registry" },
-    { "path": "../slash-commands" },
-    { "path": "../spec" },
-    { "path": "../sub-agent-spawner" },
-    { "path": "../tenancy" },
-    { "path": "../tool-bash" },
-    { "path": "../tool-catalog" },
-    { "path": "../tool-fetch" },
-    { "path": "../tool-fs" },
-    { "path": "../tool-image" },
-    { "path": "../tool-mcp" },
-    { "path": "../tool-task" },
-    { "path": "../tool-todo" },
-    { "path": "../tool-web" },
-    { "path": "../trace-event-bus" }
+    {
+      "path": "../agent-context-isolation"
+    },
+    {
+      "path": "../compiler"
+    },
+    {
+      "path": "../errors"
+    },
+    {
+      "path": "../eval-dataset"
+    },
+    {
+      "path": "../eval-grader"
+    },
+    {
+      "path": "../eval-judge"
+    },
+    {
+      "path": "../event-log"
+    },
+    {
+      "path": "../hooks-engine"
+    },
+    {
+      "path": "../ir"
+    },
+    {
+      "path": "../logging"
+    },
+    {
+      "path": "../mcp-host"
+    },
+    {
+      "path": "../memory-service"
+    },
+    {
+      "path": "../permission-engine"
+    },
+    {
+      "path": "../run-context"
+    },
+    {
+      "path": "../runtime-core"
+    },
+    {
+      "path": "../skills-registry"
+    },
+    {
+      "path": "../slash-commands"
+    },
+    {
+      "path": "../spec"
+    },
+    {
+      "path": "../sub-agent-spawner"
+    },
+    {
+      "path": "../tenancy"
+    },
+    {
+      "path": "../tool-bash"
+    },
+    {
+      "path": "../tool-catalog"
+    },
+    {
+      "path": "../tool-fetch"
+    },
+    {
+      "path": "../tool-fs"
+    },
+    {
+      "path": "../tool-image"
+    },
+    {
+      "path": "../tool-mcp"
+    },
+    {
+      "path": "../tool-task"
+    },
+    {
+      "path": "../tool-todo"
+    },
+    {
+      "path": "../tool-web"
+    },
+    {
+      "path": "../trace-event-bus"
+    }
   ]
 }

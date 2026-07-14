@@ -15,6 +15,7 @@ import type {
   IrChannels,
   IrCircuitBreaker,
   IrCompaction,
+  IrContinuity,
   IrContractBinding,
   IrCrewRole,
   IrCrewV0,
@@ -200,19 +201,21 @@ export function assertToolScopesStrict(ir: IrNode): void {
 
 type SpecWithPermissions = Exclude<Spec, { target: "eval" }>;
 /**
- * Phase 3 §3.1 — parse a heartbeat duration string ("2h", "30m",
- * "60s", "500ms") to milliseconds. Caller is expected to have already
+ * Phase 3 §3.1 — parse a duration string ("2h", "30m", "60s", "500ms";
+ * v0.3.0 adds "90d") to milliseconds. Caller is expected to have already
  * regex-validated the format at the spec layer; this is the
- * deterministic numeric step.
+ * deterministic numeric step. Shared by `heartbeat.every` and the v0.3.0
+ * `memory.ttl` lowering.
  */
-const DURATION_UNIT_MS: Record<"ms" | "s" | "m" | "h", number> = {
+const DURATION_UNIT_MS: Record<"ms" | "s" | "m" | "h" | "d", number> = {
   ms: 1,
   s: 1000,
   m: 60 * 1000,
   h: 60 * 60 * 1000,
+  d: 24 * 60 * 60 * 1000,
 };
 function parseDurationToMs(duration: string): number {
-  const m = duration.match(/^(\d+)(ms|s|m|h)$/);
+  const m = duration.match(/^(\d+)(ms|s|m|h|d)$/);
   if (!m) {
     throw new Error(`invalid duration "${duration}" (caught past spec validation)`);
   }
@@ -833,29 +836,142 @@ function lowerFeedback(spec: SpecWithFeedback): { feedback?: IrFeedback } {
 type SpecWithMemory = {
   readonly memory?: {
     readonly enabled?: boolean;
+    readonly backend?: "file" | "thredz";
+    readonly ttl?: string;
     readonly autoCapture?: boolean;
     readonly autoCaptureThreshold?: number;
     readonly autoRecall?: boolean;
     readonly recallK?: number;
+    readonly wiki?: {
+      readonly enabled?: boolean;
+      readonly recallK?: number;
+      readonly embedder?: string;
+      readonly autoRecall?: boolean;
+      readonly requireSources?: boolean;
+    };
   };
 };
+
+/** v0.3.0 — floor for `memory.ttl`. A sub-hour fact TTL is almost certainly
+ *  a unit mistake (facts would expire mid-session); reject it loudly at
+ *  compile time. LOAD-BEARING here, mirrored (validation-only) by
+ *  ir-passes' `memoryIntegrityPass` for direct-IR builders — the passes are
+ *  opt-in and skipped on the plain compile path. */
+const MEMORY_TTL_MIN_MS = 60 * 60 * 1000;
 
 // Lower the cross-cutting `memory` block (#53), mirroring lowerFeedback's
 // spread-return-{} discipline (Pillar 1): the key is absent from the IR when
 // the spec omits the block, so codegen/runtime check presence to decide
 // whether to wire Remember/Recall + the auto-capture/recall paths.
+//
+// v0.3.0 (§9) — `backend`/`ttl`/`wiki` join the block. `ttl` is parsed to
+// `ttlMs` here (the heartbeat duration grammar extended with `d`) so the
+// runtime/fragment read a literal number; every field keeps the
+// declared-fields-only discipline so pre-0.3.0 memory bundles stay
+// byte-identical.
 function lowerMemory(spec: SpecWithMemory): { memory?: IrMemory } {
   const m = spec.memory;
   if (m === undefined) return {};
+  let ttlMs: number | undefined;
+  if (m.ttl !== undefined) {
+    ttlMs = parseDurationToMs(m.ttl);
+    if (ttlMs < MEMORY_TTL_MIN_MS) {
+      throw new CompilerError(
+        `memory.ttl "${m.ttl}" is below the 1h floor — a sub-hour fact TTL expires memories mid-session. Use "1h" or longer (e.g. "90d"), or omit ttl to keep facts forever.`,
+      );
+    }
+  }
+  const w = m.wiki;
   return {
     memory: {
       ...(m.enabled !== undefined ? { enabled: m.enabled } : {}),
+      ...(m.backend !== undefined ? { backend: m.backend } : {}),
+      ...(ttlMs !== undefined ? { ttlMs } : {}),
       ...(m.autoCapture !== undefined ? { autoCapture: m.autoCapture } : {}),
       ...(m.autoCaptureThreshold !== undefined
         ? { autoCaptureThreshold: m.autoCaptureThreshold }
         : {}),
       ...(m.autoRecall !== undefined ? { autoRecall: m.autoRecall } : {}),
       ...(m.recallK !== undefined ? { recallK: m.recallK } : {}),
+      ...(w !== undefined
+        ? {
+            wiki: {
+              ...(w.enabled !== undefined ? { enabled: w.enabled } : {}),
+              ...(w.recallK !== undefined ? { recallK: w.recallK } : {}),
+              ...(w.embedder !== undefined ? { embedder: w.embedder } : {}),
+              ...(w.autoRecall !== undefined ? { autoRecall: w.autoRecall } : {}),
+              ...(w.requireSources !== undefined ? { requireSources: w.requireSources } : {}),
+            },
+          }
+        : {}),
+    },
+  };
+}
+
+type SpecContinuity =
+  | boolean
+  | {
+      readonly enabled?: boolean;
+      readonly plan?: boolean;
+      readonly proof?: "ladder" | "require" | "off";
+      readonly ledger?: boolean;
+      readonly handoff?: boolean;
+      readonly scope?: "auto" | "spec" | "session";
+      readonly focusMaxChars?: number;
+    };
+
+type SpecWithContinuity = {
+  readonly continuity?: SpecContinuity;
+};
+
+/**
+ * v0.3.0 Goal 1 (§2.1) — lower the top-level `continuity:` block.
+ *
+ * This is THE release's one sanctioned exception to the absent-equals-
+ * byte-identical rule (design §1 principle 3): on the five emit-wired
+ * agent-loop shapes (`defaultOn: true` — cli, channel, managed, research,
+ * crew) an ABSENT key lowers to the default-on IrContinuity; only
+ * `continuity: false` (or `{enabled: false}`) lowers to nothing, restoring
+ * prior bundle bytes exactly (byte-diff-pinned). On the carried shapes
+ * (`defaultOn: false` — workflow, batch, voice, browser) the block lowers
+ * only when declared, and their emitters print the ignored-note comment.
+ *
+ * `scope: "auto"` (or absent) resolves HERE, per shape (§2.7/§14.5):
+ * cli/research/crew → `spec`; channel → `session` (per-conversation stores
+ * riding the session router's sessionId through wireMemory's `sessionScope`
+ * dep); managed → `spec` + tenant fencing (deps carry the tenant at boot).
+ * Explicit `scope: "session"` is only valid where a session router exists
+ * (channel) — LOAD-BEARING validation lives here (the ir-passes mirror is
+ * opt-in and skipped on the plain compile path). Every other field is
+ * resolved to its default so the IR carries one deterministic shape.
+ */
+function lowerContinuity(
+  spec: SpecWithContinuity,
+  shape: { readonly defaultOn: boolean; readonly autoScope: IrContinuity["scope"] },
+): { continuity?: IrContinuity } {
+  const c = spec.continuity;
+  // The opt-out: `continuity: false` / `{enabled: false}` → no IR key.
+  if (c === false) return {};
+  if (typeof c === "object" && c.enabled === false) return {};
+  // Absent on a carried (non-default-on) shape → no IR key.
+  if (c === undefined && !shape.defaultOn) return {};
+
+  const obj = typeof c === "object" ? c : {};
+  const declaredScope = obj.scope ?? "auto";
+  if (declaredScope === "session" && shape.autoScope !== "session") {
+    throw new CompilerError(
+      `continuity.scope "session" needs a shape with per-conversation session routing (channel) — this shape has no session router, so a session-scoped store would never resolve a session id. Use scope "spec" or "auto".`,
+    );
+  }
+  const scope: IrContinuity["scope"] = declaredScope === "auto" ? shape.autoScope : declaredScope;
+  return {
+    continuity: {
+      plan: obj.plan ?? true,
+      proof: obj.proof ?? "ladder",
+      ledger: obj.ledger ?? true,
+      handoff: obj.handoff ?? true,
+      scope,
+      ...(obj.focusMaxChars !== undefined ? { focusMaxChars: obj.focusMaxChars } : {}),
     },
   };
 }
@@ -1055,6 +1171,10 @@ export function lower(spec: Spec): IrNode {
         ...lowerSecurity(spec),
         ...lowerFeedback(spec),
         ...lowerMemory(spec),
+        // v0.3.0 Goal 1 — DEFAULT-ON continuity (the release's one
+        // sanctioned behavior change): absent lowers to the default-on
+        // config; `continuity: false` restores prior bytes exactly.
+        ...lowerContinuity(spec, { defaultOn: true, autoScope: "spec" }),
         ...lowerObservability(spec),
         // Phase 3 §3.3 — CLI banner config. Plus Phase 2 M2.2 TUI mode
         // gate. Only included when the spec author opted in (cli block
@@ -1092,6 +1212,9 @@ export function lower(spec: Spec): IrNode {
         permissions: lowerPermissions(spec),
         compaction: lowerCompaction(spec),
         ...lowerFailureTaxonomy(spec),
+        // v0.3.0 — carried only when declared (NOT default-on); the emitter
+        // prints the ignored-note comment.
+        ...lowerContinuity(spec, { defaultOn: false, autoScope: "spec" }),
         ...lowerChainSubsystem(spec),
       } satisfies IrWorkflowV0;
     case "channel":
@@ -1116,6 +1239,10 @@ export function lower(spec: Spec): IrNode {
         ...lowerBudget(spec),
         ...lowerFeedback(spec),
         ...lowerMemory(spec),
+        // v0.3.0 Goal 1 — DEFAULT-ON continuity. `auto` scope resolves to
+        // `session` on channel: per-conversation stores ride the session
+        // router's sessionId (§2.7/§14.5); heartbeat ticks read spec scope.
+        ...lowerContinuity(spec, { defaultOn: true, autoScope: "session" }),
         ...lowerObservability(spec),
         // Phase 3 §3.1 — heartbeat. Duration string ("2h", "30m") is
         // parsed once at lower time so codegen emits a literal numeric
@@ -1183,6 +1310,10 @@ export function lower(spec: Spec): IrNode {
         ...lowerFailureTaxonomy(spec),
         ...lowerBudget(spec),
         ...lowerMemory(spec),
+        // v0.3.0 Goal 1 — DEFAULT-ON continuity. `auto` resolves to `spec`
+        // scope; the managed daemon tenant-fences every store at boot (the
+        // wireMemory deps carry the tenant, §2.7).
+        ...lowerContinuity(spec, { defaultOn: true, autoScope: "spec" }),
         ...lowerObservability(spec),
       } satisfies IrManagedV0;
     case "pipeline":
@@ -1246,6 +1377,11 @@ export function lower(spec: Spec): IrNode {
         permissions: lowerPermissions(spec),
         compaction: lowerCompaction(spec),
         ...lowerFailureTaxonomy(spec),
+        // v0.3.0 — crew joins the memory-carrying shapes (§9) and gets
+        // DEFAULT-ON continuity: roles share the `spec`-scoped plan store
+        // (the plan IS the coordination surface, §2.7).
+        ...lowerMemory(spec),
+        ...lowerContinuity(spec, { defaultOn: true, autoScope: "spec" }),
         ...lowerChainSubsystem(spec),
       } satisfies IrCrewV0;
     case "research":
@@ -1276,6 +1412,8 @@ export function lower(spec: Spec): IrNode {
         compaction: lowerCompaction(spec),
         ...lowerFailureTaxonomy(spec),
         ...lowerMemory(spec),
+        // v0.3.0 Goal 1 — DEFAULT-ON continuity, `spec` scope (§2.7).
+        ...lowerContinuity(spec, { defaultOn: true, autoScope: "spec" }),
         ...lowerChainSubsystem(spec),
       } satisfies IrResearchV0;
     case "batch":
@@ -1306,6 +1444,9 @@ export function lower(spec: Spec): IrNode {
         permissions: lowerPermissions(spec),
         compaction: lowerCompaction(spec),
         ...lowerFailureTaxonomy(spec),
+        // v0.3.0 — carried only when declared (NOT default-on); the emitter
+        // prints the ignored-note comment.
+        ...lowerContinuity(spec, { defaultOn: false, autoScope: "spec" }),
         ...lowerChainSubsystem(spec),
       } satisfies IrBatchV0;
     case "voice":
@@ -1330,6 +1471,9 @@ export function lower(spec: Spec): IrNode {
         permissions: lowerPermissions(spec),
         compaction: lowerCompaction(spec),
         ...lowerFailureTaxonomy(spec),
+        // v0.3.0 — carried only when declared (NOT default-on); the emitter
+        // prints the ignored-note comment.
+        ...lowerContinuity(spec, { defaultOn: false, autoScope: "spec" }),
       } satisfies IrVoiceV0;
     case "browser":
       return {
@@ -1354,6 +1498,9 @@ export function lower(spec: Spec): IrNode {
         permissions: lowerPermissions(spec),
         compaction: lowerCompaction(spec),
         ...lowerFailureTaxonomy(spec),
+        // v0.3.0 — carried only when declared (NOT default-on); the emitter
+        // prints the ignored-note comment.
+        ...lowerContinuity(spec, { defaultOn: false, autoScope: "spec" }),
       } satisfies IrBrowserV0;
     case "eval":
       return {

@@ -75,19 +75,36 @@ agent:
   });
 
   test("emits Section 11 extension surface (hooks/skills/slash) on every CLI bundle", () => {
+    // v0.3.0 — continuity is DEFAULT-ON, so the composition root owns skill
+    // + slash-command discovery (builtin `continuity` skill merged at lowest
+    // precedence); the bundle keeps its own hooks discovery and registers
+    // the Skill tool from the wired list.
     const content = compile(MINIMAL_SPEC).files[0]?.content ?? "";
     expect(content).toContain('import { loadHooks } from "@crewhaus/hooks-engine";');
+    expect(content).toContain('import { createSkillTool } from "@crewhaus/skills-registry";');
+    expect(content).toContain("loadHooks({ cwd: __cwd })");
+    expect(content).toContain("const __skills = __memWired.options.skills ?? [];");
+    expect(content).toContain(
+      "const __slashCommands = __memWired.options.slashCommands ?? new Map();",
+    );
+    expect(content).toContain(
+      "if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));",
+    );
+    expect(content).toContain("hooks: __hooks,");
+    expect(content).toContain("skills: __skills,");
+    expect(content).toContain("slashCommands: __slashCommands,");
+  });
+
+  test("continuity: false restores the pre-0.3.0 extension surface (bundle-owned discovery)", () => {
+    const content = compile(`${MINIMAL_SPEC}continuity: false\n`).files[0]?.content ?? "";
     expect(content).toContain(
       'import { discoverSkills, createSkillTool } from "@crewhaus/skills-registry";',
     );
     expect(content).toContain('import { loadCommands } from "@crewhaus/slash-commands";');
     expect(content).toContain("await Promise.all([");
-    expect(content).toContain("loadHooks({ cwd: __cwd })");
     expect(content).toContain("discoverSkills({ cwd: __cwd })");
     expect(content).toContain("loadCommands({ cwd: __cwd })");
-    expect(content).toContain("hooks: __hooks,");
-    expect(content).toContain("skills: __skills,");
-    expect(content).toContain("slashCommands: __slashCommands,");
+    expect(content).not.toContain("wireMemory");
   });
 });
 

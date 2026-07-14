@@ -11,16 +11,15 @@
   "dependencies": {
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/infra-utils": "workspace:*",
-    "@crewhaus/ir": "workspace:*"
+    "@crewhaus/ir": "workspace:*",
+    "@crewhaus/memory-service": "workspace:*"
   },
   "peerDependencies": {
     "@crewhaus/egress-matcher-semantic": "workspace:*",
     "@crewhaus/embedder": "workspace:*",
     "@crewhaus/hooks-engine": "workspace:*",
-    "@crewhaus/memory-store": "workspace:*",
     "@crewhaus/skills-registry": "workspace:*",
-    "@crewhaus/slash-commands": "workspace:*",
-    "@crewhaus/tool-memory": "workspace:*"
+    "@crewhaus/slash-commands": "workspace:*"
   },
   "peerDependenciesMeta": {
     "@crewhaus/egress-matcher-semantic": {

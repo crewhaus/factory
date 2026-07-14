@@ -68,14 +68,10 @@ import {
 import { GENERATED_README_MARKER, type IrBudget } from "@crewhaus/ir";
 import { createLogger } from "@crewhaus/logging";
 import { McpHost, resolveMcpServerConfig } from "@crewhaus/mcp-host";
-import {
-  captureChildFacts,
-  captureFacts,
-  createMemoryStore,
-  deriveMemoryDecision,
-  summarizeDurableFactsWithEvidence,
-  turnsFromEventsWithChildren,
-} from "@crewhaus/memory-store";
+// PR 10 — the memory fabric's composition root: `crewhaus run` makes the
+// same one stable wireMemory call compiled bundles emit.
+import { memoryFragmentFromIr, wireMemory } from "@crewhaus/memory-service";
+import { createMemoryStore } from "@crewhaus/memory-store";
 import {
   BUILTIN_DEFAULT_RULES,
   type JustificationJudge,
@@ -91,15 +87,14 @@ import {
 import { openScoreboard } from "@crewhaus/routing-store";
 import { runChatLoop } from "@crewhaus/runtime-core";
 import { createSessionStore, evictExpiredSessions } from "@crewhaus/session-store";
-import { createSkillTool, discoverSkills } from "@crewhaus/skills-registry";
-import { loadCommands } from "@crewhaus/slash-commands";
+import { type SkillRef, createSkillTool, discoverSkills } from "@crewhaus/skills-registry";
+import { type SlashCommand, loadCommands } from "@crewhaus/slash-commands";
 import { type Spec, parseSpec } from "@crewhaus/spec";
 import { specHasPath } from "@crewhaus/spec-patch";
 import type { RegistryAdapter } from "@crewhaus/spec-registry";
 import { spawnSubAgent } from "@crewhaus/sub-agent-spawner";
 import { type RegisteredTool, ToolCatalog } from "@crewhaus/tool-catalog";
 import { registerMcpServer } from "@crewhaus/tool-mcp";
-import { createMemoryTools } from "@crewhaus/tool-memory";
 import { createTaskTool } from "@crewhaus/tool-task";
 import { type CostAccrualEvent, type ProviderId, TraceEventBus } from "@crewhaus/trace-event-bus";
 // 0.3.0 memory release (design §3.1, PR 9) — the local wiki substrate behind
@@ -4037,11 +4032,47 @@ async function runRunCli(
   // a synthetic `Skill(name)` tool is appended to the tool list so the
   // model can lazily fetch each skill's body.
   const cwd = process.cwd();
-  const [hooks, skills, slashCommands] = await Promise.all([
+  const [hooks, discoveredSkills, discoveredCommands] = await Promise.all([
     loadHooks({ cwd }),
     discoverSkills({ cwd }),
     loadCommands({ cwd }),
   ]);
+
+  // Feature #53 / v0.3.0 PR 11 — memory + continuity, wired through the
+  // composition root. The SAME `wireMemory(fragment, deps)` call a compiled
+  // bundle emits runs here: it constructs the stores, registers the tools
+  // (into this run's local tool list via the registrar shim), and returns
+  // the runChatLoop seams. Continuity is DEFAULT-ON for the cli target —
+  // `ir.continuity` is present unless the spec opted out with
+  // `continuity: false` (the compiler dropped the key at lower time, so
+  // opted-out specs run exactly the pre-0.3.0 path — no flag needed).
+  // When continuity is on, the composition root owns the skill/command
+  // surface (builtin `continuity` skill + commands merged at LOWEST
+  // precedence with ~/.crewhaus + project entries) and the interpreter
+  // adopts it wholesale, exactly like a compiled bundle — registering the
+  // Skill tool from its own discovery would strand the builtin skill.
+  let skills: ReadonlyArray<SkillRef> = discoveredSkills;
+  let slashCommands: ReadonlyMap<string, SlashCommand> = discoveredCommands;
+  let memoryRunOpt: Parameters<typeof runChatLoop>[0]["memory"];
+  let continuityRunOpt: Parameters<typeof runChatLoop>[0]["continuity"];
+  if ((ir.memory !== undefined && ir.memory.enabled !== false) || ir.continuity !== undefined) {
+    const wiredMemory = await wireMemory(memoryFragmentFromIr(ir), {
+      catalog: {
+        register: (tool) => {
+          tools.push(tool);
+        },
+      },
+      cwd: process.cwd(),
+      log: (line) => process.stdout.write(line),
+    });
+    memoryRunOpt = wiredMemory.options.memory;
+    continuityRunOpt = wiredMemory.options.continuity;
+    if (wiredMemory.options.skills !== undefined) skills = wiredMemory.options.skills;
+    if (wiredMemory.options.slashCommands !== undefined) {
+      slashCommands = wiredMemory.options.slashCommands;
+    }
+  }
+
   if (skills.length > 0) {
     tools.push(createSkillTool(skills));
     process.stdout.write(
@@ -4227,77 +4258,6 @@ async function runRunCli(
     });
   }
 
-  // Feature #53 — first-class `memory:` block. Its presence wires Remember/
-  // Recall into the tool list (no hand-editing) and — via the auto-* switches
-  // — the runtime's auto-recall (system-prompt injection) and auto-capture
-  // (summarize durable outcomes into the store at teardown). Mirrors the
-  // codegen registration in @crewhaus/target-cli.
-  let memoryRunOpt: Parameters<typeof runChatLoop>[0]["memory"];
-  if (ir.memory !== undefined && ir.memory.enabled !== false) {
-    const memoryStore = createMemoryStore({ specName: ir.name });
-    const memoryBundle = createMemoryTools({ specName: ir.name, store: memoryStore });
-    tools.push(memoryBundle.remember, memoryBundle.recall);
-    const decision = deriveMemoryDecision(ir.memory, Number.MAX_SAFE_INTEGER);
-    process.stdout.write(
-      `[memory] Remember/Recall wired (autoRecall=${decision.recall}, autoCapture=${ir.memory.autoCapture === true})\n`,
-    );
-    memoryRunOpt = {
-      ...(decision.recall
-        ? {
-            autoRecall: true,
-            recallK: decision.recallK,
-            recall: async (query, k) => {
-              const results = await memoryStore.recall(query, k);
-              return results.map((r) => r.entry.text);
-            },
-          }
-        : {}),
-      ...(ir.memory.autoCapture === true
-        ? {
-            autoCapture: true,
-            onCapture: async (completedTurns, sessionId) => {
-              const { capture } = deriveMemoryDecision(ir.memory, completedTurns);
-              if (!capture) return;
-              const events = parseJsonlObjects(
-                readFileSync(sessionJsonlPath(sessionId), "utf-8"),
-              ) as Array<{ kind?: string; payload?: unknown }>;
-              // v2 proof-linked capture: turnsFromEvents (the shared extractor)
-              // carries each turn's successful tool_result ids so captured
-              // facts land with provenance {sessionId, evidence: toolUseIds}.
-              // The sessionId tag is kept for back-compat/grep (and it is what
-              // `crewhaus migrate memories` derives provenance from on v1 files).
-              // v0.3.0 §7.1: the walk follows sub_agent_start brackets into
-              // child session JSONLs (lazy, capped per child) so researcher
-              // sub-agent findings reach the store too — child facts carry
-              // provenance {sessionId: <child>} plus a subagent:<name> tag.
-              const { turns, children } = await turnsFromEventsWithChildren(
-                events,
-                (childId, maxEvents) =>
-                  (
-                    parseJsonlObjects(readFileSync(sessionJsonlPath(childId), "utf-8")) as Array<{
-                      kind?: string;
-                      payload?: unknown;
-                    }>
-                  ).slice(0, maxEvents),
-              );
-              const facts = summarizeDurableFactsWithEvidence(turns);
-              const written = await captureFacts(memoryStore, facts, ["auto-capture", sessionId], {
-                sessionId,
-              });
-              written.push(
-                ...(await captureChildFacts(memoryStore, children, ["auto-capture", sessionId])),
-              );
-              if (written.length > 0) {
-                process.stdout.write(
-                  `[memory] auto-captured ${written.length} durable fact(s) into ${memoryStore.path()}\n`,
-                );
-              }
-            },
-          }
-        : {}),
-    };
-  }
-
   // Item #56 — resolve the current user's preference file (flag > env) so the
   // runtime injects `.crewhaus/preferences/<user>.md` at run start. Absent when
   // no user is identified or the file doesn't exist yet.
@@ -4455,6 +4415,10 @@ async function runRunCli(
       // (gated by CREWHAUS_INCIDENTS inside runtime-core).
       incidentSpec: { name: ir.name },
       ...(memoryRunOpt !== undefined ? { memory: memoryRunOpt } : {}),
+      // v0.3.0 Goal 1 — the continuity seam (plan tail + requirements ledger
+      // + teardown handoff), default-on unless the spec said
+      // `continuity: false`.
+      ...(continuityRunOpt !== undefined ? { continuity: continuityRunOpt } : {}),
       // Item #56 — inject the current user's preference file at run start (via
       // the project-memory auto-load path). LESSONS.md is auto-loaded already
       // as a canonical memory file, so no extra wiring is needed for it.

@@ -1,0 +1,11 @@
+name: pin-cli-memory
+target: cli
+agent:
+  model: claude-sonnet-4-6
+  instructions: |
+    You are a byte-restore pin fixture for the CLI shape with memory. Reply concisely.
+tools: [read]
+memory:
+  autoRecall: true
+  autoCapture: true
+  recallK: 4

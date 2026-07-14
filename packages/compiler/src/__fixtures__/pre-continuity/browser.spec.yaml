@@ -1,0 +1,6 @@
+name: pin-browser
+target: browser
+agent:
+  model: claude-sonnet-4-6
+  instructions: |
+    Byte-restore pin fixture for the browser shape.

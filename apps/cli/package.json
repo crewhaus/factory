@@ -62,6 +62,7 @@
     "@crewhaus/ir-passes": "workspace:*",
     "@crewhaus/logging": "workspace:*",
     "@crewhaus/mcp-host": "workspace:*",
+    "@crewhaus/memory-service": "workspace:*",
     "@crewhaus/memory-store": "workspace:*",
     "@crewhaus/wiki-store": "workspace:*",
     "@crewhaus/model-router": "workspace:*",

@@ -554,25 +554,119 @@ const feedbackBlock = z
   .optional();
 
 /**
+ * v0.3.0 §3.1/§9 — the `memory.wiki` sub-block: the update-in-place semantic
+ * tier over `@crewhaus/wiki-store` (`.crewhaus/wiki/<spec>/`). Presence (with
+ * `enabled` not `false`) registers the ten thredz-vocabulary `wiki_*` tools.
+ * `recallK` caps wiki hits fused into auto-recall (OPTIMIZABLE, PR 20);
+ * `embedder` is the `@crewhaus/embedder` factory grammar enabling hybrid
+ * recall on BOTH the wiki and the fact store; `autoRecall` fuses wiki recall
+ * into the session-start memory bundle; `requireSources` is the learning-mode
+ * write governance (`wiki_write` rejects bodies without a `## Sources`
+ * heading — the `learning:` lowering sets it in PR 17).
+ * `.strict()` so a typo'd sub-key fails the build.
+ */
+const memoryWikiBlock = z
+  .object({
+    enabled: z.boolean().optional(),
+    recallK: z.number().int().positive().max(50).optional(),
+    embedder: z.string().min(1).optional(),
+    autoRecall: z.boolean().optional(),
+    requireSources: z.boolean().optional(),
+  })
+  .strict();
+
+/**
+ * The shared duration-string grammar (Phase 3 §3.1 heartbeat, v0.3.0
+ * `memory.ttl`). Extended with `d` (days) in 0.3.0. Parsed to milliseconds
+ * at lower time by the compiler's `parseDurationToMs`.
+ */
+const DURATION_REGEX = /^\d+(?:ms|s|m|h|d)$/;
+
+/**
  * Feature #53 — cross-session memory block. Its mere presence wires the
  * Remember/Recall tools into the harness (no hand-editing). The auto-*
  * switches layer on top: `autoCapture` summarizes the session's durable
  * outcomes into `.crewhaus/memories/<name>.jsonl` at run teardown;
  * `autoRecall` injects the top-`recallK` relevant memories into the system
  * prompt at session start (mirrors project-memory auto-load). Carried on the
- * interactive shapes that run a chat loop (cli, channel, managed, research).
+ * agent-loop shapes (cli, channel, managed, research, crew).
+ *
+ * v0.3.0 (§9) extensions — all optional so pre-0.3.0 specs parse (and lower)
+ * unchanged:
+ *   - `backend`: `file` (the default when absent) | `thredz` (reserved — the
+ *     store flip ships with the `thredz:` block, PR 16). Deliberately NOT
+ *     zod-defaulted: only declared fields are carried into the IR, keeping
+ *     existing memory bundles byte-identical.
+ *   - `ttl`: explicit forgetting for auto-captured facts, as a duration
+ *     string in the heartbeat grammar extended with `d` (days) — e.g. "90d".
+ *     Must be >= 1h (enforced at lower time); omit to keep facts forever.
+ *   - `wiki`: the semantic tier (see {@link memoryWikiBlock}).
  * `.strict()` so a typo'd sub-key fails the build.
  */
 const memoryBlock = z
   .object({
     enabled: z.boolean().optional(),
+    backend: z.enum(["file", "thredz"]).optional(),
+    ttl: z
+      .string()
+      .regex(
+        DURATION_REGEX,
+        'memory.ttl must be a duration like "90d", "12h", "30m", "60s", or "500ms"',
+      )
+      .optional(),
     autoCapture: z.boolean().optional(),
     autoCaptureThreshold: z.number().int().positive().optional(),
     autoRecall: z.boolean().optional(),
     recallK: z.number().int().positive().max(50).optional(),
+    wiki: memoryWikiBlock.optional(),
   })
   .strict()
   .optional();
+
+/**
+ * v0.3.0 Goal 1 (§2.1) — the top-level `continuity:` block: focus, plans,
+ * goals, the proof-of-action ladder, the requirements ledger, and teardown
+ * handoff. THE release's one sanctioned default-on behavior change
+ * (ROADMAP.md:9): on the emit-wired agent-loop shapes (cli, channel, managed,
+ * research, crew) an ABSENT key lowers to the default-on config —
+ * `continuity: false` is the opt-out that restores prior bundle bytes
+ * exactly (byte-diff-pinned).
+ *
+ * Forms: boolean shorthand (`continuity: true|false`) or the strict object:
+ *   - `enabled`: `false` disables (same as the `false` shorthand).
+ *   - `plan`: plan/goal persistence + the Plan and Goal tool families
+ *     (default true; `false` keeps only FocusRead/FocusWrite + MemoryClear).
+ *   - `proof`: `ladder` (default — claimed is free, proven is machine-checked)
+ *     | `require` (refuse plan completion below proven; `init` templates)
+ *     | `off` (no verification). See §2.4.
+ *   - `ledger`: the verbatim requirements ledger (§2.3; default true).
+ *   - `handoff`: deterministic teardown handoff.md (§2.8; default true).
+ *   - `scope`: `auto` (default) | `spec` | `session` — §2.7/§14.5: `auto`
+ *     resolves at lower time to `spec` on cli/research/crew/managed (managed
+ *     additionally tenant-fenced at boot) and `session` (per-conversation)
+ *     on channel; explicit `session` is only accepted on shapes with session
+ *     routing (channel).
+ *   - `focusMaxChars`: hard cap on the mutable tail block (default 4096;
+ *     OPTIMIZABLE, PR 20).
+ *
+ * Also carried (spec-parsed, compiled with an ignored-note comment) on
+ * workflow, batch, voice, browser; deliberately NOT on graph/pipeline/eval/
+ * onchain/onchain-game — the strict union rejects it loudly there, which
+ * beats silent dead config.
+ */
+const continuityObject = z
+  .object({
+    enabled: z.boolean().optional(),
+    plan: z.boolean().optional(),
+    proof: z.enum(["ladder", "require", "off"]).optional(),
+    ledger: z.boolean().optional(),
+    handoff: z.boolean().optional(),
+    scope: z.enum(["auto", "spec", "session"]).optional(),
+    focusMaxChars: z.number().int().positive().optional(),
+  })
+  .strict();
+
+const continuityBlock = z.union([z.boolean(), continuityObject]).optional();
 
 /**
  * Ops item 37 — cross-cutting `observability` block. Today it carries one
@@ -758,15 +852,13 @@ const cliOptionsBlock = z
  * message at each tick; pair with HEARTBEAT.md in cwd for richer
  * playbook reads.
  */
-const HEARTBEAT_DURATION_REGEX = /^\d+(?:ms|s|m|h)$/;
-
 const heartbeatBlock = z
   .object({
     every: z
       .string()
       .regex(
-        HEARTBEAT_DURATION_REGEX,
-        'heartbeat.every must be a duration like "2h", "30m", "60s", or "500ms"',
+        DURATION_REGEX,
+        'heartbeat.every must be a duration like "1d", "2h", "30m", "60s", or "500ms"',
       ),
     instructions: z.string().min(1),
   })
@@ -822,6 +914,7 @@ const cliSchema = z
     budget: budgetBlock,
     feedback: feedbackBlock,
     memory: memoryBlock,
+    continuity: continuityBlock,
     observability: observabilityBlock,
     cli: cliOptionsBlock,
     chains: chainsBlock,
@@ -852,6 +945,9 @@ const workflowSchema = z
     permissions: permissionsBlock,
     compaction: compactionBlock,
     failure_taxonomy: failureTaxonomyBlock,
+    // v0.3.0 — carried but not emit-wired in 0.3.0 (ignored-note comment in
+    // the generated bundle; NOT default-on here).
+    continuity: continuityBlock,
     chains: chainsBlock,
     wallets: walletsBlock,
     contracts: contractsBlock,
@@ -971,6 +1067,7 @@ const channelSchema = z
     budget: budgetBlock,
     feedback: feedbackBlock,
     memory: memoryBlock,
+    continuity: continuityBlock,
     observability: observabilityBlock,
     heartbeat: heartbeatBlock,
     gateway: channelGatewayBlock,
@@ -1073,6 +1170,7 @@ const managedSchema = z
     failure_taxonomy: failureTaxonomyBlock,
     budget: budgetBlock,
     memory: memoryBlock,
+    continuity: continuityBlock,
     observability: observabilityBlock,
   })
   .strict();
@@ -1199,6 +1297,11 @@ const crewSchema = z
     permissions: permissionsBlock,
     compaction: compactionBlock,
     failure_taxonomy: failureTaxonomyBlock,
+    // v0.3.0 — crew joins the memory-carrying shapes (§9: emit-wired; the
+    // roles share the spec-scoped stores — the plan IS the coordination
+    // surface, §2.7).
+    memory: memoryBlock,
+    continuity: continuityBlock,
     chains: chainsBlock,
     wallets: walletsBlock,
     contracts: contractsBlock,
@@ -1239,6 +1342,7 @@ const researchSchema = z
     compaction: compactionBlock,
     failure_taxonomy: failureTaxonomyBlock,
     memory: memoryBlock,
+    continuity: continuityBlock,
     chains: chainsBlock,
     wallets: walletsBlock,
     contracts: contractsBlock,
@@ -1275,6 +1379,9 @@ const batchSchema = z
     permissions: permissionsBlock,
     compaction: compactionBlock,
     failure_taxonomy: failureTaxonomyBlock,
+    // v0.3.0 — carried but not emit-wired in 0.3.0 (ignored-note comment in
+    // the generated bundle; NOT default-on here).
+    continuity: continuityBlock,
     chains: chainsBlock,
     wallets: walletsBlock,
     contracts: contractsBlock,
@@ -1318,6 +1425,9 @@ const voiceSchema = z
     permissions: permissionsBlock,
     compaction: compactionBlock,
     failure_taxonomy: failureTaxonomyBlock,
+    // v0.3.0 — carried but not emit-wired in 0.3.0 (ignored-note comment in
+    // the generated bundle; NOT default-on here).
+    continuity: continuityBlock,
   })
   .strict();
 
@@ -1351,6 +1461,9 @@ const browserSchema = z
     permissions: permissionsBlock,
     compaction: compactionBlock,
     failure_taxonomy: failureTaxonomyBlock,
+    // v0.3.0 — carried but not emit-wired in 0.3.0 (ignored-note comment in
+    // the generated bundle; NOT default-on here).
+    continuity: continuityBlock,
   })
   .strict();
 
@@ -1566,6 +1679,11 @@ export type SpecBudgetBlock = z.infer<typeof budgetBlock>;
 export type SpecSecurityBlock = z.infer<typeof securityBlock>;
 export type SpecFeedbackBlock = z.infer<typeof feedbackBlock>;
 export type SpecMemoryBlock = z.infer<typeof memoryBlock>;
+export type SpecMemoryWikiBlock = z.infer<typeof memoryWikiBlock>;
+/** The `continuity:` object form (v0.3.0 §2.1). */
+export type SpecContinuityObject = z.infer<typeof continuityObject>;
+/** The full `continuity:` surface: boolean shorthand or the object form. */
+export type SpecContinuityBlock = z.infer<typeof continuityBlock>;
 export type SpecFailureTaxonomyEntry = z.infer<typeof failureTaxonomyEntrySchema>;
 export type SpecFailureTaxonomy = z.infer<typeof failureTaxonomyBlock>;
 

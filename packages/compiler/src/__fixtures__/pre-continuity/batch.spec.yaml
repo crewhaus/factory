@@ -1,0 +1,8 @@
+name: pin-batch
+target: batch
+agent:
+  model: claude-sonnet-4-6
+  instructions: |
+    Byte-restore pin fixture for the batch shape.
+queue:
+  adapter: in-memory
