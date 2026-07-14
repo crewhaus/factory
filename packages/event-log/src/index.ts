@@ -180,7 +180,18 @@ export type EventKind =
   // / `ActionProofEventPayload`.
   | "plan_update"
   | "goal_update"
-  | "action_proof";
+  | "action_proof"
+  // v0.3.0 Goal 5 (design §6) — one line per scheduled-consolidation (dream)
+  // run, emitted by `@crewhaus/dream-engine` through its injected append seam
+  // (the composition root / CLI decide which log it lands in — when the
+  // model phase ran, the dream session's own log). Proof the dream actually
+  // ran: trigger, outcome, deterministic-phase counts, and the model phase's
+  // evidence toolUseIds. Non-conversational: `replayMessageHistory` ignores
+  // it, `--resume` is unaffected, and readers written before this kind
+  // existed keep parsing (every session-log reader branches on the kinds it
+  // knows and skips the rest). Payload shape exported below as
+  // `DreamRunEventPayload`.
+  | "dream_run";
 
 /**
  * Payload for the `wiki_write` event kind (0.3.0 design §9): which article
@@ -194,6 +205,29 @@ export type WikiWriteEventPayload = {
   readonly action: "write" | "set_signals" | "gap";
   /** thredz-parity `editMessage`, when the model supplied one. */
   readonly editMessage?: string;
+};
+
+/**
+ * Payload for the `dream_run` event kind (0.3.0 design §6): proof one
+ * scheduled-consolidation run happened, with what outcome, and — when the
+ * model phase ran — which tool calls it left behind as evidence. The counts
+ * object mirrors dream-engine's `DreamPhase1Counts` (kept structural here so
+ * event-log stays dependency-free).
+ */
+export type DreamRunEventPayload = {
+  readonly specName: string;
+  /** What fired the run: `cli` verb, `boot` catch-up, or a daemon `janitor` tick. */
+  readonly trigger: string;
+  /** `deterministic` | `full` | `model_refused_unpriced` | `model_failed`. */
+  readonly outcome: string;
+  /** The idempotency window this run consumed (`dream:<spec>:<windowIndex>`). */
+  readonly windowKey: string;
+  readonly phase1Counts: Readonly<Record<string, number>>;
+  /** The dream model session, when the model phase ran. */
+  readonly sessionId?: string;
+  readonly spentUsd?: number;
+  /** Successful toolUseIds from the model phase — the §6.2 evidence trail. */
+  readonly evidence?: readonly string[];
 };
 
 export type Event = {

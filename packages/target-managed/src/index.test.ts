@@ -264,3 +264,37 @@ describe("emitManaged — terminal-failure reporting (0.3.0 Goal 6)", () => {
     expect(daemon.slice(catchIdx, rethrowIdx)).not.toContain("process.exit");
   });
 });
+
+describe("emitManaged — dream janitor step (v0.3.0 PR 14, §6.3)", () => {
+  const dreamIr: IrManagedV0 = {
+    ...ir,
+    memory: { dream: { everyMs: 86_400_000, mode: "full", budgetUsd: 0.5 } },
+  };
+
+  test("registers a per-tenant deterministic dream step into the janitor", () => {
+    const daemon = emitManaged(dreamIr).files.find((f) => f.path === "daemon.ts")?.content ?? "";
+    expect(daemon).toContain('import { createDreamJanitorStep } from "@crewhaus/memory-service";');
+    expect(daemon).toContain("const DREAM_STEP = createDreamJanitorStep(");
+    expect(daemon).toContain("tenantsRootDir: TENANTS_ROOT,");
+    expect(daemon).toContain("steps: DREAM_STEP !== null ? [DREAM_STEP] : [],");
+    // The multi-tenant janitor never fires the model phase — the emitted
+    // deps carry NO modelPhase and the block says why.
+    expect(daemon).not.toContain("modelPhase");
+    expect(daemon).toContain("per-tenant `crewhaus dream run` cron");
+  });
+
+  test("the embedded fragment carries the dream schedule", () => {
+    const daemon = emitManaged(dreamIr).files.find((f) => f.path === "daemon.ts")?.content ?? "";
+    const match = daemon.match(/createDreamJanitorStep\((\{.*?\}), \{/);
+    const fragment = JSON.parse(match?.[1] ?? "{}") as {
+      memory?: { dream?: { everyMs: number; mode: string; budgetUsd?: number } };
+    };
+    expect(fragment.memory?.dream).toEqual({ everyMs: 86_400_000, mode: "full", budgetUsd: 0.5 });
+  });
+
+  test("no dream schedule → zero dream codegen", () => {
+    const daemon = emitManaged(ir).files.find((f) => f.path === "daemon.ts")?.content ?? "";
+    expect(daemon).not.toContain("createDreamJanitorStep");
+    expect(daemon).not.toContain("DREAM_STEP");
+  });
+});

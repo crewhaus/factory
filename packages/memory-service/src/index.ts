@@ -76,6 +76,7 @@
  * fence of its own — is constructed inside the tenant root).
  */
 import { readFileSync } from "node:fs";
+import { readdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import {
   type ContinuityScope,
@@ -83,7 +84,15 @@ import {
   createContinuityStore,
   renderStatus,
 } from "@crewhaus/continuity-store";
-import { DEFAULT_SKILLS, builtinCommandsDir } from "@crewhaus/default-skills";
+import { DEFAULT_SKILLS, DREAM_SKILL_BODY, builtinCommandsDir } from "@crewhaus/default-skills";
+import {
+  type DreamEngine,
+  type DreamJanitorStep,
+  type DreamModelPhase,
+  type DreamRunReport,
+  createDreamEngine,
+  dreamJanitorStep,
+} from "@crewhaus/dream-engine";
 import { createEmbedder } from "@crewhaus/embedder";
 import { CrewhausError } from "@crewhaus/errors";
 import {
@@ -120,7 +129,7 @@ export class MemoryServiceError extends CrewhausError {
 export type MemoryBackend = "file" | "thredz";
 
 /** The `memory:` slice — `IrMemory` (#53) plus the §9 extensions this root
- *  wires today (`backend`, `ttlMs`, `wiki`). */
+ *  wires today (`backend`, `ttlMs`, `wiki`, `dream`). */
 export type MemoryFactsFragment = {
   /** Presence of the block implies enabled; explicit `false` wires nothing. */
   readonly enabled?: boolean;
@@ -133,6 +142,20 @@ export type MemoryFactsFragment = {
   readonly autoRecall?: boolean;
   readonly recallK?: number;
   readonly wiki?: WikiWiringFragment;
+  readonly dream?: DreamWiringFragment;
+};
+
+/** The `memory.dream` slice (§6/§9) — `IrMemoryDream` structurally. */
+export type DreamWiringFragment = {
+  /** Consolidation cadence in ms (`memory.dream.every`, lowered). */
+  readonly everyMs: number;
+  /** The IR carries this resolved (default `full`); optional here so
+   *  hand-built fragments stay ergonomic. */
+  readonly mode?: "deterministic" | "full";
+  /** Model-phase spend cap (USD). Absent or 0 = deterministic only. */
+  readonly budgetUsd?: number;
+  /** Playbook override; default = the builtin `dream` skill body. */
+  readonly instructions?: string;
 };
 
 /** The `memory.wiki` slice (§3.1/§9). */
@@ -207,6 +230,12 @@ export type IrMemoryLike = {
     readonly autoRecall?: boolean;
     readonly requireSources?: boolean;
   };
+  readonly dream?: {
+    readonly everyMs: number;
+    readonly mode: "deterministic" | "full";
+    readonly budgetUsd?: number;
+    readonly instructions?: string;
+  };
 };
 
 /** Structural mirror of `IrContinuity` (v0.3.0 §9) — the compiler lowers a
@@ -238,6 +267,7 @@ export function memoryFragmentFromIr(ir: {
 }): MemoryWiringFragment {
   const mem = ir.memory;
   const wiki = mem?.wiki;
+  const dream = mem?.dream;
   const cont = ir.continuity;
   return {
     specName: ir.name,
@@ -262,6 +292,18 @@ export function memoryFragmentFromIr(ir: {
                     ...(wiki.autoRecall !== undefined ? { autoRecall: wiki.autoRecall } : {}),
                     ...(wiki.requireSources !== undefined
                       ? { requireSources: wiki.requireSources }
+                      : {}),
+                  },
+                }
+              : {}),
+            ...(dream !== undefined
+              ? {
+                  dream: {
+                    everyMs: dream.everyMs,
+                    mode: dream.mode,
+                    ...(dream.budgetUsd !== undefined ? { budgetUsd: dream.budgetUsd } : {}),
+                    ...(dream.instructions !== undefined
+                      ? { instructions: dream.instructions }
                       : {}),
                   },
                 }
@@ -405,7 +447,7 @@ function tenantRootOf(tenant: Tenant): string {
   return resolve(tenant.sessionRoot, "..");
 }
 
-function crewhausDirOf(deps: WireMemoryDeps): string {
+function crewhausDirOf(deps: { readonly tenant?: Tenant; readonly cwd: string }): string {
   return deps.tenant !== undefined ? tenantRootOf(deps.tenant) : resolve(deps.cwd, ".crewhaus");
 }
 
@@ -425,6 +467,10 @@ function wikiEnabled(fragment: MemoryWiringFragment): boolean {
   );
 }
 
+function dreamEnabled(fragment: MemoryWiringFragment): boolean {
+  return memoryEnabled(fragment) && fragment.memory?.dream !== undefined;
+}
+
 function assertBackendImplemented(fragment: MemoryWiringFragment): void {
   const backend = fragment.memory?.backend;
   if (backend === undefined || backend === "file") return;
@@ -437,7 +483,7 @@ function assertBackendImplemented(fragment: MemoryWiringFragment): void {
 
 function resolveEmbedder(
   fragment: MemoryWiringFragment,
-  deps: WireMemoryDeps,
+  deps: { readonly embedder?: EmbedderLike },
 ): EmbedderLike | undefined {
   if (deps.embedder !== undefined) return deps.embedder;
   const spec = fragment.memory?.wiki?.embedder;
@@ -713,24 +759,30 @@ export function wireWiki(
 // ---------------------------------------------------------------------------
 
 /** Builtin slash commands gated by which feature backs their tools. The
- *  learning-loop commands (/study /reflect /exam) and /dream stay out until
- *  their skills/engines are wired (PR 14/17) — an instruction body that
- *  loads a skill the harness does not carry would strand the model. */
+ *  learning-loop commands (/study /reflect /exam) stay out until their
+ *  skill is wired (PR 17) — an instruction body that loads a skill the
+ *  harness does not carry would strand the model. `/dream` (and the `dream`
+ *  skill it loads) joins the gated set when `memory.dream` is configured
+ *  (PR 14). */
 const CONTINUITY_COMMANDS = ["plan", "focus", "next", "handoff", "clear-plan", "clear-focus"];
 const MEMORY_COMMANDS = ["forget"];
+const DREAM_COMMANDS = ["dream"];
 
 async function loadSkillsAndCommands(
   deps: WireMemoryDeps,
-  features: { memory: boolean },
+  features: { memory: boolean; dream: boolean },
 ): Promise<{ skills: ReadonlyArray<SkillRef>; slashCommands: ReadonlyMap<string, SlashCommand> }> {
-  // The continuity skill is the only builtin the composition root ships
-  // today: learning-loop needs its {{domain}} substitutions rendered by the
-  // learning: lowering (PR 17) and dream rides the dream engine (PR 14).
-  const continuitySkill = DEFAULT_SKILLS.find((s) => s.name === "continuity");
+  // Builtins the composition root ships: the continuity skill always (when
+  // continuity is on), the dream skill when a dream schedule is configured
+  // (its /dream command loads it in-session, §6.3). learning-loop still
+  // waits for its {{domain}} substitutions (PR 17).
+  const builtinSkills = DEFAULT_SKILLS.filter(
+    (s) => s.name === "continuity" || (features.dream && s.name === "dream"),
+  );
   const skills = await discoverSkills({
     cwd: deps.cwd,
     ...(deps.homeDir !== undefined ? { homeDir: deps.homeDir } : {}),
-    ...(continuitySkill !== undefined ? { builtinSkills: [continuitySkill] } : {}),
+    ...(builtinSkills.length > 0 ? { builtinSkills } : {}),
   });
 
   const commands = await loadCommands({
@@ -738,7 +790,11 @@ async function loadSkillsAndCommands(
     ...(deps.homeDir !== undefined ? { homeDir: deps.homeDir } : {}),
     builtinDirs: [builtinCommandsDir],
   });
-  const allowed = new Set([...CONTINUITY_COMMANDS, ...(features.memory ? MEMORY_COMMANDS : [])]);
+  const allowed = new Set([
+    ...CONTINUITY_COMMANDS,
+    ...(features.memory ? MEMORY_COMMANDS : []),
+    ...(features.dream ? DREAM_COMMANDS : []),
+  ]);
   for (const [name, command] of [...commands]) {
     const builtin = command.filePath.startsWith(builtinCommandsDir);
     if (builtin && !allowed.has(name)) commands.delete(name);
@@ -789,7 +845,10 @@ export async function wireMemory(
   if (continuity !== null) {
     stores.continuity = continuity.store;
     tools.push(...continuity.tools);
-    const { skills, slashCommands } = await loadSkillsAndCommands(deps, { memory: factsOn });
+    const { skills, slashCommands } = await loadSkillsAndCommands(deps, {
+      memory: factsOn,
+      dream: dreamEnabled(fragment),
+    });
     options = { ...options, continuity: continuity.continuity, skills, slashCommands };
     deps.log?.(`[memory] continuity on — ${continuity.store.dir()} (focus · plans · goals)\n`);
   }
@@ -859,4 +918,224 @@ function excerpt(body: string): string {
   return flat.length > WIKI_RECALL_EXCERPT_CHARS
     ? `${flat.slice(0, WIKI_RECALL_EXCERPT_CHARS)}…`
     : flat;
+}
+
+// ---------------------------------------------------------------------------
+// dream — scheduled consolidation (design §6, PR 14)
+// ---------------------------------------------------------------------------
+
+/** Re-exported so consumers (CLI verbs, emitted daemons) get the engine's
+ *  seam types from the composition root they already import. */
+export type {
+  DreamEngine,
+  DreamJanitorStep,
+  DreamModelPhase,
+  DreamRunReport,
+} from "@crewhaus/dream-engine";
+
+/** The §6.3 boot catch-up line, exact (tests + the emitted bundles pin it). */
+export const DREAM_BOOT_CATCHUP_NOTE =
+  "[dream] overdue — deterministic pass done; run 'crewhaus dream' for full consolidation";
+
+/**
+ * Deps for the dream composition — deliberately NOT `WireMemoryDeps`: dream
+ * wiring registers no tools (phase 2 acts through tools the CALLER wired
+ * via `wireMemory` into its own session), so there is no catalog here.
+ */
+export type WireDreamDeps = {
+  readonly cwd: string;
+  /** Tenant fencing (§2.7) — re-roots every store under the tenant root. */
+  readonly tenant?: Tenant;
+  /** Where session `.jsonl` logs live. Default `<crewhausDir>/sessions`. */
+  readonly sessionRootDir?: string;
+  readonly embedder?: EmbedderLike;
+  /** The injected model-session runner (built on runChatLoop by the CLI
+   *  verb / daemon codegen). Absent → deterministic phase only. */
+  readonly modelPhase?: DreamModelPhase;
+  /** `dream_run` event sink — see `@crewhaus/event-log`'s payload type. */
+  readonly appendEvent?: (event: {
+    kind: "dream_run";
+    payload: Record<string, unknown>;
+  }) => void | Promise<void>;
+  readonly log?: (line: string) => void;
+  readonly now?: () => Date;
+};
+
+export type WiredDream = {
+  readonly engine: DreamEngine;
+};
+
+/** Internal: construct a dream engine rooted at an explicit `.crewhaus`
+ *  directory (the tenant-enumerating janitor step reuses it per tenant). */
+function buildDreamEngine(
+  fragment: MemoryWiringFragment,
+  crewhausDir: string,
+  deps: WireDreamDeps,
+  opts: { readonly modelPhase?: DreamModelPhase } = {},
+): DreamEngine {
+  const dream = fragment.memory?.dream;
+  if (dream === undefined) {
+    throw new MemoryServiceError("memory-service: buildDreamEngine needs fragment.memory.dream");
+  }
+  const embedder = resolveEmbedder(fragment, deps);
+  const sessionRootDir = deps.sessionRootDir ?? join(crewhausDir, "sessions");
+  const memoryStore = createMemoryStore({
+    specName: fragment.specName,
+    rootDir: join(crewhausDir, "memories"),
+    ...(embedder !== undefined ? { embedder } : {}),
+    ...(deps.now !== undefined ? { now: deps.now } : {}),
+  });
+  const wikiStore = wikiEnabled(fragment)
+    ? createWikiStore({
+        specName: fragment.specName,
+        rootDir: join(crewhausDir, "wiki"),
+        ...(embedder !== undefined ? { embedder } : {}),
+        ...(deps.now !== undefined ? { now: deps.now } : {}),
+      })
+    : undefined;
+  // The dream consolidates the SPEC-scoped agenda always (§14.5: the
+  // spec-scoped store holds the daemon's own agenda, which heartbeat/dream
+  // read) — even when the harness's interactive continuity is
+  // session-scoped (channel).
+  const continuityStore = continuityEnabled(fragment)
+    ? createContinuityStore({
+        specName: fragment.specName,
+        rootDir: join(crewhausDir, "state"),
+        sessionRootDir,
+        scope: { kind: "spec" },
+        ...(deps.now !== undefined ? { now: deps.now } : {}),
+      })
+    : undefined;
+  return createDreamEngine({
+    specName: fragment.specName,
+    crewhausDir,
+    dream,
+    sessionRootDir,
+    memoryStore,
+    ...(wikiStore !== undefined ? { wikiStore } : {}),
+    ...(continuityStore !== undefined ? { continuityStore } : {}),
+    ...(opts.modelPhase !== undefined ? { modelPhase: opts.modelPhase } : {}),
+    playbook: DREAM_SKILL_BODY,
+    ...(deps.appendEvent !== undefined ? { appendEvent: deps.appendEvent } : {}),
+    ...(deps.log !== undefined ? { log: deps.log } : {}),
+    ...(deps.now !== undefined ? { now: deps.now } : {}),
+  });
+}
+
+/**
+ * Wire the dream slice (§6): construct the stores the consolidation pass
+ * reads/writes and hand back a ready `DreamEngine`. Returns null when the
+ * fragment carries no `memory.dream` (or memory is disabled). The default
+ * playbook is the builtin `dream` skill body; `dream.instructions` (spec)
+ * overrides it inside the engine.
+ */
+export function wireDream(fragment: MemoryWiringFragment, deps: WireDreamDeps): WiredDream | null {
+  if (!dreamEnabled(fragment)) return null;
+  assertBackendImplemented(fragment);
+  const engine = buildDreamEngine(fragment, crewhausDirOf(deps), deps, {
+    ...(deps.modelPhase !== undefined ? { modelPhase: deps.modelPhase } : {}),
+  });
+  return { engine };
+}
+
+/**
+ * The cli-shape boot catch-up (§6.3): when the schedule is OVERDUE, run the
+ * DETERMINISTIC phase only — sub-second, zero spend — and return the exact
+ * note line the bundle prints. Returns null when dream isn't configured,
+ * isn't due, or another process is already consolidating (lock/window). Un-
+ * attended model spend is never a side effect of starting a session — the
+ * model phase stays behind `crewhaus dream` / the daemon janitor.
+ */
+export async function runDreamBootCatchUp(
+  fragment: MemoryWiringFragment,
+  deps: WireDreamDeps,
+): Promise<string | null> {
+  const wired = wireDream(fragment, deps);
+  if (wired === null) return null;
+  const status = await wired.engine.status();
+  if (!status.overdue) return null;
+  const report = await wired.engine.runDeterministic({ trigger: "boot" });
+  if (report.cached) return null; // another process beat us to this window
+  return DREAM_BOOT_CATCHUP_NOTE;
+}
+
+export type CreateDreamJanitorStepDeps = WireDreamDeps & {
+  /** Managed daemons: enumerate `<tenantsRootDir>/<tenantId>/` per run and
+   *  consolidate each tenant's stores DETERMINISTICALLY (the model phase is
+   *  deliberately never run from a multi-tenant janitor — per-tenant model
+   *  spend needs an explicit operator decision, i.e. a per-tenant cron of
+   *  `crewhaus dream run`). */
+  readonly tenantsRootDir?: string;
+  /** Env override (tests). Default `process.env`. */
+  readonly env?: Record<string, string | undefined>;
+};
+
+/**
+ * The daemon integration (§6.3): a registrable janitor step, due-checked
+ * against `.crewhaus/dream/<spec>/state.json` inside the existing
+ * boot+hourly janitor tick. `CREWHAUS_DREAM=0` disables;
+ * `CREWHAUS_DREAM_INTERVAL_MS` overrides the cadence. Returns null when the
+ * fragment carries no dream schedule — emitters spread `...(step ? [step]
+ * : [])` into `createJanitor({ steps })`.
+ */
+export function createDreamJanitorStep(
+  fragment: MemoryWiringFragment,
+  deps: CreateDreamJanitorStepDeps,
+): DreamJanitorStep | null {
+  if (!dreamEnabled(fragment)) return null;
+  assertBackendImplemented(fragment);
+  const env = deps.env !== undefined ? { env: deps.env } : {};
+
+  if (deps.tenantsRootDir === undefined) {
+    const wired = wireDream(fragment, deps);
+    if (wired === null) return null;
+    return dreamJanitorStep(wired.engine, env);
+  }
+
+  const tenantsRootDir = deps.tenantsRootDir;
+  return {
+    name: "dream_consolidation",
+    run: async () => {
+      let tenantIds: string[];
+      try {
+        const entries = await readdir(tenantsRootDir, { withFileTypes: true });
+        tenantIds = entries.filter((e) => e.isDirectory()).map((e) => e.name);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+          return { status: "skipped", detail: `no tenants under ${tenantsRootDir}` };
+        }
+        throw err;
+      }
+      if (tenantIds.length === 0) {
+        return { status: "skipped", detail: `no tenants under ${tenantsRootDir}` };
+      }
+      let ran = 0;
+      let count = 0;
+      const errors: string[] = [];
+      for (const tenantId of tenantIds.sort()) {
+        const engine = buildDreamEngine(fragment, join(tenantsRootDir, tenantId), {
+          ...deps,
+          sessionRootDir: join(tenantsRootDir, tenantId, "sessions"),
+        });
+        const outcome = await dreamJanitorStep(engine, env).run();
+        if (outcome.status === "error") {
+          errors.push(`${tenantId}: ${outcome.detail ?? "error"}`);
+        } else if (outcome.status === "ok") {
+          ran += 1;
+          count += outcome.count ?? 0;
+        }
+      }
+      if (errors.length > 0) {
+        return { status: "error", count, detail: errors.join("; ") };
+      }
+      if (ran === 0) {
+        return { status: "skipped", detail: `no tenant due (${tenantIds.length} checked)` };
+      }
+      return {
+        status: "ok",
+        count,
+        detail: `deterministic consolidation across ${ran}/${tenantIds.length} tenant(s)`,
+      };
+    },
+  };
 }

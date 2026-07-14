@@ -18,11 +18,13 @@
  *   3. Orphaned `tool_use` entries. A crash mid-turn can persist an
  *      `assistant_message` whose `tool_use` never got a `tool_result`.
  *
- * `createJanitor(opts).runOnce()` performs the three steps, each
- * individually try/caught (a throwing step is reported and never aborts the
- * others), and `start(intervalMs)` re-runs them on a timer (unref'd, so the
- * janitor never keeps a finished process alive — the batch worker's
- * idle-exit path still exits cleanly).
+ * `createJanitor(opts).runOnce()` performs the three built-in steps — plus
+ * any steps registered via `opts.steps` (v0.3.0 PR 14: the dream
+ * consolidation step rides this seam) — each individually try/caught (a
+ * throwing step is reported and never aborts the others), and
+ * `start(intervalMs)` re-runs them on a timer (unref'd, so the janitor
+ * never keeps a finished process alive — the batch worker's idle-exit path
+ * still exits cleanly).
  *
  * Step semantics:
  *
@@ -82,20 +84,55 @@ export type JanitorReservationStore = {
   clearReservations(): Promise<void>;
 };
 
-export type JanitorStepName =
-  | "reservation_cleanup"
-  | "session_ttl_eviction"
-  | "orphan_tool_use_sweep";
+/** The built-in steps every janitor runs. Registered steps (v0.3.0 PR 14 —
+ *  `CreateJanitorOptions.steps`) carry their own names beyond this union. */
+export const JANITOR_BUILTIN_STEPS = [
+  "reservation_cleanup",
+  "session_ttl_eviction",
+  "orphan_tool_use_sweep",
+] as const;
+
+export type JanitorBuiltinStepName = (typeof JANITOR_BUILTIN_STEPS)[number];
+
+/** @deprecated the union closed over the built-ins only; kept as an alias for
+ *  source compat. Step names are open since the v0.3.0 step registry. */
+export type JanitorStepName = JanitorBuiltinStepName;
 
 export type JanitorStepStatus = "ok" | "skipped" | "error";
 
 export type JanitorStepResult = {
-  readonly step: JanitorStepName;
+  /** Built-in step name or a registered step's own name. */
+  readonly step: string;
   readonly status: JanitorStepStatus;
   /** Step tally: sessions evicted / orphaned tool_use ids found. */
   readonly count?: number;
   /** Skip reason, error message, or sweep stats. */
   readonly detail?: string;
+};
+
+/** What a registered step's `run()` reports — the janitor stamps the step
+ *  name and publishes the `janitor_action` trace event around it. */
+export type JanitorStepOutcome = {
+  readonly status: JanitorStepStatus;
+  readonly count?: number;
+  readonly detail?: string;
+};
+
+/**
+ * v0.3.0 PR 14 — a pluggable maintenance step. Registered steps run AFTER
+ * the built-ins on every `runOnce()` (boot run + interval ticks alike), each
+ * individually try/caught exactly like the built-ins, and each reported as a
+ * `janitor_action` trace event when a bus is wired. The overlap guard in
+ * `start()` covers them for free — a tick that is still consolidating is
+ * never re-entered. The memory release's dream step registers through this
+ * seam so daemon shapes get scheduled consolidation without runtime-core
+ * ever importing a store package.
+ */
+export type JanitorStep = {
+  /** Step name in results + `janitor_action` events. Must not collide with
+   *  a built-in name. */
+  readonly name: string;
+  run(): Promise<JanitorStepOutcome>;
 };
 
 export type JanitorRunResult = {
@@ -154,6 +191,14 @@ export type CreateJanitorOptions = {
    * transiently looks orphaned) and are skipped. Default 5 minutes.
    */
   readonly orphanQuietPeriodMs?: number;
+  /**
+   * v0.3.0 PR 14 — registered steps, run after the built-ins on every
+   * `runOnce()`. Each is individually try/caught and reported exactly like
+   * a built-in (`janitor_action` trace event included). A registered name
+   * colliding with a built-in throws at construction — a shadowed built-in
+   * would make trace events ambiguous.
+   */
+  readonly steps?: ReadonlyArray<JanitorStep>;
   /** Optional trace bus — one `janitor_action` event per step per run. */
   readonly bus?: TraceEventBus;
   /** Test seam: clock. */
@@ -212,6 +257,20 @@ async function countOrphanToolUses(sessionId: string, rootDir: string): Promise<
 
 export function createJanitor(opts: CreateJanitorOptions = {}): Janitor {
   const now = opts.now ?? (() => new Date());
+  const registeredSteps = opts.steps ?? [];
+  const builtinNames = new Set<string>(JANITOR_BUILTIN_STEPS);
+  const seenNames = new Set<string>();
+  for (const step of registeredSteps) {
+    if (builtinNames.has(step.name)) {
+      throw new Error(
+        `createJanitor: registered step "${step.name}" shadows a built-in step — pick a distinct name`,
+      );
+    }
+    if (seenNames.has(step.name)) {
+      throw new Error(`createJanitor: duplicate registered step name "${step.name}"`);
+    }
+    seenNames.add(step.name);
+  }
   // Same non-tenant fallback chain as `resolveSessionRootDir` (the janitor
   // runs at boot, outside any tenant scope; a cycle-free inline keeps this
   // module import-independent of index.ts). With a `tenantsRootDir` the
@@ -385,7 +444,7 @@ export function createJanitor(opts: CreateJanitorOptions = {}): Janitor {
   }
 
   async function runStep(
-    step: JanitorStepName,
+    step: string,
     fn: () => Promise<JanitorStepResult>,
   ): Promise<JanitorStepResult> {
     try {
@@ -413,6 +472,18 @@ export function createJanitor(opts: CreateJanitorOptions = {}): Janitor {
       await runStep("session_ttl_eviction", () => sessionTtlEviction(rootDirs)),
       await runStep("orphan_tool_use_sweep", () => orphanToolUseSweep(rootDirs)),
     ];
+    // v0.3.0 PR 14 — registered steps, after the built-ins: same per-step
+    // isolation, same trace-event reporting, and the start() overlap guard
+    // already covers a long-running registered step (a still-consolidating
+    // tick is never re-entered).
+    for (const registered of registeredSteps) {
+      steps.push(
+        await runStep(registered.name, async () => ({
+          step: registered.name,
+          ...(await registered.run()),
+        })),
+      );
+    }
     return { startedAt, durationMs: performance.now() - t0, steps };
   }
 

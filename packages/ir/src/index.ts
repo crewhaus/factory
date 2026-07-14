@@ -296,6 +296,26 @@ export type IrMemoryWiki = {
 };
 
 /**
+ * v0.3.0 Goal 5 (§6/§9) — scheduled memory consolidation, lowered from
+ * `spec.memory.dream`. `every` is parsed to `everyMs` at lower time
+ * (>= 5m enforced there); `mode` is RESOLVED at lower time (default
+ * `"full"`) so emitters and the interpreter read one deterministic shape.
+ * `budgetUsd`/`instructions` are carried only when declared — the model
+ * phase runs only when `mode` is `"full"` AND `budgetUsd > 0`.
+ */
+export type IrMemoryDream = {
+  /** Consolidation cadence in milliseconds (`spec.memory.dream.every`). */
+  readonly everyMs: number;
+  /** `deterministic` (no model, ever) | `full` (bounded model synthesis). */
+  readonly mode: "deterministic" | "full";
+  /** Item-27 spend cap for the model phase (USD). Absent or 0 =
+   *  deterministic only. */
+  readonly budgetUsd?: number;
+  /** Playbook override; default = the builtin `dream` skill body. */
+  readonly instructions?: string;
+};
+
+/**
  * Feature #53 — cross-session memory config, lowered from `spec.memory`.
  * Presence of the block wires Remember/Recall into the target; the auto-*
  * switches gate auto-capture (summarize durable outcomes at teardown) and
@@ -305,8 +325,8 @@ export type IrMemoryWiki = {
  *
  * v0.3.0 (§9) extensions, all absent-when-omitted: `backend` (`file` |
  * reserved `thredz`), `ttlMs` (explicit fact forgetting — `spec.memory.ttl`
- * parsed to milliseconds at lower time, >= 1h enforced there), and `wiki`
- * (see {@link IrMemoryWiki}).
+ * parsed to milliseconds at lower time, >= 1h enforced there), `wiki`
+ * (see {@link IrMemoryWiki}), and `dream` (see {@link IrMemoryDream}).
  */
 export type IrMemory = {
   readonly enabled?: boolean;
@@ -317,6 +337,7 @@ export type IrMemory = {
   readonly autoRecall?: boolean;
   readonly recallK?: number;
   readonly wiki?: IrMemoryWiki;
+  readonly dream?: IrMemoryDream;
 };
 
 /** v0.3.0 §2.7 — the RESOLVED continuity scope. `auto` is a compiler

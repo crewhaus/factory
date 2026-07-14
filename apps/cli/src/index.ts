@@ -70,7 +70,7 @@ import { createLogger } from "@crewhaus/logging";
 import { McpHost, resolveMcpServerConfig } from "@crewhaus/mcp-host";
 // PR 10 — the memory fabric's composition root: `crewhaus run` makes the
 // same one stable wireMemory call compiled bundles emit.
-import { memoryFragmentFromIr, wireMemory } from "@crewhaus/memory-service";
+import { memoryFragmentFromIr, runDreamBootCatchUp, wireMemory } from "@crewhaus/memory-service";
 import { createMemoryStore } from "@crewhaus/memory-store";
 import {
   BUILTIN_DEFAULT_RULES,
@@ -298,6 +298,9 @@ import {
 // v0.3.0 Goal 6 — `doctor --probe`: opt-in ~1-token live call per
 // configured provider, catching unfunded/invalid keys before a long run.
 import { buildProbePlan, probeResultsToChecks, runProviderProbes } from "./doctor-probe";
+// v0.3.0 PR 14 — `crewhaus dream run|status|init` (design §6.3), in a
+// side-effect-free module; only the dispatch registration lives here.
+import { DREAM_CLI_SCHEMA, runDreamCommand } from "./dream-cli";
 // FR-006 — Pillar 3 sink-side egress-matcher selection (the substring/semantic
 // selector lowered to ir.security.egressMatcher). Side-effect-free + lazily
 // imports the optional semantic package only when "semantic" is selected, so
@@ -2170,6 +2173,10 @@ function usageText(): string {
     "  wiki show <slug>                     full frontmatter + body for one article (priors in versions/<slug>/)",
     "  wiki search <q> [-k <n>]             BM25 keyword search over a spec's articles",
     "  wiki stats                           corpus health: articles/status/versions/tags/verified/links",
+    "  dream [run] <spec.yaml> [--force]    scheduled memory consolidation (§6): deterministic pass + budget-",
+    "                                       capped model synthesis per memory.dream (cron-safe, window-idempotent)",
+    "  dream status <spec.yaml>             schedule state + next due (.crewhaus/dream/<spec>/state.json)",
+    "  dream init <spec.yaml> [--force]     scaffold the nightly consolidation cron (crewhaus-dream.yml)",
     "       [--evicted] [--ttl-days N]        --evicted indexes each session just before it is deleted",
     "  datasets list                        all registered datasets + versions (Section 29)",
     "  datasets get <name>[@version]        print a dataset's samples as JSONL",
@@ -4070,6 +4077,16 @@ async function runRunCli(
     if (wiredMemory.options.skills !== undefined) skills = wiredMemory.options.skills;
     if (wiredMemory.options.slashCommands !== undefined) {
       slashCommands = wiredMemory.options.slashCommands;
+    }
+    // v0.3.0 PR 14 (§6.3) — boot-time dream catch-up: when the schedule is
+    // overdue, run the DETERMINISTIC phase only (sub-second, zero spend).
+    // Unattended model spend is never a side effect of starting a session —
+    // the full consolidation stays behind `crewhaus dream`.
+    if (ir.memory?.dream !== undefined) {
+      const dreamNote = await runDreamBootCatchUp(memoryFragmentFromIr(ir), {
+        cwd: process.cwd(),
+      });
+      if (dreamNote !== null) process.stdout.write(`${dreamNote}\n`);
     }
   }
 
@@ -15382,6 +15399,22 @@ switch (subcommand) {
       throw err;
     }
     break;
+  case "dream": {
+    // 0.3.0 memory release (design §6.3, PR 14) — scheduled consolidation
+    // verbs. A bare `crewhaus dream <spec>` defaults to `run` (the design's
+    // transcript); the verbs themselves live in dream-cli.ts.
+    const dreamFirst = rest[0];
+    const dreamAction =
+      dreamFirst === "run" || dreamFirst === "status" || dreamFirst === "init" ? dreamFirst : "run";
+    const dreamRest = dreamFirst === dreamAction ? rest.slice(1) : rest;
+    try {
+      await runDreamCommand(parseFor(dreamRest, DREAM_CLI_SCHEMA), dreamAction);
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
+    break;
+  }
   case "migrate": {
     // 0.3.0 memory release — `migrate memories`: the v2 schema backfill over
     // .crewhaus/memories/. Spec migrations stay on migrate-all/upgrade.

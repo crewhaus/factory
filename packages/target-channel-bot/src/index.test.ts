@@ -933,3 +933,61 @@ describe("emitChannelBot — run-level budget field (item 27)", () => {
     expect(agentTs).not.toContain("budget:");
   });
 });
+
+describe("emitChannelBot — dream janitor step (v0.3.0 PR 14, §6.3)", () => {
+  const DREAM_IR: IrChannelV0 = {
+    ...MIN_IR,
+    memory: { dream: { everyMs: 86_400_000, mode: "full", budgetUsd: 0.5 } },
+    continuity: {
+      plan: true,
+      proof: "ladder",
+      ledger: true,
+      handoff: true,
+      scope: "session",
+    },
+  };
+
+  test("agent.ts exports createDreamStep with the runChatLoop model phase", () => {
+    const agent = fileMap(DREAM_IR).get("agent.ts") ?? "";
+    expect(agent).toContain("export function createDreamStep(): DreamJanitorStep | null");
+    expect(agent).toContain(
+      'import { wireMemory, type MemoryWiringFragment, createDreamJanitorStep, type DreamJanitorStep } from "@crewhaus/memory-service";',
+    );
+    expect(agent).toContain('import { createCostTracker } from "@crewhaus/cost-tracker";');
+    // The bounded fresh session (§6.2): dream target, single turn, capped
+    // tool loop, the item-27 budget option fed from the seam input.
+    expect(agent).toContain('sessionTarget: "dream"');
+    expect(agent).toContain("maxToolIterations: input.maxToolIterations");
+    expect(agent).toContain("usdMicros: Math.round(input.budgetUsd * 1_000_000)");
+    expect(agent).toContain('onExceed: { kind: "stop" }');
+  });
+
+  test("the dream fragment is SPEC-scoped even when interactive continuity is session-scoped", () => {
+    const agent = fileMap(DREAM_IR).get("agent.ts") ?? "";
+    const match = agent.match(/const __DREAM_FRAGMENT: MemoryWiringFragment = (\{.*?\});\n/);
+    expect(match).not.toBeNull();
+    const fragment = JSON.parse(match?.[1] ?? "{}") as {
+      memory?: { dream?: { everyMs: number } };
+      continuity?: { scope?: string };
+    };
+    expect(fragment.memory?.dream?.everyMs).toBe(86_400_000);
+    expect(fragment.continuity?.scope).toBe("spec");
+  });
+
+  test("daemon.ts registers the step into createJanitor({ steps })", () => {
+    const daemon = fileMap(DREAM_IR).get("daemon.ts") ?? "";
+    expect(daemon).toContain('import { createAgent, createDreamStep } from "./agent.js";');
+    expect(daemon).toContain("const __dreamStep = createDreamStep();");
+    expect(daemon).toContain("steps: __dreamStep !== null ? [__dreamStep] : [],");
+  });
+
+  test("no dream schedule → zero dream codegen (byte-identity guard)", () => {
+    const files = fileMap({ ...MIN_IR, memory: { autoRecall: true } });
+    for (const path of ["agent.ts", "daemon.ts"]) {
+      const content = files.get(path) ?? "";
+      expect(content).not.toContain("createDreamStep");
+      expect(content).not.toContain("__DREAM_FRAGMENT");
+      expect(content).not.toContain("steps:");
+    }
+  });
+});

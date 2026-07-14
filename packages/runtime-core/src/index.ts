@@ -448,12 +448,16 @@ export type { ResolvedAuth } from "@crewhaus/adapter-anthropic";
 // own module (`./janitor`) but is re-exported here because emitted bundles
 // only import the package root.
 export { createJanitor } from "./janitor";
+export { JANITOR_BUILTIN_STEPS } from "./janitor";
 export type {
   CreateJanitorOptions,
   Janitor,
+  JanitorBuiltinStepName,
   JanitorReservationStore,
   JanitorRunResult,
+  JanitorStep,
   JanitorStepName,
+  JanitorStepOutcome,
   JanitorStepResult,
   JanitorStepStatus,
 } from "./janitor";

@@ -2,7 +2,7 @@
   "name": "@crewhaus/memory-service",
   "version": "0.2.4",
   "type": "module",
-  "description": "v0.3.0 composition root (design §1 principle 1): wireMemory/wireContinuity/wireWiki construct the memory fabric's stores, register its tools, and return runChatLoop-ready seams — one stable call replacing per-emitter memory codegen.",
+  "description": "v0.3.0 composition root (design \u00a71 principle 1): wireMemory/wireContinuity/wireWiki construct the memory fabric's stores, register its tools, and return runChatLoop-ready seams \u2014 one stable call replacing per-emitter memory codegen.",
   "main": "src/index.ts",
   "types": "src/index.ts",
   "exports": {
@@ -14,6 +14,7 @@
   "dependencies": {
     "@crewhaus/continuity-store": "workspace:*",
     "@crewhaus/default-skills": "workspace:*",
+    "@crewhaus/dream-engine": "workspace:*",
     "@crewhaus/embedder": "workspace:*",
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/memory-store": "workspace:*",

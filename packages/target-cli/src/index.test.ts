@@ -732,6 +732,30 @@ describe("emitCli — memory block (#53, rewired onto the PR 10 composition root
     expect(content).not.toContain("@crewhaus/memory-service");
   });
 
+  test("memory.dream emits the boot-time deterministic catch-up (PR 14, §6.3)", () => {
+    const content =
+      emitCli(
+        baseIr({
+          memory: { dream: { everyMs: 86_400_000, mode: "full", budgetUsd: 0.5 } },
+        }),
+      ).files[0]?.content ?? "";
+    expect(content).toContain(
+      `import { wireMemory, runDreamBootCatchUp } from "@crewhaus/memory-service";`,
+    );
+    expect(content).toContain(
+      'const __dreamNote = await runDreamBootCatchUp({"specName":"smoke","memory":{"dream":{"everyMs":86400000,"mode":"full","budgetUsd":0.5}}}, { cwd: process.cwd() });',
+    );
+    expect(content).toContain(
+      "if (__dreamNote !== null) process.stdout.write(`${__dreamNote}\\n`);",
+    );
+  });
+
+  test("no dream block → no catch-up lines (pinned bytes preserved)", () => {
+    const content = emitCli(baseIr({ memory: {} })).files[0]?.content ?? "";
+    expect(content).not.toContain("runDreamBootCatchUp");
+    expect(content).not.toContain("__dreamNote");
+  });
+
   test("the EMITTED fragment literal drives the real wiring: tool parity + recall/capture round-trip", async () => {
     // Behavioral-equivalence pin at the emit boundary: pull the exact JSON
     // literal out of the generated bundle, run it through wireMemory (what

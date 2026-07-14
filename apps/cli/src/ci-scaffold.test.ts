@@ -8,8 +8,10 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  DREAM_WORKFLOW_RELPATH,
   EVAL_CI_WORKFLOW_RELPATH,
   SENTINEL_WORKFLOW_RELPATH,
+  buildDreamWorkflowYaml,
   buildEvalCiWorkflowYaml,
   buildSentinelDriftWorkflowYaml,
 } from "./ci-scaffold";
@@ -327,5 +329,31 @@ describe("crewhaus init --sentinel (CLI surface, item 30)", () => {
     expect(res.exitCode).toBe(0);
     expect(existsSync(join(root, EVAL_CI_WORKFLOW_RELPATH))).toBe(true);
     expect(existsSync(join(root, SENTINEL_WORKFLOW_RELPATH))).toBe(true);
+  });
+});
+
+describe("buildDreamWorkflowYaml (v0.3.0 PR 14, §6.3)", () => {
+  test("daily-or-slower cadence → nightly odd-minute cron", () => {
+    const yaml = buildDreamWorkflowYaml({ specPath: "crewhaus.yaml", everyMs: 86_400_000 });
+    expect(yaml).toContain('- cron: "19 4 * * *"');
+    expect(yaml).toContain("workflow_dispatch: {}");
+    expect(yaml).toContain("crewhaus dream run crewhaus.yaml");
+    expect(yaml).toContain("window");
+    expect(DREAM_WORKFLOW_RELPATH).toBe(join(".github", "workflows", "crewhaus-dream.yml"));
+  });
+
+  test("sub-daily cadence → hourly odd-minute cron", () => {
+    const yaml = buildDreamWorkflowYaml({ specPath: "crewhaus.yaml", everyMs: 6 * 3_600_000 });
+    expect(yaml).toContain('- cron: "19 * * * *"');
+  });
+
+  test("a nested harness gets a working-directory and a relative spec path", () => {
+    const yaml = buildDreamWorkflowYaml({
+      specPath: "crewhaus.yaml",
+      everyMs: 86_400_000,
+      harnessDir: "agents/support",
+    });
+    expect(yaml).toContain("working-directory: agents/support");
+    expect(yaml).toContain("crewhaus dream run crewhaus.yaml");
   });
 });

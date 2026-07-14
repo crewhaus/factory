@@ -577,10 +577,43 @@ const memoryWikiBlock = z
 
 /**
  * The shared duration-string grammar (Phase 3 §3.1 heartbeat, v0.3.0
- * `memory.ttl`). Extended with `d` (days) in 0.3.0. Parsed to milliseconds
- * at lower time by the compiler's `parseDurationToMs`.
+ * `memory.ttl` and `memory.dream.every`). Extended with `d` (days) in
+ * 0.3.0. Parsed to milliseconds at lower time by the compiler's
+ * `parseDurationToMs`.
  */
 const DURATION_REGEX = /^\d+(?:ms|s|m|h|d)$/;
+
+/**
+ * v0.3.0 Goal 5 (§6/§9) — the `memory.dream` sub-block: scheduled memory
+ * consolidation. Nested under `memory:` because it consolidates the memory
+ * fabric (facts + wiki + continuity's spec-scoped agenda) — one shared zod
+ * object, minimal union churn.
+ *
+ *   - `every` (required): the consolidation cadence in the shared duration
+ *     grammar (`"24h"`, `"1d"`). Must be >= 5m (enforced at lower time) —
+ *     consolidation is a maintenance pass, not a per-turn hook.
+ *   - `mode`: `full` (default — deterministic phase + ONE bounded model
+ *     synthesis session) | `deterministic` (no model, ever).
+ *   - `budget_usd`: the model phase's item-27 spend cap (OPTIMIZABLE,
+ *     PR 20). `0` — or omitting it — means deterministic only, regardless
+ *     of `mode`; unattended model spend must be opted into by number.
+ *   - `instructions`: optional playbook override; the default is the
+ *     builtin `dream` skill body.
+ * `.strict()` so a typo'd sub-key fails the build.
+ */
+const memoryDreamBlock = z
+  .object({
+    every: z
+      .string()
+      .regex(
+        DURATION_REGEX,
+        'memory.dream.every must be a duration like "24h", "1d", "30m", or "300s"',
+      ),
+    mode: z.enum(["deterministic", "full"]).optional(),
+    budget_usd: z.number().nonnegative().optional(),
+    instructions: z.string().min(1).optional(),
+  })
+  .strict();
 
 /**
  * Feature #53 — cross-session memory block. Its mere presence wires the
@@ -601,6 +634,7 @@ const DURATION_REGEX = /^\d+(?:ms|s|m|h|d)$/;
  *     string in the heartbeat grammar extended with `d` (days) — e.g. "90d".
  *     Must be >= 1h (enforced at lower time); omit to keep facts forever.
  *   - `wiki`: the semantic tier (see {@link memoryWikiBlock}).
+ *   - `dream`: scheduled consolidation (see {@link memoryDreamBlock}, §6).
  * `.strict()` so a typo'd sub-key fails the build.
  */
 const memoryBlock = z
@@ -619,6 +653,7 @@ const memoryBlock = z
     autoRecall: z.boolean().optional(),
     recallK: z.number().int().positive().max(50).optional(),
     wiki: memoryWikiBlock.optional(),
+    dream: memoryDreamBlock.optional(),
   })
   .strict()
   .optional();
@@ -1680,6 +1715,8 @@ export type SpecSecurityBlock = z.infer<typeof securityBlock>;
 export type SpecFeedbackBlock = z.infer<typeof feedbackBlock>;
 export type SpecMemoryBlock = z.infer<typeof memoryBlock>;
 export type SpecMemoryWikiBlock = z.infer<typeof memoryWikiBlock>;
+/** The `memory.dream` scheduled-consolidation sub-block (v0.3.0 §6). */
+export type SpecMemoryDreamBlock = z.infer<typeof memoryDreamBlock>;
 /** The `continuity:` object form (v0.3.0 §2.1). */
 export type SpecContinuityObject = z.infer<typeof continuityObject>;
 /** The full `continuity:` surface: boolean shorthand or the object form. */
