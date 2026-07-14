@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { RunFailedError } from "@crewhaus/errors";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { z } from "zod";
 import { ToolPermissionError, executeTool } from "./index";
@@ -111,5 +112,41 @@ describe("ToolPermissionError", () => {
     expect(err.code).toBe("tool");
     expect(err.name).toBe("ToolPermissionError");
     expect(err.toolName).toBe("Bash");
+  });
+});
+
+describe("executeTool — RunFailedError propagates (v0.3.0 §7.1)", () => {
+  test("a RunFailedError thrown by a tool is RETHROWN, not stringified into an error result", async () => {
+    const report = {
+      class: "billing" as const,
+      title: "provider account out of funding",
+      detail: 'Anthropic said: "credit balance too low"',
+      remediation: "add credits, then rerun.",
+      exitCode: 31,
+    };
+    const failTool = makeEchoTool({
+      execute: async () => {
+        throw new RunFailedError(report);
+      },
+    });
+    let thrown: unknown;
+    try {
+      await executeTool(failTool, { command: "x" }, { toolUseId: "10" });
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(RunFailedError);
+    expect((thrown as RunFailedError).report).toEqual(report);
+  });
+
+  test("every other throw keeps the pre-0.3.0 error-result shape", async () => {
+    const failTool = makeEchoTool({
+      execute: async () => {
+        throw new Error("ordinary failure");
+      },
+    });
+    const result = await executeTool(failTool, { command: "x" }, { toolUseId: "11" });
+    expect(result.isError).toBe(true);
+    expect(result.content).toBe("ordinary failure");
   });
 });

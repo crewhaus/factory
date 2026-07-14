@@ -52,6 +52,7 @@ import type {
   GoalUpdateEventPayload,
   PlanUpdateEventPayload,
 } from "@crewhaus/event-log";
+import { type RunContext, formatAgentIdentity } from "@crewhaus/run-context";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog";
 import { z } from "zod";
@@ -293,6 +294,20 @@ export function createPlanTools(opts: CreatePlanToolsOptions): PlanToolBundle {
     return ctx?.runContext?.sessionId ?? opts.sessionId;
   }
 
+  /** v0.3.0 §7.1 — attribution: stamp the acting run context's identity
+   *  (e.g. `subagent=researcher`) into emitted event payloads so a plan
+   *  mutation made from inside a sub-agent records WHO acted. Mirrors
+   *  tool-wiki's `createdBy` stamping: prefers `ctx.runContext`, falls back
+   *  to the opaque bridge's runContext (the field the runtime threads on
+   *  every tool execute). Empty for top-level runs. */
+  function identityOf(ctx?: ToolExecuteContext): { agentIdentity: string } | Record<string, never> {
+    const rc =
+      ctx?.runContext ?? (ctx?.bridge as { runContext?: RunContext } | undefined)?.runContext;
+    return rc?.agentIdentity !== undefined
+      ? { agentIdentity: formatAgentIdentity(rc.agentIdentity) }
+      : {};
+  }
+
   /** §2.5 — flag the runtime's per-run state-store after a successful
    *  mutation so the loop re-renders the plan tail before the next model
    *  call. No-op when the runtime didn't wire `bridge.runState` (pre-0.3.0
@@ -391,7 +406,7 @@ export function createPlanTools(opts: CreatePlanToolsOptions): PlanToolBundle {
           });
           await emit({
             kind: "plan_update",
-            payload: { planId: plan.id, action: "create", title: plan.title },
+            payload: { planId: plan.id, action: "create", title: plan.title, ...identityOf(ctx) },
           });
           markPlanDirty(ctx);
           return `created ${plan.id} — ${plan.title} (${plan.steps.length} step(s))\n${renderPlan(plan)}`;
@@ -401,7 +416,7 @@ export function createPlanTools(opts: CreatePlanToolsOptions): PlanToolBundle {
           const plan = await store.addStep(planId, input.text);
           await emit({
             kind: "plan_update",
-            payload: { planId, action: "add_step", step: plan.steps.length },
+            payload: { planId, action: "add_step", step: plan.steps.length, ...identityOf(ctx) },
           });
           markPlanDirty(ctx);
           return `added step ${plan.steps.length} to ${planId}`;
@@ -416,6 +431,7 @@ export function createPlanTools(opts: CreatePlanToolsOptions): PlanToolBundle {
               action: "set_step_status",
               step: input.step,
               status: input.status,
+              ...identityOf(ctx),
             },
           });
           markPlanDirty(ctx);
@@ -427,7 +443,7 @@ export function createPlanTools(opts: CreatePlanToolsOptions): PlanToolBundle {
           await store.setActivePlan(input.planId);
           await emit({
             kind: "plan_update",
-            payload: { planId: input.planId, action: "set_active" },
+            payload: { planId: input.planId, action: "set_active", ...identityOf(ctx) },
           });
           markPlanDirty(ctx);
           return `active plan → ${input.planId}`;
@@ -465,13 +481,20 @@ export function createPlanTools(opts: CreatePlanToolsOptions): PlanToolBundle {
                 step: input.step,
                 toolUseId: proof.toolUseId,
                 verdict: "verified",
+                ...identityOf(ctx),
               },
             });
           }
         }
         await emit({
           kind: "plan_update",
-          payload: { planId, action: "prove_step", step: input.step, status: "proven" },
+          payload: {
+            planId,
+            action: "prove_step",
+            step: input.step,
+            status: "proven",
+            ...identityOf(ctx),
+          },
         });
         markPlanDirty(ctx);
         return `${planId} step ${input.step} proven — evidence: ${refs
@@ -487,6 +510,7 @@ export function createPlanTools(opts: CreatePlanToolsOptions): PlanToolBundle {
               step: input.step,
               toolUseId: err.toolUseId,
               verdict: err.verdict,
+              ...identityOf(ctx),
             },
           });
         }
@@ -510,7 +534,7 @@ export function createPlanTools(opts: CreatePlanToolsOptions): PlanToolBundle {
       });
       await emit({
         kind: "goal_update",
-        payload: { goalId: goal.id, action: "create", title: goal.title },
+        payload: { goalId: goal.id, action: "create", title: goal.title, ...identityOf(ctx) },
       });
       markPlanDirty(ctx);
       return `created ${goal.id} — ${goal.title}`;
@@ -547,6 +571,7 @@ export function createPlanTools(opts: CreatePlanToolsOptions): PlanToolBundle {
           goalId: goal.id,
           action: "update",
           ...(input.status !== undefined ? { status: input.status } : {}),
+          ...identityOf(ctx),
         },
       });
       markPlanDirty(ctx);

@@ -27,7 +27,13 @@
  * References: claude-code/query.ts recovery branches; agent-framework
  * _runner.py retry; AI-Harness-Systems §recovery.
  */
-import { CrewhausError, EXIT_CODES, type FailureClass, type FailureReport } from "@crewhaus/errors";
+import {
+  CrewhausError,
+  EXIT_CODES,
+  type FailureClass,
+  type FailureReport,
+  isRunFailedError,
+} from "@crewhaus/errors";
 
 export type RecoveryAction =
   | { readonly kind: "compact" }
@@ -422,6 +428,14 @@ export function recover(
   state: RecoveryState,
   taxonomy?: ReadonlyArray<NamedFailureClass>,
 ): RecoveryAction {
+  // v0.3.0 §7.1 — an error that ALREADY carries a classified terminal report
+  // (a child run's RunFailedError escalated through the sub-agent spawner)
+  // halts with that report verbatim: no re-classification, no retry ladder,
+  // and the user taxonomy cannot downgrade an already-terminal verdict —
+  // "a billing failure anywhere ends the run with the billing message".
+  if (isRunFailedError(error)) {
+    return { kind: "halt", report: error.report };
+  }
   if (taxonomy !== undefined && taxonomy.length > 0) {
     const named = matchNamedFailure(error, taxonomy);
     if (named !== undefined) {

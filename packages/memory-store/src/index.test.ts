@@ -14,14 +14,18 @@ import { createEmbedder } from "@crewhaus/embedder";
 import {
   DEFAULT_AUTO_CAPTURE_THRESHOLD,
   DEFAULT_AUTO_RECALL_K,
+  MAX_CAPTURE_EVENTS_PER_CHILD,
   MEMORY_SCHEMA_VERSION,
   MemoryStoreError,
+  type SessionEvent,
+  captureChildFacts,
   captureFacts,
   createMemoryStore,
   deriveMemoryDecision,
   summarizeDurableFacts,
   summarizeDurableFactsWithEvidence,
   turnsFromEvents,
+  turnsFromEventsWithChildren,
 } from "./index";
 
 let tmp: string;
@@ -592,5 +596,194 @@ describe("summarizeDurableFactsWithEvidence (v2)", () => {
       { input: "q1", output: "The build uses Bun.", toolUseIds: ["tu_a"] },
     ]);
     expect(facts).toEqual(["The build uses Bun."]);
+  });
+});
+
+// -------- v0.3.0 §7.1: capture walks sub-agent brackets into child logs --------
+
+function userEvent(text: string): SessionEvent {
+  return { kind: "user_message", payload: { content: text } };
+}
+function assistantEvent(text: string): SessionEvent {
+  return { kind: "assistant_message", payload: { content: text } };
+}
+function toolResultEvent(toolUseId: string, isError = false): SessionEvent {
+  return { kind: "tool_result", payload: { toolUseId, content: "ok", isError } };
+}
+function subAgentStart(name: string, childSessionId: string): SessionEvent {
+  return { kind: "sub_agent_start", payload: { name, childSessionId, prompt: "go" } };
+}
+function subAgentEnd(name: string, childSessionId: string): SessionEvent {
+  return { kind: "sub_agent_end", payload: { name, childSessionId, isError: false } };
+}
+
+const PARENT_EVENTS: SessionEvent[] = [
+  userEvent("research the topic"),
+  subAgentStart("researcher", "sess_aaaaaaaaaaaaaaaa"),
+  subAgentEnd("researcher", "sess_aaaaaaaaaaaaaaaa"),
+  subAgentStart("researcher", "sess_bbbbbbbbbbbbbbbb"),
+  subAgentEnd("researcher", "sess_bbbbbbbbbbbbbbbb"),
+  assistantEvent("Both researchers reported back."),
+];
+
+const CHILD_A: SessionEvent[] = [
+  userEvent("dig into A"),
+  toolResultEvent("tu_child_a"),
+  assistantEvent("Finding A: the API rate limit is 60 rpm."),
+];
+
+describe("turnsFromEventsWithChildren (§7.1)", () => {
+  test("walks sub_agent_start brackets lazily and returns per-child turns; parent turns unchanged", async () => {
+    const reads: Array<[string, number]> = [];
+    const childB: SessionEvent[] = [
+      userEvent("dig into B"),
+      assistantEvent("Finding B: retries use exponential backoff."),
+    ];
+    const { turns, children } = await turnsFromEventsWithChildren(
+      PARENT_EVENTS,
+      (childId, maxEvents) => {
+        reads.push([childId, maxEvents]);
+        return childId === "sess_aaaaaaaaaaaaaaaa" ? CHILD_A : childB;
+      },
+    );
+    // Parent turns identical to the plain extractor.
+    expect(turns).toEqual(turnsFromEvents(PARENT_EVENTS));
+    expect(children).toHaveLength(2);
+    expect(children[0]?.sessionId).toBe("sess_aaaaaaaaaaaaaaaa");
+    expect(children[0]?.name).toBe("researcher");
+    expect(children[0]?.turns).toEqual([
+      {
+        input: "dig into A",
+        output: "Finding A: the API rate limit is 60 rpm.",
+        toolUseIds: ["tu_child_a"],
+      },
+    ]);
+    expect(children[0]?.truncated).toBe(false);
+    expect(children[1]?.sessionId).toBe("sess_bbbbbbbbbbbbbbbb");
+    // Lazy + capped: exactly one read per bracket, cap forwarded.
+    expect(reads).toEqual([
+      ["sess_aaaaaaaaaaaaaaaa", MAX_CAPTURE_EVENTS_PER_CHILD],
+      ["sess_bbbbbbbbbbbbbbbb", MAX_CAPTURE_EVENTS_PER_CHILD],
+    ]);
+  });
+
+  test("enforces the per-child cap: an oversized child is sliced and flagged truncated", async () => {
+    const cap = 4;
+    // Oversized reader IGNORES maxEvents (worst case) — the walker slices.
+    const oversized: SessionEvent[] = [
+      userEvent("first turn"),
+      assistantEvent("early finding survives the cap"),
+      userEvent("second turn"),
+      assistantEvent("also inside the cap"),
+      // -- beyond the cap of 4 --
+      userEvent("third turn"),
+      assistantEvent("beyond-the-cap finding must NOT be captured"),
+    ];
+    const { children } = await turnsFromEventsWithChildren(
+      [subAgentStart("researcher", "sess_cccccccccccccccc")],
+      () => oversized,
+      { maxEventsPerChild: cap },
+    );
+    expect(children).toHaveLength(1);
+    expect(children[0]?.truncated).toBe(true);
+    expect(children[0]?.turns).toEqual(turnsFromEvents(oversized.slice(0, cap)));
+    expect(JSON.stringify(children[0]?.turns)).not.toContain("beyond-the-cap");
+  });
+
+  test("dedupes repeated childSessionIds and skips unreadable/undefined children", async () => {
+    const events: SessionEvent[] = [
+      subAgentStart("researcher", "sess_aaaaaaaaaaaaaaaa"),
+      subAgentStart("researcher", "sess_aaaaaaaaaaaaaaaa"), // duplicate bracket
+      subAgentStart("broken", "sess_dddddddddddddddd"), // reader throws
+      subAgentStart("missing", "sess_eeeeeeeeeeeeeeee"), // reader → undefined
+    ];
+    let reads = 0;
+    const { children } = await turnsFromEventsWithChildren(events, (childId) => {
+      reads += 1;
+      if (childId === "sess_dddddddddddddddd") throw new Error("ENOENT");
+      if (childId === "sess_eeeeeeeeeeeeeeee") return undefined;
+      return CHILD_A;
+    });
+    expect(children).toHaveLength(1);
+    expect(children[0]?.sessionId).toBe("sess_aaaaaaaaaaaaaaaa");
+    expect(reads).toBe(3); // dedupe prevented a 4th read
+  });
+
+  test("no brackets → no children, no reader calls", async () => {
+    let reads = 0;
+    const { turns, children } = await turnsFromEventsWithChildren(
+      [userEvent("plain"), assistantEvent("run")],
+      () => {
+        reads += 1;
+        return [];
+      },
+    );
+    expect(children).toEqual([]);
+    expect(reads).toBe(0);
+    expect(turns).toHaveLength(1);
+  });
+
+  test("MAX_CAPTURE_EVENTS_PER_CHILD is the documented default (2000)", () => {
+    expect(MAX_CAPTURE_EVENTS_PER_CHILD).toBe(2000);
+  });
+});
+
+describe("captureChildFacts (§7.1)", () => {
+  test("child facts land with provenance {sessionId: <child>} + subagent:<name> tag + evidence", async () => {
+    const store = createMemoryStore({ specName: "child-cap", rootDir: tmp });
+    const written = await captureChildFacts(
+      store,
+      [
+        {
+          sessionId: "sess_aaaaaaaaaaaaaaaa",
+          name: "researcher",
+          turns: [
+            {
+              input: "dig into A",
+              output: "Finding A: the API rate limit is 60 rpm.",
+              toolUseIds: ["tu_child_a"],
+            },
+          ],
+          truncated: false,
+        },
+        {
+          sessionId: "sess_bbbbbbbbbbbbbbbb",
+          name: "researcher",
+          turns: [{ input: "dig into B", output: "Finding B: retries use backoff." }],
+          truncated: false,
+        },
+      ],
+      ["auto-capture", "sess_parent00000000"],
+    );
+    expect(written).toHaveLength(2);
+    expect(written[0]?.tags).toEqual([
+      "auto-capture",
+      "sess_parent00000000",
+      "subagent:researcher",
+    ]);
+    expect(written[0]?.provenance).toEqual({
+      sessionId: "sess_aaaaaaaaaaaaaaaa",
+      evidence: ["tu_child_a"],
+    });
+    expect(written[1]?.provenance).toEqual({ sessionId: "sess_bbbbbbbbbbbbbbbb" });
+    // Idempotent like captureFacts: a re-run writes nothing.
+    const again = await captureChildFacts(store, [
+      {
+        sessionId: "sess_aaaaaaaaaaaaaaaa",
+        name: "researcher",
+        turns: [{ input: "dig into A", output: "Finding A: the API rate limit is 60 rpm." }],
+        truncated: false,
+      },
+    ]);
+    expect(again).toHaveLength(0);
+  });
+
+  test("children with no durable facts write nothing", async () => {
+    const store = createMemoryStore({ specName: "child-empty", rootDir: tmp });
+    const written = await captureChildFacts(store, [
+      { sessionId: "sess_ffffffffffffffff", name: "quiet", turns: [], truncated: false },
+    ]);
+    expect(written).toHaveLength(0);
+    expect(await store.size()).toBe(0);
   });
 });

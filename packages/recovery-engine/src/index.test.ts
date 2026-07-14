@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { RunFailedError } from "@crewhaus/errors";
 import {
   BUDGETS,
   BUILTIN_FAILURE_CLASSES,
@@ -758,5 +759,35 @@ describe("RecoveryEngineError", () => {
       message: "wrapped",
       cause: { name: "Error", message: "upstream" },
     });
+  });
+});
+
+describe("v0.3.0 §7.1 — an escalated RunFailedError halts with its report verbatim", () => {
+  const report = {
+    class: "billing" as const,
+    title: "provider account out of funding",
+    detail: 'Anthropic said: "credit balance too low"',
+    remediation: "add credits, then rerun.",
+    exitCode: 31,
+  };
+
+  test("recover() passes an already-classified report through — no re-classification", () => {
+    const action = recover(new RunFailedError(report), initialRecoveryState);
+    expect(action).toEqual({ kind: "halt", report });
+  });
+
+  test("the user taxonomy cannot downgrade an already-terminal verdict", () => {
+    const taxonomy: NamedFailureClass[] = [
+      // Pattern matches the RunFailedError's message — must NOT win.
+      { class: "swallow-it", pattern: "run stopped", recovery: "continue" },
+    ];
+    const action = recover(new RunFailedError(report), initialRecoveryState, taxonomy);
+    expect(action).toEqual({ kind: "halt", report });
+  });
+
+  test("a duck-typed wire twin (bundler realm split) passes through too", () => {
+    const twin = { name: "RunFailedError", message: "run stopped", report };
+    const action = recover(twin, initialRecoveryState);
+    expect(action).toEqual({ kind: "halt", report });
   });
 });

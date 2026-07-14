@@ -429,3 +429,63 @@ describe("appendEvent seam against the real event-log union (v0.3.0 integration)
     await log.close();
   });
 });
+
+describe("agentIdentity attribution (v0.3.0 §7.1)", () => {
+  test("a PlanUpdate executed from a sub-agent's context records the child's identity in the event payload", async () => {
+    const bundle = makeTools();
+    // Mirrors how a child loop threads its RunContext: through the opaque
+    // bridge (tool-executor forwards `bridge`; `ctx.runContext` may be
+    // absent). The spawner stamps agentIdentity at child mint time.
+    const childCtx = {
+      bridge: {
+        runContext: { sessionId: SESS, agentIdentity: { subAgentId: "researcher" } },
+      },
+    } as unknown as Parameters<NonNullable<typeof bundle.planUpdate.execute>>[1];
+
+    await bundle.planUpdate.execute(
+      { action: "create", title: "child-made plan", steps: ["step one"] },
+      childCtx,
+    );
+    const create = events.find((e) => e.kind === "plan_update" && e.payload.action === "create");
+    expect(create).toBeDefined();
+    expect((create?.payload as { agentIdentity?: string }).agentIdentity).toBe(
+      "subagent=researcher",
+    );
+
+    // The whole family carries it: set_step_status + goal_update too.
+    await bundle.planUpdate.execute(
+      { action: "set_step_status", planId: "plan-0001", step: 1, status: "claimed" },
+      childCtx,
+    );
+    const setStatus = events.find(
+      (e) => e.kind === "plan_update" && e.payload.action === "set_step_status",
+    );
+    expect((setStatus?.payload as { agentIdentity?: string }).agentIdentity).toBe(
+      "subagent=researcher",
+    );
+    await bundle.goalWrite.execute({ title: "child goal" }, childCtx);
+    const goal = events.find((e) => e.kind === "goal_update");
+    expect((goal?.payload as { agentIdentity?: string }).agentIdentity).toBe("subagent=researcher");
+  });
+
+  test("ctx.runContext takes precedence over the bridge fallback", async () => {
+    const bundle = makeTools();
+    const ctx = {
+      runContext: { sessionId: SESS, agentIdentity: { skillId: "review" } },
+      bridge: {
+        runContext: { sessionId: SESS, agentIdentity: { subAgentId: "shadowed" } },
+      },
+    } as unknown as Parameters<NonNullable<typeof bundle.planUpdate.execute>>[1];
+    await bundle.planUpdate.execute({ action: "create", title: "p" }, ctx);
+    const create = events.find((e) => e.kind === "plan_update" && e.payload.action === "create");
+    expect((create?.payload as { agentIdentity?: string }).agentIdentity).toBe("skill=review");
+  });
+
+  test("top-level runs (no identity) emit payloads WITHOUT the field — pre-0.3.0 shape", async () => {
+    const bundle = makeTools();
+    await bundle.planUpdate.execute({ action: "create", title: "top-level plan" }, undefined);
+    const create = events.find((e) => e.kind === "plan_update" && e.payload.action === "create");
+    expect(create).toBeDefined();
+    expect("agentIdentity" in (create?.payload ?? {})).toBe(false);
+  });
+});

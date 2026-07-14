@@ -7,6 +7,7 @@
   "references": [
     { "path": "../continuity-store" },
     { "path": "../event-log" },
+    { "path": "../run-context" },
     { "path": "../tool-builder" },
     { "path": "../tool-catalog" }
   ],

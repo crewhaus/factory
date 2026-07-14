@@ -751,6 +751,94 @@ function toolResultUseId(payload: unknown): string | undefined {
   return p.toolUseId;
 }
 
+// -------- v0.3.0 §7.1: capture walks sub-agent brackets into child logs --------
+
+/**
+ * Per-child event-read cap for the sub-agent capture walk. A researcher
+ * fan-out can leave arbitrarily large child session JSONLs behind; the walk
+ * reads AT MOST this many events per child (readers get the cap so they can
+ * stop early; the walker slices defensively regardless). 2000 events is
+ * roughly a few hundred turns — far beyond what a single-turn sub-agent
+ * produces, small enough that a 50-child fan-out stays bounded.
+ */
+export const MAX_CAPTURE_EVENTS_PER_CHILD = 2000;
+
+/**
+ * Read one child session's parsed events. `maxEvents` is the per-child cap
+ * (see {@link MAX_CAPTURE_EVENTS_PER_CHILD}) — implementations SHOULD stop
+ * reading past it (e.g. slice the parsed JSONL lines); the walker slices
+ * defensively either way. Return `undefined` (or throw) for an unreadable /
+ * missing child log — the walker skips that child.
+ */
+export type ChildSessionEventsReader = (
+  childSessionId: string,
+  maxEvents: number,
+) => readonly SessionEvent[] | undefined | Promise<readonly SessionEvent[] | undefined>;
+
+/** One child session's capturable turns, keyed for provenance/tagging. */
+export type ChildCapturableTurns = {
+  /** The child's own sessionId — stamped into `provenance.sessionId`. */
+  readonly sessionId: string;
+  /** The sub-agent definition name — becomes the `subagent:<name>` tag. */
+  readonly name: string;
+  readonly turns: CapturableTurn[];
+  /** True when the reader supplied more events than the cap (input was cut). */
+  readonly truncated: boolean;
+};
+
+export type TurnsWithChildren = {
+  /** The parent session's turns — identical to `turnsFromEvents(events)`. */
+  readonly turns: CapturableTurn[];
+  readonly children: ChildCapturableTurns[];
+};
+
+/**
+ * `turnsFromEvents` extended with the sub-agent walk: follows the parent
+ * log's `sub_agent_start` brackets (payload `{name, childSessionId}` — the
+ * spawner appends one per spawn, before the matching `sub_agent_end`) and
+ * lazily reads each referenced child session's events through the injected
+ * reader, capped per child. Children are deduped by `childSessionId`;
+ * unreadable child logs are skipped. This is THE shared helper both memory
+ * wiring paths (target-cli codegen and the apps/cli interpreter) consume so
+ * researcher sub-agent findings stop being structurally invisible to
+ * auto-capture.
+ */
+export async function turnsFromEventsWithChildren(
+  events: readonly SessionEvent[],
+  readChildEvents: ChildSessionEventsReader,
+  opts: { maxEventsPerChild?: number } = {},
+): Promise<TurnsWithChildren> {
+  const cap = Math.max(1, opts.maxEventsPerChild ?? MAX_CAPTURE_EVENTS_PER_CHILD);
+  const children: ChildCapturableTurns[] = [];
+  const seen = new Set<string>();
+  for (const ev of events) {
+    if (ev.kind !== "sub_agent_start") continue;
+    const p = ev.payload as { childSessionId?: unknown; name?: unknown } | null | undefined;
+    const childSessionId = typeof p?.childSessionId === "string" ? p.childSessionId : undefined;
+    if (childSessionId === undefined || childSessionId === "" || seen.has(childSessionId)) {
+      continue;
+    }
+    seen.add(childSessionId);
+    const name = typeof p?.name === "string" && p.name !== "" ? p.name : "unknown";
+    let childEvents: readonly SessionEvent[] | undefined;
+    try {
+      childEvents = await readChildEvents(childSessionId, cap);
+    } catch {
+      childEvents = undefined;
+    }
+    if (childEvents === undefined) continue;
+    const truncated = childEvents.length > cap;
+    const capped = truncated ? childEvents.slice(0, cap) : childEvents;
+    children.push({
+      sessionId: childSessionId,
+      name,
+      turns: turnsFromEvents(capped),
+      truncated,
+    });
+  }
+  return { turns: turnsFromEvents(events), children };
+}
+
 /** A durable fact plus the toolUseIds that ground it (may be empty). */
 export type DurableFact = {
   readonly text: string;
@@ -859,6 +947,44 @@ export async function captureFacts(
         ...(provenance !== undefined ? { provenance } : {}),
         ...(opts.ttlMs !== undefined ? { ttlMs: opts.ttlMs } : {}),
       }),
+    );
+  }
+  return written;
+}
+
+export type CaptureChildFactsOptions = {
+  /** TTL applied to each written entry. */
+  readonly ttlMs?: number;
+  /** Per-child fact cap forwarded to `summarizeDurableFactsWithEvidence`. */
+  readonly maxFactsPerChild?: number;
+};
+
+/**
+ * v0.3.0 §7.1 — persist the durable facts of walked child sessions (from
+ * {@link turnsFromEventsWithChildren}). Each child's facts land with
+ * `provenance.sessionId` set to the CHILD's sessionId (so proof/evidence
+ * resolution walks the right log) and a `subagent:<name>` tag appended to
+ * `baseTags` (so researcher findings are grep-able by sub-agent). Same
+ * idempotent dedupe as {@link captureFacts}. Returns everything written.
+ */
+export async function captureChildFacts(
+  store: MemoryStore,
+  children: ReadonlyArray<ChildCapturableTurns>,
+  baseTags: readonly string[] = ["auto-capture"],
+  opts: CaptureChildFactsOptions = {},
+): Promise<MemoryEntry[]> {
+  const written: MemoryEntry[] = [];
+  for (const child of children) {
+    const facts = summarizeDurableFactsWithEvidence(
+      child.turns,
+      opts.maxFactsPerChild !== undefined ? { maxFacts: opts.maxFactsPerChild } : {},
+    );
+    if (facts.length === 0) continue;
+    written.push(
+      ...(await captureFacts(store, facts, [...baseTags, `subagent:${child.name}`], {
+        sessionId: child.sessionId,
+        ...(opts.ttlMs !== undefined ? { ttlMs: opts.ttlMs } : {}),
+      })),
     );
   }
   return written;
