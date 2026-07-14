@@ -4,12 +4,16 @@ import {
   CompilerError,
   ConfigError,
   CrewhausError,
+  EXIT_CODES,
+  type FailureReport,
   McpConnectionError,
   McpError,
   McpProtocolError,
   ProviderAuthError,
+  RunFailedError,
   RuntimeError,
   SpecParseError,
+  formatRunFailure,
 } from "./index";
 
 describe("CrewhausError", () => {
@@ -127,6 +131,119 @@ describe("AdapterError", () => {
       message: "stream parse failed",
       cause: { name: "Error", message: "EOF" },
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v0.3.0 Goal 6 — failure-taxonomy core.
+// ---------------------------------------------------------------------------
+
+const BILLING_REPORT: FailureReport = {
+  class: "billing",
+  title: "provider account out of funding",
+  detail: 'Anthropic said: "Your credit balance is too low to access the Anthropic API."',
+  remediation: "add credits at https://console.anthropic.com/settings/billing, then rerun.",
+  exitCode: EXIT_CODES.billing,
+};
+
+describe("EXIT_CODES", () => {
+  test("pins the documented exit-code table", () => {
+    expect(EXIT_CODES).toEqual({
+      ok: 0,
+      generic: 1,
+      spec: 20,
+      config: 21,
+      auth: 30,
+      billing: 31,
+      rate_limit: 32,
+      crewhaus_budget: 33,
+      tool: 40,
+    });
+  });
+});
+
+describe("RunFailedError", () => {
+  test("carries the report and composes a one-line message from it", () => {
+    const err = new RunFailedError(BILLING_REPORT);
+    expect(err.report).toBe(BILLING_REPORT);
+    expect(err.message).toBe(
+      'run stopped — provider account out of funding: Anthropic said: "Your credit balance is too low to access the Anthropic API."',
+    );
+    expect(err.name).toBe("RunFailedError");
+  });
+
+  test("subclasses RuntimeError so existing CrewhausError catch sites still fire", () => {
+    const err = new RunFailedError(BILLING_REPORT);
+    expect(err).toBeInstanceOf(RunFailedError);
+    expect(err).toBeInstanceOf(RuntimeError);
+    expect(err).toBeInstanceOf(CrewhausError);
+    expect(err).toBeInstanceOf(Error);
+    expect(err.code).toBe("runtime");
+  });
+
+  test("preserves the offending provider error via cause", () => {
+    const sdkErr = new Error("400 credit balance too low");
+    const err = new RunFailedError(BILLING_REPORT, sdkErr);
+    expect(err.cause).toBe(sdkErr);
+    expect(err.toJSON().cause).toEqual({
+      name: "Error",
+      message: "400 credit balance too low",
+    });
+  });
+});
+
+describe("formatRunFailure", () => {
+  test("renders the canonical multi-line billing failure", () => {
+    expect(formatRunFailure(BILLING_REPORT)).toBe(
+      [
+        "✗ run stopped — provider account out of funding",
+        '  Anthropic said: "Your credit balance is too low to access the Anthropic API."',
+        "  Fix: add credits at https://console.anthropic.com/settings/billing, then rerun.",
+        "  (exit 31)",
+      ].join("\n"),
+    );
+  });
+
+  test("opts.prefix replaces the leading glyph (CLI die() style)", () => {
+    const out = formatRunFailure(BILLING_REPORT, { prefix: "crewhaus:" });
+    expect(out.startsWith("crewhaus: run stopped — provider account out of funding\n")).toBe(true);
+  });
+
+  test("omits Fix/Docs lines when absent and still prints the exit code", () => {
+    const report: FailureReport = {
+      class: "unknown",
+      title: "recovery failed",
+      detail: "something the taxonomy cannot classify",
+      exitCode: EXIT_CODES.generic,
+    };
+    expect(formatRunFailure(report)).toBe(
+      [
+        "✗ run stopped — recovery failed",
+        "  something the taxonomy cannot classify",
+        "  (exit 1)",
+      ].join("\n"),
+    );
+  });
+
+  test("renders a Docs line and indents multi-line detail", () => {
+    const report: FailureReport = {
+      class: "auth",
+      title: "provider rejected the credentials",
+      detail: "line one\nline two",
+      remediation: "check the key.",
+      exitCode: EXIT_CODES.auth,
+      docsUrl: "https://docs.crewhaus.ai/failures#auth",
+    };
+    expect(formatRunFailure(report)).toBe(
+      [
+        "✗ run stopped — provider rejected the credentials",
+        "  line one",
+        "  line two",
+        "  Fix: check the key.",
+        "  Docs: https://docs.crewhaus.ai/failures#auth",
+        "  (exit 30)",
+      ].join("\n"),
+    );
   });
 });
 
