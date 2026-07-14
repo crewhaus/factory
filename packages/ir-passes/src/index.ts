@@ -510,6 +510,9 @@ function carriesMemoryFabric(ir: IrNode): ir is IrNode & CarriesMemoryFabric {
 
 const MEMORY_TTL_MIN_MS = 60 * 60 * 1000;
 
+/** Mirror of the compiler's load-bearing `memory.dream.every` floor (PR 14). */
+const DREAM_EVERY_MIN_MS = 5 * 60 * 1000;
+
 /** Deep JSON-serializability check: value must survive a round-trip
  *  unchanged (rejects functions/undefined/Dates/NaN/cycles — anything
  *  `JSON.stringify` drops or rewrites). */
@@ -554,6 +557,11 @@ export function memoryIntegrityPass(ir: IrNode): IrNode {
   if (memory?.ttlMs !== undefined && memory.ttlMs < MEMORY_TTL_MIN_MS) {
     throw new IrPassError(
       `memory.ttlMs ${memory.ttlMs} is below the 1h floor (${MEMORY_TTL_MIN_MS}ms) — a sub-hour fact TTL expires memories mid-session`,
+    );
+  }
+  if (memory?.dream !== undefined && memory.dream.everyMs < DREAM_EVERY_MIN_MS) {
+    throw new IrPassError(
+      `memory.dream.everyMs ${memory.dream.everyMs} is below the 5m floor (${DREAM_EVERY_MIN_MS}ms) — consolidation is a scheduled maintenance pass, not a per-turn hook`,
     );
   }
   if (continuity?.scope === "session" && ir.target !== "channel") {

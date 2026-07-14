@@ -597,6 +597,20 @@
         "@crewhaus/errors": "workspace:*",
       },
     },
+    "packages/dream-engine": {
+      "name": "@crewhaus/dream-engine",
+      "version": "0.2.4",
+      "dependencies": {
+        "@crewhaus/continuity-store": "workspace:*",
+        "@crewhaus/cost-tracker": "workspace:*",
+        "@crewhaus/durable-execution": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/infra-utils": "workspace:*",
+        "@crewhaus/memory-store": "workspace:*",
+        "@crewhaus/session-store": "workspace:*",
+        "@crewhaus/wiki-store": "workspace:*",
+      },
+    },
     "packages/durable-execution": {
       "name": "@crewhaus/durable-execution",
       "version": "0.2.4",
@@ -959,6 +973,7 @@
       "dependencies": {
         "@crewhaus/continuity-store": "workspace:*",
         "@crewhaus/default-skills": "workspace:*",
+        "@crewhaus/dream-engine": "workspace:*",
         "@crewhaus/embedder": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/memory-store": "workspace:*",
@@ -2358,6 +2373,8 @@
     "@crewhaus/deployment-controller": ["@crewhaus/deployment-controller@workspace:packages/deployment-controller"],
 
     "@crewhaus/docker-images": ["@crewhaus/docker-images@workspace:packages/docker-images"],
+
+    "@crewhaus/dream-engine": ["@crewhaus/dream-engine@workspace:packages/dream-engine"],
 
     "@crewhaus/durable-execution": ["@crewhaus/durable-execution@workspace:packages/durable-execution"],
 

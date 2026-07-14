@@ -849,6 +849,12 @@ type SpecWithMemory = {
       readonly autoRecall?: boolean;
       readonly requireSources?: boolean;
     };
+    readonly dream?: {
+      readonly every: string;
+      readonly mode?: "deterministic" | "full";
+      readonly budget_usd?: number;
+      readonly instructions?: string;
+    };
   };
 };
 
@@ -859,16 +865,25 @@ type SpecWithMemory = {
  *  opt-in and skipped on the plain compile path. */
 const MEMORY_TTL_MIN_MS = 60 * 60 * 1000;
 
+/** v0.3.0 PR 14 — floor for `memory.dream.every`. Consolidation is a
+ *  maintenance pass (design §6: "on a schedule, not every turn"); a
+ *  sub-5-minute cadence is a unit mistake that would thrash the stores and
+ *  — in `full` mode — burn model budget continuously. LOAD-BEARING here,
+ *  mirrored by ir-passes' `memoryIntegrityPass` (same posture as the ttl
+ *  floor above). */
+const DREAM_EVERY_MIN_MS = 5 * 60 * 1000;
+
 // Lower the cross-cutting `memory` block (#53), mirroring lowerFeedback's
 // spread-return-{} discipline (Pillar 1): the key is absent from the IR when
 // the spec omits the block, so codegen/runtime check presence to decide
 // whether to wire Remember/Recall + the auto-capture/recall paths.
 //
-// v0.3.0 (§9) — `backend`/`ttl`/`wiki` join the block. `ttl` is parsed to
-// `ttlMs` here (the heartbeat duration grammar extended with `d`) so the
-// runtime/fragment read a literal number; every field keeps the
-// declared-fields-only discipline so pre-0.3.0 memory bundles stay
-// byte-identical.
+// v0.3.0 (§9) — `backend`/`ttl`/`wiki`/`dream` join the block. `ttl` and
+// `dream.every` are parsed to milliseconds here (the heartbeat duration
+// grammar extended with `d`) so the runtime/fragment read literal numbers;
+// `dream.mode` is RESOLVED to its default (`full`) so downstream reads one
+// deterministic shape; every other field keeps the declared-fields-only
+// discipline so pre-0.3.0 memory bundles stay byte-identical.
 function lowerMemory(spec: SpecWithMemory): { memory?: IrMemory } {
   const m = spec.memory;
   if (m === undefined) return {};
@@ -878,6 +893,16 @@ function lowerMemory(spec: SpecWithMemory): { memory?: IrMemory } {
     if (ttlMs < MEMORY_TTL_MIN_MS) {
       throw new CompilerError(
         `memory.ttl "${m.ttl}" is below the 1h floor — a sub-hour fact TTL expires memories mid-session. Use "1h" or longer (e.g. "90d"), or omit ttl to keep facts forever.`,
+      );
+    }
+  }
+  const d = m.dream;
+  let dreamEveryMs: number | undefined;
+  if (d !== undefined) {
+    dreamEveryMs = parseDurationToMs(d.every);
+    if (dreamEveryMs < DREAM_EVERY_MIN_MS) {
+      throw new CompilerError(
+        `memory.dream.every "${d.every}" is below the 5m floor — consolidation is a scheduled maintenance pass, not a per-turn hook (a sub-5-minute cadence thrashes the stores and, in "full" mode, burns model budget continuously). Use "5m" or longer (e.g. "24h").`,
       );
     }
   }
@@ -901,6 +926,19 @@ function lowerMemory(spec: SpecWithMemory): { memory?: IrMemory } {
               ...(w.embedder !== undefined ? { embedder: w.embedder } : {}),
               ...(w.autoRecall !== undefined ? { autoRecall: w.autoRecall } : {}),
               ...(w.requireSources !== undefined ? { requireSources: w.requireSources } : {}),
+            },
+          }
+        : {}),
+      ...(d !== undefined && dreamEveryMs !== undefined
+        ? {
+            dream: {
+              everyMs: dreamEveryMs,
+              // Resolved default (design §6.1): mode is `full` unless the
+              // spec said `deterministic` — the model phase still needs
+              // budget_usd > 0 to ever run.
+              mode: d.mode ?? "full",
+              ...(d.budget_usd !== undefined ? { budgetUsd: d.budget_usd } : {}),
+              ...(d.instructions !== undefined ? { instructions: d.instructions } : {}),
             },
           }
         : {}),

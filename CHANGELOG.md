@@ -9,6 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Dream — scheduled memory consolidation (0.3.0 Goal 5, §6, PR 14).** A new
+  `memory.dream` block (`every` in the shared duration grammar with a 5m
+  floor, `mode: deterministic|full` defaulting to `full`, `budget_usd`,
+  optional `instructions` playbook override) lowers to `IrMemoryDream
+  {everyMs, mode, budgetUsd?, instructions?}` on every memory-carrying shape
+  and wires the new **`@crewhaus/dream-engine`**. A dream run is two phases:
+  **phase 1, deterministic** (always; idempotent; zero model spend) — fact
+  TTL sweep + near-duplicate supersede + `compact()` growth bounding,
+  staleness flags (facts >90d, wiki unverified >30d — `STALE_FACT_AFTER_MS`
+  / `STALE_WIKI_UNVERIFIED_AFTER_MS` exported), sessions-index fold-in (the
+  item-57 machinery, lifted into `@crewhaus/session-store` as
+  `summarizeSessionIntoIndex`), proof-excerpt re-validation + retention-pin
+  refresh for records citing sessions nearing TTL, focus/handoff
+  next-actions refresh from open plans, and the trash purge past the 7-day
+  undo window (`purgeTrash`, now in continuity-store) — and **phase 2, model
+  synthesis** (`mode: full` AND `budget_usd > 0`): ONE bounded fresh session
+  (`sessionTarget: "dream"`, singleTurn, capped tool loop) seeded with the
+  builtin `dream` skill + phase-1 findings, acting ONLY through the normal
+  registered tools (`wiki_write`/`wiki_set_signals`/`MemoryForget`/
+  `PlanUpdate` — full justification/audit path), capped by the item-27
+  `budget` option, and **refusing to run an unpriced model** (cost-tracker's
+  `pricingMisses` would make the cap a silent no-op). State lands at
+  `.crewhaus/dream/<spec>/state.json` (`lastRunAt`/`lastOutcome`/
+  `phase1Counts`/`lastEvidence`) plus an additive `dream_run` event-log
+  kind; runs are **window-idempotent** (`dream:<spec>:<floor(now/every)>`
+  through durable-execution's `withIdempotency`, backed by a lock-honoring
+  file store) so a janitor tick, a GH-Actions cron, and a CLI invocation can
+  never double-fire — including under `fleet run` parallelism. Triggers:
+  runtime-core's janitor gains a **pluggable step registry**
+  (`createJanitor({ steps })`, replacing the closed step union;
+  `janitor_action` trace events for free) and the channel daemon registers
+  the full dream step (managed registers a per-tenant deterministic one)
+  with the conventional `CREWHAUS_DREAM=0` / `CREWHAUS_DREAM_INTERVAL_MS`
+  knobs; the cli shape runs a **boot-time deterministic catch-up** when
+  overdue (`[dream] overdue — deterministic pass done; run 'crewhaus dream'
+  for full consolidation`); and **`crewhaus dream run|status|init`** ships
+  cron-safe verbs (`init` scaffolds `.github/workflows/crewhaus-dream.yml`
+  on the odd-minute convention). With a dream schedule configured, the
+  builtin `dream` skill and the `/dream` command join the gated set
+  memory-service wires.
+
 - **Continuity is ON BY DEFAULT — the release's one sanctioned behavior
   change (0.3.0 Goal 1, PR 11).** Every agent-loop harness — **cli, channel,
   managed, research, crew** — now compiles (and `crewhaus run`s) with the

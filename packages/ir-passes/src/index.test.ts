@@ -516,6 +516,22 @@ describe("ir-passes — memoryIntegrityPass (v0.3.0 PR 11)", () => {
     expect(() => memoryIntegrityPass(makeCli({ memory: { ttlMs: 60 * 60 * 1000 } }))).not.toThrow();
   });
 
+  test("dream.everyMs below the 5m floor throws (mirror of the compiler's PR 14 rule)", () => {
+    expect(() =>
+      memoryIntegrityPass(makeCli({ memory: { dream: { everyMs: 4 * 60 * 1000, mode: "full" } } })),
+    ).toThrow(IrPassError);
+    expect(() =>
+      memoryIntegrityPass(makeCli({ memory: { dream: { everyMs: 5 * 60 * 1000, mode: "full" } } })),
+    ).not.toThrow();
+    expect(() =>
+      memoryIntegrityPass(
+        makeCli({
+          memory: { dream: { everyMs: 86_400_000, mode: "full", budgetUsd: 0.5 } },
+        }),
+      ),
+    ).not.toThrow();
+  });
+
   test('continuity.scope "session" only on shapes with session routing (channel)', () => {
     expect(() =>
       memoryIntegrityPass(makeCli({ continuity: { ...CONTINUITY, scope: "session" } })),

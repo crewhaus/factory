@@ -210,6 +210,33 @@ function renderDaemon(ir: IrManagedV0): string {
   // v0.3.0 — thread the request's Tenant into runOneTurn so the memory
   // fabric's stores are tenant-fenced (§2.7).
   const tenantField = memoryFabric(ir).wired ? ", tenant" : "";
+  // v0.3.0 PR 14 (§6.3) — the dream consolidation step, registered into the
+  // existing boot+hourly janitor tick. Multi-tenant daemons run the
+  // DETERMINISTIC phase per tenant (tenantsRootDir mode — re-enumerated
+  // each run, exactly like the janitor's own session sweep); the model
+  // phase is deliberately never fired from a multi-tenant janitor:
+  // per-tenant model spend needs an explicit operator decision (a
+  // per-tenant `crewhaus dream run` cron).
+  const dreamOn =
+    ir.memory !== undefined && ir.memory.enabled !== false && ir.memory.dream !== undefined;
+  const dreamImport = dreamOn
+    ? `import { createDreamJanitorStep } from "@crewhaus/memory-service";\n`
+    : "";
+  const dreamStepBlock = dreamOn
+    ? `
+// v0.3.0 §6.3 — scheduled memory consolidation (dream), deterministic per
+// tenant, due-checked against <tenantRoot>/dream/<spec>/state.json each
+// tick. CREWHAUS_DREAM=0 disables; CREWHAUS_DREAM_INTERVAL_MS overrides the
+// cadence. The model phase is never fired from a multi-tenant janitor —
+// per-tenant model spend needs an explicit operator decision: schedule a
+// per-tenant \`crewhaus dream run\` cron for full consolidation.
+const DREAM_STEP = createDreamJanitorStep(${memoryFabric(ir).fragmentJson}, {
+  cwd: process.cwd(),
+  tenantsRootDir: TENANTS_ROOT,
+});
+`
+    : "";
+  const dreamStepsField = dreamOn ? "\n  steps: DREAM_STEP !== null ? [DREAM_STEP] : []," : "";
   const tenantList = ir.tenants
     .map(
       (t) =>
@@ -226,7 +253,7 @@ import { createBudgetStore } from "@crewhaus/durable-state";
 import { formatRunFailure, isRunFailedError } from "@crewhaus/errors";
 import { createGatewayServer } from "@crewhaus/gateway-server";
 import { auditPolicyDecision, evaluatePolicy } from "@crewhaus/policy-engine";
-import { createJanitor } from "@crewhaus/runtime-core";
+${dreamImport}import { createJanitor } from "@crewhaus/runtime-core";
 import { buildTenant, type Tenant } from "@crewhaus/tenancy";
 import { runOneTurn } from "./agent.ts";
 
@@ -304,14 +331,14 @@ try {
 // overrides the hourly re-run (0 keeps only the boot run);
 // CREWHAUS_JANITOR_CLEAR_RESERVATIONS=0 skips the reservation clear
 // (REQUIRED for multi-writer sqlite deployments — see BUDGET_STORE above).
-const janitor = createJanitor({
+${dreamStepBlock}const janitor = createJanitor({
   ...(process.env.CREWHAUS_JANITOR_CLEAR_RESERVATIONS !== "0"
     ? { budgetStore: BUDGET_STORE }
     : {}),
   sessionRootDirs: Object.values(tenantOverrides).map((t) => t.sessionRoot),
   tenantsRootDir: TENANTS_ROOT,
   sessionTtlDays: RETENTION_TTL_DAYS,
-  pinnedSessionIds: RETENTION_PINS,
+  pinnedSessionIds: RETENTION_PINS,${dreamStepsField}
 });
 if (process.env.CREWHAUS_JANITOR !== "0") {
   const janitorReport = await janitor.runOnce();

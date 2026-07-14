@@ -2,8 +2,10 @@
  * Trash-and-undo clearing (design §2.6): user-facing "clear" NEVER
  * hard-deletes. Files move to `.crewhaus/trash/<timestamp>/…` preserving their
  * path relative to the `.crewhaus` directory, so `restore(<timestamp>)` can
- * put every file back exactly where it came from. Trash purge is a janitor
- * concern (7-day window per the design), deliberately not implemented here.
+ * put every file back exactly where it came from. Trash purge (7-day window
+ * per the design) lives here as `purgeTrash` — SCHEDULING it is a
+ * janitor/dream concern (the dream engine's phase-1 pass calls it), but the
+ * layout knowledge stays in this one module.
  *
  * `moveToTrash` is exported as a reusable helper so other `.crewhaus` stores
  * (wiki-store, memory-store's clear verbs) can adopt the identical clearing
@@ -179,4 +181,60 @@ export async function restoreFromTrash(ts: string, crewhausDir: string): Promise
   }
   await rm(trashDir, { recursive: true, force: true });
   return { ts, restored };
+}
+
+/** Default purge window (design §2.6: "trash is purged after 7 days"). */
+export const TRASH_PURGE_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
+
+export type PurgeTrashResult = {
+  /** Snapshot timestamps that were purged, oldest first. */
+  readonly purged: readonly string[];
+  /** Snapshots kept (younger than the window). */
+  readonly kept: number;
+};
+
+/** Parse a trash snapshot timestamp (`YYYY-MM-DDTHH-MM-SS`, produced from
+ *  `toISOString()`) back to epoch ms. Collision suffixes (`-N`) share the
+ *  base timestamp. Returns null for a non-matching name. */
+export function parseTrashTimestamp(ts: string): number | null {
+  if (!TRASH_TS_REGEX.test(ts)) return null;
+  const base = ts.slice(0, 19); // strip any -N collision suffix
+  const iso = `${base.slice(0, 13)}:${base.slice(14, 16)}:${base.slice(17, 19)}Z`;
+  const parsed = Date.parse(iso);
+  return Number.isNaN(parsed) ? null : parsed;
+}
+
+/**
+ * Hard-delete every trash snapshot STRICTLY older than `olderThanMs`
+ * (default {@link TRASH_PURGE_AFTER_MS} — the design's 7-day undo window).
+ * A snapshot exactly at the boundary is KEPT: the undo window is inclusive,
+ * so "purged after 7 days" never eats a restore attempted at 7 days sharp.
+ * This is the one sanctioned hard delete in the clearing story — everything
+ * in the trash already survived its undo window.
+ */
+export async function purgeTrash(
+  crewhausDir: string,
+  opts: { readonly olderThanMs?: number; readonly now?: () => Date } = {},
+): Promise<PurgeTrashResult> {
+  const olderThanMs = opts.olderThanMs ?? TRASH_PURGE_AFTER_MS;
+  const now = opts.now ?? (() => new Date());
+  const cutoff = now().getTime() - olderThanMs;
+  const trashRoot = join(resolve(crewhausDir), TRASH_DIR_NAME);
+  const snapshots = await listTrash(crewhausDir);
+  const purged: string[] = [];
+  let kept = 0;
+  for (const snapshot of snapshots) {
+    const ts = parseTrashTimestamp(snapshot.ts);
+    if (ts === null) {
+      kept += 1;
+      continue; // unrecognized name — never delete what we can't date
+    }
+    if (ts < cutoff) {
+      await rm(join(trashRoot, snapshot.ts), { recursive: true, force: true });
+      purged.push(snapshot.ts);
+    } else {
+      kept += 1;
+    }
+  }
+  return { purged, kept };
 }

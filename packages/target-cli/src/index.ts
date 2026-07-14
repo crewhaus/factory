@@ -685,7 +685,15 @@ function renderMemory(ir: IrV0): { imports: string[]; bootBlock: string; field: 
   if (!memoryOn && !continuityOn) {
     return { imports: [], bootBlock: "", field: "" };
   }
-  const imports = [`import { wireMemory } from "@crewhaus/memory-service";`];
+  // v0.3.0 PR 14 (§6.3) — boot-time dream catch-up, cli shape: when the
+  // schedule is overdue, the DETERMINISTIC phase runs (sub-second, zero
+  // spend) and the bundle prints the note pointing at `crewhaus dream` for
+  // the full consolidation. Only emitted when the spec configured
+  // memory.dream, so dream-less bundles keep their pinned bytes.
+  const dreamOn = memoryOn && mem?.dream !== undefined;
+  const imports = [
+    `import { wireMemory${dreamOn ? ", runDreamBootCatchUp" : ""} } from "@crewhaus/memory-service";`,
+  ];
   const fragment = JSON.stringify(
     memoryFragmentFromIr({
       name: ir.name,
@@ -693,16 +701,21 @@ function renderMemory(ir: IrV0): { imports: string[]; bootBlock: string; field: 
       ...(continuityOn ? { continuity: ir.continuity } : {}),
     }),
   );
+  const dreamBoot = (cwdExpr: string): string =>
+    dreamOn
+      ? `\nconst __dreamNote = await runDreamBootCatchUp(${fragment}, { cwd: ${cwdExpr} });
+if (__dreamNote !== null) process.stdout.write(\`\${__dreamNote}\\n\`);`
+      : "";
   if (!continuityOn) {
     // PR 10-pinned bytes: the `continuity: false` opt-out path.
-    const bootBlock = `const __memWired = await wireMemory(${fragment}, { catalog: defaultCatalog, cwd: process.cwd() });`;
+    const bootBlock = `const __memWired = await wireMemory(${fragment}, { catalog: defaultCatalog, cwd: process.cwd() });${dreamBoot("process.cwd()")}`;
     const field = "\n  ...__memWired.options,";
     return { imports, bootBlock, field };
   }
   const bootBlock = `const __memWired = await wireMemory(${fragment}, { catalog: defaultCatalog, cwd: __cwd });
 const __skills = __memWired.options.skills ?? [];
 const __slashCommands = __memWired.options.slashCommands ?? new Map();
-if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));`;
+if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));${dreamBoot("__cwd")}`;
   const field = "\n  ...__memWired.options,";
   return { imports, bootBlock, field };
 }

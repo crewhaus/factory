@@ -423,6 +423,28 @@ function memoryFabric(ir: IrChannelV0): {
   return { wired, continuityOn, fragmentJson };
 }
 
+/** v0.3.0 PR 14 — dream is configured when the enabled memory block carries
+ *  a dream schedule. Gates the janitor-step + model-phase codegen in BOTH
+ *  agent.ts and daemon.ts, so dream-less specs stay byte-identical. */
+function dreamConfigured(ir: IrChannelV0): boolean {
+  return ir.memory !== undefined && ir.memory.enabled !== false && ir.memory.dream !== undefined;
+}
+
+/** The dream's serialized fragment: SPEC-scoped continuity (§14.5 — the
+ *  dream consolidates the daemon's own agenda, never a per-conversation
+ *  store), regardless of the interactive scope the channel runs with. */
+function dreamFragmentJson(ir: IrChannelV0): string {
+  return JSON.stringify(
+    memoryFragmentFromIr({
+      name: ir.name,
+      memory: ir.memory,
+      ...(ir.continuity !== undefined
+        ? { continuity: { ...ir.continuity, scope: "spec" as const } }
+        : {}),
+    }),
+  );
+}
+
 function renderAgent(ir: IrChannelV0): string {
   const hasRules = ir.permissions.rules.length > 0;
   const permImport = hasRules
@@ -446,8 +468,9 @@ function renderAgent(ir: IrChannelV0): string {
   // scope) only exists when both continuity and a heartbeat are configured.
   const fabric = memoryFabric(ir);
   const hbScopeOverride = fabric.continuityOn && ir.heartbeat !== undefined;
+  const dreamOn = dreamConfigured(ir);
   const memImport = fabric.wired
-    ? `import { wireMemory${fabric.continuityOn ? ", type MemoryWiringFragment" : ""} } from "@crewhaus/memory-service";\n${fabric.continuityOn ? `import { createSkillTool } from "@crewhaus/skills-registry";\n` : ""}`
+    ? `import { wireMemory${fabric.continuityOn || dreamOn ? ", type MemoryWiringFragment" : ""}${dreamOn ? ", createDreamJanitorStep, type DreamJanitorStep" : ""} } from "@crewhaus/memory-service";\n${fabric.continuityOn ? `import { createSkillTool } from "@crewhaus/skills-registry";\n` : ""}${dreamOn ? `import { createCostTracker } from "@crewhaus/cost-tracker";\n` : ""}`
     : "";
   const fragmentBlock = !fabric.wired
     ? ""
@@ -508,6 +531,70 @@ function __memFragment(scope?: "spec" | "session"): MemoryWiringFragment {
     : "config.slashCommands";
   const memRunField = fabric.wired ? "\n        ...__memWired.options," : "";
 
+  // v0.3.0 PR 14 (§6.3) — the dream janitor step, exported for daemon.ts to
+  // register into createJanitor({ steps }). The model phase is ONE bounded
+  // fresh session built on the SAME runChatLoop this file already imports:
+  // sessionTarget "dream", singleTurn, capped tool loop, the item-27 budget
+  // option carrying memory.dream.budget_usd — and only the memory-fabric
+  // tools (spec-scoped), so every synthesis action rides the normal
+  // justification/audit path.
+  const dreamStepBlock = !dreamOn
+    ? ""
+    : `
+/** v0.3.0 §6.3 — the dream consolidation step for the daemon janitor.
+ *  Due-checked against .crewhaus/dream/<spec>/state.json by the step
+ *  itself; CREWHAUS_DREAM=0 disables, CREWHAUS_DREAM_INTERVAL_MS overrides
+ *  the cadence. The dream always reads the SPEC-scoped stores — the
+ *  daemon's own agenda — never a per-conversation session store. */
+const __DREAM_FRAGMENT: MemoryWiringFragment = ${dreamFragmentJson(ir)};
+
+export function createDreamStep(): DreamJanitorStep | null {
+  return createDreamJanitorStep(__DREAM_FRAGMENT, {
+    cwd: process.cwd(),
+    modelPhase: {
+      model: ${escapeJsonString(ir.agent.model)},
+      run: async (input) => {
+        // The dream session sees ONLY the memory-fabric tools (§6.2) —
+        // wired fresh, spec scope, into a local list.
+        const __tools: RegisteredTool[] = [];
+        await wireMemory(__DREAM_FRAGMENT, {
+          catalog: { register: (t: RegisteredTool) => { __tools.push(t); } },
+          cwd: process.cwd(),
+        });
+        const runContext = createRunContext();
+        const tracker = createCostTracker(runContext.eventBus, { suppressEvents: true });
+        try {
+          const summary = await runChatLoop({
+            model: ${escapeJsonString(ir.agent.model)},
+            instructions: input.playbook,
+            runContext,
+            singleTurn: true,
+            seedMessages: [{ role: "user", content: input.prompt }],
+            sessionName: ${escapeJsonString(ir.name)},
+            sessionTarget: "dream",
+            tools: __tools,
+            hooks: [],
+            maxToolIterations: input.maxToolIterations,
+            budget: {
+              usdMicros: Math.round(input.budgetUsd * 1_000_000),
+              onExceed: { kind: "stop" },
+            },
+            spinner: false,
+          });
+          return {
+            sessionId: runContext.sessionId,
+            spentUsd: tracker.getRunCost(runContext.runId).totalUsdMicros / 1_000_000,
+            summary,
+          };
+        } finally {
+          tracker.unsubscribe();
+        }
+      },
+    },
+  });
+}
+`;
+
   return `// Generated by crewhaus. DO NOT EDIT.
 // Source spec: ${escapeJsonString(ir.name)} (target: channel, ir version: ${ir.version}, file: agent.ts)
 import { runChatLoop } from "@crewhaus/runtime-core";
@@ -565,7 +652,7 @@ export function createAgent(config: AgentConfig): Agent {
     },
   };
 }
-`;
+${dreamStepBlock}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -1080,6 +1167,21 @@ registerChannelAdapter("imessage", imessageAdapter);`);
   // entries); the daemon's own discovery would strand the builtin skill
   // (advertised in the prompt with no Skill tool able to load it).
   const continuityOn = ir.continuity !== undefined;
+
+  // v0.3.0 PR 14 (§6.3) — register the dream consolidation step into the
+  // existing boot+hourly janitor tick. The step itself (agent.ts) due-checks
+  // .crewhaus/dream/<spec>/state.json and honors CREWHAUS_DREAM=0 /
+  // CREWHAUS_DREAM_INTERVAL_MS; a null step (no dream schedule) registers
+  // nothing.
+  const dreamOn = dreamConfigured(ir);
+  const dreamBoot = dreamOn
+    ? `
+  // v0.3.0 §6.3 — scheduled memory consolidation (dream), hosted by the
+  // janitor: due-checked each tick against .crewhaus/dream/<spec>/state.json.
+  const __dreamStep = createDreamStep();
+`
+    : "";
+  const dreamStepsField = dreamOn ? "\n    steps: __dreamStep !== null ? [__dreamStep] : []," : "";
   const extensionImports = continuityOn
     ? `import { loadHooks } from "@crewhaus/hooks-engine";
 import { defaultCatalog } from "@crewhaus/tool-catalog";`
@@ -1110,7 +1212,7 @@ import { formatRunFailure, ${ir.heartbeat ? "isRunFailedError, " : ""}toFailureR
 ${extensionImports}
 ${adapterImports.join("\n")}
 import { registerChannelAdapter } from "@crewhaus/tool-message-channel";
-${heartbeatImport}${builtinImportBlock}${mcpImportBlock}${subAgentImportBlock}import { createAgent } from "./agent.js";
+${heartbeatImport}${builtinImportBlock}${mcpImportBlock}${subAgentImportBlock}import { createAgent${dreamOn ? ", createDreamStep" : ""} } from "./agent.js";
 import { createSessionRouter } from "./session-router.js";
 import { createGateway } from "./gateway.js";
 import { loadRetentionConfig } from "@crewhaus/data-retention-engine";
@@ -1161,9 +1263,9 @@ ${agentSkillsFields}
     );
     __retentionTtlDays = Number.POSITIVE_INFINITY; // fail-safe: evict nothing
   }
-  const __janitor = createJanitor({
+${dreamBoot}  const __janitor = createJanitor({
     sessionTtlDays: __retentionTtlDays,
-    pinnedSessionIds: __retentionPins,
+    pinnedSessionIds: __retentionPins,${dreamStepsField}
   });
   if (process.env["CREWHAUS_JANITOR"] !== "0") {
     const __janitorReport = await __janitor.runOnce();
