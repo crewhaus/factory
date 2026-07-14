@@ -9,6 +9,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Thredz — one knob (0.3.0 Goal 3, §4, PR 16).** A new top-level `thredz:`
+  block on the five memory shapes (cli, channel, managed, research, crew):
+  `thredz: true` (≡ `{api_key: "$THREDZ_API_KEY"}`), the string shorthand
+  `thredz: $THREDZ_API_KEY`, or the object form (`api_key` required and
+  credential-lowered fail-fast; `base_url`; `visibility` defaulting
+  **private** — never Thredz's shared-by-default; `goals` mirror on/off,
+  defaulting to "on when continuity goals are on"; `agents` to register an
+  addressable handle at boot). On the emit-wired **cli** shape the compiler
+  synthesizes an `mcp_servers.thredz` stdio entry (`npx -y thredz-mcp@0.2.0`
+  with `THREDZ_API_KEY` as an `IrSecretRef` env value and
+  `THREDZ_DEFAULT_VISIBILITY` enforced deterministically) riding the §4.2
+  secret machinery end-to-end — the key never lands in compiled artifacts,
+  the generated README lists `THREDZ_API_KEY` automatically, `compile
+  --strict` stays green, and a missing key at boot renders the classified
+  config report (exit 21). A user-declared `mcp_servers.thredz` **wins over
+  synthesis** (explicit beats implicit — the vendored-server escape hatch;
+  `crewhaus lint` warns with the new `thredz-override` rule). **Tool
+  routing (§4.3):** the model keeps ONE vocabulary — the ten
+  `wiki_*`/`log_knowledge_gap` tools plus `goal_*`/`task_*` register as
+  bare-name MCP aliases via tool-mcp's new `registerMcpToolAliases`
+  (collision-guarded; `scope: "external"`, `ioCapability: "network"`,
+  boundary classification + lineage tagging identical to namespaced MCP
+  tools; `wiki_write`/`wiki_set_signals` keep their justification gate),
+  while the local tool-wiki twins are not registered and the local wiki
+  store on disk stays untouched. memory-service's `wireWiki` flips on the
+  thredz backend (replacing the reserved-backend error) and the auto-recall
+  fusion routes `wiki_recall` through the already-connected McpHost client
+  with the same recall-bundle line shape. **Goal mirroring (§4.4, resolved
+  decision 5):** continuity goal writes mirror to Thredz
+  `goal_write`/`goal_update` at the store's write/update sync points — spec
+  scope ONLY, local write always authoritative, mirrored titles
+  PII-redacted, idempotency-keyed creates, and Thredz-side failures
+  skip-and-warn (a free-tier goal cap surfaces as a clear `thredz_quota`
+  warning) without ever failing the local write. **Failure classes
+  (§4.4):** `classifyThredzFailure` maps the thredz-mcp v0.2.0 error
+  contract on status/code shapes (401/403 → `thredz_auth`, 403-disabled →
+  `thredz_billing`, 402/quota codes → `thredz_quota`, 429 →
+  `thredz_rate_limit`, else `thredz_unavailable`); boot failures degrade to
+  the local backend with an `mcp_boot` warning — Thredz codes never kill a
+  run. **`crewhaus doctor --probe`** gains a live `wiki_stats` round-trip
+  through the spec's thredz server (disabled keys and plan caps surface
+  before a long run degrades on them). The non-cli memory shapes carry the
+  block with the 0.2.3-convention ignored-note comment until their wiring
+  lands. The real published server contract is pinned by a read-only
+  integration test against thredz-mcp v0.2.0's `server.ts`.
+
 - **Dream — scheduled memory consolidation (0.3.0 Goal 5, §6, PR 14).** A new
   `memory.dream` block (`every` in the shared duration grammar with a 5m
   floor, `mode: deterministic|full` defaulting to `full`, `budget_usd`,

@@ -69,8 +69,16 @@ import { GENERATED_README_MARKER, type IrBudget } from "@crewhaus/ir";
 import { createLogger } from "@crewhaus/logging";
 import { McpHost, resolveMcpServerConfig } from "@crewhaus/mcp-host";
 // PR 10 — the memory fabric's composition root: `crewhaus run` makes the
-// same one stable wireMemory call compiled bundles emit.
-import { memoryFragmentFromIr, runDreamBootCatchUp, wireMemory } from "@crewhaus/memory-service";
+// same one stable wireMemory call compiled bundles emit. PR 16 adds
+// connectThredz (the §4.3 backend flip's boot helper — bare-name MCP tool
+// aliases + degrade-on-failure).
+import {
+  type ThredzConnection,
+  connectThredz,
+  memoryFragmentFromIr,
+  runDreamBootCatchUp,
+  wireMemory,
+} from "@crewhaus/memory-service";
 import { createMemoryStore } from "@crewhaus/memory-store";
 import {
   BUILTIN_DEFAULT_RULES,
@@ -860,6 +868,9 @@ import {
   parseExcludeGlobs,
   restoreStateArchive,
 } from "./state-backup";
+// v0.3.0 Goal 3 — `doctor --probe`'s thredz check (wiki_stats round-trip
+// through the spec's synthesized/user-declared thredz MCP server).
+import { probeThredz, thredzProbeTarget, thredzProbeToCheck } from "./thredz-probe";
 // Item 18 — `crewhaus tools` namespace (list/suggest/audit + the loadToolMap
 // ↔ BUILTIN_TOOL_MAP sync floor), in a side-effect-free module so it is
 // unit-testable (this entry file runs an argv switch on import).
@@ -3910,6 +3921,13 @@ async function runRunCli(
   // Item 38 — synthetic notice appended to the agent instructions when the MCP
   // auto-quarantine withdraws a server's tools (built in the block below).
   let mcpQuarantineNotice: string | undefined;
+  // v0.3.0 Goal 3 — the thredz server (synthesized by the compiler, or the
+  // user's own vendored entry) boots through connectThredz: its wiki+goals
+  // tools land under their BARE names (§4.3, one vocabulary across
+  // backends) and boot failure DEGRADES (null → wireMemory falls back to
+  // local files with a warning) instead of failing the run.
+  let thredzConn: ThredzConnection | null = null;
+  const thredzWired = ir.thredz !== undefined && ir.mcp_servers["thredz"] !== undefined;
   if (Object.keys(ir.mcp_servers).length > 0) {
     const host = new McpHost({ logger });
     mcpHost = host;
@@ -3920,12 +3938,20 @@ async function runRunCli(
     }
     const tempCatalog = new ToolCatalog();
     for (const t of tools) tempCatalog.register(t);
+    if (thredzWired) {
+      thredzConn = await connectThredz(host, tempCatalog, {
+        log: (line) => process.stdout.write(line),
+        ...(ir.thredz?.agentName !== undefined ? { agentName: ir.thredz.agentName } : {}),
+      });
+    }
     await Promise.all(
-      Object.keys(ir.mcp_servers).map((name) =>
-        registerMcpServer(host, name, tempCatalog, {
-          onRegister: ({ fullName }) => process.stdout.write(`[mcp] registered ${fullName}\n`),
-        }),
-      ),
+      Object.keys(ir.mcp_servers)
+        .filter((name) => !(thredzWired && name === "thredz"))
+        .map((name) =>
+          registerMcpServer(host, name, tempCatalog, {
+            onRegister: ({ fullName }) => process.stdout.write(`[mcp] registered ${fullName}\n`),
+          }),
+        ),
     );
     tools = tempCatalog.list().slice();
 
@@ -4062,7 +4088,11 @@ async function runRunCli(
   let slashCommands: ReadonlyMap<string, SlashCommand> = discoveredCommands;
   let memoryRunOpt: Parameters<typeof runChatLoop>[0]["memory"];
   let continuityRunOpt: Parameters<typeof runChatLoop>[0]["continuity"];
-  if ((ir.memory !== undefined && ir.memory.enabled !== false) || ir.continuity !== undefined) {
+  if (
+    (ir.memory !== undefined && ir.memory.enabled !== false) ||
+    ir.continuity !== undefined ||
+    ir.thredz !== undefined
+  ) {
     const wiredMemory = await wireMemory(memoryFragmentFromIr(ir), {
       catalog: {
         register: (tool) => {
@@ -4071,6 +4101,9 @@ async function runRunCli(
       },
       cwd: process.cwd(),
       log: (line) => process.stdout.write(line),
+      // v0.3.0 Goal 3 — the live connection (or null after a boot failure,
+      // which wireMemory degrades from). Absent when thredz is off.
+      ...(ir.thredz !== undefined ? { thredz: thredzConn } : {}),
     });
     memoryRunOpt = wiredMemory.options.memory;
     continuityRunOpt = wiredMemory.options.continuity;
@@ -4766,6 +4799,10 @@ async function runDoctor(args: ParsedArgs): Promise<void> {
         "                           unfunded accounts (billing) and invalid keys (auth) before\n" +
         "                           a long run dies on them. Spends fractional-cent tokens, so\n" +
         "                           it is never on by default. Failures fail doctor (exit 1).\n" +
+        "                           When the cwd spec carries `thredz:`, also runs one live\n" +
+        "                           wiki_stats round-trip through the thredz MCP server —\n" +
+        "                           disabled keys (thredz_billing) and plan caps (thredz_quota)\n" +
+        "                           surface here instead of degrading a long run.\n" +
         "\n" +
         "  Credential checks are model-aware: doctor parses the cwd crewhaus.yaml's\n" +
         "  agent.model (claude-*, openai/*, gemini/*, bedrock/*, local/<m>@<url>) and\n" +
@@ -4844,6 +4881,16 @@ async function runDoctor(args: ParsedArgs): Promise<void> {
       process.stdout.write("~ live probe: no configured providers to probe\n");
     } else {
       checks.push(...probeResultsToChecks(await runProviderProbes(plan)));
+    }
+    // v0.3.0 Goal 3 (§4.4) — when the cwd spec carries `thredz:`, probe the
+    // configured server with one live wiki_stats round-trip so a disabled
+    // key (billing lapse) or plan cap surfaces BEFORE a long run degrades
+    // on it. Classified through the same choke point the run path uses.
+    if (specText !== undefined) {
+      const thredzTarget = thredzProbeTarget(specText);
+      if (thredzTarget !== undefined) {
+        checks.push(thredzProbeToCheck(await probeThredz(thredzTarget)));
+      }
     }
   }
 

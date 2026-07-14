@@ -375,6 +375,42 @@ export type IrContinuity = {
   readonly focusMaxChars?: number;
 };
 
+/**
+ * v0.3.0 Goal 3 (§4.1/§9) — the Thredz config, lowered from the top-level
+ * `thredz:` block (boolean/string shorthand or the object form — the spec
+ * shorthands are RESOLVED at lower time so this carries one deterministic
+ * shape). Presence means Thredz is on.
+ *
+ * The compiler additionally SYNTHESIZES an `mcp_servers.thredz` stdio entry
+ * (`npx -y thredz-mcp@0.2.0` with `THREDZ_API_KEY` as an `IrSecretRef` env
+ * value, riding the §4.2 secret machinery end-to-end) on the emit-wired
+ * shape (cli). A user-declared `mcp_servers.thredz` wins over synthesis
+ * (explicit beats implicit — `crewhaus lint` warns); this config block is
+ * carried either way so the wiring layer (memory-service) still routes the
+ * wiki backend and goal mirror through that server.
+ */
+export type IrThredzVisibility = "private" | "shared";
+
+export type IrThredz = {
+  /** The Thredz API key — credential-lowered (`$THREDZ_API_KEY` →
+   *  `{ kind: "env" }`; fail-fast on a malformed `$…` ref). */
+  readonly apiKey: IrSecretRef;
+  /** Self-hosted / local API base (`THREDZ_API_BASE`). Absent → the hosted
+   *  default inside thredz-mcp. */
+  readonly baseUrl?: string;
+  /** RESOLVED default `private` — becomes `THREDZ_DEFAULT_VISIBILITY`, so
+   *  agent memory is never public by accident (Thredz's own API defaults
+   *  new articles to globally-shared). */
+  readonly visibility: IrThredzVisibility;
+  /** RESOLVED — mirror continuity goal writes to Thredz `goal_write`/
+   *  `goal_update` (spec-scoped only, §14.5 decision 5). Defaulted at lower
+   *  time to "on when continuity goals are on". */
+  readonly goals: boolean;
+  /** Register this addressable agent handle at boot (idempotent
+   *  `agent_register`). Absent → no registration (the default). */
+  readonly agentName?: string;
+};
+
 /** Ops item 37 — a mitigation-ladder rung the runtime SLO monitor walks on a
  *  sustained breach, in declared order. See {@link IrSlo}. */
 export type IrSloMitigation = "alert" | "pause-intake" | "rollback";
@@ -496,6 +532,9 @@ export type IrV0 = {
   /** v0.3.0 Goal 1 — continuity config. DEFAULT-ON: present unless the spec
    *  opted out with `continuity: false`. */
   readonly continuity?: IrContinuity;
+  /** v0.3.0 Goal 3 — Thredz config. Present when the spec declares `thredz:`;
+   *  the compiler also synthesizes `mcp_servers.thredz` on this shape. */
+  readonly thredz?: IrThredz;
   /** Ops item 37 — SLO targets + mitigation ladder. Optional; absent when the
    *  spec omits the `observability` block. */
   readonly observability?: IrObservability;
@@ -775,6 +814,9 @@ export type IrChannelV0 = {
    *  opted out with `continuity: false`. `scope` resolves to `session` here
    *  (per-conversation stores riding the session router's sessionId, §14.5). */
   readonly continuity?: IrContinuity;
+  /** v0.3.0 Goal 3 — Thredz config, CARRIED but not emit-wired on this shape
+   *  in this release (the emitter prints the ignored-note comment). */
+  readonly thredz?: IrThredz;
   /** Ops item 37 — SLO targets + mitigation ladder. Optional; absent when the
    *  spec omits the `observability` block. */
   readonly observability?: IrObservability;
@@ -828,6 +870,9 @@ export type IrManagedV0 = {
    *  opted out with `continuity: false`. `scope` resolves to `spec` here;
    *  every store is tenant-fenced at boot (deps carry the tenant, §2.7). */
   readonly continuity?: IrContinuity;
+  /** v0.3.0 Goal 3 — Thredz config, CARRIED but not emit-wired on this shape
+   *  in this release (the emitter prints the ignored-note comment). */
+  readonly thredz?: IrThredz;
   /** Ops item 37 — SLO targets + mitigation ladder. Optional; absent when the
    *  spec omits the `observability` block. The managed daemon's `pause-intake`
    *  rung reuses its `budget_exceeded` 429 path. */
@@ -996,6 +1041,9 @@ export type IrCrewV0 = {
    *  opted out with `continuity: false`. Roles share the `spec`-scoped plan
    *  store — the plan IS the coordination surface (§2.7). */
   readonly continuity?: IrContinuity;
+  /** v0.3.0 Goal 3 — Thredz config, CARRIED but not emit-wired on this shape
+   *  in this release (the emitter prints the ignored-note comment). */
+  readonly thredz?: IrThredz;
   /** §47 cross-cutting blockchain subsystem (slice 0). All optional. */
   readonly chains?: readonly IrChainBinding[];
   readonly wallets?: readonly IrWalletBinding[];
@@ -1047,6 +1095,9 @@ export type IrResearchV0 = {
   /** v0.3.0 Goal 1 — continuity config. DEFAULT-ON: present unless the spec
    *  opted out with `continuity: false`. `scope` resolves to `spec` here. */
   readonly continuity?: IrContinuity;
+  /** v0.3.0 Goal 3 — Thredz config, CARRIED but not emit-wired on this shape
+   *  in this release (the emitter prints the ignored-note comment). */
+  readonly thredz?: IrThredz;
   /** §47 cross-cutting blockchain subsystem (slice 0). All optional. */
   readonly chains?: readonly IrChainBinding[];
   readonly wallets?: readonly IrWalletBinding[];

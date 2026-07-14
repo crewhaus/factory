@@ -120,7 +120,25 @@ export function runLint(
     });
   }
 
-  return { ok: findings.length === 0, findings, spec, ir };
+  // Stage 5 — v0.3.0 Goal 3 (design §4.1): a user-declared
+  // `mcp_servers.thredz` next to a `thredz:` block WINS over the compiler's
+  // synthesis (explicit beats implicit). That is deliberate — the vendored
+  // -server escape hatch — but worth a warning so nobody wonders why their
+  // `base_url`/`visibility` knobs stopped applying.
+  const specThredz = (spec as { thredz?: unknown }).thredz;
+  const specMcp = (spec as { mcp_servers?: Record<string, unknown> }).mcp_servers;
+  if (specThredz !== undefined && specThredz !== false && specMcp?.["thredz"] !== undefined) {
+    findings.push({
+      message:
+        "mcp_servers.thredz is user-declared, so the thredz: block does not synthesize a server — your explicit entry wins (explicit beats implicit). The thredz: knobs still drive the wiring (aliases, goal mirror), but api_key/base_url/visibility only apply through YOUR server's env; it must speak the thredz-mcp v0.2.0 tool contract.",
+      path: "mcp_servers.thredz",
+      severity: "warning",
+      rule: "thredz-override",
+    });
+  }
+
+  // Warnings inform; only errors gate (`ok` drives the CLI exit code).
+  return { ok: findings.every((f) => f.severity !== "error"), findings, spec, ir };
 }
 
 /** Re-exported for the CLI wrapper's philosophy-alignment parity note. */

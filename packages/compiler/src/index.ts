@@ -41,6 +41,7 @@ import type {
   IrSlackConfig,
   IrSubAgentDefinition,
   IrTelegramConfig,
+  IrThredz,
   IrTransactionPolicy,
   IrV0,
   IrVoiceV0,
@@ -1014,6 +1015,179 @@ function lowerContinuity(
   };
 }
 
+// ---------------------------------------------------------------------------
+// v0.3.0 Goal 3 (§4.1) — the `thredz:` block: one knob, lowered here.
+// ---------------------------------------------------------------------------
+
+/** The synthesized MCP server's name. Everything downstream — alias
+ *  registration, the goal mirror, doctor's probe — keys on this. */
+export const THREDZ_MCP_SERVER_NAME = "thredz";
+/** Exact pin (design §4.1): the published stdio server whose v0.2.0 tool
+ *  contract (25 tools incl. `goal_*`/`task_*`, `THREDZ_DEFAULT_VISIBILITY`)
+ *  the wiring layer is built against. */
+export const THREDZ_MCP_PACKAGE_SPEC = "thredz-mcp@0.2.0";
+
+type SpecThredz =
+  | boolean
+  | string
+  | {
+      readonly api_key: string;
+      readonly base_url?: string;
+      readonly visibility?: "private" | "shared";
+      readonly goals?: boolean;
+      readonly agents?: boolean | string;
+    };
+
+type SpecWithThredz = {
+  readonly name: string;
+  readonly thredz?: SpecThredz;
+  readonly memory?: { readonly backend?: "file" | "thredz" };
+};
+
+/** Derive a Thredz agent handle (`^[a-z][a-z0-9-]{2,31}$`) from a spec name
+ *  for `thredz.agents: true`. Deterministic; throws when the name reduces to
+ *  nothing usable (the author then names the handle explicitly). */
+function deriveThredzHandle(specName: string): string {
+  let handle = specName
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  handle = handle.replace(/^[^a-z]+/, "");
+  handle = handle.slice(0, 32).replace(/-+$/g, "");
+  if (!/^[a-z][a-z0-9-]{2,31}$/.test(handle)) {
+    throw new CompilerError(
+      `thredz.agents: true cannot derive a valid agent handle from spec name ${JSON.stringify(specName)} — handles must match ^[a-z][a-z0-9-]{2,31}$. Name it explicitly, e.g. agents: my-expert.`,
+    );
+  }
+  return handle;
+}
+
+/**
+ * Lower the `thredz:` block to a RESOLVED `IrThredz` (shorthands expanded,
+ * defaults filled in): `true` ≡ `{api_key: "$THREDZ_API_KEY"}`, a string is
+ * the api_key, `visibility` defaults to `private` (design §4.3 — never
+ * Thredz's shared-by-default), `goals` defaults to "on when continuity goals
+ * are on" (the caller passes that fact), and `agents` resolves to a concrete
+ * handle or stays absent. `api_key` rides `lowerCredential` — a typo'd
+ * `$thredz_key` fails the compile, never ships as a baked literal.
+ */
+function lowerThredzBlock(spec: SpecWithThredz, continuityGoalsOn: boolean): IrThredz | undefined {
+  const t = spec.thredz;
+  if (t === undefined || t === false) return undefined;
+  const obj =
+    t === true ? { api_key: "$THREDZ_API_KEY" } : typeof t === "string" ? { api_key: t } : t;
+  const agents = obj.agents;
+  const agentName =
+    agents === undefined || agents === false
+      ? undefined
+      : agents === true
+        ? deriveThredzHandle(spec.name)
+        : agents;
+  return {
+    apiKey: lowerCredential("thredz.api_key", obj.api_key),
+    ...(obj.base_url !== undefined ? { baseUrl: obj.base_url } : {}),
+    visibility: obj.visibility ?? "private",
+    goals: obj.goals ?? continuityGoalsOn,
+    ...(agentName !== undefined ? { agentName } : {}),
+  };
+}
+
+/**
+ * §4.1 — synthesize the `mcp_servers.thredz` stdio entry from an `IrThredz`.
+ * Env values are `IrSecretRef`s riding the §4.2 secret machinery end-to-end:
+ * the key stays out of compiled artifacts, `collectSecretRefs` lists
+ * `THREDZ_API_KEY` in the generated README automatically, and emitted
+ * bundles resolve it at boot via `resolveMcpServerConfig` (fail-fast with
+ * the variable's name when unset).
+ */
+function synthesizeThredzServer(thredz: IrThredz): IrMcpServerConfig {
+  return {
+    transport: "stdio",
+    command: "npx",
+    args: ["-y", THREDZ_MCP_PACKAGE_SPEC],
+    env: {
+      THREDZ_API_KEY: thredz.apiKey,
+      ...(thredz.baseUrl !== undefined
+        ? { THREDZ_API_BASE: { kind: "literal", value: thredz.baseUrl } }
+        : {}),
+      // Deterministic visibility enforcement (§4.3): never left to the
+      // server's own default, even though thredz-mcp v0.2.0 also defaults
+      // private.
+      THREDZ_DEFAULT_VISIBILITY: { kind: "literal", value: thredz.visibility },
+    },
+  };
+}
+
+/**
+ * The emit-WIRED lowering (cli shape): resolve the block, synthesize the MCP
+ * server (unless the user declared their own `mcp_servers.thredz` — explicit
+ * beats implicit; `crewhaus lint` warns about the shadowing), and flip
+ * `memory.backend` to `thredz` on a declared memory block. Cross-field
+ * validation lives here (LOAD-BEARING — ir-passes are opt-in and skipped on
+ * the plain compile path):
+ *   - `memory.backend: thredz` without the `thredz:` block is an error (the
+ *     backend needs the API key the block carries);
+ *   - `memory.backend: file` alongside `thredz:` is a contradiction.
+ */
+function lowerThredzWired(
+  spec: SpecWithThredz,
+  opts: {
+    readonly continuityGoalsOn: boolean;
+    readonly mcpServers: IrMcpServers;
+    readonly memory: { memory?: IrMemory };
+  },
+): { thredz?: IrThredz; mcp_servers: IrMcpServers; memory?: IrMemory } {
+  const thredz = lowerThredzBlock(spec, opts.continuityGoalsOn);
+  if (thredz === undefined) {
+    if (spec.memory?.backend === "thredz") {
+      throw new CompilerError(
+        `memory.backend "thredz" needs the top-level thredz: block (it carries the API key) — add \`thredz: $THREDZ_API_KEY\`, or drop the backend override to stay on local files.`,
+      );
+    }
+    return { mcp_servers: opts.mcpServers, ...opts.memory };
+  }
+  if (spec.memory?.backend === "file") {
+    throw new CompilerError(
+      `memory.backend "file" contradicts the thredz: block — the one knob flips the wiki backend to Thredz (design §4). Drop the backend override (or remove thredz:) and recompile.`,
+    );
+  }
+  const userDeclared = opts.mcpServers[THREDZ_MCP_SERVER_NAME] !== undefined;
+  const mcpServers = userDeclared
+    ? opts.mcpServers
+    : (Object.freeze({
+        ...opts.mcpServers,
+        [THREDZ_MCP_SERVER_NAME]: synthesizeThredzServer(thredz),
+      }) as IrMcpServers);
+  const memory =
+    opts.memory.memory !== undefined
+      ? { memory: { ...opts.memory.memory, backend: "thredz" as const } }
+      : {};
+  return { thredz, mcp_servers: mcpServers, ...memory };
+}
+
+/**
+ * The CARRIED lowering (channel/managed/research/crew): the block parses and
+ * lowers to `IrThredz` so recompiles round-trip, but nothing is synthesized
+ * or flipped — those emitters print the 0.2.3-convention ignored-note
+ * comment instead of half-wiring a backend their daemons cannot boot yet.
+ * An explicit `memory.backend: thredz` is rejected loudly (dead config that
+ * would degrade-warn every run beats nobody's use case).
+ */
+function lowerThredzCarried(
+  spec: SpecWithThredz,
+  continuityGoalsOn: boolean,
+  shape: string,
+): { thredz?: IrThredz } {
+  if (spec.memory?.backend === "thredz") {
+    throw new CompilerError(
+      `memory.backend "thredz" is emit-wired on the cli shape only in this release — the ${shape} shape carries the thredz: block for forward compatibility but keeps the local backend. Remove the backend override.`,
+    );
+  }
+  const thredz = lowerThredzBlock(spec, continuityGoalsOn);
+  return thredz !== undefined ? { thredz } : {};
+}
+
 type SpecWithObservability = {
   readonly observability?: {
     readonly slo?: {
@@ -1187,7 +1361,20 @@ export function assertChainGameLowered(
 
 export function lower(spec: Spec): IrNode {
   switch (spec.target) {
-    case "cli":
+    case "cli": {
+      // v0.3.0 Goal 1 — DEFAULT-ON continuity (the release's one sanctioned
+      // behavior change): absent lowers to the default-on config;
+      // `continuity: false` restores prior bytes exactly.
+      const continuity = lowerContinuity(spec, { defaultOn: true, autoScope: "spec" });
+      // v0.3.0 Goal 3 — the `thredz:` knob, emit-WIRED on this shape:
+      // synthesizes `mcp_servers.thredz` (user-declared wins) and flips a
+      // declared memory block's backend. No thredz block ⇒ both pass
+      // through unchanged (byte-identical bundles).
+      const thredzLowered = lowerThredzWired(spec, {
+        continuityGoalsOn: continuity.continuity?.plan === true,
+        mcpServers: lowerMcpServers(spec.mcp_servers),
+        memory: lowerMemory(spec),
+      });
       return {
         version: 0,
         name: spec.name,
@@ -1200,7 +1387,7 @@ export function lower(spec: Spec): IrNode {
         },
         tools: spec.tools ?? [],
         toolConfigs: lowerToolConfigs(spec.tool_config),
-        mcp_servers: lowerMcpServers(spec.mcp_servers),
+        mcp_servers: thredzLowered.mcp_servers,
         permissions: lowerPermissions(spec),
         subAgents: lowerSubAgents(spec.agent.sub_agents),
         compaction: lowerCompaction(spec),
@@ -1208,11 +1395,9 @@ export function lower(spec: Spec): IrNode {
         ...lowerBudget(spec),
         ...lowerSecurity(spec),
         ...lowerFeedback(spec),
-        ...lowerMemory(spec),
-        // v0.3.0 Goal 1 — DEFAULT-ON continuity (the release's one
-        // sanctioned behavior change): absent lowers to the default-on
-        // config; `continuity: false` restores prior bytes exactly.
-        ...lowerContinuity(spec, { defaultOn: true, autoScope: "spec" }),
+        ...(thredzLowered.memory !== undefined ? { memory: thredzLowered.memory } : {}),
+        ...continuity,
+        ...(thredzLowered.thredz !== undefined ? { thredz: thredzLowered.thredz } : {}),
         ...lowerObservability(spec),
         // Phase 3 §3.3 — CLI banner config. Plus Phase 2 M2.2 TUI mode
         // gate. Only included when the spec author opted in (cli block
@@ -1234,6 +1419,7 @@ export function lower(spec: Spec): IrNode {
           : {}),
         ...lowerChainSubsystem(spec),
       } satisfies IrV0;
+    }
     case "workflow":
       return {
         version: 0,
@@ -1255,7 +1441,8 @@ export function lower(spec: Spec): IrNode {
         ...lowerContinuity(spec, { defaultOn: false, autoScope: "spec" }),
         ...lowerChainSubsystem(spec),
       } satisfies IrWorkflowV0;
-    case "channel":
+    case "channel": {
+      const continuity = lowerContinuity(spec, { defaultOn: true, autoScope: "session" });
       return {
         version: 0,
         name: spec.name,
@@ -1280,7 +1467,10 @@ export function lower(spec: Spec): IrNode {
         // v0.3.0 Goal 1 — DEFAULT-ON continuity. `auto` scope resolves to
         // `session` on channel: per-conversation stores ride the session
         // router's sessionId (§2.7/§14.5); heartbeat ticks read spec scope.
-        ...lowerContinuity(spec, { defaultOn: true, autoScope: "session" }),
+        ...continuity,
+        // v0.3.0 Goal 3 — thredz is CARRIED on this shape (ignored-note in
+        // the emitted daemon), not emit-wired yet.
+        ...lowerThredzCarried(spec, continuity.continuity?.plan === true, "channel"),
         ...lowerObservability(spec),
         // Phase 3 §3.1 — heartbeat. Duration string ("2h", "30m") is
         // parsed once at lower time so codegen emits a literal numeric
@@ -1304,6 +1494,7 @@ export function lower(spec: Spec): IrNode {
           : {}),
         ...lowerChainSubsystem(spec),
       } satisfies IrChannelV0;
+    }
     case "graph":
       return {
         version: 0,
@@ -1326,7 +1517,8 @@ export function lower(spec: Spec): IrNode {
         ...lowerFailureTaxonomy(spec),
         ...lowerChainSubsystem(spec),
       } satisfies IrGraphV0;
-    case "managed":
+    case "managed": {
+      const continuity = lowerContinuity(spec, { defaultOn: true, autoScope: "spec" });
       return {
         version: 0,
         name: spec.name,
@@ -1351,9 +1543,13 @@ export function lower(spec: Spec): IrNode {
         // v0.3.0 Goal 1 — DEFAULT-ON continuity. `auto` resolves to `spec`
         // scope; the managed daemon tenant-fences every store at boot (the
         // wireMemory deps carry the tenant, §2.7).
-        ...lowerContinuity(spec, { defaultOn: true, autoScope: "spec" }),
+        ...continuity,
+        // v0.3.0 Goal 3 — thredz is CARRIED on this shape (ignored-note in
+        // the emitted daemon), not emit-wired yet.
+        ...lowerThredzCarried(spec, continuity.continuity?.plan === true, "managed"),
         ...lowerObservability(spec),
       } satisfies IrManagedV0;
+    }
     case "pipeline":
       return {
         version: 0,
@@ -1393,7 +1589,8 @@ export function lower(spec: Spec): IrNode {
         compaction: lowerCompaction(spec),
         ...lowerFailureTaxonomy(spec),
       } satisfies IrPipelineV0;
-    case "crew":
+    case "crew": {
+      const continuity = lowerContinuity(spec, { defaultOn: true, autoScope: "spec" });
       return {
         version: 0,
         name: spec.name,
@@ -1419,10 +1616,15 @@ export function lower(spec: Spec): IrNode {
         // DEFAULT-ON continuity: roles share the `spec`-scoped plan store
         // (the plan IS the coordination surface, §2.7).
         ...lowerMemory(spec),
-        ...lowerContinuity(spec, { defaultOn: true, autoScope: "spec" }),
+        ...continuity,
+        // v0.3.0 Goal 3 — thredz is CARRIED on this shape (ignored-note in
+        // the emitted bundle), not emit-wired yet.
+        ...lowerThredzCarried(spec, continuity.continuity?.plan === true, "crew"),
         ...lowerChainSubsystem(spec),
       } satisfies IrCrewV0;
-    case "research":
+    }
+    case "research": {
+      const continuity = lowerContinuity(spec, { defaultOn: true, autoScope: "spec" });
       return {
         version: 0,
         name: spec.name,
@@ -1451,9 +1653,13 @@ export function lower(spec: Spec): IrNode {
         ...lowerFailureTaxonomy(spec),
         ...lowerMemory(spec),
         // v0.3.0 Goal 1 — DEFAULT-ON continuity, `spec` scope (§2.7).
-        ...lowerContinuity(spec, { defaultOn: true, autoScope: "spec" }),
+        ...continuity,
+        // v0.3.0 Goal 3 — thredz is CARRIED on this shape (ignored-note in
+        // the emitted daemon), not emit-wired yet.
+        ...lowerThredzCarried(spec, continuity.continuity?.plan === true, "research"),
         ...lowerChainSubsystem(spec),
       } satisfies IrResearchV0;
+    }
     case "batch":
       return {
         version: 0,
