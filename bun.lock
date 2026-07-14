@@ -930,6 +930,9 @@
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
       },
+      "devDependencies": {
+        "@crewhaus/embedder": "workspace:*",
+      },
     },
     "packages/meta-harness-optimizer": {
       "name": "@crewhaus/meta-harness-optimizer",

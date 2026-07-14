@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **memory-store v2 — explicit forgetting, provenance, and hybrid recall**
+  (0.3.0 memory release, design §3.4). Memory entries gain additive JSONL
+  fields: `schemaVersion` (2 on new writes; absent = v1, read lazily),
+  `expiresAt` (TTL via `remember(…, { ttlMs })`), `supersededBy`, and
+  `provenance { sessionId?, evidence?: toolUseId[] }`. Mixed v1/v2 files read
+  correctly in both directions. New store APIs: `forget(id|query)` appends
+  supersede tombstones (the file stays append-only — never a hard delete),
+  `sweep()` tombstones TTL-expired entries (deterministic, idempotent),
+  `compact()` rewrites the file dropping dead lines (atomic tmp+rename — the
+  growth-bounding answer to the #53 F7 unbounded-growth TODO), and `list()`
+  materializes lifecycle status. Auto-capture is now proof-linked: captured
+  facts carry `provenance.sessionId` and the source turn's successful
+  `tool_result` toolUseIds as `provenance.evidence`. Passing an `embedder`
+  to `createMemoryStore` upgrades recall to a hybrid BM25 + embedding
+  reciprocal-rank fusion in which tool-grounded facts get a documented rank
+  boost; with no embedder the BM25 ranking is byte-identical to before
+  (regression-guarded).
+- **`MemoryForget` tool** (`@crewhaus/tool-memory`): explicit forgetting by
+  id or query — destructive AND justification-gated (Pillar 3 intent gate).
+  `Remember` accepts an optional `ttlDays`.
+- **`crewhaus memory list|show <id>|forget <id|--query <q>>|sweep [--compact]`**:
+  inspect the per-spec fact stores (id/age/tags/provenance/status), explicitly
+  forget memories, and run the TTL sweep + compaction. Destructive verbs
+  preview their match set and prompt unless `--yes`.
+- **`crewhaus migrate memories [--dry-run]`**: idempotent v2 backfill over
+  `.crewhaus/memories/*.jsonl` via the migration-engine chain — stamps
+  `schemaVersion`, derives `provenance.sessionId` from v1 auto-capture tags,
+  preserves every other line verbatim, and records the store version in
+  `.crewhaus/meta.json`.
 - **Secrets can now reach MCP server child processes.** `mcp_servers` stdio
   `env` and sse `headers` values route through the same `$UPPER_SNAKE`
   secret machinery as every other credential field: plain strings stay
