@@ -235,28 +235,51 @@ function renderMcpServers(ir: IrV0): {
   if (entries.length === 0) {
     return { imports: [], bootBlock: "", cleanupBlock: "", hasAny: false };
   }
+  // v0.3.0 Goal 3 (design §4.3) — the `thredz` server (synthesized, or the
+  // user's own vendored entry) boots through `connectThredz`: its wiki+goals
+  // tools land on the catalog under their BARE names (one vocabulary across
+  // backends) and a boot failure DEGRADES (`__thredz` = null → wireMemory
+  // falls back to local files with a warning) instead of failing the run.
+  const thredzOn = ir.thredz !== undefined;
   const imports = [
     `import { McpHost, resolveMcpServerConfig } from "@crewhaus/mcp-host";`,
-    `import { registerMcpServer } from "@crewhaus/tool-mcp";`,
+    ...(thredzOn ? [`import { connectThredz } from "@crewhaus/memory-service";`] : []),
+    ...(entries.some(([name]) => !(thredzOn && name === "thredz"))
+      ? [`import { registerMcpServer } from "@crewhaus/tool-mcp";`]
+      : []),
   ];
   const addLines = entries
-    .map(
-      ([name, cfg]) =>
-        `mcpHost.addServer(${escapeJsonString(name)}, resolveMcpServerConfig(${JSON.stringify(cfg)}, { name: ${escapeJsonString(name)} }));`,
-    )
+    .map(([name, cfg]) => {
+      const add = `mcpHost.addServer(${escapeJsonString(name)}, resolveMcpServerConfig(${JSON.stringify(cfg)}, { name: ${escapeJsonString(name)} }));`;
+      // §4.4 — a missing THREDZ_API_KEY is a CONFIG failure: render the one
+      // structured report and exit with the config code (21) instead of an
+      // unhandled ConfigError stack (this add runs before the runChatLoop
+      // try/catch wrapper).
+      if (thredzOn && name === "thredz") {
+        return `try {\n  ${add}\n} catch (__err) {\n  const __report = toFailureReport(__err);\n  process.stderr.write(\`\${formatRunFailure(__report, { prefix: "crewhaus:" })}\\n\`);\n  process.exit(__report.exitCode);\n}`;
+      }
+      return add;
+    })
     .join("\n");
-  const registerLines = entries
+  const namespacedEntries = entries.filter(([name]) => !(thredzOn && name === "thredz"));
+  const registerLines = namespacedEntries
     .map(
       ([name]) =>
         `  registerMcpServer(mcpHost, ${escapeJsonString(name)}, defaultCatalog, { onRegister: ({ fullName }) => process.stdout.write(\`[mcp] registered \${fullName}\\n\`) }),`,
     )
     .join("\n");
+  const thredzBoot = thredzOn
+    ? `const __thredz = await connectThredz(mcpHost, defaultCatalog, { log: (line) => process.stdout.write(line)${
+        ir.thredz?.agentName !== undefined
+          ? `, agentName: ${escapeJsonString(ir.thredz.agentName)}`
+          : ""
+      } });`
+    : undefined;
   const bootBlock = [
     "const mcpHost = new McpHost();",
     addLines,
-    "await Promise.all([",
-    registerLines,
-    "]);",
+    ...(thredzBoot !== undefined ? [thredzBoot] : []),
+    ...(namespacedEntries.length > 0 ? ["await Promise.all([", registerLines, "]);"] : []),
   ].join("\n");
   return {
     imports,
@@ -413,13 +436,15 @@ function renderAgent(ir: IrV0): string {
   const permField = renderPermissionsField(ir);
 
   // v0.3.0 Goal 1 — when the IR carries continuity (DEFAULT-ON unless the
-  // spec opted out with `continuity: false`), the composition root owns the
-  // skill/command surface: `wireMemory` merges the builtin continuity skill
-  // and slash commands at lowest precedence with the user's `~/.crewhaus` +
-  // project `.crewhaus` entries, and the bundle registers the Skill tool
-  // from THAT list — the bundle's own discovery would strand the builtin
-  // skill (advertised in the prompt with no tool able to load it).
-  const continuityOn = ir.continuity !== undefined;
+  // spec opted out with `continuity: false`) or learning (PR 17 — its
+  // rendered learning-loop skill and /study /reflect /exam commands come
+  // from the same root), the composition root owns the skill/command
+  // surface: `wireMemory` merges the builtin skills and slash commands at
+  // lowest precedence with the user's `~/.crewhaus` + project `.crewhaus`
+  // entries, and the bundle registers the Skill tool from THAT list — the
+  // bundle's own discovery would strand the builtin skills (advertised in
+  // the prompt with no tool able to load them).
+  const continuityOn = ir.continuity !== undefined || ir.learning !== undefined;
 
   // Section 11 — extension surface. The generated bundle discovers hooks /
   // skills / slash commands at runtime from the user's `.crewhaus/`
@@ -552,6 +577,12 @@ ${catchBlock}${finallyBlock}`;
   const memoryImportBlock = memory.imports.length > 0 ? `${memory.imports.join("\n")}\n` : "";
   const memoryBoot = memory.bootBlock ? `${memory.bootBlock}\n\n` : "";
 
+  // v0.3.0 Goal 3 — with thredz on, the MCP host boots FIRST so wireMemory
+  // receives the live connection (`__thredz`) the backend flip needs; every
+  // other bundle keeps the pinned memory-before-mcp order byte-identically.
+  const bootBlocks =
+    ir.thredz !== undefined ? `${mcpBoot}${memoryBoot}` : `${memoryBoot}${mcpBoot}`;
+
   return `#!/usr/bin/env bun
 // Generated by crewhaus. DO NOT EDIT.
 // Source spec: ${escapeJsonString(ir.name)} (target: cli, ir version: ${ir.version})
@@ -561,7 +592,7 @@ ${permImport}${importBlock}${catalogImport}${mcpImportBlock}${subAgentImportBloc
 ${registerBlock}
 ${extensionBoot}
 
-${bannerBoot}${subAgentsBoot}${egressBoot}${memoryBoot}${mcpBoot}${wrapped}
+${bannerBoot}${subAgentsBoot}${egressBoot}${bootBlocks}${wrapped}
 `;
 }
 
@@ -682,27 +713,64 @@ function renderMemory(ir: IrV0): { imports: string[]; bootBlock: string; field: 
   const mem = ir.memory;
   const memoryOn = mem !== undefined && mem.enabled !== false;
   const continuityOn = ir.continuity !== undefined;
-  if (!memoryOn && !continuityOn) {
+  const thredzOn = ir.thredz !== undefined;
+  if (!memoryOn && !continuityOn && !thredzOn) {
     return { imports: [], bootBlock: "", field: "" };
   }
-  const imports = [`import { wireMemory } from "@crewhaus/memory-service";`];
+  // v0.3.0 PR 14 (§6.3) — boot-time dream catch-up, cli shape: when the
+  // schedule is overdue, the DETERMINISTIC phase runs (sub-second, zero
+  // spend) and the bundle prints the note pointing at `crewhaus dream` for
+  // the full consolidation. Only emitted when the spec configured
+  // memory.dream, so dream-less bundles keep their pinned bytes.
+  const dreamOn = memoryOn && mem?.dream !== undefined;
+  // v0.3.0 Goal 2 (§3.3, PR 17) — the first-class exam: with `learning.exam`
+  // configured, the bundle constructs the programmatic exam runner
+  // (eval-runner's `createExamRunner`) and hands it to wireMemory, which
+  // registers the `run_exam` tool + gates in `/exam`. No Bash shell-out —
+  // the compiled bundle sits its exam in-process, same as the interpreter.
+  const learningOn = ir.learning !== undefined;
+  const examOn = learningOn && ir.learning?.exam !== undefined;
+  const imports = [
+    `import { wireMemory${dreamOn ? ", runDreamBootCatchUp" : ""} } from "@crewhaus/memory-service";`,
+    ...(examOn ? [`import { createExamRunner } from "@crewhaus/eval-runner";`] : []),
+  ];
   const fragment = JSON.stringify(
     memoryFragmentFromIr({
       name: ir.name,
       ...(memoryOn ? { memory: ir.memory } : {}),
       ...(continuityOn ? { continuity: ir.continuity } : {}),
+      ...(thredzOn ? { thredz: ir.thredz } : {}),
+      ...(learningOn ? { learning: ir.learning } : {}),
     }),
   );
-  if (!continuityOn) {
+  // v0.3.0 Goal 3 — hand wireMemory the live thredz connection from the MCP
+  // boot block (which runs first when thredz is on); null means boot failed
+  // and wireMemory degrades to local files with a warning (§4.4).
+  const thredzDep = thredzOn ? ", thredz: __thredz" : "";
+  // The exam runner reuses the bundle's own identity (model + instructions —
+  // the examinee is THIS harness) and the same fragment/thredz wiring the
+  // memory fabric boots with. The instructions literal appears once more in
+  // the runChatLoop call below; duplicating the string keeps the no-learning
+  // emission byte-identical (a shared const would reshape every bundle).
+  const examDep = (cwdExpr: string): string =>
+    examOn
+      ? `, examRunner: createExamRunner({ specName: ${escapeJsonString(ir.name)}, model: ${escapeJsonString(ir.agent.model)}, instructions: ${escapeJsonString(ir.agent.instructions)}, fragment: ${fragment}, cwd: ${cwdExpr}${thredzOn ? ", thredz: __thredz" : ""} })`
+      : "";
+  const dreamBoot = (cwdExpr: string): string =>
+    dreamOn
+      ? `\nconst __dreamNote = await runDreamBootCatchUp(${fragment}, { cwd: ${cwdExpr} });
+if (__dreamNote !== null) process.stdout.write(\`\${__dreamNote}\\n\`);`
+      : "";
+  if (!continuityOn && !learningOn) {
     // PR 10-pinned bytes: the `continuity: false` opt-out path.
-    const bootBlock = `const __memWired = await wireMemory(${fragment}, { catalog: defaultCatalog, cwd: process.cwd() });`;
+    const bootBlock = `const __memWired = await wireMemory(${fragment}, { catalog: defaultCatalog, cwd: process.cwd()${thredzDep}${examDep("process.cwd()")} });${dreamBoot("process.cwd()")}`;
     const field = "\n  ...__memWired.options,";
     return { imports, bootBlock, field };
   }
-  const bootBlock = `const __memWired = await wireMemory(${fragment}, { catalog: defaultCatalog, cwd: __cwd });
+  const bootBlock = `const __memWired = await wireMemory(${fragment}, { catalog: defaultCatalog, cwd: __cwd${thredzDep}${examDep("__cwd")} });
 const __skills = __memWired.options.skills ?? [];
 const __slashCommands = __memWired.options.slashCommands ?? new Map();
-if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));`;
+if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));${dreamBoot("__cwd")}`;
   const field = "\n  ...__memWired.options,";
   return { imports, bootBlock, field };
 }

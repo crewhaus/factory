@@ -363,6 +363,11 @@ const TOOL_VOCABULARY = new Set([
   "wiki_set_signals",
   "wiki_stats",
   "log_knowledge_gap",
+  // thredz goal/task vocabulary (bare-name aliases, PR 16) — the gap
+  // listing surface on the hosted backend
+  "task_list",
+  // the first-class exam (memory-service run_exam, PR 17)
+  "run_exam",
 ]);
 
 // Identifiers that look tool-shaped inside code spans but are deliberately

@@ -72,12 +72,25 @@ export type CollectedSecretRefs = {
   readonly literalCount: number;
 };
 
+/**
+ * Literal refs under these keys are COMPILER-SYNTHESIZED configuration
+ * knobs (v0.3.0 `thredz:` lowering — visibility enforcement + self-hosted
+ * base URL), not user-supplied secrets: counting them would print the
+ * "supplied as literals in the spec" warning on every one-knob
+ * `thredz: true` spec whose author supplied nothing literal at all. Scoped
+ * to exactly these names so every user-declared literal keeps warning.
+ */
+const SYNTHESIZED_LITERAL_KEYS: ReadonlySet<string> = new Set([
+  "THREDZ_DEFAULT_VISIBILITY",
+  "THREDZ_API_BASE",
+]);
+
 export function collectSecretRefs(ir: unknown): CollectedSecretRefs {
   const envNames = new Set<string>();
   let literalCount = 0;
-  const visit = (node: unknown): void => {
+  const visit = (node: unknown, parentKey?: string): void => {
     if (Array.isArray(node)) {
-      for (const item of node) visit(item);
+      for (const item of node) visit(item, parentKey);
       return;
     }
     if (node === null || typeof node !== "object") return;
@@ -88,9 +101,11 @@ export function collectSecretRefs(ir: unknown): CollectedSecretRefs {
     if (record["kind"] === "env" && typeof record["name"] === "string") {
       envNames.add(record["name"]);
     } else if (record["kind"] === "literal" && typeof record["value"] === "string") {
-      literalCount += 1;
+      if (parentKey === undefined || !SYNTHESIZED_LITERAL_KEYS.has(parentKey)) {
+        literalCount += 1;
+      }
     }
-    for (const value of Object.values(record)) visit(value);
+    for (const [key, value] of Object.entries(record)) visit(value, key);
   };
   visit(ir);
   return { envNames: [...envNames].sort(), literalCount };

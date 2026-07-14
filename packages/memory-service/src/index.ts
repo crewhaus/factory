@@ -57,12 +57,17 @@
  * Everything is ABSENT-SAFE: a fragment with none of the blocks wires
  * nothing — no stores touched, no tools registered, `options` spreads empty.
  *
- * ## Backends
+ * ## Backends (v0.3.0 Goal 3, design §4.3/§4.4)
  *
- * `memory.backend` is a reserved discriminator: `"file"` (the default) is
- * implemented here; `"thredz"` fails fast with a clear not-yet-implemented
- * error until PR 16 lands the Thredz store implementations over the
- * already-connected McpHost client (design §4.3).
+ * `"file"` (the default) is the local fabric above. With `thredz` configured
+ * (the fragment's `thredz` slice / `memory.backend: "thredz"`) and a live
+ * connection in `deps.thredz` (from {@link connectThredz}, which registers
+ * the wiki+goals vocabulary as bare-name MCP aliases), the WIKI backend
+ * flips: no local wiki store/tools are constructed, recall routes through
+ * the MCP client, and continuity goal writes mirror to Thredz (spec scope
+ * only). Facts, focus, ledger, and dream state stay local always. Thredz
+ * configured but unreachable DEGRADES to the local backend with a boot
+ * warning — never a crash (§4.4).
  *
  * ## Scoping + tenancy (§2.7)
  *
@@ -76,6 +81,7 @@
  * fence of its own — is constructed inside the tenant root).
  */
 import { readFileSync } from "node:fs";
+import { readdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import {
   type ContinuityScope,
@@ -83,7 +89,15 @@ import {
   createContinuityStore,
   renderStatus,
 } from "@crewhaus/continuity-store";
-import { DEFAULT_SKILLS, builtinCommandsDir } from "@crewhaus/default-skills";
+import { DEFAULT_SKILLS, DREAM_SKILL_BODY, builtinCommandsDir } from "@crewhaus/default-skills";
+import {
+  type DreamEngine,
+  type DreamJanitorStep,
+  type DreamModelPhase,
+  type DreamRunReport,
+  createDreamEngine,
+  dreamJanitorStep,
+} from "@crewhaus/dream-engine";
 import { createEmbedder } from "@crewhaus/embedder";
 import { CrewhausError } from "@crewhaus/errors";
 import {
@@ -94,7 +108,8 @@ import {
   summarizeDurableFactsWithEvidence,
   turnsFromEvents,
 } from "@crewhaus/memory-store";
-import { type SkillRef, discoverSkills } from "@crewhaus/skills-registry";
+import { createPiiRedactor } from "@crewhaus/pii-redactor";
+import { type LoadedSkill, type SkillRef, discoverSkills } from "@crewhaus/skills-registry";
 import { type SlashCommand, loadCommands } from "@crewhaus/slash-commands";
 import type { Tenant } from "@crewhaus/tenancy";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
@@ -102,6 +117,65 @@ import { createMemoryTools } from "@crewhaus/tool-memory";
 import { type ContinuityEvent, createPlanTools } from "@crewhaus/tool-plan";
 import { type KnowledgeGap, type WikiEvent, createWikiTools } from "@crewhaus/tool-wiki";
 import { type WikiStore, createWikiStore } from "@crewhaus/wiki-store";
+import {
+  type ExamRunner,
+  GAP_GOAL_PREFIX,
+  type IrLearningLike,
+  type LearningWiringFragment,
+  createExamTool,
+  renderedLearningSkill,
+  withLearningDreamSeed,
+} from "./learning.js";
+import {
+  type ThredzConnection,
+  classifyThredzFailure,
+  parseThredzRecallLines,
+  withThredzGoalMirror,
+} from "./thredz.js";
+
+// v0.3.0 Goal 2 — the learning wiring surface (design §3.3, PR 17): skill
+// substitution, the study-rotation preamble, the exam seam, and the dream
+// learning seed.
+export {
+  GAP_GOAL_PREFIX,
+  buildLearningDreamSeed,
+  createExamTool,
+  learningSkillSubstitutions,
+  nextCurriculumRung,
+  renderStudyRotationPreamble,
+  renderedLearningSkill,
+  withLearningDreamSeed,
+  type CreateExamToolOptions,
+  type ExamReport,
+  type ExamRunner,
+  type ExamRunnerRequest,
+  type ExamSampleOutcome,
+  type IrLearningLike,
+  type LearningExamFragment,
+  type LearningStudyFragment,
+  type LearningWiringFragment,
+} from "./learning.js";
+
+// v0.3.0 Goal 3 — the Thredz wiring surface (design §4.3/§4.4): boot helper,
+// alias vocabulary, failure classifier, and the injected-client seam types.
+export {
+  THREDZ_SERVER_NAME,
+  THREDZ_GOAL_TOOL_NAMES,
+  THREDZ_ALIAS_TOOL_NAMES,
+  THREDZ_ALIAS_TOOL_FLAGS,
+  THREDZ_GOAL_MAP_FILE,
+  classifyThredzFailure,
+  connectThredz,
+  extractThredzGoalId,
+  parseThredzRecallLines,
+  withThredzGoalMirror,
+  type ConnectThredzOptions,
+  type ThredzCallResult,
+  type ThredzClient,
+  type ThredzConnection,
+  type ThredzFailureClass,
+  type ThredzGoalMirrorOptions,
+} from "./thredz.js";
 
 export class MemoryServiceError extends CrewhausError {
   override readonly name = "MemoryServiceError";
@@ -114,13 +188,14 @@ export class MemoryServiceError extends CrewhausError {
 // the fragment — what a future IrMemory/IrContinuity lowers into (design §9)
 // ---------------------------------------------------------------------------
 
-/** Storage backend discriminator. `"thredz"` is reserved: it lowers from the
- *  `thredz:` block (design §4) and flips every store to the Thredz MCP
- *  implementations in PR 16; until then it fails fast here. */
+/** Storage backend discriminator. `"thredz"` lowers from the `thredz:`
+ *  block (design §4) and flips the WIKI backend to the Thredz MCP server —
+ *  see the Backends section above for exactly what flips and what stays
+ *  local. */
 export type MemoryBackend = "file" | "thredz";
 
 /** The `memory:` slice — `IrMemory` (#53) plus the §9 extensions this root
- *  wires today (`backend`, `ttlMs`, `wiki`). */
+ *  wires today (`backend`, `ttlMs`, `wiki`, `dream`). */
 export type MemoryFactsFragment = {
   /** Presence of the block implies enabled; explicit `false` wires nothing. */
   readonly enabled?: boolean;
@@ -133,6 +208,20 @@ export type MemoryFactsFragment = {
   readonly autoRecall?: boolean;
   readonly recallK?: number;
   readonly wiki?: WikiWiringFragment;
+  readonly dream?: DreamWiringFragment;
+};
+
+/** The `memory.dream` slice (§6/§9) — `IrMemoryDream` structurally. */
+export type DreamWiringFragment = {
+  /** Consolidation cadence in ms (`memory.dream.every`, lowered). */
+  readonly everyMs: number;
+  /** The IR carries this resolved (default `full`); optional here so
+   *  hand-built fragments stay ergonomic. */
+  readonly mode?: "deterministic" | "full";
+  /** Model-phase spend cap (USD). Absent or 0 = deterministic only. */
+  readonly budgetUsd?: number;
+  /** Playbook override; default = the builtin `dream` skill body. */
+  readonly instructions?: string;
 };
 
 /** The `memory.wiki` slice (§3.1/§9). */
@@ -178,6 +267,26 @@ export type ContinuityWiringFragment = {
 };
 
 /**
+ * v0.3.0 Goal 3 — the `thredz:` slice (§4.1/§9), serializable. The
+ * credential/base-url live ONLY in the synthesized MCP server config (the
+ * §4.2 secret machinery); this fragment carries the WIRING knobs — whether
+ * goal writes mirror, the enforced visibility, and the boot handle. The
+ * client itself arrives structurally via `deps.thredz` ({@link ThredzClient})
+ * so the fragment stays a JSON literal in emitted bundles.
+ */
+export type ThredzWiringFragment = {
+  /** Mirror continuity goal writes to Thredz `goal_write`/`goal_update`
+   *  (spec scope only, §14.5 decision 5). The compiler lowers this resolved;
+   *  hand-built fragments default to "on when continuity goals are on". */
+  readonly goals?: boolean;
+  /** The enforced default visibility (informational at this layer — the
+   *  synthesized server env `THREDZ_DEFAULT_VISIBILITY` does the enforcing). */
+  readonly visibility?: "private" | "shared";
+  /** The boot-registered agent handle (`connectThredz` consumes it). */
+  readonly agentName?: string;
+};
+
+/**
  * The serializable input `wireMemory` consumes — the shape the future
  * `IrMemory`/`IrContinuity` lower into. Emitters embed it as a JSON literal
  * (`wireMemory({...}, { catalog: defaultCatalog, cwd: process.cwd() })`);
@@ -188,6 +297,10 @@ export type MemoryWiringFragment = {
   readonly specName: string;
   readonly memory?: MemoryFactsFragment;
   readonly continuity?: ContinuityWiringFragment;
+  /** v0.3.0 Goal 3 — present when `thredz:` is on (design §4). */
+  readonly thredz?: ThredzWiringFragment;
+  /** v0.3.0 Goal 2 — present when `learning:` is on (design §3.3, PR 17). */
+  readonly learning?: LearningWiringFragment;
 };
 
 /** Structural mirror of `IrMemory` (#53 + the v0.3.0 §9 extensions) — kept
@@ -207,6 +320,12 @@ export type IrMemoryLike = {
     readonly autoRecall?: boolean;
     readonly requireSources?: boolean;
   };
+  readonly dream?: {
+    readonly everyMs: number;
+    readonly mode: "deterministic" | "full";
+    readonly budgetUsd?: number;
+    readonly instructions?: string;
+  };
 };
 
 /** Structural mirror of `IrContinuity` (v0.3.0 §9) — the compiler lowers a
@@ -222,6 +341,16 @@ export type IrContinuityLike = {
   readonly focusMaxChars?: number;
 };
 
+/** Structural mirror of the wiring-relevant `IrThredz` fields (§4.1). The
+ *  credential (`apiKey`) and `baseUrl` deliberately do NOT appear — they
+ *  belong to the synthesized MCP server config, never to a fragment an
+ *  emitter serializes into a bundle. */
+export type IrThredzLike = {
+  readonly goals?: boolean;
+  readonly visibility?: "private" | "shared";
+  readonly agentName?: string;
+};
+
 /**
  * Build the fragment from a lowered IR's `name` + `memory` + `continuity`
  * blocks EXACTLY as the pre-PR-10 `renderMemory` codegen read them — only
@@ -235,10 +364,15 @@ export function memoryFragmentFromIr(ir: {
   readonly name: string;
   readonly memory?: IrMemoryLike;
   readonly continuity?: IrContinuityLike;
+  readonly thredz?: IrThredzLike;
+  readonly learning?: IrLearningLike;
 }): MemoryWiringFragment {
   const mem = ir.memory;
   const wiki = mem?.wiki;
+  const dream = mem?.dream;
   const cont = ir.continuity;
+  const thredz = ir.thredz;
+  const learning = ir.learning;
   return {
     specName: ir.name,
     ...(mem !== undefined
@@ -266,6 +400,18 @@ export function memoryFragmentFromIr(ir: {
                   },
                 }
               : {}),
+            ...(dream !== undefined
+              ? {
+                  dream: {
+                    everyMs: dream.everyMs,
+                    mode: dream.mode,
+                    ...(dream.budgetUsd !== undefined ? { budgetUsd: dream.budgetUsd } : {}),
+                    ...(dream.instructions !== undefined
+                      ? { instructions: dream.instructions }
+                      : {}),
+                  },
+                }
+              : {}),
           },
         }
       : {}),
@@ -278,6 +424,39 @@ export function memoryFragmentFromIr(ir: {
             ...(cont.handoff !== undefined ? { handoff: cont.handoff } : {}),
             ...(cont.scope !== undefined ? { scope: cont.scope } : {}),
             ...(cont.focusMaxChars !== undefined ? { focusMaxChars: cont.focusMaxChars } : {}),
+          },
+        }
+      : {}),
+    ...(thredz !== undefined
+      ? {
+          thredz: {
+            ...(thredz.goals !== undefined ? { goals: thredz.goals } : {}),
+            ...(thredz.visibility !== undefined ? { visibility: thredz.visibility } : {}),
+            ...(thredz.agentName !== undefined ? { agentName: thredz.agentName } : {}),
+          },
+        }
+      : {}),
+    ...(learning !== undefined
+      ? {
+          learning: {
+            domain: learning.domain,
+            ...(learning.curriculum !== undefined ? { curriculum: learning.curriculum } : {}),
+            ...(learning.sources !== undefined ? { sources: [...learning.sources] } : {}),
+            ...(learning.exam !== undefined
+              ? { exam: { dataset: learning.exam.dataset, graders: learning.exam.graders } }
+              : {}),
+            ...(learning.study !== undefined
+              ? {
+                  study: {
+                    ...(learning.study.onHeartbeat !== undefined
+                      ? { onHeartbeat: learning.study.onHeartbeat }
+                      : {}),
+                    ...(learning.study.onDream !== undefined
+                      ? { onDream: learning.study.onDream }
+                      : {}),
+                  },
+                }
+              : {}),
           },
         }
       : {}),
@@ -328,6 +507,19 @@ export type WireMemoryDeps = {
   /** Home directory override for skill/command discovery (tests). */
   readonly homeDir?: string;
   readonly now?: () => Date;
+  /** v0.3.0 Goal 3 — the live Thredz connection from {@link connectThredz}.
+   *  `null` means "configured but boot failed" — wireMemory then DEGRADES to
+   *  the local backend with a warning (§4.4), it never throws. Absent when
+   *  the fragment carries no thredz slice. */
+  readonly thredz?: ThredzConnection | null;
+  /** v0.3.0 Goal 2 (§3.3, PR 17) — the injected programmatic exam runner
+   *  (`@crewhaus/eval-runner`'s `createExamRunner`; injected because
+   *  eval-runner depends on this package). With `learning.exam` configured
+   *  AND a runner present, the `run_exam` tool registers and the `/exam`
+   *  command joins the gated set. Absent → learning still wires (skill +
+   *  /study /reflect) but no exam surface — a consumer without the eval
+   *  stack never advertises an exam it cannot sit. */
+  readonly examRunner?: ExamRunner;
 };
 
 /** The `RunChatLoopOptions.memory` seam shape (structural — assignability
@@ -380,8 +572,16 @@ export type WiredContinuity = {
 };
 
 export type WiredWiki = {
-  readonly store: WikiStore;
+  /** Which backend answered (design §4.3): `"file"` constructs the local
+   *  store; `"thredz"` routes through the MCP client (the tool surface then
+   *  comes from the bare-name aliases registered at MCP boot, so `tools` is
+   *  empty and `store` null — articles live server-side). */
+  readonly backend: "file" | "thredz";
+  readonly store: WikiStore | null;
   readonly tools: readonly RegisteredTool[];
+  /** Recall lines for the §3.4 auto-recall fusion — the same
+   *  `[wiki:<slug>] <title> — <excerpt>` bundle shape on both backends. */
+  readonly recall: (query: string, k: number) => Promise<readonly string[]>;
 };
 
 export type WiredMemory = {
@@ -405,7 +605,7 @@ function tenantRootOf(tenant: Tenant): string {
   return resolve(tenant.sessionRoot, "..");
 }
 
-function crewhausDirOf(deps: WireMemoryDeps): string {
+function crewhausDirOf(deps: { readonly tenant?: Tenant; readonly cwd: string }): string {
   return deps.tenant !== undefined ? tenantRootOf(deps.tenant) : resolve(deps.cwd, ".crewhaus");
 }
 
@@ -425,19 +625,25 @@ function wikiEnabled(fragment: MemoryWiringFragment): boolean {
   );
 }
 
-function assertBackendImplemented(fragment: MemoryWiringFragment): void {
-  const backend = fragment.memory?.backend;
-  if (backend === undefined || backend === "file") return;
-  // Reserved discriminator (design §4): loud and actionable, never a silent
-  // local fallback that would strand writes on the wrong backend.
-  throw new MemoryServiceError(
-    `memory-service: backend "${backend}" is reserved but not implemented yet — the Thredz store flip ships with the thredz: block (design §4, PR 16). Use backend "file" (or omit it) until then.`,
-  );
+function dreamEnabled(fragment: MemoryWiringFragment): boolean {
+  return memoryEnabled(fragment) && fragment.memory?.dream !== undefined;
 }
+
+/** v0.3.0 Goal 3 — is Thredz configured on this fragment? Either the
+ *  `thredz:` slice is present or a declared memory block carries
+ *  `backend: "thredz"` (the compiler stamps both together). */
+function thredzConfigured(fragment: Pick<MemoryWiringFragment, "memory" | "thredz">): boolean {
+  return fragment.thredz !== undefined || fragment.memory?.backend === "thredz";
+}
+
+/** The §4.4 degrade line, printed once per boot when Thredz is configured
+ *  but no live connection arrived (offline, npx failure, no MCP host). */
+const THREDZ_DEGRADE_NOTE =
+  "[thredz] unavailable — memory degraded to the local backend for this run (local stores under .crewhaus/ stay authoritative; nothing was lost)\n";
 
 function resolveEmbedder(
   fragment: MemoryWiringFragment,
-  deps: WireMemoryDeps,
+  deps: { readonly embedder?: EmbedderLike },
 ): EmbedderLike | undefined {
   if (deps.embedder !== undefined) return deps.embedder;
   const spec = fragment.memory?.wiki?.embedder;
@@ -584,7 +790,7 @@ async function renderPlanTail(
  * `wireMemory`'s job — granular callers keep their own prompt surface.
  */
 export function wireContinuity(
-  fragment: Pick<MemoryWiringFragment, "specName" | "continuity">,
+  fragment: Pick<MemoryWiringFragment, "specName" | "continuity" | "thredz">,
   deps: WireMemoryDeps,
 ): WiredContinuity | null {
   if (!continuityEnabled(fragment)) return null;
@@ -603,7 +809,7 @@ export function wireContinuity(
 
   // Under a tenant the store computes `<tenantRoot>/state` itself (and
   // fences it); outside one we anchor to the caller's cwd.
-  const store = createContinuityStore({
+  const localStore = createContinuityStore({
     specName: fragment.specName,
     ...(deps.tenant !== undefined
       ? { tenant: deps.tenant }
@@ -616,6 +822,28 @@ export function wireContinuity(
     ...(cont.focusMaxChars !== undefined ? { focusMaxChars: cont.focusMaxChars } : {}),
     ...(deps.now !== undefined ? { now: deps.now } : {}),
   });
+
+  // v0.3.0 Goal 3 (§4.4) — the Thredz goal mirror. SPEC scope only (§14.5
+  // resolved decision 5: goals are key-scoped server-side with tight plan
+  // quotas — a per-conversation goal would burn the account immediately, so
+  // session-scoped stores never mirror). The local write is authoritative
+  // and always lands first; a Thredz-side failure skips with one classified
+  // warning and never fails the write.
+  const mirrorOn =
+    fragment.thredz !== undefined &&
+    (fragment.thredz.goals ?? true) &&
+    cont.plan !== false &&
+    scope.kind === "spec" &&
+    deps.thredz !== null &&
+    deps.thredz !== undefined;
+  const store =
+    mirrorOn && deps.thredz != null
+      ? withThredzGoalMirror(localStore, {
+          client: deps.thredz.client,
+          specName: fragment.specName,
+          ...(deps.log !== undefined ? { log: deps.log } : {}),
+        })
+      : localStore;
 
   const bundle = createPlanTools({
     specName: fragment.specName,
@@ -668,21 +896,67 @@ export type WireWikiExtras = {
 };
 
 /**
- * Wire the wiki slice alone: construct the (tenant-fenced) wiki store and
- * register the ten thredz-vocabulary `wiki_*` tools. Returns null when the
- * fragment carries no enabled `memory.wiki` block (the wiki nests under
- * `memory:` — design §9 — so a disabled memory block disables it too).
+ * Wire the wiki slice alone. Three outcomes (design §4.3/§4.4):
+ *
+ *   - **Thredz backend** (fragment carries thredz/`backend: "thredz"` AND a
+ *     live `deps.thredz` connection): the wiki surface is the bare-name
+ *     aliases `connectThredz` already put on the catalog, so NO local store
+ *     is constructed and NO local tools are registered (`store: null`,
+ *     `tools: []`) — the local wiki on disk stays untouched (§5: removing
+ *     `thredz:` reverts to files). The `recall` seam routes `wiki_recall`
+ *     through the MCP client and renders the SAME recall-bundle line shape.
+ *   - **Local backend**: as before — the (tenant-fenced) `WikiStore` plus
+ *     the ten thredz-vocabulary `wiki_*` tools. This is ALSO the §4.4
+ *     degrade target: Thredz configured but unreachable wires the local
+ *     surface even without a `memory.wiki` block, so the tool vocabulary the
+ *     spec promised never vanishes mid-run.
+ *   - **null**: no wiki anywhere (no enabled `memory.wiki`, no thredz).
  */
 export function wireWiki(
-  fragment: Pick<MemoryWiringFragment, "specName" | "memory">,
+  fragment: Pick<MemoryWiringFragment, "specName" | "memory" | "thredz">,
   deps: WireMemoryDeps,
   extras: WireWikiExtras = {},
 ): WiredWiki | null {
   const full: MemoryWiringFragment = {
     specName: fragment.specName,
     ...(fragment.memory !== undefined ? { memory: fragment.memory } : {}),
+    ...(fragment.thredz !== undefined ? { thredz: fragment.thredz } : {}),
   };
-  if (!wikiEnabled(full)) return null;
+  const wantsThredz = thredzConfigured(full);
+  const wikiOff = full.memory?.wiki?.enabled === false;
+
+  // The Thredz backend flip (§4.3) — one connection, one vocabulary.
+  if (wantsThredz && deps.thredz != null) {
+    if (wikiOff) return null;
+    const client = deps.thredz.client;
+    const log = deps.log;
+    return {
+      backend: "thredz",
+      store: null,
+      tools: [],
+      recall: async (query, k) => {
+        let res: { content: string; isError: boolean };
+        try {
+          res = await client.callTool("wiki_recall", { query, limit: k });
+        } catch (err) {
+          log?.(
+            `[thredz] wiki recall unavailable (thredz_unavailable): ${(err as Error).message}\n`,
+          );
+          return [];
+        }
+        if (res.isError) {
+          log?.(`[thredz] wiki recall failed (${classifyThredzFailure(res.content)})\n`);
+          return [];
+        }
+        return parseThredzRecallLines(res.content, k);
+      },
+    };
+  }
+
+  // Local backend — including the §4.4 degrade (thredz configured, no
+  // connection): the promised wiki surface stays available on local files.
+  const localOn = wantsThredz ? !wikiOff : wikiEnabled(full);
+  if (!localOn) return null;
   const wiki = full.memory?.wiki ?? {};
   const embedder = resolveEmbedder(full, deps);
 
@@ -705,32 +979,62 @@ export function wireWiki(
     ...(deps.now !== undefined ? { now: deps.now } : {}),
   });
 
-  return { store, tools: bundle.all };
+  return {
+    backend: "file",
+    store,
+    tools: bundle.all,
+    recall: async (query, k) => {
+      const hits = await store.recall(query, k);
+      return hits.map((h) => `[wiki:${h.ref.slug}] ${h.ref.title} — ${excerpt(h.body)}`);
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
 // skills + slash commands (design §2.6 — builtin, lowest precedence)
 // ---------------------------------------------------------------------------
 
-/** Builtin slash commands gated by which feature backs their tools. The
- *  learning-loop commands (/study /reflect /exam) and /dream stay out until
- *  their skills/engines are wired (PR 14/17) — an instruction body that
- *  loads a skill the harness does not carry would strand the model. */
+/** Builtin slash commands gated by which feature backs their tools — an
+ *  instruction body that loads a skill (or names a tool) the harness does
+ *  not carry would strand the model. `/dream` (and the `dream` skill it
+ *  loads) joins the gated set when `memory.dream` is configured (PR 14);
+ *  `/study` `/reflect` join with the `learning:` block, and `/exam` only
+ *  when the exam is actually runnable (`learning.exam` + an injected
+ *  `deps.examRunner` — PR 17). */
 const CONTINUITY_COMMANDS = ["plan", "focus", "next", "handoff", "clear-plan", "clear-focus"];
 const MEMORY_COMMANDS = ["forget"];
+const DREAM_COMMANDS = ["dream"];
+const LEARNING_COMMANDS = ["study", "reflect"];
+const EXAM_COMMANDS = ["exam"];
 
 async function loadSkillsAndCommands(
   deps: WireMemoryDeps,
-  features: { memory: boolean },
+  features: {
+    memory: boolean;
+    dream: boolean;
+    continuity: boolean;
+    learning?: LearningWiringFragment;
+    exam: boolean;
+  },
 ): Promise<{ skills: ReadonlyArray<SkillRef>; slashCommands: ReadonlyMap<string, SlashCommand> }> {
-  // The continuity skill is the only builtin the composition root ships
-  // today: learning-loop needs its {{domain}} substitutions rendered by the
-  // learning: lowering (PR 17) and dream rides the dream engine (PR 14).
-  const continuitySkill = DEFAULT_SKILLS.find((s) => s.name === "continuity");
+  // Builtins the composition root ships: the continuity skill (when
+  // continuity is on), the learning-loop skill RENDERED with the fragment's
+  // domain/curriculum/sources substitutions (when learning is on, §3.3), and
+  // the dream skill when a dream schedule is configured (its /dream command
+  // loads it in-session, §6.3). All merge at LOWEST precedence — a user or
+  // project skill with the same name overrides.
+  const builtinSkills: LoadedSkill[] = [];
+  for (const skill of DEFAULT_SKILLS) {
+    if (skill.name === "continuity" && features.continuity) builtinSkills.push(skill);
+    if (skill.name === "learning-loop" && features.learning !== undefined) {
+      builtinSkills.push(renderedLearningSkill(features.learning));
+    }
+    if (skill.name === "dream" && features.dream) builtinSkills.push(skill);
+  }
   const skills = await discoverSkills({
     cwd: deps.cwd,
     ...(deps.homeDir !== undefined ? { homeDir: deps.homeDir } : {}),
-    ...(continuitySkill !== undefined ? { builtinSkills: [continuitySkill] } : {}),
+    ...(builtinSkills.length > 0 ? { builtinSkills } : {}),
   });
 
   const commands = await loadCommands({
@@ -738,7 +1042,13 @@ async function loadSkillsAndCommands(
     ...(deps.homeDir !== undefined ? { homeDir: deps.homeDir } : {}),
     builtinDirs: [builtinCommandsDir],
   });
-  const allowed = new Set([...CONTINUITY_COMMANDS, ...(features.memory ? MEMORY_COMMANDS : [])]);
+  const allowed = new Set([
+    ...(features.continuity ? CONTINUITY_COMMANDS : []),
+    ...(features.memory ? MEMORY_COMMANDS : []),
+    ...(features.dream ? DREAM_COMMANDS : []),
+    ...(features.learning !== undefined ? LEARNING_COMMANDS : []),
+    ...(features.exam ? EXAM_COMMANDS : []),
+  ]);
   for (const [name, command] of [...commands]) {
     const builtin = command.filePath.startsWith(builtinCommandsDir);
     if (builtin && !allowed.has(name)) commands.delete(name);
@@ -765,7 +1075,14 @@ export async function wireMemory(
   if (typeof fragment.specName !== "string" || fragment.specName === "") {
     throw new MemoryServiceError("memory-service: fragment.specName is required");
   }
-  assertBackendImplemented(fragment);
+
+  // v0.3.0 Goal 3 (§4.4) — Thredz configured but no live connection (boot
+  // failure, offline, or a consumer without an MCP host): degrade to the
+  // local backend with ONE warning line. Never a crash — a lapsed Thredz
+  // subscription must not kill a local-first harness.
+  if (thredzConfigured(fragment) && deps.thredz == null) {
+    deps.log?.(THREDZ_DEGRADE_NOTE);
+  }
 
   const factsOn = memoryEnabled(fragment);
   const tools: RegisteredTool[] = [];
@@ -789,8 +1106,7 @@ export async function wireMemory(
   if (continuity !== null) {
     stores.continuity = continuity.store;
     tools.push(...continuity.tools);
-    const { skills, slashCommands } = await loadSkillsAndCommands(deps, { memory: factsOn });
-    options = { ...options, continuity: continuity.continuity, skills, slashCommands };
+    options = { ...options, continuity: continuity.continuity };
     deps.log?.(`[memory] continuity on — ${continuity.store.dir()} (focus · plans · goals)\n`);
   }
 
@@ -806,20 +1122,26 @@ export async function wireMemory(
       : {}),
   });
   if (wiki !== null) {
-    stores.wiki = wiki.store;
+    if (wiki.store !== null) stores.wiki = wiki.store;
     tools.push(...wiki.tools);
-    deps.log?.(`[memory] wiki on — ${wiki.store.path()}\n`);
+    deps.log?.(
+      wiki.backend === "thredz"
+        ? "[memory] wiki on — thredz backend (server-side articles via the thredz MCP aliases; the local wiki store stays untouched)\n"
+        : `[memory] wiki on — ${wiki.store?.path()}\n`,
+    );
 
     // §3.4/§9 — wiki auto-recall: fuse top-`recallK` wiki hits into the
     // session-start `<recalled_memory>` bundle. Explicit opt-in
     // (`wiki.autoRecall: true`), mirroring the fact store's autoRecall
-    // semantics. The runtime classifies + delimiter-escapes the assembled
-    // block (the same path fact lines take), so recalled wiki bodies still
-    // flow through the boundary classifier before any model call.
+    // semantics. Backend-invariant: `wiki.recall` renders the same line
+    // shape from the local store or through the Thredz MCP client (§4.3).
+    // The runtime classifies + delimiter-escapes the assembled block (the
+    // same path fact lines take), so recalled wiki bodies still flow
+    // through the boundary classifier before any model call.
     const wikiFrag = fragment.memory?.wiki;
     if (wikiFrag?.autoRecall === true) {
       const wikiK = wikiFrag.recallK ?? DEFAULT_WIKI_RECALL_K;
-      const wikiStore = wiki.store;
+      const wikiRecall = wiki.recall;
       const base = options.memory;
       const baseRecall = base?.recall;
       options = {
@@ -829,15 +1151,83 @@ export async function wireMemory(
           autoRecall: true,
           recall: async (query, k) => {
             const factLines = baseRecall !== undefined ? await baseRecall(query, k) : [];
-            const hits = await wikiStore.recall(query, wikiK);
-            return [
-              ...factLines,
-              ...hits.map((h) => `[wiki:${h.ref.slug}] ${h.ref.title} — ${excerpt(h.body)}`),
-            ];
+            return [...factLines, ...(await wikiRecall(query, wikiK))];
           },
         },
       };
     }
+  }
+
+  // 4. Learning (§3.3, PR 17): the rendered learning-loop skill + the
+  // /study /reflect commands join the surface below; the first-class exam
+  // registers here when it is actually runnable (`learning.exam` configured
+  // AND an injected runner). Exam failures auto-log knowledge gaps through
+  // the SAME routing `log_knowledge_gap` uses — Thredz tasks on a live
+  // hosted backend, plan-store `[gap]` goals locally — closing the
+  // gap→study loop (failures become the next study pass's queue).
+  const learning = fragment.learning;
+  let examOn = false;
+  if (learning !== undefined) {
+    const thredzLive =
+      thredzConfigured(fragment) && deps.thredz !== null && deps.thredz !== undefined
+        ? deps.thredz
+        : null;
+    const examGapSink: ((gap: KnowledgeGap) => Promise<string>) | undefined =
+      thredzLive !== null
+        ? async (gap: KnowledgeGap): Promise<string> => {
+            // Redact-on-write (§4.3): exam text leaving the machine for
+            // Thredz passes the PII redactor, like every mirrored body.
+            const redactor = createPiiRedactor();
+            const res = await thredzLive.client.callTool("log_knowledge_gap", {
+              topic: (await redactor.redact(gap.topic)).text,
+              ...(gap.detail !== undefined
+                ? { detail: (await redactor.redact(gap.detail)).text }
+                : {}),
+              tags: [...gap.tags],
+              priority: gap.priority,
+            });
+            if (res.isError) {
+              throw new Error(`log_knowledge_gap failed (${classifyThredzFailure(res.content)})`);
+            }
+            return `logged knowledge gap "${gap.topic}" to Thredz (tag knowledge-gap) — the next study pass picks it up`;
+          }
+        : continuity !== null
+          ? async (gap: KnowledgeGap): Promise<string> => {
+              const goal = await continuity.store.writeGoal({
+                title: `${GAP_GOAL_PREFIX} ${gap.topic}`,
+              });
+              return `logged knowledge gap "${gap.topic}" → ${goal.id} — the next study pass picks it up`;
+            }
+          : undefined;
+    if (learning.exam !== undefined && deps.examRunner !== undefined) {
+      const examTool = createExamTool({
+        learning: { ...learning, exam: learning.exam },
+        examRunner: deps.examRunner,
+        cwd: deps.cwd,
+        ...(examGapSink !== undefined ? { logGap: examGapSink } : {}),
+      });
+      tools.push(examTool);
+      examOn = true;
+    }
+    deps.log?.(
+      `[learning] learning-loop on — domain "${learning.domain}"${
+        examOn ? ` · exam: ${learning.exam?.dataset}` : ""
+      }\n`,
+    );
+  }
+
+  // 5. Skills + slash commands (§2.6): the composition root owns the prompt
+  // surface whenever continuity or learning is on — builtins merged at
+  // LOWEST precedence, commands gated by the features that back them.
+  if (continuity !== null || learning !== undefined) {
+    const { skills, slashCommands } = await loadSkillsAndCommands(deps, {
+      memory: factsOn,
+      dream: dreamEnabled(fragment),
+      continuity: continuity !== null,
+      ...(learning !== undefined ? { learning } : {}),
+      exam: examOn,
+    });
+    options = { ...options, skills, slashCommands };
   }
 
   for (const tool of tools) {
@@ -859,4 +1249,247 @@ function excerpt(body: string): string {
   return flat.length > WIKI_RECALL_EXCERPT_CHARS
     ? `${flat.slice(0, WIKI_RECALL_EXCERPT_CHARS)}…`
     : flat;
+}
+
+// ---------------------------------------------------------------------------
+// dream — scheduled consolidation (design §6, PR 14)
+// ---------------------------------------------------------------------------
+
+/** Re-exported so consumers (CLI verbs, emitted daemons) get the engine's
+ *  seam types from the composition root they already import. */
+export type {
+  DreamEngine,
+  DreamJanitorStep,
+  DreamModelPhase,
+  DreamRunReport,
+} from "@crewhaus/dream-engine";
+
+/** The §6.3 boot catch-up line, exact (tests + the emitted bundles pin it). */
+export const DREAM_BOOT_CATCHUP_NOTE =
+  "[dream] overdue — deterministic pass done; run 'crewhaus dream' for full consolidation";
+
+/**
+ * Deps for the dream composition — deliberately NOT `WireMemoryDeps`: dream
+ * wiring registers no tools (phase 2 acts through tools the CALLER wired
+ * via `wireMemory` into its own session), so there is no catalog here.
+ */
+export type WireDreamDeps = {
+  readonly cwd: string;
+  /** Tenant fencing (§2.7) — re-roots every store under the tenant root. */
+  readonly tenant?: Tenant;
+  /** Where session `.jsonl` logs live. Default `<crewhausDir>/sessions`. */
+  readonly sessionRootDir?: string;
+  readonly embedder?: EmbedderLike;
+  /** The injected model-session runner (built on runChatLoop by the CLI
+   *  verb / daemon codegen). Absent → deterministic phase only. */
+  readonly modelPhase?: DreamModelPhase;
+  /** `dream_run` event sink — see `@crewhaus/event-log`'s payload type. */
+  readonly appendEvent?: (event: {
+    kind: "dream_run";
+    payload: Record<string, unknown>;
+  }) => void | Promise<void>;
+  readonly log?: (line: string) => void;
+  readonly now?: () => Date;
+};
+
+export type WiredDream = {
+  readonly engine: DreamEngine;
+};
+
+/** Internal: construct a dream engine rooted at an explicit `.crewhaus`
+ *  directory (the tenant-enumerating janitor step reuses it per tenant). */
+function buildDreamEngine(
+  fragment: MemoryWiringFragment,
+  crewhausDir: string,
+  deps: WireDreamDeps,
+  opts: { readonly modelPhase?: DreamModelPhase } = {},
+): DreamEngine {
+  const dream = fragment.memory?.dream;
+  if (dream === undefined) {
+    throw new MemoryServiceError("memory-service: buildDreamEngine needs fragment.memory.dream");
+  }
+  const embedder = resolveEmbedder(fragment, deps);
+  const sessionRootDir = deps.sessionRootDir ?? join(crewhausDir, "sessions");
+  const memoryStore = createMemoryStore({
+    specName: fragment.specName,
+    rootDir: join(crewhausDir, "memories"),
+    ...(embedder !== undefined ? { embedder } : {}),
+    ...(deps.now !== undefined ? { now: deps.now } : {}),
+  });
+  // §4.3 — with Thredz configured the local wiki store is not the wiki
+  // backend, so the dream never consolidates it (facts + continuity stay
+  // local always and keep consolidating; server-side wiki consolidation is
+  // a future-features item).
+  const wikiStore =
+    wikiEnabled(fragment) && !thredzConfigured(fragment)
+      ? createWikiStore({
+          specName: fragment.specName,
+          rootDir: join(crewhausDir, "wiki"),
+          ...(embedder !== undefined ? { embedder } : {}),
+          ...(deps.now !== undefined ? { now: deps.now } : {}),
+        })
+      : undefined;
+  // The dream consolidates the SPEC-scoped agenda always (§14.5: the
+  // spec-scoped store holds the daemon's own agenda, which heartbeat/dream
+  // read) — even when the harness's interactive continuity is
+  // session-scoped (channel).
+  const continuityStore = continuityEnabled(fragment)
+    ? createContinuityStore({
+        specName: fragment.specName,
+        rootDir: join(crewhausDir, "state"),
+        sessionRootDir,
+        scope: { kind: "spec" },
+        ...(deps.now !== undefined ? { now: deps.now } : {}),
+      })
+    : undefined;
+  // v0.3.0 Goal 2 (§3.3 study.on_dream, PR 17): with learning on, the model
+  // phase's seeded prompt gains the top open knowledge gaps (the spec-scoped
+  // plan store's `[gap]` goals) + the next unmastered curriculum rung —
+  // composed onto the engine's EXISTING DreamModelPhase seam, computed fresh
+  // per run. `study.on_dream: false` opts out.
+  const learning = fragment.learning;
+  const modelPhase =
+    opts.modelPhase !== undefined && learning !== undefined && learning.study?.onDream !== false
+      ? withLearningDreamSeed(opts.modelPhase, {
+          learning,
+          cwd: deps.cwd,
+          listGaps: async (): Promise<readonly string[]> => {
+            if (continuityStore === undefined) return [];
+            const goals = await continuityStore.listGoals();
+            return goals
+              .filter((g) => g.status !== "proven" && g.title.startsWith(GAP_GOAL_PREFIX))
+              .map((g) => g.title.slice(GAP_GOAL_PREFIX.length).trim());
+          },
+        })
+      : opts.modelPhase;
+  return createDreamEngine({
+    specName: fragment.specName,
+    crewhausDir,
+    dream,
+    sessionRootDir,
+    memoryStore,
+    ...(wikiStore !== undefined ? { wikiStore } : {}),
+    ...(continuityStore !== undefined ? { continuityStore } : {}),
+    ...(modelPhase !== undefined ? { modelPhase } : {}),
+    playbook: DREAM_SKILL_BODY,
+    ...(deps.appendEvent !== undefined ? { appendEvent: deps.appendEvent } : {}),
+    ...(deps.log !== undefined ? { log: deps.log } : {}),
+    ...(deps.now !== undefined ? { now: deps.now } : {}),
+  });
+}
+
+/**
+ * Wire the dream slice (§6): construct the stores the consolidation pass
+ * reads/writes and hand back a ready `DreamEngine`. Returns null when the
+ * fragment carries no `memory.dream` (or memory is disabled). The default
+ * playbook is the builtin `dream` skill body; `dream.instructions` (spec)
+ * overrides it inside the engine.
+ */
+export function wireDream(fragment: MemoryWiringFragment, deps: WireDreamDeps): WiredDream | null {
+  if (!dreamEnabled(fragment)) return null;
+  const engine = buildDreamEngine(fragment, crewhausDirOf(deps), deps, {
+    ...(deps.modelPhase !== undefined ? { modelPhase: deps.modelPhase } : {}),
+  });
+  return { engine };
+}
+
+/**
+ * The cli-shape boot catch-up (§6.3): when the schedule is OVERDUE, run the
+ * DETERMINISTIC phase only — sub-second, zero spend — and return the exact
+ * note line the bundle prints. Returns null when dream isn't configured,
+ * isn't due, or another process is already consolidating (lock/window). Un-
+ * attended model spend is never a side effect of starting a session — the
+ * model phase stays behind `crewhaus dream` / the daemon janitor.
+ */
+export async function runDreamBootCatchUp(
+  fragment: MemoryWiringFragment,
+  deps: WireDreamDeps,
+): Promise<string | null> {
+  const wired = wireDream(fragment, deps);
+  if (wired === null) return null;
+  const status = await wired.engine.status();
+  if (!status.overdue) return null;
+  const report = await wired.engine.runDeterministic({ trigger: "boot" });
+  if (report.cached) return null; // another process beat us to this window
+  return DREAM_BOOT_CATCHUP_NOTE;
+}
+
+export type CreateDreamJanitorStepDeps = WireDreamDeps & {
+  /** Managed daemons: enumerate `<tenantsRootDir>/<tenantId>/` per run and
+   *  consolidate each tenant's stores DETERMINISTICALLY (the model phase is
+   *  deliberately never run from a multi-tenant janitor — per-tenant model
+   *  spend needs an explicit operator decision, i.e. a per-tenant cron of
+   *  `crewhaus dream run`). */
+  readonly tenantsRootDir?: string;
+  /** Env override (tests). Default `process.env`. */
+  readonly env?: Record<string, string | undefined>;
+};
+
+/**
+ * The daemon integration (§6.3): a registrable janitor step, due-checked
+ * against `.crewhaus/dream/<spec>/state.json` inside the existing
+ * boot+hourly janitor tick. `CREWHAUS_DREAM=0` disables;
+ * `CREWHAUS_DREAM_INTERVAL_MS` overrides the cadence. Returns null when the
+ * fragment carries no dream schedule — emitters spread `...(step ? [step]
+ * : [])` into `createJanitor({ steps })`.
+ */
+export function createDreamJanitorStep(
+  fragment: MemoryWiringFragment,
+  deps: CreateDreamJanitorStepDeps,
+): DreamJanitorStep | null {
+  if (!dreamEnabled(fragment)) return null;
+  const env = deps.env !== undefined ? { env: deps.env } : {};
+
+  if (deps.tenantsRootDir === undefined) {
+    const wired = wireDream(fragment, deps);
+    if (wired === null) return null;
+    return dreamJanitorStep(wired.engine, env);
+  }
+
+  const tenantsRootDir = deps.tenantsRootDir;
+  return {
+    name: "dream_consolidation",
+    run: async () => {
+      let tenantIds: string[];
+      try {
+        const entries = await readdir(tenantsRootDir, { withFileTypes: true });
+        tenantIds = entries.filter((e) => e.isDirectory()).map((e) => e.name);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+          return { status: "skipped", detail: `no tenants under ${tenantsRootDir}` };
+        }
+        throw err;
+      }
+      if (tenantIds.length === 0) {
+        return { status: "skipped", detail: `no tenants under ${tenantsRootDir}` };
+      }
+      let ran = 0;
+      let count = 0;
+      const errors: string[] = [];
+      for (const tenantId of tenantIds.sort()) {
+        const engine = buildDreamEngine(fragment, join(tenantsRootDir, tenantId), {
+          ...deps,
+          sessionRootDir: join(tenantsRootDir, tenantId, "sessions"),
+        });
+        const outcome = await dreamJanitorStep(engine, env).run();
+        if (outcome.status === "error") {
+          errors.push(`${tenantId}: ${outcome.detail ?? "error"}`);
+        } else if (outcome.status === "ok") {
+          ran += 1;
+          count += outcome.count ?? 0;
+        }
+      }
+      if (errors.length > 0) {
+        return { status: "error", count, detail: errors.join("; ") };
+      }
+      if (ran === 0) {
+        return { status: "skipped", detail: `no tenant due (${tenantIds.length} checked)` };
+      }
+      return {
+        status: "ok",
+        count,
+        detail: `deterministic consolidation across ${ran}/${tenantIds.length} tenant(s)`,
+      };
+    },
+  };
 }

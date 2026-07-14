@@ -476,7 +476,10 @@ export type ResponseRatedEvent = TraceEventEnvelope & {
  */
 export type JanitorActionEvent = TraceEventEnvelope & {
   kind: "janitor_action";
-  step: "reservation_cleanup" | "session_ttl_eviction" | "orphan_tool_use_sweep";
+  /** A built-in step (`reservation_cleanup` | `session_ttl_eviction` |
+   *  `orphan_tool_use_sweep`) or a registered step's own name (v0.3.0
+   *  PR 14 step registry — e.g. the dream `dream_consolidation` step). */
+  step: string;
   status: "ok" | "skipped" | "error";
   /** Step tally: sessions evicted / orphaned tool_use ids found. Absent when the step has no meaningful count (reservation cleanup). */
   count?: number;

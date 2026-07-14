@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { StreamEvent } from "@crewhaus/adapter-anthropic";
+import { RunFailedError } from "@crewhaus/errors";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { z } from "zod";
@@ -233,5 +234,73 @@ describe("executeStreaming over AsyncIterable<StreamEvent>", () => {
     const aborted = result.toolResults.find((r) => r.tool_use_id === "tu2");
     expect(aborted?.is_error).toBe(true);
     expect(events.find((e) => e.kind === "sibling-aborted")).toBeDefined();
+  });
+});
+
+describe("RunFailedError escapes the streaming dispatch (v0.3.0 §7.1)", () => {
+  const REPORT = {
+    class: "billing" as const,
+    title: "provider account out of funding",
+    detail: 'Anthropic said: "credit balance too low"',
+    remediation: "add credits, then rerun.",
+    exitCode: 31,
+  };
+
+  test("a runTool rejection carrying RunFailedError rethrows the SAME error after the drain", async () => {
+    const stream = buildSimpleStream([{ id: "tu_fatal", name: "Task", input: { prompt: "x" } }]);
+    const fatal = new RunFailedError(REPORT);
+    let thrown: unknown;
+    try {
+      await executeStreaming(stream, {
+        toolByName: new Map(),
+        runTool: async () => {
+          throw fatal;
+        },
+      });
+    } catch (err) {
+      thrown = err;
+    }
+    // Identity preserved — the caller's recovery halts with the exact report.
+    expect(thrown).toBe(fatal);
+  });
+
+  test("queued siblings are short-circuited, and in-flight siblings still settle before the rethrow", async () => {
+    const settled: string[] = [];
+    const stream = buildSimpleStream([
+      { id: "tu_fatal", name: "Task", input: { prompt: "x" } },
+      { id: "tu_sibling", name: "Task", input: { prompt: "y" } },
+    ]);
+    const seen: StreamingToolEvent[] = [];
+    let thrown: unknown;
+    try {
+      await executeStreaming(stream, {
+        toolByName: new Map(),
+        onEvent: (e) => seen.push(e),
+        runTool: async (block) => {
+          settled.push(block.id);
+          if (block.id === "tu_fatal") throw new RunFailedError(REPORT);
+          return { type: "tool_result", tool_use_id: block.id, content: "ok" };
+        },
+      });
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(RunFailedError);
+    // The fatal dispatch ran; the queue was aborted (sibling-aborted fired).
+    expect(settled).toContain("tu_fatal");
+    expect(seen.some((e) => e.kind === "sibling-aborted" && e.reason === "fatal_error")).toBe(true);
+  });
+
+  test("an ordinary rejection keeps the pre-0.3.0 stringified is_error result", async () => {
+    const stream = buildSimpleStream([{ id: "tu_plain", name: "Task", input: {} }]);
+    const result = await executeStreaming(stream, {
+      toolByName: new Map(),
+      runTool: async () => {
+        throw new Error("plain failure");
+      },
+    });
+    expect(result.toolResults).toHaveLength(1);
+    expect(result.toolResults[0]?.is_error).toBe(true);
+    expect(result.toolResults[0]?.content).toBe("plain failure");
   });
 });

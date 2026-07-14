@@ -23,10 +23,13 @@
  */
 import { randomBytes, randomUUID } from "node:crypto";
 import { type AbortTree, createAbortTree } from "@crewhaus/abort-controller";
+import type { FailureReport } from "@crewhaus/errors";
 import { type EventLog, openEventLog } from "@crewhaus/event-log";
 import type { HookDef } from "@crewhaus/hooks-engine";
 import type { PermissionMode, RuleSet } from "@crewhaus/permission-engine";
+import type { NamedFailureClass } from "@crewhaus/recovery-engine";
 import { type RunContext, createRunContext } from "@crewhaus/run-context";
+import type { SkillRef } from "@crewhaus/skills-registry";
 import { type Store, createStore } from "@crewhaus/state-store";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { TraceEventBus } from "@crewhaus/trace-event-bus";
@@ -72,17 +75,70 @@ export type SubAgentMessage = {
   readonly content: unknown;
 };
 
+/**
+ * v0.3.0 §7.1 — a child terminal failure, classified at the spawner
+ * boundary. `failureClass` is the recovery-engine verdict (or the report's
+ * own class when the child loop already halted with a `RunFailedError`);
+ * `report` is the same structured shape every terminal surface renders.
+ * Carried on the result for NON-fatal classes so the Task tool can surface
+ * an honest `{isError: true, failureClass, report}` tool result; fatal
+ * classes (billing / auth) never produce a result — the spawner rethrows
+ * `RunFailedError` instead so the parent run halts with the child's report.
+ */
+export type SubAgentFailure = {
+  readonly failureClass: string;
+  readonly report: FailureReport;
+};
+
 export type SubAgentResult = {
   readonly finalMessage: string;
   readonly transcript: ReadonlyArray<SubAgentMessage>;
   readonly toolCalls: ReadonlyArray<ToolCallRecord>;
   readonly usage: TokenUsage;
+  /** Present iff the child run failed with a non-fatal classified error. */
+  readonly failure?: SubAgentFailure;
+};
+
+/**
+ * v0.3.0 §7.1 — the parent's memory seam as projected for children:
+ * RECALL-ONLY by construction. The capture half (`autoCapture`/`onCapture`)
+ * is deliberately unrepresentable here — parents own memory writes
+ * (write-path governance); child findings reach the store through the
+ * parent's capture pass walking the `sub_agent_start/end` brackets.
+ */
+export type SubAgentMemorySeam = {
+  readonly autoRecall?: boolean;
+  readonly recallK?: number;
+  readonly recallSeed?: string;
+  /** The parent's recall closure — recalled lines inject into the child's
+   *  system prompt through the same seam as the parent loop. */
+  readonly recall?: (query: string, k: number) => Promise<readonly string[]>;
+};
+
+/**
+ * v0.3.0 §7.1 — the parent's continuity seam as projected for children:
+ * READ-ONLY by construction. Only `loadPlan` crosses the boundary (so the
+ * `<current_plan>` tail renders in child loops); `onPlanDirty` / `onHandoff`
+ * / the ledger writes are deliberately unrepresentable — a child must not
+ * mutate the parent's plan-store state through the seam. (Plan TOOLS still
+ * reach children via catalog inheritance under the parent's permissions —
+ * that is a tool-permission decision, not a seam leak.)
+ */
+export type SubAgentContinuitySeam = {
+  readonly loadPlan: () => Promise<string | null>;
 };
 
 /**
  * Everything the spawner / Task tool needs from the parent runtime to start
  * a child. The runtime constructs one of these per-`runChatLoop` invocation
  * and passes it through `ToolExecuteContext.bridge`.
+ *
+ * v0.3.0 §7.1 — the four optional seams below thread the parent loop's
+ * wiring into child loops: `memory` (recall on, capture off), `skills`
+ * (children finally see the skills prompt block, not just the inherited
+ * Skill tool), `failureTaxonomy` (child recovery consults the same named
+ * classes), and read-only `continuity` (the plan tail renders; no writes).
+ * All optional: bridges built by pre-0.3.0 callers behave exactly as before.
  */
 export type ParentRunHandle = {
   readonly runContext: RunContext;
@@ -93,6 +149,10 @@ export type ParentRunHandle = {
   readonly model: string;
   readonly maxTokens: number;
   readonly sessionRootDir?: string;
+  readonly memory?: SubAgentMemorySeam;
+  readonly skills?: ReadonlyArray<SkillRef>;
+  readonly failureTaxonomy?: ReadonlyArray<NamedFailureClass>;
+  readonly continuity?: SubAgentContinuitySeam;
 };
 
 /**
@@ -260,6 +320,11 @@ export async function createIsolatedContext(
     logger: parent.runContext.logger,
     eventBus: childBus,
   });
+  // Track 10 / v0.3.0 §7.1 — stamp the child's identity at mint time so
+  // child-attributed writes (plan_update / wiki_write / audit entries)
+  // record WHICH sub-agent acted. `RunContext.agentIdentity` is documented
+  // mutable for exactly this shadowing.
+  runContext.agentIdentity = { subAgentId: opts.name };
 
   const sessionRootDir = opts.sessionRootDir ?? parent.sessionRootDir;
 

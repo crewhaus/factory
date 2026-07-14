@@ -933,3 +933,136 @@ describe("emitChannelBot — run-level budget field (item 27)", () => {
     expect(agentTs).not.toContain("budget:");
   });
 });
+
+describe("emitChannelBot — dream janitor step (v0.3.0 PR 14, §6.3)", () => {
+  const DREAM_IR: IrChannelV0 = {
+    ...MIN_IR,
+    memory: { dream: { everyMs: 86_400_000, mode: "full", budgetUsd: 0.5 } },
+    continuity: {
+      plan: true,
+      proof: "ladder",
+      ledger: true,
+      handoff: true,
+      scope: "session",
+    },
+  };
+
+  test("agent.ts exports createDreamStep with the runChatLoop model phase", () => {
+    const agent = fileMap(DREAM_IR).get("agent.ts") ?? "";
+    expect(agent).toContain("export function createDreamStep(): DreamJanitorStep | null");
+    expect(agent).toContain(
+      'import { wireMemory, type MemoryWiringFragment, createDreamJanitorStep, type DreamJanitorStep } from "@crewhaus/memory-service";',
+    );
+    expect(agent).toContain('import { createCostTracker } from "@crewhaus/cost-tracker";');
+    // The bounded fresh session (§6.2): dream target, single turn, capped
+    // tool loop, the item-27 budget option fed from the seam input.
+    expect(agent).toContain('sessionTarget: "dream"');
+    expect(agent).toContain("maxToolIterations: input.maxToolIterations");
+    expect(agent).toContain("usdMicros: Math.round(input.budgetUsd * 1_000_000)");
+    expect(agent).toContain('onExceed: { kind: "stop" }');
+  });
+
+  test("the dream fragment is SPEC-scoped even when interactive continuity is session-scoped", () => {
+    const agent = fileMap(DREAM_IR).get("agent.ts") ?? "";
+    const match = agent.match(/const __DREAM_FRAGMENT: MemoryWiringFragment = (\{.*?\});\n/);
+    expect(match).not.toBeNull();
+    const fragment = JSON.parse(match?.[1] ?? "{}") as {
+      memory?: { dream?: { everyMs: number } };
+      continuity?: { scope?: string };
+    };
+    expect(fragment.memory?.dream?.everyMs).toBe(86_400_000);
+    expect(fragment.continuity?.scope).toBe("spec");
+  });
+
+  test("daemon.ts registers the step into createJanitor({ steps })", () => {
+    const daemon = fileMap(DREAM_IR).get("daemon.ts") ?? "";
+    expect(daemon).toContain('import { createAgent, createDreamStep } from "./agent.js";');
+    expect(daemon).toContain("const __dreamStep = createDreamStep();");
+    expect(daemon).toContain("steps: __dreamStep !== null ? [__dreamStep] : [],");
+  });
+
+  test("no dream schedule → zero dream codegen (byte-identity guard)", () => {
+    const files = fileMap({ ...MIN_IR, memory: { autoRecall: true } });
+    for (const path of ["agent.ts", "daemon.ts"]) {
+      const content = files.get(path) ?? "";
+      expect(content).not.toContain("createDreamStep");
+      expect(content).not.toContain("__DREAM_FRAGMENT");
+      expect(content).not.toContain("steps:");
+    }
+  });
+});
+
+describe("emitChannelBot — learning (v0.3.0 §3.3, PR 17)", () => {
+  const LEARNING_IR: IrChannelV0 = {
+    ...MIN_IR,
+    memory: { wiki: { enabled: true, requireSources: true } },
+    learning: {
+      domain: "specialty coffee extraction science",
+      curriculum: "curriculum.md",
+      study: { onHeartbeat: true, onDream: true },
+    },
+  };
+
+  test("learning rides the per-turn fragment (skill + /study /reflect wire per turn)", () => {
+    const c = fileMap(LEARNING_IR).get("agent.ts") ?? "";
+    expect(c).toContain('"learning":{"domain":"specialty coffee extraction science"');
+    expect(c).toContain('"curriculum":"curriculum.md"');
+  });
+
+  test("study.on_heartbeat prepends the study-rotation preamble to heartbeat instructions", () => {
+    const ir: IrChannelV0 = {
+      ...LEARNING_IR,
+      continuity: { plan: true, proof: "ladder", ledger: true, handoff: true, scope: "session" },
+      heartbeat: { everyMs: 21_600_000, instructions: "Check the support queue." },
+    };
+    const c = fileMap(ir).get("daemon.ts") ?? "";
+    // The §3.3 rotation policy, baked at codegen time.
+    expect(c).toContain("unattended study tick");
+    expect(c).toContain("GAPS FIRST");
+    expect(c).toContain("3 STUDY ticks");
+    expect(c).toContain("1 REFLECT tick");
+    // The operator's own instructions survive, after the preamble.
+    expect(c).toContain("Check the support queue.");
+    expect(c.indexOf("GAPS FIRST")).toBeLessThan(c.indexOf("Check the support queue."));
+  });
+
+  test("study.on_heartbeat: false keeps the operator's heartbeat instructions verbatim", () => {
+    const ir: IrChannelV0 = {
+      ...LEARNING_IR,
+      learning: {
+        domain: "coffee",
+        study: { onHeartbeat: false, onDream: true },
+      },
+      heartbeat: { everyMs: 21_600_000, instructions: "Check the support queue." },
+    };
+    const c = fileMap(ir).get("daemon.ts") ?? "";
+    expect(c).toContain('const __heartbeatInstructions = "Check the support queue.";');
+    expect(c).not.toContain("GAPS FIRST");
+  });
+
+  test("no learning → heartbeat and fragment stay byte-identical (no preamble, no slice)", () => {
+    const ir: IrChannelV0 = {
+      ...MIN_IR,
+      memory: { wiki: { enabled: true } },
+      heartbeat: { everyMs: 21_600_000, instructions: "Check the support queue." },
+    };
+    const daemon = fileMap(ir).get("daemon.ts") ?? "";
+    expect(daemon).toContain('const __heartbeatInstructions = "Check the support queue.";');
+    expect(daemon).not.toContain("GAPS FIRST");
+    const agent = fileMap(ir).get("agent.ts") ?? "";
+    expect(agent).not.toContain('"learning"');
+  });
+
+  test("learning + dream threads the learning slice into the dream fragment", () => {
+    const ir: IrChannelV0 = {
+      ...LEARNING_IR,
+      memory: {
+        wiki: { enabled: true, requireSources: true },
+        dream: { everyMs: 86_400_000, mode: "full", budgetUsd: 0.5 },
+      },
+    };
+    const c = fileMap(ir).get("agent.ts") ?? "";
+    const dreamFragment = c.split("__DREAM_FRAGMENT: MemoryWiringFragment = ")[1] ?? "";
+    expect(dreamFragment).toContain('"learning":{"domain":"specialty coffee extraction science"');
+  });
+});

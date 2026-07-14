@@ -8,12 +8,15 @@
     { "path": "../adapter-anthropic" },
     { "path": "../agent-context-isolation" },
     { "path": "../boundary-classifier" },
+    { "path": "../errors" },
     { "path": "../event-log" },
     { "path": "../permission-engine" },
+    { "path": "../recovery-engine" },
     { "path": "../run-context" },
     { "path": "../runtime-core" },
     { "path": "../tool-builder" },
-    { "path": "../tool-catalog" }
+    { "path": "../tool-catalog" },
+    { "path": "../tool-task" }
   ],
   "include": ["src/**/*"]
 }

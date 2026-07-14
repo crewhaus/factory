@@ -37,6 +37,7 @@ import {
   type FailureReport,
   RunFailedError,
   RuntimeError,
+  isRunFailedError,
 } from "@crewhaus/errors";
 import { type EventKind, type EventLog, openEventLog } from "@crewhaus/event-log";
 import { type HookDef, type HookEvent, aggregateDecisions, runHooks } from "@crewhaus/hooks-engine";
@@ -447,12 +448,16 @@ export type { ResolvedAuth } from "@crewhaus/adapter-anthropic";
 // own module (`./janitor`) but is re-exported here because emitted bundles
 // only import the package root.
 export { createJanitor } from "./janitor";
+export { JANITOR_BUILTIN_STEPS } from "./janitor";
 export type {
   CreateJanitorOptions,
   Janitor,
+  JanitorBuiltinStepName,
   JanitorReservationStore,
   JanitorRunResult,
+  JanitorStep,
   JanitorStepName,
+  JanitorStepOutcome,
   JanitorStepResult,
   JanitorStepStatus,
 } from "./janitor";
@@ -2118,6 +2123,27 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     skillsText.length > 0
       ? [{ type: "text", text: skillsText, cache_control: { type: "ephemeral" } }]
       : [];
+  // v0.3.0 §7.1 — child-seam projections for the RuntimeBridge, computed once
+  // per run. The spawner threads these into child loops via the Task tool:
+  //   - memory: RECALL-ONLY. `autoCapture`/`onCapture` are dropped at the
+  //     projection so no write closure can reach a child (parents own memory
+  //     writes; child findings arrive through the capture pass walking the
+  //     sub_agent_start/end brackets). Projected only when a recall closure
+  //     exists — a capture-only seam gives children nothing.
+  //   - continuity: READ-ONLY. Only `loadPlan` crosses; `onPlanDirty` /
+  //     `onHandoff` / the ledger stay parent-side so a child cannot mutate
+  //     the parent's plan-store state through the seam.
+  const bridgeMemorySeam =
+    opts.memory?.recall !== undefined
+      ? {
+          ...(opts.memory.autoRecall !== undefined ? { autoRecall: opts.memory.autoRecall } : {}),
+          ...(opts.memory.recallK !== undefined ? { recallK: opts.memory.recallK } : {}),
+          ...(opts.memory.recallSeed !== undefined ? { recallSeed: opts.memory.recallSeed } : {}),
+          recall: opts.memory.recall,
+        }
+      : undefined;
+  const bridgeContinuitySeam =
+    opts.continuity !== undefined ? { loadPlan: opts.continuity.loadPlan } : undefined;
   // M3.1 — auto-load project memory files (AGENTS.md / CLAUDE.md /
   // CODE-COMPANION.md / AGENT.md) from cwd at session start. Follows the
   // vendor-neutral agents.md convention; compatible with Claude Code's
@@ -2656,6 +2682,14 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       ...(opts.subAgents !== undefined ? { subAgents: opts.subAgents } : {}),
       ...(opts.spawnSubAgent !== undefined ? { spawnSubAgent: opts.spawnSubAgent } : {}),
       ...(opts.crewMailbox !== undefined ? { crewMailbox: opts.crewMailbox } : {}),
+      // v0.3.0 §7.1 — the four child seams (projected above: recall-only
+      // memory, skills list, failure taxonomy, read-only continuity) so the
+      // Task tool can hand them to the spawner. All conditional: a run
+      // without them builds the exact pre-0.3.0 bridge shape.
+      ...(bridgeMemorySeam !== undefined ? { memory: bridgeMemorySeam } : {}),
+      ...(skills.length > 0 ? { skills } : {}),
+      ...(opts.failureTaxonomy !== undefined ? { failureTaxonomy: opts.failureTaxonomy } : {}),
+      ...(bridgeContinuitySeam !== undefined ? { continuity: bridgeContinuitySeam } : {}),
     };
     // Spin "running <tool>…" for exactly the execution window — started after
     // every gate (permission/justification/egress) so it never overlaps the
@@ -2956,6 +2990,30 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     // strongest candidate for the rest of the run (misroute recovery, mirroring
     // the tier router's fast→default escalation latch).
     let escalatePool = false;
+
+    // v0.3.0 Goal 6 — one structured report on every terminal path,
+    // published to the bus AND appended to the session event log BEFORE the
+    // throw (a throw is invisible to structured consumers; the event is what
+    // the UI host, printers, exporters, and incident capture render). Used
+    // by the recovery `halt`/`fail` arms below and by the §7.1 sub-agent
+    // escalation path in `NeedTools`.
+    const publishRunFailed = async (report: FailureReport): Promise<void> => {
+      const failureMessage = `${report.title}: ${report.detail}`;
+      bus.publish({
+        ...bus.envelope(),
+        kind: "run_failed",
+        class: report.class,
+        message: failureMessage,
+        ...(report.remediation !== undefined ? { remediation: report.remediation } : {}),
+        exitCode: report.exitCode,
+      });
+      await logEvent("run_failed", {
+        class: report.class,
+        message: failureMessage,
+        ...(report.remediation !== undefined ? { remediation: report.remediation } : {}),
+        exitCode: report.exitCode,
+      });
+    };
 
     while (state.kind !== "Done") {
       if (turnAbort.signal.aborted) {
@@ -3506,7 +3564,23 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           // Item 26 — accrue this turn's tool_use count (a next-turn tier
           // signal): a dense tool turn marks an active multi-step task.
           thisTurnToolUseCount += state.toolUses.length;
-          const toolResults = await runToolBatch(state.toolUses);
+          let toolResults: Anthropic.ToolResultBlockParam[];
+          try {
+            toolResults = await runToolBatch(state.toolUses);
+          } catch (err) {
+            // v0.3.0 §7.1 — a RunFailedError escaping the tool batch is a
+            // sub-agent's terminal report escalated through the spawner
+            // (tool-executor deliberately lets it pass). Publish the same
+            // structured run_failed surface as the recovery halt path, then
+            // rethrow: both the singleTurn and REPL paths propagate non-abort
+            // errors to the caller's catch-wrapper, which renders the
+            // child's report and exits with its coded status. (The streaming
+            // path reaches the identical halt through recovery — the
+            // streaming executor rethrows after its drain and `recover()`
+            // passes an already-classified report through verbatim.)
+            if (isRunFailedError(err)) await publishRunFailed(err.report);
+            throw err;
+          }
           messages.push({ role: "user", content: toolResults });
           await logEvent("user_message", { content: toolResults });
           const warning = maybeBuildLoopWarning();
@@ -3550,29 +3624,10 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             errorName: state.error.name,
             depth: recovery.retryCount + recovery.compactCount + recovery.continueCount,
           });
-          // v0.3.0 Goal 6 — one structured report on every terminal path,
-          // published to the bus AND appended to the session event log
-          // BEFORE the throw (a throw is invisible to structured
-          // consumers; the event is what the UI host, printers, exporters,
-          // and incident capture render). Non-terminal actions publish
-          // nothing here.
-          const publishRunFailed = async (report: FailureReport): Promise<void> => {
-            const failureMessage = `${report.title}: ${report.detail}`;
-            bus.publish({
-              ...bus.envelope(),
-              kind: "run_failed",
-              class: report.class,
-              message: failureMessage,
-              ...(report.remediation !== undefined ? { remediation: report.remediation } : {}),
-              exitCode: report.exitCode,
-            });
-            await logEvent("run_failed", {
-              class: report.class,
-              message: failureMessage,
-              ...(report.remediation !== undefined ? { remediation: report.remediation } : {}),
-              exitCode: report.exitCode,
-            });
-          };
+          // Non-terminal actions publish no run_failed report here — only
+          // the terminal `fail`/`halt` arms below call `publishRunFailed`
+          // (hoisted to runOneTurn scope; also used by the §7.1 sub-agent
+          // escalation path in `NeedTools`).
           switch (action.kind) {
             case "compact": {
               const before = messages.length;

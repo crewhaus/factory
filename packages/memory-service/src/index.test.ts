@@ -13,12 +13,16 @@ import { buildTenant } from "@crewhaus/tenancy";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import {
   type ContinuitySeam,
+  DREAM_BOOT_CATCHUP_NOTE,
   type MemorySeam,
   MemoryServiceError,
   type MemoryWiringFragment,
   type WireMemoryDeps,
+  createDreamJanitorStep,
   memoryFragmentFromIr,
+  runDreamBootCatchUp,
   wireContinuity,
+  wireDream,
   wireMemory,
   wireWiki,
 } from "./index";
@@ -47,13 +51,17 @@ function collectingCatalog(): { registered: RegisteredTool[]; register(t: Regist
 
 function deps(overrides: Partial<WireMemoryDeps> = {}) {
   const catalog = collectingCatalog();
+  const logs: string[] = [];
   const base: WireMemoryDeps = {
     catalog,
     cwd: tmp,
     homeDir: join(tmp, "home"), // isolate from the real ~/.crewhaus
+    log: (line) => {
+      logs.push(line);
+    },
     ...overrides,
   };
-  return { deps: base, catalog };
+  return { deps: base, catalog, logs };
 }
 
 function names(tools: readonly RegisteredTool[]): string[] {
@@ -394,12 +402,12 @@ describe("wireMemory — scope, tenancy, backend (§2.7, §4)", () => {
     expect(existsSync(join(tenantRoot, "memories", "tenant-spec.jsonl"))).toBe(true);
   });
 
-  test('backend "thredz" is reserved: loud not-implemented error, nothing wired', async () => {
-    const { deps: d, catalog } = deps();
-    await expect(
-      wireMemory({ specName: "thredz-spec", memory: { backend: "thredz" } }, d),
-    ).rejects.toThrow(/backend "thredz" is reserved but not implemented yet/);
-    expect(catalog.registered).toEqual([]);
+  test('backend "thredz" without a live connection degrades to the local backend with a warning (§4.4)', async () => {
+    const { deps: d, logs } = deps();
+    const wired = await wireMemory({ specName: "thredz-spec", memory: { backend: "thredz" } }, d);
+    // Never a crash: facts wired locally, one degrade line printed.
+    expect(wired.stores.memory).toBeDefined();
+    expect(logs.join("")).toContain("[thredz] unavailable — memory degraded to the local backend");
   });
 
   test('backend "file" is the implemented default', async () => {
@@ -727,3 +735,169 @@ const _fragmentShape: MemoryWiringFragment = {
   },
 };
 void _fragmentShape;
+
+// ---------------------------------------------------------------------------
+// PR 14 — dream (design §6)
+// ---------------------------------------------------------------------------
+
+describe("PR 14 — dream fragment threading", () => {
+  test("memoryFragmentFromIr carries the dream block (declared fields only)", () => {
+    const fragment = memoryFragmentFromIr({
+      name: "dreamer",
+      memory: {
+        autoRecall: true,
+        dream: { everyMs: 86_400_000, mode: "full", budgetUsd: 0.5 },
+      },
+    });
+    expect(fragment.memory?.dream).toEqual({
+      everyMs: 86_400_000,
+      mode: "full",
+      budgetUsd: 0.5,
+    });
+    // JSON-serializable — emitters stringify it into bundles.
+    expect(JSON.parse(JSON.stringify(fragment))).toEqual(fragment);
+    const without = memoryFragmentFromIr({ name: "plain", memory: { autoRecall: true } });
+    expect(without.memory !== undefined && "dream" in without.memory).toBe(false);
+  });
+});
+
+describe("PR 14 — /dream + dream skill join the gated set when configured", () => {
+  const DREAM_FRAGMENT: MemoryWiringFragment = {
+    specName: "dreamer",
+    memory: { dream: { everyMs: 86_400_000, mode: "full", budgetUsd: 0.5 } },
+    continuity: {},
+  };
+
+  test("dream configured → /dream command and dream skill are wired", async () => {
+    const { deps: d } = deps();
+    const wired = await wireMemory(DREAM_FRAGMENT, d);
+    expect(wired.options.slashCommands?.has("dream")).toBe(true);
+    expect(wired.options.skills?.some((s) => s.name === "dream")).toBe(true);
+    // The learning-loop set stays out (PR 17).
+    expect(wired.options.slashCommands?.has("study")).toBe(false);
+    expect(wired.options.skills?.some((s) => s.name === "learning-loop")).toBe(false);
+  });
+
+  test("no dream block → /dream and the dream skill stay excluded", async () => {
+    const { deps: d } = deps();
+    const wired = await wireMemory({ specName: "plain", memory: {}, continuity: {} }, d);
+    expect(wired.options.slashCommands?.has("dream")).toBe(false);
+    expect(wired.options.skills?.some((s) => s.name === "dream")).toBe(false);
+  });
+});
+
+describe("PR 14 — wireDream / runDreamBootCatchUp / createDreamJanitorStep", () => {
+  const NOW = new Date("2026-07-13T19:04:12.000Z");
+  const DAY = 86_400_000;
+  const DREAM_FRAGMENT: MemoryWiringFragment = {
+    specName: "dreamer",
+    memory: { dream: { everyMs: DAY } },
+    continuity: {},
+  };
+
+  test("wireDream constructs an engine rooted under <cwd>/.crewhaus; null without dream", () => {
+    const wired = wireDream(DREAM_FRAGMENT, { cwd: tmp, now: () => NOW });
+    expect(wired).not.toBeNull();
+    expect(wired?.engine.stateDir()).toBe(join(tmp, ".crewhaus", "dream", "dreamer"));
+    expect(wired?.engine.config).toEqual({ everyMs: DAY, mode: "full", budgetUsd: 0 });
+    expect(wireDream({ specName: "plain", memory: {} }, { cwd: tmp })).toBeNull();
+    expect(
+      wireDream(
+        { specName: "off", memory: { enabled: false, dream: { everyMs: DAY } } },
+        { cwd: tmp },
+      ),
+    ).toBeNull();
+  });
+
+  test("boot catch-up: overdue → phase 1 + the exact §6.3 note; then quiet", async () => {
+    const first = await runDreamBootCatchUp(DREAM_FRAGMENT, { cwd: tmp, now: () => NOW });
+    expect(first).toBe(DREAM_BOOT_CATCHUP_NOTE);
+    expect(first).toBe(
+      "[dream] overdue — deterministic pass done; run 'crewhaus dream' for full consolidation",
+    );
+    // State was written; the same boot within the cadence is silent.
+    const second = await runDreamBootCatchUp(DREAM_FRAGMENT, { cwd: tmp, now: () => NOW });
+    expect(second).toBeNull();
+    // No dream block → always null.
+    expect(await runDreamBootCatchUp({ specName: "plain" }, { cwd: tmp })).toBeNull();
+  });
+
+  test("boot catch-up NEVER runs the model phase (§6.3: zero unattended spend)", async () => {
+    let modelCalls = 0;
+    const note = await runDreamBootCatchUp(
+      {
+        specName: "dreamer",
+        memory: { dream: { everyMs: DAY, mode: "full", budgetUsd: 5 } },
+      },
+      {
+        cwd: tmp,
+        now: () => NOW,
+        modelPhase: {
+          model: "claude-haiku-4-5",
+          run: async () => {
+            modelCalls += 1;
+            return {};
+          },
+        },
+      },
+    );
+    expect(note).toBe(DREAM_BOOT_CATCHUP_NOTE);
+    expect(modelCalls).toBe(0);
+  });
+
+  test("janitor step: due-checked, runs once, then skips; null without dream", async () => {
+    const step = createDreamJanitorStep(DREAM_FRAGMENT, { cwd: tmp, now: () => NOW, env: {} });
+    expect(step).not.toBeNull();
+    expect(step?.name).toBe("dream_consolidation");
+    const first = await step?.run();
+    expect(first?.status).toBe("ok");
+    const second = await step?.run();
+    expect(second?.status).toBe("skipped");
+    expect(createDreamJanitorStep({ specName: "plain" }, { cwd: tmp, env: {} })).toBeNull();
+  });
+
+  test("janitor step (managed): enumerates tenants per run, deterministic only", async () => {
+    const tenantsRoot = join(tmp, "tenants");
+    mkdirSync(join(tenantsRoot, "acme", "sessions"), { recursive: true });
+    mkdirSync(join(tenantsRoot, "globex", "sessions"), { recursive: true });
+    let modelCalls = 0;
+    const step = createDreamJanitorStep(
+      { specName: "dreamer", memory: { dream: { everyMs: DAY, mode: "full", budgetUsd: 5 } } },
+      {
+        cwd: tmp,
+        tenantsRootDir: tenantsRoot,
+        env: {},
+        now: () => NOW,
+        modelPhase: {
+          model: "claude-haiku-4-5",
+          run: async () => {
+            modelCalls += 1;
+            return {};
+          },
+        },
+      },
+    );
+    const outcome = await step?.run();
+    expect(outcome?.status).toBe("ok");
+    expect(outcome?.detail).toContain("2/2 tenant(s)");
+    // The model phase never runs from a multi-tenant janitor.
+    expect(modelCalls).toBe(0);
+    // Per-tenant state landed under each tenant root.
+    expect(existsSync(join(tenantsRoot, "acme", "dream", "dreamer", "state.json"))).toBe(true);
+    expect(existsSync(join(tenantsRoot, "globex", "dream", "dreamer", "state.json"))).toBe(true);
+    // Second tick: nothing due.
+    const second = await step?.run();
+    expect(second?.status).toBe("skipped");
+  });
+
+  test("CREWHAUS_DREAM=0 disables the composed step", async () => {
+    const step = createDreamJanitorStep(DREAM_FRAGMENT, {
+      cwd: tmp,
+      env: { CREWHAUS_DREAM: "0" },
+      now: () => NOW,
+    });
+    const outcome = await step?.run();
+    expect(outcome?.status).toBe("skipped");
+    expect(outcome?.detail).toBe("CREWHAUS_DREAM=0");
+  });
+});

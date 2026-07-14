@@ -242,6 +242,37 @@ describe("renderBundleReadme — MCP servers (item 42)", () => {
     expect(md).toContain("- `SEARCH_TOKEN`");
   });
 
+  test("0.3.0 PR 16 — synthesized thredz config literals do NOT trip the literal warning; user literals still do", () => {
+    const synthesized = baseCliIr({
+      mcp_servers: {
+        thredz: {
+          transport: "stdio",
+          command: "npx",
+          args: ["-y", "thredz-mcp@0.2.0"],
+          env: {
+            THREDZ_API_KEY: { kind: "env", name: "THREDZ_API_KEY" },
+            THREDZ_API_BASE: { kind: "literal", value: "http://localhost:3000/api" },
+            THREDZ_DEFAULT_VISIBILITY: { kind: "literal", value: "private" },
+          },
+        },
+      },
+    });
+    expect(collectSecretRefs(synthesized).literalCount).toBe(0);
+    expect(renderBundleReadme(synthesized)).not.toContain("supplied as literals");
+    // A user-declared literal under any other key keeps warning.
+    const userLiteral = baseCliIr({
+      mcp_servers: {
+        thredz: {
+          transport: "stdio",
+          command: "npx",
+          args: [],
+          env: { MY_KEY: { kind: "literal", value: "raw-secret" } },
+        },
+      },
+    });
+    expect(collectSecretRefs(userLiteral).literalCount).toBe(1);
+  });
+
   test("the section is omitted when no MCP servers are configured", () => {
     expect(renderBundleReadme(baseCliIr())).not.toContain("## MCP servers");
   });

@@ -37,7 +37,11 @@
  */
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import type { RuntimeBridge, SubAgentDefinition } from "@crewhaus/agent-context-isolation";
+import type {
+  RuntimeBridge,
+  SubAgentDefinition,
+  SubAgentFailure,
+} from "@crewhaus/agent-context-isolation";
 import { CrewhausError } from "@crewhaus/errors";
 import { resolveChildPermissions } from "@crewhaus/sub-agent-permission-inheritance";
 import { buildTool } from "@crewhaus/tool-builder";
@@ -49,6 +53,27 @@ export class SubAgentResolutionError extends CrewhausError {
   override readonly name = "SubAgentResolutionError";
   constructor(message: string, cause?: unknown) {
     super("config", message, cause);
+  }
+}
+
+/**
+ * v0.3.0 §7.1 — a NON-fatal classified child failure, rethrown by the Task
+ * tool so `tool-executor` surfaces it as an `is_error: true` tool result
+ * whose content is the structured `{isError, failureClass, report}` JSON —
+ * the parent model sees an honest, classified failure instead of a bare
+ * `[sub-agent error]` string. Fatal classes (billing/auth) never reach
+ * here: the spawner rethrows `RunFailedError`, which tool-executor lets
+ * propagate so the whole run halts with the child's report.
+ */
+export class SubAgentFailedError extends CrewhausError {
+  override readonly name = "SubAgentFailedError";
+  readonly failure: SubAgentFailure;
+  constructor(failure: SubAgentFailure) {
+    super(
+      "tool",
+      JSON.stringify({ isError: true, failureClass: failure.failureClass, report: failure.report }),
+    );
+    this.failure = failure;
   }
 }
 
@@ -291,8 +316,21 @@ export function createTaskTool(opts: CreateTaskToolOptions = {}): RegisteredTool
         model: bridge.model,
         maxTokens: bridge.maxTokens,
         ...(bridge.sessionRootDir !== undefined ? { sessionRootDir: bridge.sessionRootDir } : {}),
+        // v0.3.0 §7.1 — the four child seams, projected by runtime-core onto
+        // the bridge (recall-only memory, skills list, failure taxonomy,
+        // read-only continuity) and handed to the spawner verbatim.
+        ...(bridge.memory !== undefined ? { memory: bridge.memory } : {}),
+        ...(bridge.skills !== undefined ? { skills: bridge.skills } : {}),
+        ...(bridge.failureTaxonomy !== undefined
+          ? { failureTaxonomy: bridge.failureTaxonomy }
+          : {}),
+        ...(bridge.continuity !== undefined ? { continuity: bridge.continuity } : {}),
       };
 
+      // A fatal child failure (billing/auth) makes `spawnSubAgent` throw
+      // `RunFailedError`; it propagates through here and through
+      // tool-executor's carve-out so the whole run halts with the child's
+      // report (§7.1: "a billing failure anywhere ends the run").
       const result = await spawnSubAgent(parentHandle, {
         def,
         prompt: input.prompt,
@@ -301,6 +339,13 @@ export function createTaskTool(opts: CreateTaskToolOptions = {}): RegisteredTool
         childTools,
         ...(bridge.sessionRootDir !== undefined ? { sessionRootDir: bridge.sessionRootDir } : {}),
       });
+
+      if (result.failure !== undefined) {
+        // Non-fatal classified failure → an is_error tool result carrying
+        // the structured {isError, failureClass, report} content. The run
+        // continues; the parent model decides what to do next.
+        throw new SubAgentFailedError(result.failure);
+      }
 
       return result.finalMessage;
     },

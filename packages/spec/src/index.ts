@@ -577,10 +577,43 @@ const memoryWikiBlock = z
 
 /**
  * The shared duration-string grammar (Phase 3 §3.1 heartbeat, v0.3.0
- * `memory.ttl`). Extended with `d` (days) in 0.3.0. Parsed to milliseconds
- * at lower time by the compiler's `parseDurationToMs`.
+ * `memory.ttl` and `memory.dream.every`). Extended with `d` (days) in
+ * 0.3.0. Parsed to milliseconds at lower time by the compiler's
+ * `parseDurationToMs`.
  */
 const DURATION_REGEX = /^\d+(?:ms|s|m|h|d)$/;
+
+/**
+ * v0.3.0 Goal 5 (§6/§9) — the `memory.dream` sub-block: scheduled memory
+ * consolidation. Nested under `memory:` because it consolidates the memory
+ * fabric (facts + wiki + continuity's spec-scoped agenda) — one shared zod
+ * object, minimal union churn.
+ *
+ *   - `every` (required): the consolidation cadence in the shared duration
+ *     grammar (`"24h"`, `"1d"`). Must be >= 5m (enforced at lower time) —
+ *     consolidation is a maintenance pass, not a per-turn hook.
+ *   - `mode`: `full` (default — deterministic phase + ONE bounded model
+ *     synthesis session) | `deterministic` (no model, ever).
+ *   - `budget_usd`: the model phase's item-27 spend cap (OPTIMIZABLE,
+ *     PR 20). `0` — or omitting it — means deterministic only, regardless
+ *     of `mode`; unattended model spend must be opted into by number.
+ *   - `instructions`: optional playbook override; the default is the
+ *     builtin `dream` skill body.
+ * `.strict()` so a typo'd sub-key fails the build.
+ */
+const memoryDreamBlock = z
+  .object({
+    every: z
+      .string()
+      .regex(
+        DURATION_REGEX,
+        'memory.dream.every must be a duration like "24h", "1d", "30m", or "300s"',
+      ),
+    mode: z.enum(["deterministic", "full"]).optional(),
+    budget_usd: z.number().nonnegative().optional(),
+    instructions: z.string().min(1).optional(),
+  })
+  .strict();
 
 /**
  * Feature #53 — cross-session memory block. Its mere presence wires the
@@ -601,6 +634,7 @@ const DURATION_REGEX = /^\d+(?:ms|s|m|h|d)$/;
  *     string in the heartbeat grammar extended with `d` (days) — e.g. "90d".
  *     Must be >= 1h (enforced at lower time); omit to keep facts forever.
  *   - `wiki`: the semantic tier (see {@link memoryWikiBlock}).
+ *   - `dream`: scheduled consolidation (see {@link memoryDreamBlock}, §6).
  * `.strict()` so a typo'd sub-key fails the build.
  */
 const memoryBlock = z
@@ -619,6 +653,7 @@ const memoryBlock = z
     autoRecall: z.boolean().optional(),
     recallK: z.number().int().positive().max(50).optional(),
     wiki: memoryWikiBlock.optional(),
+    dream: memoryDreamBlock.optional(),
   })
   .strict()
   .optional();
@@ -667,6 +702,118 @@ const continuityObject = z
   .strict();
 
 const continuityBlock = z.union([z.boolean(), continuityObject]).optional();
+
+/**
+ * v0.3.0 Goal 3 (§4.1) — the top-level `thredz:` block: ONE knob that flips
+ * the memory fabric's wiki backend to a hosted Thredz wiki over the published
+ * `thredz-mcp` stdio server (npm, v0.2.0 — 25 tools incl. `goal_*`/`task_*`).
+ *
+ * Forms:
+ *   - boolean shorthand: `thredz: true` ≡ `{ api_key: "$THREDZ_API_KEY" }`
+ *     (`false` ≡ absent — the explicit opt-out).
+ *   - string shorthand: `thredz: $THREDZ_API_KEY` — THE one argument.
+ *   - the strict object:
+ *       · `api_key` (required): credential-lowered to an `IrSecretRef`
+ *         (`lowerCredential` — fail-fast on a malformed `$…` env ref).
+ *       · `base_url`: self-hosted / local Thredz API base
+ *         (`THREDZ_API_BASE` in the synthesized server env).
+ *       · `visibility`: `private` (DEFAULT — overrides Thredz's
+ *         shared-by-default foot-gun) | `shared`; becomes the synthesized
+ *         server's `THREDZ_DEFAULT_VISIBILITY`.
+ *       · `goals`: mirror continuity goal writes to Thredz `goal_write`/
+ *         `goal_update` (spec-scoped ONLY, §14.5 decision 5). Default: on
+ *         when continuity goals are on.
+ *       · `agents`: register an addressable agent handle at boot
+ *         (idempotent `agent_register`). `true` derives the handle from the
+ *         spec name; a string names it explicitly. Default off.
+ *
+ * Carried on the five memory shapes (cli, channel, managed, research, crew);
+ * the strict unions reject it loudly elsewhere. Emit-wiring in this release
+ * is the cli shape (compiled bundle + `crewhaus run`); the other four carry
+ * the block with the 0.2.3-convention ignored-note comment.
+ */
+const THREDZ_HANDLE_RE = /^[a-z][a-z0-9-]{2,31}$/;
+
+const thredzObject = z
+  .object({
+    api_key: z.string().min(1),
+    base_url: z.string().url().optional(),
+    visibility: z.enum(["private", "shared"]).optional(),
+    goals: z.boolean().optional(),
+    agents: z
+      .union([
+        z.boolean(),
+        z
+          .string()
+          .regex(
+            THREDZ_HANDLE_RE,
+            "thredz.agents must be a lowercase handle matching ^[a-z][a-z0-9-]{2,31}$ (or true to derive one from the spec name)",
+          ),
+      ])
+      .optional(),
+  })
+  .strict();
+
+const thredzBlock = z.union([z.boolean(), z.string().min(1), thredzObject]).optional();
+
+/**
+ * v0.3.0 Goal 2 (§3.3, PR 17) — the top-level `learning:` block: continual
+ * learning as a first-class capability. Presence (with `enabled` not `false`)
+ * registers the builtin `learning-loop` skill with `domain`/`curriculum`/
+ * `sources` substituted at compile time, gates in the `/study` `/reflect`
+ * (and, with `exam`, `/exam`) slash commands, and enforces Sources-required
+ * wiki writes deterministically.
+ *
+ * Learning NEEDS a wiki — the knowledge lives there, not in the prompt — so
+ * the compiler REQUIRES `memory.wiki` (local files) or `thredz:` (hosted)
+ * alongside this block (cross-field CompilerError otherwise).
+ *
+ *   - `domain` (required): one sentence naming the field of expertise —
+ *     substituted into the learning-loop skill body.
+ *   - `curriculum`: spec-relative path to an agent-editable checkbox-ladder
+ *     file (e.g. `curriculum.md`). Optional; without it the skill keeps the
+ *     ladder in the wiki. Whether the file EXISTS is a runtime concern.
+ *   - `sources`: source-allowlist hints (domains/patterns) woven into the
+ *     skill's STUDY gathering rules. Deliberately NOT optimizable — an
+ *     allowlist is a security surface (§7.5).
+ *   - `exam`: spec-relative `dataset` (jsonl) + `graders` (yaml) paths for
+ *     the first-class competency exam: `/exam` drives a programmatic
+ *     eval-runner invocation (the `run_exam` tool — no Bash shell-out), and
+ *     every failed sample is logged as a knowledge gap automatically.
+ *   - `study`: unattended-study toggles, both default ON —
+ *       · `on_heartbeat`: prepend the study-rotation preamble (gaps first,
+ *         ~3:1 study:reflect, bounded per tick) to channel heartbeat
+ *         instructions;
+ *       · `on_dream`: seed the dream model phase's findings with the top
+ *         open knowledge gaps + the next unmastered curriculum rung.
+ *
+ * Carried on the five memory shapes (cli, channel, managed, research, crew);
+ * the strict unions reject it loudly elsewhere. `.strict()` throughout so a
+ * typo'd sub-key fails the build.
+ */
+const learningBlock = z
+  .object({
+    enabled: z.boolean().optional(),
+    domain: z.string().min(1),
+    curriculum: z.string().min(1).optional(),
+    sources: z.array(z.string().min(1)).optional(),
+    exam: z
+      .object({
+        dataset: z.string().min(1),
+        graders: z.string().min(1),
+      })
+      .strict()
+      .optional(),
+    study: z
+      .object({
+        on_heartbeat: z.boolean().optional(),
+        on_dream: z.boolean().optional(),
+      })
+      .strict()
+      .optional(),
+  })
+  .strict()
+  .optional();
 
 /**
  * Ops item 37 — cross-cutting `observability` block. Today it carries one
@@ -915,6 +1062,8 @@ const cliSchema = z
     feedback: feedbackBlock,
     memory: memoryBlock,
     continuity: continuityBlock,
+    thredz: thredzBlock,
+    learning: learningBlock,
     observability: observabilityBlock,
     cli: cliOptionsBlock,
     chains: chainsBlock,
@@ -1068,6 +1217,8 @@ const channelSchema = z
     feedback: feedbackBlock,
     memory: memoryBlock,
     continuity: continuityBlock,
+    thredz: thredzBlock,
+    learning: learningBlock,
     observability: observabilityBlock,
     heartbeat: heartbeatBlock,
     gateway: channelGatewayBlock,
@@ -1171,6 +1322,8 @@ const managedSchema = z
     budget: budgetBlock,
     memory: memoryBlock,
     continuity: continuityBlock,
+    thredz: thredzBlock,
+    learning: learningBlock,
     observability: observabilityBlock,
   })
   .strict();
@@ -1302,6 +1455,8 @@ const crewSchema = z
     // surface, §2.7).
     memory: memoryBlock,
     continuity: continuityBlock,
+    thredz: thredzBlock,
+    learning: learningBlock,
     chains: chainsBlock,
     wallets: walletsBlock,
     contracts: contractsBlock,
@@ -1343,6 +1498,8 @@ const researchSchema = z
     failure_taxonomy: failureTaxonomyBlock,
     memory: memoryBlock,
     continuity: continuityBlock,
+    thredz: thredzBlock,
+    learning: learningBlock,
     chains: chainsBlock,
     wallets: walletsBlock,
     contracts: contractsBlock,
@@ -1680,10 +1837,18 @@ export type SpecSecurityBlock = z.infer<typeof securityBlock>;
 export type SpecFeedbackBlock = z.infer<typeof feedbackBlock>;
 export type SpecMemoryBlock = z.infer<typeof memoryBlock>;
 export type SpecMemoryWikiBlock = z.infer<typeof memoryWikiBlock>;
+/** The `memory.dream` scheduled-consolidation sub-block (v0.3.0 §6). */
+export type SpecMemoryDreamBlock = z.infer<typeof memoryDreamBlock>;
 /** The `continuity:` object form (v0.3.0 §2.1). */
 export type SpecContinuityObject = z.infer<typeof continuityObject>;
 /** The full `continuity:` surface: boolean shorthand or the object form. */
 export type SpecContinuityBlock = z.infer<typeof continuityBlock>;
+/** The `thredz:` object form (v0.3.0 §4.1). */
+export type SpecThredzObject = z.infer<typeof thredzObject>;
+/** The full `thredz:` surface: boolean/string shorthand or the object form. */
+export type SpecThredzBlock = z.infer<typeof thredzBlock>;
+/** The `learning:` block (v0.3.0 §3.3, PR 17). */
+export type SpecLearningBlock = z.infer<typeof learningBlock>;
 export type SpecFailureTaxonomyEntry = z.infer<typeof failureTaxonomyEntrySchema>;
 export type SpecFailureTaxonomy = z.infer<typeof failureTaxonomyBlock>;
 

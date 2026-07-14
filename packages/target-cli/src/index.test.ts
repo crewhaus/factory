@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { IrV0 } from "@crewhaus/ir";
@@ -732,6 +732,30 @@ describe("emitCli — memory block (#53, rewired onto the PR 10 composition root
     expect(content).not.toContain("@crewhaus/memory-service");
   });
 
+  test("memory.dream emits the boot-time deterministic catch-up (PR 14, §6.3)", () => {
+    const content =
+      emitCli(
+        baseIr({
+          memory: { dream: { everyMs: 86_400_000, mode: "full", budgetUsd: 0.5 } },
+        }),
+      ).files[0]?.content ?? "";
+    expect(content).toContain(
+      `import { wireMemory, runDreamBootCatchUp } from "@crewhaus/memory-service";`,
+    );
+    expect(content).toContain(
+      'const __dreamNote = await runDreamBootCatchUp({"specName":"smoke","memory":{"dream":{"everyMs":86400000,"mode":"full","budgetUsd":0.5}}}, { cwd: process.cwd() });',
+    );
+    expect(content).toContain(
+      "if (__dreamNote !== null) process.stdout.write(`${__dreamNote}\\n`);",
+    );
+  });
+
+  test("no dream block → no catch-up lines (pinned bytes preserved)", () => {
+    const content = emitCli(baseIr({ memory: {} })).files[0]?.content ?? "";
+    expect(content).not.toContain("runDreamBootCatchUp");
+    expect(content).not.toContain("__dreamNote");
+  });
+
   test("the EMITTED fragment literal drives the real wiring: tool parity + recall/capture round-trip", async () => {
     // Behavioral-equivalence pin at the emit boundary: pull the exact JSON
     // literal out of the generated bundle, run it through wireMemory (what
@@ -799,5 +823,102 @@ describe("emitCli — observability.slo → sloTargets (item 37, F4 codegen pari
   test("no observability block ⇒ no sloTargets field (byte-identical to before)", () => {
     const content = emitCli(baseIr()).files[0]?.content ?? "";
     expect(content).not.toContain("sloTargets:");
+  });
+});
+
+describe("emitCli — learning block (v0.3.0 §3.3, PR 17)", () => {
+  const LEARNING = {
+    domain: "specialty coffee extraction science",
+    curriculum: "curriculum.md",
+    sources: ["sca.coffee", "*.edu"],
+    study: { onHeartbeat: true, onDream: true },
+  } as const;
+
+  test("learning rides the emitted fragment (skill + /study /reflect wire at boot)", () => {
+    const content =
+      emitCli(
+        baseIr({
+          memory: { wiki: { enabled: true, requireSources: true } },
+          continuity: { plan: true, proof: "ladder", ledger: true, handoff: true, scope: "spec" },
+          learning: LEARNING,
+        }),
+      ).files[0]?.content ?? "";
+    expect(content).toContain('"learning":{"domain":"specialty coffee extraction science"');
+    expect(content).toContain('"curriculum":"curriculum.md"');
+    expect(content).toContain('"sources":["sca.coffee","*.edu"]');
+    expect(content).toContain('"study":{"onHeartbeat":true,"onDream":true}');
+    // No exam configured → no exam runner in the bundle.
+    expect(content).not.toContain("createExamRunner");
+    expect(content).not.toContain("@crewhaus/eval-runner");
+  });
+
+  test("learning.exam emits the programmatic exam runner (no Bash shell-out)", () => {
+    const content =
+      emitCli(
+        baseIr({
+          memory: { wiki: { enabled: true, requireSources: true } },
+          continuity: { plan: true, proof: "ladder", ledger: true, handoff: true, scope: "spec" },
+          learning: {
+            ...LEARNING,
+            exam: { dataset: "eval/dataset.jsonl", graders: "eval/graders.yaml" },
+          },
+        }),
+      ).files[0]?.content ?? "";
+    expect(content).toContain('import { createExamRunner } from "@crewhaus/eval-runner";');
+    expect(content).toContain(
+      'examRunner: createExamRunner({ specName: "smoke", model: "claude-sonnet-4-6", instructions: "be helpful", fragment: ',
+    );
+    // The runner rides the SAME wireMemory call — one composition root.
+    expect(content).toContain("await wireMemory(");
+    expect(content).not.toContain("crewhaus eval"); // the demo's Bash hack never resurfaces
+  });
+
+  test("learning without continuity still hands the skill surface to wireMemory", () => {
+    const content =
+      emitCli(
+        baseIr({
+          memory: { wiki: { enabled: true, requireSources: true } },
+          learning: LEARNING,
+        }),
+      ).files[0]?.content ?? "";
+    // The composition root owns skills/commands (no bundle-side discovery).
+    expect(content).toContain("const __skills = __memWired.options.skills ?? [];");
+    expect(content).not.toContain("discoverSkills");
+  });
+
+  test("REGRESSION: no learning block → the emitted bundle is byte-identical to PR 16 (golden pin)", () => {
+    const golden = readFileSync(
+      join(import.meta.dir, "__fixtures__", "pr16-memory-bundle.golden.txt"),
+      "utf-8",
+    );
+    const content =
+      emitCli(
+        baseIr({
+          name: "pinned",
+          memory: {
+            enabled: true,
+            autoCapture: true,
+            autoRecall: true,
+            recallK: 5,
+            wiki: { enabled: true, autoRecall: true },
+            dream: { everyMs: 86_400_000, mode: "full", budgetUsd: 0.5 },
+          },
+          continuity: { plan: true, proof: "ladder", ledger: true, handoff: true, scope: "spec" },
+        }),
+      ).files[0]?.content ?? "";
+    expect(content).toBe(golden);
+  });
+
+  test("no learning block → no learning artifacts anywhere in the bundle", () => {
+    const content =
+      emitCli(
+        baseIr({
+          memory: { wiki: { enabled: true } },
+          continuity: { plan: true, proof: "ladder", ledger: true, handoff: true, scope: "spec" },
+        }),
+      ).files[0]?.content ?? "";
+    expect(content).not.toContain("learning");
+    expect(content).not.toContain("run_exam");
+    expect(content).not.toContain("createExamRunner");
   });
 });

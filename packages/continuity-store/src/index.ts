@@ -79,12 +79,16 @@ export {
 } from "./lock";
 export {
   type MoveToTrashResult,
+  type PurgeTrashResult,
   type RestoreResult,
   type TrashSnapshot,
   TRASH_DIR_NAME,
+  TRASH_PURGE_AFTER_MS,
   TrashError,
   listTrash,
   moveToTrash,
+  parseTrashTimestamp,
+  purgeTrash,
   restoreFromTrash,
 } from "./trash";
 export {

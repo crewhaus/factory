@@ -36,6 +36,86 @@ import { normalizeHarnessDir } from "./flywheel";
 
 export const EVAL_CI_WORKFLOW_RELPATH = join(".github", "workflows", "crewhaus-eval.yml");
 export const SENTINEL_WORKFLOW_RELPATH = join(".github", "workflows", "sentinel-drift.yml");
+export const DREAM_WORKFLOW_RELPATH = join(".github", "workflows", "crewhaus-dream.yml");
+
+/**
+ * v0.3.0 PR 14 (§6.3) — the scheduled-consolidation cron workflow,
+ * scaffolded by `crewhaus dream init <spec>`. Follows the sentinel/flywheel
+ * conventions: odd-minute cron (every workflow scheduled at :00 queues
+ * behind GitHub's backlog), `workflow_dispatch` for manual runs, and a
+ * human-auditable job body. The cadence is derived from the spec's
+ * `memory.dream.every`: sub-daily schedules get an hourly cron, daily and
+ * slower get a nightly one — over-firing is harmless because `crewhaus
+ * dream run` is WINDOW-IDEMPOTENT (a second invocation inside one
+ * `every` window is a cached no-op), which is exactly what makes the verb
+ * cron-safe.
+ */
+export function buildDreamWorkflowYaml(opts: {
+  readonly specPath: string;
+  readonly everyMs: number;
+  readonly harnessDir?: string;
+}): string {
+  const sub = normalizeHarnessDir(opts.harnessDir);
+  const workingDirLine = sub === "" ? "" : `\n        working-directory: ${sub}`;
+  const subdirNote =
+    sub === ""
+      ? ""
+      : `#   - Scaffolded for the harness at ${sub}/ — the job's working-directory is
+#     set so the spec path resolves inside it.\n`;
+  const hourly = opts.everyMs < 24 * 60 * 60 * 1000;
+  const cron = hourly ? "19 * * * *" : "19 4 * * *";
+  const cadenceNote = hourly
+    ? "# Hourly at :19 (off the hour to dodge cron scheduling backlog) — the\n# spec's dream cadence is sub-daily; window idempotency dedupes over-fires."
+    : "# Nightly at 04:19 UTC (off the hour to dodge cron scheduling backlog).";
+  return `# crewhaus-dream.yml — scaffolded by \`crewhaus dream init\` (v0.3.0 §6.3).
+#
+# Scheduled memory consolidation: runs \`crewhaus dream run\` on a cron. The
+# verb is CRON-SAFE by construction — runs are idempotency-keyed on the
+# schedule window (dream:<spec>:<floor(now/every)>), so this cron, a daemon
+# janitor tick, and a manual \`crewhaus dream\` can never double-fire; a
+# fresh window runs the deterministic pass plus (mode: full, budget_usd > 0)
+# ONE bounded model synthesis session capped by the spec's budget.
+${subdirNote}#
+# Required repo secret: ANTHROPIC_API_KEY (billed by the model phase, capped
+# at the spec's memory.dream.budget_usd per run).
+
+name: crewhaus-dream
+
+on:
+  schedule:
+    ${cadenceNote.replace(/\n/g, "\n    ")}
+    - cron: "${cron}"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  dream:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash${workingDirLine}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install crewhaus CLI
+        run: |
+          bun add -g crewhaus
+          echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
+
+      - name: Run the consolidation pass
+        env:
+          ANTHROPIC_API_KEY: \${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          crewhaus dream run ${opts.specPath}
+`;
+}
 
 /**
  * Item 30 — the nightly model-drift sentinel workflow, scaffolded by

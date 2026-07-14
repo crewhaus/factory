@@ -207,3 +207,57 @@ describe("lowerMemory — v0.3.0 extensions (backend/ttl/wiki, §9)", () => {
     expect(ir.memory).toEqual({ autoRecall: true });
   });
 });
+
+describe("lowerMemory — dream (v0.3.0 PR 14, §6/§9)", () => {
+  test("dream lowers with every → everyMs and mode resolved to its default", () => {
+    const ir = lowerYaml(`${CLI}memory:\n  dream:\n    every: 24h\n`);
+    expect(ir.memory).toEqual({
+      dream: { everyMs: 24 * 60 * 60 * 1000, mode: "full" },
+    });
+  });
+
+  test("full dream block lowers verbatim (budget_usd → budgetUsd)", () => {
+    const ir = lowerYaml(
+      `${CLI}memory:\n  dream:\n    every: 1d\n    mode: deterministic\n    budget_usd: 0.5\n    instructions: consolidate gently\n`,
+    );
+    expect(ir.memory?.dream).toEqual({
+      everyMs: 24 * 60 * 60 * 1000,
+      mode: "deterministic",
+      budgetUsd: 0.5,
+      instructions: "consolidate gently",
+    });
+  });
+
+  test("dream.every below the 5m floor is rejected at compile time", () => {
+    expect(() => lowerYaml(`${CLI}memory:\n  dream:\n    every: 4m\n`)).toThrow(CompilerError);
+    expect(() => lowerYaml(`${CLI}memory:\n  dream:\n    every: 30s\n`)).toThrow(
+      /below the 5m floor/,
+    );
+    expect(() => lowerYaml(`${CLI}memory:\n  dream:\n    every: 5m\n`)).not.toThrow();
+  });
+
+  test("dream.every is required and typo'd sub-keys fail the strict schema", () => {
+    expect(() => lowerYaml(`${CLI}memory:\n  dream:\n    mode: full\n`)).toThrow();
+    expect(() =>
+      lowerYaml(`${CLI}memory:\n  dream:\n    every: 24h\n    budgetUsd: 0.5\n`),
+    ).toThrow();
+  });
+
+  test("dream is carried on every memory-bearing shape (channel here)", () => {
+    const ir = lower(
+      parseSpec(`${CHANNEL}memory:\n  dream:\n    every: 12h\n    budget_usd: 0.25\n`),
+    );
+    if (ir.target !== "channel") throw new Error("expected channel");
+    expect(ir.memory?.dream).toEqual({
+      everyMs: 12 * 60 * 60 * 1000,
+      mode: "full",
+      budgetUsd: 0.25,
+    });
+  });
+
+  test("a memory block without dream lowers with no dream key (declared-fields-only)", () => {
+    const ir = lowerYaml(`${CLI}memory:\n  autoRecall: true\ncontinuity: false\n`);
+    expect(ir.memory).toEqual({ autoRecall: true });
+    expect(ir.memory && "dream" in ir.memory).toBe(false);
+  });
+});
