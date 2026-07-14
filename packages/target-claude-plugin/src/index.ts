@@ -39,9 +39,11 @@ import {
   type IrEvalV0,
   type IrGraphV0,
   type IrManagedV0,
+  type IrMcpServers,
   type IrNode,
   type IrPipelineV0,
   type IrResearchV0,
+  type IrSecretRef,
   type IrV0,
   type IrWorkflowV0,
   renderBundleReadme,
@@ -190,11 +192,34 @@ function renderReadme(ir: IrNode, description: string): string {
 
 function renderMcpJson(ir: IrNode): string | undefined {
   // Only emit when the IR variant has mcp_servers and it's non-empty.
-  const v = ir as { mcp_servers?: Record<string, unknown> };
+  const v = ir as { mcp_servers?: IrMcpServers };
   if (v.mcp_servers === undefined) return undefined;
-  const keys = Object.keys(v.mcp_servers);
-  if (keys.length === 0) return undefined;
-  return `${JSON.stringify(v.mcp_servers, null, 2)}\n`;
+  const entries = Object.entries(v.mcp_servers);
+  if (entries.length === 0) return undefined;
+  // 0.3.0 — env/header values are IrSecretRef objects. Claude Code's
+  // .mcp.json expands `${VAR}` from the environment at load time, so an
+  // env ref renders as `${VAR}` (the secret stays out of the artifact and
+  // Claude Code resolves it on the user's machine); literals render as
+  // their plain string.
+  const rendered: Record<string, unknown> = {};
+  for (const [name, cfg] of entries) {
+    rendered[name] =
+      cfg.transport === "stdio"
+        ? { ...cfg, ...(cfg.env !== undefined ? { env: renderSecretMap(cfg.env) } : {}) }
+        : {
+            ...cfg,
+            ...(cfg.headers !== undefined ? { headers: renderSecretMap(cfg.headers) } : {}),
+          };
+  }
+  return `${JSON.stringify(rendered, null, 2)}\n`;
+}
+
+function renderSecretMap(map: Readonly<Record<string, IrSecretRef>>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [key, ref] of Object.entries(map)) {
+    out[key] = ref.kind === "env" ? `\${${ref.name}}` : ref.value;
+  }
+  return out;
 }
 
 /**
