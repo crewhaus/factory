@@ -39,6 +39,42 @@ export type EventKind =
   | "tool_use"
   | "tool_result"
   | "error"
+  // v0.3.0 Goal 6 — the structured TERMINAL failure record, appended by
+  // runtime-core immediately before the run-ending throw (mirrors the
+  // `run_failed` trace event; payload `{ class, message, remediation?,
+  // exitCode }` from the thrown FailureReport). The pre-existing `error`
+  // kind records every recoverable model-call error as it happens; this
+  // kind records the ONE failure the run actually died with, so offline
+  // consumers (`crewhaus advise`, incident collection, session viewers)
+  // can tell "the run ended because the provider account is out of
+  // funding (exit 31)" without re-deriving it from the recovery ladder.
+  // Non-conversational: `replayMessageHistory` ignores it, so `--resume`
+  // is unaffected, and readers written before this kind existed keep
+  // parsing (every session-log reader branches on the kinds it knows).
+  | "run_failed"
+  // v0.3.0 Goal 1 (§2.3) — verbatim externalization of content EVICTED by
+  // compaction, appended by runtime-core BEFORE `snip` drops middle messages
+  // and BEFORE `autoCompact` replaces history (gated on the continuity
+  // seam's `ledger !== false`). Payload `{ role: "user" | "assistant" |
+  // "tool", text, turnNumber? }` — `text` is the evicted content verbatim,
+  // zero model trust. Evicted USER messages are additionally folded into the
+  // in-run requirements ledger and re-injected into every model call's
+  // `<requirements_ledger>` tail block, so a user's clarification answer
+  // survives any number of compactions regardless of summary quality; the
+  // assistant/tool records are episodic externalization for a later recall
+  // integration. `--resume` rebuilds the ledger deterministically from these
+  // events. Non-conversational: `replayMessageHistory` ignores it, so
+  // `--resume` replay is unaffected, and readers written before this kind
+  // existed keep parsing (every session-log reader branches on the kinds it
+  // knows and skips the rest).
+  | "context_evicted"
+  // Payload today: `{ kind: "snip" | "autocompact" | "reactive", before,
+  // after }` message counts, PLUS (v0.3.0 §2.3, additive) `summary?` — the
+  // verbatim autocompact summary TEXT that replaced the history, persisted
+  // so post-mortems and verifiers can check what the model claimed the
+  // conversation contained (before/after counts alone said nothing about
+  // WHAT survived). Absent on pure snip steps and on records written before
+  // v0.3.0; old readers skip the unknown field.
   | "compaction"
   | "sub_agent_start"
   | "sub_agent_end"
@@ -125,20 +161,33 @@ export type EventKind =
   // route explain <session>`. Non-conversational, so `replayMessageHistory`
   // ignores it and `--resume` is unaffected.
   | "model_route"
-  // v0.3.0 continuity (design §2.4) — plan/goal mutations and machine-checked
-  // action proof, appended by `@crewhaus/tool-plan` through its injected
-  // append seam (the tool package stays decoupled from runtime wiring). All
-  // three are non-conversational: `replayMessageHistory` ignores them and
-  // readers written before these kinds existed keep parsing (every session-log
-  // reader branches on the kinds it knows and skips the rest). Payload shapes
-  // are exported below as `PlanUpdateEventPayload` / `GoalUpdateEventPayload`
-  // / `ActionProofEventPayload`.
-  //
-  // NOTE: a sibling in-flight branch appends `run_failed` to this union — each
-  // addition deliberately sits on its own line so the merge stays trivial.
+  // v0.3.0 continuity (design §2.4) — `plan_update` / `goal_update` /
+  // `action_proof` appended by `@crewhaus/tool-plan`; v0.3.0 memory (design §9)
+  // — `wiki_write` appended by `@crewhaus/tool-wiki`. Both through injected
+  // append seams (the tool packages stay decoupled from runtime wiring). All
+  // non-conversational: `replayMessageHistory` ignores them and readers written
+  // before these kinds existed keep parsing. Each kind sits on its own line so
+  // the parallel 0.3.0 branches merge trivially. Payload shapes are exported
+  // below (`PlanUpdateEventPayload` / `GoalUpdateEventPayload` /
+  // `ActionProofEventPayload` / `WikiWriteEventPayload`).
   | "plan_update"
   | "goal_update"
-  | "action_proof";
+  | "action_proof"
+  | "wiki_write";
+
+/**
+ * Payload for the `wiki_write` event kind (0.3.0 design §9): which article
+ * was mutated, at what version, and how. `action` distinguishes a body
+ * upsert (`"write"`), a reflection-pass signals change (`"set_signals"`),
+ * and the standalone `log_knowledge_gap` fallback (`"gap"`).
+ */
+export type WikiWriteEventPayload = {
+  readonly slug: string;
+  readonly version: number;
+  readonly action: "write" | "set_signals" | "gap";
+  /** thredz-parity `editMessage`, when the model supplied one. */
+  readonly editMessage?: string;
+};
 
 export type Event = {
   readonly ts: number;

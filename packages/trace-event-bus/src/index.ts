@@ -10,6 +10,7 @@
 
 export type {
   A2AMessageEvent,
+  CacheRotationEvent,
   CircuitStateChangedEvent,
   CompactionFiredEvent,
   CostAccrualEvent,
@@ -35,6 +36,7 @@ export type {
   ResponseRatedEvent,
   RoleEndEvent,
   RoleStartEvent,
+  RunFailedEvent,
   SanitizerReportEvent,
   Span,
   SubAgentEndEvent,

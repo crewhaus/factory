@@ -126,6 +126,45 @@ describe("emitCli — tool wiring (Section 2)", () => {
   });
 });
 
+describe("emitCli — terminal-failure catch wrapper (0.3.0 Goal 6)", () => {
+  test("the top-level runChatLoop is wrapped in a catch that renders the report and exits coded", () => {
+    const content = emitCli(baseIr()).files[0]?.content ?? "";
+    // The bare `await runChatLoop(...)` (the "agent exited" unhandled-stack
+    // path) is gone: every bundle catches, renders formatRunFailure, and
+    // exits with the report's coded status.
+    expect(content).toContain(
+      'import { formatRunFailure, toFailureReport } from "@crewhaus/errors";',
+    );
+    const tryIdx = content.indexOf("try {");
+    const runChatLoopIdx = content.indexOf("await runChatLoop({");
+    const catchIdx = content.indexOf("} catch (__err) {");
+    expect(tryIdx).toBeGreaterThanOrEqual(0);
+    expect(runChatLoopIdx).toBeGreaterThan(tryIdx);
+    expect(catchIdx).toBeGreaterThan(runChatLoopIdx);
+    expect(content).toContain("const __report = toFailureReport(__err);");
+    expect(content).toContain("process.stderr.write(`${formatRunFailure(__report)}\\n`);");
+    expect(content).toContain("process.exit(__report.exitCode);");
+    // No MCP → no finally block.
+    expect(content).not.toContain("} finally {");
+  });
+
+  test("with MCP servers the catch precedes the cleanup finally", () => {
+    const content =
+      emitCli(
+        baseIr({
+          mcp_servers: {
+            things: { transport: "stdio", command: "node", args: ["server.js"] },
+          },
+        }),
+      ).files[0]?.content ?? "";
+    const catchIdx = content.indexOf("} catch (__err) {");
+    const finallyIdx = content.indexOf("} finally {");
+    expect(catchIdx).toBeGreaterThanOrEqual(0);
+    expect(finallyIdx).toBeGreaterThan(catchIdx);
+    expect(content).toContain("await mcpHost.disconnectAll();");
+  });
+});
+
 describe("emitCli — permissions (Section 7)", () => {
   test("no rules and no mode → no permissionMode or permissionRules emitted", () => {
     const content = emitCli(baseIr()).files[0]?.content ?? "";
@@ -189,7 +228,9 @@ describe("emitCli — MCP servers (Section 9)", () => {
           },
         }),
       ).files[0]?.content ?? "";
-    expect(content).toContain('import { McpHost } from "@crewhaus/mcp-host"');
+    expect(content).toContain(
+      'import { McpHost, resolveMcpServerConfig } from "@crewhaus/mcp-host"',
+    );
     expect(content).toContain('import { registerMcpServer } from "@crewhaus/tool-mcp"');
     expect(content).toContain("const mcpHost = new McpHost();");
     expect(content).toContain('mcpHost.addServer("everything"');
@@ -199,6 +240,31 @@ describe("emitCli — MCP servers (Section 9)", () => {
     expect(content).toContain("try {");
     expect(content).toContain("} finally {");
     expect(content).toContain("await mcpHost.disconnectAll();");
+  });
+
+  test("0.3.0 — env secret refs are embedded UNRESOLVED and resolved at boot", () => {
+    const content =
+      emitCli(
+        baseIr({
+          mcp_servers: {
+            thredz: {
+              transport: "stdio",
+              command: "npx",
+              args: ["-y", "thredz-mcp@0.2.0"],
+              env: {
+                THREDZ_API_KEY: { kind: "env", name: "THREDZ_API_KEY" },
+                THREDZ_BASE_URL: { kind: "literal", value: "https://thredz.example/api" },
+              },
+            },
+          },
+        }),
+      ).files[0]?.content ?? "";
+    // The unresolved IrSecretRef JSON is embedded — never a resolved value —
+    // and the boot line materialises it via resolveMcpServerConfig.
+    expect(content).toContain('{"kind":"env","name":"THREDZ_API_KEY"}');
+    expect(content).toContain(
+      'mcpHost.addServer("thredz", resolveMcpServerConfig({"transport":"stdio","command":"npx","args":["-y","thredz-mcp@0.2.0"],"env":{"THREDZ_API_KEY":{"kind":"env","name":"THREDZ_API_KEY"},"THREDZ_BASE_URL":{"kind":"literal","value":"https://thredz.example/api"}}}, { name: "thredz" }));',
+    );
   });
 });
 

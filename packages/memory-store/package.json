@@ -14,6 +14,9 @@
   "dependencies": {
     "@crewhaus/errors": "workspace:*"
   },
+  "devDependencies": {
+    "@crewhaus/embedder": "workspace:*"
+  },
   "license": "Apache-2.0",
   "author": {
     "name": "Max Meier",

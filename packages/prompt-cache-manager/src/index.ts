@@ -32,6 +32,23 @@ import type {
 /** Default rotation period: 7 days. Anthropic's hard TTL is 30 days. */
 export const DEFAULT_ROTATE_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
 
+/**
+ * v0.3.0 Goal 1 (§2.5) — a system block that may carry the `volatile` flag.
+ * Volatile blocks are the mutable tail region runtime-core rebuilds per
+ * model call (`<current_plan>` / `<requirements_ledger>`): they sit AFTER
+ * the cache-marked frozen prefix and must NEVER receive a cache marker —
+ * marking a block that changes every call would re-create (and re-bill) a
+ * cache entry per turn, and marking anything after it would silently bust
+ * the prefix cache. `manage()` therefore skips volatile blocks when picking
+ * the marker target and strips any stray marker off them on rotation.
+ * Plain `CanonicalTextBlockParam` arrays (every pre-0.3.0 caller) are
+ * assignable as-is — `volatile` absent means the block is frozen-prefix
+ * content, and behavior is byte-identical to before this flag existed.
+ */
+export type CacheManagedBlock = CanonicalTextBlockParam & {
+  readonly volatile?: boolean;
+};
+
 export type ManageOptions = {
   /** Adapter features so we skip when caching is automatic / unsupported. */
   readonly features: ProviderFeatures;
@@ -48,7 +65,7 @@ export type ManageOptions = {
 
 export type ManageResult = {
   /** The (possibly mutated) system blocks. */
-  readonly blocks: ReadonlyArray<CanonicalTextBlockParam>;
+  readonly blocks: ReadonlyArray<CacheManagedBlock>;
   /**
    * `true` if we wrote a fresh marker; the caller must persist
    * `result.rotatedAt` to state-store. `false` when we skipped (either
@@ -69,14 +86,18 @@ export type ManageResult = {
  *  - When `features.caching !== "explicit"`, returns input unchanged with
  *    `rotated: false`.
  *  - When `lastRotatedAt` is undefined or stale relative to `rotateAfterMs`,
- *    strips existing markers off all blocks, marks the LAST block with a
- *    fresh `{ type: "ephemeral" }`, and returns `rotated: true` plus the
- *    current timestamp.
+ *    strips existing markers off all blocks, marks the LAST NON-VOLATILE
+ *    block with a fresh `{ type: "ephemeral" }`, and returns `rotated: true`
+ *    plus the current timestamp. Blocks flagged `volatile: true` (the
+ *    mutable tail region, §2.5) are NEVER marked — the marker must stay on
+ *    the frozen prefix so per-call tail edits re-tokenize only the tail —
+ *    and any stray marker on them is stripped.
  *  - When the marker is fresh, returns input unchanged with `rotated: false`.
- *  - When `blocks` is empty, returns input unchanged with `rotated: false`.
+ *  - When `blocks` is empty (or every block is volatile — there is no frozen
+ *    prefix to cache), returns input unchanged with `rotated: false`.
  */
 export function manage(
-  blocks: ReadonlyArray<CanonicalTextBlockParam>,
+  blocks: ReadonlyArray<CacheManagedBlock>,
   opts: ManageOptions,
 ): ManageResult {
   const now = (opts.now ?? Date.now)();
@@ -97,13 +118,30 @@ export function manage(
     return { blocks, rotated: false, rotatedAt: lastRotatedAt };
   }
 
-  // Strip existing markers; refresh the last block.
-  const next: CanonicalTextBlockParam[] = blocks.map((b, i) => {
-    if (i === blocks.length - 1) {
+  // The marker target is the LAST NON-VOLATILE block: everything after it
+  // (the volatile tail) is rebuilt per model call and must sit outside the
+  // cached prefix. All-volatile input has nothing stable to cache — no-op.
+  let lastStable = -1;
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    if (blocks[i]?.volatile !== true) {
+      lastStable = i;
+      break;
+    }
+  }
+  if (lastStable === -1) {
+    return { blocks, rotated: false, rotatedAt: lastRotatedAt };
+  }
+
+  // Strip existing markers; refresh the last non-volatile block. Volatile
+  // blocks keep their flag (so a re-manage stays stable) and never a marker.
+  const next: CacheManagedBlock[] = blocks.map((b, i) => {
+    if (i === lastStable) {
       const cache_control: CanonicalCacheControl = { type: "ephemeral" };
       return { type: "text", text: b.text, cache_control };
     }
-    return { type: "text", text: b.text };
+    return b.volatile === true
+      ? { type: "text", text: b.text, volatile: true }
+      : { type: "text", text: b.text };
   });
   return { blocks: next, rotated: true, rotatedAt: now };
 }

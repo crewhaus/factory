@@ -1,7 +1,10 @@
 /**
  * Pretty formatter for TraceEvent. One line per event with the kind in
  * fixed-width brackets followed by event-specific summary fields.
+ * (`run_failed` is the one deliberate exception: a terminal failure
+ * renders as the canonical multi-line report block.)
  */
+import { formatRunFailure } from "@crewhaus/errors";
 import type { TraceEvent } from "@crewhaus/trace-event-bus";
 
 const KIND_WIDTH = 22;
@@ -47,12 +50,28 @@ function formatBody(ev: TraceEvent): string {
       }`;
     case "compaction_fired":
       return `kind=${ev.subKind} phase=${ev.phase} before=${ev.before} after=${ev.after}`;
+    case "cache_rotation":
+      return `rotatedAt=${new Date(ev.rotatedAt).toISOString()}`;
     case "permission_decision":
       return `tool=${ev.toolName} decision=${ev.decision} mode=${ev.mode}${
         ev.outcome ? ` outcome=${ev.outcome}` : ""
       }${ev.reason ? ` reason=${ev.reason}` : ""}`;
     case "error_recovered":
       return `action=${ev.action} error=${ev.errorName} depth=${ev.depth}`;
+    case "run_failed":
+      // v0.3.0 Goal 6 — the terminal failure is the one event worth more
+      // than a single line: render the same canonical block every other
+      // surface (die(), the bundle catch-wrappers) prints, so the trace
+      // feed and the process stderr tell an identical story. The event's
+      // `message` is "<title>: <detail>" — it rides in the report's title
+      // slot with an empty detail, which formatRunFailure omits.
+      return formatRunFailure({
+        class: ev.class,
+        title: ev.message,
+        detail: "",
+        ...(ev.remediation !== undefined ? { remediation: ev.remediation } : {}),
+        exitCode: ev.exitCode,
+      });
     case "sub_agent_start":
       return `name=${ev.name} childRun=${ev.childRunId} tools=${ev.toolCount} prompt=${ev.promptBytes}B`;
     case "sub_agent_end":

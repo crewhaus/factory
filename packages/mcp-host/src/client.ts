@@ -3,7 +3,10 @@ import type { Logger } from "@crewhaus/logging";
 import type { TraceEventBus } from "@crewhaus/trace-event-bus";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import {
+  StdioClientTransport,
+  getDefaultEnvironment,
+} from "@modelcontextprotocol/sdk/client/stdio.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { CallToolResultSchema } from "@modelcontextprotocol/sdk/types.js";
 import { nextBackoffMs } from "./backoff.js";
@@ -384,8 +387,15 @@ function defaultTransportFactory(config: McpServerConfig): McpClientLikeTranspor
       command: config.command,
       args: config.args ? [...config.args] : undefined,
       // `env: undefined` makes the SDK fall back to its safe default
-      // (DEFAULT_INHERITED_ENV_VARS). Pass through user overrides as-is.
-      ...(config.env !== undefined ? { env: { ...config.env } } : {}),
+      // (DEFAULT_INHERITED_ENV_VARS). When the config DOES declare env,
+      // merge it ON TOP of that same default set — the SDK treats an
+      // explicit `env` as the child's ENTIRE environment, so passing the
+      // overrides alone used to strip PATH/HOME AND meant an explicitly
+      // configured secret (e.g. THREDZ_API_KEY, not on the allowlist)
+      // was the child's only variable while still losing everything a
+      // spawned `npx`/`node` needs to run. This spread is the actual
+      // secret-delivery fix: explicit keys survive the SDK allowlist.
+      ...(config.env !== undefined ? { env: buildStdioChildEnv(config.env) } : {}),
     });
   }
   // SSE — the SDK accepts a URL and request init; we layer headers via
@@ -396,6 +406,18 @@ function defaultTransportFactory(config: McpServerConfig): McpClientLikeTranspor
     sseOpts.requestInit = { headers: { ...config.headers } };
   }
   return new SSEClientTransport(new URL(config.url), sseOpts);
+}
+
+/**
+ * Merge the SDK's safe default child environment (`getDefaultEnvironment()`
+ * — HOME/PATH/SHELL/… per `DEFAULT_INHERITED_ENV_VARS`) with the config's
+ * explicit `env`, explicit keys winning. Extracted (and exported) so the
+ * merge is unit-testable without spawning a real subprocess.
+ *
+ * @internal exported for tests only; not part of the public package surface.
+ */
+export function buildStdioChildEnv(env: Readonly<Record<string, string>>): Record<string, string> {
+  return { ...getDefaultEnvironment(), ...env };
 }
 
 /**

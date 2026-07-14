@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { CanonicalMessage, ProviderRequest, StreamEvent } from "@crewhaus/adapter-anthropic";
 import { AdapterError, ProviderAuthError } from "@crewhaus/errors";
+import { classify, initialRecoveryState, recover, retryAfterMs } from "@crewhaus/recovery-engine";
 import type { GenerateContentResponse, GoogleGenAI } from "@google/genai";
 import { GeminiAdapter, createGeminiAdapter } from "./adapter.js";
 
@@ -101,7 +102,7 @@ describe("GeminiAdapter", () => {
     expect(textDelta?.delta.type === "text_delta" && textDelta.delta.text).toBe("Hello");
   });
 
-  test("stream() normalises a 429 from the request call into overloaded_error", async () => {
+  test("stream() normalises a 429 from the request call into a rate-limit shape", async () => {
     const apiErr = Object.assign(new Error("rate limited"), { name: "ApiError", status: 429 });
     const { client } = fakeClient({ failOn: "call", error: apiErr });
     const adapter = new GeminiAdapter({ client });
@@ -114,7 +115,9 @@ describe("GeminiAdapter", () => {
     }
     expect(thrown).toBeInstanceOf(AdapterError);
     expect((thrown as { status?: number }).status).toBe(429);
-    expect((thrown as { error?: { type?: string } }).error?.type).toBe("overloaded_error");
+    // v0.3.0 Goal 6 — a 429 is a rate limit (retried, Retry-After honored),
+    // no longer stamped overloaded_error.
+    expect((thrown as { error?: { type?: string } }).error?.type).toBe("rate_limit_error");
     // cause chain preserves the original SDK error.
     expect((thrown as AdapterError).cause).toBe(apiErr);
   });
@@ -336,7 +339,7 @@ describe("Gemini error normalisation matrix", () => {
     const err = Object.assign(new Error("rate limited via code"), { code: 429 });
     const wrapped = (await streamError(err)) as { status?: number; error?: { type?: string } };
     expect(wrapped.status).toBe(429);
-    expect(wrapped.error?.type).toBe("overloaded_error");
+    expect(wrapped.error?.type).toBe("rate_limit_error");
   });
 
   test("5xx range maps to overloaded_error, preserving the status", async () => {
@@ -401,6 +404,178 @@ describe("Gemini error normalisation matrix", () => {
     expect(wrapped).toBeInstanceOf(AdapterError);
     expect(wrapped.status).toBeUndefined();
     expect(wrapped.error).toBeUndefined();
+  });
+});
+
+// ===========================================================================
+// v0.3.0 Goal 6 (PR 2) — quota-vs-throttle discrimination, end-to-end
+// through normaliseGeminiError → recovery-engine. `@google/genai`'s
+// ApiError.message is JSON.stringify of the REST error envelope — the
+// fixtures below pin the REAL envelope for a free-tier daily quota
+// exhaustion vs a per-minute throttle (both HTTP 429 RESOURCE_EXHAUSTED).
+// ===========================================================================
+describe("Goal 6 — Gemini error discrimination (via stream())", () => {
+  async function streamError(error: unknown): Promise<unknown> {
+    const { client } = fakeClient({ failOn: "call", error });
+    const adapter = new GeminiAdapter({ client });
+    try {
+      await collect(adapter.stream(baseReq));
+    } catch (e) {
+      return e;
+    }
+    throw new Error("expected stream() to throw");
+  }
+
+  function apiError(status: number, body: unknown): Error {
+    return Object.assign(new Error(JSON.stringify(body)), { name: "ApiError", status });
+  }
+
+  /** Real free-tier daily-quota exhaustion envelope (out of quota → billing). */
+  const DAILY_QUOTA_BODY = {
+    error: {
+      code: 429,
+      message:
+        "You exceeded your current quota, please check your plan and billing details. For more information on this error, head to: https://ai.google.dev/gemini-api/docs/rate-limits.",
+      status: "RESOURCE_EXHAUSTED",
+      details: [
+        {
+          "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+          violations: [
+            {
+              quotaMetric: "generativelanguage.googleapis.com/generate_content_free_tier_requests",
+              quotaId: "GenerateRequestsPerDayPerProjectPerModel-FreeTier",
+              quotaDimensions: { location: "global", model: "gemini-2.0-flash" },
+              quotaValue: "200",
+            },
+          ],
+        },
+        {
+          "@type": "type.googleapis.com/google.rpc.Help",
+          links: [
+            {
+              description: "Learn more about Gemini API quotas",
+              url: "https://ai.google.dev/gemini-api/docs/rate-limits",
+            },
+          ],
+        },
+        { "@type": "type.googleapis.com/google.rpc.RetryInfo", retryDelay: "26s" },
+      ],
+    },
+  };
+
+  /** Same envelope shape, but a per-minute quota — a transient throttle. */
+  const PER_MINUTE_QUOTA_BODY = {
+    error: {
+      code: 429,
+      message:
+        "You exceeded your current quota, please check your plan and billing details. For more information on this error, head to: https://ai.google.dev/gemini-api/docs/rate-limits.",
+      status: "RESOURCE_EXHAUSTED",
+      details: [
+        {
+          "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+          violations: [
+            {
+              quotaMetric: "generativelanguage.googleapis.com/generate_content_paid_tier_requests",
+              quotaId: "GenerateRequestsPerMinutePerProjectPerModel",
+              quotaDimensions: { location: "global", model: "gemini-2.5-flash" },
+              quotaValue: "10",
+            },
+          ],
+        },
+        { "@type": "type.googleapis.com/google.rpc.RetryInfo", retryDelay: "39s" },
+      ],
+    },
+  };
+
+  test("RESOURCE_EXHAUSTED daily/free-tier quota → insufficient_quota envelope → classify() billing", async () => {
+    const err = await streamError(apiError(429, DAILY_QUOTA_BODY));
+    expect(err).toBeInstanceOf(AdapterError);
+    expect((err as AdapterError).providerId).toBe("gemini");
+    expect((err as { status?: number }).status).toBe(429);
+    expect((err as { error?: { code?: string } }).error?.code).toBe("insufficient_quota");
+    // The wrapper's own top-level `code` stays CrewhausError's ErrorCode.
+    expect((err as AdapterError).code).toBe("adapter");
+    // The human-readable body message is surfaced, not the JSON blob.
+    expect((err as { error?: { message?: string } }).error?.message).toContain(
+      "You exceeded your current quota",
+    );
+    expect(classify(err)).toBe("billing");
+  });
+
+  test("daily quota exhaustion → recover() halts with the billing report (exit 31, Gemini attribution)", async () => {
+    const err = await streamError(apiError(429, DAILY_QUOTA_BODY));
+    const action = recover(err, initialRecoveryState);
+    expect(action.kind).toBe("halt");
+    if (action.kind !== "halt") return;
+    expect(action.report.class).toBe("billing");
+    expect(action.report.exitCode).toBe(31);
+    expect(action.report.detail).toContain("Gemini said:");
+    expect(action.report.remediation).toContain("aistudio.google.com");
+  });
+
+  test("RESOURCE_EXHAUSTED per-minute quota → classify() rate_limit, RetryInfo threaded", async () => {
+    const err = await streamError(apiError(429, PER_MINUTE_QUOTA_BODY));
+    expect((err as { error?: { code?: string } }).error?.code).toBeUndefined();
+    expect((err as { error?: { type?: string } }).error?.type).toBe("rate_limit_error");
+    expect(classify(err)).toBe("rate_limit");
+    // google.rpc.RetryInfo retryDelay "39s" → 39000ms on the wrapper.
+    expect(retryAfterMs(err)).toBe(39_000);
+    const action = recover(err, initialRecoveryState);
+    expect(action).toEqual({ kind: "retry", delayMs: 39_000, attempt: 1 });
+  });
+
+  test("429 with an unparseable message stays rate-limit-shaped (no billing guess)", async () => {
+    const err = await streamError(
+      Object.assign(new Error("too many requests"), { name: "ApiError", status: 429 }),
+    );
+    expect((err as { error?: { code?: string; type?: string } }).error?.code).toBeUndefined();
+    expect((err as { error?: { type?: string } }).error?.type).toBe("rate_limit_error");
+    expect(classify(err)).toBe("rate_limit");
+  });
+
+  test("403 PERMISSION_DENIED passes through on status → classify() auth, body message surfaced", async () => {
+    const err = await streamError(
+      apiError(403, {
+        error: {
+          code: 403,
+          message: "Permission denied on resource project my-project.",
+          status: "PERMISSION_DENIED",
+        },
+      }),
+    );
+    expect((err as { status?: number }).status).toBe(403);
+    expect((err as { error?: { message?: string } }).error?.message).toBe(
+      "Permission denied on resource project my-project.",
+    );
+    expect(classify(err)).toBe("auth");
+    const action = recover(err, initialRecoveryState);
+    expect(action.kind).toBe("halt");
+    if (action.kind !== "halt") return;
+    expect(action.report.exitCode).toBe(30);
+    expect(action.report.detail).toContain("Permission denied");
+  });
+
+  test("401 UNAUTHENTICATED passes through on status → classify() auth", async () => {
+    const err = await streamError(
+      apiError(401, {
+        error: {
+          code: 401,
+          message: "Request had invalid authentication credentials.",
+          status: "UNAUTHENTICATED",
+        },
+      }),
+    );
+    expect((err as { status?: number }).status).toBe(401);
+    expect(classify(err)).toBe("auth");
+  });
+
+  test("regression: 503 keeps the exact overloaded shape and retry semantics", async () => {
+    const err = await streamError(
+      Object.assign(new Error("server blew up"), { name: "ApiError", status: 503 }),
+    );
+    expect((err as { error?: unknown }).error).toEqual({ type: "overloaded_error" });
+    expect(classify(err)).toBe("overloaded_or_5xx");
+    expect(recover(err, initialRecoveryState).kind).toBe("retry");
   });
 });
 

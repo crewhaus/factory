@@ -118,6 +118,101 @@ describe("ir-passes — redundantMcpServerCollapse (T1)", () => {
     });
     expect(redundantMcpServerCollapse(ir)).toBe(ir);
   });
+
+  test("stdio servers with identical IrSecretRef env still dedupe (structural comparison, 0.3.0)", () => {
+    const ir = makeCli({
+      mcp_servers: {
+        a: {
+          transport: "stdio",
+          command: "npx",
+          args: ["@x"],
+          env: { API_KEY: { kind: "env", name: "API_KEY" } },
+        },
+        b: {
+          transport: "stdio",
+          command: "npx",
+          args: ["@x"],
+          env: { API_KEY: { kind: "env", name: "API_KEY" } },
+        },
+      },
+    });
+    const out = redundantMcpServerCollapse(ir) as IrV0;
+    expect(Object.keys(out.mcp_servers)).toEqual(["a"]);
+  });
+
+  test("stdio servers that differ only in env refs do NOT collapse (different credentials)", () => {
+    const ir = makeCli({
+      mcp_servers: {
+        a: {
+          transport: "stdio",
+          command: "npx",
+          args: ["@x"],
+          env: { API_KEY: { kind: "env", name: "KEY_A" } },
+        },
+        b: {
+          transport: "stdio",
+          command: "npx",
+          args: ["@x"],
+          env: { API_KEY: { kind: "env", name: "KEY_B" } },
+        },
+      },
+    });
+    expect(redundantMcpServerCollapse(ir)).toBe(ir);
+  });
+
+  test('an env ref $X never collides with the literal string "$X"', () => {
+    const ir = makeCli({
+      mcp_servers: {
+        a: {
+          transport: "stdio",
+          command: "npx",
+          args: ["@x"],
+          env: { API_KEY: { kind: "env", name: "X" } },
+        },
+        b: {
+          transport: "stdio",
+          command: "npx",
+          args: ["@x"],
+          env: { API_KEY: { kind: "literal", value: "$X" } },
+        },
+      },
+    });
+    expect(redundantMcpServerCollapse(ir)).toBe(ir);
+  });
+
+  test("sse servers dedupe on (url, headers) — same headers collapse, different keep", () => {
+    const same = makeCli({
+      mcp_servers: {
+        a: {
+          transport: "sse",
+          url: "http://x",
+          headers: { Authorization: { kind: "env", name: "TOK" } },
+        },
+        b: {
+          transport: "sse",
+          url: "http://x",
+          headers: { Authorization: { kind: "env", name: "TOK" } },
+        },
+      },
+    });
+    expect(Object.keys((redundantMcpServerCollapse(same) as IrV0).mcp_servers)).toEqual(["a"]);
+
+    const different = makeCli({
+      mcp_servers: {
+        a: {
+          transport: "sse",
+          url: "http://x",
+          headers: { Authorization: { kind: "env", name: "TOK_A" } },
+        },
+        b: {
+          transport: "sse",
+          url: "http://x",
+          headers: { Authorization: { kind: "env", name: "TOK_B" } },
+        },
+      },
+    });
+    expect(redundantMcpServerCollapse(different)).toBe(different);
+  });
 });
 
 describe("ir-passes — permissionRuleCanonicalize (T1)", () => {

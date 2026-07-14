@@ -18,7 +18,7 @@ import type { SubAgentDefinition } from "@crewhaus/agent-context-isolation";
 import { type HookDef, loadHooks } from "@crewhaus/hooks-engine";
 import type { IrV0 } from "@crewhaus/ir";
 import { createLogger } from "@crewhaus/logging";
-import { McpHost } from "@crewhaus/mcp-host";
+import { McpHost, resolveMcpServerConfig } from "@crewhaus/mcp-host";
 import {
   BUILTIN_DEFAULT_RULES,
   PermissionConfigError,
@@ -76,7 +76,11 @@ export async function wireRunOnce(ir: IrV0, opts: { cwd?: string } = {}): Promis
   if (Object.keys(ir.mcp_servers).length > 0) {
     const host = new McpHost({ logger });
     mcpHost = host;
-    for (const [name, cfg] of Object.entries(ir.mcp_servers)) host.addServer(name, cfg);
+    // 0.3.0 — env/header values are IrSecretRef; resolve from the eval
+    // process's environment (fail-fast, names the variable).
+    for (const [name, cfg] of Object.entries(ir.mcp_servers)) {
+      host.addServer(name, resolveMcpServerConfig(cfg, { name }));
+    }
     const tempCatalog = new ToolCatalog();
     for (const t of tools) tempCatalog.register(t);
     await Promise.all(

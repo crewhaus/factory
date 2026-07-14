@@ -27,6 +27,7 @@ describe("classifyBoundary — defaults per origin", () => {
       "compaction",
       "tool",
       "chain",
+      "memory",
     ];
     for (const origin of origins) {
       const res = await classifyBoundary(CLEAN, { origin, bypassCache: true });
@@ -47,6 +48,8 @@ describe("classifyBoundary — defaults per origin", () => {
       "compaction",
       "tool",
       "chain",
+      // 0.3.0: recalled wiki/fact content — same block tier as "skill".
+      "memory",
     ];
     for (const origin of blocking) {
       const res = await classifyBoundary(MALICIOUS, { origin, bypassCache: true });

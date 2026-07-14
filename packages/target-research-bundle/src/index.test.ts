@@ -115,3 +115,19 @@ describe("emitResearchBundle — failureTaxonomy field (item 23)", () => {
     expect(emitResearchBundle(empty).files[0]?.content ?? "").not.toContain("failureTaxonomy:");
   });
 });
+
+describe("emitResearchBundle — terminal-failure reporting (0.3.0 Goal 6)", () => {
+  test("main().catch renders the structured report and exits with the coded status", () => {
+    const content = emitResearchBundle(baseIr).files[0]?.content ?? "";
+    expect(content).toContain(
+      'import { formatRunFailure, toFailureReport } from "@crewhaus/errors";',
+    );
+    expect(content).toContain("const __report = toFailureReport(err);");
+    expect(content).toContain(
+      'process.stderr.write(`${formatRunFailure(__report, { prefix: "[research]" })}\\n`);',
+    );
+    expect(content).toContain("process.exit(__report.exitCode);");
+    // The pre-0.3.0 bare fatal one-liner is gone.
+    expect(content).not.toContain("[research] fatal: ${");
+  });
+});

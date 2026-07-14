@@ -1,0 +1,17 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "references": [
+    { "path": "../boundary-classifier" },
+    { "path": "../event-log" },
+    { "path": "../run-context" },
+    { "path": "../tool-builder" },
+    { "path": "../tool-catalog" },
+    { "path": "../wiki-store" },
+    { "path": "../embedder" }
+  ],
+  "include": ["src/**/*"]
+}

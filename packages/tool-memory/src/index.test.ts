@@ -94,3 +94,70 @@ describe("createMemoryTools — Recall", () => {
     expect(() => recall.inputSchema.parse({ query: "q", k: 5 })).not.toThrow();
   });
 });
+
+describe("createMemoryTools — Remember ttlDays (v2)", () => {
+  test("ttlDays sets an expiry and is echoed in the confirmation", async () => {
+    const { remember, store } = createMemoryTools({ specName: "s", rootDir: tmp });
+    const out = await remember.execute({ text: "conference badge pickup code 4411", ttlDays: 7 });
+    expect(out).toContain("expires ");
+    const [item] = await store.list();
+    expect(item?.entry.expiresAt).toBeGreaterThan(Date.now());
+  });
+
+  test("ttlDays schema bounds", () => {
+    const { remember } = createMemoryTools({ specName: "s", rootDir: tmp });
+    expect(() => remember.inputSchema.parse({ text: "t", ttlDays: 0 })).toThrow();
+    expect(() => remember.inputSchema.parse({ text: "t", ttlDays: 4000 })).toThrow();
+    expect(() => remember.inputSchema.parse({ text: "t", ttlDays: 30 })).not.toThrow();
+  });
+});
+
+describe("createMemoryTools — MemoryForget (v2)", () => {
+  test("is destructive AND justification-gated", () => {
+    const { forget } = createMemoryTools({ specName: "s", rootDir: tmp });
+    expect(forget.name).toBe("MemoryForget");
+    expect(forget.destructive).toBe(true);
+    expect(forget.requireJustification).toBe(true);
+    expect(forget.readOnly).toBe(false);
+  });
+
+  test("forgets by exact id and echoes the reason", async () => {
+    const { remember, forget, store } = createMemoryTools({ specName: "s", rootDir: tmp });
+    const confirmation = await remember.execute({ text: "the office wifi password is rotating" });
+    const id = /\((mem_[0-9a-f]{16})\)/.exec(confirmation)?.[1] as string;
+    const out = await forget.execute({ id, reason: "password rotated" });
+    expect(out).toContain("forgot 1 memory(ies) — password rotated:");
+    expect(out).toContain(id);
+    expect(await store.size()).toBe(0);
+  });
+
+  test("forgets every match of a query", async () => {
+    const { remember, forget, store } = createMemoryTools({ specName: "s", rootDir: tmp });
+    await remember.execute({ text: "coffee order: flat white" });
+    await remember.execute({ text: "coffee budget is $40" });
+    await remember.execute({ text: "tea drawer is stocked" });
+    const out = await forget.execute({ query: "coffee" });
+    expect(out).toContain("forgot 2 memory(ies)");
+    expect(await store.size()).toBe(1);
+  });
+
+  test("requires exactly one of id/query", async () => {
+    const { forget } = createMemoryTools({ specName: "s", rootDir: tmp });
+    expect(await forget.execute({})).toContain("exactly one of");
+    expect(await forget.execute({ id: "mem_0123456789abcdef", query: "also a query" })).toContain(
+      "exactly one of",
+    );
+  });
+
+  test("reports when nothing matched", async () => {
+    const { forget } = createMemoryTools({ specName: "s", rootDir: tmp });
+    const out = await forget.execute({ id: "mem_ffffffffffffffff" });
+    expect(out).toContain("nothing to forget");
+  });
+
+  test("id schema rejects non-mem ids", () => {
+    const { forget } = createMemoryTools({ specName: "s", rootDir: tmp });
+    expect(() => forget.inputSchema.parse({ id: "not-an-id" })).toThrow();
+    expect(() => forget.inputSchema.parse({ id: "mem_0123456789abcdef" })).not.toThrow();
+  });
+});

@@ -176,6 +176,16 @@ export type RuntimeBridge = ParentRunHandle & {
   readonly subAgents?: ReadonlyMap<string, SubAgentDefinition>;
   readonly spawnSubAgent?: SpawnSubAgentFn;
   readonly crewMailbox?: CrewMailbox;
+  /**
+   * v0.3.0 Goal 1 (§2.5) — the per-run `state-store` coordination surface,
+   * threaded so tools can signal the runtime within one run. First
+   * consumer: a plan-mutating tool (PlanUpdate/FocusWrite, PR 7) sets
+   * `"plan.dirty": true` here and runtime-core re-renders the mutable
+   * `<current_plan>` tail block before the next model call. Optional
+   * because pre-0.3.0 bridge builders (the crew orchestrator's role
+   * bridges) don't wire it; tools MUST check for undefined.
+   */
+  readonly runState?: Store<Record<string, unknown>>;
 };
 
 /**
