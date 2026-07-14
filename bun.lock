@@ -754,6 +754,10 @@
         "@crewhaus/wiki-store": "workspace:*",
         "zod": "^3.23.8",
       },
+      "devDependencies": {
+        "@crewhaus/grader-continuity": "workspace:*",
+        "@crewhaus/grader-registry": "workspace:*",
+      },
     },
     "packages/event-log": {
       "name": "@crewhaus/event-log",
@@ -851,6 +855,19 @@
         "@crewhaus/eval-dataset": "workspace:*",
         "@crewhaus/eval-grader": "workspace:*",
         "@crewhaus/grader-registry": "workspace:*",
+      },
+    },
+    "packages/grader-continuity": {
+      "name": "@crewhaus/grader-continuity",
+      "version": "0.2.4",
+      "dependencies": {
+        "@crewhaus/continuity-store": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/eval-dataset": "workspace:*",
+        "@crewhaus/eval-grader": "workspace:*",
+        "@crewhaus/event-log": "workspace:*",
+        "@crewhaus/grader-registry": "workspace:*",
+        "@crewhaus/tool-plan": "workspace:*",
       },
     },
     "packages/grader-multimodal": {
@@ -2207,6 +2224,7 @@
       },
       "devDependencies": {
         "@crewhaus/embedder": "workspace:*",
+        "@crewhaus/memory-service": "workspace:*",
       },
     },
   },
@@ -2422,6 +2440,8 @@
     "@crewhaus/gateway-server": ["@crewhaus/gateway-server@workspace:packages/gateway-server"],
 
     "@crewhaus/grader-12-metric-rubric": ["@crewhaus/grader-12-metric-rubric@workspace:packages/grader-12-metric-rubric"],
+
+    "@crewhaus/grader-continuity": ["@crewhaus/grader-continuity@workspace:packages/grader-continuity"],
 
     "@crewhaus/grader-multimodal": ["@crewhaus/grader-multimodal@workspace:packages/grader-multimodal"],
 

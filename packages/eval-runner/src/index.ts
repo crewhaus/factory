@@ -40,12 +40,20 @@ import type {
   AgentInvoker,
   EvalRunSummary,
   GraderEntry,
+  GraderLookup,
   RunEvalOptions,
   SampleResult,
 } from "./types";
 import { type SharedAgentDeps, wireRunOnce } from "./wire-once";
 
-export type { AgentInvoker, EvalRunSummary, GraderEntry, RunEvalOptions, SampleResult };
+export type {
+  AgentInvoker,
+  EvalRunSummary,
+  GraderEntry,
+  GraderLookup,
+  RunEvalOptions,
+  SampleResult,
+};
 export type { SharedAgentDeps };
 export { wireRunOnce };
 // v0.3.0 Goal 2 (§3.3, PR 17) — the first-class competency exam: the
@@ -99,13 +107,23 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
   mkdirSync(outDir, { recursive: true });
 
   // Resolve graders. Replace any `llm_judge` placeholder with a real judge
-  // grader bound to the runner's judgeModel (or the per-grader override).
+  // grader bound to the runner's judgeModel (or the per-grader override),
+  // and any `registry` placeholder with the named grader from the caller's
+  // grader registry (PR 19 — loud at run start, not per-sample).
   const graders: GraderEntry[] = compiledGraders.map((g) => {
     if (g.judgeSpec) {
       const rubric = loadRubric(g.judgeSpec.rubric);
       const model = g.judgeSpec.model ?? opts.judgeModel;
       const grader = createJudgeGrader(rubric, model !== undefined ? { model } : {});
       return { name: g.name, grader };
+    }
+    if (g.registrySpec) {
+      if (opts.graderRegistry === undefined) {
+        throw new RunnerError(
+          `grader "${g.name}" resolves by registry name "${g.registrySpec.grader}" but no graderRegistry was supplied — pass RunEvalOptions.graderRegistry (and register the pack, e.g. registerContinuityGraders(registry))`,
+        );
+      }
+      return { name: g.name, grader: opts.graderRegistry.lookup(g.registrySpec.grader) };
     }
     return { name: g.name, grader: g.grader };
   });
@@ -175,6 +193,7 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
             graders,
             outDir,
             model: ir.agent.model,
+            specName: ir.name,
             ...(opts.seed !== undefined ? { seed: opts.seed } : {}),
           });
         const first = await runOnce();

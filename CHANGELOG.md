@@ -9,6 +9,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Memory quality is now measurable: continuity graders + the store-backend
+  conformance suite (0.3.0 §7.3/§5, PR 19).** New package
+  `@crewhaus/grader-continuity` ships five DETERMINISTIC (no-LLM) graders
+  computed from a sample's session artifacts — the eval-runner's isolated
+  per-sample session JSONLs + `.crewhaus/` state root (§7.2) — installable
+  with one call, `registerContinuityGraders(registry)`, exactly like the
+  12-metric rubric: `continuity.reAskRate` (question-shaped assistant
+  sentences whose content-token set is already ≥60%-covered by an earlier
+  user statement or a confirmed REQ ledger entry from an earlier session —
+  gate: 0, the motivating failure), `continuity.reqRetention` (fraction of
+  requirement-marker user sentences that survive to the final context:
+  unevicted, or carried by a focus-ledger REQ entry), `continuity.proofHonesty`
+  (past-tense done-claims vs plan steps with a VERIFIED `action_proof`
+  event; a `prove_step` without one is a proven-without-evidence anomaly →
+  score 0), `continuity.pickupSuccess` (two-session samples: does session
+  2's first assistant turn act on the handoff — references a next-action/
+  plan cue, no re-asking, no re-planning from scratch), and
+  `continuity.costPerProvenOutcome` (`cost_accrual` USD per verified proven
+  step, Infinity-safe when zero steps are proven). Cross-sample roll-ups
+  (`summarizeContinuityMetrics`, p50/p95/p99 + pass fractions + threshold
+  breaches, plus the cost ratio's own summarize) match the rubric's
+  summarize shape, and `renderContinuitySummaryLines` emits the report
+  lines. Eval configs opt in BY NAME via the new `type: registry` grader
+  entry (`grader: continuity.reAskRate`), resolved against
+  `RunEvalOptions.graderRegistry` with the same placeholder pattern
+  `llm_judge` uses; the runner now stamps `RunResult.artifacts`
+  (sampleDir/sessionId/transcriptPath/stateRootDir/specName) so artifact
+  graders find a finished sample's files without ever touching live stores.
+  A worked two-session fixture (`CONTINUITY_FIXTURE_SAMPLES` + a scripted
+  mock-adapter invoker that plays the conversations through the REAL
+  event-log/continuity-store/tool-plan code paths) pins the discrimination
+  matrix in tests: one clean run passes every gate, a re-asker fails
+  re-ask/retention/pickup, a claims-without-proof run fails honesty — end
+  to end through `runEval`. And the §5 promise — "local and Thredz are
+  contract-identical" is a test, not a convention — lands as
+  `runWikiBackendConformance` (exported from `@crewhaus/memory-service`, a
+  test-kit function, not a test file): upsert version-conflict semantics
+  incl. the literal `stale_article_version`, recall bundle shape, signals
+  metadata-only (+ verified reset on content writes), list staleness
+  ordering, visibility DEFAULTING TO PRIVATE, and `log_knowledge_gap`
+  behavior, run per-check against a fresh backend from a factory. The file
+  backend enrolls today (wiki-store's test suite, with a last-write-wins
+  negative control proving the suite discriminates); the Thredz backend
+  (PR 16) runs the same suite against a stub server.
 - **Learning — continual learning as a first-class capability (0.3.0
   Goal 2, §3.3, PR 17).** A new top-level `learning:` block on the five
   memory shapes (cli, channel, managed, research, crew): `domain`

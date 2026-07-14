@@ -28,6 +28,9 @@ export async function runSample(args: {
   outDir: string; // .crewhaus/evals/<runId>
   model: string;
   seed?: number;
+  /** The spec name (`ir.name`) — threaded into `RunResult.artifacts` so
+   *  artifact graders can address `.crewhaus/state/<specName>/` directly. */
+  specName?: string;
 }): Promise<SampleResult> {
   const { sample, invoker, graders, outDir, model } = args;
   const sampleDir = join(outDir, sanitize(sample.id));
@@ -99,7 +102,12 @@ export async function runSample(args: {
   const toolCalls = extractToolCalls(finalEvents);
   const tokens = sumTokens(finalEvents);
 
-  // Apply graders.
+  // Apply graders. `artifacts` is the PR-19 seam for artifact-reading
+  // graders (grader-continuity): the sample's own directory — the primary
+  // session's `transcript.jsonl`, any extra session JSONLs a multi-session
+  // invoker wrote, and the isolated `.crewhaus/` fabric root (§7.2) — so
+  // graders measure the finished sample's files, never the host's live
+  // stores.
   const runResult: RunResult = {
     agentOutput,
     events: finalEvents,
@@ -107,6 +115,13 @@ export async function runSample(args: {
     toolCalls,
     turns,
     latencyMs,
+    artifacts: {
+      sampleDir,
+      sessionId: runContext.sessionId,
+      transcriptPath,
+      stateRootDir: join(sampleDir, ".crewhaus"),
+      ...(args.specName !== undefined ? { specName: args.specName } : {}),
+    },
   };
 
   const perGrader: Array<{ name: string } & GradeResult> = [];

@@ -177,6 +177,20 @@ export {
   type ThredzGoalMirrorOptions,
 } from "./thredz.js";
 
+// PR 19 — the cross-backend WikiStore conformance suite (design §5): an
+// exported test-kit function so the file backend and the Thredz backend
+// (PR 16) run the SAME contract assertions. Kept in its own module; this is
+// its only touchpoint in this file so parallel-branch merges stay trivial.
+export {
+  type ConformanceCheck,
+  type ConformanceReport,
+  type WikiBackendFactory,
+  type WikiConformanceBackend,
+  type WikiVisibility,
+  WIKI_CONFORMANCE_CHECKS,
+  runWikiBackendConformance,
+} from "./backend-conformance";
+
 export class MemoryServiceError extends CrewhausError {
   override readonly name = "MemoryServiceError";
   constructor(message: string, cause?: unknown) {
