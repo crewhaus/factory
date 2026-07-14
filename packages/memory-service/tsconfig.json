@@ -21,7 +21,13 @@
       "path": "../errors"
     },
     {
+      "path": "../mcp-host"
+    },
+    {
       "path": "../memory-store"
+    },
+    {
+      "path": "../pii-redactor"
     },
     {
       "path": "../runtime-core"
@@ -37,6 +43,9 @@
     },
     {
       "path": "../tool-catalog"
+    },
+    {
+      "path": "../tool-mcp"
     },
     {
       "path": "../tool-memory"

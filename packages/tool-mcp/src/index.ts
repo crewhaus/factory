@@ -28,6 +28,10 @@ export type McpToolFlags = {
   readonly concurrencySafe?: boolean;
   readonly readOnly?: boolean;
   readonly destructive?: boolean;
+  /** Pillar 3 intent gate — set for remote tools whose local twins are
+   *  justification-gated (e.g. the Thredz backend's `wiki_write`), so the
+   *  backend flip never silently drops the gate. Default false. */
+  readonly requireJustification?: boolean;
 };
 
 export type RegisterMcpServerOptions = {
@@ -50,12 +54,25 @@ export function namespacedToolName(serverName: string, toolName: string): string
  * Build a single `RegisteredTool` from one remote MCP tool. Exposed so
  * tests (and any future custom-naming caller) can reuse the wiring without
  * going through `registerMcpServer`.
+ *
+ * `opts.registeredName` overrides the default `<server>__<tool>` catalog
+ * name — the bare-name alias path (`registerMcpToolAliases`) uses it so a
+ * backend flip (design §4.3) keeps one tool vocabulary. Everything else —
+ * `scope: "external"`, `ioCapability: "network"`, the boundary
+ * classification + lineage tagging around the remote call — is IDENTICAL
+ * for aliases; only the advertised name changes.
  */
 export function buildMcpRegisteredTool(
   host: McpHost,
   serverName: string,
   remote: McpToolDefinition,
-  flags: { concurrencySafe: boolean; readOnly: boolean; destructive: boolean },
+  flags: {
+    concurrencySafe: boolean;
+    readOnly: boolean;
+    destructive: boolean;
+    requireJustification?: boolean;
+  },
+  opts: { readonly registeredName?: string } = {},
 ): RegisteredTool {
   if (typeof remote.name !== "string" || remote.name.length === 0) {
     throw new McpError(`mcp server "${serverName}" returned a tool with an empty/missing name`);
@@ -65,7 +82,7 @@ export function buildMcpRegisteredTool(
       `mcp server "${serverName}" returned a tool with an invalid name "${remote.name}" (must match ${TOOL_NAME_PATTERN.source})`,
     );
   }
-  const fullName = namespacedToolName(serverName, remote.name);
+  const fullName = opts.registeredName ?? namespacedToolName(serverName, remote.name);
   const description = sanitizeDescription(remote.description) ?? `MCP tool ${fullName}`;
   return buildTool({
     name: fullName,
@@ -77,6 +94,7 @@ export function buildMcpRegisteredTool(
     concurrencySafe: flags.concurrencySafe,
     readOnly: flags.readOnly,
     destructive: flags.destructive,
+    requireJustification: flags.requireJustification ?? false,
     // Pillar 3 sink-side: every MCP call is an external sink. The MCP
     // protocol gives us no visibility into what the remote server actually
     // does with its arguments — egress-classifier defaults to "external"
@@ -157,22 +175,85 @@ export async function registerMcpServer(
   const client = host.getClient(serverName);
   await client.connect();
   const remoteTools = await client.listTools();
-  const defaults: { concurrencySafe: boolean; readOnly: boolean; destructive: boolean } = {
-    concurrencySafe: opts.defaults?.concurrencySafe ?? false,
-    readOnly: opts.defaults?.readOnly ?? false,
-    destructive: opts.defaults?.destructive ?? false,
-  };
   for (const remote of remoteTools) {
-    const override = opts.perTool?.[remote.name] ?? {};
-    const flags = {
-      concurrencySafe: override.concurrencySafe ?? defaults.concurrencySafe,
-      readOnly: override.readOnly ?? defaults.readOnly,
-      destructive: override.destructive ?? defaults.destructive,
-    };
-    const tool = buildMcpRegisteredTool(host, serverName, remote, flags);
+    const tool = buildMcpRegisteredTool(host, serverName, remote, resolveFlags(opts, remote.name));
     catalog.register(tool);
     opts.onRegister?.({ fullName: tool.name, remoteName: remote.name });
   }
+}
+
+/** Fold `defaults` + `perTool` overrides into one resolved flag set. */
+function resolveFlags(
+  opts: RegisterMcpServerOptions,
+  remoteName: string,
+): {
+  concurrencySafe: boolean;
+  readOnly: boolean;
+  destructive: boolean;
+  requireJustification: boolean;
+} {
+  const override = opts.perTool?.[remoteName] ?? {};
+  return {
+    concurrencySafe: override.concurrencySafe ?? opts.defaults?.concurrencySafe ?? false,
+    readOnly: override.readOnly ?? opts.defaults?.readOnly ?? false,
+    destructive: override.destructive ?? opts.defaults?.destructive ?? false,
+    requireJustification:
+      override.requireJustification ?? opts.defaults?.requireJustification ?? false,
+  };
+}
+
+/** The result of `registerMcpToolAliases`: which bare names landed on the
+ *  catalog, and which requested aliases the server did not advertise (the
+ *  caller decides whether that is a warning or an error). */
+export type McpAliasRegistration = {
+  readonly registered: readonly string[];
+  readonly missing: readonly string[];
+};
+
+/**
+ * v0.3.0 Goal 3 (design §4.3) — register a SELECTED set of a server's remote
+ * tools under their BARE names (no `<server>__` prefix), so a backend flip
+ * keeps the exact tool vocabulary the model already knows (`wiki_recall`,
+ * `goal_write`, …) while routing through the MCP client.
+ *
+ * Collision-guarded: a bare name already on the catalog is a composition bug
+ * (e.g. the local twin was registered first) and throws `McpError` naming
+ * both sides — never a silent shadow. Aliases ride the SAME
+ * `buildMcpRegisteredTool` wiring as namespaced tools: `scope: "external"`,
+ * `ioCapability: "network"`, boundary classification + `dataLineage` tagging
+ * on every response — the Pillar 3 fabric does not care what a sink is
+ * called. Requested aliases the server does not advertise are returned in
+ * `missing` rather than thrown, so a caller can degrade with a warning.
+ */
+export async function registerMcpToolAliases(
+  host: McpHost,
+  serverName: string,
+  catalog: ToolCatalog,
+  aliasNames: ReadonlyArray<string>,
+  opts: RegisterMcpServerOptions = {},
+): Promise<McpAliasRegistration> {
+  const client = host.getClient(serverName);
+  await client.connect();
+  const remoteTools = await client.listTools();
+  const wanted = new Set(aliasNames);
+  const registered: string[] = [];
+  for (const remote of remoteTools) {
+    if (!wanted.has(remote.name)) continue;
+    if (catalog.has(remote.name)) {
+      throw new McpError(
+        `mcp server "${serverName}" tool "${remote.name}" cannot be aliased onto its bare name — a tool named "${remote.name}" is already registered on the catalog (the local twin must not be registered when the ${serverName} backend owns the vocabulary)`,
+      );
+    }
+    const tool = buildMcpRegisteredTool(host, serverName, remote, resolveFlags(opts, remote.name), {
+      registeredName: remote.name,
+    });
+    catalog.register(tool);
+    registered.push(remote.name);
+    opts.onRegister?.({ fullName: tool.name, remoteName: remote.name });
+  }
+  const advertised = new Set(remoteTools.map((t) => t.name));
+  const missing = aliasNames.filter((name) => !advertised.has(name));
+  return { registered, missing };
 }
 
 /**

@@ -57,12 +57,17 @@
  * Everything is ABSENT-SAFE: a fragment with none of the blocks wires
  * nothing — no stores touched, no tools registered, `options` spreads empty.
  *
- * ## Backends
+ * ## Backends (v0.3.0 Goal 3, design §4.3/§4.4)
  *
- * `memory.backend` is a reserved discriminator: `"file"` (the default) is
- * implemented here; `"thredz"` fails fast with a clear not-yet-implemented
- * error until PR 16 lands the Thredz store implementations over the
- * already-connected McpHost client (design §4.3).
+ * `"file"` (the default) is the local fabric above. With `thredz` configured
+ * (the fragment's `thredz` slice / `memory.backend: "thredz"`) and a live
+ * connection in `deps.thredz` (from {@link connectThredz}, which registers
+ * the wiki+goals vocabulary as bare-name MCP aliases), the WIKI backend
+ * flips: no local wiki store/tools are constructed, recall routes through
+ * the MCP client, and continuity goal writes mirror to Thredz (spec scope
+ * only). Facts, focus, ledger, and dream state stay local always. Thredz
+ * configured but unreachable DEGRADES to the local backend with a boot
+ * warning — never a crash (§4.4).
  *
  * ## Scoping + tenancy (§2.7)
  *
@@ -111,6 +116,33 @@ import { createMemoryTools } from "@crewhaus/tool-memory";
 import { type ContinuityEvent, createPlanTools } from "@crewhaus/tool-plan";
 import { type KnowledgeGap, type WikiEvent, createWikiTools } from "@crewhaus/tool-wiki";
 import { type WikiStore, createWikiStore } from "@crewhaus/wiki-store";
+import {
+  type ThredzConnection,
+  classifyThredzFailure,
+  parseThredzRecallLines,
+  withThredzGoalMirror,
+} from "./thredz.js";
+
+// v0.3.0 Goal 3 — the Thredz wiring surface (design §4.3/§4.4): boot helper,
+// alias vocabulary, failure classifier, and the injected-client seam types.
+export {
+  THREDZ_SERVER_NAME,
+  THREDZ_GOAL_TOOL_NAMES,
+  THREDZ_ALIAS_TOOL_NAMES,
+  THREDZ_ALIAS_TOOL_FLAGS,
+  THREDZ_GOAL_MAP_FILE,
+  classifyThredzFailure,
+  connectThredz,
+  extractThredzGoalId,
+  parseThredzRecallLines,
+  withThredzGoalMirror,
+  type ConnectThredzOptions,
+  type ThredzCallResult,
+  type ThredzClient,
+  type ThredzConnection,
+  type ThredzFailureClass,
+  type ThredzGoalMirrorOptions,
+} from "./thredz.js";
 
 export class MemoryServiceError extends CrewhausError {
   override readonly name = "MemoryServiceError";
@@ -123,9 +155,10 @@ export class MemoryServiceError extends CrewhausError {
 // the fragment — what a future IrMemory/IrContinuity lowers into (design §9)
 // ---------------------------------------------------------------------------
 
-/** Storage backend discriminator. `"thredz"` is reserved: it lowers from the
- *  `thredz:` block (design §4) and flips every store to the Thredz MCP
- *  implementations in PR 16; until then it fails fast here. */
+/** Storage backend discriminator. `"thredz"` lowers from the `thredz:`
+ *  block (design §4) and flips the WIKI backend to the Thredz MCP server —
+ *  see the Backends section above for exactly what flips and what stays
+ *  local. */
 export type MemoryBackend = "file" | "thredz";
 
 /** The `memory:` slice — `IrMemory` (#53) plus the §9 extensions this root
@@ -201,6 +234,26 @@ export type ContinuityWiringFragment = {
 };
 
 /**
+ * v0.3.0 Goal 3 — the `thredz:` slice (§4.1/§9), serializable. The
+ * credential/base-url live ONLY in the synthesized MCP server config (the
+ * §4.2 secret machinery); this fragment carries the WIRING knobs — whether
+ * goal writes mirror, the enforced visibility, and the boot handle. The
+ * client itself arrives structurally via `deps.thredz` ({@link ThredzClient})
+ * so the fragment stays a JSON literal in emitted bundles.
+ */
+export type ThredzWiringFragment = {
+  /** Mirror continuity goal writes to Thredz `goal_write`/`goal_update`
+   *  (spec scope only, §14.5 decision 5). The compiler lowers this resolved;
+   *  hand-built fragments default to "on when continuity goals are on". */
+  readonly goals?: boolean;
+  /** The enforced default visibility (informational at this layer — the
+   *  synthesized server env `THREDZ_DEFAULT_VISIBILITY` does the enforcing). */
+  readonly visibility?: "private" | "shared";
+  /** The boot-registered agent handle (`connectThredz` consumes it). */
+  readonly agentName?: string;
+};
+
+/**
  * The serializable input `wireMemory` consumes — the shape the future
  * `IrMemory`/`IrContinuity` lower into. Emitters embed it as a JSON literal
  * (`wireMemory({...}, { catalog: defaultCatalog, cwd: process.cwd() })`);
@@ -211,6 +264,8 @@ export type MemoryWiringFragment = {
   readonly specName: string;
   readonly memory?: MemoryFactsFragment;
   readonly continuity?: ContinuityWiringFragment;
+  /** v0.3.0 Goal 3 — present when `thredz:` is on (design §4). */
+  readonly thredz?: ThredzWiringFragment;
 };
 
 /** Structural mirror of `IrMemory` (#53 + the v0.3.0 §9 extensions) — kept
@@ -251,6 +306,16 @@ export type IrContinuityLike = {
   readonly focusMaxChars?: number;
 };
 
+/** Structural mirror of the wiring-relevant `IrThredz` fields (§4.1). The
+ *  credential (`apiKey`) and `baseUrl` deliberately do NOT appear — they
+ *  belong to the synthesized MCP server config, never to a fragment an
+ *  emitter serializes into a bundle. */
+export type IrThredzLike = {
+  readonly goals?: boolean;
+  readonly visibility?: "private" | "shared";
+  readonly agentName?: string;
+};
+
 /**
  * Build the fragment from a lowered IR's `name` + `memory` + `continuity`
  * blocks EXACTLY as the pre-PR-10 `renderMemory` codegen read them — only
@@ -264,11 +329,13 @@ export function memoryFragmentFromIr(ir: {
   readonly name: string;
   readonly memory?: IrMemoryLike;
   readonly continuity?: IrContinuityLike;
+  readonly thredz?: IrThredzLike;
 }): MemoryWiringFragment {
   const mem = ir.memory;
   const wiki = mem?.wiki;
   const dream = mem?.dream;
   const cont = ir.continuity;
+  const thredz = ir.thredz;
   return {
     specName: ir.name,
     ...(mem !== undefined
@@ -323,6 +390,15 @@ export function memoryFragmentFromIr(ir: {
           },
         }
       : {}),
+    ...(thredz !== undefined
+      ? {
+          thredz: {
+            ...(thredz.goals !== undefined ? { goals: thredz.goals } : {}),
+            ...(thredz.visibility !== undefined ? { visibility: thredz.visibility } : {}),
+            ...(thredz.agentName !== undefined ? { agentName: thredz.agentName } : {}),
+          },
+        }
+      : {}),
   };
 }
 
@@ -370,6 +446,11 @@ export type WireMemoryDeps = {
   /** Home directory override for skill/command discovery (tests). */
   readonly homeDir?: string;
   readonly now?: () => Date;
+  /** v0.3.0 Goal 3 — the live Thredz connection from {@link connectThredz}.
+   *  `null` means "configured but boot failed" — wireMemory then DEGRADES to
+   *  the local backend with a warning (§4.4), it never throws. Absent when
+   *  the fragment carries no thredz slice. */
+  readonly thredz?: ThredzConnection | null;
 };
 
 /** The `RunChatLoopOptions.memory` seam shape (structural — assignability
@@ -422,8 +503,16 @@ export type WiredContinuity = {
 };
 
 export type WiredWiki = {
-  readonly store: WikiStore;
+  /** Which backend answered (design §4.3): `"file"` constructs the local
+   *  store; `"thredz"` routes through the MCP client (the tool surface then
+   *  comes from the bare-name aliases registered at MCP boot, so `tools` is
+   *  empty and `store` null — articles live server-side). */
+  readonly backend: "file" | "thredz";
+  readonly store: WikiStore | null;
   readonly tools: readonly RegisteredTool[];
+  /** Recall lines for the §3.4 auto-recall fusion — the same
+   *  `[wiki:<slug>] <title> — <excerpt>` bundle shape on both backends. */
+  readonly recall: (query: string, k: number) => Promise<readonly string[]>;
 };
 
 export type WiredMemory = {
@@ -471,15 +560,17 @@ function dreamEnabled(fragment: MemoryWiringFragment): boolean {
   return memoryEnabled(fragment) && fragment.memory?.dream !== undefined;
 }
 
-function assertBackendImplemented(fragment: MemoryWiringFragment): void {
-  const backend = fragment.memory?.backend;
-  if (backend === undefined || backend === "file") return;
-  // Reserved discriminator (design §4): loud and actionable, never a silent
-  // local fallback that would strand writes on the wrong backend.
-  throw new MemoryServiceError(
-    `memory-service: backend "${backend}" is reserved but not implemented yet — the Thredz store flip ships with the thredz: block (design §4, PR 16). Use backend "file" (or omit it) until then.`,
-  );
+/** v0.3.0 Goal 3 — is Thredz configured on this fragment? Either the
+ *  `thredz:` slice is present or a declared memory block carries
+ *  `backend: "thredz"` (the compiler stamps both together). */
+function thredzConfigured(fragment: Pick<MemoryWiringFragment, "memory" | "thredz">): boolean {
+  return fragment.thredz !== undefined || fragment.memory?.backend === "thredz";
 }
+
+/** The §4.4 degrade line, printed once per boot when Thredz is configured
+ *  but no live connection arrived (offline, npx failure, no MCP host). */
+const THREDZ_DEGRADE_NOTE =
+  "[thredz] unavailable — memory degraded to the local backend for this run (local stores under .crewhaus/ stay authoritative; nothing was lost)\n";
 
 function resolveEmbedder(
   fragment: MemoryWiringFragment,
@@ -630,7 +721,7 @@ async function renderPlanTail(
  * `wireMemory`'s job — granular callers keep their own prompt surface.
  */
 export function wireContinuity(
-  fragment: Pick<MemoryWiringFragment, "specName" | "continuity">,
+  fragment: Pick<MemoryWiringFragment, "specName" | "continuity" | "thredz">,
   deps: WireMemoryDeps,
 ): WiredContinuity | null {
   if (!continuityEnabled(fragment)) return null;
@@ -649,7 +740,7 @@ export function wireContinuity(
 
   // Under a tenant the store computes `<tenantRoot>/state` itself (and
   // fences it); outside one we anchor to the caller's cwd.
-  const store = createContinuityStore({
+  const localStore = createContinuityStore({
     specName: fragment.specName,
     ...(deps.tenant !== undefined
       ? { tenant: deps.tenant }
@@ -662,6 +753,28 @@ export function wireContinuity(
     ...(cont.focusMaxChars !== undefined ? { focusMaxChars: cont.focusMaxChars } : {}),
     ...(deps.now !== undefined ? { now: deps.now } : {}),
   });
+
+  // v0.3.0 Goal 3 (§4.4) — the Thredz goal mirror. SPEC scope only (§14.5
+  // resolved decision 5: goals are key-scoped server-side with tight plan
+  // quotas — a per-conversation goal would burn the account immediately, so
+  // session-scoped stores never mirror). The local write is authoritative
+  // and always lands first; a Thredz-side failure skips with one classified
+  // warning and never fails the write.
+  const mirrorOn =
+    fragment.thredz !== undefined &&
+    (fragment.thredz.goals ?? true) &&
+    cont.plan !== false &&
+    scope.kind === "spec" &&
+    deps.thredz !== null &&
+    deps.thredz !== undefined;
+  const store =
+    mirrorOn && deps.thredz != null
+      ? withThredzGoalMirror(localStore, {
+          client: deps.thredz.client,
+          specName: fragment.specName,
+          ...(deps.log !== undefined ? { log: deps.log } : {}),
+        })
+      : localStore;
 
   const bundle = createPlanTools({
     specName: fragment.specName,
@@ -714,21 +827,67 @@ export type WireWikiExtras = {
 };
 
 /**
- * Wire the wiki slice alone: construct the (tenant-fenced) wiki store and
- * register the ten thredz-vocabulary `wiki_*` tools. Returns null when the
- * fragment carries no enabled `memory.wiki` block (the wiki nests under
- * `memory:` — design §9 — so a disabled memory block disables it too).
+ * Wire the wiki slice alone. Three outcomes (design §4.3/§4.4):
+ *
+ *   - **Thredz backend** (fragment carries thredz/`backend: "thredz"` AND a
+ *     live `deps.thredz` connection): the wiki surface is the bare-name
+ *     aliases `connectThredz` already put on the catalog, so NO local store
+ *     is constructed and NO local tools are registered (`store: null`,
+ *     `tools: []`) — the local wiki on disk stays untouched (§5: removing
+ *     `thredz:` reverts to files). The `recall` seam routes `wiki_recall`
+ *     through the MCP client and renders the SAME recall-bundle line shape.
+ *   - **Local backend**: as before — the (tenant-fenced) `WikiStore` plus
+ *     the ten thredz-vocabulary `wiki_*` tools. This is ALSO the §4.4
+ *     degrade target: Thredz configured but unreachable wires the local
+ *     surface even without a `memory.wiki` block, so the tool vocabulary the
+ *     spec promised never vanishes mid-run.
+ *   - **null**: no wiki anywhere (no enabled `memory.wiki`, no thredz).
  */
 export function wireWiki(
-  fragment: Pick<MemoryWiringFragment, "specName" | "memory">,
+  fragment: Pick<MemoryWiringFragment, "specName" | "memory" | "thredz">,
   deps: WireMemoryDeps,
   extras: WireWikiExtras = {},
 ): WiredWiki | null {
   const full: MemoryWiringFragment = {
     specName: fragment.specName,
     ...(fragment.memory !== undefined ? { memory: fragment.memory } : {}),
+    ...(fragment.thredz !== undefined ? { thredz: fragment.thredz } : {}),
   };
-  if (!wikiEnabled(full)) return null;
+  const wantsThredz = thredzConfigured(full);
+  const wikiOff = full.memory?.wiki?.enabled === false;
+
+  // The Thredz backend flip (§4.3) — one connection, one vocabulary.
+  if (wantsThredz && deps.thredz != null) {
+    if (wikiOff) return null;
+    const client = deps.thredz.client;
+    const log = deps.log;
+    return {
+      backend: "thredz",
+      store: null,
+      tools: [],
+      recall: async (query, k) => {
+        let res: { content: string; isError: boolean };
+        try {
+          res = await client.callTool("wiki_recall", { query, limit: k });
+        } catch (err) {
+          log?.(
+            `[thredz] wiki recall unavailable (thredz_unavailable): ${(err as Error).message}\n`,
+          );
+          return [];
+        }
+        if (res.isError) {
+          log?.(`[thredz] wiki recall failed (${classifyThredzFailure(res.content)})\n`);
+          return [];
+        }
+        return parseThredzRecallLines(res.content, k);
+      },
+    };
+  }
+
+  // Local backend — including the §4.4 degrade (thredz configured, no
+  // connection): the promised wiki surface stays available on local files.
+  const localOn = wantsThredz ? !wikiOff : wikiEnabled(full);
+  if (!localOn) return null;
   const wiki = full.memory?.wiki ?? {};
   const embedder = resolveEmbedder(full, deps);
 
@@ -751,7 +910,15 @@ export function wireWiki(
     ...(deps.now !== undefined ? { now: deps.now } : {}),
   });
 
-  return { store, tools: bundle.all };
+  return {
+    backend: "file",
+    store,
+    tools: bundle.all,
+    recall: async (query, k) => {
+      const hits = await store.recall(query, k);
+      return hits.map((h) => `[wiki:${h.ref.slug}] ${h.ref.title} — ${excerpt(h.body)}`);
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -821,7 +988,14 @@ export async function wireMemory(
   if (typeof fragment.specName !== "string" || fragment.specName === "") {
     throw new MemoryServiceError("memory-service: fragment.specName is required");
   }
-  assertBackendImplemented(fragment);
+
+  // v0.3.0 Goal 3 (§4.4) — Thredz configured but no live connection (boot
+  // failure, offline, or a consumer without an MCP host): degrade to the
+  // local backend with ONE warning line. Never a crash — a lapsed Thredz
+  // subscription must not kill a local-first harness.
+  if (thredzConfigured(fragment) && deps.thredz == null) {
+    deps.log?.(THREDZ_DEGRADE_NOTE);
+  }
 
   const factsOn = memoryEnabled(fragment);
   const tools: RegisteredTool[] = [];
@@ -865,20 +1039,26 @@ export async function wireMemory(
       : {}),
   });
   if (wiki !== null) {
-    stores.wiki = wiki.store;
+    if (wiki.store !== null) stores.wiki = wiki.store;
     tools.push(...wiki.tools);
-    deps.log?.(`[memory] wiki on — ${wiki.store.path()}\n`);
+    deps.log?.(
+      wiki.backend === "thredz"
+        ? "[memory] wiki on — thredz backend (server-side articles via the thredz MCP aliases; the local wiki store stays untouched)\n"
+        : `[memory] wiki on — ${wiki.store?.path()}\n`,
+    );
 
     // §3.4/§9 — wiki auto-recall: fuse top-`recallK` wiki hits into the
     // session-start `<recalled_memory>` bundle. Explicit opt-in
     // (`wiki.autoRecall: true`), mirroring the fact store's autoRecall
-    // semantics. The runtime classifies + delimiter-escapes the assembled
-    // block (the same path fact lines take), so recalled wiki bodies still
-    // flow through the boundary classifier before any model call.
+    // semantics. Backend-invariant: `wiki.recall` renders the same line
+    // shape from the local store or through the Thredz MCP client (§4.3).
+    // The runtime classifies + delimiter-escapes the assembled block (the
+    // same path fact lines take), so recalled wiki bodies still flow
+    // through the boundary classifier before any model call.
     const wikiFrag = fragment.memory?.wiki;
     if (wikiFrag?.autoRecall === true) {
       const wikiK = wikiFrag.recallK ?? DEFAULT_WIKI_RECALL_K;
-      const wikiStore = wiki.store;
+      const wikiRecall = wiki.recall;
       const base = options.memory;
       const baseRecall = base?.recall;
       options = {
@@ -888,11 +1068,7 @@ export async function wireMemory(
           autoRecall: true,
           recall: async (query, k) => {
             const factLines = baseRecall !== undefined ? await baseRecall(query, k) : [];
-            const hits = await wikiStore.recall(query, wikiK);
-            return [
-              ...factLines,
-              ...hits.map((h) => `[wiki:${h.ref.slug}] ${h.ref.title} — ${excerpt(h.body)}`),
-            ];
+            return [...factLines, ...(await wikiRecall(query, wikiK))];
           },
         },
       };
@@ -985,14 +1161,19 @@ function buildDreamEngine(
     ...(embedder !== undefined ? { embedder } : {}),
     ...(deps.now !== undefined ? { now: deps.now } : {}),
   });
-  const wikiStore = wikiEnabled(fragment)
-    ? createWikiStore({
-        specName: fragment.specName,
-        rootDir: join(crewhausDir, "wiki"),
-        ...(embedder !== undefined ? { embedder } : {}),
-        ...(deps.now !== undefined ? { now: deps.now } : {}),
-      })
-    : undefined;
+  // §4.3 — with Thredz configured the local wiki store is not the wiki
+  // backend, so the dream never consolidates it (facts + continuity stay
+  // local always and keep consolidating; server-side wiki consolidation is
+  // a future-features item).
+  const wikiStore =
+    wikiEnabled(fragment) && !thredzConfigured(fragment)
+      ? createWikiStore({
+          specName: fragment.specName,
+          rootDir: join(crewhausDir, "wiki"),
+          ...(embedder !== undefined ? { embedder } : {}),
+          ...(deps.now !== undefined ? { now: deps.now } : {}),
+        })
+      : undefined;
   // The dream consolidates the SPEC-scoped agenda always (§14.5: the
   // spec-scoped store holds the daemon's own agenda, which heartbeat/dream
   // read) — even when the harness's interactive continuity is
@@ -1031,7 +1212,6 @@ function buildDreamEngine(
  */
 export function wireDream(fragment: MemoryWiringFragment, deps: WireDreamDeps): WiredDream | null {
   if (!dreamEnabled(fragment)) return null;
-  assertBackendImplemented(fragment);
   const engine = buildDreamEngine(fragment, crewhausDirOf(deps), deps, {
     ...(deps.modelPhase !== undefined ? { modelPhase: deps.modelPhase } : {}),
   });
@@ -1083,7 +1263,6 @@ export function createDreamJanitorStep(
   deps: CreateDreamJanitorStepDeps,
 ): DreamJanitorStep | null {
   if (!dreamEnabled(fragment)) return null;
-  assertBackendImplemented(fragment);
   const env = deps.env !== undefined ? { env: deps.env } : {};
 
   if (deps.tenantsRootDir === undefined) {

@@ -24,6 +24,30 @@ describe("runLint — pipeline", () => {
     expect(result.spec?.target).toBe("cli");
   });
 
+  test("thredz: next to a user-declared mcp_servers.thredz warns (explicit beats implicit) without failing lint", () => {
+    const spec = `${validCli}thredz: true
+mcp_servers:
+  thredz:
+    transport: stdio
+    command: bun
+    args: ["./thredz-mcp/server.ts"]
+    env:
+      THREDZ_API_KEY: $THREDZ_API_KEY
+`;
+    const result = runLint(spec, noTools);
+    // Warnings inform; only errors gate.
+    expect(result.ok).toBe(true);
+    const warning = result.findings.find((f) => f.rule === "thredz-override");
+    expect(warning?.severity).toBe("warning");
+    expect(warning?.path).toBe("mcp_servers.thredz");
+    expect(warning?.message).toContain("your explicit entry wins");
+  });
+
+  test("thredz: alone (synthesis path) produces no override warning", () => {
+    const result = runLint(`${validCli}thredz: true\n`, noTools);
+    expect(result.findings.filter((f) => f.rule === "thredz-override")).toEqual([]);
+  });
+
   test("parse failure is a single terminal finding (rule: parse)", () => {
     const result = runLint("name: t\ntarget: cli\n", noTools); // no agent block
     expect(result.ok).toBe(false);

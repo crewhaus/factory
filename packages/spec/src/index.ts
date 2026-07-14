@@ -704,6 +704,59 @@ const continuityObject = z
 const continuityBlock = z.union([z.boolean(), continuityObject]).optional();
 
 /**
+ * v0.3.0 Goal 3 (§4.1) — the top-level `thredz:` block: ONE knob that flips
+ * the memory fabric's wiki backend to a hosted Thredz wiki over the published
+ * `thredz-mcp` stdio server (npm, v0.2.0 — 25 tools incl. `goal_*`/`task_*`).
+ *
+ * Forms:
+ *   - boolean shorthand: `thredz: true` ≡ `{ api_key: "$THREDZ_API_KEY" }`
+ *     (`false` ≡ absent — the explicit opt-out).
+ *   - string shorthand: `thredz: $THREDZ_API_KEY` — THE one argument.
+ *   - the strict object:
+ *       · `api_key` (required): credential-lowered to an `IrSecretRef`
+ *         (`lowerCredential` — fail-fast on a malformed `$…` env ref).
+ *       · `base_url`: self-hosted / local Thredz API base
+ *         (`THREDZ_API_BASE` in the synthesized server env).
+ *       · `visibility`: `private` (DEFAULT — overrides Thredz's
+ *         shared-by-default foot-gun) | `shared`; becomes the synthesized
+ *         server's `THREDZ_DEFAULT_VISIBILITY`.
+ *       · `goals`: mirror continuity goal writes to Thredz `goal_write`/
+ *         `goal_update` (spec-scoped ONLY, §14.5 decision 5). Default: on
+ *         when continuity goals are on.
+ *       · `agents`: register an addressable agent handle at boot
+ *         (idempotent `agent_register`). `true` derives the handle from the
+ *         spec name; a string names it explicitly. Default off.
+ *
+ * Carried on the five memory shapes (cli, channel, managed, research, crew);
+ * the strict unions reject it loudly elsewhere. Emit-wiring in this release
+ * is the cli shape (compiled bundle + `crewhaus run`); the other four carry
+ * the block with the 0.2.3-convention ignored-note comment.
+ */
+const THREDZ_HANDLE_RE = /^[a-z][a-z0-9-]{2,31}$/;
+
+const thredzObject = z
+  .object({
+    api_key: z.string().min(1),
+    base_url: z.string().url().optional(),
+    visibility: z.enum(["private", "shared"]).optional(),
+    goals: z.boolean().optional(),
+    agents: z
+      .union([
+        z.boolean(),
+        z
+          .string()
+          .regex(
+            THREDZ_HANDLE_RE,
+            "thredz.agents must be a lowercase handle matching ^[a-z][a-z0-9-]{2,31}$ (or true to derive one from the spec name)",
+          ),
+      ])
+      .optional(),
+  })
+  .strict();
+
+const thredzBlock = z.union([z.boolean(), z.string().min(1), thredzObject]).optional();
+
+/**
  * Ops item 37 — cross-cutting `observability` block. Today it carries one
  * sub-block, `slo`, that declares production Service-Level Objectives + the
  * mitigation ladder the runtime SLO monitor walks on a SUSTAINED breach.
@@ -950,6 +1003,7 @@ const cliSchema = z
     feedback: feedbackBlock,
     memory: memoryBlock,
     continuity: continuityBlock,
+    thredz: thredzBlock,
     observability: observabilityBlock,
     cli: cliOptionsBlock,
     chains: chainsBlock,
@@ -1103,6 +1157,7 @@ const channelSchema = z
     feedback: feedbackBlock,
     memory: memoryBlock,
     continuity: continuityBlock,
+    thredz: thredzBlock,
     observability: observabilityBlock,
     heartbeat: heartbeatBlock,
     gateway: channelGatewayBlock,
@@ -1206,6 +1261,7 @@ const managedSchema = z
     budget: budgetBlock,
     memory: memoryBlock,
     continuity: continuityBlock,
+    thredz: thredzBlock,
     observability: observabilityBlock,
   })
   .strict();
@@ -1337,6 +1393,7 @@ const crewSchema = z
     // surface, §2.7).
     memory: memoryBlock,
     continuity: continuityBlock,
+    thredz: thredzBlock,
     chains: chainsBlock,
     wallets: walletsBlock,
     contracts: contractsBlock,
@@ -1378,6 +1435,7 @@ const researchSchema = z
     failure_taxonomy: failureTaxonomyBlock,
     memory: memoryBlock,
     continuity: continuityBlock,
+    thredz: thredzBlock,
     chains: chainsBlock,
     wallets: walletsBlock,
     contracts: contractsBlock,
@@ -1721,6 +1779,10 @@ export type SpecMemoryDreamBlock = z.infer<typeof memoryDreamBlock>;
 export type SpecContinuityObject = z.infer<typeof continuityObject>;
 /** The full `continuity:` surface: boolean shorthand or the object form. */
 export type SpecContinuityBlock = z.infer<typeof continuityBlock>;
+/** The `thredz:` object form (v0.3.0 §4.1). */
+export type SpecThredzObject = z.infer<typeof thredzObject>;
+/** The full `thredz:` surface: boolean/string shorthand or the object form. */
+export type SpecThredzBlock = z.infer<typeof thredzBlock>;
 export type SpecFailureTaxonomyEntry = z.infer<typeof failureTaxonomyEntrySchema>;
 export type SpecFailureTaxonomy = z.infer<typeof failureTaxonomyBlock>;
 

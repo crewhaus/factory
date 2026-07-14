@@ -51,13 +51,17 @@ function collectingCatalog(): { registered: RegisteredTool[]; register(t: Regist
 
 function deps(overrides: Partial<WireMemoryDeps> = {}) {
   const catalog = collectingCatalog();
+  const logs: string[] = [];
   const base: WireMemoryDeps = {
     catalog,
     cwd: tmp,
     homeDir: join(tmp, "home"), // isolate from the real ~/.crewhaus
+    log: (line) => {
+      logs.push(line);
+    },
     ...overrides,
   };
-  return { deps: base, catalog };
+  return { deps: base, catalog, logs };
 }
 
 function names(tools: readonly RegisteredTool[]): string[] {
@@ -398,12 +402,12 @@ describe("wireMemory — scope, tenancy, backend (§2.7, §4)", () => {
     expect(existsSync(join(tenantRoot, "memories", "tenant-spec.jsonl"))).toBe(true);
   });
 
-  test('backend "thredz" is reserved: loud not-implemented error, nothing wired', async () => {
-    const { deps: d, catalog } = deps();
-    await expect(
-      wireMemory({ specName: "thredz-spec", memory: { backend: "thredz" } }, d),
-    ).rejects.toThrow(/backend "thredz" is reserved but not implemented yet/);
-    expect(catalog.registered).toEqual([]);
+  test('backend "thredz" without a live connection degrades to the local backend with a warning (§4.4)', async () => {
+    const { deps: d, logs } = deps();
+    const wired = await wireMemory({ specName: "thredz-spec", memory: { backend: "thredz" } }, d);
+    // Never a crash: facts wired locally, one degrade line printed.
+    expect(wired.stores.memory).toBeDefined();
+    expect(logs.join("")).toContain("[thredz] unavailable — memory degraded to the local backend");
   });
 
   test('backend "file" is the implemented default', async () => {
