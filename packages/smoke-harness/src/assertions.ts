@@ -54,6 +54,12 @@ export const SHAPE_ASSERTIONS: readonly ShapeAssertion[] = [
       { in: "agent.ts", contains: "@crewhaus/hooks-engine" },
       { in: "agent.ts", contains: "@crewhaus/skills-registry" },
       { in: "agent.ts", contains: "@crewhaus/slash-commands" },
+      // 0.3.0 Goal 6 — the terminal-failure catch wrapper (the exact
+      // "agent exited" fix): every cli bundle renders formatRunFailure and
+      // exits with the report's coded status instead of an unhandled stack.
+      { in: "agent.ts", contains: "formatRunFailure" },
+      { in: "agent.ts", contains: "toFailureReport" },
+      { in: "agent.ts", contains: "process.exit(__report.exitCode)" },
     ],
   },
   // Cross-provider compile-path fixtures (no keys needed): the SAME cli
@@ -142,6 +148,10 @@ export const SHAPE_ASSERTIONS: readonly ShapeAssertion[] = [
       { in: "daemon.ts", contains: "SMOKE_SLACK_SIGNING_SECRET", fixtureOnly: true },
       // Ops item 36 — boot-time self-heal janitor wired into the daemon.
       { in: "daemon.ts", contains: "createJanitor" },
+      // 0.3.0 Goal 6 — the daemon main renders the structured failure
+      // report and exits with the report's coded status.
+      { in: "daemon.ts", contains: "formatRunFailure" },
+      { in: "daemon.ts", contains: "process.exit(__report.exitCode)" },
     ],
   },
   {
@@ -172,6 +182,9 @@ export const SHAPE_ASSERTIONS: readonly ShapeAssertion[] = [
       { in: "agent_researcher.ts", contains: "RoleDefinition", fixtureOnly: true },
       { in: "agent_writer.ts", contains: "RoleDefinition", fixtureOnly: true },
       { in: "any", contains: "RoleDefinition" },
+      // 0.3.0 Goal 6 — structured terminal-failure reporting + coded exits.
+      { in: "daemon.ts", contains: "formatRunFailure" },
+      { in: "daemon.ts", contains: "process.exit(__report.exitCode)" },
     ],
   },
   {
@@ -202,6 +215,10 @@ export const SHAPE_ASSERTIONS: readonly ShapeAssertion[] = [
       // Ops item 36 — boot-time self-heal janitor + pluggable budget store.
       { in: "daemon.ts", contains: "createJanitor" },
       { in: "daemon.ts", contains: "createBudgetStore" },
+      // 0.3.0 Goal 6 — classified failures render their report on stderr
+      // (the daemon rethrows to the gateway and keeps serving).
+      { in: "daemon.ts", contains: "formatRunFailure" },
+      { in: "daemon.ts", contains: "isRunFailedError" },
     ],
   },
   {
@@ -245,6 +262,9 @@ export const SHAPE_ASSERTIONS: readonly ShapeAssertion[] = [
       { in: "agent.ts", contains: "@crewhaus/citation-tracker" },
       { in: "agent.ts", contains: "@crewhaus/report-writer" },
       { in: "agent.ts", contains: '"branch_start"' },
+      // 0.3.0 Goal 6 — structured terminal-failure reporting + coded exits.
+      { in: "agent.ts", contains: "formatRunFailure" },
+      { in: "agent.ts", contains: "process.exit(__report.exitCode)" },
     ],
   },
   {

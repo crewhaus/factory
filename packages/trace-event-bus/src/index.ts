@@ -35,6 +35,7 @@ export type {
   ResponseRatedEvent,
   RoleEndEvent,
   RoleStartEvent,
+  RunFailedEvent,
   SanitizerReportEvent,
   Span,
   SubAgentEndEvent,

@@ -31,7 +31,13 @@ import {
   classifyEgress,
   summarizeEgress,
 } from "@crewhaus/egress-classifier";
-import { ConfigError, RunFailedError, RuntimeError } from "@crewhaus/errors";
+import {
+  ConfigError,
+  EXIT_CODES,
+  type FailureReport,
+  RunFailedError,
+  RuntimeError,
+} from "@crewhaus/errors";
 import { type EventKind, type EventLog, openEventLog } from "@crewhaus/event-log";
 import { type HookDef, type HookEvent, aggregateDecisions, runHooks } from "@crewhaus/hooks-engine";
 import {
@@ -3091,15 +3097,38 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           bus.publish({
             ...bus.envelope(),
             kind: "error_recovered",
-            // v0.3.0 Goal 6 — `halt` is a classified terminal stop; on the
-            // wire it maps to the existing `fail` action so structured
-            // consumers (alert-watchdog's unrecoveredErrors counter, the UI
-            // feed) keep counting terminal failures unchanged. The
-            // first-class `run_failed` event ships in the follow-up PR.
-            action: action.kind === "halt" ? "fail" : action.kind,
+            // v0.3.0 Goal 6 — `halt` is published first-class now that the
+            // action union carries it (PR 1 mapped it to "fail" as a
+            // stopgap). alert-watchdog and the SLO monitor count BOTH
+            // `fail` and `halt` as unrecovered, so terminal-failure
+            // accounting is unchanged.
+            action: action.kind,
             errorName: state.error.name,
             depth: recovery.retryCount + recovery.compactCount + recovery.continueCount,
           });
+          // v0.3.0 Goal 6 — one structured report on every terminal path,
+          // published to the bus AND appended to the session event log
+          // BEFORE the throw (a throw is invisible to structured
+          // consumers; the event is what the UI host, printers, exporters,
+          // and incident capture render). Non-terminal actions publish
+          // nothing here.
+          const publishRunFailed = async (report: FailureReport): Promise<void> => {
+            const failureMessage = `${report.title}: ${report.detail}`;
+            bus.publish({
+              ...bus.envelope(),
+              kind: "run_failed",
+              class: report.class,
+              message: failureMessage,
+              ...(report.remediation !== undefined ? { remediation: report.remediation } : {}),
+              exitCode: report.exitCode,
+            });
+            await logEvent("run_failed", {
+              class: report.class,
+              message: failureMessage,
+              ...(report.remediation !== undefined ? { remediation: report.remediation } : {}),
+              exitCode: report.exitCode,
+            });
+          };
           switch (action.kind) {
             case "compact": {
               const before = messages.length;
@@ -3213,17 +3242,30 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               state = transition(state, { kind: "RecoveryDone" });
               break;
             }
-            case "fail":
+            case "fail": {
+              // Generic terminal fail — synthesize a best-effort report
+              // (class "unknown", exit 1) so even the unclassified path
+              // leaves a structured `run_failed` behind, then throw the
+              // byte-identical pre-0.3.0 RuntimeError (die()'s one-liner
+              // for non-RunFailedError CrewhausErrors is unchanged).
+              await publishRunFailed({
+                class: "unknown",
+                title: "recovery failed",
+                detail: action.reason,
+                exitCode: EXIT_CODES.generic,
+              });
               throw new RuntimeError(`recovery failed: ${action.reason}`);
+            }
             case "halt":
               // v0.3.0 Goal 6 — classified terminal stop (billing / auth /
               // rate-limit exhaustion / hinted taxonomy entries). The report
               // carries title, raw provider text, remediation, and the coded
               // exit status; RunFailedError extends RuntimeError so existing
               // CrewhausError catch sites (e.g. `crewhaus run`'s die())
-              // still produce a clean one-liner. The `run_failed` trace
-              // event, coded process exits, and report rendering land in the
-              // follow-up PR.
+              // still work. Every terminal surface renders the SAME report:
+              // die() and the bundle catch-wrappers print formatRunFailure()
+              // and exit with report.exitCode.
+              await publishRunFailed(action.report);
               throw new RunFailedError(action.report, lastErrorForRecovery);
           }
           break;

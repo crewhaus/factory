@@ -221,7 +221,10 @@ mcp_servers:
     expect(content).not.toContain("@crewhaus/tool-mcp");
     expect(content).not.toContain("McpHost");
     expect(content).not.toContain("disconnectAll");
-    expect(content).not.toContain("try {");
+    // NOTE: `try {` is no longer MCP-specific — every cli bundle wraps its
+    // runChatLoop in the 0.3.0 Goal 6 terminal-failure catch. Only the MCP
+    // cleanup adds a `finally`.
+    expect(content).not.toContain("} finally {");
   });
 });
 

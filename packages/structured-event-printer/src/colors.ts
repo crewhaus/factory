@@ -21,6 +21,8 @@ const PALETTE: Record<TraceEventKind, string> = {
   compaction_fired: "\x1b[32m", // green
   permission_decision: "\x1b[33m",
   error_recovered: "\x1b[31m", // red
+  // v0.3.0 Goal 6 — the structured terminal-failure report block.
+  run_failed: "\x1b[91m", // bright red — the run died; this is THE headline
   sub_agent_start: "\x1b[36m",
   sub_agent_end: "\x1b[36m",
   // Section 22 — CRW lifecycle events. Reuse the cyan/blue family so a

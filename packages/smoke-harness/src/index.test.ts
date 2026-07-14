@@ -90,10 +90,16 @@ describe("assertionForTarget + assertBundleAgainstShape (item 33 — compile --c
         {
           path: "daemon.ts",
           content:
+            'import { formatRunFailure, toFailureReport } from "@crewhaus/errors";\n' +
             'import { createDiscordAdapter } from "@crewhaus/channel-adapter-discord";\n' +
             'import { sendMessage } from "@crewhaus/tool-message-channel";\n' +
             'import { createJanitor } from "@crewhaus/runtime-core";\n' +
-            'const token = process.env["MY_DISCORD_TOKEN"];\n',
+            'const token = process.env["MY_DISCORD_TOKEN"];\n' +
+            "main().catch((err) => {\n" +
+            "  const __report = toFailureReport(err);\n" +
+            "  process.stderr.write(`${formatRunFailure(__report)}\\n`);\n" +
+            "  process.exit(__report.exitCode);\n" +
+            "});\n",
         },
         { path: "gateway.ts", content: "// gateway" },
         { path: "session-router.ts", content: "// router" },

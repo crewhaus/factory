@@ -65,6 +65,7 @@
         "@crewhaus/prompt-injection-detector": "workspace:*",
         "@crewhaus/prompt-optimizer": "workspace:*",
         "@crewhaus/prompt-optimizer-claude": "workspace:*",
+        "@crewhaus/recovery-engine": "workspace:*",
         "@crewhaus/regression-runner": "workspace:*",
         "@crewhaus/routing-store": "workspace:*",
         "@crewhaus/run-context": "workspace:*",
@@ -1409,6 +1410,7 @@
       "name": "@crewhaus/structured-event-printer",
       "version": "0.2.4",
       "dependencies": {
+        "@crewhaus/errors": "workspace:*",
         "@crewhaus/trace-event-bus": "workspace:*",
       },
     },
@@ -2043,6 +2045,7 @@
       "name": "@crewhaus/trace-event-bus",
       "version": "0.2.4",
       "dependencies": {
+        "@crewhaus/errors": "workspace:*",
         "@crewhaus/logging": "workspace:*",
       },
     },

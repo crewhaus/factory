@@ -836,6 +836,45 @@ describe("emitChannelBot — heartbeat (Phase 3 §3.1)", () => {
   });
 });
 
+describe("emitChannelBot — terminal-failure reporting (0.3.0 Goal 6)", () => {
+  test("main().catch renders the structured report and exits with the coded status", () => {
+    const c = fileMap(MIN_IR).get("daemon.ts") ?? "";
+    expect(c).toContain('import { formatRunFailure, toFailureReport } from "@crewhaus/errors";');
+    expect(c).toContain("const __report = toFailureReport(err);");
+    expect(c).toContain(
+      'process.stderr.write(`${formatRunFailure(__report, { prefix: "[daemon]" })}\\n`);',
+    );
+    expect(c).toContain("process.exit(__report.exitCode);");
+    // The pre-0.3.0 bare fatal line is gone.
+    expect(c).not.toContain("[daemon] fatal:");
+    // Without a heartbeat, the tick-only helper is not imported.
+    expect(c).not.toContain("isRunFailedError");
+  });
+
+  test("heartbeat tick renders the classified report but keeps the bare line for other errors — and never exits", () => {
+    const irWithHeartbeat: IrChannelV0 = {
+      ...MIN_IR,
+      heartbeat: { everyMs: 60_000, instructions: "tick" },
+    };
+    const c = fileMap(irWithHeartbeat).get("daemon.ts") ?? "";
+    expect(c).toContain(
+      'import { formatRunFailure, isRunFailedError, toFailureReport } from "@crewhaus/errors";',
+    );
+    expect(c).toContain("if (isRunFailedError(__err)) {");
+    expect(c).toContain(
+      'process.stderr.write(`${formatRunFailure(__err.report, { prefix: "[heartbeat]" })}\\n`);',
+    );
+    // Unclassifiable tick errors keep the pre-0.3.0 bare line…
+    expect(c).toContain("[heartbeat] error:");
+    // …and the tick catch never kills the daemon: no process.exit between
+    // the heartbeat catch and the end of the setInterval callback.
+    const tickCatch = c.indexOf("if (isRunFailedError(__err)) {");
+    const tickEnd = c.indexOf("[heartbeat] enabled every");
+    expect(tickCatch).toBeGreaterThan(-1);
+    expect(c.slice(tickCatch, tickEnd)).not.toContain("process.exit");
+  });
+});
+
 describe("emitChannelBot — provider failover chain (item 22)", () => {
   test("agent.ts threads modelFallbacks + circuitBreaker into runChatLoop when set", () => {
     const irFailover: IrChannelV0 = {

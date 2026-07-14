@@ -3,6 +3,7 @@
  * observability bus. Every variant carries the same envelope so subscribers
  * can correlate events across runs, sessions, turns, and traces.
  */
+import type { FailureClass } from "@crewhaus/errors";
 
 export type TraceEventEnvelope = {
   readonly runId: string;
@@ -209,9 +210,38 @@ export type ErrorRecoveredEvent = TraceEventEnvelope & {
   // Item 23 — `switch-model` joins the recovery-engine action set (an
   // opt-in failure_taxonomy verdict that reroutes onto the next failover
   // candidate mid-turn).
-  action: "retry" | "compact" | "continue" | "tombstone" | "switch-model" | "fail";
+  // v0.3.0 Goal 6 — `halt` is the recovery engine's CLASSIFIED terminal
+  // stop (billing/auth/rate-limit exhaustion/hinted taxonomy entries),
+  // published first-class instead of the interim halt→"fail" mapping.
+  // Consumers that count unrecovered errors (alert-watchdog, slo-monitor)
+  // treat BOTH `fail` and `halt` as terminal. The accompanying `run_failed`
+  // event carries the human-readable report this event never had room for.
+  action: "retry" | "compact" | "continue" | "tombstone" | "switch-model" | "fail" | "halt";
   errorName: string;
   depth: number;
+};
+
+/**
+ * v0.3.0 Goal 6 — the structured TERMINAL failure event, published by
+ * runtime-core immediately BEFORE the run-ending throw (both the classified
+ * `halt` path and the generic `fail` path). `error_recovered` carries only
+ * `errorName` + `depth`; this event finally puts the human-readable reason
+ * on the wire so structured consumers (the UI host feed, the pretty
+ * printer, exporters, incident capture) can render WHY the run died.
+ *
+ * `class`/`remediation`/`exitCode` mirror the thrown `FailureReport`
+ * (`@crewhaus/errors`); `message` is `"<title>: <detail>"` — the same text
+ * `RunFailedError.message` carries after its "run stopped — " prefix.
+ * Generic fails publish a best-effort report (`class: "unknown"`, exit 1).
+ * Exactly one `run_failed` is published per terminal failure; successful
+ * runs and recovered errors publish none.
+ */
+export type RunFailedEvent = TraceEventEnvelope & {
+  kind: "run_failed";
+  class: FailureClass;
+  message: string;
+  remediation?: string;
+  exitCode: number;
 };
 
 export type SubAgentStartEvent = TraceEventEnvelope & {
@@ -574,6 +604,7 @@ export type TraceEvent =
   | CompactionFiredEvent
   | PermissionDecisionEvent
   | ErrorRecoveredEvent
+  | RunFailedEvent
   | SubAgentStartEvent
   | SubAgentEndEvent
   | RoleStartEvent
