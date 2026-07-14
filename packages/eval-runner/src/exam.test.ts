@@ -147,6 +147,28 @@ describe("createExamRunner — grading + report (deterministic, no model)", () =
     );
   });
 
+  test("a `type: registry` grader is refused loudly at exam start (PR 17 ∩ PR 19)", async () => {
+    // Cross-branch seam pin (v0.3.0 final integration): registry graders
+    // resolve against RunEvalOptions.graderRegistry — a seam run_exam does
+    // not carry. The exam must reject them upfront with the eval-runner's
+    // loud-at-start behavior, never as per-sample grader-infra noise.
+    const { datasetPath } = writeExamFiles();
+    const registryGradersPath = join(tmp, "eval", "graders-registry.yaml");
+    writeFileSync(
+      registryGradersPath,
+      `graders:
+  - name: reask
+    type: registry
+    grader: continuity.reAskRate
+`,
+    );
+    const runner = createExamRunner(runnerOpts({ invoker: async () => ({ agentOutput: "x" }) }));
+    expect(runner({ datasetPath, gradersPath: registryGradersPath })).rejects.toThrow(RunnerError);
+    expect(runner({ datasetPath, gradersPath: registryGradersPath })).rejects.toThrow(
+      /type: registry.*not available to `run_exam`/,
+    );
+  });
+
   test("an empty dataset is refused loudly", async () => {
     const { gradersPath } = writeExamFiles();
     const emptyPath = join(tmp, "eval", "empty.jsonl");

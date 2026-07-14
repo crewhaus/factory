@@ -143,6 +143,17 @@ export function createExamRunner(opts: CreateExamRunnerOptions): ExamRunner {
         const model = g.judgeSpec.model ?? opts.judgeModel ?? opts.model;
         return { name: g.name, grader: createJudgeGrader(rubric, { model }) };
       }
+      // v0.3.0 final integration (PR 17 ∩ PR 19): `type: registry` graders
+      // resolve against RunEvalOptions.graderRegistry — a seam run_exam does
+      // not carry (the exam is invoked from inside a running harness, which
+      // has no grader registry to hand over). Reject LOUDLY at exam start,
+      // exactly like runEval does, instead of letting the compiled
+      // placeholder throw per-sample as confusing grader-infra noise.
+      if (g.registrySpec) {
+        throw new RunnerError(
+          `exam: grader "${g.name}" is \`type: registry\` (→ "${g.registrySpec.grader}") — registry graders resolve via RunEvalOptions.graderRegistry under \`crewhaus eval\` and are not available to \`run_exam\`; use code/llm_judge graders in learning.exam.graders`,
+        );
+      }
       return { name: g.name, grader: g.grader };
     });
 
@@ -174,7 +185,16 @@ export function createExamRunner(opts: CreateExamRunnerOptions): ExamRunner {
       samples.map(async (sample) => {
         const release = await sem.acquire();
         try {
-          return await runSample({ sample, invoker, graders, outDir, model: opts.model });
+          return await runSample({
+            sample,
+            invoker,
+            graders,
+            outDir,
+            model: opts.model,
+            // PR 19's artifact seam: stamp the examinee's spec name so any
+            // artifact-reading grader addresses the right state root.
+            specName: opts.specName,
+          });
         } finally {
           release();
         }

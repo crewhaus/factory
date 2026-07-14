@@ -53,6 +53,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backend enrolls today (wiki-store's test suite, with a last-write-wins
   negative control proving the suite discriminates); the Thredz backend
   (PR 16) runs the same suite against a stub server.
+
 - **Learning — continual learning as a first-class capability (0.3.0
   Goal 2, §3.3, PR 17).** A new top-level `learning:` block on the five
   memory shapes (cli, channel, managed, research, crew): `domain`
@@ -609,6 +610,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   branches is unified into `@crewhaus/infra-utils`
   (`acquireFileLock`/`withFileLock`); both stores keep their exact error
   types and message prefixes (pinned by their existing lock tests).
+
+- **Sub-agents are no longer memory-blind, and their failures are no longer
+  swallowed (0.3.0 §7.1, PR 13).** `spawnSubAgent` threads four seams from
+  the parent's bridge into child loops: `memory` — recall ON via the
+  parent's own recall closure (recalled context reaches the child's system
+  prompt through the same injected seam; `autoRecall` respects the parent's
+  setting) and capture OFF by construction (the projected seam cannot carry
+  the write closures — parents own memory writes); `skills` — children
+  finally see the "Available skills:" prompt block, not just the
+  catalog-inherited Skill tool; `failureTaxonomy` — child recovery consults
+  the same named classes; and READ-ONLY `continuity` — `loadPlan` renders
+  the `<current_plan>` tail in child loops while `onPlanDirty`/`onHandoff`/
+  the ledger stay parent-side. Child terminal errors are CLASSIFIED at the
+  spawner boundary instead of dissolving into a `[sub-agent error]` string:
+  non-fatal classes surface as an `is_error` tool result carrying structured
+  `{isError, failureClass, report}` content (the run continues), while a
+  billing/auth-class failure inside a child rethrows `RunFailedError` after
+  the `sub_agent_end` bracket bookkeeping — tool-executor, the streaming
+  executor, and `recover()` all pass an already-classified report through
+  verbatim, so a billing failure anywhere ends the whole run with the
+  child's report (same `run_failed` event + coded exit as a top-level
+  halt). Auto-capture finally SEES sub-agent findings: memory-store gains
+  `turnsFromEventsWithChildren` (walks the parent log's `sub_agent_start`
+  brackets into child session JSONLs — lazy reads, capped at
+  `MAX_CAPTURE_EVENTS_PER_CHILD` = 2000 events per child) and
+  `captureChildFacts` (child facts land with
+  `provenance {sessionId: <childSessionId>}` plus a `subagent:<name>` tag);
+  `crewhaus run`'s onCapture is wired (the target-cli emitter mirror is
+  deferred to the memory-service refactor with a marked TODO). Attribution:
+  `createIsolatedContext` stamps `agentIdentity {subAgentId: <name>}` on
+  every child RunContext, and tool-plan's `plan_update`/`goal_update`/
+  `action_proof` payloads record the formatted identity (e.g.
+  `subagent=researcher`) when one is set. Spawning with none of the new
+  options behaves exactly as before (regression-pinned).
 
 - **`crewhaus init --interactive` is a real conversation** (v0.3.0 §2.9,
   PR 18 — the scene of the release's motivating failure, rebuilt). The model
