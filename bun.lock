@@ -65,6 +65,7 @@
         "@crewhaus/prompt-injection-detector": "workspace:*",
         "@crewhaus/prompt-optimizer": "workspace:*",
         "@crewhaus/prompt-optimizer-claude": "workspace:*",
+        "@crewhaus/recovery-engine": "workspace:*",
         "@crewhaus/regression-runner": "workspace:*",
         "@crewhaus/routing-store": "workspace:*",
         "@crewhaus/run-context": "workspace:*",
@@ -136,6 +137,9 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/token-budget": "workspace:*",
       },
+      "devDependencies": {
+        "@crewhaus/recovery-engine": "workspace:*",
+      },
       "optionalDependencies": {
         "@anthropic-ai/vertex-sdk": "^0.17.0",
       },
@@ -149,6 +153,9 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/token-budget": "workspace:*",
       },
+      "devDependencies": {
+        "@crewhaus/recovery-engine": "workspace:*",
+      },
     },
     "packages/adapter-gemini": {
       "name": "@crewhaus/adapter-gemini",
@@ -159,6 +166,9 @@
         "@crewhaus/token-budget": "workspace:*",
         "@google/genai": "^1.6.0",
       },
+      "devDependencies": {
+        "@crewhaus/recovery-engine": "workspace:*",
+      },
     },
     "packages/adapter-openai": {
       "name": "@crewhaus/adapter-openai",
@@ -168,6 +178,9 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/token-budget": "workspace:*",
         "openai": "^4.65.0",
+      },
+      "devDependencies": {
+        "@crewhaus/recovery-engine": "workspace:*",
       },
     },
     "packages/agent-context-isolation": {
@@ -1401,6 +1414,7 @@
       "name": "@crewhaus/structured-event-printer",
       "version": "0.2.4",
       "dependencies": {
+        "@crewhaus/errors": "workspace:*",
         "@crewhaus/trace-event-bus": "workspace:*",
       },
     },
@@ -2051,6 +2065,7 @@
       "name": "@crewhaus/trace-event-bus",
       "version": "0.2.4",
       "dependencies": {
+        "@crewhaus/errors": "workspace:*",
         "@crewhaus/logging": "workspace:*",
       },
     },

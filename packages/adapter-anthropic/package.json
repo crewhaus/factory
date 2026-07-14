@@ -17,6 +17,9 @@
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/token-budget": "workspace:*"
   },
+  "devDependencies": {
+    "@crewhaus/recovery-engine": "workspace:*"
+  },
   "optionalDependencies": {
     "@anthropic-ai/vertex-sdk": "^0.17.0"
   },

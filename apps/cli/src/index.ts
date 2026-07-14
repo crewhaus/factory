@@ -36,7 +36,7 @@ import {
   createFileBackedRegistry,
   latestVersion,
 } from "@crewhaus/dataset-registry";
-import { CrewhausError } from "@crewhaus/errors";
+import { CrewhausError, RunFailedError } from "@crewhaus/errors";
 import { type Sample, loadDataset } from "@crewhaus/eval-dataset";
 import { type CompiledGrader, type GradersConfig, parseGradersConfig } from "@crewhaus/eval-grader";
 import {
@@ -67,7 +67,7 @@ import {
 } from "@crewhaus/infra-utils";
 import { GENERATED_README_MARKER, type IrBudget } from "@crewhaus/ir";
 import { createLogger } from "@crewhaus/logging";
-import { McpHost } from "@crewhaus/mcp-host";
+import { McpHost, resolveMcpServerConfig } from "@crewhaus/mcp-host";
 import {
   captureFacts,
   createMemoryStore,
@@ -299,6 +299,9 @@ import {
   planScaffoldSpec,
   planScopeFix,
 } from "./doctor-fix";
+// v0.3.0 Goal 6 — `doctor --probe`: opt-in ~1-token live call per
+// configured provider, catching unfunded/invalid keys before a long run.
+import { buildProbePlan, probeResultsToChecks, runProviderProbes } from "./doctor-probe";
 // FR-006 — Pillar 3 sink-side egress-matcher selection (the substring/semantic
 // selector lowered to ir.security.egressMatcher). Side-effect-free + lazily
 // imports the optional semantic package only when "semantic" is selected, so
@@ -759,6 +762,11 @@ import {
   enumerateSlotCandidates,
 } from "./right-size";
 import { runRoute } from "./route";
+// v0.3.0 Goal 6 — canonical terminal-failure rendering: die() and the
+// `crewhaus run` failure path both route through renderCliFailure so a
+// RunFailedError prints its structured report + coded exit while every
+// other fatal keeps the classic `crewhaus: <message>` one-liner + exit 1.
+import { CONTINUE_NOTE, renderCliFailure } from "./run-failure";
 // Item 13 — `crewhaus scaffold-evals` + `init --with-evals`: day-one eval
 // assets generated from the spec (deterministic template / one-shot model
 // sample stubs + a single spec-goal llm_judge or floor grader), in a
@@ -1144,6 +1152,12 @@ const DOCTOR_SCHEMA: ParseArgsSchema = {
     // tools scope:external, append commented .env stubs). Dry-run is the
     // DEFAULT: without --fix, doctor prints the diff it WOULD apply.
     { name: "fix", takesValue: false },
+    // v0.3.0 Goal 6 — `--probe`: opt-in ~1-token live call per configured
+    // provider, catching present-but-invalid keys and unfunded accounts
+    // BEFORE a long run dies on them. Distinct from --detect's --no-probe
+    // (a localhost reachability knob): this one spends real (fractional-
+    // cent) tokens, so it is never on by default.
+    { name: "probe", takesValue: false },
     { name: "help", short: "h" },
   ],
 };
@@ -2258,9 +2272,17 @@ function help(): never {
   process.exit(0);
 }
 
-function die(message: string): never {
-  process.stderr.write(`crewhaus: ${message}\n`);
-  process.exit(1);
+/**
+ * Fatal-error exit. A plain string (or any non-RunFailed CrewhausError)
+ * keeps the classic one-liner `crewhaus: <message>` + exit 1; a
+ * `RunFailedError` (v0.3.0 Goal 6) renders its structured report via
+ * `formatRunFailure()` and exits with the report's coded status, so
+ * callers can simply `die(err)` and the taxonomy does the rest.
+ */
+function die(message: string | CrewhausError): never {
+  const rendered = renderCliFailure(message);
+  process.stderr.write(`${rendered.text}\n`);
+  process.exit(rendered.exitCode);
 }
 
 function printVersion(): void {
@@ -3889,7 +3911,9 @@ async function runRunCli(
     const host = new McpHost({ logger });
     mcpHost = host;
     for (const [name, cfg] of Object.entries(ir.mcp_servers)) {
-      host.addServer(name, cfg);
+      // 0.3.0 — env/header values are IrSecretRef; resolve them from the
+      // interpreter process's environment (fail-fast, names the variable).
+      host.addServer(name, resolveMcpServerConfig(cfg, { name }));
     }
     const tempCatalog = new ToolCatalog();
     for (const t of tools) tempCatalog.register(t);
@@ -4323,6 +4347,11 @@ async function runRunCli(
   }
 
   let oneShotResult: string | undefined;
+  // v0.3.0 Goal 6 — a RunFailedError is remembered (not rethrown) so the
+  // finally still disconnects MCP servers, then rendered below with the
+  // resume hint + the report's coded exit. Everything else propagates to
+  // the `case "run"` catch → die() one-liner, exactly as before.
+  let runFailure: RunFailedError | undefined;
   try {
     oneShotResult = await runChatLoop({
       model,
@@ -4414,8 +4443,31 @@ async function runRunCli(
       // as a canonical memory file, so no extra wiring is needed for it.
       ...(preferenceFiles.length > 0 ? { preferenceFiles } : {}),
     });
+  } catch (err) {
+    if (!(err instanceof RunFailedError)) throw err;
+    runFailure = err;
   } finally {
     if (mcpHost) await mcpHost.disconnectAll();
+  }
+
+  // v0.3.0 Goal 6 — render the classified terminal report (billing/auth/
+  // rate-limit/…) with the resume hint when this spec has a persisted
+  // session, then exit with the report's coded status. The design §8.2
+  // out-of-funding example ends exactly like this.
+  if (runFailure !== undefined) {
+    const notes: string[] = [];
+    try {
+      const store = createSessionStore();
+      const sessions = await store.list();
+      if (sessions.some((s: { name: string }) => s.name === ir.name)) {
+        notes.push(CONTINUE_NOTE);
+      }
+    } catch {
+      // Best-effort: the resume hint must never mask the real failure.
+    }
+    const rendered = renderCliFailure(runFailure, { notes });
+    process.stderr.write(`${rendered.text}\n`);
+    process.exit(rendered.exitCode);
   }
 
   // One-shot (`--prompt`): emit the final assistant message to stdout so it
@@ -4679,7 +4731,7 @@ async function runDoctor(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
       "usage: crewhaus doctor [--philosophy-alignment [--json] [--baseline | --accept-baseline]]\n" +
-        "                       [--liveness] [--context-pressure [--sessions N]]\n" +
+        "                       [--liveness] [--context-pressure [--sessions N]] [--probe]\n" +
         "  --philosophy-alignment   audit the codebase + examples against the three architectural pillars\n" +
         "  --json                   persist findings (stable ids) to .crewhaus/scope-audit/<date>.json\n" +
         "                           and print the snapshot JSON (item 49)\n" +
@@ -4710,6 +4762,12 @@ async function runDoctor(args: ParsedArgs): Promise<void> {
         "                           mark outward tools scope:external via a CST spec-patch, and\n" +
         "                           append commented .env stubs. DRY-RUN IS THE DEFAULT — without\n" +
         "                           --fix, doctor prints the diff it WOULD apply.\n" +
+        "  --probe                  OPT-IN live credential probe: one ~1-token call per\n" +
+        "                           configured provider (the cwd spec's model verbatim, plus a\n" +
+        "                           cheap default for other providers with env set), catching\n" +
+        "                           unfunded accounts (billing) and invalid keys (auth) before\n" +
+        "                           a long run dies on them. Spends fractional-cent tokens, so\n" +
+        "                           it is never on by default. Failures fail doctor (exit 1).\n" +
         "\n" +
         "  Credential checks are model-aware: doctor parses the cwd crewhaus.yaml's\n" +
         "  agent.model (claude-*, openai/*, gemini/*, bedrock/*, local/<m>@<url>) and\n" +
@@ -4775,6 +4833,20 @@ async function runDoctor(args: ParsedArgs): Promise<void> {
   // are set. Live platform probes live in `crewhaus channel verify`.
   if (specText !== undefined) {
     checks.push(...buildChannelEnvChecks(specText, process.env));
+  }
+
+  // v0.3.0 Goal 6 — `--probe`: opt-in ~1-token live call per configured
+  // provider (the spec's model verbatim + cheap defaults for other
+  // configured providers), catching unfunded/invalid keys pre-run. Failures
+  // classify through recovery-engine (billing/auth/rate_limit) so the ✗
+  // line names the fix class, and they gate doctor's exit like any check.
+  if (args.flags["probe"]) {
+    const plan = buildProbePlan(specModel, process.env);
+    if (plan.length === 0) {
+      process.stdout.write("~ live probe: no configured providers to probe\n");
+    } else {
+      checks.push(...probeResultsToChecks(await runProviderProbes(plan)));
+    }
   }
 
   const bunCheck = checkBunVersion(Bun.version);
@@ -13555,7 +13627,7 @@ async function runMcpDoctor(args: ParsedArgs): Promise<void> {
   let driftDetected = false;
   if (wantProbe) {
     const specPath = join(cwd, "crewhaus.yaml");
-    let mcpServers: Record<string, import("@crewhaus/mcp-host").McpServerConfig> = {};
+    let mcpServers: Record<string, import("@crewhaus/ir").IrMcpServerConfig> = {};
     if (existsSync(specPath)) {
       try {
         const ir = lower(parseSpec(readFileSync(specPath, "utf-8")));
@@ -13567,10 +13639,26 @@ async function runMcpDoctor(args: ParsedArgs): Promise<void> {
     if (Object.keys(mcpServers).length > 0) {
       mkdirSync(mcpDir, { recursive: true });
       const host = new McpHost({ logger });
-      for (const [name, cfg] of Object.entries(mcpServers)) host.addServer(name, cfg);
+      for (const [name, cfg] of Object.entries(mcpServers)) {
+        // 0.3.0 — env/header values are IrSecretRef; an unresolvable env
+        // ref becomes a per-server probe failure (named variable) rather
+        // than crashing the whole doctor run.
+        try {
+          host.addServer(name, resolveMcpServerConfig(cfg, { name }));
+        } catch (err) {
+          driftEntries.push({
+            server: name,
+            lines: [
+              `  ✗ ${name}: probe failed — ${err instanceof Error ? err.message : String(err)}`,
+            ],
+          });
+          driftDetected = true;
+        }
+      }
+      const probeNames = Object.keys(mcpServers).filter((name) => host.has(name));
       const nowIso = new Date().toISOString();
       await Promise.all(
-        Object.keys(mcpServers).map(async (name) => {
+        probeNames.map(async (name) => {
           const lines: string[] = [];
           try {
             const client = host.getClient(name);
@@ -15100,13 +15188,14 @@ switch (subcommand) {
     // Mirror runCompile's policy: every structured failure in the run
     // pipeline (ConfigError from the model-router, ProviderAuthError from
     // an adapter, RuntimeError, …) extends CrewhausError — route the
-    // family through die() for a clean one-line error + exit 1 instead of
-    // a raw stack trace. A non-CrewhausError (a genuine bug) still
-    // propagates with its full stack for debugging.
+    // family through die(), which prints the classic one-liner + exit 1
+    // for most of them and (v0.3.0 Goal 6) the full structured report +
+    // coded exit for a RunFailedError. A non-CrewhausError (a genuine
+    // bug) still propagates with its full stack for debugging.
     try {
       await runRun(parseFor(rest, RUN_SCHEMA));
     } catch (err) {
-      if (err instanceof CrewhausError) die(err.message);
+      if (err instanceof CrewhausError) die(err);
       throw err;
     }
     break;

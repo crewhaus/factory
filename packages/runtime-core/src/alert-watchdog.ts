@@ -69,7 +69,7 @@ export type SessionMetricsSnapshot = {
   readonly turns: number;
   /** Total model calls (model_response events). */
   readonly modelCalls: number;
-  /** Errors that were NOT recovered (error_recovered action "fail"). */
+  /** Errors that were NOT recovered (error_recovered action "fail" or "halt"). */
   readonly unrecoveredErrors: number;
   /** unrecoveredErrors / max(modelCalls,1) — the rate we alert on. */
   readonly errorRate: number;
@@ -167,9 +167,12 @@ export class SessionMetricsAccumulator {
         this.ttftSeen.delete(ev.traceId);
         return;
       case "error_recovered":
-        // Only a terminal "fail" is an unrecovered error; retry/compact/etc.
-        // are the recovery engine doing its job.
-        if (ev.action === "fail") this.unrecoveredErrors += 1;
+        // Only a terminal stop is an unrecovered error; retry/compact/etc.
+        // are the recovery engine doing its job. "fail" is the generic
+        // terminal action; "halt" (v0.3.0 Goal 6) is the CLASSIFIED
+        // terminal action (billing/auth/rate-limit) — count both so the
+        // error-rate baseline is unchanged by the taxonomy upgrade.
+        if (ev.action === "fail" || ev.action === "halt") this.unrecoveredErrors += 1;
         return;
       case "cost_accrual": {
         // Skip the FR-003 terminal aggregate (summary:true) — it double-counts.

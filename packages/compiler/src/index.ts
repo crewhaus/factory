@@ -239,9 +239,39 @@ function lowerPermissions(spec: SpecWithPermissions): IrPermissions {
 /**
  * Normalise mcp_servers from spec (where args/env/headers are optional) to
  * IR (where args is a required readonly array — env/headers stay optional).
- * The shape is otherwise identical so target codegen can JSON-stringify
- * the IR config directly into the emitted bundle.
+ *
+ * 0.3.0 — stdio `env` and sse `headers` VALUES route through the Section-12
+ * secret machinery instead of being copied verbatim (which used to bake the
+ * literal string `"$THREDZ_API_KEY"` into compiled bundles, with no runtime
+ * resolution — the blocker for delivering any secret into an MCP child
+ * process). Each value lowers with `lowerSecret` (permissive: plain strings
+ * stay literals, `$UPPER_SNAKE` becomes an env ref), upgraded to
+ * `lowerCredential` (fail-fast on a malformed `$…` ref) when the KEY is
+ * credential-shaped — `*_KEY` / `*_TOKEN` / `*_SECRET` / `*_PASSWORD`, or
+ * the `Authorization` / `x-api-key` header names. Target codegen embeds the
+ * unresolved config and emitted bundles resolve it at process start via
+ * `resolveMcpServerConfig` from `@crewhaus/mcp-host`.
  */
+const CREDENTIAL_SHAPED_KEY_RE = /(_KEY|_TOKEN|_SECRET|_PASSWORD)$/i;
+const CREDENTIAL_HEADER_NAMES: ReadonlySet<string> = new Set(["authorization", "x-api-key"]);
+
+function lowerMcpSecretMap(
+  map: Readonly<Record<string, string>>,
+  labelPrefix: string,
+  kind: "env" | "headers",
+): Readonly<Record<string, IrSecretRef>> {
+  const out: Record<string, IrSecretRef> = {};
+  for (const [key, value] of Object.entries(map)) {
+    const credentialShaped =
+      CREDENTIAL_SHAPED_KEY_RE.test(key) ||
+      (kind === "headers" && CREDENTIAL_HEADER_NAMES.has(key.toLowerCase()));
+    out[key] = credentialShaped
+      ? lowerCredential(`${labelPrefix}.${kind}.${key}`, value)
+      : lowerSecret(value);
+  }
+  return out;
+}
+
 function lowerMcpServers(specMcp: Record<string, SpecMcpServerConfig> | undefined): IrMcpServers {
   if (specMcp === undefined) return Object.freeze({}) as IrMcpServers;
   const out: Record<string, IrMcpServerConfig> = {};
@@ -251,13 +281,17 @@ function lowerMcpServers(specMcp: Record<string, SpecMcpServerConfig> | undefine
         transport: "stdio",
         command: cfg.command,
         args: cfg.args ?? [],
-        ...(cfg.env !== undefined ? { env: cfg.env } : {}),
+        ...(cfg.env !== undefined
+          ? { env: lowerMcpSecretMap(cfg.env, `mcp_servers.${name}`, "env") }
+          : {}),
       };
     } else {
       out[name] = {
         transport: "sse",
         url: cfg.url,
-        ...(cfg.headers !== undefined ? { headers: cfg.headers } : {}),
+        ...(cfg.headers !== undefined
+          ? { headers: lowerMcpSecretMap(cfg.headers, `mcp_servers.${name}`, "headers") }
+          : {}),
       };
     }
   }

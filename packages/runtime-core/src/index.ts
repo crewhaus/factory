@@ -31,7 +31,13 @@ import {
   classifyEgress,
   summarizeEgress,
 } from "@crewhaus/egress-classifier";
-import { ConfigError, RuntimeError } from "@crewhaus/errors";
+import {
+  ConfigError,
+  EXIT_CODES,
+  type FailureReport,
+  RunFailedError,
+  RuntimeError,
+} from "@crewhaus/errors";
 import { type EventKind, type EventLog, openEventLog } from "@crewhaus/event-log";
 import { type HookDef, type HookEvent, aggregateDecisions, runHooks } from "@crewhaus/hooks-engine";
 import {
@@ -197,6 +203,204 @@ const DEFAULT_MAX_CONCURRENT_TOOLS = 4;
 const DEFAULT_COMPACTION_THRESHOLD = 0.85;
 const DEFAULT_SNIP_KEEP_HEAD = 4;
 const DEFAULT_SNIP_KEEP_TAIL = 20;
+
+// ---------------------------------------------------------------------------
+// v0.3.0 Goal 1 — the continuity seam (§2.3 requirements ledger, §2.5 mutable
+// tail region). All injected closures: runtime-core stays store-free; the
+// composition root (memory-service, PR 10) constructs them over the
+// continuity store and target emitters thread them (PR 11).
+// ---------------------------------------------------------------------------
+
+/**
+ * Hard cap (chars) on the RENDERED mutable tail — the `<current_plan>` +
+ * `<requirements_ledger>` blocks appended after the cache-marked frozen
+ * prefix on every model call. The spec's `continuity.focusMaxChars` lowers
+ * onto this in PR 11; until then the default applies. Enforced in
+ * `renderContinuityTail`: the ledger has priority (it is the
+ * motivating-failure fix), truncating oldest-first with a marker; the plan
+ * yields whatever budget remains.
+ */
+export const DEFAULT_CONTINUITY_TAIL_MAX_CHARS = 4096;
+
+/**
+ * Cap (chars, ~16KB) on the in-run requirements ledger's total entry text.
+ * Oldest entries are evicted first and the rendered block gains a
+ * `[ledger truncated]` marker — user messages are small, so hitting this
+ * means hundreds of evicted requirements.
+ */
+export const CONTINUITY_LEDGER_MAX_CHARS = 16 * 1024;
+
+/**
+ * Key in the per-run `runState` state-store that plan-mutating tools
+ * (PlanUpdate/FocusWrite, PR 7) set to `true` after a write. The loop
+ * re-reads it before each model call and re-renders the `<current_plan>`
+ * tail block via `continuity.onPlanDirty` when set — the state-store's
+ * first consumer.
+ */
+export const PLAN_DIRTY_STATE_KEY = "plan.dirty";
+
+/** Role attribution on an evicted-content record (§2.3): `"user"` for user
+ *  text, `"assistant"` for assistant text, `"tool"` for tool_result content
+ *  (which the API carries inside user-role messages). */
+export type ContextEvictedRole = "user" | "assistant" | "tool";
+
+/** One verbatim evicted-content record — the `context_evicted` event payload
+ *  and the requirements-ledger entry shape. */
+export type ContinuityLedgerEntry = {
+  readonly role: ContextEvictedRole;
+  readonly text: string;
+  readonly turnNumber?: number;
+};
+
+/**
+ * §2.5 — the deterministic teardown handoff payload. Built with ZERO model
+ * calls from state the run already holds: the last rendered plan snapshot,
+ * the in-run ledger entries verbatim, the session id, and why the run
+ * stopped (the same reason the `stop` hook receives).
+ */
+export type HandoffInput = {
+  /** Last `<current_plan>` content from `loadPlan`/`onPlanDirty`; null when
+   *  the plan store is empty or the seam never produced one. */
+  readonly plan: string | null;
+  /** The in-run requirements ledger, oldest-first, verbatim. */
+  readonly ledger: ReadonlyArray<ContinuityLedgerEntry>;
+  readonly sessionId: string;
+  readonly stopReason: "complete" | "exit" | "abort";
+};
+
+/** compaction-snip's marker message — filtered out of eviction records (it
+ *  is runtime scaffolding, not conversation content). */
+const SNIP_MARKER_RE = /^\[Context compacted: \d+ messages removed\]$/;
+
+/**
+ * §2.3 — decompose one message that compaction is about to drop into
+ * verbatim `context_evicted` records. Text-bearing content only: user/
+ * assistant text becomes one entry per message (blocks joined with `\n` so
+ * the record IS the message, not fragments), each `tool_result`'s text
+ * becomes a `"tool"` entry. `tool_use` inputs are skipped — they already
+ * persist verbatim as `tool_use` event-log lines. The snip marker is
+ * dropped. Exported for tests.
+ */
+export function extractEvictedEntries(message: Anthropic.MessageParam): ContinuityLedgerEntry[] {
+  const textRole: ContextEvictedRole = message.role === "user" ? "user" : "assistant";
+  if (typeof message.content === "string") {
+    if (message.content.length === 0 || SNIP_MARKER_RE.test(message.content)) return [];
+    return [{ role: textRole, text: message.content }];
+  }
+  const entries: ContinuityLedgerEntry[] = [];
+  const texts: string[] = [];
+  for (const block of message.content) {
+    const b = block as { type?: string; text?: unknown; content?: unknown };
+    if (b.type === "text" && typeof b.text === "string" && b.text.length > 0) {
+      texts.push(b.text);
+    } else if (b.type === "tool_result") {
+      const c = b.content;
+      const text =
+        typeof c === "string"
+          ? c
+          : Array.isArray(c)
+            ? c
+                .map((inner) => {
+                  const i = inner as { type?: string; text?: unknown };
+                  return i.type === "text" && typeof i.text === "string" ? i.text : "";
+                })
+                .filter((t) => t.length > 0)
+                .join("\n")
+            : "";
+      if (text.length > 0) entries.push({ role: "tool", text });
+    }
+  }
+  if (texts.length > 0) {
+    const joined = texts.join("\n");
+    if (!SNIP_MARKER_RE.test(joined)) entries.push({ role: textRole, text: joined });
+  }
+  return entries;
+}
+
+const LEDGER_TRUNCATED_MARKER = "[ledger truncated]";
+const PLAN_TRUNCATED_MARKER = "[plan truncated to fit the tail cap]";
+
+/**
+ * §2.5 — render the mutable tail region: the `<current_plan>` block and the
+ * `<requirements_ledger>` block, hard-capped at `maxChars` (default
+ * {@link DEFAULT_CONTINUITY_TAIL_MAX_CHARS}). Pure and deterministic;
+ * exported for tests.
+ *
+ * Cap enforcement, in priority order:
+ *  1. The ledger block drops its OLDEST entries first (they are the
+ *     time-ordered content) until it fits, gaining the
+ *     `[ledger truncated]` marker — the newest requirements always survive.
+ *  2. The plan gets whatever budget remains; an over-budget plan keeps its
+ *     HEAD (focus/next-steps render first in plan documents) and gains a
+ *     trailing truncation marker. A remainder too small for any plan
+ *     content drops the plan block entirely — the ledger is the
+ *     motivating-failure fix and always wins.
+ *
+ * Closing delimiters inside plan/ledger content are neutralized so
+ * embedded `</current_plan>` / `</requirements_ledger>` text cannot
+ * terminate its wrapper block early (same defense as `<recalled_memory>`).
+ */
+export function renderContinuityTail(input: {
+  readonly plan: string | null;
+  readonly ledger: ReadonlyArray<ContinuityLedgerEntry>;
+  readonly ledgerTruncated?: boolean;
+  readonly maxChars?: number;
+}): string[] {
+  const maxChars = input.maxChars ?? DEFAULT_CONTINUITY_TAIL_MAX_CHARS;
+
+  const renderLedger = (
+    entries: ReadonlyArray<ContinuityLedgerEntry>,
+    truncated: boolean,
+  ): string => {
+    const lines = entries.map((e) => {
+      const attribution = e.turnNumber !== undefined ? `(user, turn ${e.turnNumber})` : "(user)";
+      return `- ${attribution} ${escapeBoundaryDelimiter(e.text, "requirements_ledger")}`;
+    });
+    const body = [...(truncated ? [LEDGER_TRUNCATED_MARKER] : []), ...lines].join("\n");
+    return `<requirements_ledger>\nUser requirements preserved verbatim before context compaction — they remain binding even though the original messages were evicted:\n${body}\n</requirements_ledger>`;
+  };
+
+  // 1. Ledger block, oldest-first eviction until it fits the cap alone.
+  let ledgerBlock: string | undefined;
+  if (input.ledger.length > 0) {
+    let entries = [...input.ledger];
+    let truncated = input.ledgerTruncated === true;
+    ledgerBlock = renderLedger(entries, truncated);
+    while (ledgerBlock.length > maxChars && entries.length > 1) {
+      entries = entries.slice(1);
+      truncated = true;
+      ledgerBlock = renderLedger(entries, truncated);
+    }
+    if (ledgerBlock.length > maxChars) {
+      // A single entry alone exceeds the cap — keep its NEWEST chars.
+      const last = entries[0] as ContinuityLedgerEntry;
+      const clipped = last.text.slice(Math.max(0, last.text.length - maxChars));
+      ledgerBlock = renderLedger([{ ...last, text: clipped }], true).slice(0, maxChars);
+    }
+  }
+
+  // 2. Plan block within the remaining budget.
+  let planBlock: string | undefined;
+  const planText = input.plan;
+  if (planText !== null && planText.trim().length > 0) {
+    const remaining = maxChars - (ledgerBlock !== undefined ? ledgerBlock.length : 0);
+    const escaped = escapeBoundaryDelimiter(planText, "current_plan");
+    const wrap = (body: string): string => `<current_plan>\n${body}\n</current_plan>`;
+    const overhead = wrap("").length + PLAN_TRUNCATED_MARKER.length + 1;
+    if (remaining > overhead) {
+      const full = wrap(escaped);
+      planBlock =
+        full.length <= remaining
+          ? full
+          : wrap(`${escaped.slice(0, remaining - overhead)}\n${PLAN_TRUNCATED_MARKER}`);
+    }
+  }
+
+  const blocks: string[] = [];
+  if (planBlock !== undefined) blocks.push(planBlock);
+  if (ledgerBlock !== undefined) blocks.push(ledgerBlock);
+  return blocks;
+}
 
 /**
  * Run `items` through `fn` with at most `limit` in flight at once,
@@ -616,6 +820,53 @@ export type RunChatLoopOptions = {
     readonly onCapture?: (completedTurns: number, sessionId: string) => Promise<void>;
   };
   /**
+   * v0.3.0 Goal 1 — the continuity seam (§2.3 requirements ledger, §2.5
+   * mutable tail region, §2.8 handoff). Injected closures exactly like
+   * `memory` above: the composition root (memory-service) constructs them
+   * over the continuity store; runtime-core never touches a store.
+   *
+   * When present:
+   *  - A VOLATILE TAIL of system blocks (`<current_plan>` +
+   *    `<requirements_ledger>`) is rebuilt on every model call and appended
+   *    AFTER the cache-marked frozen prefix, so tail edits re-tokenize only
+   *    the tail (see prompt-cache-manager's `volatile` flag). The rendered
+   *    tail is hard-capped at {@link DEFAULT_CONTINUITY_TAIL_MAX_CHARS}.
+   *  - `loadPlan` renders the initial `<current_plan>` content at boot;
+   *    `onPlanDirty` re-renders it when a tool has set
+   *    `"plan.dirty": true` in the per-run state-store (reachable via the
+   *    RuntimeBridge's `runState`); absent `onPlanDirty` falls back to
+   *    `loadPlan`.
+   *  - `ledger !== false` (the default) turns on the requirements ledger —
+   *    the deterministic fix for the release's motivating failure: every
+   *    USER message compaction is about to drop is appended VERBATIM to the
+   *    session event log as a `context_evicted` event and folded into the
+   *    in-run ledger ({@link CONTINUITY_LEDGER_MAX_CHARS} cap, oldest-first
+   *    eviction), which re-injects on every model call — the user's answer
+   *    survives any number of compactions regardless of summary quality.
+   *    Evicted assistant text and tool findings are also persisted as
+   *    `context_evicted` events (episodic externalization for a later
+   *    recall integration). `--resume` rebuilds the ledger from the logged
+   *    events. The autocompact summarizer's prompt receives the ledger text
+   *    as an anchor, but nothing depends on the summary being right.
+   *  - `onHandoff` fires ONCE at teardown (the same finally slot as
+   *    `memory.onCapture`) with a deterministic {@link HandoffInput} — no
+   *    model calls.
+   *
+   * ABSENT → byte-identical behavior to a pre-0.3.0 runtime: no tail
+   * blocks, no `context_evicted` events, no ledger anchor in the compaction
+   * prompt, no handoff (regression-pinned in continuity.test.ts).
+   */
+  continuity?: {
+    /** Rendered `<current_plan>` tail content, or null when no plan exists. */
+    readonly loadPlan: () => Promise<string | null>;
+    /** Re-render after a Plan/Goal mutation (the `plan.dirty` flag). */
+    readonly onPlanDirty?: () => Promise<string | null>;
+    /** `context_evicted` externalization + reinjection. Default: true. */
+    readonly ledger?: boolean;
+    /** Deterministic teardown handoff write. */
+    readonly onHandoff?: (input: HandoffInput) => Promise<void>;
+  };
+  /**
    * Item #56 — absolute paths to per-user preference files injected at run
    * start via the project-memory auto-load path (alongside LESSONS.md, which
    * is now a canonical memory file). The CLI resolves the current user's
@@ -901,11 +1152,26 @@ export type RunChatLoopOptions = {
   }>;
   /**
    * Section 27 — when set, the system block array goes through
-   * `prompt-cache-manager.manage()` once at run start; if a fresh marker is
-   * injected the new `lastRotatedAt` is exposed via the returned bus event.
-   * Pass `0` (or omit) to force a refresh on the first turn.
+   * `prompt-cache-manager.manage()` once at run start; a valid recent
+   * timestamp makes `manage()` skip, so the run REUSES the existing cached
+   * prefix instead of force-rotating (and cold-starting the cache) at every
+   * boot. Pass `0` (or omit) to force a refresh on the first turn.
+   *
+   * v0.3.0 Goal 1 (§2.5) — the cross-run bookkeeping is live now: a
+   * rotation publishes a `cache_rotation` trace event and invokes
+   * `onPromptCacheRotated` with the fresh timestamp so the caller can
+   * persist it and thread it back here on the next run (store wiring lands
+   * with memory-service/threading, PR 10/11).
    */
   promptCacheLastRotatedAt?: number;
+  /**
+   * v0.3.0 Goal 1 (§2.5) — invoked once at boot IF `manage()` injected a
+   * fresh cache marker, with the `rotatedAt` timestamp to persist. The
+   * caller threads the persisted value back as `promptCacheLastRotatedAt`
+   * on the next run, which stops the boot-time force-rotation. Best-effort:
+   * a persist failure is logged and never aborts the run.
+   */
+  onPromptCacheRotated?: (rotatedAt: number) => void | Promise<void>;
   /**
    * Item 27 — run-level spend cap with a degradation ladder. Generalizes
    * the optimizer's `BudgetMeter` to normal runs (`crewhaus run
@@ -1353,6 +1619,11 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
 
   let sessionId: string;
   let resumedMessages: Anthropic.MessageParam[] | undefined;
+  // §2.3 — on resume, the requirements ledger rebuilds DETERMINISTICALLY
+  // from the `context_evicted` events already on disk (dedup against
+  // re-evictions happens at fold time): a resumed session recovers every
+  // externalized user requirement without trusting any summary.
+  const resumedLedgerSeed: ContinuityLedgerEntry[] = [];
   if (opts.resume) {
     const existing = await sessionStore.get(opts.resume.sessionId);
     if (existing === null) {
@@ -1363,6 +1634,19 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     sessionId = existing.id;
     const replayLog = await openEventLog(sessionId, { rootDir: sessionRootDir });
     resumedMessages = await replayMessageHistory(replayLog);
+    if (opts.continuity !== undefined && opts.continuity.ledger !== false) {
+      for await (const ev of replayLog.read()) {
+        if (ev.kind !== "context_evicted") continue;
+        const p = ev.payload as { role?: unknown; text?: unknown; turnNumber?: unknown };
+        if (p.role === "user" && typeof p.text === "string") {
+          resumedLedgerSeed.push({
+            role: "user",
+            text: p.text,
+            ...(typeof p.turnNumber === "number" ? { turnNumber: p.turnNumber } : {}),
+          });
+        }
+      }
+    }
     await replayLog.close();
   } else {
     // If the caller supplied a runContext, honour its sessionId (already
@@ -1607,11 +1891,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // (CREWHAUS_ADVISOR_EVENTS=0 disables both). See observability.ts.
   const mcpStatsPersist = attachMcpStatsPersistence(bus, eventLog, runContext);
 
-  // Per-run state container — coordination surface for hooks/skills/tools
-  // landing in Section 11+. Section 10 only ships the plumbing; the
-  // underscore prefix marks the intentional non-consumer.
-  const _runState: Store<Record<string, unknown>> = createStore({});
-  void _runState;
+  // Per-run state container — coordination surface for hooks/skills/tools.
+  // Shipped as plumbing in Section 10; v0.3.0 Goal 1 (§2.5) lands its first
+  // consumer: plan-mutating tools set `PLAN_DIRTY_STATE_KEY` here (via the
+  // RuntimeBridge's `runState`) and `buildContinuityTail` below re-reads it
+  // before each model call to re-render the `<current_plan>` tail block.
+  const runState: Store<Record<string, unknown>> = createStore({});
 
   // Section 13 — RuntimeBridge. Built once per run, handed to every
   // tool execution through the executor's ExecutionContext. Framework-
@@ -1666,6 +1951,138 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       runContext.logger.warn("memory auto-capture failed", { error: (err as Error).message });
     }
   };
+
+  // -------------------------------------------------------------------------
+  // v0.3.0 Goal 1 — continuity wiring (§2.3 ledger, §2.5 tail, §2.8 handoff).
+  // Everything below is inert when `opts.continuity` is absent: no tail
+  // blocks, no `context_evicted` events, no ledger anchor, no handoff —
+  // byte-identical request payloads to a pre-0.3.0 runtime.
+  // -------------------------------------------------------------------------
+  const continuity = opts.continuity;
+  const continuityLedgerEnabled = continuity !== undefined && continuity.ledger !== false;
+  // The in-run requirements ledger: evicted USER messages, oldest-first,
+  // verbatim. `ledgerTruncated` flags that oldest entries were dropped at
+  // the CONTINUITY_LEDGER_MAX_CHARS cap so the rendered block says so.
+  const ledgerEntries: ContinuityLedgerEntry[] = [];
+  let ledgerTruncated = false;
+  // The last rendered plan snapshot (loadPlan at boot, onPlanDirty on a
+  // `plan.dirty` refresh) — also the deterministic handoff's plan field.
+  let lastPlanText: string | null = null;
+  let handoffFired = false;
+
+  /** Fold one evicted user message into the ledger. Dedupe (role, text) —
+   *  a resume seed followed by a live re-eviction of the same replayed
+   *  message must not double an entry — then evict oldest-first past the
+   *  cap. A single over-cap entry is clipped to its newest chars. */
+  const foldLedgerEntry = (entry: ContinuityLedgerEntry): void => {
+    if (ledgerEntries.some((e) => e.role === entry.role && e.text === entry.text)) return;
+    ledgerEntries.push(entry);
+    let total = ledgerEntries.reduce((n, e) => n + e.text.length, 0);
+    while (total > CONTINUITY_LEDGER_MAX_CHARS && ledgerEntries.length > 1) {
+      const dropped = ledgerEntries.shift() as ContinuityLedgerEntry;
+      total -= dropped.text.length;
+      ledgerTruncated = true;
+    }
+    const sole = ledgerEntries[0];
+    if (total > CONTINUITY_LEDGER_MAX_CHARS && ledgerEntries.length === 1 && sole !== undefined) {
+      ledgerEntries[0] = {
+        ...sole,
+        text: sole.text.slice(sole.text.length - CONTINUITY_LEDGER_MAX_CHARS),
+      };
+      ledgerTruncated = true;
+    }
+  };
+  for (const seeded of resumedLedgerSeed) foldLedgerEntry(seeded);
+
+  /**
+   * §2.3 — the eviction chokepoint, called by the compaction ladder with
+   * the messages a step is ABOUT to drop, before the drop commits. Every
+   * text-bearing record is appended verbatim to the session event log as
+   * `context_evicted` (zero model trust — the recall integration comes in a
+   * later PR); user records additionally fold into the in-run ledger for
+   * per-call reinjection.
+   */
+  const externalizeEvicted = async (
+    evicted: ReadonlyArray<Anthropic.MessageParam>,
+  ): Promise<void> => {
+    if (!continuityLedgerEnabled) return;
+    for (const message of evicted) {
+      for (const entry of extractEvictedEntries(message)) {
+        await logEvent("context_evicted", {
+          role: entry.role,
+          text: entry.text,
+          ...(entry.turnNumber !== undefined ? { turnNumber: entry.turnNumber } : {}),
+        });
+        if (entry.role === "user") foldLedgerEntry(entry);
+      }
+    }
+  };
+
+  /** §2.3 — the ledger text handed to the autocompact summarizer as an
+   *  anchor. Evaluated lazily AFTER the current step's evictions folded, so
+   *  the requirements at risk in THIS compaction anchor THIS summary. */
+  const ledgerAnchorText = (): string | undefined => {
+    if (!continuityLedgerEnabled || ledgerEntries.length === 0) return undefined;
+    return ledgerEntries.map((e) => `- ${e.text}`).join("\n");
+  };
+
+  /**
+   * §2.5 — build the volatile tail for one model call. Re-reads the
+   * `plan.dirty` flag from the per-run state-store (set by plan-mutating
+   * tools through the RuntimeBridge) and re-renders the plan via
+   * `onPlanDirty` (falling back to `loadPlan`) when set. The returned
+   * blocks carry NO cache_control — they sit AFTER the cache-marked frozen
+   * prefix, so per-call edits re-tokenize only the tail (the
+   * prompt-cache-manager `volatile` contract).
+   */
+  const buildContinuityTail = async (): Promise<Anthropic.TextBlockParam[]> => {
+    if (continuity === undefined) return [];
+    if (runState.get()[PLAN_DIRTY_STATE_KEY] === true) {
+      try {
+        lastPlanText = await (continuity.onPlanDirty ?? continuity.loadPlan)();
+      } catch (err) {
+        runContext.logger.warn("continuity plan refresh failed", {
+          error: (err as Error).message,
+        });
+      }
+      runState.set({ [PLAN_DIRTY_STATE_KEY]: false });
+    }
+    return renderContinuityTail({
+      plan: lastPlanText,
+      ledger: ledgerEntries,
+      ledgerTruncated,
+    }).map((text) => ({ type: "text" as const, text }));
+  };
+
+  /** §2.8 — the deterministic teardown handoff: fired exactly once, in the
+   *  same finally slot as `memory.onCapture`, with no model calls.
+   *  Best-effort — a handoff failure never turns a clean exit into an
+   *  error. */
+  const maybeHandoff = async (stopReason: HandoffInput["stopReason"]): Promise<void> => {
+    if (continuity?.onHandoff === undefined || handoffFired) return;
+    handoffFired = true;
+    try {
+      await continuity.onHandoff({
+        plan: lastPlanText,
+        ledger: [...ledgerEntries],
+        sessionId,
+        stopReason,
+      });
+    } catch (err) {
+      runContext.logger.warn("continuity handoff failed", { error: (err as Error).message });
+    }
+  };
+
+  // Boot-time plan snapshot. Best-effort: a store failure degrades to no
+  // plan block rather than aborting the run (memory-backend failures
+  // degrade; provider failures halt).
+  if (continuity !== undefined) {
+    try {
+      lastPlanText = await continuity.loadPlan();
+    } catch (err) {
+      runContext.logger.warn("continuity loadPlan failed", { error: (err as Error).message });
+    }
+  }
 
   // Section 11 — `session-start` fires once after the persistence + run
   // context boot is complete. Observational only (no deny/block effect).
@@ -1779,7 +2196,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // last refresh is older than the rotation interval. Skips automatically
   // when the adapter doesn't support explicit caching (OpenAI / Bedrock
   // Llama / Mistral). This keeps long-running CHN/MGD/RES daemons under
-  // Anthropic's 30-day TTL.
+  // Anthropic's 30-day TTL. A caller-supplied `promptCacheLastRotatedAt`
+  // that is still fresh makes `manage()` skip — the run reuses the cached
+  // prefix instead of force-rotating at every boot (§2.5 bookkeeping fix).
   if (adapter.features.caching === "explicit") {
     const cacheManaged = manageCacheMarkers(
       systemBlocks.map((b) => ({
@@ -1800,6 +2219,24 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         text: b.text,
         ...(b.cache_control !== undefined ? { cache_control: b.cache_control } : {}),
       })) as Anthropic.TextBlockParam[];
+      // v0.3.0 §2.5 — surface the rotation so the caller can persist
+      // `rotatedAt` and thread it back next run. The trace event is the
+      // observable half; `onPromptCacheRotated` is the persistence seam
+      // (best-effort — a persist failure never aborts the run).
+      bus.publish({
+        ...bus.envelope(),
+        kind: "cache_rotation",
+        rotatedAt: cacheManaged.rotatedAt,
+      });
+      if (opts.onPromptCacheRotated !== undefined) {
+        try {
+          await opts.onPromptCacheRotated(cacheManaged.rotatedAt);
+        } catch (err) {
+          runContext.logger.warn("prompt-cache rotatedAt persist failed", {
+            error: (err as Error).message,
+          });
+        }
+      }
     }
   }
 
@@ -2212,6 +2649,10 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       maxTokens,
       ...(sessionRootDir !== undefined ? { sessionRootDir } : {}),
       hooks,
+      // v0.3.0 §2.5 — the per-run state-store, so plan-mutating tools can
+      // set PLAN_DIRTY_STATE_KEY and the loop re-renders the plan tail
+      // before the next model call.
+      runState,
       ...(opts.subAgents !== undefined ? { subAgents: opts.subAgents } : {}),
       ...(opts.spawnSubAgent !== undefined ? { spawnSubAgent: opts.spawnSubAgent } : {}),
       ...(opts.crewMailbox !== undefined ? { crewMailbox: opts.crewMailbox } : {}),
@@ -2712,13 +3153,22 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             // Item 22 — the failover chain rewrites `model` per serving
             // candidate internally; the planned id here is the single-adapter
             // value and the chain's best-effort prediction otherwise.
+            // v0.3.0 §2.5 — the volatile continuity tail is rebuilt for
+            // EVERY model call and appended AFTER the frozen cache-marked
+            // prefix, so a plan/ledger edit re-tokenizes only the tail.
+            // `[]` when the seam is absent — the request payload is then
+            // byte-identical to a pre-0.3.0 runtime.
+            const continuityTail = await buildContinuityTail();
             const reqStream = turnAdapter.stream({
               model: reqWireModelId,
-              system: systemBlocks.map((b) => ({
-                type: "text" as const,
-                text: b.text,
-                ...(b.cache_control !== undefined ? { cache_control: b.cache_control } : {}),
-              })),
+              system: [
+                ...systemBlocks.map((b) => ({
+                  type: "text" as const,
+                  text: b.text,
+                  ...(b.cache_control !== undefined ? { cache_control: b.cache_control } : {}),
+                })),
+                ...continuityTail.map((b) => ({ type: "text" as const, text: b.text })),
+              ],
               messages: messages as Parameters<ProviderAdapter["stream"]>[0]["messages"],
               tools:
                 anthropicTools !== undefined
@@ -3091,10 +3541,38 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           bus.publish({
             ...bus.envelope(),
             kind: "error_recovered",
+            // v0.3.0 Goal 6 — `halt` is published first-class now that the
+            // action union carries it (PR 1 mapped it to "fail" as a
+            // stopgap). alert-watchdog and the SLO monitor count BOTH
+            // `fail` and `halt` as unrecovered, so terminal-failure
+            // accounting is unchanged.
             action: action.kind,
             errorName: state.error.name,
             depth: recovery.retryCount + recovery.compactCount + recovery.continueCount,
           });
+          // v0.3.0 Goal 6 — one structured report on every terminal path,
+          // published to the bus AND appended to the session event log
+          // BEFORE the throw (a throw is invisible to structured
+          // consumers; the event is what the UI host, printers, exporters,
+          // and incident capture render). Non-terminal actions publish
+          // nothing here.
+          const publishRunFailed = async (report: FailureReport): Promise<void> => {
+            const failureMessage = `${report.title}: ${report.detail}`;
+            bus.publish({
+              ...bus.envelope(),
+              kind: "run_failed",
+              class: report.class,
+              message: failureMessage,
+              ...(report.remediation !== undefined ? { remediation: report.remediation } : {}),
+              exitCode: report.exitCode,
+            });
+            await logEvent("run_failed", {
+              class: report.class,
+              message: failureMessage,
+              ...(report.remediation !== undefined ? { remediation: report.remediation } : {}),
+              exitCode: report.exitCode,
+            });
+          };
           switch (action.kind) {
             case "compact": {
               const before = messages.length;
@@ -3108,13 +3586,22 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 snipKeepHead,
                 snipKeepTail,
                 logger: runContext.logger,
+                onEvict: externalizeEvicted,
+                getLedgerText: ledgerAnchorText,
               }).finally(() => out.spinner.stop());
+              // §2.3 — persist the summary text alongside the counts (the
+              // reactive path always ends in autocompact's [marker, summary]).
+              const reactiveSummary =
+                compacted.length === 2 && typeof compacted[1]?.content === "string"
+                  ? compacted[1].content
+                  : undefined;
               messages.length = 0;
               messages.push(...compacted);
               await logEvent("compaction", {
                 kind: "reactive",
                 before,
                 after: messages.length,
+                ...(reactiveSummary !== undefined ? { summary: reactiveSummary } : {}),
               });
               bus.publish({
                 ...bus.envelope(),
@@ -3208,8 +3695,31 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               state = transition(state, { kind: "RecoveryDone" });
               break;
             }
-            case "fail":
+            case "fail": {
+              // Generic terminal fail — synthesize a best-effort report
+              // (class "unknown", exit 1) so even the unclassified path
+              // leaves a structured `run_failed` behind, then throw the
+              // byte-identical pre-0.3.0 RuntimeError (die()'s one-liner
+              // for non-RunFailedError CrewhausErrors is unchanged).
+              await publishRunFailed({
+                class: "unknown",
+                title: "recovery failed",
+                detail: action.reason,
+                exitCode: EXIT_CODES.generic,
+              });
               throw new RuntimeError(`recovery failed: ${action.reason}`);
+            }
+            case "halt":
+              // v0.3.0 Goal 6 — classified terminal stop (billing / auth /
+              // rate-limit exhaustion / hinted taxonomy entries). The report
+              // carries title, raw provider text, remediation, and the coded
+              // exit status; RunFailedError extends RuntimeError so existing
+              // CrewhausError catch sites (e.g. `crewhaus run`'s die())
+              // still work. Every terminal surface renders the SAME report:
+              // die() and the bundle catch-wrappers print formatRunFailure()
+              // and exit with report.exitCode.
+              await publishRunFailed(action.report);
+              throw new RunFailedError(action.report, lastErrorForRecovery);
           }
           break;
         }
@@ -3272,6 +3782,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           snipKeepHead,
           snipKeepTail,
           logger: runContext.logger,
+          onEvict: externalizeEvicted,
+          getLedgerText: ledgerAnchorText,
         },
         async (info) => {
           await logEvent("compaction", info);
@@ -3312,6 +3824,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         reason: "complete",
       });
       await maybeAutoCapture();
+      // §2.8 — deterministic handoff, same teardown slot as onCapture.
+      await maybeHandoff("complete");
       await subscribers.flushAll();
       await subscribers.shutdownAll();
       costPersistUnsubscribe?.();
@@ -3498,6 +4012,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           snipKeepHead,
           snipKeepTail,
           logger: runContext.logger,
+          onEvict: externalizeEvicted,
+          getLedgerText: ledgerAnchorText,
         },
         async (info) => {
           await logEvent("compaction", info);
@@ -3545,6 +4061,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       reason: runAbort.signal.aborted ? "abort" : "exit",
     });
     await maybeAutoCapture();
+    // §2.8 — deterministic handoff, same teardown slot as onCapture.
+    await maybeHandoff(runAbort.signal.aborted ? "abort" : "exit");
     await subscribers.flushAll();
     await subscribers.shutdownAll();
     costPersistUnsubscribe?.();
@@ -3595,6 +4113,11 @@ type CompactionInfo = {
   readonly kind: "snip" | "autocompact";
   readonly before: number;
   readonly after: number;
+  /** v0.3.0 §2.3 — the verbatim autocompact summary TEXT that replaced the
+   *  history (additive; absent on snip steps), persisted into the
+   *  `compaction` event-log payload so post-mortems can check WHAT the
+   *  summary claimed survived — counts alone said nothing. */
+  readonly summary?: string;
 };
 
 type CompactArgs = {
@@ -3606,9 +4129,36 @@ type CompactArgs = {
   snipKeepHead: number;
   snipKeepTail: number;
   logger: RunContext["logger"];
+  /** v0.3.0 §2.3 — invoked with the messages a step is about to drop,
+   *  BEFORE the drop commits (and, for autocompact, before the summarizer
+   *  model call — so the externalization survives even a summarizer
+   *  failure). Absent → no externalization (pre-0.3.0 behavior). */
+  onEvict?: (evicted: ReadonlyArray<Anthropic.MessageParam>) => Promise<void>;
+  /** v0.3.0 §2.3 — lazily-rendered requirements-ledger text used to anchor
+   *  the autocompact summarizer. Read AFTER `onEvict` folded this step's
+   *  evictions, so the requirements at risk in THIS compaction anchor THIS
+   *  summary. `undefined` keeps the summarizer prompt byte-identical. */
+  getLedgerText?: () => string | undefined;
 };
 
 type OnCompaction = (info: CompactionInfo) => Promise<void>;
+
+/** The messages `snip` dropped: input entries absent (by reference — snip
+ *  copies references) from the output. The inserted marker is a fresh
+ *  object, so it never shows up as "kept". */
+function snippedAway(
+  before: ReadonlyArray<Anthropic.MessageParam>,
+  after: ReadonlyArray<Anthropic.MessageParam>,
+): Anthropic.MessageParam[] {
+  const kept = new Set<Anthropic.MessageParam>(after);
+  return before.filter((m) => !kept.has(m));
+}
+
+/** Extract the summary text out of autoCompact's `[marker, summary]` tuple. */
+function summaryTextOf(tuple: ReadonlyArray<Anthropic.MessageParam>): string | undefined {
+  const summary = tuple[1];
+  return summary !== undefined && typeof summary.content === "string" ? summary.content : undefined;
+}
 
 /**
  * Pre-turn compaction ladder: estimate → snip → re-estimate → autocompact.
@@ -3630,6 +4180,8 @@ async function maybeCompact(
     snipKeepHead,
     snipKeepTail,
     logger,
+    onEvict,
+    getLedgerText,
   } = args;
 
   const initialBudget = new TokenBudget(contextLimit);
@@ -3639,6 +4191,11 @@ async function maybeCompact(
   }
 
   const snipped = snip(messages, snipKeepHead, snipKeepTail);
+  // §2.3 — externalize what snip is about to drop BEFORE the drop commits.
+  if (onEvict !== undefined) {
+    const evicted = snippedAway(messages, snipped);
+    if (evicted.length > 0) await onEvict(evicted);
+  }
   logger.info("snip applied", { before: messages.length, after: snipped.length });
   if (onCompaction !== undefined) {
     await onCompaction({ kind: "snip", before: messages.length, after: snipped.length });
@@ -3651,9 +4208,26 @@ async function maybeCompact(
   }
 
   logger.info("autocompact triggered", { tokensAfterSnip: postSnipBudget.used });
-  const after = await autoCompact(snipped, adapter, model);
+  // §2.3 — autocompact replaces the ENTIRE history; externalize all of it
+  // before the summarizer model call so the records survive even a
+  // summarizer failure. The ledger anchor is read afterwards so this
+  // step's evictions are part of it.
+  if (onEvict !== undefined && snipped.length > 0) await onEvict(snipped);
+  const ledgerText = getLedgerText?.();
+  const after = await autoCompact(
+    snipped,
+    adapter,
+    model,
+    ledgerText !== undefined ? { ledgerText } : {},
+  );
   if (onCompaction !== undefined) {
-    await onCompaction({ kind: "autocompact", before: snipped.length, after: after.length });
+    const summary = summaryTextOf(after);
+    await onCompaction({
+      kind: "autocompact",
+      before: snipped.length,
+      after: after.length,
+      ...(summary !== undefined ? { summary } : {}),
+    });
   }
   return after;
 }
@@ -3665,6 +4239,10 @@ type ForceCompactArgs = {
   snipKeepHead: number;
   snipKeepTail: number;
   logger: RunContext["logger"];
+  /** See CompactArgs.onEvict — same contract on the reactive path. */
+  onEvict?: (evicted: ReadonlyArray<Anthropic.MessageParam>) => Promise<void>;
+  /** See CompactArgs.getLedgerText. */
+  getLedgerText?: () => string | undefined;
 };
 
 /**
@@ -3674,8 +4252,18 @@ type ForceCompactArgs = {
  * largest blob).
  */
 async function forceCompact(args: ForceCompactArgs): Promise<Anthropic.MessageParam[]> {
-  const { messages, adapter, model, snipKeepHead, snipKeepTail, logger } = args;
+  const { messages, adapter, model, snipKeepHead, snipKeepTail, logger, onEvict, getLedgerText } =
+    args;
   const snipped = snip(messages, snipKeepHead, snipKeepTail);
+  // §2.3 — same externalize-before-drop contract as the pre-turn ladder:
+  // the snip diff first, then the full remaining history autocompact is
+  // about to replace (disjoint sets, so no record is written twice).
+  if (onEvict !== undefined) {
+    const evicted = snippedAway(messages, snipped);
+    if (evicted.length > 0) await onEvict(evicted);
+  }
   logger.info("reactive snip applied", { before: messages.length, after: snipped.length });
-  return await autoCompact(snipped, adapter, model);
+  if (onEvict !== undefined && snipped.length > 0) await onEvict(snipped);
+  const ledgerText = getLedgerText?.();
+  return await autoCompact(snipped, adapter, model, ledgerText !== undefined ? { ledgerText } : {});
 }
