@@ -4,9 +4,22 @@
  * each skill's body on first invocation.
  *
  * Discovery order (later entries override earlier by `name`):
+ *   0. builtin skills (`opts.builtinSkills`) — shipped defaults, lowest precedence
  *   1. `~/.crewhaus/skills/<name>/SKILL.md`
  *   2. `<cwd>/.crewhaus/skills/<name>/SKILL.md`
  *   3. plugin-bundled directories (`opts.pluginDirs`)
+ *
+ * Builtins are pre-parsed refs (typically `@crewhaus/default-skills`), not a
+ * directory walk: a compiled bundle embeds their bodies as string constants,
+ * so at deploy time there may be no SKILL.md on disk at all. A builtin given
+ * as a `LoadedSkill` (body in memory) is served from memory by
+ * `loadSkillBody`; a builtin given as a bare `SkillRef` reads its `filePath`
+ * like any discovered skill. Either way the body goes through the same
+ * `"skill"`-origin boundary classification — shipped text gets no trust
+ * shortcut. Because builtins seed the name map FIRST, a user
+ * (`~/.crewhaus/skills`) or project (`.crewhaus/skills`) skill with the same
+ * `name` overrides them wholesale — an override with an empty body
+ * effectively disables a builtin.
  *
  * The lazy-load contract: `discoverSkills()` reads each file once just to
  * pull the frontmatter and stash the absolute path; the body stays on disk.
@@ -89,6 +102,15 @@ export type DiscoverSkillsOptions = {
   readonly cwd?: string;
   readonly homeDir?: string;
   readonly pluginDirs?: ReadonlyArray<string>;
+  /**
+   * Shipped default skills, merged at LOWEST precedence: any user, project,
+   * or plugin skill with the same `name` overrides a builtin wholesale.
+   * Entries may be `LoadedSkill`s (body carried in memory — the
+   * compiled-bundle embedding case) or bare `SkillRef`s (body read from
+   * `filePath` on demand). Builtin frontmatter and bodies flow through the
+   * same `"skill"`-origin classification as every other skill.
+   */
+  readonly builtinSkills?: ReadonlyArray<SkillRef | LoadedSkill>;
 };
 
 export class SkillParseError extends CrewhausError {
@@ -197,9 +219,10 @@ function findFrontmatterEnd(content: string): number {
 
 /**
  * Walk every skill discovery root and return one `SkillRef` per `<dir>/SKILL.md`.
- * Project-level entries overwrite user-level entries by `name`; plugin-bundled
- * entries overwrite both. The body of each file is left on disk; only
- * frontmatter is parsed here.
+ * Builtins (`opts.builtinSkills`) seed the map at lowest precedence;
+ * user-level entries overwrite them, project-level entries overwrite
+ * user-level, and plugin-bundled entries overwrite all — always by `name`.
+ * The body of each file is left on disk; only frontmatter is parsed here.
  */
 export async function discoverSkills(opts: DiscoverSkillsOptions = {}): Promise<SkillRef[]> {
   const cwd = opts.cwd ?? process.cwd();
@@ -213,6 +236,12 @@ export async function discoverSkills(opts: DiscoverSkillsOptions = {}): Promise<
     if (existsSync(dir)) roots.push(dir);
   }
   const byName = new Map<string, SkillRef>();
+  // Builtins first: every later root wins by `name`, which is exactly the
+  // "users can clear these" story — a project/user SKILL.md with a builtin's
+  // name (even an empty-bodied one) replaces the shipped default.
+  for (const ref of opts.builtinSkills ?? []) {
+    byName.set(ref.name, ref);
+  }
   for (const root of roots) {
     for (const ref of readSkillsUnder(root)) {
       byName.set(ref.name, ref);
@@ -269,8 +298,11 @@ function readSkillsUnder(root: string): SkillRef[] {
 }
 
 /**
- * Read the full body of a skill from disk. Called only when the model
- * invokes `Skill({ name })` — the lazy-load contract.
+ * Read the full body of a skill from disk — or serve it from memory when the
+ * ref is a `LoadedSkill` (builtins embedded in a compiled bundle carry their
+ * body as a string constant; there may be no file at `filePath` at all).
+ * Called only when the model invokes `Skill({ name })` — the lazy-load
+ * contract.
  *
  * Pillar 3 boundary site — a plugin-installed or attacker-planted
  * SKILL.md on disk is externally-controlled content. Classify the body
@@ -290,8 +322,14 @@ function readSkillsUnder(root: string): SkillRef[] {
  * `loadSkillBody(ref)` in a test) still get classification, just no tag.
  */
 export async function loadSkillBody(ref: SkillRef, ctx?: RunContext): Promise<string> {
-  const raw = readFileSync(ref.filePath, "utf8");
-  const { body } = parseSkillFile(raw);
+  // An in-memory body (LoadedSkill — the builtin/embedded case) short-circuits
+  // the disk read but NOT the classification below: shipped skill text is
+  // still `"skill"`-origin content, same as anything found on disk.
+  const inMemory = (ref as Partial<LoadedSkill>).body;
+  const body =
+    typeof inMemory === "string"
+      ? inMemory
+      : parseSkillFile(readFileSync(ref.filePath, "utf8")).body;
   const boundary = await classifyBoundary(body, { origin: "skill" });
   if (boundary.action === "redact" && boundary.redacted !== undefined) {
     // Malicious — the raw body never reaches the model, so there is nothing

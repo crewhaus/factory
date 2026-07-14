@@ -564,6 +564,19 @@
         "@crewhaus/eval-dataset": "workspace:*",
       },
     },
+    "packages/default-skills": {
+      "name": "@crewhaus/default-skills",
+      "version": "0.2.4",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/skills-registry": "workspace:*",
+        "@crewhaus/slash-commands": "workspace:*",
+      },
+      "devDependencies": {
+        "@crewhaus/boundary-classifier": "workspace:*",
+        "@crewhaus/run-context": "workspace:*",
+      },
+    },
     "packages/deployment-controller": {
       "name": "@crewhaus/deployment-controller",
       "version": "0.2.4",
@@ -2295,6 +2308,8 @@
     "@crewhaus/data-retention-engine": ["@crewhaus/data-retention-engine@workspace:packages/data-retention-engine"],
 
     "@crewhaus/dataset-registry": ["@crewhaus/dataset-registry@workspace:packages/dataset-registry"],
+
+    "@crewhaus/default-skills": ["@crewhaus/default-skills@workspace:packages/default-skills"],
 
     "@crewhaus/deployment-controller": ["@crewhaus/deployment-controller@workspace:packages/deployment-controller"],
 
