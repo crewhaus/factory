@@ -161,14 +161,18 @@ export type EventKind =
   // route explain <session>`. Non-conversational, so `replayMessageHistory`
   // ignores it and `--resume` is unaffected.
   | "model_route"
-  // 0.3.0 memory release (design §9) — one line per wiki mutation (payload
-  // `WikiWriteEventPayload`), emitted by @crewhaus/tool-wiki through its
-  // injected append seam (the emitter / memory-service composition root
-  // decides where it lands). Non-conversational, so `replayMessageHistory`
-  // ignores it and `--resume` is unaffected; readers written before this
-  // kind existed keep parsing. Additive — kept on its own line so the
-  // parallel 0.3.0 branches (plan_update/goal_update/action_proof,
-  // run_failed) merge trivially.
+  // v0.3.0 continuity (design §2.4) — `plan_update` / `goal_update` /
+  // `action_proof` appended by `@crewhaus/tool-plan`; v0.3.0 memory (design §9)
+  // — `wiki_write` appended by `@crewhaus/tool-wiki`. Both through injected
+  // append seams (the tool packages stay decoupled from runtime wiring). All
+  // non-conversational: `replayMessageHistory` ignores them and readers written
+  // before these kinds existed keep parsing. Each kind sits on its own line so
+  // the parallel 0.3.0 branches merge trivially. Payload shapes are exported
+  // below (`PlanUpdateEventPayload` / `GoalUpdateEventPayload` /
+  // `ActionProofEventPayload` / `WikiWriteEventPayload`).
+  | "plan_update"
+  | "goal_update"
+  | "action_proof"
   | "wiki_write";
 
 /**
@@ -291,3 +295,39 @@ async function* readEvents(
     stream.close();
   }
 }
+
+// ---- v0.3.0 continuity event payloads (design §2.4, PR 7) ----
+// Additive exports only: writers are `@crewhaus/tool-plan`'s injected append
+// seam; readers that predate these kinds skip them by convention.
+
+/** Payload of a `plan_update` event — one plan mutation (creation, a new
+ *  step, a ladder-status move up to `claimed`, the active-plan pointer, or
+ *  the machine-checked `prove_step` transition recorded alongside its
+ *  `action_proof` events). */
+export type PlanUpdateEventPayload = {
+  readonly planId: string;
+  readonly action: "create" | "add_step" | "set_step_status" | "set_active" | "prove_step";
+  readonly step?: number;
+  readonly status?: string;
+  readonly title?: string;
+};
+
+/** Payload of a `goal_update` event — one goal creation or mutation. */
+export type GoalUpdateEventPayload = {
+  readonly goalId: string;
+  readonly action: "create" | "update";
+  readonly status?: string;
+  readonly title?: string;
+};
+
+/** Payload of an `action_proof` event — one evidence reference checked
+ *  during a `proven` transition. `verified` means the cited `tool_use` /
+ *  `tool_result` pair resolved in a session log (parent or child) with
+ *  `isError` false; `missing` and `error_result` record rejected attempts so
+ *  the audit trail shows proof pressure, not just successes. */
+export type ActionProofEventPayload = {
+  readonly planId: string;
+  readonly step: number;
+  readonly toolUseId: string;
+  readonly verdict: "verified" | "missing" | "error_result";
+};

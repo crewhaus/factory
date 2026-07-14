@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **v0.3.0 continuity substrate (Goal 1, PR 7): `@crewhaus/continuity-store` +
+  `@crewhaus/tool-plan`.** Two new packages carrying the memory release's
+  focus/plans/goals layer — packages only; runtime/compiler/CLI wiring follows
+  in the later PRs of the train.
+  - `continuity-store`: human-readable artifacts under
+    `.crewhaus/state/<spec>/` — marker-gated `focus.md` (capped body + the
+    verbatim `REQ-nnn` requirements ledger + active-plan pointer),
+    `plans/plan-NNNN-<slug>.md` (YAML frontmatter + numbered steps),
+    `goals.yaml`, and a deterministic `handoff.md` render (no model calls).
+    The `open → in_progress → claimed → proven` proof ladder is
+    machine-checked: `proven` requires `toolUseId` evidence resolved against
+    session event logs (sub-agent child sessions included via the
+    `sub_agent_start` brackets); proven transitions pin cited sessions in
+    `.crewhaus/retention.json` and freeze `{toolName, inputHash,
+    resultDigest}` excerpts so evidence outlives the transcript TTL. Clearing
+    goes through `.crewhaus/trash/<ts>/` with restore — never a hard delete
+    (`moveToTrash` is exported for other stores to adopt). Writes are
+    tmp+rename atomic under an advisory `.lock` (wait 2s → steal stale >30s
+    with a warning → fail naming the holder pid). Session-scoped stores and
+    fail-closed tenant path fencing follow the session-store rules.
+  - `tool-plan`: the tool surface — `FocusRead`/`FocusWrite`, `PlanRead`/
+    `PlanUpdate`/`PlanComplete`, `GoalWrite`/`GoalUpdate`/`GoalList`, and
+    `MemoryClear` (destructive + `requireJustification`). `PlanComplete` is
+    the proven transition and rejects unverifiable citations with an
+    instructive error. Mutations emit the new additive event kinds
+    `plan_update` / `goal_update` / `action_proof` through an injected
+    `appendEvent` seam (no runtime-core dependency).
+  - `event-log`: additive `plan_update`, `goal_update`, `action_proof` kinds +
+    exported payload types (readers skip unknown kinds by design).
+  - Docs-repo module briefs (292+) for the new packages are a follow-up in the
+    docs repository.
 - **memory-store v2 — explicit forgetting, provenance, and hybrid recall**
   (0.3.0 memory release, design §3.4). Memory entries gain additive JSONL
   fields: `schemaVersion` (2 on new writes; absent = v1, read lazily),
