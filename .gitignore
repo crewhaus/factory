@@ -158,3 +158,6 @@ reference-repos/
 
 # crewhaus runtime artifacts (sessions, transcripts, persisted tool results)
 .crewhaus/
+
+# Local agent/git worktrees (never track these)
+.claude/worktrees/
