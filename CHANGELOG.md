@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **`$0` cost and `0` tokens on an unpriced model.** `cost-tracker` used to
+  early-return on a pricing-table miss and publish nothing, so a
+  `model_response` for a model with no pricing row emitted no `cost_accrual` at
+  all. Because the studio cost tile accrues both dollars AND tokens from
+  `cost_accrual`, a single unpriced call zeroed the whole tile. `cost-tracker`
+  now still publishes a `cost_accrual` on a miss — carrying `costUsdMicros: 0`
+  (there is no rate to charge) and the REAL `inputTokens` / `outputTokens` /
+  cache token counts, flagged with a new optional `unpriced: true` on
+  `CostAccrualEvent` so consumers can tell "genuinely free" from "not priced".
+  The token tally now survives an unpriced model, and this is exactly the shape
+  `runtime-core`'s alert-watchdog already scanned for
+  (`costUsdMicros === 0 && inputTokens + outputTokens > 0`) — its pricing-miss
+  detector now actually fires, where before nothing emitted that event.
+  Priced responses are unchanged (byte-identical accrual, `observed()` still
+  counts only priced calls).
+- **Pricing / capability / sunset tables refreshed to the current model
+  families (2026-07-14).** The tables topped out at `claude-opus-4-7` /
+  `claude-sonnet-4-6`, so `claude-opus-4-8`, `claude-sonnet-5`,
+  `claude-fable-5` (and their Bedrock forms) either missed outright or resolved
+  at a stale family-base rate. Added rows for the current Anthropic models
+  (Opus 4.8 $5/$25, Sonnet 5 $3/$15, Haiku 4.5 $1/$5, Fable 5 $10/$50, per the
+  Anthropic pricing reference), bumped OpenAI (`gpt-5.1`) and Google
+  (`gemini-3-pro`) to current families, and added bare-family fallback rows
+  (`claude-opus` / `claude-sonnet` / `claude-haiku` / `claude-fable`) so a
+  future next-major id resolves at the current rate instead of silently
+  missing. `DEFAULT_CAPABILITIES` and `KNOWN_SUNSETS` were updated in lockstep;
+  the table `version` is now `2026-07-14`. Existing rows (including the legacy
+  `claude-opus-4-7`/`4-6` $15/$75 lineage) are preserved for historical
+  re-aggregation.
+
 ## [0.3.0] - 2026-07-14
 
 v0.3.0 — **the memory release**: every agent-loop harness now remembers.

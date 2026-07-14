@@ -160,26 +160,39 @@ export function createCostTracker(bus: TraceEventBus, opts: CostTrackerOptions =
     if (event.kind !== "model_response") return;
     const resp = event as ModelResponseEvent;
     const provider: ProviderId = resp.provider ?? "anthropic";
-    // `resp.model` is the WIRE model id (runtime-core strips the spec
-    // grammar before publishing) — the form the pricing table is keyed on.
-    const row = resolvePricing(pricing, provider, resp.model);
-    if (!row) {
-      pricingMisses++;
-      return;
-    }
-    observed++;
     const inputTokens = resp.usage.input;
     const outputTokens = resp.usage.output;
     const cachedReadTokens = resp.usage.cacheRead ?? 0;
     const cacheCreationTokens = resp.usage.cacheCreate ?? 0;
-    const costUsdMicros = computeCostMicros(
-      row,
-      inputTokens,
-      outputTokens,
-      cachedReadTokens,
-      cacheCreationTokens,
-    );
-    recordCost(resp.runId, provider, costUsdMicros, tenantId);
+    // `resp.model` is the WIRE model id (runtime-core strips the spec
+    // grammar before publishing) — the form the pricing table is keyed on.
+    const row = resolvePricing(pricing, provider, resp.model);
+    // F1 — on a pricing MISS we no longer early-return silently. We still
+    // count the miss and charge nothing (there is no rate to charge), but we
+    // DO publish a `cost_accrual` carrying costUsdMicros:0 and the REAL token
+    // counts, flagged `unpriced`. Two reasons: (1) a downstream token tally
+    // (the studio cost tile) survives an unpriced model instead of zeroing,
+    // and (2) this is exactly the shape `runtime-core`'s alert-watchdog looks
+    // for (`costUsdMicros === 0 && inputTokens + outputTokens > 0`) to flag a
+    // pricing miss — nothing emitted that shape before. Priced responses are
+    // byte-identical to before: they never carry `unpriced`, `observed`
+    // still counts only priced calls, and only they touch `recordCost`.
+    let costUsdMicros = 0;
+    let unpriced = false;
+    if (row) {
+      observed++;
+      costUsdMicros = computeCostMicros(
+        row,
+        inputTokens,
+        outputTokens,
+        cachedReadTokens,
+        cacheCreationTokens,
+      );
+      recordCost(resp.runId, provider, costUsdMicros, tenantId);
+    } else {
+      pricingMisses++;
+      unpriced = true;
+    }
     if (!suppressEvents) {
       const accrual: CostAccrualEvent = {
         ...bus.envelope(),
@@ -192,6 +205,7 @@ export function createCostTracker(bus: TraceEventBus, opts: CostTrackerOptions =
         cachedReadTokens,
         cacheCreationTokens,
         costUsdMicros,
+        ...(unpriced ? { unpriced: true } : {}),
         ...(tenantId !== undefined ? { tenantId } : {}),
       };
       bus.publish(accrual);

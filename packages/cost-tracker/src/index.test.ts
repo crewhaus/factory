@@ -279,7 +279,7 @@ describe("cost-tracker — T3 trace bus integration", () => {
     expect(accruals[0]?.costUsdMicros).toBe(5_700);
   });
 
-  test("missing pricing → no accrual event, pricingMisses counter increments", () => {
+  test("F1 — pricing MISS now publishes a $0 cost_accrual carrying the real tokens (unpriced)", () => {
     const bus = makeBus();
     const accruals: CostAccrualEvent[] = [];
     bus.subscribe((e) => {
@@ -293,14 +293,131 @@ describe("cost-tracker — T3 trace bus integration", () => {
         inputTokens: 10,
         outputTokens: 10,
         // Cache traffic on an unmapped model must not change the contract:
-        // miss counter increments, nothing is charged, nothing throws.
+        // miss counter increments, nothing is charged, nothing throws — but
+        // (F1) an accrual IS now published so a downstream token tally and the
+        // alert-watchdog's pricing-miss detector both see the event.
         cacheRead: 100,
         cacheCreate: 50,
       }),
     );
-    expect(accruals.length).toBe(0);
-    expect(tracker.observed()).toBe(0);
+    // Previously this published nothing; now it publishes exactly one accrual.
+    expect(accruals.length).toBe(1);
+    const a = accruals[0];
+    expect(a?.costUsdMicros).toBe(0);
+    expect(a?.unpriced).toBe(true);
+    // The REAL usage rides along so the token tile survives the unpriced model.
+    expect(a?.inputTokens).toBe(10);
+    expect(a?.outputTokens).toBe(10);
+    expect(a?.cachedReadTokens).toBe(100);
+    expect(a?.cacheCreationTokens).toBe(50);
+    expect(a?.modelId).toBe("fictional-model-99");
+    // Miss counter still increments; a miss is not a priced "observed" call;
+    // and it contributes $0 to the run total.
     expect(tracker.pricingMisses()).toBe(1);
+    expect(tracker.observed()).toBe(0);
+    expect(tracker.getRunCost(RUN_ID).totalUsdMicros).toBe(0);
+    // This is exactly the watchdog's pricing-miss signal.
+    expect(a?.costUsdMicros === 0 && (a?.inputTokens ?? 0) + (a?.outputTokens ?? 0) > 0).toBe(true);
+  });
+
+  test("F1 — suppressEvents still emits nothing on a miss, but the miss counter increments", () => {
+    const bus = makeBus();
+    const accruals: CostAccrualEvent[] = [];
+    bus.subscribe((e) => {
+      if (e.kind === "cost_accrual") accruals.push(e);
+    });
+    const tracker = createCostTracker(bus, { suppressEvents: true });
+    bus.publish(
+      modelResponse(bus, {
+        model: "fictional-model-99",
+        provider: "openai",
+        inputTokens: 10,
+        outputTokens: 10,
+      }),
+    );
+    expect(accruals.length).toBe(0);
+    expect(tracker.pricingMisses()).toBe(1);
+  });
+
+  test("F2 — current model ids resolve to a priced row (not a miss) and never carry unpriced", () => {
+    const bus = makeBus();
+    const accruals: CostAccrualEvent[] = [];
+    bus.subscribe((e) => {
+      if (e.kind === "cost_accrual") accruals.push(e);
+    });
+    const tracker = createCostTracker(bus);
+    // The four current families that previously missed or resolved stale.
+    const current: ReadonlyArray<{ model: string; input: number; output: number; micros: number }> =
+      [
+        // opus-4-8 @ $5/$25: 1000×5 + 500×25 = 17_500
+        { model: "claude-opus-4-8", input: 1000, output: 500, micros: 17_500 },
+        // sonnet-5 @ $3/$15: 1000×3 + 500×15 = 10_500
+        { model: "claude-sonnet-5", input: 1000, output: 500, micros: 10_500 },
+        // haiku-4-5 @ $1/$5: 1000×1 + 500×5 = 3_500
+        { model: "claude-haiku-4-5", input: 1000, output: 500, micros: 3_500 },
+        // fable-5 @ $10/$50: 1000×10 + 500×50 = 35_000
+        { model: "claude-fable-5", input: 1000, output: 500, micros: 35_000 },
+      ];
+    for (const c of current) {
+      const row = resolvePricing(DEFAULT_PRICING, "anthropic", c.model);
+      expect(row).toBeDefined();
+      bus.publish(
+        modelResponse(bus, {
+          model: c.model,
+          provider: "anthropic",
+          inputTokens: c.input,
+          outputTokens: c.output,
+        }),
+      );
+    }
+    expect(tracker.pricingMisses()).toBe(0);
+    expect(tracker.observed()).toBe(current.length);
+    expect(accruals.length).toBe(current.length);
+    for (let i = 0; i < current.length; i++) {
+      expect(accruals[i]?.costUsdMicros).toBe(current[i]?.micros);
+      // Priced accruals never carry the unpriced flag.
+      expect(accruals[i]?.unpriced).toBeUndefined();
+    }
+  });
+
+  test("F2 — bare-family fallbacks catch a hypothetical next-major id at the current rate", () => {
+    // No claude-opus-5-x row exists; the `claude-opus` fallback ($5/$25)
+    // resolves it instead of missing.
+    const row = resolvePricing(DEFAULT_PRICING, "anthropic", "claude-opus-5-0");
+    expect(row?.inputPer1M).toBe(5.0);
+    expect(row?.outputPer1M).toBe(25.0);
+    // Longest-prefix still wins for today's ids: opus-4-8 keeps its own row.
+    expect(resolvePricing(DEFAULT_PRICING, "anthropic", "claude-opus-4-8")?.inputPer1M).toBe(5.0);
+  });
+
+  test("F1 regression — a stable-priced model still accrues byte-identically (no unpriced key)", () => {
+    const bus = makeBus();
+    const accruals: CostAccrualEvent[] = [];
+    bus.subscribe((e) => {
+      if (e.kind === "cost_accrual") accruals.push(e);
+    });
+    const tracker = createCostTracker(bus);
+    // haiku-4-5 price is unchanged by F2 ($1/$5): 1000×1 + 100×5 + cache.
+    bus.publish(
+      modelResponse(bus, {
+        model: "claude-haiku-4-5",
+        provider: "anthropic",
+        inputTokens: 1000,
+        outputTokens: 100,
+        cacheRead: 4000,
+        cacheCreate: 2000,
+      }),
+    );
+    const a = accruals[0];
+    // 1000×1 + 100×5 + 4000×0.1 + 2000×1.25 = 1000+500+400+2500 = 4_400
+    expect(a?.costUsdMicros).toBe(4_400);
+    expect(a?.cachedReadTokens).toBe(4000);
+    expect(a?.cacheCreationTokens).toBe(2000);
+    expect(a?.unpriced).toBeUndefined();
+    expect("unpriced" in (a ?? {})).toBe(false);
+    expect(tracker.observed()).toBe(1);
+    expect(tracker.pricingMisses()).toBe(0);
+    expect(tracker.getRunCost(RUN_ID).totalUsdMicros).toBe(4_400);
   });
 
   test("tenantId stamps cost_accrual events and per-tenant aggregation", () => {
