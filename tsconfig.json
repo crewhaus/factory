@@ -177,6 +177,7 @@
     { "path": "./packages/crew-orchestrator" },
     { "path": "./packages/event-log" },
     { "path": "./packages/idempotency-keys" },
+    { "path": "./packages/memory-service" },
     { "path": "./packages/memory-store" },
     { "path": "./packages/wiki-store" },
     { "path": "./packages/planner" },

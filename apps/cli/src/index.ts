@@ -68,13 +68,10 @@ import {
 import { GENERATED_README_MARKER, type IrBudget } from "@crewhaus/ir";
 import { createLogger } from "@crewhaus/logging";
 import { McpHost, resolveMcpServerConfig } from "@crewhaus/mcp-host";
-import {
-  captureFacts,
-  createMemoryStore,
-  deriveMemoryDecision,
-  summarizeDurableFactsWithEvidence,
-  turnsFromEvents,
-} from "@crewhaus/memory-store";
+// PR 10 — the memory fabric's composition root: `crewhaus run` makes the
+// same one stable wireMemory call compiled bundles emit.
+import { memoryFragmentFromIr, wireMemory } from "@crewhaus/memory-service";
+import { createMemoryStore } from "@crewhaus/memory-store";
 import {
   BUILTIN_DEFAULT_RULES,
   type JustificationJudge,
@@ -98,7 +95,6 @@ import type { RegistryAdapter } from "@crewhaus/spec-registry";
 import { spawnSubAgent } from "@crewhaus/sub-agent-spawner";
 import { type RegisteredTool, ToolCatalog } from "@crewhaus/tool-catalog";
 import { registerMcpServer } from "@crewhaus/tool-mcp";
-import { createMemoryTools } from "@crewhaus/tool-memory";
 import { createTaskTool } from "@crewhaus/tool-task";
 import { type CostAccrualEvent, type ProviderId, TraceEventBus } from "@crewhaus/trace-event-bus";
 // 0.3.0 memory release (design §3.1, PR 9) — the local wiki substrate behind
@@ -4226,59 +4222,25 @@ async function runRunCli(
     });
   }
 
-  // Feature #53 — first-class `memory:` block. Its presence wires Remember/
-  // Recall into the tool list (no hand-editing) and — via the auto-* switches
-  // — the runtime's auto-recall (system-prompt injection) and auto-capture
-  // (summarize durable outcomes into the store at teardown). Mirrors the
-  // codegen registration in @crewhaus/target-cli.
+  // Feature #53 / v0.3.0 PR 10 — first-class `memory:` block, wired through
+  // the composition root. The SAME `wireMemory(fragment, deps)` call a
+  // compiled bundle emits runs here: it constructs the store, registers
+  // Remember/Recall/MemoryForget (into this run's local tool list via the
+  // registrar shim), and returns the auto-recall/auto-capture seams — the
+  // capture path stamps provenance {sessionId, evidence: toolUseIds} exactly
+  // as before (the extraction lives in memory-service now, one place).
   let memoryRunOpt: Parameters<typeof runChatLoop>[0]["memory"];
   if (ir.memory !== undefined && ir.memory.enabled !== false) {
-    const memoryStore = createMemoryStore({ specName: ir.name });
-    const memoryBundle = createMemoryTools({ specName: ir.name, store: memoryStore });
-    tools.push(memoryBundle.remember, memoryBundle.recall);
-    const decision = deriveMemoryDecision(ir.memory, Number.MAX_SAFE_INTEGER);
-    process.stdout.write(
-      `[memory] Remember/Recall wired (autoRecall=${decision.recall}, autoCapture=${ir.memory.autoCapture === true})\n`,
-    );
-    memoryRunOpt = {
-      ...(decision.recall
-        ? {
-            autoRecall: true,
-            recallK: decision.recallK,
-            recall: async (query, k) => {
-              const results = await memoryStore.recall(query, k);
-              return results.map((r) => r.entry.text);
-            },
-          }
-        : {}),
-      ...(ir.memory.autoCapture === true
-        ? {
-            autoCapture: true,
-            onCapture: async (completedTurns, sessionId) => {
-              const { capture } = deriveMemoryDecision(ir.memory, completedTurns);
-              if (!capture) return;
-              const events = parseJsonlObjects(
-                readFileSync(sessionJsonlPath(sessionId), "utf-8"),
-              ) as Array<{ kind?: string; payload?: unknown }>;
-              // v2 proof-linked capture: turnsFromEvents (the shared extractor)
-              // carries each turn's successful tool_result ids so captured
-              // facts land with provenance {sessionId, evidence: toolUseIds}.
-              // The sessionId tag is kept for back-compat/grep (and it is what
-              // `crewhaus migrate memories` derives provenance from on v1 files).
-              const turns = turnsFromEvents(events);
-              const facts = summarizeDurableFactsWithEvidence(turns);
-              const written = await captureFacts(memoryStore, facts, ["auto-capture", sessionId], {
-                sessionId,
-              });
-              if (written.length > 0) {
-                process.stdout.write(
-                  `[memory] auto-captured ${written.length} durable fact(s) into ${memoryStore.path()}\n`,
-                );
-              }
-            },
-          }
-        : {}),
-    };
+    const wiredMemory = await wireMemory(memoryFragmentFromIr(ir), {
+      catalog: {
+        register: (tool) => {
+          tools.push(tool);
+        },
+      },
+      cwd: process.cwd(),
+      log: (line) => process.stdout.write(line),
+    });
+    memoryRunOpt = wiredMemory.options.memory;
   }
 
   // Item #56 — resolve the current user's preference file (flag > env) so the

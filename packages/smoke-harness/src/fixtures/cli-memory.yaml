@@ -1,0 +1,10 @@
+name: smoke-cli-memory
+target: cli
+agent:
+  model: claude-sonnet-4-6
+  instructions: |
+    You are a smoke fixture for the CLI shape with a memory block. Reply concisely.
+memory:
+  autoRecall: true
+  autoCapture: true
+  recallK: 4

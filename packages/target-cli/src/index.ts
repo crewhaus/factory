@@ -7,6 +7,7 @@ import {
   type IrV0,
   renderBundleReadme,
 } from "@crewhaus/ir";
+import { memoryFragmentFromIr } from "@crewhaus/memory-service";
 
 /**
  * Emit a self-contained CLI agent bundle for a CLI-target IR.
@@ -639,68 +640,27 @@ function renderSloField(ir: IrV0): string {
 }
 
 /**
- * Feature #53 — render the `memory:` block wiring. When the spec declared a
- * `memory` block (and did not disable it), emit: the memory-store/tool imports,
- * a boot block that constructs the store, registers Remember/Recall, and — via
- * the auto-* switches — the auto-recall (system-prompt injection) + auto-capture
- * (durable-fact summary at teardown) seams, plus the `memory:` runChatLoop
- * field. Empty when the spec omits `memory` so pre-existing bundles are
- * byte-identical. Mirrors apps/cli's runRunCli.
+ * Feature #53 / v0.3.0 PR 10 — render the `memory:` block wiring. When the
+ * spec declared a `memory` block (and did not disable it), emit ONE stable
+ * composition-root call (design §1 principle 1): the fragment — serialized
+ * from `ir.memory` exactly as the old inline codegen read it — goes to
+ * `@crewhaus/memory-service`'s `wireMemory`, which constructs the store,
+ * registers Remember/Recall/MemoryForget, and returns the runChatLoop
+ * seams; the bundle spreads `__memWired.options` into the call. The
+ * per-emitter store/seam templating this replaces lived only here (the
+ * "keep in sync" mirrors were fiction); every future memory feature lands
+ * in the service, not in codegen. Empty when the spec omits `memory` so
+ * pre-existing bundles are byte-identical (test-pinned).
  */
 function renderMemory(ir: IrV0): { imports: string[]; bootBlock: string; field: string } {
   const mem = ir.memory;
   if (mem === undefined || mem.enabled === false) {
     return { imports: [], bootBlock: "", field: "" };
   }
-  const imports = [
-    `import { createMemoryStore, deriveMemoryDecision, summarizeDurableFacts, captureFacts, turnsFromEvents } from "@crewhaus/memory-store";`,
-    `import { createMemoryTools } from "@crewhaus/tool-memory";`,
-    `import { readFileSync as __memReadFileSync } from "node:fs";`,
-    `import { join as __memJoin } from "node:path";`,
-  ];
-  const specName = escapeJsonString(ir.name);
-  const autoRecall = mem.autoRecall === true;
-  const autoCapture = mem.autoCapture === true;
-  const config = JSON.stringify({
-    ...(mem.enabled !== undefined ? { enabled: mem.enabled } : {}),
-    ...(mem.autoCapture !== undefined ? { autoCapture: mem.autoCapture } : {}),
-    ...(mem.autoCaptureThreshold !== undefined
-      ? { autoCaptureThreshold: mem.autoCaptureThreshold }
-      : {}),
-    ...(mem.autoRecall !== undefined ? { autoRecall: mem.autoRecall } : {}),
-    ...(mem.recallK !== undefined ? { recallK: mem.recallK } : {}),
-  });
-  const recallSeam = autoRecall
-    ? `
-    autoRecall: true,
-    recallK: __memDecision.recallK,
-    recall: async (query, k) => (await __memStore.recall(query, k)).map((r) => r.entry.text),`
-    : "";
-  const captureSeam = autoCapture
-    ? `
-    autoCapture: true,
-    onCapture: async (completedTurns, sessionId) => {
-      if (!deriveMemoryDecision(__memConfig, completedTurns).capture) return;
-      const __memFile = __memJoin(process.cwd(), ".crewhaus", "sessions", sessionId + ".jsonl");
-      let __memEvents = [];
-      try {
-        __memEvents = __memReadFileSync(__memFile, "utf-8")
-          .split("\\n")
-          .filter((l) => l.trim() !== "")
-          .map((l) => { try { return JSON.parse(l); } catch { return undefined; } })
-          .filter((e) => e !== undefined);
-      } catch {}
-      const __memFacts = summarizeDurableFacts(turnsFromEvents(__memEvents));
-      await captureFacts(__memStore, __memFacts, ["auto-capture", sessionId]);
-    },`
-    : "";
-  const bootBlock = `const __memConfig = ${config};
-const __memStore = createMemoryStore({ specName: ${specName} });
-const __memBundle = createMemoryTools({ specName: ${specName}, store: __memStore });
-defaultCatalog.register(__memBundle.remember);
-defaultCatalog.register(__memBundle.recall);
-const __memDecision = deriveMemoryDecision(__memConfig, Number.MAX_SAFE_INTEGER);`;
-  const field = `\n  memory: {${recallSeam}${captureSeam}\n  },`;
+  const imports = [`import { wireMemory } from "@crewhaus/memory-service";`];
+  const fragment = JSON.stringify(memoryFragmentFromIr(ir));
+  const bootBlock = `const __memWired = await wireMemory(${fragment}, { catalog: defaultCatalog, cwd: process.cwd() });`;
+  const field = "\n  ...__memWired.options,";
   return { imports, bootBlock, field };
 }
 

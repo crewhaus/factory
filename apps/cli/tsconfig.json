@@ -37,6 +37,7 @@
     { "path": "../../packages/ir" },
     { "path": "../../packages/logging" },
     { "path": "../../packages/mcp-host" },
+    { "path": "../../packages/memory-service" },
     { "path": "../../packages/model-router" },
     { "path": "../../packages/recovery-engine" },
     { "path": "../../packages/migration-engine" },
