@@ -298,6 +298,9 @@ function memoryFabric(ir: IrCrewV0): { wired: boolean; fragmentJson: string } {
           name: ir.name,
           ...(memoryOn ? { memory: ir.memory } : {}),
           ...(continuityOn ? { continuity: ir.continuity } : {}),
+          // v0.3.0 Goal 2 (PR 17) — learning rides the fragment: wireMemory
+          // renders the learning-loop skill + gates in /study /reflect.
+          ...(ir.learning !== undefined ? { learning: ir.learning } : {}),
         }),
       )
     : "";

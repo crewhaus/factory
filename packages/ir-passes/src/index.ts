@@ -44,6 +44,7 @@ import type {
   IrContractBinding,
   IrCrewV0,
   IrGraphV0,
+  IrLearning,
   IrManagedV0,
   IrMcpServerConfig,
   IrMcpServers,
@@ -491,6 +492,10 @@ export function wellFormednessCheck(ir: IrNode): IrNode {
 type CarriesMemoryFabric = {
   readonly memory?: IrMemory;
   readonly continuity?: IrContinuity;
+  /** v0.3.0 PR 17 — carried on the five memory shapes only; structurally
+   *  optional here so the workflow/batch/voice/browser variants type-check. */
+  readonly learning?: IrLearning;
+  readonly thredz?: unknown;
 };
 
 function carriesMemoryFabric(ir: IrNode): ir is IrNode & CarriesMemoryFabric {
@@ -546,7 +551,8 @@ export function memoryIntegrityPass(ir: IrNode): IrNode {
   if (!carriesMemoryFabric(ir)) return ir;
   const memory = ir.memory;
   const continuity = ir.continuity;
-  if (memory === undefined && continuity === undefined) return ir;
+  const learning = ir.learning;
+  if (memory === undefined && continuity === undefined && learning === undefined) return ir;
 
   if (memory?.wiki?.recallK !== undefined) {
     const k = memory.wiki.recallK;
@@ -569,9 +575,23 @@ export function memoryIntegrityPass(ir: IrNode): IrNode {
       `continuity.scope "session" needs a shape with per-conversation session routing (channel); target "${ir.target}" has no session router`,
     );
   }
+  // v0.3.0 PR 17 — learning needs a wiki (mirror of the compiler's
+  // load-bearing cross-field check): the local one enabled, or thredz.
+  if (learning !== undefined) {
+    const wikiOn = memory?.wiki !== undefined && memory.wiki.enabled !== false;
+    if (!wikiOn && ir.thredz === undefined) {
+      throw new IrPassError(
+        "learning needs a wiki to learn into — carry memory.wiki (enabled) or a thredz block on this IR",
+      );
+    }
+    if (learning.domain === "") {
+      throw new IrPassError("learning.domain must be a non-empty string");
+    }
+  }
   for (const [label, block] of [
     ["memory", memory],
     ["continuity", continuity],
+    ["learning", learning],
   ] as const) {
     if (block !== undefined && !jsonRoundTrips(block)) {
       throw new IrPassError(

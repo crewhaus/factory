@@ -108,7 +108,8 @@ import {
   summarizeDurableFactsWithEvidence,
   turnsFromEvents,
 } from "@crewhaus/memory-store";
-import { type SkillRef, discoverSkills } from "@crewhaus/skills-registry";
+import { createPiiRedactor } from "@crewhaus/pii-redactor";
+import { type LoadedSkill, type SkillRef, discoverSkills } from "@crewhaus/skills-registry";
 import { type SlashCommand, loadCommands } from "@crewhaus/slash-commands";
 import type { Tenant } from "@crewhaus/tenancy";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
@@ -117,11 +118,43 @@ import { type ContinuityEvent, createPlanTools } from "@crewhaus/tool-plan";
 import { type KnowledgeGap, type WikiEvent, createWikiTools } from "@crewhaus/tool-wiki";
 import { type WikiStore, createWikiStore } from "@crewhaus/wiki-store";
 import {
+  type ExamRunner,
+  GAP_GOAL_PREFIX,
+  type IrLearningLike,
+  type LearningWiringFragment,
+  createExamTool,
+  renderedLearningSkill,
+  withLearningDreamSeed,
+} from "./learning.js";
+import {
   type ThredzConnection,
   classifyThredzFailure,
   parseThredzRecallLines,
   withThredzGoalMirror,
 } from "./thredz.js";
+
+// v0.3.0 Goal 2 — the learning wiring surface (design §3.3, PR 17): skill
+// substitution, the study-rotation preamble, the exam seam, and the dream
+// learning seed.
+export {
+  GAP_GOAL_PREFIX,
+  buildLearningDreamSeed,
+  createExamTool,
+  learningSkillSubstitutions,
+  nextCurriculumRung,
+  renderStudyRotationPreamble,
+  renderedLearningSkill,
+  withLearningDreamSeed,
+  type CreateExamToolOptions,
+  type ExamReport,
+  type ExamRunner,
+  type ExamRunnerRequest,
+  type ExamSampleOutcome,
+  type IrLearningLike,
+  type LearningExamFragment,
+  type LearningStudyFragment,
+  type LearningWiringFragment,
+} from "./learning.js";
 
 // v0.3.0 Goal 3 — the Thredz wiring surface (design §4.3/§4.4): boot helper,
 // alias vocabulary, failure classifier, and the injected-client seam types.
@@ -266,6 +299,8 @@ export type MemoryWiringFragment = {
   readonly continuity?: ContinuityWiringFragment;
   /** v0.3.0 Goal 3 — present when `thredz:` is on (design §4). */
   readonly thredz?: ThredzWiringFragment;
+  /** v0.3.0 Goal 2 — present when `learning:` is on (design §3.3, PR 17). */
+  readonly learning?: LearningWiringFragment;
 };
 
 /** Structural mirror of `IrMemory` (#53 + the v0.3.0 §9 extensions) — kept
@@ -330,12 +365,14 @@ export function memoryFragmentFromIr(ir: {
   readonly memory?: IrMemoryLike;
   readonly continuity?: IrContinuityLike;
   readonly thredz?: IrThredzLike;
+  readonly learning?: IrLearningLike;
 }): MemoryWiringFragment {
   const mem = ir.memory;
   const wiki = mem?.wiki;
   const dream = mem?.dream;
   const cont = ir.continuity;
   const thredz = ir.thredz;
+  const learning = ir.learning;
   return {
     specName: ir.name,
     ...(mem !== undefined
@@ -399,6 +436,30 @@ export function memoryFragmentFromIr(ir: {
           },
         }
       : {}),
+    ...(learning !== undefined
+      ? {
+          learning: {
+            domain: learning.domain,
+            ...(learning.curriculum !== undefined ? { curriculum: learning.curriculum } : {}),
+            ...(learning.sources !== undefined ? { sources: [...learning.sources] } : {}),
+            ...(learning.exam !== undefined
+              ? { exam: { dataset: learning.exam.dataset, graders: learning.exam.graders } }
+              : {}),
+            ...(learning.study !== undefined
+              ? {
+                  study: {
+                    ...(learning.study.onHeartbeat !== undefined
+                      ? { onHeartbeat: learning.study.onHeartbeat }
+                      : {}),
+                    ...(learning.study.onDream !== undefined
+                      ? { onDream: learning.study.onDream }
+                      : {}),
+                  },
+                }
+              : {}),
+          },
+        }
+      : {}),
   };
 }
 
@@ -451,6 +512,14 @@ export type WireMemoryDeps = {
    *  the local backend with a warning (§4.4), it never throws. Absent when
    *  the fragment carries no thredz slice. */
   readonly thredz?: ThredzConnection | null;
+  /** v0.3.0 Goal 2 (§3.3, PR 17) — the injected programmatic exam runner
+   *  (`@crewhaus/eval-runner`'s `createExamRunner`; injected because
+   *  eval-runner depends on this package). With `learning.exam` configured
+   *  AND a runner present, the `run_exam` tool registers and the `/exam`
+   *  command joins the gated set. Absent → learning still wires (skill +
+   *  /study /reflect) but no exam surface — a consumer without the eval
+   *  stack never advertises an exam it cannot sit. */
+  readonly examRunner?: ExamRunner;
 };
 
 /** The `RunChatLoopOptions.memory` seam shape (structural — assignability
@@ -925,27 +994,43 @@ export function wireWiki(
 // skills + slash commands (design §2.6 — builtin, lowest precedence)
 // ---------------------------------------------------------------------------
 
-/** Builtin slash commands gated by which feature backs their tools. The
- *  learning-loop commands (/study /reflect /exam) stay out until their
- *  skill is wired (PR 17) — an instruction body that loads a skill the
- *  harness does not carry would strand the model. `/dream` (and the `dream`
- *  skill it loads) joins the gated set when `memory.dream` is configured
- *  (PR 14). */
+/** Builtin slash commands gated by which feature backs their tools — an
+ *  instruction body that loads a skill (or names a tool) the harness does
+ *  not carry would strand the model. `/dream` (and the `dream` skill it
+ *  loads) joins the gated set when `memory.dream` is configured (PR 14);
+ *  `/study` `/reflect` join with the `learning:` block, and `/exam` only
+ *  when the exam is actually runnable (`learning.exam` + an injected
+ *  `deps.examRunner` — PR 17). */
 const CONTINUITY_COMMANDS = ["plan", "focus", "next", "handoff", "clear-plan", "clear-focus"];
 const MEMORY_COMMANDS = ["forget"];
 const DREAM_COMMANDS = ["dream"];
+const LEARNING_COMMANDS = ["study", "reflect"];
+const EXAM_COMMANDS = ["exam"];
 
 async function loadSkillsAndCommands(
   deps: WireMemoryDeps,
-  features: { memory: boolean; dream: boolean },
+  features: {
+    memory: boolean;
+    dream: boolean;
+    continuity: boolean;
+    learning?: LearningWiringFragment;
+    exam: boolean;
+  },
 ): Promise<{ skills: ReadonlyArray<SkillRef>; slashCommands: ReadonlyMap<string, SlashCommand> }> {
-  // Builtins the composition root ships: the continuity skill always (when
-  // continuity is on), the dream skill when a dream schedule is configured
-  // (its /dream command loads it in-session, §6.3). learning-loop still
-  // waits for its {{domain}} substitutions (PR 17).
-  const builtinSkills = DEFAULT_SKILLS.filter(
-    (s) => s.name === "continuity" || (features.dream && s.name === "dream"),
-  );
+  // Builtins the composition root ships: the continuity skill (when
+  // continuity is on), the learning-loop skill RENDERED with the fragment's
+  // domain/curriculum/sources substitutions (when learning is on, §3.3), and
+  // the dream skill when a dream schedule is configured (its /dream command
+  // loads it in-session, §6.3). All merge at LOWEST precedence — a user or
+  // project skill with the same name overrides.
+  const builtinSkills: LoadedSkill[] = [];
+  for (const skill of DEFAULT_SKILLS) {
+    if (skill.name === "continuity" && features.continuity) builtinSkills.push(skill);
+    if (skill.name === "learning-loop" && features.learning !== undefined) {
+      builtinSkills.push(renderedLearningSkill(features.learning));
+    }
+    if (skill.name === "dream" && features.dream) builtinSkills.push(skill);
+  }
   const skills = await discoverSkills({
     cwd: deps.cwd,
     ...(deps.homeDir !== undefined ? { homeDir: deps.homeDir } : {}),
@@ -958,9 +1043,11 @@ async function loadSkillsAndCommands(
     builtinDirs: [builtinCommandsDir],
   });
   const allowed = new Set([
-    ...CONTINUITY_COMMANDS,
+    ...(features.continuity ? CONTINUITY_COMMANDS : []),
     ...(features.memory ? MEMORY_COMMANDS : []),
     ...(features.dream ? DREAM_COMMANDS : []),
+    ...(features.learning !== undefined ? LEARNING_COMMANDS : []),
+    ...(features.exam ? EXAM_COMMANDS : []),
   ]);
   for (const [name, command] of [...commands]) {
     const builtin = command.filePath.startsWith(builtinCommandsDir);
@@ -1019,11 +1106,7 @@ export async function wireMemory(
   if (continuity !== null) {
     stores.continuity = continuity.store;
     tools.push(...continuity.tools);
-    const { skills, slashCommands } = await loadSkillsAndCommands(deps, {
-      memory: factsOn,
-      dream: dreamEnabled(fragment),
-    });
-    options = { ...options, continuity: continuity.continuity, skills, slashCommands };
+    options = { ...options, continuity: continuity.continuity };
     deps.log?.(`[memory] continuity on — ${continuity.store.dir()} (focus · plans · goals)\n`);
   }
 
@@ -1073,6 +1156,78 @@ export async function wireMemory(
         },
       };
     }
+  }
+
+  // 4. Learning (§3.3, PR 17): the rendered learning-loop skill + the
+  // /study /reflect commands join the surface below; the first-class exam
+  // registers here when it is actually runnable (`learning.exam` configured
+  // AND an injected runner). Exam failures auto-log knowledge gaps through
+  // the SAME routing `log_knowledge_gap` uses — Thredz tasks on a live
+  // hosted backend, plan-store `[gap]` goals locally — closing the
+  // gap→study loop (failures become the next study pass's queue).
+  const learning = fragment.learning;
+  let examOn = false;
+  if (learning !== undefined) {
+    const thredzLive =
+      thredzConfigured(fragment) && deps.thredz !== null && deps.thredz !== undefined
+        ? deps.thredz
+        : null;
+    const examGapSink: ((gap: KnowledgeGap) => Promise<string>) | undefined =
+      thredzLive !== null
+        ? async (gap: KnowledgeGap): Promise<string> => {
+            // Redact-on-write (§4.3): exam text leaving the machine for
+            // Thredz passes the PII redactor, like every mirrored body.
+            const redactor = createPiiRedactor();
+            const res = await thredzLive.client.callTool("log_knowledge_gap", {
+              topic: (await redactor.redact(gap.topic)).text,
+              ...(gap.detail !== undefined
+                ? { detail: (await redactor.redact(gap.detail)).text }
+                : {}),
+              tags: [...gap.tags],
+              priority: gap.priority,
+            });
+            if (res.isError) {
+              throw new Error(`log_knowledge_gap failed (${classifyThredzFailure(res.content)})`);
+            }
+            return `logged knowledge gap "${gap.topic}" to Thredz (tag knowledge-gap) — the next study pass picks it up`;
+          }
+        : continuity !== null
+          ? async (gap: KnowledgeGap): Promise<string> => {
+              const goal = await continuity.store.writeGoal({
+                title: `${GAP_GOAL_PREFIX} ${gap.topic}`,
+              });
+              return `logged knowledge gap "${gap.topic}" → ${goal.id} — the next study pass picks it up`;
+            }
+          : undefined;
+    if (learning.exam !== undefined && deps.examRunner !== undefined) {
+      const examTool = createExamTool({
+        learning: { ...learning, exam: learning.exam },
+        examRunner: deps.examRunner,
+        cwd: deps.cwd,
+        ...(examGapSink !== undefined ? { logGap: examGapSink } : {}),
+      });
+      tools.push(examTool);
+      examOn = true;
+    }
+    deps.log?.(
+      `[learning] learning-loop on — domain "${learning.domain}"${
+        examOn ? ` · exam: ${learning.exam?.dataset}` : ""
+      }\n`,
+    );
+  }
+
+  // 5. Skills + slash commands (§2.6): the composition root owns the prompt
+  // surface whenever continuity or learning is on — builtins merged at
+  // LOWEST precedence, commands gated by the features that back them.
+  if (continuity !== null || learning !== undefined) {
+    const { skills, slashCommands } = await loadSkillsAndCommands(deps, {
+      memory: factsOn,
+      dream: dreamEnabled(fragment),
+      continuity: continuity !== null,
+      ...(learning !== undefined ? { learning } : {}),
+      exam: examOn,
+    });
+    options = { ...options, skills, slashCommands };
   }
 
   for (const tool of tools) {
@@ -1187,6 +1342,26 @@ function buildDreamEngine(
         ...(deps.now !== undefined ? { now: deps.now } : {}),
       })
     : undefined;
+  // v0.3.0 Goal 2 (§3.3 study.on_dream, PR 17): with learning on, the model
+  // phase's seeded prompt gains the top open knowledge gaps (the spec-scoped
+  // plan store's `[gap]` goals) + the next unmastered curriculum rung —
+  // composed onto the engine's EXISTING DreamModelPhase seam, computed fresh
+  // per run. `study.on_dream: false` opts out.
+  const learning = fragment.learning;
+  const modelPhase =
+    opts.modelPhase !== undefined && learning !== undefined && learning.study?.onDream !== false
+      ? withLearningDreamSeed(opts.modelPhase, {
+          learning,
+          cwd: deps.cwd,
+          listGaps: async (): Promise<readonly string[]> => {
+            if (continuityStore === undefined) return [];
+            const goals = await continuityStore.listGoals();
+            return goals
+              .filter((g) => g.status !== "proven" && g.title.startsWith(GAP_GOAL_PREFIX))
+              .map((g) => g.title.slice(GAP_GOAL_PREFIX.length).trim());
+          },
+        })
+      : opts.modelPhase;
   return createDreamEngine({
     specName: fragment.specName,
     crewhausDir,
@@ -1195,7 +1370,7 @@ function buildDreamEngine(
     memoryStore,
     ...(wikiStore !== undefined ? { wikiStore } : {}),
     ...(continuityStore !== undefined ? { continuityStore } : {}),
-    ...(opts.modelPhase !== undefined ? { modelPhase: opts.modelPhase } : {}),
+    ...(modelPhase !== undefined ? { modelPhase } : {}),
     playbook: DREAM_SKILL_BODY,
     ...(deps.appendEvent !== undefined ? { appendEvent: deps.appendEvent } : {}),
     ...(deps.log !== undefined ? { log: deps.log } : {}),

@@ -8,7 +8,7 @@ import {
   type IrSubAgentDefinition,
   renderBundleReadme,
 } from "@crewhaus/ir";
-import { memoryFragmentFromIr } from "@crewhaus/memory-service";
+import { memoryFragmentFromIr, renderStudyRotationPreamble } from "@crewhaus/memory-service";
 import { type ParsedModelString, parseModelString } from "@crewhaus/model-router";
 
 /**
@@ -410,6 +410,7 @@ function memoryFabric(ir: IrChannelV0): {
 } {
   const memoryOn = ir.memory !== undefined && ir.memory.enabled !== false;
   const continuityOn = ir.continuity !== undefined;
+  const learningOn = ir.learning !== undefined;
   const wired = memoryOn || continuityOn;
   const fragmentJson = wired
     ? JSON.stringify(
@@ -417,6 +418,11 @@ function memoryFabric(ir: IrChannelV0): {
           name: ir.name,
           ...(memoryOn ? { memory: ir.memory } : {}),
           ...(continuityOn ? { continuity: ir.continuity } : {}),
+          // v0.3.0 Goal 2 (PR 17) — learning rides the fragment so every
+          // turn's wireMemory renders the learning-loop skill and gates in
+          // /study /reflect. The exam runner is cli-shape wiring in this
+          // release (no examRunner dep here), so /exam stays gated out.
+          ...(learningOn ? { learning: ir.learning } : {}),
         }),
       )
     : "";
@@ -441,6 +447,10 @@ function dreamFragmentJson(ir: IrChannelV0): string {
       ...(ir.continuity !== undefined
         ? { continuity: { ...ir.continuity, scope: "spec" as const } }
         : {}),
+      // v0.3.0 Goal 2 (PR 17) — with learning on (and study.on_dream not
+      // opted out), wireDream seeds the model phase's findings with the top
+      // open knowledge gaps + the next unmastered curriculum rung.
+      ...(ir.learning !== undefined ? { learning: ir.learning } : {}),
     }),
   );
 }
@@ -1081,10 +1091,22 @@ registerChannelAdapter("imessage", imessageAdapter);`);
   // agenda: `spec`-scoped continuity instead of a throwaway per-tick
   // session store (§2.7/§14.5).
   const hbScopeField = ir.continuity !== undefined ? `\n        continuityScope: "spec",` : "";
+  // v0.3.0 Goal 2 (§3.3 study.on_heartbeat, PR 17) — with learning on (and
+  // the toggle not opted out), every heartbeat tick doubles as an unattended
+  // study tick: the study-rotation preamble (gaps first, ~3:1 study:reflect,
+  // bounded per tick — the expert demo's HEARTBEAT.md policy, productized)
+  // is baked ahead of the operator's own heartbeat instructions at CODEGEN
+  // time, so the emitted daemon carries the resolved text.
+  const hbInstructions =
+    ir.heartbeat === undefined
+      ? ""
+      : ir.learning?.study.onHeartbeat
+        ? `${renderStudyRotationPreamble(ir.learning)}\n${ir.heartbeat.instructions}`
+        : ir.heartbeat.instructions;
   const heartbeatBoot = ir.heartbeat
     ? `
   // Phase 3 §3.1 — heartbeat scheduled wake
-  const __heartbeatInstructions = ${escapeJsonString(ir.heartbeat.instructions)};
+  const __heartbeatInstructions = ${escapeJsonString(hbInstructions)};
   let __heartbeatTick = 0;
   const __heartbeatTimer = setInterval(async () => {
     __heartbeatTick++;
