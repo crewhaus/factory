@@ -87,8 +87,8 @@ import {
 import { openScoreboard } from "@crewhaus/routing-store";
 import { runChatLoop } from "@crewhaus/runtime-core";
 import { createSessionStore, evictExpiredSessions } from "@crewhaus/session-store";
-import { createSkillTool, discoverSkills } from "@crewhaus/skills-registry";
-import { loadCommands } from "@crewhaus/slash-commands";
+import { type SkillRef, createSkillTool, discoverSkills } from "@crewhaus/skills-registry";
+import { type SlashCommand, loadCommands } from "@crewhaus/slash-commands";
 import { type Spec, parseSpec } from "@crewhaus/spec";
 import { specHasPath } from "@crewhaus/spec-patch";
 import type { RegistryAdapter } from "@crewhaus/spec-registry";
@@ -4032,11 +4032,47 @@ async function runRunCli(
   // a synthetic `Skill(name)` tool is appended to the tool list so the
   // model can lazily fetch each skill's body.
   const cwd = process.cwd();
-  const [hooks, skills, slashCommands] = await Promise.all([
+  const [hooks, discoveredSkills, discoveredCommands] = await Promise.all([
     loadHooks({ cwd }),
     discoverSkills({ cwd }),
     loadCommands({ cwd }),
   ]);
+
+  // Feature #53 / v0.3.0 PR 11 — memory + continuity, wired through the
+  // composition root. The SAME `wireMemory(fragment, deps)` call a compiled
+  // bundle emits runs here: it constructs the stores, registers the tools
+  // (into this run's local tool list via the registrar shim), and returns
+  // the runChatLoop seams. Continuity is DEFAULT-ON for the cli target —
+  // `ir.continuity` is present unless the spec opted out with
+  // `continuity: false` (the compiler dropped the key at lower time, so
+  // opted-out specs run exactly the pre-0.3.0 path — no flag needed).
+  // When continuity is on, the composition root owns the skill/command
+  // surface (builtin `continuity` skill + commands merged at LOWEST
+  // precedence with ~/.crewhaus + project entries) and the interpreter
+  // adopts it wholesale, exactly like a compiled bundle — registering the
+  // Skill tool from its own discovery would strand the builtin skill.
+  let skills: ReadonlyArray<SkillRef> = discoveredSkills;
+  let slashCommands: ReadonlyMap<string, SlashCommand> = discoveredCommands;
+  let memoryRunOpt: Parameters<typeof runChatLoop>[0]["memory"];
+  let continuityRunOpt: Parameters<typeof runChatLoop>[0]["continuity"];
+  if ((ir.memory !== undefined && ir.memory.enabled !== false) || ir.continuity !== undefined) {
+    const wiredMemory = await wireMemory(memoryFragmentFromIr(ir), {
+      catalog: {
+        register: (tool) => {
+          tools.push(tool);
+        },
+      },
+      cwd: process.cwd(),
+      log: (line) => process.stdout.write(line),
+    });
+    memoryRunOpt = wiredMemory.options.memory;
+    continuityRunOpt = wiredMemory.options.continuity;
+    if (wiredMemory.options.skills !== undefined) skills = wiredMemory.options.skills;
+    if (wiredMemory.options.slashCommands !== undefined) {
+      slashCommands = wiredMemory.options.slashCommands;
+    }
+  }
+
   if (skills.length > 0) {
     tools.push(createSkillTool(skills));
     process.stdout.write(
@@ -4222,27 +4258,6 @@ async function runRunCli(
     });
   }
 
-  // Feature #53 / v0.3.0 PR 10 — first-class `memory:` block, wired through
-  // the composition root. The SAME `wireMemory(fragment, deps)` call a
-  // compiled bundle emits runs here: it constructs the store, registers
-  // Remember/Recall/MemoryForget (into this run's local tool list via the
-  // registrar shim), and returns the auto-recall/auto-capture seams — the
-  // capture path stamps provenance {sessionId, evidence: toolUseIds} exactly
-  // as before (the extraction lives in memory-service now, one place).
-  let memoryRunOpt: Parameters<typeof runChatLoop>[0]["memory"];
-  if (ir.memory !== undefined && ir.memory.enabled !== false) {
-    const wiredMemory = await wireMemory(memoryFragmentFromIr(ir), {
-      catalog: {
-        register: (tool) => {
-          tools.push(tool);
-        },
-      },
-      cwd: process.cwd(),
-      log: (line) => process.stdout.write(line),
-    });
-    memoryRunOpt = wiredMemory.options.memory;
-  }
-
   // Item #56 — resolve the current user's preference file (flag > env) so the
   // runtime injects `.crewhaus/preferences/<user>.md` at run start. Absent when
   // no user is identified or the file doesn't exist yet.
@@ -4400,6 +4415,10 @@ async function runRunCli(
       // (gated by CREWHAUS_INCIDENTS inside runtime-core).
       incidentSpec: { name: ir.name },
       ...(memoryRunOpt !== undefined ? { memory: memoryRunOpt } : {}),
+      // v0.3.0 Goal 1 — the continuity seam (plan tail + requirements ledger
+      // + teardown handoff), default-on unless the spec said
+      // `continuity: false`.
+      ...(continuityRunOpt !== undefined ? { continuity: continuityRunOpt } : {}),
       // Item #56 — inject the current user's preference file at run start (via
       // the project-memory auto-load path). LESSONS.md is auto-loaded already
       // as a canonical memory file, so no extra wiring is needed for it.

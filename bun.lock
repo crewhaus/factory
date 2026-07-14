@@ -715,6 +715,7 @@
         "@crewhaus/ir": "workspace:*",
         "@crewhaus/logging": "workspace:*",
         "@crewhaus/mcp-host": "workspace:*",
+        "@crewhaus/memory-service": "workspace:*",
         "@crewhaus/permission-engine": "workspace:*",
         "@crewhaus/run-context": "workspace:*",
         "@crewhaus/runtime-core": "workspace:*",
@@ -1551,6 +1552,7 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
+        "@crewhaus/memory-service": "workspace:*",
         "@crewhaus/model-router": "workspace:*",
       },
       "peerDependencies": {
@@ -1609,6 +1611,7 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
+        "@crewhaus/memory-service": "workspace:*",
       },
     },
     "packages/target-eval-bundle": {
@@ -1635,6 +1638,7 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
+        "@crewhaus/memory-service": "workspace:*",
       },
     },
     "packages/target-onchain": {
@@ -1671,6 +1675,7 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
+        "@crewhaus/memory-service": "workspace:*",
       },
     },
     "packages/target-voice": {

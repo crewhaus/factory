@@ -1,0 +1,7 @@
+name: pin-cli-plain
+target: cli
+agent:
+  model: claude-sonnet-4-6
+  instructions: |
+    You are a byte-restore pin fixture for the CLI shape. Reply concisely.
+tools: [read, bash]

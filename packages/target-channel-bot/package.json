@@ -15,6 +15,7 @@
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/infra-utils": "workspace:*",
     "@crewhaus/ir": "workspace:*",
+    "@crewhaus/memory-service": "workspace:*",
     "@crewhaus/model-router": "workspace:*"
   },
   "peerDependencies": {
