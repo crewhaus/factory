@@ -38,6 +38,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `run_failed` trace event, coded process exits, and adapter-side error
   discrimination land in the follow-up PRs.
 
+- **Adapter error discrimination: all four provider adapters now surface the
+  billing / auth / rate-limit signals the classifier reads (0.3.0 Goal 6,
+  PR 2).** adapter-openai stops conflating every 429 into `overloaded_error`:
+  the API body envelope (with its `code` — `insufficient_quota` vs
+  `rate_limit_exceeded`) and the response headers now ride the `AdapterError`
+  wrapper, so an out-of-funds account halts immediately (exit 31) while a
+  genuine rate limit retries honoring `retry-after`; 401/402/403 pass through
+  on status. adapter-anthropic additionally copies the response headers
+  (Retry-After on 429s); its credit-balance 400 / 401 / 403 envelopes already
+  flowed through intact and are now pinned end-to-end. adapter-gemini parses
+  the REST error envelope out of `ApiError.message`: a 429 RESOURCE_EXHAUSTED
+  whose QuotaFailure names a per-day / free-tier quota is billing-class
+  (envelope `code: "insufficient_quota"`), any other 429 is rate-limit-shaped
+  with google.rpc.RetryInfo's `retryDelay` threaded as the retry delay, and
+  passthrough statuses (401/403) carry the parsed body message instead of a
+  JSON blob. adapter-bedrock keeps the original Smithy exception name on the
+  wrapper so `ServiceQuotaExceededException` (a hard account quota, HTTP 400)
+  classifies as billing instead of being fabricated into a 429/overloaded,
+  while `ThrottlingException`/`TooManyRequestsException` stay
+  rate-limit-shaped; 401/403 pass through on status. `recovery-engine`'s
+  `classify()` now consults the top-level `code` and the envelope
+  `error.code` independently — the wrapper's own `code` slot holds
+  CrewhausError's ErrorCode (`"adapter"`) and no longer shadows the
+  provider's billing code. `circuit-breaker` fails fast: a billing-class
+  error (new exported structural check `isBillingError`, tunable via the new
+  `isFatal` option) trips the breaker on first sight instead of counting
+  toward the 5-failure threshold — a dead account no longer needs five
+  identical failures before the failover chain routes around it. Plain 500s,
+  overloads, and 400s behave exactly as before (regression-pinned per
+  provider).
+
 ### Fixed
 
 - **`crewhaus fleet run <sub>` works from the compiled binary again.** When the

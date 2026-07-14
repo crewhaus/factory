@@ -136,11 +136,18 @@ function normaliseAnthropicError(err: unknown): unknown {
   const wrapped = new AdapterError("anthropic", message, err);
   // Copy the discriminating fields onto the wrapper so `classify(wrapped)`
   // reaches the same verdict it would have for the raw SDK error.
-  const e = err as { status?: unknown; error?: unknown; name?: unknown };
+  const e = err as { status?: unknown; error?: unknown; name?: unknown; headers?: unknown };
   if (e.status !== undefined) (wrapped as unknown as { status?: unknown }).status = e.status;
   if (e.error !== undefined) (wrapped as unknown as { error?: unknown }).error = e.error;
   if (typeof e.name === "string") {
     (wrapped as unknown as { name?: string }).name = e.name;
+  }
+  // v0.3.0 Goal 6 (PR 2) — Anthropic sends `retry-after` on 429s via the
+  // response headers (the SDK surfaces them as a fetch Headers instance on
+  // `.headers`). Copy them through so recovery-engine's `retryAfterMs()`
+  // can honor the provider's requested delay on a rate_limit retry.
+  if (e.headers !== null && typeof e.headers === "object") {
+    (wrapped as unknown as { headers?: unknown }).headers = e.headers;
   }
 
   // Recover structured fields from a JSON-envelope error message when the

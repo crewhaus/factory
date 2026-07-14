@@ -429,6 +429,20 @@ describe("Goal 6 — classify: billing / auth / rate_limit", () => {
     ).toBe("billing");
   });
 
+  test("a top-level code string does not shadow the envelope's insufficient_quota (PR 2)", () => {
+    // The AdapterError wrapper shape: CrewhausError's ErrorCode occupies the
+    // top-level `code` slot ("adapter"); the provider code rides error.code.
+    expect(
+      classify({
+        name: "AdapterError",
+        code: "adapter",
+        status: 429,
+        error: { type: "insufficient_quota", code: "insufficient_quota", message: "quota" },
+        message: "429 quota",
+      }),
+    ).toBe("billing");
+  });
+
   test("HTTP 402 anywhere → billing", () => {
     expect(classify({ status: 402, message: "402 Payment Required" })).toBe("billing");
   });

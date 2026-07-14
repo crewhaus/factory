@@ -181,6 +181,24 @@ export function createBedrockAdapter(
   return new BedrockAdapter({ client, family: opts.family });
 }
 
+/**
+ * Normalise Bedrock (Smithy) exceptions into the Anthropic-shaped fields
+ * recovery-engine reads.
+ *
+ * v0.3.0 Goal 6 (PR 2) — the quota-vs-throttle distinction AWS encodes in
+ * the exception NAME is preserved instead of both being stamped
+ * 429/overloaded:
+ *   - ThrottlingException / TooManyRequestsException → 429 +
+ *     `rate_limit_error` (transient — classify() retries, honoring
+ *     Retry-After when one is exposed).
+ *   - ServiceQuotaExceededException → surfaced by name (copied onto the
+ *     wrapper, which the blanket "AdapterError" name used to erase) so
+ *     classify() routes it to billing: a hard account quota fails every
+ *     retry identically — the fix is a quota increase, not patience.
+ *   - 401/403 ($metadata.httpStatusCode) pass through on status alone
+ *     (classify() → auth: UnrecognizedClientException, AccessDeniedException,
+ *     ExpiredTokenException and friends).
+ */
 function normaliseBedrockError(err: unknown): unknown {
   const name = (err as { name?: unknown })?.name;
   if (name === "AbortError" || name === "APIUserAbortError") return err;
@@ -190,11 +208,23 @@ function normaliseBedrockError(err: unknown): unknown {
   const e = err as { $metadata?: { httpStatusCode?: number } } | null | undefined;
   const status = e?.$metadata?.httpStatusCode;
 
+  // Keep the original exception name on the wrapper (mirrors the Anthropic
+  // adapter): classify() matches ServiceQuotaExceededException by name, and
+  // the concrete Smithy name beats a uniform "AdapterError" in traces.
+  if (typeof name === "string" && name.length > 0) {
+    (wrapped as unknown as { name: string }).name = name;
+  }
+
   // Bedrock taxonomy → Anthropic-shaped fields recovery-engine reads.
-  // ThrottlingException / ServiceQuotaExceededException / TooManyRequestsException → 429.
-  if (typeof name === "string" && /Throttling|TooManyRequests|ServiceQuotaExceeded/.test(name)) {
+  if (typeof name === "string" && /ServiceQuotaExceeded/.test(name)) {
+    // Billing-class: no shape stamping (the name is the discriminator);
+    // copy the real HTTP status (usually 400) instead of fabricating a 429.
+    if (status !== undefined) {
+      (wrapped as unknown as { status: number }).status = status;
+    }
+  } else if (typeof name === "string" && /Throttling|TooManyRequests/.test(name)) {
     (wrapped as unknown as { status: number }).status = 429;
-    (wrapped as unknown as { error: { type: string } }).error = { type: "overloaded_error" };
+    (wrapped as unknown as { error: { type: string } }).error = { type: "rate_limit_error" };
   } else if (typeof name === "string" && /ModelStreamError|InternalServerException/.test(name)) {
     (wrapped as unknown as { status: number }).status = status ?? 500;
     (wrapped as unknown as { error: { type: string } }).error = { type: "overloaded_error" };

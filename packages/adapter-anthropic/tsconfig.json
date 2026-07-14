@@ -4,6 +4,10 @@
     "rootDir": "src",
     "outDir": "dist"
   },
-  "references": [{ "path": "../errors" }, { "path": "../token-budget" }],
+  "references": [
+    { "path": "../errors" },
+    { "path": "../recovery-engine" },
+    { "path": "../token-budget" }
+  ],
   "include": ["src/**/*"]
 }

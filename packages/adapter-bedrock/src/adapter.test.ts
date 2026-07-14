@@ -7,6 +7,7 @@ import {
 } from "@aws-sdk/client-bedrock-runtime";
 import type { ProviderRequest, StreamEvent } from "@crewhaus/adapter-anthropic";
 import { AdapterError } from "@crewhaus/errors";
+import { classify, initialRecoveryState, recover } from "@crewhaus/recovery-engine";
 import {
   BedrockAdapter,
   type CreateBedrockAdapterOptions,
@@ -435,7 +436,8 @@ describe("BedrockAdapter.stream — error handling", () => {
     }
     expect(caught).toBeInstanceOf(AdapterError);
     expect((caught as { status?: number }).status).toBe(429);
-    expect((caught as { error?: { type?: string } }).error?.type).toBe("overloaded_error");
+    // v0.3.0 Goal 6 — throttles are rate-limit-shaped, no longer overloaded.
+    expect((caught as { error?: { type?: string } }).error?.type).toBe("rate_limit_error");
   });
 
   test("normalises a non-abort mid-invoke-stream failure", async () => {
@@ -509,14 +511,14 @@ describe("normaliseBedrockError — taxonomy mapping (via send failures)", () =>
     expect(await streamError("anthropic", err)).toBe(err);
   });
 
-  test("Throttling-class names map to 429 / overloaded_error", async () => {
+  test("Throttling-class names map to 429 / rate_limit_error (v0.3.0: rate-limit-shaped)", async () => {
     const err = Object.assign(new Error("slow down"), { name: "ThrottlingException" });
     const out = (await streamError("anthropic", err)) as {
       status?: number;
       error?: { type?: string };
     };
     expect(out.status).toBe(429);
-    expect(out.error?.type).toBe("overloaded_error");
+    expect(out.error?.type).toBe("rate_limit_error");
   });
 
   test("InternalServerException without metadata defaults to 500 / overloaded_error", async () => {
@@ -612,5 +614,107 @@ describe("normaliseBedrockError — taxonomy mapping (via send failures)", () =>
     const out = (await streamError("anthropic", null)) as Error;
     expect(out).toBeInstanceOf(AdapterError);
     expect(out.message).toBe("null");
+  });
+
+  // =========================================================================
+  // v0.3.0 Goal 6 (PR 2) — quota-vs-throttle discrimination, end-to-end
+  // through recovery-engine. Smithy exceptions carry the discriminator in
+  // the exception NAME plus `$metadata.httpStatusCode`.
+  // =========================================================================
+
+  test("TooManyRequestsException also maps to the rate-limit shape → classify() rate_limit", async () => {
+    const err = Object.assign(new Error("Too many requests, please wait"), {
+      name: "TooManyRequestsException",
+      $metadata: { httpStatusCode: 429 },
+    });
+    const out = (await streamError("anthropic", err)) as {
+      status?: number;
+      error?: { type?: string };
+    };
+    expect(out.status).toBe(429);
+    expect(out.error?.type).toBe("rate_limit_error");
+    expect(classify(out)).toBe("rate_limit");
+    expect(recover(out, initialRecoveryState).kind).toBe("retry");
+  });
+
+  test("ServiceQuotaExceededException keeps its name and real status → classify() billing", async () => {
+    // Real Smithy shape: ServiceQuotaExceededException is an HTTP 400 —
+    // pre-0.3.0 the adapter fabricated a 429/overloaded, burning retries on
+    // a hard account quota.
+    const err = Object.assign(
+      new Error("You have reached the maximum number of requests for this account."),
+      {
+        name: "ServiceQuotaExceededException",
+        $fault: "client",
+        $metadata: { httpStatusCode: 400 },
+      },
+    );
+    const out = (await streamError("anthropic", err)) as {
+      name?: string;
+      status?: number;
+      error?: unknown;
+    };
+    expect(out).toBeInstanceOf(AdapterError);
+    expect((out as AdapterError).providerId).toBe("bedrock");
+    expect(out.name).toBe("ServiceQuotaExceededException");
+    expect(out.status).toBe(400);
+    // No fabricated 429/overloaded stamp — the name is the discriminator.
+    expect(out.error).toBeUndefined();
+    expect(classify(out)).toBe("billing");
+  });
+
+  test("ServiceQuotaExceededException → recover() halts with the billing report (exit 31, Bedrock attribution)", async () => {
+    const err = Object.assign(
+      new Error("You have reached the maximum number of requests for this account."),
+      {
+        name: "ServiceQuotaExceededException",
+        $metadata: { httpStatusCode: 400 },
+      },
+    );
+    const out = await streamError("anthropic", err);
+    const action = recover(out, initialRecoveryState);
+    expect(action.kind).toBe("halt");
+    if (action.kind !== "halt") return;
+    expect(action.report.class).toBe("billing");
+    expect(action.report.exitCode).toBe(31);
+    expect(action.report.detail).toContain("Bedrock said:");
+    expect(action.report.remediation).toContain("quota");
+  });
+
+  test("403 auth-class exceptions pass through on status → classify() auth", async () => {
+    for (const name of [
+      "UnrecognizedClientException",
+      "AccessDeniedException",
+      "ExpiredTokenException",
+    ]) {
+      const err = Object.assign(new Error("The security token included is invalid."), {
+        name,
+        $metadata: { httpStatusCode: 403 },
+      });
+      const out = (await streamError("anthropic", err)) as { status?: number };
+      expect(out.status).toBe(403);
+      expect(classify(out)).toBe("auth");
+    }
+  });
+
+  test("401 passes through on status → classify() auth → halt (exit 30)", async () => {
+    const err = Object.assign(new Error("Unable to locate credentials"), {
+      name: "UnauthorizedException",
+      $metadata: { httpStatusCode: 401 },
+    });
+    const out = await streamError("anthropic", err);
+    expect(classify(out)).toBe("auth");
+    const action = recover(out, initialRecoveryState);
+    expect(action.kind).toBe("halt");
+    if (action.kind !== "halt") return;
+    expect(action.report.exitCode).toBe(30);
+  });
+
+  test("regression: InternalServerException / plain 5xx keep the overloaded shape and retry", async () => {
+    const err = Object.assign(new Error("kaboom"), { name: "InternalServerException" });
+    const out = await streamError("anthropic", err);
+    expect((out as { error?: unknown }).error).toEqual({ type: "overloaded_error" });
+    expect(classify(out)).toBe("overloaded_or_5xx");
+    expect(recover(out, initialRecoveryState).kind).toBe("retry");
   });
 });
