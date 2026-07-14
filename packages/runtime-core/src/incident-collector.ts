@@ -20,7 +20,15 @@ import { join } from "node:path";
 import type { RunContext } from "@crewhaus/run-context";
 import type { TraceEvent, TraceEventBus, Unsubscribe } from "@crewhaus/trace-event-bus";
 
-export type IncidentTriggerKind = "circuit_open" | "egress_blocked" | "justification_deny_storm";
+export type IncidentTriggerKind =
+  | "circuit_open"
+  | "egress_blocked"
+  | "justification_deny_storm"
+  // v0.3.0 Goal 6 — the structured terminal-failure event. Previously a
+  // plain run death left no incident bundle unless a circuit breaker
+  // happened to be configured; `run_failed` is the exact moment 0.3.0's
+  // failure messaging cares about, so it auto-captures too.
+  | "run_failed";
 
 /** How many judge-backed denials in the ring buffer constitute a "storm". */
 export const DENY_STORM_THRESHOLD = 3;
@@ -51,6 +59,15 @@ export function classifyIncidentTrigger(
         };
       }
       return undefined;
+    case "run_failed":
+      // v0.3.0 Goal 6 — a terminal run failure (classified or generic)
+      // captures an incident bundle unconditionally: it is published
+      // exactly once, immediately before the run-ending throw.
+      return {
+        kind: "run_failed",
+        reason: `run failed (${event.class}, exit ${event.exitCode}): ${event.message}`,
+        triggeredBy: "run_failed",
+      };
     case "permission_decision":
       if (event.outcome === "egress-blocked") {
         return {

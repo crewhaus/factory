@@ -34,6 +34,19 @@ const SUMMARY_MARKER =
 
 const SUMMARY_MAX_TOKENS = 4096;
 
+export type AutoCompactOptions = {
+  /**
+   * v0.3.0 Goal 1 (§2.3) — verbatim requirements-ledger text (the user
+   * messages already externalized as `context_evicted` events) appended to
+   * the summarization prompt so the summary is ANCHORED against the stated
+   * requirements. This is model discipline only: correctness never depends
+   * on the summary honoring it — the ledger is re-injected into every model
+   * call independently. Absent (every pre-0.3.0 caller) → the prompt is
+   * byte-identical to before this option existed.
+   */
+  readonly ledgerText?: string;
+};
+
 /**
  * Replace the full message history with `[marker, summary]`.
  *
@@ -44,10 +57,15 @@ export async function autoCompact(
   messages: ReadonlyArray<Anthropic.MessageParam>,
   adapter: ProviderAdapter,
   model: string,
+  opts: AutoCompactOptions = {},
 ): Promise<Anthropic.MessageParam[]> {
+  const request =
+    opts.ledgerText !== undefined && opts.ledgerText.length > 0
+      ? `${SUMMARY_REQUEST}\n\nThe following user requirements were stated earlier in this conversation and were preserved verbatim before compaction. Anchor the summary against them — restate any that are still relevant and never contradict or drop them:\n${opts.ledgerText}`
+      : SUMMARY_REQUEST;
   const summarizationPrompt: Anthropic.MessageParam = {
     role: "user",
-    content: SUMMARY_REQUEST,
+    content: request,
   };
 
   const final = await collectFinalMessage(

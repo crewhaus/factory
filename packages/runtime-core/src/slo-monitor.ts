@@ -151,7 +151,11 @@ export class SloWindow {
         this.ttftSeen.delete(ev.traceId);
         return;
       case "error_recovered":
-        if (ev.action === "fail") this.unrecoveredErrors.push({ ts: t, value: 1 });
+        // "fail" (generic) and "halt" (v0.3.0 classified terminal stop) are
+        // both unrecovered — mirror alert-watchdog's accounting.
+        if (ev.action === "fail" || ev.action === "halt") {
+          this.unrecoveredErrors.push({ ts: t, value: 1 });
+        }
         return;
       case "cost_accrual":
         // Skip the FR-003 terminal aggregate (summary:true) — it double-counts.

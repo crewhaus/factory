@@ -69,7 +69,8 @@ export type TrustOrigin =
   | "skill"
   | "compaction"
   | "tool"
-  | "chain";
+  | "chain"
+  | "memory";
 
 export type BoundarySeverity = "block" | "warn" | "pass";
 
@@ -100,6 +101,14 @@ const ORIGIN_DEFAULT_POLICY: Record<TrustOrigin, BoundarySeverity> = {
   // or an event-emitting contract can plant malicious strings in event payloads
   // that get decoded and injected into the model's context. Block by default.
   chain: "block",
+  // Memory content (0.3.0 design §7.4): recalled wiki articles, recalled
+  // facts, and dream-synthesis output. A wiki article written in an earlier
+  // session may have absorbed attacker text (a poisoned web page STUDYed
+  // into an article, a malicious MCP response captured as a fact) — recall
+  // re-injects it across a session boundary, so it must be re-verified at
+  // read time. Block by default, same tier as "skill" (both are
+  // disk-persisted instructions-adjacent content).
+  memory: "block",
 };
 
 export type ClassifyBoundaryOptions = {

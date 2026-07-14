@@ -243,3 +243,24 @@ describe("emitManaged — SLO wiring (ops item 37)", () => {
     expect(agentTs).not.toContain("sloTargets:");
   });
 });
+
+describe("emitManaged — terminal-failure reporting (0.3.0 Goal 6)", () => {
+  test("daemon renders a classified report on stderr and rethrows — the daemon keeps serving", () => {
+    const daemon = emitManaged(ir).files.find((f) => f.path === "daemon.ts")?.content ?? "";
+    expect(daemon).toContain(
+      'import { formatRunFailure, isRunFailedError } from "@crewhaus/errors";',
+    );
+    // runOneTurn is wrapped: classified failures print the report…
+    expect(daemon).toContain("if (isRunFailedError(err)) {");
+    expect(daemon).toContain(
+      'process.stderr.write(`${formatRunFailure(err.report, { prefix: "[managed]" })}\\n`);',
+    );
+    // …then rethrow to the gateway (error response, not process death).
+    expect(daemon).toContain("throw err;");
+    const catchIdx = daemon.indexOf("if (isRunFailedError(err)) {");
+    const rethrowIdx = daemon.indexOf("throw err;", catchIdx);
+    expect(rethrowIdx).toBeGreaterThan(catchIdx);
+    // No process.exit rides in that catch block.
+    expect(daemon.slice(catchIdx, rethrowIdx)).not.toContain("process.exit");
+  });
+});

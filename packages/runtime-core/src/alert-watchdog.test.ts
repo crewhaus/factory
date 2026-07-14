@@ -151,6 +151,27 @@ describe("SessionMetricsAccumulator.fold + snapshot", () => {
     expect(s.errorRate).toBe(1); // 1 unrecovered / 1 model call
   });
 
+  test("counts the classified halt action as unrecovered too (0.3.0 Goal 6)", () => {
+    const acc = new SessionMetricsAccumulator();
+    acc.fold({
+      ...env("2026-07-02T00:00:00Z"),
+      kind: "error_recovered",
+      action: "halt",
+      errorName: "AdapterError",
+      depth: 0,
+    } as TraceEvent);
+    acc.fold({
+      ...env("2026-07-02T00:00:01Z"),
+      kind: "error_recovered",
+      action: "fail",
+      errorName: "Fatal",
+      depth: 1,
+    } as TraceEvent);
+    const s = acc.snapshot("sess_x");
+    // BOTH "fail" (generic) and "halt" (classified) are terminal stops.
+    expect(s.unrecoveredErrors).toBe(2);
+  });
+
   test("counts a $0-priced non-empty accrual as a pricing miss; skips FR-003 summary", () => {
     const acc = new SessionMetricsAccumulator();
     acc.fold({

@@ -1,0 +1,41 @@
+{
+  "name": "@crewhaus/wiki-store",
+  "version": "0.2.4",
+  "type": "module",
+  "description": "0.3.0 memory release §3.1 — local update-in-place wiki: versioned markdown articles (supersede, never delete), optimistic concurrency (stale_article_version), hybrid BM25+embedding recall with one-hop [[wikilink]] expansion.",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@crewhaus/errors": "workspace:*",
+    "@crewhaus/tenancy": "workspace:*",
+    "yaml": "^2.6.0"
+  },
+  "devDependencies": {
+    "@crewhaus/embedder": "workspace:*"
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@crewhaus.ai",
+    "url": "https://crewhaus.ai"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/wiki-store"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/wiki-store#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+}
