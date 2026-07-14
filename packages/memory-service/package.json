@@ -2,7 +2,7 @@
   "name": "@crewhaus/memory-service",
   "version": "0.2.4",
   "type": "module",
-  "description": "v0.3.0 composition root (design §1 principle 1): wireMemory/wireContinuity/wireWiki construct the memory fabric's stores, register its tools, and return runChatLoop-ready seams — one stable call replacing per-emitter memory codegen.",
+  "description": "v0.3.0 composition root (design \u00a71 principle 1): wireMemory/wireContinuity/wireWiki construct the memory fabric's stores, register its tools, and return runChatLoop-ready seams \u2014 one stable call replacing per-emitter memory codegen.",
   "main": "src/index.ts",
   "types": "src/index.ts",
   "exports": {
@@ -14,17 +14,23 @@
   "dependencies": {
     "@crewhaus/continuity-store": "workspace:*",
     "@crewhaus/default-skills": "workspace:*",
+    "@crewhaus/dream-engine": "workspace:*",
     "@crewhaus/embedder": "workspace:*",
     "@crewhaus/errors": "workspace:*",
+    "@crewhaus/mcp-host": "workspace:*",
     "@crewhaus/memory-store": "workspace:*",
+    "@crewhaus/pii-redactor": "workspace:*",
     "@crewhaus/skills-registry": "workspace:*",
     "@crewhaus/slash-commands": "workspace:*",
     "@crewhaus/tenancy": "workspace:*",
+    "@crewhaus/tool-builder": "workspace:*",
     "@crewhaus/tool-catalog": "workspace:*",
+    "@crewhaus/tool-mcp": "workspace:*",
     "@crewhaus/tool-memory": "workspace:*",
     "@crewhaus/tool-plan": "workspace:*",
     "@crewhaus/tool-wiki": "workspace:*",
-    "@crewhaus/wiki-store": "workspace:*"
+    "@crewhaus/wiki-store": "workspace:*",
+    "zod": "^3.23.8"
   },
   "devDependencies": {
     "@crewhaus/runtime-core": "workspace:*"

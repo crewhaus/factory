@@ -56,7 +56,11 @@ import {
   renderReport,
   setBaseline,
 } from "@crewhaus/eval-report";
-import { type EvalRunSummary, runEval as runEvalLib } from "@crewhaus/eval-runner";
+import {
+  type EvalRunSummary,
+  createExamRunner,
+  runEval as runEvalLib,
+} from "@crewhaus/eval-runner";
 import { openEventLog } from "@crewhaus/event-log";
 import { loadHooks, runHooks } from "@crewhaus/hooks-engine";
 import {
@@ -69,8 +73,16 @@ import { GENERATED_README_MARKER, type IrBudget } from "@crewhaus/ir";
 import { createLogger } from "@crewhaus/logging";
 import { McpHost, resolveMcpServerConfig } from "@crewhaus/mcp-host";
 // PR 10 — the memory fabric's composition root: `crewhaus run` makes the
-// same one stable wireMemory call compiled bundles emit.
-import { memoryFragmentFromIr, wireMemory } from "@crewhaus/memory-service";
+// same one stable wireMemory call compiled bundles emit. PR 16 adds
+// connectThredz (the §4.3 backend flip's boot helper — bare-name MCP tool
+// aliases + degrade-on-failure).
+import {
+  type ThredzConnection,
+  connectThredz,
+  memoryFragmentFromIr,
+  runDreamBootCatchUp,
+  wireMemory,
+} from "@crewhaus/memory-service";
 import { createMemoryStore } from "@crewhaus/memory-store";
 import {
   BUILTIN_DEFAULT_RULES,
@@ -298,6 +310,9 @@ import {
 // v0.3.0 Goal 6 — `doctor --probe`: opt-in ~1-token live call per
 // configured provider, catching unfunded/invalid keys before a long run.
 import { buildProbePlan, probeResultsToChecks, runProviderProbes } from "./doctor-probe";
+// v0.3.0 PR 14 — `crewhaus dream run|status|init` (design §6.3), in a
+// side-effect-free module; only the dispatch registration lives here.
+import { DREAM_CLI_SCHEMA, runDreamCommand } from "./dream-cli";
 // FR-006 — Pillar 3 sink-side egress-matcher selection (the substring/semantic
 // selector lowered to ir.security.egressMatcher). Side-effect-free + lazily
 // imports the optional semantic package only when "semantic" is selected, so
@@ -467,17 +482,20 @@ import {
   matchAuditRecordsByWindow,
   summarizeCost,
 } from "./incident";
-// Item 39 — `crewhaus init --interactive`: the harness-designer interview
-// (validate-and-retry loop + scripted no-credentials fallback) in a
-// side-effect-free module so this entry file stays testable.
+// Item 39 / v0.3.0 §2.9 — `crewhaus init --interactive`: the conversational
+// harness-designer interview (persisted, resumable runChatLoop session) plus
+// the scripted no-credentials fallback, in importable modules so this entry
+// file stays testable.
 import {
-  EMIT_SPEC_TOOL,
+  INIT_INTERVIEW_SAVED_NOTE,
+  conversationalPathAllowed,
+  runConversationalInterview,
+} from "./init-conversation";
+import {
   type ScriptedAnswers,
   type ScriptedShape,
-  buildInterviewSystemPrompt,
   buildScriptedSpec,
   isScriptedShape,
-  runInterview,
 } from "./init-interactive";
 // Item 67 — `crewhaus intents`: cluster user_message inputs across sessions +
 // rank by frequency / satisfaction / failure. Side-effect-free (this entry file
@@ -857,6 +875,9 @@ import {
   parseExcludeGlobs,
   restoreStateArchive,
 } from "./state-backup";
+// v0.3.0 Goal 3 — `doctor --probe`'s thredz check (wiki_stats round-trip
+// through the spec's synthesized/user-declared thredz MCP server).
+import { probeThredz, thredzProbeTarget, thredzProbeToCheck } from "./thredz-probe";
 // Item 18 — `crewhaus tools` namespace (list/suggest/audit + the loadToolMap
 // ↔ BUILTIN_TOOL_MAP sync floor), in a side-effect-free module so it is
 // unit-testable (this entry file runs an argv switch on import).
@@ -1064,6 +1085,13 @@ const INIT_SCHEMA: ParseArgsSchema = {
     // prefill the model from what's reachable.
     { name: "interactive", short: "i", takesValue: false },
     { name: "detect", takesValue: false },
+    // v0.3.0 §2.9 — restart a persisted interview session (the conversation
+    // is a runChatLoop session; a crashed/interrupted interview resumes with
+    // its ledger and transcript intact).
+    { name: "resume", takesValue: false },
+    // v0.3.0 §2.9 — skip the conversational interview (scripted
+    // questionnaire), mirroring the non-TTY behavior.
+    { name: "yes", short: "y", takesValue: false },
     { name: "help", short: "h" },
   ],
 };
@@ -2170,6 +2198,10 @@ function usageText(): string {
     "  wiki show <slug>                     full frontmatter + body for one article (priors in versions/<slug>/)",
     "  wiki search <q> [-k <n>]             BM25 keyword search over a spec's articles",
     "  wiki stats                           corpus health: articles/status/versions/tags/verified/links",
+    "  dream [run] <spec.yaml> [--force]    scheduled memory consolidation (§6): deterministic pass + budget-",
+    "                                       capped model synthesis per memory.dream (cron-safe, window-idempotent)",
+    "  dream status <spec.yaml>             schedule state + next due (.crewhaus/dream/<spec>/state.json)",
+    "  dream init <spec.yaml> [--force]     scaffold the nightly consolidation cron (crewhaus-dream.yml)",
     "       [--evicted] [--ttl-days N]        --evicted indexes each session just before it is deleted",
     "  datasets list                        all registered datasets + versions (Section 29)",
     "  datasets get <name>[@version]        print a dataset's samples as JSONL",
@@ -3352,17 +3384,24 @@ function createLineReader(): { ask(prompt: string): Promise<string>; close(): vo
 }
 
 /**
- * Item 39 — `crewhaus init --interactive`. Promotes the demos harness-designer
- * into core: interview the user and emit a `parseSpec`-validated crewhaus.yaml.
+ * Item 39 / v0.3.0 §2.9 — `crewhaus init --interactive`. Interview the user
+ * and emit a `parseSpec`-validated crewhaus.yaml.
  *
- * Two paths, chosen by credential availability (like the merged scaffold path):
- *   - Credentials present → the MODEL interview. `runInterview` (side-effect-
- *     free) drives a validate-and-retry loop: the model calls `emit_spec` with
- *     a draft, `parseSpec` validates it in-process, and any structured error is
- *     fed back for a corrected re-emit. No demos dependency — the shape
- *     guidance is bundled in `init-interactive.ts`.
- *   - No credentials → a scripted stdin questionnaire (name/shape/model/tools)
- *     that still emits a `parseSpec`-validated spec via `buildScriptedSpec`.
+ * Three paths:
+ *   - Credentials + a TTY → the CONVERSATIONAL interview (PR 18): a
+ *     persisted, resumable `runChatLoop` session with `ask_user` +
+ *     `emit_spec` and no forced toolChoice, the continuity fabric on
+ *     (requirements ledger, focus pinning, handoff) spec-scoped as
+ *     `init-<dirname>` under the target directory. Validation errors return
+ *     to the conversation as tool errors; a terminal failure prints the
+ *     classified FailureReport plus the saved-interview resume hint;
+ *     `--resume` restarts the session with the ledger intact.
+ *   - Credentials but no TTY (or `--yes`) → the conversational path is
+ *     refused (same convention as the other interactive verbs) and the
+ *     scripted questionnaire runs instead.
+ *   - No credentials → the scripted stdin questionnaire
+ *     (name/shape/model/tools), byte-identical to pre-0.3.0, still emitting
+ *     a `parseSpec`-validated spec via `buildScriptedSpec`.
  *
  * Reuses `runInit`'s exists-check/refuse-overwrite + standalone-dir guidance,
  * and composes with `--detect` (#40) to prefill the default model from a
@@ -3371,12 +3410,14 @@ function createLineReader(): { ask(prompt: string): Promise<string>; close(): vo
 async function runInitInteractive(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
-      "usage: crewhaus init --interactive [name] [--detect]\n" +
-        "  Interview-driven spec authoring. With credentials, an agent interviews you\n" +
-        "  and emits a validated crewhaus.yaml (every draft is checked against the live\n" +
-        "  spec schema and retried on error). Without credentials, a scripted\n" +
+      "usage: crewhaus init --interactive [name] [--detect] [--resume] [--yes]\n" +
+        "  Interview-driven spec authoring. With credentials and a TTY, an agent runs a\n" +
+        "  real multi-turn interview (persisted + resumable; every draft is validated\n" +
+        "  against the live spec schema in-conversation). Without credentials, a scripted\n" +
         "  questionnaire (name/shape/model/tools) still emits a validated spec.\n" +
-        "  --detect  prefill the default model from a reachable local endpoint/provider.\n",
+        "  --detect  prefill the default model from a reachable local endpoint/provider.\n" +
+        "  --resume  continue a saved interview session where it stopped.\n" +
+        "  --yes     skip the conversation; use the scripted questionnaire.\n",
     );
     return;
   }
@@ -3400,37 +3441,78 @@ async function runInitInteractive(args: ParsedArgs): Promise<void> {
     if (prefill !== undefined) defaultModel = prefill;
   }
 
-  // Credential-gated path selection: try to resolve the default model's adapter.
-  // A resolution failure (no credentials / missing optional adapter) degrades
-  // to the scripted questionnaire.
+  // Credential-gated path selection: try to resolve the default model's
+  // adapter. A resolution failure (no credentials / missing optional adapter)
+  // degrades to the scripted questionnaire — byte-identical messaging.
   const interviewer = await tryBuildInterviewer(defaultModel);
-  const reader = createLineReader();
+  const conversational = conversationalPathAllowed({
+    stdinIsTTY: process.stdin.isTTY === true,
+    assumeYes: args.flags["yes"] === true,
+  });
+
   let yaml: string;
-  try {
-    if (interviewer !== undefined) {
-      process.stdout.write(
-        `interactive spec authoring (model: ${interviewer.modelId}). Describe the agent you want to build.\n`,
-      );
-      const description = await reader.ask("> ");
-      if (description === "") die("no description given — aborting");
-      const result = await runInterview({
-        proposeSpec: (feedback) => interviewer.propose(description, feedback),
+  let mappingLines: readonly string[] = [];
+  if (interviewer !== undefined && conversational.allowed) {
+    // v0.3.0 §2.9 — the conversational interview owns stdin via runChatLoop's
+    // REPL (no line reader here: a second readline would steal input).
+    process.stdout.write(
+      args.flags["resume"] === true
+        ? `interactive spec authoring (model: ${interviewer.modelId}) — resuming your saved interview.\n`
+        : `interactive spec authoring (model: ${interviewer.modelId}). Describe the agent you want to build.\n`,
+    );
+    try {
+      const result = await runConversationalInterview({
+        targetDir,
+        specName: `init-${basename(targetDir)}`,
+        model: defaultModel,
+        resume: args.flags["resume"] === true,
       });
       yaml = result.yaml;
-      process.stdout.write(`validated after ${result.attempts} draft(s).\n`);
-    } else {
-      process.stdout.write(
-        "no model credentials detected — falling back to the scripted questionnaire.\n",
-      );
-      yaml = (await runScriptedQuestionnaire({ reader, specName, defaultModel })).yaml;
+      mappingLines = result.mappingLines;
+    } catch (err) {
+      // A classified terminal failure (billing/auth/token exhaustion) prints
+      // the PR-3 FailureReport with the saved-interview hint and the coded
+      // exit — the session + ledger are on disk, `--resume` continues.
+      if (err instanceof RunFailedError) {
+        const rendered = renderCliFailure(err, { notes: [INIT_INTERVIEW_SAVED_NOTE] });
+        process.stderr.write(`${rendered.text}\n`);
+        process.exit(rendered.exitCode);
+      }
+      throw err;
     }
-  } finally {
-    reader.close();
+  } else {
+    if (args.flags["resume"] === true) {
+      die(
+        "crewhaus init --interactive --resume needs the conversational interview (model credentials and an interactive terminal)",
+      );
+    }
+    const reader = createLineReader();
+    try {
+      if (interviewer === undefined) {
+        process.stdout.write(
+          "no model credentials detected — falling back to the scripted questionnaire.\n",
+        );
+      } else {
+        process.stdout.write(
+          `${conversational.reason ?? "conversational interview unavailable"} — falling back to the scripted questionnaire.\n`,
+        );
+      }
+      yaml = (await runScriptedQuestionnaire({ reader, specName, defaultModel })).yaml;
+    } finally {
+      reader.close();
+    }
   }
 
   mkdirSync(targetDir, { recursive: true });
   writeFileSync(targetFile, yaml);
   process.stdout.write(`wrote ${targetFile}\n`);
+  // v0.3.0 §2.9 — the REQ → spec-field mapping the model produced before
+  // emit_spec, surfaced as the interview's closing summary.
+  if (mappingLines.length > 0) {
+    process.stdout.write(
+      `requirements → spec mapping (from the interview):\n${mappingLines.map((l) => `  ${l}`).join("\n")}\n`,
+    );
+  }
   const rel = relative(process.cwd(), targetDir);
   const cd = rel === "" ? "" : `cd ${rel} && `;
   process.stdout.write(`next: ${cd}crewhaus run crewhaus.yaml\n`);
@@ -3479,50 +3561,21 @@ async function runScriptedQuestionnaire(opts: {
 }
 
 /**
- * Item 39 — attempt to build the model interviewer for `model`. Resolves the
- * adapter via the same `resolveModel` path the scaffold-evals/mutator use;
- * returns undefined when no credentials/adapter are available so the caller
- * degrades to the scripted questionnaire. The returned `propose` closure runs
- * one interview turn: it sends the system prompt + description + the running
- * validation-feedback log and returns the `emit_spec` YAML (or undefined).
+ * Item 39 / v0.3.0 §2.9 — credential gate for the conversational interview.
+ * Resolves the model's adapter via the same `resolveModel` path the
+ * scaffold-evals/mutator use; returns undefined when no credentials/adapter
+ * are available so the caller degrades to the scripted questionnaire. The
+ * interview itself runs on `runChatLoop` (init-conversation.ts), which
+ * resolves the model again through the normal router path — the single-shot
+ * forced-`emit_spec` propose closure this used to carry is gone (PR 18).
  */
-async function tryBuildInterviewer(model: string): Promise<
-  | {
-      readonly modelId: string;
-      propose: (desc: string, feedback: readonly string[]) => Promise<string | undefined>;
-    }
-  | undefined
-> {
+async function tryBuildInterviewer(
+  model: string,
+): Promise<{ readonly modelId: string } | undefined> {
   try {
     const { resolveModel } = await import("@crewhaus/model-router");
-    const { collectFinalMessage, extractToolUse } = await import("@crewhaus/adapter-anthropic");
     const resolution = await resolveModel(model);
-    const system = buildInterviewSystemPrompt();
-    const propose = async (
-      desc: string,
-      feedback: readonly string[],
-    ): Promise<string | undefined> => {
-      const feedbackText =
-        feedback.length > 0
-          ? `\n\nYour previous draft(s) failed validation with:\n${feedback
-              .map((f) => `- ${f}`)
-              .join("\n")}\nEmit a corrected spec.`
-          : "";
-      const final = await collectFinalMessage(
-        resolution.adapter.stream({
-          model: resolution.modelId,
-          system: [{ type: "text", text: system }],
-          messages: [{ role: "user", content: `Build this agent: ${desc}${feedbackText}` }],
-          tools: [EMIT_SPEC_TOOL],
-          toolChoice: { type: "tool", name: EMIT_SPEC_TOOL.name },
-          maxTokens: 4096,
-        }),
-      );
-      const toolUse = extractToolUse(final, EMIT_SPEC_TOOL.name);
-      const yaml = (toolUse?.input as { yaml?: unknown } | undefined)?.yaml;
-      return typeof yaml === "string" && yaml.length > 0 ? yaml : undefined;
-    };
-    return { modelId: resolution.modelId, propose };
+    return { modelId: resolution.modelId };
   } catch {
     return undefined;
   }
@@ -3903,6 +3956,13 @@ async function runRunCli(
   // Item 38 — synthetic notice appended to the agent instructions when the MCP
   // auto-quarantine withdraws a server's tools (built in the block below).
   let mcpQuarantineNotice: string | undefined;
+  // v0.3.0 Goal 3 — the thredz server (synthesized by the compiler, or the
+  // user's own vendored entry) boots through connectThredz: its wiki+goals
+  // tools land under their BARE names (§4.3, one vocabulary across
+  // backends) and boot failure DEGRADES (null → wireMemory falls back to
+  // local files with a warning) instead of failing the run.
+  let thredzConn: ThredzConnection | null = null;
+  const thredzWired = ir.thredz !== undefined && ir.mcp_servers["thredz"] !== undefined;
   if (Object.keys(ir.mcp_servers).length > 0) {
     const host = new McpHost({ logger });
     mcpHost = host;
@@ -3913,12 +3973,20 @@ async function runRunCli(
     }
     const tempCatalog = new ToolCatalog();
     for (const t of tools) tempCatalog.register(t);
+    if (thredzWired) {
+      thredzConn = await connectThredz(host, tempCatalog, {
+        log: (line) => process.stdout.write(line),
+        ...(ir.thredz?.agentName !== undefined ? { agentName: ir.thredz.agentName } : {}),
+      });
+    }
     await Promise.all(
-      Object.keys(ir.mcp_servers).map((name) =>
-        registerMcpServer(host, name, tempCatalog, {
-          onRegister: ({ fullName }) => process.stdout.write(`[mcp] registered ${fullName}\n`),
-        }),
-      ),
+      Object.keys(ir.mcp_servers)
+        .filter((name) => !(thredzWired && name === "thredz"))
+        .map((name) =>
+          registerMcpServer(host, name, tempCatalog, {
+            onRegister: ({ fullName }) => process.stdout.write(`[mcp] registered ${fullName}\n`),
+          }),
+        ),
     );
     tools = tempCatalog.list().slice();
 
@@ -4055,7 +4123,11 @@ async function runRunCli(
   let slashCommands: ReadonlyMap<string, SlashCommand> = discoveredCommands;
   let memoryRunOpt: Parameters<typeof runChatLoop>[0]["memory"];
   let continuityRunOpt: Parameters<typeof runChatLoop>[0]["continuity"];
-  if ((ir.memory !== undefined && ir.memory.enabled !== false) || ir.continuity !== undefined) {
+  if (
+    (ir.memory !== undefined && ir.memory.enabled !== false) ||
+    ir.continuity !== undefined ||
+    ir.thredz !== undefined
+  ) {
     const wiredMemory = await wireMemory(memoryFragmentFromIr(ir), {
       catalog: {
         register: (tool) => {
@@ -4064,12 +4136,40 @@ async function runRunCli(
       },
       cwd: process.cwd(),
       log: (line) => process.stdout.write(line),
+      // v0.3.0 Goal 3 — the live connection (or null after a boot failure,
+      // which wireMemory degrades from). Absent when thredz is off.
+      ...(ir.thredz !== undefined ? { thredz: thredzConn } : {}),
+      // v0.3.0 Goal 2 (§3.3, PR 17) — the first-class exam: `/exam` drives
+      // the run_exam tool, which invokes the eval library programmatically
+      // (no agent-shells-to-`crewhaus` hack, no Bash permission needed).
+      ...(ir.learning?.exam !== undefined
+        ? {
+            examRunner: createExamRunner({
+              specName: ir.name,
+              model,
+              instructions: ir.agent.instructions,
+              fragment: memoryFragmentFromIr(ir),
+              cwd: process.cwd(),
+              ...(ir.thredz !== undefined ? { thredz: thredzConn } : {}),
+            }),
+          }
+        : {}),
     });
     memoryRunOpt = wiredMemory.options.memory;
     continuityRunOpt = wiredMemory.options.continuity;
     if (wiredMemory.options.skills !== undefined) skills = wiredMemory.options.skills;
     if (wiredMemory.options.slashCommands !== undefined) {
       slashCommands = wiredMemory.options.slashCommands;
+    }
+    // v0.3.0 PR 14 (§6.3) — boot-time dream catch-up: when the schedule is
+    // overdue, run the DETERMINISTIC phase only (sub-second, zero spend).
+    // Unattended model spend is never a side effect of starting a session —
+    // the full consolidation stays behind `crewhaus dream`.
+    if (ir.memory?.dream !== undefined) {
+      const dreamNote = await runDreamBootCatchUp(memoryFragmentFromIr(ir), {
+        cwd: process.cwd(),
+      });
+      if (dreamNote !== null) process.stdout.write(`${dreamNote}\n`);
     }
   }
 
@@ -4749,6 +4849,10 @@ async function runDoctor(args: ParsedArgs): Promise<void> {
         "                           unfunded accounts (billing) and invalid keys (auth) before\n" +
         "                           a long run dies on them. Spends fractional-cent tokens, so\n" +
         "                           it is never on by default. Failures fail doctor (exit 1).\n" +
+        "                           When the cwd spec carries `thredz:`, also runs one live\n" +
+        "                           wiki_stats round-trip through the thredz MCP server —\n" +
+        "                           disabled keys (thredz_billing) and plan caps (thredz_quota)\n" +
+        "                           surface here instead of degrading a long run.\n" +
         "\n" +
         "  Credential checks are model-aware: doctor parses the cwd crewhaus.yaml's\n" +
         "  agent.model (claude-*, openai/*, gemini/*, bedrock/*, local/<m>@<url>) and\n" +
@@ -4827,6 +4931,16 @@ async function runDoctor(args: ParsedArgs): Promise<void> {
       process.stdout.write("~ live probe: no configured providers to probe\n");
     } else {
       checks.push(...probeResultsToChecks(await runProviderProbes(plan)));
+    }
+    // v0.3.0 Goal 3 (§4.4) — when the cwd spec carries `thredz:`, probe the
+    // configured server with one live wiki_stats round-trip so a disabled
+    // key (billing lapse) or plan cap surfaces BEFORE a long run degrades
+    // on it. Classified through the same choke point the run path uses.
+    if (specText !== undefined) {
+      const thredzTarget = thredzProbeTarget(specText);
+      if (thredzTarget !== undefined) {
+        checks.push(thredzProbeToCheck(await probeThredz(thredzTarget)));
+      }
     }
   }
 
@@ -15382,6 +15496,22 @@ switch (subcommand) {
       throw err;
     }
     break;
+  case "dream": {
+    // 0.3.0 memory release (design §6.3, PR 14) — scheduled consolidation
+    // verbs. A bare `crewhaus dream <spec>` defaults to `run` (the design's
+    // transcript); the verbs themselves live in dream-cli.ts.
+    const dreamFirst = rest[0];
+    const dreamAction =
+      dreamFirst === "run" || dreamFirst === "status" || dreamFirst === "init" ? dreamFirst : "run";
+    const dreamRest = dreamFirst === dreamAction ? rest.slice(1) : rest;
+    try {
+      await runDreamCommand(parseFor(dreamRest, DREAM_CLI_SCHEMA), dreamAction);
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
+    break;
+  }
   case "migrate": {
     // 0.3.0 memory release — `migrate memories`: the v2 schema backfill over
     // .crewhaus/memories/. Spec migrations stay on migrate-all/upgrade.

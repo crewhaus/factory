@@ -440,3 +440,123 @@ describe("createJanitor — timer", () => {
     await expectHalted(() => runs);
   });
 });
+
+describe("createJanitor — registered steps (v0.3.0 PR 14 step registry)", () => {
+  test("registered steps run after the built-ins with their outcome stamped", async () => {
+    let ran = 0;
+    const janitor = createJanitor({
+      sessionRootDirs: [rootDir],
+      steps: [
+        {
+          name: "dream_consolidation",
+          run: async () => {
+            ran += 1;
+            return { status: "ok", count: 7, detail: "consolidated" };
+          },
+        },
+      ],
+    });
+    const result = await janitor.runOnce();
+    expect(ran).toBe(1);
+    expect(result.steps.map((s) => s.step)).toEqual([
+      "reservation_cleanup",
+      "session_ttl_eviction",
+      "orphan_tool_use_sweep",
+      "dream_consolidation",
+    ]);
+    const dream = step(result, "dream_consolidation");
+    expect(dream.status).toBe("ok");
+    expect(dream.count).toBe(7);
+    expect(dream.detail).toBe("consolidated");
+  });
+
+  test("a throwing registered step is isolated and reported as error", async () => {
+    const janitor = createJanitor({
+      sessionRootDirs: [rootDir],
+      steps: [
+        {
+          name: "explodes",
+          run: async () => {
+            throw new Error("boom");
+          },
+        },
+        { name: "still_runs", run: async () => ({ status: "ok" }) },
+      ],
+    });
+    const result = await janitor.runOnce();
+    expect(step(result, "explodes").status).toBe("error");
+    expect(step(result, "explodes").detail).toBe("boom");
+    // Built-ins AND later registered steps are unaffected.
+    expect(step(result, "session_ttl_eviction").status).toBe("ok");
+    expect(step(result, "still_runs").status).toBe("ok");
+  });
+
+  test("registered steps publish janitor_action trace events for free", async () => {
+    const bus = new TraceEventBus({ runId: "run_registry", sessionId: sessId(30) });
+    const seen: JanitorActionEvent[] = [];
+    bus.subscribe((ev) => {
+      if (ev.kind === "janitor_action") seen.push(ev);
+    });
+    const janitor = createJanitor({
+      sessionRootDirs: [rootDir],
+      bus,
+      steps: [
+        {
+          name: "dream_consolidation",
+          run: async () => ({ status: "skipped", detail: "not due" }),
+        },
+      ],
+    });
+    await janitor.runOnce();
+    const dreamEvents = seen.filter((e) => e.step === "dream_consolidation");
+    expect(dreamEvents).toHaveLength(1);
+    expect(dreamEvents[0]?.status).toBe("skipped");
+    expect(dreamEvents[0]?.detail).toBe("not due");
+  });
+
+  test("a registered step shadowing a built-in name throws at construction", () => {
+    expect(() =>
+      createJanitor({
+        steps: [{ name: "session_ttl_eviction", run: async () => ({ status: "ok" }) }],
+      }),
+    ).toThrow(/shadows a built-in/);
+    expect(() =>
+      createJanitor({
+        steps: [
+          { name: "dupe", run: async () => ({ status: "ok" }) },
+          { name: "dupe", run: async () => ({ status: "ok" }) },
+        ],
+      }),
+    ).toThrow(/duplicate registered step/);
+  });
+
+  test("the start() overlap guard covers a long-running registered step", async () => {
+    let entered = 0;
+    let concurrent = 0;
+    let maxConcurrent = 0;
+    const janitor = createJanitor({
+      sessionRootDirs: [rootDir],
+      steps: [
+        {
+          name: "slow_step",
+          run: async () => {
+            entered += 1;
+            concurrent += 1;
+            maxConcurrent = Math.max(maxConcurrent, concurrent);
+            await new Promise((r) => setTimeout(r, 80));
+            concurrent -= 1;
+            return { status: "ok" };
+          },
+        },
+      ],
+    });
+    // Tick far faster than the step completes: without the tickInFlight
+    // guard the 80ms step would overlap itself.
+    janitor.start(10);
+    await new Promise((r) => setTimeout(r, 250));
+    janitor.stop();
+    await new Promise((r) => setTimeout(r, 120));
+    expect(entered).toBeGreaterThanOrEqual(1);
+    expect(maxConcurrent).toBe(1);
+  });
+});

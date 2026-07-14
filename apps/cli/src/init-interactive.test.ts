@@ -1,13 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import { parseSpec } from "@crewhaus/spec";
 import {
+  ASK_USER_TOOL,
   EMIT_SPEC_TOOL,
-  InterviewError,
   SHAPE_GUIDANCE,
   buildInterviewSystemPrompt,
   buildScriptedSpec,
   isScriptedShape,
-  runInterview,
 } from "./init-interactive";
 
 describe("SHAPE_GUIDANCE + buildInterviewSystemPrompt", () => {
@@ -27,59 +26,35 @@ describe("SHAPE_GUIDANCE + buildInterviewSystemPrompt", () => {
     for (const { target } of SHAPE_GUIDANCE) expect(prompt).toContain(target);
   });
 
-  test("EMIT_SPEC_TOOL declares a required yaml string input", () => {
+  test("prompt carries the v0.3.0 §2.9 interview discipline (focused continuity variant)", () => {
+    const prompt = buildInterviewSystemPrompt();
+    // Two conversation tools, no forced toolChoice — the model is TOLD how
+    // ask_user turns work instead of being forced into emit_spec.
+    expect(prompt).toContain("ask_user");
+    expect(prompt).toContain("end your");
+    // Turn-1 extraction + echo of verbatim REQ entries.
+    expect(prompt).toContain("REQ-001");
+    expect(prompt).toContain("Requirements so far");
+    // Never re-ask a confirmed REQ; the ledger is the check.
+    expect(prompt).toContain("NEVER re-ask");
+    expect(prompt).toContain("<requirements_ledger>");
+    // Pre-emit REQ → spec-field mapping, listed in the reply.
+    expect(prompt).toContain("→");
+    expect(prompt).toContain("maps to a spec");
+    // Resumed sessions lead with the resume summary.
+    expect(prompt).toContain("Resuming: N");
+    // In-context revision on validation errors — no interview restart.
+    expect(prompt).toContain("do not restart the interview");
+  });
+
+  test("EMIT_SPEC_TOOL keeps the pre-0.3.0 contract: a required yaml string input", () => {
+    expect(EMIT_SPEC_TOOL.name).toBe("emit_spec");
     expect(EMIT_SPEC_TOOL.input_schema.required).toEqual(["yaml"]);
   });
-});
 
-describe("runInterview — validate-and-retry loop", () => {
-  const validCli = "name: t\ntarget: cli\nagent:\n  model: claude-opus-4-7\n  instructions: hi\n";
-
-  test("succeeds on the first valid draft", async () => {
-    let calls = 0;
-    const result = await runInterview({
-      proposeSpec: async () => {
-        calls++;
-        return validCli;
-      },
-    });
-    expect(calls).toBe(1);
-    expect(result.attempts).toBe(1);
-    expect(result.spec.target).toBe("cli");
-  });
-
-  test("retries with the structured error fed back, then succeeds", async () => {
-    const drafts = [
-      "name: t\ntarget: cli\nagent:\n  model: claude-opus-4-7\n", // missing instructions
-      validCli,
-    ];
-    const feedbackSeen: string[][] = [];
-    let i = 0;
-    const result = await runInterview({
-      proposeSpec: async (feedback) => {
-        feedbackSeen.push([...feedback]);
-        return drafts[i++];
-      },
-    });
-    expect(result.attempts).toBe(2);
-    // First attempt had no feedback; the second attempt received the first
-    // draft's validation error.
-    expect(feedbackSeen[0]).toEqual([]);
-    expect(feedbackSeen[1]?.length).toBe(1);
-    expect(feedbackSeen[1]?.[0]).toContain("instructions");
-  });
-
-  test("throws InterviewError after maxAttempts of invalid drafts", async () => {
-    const badDraft = "name: t\ntarget: cli\n"; // no agent block
-    await expect(
-      runInterview({ proposeSpec: async () => badDraft, maxAttempts: 2 }),
-    ).rejects.toBeInstanceOf(InterviewError);
-  });
-
-  test("throws when the model declines to emit (undefined)", async () => {
-    await expect(runInterview({ proposeSpec: async () => undefined })).rejects.toBeInstanceOf(
-      InterviewError,
-    );
+  test("ASK_USER_TOOL declares a required question string input", () => {
+    expect(ASK_USER_TOOL.name).toBe("ask_user");
+    expect(ASK_USER_TOOL.input_schema.required).toEqual(["question"]);
   });
 });
 

@@ -5,7 +5,14 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { TrashError, listTrash, moveToTrash, restoreFromTrash } from "./trash";
+import {
+  TrashError,
+  listTrash,
+  moveToTrash,
+  parseTrashTimestamp,
+  purgeTrash,
+  restoreFromTrash,
+} from "./trash";
 
 let tmp: string; // stands in for the .crewhaus dir
 
@@ -122,5 +129,53 @@ describe("listTrash + restoreFromTrash", () => {
 
   test("listTrash on a store with no trash returns []", async () => {
     expect(await listTrash(tmp)).toEqual([]);
+  });
+});
+
+describe("purgeTrash (v0.3.0 PR 14 — the dream's trash-purge step)", () => {
+  const DAY = 24 * 60 * 60 * 1000;
+
+  async function seedSnapshot(at: Date, relPath = "state/bot/focus.md"): Promise<string> {
+    const file = seed(relPath, "x");
+    const result = await moveToTrash([file], tmp, { now: () => at });
+    return result.ts;
+  }
+
+  test("purges snapshots strictly older than 7 days; keeps the boundary", async () => {
+    const now = new Date("2026-07-13T19:04:12.000Z");
+    const old = await seedSnapshot(new Date(now.getTime() - 7 * DAY - 1000), "state/a/f.md");
+    const boundary = await seedSnapshot(new Date(now.getTime() - 7 * DAY), "state/b/f.md");
+    const fresh = await seedSnapshot(new Date(now.getTime() - 1 * DAY), "state/c/f.md");
+
+    const result = await purgeTrash(tmp, { now: () => now });
+    expect(result.purged).toEqual([old]);
+    expect(result.kept).toBe(2);
+    const remaining = (await listTrash(tmp)).map((s) => s.ts);
+    // Exactly-7-days is KEPT — "purged after 7 days" is an inclusive undo
+    // window, so a restore attempted at 7 days sharp still works.
+    expect(remaining).toContain(boundary);
+    expect(remaining).toContain(fresh);
+    expect(remaining).not.toContain(old);
+  });
+
+  test("purge is idempotent and respects a custom window", async () => {
+    const now = new Date("2026-07-13T19:04:12.000Z");
+    const old = await seedSnapshot(new Date(now.getTime() - 3 * DAY), "state/a/f.md");
+    const first = await purgeTrash(tmp, { olderThanMs: 2 * DAY, now: () => now });
+    expect(first.purged).toEqual([old]);
+    const second = await purgeTrash(tmp, { olderThanMs: 2 * DAY, now: () => now });
+    expect(second.purged).toEqual([]);
+    expect(second.kept).toBe(0);
+  });
+
+  test("parseTrashTimestamp round-trips snapshot names incl. collision suffixes", () => {
+    expect(parseTrashTimestamp("2026-07-13T19-04-12")).toBe(Date.parse("2026-07-13T19:04:12Z"));
+    expect(parseTrashTimestamp("2026-07-13T19-04-12-2")).toBe(Date.parse("2026-07-13T19:04:12Z"));
+    expect(parseTrashTimestamp("not-a-snapshot")).toBeNull();
+  });
+
+  test("an empty trash purges nothing", async () => {
+    const result = await purgeTrash(tmp);
+    expect(result).toEqual({ purged: [], kept: 0 });
   });
 });

@@ -25,6 +25,7 @@ import type {
   IrFeedback,
   IrGraphV0,
   IrIMessageConfig,
+  IrLearning,
   IrManagedV0,
   IrMcpServerConfig,
   IrMcpServers,
@@ -41,6 +42,7 @@ import type {
   IrSlackConfig,
   IrSubAgentDefinition,
   IrTelegramConfig,
+  IrThredz,
   IrTransactionPolicy,
   IrV0,
   IrVoiceV0,
@@ -849,6 +851,12 @@ type SpecWithMemory = {
       readonly autoRecall?: boolean;
       readonly requireSources?: boolean;
     };
+    readonly dream?: {
+      readonly every: string;
+      readonly mode?: "deterministic" | "full";
+      readonly budget_usd?: number;
+      readonly instructions?: string;
+    };
   };
 };
 
@@ -859,16 +867,25 @@ type SpecWithMemory = {
  *  opt-in and skipped on the plain compile path. */
 const MEMORY_TTL_MIN_MS = 60 * 60 * 1000;
 
+/** v0.3.0 PR 14 — floor for `memory.dream.every`. Consolidation is a
+ *  maintenance pass (design §6: "on a schedule, not every turn"); a
+ *  sub-5-minute cadence is a unit mistake that would thrash the stores and
+ *  — in `full` mode — burn model budget continuously. LOAD-BEARING here,
+ *  mirrored by ir-passes' `memoryIntegrityPass` (same posture as the ttl
+ *  floor above). */
+const DREAM_EVERY_MIN_MS = 5 * 60 * 1000;
+
 // Lower the cross-cutting `memory` block (#53), mirroring lowerFeedback's
 // spread-return-{} discipline (Pillar 1): the key is absent from the IR when
 // the spec omits the block, so codegen/runtime check presence to decide
 // whether to wire Remember/Recall + the auto-capture/recall paths.
 //
-// v0.3.0 (§9) — `backend`/`ttl`/`wiki` join the block. `ttl` is parsed to
-// `ttlMs` here (the heartbeat duration grammar extended with `d`) so the
-// runtime/fragment read a literal number; every field keeps the
-// declared-fields-only discipline so pre-0.3.0 memory bundles stay
-// byte-identical.
+// v0.3.0 (§9) — `backend`/`ttl`/`wiki`/`dream` join the block. `ttl` and
+// `dream.every` are parsed to milliseconds here (the heartbeat duration
+// grammar extended with `d`) so the runtime/fragment read literal numbers;
+// `dream.mode` is RESOLVED to its default (`full`) so downstream reads one
+// deterministic shape; every other field keeps the declared-fields-only
+// discipline so pre-0.3.0 memory bundles stay byte-identical.
 function lowerMemory(spec: SpecWithMemory): { memory?: IrMemory } {
   const m = spec.memory;
   if (m === undefined) return {};
@@ -878,6 +895,16 @@ function lowerMemory(spec: SpecWithMemory): { memory?: IrMemory } {
     if (ttlMs < MEMORY_TTL_MIN_MS) {
       throw new CompilerError(
         `memory.ttl "${m.ttl}" is below the 1h floor — a sub-hour fact TTL expires memories mid-session. Use "1h" or longer (e.g. "90d"), or omit ttl to keep facts forever.`,
+      );
+    }
+  }
+  const d = m.dream;
+  let dreamEveryMs: number | undefined;
+  if (d !== undefined) {
+    dreamEveryMs = parseDurationToMs(d.every);
+    if (dreamEveryMs < DREAM_EVERY_MIN_MS) {
+      throw new CompilerError(
+        `memory.dream.every "${d.every}" is below the 5m floor — consolidation is a scheduled maintenance pass, not a per-turn hook (a sub-5-minute cadence thrashes the stores and, in "full" mode, burns model budget continuously). Use "5m" or longer (e.g. "24h").`,
       );
     }
   }
@@ -901,6 +928,19 @@ function lowerMemory(spec: SpecWithMemory): { memory?: IrMemory } {
               ...(w.embedder !== undefined ? { embedder: w.embedder } : {}),
               ...(w.autoRecall !== undefined ? { autoRecall: w.autoRecall } : {}),
               ...(w.requireSources !== undefined ? { requireSources: w.requireSources } : {}),
+            },
+          }
+        : {}),
+      ...(d !== undefined && dreamEveryMs !== undefined
+        ? {
+            dream: {
+              everyMs: dreamEveryMs,
+              // Resolved default (design §6.1): mode is `full` unless the
+              // spec said `deterministic` — the model phase still needs
+              // budget_usd > 0 to ever run.
+              mode: d.mode ?? "full",
+              ...(d.budget_usd !== undefined ? { budgetUsd: d.budget_usd } : {}),
+              ...(d.instructions !== undefined ? { instructions: d.instructions } : {}),
             },
           }
         : {}),
@@ -972,6 +1012,271 @@ function lowerContinuity(
       handoff: obj.handoff ?? true,
       scope,
       ...(obj.focusMaxChars !== undefined ? { focusMaxChars: obj.focusMaxChars } : {}),
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// v0.3.0 Goal 3 (§4.1) — the `thredz:` block: one knob, lowered here.
+// ---------------------------------------------------------------------------
+
+/** The synthesized MCP server's name. Everything downstream — alias
+ *  registration, the goal mirror, doctor's probe — keys on this. */
+export const THREDZ_MCP_SERVER_NAME = "thredz";
+/** Exact pin (design §4.1): the published stdio server whose v0.2.0 tool
+ *  contract (25 tools incl. `goal_*`/`task_*`, `THREDZ_DEFAULT_VISIBILITY`)
+ *  the wiring layer is built against. */
+export const THREDZ_MCP_PACKAGE_SPEC = "thredz-mcp@0.2.0";
+
+type SpecThredz =
+  | boolean
+  | string
+  | {
+      readonly api_key: string;
+      readonly base_url?: string;
+      readonly visibility?: "private" | "shared";
+      readonly goals?: boolean;
+      readonly agents?: boolean | string;
+    };
+
+type SpecWithThredz = {
+  readonly name: string;
+  readonly thredz?: SpecThredz;
+  readonly memory?: { readonly backend?: "file" | "thredz" };
+};
+
+/** Derive a Thredz agent handle (`^[a-z][a-z0-9-]{2,31}$`) from a spec name
+ *  for `thredz.agents: true`. Deterministic; throws when the name reduces to
+ *  nothing usable (the author then names the handle explicitly). */
+function deriveThredzHandle(specName: string): string {
+  let handle = specName
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  handle = handle.replace(/^[^a-z]+/, "");
+  handle = handle.slice(0, 32).replace(/-+$/g, "");
+  if (!/^[a-z][a-z0-9-]{2,31}$/.test(handle)) {
+    throw new CompilerError(
+      `thredz.agents: true cannot derive a valid agent handle from spec name ${JSON.stringify(specName)} — handles must match ^[a-z][a-z0-9-]{2,31}$. Name it explicitly, e.g. agents: my-expert.`,
+    );
+  }
+  return handle;
+}
+
+/**
+ * Lower the `thredz:` block to a RESOLVED `IrThredz` (shorthands expanded,
+ * defaults filled in): `true` ≡ `{api_key: "$THREDZ_API_KEY"}`, a string is
+ * the api_key, `visibility` defaults to `private` (design §4.3 — never
+ * Thredz's shared-by-default), `goals` defaults to "on when continuity goals
+ * are on" (the caller passes that fact), and `agents` resolves to a concrete
+ * handle or stays absent. `api_key` rides `lowerCredential` — a typo'd
+ * `$thredz_key` fails the compile, never ships as a baked literal.
+ */
+function lowerThredzBlock(spec: SpecWithThredz, continuityGoalsOn: boolean): IrThredz | undefined {
+  const t = spec.thredz;
+  if (t === undefined || t === false) return undefined;
+  const obj =
+    t === true ? { api_key: "$THREDZ_API_KEY" } : typeof t === "string" ? { api_key: t } : t;
+  const agents = obj.agents;
+  const agentName =
+    agents === undefined || agents === false
+      ? undefined
+      : agents === true
+        ? deriveThredzHandle(spec.name)
+        : agents;
+  return {
+    apiKey: lowerCredential("thredz.api_key", obj.api_key),
+    ...(obj.base_url !== undefined ? { baseUrl: obj.base_url } : {}),
+    visibility: obj.visibility ?? "private",
+    goals: obj.goals ?? continuityGoalsOn,
+    ...(agentName !== undefined ? { agentName } : {}),
+  };
+}
+
+/**
+ * §4.1 — synthesize the `mcp_servers.thredz` stdio entry from an `IrThredz`.
+ * Env values are `IrSecretRef`s riding the §4.2 secret machinery end-to-end:
+ * the key stays out of compiled artifacts, `collectSecretRefs` lists
+ * `THREDZ_API_KEY` in the generated README automatically, and emitted
+ * bundles resolve it at boot via `resolveMcpServerConfig` (fail-fast with
+ * the variable's name when unset).
+ */
+function synthesizeThredzServer(thredz: IrThredz): IrMcpServerConfig {
+  return {
+    transport: "stdio",
+    command: "npx",
+    args: ["-y", THREDZ_MCP_PACKAGE_SPEC],
+    env: {
+      THREDZ_API_KEY: thredz.apiKey,
+      ...(thredz.baseUrl !== undefined
+        ? { THREDZ_API_BASE: { kind: "literal", value: thredz.baseUrl } }
+        : {}),
+      // Deterministic visibility enforcement (§4.3): never left to the
+      // server's own default, even though thredz-mcp v0.2.0 also defaults
+      // private.
+      THREDZ_DEFAULT_VISIBILITY: { kind: "literal", value: thredz.visibility },
+    },
+  };
+}
+
+/**
+ * The emit-WIRED lowering (cli shape): resolve the block, synthesize the MCP
+ * server (unless the user declared their own `mcp_servers.thredz` — explicit
+ * beats implicit; `crewhaus lint` warns about the shadowing), and flip
+ * `memory.backend` to `thredz` on a declared memory block. Cross-field
+ * validation lives here (LOAD-BEARING — ir-passes are opt-in and skipped on
+ * the plain compile path):
+ *   - `memory.backend: thredz` without the `thredz:` block is an error (the
+ *     backend needs the API key the block carries);
+ *   - `memory.backend: file` alongside `thredz:` is a contradiction.
+ */
+function lowerThredzWired(
+  spec: SpecWithThredz,
+  opts: {
+    readonly continuityGoalsOn: boolean;
+    readonly mcpServers: IrMcpServers;
+    readonly memory: { memory?: IrMemory };
+  },
+): { thredz?: IrThredz; mcp_servers: IrMcpServers; memory?: IrMemory } {
+  const thredz = lowerThredzBlock(spec, opts.continuityGoalsOn);
+  if (thredz === undefined) {
+    if (spec.memory?.backend === "thredz") {
+      throw new CompilerError(
+        `memory.backend "thredz" needs the top-level thredz: block (it carries the API key) — add \`thredz: $THREDZ_API_KEY\`, or drop the backend override to stay on local files.`,
+      );
+    }
+    return { mcp_servers: opts.mcpServers, ...opts.memory };
+  }
+  if (spec.memory?.backend === "file") {
+    throw new CompilerError(
+      `memory.backend "file" contradicts the thredz: block — the one knob flips the wiki backend to Thredz (design §4). Drop the backend override (or remove thredz:) and recompile.`,
+    );
+  }
+  const userDeclared = opts.mcpServers[THREDZ_MCP_SERVER_NAME] !== undefined;
+  const mcpServers = userDeclared
+    ? opts.mcpServers
+    : (Object.freeze({
+        ...opts.mcpServers,
+        [THREDZ_MCP_SERVER_NAME]: synthesizeThredzServer(thredz),
+      }) as IrMcpServers);
+  const memory =
+    opts.memory.memory !== undefined
+      ? { memory: { ...opts.memory.memory, backend: "thredz" as const } }
+      : {};
+  return { thredz, mcp_servers: mcpServers, ...memory };
+}
+
+/**
+ * The CARRIED lowering (channel/managed/research/crew): the block parses and
+ * lowers to `IrThredz` so recompiles round-trip, but nothing is synthesized
+ * or flipped — those emitters print the 0.2.3-convention ignored-note
+ * comment instead of half-wiring a backend their daemons cannot boot yet.
+ * An explicit `memory.backend: thredz` is rejected loudly (dead config that
+ * would degrade-warn every run beats nobody's use case).
+ */
+function lowerThredzCarried(
+  spec: SpecWithThredz,
+  continuityGoalsOn: boolean,
+  shape: string,
+): { thredz?: IrThredz } {
+  if (spec.memory?.backend === "thredz") {
+    throw new CompilerError(
+      `memory.backend "thredz" is emit-wired on the cli shape only in this release — the ${shape} shape carries the thredz: block for forward compatibility but keeps the local backend. Remove the backend override.`,
+    );
+  }
+  const thredz = lowerThredzBlock(spec, continuityGoalsOn);
+  return thredz !== undefined ? { thredz } : {};
+}
+
+// ---------------------------------------------------------------------------
+// v0.3.0 Goal 2 (§3.3, PR 17) — the `learning:` block, lowered here.
+// ---------------------------------------------------------------------------
+
+type SpecWithLearning = {
+  readonly learning?: {
+    readonly enabled?: boolean;
+    readonly domain: string;
+    readonly curriculum?: string;
+    readonly sources?: readonly string[];
+    readonly exam?: { readonly dataset: string; readonly graders: string };
+    readonly study?: { readonly on_heartbeat?: boolean; readonly on_dream?: boolean };
+  };
+  readonly memory?: {
+    readonly wiki?: { readonly enabled?: boolean; readonly requireSources?: boolean };
+  };
+  readonly thredz?: SpecThredz;
+};
+
+/**
+ * Lower the `learning:` block to a RESOLVED `IrLearning` (study toggles
+ * defaulted to true so downstream reads one deterministic shape). Cross-field
+ * validation lives HERE (LOAD-BEARING — ir-passes are opt-in and skipped on
+ * the plain compile path), mirrored by ir-passes' `memoryIntegrityPass` for
+ * direct-IR builders:
+ *
+ *   - learning NEEDS a wiki (the knowledge lives there): `memory.wiki`
+ *     (local, not explicitly disabled) or `thredz:` (hosted) must be present;
+ *   - an explicit `memory.wiki.requireSources: false` contradicts learning's
+ *     deterministic Sources-required write governance (§3.3) — rejected
+ *     loudly rather than silently overridden.
+ *
+ * Whether `curriculum`/`exam.dataset`/`exam.graders` files EXIST is a
+ * RUNTIME concern (the study/exam paths fail with clear errors); the
+ * compiler validates shape only.
+ */
+function lowerLearning(spec: SpecWithLearning): { learning?: IrLearning } {
+  const l = spec.learning;
+  if (l === undefined || l.enabled === false) return {};
+
+  const wikiOn = spec.memory?.wiki !== undefined && spec.memory.wiki.enabled !== false;
+  const thredzOn = spec.thredz !== undefined && spec.thredz !== false;
+  if (!wikiOn && !thredzOn) {
+    throw new CompilerError(
+      "learning: needs a wiki to learn into — enable the local one (memory: { wiki: { enabled: true } }) or add the hosted backend (thredz: $THREDZ_API_KEY). The learning loop commits knowledge to wiki articles, not to the prompt.",
+    );
+  }
+  if (spec.memory?.wiki?.requireSources === false) {
+    throw new CompilerError(
+      "memory.wiki.requireSources: false contradicts the learning: block — learning enforces Sources-required wiki writes deterministically (design §3.3: no source, no commit). Drop the override (or remove learning:) and recompile.",
+    );
+  }
+
+  return {
+    learning: {
+      domain: l.domain,
+      ...(l.curriculum !== undefined ? { curriculum: l.curriculum } : {}),
+      ...(l.sources !== undefined ? { sources: [...l.sources] } : {}),
+      ...(l.exam !== undefined
+        ? { exam: { dataset: l.exam.dataset, graders: l.exam.graders } }
+        : {}),
+      // Resolved defaults: unattended study is ON for a learning harness —
+      // the block itself is the opt-in; the toggles are the opt-outs.
+      study: {
+        onHeartbeat: l.study?.on_heartbeat ?? true,
+        onDream: l.study?.on_dream ?? true,
+      },
+    },
+  };
+}
+
+/**
+ * §3.3 write-path governance, applied at lower time: with learning ON,
+ * `memory.wiki.requireSources` is stamped `true` on the lowered memory block
+ * so `wiki_write` deterministically rejects bodies without a `## Sources`
+ * heading (the contradiction — an explicit `false` — was rejected in
+ * `lowerLearning`). No learning, or no local wiki block (thredz-only), and
+ * the lowered memory passes through untouched — byte-identical IR.
+ */
+function applyLearningWikiGovernance(
+  lowered: { memory?: IrMemory },
+  learningOn: boolean,
+): { memory?: IrMemory } {
+  if (!learningOn || lowered.memory?.wiki === undefined) return lowered;
+  return {
+    memory: {
+      ...lowered.memory,
+      wiki: { ...lowered.memory.wiki, requireSources: true },
     },
   };
 }
@@ -1149,7 +1454,27 @@ export function assertChainGameLowered(
 
 export function lower(spec: Spec): IrNode {
   switch (spec.target) {
-    case "cli":
+    case "cli": {
+      // v0.3.0 Goal 1 — DEFAULT-ON continuity (the release's one sanctioned
+      // behavior change): absent lowers to the default-on config;
+      // `continuity: false` restores prior bytes exactly.
+      const continuity = lowerContinuity(spec, { defaultOn: true, autoScope: "spec" });
+      // v0.3.0 Goal 3 — the `thredz:` knob, emit-WIRED on this shape:
+      // synthesizes `mcp_servers.thredz` (user-declared wins) and flips a
+      // declared memory block's backend. No thredz block ⇒ both pass
+      // through unchanged (byte-identical bundles).
+      const thredzLowered = lowerThredzWired(spec, {
+        continuityGoalsOn: continuity.continuity?.plan === true,
+        mcpServers: lowerMcpServers(spec.mcp_servers),
+        memory: lowerMemory(spec),
+      });
+      // v0.3.0 Goal 2 — the `learning:` block (validated against the wiki/
+      // thredz surface it needs) + the §3.3 Sources-required wiki stamp.
+      const learning = lowerLearning(spec);
+      const memoryLowered = applyLearningWikiGovernance(
+        thredzLowered.memory !== undefined ? { memory: thredzLowered.memory } : {},
+        learning.learning !== undefined,
+      );
       return {
         version: 0,
         name: spec.name,
@@ -1162,7 +1487,7 @@ export function lower(spec: Spec): IrNode {
         },
         tools: spec.tools ?? [],
         toolConfigs: lowerToolConfigs(spec.tool_config),
-        mcp_servers: lowerMcpServers(spec.mcp_servers),
+        mcp_servers: thredzLowered.mcp_servers,
         permissions: lowerPermissions(spec),
         subAgents: lowerSubAgents(spec.agent.sub_agents),
         compaction: lowerCompaction(spec),
@@ -1170,11 +1495,10 @@ export function lower(spec: Spec): IrNode {
         ...lowerBudget(spec),
         ...lowerSecurity(spec),
         ...lowerFeedback(spec),
-        ...lowerMemory(spec),
-        // v0.3.0 Goal 1 — DEFAULT-ON continuity (the release's one
-        // sanctioned behavior change): absent lowers to the default-on
-        // config; `continuity: false` restores prior bytes exactly.
-        ...lowerContinuity(spec, { defaultOn: true, autoScope: "spec" }),
+        ...memoryLowered,
+        ...continuity,
+        ...(thredzLowered.thredz !== undefined ? { thredz: thredzLowered.thredz } : {}),
+        ...learning,
         ...lowerObservability(spec),
         // Phase 3 §3.3 — CLI banner config. Plus Phase 2 M2.2 TUI mode
         // gate. Only included when the spec author opted in (cli block
@@ -1196,6 +1520,7 @@ export function lower(spec: Spec): IrNode {
           : {}),
         ...lowerChainSubsystem(spec),
       } satisfies IrV0;
+    }
     case "workflow":
       return {
         version: 0,
@@ -1217,7 +1542,10 @@ export function lower(spec: Spec): IrNode {
         ...lowerContinuity(spec, { defaultOn: false, autoScope: "spec" }),
         ...lowerChainSubsystem(spec),
       } satisfies IrWorkflowV0;
-    case "channel":
+    case "channel": {
+      const continuity = lowerContinuity(spec, { defaultOn: true, autoScope: "session" });
+      // v0.3.0 Goal 2 — learning (validated + Sources-required wiki stamp).
+      const learning = lowerLearning(spec);
       return {
         version: 0,
         name: spec.name,
@@ -1238,11 +1566,15 @@ export function lower(spec: Spec): IrNode {
         ...lowerFailureTaxonomy(spec),
         ...lowerBudget(spec),
         ...lowerFeedback(spec),
-        ...lowerMemory(spec),
+        ...applyLearningWikiGovernance(lowerMemory(spec), learning.learning !== undefined),
         // v0.3.0 Goal 1 — DEFAULT-ON continuity. `auto` scope resolves to
         // `session` on channel: per-conversation stores ride the session
         // router's sessionId (§2.7/§14.5); heartbeat ticks read spec scope.
-        ...lowerContinuity(spec, { defaultOn: true, autoScope: "session" }),
+        ...continuity,
+        // v0.3.0 Goal 3 — thredz is CARRIED on this shape (ignored-note in
+        // the emitted daemon), not emit-wired yet.
+        ...lowerThredzCarried(spec, continuity.continuity?.plan === true, "channel"),
+        ...learning,
         ...lowerObservability(spec),
         // Phase 3 §3.1 — heartbeat. Duration string ("2h", "30m") is
         // parsed once at lower time so codegen emits a literal numeric
@@ -1266,6 +1598,7 @@ export function lower(spec: Spec): IrNode {
           : {}),
         ...lowerChainSubsystem(spec),
       } satisfies IrChannelV0;
+    }
     case "graph":
       return {
         version: 0,
@@ -1288,7 +1621,10 @@ export function lower(spec: Spec): IrNode {
         ...lowerFailureTaxonomy(spec),
         ...lowerChainSubsystem(spec),
       } satisfies IrGraphV0;
-    case "managed":
+    case "managed": {
+      const continuity = lowerContinuity(spec, { defaultOn: true, autoScope: "spec" });
+      // v0.3.0 Goal 2 — learning (validated + Sources-required wiki stamp).
+      const learning = lowerLearning(spec);
       return {
         version: 0,
         name: spec.name,
@@ -1309,13 +1645,18 @@ export function lower(spec: Spec): IrNode {
         compaction: lowerCompaction(spec),
         ...lowerFailureTaxonomy(spec),
         ...lowerBudget(spec),
-        ...lowerMemory(spec),
+        ...applyLearningWikiGovernance(lowerMemory(spec), learning.learning !== undefined),
         // v0.3.0 Goal 1 — DEFAULT-ON continuity. `auto` resolves to `spec`
         // scope; the managed daemon tenant-fences every store at boot (the
         // wireMemory deps carry the tenant, §2.7).
-        ...lowerContinuity(spec, { defaultOn: true, autoScope: "spec" }),
+        ...continuity,
+        // v0.3.0 Goal 3 — thredz is CARRIED on this shape (ignored-note in
+        // the emitted daemon), not emit-wired yet.
+        ...lowerThredzCarried(spec, continuity.continuity?.plan === true, "managed"),
+        ...learning,
         ...lowerObservability(spec),
       } satisfies IrManagedV0;
+    }
     case "pipeline":
       return {
         version: 0,
@@ -1355,7 +1696,10 @@ export function lower(spec: Spec): IrNode {
         compaction: lowerCompaction(spec),
         ...lowerFailureTaxonomy(spec),
       } satisfies IrPipelineV0;
-    case "crew":
+    case "crew": {
+      const continuity = lowerContinuity(spec, { defaultOn: true, autoScope: "spec" });
+      // v0.3.0 Goal 2 — learning (validated + Sources-required wiki stamp).
+      const learning = lowerLearning(spec);
       return {
         version: 0,
         name: spec.name,
@@ -1380,11 +1724,19 @@ export function lower(spec: Spec): IrNode {
         // v0.3.0 — crew joins the memory-carrying shapes (§9) and gets
         // DEFAULT-ON continuity: roles share the `spec`-scoped plan store
         // (the plan IS the coordination surface, §2.7).
-        ...lowerMemory(spec),
-        ...lowerContinuity(spec, { defaultOn: true, autoScope: "spec" }),
+        ...applyLearningWikiGovernance(lowerMemory(spec), learning.learning !== undefined),
+        ...continuity,
+        // v0.3.0 Goal 3 — thredz is CARRIED on this shape (ignored-note in
+        // the emitted bundle), not emit-wired yet.
+        ...lowerThredzCarried(spec, continuity.continuity?.plan === true, "crew"),
+        ...learning,
         ...lowerChainSubsystem(spec),
       } satisfies IrCrewV0;
-    case "research":
+    }
+    case "research": {
+      const continuity = lowerContinuity(spec, { defaultOn: true, autoScope: "spec" });
+      // v0.3.0 Goal 2 — learning (validated + Sources-required wiki stamp).
+      const learning = lowerLearning(spec);
       return {
         version: 0,
         name: spec.name,
@@ -1411,11 +1763,16 @@ export function lower(spec: Spec): IrNode {
         permissions: lowerPermissions(spec),
         compaction: lowerCompaction(spec),
         ...lowerFailureTaxonomy(spec),
-        ...lowerMemory(spec),
+        ...applyLearningWikiGovernance(lowerMemory(spec), learning.learning !== undefined),
         // v0.3.0 Goal 1 — DEFAULT-ON continuity, `spec` scope (§2.7).
-        ...lowerContinuity(spec, { defaultOn: true, autoScope: "spec" }),
+        ...continuity,
+        // v0.3.0 Goal 3 — thredz is CARRIED on this shape (ignored-note in
+        // the emitted daemon), not emit-wired yet.
+        ...lowerThredzCarried(spec, continuity.continuity?.plan === true, "research"),
+        ...learning,
         ...lowerChainSubsystem(spec),
       } satisfies IrResearchV0;
+    }
     case "batch":
       return {
         version: 0,

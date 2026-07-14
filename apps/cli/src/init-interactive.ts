@@ -1,23 +1,26 @@
-import { type Spec, SpecParseError, parseSpec } from "@crewhaus/spec";
+import { type Spec, parseSpec } from "@crewhaus/spec";
 
 /**
- * Item 39 — `crewhaus init --interactive`. Folds the demos harness-designer
- * pattern (an agent that interviews the user in plain English and emits a
- * validated crewhaus.yaml) into core. Two design commitments:
+ * Item 39 / v0.3.0 §2.9 — `crewhaus init --interactive`. Folds the demos
+ * harness-designer pattern (an agent that interviews the user in plain
+ * English and emits a validated crewhaus.yaml) into core. Design commitments:
  *
  *   1. NO dependency on the demos repo. The shape-decision guidance is
  *      bundled inline here ({@link SHAPE_GUIDANCE} / {@link buildInterviewSystemPrompt}),
  *      and validation is `parseSpec` called in-process — the single source of
  *      truth for what compiles.
  *   2. Every draft the model emits is validated against the LIVE Zod union via
- *      `parseSpec`, and on a structured error the error text is fed back for a
- *      retry. So `init --interactive` cannot emit a spec that won't parse.
- *
- * Everything here is side-effect-free and unit-testable: the interview loop is
- * driven by an INJECTED `proposeSpec` callback (the CLI wires the model
- * adapter behind it), and the credential-free fallback is a pure
- * {@link buildScriptedSpec} over stdin answers. The CLI wrapper in `index.ts`
- * owns all I/O.
+ *      `parseSpec`, and on a structured error the error text goes back into
+ *      the conversation as a tool error the model fixes in-context. So
+ *      `init --interactive` cannot emit a spec that won't parse.
+ *   3. The interview is a REAL conversation (v0.3.0 PR 18): a `runChatLoop`
+ *      session with `ask_user` + `emit_spec` and NO forced toolChoice —
+ *      persisted, ledger-protected, and resumable. The conversational loop
+ *      lives in `init-conversation.ts`; this module keeps the pure,
+ *      side-effect-free pieces: the shape catalog, the interviewer system
+ *      prompt, the tool contracts, and the credential-free fallback
+ *      ({@link buildScriptedSpec} over stdin answers). The CLI wrapper in
+ *      `index.ts` owns all I/O.
  */
 
 /** The fourteen target shapes, with the one-line "pick me when" guidance the
@@ -60,17 +63,42 @@ export function isScriptedShape(s: string): s is ScriptedShape {
 }
 
 /**
- * The interviewer's system prompt. Bundles the shape catalog + the hard rules
- * the emitted YAML must obey (single-line-safe names, the `$UPPER_SNAKE_CASE`
+ * The interviewer's system prompt — a focused variant of the `continuity`
+ * discipline (v0.3.0 §2.9) on top of the shape catalog + the hard rules the
+ * emitted YAML must obey (single-line-safe names, the `$UPPER_SNAKE_CASE`
  * secret convention, no `permissions.mode: bypass`). Kept as a builder so a
  * test can assert the guidance is present without shipping a golden file.
  */
 export function buildInterviewSystemPrompt(): string {
   const shapes = SHAPE_GUIDANCE.map((s) => `  - ${s.target}: ${s.when}`).join("\n");
   return [
-    "You are the CrewHaus harness designer. Interview the user in plain English to",
-    "understand what agent they want to build, then emit a single valid crewhaus.yaml",
-    "by calling the `emit_spec` tool with the full YAML as its `yaml` argument.",
+    "You are the CrewHaus harness designer, running a real multi-turn interview to",
+    "understand what agent the user wants to build and emit ONE valid crewhaus.yaml.",
+    "Two interview tools drive the conversation:",
+    "",
+    "  - `ask_user`: pose ONE focused clarifying question. After calling it, end your",
+    "    turn — the user's answer arrives as the next user message. Never bundle",
+    "    several questions into one call, and never call it twice in one turn.",
+    "  - `emit_spec`: submit the complete crewhaus.yaml as the `yaml` argument. The",
+    "    validator replies in the tool result; on an error, FIX exactly that error and",
+    "    re-emit in this same conversation — do not restart the interview.",
+    "",
+    "Requirements discipline (binding, every turn):",
+    "  - Turn 1: extract EVERY requirement from the user's opening message into",
+    "    verbatim REQ entries (REQ-001, REQ-002, …) — quote the user's exact words,",
+    "    never paraphrase — pin them with FocusWrite, and ECHO them back:",
+    '    "Got it. Requirements so far: REQ-001 …; open questions: …".',
+    '  - Each later answer: pin it, confirm the REQ ("REQ-002 confirmed"), and keep',
+    "    the echo current.",
+    "  - NEVER re-ask a requirement recorded as confirmed. Check the",
+    "    <requirements_ledger> block, <current_plan>, and FocusRead before asking",
+    "    anything — a confirmed REQ is already answered, in the user's own words.",
+    "  - Before calling emit_spec: read the ledger, verify each REQ maps to a spec",
+    "    field, and list the mapping in your reply, one line per REQ, using the →",
+    '    arrow: REQ-001 "…" → name',
+    '  - On a resumed session, your FIRST reply must start with "Resuming: N',
+    '    requirements confirmed, M open questions", computed from the ledger and',
+    "    focus — then continue where the interview stopped, without re-asking.",
     "",
     "Pick exactly ONE target shape:",
     shapes,
@@ -84,14 +112,13 @@ export function buildInterviewSystemPrompt(): string {
     "  - For a cli target: top-level `name`, `target: cli`, and an `agent` block with",
     "    `model` and `instructions`. Tools go in a top-level `tools:` list of names.",
     "  - Keep the spec minimal — only the blocks the user actually asked for.",
-    "",
-    "When the validator reports an error on your draft, FIX exactly that error and re-emit",
-    "— do not restart the interview.",
   ].join("\n");
 }
 
-/** The tool the interviewer calls to submit a candidate spec. Exported so the
- *  CLI wires the same schema into the adapter request. */
+/** The tool the interviewer calls to submit a candidate spec — the SAME
+ *  contract the pre-0.3.0 single-shot interview used (`{ yaml: string }`).
+ *  Exported so tests can pin the schema and `init-conversation.ts` builds
+ *  the RegisteredTool from it. */
 export const EMIT_SPEC_TOOL = {
   name: "emit_spec",
   description:
@@ -106,58 +133,24 @@ export const EMIT_SPEC_TOOL = {
   },
 };
 
-/** One turn of the interview: the injected model proposes a spec (the `yaml`
- *  string it passed to `emit_spec`), given the running feedback log of prior
- *  validation errors. Returns undefined if the model declined to emit. */
-export type ProposeSpec = (feedback: readonly string[]) => Promise<string | undefined>;
-
-export type InterviewResult = {
-  readonly yaml: string;
-  readonly spec: Spec;
-  /** How many drafts were tried before one validated (1 = first try). */
-  readonly attempts: number;
+/** v0.3.0 §2.9 — the interviewer's clarifying-question tool. The loop
+ *  surfaces the question on the terminal; the user's answer arrives as the
+ *  next user message through the multi-turn REPL (nothing typed is ever
+ *  discarded — the exact failure the single-shot path had). */
+export const ASK_USER_TOOL = {
+  name: "ask_user",
+  description:
+    "Ask the user ONE focused clarifying question. The question is shown on the terminal; " +
+    "end your turn after calling this — the user's answer arrives as the next user message. " +
+    "Check the requirements ledger first: never re-ask a confirmed requirement.",
+  input_schema: {
+    type: "object" as const,
+    properties: {
+      question: { type: "string" as const, description: "The single question to ask." },
+    },
+    required: ["question"],
+  },
 };
-
-export class InterviewError extends SpecParseError {}
-
-/**
- * Drive the validate-and-retry interview loop. Each attempt asks the injected
- * `proposeSpec` for a draft, runs it through `parseSpec` (the LIVE union), and
- * on a `SpecParseError` appends the error to the feedback log for the next
- * attempt. Succeeds on the first draft that validates; throws
- * {@link InterviewError} after `maxAttempts` failed drafts (or if the model
- * declines to emit). Pure given its `proposeSpec` seam — no I/O.
- */
-export async function runInterview(opts: {
-  readonly proposeSpec: ProposeSpec;
-  readonly maxAttempts?: number;
-}): Promise<InterviewResult> {
-  const maxAttempts = opts.maxAttempts ?? 4;
-  const feedback: string[] = [];
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const yaml = await opts.proposeSpec(feedback);
-    if (yaml === undefined) {
-      throw new InterviewError(
-        "the interviewer did not emit a spec (no emit_spec tool call) — try a more concrete description",
-      );
-    }
-    try {
-      const spec = parseSpec(yaml);
-      return { yaml, spec, attempts: attempt };
-    } catch (err) {
-      if (err instanceof SpecParseError) {
-        feedback.push(err.message);
-        continue;
-      }
-      throw err;
-    }
-  }
-  throw new InterviewError(
-    `interviewer failed to produce a valid spec after ${maxAttempts} attempts. Last errors:\n${feedback
-      .map((f) => `  - ${f}`)
-      .join("\n")}`,
-  );
-}
 
 /** The answers the scripted (no-credentials) questionnaire collects. Every
  *  field is a plain string/list so the CLI can gather them over stdin and a

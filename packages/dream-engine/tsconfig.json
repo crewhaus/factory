@@ -1,0 +1,18 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "references": [
+    { "path": "../continuity-store" },
+    { "path": "../cost-tracker" },
+    { "path": "../durable-execution" },
+    { "path": "../errors" },
+    { "path": "../infra-utils" },
+    { "path": "../memory-store" },
+    { "path": "../session-store" },
+    { "path": "../wiki-store" }
+  ],
+  "include": ["src/**/*"]
+}

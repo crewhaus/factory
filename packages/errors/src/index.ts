@@ -281,6 +281,20 @@ export function isRunFailedError(err: unknown): err is RunFailedError {
 export function toFailureReport(err: unknown): FailureReport {
   if (isRunFailedError(err)) return err.report;
   const detail = err instanceof Error ? err.message : String(err);
+  // A `ConfigError` (missing env var, unresolvable secret ref — e.g. the
+  // thredz boot's THREDZ_API_KEY resolution, §4.4) is a classified failure
+  // with its own exit code (21), not the generic catch-all. Duck-typed on
+  // the stable `code` field so a realm-split copy of this package still
+  // classifies.
+  const code = (err as { code?: unknown } | null)?.code;
+  if (err instanceof Error && code === "config") {
+    return {
+      class: "config",
+      title: "configuration error",
+      detail,
+      exitCode: EXIT_CODES.config,
+    };
+  }
   return {
     class: "unknown",
     title: "unexpected error",

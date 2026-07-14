@@ -296,6 +296,26 @@ export type IrMemoryWiki = {
 };
 
 /**
+ * v0.3.0 Goal 5 (§6/§9) — scheduled memory consolidation, lowered from
+ * `spec.memory.dream`. `every` is parsed to `everyMs` at lower time
+ * (>= 5m enforced there); `mode` is RESOLVED at lower time (default
+ * `"full"`) so emitters and the interpreter read one deterministic shape.
+ * `budgetUsd`/`instructions` are carried only when declared — the model
+ * phase runs only when `mode` is `"full"` AND `budgetUsd > 0`.
+ */
+export type IrMemoryDream = {
+  /** Consolidation cadence in milliseconds (`spec.memory.dream.every`). */
+  readonly everyMs: number;
+  /** `deterministic` (no model, ever) | `full` (bounded model synthesis). */
+  readonly mode: "deterministic" | "full";
+  /** Item-27 spend cap for the model phase (USD). Absent or 0 =
+   *  deterministic only. */
+  readonly budgetUsd?: number;
+  /** Playbook override; default = the builtin `dream` skill body. */
+  readonly instructions?: string;
+};
+
+/**
  * Feature #53 — cross-session memory config, lowered from `spec.memory`.
  * Presence of the block wires Remember/Recall into the target; the auto-*
  * switches gate auto-capture (summarize durable outcomes at teardown) and
@@ -305,8 +325,8 @@ export type IrMemoryWiki = {
  *
  * v0.3.0 (§9) extensions, all absent-when-omitted: `backend` (`file` |
  * reserved `thredz`), `ttlMs` (explicit fact forgetting — `spec.memory.ttl`
- * parsed to milliseconds at lower time, >= 1h enforced there), and `wiki`
- * (see {@link IrMemoryWiki}).
+ * parsed to milliseconds at lower time, >= 1h enforced there), `wiki`
+ * (see {@link IrMemoryWiki}), and `dream` (see {@link IrMemoryDream}).
  */
 export type IrMemory = {
   readonly enabled?: boolean;
@@ -317,6 +337,7 @@ export type IrMemory = {
   readonly autoRecall?: boolean;
   readonly recallK?: number;
   readonly wiki?: IrMemoryWiki;
+  readonly dream?: IrMemoryDream;
 };
 
 /** v0.3.0 §2.7 — the RESOLVED continuity scope. `auto` is a compiler
@@ -352,6 +373,91 @@ export type IrContinuity = {
   readonly scope: IrContinuityScope;
   /** Hard cap on the mutable tail block. Absent → runtime default (4096). */
   readonly focusMaxChars?: number;
+};
+
+/**
+ * v0.3.0 Goal 3 (§4.1/§9) — the Thredz config, lowered from the top-level
+ * `thredz:` block (boolean/string shorthand or the object form — the spec
+ * shorthands are RESOLVED at lower time so this carries one deterministic
+ * shape). Presence means Thredz is on.
+ *
+ * The compiler additionally SYNTHESIZES an `mcp_servers.thredz` stdio entry
+ * (`npx -y thredz-mcp@0.2.0` with `THREDZ_API_KEY` as an `IrSecretRef` env
+ * value, riding the §4.2 secret machinery end-to-end) on the emit-wired
+ * shape (cli). A user-declared `mcp_servers.thredz` wins over synthesis
+ * (explicit beats implicit — `crewhaus lint` warns); this config block is
+ * carried either way so the wiring layer (memory-service) still routes the
+ * wiki backend and goal mirror through that server.
+ */
+export type IrThredzVisibility = "private" | "shared";
+
+export type IrThredz = {
+  /** The Thredz API key — credential-lowered (`$THREDZ_API_KEY` →
+   *  `{ kind: "env" }`; fail-fast on a malformed `$…` ref). */
+  readonly apiKey: IrSecretRef;
+  /** Self-hosted / local API base (`THREDZ_API_BASE`). Absent → the hosted
+   *  default inside thredz-mcp. */
+  readonly baseUrl?: string;
+  /** RESOLVED default `private` — becomes `THREDZ_DEFAULT_VISIBILITY`, so
+   *  agent memory is never public by accident (Thredz's own API defaults
+   *  new articles to globally-shared). */
+  readonly visibility: IrThredzVisibility;
+  /** RESOLVED — mirror continuity goal writes to Thredz `goal_write`/
+   *  `goal_update` (spec-scoped only, §14.5 decision 5). Defaulted at lower
+   *  time to "on when continuity goals are on". */
+  readonly goals: boolean;
+  /** Register this addressable agent handle at boot (idempotent
+   *  `agent_register`). Absent → no registration (the default). */
+  readonly agentName?: string;
+};
+
+/** v0.3.0 Goal 2 (§3.3, PR 17) — the first-class competency exam: dataset +
+ *  graders paths, spec-relative. Whether the files EXIST is a runtime
+ *  concern (the `run_exam` tool fails with a clear error); the compiler
+ *  validates shape only. */
+export type IrLearningExam = {
+  /** Spec-relative path to the exam dataset (jsonl). */
+  readonly dataset: string;
+  /** Spec-relative path to the graders config (yaml). */
+  readonly graders: string;
+};
+
+/** v0.3.0 Goal 2 (§3.3, PR 17) — unattended-study toggles, RESOLVED at lower
+ *  time (both default true) so downstream reads one deterministic shape. */
+export type IrLearningStudy = {
+  /** Prepend the study-rotation preamble (gaps first, ~3:1 study:reflect,
+   *  bounded per tick) to channel heartbeat instructions. */
+  readonly onHeartbeat: boolean;
+  /** Seed the dream model phase's findings with the top open knowledge gaps
+   *  + the next unmastered curriculum rung. */
+  readonly onDream: boolean;
+};
+
+/**
+ * v0.3.0 Goal 2 (§3.3, PR 17) — continual-learning config, lowered from the
+ * top-level `learning:` block. Presence means learning is ON (the compiler
+ * dropped `enabled: false` at lower time). Learning REQUIRES a wiki —
+ * `lower()` rejects the block without `memory.wiki` (local) or `thredz:`
+ * (hosted) — and deterministically stamps `memory.wiki.requireSources: true`
+ * (Sources-required write governance, what was prompt-only in the expert
+ * demo).
+ *
+ * `domain`/`curriculum`/`sources` are substituted into the builtin
+ * `learning-loop` skill body at wire time; `exam` drives the programmatic
+ * `run_exam` tool; `study` carries the resolved unattended-study toggles.
+ * Carried on the five memory shapes (IrV0/cli, IrChannelV0, IrManagedV0,
+ * IrResearchV0, IrCrewV0).
+ */
+export type IrLearning = {
+  /** One sentence naming the field of expertise. */
+  readonly domain: string;
+  /** Spec-relative path to the agent-editable curriculum ladder. Absent →
+   *  the skill keeps the ladder in the wiki. */
+  readonly curriculum?: string;
+  /** Source-allowlist hints. NOT optimizable — allowlist = security (§7.5). */
+  readonly sources?: readonly string[];
+  readonly exam?: IrLearningExam;
+  readonly study: IrLearningStudy;
 };
 
 /** Ops item 37 — a mitigation-ladder rung the runtime SLO monitor walks on a
@@ -475,6 +581,12 @@ export type IrV0 = {
   /** v0.3.0 Goal 1 — continuity config. DEFAULT-ON: present unless the spec
    *  opted out with `continuity: false`. */
   readonly continuity?: IrContinuity;
+  /** v0.3.0 Goal 3 — Thredz config. Present when the spec declares `thredz:`;
+   *  the compiler also synthesizes `mcp_servers.thredz` on this shape. */
+  readonly thredz?: IrThredz;
+  /** v0.3.0 Goal 2 — continual-learning config (§3.3, PR 17). Present
+   *  when the spec declares an enabled `learning:` block. */
+  readonly learning?: IrLearning;
   /** Ops item 37 — SLO targets + mitigation ladder. Optional; absent when the
    *  spec omits the `observability` block. */
   readonly observability?: IrObservability;
@@ -754,6 +866,12 @@ export type IrChannelV0 = {
    *  opted out with `continuity: false`. `scope` resolves to `session` here
    *  (per-conversation stores riding the session router's sessionId, §14.5). */
   readonly continuity?: IrContinuity;
+  /** v0.3.0 Goal 3 — Thredz config, CARRIED but not emit-wired on this shape
+   *  in this release (the emitter prints the ignored-note comment). */
+  readonly thredz?: IrThredz;
+  /** v0.3.0 Goal 2 — continual-learning config (§3.3, PR 17). Present
+   *  when the spec declares an enabled `learning:` block. */
+  readonly learning?: IrLearning;
   /** Ops item 37 — SLO targets + mitigation ladder. Optional; absent when the
    *  spec omits the `observability` block. */
   readonly observability?: IrObservability;
@@ -807,6 +925,12 @@ export type IrManagedV0 = {
    *  opted out with `continuity: false`. `scope` resolves to `spec` here;
    *  every store is tenant-fenced at boot (deps carry the tenant, §2.7). */
   readonly continuity?: IrContinuity;
+  /** v0.3.0 Goal 3 — Thredz config, CARRIED but not emit-wired on this shape
+   *  in this release (the emitter prints the ignored-note comment). */
+  readonly thredz?: IrThredz;
+  /** v0.3.0 Goal 2 — continual-learning config (§3.3, PR 17). Present
+   *  when the spec declares an enabled `learning:` block. */
+  readonly learning?: IrLearning;
   /** Ops item 37 — SLO targets + mitigation ladder. Optional; absent when the
    *  spec omits the `observability` block. The managed daemon's `pause-intake`
    *  rung reuses its `budget_exceeded` 429 path. */
@@ -975,6 +1099,12 @@ export type IrCrewV0 = {
    *  opted out with `continuity: false`. Roles share the `spec`-scoped plan
    *  store — the plan IS the coordination surface (§2.7). */
   readonly continuity?: IrContinuity;
+  /** v0.3.0 Goal 3 — Thredz config, CARRIED but not emit-wired on this shape
+   *  in this release (the emitter prints the ignored-note comment). */
+  readonly thredz?: IrThredz;
+  /** v0.3.0 Goal 2 — continual-learning config (§3.3, PR 17). Present
+   *  when the spec declares an enabled `learning:` block. */
+  readonly learning?: IrLearning;
   /** §47 cross-cutting blockchain subsystem (slice 0). All optional. */
   readonly chains?: readonly IrChainBinding[];
   readonly wallets?: readonly IrWalletBinding[];
@@ -1026,6 +1156,12 @@ export type IrResearchV0 = {
   /** v0.3.0 Goal 1 — continuity config. DEFAULT-ON: present unless the spec
    *  opted out with `continuity: false`. `scope` resolves to `spec` here. */
   readonly continuity?: IrContinuity;
+  /** v0.3.0 Goal 3 — Thredz config, CARRIED but not emit-wired on this shape
+   *  in this release (the emitter prints the ignored-note comment). */
+  readonly thredz?: IrThredz;
+  /** v0.3.0 Goal 2 — continual-learning config (§3.3, PR 17). Present
+   *  when the spec declares an enabled `learning:` block. */
+  readonly learning?: IrLearning;
   /** §47 cross-cutting blockchain subsystem (slice 0). All optional. */
   readonly chains?: readonly IrChainBinding[];
   readonly wallets?: readonly IrWalletBinding[];

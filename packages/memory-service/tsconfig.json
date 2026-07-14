@@ -5,20 +5,60 @@
     "outDir": "dist"
   },
   "references": [
-    { "path": "../continuity-store" },
-    { "path": "../default-skills" },
-    { "path": "../embedder" },
-    { "path": "../errors" },
-    { "path": "../memory-store" },
-    { "path": "../runtime-core" },
-    { "path": "../skills-registry" },
-    { "path": "../slash-commands" },
-    { "path": "../tenancy" },
-    { "path": "../tool-catalog" },
-    { "path": "../tool-memory" },
-    { "path": "../tool-plan" },
-    { "path": "../tool-wiki" },
-    { "path": "../wiki-store" }
+    {
+      "path": "../continuity-store"
+    },
+    {
+      "path": "../default-skills"
+    },
+    {
+      "path": "../dream-engine"
+    },
+    {
+      "path": "../embedder"
+    },
+    {
+      "path": "../errors"
+    },
+    {
+      "path": "../mcp-host"
+    },
+    {
+      "path": "../memory-store"
+    },
+    {
+      "path": "../pii-redactor"
+    },
+    {
+      "path": "../runtime-core"
+    },
+    {
+      "path": "../skills-registry"
+    },
+    {
+      "path": "../slash-commands"
+    },
+    {
+      "path": "../tenancy"
+    },
+    {
+      "path": "../tool-catalog"
+    },
+    {
+      "path": "../tool-mcp"
+    },
+    {
+      "path": "../tool-memory"
+    },
+    {
+      "path": "../tool-plan"
+    },
+    {
+      "path": "../tool-wiki"
+    },
+    {
+      "path": "../wiki-store"
+    }
   ],
   "include": ["src/**/*"]
 }

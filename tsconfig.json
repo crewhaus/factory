@@ -102,6 +102,7 @@
     { "path": "./packages/graph-engine" },
     { "path": "./packages/branch-history" },
     { "path": "./packages/durable-execution" },
+    { "path": "./packages/dream-engine" },
     { "path": "./packages/durable-state" },
     { "path": "./packages/target-graph" },
     { "path": "./packages/gateway-protocol" },

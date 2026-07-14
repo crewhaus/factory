@@ -23,6 +23,7 @@
  * References: `claude-code/utils/sessionStorage.ts`, `agent-framework/_sessions.py`.
  */
 import { randomBytes } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { mkdir, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { RuntimeError } from "@crewhaus/errors";
@@ -457,6 +458,51 @@ export function summarizeSession(
     hadError,
     summarizedAt: now().toISOString(),
   };
+}
+
+// -------- durable sessions index (item #57 glue, lifted from apps/cli in
+// v0.3.0 PR 14 so the dream engine's fold-in step can reuse it — the CLI
+// re-exports these unchanged) --------
+
+/** The index directory name, relative to a session root's PARENT
+ *  `.crewhaus` dir (`.crewhaus/sessions-index/`). */
+export const SESSIONS_INDEX_DIRNAME = "sessions-index";
+
+/** Parse a JSONL blob into `{ kind, payload }` events, skipping bad lines. */
+export function parseSessionLog(text: string): Array<{ kind?: string; payload?: unknown }> {
+  const out: Array<{ kind?: string; payload?: unknown }> = [];
+  for (const line of text.split("\n")) {
+    if (line.trim() === "") continue;
+    try {
+      out.push(JSON.parse(line));
+    } catch {
+      // A single malformed line must not abort the summary.
+    }
+  }
+  return out;
+}
+
+/**
+ * Summarize the session whose `.jsonl` lives at `logPath` into `indexDir`,
+ * returning the written summary (or undefined when the log is missing/empty).
+ * Idempotent: re-writing the same session overwrites its entry rather than
+ * duplicating. `now` is injectable for deterministic tests.
+ */
+export function summarizeSessionIntoIndex(
+  sessionId: string,
+  logPath: string,
+  indexDir: string,
+  now: () => Date = () => new Date(),
+): SessionSummary | undefined {
+  if (!existsSync(logPath)) return undefined;
+  const events = parseSessionLog(readFileSync(logPath, "utf-8"));
+  if (events.length === 0) return undefined;
+  const summary = summarizeSession(sessionId, events, { now });
+  mkdirSync(indexDir, { recursive: true });
+  writeFileSync(join(indexDir, `${sessionId}.json`), `${JSON.stringify(summary, null, 2)}\n`, {
+    mode: 0o600,
+  });
+  return summary;
 }
 
 function isSessionShape(value: unknown): value is Session {
