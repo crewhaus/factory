@@ -50,6 +50,7 @@
     { "path": "./packages/hooks-engine" },
     { "path": "./packages/skills-registry" },
     { "path": "./packages/slash-commands" },
+    { "path": "./packages/default-skills" },
     { "path": "./packages/agent-context-isolation" },
     { "path": "./packages/sub-agent-spawner" },
     { "path": "./packages/sub-agent-permission-inheritance" },

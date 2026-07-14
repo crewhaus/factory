@@ -265,6 +265,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (verified/confidence), full frontmatter + body for one article, BM25
   keyword search, and corpus-health stats.
 
+- **Default skills and builtin slash commands** (`@crewhaus/default-skills` —
+  PR 12 of the v0.3.0 memory train). The product now ships three skills:
+  `continuity` (read the plan first, pin user requirements as verbatim REQ
+  entries, claimed-vs-proven status honesty with `PlanComplete` toolUseId
+  evidence, bias to action, accurate handoffs), `learning-loop` (the expert
+  demo's ANSWER/STUDY/REFLECT/EXAM modes productized, templated at compile
+  time via `renderSkill` with `{{domain}}`/`{{curriculum}}`/`{{sources}}` —
+  strict both ways, so a missing or typo'd substitution throws), and `dream`
+  (the consolidation playbook consumed by scheduled dream ticks). Bodies ship
+  both as exported string constants (compile-time embeddable into bundles)
+  and as real SKILL.md files (runtime-discoverable); either way they pass the
+  same `skill`-TrustOrigin classification as any other skill, and a
+  content-lint test pins every tool name they mention to the real v0.3.0
+  tool vocabulary. `discoverSkills` gains a `builtinSkills` option merged at
+  lowest precedence — `~/.crewhaus/skills` and `.crewhaus/skills` override
+  builtins by name, and an empty-body override disables one. `loadCommands`
+  gains builtin (`builtinDirs`) and user-level (`~/.crewhaus/commands`) roots
+  below the existing project root, and eleven builtin commands ship: `/plan`,
+  `/focus <text>`, `/next`, `/handoff`, `/clear-plan`, `/clear-focus`,
+  `/forget <query>`, `/study`, `/reflect`, `/exam`, `/dream`. Emitter and
+  interpreter wiring land in later PRs of the train.
+
 ### Changed
 
 - **BREAKING (IR, pre-1.0):** `IrMcpStdioConfig.env` and

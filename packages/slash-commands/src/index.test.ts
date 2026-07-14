@@ -10,6 +10,10 @@ import {
   parseCommandFile,
 } from "./index";
 
+// A shared empty home dir so tests never read the developer's real
+// `~/.crewhaus/commands` now that loadCommands walks a user-level root.
+const EMPTY_HOME = mkdtempSync(join(tmpdir(), "slash-home-"));
+
 // Snapshot the genuine node:fs module before any mock so passthroughs hold the
 // real implementations (Bun mutates the live namespace in place when mocking).
 const REAL_FS = { ...(await import("node:fs")) };
@@ -47,7 +51,7 @@ describe("loadCommands", () => {
     await withTempCwd(
       () => {},
       async (cwd) => {
-        const cmds = await loadCommands({ cwd });
+        const cmds = await loadCommands({ cwd, homeDir: EMPTY_HOME });
         expect(cmds.size).toBe(0);
       },
     );
@@ -59,7 +63,7 @@ describe("loadCommands", () => {
         writeCommand(cwd, "explain", "Explain $ARGUMENTS in two sentences.");
       },
       async (cwd) => {
-        const cmds = await loadCommands({ cwd });
+        const cmds = await loadCommands({ cwd, homeDir: EMPTY_HOME });
         expect(cmds.size).toBe(1);
         const cmd = cmds.get("explain");
         expect(cmd?.body).toBe("Explain $ARGUMENTS in two sentences.");
@@ -78,7 +82,7 @@ describe("loadCommands", () => {
         );
       },
       async (cwd) => {
-        const cmds = await loadCommands({ cwd });
+        const cmds = await loadCommands({ cwd, homeDir: EMPTY_HOME });
         const cmd = cmds.get("review");
         expect(cmd?.description).toBe("code review on a PR");
         expect(cmd?.argumentHint).toBe("<pr-number>");
@@ -93,7 +97,7 @@ describe("loadCommands", () => {
         writeCommand(cwd, "alias", `---\nargumentHint: "<x>"\n---\nbody`);
       },
       async (cwd) => {
-        const cmds = await loadCommands({ cwd });
+        const cmds = await loadCommands({ cwd, homeDir: EMPTY_HOME });
         expect(cmds.get("alias")?.argumentHint).toBe("<x>");
       },
     );
@@ -107,7 +111,7 @@ describe("loadCommands", () => {
         writeCommand(cwd, "real", "body");
       },
       async (cwd) => {
-        const cmds = await loadCommands({ cwd });
+        const cmds = await loadCommands({ cwd, homeDir: EMPTY_HOME });
         expect([...cmds.keys()]).toEqual(["real"]);
       },
     );
@@ -119,9 +123,146 @@ describe("loadCommands", () => {
         writeCommand(cwd, "rule", "---\nthis is not really frontmatter\nstill the body");
       },
       async (cwd) => {
-        const cmds = await loadCommands({ cwd });
+        const cmds = await loadCommands({ cwd, homeDir: EMPTY_HOME });
         const cmd = cmds.get("rule");
         expect(cmd?.body.startsWith("---\n")).toBe(true);
+      },
+    );
+  });
+});
+
+describe("loadCommands — builtin + user + project roots (PR 12)", () => {
+  function writeUserCommand(home: string, name: string, content: string): string {
+    const dir = join(home, ".crewhaus", "commands");
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, `${name}.md`);
+    writeFileSync(file, content);
+    return file;
+  }
+
+  function writeBuiltinCommand(dir: string, name: string, content: string): string {
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, `${name}.md`);
+    writeFileSync(file, content);
+    return file;
+  }
+
+  test("user-level ~/.crewhaus/commands is loaded", async () => {
+    await withTempCwd(
+      () => {},
+      async (cwd) => {
+        const home = mkdtempSync(join(tmpdir(), "slash-home-"));
+        try {
+          writeUserCommand(home, "mine", "user body");
+          const cmds = await loadCommands({ cwd, homeDir: home });
+          expect(cmds.get("mine")?.body).toBe("user body");
+        } finally {
+          rmSync(home, { recursive: true, force: true });
+        }
+      },
+    );
+  });
+
+  test("builtin dirs are read as flat command directories (no .crewhaus suffix)", async () => {
+    await withTempCwd(
+      (cwd) => {
+        writeBuiltinCommand(join(cwd, "builtin-cmds"), "plan", "builtin plan body $ARGUMENTS");
+      },
+      async (cwd) => {
+        const cmds = await loadCommands({
+          cwd,
+          homeDir: EMPTY_HOME,
+          builtinDirs: [join(cwd, "builtin-cmds")],
+        });
+        expect(cmds.get("plan")?.body).toBe("builtin plan body $ARGUMENTS");
+      },
+    );
+  });
+
+  test("precedence: builtin < user < project, override by name", async () => {
+    await withTempCwd(
+      (cwd) => {
+        const builtinDir = join(cwd, "builtin-cmds");
+        writeBuiltinCommand(builtinDir, "only-builtin", "from builtin");
+        writeBuiltinCommand(builtinDir, "user-wins", "from builtin");
+        writeBuiltinCommand(builtinDir, "project-wins", "from builtin");
+        writeCommand(cwd, "project-wins", "from project");
+      },
+      async (cwd) => {
+        const home = mkdtempSync(join(tmpdir(), "slash-home-"));
+        try {
+          writeUserCommand(home, "user-wins", "from user");
+          writeUserCommand(home, "project-wins", "from user");
+          const cmds = await loadCommands({
+            cwd,
+            homeDir: home,
+            builtinDirs: [join(cwd, "builtin-cmds")],
+          });
+          expect(cmds.get("only-builtin")?.body).toBe("from builtin");
+          expect(cmds.get("user-wins")?.body).toBe("from user");
+          expect(cmds.get("project-wins")?.body).toBe("from project");
+        } finally {
+          rmSync(home, { recursive: true, force: true });
+        }
+      },
+    );
+  });
+
+  test("an empty-body project override effectively disables a builtin", async () => {
+    await withTempCwd(
+      (cwd) => {
+        writeBuiltinCommand(join(cwd, "builtin-cmds"), "dream", "run the dream playbook");
+        writeCommand(cwd, "dream", "");
+      },
+      async (cwd) => {
+        const cmds = await loadCommands({
+          cwd,
+          homeDir: EMPTY_HOME,
+          builtinDirs: [join(cwd, "builtin-cmds")],
+        });
+        expect(cmds.get("dream")?.body).toBe("");
+        // expand() of the disabled command yields an empty effective message.
+        const r = expand("/dream now", cmds);
+        expect(r.handled).toBe(true);
+        expect(r.expanded).toBe("");
+      },
+    );
+  });
+
+  test("nonexistent builtin dirs are ignored", async () => {
+    await withTempCwd(
+      (cwd) => {
+        writeCommand(cwd, "real", "body");
+      },
+      async (cwd) => {
+        const cmds = await loadCommands({
+          cwd,
+          homeDir: EMPTY_HOME,
+          builtinDirs: [join(cwd, "does-not-exist")],
+        });
+        expect([...cmds.keys()]).toEqual(["real"]);
+      },
+    );
+  });
+
+  test("$ARGUMENTS expansion works for a builtin-loaded command", async () => {
+    await withTempCwd(
+      (cwd) => {
+        writeBuiltinCommand(
+          join(cwd, "builtin-cmds"),
+          "focus",
+          "Set the current focus to: $ARGUMENTS",
+        );
+      },
+      async (cwd) => {
+        const cmds = await loadCommands({
+          cwd,
+          homeDir: EMPTY_HOME,
+          builtinDirs: [join(cwd, "builtin-cmds")],
+        });
+        const r = expand("/focus ship the CSV export", cmds);
+        expect(r.handled).toBe(true);
+        expect(r.expanded).toBe("Set the current focus to: ship the CSV export");
       },
     );
   });
@@ -152,7 +293,7 @@ describe("loadCommands — error wrapping (SlashCommandError)", () => {
           },
         }));
 
-        const err = await loadCommands({ cwd }).then(
+        const err = await loadCommands({ cwd, homeDir: EMPTY_HOME }).then(
           () => null,
           (e) => e,
         );

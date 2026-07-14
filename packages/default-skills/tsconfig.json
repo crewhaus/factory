@@ -1,0 +1,13 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "references": [
+    { "path": "../errors" },
+    { "path": "../skills-registry" },
+    { "path": "../slash-commands" }
+  ],
+  "include": ["src/**/*"]
+}
