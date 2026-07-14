@@ -205,6 +205,76 @@ const DEFAULT_COMPACTION_THRESHOLD = 0.85;
 const DEFAULT_SNIP_KEEP_HEAD = 4;
 const DEFAULT_SNIP_KEEP_TAIL = 20;
 
+// Explicit optional keys (not a bare index signature) so dot-access stays lint-
+// and tsc-clean.
+type JsonSchemaLike = {
+  type?: unknown;
+  properties?: Record<string, unknown>;
+  required?: unknown;
+  anyOf?: unknown;
+  oneOf?: unknown;
+  allOf?: unknown;
+};
+
+// Convert a registered tool to the Anthropic `input_schema` shape. Anthropic
+// requires a JSON-Schema OBJECT at the top level: it rejects a `type`-less
+// schema (`input_schema.type: Field required`) AND a top-level `anyOf`/`oneOf`/
+// `allOf` (`input_schema does not support oneOf, allOf, or anyOf at the top
+// level`). zod-to-json-schema renders a union / discriminatedUnion as exactly
+// that top-level `anyOf` — e.g. tool-plan's `PlanUpdate` (an action-discriminated
+// union) and tool-evm — so we FLATTEN a top-level union of object branches into
+// one object schema (see `flattenUnionToObject`). A schema that is already a
+// clean object passes through by reference untouched.
+function toAnthropicInputSchema(t: RegisteredTool): Anthropic.Tool.InputSchema {
+  const converted = (t.jsonSchema ??
+    zodToJsonSchema(t.inputSchema, { $refStrategy: "none" })) as JsonSchemaLike;
+  const union = converted.anyOf ?? converted.oneOf ?? converted.allOf;
+  // Already a clean top-level object schema (incl. an empty `z.object({})`).
+  if (converted.type === "object" && union === undefined) {
+    return converted as Anthropic.Tool.InputSchema;
+  }
+  if (Array.isArray(union)) {
+    return flattenUnionToObject(union as JsonSchemaLike[], converted.properties);
+  }
+  // Degenerate (no object type, no union): coerce to an empty object schema.
+  return { type: "object", properties: converted.properties ?? {} } as Anthropic.Tool.InputSchema;
+}
+
+// Merge a top-level union of object branches into a single object schema.
+// Anthropic forbids a top-level `anyOf`, but a nested `anyOf` on an individual
+// property is fine — so each property becomes the union of its per-branch
+// shapes, and `required` is the intersection across branches (in practice the
+// shared discriminator). The tool's own zod schema still validates the real
+// input at execute time, so the looser model-facing schema loses no safety.
+function flattenUnionToObject(
+  branches: JsonSchemaLike[],
+  baseProps: Record<string, unknown> | undefined,
+): Anthropic.Tool.InputSchema {
+  const perKey = new Map<string, unknown[]>();
+  const requiredSets: string[][] = [];
+  for (const b of branches) {
+    for (const [k, v] of Object.entries(b.properties ?? {})) {
+      const seen = perKey.get(k) ?? [];
+      if (!seen.some((e) => JSON.stringify(e) === JSON.stringify(v))) seen.push(v);
+      perKey.set(k, seen);
+    }
+    requiredSets.push(Array.isArray(b.required) ? (b.required as string[]) : []);
+  }
+  const properties: Record<string, unknown> = { ...(baseProps ?? {}) };
+  for (const [k, variants] of perKey) {
+    properties[k] = variants.length === 1 ? variants[0] : { anyOf: variants };
+  }
+  const required =
+    requiredSets.length > 0
+      ? requiredSets.reduce((acc, r) => acc.filter((x) => r.includes(x)))
+      : [];
+  return {
+    type: "object",
+    properties,
+    ...(required.length > 0 ? { required } : {}),
+  } as Anthropic.Tool.InputSchema;
+}
+
 // ---------------------------------------------------------------------------
 // v0.3.0 Goal 1 — the continuity seam (§2.3 requirements ledger, §2.5 mutable
 // tail region). All injected closures: runtime-core stays store-free; the
@@ -2272,10 +2342,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       ? tools.map((t) => ({
           name: t.name,
           description: t.description,
-          input_schema: (t.jsonSchema ??
-            zodToJsonSchema(t.inputSchema, {
-              $refStrategy: "none",
-            })) as Anthropic.Tool.InputSchema,
+          input_schema: toAnthropicInputSchema(t),
         }))
       : undefined;
   const toolByName = new Map(tools.map((t) => [t.name, t]));

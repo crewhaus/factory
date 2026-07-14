@@ -467,6 +467,53 @@ describe("runChatLoop tool execution", () => {
       customJsonSchema as unknown as Anthropic.Tool.InputSchema,
     );
   });
+
+  test("coerces a discriminatedUnion tool schema to a valid object input_schema", async () => {
+    // zod-to-json-schema renders a discriminatedUnion as a bare top-level
+    // `anyOf` with NO `type`, which Anthropic rejects with
+    // `tools.N.custom.input_schema.type: Field required`. Regression for
+    // tool-plan's `PlanUpdate` (an `action`-discriminated union) — the default
+    // cli harness advertises it once continuity is on.
+    const unionTool = buildTool({
+      name: "PlanUpdateLike",
+      description: "action-discriminated update",
+      inputSchema: z.discriminatedUnion("action", [
+        z.object({ action: z.literal("create"), title: z.string() }),
+        z.object({ action: z.literal("add_step"), text: z.string() }),
+      ]),
+      execute: async () => "ok",
+    });
+
+    const { adapter, capturedTools } = makeScriptedClient([
+      [{ type: "text", text: "fine", citations: null } as Anthropic.TextBlock],
+    ]);
+
+    const input = new PassThrough();
+    input.write("hi\n");
+    input.end();
+
+    await runChatLoop({
+      model: "test-model",
+      instructions: "test",
+      _adapter: adapter,
+      input,
+      tools: [unionTool],
+    });
+
+    const schema = capturedTools()[0]?.[0]?.input_schema as Record<string, unknown>;
+    // Anthropic requires a top-level object and forbids a top-level
+    // anyOf/oneOf/allOf…
+    expect(schema.type).toBe("object");
+    expect(schema.anyOf).toBeUndefined();
+    expect(schema.oneOf).toBeUndefined();
+    expect(schema.allOf).toBeUndefined();
+    // …so the discriminated branches are flattened into `properties` (the model
+    // still sees every field, incl. the `action` discriminator).
+    const props = schema.properties as Record<string, unknown>;
+    expect(props.action).toBeDefined();
+    expect(props.title).toBeDefined();
+    expect(props.text).toBeDefined();
+  });
 });
 
 /**
