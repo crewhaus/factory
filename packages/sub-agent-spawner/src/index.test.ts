@@ -507,6 +507,57 @@ describe("spawnSubAgent — §7.1 seam threading into the child loop", () => {
     }
   });
 
+  test("learning on: wireMemory's rendered learning-loop skill reaches the CHILD prompt (PR 13 ∩ PR 17)", async () => {
+    // Cross-branch composition pin (v0.3.0 final integration): each link is
+    // pinned alone — wireMemory renders learning-loop into options.skills
+    // (memory-service), the bridge carries opts.skills (runtime-core), and
+    // parent.skills renders the child's skills block (above). This test
+    // composes them: a REAL wireMemory call with `learning:` on supplies the
+    // parent's skills list, and the child's system blocks must list the
+    // learning-loop skill — children get the skills LIST, so a learning
+    // parent's children see the learning discipline too.
+    const { wireMemory } = await import("@crewhaus/memory-service");
+    const root = newTempRoot();
+    try {
+      const wired = await wireMemory(
+        {
+          specName: "learning-parent",
+          memory: { wiki: { enabled: true, requireSources: true } },
+          continuity: {},
+          learning: { domain: "specialty coffee extraction science" },
+        },
+        {
+          catalog: { register: () => {} },
+          cwd: root,
+          homeDir: join(root, "home"),
+        },
+      );
+      const parentSkills = wired.options.skills ?? [];
+      expect(parentSkills.some((s) => s.name === "learning-loop")).toBe(true);
+
+      const { parent, parentLog } = await makeParent(root);
+      const withSkills: ParentRunHandle = { ...parent, skills: parentSkills };
+      const { adapter, requests } = makeCapturingClient([
+        [{ type: "text", text: "done", citations: null } as Anthropic.TextBlock],
+      ]);
+      await spawnSubAgent(withSkills, {
+        def: DEF_NO_TOOLS,
+        prompt: "study up first",
+        permissionMode: "bypass",
+        permissionRules: { ...emptyRuleSet },
+        childTools: [],
+        sessionRootDir: root,
+        _client: adapter,
+      });
+      const skillsBlock = childSystemTexts(requests()).find((t) => t.includes("Available skills"));
+      expect(skillsBlock).toBeDefined();
+      expect(skillsBlock).toContain("learning-loop");
+      await parentLog.close();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("read-only continuity: loadPlan renders the <current_plan> tail in the child; the seam carries no write closures", async () => {
     const root = newTempRoot();
     try {

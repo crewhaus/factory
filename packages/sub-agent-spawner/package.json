@@ -23,6 +23,7 @@
     "@crewhaus/runtime-core": "workspace:*"
   },
   "devDependencies": {
+    "@crewhaus/memory-service": "workspace:*",
     "@crewhaus/permission-engine": "workspace:*",
     "@crewhaus/tool-builder": "workspace:*",
     "@crewhaus/tool-catalog": "workspace:*",

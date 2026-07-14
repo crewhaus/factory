@@ -10,6 +10,7 @@
     { "path": "../boundary-classifier" },
     { "path": "../errors" },
     { "path": "../event-log" },
+    { "path": "../memory-service" },
     { "path": "../permission-engine" },
     { "path": "../recovery-engine" },
     { "path": "../run-context" },

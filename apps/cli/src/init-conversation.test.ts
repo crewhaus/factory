@@ -295,6 +295,16 @@ describe("runConversationalInterview — the full conversation", () => {
     expect(toolNames).toContain("ask_user");
     expect(toolNames).toContain("emit_spec");
     expect(toolNames).toContain("FocusWrite");
+    // Cross-branch seam pin (v0.3.0 final integration): the interview's
+    // fragment is continuity-only (`continuity: {}`) — wireMemory must NOT
+    // boot the thredz/learning surfaces (PR 16/17) for the creator
+    // conversation: no wiki tool vocabulary, no run_exam, and no rendered
+    // learning-loop skill reaching the system blocks.
+    expect(toolNames.some((n) => n.startsWith("wiki_"))).toBe(false);
+    expect(toolNames).not.toContain("log_knowledge_gap");
+    expect(toolNames).not.toContain("run_exam");
+    const systemBlocksText = JSON.stringify(main.requests()[0]?.system ?? []);
+    expect(systemBlocksText).not.toContain("learning-loop");
 
     // The clarifying question was surfaced on the terminal…
     expect(
