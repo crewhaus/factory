@@ -19,6 +19,8 @@ const PALETTE: Record<TraceEventKind, string> = {
   mcp_call_end: "\x1b[35m",
   hook_fired: "\x1b[35m",
   compaction_fired: "\x1b[32m", // green
+  // v0.3.0 Goal 1 — boot-time prompt-cache marker rotation bookkeeping.
+  cache_rotation: "\x1b[2m", // dim — routine housekeeping
   permission_decision: "\x1b[33m",
   error_recovered: "\x1b[31m", // red
   // v0.3.0 Goal 6 — the structured terminal-failure report block.

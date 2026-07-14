@@ -52,6 +52,29 @@ export type EventKind =
   // is unaffected, and readers written before this kind existed keep
   // parsing (every session-log reader branches on the kinds it knows).
   | "run_failed"
+  // v0.3.0 Goal 1 (§2.3) — verbatim externalization of content EVICTED by
+  // compaction, appended by runtime-core BEFORE `snip` drops middle messages
+  // and BEFORE `autoCompact` replaces history (gated on the continuity
+  // seam's `ledger !== false`). Payload `{ role: "user" | "assistant" |
+  // "tool", text, turnNumber? }` — `text` is the evicted content verbatim,
+  // zero model trust. Evicted USER messages are additionally folded into the
+  // in-run requirements ledger and re-injected into every model call's
+  // `<requirements_ledger>` tail block, so a user's clarification answer
+  // survives any number of compactions regardless of summary quality; the
+  // assistant/tool records are episodic externalization for a later recall
+  // integration. `--resume` rebuilds the ledger deterministically from these
+  // events. Non-conversational: `replayMessageHistory` ignores it, so
+  // `--resume` replay is unaffected, and readers written before this kind
+  // existed keep parsing (every session-log reader branches on the kinds it
+  // knows and skips the rest).
+  | "context_evicted"
+  // Payload today: `{ kind: "snip" | "autocompact" | "reactive", before,
+  // after }` message counts, PLUS (v0.3.0 §2.3, additive) `summary?` — the
+  // verbatim autocompact summary TEXT that replaced the history, persisted
+  // so post-mortems and verifiers can check what the model claimed the
+  // conversation contained (before/after counts alone said nothing about
+  // WHAT survived). Absent on pure snip steps and on records written before
+  // v0.3.0; old readers skip the unknown field.
   | "compaction"
   | "sub_agent_start"
   | "sub_agent_end"

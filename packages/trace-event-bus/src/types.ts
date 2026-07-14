@@ -153,6 +153,24 @@ export type CompactionFiredEvent = TraceEventEnvelope & {
   phase: "pre-turn" | "reactive";
 };
 
+/**
+ * v0.3.0 Goal 1 (§2.5) — published by runtime-core when
+ * `prompt-cache-manager.manage()` injects a fresh cache marker at boot.
+ * `rotatedAt` is the ms-epoch timestamp the caller must persist and thread
+ * back as `RunChatLoopOptions.promptCacheLastRotatedAt` on the next run —
+ * a fresh value makes `manage()` skip, so the harness stops force-rotating
+ * (and cold-starting the cached prefix) on every boot. Until this event
+ * existed the rotation bookkeeping was dead wiring: nothing observed a
+ * rotation and nothing could persist the timestamp. The store wiring lands
+ * with memory-service/threading (PR 10/11); this event + the
+ * `onPromptCacheRotated` runtime seam are the observable halves.
+ */
+export type CacheRotationEvent = TraceEventEnvelope & {
+  kind: "cache_rotation";
+  /** ms-epoch timestamp of the fresh marker (ManageResult.rotatedAt). */
+  rotatedAt: number;
+};
+
 export type PermissionDecisionEvent = TraceEventEnvelope & {
   kind: "permission_decision";
   toolName: string;
@@ -602,6 +620,7 @@ export type TraceEvent =
   | McpCallEndEvent
   | HookFiredEvent
   | CompactionFiredEvent
+  | CacheRotationEvent
   | PermissionDecisionEvent
   | ErrorRecoveredEvent
   | RunFailedEvent
