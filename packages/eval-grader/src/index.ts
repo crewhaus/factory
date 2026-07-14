@@ -13,7 +13,7 @@
  */
 import { RuntimeError } from "@crewhaus/errors";
 
-export type { Grader, GradeResult, RunResult, ToolCall } from "./types";
+export type { Grader, GradeResult, RunArtifacts, RunResult, ToolCall } from "./types";
 export { GraderError } from "./errors";
 
 export {

@@ -18,7 +18,8 @@
     "yaml": "^2.6.0"
   },
   "devDependencies": {
-    "@crewhaus/embedder": "workspace:*"
+    "@crewhaus/embedder": "workspace:*",
+    "@crewhaus/memory-service": "workspace:*"
   },
   "license": "Apache-2.0",
   "author": {

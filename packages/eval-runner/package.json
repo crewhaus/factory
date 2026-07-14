@@ -45,6 +45,10 @@
     "@crewhaus/wiki-store": "workspace:*",
     "zod": "^3.23.8"
   },
+  "devDependencies": {
+    "@crewhaus/grader-continuity": "workspace:*",
+    "@crewhaus/grader-registry": "workspace:*"
+  },
   "license": "Apache-2.0",
   "author": {
     "name": "Max Meier",

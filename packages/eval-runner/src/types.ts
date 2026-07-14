@@ -99,6 +99,15 @@ export type EvalRunSummary = {
   readonly outDir: string;
 };
 
+/**
+ * Structural view of `@crewhaus/grader-registry`'s `GraderRegistry` — just
+ * the lookup the runner needs to resolve `type: registry` grader entries,
+ * kept structural so this package takes no grader-registry dependency.
+ */
+export type GraderLookup = {
+  lookup(name: string): Grader;
+};
+
 export type RunEvalOptions = {
   readonly runId?: string;
   readonly concurrency?: number;
@@ -107,6 +116,14 @@ export type RunEvalOptions = {
   readonly judgeModel?: string;
   readonly invoker?: AgentInvoker;
   readonly cwd?: string;
+  /**
+   * v0.3.0 §7.3 (PR 19) — resolves `type: registry` grader entries by name.
+   * An eval config opts into registered grader packs (`continuity.*` after
+   * `registerContinuityGraders`, `twelve.*` after `register12MetricRubric`)
+   * without this package importing them; omitting the registry while the
+   * config carries a registry entry is a loud `RunnerError` at run start.
+   */
+  readonly graderRegistry?: GraderLookup;
   /**
    * Retry a sample ONCE, within the run, when its result is an ERROR
    * (`SampleResult.error` — the INVOKER failed: provider timeout, 429,
