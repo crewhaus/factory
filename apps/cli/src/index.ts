@@ -69,11 +69,12 @@ import { GENERATED_README_MARKER, type IrBudget } from "@crewhaus/ir";
 import { createLogger } from "@crewhaus/logging";
 import { McpHost, resolveMcpServerConfig } from "@crewhaus/mcp-host";
 import {
+  captureChildFacts,
   captureFacts,
   createMemoryStore,
   deriveMemoryDecision,
   summarizeDurableFactsWithEvidence,
-  turnsFromEvents,
+  turnsFromEventsWithChildren,
 } from "@crewhaus/memory-store";
 import {
   BUILTIN_DEFAULT_RULES,
@@ -4265,11 +4266,27 @@ async function runRunCli(
               // facts land with provenance {sessionId, evidence: toolUseIds}.
               // The sessionId tag is kept for back-compat/grep (and it is what
               // `crewhaus migrate memories` derives provenance from on v1 files).
-              const turns = turnsFromEvents(events);
+              // v0.3.0 §7.1: the walk follows sub_agent_start brackets into
+              // child session JSONLs (lazy, capped per child) so researcher
+              // sub-agent findings reach the store too — child facts carry
+              // provenance {sessionId: <child>} plus a subagent:<name> tag.
+              const { turns, children } = await turnsFromEventsWithChildren(
+                events,
+                (childId, maxEvents) =>
+                  (
+                    parseJsonlObjects(readFileSync(sessionJsonlPath(childId), "utf-8")) as Array<{
+                      kind?: string;
+                      payload?: unknown;
+                    }>
+                  ).slice(0, maxEvents),
+              );
               const facts = summarizeDurableFactsWithEvidence(turns);
               const written = await captureFacts(memoryStore, facts, ["auto-capture", sessionId], {
                 sessionId,
               });
+              written.push(
+                ...(await captureChildFacts(memoryStore, children, ["auto-capture", sessionId])),
+              );
               if (written.length > 0) {
                 process.stdout.write(
                   `[memory] auto-captured ${written.length} durable fact(s) into ${memoryStore.path()}\n`,

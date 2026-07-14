@@ -676,6 +676,12 @@ function renderMemory(ir: IrV0): { imports: string[]; bootBlock: string; field: 
     recallK: __memDecision.recallK,
     recall: async (query, k) => (await __memStore.recall(query, k)).map((r) => r.entry.text),`
     : "";
+  // TODO(integration): PR 13 landed the shared sub-agent capture walk in
+  // memory-store (`turnsFromEventsWithChildren` + `captureChildFacts`, capped
+  // per child) and wired the interpreter path (apps/cli runRunCli). Mirror it
+  // in this emitted captureSeam when PR 10's memory-service refactor lands —
+  // deliberately NOT changed here to avoid a parallel-edit collision on the
+  // emitter's memory wiring (byte-diff-pinned by PR 10).
   const captureSeam = autoCapture
     ? `
     autoCapture: true,

@@ -33,7 +33,7 @@ import type Anthropic from "@anthropic-ai/sdk";
  * next, not what is already mid-flight.
  */
 import type { CanonicalContentBlock, StreamEvent, TokenUsage } from "@crewhaus/adapter-anthropic";
-import { RuntimeError } from "@crewhaus/errors";
+import { RuntimeError, isRunFailedError } from "@crewhaus/errors";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { executeTool } from "@crewhaus/tool-executor";
 
@@ -170,6 +170,12 @@ export async function executeStreaming(
   const openOrder: number[] = [];
   let stopReason = "end_turn";
   let usage: TokenUsage = { input: 0, output: 0 };
+  // v0.3.0 §7.1 — a RunFailedError escaping a tool dispatch is a terminal
+  // RUN verdict (a sub-agent's billing/auth failure escalated by the
+  // spawner). It must not dissolve into an is_error tool result: capture
+  // the first one, short-circuit the queue, and rethrow after the drain so
+  // in-flight siblings still settle.
+  let fatalError: unknown;
 
   if (opts.abortSignal) {
     if (opts.abortSignal.aborted) {
@@ -274,6 +280,17 @@ export async function executeStreaming(
       })
       .catch((err: unknown) => {
         entry.status = "done";
+        if (fatalError === undefined && isRunFailedError(err)) {
+          fatalError = err;
+          if (!siblingAbort.signal.aborted) {
+            siblingAbort.abort("fatal_error");
+            fire({
+              kind: "sibling-aborted",
+              reason: "fatal_error",
+              failedToolName: entry.block.name,
+            });
+          }
+        }
         const msg = err instanceof Error ? err.message : String(err);
         results.set(entry.block.id, {
           type: "tool_result",
@@ -432,6 +449,11 @@ export async function executeStreaming(
     await Promise.race(inFlight);
     processQueue();
   }
+
+  // v0.3.0 §7.1 — every sibling has settled; surface the terminal verdict
+  // now. The caller (runtime-core's streaming path) routes it to recovery,
+  // which halts the run with the report verbatim.
+  if (fatalError !== undefined) throw fatalError;
 
   // Build the final content array in open-order so tool_use blocks
   // surface in the same order they came down the wire (matching the

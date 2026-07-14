@@ -1,4 +1,4 @@
-import { CrewhausError } from "@crewhaus/errors";
+import { CrewhausError, isRunFailedError } from "@crewhaus/errors";
 import type { RegisteredTool, ToolExecuteResult } from "@crewhaus/tool-catalog";
 import { compilePattern, matchesPattern } from "@crewhaus/tool-permission-matcher";
 import { validateToolInput } from "@crewhaus/tool-validate";
@@ -76,6 +76,12 @@ export async function executeTool(
     });
     return { toolUseId, content, isError: false };
   } catch (err) {
+    // v0.3.0 §7.1 — a RunFailedError is a terminal RUN verdict (e.g. a
+    // sub-agent's billing/auth failure escalated by the spawner), not a
+    // tool error: let it propagate so the run halts with its classified
+    // report instead of dissolving into an is_error string the model
+    // would try to talk its way past.
+    if (isRunFailedError(err)) throw err;
     const msg = err instanceof Error ? err.message : String(err);
     return { toolUseId, content: msg, isError: true };
   }
