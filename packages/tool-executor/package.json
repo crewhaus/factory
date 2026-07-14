@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-executor",
-  "version": "0.2.4",
+  "version": "0.3.0",
   "type": "module",
   "description": "Execute a single tool: validate → permission-check → invoke → format result",
   "main": "src/index.ts",
@@ -37,5 +37,10 @@
   "publishConfig": {
     "access": "public"
   },
-  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ]
 }

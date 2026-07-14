@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/wiki-store",
-  "version": "0.2.4",
+  "version": "0.3.0",
   "type": "module",
   "description": "0.3.0 memory release §3.1 — local update-in-place wiki: versioned markdown articles (supersede, never delete), optimistic concurrency (stale_article_version), hybrid BM25+embedding recall with one-hop [[wikilink]] expansion.",
   "main": "src/index.ts",
@@ -39,5 +39,10 @@
   "publishConfig": {
     "access": "public"
   },
-  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ]
 }

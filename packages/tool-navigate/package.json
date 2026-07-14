@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-navigate",
-  "version": "0.2.4",
+  "version": "0.3.0",
   "type": "module",
   "description": "Navigate tool — drives driver.goto(url) for the BROW agent (Section 25 BROW)",
   "main": "src/index.ts",
@@ -36,5 +36,10 @@
   "publishConfig": {
     "access": "public"
   },
-  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ]
 }

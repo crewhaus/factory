@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/permission-engine",
-  "version": "0.2.4",
+  "version": "0.3.0",
   "type": "module",
   "description": "Permission decisions: modes (default/plan/auto/bypass) over a 5-source RuleSet, built on @crewhaus/tool-permission-matcher",
   "main": "src/index.ts",
@@ -34,5 +34,10 @@
   "publishConfig": {
     "access": "public"
   },
-  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ]
 }

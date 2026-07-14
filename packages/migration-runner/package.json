@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/migration-runner",
-  "version": "0.2.4",
+  "version": "0.3.0",
   "type": "module",
   "description": "Batch-migrate every spec in a registry: dry-run + write, idempotent re-runs",
   "main": "src/index.ts",
@@ -35,5 +35,11 @@
   "publishConfig": {
     "access": "public"
   },
-  "files": ["src", "templates", "README.md", "LICENSE", "NOTICE"]
+  "files": [
+    "src",
+    "templates",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ]
 }

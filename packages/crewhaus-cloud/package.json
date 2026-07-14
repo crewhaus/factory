@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/crewhaus-cloud",
-  "version": "0.2.4",
+  "version": "0.3.0",
   "type": "module",
   "description": "Managed-as-a-service composite recipe: target-managed + helm-chart Kustomize overlay + Terraform module for GKE/EKS/AKS provisioning (Section 32)",
   "main": "src/index.ts",
@@ -34,5 +34,10 @@
   "publishConfig": {
     "access": "public"
   },
-  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ]
 }

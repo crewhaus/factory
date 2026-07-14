@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/federation-protocol",
-  "version": "0.2.4",
+  "version": "0.3.0",
   "type": "module",
   "description": "Cross-deployment A2A wire protocol: federation envelope (extends @crewhaus/a2a-protocol) + mTLS HTTPS POST transport with cert pinning (Section 34)",
   "main": "src/index.ts",
@@ -32,5 +32,10 @@
   "publishConfig": {
     "access": "public"
   },
-  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ]
 }

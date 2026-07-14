@@ -1,8 +1,8 @@
 {
   "name": "@crewhaus/target-research-bundle",
-  "version": "0.2.4",
+  "version": "0.3.0",
   "type": "module",
-  "description": "Codegen for the RES target \u2014 emits a resumable daemon that drives planner \u2192 branches \u2192 report (Section 23 RES)",
+  "description": "Codegen for the RES target — emits a resumable daemon that drives planner → branches → report (Section 23 RES)",
   "main": "src/index.ts",
   "types": "src/index.ts",
   "exports": {
@@ -35,5 +35,10 @@
   "publishConfig": {
     "access": "public"
   },
-  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ]
 }

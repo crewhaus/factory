@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/plugin-sdk",
-  "version": "0.2.4",
+  "version": "0.3.0",
   "type": "module",
   "description": "Plugin SDK v2 — public typed surface for third-party tools / channels / models / graders / target backends, with manifest validation and Ed25519 signature verification (Section 41)",
   "main": "src/index.ts",
@@ -33,5 +33,10 @@
   "publishConfig": {
     "access": "public"
   },
-  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ]
 }

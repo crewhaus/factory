@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/adapter-openai",
-  "version": "0.2.4",
+  "version": "0.3.0",
   "type": "module",
   "description": "OpenAI provider adapter (Section 17). Chat Completions streaming + function calls",
   "main": "src/index.ts",
@@ -38,5 +38,10 @@
   "publishConfig": {
     "access": "public"
   },
-  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ]
 }

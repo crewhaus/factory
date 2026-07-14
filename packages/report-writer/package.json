@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/report-writer",
-  "version": "0.2.4",
+  "version": "0.3.0",
   "type": "module",
   "description": "Markdown + JSON report assembly from citations + branch answers (Section 23 RES)",
   "main": "src/index.ts",
@@ -33,5 +33,10 @@
   "publishConfig": {
     "access": "public"
   },
-  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ]
 }

@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/prompt-optimizer",
-  "version": "0.2.4",
+  "version": "0.3.0",
   "type": "module",
   "description": "DSPy-style automated prompt tuning. Search over candidate prompt mutations using eval-runner as the fitness function.",
   "main": "src/index.ts",
@@ -36,5 +36,10 @@
   "publishConfig": {
     "access": "public"
   },
-  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ]
 }

@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/runtime-core",
-  "version": "0.2.4",
+  "version": "0.3.0",
   "type": "module",
   "description": "Minimal runtime imported by generated harness bundles",
   "main": "src/index.ts",
@@ -76,5 +76,10 @@
   "publishConfig": {
     "access": "public"
   },
-  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ]
 }

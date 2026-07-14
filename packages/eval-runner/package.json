@@ -1,8 +1,8 @@
 {
   "name": "@crewhaus/eval-runner",
-  "version": "0.2.4",
+  "version": "0.3.0",
   "type": "module",
-  "description": "Eval runner \u2014 per-sample isolation, concurrency, grading, persistence",
+  "description": "Eval runner — per-sample isolation, concurrency, grading, persistence",
   "main": "src/index.ts",
   "types": "src/index.ts",
   "exports": {
@@ -67,5 +67,10 @@
   "publishConfig": {
     "access": "public"
   },
-  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ]
 }

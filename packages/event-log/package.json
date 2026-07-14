@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/event-log",
-  "version": "0.2.4",
+  "version": "0.3.0",
   "type": "module",
   "description": "Append-only JSONL transcript log per session",
   "main": "src/index.ts",
@@ -33,5 +33,10 @@
   "publishConfig": {
     "access": "public"
   },
-  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ]
 }

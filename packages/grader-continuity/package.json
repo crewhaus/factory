@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/grader-continuity",
-  "version": "0.2.4",
+  "version": "0.3.0",
   "type": "module",
   "description": "v0.3.0 memory-release eval layer (§7.3) — deterministic continuity graders computed from a sample's session artifacts: re-ask rate, REQ retention, proof honesty (claimed vs proven), pickup success, cost per proven outcome",
   "main": "src/index.ts",
@@ -38,5 +38,10 @@
   "publishConfig": {
     "access": "public"
   },
-  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ]
 }

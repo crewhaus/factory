@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/channel-adapter-discord",
-  "version": "0.2.4",
+  "version": "0.3.0",
   "type": "module",
   "description": "Discord channel adapter: Ed25519 signature verification + slash-command/button/modal interaction parsing + interaction-response API (Section 33)",
   "main": "src/index.ts",
@@ -32,5 +32,10 @@
   "publishConfig": {
     "access": "public"
   },
-  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ]
 }

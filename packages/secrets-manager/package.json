@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/secrets-manager",
-  "version": "0.2.4",
+  "version": "0.3.0",
   "type": "module",
   "description": "Pluggable secrets backend with rotation + audit-log integration: env-var, file, vault",
   "main": "src/index.ts",
@@ -34,5 +34,10 @@
   "publishConfig": {
     "access": "public"
   },
-  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ]
 }

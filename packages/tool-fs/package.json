@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-fs",
-  "version": "0.2.4",
+  "version": "0.3.0",
   "type": "module",
   "description": "Built-in filesystem tools (Read, Write, Edit, Glob, Grep) sandboxed to process.cwd()",
   "main": "src/index.ts",
@@ -40,5 +40,10 @@
   "publishConfig": {
     "access": "public"
   },
-  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ]
 }

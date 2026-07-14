@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/target-voice",
-  "version": "0.2.4",
+  "version": "0.3.0",
   "type": "module",
   "description": "Codegen for the VOICE target — emits a realtime daemon (Section 24 VOICE)",
   "main": "src/index.ts",
@@ -34,5 +34,10 @@
   "publishConfig": {
     "access": "public"
   },
-  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ]
 }

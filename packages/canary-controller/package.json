@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/canary-controller",
-  "version": "0.2.4",
+  "version": "0.3.0",
   "type": "module",
   "description": "Percent-of-traffic rollout with eval-gated promotion. Hash-routes requests across two pinned versions and auto-rolls-back on regression.",
   "main": "src/index.ts",
@@ -35,5 +35,10 @@
   "publishConfig": {
     "access": "public"
   },
-  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ]
 }

@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/wallet-engine",
-  "version": "0.2.4",
+  "version": "0.3.0",
   "type": "module",
   "description": "Wallet custody + sign-request flow. Routes every transaction through simulation, transaction-policy enforcement, approval gate, then broadcast. §47 slice 1.",
   "main": "src/index.ts",
@@ -34,5 +34,10 @@
   "publishConfig": {
     "access": "public"
   },
-  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ]
 }

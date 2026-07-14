@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/compiler-worker",
-  "version": "0.2.4",
+  "version": "0.3.0",
   "type": "module",
   "description": "Stateless Cloudflare Worker exposing the CrewHaus compiler over HTTP for the studio PWA",
   "main": "src/index.ts",
@@ -42,5 +42,10 @@
   "publishConfig": {
     "access": "public"
   },
-  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ]
 }

@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/branch-history",
-  "version": "0.2.4",
+  "version": "0.3.0",
   "type": "module",
   "description": "Branch + diff helpers over checkpoint-store — time-travel utilities for the GRPH target",
   "main": "src/index.ts",
@@ -33,5 +33,10 @@
   "publishConfig": {
     "access": "public"
   },
-  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ]
 }
