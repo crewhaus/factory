@@ -106,6 +106,20 @@ function toDist(p: string, ext: ".js" | ".d.ts"): string {
   return dotSlash ? `./${rel}` : rel;
 }
 
+/** Default packed allowlist for a package with no explicit `files`. */
+const DEFAULT_FILES = ["src", "README.md", "LICENSE", "NOTICE"];
+
+/**
+ * `--for-publish` packed `files`: map `src` → `dist`, keep every other entry.
+ * Runtime data dirs that ship uncompiled (e.g. default-skills' `skills`/
+ * `commands`) MUST survive into the tarball — replacing the whole array with a
+ * literal `["dist", …]` silently drops them. `dist` is guaranteed present.
+ */
+function distFilesForPublish(files: readonly string[]): string[] {
+  const mapped = files.map((f) => (f === "src" ? "dist" : f));
+  return mapped.includes("dist") ? mapped : ["dist", ...mapped];
+}
+
 /** A single exports target: "./src/x.ts" → { types, import }; conditional objects remap in place. */
 function distExportTarget(value: unknown): unknown {
   if (typeof value === "string") {
@@ -231,7 +245,7 @@ function applyRelease(pkg: Json, pkgDir: string, isRoot: boolean): boolean {
 
   // files (default to src + README + LICENSE; respect existing if present)
   if (pkg.files === undefined) {
-    set("files", ["src", "README.md", "LICENSE", "NOTICE"]);
+    set("files", [...DEFAULT_FILES]);
   }
 
   // --for-publish: flip entrypoints + the packed `files` from src → built dist so the
@@ -250,7 +264,13 @@ function applyRelease(pkg: Json, pkgDir: string, isRoot: boolean): boolean {
       set("exports", distExportTarget(pkg.exports));
     }
     if (pkg.bin !== undefined) set("bin", distBin(pkg.bin));
-    set("files", ["dist", "README.md", "LICENSE", "NOTICE"]);
+    // Map the packed allowlist src → dist, PRESERVING every non-`src` entry.
+    // A hardcoded `["dist", …]` here dropped runtime data dirs that ship
+    // uncompiled — e.g. `@crewhaus/default-skills`' `skills/`/`commands/`
+    // (its `dist/index.js` reads `skills/<name>/SKILL.md` at boot), so every
+    // compiled agent-loop bundle crashed at boot with ENOENT once default-on
+    // continuity pulled the package in. Only `src` maps to `dist`.
+    set("files", distFilesForPublish((pkg.files as string[] | undefined) ?? DEFAULT_FILES));
   }
 
   return changed;
