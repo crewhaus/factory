@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # release.yml `uses:` this workflow as a publish gate so a tagged tree that
+  # would fail lint/typecheck/test can never ship. Reusing the CI job (rather
+  # than duplicating the steps) keeps the release bar identical to the PR bar —
+  # exactly how smoke-runtime.yml is reused. See release.yml's `ci` job.
+  workflow_call:
 
 permissions:
   contents: read

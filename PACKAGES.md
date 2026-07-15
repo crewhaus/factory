@@ -124,7 +124,7 @@ All twelve publish in their own lockstep (currently 0.1.5), independent of the f
 
 Releases are **lockstep** — every publishable package ships the same version, cut with the two scripts under `scripts/` (a changesets config existed early on but was never adopted and has been removed).
 
-1. **Bump.** `bun scripts/release-prep.ts --version <next>` stamps every publishable package and re-runs biome over the touched files. Land the bump on `main` via PR with the workspace green (`bun run typecheck && bun run lint && bun test`).
+1. **Bump.** `bun scripts/release-prep.ts --version <next>` stamps every publishable package, then reformats **and verifies** the touched files with the pinned biome — it hard-fails rather than committing an un-normalized bump. Land the bump on `main` **via PR** with the workspace green (`bun run typecheck && bun run lint && bun test`), never a direct push: the v0.3.0 cut was pushed straight to `main` and shipped a lint-red tree that stayed red for a day. Belt-and-suspenders, the Release workflow now gates every publish channel on the full CI bar (its `ci` job reuses `.github/workflows/ci.yml`), so a red tag can no longer publish even if a bump lands un-gated.
 2. **Auth.** Export a classic npm *Automation* token as `NPM_CONFIG_TOKEN`. A 2FA-bound token dead-ends `bun publish` in a web-OTP prompt.
 3. **Canary.** `bun scripts/publish-workspace.ts --filter @crewhaus/errors` — one leaf package proves auth before the full fan-out.
 4. **Publish.** `bun scripts/publish-workspace.ts` — topological order, skips versions already on the registry. Must stay on `bun publish`: it rewrites `workspace:*` to concrete versions at pack time; `npm publish` would ship the literal range and break every install.
