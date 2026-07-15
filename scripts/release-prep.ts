@@ -312,14 +312,36 @@ if (errors.length) {
 // writeJson's JSON.stringify array style differs from biome's (single-line
 // `files` arrays get expanded); reformat the touched files so the bump
 // commits lint-clean — the v0.1.2 cut hit 200 lint errors without this.
+//
+// This step is load-bearing: v0.3.0 shipped 209 unformatted `files` arrays to
+// main (CI red for a day) because the reformat silently no-op'd. Two guards make
+// that impossible:
+//   1. Invoke the workspace's PINNED biome (node_modules/.bin/biome) rather than
+//      `bun x biome` — the latter resolves to whatever biome is cached/latest
+//      when node_modules isn't populated, and a different major formats
+//      package.json differently, so the write lands non-canonical.
+//   2. VERIFY after writing. `biome check --write` exits 0 even when it changes
+//      nothing, so a no-op reformat would otherwise pass silently; a second
+//      `biome check` (no --write) over the touched files hard-fails the script
+//      if anything is still unformatted. release-prep can no longer exit 0
+//      while leaving an un-normalized bump for CI to reject after it hits main.
 if (written.length > 0) {
-  const fmt = spawnSync("bun", ["x", "biome", "check", "--write", ...written], {
-    cwd: ROOT,
-    stdio: "inherit",
-  });
+  const biome = join(ROOT, "node_modules", ".bin", "biome");
+  if (!existsSync(biome)) {
+    console.error(`✗ biome not found at ${relative(ROOT, biome)} — run \`bun install\` first.`);
+    process.exit(1);
+  }
+  const fmt = spawnSync(biome, ["check", "--write", ...written], { cwd: ROOT, stdio: "inherit" });
   if (fmt.status !== 0) {
     console.error("✗ biome reformat failed; run `bun run lint:fix` before committing the bump.");
     process.exit(1);
   }
-  console.log(`Reformatted ${written.length} written file(s) with biome.`);
+  const verify = spawnSync(biome, ["check", ...written], { cwd: ROOT, stdio: "inherit" });
+  if (verify.status !== 0) {
+    console.error(
+      "✗ package.json still not biome-clean after reformat — refusing to leave an un-normalized bump. Run `bun run lint:fix`, then re-run.",
+    );
+    process.exit(1);
+  }
+  console.log(`Reformatted + verified ${written.length} written file(s) with biome.`);
 }
