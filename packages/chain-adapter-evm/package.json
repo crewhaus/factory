@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/chain-adapter-evm",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "type": "module",
   "description": "EVM chain adapter: JSON-RPC over fetch with single/quorum/fallback dispatch, finality enforcement, and §41 boundary classification of every response (Section 47, Slice 0).",
   "main": "src/index.ts",

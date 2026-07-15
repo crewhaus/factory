@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-plan",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "type": "module",
   "description": "v0.3.0 Goal 1 — Focus*/Plan*/Goal*/MemoryClear RegisteredTools over @crewhaus/continuity-store: the claimed→proven proof ladder as a tool surface, with plan_update/goal_update/action_proof event emission via an injected append seam.",
   "main": "src/index.ts",

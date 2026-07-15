@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/compliance-controls",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "type": "module",
   "description": "SOC 2 / ISO 27001 / HIPAA control-evidence collection. Walks audit-log per control, writes signed evidence bundles (Section 39)",
   "main": "src/index.ts",

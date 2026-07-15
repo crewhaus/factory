@@ -10,7 +10,10 @@ For day-to-day visibility on what's in flight, see the [GitHub Project](https://
 - The spec schema is versioned from day one (`spec_version: v0`).
 - 1.0 ships when: schema is stable, the eval-driven optimization loop is documented and tested for at least three target shapes, and the boundary-classifier inventory is complete.
 
-## What's shipped (current: v0.3.0)
+## What's shipped (current: v0.3.1)
+
+**v0.3.1 — the memory-release patch:** republishes the memory-release packages with a packaging fix so compiled agent-loop bundles boot. `@crewhaus/default-skills@0.3.0` (and six `templates/` packages) shipped without their runtime data dirs — the publish step dropped every non-`src` `files` entry — so default-on continuity made every compiled bundle crash at boot on a missing `SKILL.md`; `release-prep --for-publish` now preserves data dirs. Also carries the cost-tracker unpriced-model fix and the refreshed pricing/capability tables (Opus 4.8 / Sonnet 5 / Haiku 4.5 / Fable 5). See the [changelog](CHANGELOG.md).
+
 
 **Compiler core (v0.1.0):**
 

@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/template-marketplace-client",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "type": "module",
   "description": "Studio Marketplace integration: list / search / install community templates; one-click publish flow (Section 40)",
   "main": "src/index.ts",

@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/grader-multimodal",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "type": "module",
   "description": "Multimodal graders: image_similarity (perceptual hash + DSSIM), image_ocr_then_grade, audio_transcript_match (Section 38)",
   "main": "src/index.ts",

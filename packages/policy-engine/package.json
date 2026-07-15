@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/policy-engine",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "type": "module",
   "description": "Side-effect classification + audit-and-allow policy decisions for the managed-daemon target",
   "main": "src/index.ts",
