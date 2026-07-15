@@ -60,10 +60,20 @@ jobs:
     uses: ./.github/workflows/smoke-runtime.yml
     secrets: inherit
 
+  ci:
+    name: Full CI gate (lint + typecheck + test)
+    # A release must clear the same static + test bar as a PR into main.
+    # v0.3.0 shipped from a lint-red tree because the only publish gate was
+    # smoke-runtime — reuse the CI workflow so a tagged tree that would fail
+    # `bun run lint | typecheck | test` can never publish. Reused (not
+    # duplicated) so the release bar stays identical to the PR bar, mirroring
+    # the smoke-runtime reuse above.
+    uses: ./.github/workflows/ci.yml
+
   build:
     name: Build binaries + manifests + GitHub Release
     # Gating build gates the whole fan-out: every publish job `needs: build`.
-    needs: smoke-runtime
+    needs: [smoke-runtime, ci]
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -405,6 +415,7 @@ jobs:
           # v* tags are cut from main and the lockfile commit lands there too
           # (main's ruleset allows the bot's direct push — no require-PR).
           ref: main
+          token: ${{ secrets.RELEASE_PAT }} 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: ">=1.2.0"
