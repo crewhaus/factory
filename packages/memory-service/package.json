@@ -53,10 +53,5 @@
   "publishConfig": {
     "access": "public"
   },
-  "files": [
-    "src",
-    "README.md",
-    "LICENSE",
-    "NOTICE"
-  ]
+  "files": ["src", "README.md", "LICENSE", "NOTICE"]
 }
