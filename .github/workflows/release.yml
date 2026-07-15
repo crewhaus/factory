@@ -415,6 +415,7 @@ jobs:
           # v* tags are cut from main and the lockfile commit lands there too
           # (main's ruleset allows the bot's direct push — no require-PR).
           ref: main
+          token: ${{ secrets.RELEASE_PAT }} 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: ">=1.2.0"
