@@ -12,6 +12,7 @@ import {
   assertMatrixFlagsCompatible,
   assignCellSlugs,
   cellCrashReason,
+  classifyCellError,
   defaultMatrixPricing,
   modelSlug,
   parseModelsFlag,
@@ -46,7 +47,12 @@ function makeSummary(model: string, passRate = 1): EvalRunSummary {
 }
 
 /** A summary whose samples errored (invoker failures the runner absorbed). */
-function makeErroredSummary(model: string, errored: number, total: number): EvalRunSummary {
+function makeErroredSummary(
+  model: string,
+  errored: number,
+  total: number,
+  errorMsg = "401 invalid api key",
+): EvalRunSummary {
   const base = makeSummary(model, 0);
   const samples = Array.from({ length: total }, (_, i) => ({
     sampleId: `s${i + 1}`,
@@ -62,7 +68,7 @@ function makeErroredSummary(model: string, errored: number, total: number): Eval
       overall: { passed: false, score: 0, rationale: "" },
       perGrader: [],
     },
-    ...(i < errored ? { error: "401 invalid api key" } : {}),
+    ...(i < errored ? { error: errorMsg } : {}),
   }));
   return {
     ...base,
@@ -158,13 +164,98 @@ describe("defaultMatrixPricing", () => {
   });
 });
 
+describe("classifyCellError", () => {
+  test("systemic: auth / bad request / missing model — re-running won't help", () => {
+    for (const msg of [
+      "401 invalid x-api-key",
+      "403 Forbidden",
+      "404 model not found",
+      "unknown model 'gpt-9'",
+      "400 invalid_request_error: unsupported model",
+    ]) {
+      expect(classifyCellError(msg)).toBe("systemic");
+    }
+  });
+
+  test("billing: quota / credit exhaustion — re-running won't help (add credits)", () => {
+    for (const msg of [
+      // The real OpenAI out-of-funds message: a 429 that is NOT a rate limit.
+      "429 You exceeded your current quota, please check your plan and billing details.",
+      "402 payment required",
+      "insufficient_quota: your credit balance is too low",
+      "400 Your credit balance is too low to access the Anthropic API",
+      "429 Resource has been exhausted (e.g. check quota).",
+      "ServiceQuotaExceededException: ...",
+    ]) {
+      expect(classifyCellError(msg)).toBe("billing");
+    }
+  });
+
+  test("transient: genuine rate limits, overloads, 5xx, network blips — re-running might help", () => {
+    for (const msg of [
+      "429 Too Many Requests",
+      "Rate limit reached for gpt-4o, please try again in 20ms",
+      "529 Overloaded",
+      "500 internal server error",
+      "503 service unavailable",
+      "overloaded_error",
+      "request timed out",
+      "ECONNRESET: socket hang up",
+    ]) {
+      expect(classifyCellError(msg)).toBe("transient");
+    }
+  });
+
+  test("unknown: text matching no bucket", () => {
+    expect(classifyCellError("something inexplicable happened")).toBe("unknown");
+    expect(classifyCellError("")).toBe("unknown");
+  });
+});
+
 describe("cellCrashReason", () => {
-  test("all-errored → reason; partial or empty → undefined", () => {
+  test("all-errored → classified reason; partial or empty → undefined", () => {
+    // Systemic first error (a bad credential) — flagged as such.
     expect(cellCrashReason(makeErroredSummary("m", 2, 2))).toBe(
-      "all 2 sample(s) errored (first: 401 invalid api key)",
+      "all 2 sample(s) errored (first: 401 invalid api key) — looks systemic (auth/config/model); " +
+        "re-running won't help — check the model id and credentials",
     );
     expect(cellCrashReason(makeErroredSummary("m", 1, 2))).toBeUndefined();
     expect(cellCrashReason(makeSummary("m"))).toBeUndefined();
+  });
+
+  test("a 1-sample cell felled by a transient blip reads differently from a bad credential", () => {
+    // The documented limitation: with 1 sample, a transient error and a bad
+    // credential are otherwise indistinguishable (1 sample, 1 error). The
+    // classified reason tells them apart.
+    const transient = cellCrashReason(makeErroredSummary("m", 1, 1, "529 Overloaded"));
+    expect(transient).toBe(
+      "all 1 sample(s) errored (first: 529 Overloaded) — looks like a transient provider error; " +
+        "re-run to confirm",
+    );
+    const systemic = cellCrashReason(makeErroredSummary("m", 1, 1, "401 invalid api key"));
+    expect(systemic).toContain("looks systemic");
+    expect(transient).not.toBe(systemic);
+  });
+
+  test("a 429 quota-exhaustion is billing, NOT a transient rate limit (don't say 're-run')", () => {
+    // Regression guard: the real OpenAI out-of-funds error is a 429 whose
+    // correct remedy is 'add credits', never 're-run to confirm'.
+    const reason = cellCrashReason(
+      makeErroredSummary(
+        "m",
+        1,
+        1,
+        "429 You exceeded your current quota, please check your plan and billing details.",
+      ),
+    );
+    expect(reason).toContain("quota/billing limit");
+    expect(reason).not.toContain("re-run to confirm");
+  });
+
+  test("an unrecognized error keeps the bare reason (no misleading hint)", () => {
+    expect(cellCrashReason(makeErroredSummary("m", 1, 1, "kaboom"))).toBe(
+      "all 1 sample(s) errored (first: kaboom)",
+    );
   });
 });
 
@@ -224,7 +315,10 @@ describe("runMatrixCells", () => {
         model === "openai/gpt-4o" ? makeErroredSummary(model, 2, 2) : makeSummary(model),
     });
     expect(cells[0]?.summary).toBeUndefined();
-    expect(cells[0]?.error).toBe("all 2 sample(s) errored (first: 401 invalid api key)");
+    expect(cells[0]?.error).toBe(
+      "all 2 sample(s) errored (first: 401 invalid api key) — looks systemic (auth/config/model); " +
+        "re-running won't help — check the model id and credentials",
+    );
     expect(cells[1]?.summary?.config.model).toBe("claude-sonnet-4-5");
   });
 

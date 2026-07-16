@@ -162,6 +162,64 @@ export type RunMatrixCellsOptions = {
   readonly write?: (line: string) => void;
 };
 
+/** How an all-errored cell's failure looks, from the error text alone:
+ *  - `billing` — quota / credit exhaustion (402, insufficient quota, "exceeded
+ *    your quota", credit balance, resource exhausted). Re-running WON'T help;
+ *    add credits or raise the account quota. Kept distinct from `systemic`
+ *    because a 429 quota-exhaustion is NOT a retryable rate limit.
+ *  - `systemic` — deterministic auth/config/model errors (401/403/404, invalid
+ *    api key, unknown model, bad request). Re-running WON'T help.
+ *  - `transient` — provider blips (429 rate limit, 529/5xx, overloaded,
+ *    timeout, network reset). Re-running MIGHT help.
+ *  - `unknown` — the text matched no bucket. */
+export type CellErrorKind = "billing" | "transient" | "systemic" | "unknown";
+
+/**
+ * Classify an eval-runner error STRING (`SampleResult.error` is already
+ * flattened to `err.message`) into {@link CellErrorKind}. Order matters and
+ * mirrors `recovery-engine`'s classify() precedence: BILLING first (a real
+ * OpenAI quota-exhaustion arrives as "429 You exceeded your current quota…" —
+ * a 429 that is NOT retryable, so it must win over the transient 429 rule),
+ * then SYSTEMIC auth/config/model (deterministic even if the message also
+ * mentions a retryable word), then TRANSIENT. Works on message text since that
+ * is all the cell keeps (the structured status/code recovery-engine reads is
+ * gone by the time an invoker error is flattened onto SampleResult.error).
+ */
+export function classifyCellError(message: string): CellErrorKind {
+  const m = message.toLowerCase();
+  // Billing / quota exhaustion — includes 429-quota, which is NOT a rate limit.
+  // OpenAI: "429 You exceeded your current quota, please check your plan and
+  // billing details." · Anthropic: 400 "credit balance is too low" ·
+  // Gemini: 429 "Resource has been exhausted" · Bedrock: ServiceQuotaExceeded.
+  if (
+    /\b402\b|insufficient[\s_-]*quota|exceeded your (?:current )?quota|quota exceeded|billing details|check your plan|credit balance|payment required|resource[\s_-]*(?:has been )?exhausted|resource_exhausted|servicequotaexceeded|service quota exceeded/.test(
+      m,
+    )
+  ) {
+    return "billing";
+  }
+  // Systemic: auth / bad request / missing-or-wrong model.
+  if (
+    /\b40[13]\b|invalid[\s_-]*(?:x-)?api[\s_-]*key|unauthor|forbidden|authentication|permission denied|\b400\b|invalid[\s_-]*request/.test(
+      m,
+    ) ||
+    /\b404\b|not found|unknown model|no such model|does not exist|unsupported model|invalid model/.test(
+      m,
+    )
+  ) {
+    return "systemic";
+  }
+  // Transient: rate limits, overloads, 5xx, network/timeout blips.
+  if (
+    /\b429\b|\b529\b|\b5\d\d\b|rate[\s_-]*limit|too many requests|overloaded|service unavailable|bad gateway|gateway timeout|timed?[\s_-]*out|timeout|econnreset|etimedout|eai_again|socket hang up|temporarily|try again/.test(
+      m,
+    )
+  ) {
+    return "transient";
+  }
+  return "unknown";
+}
+
 /**
  * "The cell never really ran": eval-runner isolates per-sample invoker
  * errors (a summary always comes back), so a bad credential / 404 model
@@ -169,12 +227,28 @@ export type RunMatrixCellsOptions = {
  * cell failure — its 0% pass rate and 0ms latencies are artifacts of never
  * producing output, not a comparison result. Partial sample errors (a 529
  * blip on 1 of 20) leave the cell a normal "ran with failing samples" row.
+ *
+ * The cell genuinely has no data either way, so this stays a crash — but the
+ * reason CLASSIFIES the first error (see {@link classifyCellError}) so a
+ * one-sample cell felled by a transient blip reads differently from one felled
+ * by a bad credential (the two are otherwise identical: 1 sample, 1 error).
  */
 export function cellCrashReason(summary: EvalRunSummary): string | undefined {
   const n = summary.samples.length;
   if (n === 0 || summary.aggregates.errorCount < n) return undefined;
   const first = summary.samples.find((s) => s.error !== undefined)?.error;
-  return `all ${n} sample(s) errored${first !== undefined ? ` (first: ${first})` : ""}`;
+  const base = `all ${n} sample(s) errored${first !== undefined ? ` (first: ${first})` : ""}`;
+  if (first === undefined) return base;
+  switch (classifyCellError(first)) {
+    case "billing":
+      return `${base} — looks like a quota/billing limit; re-running won't help — add credits or raise the account quota`;
+    case "systemic":
+      return `${base} — looks systemic (auth/config/model); re-running won't help — check the model id and credentials`;
+    case "transient":
+      return `${base} — looks like a transient provider error; re-run to confirm`;
+    default:
+      return base;
+  }
 }
 
 /**

@@ -84,16 +84,21 @@ type Ctx = {
   evalsDir: string;
   lines: string[];
   write: (line: string) => void;
+  warnings: string[];
+  warn: (line: string) => void;
 };
 
 function newCtx(): Ctx {
   const root = newTempRoot();
   const lines: string[] = [];
+  const warnings: string[] = [];
   return {
     root,
     evalsDir: join(root, ".crewhaus", "evals"),
     lines,
     write: (line) => lines.push(line),
+    warnings,
+    warn: (line) => warnings.push(line),
   };
 }
 
@@ -106,17 +111,24 @@ function makeRun(ctx: Ctx, runId: string, samples: SampleResult[], p95LatencyMs 
 async function finish(
   ctx: Ctx,
   summary: EvalRunSummary,
-  opts: { gateRequested?: boolean; promote?: boolean; datasetHash?: string } = {},
+  opts: {
+    gateRequested?: boolean;
+    promote?: boolean;
+    datasetHash?: string;
+    specSource?: string;
+  } = {},
 ) {
   return finishEvalRun({
     summary,
     specName: "concierge",
+    ...(opts.specSource !== undefined ? { specSource: opts.specSource } : {}),
     datasetHash: opts.datasetHash ?? "d".repeat(64),
     outDir: summary.outDir,
     gateRequested: opts.gateRequested ?? false,
     promote: opts.promote ?? true,
     evalsDir: ctx.evalsDir,
     write: ctx.write,
+    warn: ctx.warn,
   });
 }
 
@@ -258,6 +270,69 @@ describe("finishEvalRun — index + baseline lifecycle", () => {
     expect(result.gateFailed).toBe(false);
     expect(ctx.lines.join("\n")).toContain("starting new baseline lineage");
     expect(getBaseline("concierge", "smoke", ctx.evalsDir)?.runId).toBe("run_bbbb2222bbbb2222");
+  });
+});
+
+describe("finishEvalRun — spec-source collision detection", () => {
+  test("records specSource on the index entry and baseline pin", async () => {
+    const ctx = newCtx();
+    const run = makeRun(ctx, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)]);
+    await finish(ctx, run, { specSource: "/repo/billing/crewhaus.yaml" });
+    expect(readRunIndex(ctx.evalsDir)[0]?.specSource).toBe("/repo/billing/crewhaus.yaml");
+    expect(getBaseline("concierge", "smoke", ctx.evalsDir)?.specSource).toBe(
+      "/repo/billing/crewhaus.yaml",
+    );
+  });
+
+  test("a DIFFERENT spec file sharing the name warns but still gates", async () => {
+    const ctx = newCtx();
+    const prev = makeRun(ctx, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)]);
+    await finish(ctx, prev, { specSource: "/repo/billing/crewhaus.yaml" });
+    // A different spec file, same `name:` (concierge) and dataset (smoke).
+    const next = makeRun(ctx, "run_bbbb2222bbbb2222", [makeSample("a", true, 1)]);
+    const result = await finish(ctx, next, {
+      gateRequested: true,
+      specSource: "/repo/support/crewhaus.yaml",
+    });
+    expect(result.gateFailed).toBe(false);
+    const warned = ctx.warnings.join("\n");
+    expect(warned).toContain("pinned by a different spec file");
+    expect(warned).toContain("/repo/billing/crewhaus.yaml");
+    expect(warned).toContain("/repo/support/crewhaus.yaml");
+    // The lineage is NOT re-keyed — the gate still ran against the pin.
+    expect(ctx.lines.join("\n")).toContain("vs baseline run_aaaa1111aaaa1111");
+  });
+
+  test("the SAME spec file, edited (same path), does NOT warn — that IS the gate", async () => {
+    const ctx = newCtx();
+    const prev = makeRun(ctx, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)]);
+    await finish(ctx, prev, { specSource: "/repo/billing/crewhaus.yaml" });
+    // Same path (an instruction edit changes specHash, not the source path).
+    const next = makeRun(ctx, "run_bbbb2222bbbb2222", [makeSample("a", true, 1)]);
+    await finish(ctx, next, { specSource: "/repo/billing/crewhaus.yaml" });
+    expect(ctx.warnings.join("\n")).not.toContain("different spec file");
+  });
+
+  test("no warning when the baseline lacks specSource (older CLI pinned it)", async () => {
+    const ctx = newCtx();
+    // Baseline pinned by an old CLI (no specSource recorded).
+    const prev = makeRun(ctx, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)]);
+    await finish(ctx, prev);
+    const next = makeRun(ctx, "run_bbbb2222bbbb2222", [makeSample("a", true, 1)]);
+    await finish(ctx, next, { specSource: "/repo/support/crewhaus.yaml" });
+    expect(ctx.warnings.join("\n")).not.toContain("different spec file");
+  });
+
+  test("no warning when THIS run lacks specSource but the baseline has one", async () => {
+    // The symmetric back-compat direction (guard 1): a caller that doesn't
+    // pass specSource must never trip the warning, even against a pin that
+    // recorded one.
+    const ctx = newCtx();
+    const prev = makeRun(ctx, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)]);
+    await finish(ctx, prev, { specSource: "/repo/billing/crewhaus.yaml" });
+    const next = makeRun(ctx, "run_bbbb2222bbbb2222", [makeSample("a", true, 1)]);
+    await finish(ctx, next); // no specSource
+    expect(ctx.warnings.join("\n")).not.toContain("different spec file");
   });
 });
 
