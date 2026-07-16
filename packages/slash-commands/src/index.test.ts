@@ -245,6 +245,75 @@ describe("loadCommands — builtin + user + project roots (PR 12)", () => {
     );
   });
 
+  test("pre-parsed builtinCommands are seeded with NO disk dir (compiled-binary path)", async () => {
+    // In a `bun build --compile` binary there is no on-disk commands/ dir to
+    // point builtinDirs at (it would resolve under /$bunfs and existsSync-skip),
+    // so shipped defaults must arrive as pre-parsed objects.
+    await withTempCwd(
+      () => {},
+      async (cwd) => {
+        const cmds = await loadCommands({
+          cwd,
+          homeDir: EMPTY_HOME,
+          builtinCommands: [
+            {
+              name: "plan",
+              body: "embedded plan $ARGUMENTS",
+              filePath: "/$bunfs/commands/plan.md",
+            },
+          ],
+        });
+        expect(cmds.get("plan")?.body).toBe("embedded plan $ARGUMENTS");
+        expect(expand("/plan ship it", cmds).expanded).toBe("embedded plan ship it");
+      },
+    );
+  });
+
+  test("precedence: builtinCommands < builtinDirs < user < project", async () => {
+    await withTempCwd(
+      (cwd) => {
+        const builtinDir = join(cwd, "builtin-cmds");
+        writeBuiltinCommand(builtinDir, "dir-wins", "from dir");
+        writeCommand(cwd, "project-wins", "from project");
+      },
+      async (cwd) => {
+        const home = mkdtempSync(join(tmpdir(), "slash-home-"));
+        try {
+          writeUserCommand(home, "user-wins", "from user");
+          const cmds = await loadCommands({
+            cwd,
+            homeDir: home,
+            builtinCommands: [
+              {
+                name: "only-embedded",
+                body: "from embedded",
+                filePath: "/$bunfs/commands/only-embedded.md",
+              },
+              { name: "dir-wins", body: "from embedded", filePath: "/$bunfs/commands/dir-wins.md" },
+              {
+                name: "user-wins",
+                body: "from embedded",
+                filePath: "/$bunfs/commands/user-wins.md",
+              },
+              {
+                name: "project-wins",
+                body: "from embedded",
+                filePath: "/$bunfs/commands/project-wins.md",
+              },
+            ],
+            builtinDirs: [join(cwd, "builtin-cmds")],
+          });
+          expect(cmds.get("only-embedded")?.body).toBe("from embedded");
+          expect(cmds.get("dir-wins")?.body).toBe("from dir");
+          expect(cmds.get("user-wins")?.body).toBe("from user");
+          expect(cmds.get("project-wins")?.body).toBe("from project");
+        } finally {
+          rmSync(home, { recursive: true, force: true });
+        }
+      },
+    );
+  });
+
   test("$ARGUMENTS expansion works for a builtin-loaded command", async () => {
     await withTempCwd(
       (cwd) => {

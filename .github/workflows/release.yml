@@ -110,6 +110,28 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: bun packages/single-binary-cli/src/cli.ts --version "$VERSION"
 
+      # Actually EXECUTE a compiled binary. The build step above only compiles;
+      # nothing else in CI runs a produced binary (smoke-runtime runs from
+      # source via bun), so a binary that crashes at startup — e.g. an eager
+      # readFileSync of a package-relative path that resolves under /$bunfs and
+      # ENOENTs — shipped green. This step runs the artifact matching the
+      # runner (ubuntu-latest = linux-x64) and asserts `--version` works.
+      - name: Smoke-test the compiled linux-x64 binary
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          BIN="dist/crewhaus-linux-x64-$VERSION"
+          test -f "$BIN" || { echo "::error::$BIN was not built"; exit 1; }
+          chmod +x "$BIN"
+          # (1) exit 0 — a crashing/segfaulting --version fails here under `set -e`
+          "$BIN" --version
+          # (2) it printed the embedded version — guards a bad --define / stale embed
+          OUT="$("$BIN" --version)"
+          if [ "$OUT" != "$VERSION" ]; then
+            echo "::error::crewhaus --version printed '$OUT', expected '$VERSION'"; exit 1
+          fi
+          echo "compiled linux-x64 binary smoke OK: $OUT"
+
       - name: Generate package manifests
         env:
           VERSION: ${{ steps.version.outputs.version }}
