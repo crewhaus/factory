@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/specialization-registry",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "type": "module",
   "description": "Track G / §58 — file-backed registry of domain specializations (payments, booking, auth) that inject invariants into contract compilation. Source: Meta-Engineering Harnesses (arxiv 2605.25665, §4.4).",
   "main": "src/index.ts",

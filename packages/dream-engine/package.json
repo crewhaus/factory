@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/dream-engine",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "type": "module",
   "description": "v0.3.0 Goal 5 (design §6): scheduled memory consolidation — a deterministic phase-1 pass (TTL sweep, dedupe/supersede, staleness flags, sessions-index fold-in, proof pinning, handoff refresh, trash purge) plus ONE bounded, budget-capped model synthesis session; window-idempotent, janitor-steppable, state under .crewhaus/dream/<spec>/.",
   "main": "src/index.ts",

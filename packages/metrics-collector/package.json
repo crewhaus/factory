@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/metrics-collector",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "type": "module",
   "description": "Counters/histograms over TraceEvent — Prometheus textfile, stdout JSON, or HTTP /metrics",
   "main": "src/index.ts",

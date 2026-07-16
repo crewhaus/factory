@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/dataset-registry",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "type": "module",
   "description": "Split-aware dataset versioning: train/dev/test with hash-stable sample identifiers and split-leak prevention",
   "main": "src/index.ts",

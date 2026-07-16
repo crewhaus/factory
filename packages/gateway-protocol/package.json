@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/gateway-protocol",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "type": "module",
   "description": "JSON-RPC wire protocol for the managed-daemon gateway — versioned envelope + Zod schemas",
   "main": "src/index.ts",
