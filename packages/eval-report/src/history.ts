@@ -29,6 +29,16 @@ export type RunIndexEntry = {
   readonly runId: string;
   readonly specName: string;
   readonly specHash: string;
+  /**
+   * Stable spec *identity* — the resolved source path of the spec this run
+   * evaluated. Unlike {@link specHash} (which changes on every instruction
+   * edit), the source survives edits, so it distinguishes "the same spec,
+   * edited" (baseline lineage should continue — that IS the regression gate)
+   * from "a different spec that merely shares a `name:`" (a collision worth
+   * warning about). Additive — absent on entries written before the field
+   * existed, and on runs whose caller didn't supply a source.
+   */
+  readonly specSource?: string;
   readonly datasetName: string;
   /** sha256 hex of the dataset file bytes (see {@link hashDatasetFile}). */
   readonly datasetHash: string;
@@ -52,6 +62,13 @@ export type BaselineEntry = {
   readonly specName: string;
   readonly datasetName: string;
   readonly runId: string;
+  /**
+   * Resolved source path of the spec that pinned this baseline (see
+   * {@link RunIndexEntry.specSource}). Lets a later run detect that it is a
+   * *different* spec sharing the same `name:` — a lineage collision — and
+   * warn. Additive; absent on baselines pinned before the field existed.
+   */
+  readonly specSource?: string;
   /** Absolute path to the baseline run's output directory. */
   readonly outDir: string;
   /** Dataset content hash at the time the baseline was pinned. */

@@ -36,6 +36,14 @@ import { type GateThresholds, type GateVerdict, gate } from "@crewhaus/regressio
 export type FinishEvalOptions = {
   readonly summary: EvalRunSummary;
   readonly specName: string;
+  /**
+   * Stable spec identity — the resolved source path of the evaluated spec.
+   * Recorded on the index entry + baseline pin and used to warn when this
+   * run's (specName, datasetName) baseline was pinned by a *different* spec
+   * file (a name collision). Optional: absent → collision detection is
+   * simply skipped for this run (back-compat with callers that don't pass it).
+   */
+  readonly specSource?: string;
   /** sha256 hex of the dataset file bytes. */
   readonly datasetHash: string;
   /** Absolute path to the new run's output directory. */
@@ -48,6 +56,8 @@ export type FinishEvalOptions = {
   readonly evalsDir?: string;
   /** Line sink; defaults to stdout. */
   readonly write?: (line: string) => void;
+  /** Warning sink; defaults to stderr. */
+  readonly warn?: (line: string) => void;
 };
 
 export type FinishEvalResult = {
@@ -105,7 +115,8 @@ export function gateRuns(
  */
 export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEvalResult> {
   const write = opts.write ?? ((line: string) => process.stdout.write(`${line}\n`));
-  const { summary, specName } = opts;
+  const warn = opts.warn ?? ((line: string) => process.stderr.write(`${line}\n`));
+  const { summary, specName, specSource } = opts;
   const datasetName = summary.config.datasetName;
   const absOut = resolve(opts.outDir);
 
@@ -122,6 +133,7 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
     runId: summary.runId,
     specName,
     specHash: summary.config.specHash,
+    ...(specSource !== undefined ? { specSource } : {}),
     datasetName,
     datasetHash: opts.datasetHash,
     passRate: summary.aggregates.passRate,
@@ -142,6 +154,7 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
       specName,
       datasetName,
       runId: summary.runId,
+      ...(specSource !== undefined ? { specSource } : {}),
       outDir: absOut,
       datasetHash: opts.datasetHash,
       ts: entry.ts,
@@ -154,6 +167,30 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
   if (baseline === undefined) {
     pinCurrentRun(`first run for ${specName}/${datasetName}`);
     return { gateFailed: false };
+  }
+
+  // Lineage-collision guard: baselines key on (specName, datasetName), which
+  // deliberately keeps ONE lineage across instruction edits (a re-run of an
+  // EDITED spec must gate against its pre-edit baseline — that is the whole
+  // point of the gate). But two *different* spec files that merely share a
+  // `name:` also collapse onto the same key, silently gating one spec against
+  // the other's baseline. specSource (the spec's source PATH, which survives
+  // edits) tells the two apart: same path → an edit (expected, no warning);
+  // different path → a genuine collision. We only WARN (never re-key or
+  // refuse) — the name-keyed lineage stays intact and the gate still runs.
+  if (
+    specSource !== undefined &&
+    baseline.specSource !== undefined &&
+    baseline.specSource !== specSource
+  ) {
+    warn(
+      `[eval] warning: the baseline for ${specName}/${datasetName} was pinned by a different spec file:`,
+    );
+    warn(`[eval]   baseline spec: ${baseline.specSource}`);
+    warn(`[eval]   this run's spec: ${specSource}`);
+    warn(
+      `[eval]   two specs sharing name "${specName}" share one baseline lineage — give them distinct \`name:\` values (or a separate evals dir) so their histories don't gate against each other. Gating this run against the other spec's baseline anyway.`,
+    );
   }
 
   let prevLoaded: LoadedRun;

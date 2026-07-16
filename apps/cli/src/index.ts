@@ -7553,6 +7553,10 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
   const finish = await finishEvalRun({
     summary,
     specName: ir.name,
+    // Stable spec identity for baseline-collision detection: the resolved
+    // source path survives instruction edits (so an edited spec keeps its
+    // lineage) yet differs across distinct spec files that share a `name:`.
+    specSource: absSpec,
     datasetHash,
     outDir: absOut,
     gateRequested,
@@ -8244,6 +8248,9 @@ function runEvalReportBaseline(args: ParsedArgs): void {
         specName: entry.specName,
         datasetName: entry.datasetName,
         runId: entry.runId,
+        // Carry the spec source forward from the index entry (when present)
+        // so manual pins keep collision detection working.
+        ...(entry.specSource !== undefined ? { specSource: entry.specSource } : {}),
         outDir: entry.outDir,
         datasetHash: entry.datasetHash,
         ts: new Date().toISOString(),

@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Two documented eval run-history limitations closed.** (1) *Baseline
+  name-collisions.* Run-index entries and baseline pins now record the spec's
+  `specSource` (its resolved source path), and `crewhaus eval` warns when a
+  run's `(specName, datasetName)` baseline was pinned by a *different* spec
+  file — the real footgun when two distinct specs share a `name:`. The lineage
+  is still keyed on `(name, dataset)` and never re-keyed, so an *edited* spec
+  keeps gating against its pre-edit baseline (that is the whole point of the
+  gate); only a genuine cross-spec collision warns. Additive and back-compat —
+  baselines pinned by an older CLI (no `specSource`) simply skip the check.
+  (2) *Matrix crash reasons.* `eval --models` still flags an all-errored cell
+  as a crash (it produced no comparison data), but `cellCrashReason` now
+  classifies the error — `billing` (quota/credit exhaustion, including the
+  non-retryable OpenAI/Gemini 429), `systemic` (auth/config/model), or
+  `transient` (rate limit / 5xx / timeout) — so a one-sample cell felled by a
+  transient blip no longer reads identically to one felled by a bad credential
+  or an out-of-funds account. The two "Known limitations" notes are removed
+  from the CLI README.
+
 ## [0.3.1] - 2026-07-15
 
 ### Fixed
