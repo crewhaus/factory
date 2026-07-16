@@ -63,6 +63,15 @@ export type LoadCommandsOptions = {
    * (`<cwd>/.crewhaus/commands`) commands override builtins by name.
    */
   readonly builtinDirs?: ReadonlyArray<string>;
+  /**
+   * Pre-parsed builtin commands, seeded at the LOWEST precedence of all —
+   * below `builtinDirs`, user, and project. This is the disk-free path for
+   * shipped defaults (`@crewhaus/default-skills`' `DEFAULT_COMMANDS`): a
+   * `bun build --compile` binary has no on-disk `commands/` directory to
+   * point `builtinDirs` at, so without this the builtin slash commands would
+   * silently vanish from compiled binaries.
+   */
+  readonly builtinCommands?: ReadonlyArray<SlashCommand>;
 };
 
 export type ExpandResult = {
@@ -80,11 +89,12 @@ export class SlashCommandError extends CrewhausError {
 }
 
 /**
- * Read every `.md` file directly under each command root — builtin dirs
- * first, then `~/.crewhaus/commands/`, then `<cwd>/.crewhaus/commands/` —
- * so later roots override earlier ones by name. Each file's basename (sans
- * extension) becomes its key in the returned map. Subdirectories are not
- * currently walked (v1 keeps the namespace flat).
+ * Read every `.md` file directly under each command root — pre-parsed
+ * `builtinCommands` first, then builtin dirs, then `~/.crewhaus/commands/`,
+ * then `<cwd>/.crewhaus/commands/` — so later sources override earlier ones
+ * by name. Each file's basename (sans extension) becomes its key in the
+ * returned map. Subdirectories are not currently walked (v1 keeps the
+ * namespace flat).
  */
 export async function loadCommands(
   opts: LoadCommandsOptions = {},
@@ -96,6 +106,11 @@ export async function loadCommands(
   const roots: string[] = [...(opts.builtinDirs ?? []), userRoot];
   if (projectRoot !== userRoot) roots.push(projectRoot);
   const out = new Map<string, SlashCommand>();
+  // Lowest precedence: pre-parsed builtins (disk-free, so they survive in a
+  // compiled binary). On-disk roots below override them by name.
+  for (const command of opts.builtinCommands ?? []) {
+    out.set(command.name, command);
+  }
   for (const root of roots) {
     readCommandsUnder(root, out);
   }

@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Compiled `crewhaus` binaries no longer crash at startup.** The standalone
+  binaries (Homebrew/Scoop/apt/winget, built with `bun build --compile`) threw
+  `ENOENT: … '/$bunfs/skills/continuity/SKILL.md'` on *every* command — even
+  `crewhaus --version` — because `@crewhaus/default-skills` `readFileSync`'d its
+  builtin skill/command `.md` files from a package-relative path at module load,
+  which resolves into the binary's virtual `/$bunfs` filesystem where the files
+  were never embedded. The bodies are now embedded at build time via
+  `with { type: "text" }` imports of the same canonical `.md` files (single
+  source of truth, no drift; the interpreter/`bunx` path still reads them from
+  disk). Builtin slash commands (`/plan`, `/handoff`, `/dream`, …) are now fed
+  to `loadCommands` as pre-parsed `builtinCommands` (mirroring
+  `discoverSkills({ builtinSkills })`) so they survive in a compiled binary
+  instead of silently vanishing when the on-disk `commands/` dir is absent. A
+  release-workflow step now *executes* the compiled `linux-x64` binary
+  (`crewhaus --version`) so a boot-crashing binary can never ship green again.
+
 - **Two documented eval run-history limitations closed.** (1) *Baseline
   name-collisions.* Run-index entries and baseline pins now record the spec's
   `specSource` (its resolved source path), and `crewhaus eval` warns when a

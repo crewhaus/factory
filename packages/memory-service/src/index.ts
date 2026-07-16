@@ -92,7 +92,12 @@ import {
   createContinuityStore,
   renderStatus,
 } from "@crewhaus/continuity-store";
-import { DEFAULT_SKILLS, DREAM_SKILL_BODY, builtinCommandsDir } from "@crewhaus/default-skills";
+import {
+  DEFAULT_COMMANDS,
+  DEFAULT_SKILLS,
+  DREAM_SKILL_BODY,
+  builtinCommandsDir,
+} from "@crewhaus/default-skills";
 import {
   type DreamEngine,
   type DreamJanitorStep,
@@ -1081,7 +1086,12 @@ async function loadSkillsAndCommands(
   const commands = await loadCommands({
     cwd: deps.cwd,
     ...(deps.homeDir !== undefined ? { homeDir: deps.homeDir } : {}),
-    builtinDirs: [builtinCommandsDir],
+    // Pre-parsed builtins (embedded, disk-free) rather than a `builtinCommandsDir`
+    // disk read — the latter resolves under `/$bunfs` in a compiled binary where
+    // the `commands/` tree is absent, so builtin slash commands would silently
+    // vanish. Their `filePath` still starts with `builtinCommandsDir`, so the
+    // builtin gate below is unchanged.
+    builtinCommands: DEFAULT_COMMANDS,
   });
   const allowed = new Set([
     ...(features.continuity ? CONTINUITY_COMMANDS : []),

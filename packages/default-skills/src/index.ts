@@ -35,12 +35,12 @@
  * discovery and builtin bodies at load, both at the `"skill"` TrustOrigin,
  * exactly like user- or project-provided skills (Pillar 3).
  */
-import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { CrewhausError } from "@crewhaus/errors";
 import { type LoadedSkill, parseSkillFile } from "@crewhaus/skills-registry";
 import { type SlashCommand, parseCommandFile } from "@crewhaus/slash-commands";
+import { COMMAND_BODIES, SKILL_BODIES } from "./embedded";
 
 const PKG_ROOT = fileURLToPath(new URL("..", import.meta.url));
 
@@ -83,8 +83,16 @@ export const BUILTIN_COMMAND_NAMES = [
 export type BuiltinCommandName = (typeof BUILTIN_COMMAND_NAMES)[number];
 
 function loadSkill(name: DefaultSkillName): LoadedSkill {
+  // `filePath` is a stable identifier only — the body comes from the
+  // compile-time-embedded text (`./embedded`), never a runtime disk read, so
+  // this resolves inside a `bun build --compile` binary where the on-disk
+  // `skills/` tree is absent. See `./embedded` for why.
   const filePath = join(builtinSkillsDir, name, "SKILL.md");
-  const { frontmatter, body } = parseSkillFile(readFileSync(filePath, "utf8"));
+  const source = SKILL_BODIES[name];
+  if (source === undefined) {
+    throw new DefaultSkillsError(`default skill "${name}" has no embedded body`);
+  }
+  const { frontmatter, body } = parseSkillFile(source);
   if (frontmatter.name !== name) {
     throw new DefaultSkillsError(
       `default skill directory "${name}" declares frontmatter name "${frontmatter.name}"`,
@@ -94,8 +102,15 @@ function loadSkill(name: DefaultSkillName): LoadedSkill {
 }
 
 function loadCommand(name: BuiltinCommandName): SlashCommand {
+  // `filePath` is a stable identifier only; the body is embedded at compile
+  // time (`./embedded`) rather than read from disk, so builtin commands
+  // survive inside a compiled binary.
   const filePath = join(builtinCommandsDir, `${name}.md`);
-  const parsed = parseCommandFile(readFileSync(filePath, "utf8"));
+  const source = COMMAND_BODIES[name];
+  if (source === undefined) {
+    throw new DefaultSkillsError(`builtin command "${name}" has no embedded body`);
+  }
+  const parsed = parseCommandFile(source);
   return {
     name,
     body: parsed.body,
