@@ -7,7 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-07-15
+
 ### Fixed
+
+- **Compiled agent-loop bundles crashed at boot — the published
+  `@crewhaus/default-skills` tarball was missing its runtime data files.**
+  Continuity is default-on in 0.3.0, so every compiled cli/channel/managed/
+  research/crew bundle imports `@crewhaus/default-skills`, whose `dist/index.js`
+  `readFileSync`s `skills/<name>/SKILL.md` and `commands/<name>.md` at boot. The
+  publish step (`scripts/release-prep.ts --for-publish`) hardcoded the packed
+  `files` allowlist to `["dist", …]`, dropping every uncompiled data dir — so
+  `@crewhaus/default-skills@0.3.0` shipped `dist/` but not `skills/`/`commands/`,
+  and a compiled bundle died at boot with `ENOENT` before it ever reached the
+  credential boundary (compile itself always succeeded). Six other packages that
+  ship a `templates/` dir were affected the same way (`boundary-classifier`,
+  `compliance-controls`, `cost-tracker`, `data-retention-engine`,
+  `metrics-collector`, `migration-runner`). `--for-publish` now maps the existing
+  `files` allowlist `src` → `dist` and **preserves every other entry**, so data
+  dirs stay in the tarball; a `bun pm pack` smoke over the real
+  `@crewhaus/default-skills` pins that its `skills/`/`commands/` files ship, and
+  `scripts/` tests now run in CI. Recompiled or freshly installed bundles boot
+  cleanly on 0.3.1.
 
 - **`$0` cost and `0` tokens on an unpriced model.** `cost-tracker` used to
   early-return on a pricing-table miss and publish nothing, so a

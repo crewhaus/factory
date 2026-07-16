@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/eval-grader",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "type": "module",
   "description": "Deterministic graders + composers for the eval stack",
   "main": "src/index.ts",

@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-document-ingest",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "type": "module",
   "description": "M4.3 — IngestDocument tool. Reads .txt/.md/.csv/.json/.yaml inline; PDF/docx/xlsx via pluggable parsers (deferred to operator-provided handlers).",
   "main": "src/index.ts",

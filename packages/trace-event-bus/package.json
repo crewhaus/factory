@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/trace-event-bus",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "type": "module",
   "description": "In-process trace event bus with ring-buffered history and W3C trace-context propagation",
   "main": "src/index.ts",
