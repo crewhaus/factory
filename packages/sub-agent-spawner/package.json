@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/sub-agent-spawner",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "type": "module",
   "description": "spawnSubAgent — wires IsolatedContext + child runChatLoop and re-emits boundary events to the parent (Section 13)",
   "main": "src/index.ts",

@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/computer-use-driver",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "type": "module",
   "description": "Cross-platform mouse/keyboard/screenshot driver — chromium backend (Section 25 BROW)",
   "main": "src/index.ts",

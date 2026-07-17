@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/grader-safety-classifiers",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "type": "module",
   "description": "Safety-classifier graders: toxicity, bias, pii_leak. Pluggable via @crewhaus/grader-registry (Section 38)",
   "main": "src/index.ts",
