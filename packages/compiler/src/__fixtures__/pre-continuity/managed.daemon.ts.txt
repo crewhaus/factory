@@ -6,6 +6,7 @@ import { createBudgetStore } from "@crewhaus/durable-state";
 import { formatRunFailure, isRunFailedError } from "@crewhaus/errors";
 import { createGatewayServer } from "@crewhaus/gateway-server";
 import { auditPolicyDecision, evaluatePolicy } from "@crewhaus/policy-engine";
+import { createRunContext, type RunContext } from "@crewhaus/run-context";
 import { createJanitor } from "@crewhaus/runtime-core";
 import { buildTenant, type Tenant } from "@crewhaus/tenancy";
 import { runOneTurn } from "./agent.ts";
@@ -124,16 +125,53 @@ function readIntakeGate(): { paused: boolean; reason?: string } {
   return __intakeCache;
 }
 
+// Contract item 3 — the per-run trace-bus registry that backs runs.subscribe.
+// Every run's TraceEventBus is registered under its runId, TENANT-FENCED:
+// resolveRunEvents only streams to the tenant that started the run (a
+// cross-tenant — or unknown — runId resolves to undefined → 404, so a run's
+// existence never leaks across tenants). Bounded so completed runs' ring
+// buffers don't accumulate unboundedly; the oldest entry is evicted past the
+// cap.
+const RUN_BUS_CAP = 256;
+const RUN_BUSES = new Map<string, { tenantId: string; bus: RunContext["eventBus"] }>();
+function registerRunBus(runId: string, tenantId: string, bus: RunContext["eventBus"]): void {
+  RUN_BUSES.set(runId, { tenantId, bus });
+  while (RUN_BUSES.size > RUN_BUS_CAP) {
+    const oldest = RUN_BUSES.keys().next().value;
+    if (oldest === undefined) break;
+    RUN_BUSES.delete(oldest);
+  }
+}
+
 const gateway = createGatewayServer({
   jwtSecret: JWT_SECRET,
   tenantsRoot: TENANTS_ROOT,
   tenantOverrides,
   budgetStore: BUDGET_STORE,
   intakeGate: readIntakeGate,
+  // Contract item 3 — resolve a run's live trace stream for runs.subscribe from
+  // the per-run bus registry, fenced to the owning tenant. Returning undefined
+  // (unknown OR cross-tenant runId) makes the gateway answer 404.
+  resolveRunEvents: ({ runId, tenant }) => {
+    const entry = RUN_BUSES.get(runId);
+    if (entry === undefined || entry.tenantId !== tenant.id) return undefined;
+    const bus = entry.bus;
+    return {
+      // Atomic snapshot + live-subscribe: the ring-buffer replay and the live
+      // listener attach with no yield between (both synchronous), so no event
+      // is dropped or duplicated across the replay→live boundary.
+      open: (listener: (event: unknown) => void) => {
+        const replay = bus.recent();
+        const close = bus.subscribe(listener);
+        return { replay, close };
+      },
+    };
+  },
   handler: async ({ method, params, tenant }) => {
     if (method === "runs.create" || method === "runs.continue") {
       const p = params as { input: string; sessionId?: string };
       const sessionId = p.sessionId ?? `sess_${Math.random().toString(36).slice(2, 18).padEnd(16, "0")}`;
+      const runId = `run_${Math.random().toString(36).slice(2, 10)}`;
       const log = await gateway.getAuditLog(tenant);
       const policy = evaluatePolicy(
         { toolName: "runChatLoop", sideEffect: "external", input: p.input, tenantId: tenant.id },
@@ -142,9 +180,28 @@ const gateway = createGatewayServer({
       if (policy.decision === "deny") {
         throw new Error(`policy denied: ${policy.reason ?? "no reason"}`);
       }
+      // Contract item 3 — mint the run's trace bus up front and register it
+      // (tenant-fenced) so runs.subscribe can replay + live-stream THIS run;
+      // the SAME context is threaded into runOneTurn so every trace event the
+      // run publishes lands on the registered bus, and the response runId is
+      // the bus's runId (the id a client subsequently subscribes with).
+      // G48 — the per-tenant hash-chained audit log is wired as BOTH the
+      // justification and egress durable sinks, so intent-gate and egress
+      // verdicts are tamper-evidenced per tenant inside the managed daemon.
+      const runContext = createRunContext({ runId, sessionId });
+      registerRunBus(runId, tenant.id, runContext.eventBus);
       let reply: string;
       try {
-        reply = await runOneTurn({ tenantId: tenant.id, sessionId, input: p.input });
+        reply = await runOneTurn({
+          tenantId: tenant.id,
+          sessionId,
+          input: p.input,
+          extraOptions: {
+            runContext,
+            justificationAuditSink: log,
+            egressAuditSink: log,
+          },
+        });
       } catch (err) {
         // v0.3.0 Goal 6 — a classified terminal failure (billing/auth/…)
         // renders its structured report on the daemon's stderr, then
@@ -163,7 +220,7 @@ const gateway = createGatewayServer({
         kind: "model_call",
         payload: { tenantId: tenant.id, sessionId, inputTokens, outputTokens },
       });
-      return { runId: `run_${Math.random().toString(36).slice(2, 10)}`, sessionId, tenantId: tenant.id, reply };
+      return { runId, sessionId, tenantId: tenant.id, reply };
     }
     if (method === "runs.cancel") {
       return { ok: true };

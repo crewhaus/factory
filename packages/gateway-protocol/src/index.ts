@@ -213,6 +213,49 @@ export function encodeError(
 }
 
 // ---------------------------------------------------------------------------
+// `runs.subscribe` — Server-Sent Events framing.
+//
+// `runs.subscribe` is the ONE method that does not answer with a JSON
+// `ResponseEnvelope`: it upgrades to a long-lived `text/event-stream` that
+// replays the run's buffered trace events and then live-streams new ones.
+// The frame format lives HERE (the wire-contract package) so the daemon and
+// every reference client encode/parse it identically:
+//
+//   - each trace event is one SSE `data:` frame carrying the event's JSON.
+//     `JSON.stringify` never emits a literal newline (newlines inside string
+//     fields are escaped to `\n`), so one event is always exactly one `data:`
+//     line — no multi-line-`data:` reassembly is required on the read side.
+//   - heartbeats and the connection-open marker are SSE COMMENT frames
+//     (`:`-prefixed); a spec-compliant client ignores them, so they keep
+//     intermediaries from idling the connection out without polluting the
+//     event stream. A comment body must not contain a newline.
+//
+// A stream carries no envelope `id`/`protocol` — those are per-request-reply
+// fields; the subscription is a fire-hose keyed by the `runId` in the
+// originating `runs.subscribe` request.
+// ---------------------------------------------------------------------------
+
+/** MIME type of a `runs.subscribe` response body. */
+export const SSE_CONTENT_TYPE = "text/event-stream" as const;
+
+/**
+ * Encode one trace event as an SSE `data:` frame. `event` is serialized with
+ * `JSON.stringify` (a TraceEvent is always JSON-serializable), so the frame is
+ * a single `data:` line terminated by the mandatory blank line.
+ */
+export function encodeSseEvent(event: unknown): string {
+  return `data: ${JSON.stringify(event)}\n\n`;
+}
+
+/**
+ * Encode an SSE comment frame (heartbeat / open marker). Any newline in `text`
+ * is collapsed to a space so the comment stays a single well-formed frame.
+ */
+export function encodeSseComment(text: string): string {
+  return `: ${text.replace(/[\r\n]+/g, " ")}\n\n`;
+}
+
+// ---------------------------------------------------------------------------
 // Standard error codes — wire-stable so reference clients can switch on them.
 // ---------------------------------------------------------------------------
 

@@ -620,6 +620,33 @@ describe("formatBody — every kind + optional-field branches", () => {
     expect(formatLine(ev)).toBe(`${prefix("response_rated")}rating=0.50`);
   });
 
+  // Loop contract 0.4 (Batch C, G11) — pending-approval lifecycle.
+  test("approval_requested renders tool/approval/surface", () => {
+    const ev = {
+      ...envelope,
+      kind: "approval_requested",
+      approvalId: "appr_1",
+      toolName: "Bash",
+      surface: "single-turn",
+    } satisfies TraceEvent;
+    expect(formatLine(ev)).toBe(
+      `${prefix("approval_requested")}tool=Bash approval=appr_1 surface=single-turn`,
+    );
+  });
+
+  test("approval_resolved renders approval/decision/by", () => {
+    const ev = {
+      ...envelope,
+      kind: "approval_resolved",
+      approvalId: "appr_1",
+      decision: "grant",
+      by: "slack:U0123",
+    } satisfies TraceEvent;
+    expect(formatLine(ev)).toBe(
+      `${prefix("approval_resolved")}approval=appr_1 decision=grant by=slack:U0123`,
+    );
+  });
+
   test("program_output", () => {
     const ev = {
       ...envelope,
@@ -742,5 +769,16 @@ describe("formatJsonLine — JSON Lines", () => {
     expect(parsed.kind).toBe("turn_start");
     expect(parsed.turn).toBe(1);
     expect(parsed.runId).toBe("run_a");
+  });
+
+  test("carries the Batch-C agentId envelope field onto the JSON wire when stamped", () => {
+    const ev = {
+      ...env({ agentId: "ed25519:abc123" }),
+      kind: "turn_start",
+      turn: 1,
+      messageCount: 0,
+    } satisfies TraceEvent;
+    const parsed = JSON.parse(formatJsonLine(ev).trimEnd());
+    expect(parsed.agentId).toBe("ed25519:abc123");
   });
 });

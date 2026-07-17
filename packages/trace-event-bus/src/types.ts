@@ -17,6 +17,18 @@ export type TraceEventEnvelope = {
   readonly parentSpanId?: string;
   /** ISO 8601 timestamp when the event was published. */
   readonly timestamp: string;
+  /**
+   * Loop contract 0.4 (Batch C, item 4) — the publishing agent's identity: the
+   * fingerprint of the Ed25519 public key auto-generated at first boot into
+   * `.crewhaus/identity.json`. Stamped by `TraceEventBus.envelope()` when the
+   * runtime supplies an `agentId` on the bus (and read by publishers that build
+   * envelopes by hand via `bus.agentId`). The same fingerprint is appended to
+   * audit-log records so a trace event and its audit trail attribute to one
+   * agent. Optional: absent when no identity is available (e.g. an isolated
+   * unit test, or a subscriber replaying events published before this field
+   * existed).
+   */
+  readonly agentId?: string;
 };
 
 export type TurnStartEvent = TraceEventEnvelope & {
@@ -476,6 +488,41 @@ export type ResponseRatedEvent = TraceEventEnvelope & {
 };
 
 /**
+ * Loop contract 0.4 (Batch C, G11) — published by the runtime when a tool
+ * permission resolves to `ask` on a NON-interactive surface and
+ * `permissions.ask_mode` is `"pause"` (the default): the runtime persists a
+ * `PendingApproval` via the injected approvals store, publishes THIS event,
+ * and parks the turn (the `approval_pending` failure class + a resume token).
+ * `approvalId` is the persisted `PendingApproval.id` — the same id the later
+ * `approval_resolved` event and the CLI/Slack approval verbs key on;
+ * `toolName` is the parked tool call; `surface` is the non-interactive surface
+ * the ask arose on (e.g. `"single-turn"`, `"daemon"`, `"gateway"`), a
+ * free-form classifier so new surfaces don't need a schema bump.
+ */
+export type ApprovalRequestedEvent = TraceEventEnvelope & {
+  kind: "approval_requested";
+  approvalId: string;
+  toolName: string;
+  surface: string;
+};
+
+/**
+ * Loop contract 0.4 (Batch C, G11) — published when a parked approval is
+ * resolved (by a CLI verb, a Slack button, or any downstream approval surface)
+ * and the decision is recorded in the approvals store, so the next run/turn
+ * re-executes the tool call pre-resolved (`grant`) or denies it with a note
+ * (`deny`). `approvalId` matches the originating `approval_requested.approvalId`;
+ * `decision` is the recorded verdict; `by` is the deciding identity (free-form
+ * — e.g. a username, `"cli"`, or `"slack:U0123"`).
+ */
+export type ApprovalResolvedEvent = TraceEventEnvelope & {
+  kind: "approval_resolved";
+  approvalId: string;
+  decision: "grant" | "deny";
+  by: string;
+};
+
+/**
  * Ops item 36 — emitted by `runtime-core`'s boot-time self-heal janitor,
  * once per maintenance step per run (daemon shapes run it at boot and on an
  * hourly interval). Steps: crash-leaked durable-state reservation cleanup,
@@ -697,6 +744,8 @@ export type TraceEvent =
   | ModelRouteEvent
   | JanitorActionEvent
   | ResponseRatedEvent
+  | ApprovalRequestedEvent
+  | ApprovalResolvedEvent
   | TestVerdictEvent
   | ProgramOutputEvent
   | CoverageReportEvent

@@ -66,6 +66,26 @@ const permissionsBlock = z
   .object({
     mode: z.enum(["default", "plan", "auto"]).optional(),
     rules: z.array(permissionRuleSchema).optional(),
+    /**
+     * Loop contract 0.4 (Batch C, G11) — what a tool permission that resolves
+     * to `ask` does on a NON-interactive surface (single-turn / daemon /
+     * gateway, anywhere without a synchronous human prompt). `"pause"`
+     * (DEFAULT — the safe direction) parks the turn: the runtime persists a
+     * `PendingApproval`, publishes an `approval_requested` trace event, and
+     * ends the turn with the `approval_pending` failure class + resume token
+     * so a later `grant`/`deny` decision re-runs the tool call pre-resolved.
+     * `"deny"` is the pre-0.4 collapse behaviour — an ask on a non-interactive
+     * surface becomes a denial in place. The REPL always keeps its
+     * synchronous prompt regardless of this key.
+     *
+     * Deliberately OMITTED from `OPTIMIZABLE_PATHS`: this is a safety /
+     * human-in-the-loop control, not a quality knob. Letting an optimizer
+     * flip a pending-approval `pause` to `deny` (or vice-versa) would let the
+     * search loop silently rewrite the approval posture of a deployment — the
+     * same reason the intent-gate grader and other safety surfaces stay out
+     * of the optimizer's reach.
+     */
+    ask_mode: z.enum(["pause", "deny"]).optional(),
   })
   .strict()
   .optional();
@@ -1214,9 +1234,55 @@ const sloBlock = z
     { message: "observability.slo must declare at least one target threshold" },
   );
 
+/**
+ * Loop contract 0.4 (Batch C, G26) — the observability control sub-blocks.
+ * These declare which of the runtime's observability subscribers the emitted
+ * bundle wires and how it stamps their env / subscriber options.
+ *
+ * DEFAULTS SEMANTICS (critical — mirrored in `@crewhaus/ir` + the lowering):
+ * cost tracking and the trace ring buffer are DEFAULT ON even when the whole
+ * `observability:` block is absent — spec ABSENCE is NOT `off`. An EXPLICIT
+ * opt-out (`cost: { enabled: false }` / `trace: { level: off }`) wins. So the
+ * lowering carries only what the spec declares (absent sub-block ⇒ absent IR
+ * key ⇒ the emitter applies the default), and the presence of an explicit
+ * `enabled: false` / `level: off` is what turns a subscriber off.
+ *
+ *   - `trace.level`: `off` (no ring buffer, no printer) | `ring` (ring buffer
+ *     only, the DEFAULT) | `pretty` (ring + colorised stderr printer) | `json`
+ *     (ring + JSON-Lines printer). Absent ⇒ `ring`.
+ *   - `metrics.enabled`: attach the metrics-collector subscriber. Opt-IN —
+ *     absent ⇒ off.
+ *   - `cost.enabled`: attach the cost-tracker subscriber. DEFAULT ON — absent
+ *     ⇒ on; set `false` to suppress cost accrual entirely.
+ *   - `alerts.enabled`: arm the alert watchdog. Opt-IN — absent ⇒ off.
+ *   - `incidents.enabled`: arm incident capture. Opt-IN — absent ⇒ off.
+ *   - `otel.endpoint`: OTLP exporter endpoint (e.g. `http://localhost:4318`).
+ *     Absent ⇒ no OTel export. Carried verbatim (a `$VAR` value is the
+ *     emitter's to resolve).
+ *
+ * Every feature toggle carries a `.default(true)` on `enabled` so a bare
+ * `metrics: {}` reads as "on"; the ABSENT-block default (opt-in features off,
+ * cost/ring on) is applied downstream, not here. `.strict()` so a typo'd
+ * sub-key fails the build.
+ */
+const observabilityToggle = z.object({ enabled: z.boolean().default(true) }).strict();
+
+const observabilityTraceBlock = z
+  .object({ level: z.enum(["off", "ring", "pretty", "json"]).default("ring") })
+  .strict();
+
+const observabilityOtelBlock = z.object({ endpoint: z.string().min(1).optional() }).strict();
+
 const observabilityBlock = z
   .object({
     slo: sloBlock.optional(),
+    // Loop contract 0.4 (Batch C, G26) — subscriber/exporter controls.
+    trace: observabilityTraceBlock.optional(),
+    metrics: observabilityToggle.optional(),
+    cost: observabilityToggle.optional(),
+    alerts: observabilityToggle.optional(),
+    incidents: observabilityToggle.optional(),
+    otel: observabilityOtelBlock.optional(),
   })
   .strict()
   .optional();
@@ -1952,6 +2018,11 @@ const crewSchema = z
     continuity: continuityBlock,
     thredz: thredzBlock,
     learning: learningBlock,
+    // Loop contract 0.4 (Batch C, G26) — crew joins the observability-carrying
+    // shapes (cli/channel/managed): the orchestrator's cost/trace/metrics/
+    // alert/incident/otel subscribers are spec-controllable per the shared
+    // block's defaults semantics.
+    observability: observabilityBlock,
     chains: chainsBlock,
     wallets: walletsBlock,
     contracts: contractsBlock,
@@ -2337,6 +2408,9 @@ export type SpecCircuitBreakerBlock = z.infer<typeof circuitBreakerBlock>;
 export type SpecModelTiersBlock = z.infer<typeof modelTiersBlock>;
 export type SpecModelPoolBlock = z.infer<typeof modelPoolBlock>;
 export type SpecBudgetBlock = z.infer<typeof budgetBlock>;
+/** Ops item 37 + Loop contract 0.4 (Batch C, G26) — the cross-cutting
+ *  `observability:` block (slo + trace/metrics/cost/alerts/incidents/otel). */
+export type SpecObservabilityBlock = z.infer<typeof observabilityBlock>;
 export type SpecSecurityBlock = z.infer<typeof securityBlock>;
 export type SpecFeedbackBlock = z.infer<typeof feedbackBlock>;
 export type SpecMemoryBlock = z.infer<typeof memoryBlock>;

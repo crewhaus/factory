@@ -15,6 +15,18 @@ export type IrPermissionRule = {
 export type IrPermissions = {
   readonly mode?: "default" | "plan" | "auto";
   readonly rules: readonly IrPermissionRule[];
+  /**
+   * Loop contract 0.4 (Batch C, G11) — what an `ask` permission does on a
+   * NON-interactive surface: `"pause"` parks the turn as a `PendingApproval`
+   * (the SAFE default), `"deny"` collapses the ask to a denial in place (the
+   * pre-0.4 behaviour). ABSENT MEANS `"pause"` — the runtime resolves the
+   * default with `permissions.askMode ?? "pause"`, so the safe direction
+   * holds even when no `permissions:` block is declared. Carried only when
+   * the spec sets it explicitly (mirrors `mode`), keeping the IR minimal and
+   * byte-stable for the emitters that don't read it. NOT optimizer-reachable
+   * (a safety control — excluded from `OPTIMIZABLE_PATHS`).
+   */
+  readonly askMode?: "pause" | "deny";
 };
 
 /**
@@ -684,13 +696,49 @@ export type IrSlo = {
 };
 
 /**
- * Ops item 37 — cross-cutting observability config, lowered from
- * `spec.observability`. Today it carries one sub-block, `slo`. Carried on the
- * interactive/daemon shapes that run a chat loop (IrV0/cli, IrChannelV0,
- * IrManagedV0). Absent when the spec omits the `observability` block.
+ * Loop contract 0.4 (Batch C, G26) — trace subscriber level.
+ *   `off`    — no ring buffer, no printer.
+ *   `ring`   — ring buffer only (the DEFAULT), no printer attached.
+ *   `pretty` — ring buffer + colorised stderr printer.
+ *   `json`   — ring buffer + JSON-Lines printer.
+ */
+export type IrObservabilityTraceLevel = "off" | "ring" | "pretty" | "json";
+export type IrObservabilityTrace = { readonly level: IrObservabilityTraceLevel };
+
+/** Loop contract 0.4 (Batch C, G26) — a simple on/off subscriber toggle
+ *  (metrics / cost / alerts / incidents). */
+export type IrObservabilityToggle = { readonly enabled: boolean };
+
+/** Loop contract 0.4 (Batch C, G26) — OTLP exporter config. `endpoint` is
+ *  carried verbatim (a `$VAR` value is the emitter's to resolve). */
+export type IrObservabilityOtel = { readonly endpoint?: string };
+
+/**
+ * Ops item 37 + Loop contract 0.4 (Batch C, G26) — cross-cutting
+ * observability config, lowered from `spec.observability`. Carries the `slo`
+ * targets (item 37) plus the subscriber/exporter controls (G26). Carried on
+ * the shapes that run an agent loop with observability subscribers
+ * (IrV0/cli, IrChannelV0, IrManagedV0, IrCrewV0).
+ *
+ * DEFAULTS SEMANTICS — spec ABSENCE is NOT `off`. The lowering carries ONLY
+ * what the spec declares; each key is absent when its sub-block is omitted,
+ * and the emitter/runtime applies the default:
+ *   - `cost` absent   ⇒ cost-tracker ON  (`ir.observability?.cost?.enabled ?? true`)
+ *   - `trace` absent  ⇒ ring buffer ON, no printer (`?.trace?.level ?? "ring"`)
+ *   - `metrics`/`alerts`/`incidents` absent ⇒ OFF (opt-in: `?.enabled ?? false`)
+ *   - `otel` absent   ⇒ no OTel export
+ * An EXPLICIT `cost: { enabled: false }` / `trace: { level: "off" }` reaches
+ * the IR verbatim and wins. Absent from the IR entirely when the spec omits
+ * the whole `observability:` block.
  */
 export type IrObservability = {
   readonly slo?: IrSlo;
+  readonly trace?: IrObservabilityTrace;
+  readonly metrics?: IrObservabilityToggle;
+  readonly cost?: IrObservabilityToggle;
+  readonly alerts?: IrObservabilityToggle;
+  readonly incidents?: IrObservabilityToggle;
+  readonly otel?: IrObservabilityOtel;
 };
 
 /**
@@ -1443,6 +1491,10 @@ export type IrCrewV0 = {
   /** v0.3.0 Goal 2 — continual-learning config (§3.3, PR 17). Present
    *  when the spec declares an enabled `learning:` block. */
   readonly learning?: IrLearning;
+  /** Loop contract 0.4 (Batch C, G26) — observability subscriber/exporter
+   *  controls (+ item-37 SLO targets). Optional; absent when the spec omits
+   *  the `observability` block. */
+  readonly observability?: IrObservability;
   /** §47 cross-cutting blockchain subsystem (slice 0). All optional. */
   readonly chains?: readonly IrChainBinding[];
   readonly wallets?: readonly IrWalletBinding[];

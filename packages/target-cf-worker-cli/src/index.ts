@@ -114,6 +114,11 @@ function renderWorker(ir: IrV0, allowedOrigins: readonly string[]): string {
   const model = escapeJsonString(ir.agent.model);
   const instructions = escapeJsonString(ir.agent.instructions);
   const allowed = JSON.stringify(allowedOrigins);
+  // Loop contract 0.4 (Batch C, item 3) — the /chat SSE gains `trace` events in
+  // the TraceEvent JSON vocabulary. `observability.trace: off` suppresses them
+  // entirely; every other level (the default "ring", "pretty", "json") emits.
+  // Baked as a literal boolean so the generated worker carries no config parse.
+  const traceEnabled = (ir.observability?.trace?.level ?? "ring") !== "off";
 
   // Item 23 — surface the ignored failure_taxonomy as a generated comment
   // (mirror of target-workflow's mcp_servers note); the Worker calls the
@@ -130,6 +135,7 @@ const CONFIG = {
   model: ${model},
   instructions: ${instructions},
   allowedOrigins: ${allowed},
+  trace: ${traceEnabled},
 };
 
 const ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
@@ -167,6 +173,7 @@ async function handleChat(request, env, cors) {
     return json({ error: { code: "BAD_REQUEST", message: "messages must be an array of {role,content}" } }, 400, cors);
   }
 
+  const t0 = Date.now();
   const upstream = await fetch(ANTHROPIC_URL, {
     method: "POST",
     headers: {
@@ -198,10 +205,16 @@ async function handleChat(request, env, cors) {
       const emit = (event, data) => {
         controller.enqueue(enc.encode(\`event: \${event}\\ndata: \${JSON.stringify(data)}\\n\\n\`));
       };
+      // Loop contract 0.4 (Batch C, item 3) — trace frames are gated on
+      // CONFIG.trace (observability.trace !== "off"). No-op when disabled.
+      const emitTrace = (event) => { if (CONFIG.trace) emit("trace", event); };
       const reader = upstream.body.getReader();
       let buffer = "";
       let acc = "";
       let stopReason = "end_turn";
+      // Real token usage, harvested from Anthropic's own SSE: message_start
+      // seeds the input/cache counts, message_delta carries the final output.
+      let usageIn = 0, usageOut = 0, cacheRead = 0, cacheCreate = 0;
       try {
         while (true) {
           const { value, done } = await reader.read();
@@ -220,14 +233,27 @@ async function handleChat(request, env, cors) {
             if (!data || data === "[DONE]") continue;
             let payload;
             try { payload = JSON.parse(data); } catch { continue; }
-            if (eventName === "content_block_delta" && payload.delta && payload.delta.type === "text_delta") {
+            if (eventName === "message_start" && payload.message && payload.message.usage) {
+              const u = payload.message.usage;
+              usageIn = u.input_tokens || 0;
+              usageOut = u.output_tokens || 0;
+              cacheRead = u.cache_read_input_tokens || 0;
+              cacheCreate = u.cache_creation_input_tokens || 0;
+            } else if (eventName === "content_block_delta" && payload.delta && payload.delta.type === "text_delta") {
               acc += payload.delta.text;
               emit("text", { text: payload.delta.text });
-            } else if (eventName === "message_delta" && payload.delta && payload.delta.stop_reason) {
-              stopReason = payload.delta.stop_reason;
+            } else if (eventName === "message_delta") {
+              if (payload.delta && payload.delta.stop_reason) stopReason = payload.delta.stop_reason;
+              if (payload.usage && typeof payload.usage.output_tokens === "number") usageOut = payload.usage.output_tokens;
             }
           }
         }
+        // usage + cost, emitted on done. Tokens are real; the inlined worker
+        // carries no pricing table (that ports over with the shared runtime in
+        // M2+), so cost_accrual is published \`unpriced\` — the studio host reads
+        // tokens from model_response.usage and flags the unpriced cost.
+        emitTrace({ kind: "model_response", model: CONFIG.model, usage: { input: usageIn, output: usageOut, cacheRead, cacheCreate }, stopReason, durationMs: Date.now() - t0 });
+        emitTrace({ kind: "cost_accrual", provider: "anthropic", modelId: CONFIG.model, inputTokens: usageIn, outputTokens: usageOut, cachedReadTokens: cacheRead, cacheCreationTokens: cacheCreate, costUsdMicros: 0, unpriced: true });
         emit("done", { text: acc, stopReason });
       } catch (err) {
         emit("error", { message: err && err.message ? err.message : String(err) });

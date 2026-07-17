@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { dirname as pathDirname } from "node:path";
 import * as readline from "node:readline/promises";
 import type Anthropic from "@anthropic-ai/sdk";
@@ -86,7 +87,14 @@ import {
   openScoreboard,
 } from "@crewhaus/routing-store";
 import { type RunContext, createRunContext, tagContent } from "@crewhaus/run-context";
-import { type SessionStore, createSessionStore } from "@crewhaus/session-store";
+import {
+  type PendingApproval,
+  type PendingApprovalStore,
+  type SessionStore,
+  createSessionStore,
+  generateApprovalId,
+  hashApprovalInput,
+} from "@crewhaus/session-store";
 import { type SkillRef, formatSkillsForPrompt } from "@crewhaus/skills-registry";
 import { type SlashCommand, expand as expandSlash } from "@crewhaus/slash-commands";
 import { type Store, createStore } from "@crewhaus/state-store";
@@ -538,6 +546,34 @@ export type {
   JanitorStepResult,
   JanitorStepStatus,
 } from "./janitor";
+
+// Loop contract 0.4 (Batch C, item 4) — agent identity generation. Lives in
+// its own module (`./identity`) but is re-exported here because emitted
+// bundles and the CLI only import the package root. The CLI calls
+// `loadOrCreateAgentIdentity()` at boot and threads the resulting `agentId`
+// into `RunChatLoopOptions.agentId` (and onto any bus it constructs itself).
+export {
+  AGENT_IDENTITY_SCHEMA_VERSION,
+  DEFAULT_IDENTITY_DIR,
+  IDENTITY_FILENAME,
+  agentFingerprint,
+  loadOrCreateAgentIdentity,
+} from "./identity";
+export type { AgentIdentityFile } from "./identity";
+
+// Loop contract 0.4 (Batch C, G11) — the pending-approval persistence seam is
+// owned by `@crewhaus/session-store`; re-exported here so the CLI/codegen can
+// build the store + input hash it passes as `RunChatLoopOptions.approvals`
+// without depending on session-store directly.
+export {
+  type ApprovalDecision,
+  type PendingApproval,
+  type PendingApprovalStore,
+  type PendingApprovalStoreOptions,
+  createPendingApprovalStore,
+  generateApprovalId,
+  hashApprovalInput,
+} from "@crewhaus/session-store";
 
 // Ops item 31 — alert watchdog seams re-exported so the CLI/codegen can build
 // the durable + off-box alert sink (audit append + settings.json alert hook /
@@ -1475,6 +1511,61 @@ export type RunChatLoopOptions = {
    * is not evaluated. Absent → zero behaviour change for existing callers.
    */
   evaluation?: RunEvaluation;
+  /**
+   * Loop contract 0.4 (Batch C, item 4) — the publishing agent's identity
+   * fingerprint (the `agentId` from `loadOrCreateAgentIdentity`). When set AND
+   * runChatLoop constructs the run context itself (no `opts.runContext`), the
+   * run's `TraceEventBus` is built with this `agentId` so every trace envelope
+   * carries it and audit sinks can attribute the run to one agent. When the
+   * caller supplies `opts.runContext`, they own `agentId` on its bus (a
+   * sub-agent spawner threads the parent's `agentId` into the child bus) and
+   * this field is ignored — matching how `runContext` overrides the other
+   * per-run construction inputs. Absent → no stamping (byte-identical to a
+   * pre-0.4 runtime).
+   */
+  agentId?: string;
+  /**
+   * Loop contract 0.4 (Batch C, G11) — how a tool permission that resolves to
+   * `ask` behaves on a NON-interactive surface (`permissions.ask_mode`,
+   * lowered from the IR; absent ⇒ `"pause"`):
+   *   - `"pause"` (default) — WITH an `approvals` store, PARK the run: persist
+   *     a `PendingApproval`, publish `approval_requested`, and end with the
+   *     `approval_pending` failure class so the call can be granted/denied out
+   *     of band and re-resolved on the next execution. WITHOUT an `approvals`
+   *     store there is nowhere to park, so it collapses to the pre-0.4 deny.
+   *   - `"deny"` — the pre-0.4 collapse-in-place: the ask denies immediately
+   *     with a note (never parks), regardless of any `approvals` store.
+   * The interactive REPL path is unaffected either way — an `ask` there always
+   * prompts on stdin.
+   */
+  askMode?: "pause" | "deny";
+  /**
+   * Loop contract 0.4 (Batch C, G11) — the pending-approval seam. When
+   * supplied AND `askMode` is `"pause"` (the default), a headless `ask`
+   * consults `store.get(toolName, inputHash)`:
+   *   - a `"grant"` → allow this ONE call (the grant is one-shot: consumed via
+   *     `store.persist`, so a later identical call re-asks);
+   *   - a `"deny"` → deny with a note;
+   *   - nothing yet → persist a fresh `PendingApproval`, fire `notify` (if
+   *     given), publish `approval_requested`, and PARK the run.
+   * The store is injected (the CLI builds `createPendingApprovalStore`); the
+   * `surface` classifier stamps the `approval_requested` event (defaults to
+   * `"single-turn"` under `singleTurn`, else `"headless"`). Omitted → no
+   * parking (headless `ask` collapses to the pre-0.4 deny).
+   */
+  approvals?: {
+    /**
+     * The persistence seam. Only `{ persist, get, resolve }` are contracted;
+     * the runtime calls `get` (look up a prior decision) and `persist` (park a
+     * fresh request / consume a one-shot grant), while `resolve` is the
+     * out-of-band CLI/Slack surface's entry point on the SAME store. Narrowed
+     * from the full `PendingApprovalStore` so a caller may inject a minimal
+     * store; the concrete `createPendingApprovalStore` satisfies it.
+     */
+    readonly store: Pick<PendingApprovalStore, "persist" | "get" | "resolve">;
+    readonly notify?: (approval: PendingApproval) => Promise<void>;
+    readonly surface?: string;
+  };
 };
 
 /**
@@ -2046,7 +2137,22 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // sessionId; otherwise build a fresh context bound to that sessionId.
   // Tests that pass their own runContext rely on observing turnNumber on
   // it after the loop returns, so we never silently swap it out.
-  const runContext: RunContext = opts.runContext ?? createRunContext({ sessionId });
+  //
+  // Loop contract 0.4 (Batch C, item 4) — when the caller supplies an
+  // `agentId` and lets runChatLoop own the context, build the bus with that
+  // identity so `envelope()` stamps every trace event with it. runId is minted
+  // here (matching run-context's `run_<8 hex>` shape) and threaded into BOTH
+  // the bus and the context so their ids stay coherent. When `opts.runContext`
+  // is supplied the caller owns `agentId` on its bus, so this is skipped.
+  const runContext: RunContext =
+    opts.runContext ??
+    (opts.agentId !== undefined
+      ? (() => {
+          const runId = `run_${randomUUID().slice(0, 8)}`;
+          const eventBus = new TraceEventBus({ runId, sessionId, agentId: opts.agentId });
+          return createRunContext({ runId, sessionId, eventBus });
+        })()
+      : createRunContext({ sessionId }));
 
   // G01 — surface the max-tokens lift once, at boot (see `effectiveMaxTokens`).
   if (effectiveMaxTokens !== maxTokens) {
@@ -2069,7 +2175,6 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // mints a no-subscriber bus; here we attach the env-gated set so a fresh
   // run with `OTEL_EXPORTER_OTLP_ENDPOINT` set automatically exports.
   const bus: TraceEventBus = runContext.eventBus;
-  void TraceEventBus; // keep type import alive for future direct constructions
   // Item 22 — re-point the failover chain's late-bound bus getter at the
   // run's real bus (see the chain construction above): the chain and its
   // per-candidate breakers publish model_failover / circuit_state_changed
@@ -2757,6 +2862,17 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // `useConst` rule (which fires on exactly-one-assignment lets).
   let askApproval: ((toolName: string, input: unknown) => Promise<boolean>) | undefined = undefined;
 
+  // Loop contract 0.4 (Batch C, G11) — headless ask-approval parking. `askMode`
+  // is the lowered `permissions.ask_mode` (absent ⇒ "pause"); `approvals` is
+  // the injected persistence seam. Parking is active only when BOTH a store is
+  // present AND the mode is "pause" — otherwise a headless `ask` collapses to
+  // the pre-0.4 deny. `approvalSurface` classifies the `approval_requested`
+  // event; it never affects the REPL path (which prompts on stdin).
+  const askMode = opts.askMode ?? "pause";
+  const approvals = opts.approvals;
+  const approvalSurface =
+    approvals?.surface ?? (opts.singleTurn === true ? "single-turn" : "headless");
+
   // Per-run state for tool-loop detection and warning de-dup. Both span
   // turns within a single `runChatLoop` invocation so cross-turn loops
   // (e.g. "keep running date") get caught and warned at most once per
@@ -2772,6 +2888,33 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   const toolUseHistory: TsmToolUseBlock[] = [];
   const loopSignatureStage = new Map<string, "warned" | "escalated">();
   const loopEscalation = opts.loopDetection?.escalation ?? "warn";
+
+  // Loop contract 0.4 (Batch C, item 7) — per-tool cost attribution. When a
+  // NON-streaming model response that emitted tool_use blocks is priceable, the
+  // response's cost is split evenly across those calls and stashed here by
+  // tool_use id, then stamped as `attributedCostUsdMicros` on each `tool_use`
+  // event-log record. Keyed by id (unique per call) and consumed (deleted) on
+  // read to bound growth. The streaming path dispatches tools BEFORE the
+  // response's usage is known, so it never populates this map — precisely the
+  // "where the model usage split is computable" boundary: absent ⇒ no field.
+  const toolCostAttribution = new Map<string, number>();
+  // Response cost in USD-micros, or undefined when the served model isn't on the
+  // pricing table (the split is then not computable — no attribution stamped).
+  const responseCostMicros = (
+    provider: ProviderId,
+    wireModelId: string,
+    usage: { input: number; output: number; cacheRead?: number; cacheCreate?: number },
+  ): number | undefined => {
+    const row = resolvePricing(DEFAULT_PRICING, provider, wireModelId);
+    if (row === undefined) return undefined;
+    return computeCostMicros(
+      row,
+      usage.input,
+      usage.output,
+      usage.cacheRead ?? 0,
+      usage.cacheCreate ?? 0,
+    );
+  };
 
   // Working-indicator bookkeeping for tool execution. A single shared spinner
   // serves the whole loop, so the set tracks which tools are mid-flight to
@@ -2812,7 +2955,17 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     // `[tool: …]` line sits cleanly above any animation that follows.
     if (activeToolNames.length === 0) out.spinner.stop();
     out.write(`[tool: ${tu.name}]\n`);
-    await logEvent("tool_use", { id: tu.id, name: tu.name, input: tu.input });
+    // Item 7 — stamp the per-tool cost attribution when the producing response
+    // was priceable (non-streaming path only; see `toolCostAttribution`).
+    // Consume the entry so the map stays bounded across a long run.
+    const attributedCostUsdMicros = toolCostAttribution.get(tu.id);
+    if (attributedCostUsdMicros !== undefined) toolCostAttribution.delete(tu.id);
+    await logEvent("tool_use", {
+      id: tu.id,
+      name: tu.name,
+      input: tu.input,
+      ...(attributedCostUsdMicros !== undefined ? { attributedCostUsdMicros } : {}),
+    });
     const inputBytes = Buffer.byteLength(JSON.stringify(tu.input ?? null), "utf8");
     const toolStartEnvelope = bus.envelope();
     bus.publish({
@@ -2920,20 +3073,86 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       denialMessage = decisionDetails.reason ?? "tool denied by permission policy";
     } else if (decision === "ask") {
       if (askApproval !== undefined) {
+        // Interactive REPL path — unchanged: prompt on stdin.
         approved = await askApproval(tu.name, tu.input);
         if (!approved) denialMessage = "tool denied by user";
+      } else if (approvals !== undefined && askMode === "pause") {
+        // G11 headless parking/resume. Consult the store for a prior decision
+        // on this exact (toolName, inputHash).
+        const inputHash = hashApprovalInput(tu.name, tu.input);
+        const existing = await approvals.store.get(tu.name, inputHash);
+        if (existing?.decision === "grant") {
+          // One-shot allow: consume the grant so a later identical call re-asks.
+          approved = true;
+          await approvals.store.persist({ ...existing, consumedAt: new Date().toISOString() });
+        } else if (existing?.decision === "deny") {
+          approved = false;
+          denialMessage = `tool denied: \`${tu.name}\` approval was denied${
+            existing.decidedBy !== undefined ? ` by ${existing.decidedBy}` : ""
+          }.`;
+        } else {
+          // No decision yet. Reuse an existing pending record for this key
+          // (idempotent re-park across resumed runs) or persist a fresh one,
+          // fire the out-of-band notification, publish `approval_requested`,
+          // and PARK: throw the classified `approval_pending` report. The
+          // NeedTools catch (non-streaming) publishes `run_failed` + rethrows;
+          // the streaming path reaches the same halt through recovery's
+          // classified-report passthrough. On the next execution the store
+          // carries a grant/deny and the call re-resolves pre-decided.
+          const pending: PendingApproval = existing ?? {
+            id: generateApprovalId(),
+            toolName: tu.name,
+            inputHash,
+            input: tu.input,
+            runId: bus.runId,
+            sessionId,
+            surface: approvalSurface,
+            createdAt: new Date().toISOString(),
+          };
+          if (existing === null) await approvals.store.persist(pending);
+          if (approvals.notify !== undefined) {
+            await approvals.notify(pending).catch((err) => {
+              runContext.logger.warn("approvals.notify failed", {
+                approvalId: pending.id,
+                error: (err as Error).message,
+              });
+            });
+          }
+          bus.publish({
+            ...bus.envelope(),
+            kind: "approval_requested",
+            approvalId: pending.id,
+            toolName: tu.name,
+            surface: approvalSurface,
+          });
+          runContext.logger.info("tool approval parked", {
+            approvalId: pending.id,
+            toolName: tu.name,
+            surface: approvalSurface,
+          });
+          throw new RunFailedError({
+            class: "approval_pending",
+            title: "awaiting tool approval",
+            detail: `\`${tu.name}\` requires approval on a non-interactive surface (${approvalSurface}); the run is parked as approval ${pending.id}`,
+            remediation: `grant or deny approval ${pending.id} out of band (e.g. \`crewhaus approvals grant ${pending.id}\`), then rerun`,
+            exitCode: EXIT_CODES.approval_pending,
+          });
+        }
       } else {
+        // Pre-0.4 collapse-to-deny: no interactive surface, and either
+        // `ask_mode: "deny"` or no approvals store is wired to park against.
         denialMessage =
-          `tool denied: \`${tu.name}\` defaulted to "ask" and single-turn mode has no interactive surface to prompt on. ` +
-          `Add an explicit rule to permissions.rules in your spec, e.g. \`{ type: alwaysAllow, pattern: ${tu.name} }\`, or run in REPL mode where "ask" can prompt.`;
+          `tool denied: \`${tu.name}\` defaulted to "ask" and this non-interactive surface has no way to prompt` +
+          `${approvals === undefined ? " (no approvals store wired)" : ' (ask_mode: "deny")'}. ` +
+          `Add an explicit rule to permissions.rules in your spec, e.g. \`{ type: alwaysAllow, pattern: ${tu.name} }\`, run in REPL mode where "ask" can prompt, or set ask_mode: pause with an approvals store to park for out-of-band approval.`;
       }
       // Advisor groundwork (item 14) — event the ask RESOLUTION. The publish
-      // above fired BEFORE the approval prompt (decision "ask", no outcome);
-      // this one fires after `askApproval` resolves — or after the
-      // single-turn fallback collapses the ask to a deny — so offline advice
-      // mining can measure how each tool's prompts are actually answered.
-      // The advisor persistence subscriber (observability.ts) keys on
-      // `askOutcome` to persist exactly this resolved form.
+      // above fired BEFORE the approval resolved (decision "ask", no outcome);
+      // this one fires after the REPL prompt / store decision / collapse
+      // resolves — so offline advice mining can measure how each tool's prompts
+      // are actually answered. The advisor persistence subscriber
+      // (observability.ts) keys on `askOutcome` to persist exactly this resolved
+      // form. Unreached on the PARK path, which throws above.
       bus.publish({
         ...bus.envelope(),
         kind: "permission_decision",
@@ -4137,6 +4356,16 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 input: t.input,
               }));
               for (const tu of tsmBlocks) toolUseHistory.push(tu);
+              // Item 7 — the response fully drained (usage known) before these
+              // calls dispatch in `NeedTools`, so the split IS computable here:
+              // split the priceable response cost evenly across its tool_use
+              // blocks, keyed by id for `executeOneToolUse` to stamp. Skipped
+              // (no attribution) when the model isn't on the pricing table.
+              const respCost = responseCostMicros(respProvider, respWireModelId, final.usage);
+              if (respCost !== undefined) {
+                const perTool = Math.round(respCost / toolUses.length);
+                for (const tu of tsmBlocks) toolCostAttribution.set(tu.id, perTool);
+              }
               state = transition(state, { kind: "ModelReturnedToolUse", toolUses: tsmBlocks });
             }
           } catch (err) {

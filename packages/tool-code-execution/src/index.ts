@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import {
   type Sandbox,
   type SandboxBackend,
@@ -5,7 +6,8 @@ import {
   createSandbox,
 } from "@crewhaus/sandbox";
 import { buildTool } from "@crewhaus/tool-builder";
-import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog";
+import type { TraceEventBus } from "@crewhaus/trace-event-bus";
 import { z } from "zod";
 
 /**
@@ -158,11 +160,52 @@ const codeSchema = z.object({
 
 type CodeInput = z.infer<typeof codeSchema>;
 
+/**
+ * Section 57 / loop contract 0.4 (Batch C, G59) — resolve the run's
+ * `TraceEventBus` from a tool-execute context. The runtime threads the
+ * `RunContext` on EVERY tool execute via `ctx.bridge.runContext` (and, where
+ * available, the first-class `ctx.runContext`), mirroring how tool-mcp /
+ * skills-registry reach the run context. Returns undefined when neither is
+ * present (bare unit calls / tests that pass no context) so publishing is a
+ * strict no-op off the loop.
+ */
+function resolveEventBus(ctx?: ToolExecuteContext): TraceEventBus | undefined {
+  const rc =
+    ctx?.runContext ??
+    (ctx?.bridge as { runContext?: { eventBus?: TraceEventBus } } | undefined)?.runContext;
+  return rc?.eventBus;
+}
+
+/**
+ * Section 57 / loop contract 0.4 (Batch C, G59) — the AgentFlow feedback
+ * channel for a sandboxed program run: publish ONE `program_output` summary
+ * at process exit (per-chunk stdout/stderr is the separate `tool_stream_chunk`
+ * stream). The event carries only byte COUNTS + the exit code + duration —
+ * never the raw stdout/stderr — so it is inherently size-capped and safe to
+ * emit for chatty programs. Fire-and-forget: a missing bus (no run context)
+ * skips silently.
+ */
+function publishProgramOutput(
+  bus: TraceEventBus | undefined,
+  summary: { stdout: string; stderr: string; exitCode: number; durationMs: number },
+): void {
+  if (bus === undefined) return;
+  bus.publish({
+    ...bus.envelope(),
+    kind: "program_output",
+    programId: `prog_${randomBytes(6).toString("hex")}`,
+    exitCode: summary.exitCode,
+    stdoutBytes: Buffer.byteLength(summary.stdout, "utf8"),
+    stderrBytes: Buffer.byteLength(summary.stderr, "utf8"),
+    durationMs: Math.round(summary.durationMs),
+  });
+}
+
 async function runInSandbox(
   language: "python" | "javascript" | "shell",
   argv: ReadonlyArray<string>,
   input: CodeInput,
-  ctx: { signal?: AbortSignal; onStreamChunk?: (s: "stdout" | "stderr", c: string) => void } = {},
+  ctx?: ToolExecuteContext,
 ): Promise<string> {
   const sandbox = getOrCreateSandbox();
   if (sandbox.backend === "noop") {
@@ -172,15 +215,19 @@ async function runInSandbox(
   }
   const image = configuredImage(language);
   const mounts = buildMounts();
+  const onStreamChunk = ctx?.onStreamChunk;
   const result = await sandbox.exec({
     image,
     argv: [...argv, input.code],
     ...(input.timeout !== undefined ? { timeoutMs: input.timeout } : {}),
-    ...(ctx.signal !== undefined ? { signal: ctx.signal } : {}),
+    ...(ctx?.signal !== undefined ? { signal: ctx.signal } : {}),
     ...(mounts.length > 0 ? { mounts } : {}),
-    onStdoutChunk: ctx.onStreamChunk ? (chunk) => ctx.onStreamChunk?.("stdout", chunk) : undefined,
-    onStderrChunk: ctx.onStreamChunk ? (chunk) => ctx.onStreamChunk?.("stderr", chunk) : undefined,
+    onStdoutChunk: onStreamChunk ? (chunk) => onStreamChunk("stdout", chunk) : undefined,
+    onStderrChunk: onStreamChunk ? (chunk) => onStreamChunk("stderr", chunk) : undefined,
   });
+  // G59 — publish the per-process summary at exit (byte counts + exit code +
+  // duration only) for the runtime feedback channel.
+  publishProgramOutput(resolveEventBus(ctx), result);
   return formatResult(result);
 }
 
@@ -191,11 +238,7 @@ export const python: RegisteredTool = buildTool({
   inputSchema: codeSchema,
   destructive: true,
   requiresSandbox: true,
-  execute: async (input, ctx) =>
-    runInSandbox("python", ["python3", "-c"], input as CodeInput, {
-      ...(ctx?.signal !== undefined ? { signal: ctx.signal } : {}),
-      ...(ctx?.onStreamChunk !== undefined ? { onStreamChunk: ctx.onStreamChunk } : {}),
-    }),
+  execute: async (input, ctx) => runInSandbox("python", ["python3", "-c"], input as CodeInput, ctx),
 });
 
 export const javascript: RegisteredTool = buildTool({
@@ -206,10 +249,7 @@ export const javascript: RegisteredTool = buildTool({
   destructive: true,
   requiresSandbox: true,
   execute: async (input, ctx) =>
-    runInSandbox("javascript", ["node", "-e"], input as CodeInput, {
-      ...(ctx?.signal !== undefined ? { signal: ctx.signal } : {}),
-      ...(ctx?.onStreamChunk !== undefined ? { onStreamChunk: ctx.onStreamChunk } : {}),
-    }),
+    runInSandbox("javascript", ["node", "-e"], input as CodeInput, ctx),
 });
 
 export const shell: RegisteredTool = buildTool({
@@ -219,11 +259,7 @@ export const shell: RegisteredTool = buildTool({
   inputSchema: codeSchema,
   destructive: true,
   requiresSandbox: true,
-  execute: async (input, ctx) =>
-    runInSandbox("shell", ["sh", "-c"], input as CodeInput, {
-      ...(ctx?.signal !== undefined ? { signal: ctx.signal } : {}),
-      ...(ctx?.onStreamChunk !== undefined ? { onStreamChunk: ctx.onStreamChunk } : {}),
-    }),
+  execute: async (input, ctx) => runInSandbox("shell", ["sh", "-c"], input as CodeInput, ctx),
 });
 
 export const allCodeExecutionTools: ReadonlyArray<RegisteredTool> = [python, javascript, shell];

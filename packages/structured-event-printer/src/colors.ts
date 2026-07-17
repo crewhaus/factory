@@ -45,6 +45,10 @@ const PALETTE: Record<TraceEventKind, string> = {
   model_route: "\x1b[94m", // bright blue — a routing decision, in the model family
   // Human feedback channel — a user rating on an assistant turn.
   response_rated: "\x1b[92m", // bright green — a human signal worth spotting
+  // Loop contract 0.4 (Batch C, G11) — pending-approval lifecycle. A parked
+  // approval is a human-in-the-loop gate, in the permission/yellow family.
+  approval_requested: "\x1b[33m", // yellow — a turn is parked awaiting a human
+  approval_resolved: "\x1b[33m", // yellow — the gate cleared (grant or deny)
   // Ops item 36 — boot-time self-heal janitor maintenance actions.
   janitor_action: "\x1b[2m", // dim — routine housekeeping
   // Track F (§57) — AgentFlow-style runtime feedback channels

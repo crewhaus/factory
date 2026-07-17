@@ -2,11 +2,22 @@
 // Channel-generic gateway: dispatches signed webhooks to the matching adapter.
 import { InMemoryDedupStore, type DedupStore } from "@crewhaus/durable-state";
 import type { ChannelAdapter } from "@crewhaus/channel-adapter-slack";
+import { resolveApproval } from "@crewhaus/channel-adapter-base";
+import type { ApprovalStore, ApprovalAuditSink } from "@crewhaus/channel-adapter-base";
 import type { SessionRouter } from "./session-router.js";
 
 export type GatewayConfig = {
   adapters: ReadonlyMap<string, ChannelAdapter>;
   sessionRouter: SessionRouter;
+  /**
+   * G11 — the shared pending-approval store. The `/<adapter>/actions` route
+   * resolves a parked approval here on a button click; the parked turn (in the
+   * session-router) awaits the same store. Absent ⇒ the actions route ACKs and
+   * ignores (no approval surface).
+   */
+  approvals?: ApprovalStore;
+  /** G48 — durable audit sink; an approval resolution appends one record. */
+  auditSink?: ApprovalAuditSink;
   /** Maximum number of inbound idempotency keys remembered before LRU eviction (in-memory store only). */
   dedupCapacity?: number;
   /**
@@ -32,6 +43,50 @@ export function createGateway(config: GatewayConfig): Gateway {
   return {
     async handle(req: Request): Promise<Response> {
       const url = new URL(req.url);
+      // G11 — interactivity webhook (an Approve/Deny button click), verified
+      // with the SAME signing machinery as an events webhook and resolved via
+      // the shared store. Path: /<adapter>/actions.
+      const actionMatch = url.pathname.match(/^\/([^/]+)\/actions$/);
+      if (actionMatch && actionMatch[1] !== undefined) {
+        const actionAdapter = config.adapters.get(actionMatch[1]);
+        if (!actionAdapter || !actionAdapter.parseInteraction) {
+          return new Response("unknown channel", { status: 404 });
+        }
+        const actionBody = await req.text();
+        const actionReq = { headers: req.headers, body: actionBody };
+        if (!actionAdapter.verify(actionReq)) {
+          return new Response("invalid signature", { status: 401 });
+        }
+        const interaction = actionAdapter.parseInteraction(actionReq);
+        if (interaction.kind !== "approval_action" || config.approvals === undefined) {
+          return new Response("ok", { status: 200 });
+        }
+        const by = actionAdapter.id + ":" + interaction.userId;
+        const resolved = await resolveApproval({
+          store: config.approvals,
+          approvalId: interaction.approvalId,
+          decision: interaction.decision,
+          by,
+          ...(config.auditSink !== undefined ? { auditSink: config.auditSink } : {}),
+        });
+        if (resolved === null) return new Response("unknown approval", { status: 200 });
+        const ackApproval = actionAdapter.ackApproval;
+        if (ackApproval !== undefined) {
+          try {
+            await ackApproval({ interaction, decision: interaction.decision, by, toolName: resolved.toolName });
+          } catch (err) {
+            process.stderr.write("[gateway] approval ack error: " + (err as Error).message + "\n");
+          }
+        }
+        // Resume runs off the ACK path so a slow re-drive can't stall the 3s
+        // interactivity response; the parked turn re-executes pre-resolved.
+        queueMicrotask(() => {
+          config.sessionRouter.resumeApproval(resolved, actionAdapter).catch((err) => {
+            process.stderr.write("[gateway] approval resume error: " + (err as Error).message + "\n");
+          });
+        });
+        return new Response("ok", { status: 200 });
+      }
       // Match adapter by path prefix: /slack/events → "slack".
       const match = url.pathname.match(/^\/([^/]+)\/events$/);
       if (!match || match[1] === undefined) return new Response("not found", { status: 404 });

@@ -23,9 +23,28 @@
  * surface minimal.
  */
 import { CrewhausError } from "@crewhaus/errors";
+import {
+  type ApprovalPromptContent,
+  type ParsedInteraction,
+  buildApprovalAckMessage,
+  buildApprovalMessage,
+  parseSlackInteraction,
+} from "./approvals.js";
 import { signSlackBody, verifySlackSignature } from "./verify.js";
 
 export { signSlackBody, verifySlackSignature } from "./verify.js";
+// Loop contract 0.4 (Batch C, G11) — Slack interactive approval surface.
+export {
+  APPROVE_ACTION_ID,
+  DENY_ACTION_ID,
+  APPROVAL_BLOCK_ID_PREFIX,
+  type ApprovalPromptContent,
+  type SlackApprovalMessage,
+  type ParsedInteraction,
+  buildApprovalMessage,
+  buildApprovalAckMessage,
+  parseSlackInteraction,
+} from "./approvals.js";
 
 export class SlackAdapterError extends CrewhausError {
   override readonly name = "SlackAdapterError";
@@ -117,6 +136,34 @@ export interface ChannelAdapter {
    * skip the hook silently.
    */
   react?(args: { event: InboundEvent; emoji: string }): Promise<void>;
+  /**
+   * Loop contract 0.4 (Batch C, G11) — post an interactive Approve/Deny
+   * approval message into the run's thread and return the posted message ts
+   * (for a later `chat.update` ACK). Only adapters with interactive buttons
+   * (Slack) implement this; the channel-generic `postApprovalPrompt` falls
+   * back to a text message via `sendReply` when it is undefined.
+   */
+  postApproval?(args: {
+    event: InboundEvent;
+    approval: ApprovalPromptContent;
+  }): Promise<{ messageTs?: string }>;
+  /**
+   * G11 — parse this channel's interactivity webhook (a button click) into a
+   * normalised approval action. Undefined for adapters without interactive
+   * buttons; the gateway's `/<adapter>/actions` route no-ops for them.
+   */
+  parseInteraction?(req: RawRequest): ParsedInteraction;
+  /**
+   * G11 — ACK a resolved approval in-thread: replace the buttons with a
+   * "decision recorded" line so it can't be clicked twice and the thread shows
+   * who decided. Best-effort — a failure here must not fail the resolution.
+   */
+  ackApproval?(args: {
+    interaction: Extract<ParsedInteraction, { kind: "approval_action" }>;
+    decision: "grant" | "deny";
+    by: string;
+    toolName?: string;
+  }): Promise<void>;
 }
 
 export type SlackAdapterConfig = {
@@ -306,6 +353,114 @@ export function createSlackAdapter(
         // "already_reacted" is a benign no-op; don't surface as error.
         if (body.ok === false && body.error !== "already_reacted") {
           throw new SlackAdapterError(`reactions.add error: ${body.error ?? "unknown"}`);
+        }
+      }
+    },
+
+    // G11 — post the interactive Approve/Deny approval message into the run's
+    // thread. Returns the posted message ts so the gateway can `chat.update`
+    // the buttons away when the approval resolves.
+    async postApproval(args: {
+      event: InboundEvent;
+      approval: ApprovalPromptContent;
+    }): Promise<{ messageTs?: string }> {
+      const message = buildApprovalMessage(args.approval);
+      const url = `${apiBaseUrl}/chat.postMessage`;
+      const threadKey = args.event.threadTs ?? args.event.ts;
+      const res = await doFetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json; charset=utf-8",
+          Authorization: `Bearer ${config.botToken}`,
+        },
+        body: JSON.stringify({
+          channel: args.event.channelId,
+          thread_ts: threadKey,
+          text: message.text,
+          blocks: message.blocks,
+        }),
+      });
+      if (!res.ok) {
+        throw new SlackAdapterError(
+          `chat.postMessage (approval) failed: ${res.status} ${res.statusText}`,
+        );
+      }
+      const ct = res.headers.get("content-type") ?? "";
+      if (ct.includes("application/json")) {
+        const body = (await res.json()) as { ok?: boolean; error?: string; ts?: string };
+        if (body.ok === false) {
+          throw new SlackAdapterError(
+            `chat.postMessage (approval) error: ${body.error ?? "unknown"}`,
+          );
+        }
+        return typeof body.ts === "string" ? { messageTs: body.ts } : {};
+      }
+      return {};
+    },
+
+    // G11 — parse Slack's interactivity webhook (a block_actions button click).
+    parseInteraction(req: RawRequest): ParsedInteraction {
+      return parseSlackInteraction(req.body);
+    },
+
+    // G11 — ACK a resolved approval in-thread. Prefers the interaction's
+    // `response_url` (no extra scope, replaces the original message); falls
+    // back to `chat.update` with the bot token when the message ts is known.
+    async ackApproval(args: {
+      interaction: Extract<ParsedInteraction, { kind: "approval_action" }>;
+      decision: "grant" | "deny";
+      by: string;
+      toolName?: string;
+    }): Promise<void> {
+      const ack = buildApprovalAckMessage({
+        decision: args.decision,
+        by: args.by,
+        ...(args.toolName !== undefined ? { toolName: args.toolName } : {}),
+      });
+      if (args.interaction.responseUrl !== undefined) {
+        const res = await doFetch(args.interaction.responseUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json; charset=utf-8" },
+          body: JSON.stringify({
+            replace_original: true,
+            text: ack.text,
+            blocks: ack.blocks,
+          }),
+        });
+        if (!res.ok) {
+          throw new SlackAdapterError(
+            `approval ack (response_url) failed: ${res.status} ${res.statusText}`,
+          );
+        }
+        return;
+      }
+      if (args.interaction.channelId !== undefined && args.interaction.messageTs !== undefined) {
+        const res = await doFetch(`${apiBaseUrl}/chat.update`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json; charset=utf-8",
+            Authorization: `Bearer ${config.botToken}`,
+          },
+          body: JSON.stringify({
+            channel: args.interaction.channelId,
+            ts: args.interaction.messageTs,
+            text: ack.text,
+            blocks: ack.blocks,
+          }),
+        });
+        if (!res.ok) {
+          throw new SlackAdapterError(
+            `approval ack (chat.update) failed: ${res.status} ${res.statusText}`,
+          );
+        }
+        const ct = res.headers.get("content-type") ?? "";
+        if (ct.includes("application/json")) {
+          const body = (await res.json()) as { ok?: boolean; error?: string };
+          if (body.ok === false) {
+            throw new SlackAdapterError(
+              `approval ack (chat.update) error: ${body.error ?? "unknown"}`,
+            );
+          }
         }
       }
     },

@@ -140,6 +140,17 @@ export class Registry {
     "Total model tokens by direction (in/out)",
   );
   readonly errorsTotal = new Counter("crewhaus_errors_total", "Total recovered errors by kind");
+  // Loop contract 0.4 (Batch C, G57) — labeled cost counter fed by the
+  // `cost_accrual` trace events cost-tracker emits (one per `model_response`).
+  // Labeled by `provider` + `model` so a Prometheus scrape can break spend
+  // down per provider/model. Microdollars (1e-6 USD) to stay integer-valued —
+  // the same unit `CostAccrualEvent.costUsdMicros` and audit-log carry, so a
+  // dashboard divides by 1e6 once. Per-call accruals only: the aggregate
+  // run-total accrual (`summary: true`) is skipped so it never double-counts.
+  readonly costUsdMicrosTotal = new Counter(
+    "crewhaus_cost_usd_micros_total",
+    "Total model spend in microdollars (1e-6 USD) by provider and model",
+  );
   readonly turnDurationSeconds = new Histogram(
     "crewhaus_turn_duration_seconds",
     "Wall-clock duration of one user turn",
@@ -169,6 +180,7 @@ export class Registry {
       this.toolCallsTotal.prometheus(),
       this.tokensTotal.prometheus(),
       this.errorsTotal.prometheus(),
+      this.costUsdMicrosTotal.prometheus(),
       this.turnDurationSeconds.prometheus(),
       this.toolDurationSeconds.prometheus(),
       this.modelTtftSeconds.prometheus(),
@@ -177,7 +189,13 @@ export class Registry {
 
   jsonSnapshot(): RegistryJsonSnapshot {
     const counters: RegistryJsonSnapshot["counters"] = {};
-    for (const c of [this.turnsTotal, this.toolCallsTotal, this.tokensTotal, this.errorsTotal]) {
+    for (const c of [
+      this.turnsTotal,
+      this.toolCallsTotal,
+      this.tokensTotal,
+      this.errorsTotal,
+      this.costUsdMicrosTotal,
+    ]) {
       counters[c.name] = c.series().map((s) => ({ labels: s.labels, value: s.value }));
     }
     const histograms: RegistryJsonSnapshot["histograms"] = {};

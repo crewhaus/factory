@@ -149,6 +149,88 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     sessions as JSONL trajectory tuples for offline analysis and
     fine-tune-style pipelines.
 
+- **Loop contract 0.4, Batch C — the observe-and-govern half of the loop:
+  headless human-in-the-loop approvals, agent identity, the observability
+  control surface, live run streaming, and failure triage.** One coordinated
+  batch lands the spec grammar, the IR, the runtime seam, the affected
+  emitters, the gateway protocol, the OTel exporter, and the CLI:
+
+  - **`permissions.ask_mode: pause|deny` — what an `ask` does where no human
+    is watching (G11).** On a non-interactive surface (single-turn / daemon /
+    gateway) a tool permission that resolves to `ask` no longer silently
+    collapses to a denial. `pause` (the DEFAULT, the safe direction) parks the
+    turn: the runtime persists a `PendingApproval`, publishes the new
+    `approval_requested` trace event, and ends the run with the classified
+    failure machinery — `run_failed` class `"approval_pending"`, exit code 36
+    (beside the budget cap's 33, the timers' 34 and the quality floor's 35) —
+    plus a resume token, so a later `grant`/`deny` re-drives the parked tool
+    call pre-resolved (publishing `approval_resolved`). `deny` restores the
+    pre-0.4 collapse. `crewhaus approvals list|show|grant|deny <id>` resolves
+    parked approvals over the session store
+    (`.crewhaus/sessions/approvals.jsonl`; `--by` records the deciding
+    identity); on the channel shape the daemon constructs a shared approval
+    store, the gateway gains a `/<adapter>/actions` route
+    (verify → resolve → ack → resume) and Slack posts an interactive
+    Approve/Deny Block Kit message a click resolves in-thread. `ask_mode` is
+    deliberately OUT of `OPTIMIZABLE_PATHS` — a safety / human-in-the-loop
+    posture, not a quality knob.
+
+  - **Agent identity — a stable, verifiable fingerprint (item 4).** An
+    Ed25519 keypair auto-generated at first boot into `.crewhaus/identity.json`
+    (private key mode 0600); its `agentId` — the SHA-256 fingerprint of the
+    public key — is stamped onto every `TraceEvent` envelope and appended to
+    audit records, so a trace event and its audit trail attribute to one
+    agent. `loadOrCreateAgentIdentity` is idempotent and create-exclusive
+    (concurrent first-boots can't clobber each other; first writer wins).
+    `crewhaus doctor` prints the resolved identity line.
+
+  - **`observability:` control surface (G26) — which subscribers a bundle
+    wires, and how.** New `trace` (`off|ring|pretty|json`), `metrics`, `cost`,
+    `alerts`, `incidents` and `otel.endpoint` sub-blocks join the existing
+    `slo` (now carried on crew too). DEFAULTS SEMANTICS: spec ABSENCE is NOT
+    `off` — cost accrual and the low-overhead trace ring are default-ON; the
+    pretty/json printer, metrics, alerts, incidents and OTel export stay
+    opt-in; an explicit `cost: { enabled: false }` / `trace: { level: off }`
+    wins. The serving emitters stamp the env the runtime's subscriber layer
+    reads (`CREWHAUS_COST_TRACKING ??= "1"`; `CREWHAUS_TRACE ??=` only for
+    pretty/json, since the ring is bus-internal); `crewhaus run --trace
+    <level>` overrides per run — the flag wins over the spec block and ambient
+    env — keeping `crewhaus run` byte-consistent with the compiled bundles.
+
+  - **Per-response cost, attributed per tool (item 7) + a labeled cost
+    counter (G57).** A priceable response's cost is split evenly across the
+    tool calls it authorized and stamped as `attributedCostUsdMicros` on each
+    `tool_use`; the metrics-collector gains a labeled cost counter fed by
+    `cost_accrual` events (microdollars by model/provider, `unpriced` accruals
+    counted at zero).
+
+  - **Live run streaming — `runs.subscribe` over SSE (item 3).** The gateway
+    protocol adds the one streaming method: `runs.subscribe` upgrades to a
+    long-lived `text/event-stream` (one trace event per `data:` frame,
+    heartbeat/open marker as SSE comment frames) instead of a JSON envelope;
+    the gateway server serves it — same admission + tenant fencing as every
+    RPC, idle heartbeats, disconnect teardown — from an injected per-run event
+    source. The managed daemon wires it end to end: a bounded, tenant-fenced
+    per-run trace-bus registry whose resolver atomically replays the ring and
+    live-subscribes the bus, so a client replays THIS run and streams it live
+    with no gap. The cf-worker `/chat` streams now interleave the same
+    TraceEvent vocabulary — each workflow step brackets a `step_start`/
+    `step_end` pair with its real token usage + cost — all gated on
+    `observability.trace` (an explicit `off` suppresses every frame; text and
+    `done` still flow).
+
+  - **OpenTelemetry gen-ai spans (G58).** The OTel exporter maps the trace
+    vocabulary onto OpenTelemetry gen-ai semantic-convention spans (model
+    calls, tool use, cost accrual, approval requested/resolved, alerts,
+    circuit-state changes, A2A messages, coverage reports, …) for export to
+    `observability.otel.endpoint` when set.
+
+  - **`program_output` tool events (G59) + failure triage (G63).** The bash
+    and code-execution tools publish one `program_output` trace event per
+    invocation carrying the captured program output; `crewhaus failures report
+    [--propose-taxonomy]` clusters `run_failed` + incident records by failure
+    class and message so a run's failure modes read at a glance.
+
 ## [0.3.2] - 2026-07-16
 
 ### Fixed

@@ -5,39 +5,79 @@
  * key (turn / model / tool / etc) until its end arrives.
  */
 import type {
+  A2AMessageEvent,
+  ApprovalRequestedEvent,
+  ApprovalResolvedEvent,
+  CircuitStateChangedEvent,
   CompactionFiredEvent,
+  CostAccrualEvent,
+  CoverageReportEvent,
   ErrorRecoveredEvent,
+  HandoffEvent,
   HookFiredEvent,
+  JanitorActionEvent,
   McpCallEndEvent,
   McpCallStartEvent,
+  ModelFailoverEvent,
   ModelRequestEvent,
   ModelResponseEvent,
   ModelStreamTokenEvent,
+  ModelTierRouteEvent,
   PermissionDecisionEvent,
+  ProgramOutputEvent,
   ResponseRatedEvent,
+  RoleEndEvent,
+  RoleStartEvent,
+  RunFailedEvent,
+  SanitizerReportEvent,
   SubAgentEndEvent,
   SubAgentStartEvent,
+  TestVerdictEvent,
   ToolCallEndEvent,
   ToolCallStartEvent,
   TraceEvent,
   TurnEndEvent,
   TurnStartEvent,
 } from "@crewhaus/trace-event-bus";
+
+// See gen-ai-mapping.ts: these two union members are not re-exported by name
+// from the trace-event-bus index barrel, so derive them from `TraceEvent`.
+type AlertRaisedEvent = Extract<TraceEvent, { kind: "alert_raised" }>;
+type ModelRouteEvent = Extract<TraceEvent, { kind: "model_route" }>;
 import {
   type StartedMcp,
   type StartedModel,
+  type StartedRole,
   type StartedSubAgent,
   type StartedTool,
   type StartedTurn,
+  buildA2AMessageSpan,
+  buildAlertRaisedSpan,
+  buildApprovalRequestedSpan,
+  buildApprovalResolvedSpan,
+  buildCircuitStateChangedSpan,
   buildCompactionSpan,
+  buildCostAccrualSpan,
+  buildCoverageReportSpan,
   buildErrorRecoveredSpan,
+  buildGenericSpan,
+  buildHandoffSpan,
   buildHookSpan,
+  buildJanitorActionSpan,
   buildMcpSpan,
+  buildModelFailoverSpan,
+  buildModelRouteSpan,
   buildModelSpan,
+  buildModelTierRouteSpan,
   buildPermissionSpan,
+  buildProgramOutputSpan,
   buildResponseRatedSpan,
+  buildRoleSpan,
+  buildRunFailedSpan,
+  buildSanitizerReportSpan,
   buildStreamTokenEvent,
   buildSubAgentSpan,
+  buildTestVerdictSpan,
   buildToolSpan,
   buildTurnSpan,
 } from "./gen-ai-mapping";
@@ -55,6 +95,8 @@ export class SpanTracker {
   private readonly mcps = new Map<string, StartedMcp>();
   /** name::childRunId key. */
   private readonly subAgents = new Map<string, StartedSubAgent>();
+  /** role::activation key — one crew role activation in flight per key. */
+  private readonly roles = new Map<string, StartedRole>();
   private readonly emit: (span: OtelSpan) => void;
 
   constructor(emit: (span: OtelSpan) => void) {
@@ -167,6 +209,83 @@ export class SpanTracker {
         }
         return;
       }
+      // G58 — crew role activation, `role_start` → `role_end`.
+      case "role_start": {
+        const e = ev as RoleStartEvent;
+        this.roles.set(`${e.role}::${e.activation}`, {
+          startNano: isoToNano(ev.timestamp),
+          ev: e,
+        });
+        return;
+      }
+      case "role_end": {
+        const e = ev as RoleEndEvent;
+        const key = `${e.role}::${e.activation}`;
+        const start = this.roles.get(key);
+        if (start) {
+          this.emit(buildRoleSpan(start, e));
+          this.roles.delete(key);
+        }
+        return;
+      }
+      // G58 — point-in-time spans (no start/end pairing).
+      case "handoff":
+        this.emit(buildHandoffSpan(ev as HandoffEvent));
+        return;
+      case "a2a_message":
+        this.emit(buildA2AMessageSpan(ev as A2AMessageEvent));
+        return;
+      case "cost_accrual":
+        this.emit(buildCostAccrualSpan(ev as CostAccrualEvent));
+        return;
+      case "run_failed":
+        this.emit(buildRunFailedSpan(ev as RunFailedEvent));
+        return;
+      case "circuit_state_changed":
+        this.emit(buildCircuitStateChangedSpan(ev as CircuitStateChangedEvent));
+        return;
+      case "model_failover":
+        this.emit(buildModelFailoverSpan(ev as ModelFailoverEvent));
+        return;
+      case "model_tier_route":
+        this.emit(buildModelTierRouteSpan(ev as ModelTierRouteEvent));
+        return;
+      case "model_route":
+        this.emit(buildModelRouteSpan(ev as ModelRouteEvent));
+        return;
+      case "janitor_action":
+        this.emit(buildJanitorActionSpan(ev as JanitorActionEvent));
+        return;
+      case "alert_raised":
+        this.emit(buildAlertRaisedSpan(ev as AlertRaisedEvent));
+        return;
+      case "test_verdict":
+        this.emit(buildTestVerdictSpan(ev as TestVerdictEvent));
+        return;
+      case "program_output":
+        this.emit(buildProgramOutputSpan(ev as ProgramOutputEvent));
+        return;
+      case "coverage_report":
+        this.emit(buildCoverageReportSpan(ev as CoverageReportEvent));
+        return;
+      case "sanitizer_report":
+        this.emit(buildSanitizerReportSpan(ev as SanitizerReportEvent));
+        return;
+      case "approval_requested":
+        this.emit(buildApprovalRequestedSpan(ev as ApprovalRequestedEvent));
+        return;
+      case "approval_resolved":
+        this.emit(buildApprovalResolvedSpan(ev as ApprovalResolvedEvent));
+        return;
+      // G58 — never silently drop: any TraceEvent kind without a dedicated
+      // mapping (e.g. `eval_graded`, `judge_verdict`, or a kind added after
+      // this exporter) still produces a generic `crewhaus.<kind>` span. The
+      // `*_start` events tracked above intentionally never reach here (they are
+      // paired with their `*_end` and emit on the end), so this default carries
+      // only genuinely-standalone events.
+      default:
+        this.emit(buildGenericSpan(ev));
+        return;
     }
   }
 }

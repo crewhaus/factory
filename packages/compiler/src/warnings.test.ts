@@ -217,6 +217,48 @@ describe("compile() warnings — ACCEPTED_BUT_UNWIRED table", () => {
     );
     expect(result.warnings).toEqual([]);
   });
+
+  test("Batch-C keys never warn — observability + permissions.ask_mode are wired-in-batch", () => {
+    // cli with the full observability control block + ask_mode.
+    const cli = compile(
+      [
+        "name: c",
+        "target: cli",
+        "agent:",
+        "  model: m",
+        "  instructions: i",
+        "permissions:",
+        "  ask_mode: pause",
+        "observability:",
+        "  trace:",
+        "    level: pretty",
+        "  metrics:",
+        "    enabled: true",
+        "  otel:",
+        "    endpoint: http://localhost:4318",
+      ].join("\n"),
+    );
+    expect(cli.warnings).toEqual([]);
+
+    // crew — the shape Batch C newly joins to the observability carriers.
+    const crew = compile(
+      [
+        "name: cr",
+        "target: crew",
+        "model: m",
+        "entry: lead",
+        "roles:",
+        "  lead:",
+        "    instructions: lead it",
+        "permissions:",
+        "  ask_mode: deny",
+        "observability:",
+        "  cost:",
+        "    enabled: false",
+      ].join("\n"),
+    );
+    expect(crew.warnings).toEqual([]);
+  });
 });
 
 describe("G45 — validating ir-passes run unconditionally in compile()", () => {

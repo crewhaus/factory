@@ -1076,6 +1076,185 @@ observability:
   });
 });
 
+// Loop contract 0.4 (Batch C, G26) — observability control sub-blocks
+// (trace/metrics/cost/alerts/incidents/otel) lowered into ir.observability.
+describe("lower — observability control sub-blocks (Batch C, G26)", () => {
+  test("carries declared sub-blocks verbatim; toggles keep zod's enabled default", () => {
+    const spec = parseSpec(`
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+observability:
+  trace:
+    level: json
+  metrics: {}
+  cost:
+    enabled: false
+  alerts: {}
+  incidents: {}
+  otel:
+    endpoint: http://localhost:4318
+`);
+    const ir = lower(spec);
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect(ir.observability).toEqual({
+      trace: { level: "json" },
+      metrics: { enabled: true },
+      cost: { enabled: false },
+      alerts: { enabled: true },
+      incidents: { enabled: true },
+      otel: { endpoint: "http://localhost:4318" },
+    });
+  });
+
+  test("DEFAULTS SEMANTICS — absent block leaves ir.observability undefined (emitter defaults cost/ring ON)", () => {
+    const ir = lower(parseSpec("name: c\ntarget: cli\nagent:\n  model: m\n  instructions: i"));
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect(ir.observability).toBeUndefined();
+  });
+
+  test("explicit trace.level: off is carried verbatim (explicit off wins)", () => {
+    const ir = lower(
+      parseSpec(
+        "name: c\ntarget: cli\nagent:\n  model: m\n  instructions: i\nobservability:\n  trace:\n    level: off",
+      ),
+    );
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect(ir.observability?.trace).toEqual({ level: "off" });
+    // Sub-blocks the spec didn't declare stay absent (emitter applies defaults).
+    expect(ir.observability?.cost).toBeUndefined();
+    expect(ir.observability?.metrics).toBeUndefined();
+  });
+
+  test("otel without an endpoint lowers to an empty otel object", () => {
+    const ir = lower(
+      parseSpec(
+        "name: c\ntarget: cli\nagent:\n  model: m\n  instructions: i\nobservability:\n  otel: {}",
+      ),
+    );
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect(ir.observability?.otel).toEqual({});
+  });
+
+  test("slo and the control sub-blocks coexist in one lowered observability", () => {
+    const ir = lower(
+      parseSpec(
+        [
+          "name: c",
+          "target: channel",
+          "agent:",
+          "  model: m",
+          "  instructions: i",
+          "channels:",
+          "  slack:",
+          "    botToken: $SLACK_BOT_TOKEN",
+          "    signingSecret: $SLACK_SIGNING_SECRET",
+          "routing:",
+          "  sessionKey: thread",
+          "observability:",
+          "  slo:",
+          "    ttft_ms: 1400",
+          "  metrics:",
+          "    enabled: true",
+        ].join("\n"),
+      ),
+    );
+    if (ir.target !== "channel") throw new Error("unexpected target");
+    expect(ir.observability?.slo?.ttftMs).toBe(1400);
+    expect(ir.observability?.slo?.mitigation).toEqual(["alert"]);
+    expect(ir.observability?.metrics).toEqual({ enabled: true });
+  });
+
+  test("crew joins the observability-carrying shapes (Batch C)", () => {
+    const ir = lower(
+      parseSpec(
+        [
+          "name: cr",
+          "target: crew",
+          "model: m",
+          "entry: lead",
+          "roles:",
+          "  lead:",
+          "    instructions: lead it",
+          "observability:",
+          "  cost:",
+          "    enabled: false",
+          "  otel:",
+          "    endpoint: http://collector:4318",
+        ].join("\n"),
+      ),
+    );
+    if (ir.target !== "crew") throw new Error("unexpected target");
+    expect(ir.observability).toEqual({
+      cost: { enabled: false },
+      otel: { endpoint: "http://collector:4318" },
+    });
+  });
+
+  test("crew without an observability block leaves ir.observability undefined", () => {
+    const ir = lower(
+      parseSpec(
+        "name: cr\ntarget: crew\nmodel: m\nentry: lead\nroles:\n  lead:\n    instructions: x",
+      ),
+    );
+    if (ir.target !== "crew") throw new Error("unexpected target");
+    expect(ir.observability).toBeUndefined();
+  });
+});
+
+// Loop contract 0.4 (Batch C, G11) — permissions.ask_mode lowered into
+// ir.permissions.askMode (carried only when declared; absent means "pause").
+describe("lower — permissions.ask_mode (Batch C, G11)", () => {
+  test("carries an explicit ask_mode: deny onto ir.permissions.askMode", () => {
+    const ir = lower(
+      parseSpec(
+        "name: c\ntarget: cli\nagent:\n  model: m\n  instructions: i\npermissions:\n  ask_mode: deny",
+      ),
+    );
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect(ir.permissions.askMode).toBe("deny");
+  });
+
+  test("carries ask_mode: pause verbatim", () => {
+    const ir = lower(
+      parseSpec(
+        "name: c\ntarget: cli\nagent:\n  model: m\n  instructions: i\npermissions:\n  ask_mode: pause",
+      ),
+    );
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect(ir.permissions.askMode).toBe("pause");
+  });
+
+  test("absent ask_mode leaves askMode absent from ir.permissions (runtime defaults to pause)", () => {
+    const ir = lower(parseSpec("name: c\ntarget: cli\nagent:\n  model: m\n  instructions: i"));
+    if (ir.target !== "cli") throw new Error("unexpected target");
+    expect(ir.permissions.askMode).toBeUndefined();
+    expect("askMode" in ir.permissions).toBe(false);
+  });
+
+  test("lowers on the crew shape (permissions is shared across shapes)", () => {
+    const ir = lower(
+      parseSpec(
+        [
+          "name: cr",
+          "target: crew",
+          "model: m",
+          "entry: lead",
+          "roles:",
+          "  lead:",
+          "    instructions: x",
+          "permissions:",
+          "  ask_mode: deny",
+        ].join("\n"),
+      ),
+    );
+    if (ir.target !== "crew") throw new Error("unexpected target");
+    expect(ir.permissions.askMode).toBe("deny");
+  });
+});
+
 // FR-006 — Pillar 3 sink-side egress-matcher selector lowered into
 // ir.security.egressMatcher. This is the seam that closes the "flag parsed
 // but not threaded" gap: the run path reads ir.security.egressMatcher and

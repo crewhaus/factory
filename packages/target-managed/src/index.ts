@@ -201,6 +201,85 @@ function renderSloField(ir: IrManagedV0): string {
 }
 
 /**
+ * Loop contract 0.4 (Batch C, G26) — thread the `observability` block into the
+ * managed daemon by stamping the env vars runtime-core's subscribers read, so a
+ * deployed bundle's observability matches its spec out of the box. Each var is
+ * set with `??=` (set-if-unset) so an operator's explicit environment ALWAYS
+ * wins; the spec supplies the DEFAULT.
+ *
+ * Applies the keystone's defaults semantics verbatim — spec ABSENCE is NOT
+ * "off":
+ *   - `cost`  → cost-tracker ON  (`?.cost?.enabled ?? true`) → CREWHAUS_COST_TRACKING
+ *   - `trace` → ring (buffer only) by default; `pretty`/`json` attach the
+ *      structured printer (CREWHAUS_TRACE). `ring`/`off` attach no printer —
+ *      the in-process ring buffer is ALWAYS retained (runs.subscribe replays
+ *      it), so `off` degrades to "no printer" here (a true buffer-off would
+ *      need a runtime seam and would break SSE replay).
+ *   - `metrics`/`alerts`/`incidents` → opt-in OFF (`?.enabled ?? false`) →
+ *      CREWHAUS_METRICS=stdout / CREWHAUS_ALERTS=1 / CREWHAUS_INCIDENTS=1
+ *   - `otel.endpoint` → OTEL_EXPORTER_OTLP_ENDPOINT (a leading `$VAR` resolves
+ *      from the daemon's own env at boot).
+ *   - `slo` present → CREWHAUS_SLO=1 (activates the monitor whose targets ride
+ *      agent.ts's `sloTargets`).
+ *
+ * Threading is GATED on the spec actually declaring an `observability` block:
+ * a spec that says nothing about observability is left byte/behavior-stable
+ * (no forced fleet-wide cost tracking). Once a deployer writes ANY
+ * `observability:` block, the keystone defaults apply within it — notably cost
+ * defaults ON (`?.cost?.enabled ?? true`). Emits nothing when the block is
+ * absent.
+ */
+function renderObservabilityEnv(ir: IrManagedV0): string {
+  const obs = ir.observability;
+  if (obs === undefined) return "";
+  const lines: string[] = [];
+  // cost → ON unless the spec explicitly disables it.
+  if ((obs.cost?.enabled ?? true) === true) {
+    lines.push(`process.env["CREWHAUS_COST_TRACKING"] ??= "1";`);
+  }
+  // trace → printer only for pretty/json (ring/off keep the buffer, no printer).
+  const traceLevel = obs.trace?.level ?? "ring";
+  if (traceLevel === "pretty" || traceLevel === "json") {
+    lines.push(`process.env["CREWHAUS_TRACE"] ??= ${escapeJsonString(traceLevel)};`);
+  }
+  // metrics/alerts/incidents → opt-in.
+  if (obs.metrics?.enabled === true) {
+    lines.push(`process.env["CREWHAUS_METRICS"] ??= "stdout";`);
+  }
+  if (obs.alerts?.enabled === true) {
+    lines.push(`process.env["CREWHAUS_ALERTS"] ??= "1";`);
+  }
+  if (obs.incidents?.enabled === true) {
+    lines.push(`process.env["CREWHAUS_INCIDENTS"] ??= "1";`);
+  }
+  // otel → OTLP endpoint (resolve a `$VAR` reference from the daemon's env).
+  const endpoint = obs.otel?.endpoint;
+  if (endpoint !== undefined && endpoint !== "") {
+    if (endpoint.startsWith("$")) {
+      const varName = endpoint.slice(1);
+      lines.push(
+        `{ const __otel = process.env[${escapeJsonString(varName)}]; if (__otel) process.env["OTEL_EXPORTER_OTLP_ENDPOINT"] ??= __otel; }`,
+      );
+    } else {
+      lines.push(`process.env["OTEL_EXPORTER_OTLP_ENDPOINT"] ??= ${escapeJsonString(endpoint)};`);
+    }
+  }
+  // slo → activate the monitor (targets ride agent.ts's sloTargets).
+  if (obs.slo !== undefined) {
+    lines.push(`process.env["CREWHAUS_SLO"] ??= "1";`);
+  }
+  if (lines.length === 0) return "";
+  return `
+// Loop contract 0.4 (Batch C, G26) — apply the spec's \`observability\` block as
+// the deployment's observability DEFAULTS. Each var is set only when unset
+// (\`??=\`) so an operator's explicit environment always wins. Spec absence is
+// NOT "off": cost tracking defaults ON; trace keeps the ring buffer (no printer
+// unless pretty/json); metrics/alerts/incidents are opt-in.
+${lines.join("\n")}
+`;
+}
+
+/**
  * Loop contract 0.4 (Batch B, G02) — render the in-loop `evaluation:` wiring.
  * The bundle constructs the evaluate fn from the RESOLVED IR grader at
  * module scope in agent.ts and threads it — together with the resolved gate
@@ -462,13 +541,14 @@ import { createBudgetStore } from "@crewhaus/durable-state";
 import { formatRunFailure, isRunFailedError } from "@crewhaus/errors";
 import { createGatewayServer } from "@crewhaus/gateway-server";
 import { auditPolicyDecision, evaluatePolicy } from "@crewhaus/policy-engine";
+import { createRunContext, type RunContext } from "@crewhaus/run-context";
 ${dreamImport}import { createJanitor } from "@crewhaus/runtime-core";
 import { buildTenant, type Tenant } from "@crewhaus/tenancy";
 import { runOneTurn } from "./agent.ts";
 
 import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
-const TENANTS_ROOT = process.env.CREWHAUS_TENANTS_ROOT ?? "/tmp/crewhaus-tenants";
+${renderObservabilityEnv(ir)}const TENANTS_ROOT = process.env.CREWHAUS_TENANTS_ROOT ?? "/tmp/crewhaus-tenants";
 const PORT = Number(process.env.PORT ?? 3000);
 const ENV_JWT_SECRET = process.env.CREWHAUS_GATEWAY_JWT_SECRET;
 if (ENV_JWT_SECRET !== undefined && ENV_JWT_SECRET.length < 16) {
@@ -580,16 +660,53 @@ function readIntakeGate(): { paused: boolean; reason?: string } {
   return __intakeCache;
 }
 
+// Contract item 3 — the per-run trace-bus registry that backs runs.subscribe.
+// Every run's TraceEventBus is registered under its runId, TENANT-FENCED:
+// resolveRunEvents only streams to the tenant that started the run (a
+// cross-tenant — or unknown — runId resolves to undefined → 404, so a run's
+// existence never leaks across tenants). Bounded so completed runs' ring
+// buffers don't accumulate unboundedly; the oldest entry is evicted past the
+// cap.
+const RUN_BUS_CAP = 256;
+const RUN_BUSES = new Map<string, { tenantId: string; bus: RunContext["eventBus"] }>();
+function registerRunBus(runId: string, tenantId: string, bus: RunContext["eventBus"]): void {
+  RUN_BUSES.set(runId, { tenantId, bus });
+  while (RUN_BUSES.size > RUN_BUS_CAP) {
+    const oldest = RUN_BUSES.keys().next().value;
+    if (oldest === undefined) break;
+    RUN_BUSES.delete(oldest);
+  }
+}
+
 const gateway = createGatewayServer({
   jwtSecret: JWT_SECRET,
   tenantsRoot: TENANTS_ROOT,
   tenantOverrides,
   budgetStore: BUDGET_STORE,
   intakeGate: readIntakeGate,
+  // Contract item 3 — resolve a run's live trace stream for runs.subscribe from
+  // the per-run bus registry, fenced to the owning tenant. Returning undefined
+  // (unknown OR cross-tenant runId) makes the gateway answer 404.
+  resolveRunEvents: ({ runId, tenant }) => {
+    const entry = RUN_BUSES.get(runId);
+    if (entry === undefined || entry.tenantId !== tenant.id) return undefined;
+    const bus = entry.bus;
+    return {
+      // Atomic snapshot + live-subscribe: the ring-buffer replay and the live
+      // listener attach with no yield between (both synchronous), so no event
+      // is dropped or duplicated across the replay→live boundary.
+      open: (listener: (event: unknown) => void) => {
+        const replay = bus.recent();
+        const close = bus.subscribe(listener);
+        return { replay, close };
+      },
+    };
+  },
   handler: async ({ method, params, tenant }) => {
     if (method === "runs.create" || method === "runs.continue") {
       const p = params as { input: string; sessionId?: string };
       const sessionId = p.sessionId ?? \`sess_\${Math.random().toString(36).slice(2, 18).padEnd(16, "0")}\`;
+      const runId = \`run_\${Math.random().toString(36).slice(2, 10)}\`;
       const log = await gateway.getAuditLog(tenant);
       const policy = evaluatePolicy(
         { toolName: "runChatLoop", sideEffect: "external", input: p.input, tenantId: tenant.id },
@@ -598,9 +715,28 @@ const gateway = createGatewayServer({
       if (policy.decision === "deny") {
         throw new Error(\`policy denied: \${policy.reason ?? "no reason"}\`);
       }
+      // Contract item 3 — mint the run's trace bus up front and register it
+      // (tenant-fenced) so runs.subscribe can replay + live-stream THIS run;
+      // the SAME context is threaded into runOneTurn so every trace event the
+      // run publishes lands on the registered bus, and the response runId is
+      // the bus's runId (the id a client subsequently subscribes with).
+      // G48 — the per-tenant hash-chained audit log is wired as BOTH the
+      // justification and egress durable sinks, so intent-gate and egress
+      // verdicts are tamper-evidenced per tenant inside the managed daemon.
+      const runContext = createRunContext({ runId, sessionId });
+      registerRunBus(runId, tenant.id, runContext.eventBus);
       let reply: string;
       try {
-        reply = await runOneTurn({ tenantId: tenant.id, sessionId, input: p.input${tenantField} });
+        reply = await runOneTurn({
+          tenantId: tenant.id,
+          sessionId,
+          input: p.input${tenantField},
+          extraOptions: {
+            runContext,
+            justificationAuditSink: log,
+            egressAuditSink: log,
+          },
+        });
       } catch (err) {
         // v0.3.0 Goal 6 — a classified terminal failure (billing/auth/…)
         // renders its structured report on the daemon's stderr, then
@@ -619,7 +755,7 @@ const gateway = createGatewayServer({
         kind: "model_call",
         payload: { tenantId: tenant.id, sessionId, inputTokens, outputTokens },
       });
-      return { runId: \`run_\${Math.random().toString(36).slice(2, 10)}\`, sessionId, tenantId: tenant.id, reply };
+      return { runId, sessionId, tenantId: tenant.id, reply };
     }
     if (method === "runs.cancel") {
       return { ok: true };

@@ -10,10 +10,11 @@ import {
   combineCompiledGraders,
 } from "@crewhaus/eval-grader";
 import { type Event as TranscriptEvent, openEventLog } from "@crewhaus/event-log";
-import { createRunContext } from "@crewhaus/run-context";
+import { type RunContext, createRunContext } from "@crewhaus/run-context";
 import type {
   ModelResponseEvent,
   PermissionDecisionEvent,
+  TestVerdictEvent,
   TraceEvent,
 } from "@crewhaus/trace-event-bus";
 import { RunnerError } from "./errors";
@@ -42,13 +43,21 @@ export async function runSample(args: {
    * runs never clobber each other's transcripts.
    */
   trial?: number;
+  /**
+   * Loop contract 0.4 (Batch C, G59) — optional shared `RunContext`. When a
+   * caller threads one (e.g. a run loop that attaches an OTel exporter to the
+   * whole eval run's bus), the sample runs on it and the per-sample
+   * `test_verdict` publish lands on that shared bus; omitted ⇒ a fresh
+   * per-sample context as before (behaviour unchanged for existing callers).
+   */
+  runContext?: RunContext;
 }): Promise<SampleResult> {
   const { sample, invoker, graders, outDir, model } = args;
   const trialSuffix = args.trial !== undefined && args.trial > 1 ? `.trial${args.trial}` : "";
   const sampleDir = join(outDir, `${sanitize(sample.id)}${trialSuffix}`);
   mkdirSync(sampleDir, { recursive: true });
 
-  const runContext = createRunContext();
+  const runContext = args.runContext ?? createRunContext();
   const events: TraceEvent[] = [];
   const unsubscribe = runContext.eventBus.subscribe((e) => {
     events.push(e);
@@ -171,6 +180,24 @@ export async function runSample(args: {
         ? `agent invocation error: ${error}`
         : perGrader.map((g) => `[${g.name}: ${g.passed ? "✓" : "✗"}] ${g.rationale}`).join(" & "),
   };
+
+  // Loop contract 0.4 (Batch C, G59) — publish the AgentFlow `test_verdict`
+  // feedback signal from the grader outcome. A distinct event kind (not a
+  // `tool_call_end`) so the optimizer can filter cheaply and OTel exporters
+  // can route verdicts to a verdict dashboard. An invoker error is an
+  // `"error"` verdict (the run never produced a gradeable output); otherwise
+  // the AND-of-graders `overall.passed` maps to `pass`/`fail`. Additive: it
+  // does NOT touch the already-persisted events.jsonl / metrics / aggregates
+  // — it is a bus emit on the (optionally shared) run context.
+  const verdict: TestVerdictEvent = {
+    ...runContext.eventBus.envelope(),
+    kind: "test_verdict",
+    testId: sample.id,
+    verdict: error !== undefined ? "error" : overall.passed ? "pass" : "fail",
+    reason: overall.rationale,
+    durationMs: latencyMs,
+  };
+  runContext.eventBus.publish(verdict);
 
   const sampleResult: SampleResult = {
     sampleId: sample.id,

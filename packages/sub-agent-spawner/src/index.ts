@@ -23,8 +23,10 @@
  * codegen / interpreter inject `spawnSubAgent` into `runChatLoop`'s options
  * so the bridge can hand it to the Task tool.
  *
- * Section 15 will plumb real token usage through; today we stamp a zero
- * placeholder so the result type is stable.
+ * Loop contract 0.4 (Batch C, G57): the child's real token usage is now
+ * aggregated from the `model_response` events on its own bus and rolled into
+ * `SubAgentResult.usage` (replacing the Section-13 zero placeholder), so the
+ * parent's Task tool can fold child spend into its run accounting.
  */
 import type { ProviderAdapter } from "@crewhaus/adapter-anthropic";
 import {
@@ -134,6 +136,23 @@ export async function spawnSubAgent(
     promptBytes: Buffer.byteLength(opts.prompt, "utf8"),
   });
 
+  // Loop contract 0.4 (Batch C, G57) — aggregate the child's real token usage
+  // instead of stamping the Section-13 zero placeholder. The child loop
+  // publishes one `model_response` per model call on its OWN bus
+  // (`child.runContext.eventBus`); we sum their `usage` here and roll the
+  // total into `SubAgentResult.usage`, which the parent's Task tool folds into
+  // its run accounting. Subscribing to the child bus (rather than re-reading
+  // the event log) keeps this independent of the opt-in cost/advisor mirrors —
+  // token usage is never persisted to the child's JSONL by default.
+  let childInputTokens = 0;
+  let childOutputTokens = 0;
+  const usageUnsubscribe = child.runContext.eventBus.subscribe((ev) => {
+    if (ev.kind === "model_response") {
+      childInputTokens += ev.usage.input;
+      childOutputTokens += ev.usage.output;
+    }
+  });
+
   const t0SubAgent = performance.now();
   let finalMessage = "";
   let isError = false;
@@ -203,6 +222,10 @@ export async function spawnSubAgent(
       }
     }
   }
+
+  // The child loop has returned (or thrown) — every `model_response` it was
+  // going to emit has been observed, so stop listening.
+  usageUnsubscribe();
 
   // Read the child's event log back to assemble transcript + tool calls.
   // Use a fresh handle (the runtime closed its handle in its `finally`).
@@ -291,7 +314,7 @@ export async function spawnSubAgent(
     finalMessage,
     transcript,
     toolCalls,
-    usage: { input_tokens: 0, output_tokens: 0 },
+    usage: { input_tokens: childInputTokens, output_tokens: childOutputTokens },
     ...(childFailure !== undefined ? { failure: childFailure } : {}),
   };
 }

@@ -2,6 +2,7 @@
 import { spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import {
+  appendFileSync,
   existsSync,
   mkdirSync,
   readFileSync,
@@ -103,8 +104,13 @@ import {
 // per-(routeKey, model) reward scoreboard behind `agent.model_pool`; advise
 // mines the same scoreboard into pool-policy suggestions.
 import { openScoreboard } from "@crewhaus/routing-store";
-import { runChatLoop } from "@crewhaus/runtime-core";
-import { createSessionStore, evictExpiredSessions } from "@crewhaus/session-store";
+import { type AgentIdentityFile, runChatLoop } from "@crewhaus/runtime-core";
+import {
+  type PendingApproval,
+  createPendingApprovalStore,
+  createSessionStore,
+  evictExpiredSessions,
+} from "@crewhaus/session-store";
 import { type SkillRef, createSkillTool, discoverSkills } from "@crewhaus/skills-registry";
 import { type SlashCommand, loadCommands } from "@crewhaus/slash-commands";
 import { type Spec, parseSpec } from "@crewhaus/spec";
@@ -169,6 +175,9 @@ import {
   readApprovals,
   rollupConclusion,
 } from "./approval-gate";
+// Loop contract 0.4 (Batch C, G11) — the `crewhaus approvals` verbs' pure
+// rendering layer (the file-backed store wiring lives in the handler below).
+import { formatApprovalDetail, formatApprovalsTable } from "./approvals-cli";
 // Item 34 — `crewhaus audit verify` plumbing (anchor-flag parsing + per-check
 // summary + doctor mapping), in a side-effect-free module so it is
 // unit-testable (this entry file runs an argv switch on import).
@@ -390,6 +399,16 @@ import { evalRunOutputLines, fitnessScore, graderRegistryForCompiled } from "./e
 // module so it is unit-testable (this entry file runs an argv switch on
 // import). The fresh run + baseline load happen in index.ts; this decides drift.
 import { evaluateSentinel } from "./eval-sentinel";
+// G63 — `crewhaus failures report`: cluster run_failed + incident records and
+// (optionally) draft failure_taxonomy entries. Pure transform (FS reads live
+// in the handler below).
+import {
+  type FailureRecord,
+  clusterFailures as clusterFailureRecords,
+  proposeTaxonomy,
+  renderFailuresTable,
+  renderTaxonomyYaml,
+} from "./failures";
 // Item #55 — distill recurring user questions into an auto-discovered FAQ skill.
 import { buildFaqSkill, distillFaq } from "./faq";
 // Response-feedback core — pure, side-effect-free so it is unit-testable
@@ -811,6 +830,14 @@ import { runRoute } from "./route";
 // RunFailedError prints its structured report + coded exit while every
 // other fatal keeps the classic `crewhaus: <message>` one-liner + exit 1.
 import { CONTINUE_NOTE, renderCliFailure } from "./run-failure";
+// Loop contract 0.4 (Batch C, G26) — pure resolution of `run --trace` + the
+// cost-on-by-default env, applied by `applyRunObservabilityEnv` below.
+import {
+  TRACE_LEVELS,
+  isValidTraceLevel,
+  resolveCostEnv,
+  resolveTraceEnv,
+} from "./run-observability";
 // Item 13 — `crewhaus scaffold-evals` + `init --with-evals`: day-one eval
 // assets generated from the spec (deterministic template / one-shot model
 // sample stubs + a single spec-goal llm_judge or floor grader), in a
@@ -1098,6 +1125,12 @@ const RUN_SCHEMA: ParseArgsSchema = {
     // tool_use block completes mid-stream). The spec's `agent.streaming`
     // sets the default; the flag wins.
     { name: "streaming", takesValue: false },
+    // Loop contract 0.4 (Batch C, G26) — override the spec's
+    // `observability.trace.level` for this run: off | ring | pretty | json.
+    // pretty/json attach the structured-event-printer; ring keeps only the
+    // bus ring buffer (default); off suppresses the printer. The flag wins
+    // absolutely over the spec block AND the ambient CREWHAUS_TRACE env.
+    { name: "trace", takesValue: true },
     // Item #56 — identify the current user so their
     // `.crewhaus/preferences/<user>.md` is injected at run start (alongside
     // the auto-loaded LESSONS.md). Flag > CREWHAUS_USER env.
@@ -1601,6 +1634,39 @@ const FEEDBACK_SCHEMA: ParseArgsSchema = {
     { name: "text", takesValue: true },
     { name: "correction", takesValue: true },
     { name: "rater", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
+// Loop contract 0.4 (Batch C, G11) — `crewhaus approvals list|show|grant|deny`
+// over the session-store approvals store (`.crewhaus/sessions/approvals.jsonl`).
+const APPROVALS_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // Harness root that owns `.crewhaus/` (mirrors `security digest --dir`).
+    { name: "dir", takesValue: true },
+    // The deciding identity recorded on grant/deny (flag > CREWHAUS_USER > "cli").
+    { name: "by", takesValue: true },
+    // grant only — the grant applies to the next matching tool call only
+    // (default; the runtime consumes a grant on use). Explicit for scripting.
+    { name: "once", takesValue: false },
+    { name: "json", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
+// G63 — `crewhaus failures report`: cluster run_failed + incident records.
+const FAILURES_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // Harness root that owns `.crewhaus/` (mirrors `security digest --dir`).
+    { name: "dir", takesValue: true },
+    // How many recent sessions to scan (default all); `all` is explicit.
+    { name: "sessions", takesValue: true },
+    // Draft failure_taxonomy entries from the clusters (reuses the advise
+    // drafting machinery + specificity floor).
+    { name: "propose-taxonomy", takesValue: false },
+    // Write the drafted failure_taxonomy YAML to a file (else printed to stdout).
+    { name: "out", short: "o", takesValue: true },
+    { name: "json", takesValue: false },
     { name: "help", short: "h" },
   ],
 };
@@ -2240,6 +2306,8 @@ function usageText(): string {
     "       (--thumbs up|down | --stars 1-5 | --score 0-1) [--comment <t>]",
     "  feedback --session <id> --text <msg> attach a comment/correction to a turn",
     "       [--turn N] [--correction <better answer>]",
+    "  approvals list|show|grant|deny <id>  resolve tool-permission approvals a headless run parked",
+    "       [--dir <root>] [--by <who>]      (permissions.ask_mode: pause); grant is one-shot (--once)",
     "  distill --session <id> -o <ds.jsonl> turn ratings into an eval dataset + graders",
     "       [--all-sessions] [--graders-out <g.yaml>] [--min-score F]",
     "       [--register <name>]            also promote a new dataset version into the registry",
@@ -2305,6 +2373,8 @@ function usageText(): string {
     "                                       gate on regression-runner, auto-promote/rollback",
     "  incident collect --session <id>      assemble an incident bundle from a session's",
     "                                       traces + audit + cost + doctor (item 32)",
+    "  failures report [--propose-taxonomy] cluster run_failed + incidents by class + message",
+    "       [--sessions N|all] [--dir <r>]   similarity; --propose-taxonomy drafts failure_taxonomy (G63)",
     "  migrate-all --from N --to N          batch-migrate every spec in the registry",
     "  upgrade [spec.yaml] [--write]        detect the cwd spec's version drift + run the migration",
     "                                       chain (validated); --dry-run diff by default (item 43)",
@@ -3973,10 +4043,12 @@ async function resolveEgressMatcher(
 async function runRun(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
-      "usage: crewhaus run <spec.yaml> [--model <model>] [--permission-mode <default|plan|auto|bypass>] [--resume <sessionId> | --continue] [--prompt <text>] [--streaming] [--budget-usd <n>] [--justification-judge rule-based|claude] [--egress-matcher substring|semantic] [--egress-embedder <model>]\n" +
+      "usage: crewhaus run <spec.yaml> [--model <model>] [--permission-mode <default|plan|auto|bypass>] [--resume <sessionId> | --continue] [--prompt <text>] [--streaming] [--trace off|ring|pretty|json] [--budget-usd <n>] [--justification-judge rule-based|claude] [--egress-matcher substring|semantic] [--egress-embedder <model>]\n" +
         "  --prompt <text> runs a single turn non-interactively and prints the reply, then exits (no REPL) — for scripting/CI; composes with --resume/--continue\n" +
         "  --model accepts the full router grammar: claude-* (Anthropic), openai/<m>, gemini/<m>, bedrock/<id> (geo prefixes tolerated), local/<m>@<url>\n" +
         "  --streaming dispatches tools mid-stream (as each tool_use block completes) instead of after the full response; the spec's agent.streaming sets the default, the flag forces it on\n" +
+        "  --trace <level> overrides the spec's observability.trace.level for this run: pretty/json attach the structured-event-printer, ring keeps only the bus ring buffer (default), off suppresses the printer; the flag wins over the spec block and CREWHAUS_TRACE\n" +
+        "  Cost tracking is ON by default (accrues per-call spend; set observability.cost.enabled: false to disable, CREWHAUS_COST_INLINE=1 to print a per-call line, `crewhaus cost-summary --session <id>` to total it after the run)\n" +
         "  --budget-usd <n> caps this run's model spend in dollars: it sets/overrides the spec budget.usd ceiling and keeps the spec's on_exceed ladder (stop when the spec has none).\n" +
         "    Interplay with the spec's limits: block — the budget cap and the limits ceilings (max_tool_iterations, max_concurrent_tools, context_limit, deadline_ms, turn_timeout_ms,\n" +
         "    model_call_timeout_ms, loop_detection) are enforced INDEPENDENTLY; whichever bound trips first governs. The budget check gates the NEXT turn (an in-flight turn is never\n" +
@@ -4018,11 +4090,56 @@ async function runRun(args: ParsedArgs): Promise<void> {
     throw err;
   }
 
+  // Loop contract 0.4 (Batch C, G26) — apply the run's observability toggles to
+  // the env the runtime's subscriber layer reads, mirroring what a compiled
+  // bundle stamps at boot (cost-on-by-default; trace printer for pretty/json).
+  applyRunObservabilityEnv(args, ir);
+
   if (ir.target === "cli") return runRunCli(args, ir, specPath);
   if (ir.target === "browser") return runRunBrowser(args, ir);
   die(
     `crewhaus run supports target: cli or browser (got "${ir.target}"). Other target shapes are compile-only — see PACKAGES.md.`,
   );
+}
+
+/**
+ * Loop contract 0.4 (Batch C, G26) — apply this run's observability env, so
+ * `crewhaus run` honours the spec's `observability` block exactly like a
+ * compiled bundle (which stamps the same env at boot). The precedence rules
+ * live in the pure `run-observability` module (unit-tested); this only
+ * validates the flag and mutates `process.env` before the runtime's env-driven
+ * subscriber layer attaches.
+ *
+ * - trace: `--trace` flag > `observability.trace.level` > `"ring"`. `pretty`/
+ *   `json` attach the structured-event-printer; `ring`/`off` attach no printer.
+ *   The FLAG wins absolutely over the spec block and ambient `CREWHAUS_TRACE`.
+ * - cost: ON by default unless the spec sets `observability.cost.enabled:
+ *   false` (it prints nothing on its own; `CREWHAUS_COST_INLINE=1` surfaces a
+ *   per-call line, `cost-summary` totals it after the run).
+ */
+function applyRunObservabilityEnv(args: ParsedArgs, ir: ReturnType<typeof lower>): void {
+  const obs = (
+    ir as {
+      observability?: {
+        trace?: { level?: string };
+        cost?: { enabled?: boolean };
+      };
+    }
+  ).observability;
+
+  const traceFlag = args.flags["trace"];
+  if (typeof traceFlag === "string" && !isValidTraceLevel(traceFlag)) {
+    die(`--trace must be one of: ${TRACE_LEVELS.join(", ")} (got "${traceFlag}")`);
+  }
+  const trace = resolveTraceEnv(
+    typeof traceFlag === "string" ? traceFlag : undefined,
+    obs?.trace?.level,
+    process.env["CREWHAUS_TRACE"],
+  );
+  if (trace !== undefined) process.env["CREWHAUS_TRACE"] = trace;
+
+  const cost = resolveCostEnv(obs?.cost?.enabled, process.env["CREWHAUS_COST_TRACKING"]);
+  if (cost !== undefined) process.env["CREWHAUS_COST_TRACKING"] = cost;
 }
 
 /**
@@ -4996,6 +5113,31 @@ function runContext(args: ParsedArgs): void {
   process.stdout.write(bundle.markdown);
 }
 
+/**
+ * Loop contract 0.4 (Batch C, item 4) — read-only render of this project's
+ * agent identity fingerprint for `crewhaus doctor`. Reads
+ * `.crewhaus/identity.json` (the Ed25519 keypair minted on a run's first boot)
+ * and returns the `agentId` line; deliberately never mints one — doctor must
+ * not write during a read-only probe (a run mints it). An absent file is
+ * informational; a corrupt file is flagged.
+ */
+function describeAgentIdentityLine(cwd: string): string {
+  const path = join(cwd, ".crewhaus", "identity.json");
+  if (!existsSync(path)) {
+    return "~ agent identity: not yet minted (created on first `crewhaus run`)";
+  }
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf-8")) as Partial<AgentIdentityFile>;
+    if (typeof parsed.agentId === "string" && parsed.agentId.length > 0) {
+      const algo = typeof parsed.algorithm === "string" ? parsed.algorithm : "ed25519";
+      return `✓ agent identity: ${parsed.agentId} (${algo}; stamped on every trace + audit record)`;
+    }
+  } catch {
+    // fall through to the corrupt-file note
+  }
+  return `✗ agent identity: ${path} is unreadable or malformed (delete it to re-mint on next run)`;
+}
+
 async function runDoctor(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
@@ -5154,6 +5296,13 @@ async function runDoctor(args: ParsedArgs): Promise<void> {
     const { verify: verifyAuditLog } = await import("@crewhaus/audit-log");
     checks.push(buildAuditIntegrityCheck(await verifyAuditLog(auditDir)));
   }
+
+  // Loop contract 0.4 (Batch C, item 4) — surface this project's agent
+  // identity fingerprint (the `agentId` stamped onto every trace envelope +
+  // audit record) so an operator can correlate traces/audits to this agent.
+  // Read-only: doctor never mints one (a run does, on first boot) — an absent
+  // file is reported informationally, not created.
+  process.stdout.write(`${describeAgentIdentityLine(process.cwd())}\n`);
 
   for (const c of checks) {
     if (c.warn && c.pass) {
@@ -10050,7 +10199,56 @@ async function captureFeedback(
 
   const log = await openEventLog(session, { rootDir: join(process.cwd(), SESSIONS_SUBDIR) });
   await log.append({ kind: FEEDBACK_EVENT_KIND, payload: record });
+  // G59 — also mirror a `response_rated` TraceEvent onto the session trace so
+  // the human rating is present in the session's durable trace vocabulary
+  // (the sibling of the rich `user_feedback` record `distill` reads), the
+  // offline analogue of an in-session capture surface publishing it live.
+  mirrorResponseRated(session, record);
   process.stdout.write(`recorded ${record.modality} feedback on ${session} turn ${turnNumber}\n`);
+}
+
+/**
+ * G59 — append a `response_rated` TraceEvent to the session JSONL (the durable
+ * trace mirror). Emitted only when the record carries a numeric/thumbs rating
+ * (a comment/correction-only record has no `rating`, and `ResponseRatedEvent`
+ * requires one). Written in the event-log wire shape (`{ ts, version, kind,
+ * payload }`) directly rather than via `EventLog.append` — `response_rated` is
+ * a trace-bus kind, not a conversational `EventKind`, and every session-log
+ * reader branches on the kinds it knows and skips the rest, so this stays
+ * additive-safe (resume/replay/distill ignore it).
+ */
+function mirrorResponseRated(session: string, record: FeedbackRecord): void {
+  const rating: "up" | "down" | number | undefined =
+    record.rating.thumbs !== undefined ? record.rating.thumbs : normalizeRating(record);
+  if (rating === undefined) return; // comment/correction-only — no rating to mirror
+  const payload: {
+    rating: "up" | "down" | number;
+    turnNumber: number;
+    source: FeedbackSource;
+    comment?: string;
+    targetSpanId?: string;
+  } = {
+    rating,
+    turnNumber: record.turnNumber,
+    source: record.source,
+    ...(record.comment !== undefined ? { comment: record.comment } : {}),
+    ...(record.targetSpanId !== undefined ? { targetSpanId: record.targetSpanId } : {}),
+  };
+  const wire = {
+    ts: Date.parse(record.ts) || Date.now(),
+    version: 1,
+    kind: "response_rated",
+    payload,
+  };
+  try {
+    appendFileSync(sessionJsonlPath(session), `${JSON.stringify(wire)}\n`, { mode: 0o600 });
+  } catch (err) {
+    // The durable user_feedback record already landed; a mirror failure must
+    // never fail the capture command.
+    logger.debug("response_rated.mirror_failed", {
+      message: err instanceof Error ? err.message : String(err),
+    });
+  }
 }
 
 async function runRate(args: ParsedArgs): Promise<void> {
@@ -10099,6 +10297,84 @@ async function runFeedbackCmd(args: ParsedArgs): Promise<void> {
     ...(correction !== undefined ? { correction } : {}),
     ...(strFlag(args, "rater") !== undefined ? { rater: strFlag(args, "rater") } : {}),
   });
+}
+
+/**
+ * Loop contract 0.4 (Batch C, G11) — `crewhaus approvals list|show|grant|deny`.
+ * Reads/writes the file-backed `PendingApprovalStore` under the harness's
+ * `.crewhaus/sessions/` (the same store the runtime parks against and re-reads
+ * to resume a paused run). `--dir` overrides the harness root; `--json` prints
+ * the raw store records; grant/deny record an out-of-band decision keyed on the
+ * approval id.
+ */
+async function runApprovals(args: ParsedArgs, action: string): Promise<void> {
+  if (args.flags["help"] || action === "") {
+    process.stdout.write(
+      "usage: crewhaus approvals list|show|grant|deny <id> [--dir <root>] [--by <who>] [--json]\n" +
+        "  list                 all parked approvals under .crewhaus/sessions/, newest first\n" +
+        "  show <id>            full detail for one approval (incl. the verbatim tool input)\n" +
+        "  grant <id> [--once]  record a GRANT — the next run re-issuing the same tool call\n" +
+        "                       proceeds pre-approved. --once (default) is one-shot: the\n" +
+        "                       runtime consumes the grant on use, so a later identical call\n" +
+        "                       re-asks. --by <who> records the deciding identity (> CREWHAUS_USER > cli).\n" +
+        "  deny <id>            record a DENY — the parked call is refused with a note on resume.\n" +
+        "  These resolve the parks a headless run creates when a tool permission asks and\n" +
+        "  `permissions.ask_mode: pause` (the default) is set.\n",
+    );
+    return;
+  }
+  const dirFlag = args.flags["dir"];
+  const harnessRoot = typeof dirFlag === "string" ? resolve(dirFlag) : process.cwd();
+  const rootDir = join(harnessRoot, SESSIONS_SUBDIR);
+  const store = createPendingApprovalStore({ rootDir });
+  const json = args.flags["json"] === true;
+
+  if (action === "list") {
+    const list = await store.list();
+    if (json) {
+      process.stdout.write(`${JSON.stringify(list, null, 2)}\n`);
+      return;
+    }
+    process.stdout.write(formatApprovalsTable(list));
+    return;
+  }
+
+  const id = args.positional[0];
+  if (typeof id !== "string" || id === "") die("missing <id> — see `crewhaus approvals`");
+
+  if (action === "show") {
+    const found = (await store.list()).find((a: PendingApproval) => a.id === id);
+    if (found === undefined) die(`no approval "${id}" under ${rootDir}`);
+    if (json) {
+      process.stdout.write(`${JSON.stringify(found, null, 2)}\n`);
+      return;
+    }
+    process.stdout.write(formatApprovalDetail(found));
+    return;
+  }
+
+  // grant | deny — record an out-of-band decision.
+  const by = strFlag(args, "by") ?? process.env["CREWHAUS_USER"] ?? "cli";
+  const decision: "grant" | "deny" = action === "grant" ? "grant" : "deny";
+  let updated: PendingApproval | null;
+  try {
+    updated = await store.resolve(id, decision, by);
+  } catch (err) {
+    // resolve() throws on a malformed id (not appr_<16 hex>).
+    die(err instanceof Error ? err.message : String(err));
+  }
+  if (updated === null) die(`no approval "${id}" under ${rootDir}`);
+  if (json) {
+    process.stdout.write(`${JSON.stringify(updated, null, 2)}\n`);
+    return;
+  }
+  const note =
+    decision === "grant"
+      ? " (one-shot — the runtime consumes it on the next matching tool call)"
+      : "";
+  process.stdout.write(
+    `${decision === "grant" ? "granted" : "denied"} ${id} — ${updated.toolName}${note}\n`,
+  );
 }
 
 /** List `sess_*` ids that have a transcript under `.crewhaus/sessions`. */
@@ -13398,6 +13674,135 @@ async function runMigrateAll(args: ParsedArgs): Promise<void> {
  * `incident.json`+`events.jsonl` for this session (CREWHAUS_INCIDENTS), those
  * ring events are folded in and the kind/reason default from it.
  */
+/**
+ * G63 — `crewhaus failures report`. Reads run_failed events across the
+ * harness's session logs + incident bundle manifests, clusters them by
+ * FailureClass + message similarity (see `./failures`), and prints a table.
+ * `--propose-taxonomy` additionally drafts paste-ready failure_taxonomy
+ * entries. Read-only; a report, never a gate (always exits 0).
+ */
+async function runFailuresReport(args: ParsedArgs): Promise<void> {
+  if (args.flags["help"]) {
+    process.stdout.write(
+      "usage: crewhaus failures report [--sessions N|all] [--propose-taxonomy] [-o <taxonomy.yaml>]\n" +
+        "                                [--dir <root>] [--json]\n" +
+        "  Aggregate run_failed events (across .crewhaus/sessions) + incident bundles\n" +
+        "  (.crewhaus/incidents/*/bundle.json), cluster them by FailureClass + message\n" +
+        "  similarity (normalized-token, offline), and print a table ranked by frequency.\n" +
+        "  --propose-taxonomy   draft failure_taxonomy entries from the clusters (paste-ready\n" +
+        "                       YAML; -o writes them to a file). Each pattern is matched as a\n" +
+        "                       case-insensitive substring of error.message — review before adopting.\n" +
+        "  --sessions N|all     limit the scan to the N most-recent sessions (default: all).\n" +
+        "  approval_pending parks are excluded — resolve those with `crewhaus approvals`.\n",
+    );
+    return;
+  }
+  const dirFlag = args.flags["dir"];
+  const harnessRoot = typeof dirFlag === "string" ? resolve(dirFlag) : process.cwd();
+  const sessionsDir = join(harnessRoot, SESSIONS_SUBDIR);
+  const incidentsDir = join(harnessRoot, ".crewhaus", "incidents");
+
+  // Session scope: all (default) or the N most-recent.
+  let sessionIds = sessionIdsByRecency(sessionsDir);
+  const sessionsFlag = args.flags["sessions"];
+  if (typeof sessionsFlag === "string" && sessionsFlag !== "all") {
+    const n = Number.parseInt(sessionsFlag, 10);
+    if (Number.isNaN(n) || n < 1) {
+      die(`invalid --sessions "${sessionsFlag}" — a positive integer or "all"`);
+    }
+    sessionIds = sessionIds.slice(0, n);
+  }
+
+  const records: FailureRecord[] = [];
+
+  // 1) run_failed events from the session logs (the ONE failure each run died
+  //    with — payload `{ class, message, remediation?, exitCode }`).
+  for (const id of sessionIds) {
+    let events: unknown[];
+    try {
+      events = parseJsonlObjects(readFileSync(join(sessionsDir, `${id}.jsonl`), "utf-8"));
+    } catch {
+      continue; // a vanished/unreadable log is skipped, not fatal
+    }
+    for (const ev of events) {
+      if (ev === null || typeof ev !== "object") continue;
+      const e = ev as { kind?: unknown; ts?: unknown; payload?: unknown };
+      if (e.kind !== "run_failed") continue;
+      const p = (e.payload ?? {}) as { class?: unknown; message?: unknown; exitCode?: unknown };
+      records.push({
+        source: "run_failed",
+        class: typeof p.class === "string" ? p.class : "unknown",
+        message: typeof p.message === "string" ? p.message : "",
+        sessionId: id,
+        ...(typeof e.ts === "number" ? { ts: e.ts } : {}),
+        ...(typeof p.exitCode === "number" ? { exitCode: p.exitCode } : {}),
+      });
+    }
+  }
+
+  // 2) incident bundle manifests (auto-assembled on a failure trigger).
+  if (existsSync(incidentsDir)) {
+    for (const name of readdirSync(incidentsDir)) {
+      const manifestPath = join(incidentsDir, name, "bundle.json");
+      if (!existsSync(manifestPath)) continue;
+      let manifest: {
+        kind?: unknown;
+        sessionId?: unknown;
+        reason?: unknown;
+        incidentTs?: unknown;
+      };
+      try {
+        manifest = JSON.parse(readFileSync(manifestPath, "utf-8"));
+      } catch {
+        continue;
+      }
+      const kind = typeof manifest.kind === "string" ? manifest.kind : "incident";
+      const ts =
+        typeof manifest.incidentTs === "string" ? Date.parse(manifest.incidentTs) : Number.NaN;
+      records.push({
+        source: "incident",
+        class: `incident:${kind}`,
+        message: typeof manifest.reason === "string" ? manifest.reason : "",
+        sessionId: typeof manifest.sessionId === "string" ? manifest.sessionId : name,
+        ...(Number.isFinite(ts) ? { ts } : {}),
+      });
+    }
+  }
+
+  const clusters = clusterFailureRecords(records);
+  const proposeTax = args.flags["propose-taxonomy"] === true;
+
+  if (args.flags["json"] === true) {
+    const proposal = proposeTax ? proposeTaxonomy(clusters) : undefined;
+    process.stdout.write(
+      `${JSON.stringify(
+        { clusters, ...(proposal !== undefined ? { taxonomy: proposal } : {}) },
+        null,
+        2,
+      )}\n`,
+    );
+    return;
+  }
+
+  process.stdout.write(renderFailuresTable(clusters));
+
+  if (proposeTax) {
+    const proposal = proposeTaxonomy(clusters);
+    const yaml = renderTaxonomyYaml(proposal);
+    const outFlag = args.flags["out"];
+    if (typeof outFlag === "string") {
+      writeFileSync(resolve(outFlag), yaml);
+      process.stdout.write(
+        `\n[failures] drafted ${proposal.drafts.length} failure_taxonomy entr${
+          proposal.drafts.length === 1 ? "y" : "ies"
+        } → ${resolve(outFlag)}\n`,
+      );
+    } else {
+      process.stdout.write(`\n${yaml}`);
+    }
+  }
+}
+
 async function runIncidentCollect(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
@@ -15774,6 +16179,39 @@ switch (subcommand) {
   case "feedback":
     await runFeedbackCmd(parseFor(rest, FEEDBACK_SCHEMA));
     break;
+  case "approvals": {
+    // Loop contract 0.4 (Batch C, G11) — list | show | grant | deny <id>.
+    // A leading -h/--help (help flag in the action slot) routes to the
+    // handler's own help, not the invalid-action error.
+    const first = rest[0] ?? "";
+    const isHelp = first === "--help" || first === "-h";
+    const action = isHelp ? "" : first;
+    if (!isHelp && !["", "list", "show", "grant", "deny"].includes(action)) {
+      die(`approvals action must be one of: list, show, grant, deny (got "${action}")`);
+    }
+    try {
+      await runApprovals(parseFor(isHelp ? rest : rest.slice(1), APPROVALS_SCHEMA), action);
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
+    break;
+  }
+  case "failures": {
+    // G63 — `failures report`: aggregate/cluster run_failed + incidents.
+    const first = rest[0] ?? "";
+    const isHelp = first === "--help" || first === "-h";
+    if (!isHelp && first !== "report") {
+      die(`failures action must be "report" (got "${first}")`);
+    }
+    try {
+      await runFailuresReport(parseFor(isHelp ? rest : rest.slice(1), FAILURES_SCHEMA));
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
+    break;
+  }
   case "distill":
     await runDistill(parseFor(rest, DISTILL_SCHEMA));
     break;

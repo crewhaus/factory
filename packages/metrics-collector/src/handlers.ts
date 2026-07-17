@@ -52,6 +52,18 @@ export class EventToMetrics {
       case "error_recovered":
         this.registry.errorsTotal.inc({ kind: ev.errorName });
         return;
+      case "cost_accrual":
+        // G57 — meter per-call spend labeled by provider + model. Skip the
+        // aggregate run-total accrual (`summary: true`, published by the
+        // optimizer orchestrator) so it never double-counts the per-call
+        // events it sums over. `unpriced` accruals carry a real token tally
+        // but `costUsdMicros: 0`, so incrementing is a harmless no-op.
+        if (ev.summary) return;
+        this.registry.costUsdMicrosTotal.inc(
+          { provider: ev.provider, model: ev.modelId },
+          ev.costUsdMicros,
+        );
+        return;
       default:
         return;
     }

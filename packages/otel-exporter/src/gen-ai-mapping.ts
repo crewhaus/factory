@@ -13,23 +13,49 @@
  * `crewhaus.tool.*` extension keys.
  */
 import type {
+  A2AMessageEvent,
+  ApprovalRequestedEvent,
+  ApprovalResolvedEvent,
+  CircuitStateChangedEvent,
   CompactionFiredEvent,
+  CostAccrualEvent,
+  CoverageReportEvent,
   ErrorRecoveredEvent,
+  HandoffEvent,
   HookFiredEvent,
+  JanitorActionEvent,
   McpCallEndEvent,
   McpCallStartEvent,
+  ModelFailoverEvent,
   ModelRequestEvent,
   ModelResponseEvent,
   ModelStreamTokenEvent,
+  ModelTierRouteEvent,
   PermissionDecisionEvent,
+  ProgramOutputEvent,
   ResponseRatedEvent,
+  RoleEndEvent,
+  RoleStartEvent,
+  RunFailedEvent,
+  SanitizerReportEvent,
   SubAgentEndEvent,
   SubAgentStartEvent,
+  TestVerdictEvent,
   ToolCallEndEvent,
   ToolCallStartEvent,
+  TraceEvent,
+  TraceEventEnvelope,
   TurnEndEvent,
   TurnStartEvent,
 } from "@crewhaus/trace-event-bus";
+
+// `AlertRaisedEvent` and `ModelRouteEvent` are defined in trace-event-bus's
+// types.ts and are members of the exported `TraceEvent` union, but the
+// package's index barrel does not re-export them by name (see cross-package
+// note in the return). Derive them from the union so we depend only on the
+// exported surface rather than editing the keystone package.
+type AlertRaisedEvent = Extract<TraceEvent, { kind: "alert_raised" }>;
+type ModelRouteEvent = Extract<TraceEvent, { kind: "model_route" }>;
 import {
   type Attribute,
   type OtelSpan,
@@ -116,6 +142,81 @@ export const ATTR = {
   CREWHAUS_FEEDBACK_RATING: "crewhaus.feedback.rating",
   CREWHAUS_FEEDBACK_SOURCE: "crewhaus.feedback.source",
   CREWHAUS_FEEDBACK_COMMENT: "crewhaus.feedback.comment",
+  // G58 — crew role / handoff / a2a.
+  CREWHAUS_CREW_ROLE: "crewhaus.crew.role",
+  CREWHAUS_CREW_ACTIVATION: "crewhaus.crew.activation",
+  CREWHAUS_CREW_FINAL_BYTES: "crewhaus.crew.final_message_bytes",
+  CREWHAUS_HANDOFF_FROM: "crewhaus.handoff.from",
+  CREWHAUS_HANDOFF_TO: "crewhaus.handoff.to",
+  CREWHAUS_HANDOFF_REASON: "crewhaus.handoff.reason",
+  CREWHAUS_HANDOFF_DEPTH: "crewhaus.handoff.depth",
+  CREWHAUS_A2A_FROM: "crewhaus.a2a.from",
+  CREWHAUS_A2A_TO: "crewhaus.a2a.to",
+  CREWHAUS_A2A_MESSAGE_KIND: "crewhaus.a2a.message_kind",
+  CREWHAUS_A2A_PAYLOAD_BYTES: "crewhaus.a2a.payload_bytes",
+  CREWHAUS_A2A_TRACEPARENT: "crewhaus.a2a.traceparent",
+  // G58 — cost accrual. gen_ai.usage.* reuses the model-span attr names.
+  CREWHAUS_COST_USD_MICROS: "crewhaus.cost.usd_micros",
+  CREWHAUS_COST_UNPRICED: "crewhaus.cost.unpriced",
+  CREWHAUS_COST_TENANT_ID: "crewhaus.cost.tenant_id",
+  // G58 — run_failed.
+  CREWHAUS_FAILURE_CLASS: "crewhaus.failure.class",
+  CREWHAUS_FAILURE_MESSAGE: "crewhaus.failure.message",
+  CREWHAUS_FAILURE_REMEDIATION: "crewhaus.failure.remediation",
+  CREWHAUS_FAILURE_EXIT_CODE: "crewhaus.failure.exit_code",
+  // G58 — circuit breaker / failover / route.
+  CREWHAUS_CIRCUIT_ADAPTER: "crewhaus.circuit.adapter",
+  CREWHAUS_CIRCUIT_FROM_STATE: "crewhaus.circuit.from_state",
+  CREWHAUS_CIRCUIT_TO_STATE: "crewhaus.circuit.to_state",
+  CREWHAUS_CIRCUIT_REASON: "crewhaus.circuit.reason",
+  CREWHAUS_FAILOVER_FROM: "crewhaus.failover.from",
+  CREWHAUS_FAILOVER_TO: "crewhaus.failover.to",
+  CREWHAUS_FAILOVER_REASON: "crewhaus.failover.reason",
+  CREWHAUS_ROUTE_KEY: "crewhaus.route.key",
+  CREWHAUS_ROUTE_TIER: "crewhaus.route.tier",
+  CREWHAUS_ROUTE_POLICY: "crewhaus.route.policy",
+  CREWHAUS_ROUTE_REASON: "crewhaus.route.reason",
+  CREWHAUS_ROUTE_ESCALATED: "crewhaus.route.escalated",
+  CREWHAUS_ROUTE_EXPLORED: "crewhaus.route.explored",
+  CREWHAUS_ROUTE_POLICY_VERSION: "crewhaus.route.policy_version",
+  // G58 — janitor.
+  CREWHAUS_JANITOR_STEP: "crewhaus.janitor.step",
+  CREWHAUS_JANITOR_STATUS: "crewhaus.janitor.status",
+  CREWHAUS_JANITOR_COUNT: "crewhaus.janitor.count",
+  CREWHAUS_JANITOR_DETAIL: "crewhaus.janitor.detail",
+  // G58 — alert.
+  CREWHAUS_ALERT_METRIC: "crewhaus.alert.metric",
+  CREWHAUS_ALERT_OBSERVED: "crewhaus.alert.observed",
+  CREWHAUS_ALERT_THRESHOLD: "crewhaus.alert.threshold",
+  CREWHAUS_ALERT_BASELINE_SESSIONS: "crewhaus.alert.baseline_sessions",
+  CREWHAUS_ALERT_DETAIL: "crewhaus.alert.detail",
+  // G58 — test-verdict family.
+  CREWHAUS_TEST_ID: "crewhaus.test.id",
+  CREWHAUS_TEST_VERDICT: "crewhaus.test.verdict",
+  CREWHAUS_TEST_REASON: "crewhaus.test.reason",
+  CREWHAUS_TEST_DURATION_MS: "crewhaus.test.duration_ms",
+  CREWHAUS_PROGRAM_ID: "crewhaus.program.id",
+  CREWHAUS_PROGRAM_EXIT_CODE: "crewhaus.program.exit_code",
+  CREWHAUS_PROGRAM_STDOUT_BYTES: "crewhaus.program.stdout_bytes",
+  CREWHAUS_PROGRAM_STDERR_BYTES: "crewhaus.program.stderr_bytes",
+  CREWHAUS_PROGRAM_DURATION_MS: "crewhaus.program.duration_ms",
+  CREWHAUS_COVERAGE_LINES_COVERED: "crewhaus.coverage.lines_covered",
+  CREWHAUS_COVERAGE_LINES_TOTAL: "crewhaus.coverage.lines_total",
+  CREWHAUS_COVERAGE_BRANCHES_COVERED: "crewhaus.coverage.branches_covered",
+  CREWHAUS_COVERAGE_BRANCHES_TOTAL: "crewhaus.coverage.branches_total",
+  CREWHAUS_SANITIZER_KIND: "crewhaus.sanitizer.kind",
+  CREWHAUS_SANITIZER_IS_ERROR: "crewhaus.sanitizer.is_error",
+  CREWHAUS_SANITIZER_SUMMARY: "crewhaus.sanitizer.summary",
+  // G58 — approvals.
+  CREWHAUS_APPROVAL_ID: "crewhaus.approval.id",
+  CREWHAUS_APPROVAL_TOOL: "crewhaus.approval.tool",
+  CREWHAUS_APPROVAL_SURFACE: "crewhaus.approval.surface",
+  CREWHAUS_APPROVAL_DECISION: "crewhaus.approval.decision",
+  CREWHAUS_APPROVAL_BY: "crewhaus.approval.by",
+  // G58 — generic fallback (default branch: never silently drop an event).
+  CREWHAUS_EVENT_KIND: "crewhaus.event.kind",
+  // Identity — the Ed25519 fingerprint of the publishing agent, when set.
+  CREWHAUS_AGENT_ID: "crewhaus.agent.id",
 } as const;
 
 function attrStr(key: string, v: string): Attribute {
@@ -138,12 +239,44 @@ function nanoFromMs(ms: number): string {
   return `${BigInt(Math.trunc(ms))}000000`;
 }
 
-function envelopeAttrs(ev: { runId: string; sessionId: string; turnNumber: number }): Attribute[] {
-  return [
+function envelopeAttrs(ev: {
+  runId: string;
+  sessionId: string;
+  turnNumber: number;
+  agentId?: string;
+}): Attribute[] {
+  const attrs = [
     attrStr(ATTR.CREWHAUS_RUN_ID, ev.runId),
     attrStr(ATTR.CREWHAUS_SESSION_ID, ev.sessionId),
     attrInt(ATTR.CREWHAUS_TURN_NUMBER, ev.turnNumber),
   ];
+  // Batch C keystone item 4 — stamp the publishing agent's Ed25519 fingerprint
+  // when the bus supplied one, so a span attributes to the same agent as its
+  // audit record. Additive: absent on isolated tests / pre-identity events.
+  if (ev.agentId !== undefined) attrs.push(attrStr(ATTR.CREWHAUS_AGENT_ID, ev.agentId));
+  return attrs;
+}
+
+/** Zero-duration point-in-time span helper for events with no start/end pair. */
+function pointSpan(
+  ev: TraceEventEnvelope,
+  name: string,
+  extraAttrs: Attribute[],
+  status: OtelSpan["status"],
+  kind: OtelSpan["kind"] = SPAN_KIND_INTERNAL,
+): OtelSpan {
+  const nano = isoToNano(ev.timestamp);
+  return {
+    traceId: ev.traceId,
+    spanId: ev.spanId,
+    ...(ev.parentSpanId ? { parentSpanId: ev.parentSpanId } : {}),
+    name,
+    kind,
+    startTimeUnixNano: nano,
+    endTimeUnixNano: nano,
+    attributes: [...envelopeAttrs(ev), ...extraAttrs],
+    status,
+  };
 }
 
 export type StartedTurn = {
@@ -398,4 +531,336 @@ export function buildErrorRecoveredSpan(ev: ErrorRecoveredEvent): OtelSpan {
     ],
     status: { code: STATUS_ERROR, message: ev.errorName },
   };
+}
+
+// ---------------------------------------------------------------------------
+// G58 — crew (role / handoff / a2a) span mappings.
+// ---------------------------------------------------------------------------
+
+export type StartedRole = {
+  startNano: string;
+  ev: RoleStartEvent;
+};
+
+/** A crew role's activation, `role_start` → `role_end`, mapped as one span. */
+export function buildRoleSpan(start: StartedRole, end: RoleEndEvent): OtelSpan {
+  return {
+    traceId: end.traceId,
+    spanId: end.spanId,
+    ...(end.parentSpanId ? { parentSpanId: end.parentSpanId } : {}),
+    name: `role.${end.role}`,
+    kind: SPAN_KIND_INTERNAL,
+    startTimeUnixNano: start.startNano,
+    endTimeUnixNano: isoToNano(end.timestamp),
+    attributes: [
+      ...envelopeAttrs(end),
+      attrStr(ATTR.CREWHAUS_CREW_ROLE, end.role),
+      attrInt(ATTR.CREWHAUS_CREW_ACTIVATION, end.activation),
+      attrInt(ATTR.CREWHAUS_CREW_FINAL_BYTES, end.finalMessageBytes),
+    ],
+    status: { code: STATUS_OK },
+  };
+}
+
+/** A crew control-handoff — a point-in-time span carrying the from/to/depth. */
+export function buildHandoffSpan(ev: HandoffEvent): OtelSpan {
+  return pointSpan(
+    ev,
+    "handoff",
+    [
+      attrStr(ATTR.CREWHAUS_HANDOFF_FROM, ev.from),
+      attrStr(ATTR.CREWHAUS_HANDOFF_TO, ev.to),
+      attrStr(ATTR.CREWHAUS_HANDOFF_REASON, ev.reason),
+      attrInt(ATTR.CREWHAUS_HANDOFF_DEPTH, ev.depth),
+    ],
+    { code: STATUS_OK },
+  );
+}
+
+/** An agent-to-agent message — a point-in-time span (SPAN_KIND_PRODUCER-ish;
+ *  kept INTERNAL to match the rest of our nested crew spans). */
+export function buildA2AMessageSpan(ev: A2AMessageEvent): OtelSpan {
+  return pointSpan(
+    ev,
+    `a2a.${ev.messageKind}`,
+    [
+      attrStr(ATTR.CREWHAUS_A2A_FROM, ev.from),
+      attrStr(ATTR.CREWHAUS_A2A_TO, ev.to),
+      attrStr(ATTR.CREWHAUS_A2A_MESSAGE_KIND, ev.messageKind),
+      attrInt(ATTR.CREWHAUS_A2A_PAYLOAD_BYTES, ev.payloadBytes),
+      attrStr(ATTR.CREWHAUS_A2A_TRACEPARENT, ev.traceparent),
+    ],
+    { code: STATUS_OK },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// G58 — cost / failure span mappings.
+// ---------------------------------------------------------------------------
+
+/** A per-call (or aggregate) cost accrual — a point-in-time span carrying the
+ *  gen_ai.usage.* token counts plus the microdollar total. */
+export function buildCostAccrualSpan(ev: CostAccrualEvent): OtelSpan {
+  const attrs: Attribute[] = [
+    attrStr(ATTR.GEN_AI_SYSTEM, genAiSystem(ev.provider)),
+    attrStr(ATTR.GEN_AI_REQUEST_MODEL, ev.modelId),
+    attrInt(ATTR.GEN_AI_USAGE_INPUT_TOKENS, ev.inputTokens),
+    attrInt(ATTR.GEN_AI_USAGE_OUTPUT_TOKENS, ev.outputTokens),
+    attrInt(ATTR.GEN_AI_USAGE_CACHE_READ_TOKENS, ev.cachedReadTokens),
+    attrInt(ATTR.CREWHAUS_COST_USD_MICROS, ev.costUsdMicros),
+  ];
+  if (ev.cacheCreationTokens !== undefined) {
+    attrs.push(attrInt(ATTR.GEN_AI_USAGE_CACHE_CREATE_TOKENS, ev.cacheCreationTokens));
+  }
+  if (ev.unpriced) attrs.push(attrBool(ATTR.CREWHAUS_COST_UNPRICED, true));
+  if (ev.tenantId !== undefined) attrs.push(attrStr(ATTR.CREWHAUS_COST_TENANT_ID, ev.tenantId));
+  return pointSpan(ev, ev.summary ? "cost_accrual.summary" : "cost_accrual", attrs, {
+    code: STATUS_OK,
+  });
+}
+
+/** The terminal run failure — a point-in-time span with ERROR status. */
+export function buildRunFailedSpan(ev: RunFailedEvent): OtelSpan {
+  const attrs: Attribute[] = [
+    attrStr(ATTR.CREWHAUS_FAILURE_CLASS, ev.class),
+    attrStr(ATTR.CREWHAUS_FAILURE_MESSAGE, ev.message),
+    attrInt(ATTR.CREWHAUS_FAILURE_EXIT_CODE, ev.exitCode),
+  ];
+  if (ev.remediation !== undefined) {
+    attrs.push(attrStr(ATTR.CREWHAUS_FAILURE_REMEDIATION, ev.remediation));
+  }
+  return pointSpan(ev, `run_failed.${ev.class}`, attrs, {
+    code: STATUS_ERROR,
+    message: ev.message,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// G58 — routing (circuit breaker / failover / tier / pool) span mappings.
+// ---------------------------------------------------------------------------
+
+/** A circuit-breaker transition — a point-in-time span. ERROR when it opened. */
+export function buildCircuitStateChangedSpan(ev: CircuitStateChangedEvent): OtelSpan {
+  const attrs: Attribute[] = [
+    attrStr(ATTR.CREWHAUS_CIRCUIT_ADAPTER, ev.adapter),
+    attrStr(ATTR.CREWHAUS_CIRCUIT_FROM_STATE, ev.fromState),
+    attrStr(ATTR.CREWHAUS_CIRCUIT_TO_STATE, ev.toState),
+  ];
+  if (ev.reason !== undefined) attrs.push(attrStr(ATTR.CREWHAUS_CIRCUIT_REASON, ev.reason));
+  return pointSpan(ev, `circuit.${ev.toState}`, attrs, {
+    code: ev.toState === "open" ? STATUS_ERROR : STATUS_OK,
+  });
+}
+
+/** A model-router failover — a point-in-time span. */
+export function buildModelFailoverSpan(ev: ModelFailoverEvent): OtelSpan {
+  return pointSpan(
+    ev,
+    "model_failover",
+    [
+      attrStr(ATTR.CREWHAUS_FAILOVER_FROM, ev.from),
+      attrStr(ATTR.CREWHAUS_FAILOVER_TO, ev.to),
+      attrStr(ATTR.CREWHAUS_FAILOVER_REASON, ev.reason),
+      attrStr(ATTR.GEN_AI_REQUEST_MODEL, ev.to),
+    ],
+    { code: STATUS_OK },
+  );
+}
+
+/** A two-tier difficulty route — a point-in-time span. */
+export function buildModelTierRouteSpan(ev: ModelTierRouteEvent): OtelSpan {
+  const attrs: Attribute[] = [
+    attrStr(ATTR.CREWHAUS_ROUTE_TIER, ev.tier),
+    attrStr(ATTR.GEN_AI_REQUEST_MODEL, ev.model),
+    attrStr(ATTR.CREWHAUS_ROUTE_REASON, ev.reason),
+  ];
+  if (ev.escalated !== undefined) attrs.push(attrBool(ATTR.CREWHAUS_ROUTE_ESCALATED, ev.escalated));
+  return pointSpan(ev, `model_tier_route.${ev.tier}`, attrs, { code: STATUS_OK });
+}
+
+/** An N-candidate pool route (`model_pool`) — a point-in-time span. */
+export function buildModelRouteSpan(ev: ModelRouteEvent): OtelSpan {
+  const attrs: Attribute[] = [
+    attrStr(ATTR.CREWHAUS_ROUTE_KEY, ev.routeKey),
+    attrStr(ATTR.GEN_AI_REQUEST_MODEL, ev.model),
+    attrStr(ATTR.CREWHAUS_ROUTE_POLICY, ev.policy),
+    attrStr(ATTR.CREWHAUS_ROUTE_REASON, ev.reason),
+  ];
+  if (ev.explored !== undefined) attrs.push(attrBool(ATTR.CREWHAUS_ROUTE_EXPLORED, ev.explored));
+  if (ev.policyVersion !== undefined) {
+    attrs.push(attrStr(ATTR.CREWHAUS_ROUTE_POLICY_VERSION, ev.policyVersion));
+  }
+  return pointSpan(ev, `model_route.${ev.routeKey}`, attrs, { code: STATUS_OK });
+}
+
+// ---------------------------------------------------------------------------
+// G58 — janitor / alert span mappings.
+// ---------------------------------------------------------------------------
+
+/** A boot-time self-heal janitor step — a point-in-time span. ERROR on "error". */
+export function buildJanitorActionSpan(ev: JanitorActionEvent): OtelSpan {
+  const attrs: Attribute[] = [
+    attrStr(ATTR.CREWHAUS_JANITOR_STEP, ev.step),
+    attrStr(ATTR.CREWHAUS_JANITOR_STATUS, ev.status),
+  ];
+  if (ev.count !== undefined) attrs.push(attrInt(ATTR.CREWHAUS_JANITOR_COUNT, ev.count));
+  if (ev.detail !== undefined) attrs.push(attrStr(ATTR.CREWHAUS_JANITOR_DETAIL, ev.detail));
+  return pointSpan(ev, `janitor.${ev.step}`, attrs, {
+    code: ev.status === "error" ? STATUS_ERROR : STATUS_OK,
+    ...(ev.status === "error" && ev.detail !== undefined ? { message: ev.detail } : {}),
+  });
+}
+
+/** An alert-watchdog breach — a point-in-time span with ERROR status. */
+export function buildAlertRaisedSpan(ev: AlertRaisedEvent): OtelSpan {
+  return pointSpan(
+    ev,
+    "alert_raised",
+    [
+      attrStr(ATTR.CREWHAUS_ALERT_METRIC, ev.metric),
+      { key: ATTR.CREWHAUS_ALERT_OBSERVED, value: { doubleValue: ev.observed } },
+      { key: ATTR.CREWHAUS_ALERT_THRESHOLD, value: { doubleValue: ev.threshold } },
+      attrInt(ATTR.CREWHAUS_ALERT_BASELINE_SESSIONS, ev.baselineSessions),
+      attrStr(ATTR.CREWHAUS_ALERT_DETAIL, ev.detail),
+    ],
+    { code: STATUS_ERROR, message: ev.detail },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// G58 — test-verdict family (test_verdict / program_output / coverage_report /
+// sanitizer_report) span mappings.
+// ---------------------------------------------------------------------------
+
+/** A structured test verdict — a point-in-time span. ERROR on fail/error. */
+export function buildTestVerdictSpan(ev: TestVerdictEvent): OtelSpan {
+  const attrs: Attribute[] = [
+    attrStr(ATTR.CREWHAUS_TEST_ID, ev.testId),
+    attrStr(ATTR.CREWHAUS_TEST_VERDICT, ev.verdict),
+    attrInt(ATTR.CREWHAUS_TEST_DURATION_MS, ev.durationMs),
+  ];
+  if (ev.reason !== undefined) attrs.push(attrStr(ATTR.CREWHAUS_TEST_REASON, ev.reason));
+  const failed = ev.verdict === "fail" || ev.verdict === "error";
+  return pointSpan(ev, `test_verdict.${ev.verdict}`, attrs, {
+    code: failed ? STATUS_ERROR : STATUS_OK,
+    ...(failed && ev.reason !== undefined ? { message: ev.reason } : {}),
+  });
+}
+
+/** A sandboxed program's exit summary — a point-in-time span. */
+export function buildProgramOutputSpan(ev: ProgramOutputEvent): OtelSpan {
+  return pointSpan(
+    ev,
+    "program_output",
+    [
+      attrStr(ATTR.CREWHAUS_PROGRAM_ID, ev.programId),
+      attrInt(ATTR.CREWHAUS_PROGRAM_EXIT_CODE, ev.exitCode),
+      attrInt(ATTR.CREWHAUS_PROGRAM_STDOUT_BYTES, ev.stdoutBytes),
+      attrInt(ATTR.CREWHAUS_PROGRAM_STDERR_BYTES, ev.stderrBytes),
+      attrInt(ATTR.CREWHAUS_PROGRAM_DURATION_MS, ev.durationMs),
+    ],
+    { code: ev.exitCode === 0 ? STATUS_OK : STATUS_ERROR },
+  );
+}
+
+/** A coverage report — a point-in-time span. */
+export function buildCoverageReportSpan(ev: CoverageReportEvent): OtelSpan {
+  return pointSpan(
+    ev,
+    "coverage_report",
+    [
+      attrStr(ATTR.CREWHAUS_PROGRAM_ID, ev.programId),
+      attrInt(ATTR.CREWHAUS_COVERAGE_LINES_COVERED, ev.linesCovered),
+      attrInt(ATTR.CREWHAUS_COVERAGE_LINES_TOTAL, ev.linesTotal),
+      attrInt(ATTR.CREWHAUS_COVERAGE_BRANCHES_COVERED, ev.branchesCovered),
+      attrInt(ATTR.CREWHAUS_COVERAGE_BRANCHES_TOTAL, ev.branchesTotal),
+    ],
+    { code: STATUS_OK },
+  );
+}
+
+/** A sanitizer report — a point-in-time span. ERROR when it flagged. */
+export function buildSanitizerReportSpan(ev: SanitizerReportEvent): OtelSpan {
+  return pointSpan(
+    ev,
+    `sanitizer.${ev.sanitizer}`,
+    [
+      attrStr(ATTR.CREWHAUS_PROGRAM_ID, ev.programId),
+      attrStr(ATTR.CREWHAUS_SANITIZER_KIND, ev.sanitizer),
+      attrBool(ATTR.CREWHAUS_SANITIZER_IS_ERROR, ev.isError),
+      attrStr(ATTR.CREWHAUS_SANITIZER_SUMMARY, ev.summary),
+    ],
+    { code: ev.isError ? STATUS_ERROR : STATUS_OK, ...(ev.isError ? { message: ev.summary } : {}) },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// G58 — approval span mappings.
+// ---------------------------------------------------------------------------
+
+/** A parked approval request — a point-in-time span. */
+export function buildApprovalRequestedSpan(ev: ApprovalRequestedEvent): OtelSpan {
+  return pointSpan(
+    ev,
+    "approval.requested",
+    [
+      attrStr(ATTR.CREWHAUS_APPROVAL_ID, ev.approvalId),
+      attrStr(ATTR.CREWHAUS_APPROVAL_TOOL, ev.toolName),
+      attrStr(ATTR.CREWHAUS_APPROVAL_SURFACE, ev.surface),
+    ],
+    { code: STATUS_OK },
+  );
+}
+
+/** A resolved approval — a point-in-time span. ERROR when denied. */
+export function buildApprovalResolvedSpan(ev: ApprovalResolvedEvent): OtelSpan {
+  return pointSpan(
+    ev,
+    `approval.resolved.${ev.decision}`,
+    [
+      attrStr(ATTR.CREWHAUS_APPROVAL_ID, ev.approvalId),
+      attrStr(ATTR.CREWHAUS_APPROVAL_DECISION, ev.decision),
+      attrStr(ATTR.CREWHAUS_APPROVAL_BY, ev.by),
+    ],
+    { code: ev.decision === "deny" ? STATUS_ERROR : STATUS_OK },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// G58 — generic fallback. The SpanTracker's default branch routes here so a
+// TraceEvent kind with no dedicated mapping still produces a span (never
+// silently dropped). Emits a zero-duration span named `crewhaus.<kind>` with
+// the envelope attrs plus a best-effort dump of the event's own scalar fields.
+// ---------------------------------------------------------------------------
+
+const ENVELOPE_KEYS = new Set<string>([
+  "runId",
+  "sessionId",
+  "turnNumber",
+  "traceId",
+  "spanId",
+  "parentSpanId",
+  "timestamp",
+  "agentId",
+  "kind",
+]);
+
+export function buildGenericSpan(ev: TraceEvent): OtelSpan {
+  const extra: Attribute[] = [attrStr(ATTR.CREWHAUS_EVENT_KIND, ev.kind)];
+  for (const [key, value] of Object.entries(ev as Record<string, unknown>)) {
+    if (ENVELOPE_KEYS.has(key)) continue;
+    const attrKey = `crewhaus.event.${key}`;
+    if (typeof value === "string") extra.push(attrStr(attrKey, value));
+    else if (typeof value === "boolean") extra.push(attrBool(attrKey, value));
+    else if (typeof value === "number") {
+      extra.push(
+        Number.isInteger(value)
+          ? attrInt(attrKey, value)
+          : { key: attrKey, value: { doubleValue: value } },
+      );
+    }
+    // Objects/arrays/undefined are skipped — the scalar dump is a best-effort
+    // fallback, not a full serializer; the dedicated builders carry structure.
+  }
+  return pointSpan(ev, `crewhaus.${ev.kind}`, extra, { code: STATUS_OK });
 }

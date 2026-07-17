@@ -92,3 +92,24 @@ export async function classifyInbound(
 // Convenience re-exports so channel call sites depend on one package.
 export { classifyBoundary, type TrustOrigin, type BoundarySeverity };
 export { tagContent, type RunContext };
+
+// Loop contract 0.4 (Batch C, G11) — the channel-generic pending-approval
+// surface (store contract + in-memory default + park/resolve orchestration).
+export {
+  type ApprovalDecision,
+  type ApprovalStatus,
+  type NewPendingApproval,
+  type PendingApproval,
+  type ApprovalListFilter,
+  type ApprovalStore,
+  type ApprovalAuditSink,
+  type ApprovalTraceEvent,
+  type ApprovalTracePublish,
+  type InMemoryApprovalStoreOptions,
+  InMemoryApprovalStore,
+  previewApprovalInput,
+  approvalFallbackText,
+  postApprovalPrompt,
+  createApprovalPrompter,
+  resolveApproval,
+} from "./approvals.js";

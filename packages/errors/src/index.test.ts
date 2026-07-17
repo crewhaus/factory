@@ -161,6 +161,7 @@ describe("EXIT_CODES", () => {
       crewhaus_budget: 33,
       timeout: 34,
       evaluation: 35,
+      approval_pending: 36,
       tool: 40,
     });
   });

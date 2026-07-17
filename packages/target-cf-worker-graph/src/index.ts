@@ -201,6 +201,20 @@ function renderWorker(
   // syntax error Cloudflare rejects at upload time.
   const name = escapeJsonString(ir.name);
   const allowed = JSON.stringify(allowedOrigins);
+  // Loop contract 0.4 (Batch C, item 3) — the /chat SSE gains `trace` events in
+  // the TraceEvent JSON vocabulary. `observability.trace: off` suppresses them
+  // entirely; every other level (the default "ring", "pretty", "json") emits.
+  // Baked as a literal boolean so the generated worker carries no config parse.
+  //
+  // NOTE: IrGraphV0 does not (yet) carry an `observability` field — the Batch C
+  // keystone added it only to the agent-loop shapes (IrV0/cli, IrChannelV0,
+  // IrManagedV0, IrCrewV0). The structural read below keeps the gate
+  // forward-compatible: it defaults to trace-ON today and honours an explicit
+  // `trace: off` the moment the IR + graph lowering carry it (flagged as a
+  // cross-package need). See the emitter's return notes.
+  const traceEnabled =
+    ((ir as { observability?: { trace?: { level?: string } } }).observability?.trace?.level ??
+      "ring") !== "off";
   const nodes = order
     .map(
       (n) =>
@@ -224,6 +238,7 @@ const CONFIG = {
 ${nodes}
   ],
   allowedOrigins: ${allowed},
+  trace: ${traceEnabled},
 };
 
 const ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
@@ -278,11 +293,21 @@ async function handleChat(request, env, cors) {
       const emit = (event, data) => {
         controller.enqueue(enc.encode(\`event: \${event}\\ndata: \${JSON.stringify(data)}\\n\\n\`));
       };
+      // Loop contract 0.4 (Batch C, item 3) — trace frames are gated on
+      // CONFIG.trace (observability.trace !== "off"). Each node brackets a
+      // node_start/node_end pair and reports its real token usage + an
+      // (unpriced) cost accrual; the inlined worker carries no pricing table
+      // (that ports over with the shared runtime in M2+), so the studio host
+      // reads tokens from model_response.usage and flags the unpriced cost.
+      const emitTrace = (event) => { if (CONFIG.trace) emit("trace", event); };
+      const costEvent = (model, usage) => ({ kind: "cost_accrual", provider: "anthropic", modelId: model, inputTokens: usage.input, outputTokens: usage.output, cachedReadTokens: usage.cacheRead, cacheCreationTokens: usage.cacheCreate, costUsdMicros: 0, unpriced: true });
       try {
         for (let i = 0; i < nodes.length; i++) {
           const node = nodes[i];
           const isLast = i === nodes.length - 1;
           emit("text", { text: \`\\n[node \${i + 1}/\${nodes.length}: \${node.name}]\\n\` });
+          emitTrace({ kind: "node_start", name: node.name, node: i + 1, total: nodes.length });
+          const nodeT0 = Date.now();
           const userMessage =
             "Upstream state:\\n\`\`\`json\\n" + JSON.stringify(state, null, 2) + "\\n\`\`\`";
           const reqBody = {
@@ -316,6 +341,10 @@ async function handleChat(request, env, cors) {
             const payload = await upstream.json();
             const text = joinTextBlocks(payload);
             state = { ...state, [node.name]: text };
+            const usage = extractUsage(payload && payload.usage);
+            emitTrace({ kind: "model_response", model: node.model, usage, stopReason: (payload && payload.stop_reason) || "end_turn", durationMs: Date.now() - nodeT0 });
+            emitTrace(costEvent(node.model, usage));
+            emitTrace({ kind: "node_end", name: node.name, node: i + 1, durationMs: Date.now() - nodeT0 });
             continue;
           }
 
@@ -326,6 +355,9 @@ async function handleChat(request, env, cors) {
           let buffer = "";
           let acc = "";
           let stopReason = "end_turn";
+          // Real token usage from Anthropic's own SSE: message_start seeds the
+          // input/cache counts, message_delta carries the final output tally.
+          let usage = { input: 0, output: 0, cacheRead: 0, cacheCreate: 0 };
           while (true) {
             const { value, done } = await reader.read();
             if (done) break;
@@ -343,15 +375,21 @@ async function handleChat(request, env, cors) {
               if (!data || data === "[DONE]") continue;
               let p;
               try { p = JSON.parse(data); } catch { continue; }
-              if (eventName === "content_block_delta" && p.delta && p.delta.type === "text_delta") {
+              if (eventName === "message_start" && p.message && p.message.usage) {
+                usage = extractUsage(p.message.usage);
+              } else if (eventName === "content_block_delta" && p.delta && p.delta.type === "text_delta") {
                 acc += p.delta.text;
                 emit("text", { text: p.delta.text });
-              } else if (eventName === "message_delta" && p.delta && p.delta.stop_reason) {
-                stopReason = p.delta.stop_reason;
+              } else if (eventName === "message_delta") {
+                if (p.delta && p.delta.stop_reason) stopReason = p.delta.stop_reason;
+                if (p.usage && typeof p.usage.output_tokens === "number") usage.output = p.usage.output_tokens;
               }
             }
           }
           state = { ...state, [node.name]: acc };
+          emitTrace({ kind: "model_response", model: node.model, usage, stopReason, durationMs: Date.now() - nodeT0 });
+          emitTrace(costEvent(node.model, usage));
+          emitTrace({ kind: "node_end", name: node.name, node: i + 1, durationMs: Date.now() - nodeT0 });
           emit("done", { text: acc, stopReason });
         }
       } catch (err) {
@@ -380,6 +418,17 @@ function joinTextBlocks(payload) {
     if (block && block.type === "text" && typeof block.text === "string") out += block.text;
   }
   return out;
+}
+
+// Normalize an Anthropic \`usage\` object to the model_response.usage shape.
+function extractUsage(u) {
+  u = u || {};
+  return {
+    input: u.input_tokens || 0,
+    output: u.output_tokens || 0,
+    cacheRead: u.cache_read_input_tokens || 0,
+    cacheCreate: u.cache_creation_input_tokens || 0,
+  };
 }
 
 function lastUserText(messages) {

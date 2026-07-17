@@ -63,6 +63,7 @@ import {
   type SpecDiscordChannel,
   type SpecIMessageChannel,
   type SpecMcpServerConfig,
+  type SpecObservabilityBlock,
   type SpecSlackChannel,
   type SpecSubAgentDefinition,
   type SpecTelegramChannel,
@@ -202,6 +203,17 @@ export function compile(yamlText: string, opts: CompileOptions = {}): CompileRes
  * and the `crewhaus run` interpreter implement them alongside this
  * lowering), so they are deliberately NOT listed either — declaring them
  * must not warn.
+ *
+ * Batch C (G26 observability / G11 pending-approval): the `observability:`
+ * block (its new trace/metrics/cost/alerts/incidents/otel sub-blocks) and
+ * `permissions.ask_mode` are WIRED-IN-BATCH on the shapes this batch's
+ * downstream agents cover — cli / channel / managed / crew (+ the cf-workers
+ * trace SSE) — so they are deliberately NOT listed. `observability` is a
+ * top-level key already lowered on all four shapes (crew joins them here);
+ * `ask_mode` is a sub-key of the universally-wired `permissions` block, and
+ * the ACCEPTED_BUT_UNWIRED mechanism tracks top-level keys only, so there is
+ * no nested-path row for it — its absent default (`"pause"`) is the safe
+ * runtime behaviour on every shape regardless.
  */
 type UnwiredKey = {
   readonly path: string;
@@ -356,6 +368,11 @@ function lowerPermissions(spec: SpecWithPermissions): IrPermissions {
   if (p === undefined) return { rules: [] };
   return {
     mode: p.mode,
+    // Loop contract 0.4 (Batch C, G11) — carry `ask_mode` only when the spec
+    // sets it (mirrors `mode`): absent means the SAFE default `"pause"`, which
+    // the runtime resolves with `askMode ?? "pause"`. NOT optimizer-reachable
+    // (a safety control, excluded from OPTIMIZABLE_PATHS at the spec layer).
+    ...(p.ask_mode !== undefined ? { askMode: p.ask_mode } : {}),
     rules: (p.rules ?? []).map(
       (r: { type: IrPermissions["rules"][number]["type"]; pattern: string }) => ({
         type: r.type,
@@ -1630,47 +1647,53 @@ function applyLearningWikiGovernance(
   };
 }
 
-type SpecWithObservability = {
-  readonly observability?: {
-    readonly slo?: {
-      readonly error_rate?: number;
-      readonly p95_latency_ms?: number;
-      readonly ttft_ms?: number;
-      readonly cost_per_hour_usd?: number;
-      readonly egress_block_rate?: number;
-      readonly window_seconds?: number;
-      readonly mitigation?: ReadonlyArray<"alert" | "pause-intake" | "rollback">;
-    };
-  };
-};
+type SpecWithObservability = { readonly observability?: SpecObservabilityBlock };
 
 /**
- * Ops item 37 — lower the cross-cutting `observability` block, mirroring
- * lowerMemory's spread-return-{} discipline (Pillar 1): the key is absent from
- * the IR when the spec omits the block. `slo.window_seconds` is folded to
- * `windowMs` (ms) at lower time so the runtime monitor reads a literal duration;
- * `mitigation` defaults to `["alert"]` here so an observe-only spec that lists
- * thresholds without a ladder still warns (the safe rung). Targets are carried
- * verbatim from snake_case spec keys to camelCase IR keys.
+ * Ops item 37 + Loop contract 0.4 (Batch C, G26) — lower the cross-cutting
+ * `observability` block, mirroring lowerMemory's spread-return-{} discipline
+ * (Pillar 1): the key is absent from the IR when the spec omits the block.
+ *
+ * `slo.window_seconds` is folded to `windowMs` (ms) at lower time so the
+ * runtime monitor reads a literal duration; `mitigation` defaults to
+ * `["alert"]` here so an observe-only spec that lists thresholds without a
+ * ladder still warns (the safe rung). Targets are carried verbatim from
+ * snake_case spec keys to camelCase IR keys.
+ *
+ * G26 DEFAULTS SEMANTICS — spec ABSENCE is NOT `off`. This lowering carries
+ * ONLY the sub-blocks the spec declares; an absent sub-block stays absent from
+ * the IR and the EMITTER applies the default (cost-tracker + ring buffer ON;
+ * metrics/alerts/incidents opt-in OFF). An explicit `cost: { enabled: false }`
+ * / `trace: { level: "off" }` reaches the IR verbatim and wins. Zod has
+ * already materialised each declared toggle's `enabled` default (`true`) and
+ * `trace.level`'s default (`"ring"`), so a bare `metrics: {}` lowers to
+ * `{ enabled: true }`.
  */
 function lowerObservability(spec: SpecWithObservability): { observability?: IrObservability } {
   const o = spec.observability;
   if (o === undefined) return {};
+  const observability: { -readonly [K in keyof IrObservability]: IrObservability[K] } = {};
   const slo = o.slo;
-  if (slo === undefined) return { observability: {} };
-  return {
-    observability: {
-      slo: {
-        ...(slo.error_rate !== undefined ? { errorRate: slo.error_rate } : {}),
-        ...(slo.p95_latency_ms !== undefined ? { p95LatencyMs: slo.p95_latency_ms } : {}),
-        ...(slo.ttft_ms !== undefined ? { ttftMs: slo.ttft_ms } : {}),
-        ...(slo.cost_per_hour_usd !== undefined ? { costPerHourUsd: slo.cost_per_hour_usd } : {}),
-        ...(slo.egress_block_rate !== undefined ? { egressBlockRate: slo.egress_block_rate } : {}),
-        ...(slo.window_seconds !== undefined ? { windowMs: slo.window_seconds * 1000 } : {}),
-        mitigation: slo.mitigation !== undefined ? [...slo.mitigation] : ["alert"],
-      },
-    },
-  };
+  if (slo !== undefined) {
+    observability.slo = {
+      ...(slo.error_rate !== undefined ? { errorRate: slo.error_rate } : {}),
+      ...(slo.p95_latency_ms !== undefined ? { p95LatencyMs: slo.p95_latency_ms } : {}),
+      ...(slo.ttft_ms !== undefined ? { ttftMs: slo.ttft_ms } : {}),
+      ...(slo.cost_per_hour_usd !== undefined ? { costPerHourUsd: slo.cost_per_hour_usd } : {}),
+      ...(slo.egress_block_rate !== undefined ? { egressBlockRate: slo.egress_block_rate } : {}),
+      ...(slo.window_seconds !== undefined ? { windowMs: slo.window_seconds * 1000 } : {}),
+      mitigation: slo.mitigation !== undefined ? [...slo.mitigation] : ["alert"],
+    };
+  }
+  if (o.trace !== undefined) observability.trace = { level: o.trace.level };
+  if (o.metrics !== undefined) observability.metrics = { enabled: o.metrics.enabled };
+  if (o.cost !== undefined) observability.cost = { enabled: o.cost.enabled };
+  if (o.alerts !== undefined) observability.alerts = { enabled: o.alerts.enabled };
+  if (o.incidents !== undefined) observability.incidents = { enabled: o.incidents.enabled };
+  if (o.otel !== undefined) {
+    observability.otel = o.otel.endpoint !== undefined ? { endpoint: o.otel.endpoint } : {};
+  }
+  return { observability };
 }
 
 /**
@@ -2184,6 +2207,9 @@ export function lower(spec: Spec): IrNode {
         // the emitted bundle), not emit-wired yet.
         ...lowerThredzCarried(spec, continuity.continuity?.plan === true, "crew"),
         ...learning,
+        // Loop contract 0.4 (Batch C, G26) — observability subscriber/exporter
+        // controls (crew joins cli/channel/managed).
+        ...lowerObservability(spec),
         ...lowerChainSubsystem(spec),
       } satisfies IrCrewV0;
     }

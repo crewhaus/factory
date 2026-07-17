@@ -112,6 +112,10 @@ function formatBody(ev: TraceEvent): string {
         ev.targetSpanId ? ` span=${ev.targetSpanId}` : ""
       }${ev.comment ? ` comment=${ev.comment}` : ""}`;
     }
+    case "approval_requested":
+      return `tool=${ev.toolName} approval=${ev.approvalId} surface=${ev.surface}`;
+    case "approval_resolved":
+      return `approval=${ev.approvalId} decision=${ev.decision} by=${ev.by}`;
     case "test_verdict":
       return `test=${ev.testId} verdict=${ev.verdict} duration=${ev.durationMs.toFixed(0)}ms${
         ev.reason ? ` reason=${ev.reason}` : ""

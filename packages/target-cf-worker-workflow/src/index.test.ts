@@ -1,6 +1,116 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { IrWorkflowStep, IrWorkflowV0 } from "@crewhaus/ir";
 import { TargetEmitError, emitCfWorkerWorkflow } from "./index";
+
+/**
+ * SSE-frame test harness (Batch C, item 3). Executes the emitted worker
+ * in-process against a stubbed Anthropic endpoint (streaming for the final
+ * step, non-streaming JSON for intermediate steps) and collects the SSE frames
+ * the worker's `/chat` returns, so the tests pin the real wire bytes.
+ */
+type SseEvent = { readonly name: string; readonly data: Record<string, unknown> };
+
+function anthropicStreamBody(opts: {
+  input: number;
+  output: number;
+  text: string;
+  stopReason: string;
+}): ReadableStream<Uint8Array> {
+  const frames = [
+    `event: message_start\ndata: ${JSON.stringify({
+      type: "message_start",
+      message: {
+        usage: { input_tokens: opts.input, output_tokens: 1, cache_read_input_tokens: 0 },
+      },
+    })}\n\n`,
+    `event: content_block_delta\ndata: ${JSON.stringify({
+      type: "content_block_delta",
+      delta: { type: "text_delta", text: opts.text },
+    })}\n\n`,
+    `event: message_delta\ndata: ${JSON.stringify({
+      type: "message_delta",
+      delta: { stop_reason: opts.stopReason },
+      usage: { output_tokens: opts.output },
+    })}\n\n`,
+    "event: message_stop\ndata: {}\n\n",
+  ];
+  const enc = new TextEncoder();
+  return new ReadableStream({
+    start(controller) {
+      for (const f of frames) controller.enqueue(enc.encode(f));
+      controller.close();
+    },
+  });
+}
+
+/** Stub Anthropic: JSON for `stream:false` intermediate steps, SSE for the final. */
+function installAnthropicStub(): void {
+  globalThis.fetch = (async (_url: string, init: { body: string }) => {
+    const body = JSON.parse(init.body) as { stream?: boolean };
+    if (body.stream) {
+      return new Response(
+        anthropicStreamBody({ input: 10, output: 5, text: "Final.", stopReason: "end_turn" }),
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      );
+    }
+    return new Response(
+      JSON.stringify({
+        content: [{ type: "text", text: "intermediate output" }],
+        usage: { input_tokens: 7, output_tokens: 3 },
+        stop_reason: "end_turn",
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    );
+  }) as unknown as typeof fetch;
+}
+
+async function loadWorker(code: string): Promise<{
+  fetch: (req: Request, env: Record<string, string>) => Promise<Response>;
+}> {
+  const dir = mkdtempSync(join(tmpdir(), "cfw-wf-"));
+  const file = join(dir, "worker.mjs");
+  writeFileSync(file, code);
+  const mod = (await import(file)).default;
+  rmSync(dir, { recursive: true, force: true });
+  return mod;
+}
+
+async function driveChat(code: string): Promise<SseEvent[]> {
+  const worker = await loadWorker(code);
+  const req = new Request("https://harness.example/chat", {
+    method: "POST",
+    headers: { "content-type": "application/json", origin: "https://studio.crewhaus.ai" },
+    body: JSON.stringify({ messages: [{ role: "user", content: "go" }] }),
+  });
+  const res = await worker.fetch(req, { ANTHROPIC_API_KEY: "sk-test" });
+  const reader = res.body?.getReader();
+  if (!reader) throw new Error("no response body");
+  const dec = new TextDecoder();
+  let buffer = "";
+  const out: SseEvent[] = [];
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += dec.decode(value, { stream: true });
+    let sep = buffer.indexOf("\n\n");
+    while (sep !== -1) {
+      const raw = buffer.slice(0, sep);
+      buffer = buffer.slice(sep + 2);
+      let name = "message";
+      let data = "";
+      for (const line of raw.split("\n")) {
+        if (line.startsWith("event: ")) name = line.slice(7);
+        else if (line.startsWith("data: ")) data += line.slice(6);
+      }
+      if (data) out.push({ name, data: JSON.parse(data) as Record<string, unknown> });
+      sep = buffer.indexOf("\n\n");
+    }
+  }
+  return out;
+}
 
 const step = (over: Partial<IrWorkflowStep> = {}): IrWorkflowStep => ({
   name: "research",
@@ -191,5 +301,89 @@ describe("emitCfWorkerWorkflow — failure_taxonomy ignored-note (item 23)", () 
     expect(emitCfWorkerWorkflow(baseIr).files[0]?.content ?? "").not.toContain(
       "failure_taxonomy configured",
     );
+  });
+});
+
+describe("emitCfWorkerWorkflow — trace SSE frames (Batch C, item 3)", () => {
+  const realFetch = globalThis.fetch;
+  beforeEach(() => {
+    installAnthropicStub();
+  });
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+  });
+
+  const workerCode = (ir: IrWorkflowV0) =>
+    emitCfWorkerWorkflow(ir).files.find((f) => f.path === "worker.js")?.content ?? "";
+
+  test("brackets every step with step_start/step_end + per-step usage/cost, then a done", async () => {
+    const events = await driveChat(workerCode(baseIr)); // baseIr has 3 steps
+    const done = events.find((e) => e.name === "done");
+    expect(done?.data).toEqual({ text: "Final.", stopReason: "end_turn" });
+
+    const traces = events.filter((e) => e.name === "trace");
+    const byKind = (k: string) => traces.filter((e) => e.data["kind"] === k);
+    expect(byKind("step_start")).toHaveLength(3);
+    expect(byKind("step_end")).toHaveLength(3);
+    expect(byKind("model_response")).toHaveLength(3);
+    expect(byKind("cost_accrual")).toHaveLength(3);
+
+    // step_start carries the step name + 1-based index / total.
+    expect(byKind("step_start")[0]?.data).toMatchObject({
+      kind: "step_start",
+      name: "research",
+      step: 1,
+      total: 3,
+    });
+
+    // Intermediate steps report the non-streaming usage (7 in / 3 out); the
+    // final streaming step reports the streamed usage (10 in / 5 out).
+    const responses = byKind("model_response");
+    expect(responses[0]?.data).toMatchObject({
+      model: "claude-haiku-4-5-20251001",
+      usage: { input: 7, output: 3 },
+    });
+    expect(responses[2]?.data).toMatchObject({ usage: { input: 10, output: 5 } });
+
+    // cost_accrual is unpriced (the inlined worker carries no pricing table).
+    expect(byKind("cost_accrual")[0]?.data).toMatchObject({
+      kind: "cost_accrual",
+      provider: "anthropic",
+      inputTokens: 7,
+      outputTokens: 3,
+      costUsdMicros: 0,
+      unpriced: true,
+    });
+  });
+
+  test("the final step's step_start precedes its step_end which precedes done", async () => {
+    const events = await driveChat(workerCode(baseIr));
+    const kindsInOrder = events
+      .filter((e) => e.name === "trace" || e.name === "done")
+      .map((e) => (e.name === "done" ? "done" : (e.data["kind"] as string)));
+    // Last three meaningful markers: model_response, step_end (step 3), done.
+    expect(kindsInOrder[kindsInOrder.length - 1]).toBe("done");
+    expect(kindsInOrder[kindsInOrder.length - 2]).toBe("step_end");
+  });
+
+  // IrWorkflowV0 does not yet carry `observability`; the emitter reads it
+  // structurally (forward-compatible gate). Cast the fixtures to attach it.
+  const withObs = (level: string): IrWorkflowV0 =>
+    ({ ...baseIr, observability: { trace: { level } } }) as unknown as IrWorkflowV0;
+
+  test("observability.trace: off emits NO trace frames (text/done still flow)", async () => {
+    const code = workerCode(withObs("off"));
+    expect(code).toContain("trace: false");
+    const events = await driveChat(code);
+    expect(events.some((e) => e.name === "trace")).toBe(false);
+    expect(events.find((e) => e.name === "done")?.data).toEqual({
+      text: "Final.",
+      stopReason: "end_turn",
+    });
+  });
+
+  test("trace bakes ON by default and for a non-off level", () => {
+    expect(workerCode(baseIr)).toContain("trace: true");
+    expect(workerCode(withObs("json"))).toContain("trace: true");
   });
 });

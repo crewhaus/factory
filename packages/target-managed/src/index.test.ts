@@ -521,3 +521,169 @@ describe("emitManaged — evaluation block (loop contract 0.4, Batch B, G02)", (
     }
   });
 });
+
+describe("emitManaged — runs.subscribe per-run bus registry (contract item 3)", () => {
+  const daemonOf = (over: Partial<IrManagedV0> = {}): string =>
+    emitManaged({ ...ir, ...over }).files.find((f) => f.path === "daemon.ts")?.content ?? "";
+
+  test("daemon imports run-context and holds a tenant-fenced per-run bus registry", () => {
+    const daemon = daemonOf();
+    expect(daemon).toContain(
+      'import { createRunContext, type RunContext } from "@crewhaus/run-context";',
+    );
+    expect(daemon).toContain(
+      'const RUN_BUSES = new Map<string, { tenantId: string; bus: RunContext["eventBus"] }>();',
+    );
+    expect(daemon).toContain("function registerRunBus(runId: string, tenantId: string,");
+    // Bounded so completed runs' buffers don't accumulate forever.
+    expect(daemon).toContain("RUN_BUSES.size > RUN_BUS_CAP");
+  });
+
+  test("resolveRunEvents fences by tenant and replays-then-live-streams the bus atomically", () => {
+    const daemon = daemonOf();
+    expect(daemon).toContain("resolveRunEvents: ({ runId, tenant }) => {");
+    // Tenant fence: unknown OR cross-tenant runId → undefined → 404.
+    expect(daemon).toContain(
+      "if (entry === undefined || entry.tenantId !== tenant.id) return undefined;",
+    );
+    // Atomic snapshot (ring buffer) + live subscribe (no gap between).
+    expect(daemon).toContain("const replay = bus.recent();");
+    expect(daemon).toContain("const close = bus.subscribe(listener);");
+    expect(daemon).toContain("return { replay, close };");
+  });
+
+  test("each run mints + registers its bus up front and returns that runId", () => {
+    const daemon = daemonOf();
+    expect(daemon).toContain("const runId = `run_${Math.random().toString(36).slice(2, 10)}`;");
+    expect(daemon).toContain("const runContext = createRunContext({ runId, sessionId });");
+    expect(daemon).toContain("registerRunBus(runId, tenant.id, runContext.eventBus);");
+    // The response runId is the registered bus's runId (the id a client
+    // subscribes with) — not a second, throwaway id.
+    expect(daemon).toContain("return { runId, sessionId, tenantId: tenant.id, reply };");
+    expect(daemon).not.toContain(
+      "return { runId: `run_${Math.random().toString(36).slice(2, 10)}`,",
+    );
+    // runId is minted BEFORE the run is registered and executed (match the
+    // CALL site, not the `function registerRunBus(runId…)` definition).
+    const callIdx = daemon.indexOf("registerRunBus(runId, tenant.id,");
+    expect(callIdx).toBeGreaterThan(-1);
+    expect(daemon.indexOf("const runId = ")).toBeLessThan(callIdx);
+    expect(callIdx).toBeLessThan(daemon.indexOf("await runOneTurn("));
+  });
+
+  test("the run's trace context is threaded into runOneTurn via extraOptions", () => {
+    const daemon = daemonOf();
+    expect(daemon).toContain("extraOptions: {");
+    expect(daemon).toContain("runContext,");
+  });
+});
+
+describe("emitManaged — G48 durable justification/egress audit sinks (managed slice)", () => {
+  test("the per-tenant hash-chained audit log is wired as both durable sinks", () => {
+    const daemon = emitManaged(ir).files.find((f) => f.path === "daemon.ts")?.content ?? "";
+    // The SAME `log` used for policy audit is threaded as both sinks, so
+    // intent-gate + egress verdicts are tamper-evidenced per tenant.
+    expect(daemon).toContain("justificationAuditSink: log,");
+    expect(daemon).toContain("egressAuditSink: log,");
+    // Both ride the runOneTurn extraOptions (the audit log lives in the daemon,
+    // not agent.ts).
+    const optIdx = daemon.indexOf("extraOptions: {");
+    expect(optIdx).toBeGreaterThan(-1);
+    expect(daemon.indexOf("justificationAuditSink: log,")).toBeGreaterThan(optIdx);
+    expect(daemon.indexOf("egressAuditSink: log,")).toBeGreaterThan(optIdx);
+  });
+});
+
+describe("emitManaged — observability block threading (loop contract 0.4, Batch C, G26)", () => {
+  const daemonOf = (observability?: IrManagedV0["observability"]): string =>
+    emitManaged(observability === undefined ? ir : { ...ir, observability }).files.find(
+      (f) => f.path === "daemon.ts",
+    )?.content ?? "";
+
+  test("a spec with no observability block gets NO observability env stamping (behavior-stable)", () => {
+    const daemon = daemonOf();
+    // Threading is gated on a declared block — an observability-silent spec is
+    // left byte/behavior-stable (no forced fleet-wide cost tracking).
+    expect(daemon).not.toContain("CREWHAUS_COST_TRACKING");
+    expect(daemon).not.toContain("apply the spec's `observability` block");
+    expect(daemon).not.toContain("CREWHAUS_TRACE");
+    expect(daemon).not.toContain("CREWHAUS_METRICS");
+    expect(daemon).not.toContain("CREWHAUS_ALERTS");
+    expect(daemon).not.toContain("CREWHAUS_INCIDENTS");
+    expect(daemon).not.toContain("OTEL_EXPORTER_OTLP_ENDPOINT");
+  });
+
+  test("any declared observability block defaults cost tracking ON (keystone `?? true`)", () => {
+    // Even a slo-only or metrics-only block turns cost ON by default…
+    for (const obs of [
+      { slo: { ttftMs: 1400, mitigation: ["alert"] as const } },
+      { metrics: { enabled: true } },
+    ] satisfies IrManagedV0["observability"][]) {
+      const daemon = daemonOf(obs);
+      expect(daemon).toContain('process.env["CREWHAUS_COST_TRACKING"] ??= "1";');
+      // …stamped before the gateway is constructed (match the construction, not
+      // the `import { createGatewayServer }` line).
+      expect(daemon.indexOf("CREWHAUS_COST_TRACKING")).toBeLessThan(
+        daemon.indexOf("const gateway = createGatewayServer("),
+      );
+    }
+  });
+
+  test("explicit cost:{enabled:false} in a declared block opts out (explicit off wins)", () => {
+    // The block is present (metrics on) so threading runs, but cost is off.
+    const daemon = daemonOf({ cost: { enabled: false }, metrics: { enabled: true } });
+    expect(daemon).not.toContain("CREWHAUS_COST_TRACKING");
+    expect(daemon).toContain('process.env["CREWHAUS_METRICS"] ??= "stdout";');
+  });
+
+  test("trace pretty/json attach the printer; ring/off attach none (buffer retained)", () => {
+    expect(daemonOf({ trace: { level: "pretty" } })).toContain(
+      'process.env["CREWHAUS_TRACE"] ??= "pretty";',
+    );
+    expect(daemonOf({ trace: { level: "json" } })).toContain(
+      'process.env["CREWHAUS_TRACE"] ??= "json";',
+    );
+    // ring is the default (buffer only, needed for runs.subscribe replay) — no
+    // printer env; off degrades to the same (a true buffer-off would break SSE).
+    expect(daemonOf({ trace: { level: "ring" } })).not.toContain("CREWHAUS_TRACE");
+    expect(daemonOf({ trace: { level: "off" } })).not.toContain("CREWHAUS_TRACE");
+  });
+
+  test("metrics / alerts / incidents are opt-in ON when declared", () => {
+    expect(daemonOf({ metrics: { enabled: true } })).toContain(
+      'process.env["CREWHAUS_METRICS"] ??= "stdout";',
+    );
+    expect(daemonOf({ alerts: { enabled: true } })).toContain(
+      'process.env["CREWHAUS_ALERTS"] ??= "1";',
+    );
+    expect(daemonOf({ incidents: { enabled: true } })).toContain(
+      'process.env["CREWHAUS_INCIDENTS"] ??= "1";',
+    );
+    // …and stay off when explicitly disabled.
+    expect(daemonOf({ metrics: { enabled: false } })).not.toContain("CREWHAUS_METRICS");
+  });
+
+  test("otel endpoint is stamped literally, and a $VAR is resolved from env at boot", () => {
+    expect(daemonOf({ otel: { endpoint: "http://localhost:4318" } })).toContain(
+      'process.env["OTEL_EXPORTER_OTLP_ENDPOINT"] ??= "http://localhost:4318";',
+    );
+    const varDaemon = daemonOf({ otel: { endpoint: "$OTLP_URL" } });
+    expect(varDaemon).toContain('const __otel = process.env["OTLP_URL"];');
+    expect(varDaemon).toContain('process.env["OTEL_EXPORTER_OTLP_ENDPOINT"] ??= __otel;');
+    // A bare `otel: {}` (no endpoint) stamps nothing.
+    expect(daemonOf({ otel: {} })).not.toContain("OTEL_EXPORTER_OTLP_ENDPOINT");
+  });
+
+  test("declaring an SLO block activates the monitor env gate (targets ride agent.ts)", () => {
+    const bundle = emitManaged({
+      ...ir,
+      observability: { slo: { ttftMs: 1400, windowMs: 300_000, mitigation: ["alert"] } },
+    });
+    const daemon = bundle.files.find((f) => f.path === "daemon.ts")?.content ?? "";
+    const agent = bundle.files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(daemon).toContain('process.env["CREWHAUS_SLO"] ??= "1";');
+    // The targets themselves still ride agent.ts's runChatLoop call (unchanged).
+    expect(agent).toContain("sloTargets:");
+    expect(agent).toContain('"ttftMs":1400');
+  });
+});

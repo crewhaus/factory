@@ -1365,3 +1365,153 @@ describe("emitChannelBot — evaluation block (loop contract 0.4, Batch B, G02)"
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Loop contract 0.4 (Batch C) — G26 observability env stamps, G48 audit sinks,
+// G11 pending-approval channel surface.
+// ---------------------------------------------------------------------------
+
+describe("emitChannelBot — G26 observability env stamps", () => {
+  test("default (no observability block): cost tracking on, trace ring (no printer)", () => {
+    const daemon = fileMap(MIN_IR).get("daemon.ts") ?? "";
+    expect(daemon).toContain('process.env["CREWHAUS_COST_TRACKING"] ??= "1";');
+    // ring is the default: no printer env, and no metrics/alerts/incidents/otel.
+    expect(daemon).not.toContain("CREWHAUS_TRACE");
+    expect(daemon).not.toContain("CREWHAUS_METRICS");
+    expect(daemon).not.toContain("CREWHAUS_ALERTS");
+    expect(daemon).not.toContain("CREWHAUS_INCIDENTS");
+    expect(daemon).not.toContain("OTEL_EXPORTER_OTLP_ENDPOINT");
+  });
+
+  test("trace pretty/json stamp the printer; metrics/alerts/incidents opt-in on", () => {
+    const daemon =
+      fileMap({
+        ...MIN_IR,
+        observability: {
+          trace: { level: "pretty" },
+          metrics: { enabled: true },
+          alerts: { enabled: true },
+          incidents: { enabled: true },
+        },
+      }).get("daemon.ts") ?? "";
+    expect(daemon).toContain('process.env["CREWHAUS_TRACE"] ??= "pretty";');
+    expect(daemon).toContain('process.env["CREWHAUS_METRICS"] ??= "stdout";');
+    expect(daemon).toContain('process.env["CREWHAUS_ALERTS"] ??= "1";');
+    expect(daemon).toContain('process.env["CREWHAUS_INCIDENTS"] ??= "1";');
+  });
+
+  test("explicit cost:false suppresses the cost stamp; trace off ⇒ no printer", () => {
+    const daemon =
+      fileMap({
+        ...MIN_IR,
+        observability: { cost: { enabled: false }, trace: { level: "off" } },
+      }).get("daemon.ts") ?? "";
+    expect(daemon).not.toContain("CREWHAUS_COST_TRACKING");
+    expect(daemon).not.toContain("CREWHAUS_TRACE");
+  });
+
+  test("otel endpoint: a literal stamps verbatim; a $VAR resolves to that env", () => {
+    const literal =
+      fileMap({ ...MIN_IR, observability: { otel: { endpoint: "https://otlp.example/v1" } } }).get(
+        "daemon.ts",
+      ) ?? "";
+    expect(literal).toContain(
+      'process.env["OTEL_EXPORTER_OTLP_ENDPOINT"] ??= "https://otlp.example/v1";',
+    );
+    const fromVar =
+      fileMap({ ...MIN_IR, observability: { otel: { endpoint: "$OTLP_URL" } } }).get("daemon.ts") ??
+      "";
+    expect(fromVar).toContain(
+      'process.env["OTEL_EXPORTER_OTLP_ENDPOINT"] ??= process.env["OTLP_URL"];',
+    );
+  });
+});
+
+describe("emitChannelBot — G48 durable security audit sink", () => {
+  test("daemon opens one audit-log rooted at .crewhaus/audit (env opt-out)", () => {
+    const daemon = fileMap(MIN_IR).get("daemon.ts") ?? "";
+    expect(daemon).toContain('import { openAuditLog } from "@crewhaus/audit-log";');
+    expect(daemon).toContain('import { join } from "node:path";');
+    expect(daemon).toContain('process.env["CREWHAUS_SECURITY_AUDIT"] === "0"');
+    expect(daemon).toContain('await openAuditLog({ rootDir: join(__cwd, ".crewhaus", "audit") })');
+  });
+
+  test("the sink threads into createAgent and the runChatLoop turn (both gates)", () => {
+    const files = fileMap(MIN_IR);
+    const daemon = files.get("daemon.ts") ?? "";
+    expect(daemon).toContain(
+      "{ justificationAuditSink: __securityAudit, egressAuditSink: __securityAudit }",
+    );
+    const agent = files.get("agent.ts") ?? "";
+    expect(agent).toContain("justificationAuditSink?: JustificationAuditSink;");
+    expect(agent).toContain("egressAuditSink?: EgressAuditSink;");
+    expect(agent).toContain("...(config.justificationAuditSink !== undefined");
+    expect(agent).toContain("...(config.egressAuditSink !== undefined");
+  });
+});
+
+describe("emitChannelBot — G11 pending-approval channel surface (ask_mode pause)", () => {
+  test("daemon constructs the shared approval store and wires it into gateway + router", () => {
+    const daemon = fileMap(MIN_IR).get("daemon.ts") ?? "";
+    expect(daemon).toContain(
+      'import { InMemoryApprovalStore } from "@crewhaus/channel-adapter-base";',
+    );
+    expect(daemon).toContain("const __approvals = new InMemoryApprovalStore();");
+    expect(daemon).toContain("createSessionRouter({ agent, approvals: __approvals })");
+    expect(daemon).toContain("approvals: __approvals,");
+    expect(daemon).toContain("auditSink: __securityAudit,");
+  });
+
+  test("gateway adds the /<adapter>/actions route: verify → resolve → ack → resume", () => {
+    const gateway = fileMap(MIN_IR).get("gateway.ts") ?? "";
+    expect(gateway).toContain('import { resolveApproval } from "@crewhaus/channel-adapter-base";');
+    expect(gateway).toContain("url.pathname.match(/^\\/([^/]+)\\/actions$/)");
+    expect(gateway).toContain("actionAdapter.parseInteraction(actionReq)");
+    // Same signing machinery as an events webhook.
+    expect(gateway).toContain("actionAdapter.verify(actionReq)");
+    expect(gateway).toContain("await resolveApproval({");
+    expect(gateway).toContain("await ackApproval({ interaction, decision: interaction.decision");
+    expect(gateway).toContain("config.sessionRouter.resumeApproval(resolved, actionAdapter)");
+    expect(gateway).toContain("approvals?: ApprovalStore;");
+    expect(gateway).toContain("auditSink?: ApprovalAuditSink;");
+  });
+
+  test("session-router parks on approval_pending and re-drives on resume", () => {
+    const router = fileMap(MIN_IR).get("session-router.ts") ?? "";
+    expect(router).toContain(
+      'import { postApprovalPrompt } from "@crewhaus/channel-adapter-base";',
+    );
+    expect(router).toContain('import { isRunFailedError } from "@crewhaus/errors";');
+    expect(router).toContain('err.report.class === "approval_pending"');
+    expect(router).toContain("await postApprovalPrompt({");
+    expect(router).toContain("sendText: (text) => adapter.sendReply({ event, text })");
+    expect(router).toContain("postInteractive: (approval) => __postApproval({ event, approval })");
+    expect(router).toContain("resumeApproval(approval: PendingApproval, adapter: ChannelAdapter)");
+    expect(router).toContain("const __resumeContexts = new Map<string, InboundEvent>();");
+    expect(router).toContain('if (approval.status !== "grant" || event === undefined) return;');
+  });
+});
+
+describe("emitChannelBot — permissions.ask_mode: deny opts out of the approval surface", () => {
+  const DENY_IR: IrChannelV0 = { ...MIN_IR, permissions: { rules: [], askMode: "deny" } };
+
+  test("no approval store, no actions route, no park/resume wiring", () => {
+    const files = fileMap(DENY_IR);
+    const daemon = files.get("daemon.ts") ?? "";
+    const gateway = files.get("gateway.ts") ?? "";
+    const router = files.get("session-router.ts") ?? "";
+    expect(daemon).not.toContain("InMemoryApprovalStore");
+    expect(daemon).not.toContain("approvals: __approvals");
+    expect(gateway).not.toContain("/actions");
+    expect(gateway).not.toContain("resolveApproval");
+    expect(router).not.toContain("resumeApproval");
+    expect(router).not.toContain("postApprovalPrompt");
+    expect(router).not.toContain("approval_pending");
+  });
+
+  test("G48 audit + G26 observability stay wired regardless of ask_mode", () => {
+    const daemon = fileMap(DENY_IR).get("daemon.ts") ?? "";
+    expect(daemon).toContain('await openAuditLog({ rootDir: join(__cwd, ".crewhaus", "audit") })');
+    expect(daemon).toContain('process.env["CREWHAUS_COST_TRACKING"] ??= "1";');
+  });
+});

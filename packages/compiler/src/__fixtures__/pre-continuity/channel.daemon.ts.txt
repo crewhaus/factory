@@ -14,6 +14,9 @@ import { createGateway } from "./gateway.js";
 import { loadRetentionConfig } from "@crewhaus/data-retention-engine";
 import { createDedupStore } from "@crewhaus/durable-state";
 import { createJanitor } from "@crewhaus/runtime-core";
+import { openAuditLog } from "@crewhaus/audit-log";
+import { InMemoryApprovalStore } from "@crewhaus/channel-adapter-base";
+import { join } from "node:path";
 
 const __requiredEnv = ["PIN_SLACK_BOT_TOKEN","PIN_SLACK_SIGNING_SECRET"];
 // Provider credentials for the agent model — ANY one name per group suffices.
@@ -29,6 +32,11 @@ if (__missingEnv.length > 0) {
   process.exit(2);
 }
 
+// G26 — observability lowered to env stamps (`??=` so an operator's own env
+// still wins). cost tracking + the trace ring are default-on; printers,
+// metrics, alerts, incidents, and OTel export stay opt-in.
+process.env["CREWHAUS_COST_TRACKING"] ??= "1";
+
 const slackAdapter = createSlackAdapter({
   botToken: process.env["PIN_SLACK_BOT_TOKEN"] ?? "",
   signingSecret: process.env["PIN_SLACK_SIGNING_SECRET"] ?? "",
@@ -43,14 +51,31 @@ async function main(): Promise<void> {
     loadCommands({ cwd: __cwd }),
   ]);
   if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));
+  // G48 — durable, hash-chained security audit sink rooted at
+  // <cwd>/.crewhaus/audit. The Pillar 3 justification + egress gates append
+  // here so an unattended daemon's security decisions are tamper-evidenced.
+  // Opt out with CREWHAUS_SECURITY_AUDIT=0.
+  const __securityAudit =
+    process.env["CREWHAUS_SECURITY_AUDIT"] === "0"
+      ? undefined
+      : await openAuditLog({ rootDir: join(__cwd, ".crewhaus", "audit") });
+  // G11 — the shared pending-approval store: the parked turn (session-router)
+  // and the /<adapter>/actions webhook rendezvous here. In-memory default —
+  // volatile, so a restart forgets parked approvals; a durable/cross-process
+  // backend (shared with the `crewhaus approvals` CLI verbs) is a follow-up.
+  const __approvals = new InMemoryApprovalStore();
+
 
   const agent = createAgent({
     hooks: __hooks,
     skills: __skills,
     slashCommands: __slashCommands,
     tools: defaultCatalog.list(),
+    ...(__securityAudit !== undefined
+      ? { justificationAuditSink: __securityAudit, egressAuditSink: __securityAudit }
+      : {}),
   });
-  const sessionRouter = createSessionRouter({ agent });
+  const sessionRouter = createSessionRouter({ agent, approvals: __approvals });
   // SECURITY (audit R3) — replay-dedup backend. Default in-memory; set
   // CREWHAUS_DEDUP_STORE=sqlite:<path> so seen webhook ids survive restarts
   // and are shared by every daemon process on this host.
@@ -58,6 +83,8 @@ async function main(): Promise<void> {
   const gateway = createGateway({
     adapters: new Map([["slack", slackAdapter]]),
     sessionRouter,
+    approvals: __approvals,
+    auditSink: __securityAudit,
     dedupStore: __dedupStore,
   });
 

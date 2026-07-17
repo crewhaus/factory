@@ -10,6 +10,8 @@
 
 export type {
   A2AMessageEvent,
+  ApprovalRequestedEvent,
+  ApprovalResolvedEvent,
   CacheRotationEvent,
   CircuitStateChangedEvent,
   CompactionFiredEvent,

@@ -133,6 +133,20 @@ function renderWorker(ir: IrWorkflowV0, allowedOrigins: readonly string[]): stri
     })
     .join(",\n");
   const allowed = JSON.stringify(allowedOrigins);
+  // Loop contract 0.4 (Batch C, item 3) — the /chat SSE gains `trace` events in
+  // the TraceEvent JSON vocabulary. `observability.trace: off` suppresses them
+  // entirely; every other level (the default "ring", "pretty", "json") emits.
+  // Baked as a literal boolean so the generated worker carries no config parse.
+  //
+  // NOTE: IrWorkflowV0 does not (yet) carry an `observability` field — the Batch
+  // C keystone added it only to the agent-loop shapes (IrV0/cli, IrChannelV0,
+  // IrManagedV0, IrCrewV0). The structural read below keeps the gate
+  // forward-compatible: it defaults to trace-ON today and honours an explicit
+  // `trace: off` the moment the IR + workflow lowering carry it (flagged as a
+  // cross-package need). See the emitter's return notes.
+  const traceEnabled =
+    ((ir as { observability?: { trace?: { level?: string } } }).observability?.trace?.level ??
+      "ring") !== "off";
 
   // Item 23 — surface the ignored failure_taxonomy as a generated comment
   // (mirror of target-workflow's mcp_servers note); the Worker calls the
@@ -150,6 +164,7 @@ const CONFIG = {
 ${steps}
   ],
   allowedOrigins: ${allowed},
+  trace: ${traceEnabled},
 };
 
 const ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
@@ -205,6 +220,14 @@ async function handleChat(request, env, cors) {
       const emit = (event, data) => {
         controller.enqueue(enc.encode(\`event: \${event}\\ndata: \${JSON.stringify(data)}\\n\\n\`));
       };
+      // Loop contract 0.4 (Batch C, item 3) — trace frames are gated on
+      // CONFIG.trace (observability.trace !== "off"). Each step brackets a
+      // step_start/step_end pair and reports its real token usage + an
+      // (unpriced) cost accrual; the inlined worker carries no pricing table
+      // (that ports over with the shared runtime in M2+), so the studio host
+      // reads tokens from model_response.usage and flags the unpriced cost.
+      const emitTrace = (event) => { if (CONFIG.trace) emit("trace", event); };
+      const costEvent = (model, usage) => ({ kind: "cost_accrual", provider: "anthropic", modelId: model, inputTokens: usage.input, outputTokens: usage.output, cachedReadTokens: usage.cacheRead, cacheCreationTokens: usage.cacheCreate, costUsdMicros: 0, unpriced: true });
       const total = CONFIG.steps.length;
       try {
         let priorOutput = "";
@@ -222,11 +245,19 @@ async function handleChat(request, env, cors) {
           // Progress marker so the user sees the workflow advancing. The chat
           // panel appends text deltas, so this renders inline.
           emit("text", { text: \`\\n[step \${stepNum}/\${total}: \${step.name}]\\n\` });
+          emitTrace({ kind: "step_start", name: step.name, step: stepNum, total });
 
           if (i < total - 1) {
-            priorOutput = await runStepNonStreaming(env, step, userContent);
+            const res = await runStepNonStreaming(env, step, userContent);
+            priorOutput = res.text;
+            emitTrace({ kind: "model_response", model: step.model, usage: res.usage, stopReason: res.stopReason, durationMs: res.durationMs });
+            emitTrace(costEvent(step.model, res.usage));
+            emitTrace({ kind: "step_end", name: step.name, step: stepNum, durationMs: res.durationMs });
           } else {
             const final = await runStepStreaming(env, step, userContent, emit);
+            emitTrace({ kind: "model_response", model: step.model, usage: final.usage, stopReason: final.stopReason, durationMs: final.durationMs });
+            emitTrace(costEvent(step.model, final.usage));
+            emitTrace({ kind: "step_end", name: step.name, step: stepNum, durationMs: final.durationMs });
             emit("done", { text: final.text, stopReason: final.stopReason });
           }
         }
@@ -252,9 +283,23 @@ async function handleChat(request, env, cors) {
   });
 }
 
+// Normalize an Anthropic \`usage\` object to the model_response.usage shape.
+function extractUsage(u) {
+  u = u || {};
+  return {
+    input: u.input_tokens || 0,
+    output: u.output_tokens || 0,
+    cacheRead: u.cache_read_input_tokens || 0,
+    cacheCreate: u.cache_creation_input_tokens || 0,
+  };
+}
+
 // One non-streaming Anthropic call. Reads the full JSON response and
-// concatenates the text blocks into a single string.
+// concatenates the text blocks into a single string. Returns the text plus
+// the real token usage, stop reason, and wall-clock duration so the caller can
+// publish the step's model_response / cost_accrual trace frames.
 async function runStepNonStreaming(env, step, userContent) {
+  const t0 = Date.now();
   const upstream = await fetch(ANTHROPIC_URL, {
     method: "POST",
     headers: {
@@ -281,7 +326,12 @@ async function runStepNonStreaming(env, step, userContent) {
       if (block && block.type === "text" && typeof block.text === "string") acc += block.text;
     }
   }
-  return acc;
+  return {
+    text: acc,
+    usage: extractUsage(payload && payload.usage),
+    stopReason: (payload && payload.stop_reason) || "end_turn",
+    durationMs: Date.now() - t0,
+  };
 }
 
 // One streaming Anthropic call. Translates Anthropic's SSE stream into the
@@ -289,6 +339,7 @@ async function runStepNonStreaming(env, step, userContent) {
 // \`done\`). Buffers across chunks because events can split mid-line. Returns
 // the accumulated text + stop reason for the \`done\` event.
 async function runStepStreaming(env, step, userContent, emit) {
+  const t0 = Date.now();
   const upstream = await fetch(ANTHROPIC_URL, {
     method: "POST",
     headers: {
@@ -315,6 +366,9 @@ async function runStepStreaming(env, step, userContent, emit) {
   let buffer = "";
   let acc = "";
   let stopReason = "end_turn";
+  // Real token usage from Anthropic's own SSE: message_start seeds the input/
+  // cache counts, message_delta carries the final output tally.
+  let usage = { input: 0, output: 0, cacheRead: 0, cacheCreate: 0 };
   while (true) {
     const { value, done } = await reader.read();
     if (done) break;
@@ -332,15 +386,18 @@ async function runStepStreaming(env, step, userContent, emit) {
       if (!data || data === "[DONE]") continue;
       let payload;
       try { payload = JSON.parse(data); } catch { continue; }
-      if (eventName === "content_block_delta" && payload.delta && payload.delta.type === "text_delta") {
+      if (eventName === "message_start" && payload.message && payload.message.usage) {
+        usage = extractUsage(payload.message.usage);
+      } else if (eventName === "content_block_delta" && payload.delta && payload.delta.type === "text_delta") {
         acc += payload.delta.text;
         emit("text", { text: payload.delta.text });
-      } else if (eventName === "message_delta" && payload.delta && payload.delta.stop_reason) {
-        stopReason = payload.delta.stop_reason;
+      } else if (eventName === "message_delta") {
+        if (payload.delta && payload.delta.stop_reason) stopReason = payload.delta.stop_reason;
+        if (payload.usage && typeof payload.usage.output_tokens === "number") usage.output = payload.usage.output_tokens;
       }
     }
   }
-  return { text: acc, stopReason };
+  return { text: acc, stopReason, usage, durationMs: Date.now() - t0 };
 }
 
 function normalizeMessages(raw) {
