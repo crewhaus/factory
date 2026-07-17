@@ -63,6 +63,7 @@ import {
 } from "@crewhaus/eval-report";
 import {
   type EvalRunSummary,
+  type GraderLookup,
   createExamRunner,
   runEval as runEvalLib,
 } from "@crewhaus/eval-runner";
@@ -74,7 +75,7 @@ import {
   type ParsedArgs,
   parseArgs,
 } from "@crewhaus/infra-utils";
-import { GENERATED_README_MARKER, type IrBudget } from "@crewhaus/ir";
+import { GENERATED_README_MARKER, type IrBudget, projectLoop } from "@crewhaus/ir";
 import { createLogger } from "@crewhaus/logging";
 import { McpHost, resolveMcpServerConfig } from "@crewhaus/mcp-host";
 // PR 10 — the memory fabric's composition root: `crewhaus run` makes the
@@ -378,6 +379,13 @@ import {
   parseModelsFlag,
   runMatrixCells,
 } from "./eval-matrix";
+// Loop contract 0.4 (Batch B) — shared eval-loop CLI helpers: the G14
+// default-registry construction rule, the G56 partial-credit fitness figure
+// the optimize/flywheel search ranks by, and the `[eval]` stdout block
+// (partial_score / loop metrics / pass@k–pass^k / failure classes / judge
+// calibration notes), in a side-effect-free module so all of it is
+// unit-testable (this entry file runs an argv switch on import).
+import { evalRunOutputLines, fitnessScore, graderRegistryForCompiled } from "./eval-output";
 // Item 30 — model-drift sentinel comparison logic, in a side-effect-free
 // module so it is unit-testable (this entry file runs an argv switch on
 // import). The fresh run + baseline load happen in index.ts; this decides drift.
@@ -623,6 +631,11 @@ import {
   mergeSpecHooks,
   resolveStreaming,
 } from "./loop-contract";
+// Loop contract 0.4 (Batch B, G42) — the human-readable `compile
+// --emit-loop` rendering of `projectLoop`'s wire-contract projection, in a
+// side-effect-free module so it is unit-testable (this entry file runs an
+// argv switch on import).
+import { formatLoopProjection } from "./loop-view";
 // Item 60 — the marketplace CLI core: registry-source resolution, the
 // outdated freshness compare, list/outdated formatters, and the publish PR
 // plan, in a side-effect-free module so it is unit-testable (this entry file
@@ -872,8 +885,23 @@ import {
   renderSecurityDigestHtml,
   renderSecurityDigestText,
 } from "./security-digest";
+// Loop contract 0.4 (Batch B, G53) — `sessions export --format trajectories`
+// assembly ((state, action, observation, reward) tuples from session event
+// logs + trace events, terminal-sparse reward ladder), in a side-effect-free
+// module so it is unit-testable (this entry file runs an argv switch on
+// import).
+import {
+  type TrajectoryStep,
+  assembleTrajectory,
+  parseJsonlLoose,
+  trajectoryStepsToJsonl,
+} from "./sessions-export";
 // Item #57 — summarize sessions into a durable index before TTL eviction.
-import { SESSIONS_INDEX_DIRNAME, summarizeSessionIntoIndex } from "./sessions-index";
+import {
+  SESSIONS_INDEX_DIRNAME,
+  parseSessionLog,
+  summarizeSessionIntoIndex,
+} from "./sessions-index";
 // Item 37 — SLO/TTFT doctor probe + mitigation-ladder sink, in side-effect-free
 // modules (this entry file runs an argv switch on import) mirroring
 // doctor-checks.ts / alert-sink.ts.
@@ -974,6 +1002,12 @@ const COMPILE_SCHEMA: ParseArgsSchema = {
   flags: [
     { name: "out", short: "o", takesValue: true },
     { name: "emit-ir", takesValue: false },
+    // Loop contract 0.4 (Batch B, G42) — print projectLoop() of the lowered
+    // IR (the studio /builder + compiler-worker POST /loop wire contract)
+    // instead of emitting code. Human-readable by default; --json prints the
+    // raw LoopProjection; with -o writes <out-dir>/loop.json.
+    { name: "emit-loop", takesValue: false },
+    { name: "json", takesValue: false },
     // FR-002 made the strict scope gate DEFAULT-ON, which left `--strict` an
     // accepted no-op. Loop contract 0.4 (Batch A) gives it real meaning
     // again: escalate compile WARNINGS (accepted-but-unwired spec keys) to
@@ -1443,6 +1477,10 @@ const EVAL_SCHEMA: ParseArgsSchema = {
     { name: "judge-model", takesValue: true },
     { name: "concurrency", takesValue: true },
     { name: "seed", takesValue: true },
+    // Loop contract 0.4 (Batch B, G15) — trials per sample: run every sample
+    // K times (seed-offset when --seed is set); aggregates gain pass@K /
+    // pass^K and the per-sample results carry per-trial grades.
+    { name: "repeats", takesValue: true },
     // Item 11 — benchmark matrix: run the same dataset+graders once per
     // model; each cell writes to <out>/<model-slug>/. Incompatible with
     // --gate/--no-promote (cells skip the run-history lineage entirely).
@@ -1639,6 +1677,10 @@ const SESSIONS_SCHEMA: ParseArgsSchema = {
     { name: "evicted", takesValue: false },
     // TTL for the --evicted eviction pass (days). Default: session-store's 30.
     { name: "ttl-days", takesValue: true },
+    // Loop contract 0.4 (Batch B, G53) — `sessions export`: the export shape
+    // (only "trajectories" today) and where the JSONL lands (default stdout).
+    { name: "format", takesValue: true },
+    { name: "out", short: "o", takesValue: true },
     { name: "help", short: "h" },
   ],
 };
@@ -2356,10 +2398,19 @@ function parseFor(rest: ReadonlyArray<string>, schema: ParseArgsSchema): ParsedA
 async function runCompile(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
-      "usage: crewhaus compile <spec.yaml> [-o <out-dir>] [--emit-ir] [--check]\n" +
+      "usage: crewhaus compile <spec.yaml> [-o <out-dir>] [--emit-ir] [--emit-loop [--json]] [--check]\n" +
         "                        [--allow-unmarked-sinks] [--no-readme] [--no-register]\n" +
         "  --emit-ir  Skip code emission; print the lowered IR as JSON to\n" +
         "             stdout (or to <out-dir>/ir.json when -o is set).\n" +
+        "  --emit-loop  Skip code emission; print the canonical agent-loop\n" +
+        "             projection (projectLoop of the lowered IR) — the exact\n" +
+        "             wire shape the studio /builder renders and the\n" +
+        "             compiler-worker's POST /loop returns. Human-readable by\n" +
+        "             default; --json prints the raw LoopProjection JSON; with\n" +
+        "             -o it writes <out-dir>/loop.json instead. A read-only\n" +
+        "             view: nothing is emitted, and (matching POST /loop) the\n" +
+        "             FR-002 scope gate does not run, so you can inspect the\n" +
+        "             loop of a spec whose tool scopes still need fixing.\n" +
         "  --check    After emitting, verify the bundle: run the target shape's\n" +
         "             smoke assertion, `bun install` its deps in the out-dir, and\n" +
         "             boot it once credential-free (liveness only — shapes whose\n" +
@@ -2421,8 +2472,16 @@ async function runCompile(args: ParsedArgs): Promise<void> {
   const specPath = args.positional[0];
   const outDir = args.flags["out"];
   const emitIr = args.flags["emit-ir"] === true;
+  // Loop contract 0.4 (Batch B, G42) — `--emit-loop` is a print mode like
+  // --emit-ir: exactly one of them may own stdout, and neither emits files
+  // for --check to verify.
+  const emitLoop = args.flags["emit-loop"] === true;
   const check = args.flags["check"] === true;
   if (check && emitIr) die("--check verifies emitted files — it cannot combine with --emit-ir");
+  if (check && emitLoop) die("--check verifies emitted files — it cannot combine with --emit-loop");
+  if (emitIr && emitLoop) {
+    die("--emit-ir and --emit-loop are mutually exclusive (each owns stdout)");
+  }
   // FR-002 — the strict scope gate is DEFAULT-ON. It runs unless the user
   // explicitly opts out with --allow-unmarked-sinks (or its alias
   // --no-strict-scope). `--strict` is now a no-op kept for back-compat.
@@ -2434,7 +2493,7 @@ async function runCompile(args: ParsedArgs): Promise<void> {
   // Item 46 — registry auto-put + changelog, DEFAULT-ON; --no-register opts out.
   const register = args.flags["no-register"] !== true;
   if (typeof specPath !== "string") die("missing <spec.yaml>");
-  if (!emitIr && typeof outDir !== "string") die("missing -o <out-dir>");
+  if (!emitIr && !emitLoop && typeof outDir !== "string") die("missing -o <out-dir>");
 
   // Loop contract 0.4 (Batch A) — `--strict` escalates compile warnings
   // (accepted-but-unwired spec keys) to errors. Distinct from the FR-002
@@ -2468,6 +2527,41 @@ async function runCompile(args: ParsedArgs): Promise<void> {
   // it into the bundle's `runChatLoop({ egressMatcher })`), so a compiled
   // artifact honours the selection WITHOUT the `run` path. No compile-time
   // warning is needed anymore — emission replaced the warn-only shim.
+
+  // Loop contract 0.4 (Batch B, G42) — `--emit-loop`: parse → lower →
+  // projectLoop, print, done. Deliberately runs BEFORE the FR-002 scope gate
+  // below: the projection is a read-only VIEW (no artifact is produced, so
+  // there is nothing whose egress scopes need gating), and it must return
+  // exactly what the compiler-worker's POST /loop endpoint (which runs no
+  // gate) returns for the same YAML — including specs the gate would refuse,
+  // so an operator can SEE the loop before fixing scopes.
+  if (emitLoop) {
+    let ir: ReturnType<typeof lower>;
+    try {
+      ir = lower(parseSpec(yamlText));
+    } catch (err) {
+      // parseSpec throws SpecParseError; lower() can throw CompilerError.
+      // Both extend CrewhausError — clean one-liner instead of a stack trace.
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
+    const projection = projectLoop(ir);
+    if (typeof outDir === "string") {
+      const absOut = resolve(outDir);
+      mkdirSync(absOut, { recursive: true });
+      const loopPath = join(absOut, "loop.json");
+      writeFileSync(loopPath, `${JSON.stringify(projection, null, 2)}\n`);
+      process.stdout.write(`wrote ${loopPath}\n`);
+    } else if (args.flags["json"] === true) {
+      process.stdout.write(`${JSON.stringify(projection, null, 2)}\n`);
+    } else {
+      for (const line of formatLoopProjection(projection)) {
+        process.stdout.write(`${line}\n`);
+      }
+    }
+    logger.debug("compile.emit-loop.success", { out: outDir ?? "stdout" });
+    return;
+  }
 
   // FR-002 — strict scope gate, now DEFAULT-ON. Lower the spec (pure), resolve
   // every referenced built-in tool name to its RegisteredTool, and audit scopes
@@ -5921,6 +6015,11 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
     gradersYaml = (ratingsDistill as { gradersYaml: string }).gradersYaml;
   }
   const { compiled } = parseGradersConfig(gradersYaml);
+  // G14 — same registry-construction rule as `crewhaus eval`: `type:
+  // registry` graders get the default registry, built ONCE here and reused
+  // by every fitness eval the search runs (N candidate evals must not
+  // re-discover plugins per pass).
+  const graderRegistry = await graderRegistryForCompiled(compiled);
 
   // Materialize the training set once — we'll re-iterate per fitness call. It
   // is the union of the file dataset (if any) and the distilled ratings (if
@@ -6032,6 +6131,7 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
       runId,
       outDir,
       compiled,
+      ...(graderRegistry !== undefined ? { graderRegistry } : {}),
       devSet,
       datasetName,
       concurrency,
@@ -6118,6 +6218,7 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
         concurrency,
         seed,
         retryErrors,
+        ...(graderRegistry !== undefined ? { graderRegistry } : {}),
       },
     });
     // Item 7 — failure-arbiter pre-filter: classify this candidate's failing
@@ -6161,7 +6262,12 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
       });
     // Item 9 — report where this measurement's eval run was persisted so
     // the optimizer can surface the baseline/winner dirs for pinning.
-    return { score: summary.aggregates.passRate, grades, runDir: summary.outDir };
+    // G56 — the search ranks candidates by PARTIAL CREDIT when the runner
+    // emitted it (partialScoreMean: mean overall score over ALL samples,
+    // errored ones scoring 0), falling back to passRate on older summaries —
+    // a candidate that moves failing answers closer to the bar now measures
+    // as progress even before whole samples flip.
+    return { score: fitnessScore(summary.aggregates), grades, runDir: summary.outDir };
   };
 
   const mutator = args.flags["mutator"];
@@ -6307,6 +6413,8 @@ async function runOptimizeFromAdvice(opts: {
   readonly runId: string;
   readonly outDir: string;
   readonly compiled: ReadonlyArray<CompiledGrader>;
+  /** G14 — the shared default registry (when the graders opt into one). */
+  readonly graderRegistry?: GraderLookup;
   readonly devSet: ReadonlyArray<{ id: string; input: string; expected_output?: string }>;
   readonly datasetName: string;
   readonly concurrency: number;
@@ -6368,6 +6476,7 @@ async function runOptimizeFromAdvice(opts: {
         concurrency: opts.concurrency,
         seed: opts.seed,
         retryErrors: opts.retryErrors,
+        ...(opts.graderRegistry !== undefined ? { graderRegistry: opts.graderRegistry } : {}),
       },
     });
     process.stdout.write(
@@ -6714,6 +6823,10 @@ async function runFlywheelRun(args: ParsedArgs): Promise<void> {
     die(`could not read ${data.graders}: ${(err as Error).message}`);
   }
   const { compiled } = parseGradersConfig(gradersYaml);
+  // G14 — same registry-construction rule as `eval`/`optimize`: built ONCE
+  // and shared by the before/after acceptance evals and every per-iteration
+  // fitness eval.
+  const graderRegistry = await graderRegistryForCompiled(compiled);
 
   // Materialize the dataset once (file path or registry: ref) — the same
   // sample set feeds the before eval, the optimizer's dev evals, and the
@@ -6846,6 +6959,7 @@ async function runFlywheelRun(args: ParsedArgs): Promise<void> {
         seed: knobs.seed,
         datasetHash,
         retryErrors: true,
+        ...(graderRegistry !== undefined ? { graderRegistry } : {}),
       },
     });
     process.stdout.write(
@@ -6899,6 +7013,7 @@ async function runFlywheelRun(args: ParsedArgs): Promise<void> {
         concurrency: knobs.concurrency,
         seed: knobs.seed,
         retryErrors: true,
+        ...(graderRegistry !== undefined ? { graderRegistry } : {}),
       },
     });
     let excludedFromSignal: ReadonlySet<string> = new Set<string>();
@@ -6931,7 +7046,10 @@ async function runFlywheelRun(args: ParsedArgs): Promise<void> {
           rationale: r.grades.overall.rationale,
         };
       });
-    return { score: summary.aggregates.passRate, grades, runDir: summary.outDir };
+    // G56 — partial credit when the runner emitted it (see the optimize
+    // fitness fn): the acceptance GATE still compares pass rates, only the
+    // search's candidate ranking gains the gradient.
+    return { score: fitnessScore(summary.aggregates), grades, runDir: summary.outDir };
   };
 
   let optimizeResult: Awaited<ReturnType<typeof optimizeSpec>> | undefined;
@@ -7279,7 +7397,7 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
       "usage: crewhaus eval <spec.yaml> --dataset <data> --graders <graders.yaml> " +
-        "[--judge-model <model>] [--concurrency N] [--seed N] [-o <out-dir>] " +
+        "[--judge-model <model>] [--concurrency N] [--seed N] [--repeats K] [-o <out-dir>] " +
         "[--gate] [--no-promote] [--no-regressions] [--no-retry] [--models <m1,m2,...>]\n" +
         "  --dataset takes a file path (jsonl/csv/yaml/http) or registry:<name>[@version][#split]\n" +
         "  — a Section 29 dataset-registry ref (.crewhaus/datasets, or CREWHAUS_DATASETS_DIR).\n" +
@@ -7302,6 +7420,25 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
         "  noise, not a graded failure) are retried once by default; the retried outcome\n" +
         "  replaces the errored one and is tagged retried:true in results.json (the summary\n" +
         "  line and run index report the retried count). --no-retry disables the retry.\n" +
+        "  When the spec declares a failure_taxonomy, a sample's final error is classified\n" +
+        "  against it (results.json failureClass + a `failure classes:` output tally), and\n" +
+        "  a matched class declaring `recovery: fail` SUPPRESSES the noise auto-retry —\n" +
+        "  the user declared that error terminal, so re-running it is futile.\n" +
+        "  --repeats K runs every sample K times (trial t gets seed+t-1 when --seed is\n" +
+        "  set; i.i.d. draws otherwise). Trial 1 is the canonical result; per-trial grades\n" +
+        "  land on the sample (results.json trials[]) and the aggregates gain pass@K (at\n" +
+        "  least one trial passed — the optimistic capability metric) and pass^K (ALL K\n" +
+        "  passed — tau-bench's reliability metric: a flaky 60%-reliable agent scores\n" +
+        "  0.6^K). Trials run sequentially inside each sample's concurrency slot, so a\n" +
+        "  K-repeat run costs ~K× the wall clock and spend; the summary's\n" +
+        "  tokens_all_trials makes the real spend visible.\n" +
+        "  Graders with `type: registry` resolve against the default grader registry:\n" +
+        "  the six specialty packs (continuity.*, twelve.*, nlg.*, semantic.similarity,\n" +
+        "  multimodal.*, safety.*) plus .crewhaus/graders plugins, which win on name\n" +
+        "  collisions. Constructed once per run and shared with every matrix cell.\n" +
+        "  llm_judge rubrics that declare no passing_score gate on the calibrated cut\n" +
+        "  from .crewhaus/judge-calibration.json when present (`crewhaus judge calibrate\n" +
+        "  --apply`); the run output and run.json note every grader gated this way.\n" +
         "  After the run, every failing sample is triaged by the failure arbiter into\n" +
         "  bug / spec-gap / noise / contract-ambiguity: verdicts land in <out>/verdicts.json\n" +
         "  + a report section + a one-line `triage:` summary. Triage never pins samples the\n" +
@@ -7402,6 +7539,17 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
   if (seed !== undefined && Number.isNaN(seed)) {
     die(`invalid --seed "${seedFlag}" — must be integer`);
   }
+  // G15 — trials per sample. Validated strictly here ("3.5"/"3x" die rather
+  // than silently truncate) so a bad value is loud BEFORE any dataset load or
+  // spend, mirroring the runner's own integer>=1 guard.
+  const repeatsFlag = args.flags["repeats"];
+  const repeats = typeof repeatsFlag === "string" ? Number.parseInt(repeatsFlag, 10) : undefined;
+  if (
+    repeats !== undefined &&
+    (Number.isNaN(repeats) || repeats < 1 || String(repeats) !== (repeatsFlag as string).trim())
+  ) {
+    die(`invalid --repeats "${repeatsFlag}" — must be a positive integer`);
+  }
 
   const absSpec = resolve(specPath);
   let yamlText: string;
@@ -7432,6 +7580,11 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
   // results.json so `--sentinel` can assert a fresh run graded with the same
   // rubric/thresholds as the baseline (see hashGradersConfig doc comment).
   const gradersHash = hashGradersConfig(gradersConfig);
+  // G14 — graders that resolve by registry name get the default registry
+  // (six specialty packs + .crewhaus/graders plugins), constructed ONCE here
+  // and shared with every matrix cell; `runEval` has the identical fallback,
+  // so the vocabulary cannot differ between the CLI and library paths.
+  const graderRegistry = await graderRegistryForCompiled(compiled);
 
   // Item 12 — `--dataset registry:<name>[@version][#split]` resolves via the
   // Section 29 dataset registry instead of loadDataset. datasetName becomes
@@ -7523,6 +7676,8 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
       ...(typeof outDirArg === "string" ? { outDirArg } : {}),
       ...(concurrency !== undefined ? { concurrency } : {}),
       ...(seed !== undefined ? { seed } : {}),
+      ...(repeats !== undefined ? { repeats } : {}),
+      ...(graderRegistry !== undefined ? { graderRegistry } : {}),
       ...(typeof judgeModelFlag === "string" ? { judgeModel: judgeModelFlag } : {}),
     });
   }
@@ -7548,6 +7703,8 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
       retryErrors,
       ...(concurrency !== undefined ? { concurrency } : {}),
       ...(seed !== undefined ? { seed } : {}),
+      ...(repeats !== undefined ? { repeats } : {}),
+      ...(graderRegistry !== undefined ? { graderRegistry } : {}),
       ...(typeof judgeModelFlag === "string" ? { judgeModel: judgeModelFlag } : {}),
     },
   });
@@ -7586,10 +7743,13 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
       baselineDatasetHash,
       currentDatasetHash: datasetHash,
     });
-    process.stdout.write(
-      `[eval] runId=${summary.runId} pass_rate=${(summary.aggregates.passRate * 100).toFixed(1)}% ` +
-        `mean_score=${summary.aggregates.meanScore.toFixed(3)}\n`,
-    );
+    // Same output block as a normal run (Batch B: partial_score / loop
+    // metrics / repeats / failure classes / calibration notes) — a sentinel
+    // is still a run someone reads.
+    const sentinelRetried = summary.samples.filter((s) => s.retried === true).length;
+    for (const line of evalRunOutputLines(summary, { retriedCount: sentinelRetried })) {
+      process.stdout.write(`${line}\n`);
+    }
     process.stdout.write(`[eval] report: ${join(absOut, "index.html")}\n`);
     process.stdout.write(`[sentinel] ${result.verdict}: ${result.reason}\n`);
     if (result.alert) {
@@ -7632,14 +7792,13 @@ async function runEvalSubcommand(args: ParsedArgs): Promise<void> {
 
   // Item 7/F12 — surface retry activity: how many recorded outcomes replaced
   // an errored first attempt (also recorded in the run index as retriedCount).
+  // Batch B: the classic summary line plus the presence-gated partial_score /
+  // loop-metrics / pass@k–pass^k / failure-class / judge-calibration lines
+  // (see eval-output.ts — each prints only when the run carries the data).
   const retriedCount = summary.samples.filter((s) => s.retried === true).length;
-  process.stdout.write(
-    `[eval] runId=${summary.runId} pass_rate=${(summary.aggregates.passRate * 100).toFixed(1)}% ` +
-      `mean_score=${summary.aggregates.meanScore.toFixed(3)} ` +
-      `errors=${summary.aggregates.errorCount} ` +
-      `tokens=${summary.aggregates.totalTokens.input}/${summary.aggregates.totalTokens.output}` +
-      `${retriedCount > 0 ? ` (${retriedCount} retried)` : ""}\n`,
-  );
+  for (const line of evalRunOutputLines(summary, { retriedCount })) {
+    process.stdout.write(`${line}\n`);
+  }
   process.stdout.write(`[eval] report: ${join(absOut, "index.html")}\n`);
 
   // Run-history: append to the index, diff/gate against the pinned baseline,
@@ -7684,6 +7843,10 @@ async function runEvalMatrixCommand(opts: {
   readonly outDirArg?: string;
   readonly concurrency?: number;
   readonly seed?: number;
+  /** G15 — `--repeats`, threaded into every cell (per-cell pass@k/pass^k). */
+  readonly repeats?: number;
+  /** G14 — the shared default registry, constructed once for all cells. */
+  readonly graderRegistry?: GraderLookup;
   readonly judgeModel?: string;
 }): Promise<void> {
   const rootDir =
@@ -7711,6 +7874,8 @@ async function runEvalMatrixCommand(opts: {
           retryErrors: opts.retryErrors,
           ...(opts.concurrency !== undefined ? { concurrency: opts.concurrency } : {}),
           ...(opts.seed !== undefined ? { seed: opts.seed } : {}),
+          ...(opts.repeats !== undefined ? { repeats: opts.repeats } : {}),
+          ...(opts.graderRegistry !== undefined ? { graderRegistry: opts.graderRegistry } : {}),
           ...(opts.judgeModel !== undefined ? { judgeModel: opts.judgeModel } : {}),
         },
       });
@@ -10415,20 +10580,93 @@ async function runLessons(args: ParsedArgs): Promise<void> {
  */
 async function runSessions(args: ParsedArgs): Promise<void> {
   const action = args.positional[0];
-  if (args.flags["help"] === true && action === undefined) {
+  if (args.flags["help"] === true) {
     process.stdout.write(
       "usage: crewhaus sessions summarize [--before <date>] [--evicted] [--ttl-days N]\n" +
-        "  Summarize sessions (outcome, tools, ratings, key facts) into the durable\n" +
+        "       crewhaus sessions export --format trajectories [--out <file.jsonl>]\n" +
+        "  summarize: fold sessions (outcome, tools, ratings, key facts) into the durable\n" +
         "  .crewhaus/sessions-index/ before their transcripts expire (30-day TTL).\n" +
-        "  --evicted runs a TTL eviction pass and indexes each session just before it is deleted.\n",
+        "  --evicted runs a TTL eviction pass and indexes each session just before it is deleted.\n" +
+        "\n" +
+        "  export --format trajectories: one JSONL line per agent step — a\n" +
+        "  (state, action, observation, reward) tuple — assembled from every session\n" +
+        "  event log under .crewhaus/sessions (plus a session's trace events when a\n" +
+        "  sibling <id>.events.jsonl exists). state is the full verbatim message prefix\n" +
+        "  before the action (so lines are independently consumable, at O(n²) size for\n" +
+        "  long sessions); action is the assistant's text and/or tool calls (one model\n" +
+        "  response = one action); observation is the tool results the environment\n" +
+        "  returned (null for a plain text turn). reward is terminal-sparse — null on\n" +
+        "  every step except the session's last, which carries: the last eval_graded\n" +
+        "  score when the session has one, else the latest user rating normalized to\n" +
+        "  [0,1] (thumbs up→1/down→0, stars (n-1)/4 — the distill convention), else\n" +
+        "  null. rewardSource says which rung fired. --out writes the JSONL to a file;\n" +
+        "  omitted, it streams to stdout (the summary line then goes to stderr).\n" +
+        "\n" +
+        "  G53 posture — trajectory RL is EXPERIMENTAL: inference-time scaffolding\n" +
+        "  (eval → optimize → flywheel) is the mature improvement lane, and published\n" +
+        "  results still show trajectory-level RL on agent scaffolds collapsing. This\n" +
+        "  export exists so an external trainer can consume real sessions; the\n" +
+        "  meta-harness optimizer stays an opt-in experiment and is deliberately NOT\n" +
+        "  wired into `crewhaus optimize` in this batch (there is no --mutator\n" +
+        "  meta-harness).\n",
     );
     return;
   }
-  if (action !== "summarize") {
-    die(`sessions: unknown action "${action ?? ""}" — supported: summarize`);
+  if (action !== "summarize" && action !== "export") {
+    die(`sessions: unknown action "${action ?? ""}" — supported: summarize, export`);
   }
   const sessionsDir = join(process.cwd(), SESSIONS_SUBDIR);
   const indexDir = join(process.cwd(), ".crewhaus", SESSIONS_INDEX_DIRNAME);
+
+  // Loop contract 0.4 (Batch B, G53) — `sessions export --format trajectories`.
+  if (action === "export") {
+    const format = strFlag(args, "format");
+    if (format !== "trajectories") {
+      die(
+        `sessions export: unsupported --format "${format ?? ""}" — supported: trajectories (see \`crewhaus sessions --help\` for the tuple shape and the G53 posture)`,
+      );
+    }
+    const ids = listSessionIds(sessionsDir).sort();
+    if (ids.length === 0) die(`no sessions found under ${sessionsDir}`);
+    const steps: TrajectoryStep[] = [];
+    let sessionsWithSteps = 0;
+    for (const id of ids) {
+      let text: string;
+      try {
+        text = readFileSync(join(sessionsDir, `${id}.jsonl`), "utf-8");
+      } catch {
+        continue; // evicted between listing and read — skip, never abort
+      }
+      const events = parseSessionLog(text);
+      // A session's persisted trace events, when present (the eval
+      // per-sample artifact convention, `<id>.events.jsonl` here) — the
+      // carrier of `eval_graded` reward signal.
+      const tracePath = join(sessionsDir, `${id}.events.jsonl`);
+      const traceEvents = existsSync(tracePath)
+        ? parseJsonlLoose(readFileSync(tracePath, "utf-8"))
+        : [];
+      const sessionSteps = assembleTrajectory(id, events, traceEvents);
+      if (sessionSteps.length > 0) sessionsWithSteps += 1;
+      steps.push(...sessionSteps);
+    }
+    const jsonl = trajectoryStepsToJsonl(steps);
+    const summaryLine =
+      `[sessions] exported ${steps.length} trajectory step(s) from ` +
+      `${sessionsWithSteps}/${ids.length} session(s)`;
+    const outFlag = strFlag(args, "out");
+    if (outFlag !== undefined) {
+      const outPath = resolve(outFlag);
+      mkdirSync(dirname(outPath), { recursive: true });
+      writeFileSync(outPath, jsonl);
+      process.stdout.write(`${summaryLine} → ${outPath}\n`);
+    } else {
+      // JSONL owns stdout so the export is pipeable; the human line goes to
+      // stderr.
+      process.stdout.write(jsonl);
+      process.stderr.write(`${summaryLine}\n`);
+    }
+    return;
+  }
 
   if (args.flags["evicted"] === true) {
     // Summarize-before-evict: wire the session-store hook so each expiring

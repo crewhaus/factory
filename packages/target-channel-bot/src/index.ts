@@ -363,6 +363,122 @@ function renderLimitsFields(ir: IrChannelV0): string {
   return pieces.join("");
 }
 
+/**
+ * Loop contract 0.4 (Batch B, G02) — render the in-loop `evaluation:` wiring
+ * for the interactive turn. The bundle constructs the evaluate fn from the
+ * RESOLVED IR grader at module scope in agent.ts and threads it — together
+ * with the resolved gate knobs — into the interactive `runChatLoop` call's
+ * `evaluation` option; the runtime scores each completed assistant turn,
+ * compares against `threshold`, applies `onFail` (retry ≤ `maxRetries` with
+ * the rationale appended as a system nudge / halt as a classified
+ * `evaluation` failure / note as an `eval_graded` trace event only) and
+ * emits one `eval_graded` event per grading pass.
+ *
+ *   - `llm_judge` rides `@crewhaus/eval-judge`'s `judge()` (the offline
+ *     eval-judge scoring path: single-criterion rubric from `criteria`, 1–5
+ *     score mapped to [0,1] via (n-1)/4, prompt-injection-hardened
+ *     sentinels). The judge model resolves through the SAME model-router
+ *     adapter wiring the bundle's primary model uses, so judge spend is
+ *     metered exactly like every other model call; the model defaults to
+ *     the shape's primary model when the spec omitted `grader.model`
+ *     (`cheapest` already resolved at lower time). `threshold` was resolved
+ *     at lower time (default 0.7) — the `?? 0.7` is a defensive floor for
+ *     hand-built IR.
+ *   - `contains` / `regex` are emitted as pure fns (score 1 on pass, 0 on
+ *     fail; no model spend, no import). `lastIndex` is reset per call so a
+ *     global/sticky flag can never flip-flop verdicts across turns.
+ *
+ * The dream path deliberately carries NO evaluation — its bounded fresh
+ * session is a consolidation pass, not a served answer. The emitted literal
+ * is annotated `RunEvaluation` (runtime-core's seam type), so a compiled
+ * bundle typechecks against the exact runtime contract:
+ * `graderType`/`threshold` are stamped verbatim onto every `eval_graded`
+ * event (deterministic graders carry the documented threshold 1 — score is
+ * 0|1 and `score >= threshold` is the pass rule). Empty pieces when the
+ * spec omits the block, keeping pre-existing bundles byte-identical.
+ * Mirror: target-cli + target-managed render the same wiring — keep the
+ * three in sync.
+ */
+function renderEvaluation(ir: IrChannelV0): {
+  imports: string[];
+  bootBlock: string;
+  field: string;
+} {
+  const ev = ir.evaluation;
+  if (ev === undefined) return { imports: [], bootBlock: "", field: "" };
+  const field = "\n        evaluation: __evaluation,";
+  const typeImport = `import type { RunEvaluation } from "@crewhaus/runtime-core";`;
+  const onFail = escapeJsonString(ev.onFail);
+  if (ev.grader.type === "llm_judge") {
+    const criteria = escapeJsonString(ev.grader.criteria);
+    const model = escapeJsonString(ev.grader.model ?? ir.agent.model);
+    const bootBlock = `const __evaluation: RunEvaluation = {
+  graderType: "llm_judge",
+  threshold: ${ev.threshold ?? 0.7},
+  onFail: ${onFail},
+  maxRetries: ${ev.maxRetries},
+  evaluate: async ({ finalText }) => {
+    const __verdict = await judge({
+      rubric: {
+        criteria: [
+          {
+            name: "criteria",
+            description: ${criteria},
+            anchors: {
+              "1": "fails the criteria entirely",
+              "2": "mostly fails the criteria",
+              "3": "partially meets the criteria",
+              "4": "meets the criteria with minor gaps",
+              "5": "fully meets the criteria",
+            },
+          },
+        ],
+        passing_score: 3,
+      },
+      sample: { id: "in-loop-evaluation", input: "" },
+      agentOutput: finalText,
+      model: ${model},
+    });
+    return { score: (__verdict.score - 1) / 4, rationale: __verdict.rationale };
+  },
+};`;
+    return {
+      imports: [typeImport, `import { judge } from "@crewhaus/eval-judge";`],
+      bootBlock,
+      field,
+    };
+  }
+  const value = ev.grader.value;
+  const valueLit = escapeJsonString(value);
+  if (ev.grader.type === "contains") {
+    const bootBlock = `const __evaluation: RunEvaluation = {
+  graderType: "contains",
+  threshold: 1,
+  onFail: ${onFail},
+  maxRetries: ${ev.maxRetries},
+  evaluate: async ({ finalText }) =>
+    finalText.includes(${valueLit})
+      ? { score: 1, rationale: ${escapeJsonString(`output contains "${value}"`)} }
+      : { score: 0, rationale: ${escapeJsonString(`output missing "${value}"`)} },
+};`;
+    return { imports: [typeImport], bootBlock, field };
+  }
+  const bootBlock = `const __evalRegex = new RegExp(${valueLit});
+const __evaluation: RunEvaluation = {
+  graderType: "regex",
+  threshold: 1,
+  onFail: ${onFail},
+  maxRetries: ${ev.maxRetries},
+  evaluate: async ({ finalText }) => {
+    __evalRegex.lastIndex = 0;
+    return __evalRegex.test(finalText)
+      ? { score: 1, rationale: ${escapeJsonString(`output matches /${value}/`)} }
+      : { score: 0, rationale: ${escapeJsonString(`output does not match /${value}/`)} };
+  },
+};`;
+  return { imports: [typeImport], bootBlock, field };
+}
+
 function renderPermissionsField(ir: IrChannelV0): string {
   const { mode, rules } = ir.permissions;
   if (mode === undefined && rules.length === 0) return "";
@@ -542,6 +658,11 @@ function dreamFragmentJson(ir: IrChannelV0): string {
 }
 
 function renderAgent(ir: IrChannelV0): string {
+  // Loop contract 0.4 (Batch B, G02) — in-loop output evaluation for the
+  // interactive turn. Empty pieces when the spec omits the block.
+  const evaluation = renderEvaluation(ir);
+  const evalImport = evaluation.imports.length > 0 ? `${evaluation.imports.join("\n")}\n` : "";
+  const evaluationBlock = evaluation.bootBlock ? `\n${evaluation.bootBlock}\n` : "";
   const hasRules = ir.permissions.rules.length > 0;
   const permImport = hasRules
     ? `import { BUILTIN_DEFAULT_RULES } from "@crewhaus/permission-engine";\n`
@@ -715,11 +836,11 @@ export function createDreamStep(): DreamJanitorStep | null {
 import { runChatLoop } from "@crewhaus/runtime-core";
 import { createRunContext } from "@crewhaus/run-context";
 import { classifyInbound } from "@crewhaus/channel-adapter-base";
-${permImport}${subAgentTypeImport}${memImport}import type { HookDef } from "@crewhaus/hooks-engine";
+${permImport}${subAgentTypeImport}${memImport}${evalImport}import type { HookDef } from "@crewhaus/hooks-engine";
 import type { SkillRef } from "@crewhaus/skills-registry";
 import type { SlashCommand } from "@crewhaus/slash-commands";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
-${fragmentBlock}${memEmbedderBlock}
+${fragmentBlock}${memEmbedderBlock}${evaluationBlock}
 export type AgentConfig = {
   hooks: ReadonlyArray<HookDef>;
   skills: ReadonlyArray<SkillRef>;
@@ -751,7 +872,7 @@ export function createAgent(config: AgentConfig): Agent {
       const __inbound = await classifyInbound(args.message, runContext, { origin: "channel" });${memTurnBlock}
       return await runChatLoop({
         model: ${escapeJsonString(ir.agent.model)},
-        instructions: ${escapeJsonString(ir.agent.instructions)},${renderAgentTuningFields(ir)}${renderModelFailoverFields(ir)}${renderFailureTaxonomyField(ir)}${renderBudgetField(ir)}${renderLimitsFields(ir)}${renderCompactionFields(ir)}
+        instructions: ${escapeJsonString(ir.agent.instructions)},${renderAgentTuningFields(ir)}${renderModelFailoverFields(ir)}${renderFailureTaxonomyField(ir)}${renderBudgetField(ir)}${evaluation.field}${renderLimitsFields(ir)}${renderCompactionFields(ir)}
         sessionName: ${escapeJsonString(ir.name)},
         sessionTarget: "channel",
         ...(config.sessionRootDir !== undefined ? { sessionRootDir: config.sessionRootDir } : {}),

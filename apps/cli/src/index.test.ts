@@ -131,6 +131,67 @@ describe("crewhaus compile", () => {
     expect(result.exitCode).toBe(0);
   });
 
+  // Loop contract 0.4 (Batch B, G42) — `--emit-loop`: projectLoop() of the
+  // lowered IR, the wire contract shared with the studio /builder and the
+  // compiler-worker's POST /loop.
+  test("--emit-loop with -o writes loop.json byte-matching the keystone projection golden (G42)", async () => {
+    const fixturesDir = join(REPO_ROOT, "packages/compiler/src/__fixtures__");
+    const golden = JSON.parse(
+      readFileSync(join(fixturesDir, "loop-projections.golden.json"), "utf-8"),
+    ) as Record<string, unknown>;
+    const { LOOP_PROJECTION_SPECS } = (await import(
+      join(fixturesDir, "loop-projection-specs.ts")
+    )) as { LOOP_PROJECTION_SPECS: Record<string, string> };
+    const specPath = join(tmp, "crewhaus.yaml");
+    writeFileSync(specPath, LOOP_PROJECTION_SPECS["cli"] as string);
+    const outDir = join(tmp, "out");
+    const result = await runCli(["compile", specPath, "--emit-loop", "-o", outDir]);
+    expect(result.exitCode).toBe(0);
+    const loopPath = join(outDir, "loop.json");
+    expect(existsSync(loopPath)).toBe(true);
+    // A print mode like --emit-ir: no codegen.
+    expect(existsSync(join(outDir, "agent.ts"))).toBe(false);
+    expect(result.stdout).toContain(`wrote ${loopPath}`);
+    // Byte-parity with the golden the compiler + compiler-worker pin — the
+    // CLI, the worker endpoint, and the studio must render the same object.
+    const projection = JSON.parse(readFileSync(loopPath, "utf-8"));
+    expect(JSON.stringify(projection)).toBe(JSON.stringify(golden["cli"]));
+  });
+
+  test("--emit-loop without -o exits 0 (human render; stdout capture is racy — see --emit-ir note)", async () => {
+    const result = await runCli(["compile", HELLO_SPEC, "--emit-loop"]);
+    expect(result.exitCode).toBe(0);
+  });
+
+  test("--emit-loop --json without -o exits 0", async () => {
+    const result = await runCli(["compile", HELLO_SPEC, "--emit-loop", "--json"]);
+    expect(result.exitCode).toBe(0);
+  });
+
+  test("--emit-loop is a read-only view: the FR-002 scope gate does NOT run (POST /loop parity)", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    writeFileSync(
+      specPath,
+      "name: evil\ntarget: cli\nagent:\n  model: claude-sonnet-4-6\n  instructions: |\n    do a thing\ntools:\n  - mcp__evil__exfiltrate\n",
+    );
+    const outDir = join(tmp, "out");
+    const result = await runCli(["compile", specPath, "--emit-loop", "-o", outDir]);
+    // The same spec FAILS `compile`/`--emit-ir` by default (gate tests
+    // below); the projection is not an artifact, so it renders.
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).not.toContain("[strict]");
+    expect(existsSync(join(outDir, "loop.json"))).toBe(true);
+  });
+
+  test("--emit-loop rejects --check and --emit-ir combinations", async () => {
+    const withCheck = await runCli(["compile", HELLO_SPEC, "--emit-loop", "--check"]);
+    expect(withCheck.exitCode).toBe(1);
+    expect(withCheck.stderr).toContain("--emit-loop");
+    const withEmitIr = await runCli(["compile", HELLO_SPEC, "--emit-loop", "--emit-ir"]);
+    expect(withEmitIr.exitCode).toBe(1);
+    expect(withEmitIr.stderr).toContain("mutually exclusive");
+  });
+
   // FR-002 — compile-time external-sink scope gate, now DEFAULT-ON.
   const MCP_SINK_SPEC =
     "name: evil\ntarget: cli\nagent:\n  model: claude-sonnet-4-6\n  instructions: |\n    do a thing\ntools:\n  - mcp__evil__exfiltrate\n";
@@ -1114,7 +1175,19 @@ describe("crewhaus optimize --budget-usd", () => {
         "-o",
         out,
       ],
-      { env: { ANTHROPIC_API_KEY: process.env["ANTHROPIC_API_KEY"] ?? "" } },
+      {
+        env: {
+          ANTHROPIC_API_KEY: process.env["ANTHROPIC_API_KEY"] ?? "",
+          // Hermetic dataset registry: optimize PINS recovered dev samples
+          // into `<specName>-regressions` by default (item 9); with
+          // cwd=REPO_ROOT that would write the shared checkout's
+          // `.crewhaus/datasets/hello-regressions`, which every later
+          // `crewhaus eval` on the hello fixture then unions into ITS
+          // dataset (observed: eval.test.ts graded 3 samples out of a
+          // 2-sample dataset). Point the registry at this test's tmp dir.
+          CREWHAUS_DATASETS_DIR: join(tmp, "datasets"),
+        },
+      },
     );
     expect(result.exitCode).toBe(0);
     // Assert on the persisted report (robust artifact, not stdout).

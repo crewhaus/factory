@@ -434,3 +434,90 @@ describe("emitManaged — dream janitor step (v0.3.0 PR 14, §6.3)", () => {
     expect(daemon).not.toContain("DREAM_STEP");
   });
 });
+
+describe("emitManaged — evaluation block (loop contract 0.4, Batch B, G02)", () => {
+  const agentContent = (overrides: Partial<IrManagedV0>): string =>
+    emitManaged({ ...ir, ...overrides }).files.find((f) => f.path === "agent.ts")?.content ?? "";
+
+  test("llm_judge: agent.ts carries the eval-judge wiring threaded into runOneTurn", () => {
+    const agent = agentContent({
+      evaluation: {
+        grader: {
+          type: "llm_judge",
+          criteria: "answers cite a source",
+          model: "claude-haiku-4-5",
+        },
+        threshold: 0.8,
+        onFail: "retry",
+        maxRetries: 2,
+      },
+    });
+    expect(agent).toContain('import type { RunEvaluation } from "@crewhaus/runtime-core";');
+    expect(agent).toContain('import { judge } from "@crewhaus/eval-judge";');
+    expect(agent).toContain("const __evaluation: RunEvaluation = {");
+    expect(agent).toContain('graderType: "llm_judge",');
+    expect(agent).toContain('model: "claude-haiku-4-5",');
+    expect(agent).toContain('description: "answers cite a source",');
+    expect(agent).toContain("threshold: 0.8,");
+    expect(agent).toContain('onFail: "retry",');
+    expect(agent).toContain("maxRetries: 2,");
+    expect(agent).toContain("evaluate: async ({ finalText }) => {");
+    expect(agent).toContain("agentOutput: finalText,");
+    expect(agent).toContain("(__verdict.score - 1) / 4");
+    expect(agent).toContain("evaluation: __evaluation,");
+  });
+
+  test("llm_judge: the judge model defaults to the shape's primary model and the resolved default threshold is honored", () => {
+    const agent = agentContent({
+      evaluation: {
+        grader: { type: "llm_judge", criteria: "be kind" },
+        onFail: "retry",
+        maxRetries: 1,
+      },
+    });
+    expect(agent).toContain('model: "claude-sonnet-4-6",');
+    expect(agent).toContain('description: "be kind",');
+    expect(agent).toContain("threshold: 0.7,");
+  });
+
+  test("contains: emits a pure fn (no eval-judge import; documented threshold 1)", () => {
+    const agent = agentContent({
+      evaluation: {
+        grader: { type: "contains", value: "DONE" },
+        onFail: "halt",
+        maxRetries: 3,
+      },
+    });
+    expect(agent).not.toContain("@crewhaus/eval-judge");
+    expect(agent).toContain('graderType: "contains",');
+    expect(agent).toContain("threshold: 1,");
+    expect(agent).toContain('finalText.includes("DONE")');
+    expect(agent).toContain('onFail: "halt",');
+    expect(agent).toContain("evaluation: __evaluation,");
+  });
+
+  test("regex: emits a pure fn with a per-call lastIndex reset", () => {
+    const agent = agentContent({
+      evaluation: {
+        grader: { type: "regex", value: "\\d+ items" },
+        onFail: "note",
+        maxRetries: 1,
+      },
+    });
+    expect(agent).toContain('const __evalRegex = new RegExp("\\\\d+ items");');
+    expect(agent).toContain('graderType: "regex",');
+    expect(agent).toContain("threshold: 1,");
+    expect(agent).toContain("__evalRegex.lastIndex = 0;");
+    expect(agent).toContain("__evalRegex.test(finalText)");
+    expect(agent).toContain('onFail: "note",');
+    expect(agent).toContain("evaluation: __evaluation,");
+  });
+
+  test("no evaluation block → no evaluation wiring in any emitted file (byte-identity guard)", () => {
+    for (const f of emitManaged(ir).files) {
+      expect(f.content).not.toContain("evaluation:");
+      expect(f.content).not.toContain("__evaluation");
+      expect(f.content).not.toContain("@crewhaus/eval-judge");
+    }
+  });
+});

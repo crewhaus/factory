@@ -148,6 +148,11 @@ export type FailureClass =
   | "rate_limit"
   | "crewhaus_budget"
   | "timeout"
+  /** Loop contract 0.4 (G02) — the spec's in-loop `evaluation:` gate scored
+   *  the run's final answer below threshold with `on_fail: halt`. Like
+   *  `crewhaus_budget`/`timeout`, this is CrewHaus's OWN configured ceiling
+   *  ending the run, not a provider failure. */
+  | "evaluation"
   | "mcp_boot"
   | "context_overflow"
   | "spec"
@@ -198,6 +203,10 @@ export const EXIT_CODES = {
    *  spend cap, it is CrewHaus's OWN configured ceiling, not a provider
    *  failure. */
   timeout: 34,
+  /** Loop contract 0.4 (G02) — the spec's in-loop `evaluation:` gate failed
+   *  the final answer with `on_fail: halt`. Same 3x band rationale: a
+   *  CrewHaus-configured quality floor, not a provider failure. */
+  evaluation: 35,
   /** Tool or MCP failure (including MCP boot). */
   tool: 40,
 } as const;

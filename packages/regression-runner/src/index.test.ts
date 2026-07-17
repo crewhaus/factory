@@ -5,7 +5,7 @@
  */
 import { describe, expect, test } from "bun:test";
 import type { EvalRunSummary, SampleResult } from "@crewhaus/eval-runner";
-import { RegressionError, gate, regress } from "./index";
+import { RegressionError, gate, regress, samplePassRate } from "./index";
 
 function sample(id: string, passed: boolean, score: number, latencyMs = 100): SampleResult {
   return {
@@ -120,6 +120,75 @@ describe("regression-runner — T1 fixture corpus", () => {
     const next = summary([sample("a", true, 1, 1000), sample("b", true, 1, 2000)]);
     const r = regress(prev, next);
     expect(r.p95LatencyDeltaMs).toBeGreaterThan(0);
+  });
+});
+
+describe("regression-runner — per-sample pass-rate flips (G15)", () => {
+  function withTrials(s: SampleResult, passes: number, k: number): SampleResult {
+    return {
+      ...s,
+      trialPassRate: passes / k,
+      trials: Array.from({ length: k }, (_, i) => ({
+        trial: i + 1,
+        sessionId: `${s.sessionId}-t${i + 1}`,
+        passed: i < passes,
+        score: i < passes ? 1 : 0,
+        rationale: i < passes ? "ok" : "fail",
+        latencyMs: s.latencyMs,
+        tokens: s.tokens,
+      })),
+    };
+  }
+
+  test("samplePassRate: trial rate when present, else the 0/1 verdict", () => {
+    expect(samplePassRate(sample("a", true, 1))).toBe(1);
+    expect(samplePassRate(sample("a", false, 0))).toBe(0);
+    expect(samplePassRate(withTrials(sample("a", true, 1), 3, 4))).toBeCloseTo(0.75);
+  });
+
+  test("a reliability drop (4/4 → 1/4, canonical still passing) is a regression", () => {
+    const prev = summary([withTrials(sample("a", true, 1), 4, 4)]);
+    const next = summary([withTrials(sample("a", true, 1), 1, 4)]);
+    const r = regress(prev, next);
+    expect(r.regressions).toHaveLength(1);
+    expect(r.regressions[0]?.prev.passRate).toBeCloseTo(1);
+    expect(r.regressions[0]?.next.passRate).toBeCloseTo(0.25);
+    // The canonical verdicts both PASS — only the rate view can see this.
+    expect(r.regressions[0]?.prev.passed).toBe(true);
+    expect(r.regressions[0]?.next.passed).toBe(true);
+  });
+
+  test("a reliability rise is a recovery; equal rates are unchanged", () => {
+    const prev = summary([
+      withTrials(sample("a", false, 0), 1, 4),
+      withTrials(sample("b", true, 1), 2, 4),
+    ]);
+    const next = summary([
+      withTrials(sample("a", false, 0), 3, 4),
+      withTrials(sample("b", true, 1), 2, 4),
+    ]);
+    const r = regress(prev, next);
+    expect(r.recoveries).toHaveLength(1);
+    expect(r.recoveries[0]?.sampleId).toBe("a");
+    expect(r.unchanged).toBe(1);
+  });
+
+  test("mixed runs compare rate-to-verdict (prev single-trial, next repeated)", () => {
+    const prev = summary([sample("a", true, 1)]); // rate 1.0
+    const next = summary([withTrials(sample("a", true, 1), 3, 4)]); // rate 0.75
+    const r = regress(prev, next);
+    expect(r.regressions).toHaveLength(1);
+    expect(r.regressions[0]?.prev.passRate).toBe(1);
+    expect(r.regressions[0]?.next.passRate).toBeCloseTo(0.75);
+  });
+
+  test("single-trial runs keep the boolean flip semantics and no passRate fields", () => {
+    const prev = summary([sample("a", true, 1), sample("b", true, 1)]);
+    const next = summary([sample("a", true, 1), sample("b", false, 0)]);
+    const r = regress(prev, next);
+    expect(r.regressions).toHaveLength(1);
+    expect("passRate" in (r.regressions[0]?.prev ?? {})).toBe(false);
+    expect("passRate" in (r.regressions[0]?.next ?? {})).toBe(false);
   });
 });
 

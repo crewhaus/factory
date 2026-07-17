@@ -84,6 +84,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     parallel barriers, chain integrity) now run unconditionally inside
     `compile()`; they rewrite nothing, so bundle bytes are unchanged.
 
+- **Loop contract 0.4, Batch B — the evaluate half of the loop: in-loop
+  evaluation, judge gates, and the builder-facing contract surfaces.** One
+  coordinated batch lands the spec grammar, the IR, the runtime seam, the
+  affected emitters, the eval stack, the compiler-worker endpoints, and the
+  CLI:
+
+  - **`evaluation:` — in-loop output evaluation on cli/channel/managed**:
+    `grader` (`llm_judge` with `criteria` + optional `model`, or the
+    deterministic `contains`/`regex`), `threshold` (llm_judge only, default
+    0.7), `on_fail: retry|halt|note` (default `retry`) and `max_retries`
+    (default 1). Defaults resolve AT LOWER TIME into the IR; bundles
+    construct a `RunEvaluation` and the runtime loop scores every completed
+    assistant turn, publishing the new `eval_graded` trace event and
+    retrying/halting/noting per spec. A below-threshold `halt` ends the run
+    with the classified failure machinery: `run_failed` class
+    `"evaluation"`, exit code 35 (CrewHaus's own configured quality floor,
+    beside the budget cap's 33 and the timers' 34).
+    `evaluation.threshold`/`evaluation.max_retries` join `OPTIMIZABLE_PATHS`
+    on all three shapes (subset-guard test updated); the grader itself is
+    deliberately NOT optimizer-reachable.
+  - **`kind: "judge"` workflow steps + graph judge nodes** — LLM judge
+    gates over upstream output: the gate scores the nearest earlier
+    non-judge step's (or gated node's) output in [0,1] against `criteria`
+    via `@crewhaus/eval-judge` on the step's resolved model (aux-model
+    `cheapest` supported), with `threshold` / `on_fail`
+    (`retry_previous` re-runs the gated step with the verdict's rationale
+    as feedback) / `max_retries` resolved at lower time. Every scoring
+    pass publishes the new `judge_verdict` trace event (both kinds ship
+    pretty renderers in the structured event printer).
+  - **Builder-facing contract surfaces (compiler-worker + spec)**:
+    `GET /schema` serves the whole 14-target spec grammar as a JSON-Schema
+    document (`specJsonSchema()` via zod-to-json-schema, ETag-cached) —
+    per-target definitions carry the new `evaluation`/`limits` keys;
+    `POST /loop` serves `projectLoop(ir)` (`@crewhaus/ir`), the canonical
+    ring/canvas loop projection matching the studio's `LoopProjection`
+    wire contract (goldens pin every IR variant byte-for-byte; canvas
+    node kinds pin to the studio's `step|node|role|doc` union);
+    `parseSpecIssues()` returns path-bearing structured diagnostics
+    (including YAML syntax line/col) and backs the worker's
+    /validate + /compile error payloads; `applySpecEdits()` in
+    `@crewhaus/spec-patch` gives the builder an atomic, comment-preserving
+    multi-edit author surface (one CST mutation batch, one `parseSpec`
+    re-validation, all-or-nothing).
+  - **The eval stack learns the loop**: `crewhaus eval --repeats K` runs k
+    seed-offset trials per sample and reports `pass@k` / `pass^k` beside
+    the canonical verdict (per-trial grades recorded; regression gating
+    and report flips compare per-sample pass-RATES, so flakiness
+    surfaces even when the canonical verdict is unchanged); per-sample
+    loop metrics (tool-call accuracy, interventions, safety-violation
+    counts by deny/egress/justify, model-call latency p50/p95) aggregate
+    into the run summary, the CLI's `[eval] loop:` line and the report
+    renderer; per-sample `failureClass` tallies print as
+    `[eval] failure classes:`; `llm_judge` graders take their min-score
+    cut from `.crewhaus/judge-calibration.json` when present (applied
+    calibrations echoed per run); graders files may declare
+    `type: registry` — the default grader registry (the six specialty
+    grader packs) is constructed once and shared across single runs,
+    matrix cells, `optimize` and the flywheel.
+  - **CLI**: `crewhaus compile --emit-loop` prints the same loop
+    projection the worker serves (`--json` for the raw wire shape,
+    `--out` writes `loop.json` beside the bundle);
+    `crewhaus sessions export --format trajectories` exports logged
+    sessions as JSONL trajectory tuples for offline analysis and
+    fine-tune-style pipelines.
+
 ## [0.3.2] - 2026-07-16
 
 ### Fixed

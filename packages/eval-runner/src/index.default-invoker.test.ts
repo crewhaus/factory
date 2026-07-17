@@ -168,5 +168,43 @@ describe("runEval — defaultInvoker (no caller invoker)", () => {
     const call = chatLoopCalls[0];
     expect(call?.["subAgents"]).toBeInstanceOf(Map);
     expect(typeof call?.["spawnSubAgent"]).toBe("function");
+    // No taxonomy in the spec → the option is not even present.
+    expect(call?.["failureTaxonomy"]).toBeUndefined();
+  });
+
+  test("threads the lowered failure_taxonomy into runChatLoop (G54)", async () => {
+    const outDir = newTempRoot();
+    chatLoopCalls.length = 0;
+    wireCalls.length = 0;
+    includeSubAgents = false;
+
+    const taxSpec = `name: default-invoker-tax
+target: cli
+agent:
+  model: claude-opus-4-7
+  instructions: spec instructions
+failure_taxonomy:
+  - class: quota_exhausted
+    pattern: quota exceeded
+    recovery: fail
+    hint: top up
+`;
+    const ir = narrowToAgent(lower(parseSpec(taxSpec)));
+    const samples: Sample[] = [{ id: "a", input: "q", expected_output: "answer for q" }];
+    const { compiled } = parseGradersConfig("graders:\n  - name: m\n    type: exact_match\n");
+
+    await runEval({
+      ir,
+      dataset: { name: "def-tax", samples: yieldSamples(samples) },
+      compiledGraders: compiled,
+      opts: { outDir },
+    });
+
+    expect(chatLoopCalls).toHaveLength(1);
+    // The IR's taxonomy reaches the in-loop recovery engine verbatim, so a
+    // named transient class gets classified recovery INSIDE the loop.
+    expect(chatLoopCalls[0]?.["failureTaxonomy"]).toEqual([
+      { class: "quota_exhausted", pattern: "quota exceeded", recovery: "fail", hint: "top up" },
+    ]);
   });
 });

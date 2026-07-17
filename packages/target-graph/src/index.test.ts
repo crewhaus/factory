@@ -575,3 +575,392 @@ describe("emitGraph — when/parallel end-to-end fixture (Batch A)", () => {
     expect(c).toContain('import { read } from "@crewhaus/tool-fs";');
   });
 });
+
+describe("emitGraph — judge gate nodes (loop contract 0.4, G02)", () => {
+  const judgeNode = (
+    overrides: Partial<IrGraphV0["nodes"][number]["judge"]> = {},
+  ): IrGraphV0["nodes"][number] => ({
+    name: "gate",
+    kind: "judge",
+    instructions: "cites at least two sources",
+    model: "claude-haiku-4-5",
+    tools: [],
+    toolConfigs: {},
+    judge: {
+      criteria: "cites at least two sources",
+      threshold: 0.9,
+      onFail: "retry_previous",
+      maxRetries: 2,
+      ...overrides,
+    },
+  });
+
+  /** draft → gate(judge, retry_previous ≤2) → publish. */
+  const RETRY_IR: IrGraphV0 = {
+    version: 0,
+    name: "judged",
+    target: "graph",
+    entry: "draft",
+    nodes: [
+      {
+        name: "draft",
+        instructions: "Write the report.",
+        model: "claude-sonnet-4-6",
+        tools: [],
+        toolConfigs: {},
+      },
+      judgeNode(),
+      {
+        name: "publish",
+        instructions: "Publish.",
+        model: "claude-sonnet-4-6",
+        tools: [],
+        toolConfigs: {},
+      },
+    ],
+    edges: [
+      { from: "draft", to: "gate" },
+      { from: "gate", to: "publish" },
+    ],
+    permissions: { rules: [] },
+    compaction: {},
+  };
+
+  const withOnFail = (onFail: "retry_previous" | "halt" | "continue"): IrGraphV0 => ({
+    ...RETRY_IR,
+    nodes: RETRY_IR.nodes.map((n) => (n.name === "gate" ? judgeNode({ onFail }) : n)),
+  });
+
+  const parseTs = (code: string) =>
+    new Bun.Transpiler({ loader: "ts" }).transformSync(code.replace(/^#!.*\n/, ""));
+
+  test("judge bundles emit the judge machinery: imports and the __judgeGate scorer", () => {
+    const c = emitGraph(RETRY_IR).files[0]?.content ?? "";
+    expect(c).toContain(
+      'import { EXIT_CODES, RunFailedError, formatRunFailure, toFailureReport } from "@crewhaus/errors";',
+    );
+    expect(c).toContain('import { judge } from "@crewhaus/eval-judge";');
+    expect(c).toContain("async function __judgeGate(");
+    // createJudgeGrader's 1–5 → [0,1] mapping.
+    expect(c).toContain("score: (result.score - 1) / 4");
+    // Resilient classified exit: EXIT_CODES.evaluation with the 35 fallback.
+    expect(c).toContain(
+      'const __EVAL_EXIT: number = (EXIT_CODES as Record<string, number>)["evaluation"] ?? 35;',
+    );
+  });
+
+  test("the judge node scores the gated upstream output and publishes judge_verdict", () => {
+    const c = emitGraph(RETRY_IR).files[0]?.content ?? "";
+    // Emit-time task map keyed by the gated node's name.
+    expect(c).toContain(
+      'const __tasks: Record<string, string> = { "draft": "Write the report." };',
+    );
+    expect(c).toContain(
+      'throw new Error("judge node \\"gate\\" found no upstream output to gate (expected output from: draft)");',
+    );
+    expect(c).toContain('criteria: "cites at least two sources",');
+    // The judge model is the node's resolved model slot, not the graph model.
+    expect(c).toContain('model: "claude-haiku-4-5",');
+    expect(c).toContain("const __pass = __result.score >= 0.9;");
+    // One judge_verdict per scoring pass, on the run's bus.
+    expect(c).toContain("const __bus = ctx.runContext.eventBus;");
+    expect(c).toContain('kind: "judge_verdict",');
+    expect(c).toContain('stepOrNode: "gate",');
+    expect(c).toContain('verdict: __pass ? "pass" : "fail",');
+    expect(c).toContain(
+      "...(__result.rationale.length > 0 ? { rationale: __result.rationale } : {}),",
+    );
+    // Diagnostics ride the bundle's stderr stream like the [graph] events.
+    expect(c).toContain('"[judge gate] "');
+    expect(c).toContain('" threshold=0.9\\n"');
+    // The judge never runs an agent turn of its own.
+    const judgeBody = c.slice(c.indexOf('.addNode("gate"'), c.indexOf('.addNode("publish"'));
+    expect(judgeBody).not.toContain("runChatLoop(");
+  });
+
+  test("the verdict is recorded under the judge's name (when-predicate friendly) plus a _judge record", () => {
+    const c = emitGraph(RETRY_IR).files[0]?.content ?? "";
+    expect(c).toContain('["gate"]: __pass ? "pass" : "fail",');
+    expect(c).toContain(
+      '["gate" + "_judge"]: { verdict: __pass ? "pass" : "fail", score: __result.score, rationale: __result.rationale, retries: __pass ? __retries : __retries + 1 },',
+    );
+  });
+
+  test("retry_previous: pass-gated outgoing edge + synthesized back-edge through the engine", () => {
+    const c = emitGraph(RETRY_IR).files[0]?.content ?? "";
+    // The declared edge out of the judge only fires on "pass".
+    expect(c).toContain(
+      '.addEdge("gate", "publish", (__state) => (__state as Record<string, unknown>)["gate"] === "pass")',
+    );
+    // The synthesized back-edge fires on "fail" (retries always remain —
+    // exhaustion throws inside the judge body).
+    expect(c).toContain(
+      '.addEdge("gate", "draft", (__state) => (__state as Record<string, unknown>)["gate"] === "fail")',
+    );
+    // Back-edges append AFTER the declared edges.
+    expect(c.indexOf('.addEdge("gate", "publish"')).toBeLessThan(
+      c.indexOf('.addEdge("gate", "draft"'),
+    );
+    // Retry counting lives in the checkpointed state; exhaustion throws.
+    expect(c).toContain('const __rec = __state["gate" + "_judge"]');
+    expect(c).toContain("if (!__pass && __retries >= 2) {");
+    expect(c).toContain('title: "judge gate failed after retries",');
+    expect(c).toContain('class: "evaluation" as const,');
+    expect(c).toContain("exitCode: __EVAL_EXIT,");
+    expect(c).toContain('kind: "run_failed"');
+    expect(c).toContain("throw new RunFailedError(__report);");
+    expect(c).toContain('"[judge gate] retry "');
+  });
+
+  test("the retry target's body appends the failing judge's rationale as a nudge", () => {
+    const c = emitGraph(RETRY_IR).files[0]?.content ?? "";
+    const draftBody = c.slice(c.indexOf('.addNode("draft"'), c.indexOf('.addNode("gate"'));
+    expect(draftBody).toContain('for (const __j of ["gate"]) {');
+    expect(draftBody).toContain('if (__judgeState[__j] !== "fail") continue;');
+    expect(draftBody).toContain('__rec = __judgeState[__j + "_judge"]');
+    expect(draftBody).toContain("[judge feedback — the previous attempt failed the ");
+    expect(draftBody).toContain('instructions: "Write the report." + __nudge,');
+    // Nodes that no judge retries keep the plain instructions field.
+    const publishBody = c.slice(c.indexOf('.addNode("publish"'), c.indexOf(".addEdge("));
+    expect(publishBody).toContain('instructions: "Publish.",');
+    expect(publishBody).not.toContain("__nudge");
+  });
+
+  test("halt: immediate classified throw, pass-gated outgoing edge, NO back-edge", () => {
+    const c = emitGraph(withOnFail("halt")).files[0]?.content ?? "";
+    expect(c).toContain('title: "judge gate failed",');
+    expect(c).toContain("throw new RunFailedError(__report);");
+    expect(c).toContain(
+      '.addEdge("gate", "publish", (__state) => (__state as Record<string, unknown>)["gate"] === "pass")',
+    );
+    expect(c).not.toContain('.addEdge("gate", "draft"');
+    expect(c).not.toContain("__retries");
+    expect(c).not.toContain("retry back-edge");
+  });
+
+  test("continue: verdict recorded, edges stay as declared, no throw machinery", () => {
+    const c = emitGraph(withOnFail("continue")).files[0]?.content ?? "";
+    expect(c).toContain('.addEdge("gate", "publish")');
+    expect(c).not.toContain('=== "pass"');
+    expect(c).not.toContain('.addEdge("gate", "draft"');
+    expect(c).toContain("on_fail=continue — proceeding with the flagged output");
+    // Continue-only bundles carry no throw machinery: errors import stays
+    // the pre-judge shape and __EVAL_EXIT is not emitted.
+    expect(c).toContain('import { formatRunFailure, toFailureReport } from "@crewhaus/errors";');
+    expect(c).not.toContain("throw new RunFailedError");
+    expect(c).not.toContain("__EVAL_EXIT");
+    expect(c).toContain('kind: "judge_verdict",');
+  });
+
+  test("an author when on a judge's outgoing edge AND-composes with the pass gate", () => {
+    const ir: IrGraphV0 = {
+      ...RETRY_IR,
+      edges: [
+        { from: "draft", to: "gate" },
+        { from: "gate", to: "publish", when: { key: "draft", exists: true } },
+      ],
+    };
+    const c = emitGraph(ir).files[0]?.content ?? "";
+    expect(c).toContain(
+      '.addEdge("gate", "publish", (__state) => (__state as Record<string, unknown>)["gate"] === "pass" && (__state as Record<string, unknown>)["draft"] !== undefined)',
+    );
+  });
+
+  test("author when predicates can read the judge's recorded verdict", () => {
+    const ir: IrGraphV0 = {
+      ...withOnFail("continue"),
+      edges: [
+        { from: "draft", to: "gate" },
+        { from: "gate", to: "publish", when: { key: "gate", equals: "pass" } },
+      ],
+    };
+    const c = emitGraph(ir).files[0]?.content ?? "";
+    expect(c).toContain(
+      '.addEdge("gate", "publish", (__state) => (__state as Record<string, unknown>)["gate"] === "pass")',
+    );
+  });
+
+  test("a judge chained behind another judge gates the original producing node (transitive)", () => {
+    const ir: IrGraphV0 = {
+      ...RETRY_IR,
+      nodes: [
+        ...RETRY_IR.nodes,
+        {
+          ...judgeNode({ maxRetries: 1 }),
+          name: "tone",
+          instructions: "professional tone",
+          judge: {
+            criteria: "professional tone",
+            threshold: 0.7,
+            onFail: "retry_previous",
+            maxRetries: 1,
+          },
+        },
+      ],
+      edges: [
+        { from: "draft", to: "gate" },
+        { from: "gate", to: "tone" },
+        { from: "tone", to: "publish" },
+      ],
+    };
+    const c = emitGraph(ir).files[0]?.content ?? "";
+    // tone's task map resolves through the gate judge to draft.
+    const toneBody = c.slice(c.indexOf('.addNode("tone"'), c.indexOf(".addEdge("));
+    expect(toneBody).toContain('{ "draft": "Write the report." }');
+    // And its back-edge loops all the way to draft (the whole gate chain
+    // re-validates on the way back down).
+    expect(c).toContain(
+      '.addEdge("tone", "draft", (__state) => (__state as Record<string, unknown>)["tone"] === "fail")',
+    );
+    // draft carries nudge handling for BOTH judges.
+    expect(c).toContain('for (const __j of ["gate", "tone"]) {');
+  });
+
+  test("halt judges may gate several upstreams (labelled concatenation at runtime)", () => {
+    const ir: IrGraphV0 = {
+      ...withOnFail("halt"),
+      nodes: [
+        ...withOnFail("halt").nodes,
+        {
+          name: "tech",
+          instructions: "Handle technical.",
+          model: "claude-sonnet-4-6",
+          tools: [],
+          toolConfigs: {},
+        },
+      ],
+      edges: [
+        { from: "draft", to: "gate" },
+        { from: "tech", to: "gate" },
+        { from: "gate", to: "publish" },
+      ],
+    };
+    const c = emitGraph(ir).files[0]?.content ?? "";
+    expect(c).toContain(
+      'const __tasks: Record<string, string> = { "draft": "Write the report.", "tech": "Handle technical." };',
+    );
+    expect(c).toContain(
+      '__present.map((n) => "## " + n + "\\n" + String(__state[n])).join("\\n\\n")',
+    );
+    expect(c).toContain("(expected output from: draft, tech)");
+  });
+
+  test("retry_previous with several gated upstreams is rejected at emit time", () => {
+    const ir: IrGraphV0 = {
+      ...RETRY_IR,
+      nodes: [
+        ...RETRY_IR.nodes,
+        {
+          name: "tech",
+          instructions: "Handle technical.",
+          model: "m",
+          tools: [],
+          toolConfigs: {},
+        },
+      ],
+      edges: [
+        { from: "draft", to: "gate" },
+        { from: "tech", to: "gate" },
+        { from: "gate", to: "publish" },
+      ],
+    };
+    expect(() => emitGraph(ir)).toThrow(TargetEmitError);
+    expect(() => emitGraph(ir)).toThrow(
+      /retry_previous but gates 2 upstream nodes \(draft, tech\)/,
+    );
+  });
+
+  test("a judge with no upstream producing node is rejected at emit time", () => {
+    const ir: IrGraphV0 = {
+      ...RETRY_IR,
+      edges: [{ from: "gate", to: "publish" }],
+    };
+    expect(() => emitGraph(ir)).toThrow(/no non-judge upstream node to gate/);
+  });
+
+  test("a judge entry node is rejected at emit time (parseSpec mirror)", () => {
+    const ir: IrGraphV0 = { ...RETRY_IR, entry: "gate" };
+    expect(() => emitGraph(ir)).toThrow(/entry node "gate" cannot be a judge/);
+  });
+
+  test("kind: judge without a judge block renders as a regular node (direct-IR guard)", () => {
+    const ir: IrGraphV0 = {
+      ...RETRY_IR,
+      nodes: RETRY_IR.nodes.map((n) =>
+        n.name === "gate" ? { ...n, judge: undefined } : n,
+      ) as IrGraphV0["nodes"],
+    };
+    const c = emitGraph(ir).files[0]?.content ?? "";
+    expect(c).not.toContain("__judgeGate");
+    // It falls back to an ordinary LLM node over its instructions.
+    expect(c).toContain('instructions: "cites at least two sources",');
+  });
+
+  test("tricky names/criteria stay JSON-escaped in every executable string", () => {
+    const name = 'ga"te`${x}';
+    const ir: IrGraphV0 = {
+      ...RETRY_IR,
+      nodes: RETRY_IR.nodes.map((n) =>
+        n.name === "gate"
+          ? {
+              ...n,
+              name,
+              judge: {
+                criteria: 'must "quote" ${sources}',
+                threshold: 0.7,
+                onFail: "retry_previous" as const,
+                maxRetries: 1,
+              },
+            }
+          : n,
+      ) as IrGraphV0["nodes"],
+      edges: [
+        { from: "draft", to: name },
+        { from: name, to: "publish" },
+      ],
+    };
+    const c = emitGraph(ir).files[0]?.content ?? "";
+    expect(c).toContain('criteria: "must \\"quote\\" ${sources}",');
+    expect(c).toContain('stepOrNode: "ga\\"te`${x}",');
+    expect(() => parseTs(c)).not.toThrow();
+  });
+
+  test("judge bundles are syntactically valid TypeScript (retry/halt/continue, with when+parallel+hitl)", () => {
+    for (const onFail of ["retry_previous", "halt", "continue"] as const) {
+      const base = withOnFail(onFail);
+      const ir: IrGraphV0 = {
+        ...base,
+        nodes: base.nodes.map((n) =>
+          n.name === "publish" ? { ...n, hitlPrompt: "publish it?" } : n,
+        ) as IrGraphV0["nodes"],
+        edges: [
+          { from: "draft", to: "gate", when: { key: "draft", exists: true } },
+          { from: "gate", to: "publish" },
+        ],
+        limits: { deadlineMs: 60000 },
+        hooks: [{ event: "stop", command: "./notify.sh" }],
+        budget: { usdMicros: 1_000_000, onExceed: { kind: "stop" } },
+      };
+      const c = emitGraph(ir).files[0]?.content ?? "";
+      expect(() => parseTs(c)).not.toThrow();
+    }
+  });
+
+  test("judge-free graphs carry NO judge machinery (byte-stability)", () => {
+    const c = emitGraph(baseIr).files[0]?.content ?? "";
+    for (const s of [
+      "__judgeGate",
+      "__EVAL_EXIT",
+      "eval-judge",
+      "judge_verdict",
+      "throw new RunFailedError", // the catch-wrapper COMMENT may name the class
+      "EXIT_CODES",
+      "__nudge",
+      "retry back-edge",
+      "_judge",
+    ]) {
+      expect(c).not.toContain(s);
+    }
+    expect(c).toContain('import { formatRunFailure, toFailureReport } from "@crewhaus/errors";');
+  });
+});

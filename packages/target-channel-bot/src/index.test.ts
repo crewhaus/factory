@@ -1273,3 +1273,95 @@ describe("emitChannelBot — memory.embedder (loop contract 0.4, Batch A)", () =
     expect(disabled).not.toContain("createEmbedder");
   });
 });
+
+describe("emitChannelBot — evaluation block (loop contract 0.4, Batch B, G02)", () => {
+  test("llm_judge: agent.ts carries the eval-judge wiring threaded into the interactive turn", () => {
+    const agent =
+      fileMap({
+        ...MIN_IR,
+        evaluation: {
+          grader: {
+            type: "llm_judge",
+            criteria: "answers cite a source",
+            model: "claude-haiku-4-5",
+          },
+          threshold: 0.8,
+          onFail: "retry",
+          maxRetries: 2,
+        },
+      }).get("agent.ts") ?? "";
+    expect(agent).toContain('import type { RunEvaluation } from "@crewhaus/runtime-core";');
+    expect(agent).toContain('import { judge } from "@crewhaus/eval-judge";');
+    expect(agent).toContain("const __evaluation: RunEvaluation = {");
+    expect(agent).toContain('graderType: "llm_judge",');
+    expect(agent).toContain('model: "claude-haiku-4-5",');
+    expect(agent).toContain('description: "answers cite a source",');
+    expect(agent).toContain("threshold: 0.8,");
+    expect(agent).toContain('onFail: "retry",');
+    expect(agent).toContain("maxRetries: 2,");
+    expect(agent).toContain("evaluate: async ({ finalText }) => {");
+    expect(agent).toContain("agentOutput: finalText,");
+    expect(agent).toContain("(__verdict.score - 1) / 4");
+    expect(agent).toContain("evaluation: __evaluation,");
+  });
+
+  test("llm_judge: the judge model defaults to the shape's primary model and the resolved default threshold is honored", () => {
+    const agent =
+      fileMap({
+        ...MIN_IR,
+        evaluation: {
+          grader: { type: "llm_judge", criteria: "be kind" },
+          onFail: "retry",
+          maxRetries: 1,
+        },
+      }).get("agent.ts") ?? "";
+    expect(agent).toContain('model: "claude-sonnet-4-6",');
+    expect(agent).toContain('description: "be kind",');
+    expect(agent).toContain("threshold: 0.7,");
+  });
+
+  test("contains: emits a pure fn (no eval-judge import; documented threshold 1)", () => {
+    const agent =
+      fileMap({
+        ...MIN_IR,
+        evaluation: {
+          grader: { type: "contains", value: "DONE" },
+          onFail: "halt",
+          maxRetries: 3,
+        },
+      }).get("agent.ts") ?? "";
+    expect(agent).not.toContain("@crewhaus/eval-judge");
+    expect(agent).toContain('graderType: "contains",');
+    expect(agent).toContain("threshold: 1,");
+    expect(agent).toContain('finalText.includes("DONE")');
+    expect(agent).toContain('onFail: "halt",');
+    expect(agent).toContain("evaluation: __evaluation,");
+  });
+
+  test("regex: emits a pure fn with a per-call lastIndex reset", () => {
+    const agent =
+      fileMap({
+        ...MIN_IR,
+        evaluation: {
+          grader: { type: "regex", value: "\\d+ items" },
+          onFail: "note",
+          maxRetries: 1,
+        },
+      }).get("agent.ts") ?? "";
+    expect(agent).toContain('const __evalRegex = new RegExp("\\\\d+ items");');
+    expect(agent).toContain('graderType: "regex",');
+    expect(agent).toContain("threshold: 1,");
+    expect(agent).toContain("__evalRegex.lastIndex = 0;");
+    expect(agent).toContain("__evalRegex.test(finalText)");
+    expect(agent).toContain('onFail: "note",');
+    expect(agent).toContain("evaluation: __evaluation,");
+  });
+
+  test("no evaluation block → no evaluation wiring in any emitted file (byte-identity guard)", () => {
+    for (const [, content] of fileMap(MIN_IR)) {
+      expect(content).not.toContain("evaluation:");
+      expect(content).not.toContain("__evaluation");
+      expect(content).not.toContain("@crewhaus/eval-judge");
+    }
+  });
+});

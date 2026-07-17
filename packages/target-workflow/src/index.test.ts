@@ -513,3 +513,296 @@ describe("emitWorkflow — wire-once MCP servers (G05)", () => {
     expect(c).not.toContain("note: mcp_servers");
   });
 });
+
+describe("emitWorkflow — judge gate steps (loop contract 0.4, G02)", () => {
+  /** draft → gate(judge, retry_previous ≤2) → publish. */
+  const RETRY_IR: IrWorkflowV0 = {
+    ...TWO_STEP_IR,
+    steps: [
+      {
+        name: "draft",
+        instructions: "Write the report.",
+        model: "claude-sonnet-4-6",
+        tools: [],
+        toolConfigs: {},
+      },
+      {
+        name: "gate",
+        kind: "judge",
+        instructions: "cites at least two sources",
+        model: "claude-haiku-4-5",
+        tools: [],
+        toolConfigs: {},
+        judge: {
+          criteria: "cites at least two sources",
+          threshold: 0.9,
+          onFail: "retry_previous",
+          maxRetries: 2,
+        },
+      },
+      {
+        name: "publish",
+        instructions: "Format and publish.",
+        model: "claude-sonnet-4-6",
+        tools: [],
+        toolConfigs: {},
+      },
+    ],
+  };
+
+  const withOnFail = (onFail: "retry_previous" | "halt" | "continue"): IrWorkflowV0 => ({
+    ...RETRY_IR,
+    steps: RETRY_IR.steps.map((s) =>
+      s.kind === "judge" && s.judge !== undefined ? { ...s, judge: { ...s.judge, onFail } } : s,
+    ),
+  });
+
+  const parseTs = (code: string) =>
+    new Bun.Transpiler({ loader: "ts" }).transformSync(code.replace(/^#!.*\n/, ""));
+
+  test("judge bundles emit the judge machinery: imports, helper, shared RunContext, catch wrapper", () => {
+    const c = emitWorkflow(RETRY_IR).files[0]?.content ?? "";
+    expect(c).toContain(
+      'import { EXIT_CODES, RunFailedError, formatRunFailure, toFailureReport } from "@crewhaus/errors";',
+    );
+    expect(c).toContain('import { judge } from "@crewhaus/eval-judge";');
+    expect(c).toContain('import { createRunContext } from "@crewhaus/run-context";');
+    expect(c).toContain("async function __judgeGate(");
+    // createJudgeGrader's 1–5 → [0,1] mapping.
+    expect(c).toContain("score: (result.score - 1) / 4");
+    // Resilient classified exit: EXIT_CODES.evaluation with the 35 fallback.
+    expect(c).toContain(
+      'const __EVAL_EXIT: number = (EXIT_CODES as Record<string, number>)["evaluation"] ?? 35;',
+    );
+    expect(c).toContain("const __runContext = createRunContext();");
+    // Both LLM steps share the one context (the judge step publishes on
+    // its bus instead of calling runChatLoop).
+    expect(c.match(/runContext: __runContext,/g) ?? []).toHaveLength(2);
+    expect(c).toContain("const __bus = __runContext.eventBus;");
+    // Classified terminal wrapper (target-graph's convention).
+    expect(c).toContain("const __report = toFailureReport(__err);");
+    expect(c).toContain('prefix: "[workflow]"');
+    expect(c).toContain("process.exit(__report.exitCode);");
+    expect(c).not.toContain("\nawait main();");
+  });
+
+  test("the gated step becomes a re-invocable closure with its input captured up front", () => {
+    const c = emitWorkflow(RETRY_IR).files[0]?.content ?? "";
+    // Step 1 is gated: input const + closure + first invocation.
+    expect(c).toContain('const __step1Input = stdinInput || "begin";');
+    expect(c).toContain(
+      "const __runStep1 = async (__nudge: string): Promise<string> => runChatLoop({",
+    );
+    expect(c).toContain('instructions: "Write the report." + __nudge,');
+    expect(c).toContain('seedMessages: [{ role: "user", content: __step1Input }],');
+    expect(c).toContain('priorOutput = await __runStep1("");');
+    // The un-gated step 3 keeps the plain call shape.
+    expect(c).toContain('instructions: "Format and publish.",');
+    expect(c).not.toContain("__runStep3");
+  });
+
+  test("a mid-workflow gated step captures the PRIOR output template, not its own output", () => {
+    // draft → refine → gate(judge of refine): refine is the gated step.
+    const ir: IrWorkflowV0 = {
+      ...RETRY_IR,
+      steps: [
+        RETRY_IR.steps[0] as IrWorkflowV0["steps"][number],
+        {
+          name: "refine",
+          instructions: "Refine it.",
+          model: "m",
+          tools: [],
+          toolConfigs: {},
+        },
+        RETRY_IR.steps[1] as IrWorkflowV0["steps"][number],
+      ],
+    };
+    const c = emitWorkflow(ir).files[0]?.content ?? "";
+    expect(c).toContain(
+      "const __step2Input = `## Output of previous step:\\n${priorOutput}\\n\\n## Your task:\\n(continue based on the previous step's output)`;",
+    );
+    expect(c).toContain("priorOutput = await __runStep2(");
+    // Step 1 is NOT gated here — no closure for it.
+    expect(c).not.toContain("__runStep1");
+  });
+
+  test("the judge step scores priorOutput on the judge model and publishes judge_verdict", () => {
+    const c = emitWorkflow(RETRY_IR).files[0]?.content ?? "";
+    expect(c).toContain("// ── Step 2/3: gate (judge — gates step 1/3: draft) ──");
+    expect(c).toContain("[step 2/3: gate (judge)]");
+    expect(c).toContain('criteria: "cites at least two sources",');
+    // The judge model is the step's resolved model slot, not the workflow model.
+    expect(c).toContain('model: "claude-haiku-4-5",');
+    expect(c).toContain('gatedTask: "Write the report.",');
+    expect(c).toContain("output: priorOutput,");
+    expect(c).toContain("const __pass = __result.score >= 0.9;");
+    expect(c).toContain('kind: "judge_verdict",');
+    expect(c).toContain('stepOrNode: "gate",');
+    expect(c).toContain('verdict: __pass ? "pass" : "fail",');
+    expect(c).toContain("score: __result.score,");
+    expect(c).toContain(
+      "...(__result.rationale.length > 0 ? { rationale: __result.rationale } : {}),",
+    );
+    // The observable verdict line.
+    expect(c).toContain('"[judge gate] "');
+    expect(c).toContain('" threshold=0.9\\n"');
+  });
+
+  test("retry_previous: bounded re-runs with the rationale nudge, then a classified fail-closed stop", () => {
+    const c = emitWorkflow(RETRY_IR).files[0]?.content ?? "";
+    expect(c).toContain("let __retries = 0;");
+    expect(c).toContain("if (__pass) break;");
+    expect(c).toContain("if (__retries >= 2) {");
+    expect(c).toContain('title: "judge gate failed after retries",');
+    expect(c).toContain('class: "evaluation" as const,');
+    expect(c).toContain("exitCode: __EVAL_EXIT,");
+    // run_failed publishes before the throw (graph-engine G69 convention).
+    expect(c).toContain('kind: "run_failed"');
+    expect(c).toContain("throw new RunFailedError(__report);");
+    // The retry re-invokes the gated step's closure with the nudge.
+    expect(c).toContain('"[judge gate] retry "');
+    expect(c).toContain(
+      'priorOutput = await __runStep1("\\n\\n[judge feedback — the previous attempt failed the \\"gate\\" gate (score " + __result.score.toFixed(2) + " < threshold 0.9)]:\\n" + __result.rationale);',
+    );
+  });
+
+  test("halt: no retry loop, immediate classified stop", () => {
+    const c = emitWorkflow(withOnFail("halt")).files[0]?.content ?? "";
+    expect(c).not.toContain("__retries");
+    expect(c).not.toContain("for (;;)");
+    expect(c).toContain('title: "judge gate failed",');
+    expect(c).toContain("throw new RunFailedError(__report);");
+    expect(c).not.toContain('__runStep1("\\n\\n[judge feedback');
+    // The gated step still renders as a closure (uniform gated shape).
+    expect(c).toContain('priorOutput = await __runStep1("");');
+  });
+
+  test("continue: verdict recorded, no throw, run proceeds annotated", () => {
+    const c = emitWorkflow(withOnFail("continue")).files[0]?.content ?? "";
+    expect(c).toContain("on_fail=continue — proceeding with the flagged output");
+    // A continue-only bundle carries NO throw machinery: the errors import
+    // shrinks to the report renderers and __EVAL_EXIT is not emitted.
+    expect(c).toContain('import { formatRunFailure, toFailureReport } from "@crewhaus/errors";');
+    expect(c).not.toContain("throw new RunFailedError");
+    expect(c).not.toContain("__EVAL_EXIT");
+    expect(c).not.toContain("__retries");
+    expect(c).toContain('kind: "judge_verdict",');
+  });
+
+  test("consecutive judges gate the SAME nearest non-judge step", () => {
+    const ir: IrWorkflowV0 = {
+      ...RETRY_IR,
+      steps: [
+        RETRY_IR.steps[0] as IrWorkflowV0["steps"][number],
+        RETRY_IR.steps[1] as IrWorkflowV0["steps"][number],
+        {
+          name: "tone",
+          kind: "judge",
+          instructions: "professional tone",
+          model: "m2",
+          tools: [],
+          toolConfigs: {},
+          judge: {
+            criteria: "professional tone",
+            threshold: 0.7,
+            onFail: "retry_previous",
+            maxRetries: 1,
+          },
+        },
+      ],
+    };
+    const c = emitWorkflow(ir).files[0]?.content ?? "";
+    expect(c).toContain("// ── Step 2/3: gate (judge — gates step 1/3: draft) ──");
+    expect(c).toContain("// ── Step 3/3: tone (judge — gates step 1/3: draft) ──");
+    // Both judges re-run the same closure; it is emitted exactly once.
+    expect(c.match(/const __runStep1 = /g) ?? []).toHaveLength(1);
+    expect(c.match(/await __runStep1\(/g) ?? []).toHaveLength(3); // first run + one retry per judge
+  });
+
+  test("a judge with no earlier non-judge step is rejected at emit time", () => {
+    const ir: IrWorkflowV0 = {
+      ...RETRY_IR,
+      steps: [RETRY_IR.steps[1] as IrWorkflowV0["steps"][number]],
+    };
+    expect(() => emitWorkflow(ir)).toThrow(TargetEmitError);
+    expect(() => emitWorkflow(ir)).toThrow(/no earlier non-judge step to gate/);
+  });
+
+  test("kind: judge without a judge block is rejected at emit time (direct-IR guard)", () => {
+    const gate = RETRY_IR.steps[1] as IrWorkflowV0["steps"][number];
+    const ir: IrWorkflowV0 = {
+      ...RETRY_IR,
+      steps: [RETRY_IR.steps[0] as IrWorkflowV0["steps"][number], { ...gate, judge: undefined }],
+    };
+    // isJudgeStep treats it as a regular step — it renders as a plain LLM
+    // step rather than a half-gate (the IR contract sets judge iff kind).
+    const c = emitWorkflow(ir).files[0]?.content ?? "";
+    expect(c).not.toContain("__judgeGate");
+  });
+
+  test("tricky names/criteria stay JSON-escaped in every executable string", () => {
+    const ir: IrWorkflowV0 = {
+      ...RETRY_IR,
+      steps: [
+        RETRY_IR.steps[0] as IrWorkflowV0["steps"][number],
+        {
+          name: 'ga"te`${x}',
+          kind: "judge",
+          instructions: 'must "quote" ${sources}',
+          model: "m",
+          tools: [],
+          toolConfigs: {},
+          judge: {
+            criteria: 'must "quote" ${sources}',
+            threshold: 0.7,
+            onFail: "retry_previous",
+            maxRetries: 1,
+          },
+        },
+      ],
+    };
+    const c = emitWorkflow(ir).files[0]?.content ?? "";
+    expect(c).toContain('criteria: "must \\"quote\\" ${sources}",');
+    expect(c).toContain('stepOrNode: "ga\\"te`${x}",');
+    // And the whole module still parses.
+    expect(() => parseTs(c)).not.toThrow();
+  });
+
+  test("judge bundles are syntactically valid TypeScript (retry/halt/continue, with MCP+limits+hooks)", () => {
+    for (const onFail of ["retry_previous", "halt", "continue"] as const) {
+      const ir: IrWorkflowV0 = {
+        ...withOnFail(onFail),
+        mcp_servers: {
+          docs: { transport: "stdio", command: "bunx", args: ["docs-mcp"] },
+        },
+        limits: { deadlineMs: 60000, turnTimeoutMs: 9000 },
+        hooks: [{ event: "stop", command: "./notify.sh" }],
+        budget: { usdMicros: 1_000_000, onExceed: { kind: "stop" } },
+        steps: withOnFail(onFail).steps.map((s, i) => (i === 0 ? { ...s, tools: ["bash"] } : s)),
+      };
+      const c = emitWorkflow(ir).files[0]?.content ?? "";
+      expect(() => parseTs(c)).not.toThrow();
+      // Judge blocks sit inside the MCP try so a halt still disconnects.
+      expect(c.indexOf("__judgeGate({")).toBeGreaterThan(c.indexOf("try {"));
+      expect(c.indexOf("disconnectAll")).toBeGreaterThan(c.indexOf("__judgeGate({"));
+    }
+  });
+
+  test("judge-free workflows carry NO judge machinery (byte-stability)", () => {
+    const c = emitWorkflow(TWO_STEP_IR).files[0]?.content ?? "";
+    for (const s of [
+      "__judgeGate",
+      "__EVAL_EXIT",
+      "createRunContext",
+      "runContext:",
+      "eval-judge",
+      "judge_verdict",
+      "toFailureReport",
+      "__runStep",
+      "RunFailedError",
+    ]) {
+      expect(c).not.toContain(s);
+    }
+    expect(c).toContain("\nawait main();");
+  });
+});

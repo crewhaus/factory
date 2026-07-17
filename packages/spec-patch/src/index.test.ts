@@ -3,6 +3,7 @@ import {
   DIFF_VALUE_MAX_LENGTH,
   OPTIMIZABLE_PATHS,
   SpecPatchError,
+  applySpecEdits,
   applySpecPatch,
   diffSpecYaml,
   formatDiffValue,
@@ -705,5 +706,279 @@ agent:
     expect(specHasPath(POOL_YAML, ["agent", "model_pool", "candidates"])).toBe(true);
     expect(specHasPath(POOL_YAML, ["agent", "model"])).toBe(true);
     expect(specHasPath("not: [valid", ["agent"])).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Loop contract 0.4 (Batch B, G40) — applySpecEdits
+// ---------------------------------------------------------------------------
+
+const WORKFLOW_YAML = `# Release-notes workflow
+target: workflow
+name: notes
+model: claude-sonnet-4-5
+steps:
+  # First pass: get the facts down
+  - name: draft
+    instructions: Draft the notes.
+  - name: polish
+    instructions: Polish the notes.
+`;
+
+const EVAL_CLI_YAML = `target: cli
+name: gated-cli
+agent:
+  model: claude-sonnet-4-5
+  instructions: Answer carefully.
+# In-loop gate — its dials are optimizer-tunable
+evaluation:
+  grader:
+    type: llm_judge
+    criteria: response is factually grounded
+  threshold: 0.7
+  on_fail: retry
+  max_retries: 1
+`;
+
+describe("applySpecEdits — author surface (upsert / delete-on-undefined)", () => {
+  test("upserts an existing scalar and preserves comments", () => {
+    const { yaml, spec, applied } = applySpecEdits(CLI_YAML, [
+      { path: ["agent", "instructions"], value: "Be concise." },
+    ]);
+    expect(applied).toBe(1);
+    if (spec.target !== "cli") throw new Error("expected cli spec");
+    expect(spec.agent.instructions).toBe("Be concise.");
+    expect(yaml).toContain("# A simple CLI agent");
+    expect(yaml).toContain("# The system prompt the model sees on every turn");
+  });
+
+  test("upserts through missing intermediate collections", () => {
+    // CLI_YAML has no `limits:` block — the declarative surface creates it.
+    const { spec, applied } = applySpecEdits(CLI_YAML, [
+      { path: ["limits", "max_tool_iterations"], value: 25 },
+    ]);
+    expect(applied).toBe(1);
+    if (spec.target !== "cli") throw new Error("expected cli spec");
+    expect(spec.limits?.max_tool_iterations).toBe(25);
+  });
+
+  test("author surface may edit fields outside OPTIMIZABLE_PATHS", () => {
+    // ["agent","model"] is deliberately NOT whitelisted for the optimizer;
+    // the author surface (no restrictToOptimizable) edits it freely.
+    const { spec } = applySpecEdits(CLI_YAML, [
+      { path: ["agent", "model"], value: "claude-opus-4-8" },
+    ]);
+    if (spec.target !== "cli") throw new Error("expected cli spec");
+    expect(spec.agent.model).toBe("claude-opus-4-8");
+  });
+
+  test("undefined value deletes an existing path", () => {
+    const { yaml, spec, applied } = applySpecEdits(CLI_YAML, [
+      { path: ["tools"], value: undefined },
+    ]);
+    expect(applied).toBe(1);
+    if (spec.target !== "cli") throw new Error("expected cli spec");
+    expect(spec.tools).toBeUndefined();
+    expect(yaml).not.toContain("tools:");
+    expect(yaml).toContain("# A simple CLI agent");
+  });
+
+  test("omitting the value key entirely also deletes", () => {
+    const { spec, applied } = applySpecEdits(CLI_YAML, [{ path: ["tools"] }]);
+    expect(applied).toBe(1);
+    if (spec.target !== "cli") throw new Error("expected cli spec");
+    expect(spec.tools).toBeUndefined();
+  });
+
+  test("deleting an absent path is an idempotent no-op", () => {
+    const { yaml, applied } = applySpecEdits(CLI_YAML, [
+      { path: ["budget"], value: undefined },
+      { path: ["agent", "thinking"], value: undefined },
+    ]);
+    expect(applied).toBe(0);
+    expect(diffSpecYaml(CLI_YAML, yaml)).toEqual([]);
+  });
+
+  test("zero-edit batch validates and returns the input byte-identical", () => {
+    const { yaml, spec, applied } = applySpecEdits(CLI_YAML, []);
+    expect(yaml).toBe(CLI_YAML); // no CST round-trip reformatting
+    expect(applied).toBe(0);
+    expect(spec.target).toBe("cli");
+  });
+
+  test("zero-edit batch still rejects an invalid spec", () => {
+    expect(() => applySpecEdits("target: cli\n", [])).toThrow(/input YAML failed spec validation/);
+  });
+
+  test("a batch that produces an invalid spec throws atomically", () => {
+    const edits = [
+      { path: ["agent", "instructions"], value: "ok" },
+      { path: ["agent", "model"], value: 42 }, // breaks the schema
+    ];
+    expect(() => applySpecEdits(CLI_YAML, edits)).toThrow(SpecPatchError);
+    expect(() => applySpecEdits(CLI_YAML, edits)).toThrow(/edited YAML failed spec validation/);
+    // The same batch minus the poison edit applies cleanly — the failure
+    // above came from the atomic re-validation, not the first edit.
+    const first = edits[0];
+    if (first === undefined) throw new Error("unreachable");
+    expect(() => applySpecEdits(CLI_YAML, [first])).not.toThrow();
+  });
+
+  test("malformed edit shape (empty path) is rejected with its index", () => {
+    // biome-ignore lint/suspicious/noExplicitAny: testing runtime validation
+    expect(() => applySpecEdits(CLI_YAML, [{ path: [] as any, value: 1 }])).toThrow(
+      /edit #0 shape is invalid/,
+    );
+  });
+
+  test("unparseable input YAML is rejected", () => {
+    expect(() => applySpecEdits("not: [valid", [{ path: ["name"], value: "x" }])).toThrow(
+      /not parseable/,
+    );
+  });
+});
+
+describe("applySpecEdits — sequence index paths", () => {
+  test("replaces a field on a step by integer index, comments intact", () => {
+    const { yaml, spec, applied } = applySpecEdits(WORKFLOW_YAML, [
+      { path: ["steps", 0, "instructions"], value: "Draft thoroughly." },
+    ]);
+    expect(applied).toBe(1);
+    if (spec.target !== "workflow") throw new Error("expected workflow spec");
+    expect(spec.steps[0]?.instructions).toBe("Draft thoroughly.");
+    expect(spec.steps[1]?.instructions).toBe("Polish the notes.");
+    expect(yaml).toContain("# Release-notes workflow");
+    expect(yaml).toContain("# First pass: get the facts down");
+  });
+
+  test("numeric-string indices address sequences too", () => {
+    const { spec } = applySpecEdits(WORKFLOW_YAML, [
+      { path: ["steps", "1", "instructions"], value: "Polish harder." },
+    ]);
+    if (spec.target !== "workflow") throw new Error("expected workflow spec");
+    expect(spec.steps[1]?.instructions).toBe("Polish harder.");
+  });
+
+  test("index === length appends", () => {
+    const { spec, applied } = applySpecEdits(WORKFLOW_YAML, [
+      { path: ["steps", 2], value: { name: "review", instructions: "Review the notes." } },
+    ]);
+    expect(applied).toBe(1);
+    if (spec.target !== "workflow") throw new Error("expected workflow spec");
+    expect(spec.steps).toHaveLength(3);
+    expect(spec.steps[2]?.name).toBe("review");
+  });
+
+  test("index past length is rejected — never null-padded", () => {
+    expect(() =>
+      applySpecEdits(WORKFLOW_YAML, [{ path: ["steps", 5], value: { name: "x" } }]),
+    ).toThrow(/index 5 is out of bounds .* \(length 2; index 2 appends\)/);
+  });
+
+  test("a brand-new sequence can only start at index 0", () => {
+    const item = { class: "rate-limit", pattern: "429", recovery: "retry" };
+    expect(() =>
+      applySpecEdits(CLI_YAML, [{ path: ["failure_taxonomy", 1], value: item }]),
+    ).toThrow(/a new sequence starts at index 0/);
+    const { spec } = applySpecEdits(CLI_YAML, [{ path: ["failure_taxonomy", 0], value: item }]);
+    if (spec.target !== "cli") throw new Error("expected cli spec");
+    expect(spec.failure_taxonomy).toHaveLength(1);
+  });
+});
+
+describe("applySpecEdits — restrictToOptimizable (optimizer surface)", () => {
+  test("rejects a path outside the whitelist", () => {
+    expect(() =>
+      applySpecEdits(CLI_YAML, [{ path: ["agent", "model"], value: "m" }], {
+        restrictToOptimizable: true,
+      }),
+    ).toThrow(/not listed in OPTIMIZABLE_PATHS/);
+  });
+
+  test("accepts an indexed sub-path under a whitelisted prefix", () => {
+    // ["steps"] is whitelisted for workflow — fine-grained edits below it pass.
+    const { spec } = applySpecEdits(
+      WORKFLOW_YAML,
+      [{ path: ["steps", 0, "instructions"], value: "Draft with citations." }],
+      { restrictToOptimizable: true },
+    );
+    if (spec.target !== "workflow") throw new Error("expected workflow spec");
+    expect(spec.steps[0]?.instructions).toBe("Draft with citations.");
+  });
+
+  test("evaluation.threshold and evaluation.max_retries are tunable dials", () => {
+    const { yaml, spec, applied } = applySpecEdits(
+      EVAL_CLI_YAML,
+      [
+        { path: ["evaluation", "threshold"], value: 0.9 },
+        { path: ["evaluation", "max_retries"], value: 3 },
+      ],
+      { restrictToOptimizable: true },
+    );
+    expect(applied).toBe(2);
+    if (spec.target !== "cli") throw new Error("expected cli spec");
+    expect(spec.evaluation?.threshold).toBe(0.9);
+    expect(spec.evaluation?.max_retries).toBe(3);
+    expect(yaml).toContain("# In-loop gate — its dials are optimizer-tunable");
+  });
+
+  test("evaluation.grader stays human-owned", () => {
+    expect(() =>
+      applySpecEdits(
+        EVAL_CLI_YAML,
+        [{ path: ["evaluation", "grader", "criteria"], value: "always pass" }],
+        { restrictToOptimizable: true },
+      ),
+    ).toThrow(/not listed in OPTIMIZABLE_PATHS/);
+  });
+
+  test("a threshold patch on a deterministic grader fails the atomic re-parse", () => {
+    const containsYaml = EVAL_CLI_YAML.replace(
+      "    type: llm_judge\n    criteria: response is factually grounded\n  threshold: 0.7\n",
+      "    type: contains\n    value: DONE\n",
+    );
+    expect(() =>
+      applySpecEdits(containsYaml, [{ path: ["evaluation", "threshold"], value: 0.9 }], {
+        restrictToOptimizable: true,
+      }),
+    ).toThrow(/failed spec validation/);
+  });
+
+  test("unknown spec target cannot be restricted", () => {
+    expect(() =>
+      applySpecEdits("target: bogus\nname: x\n", [{ path: ["name"], value: "y" }], {
+        restrictToOptimizable: true,
+      }),
+    ).toThrow(/is not a known target/);
+  });
+});
+
+describe("validatePatch — evaluation dials", () => {
+  test("accepts the newly whitelisted evaluation paths", () => {
+    const { spec } = applySpecEdits(EVAL_CLI_YAML, []);
+    expect(() =>
+      validatePatch(spec, {
+        target: "cli",
+        path: ["evaluation", "threshold"],
+        op: "replace",
+        value: 0.85,
+      }),
+    ).not.toThrow();
+    expect(() =>
+      validatePatch(spec, {
+        target: "cli",
+        path: ["evaluation", "max_retries"],
+        op: "replace",
+        value: 2,
+      }),
+    ).not.toThrow();
+    expect(() =>
+      validatePatch(spec, {
+        target: "cli",
+        path: ["evaluation", "on_fail"], // behavioral switch — human-owned
+        op: "replace",
+        value: "halt",
+      }),
+    ).toThrow(/not listed in OPTIMIZABLE_PATHS/);
   });
 });

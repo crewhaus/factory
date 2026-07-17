@@ -1216,3 +1216,135 @@ describe("emitCli — learning block (v0.3.0 §3.3, PR 17)", () => {
     expect(content).not.toContain("createExamRunner");
   });
 });
+
+describe("emitCli — evaluation block (loop contract 0.4, Batch B, G02)", () => {
+  test("llm_judge: emits the eval-judge wiring with the explicit judge model", () => {
+    const content =
+      emitCli(
+        baseIr({
+          evaluation: {
+            grader: {
+              type: "llm_judge",
+              criteria: "answers cite a source",
+              model: "claude-haiku-4-5",
+            },
+            threshold: 0.8,
+            onFail: "retry",
+            maxRetries: 2,
+          },
+        }),
+      ).files[0]?.content ?? "";
+    expect(content).toContain('import type { RunEvaluation } from "@crewhaus/runtime-core";');
+    expect(content).toContain('import { judge } from "@crewhaus/eval-judge";');
+    expect(content).toContain("const __evaluation: RunEvaluation = {");
+    expect(content).toContain('graderType: "llm_judge",');
+    expect(content).toContain("threshold: 0.8,");
+    expect(content).toContain('onFail: "retry",');
+    expect(content).toContain("maxRetries: 2,");
+    // the evaluate fn scores through judge() on the resolved judge model
+    expect(content).toContain('model: "claude-haiku-4-5",');
+    expect(content).toContain('description: "answers cite a source",');
+    expect(content).toContain("evaluate: async ({ finalText }) => {");
+    expect(content).toContain("agentOutput: finalText,");
+    expect(content).toContain("(__verdict.score - 1) / 4");
+    // and the option is threaded into runChatLoop
+    expect(content).toContain("evaluation: __evaluation,");
+  });
+
+  test("llm_judge: the judge model defaults to the shape's primary model", () => {
+    const content =
+      emitCli(
+        baseIr({
+          evaluation: {
+            grader: { type: "llm_judge", criteria: "be kind" },
+            threshold: 0.7,
+            onFail: "retry",
+            maxRetries: 1,
+          },
+        }),
+      ).files[0]?.content ?? "";
+    expect(content).toContain('model: "claude-sonnet-4-6",');
+    expect(content).toContain('description: "be kind",');
+  });
+
+  test("llm_judge: the default threshold 0.7 is honored when the IR omits it", () => {
+    const content =
+      emitCli(
+        baseIr({
+          evaluation: {
+            grader: { type: "llm_judge", criteria: "be kind" },
+            onFail: "retry",
+            maxRetries: 1,
+          },
+        }),
+      ).files[0]?.content ?? "";
+    expect(content).toContain("threshold: 0.7,");
+  });
+
+  test("contains: emits a pure fn (no eval-judge import; documented threshold 1)", () => {
+    const content =
+      emitCli(
+        baseIr({
+          evaluation: {
+            grader: { type: "contains", value: "DONE" },
+            onFail: "halt",
+            maxRetries: 3,
+          },
+        }),
+      ).files[0]?.content ?? "";
+    expect(content).not.toContain("@crewhaus/eval-judge");
+    expect(content).toContain('graderType: "contains",');
+    expect(content).toContain("threshold: 1,");
+    expect(content).toContain('finalText.includes("DONE")');
+    expect(content).toContain('{ score: 1, rationale: "output contains \\"DONE\\"" }');
+    expect(content).toContain('{ score: 0, rationale: "output missing \\"DONE\\"" }');
+    expect(content).toContain('onFail: "halt",');
+    expect(content).toContain("maxRetries: 3,");
+    expect(content).toContain("evaluation: __evaluation,");
+  });
+
+  test("regex: emits a pure fn with a per-call lastIndex reset", () => {
+    const content =
+      emitCli(
+        baseIr({
+          evaluation: {
+            grader: { type: "regex", value: "\\d{3}-\\d{4}" },
+            onFail: "note",
+            maxRetries: 1,
+          },
+        }),
+      ).files[0]?.content ?? "";
+    expect(content).not.toContain("@crewhaus/eval-judge");
+    expect(content).toContain('const __evalRegex = new RegExp("\\\\d{3}-\\\\d{4}");');
+    expect(content).toContain('graderType: "regex",');
+    expect(content).toContain("threshold: 1,");
+    expect(content).toContain("__evalRegex.lastIndex = 0;");
+    expect(content).toContain("__evalRegex.test(finalText)");
+    expect(content).toContain('onFail: "note",');
+    expect(content).toContain("evaluation: __evaluation,");
+  });
+
+  test("criteria with quotes/newlines are escaped into the generated source", () => {
+    const content =
+      emitCli(
+        baseIr({
+          evaluation: {
+            grader: { type: "llm_judge", criteria: 'say "yes"\nthen stop' },
+            threshold: 0.7,
+            onFail: "retry",
+            maxRetries: 1,
+          },
+        }),
+      ).files[0]?.content ?? "";
+    expect(content).toContain('description: "say \\"yes\\"\\nthen stop"');
+    expect(content).not.toContain('\nthen stop"');
+  });
+
+  test("no evaluation block → no evaluation wiring anywhere (byte-identity guard)", () => {
+    const content = emitCli(baseIr()).files[0]?.content ?? "";
+    expect(content).not.toContain("evaluation:");
+    expect(content).not.toContain("__evaluation");
+    expect(content).not.toContain("@crewhaus/eval-judge");
+    expect(content).not.toContain("__evalRegex");
+  });
+});

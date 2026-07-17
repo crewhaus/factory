@@ -14,17 +14,26 @@
   "dependencies": {
     "@crewhaus/agent-context-isolation": "workspace:*",
     "@crewhaus/compiler": "workspace:*",
+    "@crewhaus/embedder": "workspace:*",
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/eval-dataset": "workspace:*",
     "@crewhaus/eval-grader": "workspace:*",
     "@crewhaus/eval-judge": "workspace:*",
     "@crewhaus/event-log": "workspace:*",
+    "@crewhaus/grader-12-metric-rubric": "workspace:*",
+    "@crewhaus/grader-continuity": "workspace:*",
+    "@crewhaus/grader-multimodal": "workspace:*",
+    "@crewhaus/grader-nlg-metrics": "workspace:*",
+    "@crewhaus/grader-registry": "workspace:*",
+    "@crewhaus/grader-safety-classifiers": "workspace:*",
+    "@crewhaus/grader-semantic-similarity": "workspace:*",
     "@crewhaus/hooks-engine": "workspace:*",
     "@crewhaus/ir": "workspace:*",
     "@crewhaus/logging": "workspace:*",
     "@crewhaus/mcp-host": "workspace:*",
     "@crewhaus/memory-service": "workspace:*",
     "@crewhaus/permission-engine": "workspace:*",
+    "@crewhaus/recovery-engine": "workspace:*",
     "@crewhaus/run-context": "workspace:*",
     "@crewhaus/runtime-core": "workspace:*",
     "@crewhaus/skills-registry": "workspace:*",
@@ -44,10 +53,6 @@
     "@crewhaus/trace-event-bus": "workspace:*",
     "@crewhaus/wiki-store": "workspace:*",
     "zod": "^3.23.8"
-  },
-  "devDependencies": {
-    "@crewhaus/grader-continuity": "workspace:*",
-    "@crewhaus/grader-registry": "workspace:*"
   },
   "license": "Apache-2.0",
   "author": {

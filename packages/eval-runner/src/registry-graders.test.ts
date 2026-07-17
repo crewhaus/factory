@@ -88,16 +88,19 @@ describe("runEval — registry grader resolution", () => {
     expect(per?.rationale).toBe("registered");
   });
 
-  test("a registry entry without a graderRegistry is a loud RunnerError", async () => {
+  test("a registry entry without a graderRegistry falls back to the default registry (G14)", async () => {
+    // `test.alwaysPass` is not a pack/plugin name, so the automatic default
+    // registry (constructed because no graderRegistry was supplied) fails
+    // the lookup loudly at run start — listing the actual vocabulary.
     const { compiled } = parseGradersConfig(REGISTRY_GRADERS);
     await expect(
       runEval({
         ir: narrowToAgent(lower(parseSpec(SPEC))),
         dataset: { name: "reg", samples: yieldSamples(SAMPLES) },
         compiledGraders: compiled,
-        opts: { invoker, outDir: newTempRoot() },
+        opts: { invoker, outDir: newTempRoot(), cwd: newTempRoot() },
       }),
-    ).rejects.toThrow(/graderRegistry/);
+    ).rejects.toThrow(/no grader registered as "test.alwaysPass".*registered graders:/);
   });
 
   test("an unregistered name fails at run start, not per sample", async () => {

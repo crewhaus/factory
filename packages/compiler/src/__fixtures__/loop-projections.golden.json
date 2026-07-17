@@ -950,7 +950,7 @@
         {
           "id": "branch-1",
           "label": "branch 1",
-          "kind": "branch",
+          "kind": "node",
           "mini": [
             {
               "id": "perceive",
@@ -999,7 +999,7 @@
         {
           "id": "branch-2",
           "label": "branch 2",
-          "kind": "branch",
+          "kind": "node",
           "mini": [
             {
               "id": "perceive",
@@ -1124,7 +1124,7 @@
         {
           "id": "queue",
           "label": "queue (in-memory)",
-          "kind": "queue",
+          "kind": "node",
           "mini": [
             {
               "id": "perceive",

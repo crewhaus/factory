@@ -104,8 +104,14 @@ export type LoopRing = {
   readonly segments: readonly LoopSegment[];
 };
 
-/** What a canvas node represents on its shape. */
-export type LoopNodeKind = "step" | "node" | "role" | "doc" | "queue" | "branch";
+/**
+ * What a canvas node represents on its shape. EXACTLY the studio's
+ * `LoopNodeKind` union (studio-pwa `src/lib/loop-model.ts`) — the studio
+ * renderer is the wire consumer, so factory must not emit kinds outside it.
+ * Research branches and the batch queue render as `"node"`, mirroring the
+ * studio's own client-side projection of those shapes.
+ */
+export type LoopNodeKind = "step" | "node" | "role" | "doc";
 
 /**
  * One canvas node (a workflow step, graph node, crew role, research branch,
@@ -763,7 +769,7 @@ function researchCanvas(ir: Extract<IrNode, { target: "research" }>): LoopCanvas
   ];
   const edges: LoopEdge[] = [];
   for (let i = 1; i <= ir.branchingFactor; i += 1) {
-    nodes.push({ id: `branch-${i}`, label: `branch ${i}`, kind: "branch", mini: agentMini() });
+    nodes.push({ id: `branch-${i}`, label: `branch ${i}`, kind: "node", mini: agentMini() });
     edges.push({ from: "goal", to: `branch-${i}` });
     edges.push({ from: `branch-${i}`, to: "report" });
   }
@@ -773,7 +779,7 @@ function researchCanvas(ir: Extract<IrNode, { target: "research" }>): LoopCanvas
 
 function batchCanvas(ir: Extract<IrNode, { target: "batch" }>): LoopCanvas {
   const nodes: LoopNode[] = [
-    { id: "queue", label: `queue (${ir.queue.adapter})`, kind: "queue", mini: emptyMini() },
+    { id: "queue", label: `queue (${ir.queue.adapter})`, kind: "node", mini: emptyMini() },
     {
       id: "agent",
       label: `worker × ${ir.concurrency}`,

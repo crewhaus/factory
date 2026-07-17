@@ -31,6 +31,38 @@ import {
  *     `limits` (flat runChatLoop knobs) and `hooks` thread into every
  *     node's runChatLoop call, mirroring target-managed's field renderers.
  *
+ * Loop contract 0.4 (Batch B, G02) — `kind: "judge"` nodes are emitted as
+ * JUDGE GATES over their upstream node's output, expressed entirely
+ * through the engine's existing edge/checkpoint machinery:
+ *
+ *   - The judge node's body scores the gated upstream output(s) present in
+ *     the shared state (in [0,1], via `@crewhaus/eval-judge`'s forced-tool
+ *     scorer on the judge node's resolved `model`), publishes a
+ *     `judge_verdict` trace event on `ctx.runContext.eventBus`, and
+ *     records `state["<judge>"] = "pass" | "fail"` plus a structured
+ *     `state["<judge>_judge"] = { verdict, score, rationale, retries }`
+ *     record (the hitl `_decision`-suffix convention) — so author-declared
+ *     `when: {key: <judge>, equals: pass}` predicates work too.
+ *   - The judge's declared outgoing edges are PASS-GATED (condition
+ *     `state["<judge>"] === "pass"`, AND-composed with any author `when`)
+ *     for `halt`/`retry_previous`, matching the loop projection's
+ *     conditional "pass" edge; `continue` leaves them as declared.
+ *   - `on_fail: retry_previous` synthesizes a conditional BACK-EDGE from
+ *     the judge to its single gated upstream node (`=== "fail"`); the
+ *     retry counter lives in the checkpointed state, the gated node reads
+ *     the failing judge's rationale out of the state as an instructions
+ *     nudge, and exhausted retries throw the classified failure inside
+ *     the body (so an edge-visible "fail" always means retries remain).
+ *     A retry_previous judge therefore requires exactly ONE non-judge
+ *     upstream (transitively through other judges) — enforced at emit
+ *     time. `halt` throws immediately; both publish `run_failed` first
+ *     (the engine's G69 convention) and the existing catch wrapper exits
+ *     with the report's code.
+ *
+ * v0 honesty note: judge model calls ride outside the graph-level
+ * `budget`/`limits` runChatLoop knobs (eval-judge drives the provider
+ * adapter directly).
+ *
  * HITL: nodes whose IR carries `hitlPrompt` await `ctx.requestApproval`
  * after the LLM turn. The graph-engine's pause/resume flow handles the
  * checkpoint persistence; the bundle emits CLI argument parsing for
@@ -173,6 +205,43 @@ function resolveTools(ir: IrGraphV0): {
   return { imports, inits, toolsArrayByNode };
 }
 
+/**
+ * Loop contract 0.4 (Batch B, G02) — is this node a judge gate? The IR
+ * contract sets `judge` iff `kind === "judge"`; both are checked so a
+ * malformed direct-IR node falls through to the regular renderer instead
+ * of emitting a half-gate (mirror: target-workflow's isJudgeStep).
+ */
+function isJudgeNode(node: IrGraphNode): boolean {
+  return node.kind === "judge" && node.judge !== undefined;
+}
+
+/**
+ * Loop contract 0.4 (Batch B, G02) — the non-judge upstream node names a
+ * judge gates: walk the declared edges backwards from the judge,
+ * COLLECTING non-judge ancestors and RECURSING through judge ancestors
+ * (judges pass no output of their own — a judge chained behind another
+ * judge still gates the original producing node). Deduped, edge
+ * declaration order, cycle-safe.
+ */
+function gatedUpstreams(ir: IrGraphV0, judgeName: string): string[] {
+  const byName = new Map(ir.nodes.map((n) => [n.name, n]));
+  const out: string[] = [];
+  const seen = new Set<string>([judgeName]);
+  const queue: string[] = [judgeName];
+  while (queue.length > 0) {
+    const cur = queue.shift() as string;
+    for (const e of ir.edges) {
+      if (e.to !== cur || seen.has(e.from)) continue;
+      seen.add(e.from);
+      const from = byName.get(e.from);
+      if (from === undefined) continue; // unknown-node edges throw in validateGraph
+      if (isJudgeNode(from)) queue.push(e.from);
+      else out.push(e.from);
+    }
+  }
+  return out;
+}
+
 function validateGraph(ir: IrGraphV0): void {
   const names = new Set(ir.nodes.map((n) => n.name));
   if (!names.has(ir.entry)) {
@@ -209,6 +278,28 @@ function validateGraph(ir: IrGraphV0): void {
       }
     }
   }
+  // Loop contract 0.4 (Batch B, G02) — judge gate wellformedness. parseSpec
+  // already rejects a judge entry; the upstream checks are emit-level
+  // because they depend on the gate semantics this emitter implements.
+  for (const node of ir.nodes) {
+    if (!isJudgeNode(node)) continue;
+    if (node.name === ir.entry) {
+      throw new TargetEmitError(
+        `entry node "${node.name}" cannot be a judge — nothing upstream to gate`,
+      );
+    }
+    const upstreams = gatedUpstreams(ir, node.name);
+    if (upstreams.length === 0) {
+      throw new TargetEmitError(
+        `judge node "${node.name}" has no non-judge upstream node to gate — add an edge from a producing node into it`,
+      );
+    }
+    if (node.judge?.onFail === "retry_previous" && upstreams.length !== 1) {
+      throw new TargetEmitError(
+        `judge node "${node.name}" uses on_fail: retry_previous but gates ${upstreams.length} upstream nodes (${upstreams.join(", ")}) — the retry target must be unambiguous; keep a single upstream or use on_fail: halt/continue`,
+      );
+    }
+  }
 }
 
 /**
@@ -225,13 +316,13 @@ function validateGraph(ir: IrGraphV0): void {
  * literals are JSON-encoded — string, number and boolean all serialize to
  * valid JS literals (`equals: false` is legal and distinct from `exists`).
  */
-function renderEdgeCondition(when: IrGraphEdgeWhen): string {
+function renderWhenExpr(when: IrGraphEdgeWhen): string {
   const keyJs = escapeJsonString(when.key);
   if (when.equals !== undefined) {
-    return `(__state) => (__state as Record<string, unknown>)[${keyJs}] === ${JSON.stringify(when.equals)}`;
+    return `(__state as Record<string, unknown>)[${keyJs}] === ${JSON.stringify(when.equals)}`;
   }
   if (when.exists === true) {
-    return `(__state) => (__state as Record<string, unknown>)[${keyJs}] !== undefined`;
+    return `(__state as Record<string, unknown>)[${keyJs}] !== undefined`;
   }
   // Unreachable through parseSpec (its superRefine demands exactly one
   // form) — guard for direct-IR builders handing in an empty block.
@@ -240,12 +331,95 @@ function renderEdgeCondition(when: IrGraphEdgeWhen): string {
   );
 }
 
+function renderEdgeCondition(when: IrGraphEdgeWhen): string {
+  return `(__state) => ${renderWhenExpr(when)}`;
+}
+
+/**
+ * Loop contract 0.4 (Batch B, G02) — the `state["<judge>"] === "pass"`
+ * test gating a judge's declared outgoing edges (halt / retry_previous
+ * modes — the projection's conditional "pass" edge). AND-composed with
+ * the author's `when` when both are present.
+ */
+function renderJudgePassCondition(judgeName: string, when: IrGraphEdgeWhen | undefined): string {
+  const passExpr = `(__state as Record<string, unknown>)[${escapeJsonString(judgeName)}] === "pass"`;
+  return when === undefined
+    ? `(__state) => ${passExpr}`
+    : `(__state) => ${passExpr} && ${renderWhenExpr(when)}`;
+}
+
+/**
+ * Loop contract 0.4 (Batch B, G02) — module-scope judge machinery, emitted
+ * once when the graph carries judge nodes: the `__judgeGate` scorer
+ * (eval-judge's forced-tool `judge()` over a synthesized single-criterion
+ * rubric with generic 1–5 anchors, mapped to [0,1] via `(n − 1) / 4` — the
+ * createJudgeGrader convention) and, when a gate can throw, the classified
+ * exit code with the literal 35 fallback (the next slot in the 3x
+ * own-ceiling band after crewhaus_budget 33 / timeout 34) so bundles
+ * emitted before @crewhaus/errors ships `EXIT_CODES.evaluation` still exit
+ * classified. Mirror: target-workflow emits the same helper.
+ */
+const JUDGE_GATE_HELPER = `
+/**
+ * Loop contract 0.4 (G02) — score \`output\` in [0,1] against free-text
+ * judge criteria: eval-judge's forced-tool scorer over a single-criterion
+ * rubric (generic 1–5 anchors), mapped down via (n - 1) / 4. The judge
+ * model resolves through the model-router, so any provider can judge.
+ */
+async function __judgeGate(opts: {
+  criteria: string;
+  model: string;
+  gatedTask: string;
+  output: string;
+}): Promise<{ score: number; rationale: string }> {
+  const result = await judge({
+    rubric: {
+      criteria: [
+        {
+          name: "criteria",
+          description: opts.criteria,
+          anchors: {
+            "1": "clearly fails the criteria",
+            "2": "mostly fails the criteria",
+            "3": "partially meets the criteria",
+            "4": "mostly meets the criteria",
+            "5": "fully meets the criteria",
+          },
+        },
+      ],
+      passing_score: 3,
+    },
+    sample: { id: "judge-gate", input: opts.gatedTask },
+    agentOutput: opts.output,
+    model: opts.model,
+  });
+  return { score: (result.score - 1) / 4, rationale: result.rationale };
+}
+`;
+
+/**
+ * G02 — companion const to {@link JUDGE_GATE_HELPER}, emitted only when a
+ * gate can THROW (`on_fail: halt` / exhausted `retry_previous`) so
+ * continue-only bundles carry no dead throw machinery.
+ */
+const EVAL_EXIT_CONST = `
+// Classified exit for a failed judge gate (falls back to 35 until
+// @crewhaus/errors ships EXIT_CODES.evaluation).
+const __EVAL_EXIT: number = (EXIT_CODES as Record<string, number>)["evaluation"] ?? 35;
+`;
+
 /**
  * Render a single node's body. The body calls runChatLoop singleTurn
  * with the node's instructions and the upstream state serialised as a
  * user message. Returns the assistant reply text under
  * `state["<nodeName>"]`. When `hitlPrompt` is set, the node calls
  * `ctx.requestApproval` after the LLM turn so the engine can pause.
+ *
+ * Loop contract 0.4 (Batch B, G02) — when this node is the retry target
+ * of one or more `retry_previous` judges (`nudgeJudges`), the body reads
+ * each currently-failing judge's rationale out of the state and appends
+ * it to the instructions as a nudge, so a retried run self-corrects
+ * against the gate's feedback.
  */
 /**
  * Section 55 / item 23 — render the `failureTaxonomy` runChatLoop field.
@@ -351,6 +525,7 @@ function renderNodeBody(
   node: IrGraphNode,
   graphLevelFields: string,
   toolsArrayLiteral: string | undefined,
+  nudgeJudges: readonly string[] = [],
 ): string {
   const instructionsJs = escapeJsonString(node.instructions);
   const modelJs = escapeJsonString(node.model);
@@ -367,14 +542,33 @@ function renderNodeBody(
       const __decision = await ctx.requestApproval(${escapeJsonString(node.hitlPrompt)});
       __next[${nameJs} + "_decision"] = __decision;`
       : "";
+  // G02 — judge-retry nudge: read every currently-failing gating judge's
+  // rationale out of the state and append it to the instructions.
+  const nudgeBlock =
+    nudgeJudges.length > 0
+      ? `
+      // G02 — a retry_previous judge sent the run back here when its state
+      // record reads "fail"; its rationale rides in as a nudge.
+      const __judgeState = prev as Record<string, unknown>;
+      const __nudges: string[] = [];
+      for (const __j of [${nudgeJudges.map((n) => escapeJsonString(n)).join(", ")}]) {
+        if (__judgeState[__j] !== "fail") continue;
+        const __rec = __judgeState[__j + "_judge"] as { rationale?: string } | undefined;
+        if (typeof __rec?.rationale === "string" && __rec.rationale.length > 0) {
+          __nudges.push('[judge feedback — the previous attempt failed the "' + __j + '" gate]:\\n' + __rec.rationale);
+        }
+      }
+      const __nudge = __nudges.length === 0 ? "" : "\\n\\n" + __nudges.join("\\n\\n");`
+      : "";
+  const instructionsExpr = nudgeJudges.length > 0 ? `${instructionsJs} + __nudge` : instructionsJs;
   return `
-    async (ctx, prev) => {
+    async (ctx, prev) => {${nudgeBlock}
       const __seed = [
         { role: "user", content: \`Upstream state:\\n\\\`\\\`\\\`json\\n\${JSON.stringify(prev, null, 2)}\\n\\\`\\\`\\\`\` },
       ];
       const __reply = await runChatLoop({
         model: ${modelJs},
-        instructions: ${instructionsJs},
+        instructions: ${instructionsExpr},
         sessionName: ${escapeJsonString(node.name)} + "-" + ctx.graphRunId,
         sessionTarget: "graph-node",
         seedMessages: __seed,
@@ -383,6 +577,130 @@ function renderNodeBody(
       });
       const __next = { ...prev, [${nameJs}]: __reply };${hitlBlock}
       return __next;
+    }`;
+}
+
+/**
+ * Loop contract 0.4 (Batch B, G02) — render a judge node's body. The gate
+ * scores the gated upstream output(s) recorded in the shared state (one
+ * upstream: its output verbatim; several, e.g. behind a parallel barrier:
+ * a `## <node>`-labelled concatenation — halt/continue only, since
+ * retry_previous demands a single target), publishes ONE `judge_verdict`
+ * trace event per scoring pass on `ctx.runContext.eventBus`, prints a
+ * `[judge <name>]` stderr line (the bundle's `[graph]` diagnostic
+ * stream), then applies the resolved `onFail`:
+ *
+ *   - `retry_previous`: record `"fail"` + retries+1 so the synthesized
+ *     back-edge re-runs the gated node (nudged with the rationale);
+ *     retries exhausted with the gate still failing publishes
+ *     `run_failed` and throws the classified RunFailedError (fail-closed
+ *     — an edge-visible "fail" always has retries remaining).
+ *   - `halt`: publish `run_failed` + throw immediately.
+ *   - `continue`: record the verdict and proceed (edges stay as
+ *     declared).
+ *
+ * Every emit-time string that reaches executable code threads through
+ * escapeJsonString — node names and criteria are user-controlled.
+ */
+function renderJudgeNodeBody(node: IrGraphNode, ir: IrGraphV0): string {
+  const gate = node.judge;
+  if (gate === undefined) {
+    throw new TargetEmitError(
+      `judge node "${node.name}" carries no judge config — kind: "judge" requires a judge block`,
+    );
+  }
+  const nameJs = escapeJsonString(node.name);
+  const upstreams = gatedUpstreams(ir, node.name);
+  const byName = new Map(ir.nodes.map((n) => [n.name, n]));
+  const taskEntries = upstreams
+    .map((u) => `${escapeJsonString(u)}: ${escapeJsonString(byName.get(u)?.instructions ?? "")}`)
+    .join(", ");
+  const noOutputError = escapeJsonString(
+    `judge node "${node.name}" found no upstream output to gate (expected output from: ${upstreams.join(", ")})`,
+  );
+  const verdictLine = `      process.stderr.write(${escapeJsonString(`[judge ${node.name}] `)} + "verdict=" + (__pass ? "pass" : "fail") + " score=" + __result.score.toFixed(2) + ${escapeJsonString(` threshold=${gate.threshold}\n`)});`;
+  const throwBlock = (title: string, detailOpen: string, i: string): string =>
+    [
+      `${i}const __report = {`,
+      `${i}  class: "evaluation" as const,`,
+      `${i}  title: ${escapeJsonString(title)},`,
+      `${i}  detail: ${escapeJsonString(detailOpen)} + __result.score.toFixed(2) + ${escapeJsonString(` < threshold ${gate.threshold} (gating: ${upstreams.join(", ")})`)} + (__result.rationale.length > 0 ? " — " + __result.rationale : ""),`,
+      `${i}  remediation: ${escapeJsonString(`raise the gated node's quality (instructions/model), lower the judge threshold, or set on_fail: continue`)},`,
+      `${i}  exitCode: __EVAL_EXIT,`,
+      `${i}};`,
+      `${i}__bus.publish({ ...__bus.envelope(), kind: "run_failed", class: __report.class, message: __report.title + ": " + __report.detail, remediation: __report.remediation, exitCode: __report.exitCode });`,
+      `${i}throw new RunFailedError(__report);`,
+    ].join("\n");
+  const scoringPass = `      const __state = prev as Record<string, unknown>;
+      // Gated upstream task(s) — emit-time constants keyed by node name.
+      const __tasks: Record<string, string> = { ${taskEntries} };
+      const __present = Object.keys(__tasks).filter((n) => typeof __state[n] === "string");
+      if (__present.length === 0) {
+        throw new Error(${noOutputError});
+      }
+      const __first = __present[0] as string;
+      const __output = __present.length === 1 ? String(__state[__first]) : __present.map((n) => "## " + n + "\\n" + String(__state[n])).join("\\n\\n");
+      const __task = __present.length === 1 ? (__tasks[__first] ?? "") : __present.map((n) => "## " + n + "\\n" + (__tasks[n] ?? "")).join("\\n\\n");
+      const __result = await __judgeGate({
+        criteria: ${escapeJsonString(gate.criteria)},
+        model: ${escapeJsonString(node.model)},
+        gatedTask: __task,
+        output: __output,
+      });
+      const __pass = __result.score >= ${gate.threshold};
+      const __bus = ctx.runContext.eventBus;
+      __bus.publish({
+        ...__bus.envelope(),
+        kind: "judge_verdict",
+        stepOrNode: ${nameJs},
+        verdict: __pass ? "pass" : "fail",
+        score: __result.score,
+        ...(__result.rationale.length > 0 ? { rationale: __result.rationale } : {}),
+      });
+${verdictLine}`;
+  const recordReturn = (retriesExpr: string): string =>
+    [
+      "      return {",
+      "        ...prev,",
+      `        [${nameJs}]: __pass ? "pass" : "fail",`,
+      `        [${nameJs} + "_judge"]: { verdict: __pass ? "pass" : "fail", score: __result.score, rationale: __result.rationale, retries: ${retriesExpr} },`,
+      "      };",
+    ].join("\n");
+
+  if (gate.onFail === "retry_previous") {
+    const retryTarget = upstreams[0] as string; // validateGraph pinned length === 1
+    return `
+    async (ctx, prev) => {
+${scoringPass}
+      const __rec = __state[${nameJs} + "_judge"] as { retries?: number } | undefined;
+      const __retries = typeof __rec?.retries === "number" ? __rec.retries : 0;
+      if (!__pass && __retries >= ${gate.maxRetries}) {
+${throwBlock("judge gate failed after retries", `judge node "${node.name}" still scored `, "        ")}
+      }
+      if (!__pass) {
+        process.stderr.write(${escapeJsonString(`[judge ${node.name}] retry `)} + (__retries + 1) + ${escapeJsonString(`/${gate.maxRetries} of node "${retryTarget}"\n`)});
+      }
+${recordReturn("__pass ? __retries : __retries + 1")}
+    }`;
+  }
+  if (gate.onFail === "halt") {
+    return `
+    async (ctx, prev) => {
+${scoringPass}
+      if (!__pass) {
+${throwBlock("judge gate failed", `judge node "${node.name}" scored `, "        ")}
+      }
+${recordReturn("0")}
+    }`;
+  }
+  // on_fail: continue — record the verdict (event + line + state) and proceed.
+  return `
+    async (ctx, prev) => {
+${scoringPass}
+      if (!__pass) {
+        process.stderr.write(${escapeJsonString(`[judge ${node.name}] on_fail=continue — proceeding with the flagged output\n`)});
+      }
+${recordReturn("0")}
     }`;
 }
 
@@ -397,26 +715,70 @@ function renderAgent(ir: IrGraphV0): string {
   const tools = resolveTools(ir);
   const toolImportBlock = tools.imports.length > 0 ? `${tools.imports.join("\n")}\n` : "";
   const toolInitBlock = tools.inits.length > 0 ? `\n${tools.inits.join("\n")}\n` : "";
+
+  // G02 — judge gates: which nodes are judges, which can throw (halt /
+  // exhausted retry_previous — gates the classified-throw machinery), and
+  // which nodes are retry targets (their bodies read the failing judge's
+  // rationale as a nudge; a node can be gated by several judges).
+  const judgeNodes = ir.nodes.filter(isJudgeNode);
+  const hasJudges = judgeNodes.length > 0;
+  const hasThrowingJudges = judgeNodes.some((n) => n.judge?.onFail !== "continue");
+  const passGatedJudges = new Set(
+    judgeNodes.filter((n) => n.judge?.onFail !== "continue").map((n) => n.name),
+  );
+  const nudgeJudgesByNode = new Map<string, string[]>();
+  for (const j of judgeNodes) {
+    if (j.judge?.onFail !== "retry_previous") continue;
+    const target = gatedUpstreams(ir, j.name)[0] as string; // validateGraph pinned length === 1
+    const list = nudgeJudgesByNode.get(target) ?? [];
+    list.push(j.name);
+    nudgeJudgesByNode.set(target, list);
+  }
+
   const nodeRegistrations = ir.nodes
-    .map(
-      (n) =>
-        `  .addNode(${escapeJsonString(n.name)}, ${renderNodeBody(
-          n,
-          graphLevelFields,
-          tools.toolsArrayByNode.get(n.name),
-        ).trim()})`,
-    )
+    .map((n) => {
+      const body = isJudgeNode(n)
+        ? renderJudgeNodeBody(n, ir)
+        : renderNodeBody(
+            n,
+            graphLevelFields,
+            tools.toolsArrayByNode.get(n.name),
+            nudgeJudgesByNode.get(n.name) ?? [],
+          );
+      return `  .addNode(${escapeJsonString(n.name)}, ${body.trim()})`;
+    })
     .join("\n");
 
   // Loop contract 0.4 (Batch A) — `when` blocks become EdgeCondition
   // lambdas (declaration order is semantics: the engine takes the first
-  // matching edge, so no reordering).
+  // matching edge, so no reordering). G02 — edges LEAVING a halt /
+  // retry_previous judge are pass-gated (`state["<judge>"] === "pass"`,
+  // AND-composed with any author `when`).
   const edgeRegistrations = ir.edges
     .map((e) => {
-      const conditionArg = e.when !== undefined ? `, ${renderEdgeCondition(e.when)}` : "";
+      const conditionArg = passGatedJudges.has(e.from)
+        ? `, ${renderJudgePassCondition(e.from, e.when)}`
+        : e.when !== undefined
+          ? `, ${renderEdgeCondition(e.when)}`
+          : "";
       return `  .addEdge(${escapeJsonString(e.from)}, ${escapeJsonString(e.to)}${conditionArg})`;
     })
     .join("\n");
+
+  // G02 — synthesized retry back-edges, appended AFTER the declared edges:
+  // a "fail" record loops the run back to the gated node (retries always
+  // remain when an edge sees "fail" — exhaustion throws inside the judge
+  // body). Declaration order keeps author edges first, but the conditions
+  // are disjoint ("pass" vs "fail") so no declared edge can shadow these.
+  const retryBackEdges = judgeNodes
+    .filter((n) => n.judge?.onFail === "retry_previous")
+    .map((n) => {
+      const target = gatedUpstreams(ir, n.name)[0] as string;
+      return `  // G02 — judge "${n.name}" retry back-edge (rationale rides the state as a nudge)
+  .addEdge(${escapeJsonString(n.name)}, ${escapeJsonString(target)}, (__state) => (__state as Record<string, unknown>)[${escapeJsonString(n.name)}] === "fail")`;
+    })
+    .join("\n");
+  const retryBackEdgeBlock = retryBackEdges.length > 0 ? `\n${retryBackEdges}` : "";
 
   // Loop contract 0.4 (Batch A) — parallel barrier groups, in declaration
   // order (group order and member order are execution semantics). No
@@ -429,21 +791,33 @@ function renderAgent(ir: IrGraphV0): string {
 
   const entryRegistration = `  .setEntry(${escapeJsonString(ir.entry)})`;
 
+  // G02 — judge machinery, emitted only when a judge node is present so
+  // judge-free bundles stay byte-identical: the errors import grows the
+  // classified-throw members, eval-judge supplies the scorer, and the
+  // module-scope helper block lands before the graph construction.
+  const errorsImport = hasThrowingJudges
+    ? `import { EXIT_CODES, RunFailedError, formatRunFailure, toFailureReport } from "@crewhaus/errors";`
+    : `import { formatRunFailure, toFailureReport } from "@crewhaus/errors";`;
+  const judgeImport = hasJudges ? `\nimport { judge } from "@crewhaus/eval-judge";` : "";
+  const judgeHelperBlock = hasJudges
+    ? `${JUDGE_GATE_HELPER}${hasThrowingJudges ? EVAL_EXIT_CONST : ""}`
+    : "";
+
   return `#!/usr/bin/env bun
 // Generated by crewhaus. DO NOT EDIT.
 // Source spec: ${escapeJsonString(ir.name)} (target: graph, ir version: ${ir.version})
-import { formatRunFailure, toFailureReport } from "@crewhaus/errors";
+${errorsImport}${judgeImport}
 import { runChatLoop } from "@crewhaus/runtime-core";
 import { createCheckpointStore } from "@crewhaus/checkpoint-store";
 import { createGraph } from "@crewhaus/graph-engine";
 import { createRunContext } from "@crewhaus/run-context";
-${toolImportBlock}${toolInitBlock}
+${toolImportBlock}${toolInitBlock}${judgeHelperBlock}
 const __store = createCheckpointStore();
 const __runContext = createRunContext();
 const __graph = createGraph({ checkpointStore: __store })
   .setInputAdapter((input) => ({ input }))
 ${nodeRegistrations}
-${edgeRegistrations}${parallelBlock}
+${edgeRegistrations}${retryBackEdgeBlock}${parallelBlock}
 ${entryRegistration}
   .compile();
 

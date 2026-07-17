@@ -98,7 +98,12 @@ import { executeTool } from "@crewhaus/tool-executor";
 import { type LoopDetection, detectLoop } from "@crewhaus/tool-loop-detection";
 import { partitionToolCalls } from "@crewhaus/tool-orchestrator";
 import { storeAndPreview } from "@crewhaus/tool-result-store";
-import { type CostAccrualEvent, TraceEventBus, type Unsubscribe } from "@crewhaus/trace-event-bus";
+import {
+  type CostAccrualEvent,
+  type ModelUsage,
+  TraceEventBus,
+  type Unsubscribe,
+} from "@crewhaus/trace-event-bus";
 import {
   type ToolUseBlock as TsmToolUseBlock,
   type TurnState,
@@ -721,6 +726,74 @@ export type EgressAuditSink = {
     readonly kind: "egress_decision";
     readonly payload: unknown;
   }): Promise<unknown>;
+};
+
+/**
+ * Loop contract 0.4 (G02) — the observable output of ONE completed
+ * user→assistant turn, handed to the injected in-loop evaluator. A "turn"
+ * here is the whole tool inner-loop until the state machine reaches Done —
+ * the evaluator NEVER sees tool-only intermediate iterations.
+ */
+export type EvaluationTurn = {
+  /**
+   * Concatenated text of the terminal assistant message (`""` when the
+   * turn produced no text blocks). This is exactly the string a
+   * `singleTurn` run returns to its caller.
+   */
+  readonly finalText: string;
+  /**
+   * The full conversation history as of turn completion (read-only view —
+   * evaluators must not mutate it; the runtime owns the array).
+   */
+  readonly messages: ReadonlyArray<Anthropic.MessageParam>;
+  /**
+   * Aggregate token usage across every MAIN-turn model call this attempt
+   * made (all tool iterations included; compaction/judge side-calls are
+   * not main-turn calls and are excluded). On an evaluation-triggered
+   * retry the re-run attempt gets a fresh accumulator, so each `evaluate`
+   * invocation sees the usage of exactly the attempt it is grading.
+   */
+  readonly usage: ModelUsage;
+};
+
+/** The injected grader's verdict for one graded attempt. */
+export type EvaluationResult = {
+  /** Score in [0,1]; compared against `threshold` (>= passes). A non-finite
+   *  score is treated as 0 (fail) defensively. */
+  readonly score: number;
+  /** Grader explanation; appended to the retry nudge when `onFail: "retry"`. */
+  readonly rationale?: string;
+};
+
+/**
+ * Loop contract 0.4 (G02) — the in-loop evaluation seam (spec
+ * `evaluation:` on cli/channel/managed). See
+ * {@link RunChatLoopOptions.evaluation} for semantics.
+ */
+export type RunEvaluation = {
+  /**
+   * The grader, INJECTED by the caller (target emitters construct it from
+   * the IR's `evaluation.grader` — an llm_judge side-call or a
+   * deterministic contains/regex check). runtime-core never constructs a
+   * judge itself, so it gains no eval dependency. A grader that throws is
+   * treated as grading INFRASTRUCTURE failure, not a verdict: the error is
+   * logged (`error` event) and the turn stands un-gated (fail-open) — a
+   * flaky judge model must not kill an otherwise healthy run.
+   */
+  readonly evaluate: (turn: EvaluationTurn) => Promise<EvaluationResult>;
+  /** Passing bar: `score >= threshold` passes. (The compiler resolves the
+   *  spec default: 0.7 for llm_judge; deterministic graders use 1.) */
+  readonly threshold: number;
+  /** What a failing verdict does — see the option docblock. */
+  readonly onFail: "retry" | "halt" | "note";
+  /** Hard cap on evaluation-triggered re-runs (>= 0; resolved default 1). */
+  readonly maxRetries: number;
+  /**
+   * Which grader kind produced the score — stamped verbatim onto every
+   * `eval_graded` trace event (the event field is required, and only the
+   * caller knows what it built `evaluate` from).
+   */
+  readonly graderType: "llm_judge" | "contains" | "regex";
 };
 
 export type RunChatLoopOptions = {
@@ -1374,6 +1447,34 @@ export type RunChatLoopOptions = {
    * survives intact (logged once at boot).
    */
   thinking?: { readonly budgetTokens: number } | { readonly effort: "low" | "medium" | "high" };
+  /**
+   * Loop contract 0.4 (G02) — in-loop evaluation of every COMPLETED turn
+   * (spec `evaluation:` on cli/channel/managed; both `singleTurn` and REPL
+   * paths). After the turn's tool inner-loop reaches Done — never on a
+   * tool-only intermediate iteration — the injected `evaluate` grades the
+   * terminal assistant text and one `eval_graded` trace event is published
+   * per grading pass (`retryIndex` 0 for the original attempt, n for the
+   * n-th evaluation-triggered retry). On `score < threshold`:
+   *
+   *  - `onFail: "retry"` — the grader rationale is appended to history as a
+   *    synthetic corrective user message (event-logged `synthetic: true`,
+   *    like the recovery/loop nudges) and the turn re-runs, up to
+   *    `maxRetries` times. Each re-run makes REAL model calls, so its spend
+   *    accrues through the existing cost path (`model_response` → budget
+   *    meter) and counts against `budget:` exactly like any other call.
+   *    Retries exhausted → the last attempt stands and the run continues
+   *    (the failing verdict trail is on the trace bus).
+   *  - `onFail: "halt"` — classified terminal stop: `run_failed` (class
+   *    `"evaluation"`, exit {@link EXIT_CODES.evaluation}) is published +
+   *    event-logged and the matching `RunFailedError` is thrown, in REPL
+   *    mode too (a quality-floor halt is terminal everywhere).
+   *  - `onFail: "note"` — the failing `eval_graded` event is the whole
+   *    story; the turn stands and the run continues.
+   *
+   * A turn that ABORTED (SIGINT / wall-clock timer) never completed, so it
+   * is not evaluated. Absent → zero behaviour change for existing callers.
+   */
+  evaluation?: RunEvaluation;
 };
 
 /**
@@ -3488,9 +3589,30 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
 
   async function runOneTurn(
     messages: Anthropic.MessageParam[],
-  ): Promise<{ terminalContent: Anthropic.ContentBlock[] }> {
+  ): Promise<{ terminalContent: Anthropic.ContentBlock[]; usage: ModelUsage }> {
     let state: TurnState = initialState;
     let terminalContent: Anthropic.ContentBlock[] = [];
+    // G02 — aggregate token usage across every MAIN-turn model call this
+    // turn makes (each tool iteration streams once). Handed to the in-loop
+    // evaluator so a judge can weigh cost/verbosity; side-calls (compaction,
+    // the injected judge itself) publish no accumulation here.
+    const turnUsage: { input: number; output: number; cacheRead: number; cacheCreate: number } = {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheCreate: 0,
+    };
+    const accrueTurnUsage = (u: {
+      readonly input: number;
+      readonly output: number;
+      readonly cacheRead?: number;
+      readonly cacheCreate?: number;
+    }): void => {
+      turnUsage.input += u.input;
+      turnUsage.output += u.output;
+      turnUsage.cacheRead += u.cacheRead ?? 0;
+      turnUsage.cacheCreate += u.cacheCreate ?? 0;
+    };
     let recovery: RecoveryState = initialRecoveryState;
     const maxToolIterations = opts.maxToolIterations ?? DEFAULT_MAX_TOOL_ITERATIONS;
     let toolIterations = 0;
@@ -3780,6 +3902,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               );
               clearModelCallTimer();
               endTurn();
+              accrueTurnUsage(usage);
 
               // On `stop_reason: "max_tokens"` the model may have been cut off
               // mid-`tool_use`; the streaming executor only runs a call once its
@@ -3916,6 +4039,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             });
             clearModelCallTimer();
             endTurn();
+            accrueTurnUsage(final.usage);
 
             // Item 22 — lastServed() is exact: the candidate that actually
             // streamed this response. Cost-tracker prices off this pair.
@@ -4327,7 +4451,114 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         message: `turn aborted: the configured ${TIMEOUT_SPEC_KEYS[timedOut.crewhausTimeout]} (${timedOut.limitMs}ms) elapsed`,
       });
     }
-    return { terminalContent };
+    return { terminalContent, usage: turnUsage };
+  }
+
+  /** Concatenated text of a terminal content-block array (the same
+   *  projection the `singleTurn` return value uses). */
+  const terminalText = (blocks: ReadonlyArray<Anthropic.ContentBlock>): string =>
+    blocks
+      .filter((b): b is Anthropic.TextBlock => b.type === "text")
+      .map((b) => b.text)
+      .join("");
+
+  /**
+   * G02 — one COMPLETED turn plus its in-loop evaluation gate. Wraps
+   * `runOneTurn` so evaluation fires only at turn completion (the tool
+   * inner-loop lives INSIDE `runOneTurn`, so tool-only intermediate
+   * iterations can never reach the grader by construction), on both the
+   * `singleTurn` and REPL paths. Without `opts.evaluation` this is exactly
+   * `runOneTurn` — zero behaviour change.
+   *
+   * The retry ladder: grade attempt 0 (`retryIndex` 0); a failing verdict
+   * with `onFail: "retry"` appends the grader rationale as a synthetic
+   * corrective user message and re-runs the turn, re-grading each re-run
+   * (`retryIndex` n) up to `maxRetries`. Every re-run streams real model
+   * calls through the normal `NeedModel` path, so its spend is metered by
+   * the always-on budget cost path exactly like any other call. `halt`
+   * publishes + logs the classified `run_failed` (class `"evaluation"`)
+   * and throws; `note` and an exhausted retry cap leave the last attempt
+   * standing. An ABORTED (SIGINT / wall-clock) attempt never completed —
+   * it is returned un-graded.
+   */
+  async function runEvaluatedTurn(
+    messages: Anthropic.MessageParam[],
+  ): Promise<{ terminalContent: Anthropic.ContentBlock[]; usage: ModelUsage }> {
+    const evaluation = opts.evaluation;
+    let attempt = await runOneTurn(messages);
+    if (evaluation === undefined) return attempt;
+    const maxRetries = Math.max(0, Math.floor(evaluation.maxRetries));
+    for (let retryIndex = 0; ; retryIndex += 1) {
+      // A turn the abort tree stopped (SIGINT, turn/model-call/run timer)
+      // did not COMPLETE — grading its partial output would be noise, and
+      // a retry would fight the very signal that stopped it.
+      if (turnAbort.signal.aborted || runAbort.signal.aborted) return attempt;
+      let graded: EvaluationResult;
+      out.spinner.start("evaluating");
+      try {
+        graded = await evaluation.evaluate({
+          finalText: terminalText(attempt.terminalContent),
+          messages,
+          usage: attempt.usage,
+        });
+      } catch (err) {
+        // Grading INFRASTRUCTURE failure (judge model down, evaluator bug)
+        // is not a verdict. Fail open: record it and let the turn stand —
+        // a flaky judge must not kill an otherwise healthy run.
+        const errObj = err as { name?: unknown; message?: unknown };
+        const name = typeof errObj.name === "string" ? errObj.name : "EvaluationError";
+        const message = typeof errObj.message === "string" ? errObj.message : String(err);
+        runContext.logger.warn("evaluation: grader threw — turn stands un-graded", {
+          name,
+          message,
+        });
+        await logEvent("error", { name, message: `evaluation grader failed: ${message}` });
+        return attempt;
+      } finally {
+        out.spinner.stop();
+      }
+      // A rogue evaluator returning NaN/±Infinity must not poison the
+      // trace surface; treat non-finite as 0 (an unambiguous fail).
+      const score = Number.isFinite(graded.score) ? graded.score : 0;
+      const rationale = graded.rationale;
+      const verdict: "pass" | "fail" = score >= evaluation.threshold ? "pass" : "fail";
+      bus.publish({
+        ...bus.envelope(),
+        kind: "eval_graded",
+        score,
+        threshold: evaluation.threshold,
+        verdict,
+        graderType: evaluation.graderType,
+        retryIndex,
+      });
+      if (verdict === "pass" || evaluation.onFail === "note") return attempt;
+      const rationaleNote =
+        rationale !== undefined && rationale.trim().length > 0 ? ` — ${rationale.trim()}` : "";
+      if (evaluation.onFail === "halt") {
+        const detail = `the ${evaluation.graderType} grader scored the final answer ${score.toFixed(2)}, below the required ${evaluation.threshold} threshold${rationaleNote}`;
+        const report: FailureReport = {
+          class: "evaluation",
+          title: "in-loop evaluation gate failed",
+          detail,
+          remediation:
+            "improve the agent (instructions/model), lower evaluation.threshold, or soften evaluation.on_fail to retry/note",
+          exitCode: EXIT_CODES.evaluation,
+        };
+        await publishRunFailed(report);
+        throw new RunFailedError(report);
+      }
+      // onFail: "retry" — bounded by the resolved cap; when spent, the last
+      // attempt stands (the failing eval_graded trail tells the story).
+      if (retryIndex >= maxRetries) return attempt;
+      const feedback =
+        rationale !== undefined && rationale.trim().length > 0
+          ? ` Grader feedback: ${rationale.trim()}`
+          : "";
+      const correction = `[evaluation failed: scored ${score.toFixed(2)}, threshold ${evaluation.threshold}]${feedback}\nPlease revise your previous answer to address the feedback, then give the corrected answer in full.`;
+      messages.push({ role: "user", content: correction });
+      await logEvent("user_message", { content: correction, synthetic: true });
+      attempt = await runOneTurn(messages);
+    }
   }
 
   // Single-shot path used by the workflow target and (Section 12) the
@@ -4406,9 +4637,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       // G10 — the single turn IS the run: arm the per-turn ceiling around
       // it (the deadline timer is already live from boot). Fired timers
       // surface as a classified RunFailedError out of runOneTurn; the
-      // finally below tears every timer down on all paths.
+      // finally below tears every timer down on all paths. (G02 — the
+      // evaluated wrapper re-runs the turn on a failing verdict, all
+      // attempts inside the same armed window: a retried turn is still ONE
+      // turn against `turn_timeout_ms`.)
       armTurnTimer();
-      const { terminalContent } = await runOneTurn(messages);
+      const { terminalContent } = await runEvaluatedTurn(messages);
       clearTurnTimer();
       bus.publish({
         ...bus.envelope(),
@@ -4416,10 +4650,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         turn: runContext.turnNumber,
         durationMs: performance.now() - t0SingleTurn,
       });
-      return terminalContent
-        .filter((b): b is Anthropic.TextBlock => b.type === "text")
-        .map((b) => b.text)
-        .join("");
+      return terminalText(terminalContent);
     } finally {
       clearAllTimers();
       out.spinner.stop();
@@ -4655,7 +4886,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       // RunFailedError, which the catch rethrows.
       armTurnTimer();
       try {
-        await runOneTurn(messages);
+        await runEvaluatedTurn(messages);
       } catch (err) {
         // Defensive: tear down any animation a thrown turn left spinning.
         out.spinner.stop();

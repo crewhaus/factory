@@ -160,6 +160,7 @@ describe("EXIT_CODES", () => {
       rate_limit: 32,
       crewhaus_budget: 33,
       timeout: 34,
+      evaluation: 35,
       tool: 40,
     });
   });

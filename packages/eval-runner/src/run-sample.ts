@@ -11,9 +11,13 @@ import {
 } from "@crewhaus/eval-grader";
 import { type Event as TranscriptEvent, openEventLog } from "@crewhaus/event-log";
 import { createRunContext } from "@crewhaus/run-context";
-import type { ModelResponseEvent, TraceEvent } from "@crewhaus/trace-event-bus";
+import type {
+  ModelResponseEvent,
+  PermissionDecisionEvent,
+  TraceEvent,
+} from "@crewhaus/trace-event-bus";
 import { RunnerError } from "./errors";
-import type { AgentInvoker, GraderEntry, SampleResult } from "./types";
+import type { AgentInvoker, GraderEntry, SampleMetrics, SampleResult } from "./types";
 
 /**
  * Per-sample logic. Mints a fresh runContext (and therefore a fresh
@@ -31,9 +35,17 @@ export async function runSample(args: {
   /** The spec name (`ir.name`) — threaded into `RunResult.artifacts` so
    *  artifact graders can address `.crewhaus/state/<specName>/` directly. */
   specName?: string;
+  /**
+   * G15 — 1-based trial index under `RunEvalOptions.repeats`. Trial 1 (or
+   * absent) keeps the pre-repeats artifact layout (`<outDir>/<sampleId>/`);
+   * trials ≥ 2 get their own `<sampleId>.trial<N>` directory so repeated
+   * runs never clobber each other's transcripts.
+   */
+  trial?: number;
 }): Promise<SampleResult> {
   const { sample, invoker, graders, outDir, model } = args;
-  const sampleDir = join(outDir, sanitize(sample.id));
+  const trialSuffix = args.trial !== undefined && args.trial > 1 ? `.trial${args.trial}` : "";
+  const sampleDir = join(outDir, `${sanitize(sample.id)}${trialSuffix}`);
   mkdirSync(sampleDir, { recursive: true });
 
   const runContext = createRunContext();
@@ -101,6 +113,7 @@ export async function runSample(args: {
   const turns = transcript.filter((e) => e.kind === "assistant_message").length;
   const toolCalls = extractToolCalls(finalEvents);
   const tokens = sumTokens(finalEvents);
+  const metrics = computeMetrics(sample, finalEvents, toolCalls);
 
   // Apply graders. `artifacts` is the PR-19 seam for artifact-reading
   // graders (grader-continuity): the sample's own directory — the primary
@@ -170,6 +183,7 @@ export async function runSample(args: {
     model,
     agentOutput,
     grades: { overall, perGrader },
+    metrics,
     ...(error !== undefined ? { error } : {}),
     ...(graderError !== undefined ? { graderError } : {}),
   };
@@ -187,9 +201,11 @@ export async function runSample(args: {
         turns,
         tokens,
         model,
+        metrics,
         ...(error !== undefined ? { error } : {}),
         ...(graderError !== undefined ? { graderError } : {}),
         ...(args.seed !== undefined ? { seed: args.seed } : {}),
+        ...(args.trial !== undefined && args.trial > 1 ? { trial: args.trial } : {}),
       },
       null,
       2,
@@ -197,6 +213,61 @@ export async function runSample(args: {
   );
 
   return sampleResult;
+}
+
+/**
+ * G56 — extract per-sample loop-quality metrics from the captured trace
+ * events. The safety buckets are DISJOINT (see `SafetyViolationCounts`):
+ * `egress-blocked` outcomes count only as egress blocks even though their
+ * `decision` is also `"deny"`; a deny carrying `judgeModel` is the intent
+ * gate's justification rejection; every remaining deny is a plain
+ * permission denial. Resolved asks (`askOutcome` present — published as a
+ * SECOND `decision: "ask"` event, so they never collide with the deny
+ * buckets) count as human-intervention points.
+ */
+function computeMetrics(
+  sample: Sample,
+  events: ReadonlyArray<TraceEvent>,
+  toolCalls: ReadonlyArray<ToolCall>,
+): SampleMetrics {
+  let interventions = 0;
+  let permissionDenials = 0;
+  let egressBlocks = 0;
+  let justificationRejections = 0;
+  const modelCallLatenciesMs: number[] = [];
+  for (const ev of events) {
+    if (ev.kind === "model_response") {
+      modelCallLatenciesMs.push((ev as ModelResponseEvent).durationMs);
+    } else if (ev.kind === "permission_decision") {
+      const e = ev as PermissionDecisionEvent;
+      if (e.askOutcome !== undefined) interventions += 1;
+      if (e.outcome === "egress-blocked") egressBlocks += 1;
+      else if (e.decision === "deny" && e.judgeModel !== undefined) justificationRejections += 1;
+      else if (e.decision === "deny") permissionDenials += 1;
+    }
+  }
+
+  let toolCallAccuracy: number | undefined;
+  const expected = sample.expected_tools;
+  if (expected !== undefined && expected.length > 0) {
+    const expectedSet = new Set(expected);
+    const called = new Set(toolCalls.map((c) => c.toolName));
+    let hit = 0;
+    for (const name of expectedSet) if (called.has(name)) hit += 1;
+    toolCallAccuracy = hit / expectedSet.size;
+  }
+
+  return {
+    ...(toolCallAccuracy !== undefined ? { toolCallAccuracy } : {}),
+    interventions,
+    safetyViolations: {
+      permissionDenials,
+      egressBlocks,
+      justificationRejections,
+      total: permissionDenials + egressBlocks + justificationRejections,
+    },
+    modelCallLatenciesMs,
+  };
 }
 
 /** Helper: produce one combined grader from an array of CompiledGrader. */

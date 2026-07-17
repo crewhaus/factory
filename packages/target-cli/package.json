@@ -17,6 +17,7 @@
   "peerDependencies": {
     "@crewhaus/egress-matcher-semantic": "workspace:*",
     "@crewhaus/embedder": "workspace:*",
+    "@crewhaus/eval-judge": "workspace:*",
     "@crewhaus/hooks-engine": "workspace:*",
     "@crewhaus/skills-registry": "workspace:*",
     "@crewhaus/slash-commands": "workspace:*"
@@ -26,6 +27,9 @@
       "optional": true
     },
     "@crewhaus/embedder": {
+      "optional": true
+    },
+    "@crewhaus/eval-judge": {
       "optional": true
     }
   },

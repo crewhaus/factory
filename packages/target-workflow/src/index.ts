@@ -25,8 +25,33 @@ import {
  * McpHost boots before the steps and its tools flow to every step that
  * declares tools.
  *
- * Future expansion: parallel/conditional steps, fan-out, retry/branch
- * logic — this v0 emits strictly sequential execution.
+ * Loop contract 0.4 (Batch B, G02) — `kind: "judge"` steps are emitted as
+ * JUDGE GATES over the previous non-judge step's output:
+ *
+ *   - The gate scores `priorOutput` in [0,1] against the judge criteria
+ *     via `@crewhaus/eval-judge` (forced-tool scoring, single-criterion
+ *     rubric, `(n − 1) / 4` mapping — the createJudgeGrader convention)
+ *     on the judge step's resolved `model`.
+ *   - Every scoring pass publishes a `judge_verdict` trace event on the
+ *     bundle's shared RunContext bus and prints a `[judge <name>]` line.
+ *   - `on_fail: retry_previous` re-runs the gated step with the judge
+ *     rationale appended to its instructions as a system nudge, at most
+ *     `maxRetries` times; a still-failing gate then stops the run
+ *     CLASSIFIED (fail-closed — the loop projection's outgoing edge only
+ *     fires on "pass"). `halt` stops classified immediately; `continue`
+ *     records the verdict and proceeds with the flagged output.
+ *   - Gated steps are emitted as re-invocable closures with their input
+ *     captured BEFORE the first run, so a retry replays the exact same
+ *     user content (not the step's own output).
+ *
+ * v0 honesty notes (mirrors the per-step `budget` meter caveat): judge
+ * model calls ride OUTSIDE the per-step budget meter and the runtime
+ * deadline timers (eval-judge drives the provider adapter directly), and
+ * in a judge CHAIN a retry re-scores only the retrying judge — earlier
+ * judges' verdicts refer to the previous attempt.
+ *
+ * Future expansion: parallel/conditional steps, fan-out — this v0 emits
+ * strictly sequential execution.
  */
 export function emitWorkflow(ir: IrWorkflowV0, opts: EmitReadmeOptions = {}): Bundle {
   const files = [
@@ -112,12 +137,43 @@ function resolveAllTools(steps: readonly IrWorkflowStep[]): string[] {
 }
 
 /**
+ * Loop contract 0.4 (Batch B, G02) — is this step a judge gate? The IR
+ * contract sets `judge` iff `kind === "judge"`; both are checked so a
+ * malformed direct-IR step falls through to the regular renderer (and the
+ * judge renderer's own guard) instead of emitting a half-gate.
+ */
+function isJudgeStep(step: IrWorkflowStep): boolean {
+  return step.kind === "judge" && step.judge !== undefined;
+}
+
+/**
+ * Loop contract 0.4 (Batch B, G02) — index of the step a judge at
+ * `judgeIdx` gates: the NEAREST earlier non-judge step. Judge steps pass
+ * `priorOutput` through untouched, so consecutive judges all gate the
+ * same upstream output (two quality bars on one artifact). parseSpec
+ * rejects `steps[0]` as a judge; this re-checks for direct emitWorkflow
+ * callers (same convention as target-graph's validateGraph).
+ */
+function gatedStepIndex(steps: readonly IrWorkflowStep[], judgeIdx: number): number {
+  for (let i = judgeIdx - 1; i >= 0; i -= 1) {
+    const s = steps[i];
+    if (s !== undefined && !isJudgeStep(s)) return i;
+  }
+  throw new TargetEmitError(
+    `judge step "${steps[judgeIdx]?.name ?? judgeIdx}" has no earlier non-judge step to gate — a judge cannot be the first step`,
+  );
+}
+
+/**
  * Fields shared verbatim by every step's runChatLoop call, precomputed
  * once in renderAgent. `hooksExpr` is `__allHooks` when the spec declares
  * `hooks:` (concat with the discovered settings.json hooks), else the
  * pre-existing `__hooks`. `deadlineMs` renders the per-step whole-run
  * deadline guard; `mcpWired` spreads `__mcpTools` into tool-declaring
- * steps (G05).
+ * steps (G05). `runContextLine` threads the shared `__runContext` into
+ * every call when the workflow carries judge steps (G02) — one bus for
+ * step traces and judge verdicts — and is empty otherwise so judge-free
+ * bundles stay byte-identical.
  */
 type StepShared = {
   readonly permFields: string;
@@ -127,6 +183,7 @@ type StepShared = {
   readonly hooksExpr: string;
   readonly deadlineMs: number | undefined;
   readonly mcpWired: boolean;
+  readonly runContextLine: string;
 };
 
 function renderStep(step: IrWorkflowStep, idx: number, total: number, shared: StepShared): string {
@@ -155,8 +212,166 @@ ${deadlineGuard}${stdinReadLine}  process.stdout.write("\\n[step ${stepNum}/${to
     seedMessages: [{ role: "user", content: ${userContent} }],${toolsField}${stepTuningFields}${shared.limitsFields}${shared.budgetField}${shared.permFields}${shared.failureTaxonomyField}
     hooks: ${shared.hooksExpr},
     skills: __skills,
-    slashCommands: __slashCommands,
+    slashCommands: __slashCommands,${shared.runContextLine}
   });
+`;
+}
+
+/**
+ * Loop contract 0.4 (Batch B, G02) — render a step that a downstream
+ * judge gates. Identical to {@link renderStep} except the user input is
+ * captured into a const BEFORE the first run (a retry must replay the
+ * step's ORIGINAL input, not the output it just produced) and the
+ * runChatLoop call is wrapped in a re-invocable closure taking the judge
+ * nudge; the nudge is appended to the step's instructions (seed roles are
+ * user/assistant only, so "system nudge" = instructions suffix).
+ */
+function renderGatedStep(
+  step: IrWorkflowStep,
+  idx: number,
+  total: number,
+  shared: StepShared,
+): string {
+  const isFirst = idx === 0;
+  const stepNum = idx + 1;
+  const toolsField = renderStepToolsField(step.tools, shared.mcpWired);
+  const stepTuningFields = renderStepTuningFields(step);
+  const deadlineGuard = renderDeadlineGuard(shared.deadlineMs, stepNum, total, step.name);
+  const inputExpr = isFirst
+    ? 'stdinInput || "begin"'
+    : "`## Output of previous step:\\n${priorOutput}\\n\\n## Your task:\\n(continue based on the previous step's output)`";
+  const stdinReadLine = isFirst ? "  const stdinInput = await readStdinToEnd();\n" : "";
+
+  return `
+  // ── Step ${stepNum}/${total}: ${step.name} ──
+${deadlineGuard}${stdinReadLine}  process.stdout.write(${escapeJsonString(`\n[step ${stepNum}/${total}: ${step.name}]\n`)});
+  // Judge-gated (loop contract 0.4, G02): input captured up front, call
+  // wrapped in a closure so the gate can re-run this step with the judge
+  // rationale appended as a nudge (bounded by the judge's max_retries).
+  const __step${stepNum}Input = ${inputExpr};
+  const __runStep${stepNum} = async (__nudge: string): Promise<string> => runChatLoop({
+    model: ${escapeJsonString(step.model)},
+    instructions: ${escapeJsonString(step.instructions)} + __nudge,
+    singleTurn: true,
+    seedMessages: [{ role: "user", content: __step${stepNum}Input }],${toolsField}${stepTuningFields}${shared.limitsFields}${shared.budgetField}${shared.permFields}${shared.failureTaxonomyField}
+    hooks: ${shared.hooksExpr},
+    skills: __skills,
+    slashCommands: __slashCommands,${shared.runContextLine}
+  });
+  priorOutput = await __runStep${stepNum}("");
+`;
+}
+
+/**
+ * Loop contract 0.4 (Batch B, G02) — render a judge step. The gate scores
+ * `priorOutput` (the gated step's output — judges pass it through
+ * untouched) with the generated `__judgeGate` helper, publishes ONE
+ * `judge_verdict` trace event per scoring pass, prints a `[judge <name>]`
+ * line, then applies the resolved `onFail`:
+ *
+ *   - `retry_previous`: re-invoke the gated step's closure with the
+ *     rationale nudge, at most `maxRetries` times; retries exhausted with
+ *     the gate still failing stops the run classified (fail-closed — the
+ *     projection's outgoing edge fires only on "pass").
+ *   - `halt`: publish `run_failed` (the graph-engine G69 convention) and
+ *     throw the classified RunFailedError immediately.
+ *   - `continue`: print the flagged-output note and proceed.
+ *
+ * Every emit-time string that reaches executable code threads through
+ * escapeJsonString — judge/step names and criteria are user-controlled.
+ */
+function renderJudgeStep(
+  step: IrWorkflowStep,
+  idx: number,
+  steps: readonly IrWorkflowStep[],
+  total: number,
+  shared: StepShared,
+): string {
+  const gate = step.judge;
+  if (gate === undefined) {
+    throw new TargetEmitError(
+      `judge step "${step.name}" carries no judge config — kind: "judge" requires a judge block`,
+    );
+  }
+  const stepNum = idx + 1;
+  const gIdx = gatedStepIndex(steps, idx);
+  const gated = steps[gIdx] as IrWorkflowStep;
+  const gatedNum = gIdx + 1;
+  const deadlineGuard = renderDeadlineGuard(shared.deadlineMs, stepNum, total, step.name);
+  const header = `
+  // ── Step ${stepNum}/${total}: ${step.name} (judge — gates step ${gatedNum}/${total}: ${gated.name}) ──
+${deadlineGuard}  process.stdout.write(${escapeJsonString(`\n[step ${stepNum}/${total}: ${step.name} (judge)]\n`)});
+`;
+  const scoringPass = (i: string): string =>
+    [
+      `${i}const __result = await __judgeGate({`,
+      `${i}  criteria: ${escapeJsonString(gate.criteria)},`,
+      `${i}  model: ${escapeJsonString(step.model)},`,
+      `${i}  gatedTask: ${escapeJsonString(gated.instructions)},`,
+      `${i}  output: priorOutput,`,
+      `${i}});`,
+      `${i}const __pass = __result.score >= ${gate.threshold};`,
+      `${i}const __bus = __runContext.eventBus;`,
+      `${i}__bus.publish({`,
+      `${i}  ...__bus.envelope(),`,
+      `${i}  kind: "judge_verdict",`,
+      `${i}  stepOrNode: ${escapeJsonString(step.name)},`,
+      `${i}  verdict: __pass ? "pass" : "fail",`,
+      `${i}  score: __result.score,`,
+      `${i}  ...(__result.rationale.length > 0 ? { rationale: __result.rationale } : {}),`,
+      `${i}});`,
+      `${i}process.stdout.write(${escapeJsonString(`[judge ${step.name}] `)} + "verdict=" + (__pass ? "pass" : "fail") + " score=" + __result.score.toFixed(2) + ${escapeJsonString(` threshold=${gate.threshold}\n`)});`,
+    ].join("\n");
+  const throwBlock = (title: string, detailOpen: string, indent: string): string =>
+    [
+      `${indent}const __report = {`,
+      `${indent}  class: "evaluation" as const,`,
+      `${indent}  title: ${escapeJsonString(title)},`,
+      `${indent}  detail: ${escapeJsonString(detailOpen)} + __result.score.toFixed(2) + ${escapeJsonString(` < threshold ${gate.threshold}`)} + (__result.rationale.length > 0 ? " — " + __result.rationale : ""),`,
+      `${indent}  remediation: ${escapeJsonString(`raise step "${gated.name}"'s quality (instructions/model), lower the judge threshold, or set on_fail: continue`)},`,
+      `${indent}  exitCode: __EVAL_EXIT,`,
+      `${indent}};`,
+      `${indent}__bus.publish({ ...__bus.envelope(), kind: "run_failed", class: __report.class, message: __report.title + ": " + __report.detail, remediation: __report.remediation, exitCode: __report.exitCode });`,
+      `${indent}throw new RunFailedError(__report);`,
+    ].join("\n");
+
+  if (gate.onFail === "retry_previous") {
+    const nudgeExpr = `${escapeJsonString(`\n\n[judge feedback — the previous attempt failed the "${step.name}" gate (score `)} + __result.score.toFixed(2) + ${escapeJsonString(` < threshold ${gate.threshold})]:\n`)} + __result.rationale`;
+    return `${header}  {
+    let __retries = 0;
+    for (;;) {
+${scoringPass("      ")}
+      if (__pass) break;
+      if (__retries >= ${gate.maxRetries}) {
+${throwBlock(
+  "judge gate failed after retries",
+  `judge step "${step.name}" still scored `,
+  "        ",
+)}
+      }
+      __retries += 1;
+      process.stdout.write(${escapeJsonString(`[judge ${step.name}] retry `)} + __retries + ${escapeJsonString(`/${gate.maxRetries} of step ${gatedNum}/${total}: ${gated.name}\n`)});
+      priorOutput = await __runStep${gatedNum}(${nudgeExpr});
+    }
+  }
+`;
+  }
+  if (gate.onFail === "halt") {
+    return `${header}  {
+${scoringPass("    ")}
+    if (!__pass) {
+${throwBlock("judge gate failed", `judge step "${step.name}" scored `, "      ")}
+    }
+  }
+`;
+  }
+  // on_fail: continue — record the verdict (event + line) and proceed.
+  return `${header}  {
+${scoringPass("    ")}
+    if (!__pass) {
+      process.stdout.write(${escapeJsonString(`[judge ${step.name}] on_fail=continue — proceeding with the flagged output\n`)});
+    }
+  }
 `;
 }
 
@@ -438,6 +653,66 @@ function indentStepBodies(stepBodies: string): string {
     .join("\n");
 }
 
+/**
+ * Loop contract 0.4 (Batch B, G02) — module-scope judge machinery, emitted
+ * once when the workflow carries judge steps: the `__judgeGate` scorer
+ * (eval-judge's forced-tool `judge()` over a synthesized single-criterion
+ * rubric with generic 1–5 anchors, mapped to [0,1] via `(n − 1) / 4` — the
+ * createJudgeGrader convention) and the classified exit code. The exit
+ * code reads `EXIT_CODES.evaluation` with a literal 35 fallback (the next
+ * slot in the 3x own-ceiling band after crewhaus_budget 33 / timeout 34)
+ * so bundles emitted before @crewhaus/errors ships the member still exit
+ * classified. Mirror: target-graph emits the same helper.
+ */
+const JUDGE_GATE_HELPER = `
+/**
+ * Loop contract 0.4 (G02) — score \`output\` in [0,1] against free-text
+ * judge criteria: eval-judge's forced-tool scorer over a single-criterion
+ * rubric (generic 1–5 anchors), mapped down via (n - 1) / 4. The judge
+ * model resolves through the model-router, so any provider can judge.
+ */
+async function __judgeGate(opts: {
+  criteria: string;
+  model: string;
+  gatedTask: string;
+  output: string;
+}): Promise<{ score: number; rationale: string }> {
+  const result = await judge({
+    rubric: {
+      criteria: [
+        {
+          name: "criteria",
+          description: opts.criteria,
+          anchors: {
+            "1": "clearly fails the criteria",
+            "2": "mostly fails the criteria",
+            "3": "partially meets the criteria",
+            "4": "mostly meets the criteria",
+            "5": "fully meets the criteria",
+          },
+        },
+      ],
+      passing_score: 3,
+    },
+    sample: { id: "judge-gate", input: opts.gatedTask },
+    agentOutput: opts.output,
+    model: opts.model,
+  });
+  return { score: (result.score - 1) / 4, rationale: result.rationale };
+}
+`;
+
+/**
+ * G02 — companion const to {@link JUDGE_GATE_HELPER}, emitted only when a
+ * gate can THROW (`on_fail: halt` / exhausted `retry_previous`) so
+ * continue-only bundles carry no dead throw machinery.
+ */
+const EVAL_EXIT_CONST = `
+// Classified exit for a failed judge gate (falls back to 35 until
+// @crewhaus/errors ships EXIT_CODES.evaluation).
+const __EVAL_EXIT: number = (EXIT_CODES as Record<string, number>)["evaluation"] ?? 35;
+`;
+
 function renderAgent(ir: IrWorkflowV0): string {
   const importLines = resolveAllTools(ir.steps);
   const importBlock = importLines.length > 0 ? `${importLines.join("\n")}\n` : "";
@@ -456,6 +731,19 @@ function renderAgent(ir: IrWorkflowV0): string {
   const specHooksBoot = renderSpecHooksBoot(ir);
   const hasSpecHooks = specHooksBoot !== "";
   const deadlineMs = ir.limits?.deadlineMs;
+  // G02 — judge gates: which steps are judges, and which steps a judge
+  // gates (those render as re-invocable closures). `hasThrowingJudges`
+  // gates the classified-throw machinery (halt / exhausted retries);
+  // continue-only bundles skip it entirely.
+  const hasJudges = ir.steps.some(isJudgeStep);
+  const hasThrowingJudges = ir.steps.some(
+    (s) => isJudgeStep(s) && s.judge !== undefined && s.judge.onFail !== "continue",
+  );
+  const gatedIdx = new Set<number>();
+  for (let i = 0; i < ir.steps.length; i += 1) {
+    const s = ir.steps[i];
+    if (s !== undefined && isJudgeStep(s)) gatedIdx.add(gatedStepIndex(ir.steps, i));
+  }
   const shared: StepShared = {
     permFields,
     failureTaxonomyField,
@@ -464,8 +752,17 @@ function renderAgent(ir: IrWorkflowV0): string {
     hooksExpr: hasSpecHooks ? "__allHooks" : "__hooks",
     deadlineMs,
     mcpWired: mcp.wired,
+    runContextLine: hasJudges ? "\n    runContext: __runContext," : "",
   };
-  const stepBodies = ir.steps.map((s, i) => renderStep(s, i, ir.steps.length, shared)).join("");
+  const stepBodies = ir.steps
+    .map((s, i) =>
+      isJudgeStep(s)
+        ? renderJudgeStep(s, i, ir.steps, ir.steps.length, shared)
+        : gatedIdx.has(i)
+          ? renderGatedStep(s, i, ir.steps.length, shared)
+          : renderStep(s, i, ir.steps.length, shared),
+    )
+    .join("");
   // v0.3.0 — continuity is spec-carried on this shape but not emit-wired in
   // 0.3.0 (only the five agent-loop shapes are). Surface it, 0.2.3-style.
   const continuityWarning =
@@ -509,11 +806,51 @@ import { loadCommands } from "@crewhaus/slash-commands";
 `
     : stepBodies;
 
+  // G02 — judge-step machinery, emitted only when a judge is present so
+  // judge-free bundles stay byte-identical: the eval-judge/errors/
+  // run-context imports, the module-scope __judgeGate helper, the shared
+  // RunContext boot (one bus for step traces AND judge verdicts), and the
+  // classified catch wrapper around main() (target-graph's convention) so
+  // a judge halt exits with the report's code instead of a raw Bun stack.
+  const errorsMembers = hasThrowingJudges
+    ? "EXIT_CODES, RunFailedError, formatRunFailure, toFailureReport"
+    : "formatRunFailure, toFailureReport";
+  const judgeImports = hasJudges
+    ? `import { ${errorsMembers} } from "@crewhaus/errors";
+import { judge } from "@crewhaus/eval-judge";
+import { createRunContext } from "@crewhaus/run-context";
+`
+    : "";
+  const judgeHelperBlock = hasJudges
+    ? `${JUDGE_GATE_HELPER}${hasThrowingJudges ? EVAL_EXIT_CONST : ""}`
+    : "";
+  const runContextBoot = hasJudges
+    ? [
+        "",
+        "  // G02 — one shared RunContext: every step's trace events and the",
+        "  // judge verdicts land on a single bus (single runId, like the graph",
+        "  // bundle's shared context).",
+        "  const __runContext = createRunContext();",
+      ].join("\n")
+    : "";
+  const mainInvocation = hasJudges
+    ? `try {
+  await main();
+} catch (__err) {
+  // G02 — render the ONE structured failure report (a failed judge gate
+  // throws a classified RunFailedError) and exit with its coded status
+  // instead of an unhandled Bun stack (mirror: target-graph's wrapper).
+  const __report = toFailureReport(__err);
+  process.stderr.write(\`\${formatRunFailure(__report, { prefix: "[workflow]" })}\\n\`);
+  process.exit(__report.exitCode);
+}`
+    : "await main();";
+
   return `#!/usr/bin/env bun
 // Generated by crewhaus. DO NOT EDIT.
 // Source spec: ${escapeJsonString(ir.name)} (target: workflow, ir version: ${ir.version}, ${ir.steps.length} step(s))
 ${mcp.note}${continuityWarning}import { runChatLoop } from "@crewhaus/runtime-core";
-${permImport}${extensionImports}${importBlock}${mcpImportBlock}
+${judgeImports}${permImport}${extensionImports}${importBlock}${mcpImportBlock}
 async function readStdinToEnd(): Promise<string> {
   // No piped input — don't block waiting on an interactive TTY.
   if (process.stdin.isTTY) return "";
@@ -523,9 +860,9 @@ async function readStdinToEnd(): Promise<string> {
   }
   return Buffer.concat(chunks).toString("utf-8").trim();
 }
-
+${judgeHelperBlock}
 async function main(): Promise<void> {
-  let priorOutput = "";${deadlineBoot}
+  let priorOutput = "";${deadlineBoot}${runContextBoot}
   const __cwd = process.cwd();
   const [__hooks, __skills, __slashCommands] = await Promise.all([
     loadHooks({ cwd: __cwd }),
@@ -536,6 +873,6 @@ async function main(): Promise<void> {
   void __skillTool;${specHooksBoot}${mcp.bootBlock}
 ${stepsSection}}
 
-await main();
+${mainInvocation}
 `;
 }

@@ -14,7 +14,8 @@
  */
 import { describe, expect, test } from "bun:test";
 import { type Spec, parseSpec } from "@crewhaus/spec";
-import { OPTIMIZABLE_PATHS, specHasPath } from "./index";
+import { parse } from "yaml";
+import { OPTIMIZABLE_PATHS, applySpecEdits, diffSpecYaml, specHasPath } from "./index";
 
 const CHAIN_BLOCKS = `
 chains:
@@ -75,6 +76,19 @@ limits:
   max_tool_iterations: 25
 `.trim();
 
+// Loop contract 0.4 (Batch B, G40) — threshold is llm_judge-only, so the
+// fixture grader must be llm_judge for ["evaluation","threshold"] to be
+// declarable.
+const EVALUATION = `
+evaluation:
+  grader:
+    type: llm_judge
+    criteria: the answer is correct and complete
+  threshold: 0.8
+  on_fail: retry
+  max_retries: 2
+`.trim();
+
 /** One fixture per target, declaring a value at EVERY optimizable path. */
 const FIXTURES: Readonly<Record<Spec["target"], string>> = {
   cli: [
@@ -99,6 +113,7 @@ const FIXTURES: Readonly<Record<Spec["target"], string>> = {
     LIMITS,
     CHAIN_BLOCKS,
     MEMORY_CONTINUITY,
+    EVALUATION,
   ].join("\n"),
   workflow: [
     "name: fx",
@@ -130,6 +145,7 @@ const FIXTURES: Readonly<Record<Spec["target"], string>> = {
     LIMITS,
     CHAIN_BLOCKS,
     MEMORY_CONTINUITY,
+    EVALUATION,
   ].join("\n"),
   graph: [
     "name: fx",
@@ -158,6 +174,7 @@ const FIXTURES: Readonly<Record<Spec["target"], string>> = {
     FAILURE_TAXONOMY,
     LIMITS,
     MEMORY_CONTINUITY,
+    EVALUATION,
   ].join("\n"),
   pipeline: [
     "name: fx",
@@ -312,6 +329,61 @@ describe("OPTIMIZABLE_PATHS ⊆ spec schema (subset-of-schema guard)", () => {
           specHasPath(yaml, path),
           `optimizable path [${path.join(", ")}] is not declarable on target "${target}" — phantom entry in OPTIMIZABLE_PATHS or fixture gap`,
         ).toBe(true);
+      }
+    });
+  }
+});
+
+/** Walk a parsed (plain-JS) value tree down a property-key path. */
+function getAtPath(value: unknown, path: ReadonlyArray<string>): unknown {
+  let cur: unknown = value;
+  for (const seg of path) {
+    if (typeof cur !== "object" || cur === null) return undefined;
+    cur = (cur as Record<string, unknown>)[seg];
+  }
+  return cur;
+}
+
+/**
+ * Loop contract 0.4 (Batch B, G40) — the same whitelist, exercised through
+ * the DECLARATIVE optimizer surface: every optimizable path must survive an
+ * `applySpecEdits` round-trip under `restrictToOptimizable` with the
+ * document's comments intact and zero value-level drift. A path that the
+ * edit surface can't upsert (or that trips the whitelist check it is itself
+ * listed in) fails HERE, not in a user's optimize run.
+ */
+describe("OPTIMIZABLE_PATHS × applySpecEdits (optimizer-surface round-trip)", () => {
+  const targets = Object.keys(OPTIMIZABLE_PATHS) as Array<Spec["target"]>;
+
+  for (const target of targets) {
+    test(`${target}: every optimizable path round-trips with comments preserved`, () => {
+      // A leading comment plus a structural comment pinned to a key every
+      // fixture carries — both must survive every edit.
+      const yaml = `# optimizer guard fixture\n${FIXTURES[target].replace(
+        "failure_taxonomy:",
+        "# recovery table\nfailure_taxonomy:",
+      )}`;
+      const parsed = parse(yaml) as Record<string, unknown>;
+      for (const path of OPTIMIZABLE_PATHS[target]) {
+        const value = getAtPath(parsed, path);
+        expect(
+          value,
+          `fixture for "${target}" carries no value at [${path.join(", ")}]`,
+        ).not.toBeUndefined();
+        // Upsert the value the document already carries: a pure round-trip,
+        // so the only acceptable outcome is "applied, byte-comments intact,
+        // value-identical".
+        const result = applySpecEdits(yaml, [{ path: [...path], value }], {
+          restrictToOptimizable: true,
+        });
+        expect(result.applied).toBe(1);
+        expect(result.spec.target).toBe(target);
+        expect(result.yaml).toContain("# optimizer guard fixture");
+        expect(result.yaml).toContain("# recovery table");
+        expect(
+          diffSpecYaml(yaml, result.yaml),
+          `re-setting [${path.join(", ")}] to its own value drifted the parsed spec`,
+        ).toEqual([]);
       }
     });
   }

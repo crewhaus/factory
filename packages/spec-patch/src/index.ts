@@ -223,9 +223,7 @@ export type SpecEdit = {
 };
 
 const specEditSchema = z.object({
-  path: z
-    .array(z.union([z.string().min(1), z.number().int().nonnegative()]))
-    .min(1),
+  path: z.array(z.union([z.string().min(1), z.number().int().nonnegative()])).min(1),
   value: z.unknown().optional(),
   rationale: z.string().optional(),
 });
@@ -276,10 +274,7 @@ export function applySpecEdits(
     try {
       spec = parseSpec(yamlText);
     } catch (err) {
-      throw new SpecPatchError(
-        `input YAML failed spec validation: ${(err as Error).message}`,
-        err,
-      );
+      throw new SpecPatchError(`input YAML failed spec validation: ${(err as Error).message}`, err);
     }
     return { yaml: yamlText, spec, applied: 0 };
   }
@@ -289,6 +284,14 @@ export function applySpecEdits(
     doc = parseDocument(yamlText);
   } catch (err) {
     throw new SpecPatchError("input YAML is not parseable", err);
+  }
+  // `parseDocument` collects syntax errors on `doc.errors` instead of
+  // throwing — without this check they'd only surface as the CST's opaque
+  // "Document with errors cannot be stringified" at toString() time.
+  if (doc.errors.length > 0) {
+    throw new SpecPatchError(
+      `input YAML is not parseable: ${doc.errors[0]?.message ?? "unknown error"}`,
+    );
   }
 
   if (opts.restrictToOptimizable === true) {
@@ -335,10 +338,7 @@ export function applySpecEdits(
   try {
     spec = parseSpec(newYaml);
   } catch (err) {
-    throw new SpecPatchError(
-      `edited YAML failed spec validation: ${(err as Error).message}`,
-      err,
-    );
+    throw new SpecPatchError(`edited YAML failed spec validation: ${(err as Error).message}`, err);
   }
   return { yaml: newYaml, spec, applied };
 }
@@ -361,11 +361,7 @@ function guardSequenceIndices(
     const seg = path[i] as SpecEditPathSegment;
     const parent = i === 0 ? doc.contents : doc.getIn(path.slice(0, i), true);
     const asIndex =
-      typeof seg === "number"
-        ? seg
-        : /^\d+$/.test(seg)
-          ? Number.parseInt(seg, 10)
-          : undefined;
+      typeof seg === "number" ? seg : /^\d+$/.test(seg) ? Number.parseInt(seg, 10) : undefined;
     if (isSeq(parent)) {
       if (asIndex !== undefined && asIndex > parent.items.length) {
         throw new SpecPatchError(
@@ -486,6 +482,15 @@ export const OPTIMIZABLE_PATHS: Readonly<
     Object.freeze(["memory", "wiki", "recallK"]),
     Object.freeze(["memory", "dream", "budget_usd"]),
     Object.freeze(["continuity", "focusMaxChars"]),
+    // Loop contract 0.4 (Batch B, G40) — the in-loop evaluation dials. The
+    // pass bar (llm_judge graders only — the spec rejects threshold on
+    // deterministic graders, so a mis-aimed patch fails the re-parse) and
+    // the retry cap are classic quality-vs-cost knobs. Deliberately NOT
+    // ["evaluation"] wholesale and NOT ["evaluation","grader"]: the grader
+    // (criteria/type) and on_fail behaviour are human-owned semantics —
+    // the optimizer tunes how strict the gate is, never what it judges.
+    Object.freeze(["evaluation", "threshold"]),
+    Object.freeze(["evaluation", "max_retries"]),
   ]),
   workflow: Object.freeze([
     Object.freeze(["steps"]),
@@ -514,6 +519,9 @@ export const OPTIMIZABLE_PATHS: Readonly<
     Object.freeze(["memory", "wiki", "recallK"]),
     Object.freeze(["memory", "dream", "budget_usd"]),
     Object.freeze(["continuity", "focusMaxChars"]),
+    // Loop contract 0.4 (Batch B, G40) — evaluation dials; see the cli entry.
+    Object.freeze(["evaluation", "threshold"]),
+    Object.freeze(["evaluation", "max_retries"]),
   ]),
   graph: Object.freeze([
     Object.freeze(["nodes"]),
@@ -540,6 +548,9 @@ export const OPTIMIZABLE_PATHS: Readonly<
     Object.freeze(["memory", "wiki", "recallK"]),
     Object.freeze(["memory", "dream", "budget_usd"]),
     Object.freeze(["continuity", "focusMaxChars"]),
+    // Loop contract 0.4 (Batch B, G40) — evaluation dials; see the cli entry.
+    Object.freeze(["evaluation", "threshold"]),
+    Object.freeze(["evaluation", "max_retries"]),
   ]),
   pipeline: Object.freeze([
     Object.freeze(["agent", "instructions"]),
@@ -623,7 +634,7 @@ export const OPTIMIZABLE_PATHS: Readonly<
   ]),
 });
 
-function isOptimizable(target: Spec["target"], path: ReadonlyArray<string>): boolean {
+function isOptimizable(target: Spec["target"], path: ReadonlyArray<SpecEditPathSegment>): boolean {
   const allowed = OPTIMIZABLE_PATHS[target];
   for (const ok of allowed) {
     if (ok.length !== path.length) continue;
