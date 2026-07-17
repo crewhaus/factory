@@ -21,11 +21,13 @@ import type {
   IrCrewV0,
   IrDiscordConfig,
   IrEvalV0,
+  IrEvaluation,
   IrFailureTaxonomyEntry,
   IrFeedback,
   IrGraphV0,
   IrHook,
   IrIMessageConfig,
+  IrJudge,
   IrLearning,
   IrLimits,
   IrManagedV0,
@@ -194,6 +196,12 @@ export function compile(yamlText: string, opts: CompileOptions = {}): CompileRes
  * key exists), so there is nothing accepted to warn about — they're absent
  * from the table by construction, not by oversight. When an emitter wires
  * a listed key, delete its row (the warnings tests pin the table).
+ *
+ * Batch B (G02): `evaluation:` on cli/channel/managed and `kind: "judge"`
+ * workflow steps / graph nodes are WIRED in this batch (the target emitters
+ * and the `crewhaus run` interpreter implement them alongside this
+ * lowering), so they are deliberately NOT listed either — declaring them
+ * must not warn.
  */
 type UnwiredKey = {
   readonly path: string;
@@ -999,6 +1007,79 @@ function lowerHooks(spec: SpecWithHooks): { hooks?: ReadonlyArray<IrHook> } {
 }
 
 /**
+ * Loop contract 0.4 (Batch B, G02) — lower the top-level `evaluation:`
+ * block (cli/channel/managed). `on_fail`/`max_retries` RESOLVE here
+ * (defaults `"retry"` / 1) so emitters and the interpreter read one
+ * deterministic shape; `threshold` resolves to 0.7 for the `llm_judge`
+ * grader and stays ABSENT for the deterministic graders (they are
+ * pass/fail — the spec rejects a declared threshold there). The judge
+ * model rides the item-25 aux-model machinery, so `cheapest` resolves at
+ * compile time exactly like `compaction.model`. Spread-return-{}
+ * discipline: the IR key stays absent when the spec omits the block.
+ */
+type SpecWithEvaluation = SpecWithPermissions & {
+  readonly evaluation?: {
+    readonly grader:
+      | { readonly type: "llm_judge"; readonly criteria: string; readonly model?: string }
+      | { readonly type: "contains"; readonly value: string }
+      | { readonly type: "regex"; readonly value: string };
+    readonly threshold?: number;
+    readonly on_fail?: "retry" | "halt" | "note";
+    readonly max_retries?: number;
+  };
+};
+
+function lowerEvaluation(spec: SpecWithEvaluation): { evaluation?: IrEvaluation } {
+  const e = spec.evaluation;
+  if (e === undefined) return {};
+  const grader: IrEvaluation["grader"] =
+    e.grader.type === "llm_judge"
+      ? {
+          type: "llm_judge",
+          criteria: e.grader.criteria,
+          ...(e.grader.model !== undefined
+            ? { model: resolveAuxModel(e.grader.model, spec, "evaluation.grader.model") }
+            : {}),
+        }
+      : e.grader.type === "contains"
+        ? { type: "contains", value: e.grader.value }
+        : { type: "regex", value: e.grader.value };
+  return {
+    evaluation: {
+      grader,
+      ...(e.grader.type === "llm_judge" ? { threshold: e.threshold ?? 0.7 } : {}),
+      onFail: e.on_fail ?? "retry",
+      maxRetries: e.max_retries ?? 1,
+    },
+  };
+}
+
+/**
+ * Loop contract 0.4 (Batch B, G02) — resolve a judge gate's knobs
+ * (defaults: threshold 0.7, on_fail `"retry_previous"`, max_retries 1).
+ * The judge MODEL is deliberately NOT part of `IrJudge`: the caller
+ * resolves it into the judge step's/node's ordinary `model` field
+ * (`judge.model ?? <shape>.model`, `cheapest` supported via
+ * `resolveAuxModel`) so emitters read one model slot per step/node.
+ */
+type SpecJudgeGateBlock = {
+  readonly criteria: string;
+  readonly model?: string;
+  readonly threshold?: number;
+  readonly on_fail?: "retry_previous" | "halt" | "continue";
+  readonly max_retries?: number;
+};
+
+function lowerJudgeGate(judge: SpecJudgeGateBlock): IrJudge {
+  return {
+    criteria: judge.criteria,
+    threshold: judge.threshold ?? 0.7,
+    onFail: judge.on_fail ?? "retry_previous",
+    maxRetries: judge.max_retries ?? 1,
+  };
+}
+
+/**
  * Loop contract 0.4 (Batch A) — lower `agent.rate_limits` (cli/channel/
  * managed). Values are carried verbatim under a frozen map; keys are tool
  * names or `"*"`. Spread-return-{} discipline.
@@ -1767,6 +1848,8 @@ export function lower(spec: Spec): IrNode {
         ...lowerBudget(spec),
         ...lowerLimits(spec),
         ...lowerHooks(spec),
+        // Loop contract 0.4 (Batch B, G02) — in-loop output evaluation.
+        ...lowerEvaluation(spec),
         ...lowerSecurity(spec),
         ...lowerFeedback(spec),
         ...memoryLowered,
@@ -1800,16 +1883,38 @@ export function lower(spec: Spec): IrNode {
         version: 0,
         name: spec.name,
         target: "workflow",
-        steps: spec.steps.map((s) => ({
-          name: s.name,
-          instructions: s.instructions,
-          model: s.model ?? spec.model,
-          ...(s.max_tokens !== undefined ? { maxTokens: s.max_tokens } : {}),
-          // Loop contract 0.4 (Batch A) — per-step thinking selector.
-          ...lowerThinking(s.thinking),
-          tools: s.tools ?? [],
-          toolConfigs: lowerToolConfigs(s.tool_config),
-        })),
+        steps: spec.steps.map((s, i) => {
+          // Loop contract 0.4 (Batch B, G02) — judge gate steps run no agent
+          // turn of their own: instructions carry the criteria verbatim, the
+          // judge model resolves into the ordinary `model` slot
+          // (`judge.model ?? workflow.model`, `cheapest` supported), and the
+          // gate knobs resolve in `lowerJudgeGate`. `kind` exists ONLY on
+          // the judge variant, so the `in` check is the discriminator.
+          if ("kind" in s) {
+            return {
+              name: s.name,
+              kind: "judge" as const,
+              instructions: s.judge.criteria,
+              model:
+                s.judge.model !== undefined
+                  ? resolveAuxModel(s.judge.model, spec, `steps[${i}].judge.model`)
+                  : spec.model,
+              tools: [],
+              toolConfigs: lowerToolConfigs(undefined),
+              judge: lowerJudgeGate(s.judge),
+            };
+          }
+          return {
+            name: s.name,
+            instructions: s.instructions,
+            model: s.model ?? spec.model,
+            ...(s.max_tokens !== undefined ? { maxTokens: s.max_tokens } : {}),
+            // Loop contract 0.4 (Batch A) — per-step thinking selector.
+            ...lowerThinking(s.thinking),
+            tools: s.tools ?? [],
+            toolConfigs: lowerToolConfigs(s.tool_config),
+          };
+        }),
         mcp_servers: lowerMcpServers(spec.mcp_servers),
         permissions: lowerPermissions(spec),
         compaction: lowerCompaction(spec),
@@ -1851,6 +1956,8 @@ export function lower(spec: Spec): IrNode {
         ...lowerBudget(spec),
         ...lowerLimits(spec),
         ...lowerHooks(spec),
+        // Loop contract 0.4 (Batch B, G02) — in-loop output evaluation.
+        ...lowerEvaluation(spec),
         ...lowerFeedback(spec),
         ...applyLearningWikiGovernance(lowerMemory(spec), learning.learning !== undefined),
         // v0.3.0 Goal 1 — DEFAULT-ON continuity. `auto` scope resolves to
@@ -1893,17 +2000,39 @@ export function lower(spec: Spec): IrNode {
         entry: spec.entry,
         // Preserve YAML insertion order — nodes appear in the bundle in
         // the same order the spec author wrote them.
-        nodes: Object.entries(spec.nodes).map(([name, node]) => ({
-          name,
-          instructions: node.instructions,
-          model: node.model ?? spec.model,
-          ...(node.max_tokens !== undefined ? { maxTokens: node.max_tokens } : {}),
-          // Loop contract 0.4 (Batch A) — per-node thinking selector.
-          ...lowerThinking(node.thinking),
-          tools: node.tools ?? [],
-          toolConfigs: lowerToolConfigs(node.tool_config),
-          ...(node.hitl !== undefined ? { hitlPrompt: node.hitl.prompt } : {}),
-        })),
+        nodes: Object.entries(spec.nodes).map(([name, node]) => {
+          // Loop contract 0.4 (Batch B, G02) — judge gate nodes run no agent
+          // turn of their own: instructions carry the criteria verbatim, the
+          // judge model resolves into the ordinary `model` slot
+          // (`judge.model ?? graph.model`, `cheapest` supported), and the
+          // gate knobs resolve in `lowerJudgeGate`. `kind` exists ONLY on
+          // the judge variant, so the `in` check is the discriminator.
+          if ("kind" in node) {
+            return {
+              name,
+              kind: "judge" as const,
+              instructions: node.judge.criteria,
+              model:
+                node.judge.model !== undefined
+                  ? resolveAuxModel(node.judge.model, spec, `nodes.${name}.judge.model`)
+                  : spec.model,
+              tools: [],
+              toolConfigs: lowerToolConfigs(undefined),
+              judge: lowerJudgeGate(node.judge),
+            };
+          }
+          return {
+            name,
+            instructions: node.instructions,
+            model: node.model ?? spec.model,
+            ...(node.max_tokens !== undefined ? { maxTokens: node.max_tokens } : {}),
+            // Loop contract 0.4 (Batch A) — per-node thinking selector.
+            ...lowerThinking(node.thinking),
+            tools: node.tools ?? [],
+            toolConfigs: lowerToolConfigs(node.tool_config),
+            ...(node.hitl !== undefined ? { hitlPrompt: node.hitl.prompt } : {}),
+          };
+        }),
         // Loop contract 0.4 (Batch A) — `when` lowers 1:1 (exactly one of
         // equals/exists survives the spec's superRefine); declaration order
         // is semantics (first matching edge wins), so no reordering.
@@ -1963,6 +2092,8 @@ export function lower(spec: Spec): IrNode {
         ...lowerBudget(spec),
         ...lowerLimits(spec),
         ...lowerHooks(spec),
+        // Loop contract 0.4 (Batch B, G02) — in-loop output evaluation.
+        ...lowerEvaluation(spec),
         ...applyLearningWikiGovernance(lowerMemory(spec), learning.learning !== undefined),
         // v0.3.0 Goal 1 — DEFAULT-ON continuity. `auto` resolves to `spec`
         // scope; the managed daemon tenant-fences every store at boot (the

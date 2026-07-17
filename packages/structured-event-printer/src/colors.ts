@@ -54,6 +54,10 @@ const PALETTE: Record<TraceEventKind, string> = {
   sanitizer_report: "\x1b[31m", // red — almost always a finding
   // Ops item 31 — alert watchdog breach against a baseline-derived threshold
   alert_raised: "\x1b[91m", // bright red — an alert is a headline
+  // Loop contract 0.4 (Batch B, G62) — in-loop evaluation verdicts sit
+  // beside test_verdict in the green verdict family.
+  eval_graded: "\x1b[32m", // green
+  judge_verdict: "\x1b[32m", // green
 };
 
 export function colorize(kind: TraceEventKind, text: string, useColor: boolean): string {

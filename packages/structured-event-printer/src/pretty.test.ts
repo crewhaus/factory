@@ -675,6 +675,62 @@ describe("formatBody — every kind + optional-field branches", () => {
     } satisfies TraceEvent;
     expect(formatLine(ev)).toBe(`${prefix("sanitizer_report")}program=p-2 sanitizer=ubsan clean`);
   });
+
+  // Loop contract 0.4 (Batch B, G62) — in-loop evaluation verdicts.
+  test("eval_graded renders grader/score/threshold/verdict/retry", () => {
+    const ev = {
+      ...envelope,
+      kind: "eval_graded",
+      score: 0.8,
+      threshold: 0.7,
+      verdict: "pass",
+      graderType: "llm_judge",
+      retryIndex: 0,
+    } satisfies TraceEvent;
+    expect(formatLine(ev)).toBe(
+      `${prefix("eval_graded")}grader=llm_judge score=0.80 threshold=0.70 verdict=pass retry=0`,
+    );
+  });
+
+  test("eval_graded fail on a retry renders the retry index", () => {
+    const ev = {
+      ...envelope,
+      kind: "eval_graded",
+      score: 0,
+      threshold: 1,
+      verdict: "fail",
+      graderType: "contains",
+      retryIndex: 1,
+    } satisfies TraceEvent;
+    expect(formatLine(ev)).toBe(
+      `${prefix("eval_graded")}grader=contains score=0.00 threshold=1.00 verdict=fail retry=1`,
+    );
+  });
+
+  test("judge_verdict WITH rationale includes it", () => {
+    const ev = {
+      ...envelope,
+      kind: "judge_verdict",
+      stepOrNode: "gate",
+      verdict: "fail",
+      score: 0.4,
+      rationale: "missing second source",
+    } satisfies TraceEvent;
+    expect(formatLine(ev)).toBe(
+      `${prefix("judge_verdict")}at=gate verdict=fail score=0.40 rationale=missing second source`,
+    );
+  });
+
+  test("judge_verdict WITHOUT rationale omits the suffix", () => {
+    const ev = {
+      ...envelope,
+      kind: "judge_verdict",
+      stepOrNode: "gate",
+      verdict: "pass",
+      score: 0.95,
+    } satisfies TraceEvent;
+    expect(formatLine(ev)).toBe(`${prefix("judge_verdict")}at=gate verdict=pass score=0.95`);
+  });
 });
 
 describe("formatJsonLine — JSON Lines", () => {

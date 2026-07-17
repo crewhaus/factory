@@ -339,6 +339,81 @@ export type IrBudget = {
 };
 
 /**
+ * Loop contract 0.4 (Batch B, G02) — the grader selector inside
+ * {@link IrEvaluation}, lowered 1:1 from `evaluation.grader`:
+ *
+ *   - `llm_judge` — a model scores the final text in [0,1] against
+ *     `criteria`. `model` is the judge model id; when ABSENT the runtime
+ *     uses the shape's primary model (the `cheapest` sentinel was already
+ *     resolved at lower time, like `compaction.model`). Judge calls are
+ *     METERED into the run budget.
+ *   - `contains` / `regex` — deterministic pass/fail text checks (score 1
+ *     on pass, 0 on fail; no model spend).
+ */
+export type IrEvaluationGrader =
+  | { readonly type: "llm_judge"; readonly criteria: string; readonly model?: string }
+  | { readonly type: "contains"; readonly value: string }
+  | { readonly type: "regex"; readonly value: string };
+
+/**
+ * Loop contract 0.4 (Batch B, G02) — in-loop output evaluation, lowered
+ * from the top-level `evaluation:` block on the interactive shapes
+ * (IrV0/cli, IrChannelV0, IrManagedV0). After each completed assistant
+ * turn the runtime scores the final text with `grader`; a score below
+ * `threshold` triggers `onFail`:
+ *
+ *   - `retry` — re-prompt with the judge rationale appended as a system
+ *     nudge, at most `maxRetries` times (retries are hard-capped and the
+ *     judge/model calls metered into the run budget).
+ *   - `halt`  — abort the turn with a classified `"evaluation"` failure.
+ *   - `note`  — emit the `eval_graded` trace event only.
+ *
+ * `onFail`/`maxRetries` are RESOLVED at lower time (defaults `"retry"`/1)
+ * so emitters and the interpreter read one deterministic shape.
+ * `threshold` is present iff `grader.type === "llm_judge"` (RESOLVED
+ * default 0.7) — deterministic graders are pass/fail and carry none.
+ * Absent from the IR when the spec omits the block.
+ */
+export type IrEvaluation = {
+  readonly grader: IrEvaluationGrader;
+  /** Present iff `grader.type === "llm_judge"` (resolved default 0.7). */
+  readonly threshold?: number;
+  /** Resolved below-threshold behaviour (spec `on_fail`, default "retry"). */
+  readonly onFail: "retry" | "halt" | "note";
+  /** Resolved retry hard-cap (spec `max_retries`, default 1). */
+  readonly maxRetries: number;
+};
+
+/**
+ * Loop contract 0.4 (Batch B, G02) — the judge gate carried by
+ * `kind: "judge"` workflow steps ({@link IrWorkflowStep}) and graph nodes
+ * ({@link IrGraphNode}). The judge scores the PREVIOUS step's (workflow) /
+ * upstream node's (graph) final output in [0,1] against `criteria`; below
+ * `threshold`, `onFail` applies:
+ *
+ *   - `retry_previous` — re-run the gated step/node with the judge
+ *     rationale appended as a system nudge, at most `maxRetries` times.
+ *   - `halt`     — abort the run with a classified `"evaluation"` failure.
+ *   - `continue` — record the `judge_verdict` trace event and proceed.
+ *
+ * All three knobs are RESOLVED at lower time (defaults 0.7 /
+ * `"retry_previous"` / 1). The judge MODEL is not carried here: it lives
+ * in the step's/node's existing `model` field, resolved at lower time as
+ * `judge.model ?? <shape>.model` (exactly how regular steps resolve
+ * theirs), so emitters read one model slot per step/node.
+ */
+export type IrJudge = {
+  readonly criteria: string;
+  /** Resolved passing score in [0,1] (spec `threshold`, default 0.7). */
+  readonly threshold: number;
+  /** Resolved below-threshold behaviour (spec `on_fail`,
+   *  default "retry_previous"). */
+  readonly onFail: "retry_previous" | "halt" | "continue";
+  /** Resolved re-run hard-cap (spec `max_retries`, default 1). */
+  readonly maxRetries: number;
+};
+
+/**
  * Pillar 3 (FR-004) — per-target security fabric configuration the
  * compiler lowers from the spec's `security` block. Today it carries the
  * intent-gate's judge selection; `egressPolicy` is reserved for the
@@ -711,6 +786,9 @@ export type IrV0 = {
   /** Loop contract 0.4 (Batch A) — spec-declared lifecycle hooks. Optional;
    *  absent when the spec omits the `hooks` block. */
   readonly hooks?: readonly IrHook[];
+  /** Loop contract 0.4 (Batch B, G02) — in-loop output evaluation.
+   *  Optional; absent when the spec omits the `evaluation` block. */
+  readonly evaluation?: IrEvaluation;
   /** Pillar 3 (FR-004) — security fabric config (intent-gate judge
    *  selection). Optional; absent when the spec omits the `security`
    *  block. */
@@ -741,6 +819,14 @@ export type IrV0 = {
 /**
  * One step in a workflow IR. `model` is resolved at lower-time
  * (`step.model ?? workflow.model`) so codegen can read it directly.
+ *
+ * Loop contract 0.4 (Batch B, G02) — a step may be a JUDGE GATE
+ * (`kind: "judge"`) over the previous step's output. Judge steps keep the
+ * full step shape so every existing consumer compiles and iterates
+ * unchanged: `instructions` carries the judge `criteria` verbatim, `model`
+ * is the resolved judge model (`judge.model ?? workflow.model`), and
+ * `tools`/`toolConfigs` are empty. Emitters/interpreters branch on
+ * `kind === "judge"` and read the gate config from `judge`.
  */
 export type IrWorkflowStep = {
   readonly name: string;
@@ -754,6 +840,11 @@ export type IrWorkflowStep = {
   readonly thinking?: IrThinking;
   readonly tools: readonly string[];
   readonly toolConfigs: IrToolConfigs;
+  /** Loop contract 0.4 (Batch B, G02) — `"judge"` marks a gate step over
+   *  the previous step's output. ABSENT on regular agent steps. */
+  readonly kind?: "judge";
+  /** Present iff `kind === "judge"` — the resolved gate config. */
+  readonly judge?: IrJudge;
 };
 
 /**
@@ -1024,6 +1115,9 @@ export type IrChannelV0 = {
   readonly limits?: IrLimits;
   /** Loop contract 0.4 (Batch A) — spec-declared lifecycle hooks. Optional. */
   readonly hooks?: readonly IrHook[];
+  /** Loop contract 0.4 (Batch B, G02) — in-loop output evaluation.
+   *  Optional; absent when the spec omits the `evaluation` block. */
+  readonly evaluation?: IrEvaluation;
   /** Response-feedback config. `feedback.channelReactions` gates Slack 👍/👎
    *  → user_feedback codegen in this target. Absent when spec omits it. */
   readonly feedback?: IrFeedback;
@@ -1099,6 +1193,9 @@ export type IrManagedV0 = {
   readonly limits?: IrLimits;
   /** Loop contract 0.4 (Batch A) — spec-declared lifecycle hooks. Optional. */
   readonly hooks?: readonly IrHook[];
+  /** Loop contract 0.4 (Batch B, G02) — in-loop output evaluation.
+   *  Optional; absent when the spec omits the `evaluation` block. */
+  readonly evaluation?: IrEvaluation;
   /** #53 cross-session memory config. Optional; absent when the spec omits `memory`. */
   readonly memory?: IrMemory;
   /** v0.3.0 Goal 1 — continuity config. DEFAULT-ON: present unless the spec
@@ -1139,6 +1236,14 @@ export type IrGraphNode = {
    * LLM turn and pauses the graph until `resume(checkpointId, decision)`.
    */
   readonly hitlPrompt?: string;
+  /** Loop contract 0.4 (Batch B, G02) — `"judge"` marks a gate node over
+   *  its upstream node's output. ABSENT on regular LLM nodes. Judge nodes
+   *  keep the full node shape (`instructions` = the judge criteria, `model`
+   *  = resolved `judge.model ?? graph.model`, empty `tools`) so existing
+   *  consumers compile unchanged; branch on `kind` and read `judge`. */
+  readonly kind?: "judge";
+  /** Present iff `kind === "judge"` — the resolved gate config. */
+  readonly judge?: IrJudge;
 };
 
 /**
@@ -1749,3 +1854,24 @@ export {
   collectSecretRefs,
   renderBundleReadme,
 } from "./readme";
+
+// Loop contract 0.4 (Batch B, G42) — the canonical agent-loop projection
+// (`projectLoop(ir)`), whose LoopProjection shape is the wire contract
+// shared with the studio's /builder page and the compiler-worker's
+// `POST /loop` endpoint. See ./loop.ts for the module docs.
+export {
+  CANVAS_TARGETS,
+  type LoopCanvas,
+  type LoopEdge,
+  type LoopNode,
+  type LoopNodeKind,
+  type LoopProjection,
+  type LoopRing,
+  type LoopSegment,
+  type LoopSegmentId,
+  NO_BUDGET_WARNING,
+  PERCEIVE_TOOL_RE,
+  RING_TARGETS,
+  SEGMENT_ORDER,
+  projectLoop,
+} from "./loop";

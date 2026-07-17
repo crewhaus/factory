@@ -124,5 +124,11 @@ function formatBody(ev: TraceEvent): string {
       return `program=${ev.programId} sanitizer=${ev.sanitizer} ${ev.isError ? "ERROR " : ""}${ev.summary}`;
     case "alert_raised":
       return `metric=${ev.metric} observed=${ev.observed} threshold=${ev.threshold} baseline=${ev.baselineSessions}sess — ${ev.detail}`;
+    case "eval_graded":
+      return `grader=${ev.graderType} score=${ev.score.toFixed(2)} threshold=${ev.threshold.toFixed(2)} verdict=${ev.verdict} retry=${ev.retryIndex}`;
+    case "judge_verdict":
+      return `at=${ev.stepOrNode} verdict=${ev.verdict} score=${ev.score.toFixed(2)}${
+        ev.rationale ? ` rationale=${ev.rationale}` : ""
+      }`;
   }
 }

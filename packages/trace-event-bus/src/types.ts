@@ -622,6 +622,50 @@ export type ModelRouteEvent = TraceEventEnvelope & {
   policyVersion?: string;
 };
 
+/**
+ * Loop contract 0.4 (Batch B, G62) — published by the in-loop `evaluation:`
+ * machinery each time a completed assistant turn's final text is scored
+ * (cli/channel/managed shapes). One event per grading pass, INCLUDING the
+ * re-grades of evaluation-triggered retries: `retryIndex` is 0 for the
+ * original attempt, 1 for the first retry, … up to the block's
+ * `max_retries`. `verdict` is `"pass"` when `score >= threshold` (for the
+ * deterministic `contains`/`regex` graders score is 1 or 0 against a
+ * threshold of 1). Judge/model grading calls are metered into the run
+ * budget as ordinary `cost_accrual` events — this event carries only the
+ * verdict.
+ */
+export type EvalGradedEvent = TraceEventEnvelope & {
+  kind: "eval_graded";
+  /** The grader's score in [0,1] (deterministic graders emit 1 or 0). */
+  score: number;
+  /** The passing bar the score was compared against. */
+  threshold: number;
+  verdict: "pass" | "fail";
+  /** Which `evaluation.grader.type` produced the score. */
+  graderType: "llm_judge" | "contains" | "regex";
+  /** 0 = the original turn, n = the n-th evaluation-triggered retry. */
+  retryIndex: number;
+};
+
+/**
+ * Loop contract 0.4 (Batch B, G62) — published by a `kind: "judge"`
+ * workflow step / graph node when it scores its gated (previous/upstream)
+ * output. `stepOrNode` is the judge step's/node's name; `verdict` is
+ * `"pass"` when `score >= threshold`; `rationale` is the judge model's
+ * explanation when it supplied one (also what `on_fail: retry_previous`
+ * appends to the re-run as a system nudge).
+ */
+export type JudgeVerdictEvent = TraceEventEnvelope & {
+  kind: "judge_verdict";
+  /** Name of the judge step (workflow) or judge node (graph). */
+  stepOrNode: string;
+  verdict: "pass" | "fail";
+  /** The judge's score in [0,1]. */
+  score: number;
+  /** Judge-model explanation, when it supplied one. */
+  rationale?: string;
+};
+
 export type TraceEvent =
   | TurnStartEvent
   | TurnEndEvent
@@ -657,7 +701,9 @@ export type TraceEvent =
   | ProgramOutputEvent
   | CoverageReportEvent
   | SanitizerReportEvent
-  | AlertRaisedEvent;
+  | AlertRaisedEvent
+  | EvalGradedEvent
+  | JudgeVerdictEvent;
 
 export type TraceEventKind = TraceEvent["kind"];
 

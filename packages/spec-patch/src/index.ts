@@ -32,7 +32,7 @@
  */
 import { CrewhausError } from "@crewhaus/errors";
 import { type Spec, parseSpec } from "@crewhaus/spec";
-import { parse, parseDocument } from "yaml";
+import { isSeq, parse, parseDocument } from "yaml";
 import { z } from "zod";
 import { REDACTED_VALUE, isCredentialKey, maskCredentialTokens } from "./redact";
 
@@ -194,6 +194,209 @@ export function validatePatch(spec: Spec, patch: SpecPatch): void {
 
 function formatPath(path: ReadonlyArray<string>): string {
   return path.join(".");
+}
+
+/**
+ * Loop contract 0.4 (Batch B, G40) — one edit in an `applySpecEdits` batch.
+ *
+ * Where `SpecPatch` is the optimizer's IMPERATIVE op (`add` vs `replace` vs
+ * `remove`, each with a strict presence pre-check), `SpecEdit` is the
+ * DECLARATIVE surface shared by spec authors (the studio's form fields, the
+ * compiler-worker) and the optimizer: "make `path` carry `value`" (upsert —
+ * creates missing intermediate collections) or, when `value` is `undefined`,
+ * "make `path` absent" (idempotent — deleting an already-absent path is a
+ * no-op, so a cleared form field never needs to track prior presence).
+ *
+ * Paths may address sequence items by non-negative integer index (numeric
+ * strings work too — the CST coerces them for sequences): `["steps", 0,
+ * "instructions"]`. Index `length` appends; anything past that is an error
+ * (never null-padding), and a brand-new sequence can only start at index 0.
+ */
+export type SpecEditPathSegment = string | number;
+
+export type SpecEdit = {
+  readonly path: ReadonlyArray<SpecEditPathSegment>;
+  /** New value at `path` (upsert). `undefined` — or omitting the key — DELETES the path. */
+  readonly value?: unknown;
+  /** Optional rationale string for audit / write-back commit messages. */
+  readonly rationale?: string;
+};
+
+const specEditSchema = z.object({
+  path: z
+    .array(z.union([z.string().min(1), z.number().int().nonnegative()]))
+    .min(1),
+  value: z.unknown().optional(),
+  rationale: z.string().optional(),
+});
+
+export type ApplySpecEditsOptions = {
+  /**
+   * The optimizer surface: every edit path must fall under the spec target's
+   * `OPTIMIZABLE_PATHS` whitelist (exact or prefix match, same rule as
+   * `validatePatch`). Author surfaces leave this off and may edit any field —
+   * the atomic `parseSpec` re-validation is their safety floor.
+   */
+  readonly restrictToOptimizable?: boolean;
+};
+
+export type ApplySpecEditsResult = {
+  /** The mutated YAML text, with comments and key order preserved. */
+  readonly yaml: string;
+  /** The re-parsed Spec after the whole batch. */
+  readonly spec: Spec;
+  /** Edits that changed the document — idempotent deletes of absent paths don't count. */
+  readonly applied: number;
+};
+
+/**
+ * Apply a batch of `SpecEdit`s to a YAML spec source ATOMICALLY: all edits
+ * mutate one CST in order, the result is re-validated via `parseSpec` once,
+ * and any failure — a malformed edit, an out-of-bounds sequence index, or a
+ * batch that produces an invalid spec — throws `SpecPatchError` without
+ * yielding a partially-edited text. Comments and key order survive exactly
+ * as in `applySpecPatch` (same `yaml`-package CST underneath).
+ *
+ * A zero-edit batch is a validated no-op: the input text is returned
+ * byte-identical (no CST round-trip reformatting).
+ */
+export function applySpecEdits(
+  yamlText: string,
+  edits: ReadonlyArray<SpecEdit>,
+  opts: ApplySpecEditsOptions = {},
+): ApplySpecEditsResult {
+  edits.forEach((edit, i) => {
+    const parsed = specEditSchema.safeParse(edit);
+    if (!parsed.success) {
+      throw new SpecPatchError(`edit #${i} shape is invalid: ${parsed.error.message}`);
+    }
+  });
+  if (edits.length === 0) {
+    let spec: Spec;
+    try {
+      spec = parseSpec(yamlText);
+    } catch (err) {
+      throw new SpecPatchError(
+        `input YAML failed spec validation: ${(err as Error).message}`,
+        err,
+      );
+    }
+    return { yaml: yamlText, spec, applied: 0 };
+  }
+
+  let doc: ReturnType<typeof parseDocument>;
+  try {
+    doc = parseDocument(yamlText);
+  } catch (err) {
+    throw new SpecPatchError("input YAML is not parseable", err);
+  }
+
+  if (opts.restrictToOptimizable === true) {
+    const docTarget = doc.getIn(["target"]);
+    if (typeof docTarget !== "string" || !(docTarget in OPTIMIZABLE_PATHS)) {
+      throw new SpecPatchError(
+        `cannot restrict to optimizable paths: spec target ${JSON.stringify(docTarget)} is not a known target`,
+      );
+    }
+    edits.forEach((edit, i) => {
+      if (!isOptimizable(docTarget as Spec["target"], edit.path)) {
+        throw new SpecPatchError(
+          `edit #${i}: path ${formatEditPath(edit.path)} is not listed in OPTIMIZABLE_PATHS for target "${docTarget}"; add it to packages/spec-patch/src/index.ts if it's intended to be tunable`,
+        );
+      }
+    });
+  }
+
+  let applied = 0;
+  edits.forEach((edit, i) => {
+    const path = [...edit.path];
+    const label = `edit #${i} (${formatEditPath(path)})`;
+    if (edit.value === undefined) {
+      // Delete-on-undefined. hasIn is false both for an absent leaf and for a
+      // scalar intermediate, so the deleteIn below can never hit the CST's
+      // "Expected YAML collection" throw — absent paths are a clean no-op.
+      if (doc.hasIn(path)) {
+        doc.deleteIn(path);
+        applied += 1;
+      }
+      return;
+    }
+    guardSequenceIndices(doc, path, label);
+    try {
+      doc.setIn(path, edit.value);
+    } catch (err) {
+      throw new SpecPatchError(`${label} failed: ${(err as Error).message}`, err);
+    }
+    applied += 1;
+  });
+
+  const newYaml = doc.toString();
+  let spec: Spec;
+  try {
+    spec = parseSpec(newYaml);
+  } catch (err) {
+    throw new SpecPatchError(
+      `edited YAML failed spec validation: ${(err as Error).message}`,
+      err,
+    );
+  }
+  return { yaml: newYaml, spec, applied };
+}
+
+/**
+ * Pre-flight for `setIn` along a path that may address sequences: the CST
+ * happily null-pads a sequence up to any index (`steps[5]` on a 2-step list
+ * yields three `null` steps), which is never what an author or optimizer
+ * meant. Reject indices past `length` (index === `length` appends) and
+ * refuse to CREATE a sequence anywhere but at index 0. Map keys and the
+ * CST's own errors (negative / non-integer index, scalar intermediates)
+ * pass through untouched — the caller wraps those with the edit label.
+ */
+function guardSequenceIndices(
+  doc: ReturnType<typeof parseDocument>,
+  path: ReadonlyArray<SpecEditPathSegment>,
+  label: string,
+): void {
+  for (let i = 0; i < path.length; i++) {
+    const seg = path[i] as SpecEditPathSegment;
+    const parent = i === 0 ? doc.contents : doc.getIn(path.slice(0, i), true);
+    const asIndex =
+      typeof seg === "number"
+        ? seg
+        : /^\d+$/.test(seg)
+          ? Number.parseInt(seg, 10)
+          : undefined;
+    if (isSeq(parent)) {
+      if (asIndex !== undefined && asIndex > parent.items.length) {
+        throw new SpecPatchError(
+          `${label}: index ${asIndex} is out of bounds for the sequence at ${
+            i === 0 ? "(root)" : formatEditPath(path.slice(0, i))
+          } (length ${parent.items.length}; index ${parent.items.length} appends)`,
+        );
+      }
+    } else if (parent === undefined && typeof seg === "number" && seg !== 0) {
+      throw new SpecPatchError(
+        `${label}: cannot create a new sequence at ${
+          i === 0 ? "(root)" : formatEditPath(path.slice(0, i))
+        } starting at index ${seg} — a new sequence starts at index 0`,
+      );
+    }
+  }
+}
+
+/** Render an edit path for messages: string keys dot-joined, integer
+ *  sequence indices as `[i]` — `["steps", 0, "instructions"]` →
+ *  `steps[0].instructions`. */
+function formatEditPath(path: ReadonlyArray<SpecEditPathSegment>): string {
+  let out = "";
+  for (const seg of path) {
+    if (typeof seg === "number") {
+      out += `[${seg}]`;
+    } else {
+      out += out === "" ? seg : `.${seg}`;
+    }
+  }
+  return out;
 }
 
 /**

@@ -1,6 +1,7 @@
 import { SpecParseError } from "@crewhaus/errors";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
+import { zodToJsonSchema } from "zod-to-json-schema";
 
 // SECURITY (codegen-injection backstop, #147/#148): spec/role/node/step names
 // flow verbatim into generated source across ~14 emitters — `//` and `/* */`
@@ -542,6 +543,161 @@ const budgetBlock = z
   })
   .strict()
   .optional();
+
+/**
+ * Loop contract 0.4 (Batch B, G02) — the top-level `evaluation:` block:
+ * in-loop output evaluation on the interactive shapes (cli, channel,
+ * managed). After each completed assistant turn the runtime scores the
+ * final text with `grader`; a score below `threshold` triggers the
+ * `on_fail` behaviour:
+ *
+ *   - `retry` (default) — re-prompt the model with the judge's rationale
+ *     appended as a system nudge, at most `max_retries` times.
+ *   - `halt`  — abort the turn with a classified `evaluation` failure.
+ *   - `note`  — emit an `eval_graded` trace event only.
+ *
+ * Graders:
+ *   - `{ type: llm_judge, criteria, model? }` — a model scores the reply
+ *     in [0,1] against `criteria`; `model` defaults to the shape's primary
+ *     model (the `cheapest` sentinel resolves like `compaction.model`).
+ *     Judge calls are METERED into the run budget.
+ *   - `{ type: contains, value }` / `{ type: regex, value }` —
+ *     deterministic pass/fail text checks (no threshold; no model spend).
+ *
+ * `threshold` (0..1, default 0.7) applies to `llm_judge` only — declaring
+ * it with a deterministic grader is a parse error. `.strict()` throughout
+ * so a typo'd sub-key fails the build.
+ */
+const evaluationGraderSchema = z.discriminatedUnion("type", [
+  z
+    .object({
+      type: z.literal("llm_judge"),
+      model: z
+        .string()
+        .min(1)
+        .optional()
+        .describe(
+          "judge model id; defaults to the shape's primary model (the cheapest sentinel resolves at compile time)",
+        ),
+      criteria: z
+        .string()
+        .min(1)
+        .describe(
+          "what a passing reply must satisfy — the judge scores the final text against this",
+        ),
+    })
+    .strict()
+    .describe("model-scored grader: an LLM judges the final text in [0,1] against criteria"),
+  z
+    .object({
+      type: z.literal("contains"),
+      value: z.string().min(1).describe("substring the final text must contain (case-sensitive)"),
+    })
+    .strict()
+    .describe("deterministic grader: pass iff the final text contains value"),
+  z
+    .object({
+      type: z.literal("regex"),
+      value: z.string().min(1).describe("JavaScript regular expression the final text must match"),
+    })
+    .strict()
+    .describe("deterministic grader: pass iff the final text matches the regex"),
+]);
+
+const evaluationBlock = z
+  .object({
+    grader: evaluationGraderSchema,
+    threshold: z
+      .number()
+      .min(0)
+      .max(1)
+      .optional()
+      .describe("passing score in 0..1 (default 0.7); llm_judge grader only"),
+    on_fail: z
+      .enum(["retry", "halt", "note"])
+      .optional()
+      .describe(
+        "below-threshold behaviour: retry re-prompts with the judge rationale (default), halt aborts the turn classified, note emits a trace event only",
+      ),
+    max_retries: z
+      .number()
+      .int()
+      .min(1)
+      .max(5)
+      .optional()
+      .describe("hard cap on evaluation-triggered retries per turn (default 1)"),
+  })
+  .strict()
+  .superRefine((e, ctx) => {
+    if (e.threshold !== undefined && e.grader.type !== "llm_judge") {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["threshold"],
+        message: `evaluation.threshold applies to the llm_judge grader only — the "${e.grader.type}" grader is deterministic pass/fail`,
+      });
+    }
+    if (e.grader.type === "regex") {
+      try {
+        new RegExp(e.grader.value);
+      } catch (err) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["grader", "value"],
+          message: `evaluation.grader.value is not a valid regular expression: ${err instanceof Error ? err.message : String(err)}`,
+        });
+      }
+    }
+  })
+  .describe(
+    "in-loop output evaluation: score each completed assistant turn and retry/halt/note below threshold",
+  )
+  .optional();
+
+/**
+ * Loop contract 0.4 (Batch B, G02) — the `judge:` gate declared by
+ * `kind: "judge"` workflow steps and graph nodes. A judge step/node runs no
+ * agent turn of its own: it scores the PREVIOUS step's (workflow) /
+ * upstream node's (graph) final output in [0,1] against `criteria` and,
+ * below `threshold` (default 0.7), applies `on_fail`:
+ *
+ *   - `retry_previous` (default) — re-run the gated step/node with the
+ *     judge rationale appended as a system nudge, at most `max_retries`
+ *     times.
+ *   - `halt`     — abort the run with a classified `evaluation` failure.
+ *   - `continue` — record the `judge_verdict` trace event and proceed.
+ *
+ * `model` defaults to the shape's top-level `model` (the `cheapest`
+ * sentinel resolves like `compaction.model`). Judge calls are METERED into
+ * the run budget.
+ */
+const judgeGateBlock = z
+  .object({
+    criteria: z
+      .string()
+      .min(1)
+      .describe("what a passing upstream output must satisfy — the judge scores against this"),
+    model: z
+      .string()
+      .min(1)
+      .optional()
+      .describe("judge model id; defaults to the shape's top-level model"),
+    threshold: z.number().min(0).max(1).optional().describe("passing score in 0..1 (default 0.7)"),
+    on_fail: z
+      .enum(["retry_previous", "halt", "continue"])
+      .optional()
+      .describe(
+        "below-threshold behaviour: retry_previous re-runs the gated step/node (default), halt aborts classified, continue records the verdict and proceeds",
+      ),
+    max_retries: z
+      .number()
+      .int()
+      .min(1)
+      .max(5)
+      .optional()
+      .describe("hard cap on judge-triggered re-runs of the gated step/node (default 1)"),
+  })
+  .strict()
+  .describe("judge gate config for kind: judge workflow steps and graph nodes");
 
 /**
  * Loop contract 0.4 (Batch A) — extended-thinking selector, carried on the
@@ -1250,6 +1406,8 @@ const cliSchema = z
     budget: budgetBlock,
     limits: limitsBlock,
     hooks: hooksBlock,
+    // Loop contract 0.4 (Batch B, G02) — in-loop output evaluation.
+    evaluation: evaluationBlock,
     feedback: feedbackBlock,
     memory: memoryBlock,
     continuity: continuityBlock,
@@ -1279,13 +1437,32 @@ const workflowStepSchema = z
   })
   .strict();
 
+/**
+ * Loop contract 0.4 (Batch B, G02) — the `kind: "judge"` workflow-step
+ * variant: a gate over the PREVIOUS step's output (see
+ * {@link judgeGateBlock}). Judge steps run no agent turn of their own, so
+ * they carry no instructions/tools — only the gate config. A judge step
+ * cannot be the first step (there is no previous output to gate; enforced
+ * in `parseSpec`). Regular steps stay exactly as before (no `kind` key).
+ */
+const workflowJudgeStepSchema = z
+  .object({
+    name: safeName,
+    kind: z.literal("judge"),
+    judge: judgeGateBlock,
+  })
+  .strict()
+  .describe("judge gate step: scores the previous step's output instead of running an agent turn");
+
+const workflowAnyStepSchema = z.union([workflowStepSchema, workflowJudgeStepSchema]);
+
 const workflowSchema = z
   .object({
     name: safeName,
     version: versionField,
     target: z.literal("workflow"),
     model: z.string().min(1),
-    steps: z.array(workflowStepSchema).min(1),
+    steps: z.array(workflowAnyStepSchema).min(1),
     mcp_servers: mcpServersBlock,
     permissions: permissionsBlock,
     compaction: compactionBlock,
@@ -1422,6 +1599,8 @@ const channelSchema = z
     budget: budgetBlock,
     limits: limitsBlock,
     hooks: hooksBlock,
+    // Loop contract 0.4 (Batch B, G02) — in-loop output evaluation.
+    evaluation: evaluationBlock,
     feedback: feedbackBlock,
     memory: memoryBlock,
     continuity: continuityBlock,
@@ -1464,6 +1643,24 @@ const graphNodeSchema = z
       .optional(),
   })
   .strict();
+
+/**
+ * Loop contract 0.4 (Batch B, G02) — the `kind: "judge"` graph-node
+ * variant: a gate over the node's UPSTREAM output (see
+ * {@link judgeGateBlock}). Judge nodes run no agent turn of their own, so
+ * they carry no instructions/tools — only the gate config. The graph entry
+ * cannot be a judge node (there is no upstream output to gate; enforced in
+ * `parseSpec`). Regular nodes stay exactly as before (no `kind` key).
+ */
+const graphJudgeNodeSchema = z
+  .object({
+    kind: z.literal("judge"),
+    judge: judgeGateBlock,
+  })
+  .strict()
+  .describe("judge gate node: scores the upstream node's output instead of running an agent turn");
+
+const graphAnyNodeSchema = z.union([graphNodeSchema, graphJudgeNodeSchema]);
 
 /**
  * Loop contract 0.4 (Batch A) — declarative edge predicate over the graph's
@@ -1516,7 +1713,7 @@ const graphSchema = z
     target: z.literal("graph"),
     model: z.string().min(1),
     entry: z.string().min(1),
-    nodes: z.record(safeName, graphNodeSchema),
+    nodes: z.record(safeName, graphAnyNodeSchema),
     edges: z.array(graphEdgeSchema).default([]),
     /**
      * Loop contract 0.4 (Batch A) — parallel barrier groups, lowered onto
@@ -1591,6 +1788,8 @@ const managedSchema = z
     budget: budgetBlock,
     limits: limitsBlock,
     hooks: hooksBlock,
+    // Loop contract 0.4 (Batch B, G02) — in-loop output evaluation.
+    evaluation: evaluationBlock,
     memory: memoryBlock,
     continuity: continuityBlock,
     thredz: thredzBlock,
@@ -2172,8 +2371,180 @@ export type SpecHookEvent = (typeof SPEC_HOOK_EVENTS)[number];
 export type SpecRateLimitsBlock = z.infer<typeof rateLimitsBlock>;
 /** Loop contract 0.4 (Batch A) — the declarative graph-edge predicate. */
 export type SpecGraphEdgeWhen = z.infer<typeof graphEdgeWhenSchema>;
+/** Loop contract 0.4 (Batch B, G02) — the `evaluation:` block
+ *  (cli/channel/managed in-loop output evaluation). */
+export type SpecEvaluationBlock = z.infer<typeof evaluationBlock>;
+/** Loop contract 0.4 (Batch B, G02) — the evaluation grader union
+ *  (llm_judge | contains | regex). */
+export type SpecEvaluationGrader = z.infer<typeof evaluationGraderSchema>;
+/** Loop contract 0.4 (Batch B, G02) — the judge gate config shared by
+ *  `kind: "judge"` workflow steps and graph nodes. */
+export type SpecJudgeGate = z.infer<typeof judgeGateBlock>;
+/** Loop contract 0.4 (Batch B, G02) — a `kind: "judge"` workflow step. */
+export type SpecWorkflowJudgeStep = z.infer<typeof workflowJudgeStepSchema>;
+/** Loop contract 0.4 (Batch B, G02) — one workflow step: a regular agent
+ *  step ({@link SpecWorkflowStep}) or a judge gate. */
+export type SpecWorkflowAnyStep = z.infer<typeof workflowAnyStepSchema>;
+/** Loop contract 0.4 (Batch B, G02) — a `kind: "judge"` graph node. */
+export type SpecGraphJudgeNode = z.infer<typeof graphJudgeNodeSchema>;
+/** Loop contract 0.4 (Batch B, G02) — one graph node: a regular LLM node
+ *  ({@link SpecGraphNode}) or a judge gate. */
+export type SpecGraphAnyNode = z.infer<typeof graphAnyNodeSchema>;
 
 export { SpecParseError };
+
+/**
+ * Loop contract 0.4 (Batch B, G04) — one structured spec diagnostic.
+ * `path` locates the problem in the parsed document (`[]` for
+ * whole-document problems such as YAML syntax errors); `code` is a stable
+ * machine key — zod's issue codes (`"invalid_type"`, `"unrecognized_keys"`,
+ * `"custom"`, …) for schema failures, `"yaml_syntax"` for YAML parse
+ * failures (line/column ride in the message), and `"custom"` for the
+ * cross-field invariants enforced beyond the schema.
+ */
+export type SpecIssue = {
+  path: (string | number)[];
+  message: string;
+  code: string;
+};
+
+/**
+ * Friendly early-rejection for `permissions.mode: bypass` so the error
+ * names the actual security policy rather than a Zod enum mismatch. The
+ * Zod schema also excludes "bypass" from its enum (defense in depth).
+ */
+function bypassModeIssue(raw: unknown): SpecIssue | undefined {
+  if (typeof raw === "object" && raw !== null && "permissions" in raw) {
+    const perms = (raw as { permissions?: unknown }).permissions;
+    if (typeof perms === "object" && perms !== null && "mode" in perms) {
+      const mode = (perms as { mode?: unknown }).mode;
+      if (mode === "bypass") {
+        return {
+          path: ["permissions", "mode"],
+          code: "custom",
+          message:
+            "permissions.mode: bypass is rejected — bypass mode is only available via the --permission-mode CLI flag, never from a spec file",
+        };
+      }
+    }
+  }
+  return undefined;
+}
+
+/**
+ * The cross-field invariants `parseSpec` enforces beyond the zod schema,
+ * as a structured issue list (empty = all invariants hold). Kept as data
+ * checks rather than `.refine()`s so every discriminated-union member
+ * stays a plain ZodObject (Zod's discriminatedUnion rejects ZodEffects).
+ * `parseSpec` throws the FIRST issue's message (its historical behaviour);
+ * `parseSpecIssues` returns them all. Check order is load-bearing for
+ * `parseSpec`'s error messages — append, don't reorder.
+ */
+function crossFieldIssues(data: Spec): SpecIssue[] {
+  const issues: SpecIssue[] = [];
+  const custom = (path: (string | number)[], message: string): void => {
+    issues.push({ path, message, code: "custom" });
+  };
+  // Section 22 — crew cross-field invariants.
+  if (data.target === "crew") {
+    const roleNames = Object.keys(data.roles);
+    if (roleNames.length === 0) {
+      custom(["roles"], "crew target requires at least one role");
+    }
+    if (roleNames.length > 0 && !roleNames.includes(data.entry)) {
+      custom(
+        ["entry"],
+        `crew.entry "${data.entry}" must name one of crew.roles (got: ${roleNames.join(", ")})`,
+      );
+    }
+    if (data.routing !== undefined && data.routing.kind === "match" && data.routing.match) {
+      for (const [from, rules] of Object.entries(data.routing.match)) {
+        if (!roleNames.includes(from)) {
+          custom(
+            ["routing", "match", from],
+            `crew.routing.match["${from}"]: source role not in crew.roles`,
+          );
+        }
+        for (const [ri, rule] of rules.entries()) {
+          if (!roleNames.includes(rule.to)) {
+            custom(
+              ["routing", "match", from, ri, "to"],
+              `crew.routing.match["${from}"].to = "${rule.to}" — target role not in crew.roles`,
+            );
+          }
+        }
+      }
+    }
+  }
+  // Loop contract 0.4 (Batch B, G02) — a judge step gates the PREVIOUS
+  // step's output, so the first step can never be one.
+  if (data.target === "workflow") {
+    const first = data.steps[0];
+    if (first !== undefined && "kind" in first && first.kind === "judge") {
+      custom(
+        ["steps", 0],
+        `workflow steps[0] "${first.name}" cannot be a judge step — a judge gates the previous step's output and no step precedes it`,
+      );
+    }
+  }
+  // Loop contract 0.4 (Batch A) — graph cross-field invariants:
+  //   - every `edges[].when.key` must name a declared node — the generated
+  //     graph state records each node's reply under its own name, so a key
+  //     that names nothing can never match;
+  //   - every `parallel` group member must name a declared node (mirrors
+  //     graph-engine's own compile-time check, surfaced at parse time);
+  //   - (Batch B) the entry cannot be a judge node — a judge gates its
+  //     upstream node's output and the entry has none.
+  if (data.target === "graph") {
+    const nodeNames = Object.keys(data.nodes);
+    for (const [i, edge] of data.edges.entries()) {
+      if (edge.when !== undefined && !nodeNames.includes(edge.when.key)) {
+        custom(
+          ["edges", i, "when", "key"],
+          `graph.edges[${i}].when.key "${edge.when.key}" must name a declared node — the shared state records each node's output under its name (nodes: ${nodeNames.join(", ")})`,
+        );
+      }
+    }
+    if (data.parallel !== undefined) {
+      for (const [gi, group] of data.parallel.entries()) {
+        for (const nodeName of group) {
+          if (!nodeNames.includes(nodeName)) {
+            custom(
+              ["parallel", gi],
+              `graph.parallel[${gi}] references "${nodeName}" which is not a declared node (nodes: ${nodeNames.join(", ")})`,
+            );
+          }
+        }
+      }
+    }
+    const entryNode = data.nodes[data.entry];
+    if (entryNode !== undefined && "kind" in entryNode && entryNode.kind === "judge") {
+      custom(
+        ["entry"],
+        `graph entry "${data.entry}" cannot be a judge node — a judge gates its upstream node's output and the entry has none`,
+      );
+    }
+  }
+  // Section 21 — pipeline HTTP-backend invariants. qdrant/pinecone/weaviate
+  // throw at construction without a url + collection, so selecting one
+  // without both would emit an unrunnable bundle.
+  if (data.target === "pipeline" && HTTP_VECTOR_BACKENDS.has(data.retrieve.vectorBackend)) {
+    const { vectorBackend, url, collection } = data.retrieve;
+    if (!url) {
+      custom(
+        ["retrieve", "url"],
+        `pipeline retrieve.vectorBackend "${vectorBackend}" requires retrieve.url (the remote service base URL)`,
+      );
+    }
+    if (!collection) {
+      custom(
+        ["retrieve", "collection"],
+        `pipeline retrieve.vectorBackend "${vectorBackend}" requires retrieve.collection`,
+      );
+    }
+  }
+  return issues;
+}
 
 export function parseSpec(yamlText: string): Spec {
   let raw: unknown;
@@ -2183,19 +2554,9 @@ export function parseSpec(yamlText: string): Spec {
     throw new SpecParseError("invalid YAML", err);
   }
 
-  // Friendly early-rejection for `permissions.mode: bypass` so the error
-  // message names the actual security policy rather than a Zod enum mismatch.
-  // The Zod schema also excludes "bypass" from its enum (defense in depth).
-  if (typeof raw === "object" && raw !== null && "permissions" in raw) {
-    const perms = (raw as { permissions?: unknown }).permissions;
-    if (typeof perms === "object" && perms !== null && "mode" in perms) {
-      const mode = (perms as { mode?: unknown }).mode;
-      if (mode === "bypass") {
-        throw new SpecParseError(
-          "permissions.mode: bypass is rejected — bypass mode is only available via the --permission-mode CLI flag, never from a spec file",
-        );
-      }
-    }
+  const bypass = bypassModeIssue(raw);
+  if (bypass !== undefined) {
+    throw new SpecParseError(bypass.message);
   }
 
   const result = Spec.safeParse(raw);
@@ -2207,81 +2568,120 @@ export function parseSpec(yamlText: string): Spec {
       result.error,
     );
   }
-  // Section 22 — crew cross-field invariants. Kept here rather than as
-  // `.refine()`s on the schema so the discriminated-union member stays
-  // a plain ZodObject (Zod's discriminatedUnion rejects ZodEffects).
-  const data = result.data;
-  if (data.target === "crew") {
-    const roleNames = Object.keys(data.roles);
-    if (roleNames.length === 0) {
-      throw new SpecParseError("crew target requires at least one role");
-    }
-    if (!roleNames.includes(data.entry)) {
-      throw new SpecParseError(
-        `crew.entry "${data.entry}" must name one of crew.roles (got: ${roleNames.join(", ")})`,
-      );
-    }
-    if (data.routing !== undefined && data.routing.kind === "match" && data.routing.match) {
-      for (const [from, rules] of Object.entries(data.routing.match)) {
-        if (!roleNames.includes(from)) {
-          throw new SpecParseError(`crew.routing.match["${from}"]: source role not in crew.roles`);
-        }
-        for (const rule of rules) {
-          if (!roleNames.includes(rule.to)) {
-            throw new SpecParseError(
-              `crew.routing.match["${from}"].to = "${rule.to}" — target role not in crew.roles`,
-            );
-          }
-        }
+  const issues = crossFieldIssues(result.data);
+  const firstIssue = issues[0];
+  if (firstIssue !== undefined) {
+    throw new SpecParseError(firstIssue.message);
+  }
+  return result.data;
+}
+
+/** yaml's parse errors carry 1-indexed line/column in `linePos`. */
+function yamlSyntaxIssue(err: unknown): SpecIssue {
+  const linePos = (err as { linePos?: ReadonlyArray<{ line: number; col: number }> }).linePos;
+  const pos = Array.isArray(linePos) && linePos[0] !== undefined ? linePos[0] : undefined;
+  const raw = err instanceof Error ? err.message : String(err);
+  // yaml's message embeds a multi-line code frame; keep the first line and
+  // move its trailing position marker into a uniform suffix.
+  const firstLine = (raw.split("\n")[0] ?? raw).trim();
+  const cleaned =
+    pos !== undefined ? firstLine.replace(/ at line \d+, column \d+:?$/, "") : firstLine;
+  const where = pos !== undefined ? ` (line ${pos.line}, column ${pos.col})` : "";
+  return { path: [], code: "yaml_syntax", message: `invalid YAML: ${cleaned}${where}` };
+}
+
+/**
+ * Flatten zod issues to `SpecIssue`s. `invalid_union` issues (the workflow
+ * step / graph node / continuity / thredz unions) are replaced by the most
+ * plausible branch's issues — the branch that failed with the FEWEST
+ * problems, ties broken by the fewest unrecognized KEYS (so a step that
+ * declares `kind: judge` with a typo inside `judge:` reports the judge
+ * branch's problem, not the regular branch's "unrecognized 'kind'") — so a
+ * malformed union member reports its actual problem instead of an opaque
+ * "Invalid input". Union sub-issues carry document-absolute paths in zod
+ * v3, so no re-prefixing is needed.
+ */
+function unrecognizedKeyCount(err: z.ZodError): number {
+  let count = 0;
+  for (const issue of err.issues) {
+    if (issue.code === z.ZodIssueCode.unrecognized_keys) count += issue.keys.length;
+  }
+  return count;
+}
+
+function zodIssuesToSpecIssues(zodIssues: ReadonlyArray<z.ZodIssue>): SpecIssue[] {
+  const out: SpecIssue[] = [];
+  for (const issue of zodIssues) {
+    if (issue.code === z.ZodIssueCode.invalid_union && issue.unionErrors.length > 0) {
+      const best = [...issue.unionErrors].sort(
+        (a, b) =>
+          a.issues.length - b.issues.length || unrecognizedKeyCount(a) - unrecognizedKeyCount(b),
+      )[0];
+      if (best !== undefined && best.issues.length > 0) {
+        out.push(...zodIssuesToSpecIssues(best.issues));
+        continue;
       }
     }
+    out.push({ path: [...issue.path], message: issue.message, code: issue.code });
   }
-  // Loop contract 0.4 (Batch A) — graph cross-field invariants. Kept here
-  // rather than as `.refine()`s on the schema so the discriminated-union
-  // member stays a plain ZodObject (same posture as the crew checks above):
-  //   - every `edges[].when.key` must name a declared node — the generated
-  //     graph state records each node's reply under its own name, so a key
-  //     that names nothing can never match;
-  //   - every `parallel` group member must name a declared node (mirrors
-  //     graph-engine's own compile-time check, surfaced at parse time).
-  if (data.target === "graph") {
-    const nodeNames = Object.keys(data.nodes);
-    for (const [i, edge] of data.edges.entries()) {
-      if (edge.when !== undefined && !nodeNames.includes(edge.when.key)) {
-        throw new SpecParseError(
-          `graph.edges[${i}].when.key "${edge.when.key}" must name a declared node — the shared state records each node's output under its name (nodes: ${nodeNames.join(", ")})`,
-        );
-      }
-    }
-    if (data.parallel !== undefined) {
-      for (const [gi, group] of data.parallel.entries()) {
-        for (const nodeName of group) {
-          if (!nodeNames.includes(nodeName)) {
-            throw new SpecParseError(
-              `graph.parallel[${gi}] references "${nodeName}" which is not a declared node (nodes: ${nodeNames.join(", ")})`,
-            );
-          }
-        }
-      }
-    }
+  return out;
+}
+
+/**
+ * Loop contract 0.4 (Batch B, G04) — the non-throwing sibling of
+ * {@link parseSpec}: parse `yamlText` and return EVERY diagnostic as a
+ * structured issue list (`[]` when the spec is valid). Built on the same
+ * internals as `parseSpec` — which keeps its throw behaviour — so the two
+ * can never disagree about validity:
+ *
+ *   - YAML syntax errors → one issue, `path: []`, `code: "yaml_syntax"`,
+ *     line/column in the message.
+ *   - schema failures    → one issue per zod issue (zod's own `code`s),
+ *     with `invalid_union` flattened to the most plausible branch.
+ *   - cross-field checks → `code: "custom"` with a best-effort path.
+ */
+export function parseSpecIssues(yamlText: string): SpecIssue[] {
+  let raw: unknown;
+  try {
+    raw = parseYaml(yamlText);
+  } catch (err) {
+    return [yamlSyntaxIssue(err)];
   }
-  // Section 21 — pipeline HTTP-backend invariants. qdrant/pinecone/weaviate
-  // throw at construction without a url + collection, so selecting one
-  // without both would emit an unrunnable bundle. Reject at parse time with
-  // a message naming the missing field (kept here, not as a `.refine()`, so
-  // the discriminated-union member stays a plain ZodObject).
-  if (data.target === "pipeline" && HTTP_VECTOR_BACKENDS.has(data.retrieve.vectorBackend)) {
-    const { vectorBackend, url, collection } = data.retrieve;
-    if (!url) {
-      throw new SpecParseError(
-        `pipeline retrieve.vectorBackend "${vectorBackend}" requires retrieve.url (the remote service base URL)`,
-      );
-    }
-    if (!collection) {
-      throw new SpecParseError(
-        `pipeline retrieve.vectorBackend "${vectorBackend}" requires retrieve.collection`,
-      );
-    }
-  }
-  return data;
+  const bypass = bypassModeIssue(raw);
+  if (bypass !== undefined) return [bypass];
+  const result = Spec.safeParse(raw);
+  if (!result.success) return zodIssuesToSpecIssues(result.error.issues);
+  return crossFieldIssues(result.data);
+}
+
+/**
+ * Loop contract 0.4 (Batch B, G03) — the whole Spec union as a JSON-Schema
+ * document. The document root is a `$ref` to `#/definitions/CrewhausSpec`
+ * (the target-discriminated union); every target shape additionally gets
+ * its own named definition (`#/definitions/cli`, `#/definitions/workflow`,
+ * …) so tooling (editors, the compiler-worker `GET /schema` endpoint, the
+ * studio) can link straight to one shape. Zod `.describe()` annotations
+ * surface as JSON-Schema `description` keys. Pure function of this module
+ * — no I/O, deterministic output.
+ */
+export function specJsonSchema(): Record<string, unknown> {
+  return zodToJsonSchema(Spec, {
+    name: "CrewhausSpec",
+    definitions: {
+      cli: cliSchema,
+      workflow: workflowSchema,
+      channel: channelSchema,
+      graph: graphSchema,
+      managed: managedSchema,
+      pipeline: pipelineSchema,
+      crew: crewSchema,
+      research: researchSchema,
+      batch: batchSchema,
+      voice: voiceSchema,
+      browser: browserSchema,
+      eval: evalSchema,
+      onchain: onchainSchema,
+      "onchain-game": onchainGameSchema,
+    },
+  }) as Record<string, unknown>;
 }
