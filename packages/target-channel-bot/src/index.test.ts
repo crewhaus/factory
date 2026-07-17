@@ -254,6 +254,143 @@ describe("emitChannelBot — daemon.ts wiring", () => {
   });
 });
 
+describe("emitChannelBot — thredz emit-wired (Loop contract 0.4, Batch E, G23)", () => {
+  // The compiler's lowerThredzWired synthesizes the mcp_servers.thredz entry
+  // and flips memory.backend to "thredz"; this fixture mirrors that lowered IR.
+  const THREDZ_IR: IrChannelV0 = {
+    ...MIN_IR,
+    memory: { enabled: true, backend: "thredz", autoRecall: true, autoCapture: true },
+    continuity: { plan: true, proof: "ladder", ledger: true, handoff: true, scope: "session" },
+    thredz: {
+      apiKey: { kind: "env", name: "THREDZ_API_KEY" },
+      visibility: "private",
+      goals: true,
+      agentName: "demo-bot",
+    },
+    mcp_servers: {
+      thredz: {
+        transport: "stdio",
+        command: "npx",
+        args: ["-y", "thredz-mcp@0.2.0"],
+        env: {
+          THREDZ_API_KEY: { kind: "env", name: "THREDZ_API_KEY" },
+          THREDZ_DEFAULT_VISIBILITY: { kind: "literal", value: "private" },
+        },
+      },
+    },
+  };
+
+  test("the daemon boots connectThredz on the mcp host and drops the ignored-note", () => {
+    const c = fileMap(THREDZ_IR).get("daemon.ts") ?? "";
+    expect(c).toContain('import { connectThredz } from "@crewhaus/memory-service";');
+    expect(c).toContain("const __thredz = await connectThredz(mcpHost, defaultCatalog");
+    expect(c).toContain('agentName: "demo-bot"');
+    // The synthesized thredz addServer is config-error guarded (exit 21).
+    expect(c).toContain("const __report = toFailureReport(__err);");
+    // The live connection threads into createAgent.
+    expect(c).toContain("thredz: __thredz,");
+    // No 0.2.3-style ignored-note comment survives.
+    expect(c).not.toContain("thredz configured but ignored");
+  });
+
+  test("agent.ts threads the live connection into the per-turn wireMemory call", () => {
+    const c = fileMap(THREDZ_IR).get("agent.ts") ?? "";
+    expect(c).toContain("type ThredzConnection");
+    expect(c).toContain("thredz: ThredzConnection | null;");
+    expect(c).toContain("thredz: config.thredz,");
+    // The fragment carries the thredz block so wireMemory flips the backend.
+    expect(c).toContain('"thredz":{');
+  });
+
+  test("a namespaced (non-thredz) server still registers the normal way alongside thredz", () => {
+    const c =
+      fileMap({
+        ...THREDZ_IR,
+        mcp_servers: {
+          ...THREDZ_IR.mcp_servers,
+          fs: { transport: "stdio", command: "npx", args: ["-y", "fs-server"] },
+        },
+      }).get("daemon.ts") ?? "";
+    expect(c).toContain("const __thredz = await connectThredz(mcpHost, defaultCatalog");
+    expect(c).toContain("await Promise.all([");
+    expect(c).toContain('registerMcpServer(mcpHost, "fs"');
+  });
+
+  test("no thredz block → no connectThredz, config.thredz field, or ThredzConnection import", () => {
+    const daemon = fileMap(MIN_IR).get("daemon.ts") ?? "";
+    const agent = fileMap(MIN_IR).get("agent.ts") ?? "";
+    expect(daemon).not.toContain("connectThredz");
+    expect(agent).not.toContain("ThredzConnection");
+    expect(agent).not.toContain("thredz: config.thredz");
+  });
+});
+
+describe("emitChannelBot — knowledge RAG block (Loop contract 0.4, Batch E, G22)", () => {
+  const KNOWLEDGE_IR: IrChannelV0 = {
+    ...MIN_IR,
+    knowledge: {
+      embedder: "openai/text-embedding-3-large",
+      vectorBackend: "in-memory",
+      defaultK: 8,
+      chunkSize: 400,
+      chunkOverlap: 0,
+      sources: [
+        { kind: "glob", glob: "kb/**/*.md" },
+        { kind: "url", url: "https://example.com/faq" },
+      ],
+    },
+    memory: { enabled: true, embedder: "mock/deterministic" },
+  };
+
+  test("the daemon ingests the corpus and registers the Retrieve tool before createAgent", () => {
+    const c = fileMap(KNOWLEDGE_IR).get("daemon.ts") ?? "";
+    expect(c).toContain(
+      'import { knowledgeRetrieve, resolveKnowledgeEmbedder } from "@crewhaus/tool-retrieve";',
+    );
+    expect(c).toContain("const __knowledgeTool = await knowledgeRetrieve({");
+    expect(c).toContain('{"kind":"glob","glob":"kb/**/*.md"}');
+    expect(c).toContain("defaultK: 8");
+    expect(c).toContain("defaultCatalog.register(__knowledgeTool);");
+    // G76 order deferred to the helper, with the declared inputs.
+    expect(c).toContain(
+      'resolveKnowledgeEmbedder({ knowledgeEmbedder: "openai/text-embedding-3-large", memoryEmbedder: "mock/deterministic" })',
+    );
+    // Registered before the agent snapshots the catalog.
+    expect(c.indexOf("defaultCatalog.register(__knowledgeTool);")).toBeLessThan(
+      c.indexOf("const agent = createAgent("),
+    );
+  });
+
+  test("no knowledge block → no RAG wiring (byte-stable)", () => {
+    const c = fileMap(MIN_IR).get("daemon.ts") ?? "";
+    expect(c).not.toContain("knowledgeRetrieve");
+    expect(c).not.toContain("__knowledgeTool");
+  });
+});
+
+describe("emitChannelBot — prompt-cache rotation persistence (Loop contract 0.4, Batch E, G78)", () => {
+  test("the daemon constructs a per-spec rotation store and hands it to the agent", () => {
+    const c = fileMap(MIN_IR).get("daemon.ts") ?? "";
+    expect(c).toContain(
+      'import { createPromptCacheRotationStore } from "@crewhaus/prompt-cache-manager";',
+    );
+    expect(c).toContain('createPromptCacheRotationStore({ specName: "demo" })');
+    expect(c).toContain("promptCacheStore: __promptCacheStore,");
+  });
+
+  test("agent.ts reads the stamp before each turn and persists on rotation", () => {
+    const c = fileMap(MIN_IR).get("agent.ts") ?? "";
+    expect(c).toContain(
+      'import type { PromptCacheRotationStore } from "@crewhaus/prompt-cache-manager";',
+    );
+    expect(c).toContain("promptCacheStore: PromptCacheRotationStore;");
+    expect(c).toContain("promptCacheLastRotatedAt: await config.promptCacheStore.read(),");
+    expect(c).toContain(
+      "onPromptCacheRotated: (rotatedAt) => config.promptCacheStore.write(rotatedAt),",
+    );
+  });
+});
+
 describe("emitChannelBot — session-router.ts", () => {
   test("derives sess_<16hex> ids via sha256 of the routing key", () => {
     const c = fileMap(MIN_IR).get("session-router.ts") ?? "";

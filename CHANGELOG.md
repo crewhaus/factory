@@ -231,6 +231,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     [--propose-taxonomy]` clusters `run_failed` + incident records by failure
     class and message so a run's failure modes read at a glance.
 
+- **Loop contract 0.4, Batch E — richer memory recall, agent-shape RAG, and
+  the active-context curator wired end to end.** One coordinated batch lands
+  the spec grammar, the IR, the lowering, the runtime seams, the affected
+  emitters and the trace/printer surface:
+
+  - **`knowledge:` — agent-shape RAG on cli/channel/managed (G22).** A new
+    optional block registers the existing `@crewhaus/tool-retrieve` (chunker →
+    embedder → vector-store) as a citation-bearing `Retrieve` tool, ingesting
+    `sources: [{ path | glob | url }]` at build/boot: `embedder?`,
+    `vector_backend?` (the same backend enum as pipeline `retrieve`), `chunk?:
+    { size?, overlap? }` and `default_k?` (1..50). It reuses target-pipeline's
+    retrieve engine, so the backend/`default_k`/chunk knobs resolve to the same
+    defaults (`in-memory` / 5 / 400 / 0). `knowledge.default_k` +
+    `knowledge.chunk.size` + `knowledge.chunk.overlap` join `OPTIMIZABLE_PATHS`
+    (the `sources` corpus stays human-owned).
+
+  - **`memory.autoRecall` gains a cadence + `refreshEvery` (G21).**
+    `autoRecall` now accepts `boolean | "session-start" | "per-turn"`;
+    `"per-turn"` (or declaring `refreshEvery: <int>`) re-runs the recall
+    closure against the latest user message every turn (or every N turns) and
+    swaps the volatile recalled tail block WITHOUT re-injecting into the frozen
+    cache prefix. `memory.refreshEvery` joins `OPTIMIZABLE_PATHS`; declaring it
+    alongside `autoRecall: false` is a loud compile error.
+
+  - **`memory.sessionRecall` (G77).** Opting in folds session summaries in as a
+    third RRF ranker in the recall fusion (default false).
+
+  - **Default change — recall + capture ON when `memory:` is present (G46,
+    mildly breaking).** With the `memory:` block declared, `autoRecall` now
+    defaults to `true` (`"session-start"`) and `autoCapture` to `true` (behind
+    the existing `autoCaptureThreshold` gate) — both previously defaulted to
+    `false`. The resolved booleans are stamped into the IR at lower time. **Opt
+    back out with `autoRecall: false` / `autoCapture: false`.**
+
+  - **Active-context curator wired (G19).** The pre-declared `compaction.curate`
+    / `dedupeThreshold` / `relevanceTopK` keys now drive an actual pre-compaction
+    pass (`@crewhaus/compaction-curator`) inside runtime-core's `maybeCompact`,
+    threading the embedder from `memory.embedder ?? memory.wiki.embedder` (BM25
+    lexical dedupe when none resolves). Every pass publishes the new `curate`
+    trace event (`before`/`after`/`dropped`/`bytesSaved`/`embedded`), rendered
+    by the structured event printer.
+
+  - **Thredz emit-wired on channel + managed (G23).** The one-knob `thredz:`
+    block, previously carried-with-note off the cli shape, now synthesizes the
+    thredz backend and boots `connectThredz` on the channel + managed daemons
+    (research + crew stay carried-with-note this batch). `compile()` no longer
+    warns `accepted-but-unwired` for `thredz` on channel/managed.
+
+  - **Embedder resolution order (G76), documented and coherent:** fact-store
+    recall + the curator resolve `memory.embedder → memory.wiki.embedder →
+    BM25-only`; the wiki tier resolves `memory.wiki.embedder → memory.embedder
+    → BM25-only`; agent-shape RAG resolves `knowledge.embedder →
+    memory.embedder → memory.wiki.embedder → the target's default embedder
+    model`.
+
+  - **Prompt-cache rotation now survives a restart (G78).** The §2.5
+    cross-run seam runtime-core always exposed
+    (`promptCacheLastRotatedAt` in, `onPromptCacheRotated` out) finally has
+    its promised persistence: `@crewhaus/prompt-cache-manager`'s
+    `createPromptCacheRotationStore` writes the last rotation timestamp to a
+    per-spec JSON record (`.crewhaus/prompt-cache/<spec>.json`, atomic, mode
+    0600, path-safe spec name). A long-running channel/managed daemon reads
+    it at boot and threads it back, so `manage()` REUSES the still-warm
+    cached prefix across restarts instead of force-rotating (and cold-starting
+    the cache) on every boot; a missing or corrupt record safely force-
+    refreshes rather than bricking boot.
+
 ## [0.3.2] - 2026-07-16
 
 ### Fixed

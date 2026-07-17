@@ -4,6 +4,7 @@ import {
   type Bundle,
   type EmitReadmeOptions,
   type IrChannelV0,
+  type IrKnowledge,
   type IrSecretRef,
   type IrSubAgentDefinition,
   renderBundleReadme,
@@ -551,6 +552,44 @@ function renderSubAgents(ir: IrChannelV0): {
   return { imports, registryBlock, registerBlock, hasAny: true };
 }
 
+/**
+ * Loop contract 0.4 (Batch E, G22) — agent-shape RAG (`knowledge:`). Mirror of
+ * target-cli's renderKnowledge (keep in sync): the daemon ingests the declared
+ * sources at boot through `@crewhaus/tool-retrieve`'s `knowledgeRetrieve` and
+ * registers the returned `Retrieve` tool on defaultCatalog, so it rides
+ * `defaultCatalog.list()` into createAgent. The G76 embedder order is deferred
+ * to `resolveKnowledgeEmbedder`. Empty when the spec omits the block.
+ */
+function renderKnowledge(ir: IrChannelV0): { imports: string[]; bootBlock: string } {
+  const k = ir.knowledge;
+  if (k === undefined) return { imports: [], bootBlock: "" };
+  const memOn = ir.memory !== undefined && ir.memory.enabled !== false;
+  const embInputs: string[] = [];
+  if (k.embedder !== undefined)
+    embInputs.push(`knowledgeEmbedder: ${escapeJsonString(k.embedder)}`);
+  const memEmb = memOn ? ir.memory?.embedder : undefined;
+  if (memEmb !== undefined) embInputs.push(`memoryEmbedder: ${escapeJsonString(memEmb)}`);
+  const wikiEmb = memOn ? ir.memory?.wiki?.embedder : undefined;
+  if (wikiEmb !== undefined) embInputs.push(`wikiEmbedder: ${escapeJsonString(wikiEmb)}`);
+  const embedderExpr = `resolveKnowledgeEmbedder({ ${embInputs.join(", ")} })`;
+  const bootBlock = `const __knowledgeTool = await knowledgeRetrieve({
+  sources: ${JSON.stringify(k.sources)},
+  embedderModel: ${embedderExpr},
+  vectorBackend: ${escapeJsonString(k.vectorBackend)},
+  defaultK: ${k.defaultK},
+  chunkSize: ${k.chunkSize},
+  chunkOverlap: ${k.chunkOverlap},
+  log: (line) => process.stdout.write(line),
+});
+defaultCatalog.register(__knowledgeTool);`;
+  return {
+    imports: [
+      `import { knowledgeRetrieve, resolveKnowledgeEmbedder } from "@crewhaus/tool-retrieve";`,
+    ],
+    bootBlock,
+  };
+}
+
 function renderMcpServers(ir: IrChannelV0): {
   imports: string[];
   bootBlock: string;
@@ -561,30 +600,58 @@ function renderMcpServers(ir: IrChannelV0): {
   if (entries.length === 0) {
     return { imports: [], bootBlock: "", cleanupBlock: "", hasAny: false };
   }
+  // Loop contract 0.4 (Batch E, G23) — the synthesized `thredz` server (from
+  // the compiler's `lowerThredzWired`, or the user's own vendored entry) boots
+  // through `connectThredz` (ported from the cli emitter): its wiki+goals
+  // tools land on the catalog under BARE names (one vocabulary across
+  // backends) and a boot failure DEGRADES (`__thredz` = null → wireMemory
+  // falls back to local files with a warning) instead of failing the daemon.
+  // Mirror of target-cli's renderMcpServers; keep the two in sync.
+  const thredzOn = ir.thredz !== undefined;
   const imports = [
     `import { McpHost, resolveMcpServerConfig } from "@crewhaus/mcp-host";`,
-    `import { registerMcpServer } from "@crewhaus/tool-mcp";`,
+    ...(thredzOn ? [`import { connectThredz } from "@crewhaus/memory-service";`] : []),
+    ...(entries.some(([name]) => !(thredzOn && name === "thredz"))
+      ? [`import { registerMcpServer } from "@crewhaus/tool-mcp";`]
+      : []),
   ];
   // 0.3.0 — embed the UNRESOLVED IrSecretRef-valued config and resolve at
   // daemon boot (mirror of target-cli's renderMcpServers; keep in sync).
   const addLines = entries
-    .map(
-      ([name, cfg]) =>
-        `mcpHost.addServer(${escapeJsonString(name)}, resolveMcpServerConfig(${JSON.stringify(cfg)}, { name: ${escapeJsonString(name)} }));`,
-    )
+    .map(([name, cfg]) => {
+      const add = `mcpHost.addServer(${escapeJsonString(name)}, resolveMcpServerConfig(${JSON.stringify(cfg)}, { name: ${escapeJsonString(name)} }));`;
+      // §4.4 — a missing THREDZ_API_KEY is a CONFIG failure: render the one
+      // structured report and exit with the config code (21) instead of an
+      // unhandled ConfigError stack (this add runs before the daemon's own
+      // main().catch wrapper).
+      if (thredzOn && name === "thredz") {
+        return `try {\n  ${add}\n} catch (__err) {\n  const __report = toFailureReport(__err);\n  process.stderr.write(\`\${formatRunFailure(__report, { prefix: "[daemon]" })}\\n\`);\n  process.exit(__report.exitCode);\n}`;
+      }
+      return add;
+    })
     .join("\n");
-  const registerLines = entries
+  const namespacedEntries = entries.filter(([name]) => !(thredzOn && name === "thredz"));
+  const registerLines = namespacedEntries
     .map(
       ([name]) =>
         `  registerMcpServer(mcpHost, ${escapeJsonString(name)}, defaultCatalog, { onRegister: ({ fullName }) => process.stdout.write(\`[mcp] registered \${fullName}\\n\`) }),`,
     )
     .join("\n");
+  // The thredz alias vocabulary must land on the catalog BEFORE any namespaced
+  // MCP server registers (the collision guard wants an empty slot), so
+  // connectThredz runs between the addServer calls and the Promise.all.
+  const thredzBoot = thredzOn
+    ? `const __thredz = await connectThredz(mcpHost, defaultCatalog, { log: (line) => process.stdout.write(line)${
+        ir.thredz?.agentName !== undefined
+          ? `, agentName: ${escapeJsonString(ir.thredz.agentName)}`
+          : ""
+      } });`
+    : undefined;
   const bootBlock = [
     "const mcpHost = new McpHost();",
     addLines,
-    "await Promise.all([",
-    registerLines,
-    "]);",
+    ...(thredzBoot !== undefined ? [thredzBoot] : []),
+    ...(namespacedEntries.length > 0 ? ["await Promise.all([", registerLines, "]);"] : []),
   ].join("\n");
   return {
     imports,
@@ -625,6 +692,11 @@ function memoryFabric(ir: IrChannelV0): {
           // /study /reflect. The exam runner is cli-shape wiring in this
           // release (no examRunner dep here), so /exam stays gated out.
           ...(learningOn ? { learning: ir.learning } : {}),
+          // Loop contract 0.4 (Batch E, G23) — thredz rides the fragment so
+          // wireMemory flips the wiki backend; the LIVE connection (`__thredz`
+          // from the daemon's connectThredz boot) is threaded separately as
+          // the `thredz` dep on the per-turn wireMemory call.
+          ...(ir.thredz !== undefined ? { thredz: ir.thredz } : {}),
         }),
       )
     : "";
@@ -686,6 +758,11 @@ function renderAgent(ir: IrChannelV0): string {
   const fabric = memoryFabric(ir);
   const hbScopeOverride = fabric.continuityOn && ir.heartbeat !== undefined;
   const dreamOn = dreamConfigured(ir);
+  // Loop contract 0.4 (Batch E, G23) — the live Thredz connection threads from
+  // the daemon's connectThredz boot into every per-turn wireMemory call as the
+  // `thredz` dep (the wiki-backend flip needs the live client). Only relevant
+  // when the memory fabric actually wires (wireMemory is the sole consumer).
+  const thredzOn = ir.thredz !== undefined && fabric.wired;
   // Loop contract 0.4 (Batch A) — top-level `memory.embedder`. Only
   // meaningful when the fact store actually wires (an enabled memory block);
   // threaded as the structural `deps.embedder` on every wireMemory /
@@ -694,7 +771,7 @@ function renderAgent(ir: IrChannelV0): string {
   const memEmbedderModel =
     ir.memory !== undefined && ir.memory.enabled !== false ? ir.memory.embedder : undefined;
   const memImport = fabric.wired
-    ? `${memEmbedderModel !== undefined ? `import { createEmbedder } from "@crewhaus/embedder";\n` : ""}import { wireMemory${fabric.continuityOn || dreamOn ? ", type MemoryWiringFragment" : ""}${dreamOn ? ", createDreamJanitorStep, type DreamJanitorStep" : ""} } from "@crewhaus/memory-service";\n${fabric.continuityOn ? `import { createSkillTool } from "@crewhaus/skills-registry";\n` : ""}${dreamOn ? `import { createCostTracker } from "@crewhaus/cost-tracker";\n` : ""}`
+    ? `${memEmbedderModel !== undefined ? `import { createEmbedder } from "@crewhaus/embedder";\n` : ""}import { wireMemory${fabric.continuityOn || dreamOn ? ", type MemoryWiringFragment" : ""}${dreamOn ? ", createDreamJanitorStep, type DreamJanitorStep" : ""}${thredzOn ? ", type ThredzConnection" : ""} } from "@crewhaus/memory-service";\n${fabric.continuityOn ? `import { createSkillTool } from "@crewhaus/skills-registry";\n` : ""}${dreamOn ? `import { createCostTracker } from "@crewhaus/cost-tracker";\n` : ""}`
     : "";
   const memEmbedderBlock =
     memEmbedderModel === undefined
@@ -746,7 +823,7 @@ function __memFragment(scope?: "spec" | "session"): MemoryWiringFragment {
       const __memTools: RegisteredTool[] = [];
       const __memWired = await wireMemory(${fragmentExpr}, {
         catalog: { register: (t: RegisteredTool) => { __memTools.push(t); } },
-        cwd: process.cwd(),${memEmbedderDep}
+        cwd: process.cwd(),${memEmbedderDep}${thredzOn ? "\n        thredz: config.thredz," : ""}
         sessionScope: args.sessionId,
       });${
         fabric.continuityOn
@@ -841,6 +918,7 @@ ${permImport}${subAgentTypeImport}${memImport}${evalImport}import type { HookDef
 import type { SkillRef } from "@crewhaus/skills-registry";
 import type { SlashCommand } from "@crewhaus/slash-commands";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import type { PromptCacheRotationStore } from "@crewhaus/prompt-cache-manager";
 ${fragmentBlock}${memEmbedderBlock}${evaluationBlock}
 export type AgentConfig = {
   hooks: ReadonlyArray<HookDef>;
@@ -848,13 +926,18 @@ export type AgentConfig = {
   slashCommands: ReadonlyMap<string, SlashCommand>;
   tools: ReadonlyArray<RegisteredTool>;
   sessionRootDir?: string;
+  // Loop contract 0.4 (Batch E, G78) — cross-run prompt-cache rotation
+  // persistence (§2.5): a long-running channel daemon reads the last rotation
+  // stamp before each turn (so a still-fresh cache prefix is REUSED instead of
+  // cold-started) and persists a fresh stamp when the runtime rotates.
+  promptCacheStore: PromptCacheRotationStore;
   // G48 — durable, hash-chained security audit sink (the Pillar 3 justification
   // + egress gates append here). The daemon opens one @crewhaus/audit-log
   // instance rooted at <cwd>/.crewhaus/audit and passes it to BOTH fields, so
   // the intent-gate + egress records land on one gapless chain.
   justificationAuditSink?: JustificationAuditSink;
   egressAuditSink?: EgressAuditSink;
-${subAgentConfigFields}};
+${thredzOn ? "  // Loop contract 0.4 (Batch E, G23) — the live Thredz connection from the\n  // daemon's connectThredz boot (null when the backend degraded to local\n  // files), threaded into every per-turn wireMemory call as the backend flip.\n  thredz: ThredzConnection | null;\n" : ""}${subAgentConfigFields}};
 
 export type RunTurnArgs = {
   sessionId: string;
@@ -883,6 +966,11 @@ export function createAgent(config: AgentConfig): Agent {
         sessionName: ${escapeJsonString(ir.name)},
         sessionTarget: "channel",
         ...(config.sessionRootDir !== undefined ? { sessionRootDir: config.sessionRootDir } : {}),
+        // Loop contract 0.4 (Batch E, G78) — thread the persisted rotation
+        // stamp in (undefined force-refreshes, the safe direction) and persist
+        // a fresh stamp out when the runtime rotates the cache markers (§2.5).
+        promptCacheLastRotatedAt: await config.promptCacheStore.read(),
+        onPromptCacheRotated: (rotatedAt) => config.promptCacheStore.write(rotatedAt),
         runContext,
         singleTurn: true,
         seedMessages: [{ role: "user", content: __inbound }],
@@ -1365,6 +1453,7 @@ function renderDaemon(ir: IrChannelV0): string {
   }
   const { imports: builtinImports, inits, registrations } = resolveTools(ir.tools, ir.toolConfigs);
   const mcp = renderMcpServers(ir);
+  const knowledge = renderKnowledge(ir);
   const subAgents = renderSubAgents(ir);
   const envNames = requiredEnvNames(ir);
   // Provider credential groups (either-or) derived from agent.model at
@@ -1500,6 +1589,15 @@ registerChannelAdapter("imessage", imessageAdapter);`);
     ? `\n  // MCP servers\n  ${mcp.bootBlock.split("\n").join("\n  ")}\n`
     : "";
   const mcpCleanup = mcp.hasAny ? `\n    ${mcp.cleanupBlock}` : "";
+
+  // Loop contract 0.4 (Batch E, G22) — the RAG corpus ingests at daemon boot
+  // (async) and registers the Retrieve tool on defaultCatalog before
+  // createAgent snapshots `defaultCatalog.list()`.
+  const knowledgeImportBlock =
+    knowledge.imports.length > 0 ? `${knowledge.imports.join("\n")}\n` : "";
+  const knowledgeBoot = knowledge.bootBlock
+    ? `\n  // Knowledge RAG (Batch E)\n  ${knowledge.bootBlock.split("\n").join("\n  ")}\n`
+    : "";
 
   const subAgentImportBlock =
     subAgents.imports.length > 0 ? `${subAgents.imports.join("\n")}\n` : "";
@@ -1676,13 +1774,13 @@ import { defaultCatalog } from "@crewhaus/tool-catalog";`;
     : `    skills: __skills,
     slashCommands: __slashCommands,`;
 
-  // v0.3.0 Goal 3 — thredz is spec-carried on this shape but not emit-wired
-  // in this release (the one-knob backend flip ships on cli). Surface it,
-  // 0.2.3-style, so nobody wonders why their wiki stayed local.
-  const thredzWarning =
-    ir.thredz !== undefined
-      ? "// note: thredz configured but ignored on channel in 0.3.0 — the Thredz backend flip is wired on the cli shape (design §4)\n"
-      : "";
+  // Loop contract 0.4 (Batch E, G23) — thredz is now emit-WIRED on channel:
+  // the daemon's connectThredz boot flips the wiki backend, so the live
+  // connection threads into createAgent as the `thredz` config field (only
+  // meaningful when the memory fabric wires — wireMemory is the sole
+  // consumer of the live connection).
+  const thredzOn = ir.thredz !== undefined && memoryFabric(ir).wired;
+  const thredzCreateAgentField = thredzOn ? "\n    thredz: __thredz," : "";
 
   // Loop contract 0.4 (Batch C) — observability env stamps (G26), the durable
   // security audit sink (G48), and the pending-approval surface (G11).
@@ -1714,17 +1812,18 @@ ${
   return `#!/usr/bin/env bun
 // Generated by crewhaus. DO NOT EDIT.
 // Source spec: ${escapeJsonString(ir.name)} (target: channel, ir version: ${ir.version}, file: daemon.ts)
-${thredzWarning}import { formatRunFailure, ${ir.heartbeat ? "isRunFailedError, " : ""}toFailureReport } from "@crewhaus/errors";
+import { formatRunFailure, ${ir.heartbeat ? "isRunFailedError, " : ""}toFailureReport } from "@crewhaus/errors";
 ${extensionImports}
 ${adapterImports.join("\n")}
 import { registerChannelAdapter } from "@crewhaus/tool-message-channel";
-${heartbeatImport}${builtinImportBlock}${mcpImportBlock}${subAgentImportBlock}import { createAgent${dreamOn ? ", createDreamStep" : ""} } from "./agent.js";
+${heartbeatImport}${builtinImportBlock}${mcpImportBlock}${knowledgeImportBlock}${subAgentImportBlock}import { createAgent${dreamOn ? ", createDreamStep" : ""} } from "./agent.js";
 import { createSessionRouter } from "./session-router.js";
 import { createGateway } from "./gateway.js";
 import { loadRetentionConfig } from "@crewhaus/data-retention-engine";
 import { createDedupStore } from "@crewhaus/durable-state";
 import { createJanitor } from "@crewhaus/runtime-core";
 import { openAuditLog } from "@crewhaus/audit-log";
+import { createPromptCacheRotationStore } from "@crewhaus/prompt-cache-manager";
 ${approvalsImport}import { join } from "node:path";
 
 ${startupEnvCheck}${observabilityEnvStamp}
@@ -1732,11 +1831,17 @@ ${adapterConstructBlock}
 
 async function main(): Promise<void> {
 ${extensionBoot}${specHooksBoot}${auditApprovalsBoot}
-${registerBlock}${mcpBoot}${subAgentBoot}
+${registerBlock}${mcpBoot}${subAgentBoot}${knowledgeBoot}
+  // Loop contract 0.4 (Batch E, G78) — per-spec cross-run prompt-cache
+  // rotation store (§2.5). One small JSON record under
+  // .crewhaus/prompt-cache/<spec>.json survives restarts so the daemon reuses
+  // a still-fresh cache prefix instead of cold-starting it every boot.
+  const __promptCacheStore = createPromptCacheRotationStore({ specName: ${escapeJsonString(ir.name)} });
   const agent = createAgent({
     hooks: ${agentHooksExpr},
 ${agentSkillsFields}
-    tools: defaultCatalog.list(),${subAgentCreateAgentFields}${agentAuditFields}
+    tools: defaultCatalog.list(),${subAgentCreateAgentFields}${agentAuditFields}${thredzCreateAgentField}
+    promptCacheStore: __promptCacheStore,
   });
   const sessionRouter = createSessionRouter({ agent${sessionRouterApprovalsField} });
   // SECURITY (audit R3) — replay-dedup backend. Default in-memory; set

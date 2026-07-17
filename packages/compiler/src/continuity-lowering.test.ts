@@ -162,9 +162,12 @@ describe("lowerContinuity — default-on + per-shape auto scope (§2.7/§14.5)",
 });
 
 describe("lowerMemory — v0.3.0 extensions (backend/ttl/wiki, §9)", () => {
-  test("pre-0.3.0 memory blocks lower unchanged (declared fields only)", () => {
+  test("declared fields carry through; autoRecall/autoCapture resolve (G46)", () => {
+    // Batch E (G46): with the block present, autoCapture defaults to true and
+    // autoRecall to true ("session-start", not carried); every OTHER field
+    // keeps the declared-fields-only discipline.
     const ir = lowerYaml(`${CLI}memory:\n  autoRecall: true\n  recallK: 4\ncontinuity: false\n`);
-    expect(ir.memory).toEqual({ autoRecall: true, recallK: 4 });
+    expect(ir.memory).toEqual({ autoCapture: true, autoRecall: true, recallK: 4 });
   });
 
   test("backend + ttl + wiki lower verbatim/parsed (ttl → ttlMs)", () => {
@@ -174,6 +177,9 @@ describe("lowerMemory — v0.3.0 extensions (backend/ttl/wiki, §9)", () => {
     expect(ir.memory).toEqual({
       backend: "file",
       ttlMs: 90 * 24 * 60 * 60 * 1000,
+      // Batch E (G46) — resolved auto-recall/capture defaults.
+      autoCapture: true,
+      autoRecall: true,
       wiki: {
         enabled: true,
         recallK: 6,
@@ -204,7 +210,8 @@ describe("lowerMemory — v0.3.0 extensions (backend/ttl/wiki, §9)", () => {
   test("crew now carries memory (emit-wired in 0.3.0)", () => {
     const ir = lower(parseSpec(`${CREW}memory:\n  autoRecall: true\n`));
     if (ir.target !== "crew") throw new Error("expected crew");
-    expect(ir.memory).toEqual({ autoRecall: true });
+    // Batch E (G46) — autoCapture resolves to true alongside autoRecall.
+    expect(ir.memory).toEqual({ autoCapture: true, autoRecall: true });
   });
 });
 
@@ -212,6 +219,9 @@ describe("lowerMemory — dream (v0.3.0 PR 14, §6/§9)", () => {
   test("dream lowers with every → everyMs and mode resolved to its default", () => {
     const ir = lowerYaml(`${CLI}memory:\n  dream:\n    every: 24h\n`);
     expect(ir.memory).toEqual({
+      // Batch E (G46) — resolved auto-recall/capture defaults ride alongside.
+      autoCapture: true,
+      autoRecall: true,
       dream: { everyMs: 24 * 60 * 60 * 1000, mode: "full" },
     });
   });
@@ -257,7 +267,8 @@ describe("lowerMemory — dream (v0.3.0 PR 14, §6/§9)", () => {
 
   test("a memory block without dream lowers with no dream key (declared-fields-only)", () => {
     const ir = lowerYaml(`${CLI}memory:\n  autoRecall: true\ncontinuity: false\n`);
-    expect(ir.memory).toEqual({ autoRecall: true });
+    // Batch E (G46) — autoCapture resolves to true; dream stays absent.
+    expect(ir.memory).toEqual({ autoCapture: true, autoRecall: true });
     expect(ir.memory && "dream" in ir.memory).toBe(false);
   });
 });

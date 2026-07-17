@@ -20,6 +20,12 @@ import type {
 import { classifyBoundary, setDefaultBoundaryLlmClassifier } from "@crewhaus/boundary-classifier";
 import { type WrappedAdapter, wrap as wrapWithCircuitBreaker } from "@crewhaus/circuit-breaker";
 import { autoCompact } from "@crewhaus/compaction-autocompact";
+import {
+  type Item as CuratorItem,
+  DEFAULT_DEDUPE_THRESHOLD,
+  type EmbedderFn,
+  curate as curateItems,
+} from "@crewhaus/compaction-curator";
 import { snip } from "@crewhaus/compaction-snip";
 import {
   DEFAULT_PRICING,
@@ -1004,6 +1010,49 @@ export type RunChatLoopOptions = {
     /** Invoked at teardown with the completed user-text turn count and the
      *  run's session id (so the callback can read the transcript to summarize). */
     readonly onCapture?: (completedTurns: number, sessionId: string) => Promise<void>;
+    /**
+     * Loop contract 0.4 (Batch E, G21) — WHEN auto-recall runs, lowered from
+     * `IrMemory.recallMode`. `"session-start"` (the implicit default) recalls
+     * ONCE at boot into the frozen, cache-marked system prefix — the pre-0.4
+     * behaviour. `"per-turn"` instead re-runs `recall` against the LATEST user
+     * message every `refreshEvery` turns and swaps a VOLATILE recalled block
+     * that sits in the mutable tail region (alongside the continuity tail),
+     * NEVER re-injecting into the frozen cache prefix — so a long daemon's
+     * recalled evidence tracks the conversation instead of drifting from a
+     * stale boot-time snapshot. Requires `recall` + `autoRecall: true`.
+     */
+    readonly recallMode?: "session-start" | "per-turn";
+    /**
+     * Loop contract 0.4 (Batch E, G21) — turns between per-turn recall
+     * refreshes (`IrMemory.refreshEvery`, int > 0; runtime clamps to >= 1 and
+     * defaults to 1). Only meaningful when `recallMode` is `"per-turn"`.
+     */
+    readonly refreshEvery?: number;
+  };
+  /**
+   * Loop contract 0.4 (Batch E, G19) — the active-context curation pre-pass
+   * (spec `compaction.curate`, lowered from `IrCompaction`; presence GATES the
+   * pass). Once the pre-turn compaction ladder decides the context is already
+   * approaching the limit, the runtime runs `@crewhaus/compaction-curator`
+   * BEFORE snip→autocompact: it drops semantically-duplicate transcript
+   * messages (embedding cosine when an `embedder` is injected, a BM25-family
+   * lexical fallback when not) and — when `relevanceTopK` is set — keeps only
+   * the top-K most relevant to the latest user message, re-sorted back into
+   * transcript order (the curator's relevance ranking SELECTS survivors; it
+   * never scrambles the conversation, and messages carrying tool_use/tool_result
+   * pairs or inside the snip-protected head/tail are never touched). When the
+   * pass frees enough headroom the expensive summarizer call is skipped
+   * entirely. Every pass publishes a `curate` trace event
+   * (`before`/`after`/`dropped`/`bytesSaved`/`embedded`). The embedder is
+   * INJECTED (runtime-core carries no embedder dependency): callers resolve it
+   * from `memory.embedder ?? memory.wiki.embedder`; absent → lexical dedupe
+   * (`embedded: false`). Absent block → no curation, byte-identical to a
+   * pre-0.4 runtime.
+   */
+  curate?: {
+    readonly embedder?: EmbedderFn;
+    readonly dedupeThreshold?: number;
+    readonly relevanceTopK?: number;
   };
   /**
    * v0.3.0 Goal 1 — the continuity seam (§2.3 requirements ledger, §2.5
@@ -1913,6 +1962,18 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // signal). Persists across `runOneTurn` calls; 0 on the first turn.
   let priorTurnToolUseCount = 0;
 
+  // Item 4 / G28 — the provider's ACTUAL input_tokens (input + cache read +
+  // cache create) from the MOST RECENT `model_response`. Updated after every
+  // main-turn model call; feeds the pre-turn compaction trigger and the
+  // tier/pool routing `contextTokens` signal a real count instead of the
+  // chars/4 heuristic. `undefined` before the first response — the heuristic
+  // is used only pre-first-call.
+  let lastModelInputTokens: number | undefined;
+  /** The context-size signal for routing/compaction: the provider's real
+   *  last-call input_tokens once available, else the chars/4 estimate. */
+  const contextTokenSignal = (msgs: ReadonlyArray<Anthropic.MessageParam>): number =>
+    lastModelInputTokens ?? estimateTokens(msgs);
+
   // Default model max OUTPUT tokens for one turn. Callers thread the spec's
   // `agent.max_tokens` here when set (the CLI target's codegen + apps/cli);
   // this fallback applies when the spec is silent. Kept comfortably above the
@@ -2592,6 +2653,29 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   const compactionThreshold = opts.compactionThreshold ?? DEFAULT_COMPACTION_THRESHOLD;
   const snipKeepHead = opts.snipKeepHead ?? DEFAULT_SNIP_KEEP_HEAD;
   const snipKeepTail = opts.snipKeepTail ?? DEFAULT_SNIP_KEEP_TAIL;
+
+  // Item 1 / G19 — active-context curation config (present ⇒ the pre-pass
+  // runs, gated by the emitter on `ir.compaction.curate`) and the shared
+  // extra `maybeCompact` args threaded at both call sites: the injected
+  // curate config, the `curate`-event publisher, and the real-token trigger.
+  const curateConfig: CurateConfig | undefined = opts.curate;
+  const publishCurate = async (info: CurateInfo): Promise<void> => {
+    bus.publish({
+      ...bus.envelope(),
+      kind: "curate",
+      before: info.before,
+      after: info.after,
+      dropped: info.dropped,
+      bytesSaved: info.bytesSaved,
+      embedded: info.embedded,
+    });
+  };
+  /** The extra `maybeCompact` args (Item 1 curation + Item 4 real tokens),
+   *  recomputed per call so `realInputTokens` reflects the newest response. */
+  const compactionExtras = (): Pick<CompactArgs, "realInputTokens" | "curate" | "onCurate"> => ({
+    ...(lastModelInputTokens !== undefined ? { realInputTokens: lastModelInputTokens } : {}),
+    ...(curateConfig !== undefined ? { curate: curateConfig, onCurate: publishCurate } : {}),
+  });
   const permissionMode: PermissionMode = opts.permissionMode ?? "default";
   const permissionRules: RuleSet = opts.permissionRules ?? {
     ...emptyRuleSet,
@@ -2662,35 +2746,31 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         .join(", ")}\n`,
     );
   }
-  // Feature #53 — auto-recall: at session start, pull the top-K relevant
-  // cross-session memories and inject them as a system block, mirroring the
-  // project-memory auto-load above. The caller supplies the `recall` seam
-  // (runtime-core stays independent of memory-store). Best-effort: a recall
-  // failure never aborts the run.
+  // Feature #53 / Item 2 (G21) — cross-session auto-recall. `recallMode`
+  // decides WHERE the recalled evidence lives:
+  //   - "session-start" (default): pull the top-K relevant memories ONCE at
+  //     boot and inject them into the frozen, cache-marked system prefix
+  //     below — the pre-0.4 behaviour.
+  //   - "per-turn": leave the frozen prefix empty and instead refresh a
+  //     VOLATILE recalled block every `refreshEvery` turns (see
+  //     `maybePerTurnRecall`), so a long daemon's evidence tracks the
+  //     conversation instead of drifting from a stale boot-time snapshot.
+  // The caller supplies the `recall` seam (runtime-core stays independent of
+  // memory-store). Best-effort: a recall failure never aborts the run.
+  const recallMode = opts.memory?.recallMode ?? "session-start";
+  const autoRecallOn = opts.memory?.autoRecall === true && opts.memory?.recall !== undefined;
   let memoryRecallBlock: Anthropic.TextBlockParam[] = [];
-  if (opts.memory?.autoRecall === true && opts.memory.recall !== undefined) {
+  if (autoRecallOn && recallMode !== "per-turn" && opts.memory?.recall !== undefined) {
     try {
       const seed = opts.memory.recallSeed ?? opts.instructions;
       const k = opts.memory.recallK ?? 5;
+      // Pillar 3 — a recalled memory can embed content shaped by untrusted
+      // tool output from an earlier session; `renderRecalledMemory` applies
+      // the same delimiter-safety + boundary-classification defenses the
+      // security fabric uses for every other prompt-bound source (#53).
       const lines = await opts.memory.recall(seed, k);
-      if (lines.length > 0) {
-        // Pillar 3 — a recalled memory can embed content shaped by untrusted
-        // tool output from an earlier session, so it is NOT verbatim-safe like
-        // the developer's own repo files. Two defenses, mirroring how the rest
-        // of the security fabric treats injected content:
-        //   1. Delimiter safety — neutralize any `</recalled_memory>` closing
-        //      tag inside a recalled line so a poisoned memory can't break out
-        //      of its block and inject trailing instructions.
-        //   2. Classification — run the assembled block through the SAME
-        //      `classifyBoundary(text, { origin: "user" })` best-effort path
-        //      `loadProjectMemory()` uses (pass policy: classify + emit trace
-        //      events without mutating), so recalled content flows through the
-        //      boundary classifier exactly like every other prompt-bound source.
-        const body = lines
-          .map((l) => `- ${escapeBoundaryDelimiter(l, "recalled_memory")}`)
-          .join("\n");
-        const text = `<recalled_memory>\nRelevant facts remembered from earlier sessions:\n${body}\n</recalled_memory>`;
-        await classifyBoundary(text, { origin: "user" }).catch(() => undefined);
+      const text = await renderRecalledMemory(lines);
+      if (text !== undefined) {
         memoryRecallBlock = [{ type: "text", text, cache_control: { type: "ephemeral" } }];
         process.stdout.write(`[memory] recalled ${lines.length} memory(ies) into the prompt\n`);
       }
@@ -2698,6 +2778,44 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       runContext.logger.warn("memory auto-recall failed", { error: (err as Error).message });
     }
   }
+
+  // Item 2 (G21) — per-turn recall state. The volatile block sits in the
+  // mutable tail region (never the frozen prefix), so swapping it each turn
+  // re-tokenizes only the tail and never busts the cached system prefix. The
+  // refresh cadence counter starts "due" so the first applicable turn recalls.
+  const perTurnRecallEnabled = autoRecallOn && recallMode === "per-turn";
+  const perTurnRefreshEvery = Math.max(1, opts.memory?.refreshEvery ?? 1);
+  let volatileRecallBlocks: Anthropic.TextBlockParam[] = [];
+  let turnsSinceRecall = perTurnRefreshEvery;
+  const maybePerTurnRecall = async (msgs: ReadonlyArray<Anthropic.MessageParam>): Promise<void> => {
+    if (!perTurnRecallEnabled) return;
+    if (turnsSinceRecall < perTurnRefreshEvery) {
+      turnsSinceRecall++;
+      return;
+    }
+    turnsSinceRecall = 1;
+    const recall = opts.memory?.recall;
+    if (recall === undefined) return;
+    // Recall against the LATEST user message (the interactive cadence), falling
+    // back to the seed/instructions when the tail carries no human text.
+    const query = latestUserText(msgs) ?? opts.memory?.recallSeed ?? opts.instructions;
+    const k = opts.memory?.recallK ?? 5;
+    try {
+      const lines = await recall(query, k);
+      const text = await renderRecalledMemory(lines);
+      volatileRecallBlocks = text !== undefined ? [{ type: "text", text }] : [];
+      if (lines.length > 0) {
+        process.stdout.write(
+          `[memory] refreshed ${lines.length} recalled memory(ies) for this turn\n`,
+        );
+      }
+    } catch (err) {
+      // Keep the prior volatile block on a transient recall failure.
+      runContext.logger.warn("per-turn memory recall failed", {
+        error: (err as Error).message,
+      });
+    }
+  };
   // Section 17 — runtime-core no longer prepends the Claude Code OAuth
   // prefix; `adapter-anthropic` handles that internally so each adapter
   // owns its provider-specific auth-shape requirements.
@@ -3929,7 +4047,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             if (poolRouter !== undefined) {
               const base = poolRouter.route(
                 {
-                  contextTokens: estimateTokens(messages),
+                  contextTokens: contextTokenSignal(messages),
                   toolsInPlay: (anthropicTools?.length ?? 0) > 0,
                   turnIndex: Math.max(0, runContext.turnNumber - 1),
                   priorTurnToolUseCount,
@@ -3990,7 +4108,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               const decision = escalateTier
                 ? { tier: "default" as const, reason: "escalated after fast-tier failure" }
                 : tierRouter.route({
-                    contextTokens: estimateTokens(messages),
+                    contextTokens: contextTokenSignal(messages),
                     toolsInPlay: (anthropicTools?.length ?? 0) > 0,
                     // `turnNumber` is 1-based (incremented before the turn
                     // runs); the router wants a 0-based index so its
@@ -4057,6 +4175,13 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             // requests) carries the resolved thinking fields, and the token
             // ceiling is the thinking-aware `effectiveMaxTokens`.
             armModelCallTimer();
+            // Item 9 / G79 — cache the settled transcript prefix when the
+            // serving adapter supports explicit caching. A request-local copy;
+            // the persisted `messages` array never carries the marker.
+            const reqMessages =
+              turnAdapter.features.caching === "explicit"
+                ? withMessageCacheBreakpoint(messages)
+                : messages;
             const reqStream = turnAdapter.stream({
               model: reqWireModelId,
               system: [
@@ -4065,9 +4190,13 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                   text: b.text,
                   ...(b.cache_control !== undefined ? { cache_control: b.cache_control } : {}),
                 })),
+                // Item 2 / G21 — the volatile recalled-memory block: rebuilt
+                // per-turn in per-turn recall mode, NO cache marker, sits in
+                // the mutable tail so a swap never busts the frozen prefix.
+                ...volatileRecallBlocks.map((b) => ({ type: "text" as const, text: b.text })),
                 ...continuityTail.map((b) => ({ type: "text" as const, text: b.text })),
               ],
-              messages: messages as Parameters<ProviderAdapter["stream"]>[0]["messages"],
+              messages: reqMessages as Parameters<ProviderAdapter["stream"]>[0]["messages"],
               tools:
                 anthropicTools !== undefined
                   ? anthropicTools.map((t) => ({
@@ -4180,6 +4309,14 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 usage,
                 durationMs: performance.now() - t0Model,
               });
+              // Item 4 / G28 — record the provider's real input_tokens for the
+              // next pre-turn compaction trigger + routing signal. A response
+              // that reports NO usage (sum 0) means "unknown", not "empty":
+              // keep the last known count (undefined pre-first-call) so both the
+              // trigger and the router fall back to the chars/4 estimate instead
+              // of reading the context as empty and silently disabling compaction.
+              const reportedInputTokens = responseInputTokens(usage);
+              if (reportedInputTokens > 0) lastModelInputTokens = reportedInputTokens;
               // Adaptive model routing — fold this successful turn into the
               // reward scoreboard so the learned policy improves next run.
               if (poolTurn !== undefined) {
@@ -4285,6 +4422,14 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               usage: final.usage,
               durationMs: performance.now() - t0Model,
             });
+            // Item 4 / G28 — record the provider's real input_tokens for the
+            // next pre-turn compaction trigger + routing signal. A response that
+            // reports NO usage (sum 0) means "unknown", not "empty": keep the
+            // last known count (undefined pre-first-call) so both the trigger and
+            // the router fall back to the chars/4 estimate instead of reading the
+            // context as empty and silently disabling compaction.
+            const reportedInputTokens = responseInputTokens(final.usage);
+            if (reportedInputTokens > 0) lastModelInputTokens = reportedInputTokens;
             // Adaptive model routing — fold this successful turn into the
             // reward scoreboard so the learned policy improves next run.
             if (poolTurn !== undefined) {
@@ -4842,6 +4987,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           logger: runContext.logger,
           onEvict: externalizeEvicted,
           getLedgerText: ledgerAnchorText,
+          ...compactionExtras(),
         },
         async (info) => {
           await logEvent("compaction", info);
@@ -4862,6 +5008,10 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           await fireHook("post-compact", { ...info, phase: "pre-turn" });
         },
       );
+
+      // Item 2 / G21 — refresh the volatile recalled block against this turn's
+      // latest user message (no-op unless per-turn recall is enabled + due).
+      await maybePerTurnRecall(messages);
 
       // G10 — the single turn IS the run: arm the per-turn ceiling around
       // it (the deadline timer is already live from boot). Fired timers
@@ -5078,7 +5228,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         messages: messages.length,
       });
 
-      // Pre-turn budget check: snip first (free), then autocompact if still over.
+      // Pre-turn budget check: (curate) → snip → autocompact if still over.
       messages = await maybeCompact(
         {
           messages,
@@ -5091,6 +5241,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           logger: runContext.logger,
           onEvict: externalizeEvicted,
           getLedgerText: ledgerAnchorText,
+          ...compactionExtras(),
         },
         async (info) => {
           await logEvent("compaction", info);
@@ -5106,6 +5257,10 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           await fireHook("post-compact", { ...info, phase: "pre-turn" });
         },
       );
+
+      // Item 2 / G21 — refresh the volatile recalled block against this turn's
+      // latest user message (no-op unless per-turn recall is enabled + due).
+      await maybePerTurnRecall(messages);
 
       // G10 — per-turn wall-clock ceiling: armed for exactly the
       // `runOneTurn` window, torn down on every exit (finally). A fired
@@ -5208,6 +5363,298 @@ function isAbortError(err: unknown): boolean {
   return typeof name === "string" && (name === "AbortError" || name === "APIUserAbortError");
 }
 
+// ---------------------------------------------------------------------------
+// Loop contract 0.4 (Batch E) — shared helpers for active-context curation
+// (Item 1 / G19), per-turn recall (Item 2 / G21) and message-level cache
+// breakpoints (Item 9 / G79).
+// ---------------------------------------------------------------------------
+
+/** Item 4 / G28 — the provider's real INPUT token count for one response:
+ *  fresh input + cache-read + cache-create (the whole prompt the provider
+ *  counted), the accurate context-size signal chars/4 approximates. */
+function responseInputTokens(u: ModelUsage): number {
+  return u.input + (u.cacheRead ?? 0) + (u.cacheCreate ?? 0);
+}
+
+/**
+ * The latest USER *text* message — the relevance query for the curator
+ * (Item 1) and the per-turn recall refresh (Item 2). Tool-result user
+ * messages carry no human words, so they're skipped: the query is what the
+ * person actually said, not a tool payload. Returns `undefined` when no
+ * text-bearing user message exists (a bare tool-result tail).
+ */
+function latestUserText(messages: ReadonlyArray<Anthropic.MessageParam>): string | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m === undefined || m.role !== "user") continue;
+    if (typeof m.content === "string") {
+      if (m.content.length > 0) return m.content;
+      continue;
+    }
+    const text = m.content
+      .filter((b): b is Anthropic.TextBlockParam => b.type === "text")
+      .map((b) => b.text)
+      .join("\n");
+    if (text.length > 0) return text;
+  }
+  return undefined;
+}
+
+/**
+ * Item 1 / G19 — a message is CURATABLE (safe for the curator to drop) only
+ * when it is pure conversational text: no `tool_use` / `tool_result` blocks,
+ * whose pairing the Anthropic API enforces (a dropped half orphans the other
+ * and 400s the request). Removing a pure-text message can never orphan a pair
+ * — consecutive same-role messages are merged server-side, exactly the
+ * tolerance the snip marker path already relies on.
+ */
+function isCuratableMessage(m: Anthropic.MessageParam): boolean {
+  const c = m.content;
+  if (typeof c === "string") return true;
+  for (const b of c) {
+    if (b.type === "tool_use" || b.type === "tool_result") return false;
+  }
+  return true;
+}
+
+/** Item 1 / G19 — flatten a message's text for curator similarity + the
+ *  `bytesSaved` accounting. Non-text blocks contribute nothing (they never
+ *  reach the curator — only pure-text messages are curatable). */
+function curatorItemText(m: Anthropic.MessageParam): string {
+  const c = m.content;
+  if (typeof c === "string") return c;
+  return c
+    .filter((b): b is Anthropic.TextBlockParam => b.type === "text")
+    .map((b) => b.text)
+    .join("\n");
+}
+
+const LEXICAL_TOKEN_RE = /[a-z0-9]+/gi;
+
+/** Item 1 / G19 — token set for the BM25-family lexical fallback. */
+function lexicalTokens(text: string): Set<string> {
+  const out = new Set<string>();
+  const matches = text.toLowerCase().match(LEXICAL_TOKEN_RE);
+  if (matches !== null) for (const t of matches) out.add(t);
+  return out;
+}
+
+/** Jaccard overlap of two token sets (the lexical similarity used by the
+ *  no-embedder curation path). Two empty sets are identical (1). */
+function jaccard(a: Set<string>, b: Set<string>): number {
+  if (a.size === 0 && b.size === 0) return 1;
+  if (a.size === 0 || b.size === 0) return 0;
+  const [small, large] = a.size <= b.size ? [a, b] : [b, a];
+  let inter = 0;
+  for (const t of small) if (large.has(t)) inter++;
+  const union = a.size + b.size - inter;
+  return union === 0 ? 0 : inter / union;
+}
+
+/**
+ * Item 1 / G19 — order-preserving lexical dedupe, the BM25-family fallback
+ * when no embedder resolves (a vector store is unavailable). Mirrors the
+ * curator's cosine `dedupeBySimilarity` structure but over token-set Jaccard:
+ * an item is dropped when a PRIOR kept item's Jaccard >= threshold, so the
+ * first occurrence (the head of the conversation, which carries goal-setting
+ * context) always wins.
+ */
+function lexicalDedupe(
+  texts: ReadonlyArray<string>,
+  threshold: number,
+): { kept: number[]; dropped: number[] } {
+  const tokenSets = texts.map(lexicalTokens);
+  const kept: number[] = [];
+  const dropped: number[] = [];
+  for (let i = 0; i < texts.length; i++) {
+    let isDuplicate = false;
+    const ti = tokenSets[i];
+    if (ti !== undefined) {
+      for (const k of kept) {
+        const tk = tokenSets[k];
+        if (tk !== undefined && jaccard(ti, tk) >= threshold) {
+          isDuplicate = true;
+          break;
+        }
+      }
+    }
+    (isDuplicate ? dropped : kept).push(i);
+  }
+  return { kept, dropped };
+}
+
+type CurateConfig = {
+  readonly embedder?: EmbedderFn;
+  readonly dedupeThreshold?: number;
+  readonly relevanceTopK?: number;
+};
+
+type CurateOutcome = {
+  readonly messages: Anthropic.MessageParam[];
+  readonly before: number;
+  readonly after: number;
+  readonly dropped: number;
+  readonly bytesSaved: number;
+  readonly embedded: boolean;
+};
+
+/**
+ * Item 1 / G19 — the active-context curation pass. Runs `curate()` (cosine,
+ * when an embedder is injected) or the lexical fallback over the CURATABLE
+ * middle messages (pure-text, outside the snip-protected head/tail), then
+ * REBUILDS the transcript keeping survivors in their original order. The
+ * curator's relevance ranking is used only to SELECT which messages survive a
+ * `relevanceTopK` trim — never to reorder the conversation, which would
+ * scramble role alternation and tool pairing. Returns `null` when nothing was
+ * eligible or nothing changed, so the caller skips the trace event. Best-
+ * effort at the call site: an embedder throw propagates and the caller
+ * degrades to the plain snip→autocompact ladder.
+ */
+async function curateActiveContext(
+  messages: ReadonlyArray<Anthropic.MessageParam>,
+  snipKeepHead: number,
+  snipKeepTail: number,
+  cfg: CurateConfig,
+): Promise<CurateOutcome | null> {
+  const firstCuratable = Math.max(0, snipKeepHead);
+  const lastCuratable = messages.length - Math.max(0, snipKeepTail);
+  const curatableIdx: number[] = [];
+  for (let i = firstCuratable; i < lastCuratable; i++) {
+    const m = messages[i];
+    if (m !== undefined && isCuratableMessage(m)) curatableIdx.push(i);
+  }
+  // Need at least two comparable items for a dedupe/relevance decision.
+  if (curatableIdx.length < 2) return null;
+
+  const texts = curatableIdx.map((i) => curatorItemText(messages[i] as Anthropic.MessageParam));
+  const threshold = cfg.dedupeThreshold ?? DEFAULT_DEDUPE_THRESHOLD;
+  const query = latestUserText(messages);
+  const embedded = cfg.embedder !== undefined;
+
+  // `keepLocal` — indices INTO `curatableIdx`/`texts` that survive, ascending
+  // (transcript order).
+  let keepLocal: number[];
+  if (embedded) {
+    const items: CuratorItem[] = texts.map((t) => ({ text: t }));
+    const result = await curateItems(items, {
+      dedupeThreshold: threshold,
+      embedder: cfg.embedder,
+      // A query only matters for the topK trim — the relevance re-order is
+      // undone by the re-sort below. Skip it (and its embedder call) unless a
+      // topK cap is actually set.
+      ...(cfg.relevanceTopK !== undefined && query !== undefined
+        ? { query, relevanceTopK: cfg.relevanceTopK }
+        : {}),
+    });
+    keepLocal = [...result.originalIndices].sort((a, b) => a - b);
+  } else {
+    const { kept } = lexicalDedupe(texts, threshold);
+    let survivors = kept;
+    if (
+      cfg.relevanceTopK !== undefined &&
+      query !== undefined &&
+      survivors.length > cfg.relevanceTopK
+    ) {
+      const q = lexicalTokens(query);
+      survivors = [...survivors]
+        .sort((a, b) => {
+          const sa = jaccard(q, lexicalTokens(texts[a] ?? ""));
+          const sb = jaccard(q, lexicalTokens(texts[b] ?? ""));
+          if (sa !== sb) return sb - sa;
+          return a - b;
+        })
+        .slice(0, cfg.relevanceTopK)
+        .sort((a, b) => a - b);
+    }
+    keepLocal = survivors;
+  }
+
+  const before = curatableIdx.length;
+  const after = keepLocal.length;
+  if (after >= before) return null; // dedupe + topK dropped nothing
+
+  const textByGlobal = new Map<number, string>();
+  curatableIdx.forEach((g, l) => textByGlobal.set(g, texts[l] as string));
+  const keepGlobal = new Set(keepLocal.map((l) => curatableIdx[l] as number));
+  const curatableSet = new Set(curatableIdx);
+
+  const out: Anthropic.MessageParam[] = [];
+  let bytesSaved = 0;
+  for (let i = 0; i < messages.length; i++) {
+    if (curatableSet.has(i) && !keepGlobal.has(i)) {
+      bytesSaved += Buffer.byteLength(textByGlobal.get(i) ?? "", "utf8");
+      continue; // curated away
+    }
+    out.push(messages[i] as Anthropic.MessageParam);
+  }
+  return { messages: out, before, after, dropped: before - after, bytesSaved, embedded };
+}
+
+/**
+ * Item 2 / G21 — render the recalled-memory system block body with the SAME
+ * two defenses the session-start recall uses (#53): neutralize any
+ * `</recalled_memory>` breakout delimiter inside a recalled line, and run the
+ * assembled block through `classifyBoundary` with origin `"user"` (recalled
+ * lines may embed content shaped by untrusted tool output in an earlier
+ * session). Returns `undefined` when there is nothing to recall.
+ */
+async function renderRecalledMemory(lines: readonly string[]): Promise<string | undefined> {
+  if (lines.length === 0) return undefined;
+  const body = lines.map((l) => `- ${escapeBoundaryDelimiter(l, "recalled_memory")}`).join("\n");
+  const text = `<recalled_memory>\nRelevant facts remembered from earlier sessions:\n${body}\n</recalled_memory>`;
+  await classifyBoundary(text, { origin: "user" }).catch(() => undefined);
+  return text;
+}
+
+/**
+ * Item 9 / G79 — stamp ONE message-level cache breakpoint so the settled
+ * transcript prefix is a cache read on the next call instead of full-price
+ * input every turn/tool-iteration. Marks the last message that carries
+ * ARRAY content (an assistant turn or a tool_result) — never a bare string,
+ * so the freshest user input stays OUTSIDE the cached prefix and a new turn
+ * EXTENDS the cache rather than rebuilding it (Anthropic's recommended
+ * incremental pattern), and string-content messages round-trip untouched.
+ * A request-local copy: the persisted `messages` array never carries a
+ * marker. One breakpoint here plus the single frozen system-prefix marker is
+ * two — well under Anthropic's four. Caller gates on
+ * `adapter.features.caching === "explicit"`.
+ */
+function withMessageCacheBreakpoint(
+  messages: ReadonlyArray<Anthropic.MessageParam>,
+): Anthropic.MessageParam[] {
+  let target = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const c = messages[i]?.content;
+    if (Array.isArray(c) && c.length > 0) {
+      target = i;
+      break;
+    }
+  }
+  if (target === -1) return [...messages];
+  return messages.map((m, i) => (i === target ? stampCacheControlTail(m) : m));
+}
+
+/** Add `cache_control: { type: "ephemeral" }` to the last cache-eligible block
+ *  of an ARRAY-content message. Walks back past `thinking`/`redacted_thinking`
+ *  blocks (which reject the marker). */
+function stampCacheControlTail(m: Anthropic.MessageParam): Anthropic.MessageParam {
+  const content = m.content;
+  if (typeof content === "string" || content.length === 0) return m;
+  let idx = -1;
+  for (let i = content.length - 1; i >= 0; i--) {
+    const t = content[i]?.type;
+    if (t !== "thinking" && t !== "redacted_thinking") {
+      idx = i;
+      break;
+    }
+  }
+  if (idx === -1) return m;
+  const next = content.map((b, i) =>
+    i === idx ? ({ ...b, cache_control: { type: "ephemeral" } } as typeof b) : b,
+  );
+  return { ...m, content: next as Anthropic.MessageParam["content"] };
+}
+
 type CompactionInfo = {
   readonly kind: "snip" | "autocompact";
   readonly before: number;
@@ -5217,6 +5664,16 @@ type CompactionInfo = {
    *  `compaction` event-log payload so post-mortems can check WHAT the
    *  summary claimed survived — counts alone said nothing. */
   readonly summary?: string;
+};
+
+/** Item 1 / G19 — one active-context curation pass, reported so the caller
+ *  publishes the `curate` trace event (mirrors {@link CompactionInfo}). */
+type CurateInfo = {
+  readonly before: number;
+  readonly after: number;
+  readonly dropped: number;
+  readonly bytesSaved: number;
+  readonly embedded: boolean;
 };
 
 type CompactArgs = {
@@ -5238,6 +5695,24 @@ type CompactArgs = {
    *  evictions, so the requirements at risk in THIS compaction anchor THIS
    *  summary. `undefined` keeps the summarizer prompt byte-identical. */
   getLedgerText?: () => string | undefined;
+  /**
+   * Item 4 / G28 — the provider's ACTUAL input_tokens from the last
+   * `model_response` (input + cache read + cache create). When set it is the
+   * trigger base (a real count, not the chars/4 heuristic) AND calibrates the
+   * heuristic for the post-stage rechecks (`realInputTokens` minus the
+   * ESTIMATED tokens each stage freed). Absent (pre-first-call, before any
+   * response is on the bus) → the pure chars/4 heuristic, unchanged.
+   */
+  realInputTokens?: number;
+  /**
+   * Item 1 / G19 — active-context curation config (opt-in; presence runs the
+   * pre-pass, gated by the caller on `ir.compaction.curate`). Embedder is
+   * injected by the caller; absent → the BM25-family lexical fallback.
+   */
+  curate?: CurateConfig;
+  /** Item 1 / G19 — reports one curation pass so the caller publishes the
+   *  `curate` trace event (mirrors `onCompaction`). */
+  onCurate?: (info: CurateInfo) => Promise<void>;
 };
 
 type OnCompaction = (info: CompactionInfo) => Promise<void>;
@@ -5260,11 +5735,21 @@ function summaryTextOf(tuple: ReadonlyArray<Anthropic.MessageParam>): string | u
 }
 
 /**
- * Pre-turn compaction ladder: estimate → snip → re-estimate → autocompact.
- * Returns the (possibly replaced) messages array. Pure with respect to
- * the input array; callers reassign. The optional `onCompaction` callback
- * fires once per applied step so the runtime can append a `compaction`
- * event to the session log without duplicating the cost-estimation logic.
+ * Pre-turn compaction ladder: (curate) → estimate → snip → re-estimate →
+ * autocompact. Returns the (possibly replaced) messages array. Pure with
+ * respect to the input array; callers reassign. The optional `onCompaction`
+ * callback fires once per applied step so the runtime can append a
+ * `compaction` event to the session log without duplicating the
+ * cost-estimation logic.
+ *
+ * Item 1 / G19 — when `args.curate` is set, the active-context curation pass
+ * runs FIRST (only once the context is already approaching the limit): it
+ * dedupes/relevance-trims the transcript, and when that alone frees enough
+ * headroom the snip→autocompact ladder is skipped entirely (the whole point —
+ * cheap dedupe before an expensive summarizer call). Item 4 / G28 — the
+ * trigger + every re-check use the provider's real `input_tokens`
+ * (`args.realInputTokens`) as the base, calibrating the chars/4 heuristic for
+ * the post-stage deltas; absent (pre-first-call) → the pure heuristic.
  */
 async function maybeCompact(
   args: CompactArgs,
@@ -5281,32 +5766,84 @@ async function maybeCompact(
     logger,
     onEvict,
     getLedgerText,
+    realInputTokens,
+    curate: curateCfg,
+    onCurate,
   } = args;
 
-  const initialBudget = new TokenBudget(contextLimit);
-  initialBudget.add(estimateTokens(messages), 0);
-  if (!initialBudget.isApproachingLimit(compactionThreshold)) {
+  // Item 4 / G28 — real-token calibration. The initial array's real size is
+  // `realInputTokens` (the provider's count); every later stage subtracts the
+  // ESTIMATED tokens it freed. Pre-first-call (`realInputTokens` undefined) →
+  // the pure chars/4 estimate, byte-identical to the pre-0.4 trigger.
+  const baseEstimate = estimateTokens(messages);
+  const effectiveTokens = (msgs: ReadonlyArray<Anthropic.MessageParam>): number => {
+    const est = estimateTokens(msgs);
+    if (realInputTokens === undefined) return est;
+    return Math.max(0, realInputTokens - (baseEstimate - est));
+  };
+  const approaching = (msgs: ReadonlyArray<Anthropic.MessageParam>): boolean => {
+    const budget = new TokenBudget(contextLimit);
+    budget.add(effectiveTokens(msgs), 0);
+    return budget.isApproachingLimit(compactionThreshold);
+  };
+
+  if (!approaching(messages)) {
     return messages;
   }
 
-  const snipped = snip(messages, snipKeepHead, snipKeepTail);
-  // §2.3 — externalize what snip is about to drop BEFORE the drop commits.
-  if (onEvict !== undefined) {
-    const evicted = snippedAway(messages, snipped);
-    if (evicted.length > 0) await onEvict(evicted);
-  }
-  logger.info("snip applied", { before: messages.length, after: snipped.length });
-  if (onCompaction !== undefined) {
-    await onCompaction({ kind: "snip", before: messages.length, after: snipped.length });
+  // Item 1 / G19 — active-context curation pre-pass. Dedupe + relevance-trim
+  // the transcript before the snip→autocompact ladder; if it frees enough,
+  // the ladder (and the summarizer model call) is skipped. Best-effort: an
+  // embedder/curator failure degrades to the plain ladder below.
+  let working = messages;
+  if (curateCfg !== undefined) {
+    try {
+      const outcome = await curateActiveContext(working, snipKeepHead, snipKeepTail, curateCfg);
+      if (outcome !== null) {
+        working = outcome.messages;
+        logger.info("active-context curation applied", {
+          before: outcome.before,
+          after: outcome.after,
+          dropped: outcome.dropped,
+          bytesSaved: outcome.bytesSaved,
+          embedded: outcome.embedded,
+        });
+        if (onCurate !== undefined) {
+          await onCurate({
+            before: outcome.before,
+            after: outcome.after,
+            dropped: outcome.dropped,
+            bytesSaved: outcome.bytesSaved,
+            embedded: outcome.embedded,
+          });
+        }
+        if (!approaching(working)) {
+          return working; // curation alone freed enough — no snip/autocompact
+        }
+      }
+    } catch (err) {
+      logger.warn("active-context curation failed; falling back to snip/autocompact", {
+        error: (err as Error).message,
+      });
+    }
   }
 
-  const postSnipBudget = new TokenBudget(contextLimit);
-  postSnipBudget.add(estimateTokens(snipped), 0);
-  if (!postSnipBudget.isApproachingLimit(compactionThreshold)) {
+  const snipped = snip(working, snipKeepHead, snipKeepTail);
+  // §2.3 — externalize what snip is about to drop BEFORE the drop commits.
+  if (onEvict !== undefined) {
+    const evicted = snippedAway(working, snipped);
+    if (evicted.length > 0) await onEvict(evicted);
+  }
+  logger.info("snip applied", { before: working.length, after: snipped.length });
+  if (onCompaction !== undefined) {
+    await onCompaction({ kind: "snip", before: working.length, after: snipped.length });
+  }
+
+  if (!approaching(snipped)) {
     return snipped;
   }
 
-  logger.info("autocompact triggered", { tokensAfterSnip: postSnipBudget.used });
+  logger.info("autocompact triggered", { tokensAfterSnip: effectiveTokens(snipped) });
   // §2.3 — autocompact replaces the ENTIRE history; externalize all of it
   // before the summarizer model call so the records survive even a
   // summarizer failure. The ledger anchor is read afterwards so this

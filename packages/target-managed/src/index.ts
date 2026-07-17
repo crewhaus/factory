@@ -3,6 +3,7 @@ import { escapeJsonString } from "@crewhaus/infra-utils";
 import {
   type Bundle,
   type EmitReadmeOptions,
+  type IrKnowledge,
   type IrManagedV0,
   renderBundleReadme,
 } from "@crewhaus/ir";
@@ -415,10 +416,49 @@ function memoryFabric(ir: IrManagedV0): { wired: boolean; fragmentJson: string }
           // v0.3.0 Goal 2 (PR 17) — learning rides the fragment: wireMemory
           // renders the learning-loop skill + gates in /study /reflect.
           ...(ir.learning !== undefined ? { learning: ir.learning } : {}),
+          // Loop contract 0.4 (Batch E, G23) — thredz rides the fragment so
+          // wireMemory flips the wiki backend to the hosted Thredz aliases;
+          // the LIVE connection (`__thredz` from the module-level connectThredz
+          // boot) is threaded separately as the `thredz` dep below.
+          ...(ir.thredz !== undefined ? { thredz: ir.thredz } : {}),
         }),
       )
     : "";
   return { wired, fragmentJson };
+}
+
+/**
+ * Loop contract 0.4 (Batch E, G22) — the module-level knowledge-RAG boot for
+ * the managed agent.ts. Ingests the declared sources through
+ * `@crewhaus/tool-retrieve`'s `knowledgeRetrieve` ONCE at module load and
+ * registers the returned `Retrieve` tool on defaultCatalog; the per-turn tool
+ * set unions `defaultCatalog.list()`. The G76 embedder order is deferred to
+ * `resolveKnowledgeEmbedder`. Mirror of target-cli's renderKnowledge.
+ */
+function renderManagedKnowledgeBoot(ir: IrManagedV0): string {
+  const k = ir.knowledge as IrKnowledge;
+  const memOn = ir.memory !== undefined && ir.memory.enabled !== false;
+  const embInputs: string[] = [];
+  if (k.embedder !== undefined)
+    embInputs.push(`knowledgeEmbedder: ${escapeJsonString(k.embedder)}`);
+  const memEmb = memOn ? ir.memory?.embedder : undefined;
+  if (memEmb !== undefined) embInputs.push(`memoryEmbedder: ${escapeJsonString(memEmb)}`);
+  const wikiEmb = memOn ? ir.memory?.wiki?.embedder : undefined;
+  if (wikiEmb !== undefined) embInputs.push(`wikiEmbedder: ${escapeJsonString(wikiEmb)}`);
+  const embedderExpr = `resolveKnowledgeEmbedder({ ${embInputs.join(", ")} })`;
+  return `
+// Loop contract 0.4 (Batch E, G22) — ingest the knowledge corpus ONCE at
+// module load and register the Retrieve tool on defaultCatalog.
+const __knowledgeTool = await knowledgeRetrieve({
+  sources: ${JSON.stringify(k.sources)},
+  embedderModel: ${embedderExpr},
+  vectorBackend: ${escapeJsonString(k.vectorBackend)},
+  defaultK: ${k.defaultK},
+  chunkSize: ${k.chunkSize},
+  chunkOverlap: ${k.chunkOverlap},
+  log: (line) => process.stderr.write(line),
+});
+defaultCatalog.register(__knowledgeTool);`;
 }
 
 function renderAgent(ir: IrManagedV0): string {
@@ -428,6 +468,22 @@ function renderAgent(ir: IrManagedV0): string {
   const evalImport = evaluation.imports.length > 0 ? `\n${evaluation.imports.join("\n")}` : "";
   const evaluationBlock = evaluation.bootBlock ? `\n\n${evaluation.bootBlock}` : "";
   const fabric = memoryFabric(ir);
+  // Loop contract 0.4 (Batch E, G23) — thredz is now emit-WIRED on managed.
+  // The managed shape has NO `mcp_servers` field, so this emitter synthesizes
+  // the thredz stdio server from `ir.thredz` itself (mirror of the compiler's
+  // `synthesizeThredzServer` / cli's `renderMcpServers`) and boots
+  // `connectThredz` ONCE at module load. The alias wiki/goals tools land on
+  // `defaultCatalog` under BARE names; the live connection threads into every
+  // per-turn `wireMemory` call as the backend flip. A boot failure DEGRADES
+  // (`__thredz` = null → wireMemory falls back to local files with a warning).
+  const thredzOn = ir.thredz !== undefined;
+  // Loop contract 0.4 (Batch E) — top-level `memory.embedder`: hybrid recall
+  // on the fact store (and the curator's cosine dedupe). Threaded as the
+  // structural `deps.embedder`, which beats the fragment's `wiki.embedder`
+  // (fallback order `embedder` → `wiki.embedder`). Only meaningful when the
+  // fact store wires (an enabled memory block).
+  const memEmbedderModel =
+    ir.memory !== undefined && ir.memory.enabled !== false ? ir.memory.embedder : undefined;
   const memImports = fabric.wired
     ? `
 import { wireMemory } from "@crewhaus/memory-service";
@@ -435,6 +491,91 @@ import { createSkillTool } from "@crewhaus/skills-registry";
 import type { Tenant } from "@crewhaus/tenancy";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";`
     : "";
+  // Loop contract 0.4 (Batch E, G22) — agent-shape RAG (`knowledge:`). Like
+  // thredz, the managed shape registers the tool on defaultCatalog at module
+  // load (top-level await ingest) and unions defaultCatalog.list() into the
+  // per-turn tool set. Mirror of target-cli's renderKnowledge (keep in sync).
+  const knowledgeOn = ir.knowledge !== undefined;
+  const thredzImports = thredzOn
+    ? `
+import { McpHost, resolveMcpServerConfig } from "@crewhaus/mcp-host";
+import { connectThredz } from "@crewhaus/memory-service";
+import { formatRunFailure, toFailureReport } from "@crewhaus/errors";`
+    : "";
+  // defaultCatalog is the shared registration surface for BOTH thredz aliases
+  // and the knowledge Retrieve tool — imported once when either is on.
+  const catalogImport =
+    thredzOn || knowledgeOn ? `\nimport { defaultCatalog } from "@crewhaus/tool-catalog";` : "";
+  const knowledgeImports = knowledgeOn
+    ? `\nimport { knowledgeRetrieve, resolveKnowledgeEmbedder } from "@crewhaus/tool-retrieve";`
+    : "";
+  const knowledgeBootBlock = knowledgeOn ? renderManagedKnowledgeBoot(ir) : "";
+  // Loop contract 0.4 (Batch E, G78) — per-spec cross-run prompt-cache rotation
+  // persistence (§2.5). The managed daemon is long-running; one JSON record per
+  // spec under .crewhaus/prompt-cache/<spec>.json survives restarts so a
+  // still-fresh cache prefix is REUSED instead of cold-started. The stamp is
+  // spec-level cache bookkeeping (not tenant data), so one record serves every
+  // tenant this daemon fronts.
+  const pcImport = `\nimport { createPromptCacheRotationStore } from "@crewhaus/prompt-cache-manager";`;
+  const pcBootBlock = `
+// Loop contract 0.4 (Batch E, G78) — cross-run prompt-cache rotation store.
+const __promptCacheStore = createPromptCacheRotationStore({ specName: ${escapeJsonString(ir.name)} });`;
+  const pcFields = `
+    promptCacheLastRotatedAt: await __promptCacheStore.read(),
+    onPromptCacheRotated: (rotatedAt) => __promptCacheStore.write(rotatedAt),`;
+  const embedderImport =
+    memEmbedderModel !== undefined ? `\nimport { createEmbedder } from "@crewhaus/embedder";` : "";
+  // The synthesized thredz stdio server (mirror of the compiler's
+  // `synthesizeThredzServer`): npx runs the version-pinned server; the API key
+  // rides the §4.2 secret machinery as an UNRESOLVED IrSecretRef and resolves
+  // at boot via `resolveMcpServerConfig` (fail-fast, config exit 21, when
+  // unset). Visibility is deterministic (never left to the server default).
+  const thredzServerJson = thredzOn
+    ? JSON.stringify({
+        transport: "stdio",
+        command: "npx",
+        // NOTE: keep in sync with the compiler's THREDZ_MCP_PACKAGE_SPEC.
+        args: ["-y", "thredz-mcp@0.2.0"],
+        env: {
+          THREDZ_API_KEY: ir.thredz?.apiKey,
+          ...(ir.thredz?.baseUrl !== undefined
+            ? { THREDZ_API_BASE: { kind: "literal", value: ir.thredz.baseUrl } }
+            : {}),
+          THREDZ_DEFAULT_VISIBILITY: { kind: "literal", value: ir.thredz?.visibility },
+        },
+      })
+    : "";
+  const thredzBootBlock = thredzOn
+    ? `
+// Loop contract 0.4 (Batch E, G23) — boot the Thredz backend ONCE at module
+// load: add the synthesized stdio server, connect + register the wiki/goals
+// vocabulary as bare-name aliases on defaultCatalog, and keep the live
+// connection for every per-turn wireMemory call (the wiki-backend flip). A
+// missing THREDZ_API_KEY is a CONFIG failure (exit 21); a connect failure
+// DEGRADES to local files (connectThredz returns null).
+const __thredzHost = new McpHost();
+try {
+  __thredzHost.addServer("thredz", resolveMcpServerConfig(${thredzServerJson}, { name: "thredz" }));
+} catch (__err) {
+  const __report = toFailureReport(__err);
+  process.stderr.write(\`\${formatRunFailure(__report, { prefix: "[managed]" })}\\n\`);
+  process.exit(__report.exitCode);
+}
+const __thredz = await connectThredz(__thredzHost, defaultCatalog, { log: (line) => process.stderr.write(line)${
+        ir.thredz?.agentName !== undefined
+          ? `, agentName: ${escapeJsonString(ir.thredz.agentName)}`
+          : ""
+      } });`
+    : "";
+  const embedderBootBlock =
+    memEmbedderModel !== undefined
+      ? `
+// Loop contract 0.4 (Batch E) — top-level \`memory.embedder\`, resolved ONCE at
+// module load from the \`@crewhaus/embedder\` factory grammar.
+const __memEmbedder = createEmbedder({ model: ${escapeJsonString(memEmbedderModel)} });`
+      : "";
+  const memEmbedderDep = memEmbedderModel !== undefined ? "\n    embedder: __memEmbedder," : "";
+  const thredzDep = thredzOn && fabric.wired ? "\n    thredz: __thredz," : "";
   const tenantArgField = fabric.wired
     ? `
   /** v0.3.0 — the request's tenant; fences every memory-fabric store. */
@@ -447,7 +588,7 @@ import type { RegisteredTool } from "@crewhaus/tool-catalog";`
   const __memTools: RegisteredTool[] = [];
   const __memWired = await wireMemory(${fabric.fragmentJson}, {
     catalog: { register: (t: RegisteredTool) => { __memTools.push(t); } },
-    cwd: process.cwd(),
+    cwd: process.cwd(),${memEmbedderDep}${thredzDep}
     tenant: args.tenant,
     sessionScope: args.sessionId,
   });
@@ -455,23 +596,30 @@ import type { RegisteredTool } from "@crewhaus/tool-catalog";`
   if (__skills.length > 0) __memTools.push(createSkillTool(__skills));
 `
     : "";
+  // Loop contract 0.4 (Batch E, G22/G23) — both the thredz alias vocabulary
+  // (G23 — the thredz-backed wiki path returns no local tools of its own) and
+  // the knowledge Retrieve tool (G22) register on defaultCatalog at module
+  // load, so whenever either is on the per-turn tool set unions
+  // `defaultCatalog.list()` with the per-turn memory tools.
+  const catalogUnion = thredzOn || knowledgeOn;
+  const toolsExpr = catalogUnion
+    ? fabric.wired
+      ? "[...__memTools, ...defaultCatalog.list()]"
+      : "defaultCatalog.list()"
+    : "__memTools";
   const memRunFields = fabric.wired
     ? `
-    tools: __memTools,
+    tools: ${toolsExpr},
     ...__memWired.options,`
-    : "";
-  // v0.3.0 Goal 3 — thredz is spec-carried on this shape but not emit-wired
-  // in this release (the one-knob backend flip ships on cli). Surface it,
-  // 0.2.3-style, so nobody wonders why their wiki stayed local.
-  const thredzWarning =
-    ir.thredz !== undefined
-      ? "// note: thredz configured but ignored on managed in 0.3.0 — the Thredz backend flip is wired on the cli shape (design §4)\n"
+    : catalogUnion
+      ? `
+    tools: ${toolsExpr},`
       : "";
   return `#!/usr/bin/env bun
 // Generated by crewhaus. DO NOT EDIT.
 // Source spec: ${escapeJsonString(ir.name)} (target: managed, ir version: ${ir.version})
-${thredzWarning}import { runChatLoop } from "@crewhaus/runtime-core";
-import type { RunChatLoopOptions } from "@crewhaus/runtime-core";${memImports}${evalImport}${evaluationBlock}
+import { runChatLoop } from "@crewhaus/runtime-core";
+import type { RunChatLoopOptions } from "@crewhaus/runtime-core";${pcImport}${memImports}${thredzImports}${catalogImport}${knowledgeImports}${embedderImport}${evalImport}${evaluationBlock}${thredzBootBlock}${embedderBootBlock}${knowledgeBootBlock}${pcBootBlock}
 
 export type ManagedAgentArgs = {
   readonly tenantId: string;
@@ -487,7 +635,7 @@ ${memBlock}  return await runChatLoop({
     sessionName: args.sessionId,
     sessionTarget: "managed",
     seedMessages: [{ role: "user", content: args.input }],
-    singleTurn: true,${memRunFields}
+    singleTurn: true,${pcFields}${memRunFields}
     ...(args.extraOptions ?? {}),
   });
 }

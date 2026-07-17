@@ -535,6 +535,13 @@ export type IrMemoryDream = {
  * reserved `thredz`), `ttlMs` (explicit fact forgetting — `spec.memory.ttl`
  * parsed to milliseconds at lower time, >= 1h enforced there), `wiki`
  * (see {@link IrMemoryWiki}), and `dream` (see {@link IrMemoryDream}).
+ *
+ * Loop contract 0.4 (Batch E): `autoRecall`/`autoCapture` are now RESOLVED at
+ * lower time — with the block present they default to `true` (G46, mildly
+ * breaking), so a compiled bundle carries an explicit boolean rather than
+ * relying on a runtime default. `recallMode`/`refreshEvery` (G21) carry the
+ * per-turn recall cadence; `sessionRecall` (G77) folds session summaries into
+ * the recall fusion.
  */
 export type IrMemory = {
   readonly enabled?: boolean;
@@ -547,9 +554,67 @@ export type IrMemory = {
   readonly autoCapture?: boolean;
   readonly autoCaptureThreshold?: number;
   readonly autoRecall?: boolean;
+  /**
+   * Loop contract 0.4 (Batch E, G21) — WHEN auto-recall runs, RESOLVED at
+   * lower time from `spec.memory.autoRecall`. Carried ONLY when `"per-turn"`
+   * (the interactive cadence); `"session-start"` is the implicit default
+   * whenever `autoRecall` is true, so the common case stays absent. In
+   * `"per-turn"` mode the runtime re-runs the recall closure against the
+   * latest user message every `refreshEvery` turns and swaps the volatile
+   * recalled TAIL block — it never re-injects into the frozen cache prefix.
+   */
+  readonly recallMode?: "session-start" | "per-turn";
+  /**
+   * Loop contract 0.4 (Batch E, G21) — turns between per-turn recall
+   * refreshes (`spec.memory.refreshEvery`, int > 0). Meaningful only when
+   * `recallMode` is `"per-turn"`; the runtime defaults to 1 when absent.
+   */
+  readonly refreshEvery?: number;
+  /**
+   * Loop contract 0.4 (Batch E, G77) — fold session summaries in as a third
+   * RRF ranker in the recall fusion (`spec.memory.sessionRecall`). Absent
+   * unless the spec opted in (default false).
+   */
+  readonly sessionRecall?: boolean;
   readonly recallK?: number;
   readonly wiki?: IrMemoryWiki;
   readonly dream?: IrMemoryDream;
+};
+
+/**
+ * Loop contract 0.4 (Batch E, G22) — one lowered `knowledge.sources[]` entry.
+ * A discriminated union so an emitter switches on `kind` without re-deriving
+ * which of path/glob/url was set (the spec's exactly-one-of rule already
+ * enforced that). Mirrors how {@link IrPipelineDocument} carries the pipeline
+ * corpus, but for the agent shapes the corpus is ingested from disk/URL at
+ * build/boot rather than inlined.
+ */
+export type IrKnowledgeSource =
+  | { readonly kind: "path"; readonly path: string }
+  | { readonly kind: "glob"; readonly glob: string }
+  | { readonly kind: "url"; readonly url: string };
+
+/**
+ * Loop contract 0.4 (Batch E, G22) — the agent-shape RAG config, lowered from
+ * `spec.knowledge` on cli/channel/managed. Presence registers
+ * `@crewhaus/tool-retrieve` as a citation-bearing `Retrieve` tool, ingesting
+ * `sources` at build/boot. It REUSES target-pipeline's retrieve engine, so
+ * the resolved shape mirrors `IrPipelineV0.retrieve` + `.indexing`:
+ * `vectorBackend`/`defaultK`/`chunkSize`/`chunkOverlap` are RESOLVED to the
+ * pipeline defaults (`in-memory` / 5 / 400 / 0) at lower time so the engine
+ * reads concrete values. `embedder` is carried only when declared;
+ * resolution order is `knowledge.embedder → memory.embedder →
+ * memory.wiki.embedder → the target's default embedder model` (a vector store
+ * needs embeddings — it never degrades to BM25, unlike memory recall).
+ * Absent when the spec omits `knowledge`.
+ */
+export type IrKnowledge = {
+  readonly embedder?: string;
+  readonly vectorBackend: IrVectorBackend;
+  readonly defaultK: number;
+  readonly chunkSize: number;
+  readonly chunkOverlap: number;
+  readonly sources: readonly IrKnowledgeSource[];
 };
 
 /** v0.3.0 §2.7 — the RESOLVED continuity scope. `auto` is a compiler
@@ -845,6 +910,9 @@ export type IrV0 = {
   readonly feedback?: IrFeedback;
   /** #53 cross-session memory config. Optional; absent when the spec omits `memory`. */
   readonly memory?: IrMemory;
+  /** Loop contract 0.4 (Batch E, G22) — agent-shape RAG config. Present when
+   *  the spec declares `knowledge:`; absent otherwise. */
+  readonly knowledge?: IrKnowledge;
   /** v0.3.0 Goal 1 — continuity config. DEFAULT-ON: present unless the spec
    *  opted out with `continuity: false`. */
   readonly continuity?: IrContinuity;
@@ -1171,6 +1239,9 @@ export type IrChannelV0 = {
   readonly feedback?: IrFeedback;
   /** #53 cross-session memory config. Optional; absent when the spec omits `memory`. */
   readonly memory?: IrMemory;
+  /** Loop contract 0.4 (Batch E, G22) — agent-shape RAG config. Present when
+   *  the spec declares `knowledge:`; absent otherwise. */
+  readonly knowledge?: IrKnowledge;
   /** v0.3.0 Goal 1 — continuity config. DEFAULT-ON: present unless the spec
    *  opted out with `continuity: false`. `scope` resolves to `session` here
    *  (per-conversation stores riding the session router's sessionId, §14.5). */
@@ -1246,6 +1317,9 @@ export type IrManagedV0 = {
   readonly evaluation?: IrEvaluation;
   /** #53 cross-session memory config. Optional; absent when the spec omits `memory`. */
   readonly memory?: IrMemory;
+  /** Loop contract 0.4 (Batch E, G22) — agent-shape RAG config. Present when
+   *  the spec declares `knowledge:`; absent otherwise. */
+  readonly knowledge?: IrKnowledge;
   /** v0.3.0 Goal 1 — continuity config. DEFAULT-ON: present unless the spec
    *  opted out with `continuity: false`. `scope` resolves to `spec` here;
    *  every store is tenant-fenced at boot (deps carry the tenant, §2.7). */

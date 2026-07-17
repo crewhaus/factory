@@ -257,7 +257,7 @@ describe("thredz: memory-backend flip + cross-field validation (§4.3)", () => {
   });
 });
 
-describe("thredz: carried-with-note on the other memory shapes", () => {
+describe("thredz: emit-wired on channel + managed (Batch E, G23)", () => {
   const channelSpec = (extra: string) => `
 name: chan
 target: channel
@@ -273,23 +273,57 @@ routing:
 ${extra}
 `;
 
-  test("channel carries IrThredz but synthesizes NO server and flips NO backend", () => {
+  test("channel synthesizes mcp_servers.thredz + carries IrThredz (like cli)", () => {
     const ir = lower(parseSpec(channelSpec("thredz: true")));
     if (ir.target !== "channel") throw new Error("unexpected target");
     expect(ir.thredz?.apiKey).toEqual({ kind: "env", name: "THREDZ_API_KEY" });
-    expect(ir.mcp_servers[THREDZ_MCP_SERVER_NAME]).toBeUndefined();
-    expect(ir.memory).toBeUndefined();
+    const server = ir.mcp_servers[THREDZ_MCP_SERVER_NAME];
+    if (server?.transport !== "stdio")
+      throw new Error("expected a synthesized stdio thredz server");
+    expect(server.args).toEqual(["-y", THREDZ_MCP_PACKAGE_SPEC]);
+    expect(server.env?.["THREDZ_DEFAULT_VISIBILITY"]).toEqual({
+      kind: "literal",
+      value: "private",
+    });
   });
 
-  test("channel emits the ignored-note comment", () => {
-    const bundle = compile(channelSpec("thredz: true"));
-    const daemon = bundle.files.find((f) => f.path === "daemon.ts")?.content ?? "";
-    expect(daemon).toContain("// note: thredz configured but ignored on channel in 0.3.0");
+  test("channel flips a declared memory block's backend to thredz", () => {
+    const ir = lower(parseSpec(channelSpec("thredz: true\nmemory:\n  autoRecall: true")));
+    if (ir.target !== "channel") throw new Error("unexpected target");
+    expect(ir.memory?.backend).toBe("thredz");
   });
 
-  test("explicit memory.backend thredz on a carried shape is a loud compile error", () => {
-    expect(() => lower(parseSpec(channelSpec("thredz: true\nmemory:\n  backend: thredz")))).toThrow(
-      /emit-wired on the cli shape only/,
+  test("channel: memory.backend file alongside thredz is a loud contradiction", () => {
+    expect(() => lower(parseSpec(channelSpec("thredz: true\nmemory:\n  backend: file")))).toThrow(
+      /contradicts the thredz: block/,
+    );
+  });
+
+  const managedSpec = (extra: string) => `
+name: mng
+target: managed
+agent:
+  model: claude-sonnet-4-6
+  instructions: be helpful
+tenants:
+  - id: t1
+    budget: { maxInputTokens: 1, maxOutputTokens: 1 }
+${extra}
+`;
+
+  test("managed carries IrThredz + flips backend (no mcp_servers field on the shape)", () => {
+    const ir = lower(parseSpec(managedSpec("thredz: true\nmemory:\n  autoRecall: true")));
+    if (ir.target !== "managed") throw new Error("unexpected target");
+    expect(ir.thredz?.apiKey).toEqual({ kind: "env", name: "THREDZ_API_KEY" });
+    expect(ir.memory?.backend).toBe("thredz");
+    // managed has no mcp_servers key at all — the daemon synthesizes the
+    // thredz server from IrThredz itself.
+    expect("mcp_servers" in ir).toBe(false);
+  });
+
+  test("managed: memory.backend file alongside thredz is a loud contradiction", () => {
+    expect(() => lower(parseSpec(managedSpec("thredz: true\nmemory:\n  backend: file")))).toThrow(
+      /contradicts the thredz: block/,
     );
   });
 });

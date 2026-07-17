@@ -118,6 +118,7 @@ import {
   turnsFromEventsWithChildren,
 } from "@crewhaus/memory-store";
 import { createPiiRedactor } from "@crewhaus/pii-redactor";
+import { SESSIONS_INDEX_DIRNAME } from "@crewhaus/session-store";
 import { type LoadedSkill, type SkillRef, discoverSkills } from "@crewhaus/skills-registry";
 import { type SlashCommand, loadCommands } from "@crewhaus/slash-commands";
 import type { Tenant } from "@crewhaus/tenancy";
@@ -135,6 +136,7 @@ import {
   renderedLearningSkill,
   withLearningDreamSeed,
 } from "./learning.js";
+import { createSessionSummaryRecall } from "./session-recall.js";
 import {
   type ThredzConnection,
   classifyThredzFailure,
@@ -230,6 +232,12 @@ export type MemoryFactsFragment = {
   readonly autoCaptureThreshold?: number;
   readonly autoRecall?: boolean;
   readonly recallK?: number;
+  /** Loop contract 0.4 (Batch E, G77) — fold the durable sessions-index in as
+   *  a third recall ranker, beside the fact-store and wiki rankers. Default
+   *  false; opting in surfaces "what we concluded last time" without a tool
+   *  call. Turns auto-recall ON for the seam even when fact `autoRecall` is
+   *  off (mirroring the wiki-recall fold). */
+  readonly sessionRecall?: boolean;
   readonly wiki?: WikiWiringFragment;
   readonly dream?: DreamWiringFragment;
 };
@@ -336,6 +344,8 @@ export type IrMemoryLike = {
   readonly autoCaptureThreshold?: number;
   readonly autoRecall?: boolean;
   readonly recallK?: number;
+  /** G77 — mirror of `IrMemory.sessionRecall`. */
+  readonly sessionRecall?: boolean;
   readonly wiki?: {
     readonly enabled?: boolean;
     readonly recallK?: number;
@@ -410,6 +420,7 @@ export function memoryFragmentFromIr(ir: {
               : {}),
             ...(mem.autoRecall !== undefined ? { autoRecall: mem.autoRecall } : {}),
             ...(mem.recallK !== undefined ? { recallK: mem.recallK } : {}),
+            ...(mem.sessionRecall !== undefined ? { sessionRecall: mem.sessionRecall } : {}),
             ...(wiki !== undefined
               ? {
                   wiki: {
@@ -1209,6 +1220,33 @@ export async function wireMemory(
     }
   }
 
+  // 3.5 — §G77 session-summary auto-recall: fold the durable sessions-index in
+  // as a THIRD recall ranker, beside the fact + wiki rankers. Independent of
+  // wiki, so it sits outside the wiki block; like the wiki fold it wraps
+  // whatever recall seam exists so far (fact lines, plus wiki lines when that
+  // fold ran) and turns auto-recall ON even when fact `autoRecall` is off —
+  // opting into sessionRecall alone is enough to surface prior sessions.
+  // Recalled session bodies take the SAME boundary-classified assembly path as
+  // the fact/wiki lines they sit beside.
+  if (fragment.memory?.sessionRecall === true) {
+    const indexDir = join(crewhausDirOf(deps), SESSIONS_INDEX_DIRNAME);
+    const sessionRecall = createSessionSummaryRecall({ indexDir });
+    const base = options.memory;
+    const baseRecall = base?.recall;
+    options = {
+      ...options,
+      memory: {
+        ...(base ?? {}),
+        autoRecall: true,
+        recall: async (query, k) => {
+          const priorLines = baseRecall !== undefined ? await baseRecall(query, k) : [];
+          return [...priorLines, ...(await sessionRecall.recall(query, DEFAULT_SESSION_RECALL_K))];
+        },
+      },
+    };
+    deps.log?.("[memory] sessionRecall on — folding the sessions-index as a third recall ranker\n");
+  }
+
   // 4. Learning (§3.3, PR 17): the rendered learning-loop skill + the
   // /study /reflect commands join the surface below; the first-class exam
   // registers here when it is actually runnable (`learning.exam` configured
@@ -1290,6 +1328,11 @@ export async function wireMemory(
 
 /** Default wiki hits fused into auto-recall (§9's `wiki.recallK: 6`). */
 const DEFAULT_WIKI_RECALL_K = 6;
+
+/** Default session-summary hits fused into auto-recall (G77). Recall is a
+ *  pointer surface ("go re-read session X"), so a few prior sessions is
+ *  plenty — kept small so the fold never floods the frozen recall block. */
+const DEFAULT_SESSION_RECALL_K = 3;
 
 /** Cap on a fused wiki body inside the recall bundle — recall is a pointer
  *  surface (`wiki_get` fetches the full article), not a article dump. */

@@ -28,6 +28,7 @@ import type {
   IrHook,
   IrIMessageConfig,
   IrJudge,
+  IrKnowledge,
   IrLearning,
   IrLimits,
   IrManagedV0,
@@ -50,6 +51,7 @@ import type {
   IrThredz,
   IrTransactionPolicy,
   IrV0,
+  IrVectorBackend,
   IrVoiceV0,
   IrWalletBinding,
   IrWhatsAppConfig,
@@ -204,6 +206,11 @@ export function compile(yamlText: string, opts: CompileOptions = {}): CompileRes
  * lowering), so they are deliberately NOT listed either — declaring them
  * must not warn.
  *
+ * Batch E (G22 knowledge / G23 thredz): the `knowledge:` block is WIRED on
+ * cli/channel/managed (registered as a Retrieve tool), so it is not listed;
+ * `thredz` becomes WIRED on channel + managed this batch (their rows are
+ * removed above), while research + crew keep the carried-with-note row.
+ *
  * Batch C (G26 observability / G11 pending-approval): the `observability:`
  * block (its new trace/metrics/cost/alerts/incidents/otel sub-blocks) and
  * `permissions.ask_mode` are WIRED-IN-BATCH on the shapes this batch's
@@ -229,8 +236,9 @@ const ACCEPTED_BUT_UNWIRED: Readonly<Partial<Record<Spec["target"], ReadonlyArra
   workflow: [
     unwired("continuity", "workflow", "the generated bundle prints the ignored-note comment"),
   ],
-  channel: [unwired("thredz", "channel", "the generated daemon prints the ignored-note comment")],
-  managed: [unwired("thredz", "managed", "the generated daemon prints the ignored-note comment")],
+  // Loop contract 0.4 (Batch E, G23) — thredz is now emit-WIRED on
+  // channel + managed (connectThredz ported from the cli emitter), so their
+  // rows are gone; research + crew stay carried-with-note this batch.
   research: [unwired("thredz", "research", "the generated daemon prints the ignored-note comment")],
   crew: [unwired("thredz", "crew", "the generated bundle prints the ignored-note comment")],
   batch: [unwired("continuity", "batch", "the generated bundle prints the ignored-note comment")],
@@ -1203,7 +1211,9 @@ type SpecWithMemory = {
     readonly ttl?: string;
     readonly autoCapture?: boolean;
     readonly autoCaptureThreshold?: number;
-    readonly autoRecall?: boolean;
+    readonly autoRecall?: boolean | "session-start" | "per-turn";
+    readonly refreshEvery?: number;
+    readonly sessionRecall?: boolean;
     readonly recallK?: number;
     readonly wiki?: {
       readonly enabled?: boolean;
@@ -1248,6 +1258,19 @@ const DREAM_EVERY_MIN_MS = 5 * 60 * 1000;
 // `dream.mode` is RESOLVED to its default (`full`) so downstream reads one
 // deterministic shape; every other field keeps the declared-fields-only
 // discipline so pre-0.3.0 memory bundles stay byte-identical.
+//
+// Loop contract 0.4 (Batch E):
+//   - G46 (mildly breaking) — with the block PRESENT, `autoRecall` and
+//     `autoCapture` RESOLVE to `true` when omitted (they previously defaulted
+//     to false). The resolved booleans are always stamped into the IR, so a
+//     bundle no longer depends on a runtime default; opt out with
+//     `autoRecall: false` / `autoCapture: false`.
+//   - G21 — `autoRecall`'s string form + `refreshEvery` resolve into
+//     `recallMode` (`"per-turn"` carried only when the interactive cadence is
+//     selected; `"session-start"` is the implicit default) + `refreshEvery`.
+//     `refreshEvery` alongside `autoRecall: false` is a contradiction
+//     (LOAD-BEARING throw — the interactive refresh has nothing to refresh).
+//   - G77 — `sessionRecall` carried only when the spec opted in.
 function lowerMemory(spec: SpecWithMemory): { memory?: IrMemory } {
   const m = spec.memory;
   if (m === undefined) return {};
@@ -1271,6 +1294,19 @@ function lowerMemory(spec: SpecWithMemory): { memory?: IrMemory } {
     }
   }
   const w = m.wiki;
+  // Loop contract 0.4 — G46 default-on + G21 per-turn cadence, RESOLVED here.
+  const ar = m.autoRecall;
+  const autoRecallOn = ar === undefined ? true : ar !== false;
+  const autoCaptureOn = m.autoCapture ?? true;
+  if (m.refreshEvery !== undefined && !autoRecallOn) {
+    throw new CompilerError(
+      `memory.refreshEvery re-runs auto-recall each turn, but autoRecall is false — set autoRecall: per-turn (or omit it / true / "session-start") to enable recall, or drop refreshEvery.`,
+    );
+  }
+  // "per-turn" when explicitly selected OR a refresh cadence was declared
+  // (refreshEvery IS the "every N turns" knob). Otherwise session-start — the
+  // implicit default, NOT carried, keeping the common case's IR lean.
+  const perTurn = autoRecallOn && (ar === "per-turn" || m.refreshEvery !== undefined);
   return {
     memory: {
       ...(m.enabled !== undefined ? { enabled: m.enabled } : {}),
@@ -1279,11 +1315,18 @@ function lowerMemory(spec: SpecWithMemory): { memory?: IrMemory } {
       // Runtime fallback order: embedder → wiki.embedder.
       ...(m.embedder !== undefined ? { embedder: m.embedder } : {}),
       ...(ttlMs !== undefined ? { ttlMs } : {}),
-      ...(m.autoCapture !== undefined ? { autoCapture: m.autoCapture } : {}),
+      // Loop contract 0.4 (Batch E, G46) — auto-capture/recall are now
+      // RESOLVED booleans (default true when the block is present).
+      autoCapture: autoCaptureOn,
       ...(m.autoCaptureThreshold !== undefined
         ? { autoCaptureThreshold: m.autoCaptureThreshold }
         : {}),
-      ...(m.autoRecall !== undefined ? { autoRecall: m.autoRecall } : {}),
+      autoRecall: autoRecallOn,
+      // Loop contract 0.4 (Batch E, G21) — per-turn recall cadence.
+      ...(perTurn ? { recallMode: "per-turn" as const } : {}),
+      ...(perTurn && m.refreshEvery !== undefined ? { refreshEvery: m.refreshEvery } : {}),
+      // Loop contract 0.4 (Batch E, G77) — session-summary recall ranker.
+      ...(m.sessionRecall !== undefined ? { sessionRecall: m.sessionRecall } : {}),
       ...(m.recallK !== undefined ? { recallK: m.recallK } : {}),
       ...(w !== undefined
         ? {
@@ -1309,6 +1352,61 @@ function lowerMemory(spec: SpecWithMemory): { memory?: IrMemory } {
             },
           }
         : {}),
+    },
+  };
+}
+
+// Loop contract 0.4 (Batch E, G22) — the agent-shape RAG (`knowledge:`)
+// block. Defaults MIRROR target-pipeline's retrieve/indexing so the shared
+// `@crewhaus/tool-retrieve` engine reads the same baseline whether it was
+// configured via the pipeline shape or the knowledge block.
+const KNOWLEDGE_DEFAULT_BACKEND: IrVectorBackend = "in-memory";
+const KNOWLEDGE_DEFAULT_K = 5;
+const KNOWLEDGE_DEFAULT_CHUNK_SIZE = 400;
+const KNOWLEDGE_DEFAULT_CHUNK_OVERLAP = 0;
+
+type SpecWithKnowledge = {
+  readonly knowledge?: {
+    readonly embedder?: string;
+    readonly vector_backend?: IrVectorBackend;
+    readonly sources: ReadonlyArray<{
+      readonly path?: string;
+      readonly glob?: string;
+      readonly url?: string;
+    }>;
+    readonly chunk?: { readonly size?: number; readonly overlap?: number };
+    readonly default_k?: number;
+  };
+};
+
+/**
+ * Lower the `knowledge:` block to a RESOLVED `IrKnowledge`: the backend /
+ * default-K / chunk knobs resolve to the pipeline defaults so the retrieve
+ * engine reads concrete values, `embedder` is carried only when declared
+ * (resolution order `knowledge.embedder → memory.embedder →
+ * memory.wiki.embedder → default` is a runtime/emitter concern — the IR
+ * carries the raw string). The spec's exactly-one-of superRefine already
+ * validated each source, so the path/glob/url discrimination is total (the
+ * final throw is unreachable defence for direct-IR-less callers).
+ */
+function lowerKnowledge(spec: SpecWithKnowledge): { knowledge?: IrKnowledge } {
+  const k = spec.knowledge;
+  if (k === undefined) return {};
+  return {
+    knowledge: {
+      ...(k.embedder !== undefined ? { embedder: k.embedder } : {}),
+      vectorBackend: k.vector_backend ?? KNOWLEDGE_DEFAULT_BACKEND,
+      defaultK: k.default_k ?? KNOWLEDGE_DEFAULT_K,
+      chunkSize: k.chunk?.size ?? KNOWLEDGE_DEFAULT_CHUNK_SIZE,
+      chunkOverlap: k.chunk?.overlap ?? KNOWLEDGE_DEFAULT_CHUNK_OVERLAP,
+      sources: k.sources.map((s) => {
+        if (s.path !== undefined) return { kind: "path" as const, path: s.path };
+        if (s.glob !== undefined) return { kind: "glob" as const, glob: s.glob };
+        if (s.url !== undefined) return { kind: "url" as const, url: s.url };
+        throw new CompilerError(
+          "knowledge source declared none of path/glob/url (unreachable after spec validation)",
+        );
+      }),
     },
   };
 }
@@ -1534,12 +1632,48 @@ function lowerThredzWired(
 }
 
 /**
- * The CARRIED lowering (channel/managed/research/crew): the block parses and
- * lowers to `IrThredz` so recompiles round-trip, but nothing is synthesized
- * or flipped — those emitters print the 0.2.3-convention ignored-note
- * comment instead of half-wiring a backend their daemons cannot boot yet.
- * An explicit `memory.backend: thredz` is rejected loudly (dead config that
- * would degrade-warn every run beats nobody's use case).
+ * Loop contract 0.4 (Batch E, G23) — the emit-wired thredz lowering for the
+ * MANAGED shape, which has NO `mcp_servers` field. Same resolve + memory-
+ * backend-flip + cross-field validation as {@link lowerThredzWired}, but it
+ * synthesizes no mcp_servers entry: the managed daemon builds the thredz
+ * stdio server from `IrThredz` itself and boots connectThredz (it cannot
+ * fold the server into a non-existent mcp_servers map). The `memory.backend`
+ * rules are identical to the cli/channel path.
+ */
+function lowerThredzWiredNoMcp(
+  spec: SpecWithThredz,
+  opts: { readonly continuityGoalsOn: boolean; readonly memory: { memory?: IrMemory } },
+): { thredz?: IrThredz; memory?: IrMemory } {
+  const thredz = lowerThredzBlock(spec, opts.continuityGoalsOn);
+  if (thredz === undefined) {
+    if (spec.memory?.backend === "thredz") {
+      throw new CompilerError(
+        `memory.backend "thredz" needs the top-level thredz: block (it carries the API key) — add \`thredz: $THREDZ_API_KEY\`, or drop the backend override to stay on local files.`,
+      );
+    }
+    return { ...opts.memory };
+  }
+  if (spec.memory?.backend === "file") {
+    throw new CompilerError(
+      `memory.backend "file" contradicts the thredz: block — the one knob flips the wiki backend to Thredz (design §4). Drop the backend override (or remove thredz:) and recompile.`,
+    );
+  }
+  const memory =
+    opts.memory.memory !== undefined
+      ? { memory: { ...opts.memory.memory, backend: "thredz" as const } }
+      : {};
+  return { thredz, ...memory };
+}
+
+/**
+ * The CARRIED lowering (research/crew): the block parses and lowers to
+ * `IrThredz` so recompiles round-trip, but nothing is synthesized or flipped
+ * — those emitters print the 0.2.3-convention ignored-note comment instead of
+ * half-wiring a backend their daemons cannot boot yet. (cli/channel/managed
+ * are now emit-WIRED — see {@link lowerThredzWired} / {@link
+ * lowerThredzWiredNoMcp}.) An explicit `memory.backend: thredz` is rejected
+ * loudly (dead config that would degrade-warn every run beats nobody's use
+ * case).
  */
 function lowerThredzCarried(
   spec: SpecWithThredz,
@@ -1548,7 +1682,7 @@ function lowerThredzCarried(
 ): { thredz?: IrThredz } {
   if (spec.memory?.backend === "thredz") {
     throw new CompilerError(
-      `memory.backend "thredz" is emit-wired on the cli shape only in this release — the ${shape} shape carries the thredz: block for forward compatibility but keeps the local backend. Remove the backend override.`,
+      `memory.backend "thredz" is emit-wired on cli/channel/managed in this release — the ${shape} shape carries the thredz: block for forward compatibility but keeps the local backend. Remove the backend override.`,
     );
   }
   const thredz = lowerThredzBlock(spec, continuityGoalsOn);
@@ -1876,6 +2010,8 @@ export function lower(spec: Spec): IrNode {
         ...lowerSecurity(spec),
         ...lowerFeedback(spec),
         ...memoryLowered,
+        // Loop contract 0.4 (Batch E, G22) — agent-shape RAG over doc sources.
+        ...lowerKnowledge(spec),
         ...continuity,
         ...(thredzLowered.thredz !== undefined ? { thredz: thredzLowered.thredz } : {}),
         ...learning,
@@ -1954,6 +2090,19 @@ export function lower(spec: Spec): IrNode {
       const continuity = lowerContinuity(spec, { defaultOn: true, autoScope: "session" });
       // v0.3.0 Goal 2 — learning (validated + Sources-required wiki stamp).
       const learning = lowerLearning(spec);
+      // Loop contract 0.4 (Batch E, G23) — thredz is now emit-WIRED on this
+      // shape (was carried-with-note): synthesize `mcp_servers.thredz` and
+      // flip a declared memory block's backend, exactly like cli. The daemon
+      // emitter ports target-cli's connectThredz boot fragment.
+      const thredzLowered = lowerThredzWired(spec, {
+        continuityGoalsOn: continuity.continuity?.plan === true,
+        mcpServers: lowerMcpServers(spec.mcp_servers),
+        memory: lowerMemory(spec),
+      });
+      const memoryLowered = applyLearningWikiGovernance(
+        thredzLowered.memory !== undefined ? { memory: thredzLowered.memory } : {},
+        learning.learning !== undefined,
+      );
       return {
         version: 0,
         name: spec.name,
@@ -1971,7 +2120,7 @@ export function lower(spec: Spec): IrNode {
         toolConfigs: lowerToolConfigs(spec.agent.tool_config),
         channels: lowerChannels(spec.channels),
         routing: { sessionKey: spec.routing.sessionKey },
-        mcp_servers: lowerMcpServers(spec.mcp_servers),
+        mcp_servers: thredzLowered.mcp_servers,
         permissions: lowerPermissions(spec),
         subAgents: lowerSubAgents(spec.agent.sub_agents),
         compaction: lowerCompaction(spec),
@@ -1982,14 +2131,16 @@ export function lower(spec: Spec): IrNode {
         // Loop contract 0.4 (Batch B, G02) — in-loop output evaluation.
         ...lowerEvaluation(spec),
         ...lowerFeedback(spec),
-        ...applyLearningWikiGovernance(lowerMemory(spec), learning.learning !== undefined),
+        ...memoryLowered,
+        // Loop contract 0.4 (Batch E, G22) — agent-shape RAG over doc sources.
+        ...lowerKnowledge(spec),
         // v0.3.0 Goal 1 — DEFAULT-ON continuity. `auto` scope resolves to
         // `session` on channel: per-conversation stores ride the session
         // router's sessionId (§2.7/§14.5); heartbeat ticks read spec scope.
         ...continuity,
-        // v0.3.0 Goal 3 — thredz is CARRIED on this shape (ignored-note in
-        // the emitted daemon), not emit-wired yet.
-        ...lowerThredzCarried(spec, continuity.continuity?.plan === true, "channel"),
+        // Loop contract 0.4 (Batch E, G23) — thredz emit-wired (see the
+        // lowerThredzWired call above).
+        ...(thredzLowered.thredz !== undefined ? { thredz: thredzLowered.thredz } : {}),
         ...learning,
         ...lowerObservability(spec),
         // Phase 3 §3.1 — heartbeat. Duration string ("2h", "30m") is
@@ -2089,6 +2240,18 @@ export function lower(spec: Spec): IrNode {
       const continuity = lowerContinuity(spec, { defaultOn: true, autoScope: "spec" });
       // v0.3.0 Goal 2 — learning (validated + Sources-required wiki stamp).
       const learning = lowerLearning(spec);
+      // Loop contract 0.4 (Batch E, G23) — thredz emit-WIRED (was carried).
+      // Managed has no mcp_servers field, so the daemon synthesizes the
+      // thredz server from IrThredz; here we carry it + flip the memory
+      // backend.
+      const thredzLowered = lowerThredzWiredNoMcp(spec, {
+        continuityGoalsOn: continuity.continuity?.plan === true,
+        memory: lowerMemory(spec),
+      });
+      const memoryLowered = applyLearningWikiGovernance(
+        thredzLowered.memory !== undefined ? { memory: thredzLowered.memory } : {},
+        learning.learning !== undefined,
+      );
       return {
         version: 0,
         name: spec.name,
@@ -2117,14 +2280,16 @@ export function lower(spec: Spec): IrNode {
         ...lowerHooks(spec),
         // Loop contract 0.4 (Batch B, G02) — in-loop output evaluation.
         ...lowerEvaluation(spec),
-        ...applyLearningWikiGovernance(lowerMemory(spec), learning.learning !== undefined),
+        ...memoryLowered,
+        // Loop contract 0.4 (Batch E, G22) — agent-shape RAG over doc sources.
+        ...lowerKnowledge(spec),
         // v0.3.0 Goal 1 — DEFAULT-ON continuity. `auto` resolves to `spec`
         // scope; the managed daemon tenant-fences every store at boot (the
         // wireMemory deps carry the tenant, §2.7).
         ...continuity,
-        // v0.3.0 Goal 3 — thredz is CARRIED on this shape (ignored-note in
-        // the emitted daemon), not emit-wired yet.
-        ...lowerThredzCarried(spec, continuity.continuity?.plan === true, "managed"),
+        // Loop contract 0.4 (Batch E, G23) — thredz emit-wired (see the
+        // lowerThredzWiredNoMcp call above).
+        ...(thredzLowered.thredz !== undefined ? { thredz: thredzLowered.thredz } : {}),
         ...learning,
         ...lowerObservability(spec),
       } satisfies IrManagedV0;

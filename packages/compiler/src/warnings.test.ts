@@ -128,7 +128,9 @@ describe("compile() warnings — ACCEPTED_BUT_UNWIRED table", () => {
     expect(paths(bt.warnings)).toEqual(["continuity"]);
   });
 
-  test("thredz warns on channel/managed/research/crew (carried, ignored-note shapes)", () => {
+  test("thredz warns on research/crew only (channel/managed now emit-WIRED, G23)", () => {
+    // Batch E (G23) — channel + managed port the cli connectThredz fragment,
+    // so thredz no longer warns there; research + crew stay carried-with-note.
     const channel = compile(
       [
         "name: ch",
@@ -145,7 +147,7 @@ describe("compile() warnings — ACCEPTED_BUT_UNWIRED table", () => {
         "thredz: $THREDZ_API_KEY",
       ].join("\n"),
     );
-    expect(paths(channel.warnings)).toEqual(["thredz"]);
+    expect(channel.warnings).toEqual([]);
 
     const managed = compile(
       [
@@ -160,7 +162,7 @@ describe("compile() warnings — ACCEPTED_BUT_UNWIRED table", () => {
         "thredz: $THREDZ_API_KEY",
       ].join("\n"),
     );
-    expect(paths(managed.warnings)).toEqual(["thredz"]);
+    expect(managed.warnings).toEqual([]);
 
     const research = compile(
       [

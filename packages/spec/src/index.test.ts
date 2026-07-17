@@ -2673,3 +2673,121 @@ describe("Batch A — graph edges[].when + parallel", () => {
     );
   });
 });
+
+describe("Batch E — memory.autoRecall union + refreshEvery + sessionRecall (G21/G77)", () => {
+  const cli = (lines: string): string =>
+    ["name: c", "target: cli", "agent:", "  model: m", "  instructions: i", lines].join("\n");
+
+  test("autoRecall accepts boolean and the session-start/per-turn strings", () => {
+    for (const v of ["true", "false", '"session-start"', '"per-turn"']) {
+      const spec = parseSpec(cli(`memory:\n  autoRecall: ${v}`));
+      if (spec.target !== "cli") expect.unreachable();
+      // value round-trips (boolean or literal string) unchanged through parse.
+    }
+    const perTurn = parseSpec(cli('memory:\n  autoRecall: "per-turn"'));
+    if (perTurn.target !== "cli") expect.unreachable();
+    expect(perTurn.memory?.autoRecall).toBe("per-turn");
+  });
+
+  test("autoRecall rejects arbitrary strings", () => {
+    expect(() => parseSpec(cli('memory:\n  autoRecall: "sometimes"'))).toThrow(SpecParseError);
+  });
+
+  test("refreshEvery parses a positive int; rejects 0 and fractions", () => {
+    const spec = parseSpec(cli("memory:\n  autoRecall: per-turn\n  refreshEvery: 4"));
+    if (spec.target !== "cli") expect.unreachable();
+    expect(spec.memory?.refreshEvery).toBe(4);
+    expect(() => parseSpec(cli("memory:\n  refreshEvery: 0"))).toThrow(SpecParseError);
+    expect(() => parseSpec(cli("memory:\n  refreshEvery: 1.5"))).toThrow(SpecParseError);
+  });
+
+  test("sessionRecall parses as a boolean", () => {
+    const spec = parseSpec(cli("memory:\n  sessionRecall: true"));
+    if (spec.target !== "cli") expect.unreachable();
+    expect(spec.memory?.sessionRecall).toBe(true);
+  });
+});
+
+describe("Batch E — knowledge block (agent-shape RAG, G22)", () => {
+  const cli = (lines: string): string =>
+    ["name: c", "target: cli", "agent:", "  model: m", "  instructions: i", lines].join("\n");
+
+  test("parses a full knowledge block with a path source", () => {
+    const spec = parseSpec(
+      cli(
+        [
+          "knowledge:",
+          "  embedder: builtin:hash",
+          "  vector_backend: lance",
+          "  default_k: 8",
+          "  chunk:",
+          "    size: 512",
+          "    overlap: 64",
+          "  sources:",
+          "    - path: ./docs",
+          "    - glob: '**/*.md'",
+          "    - url: https://example.com/guide",
+        ].join("\n"),
+      ),
+    );
+    if (spec.target !== "cli") expect.unreachable();
+    expect(spec.knowledge?.vector_backend).toBe("lance");
+    expect(spec.knowledge?.default_k).toBe(8);
+    expect(spec.knowledge?.sources).toHaveLength(3);
+  });
+
+  test("a source with zero or multiple of path/glob/url is rejected", () => {
+    expect(() => parseSpec(cli("knowledge:\n  sources:\n    - {}"))).toThrow(SpecParseError);
+    expect(() =>
+      parseSpec(cli("knowledge:\n  sources:\n    - path: ./a\n      glob: '*.md'")),
+    ).toThrow(/exactly one of path\/glob\/url/);
+  });
+
+  test("sources is required (an empty list / missing block is rejected)", () => {
+    expect(() => parseSpec(cli("knowledge:\n  sources: []"))).toThrow(SpecParseError);
+    expect(() => parseSpec(cli("knowledge:\n  default_k: 5"))).toThrow(SpecParseError);
+  });
+
+  test("a typo'd sub-key fails the strict schema", () => {
+    expect(() => parseSpec(cli("knowledge:\n  chunkz: 1\n  sources:\n    - path: ./docs"))).toThrow(
+      SpecParseError,
+    );
+  });
+
+  test("knowledge is accepted on channel + managed, rejected elsewhere (e.g. workflow)", () => {
+    const channel = parseSpec(
+      [
+        "name: c",
+        "target: channel",
+        "agent:",
+        "  model: m",
+        "  instructions: i",
+        "channels:",
+        "  slack:",
+        "    botToken: $SLACK_BOT_TOKEN",
+        "    signingSecret: $SLACK_SIGNING_SECRET",
+        "routing:",
+        "  sessionKey: thread",
+        "knowledge:",
+        "  sources:",
+        "    - path: ./docs",
+      ].join("\n"),
+    );
+    expect(channel.target).toBe("channel");
+    expect(() =>
+      parseSpec(
+        [
+          "name: w",
+          "target: workflow",
+          "model: m",
+          "steps:",
+          "  - name: s1",
+          "    instructions: go",
+          "knowledge:",
+          "  sources:",
+          "    - path: ./docs",
+        ].join("\n"),
+      ),
+    ).toThrow(SpecParseError);
+  });
+});

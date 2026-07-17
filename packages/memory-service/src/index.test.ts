@@ -233,6 +233,81 @@ describe("wireMemory — the matrix", () => {
   });
 });
 
+// Batch E item 8 (G77) — session-summary recall folded as a third ranker.
+describe("wireMemory — sessionRecall (G77)", () => {
+  /** Seed one durable session-summary record into `<tmp>/.crewhaus/sessions-index`. */
+  function writeSessionSummary(
+    sessionId: string,
+    over: { outcome?: string; keyFacts?: string[] } = {},
+  ): void {
+    const indexDir = join(tmp, ".crewhaus", "sessions-index");
+    mkdirSync(indexDir, { recursive: true });
+    const record = {
+      schemaVersion: 1,
+      sessionId,
+      turnCount: 1,
+      toolsUsed: [],
+      ratings: { positive: 0, negative: 0 },
+      outcome: over.outcome ?? "",
+      keyFacts: over.keyFacts ?? [],
+      hadError: false,
+      summarizedAt: "2026-07-15T09:00:00.000Z",
+    };
+    writeFileSync(join(indexDir, `${sessionId}.json`), `${JSON.stringify(record)}\n`);
+  }
+
+  test("folds prior-session lines into the recall bundle beside fact lines", async () => {
+    const { deps: d, logs } = deps();
+    writeSessionSummary("sess-csv", {
+      outcome: "shipped the CSV export feature",
+      keyFacts: ["export wired to the download button"],
+    });
+    const wired = await wireMemory(
+      { specName: "sr-fold", memory: { autoRecall: true, sessionRecall: true } },
+      d,
+    );
+    await wired.stores.memory?.remember("the deploy password lives in vault");
+    const lines = (await wired.options.memory?.recall?.("csv export deploy vault", 5)) ?? [];
+    // Fact line AND the session pointer line both present.
+    expect(lines.some((l) => l.includes("deploy password"))).toBe(true);
+    expect(lines.some((l) => l.startsWith("[session:sess-csv"))).toBe(true);
+    expect(logs.some((l) => l.includes("sessionRecall on"))).toBe(true);
+  });
+
+  test("no sessionRecall → no session lines in the bundle", async () => {
+    const { deps: d } = deps();
+    writeSessionSummary("sess-csv", { outcome: "shipped the CSV export feature" });
+    const wired = await wireMemory({ specName: "sr-off", memory: { autoRecall: true } }, d);
+    const lines = (await wired.options.memory?.recall?.("csv export", 5)) ?? [];
+    expect(lines.some((l) => l.startsWith("[session:"))).toBe(false);
+  });
+
+  test("sessionRecall alone turns auto-recall ON (no fact autoRecall needed)", async () => {
+    const { deps: d } = deps();
+    writeSessionSummary("sess-auth", { outcome: "fixed the OAuth refresh loop" });
+    // memory present but autoRecall unset → G46 would default it on, so pin the
+    // standalone behavior with autoRecall explicitly false + sessionRecall on.
+    const wired = await wireMemory(
+      { specName: "sr-solo", memory: { autoRecall: false, sessionRecall: true } },
+      d,
+    );
+    expect(wired.options.memory?.autoRecall).toBe(true);
+    const lines = (await wired.options.memory?.recall?.("oauth refresh", 5)) ?? [];
+    expect(lines.some((l) => l.startsWith("[session:sess-auth"))).toBe(true);
+  });
+
+  test("sessionRecall with an empty index recalls only the fact lines", async () => {
+    const { deps: d } = deps();
+    const wired = await wireMemory(
+      { specName: "sr-empty", memory: { autoRecall: true, sessionRecall: true } },
+      d,
+    );
+    await wired.stores.memory?.remember("a plain fact about deploys");
+    const lines = (await wired.options.memory?.recall?.("deploys", 5)) ?? [];
+    expect(lines).toEqual(["a plain fact about deploys"]);
+  });
+});
+
 describe("wireMemory — seams behavior", () => {
   test("recall seam round-trips facts from the store", async () => {
     const { deps: d } = deps();

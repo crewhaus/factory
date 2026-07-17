@@ -55,6 +55,7 @@ memory:
   recallK: 5
   autoCaptureThreshold: 2
   ttl: 90d
+  refreshEvery: 3
   wiki:
     recallK: 5
   dream:
@@ -62,6 +63,19 @@ memory:
     budget_usd: 0.5
 continuity:
   focusMaxChars: 4096
+`.trim();
+
+// Loop contract 0.4 (Batch E) — the agent-shape RAG block (cli/channel/
+// managed). `sources` is required so the fixture declares one; the
+// optimizable paths are the tuning dials underneath it.
+const KNOWLEDGE = `
+knowledge:
+  default_k: 5
+  chunk:
+    size: 400
+    overlap: 40
+  sources:
+    - path: ./docs
 `.trim();
 
 const FAILURE_TAXONOMY = `
@@ -114,6 +128,7 @@ const FIXTURES: Readonly<Record<Spec["target"], string>> = {
     CHAIN_BLOCKS,
     MEMORY_CONTINUITY,
     EVALUATION,
+    KNOWLEDGE,
   ].join("\n"),
   workflow: [
     "name: fx",
@@ -146,6 +161,7 @@ const FIXTURES: Readonly<Record<Spec["target"], string>> = {
     CHAIN_BLOCKS,
     MEMORY_CONTINUITY,
     EVALUATION,
+    KNOWLEDGE,
   ].join("\n"),
   graph: [
     "name: fx",
@@ -175,6 +191,7 @@ const FIXTURES: Readonly<Record<Spec["target"], string>> = {
     LIMITS,
     MEMORY_CONTINUITY,
     EVALUATION,
+    KNOWLEDGE,
   ].join("\n"),
   pipeline: [
     "name: fx",

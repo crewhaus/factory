@@ -687,3 +687,159 @@ describe("emitManaged — observability block threading (loop contract 0.4, Batc
     expect(agent).toContain('"ttftMs":1400');
   });
 });
+
+describe("emitManaged — thredz emit-wired (Loop contract 0.4, Batch E, G23)", () => {
+  // The managed shape has NO mcp_servers field; the compiler's
+  // lowerThredzWiredNoMcp resolves ir.thredz + flips memory.backend but
+  // synthesizes no server — this emitter synthesizes the stdio server itself.
+  const thredzIr: IrManagedV0 = {
+    ...ir,
+    memory: { enabled: true, backend: "thredz", autoRecall: true, autoCapture: true },
+    continuity: { plan: true, proof: "ladder", ledger: true, handoff: true, scope: "spec" },
+    thredz: {
+      apiKey: { kind: "env", name: "THREDZ_API_KEY" },
+      visibility: "private",
+      goals: true,
+      agentName: "managed-bot",
+    },
+  };
+  const agentOf = (i: IrManagedV0): string =>
+    emitManaged(i).files.find((f) => f.path === "agent.ts")?.content ?? "";
+
+  test("agent.ts synthesizes the thredz stdio server and boots connectThredz once at module load", () => {
+    const c = agentOf(thredzIr);
+    expect(c).toContain('import { McpHost, resolveMcpServerConfig } from "@crewhaus/mcp-host";');
+    expect(c).toContain('import { connectThredz } from "@crewhaus/memory-service";');
+    expect(c).toContain('import { defaultCatalog } from "@crewhaus/tool-catalog";');
+    // The synthesized server: version-pinned npx, secret-ref API key, resolved
+    // visibility (never left to the server default).
+    expect(c).toContain('"args":["-y","thredz-mcp@0.2.0"]');
+    expect(c).toContain('"THREDZ_API_KEY":{"kind":"env","name":"THREDZ_API_KEY"}');
+    expect(c).toContain('"THREDZ_DEFAULT_VISIBILITY":{"kind":"literal","value":"private"}');
+    expect(c).toContain("const __thredzHost = new McpHost();");
+    expect(c).toContain("const __thredz = await connectThredz(__thredzHost, defaultCatalog");
+    expect(c).toContain('agentName: "managed-bot"');
+    // A missing key is a config failure (structured report + coded exit).
+    expect(c).toContain("const __report = toFailureReport(__err);");
+    // No 0.2.3-style ignored-note comment survives.
+    expect(c).not.toContain("thredz configured but ignored");
+  });
+
+  test("agent.ts threads the live connection into the per-turn wireMemory call and unions the catalog aliases", () => {
+    const c = agentOf(thredzIr);
+    expect(c).toContain("thredz: __thredz,");
+    // The thredz-backed wiki path returns no local tools; the agent reaches the
+    // hosted vocabulary through the bare-name aliases on defaultCatalog.
+    expect(c).toContain("tools: [...__memTools, ...defaultCatalog.list()],");
+    // The fragment carries the thredz block for the backend flip.
+    expect(c).toContain('"thredz":{');
+  });
+
+  test("a self-hosted baseUrl rides THREDZ_API_BASE as a literal", () => {
+    const c = agentOf({
+      ...thredzIr,
+      thredz: {
+        apiKey: { kind: "env", name: "THREDZ_API_KEY" },
+        visibility: "private",
+        goals: true,
+        agentName: "managed-bot",
+        baseUrl: "https://thredz.internal",
+      },
+    });
+    expect(c).toContain('"THREDZ_API_BASE":{"kind":"literal","value":"https://thredz.internal"}');
+  });
+
+  test("no thredz block → no McpHost, connectThredz, or defaultCatalog union (byte-stable)", () => {
+    const c = agentOf(ir);
+    expect(c).not.toContain("connectThredz");
+    expect(c).not.toContain("McpHost");
+    expect(c).not.toContain("defaultCatalog.list()");
+  });
+});
+
+describe("emitManaged — memory.embedder curator/fact-store dep (Loop contract 0.4, Batch E)", () => {
+  test("memory.embedder constructs the embedder once and threads it as deps.embedder", () => {
+    const c =
+      emitManaged({
+        ...ir,
+        memory: { enabled: true, embedder: "mock/deterministic", wiki: { enabled: true } },
+      }).files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(c).toContain('import { createEmbedder } from "@crewhaus/embedder";');
+    expect(c).toContain('const __memEmbedder = createEmbedder({ model: "mock/deterministic" });');
+    expect(c).toContain("embedder: __memEmbedder,");
+  });
+
+  test("no memory.embedder → no createEmbedder import (byte-stable)", () => {
+    const c =
+      emitManaged({
+        ...ir,
+        memory: { enabled: true, wiki: { enabled: true } },
+      }).files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(c).not.toContain("createEmbedder");
+    expect(c).not.toContain("__memEmbedder");
+  });
+});
+
+describe("emitManaged — knowledge RAG block (Loop contract 0.4, Batch E, G22)", () => {
+  const agentOf = (i: IrManagedV0): string =>
+    emitManaged(i).files.find((f) => f.path === "agent.ts")?.content ?? "";
+  const knowledgeIr: IrManagedV0 = {
+    ...ir,
+    knowledge: {
+      vectorBackend: "in-memory",
+      defaultK: 5,
+      chunkSize: 400,
+      chunkOverlap: 0,
+      sources: [{ kind: "path", path: "docs/manual.md" }],
+    },
+  };
+
+  test("ingests the corpus at module load, registers the tool, and unions defaultCatalog.list()", () => {
+    const c = agentOf(knowledgeIr);
+    expect(c).toContain(
+      'import { knowledgeRetrieve, resolveKnowledgeEmbedder } from "@crewhaus/tool-retrieve";',
+    );
+    expect(c).toContain('import { defaultCatalog } from "@crewhaus/tool-catalog";');
+    expect(c).toContain("const __knowledgeTool = await knowledgeRetrieve({");
+    expect(c).toContain('{"kind":"path","path":"docs/manual.md"}');
+    expect(c).toContain("defaultCatalog.register(__knowledgeTool);");
+    // With no memory fabric on this fixture, tools resolves to the catalog.
+    expect(c).toContain("tools: defaultCatalog.list(),");
+  });
+
+  test("knowledge + memory fabric unions the per-turn memory tools with the catalog", () => {
+    const c = agentOf({
+      ...knowledgeIr,
+      memory: { enabled: true, embedder: "mock/deterministic" },
+    });
+    expect(c).toContain("tools: [...__memTools, ...defaultCatalog.list()],");
+    // memory.embedder still threads as the fact-store/curator embedder.
+    expect(c).toContain('const __memEmbedder = createEmbedder({ model: "mock/deterministic" });');
+    expect(c).toContain("embedder: __memEmbedder,");
+  });
+
+  test("no knowledge block → no RAG wiring (byte-stable)", () => {
+    const c = agentOf(ir);
+    expect(c).not.toContain("knowledgeRetrieve");
+    expect(c).not.toContain("__knowledgeTool");
+  });
+});
+
+describe("emitManaged — prompt-cache rotation persistence (Loop contract 0.4, Batch E, G78)", () => {
+  const agentOf = (i: IrManagedV0): string =>
+    emitManaged(i).files.find((f) => f.path === "agent.ts")?.content ?? "";
+
+  test("constructs a per-spec rotation store and threads the §2.5 read/persist seam", () => {
+    const c = agentOf(ir);
+    expect(c).toContain(
+      'import { createPromptCacheRotationStore } from "@crewhaus/prompt-cache-manager";',
+    );
+    expect(c).toContain(
+      'const __promptCacheStore = createPromptCacheRotationStore({ specName: "hello-managed" });',
+    );
+    expect(c).toContain("promptCacheLastRotatedAt: await __promptCacheStore.read(),");
+    expect(c).toContain(
+      "onPromptCacheRotated: (rotatedAt) => __promptCacheStore.write(rotatedAt),",
+    );
+  });
+});

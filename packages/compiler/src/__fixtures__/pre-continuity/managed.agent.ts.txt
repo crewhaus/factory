@@ -3,6 +3,9 @@
 // Source spec: "pin-managed" (target: managed, ir version: 0)
 import { runChatLoop } from "@crewhaus/runtime-core";
 import type { RunChatLoopOptions } from "@crewhaus/runtime-core";
+import { createPromptCacheRotationStore } from "@crewhaus/prompt-cache-manager";
+// Loop contract 0.4 (Batch E, G78) — cross-run prompt-cache rotation store.
+const __promptCacheStore = createPromptCacheRotationStore({ specName: "pin-managed" });
 
 export type ManagedAgentArgs = {
   readonly tenantId: string;
@@ -19,6 +22,8 @@ export async function runOneTurn(args: ManagedAgentArgs): Promise<string> {
     sessionTarget: "managed",
     seedMessages: [{ role: "user", content: args.input }],
     singleTurn: true,
+    promptCacheLastRotatedAt: await __promptCacheStore.read(),
+    onPromptCacheRotated: (rotatedAt) => __promptCacheStore.write(rotatedAt),
     ...(args.extraOptions ?? {}),
   });
 }

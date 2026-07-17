@@ -19,6 +19,9 @@ const PALETTE: Record<TraceEventKind, string> = {
   mcp_call_end: "\x1b[35m",
   hook_fired: "\x1b[35m",
   compaction_fired: "\x1b[32m", // green
+  // Loop contract 0.4 (Batch E, G19) — active-context curator pre-pass. Same
+  // green family as compaction_fired: it's a context-management event.
+  curate: "\x1b[32m", // green
   // v0.3.0 Goal 1 — boot-time prompt-cache marker rotation bookkeeping.
   cache_rotation: "\x1b[2m", // dim — routine housekeeping
   permission_decision: "\x1b[33m",

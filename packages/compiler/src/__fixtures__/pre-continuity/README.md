@@ -19,6 +19,19 @@ appended (and, for the daemon shapes, the `memory:` block stripped — memory
 became emit-wired on channel/managed/research/crew in 0.3.0, a separate
 documented delta) and asserts byte equality with the pins.
 
+**0.4 Batch E (G78) delta — channel + managed only.** The long-running
+channel/managed daemon bundles gained the §2.5 cross-run prompt-cache rotation
+persistence seam (a per-spec `createPromptCacheRotationStore` threaded into the
+`promptCacheLastRotatedAt`/`onPromptCacheRotated` options). Prompt caching is
+gated in the runtime on the provider's caching capability
+(`adapter.features.caching === "explicit"`), NOT on memory/continuity, so the
+seam is emitted unconditionally and rides even a memory-free `continuity: false`
+bundle. The `channel.*` and `managed.agent.ts` pins were regenerated to
+pre-PR-11 **plus** that orthogonal seam; the continuity opt-out contract itself
+is unchanged (no `wireMemory`/continuity wiring appears). `research`/`crew` and
+the single-shot `cli` shape did not gain the seam this batch, so their pins are
+untouched.
+
 ## Regenerating
 
 Only regenerate when a LATER release deliberately changes emitted bundles;

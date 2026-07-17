@@ -976,6 +976,26 @@ const memoryDreamBlock = z
  * prompt at session start (mirrors project-memory auto-load). Carried on the
  * agent-loop shapes (cli, channel, managed, research, crew).
  *
+ * Loop contract 0.4 (Batch E, G46) — DEFAULT CHANGE (mildly breaking): when
+ * the `memory:` block is PRESENT, `autoRecall` now defaults to `true`
+ * (`"session-start"`) and `autoCapture` defaults to `true` (behind the
+ * existing `autoCaptureThreshold` gate) — both previously defaulted to
+ * `false`. The resolved booleans are stamped into the IR at lower time, so
+ * declaring `memory:` at all opts into recall+capture. Opt back out with
+ * `autoRecall: false` / `autoCapture: false`.
+ *
+ * EMBEDDER RESOLUTION ORDER (Batch E, G76) — coherent across the three
+ * embedder knobs, applied by the runtime/emitters (the IR carries the raw
+ * declared strings):
+ *   - fact-store recall + the compaction curator: `memory.embedder` →
+ *     `memory.wiki.embedder` → (none ⇒ BM25-only lexical);
+ *   - the wiki semantic tier: `memory.wiki.embedder` → `memory.embedder` →
+ *     (none ⇒ BM25-only);
+ *   - agent-shape RAG (the `knowledge:` block): `knowledge.embedder` →
+ *     `memory.embedder` → `memory.wiki.embedder` (a vector store needs
+ *     embeddings, so with all three absent the target falls back to its
+ *     default embedder model rather than BM25).
+ *
  * v0.3.0 (§9) extensions — all optional so pre-0.3.0 specs parse (and lower)
  * unchanged:
  *   - `backend`: `file` (the default when absent) | `thredz` (reserved — the
@@ -1008,10 +1028,107 @@ const memoryBlock = z
       .optional(),
     autoCapture: z.boolean().optional(),
     autoCaptureThreshold: z.number().int().positive().optional(),
-    autoRecall: z.boolean().optional(),
+    /** Loop contract 0.4 (Batch E, G21) — WHEN auto-recall runs. The boolean
+     *  form is the pre-0.4 on/off switch (`true` ≡ `"session-start"`); the
+     *  string form picks the cadence: `"session-start"` injects the recalled
+     *  block ONCE at boot (the default when memory is present, G46), while
+     *  `"per-turn"` re-runs the recall closure against the latest user message
+     *  every turn (or every `refreshEvery` turns) and swaps the volatile
+     *  recalled tail block WITHOUT re-injecting into the frozen cache prefix. */
+    autoRecall: z.union([z.boolean(), z.enum(["session-start", "per-turn"])]).optional(),
+    /** Loop contract 0.4 (Batch E, G21) — turns between per-turn recall
+     *  refreshes (int > 0). Declaring it implies `autoRecall: "per-turn"`
+     *  (it IS the "every N turns" cadence knob); `"per-turn"` without it
+     *  refreshes every turn. OPTIMIZABLE (`["memory","refreshEvery"]`). It is
+     *  a contradiction alongside `autoRecall: false` (rejected at lower time).*/
+    refreshEvery: z.number().int().positive().optional(),
     recallK: z.number().int().positive().max(50).optional(),
+    /** Loop contract 0.4 (Batch E, G77) — fold session summaries in as a
+     *  third RRF ranker in the recall fusion (over the existing
+     *  sessions-index), beside the fact-store and wiki rankers. Default
+     *  false; opting in surfaces "what we concluded last time" without a
+     *  dedicated tool call. */
+    sessionRecall: z.boolean().optional(),
     wiki: memoryWikiBlock.optional(),
     dream: memoryDreamBlock.optional(),
+  })
+  .strict()
+  .optional();
+
+// Vector-store backend ids accepted in specs. Mirrors `VectorBackendId`
+// from @crewhaus/vector-store (and `IrVectorBackend`) — the canonical set
+// of implemented backends — kept inline so the spec stays dependency-light.
+// Keep in sync when a backend is added or removed. (Declared here, above the
+// first consumer — the `knowledge:` block — so the cli/channel/managed
+// schemas can reference it; the pipeline/research retrieve blocks below reuse
+// the same const.)
+const VECTOR_BACKENDS = ["in-memory", "lance", "qdrant", "pinecone", "weaviate"] as const;
+
+// The HTTP backends construct only with a `url` + `collection` (the
+// vector-store factory throws otherwise); parseSpec requires both so a
+// spec that selects one without them fails at compile, not at runtime.
+const HTTP_VECTOR_BACKENDS = new Set(["qdrant", "pinecone", "weaviate"]);
+
+/**
+ * Loop contract 0.4 (Batch E, G22) — a single knowledge source: exactly ONE
+ * of `path` (a file/dir on disk), `glob` (a shell glob) or `url` (a remote
+ * document) per entry. The exactly-one rule is a self-contained superRefine
+ * so the error is path-bearing at the offending source.
+ */
+const knowledgeSourceSchema = z
+  .object({
+    path: z.string().min(1).optional(),
+    glob: z.string().min(1).optional(),
+    url: z.string().min(1).optional(),
+  })
+  .strict()
+  .superRefine((s, ctx) => {
+    const set = [s.path, s.glob, s.url].filter((v) => v !== undefined).length;
+    if (set !== 1) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "each knowledge source needs exactly one of path/glob/url",
+        path: [],
+      });
+    }
+  });
+
+/**
+ * Loop contract 0.4 (Batch E, G22) — the agent-shape RAG block. Presence
+ * registers the EXISTING `@crewhaus/tool-retrieve` (chunker → embedder →
+ * vector-store) as a `Retrieve` tool with citations, ingesting `sources` at
+ * build/boot. It REUSES target-pipeline's retrieve lowering + engine (not a
+ * fork), so the sub-keys mirror the pipeline shape:
+ *   - `embedder`: the `@crewhaus/embedder` factory grammar for the retrieve
+ *     tier. Optional; resolution order `knowledge.embedder → memory.embedder
+ *     → memory.wiki.embedder → the target's default embedder model` (a vector
+ *     store needs embeddings — see the memory block's EMBEDDER RESOLUTION
+ *     ORDER note).
+ *   - `vector_backend`: the SAME enum as pipeline `retrieve.vectorBackend`
+ *     (default `in-memory`).
+ *   - `sources` (required, >= 1): the corpus to ingest (see
+ *     {@link knowledgeSourceSchema}).
+ *   - `chunk.size` / `chunk.overlap`: chunker tuning (OPTIMIZABLE); default
+ *     to pipeline's 400 / 0 at lower time.
+ *   - `default_k`: hits returned per Retrieve call (int 1..50, default 5,
+ *     OPTIMIZABLE).
+ * `.strict()` so a typo'd sub-key fails the build. Carried on cli/channel/
+ * managed (the interactive agent-loop shapes); the pipeline shape keeps its
+ * dedicated first-class `retrieve:`/`indexing:` blocks.
+ */
+const knowledgeBlock = z
+  .object({
+    embedder: z.string().min(1).optional(),
+    vector_backend: z.enum(VECTOR_BACKENDS).optional(),
+    sources: z.array(knowledgeSourceSchema).min(1),
+    chunk: z
+      .object({
+        size: z.number().int().positive().optional(),
+        overlap: z.number().int().nonnegative().optional(),
+      })
+      .strict()
+      .optional(),
+    default_k: z.number().int().positive().max(50).optional(),
   })
   .strict()
   .optional();
@@ -1476,6 +1593,8 @@ const cliSchema = z
     evaluation: evaluationBlock,
     feedback: feedbackBlock,
     memory: memoryBlock,
+    // Loop contract 0.4 (Batch E, G22) — agent-shape RAG over doc sources.
+    knowledge: knowledgeBlock,
     continuity: continuityBlock,
     thredz: thredzBlock,
     learning: learningBlock,
@@ -1669,6 +1788,8 @@ const channelSchema = z
     evaluation: evaluationBlock,
     feedback: feedbackBlock,
     memory: memoryBlock,
+    // Loop contract 0.4 (Batch E, G22) — agent-shape RAG over doc sources.
+    knowledge: knowledgeBlock,
     continuity: continuityBlock,
     thredz: thredzBlock,
     learning: learningBlock,
@@ -1857,6 +1978,8 @@ const managedSchema = z
     // Loop contract 0.4 (Batch B, G02) — in-loop output evaluation.
     evaluation: evaluationBlock,
     memory: memoryBlock,
+    // Loop contract 0.4 (Batch E, G22) — agent-shape RAG over doc sources.
+    knowledge: knowledgeBlock,
     continuity: continuityBlock,
     thredz: thredzBlock,
     learning: learningBlock,
@@ -1864,19 +1987,10 @@ const managedSchema = z
   })
   .strict();
 
-// Vector-store backend ids accepted in specs. Mirrors `VectorBackendId`
-// from @crewhaus/vector-store (and `IrVectorBackend`) — the canonical set
-// of implemented backends — kept inline so the spec stays dependency-light.
-// Keep in sync when a backend is added or removed.
-const VECTOR_BACKENDS = ["in-memory", "lance", "qdrant", "pinecone", "weaviate"] as const;
-
-// The HTTP backends construct only with a `url` + `collection` (the
-// vector-store factory throws otherwise); parseSpec requires both so a
-// spec that selects one without them fails at compile, not at runtime.
-const HTTP_VECTOR_BACKENDS = new Set(["qdrant", "pinecone", "weaviate"]);
-
 // Pipeline / RAG target (Section 21). Carries the embedder + vector-store
 // config, an indexing pipeline, and a chat agent that uses Retrieve.
+// (`VECTOR_BACKENDS` / `HTTP_VECTOR_BACKENDS` are declared above, beside the
+// `knowledge:` block that first consumes them.)
 const pipelineDocumentSchema = z
   .object({
     id: z.string().min(1),
@@ -2415,6 +2529,12 @@ export type SpecSecurityBlock = z.infer<typeof securityBlock>;
 export type SpecFeedbackBlock = z.infer<typeof feedbackBlock>;
 export type SpecMemoryBlock = z.infer<typeof memoryBlock>;
 export type SpecMemoryWikiBlock = z.infer<typeof memoryWikiBlock>;
+/** Loop contract 0.4 (Batch E, G22) — the agent-shape RAG (`knowledge:`)
+ *  block, carried on cli/channel/managed. */
+export type SpecKnowledgeBlock = z.infer<typeof knowledgeBlock>;
+/** Loop contract 0.4 (Batch E, G22) — one `knowledge.sources[]` entry
+ *  (exactly one of path/glob/url). */
+export type SpecKnowledgeSource = z.infer<typeof knowledgeSourceSchema>;
 /** The `memory.dream` scheduled-consolidation sub-block (v0.3.0 §6). */
 export type SpecMemoryDreamBlock = z.infer<typeof memoryDreamBlock>;
 /** The `continuity:` object form (v0.3.0 §2.1). */

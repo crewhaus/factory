@@ -166,6 +166,28 @@ export type CompactionFiredEvent = TraceEventEnvelope & {
 };
 
 /**
+ * Loop contract 0.4 (Batch E, G19) — published by runtime-core's
+ * `maybeCompact` when the active-context curator (`@crewhaus/compaction-
+ * curator`) runs its pre-compaction pass (gated on `compaction.curate`).
+ * `before`/`after` are the item counts entering and surviving the pass;
+ * `dropped` is `before - after` (semantic-dedupe + relevance top-K trim);
+ * `bytesSaved` is the text bytes removed (`CurationResult.bytesSaved`).
+ * `embedded` records whether an embedder was threaded (cosine dedupe) or the
+ * pass fell back to BM25-only lexical dedupe (no embedder resolved — see the
+ * memory block's embedder resolution order). Distinct from
+ * `compaction_fired`: curation is the RELEVANCE reorder + dedupe that runs
+ * BEFORE any snip/summarise, so it gets its own kind rather than a subKind.
+ */
+export type CurateEvent = TraceEventEnvelope & {
+  kind: "curate";
+  before: number;
+  after: number;
+  dropped: number;
+  bytesSaved: number;
+  embedded: boolean;
+};
+
+/**
  * v0.3.0 Goal 1 (§2.5) — published by runtime-core when
  * `prompt-cache-manager.manage()` injects a fresh cache marker at boot.
  * `rotatedAt` is the ms-epoch timestamp the caller must persist and thread
@@ -726,6 +748,7 @@ export type TraceEvent =
   | McpCallEndEvent
   | HookFiredEvent
   | CompactionFiredEvent
+  | CurateEvent
   | CacheRotationEvent
   | PermissionDecisionEvent
   | ErrorRecoveredEvent

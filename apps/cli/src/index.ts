@@ -577,6 +577,11 @@ import {
   openSecurityAuditSink,
   resolveJudgeChoice,
 } from "./justification-gate";
+// Loop contract 0.4 (Batch E, G22) — `knowledge:` RAG ingestion for the
+// interpreter path: load sources, chunk/embed/index, and register the shared
+// `Retrieve` tool. Side-effect-free module (embedder/fetch/glob seams injected)
+// so the ingest flow is unit-testable without a provider key or the network.
+import { ingestKnowledge } from "./knowledge-ingest";
 // Item 63 — cross-harness knowledge sync: shared memories / graders / prompt
 // fragments moved between a harness and a fleet-level store, dedupe-by-hash,
 // provenance-tagged, PII/token-redacted on push. Side-effect-free module so
@@ -4290,6 +4295,22 @@ async function runRunCli(
         );
       }
     }
+  }
+
+  // Loop contract 0.4 (Batch E, G22) — `knowledge:` RAG. When the spec
+  // declares a knowledge block, ingest every source at boot and register the
+  // shared `Retrieve` tool alongside the built-ins/MCP tools, mirroring the
+  // cli/channel/managed emitters. The embedder model resolves per G76
+  // (`knowledge.embedder → memory.embedder → memory.wiki.embedder → default`);
+  // the store never degrades to BM25, so a missing provider key fails loudly.
+  if (ir.knowledge !== undefined) {
+    const retrieveTool = await ingestKnowledge(ir.knowledge, {
+      cwd: process.cwd(),
+      ...(ir.memory?.embedder !== undefined ? { memoryEmbedder: ir.memory.embedder } : {}),
+      ...(ir.memory?.wiki?.embedder !== undefined ? { wikiEmbedder: ir.memory.wiki.embedder } : {}),
+      log: (line) => process.stdout.write(line),
+    });
+    tools.push(retrieveTool);
   }
 
   const modelOverride = args.flags["model"];

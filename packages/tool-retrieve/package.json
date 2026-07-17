@@ -12,6 +12,7 @@
     "test": "bun test src"
   },
   "dependencies": {
+    "@crewhaus/chunker": "workspace:*",
     "@crewhaus/embedder": "workspace:*",
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/tool-builder": "workspace:*",

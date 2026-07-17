@@ -491,6 +491,19 @@ export const OPTIMIZABLE_PATHS: Readonly<
     // the optimizer tunes how strict the gate is, never what it judges.
     Object.freeze(["evaluation", "threshold"]),
     Object.freeze(["evaluation", "max_retries"]),
+    // Loop contract 0.4 (Batch E) — the agent-shape RAG (`knowledge:`) dials
+    // + the per-turn recall cadence. All scalars that survive lower() 1:1
+    // with their bounds owned by the spec schema, so an out-of-bounds patch
+    // fails applySpecPatch's re-parse. `default_k` (hits/turn) and the chunker
+    // window are classic recall-quality vs token-cost dials; `refreshEvery`
+    // trades recall freshness against per-turn recall cost. Deliberately NOT
+    // ["knowledge"] wholesale and NOT ["knowledge","sources"]: the corpus
+    // (an allowlist of what the agent may read) is human-owned, mirroring the
+    // learning.sources / model-roster exclusions.
+    Object.freeze(["knowledge", "default_k"]),
+    Object.freeze(["knowledge", "chunk", "size"]),
+    Object.freeze(["knowledge", "chunk", "overlap"]),
+    Object.freeze(["memory", "refreshEvery"]),
   ]),
   workflow: Object.freeze([
     Object.freeze(["steps"]),
@@ -522,6 +535,11 @@ export const OPTIMIZABLE_PATHS: Readonly<
     // Loop contract 0.4 (Batch B, G40) — evaluation dials; see the cli entry.
     Object.freeze(["evaluation", "threshold"]),
     Object.freeze(["evaluation", "max_retries"]),
+    // Loop contract 0.4 (Batch E) — knowledge/recall dials; see the cli entry.
+    Object.freeze(["knowledge", "default_k"]),
+    Object.freeze(["knowledge", "chunk", "size"]),
+    Object.freeze(["knowledge", "chunk", "overlap"]),
+    Object.freeze(["memory", "refreshEvery"]),
   ]),
   graph: Object.freeze([
     Object.freeze(["nodes"]),
@@ -551,6 +569,11 @@ export const OPTIMIZABLE_PATHS: Readonly<
     // Loop contract 0.4 (Batch B, G40) — evaluation dials; see the cli entry.
     Object.freeze(["evaluation", "threshold"]),
     Object.freeze(["evaluation", "max_retries"]),
+    // Loop contract 0.4 (Batch E) — knowledge/recall dials; see the cli entry.
+    Object.freeze(["knowledge", "default_k"]),
+    Object.freeze(["knowledge", "chunk", "size"]),
+    Object.freeze(["knowledge", "chunk", "overlap"]),
+    Object.freeze(["memory", "refreshEvery"]),
   ]),
   pipeline: Object.freeze([
     Object.freeze(["agent", "instructions"]),
@@ -573,6 +596,8 @@ export const OPTIMIZABLE_PATHS: Readonly<
     Object.freeze(["memory", "wiki", "recallK"]),
     Object.freeze(["memory", "dream", "budget_usd"]),
     Object.freeze(["continuity", "focusMaxChars"]),
+    // Loop contract 0.4 (Batch E) — per-turn recall cadence; see the cli entry.
+    Object.freeze(["memory", "refreshEvery"]),
   ]) /* whole-role replacement */,
   research: Object.freeze([
     Object.freeze(["agent", "instructions"]),
@@ -592,6 +617,8 @@ export const OPTIMIZABLE_PATHS: Readonly<
     Object.freeze(["memory", "wiki", "recallK"]),
     Object.freeze(["memory", "dream", "budget_usd"]),
     Object.freeze(["continuity", "focusMaxChars"]),
+    // Loop contract 0.4 (Batch E) — per-turn recall cadence; see the cli entry.
+    Object.freeze(["memory", "refreshEvery"]),
   ]),
   batch: Object.freeze([
     Object.freeze(["agent", "instructions"]),

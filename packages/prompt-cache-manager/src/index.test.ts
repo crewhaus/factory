@@ -4,12 +4,17 @@
  *  - T3 with `caching: "explicit"` confirming rotation injects fresh marker
  *  - T9 ensures `caching: "automatic"`/`false` skip cleanly
  */
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { CanonicalTextBlockParam, ProviderFeatures } from "@crewhaus/adapter-anthropic";
 import {
   type CacheManagedBlock,
   DEFAULT_ROTATE_AFTER_MS,
+  PromptCacheStoreError,
   countCacheMarkers,
+  createPromptCacheRotationStore,
   manage,
 } from "./index";
 
@@ -241,5 +246,111 @@ describe("prompt-cache-manager — countCacheMarkers", () => {
       { type: "text", text: "null-marker", cache_control: null },
     ];
     expect(countCacheMarkers(bs)).toBe(1);
+  });
+});
+
+// Batch E item 9 (G78) — cross-run rotation persistence, keyed by spec name.
+// This is the seam the runtime-core `onPromptCacheRotated` /
+// `promptCacheLastRotatedAt` comments promise: a rotation persists, and the
+// next boot reads it back so `manage()` skips the cold-start force-rotation.
+describe("prompt-cache-manager — createPromptCacheRotationStore (G78)", () => {
+  let dir: string;
+  afterEach(() => {
+    if (dir) rmSync(dir, { recursive: true, force: true });
+  });
+
+  function freshStore(specName = "my-agent") {
+    dir = mkdtempSync(join(tmpdir(), "crewhaus-promptcache-"));
+    return createPromptCacheRotationStore({ specName, rootDir: dir });
+  }
+
+  test("read() before any write returns undefined (first boot → force refresh)", async () => {
+    const store = freshStore();
+    expect(await store.read()).toBeUndefined();
+  });
+
+  test("write() then read() round-trips the timestamp", async () => {
+    const store = freshStore();
+    await store.write(1_700_000_000_000);
+    expect(await store.read()).toBe(1_700_000_000_000);
+  });
+
+  test("the manage() → persist → next-boot read() loop stops the force-rotation", () => {
+    // Simulate the runtime seam end to end WITHOUT disk: first boot rotates
+    // (no prior timestamp), we persist rotatedAt, and the next boot threads it
+    // back as lastRotatedAt so manage() skips.
+    const EXPLICIT: ProviderFeatures = {
+      caching: "explicit",
+      tool_use: true,
+      vision: true,
+      thinking: true,
+      web_search: true,
+    };
+    const first = manage(blocks("system"), { features: EXPLICIT, now: () => 5_000 });
+    expect(first.rotated).toBe(true);
+    // …persist first.rotatedAt, read it back next boot…
+    const second = manage(blocks("system"), {
+      features: EXPLICIT,
+      lastRotatedAt: first.rotatedAt,
+      now: () => 5_000 + 60_000, // 1 minute later — still fresh
+    });
+    expect(second.rotated).toBe(false);
+  });
+
+  test("write() persists an atomic, mode-0600 JSON record with the schema marker", async () => {
+    const store = freshStore("agent.v2");
+    await store.write(42);
+    const raw = readFileSync(store.path(), "utf-8");
+    const rec = JSON.parse(raw);
+    expect(rec.schemaVersion).toBe(1);
+    expect(rec.specName).toBe("agent.v2");
+    expect(rec.lastRotatedAt).toBe(42);
+    // No leftover temp file.
+    expect(() => readFileSync(`${store.path()}.tmp`, "utf-8")).toThrow();
+  });
+
+  test("write() overwrites the previous record (last rotation wins)", async () => {
+    const store = freshStore();
+    await store.write(100);
+    await store.write(200);
+    expect(await store.read()).toBe(200);
+  });
+
+  test("a corrupt record reads as undefined (never bricks boot)", async () => {
+    const store = freshStore();
+    await store.write(1);
+    writeFileSync(store.path(), "{not json", "utf-8");
+    expect(await store.read()).toBeUndefined();
+  });
+
+  test("a record missing lastRotatedAt reads as undefined", async () => {
+    const store = freshStore();
+    await store.write(1);
+    writeFileSync(store.path(), JSON.stringify({ schemaVersion: 1, specName: "x" }), "utf-8");
+    expect(await store.read()).toBeUndefined();
+  });
+
+  test("path() scopes by spec name under the root dir", () => {
+    const store = freshStore("scoped-name");
+    expect(store.path()).toBe(join(dir, "scoped-name.json"));
+  });
+
+  test("rejects an empty spec name", () => {
+    expect(() => createPromptCacheRotationStore({ specName: "" })).toThrow(PromptCacheStoreError);
+  });
+
+  test("rejects a path-traversal spec name (the safeName floor)", () => {
+    expect(() => createPromptCacheRotationStore({ specName: "../etc/passwd" })).toThrow(
+      /must match/,
+    );
+    expect(() => createPromptCacheRotationStore({ specName: "a/b" })).toThrow(
+      PromptCacheStoreError,
+    );
+  });
+
+  test("write() rejects a non-finite / negative timestamp", async () => {
+    const store = freshStore();
+    await expect(store.write(Number.NaN)).rejects.toThrow(PromptCacheStoreError);
+    await expect(store.write(-1)).rejects.toThrow(/non-negative/);
   });
 });

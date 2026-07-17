@@ -1348,3 +1348,66 @@ describe("emitCli — evaluation block (loop contract 0.4, Batch B, G02)", () =>
     expect(content).not.toContain("__evalRegex");
   });
 });
+
+describe("emitCli — knowledge RAG block (Loop contract 0.4, Batch E, G22)", () => {
+  const KNOWLEDGE_IR = (): IrV0 =>
+    baseIr({
+      knowledge: {
+        vectorBackend: "in-memory",
+        defaultK: 5,
+        chunkSize: 400,
+        chunkOverlap: 0,
+        sources: [
+          { kind: "path", path: "docs/manual.md" },
+          { kind: "glob", glob: "kb/**/*.md" },
+          { kind: "url", url: "https://example.com/faq" },
+        ],
+      },
+    });
+
+  test("ingests the declared sources through knowledgeRetrieve and registers the tool", () => {
+    const c = emitCli(KNOWLEDGE_IR()).files[0]?.content ?? "";
+    expect(c).toContain(
+      'import { knowledgeRetrieve, resolveKnowledgeEmbedder } from "@crewhaus/tool-retrieve";',
+    );
+    expect(c).toContain("const __knowledgeTool = await knowledgeRetrieve({");
+    expect(c).toContain('{"kind":"path","path":"docs/manual.md"}');
+    expect(c).toContain('{"kind":"glob","glob":"kb/**/*.md"}');
+    expect(c).toContain('{"kind":"url","url":"https://example.com/faq"}');
+    expect(c).toContain('vectorBackend: "in-memory"');
+    expect(c).toContain("defaultK: 5");
+    expect(c).toContain("chunkSize: 400");
+    expect(c).toContain("defaultCatalog.register(__knowledgeTool);");
+  });
+
+  test("the G76 embedder order is deferred to resolveKnowledgeEmbedder with the declared inputs", () => {
+    const c =
+      emitCli(
+        baseIr({
+          knowledge: {
+            embedder: "openai/text-embedding-3-large",
+            vectorBackend: "in-memory",
+            defaultK: 5,
+            chunkSize: 400,
+            chunkOverlap: 0,
+            sources: [{ kind: "path", path: "kb.md" }],
+          },
+          memory: {
+            enabled: true,
+            embedder: "mock/deterministic",
+            wiki: { embedder: "mock/wiki" },
+          },
+        }),
+      ).files[0]?.content ?? "";
+    expect(c).toContain(
+      'resolveKnowledgeEmbedder({ knowledgeEmbedder: "openai/text-embedding-3-large", memoryEmbedder: "mock/deterministic", wikiEmbedder: "mock/wiki" })',
+    );
+  });
+
+  test("no knowledge block → no RAG wiring (byte-stable)", () => {
+    const c = emitCli(baseIr()).files[0]?.content ?? "";
+    expect(c).not.toContain("knowledgeRetrieve");
+    expect(c).not.toContain("resolveKnowledgeEmbedder");
+    expect(c).not.toContain("__knowledgeTool");
+  });
+});

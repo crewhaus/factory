@@ -248,6 +248,36 @@ describe("formatBody — every kind + optional-field branches", () => {
     );
   });
 
+  test("curate — embedder-backed pass", () => {
+    const ev = {
+      ...envelope,
+      kind: "curate",
+      before: 42,
+      after: 30,
+      dropped: 12,
+      bytesSaved: 8192,
+      embedded: true,
+    } satisfies TraceEvent;
+    expect(formatLine(ev)).toBe(
+      `${prefix("curate")}before=42 after=30 dropped=12 bytesSaved=8192 embedded`,
+    );
+  });
+
+  test("curate — BM25-only fallback labels bm25", () => {
+    const ev = {
+      ...envelope,
+      kind: "curate",
+      before: 10,
+      after: 9,
+      dropped: 1,
+      bytesSaved: 128,
+      embedded: false,
+    } satisfies TraceEvent;
+    expect(formatLine(ev)).toBe(
+      `${prefix("curate")}before=10 after=9 dropped=1 bytesSaved=128 bm25`,
+    );
+  });
+
   test("permission_decision WITH outcome + reason includes both", () => {
     const ev = {
       ...envelope,

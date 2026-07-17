@@ -15,6 +15,7 @@ import { loadRetentionConfig } from "@crewhaus/data-retention-engine";
 import { createDedupStore } from "@crewhaus/durable-state";
 import { createJanitor } from "@crewhaus/runtime-core";
 import { openAuditLog } from "@crewhaus/audit-log";
+import { createPromptCacheRotationStore } from "@crewhaus/prompt-cache-manager";
 import { InMemoryApprovalStore } from "@crewhaus/channel-adapter-base";
 import { join } from "node:path";
 
@@ -66,6 +67,11 @@ async function main(): Promise<void> {
   const __approvals = new InMemoryApprovalStore();
 
 
+  // Loop contract 0.4 (Batch E, G78) — per-spec cross-run prompt-cache
+  // rotation store (§2.5). One small JSON record under
+  // .crewhaus/prompt-cache/<spec>.json survives restarts so the daemon reuses
+  // a still-fresh cache prefix instead of cold-starting it every boot.
+  const __promptCacheStore = createPromptCacheRotationStore({ specName: "pin-channel" });
   const agent = createAgent({
     hooks: __hooks,
     skills: __skills,
@@ -74,6 +80,7 @@ async function main(): Promise<void> {
     ...(__securityAudit !== undefined
       ? { justificationAuditSink: __securityAudit, egressAuditSink: __securityAudit }
       : {}),
+    promptCacheStore: __promptCacheStore,
   });
   const sessionRouter = createSessionRouter({ agent, approvals: __approvals });
   // SECURITY (audit R3) — replay-dedup backend. Default in-memory; set

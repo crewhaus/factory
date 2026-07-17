@@ -971,7 +971,8 @@ memory:
 `);
     const ir = lower(spec);
     if (ir.target !== "research") throw new Error("unexpected target");
-    expect(ir.memory).toEqual({ autoRecall: true });
+    // Batch E (G46) — autoCapture resolves to true alongside autoRecall.
+    expect(ir.memory).toEqual({ autoCapture: true, autoRecall: true });
   });
 });
 

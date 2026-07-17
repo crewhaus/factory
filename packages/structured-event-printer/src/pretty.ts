@@ -50,6 +50,10 @@ function formatBody(ev: TraceEvent): string {
       }`;
     case "compaction_fired":
       return `kind=${ev.subKind} phase=${ev.phase} before=${ev.before} after=${ev.after}`;
+    case "curate":
+      return `before=${ev.before} after=${ev.after} dropped=${ev.dropped} bytesSaved=${ev.bytesSaved} ${
+        ev.embedded ? "embedded" : "bm25"
+      }`;
     case "cache_rotation":
       return `rotatedAt=${new Date(ev.rotatedAt).toISOString()}`;
     case "permission_decision":

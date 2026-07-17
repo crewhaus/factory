@@ -8,6 +8,7 @@ import type { HookDef } from "@crewhaus/hooks-engine";
 import type { SkillRef } from "@crewhaus/skills-registry";
 import type { SlashCommand } from "@crewhaus/slash-commands";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import type { PromptCacheRotationStore } from "@crewhaus/prompt-cache-manager";
 
 export type AgentConfig = {
   hooks: ReadonlyArray<HookDef>;
@@ -15,6 +16,11 @@ export type AgentConfig = {
   slashCommands: ReadonlyMap<string, SlashCommand>;
   tools: ReadonlyArray<RegisteredTool>;
   sessionRootDir?: string;
+  // Loop contract 0.4 (Batch E, G78) — cross-run prompt-cache rotation
+  // persistence (§2.5): a long-running channel daemon reads the last rotation
+  // stamp before each turn (so a still-fresh cache prefix is REUSED instead of
+  // cold-started) and persists a fresh stamp when the runtime rotates.
+  promptCacheStore: PromptCacheRotationStore;
   // G48 — durable, hash-chained security audit sink (the Pillar 3 justification
   // + egress gates append here). The daemon opens one @crewhaus/audit-log
   // instance rooted at <cwd>/.crewhaus/audit and passes it to BOTH fields, so
@@ -50,6 +56,11 @@ export function createAgent(config: AgentConfig): Agent {
         sessionName: "pin-channel",
         sessionTarget: "channel",
         ...(config.sessionRootDir !== undefined ? { sessionRootDir: config.sessionRootDir } : {}),
+        // Loop contract 0.4 (Batch E, G78) — thread the persisted rotation
+        // stamp in (undefined force-refreshes, the safe direction) and persist
+        // a fresh stamp out when the runtime rotates the cache markers (§2.5).
+        promptCacheLastRotatedAt: await config.promptCacheStore.read(),
+        onPromptCacheRotated: (rotatedAt) => config.promptCacheStore.write(rotatedAt),
         runContext,
         singleTurn: true,
         seedMessages: [{ role: "user", content: __inbound }],

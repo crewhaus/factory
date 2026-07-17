@@ -19,6 +19,7 @@
     "@crewhaus/boundary-classifier": "workspace:*",
     "@crewhaus/circuit-breaker": "workspace:*",
     "@crewhaus/compaction-autocompact": "workspace:*",
+    "@crewhaus/compaction-curator": "workspace:*",
     "@crewhaus/compaction-snip": "workspace:*",
     "@crewhaus/cost-tracker": "workspace:*",
     "@crewhaus/egress-classifier": "workspace:*",

@@ -165,7 +165,7 @@ hooks:
 });
 
 describe("Batch A smoke — wired and unwired keys split correctly on one compile", () => {
-  test("channel: limits/thinking/rate_limits/hooks stay silent while thredz still warns", () => {
+  test("channel: limits/thinking/rate_limits/hooks stay silent; thredz now emit-wired too (G23)", () => {
     const result = compile(
       [
         "name: smoke-channel",
@@ -194,10 +194,9 @@ describe("Batch A smoke — wired and unwired keys split correctly on one compil
         "thredz: true",
       ].join("\n"),
     );
-    expect(paths(result.warnings)).toEqual(["thredz"]);
-    for (const w of result.warnings) {
-      expect(w.code).toBe("accepted-but-unwired");
-    }
+    // Batch E (G23) — thredz is emit-wired on channel now, so it no longer
+    // joins the accepted-but-unwired warnings; the Batch-A keys never warned.
+    expect(result.warnings).toEqual([]);
     const text = bundleText(result.files);
     expect(text).toContain('thinking: {"budgetTokens":4096},');
     expect(text).toContain('rateLimits: {"SendMessage":{"rpm":10}},');

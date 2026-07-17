@@ -3,6 +3,7 @@ import { escapeJsonString } from "@crewhaus/infra-utils";
 import {
   type Bundle,
   type EmitReadmeOptions,
+  type IrKnowledge,
   type IrSubAgentDefinition,
   type IrV0,
   renderBundleReadme,
@@ -589,6 +590,9 @@ if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));`;
   // blocks, wired through the ONE stable composition-root call. Mirrors
   // apps/cli's runRunCli.
   const memory = renderMemory(ir);
+  // Loop contract 0.4 (Batch E, G22) — agent-shape RAG (`knowledge:`). Empty
+  // pieces when the spec omits the block, keeping bundles byte-identical.
+  const knowledge = renderKnowledge(ir);
 
   const mcpBoot = mcp.hasAny ? `${mcp.bootBlock}\n\n` : "";
   const subAgentsBoot = subAgents.registryBlock
@@ -724,6 +728,11 @@ ${catchBlock}${finallyBlock}`;
   const evaluationBoot = evaluation.bootBlock ? `${evaluation.bootBlock}\n\n` : "";
   const memoryImportBlock = memory.imports.length > 0 ? `${memory.imports.join("\n")}\n` : "";
   const memoryBoot = memory.bootBlock ? `${memory.bootBlock}\n\n` : "";
+  const knowledgeImportBlock =
+    knowledge.imports.length > 0 ? `${knowledge.imports.join("\n")}\n` : "";
+  // The RAG corpus ingests at boot (async) and registers the Retrieve tool on
+  // the catalog before runChatLoop advertises `defaultCatalog.list()`.
+  const knowledgeBoot = knowledge.bootBlock ? `${knowledge.bootBlock}\n\n` : "";
 
   // v0.3.0 Goal 3 — with thredz on, the MCP host boots FIRST so wireMemory
   // receives the live connection (`__thredz`) the backend flip needs; every
@@ -736,11 +745,11 @@ ${catchBlock}${finallyBlock}`;
 // Source spec: ${escapeJsonString(ir.name)} (target: cli, ir version: ${ir.version})
 import { formatRunFailure, toFailureReport } from "@crewhaus/errors";
 import { runChatLoop } from "@crewhaus/runtime-core";
-${permImport}${importBlock}${catalogImport}${mcpImportBlock}${subAgentImportBlock}${egressImportBlock}${evaluationImportBlock}${memoryImportBlock}${extensionImport}
+${permImport}${importBlock}${catalogImport}${mcpImportBlock}${subAgentImportBlock}${egressImportBlock}${evaluationImportBlock}${memoryImportBlock}${knowledgeImportBlock}${extensionImport}
 ${registerBlock}
 ${extensionBoot}${specHooks.bootBlock}
 
-${bannerBoot}${subAgentsBoot}${egressBoot}${evaluationBoot}${bootBlocks}${wrapped}
+${bannerBoot}${subAgentsBoot}${egressBoot}${evaluationBoot}${bootBlocks}${knowledgeBoot}${wrapped}
 `;
 }
 
@@ -1029,6 +1038,56 @@ const __slashCommands = __memWired.options.slashCommands ?? new Map();
 if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));${dreamBoot("__cwd")}`;
   const field = "\n  ...__memWired.options,";
   return { imports, bootBlock, field };
+}
+
+/**
+ * Loop contract 0.4 (Batch E, G22) — render the agent-shape RAG (`knowledge:`)
+ * wiring. When the IR carries a `knowledge` block the bundle ingests the
+ * declared `sources` (path/glob/url) at boot through `@crewhaus/tool-retrieve`'s
+ * `knowledgeRetrieve` — the SAME chunk → embed → vector-store engine the
+ * pipeline shape uses — and registers the returned citation-bearing `Retrieve`
+ * tool on the catalog. The G76 embedder order (`knowledge.embedder →
+ * memory.embedder → memory.wiki.embedder → target default`) is deferred to
+ * `resolveKnowledgeEmbedder` — the ONE place that order is enforced, so the
+ * cli/channel/managed emitters cannot drift. Empty when the spec omits the
+ * block, keeping non-knowledge bundles byte-identical. Mirror:
+ * target-channel-bot + target-managed render the same wiring — keep in sync.
+ */
+function renderKnowledge(ir: {
+  readonly knowledge?: IrKnowledge;
+  readonly memory?: {
+    readonly enabled?: boolean;
+    readonly embedder?: string;
+    readonly wiki?: { readonly embedder?: string };
+  };
+}): { imports: string[]; bootBlock: string } {
+  const k = ir.knowledge;
+  if (k === undefined) return { imports: [], bootBlock: "" };
+  const memOn = ir.memory !== undefined && ir.memory.enabled !== false;
+  const embInputs: string[] = [];
+  if (k.embedder !== undefined)
+    embInputs.push(`knowledgeEmbedder: ${escapeJsonString(k.embedder)}`);
+  const memEmb = memOn ? ir.memory?.embedder : undefined;
+  if (memEmb !== undefined) embInputs.push(`memoryEmbedder: ${escapeJsonString(memEmb)}`);
+  const wikiEmb = memOn ? ir.memory?.wiki?.embedder : undefined;
+  if (wikiEmb !== undefined) embInputs.push(`wikiEmbedder: ${escapeJsonString(wikiEmb)}`);
+  const embedderExpr = `resolveKnowledgeEmbedder({ ${embInputs.join(", ")} })`;
+  const bootBlock = `const __knowledgeTool = await knowledgeRetrieve({
+  sources: ${JSON.stringify(k.sources)},
+  embedderModel: ${embedderExpr},
+  vectorBackend: ${escapeJsonString(k.vectorBackend)},
+  defaultK: ${k.defaultK},
+  chunkSize: ${k.chunkSize},
+  chunkOverlap: ${k.chunkOverlap},
+  log: (line) => process.stdout.write(line),
+});
+defaultCatalog.register(__knowledgeTool);`;
+  return {
+    imports: [
+      `import { knowledgeRetrieve, resolveKnowledgeEmbedder } from "@crewhaus/tool-retrieve";`,
+    ],
+    bootBlock,
+  };
 }
 
 /**
