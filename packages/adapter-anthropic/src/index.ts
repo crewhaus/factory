@@ -33,10 +33,15 @@ export type {
   ProviderId,
   ProviderMessage,
   ProviderRequest,
+  ReasoningEffort,
   StreamEvent,
   TokenUsage,
   ToolChoice,
 } from "./types.js";
+
+// Loop contract 0.4 (Batch A) — the effort→thinking-budget preset table
+// shared by the budget-token providers (anthropic/gemini/bedrock).
+export { EFFORT_THINKING_BUDGET_TOKENS } from "./types.js";
 
 export { AnthropicAdapter, createAnthropicAdapter } from "./adapter.js";
 export { createAnthropicVertexAdapter } from "./vertex.js";

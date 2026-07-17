@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { Spec, SpecParseError, parseSpec } from "./index";
+import { SPEC_HOOK_EVENTS, Spec, SpecParseError, parseSpec } from "./index";
 
 describe("parseSpec", () => {
   test("parses a minimal valid CLI spec", () => {
@@ -1750,19 +1750,22 @@ describe("run-level budget cap block (item 27)", () => {
     expect(() => parseSpec(cli("budget:\n  usd: 1\n  on_exceed:\n    action: degrade"))).toThrow();
   });
 
+  // Loop contract 0.4 (Batch A) — budget joined workflow/graph/crew/research/
+  // batch/browser, so the strict-rejection canary moved to voice (still
+  // outside the budget-carrying set).
   test("shapes without the wiring reject the budget block (strict)", () => {
     expect(() =>
       parseSpec(
         [
-          "name: bt",
-          "target: batch",
+          "name: vc",
+          "target: voice",
           "agent:",
           "  model: m",
           "  instructions: i",
           "budget:",
           "  usd: 1",
-          "queue:",
-          "  adapter: in-memory",
+          "voice:",
+          "  provider: openai",
         ].join("\n"),
       ),
     ).toThrow();
@@ -1927,5 +1930,746 @@ describe("parseSpec agent.model_pool", () => {
     );
     if (managed.target !== "managed") expect.unreachable();
     expect(managed.agent.model_pool?.policy).toBe("heuristic");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Loop contract 0.4 (Batch A) — limits / thinking / hooks / rate_limits /
+// streaming / compaction+memory extensions / graph when+parallel / budget +
+// max_tokens shape coverage.
+// ---------------------------------------------------------------------------
+
+describe("Batch A — top-level limits block", () => {
+  const cli = (lines: string): string =>
+    ["name: c", "target: cli", "agent:", "  model: m", "  instructions: i", lines].join("\n");
+
+  test("parses every base field on cli", () => {
+    const spec = parseSpec(
+      cli(
+        [
+          "limits:",
+          "  max_tool_iterations: 25",
+          "  max_concurrent_tools: 4",
+          "  context_limit: 180000",
+          "  deadline_ms: 600000",
+          "  turn_timeout_ms: 120000",
+          "  model_call_timeout_ms: 60000",
+          "  loop_detection:",
+          "    window: 10",
+          "    threshold: 3",
+          "    escalation: justify",
+        ].join("\n"),
+      ),
+    );
+    if (spec.target !== "cli") expect.unreachable();
+    expect(spec.limits).toEqual({
+      max_tool_iterations: 25,
+      max_concurrent_tools: 4,
+      context_limit: 180000,
+      deadline_ms: 600000,
+      turn_timeout_ms: 120000,
+      model_call_timeout_ms: 60000,
+      loop_detection: { window: 10, threshold: 3, escalation: "justify" },
+    });
+  });
+
+  test.each([
+    ["a zero max_tool_iterations", "limits:\n  max_tool_iterations: 0"],
+    ["a negative deadline_ms", "limits:\n  deadline_ms: -1"],
+    ["a fractional turn_timeout_ms", "limits:\n  turn_timeout_ms: 1.5"],
+    [
+      "a loop_detection threshold of 1 (int>1 required)",
+      "limits:\n  loop_detection:\n    threshold: 1",
+    ],
+    ["an unknown escalation", "limits:\n  loop_detection:\n    escalation: explode"],
+    ["an unknown sub-key (strict)", "limits:\n  max_turns: 5"],
+  ])("rejects %s", (_label, lines) => {
+    expect(() => parseSpec(cli(lines))).toThrow(SpecParseError);
+  });
+
+  test("limits.crew is accepted on the crew shape only", () => {
+    const crew = (limitsLines: string): string =>
+      [
+        "name: cr",
+        "target: crew",
+        "model: m",
+        "entry: lead",
+        "roles:",
+        "  lead:",
+        "    instructions: lead it",
+        limitsLines,
+      ].join("\n");
+    const spec = parseSpec(
+      crew(
+        [
+          "limits:",
+          "  max_tool_iterations: 9",
+          "  crew:",
+          "    max_activations: 12",
+          "    refusal_depth: 0",
+          "    max_a2a_depth: 3",
+        ].join("\n"),
+      ),
+    );
+    if (spec.target !== "crew") expect.unreachable();
+    expect(spec.limits?.crew).toEqual({
+      max_activations: 12,
+      refusal_depth: 0,
+      max_a2a_depth: 3,
+    });
+    // refusal_depth is int>=0; max_activations int>0.
+    expect(() => parseSpec(crew("limits:\n  crew:\n    refusal_depth: -1"))).toThrow(
+      SpecParseError,
+    );
+    expect(() => parseSpec(crew("limits:\n  crew:\n    max_activations: 0"))).toThrow(
+      SpecParseError,
+    );
+    // The base limits block everywhere else rejects the crew sub-block.
+    expect(() => parseSpec(cli("limits:\n  crew:\n    max_activations: 3"))).toThrow(
+      SpecParseError,
+    );
+  });
+
+  test("limits parses on channel/managed/workflow/graph/research/batch/browser and is rejected on voice/pipeline/eval", () => {
+    const limits = "limits:\n  max_tool_iterations: 7";
+    const accepted: string[] = [
+      [
+        "name: ch",
+        "target: channel",
+        "agent:",
+        "  model: m",
+        "  instructions: i",
+        "channels:",
+        "  slack:",
+        "    botToken: xoxb-1",
+        "    signingSecret: s",
+        "routing:",
+        "  sessionKey: thread",
+        limits,
+      ].join("\n"),
+      [
+        "name: mg",
+        "target: managed",
+        "agent:",
+        "  model: m",
+        "  instructions: i",
+        "tenants:",
+        "  - id: t1",
+        "    budget: { maxInputTokens: 1, maxOutputTokens: 1 }",
+        limits,
+      ].join("\n"),
+      [
+        "name: wf",
+        "target: workflow",
+        "model: m",
+        "steps:",
+        "  - name: one",
+        "    instructions: do it",
+        limits,
+      ].join("\n"),
+      [
+        "name: g",
+        "target: graph",
+        "model: m",
+        "entry: a",
+        "nodes:",
+        "  a:",
+        "    instructions: do a",
+        limits,
+      ].join("\n"),
+      [
+        "name: re",
+        "target: research",
+        "agent:",
+        "  model: m",
+        "  instructions: i",
+        "goal: learn",
+        limits,
+      ].join("\n"),
+      [
+        "name: bt",
+        "target: batch",
+        "agent:",
+        "  model: m",
+        "  instructions: i",
+        "queue:",
+        "  adapter: in-memory",
+        limits,
+      ].join("\n"),
+      ["name: br", "target: browser", "agent:", "  model: m", "  instructions: i", limits].join(
+        "\n",
+      ),
+    ];
+    for (const yaml of accepted) {
+      const spec = parseSpec(yaml);
+      expect(
+        (spec as { limits?: { max_tool_iterations?: number } }).limits?.max_tool_iterations,
+      ).toBe(7);
+    }
+    expect(() =>
+      parseSpec(
+        [
+          "name: vc",
+          "target: voice",
+          "agent:",
+          "  model: m",
+          "  instructions: i",
+          "voice:",
+          "  provider: openai",
+          limits,
+        ].join("\n"),
+      ),
+    ).toThrow(SpecParseError);
+    expect(() =>
+      parseSpec(
+        [
+          "name: pl",
+          "target: pipeline",
+          "agent:",
+          "  model: m",
+          "  instructions: i",
+          "retrieve:",
+          "  embedderModel: e",
+          "indexing:",
+          "  documents:",
+          "    - id: d1",
+          "      text: t",
+          limits,
+        ].join("\n"),
+      ),
+    ).toThrow(SpecParseError);
+    expect(() =>
+      parseSpec(
+        [
+          "name: ev",
+          "target: eval",
+          "agent:",
+          "  model: m",
+          "  instructions: i",
+          "dataset:",
+          "  name: d",
+          "  version: v1",
+          "graders:",
+          "  - name: g",
+          limits,
+        ].join("\n"),
+      ),
+    ).toThrow(SpecParseError);
+  });
+});
+
+describe("Batch A — thinking selector (exactly one form)", () => {
+  const cli = (lines: string): string =>
+    ["name: c", "target: cli", "agent:", "  model: m", "  instructions: i", lines].join("\n");
+
+  test("parses the budget_tokens form on the cli agent", () => {
+    const spec = parseSpec(cli("  thinking:\n    budget_tokens: 4096"));
+    if (spec.target !== "cli") expect.unreachable();
+    expect(spec.agent.thinking).toEqual({ budget_tokens: 4096 });
+  });
+
+  test("parses the effort form on the cli agent", () => {
+    const spec = parseSpec(cli("  thinking:\n    effort: high"));
+    if (spec.target !== "cli") expect.unreachable();
+    expect(spec.agent.thinking).toEqual({ effort: "high" });
+  });
+
+  test.each([
+    ["both forms at once", "  thinking:\n    budget_tokens: 4096\n    effort: low"],
+    ["neither form (empty object)", "  thinking: {}"],
+    ["a sub-floor budget (1024 floor)", "  thinking:\n    budget_tokens: 512"],
+    ["an unknown effort", "  thinking:\n    effort: max"],
+    ["an unknown sub-key (strict)", "  thinking:\n    tokens: 4096"],
+  ])("rejects %s", (_label, lines) => {
+    expect(() => parseSpec(cli(lines))).toThrow(SpecParseError);
+  });
+
+  test("accepted at step/node/role granularity and on channel/managed agents", () => {
+    const wf = parseSpec(
+      [
+        "name: wf",
+        "target: workflow",
+        "model: m",
+        "steps:",
+        "  - name: one",
+        "    instructions: do it",
+        "    max_tokens: 9000",
+        "    thinking:",
+        "      effort: low",
+      ].join("\n"),
+    );
+    if (wf.target !== "workflow") expect.unreachable();
+    expect(wf.steps[0]?.thinking).toEqual({ effort: "low" });
+    expect(wf.steps[0]?.max_tokens).toBe(9000);
+
+    const g = parseSpec(
+      [
+        "name: g",
+        "target: graph",
+        "model: m",
+        "entry: a",
+        "nodes:",
+        "  a:",
+        "    instructions: do a",
+        "    max_tokens: 2048",
+        "    thinking:",
+        "      budget_tokens: 2048",
+      ].join("\n"),
+    );
+    if (g.target !== "graph") expect.unreachable();
+    expect(g.nodes["a"]?.thinking).toEqual({ budget_tokens: 2048 });
+    expect(g.nodes["a"]?.max_tokens).toBe(2048);
+
+    const cr = parseSpec(
+      [
+        "name: cr",
+        "target: crew",
+        "model: m",
+        "entry: lead",
+        "roles:",
+        "  lead:",
+        "    instructions: lead it",
+        "    max_tokens: 4096",
+        "    thinking:",
+        "      effort: medium",
+      ].join("\n"),
+    );
+    if (cr.target !== "crew") expect.unreachable();
+    expect(cr.roles["lead"]?.thinking).toEqual({ effort: "medium" });
+    expect(cr.roles["lead"]?.max_tokens).toBe(4096);
+
+    const ch = parseSpec(
+      [
+        "name: ch",
+        "target: channel",
+        "agent:",
+        "  model: m",
+        "  instructions: i",
+        "  max_tokens: 12000",
+        "  thinking:",
+        "    effort: low",
+        "channels:",
+        "  slack:",
+        "    botToken: xoxb-1",
+        "    signingSecret: s",
+        "routing:",
+        "  sessionKey: thread",
+      ].join("\n"),
+    );
+    if (ch.target !== "channel") expect.unreachable();
+    expect(ch.agent.thinking).toEqual({ effort: "low" });
+    expect(ch.agent.max_tokens).toBe(12000);
+
+    const mg = parseSpec(
+      [
+        "name: mg",
+        "target: managed",
+        "agent:",
+        "  model: m",
+        "  instructions: i",
+        "  max_tokens: 6000",
+        "  thinking:",
+        "    budget_tokens: 8192",
+        "tenants:",
+        "  - id: t1",
+        "    budget: { maxInputTokens: 1, maxOutputTokens: 1 }",
+      ].join("\n"),
+    );
+    if (mg.target !== "managed") expect.unreachable();
+    expect(mg.agent.thinking).toEqual({ budget_tokens: 8192 });
+    expect(mg.agent.max_tokens).toBe(6000);
+  });
+});
+
+describe("Batch A — hooks block", () => {
+  const cli = (lines: string): string =>
+    ["name: c", "target: cli", "agent:", "  model: m", "  instructions: i", lines].join("\n");
+
+  test("parses a hooks array with every field", () => {
+    const spec = parseSpec(
+      cli(
+        [
+          "hooks:",
+          "  - event: pre-tool",
+          "    matcher: Bash",
+          "    command: ./guard.sh",
+          "    timeout_ms: 3000",
+          "  - event: session-start",
+          "    command: echo hi",
+        ].join("\n"),
+      ),
+    );
+    if (spec.target !== "cli") expect.unreachable();
+    expect(spec.hooks).toEqual([
+      { event: "pre-tool", matcher: "Bash", command: "./guard.sh", timeout_ms: 3000 },
+      { event: "session-start", command: "echo hi" },
+    ]);
+  });
+
+  test.each([
+    ["an unknown event name", "hooks:\n  - event: on-tool\n    command: x"],
+    ["a missing command", "hooks:\n  - event: stop"],
+    ["a zero timeout_ms", "hooks:\n  - event: stop\n    command: x\n    timeout_ms: 0"],
+    ["an unknown sub-key (strict)", "hooks:\n  - event: stop\n    command: x\n    cwd: /tmp"],
+  ])("rejects %s", (_label, lines) => {
+    expect(() => parseSpec(cli(lines))).toThrow(SpecParseError);
+  });
+
+  test("hooks are rejected on shapes outside the limits set (voice)", () => {
+    expect(() =>
+      parseSpec(
+        [
+          "name: vc",
+          "target: voice",
+          "agent:",
+          "  model: m",
+          "  instructions: i",
+          "voice:",
+          "  provider: openai",
+          "hooks:",
+          "  - event: stop",
+          "    command: x",
+        ].join("\n"),
+      ),
+    ).toThrow(SpecParseError);
+  });
+
+  test("SPEC_HOOK_EVENTS is exported for the hooks-engine cross-check", () => {
+    expect(SPEC_HOOK_EVENTS).toContain("pre-tool");
+    expect(SPEC_HOOK_EVENTS).toContain("alert");
+    expect(SPEC_HOOK_EVENTS.length).toBe(10);
+  });
+});
+
+describe("Batch A — agent.streaming and agent.rate_limits", () => {
+  const cli = (lines: string): string =>
+    ["name: c", "target: cli", "agent:", "  model: m", "  instructions: i", lines].join("\n");
+
+  test("streaming parses on cli and is rejected on channel (cli-only)", () => {
+    const spec = parseSpec(cli("  streaming: true"));
+    if (spec.target !== "cli") expect.unreachable();
+    expect(spec.agent.streaming).toBe(true);
+    expect(() =>
+      parseSpec(
+        [
+          "name: ch",
+          "target: channel",
+          "agent:",
+          "  model: m",
+          "  instructions: i",
+          "  streaming: true",
+          "channels:",
+          "  slack:",
+          "    botToken: xoxb-1",
+          "    signingSecret: s",
+          "routing:",
+          "  sessionKey: thread",
+        ].join("\n"),
+      ),
+    ).toThrow(SpecParseError);
+  });
+
+  test("rate_limits parses tool buckets and the * catch-all", () => {
+    const spec = parseSpec(
+      cli(
+        [
+          "  rate_limits:",
+          "    Bash:",
+          "      rpm: 30",
+          "      burst: 5",
+          '    "*":',
+          "      rpm: 120",
+        ].join("\n"),
+      ),
+    );
+    if (spec.target !== "cli") expect.unreachable();
+    expect(spec.agent.rate_limits).toEqual({
+      Bash: { rpm: 30, burst: 5 },
+      "*": { rpm: 120 },
+    });
+  });
+
+  test.each([
+    ["a zero rpm", "  rate_limits:\n    Bash:\n      rpm: 0"],
+    ["a missing rpm", "  rate_limits:\n    Bash:\n      burst: 5"],
+    ["an unknown sub-key (strict)", "  rate_limits:\n    Bash:\n      rpm: 5\n      per: minute"],
+  ])("rejects %s", (_label, lines) => {
+    expect(() => parseSpec(cli(lines))).toThrow(SpecParseError);
+  });
+});
+
+describe("Batch A — compaction threshold/snip + memory embedder", () => {
+  const cli = (lines: string): string =>
+    ["name: c", "target: cli", "agent:", "  model: m", "  instructions: i", lines].join("\n");
+
+  test("parses threshold + snip window", () => {
+    const spec = parseSpec(
+      cli("compaction:\n  threshold: 0.85\n  snip_keep_head: 3\n  snip_keep_tail: 8"),
+    );
+    if (spec.target !== "cli") expect.unreachable();
+    expect(spec.compaction).toEqual({ threshold: 0.85, snip_keep_head: 3, snip_keep_tail: 8 });
+  });
+
+  test.each([
+    ["a threshold below 0.5", "compaction:\n  threshold: 0.4"],
+    ["a threshold above 0.99", "compaction:\n  threshold: 1"],
+    ["a zero snip_keep_head", "compaction:\n  snip_keep_head: 0"],
+    ["a fractional snip_keep_tail", "compaction:\n  snip_keep_tail: 2.5"],
+  ])("rejects %s", (_label, lines) => {
+    expect(() => parseSpec(cli(lines))).toThrow(SpecParseError);
+  });
+
+  test("threshold bounds are inclusive (0.5 and 0.99 parse)", () => {
+    const lo = parseSpec(cli("compaction:\n  threshold: 0.5"));
+    if (lo.target !== "cli") expect.unreachable();
+    expect(lo.compaction?.threshold).toBe(0.5);
+    const hi = parseSpec(cli("compaction:\n  threshold: 0.99"));
+    if (hi.target !== "cli") expect.unreachable();
+    expect(hi.compaction?.threshold).toBe(0.99);
+  });
+
+  test("memory.embedder parses alongside wiki.embedder", () => {
+    const spec = parseSpec(
+      cli(
+        ["memory:", "  embedder: builtin:hash", "  wiki:", "    embedder: builtin:hash"].join("\n"),
+      ),
+    );
+    if (spec.target !== "cli") expect.unreachable();
+    expect(spec.memory?.embedder).toBe("builtin:hash");
+    expect(spec.memory?.wiki?.embedder).toBe("builtin:hash");
+    expect(() => parseSpec(cli('memory:\n  embedder: ""'))).toThrow(SpecParseError);
+  });
+});
+
+describe("Batch A — budget extended to the six new shapes", () => {
+  test("workflow/graph/crew/research/batch/browser accept budget", () => {
+    const budget = "budget:\n  usd: 2";
+    const specs: string[] = [
+      [
+        "name: wf",
+        "target: workflow",
+        "model: m",
+        "steps:",
+        "  - name: s",
+        "    instructions: i",
+        budget,
+      ].join("\n"),
+      [
+        "name: g",
+        "target: graph",
+        "model: m",
+        "entry: a",
+        "nodes:",
+        "  a:",
+        "    instructions: i",
+        budget,
+      ].join("\n"),
+      [
+        "name: cr",
+        "target: crew",
+        "model: m",
+        "entry: lead",
+        "roles:",
+        "  lead:",
+        "    instructions: i",
+        budget,
+      ].join("\n"),
+      [
+        "name: re",
+        "target: research",
+        "agent:",
+        "  model: m",
+        "  instructions: i",
+        "goal: g",
+        budget,
+      ].join("\n"),
+      [
+        "name: bt",
+        "target: batch",
+        "agent:",
+        "  model: m",
+        "  instructions: i",
+        "queue:",
+        "  adapter: in-memory",
+        budget,
+      ].join("\n"),
+      ["name: br", "target: browser", "agent:", "  model: m", "  instructions: i", budget].join(
+        "\n",
+      ),
+    ];
+    for (const yaml of specs) {
+      const spec = parseSpec(yaml);
+      expect((spec as { budget?: { usd: number } }).budget?.usd).toBe(2);
+    }
+  });
+});
+
+describe("Batch A — agent.max_tokens on research/batch/browser (not pipeline)", () => {
+  test("research/batch/browser accept agent.max_tokens", () => {
+    const re = parseSpec(
+      [
+        "name: re",
+        "target: research",
+        "agent:",
+        "  model: m",
+        "  instructions: i",
+        "  max_tokens: 9000",
+        "goal: g",
+      ].join("\n"),
+    );
+    if (re.target !== "research") expect.unreachable();
+    expect(re.agent.max_tokens).toBe(9000);
+
+    const bt = parseSpec(
+      [
+        "name: bt",
+        "target: batch",
+        "agent:",
+        "  model: m",
+        "  instructions: i",
+        "  max_tokens: 7000",
+        "queue:",
+        "  adapter: in-memory",
+      ].join("\n"),
+    );
+    if (bt.target !== "batch") expect.unreachable();
+    expect(bt.agent.max_tokens).toBe(7000);
+
+    const br = parseSpec(
+      [
+        "name: br",
+        "target: browser",
+        "agent:",
+        "  model: m",
+        "  instructions: i",
+        "  max_tokens: 5000",
+      ].join("\n"),
+    );
+    if (br.target !== "browser") expect.unreachable();
+    expect(br.agent.max_tokens).toBe(5000);
+  });
+
+  test("pipeline still rejects agent.max_tokens (strict)", () => {
+    expect(() =>
+      parseSpec(
+        [
+          "name: pl",
+          "target: pipeline",
+          "agent:",
+          "  model: m",
+          "  instructions: i",
+          "  max_tokens: 5000",
+          "retrieve:",
+          "  embedderModel: e",
+          "indexing:",
+          "  documents:",
+          "    - id: d1",
+          "      text: t",
+        ].join("\n"),
+      ),
+    ).toThrow(SpecParseError);
+  });
+});
+
+describe("Batch A — graph edges[].when + parallel", () => {
+  const graph = (lines: string): string =>
+    [
+      "name: g",
+      "target: graph",
+      "model: m",
+      "entry: a",
+      "nodes:",
+      "  a:",
+      "    instructions: do a",
+      "  b:",
+      "    instructions: do b",
+      "  c:",
+      "    instructions: do c",
+      lines,
+    ].join("\n");
+
+  test("parses the equals form and the exists form", () => {
+    const spec = parseSpec(
+      graph(
+        [
+          "edges:",
+          "  - from: a",
+          "    to: b",
+          "    when:",
+          "      key: a",
+          "      equals: approve",
+          "  - from: a",
+          "    to: c",
+          "    when:",
+          "      key: a",
+          "      exists: true",
+        ].join("\n"),
+      ),
+    );
+    if (spec.target !== "graph") expect.unreachable();
+    expect(spec.edges[0]?.when).toEqual({ key: "a", equals: "approve" });
+    expect(spec.edges[1]?.when).toEqual({ key: "a", exists: true });
+  });
+
+  test("equals accepts numbers and booleans (including false)", () => {
+    const spec = parseSpec(
+      graph(
+        [
+          "edges:",
+          "  - from: a",
+          "    to: b",
+          "    when:",
+          "      key: a",
+          "      equals: 3",
+          "  - from: a",
+          "    to: c",
+          "    when:",
+          "      key: a",
+          "      equals: false",
+        ].join("\n"),
+      ),
+    );
+    if (spec.target !== "graph") expect.unreachable();
+    expect(spec.edges[0]?.when).toEqual({ key: "a", equals: 3 });
+    expect(spec.edges[1]?.when).toEqual({ key: "a", equals: false });
+  });
+
+  test.each([
+    [
+      "both equals and exists",
+      "edges:\n  - from: a\n    to: b\n    when:\n      key: a\n      equals: x\n      exists: true",
+    ],
+    ["neither form", "edges:\n  - from: a\n    to: b\n    when:\n      key: a"],
+    [
+      "exists: false (literal true only)",
+      "edges:\n  - from: a\n    to: b\n    when:\n      key: a\n      exists: false",
+    ],
+    [
+      "an unknown sub-key (strict)",
+      "edges:\n  - from: a\n    to: b\n    when:\n      key: a\n      matches: x",
+    ],
+  ])("rejects %s", (_label, lines) => {
+    expect(() => parseSpec(graph(lines))).toThrow(SpecParseError);
+  });
+
+  test("when.key must name a declared node (parse-level cross-check)", () => {
+    expect(() =>
+      parseSpec(
+        graph("edges:\n  - from: a\n    to: b\n    when:\n      key: ghost\n      exists: true"),
+      ),
+    ).toThrow(/when\.key "ghost" must name a declared node/);
+  });
+
+  test("parallel parses groups of >= 2 declared nodes", () => {
+    const spec = parseSpec(graph("edges:\n  - from: a\n    to: b\nparallel:\n  - [b, c]"));
+    if (spec.target !== "graph") expect.unreachable();
+    expect(spec.parallel).toEqual([["b", "c"]]);
+  });
+
+  test("parallel rejects singleton groups and undeclared members", () => {
+    expect(() => parseSpec(graph("parallel:\n  - [b]"))).toThrow(SpecParseError);
+    expect(() => parseSpec(graph("parallel:\n  - [b, ghost]"))).toThrow(
+      /parallel\[0\] references "ghost"/,
+    );
   });
 });

@@ -34,13 +34,14 @@
  *   and a non-empty `req.tools` raises a `ConfigError`.
  */
 
-import type {
-  CanonicalMessage,
-  CanonicalTextBlockParam,
-  CanonicalTool,
-  CanonicalToolResultContent,
-  ProviderRequest,
-  ToolChoice,
+import {
+  type CanonicalMessage,
+  type CanonicalTextBlockParam,
+  type CanonicalTool,
+  type CanonicalToolResultContent,
+  EFFORT_THINKING_BUDGET_TOKENS,
+  type ProviderRequest,
+  type ToolChoice,
 } from "@crewhaus/adapter-anthropic";
 import { ConfigError } from "@crewhaus/errors";
 import {
@@ -81,6 +82,15 @@ export function toGeminiParams(req: ProviderRequest): GenerateContentParameters 
   if (req.thinking !== undefined) {
     config.thinkingConfig = {
       thinkingBudget: req.thinking.budgetTokens,
+      includeThoughts: true,
+    };
+  } else if (req.reasoningEffort !== undefined) {
+    // Loop contract 0.4 (Batch A) — the portable effort preset converts
+    // to Gemini's token-budget control via the shared preset table. Only
+    // consulted when `thinking` is not explicitly set: an explicit
+    // budget always wins over the preset.
+    config.thinkingConfig = {
+      thinkingBudget: EFFORT_THINKING_BUDGET_TOKENS[req.reasoningEffort],
       includeThoughts: true,
     };
   }

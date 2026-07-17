@@ -36,6 +36,11 @@ import {
   createFileBackedRegistry,
   latestVersion,
 } from "@crewhaus/dataset-registry";
+// Loop contract 0.4 (Batch A) — `memory.embedder`: the run path constructs
+// the fact-store embedder and hands it to wireMemory as `deps.embedder`,
+// which memory-service prefers over the fragment's `wiki.embedder` (the
+// documented fallback order `embedder` → `wiki.embedder`).
+import { createEmbedder } from "@crewhaus/embedder";
 import { CrewhausError, RunFailedError } from "@crewhaus/errors";
 import { type Sample, loadDataset } from "@crewhaus/eval-dataset";
 import { type CompiledGrader, type GradersConfig, parseGradersConfig } from "@crewhaus/eval-grader";
@@ -606,6 +611,18 @@ import {
   renderLoadtestText,
   runLoadtest,
 } from "./loadtest";
+// Loop contract 0.4 (Batch A) — interpreter-side threading of the
+// loop-contract spec keys (limits / thinking / streaming / rate_limits /
+// spec hooks / compaction tuning) + the compile-warning formatter, in a
+// side-effect-free module so it is unit-testable (this entry file runs an
+// argv switch on import). Mirror: @crewhaus/target-cli codegen threads the
+// same fields into compiled bundles — keep the two in sync.
+import {
+  formatCompileWarning,
+  loopContractRunOptions,
+  mergeSpecHooks,
+  resolveStreaming,
+} from "./loop-contract";
 // Item 60 — the marketplace CLI core: registry-source resolution, the
 // outdated freshness compare, list/outdated formatters, and the publish PR
 // plan, in a side-effect-free module so it is unit-testable (this entry file
@@ -957,11 +974,12 @@ const COMPILE_SCHEMA: ParseArgsSchema = {
   flags: [
     { name: "out", short: "o", takesValue: true },
     { name: "emit-ir", takesValue: false },
-    // FR-002 — the strict scope gate (fail the build when an outward-reaching
-    // tool is left at a non-"external" scope) now runs by DEFAULT on every
-    // compile. `--strict` is retained as an accepted no-op so existing
-    // invocations and CI scripts keep working; the gate fires with or without
-    // it (see whitepaper §6).
+    // FR-002 made the strict scope gate DEFAULT-ON, which left `--strict` an
+    // accepted no-op. Loop contract 0.4 (Batch A) gives it real meaning
+    // again: escalate compile WARNINGS (accepted-but-unwired spec keys) to
+    // errors — warnings always print (code + path + message, one per line);
+    // with --strict any warning fails the compile before files are written.
+    // The scope gate itself stays default-on regardless (opt out below).
     { name: "strict", takesValue: false },
     // FR-002 — explicit opt-out for users who knowingly bypass the gate (e.g.
     // an outward sink whose external scope is verified out of band). Either
@@ -1041,6 +1059,11 @@ const RUN_SCHEMA: ParseArgsSchema = {
     // `stop`). On reaching the cap the run stops (or degrades) before the
     // next turn.
     { name: "budget-usd", takesValue: true },
+    // Loop contract 0.4 (Batch A) — force streaming tool dispatch on for
+    // this run (runChatLoop's `streaming` option: tools execute as each
+    // tool_use block completes mid-stream). The spec's `agent.streaming`
+    // sets the default; the flag wins.
+    { name: "streaming", takesValue: false },
     // Item #56 — identify the current user so their
     // `.crewhaus/preferences/<user>.md` is injected at run start (alongside
     // the auto-loaded LESSONS.md). Flag > CREWHAUS_USER env.
@@ -2383,7 +2406,15 @@ async function runCompile(args: ParsedArgs): Promise<void> {
         "\n" +
         "  --allow-unmarked-sinks   Opt out of the gate for this compile (alias:\n" +
         "             --no-strict-scope). Use only when you knowingly bypass it.\n" +
-        "  --strict   Accepted no-op — the gate is already on by default.\n",
+        "\n" +
+        "  Compile warnings: a spec key a shape ACCEPTS but whose emitter does\n" +
+        "  not wire yet (accepted-but-unwired — legal-but-inert config) always\n" +
+        "  prints as one line per warning:\n" +
+        "    crewhaus: warning[<code>] <path>: <message>\n" +
+        "  --strict   Escalate compile warnings to errors: any warning fails\n" +
+        "             the compile (exit 1) before files are written. (The\n" +
+        "             FR-002 scope gate is on by default regardless of this\n" +
+        "             flag; --allow-unmarked-sinks is its only opt-out.)\n",
     );
     return;
   }
@@ -2404,6 +2435,12 @@ async function runCompile(args: ParsedArgs): Promise<void> {
   const register = args.flags["no-register"] !== true;
   if (typeof specPath !== "string") die("missing <spec.yaml>");
   if (!emitIr && typeof outDir !== "string") die("missing -o <out-dir>");
+
+  // Loop contract 0.4 (Batch A) — `--strict` escalates compile warnings
+  // (accepted-but-unwired spec keys) to errors. Distinct from the FR-002
+  // scope gate above, which is default-on and governed solely by
+  // --allow-unmarked-sinks.
+  const strictWarnings = args.flags["strict"] === true;
 
   // Item 41 — `--watch`: re-run parse→lint→compile on every change. Delegates
   // to the watch controller, which drives one `compileOnceForWatch` cycle per
@@ -2486,6 +2523,19 @@ async function runCompile(args: ParsedArgs): Promise<void> {
       die(err.message);
     }
     throw err;
+  }
+
+  // Loop contract 0.4 (Batch A) — compile warnings ALWAYS print, one line
+  // per warning (code + path + message; stderr so stdout stays the clean
+  // `wrote …` stream). With --strict any warning fails the compile HERE —
+  // before any file is written, so a strict-failed build emits nothing.
+  for (const warning of bundle.warnings) {
+    process.stderr.write(`crewhaus: ${formatCompileWarning(warning)}\n`);
+  }
+  if (strictWarnings && bundle.warnings.length > 0) {
+    die(
+      `--strict: ${bundle.warnings.length} compile warning(s) escalated to errors (see lines above)`,
+    );
   }
 
   mkdirSync(absOut, { recursive: true });
@@ -3829,9 +3879,14 @@ async function resolveEgressMatcher(
 async function runRun(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
-      "usage: crewhaus run <spec.yaml> [--model <model>] [--permission-mode <default|plan|auto|bypass>] [--resume <sessionId> | --continue] [--prompt <text>] [--justification-judge rule-based|claude] [--egress-matcher substring|semantic] [--egress-embedder <model>]\n" +
+      "usage: crewhaus run <spec.yaml> [--model <model>] [--permission-mode <default|plan|auto|bypass>] [--resume <sessionId> | --continue] [--prompt <text>] [--streaming] [--budget-usd <n>] [--justification-judge rule-based|claude] [--egress-matcher substring|semantic] [--egress-embedder <model>]\n" +
         "  --prompt <text> runs a single turn non-interactively and prints the reply, then exits (no REPL) — for scripting/CI; composes with --resume/--continue\n" +
         "  --model accepts the full router grammar: claude-* (Anthropic), openai/<m>, gemini/<m>, bedrock/<id> (geo prefixes tolerated), local/<m>@<url>\n" +
+        "  --streaming dispatches tools mid-stream (as each tool_use block completes) instead of after the full response; the spec's agent.streaming sets the default, the flag forces it on\n" +
+        "  --budget-usd <n> caps this run's model spend in dollars: it sets/overrides the spec budget.usd ceiling and keeps the spec's on_exceed ladder (stop when the spec has none).\n" +
+        "    Interplay with the spec's limits: block — the budget cap and the limits ceilings (max_tool_iterations, max_concurrent_tools, context_limit, deadline_ms, turn_timeout_ms,\n" +
+        "    model_call_timeout_ms, loop_detection) are enforced INDEPENDENTLY; whichever bound trips first governs. The budget check gates the NEXT turn (an in-flight turn is never\n" +
+        "    severed mid-tool-call), while the limits ceilings bound the CURRENT turn/run. --budget-usd never widens a limit and limits: never raises the spend cap.\n" +
         "  A spec with a feedback: block asks `rate this session? [g]ood / [b]ad / [enter] skip`\n" +
         "  on clean REPL exit (one keystroke, 10s timeout, TTY only — never when piped). Opt out\n" +
         "  with CREWHAUS_NO_EXIT_RATING=1 or feedback.exitPrompt: false. With feedback.autoDistill\n" +
@@ -4029,6 +4084,15 @@ async function runRunCli(
   const modelOverride = args.flags["model"];
   const model = typeof modelOverride === "string" ? modelOverride : ir.agent.model;
 
+  // Loop contract 0.4 (Batch A) — streaming tool dispatch: `--streaming`
+  // forces it on; otherwise the spec's `agent.streaming` is carried
+  // verbatim; neither → absent (runtime default false). One diagnostic
+  // line so the mode is observable (mirrors the [sandbox] convention).
+  const streaming = resolveStreaming(args.flags["streaming"] === true, ir.agent.streaming);
+  if (streaming === true) {
+    process.stdout.write("[streaming] mid-stream tool dispatch enabled\n");
+  }
+
   // Item 27 — run-level spend cap: `--budget-usd <n>` (flag) > spec `budget`.
   // The flag sets/overrides the dollar ceiling and keeps the spec's on_exceed
   // ladder (defaulting to `stop` when the spec has no budget block). Absent
@@ -4100,11 +4164,19 @@ async function runRunCli(
   // a synthetic `Skill(name)` tool is appended to the tool list so the
   // model can lazily fetch each skill's body.
   const cwd = process.cwd();
-  const [hooks, discoveredSkills, discoveredCommands] = await Promise.all([
+  const [settingsHooks, discoveredSkills, discoveredCommands] = await Promise.all([
     loadHooks({ cwd }),
     discoverSkills({ cwd }),
     loadCommands({ cwd }),
   ]);
+  // Loop contract 0.4 (Batch A) — spec-declared `hooks:` layer BELOW the
+  // settings.json layers: spec entries first, then loadHooks()' user →
+  // project entries (aggregateDecisions' later-wins mutate merge keeps the
+  // user's/project's overrides authoritative — the permission RuleSet's
+  // settings-over-yaml precedence). Everything downstream (the alert/SLO
+  // sinks' event filters AND runChatLoop) reads the MERGED list, so a spec
+  // hook is a full citizen of every hook surface.
+  const hooks = mergeSpecHooks(ir.hooks, settingsHooks);
 
   // Feature #53 / v0.3.0 PR 11 — memory + continuity, wired through the
   // composition root. The SAME `wireMemory(fragment, deps)` call a compiled
@@ -4136,6 +4208,14 @@ async function runRunCli(
       },
       cwd: process.cwd(),
       log: (line) => process.stdout.write(line),
+      // Loop contract 0.4 (Batch A) — top-level fact-store embedder (spec
+      // `memory.embedder`): constructed here and handed to wireMemory as
+      // `deps.embedder`, which memory-service's resolveEmbedder prefers
+      // over the fragment's `wiki.embedder` — the documented fallback
+      // order (`embedder` → `wiki.embedder`). Mirrors target-cli codegen.
+      ...(ir.memory !== undefined && ir.memory.enabled !== false && ir.memory.embedder !== undefined
+        ? { embedder: createEmbedder({ model: ir.memory.embedder }) }
+        : {}),
       // v0.3.0 Goal 3 — the live connection (or null after a boot failure,
       // which wireMemory degrades from). Absent when thredz is off.
       ...(ir.thredz !== undefined ? { thredz: thredzConn } : {}),
@@ -4179,7 +4259,12 @@ async function runRunCli(
       `[skills] ${skills.length} available: ${skills.map((s) => s.name).join(", ")}\n`,
     );
   }
-  if (hooks.length > 0) process.stdout.write(`[hooks] ${hooks.length} loaded\n`);
+  if (hooks.length > 0) {
+    const specHookCount = ir.hooks?.length ?? 0;
+    process.stdout.write(
+      `[hooks] ${hooks.length} loaded${specHookCount > 0 ? ` (${specHookCount} from spec)` : ""}\n`,
+    );
+  }
   if (slashCommands.size > 0) {
     process.stdout.write(
       `[slash] ${slashCommands.size} commands: ${[...slashCommands.keys()].join(", ")}\n`,
@@ -4462,6 +4547,15 @@ async function runRunCli(
       ...(ir.target === "cli" && ir.compaction.model !== undefined
         ? { compactionModel: ir.compaction.model }
         : {}),
+      // Loop contract 0.4 (Batch A) — limits ceilings (incl. loop_detection),
+      // agent.thinking, agent.rate_limits, and the compaction tuning knobs
+      // (threshold / snip_keep_head / snip_keep_tail → compactionThreshold /
+      // snipKeepHead / snipKeepTail), mirrored 1:1 from the target-cli
+      // codegen (see loop-contract.ts for the option-name contract).
+      ...loopContractRunOptions(ir),
+      // Loop contract 0.4 (Batch A) — streaming tool dispatch
+      // (--streaming flag > spec agent.streaming > absent).
+      ...(streaming !== undefined ? { streaming } : {}),
       // Item 22 — provider failover chain: thread `agent.model_fallbacks` +
       // `agent.circuit_breaker` through to the runtime, mirroring the
       // target-cli codegen path. Skipped when `--model` overrides the

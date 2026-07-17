@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import type { ProviderRequest } from "@crewhaus/adapter-anthropic";
+import {
+  EFFORT_THINKING_BUDGET_TOKENS,
+  type ProviderRequest,
+  type ReasoningEffort,
+} from "@crewhaus/adapter-anthropic";
 import { toOpenAIChatParams } from "./translate.js";
 
 const baseReq: ProviderRequest = {
@@ -425,5 +429,94 @@ describe("toOpenAIChatParams", () => {
     });
     const assistant = params.messages[2] as { tool_calls?: { function: { arguments: string } }[] };
     expect(assistant.tool_calls?.[0]?.function.arguments).toBe("{}");
+  });
+});
+
+describe("toOpenAIChatParams — reasoning effort", () => {
+  test("reasoningEffort passes through verbatim on reasoning models", () => {
+    for (const model of ["o1", "o3", "o4-mini", "gpt-5", "gpt-5-mini"]) {
+      const params = toOpenAIChatParams({ ...baseReq, model, reasoningEffort: "high" });
+      expect(params.reasoning_effort).toBe("high");
+    }
+  });
+
+  test("reasoningEffort is silently ignored on non-reasoning models", () => {
+    for (const model of ["gpt-4o", "gpt-4o-mini", "llama3.1:8b", "deepseek-chat"]) {
+      const params = toOpenAIChatParams({ ...baseReq, model, reasoningEffort: "high" });
+      expect(params.reasoning_effort).toBeUndefined();
+    }
+  });
+
+  test("neither reasoningEffort nor thinking → no reasoning_effort, even on reasoning models", () => {
+    const params = toOpenAIChatParams({ ...baseReq, model: "o3" });
+    expect(params.reasoning_effort).toBeUndefined();
+  });
+
+  test("thinking.budgetTokens alone derives the exact preset buckets", () => {
+    for (const [effort, budgetTokens] of Object.entries(EFFORT_THINKING_BUDGET_TOKENS)) {
+      const params = toOpenAIChatParams({
+        ...baseReq,
+        model: "o3",
+        thinking: { type: "enabled", budgetTokens },
+      });
+      expect(params.reasoning_effort).toBe(effort as ReasoningEffort);
+    }
+  });
+
+  test("thinking.budgetTokens derives the NEAREST bucket for off-preset budgets", () => {
+    const cases: ReadonlyArray<[number, ReasoningEffort]> = [
+      [1024, "low"], // below the low preset
+      [3000, "low"], // nearer 2048 than 8192
+      [6000, "medium"], // nearer 8192 than 2048
+      [20000, "high"], // nearer 24576 than 8192
+      [100000, "high"], // above the high preset
+    ];
+    for (const [budgetTokens, expected] of cases) {
+      const params = toOpenAIChatParams({
+        ...baseReq,
+        model: "o3",
+        thinking: { type: "enabled", budgetTokens },
+      });
+      expect(params.reasoning_effort).toBe(expected);
+    }
+  });
+
+  test("bucket ties resolve to the lower effort", () => {
+    // 5120 is equidistant from low (2048) and medium (8192); 16384 from
+    // medium (8192) and high (24576).
+    const ties: ReadonlyArray<[number, ReasoningEffort]> = [
+      [5120, "low"],
+      [16384, "medium"],
+    ];
+    for (const [budgetTokens, expected] of ties) {
+      const params = toOpenAIChatParams({
+        ...baseReq,
+        model: "o3",
+        thinking: { type: "enabled", budgetTokens },
+      });
+      expect(params.reasoning_effort).toBe(expected);
+    }
+  });
+
+  test("explicit reasoningEffort wins over thinking.budgetTokens (native effort control)", () => {
+    // Inverted precedence vs the budget-token providers: OpenAI's native
+    // knob IS the effort string, so the preset passes through and the
+    // budget is not consulted.
+    const params = toOpenAIChatParams({
+      ...baseReq,
+      model: "gpt-5",
+      reasoningEffort: "low",
+      thinking: { type: "enabled", budgetTokens: 24576 },
+    });
+    expect(params.reasoning_effort).toBe("low");
+  });
+
+  test("thinking-derived effort is also ignored on non-reasoning models", () => {
+    const params = toOpenAIChatParams({
+      ...baseReq,
+      model: "gpt-4o",
+      thinking: { type: "enabled", budgetTokens: 8192 },
+    });
+    expect(params.reasoning_effort).toBeUndefined();
   });
 });

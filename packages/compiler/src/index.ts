@@ -24,8 +24,10 @@ import type {
   IrFailureTaxonomyEntry,
   IrFeedback,
   IrGraphV0,
+  IrHook,
   IrIMessageConfig,
   IrLearning,
+  IrLimits,
   IrManagedV0,
   IrMcpServerConfig,
   IrMcpServers,
@@ -42,6 +44,7 @@ import type {
   IrSlackConfig,
   IrSubAgentDefinition,
   IrTelegramConfig,
+  IrThinking,
   IrThredz,
   IrTransactionPolicy,
   IrV0,
@@ -50,7 +53,7 @@ import type {
   IrWhatsAppConfig,
   IrWorkflowV0,
 } from "@crewhaus/ir";
-import { applyPasses as applyIrPassesFn } from "@crewhaus/ir-passes";
+import { VALIDATING_PASSES, applyPasses as applyIrPassesFn } from "@crewhaus/ir-passes";
 import {
   type Spec,
   type SpecChannel,
@@ -127,19 +130,132 @@ export type CompileOptions = {
   readonly readme?: boolean;
 };
 
-export function compile(yamlText: string, opts: CompileOptions = {}): Bundle {
+/**
+ * Loop contract 0.4 (Batch A, G45 warnings framework) — one non-fatal
+ * compile diagnostic. `code` is a stable machine key (today only
+ * `"accepted-but-unwired"`), `path` the spec key it concerns (dot-joined),
+ * `message` the human explanation. Additive: every existing `compile()`
+ * consumer that only reads `.files` keeps working unchanged.
+ */
+export type CompileWarning = {
+  readonly code: string;
+  readonly path: string;
+  readonly message: string;
+};
+
+/**
+ * The result of `compile()`: the emitted {@link Bundle} plus the additive
+ * `warnings` array (empty on a clean compile). Structurally a `Bundle`, so
+ * callers typed against `Bundle` keep compiling.
+ */
+export type CompileResult = Bundle & {
+  readonly warnings: ReadonlyArray<CompileWarning>;
+};
+
+export function compile(yamlText: string, opts: CompileOptions = {}): CompileResult {
   const spec = parseSpec(yamlText);
   let ir = lower(spec);
   if (opts.strict === true) {
     assertToolScopesStrict(ir);
   }
+  // G45 — the VALIDATING ir-passes (graph reachability + edge/message-schema
+  // resolution, §47 chain referential integrity, memory/continuity
+  // integrity) run UNCONDITIONALLY: they rewrite nothing, so they cannot
+  // drift bundle bytes, and a spec that violates referential integrity must
+  // fail the build rather than emit a bundle that breaks at runtime.
+  // REWRITING passes stay behind `applyIrPasses: true` below.
+  for (const pass of VALIDATING_PASSES) {
+    ir = pass(ir);
+  }
   if (opts.applyIrPasses === true) {
     // Static import so the compiler bundles cleanly into a Cloudflare
     // Worker. ir-passes is a workspace dep regardless; the prior `require`
     // call broke Worker bundling (no `require` in CF Workers runtime).
+    // (The full pipeline re-runs the validating passes — they are pure
+    // pass-throughs on a valid IR, so the double run is free.)
     ir = applyIrPassesFn(ir);
   }
-  return emit(ir, { readme: opts.readme !== false });
+  const bundle = emit(ir, { readme: opts.readme !== false });
+  return { files: bundle.files, warnings: collectCompileWarnings(spec) };
+}
+
+/**
+ * Loop contract 0.4 (Batch A) — the ACCEPTED-BUT-UNWIRED table: spec keys a
+ * shape's schema accepts (so users can declare them) but whose emitter
+ * currently DROPS (or merely prints the 0.2.3-convention ignored-note
+ * comment for). Declaring one of these is legal-but-inert config, which
+ * beats a strict-union rejection for forward compatibility but deserves a
+ * warning so nobody ships dead YAML believing it's live.
+ *
+ * The table encodes the POST-Batch-A intended state: keys Batch A wires
+ * (mcp_servers on crew/research/batch, graph node tools, crew role
+ * sub_agents, and limits/thinking/hooks everywhere they're accepted) are
+ * deliberately NOT listed. Graph/crew `messageSchemas` are IR-only (no spec
+ * key exists), so there is nothing accepted to warn about — they're absent
+ * from the table by construction, not by oversight. When an emitter wires
+ * a listed key, delete its row (the warnings tests pin the table).
+ */
+type UnwiredKey = {
+  readonly path: string;
+  readonly message: string;
+};
+
+const unwired = (path: string, shape: string, detail: string): UnwiredKey => ({
+  path,
+  message: `${path} is accepted on the ${shape} shape but its emitter does not wire it yet — ${detail}`,
+});
+
+const ACCEPTED_BUT_UNWIRED: Readonly<Partial<Record<Spec["target"], ReadonlyArray<UnwiredKey>>>> = {
+  workflow: [
+    unwired("continuity", "workflow", "the generated bundle prints the ignored-note comment"),
+  ],
+  channel: [unwired("thredz", "channel", "the generated daemon prints the ignored-note comment")],
+  managed: [unwired("thredz", "managed", "the generated daemon prints the ignored-note comment")],
+  research: [unwired("thredz", "research", "the generated daemon prints the ignored-note comment")],
+  crew: [unwired("thredz", "crew", "the generated bundle prints the ignored-note comment")],
+  batch: [unwired("continuity", "batch", "the generated bundle prints the ignored-note comment")],
+  voice: [
+    unwired("mcp_servers", "voice", "no MCP host is booted in the voice daemon"),
+    unwired("tools", "voice", "the realtime voice loop does not register a tool catalog"),
+    unwired("continuity", "voice", "the generated daemon prints the ignored-note comment"),
+  ],
+  browser: [
+    unwired("mcp_servers", "browser", "no MCP host is booted in the browser daemon"),
+    unwired("continuity", "browser", "the generated daemon prints the ignored-note comment"),
+  ],
+  onchain: [unwired("mcp_servers", "onchain", "no MCP host is booted in the onchain daemon")],
+  "onchain-game": [
+    unwired("mcp_servers", "onchain-game", "no MCP host is booted in the onchain-game daemon"),
+  ],
+};
+
+/**
+ * Whether the spec MEANINGFULLY declares `path` — i.e. the key is present
+ * and not an explicit opt-out (`false` / `{enabled: false}`) or an empty
+ * collection. Only meaningful declarations warn: `continuity: false` is a
+ * live opt-out, not dead config, and an empty `mcp_servers: {}` configures
+ * nothing worth warning about.
+ */
+function specDeclares(spec: Spec, path: string): boolean {
+  const value = (spec as unknown as Record<string, unknown>)[path];
+  if (value === undefined || value === false) return false;
+  if (typeof value === "object" && value !== null) {
+    if ((value as { enabled?: unknown }).enabled === false) return false;
+    if (Array.isArray(value)) return value.length > 0;
+    return Object.keys(value).length > 0;
+  }
+  return true;
+}
+
+function collectCompileWarnings(spec: Spec): ReadonlyArray<CompileWarning> {
+  const rows = ACCEPTED_BUT_UNWIRED[spec.target] ?? [];
+  const out: CompileWarning[] = [];
+  for (const row of rows) {
+    if (specDeclares(spec, row.path)) {
+      out.push({ code: "accepted-but-unwired", path: row.path, message: row.message });
+    }
+  }
+  return out;
 }
 
 /**
@@ -480,6 +596,11 @@ function lowerCompaction(spec: SpecWithPermissions): IrCompaction {
     -readonly [K in keyof IrCompaction]: IrCompaction[K];
   } = {};
   if (c.model !== undefined) out.model = resolveAuxModel(c.model, spec, "compaction.model");
+  // Loop contract 0.4 (Batch A) — threshold + snip window, snake_case spec
+  // keys renamed to camelCase IR keys, carried verbatim only when declared.
+  if (c.threshold !== undefined) out.threshold = c.threshold;
+  if (c.snip_keep_head !== undefined) out.snipKeepHead = c.snip_keep_head;
+  if (c.snip_keep_tail !== undefined) out.snipKeepTail = c.snip_keep_tail;
   if (c.curate !== undefined) out.curate = c.curate;
   if (c.dedupeThreshold !== undefined) out.dedupeThreshold = c.dedupeThreshold;
   if (c.relevanceTopK !== undefined) out.relevanceTopK = c.relevanceTopK;
@@ -758,6 +879,147 @@ function lowerBudget(spec: SpecWithBudget): { budget?: IrBudget } {
 }
 
 /**
+ * Loop contract 0.4 (Batch A) — lower the top-level `limits:` block.
+ * Snake_case spec keys map to camelCase IR keys 1:1; every field is carried
+ * verbatim only when declared (the runtime owns per-knob defaults), and the
+ * whole key stays ABSENT when the spec omits the block (spread-return-{}
+ * discipline, Pillar 1). The crew shape's `limits.crew` sub-block rides the
+ * same lowering — it is only ever present there because the spec rejects it
+ * on every other shape.
+ */
+type SpecWithLimits = {
+  readonly limits?: {
+    readonly max_tool_iterations?: number;
+    readonly max_concurrent_tools?: number;
+    readonly context_limit?: number;
+    readonly deadline_ms?: number;
+    readonly turn_timeout_ms?: number;
+    readonly model_call_timeout_ms?: number;
+    readonly loop_detection?: {
+      readonly window?: number;
+      readonly threshold?: number;
+      readonly escalation?: "warn" | "justify" | "abort";
+    };
+    readonly crew?: {
+      readonly max_activations?: number;
+      readonly refusal_depth?: number;
+      readonly max_a2a_depth?: number;
+    };
+  };
+};
+
+function lowerLimits(spec: SpecWithLimits): { limits?: IrLimits } {
+  const l = spec.limits;
+  if (l === undefined) return {};
+  const ld = l.loop_detection;
+  const crew = l.crew;
+  return {
+    limits: {
+      ...(l.max_tool_iterations !== undefined ? { maxToolIterations: l.max_tool_iterations } : {}),
+      ...(l.max_concurrent_tools !== undefined
+        ? { maxConcurrentTools: l.max_concurrent_tools }
+        : {}),
+      ...(l.context_limit !== undefined ? { contextLimit: l.context_limit } : {}),
+      ...(l.deadline_ms !== undefined ? { deadlineMs: l.deadline_ms } : {}),
+      ...(l.turn_timeout_ms !== undefined ? { turnTimeoutMs: l.turn_timeout_ms } : {}),
+      ...(l.model_call_timeout_ms !== undefined
+        ? { modelCallTimeoutMs: l.model_call_timeout_ms }
+        : {}),
+      ...(ld !== undefined
+        ? {
+            loopDetection: {
+              ...(ld.window !== undefined ? { window: ld.window } : {}),
+              ...(ld.threshold !== undefined ? { threshold: ld.threshold } : {}),
+              ...(ld.escalation !== undefined ? { escalation: ld.escalation } : {}),
+            },
+          }
+        : {}),
+      ...(crew !== undefined
+        ? {
+            crew: {
+              ...(crew.max_activations !== undefined
+                ? { maxActivations: crew.max_activations }
+                : {}),
+              ...(crew.refusal_depth !== undefined ? { refusalDepth: crew.refusal_depth } : {}),
+              ...(crew.max_a2a_depth !== undefined ? { maxA2aDepth: crew.max_a2a_depth } : {}),
+            },
+          }
+        : {}),
+    },
+  };
+}
+
+/**
+ * Loop contract 0.4 (Batch A) — lower a `thinking` block (agent-level on
+ * cli/channel/managed; step/node/role-level on workflow/graph/crew). The
+ * spec's superRefine guarantees exactly one form, so the lowering is a
+ * two-arm rename: `{ budget_tokens }` → `{ budgetTokens }`, `{ effort }`
+ * carried verbatim. Spread-return-{} so the key stays absent when omitted.
+ */
+type SpecThinking = {
+  readonly budget_tokens?: number;
+  readonly effort?: "low" | "medium" | "high";
+};
+
+function lowerThinking(t: SpecThinking | undefined): { thinking?: IrThinking } {
+  if (t === undefined) return {};
+  if (t.budget_tokens !== undefined) return { thinking: { budgetTokens: t.budget_tokens } };
+  if (t.effort !== undefined) return { thinking: { effort: t.effort } };
+  // Unreachable past parseSpec (the superRefine demands exactly one form);
+  // direct callers that hand-build spec fragments get the absent key.
+  return {};
+}
+
+/**
+ * Loop contract 0.4 (Batch A) — lower the top-level `hooks:` block. 1:1
+ * except the snake_case rename (`timeout_ms` → `timeoutMs`); insertion
+ * order preserved (hooks fire in declaration order, matching hooks-engine's
+ * settings.json semantics). Spread-return-{} discipline.
+ */
+type SpecWithHooks = {
+  readonly hooks?: ReadonlyArray<{
+    readonly event: IrHook["event"];
+    readonly matcher?: string;
+    readonly command: string;
+    readonly timeout_ms?: number;
+  }>;
+};
+
+function lowerHooks(spec: SpecWithHooks): { hooks?: ReadonlyArray<IrHook> } {
+  const h = spec.hooks;
+  if (h === undefined || h.length === 0) return {};
+  return {
+    hooks: h.map((entry) => ({
+      event: entry.event,
+      command: entry.command,
+      ...(entry.matcher !== undefined ? { matcher: entry.matcher } : {}),
+      ...(entry.timeout_ms !== undefined ? { timeoutMs: entry.timeout_ms } : {}),
+    })),
+  };
+}
+
+/**
+ * Loop contract 0.4 (Batch A) — lower `agent.rate_limits` (cli/channel/
+ * managed). Values are carried verbatim under a frozen map; keys are tool
+ * names or `"*"`. Spread-return-{} discipline.
+ */
+type SpecRateLimits = Readonly<Record<string, { readonly rpm: number; readonly burst?: number }>>;
+
+function lowerRateLimits(rateLimits: SpecRateLimits | undefined): {
+  rateLimits?: Readonly<Record<string, { readonly rpm: number; readonly burst?: number }>>;
+} {
+  if (rateLimits === undefined || Object.keys(rateLimits).length === 0) return {};
+  const out: Record<string, { rpm: number; burst?: number }> = {};
+  for (const [tool, limit] of Object.entries(rateLimits)) {
+    out[tool] = {
+      rpm: limit.rpm,
+      ...(limit.burst !== undefined ? { burst: limit.burst } : {}),
+    };
+  }
+  return { rateLimits: Object.freeze(out) };
+}
+
+/**
  * Pillar 3 (FR-004) — lower the optional `security` block. Mirrors
  * `lowerCompaction`'s "propagate only defined fields" discipline:
  * defaults belong at the consumer (the cli run path defaults the judge
@@ -839,6 +1101,7 @@ type SpecWithMemory = {
   readonly memory?: {
     readonly enabled?: boolean;
     readonly backend?: "file" | "thredz";
+    readonly embedder?: string;
     readonly ttl?: string;
     readonly autoCapture?: boolean;
     readonly autoCaptureThreshold?: number;
@@ -862,9 +1125,10 @@ type SpecWithMemory = {
 
 /** v0.3.0 — floor for `memory.ttl`. A sub-hour fact TTL is almost certainly
  *  a unit mistake (facts would expire mid-session); reject it loudly at
- *  compile time. LOAD-BEARING here, mirrored (validation-only) by
- *  ir-passes' `memoryIntegrityPass` for direct-IR builders — the passes are
- *  opt-in and skipped on the plain compile path. */
+ *  compile time. LOAD-BEARING here (the first line, with the better
+ *  message), mirrored (validation-only) by ir-passes' `memoryIntegrityPass`
+ *  — which G45 now also runs unconditionally inside compile() and which
+ *  remains the audit for direct-IR builders. */
 const MEMORY_TTL_MIN_MS = 60 * 60 * 1000;
 
 /** v0.3.0 PR 14 — floor for `memory.dream.every`. Consolidation is a
@@ -913,6 +1177,9 @@ function lowerMemory(spec: SpecWithMemory): { memory?: IrMemory } {
     memory: {
       ...(m.enabled !== undefined ? { enabled: m.enabled } : {}),
       ...(m.backend !== undefined ? { backend: m.backend } : {}),
+      // Loop contract 0.4 (Batch A) — top-level fact-store embedder.
+      // Runtime fallback order: embedder → wiki.embedder.
+      ...(m.embedder !== undefined ? { embedder: m.embedder } : {}),
       ...(ttlMs !== undefined ? { ttlMs } : {}),
       ...(m.autoCapture !== undefined ? { autoCapture: m.autoCapture } : {}),
       ...(m.autoCaptureThreshold !== undefined
@@ -981,9 +1248,10 @@ type SpecWithContinuity = {
  * riding the session router's sessionId through wireMemory's `sessionScope`
  * dep); managed → `spec` + tenant fencing (deps carry the tenant at boot).
  * Explicit `scope: "session"` is only valid where a session router exists
- * (channel) — LOAD-BEARING validation lives here (the ir-passes mirror is
- * opt-in and skipped on the plain compile path). Every other field is
- * resolved to its default so the IR carries one deterministic shape.
+ * (channel) — LOAD-BEARING validation lives here, with the ir-passes mirror
+ * (G45: now also run unconditionally inside compile()) covering direct-IR
+ * builders. Every other field is resolved to its default so the IR carries
+ * one deterministic shape.
  */
 function lowerContinuity(
   spec: SpecWithContinuity,
@@ -1125,8 +1393,8 @@ function synthesizeThredzServer(thredz: IrThredz): IrMcpServerConfig {
  * server (unless the user declared their own `mcp_servers.thredz` — explicit
  * beats implicit; `crewhaus lint` warns about the shadowing), and flip
  * `memory.backend` to `thredz` on a declared memory block. Cross-field
- * validation lives here (LOAD-BEARING — ir-passes are opt-in and skipped on
- * the plain compile path):
+ * validation lives here (LOAD-BEARING — these thredz rules have no
+ * ir-passes mirror, so lower time is their only gate):
  *   - `memory.backend: thredz` without the `thredz:` block is an error (the
  *     backend needs the API key the block carries);
  *   - `memory.backend: file` alongside `thredz:` is a contradiction.
@@ -1211,9 +1479,9 @@ type SpecWithLearning = {
 /**
  * Lower the `learning:` block to a RESOLVED `IrLearning` (study toggles
  * defaulted to true so downstream reads one deterministic shape). Cross-field
- * validation lives HERE (LOAD-BEARING — ir-passes are opt-in and skipped on
- * the plain compile path), mirrored by ir-passes' `memoryIntegrityPass` for
- * direct-IR builders:
+ * validation lives HERE (LOAD-BEARING — the first line, with the better
+ * message), mirrored by ir-passes' `memoryIntegrityPass` (G45: now also run
+ * unconditionally inside compile()) for direct-IR builders:
  *
  *   - learning NEEDS a wiki (the knowledge lives there): `memory.wiki`
  *     (local, not explicitly disabled) or `thredz:` (hosted) must be present;
@@ -1483,6 +1751,10 @@ export function lower(spec: Spec): IrNode {
           model: spec.agent.model,
           instructions: spec.agent.instructions,
           ...(spec.agent.max_tokens !== undefined ? { maxTokens: spec.agent.max_tokens } : {}),
+          // Loop contract 0.4 (Batch A) — thinking / streaming / rate limits.
+          ...lowerThinking(spec.agent.thinking),
+          ...(spec.agent.streaming !== undefined ? { streaming: spec.agent.streaming } : {}),
+          ...lowerRateLimits(spec.agent.rate_limits),
           ...lowerModelFailover(spec.agent),
         },
         tools: spec.tools ?? [],
@@ -1493,6 +1765,8 @@ export function lower(spec: Spec): IrNode {
         compaction: lowerCompaction(spec),
         ...lowerFailureTaxonomy(spec),
         ...lowerBudget(spec),
+        ...lowerLimits(spec),
+        ...lowerHooks(spec),
         ...lowerSecurity(spec),
         ...lowerFeedback(spec),
         ...memoryLowered,
@@ -1530,6 +1804,9 @@ export function lower(spec: Spec): IrNode {
           name: s.name,
           instructions: s.instructions,
           model: s.model ?? spec.model,
+          ...(s.max_tokens !== undefined ? { maxTokens: s.max_tokens } : {}),
+          // Loop contract 0.4 (Batch A) — per-step thinking selector.
+          ...lowerThinking(s.thinking),
           tools: s.tools ?? [],
           toolConfigs: lowerToolConfigs(s.tool_config),
         })),
@@ -1537,6 +1814,9 @@ export function lower(spec: Spec): IrNode {
         permissions: lowerPermissions(spec),
         compaction: lowerCompaction(spec),
         ...lowerFailureTaxonomy(spec),
+        ...lowerBudget(spec),
+        ...lowerLimits(spec),
+        ...lowerHooks(spec),
         // v0.3.0 — carried only when declared (NOT default-on); the emitter
         // prints the ignored-note comment.
         ...lowerContinuity(spec, { defaultOn: false, autoScope: "spec" }),
@@ -1553,6 +1833,10 @@ export function lower(spec: Spec): IrNode {
         agent: {
           model: spec.agent.model,
           instructions: spec.agent.instructions,
+          ...(spec.agent.max_tokens !== undefined ? { maxTokens: spec.agent.max_tokens } : {}),
+          // Loop contract 0.4 (Batch A) — thinking / rate limits.
+          ...lowerThinking(spec.agent.thinking),
+          ...lowerRateLimits(spec.agent.rate_limits),
           ...lowerModelFailover(spec.agent),
         },
         tools: spec.agent.tools ?? [],
@@ -1565,6 +1849,8 @@ export function lower(spec: Spec): IrNode {
         compaction: lowerCompaction(spec),
         ...lowerFailureTaxonomy(spec),
         ...lowerBudget(spec),
+        ...lowerLimits(spec),
+        ...lowerHooks(spec),
         ...lowerFeedback(spec),
         ...applyLearningWikiGovernance(lowerMemory(spec), learning.learning !== undefined),
         // v0.3.0 Goal 1 — DEFAULT-ON continuity. `auto` scope resolves to
@@ -1611,14 +1897,40 @@ export function lower(spec: Spec): IrNode {
           name,
           instructions: node.instructions,
           model: node.model ?? spec.model,
+          ...(node.max_tokens !== undefined ? { maxTokens: node.max_tokens } : {}),
+          // Loop contract 0.4 (Batch A) — per-node thinking selector.
+          ...lowerThinking(node.thinking),
           tools: node.tools ?? [],
           toolConfigs: lowerToolConfigs(node.tool_config),
           ...(node.hitl !== undefined ? { hitlPrompt: node.hitl.prompt } : {}),
         })),
-        edges: spec.edges.map((e) => ({ from: e.from, to: e.to })),
+        // Loop contract 0.4 (Batch A) — `when` lowers 1:1 (exactly one of
+        // equals/exists survives the spec's superRefine); declaration order
+        // is semantics (first matching edge wins), so no reordering.
+        edges: spec.edges.map((e) => ({
+          from: e.from,
+          to: e.to,
+          ...(e.when !== undefined
+            ? {
+                when: {
+                  key: e.when.key,
+                  ...(e.when.equals !== undefined ? { equals: e.when.equals } : {}),
+                  ...(e.when.exists !== undefined ? { exists: e.when.exists } : {}),
+                },
+              }
+            : {}),
+        })),
+        // Loop contract 0.4 (Batch A) — parallel barrier groups, verbatim
+        // (group order and member order are execution semantics).
+        ...(spec.parallel !== undefined
+          ? { parallel: spec.parallel.map((group) => [...group]) }
+          : {}),
         permissions: lowerPermissions(spec),
         compaction: lowerCompaction(spec),
         ...lowerFailureTaxonomy(spec),
+        ...lowerBudget(spec),
+        ...lowerLimits(spec),
+        ...lowerHooks(spec),
         ...lowerChainSubsystem(spec),
       } satisfies IrGraphV0;
     case "managed": {
@@ -1632,6 +1944,10 @@ export function lower(spec: Spec): IrNode {
         agent: {
           model: spec.agent.model,
           instructions: spec.agent.instructions,
+          ...(spec.agent.max_tokens !== undefined ? { maxTokens: spec.agent.max_tokens } : {}),
+          // Loop contract 0.4 (Batch A) — thinking / rate limits.
+          ...lowerThinking(spec.agent.thinking),
+          ...lowerRateLimits(spec.agent.rate_limits),
           ...lowerModelFailover(spec.agent),
         },
         tenants: spec.tenants.map((t) => ({
@@ -1645,6 +1961,8 @@ export function lower(spec: Spec): IrNode {
         compaction: lowerCompaction(spec),
         ...lowerFailureTaxonomy(spec),
         ...lowerBudget(spec),
+        ...lowerLimits(spec),
+        ...lowerHooks(spec),
         ...applyLearningWikiGovernance(lowerMemory(spec), learning.learning !== undefined),
         // v0.3.0 Goal 1 — DEFAULT-ON continuity. `auto` resolves to `spec`
         // scope; the managed daemon tenant-fences every store at boot (the
@@ -1721,6 +2039,11 @@ export function lower(spec: Spec): IrNode {
         permissions: lowerPermissions(spec),
         compaction: lowerCompaction(spec),
         ...lowerFailureTaxonomy(spec),
+        ...lowerBudget(spec),
+        // Loop contract 0.4 (Batch A) — the crew limits block may carry the
+        // crew-only `limits.crew` orchestration ceilings.
+        ...lowerLimits(spec),
+        ...lowerHooks(spec),
         // v0.3.0 — crew joins the memory-carrying shapes (§9) and gets
         // DEFAULT-ON continuity: roles share the `spec`-scoped plan store
         // (the plan IS the coordination surface, §2.7).
@@ -1744,6 +2067,7 @@ export function lower(spec: Spec): IrNode {
         agent: {
           model: spec.agent.model,
           instructions: spec.agent.instructions,
+          ...(spec.agent.max_tokens !== undefined ? { maxTokens: spec.agent.max_tokens } : {}),
           // Adaptive model routing — lowers model_pool when declared.
           ...lowerModelFailover(spec.agent),
         },
@@ -1763,6 +2087,9 @@ export function lower(spec: Spec): IrNode {
         permissions: lowerPermissions(spec),
         compaction: lowerCompaction(spec),
         ...lowerFailureTaxonomy(spec),
+        ...lowerBudget(spec),
+        ...lowerLimits(spec),
+        ...lowerHooks(spec),
         ...applyLearningWikiGovernance(lowerMemory(spec), learning.learning !== undefined),
         // v0.3.0 Goal 1 — DEFAULT-ON continuity, `spec` scope (§2.7).
         ...continuity,
@@ -1781,6 +2108,7 @@ export function lower(spec: Spec): IrNode {
         agent: {
           model: spec.agent.model,
           instructions: spec.agent.instructions,
+          ...(spec.agent.max_tokens !== undefined ? { maxTokens: spec.agent.max_tokens } : {}),
           // Adaptive model routing — lowers model_pool when declared.
           ...lowerModelFailover(spec.agent),
         },
@@ -1801,6 +2129,9 @@ export function lower(spec: Spec): IrNode {
         permissions: lowerPermissions(spec),
         compaction: lowerCompaction(spec),
         ...lowerFailureTaxonomy(spec),
+        ...lowerBudget(spec),
+        ...lowerLimits(spec),
+        ...lowerHooks(spec),
         // v0.3.0 — carried only when declared (NOT default-on); the emitter
         // prints the ignored-note comment.
         ...lowerContinuity(spec, { defaultOn: false, autoScope: "spec" }),
@@ -1840,6 +2171,7 @@ export function lower(spec: Spec): IrNode {
         agent: {
           model: spec.agent.model,
           instructions: spec.agent.instructions,
+          ...(spec.agent.max_tokens !== undefined ? { maxTokens: spec.agent.max_tokens } : {}),
           // Adaptive model routing — lowers model_pool when declared.
           ...lowerModelFailover(spec.agent),
         },
@@ -1855,6 +2187,9 @@ export function lower(spec: Spec): IrNode {
         permissions: lowerPermissions(spec),
         compaction: lowerCompaction(spec),
         ...lowerFailureTaxonomy(spec),
+        ...lowerBudget(spec),
+        ...lowerLimits(spec),
+        ...lowerHooks(spec),
         // v0.3.0 — carried only when declared (NOT default-on); the emitter
         // prints the ignored-note comment.
         ...lowerContinuity(spec, { defaultOn: false, autoScope: "spec" }),
@@ -1992,6 +2327,9 @@ function lowerCrewRole(name: string, role: SpecCrewRole, fallbackModel: string):
     name,
     model: role.model ?? fallbackModel,
     instructions: role.instructions,
+    ...(role.max_tokens !== undefined ? { maxTokens: role.max_tokens } : {}),
+    // Loop contract 0.4 (Batch A) — per-role thinking selector.
+    ...lowerThinking(role.thinking),
     tools: role.tools ?? [],
     toolConfigs: lowerToolConfigs(role.tool_config),
     subAgents: lowerSubAgents(role.sub_agents),

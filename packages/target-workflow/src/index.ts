@@ -15,6 +15,16 @@ import {
  * steps 2+ have no user input — they receive a synthetic user message
  * containing the prior step's terminal assistant text.
  *
+ * Loop contract 0.4 (Batch A): the spec's `limits` ceilings thread into
+ * every step's call — `deadline_ms` bounds the WHOLE run (the runner
+ * stamps the deadline once, guards between steps, and arms each step's
+ * runtime deadline timer with the remaining budget) while
+ * `turn_timeout_ms` bounds one step. Each step carries its own
+ * `max_tokens`/`thinking` tuning, `budget` and the spec-declared `hooks`
+ * ride along, and `mcp_servers` are wired for real (G05): one shared
+ * McpHost boots before the steps and its tools flow to every step that
+ * declares tools.
+ *
  * Future expansion: parallel/conditional steps, fan-out, retry/branch
  * logic — this v0 emits strictly sequential execution.
  */
@@ -101,16 +111,30 @@ function resolveAllTools(steps: readonly IrWorkflowStep[]): string[] {
   return imports;
 }
 
-function renderStep(
-  step: IrWorkflowStep,
-  idx: number,
-  total: number,
-  permFields: string,
-  failureTaxonomyField: string,
-): string {
+/**
+ * Fields shared verbatim by every step's runChatLoop call, precomputed
+ * once in renderAgent. `hooksExpr` is `__allHooks` when the spec declares
+ * `hooks:` (concat with the discovered settings.json hooks), else the
+ * pre-existing `__hooks`. `deadlineMs` renders the per-step whole-run
+ * deadline guard; `mcpWired` spreads `__mcpTools` into tool-declaring
+ * steps (G05).
+ */
+type StepShared = {
+  readonly permFields: string;
+  readonly failureTaxonomyField: string;
+  readonly limitsFields: string;
+  readonly budgetField: string;
+  readonly hooksExpr: string;
+  readonly deadlineMs: number | undefined;
+  readonly mcpWired: boolean;
+};
+
+function renderStep(step: IrWorkflowStep, idx: number, total: number, shared: StepShared): string {
   const isFirst = idx === 0;
   const stepNum = idx + 1;
-  const toolsField = renderStepToolsField(step.tools);
+  const toolsField = renderStepToolsField(step.tools, shared.mcpWired);
+  const stepTuningFields = renderStepTuningFields(step);
+  const deadlineGuard = renderDeadlineGuard(shared.deadlineMs, stepNum, total, step.name);
 
   // Anthropic rejects empty user content with a 400, so fall back to a
   // non-empty placeholder when stdin is empty (autonomous-style agent —
@@ -123,13 +147,13 @@ function renderStep(
 
   return `
   // ── Step ${stepNum}/${total}: ${step.name} ──
-${stdinReadLine}  process.stdout.write("\\n[step ${stepNum}/${total}: ${step.name}]\\n");
+${deadlineGuard}${stdinReadLine}  process.stdout.write("\\n[step ${stepNum}/${total}: ${step.name}]\\n");
   priorOutput = await runChatLoop({
     model: ${escapeJsonString(step.model)},
     instructions: ${escapeJsonString(step.instructions)},
     singleTurn: true,
-    seedMessages: [{ role: "user", content: ${userContent} }],${toolsField}${permFields}${failureTaxonomyField}
-    hooks: __hooks,
+    seedMessages: [{ role: "user", content: ${userContent} }],${toolsField}${stepTuningFields}${shared.limitsFields}${shared.budgetField}${shared.permFields}${shared.failureTaxonomyField}
+    hooks: ${shared.hooksExpr},
     skills: __skills,
     slashCommands: __slashCommands,
   });
@@ -138,16 +162,117 @@ ${stdinReadLine}  process.stdout.write("\\n[step ${stepNum}/${total}: ${step.nam
 
 /**
  * Build the per-step `tools:` field. Section 11 weaves the discovered
- * Skill tool in alongside any spec-declared built-ins.
+ * Skill tool in alongside any spec-declared built-ins; G05 additionally
+ * spreads the wire-once MCP tools (`__mcpTools`) into steps that declare
+ * tools. Steps WITHOUT tools stay tool-free — they receive neither the
+ * built-ins nor the MCP tools (only the Section 11 skill weave).
  */
-function renderStepToolsField(tools: readonly string[]): string {
+function renderStepToolsField(tools: readonly string[], mcpWired: boolean): string {
   const exports = tools
     .map((t) => BUILTIN_TOOL_MAP[t]?.export)
     .filter((e): e is string => typeof e === "string");
   if (exports.length === 0) {
     return "\n    tools: __skillTool ? [__skillTool] : [],";
   }
-  return `\n    tools: __skillTool ? [${exports.join(", ")}, __skillTool] : [${exports.join(", ")}],`;
+  const base = mcpWired ? `${exports.join(", ")}, ...__mcpTools` : exports.join(", ");
+  return `\n    tools: __skillTool ? [${base}, __skillTool] : [${base}],`;
+}
+
+/**
+ * Loop contract 0.4 (Batch A) — per-step model-call tuning: `maxTokens`
+ * (spec `steps[].max_tokens`) and the extended-thinking selector (spec
+ * `steps[].thinking`; the spec's superRefine guarantees exactly one of
+ * `{ budgetTokens }` / `{ effort }`). `JSON.stringify` is safe here:
+ * numbers plus a closed `low|medium|high` literal union, no free-form
+ * user strings. Empty when the step declares neither, keeping
+ * pre-existing bundles byte-identical.
+ */
+function renderStepTuningFields(step: IrWorkflowStep): string {
+  const pieces: string[] = [];
+  if (step.maxTokens !== undefined) {
+    pieces.push(`\n    maxTokens: ${step.maxTokens},`);
+  }
+  if (step.thinking !== undefined) {
+    pieces.push(`\n    thinking: ${JSON.stringify(step.thinking)},`);
+  }
+  return pieces.join("");
+}
+
+/**
+ * Loop contract 0.4 (Batch A) — render the spec-declared `limits` ceilings
+ * shared by EVERY step's runChatLoop call. `deadline_ms` bounds the WHOLE
+ * workflow run, so it is never passed verbatim (each call would get the
+ * full ceiling — N steps would multiply the budget): the runner stamps
+ * `__deadlineAt` once at boot and each step's call arms runtime-core's
+ * run-deadline timer with the REMAINING budget
+ * (`Math.max(1, __deadlineAt - Date.now())`), so the workflow ceiling
+ * binds MID-step too — in singleTurn mode the turn is the run, so a fire
+ * is the runtime's classified timeout failure. The already-elapsed
+ * boundary is handled cleanly BEFORE the call by {@link
+ * renderDeadlineGuard} (the `Math.max(1, …)` floor exists so a razor-edge
+ * remainder of `<= 0` still arms the timer instead of disarming it).
+ * `turn_timeout_ms` passes verbatim — it bounds one step (each step is
+ * exactly one singleTurn call). `limits.crew` never appears on this shape
+ * (the spec rejects it outside crew). All values are spec-validated
+ * numbers / a closed literal union, so `JSON.stringify` is safe. Empty
+ * when the spec omits `limits`, keeping pre-existing bundles
+ * byte-identical.
+ */
+function renderLimitsFields(ir: IrWorkflowV0): string {
+  const l = ir.limits;
+  if (l === undefined) return "";
+  const pieces: string[] = [];
+  if (l.maxToolIterations !== undefined) {
+    pieces.push(`\n    maxToolIterations: ${l.maxToolIterations},`);
+  }
+  if (l.maxConcurrentTools !== undefined) {
+    pieces.push(`\n    maxConcurrentTools: ${l.maxConcurrentTools},`);
+  }
+  if (l.contextLimit !== undefined) {
+    pieces.push(`\n    contextLimit: ${l.contextLimit},`);
+  }
+  if (l.deadlineMs !== undefined) {
+    pieces.push("\n    deadlineMs: Math.max(1, __deadlineAt - Date.now()),");
+  }
+  if (l.turnTimeoutMs !== undefined) {
+    pieces.push(`\n    turnTimeoutMs: ${l.turnTimeoutMs},`);
+  }
+  if (l.modelCallTimeoutMs !== undefined) {
+    pieces.push(`\n    modelCallTimeoutMs: ${l.modelCallTimeoutMs},`);
+  }
+  if (l.loopDetection !== undefined) {
+    pieces.push(`\n    loopDetection: ${JSON.stringify(l.loopDetection)},`);
+  }
+  return pieces.join("");
+}
+
+/**
+ * Loop contract 0.4 (Batch A) — `limits.deadline_ms` bounds the WHOLE
+ * workflow run (wall clock), not any single step. The generated runner
+ * stamps `__deadlineAt` once at the top of main() and guards every step:
+ * once the deadline has passed, the run stops with a `[limits]` notice and
+ * a non-zero exit code BEFORE opening the next step's turn (mid-step
+ * enforcement is the runtime's job — each call arms the run-deadline
+ * timer with the remaining budget, see {@link renderLimitsFields}). The
+ * guard uses `process.exitCode` + `return` (never `process.exit`) so the
+ * MCP `finally` teardown still runs.
+ */
+function renderDeadlineGuard(
+  deadlineMs: number | undefined,
+  stepNum: number,
+  total: number,
+  stepName: string,
+): string {
+  if (deadlineMs === undefined) return "";
+  const notice = `\n[limits] workflow deadline exceeded (deadline_ms = ${deadlineMs}) — stopping before step ${stepNum}/${total}: ${stepName}\n`;
+  return [
+    "  if (Date.now() >= __deadlineAt) {",
+    `    process.stderr.write(${escapeJsonString(notice)});`,
+    "    process.exitCode = 1;",
+    "    return;",
+    "  }",
+    "",
+  ].join("\n");
 }
 
 /**
@@ -160,6 +285,118 @@ function renderFailureTaxonomyField(ir: IrWorkflowV0): string {
   const taxonomy = ir.failureTaxonomy;
   if (taxonomy === undefined || taxonomy.length === 0) return "";
   return `\n    failureTaxonomy: ${JSON.stringify(taxonomy)},`;
+}
+
+/**
+ * Item 27 (Batch A extends the block to this shape) — render the `budget`
+ * runChatLoop field, threaded into EVERY step's call. Each step runs its
+ * own loop with its own cost meter, so in v0 the cap bounds each step
+ * independently (a run-spanning meter needs a runtime-core seam that does
+ * not exist yet). `JSON.stringify` safely quotes the degrade `model`
+ * string. Empty when the spec omits it. Mirror: target-cli +
+ * target-channel-bot + target-managed render the same field.
+ */
+function renderBudgetField(ir: IrWorkflowV0): string {
+  if (ir.budget === undefined) return "";
+  return `\n    budget: ${JSON.stringify(ir.budget)},`;
+}
+
+/**
+ * Loop contract 0.4 (Batch A) — spec-declared lifecycle hooks. The IR
+ * entries are already HookDef-shaped (hooks-engine's type, camelCase
+ * `timeoutMs`), so the bundle declares them as one typed const and layers
+ * them BELOW the discovered settings.json hooks: spec entries first, then
+ * loadHooks()' user → project entries — aggregateDecisions' later-wins
+ * mutate merge keeps the settings layers authoritative, mirroring the
+ * permission RuleSet's settings-over-yaml precedence (same ordering as
+ * target-cli and the `crewhaus run` interpreter). All hooks still RUN
+ * (any deny wins regardless of layer). `JSON.stringify` is safe —
+ * `event` is a closed enum and matcher/command land inside JSON-quoted
+ * literals. Empty when the spec omits `hooks`.
+ */
+function renderSpecHooksBoot(ir: IrWorkflowV0): string {
+  const specHooks = ir.hooks ?? [];
+  if (specHooks.length === 0) return "";
+  return [
+    "",
+    "  // Loop contract 0.4 — spec-declared hooks layer BELOW the discovered",
+    "  // settings.json layers (spec first; user → project later-wins).",
+    `  const __specHooks: ReadonlyArray<HookDef> = ${JSON.stringify(specHooks)};`,
+    "  const __allHooks = [...__specHooks, ...__hooks];",
+  ].join("\n");
+}
+
+/**
+ * G05 — wire-once MCP host for the workflow bundle, following
+ * eval-runner's wire-once `McpHost` + `registerMcpServer` pattern: the
+ * generated main() boots ONE McpHost, registers every server's tools into
+ * ONE private `ToolCatalog` (`__mcpCatalog`), and each step that declares
+ * tools spreads the resulting `__mcpTools` into its runChatLoop call.
+ * Steps without tools stay tool-free. Teardown is a `finally` around the
+ * step sequence so stdio servers are disconnected on success, failure, or
+ * a deadline stop.
+ *
+ * 0.3.0 — env/header values are `IrSecretRef` objects; the UNRESOLVED
+ * config is embedded verbatim (no secret value ever lands in the artifact)
+ * and `resolveMcpServerConfig` materialises it from the running process's
+ * environment at boot, failing fast with the variable's name when a
+ * referenced env var is unset (mirror: target-cli renders the same call).
+ *
+ * When servers are declared but NO step declares tools there is nothing to
+ * expose them to, so the bundle skips the boot entirely and surfaces a
+ * generated note instead (0.2.3 convention: users notice rather than
+ * wondering why their MCP tools never showed up).
+ */
+function renderMcpServers(ir: IrWorkflowV0): {
+  imports: string[];
+  bootBlock: string;
+  note: string;
+  wired: boolean;
+} {
+  const entries = Object.entries(ir.mcp_servers);
+  if (entries.length === 0) {
+    return { imports: [], bootBlock: "", note: "", wired: false };
+  }
+  const anyStepHasTools = ir.steps.some((s) => s.tools.length > 0);
+  if (!anyStepHasTools) {
+    return {
+      imports: [],
+      bootBlock: "",
+      note: "// note: mcp_servers configured but no step declares tools — servers are not booted (declare tools on a step to expose MCP tools to it)\n",
+      wired: false,
+    };
+  }
+  const imports = [
+    `import { McpHost, resolveMcpServerConfig } from "@crewhaus/mcp-host";`,
+    `import { ToolCatalog } from "@crewhaus/tool-catalog";`,
+    `import { registerMcpServer } from "@crewhaus/tool-mcp";`,
+  ];
+  const addLines = entries
+    .map(
+      ([name, cfg]) =>
+        `  __mcpHost.addServer(${escapeJsonString(name)}, resolveMcpServerConfig(${JSON.stringify(cfg)}, { name: ${escapeJsonString(name)} }));`,
+    )
+    .join("\n");
+  const registerLines = entries
+    .map(
+      ([name]) =>
+        `    registerMcpServer(__mcpHost, ${escapeJsonString(name)}, __mcpCatalog, { onRegister: ({ fullName }) => process.stdout.write(\`[mcp] registered \${fullName}\\n\`) }),`,
+    )
+    .join("\n");
+  const bootBlock = [
+    "",
+    "  // G05 — wire-once MCP host shared across steps (eval-runner pattern):",
+    "  // servers boot once, their tools land in one catalog, and steps that",
+    "  // declare tools receive them alongside their built-ins.",
+    "  const __mcpHost = new McpHost();",
+    addLines,
+    "  const __mcpCatalog = new ToolCatalog();",
+    "  await Promise.all([",
+    registerLines,
+    "  ]);",
+    "  const __mcpTools = __mcpCatalog.list();",
+  ].join("\n");
+  return { imports, bootBlock, note: "", wired: true };
 }
 
 function renderPermissionsFields(ir: IrWorkflowV0): string {
@@ -193,6 +430,14 @@ function renderPermissionsFields(ir: IrWorkflowV0): string {
   return `\n${lines.join("\n")}`;
 }
 
+/** Indent every non-empty line by one extra level (the MCP try wrapper). */
+function indentStepBodies(stepBodies: string): string {
+  return stepBodies
+    .split("\n")
+    .map((line) => (line.length > 0 ? `  ${line}` : line))
+    .join("\n");
+}
+
 function renderAgent(ir: IrWorkflowV0): string {
   const importLines = resolveAllTools(ir.steps);
   const importBlock = importLines.length > 0 ? `${importLines.join("\n")}\n` : "";
@@ -202,16 +447,25 @@ function renderAgent(ir: IrWorkflowV0): string {
     : "";
   const permFields = renderPermissionsFields(ir);
   const failureTaxonomyField = renderFailureTaxonomyField(ir);
-  const stepBodies = ir.steps
-    .map((s, i) => renderStep(s, i, ir.steps.length, permFields, failureTaxonomyField))
-    .join("");
-  // Section 9: workflow target ignores mcp_servers in v0. Surface it as a
-  // generated comment so users notice rather than wondering why their MCP
-  // tools never showed up.
-  const mcpWarning =
-    Object.keys(ir.mcp_servers).length > 0
-      ? "// note: mcp_servers configured but target-workflow does not yet wire them up — they are ignored\n"
-      : "";
+  const limitsFields = renderLimitsFields(ir);
+  const budgetField = renderBudgetField(ir);
+  // G05 — mcp_servers are WIRED now (wire-once host + per-step tool spread);
+  // the pre-0.4 ignored-note remains only for the declared-but-unconsumable
+  // corner (no step declares tools).
+  const mcp = renderMcpServers(ir);
+  const specHooksBoot = renderSpecHooksBoot(ir);
+  const hasSpecHooks = specHooksBoot !== "";
+  const deadlineMs = ir.limits?.deadlineMs;
+  const shared: StepShared = {
+    permFields,
+    failureTaxonomyField,
+    limitsFields,
+    budgetField,
+    hooksExpr: hasSpecHooks ? "__allHooks" : "__hooks",
+    deadlineMs,
+    mcpWired: mcp.wired,
+  };
+  const stepBodies = ir.steps.map((s, i) => renderStep(s, i, ir.steps.length, shared)).join("");
   // v0.3.0 — continuity is spec-carried on this shape but not emit-wired in
   // 0.3.0 (only the five agent-loop shapes are). Surface it, 0.2.3-style.
   const continuityWarning =
@@ -222,17 +476,44 @@ function renderAgent(ir: IrWorkflowV0): string {
   // Section 11 — share hooks/skills/slash-commands across all steps. The
   // discovery happens once at the top of `main` and each step's
   // runChatLoop call reuses the same arrays/maps. Skill tool is appended
-  // to a step's local tool list when skills are present.
-  const extensionImports = `import { loadHooks } from "@crewhaus/hooks-engine";
+  // to a step's local tool list when skills are present. Loop contract 0.4
+  // additionally imports hooks-engine's HookDef type when the spec
+  // declares its own hooks (the typed `__specHooks` const).
+  const extensionImports = `import { ${hasSpecHooks ? "type HookDef, " : ""}loadHooks } from "@crewhaus/hooks-engine";
 import { discoverSkills, createSkillTool } from "@crewhaus/skills-registry";
 import { loadCommands } from "@crewhaus/slash-commands";
 `;
+  const mcpImportBlock = mcp.imports.length > 0 ? `${mcp.imports.join("\n")}\n` : "";
+
+  // limits.deadline_ms — stamped at the very TOP of main(), before the
+  // extension discovery and the MCP boot, so the ceiling covers the whole
+  // run (boot time included); every step body opens with the guard (see
+  // renderDeadlineGuard).
+  const deadlineBoot =
+    deadlineMs !== undefined
+      ? [
+          "",
+          "  // limits.deadline_ms — wall-clock ceiling for the WHOLE workflow run",
+          "  // (boot included), guarded before every step (turn_timeout_ms bounds",
+          "  // one step's turn from inside runChatLoop).",
+          `  const __deadlineAt = Date.now() + ${deadlineMs};`,
+        ].join("\n")
+      : "";
+
+  // G05 — with MCP wired, the step sequence runs inside try/finally so the
+  // stdio servers disconnect on success, failure, or a deadline stop.
+  const stepsSection = mcp.wired
+    ? `  try {${indentStepBodies(stepBodies)}  } finally {
+    await __mcpHost.disconnectAll();
+  }
+`
+    : stepBodies;
 
   return `#!/usr/bin/env bun
 // Generated by crewhaus. DO NOT EDIT.
 // Source spec: ${escapeJsonString(ir.name)} (target: workflow, ir version: ${ir.version}, ${ir.steps.length} step(s))
-${mcpWarning}${continuityWarning}import { runChatLoop } from "@crewhaus/runtime-core";
-${permImport}${extensionImports}${importBlock}
+${mcp.note}${continuityWarning}import { runChatLoop } from "@crewhaus/runtime-core";
+${permImport}${extensionImports}${importBlock}${mcpImportBlock}
 async function readStdinToEnd(): Promise<string> {
   // No piped input — don't block waiting on an interactive TTY.
   if (process.stdin.isTTY) return "";
@@ -244,7 +525,7 @@ async function readStdinToEnd(): Promise<string> {
 }
 
 async function main(): Promise<void> {
-  let priorOutput = "";
+  let priorOutput = "";${deadlineBoot}
   const __cwd = process.cwd();
   const [__hooks, __skills, __slashCommands] = await Promise.all([
     loadHooks({ cwd: __cwd }),
@@ -252,8 +533,8 @@ async function main(): Promise<void> {
     loadCommands({ cwd: __cwd }),
   ]);
   const __skillTool = __skills.length > 0 ? createSkillTool(__skills) : null;
-  void __skillTool;
-${stepBodies}}
+  void __skillTool;${specHooksBoot}${mcp.bootBlock}
+${stepsSection}}
 
 await main();
 `;

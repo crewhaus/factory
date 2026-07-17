@@ -35,6 +35,15 @@
  *   deadToolElimination → redundantMcpServerCollapse →
  *   permissionRuleCanonicalize → transactionPolicyEnforcement →
  *   wellFormednessCheck → memoryIntegrityPass → promptCachePrefixSort
+ *
+ * G45 (loop contract 0.4) — the passes split into two families:
+ *   - VALIDATING (transactionPolicyEnforcement, wellFormednessCheck,
+ *     memoryIntegrityPass): pure pass-throughs that throw `IrPassError` on
+ *     a violation. Exported as `VALIDATING_PASSES`; the compiler runs them
+ *     UNCONDITIONALLY inside `compile()` (they cannot drift bundle bytes).
+ *   - REWRITING (deadToolElimination, redundantMcpServerCollapse,
+ *     permissionRuleCanonicalize, promptCachePrefixSort): structural
+ *     optimizations that stay behind `compile({ applyIrPasses: true })`.
  */
 import { CrewhausError } from "@crewhaus/errors";
 import type {
@@ -409,6 +418,14 @@ export function wellFormednessCheck(ir: IrNode): IrNode {
       if (!nodeNames.has(e.to)) {
         throw new IrPassError(`graph edge to "${e.to}" references an undeclared node`);
       }
+      // Loop contract 0.4 (Batch A) — `when.key` reads a node's recorded
+      // output from the shared state, so it must name a declared node
+      // (mirror of the parseSpec cross-check for direct-IR builders).
+      if (e.when !== undefined && !nodeNames.has(e.when.key)) {
+        throw new IrPassError(
+          `graph edge ${e.from}→${e.to} when.key "${e.when.key}" references an undeclared node`,
+        );
+      }
       if (e.schema !== undefined && e.schema.kind === "named") {
         if (!schemaNames.has(e.schema.name)) {
           throw new IrPassError(
@@ -417,7 +434,27 @@ export function wellFormednessCheck(ir: IrNode): IrNode {
         }
       }
     }
-    // Reachability from entry.
+    // Loop contract 0.4 (Batch A) — parallel groups: >= 2 members (the
+    // graph-engine's addParallel rejects smaller groups at build time —
+    // fail at compile instead), every member a declared node.
+    const parallelGroups = g.parallel ?? [];
+    for (const group of parallelGroups) {
+      if (group.length < 2) {
+        throw new IrPassError(
+          `graph parallel group [${group.join(", ")}] needs at least 2 nodes (addParallel rejects smaller groups)`,
+        );
+      }
+      for (const member of group) {
+        if (!nodeNames.has(member)) {
+          throw new IrPassError(`graph parallel group references undeclared node "${member}"`);
+        }
+      }
+    }
+    // Reachability from entry. Two propagation rules, run to fixpoint:
+    //   - an edge from a reachable node reaches its `to`;
+    //   - a parallel group whose FIRST member is reachable runs ALL its
+    //     members (the engine triggers the barrier when the cursor lands on
+    //     group[0] and continues from the LAST member's outgoing edge).
     const reachable = new Set<string>([g.entry]);
     let added = true;
     while (added) {
@@ -426,6 +463,17 @@ export function wellFormednessCheck(ir: IrNode): IrNode {
         if (reachable.has(e.from) && !reachable.has(e.to)) {
           reachable.add(e.to);
           added = true;
+        }
+      }
+      for (const group of parallelGroups) {
+        const head = group[0];
+        if (head !== undefined && reachable.has(head)) {
+          for (const member of group) {
+            if (!reachable.has(member)) {
+              reachable.add(member);
+              added = true;
+            }
+          }
         }
       }
     }
@@ -483,11 +531,12 @@ export function wellFormednessCheck(ir: IrNode): IrNode {
  *     bundles via `memoryFragmentFromIr` — a Date/function/undefined/cycle
  *     smuggled in by a direct-IR builder would silently corrupt the bundle)
  *
- * NOTE the passes are OPT-IN and skipped on the plain compile path (only
- * `crewhaus lint` runs them) — the LOAD-BEARING copies of these rules live
- * in the compiler's `lowerMemory`/`lowerContinuity` (and the spec zod
- * bounds). This pass exists so `applyPasses(ir)` is a complete audit for
- * IR built outside `parseSpec → lower`.
+ * NOTE (G45, loop contract 0.4): this pass is one of the VALIDATING passes
+ * the compiler now runs UNCONDITIONALLY inside `compile()` — for specs the
+ * rules here fire only if something slipped past the compiler's own
+ * `lowerMemory`/`lowerContinuity` checks (and the spec zod bounds), which
+ * remain the first line. The pass is still the complete audit for IR built
+ * outside `parseSpec → lower` (direct-IR builders via `applyPasses(ir)`).
  */
 type CarriesMemoryFabric = {
   readonly memory?: IrMemory;
@@ -602,12 +651,25 @@ export function memoryIntegrityPass(ir: IrNode): IrNode {
   return ir;
 }
 
+/**
+ * G45 (loop contract 0.4) — the VALIDATING passes: pure pass-throughs that
+ * throw `IrPassError` on a violation and never rewrite the IR. The compiler
+ * runs these UNCONDITIONALLY inside `compile()` (between `lower()` and the
+ * opt-in rewriting pipeline); they are also part of `DEFAULT_PIPELINE`, in
+ * the same relative order, so `applyPasses(ir)` stays a complete standalone
+ * audit. Order matters: chain referential integrity → graph/crew
+ * well-formedness → memory/continuity integrity.
+ */
+export const VALIDATING_PASSES: ReadonlyArray<IrPass> = Object.freeze([
+  transactionPolicyEnforcement,
+  wellFormednessCheck,
+  memoryIntegrityPass,
+]);
+
 export const DEFAULT_PIPELINE: ReadonlyArray<IrPass> = Object.freeze([
   deadToolElimination,
   redundantMcpServerCollapse,
   permissionRuleCanonicalize,
-  transactionPolicyEnforcement,
-  wellFormednessCheck,
-  memoryIntegrityPass,
+  ...VALIDATING_PASSES,
   promptCachePrefixSort,
 ]);

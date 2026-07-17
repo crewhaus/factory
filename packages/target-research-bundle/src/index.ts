@@ -169,6 +169,118 @@ function taxonomyField(ir: IrResearchV0, indent: string): string {
   return `\n${indent}failureTaxonomy: ${JSON.stringify(taxonomy)},`;
 }
 
+/**
+ * Item 27 (Batch A extends it to this shape) — render the `budget`
+ * runChatLoop field. Empty when the spec omits it. Mirror: target-cli +
+ * target-channel-bot + target-managed render the same field. NOTE: the
+ * runtime meters cost per `runChatLoop` call, so on this shape the cap is a
+ * PER-BRANCH ceiling (each branch runs its own single-turn loop), not a
+ * whole-run one — `maxDurationMs` remains the run-level budget.
+ */
+function budgetField(ir: IrResearchV0, indent: string): string {
+  if (ir.budget === undefined) return "";
+  return `\n${indent}budget: ${JSON.stringify(ir.budget)},`;
+}
+
+/**
+ * Loop contract 0.4 (Batch A) — thread the top-level `limits:` ceilings into
+ * each branch's `runChatLoop` call as the runtime's individual top-level
+ * knobs, camelCase-mirroring the IR 1:1. Every knob is emitted only when
+ * declared — the runtime owns every default — so existing bundles stay
+ * byte-identical. Like `budget`, the time knobs (`deadlineMs` /
+ * `turnTimeoutMs`) bound ONE branch's loop; the run-level wall clock stays
+ * `maxDurationMs`. `limits.crew` never reaches this shape (crew-only; the
+ * spec rejects it everywhere else). Mirror: target-cli + target-channel-bot
+ * + target-managed render the same fields.
+ */
+function limitsFields(ir: IrResearchV0, indent: string): string {
+  const limits = ir.limits;
+  if (limits === undefined) return "";
+  const pieces: string[] = [];
+  if (limits.maxToolIterations !== undefined) {
+    pieces.push(`\n${indent}maxToolIterations: ${limits.maxToolIterations},`);
+  }
+  if (limits.maxConcurrentTools !== undefined) {
+    pieces.push(`\n${indent}maxConcurrentTools: ${limits.maxConcurrentTools},`);
+  }
+  if (limits.contextLimit !== undefined) {
+    pieces.push(`\n${indent}contextLimit: ${limits.contextLimit},`);
+  }
+  if (limits.deadlineMs !== undefined) {
+    pieces.push(`\n${indent}deadlineMs: ${limits.deadlineMs},`);
+  }
+  if (limits.turnTimeoutMs !== undefined) {
+    pieces.push(`\n${indent}turnTimeoutMs: ${limits.turnTimeoutMs},`);
+  }
+  if (limits.modelCallTimeoutMs !== undefined) {
+    pieces.push(`\n${indent}modelCallTimeoutMs: ${limits.modelCallTimeoutMs},`);
+  }
+  if (limits.loopDetection !== undefined) {
+    pieces.push(`\n${indent}loopDetection: ${JSON.stringify(limits.loopDetection)},`);
+  }
+  return pieces.join("");
+}
+
+/**
+ * Section 9 / G05 (Batch A) — emit the `McpHost` boot block when the IR
+ * carries mcp_servers. Wire-once: the host boots at module load and
+ * registers every server's namespaced tools onto the shared
+ * `defaultCatalog`, so EVERY research branch carries them (each branch's
+ * `defaultCatalog.list()` sees the same registrations — no per-branch
+ * reconnect). Mirror of target-channel-bot's renderMcpServers (keep in
+ * sync); no thredz special-case here — thredz stays carried-but-ignored on
+ * this shape in 0.3.0/0.4 (the emitter prints the ignored-note comment).
+ *
+ * 0.3.0 — env/header values are `IrSecretRef` objects; the UNRESOLVED
+ * config is embedded verbatim (so no secret value ever lands in the
+ * artifact) and `resolveMcpServerConfig` materialises it from the running
+ * process's environment at boot, failing fast with the variable's name
+ * when a referenced env var is unset.
+ *
+ * Empty `mcp_servers` returns empty strings so spec files without MCP get
+ * no MCP plumbing at all and prior bundles stay byte-identical.
+ */
+function renderMcpServers(ir: IrResearchV0): {
+  imports: string[];
+  bootBlock: string;
+  cleanupBlock: string;
+  hasAny: boolean;
+} {
+  const entries = Object.entries(ir.mcp_servers);
+  if (entries.length === 0) {
+    return { imports: [], bootBlock: "", cleanupBlock: "", hasAny: false };
+  }
+  const imports = [
+    `import { McpHost, resolveMcpServerConfig } from "@crewhaus/mcp-host";`,
+    `import { registerMcpServer } from "@crewhaus/tool-mcp";`,
+  ];
+  const addLines = entries
+    .map(
+      ([name, cfg]) =>
+        `mcpHost.addServer(${escapeJsonString(name)}, resolveMcpServerConfig(${JSON.stringify(cfg)}, { name: ${escapeJsonString(name)} }));`,
+    )
+    .join("\n");
+  const registerLines = entries
+    .map(
+      ([name]) =>
+        `  registerMcpServer(mcpHost, ${escapeJsonString(name)}, defaultCatalog, { onRegister: ({ fullName }) => process.stdout.write(\`[mcp] registered \${fullName}\\n\`) }),`,
+    )
+    .join("\n");
+  const bootBlock = [
+    "const mcpHost = new McpHost();",
+    addLines,
+    "await Promise.all([",
+    registerLines,
+    "]);",
+  ].join("\n");
+  return {
+    imports,
+    bootBlock,
+    cleanupBlock: "await mcpHost.disconnectAll();",
+    hasAny: true,
+  };
+}
+
 export function emitResearchBundle(ir: IrResearchV0, opts: EmitReadmeOptions = {}): Bundle {
   const files = [{ path: "agent.ts", content: renderAgent(ir) }];
   // Item 42 — generated bundle README; default ON (`crewhaus compile
@@ -213,6 +325,33 @@ function renderAgent(ir: IrResearchV0): string {
       ? `\n// Spec-supplied tools registered at module load.\n${registrations.join("\n")}\n`
       : "";
   const permField = renderPermissionsField(ir);
+  const mcp = renderMcpServers(ir);
+  const mcpImportBlock = mcp.imports.length > 0 ? `${mcp.imports.join("\n")}\n` : "";
+  const mcpBootBlock = mcp.hasAny
+    ? `
+// G05 — MCP servers, wired ONCE onto the shared defaultCatalog at module
+// load so every research branch carries the namespaced tools.
+${mcp.bootBlock}
+`
+    : "";
+  const mcpMainCleanup = mcp.hasAny ? `\n  ${mcp.cleanupBlock}` : "";
+  const mcpFatalCleanup = mcp.hasAny
+    ? "\n  // MCP child transports must not outlive the failed run.\n  await mcpHost.disconnectAll().catch(() => {});"
+    : "";
+  // Loop contract 0.4 (Batch A) — spec-declared lifecycle hooks (`hooks:`).
+  // IrHook is HookDef-shaped by contract (the spec ↔ hooks-engine
+  // cross-check test pins the event vocabulary), so the literal threads
+  // straight into each branch's runChatLoop. Declaration order from the
+  // spec is preserved (hooks run in registration order). Absent/empty
+  // emits nothing so existing bundles stay byte-identical.
+  const specHooks = ir.hooks !== undefined && ir.hooks.length > 0 ? ir.hooks : undefined;
+  const hooksImport =
+    specHooks !== undefined ? `import type { HookDef } from "@crewhaus/hooks-engine";\n` : "";
+  const hooksConst =
+    specHooks !== undefined
+      ? `\n// Loop contract 0.4 — spec-declared lifecycle hooks (registration order preserved).\nconst SPEC_HOOKS: ReadonlyArray<HookDef> = ${JSON.stringify(specHooks)};`
+      : "";
+  const hooksField = specHooks !== undefined ? "\n    hooks: SPEC_HOOKS," : "";
   const fabric = memoryFabric(ir);
   const memImportBlock = fabric.wired
     ? `import { wireMemory } from "@crewhaus/memory-service";
@@ -255,8 +394,8 @@ import { runChatLoop } from "@crewhaus/runtime-core";
 import { createRunContext } from "@crewhaus/run-context";
 import { BUILTIN_DEFAULT_RULES } from "@crewhaus/permission-engine";
 import { defaultCatalog } from "@crewhaus/tool-catalog";
-${memImportBlock}${importBlock}
-${initLines}${registrationBlock}${memBootBlock}
+${hooksImport}${memImportBlock}${mcpImportBlock}${importBlock}
+${initLines}${registrationBlock}${memBootBlock}${mcpBootBlock}
 type ResearchState = {
   readonly version: 1;
   readonly runId: string;
@@ -271,7 +410,7 @@ const SPEC_GOAL = ${escapeJsonString(ir.goal)};
 const SPEC_BRANCHING = ${ir.branchingFactor};
 const SPEC_MAX_DURATION_MS = ${ir.maxDurationMs};
 const SPEC_MODEL = ${escapeJsonString(ir.agent.model)};
-const SPEC_INSTRUCTIONS = ${escapeJsonString(ir.agent.instructions)};
+const SPEC_INSTRUCTIONS = ${escapeJsonString(ir.agent.instructions)};${hooksConst}
 const ALLOWED_ORIGINS = ${JSON.stringify(ir.retrieve.allowedOrigins)};
 const ALLOWED_FILE_ROOTS = ${JSON.stringify(ir.retrieve.allowedFileRoots)};
 const RESEARCH_ROOT = ".crewhaus/research";
@@ -388,7 +527,7 @@ async function runOneBranch(args: {
     seedMessages: [{ role: "user", content: seedContent }],
     tools,
     installSigintHandler: false,
-    maxTokens: 4096,${permField}${memRunFields}
+    maxTokens: ${ir.agent.maxTokens ?? 4096},${budgetField(ir, "    ")}${limitsFields(ir, "    ")}${hooksField}${permField}${memRunFields}
   });
 
   // Citations recorded for this branch are append-only, so:
@@ -502,15 +641,15 @@ async function main(): Promise<void> {
   const reportDir = join(RESEARCH_ROOT, runId);
   writeFileSync(join(reportDir, "report.md"), report.markdown, { mode: 0o600 });
   writeFileSync(join(reportDir, "report.json"), JSON.stringify(report.json, null, 2), { mode: 0o600 });
-  emit({ kind: "run_done", runId, reportPath: join(reportDir, "report.md"), citations: report.json.citations.length });
+  emit({ kind: "run_done", runId, reportPath: join(reportDir, "report.md"), citations: report.json.citations.length });${mcpMainCleanup}
 }
 
-main().catch((err) => {
+main().catch(${mcp.hasAny ? "async " : ""}(err) => {
   // v0.3.0 Goal 6 — render the one structured failure report (classified
   // for a RunFailedError, generic otherwise) and exit with its coded
   // status instead of the bare "[research] fatal:" line + exit 1.
   const __report = toFailureReport(err);
-  process.stderr.write(\`\${formatRunFailure(__report, { prefix: "[research]" })}\\n\`);
+  process.stderr.write(\`\${formatRunFailure(__report, { prefix: "[research]" })}\\n\`);${mcpFatalCleanup}
   process.exit(__report.exitCode);
 });
 `;

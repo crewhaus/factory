@@ -38,8 +38,9 @@ import {
   type GraphRunId,
   newGraphRunId,
 } from "@crewhaus/checkpoint-store";
-import { CrewhausError } from "@crewhaus/errors";
+import { CrewhausError, EXIT_CODES, type FailureReport, RunFailedError } from "@crewhaus/errors";
 import type { RunContext } from "@crewhaus/run-context";
+import type { RunFailedEvent, TraceEventBus } from "@crewhaus/trace-event-bus";
 
 export type NodeName = string;
 
@@ -77,6 +78,28 @@ type EdgeSpec<S> = {
   readonly from: NodeName;
   readonly to: NodeName;
   readonly condition?: EdgeCondition<S>;
+};
+
+/**
+ * Loop contract 0.4 (Batch A, G69) — reducer owning one parallel group's
+ * merge. Receives the pre-group state and every member's result, tagged
+ * with the producing node's name, in group declaration order. When a group
+ * configures a reducer, the engine skips its default last-writer-wins
+ * `Object.assign` merge AND the key-collision check — the reducer owns the
+ * merge semantics entirely (sync or async, matching `EdgeCondition`).
+ */
+export type ParallelMergeReducer<S> = (
+  prev: S,
+  results: ReadonlyArray<{ readonly node: NodeName; readonly state: S }>,
+) => S | Promise<S>;
+
+export type AddParallelOptions<S> = {
+  readonly reducer?: ParallelMergeReducer<S>;
+};
+
+type ParallelGroupSpec<S> = {
+  readonly names: ReadonlyArray<NodeName>;
+  readonly reducer?: ParallelMergeReducer<S>;
 };
 
 export class HitlPauseSignal extends Error {
@@ -214,8 +237,20 @@ export interface GraphBuilder<Input, State> {
    * Add a parallel barrier: every node in `names` executes concurrently,
    * the engine waits for all to complete, and the next edge is taken
    * from the LAST of `names` (the synthetic merge sink).
+   *
+   * Merge semantics (G69): without `opts.reducer` the engine merges the
+   * branch results via last-writer-wins `Object.assign` — but FIRST checks
+   * that no two branches modified the same state key (relative to the
+   * pre-group state); a collision fails the run with a classified
+   * `RunFailedError` (`FailureReport` class `"config"`) after publishing a
+   * `run_failed` trace event. Configure `opts.reducer` to own the merge
+   * (and skip the collision check) when branches intentionally write
+   * overlapping keys.
    */
-  addParallel(names: ReadonlyArray<NodeName>): GraphBuilder<Input, State>;
+  addParallel(
+    names: ReadonlyArray<NodeName>,
+    opts?: AddParallelOptions<State>,
+  ): GraphBuilder<Input, State>;
   setEntry(name: NodeName): GraphBuilder<Input, State>;
   /**
    * Convert the input shape into the initial state. Default: cast
@@ -235,7 +270,7 @@ export function createGraph<Input = unknown, State = Input>(
 ): GraphBuilder<Input, State> {
   const nodes = new Map<NodeName, NodeFn<State>>();
   const edges: EdgeSpec<State>[] = [];
-  const parallelGroups: ReadonlyArray<NodeName>[] = [];
+  const parallelGroups: ParallelGroupSpec<State>[] = [];
   let entry: NodeName | undefined;
   let inputAdapter: (input: Input) => State = (input) => input as unknown as State;
 
@@ -252,11 +287,14 @@ export function createGraph<Input = unknown, State = Input>(
       edges.push({ from, to, ...(condition !== undefined ? { condition } : {}) });
       return builder;
     },
-    addParallel(names) {
+    addParallel(names, opts) {
       if (names.length < 2) {
         throw new GraphBuildError("addParallel requires at least 2 nodes");
       }
-      parallelGroups.push(names);
+      parallelGroups.push({
+        names,
+        ...(opts?.reducer !== undefined ? { reducer: opts.reducer } : {}),
+      });
       return builder;
     },
     setEntry(name) {
@@ -284,7 +322,7 @@ export function createGraph<Input = unknown, State = Input>(
         }
       }
       for (const group of parallelGroups) {
-        for (const n of group) {
+        for (const n of group.names) {
           if (!nodes.has(n)) {
             throw new GraphBuildError(`parallel group references unknown node "${n}"`);
           }
@@ -307,7 +345,7 @@ export function createGraph<Input = unknown, State = Input>(
 type CompiledOptions<Input, State> = {
   readonly nodes: Map<NodeName, NodeFn<State>>;
   readonly edges: ReadonlyArray<EdgeSpec<State>>;
-  readonly parallelGroups: ReadonlyArray<ReadonlyArray<NodeName>>;
+  readonly parallelGroups: ReadonlyArray<ParallelGroupSpec<State>>;
   readonly entry: NodeName;
   readonly inputAdapter: (input: Input) => State;
   readonly checkpointStore?: CheckpointStore;
@@ -391,17 +429,18 @@ class CompiledGraph<Input, State> implements RunnableGraph<Input, State> {
       // Detect parallel groups: if `nodeName` is the first member of a group,
       // run the whole group in parallel; the cursor advances to the LAST
       // member's outgoing edge.
-      const parallelGroup = this.o.parallelGroups.find((g) => g[0] === nodeName);
+      const parallelGroup = this.o.parallelGroups.find((g) => g.names[0] === nodeName);
       if (parallelGroup !== undefined) {
+        const groupNames = parallelGroup.names;
         turn += 1;
         yield {
           kind: "node_start",
           graphRunId,
-          nodeName: `[parallel: ${parallelGroup.join(",")}]`,
+          nodeName: `[parallel: ${groupNames.join(",")}]`,
           turn,
         };
         const t0 = performance.now();
-        const groupCtxs = parallelGroup.map((n) =>
+        const groupCtxs = groupNames.map((n) =>
           this.makeNodeContext({
             runContext,
             graphRunId,
@@ -409,7 +448,7 @@ class CompiledGraph<Input, State> implements RunnableGraph<Input, State> {
             approval: approvals[n],
           }),
         );
-        const groupFns = parallelGroup.map((n) => {
+        const groupFns = groupNames.map((n) => {
           const f = this.o.nodes.get(n);
           if (f === undefined) {
             throw new GraphRunError(`parallel group references missing node "${n}"`);
@@ -425,27 +464,39 @@ class CompiledGraph<Input, State> implements RunnableGraph<Input, State> {
             return f(ctx, state);
           }),
         );
-        // Merge: last writer wins. Callers wanting structured merge should
-        // wrap their results in a non-conflicting shape and reduce them.
-        // Mutate `acc` in place to avoid quadratic spread cost on large groups.
-        const acc: Record<string, unknown> = { ...(state as unknown as object) };
-        for (const r of results) {
-          Object.assign(acc, r as object);
+        if (parallelGroup.reducer !== undefined) {
+          // A configured reducer owns the merge (G69): it sees every
+          // branch's result in declaration order and decides the semantics
+          // — overlapping keys are its business, so no collision check.
+          state = await parallelGroup.reducer(
+            state,
+            results.map((r, i) => ({ node: groupNames[i] as string, state: r })),
+          );
+        } else {
+          // Default merge: last writer wins — but a key MODIFIED by two or
+          // more branches would silently drop sibling writes, so G69 fails
+          // the run first (classified error + `run_failed` trace event).
+          this.failOnParallelMergeCollision(groupNames, state, results, runContext);
+          // Mutate `acc` in place to avoid quadratic spread cost on large groups.
+          const acc: Record<string, unknown> = { ...(state as unknown as object) };
+          for (const r of results) {
+            Object.assign(acc, r as object);
+          }
+          state = acc as unknown as State;
         }
-        state = acc as unknown as State;
         yield {
           kind: "node_end",
           graphRunId,
-          nodeName: `[parallel: ${parallelGroup.join(",")}]`,
+          nodeName: `[parallel: ${groupNames.join(",")}]`,
           turn,
           state,
           durationMs: performance.now() - t0,
         };
         // Advance cursor from the LAST node in the group.
-        cursor = await this.resolveNext(parallelGroup[parallelGroup.length - 1] as string, state, {
+        cursor = await this.resolveNext(groupNames[groupNames.length - 1] as string, state, {
           runContext,
           graphRunId,
-          nodeName: parallelGroup[parallelGroup.length - 1] as string,
+          nodeName: groupNames[groupNames.length - 1] as string,
         });
         continue;
       }
@@ -538,6 +589,78 @@ class CompiledGraph<Input, State> implements RunnableGraph<Input, State> {
       if (await edge.condition(state, ctx)) return edge.to;
     }
     return undefined;
+  }
+
+  /**
+   * G69 — default-merge safety net. A state key "collides" when two or more
+   * group members MODIFIED it relative to the pre-group state: the key is
+   * absent from `prev`, or the member's value differs (`Object.is`, so NaN
+   * compares sanely). Branches that merely echo untouched upstream keys —
+   * the codegen's `{ ...prev, [name]: reply }` pattern — never collide, and
+   * two branches writing the SAME new value still do (the last-writer merge
+   * would be lossy either way, e.g. both branches incrementing a counter).
+   *
+   * On collision the run fails with a CLASSIFIED error — a `RunFailedError`
+   * whose `FailureReport` is class `"config"` / exit `EXIT_CODES.config` —
+   * and a `run_failed` trace event is published immediately before the
+   * throw, mirroring runtime-core's terminal-failure convention. No-op when
+   * every modified key has exactly one writer.
+   */
+  private failOnParallelMergeCollision(
+    groupNames: ReadonlyArray<NodeName>,
+    prev: State,
+    results: ReadonlyArray<State>,
+    runContext: RunContext,
+  ): void {
+    const prevRec =
+      typeof prev === "object" && prev !== null ? (prev as Record<string, unknown>) : undefined;
+    const writersByKey = new Map<string, NodeName[]>();
+    for (let i = 0; i < results.length; i += 1) {
+      const result = results[i];
+      // Non-object results contribute no keys to Object.assign, so they
+      // cannot collide (mirrors the default merge's semantics exactly).
+      if (typeof result !== "object" || result === null) continue;
+      const node = groupNames[i] ?? `#${i}`;
+      for (const [key, value] of Object.entries(result as Record<string, unknown>)) {
+        const modified =
+          prevRec === undefined || !(key in prevRec) || !Object.is(prevRec[key], value);
+        if (!modified) continue;
+        const writers = writersByKey.get(key);
+        if (writers === undefined) {
+          writersByKey.set(key, [node]);
+        } else {
+          writers.push(node);
+        }
+      }
+    }
+    const collisions = [...writersByKey.entries()].filter(([, writers]) => writers.length >= 2);
+    if (collisions.length === 0) return;
+    const detail = collisions
+      .map(([key, writers]) => `state key "${key}" written by ${writers.join(", ")}`)
+      .join("; ");
+    const report: FailureReport = {
+      class: "config",
+      title: "parallel merge key collision",
+      detail: `parallel group [${groupNames.join(", ")}] produced conflicting writes — ${detail}`,
+      remediation:
+        "make each branch write distinct state keys, or configure a per-group reducer: addParallel(names, { reducer })",
+      exitCode: EXIT_CODES.config,
+    };
+    // Defensive `undefined` check: `RunContext.eventBus` is typed required,
+    // but a partial injected context (tests, embedders) must surface the
+    // classified error below, not a TypeError from the trace publish.
+    const bus: TraceEventBus | undefined = runContext.eventBus;
+    if (bus !== undefined) {
+      bus.publish({
+        ...bus.envelope(),
+        kind: "run_failed",
+        class: report.class,
+        message: `${report.title}: ${report.detail}`,
+        ...(report.remediation !== undefined ? { remediation: report.remediation } : {}),
+        exitCode: report.exitCode,
+      } satisfies RunFailedEvent);
+    }
+    throw new RunFailedError(report);
   }
 
   private makeNodeContext(parts: {

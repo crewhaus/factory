@@ -362,6 +362,69 @@ describe("crewhaus compile", () => {
     expect(existsSync(join(outDir, "agent.ts"))).toBe(true);
     expect(result.stderr).not.toContain("[strict]");
   });
+
+  // Loop contract 0.4 (Batch A) — compile warnings (accepted-but-unwired
+  // spec keys) always print, one line per warning, code + path + message;
+  // `--strict` escalates them to a failed build that emits nothing. A
+  // workflow spec declaring `continuity:` is the canonical warning case
+  // (its emitter prints the ignored-note comment instead of wiring it).
+  const WARNING_SPEC =
+    "name: warnful\ntarget: workflow\nmodel: claude-sonnet-4-6\nsteps:\n  - name: step1\n    instructions: do the thing\ncontinuity: true\n";
+
+  test("compile prints accepted-but-unwired warnings (code+path+message, one per line) and still emits", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    writeFileSync(specPath, WARNING_SPEC);
+    const outDir = join(tmp, "out");
+    const result = await runCli(["compile", specPath, "--no-register", "-o", outDir], {
+      cwd: tmp,
+    });
+    expect(result.exitCode).toBe(0);
+    // One line, carrying the code, the spec path, and the message.
+    expect(result.stderr).toContain("crewhaus: warning[accepted-but-unwired] continuity:");
+    expect(result.stderr).toContain("accepted on the workflow shape");
+    const warningLines = result.stderr.split("\n").filter((l) => l.includes("warning["));
+    expect(warningLines.length).toBe(1);
+    // Warnings do not fail the build without --strict.
+    expect(result.stdout).toContain("compiled bundle");
+    expect(existsSync(join(outDir, "agent.ts"))).toBe(true);
+  });
+
+  test("compile --strict escalates warnings to errors and writes NOTHING", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    writeFileSync(specPath, WARNING_SPEC);
+    const outDir = join(tmp, "out");
+    const result = await runCli(["compile", specPath, "--strict", "--no-register", "-o", outDir], {
+      cwd: tmp,
+    });
+    expect(result.exitCode).toBe(1);
+    // The warning itself still prints (with its path), then the escalation.
+    expect(result.stderr).toContain("crewhaus: warning[accepted-but-unwired] continuity:");
+    expect(result.stderr).toContain("--strict: 1 compile warning(s) escalated to errors");
+    // A strict-failed build must not emit — the out dir is never created.
+    expect(existsSync(outDir)).toBe(false);
+  });
+
+  test("compile --strict passes a warning-free spec (and prints no warning lines)", async () => {
+    const outDir = join(tmp, "out");
+    const result = await runCli(
+      ["compile", HELLO_SPEC, "--strict", "--no-register", "-o", outDir],
+      {
+        cwd: tmp,
+      },
+    );
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).not.toContain("warning[");
+    expect(existsSync(join(outDir, "agent.ts"))).toBe(true);
+  });
+
+  test("compile --help documents the warning line shape and --strict escalation", async () => {
+    const result = await runCli(["compile", "--help"]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("accepted-but-unwired");
+    expect(result.stdout).toContain("warning[<code>] <path>: <message>");
+    expect(result.stdout).toContain("--strict");
+    expect(result.stdout).toContain("Escalate compile warnings to errors");
+  });
 });
 
 describe("crewhaus init", () => {
@@ -594,6 +657,131 @@ describe("crewhaus run", () => {
     const result = await runCli(["run", "--help"]);
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("--justification-judge");
+  });
+
+  // Loop contract 0.4 (Batch A) — --streaming flag / spec agent.streaming,
+  // spec-declared hooks layered below settings.json, and the full
+  // loop-contract spec key set threading through runChatLoop boot.
+  test("run --streaming forces streaming on and prints the diagnostic", async () => {
+    const result = await runCli(["run", HELLO_SPEC, "--streaming"], {
+      env: { ANTHROPIC_API_KEY: "test-no-call" },
+      closeStdinImmediately: true,
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("[streaming] mid-stream tool dispatch enabled");
+    expect(result.stdout).toContain("agent ready");
+  });
+
+  test("spec agent.streaming: true enables streaming without the flag", async () => {
+    writeFileSync(
+      join(tmp, "crewhaus.yaml"),
+      "name: streamy\ntarget: cli\nagent:\n  model: claude-sonnet-4-6\n  instructions: hi\n  streaming: true\n",
+    );
+    const result = await runCli(["run", join(tmp, "crewhaus.yaml")], {
+      cwd: tmp,
+      env: { ANTHROPIC_API_KEY: "test-no-call" },
+      closeStdinImmediately: true,
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("[streaming] mid-stream tool dispatch enabled");
+  });
+
+  test("no flag + no spec streaming → no [streaming] diagnostic (runtime default keeps governing)", async () => {
+    const result = await runCli(["run", HELLO_SPEC], {
+      env: { ANTHROPIC_API_KEY: "test-no-call" },
+      closeStdinImmediately: true,
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).not.toContain("[streaming]");
+  });
+
+  test("spec hooks merge below settings.json hooks — the [hooks] line counts both layers", async () => {
+    writeFileSync(
+      join(tmp, "crewhaus.yaml"),
+      "name: hooked\ntarget: cli\nagent:\n  model: claude-sonnet-4-6\n  instructions: hi\nhooks:\n  - event: stop\n    command: 'true'\n",
+    );
+    mkdirSync(join(tmp, ".crewhaus"), { recursive: true });
+    writeFileSync(
+      join(tmp, ".crewhaus", "settings.json"),
+      '{ "hooks": [ { "event": "stop", "command": "true" } ] }\n',
+    );
+    const result = await runCli(["run", join(tmp, "crewhaus.yaml")], {
+      cwd: tmp,
+      env: { ANTHROPIC_API_KEY: "test-no-call" },
+      closeStdinImmediately: true,
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("[hooks] 2 loaded (1 from spec)");
+  });
+
+  test("spec hooks alone (no settings.json) still load, marked as spec-sourced", async () => {
+    writeFileSync(
+      join(tmp, "crewhaus.yaml"),
+      "name: hooked\ntarget: cli\nagent:\n  model: claude-sonnet-4-6\n  instructions: hi\nhooks:\n  - event: pre-tool\n    matcher: Bash\n    command: 'true'\n    timeout_ms: 3000\n",
+    );
+    const result = await runCli(["run", join(tmp, "crewhaus.yaml")], {
+      cwd: tmp,
+      env: { ANTHROPIC_API_KEY: "test-no-call" },
+      closeStdinImmediately: true,
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("[hooks] 1 loaded (1 from spec)");
+  });
+
+  test("the full loop-contract key set (limits/thinking/rate_limits/compaction tuning) boots cleanly", async () => {
+    writeFileSync(
+      join(tmp, "crewhaus.yaml"),
+      [
+        "name: loopy",
+        "target: cli",
+        "agent:",
+        "  model: claude-sonnet-4-6",
+        "  instructions: be helpful",
+        "  thinking:",
+        "    effort: low",
+        "  rate_limits:",
+        '    "*":',
+        "      rpm: 120",
+        "limits:",
+        "  max_tool_iterations: 25",
+        "  max_concurrent_tools: 2",
+        "  context_limit: 120000",
+        "  deadline_ms: 600000",
+        "  turn_timeout_ms: 120000",
+        "  model_call_timeout_ms: 60000",
+        "  loop_detection:",
+        "    window: 12",
+        "    threshold: 3",
+        "    escalation: warn",
+        "compaction:",
+        "  threshold: 0.8",
+        "  snip_keep_head: 6",
+        "  snip_keep_tail: 30",
+        "",
+      ].join("\n"),
+    );
+    const result = await runCli(["run", join(tmp, "crewhaus.yaml")], {
+      cwd: tmp,
+      env: { ANTHROPIC_API_KEY: "test-no-call" },
+      closeStdinImmediately: true,
+    });
+    // Boots and exits cleanly with every loop-contract option threaded into
+    // runChatLoop (the runtime enforcement itself is covered by
+    // runtime-core's own tests; the option-name mapping by loop-contract.test.ts).
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("agent ready");
+  });
+
+  test("run --help documents --streaming and the --budget-usd ↔ limits interplay", async () => {
+    const result = await runCli(["run", "--help"]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("--streaming");
+    expect(result.stdout).toContain("--budget-usd");
+    // The interplay contract: independent bounds, first to trip governs,
+    // budget gates the NEXT turn while limits bound the current one.
+    expect(result.stdout).toContain("limits:");
+    expect(result.stdout).toContain("INDEPENDENTLY");
+    expect(result.stdout).toContain("NEXT turn");
   });
 });
 

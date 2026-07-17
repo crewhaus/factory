@@ -213,7 +213,15 @@ export const OPTIMIZABLE_PATHS: Readonly<
     // per-turn output-token cap when max_tokens truncations recur; safe to
     // autotune (a bigger cap can only trade cost for completeness).
     Object.freeze(["agent", "max_tokens"]),
+    // Loop contract 0.4 (Batch A) — the explicit thinking-token budget is a
+    // pure quality/cost dial (>= 1024 enforced by the spec); the optimizer
+    // may raise/lower it but never flips the thinking FORM (effort presets
+    // stay human-owned via the exactly-one-form superRefine).
+    Object.freeze(["agent", "thinking", "budget_tokens"]),
     Object.freeze(["failure_taxonomy"]),
+    // Loop contract 0.4 (Batch A) — real as of the `compaction.threshold`
+    // spec field (0.5–0.99): when to trigger autocompaction is a classic
+    // token-cost vs context-completeness dial.
     Object.freeze(["compaction", "threshold"]),
     // Pillar 2 active context curation — eval-optimizer can flip the
     // semantic-dedupe + relevance-reorder pass on/off and tune its
@@ -221,10 +229,16 @@ export const OPTIMIZABLE_PATHS: Readonly<
     Object.freeze(["compaction", "curate"]),
     Object.freeze(["compaction", "dedupeThreshold"]),
     Object.freeze(["compaction", "relevanceTopK"]),
-    // Pillar 3 sink-side fabric — egress policy + intent-gate thresholds
-    // are tunable so the eval-optimizer can find the sweet spot between
-    // false-positive denials and false-negative exfil bypasses.
-    Object.freeze(["security", "egressPolicy"]),
+    // Loop contract 0.4 (Batch A) — tool-iteration ceiling: quality (task
+    // completion) vs runaway-cost dial. NOTE ["security","egressPolicy"]
+    // was REMOVED here: the spec never grew that key (strict schemas
+    // reject it), and the OPTIMIZABLE_PATHS guard test requires every
+    // listed path to round-trip through parseSpec. Re-add it WITH the spec
+    // field when the egress-fabric FRs ship it.
+    Object.freeze(["limits", "max_tool_iterations"]),
+    // Pillar 3 intent gate — tunable so the eval-optimizer can find the
+    // sweet spot between false-positive denials and false-negative exfil
+    // bypasses.
     Object.freeze(["security", "justification"]),
     // §47 blockchain subsystem (slice 0). Whole-block replacement so the
     // optimizer can tune `chains[*].finality.count`, `chains[*].rpcPolicy`,
@@ -275,9 +289,14 @@ export const OPTIMIZABLE_PATHS: Readonly<
     Object.freeze(["failure_taxonomy"]),
     Object.freeze(["chains"]),
     Object.freeze(["transaction_policy"]),
+    // Loop contract 0.4 (Batch A) — see the cli entry.
+    Object.freeze(["limits", "max_tool_iterations"]),
   ]) /* whole-step replacement allowed */,
   channel: Object.freeze([
     Object.freeze(["agent", "instructions"]),
+    // Loop contract 0.4 (Batch A) — see the cli entries.
+    Object.freeze(["agent", "thinking", "budget_tokens"]),
+    Object.freeze(["limits", "max_tool_iterations"]),
     Object.freeze(["failure_taxonomy"]),
     Object.freeze(["chains"]),
     Object.freeze(["transaction_policy"]),
@@ -298,9 +317,14 @@ export const OPTIMIZABLE_PATHS: Readonly<
     Object.freeze(["failure_taxonomy"]),
     Object.freeze(["chains"]),
     Object.freeze(["transaction_policy"]),
+    // Loop contract 0.4 (Batch A) — see the cli entry.
+    Object.freeze(["limits", "max_tool_iterations"]),
   ]),
   managed: Object.freeze([
     Object.freeze(["agent", "instructions"]),
+    // Loop contract 0.4 (Batch A) — see the cli entries.
+    Object.freeze(["agent", "thinking", "budget_tokens"]),
+    Object.freeze(["limits", "max_tool_iterations"]),
     Object.freeze(["failure_taxonomy"]),
     // Adaptive model routing — pool policy knobs only (see the cli entry).
     Object.freeze(["agent", "model_pool", "policy"]),
@@ -326,6 +350,8 @@ export const OPTIMIZABLE_PATHS: Readonly<
     Object.freeze(["failure_taxonomy"]),
     Object.freeze(["chains"]),
     Object.freeze(["transaction_policy"]),
+    // Loop contract 0.4 (Batch A) — see the cli entry.
+    Object.freeze(["limits", "max_tool_iterations"]),
     // 0.3.0 memory/continuity quality knobs — types/bounds at the cli entry.
     Object.freeze(["memory", "recallK"]),
     Object.freeze(["memory", "autoCaptureThreshold"]),
@@ -337,9 +363,14 @@ export const OPTIMIZABLE_PATHS: Readonly<
   research: Object.freeze([
     Object.freeze(["agent", "instructions"]),
     Object.freeze(["failure_taxonomy"]),
-    Object.freeze(["retrieve", "maxDepth"]),
+    // NOTE ["retrieve","maxDepth"] was REMOVED here (Batch A): the research
+    // retrieve block never grew a maxDepth field (strict schema rejects
+    // it), and the OPTIMIZABLE_PATHS guard test requires every listed path
+    // to round-trip through parseSpec. Re-add it WITH the spec field.
     Object.freeze(["chains"]),
     Object.freeze(["transaction_policy"]),
+    // Loop contract 0.4 (Batch A) — see the cli entry.
+    Object.freeze(["limits", "max_tool_iterations"]),
     // 0.3.0 memory/continuity quality knobs — types/bounds at the cli entry.
     Object.freeze(["memory", "recallK"]),
     Object.freeze(["memory", "autoCaptureThreshold"]),
@@ -353,6 +384,8 @@ export const OPTIMIZABLE_PATHS: Readonly<
     Object.freeze(["failure_taxonomy"]),
     Object.freeze(["chains"]),
     Object.freeze(["transaction_policy"]),
+    // Loop contract 0.4 (Batch A) — see the cli entry.
+    Object.freeze(["limits", "max_tool_iterations"]),
   ]),
   voice: Object.freeze([
     Object.freeze(["agent", "instructions"]),
@@ -361,6 +394,8 @@ export const OPTIMIZABLE_PATHS: Readonly<
   browser: Object.freeze([
     Object.freeze(["agent", "instructions"]),
     Object.freeze(["failure_taxonomy"]),
+    // Loop contract 0.4 (Batch A) — see the cli entry.
+    Object.freeze(["limits", "max_tool_iterations"]),
   ]),
   eval: Object.freeze([
     Object.freeze(["agent", "instructions"]),

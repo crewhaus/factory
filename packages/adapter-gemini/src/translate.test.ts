@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import type { ProviderRequest } from "@crewhaus/adapter-anthropic";
+import { EFFORT_THINKING_BUDGET_TOKENS, type ProviderRequest } from "@crewhaus/adapter-anthropic";
 import { ConfigError } from "@crewhaus/errors";
 import { FunctionCallingConfigMode } from "@google/genai";
 import { toGeminiParams } from "./translate.js";
@@ -158,6 +158,30 @@ describe("toGeminiParams", () => {
     });
     expect(params.config?.thinkingConfig?.thinkingBudget).toBe(2048);
     expect(params.config?.thinkingConfig?.includeThoughts).toBe(true);
+  });
+
+  test("reasoningEffort converts to a thinkingBudget via the shared preset table", () => {
+    for (const effort of ["low", "medium", "high"] as const) {
+      const params = toGeminiParams({ ...baseReq, reasoningEffort: effort });
+      expect(params.config?.thinkingConfig?.thinkingBudget).toBe(
+        EFFORT_THINKING_BUDGET_TOKENS[effort],
+      );
+      expect(params.config?.thinkingConfig?.includeThoughts).toBe(true);
+    }
+  });
+
+  test("explicit thinking budget wins over reasoningEffort", () => {
+    const params = toGeminiParams({
+      ...baseReq,
+      thinking: { type: "enabled", budgetTokens: 4096 },
+      reasoningEffort: "high",
+    });
+    expect(params.config?.thinkingConfig?.thinkingBudget).toBe(4096);
+  });
+
+  test("neither thinking nor reasoningEffort → no thinkingConfig", () => {
+    const params = toGeminiParams(baseReq);
+    expect(params.config?.thinkingConfig).toBeUndefined();
   });
 
   test("empty system blocks are filtered and omit systemInstruction", () => {

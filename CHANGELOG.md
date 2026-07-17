@@ -7,6 +7,83 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Loop contract 0.4, Batch A — the agent-loop knobs your spec always
+  implied are now real spec keys, wired end to end.** One coordinated batch
+  lands the spec grammar, the IR, every emitter, the `crewhaus run`
+  interpreter, and the runtime enforcement for the loop-shaped controls:
+
+  - **`limits:` — hard runtime ceilings for one agent loop**, accepted on
+    cli/channel/managed/workflow/graph/crew/research/batch/browser:
+    `max_tool_iterations` (now optimizer-reachable via `OPTIMIZABLE_PATHS`),
+    `max_concurrent_tools`, `context_limit`, plus the new wall-clock timers
+    `deadline_ms` (whole run), `turn_timeout_ms` (one turn) and
+    `model_call_timeout_ms` (hung-stream watchdog). A tripped timer ends the
+    run with the classified failure machinery: `run_failed` class
+    `"timeout"`, exit code 34 (CrewHaus's own configured ceiling, beside the
+    budget cap's 33). On the workflow shape `deadline_ms` binds the WHOLE
+    run — each step both guards on the shared deadline stamp and arms the
+    runtime timer with the *remaining* budget, so N steps can't each claim
+    the full ceiling. The crew shape adds `limits.crew`
+    (`max_activations` / `refusal_depth` / `max_a2a_depth`) orchestration
+    ceilings.
+  - **`limits.loop_detection` — the runaway-tool-loop escalation ladder**:
+    tune `window`/`threshold` and pick `escalation: warn` (trace event only,
+    the pre-0.4 behaviour and still the default), `justify` (the repeated
+    call must pass the intent gate's justification check) or `abort` (end
+    the run).
+  - **`agent.thinking` — extended thinking as a portable spec key**: exactly
+    one of `budget_tokens` (explicit, >= 1024) or `effort: low|medium|high`;
+    also declarable per workflow step, per graph node and per crew role. The
+    adapter layer translates per provider: Anthropic/Bedrock-Anthropic map
+    `effort` through the shared `EFFORT_THINKING_BUDGET_TOKENS` presets,
+    Gemini maps it onto `thinkingConfig`, and OpenAI reasoning models
+    (o-series / gpt-5) get native `reasoning_effort` (an explicit budget
+    picks the nearest effort bucket; non-reasoning models ignore the knob
+    silently).
+  - **`agent.rate_limits` — per-tool rate limits** on cli/channel/managed:
+    tool name (or `"*"` catch-all) → `{ rpm, burst }`, enforced in the
+    runtime tool dispatcher.
+  - **`hooks:` — spec-declared lifecycle hooks**, the in-spec equivalent of
+    `.crewhaus/settings.json` entries (same ten events; a cross-check test
+    pins the spec's event list to hooks-engine's `HOOK_EVENTS` so they
+    cannot drift). On every shape spec hooks layer BELOW the settings.json
+    layers — spec first, then user → project, so the later-wins mutate
+    merge keeps the user's/project's overrides authoritative, mirroring the
+    permission RuleSet's settings-over-yaml precedence (all hooks still run;
+    any deny wins regardless of layer).
+  - **Graph control flow**: `edges[].when` declarative predicates over the
+    shared state (`key` + `equals` value test or `exists: true`, evaluated
+    in declaration order) and `parallel:` barrier groups lowered onto
+    graph-engine's `addParallel`. The engine gains an optional
+    `ParallelMergeReducer` for custom merges, and the default merge now
+    detects same-key write collisions across branches and fails classified
+    (`run_failed`, class `"config"`, exit 21) instead of silently
+    last-write-wins.
+  - **More shapes, fewer dead keys**: `mcp_servers` now boots a real
+    wire-once MCP host on workflow/research/batch bundles (secret refs stay
+    unresolved in the artifact, `disconnectAll()` on every exit path); graph
+    node `tools:` registers the builtin catalog; crew gains
+    `routing.kind: "llm"` (model-driven role handoffs with a deterministic
+    parse ladder and entry-role fallback) and per-role `sub_agents`; batch
+    queue adapters construct their backend from env at boot (`sqs` /
+    `redis-streams` / `postgres`, each failing loudly with the missing
+    variable's name) and durable backends keep the worker alive instead of
+    fast-exiting on an empty queue; `agent.streaming`, compaction tuning
+    (`threshold` / `snip_keep_head` / `snip_keep_tail`), `memory.embedder`
+    and run-level `budget:` thread through everywhere the schema accepts
+    them.
+  - **`compile()` now returns warnings** (additive `CompileResult`; every
+    existing `Bundle` consumer keeps compiling): declaring a key a shape
+    accepts but whose emitter still drops it — e.g. `thredz` on
+    channel/managed/research/crew, `continuity` on workflow/batch, voice
+    `tools`/`mcp_servers` — emits an `accepted-but-unwired` diagnostic
+    instead of shipping dead YAML silently. The validating ir-passes (graph
+    edge/`when`/`parallel` referential integrity + reachability through
+    parallel barriers, chain integrity) now run unconditionally inside
+    `compile()`; they rewrite nothing, so bundle bytes are unchanged.
+
 ## [0.3.2] - 2026-07-16
 
 ### Fixed

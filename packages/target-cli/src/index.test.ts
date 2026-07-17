@@ -805,6 +805,300 @@ describe("emitCli — memory block (#53, rewired onto the PR 10 composition root
   });
 });
 
+describe("emitCli — limits block (loop contract 0.4, Batch A)", () => {
+  test("emits every declared limits field into the runChatLoop call", () => {
+    const content =
+      emitCli(
+        baseIr({
+          limits: {
+            maxToolIterations: 25,
+            maxConcurrentTools: 2,
+            contextLimit: 120_000,
+            deadlineMs: 600_000,
+            turnTimeoutMs: 120_000,
+            modelCallTimeoutMs: 60_000,
+            loopDetection: { window: 12, threshold: 3, escalation: "abort" },
+          },
+        }),
+      ).files[0]?.content ?? "";
+    expect(content).toContain("maxToolIterations: 25,");
+    expect(content).toContain("maxConcurrentTools: 2,");
+    expect(content).toContain("contextLimit: 120000,");
+    expect(content).toContain("deadlineMs: 600000,");
+    expect(content).toContain("turnTimeoutMs: 120000,");
+    expect(content).toContain("modelCallTimeoutMs: 60000,");
+    expect(content).toContain('loopDetection: {"window":12,"threshold":3,"escalation":"abort"},');
+  });
+
+  test("a partial limits block emits only the declared fields", () => {
+    const content = emitCli(baseIr({ limits: { maxToolIterations: 40 } })).files[0]?.content ?? "";
+    expect(content).toContain("maxToolIterations: 40,");
+    expect(content).not.toContain("maxConcurrentTools:");
+    expect(content).not.toContain("contextLimit:");
+    expect(content).not.toContain("deadlineMs:");
+    expect(content).not.toContain("turnTimeoutMs:");
+    expect(content).not.toContain("modelCallTimeoutMs:");
+    expect(content).not.toContain("loopDetection:");
+  });
+
+  test("loopDetection carries only the declared knobs", () => {
+    const content =
+      emitCli(baseIr({ limits: { loopDetection: { escalation: "justify" } } })).files[0]?.content ??
+      "";
+    expect(content).toContain('loopDetection: {"escalation":"justify"},');
+  });
+
+  test("no limits block → none of the limit fields are emitted (byte-identity guard)", () => {
+    const content = emitCli(baseIr()).files[0]?.content ?? "";
+    expect(content).not.toContain("maxToolIterations:");
+    expect(content).not.toContain("maxConcurrentTools:");
+    expect(content).not.toContain("contextLimit:");
+    expect(content).not.toContain("deadlineMs:");
+    expect(content).not.toContain("turnTimeoutMs:");
+    expect(content).not.toContain("modelCallTimeoutMs:");
+    expect(content).not.toContain("loopDetection:");
+  });
+});
+
+describe("emitCli — agent.thinking (loop contract 0.4, Batch A)", () => {
+  test("emits the explicit budget form verbatim", () => {
+    const content =
+      emitCli(
+        baseIr({
+          agent: {
+            model: "claude-sonnet-4-6",
+            instructions: "be helpful",
+            thinking: { budgetTokens: 2048 },
+          },
+        }),
+      ).files[0]?.content ?? "";
+    expect(content).toContain('thinking: {"budgetTokens":2048},');
+  });
+
+  test("emits the portable effort form verbatim", () => {
+    const content =
+      emitCli(
+        baseIr({
+          agent: {
+            model: "claude-sonnet-4-6",
+            instructions: "be helpful",
+            thinking: { effort: "high" },
+          },
+        }),
+      ).files[0]?.content ?? "";
+    expect(content).toContain('thinking: {"effort":"high"},');
+  });
+
+  test("omits thinking when the IR leaves it unset", () => {
+    const content = emitCli(baseIr()).files[0]?.content ?? "";
+    expect(content).not.toContain("thinking:");
+  });
+});
+
+describe("emitCli — agent.streaming (loop contract 0.4, Batch A)", () => {
+  test("emits streaming: true when declared", () => {
+    const content =
+      emitCli(
+        baseIr({
+          agent: { model: "claude-sonnet-4-6", instructions: "be helpful", streaming: true },
+        }),
+      ).files[0]?.content ?? "";
+    expect(content).toContain("streaming: true,");
+  });
+
+  test("a declared streaming: false is carried verbatim (declared ≠ absent)", () => {
+    const content =
+      emitCli(
+        baseIr({
+          agent: { model: "claude-sonnet-4-6", instructions: "be helpful", streaming: false },
+        }),
+      ).files[0]?.content ?? "";
+    expect(content).toContain("streaming: false,");
+  });
+
+  test("omits streaming when the IR leaves it unset", () => {
+    const content = emitCli(baseIr()).files[0]?.content ?? "";
+    expect(content).not.toContain("streaming:");
+  });
+});
+
+describe("emitCli — agent.rateLimits (loop contract 0.4, Batch A)", () => {
+  test("emits the per-tool record (incl. the * bucket) as a JSON literal", () => {
+    const content =
+      emitCli(
+        baseIr({
+          agent: {
+            model: "claude-sonnet-4-6",
+            instructions: "be helpful",
+            rateLimits: { bash: { rpm: 30, burst: 5 }, "*": { rpm: 120 } },
+          },
+        }),
+      ).files[0]?.content ?? "";
+    expect(content).toContain('rateLimits: {"bash":{"rpm":30,"burst":5},"*":{"rpm":120}},');
+  });
+
+  test("a hostile tool-name key cannot escape the JSON literal", () => {
+    const content =
+      emitCli(
+        baseIr({
+          agent: {
+            model: "claude-sonnet-4-6",
+            instructions: "be helpful",
+            rateLimits: { 'evil"},pwn:{"': { rpm: 1 } },
+          },
+        }),
+      ).files[0]?.content ?? "";
+    // JSON.stringify escapes the embedded quote so the key stays inert data.
+    expect(content).toContain('rateLimits: {"evil\\"},pwn:{\\"":{"rpm":1}},');
+  });
+
+  test("omits rateLimits when the IR leaves it unset", () => {
+    const content = emitCli(baseIr()).files[0]?.content ?? "";
+    expect(content).not.toContain("rateLimits:");
+  });
+});
+
+describe("emitCli — compaction tuning knobs (loop contract 0.4, Batch A)", () => {
+  test("threshold + snip knobs land on the runtime option names", () => {
+    const content =
+      emitCli(
+        baseIr({
+          compaction: { threshold: 0.8, snipKeepHead: 6, snipKeepTail: 30 },
+        }),
+      ).files[0]?.content ?? "";
+    expect(content).toContain("compactionThreshold: 0.8,");
+    expect(content).toContain("snipKeepHead: 6,");
+    expect(content).toContain("snipKeepTail: 30,");
+  });
+
+  test("each knob is independent (threshold alone)", () => {
+    const content = emitCli(baseIr({ compaction: { threshold: 0.75 } })).files[0]?.content ?? "";
+    expect(content).toContain("compactionThreshold: 0.75,");
+    expect(content).not.toContain("snipKeepHead:");
+    expect(content).not.toContain("snipKeepTail:");
+  });
+
+  test("composes with compaction.model (both emitted)", () => {
+    const content =
+      emitCli(baseIr({ compaction: { model: "claude-haiku-4-5-20251001", threshold: 0.9 } }))
+        .files[0]?.content ?? "";
+    expect(content).toContain('compactionModel: "claude-haiku-4-5-20251001",');
+    expect(content).toContain("compactionThreshold: 0.9,");
+  });
+
+  test("no tuning knobs → none of the fields are emitted (runtime defaults stay authoritative)", () => {
+    const content = emitCli(baseIr()).files[0]?.content ?? "";
+    expect(content).not.toContain("compactionThreshold:");
+    expect(content).not.toContain("snipKeepHead:");
+    expect(content).not.toContain("snipKeepTail:");
+  });
+});
+
+describe("emitCli — spec-declared hooks (loop contract 0.4, Batch A)", () => {
+  test("emits the spec-hooks literal and concatenates it BELOW the settings.json layers", () => {
+    const content =
+      emitCli(
+        baseIr({
+          hooks: [
+            { event: "pre-tool", matcher: "Bash", command: "./gate.sh", timeoutMs: 3000 },
+            { event: "stop", command: "./notify.sh" },
+          ],
+        }),
+      ).files[0]?.content ?? "";
+    expect(content).toContain(
+      'const __specHooks = [{"event":"pre-tool","matcher":"Bash","command":"./gate.sh","timeoutMs":3000},{"event":"stop","command":"./notify.sh"}] as const;',
+    );
+    // Spec hooks come FIRST in the concat — the lowest layer, mirroring the
+    // permission RuleSet's settings-over-yaml precedence (aggregateDecisions'
+    // mutate shallow-merge is later-wins, so settings.json entries override).
+    expect(content).toContain("hooks: [...__specHooks, ...__hooks],");
+    expect(content).not.toContain("hooks: __hooks,");
+    // Declaration order is preserved (hooks fire in declaration order).
+    const preToolIdx = content.indexOf('"event":"pre-tool"');
+    const stopIdx = content.indexOf('"event":"stop"');
+    expect(preToolIdx).toBeGreaterThanOrEqual(0);
+    expect(stopIdx).toBeGreaterThan(preToolIdx);
+  });
+
+  test("the spec-hooks literal is declared before the runChatLoop call", () => {
+    const content =
+      emitCli(baseIr({ hooks: [{ event: "session-start", command: "echo hi" }] })).files[0]
+        ?.content ?? "";
+    const declIdx = content.indexOf("const __specHooks =");
+    const callIdx = content.indexOf("await runChatLoop({");
+    expect(declIdx).toBeGreaterThanOrEqual(0);
+    expect(callIdx).toBeGreaterThan(declIdx);
+  });
+
+  test("a hostile hook command cannot escape the JSON literal", () => {
+    const content =
+      emitCli(
+        baseIr({
+          hooks: [{ event: "stop", command: 'x"; process.exit(1); //' }],
+        }),
+      ).files[0]?.content ?? "";
+    expect(content).toContain('"command":"x\\"; process.exit(1); //"');
+    expect(content).not.toContain('"x"; process.exit(1);');
+  });
+
+  test("no spec hooks → the plain settings.json wiring is unchanged (byte-identity guard)", () => {
+    const content = emitCli(baseIr()).files[0]?.content ?? "";
+    expect(content).toContain("hooks: __hooks,");
+    expect(content).not.toContain("__specHooks");
+  });
+});
+
+describe("emitCli — memory.embedder fallback (loop contract 0.4, Batch A)", () => {
+  test("memory.embedder constructs deps.embedder for wireMemory (wins over wiki.embedder)", () => {
+    const content =
+      emitCli(
+        baseIr({
+          memory: { embedder: "openai/text-embedding-3-small", wiki: { enabled: true } },
+        }),
+      ).files[0]?.content ?? "";
+    expect(content).toContain('import { createEmbedder } from "@crewhaus/embedder";');
+    // deps.embedder beats the fragment's wiki.embedder inside memory-service's
+    // resolveEmbedder — the documented fallback order (embedder → wiki.embedder).
+    expect(content).toContain(
+      'embedder: createEmbedder({ model: "openai/text-embedding-3-small" })',
+    );
+  });
+
+  test("without memory.embedder the wiki.embedder fallback rides the fragment only", () => {
+    const content =
+      emitCli(baseIr({ memory: { wiki: { enabled: true, embedder: "mock/deterministic" } } }))
+        .files[0]?.content ?? "";
+    // The fragment carries wiki.embedder; no deps-level construction.
+    expect(content).toContain('"embedder":"mock/deterministic"');
+    expect(content).not.toContain("embedder: createEmbedder(");
+    expect(content).not.toContain('import { createEmbedder } from "@crewhaus/embedder";');
+  });
+
+  test("with the semantic egress matcher also on, createEmbedder is imported exactly once", () => {
+    const content =
+      emitCli(
+        baseIr({
+          security: { egressMatcher: "semantic" },
+          memory: { embedder: "openai/text-embedding-3-small" },
+        }),
+      ).files[0]?.content ?? "";
+    const matches = content.match(/import \{ createEmbedder \} from "@crewhaus\/embedder";/g);
+    expect(matches?.length).toBe(1);
+    // Both consumers still reference the binding.
+    expect(content).toContain("createEmbedder({\n  model: process.env.CREWHAUS_EGRESS_EMBEDDER");
+    expect(content).toContain(
+      'embedder: createEmbedder({ model: "openai/text-embedding-3-small" })',
+    );
+  });
+
+  test("the embedder model string is escaped (hostile spec value stays inert)", () => {
+    const content =
+      emitCli(baseIr({ memory: { embedder: 'x" }); process.exit(1); //' } })).files[0]?.content ??
+      "";
+    expect(content).toContain('createEmbedder({ model: "x\\" }); process.exit(1); //" })');
+  });
+});
+
 describe("emitCli — observability.slo → sloTargets (item 37, F4 codegen parity)", () => {
   test("a compiled bundle threads sloTargets into runChatLoop so the monitor attaches", () => {
     const content =

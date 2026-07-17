@@ -96,11 +96,91 @@ function renderFailureTaxonomyField(ir: IrManagedV0): string {
 /**
  * Item 27 — render the `budget` runChatLoop field, indented for the
  * generated `runOneTurn` body. Empty when the spec omits it. Mirror:
- * target-cli + target-channel-bot render the same field.
+ * target-cli + target-channel-bot render the same field. This is the
+ * RUN-level spend cap; the per-tenant token budgets in daemon.ts
+ * (TENANT_OVERRIDES → gateway budget enforcement) are a separate ceiling
+ * and continue to override at admission regardless of this field.
  */
 function renderBudgetField(ir: IrManagedV0): string {
   if (ir.budget === undefined) return "";
   return `\n    budget: ${JSON.stringify(ir.budget)},`;
+}
+
+/**
+ * Loop contract 0.4 (Batch A) — render the agent-block loop knobs
+ * (`maxTokens`, `thinking`, `rateLimits`) as runChatLoop fields, indented
+ * for the generated `runOneTurn` body. Empty when the spec declares none of
+ * them so existing bundles stay byte-identical. `thinking` is the IrThinking
+ * union verbatim ({ budgetTokens } → `ProviderRequest.thinking`; { effort }
+ * → `ProviderRequest.reasoningEffort` via the adapter's
+ * EFFORT_THINKING_BUDGET_TOKENS table); `rateLimits` is the per-tool
+ * `{ rpm, burst? }` record keyed by tool name or `"*"`. Mirror: target-cli +
+ * target-channel-bot render the same fields — keep the three in sync.
+ */
+function renderAgentLoopFields(ir: IrManagedV0): string {
+  const pieces: string[] = [];
+  if (ir.agent.maxTokens !== undefined) {
+    pieces.push(`\n    maxTokens: ${ir.agent.maxTokens},`);
+  }
+  if (ir.agent.thinking !== undefined) {
+    pieces.push(`\n    thinking: ${JSON.stringify(ir.agent.thinking)},`);
+  }
+  if (ir.agent.rateLimits !== undefined) {
+    pieces.push(`\n    rateLimits: ${JSON.stringify(ir.agent.rateLimits)},`);
+  }
+  return pieces.join("");
+}
+
+/**
+ * Loop contract 0.4 (Batch A) — render the top-level `limits:` ceilings as
+ * FLAT runChatLoop fields (matching runtime-core's existing flat
+ * `maxToolIterations`/`maxConcurrentTools`/`contextLimit` options), indented
+ * for the generated `runOneTurn` body. Each knob is emitted only when the
+ * spec declared it — the runtime owns per-knob defaults, so an absent knob
+ * must stay absent rather than pin today's default into the bundle.
+ * `limits.crew` never appears on this shape (spec rejects it outside crew).
+ * Mirror: target-cli + target-channel-bot render the same fields.
+ */
+function renderLimitsFields(ir: IrManagedV0): string {
+  const limits = ir.limits;
+  if (limits === undefined) return "";
+  const pieces: string[] = [];
+  if (limits.maxToolIterations !== undefined) {
+    pieces.push(`\n    maxToolIterations: ${limits.maxToolIterations},`);
+  }
+  if (limits.maxConcurrentTools !== undefined) {
+    pieces.push(`\n    maxConcurrentTools: ${limits.maxConcurrentTools},`);
+  }
+  if (limits.contextLimit !== undefined) {
+    pieces.push(`\n    contextLimit: ${limits.contextLimit},`);
+  }
+  if (limits.deadlineMs !== undefined) {
+    pieces.push(`\n    deadlineMs: ${limits.deadlineMs},`);
+  }
+  if (limits.turnTimeoutMs !== undefined) {
+    pieces.push(`\n    turnTimeoutMs: ${limits.turnTimeoutMs},`);
+  }
+  if (limits.modelCallTimeoutMs !== undefined) {
+    pieces.push(`\n    modelCallTimeoutMs: ${limits.modelCallTimeoutMs},`);
+  }
+  if (limits.loopDetection !== undefined) {
+    pieces.push(`\n    loopDetection: ${JSON.stringify(limits.loopDetection)},`);
+  }
+  return pieces.join("");
+}
+
+/**
+ * Loop contract 0.4 (Batch A) — render the spec-declared `hooks:` entries as
+ * the `hooks` runChatLoop field, indented for the generated `runOneTurn`
+ * body. IrHook is shape-identical to hooks-engine's HookDef, so the JSON
+ * literal is a valid `HookDef[]` in the generated bundle (declaration order
+ * preserved — hook firing order is semantics). The managed shape discovers
+ * no settings.json hooks (unlike cli), so the spec list is the whole array.
+ * Empty/absent → no field. Mirror: target-cli + target-channel-bot.
+ */
+function renderHooksField(ir: IrManagedV0): string {
+  if (ir.hooks === undefined || ir.hooks.length === 0) return "";
+  return `\n    hooks: ${JSON.stringify(ir.hooks)},`;
 }
 
 /**
@@ -205,7 +285,7 @@ export type ManagedAgentArgs = {
 export async function runOneTurn(args: ManagedAgentArgs): Promise<string> {
 ${memBlock}  return await runChatLoop({
     model: ${escapeJsonString(ir.agent.model)},
-    instructions: ${escapeJsonString(ir.agent.instructions)},${renderModelFailoverFields(ir)}${renderFailureTaxonomyField(ir)}${renderBudgetField(ir)}${renderSloField(ir)}
+    instructions: ${escapeJsonString(ir.agent.instructions)},${renderAgentLoopFields(ir)}${renderModelFailoverFields(ir)}${renderFailureTaxonomyField(ir)}${renderBudgetField(ir)}${renderLimitsFields(ir)}${renderHooksField(ir)}${renderSloField(ir)}
     sessionName: args.sessionId,
     sessionTarget: "managed",
     seedMessages: [{ role: "user", content: args.input }],

@@ -147,6 +147,7 @@ export type FailureClass =
   | "auth"
   | "rate_limit"
   | "crewhaus_budget"
+  | "timeout"
   | "mcp_boot"
   | "context_overflow"
   | "spec"
@@ -191,6 +192,12 @@ export const EXIT_CODES = {
   rate_limit: 32,
   /** CrewHaus's own configured budget cap ended the run. */
   crewhaus_budget: 33,
+  /** Loop contract 0.4 (G10) — a configured wall-clock limit
+   *  (`limits.deadline_ms` / `turn_timeout_ms` / `model_call_timeout_ms`)
+   *  ended the run. Sits in the 3x band beside `crewhaus_budget`: like the
+   *  spend cap, it is CrewHaus's OWN configured ceiling, not a provider
+   *  failure. */
+  timeout: 34,
   /** Tool or MCP failure (including MCP boot). */
   tool: 40,
 } as const;

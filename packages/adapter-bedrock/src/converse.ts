@@ -15,7 +15,10 @@
  * rather than throw: URL-sourced images (Converse only takes bytes),
  * images with media types outside Converse's gif/jpeg/png/webp set, and
  * request-side thinking blocks (providers on Converse don't require
- * reasoning passback) are dropped.
+ * reasoning passback) are dropped. The reasoning controls
+ * (`req.thinking` / `req.reasoningEffort`) are likewise ignored —
+ * Converse has no cross-vendor field for a thinking budget or effort
+ * preset (the Anthropic family honours both on its native path).
  */
 
 import type {

@@ -396,6 +396,21 @@ function refineModelSelection(
 const compactionBlock = z
   .object({
     model: z.string().min(1).optional(),
+    /** Loop contract 0.4 (Batch A) — context-window fill fraction that
+     *  triggers autocompaction (e.g. 0.85 = compact at 85% full). Bounded
+     *  to 0.5–0.99: below half the window a compaction pass costs more
+     *  than it saves, and 1.0 would only ever fire after an overflow.
+     *  OPTIMIZABLE (`["compaction","threshold"]` in spec-patch). When
+     *  omitted the runtime default applies. */
+    threshold: z.number().gte(0.5).lte(0.99).optional(),
+    /** Loop contract 0.4 (Batch A) — messages preserved verbatim at the
+     *  HEAD of the transcript by `compaction-snip` before summarising the
+     *  middle. When omitted the snip package's default applies. */
+    snip_keep_head: z.number().int().positive().optional(),
+    /** Loop contract 0.4 (Batch A) — messages preserved verbatim at the
+     *  TAIL of the transcript by `compaction-snip`. When omitted the snip
+     *  package's default applies. */
+    snip_keep_tail: z.number().int().positive().optional(),
     /** Pillar 2 — opt in to the pre-compaction curator pass. Defaults
      *  to `false` when omitted; the IR carries the user's choice
      *  verbatim so target emitters can wire `@crewhaus/compaction-curator`
@@ -529,6 +544,167 @@ const budgetBlock = z
   .optional();
 
 /**
+ * Loop contract 0.4 (Batch A) — extended-thinking selector, carried on the
+ * agent blocks of the interactive shapes (cli, channel, managed) and at
+ * step/node/role granularity on workflow steps, graph nodes, and crew roles.
+ * Exactly ONE of the two forms must be declared (enforced by superRefine):
+ *
+ *   - `{ budget_tokens: n }` — an explicit thinking-token budget (>= 1024,
+ *     the provider floor), passed through to the provider verbatim.
+ *   - `{ effort: low|medium|high }` — a portable effort preset the adapter
+ *     layer converts to a provider-appropriate budget
+ *     (`EFFORT_THINKING_BUDGET_TOKENS` in `@crewhaus/adapter-anthropic`).
+ *
+ * `.strict()` so a typo'd sub-key fails the build.
+ */
+const thinkingBlock = z
+  .object({
+    budget_tokens: z.number().int().min(1024).optional(),
+    effort: z.enum(["low", "medium", "high"]).optional(),
+  })
+  .strict()
+  .superRefine((t, ctx) => {
+    const forms = (t.budget_tokens !== undefined ? 1 : 0) + (t.effort !== undefined ? 1 : 0);
+    if (forms !== 1) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "thinking requires exactly one of budget_tokens (explicit token budget >= 1024) or effort (low|medium|high preset)",
+      });
+    }
+  })
+  .optional();
+
+/**
+ * Loop contract 0.4 (Batch A) — runaway-loop detection tuning inside the
+ * `limits:` block. `window` is the trailing tool-call window inspected;
+ * `threshold` (>1 — a single repeat is normal) is how many identical calls
+ * inside the window count as a loop; `escalation` picks the response:
+ * `warn` (trace event only), `justify` (demand a justification string via
+ * the intent gate), `abort` (end the run). Runtime owns per-knob defaults.
+ */
+const loopDetectionBlock = z
+  .object({
+    window: z.number().int().positive().optional(),
+    threshold: z.number().int().min(2).optional(),
+    escalation: z.enum(["warn", "justify", "abort"]).optional(),
+  })
+  .strict();
+
+/**
+ * Loop contract 0.4 (Batch A) — the top-level `limits:` block: hard runtime
+ * ceilings for one agent loop. Carried on the loop-running shapes (cli,
+ * channel, managed, workflow, graph, crew, research, batch, browser); the
+ * strict union rejects it loudly elsewhere. Every field optional — declare
+ * only the ceilings you want; the runtime owns per-knob defaults.
+ *
+ *   - `max_tool_iterations` — cap on tool-use round-trips per turn
+ *     (OPTIMIZABLE, `["limits","max_tool_iterations"]` in spec-patch).
+ *   - `max_concurrent_tools` — parallel tool-execution ceiling per block.
+ *   - `context_limit` — hard context-token ceiling (overrides the model's).
+ *   - `deadline_ms` — wall-clock ceiling for the whole run.
+ *   - `turn_timeout_ms` — wall-clock ceiling for one turn.
+ *   - `model_call_timeout_ms` — wall-clock ceiling for one model call.
+ *   - `loop_detection` — see {@link loopDetectionBlock}.
+ *
+ * The crew shape additionally accepts a `crew:` sub-block (see
+ * {@link crewLimitsBlock}) for orchestration-level ceilings.
+ */
+const limitsObject = z
+  .object({
+    max_tool_iterations: z.number().int().positive().optional(),
+    max_concurrent_tools: z.number().int().positive().optional(),
+    context_limit: z.number().int().positive().optional(),
+    deadline_ms: z.number().int().positive().optional(),
+    turn_timeout_ms: z.number().int().positive().optional(),
+    model_call_timeout_ms: z.number().int().positive().optional(),
+    loop_detection: loopDetectionBlock.optional(),
+  })
+  .strict();
+
+const limitsBlock = limitsObject.optional();
+
+/**
+ * Loop contract 0.4 (Batch A) — crew-only orchestration ceilings nested
+ * under `limits.crew`. `max_activations` caps total role activations per
+ * run; `refusal_depth` (>= 0 — 0 means "never refuse") caps how many times
+ * a role may bounce a handoff back; `max_a2a_depth` caps agent-to-agent
+ * delegation depth. Accepted ONLY on the crew shape — the base
+ * {@link limitsObject} everywhere else rejects the `crew` key.
+ */
+const crewLimitsBlock = limitsObject
+  .extend({
+    crew: z
+      .object({
+        max_activations: z.number().int().positive().optional(),
+        refusal_depth: z.number().int().nonnegative().optional(),
+        max_a2a_depth: z.number().int().positive().optional(),
+      })
+      .strict()
+      .optional(),
+  })
+  .strict()
+  .optional();
+
+/**
+ * Loop contract 0.4 (Batch A) — the hook-event names accepted in a spec's
+ * `hooks:` block. DUPLICATED from `HOOK_EVENTS` in `@crewhaus/hooks-engine`
+ * (the runtime source of truth) because the spec package stays
+ * dependency-light — it must not import runtime packages. A cross-check
+ * test in `packages/hooks-engine` imports this const and asserts equality
+ * with `HOOK_EVENTS`, so the two lists cannot drift silently. Keep in sync.
+ */
+export const SPEC_HOOK_EVENTS = [
+  "session-start",
+  "stop",
+  "pre-tool",
+  "post-tool",
+  "pre-model",
+  "post-model",
+  "pre-compact",
+  "post-compact",
+  "pre-slash",
+  "alert",
+] as const;
+
+/**
+ * Loop contract 0.4 (Batch A) — spec-declared lifecycle hooks, the in-spec
+ * equivalent of `.crewhaus/settings.json` `hooks` entries (same shape as
+ * hooks-engine's `HookDef`, snake_case per spec convention: `timeout_ms` ↔
+ * `timeoutMs`). Carried on the same shapes as `limits:`. Each entry spawns
+ * `command` at the named lifecycle `event` (optionally filtered by the
+ * `matcher` glob against the payload's `name`).
+ */
+const hookSchema = z
+  .object({
+    event: z.enum(SPEC_HOOK_EVENTS),
+    matcher: z.string().min(1).optional(),
+    command: z.string().min(1),
+    timeout_ms: z.number().int().positive().optional(),
+  })
+  .strict();
+
+const hooksBlock = z.array(hookSchema).optional();
+
+/**
+ * Loop contract 0.4 (Batch A) — per-tool rate limits on the agent blocks of
+ * the interactive shapes (cli, channel, managed). Keys are tool names (or
+ * `"*"` for the catch-all bucket); `rpm` is the sustained requests-per-
+ * minute ceiling, `burst` the optional short-burst allowance on top.
+ */
+const rateLimitsBlock = z
+  .record(
+    z.string().min(1),
+    z
+      .object({
+        rpm: z.number().int().positive(),
+        burst: z.number().int().positive().optional(),
+      })
+      .strict(),
+  )
+  .optional();
+
+/**
  * Response-feedback block — declares that a harness collects human ratings on
  * agent responses (thumbs/stars/scale/comment) which `crewhaus distill` turns
  * into eval datasets + graders. Cross-cutting like security: carried on the
@@ -641,6 +817,12 @@ const memoryBlock = z
   .object({
     enabled: z.boolean().optional(),
     backend: z.enum(["file", "thredz"]).optional(),
+    /** Loop contract 0.4 (Batch A) — top-level embedder for the FACT store
+     *  (same `@crewhaus/embedder` factory grammar as `wiki.embedder`).
+     *  Runtime fallback order: `embedder` → `wiki.embedder` — declaring
+     *  only the wiki one keeps prior behaviour; the top-level knob lets a
+     *  spec enable hybrid fact recall without enabling the wiki tier. */
+    embedder: z.string().min(1).optional(),
     ttl: z
       .string()
       .regex(
@@ -1040,6 +1222,13 @@ const cliSchema = z
         // runtime default applies. Raise it for turns that emit large
         // multi-file edits so the model isn't cut off mid-`tool_use`.
         max_tokens: z.number().int().positive().optional(),
+        // Loop contract 0.4 (Batch A) — extended-thinking selector.
+        thinking: thinkingBlock,
+        // Loop contract 0.4 (Batch A) — stream partial output tokens.
+        // Optional; absent means false (the cli-shape default).
+        streaming: z.boolean().optional(),
+        // Loop contract 0.4 (Batch A) — per-tool rate limits.
+        rate_limits: rateLimitsBlock,
         // Item 22 — provider failover chain (see modelFallbacksBlock docs).
         model_fallbacks: modelFallbacksBlock,
         circuit_breaker: circuitBreakerBlock,
@@ -1059,6 +1248,8 @@ const cliSchema = z
     security: securityBlock,
     failure_taxonomy: failureTaxonomyBlock,
     budget: budgetBlock,
+    limits: limitsBlock,
+    hooks: hooksBlock,
     feedback: feedbackBlock,
     memory: memoryBlock,
     continuity: continuityBlock,
@@ -1078,6 +1269,11 @@ const workflowStepSchema = z
     name: safeName,
     instructions: z.string().min(1),
     model: z.string().min(1).optional(),
+    // Model max OUTPUT tokens for this step's turn (mirrors cli
+    // `agent.max_tokens`). Optional; runtime default when omitted.
+    max_tokens: z.number().int().positive().optional(),
+    // Loop contract 0.4 (Batch A) — per-step extended-thinking selector.
+    thinking: thinkingBlock,
     tools: z.array(z.string().min(1)).optional(),
     tool_config: toolConfigBlock,
   })
@@ -1094,6 +1290,9 @@ const workflowSchema = z
     permissions: permissionsBlock,
     compaction: compactionBlock,
     failure_taxonomy: failureTaxonomyBlock,
+    budget: budgetBlock,
+    limits: limitsBlock,
+    hooks: hooksBlock,
     // v0.3.0 — carried but not emit-wired in 0.3.0 (ignored-note comment in
     // the generated bundle; NOT default-on here).
     continuity: continuityBlock,
@@ -1187,6 +1386,13 @@ const channelAgentSchema = z
   .object({
     model: z.string().min(1),
     instructions: z.string().min(1),
+    // Model max OUTPUT tokens for one turn (mirrors cli `agent.max_tokens`).
+    // Optional; runtime default when omitted.
+    max_tokens: z.number().int().positive().optional(),
+    // Loop contract 0.4 (Batch A) — extended-thinking selector.
+    thinking: thinkingBlock,
+    // Loop contract 0.4 (Batch A) — per-tool rate limits.
+    rate_limits: rateLimitsBlock,
     // Item 22 — provider failover chain (see modelFallbacksBlock docs).
     model_fallbacks: modelFallbacksBlock,
     circuit_breaker: circuitBreakerBlock,
@@ -1214,6 +1420,8 @@ const channelSchema = z
     compaction: compactionBlock,
     failure_taxonomy: failureTaxonomyBlock,
     budget: budgetBlock,
+    limits: limitsBlock,
+    hooks: hooksBlock,
     feedback: feedbackBlock,
     memory: memoryBlock,
     continuity: continuityBlock,
@@ -1236,6 +1444,11 @@ const graphNodeSchema = z
   .object({
     instructions: z.string().min(1),
     model: z.string().min(1).optional(),
+    // Model max OUTPUT tokens for this node's turn (mirrors cli
+    // `agent.max_tokens`). Optional; runtime default when omitted.
+    max_tokens: z.number().int().positive().optional(),
+    // Loop contract 0.4 (Batch A) — per-node extended-thinking selector.
+    thinking: thinkingBlock,
     tools: z.array(z.string().min(1)).optional(),
     tool_config: toolConfigBlock,
     /**
@@ -1252,10 +1465,47 @@ const graphNodeSchema = z
   })
   .strict();
 
+/**
+ * Loop contract 0.4 (Batch A) — declarative edge predicate over the graph's
+ * shared state. The generated graph state is a plain record where each node
+ * writes its reply under its own name (`state["<nodeName>"]`), so `key`
+ * names the upstream NODE whose recorded output the predicate reads
+ * (cross-validated against `nodes` in `parseSpec`). Exactly ONE test form
+ * must be declared (enforced by superRefine):
+ *
+ *   - `equals` — take the edge when `state[key] === equals` (string/number/
+ *     boolean strict equality).
+ *   - `exists: true` — take the edge when `state[key] !== undefined` (the
+ *     node has produced output; pairs with hitl `_decision` gating in a
+ *     follow-up).
+ *
+ * Lowered to `IrGraphEdge.when` and emitted as a graph-engine
+ * `EdgeCondition` (`(state) => state[key] === equals` / `!== undefined`).
+ * The engine evaluates edges in declaration order and takes the first
+ * match; an edge without `when` matches unconditionally.
+ */
+const graphEdgeWhenSchema = z
+  .object({
+    key: z.string().min(1),
+    equals: z.union([z.string(), z.number(), z.boolean()]).optional(),
+    exists: z.literal(true).optional(),
+  })
+  .strict()
+  .superRefine((w, ctx) => {
+    const forms = (w.equals !== undefined ? 1 : 0) + (w.exists !== undefined ? 1 : 0);
+    if (forms !== 1) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "edge when requires exactly one of equals (value test) or exists: true",
+      });
+    }
+  });
+
 const graphEdgeSchema = z
   .object({
     from: z.string().min(1),
     to: z.string().min(1),
+    when: graphEdgeWhenSchema.optional(),
   })
   .strict();
 
@@ -1268,9 +1518,21 @@ const graphSchema = z
     entry: z.string().min(1),
     nodes: z.record(safeName, graphNodeSchema),
     edges: z.array(graphEdgeSchema).default([]),
+    /**
+     * Loop contract 0.4 (Batch A) — parallel barrier groups, lowered onto
+     * graph-engine's `addParallel`. Each group is >= 2 node names (the
+     * engine rejects smaller groups) that execute concurrently when the
+     * cursor reaches the group's FIRST member; execution continues from the
+     * LAST member's outgoing edge. Node names are cross-validated against
+     * `nodes` in `parseSpec`.
+     */
+    parallel: z.array(z.array(z.string().min(1)).min(2)).optional(),
     permissions: permissionsBlock,
     compaction: compactionBlock,
     failure_taxonomy: failureTaxonomyBlock,
+    budget: budgetBlock,
+    limits: limitsBlock,
+    hooks: hooksBlock,
     chains: chainsBlock,
     wallets: walletsBlock,
     contracts: contractsBlock,
@@ -1298,6 +1560,13 @@ const managedAgentSchema = z
   .object({
     model: z.string().min(1),
     instructions: z.string().min(1),
+    // Model max OUTPUT tokens for one turn (mirrors cli `agent.max_tokens`).
+    // Optional; runtime default when omitted.
+    max_tokens: z.number().int().positive().optional(),
+    // Loop contract 0.4 (Batch A) — extended-thinking selector.
+    thinking: thinkingBlock,
+    // Loop contract 0.4 (Batch A) — per-tool rate limits.
+    rate_limits: rateLimitsBlock,
     // Item 22 — provider failover chain (see modelFallbacksBlock docs).
     model_fallbacks: modelFallbacksBlock,
     circuit_breaker: circuitBreakerBlock,
@@ -1320,6 +1589,8 @@ const managedSchema = z
     compaction: compactionBlock,
     failure_taxonomy: failureTaxonomyBlock,
     budget: budgetBlock,
+    limits: limitsBlock,
+    hooks: hooksBlock,
     memory: memoryBlock,
     continuity: continuityBlock,
     thredz: thredzBlock,
@@ -1350,23 +1621,38 @@ const pipelineDocumentSchema = z
   .strict();
 
 /**
- * Adaptive model routing — the minimal single-agent block shared by the
- * pipeline/research/batch/browser shapes, now carrying the opt-in
- * `model_pool`. Their emitted runtimes each call `runChatLoop` with a single
- * primary (exactly the cli shape's execution model), so the pool routes there
- * with zero runtime changes. The superRefine is trivially satisfied today
- * (these shapes carry no `model_tiers`/`model_fallbacks`) but keeps the
- * mutual-exclusion rule uniform if they ever gain them. NOT used by
- * onchain/onchain-game: their emitted bundles are callable modules whose
- * agent-loop wiring is still deferred (see target-onchain slice-2 notes), so
- * a `model_pool` there would be an inert spec field.
+ * Adaptive model routing — the minimal single-agent block on the pipeline
+ * shape, carrying the opt-in `model_pool`. Its emitted runtime calls
+ * `runChatLoop` with a single primary (exactly the cli shape's execution
+ * model), so the pool routes there with zero runtime changes. The
+ * superRefine is trivially satisfied today (the shape carries no
+ * `model_tiers`/`model_fallbacks`) but keeps the mutual-exclusion rule
+ * uniform if it ever gains them. NOT used by onchain/onchain-game: their
+ * emitted bundles are callable modules whose agent-loop wiring is still
+ * deferred (see target-onchain slice-2 notes), so a `model_pool` there
+ * would be an inert spec field.
  */
-const pooledSingleAgentSchema = z
+const pooledSingleAgentObject = z
   .object({
     model: z.string().min(1),
     instructions: z.string().min(1),
     // Adaptive model routing — N-candidate pool with a selection policy.
     model_pool: modelPoolBlock,
+  })
+  .strict();
+
+const pooledSingleAgentSchema = pooledSingleAgentObject.superRefine(refineModelSelection);
+
+/**
+ * Loop contract 0.4 (Batch A) — the research/batch/browser variant of the
+ * pooled single-agent block: pipeline's shape plus `max_tokens` (model max
+ * OUTPUT tokens for one turn, mirroring the cli docblock — optional; when
+ * omitted the runtime default applies; raise it for turns that emit large
+ * outputs so the model isn't cut off mid-`tool_use`).
+ */
+const pooledSingleAgentWithMaxTokensSchema = pooledSingleAgentObject
+  .extend({
+    max_tokens: z.number().int().positive().optional(),
   })
   .strict()
   .superRefine(refineModelSelection);
@@ -1416,6 +1702,11 @@ const crewRoleSchema = z
   .object({
     instructions: z.string().min(1),
     model: z.string().min(1).optional(),
+    // Model max OUTPUT tokens for this role's turns (mirrors cli
+    // `agent.max_tokens`). Optional; runtime default when omitted.
+    max_tokens: z.number().int().positive().optional(),
+    // Loop contract 0.4 (Batch A) — per-role extended-thinking selector.
+    thinking: thinkingBlock,
     tools: z.array(z.string().min(1)).optional(),
     tool_config: toolConfigBlock,
     sub_agents: subAgentsBlock,
@@ -1450,6 +1741,11 @@ const crewSchema = z
     permissions: permissionsBlock,
     compaction: compactionBlock,
     failure_taxonomy: failureTaxonomyBlock,
+    budget: budgetBlock,
+    // Loop contract 0.4 (Batch A) — crew is the ONE shape whose limits block
+    // additionally accepts the `crew:` orchestration sub-block.
+    limits: crewLimitsBlock,
+    hooks: hooksBlock,
     // v0.3.0 — crew joins the memory-carrying shapes (§9: emit-wired; the
     // roles share the spec-scoped stores — the plan IS the coordination
     // surface, §2.7).
@@ -1485,7 +1781,7 @@ const researchSchema = z
     name: safeName,
     version: versionField,
     target: z.literal("research"),
-    agent: pooledSingleAgentSchema,
+    agent: pooledSingleAgentWithMaxTokensSchema,
     goal: z.string().min(1),
     branchingFactor: z.number().int().min(1).max(8).default(3),
     maxDurationMs: z.number().int().positive().default(300_000),
@@ -1496,6 +1792,9 @@ const researchSchema = z
     permissions: permissionsBlock,
     compaction: compactionBlock,
     failure_taxonomy: failureTaxonomyBlock,
+    budget: budgetBlock,
+    limits: limitsBlock,
+    hooks: hooksBlock,
     memory: memoryBlock,
     continuity: continuityBlock,
     thredz: thredzBlock,
@@ -1526,7 +1825,7 @@ const batchSchema = z
     name: safeName,
     version: versionField,
     target: z.literal("batch"),
-    agent: pooledSingleAgentSchema,
+    agent: pooledSingleAgentWithMaxTokensSchema,
     queue: batchQueueSchema,
     concurrency: z.number().int().min(1).max(64).default(4),
     idempotencyWindowMs: z.number().int().positive().default(60_000),
@@ -1536,6 +1835,9 @@ const batchSchema = z
     permissions: permissionsBlock,
     compaction: compactionBlock,
     failure_taxonomy: failureTaxonomyBlock,
+    budget: budgetBlock,
+    limits: limitsBlock,
+    hooks: hooksBlock,
     // v0.3.0 — carried but not emit-wired in 0.3.0 (ignored-note comment in
     // the generated bundle; NOT default-on here).
     continuity: continuityBlock,
@@ -1608,7 +1910,7 @@ const browserSchema = z
     name: safeName,
     version: versionField,
     target: z.literal("browser"),
-    agent: pooledSingleAgentSchema,
+    agent: pooledSingleAgentWithMaxTokensSchema,
     driver: browserDriverSchema.default({}),
     /** Vision-grounding model. Defaults to the agent's primary model. */
     groundingModel: z.string().min(1).optional(),
@@ -1618,6 +1920,9 @@ const browserSchema = z
     permissions: permissionsBlock,
     compaction: compactionBlock,
     failure_taxonomy: failureTaxonomyBlock,
+    budget: budgetBlock,
+    limits: limitsBlock,
+    hooks: hooksBlock,
     // v0.3.0 — carried but not emit-wired in 0.3.0 (ignored-note comment in
     // the generated bundle; NOT default-on here).
     continuity: continuityBlock,
@@ -1851,6 +2156,22 @@ export type SpecThredzBlock = z.infer<typeof thredzBlock>;
 export type SpecLearningBlock = z.infer<typeof learningBlock>;
 export type SpecFailureTaxonomyEntry = z.infer<typeof failureTaxonomyEntrySchema>;
 export type SpecFailureTaxonomy = z.infer<typeof failureTaxonomyBlock>;
+/** Loop contract 0.4 (Batch A) — the extended-thinking selector (exactly one
+ *  of `budget_tokens` / `effort`). */
+export type SpecThinkingBlock = z.infer<typeof thinkingBlock>;
+/** Loop contract 0.4 (Batch A) — the base `limits:` block (non-crew shapes). */
+export type SpecLimitsBlock = z.infer<typeof limitsBlock>;
+/** Loop contract 0.4 (Batch A) — the crew `limits:` block (base + `crew:`). */
+export type SpecCrewLimitsBlock = z.infer<typeof crewLimitsBlock>;
+/** Loop contract 0.4 (Batch A) — one spec-declared lifecycle hook. */
+export type SpecHook = z.infer<typeof hookSchema>;
+/** Loop contract 0.4 (Batch A) — the hook-event name union (see
+ *  {@link SPEC_HOOK_EVENTS}). */
+export type SpecHookEvent = (typeof SPEC_HOOK_EVENTS)[number];
+/** Loop contract 0.4 (Batch A) — the per-tool rate-limits map. */
+export type SpecRateLimitsBlock = z.infer<typeof rateLimitsBlock>;
+/** Loop contract 0.4 (Batch A) — the declarative graph-edge predicate. */
+export type SpecGraphEdgeWhen = z.infer<typeof graphEdgeWhenSchema>;
 
 export { SpecParseError };
 
@@ -1909,6 +2230,35 @@ export function parseSpec(yamlText: string): Spec {
           if (!roleNames.includes(rule.to)) {
             throw new SpecParseError(
               `crew.routing.match["${from}"].to = "${rule.to}" — target role not in crew.roles`,
+            );
+          }
+        }
+      }
+    }
+  }
+  // Loop contract 0.4 (Batch A) — graph cross-field invariants. Kept here
+  // rather than as `.refine()`s on the schema so the discriminated-union
+  // member stays a plain ZodObject (same posture as the crew checks above):
+  //   - every `edges[].when.key` must name a declared node — the generated
+  //     graph state records each node's reply under its own name, so a key
+  //     that names nothing can never match;
+  //   - every `parallel` group member must name a declared node (mirrors
+  //     graph-engine's own compile-time check, surfaced at parse time).
+  if (data.target === "graph") {
+    const nodeNames = Object.keys(data.nodes);
+    for (const [i, edge] of data.edges.entries()) {
+      if (edge.when !== undefined && !nodeNames.includes(edge.when.key)) {
+        throw new SpecParseError(
+          `graph.edges[${i}].when.key "${edge.when.key}" must name a declared node — the shared state records each node's output under its name (nodes: ${nodeNames.join(", ")})`,
+        );
+      }
+    }
+    if (data.parallel !== undefined) {
+      for (const [gi, group] of data.parallel.entries()) {
+        for (const nodeName of group) {
+          if (!nodeNames.includes(nodeName)) {
+            throw new SpecParseError(
+              `graph.parallel[${gi}] references "${nodeName}" which is not a declared node (nodes: ${nodeNames.join(", ")})`,
             );
           }
         }

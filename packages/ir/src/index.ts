@@ -83,6 +83,18 @@ export type IrToolConfigs = Readonly<Record<string, unknown>>;
  */
 export type IrCompaction = {
   readonly model?: string;
+  /** Loop contract 0.4 (Batch A) — context-window fill fraction that
+   *  triggers autocompaction (spec `compaction.threshold`, 0.5–0.99).
+   *  Runtime default applies when absent. */
+  readonly threshold?: number;
+  /** Loop contract 0.4 (Batch A) — messages preserved verbatim at the
+   *  transcript HEAD by `compaction-snip` (spec `compaction.snip_keep_head`).
+   *  Snip package default when absent. */
+  readonly snipKeepHead?: number;
+  /** Loop contract 0.4 (Batch A) — messages preserved verbatim at the
+   *  transcript TAIL by `compaction-snip` (spec `compaction.snip_keep_tail`).
+   *  Snip package default when absent. */
+  readonly snipKeepTail?: number;
   /** Pillar 2 — RESERVED, not yet wired at runtime. Intended to make
    *  target emitters wire `compaction-curator` as a pre-pass before the
    *  autocompact threshold check, but no emitter or runtime-core path
@@ -175,6 +187,115 @@ export type IrModelPool = {
     readonly bandit?: "epsilon-greedy" | "thompson";
   };
 };
+
+/**
+ * Loop contract 0.4 (Batch A) — extended-thinking selector, lowered from
+ * the spec's `thinking` block (agent-level on cli/channel/managed;
+ * step/node/role-level on workflow/graph/crew). Exactly one variant is ever
+ * present (the spec's superRefine enforces the exactly-one rule):
+ *
+ *   - `{ budgetTokens }` — explicit thinking-token budget (>= 1024), passed
+ *     to the provider verbatim (`ProviderRequest.thinking`).
+ *   - `{ effort }` — portable preset the adapter layer converts to a
+ *     provider-appropriate budget (`EFFORT_THINKING_BUDGET_TOKENS` in
+ *     `@crewhaus/adapter-anthropic`; threads as
+ *     `ProviderRequest.reasoningEffort`).
+ */
+export type IrThinking =
+  | { readonly budgetTokens: number }
+  | { readonly effort: "low" | "medium" | "high" };
+
+/**
+ * Loop contract 0.4 (Batch A) — runaway-loop detection tuning inside
+ * {@link IrLimits}. Every field carried verbatim only when declared; the
+ * runtime owns per-knob defaults. `escalation`: `warn` (trace event only) |
+ * `justify` (demand a justification via the intent gate) | `abort` (end the
+ * run).
+ */
+export type IrLoopDetection = {
+  readonly window?: number;
+  readonly threshold?: number;
+  readonly escalation?: "warn" | "justify" | "abort";
+};
+
+/**
+ * Loop contract 0.4 (Batch A) — crew-only orchestration ceilings, lowered
+ * from `limits.crew`. Present ONLY on the `IrCrewV0` variant's limits.
+ */
+export type IrCrewLimits = {
+  readonly maxActivations?: number;
+  readonly refusalDepth?: number;
+  readonly maxA2aDepth?: number;
+};
+
+/**
+ * Loop contract 0.4 (Batch A) — hard runtime ceilings for one agent loop,
+ * lowered from the top-level `limits:` block. Carried on the loop-running
+ * shapes (IrV0/cli, IrChannelV0, IrManagedV0, IrWorkflowV0, IrGraphV0,
+ * IrCrewV0, IrResearchV0, IrBatchV0, IrBrowserV0). Absent when the spec
+ * omits the block; every field carried verbatim only when declared (the
+ * runtime owns per-knob defaults). `crew` is populated only on the crew
+ * variant (the spec rejects `limits.crew` elsewhere).
+ */
+export type IrLimits = {
+  readonly maxToolIterations?: number;
+  readonly maxConcurrentTools?: number;
+  readonly contextLimit?: number;
+  readonly deadlineMs?: number;
+  readonly turnTimeoutMs?: number;
+  readonly modelCallTimeoutMs?: number;
+  readonly loopDetection?: IrLoopDetection;
+  readonly crew?: IrCrewLimits;
+};
+
+/**
+ * Loop contract 0.4 (Batch A) — the hook-event names the spec accepts.
+ * Mirrors `HookEvent` from `@crewhaus/hooks-engine` — the canonical list —
+ * kept inline (exactly as `IrVectorBackend` mirrors vector-store's ids) so
+ * the runtime-agnostic IR keeps its zero runtime-package dependencies. The
+ * spec's `SPEC_HOOK_EVENTS` const carries the same list with a hooks-engine
+ * cross-check test; keep all three in sync.
+ */
+export type IrHookEvent =
+  | "session-start"
+  | "stop"
+  | "pre-tool"
+  | "post-tool"
+  | "pre-model"
+  | "post-model"
+  | "pre-compact"
+  | "post-compact"
+  | "pre-slash"
+  | "alert";
+
+/**
+ * Loop contract 0.4 (Batch A) — one spec-declared lifecycle hook, lowered
+ * from a `hooks:` entry (snake_case `timeout_ms` → `timeoutMs`). Same shape
+ * as hooks-engine's `HookDef`, so emitters can concat these with the
+ * settings.json-discovered hooks. Carried (as `hooks?: readonly IrHook[]`)
+ * on the same shapes as {@link IrLimits}.
+ */
+export type IrHook = {
+  readonly event: IrHookEvent;
+  readonly matcher?: string;
+  readonly command: string;
+  readonly timeoutMs?: number;
+};
+
+/** Loop contract 0.4 (Batch A) — one tool's rate-limit tuning (sustained
+ *  requests-per-minute + optional short-burst allowance). */
+export type IrRateLimit = {
+  readonly rpm: number;
+  readonly burst?: number;
+};
+
+/**
+ * Loop contract 0.4 (Batch A) — per-tool rate limits, lowered from
+ * `agent.rate_limits` on the interactive shapes (IrV0/cli, IrChannelV0,
+ * IrManagedV0). Keys are tool names or `"*"` (the catch-all bucket).
+ * Absent when the spec omits the block.
+ */
+export type IrRateLimits = Readonly<Record<string, IrRateLimit>>;
 
 /**
  * Section 55 (Track A) — named failure taxonomy. Cross-cutting; carried
@@ -331,6 +452,10 @@ export type IrMemoryDream = {
 export type IrMemory = {
   readonly enabled?: boolean;
   readonly backend?: "file" | "thredz";
+  /** Loop contract 0.4 (Batch A) — top-level embedder for the FACT store
+   *  (`@crewhaus/embedder` factory grammar, spec `memory.embedder`).
+   *  Runtime fallback order: `embedder` → `wiki.embedder`. */
+  readonly embedder?: string;
   readonly ttlMs?: number;
   readonly autoCapture?: boolean;
   readonly autoCaptureThreshold?: number;
@@ -548,6 +673,16 @@ export type IrV0 = {
     /** Model max OUTPUT tokens for one turn (spec `agent.max_tokens`).
      *  Optional; when absent the runtime default applies. */
     readonly maxTokens?: number;
+    /** Loop contract 0.4 (Batch A) — extended-thinking selector (spec
+     *  `agent.thinking`). Absent when the spec omits the block. */
+    readonly thinking?: IrThinking;
+    /** Loop contract 0.4 (Batch A) — stream partial output tokens (spec
+     *  `agent.streaming`, cli shape only). Carried verbatim only when
+     *  declared; absent means false. */
+    readonly streaming?: boolean;
+    /** Loop contract 0.4 (Batch A) — per-tool rate limits (spec
+     *  `agent.rate_limits`). Absent when the spec omits the block. */
+    readonly rateLimits?: IrRateLimits;
     /** Item 22 — ordered failover models (spec `agent.model_fallbacks`).
      *  Absent when the spec omits the block; the runtime then keeps its
      *  single-adapter path. */
@@ -570,6 +705,12 @@ export type IrV0 = {
   readonly failureTaxonomy?: IrFailureTaxonomy;
   /** Item 27 — run-level spend cap + degradation ladder. Optional. */
   readonly budget?: IrBudget;
+  /** Loop contract 0.4 (Batch A) — hard runtime ceilings. Optional; absent
+   *  when the spec omits the `limits` block. */
+  readonly limits?: IrLimits;
+  /** Loop contract 0.4 (Batch A) — spec-declared lifecycle hooks. Optional;
+   *  absent when the spec omits the `hooks` block. */
+  readonly hooks?: readonly IrHook[];
   /** Pillar 3 (FR-004) — security fabric config (intent-gate judge
    *  selection). Optional; absent when the spec omits the `security`
    *  block. */
@@ -605,6 +746,12 @@ export type IrWorkflowStep = {
   readonly name: string;
   readonly instructions: string;
   readonly model: string;
+  /** Model max OUTPUT tokens for this step's turn (spec `steps[].max_tokens`).
+   *  Optional; when absent the runtime default applies. */
+  readonly maxTokens?: number;
+  /** Loop contract 0.4 (Batch A) — per-step extended-thinking selector
+   *  (spec `steps[].thinking`). Absent when the spec omits the block. */
+  readonly thinking?: IrThinking;
   readonly tools: readonly string[];
   readonly toolConfigs: IrToolConfigs;
 };
@@ -629,6 +776,13 @@ export type IrWorkflowV0 = {
   readonly compaction: IrCompaction;
   /** Section 55 (Track A) — named failure taxonomy. Optional. */
   readonly failureTaxonomy?: IrFailureTaxonomy;
+  /** Item 27 — run-level spend cap + degradation ladder (Batch A extends it
+   *  to this shape). Optional. */
+  readonly budget?: IrBudget;
+  /** Loop contract 0.4 (Batch A) — hard runtime ceilings. Optional. */
+  readonly limits?: IrLimits;
+  /** Loop contract 0.4 (Batch A) — spec-declared lifecycle hooks. Optional. */
+  readonly hooks?: readonly IrHook[];
   /** v0.3.0 — carried when the spec declares `continuity:` (NOT default-on
    *  here); target-workflow prints the ignored-note comment. */
   readonly continuity?: IrContinuity;
@@ -834,6 +988,15 @@ export type IrChannelV0 = {
   readonly agent: {
     readonly model: string;
     readonly instructions: string;
+    /** Model max OUTPUT tokens for one turn (spec `agent.max_tokens`).
+     *  Optional; when absent the runtime default applies. */
+    readonly maxTokens?: number;
+    /** Loop contract 0.4 (Batch A) — extended-thinking selector (spec
+     *  `agent.thinking`). Absent when the spec omits the block. */
+    readonly thinking?: IrThinking;
+    /** Loop contract 0.4 (Batch A) — per-tool rate limits (spec
+     *  `agent.rate_limits`). Absent when the spec omits the block. */
+    readonly rateLimits?: IrRateLimits;
     /** Item 22 — ordered failover models (spec `agent.model_fallbacks`). */
     readonly modelFallbacks?: readonly string[];
     /** Item 22 — breaker tuning (spec `agent.circuit_breaker`). */
@@ -857,6 +1020,10 @@ export type IrChannelV0 = {
   readonly failureTaxonomy?: IrFailureTaxonomy;
   /** Item 27 — run-level spend cap + degradation ladder. Optional. */
   readonly budget?: IrBudget;
+  /** Loop contract 0.4 (Batch A) — hard runtime ceilings. Optional. */
+  readonly limits?: IrLimits;
+  /** Loop contract 0.4 (Batch A) — spec-declared lifecycle hooks. Optional. */
+  readonly hooks?: readonly IrHook[];
   /** Response-feedback config. `feedback.channelReactions` gates Slack 👍/👎
    *  → user_feedback codegen in this target. Absent when spec omits it. */
   readonly feedback?: IrFeedback;
@@ -903,6 +1070,15 @@ export type IrManagedV0 = {
   readonly agent: {
     readonly model: string;
     readonly instructions: string;
+    /** Model max OUTPUT tokens for one turn (spec `agent.max_tokens`).
+     *  Optional; when absent the runtime default applies. */
+    readonly maxTokens?: number;
+    /** Loop contract 0.4 (Batch A) — extended-thinking selector (spec
+     *  `agent.thinking`). Absent when the spec omits the block. */
+    readonly thinking?: IrThinking;
+    /** Loop contract 0.4 (Batch A) — per-tool rate limits (spec
+     *  `agent.rate_limits`). Absent when the spec omits the block. */
+    readonly rateLimits?: IrRateLimits;
     /** Item 22 — ordered failover models (spec `agent.model_fallbacks`). */
     readonly modelFallbacks?: readonly string[];
     /** Item 22 — breaker tuning (spec `agent.circuit_breaker`). */
@@ -919,6 +1095,10 @@ export type IrManagedV0 = {
   readonly failureTaxonomy?: IrFailureTaxonomy;
   /** Item 27 — run-level spend cap + degradation ladder. Optional. */
   readonly budget?: IrBudget;
+  /** Loop contract 0.4 (Batch A) — hard runtime ceilings. Optional. */
+  readonly limits?: IrLimits;
+  /** Loop contract 0.4 (Batch A) — spec-declared lifecycle hooks. Optional. */
+  readonly hooks?: readonly IrHook[];
   /** #53 cross-session memory config. Optional; absent when the spec omits `memory`. */
   readonly memory?: IrMemory;
   /** v0.3.0 Goal 1 — continuity config. DEFAULT-ON: present unless the spec
@@ -946,6 +1126,12 @@ export type IrGraphNode = {
   readonly instructions: string;
   /** Resolved at lower-time (node.model ?? graph.model). */
   readonly model: string;
+  /** Model max OUTPUT tokens for this node's turn (spec
+   *  `nodes.<n>.max_tokens`). Optional; runtime default when absent. */
+  readonly maxTokens?: number;
+  /** Loop contract 0.4 (Batch A) — per-node extended-thinking selector
+   *  (spec `nodes.<n>.thinking`). Absent when the spec omits the block. */
+  readonly thinking?: IrThinking;
   readonly tools: readonly string[];
   readonly toolConfigs: IrToolConfigs;
   /**
@@ -955,9 +1141,28 @@ export type IrGraphNode = {
   readonly hitlPrompt?: string;
 };
 
+/**
+ * Loop contract 0.4 (Batch A) — declarative edge predicate over the graph's
+ * shared state, lowered 1:1 from `edges[].when`. `key` names an upstream
+ * NODE whose recorded output (`state["<nodeName>"]`) the predicate reads
+ * (parse-validated; the ir-passes wellformedness check re-verifies for
+ * direct-IR builders). Exactly one of `equals`/`exists` is ever present.
+ * Emitters lower it onto a graph-engine `EdgeCondition`:
+ * `(state) => state[key] === equals` / `(state) => state[key] !== undefined`.
+ */
+export type IrGraphEdgeWhen = {
+  readonly key: string;
+  readonly equals?: string | number | boolean;
+  readonly exists?: true;
+};
+
 export type IrGraphEdge = {
   readonly from: string;
   readonly to: string;
+  /** Loop contract 0.4 (Batch A) — declarative predicate gating this edge.
+   *  Absent means the edge matches unconditionally (the engine takes the
+   *  first matching edge in declaration order). */
+  readonly when?: IrGraphEdgeWhen;
   /** Track F (Section 57) — typed message schema carried by this edge.
    *  Defaults to `{ kind: "untyped" }` (any payload) when absent. The
    *  ir-passes wellformedness check verifies named refs resolve. */
@@ -971,6 +1176,12 @@ export type IrGraphV0 = {
   readonly entry: string;
   readonly nodes: readonly IrGraphNode[];
   readonly edges: readonly IrGraphEdge[];
+  /** Loop contract 0.4 (Batch A) — parallel barrier groups (>= 2 node names
+   *  each), lowered verbatim from the spec's `parallel` and emitted as
+   *  graph-engine `addParallel` calls. A group executes concurrently when
+   *  the cursor reaches its FIRST member; execution continues from the LAST
+   *  member's outgoing edge. Absent when the spec omits the block. */
+  readonly parallel?: ReadonlyArray<ReadonlyArray<string>>;
   /** Track F (Section 57) — named message schemas referenced by edges.
    *  Absent means no typed edges (all `untyped` by default). */
   readonly messageSchemas?: readonly IrMessageSchema[];
@@ -978,6 +1189,13 @@ export type IrGraphV0 = {
   readonly compaction: IrCompaction;
   /** Section 55 (Track A) — named failure taxonomy. Optional. */
   readonly failureTaxonomy?: IrFailureTaxonomy;
+  /** Item 27 — run-level spend cap + degradation ladder (Batch A extends it
+   *  to this shape). Optional. */
+  readonly budget?: IrBudget;
+  /** Loop contract 0.4 (Batch A) — hard runtime ceilings. Optional. */
+  readonly limits?: IrLimits;
+  /** Loop contract 0.4 (Batch A) — spec-declared lifecycle hooks. Optional. */
+  readonly hooks?: readonly IrHook[];
   /** §47 cross-cutting blockchain subsystem (slice 0). All optional. */
   readonly chains?: readonly IrChainBinding[];
   readonly wallets?: readonly IrWalletBinding[];
@@ -1058,6 +1276,12 @@ export type IrCrewRole = {
   /** Resolved at lower-time (`role.model ?? crew.model`). */
   readonly model: string;
   readonly instructions: string;
+  /** Model max OUTPUT tokens for this role's turns (spec
+   *  `roles.<r>.max_tokens`). Optional; runtime default when absent. */
+  readonly maxTokens?: number;
+  /** Loop contract 0.4 (Batch A) — per-role extended-thinking selector
+   *  (spec `roles.<r>.thinking`). Absent when the spec omits the block. */
+  readonly thinking?: IrThinking;
   readonly tools: readonly string[];
   readonly toolConfigs: IrToolConfigs;
   readonly subAgents: readonly IrSubAgentDefinition[];
@@ -1092,6 +1316,15 @@ export type IrCrewV0 = {
   readonly compaction: IrCompaction;
   /** Section 55 (Track A) — named failure taxonomy. Optional. */
   readonly failureTaxonomy?: IrFailureTaxonomy;
+  /** Item 27 — run-level spend cap + degradation ladder (Batch A extends it
+   *  to this shape). Optional. */
+  readonly budget?: IrBudget;
+  /** Loop contract 0.4 (Batch A) — hard runtime ceilings. The crew shape is
+   *  the one place `limits.crew` (orchestration ceilings) can be populated.
+   *  Optional. */
+  readonly limits?: IrLimits;
+  /** Loop contract 0.4 (Batch A) — spec-declared lifecycle hooks. Optional. */
+  readonly hooks?: readonly IrHook[];
   /** #53/v0.3.0 — cross-session memory config (crew joins the carrying
    *  shapes in 0.3.0; roles share the spec-scoped store). Optional. */
   readonly memory?: IrMemory;
@@ -1127,6 +1360,9 @@ export type IrResearchV0 = {
   readonly agent: {
     readonly model: string;
     readonly instructions: string;
+    /** Model max OUTPUT tokens for one turn (spec `agent.max_tokens`).
+     *  Optional; when absent the runtime default applies. */
+    readonly maxTokens?: number;
     /** Adaptive model routing — N-candidate pool. Absent → single-model. */
     readonly modelPool?: IrModelPool;
   };
@@ -1151,6 +1387,13 @@ export type IrResearchV0 = {
   readonly compaction: IrCompaction;
   /** Section 55 (Track A) — named failure taxonomy. Optional. */
   readonly failureTaxonomy?: IrFailureTaxonomy;
+  /** Item 27 — run-level spend cap + degradation ladder (Batch A extends it
+   *  to this shape). Optional. */
+  readonly budget?: IrBudget;
+  /** Loop contract 0.4 (Batch A) — hard runtime ceilings. Optional. */
+  readonly limits?: IrLimits;
+  /** Loop contract 0.4 (Batch A) — spec-declared lifecycle hooks. Optional. */
+  readonly hooks?: readonly IrHook[];
   /** #53 cross-session memory config. Optional; absent when the spec omits `memory`. */
   readonly memory?: IrMemory;
   /** v0.3.0 Goal 1 — continuity config. DEFAULT-ON: present unless the spec
@@ -1185,6 +1428,9 @@ export type IrBatchV0 = {
   readonly agent: {
     readonly model: string;
     readonly instructions: string;
+    /** Model max OUTPUT tokens for one turn (spec `agent.max_tokens`).
+     *  Optional; when absent the runtime default applies. */
+    readonly maxTokens?: number;
     /** Adaptive model routing — N-candidate pool. Absent → single-model. */
     readonly modelPool?: IrModelPool;
   };
@@ -1208,6 +1454,13 @@ export type IrBatchV0 = {
   readonly compaction: IrCompaction;
   /** Section 55 (Track A) — named failure taxonomy. Optional. */
   readonly failureTaxonomy?: IrFailureTaxonomy;
+  /** Item 27 — run-level spend cap + degradation ladder (Batch A extends it
+   *  to this shape). Optional. */
+  readonly budget?: IrBudget;
+  /** Loop contract 0.4 (Batch A) — hard runtime ceilings. Optional. */
+  readonly limits?: IrLimits;
+  /** Loop contract 0.4 (Batch A) — spec-declared lifecycle hooks. Optional. */
+  readonly hooks?: readonly IrHook[];
   /** v0.3.0 — carried when the spec declares `continuity:` (NOT default-on
    *  here); target-batch-worker prints the ignored-note comment. */
   readonly continuity?: IrContinuity;
@@ -1277,6 +1530,9 @@ export type IrBrowserV0 = {
   readonly agent: {
     readonly model: string;
     readonly instructions: string;
+    /** Model max OUTPUT tokens for one turn (spec `agent.max_tokens`).
+     *  Optional; when absent the runtime default applies. */
+    readonly maxTokens?: number;
     /** Adaptive model routing — N-candidate pool. Absent → single-model. */
     readonly modelPool?: IrModelPool;
   };
@@ -1298,6 +1554,13 @@ export type IrBrowserV0 = {
   readonly compaction: IrCompaction;
   /** Section 55 (Track A) — named failure taxonomy. Optional. */
   readonly failureTaxonomy?: IrFailureTaxonomy;
+  /** Item 27 — run-level spend cap + degradation ladder (Batch A extends it
+   *  to this shape). Optional. */
+  readonly budget?: IrBudget;
+  /** Loop contract 0.4 (Batch A) — hard runtime ceilings. Optional. */
+  readonly limits?: IrLimits;
+  /** Loop contract 0.4 (Batch A) — spec-declared lifecycle hooks. Optional. */
+  readonly hooks?: readonly IrHook[];
   /** v0.3.0 — carried when the spec declares `continuity:` (NOT default-on
    *  here); target-browser-driver prints the ignored-note comment. */
   readonly continuity?: IrContinuity;

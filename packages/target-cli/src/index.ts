@@ -516,6 +516,26 @@ if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));`;
     : "";
   const maxTokensField =
     ir.agent.maxTokens !== undefined ? `\n  maxTokens: ${ir.agent.maxTokens},` : "";
+  // Loop contract 0.4 (Batch A) — extended-thinking selector. The IR carries
+  // exactly one form ({budgetTokens} XOR {effort}); both are numbers/closed
+  // literal unions, so JSON.stringify is safe. Runtime-core threads it to the
+  // provider request (`thinking` verbatim, `effort` via the adapter preset
+  // table `EFFORT_THINKING_BUDGET_TOKENS`). Empty when unset.
+  const thinkingField =
+    ir.agent.thinking !== undefined ? `\n  thinking: ${JSON.stringify(ir.agent.thinking)},` : "";
+  // Loop contract 0.4 (Batch A) — stream partial output tokens (cli-only spec
+  // key). Carried verbatim only when declared, so unset specs keep their
+  // pinned bundle bytes and the runtime default (false) stays authoritative.
+  const streamingField =
+    ir.agent.streaming !== undefined ? `\n  streaming: ${ir.agent.streaming},` : "";
+  // Loop contract 0.4 (Batch A) — per-tool rate limits (keys are tool names
+  // or "*"). Keys are user-controlled spec strings landing in a plain object
+  // literal, so JSON.stringify's quoting is the escaping (same posture as
+  // toolConfigs inits). Empty when unset.
+  const rateLimitsField =
+    ir.agent.rateLimits !== undefined && Object.keys(ir.agent.rateLimits).length > 0
+      ? `\n  rateLimits: ${JSON.stringify(ir.agent.rateLimits)},`
+      : "";
   // Thread `compaction.model` so the compiled bundle's auto-compaction
   // summarizes on the spec's chosen model. The compiler already resolved the
   // `cheapest` sentinel to a concrete id, so this is a raw model string
@@ -525,6 +545,18 @@ if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));`;
     ir.compaction.model !== undefined
       ? `\n  compactionModel: ${escapeJsonString(ir.compaction.model)},`
       : "";
+  // Loop contract 0.4 (Batch A) — compaction tuning knobs, mapped onto the
+  // runtime's existing options (`compactionThreshold` + the snip window).
+  // Numbers only; each key absent when the spec omits it so the runtime's
+  // own defaults (0.85 / 4 / 20) stay authoritative and pre-existing bundles
+  // stay byte-identical.
+  const compactionTuningFields = renderCompactionTuningFields(ir);
+  // Loop contract 0.4 (Batch A) — hard runtime ceilings from the `limits:`
+  // block. Empty when the spec omits it.
+  const limitsFields = renderLimitsFields(ir);
+  // Loop contract 0.4 (Batch A) — spec-declared lifecycle hooks, layered
+  // BELOW the settings.json layers. Empty pieces when the spec has none.
+  const specHooks = renderSpecHooks(ir);
   // Item 22 — provider failover chain: thread `agent.model_fallbacks` +
   // `agent.circuit_breaker` into the runtime, which constructs the
   // breaker-driven meta-adapter (see @crewhaus/model-router). Emitted only
@@ -545,8 +577,8 @@ if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));`;
   model: ${escapeJsonString(ir.agent.model)},
   instructions: ${escapeJsonString(ir.agent.instructions)},
   sessionName: ${escapeJsonString(ir.name)},
-  sessionTarget: "cli",${maxTokensField}${compactionModelField}${failoverFields}${failureTaxonomyField}${budgetField}${sloField}${toolsField}${permField}${sandboxField}
-  hooks: __hooks,
+  sessionTarget: "cli",${maxTokensField}${thinkingField}${streamingField}${rateLimitsField}${compactionModelField}${compactionTuningFields}${limitsFields}${failoverFields}${failureTaxonomyField}${budgetField}${sloField}${toolsField}${permField}${sandboxField}
+  hooks: ${specHooks.hooksExpr},
   skills: __skills,
   slashCommands: __slashCommands,${subAgents.subAgentsField}${subAgents.spawnField}${egress.field}${memory.field}
 });`;
@@ -590,7 +622,7 @@ import { formatRunFailure, toFailureReport } from "@crewhaus/errors";
 import { runChatLoop } from "@crewhaus/runtime-core";
 ${permImport}${importBlock}${catalogImport}${mcpImportBlock}${subAgentImportBlock}${egressImportBlock}${memoryImportBlock}${extensionImport}
 ${registerBlock}
-${extensionBoot}
+${extensionBoot}${specHooks.bootBlock}
 
 ${bannerBoot}${subAgentsBoot}${egressBoot}${bootBlocks}${wrapped}
 `;
@@ -670,6 +702,98 @@ function renderBudgetField(ir: IrV0): string {
 }
 
 /**
+ * Loop contract 0.4 (Batch A) — render the `limits:` ceilings into
+ * runChatLoop options, 1:1 onto the runtime knobs of the same names:
+ * `maxToolIterations` / `maxConcurrentTools` / `contextLimit` (pre-existing)
+ * and `deadlineMs` / `turnTimeoutMs` / `modelCallTimeoutMs` / `loopDetection`
+ * (the 0.4 enforcement timers + detection tuning/escalation ladder).
+ * Every value is a spec-validated positive int or a closed literal union
+ * (`loopDetection.escalation`), so `JSON.stringify` needs no escaping.
+ * Empty when the spec omits the block, keeping pre-existing bundles
+ * byte-identical. `limits.crew` never appears on IrV0 (crew-shape only).
+ * Mirror: the `crewhaus run` interpreter threads the same fields via
+ * apps/cli's loop-contract helper — keep the two in sync.
+ */
+function renderLimitsFields(ir: IrV0): string {
+  const limits = ir.limits;
+  if (limits === undefined) return "";
+  const pieces: string[] = [];
+  if (limits.maxToolIterations !== undefined) {
+    pieces.push(`\n  maxToolIterations: ${limits.maxToolIterations},`);
+  }
+  if (limits.maxConcurrentTools !== undefined) {
+    pieces.push(`\n  maxConcurrentTools: ${limits.maxConcurrentTools},`);
+  }
+  if (limits.contextLimit !== undefined) {
+    pieces.push(`\n  contextLimit: ${limits.contextLimit},`);
+  }
+  if (limits.deadlineMs !== undefined) {
+    pieces.push(`\n  deadlineMs: ${limits.deadlineMs},`);
+  }
+  if (limits.turnTimeoutMs !== undefined) {
+    pieces.push(`\n  turnTimeoutMs: ${limits.turnTimeoutMs},`);
+  }
+  if (limits.modelCallTimeoutMs !== undefined) {
+    pieces.push(`\n  modelCallTimeoutMs: ${limits.modelCallTimeoutMs},`);
+  }
+  if (limits.loopDetection !== undefined) {
+    pieces.push(`\n  loopDetection: ${JSON.stringify(limits.loopDetection)},`);
+  }
+  return pieces.join("");
+}
+
+/**
+ * Loop contract 0.4 (Batch A) — render the compaction tuning knobs onto the
+ * runtime's EXISTING options: `compaction.threshold` → `compactionThreshold`,
+ * `compaction.snip_keep_head`/`snip_keep_tail` → `snipKeepHead`/`snipKeepTail`.
+ * Numbers only. Each key is emitted only when the spec declared it so the
+ * runtime defaults (0.85 / 4 / 20) stay authoritative and pre-existing
+ * bundles stay byte-identical.
+ */
+function renderCompactionTuningFields(ir: IrV0): string {
+  const pieces: string[] = [];
+  if (ir.compaction.threshold !== undefined) {
+    pieces.push(`\n  compactionThreshold: ${ir.compaction.threshold},`);
+  }
+  if (ir.compaction.snipKeepHead !== undefined) {
+    pieces.push(`\n  snipKeepHead: ${ir.compaction.snipKeepHead},`);
+  }
+  if (ir.compaction.snipKeepTail !== undefined) {
+    pieces.push(`\n  snipKeepTail: ${ir.compaction.snipKeepTail},`);
+  }
+  return pieces.join("");
+}
+
+/**
+ * Loop contract 0.4 (Batch A) — render the spec-declared `hooks:` array and
+ * the runChatLoop `hooks:` expression. Spec hooks are LAYERED BELOW the
+ * settings.json layers: the generated bundle concatenates
+ * `[...__specHooks, ...__hooks]` (spec first, then loadHooks()' user →
+ * project entries), mirroring the permission RuleSet's settings-over-yaml
+ * precedence — hooks-engine's `aggregateDecisions` shallow-merges `mutate`
+ * later-wins, so a settings.json hook overrides a spec hook's mutate keys,
+ * and result ordering keeps the more-local layers last. All hooks still RUN
+ * (any deny wins regardless of layer).
+ *
+ * IrHook is field-compatible with hooks-engine's `HookDef` (camelCase
+ * `timeoutMs`), and `event` values are the closed HookEvent union, so the
+ * JSON literal + `as const` type-checks against `runChatLoop({ hooks })`.
+ * `matcher`/`command` are user-controlled spec strings — JSON.stringify's
+ * quoting is the escaping (same posture as toolConfigs inits). Returns the
+ * plain `__hooks` expression and no boot line when the spec declares none,
+ * keeping pre-existing bundles byte-identical.
+ */
+function renderSpecHooks(ir: IrV0): { bootBlock: string; hooksExpr: string } {
+  if (ir.hooks === undefined || ir.hooks.length === 0) {
+    return { bootBlock: "", hooksExpr: "__hooks" };
+  }
+  return {
+    bootBlock: `\nconst __specHooks = ${JSON.stringify(ir.hooks)} as const;`,
+    hooksExpr: "[...__specHooks, ...__hooks]",
+  };
+}
+
+/**
  * Ops item 37 — render the `sloTargets` runChatLoop field from
  * `observability.slo`. The IR carries a numbers + literal-union object (no
  * user-controlled strings — mitigation is a closed `alert|pause-intake|rollback`
@@ -730,7 +854,23 @@ function renderMemory(ir: IrV0): { imports: string[]; bootBlock: string; field: 
   // the compiled bundle sits its exam in-process, same as the interpreter.
   const learningOn = ir.learning !== undefined;
   const examOn = learningOn && ir.learning?.exam !== undefined;
+  // Loop contract 0.4 (Batch A) — top-level fact-store embedder (spec
+  // `memory.embedder`). The bundle constructs it and hands it to wireMemory
+  // as `deps.embedder`, which memory-service's `resolveEmbedder` prefers
+  // over the fragment's `wiki.embedder` — exactly the documented runtime
+  // fallback order (`embedder` → `wiki.embedder`), with zero fragment-shape
+  // change. The import is skipped when the FR-006 semantic egress matcher
+  // already imported `createEmbedder` (renderEgressMatcher emits the same
+  // binding, and its import block precedes this one in the bundle).
+  const memEmbedder = memoryOn ? mem?.embedder : undefined;
+  const embedderDep =
+    memEmbedder !== undefined
+      ? `, embedder: createEmbedder({ model: ${escapeJsonString(memEmbedder)} })`
+      : "";
   const imports = [
+    ...(memEmbedder !== undefined && ir.security?.egressMatcher !== "semantic"
+      ? [`import { createEmbedder } from "@crewhaus/embedder";`]
+      : []),
     `import { wireMemory${dreamOn ? ", runDreamBootCatchUp" : ""} } from "@crewhaus/memory-service";`,
     ...(examOn ? [`import { createExamRunner } from "@crewhaus/eval-runner";`] : []),
   ];
@@ -763,11 +903,11 @@ if (__dreamNote !== null) process.stdout.write(\`\${__dreamNote}\\n\`);`
       : "";
   if (!continuityOn && !learningOn) {
     // PR 10-pinned bytes: the `continuity: false` opt-out path.
-    const bootBlock = `const __memWired = await wireMemory(${fragment}, { catalog: defaultCatalog, cwd: process.cwd()${thredzDep}${examDep("process.cwd()")} });${dreamBoot("process.cwd()")}`;
+    const bootBlock = `const __memWired = await wireMemory(${fragment}, { catalog: defaultCatalog, cwd: process.cwd()${embedderDep}${thredzDep}${examDep("process.cwd()")} });${dreamBoot("process.cwd()")}`;
     const field = "\n  ...__memWired.options,";
     return { imports, bootBlock, field };
   }
-  const bootBlock = `const __memWired = await wireMemory(${fragment}, { catalog: defaultCatalog, cwd: __cwd${thredzDep}${examDep("__cwd")} });
+  const bootBlock = `const __memWired = await wireMemory(${fragment}, { catalog: defaultCatalog, cwd: __cwd${embedderDep}${thredzDep}${examDep("__cwd")} });
 const __skills = __memWired.options.skills ?? [];
 const __slashCommands = __memWired.options.slashCommands ?? new Map();
 if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));${dreamBoot("__cwd")}`;

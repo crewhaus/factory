@@ -7,7 +7,12 @@ import {
   toAnthropicParams,
   toAnthropicSystem,
 } from "./translate.js";
-import type { CanonicalMessage, CanonicalTextBlockParam, ProviderRequest } from "./types.js";
+import {
+  type CanonicalMessage,
+  type CanonicalTextBlockParam,
+  EFFORT_THINKING_BUDGET_TOKENS,
+  type ProviderRequest,
+} from "./types.js";
 
 const baseReq: ProviderRequest = {
   model: "claude-sonnet-4-6",
@@ -360,5 +365,39 @@ describe("toAnthropicSystem", () => {
   test("preserves an explicit null cache_control", () => {
     const system: CanonicalTextBlockParam[] = [{ type: "text", text: "ctx", cache_control: null }];
     expect(toAnthropicSystem(system)).toEqual([{ type: "text", text: "ctx", cache_control: null }]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Loop contract 0.4 (Batch A) — reasoningEffort → thinking budget presets.
+// ---------------------------------------------------------------------------
+describe("toAnthropicParams — reasoningEffort presets", () => {
+  test.each([
+    ["low", 2048],
+    ["medium", 8192],
+    ["high", 24576],
+  ] as const)(
+    "effort %s converts to budget_tokens %d via EFFORT_THINKING_BUDGET_TOKENS",
+    (effort, budget) => {
+      const req: ProviderRequest = { ...baseReq, reasoningEffort: effort };
+      const params = toAnthropicParams(req, false);
+      expect(params.thinking).toEqual({ type: "enabled", budget_tokens: budget });
+      expect(EFFORT_THINKING_BUDGET_TOKENS[effort]).toBe(budget);
+    },
+  );
+
+  test("an explicit thinking budget wins over reasoningEffort", () => {
+    const req: ProviderRequest = {
+      ...baseReq,
+      thinking: { type: "enabled", budgetTokens: 4096 },
+      reasoningEffort: "high",
+    };
+    const params = toAnthropicParams(req, false);
+    expect(params.thinking).toEqual({ type: "enabled", budget_tokens: 4096 });
+  });
+
+  test("neither thinking nor reasoningEffort leaves thinking undefined", () => {
+    const params = toAnthropicParams(baseReq, false);
+    expect(params.thinking).toBeUndefined();
   });
 });

@@ -3,8 +3,10 @@ import * as readline from "node:readline/promises";
 import type Anthropic from "@anthropic-ai/sdk";
 import { type AbortTree, createAbortTree } from "@crewhaus/abort-controller";
 import {
+  EFFORT_THINKING_BUDGET_TOKENS,
   type ProviderAdapter,
   type ProviderId,
+  type ReasoningEffort,
   collectFinalMessage,
   consumeStream,
 } from "@crewhaus/adapter-anthropic";
@@ -69,7 +71,7 @@ import {
   classifyText,
   llmClassifierEnabled,
 } from "@crewhaus/prompt-injection-detector";
-import type { RateLimiter } from "@crewhaus/rate-limiter";
+import { type BucketConfig, type RateLimiter, createRateLimiter } from "@crewhaus/rate-limiter";
 import {
   type NamedFailureClass,
   type RecoveryState,
@@ -1274,6 +1276,104 @@ export type RunChatLoopOptions = {
       | { readonly kind: "stop" }
       | { readonly kind: "degrade"; readonly model: string };
   };
+  /**
+   * Loop contract 0.4 (G10) — whole-run wall-clock ceiling in ms (spec
+   * `limits.deadline_ms`). Armed once at loop start; on fire it aborts the
+   * ROOT of the abort tree (`runAbort`) with a branded reason, the in-flight
+   * turn winds down through the normal cancellation paths, and the run ends
+   * with a classified `run_failed` (class `"timeout"`, exit
+   * `EXIT_CODES.timeout`) + `RunFailedError` throw — in REPL mode too (a
+   * deadline is terminal everywhere, including while idle at the prompt).
+   * Absent → no timer (zero behaviour change).
+   */
+  deadlineMs?: number;
+  /**
+   * Loop contract 0.4 (G10) — per-turn wall-clock ceiling in ms (spec
+   * `limits.turn_timeout_ms`). Armed when a user→assistant turn starts and
+   * cleared when it ends; on fire it aborts the TURN (`turnAbort`) with a
+   * branded reason, cancelling the in-flight model call / tool children.
+   * In `singleTurn` mode the turn IS the run, so the stop is terminal:
+   * classified `run_failed` (class `"timeout"`) + `RunFailedError`. In REPL
+   * mode it mirrors the first-SIGINT semantics — the turn aborts with a
+   * printed notice and an `error` event (name `"TurnTimeout"`), and the
+   * session continues at the prompt (no `run_failed`: the run didn't end).
+   */
+  turnTimeoutMs?: number;
+  /**
+   * Loop contract 0.4 (G10) — per-model-call wall-clock ceiling in ms (spec
+   * `limits.model_call_timeout_ms`), the hung-stream watchdog. Re-armed
+   * before EVERY main-turn stream and cleared when the stream drains; on
+   * fire it aborts the turn (`turnAbort` — the turn cannot proceed without
+   * its model call) with a branded reason. Terminal/REPL posture identical
+   * to `turnTimeoutMs` (error-event name `"ModelCallTimeout"`). Note: under
+   * `streaming: true` the drain overlaps mid-stream tool dispatch, so the
+   * window covers those tools too — use `turnTimeoutMs` for tool-inclusive
+   * bounds and keep this one comfortably above normal stream latency.
+   */
+  modelCallTimeoutMs?: number;
+  /**
+   * Loop contract 0.4 (G27) — tool-loop detection tuning + escalation
+   * ladder (spec `limits.loop_detection`). `window`/`threshold` thread to
+   * `@crewhaus/tool-loop-detection.detectLoop` (defaults 10 / 3). The
+   * detector now has a NEAR-DUPLICATE tier — same tool, inputs identical
+   * after volatile-substring stripping (numbers/UUIDs/hashes/whitespace),
+   * counted at reduced weight — so trivial argument churn no longer defeats
+   * it. `escalation` picks what happens when a signature trips detection
+   * AGAIN after its one-time warning was ignored:
+   *   - `"warn"` (default) — nothing further; byte-identical to the pre-0.4
+   *     warn-once behaviour.
+   *   - `"justify"` — inject a requireJustification-STYLE demand as a
+   *     synthetic user message: the model must state a one-sentence
+   *     justification tied to the session goal before repeating the call.
+   *     (Deliberately NOT the permission-engine justification gate: that
+   *     gate is a per-tool-descriptor compile-time contract whose schema
+   *     advertises a `justification` input field — retrofitting descriptors
+   *     mid-run would change the advertised tool schema under the model.
+   *     The synthetic nudge is the proportionate in-band mechanism.)
+   *   - `"abort"` — abort the TURN, ToolLoopLimit-style: an `error` event
+   *     (name `"ToolLoopAbort"`) is logged and the state machine takes the
+   *     Aborted transition, exactly like the `maxToolIterations` cap.
+   */
+  loopDetection?: {
+    readonly window?: number;
+    readonly threshold?: number;
+    readonly escalation?: "warn" | "justify" | "abort";
+  };
+  /**
+   * Loop contract 0.4 (G17) — per-tool rate limits (spec
+   * `agent.rate_limits`): tool name (or `"*"` for the every-tool default)
+   * → sustained `rpm` + optional short-burst allowance. At loop start the
+   * runtime builds a `@crewhaus/rate-limiter` with one token bucket per
+   * entry (`refillPerSec = rpm/60`, `capacity = burst ?? rpm`) and every
+   * tool execution acquires `tool:<name>` BEFORE dispatch (after the
+   * permission/justification/egress gates, so denied calls never consume
+   * tokens). Tools with neither a named bucket nor a `"*"` default are not
+   * gated. An acquire that exhausts the limiter's wait budget fails just
+   * that call with an `is_error` tool_result (`[rate-limited] …`) so the
+   * model can adapt — it never kills the run. Independent of the
+   * model-call `rateLimiter`/`rateLimitKeys` pair above.
+   */
+  rateLimits?: Readonly<Record<string, { readonly rpm: number; readonly burst?: number }>>;
+  /**
+   * Loop contract 0.4 (G01) — extended thinking for every MAIN-TURN model
+   * stream (spec `thinking`; same two forms as `IrThinking`). Compaction
+   * and judge side-calls are deliberately untouched — they build their own
+   * `ProviderRequest`s and summarization/grading gains nothing from
+   * spending thinking tokens.
+   *   - `{ budgetTokens }` → `ProviderRequest.thinking =
+   *     { type: "enabled", budget_tokens }` verbatim.
+   *   - `{ effort }` → BOTH fields are set: `thinking` converted through
+   *     `EFFORT_THINKING_BUDGET_TOKENS` (for budget-style providers:
+   *     anthropic/bedrock/gemini) AND `reasoningEffort` passed through (for
+   *     native-effort providers: openai). Adapters ignore the field they
+   *     don't support; anthropic's translate gives an explicit `thinking`
+   *     precedence, so setting both is convergent.
+   * When the resolved budget crowds out the output budget (Anthropic
+   * requires `max_tokens > thinking.budget_tokens`), the per-request token
+   * ceiling is lifted to `budget + maxTokens` so the declared output budget
+   * survives intact (logged once at boot).
+   */
+  thinking?: { readonly budgetTokens: number } | { readonly effort: "low" | "medium" | "high" };
 };
 
 /**
@@ -1407,6 +1507,75 @@ function poolFingerprint(pool: {
   for (let i = 0; i < canonical.length; i++)
     hash = ((hash << 5) + hash + canonical.charCodeAt(i)) >>> 0;
   return `pool-${hash.toString(36)}`;
+}
+
+// ---------------------------------------------------------------------------
+// Loop contract 0.4 (G10) — wall-clock stops. Three configurable timers
+// (`deadlineMs` / `turnTimeoutMs` / `modelCallTimeoutMs`) fire through the
+// EXISTING abort tree (`runAbort` for the deadline, `turnAbort` for the two
+// turn-scoped limits) with a BRANDED abort reason, so the run winds down
+// through the same cancellation paths a SIGINT uses — in-flight model
+// streams reject on their `signal`, tool children cascade — and the loop can
+// afterwards tell a timeout stop from a user abort and classify it.
+// ---------------------------------------------------------------------------
+
+/** Which configured limit fired. `run` = `limits.deadline_ms`,
+ *  `turn` = `limits.turn_timeout_ms`, `model_call` = `limits.model_call_timeout_ms`. */
+export type TimeoutScope = "run" | "turn" | "model_call";
+
+/** The branded abort reason a G10 timer aborts with. Carried on
+ *  `AbortSignal.reason` (the abort tree propagates reasons parent→child, so
+ *  a run-deadline reason is visible on the turn signal too). */
+export type TimeoutAbortReason = {
+  readonly crewhausTimeout: TimeoutScope;
+  readonly limitMs: number;
+};
+
+/** Read the branded timeout reason off an aborted signal, or undefined when
+ *  the signal is not aborted / was aborted for another cause (SIGINT, EOF). */
+export function timeoutAbortReason(signal: AbortSignal): TimeoutAbortReason | undefined {
+  if (!signal.aborted) return undefined;
+  const reason = signal.reason as { crewhausTimeout?: unknown; limitMs?: unknown } | null;
+  if (reason === null || typeof reason !== "object") return undefined;
+  const scope = reason.crewhausTimeout;
+  if (scope !== "run" && scope !== "turn" && scope !== "model_call") return undefined;
+  return {
+    crewhausTimeout: scope,
+    limitMs: typeof reason.limitMs === "number" ? reason.limitMs : 0,
+  };
+}
+
+/** Spec key each scope lowers from — used in detail/remediation copy. */
+const TIMEOUT_SPEC_KEYS: Readonly<Record<TimeoutScope, string>> = {
+  run: "limits.deadline_ms",
+  turn: "limits.turn_timeout_ms",
+  model_call: "limits.model_call_timeout_ms",
+};
+
+const TIMEOUT_TITLES: Readonly<Record<TimeoutScope, string>> = {
+  run: "run deadline exceeded",
+  turn: "turn wall-clock limit exceeded",
+  model_call: "model call wall-clock limit exceeded",
+};
+
+/**
+ * G10 — build the classified terminal report for a fired wall-clock limit.
+ * `class: "timeout"` / exit {@link EXIT_CODES.timeout} joins the failure
+ * taxonomy beside `crewhaus_budget`: like the spend cap, the stop was
+ * CrewHaus's OWN configured ceiling, not a provider failure. Exported for
+ * emitters/tests that render or assert on the report.
+ */
+export function buildTimeoutFailureReport(timeout: TimeoutAbortReason): FailureReport {
+  const scope = timeout.crewhausTimeout;
+  return {
+    class: "timeout",
+    title: TIMEOUT_TITLES[scope],
+    detail: `the configured ${TIMEOUT_SPEC_KEYS[scope]} (${timeout.limitMs}ms) elapsed before the ${
+      scope === "run" ? "run" : scope === "turn" ? "turn" : "model call"
+    } completed`,
+    remediation: `raise ${TIMEOUT_SPEC_KEYS[scope]} in the spec's limits block (or remove it), then rerun.`,
+    exitCode: EXIT_CODES.timeout,
+  };
 }
 
 export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
@@ -1561,6 +1730,42 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // `max_tokens` recovery + `sanitizeOrphanToolUses`), but a higher ceiling
   // avoids the churn. Raise it per spec with `agent.max_tokens`.
   const maxTokens = opts.maxTokens ?? 8192;
+
+  // G01 — resolve the extended-thinking request fields ONCE at boot. The
+  // budget form maps verbatim; the effort form sets BOTH `thinking`
+  // (converted through the shared preset table for budget-style providers)
+  // and `reasoningEffort` (passed through for native-effort providers) —
+  // adapters ignore whichever field they don't support, and anthropic's
+  // translate gives the explicit `thinking` precedence, so the two agree.
+  const thinkingRequest:
+    | {
+        readonly thinking: { readonly type: "enabled"; readonly budgetTokens: number };
+        readonly reasoningEffort?: ReasoningEffort;
+      }
+    | undefined =
+    opts.thinking === undefined
+      ? undefined
+      : "budgetTokens" in opts.thinking
+        ? { thinking: { type: "enabled", budgetTokens: opts.thinking.budgetTokens } }
+        : {
+            thinking: {
+              type: "enabled",
+              budgetTokens: EFFORT_THINKING_BUDGET_TOKENS[opts.thinking.effort],
+            },
+            reasoningEffort: opts.thinking.effort,
+          };
+  // Anthropic (and the other budget-style providers) require
+  // `max_tokens > thinking.budget_tokens` — thinking tokens spend from the
+  // same output ceiling. When the configured budget crowds the ceiling out,
+  // lift the per-request ceiling to `budget + maxTokens` so the declared
+  // output budget survives intact instead of 400-ing every call (e.g.
+  // `effort: high` = 24576 over the 8192 default). The spec-declared
+  // `maxTokens` stays the bridge/sub-agent value — only main-turn requests
+  // (the only ones that carry `thinking`) use the lifted ceiling.
+  const effectiveMaxTokens =
+    thinkingRequest !== undefined && thinkingRequest.thinking.budgetTokens >= maxTokens
+      ? thinkingRequest.thinking.budgetTokens + maxTokens
+      : maxTokens;
 
   // Mutual exclusion: resume takes priority and replaces any seedMessages
   // in REPL mode (the resume payload becomes the seed). Section 12 carves
@@ -1741,6 +1946,15 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // Tests that pass their own runContext rely on observing turnNumber on
   // it after the loop returns, so we never silently swap it out.
   const runContext: RunContext = opts.runContext ?? createRunContext({ sessionId });
+
+  // G01 — surface the max-tokens lift once, at boot (see `effectiveMaxTokens`).
+  if (effectiveMaxTokens !== maxTokens) {
+    runContext.logger.info("thinking budget >= max_tokens — lifting the per-request ceiling", {
+      thinkingBudgetTokens: thinkingRequest?.thinking.budgetTokens,
+      maxTokens,
+      effectiveMaxTokens,
+    });
+  }
 
   // Adaptive model routing — ε-greedy exploration seed. A spec-fixed
   // `learning.seed` reproduces exploration across runs (tests); otherwise the
@@ -2347,6 +2561,35 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       : undefined;
   const toolByName = new Map(tools.map((t) => [t.name, t]));
 
+  // G17 — per-tool rate limiter, built once at loop start from the lowered
+  // `agent.rate_limits` map. One token bucket per entry: `rpm` is the
+  // sustained refill (per-minute → per-second), `burst` the instantaneous
+  // capacity (defaults to `rpm`, the standard token-bucket parameterization
+  // where a full window's allowance may burst). The `"*"` key becomes the
+  // limiter's per-dimension `tool:*` default, which `acquire` falls back to
+  // for any tool without a named bucket — each such tool still gets its OWN
+  // bucket instance (state keys on the specific `tool:<name>`), so the
+  // default is a per-tool limit, not one shared pool. `hasToolRateBucket`
+  // gates the acquire call site: tools outside the map (no named entry, no
+  // `"*"`) are not rate-gated at all — the limiter itself is fail-closed on
+  // unknown keys, so the guard is what keeps unlisted tools ungated.
+  const rateLimitEntries = Object.entries(opts.rateLimits ?? {});
+  let toolRateLimiter: RateLimiter | undefined;
+  if (rateLimitEntries.length > 0) {
+    const buckets = new Map<string, BucketConfig>();
+    for (const [name, limit] of rateLimitEntries) {
+      buckets.set(`tool:${name}`, {
+        kind: "token-bucket",
+        capacity: limit.burst ?? limit.rpm,
+        refillPerSec: limit.rpm / 60,
+      });
+    }
+    toolRateLimiter = createRateLimiter({ buckets });
+  }
+  const hasToolRateBucket = (toolName: string): boolean =>
+    opts.rateLimits !== undefined &&
+    (opts.rateLimits[toolName] !== undefined || opts.rateLimits["*"] !== undefined);
+
   // Root abort tree for the whole run; each turn gets a child.
   const runAbort = createAbortTree(runContext.abortSignal);
   // Per-turn abort tree, replaced at the start of each turn so a SIGINT
@@ -2354,6 +2597,58 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   let turnAbort: AbortTree = runAbort.child();
   // Latest error captured from a model call, fed to recover() on entry to NeedRecovery.
   let lastErrorForRecovery: unknown = undefined;
+
+  // -------------------------------------------------------------------------
+  // G10 — wall-clock stop timers. All three fire through the abort tree with
+  // a branded {@link TimeoutAbortReason} so downstream code can tell a
+  // timeout from a SIGINT (`timeoutAbortReason(signal)`), and all three are
+  // torn down via `clearTimeout` on every exit path (per-turn finally + the
+  // mode-level finally) — plus `unref()` so a long pending deadline never
+  // pins the process by itself. The fire callback stops any live spinner
+  // and prints a one-line notice, mirroring the SIGINT handler.
+  // -------------------------------------------------------------------------
+  type Timer = ReturnType<typeof setTimeout>;
+  const fireTimeout = (tree: AbortTree, scope: TimeoutScope, limitMs: number): void => {
+    out.spinner.stop();
+    const noun =
+      scope === "run" ? "run deadline" : scope === "turn" ? "turn timeout" : "model call timeout";
+    out.write(`\n[${noun}: ${limitMs}ms elapsed — aborting]\n`);
+    runContext.logger.warn("wall-clock limit fired", { scope, limitMs });
+    tree.abort({ crewhausTimeout: scope, limitMs } satisfies TimeoutAbortReason);
+  };
+  const armTimer = (tree: AbortTree, scope: TimeoutScope, limitMs: number): Timer => {
+    const timer = setTimeout(() => fireTimeout(tree, scope, limitMs), limitMs);
+    timer.unref();
+    return timer;
+  };
+  let deadlineTimer: Timer | undefined;
+  if (opts.deadlineMs !== undefined && opts.deadlineMs > 0) {
+    deadlineTimer = armTimer(runAbort, "run", opts.deadlineMs);
+  }
+  let turnTimer: Timer | undefined;
+  const armTurnTimer = (): void => {
+    if (opts.turnTimeoutMs === undefined || opts.turnTimeoutMs <= 0) return;
+    turnTimer = armTimer(turnAbort, "turn", opts.turnTimeoutMs);
+  };
+  const clearTurnTimer = (): void => {
+    if (turnTimer !== undefined) clearTimeout(turnTimer);
+    turnTimer = undefined;
+  };
+  let modelCallTimer: Timer | undefined;
+  const armModelCallTimer = (): void => {
+    if (opts.modelCallTimeoutMs === undefined || opts.modelCallTimeoutMs <= 0) return;
+    modelCallTimer = armTimer(turnAbort, "model_call", opts.modelCallTimeoutMs);
+  };
+  const clearModelCallTimer = (): void => {
+    if (modelCallTimer !== undefined) clearTimeout(modelCallTimer);
+    modelCallTimer = undefined;
+  };
+  const clearAllTimers = (): void => {
+    if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
+    deadlineTimer = undefined;
+    clearTurnTimer();
+    clearModelCallTimer();
+  };
 
   // Permission-ask prompter. Set in REPL mode after the readline interface
   // exists; remains undefined in single-turn mode (where ask collapses to deny).
@@ -2365,8 +2660,17 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // turns within a single `runChatLoop` invocation so cross-turn loops
   // (e.g. "keep running date") get caught and warned at most once per
   // signature.
+  //
+  // G27 — `loopSignatureStage` replaces the old warned-signature Set with a
+  // two-stage ladder per signature: first detection → `"warned"` (the
+  // pre-0.4 one-time warning, all escalation modes), a REPEAT detection of
+  // the same signature → the configured escalation (`justify` demand or
+  // turn `abort`), recorded as `"escalated"` so it fires at most once per
+  // signature too. In the default `"warn"` mode the second stage is a
+  // no-op — byte-identical behaviour to the pre-0.4 runtime.
   const toolUseHistory: TsmToolUseBlock[] = [];
-  const warnedLoopSignatures = new Set<string>();
+  const loopSignatureStage = new Map<string, "warned" | "escalated">();
+  const loopEscalation = opts.loopDetection?.escalation ?? "warn";
 
   // Working-indicator bookkeeping for tool execution. A single shared spinner
   // serves the whole loop, so the set tracks which tools are mid-flight to
@@ -2722,6 +3026,32 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       }
     }
 
+    // G17 — per-tool rate gate. Sits AFTER every deny-capable gate
+    // (permission / justification / egress) so a denied call never burns a
+    // token, and BEFORE dispatch so the pacing wait is what the model
+    // experiences as tool latency. Only tools with a named bucket or under
+    // a `"*"` default are gated (the limiter is fail-closed on unknown
+    // keys, so the guard is what keeps unlisted tools ungated). Exhausting
+    // the limiter's wait budget fails just THIS call with an `is_error`
+    // result the model can adapt to — never the run.
+    if (toolRateLimiter !== undefined && hasToolRateBucket(tu.name)) {
+      try {
+        await toolRateLimiter.acquire([{ dimension: "tool", id: tu.name }], 1);
+      } catch (err) {
+        runContext.logger.warn("tool rate limit exhausted", {
+          toolUseId: tu.id,
+          toolName: tu.name,
+          error: (err as Error).message,
+        });
+        return finish({
+          type: "tool_result",
+          tool_use_id: tu.id,
+          content: `[rate-limited] ${(err as Error).message}. Wait before retrying "${tu.name}", or proceed another way.`,
+          is_error: true,
+        });
+      }
+    }
+
     const toolAbort = turnAbort.child();
     // Build the bridge for this call. Built on EVERY run (#160 follow-up):
     // it carries `runContext`, which Pillar-3 boundary-site tools (tool-mcp,
@@ -3010,25 +3340,105 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   }
 
   /**
-   * Convert a freshly-detected loop into a synthetic user message that
-   * nudges the model to break the cycle. Returns `null` if no loop is
-   * currently detected, or if this signature has already produced a
-   * warning earlier in the run.
+   * G27 — evaluate the per-run tool-use history against the loop detector
+   * and walk the escalation ladder. Outcomes:
+   *   - `none` — no loop, or this signature already exhausted its ladder.
+   *   - `message` — a synthetic user message to inject: the one-time
+   *     warning (`stage: "warn"`, all modes — the pre-0.4 behaviour), or
+   *     the justification demand (`stage: "justify"`) when a warned
+   *     signature trips again under `escalation: "justify"`.
+   *   - `abort` — a warned signature tripped again under
+   *     `escalation: "abort"`: the caller aborts the TURN,
+   *     ToolLoopLimit-style (error event + Aborted transition).
+   * The near-duplicate tier flows through the same ladder; its warning copy
+   * names the volatile-stripped grouping so the model understands why
+   * "different" inputs were counted together.
    */
-  function maybeBuildLoopWarning(): Anthropic.MessageParam | null {
-    const detection: LoopDetection | null = detectLoop(toolUseHistory);
-    if (detection === null) return null;
-    if (warnedLoopSignatures.has(detection.signature)) return null;
-    warnedLoopSignatures.add(detection.signature);
-    runContext.logger.warn("tool loop detected", {
-      signature: detection.signature,
-      toolName: detection.toolName,
-      count: detection.count,
+  type LoopOutcome =
+    | { readonly kind: "none" }
+    | {
+        readonly kind: "message";
+        readonly stage: "warn" | "justify";
+        readonly message: Anthropic.MessageParam;
+        readonly detection: LoopDetection;
+      }
+    | { readonly kind: "abort"; readonly detection: LoopDetection };
+
+  function evaluateToolLoop(): LoopOutcome {
+    const detection: LoopDetection | null = detectLoop(
+      toolUseHistory,
+      opts.loopDetection?.window,
+      opts.loopDetection?.threshold,
+    );
+    if (detection === null) return { kind: "none" };
+    const stage = loopSignatureStage.get(detection.signature);
+    if (stage === undefined) {
+      loopSignatureStage.set(detection.signature, "warned");
+      runContext.logger.warn("tool loop detected", {
+        signature: detection.signature,
+        toolName: detection.toolName,
+        count: detection.count,
+        tier: detection.tier,
+        escalation: loopEscalation,
+      });
+      const how =
+        detection.tier === "exact"
+          ? "with the same input"
+          : "with near-identical inputs (differing only in numbers/ids)";
+      return {
+        kind: "message",
+        stage: "warn",
+        detection,
+        message: {
+          role: "user",
+          content: `[runtime] possible loop detected: tool "${detection.toolName}" has been called ${detection.count} times ${how} within the last ${detection.windowSize} calls. Reconsider before repeating; respond with a different approach or final text.`,
+        },
+      };
+    }
+    if (stage !== "warned") return { kind: "none" };
+    if (loopEscalation === "justify") {
+      loopSignatureStage.set(detection.signature, "escalated");
+      runContext.logger.warn("tool loop persists — demanding justification", {
+        signature: detection.signature,
+        toolName: detection.toolName,
+        count: detection.count,
+        tier: detection.tier,
+      });
+      return {
+        kind: "message",
+        stage: "justify",
+        detection,
+        message: {
+          role: "user",
+          content: `[runtime] the loop on tool "${detection.toolName}" persists after a warning. Before calling "${detection.toolName}" again you MUST state, in one sentence, a justification tying the repeat to the session goal and the NEW outcome you expect (the same discipline requireJustification-gated tools demand). If you cannot, do not repeat the call — take a different approach or answer with final text.`,
+        },
+      };
+    }
+    if (loopEscalation === "abort") {
+      loopSignatureStage.set(detection.signature, "escalated");
+      return { kind: "abort", detection };
+    }
+    // escalation "warn" — the warning already fired once; stay quiet.
+    return { kind: "none" };
+  }
+
+  /**
+   * G27 `escalation: "abort"` bookkeeping — the ToolLoopLimit-style
+   * classified error record (named `error` event + logger line), shared by
+   * the streaming and non-streaming tool-batch call sites. The caller takes
+   * the `Aborted` state transition itself (the two sites sit at different
+   * points in the state machine).
+   */
+  async function recordLoopAbort(detection: LoopDetection): Promise<void> {
+    await logEvent("error", {
+      name: "ToolLoopAbort",
+      message: `aborting turn: tool "${detection.toolName}" still looping (${detection.count}x in the last ${detection.windowSize} calls) after a warning — limits.loop_detection.escalation is "abort"`,
     });
-    return {
-      role: "user",
-      content: `[runtime] possible loop detected: tool "${detection.toolName}" has been called ${detection.count} times with the same input within the last ${detection.windowSize} calls. Reconsider before repeating; respond with a different approach or final text.`,
-    };
+    runContext.logger.error("tool loop escalation — aborting turn", {
+      toolName: detection.toolName,
+      signature: detection.signature,
+      tier: detection.tier,
+    });
   }
 
   /**
@@ -3037,6 +3447,45 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
    * Returns the final assistant content blocks so callers can extract
    * text. Closes over client/model/maxTokens/etc.
    */
+  // v0.3.0 Goal 6 — one structured report on every terminal path, published
+  // to the bus AND appended to the session event log BEFORE the throw (a
+  // throw is invisible to structured consumers; the event is what the UI
+  // host, printers, exporters, and incident capture render). Used by the
+  // recovery `halt`/`fail` arms, the §7.1 sub-agent escalation path in
+  // `NeedTools`, and (G10) the wall-clock timeout stops — including the REPL
+  // deadline-at-prompt path, which is why this lives at run scope rather
+  // than inside `runOneTurn`.
+  const publishRunFailed = async (report: FailureReport): Promise<void> => {
+    const failureMessage = `${report.title}: ${report.detail}`;
+    bus.publish({
+      ...bus.envelope(),
+      kind: "run_failed",
+      class: report.class,
+      message: failureMessage,
+      ...(report.remediation !== undefined ? { remediation: report.remediation } : {}),
+      exitCode: report.exitCode,
+    });
+    await logEvent("run_failed", {
+      class: report.class,
+      message: failureMessage,
+      ...(report.remediation !== undefined ? { remediation: report.remediation } : {}),
+      exitCode: report.exitCode,
+    });
+  };
+
+  /**
+   * G10 — convert a fired wall-clock limit into the classified terminal
+   * stop: publish + log the `run_failed` report (class `"timeout"`), then
+   * throw the matching `RunFailedError`. Callers invoke this only on the
+   * paths where a timeout IS terminal (any scope in `singleTurn` mode; the
+   * run deadline everywhere).
+   */
+  const throwTimeout = async (timeout: TimeoutAbortReason): Promise<never> => {
+    const report = buildTimeoutFailureReport(timeout);
+    await publishRunFailed(report);
+    throw new RunFailedError(report);
+  };
+
   async function runOneTurn(
     messages: Anthropic.MessageParam[],
   ): Promise<{ terminalContent: Anthropic.ContentBlock[] }> {
@@ -3057,30 +3506,6 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     // strongest candidate for the rest of the run (misroute recovery, mirroring
     // the tier router's fast→default escalation latch).
     let escalatePool = false;
-
-    // v0.3.0 Goal 6 — one structured report on every terminal path,
-    // published to the bus AND appended to the session event log BEFORE the
-    // throw (a throw is invisible to structured consumers; the event is what
-    // the UI host, printers, exporters, and incident capture render). Used
-    // by the recovery `halt`/`fail` arms below and by the §7.1 sub-agent
-    // escalation path in `NeedTools`.
-    const publishRunFailed = async (report: FailureReport): Promise<void> => {
-      const failureMessage = `${report.title}: ${report.detail}`;
-      bus.publish({
-        ...bus.envelope(),
-        kind: "run_failed",
-        class: report.class,
-        message: failureMessage,
-        ...(report.remediation !== undefined ? { remediation: report.remediation } : {}),
-        exitCode: report.exitCode,
-      });
-      await logEvent("run_failed", {
-        class: report.class,
-        message: failureMessage,
-        ...(report.remediation !== undefined ? { remediation: report.remediation } : {}),
-        exitCode: report.exitCode,
-      });
-    };
 
     while (state.kind !== "Done") {
       if (turnAbort.signal.aborted) {
@@ -3284,6 +3709,13 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             // `[]` when the seam is absent — the request payload is then
             // byte-identical to a pre-0.3.0 runtime.
             const continuityTail = await buildContinuityTail();
+            // G10 — arm the per-model-call watchdog for exactly the stream's
+            // lifetime: cleared right after each drain below and (throw
+            // paths) at the top of the catch. G01 — every MAIN-turn request
+            // (and only these: compaction/judge side-calls build their own
+            // requests) carries the resolved thinking fields, and the token
+            // ceiling is the thinking-aware `effectiveMaxTokens`.
+            armModelCallTimer();
             const reqStream = turnAdapter.stream({
               model: reqWireModelId,
               system: [
@@ -3303,7 +3735,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                       input_schema: t.input_schema as Record<string, unknown>,
                     }))
                   : undefined,
-              maxTokens,
+              maxTokens: effectiveMaxTokens,
+              ...(thinkingRequest !== undefined ? thinkingRequest : {}),
               signal: turnAbort.signal,
             });
 
@@ -3345,6 +3778,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                   },
                 },
               );
+              clearModelCallTimer();
               endTurn();
 
               // On `stop_reason: "max_tokens"` the model may have been cut off
@@ -3434,22 +3868,32 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               }
               messages.push({ role: "user", content: [...toolResults] });
               await logEvent("user_message", { content: [...toolResults] });
-              const warning = maybeBuildLoopWarning();
-              if (warning !== null) {
-                messages.push(warning);
-                await logEvent("user_message", { content: warning.content, synthetic: true });
+              const loopOutcome = evaluateToolLoop();
+              if (loopOutcome.kind === "message") {
+                messages.push(loopOutcome.message);
+                await logEvent("user_message", {
+                  content: loopOutcome.message.content,
+                  synthetic: true,
+                });
               }
 
               // Synthesize the two transitions the state machine expects:
               // tools have already executed during the stream so we
               // collapse ModelReturnedToolUse → ToolsExecuted into a
-              // single hop back to NeedModel.
+              // single hop back to NeedModel. (G27: on an `abort` loop
+              // escalation the second hop is the Aborted transition — the
+              // NeedTools state accepts it — ending the turn instead.)
               const tsmBlocks: TsmToolUseBlock[] = toolUses.map((t) => ({
                 id: t.id,
                 name: t.name,
                 input: t.input,
               }));
               state = transition(state, { kind: "ModelReturnedToolUse", toolUses: tsmBlocks });
+              if (loopOutcome.kind === "abort") {
+                await recordLoopAbort(loopOutcome.detection);
+                state = transition(state, { kind: "Aborted" });
+                break;
+              }
               state = transition(state, { kind: "ToolsExecuted" });
               break;
             }
@@ -3470,6 +3914,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 );
               },
             });
+            clearModelCallTimer();
             endTurn();
 
             // Item 22 — lastServed() is exact: the candidate that actually
@@ -3571,6 +4016,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               state = transition(state, { kind: "ModelReturnedToolUse", toolUses: tsmBlocks });
             }
           } catch (err) {
+            // G10 — the watchdog must not outlive the call it watched.
+            clearModelCallTimer();
             // Tear down the "thinking" animation before any error/abort output.
             out.spinner.stop();
             if (isAbortError(err)) {
@@ -3650,10 +4097,19 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           }
           messages.push({ role: "user", content: toolResults });
           await logEvent("user_message", { content: toolResults });
-          const warning = maybeBuildLoopWarning();
-          if (warning !== null) {
-            messages.push(warning);
-            await logEvent("user_message", { content: warning.content, synthetic: true });
+          const loopOutcome = evaluateToolLoop();
+          if (loopOutcome.kind === "message") {
+            messages.push(loopOutcome.message);
+            await logEvent("user_message", {
+              content: loopOutcome.message.content,
+              synthetic: true,
+            });
+          } else if (loopOutcome.kind === "abort") {
+            // G27 escalation "abort" — the warned signature tripped again:
+            // end the TURN, ToolLoopLimit-style (see recordLoopAbort).
+            await recordLoopAbort(loopOutcome.detection);
+            state = transition(state, { kind: "Aborted" });
+            break;
           }
           state = transition(state, { kind: "ToolsExecuted" });
           break;
@@ -3851,6 +4307,26 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     // Item 26 — hand this turn's tool_use count to the next turn's tier
     // decision (the prior-tool-density signal).
     priorTurnToolUseCount = thisTurnToolUseCount;
+
+    // G10 — the turn wound down through the Aborted transition; if a
+    // wall-clock timer (not a SIGINT) is what aborted it, classify the stop.
+    // The abort tree propagates reasons parent→child, so a run-deadline
+    // reason is readable off the TURN signal too; checking both covers the
+    // window where the deadline fires between turns. Terminal when the
+    // deadline fired (any mode) or in `singleTurn` mode (the turn IS the
+    // run); in REPL mode a turn/model-call timeout already printed its
+    // notice at fire time — record the named error and hand control back to
+    // the prompt, mirroring the first-SIGINT semantics.
+    const timedOut = timeoutAbortReason(turnAbort.signal) ?? timeoutAbortReason(runAbort.signal);
+    if (timedOut !== undefined) {
+      if (timedOut.crewhausTimeout === "run" || opts.singleTurn === true) {
+        await throwTimeout(timedOut);
+      }
+      await logEvent("error", {
+        name: timedOut.crewhausTimeout === "turn" ? "TurnTimeout" : "ModelCallTimeout",
+        message: `turn aborted: the configured ${TIMEOUT_SPEC_KEYS[timedOut.crewhausTimeout]} (${timedOut.limitMs}ms) elapsed`,
+      });
+    }
     return { terminalContent };
   }
 
@@ -3927,7 +4403,13 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         },
       );
 
+      // G10 — the single turn IS the run: arm the per-turn ceiling around
+      // it (the deadline timer is already live from boot). Fired timers
+      // surface as a classified RunFailedError out of runOneTurn; the
+      // finally below tears every timer down on all paths.
+      armTurnTimer();
       const { terminalContent } = await runOneTurn(messages);
+      clearTurnTimer();
       bus.publish({
         ...bus.envelope(),
         kind: "turn_end",
@@ -3939,6 +4421,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         .map((b) => b.text)
         .join("");
     } finally {
+      clearAllTimers();
       out.spinner.stop();
       await fireHook("stop", {
         sessionId,
@@ -3990,6 +4473,18 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   const STDIN_CLOSED = Symbol("stdin-closed");
   const closedSignal = new Promise<typeof STDIN_CLOSED>((resolve) => {
     rl.once("close", () => resolve(STDIN_CLOSED));
+  });
+
+  // G10 — a fired run deadline must also interrupt an IDLE `rl.question`
+  // wait (the loop-top abort check only runs once input arrives), so each
+  // prompt races this alongside the stdin-close sentinel.
+  const RUN_ABORTED = Symbol("run-aborted");
+  const runAbortedSignal = new Promise<typeof RUN_ABORTED>((resolve) => {
+    if (runAbort.signal.aborted) {
+      resolve(RUN_ABORTED);
+    } else {
+      runAbort.signal.addEventListener("abort", () => resolve(RUN_ABORTED), { once: true });
+    }
   });
 
   // Wire the permission-ask prompter once the readline interface exists.
@@ -4064,8 +4559,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
 
       let userInput: string;
       try {
-        const result = await Promise.race([rl.question("\nyou> "), closedSignal]);
-        if (result === STDIN_CLOSED) break;
+        const result = await Promise.race([rl.question("\nyou> "), closedSignal, runAbortedSignal]);
+        if (result === STDIN_CLOSED || result === RUN_ABORTED) break;
         userInput = result.trim();
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code === "ERR_USE_AFTER_CLOSE") break;
@@ -4152,6 +4647,13 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         },
       );
 
+      // G10 — per-turn wall-clock ceiling: armed for exactly the
+      // `runOneTurn` window, torn down on every exit (finally). A fired
+      // turn/model-call timer aborts the turn and (REPL posture) control
+      // returns to the prompt below — mirroring the first-SIGINT semantics;
+      // a fired run deadline makes `runOneTurn` throw the classified
+      // RunFailedError, which the catch rethrows.
+      armTurnTimer();
       try {
         await runOneTurn(messages);
       } catch (err) {
@@ -4163,6 +4665,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         } else {
           throw err;
         }
+      } finally {
+        clearTurnTimer();
       }
 
       bus.publish({
@@ -4175,7 +4679,20 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         turn: runContext.turnNumber,
       });
     }
+
+    // G10 — the loop exited on an aborted run root: when the RUN DEADLINE
+    // (not a SIGINT/EOF) is what aborted it, the stop is terminal and
+    // classified. Published here — still inside the try, BEFORE the finally
+    // tears the bus subscribers down — then thrown so `crewhaus run`/bundle
+    // wrappers render the report and exit with EXIT_CODES.timeout. (A
+    // deadline that fired MID-turn already threw from inside runOneTurn and
+    // never reaches this check.)
+    const runTimeout = timeoutAbortReason(runAbort.signal);
+    if (runTimeout !== undefined) {
+      await throwTimeout(runTimeout);
+    }
   } finally {
+    clearAllTimers();
     out.spinner.stop();
     await fireHook("stop", {
       sessionId,

@@ -22,7 +22,11 @@
  * looping forever.
  */
 import type { ProviderAdapter } from "@crewhaus/adapter-anthropic";
-import type { CrewMailbox } from "@crewhaus/agent-context-isolation";
+import type {
+  CrewMailbox,
+  SpawnSubAgentFn,
+  SubAgentDefinition,
+} from "@crewhaus/agent-context-isolation";
 import { classifyBoundary } from "@crewhaus/boundary-classifier";
 import { CrewhausError } from "@crewhaus/errors";
 import { type EventLog, openEventLog } from "@crewhaus/event-log";
@@ -54,6 +58,18 @@ export class HandoffRefusedError extends CrewhausError {
   }
 }
 
+/**
+ * Loop contract 0.4 (Batch A) — per-role extended-thinking selector.
+ * IrThinking-shaped verbatim: exactly one of `budgetTokens` (explicit
+ * Anthropic-style thinking budget) or `effort` (provider-preset tier,
+ * converted through `EFFORT_THINKING_BUDGET_TOKENS` by the adapters).
+ * Kept inline (no `@crewhaus/ir` dependency) exactly as the IR mirrors
+ * runtime ids — keep the two in sync.
+ */
+export type RoleThinking =
+  | { readonly budgetTokens: number }
+  | { readonly effort: "low" | "medium" | "high" };
+
 export type RoleDefinition = {
   readonly model: string;
   readonly instructions: string;
@@ -63,13 +79,36 @@ export type RoleDefinition = {
   readonly maxTokens?: number;
   /** Override single-turn behaviour. Defaults to true (one user→assistant turn per activation). */
   readonly singleTurn?: boolean;
+  /** Loop contract 0.4 (Batch A) — extended-thinking selector forwarded to
+   *  this role's turns (primary activations AND inline A2A peer turns). */
+  readonly thinking?: RoleThinking;
+  /** Section 13 (Batch A, G34) — inline sub-agent definitions surfaced to
+   *  this role's `Task` tool. Forwarded to the role's runChatLoop together
+   *  with the run-level `spawnSubAgent` injection (see RunOptions). */
+  readonly subAgents?: ReadonlyMap<string, SubAgentDefinition>;
 };
 
-export type RouterFn = (args: {
-  input: string;
-  lastRole: string | undefined;
-  activation: number;
-}) => string;
+export type RouterArgs = {
+  readonly input: string;
+  readonly lastRole: string | undefined;
+  readonly activation: number;
+  /** Run-scoped passthrough for model-backed routers (`routing.kind: "llm"`):
+   *  the run's session root, so a router's classify turn persists beside the
+   *  crew session instead of the process-global default. */
+  readonly sessionRootDir?: string;
+  /** Test injection backdoor mirroring `RunOptions._adapter` — forwarded to
+   *  the router each consult so a generated llm router's classify turn stays
+   *  scriptable through the same seam as every role turn. */
+  readonly _adapter?: ProviderAdapter;
+};
+
+/**
+ * Routing decision, consulted after every role turn that queued no handoff.
+ * Loop contract 0.4 (Batch A, G08) — may return a Promise so model-backed
+ * routers (the generated `routing.kind: "llm"` classify turn) can await a
+ * runChatLoop call; plain string returns keep working unchanged.
+ */
+export type RouterFn = (args: RouterArgs) => string | Promise<string>;
 
 export type CrewEvent =
   | { kind: "role_start"; role: string; activation: number }
@@ -89,6 +128,29 @@ export type CrewEvent =
       activations: number;
       durationMs: number;
     };
+
+/**
+ * Loop contract 0.4 (Batch A) — hard per-turn runtime ceilings (IrLimits-
+ * shaped, minus the crew-only `crew` block whose caps map onto the dedicated
+ * RunOptions fields). `maxToolIterations`/`maxConcurrentTools`/`contextLimit`
+ * forward onto runtime-core's existing typed knobs; the remaining 0.4
+ * enforcement knobs (`deadlineMs`/`turnTimeoutMs`/`modelCallTimeoutMs`/
+ * `loopDetection`) ride the forward-compat spread in `composeLoopTuning`
+ * until runtime-core's loop-contract options land.
+ */
+export type CrewLoopLimits = {
+  readonly maxToolIterations?: number;
+  readonly maxConcurrentTools?: number;
+  readonly contextLimit?: number;
+  readonly deadlineMs?: number;
+  readonly turnTimeoutMs?: number;
+  readonly modelCallTimeoutMs?: number;
+  readonly loopDetection?: {
+    readonly window?: number;
+    readonly threshold?: number;
+    readonly escalation?: "warn" | "justify" | "abort";
+  };
+};
 
 export type RunOptions = {
   /** Permission mode for every role's runChatLoop. Default "default". */
@@ -120,6 +182,27 @@ export type RunOptions = {
   readonly maxActivations?: number;
   /** Cap on A2A recursion depth (peer-asks-peer-asks-peer). Default 3. */
   readonly maxA2ADepth?: number;
+  /**
+   * Loop contract 0.4 (Batch A) — per-turn loop ceilings (spec `limits:`
+   * minus the crew-only block), forwarded to EVERY role's runChatLoop.
+   * The crew-LEVEL orchestration caps (`limits.crew`) map onto the
+   * dedicated `maxActivations`/`refusalDepth`/`maxA2ADepth` options above
+   * instead — they bound the orchestrator, not a single loop.
+   */
+  readonly limits?: CrewLoopLimits;
+  /** Item 27 / loop contract 0.4 — run-level spend cap + degradation
+   *  ladder, forwarded verbatim to every role's runChatLoop (the always-on
+   *  cost meter accrues each role turn's spend against the same cap). */
+  readonly budget?: RunChatLoopOptions["budget"];
+  /** Section 11 / loop contract 0.4 — spec-declared lifecycle hooks,
+   *  forwarded verbatim to every role's runChatLoop. */
+  readonly hooks?: RunChatLoopOptions["hooks"];
+  /** Section 13 (Batch A, G34) — sub-agent spawner injection, the same
+   *  inverted-DI seam as runChatLoop's own option: codegen passes
+   *  `spawnSubAgent` from `@crewhaus/sub-agent-spawner`; the orchestrator
+   *  forwards it to every role turn so roles that declare `subAgents` can
+   *  dispatch their `Task` tool. */
+  readonly spawnSubAgent?: SpawnSubAgentFn;
   /** Optional stable session id; defaults to `runContext.sessionId`. */
   readonly sessionId?: string;
   /** Override session root dir. Defaults to runtime-core's default `.crewhaus/sessions`. */
@@ -461,6 +544,10 @@ async function* driveCrew(
           ...(args.opts.memory !== undefined ? { memory: args.opts.memory } : {}),
           ...(args.opts.continuity !== undefined ? { continuity: args.opts.continuity } : {}),
           ...(args.opts.skills !== undefined ? { skills: args.opts.skills } : {}),
+          // Loop contract 0.4 (Batch A) — run-level ceilings + the peer
+          // role's own selectors, identical to a primary activation; the
+          // cast is composeLoopTuning's documented forward-compat seam.
+          ...(composeLoopTuning(peerDef, args.opts) as Partial<RunChatLoopOptions>),
           installSigintHandler: false,
           maxTokens: peerDef.maxTokens ?? DEFAULT_MAX_TOKENS,
           crewMailbox: mailbox,
@@ -538,6 +625,10 @@ async function* driveCrew(
           ...(args.opts.memory !== undefined ? { memory: args.opts.memory } : {}),
           ...(args.opts.continuity !== undefined ? { continuity: args.opts.continuity } : {}),
           ...(args.opts.skills !== undefined ? { skills: args.opts.skills } : {}),
+          // Loop contract 0.4 (Batch A) — run-level ceilings (limits/budget/
+          // hooks/spawner) + this role's selectors (thinking/subAgents); the
+          // cast is composeLoopTuning's documented forward-compat seam.
+          ...(composeLoopTuning(def, args.opts) as Partial<RunChatLoopOptions>),
           installSigintHandler: false,
           maxTokens: def.maxTokens ?? DEFAULT_MAX_TOKENS,
           crewMailbox: mailbox,
@@ -602,12 +693,17 @@ async function* driveCrew(
 
         // No pending handoff — optionally consult the routing function.
         // The default behaviour (no router) is to terminate after the
-        // current role's `end_turn`.
+        // current role's `end_turn`. Awaited since 0.4 (G08): model-backed
+        // routers return a Promise; plain string routers resolve untouched.
         if (args.router !== undefined) {
-          const next = args.router({
+          const next = await args.router({
             input: output,
             lastRole: currentRoleName,
             activation: activations,
+            ...(args.opts.sessionRootDir !== undefined
+              ? { sessionRootDir: args.opts.sessionRootDir }
+              : {}),
+            ...(args.opts._adapter !== undefined ? { _adapter: args.opts._adapter } : {}),
           });
           if (next !== currentRoleName && args.roleNames.includes(next)) {
             consecutiveHandoffs = 0; // a router move is not a refusal
@@ -752,6 +848,69 @@ async function buildHandoffSeed(
     "You now own the conversation. Continue the work end-to-end, calling tools as needed, and respond directly to the user when you are done.",
   );
   return [{ role: "user", content: parts.join("\n\n") }];
+}
+
+/**
+ * Loop contract 0.4 (Batch A) — fold the run-level ceilings (`opts.limits`,
+ * `opts.budget`, `opts.hooks`, the `spawnSubAgent` injection) and the
+ * role-level selectors (`thinking`, `subAgents`) into one runChatLoop
+ * options fragment, applied IDENTICALLY to primary role activations and
+ * inline A2A peer turns. Only declared fields are present — the runtime
+ * owns every default, so a knob-less run stays byte-identical to pre-0.4.
+ *
+ * The returned fragment is spread into each call site behind a
+ * `Partial<RunChatLoopOptions>` cast: `maxToolIterations`/
+ * `maxConcurrentTools`/`contextLimit`/`budget`/`hooks`/`subAgents`/
+ * `spawnSubAgent` are pre-existing runtime options, while the 0.4
+ * enforcement knobs (`deadlineMs`/`turnTimeoutMs`/`modelCallTimeoutMs`/
+ * `loopDetection`/`thinking`) are typed locally until runtime-core's
+ * loop-contract options land — the cast is the forward-compat seam that
+ * compiles (and forwards compatibly) on both sides of that landing; a
+ * runtime without the knobs simply ignores the extra keys. Drop the cast
+ * once runtime-core carries them (the `LoopTuningFragment` intersection then
+ * self-checks: a shape drift between these local members and the landed
+ * runtime options turns the member type impossible and fails this file's
+ * compile). Exported for direct unit coverage of the mapping.
+ */
+export type LoopTuningFragment = Pick<
+  RunChatLoopOptions,
+  | "maxToolIterations"
+  | "maxConcurrentTools"
+  | "contextLimit"
+  | "budget"
+  | "hooks"
+  | "subAgents"
+  | "spawnSubAgent"
+> & {
+  readonly deadlineMs?: number;
+  readonly turnTimeoutMs?: number;
+  readonly modelCallTimeoutMs?: number;
+  readonly loopDetection?: CrewLoopLimits["loopDetection"];
+  readonly thinking?: RoleThinking;
+};
+
+export function composeLoopTuning(def: RoleDefinition, opts: RunOptions): LoopTuningFragment {
+  const limits = opts.limits ?? {};
+  return {
+    ...(limits.maxToolIterations !== undefined
+      ? { maxToolIterations: limits.maxToolIterations }
+      : {}),
+    ...(limits.maxConcurrentTools !== undefined
+      ? { maxConcurrentTools: limits.maxConcurrentTools }
+      : {}),
+    ...(limits.contextLimit !== undefined ? { contextLimit: limits.contextLimit } : {}),
+    ...(limits.deadlineMs !== undefined ? { deadlineMs: limits.deadlineMs } : {}),
+    ...(limits.turnTimeoutMs !== undefined ? { turnTimeoutMs: limits.turnTimeoutMs } : {}),
+    ...(limits.modelCallTimeoutMs !== undefined
+      ? { modelCallTimeoutMs: limits.modelCallTimeoutMs }
+      : {}),
+    ...(limits.loopDetection !== undefined ? { loopDetection: limits.loopDetection } : {}),
+    ...(opts.budget !== undefined ? { budget: opts.budget } : {}),
+    ...(opts.hooks !== undefined ? { hooks: opts.hooks } : {}),
+    ...(def.thinking !== undefined ? { thinking: def.thinking } : {}),
+    ...(def.subAgents !== undefined ? { subAgents: def.subAgents } : {}),
+    ...(opts.spawnSubAgent !== undefined ? { spawnSubAgent: opts.spawnSubAgent } : {}),
+  };
 }
 
 function composeRoleTools(args: {

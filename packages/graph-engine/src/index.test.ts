@@ -3,6 +3,9 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type CheckpointStore, createCheckpointStore } from "@crewhaus/checkpoint-store";
+import { EXIT_CODES, RunFailedError } from "@crewhaus/errors";
+import { createRunContext } from "@crewhaus/run-context";
+import type { TraceEvent } from "@crewhaus/trace-event-bus";
 import {
   GraphBuildError,
   GraphRunError,
@@ -155,6 +158,203 @@ describe("parallel groups (T3)", () => {
     expect(state.right).toBe(2);
     // Both started before either finished — proves parallelism.
     expect(order.indexOf("right-start")).toBeLessThan(order.indexOf("left-end"));
+  });
+});
+
+describe("parallel merge collisions (G69)", () => {
+  type PState = { seed: number; left?: string; right?: string; verdict?: string };
+
+  /** Two branches that both write `verdict` — the collision case. */
+  function collidingGraph() {
+    return createGraph<unknown, PState>({ checkpointStore: store })
+      .setInputAdapter(() => ({ seed: 1 }))
+      .addNode("entry", async (_c, s) => s)
+      .addNode("left", async (_c, s) => ({ ...s, left: "L", verdict: "from-left" }))
+      .addNode("right", async (_c, s) => ({ ...s, right: "R", verdict: "from-right" }))
+      .addParallel(["left", "right"])
+      .addEdge("entry", "left")
+      .setEntry("entry")
+      .compile();
+  }
+
+  test("a key modified by two branches fails the run with a classified RunFailedError", async () => {
+    const g = collidingGraph();
+    let thrown: unknown;
+    try {
+      await collectTerminalState(g.run({}));
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(RunFailedError);
+    if (!(thrown instanceof RunFailedError)) throw new Error("expected RunFailedError");
+    expect(thrown.report.class).toBe("config");
+    expect(thrown.report.exitCode).toBe(EXIT_CODES.config);
+    expect(thrown.report.title).toBe("parallel merge key collision");
+    expect(thrown.report.detail).toContain('state key "verdict"');
+    expect(thrown.report.detail).toContain("left");
+    expect(thrown.report.detail).toContain("right");
+    expect(thrown.report.remediation).toContain("reducer");
+  });
+
+  test("the collision publishes a run_failed trace event before throwing", async () => {
+    const g = collidingGraph();
+    const runContext = createRunContext();
+    const seen: TraceEvent[] = [];
+    runContext.eventBus.subscribe((ev) => {
+      seen.push(ev);
+    });
+    await expect(collectTerminalState(g.run({}, { runContext }))).rejects.toThrow(RunFailedError);
+    const failed = seen.filter((ev) => ev.kind === "run_failed");
+    expect(failed.length).toBe(1);
+    if (failed[0]?.kind !== "run_failed") throw new Error("missing run_failed event");
+    expect(failed[0].class).toBe("config");
+    expect(failed[0].exitCode).toBe(EXIT_CODES.config);
+    expect(failed[0].message).toContain("parallel merge key collision");
+    expect(failed[0].message).toContain('"verdict"');
+    expect(failed[0].remediation).toContain("reducer");
+  });
+
+  test("branches that merely echo untouched upstream keys do NOT collide", async () => {
+    // The codegen pattern: every node returns `{ ...prev, [name]: reply }`,
+    // so all of prev's keys appear (unchanged) in every branch result.
+    const g = createGraph<unknown, PState>({ checkpointStore: store })
+      .setInputAdapter(() => ({ seed: 7 }))
+      .addNode("entry", async (_c, s) => s)
+      .addNode("left", async (_c, s) => ({ ...s, left: "L" }))
+      .addNode("right", async (_c, s) => ({ ...s, right: "R" }))
+      .addParallel(["left", "right"])
+      .addEdge("entry", "left")
+      .setEntry("entry")
+      .compile();
+    const { state } = await collectTerminalState(g.run({}));
+    expect(state).toEqual({ seed: 7, left: "L", right: "R" });
+  });
+
+  test("two branches writing the SAME new value still collide (lossy merge either way)", async () => {
+    // Both increment: last-writer-wins would record 2 where 3 was meant.
+    const g = createGraph<unknown, { count: number }>({ checkpointStore: store })
+      .setInputAdapter(() => ({ count: 1 }))
+      .addNode("entry", async (_c, s) => s)
+      .addNode("incA", async (_c, s) => ({ count: s.count + 1 }))
+      .addNode("incB", async (_c, s) => ({ count: s.count + 1 }))
+      .addParallel(["incA", "incB"])
+      .addEdge("entry", "incA")
+      .setEntry("entry")
+      .compile();
+    let thrown: unknown;
+    try {
+      await collectTerminalState(g.run({}));
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(RunFailedError);
+    if (!(thrown instanceof RunFailedError)) throw new Error("expected RunFailedError");
+    expect(thrown.report.detail).toContain('state key "count"');
+  });
+
+  test("a per-group reducer owns the merge: no collision check, results in declaration order", async () => {
+    const seenByReducer: Array<{ node: string; state: { count: number } }> = [];
+    const g = createGraph<unknown, { count: number }>({ checkpointStore: store })
+      .setInputAdapter(() => ({ count: 1 }))
+      .addNode("entry", async (_c, s) => s)
+      .addNode("incA", async (_c, s) => ({ count: s.count + 1 }))
+      .addNode("incB", async (_c, s) => ({ count: s.count + 10 }))
+      .addParallel(["incA", "incB"], {
+        reducer: (prev, results) => {
+          seenByReducer.push(...results.map((r) => ({ node: r.node, state: r.state })));
+          // Sum the per-branch deltas — the merge Object.assign can't express.
+          return {
+            count: results.reduce((acc, r) => acc + (r.state.count - prev.count), prev.count),
+          };
+        },
+      })
+      .addEdge("entry", "incA")
+      .setEntry("entry")
+      .compile();
+    const { state } = await collectTerminalState(g.run({}));
+    expect(state.count).toBe(1 + 1 + 10);
+    expect(seenByReducer.map((r) => r.node)).toEqual(["incA", "incB"]);
+    expect(seenByReducer.map((r) => r.state.count)).toEqual([2, 11]);
+  });
+
+  test("an async reducer is awaited", async () => {
+    const g = createGraph<unknown, { count: number }>({ checkpointStore: store })
+      .setInputAdapter(() => ({ count: 0 }))
+      .addNode("entry", async (_c, s) => s)
+      .addNode("a", async (_c, s) => ({ count: s.count + 2 }))
+      .addNode("b", async (_c, s) => ({ count: s.count + 3 }))
+      .addParallel(["a", "b"], {
+        reducer: async (_prev, results) => {
+          await new Promise((r) => setTimeout(r, 1));
+          return { count: results.reduce((acc, r) => acc + r.state.count, 0) };
+        },
+      })
+      .addEdge("entry", "a")
+      .setEntry("entry")
+      .compile();
+    const { state } = await collectTerminalState(g.run({}));
+    expect(state.count).toBe(5);
+  });
+});
+
+describe("when/parallel end-to-end (the emitted-bundle shape)", () => {
+  // Mirrors exactly what target-graph emits for a spec with `edges[].when`
+  // + `parallel`: node fns record their reply under `state["<name>"]`, when
+  // predicates read those keys, and the parallel group fans out then merges.
+  type S = Record<string, unknown>;
+
+  function emittedShapeGraph(reviewReply: string) {
+    return (
+      createGraph<unknown, S>({ checkpointStore: store })
+        .setInputAdapter((input) => ({ input }) as S)
+        .addNode("review", async (_c, prev) => ({ ...prev, review: reviewReply }))
+        .addNode("fanA", async (_c, prev) => ({ ...prev, fanA: "a-done" }))
+        .addNode("fanB", async (_c, prev) => ({ ...prev, fanB: "b-done" }))
+        .addNode("escalate", async (_c, prev) => ({ ...prev, escalate: "escalated" }))
+        .addNode("publish", async (_c, prev) => ({ ...prev, publish: "published" }))
+        .addParallel(["fanA", "fanB"])
+        // `when.equals` lowers to `(state) => state[key] === literal`.
+        .addEdge(
+          "review",
+          "fanA",
+          (__state) => (__state as Record<string, unknown>)["review"] === "approve",
+        )
+        // Declaration order is semantics: the unconditional fallback comes second.
+        .addEdge("review", "escalate")
+        // `when.exists` lowers to `(state) => state[key] !== undefined`.
+        .addEdge(
+          "fanB",
+          "publish",
+          (__state) => (__state as Record<string, unknown>)["fanA"] !== undefined,
+        )
+        .setEntry("review")
+        .compile()
+    );
+  }
+
+  test("approve route: equals-condition edge fires, the group fans out, exists-condition continues", async () => {
+    const g = emittedShapeGraph("approve");
+    const events: NodeEvent<S>[] = [];
+    for await (const ev of g.run({ input: "go" })) events.push(ev);
+    const done = events.find((e) => e.kind === "run_done");
+    if (done?.kind !== "run_done") throw new Error("missing run_done");
+    expect(done.state["review"]).toBe("approve");
+    expect(done.state["fanA"]).toBe("a-done");
+    expect(done.state["fanB"]).toBe("b-done");
+    expect(done.state["publish"]).toBe("published");
+    expect(done.state["escalate"]).toBeUndefined();
+    // The parallel barrier ran as ONE synthetic node.
+    const starts = events.filter((e) => e.kind === "node_start").map((e) => e.nodeName);
+    expect(starts).toContain("[parallel: fanA,fanB]");
+  });
+
+  test("reject route: equals-condition misses and the unconditional fallback edge wins", async () => {
+    const g = emittedShapeGraph("reject");
+    const { state } = await collectTerminalState(g.run({ input: "go" }));
+    expect(state["escalate"]).toBe("escalated");
+    expect(state["fanA"]).toBeUndefined();
+    expect(state["fanB"]).toBeUndefined();
+    expect(state["publish"]).toBeUndefined();
   });
 });
 

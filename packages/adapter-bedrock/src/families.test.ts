@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import type { ProviderRequest } from "@crewhaus/adapter-anthropic";
+import { EFFORT_THINKING_BUDGET_TOKENS, type ProviderRequest } from "@crewhaus/adapter-anthropic";
 import {
   ANTHROPIC_BEDROCK_VERSION,
   buildAnthropicBedrockBody,
@@ -39,6 +39,25 @@ describe("anthropic-on-bedrock body", () => {
     ]);
     expect(body.tool_choice).toEqual({ type: "tool", name: "Read" });
     expect(body.thinking).toEqual({ type: "enabled", budget_tokens: 1024 });
+  });
+
+  test("reasoningEffort converts to budget_tokens via the shared preset table", () => {
+    for (const effort of ["low", "medium", "high"] as const) {
+      const body = buildAnthropicBedrockBody({ ...baseReq, reasoningEffort: effort });
+      expect(body.thinking).toEqual({
+        type: "enabled",
+        budget_tokens: EFFORT_THINKING_BUDGET_TOKENS[effort],
+      });
+    }
+  });
+
+  test("explicit thinking budget wins over reasoningEffort", () => {
+    const body = buildAnthropicBedrockBody({
+      ...baseReq,
+      thinking: { type: "enabled", budgetTokens: 4096 },
+      reasoningEffort: "high",
+    });
+    expect(body.thinking).toEqual({ type: "enabled", budget_tokens: 4096 });
   });
 
   test("non-tool tool_choice (auto/any) passes only the type through", () => {

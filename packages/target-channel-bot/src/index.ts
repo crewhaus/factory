@@ -269,12 +269,98 @@ function renderBudgetField(ir: IrChannelV0): string {
 /**
  * Thread `compaction.model` so a channel bot's auto-compaction summarizes on
  * the spec's chosen model instead of the primary. The compiler already
- * resolved the `cheapest` sentinel to a concrete id. Empty when omitted.
- * Mirror: target-cli renders the same field.
+ * resolved the `cheapest` sentinel to a concrete id. Loop contract 0.4
+ * (Batch A) adds the tuning knobs alongside it: `compaction.threshold` →
+ * `compactionThreshold` (context-fill fraction that triggers autocompact)
+ * and `snip_keep_head`/`snip_keep_tail` → `snipKeepHead`/`snipKeepTail`
+ * (messages preserved verbatim by `compaction-snip`). Each field is emitted
+ * only when the spec declared it — the runtime owns every default — so
+ * existing bundles stay byte-identical. Mirror: target-cli renders the same
+ * fields.
  */
-function renderCompactionModelField(ir: IrChannelV0): string {
-  if (ir.compaction.model === undefined) return "";
-  return `\n        compactionModel: ${escapeJsonString(ir.compaction.model)},`;
+function renderCompactionFields(ir: IrChannelV0): string {
+  const pieces: string[] = [];
+  if (ir.compaction.model !== undefined) {
+    pieces.push(`\n        compactionModel: ${escapeJsonString(ir.compaction.model)},`);
+  }
+  if (ir.compaction.threshold !== undefined) {
+    pieces.push(`\n        compactionThreshold: ${ir.compaction.threshold},`);
+  }
+  if (ir.compaction.snipKeepHead !== undefined) {
+    pieces.push(`\n        snipKeepHead: ${ir.compaction.snipKeepHead},`);
+  }
+  if (ir.compaction.snipKeepTail !== undefined) {
+    pieces.push(`\n        snipKeepTail: ${ir.compaction.snipKeepTail},`);
+  }
+  return pieces.join("");
+}
+
+/**
+ * Loop contract 0.4 (Batch A) — thread the agent-level tuning knobs into the
+ * generated interactive `runChatLoop` call, camelCase-mirroring the IR 1:1:
+ * `agent.max_tokens` → `maxTokens` (model max OUTPUT tokens per turn),
+ * `agent.thinking` → `thinking` (extended-thinking selector; exactly one of
+ * `{ budgetTokens }` / `{ effort }` by spec construction), and
+ * `agent.rate_limits` → `rateLimits` (per-tool rpm/burst buckets, `"*"` the
+ * catch-all). Each field is emitted only when the spec declared it so
+ * existing bundles stay byte-identical. The dream path is deliberately NOT
+ * tuned by these — its bounded fresh session keeps memory-service's own
+ * DREAM_MAX_TOOL_ITERATIONS / budget seam inputs. Mirror: target-cli +
+ * target-managed render the same fields.
+ */
+function renderAgentTuningFields(ir: IrChannelV0): string {
+  const pieces: string[] = [];
+  if (ir.agent.maxTokens !== undefined) {
+    pieces.push(`\n        maxTokens: ${ir.agent.maxTokens},`);
+  }
+  if (ir.agent.thinking !== undefined) {
+    pieces.push(`\n        thinking: ${JSON.stringify(ir.agent.thinking)},`);
+  }
+  if (ir.agent.rateLimits !== undefined) {
+    pieces.push(`\n        rateLimits: ${JSON.stringify(ir.agent.rateLimits)},`);
+  }
+  return pieces.join("");
+}
+
+/**
+ * Loop contract 0.4 (Batch A) — thread the top-level `limits:` ceilings into
+ * the generated interactive `runChatLoop` call as the runtime's individual
+ * top-level knobs (`maxToolIterations` / `maxConcurrentTools` /
+ * `contextLimit` are pre-existing options; `deadlineMs` / `turnTimeoutMs` /
+ * `modelCallTimeoutMs` / `loopDetection` are the 0.4 additions, camelCase-
+ * mirroring the IR 1:1). Every knob is emitted only when declared — the
+ * runtime owns every default — so existing bundles stay byte-identical.
+ * `limits.crew` never reaches this shape (crew-only; the spec rejects it
+ * everywhere else). The daemon's dream path keeps its own bounded
+ * `input.maxToolIterations` (DREAM_MAX_TOOL_ITERATIONS) regardless of these.
+ * Mirror: target-cli + target-managed render the same fields.
+ */
+function renderLimitsFields(ir: IrChannelV0): string {
+  const limits = ir.limits;
+  if (limits === undefined) return "";
+  const pieces: string[] = [];
+  if (limits.maxToolIterations !== undefined) {
+    pieces.push(`\n        maxToolIterations: ${limits.maxToolIterations},`);
+  }
+  if (limits.maxConcurrentTools !== undefined) {
+    pieces.push(`\n        maxConcurrentTools: ${limits.maxConcurrentTools},`);
+  }
+  if (limits.contextLimit !== undefined) {
+    pieces.push(`\n        contextLimit: ${limits.contextLimit},`);
+  }
+  if (limits.deadlineMs !== undefined) {
+    pieces.push(`\n        deadlineMs: ${limits.deadlineMs},`);
+  }
+  if (limits.turnTimeoutMs !== undefined) {
+    pieces.push(`\n        turnTimeoutMs: ${limits.turnTimeoutMs},`);
+  }
+  if (limits.modelCallTimeoutMs !== undefined) {
+    pieces.push(`\n        modelCallTimeoutMs: ${limits.modelCallTimeoutMs},`);
+  }
+  if (limits.loopDetection !== undefined) {
+    pieces.push(`\n        loopDetection: ${JSON.stringify(limits.loopDetection)},`);
+  }
+  return pieces.join("");
 }
 
 function renderPermissionsField(ir: IrChannelV0): string {
@@ -479,9 +565,28 @@ function renderAgent(ir: IrChannelV0): string {
   const fabric = memoryFabric(ir);
   const hbScopeOverride = fabric.continuityOn && ir.heartbeat !== undefined;
   const dreamOn = dreamConfigured(ir);
+  // Loop contract 0.4 (Batch A) — top-level `memory.embedder`. Only
+  // meaningful when the fact store actually wires (an enabled memory block);
+  // threaded as the structural `deps.embedder` on every wireMemory /
+  // dream-janitor call so it beats the fragment's `wiki.embedder` factory
+  // string — the documented fallback order `embedder` → `wiki.embedder`.
+  const memEmbedderModel =
+    ir.memory !== undefined && ir.memory.enabled !== false ? ir.memory.embedder : undefined;
   const memImport = fabric.wired
-    ? `import { wireMemory${fabric.continuityOn || dreamOn ? ", type MemoryWiringFragment" : ""}${dreamOn ? ", createDreamJanitorStep, type DreamJanitorStep" : ""} } from "@crewhaus/memory-service";\n${fabric.continuityOn ? `import { createSkillTool } from "@crewhaus/skills-registry";\n` : ""}${dreamOn ? `import { createCostTracker } from "@crewhaus/cost-tracker";\n` : ""}`
+    ? `${memEmbedderModel !== undefined ? `import { createEmbedder } from "@crewhaus/embedder";\n` : ""}import { wireMemory${fabric.continuityOn || dreamOn ? ", type MemoryWiringFragment" : ""}${dreamOn ? ", createDreamJanitorStep, type DreamJanitorStep" : ""} } from "@crewhaus/memory-service";\n${fabric.continuityOn ? `import { createSkillTool } from "@crewhaus/skills-registry";\n` : ""}${dreamOn ? `import { createCostTracker } from "@crewhaus/cost-tracker";\n` : ""}`
     : "";
+  const memEmbedderBlock =
+    memEmbedderModel === undefined
+      ? ""
+      : `
+/** Loop contract 0.4 (Batch A) — top-level \`memory.embedder\`: hybrid recall
+ *  on the fact store (and the wiki), resolved ONCE at boot from the
+ *  \`@crewhaus/embedder\` factory grammar. Threaded as the structural
+ *  \`deps.embedder\`, which beats the fragment's \`wiki.embedder\` factory
+ *  string (fallback order \`embedder\` → \`wiki.embedder\`). */
+const __memEmbedder = createEmbedder({ model: ${escapeJsonString(memEmbedderModel)} });
+`;
+  const memEmbedderDep = memEmbedderModel !== undefined ? "\n        embedder: __memEmbedder," : "";
   const fragmentBlock = !fabric.wired
     ? ""
     : fabric.continuityOn
@@ -520,7 +625,7 @@ function __memFragment(scope?: "spec" | "session"): MemoryWiringFragment {
       const __memTools: RegisteredTool[] = [];
       const __memWired = await wireMemory(${fragmentExpr}, {
         catalog: { register: (t: RegisteredTool) => { __memTools.push(t); } },
-        cwd: process.cwd(),
+        cwd: process.cwd(),${memEmbedderDep}
         sessionScope: args.sessionId,
       });${
         fabric.continuityOn
@@ -560,7 +665,7 @@ const __DREAM_FRAGMENT: MemoryWiringFragment = ${dreamFragmentJson(ir)};
 
 export function createDreamStep(): DreamJanitorStep | null {
   return createDreamJanitorStep(__DREAM_FRAGMENT, {
-    cwd: process.cwd(),
+    cwd: process.cwd(),${memEmbedderModel !== undefined ? "\n    embedder: __memEmbedder," : ""}
     modelPhase: {
       model: ${escapeJsonString(ir.agent.model)},
       run: async (input) => {
@@ -569,7 +674,7 @@ export function createDreamStep(): DreamJanitorStep | null {
         const __tools: RegisteredTool[] = [];
         await wireMemory(__DREAM_FRAGMENT, {
           catalog: { register: (t: RegisteredTool) => { __tools.push(t); } },
-          cwd: process.cwd(),
+          cwd: process.cwd(),${memEmbedderModel !== undefined ? "\n          embedder: __memEmbedder," : ""}
         });
         const runContext = createRunContext();
         const tracker = createCostTracker(runContext.eventBus, { suppressEvents: true });
@@ -614,7 +719,7 @@ ${permImport}${subAgentTypeImport}${memImport}import type { HookDef } from "@cre
 import type { SkillRef } from "@crewhaus/skills-registry";
 import type { SlashCommand } from "@crewhaus/slash-commands";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
-${fragmentBlock}
+${fragmentBlock}${memEmbedderBlock}
 export type AgentConfig = {
   hooks: ReadonlyArray<HookDef>;
   skills: ReadonlyArray<SkillRef>;
@@ -646,7 +751,7 @@ export function createAgent(config: AgentConfig): Agent {
       const __inbound = await classifyInbound(args.message, runContext, { origin: "channel" });${memTurnBlock}
       return await runChatLoop({
         model: ${escapeJsonString(ir.agent.model)},
-        instructions: ${escapeJsonString(ir.agent.instructions)},${renderModelFailoverFields(ir)}${renderFailureTaxonomyField(ir)}${renderBudgetField(ir)}${renderCompactionModelField(ir)}
+        instructions: ${escapeJsonString(ir.agent.instructions)},${renderAgentTuningFields(ir)}${renderModelFailoverFields(ir)}${renderFailureTaxonomyField(ir)}${renderBudgetField(ir)}${renderLimitsFields(ir)}${renderCompactionFields(ir)}
         sessionName: ${escapeJsonString(ir.name)},
         sessionTarget: "channel",
         ...(config.sessionRootDir !== undefined ? { sessionRootDir: config.sessionRootDir } : {}),
@@ -1204,10 +1309,28 @@ registerChannelAdapter("imessage", imessageAdapter);`);
 `
     : "";
   const dreamStepsField = dreamOn ? "\n    steps: __dreamStep !== null ? [__dreamStep] : []," : "";
+  // Loop contract 0.4 (Batch A) — spec-declared lifecycle hooks (`hooks:`).
+  // IrHook is HookDef-shaped by contract (the spec ↔ hooks-engine
+  // cross-check test pins the event list), so codegen embeds them as a
+  // literal LAYERED BELOW the settings.json-discovered ones — spec entries
+  // first, then loadHooks()' user → project entries (aggregateDecisions'
+  // later-wins mutate merge keeps the settings layers authoritative — the
+  // permission RuleSet's settings-over-yaml precedence; mirror: target-cli
+  // and the `crewhaus run` interpreter). Declaration order within the
+  // spec is preserved (hooks run in registration order) and all hooks
+  // still RUN (any deny wins regardless of layer). Absent/empty leaves
+  // bundles byte-identical.
+  const specHooks = ir.hooks !== undefined && ir.hooks.length > 0 ? ir.hooks : undefined;
+  const hooksEngineImport = `import { loadHooks${specHooks !== undefined ? ", type HookDef" : ""} } from "@crewhaus/hooks-engine";`;
+  const specHooksBoot =
+    specHooks !== undefined
+      ? `\n  // Loop contract 0.4 — spec-declared lifecycle hooks, layered below the\n  // settings.json-discovered ones (spec first; user → project later-wins).\n  const __specHooks: ReadonlyArray<HookDef> = ${JSON.stringify(specHooks)};`
+      : "";
+  const agentHooksExpr = specHooks !== undefined ? "[...__specHooks, ...__hooks]" : "__hooks";
   const extensionImports = continuityOn
-    ? `import { loadHooks } from "@crewhaus/hooks-engine";
+    ? `${hooksEngineImport}
 import { defaultCatalog } from "@crewhaus/tool-catalog";`
-    : `import { loadHooks } from "@crewhaus/hooks-engine";
+    : `${hooksEngineImport}
 import { discoverSkills, createSkillTool } from "@crewhaus/skills-registry";
 import { loadCommands } from "@crewhaus/slash-commands";
 import { defaultCatalog } from "@crewhaus/tool-catalog";`;
@@ -1252,10 +1375,10 @@ ${startupEnvCheck}
 ${adapterConstructBlock}
 
 async function main(): Promise<void> {
-${extensionBoot}
+${extensionBoot}${specHooksBoot}
 ${registerBlock}${mcpBoot}${subAgentBoot}
   const agent = createAgent({
-    hooks: __hooks,
+    hooks: ${agentHooksExpr},
 ${agentSkillsFields}
     tools: defaultCatalog.list(),${subAgentCreateAgentFields}
   });

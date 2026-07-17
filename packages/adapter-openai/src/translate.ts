@@ -20,20 +20,28 @@
  *   `max_tokens` with a 400 and require `max_completion_tokens`;
  *   OpenAI-compatible servers (Ollama, vLLM, llama.cpp, …) only
  *   understand `max_tokens`. We branch on the model id.
+ * - Reasoning control: OpenAI's knob is the NAMED `reasoning_effort`
+ *   string, not a token budget. `req.reasoningEffort` passes through
+ *   verbatim; a `req.thinking.budgetTokens` (set without an effort)
+ *   is converted to the nearest `EFFORT_THINKING_BUDGET_TOKENS`
+ *   bucket. Non-reasoning models (and the compat-server tail) ignore
+ *   both silently — same model-id branch as the token-cap rename.
  * - Tool-result images: OpenAI `tool` role messages accept only
  *   strings, so images inside `tool_result` blocks are re-emitted as a
  *   follow-up `user` message (each image preceded by a text part naming
  *   the originating tool call) so vision models still see them.
  */
 
-import type {
-  CanonicalImageBlockParam,
-  CanonicalMessage,
-  CanonicalTextBlockParam,
-  CanonicalTool,
-  CanonicalToolResultContent,
-  ProviderRequest,
-  ToolChoice,
+import {
+  type CanonicalImageBlockParam,
+  type CanonicalMessage,
+  type CanonicalTextBlockParam,
+  type CanonicalTool,
+  type CanonicalToolResultContent,
+  EFFORT_THINKING_BUDGET_TOKENS,
+  type ProviderRequest,
+  type ReasoningEffort,
+  type ToolChoice,
 } from "@crewhaus/adapter-anthropic";
 import type OpenAI from "openai";
 
@@ -79,7 +87,51 @@ export function toOpenAIChatParams(
     params.tool_choice = toOpenAIToolChoice(req.toolChoice);
   }
 
+  // Loop contract 0.4 (Batch A) — reasoning control. Only reasoning
+  // models accept `reasoning_effort` (compat servers and the gpt-4o
+  // tail 400 on it), so it rides the same model-id branch as the
+  // token-cap rename; everything else ignores the request silently.
+  if (usesMaxCompletionTokens(req.model)) {
+    const effort = resolveReasoningEffort(req);
+    if (effort !== undefined) {
+      params.reasoning_effort = effort;
+    }
+  }
+
   return params;
+}
+
+/**
+ * Resolve the effort preset to send as `reasoning_effort`.
+ *
+ * OpenAI's native reasoning control IS the named effort string, so the
+ * precedence INVERTS the budget-token providers (anthropic/gemini/
+ * bedrock, where an explicit budget wins): `req.reasoningEffort` passes
+ * through verbatim, and `req.thinking.budgetTokens` is only consulted
+ * as a derivation source when no effort was set — mapped to the effort
+ * whose `EFFORT_THINKING_BUDGET_TOKENS` preset is NEAREST the requested
+ * budget (ties resolve to the lower effort, matching the table's
+ * low→high declaration order).
+ */
+function resolveReasoningEffort(req: ProviderRequest): ReasoningEffort | undefined {
+  if (req.reasoningEffort !== undefined) return req.reasoningEffort;
+  if (req.thinking !== undefined) return nearestEffortBucket(req.thinking.budgetTokens);
+  return undefined;
+}
+
+const EFFORT_BUCKETS: ReadonlyArray<ReasoningEffort> = ["low", "medium", "high"];
+
+function nearestEffortBucket(budgetTokens: number): ReasoningEffort {
+  let nearest: ReasoningEffort = "low";
+  let nearestDistance = Number.POSITIVE_INFINITY;
+  for (const effort of EFFORT_BUCKETS) {
+    const distance = Math.abs(budgetTokens - EFFORT_THINKING_BUDGET_TOKENS[effort]);
+    if (distance < nearestDistance) {
+      nearest = effort;
+      nearestDistance = distance;
+    }
+  }
+  return nearest;
 }
 
 /**

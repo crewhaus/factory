@@ -36,6 +36,17 @@ describe("buildConverseRequest — request marshalling", () => {
     ).toBeUndefined();
   });
 
+  test("reasoning controls (thinking / reasoningEffort) are silently ignored", () => {
+    // Converse has no cross-vendor thinking-budget or effort field — the
+    // request must be byte-identical to one without reasoning controls.
+    const input = buildConverseRequest({
+      ...baseReq,
+      thinking: { type: "enabled", budgetTokens: 8192 },
+      reasoningEffort: "high",
+    });
+    expect(input).toEqual(buildConverseRequest(baseReq));
+  });
+
   test("omits toolConfig entirely when the request is toolless", () => {
     expect(buildConverseRequest(baseReq).toolConfig).toBeUndefined();
     // An empty tools array is toolless too — Converse rejects an empty

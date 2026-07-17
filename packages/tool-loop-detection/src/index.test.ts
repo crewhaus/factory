@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { ToolUseBlock } from "@crewhaus/turn-state-machine";
-import { detectLoop, toolCallSignature } from "./index";
+import { detectLoop, nearToolCallSignature, stripVolatile, toolCallSignature } from "./index";
 
 function call(name: string, input: unknown = {}, id = `tu_${Math.random()}`): ToolUseBlock {
   return { id, name, input };
@@ -162,5 +162,89 @@ describe("detectLoop — early-exit on first hit", () => {
       3,
     );
     expect(out?.toolName).toBe("A");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Loop contract 0.4 (G27) — near-duplicate tier.
+// ---------------------------------------------------------------------------
+
+describe("stripVolatile / nearToolCallSignature", () => {
+  test("digit runs, UUIDs, long hex ids, and whitespace runs collapse", () => {
+    expect(stripVolatile("page 12 of 90")).toBe("page «n» of «n»");
+    expect(stripVolatile("id=3fa85f64-5717-4562-b3fc-2c963f66afa6")).toBe("id=«uuid»");
+    expect(stripVolatile("sha deadbeefdeadbeefdeadbeef done")).toBe("sha «hex» done");
+    expect(stripVolatile("a  \t b\n c")).toBe("a b c");
+  });
+
+  test("near signatures collapse volatile-only differences (numbers as values too)", () => {
+    expect(nearToolCallSignature("Fetch", { url: "https://x.test/items?page=1" })).toBe(
+      nearToolCallSignature("Fetch", { url: "https://x.test/items?page=2" }),
+    );
+    expect(nearToolCallSignature("Read", { offset: 100 })).toBe(
+      nearToolCallSignature("Read", { offset: 200 }),
+    );
+  });
+
+  test("near signatures keep genuinely different inputs apart, and never collide with exact ones", () => {
+    expect(nearToolCallSignature("Read", { path: "a.ts" })).not.toBe(
+      nearToolCallSignature("Read", { path: "b.ts" }),
+    );
+    // `~` separator vs `:` — a caller's dedup set can hold both kinds safely.
+    expect(nearToolCallSignature("X", {})).not.toBe(toolCallSignature("X", {}));
+  });
+});
+
+describe("detectLoop — near-duplicate tier (G27)", () => {
+  const page = (n: number): ToolUseBlock => call("Fetch", { url: `https://x.test/i?page=${n}` });
+
+  test("exact repeats keep reporting tier 'exact' (pre-0.4 behaviour intact)", () => {
+    const out = detectLoop([call("A", { k: 1 }), call("A", { k: 1 }), call("A", { k: 1 })]);
+    expect(out?.tier).toBe("exact");
+    expect(out?.signature).toBe('A:{"k":1}');
+  });
+
+  test("three near-duplicates do NOT trip the default threshold (reduced weight)", () => {
+    // Weighted score 1 + 2×0.5 = 2 < 3.
+    expect(detectLoop([page(1), page(2), page(3)])).toBeNull();
+  });
+
+  test("five near-duplicates trip the default threshold with tier 'near'", () => {
+    // Weighted score 1 + 4×0.5 = 3 >= 3.
+    const out = detectLoop([page(1), page(2), page(3), page(4), page(5)]);
+    expect(out).not.toBeNull();
+    expect(out?.tier).toBe("near");
+    expect(out?.toolName).toBe("Fetch");
+    expect(out?.count).toBe(5);
+    expect(out?.signature).toBe(nearToolCallSignature("Fetch", { url: "https://x.test/i?page=1" }));
+  });
+
+  test("a mixed exact+near group scores exact repeats at full weight", () => {
+    // 2 exact repeats of page(1) + 2 near variants: 2 + 2×0.5 = 3 >= 3,
+    // while no single exact signature reached 3 on its own.
+    const out = detectLoop([page(1), page(1), page(2), page(3)]);
+    expect(out?.tier).toBe("near");
+    expect(out?.count).toBe(4);
+  });
+
+  test("near matching never crosses tool names", () => {
+    const out = detectLoop([
+      call("A", { q: "x 1" }),
+      call("B", { q: "x 2" }),
+      call("A", { q: "x 3" }),
+      call("B", { q: "x 4" }),
+      call("A", { q: "x 5" }),
+    ]);
+    expect(out).toBeNull();
+  });
+
+  test("near detection respects the window slice", () => {
+    // Five near-duplicates followed by 10 distinct calls: window 10 only
+    // sees the distinct tail → null.
+    const churn = [page(1), page(2), page(3), page(4), page(5)];
+    const tail = Array.from({ length: 10 }, (_, i) =>
+      call("Other", { p: `path-${String.fromCharCode(97 + i)}.ts` }),
+    );
+    expect(detectLoop([...churn, ...tail], 10, 3)).toBeNull();
   });
 });

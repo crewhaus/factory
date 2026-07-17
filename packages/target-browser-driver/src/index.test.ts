@@ -324,3 +324,111 @@ describe("emitBrowserDriver — failureTaxonomy field (item 23)", () => {
     expect(emitBrowserDriver(empty).files[0]?.content ?? "").not.toContain("failureTaxonomy:");
   });
 });
+
+describe("emitBrowserDriver — agent.max_tokens (loop contract 0.4)", () => {
+  test("declared agent.maxTokens replaces the pinned 4096 in the runChatLoop call", () => {
+    const ir: IrBrowserV0 = { ...baseIr, agent: { ...baseIr.agent, maxTokens: 16384 } };
+    const code = emitBrowserDriver(ir).files[0]?.content ?? "";
+    expect(code).toContain("maxTokens: 16384,");
+    expect(code).not.toContain("maxTokens: 4096,");
+  });
+
+  test("absent maxTokens keeps the pre-existing 4096 default (bundle bytes unchanged)", () => {
+    const code = emitBrowserDriver(baseIr).files[0]?.content ?? "";
+    expect(code).toContain("maxTokens: 4096,");
+  });
+});
+
+describe("emitBrowserDriver — budget field (item 27, Batch A)", () => {
+  test("threads budget into the runChatLoop call (degrade ladder model quoted)", () => {
+    const ir: IrBrowserV0 = {
+      ...baseIr,
+      budget: { usdMicros: 2_500_000, onExceed: { kind: "degrade", model: "claude-haiku-4-5" } },
+    };
+    const code = emitBrowserDriver(ir).files[0]?.content ?? "";
+    expect(code).toContain("budget: ");
+    expect(code).toContain('"usdMicros":2500000');
+    expect(code).toContain('"model":"claude-haiku-4-5"');
+  });
+
+  test("omits budget when the IR leaves it unset", () => {
+    const code = emitBrowserDriver(baseIr).files[0]?.content ?? "";
+    expect(code).not.toContain("budget:");
+  });
+});
+
+describe("emitBrowserDriver — limits ceilings (loop contract 0.4, Batch A)", () => {
+  test("threads every declared limits knob into the runChatLoop call 1:1", () => {
+    const ir: IrBrowserV0 = {
+      ...baseIr,
+      limits: {
+        maxToolIterations: 40,
+        maxConcurrentTools: 2,
+        contextLimit: 120_000,
+        deadlineMs: 90_000,
+        turnTimeoutMs: 60_000,
+        modelCallTimeoutMs: 30_000,
+        loopDetection: { window: 6, threshold: 3, escalation: "abort" },
+      },
+    };
+    const code = emitBrowserDriver(ir).files[0]?.content ?? "";
+    expect(code).toContain("maxToolIterations: 40,");
+    expect(code).toContain("maxConcurrentTools: 2,");
+    expect(code).toContain("contextLimit: 120000,");
+    expect(code).toContain("deadlineMs: 90000,");
+    expect(code).toContain("turnTimeoutMs: 60000,");
+    expect(code).toContain("modelCallTimeoutMs: 30000,");
+    expect(code).toContain('loopDetection: {"window":6,"threshold":3,"escalation":"abort"}');
+  });
+
+  test("partial limits emit only the declared knobs (runtime defaults stay authoritative)", () => {
+    const ir: IrBrowserV0 = {
+      ...baseIr,
+      limits: { deadlineMs: 45_000, turnTimeoutMs: 30_000 },
+    };
+    const code = emitBrowserDriver(ir).files[0]?.content ?? "";
+    expect(code).toContain("deadlineMs: 45000,");
+    expect(code).toContain("turnTimeoutMs: 30000,");
+    expect(code).not.toContain("maxToolIterations:");
+    expect(code).not.toContain("modelCallTimeoutMs:");
+    expect(code).not.toContain("loopDetection:");
+  });
+
+  test("omits every limits knob when the IR leaves limits unset", () => {
+    const code = emitBrowserDriver(baseIr).files[0]?.content ?? "";
+    expect(code).not.toContain("deadlineMs:");
+    expect(code).not.toContain("turnTimeoutMs:");
+    expect(code).not.toContain("modelCallTimeoutMs:");
+    expect(code).not.toContain("maxToolIterations:");
+    expect(code).not.toContain("loopDetection:");
+  });
+});
+
+describe("emitBrowserDriver — spec hooks (loop contract 0.4, Batch A)", () => {
+  test("declared hooks emit the HookDef import, SPEC_HOOKS const, and the runChatLoop field", () => {
+    const ir: IrBrowserV0 = {
+      ...baseIr,
+      hooks: [
+        { event: "pre-tool", matcher: "Click", command: "./guard.sh", timeoutMs: 5000 },
+        { event: "stop", command: "./notify.sh" },
+      ],
+    };
+    const code = emitBrowserDriver(ir).files[0]?.content ?? "";
+    expect(code).toContain('import type { HookDef } from "@crewhaus/hooks-engine";');
+    expect(code).toContain("const SPEC_HOOKS: ReadonlyArray<HookDef> = ");
+    expect(code).toContain('"event":"pre-tool"');
+    expect(code).toContain('"command":"./guard.sh"');
+    expect(code).toContain("hooks: SPEC_HOOKS,");
+    // Declaration order is semantics — pre-tool must serialize before stop.
+    expect(code.indexOf('"event":"pre-tool"')).toBeLessThan(code.indexOf('"event":"stop"'));
+  });
+
+  test("omits all hooks plumbing when the IR leaves hooks unset or empty", () => {
+    for (const ir of [baseIr, { ...baseIr, hooks: [] } satisfies IrBrowserV0]) {
+      const code = emitBrowserDriver(ir).files[0]?.content ?? "";
+      expect(code).not.toContain("@crewhaus/hooks-engine");
+      expect(code).not.toContain("SPEC_HOOKS");
+      expect(code).not.toContain("hooks:");
+    }
+  });
+});

@@ -5,6 +5,7 @@ import type {
   IrBatchV0,
   IrBrowserBackend,
   IrBrowserV0,
+  IrBudget,
   IrChannelV0,
   IrCompaction,
   IrCrewRole,
@@ -13,6 +14,8 @@ import type {
   IrGraphEdge,
   IrGraphNode,
   IrGraphV0,
+  IrHook,
+  IrLimits,
   IrManagedTenant,
   IrManagedV0,
   IrMcpServerConfig,
@@ -25,6 +28,7 @@ import type {
   IrResearchV0,
   IrSecretRef,
   IrSubAgentDefinition,
+  IrThinking,
   IrToolConfigs,
   IrV0,
   IrVectorBackend,
@@ -1010,5 +1014,168 @@ describe("IrEvalV0 (Section 29 — EVAL target)", () => {
       concurrency: 1,
     };
     expect(ir.seed).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Loop contract 0.4 (Batch A) — type-locks for the new IR surface: IrLimits /
+// IrThinking / IrHook / IrRateLimits / streaming / compaction extensions /
+// memory.embedder / graph when+parallel / budget + maxTokens placements.
+// ---------------------------------------------------------------------------
+describe("Batch A IR surface", () => {
+  test("IrThinking is a two-variant union (budgetTokens XOR effort)", () => {
+    const budget: IrThinking = { budgetTokens: 4096 };
+    const effort: IrThinking = { effort: "medium" };
+    expect("budgetTokens" in budget && budget.budgetTokens).toBe(4096);
+    expect("effort" in effort && effort.effort).toBe("medium");
+  });
+
+  test("IrLimits carries camelCase ceilings + loopDetection + crew sub-block", () => {
+    const limits: IrLimits = {
+      maxToolIterations: 25,
+      maxConcurrentTools: 4,
+      contextLimit: 180_000,
+      deadlineMs: 600_000,
+      turnTimeoutMs: 120_000,
+      modelCallTimeoutMs: 60_000,
+      loopDetection: { window: 10, threshold: 3, escalation: "justify" },
+      crew: { maxActivations: 12, refusalDepth: 0, maxA2aDepth: 3 },
+    };
+    expect(limits.loopDetection?.escalation).toBe("justify");
+    expect(limits.crew?.refusalDepth).toBe(0);
+  });
+
+  test("IrHook mirrors hooks-engine's HookDef shape (camelCase timeoutMs)", () => {
+    const hook: IrHook = { event: "pre-tool", matcher: "Bash", command: "./g.sh", timeoutMs: 3000 };
+    expect(hook.event).toBe("pre-tool");
+    const minimal: IrHook = { event: "alert", command: "notify" };
+    expect(minimal.matcher).toBeUndefined();
+  });
+
+  test("cli agent carries thinking/streaming/rateLimits; top level carries limits/hooks", () => {
+    const ir: IrV0 = {
+      version: 0,
+      name: "hello",
+      target: "cli",
+      agent: {
+        model: "m",
+        instructions: "i",
+        maxTokens: 9000,
+        thinking: { effort: "high" },
+        streaming: true,
+        rateLimits: { Bash: { rpm: 30, burst: 5 }, "*": { rpm: 120 } },
+      },
+      tools: [],
+      toolConfigs: {},
+      mcp_servers: {},
+      permissions: { rules: [] },
+      subAgents: [],
+      compaction: { threshold: 0.85, snipKeepHead: 3, snipKeepTail: 8 },
+      memory: { embedder: "builtin:hash" },
+      limits: { maxToolIterations: 25 },
+      hooks: [{ event: "stop", command: "echo done" }],
+    };
+    expect(ir.agent.streaming).toBe(true);
+    expect(ir.agent.rateLimits?.["*"]?.rpm).toBe(120);
+    expect(ir.compaction.snipKeepTail).toBe(8);
+    expect(ir.memory?.embedder).toBe("builtin:hash");
+    expect(ir.limits?.maxToolIterations).toBe(25);
+    expect(ir.hooks?.[0]?.event).toBe("stop");
+  });
+
+  test("graph edges carry when; the variant carries parallel/budget/limits/hooks", () => {
+    const edgeEquals: IrGraphEdge = { from: "a", to: "b", when: { key: "a", equals: "approve" } };
+    const edgeExists: IrGraphEdge = { from: "a", to: "c", when: { key: "a", exists: true } };
+    const node: IrGraphNode = {
+      name: "a",
+      instructions: "i",
+      model: "m",
+      maxTokens: 2048,
+      thinking: { budgetTokens: 2048 },
+      tools: [],
+      toolConfigs: {},
+    };
+    const ir: IrGraphV0 = {
+      version: 0,
+      name: "g",
+      target: "graph",
+      entry: "a",
+      nodes: [node],
+      edges: [edgeEquals, edgeExists],
+      parallel: [["b", "c"]],
+      permissions: { rules: [] },
+      compaction: {},
+      budget: { usdMicros: 2_000_000, onExceed: { kind: "stop" } },
+      limits: { deadlineMs: 60_000 },
+      hooks: [{ event: "session-start", command: "echo" }],
+    };
+    expect(ir.parallel?.[0]).toEqual(["b", "c"]);
+    expect(ir.edges[0]?.when?.equals).toBe("approve");
+    expect(ir.edges[1]?.when?.exists).toBe(true);
+    expect(ir.nodes[0]?.thinking).toEqual({ budgetTokens: 2048 });
+  });
+
+  test("workflow steps / crew roles / channel+managed+research+batch+browser agents carry maxTokens (+ thinking where contracted)", () => {
+    const step: IrWorkflowStep = {
+      name: "s",
+      instructions: "i",
+      model: "m",
+      maxTokens: 9000,
+      thinking: { effort: "low" },
+      tools: [],
+      toolConfigs: {},
+    };
+    expect(step.maxTokens).toBe(9000);
+    const role: IrCrewRole = {
+      name: "lead",
+      model: "m",
+      instructions: "i",
+      maxTokens: 4096,
+      thinking: { effort: "medium" },
+      tools: [],
+      toolConfigs: {},
+      subAgents: [],
+    };
+    expect(role.thinking).toEqual({ effort: "medium" });
+    const channelAgent: IrChannelV0["agent"] = {
+      model: "m",
+      instructions: "i",
+      maxTokens: 12_000,
+      thinking: { effort: "low" },
+      rateLimits: { "*": { rpm: 60 } },
+    };
+    expect(channelAgent.maxTokens).toBe(12_000);
+    const managedAgent: IrManagedV0["agent"] = {
+      model: "m",
+      instructions: "i",
+      maxTokens: 6000,
+      thinking: { budgetTokens: 8192 },
+      rateLimits: { Bash: { rpm: 10 } },
+    };
+    expect(managedAgent.rateLimits?.["Bash"]?.rpm).toBe(10);
+    const researchAgent: IrResearchV0["agent"] = { model: "m", instructions: "i", maxTokens: 9000 };
+    const batchAgent: IrBatchV0["agent"] = { model: "m", instructions: "i", maxTokens: 7000 };
+    const browserAgent: IrBrowserV0["agent"] = { model: "m", instructions: "i", maxTokens: 5000 };
+    expect(researchAgent.maxTokens).toBe(9000);
+    expect(batchAgent.maxTokens).toBe(7000);
+    expect(browserAgent.maxTokens).toBe(5000);
+  });
+
+  test("budget/limits/hooks type-check on the six newly covered variants", () => {
+    const budget: IrBudget = { usdMicros: 1_000_000, onExceed: { kind: "stop" } };
+    const limits: IrLimits = { maxToolIterations: 5 };
+    const hooks: ReadonlyArray<IrHook> = [{ event: "post-tool", command: "log" }];
+    const wf: Pick<IrWorkflowV0, "budget" | "limits" | "hooks"> = { budget, limits, hooks };
+    const cr: Pick<IrCrewV0, "budget" | "limits" | "hooks"> = {
+      budget,
+      limits: { crew: { maxActivations: 3 } },
+      hooks,
+    };
+    const re: Pick<IrResearchV0, "budget" | "limits" | "hooks"> = { budget, limits, hooks };
+    const bt: Pick<IrBatchV0, "budget" | "limits" | "hooks"> = { budget, limits, hooks };
+    const br: Pick<IrBrowserV0, "budget" | "limits" | "hooks"> = { budget, limits, hooks };
+    expect(wf.budget?.usdMicros).toBe(1_000_000);
+    expect(cr.limits?.crew?.maxActivations).toBe(3);
+    expect([re, bt, br].every((v) => v.hooks?.length === 1)).toBe(true);
   });
 });

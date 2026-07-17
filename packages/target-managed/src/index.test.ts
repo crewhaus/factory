@@ -265,6 +265,142 @@ describe("emitManaged — terminal-failure reporting (0.3.0 Goal 6)", () => {
   });
 });
 
+describe("emitManaged — agent loop knobs (loop contract 0.4, Batch A)", () => {
+  test("agent.ts threads maxTokens into runChatLoop when set", () => {
+    const irMax: IrManagedV0 = { ...ir, agent: { ...ir.agent, maxTokens: 4096 } };
+    const agentTs = emitManaged(irMax).files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agentTs).toContain("maxTokens: 4096,");
+  });
+
+  test("agent.ts threads the budget-tokens thinking form verbatim", () => {
+    const irThink: IrManagedV0 = {
+      ...ir,
+      agent: { ...ir.agent, thinking: { budgetTokens: 8192 } },
+    };
+    const agentTs = emitManaged(irThink).files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agentTs).toContain('thinking: {"budgetTokens":8192},');
+  });
+
+  test("agent.ts threads the effort thinking form verbatim", () => {
+    const irThink: IrManagedV0 = { ...ir, agent: { ...ir.agent, thinking: { effort: "high" } } };
+    const agentTs = emitManaged(irThink).files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agentTs).toContain('thinking: {"effort":"high"},');
+  });
+
+  test("agent.ts threads per-tool rateLimits including the catch-all bucket", () => {
+    const irRate: IrManagedV0 = {
+      ...ir,
+      agent: {
+        ...ir.agent,
+        rateLimits: { web_search: { rpm: 30, burst: 5 }, "*": { rpm: 120 } },
+      },
+    };
+    const agentTs = emitManaged(irRate).files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agentTs).toContain('rateLimits: {"web_search":{"rpm":30,"burst":5},"*":{"rpm":120}},');
+  });
+
+  test("agent.ts omits all three knobs when the IR leaves them unset", () => {
+    const agentTs = emitManaged(ir).files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agentTs).not.toContain("maxTokens:");
+    expect(agentTs).not.toContain("thinking:");
+    expect(agentTs).not.toContain("rateLimits:");
+  });
+});
+
+describe("emitManaged — hard runtime ceilings (limits, loop contract 0.4)", () => {
+  const limitsIr: IrManagedV0 = {
+    ...ir,
+    limits: {
+      maxToolIterations: 40,
+      maxConcurrentTools: 4,
+      contextLimit: 150_000,
+      deadlineMs: 600_000,
+      turnTimeoutMs: 120_000,
+      modelCallTimeoutMs: 90_000,
+      loopDetection: { window: 6, threshold: 3, escalation: "justify" },
+    },
+  };
+
+  test("agent.ts threads every declared ceiling as a flat runChatLoop field", () => {
+    const agentTs = emitManaged(limitsIr).files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agentTs).toContain("maxToolIterations: 40,");
+    expect(agentTs).toContain("maxConcurrentTools: 4,");
+    expect(agentTs).toContain("contextLimit: 150000,");
+    expect(agentTs).toContain("deadlineMs: 600000,");
+    expect(agentTs).toContain("turnTimeoutMs: 120000,");
+    expect(agentTs).toContain("modelCallTimeoutMs: 90000,");
+    expect(agentTs).toContain('loopDetection: {"window":6,"threshold":3,"escalation":"justify"},');
+  });
+
+  test("a partial limits block emits ONLY the declared knobs — the runtime owns defaults", () => {
+    const partialIr: IrManagedV0 = { ...ir, limits: { maxToolIterations: 25 } };
+    const agentTs = emitManaged(partialIr).files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agentTs).toContain("maxToolIterations: 25,");
+    expect(agentTs).not.toContain("maxConcurrentTools:");
+    expect(agentTs).not.toContain("contextLimit:");
+    expect(agentTs).not.toContain("deadlineMs:");
+    expect(agentTs).not.toContain("turnTimeoutMs:");
+    expect(agentTs).not.toContain("modelCallTimeoutMs:");
+    expect(agentTs).not.toContain("loopDetection:");
+  });
+
+  test("agent.ts omits every ceiling when the IR has no limits block", () => {
+    const agentTs = emitManaged(ir).files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agentTs).not.toContain("maxToolIterations:");
+    expect(agentTs).not.toContain("maxConcurrentTools:");
+    expect(agentTs).not.toContain("contextLimit:");
+    expect(agentTs).not.toContain("deadlineMs:");
+    expect(agentTs).not.toContain("turnTimeoutMs:");
+    expect(agentTs).not.toContain("modelCallTimeoutMs:");
+    expect(agentTs).not.toContain("loopDetection:");
+  });
+});
+
+describe("emitManaged — spec-declared lifecycle hooks (loop contract 0.4)", () => {
+  test("agent.ts threads hooks as a HookDef[] literal in declaration order", () => {
+    const hooksIr: IrManagedV0 = {
+      ...ir,
+      hooks: [
+        { event: "pre-tool", matcher: "bash", command: "./guard.sh", timeoutMs: 5000 },
+        { event: "stop", command: "./notify.sh" },
+      ],
+    };
+    const agentTs = emitManaged(hooksIr).files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agentTs).toContain(
+      'hooks: [{"event":"pre-tool","matcher":"bash","command":"./guard.sh","timeoutMs":5000},{"event":"stop","command":"./notify.sh"}],',
+    );
+    // Declaration order is semantics — pre-tool must precede stop.
+    expect(agentTs.indexOf('"event":"pre-tool"')).toBeLessThan(agentTs.indexOf('"event":"stop"'));
+  });
+
+  test("agent.ts omits the hooks field when the IR carries none (absent or empty)", () => {
+    const agentTs = emitManaged(ir).files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agentTs).not.toContain("hooks:");
+    const emptyIr: IrManagedV0 = { ...ir, hooks: [] };
+    const emptyAgent = emitManaged(emptyIr).files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(emptyAgent).not.toContain("hooks:");
+  });
+});
+
+describe("emitManaged — run budget vs per-tenant budgets (loop contract 0.4)", () => {
+  test("top-level budget threads into runChatLoop while per-tenant gateway budgets keep overriding", () => {
+    const irBoth: IrManagedV0 = {
+      ...ir,
+      budget: { usdMicros: 2_500_000, onExceed: { kind: "abort" } },
+    };
+    const bundle = emitManaged(irBoth);
+    const agentTs = bundle.files.find((f) => f.path === "agent.ts")?.content ?? "";
+    const daemon = bundle.files.find((f) => f.path === "daemon.ts")?.content ?? "";
+    // Run-level spend cap rides runChatLoop in agent.ts…
+    expect(agentTs).toContain('budget: {"usdMicros":2500000');
+    // …while the per-tenant token budgets stay in the daemon's TENANT_OVERRIDES
+    // and continue to gate admission at the gateway, unchanged.
+    expect(daemon).toContain("budget: { maxInputTokens: 100000, maxOutputTokens: 20000 }");
+    expect(daemon).toContain("budget: { maxInputTokens: 50000, maxOutputTokens: 10000 }");
+    expect(daemon).toContain("budgetStore: BUDGET_STORE");
+  });
+});
+
 describe("emitManaged — dream janitor step (v0.3.0 PR 14, §6.3)", () => {
   const dreamIr: IrManagedV0 = {
     ...ir,

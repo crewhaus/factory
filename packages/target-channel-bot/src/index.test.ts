@@ -1066,3 +1066,210 @@ describe("emitChannelBot — learning (v0.3.0 §3.3, PR 17)", () => {
     expect(dreamFragment).toContain('"learning":{"domain":"specialty coffee extraction science"');
   });
 });
+
+describe("emitChannelBot — agent tuning knobs (loop contract 0.4, Batch A)", () => {
+  test("agent.ts threads max_tokens/thinking/rate_limits into runChatLoop when set", () => {
+    const ir: IrChannelV0 = {
+      ...MIN_IR,
+      agent: {
+        ...MIN_IR.agent,
+        maxTokens: 16_384,
+        thinking: { budgetTokens: 8192 },
+        rateLimits: { "*": { rpm: 30 }, bash: { rpm: 5, burst: 2 } },
+      },
+    };
+    const c = fileMap(ir).get("agent.ts") ?? "";
+    expect(c).toContain("maxTokens: 16384,");
+    expect(c).toContain('thinking: {"budgetTokens":8192},');
+    expect(c).toContain('rateLimits: {"*":{"rpm":30},"bash":{"rpm":5,"burst":2}},');
+  });
+
+  test("the effort form of thinking is carried verbatim (adapter converts it)", () => {
+    const ir: IrChannelV0 = {
+      ...MIN_IR,
+      agent: { ...MIN_IR.agent, thinking: { effort: "high" } },
+    };
+    const c = fileMap(ir).get("agent.ts") ?? "";
+    expect(c).toContain('thinking: {"effort":"high"},');
+  });
+
+  test("agent.ts omits all three when the IR leaves them unset (byte-identity guard)", () => {
+    const c = fileMap(MIN_IR).get("agent.ts") ?? "";
+    expect(c).not.toContain("maxTokens:");
+    expect(c).not.toContain("thinking:");
+    expect(c).not.toContain("rateLimits:");
+  });
+});
+
+describe("emitChannelBot — limits ceilings (loop contract 0.4, Batch A)", () => {
+  test("agent.ts threads every declared limits knob as its runtime option", () => {
+    const ir: IrChannelV0 = {
+      ...MIN_IR,
+      limits: {
+        maxToolIterations: 40,
+        maxConcurrentTools: 4,
+        contextLimit: 120_000,
+        deadlineMs: 600_000,
+        turnTimeoutMs: 120_000,
+        modelCallTimeoutMs: 60_000,
+        loopDetection: { window: 6, threshold: 3, escalation: "justify" },
+      },
+    };
+    const c = fileMap(ir).get("agent.ts") ?? "";
+    expect(c).toContain("maxToolIterations: 40,");
+    expect(c).toContain("maxConcurrentTools: 4,");
+    expect(c).toContain("contextLimit: 120000,");
+    expect(c).toContain("deadlineMs: 600000,");
+    expect(c).toContain("turnTimeoutMs: 120000,");
+    expect(c).toContain("modelCallTimeoutMs: 60000,");
+    expect(c).toContain('loopDetection: {"window":6,"threshold":3,"escalation":"justify"},');
+  });
+
+  test("partial limits emits only the declared knobs (runtime owns the defaults)", () => {
+    const ir: IrChannelV0 = { ...MIN_IR, limits: { maxToolIterations: 25 } };
+    const c = fileMap(ir).get("agent.ts") ?? "";
+    expect(c).toContain("maxToolIterations: 25,");
+    expect(c).not.toContain("maxConcurrentTools:");
+    expect(c).not.toContain("contextLimit:");
+    expect(c).not.toContain("deadlineMs:");
+    expect(c).not.toContain("turnTimeoutMs:");
+    expect(c).not.toContain("modelCallTimeoutMs:");
+    expect(c).not.toContain("loopDetection:");
+  });
+
+  test("no limits block → zero limits codegen (byte-identity guard)", () => {
+    const c = fileMap(MIN_IR).get("agent.ts") ?? "";
+    expect(c).not.toContain("maxToolIterations:");
+    expect(c).not.toContain("loopDetection:");
+  });
+
+  test("the dream path keeps its own bounded maxToolIterations regardless of limits", () => {
+    const ir: IrChannelV0 = {
+      ...MIN_IR,
+      memory: { dream: { everyMs: 86_400_000, mode: "full", budgetUsd: 0.5 } },
+      limits: { maxToolIterations: 40 },
+    };
+    const c = fileMap(ir).get("agent.ts") ?? "";
+    // The interactive turn carries the spec ceiling…
+    expect(c).toContain("maxToolIterations: 40,");
+    // …while the dream's bounded fresh session stays on the memory-service
+    // seam input (DREAM_MAX_TOOL_ITERATIONS).
+    expect(c).toContain("maxToolIterations: input.maxToolIterations");
+    // Exactly one interactive-call occurrence — the ceiling never leaks into
+    // the dream session.
+    expect(c.split("maxToolIterations: 40,").length - 1).toBe(1);
+  });
+});
+
+describe("emitChannelBot — compaction tuning knobs (loop contract 0.4, Batch A)", () => {
+  test("agent.ts threads threshold/snip_keep_head/snip_keep_tail alongside model", () => {
+    const ir: IrChannelV0 = {
+      ...MIN_IR,
+      compaction: {
+        model: "claude-haiku-4-5-20251001",
+        threshold: 0.75,
+        snipKeepHead: 3,
+        snipKeepTail: 12,
+      },
+    };
+    const c = fileMap(ir).get("agent.ts") ?? "";
+    expect(c).toContain('compactionModel: "claude-haiku-4-5-20251001"');
+    expect(c).toContain("compactionThreshold: 0.75,");
+    expect(c).toContain("snipKeepHead: 3,");
+    expect(c).toContain("snipKeepTail: 12,");
+  });
+
+  test("knobs emit without model, and an empty compaction block emits nothing", () => {
+    const withKnobs = fileMap({ ...MIN_IR, compaction: { threshold: 0.9 } }).get("agent.ts") ?? "";
+    expect(withKnobs).toContain("compactionThreshold: 0.9,");
+    expect(withKnobs).not.toContain("compactionModel:");
+    const without = fileMap(MIN_IR).get("agent.ts") ?? "";
+    expect(without).not.toContain("compactionThreshold:");
+    expect(without).not.toContain("snipKeepHead:");
+    expect(without).not.toContain("snipKeepTail:");
+  });
+});
+
+describe("emitChannelBot — spec-declared hooks (loop contract 0.4, Batch A)", () => {
+  const HOOKS_IR: IrChannelV0 = {
+    ...MIN_IR,
+    hooks: [
+      { event: "pre-tool", matcher: "bash", command: "./guard.sh", timeoutMs: 5000 },
+      { event: "stop", command: "./notify.sh" },
+    ],
+  };
+
+  test("daemon.ts embeds the hooks literal layered below the discovered ones", () => {
+    const c = fileMap(HOOKS_IR).get("daemon.ts") ?? "";
+    expect(c).toContain('import { loadHooks, type HookDef } from "@crewhaus/hooks-engine";');
+    expect(c).toContain(
+      'const __specHooks: ReadonlyArray<HookDef> = [{"event":"pre-tool","matcher":"bash","command":"./guard.sh","timeoutMs":5000},{"event":"stop","command":"./notify.sh"}];',
+    );
+    // Spec first, then user → project — later-wins keeps the settings
+    // layers authoritative (the permission RuleSet's settings-over-yaml
+    // precedence; same ordering as target-cli and the run interpreter).
+    expect(c).toContain("hooks: [...__specHooks, ...__hooks],");
+    expect(c).not.toContain("hooks: __hooks,");
+  });
+
+  test("spec hooks coexist with the continuity extension-boot branch", () => {
+    const ir: IrChannelV0 = {
+      ...HOOKS_IR,
+      continuity: { plan: true, proof: "ladder", ledger: true, handoff: true, scope: "session" },
+    };
+    const c = fileMap(ir).get("daemon.ts") ?? "";
+    expect(c).toContain('import { loadHooks, type HookDef } from "@crewhaus/hooks-engine";');
+    expect(c).toContain("hooks: [...__specHooks, ...__hooks],");
+  });
+
+  test("no hooks block → byte-identical daemon (plain loadHooks import, plain field)", () => {
+    const c = fileMap(MIN_IR).get("daemon.ts") ?? "";
+    expect(c).toContain('import { loadHooks } from "@crewhaus/hooks-engine";');
+    expect(c).toContain("hooks: __hooks,");
+    expect(c).not.toContain("__specHooks");
+    expect(c).not.toContain("HookDef");
+  });
+});
+
+describe("emitChannelBot — memory.embedder (loop contract 0.4, Batch A)", () => {
+  const EMBEDDER_IR: IrChannelV0 = {
+    ...MIN_IR,
+    memory: { embedder: "mock/deterministic", wiki: { enabled: true } },
+  };
+
+  test("agent.ts resolves the embedder once at boot and threads it into wireMemory deps", () => {
+    const c = fileMap(EMBEDDER_IR).get("agent.ts") ?? "";
+    expect(c).toContain('import { createEmbedder } from "@crewhaus/embedder";');
+    expect(c).toContain('const __memEmbedder = createEmbedder({ model: "mock/deterministic" });');
+    // The structural deps.embedder beats the fragment's wiki.embedder factory
+    // string — the documented fallback order embedder → wiki.embedder.
+    expect(c).toContain("embedder: __memEmbedder,");
+  });
+
+  test("the dream path carries the same embedder (janitor deps + model-phase wiring)", () => {
+    const ir: IrChannelV0 = {
+      ...EMBEDDER_IR,
+      memory: {
+        ...EMBEDDER_IR.memory,
+        dream: { everyMs: 86_400_000, mode: "full", budgetUsd: 0.5 },
+      },
+    };
+    const c = fileMap(ir).get("agent.ts") ?? "";
+    // Once in the interactive turn, once in createDreamJanitorStep deps, once
+    // in the dream model-phase's own wireMemory.
+    expect(c.split("embedder: __memEmbedder,").length - 1).toBe(3);
+  });
+
+  test("no embedder (or memory disabled) → zero embedder codegen", () => {
+    const plain = fileMap({ ...MIN_IR, memory: { wiki: { enabled: true } } }).get("agent.ts") ?? "";
+    expect(plain).not.toContain("createEmbedder");
+    expect(plain).not.toContain("__memEmbedder");
+    const disabled =
+      fileMap({
+        ...MIN_IR,
+        memory: { enabled: false, embedder: "mock/deterministic" },
+        continuity: { plan: true, proof: "ladder", ledger: true, handoff: true, scope: "session" },
+      }).get("agent.ts") ?? "";
+    expect(disabled).not.toContain("createEmbedder");
+  });
+});

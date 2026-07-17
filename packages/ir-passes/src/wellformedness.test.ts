@@ -116,3 +116,69 @@ describe("Track F — wellFormednessCheck (crew)", () => {
     expect(() => wellFormednessCheck(bad)).toThrow(IrPassError);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Loop contract 0.4 (Batch A) — `when` key resolution + `parallel` groups
+// (declared members, >= 2 per group, reachability closure via group[0]).
+// ---------------------------------------------------------------------------
+describe("Batch A — wellFormednessCheck (graph when + parallel)", () => {
+  test("accepts when.key that names a declared node (both forms)", () => {
+    const g: IrGraphV0 = {
+      ...baseGraph,
+      edges: [
+        { from: "a", to: "b", when: { key: "a", equals: "approve" } },
+        { from: "a", to: "b", when: { key: "a", exists: true } },
+      ],
+    };
+    expect(() => wellFormednessCheck(g)).not.toThrow();
+  });
+
+  test("rejects when.key that references an undeclared node", () => {
+    const bad: IrGraphV0 = {
+      ...baseGraph,
+      edges: [{ from: "a", to: "b", when: { key: "ghost", exists: true } }],
+    };
+    expect(() => wellFormednessCheck(bad)).toThrow(IrPassError);
+    expect(() => wellFormednessCheck(bad)).toThrow(/when\.key "ghost"/);
+  });
+
+  test("rejects a parallel group with fewer than 2 members", () => {
+    const bad: IrGraphV0 = { ...baseGraph, parallel: [["b"]] };
+    expect(() => wellFormednessCheck(bad)).toThrow(IrPassError);
+    expect(() => wellFormednessCheck(bad)).toThrow(/at least 2 nodes/);
+  });
+
+  test("rejects a parallel group referencing an undeclared node", () => {
+    const bad: IrGraphV0 = { ...baseGraph, parallel: [["b", "ghost"]] };
+    expect(() => wellFormednessCheck(bad)).toThrow(IrPassError);
+    expect(() => wellFormednessCheck(bad)).toThrow(/undeclared node "ghost"/);
+  });
+
+  test("a parallel group whose head is reachable makes every member reachable", () => {
+    const g: IrGraphV0 = {
+      ...baseGraph,
+      nodes: [
+        ...baseGraph.nodes,
+        { name: "c", instructions: "node c", model: "m", tools: [], toolConfigs: {} },
+      ],
+      // No edge reaches c directly — only the [b, c] barrier does (the
+      // engine triggers it when the cursor lands on b, the group head).
+      parallel: [["b", "c"]],
+    };
+    expect(() => wellFormednessCheck(g)).not.toThrow();
+  });
+
+  test("a parallel group whose head is unreachable does not launder reachability", () => {
+    const bad: IrGraphV0 = {
+      ...baseGraph,
+      nodes: [
+        ...baseGraph.nodes,
+        { name: "c", instructions: "node c", model: "m", tools: [], toolConfigs: {} },
+        { name: "d", instructions: "node d", model: "m", tools: [], toolConfigs: {} },
+      ],
+      // c is the head but nothing reaches c → c and d are both unreachable.
+      parallel: [["c", "d"]],
+    };
+    expect(() => wellFormednessCheck(bad)).toThrow(/unreachable/);
+  });
+});

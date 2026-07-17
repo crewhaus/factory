@@ -13,6 +13,7 @@
  */
 
 import {
+  EFFORT_THINKING_BUDGET_TOKENS,
   rawEventToCanonical,
   toAnthropicMessages,
   toAnthropicSystem,
@@ -75,6 +76,15 @@ export function buildAnthropicBedrockBody(req: ProviderRequest): AnthropicBedroc
   }
   if (req.thinking !== undefined) {
     body.thinking = { type: "enabled", budget_tokens: req.thinking.budgetTokens };
+  } else if (req.reasoningEffort !== undefined) {
+    // Loop contract 0.4 (Batch A) — the portable effort preset converts
+    // to the Anthropic-family budget-token control via the shared preset
+    // table. Only consulted when `thinking` is not explicitly set: an
+    // explicit budget always wins over the preset.
+    body.thinking = {
+      type: "enabled",
+      budget_tokens: EFFORT_THINKING_BUDGET_TOKENS[req.reasoningEffort],
+    };
   }
   return body as AnthropicBedrockBody;
 }

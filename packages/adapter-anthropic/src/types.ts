@@ -153,6 +153,41 @@ export type ToolChoice =
   | { readonly type: "any" }
   | { readonly type: "tool"; readonly name: string };
 
+/**
+ * Loop contract 0.4 (Batch A) — portable reasoning-effort preset. The
+ * spec's `thinking: { effort }` form lowers to this; adapters convert it
+ * to their provider's native reasoning control (see
+ * {@link EFFORT_THINKING_BUDGET_TOKENS}).
+ */
+export type ReasoningEffort = "low" | "medium" | "high";
+
+/**
+ * Loop contract 0.4 (Batch A) — the effort→thinking-budget preset table for
+ * providers whose reasoning control is a TOKEN BUDGET rather than a named
+ * effort level:
+ *
+ *   - **anthropic** — `thinking.budget_tokens` (this adapter's translate
+ *     maps `reasoningEffort` through this table when `thinking` is not
+ *     explicitly set).
+ *   - **bedrock** (Anthropic families) — the same `budget_tokens` field on
+ *     the InvokeModel body; adapter-bedrock converts through this table.
+ *   - **gemini** — `thinkingConfig.thinkingBudget` (a token count);
+ *     adapter-gemini converts through this table.
+ *
+ * Providers with a NATIVE effort string (OpenAI's `reasoning_effort`) pass
+ * the preset through verbatim and ignore this table. The numbers step
+ * roughly 4x per level: `low` (2048) covers quick sanity reasoning above
+ * the 1024 provider floor, `medium` (8192) is the balanced default, `high`
+ * (24576) approaches the ceiling recommended for hard multi-step work.
+ * An EXPLICIT `thinking.budget_tokens` in the spec always wins over the
+ * preset — the table is only consulted when the spec chose the effort form.
+ */
+export const EFFORT_THINKING_BUDGET_TOKENS: Readonly<Record<ReasoningEffort, number>> = {
+  low: 2048,
+  medium: 8192,
+  high: 24576,
+};
+
 export type ProviderRequest = {
   readonly model: string;
   /**
@@ -166,6 +201,13 @@ export type ProviderRequest = {
   readonly toolChoice?: ToolChoice;
   readonly maxTokens: number;
   readonly thinking?: { readonly type: "enabled"; readonly budgetTokens: number };
+  /**
+   * Loop contract 0.4 (Batch A) — portable effort preset, set when the spec
+   * declared `thinking: { effort }`. Ignored when `thinking` is also set
+   * (an explicit budget always wins). Adapters without a native effort
+   * control convert it via {@link EFFORT_THINKING_BUDGET_TOKENS}.
+   */
+  readonly reasoningEffort?: ReasoningEffort;
   readonly signal?: AbortSignal;
 };
 
